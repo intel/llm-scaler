@@ -17,7 +17,7 @@ RUN apt-get update -y && \
     apt-get install -y software-properties-common && \
     add-apt-repository ppa:deadsnakes/ppa && \
     apt-get update -y && \
-    apt-get install -y python3.10 python3.10-distutils && \
+    apt-get install -y python3.10 python3.10-distutils python3.10-dev && \
     curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10 && \
     apt-get install -y --no-install-recommends --fix-missing \
         curl \
@@ -36,6 +36,7 @@ RUN apt-get update -y && \
     # Install Intel GPU runtime packages
     apt-get update -y && \
     apt-get install -y libze1 libze-dev libze-intel-gpu1 intel-opencl-icd libze-intel-gpu-raytracing && \
+    apt-get install -y intel-oneapi-dpcpp-ct=2025.0.1-17 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /llm
@@ -52,6 +53,7 @@ RUN git clone -b v0.8.3 https://github.com/vllm-project/vllm.git && \
     cd vllm && \
     git apply /tmp/vllm_for_multi_arc.patch && \
     pip install --no-cache-dir -r requirements/xpu.txt && \
+    export CPATH=/opt/intel/oneapi/dpcpp-ct/2025.0/include/:${CPATH} && \
     python3 setup.py install
 
 # ======= Add oneCCL build =======
