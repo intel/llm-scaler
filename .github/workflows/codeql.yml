@@ -85,6 +85,9 @@ jobs:
         config: |
           paths:
             - vllm-upstream/vllm/
+          queries:
+            - uses: security-extended
+            - uses: security-and-quality
           exclude:
             - id: py/code-injection 
         # If you wish to specify custom queries, you can do so here or in a config file.
