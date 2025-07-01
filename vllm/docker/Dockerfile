@@ -42,6 +42,7 @@ RUN apt-get update -y && \
 WORKDIR /llm
 COPY ./patches/vllm_for_multi_arc.patch /tmp/
 COPY ./patches/0001-oneccl-align-global-V0.1.1.patch /tmp/
+COPY ./patches/libllama.so /opt/lib/
 
 # Set environment variables early
 ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/local/lib/"
@@ -78,8 +79,7 @@ RUN git clone https://github.com/oneapi-src/oneCCL.git && \
     make -j && make install && \
     mv _install /opt/intel/oneapi/ccl/2021.15.3 && \
     cd /opt/intel/oneapi/ccl/ && \
-    ln -snf 2021.15.3 latest && \
-    source /opt/intel/oneapi/setvars.sh --force
+    ln -snf 2021.15.3 latest
 
 WORKDIR /llm/vllm
 
