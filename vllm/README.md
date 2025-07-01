@@ -165,6 +165,14 @@ To enable data parallelism, add:
 
 ## 3. Supported Models
 
+| Model Name        | Category         | Notes                          |
+|-------------------|------------------|---------------------------------|
+|                   |                  |                                 |
+|                   |                  |                                 |
+|                   |                  |                                 |
+|                   |                  |                                 |
+|                   |                  |                                 |
+
 --- 
 
 ## 4. Troubleshooting
