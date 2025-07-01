@@ -42,7 +42,7 @@ RUN apt-get update -y && \
 WORKDIR /llm
 COPY ./patches/vllm_for_multi_arc.patch /tmp/
 COPY ./patches/0001-oneccl-align-global-V0.1.1.patch /tmp/
-COPY ./patches/libllama.so /opt/lib/
+COPY ./patches/vllm_int4_for_multi_arc.so /opt/lib/
 
 # Set environment variables early
 ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/local/lib/"
