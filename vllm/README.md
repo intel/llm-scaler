@@ -13,12 +13,12 @@ Our project focuses on downstream applications built on vLLM, providing a Docker
 2. [Advanced Features](#2-advanced-features)  
    2.1 [CCL Support (both P2P & USM)](#21-ccl-support-both-p2p--usm)  
    2.2 [INT4 and FP8 Quantized Online Serving](#22-int4-and-fp8-quantized-online-serving)  
-   2.3 [Model++: Embedding and Reranker Support](#23-model-embedding-and-reranker-support)  
-   2.4 [Qwen2.5-VL Performance++](#24-qwen25-vl-performance)  
-   2.5 [MoE Performance++](#25-moe-performance)  
-   2.6 [Data Parallelism (DP)](#26-data-parallelism-dp)  
-3. [Troubleshooting](#3-troubleshooting)  
-
+   2.3 [Embedding and Reranker Model Support](#23-embedding-and-reranker-model-support)  
+   2.4 [Multi-Modal Model Support](#24-multi-modal-model-support)  
+   2.5 [Data Parallelism (DP)](#25-data-parallelism-dp)  
+   2.6 [Maximum Context Length Support](#26-maximum-context-length-support)  
+3. [Supported Models](#3-supported-models)  
+4. [Troubleshooting](#4-troubleshooting)  
 
 ---
 
@@ -129,22 +129,17 @@ export CCL_TOPO_P2P_ACCESS=0  # USM mode
 
 ---
 
-### 2.3 Model++: Embedding and Reranker Support
+### 2.3 Embedding and Reranker Model Support
 
 
 ---
 
-### 2.4 Qwen2.5-VL Performance++
+### 2.4 Multi-Modal Model Support
 
 
 ---
 
-### 2.5 MoE Performance++
-
-
----
-
-### 2.6 Data Parallelism (DP)
+### 2.5 Data Parallelism (DP)
 
 Supports data parallelism on Intel XPU with near-linear scaling.
 
@@ -164,7 +159,15 @@ To enable data parallelism, add:
 
 ---
 
-## 3. Troubleshooting
+### 2.6 Maximum Context Length Support
+
+---
+
+## 3. Supported Models
+
+--- 
+
+## 4. Troubleshooting
 
 
 
