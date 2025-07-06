@@ -104,5 +104,7 @@ ENV VLLM_USAGE_SOURCE=production-docker-image
 ENV TRITON_XPU_PROFILE=1
 
 # install development dependencies (for testing)
-RUN python3 -m pip install -e tests/vllm_test_utils
+RUN cd /llm/vllm && \
+    python3 -m pip install -e tests/vllm_test_utils
+    
 ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
