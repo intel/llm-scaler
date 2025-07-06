@@ -84,7 +84,7 @@ RUN git clone https://github.com/oneapi-src/oneCCL.git && \
 # Cleanup patch file
 RUN rm -rf /tmp/*
 
-# Configure environment to source oneAPI and modify LD_LIBRARY_PATH
+# Configure environment to source oneAPI
 RUN echo "source /opt/intel/oneapi/setvars.sh --force" >> /root/.bashrc
 
 SHELL ["bash", "-c"]
