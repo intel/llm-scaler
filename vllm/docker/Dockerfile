@@ -81,14 +81,14 @@ RUN git clone https://github.com/oneapi-src/oneCCL.git && \
     cd /opt/intel/oneapi/ccl/ && \
     ln -snf 2021.15.3 latest
 
-WORKDIR /llm/vllm
-
 # Cleanup patch file
 RUN rm -rf /tmp/*
 
-CMD ["/bin/bash"]
+# Configure environment to source oneAPI and modify LD_LIBRARY_PATH
+RUN echo "source /opt/intel/oneapi/setvars.sh --force && export LD_LIBRARY_PATH=\$(echo \$LD_LIBRARY_PATH | tr ':' '\n' | grep -v '/opt/intel/oneapi/dnnl' | tr '\n' ':' | sed 's/:$//')" >> /root/.bashrc
 
-
+SHELL ["bash", "-c"]
+CMD ["bash", "-c", "source /root/.bashrc && exec bash"]
 
 # ======== OpenAI Serving Stage ========
 FROM vllm-base AS vllm-openai
@@ -97,8 +97,7 @@ ARG http_proxy
 ARG https_proxy
 
 # install additional dependencies for openai api server
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install accelerate hf_transfer 'modelscope!=1.15.0'
+RUN pip install accelerate hf_transfer 'modelscope!=1.15.0'
 
 # Set additional environment for production usage
 ENV VLLM_USAGE_SOURCE=production-docker-image
