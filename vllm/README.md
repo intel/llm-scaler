@@ -131,7 +131,65 @@ export CCL_TOPO_P2P_ACCESS=0  # USM mode
 
 ### 2.3 Embedding and Reranker Model Support
 
+#### Start service using V0 engine
+```bash
+TORCH_LLM_ALLREDUCE=1 \
+VLLM_USE_V1=0 \
+CCL_ZE_IPC_EXCHANGE=pidfd \
+VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+python3 -m vllm.entrypoints.openai.api_server \
+    --model /llm/models/bge-reranker-large \
+    --served-model-name bge-reranker-larg \
+    --task embed \
+    --dtype=float16 \
+    --device=xpu \
+    --enforce-eager \
+    --port 8000 \
+    --host 0.0.0.0 \
+    --trust-remote-code \
+    --disable-sliding-window \
+    --gpu-memory-util=0.9 \
+    --no-enable-prefix-caching \
+    --max-num-batched-tokens=2048 \
+    --disable-log-requests \
+    --max-model-len=2048 \
+    --block-size 16 \
+    --quantization fp8 \
+    -tp=1
+```
 
+After starting the vLLM service, you can follow these two links to use it.
+#### [rerank api](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#re-rank-api)
+
+'''bash
+curl -X 'POST' \
+  'http://127.0.0.1:8000/v1/rerank' \
+  -H 'accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "model": "bge-reranker-large",
+  "query": "What is the capital of France?",
+  "documents": [
+    "The capital of Brazil is Brasilia.",
+    "The capital of France is Paris.",
+    "Horses and cows are both animals.",
+    "The French have a rich tradition in engineering."
+  ]
+}'
+'''
+
+#### [embedding](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#embeddings-api_1)
+
+'''bash
+curl http://localhost:8000/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": ["需要嵌入文本1","这是第二个句子"],
+    "model": "bge-large",
+    "encoding_format": "float"
+  }'
+'''
 ---
 
 ### 2.4 Multi-Modal Model Support
