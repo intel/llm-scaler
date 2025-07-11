@@ -207,7 +207,7 @@ python3 -m vllm.entrypoints.openai.api_server \
 ### 1.4 Benchmarking the Service
 
 ```bash
-python3 benchmarks/benchmark_serving.py \
+python3 /llm/vllm/benchmarks/benchmark_serving.py \
     --model /llm/models/DeepSeek-R1-Distill-Qwen-7B \
     --dataset-name random \
     --random-input-len=1024 \
