@@ -29,7 +29,7 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
 First, pull the image:
 
 ```bash
-docker pull amr-registry.caas.intel.com/intelanalytics/llm-scaler-vllm:0.0.1
+docker pull intel/llm-scaler-vllm:latest
 ````
 
 Then, run the container:
@@ -46,7 +46,7 @@ sudo docker run -td \
     -e https_proxy=$https_proxy \
     --shm-size="32g" \
     --entrypoint /bin/bash \
-    amr-registry.caas.intel.com/intelanalytics/llm-scaler-vllm:0.0.1
+    intel/llm-scaler-vllm:latest
 ```
 
 Enter the container:
