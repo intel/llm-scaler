@@ -160,9 +160,9 @@ python3 -m vllm.entrypoints.openai.api_server \
 ```
 
 After starting the vLLM service, you can follow these two links to use it.
-#### [rerank api](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#re-rank-api)
+#### [Rerank api](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#re-rank-api)
 
-'''bash
+```bash
 curl -X 'POST' \
   'http://127.0.0.1:8000/v1/rerank' \
   -H 'accept: application/json' \
@@ -177,11 +177,11 @@ curl -X 'POST' \
     "The French have a rich tradition in engineering."
   ]
 }'
-'''
+```
 
-#### [embedding](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#embeddings-api_1)
+#### [Embedding api](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#embeddings-api_1)
 
-'''bash
+```bash
 curl http://localhost:8000/v1/embeddings \
   -H "Content-Type: application/json" \
   -d '{
@@ -189,12 +189,68 @@ curl http://localhost:8000/v1/embeddings \
     "model": "bge-large",
     "encoding_format": "float"
   }'
-'''
+```
 ---
 
 ### 2.4 Multi-Modal Model Support
 
+#### Start service using V1 engine
+```bash
+TORCH_LLM_ALLREDUCE=1 \
+VLLM_USE_V1=1 \
+CCL_ZE_IPC_EXCHANGE=pidfd \
+VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+python3 -m vllm.entrypoints.openai.api_server \
+    --model /llm/models/Qwen2.5-VL-7B-Instruct \
+    --served-model-name Qwen2.5-VL-7B-Instruct \
+    --allowed-local-media-path /llm/models/test \
+    --dtype=float16 \
+    --device=xpu \
+    --enforce-eager \
+    --port 8000 \
+    --host 0.0.0.0 \
+    --trust-remote-code \
+    --disable-sliding-window \
+    --gpu-memory-util=0.9 \
+    --no-enable-prefix-caching \
+    --max-num-batched-tokens=5120 \
+    --disable-log-requests \
+    --max-model-len=5120 \
+    --block-size 16 \
+    --quantization fp8 \
+    -tp=1
+```
 
+After starting the vLLM service, you can follow this link to use it
+
+#### [Multimodal input](https://docs.vllm.ai/en/latest/features/multimodal_inputs.html#online-serving)
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen2.5-VL-7B-Instruct",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "图片里有什么?"
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "http://farm6.staticflickr.com/5268/5602445367_3504763978_z.jpg"
+            }
+          }
+        ]
+      }
+    ],
+    "max_tokens": 128
+  }'
+```
 ---
 
 ### 2.5 Data Parallelism (DP)
