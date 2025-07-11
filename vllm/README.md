@@ -140,7 +140,7 @@ VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
 python3 -m vllm.entrypoints.openai.api_server \
     --model /llm/models/bge-reranker-large \
-    --served-model-name bge-reranker-larg \
+    --served-model-name bge-reranker-large \
     --task embed \
     --dtype=float16 \
     --device=xpu \
@@ -186,7 +186,7 @@ curl http://localhost:8000/v1/embeddings \
   -H "Content-Type: application/json" \
   -d '{
     "input": ["需要嵌入文本1","这是第二个句子"],
-    "model": "bge-large",
+    "model": "bge-m3",
     "encoding_format": "float"
   }'
 ```
@@ -211,7 +211,6 @@ python3 -m vllm.entrypoints.openai.api_server \
     --port 8000 \
     --host 0.0.0.0 \
     --trust-remote-code \
-    --disable-sliding-window \
     --gpu-memory-util=0.9 \
     --no-enable-prefix-caching \
     --max-num-batched-tokens=5120 \
@@ -281,12 +280,26 @@ To enable data parallelism, add:
 
 | Model Name        | Category         | Notes                          |
 |-------------------|------------------|---------------------------------|
-|                   |                  |                                 |
-|                   |                  |                                 |
-|                   |                  |                                 |
-|                   |                  |                                 |
-|                   |                  |                                 |
-
+|       DeepSeek-R1-0528-Qwen3-8B   |        language model             |                                 |
+|       DeepSeek-R1-Distill-1.5B/7B/8B/14B/32B/70B             |         language model         |                                 |
+|       Qwen3-8B/14B/32B            |        language model             |                                 |
+|       QwQ-32B                     |        language model             |                                 |
+|       Ministral-8B                |        language model             |                                 |
+|       Llama3.1-8B/Llama3.1-70B    |        language model             |                                 |
+|       Baichuan2-7B/13B            |        language model             |                                 |
+|       codegeex4-all-9b            |        language model             |                                 |
+|       DeepSeek-Coder-33B          |        language model             |                                 |
+|       Qwen3-30B-A3B               |        language model             |                                 |
+|       Qwen2-VL-7B-Instruct        |        multimodal model           |                                 |
+|       MiniCPM-V-2.6               |        multimodal model           |                                 |
+|       Qwen2.5-VL 7B/32B/72B       |        multimodal model           | pip install transformers==4.52.4       |
+|       UI-TARS-7B-DPO              |        multimodal model           | pip install transformers==4.49.0       |
+|       Gemma-3-12B                 |        multimodal model           | only can run bf16 with no quantization |
+|       GLM-4V-9B                   |        multimodal model           | only can run with four cards           |
+|       Qwen3-Embedding             |        Embedding                  |                                 |
+|       bge-large, bge-m3           |        Embedding                  |                                 |
+|       Qwen3-Reranker              |        Rerank                     |                                 |
+|       bge-reranker-large, bge-reranker-v2-m3 |  Rerank                |                                 |
 --- 
 
 ## 4. Troubleshooting
