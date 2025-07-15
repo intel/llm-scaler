@@ -102,6 +102,7 @@ RUN pip install accelerate hf_transfer 'modelscope!=1.15.0'
 # Set additional environment for production usage
 ENV VLLM_USAGE_SOURCE=production-docker-image
 ENV TRITON_XPU_PROFILE=1
+ENV VLLM_QUANTIZE_Q40_LIB="/usr/local/lib/python3.10/dist-packages/vllm_int4_for_multi_arc.so"
 
 # install development dependencies (for testing)
 RUN cd /llm/vllm && \
