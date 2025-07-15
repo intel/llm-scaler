@@ -106,6 +106,7 @@ ENV VLLM_QUANTIZE_Q40_LIB="/usr/local/lib/python3.10/dist-packages/vllm_int4_for
 
 # install development dependencies (for testing)
 RUN cd /llm/vllm && \
-    python3 -m pip install -e tests/vllm_test_utils
+    python3 -m pip install -e tests/vllm_test_utils && \
+    pip install bigdl-core
     
 ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
