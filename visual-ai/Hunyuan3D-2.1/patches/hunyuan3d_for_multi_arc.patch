@@ -1,0 +1,1347 @@
+diff --git a/demo.py b/demo.py
+index cdb0a0a..4e1aade 100644
+--- a/demo.py
++++ b/demo.py
+@@ -6,6 +6,8 @@ from PIL import Image
+ from hy3dshape.rembg import BackgroundRemover
+ from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
+ 
++from xpu_convert import convert_to_xpu
++convert_to_xpu()
+ 
+ from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
+ 
+@@ -44,4 +46,4 @@ output_mesh_path = paint_pipeline(
+     mesh_path = "demo.glb", 
+     image_path = 'assets/demo.png',
+     output_mesh_path = output_mesh_path
+-)
++)
+\ No newline at end of file
+diff --git a/demo_shape.py b/demo_shape.py
+new file mode 100644
+index 0000000..ef540a7
+--- /dev/null
++++ b/demo_shape.py
+@@ -0,0 +1,80 @@
++import sys
++sys.path.insert(0, './hy3dshape')
++sys.path.insert(0, './hy3dpaint')
++import time
++from PIL import Image
++from hy3dshape.rembg import BackgroundRemover
++from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
++
++import torch
++from torch import nn
++
++# import intel_extension_for_pytorch
++
++import math
++_original_layer_norm_forward = nn.LayerNorm.forward
++
++def _new_layer_norm_forward(self, hidden_states: torch.Tensor):
++    if (
++        hidden_states.device.type == 'xpu' and 
++        hidden_states.dtype in (torch.float, torch.half) and
++        self.weight is not None
++    ):
++        # try:
++        import bigdl_core
++        hidden_size = math.prod(self.normalized_shape)
++        x_2d = hidden_states.reshape(-1, hidden_size).contiguous()
++        output = bigdl_core.layer_norm(x_2d, self.weight, self.bias, self.eps)
++        return output.reshape(hidden_states.shape)
++
++        # import intel_extension_for_pytorch.ipex.llm.functional as ipex_test
++
++        # hidden_states = ipex_test.fast_layer_norm(
++        #     hidden_states,
++        #     self.normalized_shape,
++        #     self.weight,
++        #     self.bias,
++        #     self.eps,
++        # )
++        return hidden_states
++        # except ImportError:
++        #     return _original_layer_norm_forward(self, hidden_states)
++    else:
++        print(hidden_states.dtype)
++        return _original_layer_norm_forward(self, hidden_states)
++
++nn.LayerNorm.forward = _new_layer_norm_forward
++
++from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
++
++try:
++    from torchvision_fix import apply_fix
++    apply_fix()
++except ImportError:
++    print("Warning: torchvision_fix module not found, proceeding without compatibility fix")                                      
++except Exception as e:
++    print(f"Warning: Failed to apply torchvision fix: {e}")
++
++from torch.profiler import profile, record_function, ProfilerActivity
++activities = [ProfilerActivity.CPU, ProfilerActivity.XPU]
++
++# # shape
++start_time = time.perf_counter()
++model_path = '/llm/models/Hunyuan3D-2.1/'
++pipeline_shapegen = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path)
++image_path = 'assets/demo.png'
++image = Image.open(image_path).convert("RGBA")
++if image.mode == 'RGB':
++    rembg = BackgroundRemover()
++    image = rembg(image)
++# image = ["/llm/workspace/chair_images_test/Picture1.png",
++#         "/llm/workspace/chair_images_test/Picture2.png",
++#         "/llm/workspace/chair_images_test/Picture3.png",]
++
++# with profile(activities=activities, record_shapes=False) as prof:
++mesh = pipeline_shapegen(image=image)[0]
++mesh.export('demo.glb')
++end_time = time.perf_counter()
++print("Shape generation time: {:.2f} seconds".format(end_time - start_time))
++
++# print(prof.key_averages().table(sort_by="self_xpu_time_total", row_limit=-1))
+diff --git a/demo_texture.py b/demo_texture.py
+new file mode 100644
+index 0000000..085bd3d
+--- /dev/null
++++ b/demo_texture.py
+@@ -0,0 +1,55 @@
++import sys
++sys.path.insert(0, './hy3dshape')
++sys.path.insert(0, './hy3dpaint')
++import time
++from PIL import Image
++from hy3dshape.rembg import BackgroundRemover
++from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
++
++import torch
++from torch import nn
++import torch.nn.functional as F
++from diffusers.models.attention_processor import AttnProcessor2_0, Attention
++from typing import Callable, List, Optional, Tuple, Union
++
++from xpu_convert import convert_to_xpu
++convert_to_xpu()
++
++from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
++
++try:
++    from torchvision_fix import apply_fix
++    apply_fix()
++except ImportError:
++    print("Warning: torchvision_fix module not found, proceeding without compatibility fix")                                      
++except Exception as e:
++    print(f"Warning: Failed to apply torchvision fix: {e}")
++
++from torch.profiler import profile, record_function, ProfilerActivity
++activities = [ProfilerActivity.CPU, ProfilerActivity.XPU]
++
++# # paint
++start_time = time.perf_counter()
++max_num_view = 6  # can be 6 to 9
++resolution = 512  # can be 768 or 512
++conf = Hunyuan3DPaintConfig(max_num_view, resolution)
++conf.realesrgan_ckpt_path = "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"
++conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
++conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
++paint_pipeline = Hunyuan3DPaintPipeline(conf)
++
++output_mesh_path = 'demo_textured.glb'
++# with profile(activities=activities, record_shapes=False) as prof:
++#     output_mesh_path = paint_pipeline(
++#         mesh_path = "demo.glb", 
++#         image_path = 'assets/demo.png',
++#         output_mesh_path = output_mesh_path
++#     )
++# print(prof.key_averages().table(sort_by="self_xpu_time_total", row_limit=-1))
++output_mesh_path = paint_pipeline(
++    mesh_path = "demo.glb", 
++    image_path = 'assets/demo.png',
++    output_mesh_path = output_mesh_path
++)
++end_time = time.perf_counter()
++print("Texture generation time: {:.2f} seconds".format(end_time - start_time))
+\ No newline at end of file
+diff --git a/gradio_app.py b/gradio_app.py
+index 47ec574..fc33d19 100644
+--- a/gradio_app.py
++++ b/gradio_app.py
+@@ -395,7 +395,7 @@ def generation_all(
+                                                          height=HTML_HEIGHT, 
+                                                          width=HTML_WIDTH, textured=True)
+     if args.low_vram_mode:
+-        torch.cuda.empty_cache()
++        torch.xpu.empty_cache()
+     return (
+         gr.update(value=path),
+         gr.update(value=glb_path_textured),
+@@ -442,7 +442,7 @@ def shape_generation(
+     path = export_mesh(mesh, save_folder, textured=False)
+     model_viewer_html = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH)
+     if args.low_vram_mode:
+-        torch.cuda.empty_cache()
++        torch.xpu.empty_cache()
+     return (
+         gr.update(value=path),
+         model_viewer_html,
+@@ -739,7 +739,7 @@ if __name__ == '__main__':
+     parser.add_argument("--texgen_model_path", type=str, default='tencent/Hunyuan3D-2.1')
+     parser.add_argument('--port', type=int, default=8080)
+     parser.add_argument('--host', type=str, default='0.0.0.0')
+-    parser.add_argument('--device', type=str, default='cuda')
++    parser.add_argument('--device', type=str, default='xpu')
+     parser.add_argument('--mc_algo', type=str, default='mc')
+     parser.add_argument('--cache-path', type=str, default='./save_dir')
+     parser.add_argument('--enable_t23d', action='store_true')
+@@ -860,7 +860,7 @@ if __name__ == '__main__':
+     shutil.copytree('./assets/env_maps', os.path.join(static_dir, 'env_maps'), dirs_exist_ok=True)
+ 
+     if args.low_vram_mode:
+-        torch.cuda.empty_cache()
++        torch.xpu.empty_cache()
+     demo = build_app()
+     app = gr.mount_gradio_app(app, demo, path="/")
+     uvicorn.run(app, host=args.host, port=args.port)
+diff --git a/hunyuan3d-docker/Dockerfile b/hunyuan3d-docker/Dockerfile
+new file mode 100644
+index 0000000..8ad06fc
+--- /dev/null
++++ b/hunyuan3d-docker/Dockerfile
+@@ -0,0 +1,93 @@
++# Copyright (C) 2025 Intel Corporation
++# SPDX-License-Identifier: Apache-2.0
++
++# ======== Base Stage ========
++FROM intel/deep-learning-essentials:2025.0.2-0-devel-ubuntu24.04 AS vllm-base
++
++ARG https_proxy
++ARG http_proxy
++
++# Add Intel oneAPI repo and PPA for GPU support
++RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
++    echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list && \
++    add-apt-repository -y ppa:kobuk-team/intel-graphics-testing
++
++# Install dependencies and Python 3.10
++RUN apt-get update -y && \
++    apt-get install -y software-properties-common && \
++    add-apt-repository ppa:deadsnakes/ppa && \
++    apt-get update -y && \
++    apt-get install -y python3.10 python3.10-distutils python3.10-dev && \
++    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10 && \
++    apt-get install -y --no-install-recommends --fix-missing \
++        curl \
++        ffmpeg \
++        git \
++        libsndfile1 \
++        libsm6 \
++        libxext6 \
++        libgl1 \
++        lsb-release \
++        numactl \
++        wget \
++        vim \
++        linux-libc-dev && \
++    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
++    # Install Intel GPU runtime packages
++    apt-get update -y && \
++    apt-get install -y libze1 libze-dev libze-intel-gpu1 intel-opencl-icd libze-intel-gpu-raytracing && \
++    apt-get install -y intel-oneapi-dpcpp-ct=2025.0.1-17 && \
++    apt-get clean && rm -rf /var/lib/apt/lists/*
++
++WORKDIR /llm
++COPY ./patches/0001-oneccl-align-global-V0.1.1.patch /tmp/
++
++# Set environment variables early
++ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/local/lib/"
++
++# ======= Add oneCCL build =======
++RUN apt-get update && apt-get install -y \
++    cmake \
++    g++ \
++    && rm -rf /var/lib/apt/lists/*
++
++# Build 1ccl
++RUN git clone https://github.com/oneapi-src/oneCCL.git && \
++    cd oneCCL && \
++    git checkout def870543749186b6f38cdc865b44d52174c7492 && \
++    git apply /tmp/0001-oneccl-align-global-V0.1.1.patch && \
++    mkdir build && cd build && \
++    export IGC_VISAOptions=-activeThreadsOnlyBarrier && \
++    /usr/bin/cmake .. \
++        -DCMAKE_INSTALL_PREFIX=_install \
++        -DCMAKE_C_COMPILER=icx \
++        -DCMAKE_CXX_COMPILER=icpx \
++        -DCOMPUTE_BACKEND=dpcpp \
++        -DCCL_ENABLE_ARCB=1 && \
++    make -j && make install && \
++    mv _install /opt/intel/oneapi/ccl/2021.15.3 && \
++    cd /opt/intel/oneapi/ccl/ && \
++    ln -snf 2021.15.3 latest
++
++
++ENV LD_LIBRARY_PATH="/usr/local/lib/python3.11/dist-packages/open3d:$LD_LIBRARY_PATH"
++
++RUN pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/xpu && \
++    pip install bigdl-core-xe-all==2.7.0b20250625 && \
++    apt remove python3-blinker -y
++    
++RUN git clone -b test_0625 https://github.com/xiangyuT/Hunyuan3D-2.1.git && \
++    cd Hunyuan3D-2.1 && \
++    pip install -r requirements.txt && \
++    cd hy3dpaint/custom_rasterizer && \
++    pip install --upgrade setuptools>=64 && \
++    export LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/torch/lib:$LD_LIBRARY_PATH && \
++    export CPATH=/usr/include:/usr/local/lib/python3.10/dist-packages/torch/include/:$CPATH && \
++    python3 setup.py install && \
++    cd ../.. && \
++    cd hy3dpaint/DifferentiableRenderer && \
++    bash compile_mesh_painter.sh && \
++    cd ../.. && \
++    wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth -P hy3dpaint/ckpt
++
++WORKDIR /llm/Hunyuan3D-2.1
+diff --git a/hunyuan3d-docker/README.md b/hunyuan3d-docker/README.md
+new file mode 100644
+index 0000000..e69de29
+diff --git a/hunyuan3d-docker/build.sh b/hunyuan3d-docker/build.sh
+new file mode 100644
+index 0000000..0640864
+--- /dev/null
++++ b/hunyuan3d-docker/build.sh
+@@ -0,0 +1,2 @@
++set -x
++docker build . -t intelanalytics/hunyuan3d-2.1:0701 --build-arg https_proxy=http://proxy.iil.intel.com:911 --build-arg http_proxy=http://proxy.iil.intel.com:911
+\ No newline at end of file
+diff --git a/hunyuan3d-docker/patches/0001-oneccl-align-global-V0.1.1.patch b/hunyuan3d-docker/patches/0001-oneccl-align-global-V0.1.1.patch
+new file mode 100644
+index 0000000..8f8a987
+--- /dev/null
++++ b/hunyuan3d-docker/patches/0001-oneccl-align-global-V0.1.1.patch
+@@ -0,0 +1,125 @@
++From 7f7a3d65541828d9889bfdec799bc23339e8e520 Mon Sep 17 00:00:00 2001
++From: YongZhuIntel <yong.zhu@intel.com>
++Date: Wed, 21 May 2025 09:37:06 +0800
++Subject: [PATCH] oneccl align global V0.1.1
++
++base on public branch release/ccl_2021.15.3-arc(def870543749186b6f38cdc865b44d52174c7492)
++
++Build:
++       1. mkdir build; cd build
++       2. source /opt/intel/oneapi/setvars.sh
++       3. export IGC_VISAOptions=-activeThreadsOnlyBarrier
++       4. cmake .. -DCMAKE_INSTALL_PREFIX=_install -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCOMPUTE_BACKEND=dpcpp -DCCL_ENABLE_ARCB=1 && make -j && make install
++
++print bandwidth in benchmark
++---
++ examples/benchmark/include/benchmark.hpp | 40 +++++++++++++++++++++---
++ examples/benchmark/src/benchmark.cpp     |  7 +++--
++ 2 files changed, 41 insertions(+), 6 deletions(-)
++
++diff --git a/examples/benchmark/include/benchmark.hpp b/examples/benchmark/include/benchmark.hpp
++index 08a3625..bff6275 100644
++--- a/examples/benchmark/include/benchmark.hpp
+++++ b/examples/benchmark/include/benchmark.hpp
++@@ -377,7 +377,9 @@ void store_to_csv(const user_options_t& options,
++                   double max_time,
++                   double avg_time,
++                   double stddev,
++-                  double wait_avg_time) {
+++                  double wait_avg_time,
+++		  double algbw,
+++		  double busbw) {
++     std::ofstream csvf;
++     csvf.open(options.csv_filepath, std::ofstream::out | std::ofstream::app);
++ 
++@@ -396,7 +398,7 @@ void store_to_csv(const user_options_t& options,
++                  << "," << ccl::get_datatype_size(dtype) << "," << elem_count << ","
++                  << ccl::get_datatype_size(dtype) * elem_count << "," << buf_count << ","
++                  << iter_count << "," << min_time << "," << max_time << "," << avg_time << ","
++-                 << stddev << "," << wait_avg_time << std::endl;
+++                 << stddev << "," << wait_avg_time << "," << algbw << "," << busbw << std::endl;
++         }
++         csvf.close();
++     }
++@@ -472,13 +474,41 @@ void print_timings(const ccl::communicator& comm,
++         max_time /= iter_count;
++ 
++         size_t bytes = elem_count * ccl::get_datatype_size(dtype) * buf_count;
+++
+++        double algbw = bytes*1000/total_avg_time/1024/1024;
+++
+++         if (ncolls == 1) {
+++             if (options.coll_names.front() == "allgather" ||
+++                 options.coll_names.front() == "allgatherv" ||
+++                 options.coll_names.front() == "reducescatter" ||
+++                 options.coll_names.front() == "alltoall" ||
+++                 options.coll_names.front() == "alltoallv") {
+++                 algbw = algbw * nranks;
+++            }
+++         }
+++
+++        double busbw = algbw;
+++        if (ncolls == 1) {
+++            if (options.coll_names.front() == "allreduce") {
+++                busbw = algbw * 2 * (nranks -1) / nranks;
+++            } else if (options.coll_names.front() == "allgather" ||
+++                options.coll_names.front() == "allgatherv" ||
+++                options.coll_names.front() == "reducescatter" ||
+++                options.coll_names.front() == "alltoall" ||
+++                options.coll_names.front() == "alltoallv") {
+++                busbw = algbw * (nranks -1) / nranks;
+++           }
+++        }
+++
++         std::stringstream ss;
++         ss << std::right << std::fixed << std::setw(COL_WIDTH) << bytes << std::setw(COL_WIDTH)
++            << elem_count * buf_count << std::setw(COL_WIDTH) << iter_count << std::setw(COL_WIDTH)
++            << std::setprecision(COL_PRECISION) << min_time << std::setw(COL_WIDTH)
++            << std::setprecision(COL_PRECISION) << max_time << std::setw(COL_WIDTH)
++            << std::setprecision(COL_PRECISION) << total_avg_time << std::setw(COL_WIDTH - 3)
++-           << std::setprecision(COL_PRECISION) << stddev << std::setw(COL_WIDTH + 3);
+++           << std::setprecision(COL_PRECISION) << stddev << std::setw(COL_WIDTH)
+++	   << std::setprecision(COL_PRECISION) << algbw << std::setw(COL_WIDTH)
+++	   << std::setprecision(COL_PRECISION) << busbw << std::setw(COL_WIDTH + 3);
++ 
++         if (show_extened_info(options.show_additional_info)) {
++             ss << std::right << std::fixed << std::setprecision(COL_PRECISION) << wait_avg_time;
++@@ -497,7 +527,9 @@ void print_timings(const ccl::communicator& comm,
++                          max_time,
++                          total_avg_time,
++                          stddev,
++-                         wait_avg_time);
+++                         wait_avg_time,
+++			 algbw,
+++			 busbw);
++         }
++     }
++ 
++diff --git a/examples/benchmark/src/benchmark.cpp b/examples/benchmark/src/benchmark.cpp
++index d90fb9b..78957f2 100644
++--- a/examples/benchmark/src/benchmark.cpp
+++++ b/examples/benchmark/src/benchmark.cpp
++@@ -105,7 +105,8 @@ void run(ccl::communicator& service_comm,
++                    << "#elem_count" << std::setw(COL_WIDTH) << "#repetitions"
++                    << std::setw(COL_WIDTH) << "t_min[usec]" << std::setw(COL_WIDTH) << "t_max[usec]"
++                    << std::setw(COL_WIDTH) << "t_avg[usec]" << std::setw(COL_WIDTH - 3)
++-                   << "stddev[%]";
+++                   << "stddev[%]" << std::setw(COL_WIDTH) << "algbw[GB/s]" << std::setw(COL_WIDTH)
+++		   << "busbw[GB/s]";
++ 
++                 if (show_extened_info(options.show_additional_info)) {
++                     ss << std::right << std::setw(COL_WIDTH + 3) << "wait_t_avg[usec]";
++@@ -435,7 +436,9 @@ int main(int argc, char* argv[]) {
++              << "t_max[usec],"
++              << "t_avg[usec],"
++              << "stddev[%],"
++-             << "wait_t_avg[usec]" << std::endl;
+++             << "wait_t_avg[usec],"
+++             << "algbw[GB/s],"
+++             << "busbw[GB/s]" << std::endl;
++         csvf.close();
++     }
++ 
++-- 
++2.25.1
++
+diff --git a/hy3dpaint/DifferentiableRenderer/MeshRender.py b/hy3dpaint/DifferentiableRenderer/MeshRender.py
+index 83c8cf8..a0acf9a 100644
+--- a/hy3dpaint/DifferentiableRenderer/MeshRender.py
++++ b/hy3dpaint/DifferentiableRenderer/MeshRender.py
+@@ -334,7 +334,7 @@ class MeshRender:
+         raster_mode="cr",
+         shader_type="face",
+         use_opengl=False,
+-        device="cuda",
++        device="xpu",
+     ):
+         """
+         Initialize mesh renderer with configurable parameters.
+diff --git a/hy3dpaint/DifferentiableRenderer/compile_mesh_painter.sh b/hy3dpaint/DifferentiableRenderer/compile_mesh_painter.sh
+index cf24fb3..b9bae56 100755
+--- a/hy3dpaint/DifferentiableRenderer/compile_mesh_painter.sh
++++ b/hy3dpaint/DifferentiableRenderer/compile_mesh_painter.sh
+@@ -1 +1 @@
+-c++ -O3 -Wall -shared -std=c++11 -fPIC `python -m pybind11 --includes` mesh_inpaint_processor.cpp -o mesh_inpaint_processor`python3-config --extension-suffix`
+\ No newline at end of file
++c++ -O3 -Wall -shared -std=c++11 -fPIC `python3 -m pybind11 --includes` mesh_inpaint_processor.cpp -o mesh_inpaint_processor`python3.10-config --extension-suffix`
+\ No newline at end of file
+diff --git a/hy3dpaint/custom_rasterizer/custom_rasterizer/render.py b/hy3dpaint/custom_rasterizer/custom_rasterizer/render.py
+index 9d06b51..dcbdc7c 100644
+--- a/hy3dpaint/custom_rasterizer/custom_rasterizer/render.py
++++ b/hy3dpaint/custom_rasterizer/custom_rasterizer/render.py
+@@ -15,12 +15,136 @@
+ import custom_rasterizer_kernel
+ import torch
+ 
++import torch.nn.functional as F
++
++def rasterize_image_torch(V, F, D, width, height, occlusion_truncation, use_depth_prior):
++    device = V.device
++    num_faces = F.shape[0]
++    MAXINT = 1 << 18
++    max_token = (MAXINT * MAXINT) + (MAXINT - 1)
++    
++    # 初始化zbuffer和输出张量
++    zbuffer = torch.full((height * width,), max_token, dtype=torch.int64, device=device)
++    findices = torch.zeros((height, width), dtype=torch.int32, device=device)
++    barycentric = torch.zeros((height, width, 3), dtype=torch.float32, device=device)
++    
++    # 投影顶点到屏幕空间
++    def project_vertex(v):
++        x = (v[0] / v[3] * 0.5 + 0.5) * (width - 1) + 0.5
++        y = (0.5 + 0.5 * v[1] / v[3]) * (height - 1) + 0.5
++        z = v[2] / v[3] * 0.49999 + 0.5
++        return torch.stack([x, y, z])
++    
++    # 计算重心坐标
++    def barycentric_coords(v0, v1, v2, p):
++        v0_xy, v1_xy, v2_xy = v0[:2], v1[:2], v2[:2]
++        denom = (v1_xy[1] - v2_xy[1]) * (v0_xy[0] - v2_xy[0]) + (v2_xy[0] - v1_xy[0]) * (v0_xy[1] - v2_xy[1])
++        w0 = ((v1_xy[1] - v2_xy[1]) * (p[0] - v2_xy[0]) + (v2_xy[0] - v1_xy[0]) * (p[1] - v2_xy[1])) / denom
++        w1 = ((v2_xy[1] - v0_xy[1]) * (p[0] - v2_xy[0]) + (v0_xy[0] - v2_xy[0]) * (p[1] - v2_xy[1])) / denom
++        w2 = 1 - w0 - w1
++        return torch.stack([w0, w1, w2])
++    
++    # 遍历所有三角形
++    for f_idx in range(num_faces):
++        v0_idx, v1_idx, v2_idx = F[f_idx]
++        v0 = V[v0_idx]
++        v1 = V[v1_idx]
++        v2 = V[v2_idx]
++        
++        # 投影顶点
++        vt0 = project_vertex(v0)
++        vt1 = project_vertex(v1)
++        vt2 = project_vertex(v2)
++        
++        # 计算三角形边界框
++        x_min = torch.floor(torch.min(torch.stack([vt0[0], vt1[0], vt2[0]]))).int()
++        x_max = torch.ceil(torch.max(torch.stack([vt0[0], vt1[0], vt2[0]]))).int()
++        y_min = torch.floor(torch.min(torch.stack([vt0[1], vt1[1], vt2[1]]))).int()
++        y_max = torch.ceil(torch.max(torch.stack([vt0[1], vt1[1], vt2[1]]))).int()
++        
++        # 限制在图像范围内
++        x_min = torch.clamp(x_min, 0, width - 1)
++        x_max = torch.clamp(x_max, 0, width - 1)
++        y_min = torch.clamp(y_min, 0, height - 1)
++        y_max = torch.clamp(y_max, 0, height - 1)
++        
++        # 遍历边界框内的所有像素
++        for y in range(y_min, y_max + 1):
++            for x in range(x_min, x_max + 1):
++                pixel_idx = y * width + x
++                p = torch.tensor([x + 0.5, y + 0.5], device=device)
++                
++                # 计算重心坐标
++                bary = barycentric_coords(vt0, vt1, vt2, p)
++                
++                # 检查像素是否在三角形内
++                if (bary >= 0).all():
++                    # 计算深度值
++                    depth = torch.dot(bary, torch.stack([vt0[2], vt1[2], vt2[2]]))
++                    
++                    # 应用深度先验（如果启用）
++                    if use_depth_prior and D is not None:
++                        depth_thres = D.view(height, width)[y, x] * 0.49999 + 0.5 + occlusion_truncation
++                        if depth < depth_thres:
++                            continue
++                    
++                    # 量化深度值
++                    z_quantize = int(depth.item() * (2 << 17))
++                    token = z_quantize * MAXINT + (f_idx + 1)
++                    
++                    # 更新zbuffer
++                    if token < zbuffer[pixel_idx]:
++                        zbuffer[pixel_idx] = token
++    
++    # 第二遍：计算重心坐标图
++    for y in range(height):
++        for x in range(width):
++            pixel_idx = y * width + x
++            token = zbuffer[pixel_idx]
++            f_val = token % MAXINT
++            
++            if f_val == (MAXINT - 1):
++                findices[y, x] = 0
++                barycentric[y, x] = 0
++            else:
++                findices[y, x] = f_val
++                f_idx = f_val - 1
++                
++                if f_idx >= 0:
++                    v0_idx, v1_idx, v2_idx = F[f_idx]
++                    v0 = V[v0_idx]
++                    v1 = V[v1_idx]
++                    v2 = V[v2_idx]
++                    
++                    # 投影顶点（仅XY）
++                    vt0 = project_vertex(v0)[:2]
++                    vt1 = project_vertex(v1)[:2]
++                    vt2 = project_vertex(v2)[:2]
++                    
++                    # 计算重心坐标
++                    p = torch.tensor([x + 0.5, y + 0.5], device=device)
++                    bary = barycentric_coords(vt0, vt1, vt2, p)
++                    
++                    # 应用透视校正
++                    bary = bary / torch.stack([v0[3], v1[3], v2[3]])
++                    bary /= bary.sum()
++                    
++                    barycentric[y, x] = bary
++    
++    return findices, barycentric
+ 
+ def rasterize(pos, tri, resolution, clamp_depth=torch.zeros(0), use_depth_prior=0):
+     assert pos.device == tri.device
++    pos_cpu = pos[0].cpu()
++    tri_cpu = tri.cpu()
+     findices, barycentric = custom_rasterizer_kernel.rasterize_image(
+-        pos[0], tri, clamp_depth, resolution[1], resolution[0], 1e-6, use_depth_prior
++        pos_cpu, tri_cpu, clamp_depth, resolution[1], resolution[0], 1e-6, use_depth_prior
+     )
++    findices = findices.to(pos.device)
++    barycentric = barycentric.to(pos.device)
++    # findices, barycentric = rasterize_image_torch(
++    #     pos[0], tri, clamp_depth, resolution[1], resolution[0], 1e-6, use_depth_prior
++    # )
+     return findices, barycentric
+ 
+ 
+diff --git a/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.cpp b/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.cpp
+index b3ff69f..dedde93 100644
+--- a/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.cpp
++++ b/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.cpp
+@@ -128,8 +128,8 @@ std::vector<torch::Tensor> rasterize_image(torch::Tensor V, torch::Tensor F, tor
+     int device_id = V.get_device();
+     if (device_id == -1)
+         return rasterize_image_cpu(V, F, D, width, height, occlusion_truncation, use_depth_prior);
+-    else
+-        return rasterize_image_gpu(V, F, D, width, height, occlusion_truncation, use_depth_prior);
++    // else
++    //     return rasterize_image_gpu(V, F, D, width, height, occlusion_truncation, use_depth_prior);
+ }
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+diff --git a/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.h b/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.h
+index cf4f987..1b90ef0 100644
+--- a/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.h
++++ b/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.h
+@@ -4,16 +4,16 @@
+ #include <torch/extension.h>
+ #include <vector>
+ #include <ATen/ATen.h>
+-#include <ATen/cuda/CUDAContext.h> // For CUDA context
++// #include <ATen/cuda/CUDAContext.h> // For CUDA context
+ 
+ #define INT64 unsigned long long
+ #define MAXINT 2147483647
+ 
+-__host__ __device__ inline float calculateSignedArea2(float* a, float* b, float* c) {
++inline float calculateSignedArea2(float* a, float* b, float* c) {
+     return ((c[0] - a[0]) * (b[1] - a[1]) - (b[0] - a[0]) * (c[1] - a[1]));
+ }
+ 
+-__host__ __device__  inline void calculateBarycentricCoordinate(float* a, float* b, float* c, float* p,
++inline void calculateBarycentricCoordinate(float* a, float* b, float* c, float* p,
+     float* barycentric)
+ {
+     float beta_tri = calculateSignedArea2(a, p, c);
+@@ -34,14 +34,14 @@ __host__ __device__  inline void calculateBarycentricCoordinate(float* a, float*
+     barycentric[2] = gamma;
+ }
+ 
+-__host__ __device__  inline bool isBarycentricCoordInBounds(float* barycentricCoord) {
++inline bool isBarycentricCoordInBounds(float* barycentricCoord) {
+     return barycentricCoord[0] >= 0.0 && barycentricCoord[0] <= 1.0 &&
+            barycentricCoord[1] >= 0.0 && barycentricCoord[1] <= 1.0 &&
+            barycentricCoord[2] >= 0.0 && barycentricCoord[2] <= 1.0;
+ }
+ 
+-std::vector<torch::Tensor> rasterize_image_gpu(torch::Tensor V, torch::Tensor F, torch::Tensor D,
+-    int width, int height, float occlusion_truncation, int use_depth_prior);
++// std::vector<torch::Tensor> rasterize_image_gpu(torch::Tensor V, torch::Tensor F, torch::Tensor D,
++//     int width, int height, float occlusion_truncation, int use_depth_prior);
+ 
+ std::vector<std::vector<torch::Tensor>> build_hierarchy(std::vector<torch::Tensor> view_layer_positions, std::vector<torch::Tensor> view_layer_normals, int num_level, int resolution);
+ 
+diff --git a/hy3dpaint/custom_rasterizer/setup.py b/hy3dpaint/custom_rasterizer/setup.py
+index 15192e9..06f34fe 100644
+--- a/hy3dpaint/custom_rasterizer/setup.py
++++ b/hy3dpaint/custom_rasterizer/setup.py
+@@ -18,12 +18,12 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CppExtensio
+ 
+ # build custom rasterizer
+ 
+-custom_rasterizer_module = CUDAExtension(
++custom_rasterizer_module = CppExtension(
+     "custom_rasterizer_kernel",
+     [
+         "lib/custom_rasterizer_kernel/rasterizer.cpp",
+         "lib/custom_rasterizer_kernel/grid_neighbor.cpp",
+-        "lib/custom_rasterizer_kernel/rasterizer_gpu.cu",
++        # "lib/custom_rasterizer_kernel/rasterizer_gpu.cu",
+     ],
+ )
+ 
+diff --git a/hy3dpaint/hunyuanpaintpbr/pipeline.py b/hy3dpaint/hunyuanpaintpbr/pipeline.py
+index 871dae5..c02679d 100644
+--- a/hy3dpaint/hunyuanpaintpbr/pipeline.py
++++ b/hy3dpaint/hunyuanpaintpbr/pipeline.py
+@@ -242,7 +242,7 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
+                     if img.shape[2] > 3:
+                         alpha = img[:, :, 3:]
+                         img = img[:, :, :3] * alpha + bg_c * (1 - alpha)
+-                    img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).contiguous().half().to("cuda")
++                    img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).contiguous().half().to("xpu")
+                     view_imgs.append(img)
+                 view_imgs = torch.cat(view_imgs, dim=0)
+                 images_tensor.append(view_imgs.unsqueeze(0))
+diff --git a/hy3dpaint/hunyuanpaintpbr/unet/attn_processor.py b/hy3dpaint/hunyuanpaintpbr/unet/attn_processor.py
+index 37ebde0..6e4969a 100644
+--- a/hy3dpaint/hunyuanpaintpbr/unet/attn_processor.py
++++ b/hy3dpaint/hunyuanpaintpbr/unet/attn_processor.py
+@@ -747,7 +747,7 @@ class SelfAttnProcessor2_0(BaseAttnProcessor):
+         # Process each PBR setting
+         results = []
+         for token, pbr_hs in zip(self.pbr_setting, pbr_hidden_states):
+-            processed_hs = rearrange(pbr_hs, "b n_pbrs n l c -> (b n_pbrs n) l c").to("cuda:0")
++            processed_hs = rearrange(pbr_hs, "b n_pbrs n l c -> (b n_pbrs n) l c").to("xpu:0")
+             result = self.process_single(attn, processed_hs, None, attention_mask, temb, token, False)
+             results.append(result)
+ 
+diff --git a/hy3dpaint/hunyuanpaintpbr/unet/model.py b/hy3dpaint/hunyuanpaintpbr/unet/model.py
+index f98ca7e..e62db2f 100644
+--- a/hy3dpaint/hunyuanpaintpbr/unet/model.py
++++ b/hy3dpaint/hunyuanpaintpbr/unet/model.py
+@@ -143,7 +143,7 @@ class HunyuanPaint(pl.LightningModule):
+         self.register_buffer("sqrt_recipm1_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod - 1).float())
+ 
+     def on_fit_start(self):
+-        device = torch.device(f"cuda:{self.local_rank}")
++        device = torch.device(f"xpu:{self.local_rank}")
+         self.pipeline.to(device)
+         if self.global_rank == 0:
+             os.makedirs(os.path.join(self.logdir, "images_val"), exist_ok=True)
+diff --git a/hy3dpaint/textureGenPipeline.py b/hy3dpaint/textureGenPipeline.py
+index a582892..09bae41 100644
+--- a/hy3dpaint/textureGenPipeline.py
++++ b/hy3dpaint/textureGenPipeline.py
+@@ -17,6 +17,7 @@ import torch
+ import copy
+ import trimesh
+ import numpy as np
++import time
+ from PIL import Image
+ from typing import List
+ from DifferentiableRenderer.MeshRender import MeshRender
+@@ -36,7 +37,7 @@ diffusers_logging.set_verbosity(50)
+ 
+ class Hunyuan3DPaintConfig:
+     def __init__(self, max_num_view, resolution):
+-        self.device = "cuda"
++        self.device = "xpu"
+ 
+         self.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
+         self.custom_pipeline = "hunyuanpaintpbr"
+@@ -81,14 +82,46 @@ class Hunyuan3DPaintPipeline:
+             raster_mode=self.config.raster_mode,
+         )
+         self.view_processor = ViewProcessor(self.config, self.render)
+-        self.load_models()
+-
+-    def load_models(self):
+-        torch.cuda.empty_cache()
+-        self.models["super_model"] = imageSuperNet(self.config)
+-        self.models["multiview_model"] = multiviewDiffusionNet(self.config)
+-        print("Models Loaded.")
+ 
++    # def load_models(self):
++    #     torch.xpu.empty_cache()
++    #     self.models["super_model"] = imageSuperNet(self.config)
++    #     self.models["multiview_model"] = multiviewDiffusionNet(self.config)
++    #     print("Models Loaded.")
++
++    def load_super_model(self, target_device="xpu"):
++        """Load the image super-resolution model."""
++        if "super_model" not in self.models:
++            torch.xpu.empty_cache()
++            self.models["super_model"] = imageSuperNet(self.config)
++            self.models["super_model"].upsampler.model = self.models["super_model"].upsampler.model.to(target_device)
++            print("Super model loaded.")
++    
++    def load_multiview_model(self, target_device="xpu"):
++        """Load the multiview diffusion model."""
++        if "multiview_model" not in self.models:
++            torch.xpu.empty_cache()
++            if target_device != "xpu":
++                self.config.device = target_device
++            self.models["multiview_model"] = multiviewDiffusionNet(self.config)
++            print(self.models["multiview_model"].pipeline)
++            # self.models["multiview_model"].model = self.models["multiview_model"].model.to("xpu")
++            print("Multiview model loaded.")
++    
++    def unload_super_model(self):
++        """Unload the image super-resolution model."""
++        if "super_model" in self.models:
++            del self.models["super_model"]
++            torch.xpu.empty_cache()
++            print("Super model unloaded.")
++    
++    def unload_multiview_model(self):
++        """Unload the multiview diffusion model."""
++        if "multiview_model" in self.models:
++            del self.models["multiview_model"]
++            torch.xpu.empty_cache()
++            print("Multiview model unloaded.")
++        
+     @torch.no_grad()
+     def __call__(self, mesh_path=None, image_path=None, output_mesh_path=None, use_remesh=True, save_glb=True):
+         """Generate texture for 3D mesh using multiview diffusion"""
+@@ -120,6 +153,7 @@ class Hunyuan3DPaintPipeline:
+         self.render.load_mesh(mesh=mesh)
+ 
+         ########### View Selection #########
++        start_time = time.perf_counter()
+         selected_camera_elevs, selected_camera_azims, selected_view_weights = self.view_processor.bake_view_selection(
+             self.config.candidate_camera_elevs,
+             self.config.candidate_camera_azims,
+@@ -131,8 +165,12 @@ class Hunyuan3DPaintPipeline:
+             selected_camera_elevs, selected_camera_azims, use_abs_coor=True
+         )
+         position_maps = self.view_processor.render_position_multiview(selected_camera_elevs, selected_camera_azims)
++        
++        end_time = time.perf_counter()
++        print("View selection and rendering time: {:.2f} seconds".format(end_time - start_time))
+ 
+         ##########  Style  ###########
++        start_time = time.perf_counter()
+         image_caption = "high quality"
+         image_style = []
+         for image in image_prompt:
+@@ -143,8 +181,12 @@ class Hunyuan3DPaintPipeline:
+                 image = white_bg
+             image_style.append(image)
+         image_style = [image.convert("RGB") for image in image_style]
++        end_time = time.perf_counter()
++        print("Image style processing time: {:.2f} seconds".format(end_time - start_time))
+ 
+         ###########  Multiview  ##########
++        self.load_multiview_model()
++        start_time = time.perf_counter()
+         multiviews_pbr = self.models["multiview_model"](
+             image_style,
+             normal_maps + position_maps,
+@@ -152,7 +194,18 @@ class Hunyuan3DPaintPipeline:
+             custom_view_size=self.config.resolution,
+             resize_input=True,
+         )
++        end_time = time.perf_counter()
++        print("Multiview generation time: {:.2f} seconds".format(end_time - start_time))
++
++        ######### Clean and Move #######
++        start_time = time.perf_counter()
++        self.unload_multiview_model()
++        self.load_super_model(target_device=self.config.device)
++        end_time = time.perf_counter()
++        print("Model cleanup and transfer time: {:.2f} seconds".format(end_time - start_time))
++
+         ###########  Enhance  ##########
++        start_time = time.perf_counter()
+         enhance_images = {}
+         enhance_images["albedo"] = copy.deepcopy(multiviews_pbr["albedo"])
+         enhance_images["mr"] = copy.deepcopy(multiviews_pbr["mr"])
+@@ -160,8 +213,12 @@ class Hunyuan3DPaintPipeline:
+         for i in range(len(enhance_images["albedo"])):
+             enhance_images["albedo"][i] = self.models["super_model"](enhance_images["albedo"][i])
+             enhance_images["mr"][i] = self.models["super_model"](enhance_images["mr"][i])
++        end_time = time.perf_counter()
++        self.unload_super_model()
++        print("Image enhancement time: {:.2f} seconds".format(end_time - start_time))
+ 
+         ###########  Bake  ##########
++        start_time = time.perf_counter()
+         for i in range(len(enhance_images)):
+             enhance_images["albedo"][i] = enhance_images["albedo"][i].resize(
+                 (self.config.render_size, self.config.render_size)
+@@ -175,8 +232,11 @@ class Hunyuan3DPaintPipeline:
+             enhance_images["mr"], selected_camera_elevs, selected_camera_azims, selected_view_weights
+         )
+         mask_mr_np = (mask_mr.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
++        end_time = time.perf_counter()
++        print("Texture baking time: {:.2f} seconds".format(end_time - start_time))
+ 
+         ##########  inpaint  ###########
++        start_time = time.perf_counter()
+         texture = self.view_processor.texture_inpaint(texture, mask_np)
+         self.render.set_texture(texture, force_set=True)
+         if "mr" in enhance_images:
+@@ -184,6 +244,8 @@ class Hunyuan3DPaintPipeline:
+             self.render.set_texture_mr(texture_mr)
+ 
+         self.render.save_mesh(output_mesh_path, downsample=True)
++        end_time = time.perf_counter()
++        print("Mesh saving time: {:.2f} seconds".format(end_time - start_time))
+ 
+         if save_glb:
+             convert_obj_to_glb(output_mesh_path, output_mesh_path.replace(".obj", ".glb"))
+diff --git a/hy3dpaint/utils/multiview_utils.py b/hy3dpaint/utils/multiview_utils.py
+index 03f0557..74b82ae 100644
+--- a/hy3dpaint/utils/multiview_utils.py
++++ b/hy3dpaint/utils/multiview_utils.py
+@@ -40,6 +40,7 @@ class multiviewDiffusionNet:
+         )
+ 
+         model_path = os.path.join(model_path, "hunyuan3d-paintpbr-v2-1")
++        # model_path = config.multiview_pretrained_path
+         pipeline = DiffusionPipeline.from_pretrained(
+             model_path,
+             custom_pipeline=custom_pipeline, 
+@@ -98,7 +99,7 @@ class multiviewDiffusionNet:
+         kwargs["images_position"] = position_image
+ 
+         if hasattr(self.pipeline.unet, "use_dino") and self.pipeline.unet.use_dino:
+-            dino_hidden_states = self.dino_v2(input_images[0])
++            dino_hidden_states = self.dino_v2(input_images[0]).to("xpu:0")
+             kwargs["dino_hidden_states"] = dino_hidden_states
+ 
+         sync_condition = None
+diff --git a/hy3dshape/hy3dshape/models/autoencoders/model.py b/hy3dshape/hy3dshape/models/autoencoders/model.py
+index 3d782f5..c6d081c 100644
+--- a/hy3dshape/hy3dshape/models/autoencoders/model.py
++++ b/hy3dshape/hy3dshape/models/autoencoders/model.py
+@@ -123,7 +123,7 @@ class VectsetVAE(nn.Module):
+         cls,
+         ckpt_path,
+         config_path,
+-        device='cuda',
++        device='xpu',
+         dtype=torch.float16,
+         use_safetensors=None,
+         **kwargs,
+@@ -157,7 +157,7 @@ class VectsetVAE(nn.Module):
+     def from_pretrained(
+         cls,
+         model_path,
+-        device='cuda',
++        device='xpu',
+         dtype=torch.float16,
+         use_safetensors=False,
+         variant='fp16',
+diff --git a/hy3dshape/hy3dshape/models/conditioner.py b/hy3dshape/hy3dshape/models/conditioner.py
+index 5c03464..3e00595 100644
+--- a/hy3dshape/hy3dshape/models/conditioner.py
++++ b/hy3dshape/hy3dshape/models/conditioner.py
+@@ -81,7 +81,7 @@ class ImageEncoder(nn.Module):
+ 
+         self.transform = transforms.Compose(
+             [
+-                transforms.Resize(image_size, transforms.InterpolationMode.BILINEAR, antialias=True),
++                transforms.Resize(image_size, transforms.InterpolationMode.BILINEAR, antialias=False),
+                 transforms.CenterCrop(image_size),
+                 transforms.Normalize(
+                     mean=self.mean,
+diff --git a/hy3dshape/hy3dshape/models/denoisers/hunyuandit.py b/hy3dshape/hy3dshape/models/denoisers/hunyuandit.py
+index 05514c0..35858d4 100644
+--- a/hy3dshape/hy3dshape/models/denoisers/hunyuandit.py
++++ b/hy3dshape/hy3dshape/models/denoisers/hunyuandit.py
+@@ -212,26 +212,26 @@ class CrossAttention(nn.Module):
+         q = self.q_norm(q)
+         k = self.k_norm(k)
+ 
+-        with torch.backends.cuda.sdp_kernel(
+-            enable_flash=True,
+-            enable_math=False,
+-            enable_mem_efficient=True
+-        ):
+-            q, k, v = map(lambda t: rearrange(t, 'b n h d -> b h n d', h=self.num_heads), (q, k, v))
+-            context = F.scaled_dot_product_attention(
+-                q, k, v
+-            ).transpose(1, 2).reshape(b, s1, -1)
++        # with torch.backends.cuda.sdp_kernel(
++        #     enable_flash=True,
++        #     enable_math=False,
++        #     enable_mem_efficient=True
++        # ):
++        q, k, v = map(lambda t: rearrange(t, 'b n h d -> b h n d', h=self.num_heads), (q, k, v))
++        context = F.scaled_dot_product_attention(
++            q, k, v
++        ).transpose(1, 2).reshape(b, s1, -1)
+ 
+         if self.with_dca:
+-            with torch.backends.cuda.sdp_kernel(
+-                enable_flash=True,
+-                enable_math=False,
+-                enable_mem_efficient=True
+-            ):
+-                k_dca, v_dca = map(lambda t: rearrange(t, 'b n h d -> b h n d', h=self.num_heads),
+-                                   (k_dca, v_dca))
+-                context_dca = F.scaled_dot_product_attention(
+-                    q, k_dca, v_dca).transpose(1, 2).reshape(b, s1, -1)
++            # with torch.backends.cuda.sdp_kernel(
++            #     enable_flash=True,
++            #     enable_math=False,
++            #     enable_mem_efficient=True
++            # ):
++            k_dca, v_dca = map(lambda t: rearrange(t, 'b n h d -> b h n d', h=self.num_heads),
++                                (k_dca, v_dca))
++            context_dca = F.scaled_dot_product_attention(
++                q, k_dca, v_dca).transpose(1, 2).reshape(b, s1, -1)
+ 
+             context = context + self.dca_weight * context_dca
+ 
+@@ -289,13 +289,13 @@ class Attention(nn.Module):
+         q = self.q_norm(q)  # [b, h, s, d]
+         k = self.k_norm(k)  # [b, h, s, d]
+ 
+-        with torch.backends.cuda.sdp_kernel(
+-            enable_flash=True,
+-            enable_math=False,
+-            enable_mem_efficient=True
+-        ):
+-            x = F.scaled_dot_product_attention(q, k, v)
+-            x = x.transpose(1, 2).reshape(B, N, -1)
++        # with torch.backends.cuda.sdp_kernel(
++        #     enable_flash=True,
++        #     enable_math=False,
++        #     enable_mem_efficient=True
++        # ):
++        x = F.scaled_dot_product_attention(q, k, v)
++        x = x.transpose(1, 2).reshape(B, N, -1)
+ 
+         x = self.out_proj(x)
+         return x
+diff --git a/hy3dshape/hy3dshape/models/diffusion/flow_matching_sit.py b/hy3dshape/hy3dshape/models/diffusion/flow_matching_sit.py
+index 7f94bb8..8a9cb1e 100644
+--- a/hy3dshape/hy3dshape/models/diffusion/flow_matching_sit.py
++++ b/hy3dshape/hy3dshape/models/diffusion/flow_matching_sit.py
+@@ -254,10 +254,13 @@ class Diffuser(pl.LightningModule):
+         pl.seed_everything(self.trainer.global_rank)
+ 
+     def forward(self, batch):
+-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16): #float32 for text
++        with torch.autocast(device_type="xpu", dtype=torch.bfloat16): #float32 for text
+             contexts = self.cond_stage_model(image=batch.get('image'), text=batch.get('text'), mask=batch.get('mask'))
+-
+-        with torch.autocast(device_type="cuda", dtype=torch.float16):
++            # t5_text = contexts['t5_text']['prompt_embeds']
++            # nan_count = torch.isnan(t5_text).sum()
++            # if nan_count > 0:
++            #     print("t5_text has %d NaN values"%(nan_count))
++        with torch.autocast(device_type="xpu", dtype=torch.float16):
+             with torch.no_grad():
+                 latents = self.first_stage_model.encode(batch[self.first_stage_key], sample_posterior=True)
+                 latents = self.z_scale_factor * latents
+@@ -284,7 +287,7 @@ class Diffuser(pl.LightningModule):
+                 # else:
+                 #     mesh.export(f"check_{time.time()}.glb")
+                 
+-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
++        with torch.autocast(device_type="xpu", dtype=torch.bfloat16):
+             loss = self.transport.training_losses(self.model, latents, dict(contexts=contexts))["loss"].mean()
+         return loss
+ 
+@@ -319,7 +322,7 @@ class Diffuser(pl.LightningModule):
+         generator = torch.Generator().manual_seed(0)
+ 
+         with self.ema_scope("Sample"):
+-            with torch.amp.autocast(device_type='cuda'):
++            with torch.amp.autocast(device_type='xpu'):
+                 try:
+                     self.pipeline.device = self.device
+                     self.pipeline.dtype = self.dtype
+diff --git a/hy3dshape/hy3dshape/pipelines.py b/hy3dshape/hy3dshape/pipelines.py
+index 71de472..aa227df 100644
+--- a/hy3dshape/hy3dshape/pipelines.py
++++ b/hy3dshape/hy3dshape/pipelines.py
+@@ -137,7 +137,7 @@ class Hunyuan3DDiTPipeline:
+         cls,
+         ckpt_path,
+         config_path,
+-        device='cuda',
++        device='xpu',
+         dtype=torch.float16,
+         use_safetensors=None,
+         **kwargs,
+@@ -196,7 +196,7 @@ class Hunyuan3DDiTPipeline:
+     def from_pretrained(
+         cls,
+         model_path,
+-        device='cuda',
++        device='xpu',
+         dtype=torch.float16,
+         use_safetensors=False,
+         variant='fp16',
+@@ -233,7 +233,7 @@ class Hunyuan3DDiTPipeline:
+         scheduler,
+         conditioner,
+         image_processor,
+-        device='cuda',
++        device='xpu',
+         dtype=torch.float16,
+         **kwargs
+     ):
+@@ -326,7 +326,7 @@ class Hunyuan3DDiTPipeline:
+                     return torch.device(module._hf_hook.execution_device)
+         return self.device
+ 
+-    def enable_model_cpu_offload(self, gpu_id: Optional[int] = None, device: Union[torch.device, str] = "cuda"):
++    def enable_model_cpu_offload(self, gpu_id: Optional[int] = None, device: Union[torch.device, str] = "xpu"):
+         r"""
+         Offloads all models to CPU using accelerate, reducing memory usage with a low impact on performance. Compared
+         to `enable_sequential_cpu_offload`, this method moves one whole model at a time to the GPU when its `forward`
+diff --git a/hy3dshape/main.py b/hy3dshape/main.py
+index 1f281ef..95f97b4 100644
+--- a/hy3dshape/main.py
++++ b/hy3dshape/main.py
+@@ -115,11 +115,11 @@ if __name__ == "__main__":
+     
+     args = get_args()
+     
+-    if args.fast:
+-        torch.backends.cudnn.allow_tf32 = True
+-        torch.backends.cuda.matmul.allow_tf32 = True
+-        torch.set_float32_matmul_precision('medium')
+-        torch.utils.data._utils.MP_STATUS_CHECK_INTERVAL = 0.05
++    # if args.fast:
++    #     torch.backends.cudnn.allow_tf32 = True
++    #     torch.backends.cuda.matmul.allow_tf32 = True
++    #     torch.set_float32_matmul_precision('medium')
++    #     torch.utils.data._utils.MP_STATUS_CHECK_INTERVAL = 0.05
+ 
+     # Set random seed
+     pl.seed_everything(args.seed, workers=True)
+diff --git a/replace_cuda_to_xpu.sh b/replace_cuda_to_xpu.sh
+new file mode 100644
+index 0000000..6b12813
+--- /dev/null
++++ b/replace_cuda_to_xpu.sh
+@@ -0,0 +1,23 @@
++#!/bin/bash
++
++# 检查是否提供了文件名
++if [ "$#" -ne 1 ]; then
++    echo "Usage: $0 <python_file>"
++    exit 1
++fi
++
++file="$1"
++
++# 检查文件是否存在
++if [ ! -f "$file" ]; then
++    echo "Error: File '$file' not found!"
++    exit 1
++fi
++
++# 备份原始文件（可选）
++cp "$file" "${file}.bak"
++
++# 使用sed替换所有"cuda"为"xpu"
++sed -i 's/cuda/xpu/g' "$file"
++
++echo "Replaced all 'cuda' with 'xpu' in $file"
+\ No newline at end of file
+diff --git a/requirements.txt b/requirements.txt
+index d9f1e4d..3913943 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -49,11 +49,11 @@ uvicorn==0.34.3
+ tqdm==4.66.5
+ psutil==6.0.0
+ 
+-# GPU Computing (requires CUDA)
+-cupy-cuda12x==13.4.1
++## GPU Computing (requires CUDA)
++#cupy-cuda12x==13.4.1
+ 
+ # Blender
+-bpy==4.0
++bpy==4.0.0
+ 
+ # ONNX Runtime
+ onnxruntime==1.16.3
+diff --git a/xpu_convert.py b/xpu_convert.py
+new file mode 100644
+index 0000000..8eedc9d
+--- /dev/null
++++ b/xpu_convert.py
+@@ -0,0 +1,174 @@
++import torch
++from torch import nn
++import torch.nn.functional as F
++from diffusers.models.attention_processor import AttnProcessor2_0, Attention
++from typing import Callable, List, Optional, Tuple, Union
++import math
++
++_original_layer_norm_forward = nn.LayerNorm.forward
++
++def _new_layer_norm_forward(self, hidden_states: torch.Tensor):
++    if (
++        hidden_states.device.type == 'xpu' and 
++        hidden_states.dtype in (torch.float, torch.half) and
++        self.weight is not None
++    ):
++        try:
++            import bigdl_core
++            hidden_size = math.prod(self.normalized_shape)
++            x_2d = hidden_states.reshape(-1, hidden_size).contiguous()
++            output = bigdl_core.layer_norm(x_2d, self.weight, self.bias, self.eps)
++            return output.reshape(hidden_states.shape)
++
++        except ImportError:
++            return _original_layer_norm_forward(self, hidden_states)
++    else:
++        print(hidden_states.dtype)
++        return _original_layer_norm_forward(self, hidden_states)
++
++
++def chunk_scaled_dot_product_attention(
++    query,
++    key,
++    value,
++    attn_mask=None,
++    dropout_p=0.0,
++    is_causal=False,
++    chunk_size=1024
++):
++    if chunk_size is None or query.size(2) <= chunk_size:
++        return F.scaled_dot_product_attention(
++            query, key, value, attn_mask, dropout_p, is_causal
++        )
++    
++    if is_causal:
++        warnings.warn("Chunked computation may not work correctly with causal attention. "
++                      "Consider setting chunk_size=None for causal attention.")
++    
++    if dropout_p > 0:
++        warnings.warn("Dropout is applied independently to each chunk, which may "
++                      "result in slightly different behavior compared to non-chunked version.")
++    
++    Lq = query.size(2)
++    query_chunks = torch.split(query, chunk_size, dim=2)
++    
++    mask_chunks = None
++    if attn_mask is not None:
++        split_dim = -2 if attn_mask.dim() >= 2 else 0
++        if attn_mask.size(split_dim) == 1:
++            mask_chunks = [attn_mask] * len(query_chunks)
++        elif attn_mask.size(split_dim) == Lq:
++            mask_chunks = torch.split(attn_mask, chunk_size, dim=split_dim)
++        else:
++            raise ValueError(f"Attention mask size {attn_mask.size()} is incompatible "
++                             f"with query size {query.size()} for chunked computation")
++    else:
++        mask_chunks = [None] * len(query_chunks)
++    
++    output_chunks = []
++    
++    for q_chunk, m_chunk in zip(query_chunks, mask_chunks):
++        chunk_output = F.scaled_dot_product_attention(
++            q_chunk, key, value, 
++            attn_mask=m_chunk,
++            dropout_p=dropout_p,
++            is_causal=is_causal
++        )
++        output_chunks.append(chunk_output)
++    
++    return torch.cat(output_chunks, dim=2)
++
++def chunked_diffusers_attention_processor_call(
++    self,
++    attn: Attention,
++    hidden_states: torch.Tensor,
++    encoder_hidden_states: Optional[torch.Tensor] = None,
++    attention_mask: Optional[torch.Tensor] = None,
++    temb: Optional[torch.Tensor] = None,
++    *args,
++    **kwargs,
++) -> torch.Tensor:
++    if len(args) > 0 or kwargs.get("scale", None) is not None:
++        deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
++        deprecate("scale", "1.0.0", deprecation_message)
++
++    residual = hidden_states
++    if attn.spatial_norm is not None:
++        hidden_states = attn.spatial_norm(hidden_states, temb)
++
++    input_ndim = hidden_states.ndim
++
++    if input_ndim == 4:
++        batch_size, channel, height, width = hidden_states.shape
++        hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
++
++    batch_size, sequence_length, _ = (
++        hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
++    )
++
++    if attention_mask is not None:
++        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
++        # scaled_dot_product_attention expects attention_mask shape to be
++        # (batch, heads, source_length, target_length)
++        attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
++
++    if attn.group_norm is not None:
++        hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
++
++    query = attn.to_q(hidden_states)
++
++    if encoder_hidden_states is None:
++        encoder_hidden_states = hidden_states
++    elif attn.norm_cross:
++        encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
++
++    key = attn.to_k(encoder_hidden_states)
++    value = attn.to_v(encoder_hidden_states)
++
++    inner_dim = key.shape[-1]
++    head_dim = inner_dim // attn.heads
++
++    query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
++
++    key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
++    value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
++
++    if attn.norm_q is not None:
++        query = attn.norm_q(query)
++    if attn.norm_k is not None:
++        key = attn.norm_k(key)
++
++    # the output of sdp = (batch, num_heads, seq_len, head_dim)
++    # TODO: add support for attn.scale when we move to Torch 2.1
++    hidden_states = chunk_scaled_dot_product_attention(
++        query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
++    )
++
++    hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
++    hidden_states = hidden_states.to(query.dtype)
++
++    # linear proj
++    hidden_states = attn.to_out[0](hidden_states)
++    # dropout
++    hidden_states = attn.to_out[1](hidden_states)
++
++    if input_ndim == 4:
++        hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
++
++    if attn.residual_connection:
++        hidden_states = hidden_states + residual
++
++    hidden_states = hidden_states / attn.rescale_output_factor
++
++    return hidden_states
++
++from realesrgan import RealESRGANer
++def process_on_xpu(self):
++    self.output = self.model(self.img.to("xpu"))
++
++def convert_to_xpu():
++    nn.LayerNorm.forward = _new_layer_norm_forward
++    AttnProcessor2_0.__call__ = chunked_diffusers_attention_processor_call
++    RealESRGANer.process = process_on_xpu
++
++    print("Converted to XPU compatible functions.")
+\ No newline at end of file
