@@ -81,6 +81,9 @@ RUN git clone https://github.com/oneapi-src/oneCCL.git && \
     cd /opt/intel/oneapi/ccl/ && \
     ln -snf 2021.15.3 latest
 
+# Install pypi dependencies
+RUN pip install bigdl-core
+
 # Cleanup patch file
 RUN rm -rf /tmp/*
 
@@ -106,7 +109,6 @@ ENV VLLM_QUANTIZE_Q40_LIB="/usr/local/lib/python3.10/dist-packages/vllm_int4_for
 
 # install development dependencies (for testing)
 RUN cd /llm/vllm && \
-    python3 -m pip install -e tests/vllm_test_utils && \
-    pip install bigdl-core
+    python3 -m pip install -e tests/vllm_test_utils
     
 ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
