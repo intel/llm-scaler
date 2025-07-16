@@ -485,6 +485,24 @@ In this case, you should adjust the launch command with:
 
 ## 4. Troubleshooting
 
+### 4.1 ModuleNotFoundError: No module named 'vllm.\_C'
+
+If you encounter the following error:
+
+```
+ModuleNotFoundError: No module named 'vllm._C'
+```
+
+This may be caused by running your script from within the `/llm/vllm` directory.
+
+To avoid this error, make sure to run your commands from the `/llm` root directory instead. For example:
+
+```bash
+cd /llm
+python3 -m vllm.entrypoints.openai.api_server
+```
+
+
 
 
 
