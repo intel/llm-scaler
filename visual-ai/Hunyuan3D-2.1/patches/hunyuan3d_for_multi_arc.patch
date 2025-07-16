@@ -1,16 +1,25 @@
 diff --git a/demo.py b/demo.py
-index cdb0a0a..4e1aade 100644
+index cdb0a0a..47cc16f 100644
 --- a/demo.py
 +++ b/demo.py
-@@ -6,6 +6,8 @@ from PIL import Image
+@@ -6,7 +6,6 @@ from PIL import Image
  from hy3dshape.rembg import BackgroundRemover
  from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
  
-+from xpu_convert import convert_to_xpu
-+convert_to_xpu()
- 
+-
  from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
  
+ try:
+@@ -17,6 +16,9 @@ except ImportError:
+ except Exception as e:
+     print(f"Warning: Failed to apply torchvision fix: {e}")
+ 
++from xpu_convert import convert_to_xpu
++convert_to_xpu()
++
+ # shape
+ model_path = 'tencent/Hunyuan3D-2.1'
+ pipeline_shapegen = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path)
 @@ -44,4 +46,4 @@ output_mesh_path = paint_pipeline(
      mesh_path = "demo.glb", 
      image_path = 'assets/demo.png',
@@ -20,10 +29,10 @@ index cdb0a0a..4e1aade 100644
 \ No newline at end of file
 diff --git a/demo_shape.py b/demo_shape.py
 new file mode 100644
-index 0000000..ef540a7
+index 0000000..fe3af35
 --- /dev/null
 +++ b/demo_shape.py
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,38 @@
 +import sys
 +sys.path.insert(0, './hy3dshape')
 +sys.path.insert(0, './hy3dpaint')
@@ -35,42 +44,6 @@ index 0000000..ef540a7
 +import torch
 +from torch import nn
 +
-+# import intel_extension_for_pytorch
-+
-+import math
-+_original_layer_norm_forward = nn.LayerNorm.forward
-+
-+def _new_layer_norm_forward(self, hidden_states: torch.Tensor):
-+    if (
-+        hidden_states.device.type == 'xpu' and 
-+        hidden_states.dtype in (torch.float, torch.half) and
-+        self.weight is not None
-+    ):
-+        # try:
-+        import bigdl_core
-+        hidden_size = math.prod(self.normalized_shape)
-+        x_2d = hidden_states.reshape(-1, hidden_size).contiguous()
-+        output = bigdl_core.layer_norm(x_2d, self.weight, self.bias, self.eps)
-+        return output.reshape(hidden_states.shape)
-+
-+        # import intel_extension_for_pytorch.ipex.llm.functional as ipex_test
-+
-+        # hidden_states = ipex_test.fast_layer_norm(
-+        #     hidden_states,
-+        #     self.normalized_shape,
-+        #     self.weight,
-+        #     self.bias,
-+        #     self.eps,
-+        # )
-+        return hidden_states
-+        # except ImportError:
-+        #     return _original_layer_norm_forward(self, hidden_states)
-+    else:
-+        print(hidden_states.dtype)
-+        return _original_layer_norm_forward(self, hidden_states)
-+
-+nn.LayerNorm.forward = _new_layer_norm_forward
-+
 +from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
 +
 +try:
@@ -81,29 +54,23 @@ index 0000000..ef540a7
 +except Exception as e:
 +    print(f"Warning: Failed to apply torchvision fix: {e}")
 +
-+from torch.profiler import profile, record_function, ProfilerActivity
-+activities = [ProfilerActivity.CPU, ProfilerActivity.XPU]
++from xpu_convert import convert_to_xpu
++convert_to_xpu()
 +
 +# # shape
 +start_time = time.perf_counter()
-+model_path = '/llm/models/Hunyuan3D-2.1/'
++model_path = 'tencent/Hunyuan3D-2.1'
 +pipeline_shapegen = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path)
 +image_path = 'assets/demo.png'
 +image = Image.open(image_path).convert("RGBA")
 +if image.mode == 'RGB':
 +    rembg = BackgroundRemover()
 +    image = rembg(image)
-+# image = ["/llm/workspace/chair_images_test/Picture1.png",
-+#         "/llm/workspace/chair_images_test/Picture2.png",
-+#         "/llm/workspace/chair_images_test/Picture3.png",]
 +
-+# with profile(activities=activities, record_shapes=False) as prof:
 +mesh = pipeline_shapegen(image=image)[0]
 +mesh.export('demo.glb')
 +end_time = time.perf_counter()
 +print("Shape generation time: {:.2f} seconds".format(end_time - start_time))
-+
-+# print(prof.key_averages().table(sort_by="self_xpu_time_total", row_limit=-1))
 diff --git a/demo_texture.py b/demo_texture.py
 new file mode 100644
 index 0000000..da6ce04
@@ -1166,10 +1133,10 @@ index d9f1e4d..3913943 100644
  onnxruntime==1.16.3
 diff --git a/xpu_convert.py b/xpu_convert.py
 new file mode 100644
-index 0000000..8eedc9d
+index 0000000..bf53510
 --- /dev/null
 +++ b/xpu_convert.py
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,182 @@
 +import torch
 +from torch import nn
 +import torch.nn.functional as F
@@ -1199,6 +1166,7 @@ index 0000000..8eedc9d
 +        return _original_layer_norm_forward(self, hidden_states)
 +
 +
++_original_F_sdpa = F.scaled_dot_product_attention
 +def chunk_scaled_dot_product_attention(
 +    query,
 +    key,
@@ -1206,11 +1174,17 @@ index 0000000..8eedc9d
 +    attn_mask=None,
 +    dropout_p=0.0,
 +    is_causal=False,
-+    chunk_size=1024
++    scale=None,
++    chunk_size=1024,
 +):
 +    if chunk_size is None or query.size(2) <= chunk_size:
-+        return F.scaled_dot_product_attention(
-+            query, key, value, attn_mask, dropout_p, is_causal
++        return _original_F_sdpa(
++            query, key, value, attn_mask, dropout_p, is_causal, scale=scale
++        )
++
++    if scale is not None:
++        return _original_F_sdpa(
++            query, key, value, attn_mask, dropout_p, is_causal, scale=scale
 +        )
 +    
 +    if is_causal:
@@ -1340,7 +1314,8 @@ index 0000000..8eedc9d
 +
 +def convert_to_xpu():
 +    nn.LayerNorm.forward = _new_layer_norm_forward
-+    AttnProcessor2_0.__call__ = chunked_diffusers_attention_processor_call
++    # AttnProcessor2_0.__call__ = chunked_diffusers_attention_processor_call
++    F.scaled_dot_product_attention = chunk_scaled_dot_product_attention
 +    RealESRGANer.process = process_on_xpu
 +
 +    print("Converted to XPU compatible functions.")

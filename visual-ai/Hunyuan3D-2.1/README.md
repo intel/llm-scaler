@@ -1,33 +1,41 @@
 # Docker setup
 
-This docker setup is tested on Windows 10.
-
-make sure you are under this directory yourworkspace/Hunyuan3D-2.1/docker
-
 Build docker image:
 
-```
-docker build -t hunyuan3d21:latest .
-```
-
-Run docker image at the first time:
-
-```
-docker run -it --name hy3d21 -p 7860:7860 --gpus all hunyuan3d21 python gradio_app.py --port 7860
+```bash
+bash build.sh
 ```
 
-After first time:
-```
-docker start -a hy3d21
+Run docker image:
+
+```bash
+export DOCKER_IMAGE=llm-scaler-visualai:latest
+export CONTAINER_NAME=hunyuan3d-2.1
+sudo docker run -itd \
+        --privileged \
+        --net=host \
+        --device=/dev/dri \
+        -e no_proxy=localhost,127.0.0.1 \
+        --name=$CONTAINER_NAME \
+        --shm-size="16g" \
+        --entrypoint=/bin/bash \
+        $DOCKER_IMAGE 
 ```
 
-Stop the container:
-```
-docker stop hy3d21
-```
+Run Hunyuan 3D 2.1 demo:
+```bash
+docker exec -it hunyuan3d-2.1 bash
+# At /llm/Hunyuan3D-2.1 path
 
-You can find the demo link showing in terminal, such as `http://0.0.0.0:7860`, then you cuold access `http://127.0.0.1:7860` from your host machine.
+# Configure proxy to download model files
+export http_proxy=<your_http_proxy>
+export https_proxy=<your_https_proxy>
+export no_proxy=localhost,127.0.0.1
 
-Some notes:
-1. the total built time might take more than one hour.
-2. the total size of the built image will be more than 70GB.
+# Run shape + paint demo
+python3 demo.py
+# (Optional) Run shape only demo
+python3 demo_shape.py
+# (Optional) Run paint only demo
+python3 demo_texture.py
+```

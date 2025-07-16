@@ -1,2 +1,6 @@
 set -x
-docker build -f ./docker/Dockerfile . -t intelanalytics/hunyuan3d-2.1:0715 --build-arg https_proxy=http://proxy.iil.intel.com:911 --build-arg http_proxy=http://proxy.iil.intel.com:911
+
+export HTTP_PROXY=<your_http_proxy>
+export HTTPS_PROXY=<your_https_proxy>
+
+docker build -f ./docker/Dockerfile . -t llm-scaler-visualai:latest --build-arg https_proxy=$HTTPS_PROXY --build-arg http_proxy=$HTTP_PROXY

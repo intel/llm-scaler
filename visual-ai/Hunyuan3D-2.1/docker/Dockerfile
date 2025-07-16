@@ -50,7 +50,7 @@ RUN apt-get update && apt-get install -y \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-ENV LD_LIBRARY_PATH="/usr/local/lib/python3.11/dist-packages/open3d:$LD_LIBRARY_PATH"
+ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python3.10/dist-packages/torch/lib:$LD_LIBRARY_PATH"
 
 RUN pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/xpu && \
     pip install bigdl-core==2.4.0b1 && \
