@@ -84,6 +84,10 @@ RUN git clone https://github.com/oneapi-src/oneCCL.git && \
 # Install pypi dependencies
 RUN pip install --pre --upgrade bigdl-core
 
+# Install required triton version
+RUN pip uninstall pytorch-triton-xpu triton -y && \
+    pip install https://ubit-artifactory-ba.intel.com/artifactory/aipc_releases-ba-local/gpu-new/validation/IPEX/adhoc/vllm/triton-3.3.0+gitbd88137b-cp310-cp310-linux_x86_64.whl
+
 # Cleanup patch file
 RUN rm -rf /tmp/*
 
