@@ -82,7 +82,7 @@ RUN git clone https://github.com/oneapi-src/oneCCL.git && \
     ln -snf 2021.15.3 latest
 
 # Install pypi dependencies
-RUN pip install bigdl-core
+RUN pip install --pre --upgrade bigdl-core
 
 # Cleanup patch file
 RUN rm -rf /tmp/*
