@@ -10958,7 +10958,7 @@ index 504c3b42a..7e85eed3b 100644
      DUAL_CHUNK_FLASH_ATTN = enum.auto()
      NO_ATTENTION = enum.auto()
 diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
-index b2a6ad5d7..7fd6e3911 100644
+index b2a6ad5d7..3542ee542 100644
 --- a/vllm/platforms/xpu.py
 +++ b/vllm/platforms/xpu.py
 @@ -2,20 +2,40 @@
@@ -11003,7 +11003,15 @@ index b2a6ad5d7..7fd6e3911 100644
  
  class XPUPlatform(Platform):
      _enum = PlatformEnum.XPU
-@@ -32,10 +52,22 @@ class XPUPlatform(Platform):
+@@ -25,17 +45,29 @@ class XPUPlatform(Platform):
+     # Intel XPU's device key is "GPU" for Ray.
+     # see https://github.com/ray-project/ray/blob/6a5eb5865eeb9ccf058a79b44f107e327e360673/python/ray/_private/accelerators/intel_gpu.py#L20 # noqa: E501
+     ray_device_key: str = "GPU"
+-    device_control_env_var: str = "ONEAPI_DEVICE_SELECTOR"
++    device_control_env_var: str = "ZE_AFFINITY_MASK"
+ 
+     @classmethod
+     def get_attn_backend_cls(cls, selected_backend: _Backend, head_size: int,
                               dtype: torch.dtype, kv_cache_dtype: Optional[str],
                               block_size: int, use_v1: bool,
                               use_mla: bool) -> str:
@@ -11489,7 +11497,7 @@ index 000000000..913784b8d
 +        return output
 +
 diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
-index 403b5401b..b5863f749 100644
+index 403b5401b..3adf22fc4 100644
 --- a/vllm/v1/core/kv_cache_utils.py
 +++ b/vllm/v1/core/kv_cache_utils.py
 @@ -2,7 +2,7 @@
@@ -11531,6 +11539,18 @@ index 403b5401b..b5863f749 100644
          return memory_needed <= available_memory
  
      # Binary search for the maximum model length
+@@ -544,8 +550,9 @@ def check_enough_kv_cache_memory(vllm_config: VllmConfig,
+                                                    available_memory)
+         estimated_msg = ""
+         if estimated_max_len > 0:
+-            estimated_msg = " Based on the available memory,"
+-            f" the estimated maximum model length is {estimated_max_len}."
++            estimated_msg = (
++                "Based on the available memory, "
++                f"the estimated maximum model length is {estimated_max_len}.")
+ 
+         raise ValueError(
+             f"To serve at least one request with the models's max seq len "
 diff --git a/vllm/v1/engine/detokenizer.py b/vllm/v1/engine/detokenizer.py
 index dca327cc5..f55db3fef 100644
 --- a/vllm/v1/engine/detokenizer.py
