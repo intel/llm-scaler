@@ -103,8 +103,8 @@ ARG https_proxy
 RUN pip install accelerate hf_transfer 'modelscope!=1.15.0'
 
 # Install required triton version
-RUN pip uninstall pytorch-triton-xpu triton -y && \
-    pip install https://ubit-artifactory-ba.intel.com/artifactory/aipc_releases-ba-local/gpu-new/validation/IPEX/adhoc/vllm/triton-3.3.0+gitbd88137b-cp310-cp310-linux_x86_64.whl
+# RUN pip uninstall pytorch-triton-xpu triton -y && \
+#     pip install https://ubit-artifactory-ba.intel.com/artifactory/aipc_releases-ba-local/gpu-new/validation/IPEX/adhoc/vllm/triton-3.3.0+gitbd88137b-cp310-cp310-linux_x86_64.whl
 
 # Set additional environment for production usage
 ENV VLLM_USAGE_SOURCE=production-docker-image
