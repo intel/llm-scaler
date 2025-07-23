@@ -10326,21 +10326,6 @@ index 70463ecd9..106cb0871 100644
  
      @classmethod
      def get_input_positions(
-diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
-index 46d2075af..120856096 100644
---- a/vllm/model_executor/layers/vocab_parallel_embedding.py
-+++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
-@@ -136,8 +136,8 @@ class VocabParallelEmbeddingShardIndices:
-         assert self.num_org_elements <= self.num_org_elements_padded
-         assert self.num_added_elements <= self.num_added_elements_padded
- 
--
--@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
-+# fixme: 'Python.h' file not found issue
-+#@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
- def get_masked_input_and_mask(
-         input_: torch.Tensor, org_vocab_start_index: int,
-         org_vocab_end_index: int, num_org_vocab_padding: int,
 diff --git a/vllm/model_executor/model_loader/utils.py b/vllm/model_executor/model_loader/utils.py
 index 9c8d647a2..d75196874 100644
 --- a/vllm/model_executor/model_loader/utils.py
