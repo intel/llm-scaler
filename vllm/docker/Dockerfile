@@ -39,6 +39,20 @@ RUN apt-get update -y && \
     apt-get install -y intel-oneapi-dpcpp-ct=2025.0.1-17 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# pin compute runtime version
+RUN mkdir /tmp/neo && \
+    cd neo && \
+    wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.12.5/intel-igc-core-2_2.12.5+19302_amd64.deb && \
+    wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.12.5/intel-igc-opencl-2_2.12.5+19302_amd64.deb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-ocloc-dbgsym_25.22.33944.8-0_amd64.ddeb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-ocloc_25.22.33944.8-0_amd64.deb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-opencl-icd-dbgsym_25.22.33944.8-0_amd64.ddeb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-opencl-icd_25.22.33944.8-0_amd64.deb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libigdgmm12_22.7.0_amd64.deb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libze-intel-gpu1-dbgsym_25.22.33944.8-0_amd64.ddeb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libze-intel-gpu1_25.22.33944.8-0_amd64.deb && \
+    sudo dpkg -i *.deb
+
 WORKDIR /llm
 COPY ./patches/vllm_for_multi_arc.patch /tmp/
 COPY ./patches/0001-oneccl-align-global-V0.1.1.patch /tmp/
