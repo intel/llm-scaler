@@ -16,7 +16,7 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    2.2 [INT4 and FP8 Quantized Online Serving](#22-int4-and-fp8-quantized-online-serving)  
    2.3 [Embedding and Reranker Model Support](#23-embedding-and-reranker-model-support)  
    2.4 [Multi-Modal Model Support](#24-multi-modal-model-support)  
-   2.5 [Omni Model Support](#25-omni-model-support)
+   2.5 [Omni Model Support](#25-omni-model-support)  
    2.6 [Data Parallelism (DP)](#26-data-parallelism-dp)  
    2.7 [Maximum Context Length Support](#27-maximum-context-length-support)  
 3. [Supported Models](#3-supported-models)  
@@ -537,6 +537,7 @@ In this case, you should adjust the launch command with:
 |       UI-TARS-7B-DPO              |        multimodal model           | pip install transformers==4.49.0       |
 |       Gemma-3-12B                 |        multimodal model           | only can run bf16 with no quantization |
 |       GLM-4V-9B                   |        multimodal model           | only can run with four cards           |
+|       Qwen2.5-Omni-7B             |        omni model           | pip install librosa soundfile           |
 |       Qwen3-Embedding             |        Embedding                  |                                 |
 |       bge-large, bge-m3           |        Embedding                  |                                 |
 |       Qwen3-Reranker              |        Rerank                     |                                 |
