@@ -51,7 +51,7 @@ RUN mkdir /tmp/neo && \
     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libigdgmm12_22.7.0_amd64.deb && \
     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libze-intel-gpu1-dbgsym_25.22.33944.8-0_amd64.ddeb && \
     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libze-intel-gpu1_25.22.33944.8-0_amd64.deb && \
-    sudo dpkg -i *.deb
+    dpkg -i *.deb
 
 WORKDIR /llm
 COPY ./patches/vllm_for_multi_arc.patch /tmp/
