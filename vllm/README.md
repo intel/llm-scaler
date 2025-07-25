@@ -16,8 +16,9 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    2.2 [INT4 and FP8 Quantized Online Serving](#22-int4-and-fp8-quantized-online-serving)  
    2.3 [Embedding and Reranker Model Support](#23-embedding-and-reranker-model-support)  
    2.4 [Multi-Modal Model Support](#24-multi-modal-model-support)  
-   2.5 [Data Parallelism (DP)](#25-data-parallelism-dp)  
-   2.6 [Maximum Context Length Support](#26-maximum-context-length-support)  
+   2.5 [Omni Model Support](#25-omni-model-support)
+   2.6 [Data Parallelism (DP)](#26-data-parallelism-dp)  
+   2.7 [Maximum Context Length Support](#27-maximum-context-length-support)  
 3. [Supported Models](#3-supported-models)  
 4. [Troubleshooting](#4-troubleshooting)  
 
@@ -402,7 +403,61 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 ---
 
-### 2.5 Data Parallelism (DP)
+### 2.5 Omni Model Support
+
+#### Start service using V1 engine
+```bash
+TORCH_LLM_ALLREDUCE=1 \
+VLLM_USE_V1=1 \
+CCL_ZE_IPC_EXCHANGE=pidfd \
+VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+python3 -m vllm.entrypoints.openai.api_server \
+    --model /llm/models/Qwen2.5-Omni-7B \
+    --served-model-name Qwen2.5-Omni-7B \
+    --allowed-local-media-path /llm/models/test \
+    --dtype=float16 \
+    --device=xpu \
+    --enforce-eager \
+    --port 8000 \
+    --host 0.0.0.0 \
+    --trust-remote-code \
+    --gpu-memory-util=0.9 \
+    --no-enable-prefix-caching \
+    --max-num-batched-tokens=5120 \
+    --disable-log-requests \
+    --max-model-len=5120 \
+    --block-size 64 \
+    --quantization fp8 \
+    -tp=1
+```
+
+After starting the vLLM service, you can follow this link to use it
+
+#### [Qwen2.5-Omni input](https://github.com/QwenLM/Qwen2.5-Omni?tab=readme-ov-file#vllm-serve-usage)
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+    "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "https://modelscope.oss-cn-beijing.aliyuncs.com/resource/qwen.png"}},
+        {"type": "audio_url", "audio_url": {"url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2.5-Omni/cough.wav"}},
+        {"type": "text", "text": "What is the text in the illustrate ans what it the sound in the audio?"}
+    ]}
+    ]
+    }'
+```
+
+An example responce is listed below:
+```json
+{"id":"chatcmpl-xxx","object":"chat.completion","model":"Qwen2.5-Omni-7B","choices":[{"index":0,"message":{"role":"assistant","reasoning_content":null,"content":"The text in the image is \"TONGYI Qwen\". The sound in the audio is a cough.","tool_calls":[]},"logprobs":null,"finish_reason":"stop","stop_reason":null}],"usage":{"prompt_tokens":156,"total_tokens":180,"completion_tokens":24,"prompt_tokens_details":null},"prompt_logprobs":null,"kv_transfer_params":null}
+```
+---
+
+### 2.6 Data Parallelism (DP)
 
 Supports data parallelism on Intel XPU with near-linear scaling.
 
@@ -422,7 +477,7 @@ To enable data parallelism, add:
 
 ---
 
-### 2.6 Maximum Context Length Support
+### 2.7 Maximum Context Length Support
 When using the `V1` engine, the system automatically logs the maximum supported context length during startup based on the available GPU memory and KV cache configuration.
 
 #### Example: Successful Startup
