@@ -41,7 +41,7 @@ RUN apt-get update -y && \
 
 # pin compute runtime version
 RUN mkdir /tmp/neo && \
-    cd neo && \
+    cd /tmp/neo && \
     wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.12.5/intel-igc-core-2_2.12.5+19302_amd64.deb && \
     wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.12.5/intel-igc-opencl-2_2.12.5+19302_amd64.deb && \
     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-ocloc-dbgsym_25.22.33944.8-0_amd64.ddeb && \
