@@ -405,6 +405,11 @@ curl http://localhost:8000/v1/chat/completions \
 
 ### 2.5 Omni Model Support
 
+#### Install audio dependencies
+```bash
+pip install librosa soundfile
+```
+
 #### Start service using V1 engine
 ```bash
 TORCH_LLM_ALLREDUCE=1 \
