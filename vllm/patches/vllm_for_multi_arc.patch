@@ -7942,7 +7942,7 @@ index 3c8e6b95c..b42ff5de4 100644
          # num_token_padding not implemented for this case
          assert (scale.numel() == 1 or num_token_padding is None)
 diff --git a/vllm/_ipex_ops.py b/vllm/_ipex_ops.py
-index a9a624b85..292390b63 100644
+index a9a624b85..83c716b20 100644
 --- a/vllm/_ipex_ops.py
 +++ b/vllm/_ipex_ops.py
 @@ -13,6 +13,49 @@ try:
@@ -7995,7 +7995,24 @@ index a9a624b85..292390b63 100644
  
  class ipex_ops:
  
-@@ -160,14 +203,18 @@ class ipex_ops:
+@@ -141,10 +184,12 @@ class ipex_ops:
+         cos_sin_cache: torch.Tensor,  # [cos_sin_dim, rot_dim]
+         is_neox: bool,
+     ) -> None:
+-        rot_dim = cos_sin_cache.size(1)
+-        ipex.llm.functional.rotary_embedding_batched(positions, query, key,
+-                                                     head_size, cos_sin_cache,
+-                                                     is_neox, rot_dim)
++        # rot_dim = cos_sin_cache.size(1)
++        # ipex.llm.functional.rotary_embedding_batched(positions, query, key,
++        #                                              head_size, cos_sin_cache,
++        #                                              is_neox, rot_dim)
++        import vllm._C.ops
++        vllm._C.ops.rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox)
+ 
+     @staticmethod
+     def batched_rotary_embedding(positions: torch.Tensor, query: torch.Tensor,
+@@ -160,14 +205,18 @@ class ipex_ops:
      @staticmethod
      def rms_norm(input: torch.Tensor, weight: torch.Tensor,
                   epsilon: float) -> torch.Tensor:
@@ -8018,7 +8035,7 @@ index a9a624b85..292390b63 100644
  
      @staticmethod
      def varlen_attention(
-@@ -227,6 +274,64 @@ class ipex_ops:
+@@ -227,6 +276,64 @@ class ipex_ops:
          ipex.llm.modules.PagedAttention.reshape_and_cache(
              key, value, key_cache, value_cache, slot_mapping)
  
@@ -8083,7 +8100,7 @@ index a9a624b85..292390b63 100644
      @staticmethod
      def copy_blocks(key_caches: list[torch.Tensor],
                      value_caches: list[torch.Tensor],
-@@ -241,3 +346,125 @@ class ipex_ops:
+@@ -241,3 +348,125 @@ class ipex_ops:
      def swap_blocks(src: torch.Tensor, dst: torch.Tensor,
                      block_mapping: torch.Tensor) -> None:
          torch.xpu.swap_blocks(src, dst, block_mapping)  # type: ignore
@@ -11733,11 +11750,15 @@ index 910c0e80b..92cf85780 100644
              req_ids=self.input_batch.req_ids,
              req_id_to_index=self.input_batch.req_id_to_index,
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index bce5cbb5f..eeac3bbd5 100644
+index bce5cbb5f..5230cc4bf 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
-@@ -251,9 +251,13 @@ class Worker(WorkerBase):
-         if get_pp_group().is_last_rank:
+@@ -248,12 +248,16 @@ class Worker(WorkerBase):
+         # fragmentation issue.
+         # NOTE: This is called after `capture_model` on purpose to prevent
+         # memory buffers from being cleared by `torch.cuda.empty_cache`.
+-        if get_pp_group().is_last_rank:
++        if get_pp_group().is_last_rank and get_pp_group().world_size > 1:
              max_num_reqs = min(self.scheduler_config.max_num_seqs,
                                 self.scheduler_config.max_num_batched_tokens)
 -            self.model_runner._dummy_sampler_run(
@@ -11755,7 +11776,7 @@ index bce5cbb5f..eeac3bbd5 100644
          # the model initialization and profiling.
 diff --git a/vllm/v1/worker/xpu_model_runner.py b/vllm/v1/worker/xpu_model_runner.py
 new file mode 100644
-index 000000000..8ae6c089c
+index 000000000..d5dbf7be5
 --- /dev/null
 +++ b/vllm/v1/worker/xpu_model_runner.py
 @@ -0,0 +1,389 @@
@@ -12140,7 +12161,7 @@ index 000000000..8ae6c089c
 +    def profile_run(self) -> None:
 +        # Trigger compilation for general shape.
 +        hidden_states = self._dummy_run(self.max_num_tokens)
-+        if not self.use_spec_decode and get_pp_group().is_last_rank:
++        if not self.use_spec_decode and get_pp_group().is_last_rank and get_pp_group().world_size > 1:
 +            sampler_output = self._dummy_sampler_run(hidden_states)
 +        else:
 +            sampler_output = None
