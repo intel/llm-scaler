@@ -405,6 +405,11 @@ curl http://localhost:8000/v1/chat/completions \
 
 ### 2.4.1 Audio Model Support
 
+#### Install audio dependencies
+```bash
+pip install transformers==4.52.4 librosa
+```
+
 #### Start service using V0 engine
 ```bash
 TORCH_LLM_ALLREDUCE=1 \
@@ -576,12 +581,12 @@ In this case, you should adjust the launch command with:
 |       Qwen3-30B-A3B               |        language model             |                                 |
 |       Qwen2-VL-7B-Instruct        |        multimodal model           |                                 |
 |       MiniCPM-V-2.6               |        multimodal model           |                                 |
-|       Qwen2.5-VL 7B/32B/72B       |        multimodal model           | pip install transformers==4.52.4       |
-|       UI-TARS-7B-DPO              |        multimodal model           | pip install transformers==4.49.0       |
-|       Gemma-3-12B                 |        multimodal model           | only can run bf16 with no quantization |
-|       GLM-4V-9B                   |        multimodal model           | with --hf-overrides and chat_template  |
-|       Qwen2.5-Omni-7B             |        omni model                 | pip install librosa soundfile          |
-|       whisper-medium/large-v3-turb|        audio model                |                                 |
+|       Qwen2.5-VL 7B/32B/72B       |        multimodal model           | pip install transformers==4.52.4         |
+|       UI-TARS-7B-DPO              |        multimodal model           | pip install transformers==4.49.0         |
+|       Gemma-3-12B                 |        multimodal model           | only can run bf16 with no quantization   |
+|       GLM-4V-9B                   |        multimodal model           | with --hf-overrides and chat_template    |
+|       Qwen2.5-Omni-7B             |        omni model                 | pip install librosa soundfile            |
+|       whisper-medium/large-v3-turb|        audio model                | pip install transformers==4.52.4 librosa |
 |       Qwen3-Embedding             |        Embedding                  |                                 |
 |       bge-large, bge-m3           |        Embedding                  |                                 |
 |       Qwen3-Reranker              |        Rerank                     |                                 |
