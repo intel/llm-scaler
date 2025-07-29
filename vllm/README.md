@@ -367,14 +367,14 @@ python3 -m vllm.entrypoints.openai.api_server \
     --max-num-batched-tokens=5120 \
     --disable-log-requests \
     --max-model-len=5120 \
-    --block-size 16 \
+    --block-size 64 \
     --quantization fp8 \
     -tp=1
 ```
 
 After starting the vLLM service, you can follow this link to use it
 
-#### [Multimodal input](https://docs.vllm.ai/en/latest/features/multimodal_inputs.html#online-serving)
+#### [Multimodal image input](https://docs.vllm.ai/en/latest/features/multimodal_inputs.html#image-inputs_1)
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -400,6 +400,47 @@ curl http://localhost:8000/v1/chat/completions \
     ],
     "max_tokens": 128
   }'
+```
+---
+
+### 2.4.1 Audio Model Support
+
+#### Start service using V0 engine
+```bash
+TORCH_LLM_ALLREDUCE=1 \
+VLLM_USE_V1=0 \
+CCL_ZE_IPC_EXCHANGE=pidfd \
+VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+python3 -m vllm.entrypoints.openai.api_server \
+    --model /llm/models/whisper-medium \
+    --served-model-name whisper-medium \
+    --allowed-local-media-path /llm/models/test \
+    --dtype=float16 \
+    --device=xpu \
+    --enforce-eager \
+    --port 8000 \
+    --host 0.0.0.0 \
+    --trust-remote-code \
+    --gpu-memory-util=0.9 \
+    --no-enable-prefix-caching \
+    --max-num-batched-tokens=5120 \
+    --disable-log-requests \
+    --max-model-len=5120 \
+    --block-size 16 \
+    --quantization fp8 \
+    -tp=1
+```
+
+After starting the vLLM service, you can follow this link to use it
+
+#### [Multimodal audio input](https://docs.vllm.ai/en/latest/features/multimodal_inputs.html#audio-inputs_1)
+
+```bash
+curl http://localhost:8000/v1/audio/transcriptions \
+-H "Content-Type: multipart/form-data" \
+-F file="@/llm/models/test/output.wav" \
+-F model="whisper-large-v3-turbo"
 ```
 ---
 
