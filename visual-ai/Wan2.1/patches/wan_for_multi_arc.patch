@@ -1,0 +1,533 @@
+diff --git a/generate.py b/generate.py
+index c841c19..19a86ab 100644
+--- a/generate.py
++++ b/generate.py
+@@ -7,7 +7,7 @@ import warnings
+ from datetime import datetime
+ 
+ warnings.filterwarnings('ignore')
+-
++import intel_extension_for_pytorch
+ import random
+ 
+ import torch
+@@ -275,9 +275,9 @@ def generate(args):
+         logging.info(
+             f"offload_model is not specified, set to {args.offload_model}.")
+     if world_size > 1:
+-        torch.cuda.set_device(local_rank)
++        torch.xpu.set_device(local_rank)
+         dist.init_process_group(
+-            backend="nccl",
++            backend="gloo",
+             init_method="env://",
+             rank=rank,
+             world_size=world_size)
+diff --git a/requirements.txt b/requirements.txt
+index d416e7b..4b6f419 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -11,6 +11,5 @@ easydict
+ ftfy
+ dashscope
+ imageio-ffmpeg
+-flash_attn
+ gradio>=5.0.0
+ numpy>=1.23.5,<2
+diff --git a/wan/distributed/fsdp.py b/wan/distributed/fsdp.py
+index 6bb496d..9dc907a 100644
+--- a/wan/distributed/fsdp.py
++++ b/wan/distributed/fsdp.py
+@@ -40,4 +40,4 @@ def free_model(model):
+             _free_storage(m._handle.flat_param.data)
+     del model
+     gc.collect()
+-    torch.cuda.empty_cache()
++    torch.xpu.empty_cache()
+diff --git a/wan/distributed/xdit_context_parallel.py b/wan/distributed/xdit_context_parallel.py
+index 4718577..f8cfeda 100644
+--- a/wan/distributed/xdit_context_parallel.py
++++ b/wan/distributed/xdit_context_parallel.py
+@@ -1,6 +1,6 @@
+ # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+ import torch
+-import torch.cuda.amp as amp
++import torch.xpu.amp as amp
+ from xfuser.core.distributed import (
+     get_sequence_parallel_rank,
+     get_sequence_parallel_world_size,
+diff --git a/wan/first_last_frame2video.py b/wan/first_last_frame2video.py
+index 232950f..da794ce 100644
+--- a/wan/first_last_frame2video.py
++++ b/wan/first_last_frame2video.py
+@@ -11,7 +11,7 @@ from functools import partial
+ 
+ import numpy as np
+ import torch
+-import torch.cuda.amp as amp
++import torch.xpu.amp as amp
+ import torch.distributed as dist
+ import torchvision.transforms.functional as TF
+ from tqdm import tqdm
+@@ -66,7 +66,7 @@ class WanFLF2V:
+             init_on_cpu (`bool`, *optional*, defaults to True):
+                 Enable initializing Transformer Model on CPU. Only works without FSDP or USP.
+         """
+-        self.device = torch.device(f"cuda:{device_id}")
++        self.device = torch.device(f"xpu:{device_id}")
+         self.config = config
+         self.rank = rank
+         self.use_usp = use_usp
+@@ -323,7 +323,7 @@ class WanFLF2V:
+             }
+ 
+             if offload_model:
+-                torch.cuda.empty_cache()
++                torch.xpu.empty_cache()
+ 
+             self.model.to(self.device)
+             for _, t in enumerate(tqdm(timesteps)):
+@@ -336,12 +336,12 @@ class WanFLF2V:
+                     latent_model_input, t=timestep, **arg_c)[0].to(
+                         torch.device('cpu') if offload_model else self.device)
+                 if offload_model:
+-                    torch.cuda.empty_cache()
++                    torch.xpu.empty_cache()
+                 noise_pred_uncond = self.model(
+                     latent_model_input, t=timestep, **arg_null)[0].to(
+                         torch.device('cpu') if offload_model else self.device)
+                 if offload_model:
+-                    torch.cuda.empty_cache()
++                    torch.xpu.empty_cache()
+                 noise_pred = noise_pred_uncond + guide_scale * (
+                     noise_pred_cond - noise_pred_uncond)
+ 
+@@ -361,7 +361,7 @@ class WanFLF2V:
+ 
+             if offload_model:
+                 self.model.cpu()
+-                torch.cuda.empty_cache()
++                torch.xpu.empty_cache()
+ 
+             if self.rank == 0:
+                 videos = self.vae.decode(x0)
+@@ -370,7 +370,7 @@ class WanFLF2V:
+         del sample_scheduler
+         if offload_model:
+             gc.collect()
+-            torch.cuda.synchronize()
++            torch.xpu.synchronize()
+         if dist.is_initialized():
+             dist.barrier()
+ 
+diff --git a/wan/image2video.py b/wan/image2video.py
+index 6882c53..029851a 100644
+--- a/wan/image2video.py
++++ b/wan/image2video.py
+@@ -11,7 +11,7 @@ from functools import partial
+ 
+ import numpy as np
+ import torch
+-import torch.cuda.amp as amp
++import torch.xpu.amp as amp
+ import torch.distributed as dist
+ import torchvision.transforms.functional as TF
+ from tqdm import tqdm
+@@ -66,7 +66,7 @@ class WanI2V:
+             init_on_cpu (`bool`, *optional*, defaults to True):
+                 Enable initializing Transformer Model on CPU. Only works without FSDP or USP.
+         """
+-        self.device = torch.device(f"cuda:{device_id}")
++        self.device = torch.device(f"xpu:{device_id}")
+         self.config = config
+         self.rank = rank
+         self.use_usp = use_usp
+@@ -296,7 +296,7 @@ class WanI2V:
+             }
+ 
+             if offload_model:
+-                torch.cuda.empty_cache()
++                torch.xpu.empty_cache()
+ 
+             self.model.to(self.device)
+             for _, t in enumerate(tqdm(timesteps)):
+@@ -309,12 +309,12 @@ class WanI2V:
+                     latent_model_input, t=timestep, **arg_c)[0].to(
+                         torch.device('cpu') if offload_model else self.device)
+                 if offload_model:
+-                    torch.cuda.empty_cache()
++                    torch.xpu.empty_cache()
+                 noise_pred_uncond = self.model(
+                     latent_model_input, t=timestep, **arg_null)[0].to(
+                         torch.device('cpu') if offload_model else self.device)
+                 if offload_model:
+-                    torch.cuda.empty_cache()
++                    torch.xpu.empty_cache()
+                 noise_pred = noise_pred_uncond + guide_scale * (
+                     noise_pred_cond - noise_pred_uncond)
+ 
+@@ -334,7 +334,7 @@ class WanI2V:
+ 
+             if offload_model:
+                 self.model.cpu()
+-                torch.cuda.empty_cache()
++                torch.xpu.empty_cache()
+ 
+             if self.rank == 0:
+                 videos = self.vae.decode(x0)
+@@ -343,7 +343,7 @@ class WanI2V:
+         del sample_scheduler
+         if offload_model:
+             gc.collect()
+-            torch.cuda.synchronize()
++            torch.xpu.synchronize()
+         if dist.is_initialized():
+             dist.barrier()
+ 
+diff --git a/wan/modules/attention.py b/wan/modules/attention.py
+index 4dbbe03..d8e9174 100644
+--- a/wan/modules/attention.py
++++ b/wan/modules/attention.py
+@@ -13,6 +13,7 @@ try:
+ except ModuleNotFoundError:
+     FLASH_ATTN_2_AVAILABLE = False
+ 
++FLASH_ATTN_2_AVAILABLE = False
+ import warnings
+ 
+ __all__ = [
+@@ -51,7 +52,7 @@ def flash_attention(
+     """
+     half_dtypes = (torch.float16, torch.bfloat16)
+     assert dtype in half_dtypes
+-    assert q.device.type == 'cuda' and q.size(-1) <= 256
++    assert q.device.type == 'xpu' and q.size(-1) <= 256
+ 
+     # params
+     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
+@@ -168,12 +169,28 @@ def attention(
+             )
+         attn_mask = None
+ 
++        # q = q.transpose(1, 2).to(dtype)
++        # k = k.transpose(1, 2).to(dtype)
++        # v = v.transpose(1, 2).to(dtype)
++
++        # out = torch.nn.functional.scaled_dot_product_attention(
++        #     q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
++
++        # out = out.transpose(1, 2).contiguous()
++        # return out
++        dtype1 = dtype
++        dtype = torch.float16
+         q = q.transpose(1, 2).to(dtype)
+         k = k.transpose(1, 2).to(dtype)
+         v = v.transpose(1, 2).to(dtype)
+ 
+-        out = torch.nn.functional.scaled_dot_product_attention(
+-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
++        #out = torch.nn.functional.scaled_dot_product_attention(
++        #    q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
++        import xe_addons
++        head_size = q.shape[-1]
++        import math
++        scale = 1 / math.sqrt(head_size)
++        out = xe_addons.sdp_non_causal(q.contiguous(), k.contiguous(), v.contiguous(), attn_mask, scale)
+ 
+         out = out.transpose(1, 2).contiguous()
+-        return out
++        return out.to(dtype1)
+diff --git a/wan/modules/clip.py b/wan/modules/clip.py
+index 42dda04..84308e3 100644
+--- a/wan/modules/clip.py
++++ b/wan/modules/clip.py
+@@ -537,6 +537,6 @@ class CLIPModel:
+         videos = self.transforms.transforms[-1](videos.mul_(0.5).add_(0.5))
+ 
+         # forward
+-        with torch.cuda.amp.autocast(dtype=self.dtype):
++        with torch.xpu.amp.autocast(dtype=self.dtype):
+             out = self.model.visual(videos, use_31_block=True)
+             return out
+diff --git a/wan/modules/model.py b/wan/modules/model.py
+index a5425da..e6f9a76 100644
+--- a/wan/modules/model.py
++++ b/wan/modules/model.py
+@@ -2,12 +2,12 @@
+ import math
+ 
+ import torch
+-import torch.cuda.amp as amp
++import torch.xpu.amp as amp
+ import torch.nn as nn
+ from diffusers.configuration_utils import ConfigMixin, register_to_config
+ from diffusers.models.modeling_utils import ModelMixin
+ 
+-from .attention import flash_attention
++from .attention import flash_attention, attention
+ 
+ __all__ = ['WanModel']
+ 
+@@ -19,7 +19,7 @@ def sinusoidal_embedding_1d(dim, position):
+     # preprocess
+     assert dim % 2 == 0
+     half = dim // 2
+-    position = position.type(torch.float64)
++    position = position.type(torch.float32)
+ 
+     # calculation
+     sinusoid = torch.outer(
+@@ -34,7 +34,7 @@ def rope_params(max_seq_len, dim, theta=10000):
+     freqs = torch.outer(
+         torch.arange(max_seq_len),
+         1.0 / torch.pow(theta,
+-                        torch.arange(0, dim, 2).to(torch.float64).div(dim)))
++                        torch.arange(0, dim, 2).to(torch.float32).div(dim)))
+     freqs = torch.polar(torch.ones_like(freqs), freqs)
+     return freqs
+ 
+@@ -52,7 +52,7 @@ def rope_apply(x, grid_sizes, freqs):
+         seq_len = f * h * w
+ 
+         # precompute multipliers
+-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
++        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float32).reshape(
+             seq_len, n, -1, 2))
+         freqs_i = torch.cat([
+             freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+@@ -146,7 +146,7 @@ class WanSelfAttention(nn.Module):
+ 
+         q, k, v = qkv_fn(x)
+ 
+-        x = flash_attention(
++        x = attention(
+             q=rope_apply(q, grid_sizes, freqs),
+             k=rope_apply(k, grid_sizes, freqs),
+             v=v,
+@@ -176,7 +176,7 @@ class WanT2VCrossAttention(WanSelfAttention):
+         v = self.v(context).view(b, -1, n, d)
+ 
+         # compute attention
+-        x = flash_attention(q, k, v, k_lens=context_lens)
++        x = attention(q, k, v, k_lens=context_lens)
+ 
+         # output
+         x = x.flatten(2)
+diff --git a/wan/modules/t5.py b/wan/modules/t5.py
+index c841b04..bdba262 100644
+--- a/wan/modules/t5.py
++++ b/wan/modules/t5.py
+@@ -475,7 +475,7 @@ class T5EncoderModel:
+         self,
+         text_len,
+         dtype=torch.bfloat16,
+-        device=torch.cuda.current_device(),
++        device=torch.xpu.current_device(),
+         checkpoint_path=None,
+         tokenizer_path=None,
+         shard_fn=None,
+diff --git a/wan/modules/vace_model.py b/wan/modules/vace_model.py
+index a12d1dd..3569519 100644
+--- a/wan/modules/vace_model.py
++++ b/wan/modules/vace_model.py
+@@ -1,6 +1,6 @@
+ # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+ import torch
+-import torch.cuda.amp as amp
++import torch.xpu.amp as amp
+ import torch.nn as nn
+ from diffusers.configuration_utils import register_to_config
+ 
+diff --git a/wan/modules/vae.py b/wan/modules/vae.py
+index 5c6da57..763315a 100644
+--- a/wan/modules/vae.py
++++ b/wan/modules/vae.py
+@@ -2,7 +2,7 @@
+ import logging
+ 
+ import torch
+-import torch.cuda.amp as amp
++import torch.xpu.amp as amp
+ import torch.nn as nn
+ import torch.nn.functional as F
+ from einops import rearrange
+@@ -622,7 +622,7 @@ class WanVAE:
+                  z_dim=16,
+                  vae_pth='cache/vae_step_411000.pth',
+                  dtype=torch.float,
+-                 device="cuda"):
++                 device="xpu"):
+         self.dtype = dtype
+         self.device = device
+ 
+diff --git a/wan/text2video.py b/wan/text2video.py
+index c518b61..0b46637 100644
+--- a/wan/text2video.py
++++ b/wan/text2video.py
+@@ -10,7 +10,7 @@ from contextlib import contextmanager
+ from functools import partial
+ 
+ import torch
+-import torch.cuda.amp as amp
++import torch.xpu.amp as amp
+ import torch.distributed as dist
+ from tqdm import tqdm
+ 
+@@ -60,7 +60,7 @@ class WanT2V:
+             t5_cpu (`bool`, *optional*, defaults to False):
+                 Whether to place T5 model on CPU. Only works without t5_fsdp.
+         """
+-        self.device = torch.device(f"cuda:{device_id}")
++        self.device = torch.device(f"xpu:{device_id}")
+         self.config = config
+         self.rank = rank
+         self.t5_cpu = t5_cpu
+@@ -256,7 +256,7 @@ class WanT2V:
+             x0 = latents
+             if offload_model:
+                 self.model.cpu()
+-                torch.cuda.empty_cache()
++                torch.xpu.empty_cache()
+             if self.rank == 0:
+                 videos = self.vae.decode(x0)
+ 
+@@ -264,7 +264,7 @@ class WanT2V:
+         del sample_scheduler
+         if offload_model:
+             gc.collect()
+-            torch.cuda.synchronize()
++            torch.xpu.synchronize()
+         if dist.is_initialized():
+             dist.barrier()
+ 
+diff --git a/wan/vace.py b/wan/vace.py
+index 8a4f744..c3948c6 100644
+--- a/wan/vace.py
++++ b/wan/vace.py
+@@ -12,7 +12,7 @@ from contextlib import contextmanager
+ from functools import partial
+ 
+ import torch
+-import torch.cuda.amp as amp
++import torch.xpu.amp as amp
+ import torch.distributed as dist
+ import torch.multiprocessing as mp
+ import torch.nn.functional as F
+@@ -68,7 +68,7 @@ class WanVace(WanT2V):
+             t5_cpu (`bool`, *optional*, defaults to False):
+                 Whether to place T5 model on CPU. Only works without t5_fsdp.
+         """
+-        self.device = torch.device(f"cuda:{device_id}")
++        self.device = torch.device(f"xpu:{device_id}")
+         self.config = config
+         self.rank = rank
+         self.t5_cpu = t5_cpu
+@@ -460,7 +460,7 @@ class WanVace(WanT2V):
+             x0 = latents
+             if offload_model:
+                 self.model.cpu()
+-                torch.cuda.empty_cache()
++                torch.xpu.empty_cache()
+             if self.rank == 0:
+                 videos = self.decode_latent(x0, input_ref_images)
+ 
+@@ -468,7 +468,7 @@ class WanVace(WanT2V):
+         del sample_scheduler
+         if offload_model:
+             gc.collect()
+-            torch.cuda.synchronize()
++            torch.xpu.synchronize()
+         if dist.is_initialized():
+             dist.barrier()
+ 
+@@ -497,7 +497,7 @@ class WanVaceMP(WanVace):
+         self.ring_size = ring_size
+         self.dynamic_load()
+ 
+-        self.device = 'cpu' if torch.cuda.is_available() else 'cpu'
++        self.device = 'cpu' if torch.xpu.is_available() else 'cpu'
+         self.vid_proc = VaceVideoProcessor(
+             downsample=tuple(
+                 [x * y for x, y in zip(config.vae_stride, config.patch_size)]),
+@@ -513,7 +513,7 @@ class WanVaceMP(WanVace):
+         if hasattr(self, 'inference_pids') and self.inference_pids is not None:
+             return
+         gpu_infer = os.environ.get(
+-            'LOCAL_WORLD_SIZE') or torch.cuda.device_count()
++            'LOCAL_WORLD_SIZE') or torch.xpu.device_count()
+         pmi_rank = int(os.environ['RANK'])
+         pmi_world_size = int(os.environ['WORLD_SIZE'])
+         in_q_list = [
+@@ -541,7 +541,7 @@ class WanVaceMP(WanVace):
+         self.inference_pids = context.pids()
+         self.initialized_events = initialized_events
+ 
+-    def transfer_data_to_cuda(self, data, device):
++    def transfer_data_to_xpu(self, data, device):
+         if data is None:
+             return None
+         else:
+@@ -549,12 +549,12 @@ class WanVaceMP(WanVace):
+                 data = data.to(device)
+             elif isinstance(data, list):
+                 data = [
+-                    self.transfer_data_to_cuda(subdata, device)
++                    self.transfer_data_to_xpu(subdata, device)
+                     for subdata in data
+                 ]
+             elif isinstance(data, dict):
+                 data = {
+-                    key: self.transfer_data_to_cuda(val, device)
++                    key: self.transfer_data_to_xpu(val, device)
+                     for key, val in data.items()
+                 }
+         return data
+@@ -566,7 +566,7 @@ class WanVaceMP(WanVace):
+             rank = pmi_rank * gpu_infer + gpu
+             print("world_size", world_size, "rank", rank, flush=True)
+ 
+-            torch.cuda.set_device(gpu)
++            torch.xpu.set_device(gpu)
+             dist.init_process_group(
+                 backend='nccl',
+                 init_method='env://',
+@@ -633,7 +633,7 @@ class WanVaceMP(WanVace):
+             model = shard_fn(model)
+             sample_neg_prompt = self.config.sample_neg_prompt
+ 
+-            torch.cuda.empty_cache()
++            torch.xpu.empty_cache()
+             event = initialized_events[gpu]
+             in_q = in_q_list[gpu]
+             event.set()
+@@ -642,9 +642,9 @@ class WanVaceMP(WanVace):
+                 item = in_q.get()
+                 input_prompt, input_frames, input_masks, input_ref_images, size, frame_num, context_scale, \
+                 shift, sample_solver, sampling_steps, guide_scale, n_prompt, seed, offload_model = item
+-                input_frames = self.transfer_data_to_cuda(input_frames, gpu)
+-                input_masks = self.transfer_data_to_cuda(input_masks, gpu)
+-                input_ref_images = self.transfer_data_to_cuda(
++                input_frames = self.transfer_data_to_xpu(input_frames, gpu)
++                input_masks = self.transfer_data_to_xpu(input_masks, gpu)
++                input_ref_images = self.transfer_data_to_xpu(
+                     input_ref_images, gpu)
+ 
+                 if n_prompt == "":
+@@ -748,7 +748,7 @@ class WanVaceMP(WanVace):
+                             generator=seed_g)[0]
+                         latents = [temp_x0.squeeze(0)]
+ 
+-                    torch.cuda.empty_cache()
++                    torch.xpu.empty_cache()
+                     x0 = latents
+                     if rank == 0:
+                         videos = self.decode_latent(
+@@ -758,7 +758,7 @@ class WanVaceMP(WanVace):
+                 del sample_scheduler
+                 if offload_model:
+                     gc.collect()
+-                    torch.cuda.synchronize()
++                    torch.xpu.synchronize()
+                 if dist.is_initialized():
+                     dist.barrier()
+ 
