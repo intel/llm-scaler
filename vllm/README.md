@@ -522,22 +522,25 @@ In this case, you should adjust the launch command with:
 | Model Name        | Category         | Notes                          |
 |-------------------|------------------|---------------------------------|
 |       DeepSeek-R1-0528-Qwen3-8B   |        language model             |                                 |
-|       DeepSeek-R1-Distill-1.5B/7B/8B/14B/32B/70B             |         language model         |                                 |
+|       DeepSeek-R1-Distill-1.5B/7B/8B/14B/32B/70B             |         language model  |                |
 |       Qwen3-8B/14B/32B            |        language model             |                                 |
 |       QwQ-32B                     |        language model             |                                 |
 |       Ministral-8B                |        language model             |                                 |
+|       Mixtral-8x7B                |        language model             |                                 |
 |       Llama3.1-8B/Llama3.1-70B    |        language model             |                                 |
-|       Baichuan2-7B/13B            |        language model             |                                 |
-|       codegeex4-all-9b            |        language model             |                                 |
+|       Baichuan2-7B/13B            |        language model             |       with chat_template        |
+|       codegeex4-all-9b            |        language model             |       with chat_template        |
 |       DeepSeek-Coder-33B          |        language model             |                                 |
+|       GLM-4-0414-9B/32B           |        language model             |                                 |
 |       Qwen3-30B-A3B               |        language model             |                                 |
 |       Qwen2-VL-7B-Instruct        |        multimodal model           |                                 |
 |       MiniCPM-V-2.6               |        multimodal model           |                                 |
 |       Qwen2.5-VL 7B/32B/72B       |        multimodal model           | pip install transformers==4.52.4       |
 |       UI-TARS-7B-DPO              |        multimodal model           | pip install transformers==4.49.0       |
 |       Gemma-3-12B                 |        multimodal model           | only can run bf16 with no quantization |
-|       GLM-4V-9B                   |        multimodal model           | only can run with four cards           |
-|       Qwen2.5-Omni-7B             |        omni model           | pip install librosa soundfile           |
+|       GLM-4V-9B                   |        multimodal model           | with --hf-overrides and chat_template  |
+|       Qwen2.5-Omni-7B             |        omni model                 | pip install librosa soundfile          |
+|       whisper-medium/large-v3-turb|        audio model                |                                 |
 |       Qwen3-Embedding             |        Embedding                  |                                 |
 |       bge-large, bge-m3           |        Embedding                  |                                 |
 |       Qwen3-Reranker              |        Rerank                     |                                 |
