@@ -579,9 +579,10 @@ In this case, you should adjust the launch command with:
 |       codegeex4-all-9b            |        language model             |       with chat_template        |
 |       DeepSeek-Coder-33B          |        language model             |                                 |
 |       GLM-4-0414-9B/32B           |        language model             |                                 |
-|       Qwen3-30B-A3B               |        language model             |                                 |
+|Qwen3 30B-A3B/Coder-30B-A3B-Instruct|       language MOE model         |                                 |
+|       GLM-4.5-Air                 |        language MOE model         |                                 |
 |       Qwen2-VL-7B-Instruct        |        multimodal model           |                                 |
-|       MiniCPM-V-2.6               |        multimodal model           |                                 |
+|       MiniCPM-V-2.6               |        multimodal model           | use bf16 to avoid nan error     |
 |       Qwen2.5-VL 7B/32B/72B       |        multimodal model           | pip install transformers==4.52.4         |
 |       UI-TARS-7B-DPO              |        multimodal model           | pip install transformers==4.49.0         |
 |       Gemma-3-12B                 |        multimodal model           | only can run bf16 with no quantization   |
