@@ -71,7 +71,7 @@ RUN pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url h
     pip install bigdl-core-xe-all==2.6.0 --extra-index-url https://download.pytorch.org/whl/xpu && \
     apt remove python3-blinker -y
 
-    COPY ./patches/wan_for_multi_arc.patch /tmp/
+COPY ./patches/wan_for_multi_arc.patch /tmp/
 
 RUN cd /llm && \
     git clone https://github.com/Wan-Video/Wan2.1.git && \
