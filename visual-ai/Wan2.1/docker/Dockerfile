@@ -39,6 +39,20 @@ RUN apt-get update -y && \
     apt-get install -y intel-oneapi-dpcpp-ct=2025.0.1-17 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# pin compute runtime version
+RUN mkdir /tmp/neo && \
+    cd /tmp/neo && \
+    wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.12.5/intel-igc-core-2_2.12.5+19302_amd64.deb && \
+    wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.12.5/intel-igc-opencl-2_2.12.5+19302_amd64.deb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-ocloc-dbgsym_25.22.33944.8-0_amd64.ddeb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-ocloc_25.22.33944.8-0_amd64.deb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-opencl-icd-dbgsym_25.22.33944.8-0_amd64.ddeb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-opencl-icd_25.22.33944.8-0_amd64.deb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libigdgmm12_22.7.0_amd64.deb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libze-intel-gpu1-dbgsym_25.22.33944.8-0_amd64.ddeb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libze-intel-gpu1_25.22.33944.8-0_amd64.deb && \
+    dpkg -i *.deb
+
 WORKDIR /llm
 
 # Set environment variables early
@@ -53,11 +67,11 @@ RUN apt-get update && apt-get install -y \
 ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python3.10/dist-packages/torch/lib:$LD_LIBRARY_PATH"
 
 RUN pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/xpu && \
-    pip install intel-extension-for-pytorch --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/cn && \
-    pip install bigdl-core==2.4.0b1 && \
+    pip install intel-extension-for-pytorch==2.7.10+xpu --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/cn && \
+    pip install bigdl-core-xe-all==2.6.0 --extra-index-url https://download.pytorch.org/whl/xpu && \
     apt remove python3-blinker -y
-    
-COPY ./patches/wan_for_multi_arc.patch /tmp/
+
+    COPY ./patches/wan_for_multi_arc.patch /tmp/
 
 RUN cd /llm && \
     git clone https://github.com/Wan-Video/Wan2.1.git && \
@@ -66,8 +80,6 @@ RUN cd /llm && \
     git apply /tmp/wan_for_multi_arc.patch && \
     pip install -r requirements.txt && \
     pip install einops && \
-    pip install patchelf && \
-    apt-get install plocate && \
-    patchelf --clear-execstack $(locate libintel-ext-pt-cpu.so | head -n 1)
+    pip install cffi
 
 WORKDIR /llm/Wan2.1
