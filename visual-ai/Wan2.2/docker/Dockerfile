@@ -54,6 +54,8 @@ RUN mkdir /tmp/neo && \
     dpkg -i *.deb
 
 WORKDIR /llm
+COPY ./patches/wan22_for_multi_arc.patch /tmp/
+COPY ./patches/0001-oneccl-align-global-V0.1.1.patch /tmp/
 
 # Set environment variables early
 ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/local/lib/"
@@ -91,11 +93,9 @@ CMD ["bash", "-c", "source /root/.bashrc && exec bash"]
 ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python3.10/dist-packages/torch/lib:$LD_LIBRARY_PATH"
 
 RUN pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/xpu && \
-    pip install intel-extension-for-pytorch==2.7.10+xpu --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/cn && \
+    pip install intel-extension-for-pytorch==2.7.10+xpu oneccl_bind_pt==2.7.0+xpu --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/cn/ && \
     pip install bigdl-core-xe-all==2.6.0 --extra-index-url https://download.pytorch.org/whl/xpu && \
     apt remove python3-blinker -y
-
-COPY ./patches/wan22_for_multi_arc.patch /tmp/
 
 RUN cd /llm && \
     git clone https://github.com/Wan-Video/Wan2.2.git && \
@@ -106,4 +106,4 @@ RUN cd /llm && \
     pip install einops && \
     pip install cffi
 
-WORKDIR /llm/Wan2.1
+WORKDIR /llm/Wan2.2
