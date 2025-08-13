@@ -12,7 +12,7 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    1.3 [Pulling and Running the vllm Docker Container](#13-pulling-and-running-the-vllm-docker-container)  
    1.4 [Launching the Serving Service](#14-launching-the-serving-service)  
    1.5 [Benchmarking the Service](#15-benchmarking-the-service)  
-   1.6 [Monitoring the Service with Prometheus and Grafana](#16-monitoring-the-service-with-prometheus-and-grafana)  
+   1.6 [(Optional) Monitoring the Service with Prometheus and Grafana](#16-monitoring-the-service-with-prometheus-and-grafana)  
 2. [Advanced Features](#2-advanced-features)  
    2.1 [CCL Support (both P2P & USM)](#21-ccl-support-both-p2p--usm)  
    2.2 [INT4 and FP8 Quantized Online Serving](#22-int4-and-fp8-quantized-online-serving)  
