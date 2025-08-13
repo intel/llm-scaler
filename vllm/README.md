@@ -13,8 +13,6 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    1.4 [Launching the Serving Service](#14-launching-the-serving-service)  
    1.5 [Benchmarking the Service](#15-benchmarking-the-service)  
    1.6 [Monitoring the Service with Prometheus and Grafana](#16-monitoring-the-service-with-prometheus-and-grafana)  
-   1.7 [Visualization with Grafana Dashboard](#17-visualization-with-grafana-board)  
-   1.8 [Core Metrics for Evaluating LLM Service Performance and Resource Utilization](#18-core-metrics-for-evaluating-llm-service-performance-and-resource-utilization)
 2. [Advanced Features](#2-advanced-features)  
    2.1 [CCL Support (both P2P & USM)](#21-ccl-support-both-p2p--usm)  
    2.2 [INT4 and FP8 Quantized Online Serving](#22-int4-and-fp8-quantized-online-serving)  
@@ -277,8 +275,8 @@ Access http://localhost:8000/metrics to check preprocessed vLLM Prometheus metri
 
 ![alt text](README_IMAGES/image-5.png)
 
-### 1.7 Visualization with Grafana Dashboard
-Access http://localhost:3000 and log in to the website with default credential(`username:admin`, `password:admin`).
+
+To visualize the metrics, access http://localhost:3000 and log in to the website with default credential(`username:admin`, `password:admin`).
 
 ![alt text](README_IMAGES/image.png)
 
@@ -295,7 +293,6 @@ Click Save & Test. You will see a green success message stating:
 
 Go to http://localhost:3000/dashboard/import, upload the `grafana.json` file, and select the `prometheus` datasource. You will see an interface similar to the following:
 
-![alt text](README_IMAGES/image-4.png)
 <details><summary> grafana.json </summary>
 
 ```
@@ -1859,10 +1856,7 @@ Go to http://localhost:3000/dashboard/import, upload the `grafana.json` file, an
  ```
 </details>
 
-A demo of DeepSeek-R1-Distill-Qwen-32B running for one hour on 4×Arc770 GPUs.
-![alt text](README_IMAGES/image-6.png)
-
-### 1.8 Core Metrics for Evaluating LLM Service Performance and Resource Utilization
+![alt text](README_IMAGES/image-4.png)
 
 These metrics above are essential for monitoring **large language model (LLM) service performance** and **resource utilization**, particularly crucial in streaming generation scenarios (e.g., ChatGPT, API services). Below are detailed explanations and practical implications:
 
@@ -1963,7 +1957,8 @@ These metrics above are essential for monitoring **large language model (LLM) se
   - Too low → May truncate outputs; Too high → Resource waste or OOM risks.
 
 ---
-
+A demo of DeepSeek-R1-Distill-Qwen-32B running for one hour on 4×Arc770 GPUs.
+![alt text](README_IMAGES/image-6.png)
 
 ## 2. Advanced Features
 
