@@ -1859,6 +1859,8 @@ Go to http://localhost:3000/dashboard/import, upload the `grafana.json` file, an
  ```
 </details>
 
+A demo of DeepSeek-R1-Distill-Qwen-32B running for one hour on 4×Arc770 GPUs.
+![alt text](README_IMAGES/image-6.png)
 
 ### 1.8 Core Metrics for Evaluating LLM Service Performance and Resource Utilization
 
