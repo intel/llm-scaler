@@ -86,7 +86,7 @@ HOST_DIR is the directory you want to mount into the docker.
 
 ```bash
 IMAGE_NAME="intel/llm-scaler-platform:latest"
-HOST_DIR="$2"
+HOST_DIR=""
 
 # Verify directory exists
 if [ ! -d "$HOST_DIR" ]; then
@@ -96,7 +96,9 @@ fi
 
 # Run the container
 docker run -it \
+  --privileged \
   --device=/dev/dri \
+  $(for dev in /dev/mei*; do echo --device $dev; done) \
   --group-add video \
   --cap-add=SYS_ADMIN \
   --mount type=bind,source=/dev/dri/by-path,target=/dev/dri/by-path \
@@ -174,6 +176,20 @@ Enter the container:
 ```bash
 docker exec -it lsv-container bash
 ```
+
+---
+
+**Note — Mapping a Single GPU**
+> If you need to map only a specific GPU into the container, remove both `--privileged` and `--device=/dev/dri` from the `docker run` command, and replace them with the following device and mount options (example for the first GPU):
+
+```bash
+--device /dev/dri/renderD128:/dev/dri/renderD128 \
+--mount type=bind,source="/dev/dri/by-path/pci-0000:18:00.0-card",target="/dev/dri/by-path/pci-0000:18:00.0-card" \
+--mount type=bind,source="/dev/dri/by-path/pci-0000:18:00.0-render",target="/dev/dri/by-path/pci-0000:18:00.0-render" \
+-v /dev/dri/card0:/dev/dri/card0 \
+```
+
+This way, only the first GPU will be mapped into the Docker container.
 
 ---
 
