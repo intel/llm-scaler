@@ -2315,7 +2315,7 @@ In this case, you should adjust the launch command with:
 --max-model-len 114432
 ```
 
-### 2.8 Multi-modal Webui
+### 2.8 Multi-Modal Webui
 The project provides two optimized interfaces for interacting with Qwen2.5-VL models:
 
 
@@ -2328,10 +2328,10 @@ The project provides two optimized interfaces for interacting with Qwen2.5-VL mo
 #### 🚀 Deployment Options
 
 #### Option 1: Gradio Deployment (Recommended for Most Users)
-- check `/llm-scaler/vllm/webui/multimodal_gradio/README.md` for implementation details
+- check `/llm-scaler/vllm/webui/multi-modal-gradio/README.md` for implementation details
 
 #### Option 2: ComfyUI Deployment (Advanced Workflows)
-- check `/llm-scaler/vllm/webui/multimodal_comfyui/README.md` for implementation details
+- check `/llm-scaler/vllm/webui/multi-modal-comfyui/README.md` for implementation details
 
 
 #### 🔧 Configuration Guide

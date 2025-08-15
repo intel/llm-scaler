@@ -64,7 +64,7 @@ conda create -n qwen_gradio python=3.11
 conda activate qwen_gradio
 ```
 ```bash
-python /llm-scaler/vllm/webui/multimodal_gradio/main.py --model /llm/models/Qwen2.5-VL-7B-Instruct 
+python /llm-scaler/vllm/webui/multi-modal-gradio/main.py --model /llm/models/Qwen2.5-VL-7B-Instruct 
 # The model need to be downloaded in advance to the directory
 ```
 
