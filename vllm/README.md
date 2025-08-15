@@ -21,6 +21,7 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    2.5 [Omni Model Support](#25-omni-model-support)  
    2.6 [Data Parallelism (DP)](#26-data-parallelism-dp)  
    2.7 [Finding maximum Context Length](#27-finding-maximum-context-length)  
+   2.8 [Multi-modal Webui](#28-multi-modal-webui)
 3. [Supported Models](#3-supported-models)  
 4. [Troubleshooting](#4-troubleshooting)
 5. [Performance tuning](#5-performance-tuning)
@@ -2313,6 +2314,33 @@ In this case, you should adjust the launch command with:
 ```bash
 --max-model-len 114432
 ```
+
+### 2.8 Multi-modal Webui
+The project provides two optimized interfaces for interacting with Qwen2.5-VL models:
+
+
+#### 📌 Core Components
+- **Inference Engine**: vLLM (Intel-optimized)
+- **Interfaces**: 
+  - Gradio (for rapid prototyping)
+  - ComfyUI (for complex workflows)
+
+#### 🚀 Deployment Options
+
+#### Option 1: Gradio Deployment (Recommended for Most Users)
+- check `/llm-scaler/vllm/webui/multimodal_gradio/README.md` for implementation details
+
+#### Option 2: ComfyUI Deployment (Advanced Workflows)
+- check `/llm-scaler/vllm/webui/multimodal_comfyui/README.md` for implementation details
+
+
+#### 🔧 Configuration Guide
+
+| Parameter | Effect | Recommended Value |
+|-----------|--------|-------------------|
+| `--quantization fp8` | XPU acceleration | Required |
+| `-tp=2` | Tensor parallelism | Match GPU count |
+| `--max-model-len` | Context window | 32768 (max) |
 
 ---
 
