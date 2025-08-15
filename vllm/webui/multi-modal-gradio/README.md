@@ -62,6 +62,7 @@ python3 -m vllm.entrypoints.openai.api_server \
 ```bash
 conda create -n qwen_gradio python=3.11
 conda activate qwen_gradio
+pip install gradio
 ```
 ```bash
 python /llm-scaler/vllm/webui/multi-modal-gradio/main.py --model /llm/models/Qwen2.5-VL-7B-Instruct 

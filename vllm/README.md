@@ -21,7 +21,7 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    2.5 [Omni Model Support](#25-omni-model-support)  
    2.6 [Data Parallelism (DP)](#26-data-parallelism-dp)  
    2.7 [Finding maximum Context Length](#27-finding-maximum-context-length)  
-   2.8 [Multi-modal Webui](#28-multi-modal-webui)
+   2.8 [Multi-Modal Webui](#28-multi-modal-webui)
 3. [Supported Models](#3-supported-models)  
 4. [Troubleshooting](#4-troubleshooting)
 5. [Performance tuning](#5-performance-tuning)
