@@ -20,7 +20,7 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    2.4 [Multi-Modal Model Support](#24-multi-modal-model-support)  
    2.5 [Omni Model Support](#25-omni-model-support)  
    2.6 [Data Parallelism (DP)](#26-data-parallelism-dp)  
-   2.7 [Maximum Context Length Support](#27-maximum-context-length-support)  
+   2.7 [Finding maximum Context Length](#27-finding-maximum-context-length)  
 3. [Supported Models](#3-supported-models)  
 4. [Troubleshooting](#4-troubleshooting)
 5. [Performance tuning](#5-performance-tuning)
@@ -2249,7 +2249,7 @@ curl http://localhost:8000/v1/chat/completions \
     {"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": "https://modelscope.oss-cn-beijing.aliyuncs.com/resource/qwen.png"}},
         {"type": "audio_url", "audio_url": {"url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2.5-Omni/cough.wav"}},
-        {"type": "text", "text": "What is the text in the illustrate ans what it the sound in the audio?"}
+        {"type": "text", "text": "What is the text in the illustration, and what is the sound in the audio?"}
     ]}
     ]
     }'
@@ -2281,7 +2281,7 @@ To enable data parallelism, add:
 
 ---
 
-### 2.7 Maximum Context Length Support
+### 2.7 Finding maximum Context Length
 When using the `V1` engine, the system automatically logs the maximum supported context length during startup based on the available GPU memory and KV cache configuration.
 
 #### Example: Successful Startup
