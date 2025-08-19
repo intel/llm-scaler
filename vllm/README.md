@@ -166,7 +166,7 @@ docker pull intel/llm-scaler-vllm:latest
 
 **Supplement: For Intel Arc A770 GPUs**
 ```bash
-docker pull intelanalytics/multi-arc-serving:0.1.0
+docker pull intelanalytics/multi-arc-serving:latest
 ````
 - Usage Instructions: [VLLM Docker Quickstart for A770](https://github.com/intel/ipex-llm/blob/main/docs/mddocs/DockerGuides/vllm_docker_quickstart.md#3-start-the-docker-container)
 
