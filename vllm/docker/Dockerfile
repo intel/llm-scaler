@@ -120,6 +120,10 @@ RUN pip install accelerate hf_transfer 'modelscope!=1.15.0'
 RUN pip uninstall pytorch-triton-xpu triton -y && \
     pip install https://download.pytorch-extension.intel.com/ipex_dev/xpu/triton-3.3.0%2Bgitbd88137b-cp310-cp310-linux_x86_64.whl
 
+# Pin transformers version to avoid conflict in vLLM
+RUN pip install "transformers<4.54.0"
+
+
 # Set additional environment for production usage
 ENV VLLM_USAGE_SOURCE=production-docker-image
 ENV TRITON_XPU_PROFILE=1
