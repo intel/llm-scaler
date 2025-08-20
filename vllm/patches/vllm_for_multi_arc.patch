@@ -7591,17 +7591,288 @@ index 01d5d9da0..361fdda10 100644
 -    Currently, we load the model at original precision before quantizing down to 8-bits, so you need enough memory to load the whole model.
 +    Currently, by default we load the model at original precision before quantizing down to 8-bits, so you need enough memory to load the whole model. To avoid this, adding `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1` can allow offloading weights to cpu before quantization and quantized weights will be kept in device.
 diff --git a/docs/models/supported_models.md b/docs/models/supported_models.md
-index 7594c6e6f..0bd057303 100644
+index 7594c6e6f..6d9d4dea0 100644
 --- a/docs/models/supported_models.md
 +++ b/docs/models/supported_models.md
-@@ -521,6 +521,7 @@ Specified using `--task generate`.
- | `FuyuForCausalLM`                            | Fuyu                                                                     | T + I                                                                 | `adept/fuyu-8b` etc.                                                                                                                                    | ✅︎                     | ✅︎                          |                       |
- | `Gemma3ForConditionalGeneration`             | Gemma 3                                                                  | T + I<sup>+</sup>                                                     | `google/gemma-3-4b-it`, `google/gemma-3-27b-it`, etc.                                                                                                   | ✅︎                     | ✅︎                          | ⚠️                    |
- | `GLM4VForCausalLM`<sup>^</sup>               | GLM-4V                                                                   | T + I                                                                 | `THUDM/glm-4v-9b`, `THUDM/cogagent-9b-20241220` etc.                                                                                                    | ✅︎                     | ✅︎                          | ✅︎                    |
-+| `Glm4vForConditionalGeneration`              | GLM-4.1V-Thinking                                                        | T + I<sup>E+</sup> + V<sup>E+</sup>                                   | `THUDM/GLM-4.1V-9B-Thinkg`,  etc.                                                                                                                       | ✅︎                     | ✅︎                          | ✅︎                    |
- | `GraniteSpeechForConditionalGeneration`      | Granite Speech                                                           | T + A                                                                 | `ibm-granite/granite-speech-3.3-8b`                                                                                                                     | ✅︎                     | ✅︎                          | ✅︎                    |
- | `H2OVLChatModel`                             | H2OVL                                                                    | T + I<sup>E+</sup>                                                    | `h2oai/h2ovl-mississippi-800m`, `h2oai/h2ovl-mississippi-2b`, etc.                                                                                      | ✅︎                     | ✅︎\*                        |                       |
- | `Idefics3ForConditionalGeneration`           | Idefics3                                                                 | T + I                                                                 | `HuggingFaceM4/Idefics3-8B-Llama3` etc.                                                                                                                 | ✅︎                     | ✅︎                          |                       |
+@@ -297,79 +297,103 @@ See [this page][generative-models] for more information on how to use generative
+ 
+ #### Text Generation
+ 
+-Specified using `--task generate`.
+-
+-| Architecture                                      | Models                                              | Example HF Models                                                                                                                                                            | [LoRA][lora-adapter]   | [PP][distributed-serving]   |
+-|---------------------------------------------------|-----------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------|-----------------------------|
+-| `AquilaForCausalLM`                               | Aquila, Aquila2                                     | `BAAI/Aquila-7B`, `BAAI/AquilaChat-7B`, etc.                                                                                                                                 | ✅︎                     | ✅︎                          |
+-| `ArcticForCausalLM`                               | Arctic                                              | `Snowflake/snowflake-arctic-base`, `Snowflake/snowflake-arctic-instruct`, etc.                                                                                               | ✅︎                     |                             |
+-| `BaiChuanForCausalLM`                             | Baichuan2, Baichuan                                 | `baichuan-inc/Baichuan2-13B-Chat`, `baichuan-inc/Baichuan-7B`, etc.                                                                                                          | ✅︎                     | ✅︎                          |
+-| `BambaForCausalLM`                                | Bamba                                               | `ibm-ai-platform/Bamba-9B-fp8`, `ibm-ai-platform/Bamba-9B`                                                                                                                   |                        |                             |
+-| `BloomForCausalLM`                                | BLOOM, BLOOMZ, BLOOMChat                            | `bigscience/bloom`, `bigscience/bloomz`, etc.                                                                                                                                | ✅︎                     |                             |
+-| `BartForConditionalGeneration`                    | BART                                                | `facebook/bart-base`, `facebook/bart-large-cnn`, etc.                                                                                                                        |                        |                             |
+-| `ChatGLMModel`, `ChatGLMForConditionalGeneration` | ChatGLM                                             | `THUDM/chatglm2-6b`, `THUDM/chatglm3-6b`, `ShieldLM-6B-chatglm3`, etc.                                                                                                       | ✅︎                     | ✅︎                          |
+-| `CohereForCausalLM`, `Cohere2ForCausalLM`         | Command-R                                           | `CohereForAI/c4ai-command-r-v01`, `CohereForAI/c4ai-command-r7b-12-2024`, etc.                                                                                               | ✅︎                     | ✅︎                          |
+-| `DbrxForCausalLM`                                 | DBRX                                                | `databricks/dbrx-base`, `databricks/dbrx-instruct`, etc.                                                                                                                     | ✅︎                     |                             |
+-| `DeciLMForCausalLM`                               | DeciLM                                              | `nvidia/Llama-3_3-Nemotron-Super-49B-v1`, etc.                                                                                                                               | ✅︎                     |                             |
+-| `DeepseekForCausalLM`                             | DeepSeek                                            | `deepseek-ai/deepseek-llm-67b-base`, `deepseek-ai/deepseek-llm-7b-chat` etc.                                                                                                 | ✅︎                     |                             |
+-| `DeepseekV2ForCausalLM`                           | DeepSeek-V2                                         | `deepseek-ai/DeepSeek-V2`, `deepseek-ai/DeepSeek-V2-Chat` etc.                                                                                                               | ✅︎                     |                             |
+-| `DeepseekV3ForCausalLM`                           | DeepSeek-V3                                         | `deepseek-ai/DeepSeek-V3-Base`, `deepseek-ai/DeepSeek-V3` etc.                                                                                                               | ✅︎                     |                             |
+-| `ExaoneForCausalLM`                               | EXAONE-3                                            | `LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct`, etc.                                                                                                                                 | ✅︎                     | ✅︎                          |
+-| `FalconForCausalLM`                               | Falcon                                              | `tiiuae/falcon-7b`, `tiiuae/falcon-40b`, `tiiuae/falcon-rw-7b`, etc.                                                                                                         | ✅︎                     |                             |
+-| `FalconMambaForCausalLM`                          | FalconMamba                                         | `tiiuae/falcon-mamba-7b`, `tiiuae/falcon-mamba-7b-instruct`, etc.                                                                                                            | ✅︎                     | ✅︎                          |
+-| `FalconH1ForCausalLM`                             | Falcon-H1                                           | `tiiuae/Falcon-H1-34B-Base`, `tiiuae/Falcon-H1-34B-Instruct`, etc.                                                                                                           | ✅︎                     | ✅︎                          |
+-| `GemmaForCausalLM`                                | Gemma                                               | `google/gemma-2b`, `google/gemma-1.1-2b-it`, etc.                                                                                                                            | ✅︎                     | ✅︎                          |
+-| `Gemma2ForCausalLM`                               | Gemma 2                                             | `google/gemma-2-9b`, `google/gemma-2-27b`, etc.                                                                                                                              | ✅︎                     | ✅︎                          |
+-| `Gemma3ForCausalLM`                               | Gemma 3                                             | `google/gemma-3-1b-it`, etc.                                                                                                                                                 | ✅︎                     | ✅︎                          |
+-| `GlmForCausalLM`                                  | GLM-4                                               | `THUDM/glm-4-9b-chat-hf`, etc.                                                                                                                                               | ✅︎                     | ✅︎                          |
+-| `Glm4ForCausalLM`                                 | GLM-4-0414                                          | `THUDM/GLM-4-32B-0414`, etc.                                                                                                                                                 | ✅︎                     | ✅︎                          |
+-| `GPT2LMHeadModel`                                 | GPT-2                                               | `gpt2`, `gpt2-xl`, etc.                                                                                                                                                      | ✅︎                     |                             |
+-| `GPTBigCodeForCausalLM`                           | StarCoder, SantaCoder, WizardCoder                  | `bigcode/starcoder`, `bigcode/gpt_bigcode-santacoder`, `WizardLM/WizardCoder-15B-V1.0`, etc.                                                                                 | ✅︎                     | ✅︎                          |
+-| `GPTJForCausalLM`                                 | GPT-J                                               | `EleutherAI/gpt-j-6b`, `nomic-ai/gpt4all-j`, etc.                                                                                                                            | ✅︎                     |                             |
+-| `GPTNeoXForCausalLM`                              | GPT-NeoX, Pythia, OpenAssistant, Dolly V2, StableLM | `EleutherAI/gpt-neox-20b`, `EleutherAI/pythia-12b`, `OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5`, `databricks/dolly-v2-12b`, `stabilityai/stablelm-tuned-alpha-7b`, etc. | ✅︎                     |                             |
+-| `GraniteForCausalLM`                              | Granite 3.0, Granite 3.1, PowerLM                   | `ibm-granite/granite-3.0-2b-base`, `ibm-granite/granite-3.1-8b-instruct`, `ibm/PowerLM-3b`, etc.                                                                             | ✅︎                     | ✅︎                          |
+-| `GraniteMoeForCausalLM`                           | Granite 3.0 MoE, PowerMoE                           | `ibm-granite/granite-3.0-1b-a400m-base`, `ibm-granite/granite-3.0-3b-a800m-instruct`, `ibm/PowerMoE-3b`, etc.                                                                | ✅︎                     | ✅︎                          |
+-| `GraniteMoeHybridForCausalLM`                     | Granite 4.0 MoE Hybrid                              | `ibm-granite/granite-4.0-tiny-preview`, etc.                                                                                                                                 | ✅︎                     | ✅︎                          |
+-| `GraniteMoeSharedForCausalLM`                     | Granite MoE Shared                                  | `ibm-research/moe-7b-1b-active-shared-experts` (test model)                                                                                                                  | ✅︎                     | ✅︎                          |
+-| `GritLM`                                          | GritLM                                              | `parasail-ai/GritLM-7B-vllm`.                                                                                                                                                | ✅︎                     | ✅︎                          |
+-| `Grok1ModelForCausalLM`                           | Grok1                                               | `hpcai-tech/grok-1`.                                                                                                                                                         | ✅︎                     | ✅︎                          |
+-| `InternLMForCausalLM`                             | InternLM                                            | `internlm/internlm-7b`, `internlm/internlm-chat-7b`, etc.                                                                                                                    | ✅︎                     | ✅︎                          |
+-| `InternLM2ForCausalLM`                            | InternLM2                                           | `internlm/internlm2-7b`, `internlm/internlm2-chat-7b`, etc.                                                                                                                  | ✅︎                     | ✅︎                          |
+-| `InternLM3ForCausalLM`                            | InternLM3                                           | `internlm/internlm3-8b-instruct`, etc.                                                                                                                                       | ✅︎                     | ✅︎                          |
+-| `JAISLMHeadModel`                                 | Jais                                                | `inceptionai/jais-13b`, `inceptionai/jais-13b-chat`, `inceptionai/jais-30b-v3`, `inceptionai/jais-30b-chat-v3`, etc.                                                         | ✅︎                     |                             |
+-| `JambaForCausalLM`                                | Jamba                                               | `ai21labs/AI21-Jamba-1.5-Large`, `ai21labs/AI21-Jamba-1.5-Mini`, `ai21labs/Jamba-v0.1`, etc.                                                                                 | ✅︎                     | ✅︎                          |
+-| `LlamaForCausalLM`                                | Llama 3.1, Llama 3, Llama 2, LLaMA, Yi              | `meta-llama/Meta-Llama-3.1-405B-Instruct`, `meta-llama/Meta-Llama-3.1-70B`, `meta-llama/Meta-Llama-3-70B-Instruct`, `meta-llama/Llama-2-70b-hf`, `01-ai/Yi-34B`, etc.        | ✅︎                     | ✅︎                          |
+-| `MambaForCausalLM`                                | Mamba                                               | `state-spaces/mamba-130m-hf`, `state-spaces/mamba-790m-hf`, `state-spaces/mamba-2.8b-hf`, etc.                                                                               | ✅︎                     |                             |
+-| `MiniCPMForCausalLM`                              | MiniCPM                                             | `openbmb/MiniCPM-2B-sft-bf16`, `openbmb/MiniCPM-2B-dpo-bf16`, `openbmb/MiniCPM-S-1B-sft`, etc.                                                                               | ✅︎                     | ✅︎                          |
+-| `MiniCPM3ForCausalLM`                             | MiniCPM3                                            | `openbmb/MiniCPM3-4B`, etc.                                                                                                                                                  | ✅︎                     | ✅︎                          |
+-| `MistralForCausalLM`                              | Mistral, Mistral-Instruct                           | `mistralai/Mistral-7B-v0.1`, `mistralai/Mistral-7B-Instruct-v0.1`, etc.                                                                                                      | ✅︎                     | ✅︎                          |
+-| `MixtralForCausalLM`                              | Mixtral-8x7B, Mixtral-8x7B-Instruct                 | `mistralai/Mixtral-8x7B-v0.1`, `mistralai/Mixtral-8x7B-Instruct-v0.1`, `mistral-community/Mixtral-8x22B-v0.1`, etc.                                                          | ✅︎                     | ✅︎                          |
+-| `MPTForCausalLM`                                  | MPT, MPT-Instruct, MPT-Chat, MPT-StoryWriter        | `mosaicml/mpt-7b`, `mosaicml/mpt-7b-storywriter`, `mosaicml/mpt-30b`, etc.                                                                                                   | ✅︎                     |                             |
+-| `NemotronForCausalLM`                             | Nemotron-3, Nemotron-4, Minitron                    | `nvidia/Minitron-8B-Base`, `mgoin/Nemotron-4-340B-Base-hf-FP8`, etc.                                                                                                         | ✅︎                     | ✅︎                          |
+-| `OLMoForCausalLM`                                 | OLMo                                                | `allenai/OLMo-1B-hf`, `allenai/OLMo-7B-hf`, etc.                                                                                                                             | ✅︎                     |                             |
+-| `OLMo2ForCausalLM`                                | OLMo2                                               | `allenai/OLMo-2-0425-1B`, etc.                                                                                                                                               | ✅︎                     |                             |
+-| `OLMoEForCausalLM`                                | OLMoE                                               | `allenai/OLMoE-1B-7B-0924`, `allenai/OLMoE-1B-7B-0924-Instruct`, etc.                                                                                                        | ✅︎                     | ✅︎                          |
+-| `OPTForCausalLM`                                  | OPT, OPT-IML                                        | `facebook/opt-66b`, `facebook/opt-iml-max-30b`, etc.                                                                                                                         | ✅︎                     |                             |
+-| `OrionForCausalLM`                                | Orion                                               | `OrionStarAI/Orion-14B-Base`, `OrionStarAI/Orion-14B-Chat`, etc.                                                                                                             | ✅︎                     |                             |
+-| `PhiForCausalLM`                                  | Phi                                                 | `microsoft/phi-1_5`, `microsoft/phi-2`, etc.                                                                                                                                 | ✅︎                     | ✅︎                          |
+-| `Phi3ForCausalLM`                                 | Phi-4, Phi-3                                        | `microsoft/Phi-4-mini-instruct`, `microsoft/Phi-4`, `microsoft/Phi-3-mini-4k-instruct`, `microsoft/Phi-3-mini-128k-instruct`, `microsoft/Phi-3-medium-128k-instruct`, etc.   | ✅︎                     | ✅︎                          |
+-| `Phi3SmallForCausalLM`                            | Phi-3-Small                                         | `microsoft/Phi-3-small-8k-instruct`, `microsoft/Phi-3-small-128k-instruct`, etc.                                                                                             | ✅︎                     |                             |
+-| `PhiMoEForCausalLM`                               | Phi-3.5-MoE                                         | `microsoft/Phi-3.5-MoE-instruct`, etc.                                                                                                                                       | ✅︎                     | ✅︎                          |
+-| `PersimmonForCausalLM`                            | Persimmon                                           | `adept/persimmon-8b-base`, `adept/persimmon-8b-chat`, etc.                                                                                                                   | ✅︎                     |                             |
+-| `Plamo2ForCausalLM`                               | PLaMo2                                              | `pfnet/plamo-2-1b`, `pfnet/plamo-2-8b`, etc.                                                                                                                                 |                        |                             |
+-| `QWenLMHeadModel`                                 | Qwen                                                | `Qwen/Qwen-7B`, `Qwen/Qwen-7B-Chat`, etc.                                                                                                                                    | ✅︎                     | ✅︎                          |
+-| `Qwen2ForCausalLM`                                | QwQ, Qwen2                                          | `Qwen/QwQ-32B-Preview`, `Qwen/Qwen2-7B-Instruct`, `Qwen/Qwen2-7B`, etc.                                                                                                      | ✅︎                     | ✅︎                          |
+-| `Qwen2MoeForCausalLM`                             | Qwen2MoE                                            | `Qwen/Qwen1.5-MoE-A2.7B`, `Qwen/Qwen1.5-MoE-A2.7B-Chat`, etc.                                                                                                                | ✅︎                     |                             |
+-| `Qwen3ForCausalLM`                                | Qwen3                                               | `Qwen/Qwen3-8B`, etc.                                                                                                                                                        | ✅︎                     | ✅︎                          |
+-| `Qwen3MoeForCausalLM`                             | Qwen3MoE                                            | `Qwen/Qwen3-30B-A3B`, etc.                                                                                                                                                   | ✅︎                     |                             |
+-| `StableLmForCausalLM`                             | StableLM                                            | `stabilityai/stablelm-3b-4e1t`, `stabilityai/stablelm-base-alpha-7b-v2`, etc.                                                                                                | ✅︎                     |                             |
+-| `Starcoder2ForCausalLM`                           | Starcoder2                                          | `bigcode/starcoder2-3b`, `bigcode/starcoder2-7b`, `bigcode/starcoder2-15b`, etc.                                                                                             | ✅︎                     |                             |
+-| `SolarForCausalLM`                                | Solar Pro                                           | `upstage/solar-pro-preview-instruct`, etc.                                                                                                                                   | ✅︎                     | ✅︎                          |
+-| `TeleChat2ForCausalLM`                            | TeleChat2                                           | `Tele-AI/TeleChat2-3B`, `Tele-AI/TeleChat2-7B`, `Tele-AI/TeleChat2-35B`, etc.                                                                                                | ✅︎                     | ✅︎                          |
+-| `TeleFLMForCausalLM`                              | TeleFLM                                             | `CofeAI/FLM-2-52B-Instruct-2407`, `CofeAI/Tele-FLM`, etc.                                                                                                                    | ✅︎                     | ✅︎                          |
+-| `XverseForCausalLM`                               | XVERSE                                              | `xverse/XVERSE-7B-Chat`, `xverse/XVERSE-13B-Chat`, `xverse/XVERSE-65B-Chat`, etc.                                                                                            | ✅︎                     | ✅︎                          |
+-| `MiniMaxText01ForCausalLM`                        | MiniMax-Text                                        | `MiniMaxAI/MiniMax-Text-01`, etc.                                                                                                                                            | ✅︎                     |                             |
+-| `Zamba2ForCausalLM`                               | Zamba2                                              | `Zyphra/Zamba2-7B-instruct`, `Zyphra/Zamba2-2.7B-instruct`, `Zyphra/Zamba2-1.2B-instruct`, etc.                                                                              |                        |                             |
++These models primarily accept the [`LLM.generate`](./generative_models.md#llmgenerate) API. Chat/Instruct models additionally support the [`LLM.chat`](./generative_models.md#llmchat) API.
++
++<style>
++th {
++  white-space: nowrap;
++  min-width: 0 !important;
++}
++</style>
++
++| Architecture | Models | Example HF Models | [LoRA](../features/lora.md) | [PP](../serving/parallelism_scaling.md) | [V1](gh-issue:8779) |
++|--------------|--------|-------------------|----------------------|---------------------------|---------------------|
++| `AquilaForCausalLM` | Aquila, Aquila2 | `BAAI/Aquila-7B`, `BAAI/AquilaChat-7B`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `ArceeForCausalLM` | Arcee (AFM) | `arcee-ai/AFM-4.5B-Base`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `ArcticForCausalLM` | Arctic | `Snowflake/snowflake-arctic-base`, `Snowflake/snowflake-arctic-instruct`, etc. | | ✅︎ | ✅︎ |
++| `BaiChuanForCausalLM` | Baichuan2, Baichuan | `baichuan-inc/Baichuan2-13B-Chat`, `baichuan-inc/Baichuan-7B`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `BailingMoeForCausalLM` | Ling | `inclusionAI/Ling-lite-1.5`, `inclusionAI/Ling-plus`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `BambaForCausalLM` | Bamba | `ibm-ai-platform/Bamba-9B-fp8`, `ibm-ai-platform/Bamba-9B` | ✅︎ | ✅︎ | ✅︎ |
++| `BloomForCausalLM` | BLOOM, BLOOMZ, BLOOMChat | `bigscience/bloom`, `bigscience/bloomz`, etc. | | ✅︎ | |
++| `BartForConditionalGeneration` | BART | `facebook/bart-base`, `facebook/bart-large-cnn`, etc. | | | |
++| `ChatGLMModel`, `ChatGLMForConditionalGeneration` | ChatGLM | `zai-org/chatglm2-6b`, `zai-org/chatglm3-6b`, `ShieldLM-6B-chatglm3`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `CohereForCausalLM`, `Cohere2ForCausalLM` | Command-R | `CohereForAI/c4ai-command-r-v01`, `CohereForAI/c4ai-command-r7b-12-2024`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `DbrxForCausalLM` | DBRX | `databricks/dbrx-base`, `databricks/dbrx-instruct`, etc. | | ✅︎ | ✅︎ |
++| `DeciLMForCausalLM` | DeciLM | `nvidia/Llama-3_3-Nemotron-Super-49B-v1`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `DeepseekForCausalLM` | DeepSeek | `deepseek-ai/deepseek-llm-67b-base`, `deepseek-ai/deepseek-llm-7b-chat`, etc. | | ✅︎ | ✅︎ |
++| `DeepseekV2ForCausalLM` | DeepSeek-V2 | `deepseek-ai/DeepSeek-V2`, `deepseek-ai/DeepSeek-V2-Chat`, etc. | | ✅︎ | ✅︎ |
++| `DeepseekV3ForCausalLM` | DeepSeek-V3 | `deepseek-ai/DeepSeek-V3-Base`, `deepseek-ai/DeepSeek-V3`, etc. | | ✅︎ | ✅︎ |
++| `Dots1ForCausalLM` | dots.llm1 | `rednote-hilab/dots.llm1.base`, `rednote-hilab/dots.llm1.inst`, etc. | | ✅︎ | ✅︎ |
++| `Ernie4_5ForCausalLM` | Ernie4.5 | `baidu/ERNIE-4.5-0.3B-PT`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Ernie4_5_MoeForCausalLM` | Ernie4.5MoE | `baidu/ERNIE-4.5-21B-A3B-PT`, `baidu/ERNIE-4.5-300B-A47B-PT`, etc. |✅︎| ✅︎ | ✅︎ |
++| `ExaoneForCausalLM` | EXAONE-3 | `LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Exaone4ForCausalLM` | EXAONE-4 | `LGAI-EXAONE/EXAONE-4.0-32B`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Fairseq2LlamaForCausalLM` | Llama (fairseq2 format) | `mgleize/fairseq2-dummy-Llama-3.2-1B`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `FalconForCausalLM` | Falcon | `tiiuae/falcon-7b`, `tiiuae/falcon-40b`, `tiiuae/falcon-rw-7b`, etc. | | ✅︎ | ✅︎ |
++| `FalconMambaForCausalLM` | FalconMamba | `tiiuae/falcon-mamba-7b`, `tiiuae/falcon-mamba-7b-instruct`, etc. | | ✅︎ | ✅︎ |
++| `FalconH1ForCausalLM` | Falcon-H1 | `tiiuae/Falcon-H1-34B-Base`, `tiiuae/Falcon-H1-34B-Instruct`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `GemmaForCausalLM` | Gemma | `google/gemma-2b`, `google/gemma-1.1-2b-it`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Gemma2ForCausalLM` | Gemma 2 | `google/gemma-2-9b`, `google/gemma-2-27b`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Gemma3ForCausalLM` | Gemma 3 | `google/gemma-3-1b-it`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Gemma3nForConditionalGeneration` | Gemma 3n | `google/gemma-3n-E2B-it`, `google/gemma-3n-E4B-it`, etc. | | | ✅︎ |
++| `GlmForCausalLM` | GLM-4 | `zai-org/glm-4-9b-chat-hf`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Glm4ForCausalLM` | GLM-4-0414 | `zai-org/GLM-4-32B-0414`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Glm4MoeForCausalLM` | GLM-4.5 | `zai-org/GLM-4.5`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `GPT2LMHeadModel` | GPT-2 | `gpt2`, `gpt2-xl`, etc. | | ✅︎ | ✅︎ |
++| `GPTBigCodeForCausalLM` | StarCoder, SantaCoder, WizardCoder | `bigcode/starcoder`, `bigcode/gpt_bigcode-santacoder`, `WizardLM/WizardCoder-15B-V1.0`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `GPTJForCausalLM` | GPT-J | `EleutherAI/gpt-j-6b`, `nomic-ai/gpt4all-j`, etc. | | ✅︎ | ✅︎ |
++| `GPTNeoXForCausalLM` | GPT-NeoX, Pythia, OpenAssistant, Dolly V2, StableLM | `EleutherAI/gpt-neox-20b`, `EleutherAI/pythia-12b`, `OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5`, `databricks/dolly-v2-12b`, `stabilityai/stablelm-tuned-alpha-7b`, etc. | | ✅︎ | ✅︎ |
++| `GptOssForCausalLM` | GPT-OSS | `openai/gpt-oss-120b`, `openai/gpt-oss-20b` | | | ✅︎ |
++| `GraniteForCausalLM` | Granite 3.0, Granite 3.1, PowerLM | `ibm-granite/granite-3.0-2b-base`, `ibm-granite/granite-3.1-8b-instruct`, `ibm/PowerLM-3b`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `GraniteMoeForCausalLM` | Granite 3.0 MoE, PowerMoE | `ibm-granite/granite-3.0-1b-a400m-base`, `ibm-granite/granite-3.0-3b-a800m-instruct`, `ibm/PowerMoE-3b`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `GraniteMoeHybridForCausalLM` | Granite 4.0 MoE Hybrid | `ibm-granite/granite-4.0-tiny-preview`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `GraniteMoeSharedForCausalLM` | Granite MoE Shared | `ibm-research/moe-7b-1b-active-shared-experts` (test model) | ✅︎ | ✅︎ | ✅︎ |
++| `GritLM` | GritLM | `parasail-ai/GritLM-7B-vllm`. | ✅︎ | ✅︎ | |
++| `Grok1ModelForCausalLM` | Grok1 | `hpcai-tech/grok-1`. | ✅︎ | ✅︎ | ✅︎ |
++| `HunYuanDenseV1ForCausalLM` | Hunyuan-7B-Instruct-0124 | `tencent/Hunyuan-7B-Instruct-0124` | ✅︎ | | ✅︎ |
++| `HunYuanMoEV1ForCausalLM` | Hunyuan-80B-A13B | `tencent/Hunyuan-A13B-Instruct`, `tencent/Hunyuan-A13B-Pretrain`, `tencent/Hunyuan-A13B-Instruct-FP8`, etc. | ✅︎ | | ✅︎ |
++| `HCXVisionForCausalLM` | HyperCLOVAX-SEED-Vision-Instruct-3B | `naver-hyperclovax/HyperCLOVAX-SEED-Vision-Instruct-3B` | | | ✅︎ |
++| `InternLMForCausalLM` | InternLM | `internlm/internlm-7b`, `internlm/internlm-chat-7b`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `InternLM2ForCausalLM` | InternLM2 | `internlm/internlm2-7b`, `internlm/internlm2-chat-7b`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `InternLM3ForCausalLM` | InternLM3 | `internlm/internlm3-8b-instruct`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `JAISLMHeadModel` | Jais | `inceptionai/jais-13b`, `inceptionai/jais-13b-chat`, `inceptionai/jais-30b-v3`, `inceptionai/jais-30b-chat-v3`, etc. | | ✅︎ | ✅︎ |
++| `JambaForCausalLM` | Jamba | `ai21labs/AI21-Jamba-1.5-Large`, `ai21labs/AI21-Jamba-1.5-Mini`, `ai21labs/Jamba-v0.1`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `LlamaForCausalLM` | Llama 3.1, Llama 3, Llama 2, LLaMA, Yi | `meta-llama/Meta-Llama-3.1-405B-Instruct`, `meta-llama/Meta-Llama-3.1-70B`, `meta-llama/Meta-Llama-3-70B-Instruct`, `meta-llama/Llama-2-70b-hf`, `01-ai/Yi-34B`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `MambaForCausalLM` | Mamba | `state-spaces/mamba-130m-hf`, `state-spaces/mamba-790m-hf`, `state-spaces/mamba-2.8b-hf`, etc. | | ✅︎ | ✅︎ |
++| `Mamba2ForCausalLM` | Mamba2 | `mistralai/Mamba-Codestral-7B-v0.1`, etc. | | ✅︎ | ✅︎ |
++| `MiMoForCausalLM` | MiMo | `XiaomiMiMo/MiMo-7B-RL`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `MiniCPMForCausalLM` | MiniCPM | `openbmb/MiniCPM-2B-sft-bf16`, `openbmb/MiniCPM-2B-dpo-bf16`, `openbmb/MiniCPM-S-1B-sft`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `MiniCPM3ForCausalLM` | MiniCPM3 | `openbmb/MiniCPM3-4B`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `MistralForCausalLM` | Mistral, Mistral-Instruct | `mistralai/Mistral-7B-v0.1`, `mistralai/Mistral-7B-Instruct-v0.1`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `MixtralForCausalLM` | Mixtral-8x7B, Mixtral-8x7B-Instruct | `mistralai/Mixtral-8x7B-v0.1`, `mistralai/Mixtral-8x7B-Instruct-v0.1`, `mistral-community/Mixtral-8x22B-v0.1`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `MPTForCausalLM` | MPT, MPT-Instruct, MPT-Chat, MPT-StoryWriter | `mosaicml/mpt-7b`, `mosaicml/mpt-7b-storywriter`, `mosaicml/mpt-30b`, etc. | | ✅︎ | ✅︎ |
++| `NemotronForCausalLM` | Nemotron-3, Nemotron-4, Minitron | `nvidia/Minitron-8B-Base`, `mgoin/Nemotron-4-340B-Base-hf-FP8`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `NemotronHForCausalLM` | Nemotron-H | `nvidia/Nemotron-H-8B-Base-8K`, `nvidia/Nemotron-H-47B-Base-8K`, `nvidia/Nemotron-H-56B-Base-8K`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `OLMoForCausalLM` | OLMo | `allenai/OLMo-1B-hf`, `allenai/OLMo-7B-hf`, etc. | | ✅︎ | ✅︎ |
++| `OLMo2ForCausalLM` | OLMo2 | `allenai/OLMo-2-0425-1B`, etc. | | ✅︎ | ✅︎ |
++| `OLMoEForCausalLM` | OLMoE | `allenai/OLMoE-1B-7B-0924`, `allenai/OLMoE-1B-7B-0924-Instruct`, etc. | | ✅︎ | ✅︎ |
++| `OPTForCausalLM` | OPT, OPT-IML | `facebook/opt-66b`, `facebook/opt-iml-max-30b`, etc. | | ✅︎ | ✅︎ |
++| `OrionForCausalLM` | Orion | `OrionStarAI/Orion-14B-Base`, `OrionStarAI/Orion-14B-Chat`, etc. | | ✅︎ | ✅︎ |
++| `PhiForCausalLM` | Phi | `microsoft/phi-1_5`, `microsoft/phi-2`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Phi3ForCausalLM` | Phi-4, Phi-3 | `microsoft/Phi-4-mini-instruct`, `microsoft/Phi-4`, `microsoft/Phi-3-mini-4k-instruct`, `microsoft/Phi-3-mini-128k-instruct`, `microsoft/Phi-3-medium-128k-instruct`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `PhiMoEForCausalLM` | Phi-3.5-MoE | `microsoft/Phi-3.5-MoE-instruct`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Phi4FlashForCausalLM` | Phi-4-mini-flash-reasoning | `microsoft/microsoft/Phi-4-mini-instruct`, etc. | | | |
++| `PersimmonForCausalLM` | Persimmon | `adept/persimmon-8b-base`, `adept/persimmon-8b-chat`, etc. | | ✅︎ | ✅︎ |
++| `Plamo2ForCausalLM` | PLaMo2 | `pfnet/plamo-2-1b`, `pfnet/plamo-2-8b`, etc. | | ✅︎ | |
++| `QWenLMHeadModel` | Qwen | `Qwen/Qwen-7B`, `Qwen/Qwen-7B-Chat`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Qwen2ForCausalLM` | QwQ, Qwen2 | `Qwen/QwQ-32B-Preview`, `Qwen/Qwen2-7B-Instruct`, `Qwen/Qwen2-7B`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Qwen2MoeForCausalLM` | Qwen2MoE | `Qwen/Qwen1.5-MoE-A2.7B`, `Qwen/Qwen1.5-MoE-A2.7B-Chat`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Qwen3ForCausalLM` | Qwen3 | `Qwen/Qwen3-8B`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Qwen3MoeForCausalLM` | Qwen3MoE | `Qwen/Qwen3-30B-A3B`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `StableLmForCausalLM` | StableLM | `stabilityai/stablelm-3b-4e1t`, `stabilityai/stablelm-base-alpha-7b-v2`, etc. | | | ✅︎ |
++| `Starcoder2ForCausalLM` | Starcoder2 | `bigcode/starcoder2-3b`, `bigcode/starcoder2-7b`, `bigcode/starcoder2-15b`, etc. | | ✅︎ | ✅︎ |
++| `SolarForCausalLM` | Solar Pro | `upstage/solar-pro-preview-instruct`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `TeleChat2ForCausalLM` | TeleChat2 | `Tele-AI/TeleChat2-3B`, `Tele-AI/TeleChat2-7B`, `Tele-AI/TeleChat2-35B`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `TeleFLMForCausalLM` | TeleFLM | `CofeAI/FLM-2-52B-Instruct-2407`, `CofeAI/Tele-FLM`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `XverseForCausalLM` | XVERSE | `xverse/XVERSE-7B-Chat`, `xverse/XVERSE-13B-Chat`, `xverse/XVERSE-65B-Chat`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `MiniMaxM1ForCausalLM` | MiniMax-Text | `MiniMaxAI/MiniMax-M1-40k`, `MiniMaxAI/MiniMax-M1-80k`, etc. | | | ✅︎ |
++| `MiniMaxText01ForCausalLM` | MiniMax-Text | `MiniMaxAI/MiniMax-Text-01`, etc. | | | ✅︎ |
++| `Zamba2ForCausalLM` | Zamba2 | `Zyphra/Zamba2-7B-instruct`, `Zyphra/Zamba2-2.7B-instruct`, `Zyphra/Zamba2-1.2B-instruct`, etc. | | | ✅︎ |
+ 
+ !!! note
+     Currently, the ROCm version of vLLM supports Mistral and Mixtral only for context lengths up to 4096.
+@@ -510,46 +534,61 @@ See [this page][generative-models] for more information on how to use generative
+ 
+ Specified using `--task generate`.
+ 
+-| Architecture                                 | Models                                                                   | Inputs                                                                | Example HF Models                                                                                                                                       | [LoRA][lora-adapter]   | [PP][distributed-serving]   | [V1](gh-issue:8779)   |
+-|----------------------------------------------|--------------------------------------------------------------------------|-----------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------|-----------------------------|-----------------------|
+-| `AriaForConditionalGeneration`               | Aria                                                                     | T + I<sup>+</sup>                                                     | `rhymes-ai/Aria`                                                                                                                                        | ✅︎                     | ✅︎                          |                       |
+-| `AyaVisionForConditionalGeneration`          | Aya Vision                                                               | T + I<sup>+</sup>                                                     | `CohereForAI/aya-vision-8b`, `CohereForAI/aya-vision-32b`, etc.                                                                                         | ✅︎                     | ✅︎                          |                       |
+-| `Blip2ForConditionalGeneration`              | BLIP-2                                                                   | T + I<sup>E</sup>                                                     | `Salesforce/blip2-opt-2.7b`, `Salesforce/blip2-opt-6.7b`, etc.                                                                                          | ✅︎                     | ✅︎                          |                       |
+-| `ChameleonForConditionalGeneration`          | Chameleon                                                                | T + I                                                                 | `facebook/chameleon-7b` etc.                                                                                                                            | ✅︎                     | ✅︎                          |                       |
+-| `DeepseekVLV2ForCausalLM`<sup>^</sup>        | DeepSeek-VL2                                                             | T + I<sup>+</sup>                                                     | `deepseek-ai/deepseek-vl2-tiny`, `deepseek-ai/deepseek-vl2-small`, `deepseek-ai/deepseek-vl2` etc.                                                      | ✅︎                     | ✅︎                          |                       |
+-| `Florence2ForConditionalGeneration`          | Florence-2                                                               | T + I                                                                 | `microsoft/Florence-2-base`, `microsoft/Florence-2-large` etc.                                                                                          |                        |                             |                       |
+-| `FuyuForCausalLM`                            | Fuyu                                                                     | T + I                                                                 | `adept/fuyu-8b` etc.                                                                                                                                    | ✅︎                     | ✅︎                          |                       |
+-| `Gemma3ForConditionalGeneration`             | Gemma 3                                                                  | T + I<sup>+</sup>                                                     | `google/gemma-3-4b-it`, `google/gemma-3-27b-it`, etc.                                                                                                   | ✅︎                     | ✅︎                          | ⚠️                    |
+-| `GLM4VForCausalLM`<sup>^</sup>               | GLM-4V                                                                   | T + I                                                                 | `THUDM/glm-4v-9b`, `THUDM/cogagent-9b-20241220` etc.                                                                                                    | ✅︎                     | ✅︎                          | ✅︎                    |
+-| `GraniteSpeechForConditionalGeneration`      | Granite Speech                                                           | T + A                                                                 | `ibm-granite/granite-speech-3.3-8b`                                                                                                                     | ✅︎                     | ✅︎                          | ✅︎                    |
+-| `H2OVLChatModel`                             | H2OVL                                                                    | T + I<sup>E+</sup>                                                    | `h2oai/h2ovl-mississippi-800m`, `h2oai/h2ovl-mississippi-2b`, etc.                                                                                      | ✅︎                     | ✅︎\*                        |                       |
+-| `Idefics3ForConditionalGeneration`           | Idefics3                                                                 | T + I                                                                 | `HuggingFaceM4/Idefics3-8B-Llama3` etc.                                                                                                                 | ✅︎                     | ✅︎                          |                       |
+-| `InternVLChatModel`                          | InternVL 3.0, InternVideo 2.5, InternVL 2.5, Mono-InternVL, InternVL 2.0 | T + I<sup>E+</sup> + (V<sup>E+</sup>)                                                    | `OpenGVLab/InternVL3-9B`, `OpenGVLab/InternVideo2_5_Chat_8B`, `OpenGVLab/InternVL2_5-4B`, `OpenGVLab/Mono-InternVL-2B`, `OpenGVLab/InternVL2-4B`, etc.  | ✅︎                     | ✅︎                          |                       |
+-| `KimiVLForConditionalGeneration`             | Kimi-VL-A3B-Instruct, Kimi-VL-A3B-Thinking                               | T + I<sup>+</sup>                                                     | `moonshotai/Kimi-VL-A3B-Instruct`, `moonshotai/Kimi-VL-A3B-Thinking`                                                                                    | ✅︎                     |                             |                       |
+-| `Llama4ForConditionalGeneration`             | Llama 4                                                                  | T + I<sup>+</sup>                                                     | `meta-llama/Llama-4-Scout-17B-16E-Instruct`, `meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8`, `meta-llama/Llama-4-Maverick-17B-128E-Instruct`, etc. | ✅︎                     | ✅︎                          |                       |
+-| `LlavaForConditionalGeneration`              | LLaVA-1.5                                                                | T + I<sup>E+</sup>                                                    | `llava-hf/llava-1.5-7b-hf`, `TIGER-Lab/Mantis-8B-siglip-llama3` (see note), etc.                                                                        | ✅︎                     | ✅︎                          |                       |
+-| `LlavaNextForConditionalGeneration`          | LLaVA-NeXT                                                               | T + I<sup>E+</sup>                                                    | `llava-hf/llava-v1.6-mistral-7b-hf`, `llava-hf/llava-v1.6-vicuna-7b-hf`, etc.                                                                           | ✅︎                     | ✅︎                          |                       |
+-| `LlavaNextVideoForConditionalGeneration`     | LLaVA-NeXT-Video                                                         | T + V                                                                 | `llava-hf/LLaVA-NeXT-Video-7B-hf`, etc.                                                                                                                 | ✅︎                     | ✅︎                          |                       |
+-| `LlavaOnevisionForConditionalGeneration`     | LLaVA-Onevision                                                          | T + I<sup>+</sup> + V<sup>+</sup>                                     | `llava-hf/llava-onevision-qwen2-7b-ov-hf`, `llava-hf/llava-onevision-qwen2-0.5b-ov-hf`, etc.                                                            | ✅︎                     | ✅︎                          |                       |
+-| `MiniCPMO`                                   | MiniCPM-O                                                                | T + I<sup>E+</sup> + V<sup>E+</sup> + A<sup>E+</sup>                  | `openbmb/MiniCPM-o-2_6`, etc.                                                                                                                           | ✅︎                     | ✅︎                          | ✅︎                    |
+-| `MiniCPMV`                                   | MiniCPM-V                                                                | T + I<sup>E+</sup> + V<sup>E+</sup>                                   | `openbmb/MiniCPM-V-2` (see note), `openbmb/MiniCPM-Llama3-V-2_5`, `openbmb/MiniCPM-V-2_6`, etc.                                                         | ✅︎                     | ✅︎                          | ✅︎                    |
+-| `MiniMaxVL01ForConditionalGeneration`        | MiniMax-VL                                                               | T + I<sup>E+</sup>                                                    | `MiniMaxAI/MiniMax-VL-01`, etc.                                                                                                                         | ✅︎                     | ✅︎                          |                       |
+-| `Mistral3ForConditionalGeneration`           | Mistral3                                                                 | T + I<sup>+</sup>                                                     | `mistralai/Mistral-Small-3.1-24B-Instruct-2503`, etc.                                                                                                   | ✅︎                     | ✅︎                          | ✅︎                    |
+-| `MllamaForConditionalGeneration`             | Llama 3.2                                                                | T + I<sup>+</sup>                                                     | `meta-llama/Llama-3.2-90B-Vision-Instruct`, `meta-llama/Llama-3.2-11B-Vision`, etc.                                                                     |                        |                             |                       |
+-| `MolmoForCausalLM`                           | Molmo                                                                    | T + I<sup>+</sup>                                                     | `allenai/Molmo-7B-D-0924`, `allenai/Molmo-7B-O-0924`, etc.                                                                                              | ✅︎                     | ✅︎                          | ✅︎                    |
+-| `NVLM_D_Model`                               | NVLM-D 1.0                                                               | T + I<sup>+</sup>                                                     | `nvidia/NVLM-D-72B`, etc.                                                                                                                               | ✅︎                     | ✅︎                          |                       |
+-| `Ovis`                                       | Ovis2, Ovis1.6                                                           | T + I<sup>+</sup>                                                     | `AIDC-AI/Ovis2-1B`, `AIDC-AI/Ovis1.6-Llama3.2-3B`, etc.                                                                                                 | ✅︎                     |                             |                       |
+-| `PaliGemmaForConditionalGeneration`          | PaliGemma, PaliGemma 2                                                   | T + I<sup>E</sup>                                                     | `google/paligemma-3b-pt-224`, `google/paligemma-3b-mix-224`, `google/paligemma2-3b-ft-docci-448`, etc.                                                  | ✅︎                     | ⚠️                          |                       |
+-| `Phi3VForCausalLM`                           | Phi-3-Vision, Phi-3.5-Vision                                             | T + I<sup>E+</sup>                                                    | `microsoft/Phi-3-vision-128k-instruct`, `microsoft/Phi-3.5-vision-instruct`, etc.                                                                       | ✅︎                     | ✅︎                          |                       |
+-| `Phi4MMForCausalLM`                          | Phi-4-multimodal                                                         | T + I<sup>+</sup> / T + A<sup>+</sup> / I<sup>+</sup> + A<sup>+</sup> | `microsoft/Phi-4-multimodal-instruct`, etc.                                                                                                             | ✅︎                     | ✅︎                          |                       |
+-| `PixtralForConditionalGeneration`            | Pixtral                                                                  | T + I<sup>+</sup>                                                     | `mistralai/Mistral-Small-3.1-24B-Instruct-2503`, `mistral-community/pixtral-12b`, etc.                                                                  | ✅︎                     | ✅︎                          |                       |
+-| `QwenVLForConditionalGeneration`<sup>^</sup> | Qwen-VL                                                                  | T + I<sup>E+</sup>                                                    | `Qwen/Qwen-VL`, `Qwen/Qwen-VL-Chat`, etc.                                                                                                               | ✅︎                     | ✅︎                          | ✅︎                    |
+-| `Qwen2AudioForConditionalGeneration`         | Qwen2-Audio                                                              | T + A<sup>+</sup>                                                     | `Qwen/Qwen2-Audio-7B-Instruct`                                                                                                                          | ✅︎                     | ✅︎                          |                       |
+-| `Qwen2VLForConditionalGeneration`            | QVQ, Qwen2-VL                                                            | T + I<sup>E+</sup> + V<sup>E+</sup>                                   | `Qwen/QVQ-72B-Preview`, `Qwen/Qwen2-VL-7B-Instruct`, `Qwen/Qwen2-VL-72B-Instruct`, etc.                                                                 | ✅︎                     | ✅︎                          | ✅︎                    |
+-| `Qwen2_5_VLForConditionalGeneration`         | Qwen2.5-VL                                                               | T + I<sup>E+</sup> + V<sup>E+</sup>                                   | `Qwen/Qwen2.5-VL-3B-Instruct`, `Qwen/Qwen2.5-VL-72B-Instruct`, etc.                                                                                     | ✅︎                     | ✅︎                          | ✅︎                    |
+-| `Qwen2_5OmniThinkerForConditionalGeneration` | Qwen2.5-Omni                                                             | T + I<sup>E+</sup> + V<sup>E+</sup> + A<sup>+</sup>                   | `Qwen/Qwen2.5-Omni-7B`                                                                                                                                  | ✅︎                     | ✅︎\*                        |                       |
+-| `SkyworkR1VChatModel`                        | Skywork-R1V-38B                                                          | T + I                                                                 | `Skywork/Skywork-R1V-38B`                                                                                                                               | ✅︎                     | ✅︎                          |                       |
+-| `SmolVLMForConditionalGeneration`            | SmolVLM2                                                                 | T + I                                                                 | `SmolVLM2-2.2B-Instruct`                                                                                                                                | ✅︎                     | ✅︎                          |                       |
++| Architecture | Models | Inputs | Example HF Models | [LoRA](../features/lora.md) | [PP](../serving/distributed_serving.md) | [V1](gh-issue:8779) |
++|--------------|--------|--------|-------------------|----------------------|---------------------------|---------------------|
++| `AriaForConditionalGeneration` | Aria | T + I<sup>+</sup> | `rhymes-ai/Aria` | | | ✅︎ |
++| `AyaVisionForConditionalGeneration` | Aya Vision | T + I<sup>+</sup> | `CohereForAI/aya-vision-8b`, `CohereForAI/aya-vision-32b`, etc. | | ✅︎ | ✅︎ |
++| `Blip2ForConditionalGeneration` | BLIP-2 | T + I<sup>E</sup> | `Salesforce/blip2-opt-2.7b`, `Salesforce/blip2-opt-6.7b`, etc. | | ✅︎ | ✅︎ |
++| `ChameleonForConditionalGeneration` | Chameleon | T + I | `facebook/chameleon-7b`, etc. | | ✅︎ | ✅︎ |
++| `DeepseekVLV2ForCausalLM`<sup>^</sup> | DeepSeek-VL2 | T + I<sup>+</sup> | `deepseek-ai/deepseek-vl2-tiny`, `deepseek-ai/deepseek-vl2-small`, `deepseek-ai/deepseek-vl2`, etc. | | ✅︎ | ✅︎ |
++| `Florence2ForConditionalGeneration` | Florence-2 | T + I | `microsoft/Florence-2-base`, `microsoft/Florence-2-large`, etc. | | | |
++| `FuyuForCausalLM` | Fuyu | T + I | `adept/fuyu-8b`, etc. | | ✅︎ | ✅︎ |
++| `Gemma3ForConditionalGeneration` | Gemma 3 | T + I<sup>+</sup> | `google/gemma-3-4b-it`, `google/gemma-3-27b-it`, etc. | ✅︎ | ✅︎ | ⚠️ |
++| `GLM4VForCausalLM`<sup>^</sup> | GLM-4V | T + I | `zai-org/glm-4v-9b`, `zai-org/cogagent-9b-20241220`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Glm4vForConditionalGeneration` | GLM-4.1V-Thinking | T + I<sup>E+</sup> + V<sup>E+</sup> | `zai-org/GLM-4.1V-9B-Thinking`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Glm4vMoeForConditionalGeneration` | GLM-4.5V | T + I<sup>E+</sup> + V<sup>E+</sup> | `zai-org/GLM-4.5V`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `GraniteSpeechForConditionalGeneration` | Granite Speech | T + A | `ibm-granite/granite-speech-3.3-8b` | ✅︎ | ✅︎ | ✅︎ |
++| `H2OVLChatModel` | H2OVL | T + I<sup>E+</sup> | `h2oai/h2ovl-mississippi-800m`, `h2oai/h2ovl-mississippi-2b`, etc. | | ✅︎ | ✅︎ |
++| `Idefics3ForConditionalGeneration` | Idefics3 | T + I | `HuggingFaceM4/Idefics3-8B-Llama3`, etc. | ✅︎ | | ✅︎ |
++| `InternS1ForConditionalGeneration` | Intern-S1 | T + I<sup>E+</sup> + V<sup>E+</sup> | `internlm/Intern-S1`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `InternVLChatModel` | InternVL 3.0, InternVideo 2.5, InternVL 2.5, Mono-InternVL, InternVL 2.0 | T + I<sup>E+</sup> + (V<sup>E+</sup>) | `OpenGVLab/InternVL3-9B`, `OpenGVLab/InternVideo2_5_Chat_8B`, `OpenGVLab/InternVL2_5-4B`, `OpenGVLab/Mono-InternVL-2B`, `OpenGVLab/InternVL2-4B`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `KeyeForConditionalGeneration` | Keye-VL-8B-Preview | T + I<sup>E+</sup> + V<sup>E+</sup> | `Kwai-Keye/Keye-VL-8B-Preview` | | | ✅︎ |
++| `KimiVLForConditionalGeneration` | Kimi-VL-A3B-Instruct, Kimi-VL-A3B-Thinking | T + I<sup>+</sup> | `moonshotai/Kimi-VL-A3B-Instruct`, `moonshotai/Kimi-VL-A3B-Thinking` | | | ✅︎ |
++| `Llama4ForConditionalGeneration` | Llama 4 | T + I<sup>+</sup> | `meta-llama/Llama-4-Scout-17B-16E-Instruct`, `meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8`, `meta-llama/Llama-4-Maverick-17B-128E-Instruct`, etc. | | ✅︎ | ✅︎ |
++| `Llama_Nemotron_Nano_VL` | Llama Nemotron Nano VL | T + I<sup>E+</sup> | `nvidia/Llama-3.1-Nemotron-Nano-VL-8B-V1` | ✅︎ | ✅︎ | ✅︎ |
++| `LlavaForConditionalGeneration` | LLaVA-1.5, Pixtral (HF Transformers) | T + I<sup>E+</sup> | `llava-hf/llava-1.5-7b-hf`, `TIGER-Lab/Mantis-8B-siglip-llama3` (see note), `mistral-community/pixtral-12b`, etc. | | ✅︎ | ✅︎ |
++| `LlavaNextForConditionalGeneration` | LLaVA-NeXT | T + I<sup>E+</sup> | `llava-hf/llava-v1.6-mistral-7b-hf`, `llava-hf/llava-v1.6-vicuna-7b-hf`, etc. | | ✅︎ | ✅︎ |
++| `LlavaNextVideoForConditionalGeneration` | LLaVA-NeXT-Video | T + V | `llava-hf/LLaVA-NeXT-Video-7B-hf`, etc. | | ✅︎ | ✅︎ |
++| `LlavaOnevisionForConditionalGeneration` | LLaVA-Onevision | T + I<sup>+</sup> + V<sup>+</sup> | `llava-hf/llava-onevision-qwen2-7b-ov-hf`, `llava-hf/llava-onevision-qwen2-0.5b-ov-hf`, etc. | | ✅︎ | ✅︎ |
++| `MiniCPMO` | MiniCPM-O | T + I<sup>E+</sup> + V<sup>E+</sup> + A<sup>E+</sup> | `openbmb/MiniCPM-o-2_6`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `MiniCPMV` | MiniCPM-V | T + I<sup>E+</sup> + V<sup>E+</sup> | `openbmb/MiniCPM-V-2` (see note), `openbmb/MiniCPM-Llama3-V-2_5`, `openbmb/MiniCPM-V-2_6`, etc. | ✅︎ | | ✅︎ |
++| `MiniMaxVL01ForConditionalGeneration` | MiniMax-VL | T + I<sup>E+</sup> | `MiniMaxAI/MiniMax-VL-01`, etc. | | ✅︎ | ✅︎ |
++| `Mistral3ForConditionalGeneration` | Mistral3 (HF Transformers) | T + I<sup>+</sup> | `mistralai/Mistral-Small-3.1-24B-Instruct-2503`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `MllamaForConditionalGeneration` | Llama 3.2 | T + I<sup>+</sup> | `meta-llama/Llama-3.2-90B-Vision-Instruct`, `meta-llama/Llama-3.2-11B-Vision`, etc. | | | |
++| `MolmoForCausalLM` | Molmo | T + I<sup>+</sup> | `allenai/Molmo-7B-D-0924`, `allenai/Molmo-7B-O-0924`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `NVLM_D_Model` | NVLM-D 1.0 | T + I<sup>+</sup> | `nvidia/NVLM-D-72B`, etc. | | ✅︎ | ✅︎ |
++| `Ovis` | Ovis2, Ovis1.6 | T + I<sup>+</sup> | `AIDC-AI/Ovis2-1B`, `AIDC-AI/Ovis1.6-Llama3.2-3B`, etc. | | ✅︎ | ✅︎ |
++| `PaliGemmaForConditionalGeneration` | PaliGemma, PaliGemma 2 | T + I<sup>E</sup> | `google/paligemma-3b-pt-224`, `google/paligemma-3b-mix-224`, `google/paligemma2-3b-ft-docci-448`, etc. | | ✅︎ | ⚠️ |
++| `Phi3VForCausalLM` | Phi-3-Vision, Phi-3.5-Vision | T + I<sup>E+</sup> | `microsoft/Phi-3-vision-128k-instruct`, `microsoft/Phi-3.5-vision-instruct`, etc. | | ✅︎ | ✅︎ |
++| `Phi4MMForCausalLM` | Phi-4-multimodal | T + I<sup>+</sup> / T + A<sup>+</sup> / I<sup>+</sup> + A<sup>+</sup> | `microsoft/Phi-4-multimodal-instruct`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Phi4MultimodalForCausalLM` | Phi-4-multimodal (HF Transformers) | T + I<sup>+</sup> / T + A<sup>+</sup> / I<sup>+</sup> + A<sup>+</sup> | `microsoft/Phi-4-multimodal-instruct` (with revision `refs/pr/70`), etc. | ✅︎ | ✅︎ | ✅︎ |
++| `PixtralForConditionalGeneration` | Mistral 3 (Mistral format), Pixtral (Mistral format) | T + I<sup>+</sup> | `mistralai/Mistral-Small-3.1-24B-Instruct-2503`, `mistralai/Pixtral-12B-2409`, etc. | | ✅︎ | ✅︎ |
++| `QwenVLForConditionalGeneration`<sup>^</sup> | Qwen-VL | T + I<sup>E+</sup> | `Qwen/Qwen-VL`, `Qwen/Qwen-VL-Chat`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Qwen2AudioForConditionalGeneration` | Qwen2-Audio | T + A<sup>+</sup> | `Qwen/Qwen2-Audio-7B-Instruct` | | ✅︎ | ✅︎ |
++| `Qwen2VLForConditionalGeneration` | QVQ, Qwen2-VL | T + I<sup>E+</sup> + V<sup>E+</sup> | `Qwen/QVQ-72B-Preview`, `Qwen/Qwen2-VL-7B-Instruct`, `Qwen/Qwen2-VL-72B-Instruct`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Qwen2_5_VLForConditionalGeneration` | Qwen2.5-VL | T + I<sup>E+</sup> + V<sup>E+</sup> | `Qwen/Qwen2.5-VL-3B-Instruct`, `Qwen/Qwen2.5-VL-72B-Instruct`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `Qwen2_5OmniThinkerForConditionalGeneration` | Qwen2.5-Omni | T + I<sup>E+</sup> + V<sup>E+</sup> + A<sup>+</sup> | `Qwen/Qwen2.5-Omni-7B` | | ✅︎ | ✅︎ |
++| `SkyworkR1VChatModel` | Skywork-R1V-38B | T + I | `Skywork/Skywork-R1V-38B` | | ✅︎ | ✅︎ |
++| `SmolVLMForConditionalGeneration` | SmolVLM2 | T + I | `SmolVLM2-2.2B-Instruct` | ✅︎ | | ✅︎ |
++| `Step3VLForConditionalGeneration` | Step3-VL | T + I<sup>+</sup> | `stepfun-ai/step3` | | ✅︎ | ✅︎ |
++| `TarsierForConditionalGeneration` | Tarsier | T + I<sup>E+</sup> | `omni-search/Tarsier-7b`, `omni-search/Tarsier-34b` | | ✅︎ | ✅︎ |
++| `Tarsier2ForConditionalGeneration`<sup>^</sup> | Tarsier2 | T + I<sup>E+</sup> + V<sup>E+</sup> | `omni-research/Tarsier2-Recap-7b`, `omni-research/Tarsier2-7b-0115` | | ✅︎ | ✅︎ |
++
++Some models are supported only via the [Transformers backend](#transformers). The purpose of the table below is to acknowledge models which we officially support in this way. The logs will say that the Transformers backend is being used, and you will see no warning that this is fallback behaviour. This means that, if you have issues with any of the models listed below, please [make an issue](https://github.com/vllm-project/vllm/issues/new/choose) and we'll do our best to fix it!
++
++| Architecture | Models | Inputs | Example HF Models | [LoRA](../features/lora.md) | [PP](../serving/distributed_serving.md) | [V1](gh-issue:8779) |
++|--------------|--------|--------|-------------------|-----------------------------|-----------------------------------------|---------------------|
++| `Emu3ForConditionalGeneration` | Emu3 | T + I | `BAAI/Emu3-Chat-hf` | ✅︎ | ✅︎ | ✅︎ |
+ 
+ <sup>^</sup> You need to set the architecture name via `--hf-overrides` to match the one in vLLM.  
+ &nbsp;&nbsp;&nbsp;&nbsp;• For example, to use DeepSeek-VL2 series models:  
 diff --git a/examples/offline_inference/multilora_inference.py b/examples/offline_inference/multilora_inference.py
 index 1fa2f16f8..7e3bf7041 100644
 --- a/examples/offline_inference/multilora_inference.py
@@ -7978,14 +8249,16 @@ index 572fa366d..3619a0b9b 100644
      "OpenGVLab/InternVL2-1B",
      "OpenGVLab/InternVL3-1B",
 diff --git a/tests/models/registry.py b/tests/models/registry.py
-index a49e3ad6b..feecd31d3 100644
+index a49e3ad6b..86dcd79d5 100644
 --- a/tests/models/registry.py
 +++ b/tests/models/registry.py
-@@ -331,6 +331,7 @@ _MULTIMODAL_EXAMPLE_MODELS = {
+@@ -331,6 +331,9 @@ _MULTIMODAL_EXAMPLE_MODELS = {
      "GLM4VForCausalLM": _HfExamplesInfo("THUDM/glm-4v-9b",
                                          trust_remote_code=True,
                                          hf_overrides={"architectures": ["GLM4VForCausalLM"]}),  # noqa: E501
-+    "Glm4vForConditionalGeneration": _HfExamplesInfo("THUDM/GLM-4.1V-9B-Thinking", min_transformers_version="4.53"),  # noqa: E501
++    "Glm4vForConditionalGeneration": _HfExamplesInfo("zai-org/GLM-4.1V-9B-Thinking"),  # noqa: E501
++    "Glm4vMoeForConditionalGeneration": _HfExamplesInfo("zai-org/GLM-4.5V",
++                                          is_available_online=False),   # noqa: E501
      "H2OVLChatModel": _HfExamplesInfo("h2oai/h2ovl-mississippi-800m",
                                        extras={"2b": "h2oai/h2ovl-mississippi-2b"},  # noqa: E501
                                        max_transformers_version="4.48",  # noqa: E501
@@ -9412,7 +9685,7 @@ index 054c0b006..03106c1d3 100644
  ]
 diff --git a/vllm/entrypoints/openai/tool_parsers/glm4_moe_tool_parser.py b/vllm/entrypoints/openai/tool_parsers/glm4_moe_tool_parser.py
 new file mode 100644
-index 000000000..c40788de9
+index 000000000..6a03b02a4
 --- /dev/null
 +++ b/vllm/entrypoints/openai/tool_parsers/glm4_moe_tool_parser.py
 @@ -0,0 +1,402 @@
@@ -9438,7 +9711,7 @@ index 000000000..c40788de9
 +logger = init_logger(__name__)
 +
 +
-+@ToolParserManager.register_module("glm4_moe")
++@ToolParserManager.register_module("glm45")
 +class Glm4MoeModelToolParser(ToolParser):
 +
 +    def __init__(self, tokenizer: AnyTokenizer):
@@ -11865,6 +12138,556 @@ index 9c8d647a2..d75196874 100644
  
  
  def resolve_transformers_arch(model_config: ModelConfig,
+diff --git a/vllm/model_executor/models/dots1.py b/vllm/model_executor/models/dots1.py
+new file mode 100644
+index 000000000..9b21a7944
+--- /dev/null
++++ b/vllm/model_executor/models/dots1.py
+@@ -0,0 +1,544 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++# Adapted from
++# https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
++# Copyright 2025 The rednote-hilab team.
++# Copyright 2023 The vLLM team.
++# Copyright 2023 DeepSeek-AI and the HuggingFace Inc. team. All rights reserved.
++#
++# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
++# and OPT implementations in this library. It has been modified from its
++# original forms to accommodate minor architectural differences compared
++# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Inference-only dots1 model."""
++from collections.abc import Iterable
++from typing import Any, Optional, Union
++
++import torch
++from torch import nn
++from transformers import PretrainedConfig
++
++from vllm.attention import Attention
++from vllm.compilation.decorators import support_torch_compile
++from vllm.config import CacheConfig, ModelConfig, VllmConfig
++from vllm.distributed import (get_pp_group,
++                              get_tensor_model_parallel_world_size,
++                              tensor_model_parallel_all_reduce)
++from vllm.model_executor.layers.activation import SiluAndMul
++from vllm.model_executor.layers.fused_moe import FusedMoE
++from vllm.model_executor.layers.layernorm import RMSNorm
++from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
++                                               QKVParallelLinear,
++                                               ReplicatedLinear,
++                                               RowParallelLinear)
++from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.quantization import QuantizationConfig
++from vllm.model_executor.layers.rotary_embedding import get_rope
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead, VocabParallelEmbedding)
++from vllm.model_executor.model_loader.weight_utils import (
++    default_weight_loader, maybe_remap_kv_scale_name)
++from vllm.model_executor.sampling_metadata import SamplingMetadata
++from vllm.sequence import IntermediateTensors
++
++from .interfaces import SupportsLoRA, SupportsPP
++from .utils import (AutoWeightsLoader, PPMissingLayer, is_pp_missing_parameter,
++                    make_empty_intermediate_tensors_factory, make_layers,
++                    maybe_prefix)
++
++
++class Dots1MLP(nn.Module):
++
++    def __init__(
++        self,
++        hidden_size: int,
++        intermediate_size: int,
++        hidden_act: str,
++        quant_config: Optional[QuantizationConfig] = None,
++        reduce_results: bool = True,
++        prefix: str = "",
++    ) -> None:
++        super().__init__()
++        self.gate_up_proj = MergedColumnParallelLinear(
++            hidden_size, [intermediate_size] * 2,
++            bias=False,
++            quant_config=quant_config,
++            prefix=f"{prefix}.gate_up_proj")
++        self.down_proj = RowParallelLinear(intermediate_size,
++                                           hidden_size,
++                                           bias=False,
++                                           quant_config=quant_config,
++                                           reduce_results=reduce_results,
++                                           prefix=f"{prefix}.down_proj")
++        if hidden_act != "silu":
++            raise ValueError(f"Unsupported activation: {hidden_act}. "
++                             "Only silu is supported for now.")
++        self.act_fn = SiluAndMul()
++
++    def forward(self, x):
++        gate_up, _ = self.gate_up_proj(x)
++        x = self.act_fn(gate_up)
++        x, _ = self.down_proj(x)
++        return x
++
++
++class Dots1MoE(nn.Module):
++
++    def __init__(
++        self,
++        config: PretrainedConfig,
++        quant_config: Optional[QuantizationConfig] = None,
++        prefix: str = "",
++    ):
++        super().__init__()
++        self.tp_size = get_tensor_model_parallel_world_size()
++        self.routed_scaling_factor = config.routed_scaling_factor
++        self.n_shared_experts = config.n_shared_experts
++
++        if config.hidden_act != "silu":
++            raise ValueError(f"Unsupported activation: {config.hidden_act}. "
++                             "Only silu is supported for now.")
++
++        self.gate = ReplicatedLinear(config.hidden_size,
++                                     config.n_routed_experts,
++                                     bias=False,
++                                     quant_config=None,
++                                     prefix=f"{prefix}.gate")
++        if config.topk_method == "noaux_tc":
++            self.gate.e_score_correction_bias = (nn.Parameter(
++                torch.empty(config.n_routed_experts)))
++        else:
++            self.gate.e_score_correction_bias = None
++
++        self.experts = FusedMoE(
++            num_experts=config.n_routed_experts,
++            top_k=config.num_experts_per_tok,
++            hidden_size=config.hidden_size,
++            intermediate_size=config.moe_intermediate_size,
++            reduce_results=False,
++            renormalize=config.norm_topk_prob,
++            quant_config=quant_config,
++            use_grouped_topk=True,
++            num_expert_group=config.n_group,
++            topk_group=config.topk_group,
++            prefix=f"{prefix}.experts",
++            scoring_func=config.scoring_func,
++            e_score_correction_bias=self.gate.e_score_correction_bias)
++
++        if config.n_shared_experts is not None:
++            intermediate_size = (config.moe_intermediate_size *
++                                 config.n_shared_experts)
++            self.shared_experts = Dots1MLP(
++                hidden_size=config.hidden_size,
++                intermediate_size=intermediate_size,
++                hidden_act=config.hidden_act,
++                quant_config=quant_config,
++                reduce_results=False,
++                prefix=f"{prefix}.shared_experts",
++            )
++
++    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        num_tokens, hidden_dim = hidden_states.shape
++        hidden_states = hidden_states.view(-1, hidden_dim)
++        if self.n_shared_experts is not None:
++            shared_output = self.shared_experts(hidden_states)
++        router_logits, _ = self.gate(hidden_states)
++        final_hidden_states = self.experts(
++            hidden_states=hidden_states,
++            router_logits=router_logits) * self.routed_scaling_factor
++        if shared_output is not None:
++            final_hidden_states = final_hidden_states + shared_output
++        if self.tp_size > 1:
++            final_hidden_states = tensor_model_parallel_all_reduce(
++                final_hidden_states)
++        return final_hidden_states.view(num_tokens, hidden_dim)
++
++
++class Dots1Attention(nn.Module):
++
++    def __init__(
++        self,
++        hidden_size: int,
++        num_heads: int,
++        num_kv_heads: int,
++        config: PretrainedConfig,
++        rope_theta: float = 10000,
++        rope_scaling: Optional[dict[str, Any]] = None,
++        max_position_embeddings: int = 8192,
++        cache_config: Optional[CacheConfig] = None,
++        quant_config: Optional[QuantizationConfig] = None,
++        prefix: str = "",
++    ) -> None:
++        super().__init__()
++        self.hidden_size = hidden_size
++        tp_size = get_tensor_model_parallel_world_size()
++        self.total_num_heads = num_heads
++        assert self.total_num_heads % tp_size == 0
++        self.num_heads = self.total_num_heads // tp_size
++        self.total_num_kv_heads = num_kv_heads
++        if self.total_num_kv_heads >= tp_size:
++            # Number of KV heads is greater than TP size, so we partition
++            # the KV heads across multiple tensor parallel GPUs.
++            assert self.total_num_kv_heads % tp_size == 0
++        else:
++            # Number of KV heads is less than TP size, so we replicate
++            # the KV heads across multiple tensor parallel GPUs.
++            assert tp_size % self.total_num_kv_heads == 0
++        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
++        self.head_dim = getattr(config, "head_dim",
++                                hidden_size // self.total_num_heads)
++        self.q_size = self.num_heads * self.head_dim
++        self.kv_size = self.num_kv_heads * self.head_dim
++        self.scaling = self.head_dim**-0.5
++        self.rope_theta = rope_theta
++        self.max_position_embeddings = max_position_embeddings
++        attention_bias = config.attention_bias
++
++        self.qkv_proj = QKVParallelLinear(
++            hidden_size,
++            self.head_dim,
++            self.total_num_heads,
++            self.total_num_kv_heads,
++            bias=attention_bias,
++            quant_config=quant_config,
++        )
++
++        self.o_proj = RowParallelLinear(
++            self.total_num_heads * self.head_dim,
++            hidden_size,
++            bias=False,
++            quant_config=quant_config,
++        )
++
++        self.rotary_emb = get_rope(
++            self.head_dim,
++            rotary_dim=self.head_dim,
++            max_position=max_position_embeddings,
++            base=rope_theta,
++            rope_scaling=rope_scaling,
++        )
++        self.attn = Attention(
++            self.num_heads,
++            self.head_dim,
++            self.scaling,
++            num_kv_heads=self.num_kv_heads,
++            cache_config=cache_config,
++            quant_config=quant_config,
++            prefix=f"{prefix}.attn",
++        )
++        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
++        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
++
++    def forward(self, positions: torch.Tensor,
++                hidden_states: torch.Tensor) -> torch.Tensor:
++        qkv, _ = self.qkv_proj(hidden_states)
++        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
++        q = self.q_norm(q.reshape(-1, self.num_heads,
++                                  self.head_dim)).reshape(q.shape)
++        k = self.k_norm(k.reshape(-1, self.num_kv_heads,
++                                  self.head_dim)).reshape(k.shape)
++        q, k = self.rotary_emb(positions, q, k)
++        attn_output = self.attn(q, k, v)
++        output, _ = self.o_proj(attn_output)
++        return output
++
++
++class Dots1DecoderLayer(nn.Module):
++
++    def __init__(
++        self,
++        config: PretrainedConfig,
++        prefix: str,
++        model_config: ModelConfig,
++        cache_config: Optional[CacheConfig] = None,
++        quant_config: Optional[QuantizationConfig] = None,
++    ) -> None:
++        super().__init__()
++        self.hidden_size = config.hidden_size
++        rope_theta = getattr(config, "rope_theta", 10000)
++        rope_scaling = getattr(config, "rope_scaling", None)
++        max_position_embeddings = getattr(config, "max_position_embeddings",
++                                          8192)
++        layer_idx = int(prefix.split(sep='.')[-1])
++        self.layer_idx = layer_idx
++
++        self.self_attn = Dots1Attention(
++            hidden_size=self.hidden_size,
++            num_heads=config.num_attention_heads,
++            num_kv_heads=config.num_key_value_heads,
++            config=config,
++            rope_theta=rope_theta,
++            rope_scaling=rope_scaling,
++            max_position_embeddings=max_position_embeddings,
++            cache_config=cache_config,
++            quant_config=quant_config,
++            prefix=f"{prefix}.self_attn",
++        )
++        if (config.n_routed_experts is not None
++                and layer_idx >= config.first_k_dense_replace
++                and layer_idx % config.moe_layer_freq == 0):
++            self.mlp = Dots1MoE(config=config,
++                                quant_config=quant_config,
++                                prefix=f"{prefix}.mlp")
++        else:
++            self.mlp = Dots1MLP(
++                hidden_size=config.hidden_size,
++                intermediate_size=config.intermediate_size,
++                hidden_act=config.hidden_act,
++                quant_config=quant_config,
++                prefix=f"{prefix}.mlp",
++            )
++        self.input_layernorm = RMSNorm(config.hidden_size,
++                                       eps=config.rms_norm_eps)
++        self.post_attention_layernorm = RMSNorm(config.hidden_size,
++                                                eps=config.rms_norm_eps)
++        self.routed_scaling_factor = config.routed_scaling_factor
++
++    def forward(
++        self,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++        residual: Optional[torch.Tensor],
++    ) -> torch.Tensor:
++        if residual is None:
++            residual = hidden_states
++            hidden_states = self.input_layernorm(hidden_states)
++        else:
++            hidden_states, residual = self.input_layernorm(
++                hidden_states, residual)
++        hidden_states = self.self_attn(positions=positions,
++                                       hidden_states=hidden_states)
++        hidden_states, residual = self.post_attention_layernorm(
++            hidden_states, residual)
++        hidden_states = self.mlp(hidden_states)
++        return hidden_states, residual
++
++
++@support_torch_compile
++class Dots1Model(nn.Module):
++
++    fall_back_to_pt_during_load = False
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        super().__init__()
++
++        config = vllm_config.model_config.hf_config
++        model_config = vllm_config.model_config
++        cache_config = vllm_config.cache_config
++        quant_config = vllm_config.quant_config
++        self.config = config
++
++        self.vocab_size = config.vocab_size
++
++        if get_pp_group().is_first_rank:
++            self.embed_tokens = VocabParallelEmbedding(
++                config.vocab_size,
++                config.hidden_size,
++                quant_config=quant_config,
++                prefix=f"{prefix}.embed_tokens")
++        else:
++            self.embed_tokens = PPMissingLayer()
++
++        self.start_layer, self.end_layer, self.layers = make_layers(
++            config.num_hidden_layers,
++            lambda prefix: Dots1DecoderLayer(
++                config,
++                prefix,
++                model_config=model_config,
++                cache_config=cache_config,
++                quant_config=quant_config,
++            ),
++            prefix=f"{prefix}.layers")
++
++        if get_pp_group().is_last_rank:
++            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        else:
++            self.norm = PPMissingLayer()
++        self.make_empty_intermediate_tensors = (
++            make_empty_intermediate_tensors_factory(
++                ["hidden_states", "residual"], config.hidden_size))
++
++    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.embed_tokens(input_ids)
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        intermediate_tensors: Optional[IntermediateTensors],
++        inputs_embeds: Optional[torch.Tensor] = None,
++    ) -> Union[torch.Tensor, IntermediateTensors]:
++        if get_pp_group().is_first_rank:
++            if inputs_embeds is not None:
++                hidden_states = inputs_embeds
++            else:
++                hidden_states = self.get_input_embeddings(input_ids)
++            residual = None
++        else:
++            assert intermediate_tensors is not None
++            hidden_states = intermediate_tensors["hidden_states"]
++            residual = intermediate_tensors["residual"]
++        for layer in self.layers[self.start_layer:self.end_layer]:
++            hidden_states, residual = layer(
++                positions,
++                hidden_states,
++                residual,
++            )
++        if not get_pp_group().is_last_rank:
++            return IntermediateTensors({
++                "hidden_states": hidden_states,
++                "residual": residual
++            })
++        hidden_states, _ = self.norm(hidden_states, residual)
++        return hidden_states
++
++    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
++        return FusedMoE.make_expert_params_mapping(
++            ckpt_gate_proj_name="gate_proj",
++            ckpt_down_proj_name="down_proj",
++            ckpt_up_proj_name="up_proj",
++            num_experts=self.config.n_routed_experts)
++
++    def load_weights(self, weights: Iterable[tuple[str,
++                                                   torch.Tensor]]) -> set[str]:
++        stacked_params_mapping = [
++            ("qkv_proj", "q_proj", "q"),
++            ("qkv_proj", "k_proj", "k"),
++            ("qkv_proj", "v_proj", "v"),
++            ("gate_up_proj", "gate_proj", 0),
++            ("gate_up_proj", "up_proj", 1),
++        ]
++
++        params_dict = dict(self.named_parameters())
++        loaded_params: set[str] = set()
++        expert_params_mapping = self.get_expert_mapping()
++        for name, loaded_weight in weights:
++            if "rotary_emb.inv_freq" in name:
++                continue
++            for (param_name, weight_name, shard_id) in stacked_params_mapping:
++                if weight_name not in name:
++                    continue
++                if (("mlp.experts." in name) and name not in params_dict):
++                    continue
++                name = name.replace(weight_name, param_name)
++                if name.endswith(".bias") and name not in params_dict:
++                    continue
++                if is_pp_missing_parameter(name, self):
++                    continue
++                param = params_dict[name]
++                weight_loader = param.weight_loader
++                weight_loader(param, loaded_weight, shard_id)
++                break
++            else:
++                for mapping in expert_params_mapping:
++                    param_name, weight_name, expert_id, shard_id = mapping
++                    if weight_name not in name:
++                        continue
++                    name = name.replace(weight_name, param_name)
++
++                    if is_pp_missing_parameter(name, self):
++                        continue
++
++                    param = params_dict[name]
++                    weight_loader = param.weight_loader
++                    weight_loader(param,
++                                  loaded_weight,
++                                  name,
++                                  shard_id=shard_id,
++                                  expert_id=expert_id)
++                    break
++                else:
++                    if name.endswith(".bias") and name not in params_dict:
++                        continue
++                    name = maybe_remap_kv_scale_name(name, params_dict)
++                    if name is None:
++                        continue
++                    if is_pp_missing_parameter(name, self):
++                        continue
++                    param = params_dict[name]
++                    weight_loader = getattr(param, "weight_loader",
++                                            default_weight_loader)
++                    weight_loader(param, loaded_weight)
++            loaded_params.add(name)
++        return loaded_params
++
++
++class Dots1ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
++
++    packed_modules_mapping = {
++        "qkv_proj": [
++            "q_proj",
++            "k_proj",
++            "v_proj",
++        ],
++        "gate_up_proj": [
++            "gate_proj",
++            "up_proj",
++        ],
++    }
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        super().__init__()
++        config = vllm_config.model_config.hf_config
++        quant_config = vllm_config.quant_config
++        self.config = config
++        self.quant_config = quant_config
++        self.model = Dots1Model(vllm_config=vllm_config,
++                                prefix=maybe_prefix(prefix, "model"))
++        if get_pp_group().is_last_rank:
++            self.lm_head = ParallelLMHead(config.vocab_size,
++                                          config.hidden_size,
++                                          quant_config=quant_config)
++        else:
++            self.lm_head = PPMissingLayer()
++        self.logits_processor = LogitsProcessor(config.vocab_size)
++        self.make_empty_intermediate_tensors = (
++            self.model.make_empty_intermediate_tensors)
++
++    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.model.get_input_embeddings(input_ids)
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        intermediate_tensors: Optional[IntermediateTensors] = None,
++        inputs_embeds: Optional[torch.Tensor] = None,
++    ) -> Union[torch.Tensor, IntermediateTensors]:
++        hidden_states = self.model(
++            input_ids,
++            positions,
++            intermediate_tensors,
++            inputs_embeds,
++        )
++        return hidden_states
++
++    def compute_logits(
++        self,
++        hidden_states: torch.Tensor,
++        sampling_metadata: SamplingMetadata,
++    ) -> Optional[torch.Tensor]:
++        logits = self.logits_processor(self.lm_head, hidden_states,
++                                       sampling_metadata)
++        return logits
++
++    def load_weights(self, weights: Iterable[tuple[str,
++                                                   torch.Tensor]]) -> set[str]:
++        loader = AutoWeightsLoader(self)
++        return loader.load_weights(weights)
++
++    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
++        return self.model.get_expert_mapping()
 diff --git a/vllm/model_executor/models/gemma2.py b/vllm/model_executor/models/gemma2.py
 index b46716213..9051ad5ea 100644
 --- a/vllm/model_executor/models/gemma2.py
@@ -13565,10 +14388,10 @@ index 000000000..ac4939aee
 +        )
 diff --git a/vllm/model_executor/models/glm4_moe.py b/vllm/model_executor/models/glm4_moe.py
 new file mode 100644
-index 000000000..f64658bba
+index 000000000..2ca32f556
 --- /dev/null
 +++ b/vllm/model_executor/models/glm4_moe.py
-@@ -0,0 +1,687 @@
+@@ -0,0 +1,701 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -13612,7 +14435,6 @@ index 000000000..f64658bba
 +from vllm.model_executor.layers.layernorm import RMSNorm
 +from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
 +                                               QKVParallelLinear,
-+                                               ReplicatedLinear,
 +                                               RowParallelLinear)
 +from vllm.model_executor.layers.logits_processor import LogitsProcessor
 +from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -13624,7 +14446,7 @@ index 000000000..f64658bba
 +from vllm.model_executor.sampling_metadata import SamplingMetadata
 +from vllm.sequence import IntermediateTensors
 +
-+from .interfaces import SupportsPP
++from .interfaces import SupportsLoRA, SupportsPP
 +from .utils import (AutoWeightsLoader, PPMissingLayer, is_pp_missing_parameter,
 +                    make_empty_intermediate_tensors_factory, make_layers,
 +                    maybe_prefix)
@@ -13689,16 +14511,17 @@ index 000000000..f64658bba
 +        if config.hidden_act != "silu":
 +            raise ValueError(f"Unsupported activation: {config.hidden_act}. "
 +                             "Only silu is supported for now.")
-+
-+        self.gate = ReplicatedLinear(config.hidden_size,
-+                                     config.n_routed_experts,
-+                                     bias=False,
-+                                     quant_config=None,
-+                                     prefix=f"{prefix}.gate")
-+
-+        # noaux_tc is not set in transformers new config now
-+        self.gate.e_score_correction_bias = (nn.Parameter(
-+            torch.empty(config.n_routed_experts)))
++        # NOTE In the transformers implementation, the gate isn't an nn.Linear,
++        # so we cannot use ReplicatedLinear here.
++        # See: https://github.com/huggingface/transformers/blob/v4.55.1/src/transformers/models/glm4_moe/modeling_glm4_moe.py#L260
++        self.gate = nn.Linear(
++            config.hidden_size,
++            config.n_routed_experts,
++            bias=False,
++            dtype=torch.float32,
++        )
++        self.gate.e_score_correction_bias = nn.Parameter(
++            torch.empty(config.n_routed_experts, dtype=torch.float32))
 +
 +        # Load balancing settings.
 +        vllm_config = get_current_vllm_config()
@@ -13754,7 +14577,7 @@ index 000000000..f64658bba
 +
 +        if self.n_shared_experts is not None:
 +            shared_output = self.shared_experts(hidden_states)
-+        router_logits, _ = self.gate(hidden_states)
++        router_logits = self.gate(hidden_states.to(dtype=torch.float32))
 +        final_hidden_states = self.experts(
 +            hidden_states=hidden_states,
 +            router_logits=router_logits) * self.routed_scaling_factor
@@ -13945,7 +14768,13 @@ index 000000000..f64658bba
 +        return hidden_states, residual
 +
 +
-+@support_torch_compile
++@support_torch_compile(
++    dynamic_arg_dims={
++        "input_ids": 0,
++        "positions": -1,
++        "intermediate_tensors": 0,
++        "inputs_embeds": 0,
++    })
 +class Glm4MoeModel(nn.Module):
 +
 +    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -13965,7 +14794,6 @@ index 000000000..f64658bba
 +            self.embed_tokens = VocabParallelEmbedding(
 +                config.vocab_size,
 +                config.hidden_size,
-+                quant_config=quant_config,
 +                prefix=f"{prefix}.embed_tokens")
 +        else:
 +            self.embed_tokens = PPMissingLayer()
@@ -14037,6 +14865,15 @@ index 000000000..f64658bba
 +                        device=device),
 +        })
 +
++    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
++        # Params for weights, fp8 weight scales, fp8 activation scales
++        # (param_name, weight_name, expert_id, shard_id)
++        return FusedMoE.make_expert_params_mapping(
++            ckpt_gate_proj_name="gate_proj",
++            ckpt_down_proj_name="down_proj",
++            ckpt_up_proj_name="up_proj",
++            num_experts=self.config.n_routed_experts)
++
 +    def load_weights(self, weights: Iterable[tuple[str,
 +                                                   torch.Tensor]]) -> set[str]:
 +        stacked_params_mapping = [
@@ -14048,16 +14885,9 @@ index 000000000..f64658bba
 +            ("gate_up_proj", "up_proj", 1),
 +        ]
 +
-+        # Params for weights, fp8 weight scales, fp8 activation scales
-+        # (param_name, weight_name, expert_id, shard_id)
-+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-+            ckpt_gate_proj_name="gate_proj",
-+            ckpt_down_proj_name="down_proj",
-+            ckpt_up_proj_name="up_proj",
-+            num_experts=self.config.n_routed_experts)
-+
 +        params_dict = dict(self.named_parameters())
 +        loaded_params: set[str] = set()
++        expert_params_mapping = self.get_expert_mapping()
 +        for name, loaded_weight in weights:
 +            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
 +            if spec_layer is not None:
@@ -14144,7 +14974,7 @@ index 000000000..f64658bba
 +        return loaded_params
 +
 +
-+class Glm4MoeForCausalLM(nn.Module, SupportsPP):
++class Glm4MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
 +    packed_modules_mapping = {
 +        "qkv_proj": [
 +            "q_proj",
@@ -14173,8 +15003,6 @@ index 000000000..f64658bba
 +                                          quant_config=quant_config)
 +        else:
 +            self.lm_head = PPMissingLayer()
-+        if self.config.tie_word_embeddings:
-+            self.lm_head.weight = self.model.embed_tokens.weight
 +        self.logits_processor = LogitsProcessor(config.vocab_size)
 +        self.make_empty_intermediate_tensors = (
 +            self.model.make_empty_intermediate_tensors)
@@ -14186,14 +15014,20 @@ index 000000000..f64658bba
 +        self.num_expert_groups = config.n_group
 +
 +        self.moe_layers: list[FusedMoE] = []
++        example_moe = None
 +        for layer in self.model.layers:
++            if isinstance(layer, PPMissingLayer):
++                continue
++
 +            assert isinstance(layer, Glm4MoeDecoderLayer)
 +            if isinstance(layer.mlp, Glm4MoE):
++                # Pick last one layer since the first ones may be dense layers.
++                example_moe = layer.mlp
 +                self.moe_layers.append(layer.mlp.experts)
 +
-+        # Pick last one layer since the first ones may be dense layers.
-+        example_moe = typing.cast(
-+            Glm4MoE, self.model.layers[config.num_hidden_layers - 1].mlp)
++        if example_moe is None:
++            raise RuntimeError("No Glm4MoE layer found in model.layers.")
++
 +        self.num_logical_experts = example_moe.n_logical_experts
 +        self.num_physical_experts = example_moe.n_physical_experts
 +        self.num_local_physical_experts = example_moe.n_local_physical_experts
@@ -14244,6 +15078,9 @@ index 000000000..f64658bba
 +                                                   torch.Tensor]]) -> set[str]:
 +        loader = AutoWeightsLoader(self)
 +        return loader.load_weights(weights)
++
++    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
++        return self.model.get_expert_mapping()
 +
 +
 +def get_spec_layer_idx_from_weight_name(config: PretrainedConfig,
@@ -14923,7 +15760,7 @@ index 8a4c2850d..e433df0f0 100644
          q, k = self.rotary_emb(positions, q, k)
          attn_output = self.attn(q, k, v)
 diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
-index 97ea12de6..6acbcaf5c 100644
+index 97ea12de6..c860cde8c 100644
 --- a/vllm/model_executor/models/registry.py
 +++ b/vllm/model_executor/models/registry.py
 @@ -58,6 +58,7 @@ _TEXT_GENERATION_MODELS = {
@@ -14946,7 +15783,7 @@ index 97ea12de6..6acbcaf5c 100644
      "FuyuForCausalLM": ("fuyu", "FuyuForCausalLM"),
      "Gemma3ForConditionalGeneration": ("gemma3_mm", "Gemma3ForConditionalGeneration"),  # noqa: E501
      "GLM4VForCausalLM": ("glm4v", "GLM4VForCausalLM"),
-+    "Glm4vForConditionalGeneration": ("glm4_1v", "Glm4vForConditionalGeneration"),  # noqa: E501
++    "Glm4vMoeForConditionalGeneration": ("glm4_1v", "Glm4vForConditionalGeneration"),  # noqa: E501
      "GraniteSpeechForConditionalGeneration": ("granite_speech", "GraniteSpeechForConditionalGeneration"),  # noqa: E501
      "H2OVLChatModel": ("h2ovl", "H2OVLChatModel"),
      "InternVLChatModel": ("internvl", "InternVLChatModel"),
@@ -15479,7 +16316,7 @@ index 65606ce55..5a9777297 100644
  ]
 diff --git a/vllm/reasoning/glm4_moe_reasoning_parser.py b/vllm/reasoning/glm4_moe_reasoning_parser.py
 new file mode 100644
-index 000000000..050c642b1
+index 000000000..03ab6e01c
 --- /dev/null
 +++ b/vllm/reasoning/glm4_moe_reasoning_parser.py
 @@ -0,0 +1,148 @@
@@ -15499,7 +16336,7 @@ index 000000000..050c642b1
 +logger = init_logger(__name__)
 +
 +
-+@ReasoningParserManager.register_module("glm4_moe")
++@ReasoningParserManager.register_module("glm45")
 +class Glm4MoeModelReasoningParser(ReasoningParser):
 +    """
 +    Reasoning parser for the Glm4MoeModel model.
@@ -15632,6 +16469,20 @@ index 000000000..050c642b1
 +        final_content = content or None
 +        return reasoning_content, final_content
 \ No newline at end of file
+diff --git a/vllm/transformers_utils/config.py b/vllm/transformers_utils/config.py
+index 69e7207cc..c930520d5 100644
+--- a/vllm/transformers_utils/config.py
++++ b/vllm/transformers_utils/config.py
+@@ -234,7 +234,8 @@ def _uses_mrope(config: PretrainedConfig) -> bool:
+ 
+ def uses_mrope(config: PretrainedConfig) -> bool:
+     """Detect if the model with this config uses M-ROPE."""
+-    return _uses_mrope(config) or thinker_uses_mrope(config)
++    return _uses_mrope(config) or _uses_mrope(
++        config.get_text_config()) or thinker_uses_mrope(config)
+ 
+ 
+ def thinker_uses_mrope(config: PretrainedConfig) -> bool:
 diff --git a/vllm/utils.py b/vllm/utils.py
 index 846df7743..7fa8be5ff 100644
 --- a/vllm/utils.py
