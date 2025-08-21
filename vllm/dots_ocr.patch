@@ -1,0 +1,82 @@
+diff --git a/modeling_dots_ocr_vllm.py b/modeling_dots_ocr_vllm.py
+index a8ba8d0..3d9c5a4 100644
+--- a/modeling_dots_ocr_vllm.py
++++ b/modeling_dots_ocr_vllm.py
+@@ -428,8 +428,9 @@ class DotsOCRForCausalLM(nn.Module, SupportsMultiModal):
+ def patch_vllm_chat_placeholder():
+     import vllm
+     # return when vllm version > 0.9.1
+-    if not (vllm.__version_tuple__[0]==0 and vllm.__version_tuple__[1] <= 9 and vllm.__version_tuple__[2] <= 1):
+-        return
++    # our version is 0.9.0.dev, ignore the following version check.
++    # if not (vllm.__version_tuple__[0]==0 and vllm.__version_tuple__[1] <= 9 and vllm.__version_tuple__[2] <= 1):
++    #     return
+     from vllm.entrypoints.chat_utils import BaseMultiModalItemTracker
+ 
+     ori = BaseMultiModalItemTracker._placeholder_str
+diff --git a/modeling_dots_vision.py b/modeling_dots_vision.py
+index 00c5cd8..46fa418 100644
+--- a/modeling_dots_vision.py
++++ b/modeling_dots_vision.py
+@@ -4,10 +4,15 @@ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+ import torch.utils.checkpoint
+-from flash_attn import flash_attn_varlen_func
++# from flash_attn import flash_attn_varlen_func
+ from torch.nn import LayerNorm
+ from transformers.modeling_utils import PreTrainedModel
+ from .configuration_dots import DotsVisionConfig
++try:
++    import intel_extension_for_pytorch as ipex
++except ImportError as e:
++    raise ValueError("IPEX is not installed but required for XPU build")
++
+ 
+ 
+ def rotate_half(x):
+@@ -146,9 +151,41 @@ class VisionFlashAttention2(nn.Module):
+         q = apply_rotary_pos_emb_vision(q.unsqueeze(0), rotary_pos_emb).squeeze(0)
+         k = apply_rotary_pos_emb_vision(k.unsqueeze(0), rotary_pos_emb).squeeze(0)
+         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+-        attn_output = flash_attn_varlen_func(
+-            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, causal=self.is_causal
+-        ).reshape(seq_length, -1)
++
++        # Original code with flash_attn_varlen_func
++        # attn_output = flash_attn_varlen_func(
++        #     q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, causal=self.is_causal
++        # ).reshape(seq_length, -1)
++        # Original code ends
++
++        # Changes start for XPU
++        attn_output = torch.empty(
++                q.shape,
++                dtype=q.dtype,
++                device=q.device)
++        ipex.llm.functional.varlen_attention(
++            q.contiguous(),                   # query
++            k.contiguous(),                   # key
++            v.contiguous(),                   # value
++            attn_output,                      # out
++            cu_seqlens.int(),                 # seqlen_q
++            cu_seqlens.int(),                 # seqlen_k
++            None,                             # alibi_slopes
++            max_seqlen,                       # max_seqlen_q
++            max_seqlen,                       # max_seqlen_k
++            0.0,                              # pdropout
++            1.0 / (q.shape[-1] ** 0.5),       # softmax_scale
++            False,                            # zero_tensors
++            self.is_causal,                   # is_causal
++            False,                            # return_softmax
++            None,                             # gen_
++            -1,                               # window_size_left
++            -1,                               # window_size_right
++            -1,                               # logits_soft_cap
++        )
++        attn_output = attn_output.reshape(seq_length, -1)
++        # Changes end for XPU
++
+         attn_output = self.proj(attn_output)
+ 
+         return attn_output

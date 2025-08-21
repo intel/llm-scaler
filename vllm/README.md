@@ -2218,6 +2218,57 @@ curl http://localhost:8000/v1/audio/transcriptions \
 ```
 ---
 
+### 2.4.2 dots.ocr Support
+
+Git clone the repo:
+
+```bash
+https://github.com/rednote-hilab/dots.ocr.git
+cd dots.ocr
+```
+
+Then, we should comment out the following two items in `requirements.txt`:
+
+> flash-attn==2.8.0.post2 and accelerate  # because these two dependencies will require cuda
+
+After commenting out these two elements, we can install the dependencies:
+
+```bash
+# Assuming you have installed torch/ipex etc.
+pip install --no-deps accelerate
+pip install -e .
+```
+
+To download model weights in `dots.ocr`:
+```bash
+# In dots.ocr
+python3 tools/download_model.py
+
+# with modelscope
+python3 tools/download_model.py --type modelscope
+```
+
+In order to run dots.ocr, we will need to change codes in `./weights/DotsOCR`:
+
+```bash
+patch -p1 < YOUR_PATH/dots_ocr.patch
+```
+
+Then, you're ready to start:
+
+```bash
+export hf_model_path=./weights/DotsOCR  # Path to your downloaded model weights, Please use a directory name without periods (e.g., `DotsOCR` instead of `dots.ocr`) for the model save path. This is a temporary workaround pending our integration with Transformers.
+export PYTHONPATH=$(dirname "$hf_model_path"):$PYTHONPATH
+sed -i '/^from vllm\.version import __version__ as VLLM_VERSION$/a\
+from DotsOCR import modeling_dots_ocr_vllm' /usr/local/lib/python3.10/dist-packages/vllm/entrypoints/openai/api_server.py  # If you downloaded model weights by yourself, please replace `DotsOCR` by your model saved directory name, and remember to use a directory name without periods (e.g., `DotsOCR` instead of `dots.ocr`) 
+
+# Start the service:
+TORCH_LLM_ALLREDUCE=1 VLLM_USE_V1=1  CCL_ZE_IPC_EXCHANGE=pidfd VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn python3 -m vllm.entrypoints.openai.api_server --model /llm/models/DotsOCR --device=xpu --enforce-eager --host 0.0.0.0 --trust-remote-code --disable-sliding-window --gpu-memory-util=0.8 --no-enable-prefix-caching --max-num-batched-tokens=8192  --disable-log-requests  --max-model-len=40000 --block-size 64 -tp=1 --port 8000 --served-model-name DotsOCR --chat-template-content-format string --dtype bfloat16
+```
+
+
+---
+
 ### 2.5 Omni Model Support
 
 #### Install audio dependencies
