@@ -162,12 +162,15 @@ First, pull the image for **Intel Arc B60 GPUs**:
 
 ```bash
 docker pull intel/llm-scaler-vllm:latest
-````
+```
+**Notes:**
+* `intel/llm-scaler-vllm:1.0` → PV release image
+* `intel/llm-scaler-vllm:latest` → Latest development version
 
 **Supplement: For Intel Arc A770 GPUs**
 ```bash
 docker pull intelanalytics/multi-arc-serving:latest
-````
+```
 - Usage Instructions: [VLLM Docker Quickstart for A770](https://github.com/intel/ipex-llm/blob/main/docs/mddocs/DockerGuides/vllm_docker_quickstart.md#3-start-the-docker-container)
 
 Then, run the container:
