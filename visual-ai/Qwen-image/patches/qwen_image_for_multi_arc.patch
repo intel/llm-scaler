@@ -1,0 +1,349 @@
+diff --git a/apps/gradio/DiffSynth_Studio.py b/apps/gradio/DiffSynth_Studio.py
+index d265492..a4bec1e 100644
+--- a/apps/gradio/DiffSynth_Studio.py
++++ b/apps/gradio/DiffSynth_Studio.py
+@@ -117,7 +117,8 @@ def load_model(model_type, model_path):
+         model_manager_to_release, _ = model_dict[key]
+         model_manager_to_release.to("cpu")
+         del model_dict[key]
+-        torch.cuda.empty_cache()
++        #torch.cuda.empty_cache()
++        torch.xpu.empty_cache()
+     model_dict[model_key] = model_manager, pipe
+     return model_manager, pipe
+ 
+diff --git a/diffsynth/models/qwen_image_dit.py b/diffsynth/models/qwen_image_dit.py
+index e0d493c..f4841f4 100644
+--- a/diffsynth/models/qwen_image_dit.py
++++ b/diffsynth/models/qwen_image_dit.py
+@@ -77,7 +77,7 @@ class QwenEmbedRope(nn.Module):
+         ], dim=1)
+         self.rope_cache = {}
+         self.scale_rope = scale_rope
+-        
++
+     def rope_params(self, index, dim, theta=10000):
+         """
+             Args:
+@@ -293,10 +293,13 @@ class QwenDoubleStreamAttention(nn.Module):
+         txt_v = rearrange(txt_v, 'b s (h d) -> b h s d', h=self.num_heads)
+ 
+         img_q, img_k = self.norm_q(img_q), self.norm_k(img_k)
++        device = img_q.device
+         txt_q, txt_k = self.norm_added_q(txt_q), self.norm_added_k(txt_k)
+-        
++
+         if image_rotary_emb is not None:
+             img_freqs, txt_freqs = image_rotary_emb
++            img_freqs = img_freqs.to(device)
++            txt_freqs = txt_freqs.to(device)
+             img_q = apply_rotary_emb_qwen(img_q, img_freqs)
+             img_k = apply_rotary_emb_qwen(img_k, img_freqs)
+             txt_q = apply_rotary_emb_qwen(txt_q, txt_freqs)
+@@ -319,21 +322,21 @@ class QwenDoubleStreamAttention(nn.Module):
+ 
+ class QwenImageTransformerBlock(nn.Module):
+     def __init__(
+-        self, 
+-        dim: int, 
+-        num_attention_heads: int, 
+-        attention_head_dim: int, 
++        self,
++        dim: int,
++        num_attention_heads: int,
++        attention_head_dim: int,
+         eps: float = 1e-6,
+-    ):    
++    ):
+         super().__init__()
+-        
++
+         self.dim = dim
+         self.num_attention_heads = num_attention_heads
+         self.attention_head_dim = attention_head_dim
+ 
+         self.img_mod = nn.Sequential(
+             nn.SiLU(),
+-            nn.Linear(dim, 6 * dim), 
++            nn.Linear(dim, 6 * dim),
+         )
+         self.img_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+         self.attn = QwenDoubleStreamAttention(
+@@ -347,21 +350,21 @@ class QwenImageTransformerBlock(nn.Module):
+ 
+         self.txt_mod = nn.Sequential(
+             nn.SiLU(),
+-            nn.Linear(dim, 6 * dim, bias=True), 
++            nn.Linear(dim, 6 * dim, bias=True),
+         )
+         self.txt_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+         self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+         self.txt_mlp = QwenFeedForward(dim=dim, dim_out=dim)
+-    
++
+     def _modulate(self, x, mod_params):
+         shift, scale, gate = mod_params.chunk(3, dim=-1)
+-        return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1), gate.unsqueeze(1)    
++        return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1), gate.unsqueeze(1)
+ 
+     def forward(
+         self,
+-        image: torch.Tensor,  
++        image: torch.Tensor,
+         text: torch.Tensor,
+-        temb: torch.Tensor, 
++        temb: torch.Tensor,
+         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+         attention_mask: Optional[torch.Tensor] = None,
+         enable_fp8_attention = False,
+@@ -369,11 +372,15 @@ class QwenImageTransformerBlock(nn.Module):
+ 
+         img_mod_attn, img_mod_mlp = self.img_mod(temb).chunk(2, dim=-1)  # [B, 3*dim] each
+         txt_mod_attn, txt_mod_mlp = self.txt_mod(temb).chunk(2, dim=-1)  # [B, 3*dim] each
++        device = img_mod_attn.device
+ 
+-        img_normed = self.img_norm1(image)
++        img_normed = self.img_norm1(image).to(device)
++        image = image.to(device)
++        text = text.to(device)
++        temb = temb.to(device)
+         img_modulated, img_gate = self._modulate(img_normed, img_mod_attn)
+ 
+-        txt_normed = self.txt_norm1(text)
++        txt_normed = self.txt_norm1(text).to(device)
+         txt_modulated, txt_gate = self._modulate(txt_normed, txt_mod_attn)
+ 
+         img_attn_out, txt_attn_out = self.attn(
+@@ -383,14 +390,16 @@ class QwenImageTransformerBlock(nn.Module):
+             attention_mask=attention_mask,
+             enable_fp8_attention=enable_fp8_attention,
+         )
+-        
++        img_attn_out = img_attn_out.to(device)
++        txt_attn_out = txt_attn_out.to(device)
++
+         image = image + img_gate * img_attn_out
+         text = text + txt_gate * txt_attn_out
+ 
+-        img_normed_2 = self.img_norm2(image)
++        img_normed_2 = self.img_norm2(image).to(device)
+         img_modulated_2, img_gate_2 = self._modulate(img_normed_2, img_mod_mlp)
+ 
+-        txt_normed_2 = self.txt_norm2(text)
++        txt_normed_2 = self.txt_norm2(text).to(device)
+         txt_modulated_2, txt_gate_2 = self._modulate(txt_normed_2, txt_mod_mlp)
+ 
+         img_mlp_out = self.img_mlp(img_modulated_2)
+@@ -409,7 +418,7 @@ class QwenImageDiT(torch.nn.Module):
+     ):
+         super().__init__()
+ 
+-        self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=[16,56,56], scale_rope=True) 
++        self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=[16,56,56], scale_rope=True)
+ 
+         self.time_text_embed = TimestepEmbeddings(256, 3072, diffusers_compatible_format=True, scale=1000, align_dtype_to_timestep=True)
+         self.txt_norm = RMSNorm(3584, eps=1e-6)
+@@ -510,7 +519,7 @@ class QwenImageDiT(torch.nn.Module):
+     ):
+         img_shapes = [(latents.shape[0], latents.shape[2]//2, latents.shape[3]//2)]
+         txt_seq_lens = prompt_emb_mask.sum(dim=1).tolist()
+-        
++
+         image = rearrange(latents, "B C (H P) (W Q) -> B (H W) (C P Q)", H=height//16, W=width//16, P=2, Q=2)
+         image = self.img_in(image)
+         text = self.txt_in(self.txt_norm(prompt_emb))
+@@ -526,13 +535,13 @@ class QwenImageDiT(torch.nn.Module):
+                 temb=conditioning,
+                 image_rotary_emb=image_rotary_emb,
+             )
+-        
++
+         image = self.norm_out(image, conditioning)
+         image = self.proj_out(image)
+-        
++
+         latents = rearrange(image, "B (H W) (C P Q) -> B C (H P) (W Q)", H=height//16, W=width//16, P=2, Q=2)
+         return image
+-    
++
+     @staticmethod
+     def state_dict_converter():
+         return QwenImageDiTStateDictConverter()
+diff --git a/diffsynth/pipelines/qwen_image.py b/diffsynth/pipelines/qwen_image.py
+index a17defe..cb60789 100644
+--- a/diffsynth/pipelines/qwen_image.py
++++ b/diffsynth/pipelines/qwen_image.py
+@@ -153,7 +153,8 @@ class QwenImagePipeline(BasePipeline):
+     def enable_vram_management(self, num_persistent_param_in_dit=None, vram_limit=None, vram_buffer=0.5, enable_dit_fp8_computation=False):
+         self.vram_management_enabled = True
+         if vram_limit is None:
+-            vram_limit = self.get_vram()
++            #vram_limit = self.get_vram()
++            vram_limit = torch.xpu.get_device_properties().total_memory/(1024**3)
+         vram_limit = vram_limit - vram_buffer
+         
+         if self.text_encoder is not None:
+@@ -766,7 +767,9 @@ def model_fn_qwen_image(
+                 controlnet_inputs=blockwise_controlnet_inputs, block_id=block_id,
+                 progress_id=progress_id, num_inference_steps=num_inference_steps,
+             )
+-    
++
++    conditioning = conditioning.to("xpu:0")
++    image = image.to("xpu:0")
+     image = dit.norm_out(image, conditioning)
+     image = dit.proj_out(image)
+     image = image[:, :image_seq_len]
+diff --git a/diffsynth/utils/__init__.py b/diffsynth/utils/__init__.py
+index ec3c727..78a1c7b 100644
+--- a/diffsynth/utils/__init__.py
++++ b/diffsynth/utils/__init__.py
+@@ -102,7 +102,8 @@ class BasePipeline(torch.nn.Module):
+                                 module.offload()
+                     else:
+                         model.cpu()
+-            torch.cuda.empty_cache()
++            #torch.cuda.empty_cache()
++            torch.xpu.empty_cache()
+             # onload models
+             for name, model in self.named_children():
+                 if name in model_names:
+diff --git a/diffsynth/vram_management/layers.py b/diffsynth/vram_management/layers.py
+index c6f1ec6..1dc7854 100644
+--- a/diffsynth/vram_management/layers.py
++++ b/diffsynth/vram_management/layers.py
+@@ -1,4 +1,4 @@
+-import torch, copy
++import torch, copy, os
+ from ..models.utils import init_weights_on_device
+ 
+ 
+@@ -11,10 +11,11 @@ def cast_to(weight, dtype, device):
+ class AutoTorchModule(torch.nn.Module):
+     def __init__(self):
+         super().__init__()
+-        
++
+     def check_free_vram(self):
+-        gpu_mem_state = torch.cuda.mem_get_info(self.computation_device)
+-        used_memory = (gpu_mem_state[1] - gpu_mem_state[0]) / (1024 ** 3)
++        # gpu_mem_state = torch.cuda.mem_get_info(self.computation_device)
++        # used_memory = (gpu_mem_state[1] - gpu_mem_state[0]) / (1024 ** 3)
++        used_memory = torch.xpu.memory_reserved() / (1024 ** 3)
+         return used_memory < self.vram_limit
+ 
+     def offload(self):
+@@ -26,7 +27,7 @@ class AutoTorchModule(torch.nn.Module):
+         if self.state != 1:
+             self.to(dtype=self.onload_dtype, device=self.onload_device)
+             self.state = 1
+-            
++
+     def keep(self):
+         if self.state != 2:
+             self.to(dtype=self.computation_dtype, device=self.computation_device)
+@@ -45,6 +46,17 @@ class AutoWrappedModule(AutoTorchModule):
+         self.computation_device = computation_device
+         self.vram_limit = vram_limit
+         self.state = 0
++        self.name = kwargs['name']
++        if os.getenv("qwen_image_enable_two_card", None) is not None:
++            if 'transformer_blocks' in self.name:
++                parts = self.name.split('.')
++                layer_index = int(parts[1])
++                if layer_index >= 30:
++                    self.computation_device = 'xpu:1'
++
++    def check_free_vram(self):
++        used_memory = torch.xpu.memory_reserved(self.computation_device) / (1024 ** 3)
++        return used_memory < self.vram_limit
+ 
+     def forward(self, *args, **kwargs):
+         if self.state == 2:
+@@ -58,7 +70,7 @@ class AutoWrappedModule(AutoTorchModule):
+             else:
+                 module = copy.deepcopy(self.module).to(dtype=self.computation_dtype, device=self.computation_device)
+         return module(*args, **kwargs)
+-    
++
+ 
+ class WanAutoCastLayerNorm(torch.nn.LayerNorm, AutoTorchModule):
+     def __init__(self, module: torch.nn.LayerNorm, offload_dtype, offload_device, onload_dtype, onload_device, computation_dtype, computation_device, vram_limit, **kwargs):
+@@ -90,7 +102,7 @@ class WanAutoCastLayerNorm(torch.nn.LayerNorm, AutoTorchModule):
+         with torch.amp.autocast(device_type=x.device.type):
+             x = torch.nn.functional.layer_norm(x.float(), self.normalized_shape, weight, bias, self.eps).type_as(x)
+         return x
+-    
++
+ 
+ class AutoWrappedLinear(torch.nn.Linear, AutoTorchModule):
+     def __init__(self, module: torch.nn.Linear, offload_dtype, offload_device, onload_dtype, onload_device, computation_dtype, computation_device, vram_limit, name="", **kwargs):
+@@ -111,7 +123,17 @@ class AutoWrappedLinear(torch.nn.Linear, AutoTorchModule):
+         self.lora_B_weights = []
+         self.lora_merger = None
+         self.enable_fp8 = computation_dtype in [torch.float8_e4m3fn, torch.float8_e4m3fnuz]
+-        
++        if os.getenv("qwen_image_enable_two_card", None) is not None:
++            if 'transformer_blocks' in self.name:
++                parts = self.name.split('.')
++                layer_index = int(parts[1])
++                if layer_index >= 30:
++                    self.computation_device = 'xpu:1'
++
++    def check_free_vram(self):
++        used_memory = torch.xpu.memory_reserved(self.computation_device) / (1024 ** 3)
++        return used_memory < self.vram_limit
++
+     def fp8_linear(
+         self,
+         input: torch.Tensor,
+@@ -151,6 +173,7 @@ class AutoWrappedLinear(torch.nn.Linear, AutoTorchModule):
+         return result
+ 
+     def forward(self, x, *args, **kwargs):
++        x = x.to(self.computation_device)
+         # VRAM management
+         if self.state == 2:
+             weight, bias = self.weight, self.bias
+@@ -163,13 +186,13 @@ class AutoWrappedLinear(torch.nn.Linear, AutoTorchModule):
+             else:
+                 weight = cast_to(self.weight, self.computation_dtype, self.computation_device)
+                 bias = None if self.bias is None else cast_to(self.bias, self.computation_dtype, self.computation_device)
+-        
++
+         # Linear forward
+         if self.enable_fp8:
+             out = self.fp8_linear(x, weight, bias)
+         else:
+             out = torch.nn.functional.linear(x, weight, bias)
+-        
++
+         # LoRA
+         if len(self.lora_A_weights) == 0:
+             # No LoRA
+@@ -210,4 +233,3 @@ def enable_vram_management_recursively(model: torch.nn.Module, module_map: dict,
+ def enable_vram_management(model: torch.nn.Module, module_map: dict, module_config: dict, max_num_param=None, overflow_module_config: dict = None, vram_limit=None):
+     enable_vram_management_recursively(model, module_map, module_config, max_num_param, overflow_module_config, total_num_param=0, vram_limit=vram_limit)
+     model.vram_management_enabled = True
+-
+diff --git a/requirements.txt b/requirements.txt
+index 889b7fa..48c0db7 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,16 +1,3 @@
+-torch>=2.0.0
+-torchvision
+-cupy-cuda12x
+-transformers
+-controlnet-aux==0.0.7
+ imageio
+ imageio[ffmpeg]
+-safetensors
+-einops
+-sentencepiece
+-protobuf
+-modelscope
+ ftfy
+-pynvml
+-pandas
+-accelerate
