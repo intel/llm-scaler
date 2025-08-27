@@ -2251,6 +2251,7 @@ python3 tools/download_model.py --type modelscope
 In order to run dots.ocr, we will need to change codes in `./weights/DotsOCR`:
 
 ```bash
+cd ./weights/DotsOCR
 patch -p1 < YOUR_PATH/dots_ocr.patch
 ```
 
@@ -2260,10 +2261,11 @@ Then, you're ready to start:
 export hf_model_path=./weights/DotsOCR  # Path to your downloaded model weights, Please use a directory name without periods (e.g., `DotsOCR` instead of `dots.ocr`) for the model save path. This is a temporary workaround pending our integration with Transformers.
 export PYTHONPATH=$(dirname "$hf_model_path"):$PYTHONPATH
 sed -i '/^from vllm\.version import __version__ as VLLM_VERSION$/a\
-from DotsOCR import modeling_dots_ocr_vllm' /usr/local/lib/python3.10/dist-packages/vllm/entrypoints/openai/api_server.py  # If you downloaded model weights by yourself, please replace `DotsOCR` by your model saved directory name, and remember to use a directory name without periods (e.g., `DotsOCR` instead of `dots.ocr`) 
+from DotsOCR import modeling_dots_ocr_vllm' /usr/local/lib/python3.12/dist-packages/vllm-0.10.1.dev0+g6d8d0a24c.d20250825.xpu-py3.12-linux-x86_64.egg/vllm/entrypoints/openai/api_server.py  
+# If you downloaded model weights by yourself, please replace `DotsOCR` by your model saved directory name, and remember to use a directory name without periods (e.g., `DotsOCR` instead of `dots.ocr`) 
 
 # Start the service:
-TORCH_LLM_ALLREDUCE=1 VLLM_USE_V1=1  CCL_ZE_IPC_EXCHANGE=pidfd VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn python3 -m vllm.entrypoints.openai.api_server --model /llm/models/DotsOCR --device=xpu --enforce-eager --host 0.0.0.0 --trust-remote-code --disable-sliding-window --gpu-memory-util=0.8 --no-enable-prefix-caching --max-num-batched-tokens=8192  --disable-log-requests  --max-model-len=40000 --block-size 64 -tp=1 --port 8000 --served-model-name DotsOCR --chat-template-content-format string --dtype bfloat16
+TORCH_LLM_ALLREDUCE=1 VLLM_USE_V1=1  CCL_ZE_IPC_EXCHANGE=pidfd VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn python3 -m vllm.entrypoints.openai.api_server --model YOUR_DOTSOCR_PATH --enforce-eager --host 0.0.0.0 --trust-remote-code --disable-sliding-window --gpu-memory-util=0.8 --no-enable-prefix-caching --max-num-batched-tokens=8192  --disable-log-requests  --max-model-len=40000 --block-size 64 -tp=1 --port 8000 --served-model-name DotsOCR --chat-template-content-format string --dtype bfloat16
 ```
 
 

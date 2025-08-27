@@ -1,8 +1,31 @@
 diff --git a/modeling_dots_ocr_vllm.py b/modeling_dots_ocr_vllm.py
-index a8ba8d0..3d9c5a4 100644
+index a8ba8d0..eb84b0d 100644
 --- a/modeling_dots_ocr_vllm.py
 +++ b/modeling_dots_ocr_vllm.py
-@@ -428,8 +428,9 @@ class DotsOCRForCausalLM(nn.Module, SupportsMultiModal):
+@@ -178,11 +178,6 @@ class DotsOCRForCausalLM(nn.Module, SupportsMultiModal):
+     )
+     _tp_plan = {}
+ 
+-    @classmethod
+-    def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
+-        if modality in ("image",):
+-            return "<|img|><|imgpad|><|endofimg|>"
+-
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+@@ -424,12 +419,20 @@ class DotsOCRForCausalLM(nn.Module, SupportsMultiModal):
+         loader = AutoWeightsLoader(self)
+         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+ 
++    @classmethod
++    def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
++        if modality.startswith("image"):
++            return "<|img|><|imgpad|><|endofimg|>"
++
++        raise ValueError("Only image modality is supported")
++
+ 
  def patch_vllm_chat_placeholder():
      import vllm
      # return when vllm version > 0.9.1
@@ -14,28 +37,38 @@ index a8ba8d0..3d9c5a4 100644
      from vllm.entrypoints.chat_utils import BaseMultiModalItemTracker
  
      ori = BaseMultiModalItemTracker._placeholder_str
+@@ -448,4 +451,4 @@ ModelRegistry.register_model(
+ )
+ 
+ 
+-patch_vllm_chat_placeholder()
+\ No newline at end of file
++# patch_vllm_chat_placeholder()
 diff --git a/modeling_dots_vision.py b/modeling_dots_vision.py
-index 00c5cd8..46fa418 100644
+index 1046513..56009a8 100644
 --- a/modeling_dots_vision.py
 +++ b/modeling_dots_vision.py
-@@ -4,10 +4,15 @@ import torch
- import torch.nn as nn
- import torch.nn.functional as F
- import torch.utils.checkpoint
--from flash_attn import flash_attn_varlen_func
-+# from flash_attn import flash_attn_varlen_func
- from torch.nn import LayerNorm
- from transformers.modeling_utils import PreTrainedModel
- from .configuration_dots import DotsVisionConfig
-+try:
+@@ -8,10 +8,16 @@ import torch.utils.checkpoint
+ flash_attn_available = True
+ npu_available = True
+ 
++# try:
++#     from flash_attn import flash_attn_varlen_func
++# except ImportError:
++#     flash_attn_available = False
++
+ try:
+-    from flash_attn import flash_attn_varlen_func
+-except ImportError:
+-    flash_attn_available = False
 +    import intel_extension_for_pytorch as ipex
 +except ImportError as e:
 +    raise ValueError("IPEX is not installed but required for XPU build")
 +
  
- 
- def rotate_half(x):
-@@ -146,9 +151,41 @@ class VisionFlashAttention2(nn.Module):
+ from torch.nn import LayerNorm
+ from transformers.modeling_utils import PreTrainedModel
+@@ -159,9 +165,41 @@ class VisionFlashAttention2(nn.Module):
          q = apply_rotary_pos_emb_vision(q.unsqueeze(0), rotary_pos_emb).squeeze(0)
          k = apply_rotary_pos_emb_vision(k.unsqueeze(0), rotary_pos_emb).squeeze(0)
          max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
