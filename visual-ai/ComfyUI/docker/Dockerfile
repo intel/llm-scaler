@@ -1,0 +1,129 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+# ======== Base Stage ========
+FROM intel/deep-learning-essentials:2025.0.2-0-devel-ubuntu24.04 AS vllm-base
+
+ARG https_proxy
+ARG http_proxy
+
+# Add Intel oneAPI repo and PPA for GPU support
+RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
+    echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list && \
+    add-apt-repository -y ppa:kobuk-team/intel-graphics-testing
+
+# Install dependencies and Python 3.10
+RUN apt-get update -y && \
+    apt-get install -y software-properties-common && \
+    add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get update -y && \
+    apt-get install -y python3.10 python3.10-distutils python3.10-dev && \
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10 && \
+    apt-get install -y --no-install-recommends --fix-missing \
+        curl \
+        ffmpeg \
+        git \
+        libsndfile1 \
+        libsm6 \
+        libxext6 \
+        libgl1 \
+        lsb-release \
+        numactl \
+        wget \
+        vim \
+        linux-libc-dev && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
+    # Install Intel GPU runtime packages
+    apt-get update -y && \
+    apt-get install -y libze1 libze-dev libze-intel-gpu1 intel-opencl-icd libze-intel-gpu-raytracing && \
+    apt-get install -y intel-oneapi-dpcpp-ct=2025.0.1-17 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# pin compute runtime version
+RUN mkdir /tmp/neo && \
+    cd /tmp/neo && \
+    wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.12.5/intel-igc-core-2_2.12.5+19302_amd64.deb && \
+    wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.12.5/intel-igc-opencl-2_2.12.5+19302_amd64.deb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-ocloc-dbgsym_25.22.33944.8-0_amd64.ddeb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-ocloc_25.22.33944.8-0_amd64.deb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-opencl-icd-dbgsym_25.22.33944.8-0_amd64.ddeb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-opencl-icd_25.22.33944.8-0_amd64.deb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libigdgmm12_22.7.0_amd64.deb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libze-intel-gpu1-dbgsym_25.22.33944.8-0_amd64.ddeb && \
+    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libze-intel-gpu1_25.22.33944.8-0_amd64.deb && \
+    dpkg -i *.deb
+
+WORKDIR /llm
+COPY ./patches/0001-oneccl-align-global-V0.1.1.patch /tmp/
+
+# Set environment variables early
+ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/local/lib/"
+
+# ======= Add oneCCL build =======
+RUN apt-get update && apt-get install -y \
+    cmake \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build 1ccl
+RUN git clone https://github.com/oneapi-src/oneCCL.git && \
+    cd oneCCL && \
+    git checkout def870543749186b6f38cdc865b44d52174c7492 && \
+    git apply /tmp/0001-oneccl-align-global-V0.1.1.patch && \
+    mkdir build && cd build && \
+    export IGC_VISAOptions=-activeThreadsOnlyBarrier && \
+    /usr/bin/cmake .. \
+        -DCMAKE_INSTALL_PREFIX=_install \
+        -DCMAKE_C_COMPILER=icx \
+        -DCMAKE_CXX_COMPILER=icpx \
+        -DCOMPUTE_BACKEND=dpcpp \
+        -DCCL_ENABLE_ARCB=1 && \
+    make -j && make install && \
+    mv _install /opt/intel/oneapi/ccl/2021.15.3 && \
+    cd /opt/intel/oneapi/ccl/ && \
+    ln -snf 2021.15.3 latest
+
+# Configure environment to source oneAPI
+RUN echo "source /opt/intel/oneapi/setvars.sh --force" >> /root/.bashrc
+
+SHELL ["bash", "-c"]
+CMD ["bash", "-c", "source /root/.bashrc && exec bash"]
+
+ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python3.10/dist-packages/torch/lib:$LD_LIBRARY_PATH"
+
+RUN pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/xpu && \
+    pip install intel-extension-for-pytorch==2.7.10+xpu oneccl_bind_pt==2.7.0+xpu --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/cn/ && \
+    pip install bigdl-core-xe-all==2.6.0 --extra-index-url https://download.pytorch.org/whl/xpu && \
+    apt remove python3-blinker -y
+
+# Install xDit related dependencies
+RUN cd /llm && \
+    ln -s /usr/bin/python3 /usr/bin/python && \
+    git clone https://github.com/analytics-zoo/long-context-attention.git -b xpu-main && \
+    cd long-context-attention && \
+    pip install -e . && \
+    cd /llm && \
+    git clone https://github.com/analytics-zoo/xDiT.git -b xpu-main && \
+    cd xDiT && \
+    pip install -e .
+
+# Install ComfyUI
+RUN cd /llm && \
+    git clone https://github.com/comfyanonymous/ComfyUI.git && \
+    cd ComfyUI && \
+    pip install -r requirements.txt && \
+    cd custom_nodes && \
+    git clone https://github.com/ltdrdata/ComfyUI-Manager.git comfyui-manager && \
+    git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git comfyui-videohelpersuite && \
+    cd comfyui-videohelpersuite && \
+    pip install -r requirements.txt && \
+    cd .. && \
+    git clone https://github.com/xiangyuT/raylight.git -b xpu_main && \
+    cd raylight && \
+    pip install -r requirements.txt && \
+    cd .. && \
+    git clone https://github.com/yolain/ComfyUI-Easy-Use.git comfyui-easy-use && \
+    cd comfyui-easy-use && \
+    pip install -r requirements.txt
+
+WORKDIR /llm/ComfyUI
