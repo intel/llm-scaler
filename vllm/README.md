@@ -215,13 +215,11 @@ This way, only the first GPU will be mapped into the Docker container.
 ### 1.4 Launching the Serving Service
 
 ```bash
-TORCH_LLM_ALLREDUCE=1 \
-VLLM_USE_V1=1 \
-CCL_ZE_IPC_EXCHANGE=pidfd \
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
 python3 -m vllm.entrypoints.openai.api_server \
     --model /llm/models/DeepSeek-R1-Distill-Qwen-7B \
+    --served-model-name DeepSeek-R1-Distill-Qwen-7B \
     --dtype=float16 \
     --enforce-eager \
     --port 8000 \
@@ -247,6 +245,7 @@ you can add the argument `--api-key xxx` for user authentication. Users are supp
 python3 /llm/vllm/benchmarks/benchmark_serving.py \
     --model /llm/models/DeepSeek-R1-Distill-Qwen-7B \
     --dataset-name random \
+    --served-model-name DeepSeek-R1-Distill-Qwen-7B \
     --random-input-len=1024 \
     --random-output-len=512 \
     --ignore-eos \
@@ -2020,9 +2019,6 @@ To enable online quantization using `llm-scaler-vllm`, specify the desired quant
 The following example shows how to launch the server with `sym_int4` quantization:
 
 ```bash
-TORCH_LLM_ALLREDUCE=1 \
-VLLM_USE_V1=1 \
-CCL_ZE_IPC_EXCHANGE=pidfd \
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
 python3 -m vllm.entrypoints.openai.api_server \
@@ -2054,9 +2050,6 @@ To use fp8 quantization, simply replace `--quantization sym_int4` with:
 
 #### Start service with embedding task
 ```bash
-TORCH_LLM_ALLREDUCE=1 \
-VLLM_USE_V1=1 \
-CCL_ZE_IPC_EXCHANGE=pidfd \
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
 python3 -m vllm.entrypoints.openai.api_server \
@@ -2095,9 +2088,6 @@ curl http://localhost:8000/v1/embeddings \
 #### Start service with classify task
 
 ```bash
-TORCH_LLM_ALLREDUCE=1 \
-VLLM_USE_V1=1 \
-CCL_ZE_IPC_EXCHANGE=pidfd \
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
 python3 -m vllm.entrypoints.openai.api_server \
@@ -2145,9 +2135,6 @@ curl -X 'POST' \
 
 #### Start service using V1 engine
 ```bash
-TORCH_LLM_ALLREDUCE=1 \
-VLLM_USE_V1=1 \
-CCL_ZE_IPC_EXCHANGE=pidfd \
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
 python3 -m vllm.entrypoints.openai.api_server \
@@ -2200,7 +2187,7 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 ---
 
-### 2.4.1 Audio Model Support
+### 2.4.1 Audio Model Support [Deprecated]
 
 #### Install audio dependencies
 ```bash
@@ -2254,9 +2241,6 @@ pip install librosa soundfile
 
 #### Start service using V1 engine
 ```bash
-TORCH_LLM_ALLREDUCE=1 \
-VLLM_USE_V1=1 \
-CCL_ZE_IPC_EXCHANGE=pidfd \
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
 python3 -m vllm.entrypoints.openai.api_server \
