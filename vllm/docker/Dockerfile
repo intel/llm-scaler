@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ======== Base Stage ========
-FROM intel/deep-learning-essentials:2025.0.2-0-devel-ubuntu24.04 AS vllm-base
+FROM intel/deep-learning-essentials:2025.1.3-0-devel-ubuntu24.04 AS vllm-base
 
 ARG https_proxy
 ARG http_proxy
@@ -10,15 +10,17 @@ ARG http_proxy
 # Add Intel oneAPI repo and PPA for GPU support
 RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
     echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list && \
-    add-apt-repository -y ppa:kobuk-team/intel-graphics-testing
+    add-apt-repository -y ppa:kobuk-team/intel-graphics
 
 # Install dependencies and Python 3.10
 RUN apt-get update -y && \
-    apt-get install -y software-properties-common && \
-    add-apt-repository ppa:deadsnakes/ppa && \
+    # apt-get install -y software-properties-common && \
+    # add-apt-repository ppa:deadsnakes/ppa && \
     apt-get update -y && \
-    apt-get install -y python3.10 python3.10-distutils python3.10-dev && \
-    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10 && \
+    apt-get install -y python3.12 python3.12-dev python3-pip && \
+    # curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
     apt-get install -y --no-install-recommends --fix-missing \
         curl \
         ffmpeg \
@@ -32,43 +34,47 @@ RUN apt-get update -y && \
         wget \
         vim \
         linux-libc-dev && \
-    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
     # Install Intel GPU runtime packages
     apt-get update -y && \
     apt-get install -y libze1 libze-dev libze-intel-gpu1 intel-opencl-icd libze-intel-gpu-raytracing && \
-    apt-get install -y intel-oneapi-dpcpp-ct=2025.0.1-17 && \
+    apt-get install -y intel-oneapi-dpcpp-ct=2025.1.0-452 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # pin compute runtime version
-RUN mkdir /tmp/neo && \
-    cd /tmp/neo && \
-    wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.12.5/intel-igc-core-2_2.12.5+19302_amd64.deb && \
-    wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.12.5/intel-igc-opencl-2_2.12.5+19302_amd64.deb && \
-    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-ocloc-dbgsym_25.22.33944.8-0_amd64.ddeb && \
-    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-ocloc_25.22.33944.8-0_amd64.deb && \
-    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-opencl-icd-dbgsym_25.22.33944.8-0_amd64.ddeb && \
-    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-opencl-icd_25.22.33944.8-0_amd64.deb && \
-    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libigdgmm12_22.7.0_amd64.deb && \
-    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libze-intel-gpu1-dbgsym_25.22.33944.8-0_amd64.ddeb && \
-    wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libze-intel-gpu1_25.22.33944.8-0_amd64.deb && \
-    dpkg -i *.deb
+# RUN mkdir /tmp/neo && \
+#     cd /tmp/neo && \
+#     wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.12.5/intel-igc-core-2_2.12.5+19302_amd64.deb && \
+#     wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.12.5/intel-igc-opencl-2_2.12.5+19302_amd64.deb && \
+#     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-ocloc-dbgsym_25.22.33944.8-0_amd64.ddeb && \
+#     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-ocloc_25.22.33944.8-0_amd64.deb && \
+#     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-opencl-icd-dbgsym_25.22.33944.8-0_amd64.ddeb && \
+#     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-opencl-icd_25.22.33944.8-0_amd64.deb && \
+#     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libigdgmm12_22.7.0_amd64.deb && \
+#     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libze-intel-gpu1-dbgsym_25.22.33944.8-0_amd64.ddeb && \
+#     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libze-intel-gpu1_25.22.33944.8-0_amd64.deb && \
+#     dpkg -i *.deb
 
 WORKDIR /llm
+# TODO: update vllm_for_multi_arc.patch
 COPY ./patches/vllm_for_multi_arc.patch /tmp/
+# TODO: update oneccl...
 COPY ./patches/0001-oneccl-align-global-V0.1.1.patch /tmp/
-COPY ./patches/vllm_int4_for_multi_arc.so /opt/lib/
+# COPY ./patches/vllm_int4_for_multi_arc.so /opt/lib/
 
 # Set environment variables early
 ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/local/lib/"
 ENV VLLM_TARGET_DEVICE=xpu
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
 
+# suppress the python externally managed environment error
+RUN python3 -m pip config set global.break-system-packages true
+
 # Clone + patch vllm
-RUN git clone -b v0.9.0 https://github.com/vllm-project/vllm.git && \
+RUN git clone -b v0.10.0 https://github.com/vllm-project/vllm.git && \
     cd vllm && \
     git apply /tmp/vllm_for_multi_arc.patch && \
     pip install --no-cache-dir -r requirements/xpu.txt && \
-    export CPATH=/opt/intel/oneapi/dpcpp-ct/2025.0/include/:${CPATH} && \
+    export CPATH=/opt/intel/oneapi/dpcpp-ct/2025.1/include/:${CPATH} && \
     python3 setup.py install
 
 # ======= Add oneCCL build =======
@@ -77,26 +83,30 @@ RUN apt-get update && apt-get install -y \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
+# TODO: update
 # Build 1ccl
-RUN git clone https://github.com/oneapi-src/oneCCL.git && \
-    cd oneCCL && \
-    git checkout def870543749186b6f38cdc865b44d52174c7492 && \
-    git apply /tmp/0001-oneccl-align-global-V0.1.1.patch && \
-    mkdir build && cd build && \
-    export IGC_VISAOptions=-activeThreadsOnlyBarrier && \
-    /usr/bin/cmake .. \
-        -DCMAKE_INSTALL_PREFIX=_install \
-        -DCMAKE_C_COMPILER=icx \
-        -DCMAKE_CXX_COMPILER=icpx \
-        -DCOMPUTE_BACKEND=dpcpp \
-        -DCCL_ENABLE_ARCB=1 && \
-    make -j && make install && \
-    mv _install /opt/intel/oneapi/ccl/2021.15.3 && \
-    cd /opt/intel/oneapi/ccl/ && \
-    ln -snf 2021.15.3 latest
+# RUN git clone https://github.com/oneapi-src/oneCCL.git && \
+#     cd oneCCL && \
+#     git checkout def870543749186b6f38cdc865b44d52174c7492 && \
+#     git apply /tmp/0001-oneccl-align-global-V0.1.1.patch && \
+#     mkdir build && cd build && \
+#     export IGC_VISAOptions=-activeThreadsOnlyBarrier && \
+#     /usr/bin/cmake .. \
+#         -DCMAKE_INSTALL_PREFIX=_install \
+#         -DCMAKE_C_COMPILER=icx \
+#         -DCMAKE_CXX_COMPILER=icpx \
+#         -DCOMPUTE_BACKEND=dpcpp \
+#         -DCCL_ENABLE_ARCB=1 && \
+#     make -j && make install && \
+#     mv _install /opt/intel/oneapi/ccl/2021.15.3 && \
+#     cd /opt/intel/oneapi/ccl/ && \
+#     ln -snf 2021.15.3 latest
+RUN cd /tmp/ && \
+    wget https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.4/intel-oneccl-2021.15.4.11_offline.sh && \
+    bash intel-oneccl-2021.15.4.11_offline.sh -a --silent --eula accept
 
 # Install pypi dependencies
-RUN pip install --pre --upgrade bigdl-core
+RUN pip install bigdl-core==2.4.0b1
 
 # Cleanup patch file
 RUN rm -rf /tmp/*
@@ -117,17 +127,17 @@ ARG https_proxy
 RUN pip install accelerate hf_transfer 'modelscope!=1.15.0'
 
 # Install required triton version
-RUN pip uninstall pytorch-triton-xpu triton -y && \
-    pip install https://download.pytorch-extension.intel.com/ipex_dev/xpu/triton-3.3.0%2Bgitbd88137b-cp310-cp310-linux_x86_64.whl
+# RUN pip uninstall pytorch-triton-xpu triton -y && \
+#     pip install https://download.pytorch-extension.intel.com/ipex_dev/xpu/triton-3.3.0%2Bgitbd88137b-cp310-cp310-linux_x86_64.whl
 
 # Pin transformers version to avoid conflict in vLLM
 RUN pip install "transformers<4.54.0"
 
 
 # Set additional environment for production usage
-ENV VLLM_USAGE_SOURCE=production-docker-image
-ENV TRITON_XPU_PROFILE=1
-ENV VLLM_QUANTIZE_Q40_LIB="/usr/local/lib/python3.10/dist-packages/vllm_int4_for_multi_arc.so"
+ENV VLLM_QUANTIZE_Q40_LIB="/usr/local/lib/python3.12/dist-packages/vllm_int4_for_multi_arc.so"
+
+RUN pip uninstall oneccl oneccl-devel -y
 
 # install development dependencies (for testing)
 RUN cd /llm/vllm && \
