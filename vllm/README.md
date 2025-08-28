@@ -223,7 +223,6 @@ VLLM_WORKER_MULTIPROC_METHOD=spawn \
 python3 -m vllm.entrypoints.openai.api_server \
     --model /llm/models/DeepSeek-R1-Distill-Qwen-7B \
     --dtype=float16 \
-    --device=xpu \
     --enforce-eager \
     --port 8000 \
     --host 0.0.0.0 \
@@ -2029,7 +2028,6 @@ VLLM_WORKER_MULTIPROC_METHOD=spawn \
 python3 -m vllm.entrypoints.openai.api_server \
     --model /llm/models/DeepSeek-R1-Distill-Qwen-7B \
     --dtype=float16 \
-    --device=xpu \
     --enforce-eager \
     --port 8000 \
     --host 0.0.0.0 \
@@ -2054,19 +2052,18 @@ To use fp8 quantization, simply replace `--quantization sym_int4` with:
 
 ### 2.3 Embedding and Reranker Model Support
 
-#### Start service using V0 engine
+#### Start service with embedding task
 ```bash
 TORCH_LLM_ALLREDUCE=1 \
-VLLM_USE_V1=0 \
+VLLM_USE_V1=1 \
 CCL_ZE_IPC_EXCHANGE=pidfd \
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
 python3 -m vllm.entrypoints.openai.api_server \
-    --model /llm/models/bge-reranker-large \
-    --served-model-name bge-reranker-large \
+    --model /llm/models/bge-m3 \
+    --served-model-name bge-m3 \
     --task embed \
     --dtype=float16 \
-    --device=xpu \
     --enforce-eager \
     --port 8000 \
     --host 0.0.0.0 \
@@ -2077,31 +2074,12 @@ python3 -m vllm.entrypoints.openai.api_server \
     --max-num-batched-tokens=2048 \
     --disable-log-requests \
     --max-model-len=2048 \
-    --block-size 16 \
-    --quantization fp8 \
+    --block-size 64 \
     -tp=1
 ```
 
-After starting the vLLM service, you can follow these two links to use it.
-#### [Rerank api](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#re-rank-api)
-
-```bash
-curl -X 'POST' \
-  'http://127.0.0.1:8000/v1/rerank' \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/json' \
-  -d '{
-  "model": "bge-reranker-large",
-  "query": "What is the capital of France?",
-  "documents": [
-    "The capital of Brazil is Brasilia.",
-    "The capital of France is Paris.",
-    "Horses and cows are both animals.",
-    "The French have a rich tradition in engineering."
-  ]
-}'
-```
-
+---
+After starting the vLLM service, you can follow this link to use it.
 #### [Embedding api](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#embeddings-api_1)
 
 ```bash
@@ -2113,6 +2091,54 @@ curl http://localhost:8000/v1/embeddings \
     "encoding_format": "float"
   }'
 ```
+
+#### Start service with classify task
+
+```bash
+TORCH_LLM_ALLREDUCE=1 \
+VLLM_USE_V1=1 \
+CCL_ZE_IPC_EXCHANGE=pidfd \
+VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+python3 -m vllm.entrypoints.openai.api_server \
+    --model /llm/models/bge-reranker-base \
+    --served-model-name bge-reranker-base \
+    --task classify \
+    --dtype=float16 \
+    --enforce-eager \
+    --port 8000 \
+    --host 0.0.0.0 \
+    --trust-remote-code \
+    --disable-sliding-window \
+    --gpu-memory-util=0.9 \
+    --no-enable-prefix-caching \
+    --max-num-batched-tokens=2048 \
+    --disable-log-requests \
+    --max-model-len=2048 \
+    --block-size 64 \
+    -tp=1
+```
+After starting the vLLM service, you can follow this link to use it.
+#### [Rerank api](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#re-rank-api)
+
+```bash
+curl -X 'POST' \
+  'http://127.0.0.1:8000/v1/rerank' \
+  -H 'accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "model": "bge-reranker-base",
+  "query": "What is the capital of France?",
+  "documents": [
+    "The capital of Brazil is Brasilia.",
+    "The capital of France is Paris.",
+    "Horses and cows are both animals.",
+    "The French have a rich tradition in engineering."
+  ]
+}'
+```
+
+
 ---
 
 ### 2.4 Multi-Modal Model Support
@@ -2129,7 +2155,6 @@ python3 -m vllm.entrypoints.openai.api_server \
     --served-model-name Qwen2.5-VL-7B-Instruct \
     --allowed-local-media-path /llm/models/test \
     --dtype=float16 \
-    --device=xpu \
     --enforce-eager \
     --port 8000 \
     --host 0.0.0.0 \
@@ -2194,7 +2219,6 @@ python3 -m vllm.entrypoints.openai.api_server \
     --served-model-name whisper-medium \
     --allowed-local-media-path /llm/models/test \
     --dtype=float16 \
-    --device=xpu \
     --enforce-eager \
     --port 8000 \
     --host 0.0.0.0 \
@@ -2240,7 +2264,6 @@ python3 -m vllm.entrypoints.openai.api_server \
     --served-model-name Qwen2.5-Omni-7B \
     --allowed-local-media-path /llm/models/test \
     --dtype=float16 \
-    --device=xpu \
     --enforce-eager \
     --port 8000 \
     --host 0.0.0.0 \
