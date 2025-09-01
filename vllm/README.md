@@ -2039,11 +2039,13 @@ python3 -m vllm.entrypoints.openai.api_server \
     -tp=1
 ```
 
-To use fp8 quantization, simply replace `--quantization sym_int4` with:
+To use fp8 online quantization, simply replace `--quantization sym_int4` with:
 
 ```bash
 --quantization fp8
 ```
+
+For those models that have been quantized before, such as AWQ-Int4/GPTQ-Int4/FP8 models, user do not need to specify the `--quantization` option.
 ---
 
 ### 2.3 Embedding and Reranker Model Support
@@ -2419,17 +2421,20 @@ cd /llm
 python3 -m vllm.entrypoints.openai.api_server
 ```
 
+### 4.2 Out-of-memory while online quantization
+
+When the model size is very large, running FP8 online quantization may cause out-of-memory errors.
+
+To avoid this issue, set the following environment variable before starting the service:
+
+```bash
+export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
+```
+
 
 ## 5. Performance tuning
 
-To maximize performance, configure the following environment variables inside the container:
-
-```bash
-unset TRITON_XPU_PROFILE
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=0
-```
-
-In addition, you can optimize CPU affinity based on the GPU–NUMA topology.
+To improve performance, you can optimize CPU affinity based on the GPU–NUMA topology.
 
 For example, if your process uses two GPUs that are both connected to NUMA node 0, you can use lscpu to identify the CPU cores associated with that NUMA node:
 
@@ -2449,8 +2454,3 @@ numactl -C 0-17 YOUR_COMMAND
 ```
 
 This ensures that the CPU threads serving your GPUs remain on the optimal NUMA node, reducing memory access latency and improving throughput.
-
-
-
-
-

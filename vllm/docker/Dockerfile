@@ -136,6 +136,8 @@ RUN pip install "transformers<4.54.0"
 
 # Set additional environment for production usage
 ENV VLLM_QUANTIZE_Q40_LIB="/usr/local/lib/python3.12/dist-packages/vllm_int4_for_multi_arc.so"
+ENV VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
+ENV VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 
 RUN pip uninstall oneccl oneccl-devel -y
 

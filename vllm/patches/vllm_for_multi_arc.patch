@@ -8032,6 +8032,45 @@ index 0661933ac..469d88a05 100644
  !!! warning
 -    Currently, we load the model at original precision before quantizing down to 8-bits, so you need enough memory to load the whole model.
 +    Currently, by default we load the model at original precision before quantizing down to 8-bits, so you need enough memory to load the whole model. To avoid this, adding `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1` can allow offloading weights to cpu before quantization and quantized weights will be kept in device.
+diff --git a/docs/models/supported_models.md b/docs/models/supported_models.md
+index c8b6c6c86..46e754658 100644
+--- a/docs/models/supported_models.md
++++ b/docs/models/supported_models.md
+@@ -592,7 +592,8 @@ Specified using `--task generate`.
+ | `GraniteSpeechForConditionalGeneration` | Granite Speech | T + A | `ibm-granite/granite-speech-3.3-8b` | ✅︎ | ✅︎ | ✅︎ |
+ | `H2OVLChatModel` | H2OVL | T + I<sup>E+</sup> | `h2oai/h2ovl-mississippi-800m`, `h2oai/h2ovl-mississippi-2b`, etc. | | ✅︎ | ✅︎ |
+ | `Idefics3ForConditionalGeneration` | Idefics3 | T + I | `HuggingFaceM4/Idefics3-8B-Llama3`, etc. | ✅︎ | | ✅︎ |
+-| `InternVLChatModel` | InternVL 3.0, InternVideo 2.5, InternVL 2.5, Mono-InternVL, InternVL 2.0 | T + I<sup>E+</sup> + (V<sup>E+</sup>) | `OpenGVLab/InternVL3-9B`, `OpenGVLab/InternVideo2_5_Chat_8B`, `OpenGVLab/InternVL2_5-4B`, `OpenGVLab/Mono-InternVL-2B`, `OpenGVLab/InternVL2-4B`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `InternS1ForConditionalGeneration` | Intern-S1 | T + I<sup>E+</sup> + V<sup>E+</sup> | `internlm/Intern-S1`, etc. | ✅︎ | ✅︎ | ✅︎ |
++| `InternVLChatModel` | InternVL 3.5, InternVL 3.0, InternVideo 2.5, InternVL 2.5, Mono-InternVL, InternVL 2.0 | T + I<sup>E+</sup> + (V<sup>E+</sup>) | `OpenGVLab/InternVL3_5-14B`, `OpenGVLab/InternVL3-9B`, `OpenGVLab/InternVideo2_5_Chat_8B`, `OpenGVLab/InternVL2_5-4B`, `OpenGVLab/Mono-InternVL-2B`, `OpenGVLab/InternVL2-4B`, etc. | ✅︎ | ✅︎ | ✅︎ |
+ | `KeyeForConditionalGeneration` | Keye-VL-8B-Preview | T + I<sup>E+</sup> + V<sup>E+</sup> | `Kwai-Keye/Keye-VL-8B-Preview` | | | ✅︎ |
+ | `KimiVLForConditionalGeneration` | Kimi-VL-A3B-Instruct, Kimi-VL-A3B-Thinking | T + I<sup>+</sup> | `moonshotai/Kimi-VL-A3B-Instruct`, `moonshotai/Kimi-VL-A3B-Thinking` | | | ✅︎ |
+ | `Llama4ForConditionalGeneration` | Llama 4 | T + I<sup>+</sup> | `meta-llama/Llama-4-Scout-17B-16E-Instruct`, `meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8`, `meta-llama/Llama-4-Maverick-17B-128E-Instruct`, etc. | | ✅︎ | ✅︎ |
+@@ -602,7 +603,7 @@ Specified using `--task generate`.
+ | `LlavaNextVideoForConditionalGeneration` | LLaVA-NeXT-Video | T + V | `llava-hf/LLaVA-NeXT-Video-7B-hf`, etc. | | ✅︎ | ✅︎ |
+ | `LlavaOnevisionForConditionalGeneration` | LLaVA-Onevision | T + I<sup>+</sup> + V<sup>+</sup> | `llava-hf/llava-onevision-qwen2-7b-ov-hf`, `llava-hf/llava-onevision-qwen2-0.5b-ov-hf`, etc. | | ✅︎ | ✅︎ |
+ | `MiniCPMO` | MiniCPM-O | T + I<sup>E+</sup> + V<sup>E+</sup> + A<sup>E+</sup> | `openbmb/MiniCPM-o-2_6`, etc. | ✅︎ | ✅︎ | ✅︎ |
+-| `MiniCPMV` | MiniCPM-V | T + I<sup>E+</sup> + V<sup>E+</sup> | `openbmb/MiniCPM-V-2` (see note), `openbmb/MiniCPM-Llama3-V-2_5`, `openbmb/MiniCPM-V-2_6`, etc. | ✅︎ | | ✅︎ |
++| `MiniCPMV` | MiniCPM-V | T + I<sup>E+</sup> + V<sup>E+</sup> | `openbmb/MiniCPM-V-2` (see note), `openbmb/MiniCPM-Llama3-V-2_5`, `openbmb/MiniCPM-V-2_6`, `openbmb/MiniCPM-V-4`, etc. | ✅︎ | | ✅︎ |
+ | `MiniMaxVL01ForConditionalGeneration` | MiniMax-VL | T + I<sup>E+</sup> | `MiniMaxAI/MiniMax-VL-01`, etc. | | ✅︎ | ✅︎ |
+ | `Mistral3ForConditionalGeneration` | Mistral3 (HF Transformers) | T + I<sup>+</sup> | `mistralai/Mistral-Small-3.1-24B-Instruct-2503`, etc. | ✅︎ | ✅︎ | ✅︎ |
+ | `MllamaForConditionalGeneration` | Llama 3.2 | T + I<sup>+</sup> | `meta-llama/Llama-3.2-90B-Vision-Instruct`, `meta-llama/Llama-3.2-11B-Vision`, etc. | | | |
+@@ -646,6 +647,15 @@ Specified using `--task generate`.
+ 
+     This limitation exists because the model's mixed attention pattern (bidirectional for images, causal otherwise) is not yet supported by vLLM's attention backends.
+ 
++!!! note
++    `Gemma3nForConditionalGeneration` is only supported on V1 due to shared KV caching and it depends on `timm>=1.0.17` to make use of its
++    MobileNet-v5 vision backbone.
++  
++    Performance is not yet fully optimized mainly due to:
++  
++    - Both audio and vision MM encoders use `transformers.AutoModel` implementation.  
++    - There's no PLE caching or out-of-memory swapping support, as described in [Google's blog](https://developers.googleblog.com/en/introducing-gemma-3n/). These features might be too model-specific for vLLM, and swapping in particular may be better suited for constrained setups.
++
+ !!! note
+     Only `InternVLChatModel` with Qwen2.5 text backbone (`OpenGVLab/InternVL3-2B`, `OpenGVLab/InternVL2.5-1B` etc) has video inputs support currently.
+ 
 diff --git a/examples/offline_inference/basic/reward.py b/examples/offline_inference/basic/reward.py
 new file mode 100644
 index 000000000..aec3481d2
@@ -8166,10 +8205,50 @@ index 4fdc7a3cf..b6007b9f4 100644
  from einops import rearrange
  from terratorch.datamodules import Sen1Floods11NonGeoDataModule
 diff --git a/examples/offline_inference/vision_language.py b/examples/offline_inference/vision_language.py
-index e4811c023..ad3ec342d 100644
+index e4811c023..fe4393bcf 100644
 --- a/examples/offline_inference/vision_language.py
 +++ b/examples/offline_inference/vision_language.py
-@@ -1080,7 +1080,9 @@ def run_qwen2_5_vl(questions: list[str], modality: str) -> ModelRequestData:
+@@ -389,6 +389,39 @@ def run_tarsier(questions: list[str], modality: str) -> ModelRequestData:
+     )
+ 
+ 
++# Intern-S1
++def run_interns1(questions: list[str], modality: str) -> ModelRequestData:
++    model_name = "internlm/Intern-S1"
++
++    engine_args = EngineArgs(
++        model=model_name,
++        trust_remote_code=True,
++        max_model_len=8192,
++        max_num_seqs=2,
++        limit_mm_per_prompt={modality: 1},
++        enforce_eager=True,
++    )
++
++    if modality == "image":
++        placeholder = "<IMG_CONTEXT>"
++    elif modality == "video":
++        placeholder = "<video>"
++
++    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
++    messages = [
++        [{"role": "user", "content": f"{placeholder}\n{question}"}]
++        for question in questions
++    ]
++    prompts = tokenizer.apply_chat_template(
++        messages, tokenize=False, add_generation_prompt=True
++    )
++
++    return ModelRequestData(
++        engine_args=engine_args,
++        prompts=prompts,
++    )
++
++
+ # InternVL
+ def run_internvl(questions: list[str], modality: str) -> ModelRequestData:
+     model_name = "OpenGVLab/InternVL3-2B"
+@@ -1080,7 +1113,9 @@ def run_qwen2_5_vl(questions: list[str], modality: str) -> ModelRequestData:
              "max_pixels": 1280 * 28 * 28,
              "fps": 1,
          },
@@ -8380,6 +8459,321 @@ index 16c711407..a4681baa5 100644
  @pytest.mark.parametrize("model_info", EMBEDDING_MODELS)
  def test_embed_models_mteb(hf_runner, vllm_runner,
                             model_info: EmbedModelInfo) -> None:
+diff --git a/tests/models/multimodal/processing/test_common.py b/tests/models/multimodal/processing/test_common.py
+index fd5842523..321a156a6 100644
+--- a/tests/models/multimodal/processing/test_common.py
++++ b/tests/models/multimodal/processing/test_common.py
+@@ -272,10 +272,15 @@ def _test_processing_correctness_one(
+     "THUDM/GLM-4.1V-9B-Thinking",
+     "ibm-granite/granite-speech-3.3-2b",
+     "h2oai/h2ovl-mississippi-800m",
++    "internlm/Intern-S1",
+     "OpenGVLab/InternVL2-1B",
+     "OpenGVLab/InternVL3-1B",
+     "HuggingFaceM4/Idefics3-8B-Llama3",
+     "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
++    "OpenGVLab/InternVL3_5-1B",
++    "OpenGVLab/InternVL3_5-GPT-OSS-20B-A4B-Preview",
++    "OpenGVLab/InternVL3_5-30B-A3B",
++    "Kwai-Keye/Keye-VL-8B-Preview",
+     "moonshotai/Kimi-VL-A3B-Instruct",
+     "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+     "llava-hf/llava-1.5-7b-hf",
+diff --git a/tests/models/multimodal/processing/test_tensor_schema.py b/tests/models/multimodal/processing/test_tensor_schema.py
+new file mode 100644
+index 000000000..2d8cd49ed
+--- /dev/null
++++ b/tests/models/multimodal/processing/test_tensor_schema.py
+@@ -0,0 +1,264 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from collections.abc import Iterable
++from functools import partial
++from typing import Any, Union
++from unittest.mock import patch
++
++import numpy as np
++import pytest
++from mistral_common.protocol.instruct.messages import (ImageChunk, TextChunk,
++                                                       UserMessage)
++from mistral_common.protocol.instruct.request import ChatCompletionRequest
++from PIL import Image
++
++from vllm.config import ModelConfig
++from vllm.engine.llm_engine import LLMEngine as V0LLMEngine
++from vllm.inputs import InputProcessingContext
++from vllm.multimodal import (MULTIMODAL_REGISTRY, BatchedTensorInputs,
++                             MultiModalKwargs)
++from vllm.multimodal.processing import BaseMultiModalProcessor
++from vllm.multimodal.utils import group_mm_kwargs_by_modality
++from vllm.transformers_utils.tokenizer import cached_tokenizer_from_config
++from vllm.utils import GiB_bytes, is_list_of, set_default_torch_num_threads
++from vllm.v1.core.kv_cache_utils import get_kv_cache_config
++from vllm.v1.engine.core import EngineCore as V1EngineCore
++
++from ....conftest import VllmRunner
++from ...registry import _MULTIMODAL_EXAMPLE_MODELS, HF_EXAMPLE_MODELS
++from ...utils import dummy_hf_overrides
++
++ARCH_TO_SKIP = {
++    "MolmoForCausalLM": "incompatible requirements",
++}
++ARCH_NEEDS_EXTRAS = [
++    "InternVLChatModel",
++    "Idefics3ForConditionalGeneration",
++    "LlavaForConditionalGeneration",
++    "MiniCPMV",
++    "PaliGemmaForConditionalGeneration",
++]
++REPO_ID_TO_SKIP = {
++    "nm-testing/pixtral-12b-FP8-dynamic": "duplicated test",
++    # FIXME(Isotr0py): enable GPT-OSS based InternVL3.5 model
++    # after support PP for GPT-OSS
++    "OpenGVLab/InternVL3_5-GPT-OSS-20B-A4B-Preview": "Broken model",
++}
++
++ImageInput = list[Image.Image]
++VideoInput = Union[list[Image.Image], list[np.ndarray],
++                   list[tuple[np.ndarray, dict[str, Any]]]]
++AudioInput = list[tuple[np.ndarray, int]]
++
++
++def _resize_data(_data: Union[Image.Image, np.ndarray],
++                 size_factor: float) -> Union[Image.Image, np.ndarray]:
++    assert size_factor <= 1, "Size factor must be less than 1"
++    # Image input
++    if isinstance(_data, Image.Image):
++        W, H = _data.width, _data.height
++        W, H = map(lambda x: int(x * size_factor), (W, H))
++        return _data.resize((W, H))
++    # Video input with PIL Images
++    elif is_list_of(_data, Image.Image):
++        W, H = next(iter(_data)).width, next(iter(_data)).height
++        T = len(_data)
++        T, W, H = map(lambda x: max(int(x * size_factor), 1), (T, W, H))
++        return [d.resize((W, H)) for d in _data[:T]]
++    # Video input with numpy arrays
++    elif isinstance(_data, np.ndarray) and _data.ndim >= 4:
++        T, H, W, C = _data.shape[-4:]
++        T, H, W = map(lambda x: max(int(x * size_factor), 1), (T, H, W))
++        return _data[..., :T, :H, :W, :C]
++    # Audio input
++    elif isinstance(_data, np.ndarray) and _data.ndim == 1:
++        return _data[:int(len(_data) * size_factor)]
++    raise AssertionError("This line should be unreachable.")
++
++
++def resize_mm_data(
++    data: Union[ImageInput, VideoInput, AudioInput],
++    size_factors: tuple[float,
++                        ...]) -> Union[ImageInput, VideoInput, AudioInput]:
++    size_factors = size_factors[:len(data)]
++    if is_list_of(data, (Image.Image, np.ndarray, list)):
++        return [_resize_data(d, s) for d, s in zip(data, size_factors)]
++    elif is_list_of(data, tuple):
++        return [(_resize_data(d, s), meta)
++                for (d, meta), s in zip(data, size_factors)]
++    raise ValueError("Unsupported multimodal data type.")
++
++
++def create_batched_mm_kwargs(
++    model_config: ModelConfig,
++    processor: BaseMultiModalProcessor,
++    size_factors: tuple[float, ...] = (1.0, 0.5, 0.25),
++) -> Iterable[tuple[str, int, BatchedTensorInputs]]:
++    processing_info = processor.info
++    dummy_inputs = processor.dummy_inputs
++    supported_mm_limits = processing_info.get_supported_mm_limits()
++    mm_counts = {
++        modality: 3 if limit is None else limit
++        for modality, limit in supported_mm_limits.items()
++    }
++    processor_inputs = dummy_inputs.get_dummy_processor_inputs(
++        seq_len=model_config.max_model_len,
++        mm_counts=mm_counts,
++    )
++    mm_data = processor_inputs.mm_data
++    resized_mm_data = {
++        modality: resize_mm_data(data, size_factors)
++        for modality, data in mm_data.items()
++    }
++    # Mistral chat outputs tokens directly, rather than text prompts
++    if model_config.tokenizer_mode == "mistral":
++        images = resized_mm_data.get("image", [])
++        request = ChatCompletionRequest(messages=[
++            UserMessage(content=[
++                TextChunk(text=""),
++                *(ImageChunk(image=image) for image in images),
++            ]),
++        ])
++        tokenizer = processing_info.get_tokenizer()
++        res = tokenizer.mistral.encode_chat_completion(request)
++        prompt = res.tokens
++    else:
++        prompt = processor_inputs.prompt
++    mm_kwargs = processor.apply(
++        prompt=prompt,
++        mm_data=resized_mm_data,
++        hf_processor_mm_kwargs=processor_inputs.hf_processor_mm_kwargs,
++        tokenization_kwargs=processor_inputs.tokenization_kwargs,
++    )["mm_kwargs"]
++    items = [
++        item for modality in supported_mm_limits
++        for item in mm_kwargs[modality]
++    ]
++    return group_mm_kwargs_by_modality(items)
++
++
++def get_model_id_to_test(
++        model_arch_list: Iterable[str]) -> list[tuple[str, str]]:
++    filtered_results = []
++    for model_arch in model_arch_list:
++        model_info = HF_EXAMPLE_MODELS.get_hf_info(model_arch)
++        if model_info.extras and model_arch in ARCH_NEEDS_EXTRAS:
++            available_repos = list(
++                map(lambda model_id: (model_arch, model_id),
++                    [model_info.default, *model_info.extras.values()]))
++            filtered_results.extend(available_repos)
++        else:
++            filtered_results.append((model_arch, model_info.default))
++    return filtered_results
++
++
++@pytest.mark.parametrize(
++    "model_arch, model_id",
++    get_model_id_to_test(_MULTIMODAL_EXAMPLE_MODELS.keys()))
++def test_model_tensor_schema(model_arch: str, model_id: str,
++                             vllm_runner: type[VllmRunner], monkeypatch):
++    if model_arch in ARCH_TO_SKIP:
++        pytest.skip(f"Skipping {model_arch} due to {ARCH_TO_SKIP[model_arch]}")
++    if model_id in REPO_ID_TO_SKIP:
++        pytest.skip(f"Skipping {model_id} due to {REPO_ID_TO_SKIP[model_id]}")
++
++    model_info = HF_EXAMPLE_MODELS.get_hf_info(model_arch)
++    model_info.check_available_online(on_fail="skip")
++    model_info.check_transformers_version(on_fail="skip",
++                                          check_max_version=False)
++
++    hf_overrides_fn = partial(dummy_hf_overrides,
++                              model_arch=model_arch,
++                              exist_overrides=model_info.hf_overrides)
++
++    model_config = ModelConfig(
++        model_id,
++        tokenizer=model_info.tokenizer or model_id,
++        tokenizer_mode=model_info.tokenizer_mode,
++        revision=model_info.revision,
++        trust_remote_code=model_info.trust_remote_code,
++        hf_overrides=model_info.hf_overrides,
++    )
++    model_cls = MULTIMODAL_REGISTRY._get_model_cls(model_config)
++    factories = MULTIMODAL_REGISTRY._processor_factories[model_cls]
++
++    if not any(
++            hasattr(model_cls, f"_parse_and_validate_{m}_input")
++            for m in ["image", "video", "audio"]):
++        pytest.skip(f"{model_arch} does not support tensor schema validation.")
++
++    ctx = InputProcessingContext(
++        model_config,
++        tokenizer=cached_tokenizer_from_config(model_config),
++    )
++    processing_info = factories.info(ctx)
++    supported_mm_limits = processing_info.get_supported_mm_limits()
++    limit_mm_per_prompt = {
++        modality: 3 if limit is None else limit
++        for modality, limit in supported_mm_limits.items()
++    }
++
++    # Avoid calling model.forward()
++    def _initialize_kv_caches_v0(self) -> None:
++        self.cache_config.num_gpu_blocks = 0
++        self.cache_config.num_cpu_blocks = 0
++
++    def _initialize_kv_caches_v1(self, vllm_config):
++        kv_cache_specs = self.model_executor.get_kv_cache_specs()
++        scheduler_kv_cache_config = get_kv_cache_config(
++            vllm_config,
++            kv_cache_specs[0],
++            10 * GiB_bytes,
++        )
++
++        # gpu_blocks (> 0), cpu_blocks, scheduler_kv_cache_config
++        return 1, 0, scheduler_kv_cache_config
++
++    with (patch.object(V0LLMEngine, "_initialize_kv_caches",
++                       _initialize_kv_caches_v0),
++          patch.object(V1EngineCore, "_initialize_kv_caches",
++                       _initialize_kv_caches_v1), monkeypatch.context() as m):
++        m.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
++        if model_info.v0_only:
++            m.setenv("VLLM_USE_V1", "0")
++
++        # TODO(Isotr0py): Can we avoid initializing engine?
++        with (
++                set_default_torch_num_threads(1),
++                vllm_runner(
++                    model_id,
++                    tokenizer_name=model_info.tokenizer,
++                    tokenizer_mode=model_info.tokenizer_mode,
++                    revision=model_info.revision,
++                    trust_remote_code=model_info.trust_remote_code,
++                    max_model_len=model_info.max_model_len,
++                    load_format="dummy",
++                    hf_overrides=hf_overrides_fn,
++                    limit_mm_per_prompt=limit_mm_per_prompt,
++                    enforce_eager=True,
++                ) as vllm_model,
++        ):
++            model_config = vllm_model.llm.llm_engine.model_config
++            llm_engine = vllm_model.llm.llm_engine
++
++            if hasattr(llm_engine, "processor"):
++                # v1 processor
++                mm_registry = llm_engine.processor.mm_registry
++            else:
++                # v0 input_preprocessor
++                mm_registry = llm_engine.input_preprocessor.mm_registry
++
++            processor = mm_registry.create_processor(model_config)
++
++            def validate_model_input(model, modality: str,
++                                     mm_kwargs: MultiModalKwargs):
++                method_name = f"_parse_and_validate_{modality}_input"
++                if hasattr(model, method_name):
++                    getattr(model, method_name)(**mm_kwargs)
++
++            for modality, _, mm_kwargs in create_batched_mm_kwargs(
++                    model_config, processor):
++                valid_func = partial(validate_model_input,
++                                     modality=modality,
++                                     mm_kwargs=mm_kwargs)
++                vllm_model.apply_model(valid_func)
+diff --git a/tests/models/registry.py b/tests/models/registry.py
+index 84ca0bc60..0bec8d359 100644
+--- a/tests/models/registry.py
++++ b/tests/models/registry.py
+@@ -373,7 +373,10 @@ _MULTIMODAL_EXAMPLE_MODELS = {
+                                       transformers_version_reason="HF model is not compatible."),  # noqa: E501
+     "InternVLChatModel": _HfExamplesInfo("OpenGVLab/InternVL2-1B",
+                                          extras={"2B": "OpenGVLab/InternVL2-2B",
+-                                                 "3.0": "OpenGVLab/InternVL3-1B"},  # noqa: E501
++                                                 "3.0": "OpenGVLab/InternVL3-1B",   # noqa: E501
++                                                 "3.5-qwen3": "OpenGVLab/InternVL3_5-1B",   # noqa: E501
++                                                 "3.5-qwen3moe": "OpenGVLab/InternVL3_5-30B-A3B",   # noqa: E501
++                                                 "3.5-gptoss": "OpenGVLab/InternVL3_5-GPT-OSS-20B-A4B-Preview"},  # noqa: E501
+                                          trust_remote_code=True),
+     "Idefics3ForConditionalGeneration": _HfExamplesInfo("HuggingFaceM4/Idefics3-8B-Llama3",  # noqa: E501
+                                                         {"tiny": "HuggingFaceTB/SmolVLM-256M-Instruct"}),  # noqa: E501
+@@ -397,7 +400,7 @@ _MULTIMODAL_EXAMPLE_MODELS = {
+     "MiniCPMO": _HfExamplesInfo("openbmb/MiniCPM-o-2_6",
+                                 trust_remote_code=True),
+     "MiniCPMV": _HfExamplesInfo("openbmb/MiniCPM-Llama3-V-2_5",
+-                                extras={"2.6": "openbmb/MiniCPM-V-2_6"},  # noqa: E501
++                                extras={"2.6": "openbmb/MiniCPM-V-2_6", "4.0": "openbmb/MiniCPM-V-4"},  # noqa: E501
+                                 trust_remote_code=True),
+     "MiniMaxVL01ForConditionalGeneration": _HfExamplesInfo("MiniMaxAI/MiniMax-VL-01", # noqa: E501
+                                               trust_remote_code=True,
 diff --git a/tests/quantization/test_cpu_offload.py b/tests/quantization/test_cpu_offload.py
 index 08d9573ec..82a0e0cd8 100644
 --- a/tests/quantization/test_cpu_offload.py
@@ -11023,10 +11417,10 @@ index 428e9b882..b778b4ae0 100644
      """GPTQ linear method using IPEX for the CPU/XPU backend.
 diff --git a/vllm/model_executor/layers/quantization/sym_int4.py b/vllm/model_executor/layers/quantization/sym_int4.py
 new file mode 100644
-index 000000000..137f29a82
+index 000000000..10d1d3d56
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/sym_int4.py
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,223 @@
 +# SPDX-License-Identifier: Apache-2.0
 +
 +from typing import Any, Dict, List, Optional, Tuple
@@ -11096,6 +11490,9 @@ index 000000000..137f29a82
 +            The quantize method. None if the given layer doesn't support quant
 +            method.
 +        """
++        modules_to_not_convert=["visual", "vision", "vpm", "resampler"]
++        if any(key in prefix for key in modules_to_not_convert):
++            return UnquantizedLinearMethod()
 +        if isinstance(layer, LinearBase):
 +            return SymInt4LinearMethod(self)
 +        else:
@@ -11171,7 +11568,7 @@ index 000000000..137f29a82
 +            output_size_per_partition,
 +            input_size_per_partition,
 +            dtype=weight_dtype,
-+            device="cpu" if VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT else None),
++            device="cpu"),
 +                                      input_dim=1,
 +                                      output_dim=0,
 +                                      weight_loader=weight_loader)
@@ -11269,7 +11666,7 @@ index dddd4d6a7..324645157 100644
      @classmethod
      def get_input_positions(
 diff --git a/vllm/model_executor/model_loader/utils.py b/vllm/model_executor/model_loader/utils.py
-index 4b30336f0..b4cd36f34 100644
+index 4b30336f0..5298ed666 100644
 --- a/vllm/model_executor/model_loader/utils.py
 +++ b/vllm/model_executor/model_loader/utils.py
 @@ -16,6 +16,7 @@ from transformers.dynamic_module_utils import get_class_from_dynamic_module
@@ -11288,17 +11685,18 @@ index 4b30336f0..b4cd36f34 100644
  
  logger = init_logger(__name__)
  
-@@ -99,7 +101,8 @@ def initialize_model(
+@@ -99,7 +101,9 @@ def initialize_model(
  
  def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
                                    target_device: torch.device) -> None:
 -    for _, module in model.named_modules():
++    # gc: Any changes here need to be added to SymInt4Config.get_quant_method
 +    modules_to_not_convert=["visual", "vision", "vpm", "resampler"]
 +    for name, module in model.named_modules():
          if isinstance(module, QKVCrossParallelLinear):
              # NOTE(Isotr0py): special case for cross QKV layer because
              # q and kv proj aren't registered as submodules intentionally
-@@ -107,12 +110,18 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
+@@ -107,12 +111,18 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
              continue
          quant_method = getattr(module, "quant_method", None)
          if isinstance(quant_method, QuantizeMethodBase):
@@ -11323,7 +11721,7 @@ index 4b30336f0..b4cd36f34 100644
                  quant_method.process_weights_after_loading(module)
  
      # Currently only used by MLA.
-@@ -128,7 +137,8 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
+@@ -128,7 +138,8 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
  
  @contextmanager
  def device_loading_context(module: torch.nn.Module,
@@ -11333,7 +11731,7 @@ index 4b30336f0..b4cd36f34 100644
      if target_device.type == "cpu":
          # If target is CPU, no need to move anything
          yield module
-@@ -137,36 +147,41 @@ def device_loading_context(module: torch.nn.Module,
+@@ -137,36 +148,41 @@ def device_loading_context(module: torch.nn.Module,
      original_device_states: dict[str, torch.device] = {}
  
      # Store original device states and move parameters to GPU if they're on CPU
@@ -11512,6 +11910,255 @@ index d14f5fa3d..07ad2bce4 100644
  
          self.vision_tower = SiglipVisionModel(config.vision_config,
                                                quant_config,
+diff --git a/vllm/model_executor/models/glm4_1v.py b/vllm/model_executor/models/glm4_1v.py
+index 0996bcf60..c06e9853f 100644
+--- a/vllm/model_executor/models/glm4_1v.py
++++ b/vllm/model_executor/models/glm4_1v.py
+@@ -259,7 +259,8 @@ class Glm4vVisionAttention(nn.Module):
+         )
+ 
+         # Detect attention implementation.
+-        self.attn_backend: _Backend = get_vit_attn_backend(support_fa=True)
++        # self.attn_backend: _Backend = get_vit_attn_backend(support_fa=True)
++        self.attn_backend = _Backend.TORCH_SDPA
+         if self.attn_backend not in {
+                 _Backend.FLASH_ATTN,
+                 _Backend.TORCH_SDPA,
+@@ -343,22 +344,51 @@ class Glm4vVisionAttention(nn.Module):
+                                       b=batch_size)
+         elif self.attn_backend == _Backend.TORCH_SDPA:
+             # Execute attention entry by entry for speed & less VRAM.
+-            outputs = []
+-            for i in range(1, len(cu_seqlens)):
+-                start_idx = cu_seqlens[i - 1]
+-                end_idx = cu_seqlens[i]
+-                q_i = q[:, start_idx:end_idx]
+-                k_i = k[:, start_idx:end_idx]
+-                v_i = v[:, start_idx:end_idx]
+-                q_i, k_i, v_i = (rearrange(x, "b s h d -> b h s d")
+-                                 for x in [q_i, k_i, v_i])
+-                output_i = F.scaled_dot_product_attention(q_i,
+-                                                          k_i,
+-                                                          v_i,
+-                                                          dropout_p=0.0)
+-                output_i = rearrange(output_i, "b h s d -> b s h d ")
+-                outputs.append(output_i)
+-            context_layer = torch.cat(outputs, dim=1)
++            q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
++            from vllm._ipex_ops import ipex_ops
++            output = torch.empty(
++                        (q.shape[0], q.shape[1], q.shape[2]),
++                        dtype=q.dtype,
++                        device=q.device)
++            import math
++            head_dim = q.shape[-1]
++            scale = 1 / math.sqrt(head_dim)
++            ipex_ops.varlen_attention(q, k, v, output,
++                                    cu_seqlens,
++                                    cu_seqlens,
++                                    None,
++                                    max_seqlen,
++                                    max_seqlen,
++                                    pdropout=0,
++                                    softmax_scale=scale,
++                                    zero_tensors=False,
++                                    is_causal=False,
++                                    return_softmax=False,
++                                    window_size_left=-1,
++                                    window_size_right=-1,
++                                    gen_=None,
++                                    logits_soft_cap=0
++                                    )
++
++            context_layer = rearrange(output,
++                                      "(b s) ... -> b s ...",
++                                      b=batch_size)
++            # outputs = []
++            # for i in range(1, len(cu_seqlens)):
++            #     start_idx = cu_seqlens[i - 1]
++            #     end_idx = cu_seqlens[i]
++            #     q_i = q[:, start_idx:end_idx]
++            #     k_i = k[:, start_idx:end_idx]
++            #     v_i = v[:, start_idx:end_idx]
++            #     q_i, k_i, v_i = (rearrange(x, "b s h d -> b h s d")
++            #                      for x in [q_i, k_i, v_i])
++            #     output_i = F.scaled_dot_product_attention(q_i,
++            #                                               k_i,
++            #                                               v_i,
++            #                                               dropout_p=0.0)
++            #     output_i = rearrange(output_i, "b h s d -> b s h d ")
++            #     outputs.append(output_i)
++            # context_layer = torch.cat(outputs, dim=1)
+         elif self.attn_backend == _Backend.XFORMERS:
+             from xformers import ops as xops
+             from xformers.ops.fmha.attn_bias import BlockDiagonalMask
+@@ -730,7 +760,7 @@ class Glm4vVisionTransformer(nn.Module):
+     ) -> tuple[Optional[int], Optional[list[int]]]:
+         max_seqlen, seqlens = None, None
+         seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+-        if self.attn_backend == _Backend.FLASH_ATTN:
++        if self.attn_backend == _Backend.FLASH_ATTN or self.attn_backend == _Backend.IPEX:
+             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+         return max_seqlen, seqlens
+ 
+diff --git a/vllm/model_executor/models/glm4_moe.py b/vllm/model_executor/models/glm4_moe.py
+index bdca293d2..8fa5d8b9b 100644
+--- a/vllm/model_executor/models/glm4_moe.py
++++ b/vllm/model_executor/models/glm4_moe.py
+@@ -53,7 +53,7 @@ from vllm.model_executor.model_loader.weight_utils import (
+ from vllm.model_executor.sampling_metadata import SamplingMetadata
+ from vllm.sequence import IntermediateTensors
+ 
+-from .interfaces import SupportsPP
++from .interfaces import SupportsLoRA, SupportsPP
+ from .utils import (AutoWeightsLoader, PPMissingLayer, is_pp_missing_parameter,
+                     make_empty_intermediate_tensors_factory, make_layers,
+                     maybe_prefix)
+@@ -118,16 +118,17 @@ class Glm4MoE(nn.Module):
+         if config.hidden_act != "silu":
+             raise ValueError(f"Unsupported activation: {config.hidden_act}. "
+                              "Only silu is supported for now.")
+-
+-        self.gate = ReplicatedLinear(config.hidden_size,
+-                                     config.n_routed_experts,
+-                                     bias=False,
+-                                     quant_config=None,
+-                                     prefix=f"{prefix}.gate")
+-
+-        # noaux_tc is not set in transformers new config now
+-        self.gate.e_score_correction_bias = (nn.Parameter(
+-            torch.empty(config.n_routed_experts)))
++        # NOTE In the transformers implementation, the gate isn't an nn.Linear,
++        # so we cannot use ReplicatedLinear here.
++        # See: https://github.com/huggingface/transformers/blob/v4.55.1/src/transformers/models/glm4_moe/modeling_glm4_moe.py#L260
++        self.gate = nn.Linear(
++            config.hidden_size,
++            config.n_routed_experts,
++            bias=False,
++            dtype=torch.float32,
++        )
++        self.gate.e_score_correction_bias = nn.Parameter(
++            torch.empty(config.n_routed_experts, dtype=torch.float32))
+ 
+         # Load balancing settings.
+         vllm_config = get_current_vllm_config()
+@@ -181,7 +182,7 @@ class Glm4MoE(nn.Module):
+ 
+         if self.n_shared_experts is not None:
+             shared_output = self.shared_experts(hidden_states)
+-        router_logits, _ = self.gate(hidden_states)
++        router_logits = self.gate(hidden_states.to(dtype=torch.float32))
+         final_hidden_states = self.experts(
+             hidden_states=hidden_states,
+             router_logits=router_logits) * self.routed_scaling_factor
+@@ -372,7 +373,13 @@ class Glm4MoeDecoderLayer(nn.Module):
+         return hidden_states, residual
+ 
+ 
+-@support_torch_compile
++@support_torch_compile(
++    dynamic_arg_dims={
++        "input_ids": 0,
++        "positions": -1,
++        "intermediate_tensors": 0,
++        "inputs_embeds": 0,
++    })
+ class Glm4MoeModel(nn.Module):
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+@@ -390,7 +397,6 @@ class Glm4MoeModel(nn.Module):
+             self.embed_tokens = VocabParallelEmbedding(
+                 config.vocab_size,
+                 config.hidden_size,
+-                quant_config=quant_config,
+                 prefix=f"{prefix}.embed_tokens")
+         else:
+             self.embed_tokens = PPMissingLayer()
+@@ -462,6 +468,15 @@ class Glm4MoeModel(nn.Module):
+                         device=device),
+         })
+ 
++    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
++        # Params for weights, fp8 weight scales, fp8 activation scales
++        # (param_name, weight_name, expert_id, shard_id)
++        return FusedMoE.make_expert_params_mapping(
++            ckpt_gate_proj_name="gate_proj",
++            ckpt_down_proj_name="down_proj",
++            ckpt_up_proj_name="up_proj",
++            num_experts=self.config.n_routed_experts)
++
+     def load_weights(self, weights: Iterable[tuple[str,
+                                                    torch.Tensor]]) -> set[str]:
+         stacked_params_mapping = [
+@@ -473,16 +488,9 @@ class Glm4MoeModel(nn.Module):
+             ("gate_up_proj", "up_proj", 1),
+         ]
+ 
+-        # Params for weights, fp8 weight scales, fp8 activation scales
+-        # (param_name, weight_name, expert_id, shard_id)
+-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+-            ckpt_gate_proj_name="gate_proj",
+-            ckpt_down_proj_name="down_proj",
+-            ckpt_up_proj_name="up_proj",
+-            num_experts=self.config.n_routed_experts)
+-
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
++        expert_params_mapping = self.get_expert_mapping()
+         for name, loaded_weight in weights:
+             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+             if spec_layer is not None:
+@@ -571,7 +579,7 @@ class Glm4MoeModel(nn.Module):
+         return loaded_params
+ 
+ 
+-class Glm4MoeForCausalLM(nn.Module, SupportsPP):
++class Glm4MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
+     packed_modules_mapping = {
+         "qkv_proj": [
+             "q_proj",
+@@ -600,8 +608,6 @@ class Glm4MoeForCausalLM(nn.Module, SupportsPP):
+                                           quant_config=quant_config)
+         else:
+             self.lm_head = PPMissingLayer()
+-        if self.config.tie_word_embeddings:
+-            self.lm_head.weight = self.model.embed_tokens.weight
+         self.logits_processor = LogitsProcessor(config.vocab_size)
+         self.make_empty_intermediate_tensors = (
+             self.model.make_empty_intermediate_tensors)
+@@ -613,14 +619,19 @@ class Glm4MoeForCausalLM(nn.Module, SupportsPP):
+         self.num_expert_groups = config.n_group
+ 
+         self.moe_layers: list[FusedMoE] = []
++        example_moe = None
+         for layer in self.model.layers:
++            if isinstance(layer, PPMissingLayer):
++                continue
+             assert isinstance(layer, Glm4MoeDecoderLayer)
+             if isinstance(layer.mlp, Glm4MoE):
++                # Pick last one layer since the first ones may be dense layers.
++                example_moe = layer.mlp
+                 self.moe_layers.append(layer.mlp.experts)
+ 
+         # Pick last one layer since the first ones may be dense layers.
+-        example_moe = typing.cast(
+-            Glm4MoE, self.model.layers[config.num_hidden_layers - 1].mlp)
++        if example_moe is None:
++            raise RuntimeError("No Glm4MoE layer found in model.layers.")
+         self.num_logical_experts = example_moe.n_logical_experts
+         self.num_physical_experts = example_moe.n_physical_experts
+         self.num_local_physical_experts = example_moe.n_local_physical_experts
+@@ -673,6 +684,10 @@ class Glm4MoeForCausalLM(nn.Module, SupportsPP):
+         return loader.load_weights(weights)
+ 
+ 
++    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
++        return self.model.get_expert_mapping()
++
++
+ def get_spec_layer_idx_from_weight_name(config: PretrainedConfig,
+                                         weight_name: str) -> Optional[int]:
+     if hasattr(config,
 diff --git a/vllm/model_executor/models/glm4v.py b/vllm/model_executor/models/glm4v.py
 index 7584b5188..79d2700ac 100644
 --- a/vllm/model_executor/models/glm4v.py
@@ -11560,6 +12207,1103 @@ index 9e27200fb..ab8bd737f 100644
  
      def forward(
          self,
+diff --git a/vllm/model_executor/models/interns1.py b/vllm/model_executor/models/interns1.py
+new file mode 100644
+index 000000000..ab21cbe91
+--- /dev/null
++++ b/vllm/model_executor/models/interns1.py
+@@ -0,0 +1,832 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++# --------------------------------------------------------
++# InternS1
++# Copyright (c) 2025 Shanghai AI Lab
++# Licensed under The MIT License [see LICENSE for details]
++# --------------------------------------------------------
++from collections.abc import Iterable, Mapping, Sequence
++from typing import Literal, Optional, TypedDict, Union
++
++import regex as re
++import torch
++import torch.nn as nn
++from transformers import BatchFeature, InternVLProcessor, PretrainedConfig
++from transformers.activations import ACT2FN
++from transformers.models.got_ocr2.image_processing_got_ocr2_fast import (
++    GotOcr2ImageProcessorFast)
++
++from vllm.config import VllmConfig
++from vllm.model_executor.layers.quantization import QuantizationConfig
++from vllm.model_executor.models.interns1_vit import InternS1VisionModel
++from vllm.model_executor.models.module_mapping import MultiModelKeys
++from vllm.model_executor.sampling_metadata import SamplingMetadata
++from vllm.multimodal import MULTIMODAL_REGISTRY
++from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalFieldConfig,
++                                    MultiModalKwargs, NestedTensors)
++from vllm.multimodal.parse import (ImageEmbeddingItems, ImageProcessorItems,
++                                   ImageSize, MultiModalDataItems)
++from vllm.multimodal.processing import (BaseMultiModalProcessor,
++                                        BaseProcessingInfo, PromptReplacement,
++                                        PromptUpdate, PromptUpdateDetails)
++from vllm.multimodal.profiling import BaseDummyInputsBuilder
++from vllm.sequence import IntermediateTensors
++
++from .interfaces import (MultiModalEmbeddings, SupportsLoRA,
++                         SupportsMultiModal, SupportsPP)
++from .utils import (AutoWeightsLoader, WeightsMapper, flatten_bn,
++                    init_vllm_registered_model, maybe_prefix,
++                    merge_multimodal_embeddings)
++
++
++class InternS1MultiModalProjector(nn.Module):
++
++    def __init__(self, config):
++        super().__init__()
++        self.layer_norm = nn.LayerNorm(config.vision_config.hidden_size *
++                                       int(1 / config.downsample_ratio)**2)
++        self.linear_1 = nn.Linear(
++            config.vision_config.hidden_size *
++            int(1 / config.downsample_ratio)**2,
++            config.text_config.hidden_size)
++        self.act = ACT2FN[config.projector_hidden_act]
++        self.linear_2 = nn.Linear(config.text_config.hidden_size,
++                                  config.text_config.hidden_size)
++
++    def forward(self, image_features):
++        hidden_states = self.layer_norm(image_features)
++        hidden_states = self.linear_1(hidden_states)
++        hidden_states = self.act(hidden_states)
++        hidden_states = self.linear_2(hidden_states)
++        return hidden_states
++
++
++class InternS1ImagePixelInputs(TypedDict):
++    type: Literal["pixel_values"]
++    pixel_values: torch.Tensor
++    """
++    Shape:
++    `(batch_size * num_images * (1 + num_patches), num_channels, height, width)`
++    """
++
++
++class InternS1ImageEmbeddingInputs(TypedDict):
++    type: Literal["image_embeds"]
++    data: Union[torch.Tensor, list[torch.Tensor]]
++    """
++    A tensor of shape `(num_images, total_image_feature_size, hidden_size)`
++    or a list of tensors of shape `(total_image_feature_size, hidden_size)`
++
++    `hidden_size` must match the hidden size of language model backbone.
++    """
++
++
++InternS1ImageInputs = Union[InternS1ImagePixelInputs,
++                            InternS1ImageEmbeddingInputs]
++
++
++class InternS1VideoPixelInputs(TypedDict):
++    type: Literal["pixel_values_videos"]
++    pixel_values: torch.Tensor
++    """
++    Shape:
++    `(batch_size * num_video * num_frames, num_channels, height, width)`
++    """
++
++    num_patches: torch.Tensor
++    """Shape: `(batch_size * num_images)`"""
++
++
++class InternS1VideoEmbeddingInputs(TypedDict):
++    type: Literal["video_embeds"]
++    data: Union[torch.Tensor, list[torch.Tensor]]
++    """
++    A tensor of shape `(num_videos, total_video_feature_size, hidden_size)`
++    or a list of tensors of shape `(total_video_feature_size, hidden_size)`
++
++    `hidden_size` must match the hidden size of language model backbone.
++    """
++
++
++InternS1VideoInputs = Union[InternS1VideoPixelInputs,
++                            InternS1VideoEmbeddingInputs]
++
++
++def resolve_interns1_min_max_num(
++    min_dynamic_patch: int,
++    max_dynamic_patch: int,
++    dynamic_image_size: bool,
++    use_thumbnail: bool,
++) -> tuple[int, int]:
++    min_dynamic_patch = min_dynamic_patch if dynamic_image_size else 1
++    max_dynamic_patch = max_dynamic_patch if dynamic_image_size else 1
++
++    if use_thumbnail and max_dynamic_patch != 1:
++        max_dynamic_patch += 1
++
++    return min_dynamic_patch, max_dynamic_patch
++
++
++def get_interns1_target_ratios(
++    min_num: int,
++    max_num: int,
++) -> list[tuple[int, int]]:
++    target_ratios = {(i, j)
++                     for n in range(min_num, max_num + 1)
++                     for i in range(1, n + 1)
++                     for j in range(1, n + 1) if min_num <= i * j <= max_num}
++    return sorted(target_ratios, key=lambda x: x[0] * x[1])
++
++
++class InternS1ProcessingInfo(BaseProcessingInfo):
++    """ProcessingInfo for InternS1-style models."""
++
++    def get_hf_processor(self, **kwargs: object) -> InternVLProcessor:
++        return self.ctx.get_hf_processor(InternVLProcessor, **kwargs)
++
++    def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
++        return {"image": None, "video": None}
++
++    def get_num_image_tokens(
++        self,
++        *,
++        image_width: int,
++        image_height: int,
++        processor: Optional['GotOcr2ImageProcessorFast'] = None,
++    ) -> int:
++        if processor is None:
++            processor = self.get_hf_processor().image_processor
++
++        if not isinstance(processor, GotOcr2ImageProcessorFast):
++            raise ValueError(f'GotOcr2ImageProcessorFast is expected but got '
++                             f'{type(processor)}')
++        num_image_patches = processor.get_number_of_image_tokens(
++            image_height, image_width, images_kwargs=dict())
++        num_image_tokens = self.get_hf_processor(
++        ).image_seq_length * num_image_patches
++        return num_image_tokens
++
++    def resolve_target_ratios(self, use_thumbnail: Optional[bool] = None):
++        image_processor = self.get_hf_processor().image_processor
++        min_dynamic_patch = image_processor.min_patches
++        max_dynamic_patch = image_processor.max_patches
++        # HF format's InternVL processor uses `crop_to_patches` which is
++        # equivalent to `use_thumbnail` in original format.
++        use_thumbnail = image_processor.crop_to_patches
++        dynamic_image_size = True
++        min_num, max_num = resolve_interns1_min_max_num(
++            min_dynamic_patch,
++            max_dynamic_patch,
++            dynamic_image_size,
++            use_thumbnail=use_thumbnail)
++
++        return get_interns1_target_ratios(min_num, max_num)
++
++    def get_image_size_with_most_features(self) -> ImageSize:
++        processor = self.get_hf_processor()
++
++        hf_config = self.ctx.get_hf_config()
++        base_height, base_width = hf_config.vision_config.image_size
++        target_ratios = self.resolve_target_ratios()
++
++        largest_feature_size, largest_feature_pinpoint = 0, None
++        for wr, hr in target_ratios:
++            width, height = base_width * wr, base_height * hr
++
++            feat_size = self.get_num_image_tokens(
++                image_width=width,
++                image_height=height,
++                processor=processor.image_processor,
++            )
++            if feat_size > largest_feature_size:
++                largest_feature_size = feat_size
++                largest_feature_pinpoint = ImageSize(width=width,
++                                                     height=height)
++
++        assert not (largest_feature_size == 0 or largest_feature_pinpoint
++                    is None), ("Cannot have a largest feature size of 0!")
++
++        return largest_feature_pinpoint
++
++    def get_max_image_tokens(self) -> int:
++        processor = self.get_hf_processor()
++        target_width, target_height = self.get_image_size_with_most_features()
++
++        return self.get_num_image_tokens(
++            image_width=target_width,
++            image_height=target_height,
++            processor=processor.image_processor,
++        )
++
++    def get_num_frames_with_most_features(
++        self,
++        seq_len: int,
++        mm_counts: Mapping[str, int],
++    ) -> int:
++        max_images = mm_counts.get("image", 0)
++        max_videos = mm_counts.get("video", 0)
++
++        processor = self.get_hf_processor()
++
++        max_image_tokens = self.get_max_image_tokens() * max_images
++        max_total_frames = (seq_len -
++                            max_image_tokens) // processor.image_seq_length
++        max_frames_per_video = max_total_frames // max(max_videos, 1)
++
++        return max(max_frames_per_video, 1)
++
++
++class InternS1DummyInputsBuilder(BaseDummyInputsBuilder[InternS1ProcessingInfo]
++                                 ):
++    """DummyInputsBuilder for InternS1-style models."""
++
++    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
++        num_images = mm_counts.get("image", 0)
++        num_videos = mm_counts.get("video", 0)
++        image_token = self.info.get_hf_processor().image_token
++        video_token = self.info.get_hf_processor().video_token
++
++        return image_token * num_images + video_token * num_videos
++
++    def get_dummy_mm_data(
++        self,
++        seq_len: int,
++        mm_counts: Mapping[str, int],
++    ) -> MultiModalDataDict:
++        target_width, target_height = \
++            self.info.get_image_size_with_most_features()
++        target_num_frames = \
++                self.info.get_num_frames_with_most_features(seq_len, mm_counts)
++        num_images = mm_counts.get("image", 0)
++        num_videos = mm_counts.get("video", 0)
++
++        config = self.info.get_hf_config()
++        image_size_h, image_size_w = config.vision_config.image_size
++
++        return {
++            "image":
++            self._get_dummy_images(width=target_width,
++                                   height=target_height,
++                                   num_images=num_images),
++            "video":
++            self._get_dummy_videos(width=image_size_w,
++                                   height=image_size_h,
++                                   num_frames=target_num_frames,
++                                   num_videos=num_videos),
++        }
++
++
++class InternS1MultiModalProcessor(
++        BaseMultiModalProcessor[InternS1ProcessingInfo]):
++    """ Basic image-only MultiModalProcessor for InternS1-style models."""
++
++    def _call_hf_processor(
++        self,
++        prompt: str,
++        mm_data: Mapping[str, object],
++        mm_kwargs: Mapping[str, object],
++        tok_kwargs: Mapping[str, object],
++    ) -> Mapping[str, NestedTensors]:
++        mm_data = dict(mm_data)
++        videos = mm_data.pop("videos", [])
++        images = mm_data.pop("images", [])
++        assert isinstance(videos, list)
++        assert isinstance(images, list)
++
++        hf_processor = self.info.get_hf_processor(**mm_kwargs)
++        tokenizer = hf_processor.tokenizer
++        video_token_id = tokenizer.encode(hf_processor.video_token,
++                                          add_special_tokens=False)
++        assert len(video_token_id) == 1
++        video_token_id = video_token_id[0]
++
++        prompt = re.sub(hf_processor.image_token, "<image_placeholder>",
++                        prompt)
++        prompt = re.sub(hf_processor.video_token, "<video_placeholder>",
++                        prompt)
++
++        image_outputs = {}
++        if images:
++            image_pixel_values = []
++            for image in images:
++                processed_outputs = super()._call_hf_processor(
++                    prompt=hf_processor.image_token,
++                    mm_data={"images": image},
++                    mm_kwargs=mm_kwargs,
++                    tok_kwargs=tok_kwargs,
++                )
++                image_pixel_values.append(
++                    processed_outputs.pop("pixel_values"))
++
++                input_ids = processed_outputs.pop("input_ids")
++                image_placeholder = tokenizer.batch_decode(input_ids)[0]
++                prompt = prompt.replace("<image_placeholder>",
++                                        image_placeholder, 1)
++
++            num_patches = [len(item) for item in image_pixel_values]
++            image_outputs: dict[str, NestedTensors] = {
++                "pixel_values": torch.concat(image_pixel_values),
++                "image_num_patches": torch.tensor(num_patches),
++                "image_token_id": torch.tensor(hf_processor.image_token_id),
++            }
++
++        video_outputs = {}
++        if videos:
++            video_pixel_values = []
++            for video in videos:
++                processed_outputs = super()._call_hf_processor(
++                    prompt=hf_processor.video_token,
++                    mm_data={"videos": video},
++                    mm_kwargs=mm_kwargs,
++                    tok_kwargs=tok_kwargs,
++                )
++                video_pixel_values.append(
++                    processed_outputs.pop("pixel_values"))
++
++                input_ids = processed_outputs.pop("input_ids")
++                input_ids[input_ids ==
++                          hf_processor.image_token_id] = video_token_id
++
++                video_placeholder = tokenizer.batch_decode(input_ids)[0]
++                prompt = prompt.replace("<video_placeholder>",
++                                        video_placeholder, 1)
++
++            num_frames = [len(item) for item in video_pixel_values]
++            video_outputs: dict[str, NestedTensors] = {
++                "pixel_values_videos": torch.concat(video_pixel_values),
++                "video_num_patches": torch.tensor(num_frames),
++                "video_token_id": torch.tensor(video_token_id),
++            }
++
++        prompt = re.sub("<image_placeholder>", hf_processor.image_token,
++                        prompt)
++        prompt = re.sub("<video_placeholder>", hf_processor.video_token,
++                        prompt)
++        text_outputs = tokenizer(prompt, **tok_kwargs, return_tensors="pt")
++
++        combined_outputs = dict(
++            **text_outputs,
++            **image_outputs,
++            **video_outputs,
++        )
++        return BatchFeature(combined_outputs)
++
++    def _get_mm_fields_config(
++        self,
++        hf_inputs: Mapping[str, NestedTensors],
++        hf_processor_mm_kwargs: Mapping[str, object],
++    ) -> Mapping[str, MultiModalFieldConfig]:
++
++        image_num_patches = hf_inputs.get("image_num_patches", torch.empty(0))
++        video_num_patches = hf_inputs.get("video_num_patches", torch.empty(0))
++        num_images = len(image_num_patches)
++        num_videos = len(video_num_patches)
++
++        return dict(
++            pixel_values=MultiModalFieldConfig.flat_from_sizes(
++                "image", image_num_patches),
++            image_num_patches=MultiModalFieldConfig.batched("image"),
++            image_embeds=MultiModalFieldConfig.batched("image"),
++            image_token_id=MultiModalFieldConfig.shared("image", num_images),
++            pixel_values_videos=MultiModalFieldConfig.flat_from_sizes(
++                "video", video_num_patches),
++            video_num_patches=MultiModalFieldConfig.batched("video"),
++            video_token_id=MultiModalFieldConfig.shared("video", num_videos),
++        )
++
++    def _get_prompt_updates(
++        self,
++        mm_items: MultiModalDataItems,
++        hf_processor_mm_kwargs: Mapping[str, object],
++        out_mm_kwargs: MultiModalKwargs,
++    ) -> Sequence[PromptUpdate]:
++        hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
++        img_context_token = hf_processor.image_token
++        start_image_token = hf_processor.start_image_token
++        end_image_token = hf_processor.end_image_token
++        video_token = hf_processor.video_token
++
++        if "video_num_patches" in out_mm_kwargs:
++            video_num_patches = out_mm_kwargs["video_num_patches"]
++            assert isinstance(video_num_patches, torch.Tensor)
++            video_num_patches = video_num_patches.tolist()
++        else:
++            video_num_patches = []
++
++        if "image_num_patches" in out_mm_kwargs:
++            image_num_patches = out_mm_kwargs["image_num_patches"]
++            assert isinstance(image_num_patches, torch.Tensor)
++            image_num_patches = image_num_patches.tolist()
++        else:
++            image_num_patches = []
++
++        def get_replacement_interns1_image(item_idx: int):
++            images = mm_items.get_items(
++                "image", (ImageEmbeddingItems, ImageProcessorItems))
++
++            if isinstance(images, ImageEmbeddingItems):
++                feature_size = images.get_feature_size(item_idx)
++            else:
++                num_patches = image_num_patches[item_idx]
++                feature_size = num_patches * hf_processor.image_seq_length
++
++            repl_features = img_context_token * feature_size
++            repl_full = start_image_token + repl_features + end_image_token
++            return PromptUpdateDetails.select_text(repl_full,
++                                                   img_context_token)
++
++        def get_replacement_interns1_video(item_idx: int):
++            num_patches = video_num_patches[item_idx]
++            repl_features = video_token * hf_processor.image_seq_length
++            repl_features_with_sep = (start_image_token + repl_features +
++                                      end_image_token)
++            # num_patches is equal to num_frames
++            repl_full = '\n'.join([
++                f'Frame{i+1}: {repl_features_with_sep}'
++                for i in range(num_patches)
++            ])
++
++            return PromptUpdateDetails.select_text(repl_full, video_token)
++
++        return [
++            PromptReplacement(
++                modality="image",
++                target=img_context_token,
++                replacement=get_replacement_interns1_image,
++            ),
++            PromptReplacement(
++                modality="video",
++                target=video_token,
++                replacement=get_replacement_interns1_video,
++            ),
++        ]
++
++
++@MULTIMODAL_REGISTRY.register_processor(
++    InternS1MultiModalProcessor,
++    info=InternS1ProcessingInfo,
++    dummy_inputs=InternS1DummyInputsBuilder)
++class InternS1ForConditionalGeneration(nn.Module, SupportsMultiModal,
++                                       SupportsPP, SupportsLoRA):
++
++    # To ensure correct weight loading and mapping.
++    hf_to_vllm_mapper = WeightsMapper(
++        orig_to_new_prefix={
++            "lm_head.": "language_model.lm_head.",
++            "model.language_model.": "language_model.model.",
++            "model.vision_tower.": "vision_tower.",
++            "model.multi_modal_projector.": "multi_modal_projector.",
++        })
++
++    @classmethod
++    def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
++        # transformers InternVLProcessor uses <IMG_CONTEXT> as the seperator
++        # refer to https://github.com/huggingface/transformers/blob/f90de364c2484c7c325bbe05befdcf487bd75b63/src/transformers/models/internvl/processing_internvl.py#L116
++        if modality.startswith("image"):
++            return '<IMG_CONTEXT>'
++        if modality.startswith("video"):
++            return "<video>"
++
++        raise ValueError("Only image or video modality is supported")
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
++        super().__init__()
++        config = vllm_config.model_config.hf_config
++        quant_config = vllm_config.quant_config
++        multimodal_config = vllm_config.model_config.multimodal_config
++
++        self.config = config
++        self.multimodal_config = multimodal_config
++
++        image_size = config.vision_config.image_size[0]
++        patch_size = config.vision_config.patch_size[0]
++        self.patch_size = patch_size
++        self.num_image_token = int(
++            (image_size // patch_size)**2 * (config.downsample_ratio**2))
++        self.downsample_ratio = config.downsample_ratio
++
++        self.llm_arch_name = config.text_config.architectures[0]
++        self.vision_tower = self._init_vision_model(
++            config,
++            quant_config=quant_config,
++            prefix=maybe_prefix(prefix, "vision_tower"),
++        )
++
++        self.language_model = init_vllm_registered_model(
++            vllm_config=vllm_config,
++            hf_config=config.text_config,
++            prefix=maybe_prefix(prefix, "language_model"),
++        )
++
++        self.multi_modal_projector = self._init_mlp1(config)
++
++        self.img_context_token_id = None
++        self.video_context_token_id = None
++
++        self.visual_token_mask = None
++        self.make_empty_intermediate_tensors = (
++            self.language_model.make_empty_intermediate_tensors)
++
++    def _init_vision_model(
++        self,
++        config: PretrainedConfig,
++        quant_config: Optional[QuantizationConfig],
++        *,
++        prefix: str,
++    ):
++        num_hidden_layers = config.vision_config.num_hidden_layers
++        return InternS1VisionModel(
++            config.vision_config,
++            quant_config=quant_config,
++            num_hidden_layers_override=num_hidden_layers,
++            prefix=prefix,
++        )
++
++    def _init_mlp1(self, config: PretrainedConfig) -> nn.Sequential:
++        return InternS1MultiModalProjector(config)
++
++    def pixel_shuffle(self, x, scale_factor=0.5):
++        n, w, h, c = x.size()
++        # N, W, H, C --> N, W, H * scale, C // scale
++        x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
++        # N, W, H * scale, C // scale --> N, H * scale, W, C // scale
++        x = x.permute(0, 2, 1, 3).contiguous()
++        x = x.view(n, int(h * scale_factor), int(w * scale_factor),
++                   int(c / (scale_factor * scale_factor)))
++        x = x.permute(0, 2, 1, 3).contiguous()
++        return x
++
++    def extract_feature(self, pixel_values: torch.Tensor) -> torch.Tensor:
++        vit_embeds = self.vision_tower(pixel_values=pixel_values)
++        vit_embeds = vit_embeds[:, 1:, :]
++
++        h = w = int(vit_embeds.shape[1]**0.5)
++        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
++        vit_embeds = self.pixel_shuffle(vit_embeds,
++                                        scale_factor=self.downsample_ratio)
++        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1,
++                                        vit_embeds.shape[-1])
++
++        vit_embeds = self.multi_modal_projector(vit_embeds)
++        return vit_embeds
++
++    def _validate_pixel_values(self, data: torch.Tensor) -> torch.Tensor:
++
++        h, w = self.config.vision_config.image_size
++        expected_dims = (3, h, w)
++
++        def _validate_shape(d: torch.Tensor):
++            actual_dims = tuple(d.shape)
++
++            if actual_dims != expected_dims:
++                expected_expr = str(expected_dims)
++                raise ValueError(
++                    "The expected shape of pixel values per image per batch "
++                    f" per patch is {expected_expr}. "
++                    f"You supplied {tuple(d.shape)}.")
++
++        for d in data:
++            _validate_shape(d)
++
++        return data
++
++    def _parse_and_validate_image_input(
++            self, **kwargs: object) -> Optional[InternS1ImageInputs]:
++        pixel_values = kwargs.pop("pixel_values", None)
++        image_num_patches = kwargs.pop("image_num_patches", None)
++        image_embeds = kwargs.pop("image_embeds", None)
++
++        if pixel_values is None and image_embeds is None:
++            return None
++
++        if image_embeds is not None:
++            if not isinstance(image_embeds, (torch.Tensor, list)):
++                raise ValueError("Incorrect type of image embeddings. "
++                                 f"Got type: {type(image_embeds)}")
++
++            return InternS1ImageEmbeddingInputs(
++                type="image_embeds",
++                data=flatten_bn(image_embeds),
++            )
++
++        image_token_id = kwargs["image_token_id"]
++        assert isinstance(image_token_id, torch.Tensor)
++        self.img_context_token_id = image_token_id.flatten().unique().item()
++
++        if pixel_values is not None:
++            if not isinstance(pixel_values, (torch.Tensor, list)):
++                raise ValueError("Incorrect type of pixel values. "
++                                 f"Got type: {type(pixel_values)}")
++
++            if not isinstance(image_num_patches, (torch.Tensor, list)):
++                raise ValueError("Incorrect type of image_num_patches. "
++                                 f"Got type: {type(image_num_patches)}")
++
++            pixel_values = flatten_bn(pixel_values, concat=True)
++            image_num_patches = flatten_bn(image_num_patches, concat=True)
++
++            return InternS1ImagePixelInputs(
++                type="pixel_values",
++                pixel_values=self._validate_pixel_values(pixel_values),
++                num_patches=image_num_patches,
++            )
++
++        raise AssertionError("This line should be unreachable.")
++
++    def _parse_and_validate_video_input(
++            self, **kwargs: object) -> Optional[InternS1VideoPixelInputs]:
++        pixel_values_flat_video = kwargs.pop("pixel_values_videos", None)
++        video_num_patches = kwargs.pop("video_num_patches", None)
++        video_embeds = kwargs.pop("video_embeds", None)
++
++        if pixel_values_flat_video is None and video_embeds is None:
++            return None
++
++        if video_embeds is not None:
++            if not isinstance(video_embeds, (torch.Tensor, list)):
++                raise ValueError("Incorrect type of video embeddings. "
++                                 f"Got type: {type(video_embeds)}")
++
++            return InternS1ImageEmbeddingInputs(
++                type="video_embeds",
++                data=flatten_bn(video_embeds),
++            )
++
++        video_token_id = kwargs["video_token_id"]
++        assert isinstance(video_token_id, torch.Tensor)
++        self.video_context_token_id = video_token_id.flatten().unique().item()
++
++        if pixel_values_flat_video is not None:
++            if not isinstance(pixel_values_flat_video, (torch.Tensor, list)):
++                raise ValueError("Incorrect type of pixel values. "
++                                 f"Got type: {type(pixel_values_flat_video)}")
++
++            if not isinstance(video_num_patches, (torch.Tensor, list)):
++                raise ValueError("Incorrect type of image_num_patches. "
++                                 f"Got type: {type(video_num_patches)}")
++
++            pixel_values_flat_video = flatten_bn(pixel_values_flat_video,
++                                                 concat=True)
++            video_num_patches = flatten_bn(video_num_patches, concat=True)
++
++            return InternS1VideoPixelInputs(
++                type="pixel_values_videos",
++                pixel_values=self._validate_pixel_values(
++                    pixel_values_flat_video),
++                num_patches=video_num_patches,
++            )
++
++        raise AssertionError("This line should be unreachable.")
++
++    def _process_image_input(
++        self,
++        image_input: Union[InternS1ImageInputs, InternS1VideoPixelInputs],
++    ) -> tuple[torch.Tensor, ...]:
++        if image_input["type"] == "image_embeds":
++            return image_input["data"]
++
++        assert self.vision_tower is not None
++
++        image_embeds = self.extract_feature(image_input["pixel_values"])
++
++        num_patches = image_input["num_patches"]
++
++        # Only one image in the current batch
++        if len(num_patches) == 1:
++            return (image_embeds.view(-1,
++                                      self.config.text_config.hidden_size), )
++
++        # NOTE: Image embeddings are split into separate tensors for each image
++        # by the size of each embedding.
++        feature_size = image_embeds.shape[1]
++        image_embeds = image_embeds.view(-1,
++                                         self.config.text_config.hidden_size)
++        image_feature_sizes = [
++            num_patches * feature_size for num_patches in num_patches
++        ]
++        return image_embeds.split(image_feature_sizes)
++
++    def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
++        modalities = {}
++
++        # Preserve the order of modalities if there are multiple of them
++        # from the order of kwargs.
++        for input_key in kwargs:
++            if input_key in ("pixel_values",
++                             "image_embeds") and "images" not in modalities:
++                modalities["images"] = self._parse_and_validate_image_input(
++                    **kwargs)
++            if input_key in (
++                    "pixel_values_videos", ) and "videos" not in modalities:
++                modalities["videos"] = self._parse_and_validate_video_input(
++                    **kwargs)
++
++        return modalities
++
++    def _set_visual_token_mask(self, input_ids: torch.Tensor) -> None:
++        self.visual_token_mask = None
++
++    def get_language_model(self) -> torch.nn.Module:
++        return self.language_model
++
++    def get_multimodal_embeddings(self,
++                                  **kwargs: object) -> MultiModalEmbeddings:
++
++        modalities = self._parse_and_validate_multimodal_inputs(**kwargs)
++        if not modalities:
++            return []
++
++        # The result multimodal_embeddings is tuple of tensors, with each
++        # tensor correspoending to a multimodal data item (image or video).
++        multimodal_embeddings: tuple[torch.Tensor, ...] = ()
++
++        # NOTE: It is important to iterate over the keys in this dictionary
++        # to preserve the order of the modalities.
++        for modality in modalities:
++            if modality == "images":
++                image_input = modalities["images"]
++                vision_embeddings = self._process_image_input(image_input)
++                multimodal_embeddings += vision_embeddings
++            if modality == "videos":
++                video_input = modalities["videos"]
++                video_embeddings = self._process_image_input(video_input)
++                multimodal_embeddings += video_embeddings
++
++        return multimodal_embeddings
++
++    def get_input_embeddings(
++        self,
++        input_ids: torch.Tensor,
++        multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
++    ) -> torch.Tensor:
++        inputs_embeds = self.language_model.get_input_embeddings(input_ids)
++        if multimodal_embeddings is not None \
++            and len(multimodal_embeddings) != 0:
++            context_token_ids = [
++                token_id for token_id in (self.img_context_token_id,
++                                          self.video_context_token_id)
++                if token_id is not None
++            ]
++            assert len(context_token_ids) >= 1
++            self._set_visual_token_mask(input_ids)
++            inputs_embeds = merge_multimodal_embeddings(
++                input_ids,
++                inputs_embeds,
++                multimodal_embeddings,
++                context_token_ids,
++            )
++        return inputs_embeds
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        intermediate_tensors: Optional[IntermediateTensors] = None,
++        inputs_embeds: Optional[torch.Tensor] = None,
++        **kwargs: object,
++    ) -> IntermediateTensors:
++
++        if intermediate_tensors is not None:
++            input_ids = None
++            inputs_embeds = None
++
++        # NOTE: In v1, inputs_embeds is always generated at model runner, this
++        # condition is for v0 compatibility.
++        elif inputs_embeds is None:
++            vision_embeddings = self.get_multimodal_embeddings(**kwargs)
++            inputs_embeds = self.get_input_embeddings(input_ids,
++                                                      vision_embeddings)
++            input_ids = None
++
++        forward_kwargs = {
++            "input_ids": input_ids,
++            "positions": positions,
++            "intermediate_tensors": intermediate_tensors,
++            "inputs_embeds": inputs_embeds,
++        }
++
++        hidden_states = self.language_model.model(**forward_kwargs)
++        return hidden_states
++
++    def compute_logits(
++        self,
++        hidden_states: torch.Tensor,
++        sampling_metadata: SamplingMetadata,
++    ) -> Optional[torch.Tensor]:
++        return self.language_model.compute_logits(hidden_states,
++                                                  sampling_metadata)
++
++    def load_weights(self, weights: Iterable[tuple[str,
++                                                   torch.Tensor]]) -> set[str]:
++        loader = AutoWeightsLoader(self)
++        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
++
++    def get_mm_mapping(self) -> MultiModelKeys:
++        """
++        Get the module prefix in multimodal models
++        """
++        return MultiModelKeys.from_string_field(
++            language_model="language_model",
++            connector="multi_modal_projector",
++            tower_model="vision_tower")
+diff --git a/vllm/model_executor/models/internvl.py b/vllm/model_executor/models/internvl.py
+index f8b9ea2c5..2a9366d87 100644
+--- a/vllm/model_executor/models/internvl.py
++++ b/vllm/model_executor/models/internvl.py
+@@ -9,7 +9,7 @@
+ # --------------------------------------------------------
+ from abc import ABC, abstractmethod
+ from collections.abc import Iterable, Mapping, Sequence
+-from typing import Any, Literal, Optional, TypedDict, TypeVar, Union
++from typing import Annotated, Any, Literal, Optional, TypeVar, Union
+ 
+ import numpy.typing as npt
+ import torch
+@@ -37,6 +37,7 @@ from vllm.multimodal.processing import (BaseMultiModalProcessor,
+ from vllm.multimodal.profiling import BaseDummyInputsBuilder
+ from vllm.sequence import IntermediateTensors
+ from vllm.transformers_utils.tokenizer import AnyTokenizer
++from vllm.utils.tensor_schema import TensorSchema, TensorShape
+ 
+ from .interfaces import (MultiModalEmbeddings, SupportsLoRA,
+                          SupportsMultiModal, SupportsPP)
+@@ -51,54 +52,60 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
+ IMAGENET_STD = (0.229, 0.224, 0.225)
+ 
+ 
+-class InternVLImagePixelInputs(TypedDict):
+-    type: Literal["pixel_values"]
+-    pixel_values_flat: torch.Tensor
++class InternVLImagePixelInputs(TensorSchema):
+     """
+-    Shape:
+-    `(batch_size * num_images * (1 + num_patches), num_channels, height, width)`
++    Dimensions:
++        - bn: Batch size * number of images
++        - bnp: Batch size * number of images * (1 + num_patches)
++        - c: Number of channels (3)
++        - h: Height of each image patch
++        - w: Width of each image patch
+     """
++    type: Literal["pixel_values"]
++    pixel_values_flat: Annotated[torch.Tensor, TensorShape("bnp", 3, "h", "w")]
++    num_patches: Annotated[torch.Tensor, TensorShape("bn")]
+ 
+-    num_patches: torch.Tensor
+-    """Shape: `(batch_size * num_images)`"""
+-
+-
+-class InternVLImageEmbeddingInputs(TypedDict):
+-    type: Literal["image_embeds"]
+-    data: Union[torch.Tensor, list[torch.Tensor]]
+-    """ 
+-    A tensor of shape `(num_images, total_image_feature_size, hidden_size)`
+-    or a list of tensors of shape `(total_image_feature_size, hidden_size)`
+ 
+-    `hidden_size` must match the hidden size of language model backbone.
++class InternVLImageEmbeddingInputs(TensorSchema):
+     """
++    Dimensions:
++        - n: Number of images
++        - f: Total image feature size
++        - h: Hidden size (must match the hidden size of language model backbone)
++    """
++    type: Literal["image_embeds"]
++    data: Annotated[Union[torch.Tensor, list[torch.Tensor]],
++                    TensorShape("n", "f", "h")]
+ 
+ 
+ InternVLImageInputs = Union[InternVLImagePixelInputs,
+                             InternVLImageEmbeddingInputs]
+ 
+ 
+-class InternVLVideoPixelInputs(TypedDict):
+-    type: Literal["pixel_values_videos"]
+-    pixel_values_flat: torch.Tensor
++class InternVLVideoPixelInputs(TensorSchema):
+     """
+-    Shape:
+-    `(batch_size * num_video * num_frames, num_channels, height, width)`
++    Dimensions:
++        - bvf: Batch size * number of videos * num_frames
++        - bn: Batch size * number of images
++        - c: Number of channels (3)
++        - h: Height of each video frame
++        - w: Width of each video frame
+     """
++    type: Literal["pixel_values_videos"]
++    pixel_values_flat: Annotated[torch.Tensor, TensorShape("bvf", 3, "h", "w")]
++    num_patches: Annotated[torch.Tensor, TensorShape("bn")]
+ 
+-    num_patches: torch.Tensor
+-    """Shape: `(batch_size * num_images)`"""
+-
+-
+-class InternVLVideoEmbeddingInputs(TypedDict):
+-    type: Literal["video_embeds"]
+-    data: Union[torch.Tensor, list[torch.Tensor]]
+-    """ 
+-    A tensor of shape `(num_videos, total_video_feature_size, hidden_size)`
+-    or a list of tensors of shape `(total_video_feature_size, hidden_size)`
+ 
+-    `hidden_size` must match the hidden size of language model backbone.
++class InternVLVideoEmbeddingInputs(TensorSchema):
++    """
++    Dimensions:
++        - n: Number of videos
++        - f: Total video feature size
++        - h: Hidden size (must match the hidden size of language model backbone)
+     """
++    type: Literal["video_embeds"]
++    data: Annotated[Union[torch.Tensor, list[torch.Tensor]],
++                    TensorShape("n", "f", "h")]
+ 
+ 
+ InternVLVideoInputs = Union[InternVLVideoPixelInputs,
+@@ -658,14 +665,7 @@ class BaseInternVLProcessingInfo(BaseProcessingInfo):
+     """Basic image-only ProcessingInfo for InternVL-style models."""
+ 
+     @abstractmethod
+-    def get_hf_processor(
+-        self,
+-        *,
+-        min_dynamic_patch: Optional[int] = None,
+-        max_dynamic_patch: Optional[int] = None,
+-        dynamic_image_size: Optional[bool] = None,
+-        **kwargs: object,
+-    ) -> BaseInternVLProcessor:
++    def get_hf_processor(self, **kwargs: object) -> BaseInternVLProcessor:
+         raise NotImplementedError
+ 
+     def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
+@@ -854,9 +854,13 @@ class InternVLProcessingInfo(BaseInternVLProcessingInfo):
+ 
+     def get_video_token(self) -> Optional[str]:
+         text_model_type = self.get_hf_config().get_text_config().model_type
+-        if text_model_type == "qwen2":
+-            return "<|video_pad|>"
+-        return None
++        video_token_map = {
++            "qwen2": "<|video_pad|>",
++            "qwen3": "<|video_pad|>",
++            "qwen3_moe": "<|video_pad|>",
++            "gpt_oss": "<|reserved_200000|>",
++        }
++        return video_token_map.get(text_model_type)
+ 
+     def get_num_frames_with_most_features(
+         self,
+@@ -875,27 +879,12 @@ class InternVLProcessingInfo(BaseInternVLProcessingInfo):
+ 
+         return max(max_frames_per_video, 1)
+ 
+-    def get_hf_processor(
+-        self,
+-        *,
+-        min_dynamic_patch: Optional[int] = None,
+-        max_dynamic_patch: Optional[int] = None,
+-        dynamic_image_size: Optional[bool] = None,
+-        **kwargs: object,
+-    ) -> InternVLProcessor:
+-        if min_dynamic_patch is not None:
+-            kwargs["min_dynamic_patch"] = min_dynamic_patch
+-        if max_dynamic_patch is not None:
+-            kwargs["max_dynamic_patch"] = max_dynamic_patch
+-        if dynamic_image_size is not None:
+-            kwargs["dynamic_image_size"] = dynamic_image_size
+-
+-        kwargs["video_token"] = self.get_video_token()
+-
++    def get_hf_processor(self, **kwargs: object) -> InternVLProcessor:
+         return self.ctx.init_processor(
+             InternVLProcessor,
+             config=self.get_hf_config(),
+             tokenizer=self.get_tokenizer(),
++            video_token=self.get_video_token(),
+             **kwargs,
+         )
+ 
+@@ -1151,26 +1140,6 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
+         vit_embeds = self.mlp1(vit_embeds)
+         return vit_embeds
+ 
+-    def _validate_pixel_values(self, data: torch.Tensor) -> torch.Tensor:
+-
+-        h = w = self.config.vision_config.image_size
+-        expected_dims = (3, h, w)
+-
+-        def _validate_shape(d: torch.Tensor):
+-            actual_dims = tuple(d.shape)
+-
+-            if actual_dims != expected_dims:
+-                expected_expr = str(expected_dims)
+-                raise ValueError(
+-                    "The expected shape of pixel values per image per batch "
+-                    f" per patch is {expected_expr}. "
+-                    f"You supplied {tuple(d.shape)}.")
+-
+-        for d in data:
+-            _validate_shape(d)
+-
+-        return data
+-
+     def _parse_and_validate_image_input(
+             self, **kwargs: object) -> Optional[InternVLImageInputs]:
+         pixel_values_flat = kwargs.pop("pixel_values_flat", None)
+@@ -1205,12 +1174,14 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
+ 
+             pixel_values_flat = flatten_bn(pixel_values_flat, concat=True)
+             image_num_patches = flatten_bn(image_num_patches, concat=True)
++            expected_h = expected_w = self.config.vision_config.image_size
++            resolve_bindings = {"h": expected_h, "w": expected_w}
+ 
+             return InternVLImagePixelInputs(
+                 type="pixel_values",
+-                pixel_values_flat=self._validate_pixel_values(
+-                    pixel_values_flat),
++                pixel_values_flat=pixel_values_flat,
+                 num_patches=image_num_patches,
++                resolve_bindings=resolve_bindings,
+             )
+ 
+         raise AssertionError("This line should be unreachable.")
+@@ -1225,11 +1196,7 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
+             return None
+ 
+         if video_embeds is not None:
+-            if not isinstance(video_embeds, (torch.Tensor, list)):
+-                raise ValueError("Incorrect type of video embeddings. "
+-                                 f"Got type: {type(video_embeds)}")
+-
+-            return InternVLImageEmbeddingInputs(
++            return InternVLVideoEmbeddingInputs(
+                 type="video_embeds",
+                 data=flatten_bn(video_embeds),
+             )
+@@ -1250,12 +1217,14 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
+             pixel_values_flat_video = flatten_bn(pixel_values_flat_video,
+                                                  concat=True)
+             video_num_patches = flatten_bn(video_num_patches, concat=True)
++            expected_h = expected_w = self.config.vision_config.image_size
++            resolve_bindings = {"h": expected_h, "w": expected_w}
+ 
+             return InternVLVideoPixelInputs(
+                 type="pixel_values_videos",
+-                pixel_values_flat=self._validate_pixel_values(
+-                    pixel_values_flat_video),
++                pixel_values_flat=pixel_values_flat_video,
+                 num_patches=video_num_patches,
++                resolve_bindings=resolve_bindings,
+             )
+ 
+         raise AssertionError("This line should be unreachable.")
+@@ -1322,7 +1291,6 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
+         modalities = self._parse_and_validate_multimodal_inputs(**kwargs)
+         if not modalities:
+             return []
+-            return None
+ 
+         # The result multimodal_embeddings is tuple of tensors, with each
+         # tensor correspoending to a multimodal data item (image or video).
 diff --git a/vllm/model_executor/models/llama.py b/vllm/model_executor/models/llama.py
 index 48ec611df..09e6d8af7 100644
 --- a/vllm/model_executor/models/llama.py
@@ -11574,6 +13318,225 @@ index 48ec611df..09e6d8af7 100644
                  if name is None:
                      continue
              for param_name, weight_name, shard_id in stacked_params_mapping:
+diff --git a/vllm/model_executor/models/minicpmv.py b/vllm/model_executor/models/minicpmv.py
+index 70f2d4a64..3aa16bb9a 100644
+--- a/vllm/model_executor/models/minicpmv.py
++++ b/vllm/model_executor/models/minicpmv.py
+@@ -38,6 +38,8 @@ from typing_extensions import TypeVar
+ 
+ from vllm.config import VllmConfig
+ from vllm.model_executor.layers.quantization import QuantizationConfig
++from vllm.model_executor.layers.quantization.awq import AWQConfig
++from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
+ from vllm.model_executor.layers.resampler import (BaseResampler, Resampler2,
+                                                   get_2d_sincos_pos_embed)
+ from vllm.model_executor.model_loader.utils import set_default_torch_dtype
+@@ -331,17 +333,17 @@ class MiniCPMVProcessingInfo(BaseProcessingInfo):
+ 
+         return hf_processor
+ 
+-    def get_image_processor(self):
+-        hf_processor = self.get_hf_processor()
+-        image_processor = hf_processor.image_processor  # type: ignore
+-        return image_processor
++    def get_image_processor(self, **kwargs: object):
++        return self.get_hf_processor(**kwargs).image_processor
+ 
+     def get_model_version(self):
+         return get_version_by_config(self.get_hf_config())
+ 
+     def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
+         mm_limits = {"image": None}
+-        if self.get_model_version() == (2, 6):
++        if self.get_model_version() == (2,
++                                        6) or self.get_model_version() == (4,
++                                                                           0):
+             mm_limits["video"] = None
+ 
+         return mm_limits
+@@ -622,7 +624,8 @@ class MiniCPMVMultiModalProcessor(BaseMultiModalProcessor[_I]):
+         out_keys: set[str],
+     ) -> dict[str, NestedTensors]:
+         # This processor supports zipping prompt and mm_data together
+-        if self.info.get_model_version() == (2, 6):
++        if self.info.get_model_version() == (
++                2, 6) or self.info.get_model_version() == (4, 0):
+             inputs = super()._call_hf_processor(
+                 prompt=prompts,  # type: ignore
+                 mm_data=mm_data,
+@@ -681,10 +684,18 @@ class MiniCPMVMultiModalProcessor(BaseMultiModalProcessor[_I]):
+         hf_processor_mm_kwargs: Mapping[str, object],
+         out_mm_kwargs: MultiModalKwargs,
+     ) -> Sequence[PromptUpdate]:
+-        placeholder = {
+-            "image": self.info.image_pattern,
+-            "video": self.info.video_pattern,
+-        }
++        placeholders = [("image", self.info.image_pattern),
++                        ("video", self.info.video_pattern)]
++
++        # hard code for inconsistency of encode-decode image_pattern
++        additional_placeholders = []
++        tokenizer = self.info.get_tokenizer()
++        for modality, pattern in placeholders:
++            sub_pattern = tokenizer.decode(
++                tokenizer.encode(pattern, add_special_tokens=False))
++            if sub_pattern != pattern:
++                additional_placeholders.append((modality, sub_pattern))
++        placeholders += additional_placeholders
+ 
+         def get_image_replacement(item_idx: int):
+             images = mm_items.get_items(
+@@ -716,9 +727,9 @@ class MiniCPMVMultiModalProcessor(BaseMultiModalProcessor[_I]):
+ 
+         return [
+             PromptReplacement(modality=modality,
+-                              target=placeholder[modality],
++                              target=pattern,
+                               replacement=get_replacement[modality])
+-            for modality in ("image", "video")
++            for modality, pattern in placeholders
+         ]
+ 
+     def _get_mm_fields_config(
+@@ -1264,11 +1275,124 @@ class MiniCPMV2_6(MiniCPMVBaseModel, SupportsLoRA):
+ 
+         return self.resampler(vision_embedding, tgt_sizes)
+ 
++    def load_weights(self, weights: Iterable[tuple[str,
++                                                   torch.Tensor]]) -> set[str]:
++        loader = AutoWeightsLoader(self,
++                                   skip_prefixes=["apm.", "audio", "tts"])
++        return loader.load_weights(weights)
++
++
++class MiniCPMV4_0(MiniCPMVBaseModel, SupportsLoRA):
++    packed_modules_mapping = {
++        "qkv_proj": [
++            "q_proj",
++            "k_proj",
++            "v_proj",
++        ],
++        "gate_up_proj": [
++            "gate_proj",
++            "up_proj",
++        ],
++    }
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        super().__init__(vllm_config=vllm_config, prefix=prefix)
++        assert self.version == (4, 0)
++
++    def _maybe_ignore_quant_config(self, quant_config: QuantizationConfig):
++        if isinstance(quant_config, (AWQConfig, AWQMarlinConfig)):
++            return None
++        return quant_config
++
++    def init_llm(
++        self,
++        vllm_config: VllmConfig,
++        prefix: str = "",
++    ) -> nn.Module:
++        return LlamaForCausalLM(vllm_config=vllm_config, prefix=prefix)
++
++    def init_vision_module(
++        self,
++        config: PretrainedConfig,
++        quant_config: Optional[QuantizationConfig] = None,
++        prefix: str = "",
++    ) -> nn.Module:
++        quant_config = self._maybe_ignore_quant_config(quant_config)
++        model = Idefics2VisionTransformer(config.vision_config,
++                                          quant_config=quant_config,
++                                          prefix=prefix)
++        if self.config.drop_vision_last_layer:
++            model.encoder.layers = model.encoder.layers[:-1]
++        return model
++
++    def init_resampler(
++        self,
++        embed_dim: int,
++        vision_dim: int,
++        quant_config: Optional[QuantizationConfig] = None,
++        prefix: str = "",
++    ) -> nn.Module:
++        quant_config = self._maybe_ignore_quant_config(quant_config)
++        with set_default_torch_dtype(torch.float16):
++            # The resampler in 4.0 remains consistent with the one in 2.5/2.6.
++            resampler = Resampler2_5(num_queries=self.config.query_num,
++                                     embed_dim=embed_dim,
++                                     num_heads=embed_dim // 128,
++                                     kv_dim=vision_dim,
++                                     quant_config=quant_config,
++                                     prefix=prefix)
++
++        return resampler.to(device=current_platform.device_type,
++                            dtype=torch.get_default_dtype())
++
++    def get_vision_hidden_states(
++            self, data: MiniCPMVImagePixelInputs) -> torch.Tensor:
++        pixel_values = data["pixel_values"]
++        tgt_sizes = data["tgt_sizes"]
++
++        B = len(pixel_values)
++        P = pixel_values[0].shape[-2]
++        L = max(item.shape[-1] for item in pixel_values)
++        device = pixel_values[0].device
++        dtype = pixel_values[0].dtype
++
++        all_pixel_values = torch.zeros((B, 3, P, L),
++                                       dtype=dtype,
++                                       device=device)
++        for i, pixel_values_item in enumerate(pixel_values):
++            L_item = pixel_values_item.shape[-1]
++            all_pixel_values[i, ..., :L_item] = pixel_values_item
++
++        num_patches = tgt_sizes.prod(-1)
++        max_patches = num_patches.max().item()
++        assert isinstance(max_patches, int)
++
++        patch_attn_mask = torch.zeros((B, max_patches),
++                                      dtype=torch.bool,
++                                      device=device)
++        for i, num_patches_item in enumerate(num_patches):
++            patch_attn_mask[i, :num_patches_item] = True
++
++        vision_embedding = self.vpm(
++            all_pixel_values,
++            patch_attention_mask=patch_attn_mask.unsqueeze(1),
++            tgt_sizes=tgt_sizes,
++        )
++
++        return self.resampler(vision_embedding, tgt_sizes)
++
++    def load_weights(self, weights: Iterable[tuple[str,
++                                                   torch.Tensor]]) -> set[str]:
++        loader = AutoWeightsLoader(self,
++                                   skip_prefixes=["apm.", "audio", "tts"])
++        return loader.load_weights(weights)
++
+ 
+ _SUPPORT_VERSION = {
+     (2, 0): MiniCPMV2_0,
+     (2, 5): MiniCPMV2_5,
+     (2, 6): MiniCPMV2_6,
++    (4, 0): MiniCPMV4_0,
+ }
+ 
+ 
+@@ -1296,8 +1420,10 @@ class MiniCPMV(MiniCPMVBaseModel, SupportsMultiModal, SupportsLoRA):
+         # Dispatch class based on version
+         instance_cls = _SUPPORT_VERSION.get(version)
+         if instance_cls is None:
+-            raise ValueError(
+-                "Currently, MiniCPMV only supports versions 2.0, 2.5, and 2.6")
++            supported_versions = ", ".join(
++                [f"{v[0]}.{v[1]}" for v in sorted(_SUPPORT_VERSION.keys())])
++            raise ValueError(f"Currently, MiniCPMV only supports versions "
++                             f"{supported_versions}. Got version: {version}")
+ 
+         # quant_config references base class members,
+         # so update values before init is called
 diff --git a/vllm/model_executor/models/phi4mm_audio.py b/vllm/model_executor/models/phi4mm_audio.py
 index 0b0d66ae7..ab54409e5 100644
 --- a/vllm/model_executor/models/phi4mm_audio.py
