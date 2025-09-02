@@ -126,4 +126,6 @@ RUN cd /llm && \
     cd comfyui-easy-use && \
     pip install -r requirements.txt
 
+COPY ./workflows/ /llm/ComfyUI/workflows/
+
 WORKDIR /llm/ComfyUI
