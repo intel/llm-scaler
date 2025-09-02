@@ -19,11 +19,11 @@ sudo docker run -itd \
         -e no_proxy=localhost,127.0.0.1 \
         --name=$CONTAINER_NAME \
         -v $MODEL_DIR:/llm/models/ \
-        --shm-size="16g" \
+        --shm-size="64g" \
         --entrypoint=/bin/bash \
         $DOCKER_IMAGE
 
-docker exec -it wan-2.2 bash
+docker exec -it comfyui bash
 
 MODEL_PATH=/llm/models/comfyui/comfyui_models/
 rm -rf /llm/ComfyUI/models
