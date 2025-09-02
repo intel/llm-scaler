@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ======== Base Stage ========
-FROM intel/deep-learning-essentials:2025.1.3-0-devel-ubuntu24.04 AS vllm-base
+FROM amr-registry.caas.intel.com/intelanalytics/llm-scaler-platform:25.38.4.1 AS vllm-base
 
 ARG https_proxy
 ARG http_proxy
@@ -18,7 +18,6 @@ RUN apt-get update -y && \
     # add-apt-repository ppa:deadsnakes/ppa && \
     apt-get update -y && \
     apt-get install -y python3.12 python3.12-dev python3-pip && \
-    # curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
     update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
     apt-get install -y --no-install-recommends --fix-missing \
@@ -36,30 +35,13 @@ RUN apt-get update -y && \
         linux-libc-dev && \
     # Install Intel GPU runtime packages
     apt-get update -y && \
-    apt-get install -y libze1 libze-dev libze-intel-gpu1 intel-opencl-icd libze-intel-gpu-raytracing && \
     apt-get install -y intel-oneapi-dpcpp-ct=2025.1.0-452 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# pin compute runtime version
-# RUN mkdir /tmp/neo && \
-#     cd /tmp/neo && \
-#     wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.12.5/intel-igc-core-2_2.12.5+19302_amd64.deb && \
-#     wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.12.5/intel-igc-opencl-2_2.12.5+19302_amd64.deb && \
-#     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-ocloc-dbgsym_25.22.33944.8-0_amd64.ddeb && \
-#     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-ocloc_25.22.33944.8-0_amd64.deb && \
-#     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-opencl-icd-dbgsym_25.22.33944.8-0_amd64.ddeb && \
-#     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/intel-opencl-icd_25.22.33944.8-0_amd64.deb && \
-#     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libigdgmm12_22.7.0_amd64.deb && \
-#     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libze-intel-gpu1-dbgsym_25.22.33944.8-0_amd64.ddeb && \
-#     wget https://github.com/intel/compute-runtime/releases/download/25.22.33944.8/libze-intel-gpu1_25.22.33944.8-0_amd64.deb && \
-#     dpkg -i *.deb
-
 WORKDIR /llm
-# TODO: update vllm_for_multi_arc.patch
 COPY ./patches/vllm_for_multi_arc.patch /tmp/
 # TODO: update oneccl...
 COPY ./patches/0001-oneccl-align-global-V0.1.1.patch /tmp/
-# COPY ./patches/vllm_int4_for_multi_arc.so /opt/lib/
 
 # Set environment variables early
 ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/local/lib/"
@@ -126,9 +108,6 @@ ARG https_proxy
 # install additional dependencies for openai api server
 RUN pip install accelerate hf_transfer 'modelscope!=1.15.0'
 
-# Install required triton version
-# RUN pip uninstall pytorch-triton-xpu triton -y && \
-#     pip install https://download.pytorch-extension.intel.com/ipex_dev/xpu/triton-3.3.0%2Bgitbd88137b-cp310-cp310-linux_x86_64.whl
 
 # Pin transformers version to avoid conflict in vLLM
 RUN pip install "transformers<4.54.0"
