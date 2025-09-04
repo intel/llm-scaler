@@ -6,6 +6,7 @@ FROM amr-registry.caas.intel.com/intelanalytics/llm-scaler-platform:25.38.4.1
 
 ARG https_proxy
 ARG http_proxy
+ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python3.10/dist-packages/torch/lib:$LD_LIBRARY_PATH"
 
 # Add Intel oneAPI repo and PPA for GPU support
 RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
@@ -13,16 +14,13 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     add-apt-repository -y ppa:kobuk-team/intel-graphics-testing && \
 # Install dependencies and Python 3.10
     apt-get update -y && \
-    apt-get install -y software-properties-common && \
+    apt-get install -y software-properties-common libgl1 && \
     add-apt-repository ppa:deadsnakes/ppa && \
     apt-get update -y && \
     apt-get install -y python3.10 python3.10-distutils python3.10-dev && \
     curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10 && \
-    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
-
-ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python3.10/dist-packages/torch/lib:$LD_LIBRARY_PATH"
-
-RUN pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/xpu && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
+    pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/xpu && \
     pip install intel-extension-for-pytorch==2.7.10+xpu oneccl_bind_pt==2.7.0+xpu --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/cn/ && \
     pip install bigdl-core-xe-all==2.6.0 --extra-index-url https://download.pytorch.org/whl/xpu && \
     apt remove python3-blinker -y && \
@@ -56,6 +54,6 @@ RUN pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url h
     cd comfyui-easy-use && \
     pip install -r requirements.txt
 
-COPY ./workflows/ /llm/ComfyUI/workflows/
+COPY ./workflows/* /llm/ComfyUI/user/default/workflows/
 
 WORKDIR /llm/ComfyUI
