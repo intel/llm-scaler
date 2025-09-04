@@ -9,7 +9,7 @@ bash build.sh
 Run docker image:
 
 ```bash
-export DOCKER_IMAGE=llm-scaler-visualai:latest-comfyui
+export DOCKER_IMAGE=intel/llm-scaler-visual-ai:0.1-b1
 export CONTAINER_NAME=comfyui
 export MODEL_DIR=<your_model_dir>
 sudo docker run -itd \
