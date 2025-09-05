@@ -2471,11 +2471,10 @@ sudo docker run -td \
     --network=my-overlay \
     --device=/dev/dri \
     --name=node-1 \
-    -v /home/intel/LLM:/llm/models/ \
-    -v /home/intel/shaojun/:/llm/shaojun/ \
+    -v /model_path:/llm/models/ \
     -e no_proxy=localhost,127.0.0.1 \
-    -e http_proxy="http://proxy.ims.intel.com:911" \
-    -e https_proxy="http://proxy.ims.intel.com:911" \
+    -e http_proxy=$http_proxy \
+    -e https_proxy=$https_proxy \
     --shm-size="32g" \
     --entrypoint /bin/bash \
     intel/llm-scaler-vllm:0.10.0-b2
@@ -2489,11 +2488,10 @@ sudo docker run -td \
     --network=my-overlay \
     --device=/dev/dri \
     --name=node-2 \
-    -v /home/intel/LLM:/llm/models/ \
-    -v /home/intel/shaojun/:/llm/shaojun/ \
+    -v /model_path:/llm/models/ \
     -e no_proxy=localhost,127.0.0.1 \
-    -e http_proxy="http://proxy.ims.intel.com:911" \
-    -e https_proxy="http://proxy.ims.intel.com:911" \
+    -e http_proxy=$http_proxy \
+    -e https_proxy=$https_proxy \
     --shm-size="32g" \
     --entrypoint /bin/bash \
     intel/llm-scaler-vllm:0.10.0-b2
