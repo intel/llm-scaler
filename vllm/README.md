@@ -20,11 +20,12 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    2.4 [Multi-Modal Model Support](#24-multi-modal-model-support)  
    2.5 [Omni Model Support](#25-omni-model-support)  
    2.6 [Data Parallelism (DP)](#26-data-parallelism-dp)  
-   2.7 [Finding maximum Context Length](#27-finding-maximum-context-length)  
-   2.8 [Multi-Modal Webui](#28-multi-modal-webui)
-3. [Supported Models](#3-supported-models)  
-4. [Troubleshooting](#4-troubleshooting)
-5. [Performance tuning](#5-performance-tuning)
+   2.7 [Finding maximum Context Length](#27-finding-maximum-context-length)   
+   2.8 [Multi-Modal Webui](#28-multi-modal-webui)  
+   2.9 [Multi-node Distributed Deployment (PP/TP)](#29-multi-node-distributed-deployment-pptp)
+4. [Supported Models](#3-supported-models)  
+5. [Troubleshooting](#4-troubleshooting)
+6. [Performance tuning](#5-performance-tuning)
 
 ---
 
@@ -2421,6 +2422,224 @@ The project provides two optimized interfaces for interacting with Qwen2.5-VL mo
 | `--quantization fp8` | XPU acceleration | Required |
 | `-tp=2` | Tensor parallelism | Match GPU count |
 | `--max-model-len` | Context window | 32768 (max) |
+
+---
+
+
+### 2.9 Multi-node Distributed Deployment (PP/TP)
+
+Supports multi-node distributed deployment with **pipeline parallelism (PP)** and **tensor parallelism (TP)**, using **Docker Swarm, SSH, MPI, and Ray**. This enables scaling across multiple machines with coordinated communication.
+
+---
+
+#### **Step 1. Setup Docker Swarm**
+
+On **Machine A (Node-1)**:
+
+```bash
+docker swarm init --advertise-addr <MachineA_IP>
+```
+
+On **Machine B (Node-2)** (use the join command printed from Machine A):
+
+```bash
+docker swarm join --token <token> <MachineA_IP>:2377
+```
+
+Create overlay network (on any node):
+
+```bash
+docker network create --driver overlay --attachable my-overlay
+```
+
+Check cluster:
+
+```bash
+docker node ls
+docker network ls --filter driver=overlay
+```
+
+---
+
+#### **Step 2. Start Containers**
+
+**Node-1:**
+
+```bash
+sudo docker run -td \
+    --privileged \
+    --network=my-overlay \
+    --device=/dev/dri \
+    --name=node-1 \
+    -v /home/intel/LLM:/llm/models/ \
+    -v /home/intel/shaojun/:/llm/shaojun/ \
+    -e no_proxy=localhost,127.0.0.1 \
+    -e http_proxy="http://proxy.ims.intel.com:911" \
+    -e https_proxy="http://proxy.ims.intel.com:911" \
+    --shm-size="32g" \
+    --entrypoint /bin/bash \
+    intel/llm-scaler-vllm:0.10.0-b2
+```
+
+**Node-2:**
+
+```bash
+sudo docker run -td \
+    --privileged \
+    --network=my-overlay \
+    --device=/dev/dri \
+    --name=node-2 \
+    -v /home/intel/LLM:/llm/models/ \
+    -v /home/intel/shaojun/:/llm/shaojun/ \
+    -e no_proxy=localhost,127.0.0.1 \
+    -e http_proxy="http://proxy.ims.intel.com:911" \
+    -e https_proxy="http://proxy.ims.intel.com:911" \
+    --shm-size="32g" \
+    --entrypoint /bin/bash \
+    intel/llm-scaler-vllm:0.10.0-b2
+```
+
+Enter container:
+
+```bash
+docker exec -it node-1 bash
+```
+
+---
+
+#### **Step 3. Configure Hostname and SSH**
+
+Inside each container:
+
+```bash
+hostname node-1   # on Node-1
+hostname node-2   # on Node-2
+```
+
+Install networking & SSH:
+
+```bash
+apt update && apt install -y iputils-ping openssh-client openssh-server net-tools
+```
+
+Start SSH:
+
+```bash
+mkdir -p /var/run/sshd
+/usr/sbin/sshd
+```
+
+Enable root login (`/etc/ssh/sshd_config`):
+
+```
+PermitRootLogin yes
+PasswordAuthentication yes
+```
+
+Restart SSH:
+
+```bash
+pkill sshd
+/usr/sbin/sshd
+```
+
+Set root password:
+
+```bash
+passwd
+# use: rootpass123
+```
+
+Verify SSH port:
+
+```bash
+netstat -tlnp | grep :22
+```
+
+Generate SSH key (Node-1):
+
+```bash
+ssh-keygen -t rsa -b 4096 -C "user@domain"
+ssh-copy-id root@node-2
+```
+
+Test login:
+
+```bash
+ssh node-2
+```
+
+Repeat same setup on **Node-2**.
+
+---
+
+#### **Step 4. Run MPI Tests**
+
+Using hostnames:
+
+```bash
+mpirun -np 2 -ppn 1 -hosts node-1,node-2 hostname
+```
+
+Benchmark test:
+
+```bash
+mpirun -np 2 -ppn 1 -hosts node-1,node-2 /llm/models/benchmark
+```
+
+---
+
+#### **Step 5. Start Ray Cluster**
+
+**On Node-1 (Head):**
+
+```bash
+export VLLM_HOST_IP=10.0.1.19
+ray start --block --head --port=6379 --num-gpus=1 --node-ip-address=10.0.1.19
+```
+
+**On Node-2 (Worker):**
+
+```bash
+export VLLM_HOST_IP=10.0.1.20
+ray start --block --address=10.0.1.19:6379 --num-gpus=1
+```
+
+---
+
+#### **Step 6. Launch vLLM Service**
+
+Run on **Node-1**:
+
+```bash
+export MODEL_NAME="/llm/models/Qwen2.5-7B-Instruct"
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
+export CCL_ATL_TRANSPORT=ofi
+export VLLM_HOST_IP=10.0.1.19
+
+python3 -m vllm.entrypoints.openai.api_server \
+    --model $MODEL_NAME \
+    --dtype=float16 \
+    --enforce-eager \
+    --port 8005 \
+    --host 0.0.0.0 \
+    --trust-remote-code \
+    --disable-sliding-window \
+    --gpu-memory-util=0.9 \
+    --no-enable-prefix-caching \
+    --max-num-batched-tokens=8192 \
+    --disable-log-requests \
+    --max-model-len=20000 \
+    --block-size 64 \
+    --served-model-name test \
+    -tp=2 -pp=1 \
+    --distributed-executor-backend ray
+```
+
+---
+At this point, multi-node distributed inference with **PP + TP** is running, coordinated by **Ray** across Node-1 and Node-2.
 
 ---
 
