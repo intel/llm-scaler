@@ -8033,7 +8033,7 @@ index 0661933ac..469d88a05 100644
 -    Currently, we load the model at original precision before quantizing down to 8-bits, so you need enough memory to load the whole model.
 +    Currently, by default we load the model at original precision before quantizing down to 8-bits, so you need enough memory to load the whole model. To avoid this, adding `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1` can allow offloading weights to cpu before quantization and quantized weights will be kept in device.
 diff --git a/docs/models/supported_models.md b/docs/models/supported_models.md
-index c8b6c6c86..46e754658 100644
+index c8b6c6c86..404045306 100644
 --- a/docs/models/supported_models.md
 +++ b/docs/models/supported_models.md
 @@ -592,7 +592,8 @@ Specified using `--task generate`.
@@ -8051,7 +8051,7 @@ index c8b6c6c86..46e754658 100644
  | `LlavaOnevisionForConditionalGeneration` | LLaVA-Onevision | T + I<sup>+</sup> + V<sup>+</sup> | `llava-hf/llava-onevision-qwen2-7b-ov-hf`, `llava-hf/llava-onevision-qwen2-0.5b-ov-hf`, etc. | | ✅︎ | ✅︎ |
  | `MiniCPMO` | MiniCPM-O | T + I<sup>E+</sup> + V<sup>E+</sup> + A<sup>E+</sup> | `openbmb/MiniCPM-o-2_6`, etc. | ✅︎ | ✅︎ | ✅︎ |
 -| `MiniCPMV` | MiniCPM-V | T + I<sup>E+</sup> + V<sup>E+</sup> | `openbmb/MiniCPM-V-2` (see note), `openbmb/MiniCPM-Llama3-V-2_5`, `openbmb/MiniCPM-V-2_6`, etc. | ✅︎ | | ✅︎ |
-+| `MiniCPMV` | MiniCPM-V | T + I<sup>E+</sup> + V<sup>E+</sup> | `openbmb/MiniCPM-V-2` (see note), `openbmb/MiniCPM-Llama3-V-2_5`, `openbmb/MiniCPM-V-2_6`, `openbmb/MiniCPM-V-4`, etc. | ✅︎ | | ✅︎ |
++| `MiniCPMV` | MiniCPM-V | T + I<sup>E+</sup> + V<sup>E+</sup> | `openbmb/MiniCPM-V-2` (see note), `openbmb/MiniCPM-Llama3-V-2_5`, `openbmb/MiniCPM-V-2_6`, `openbmb/MiniCPM-V-4`, `openbmb/MiniCPM-V-4_5`, etc. | ✅︎ | | ✅︎ |
  | `MiniMaxVL01ForConditionalGeneration` | MiniMax-VL | T + I<sup>E+</sup> | `MiniMaxAI/MiniMax-VL-01`, etc. | | ✅︎ | ✅︎ |
  | `Mistral3ForConditionalGeneration` | Mistral3 (HF Transformers) | T + I<sup>+</sup> | `mistralai/Mistral-Small-3.1-24B-Instruct-2503`, etc. | ✅︎ | ✅︎ | ✅︎ |
  | `MllamaForConditionalGeneration` | Llama 3.2 | T + I<sup>+</sup> | `meta-llama/Llama-3.2-90B-Vision-Instruct`, `meta-llama/Llama-3.2-11B-Vision`, etc. | | | |
@@ -8293,7 +8293,7 @@ index 354771482..d86f643d3 100644
  # Install torch_xla
  --pre
 diff --git a/requirements/xpu.txt b/requirements/xpu.txt
-index 0d95dc571..082c6b2a6 100644
+index 0d95dc571..170c09928 100644
 --- a/requirements/xpu.txt
 +++ b/requirements/xpu.txt
 @@ -11,14 +11,10 @@ jinja2>=3.1.6
@@ -8313,7 +8313,7 @@ index 0d95dc571..082c6b2a6 100644
 -intel-extension-for-pytorch==2.7.10+xpu
 -oneccl_bind_pt==2.7.0+xpu
 ---extra-index-url=https://pytorch-extension.intel.com/release-whl/stable/xpu/us/
-+intel-extension-for-pytorch @ https://ubit-artifactory-ba.intel.com/artifactory/aipc_releases-ba-local//gpu/new/validation/IPEX/nightly/PVC/UBUNTU/VLLM_nightly/20250820/48933bfea/intel_extension_for_pytorch-2.8.10.post0+xpu-cp312-cp312-linux_x86_64.whl
++intel-extension-for-pytorch @ https://intel-extension-for-pytorch.s3.us-east-1.amazonaws.com/ipex_dev/xpu/intel_extension_for_pytorch-2.8.10.post0%2Bxpu-cp312-cp312-linux_x86_64.whl
 diff --git a/run_benchmark_with_profile.sh b/run_benchmark_with_profile.sh
 new file mode 100644
 index 000000000..fe4dbc268
@@ -8750,7 +8750,7 @@ index 000000000..2d8cd49ed
 +                                     mm_kwargs=mm_kwargs)
 +                vllm_model.apply_model(valid_func)
 diff --git a/tests/models/registry.py b/tests/models/registry.py
-index 84ca0bc60..0bec8d359 100644
+index 84ca0bc60..3e36c18af 100644
 --- a/tests/models/registry.py
 +++ b/tests/models/registry.py
 @@ -373,7 +373,10 @@ _MULTIMODAL_EXAMPLE_MODELS = {
@@ -8770,7 +8770,7 @@ index 84ca0bc60..0bec8d359 100644
                                  trust_remote_code=True),
      "MiniCPMV": _HfExamplesInfo("openbmb/MiniCPM-Llama3-V-2_5",
 -                                extras={"2.6": "openbmb/MiniCPM-V-2_6"},  # noqa: E501
-+                                extras={"2.6": "openbmb/MiniCPM-V-2_6", "4.0": "openbmb/MiniCPM-V-4"},  # noqa: E501
++                                extras={"2.6": "openbmb/MiniCPM-V-2_6", "4.0": "openbmb/MiniCPM-V-4", "4.5": "openbmb/MiniCPM-V-4_5"},  # noqa: E501
                                  trust_remote_code=True),
      "MiniMaxVL01ForConditionalGeneration": _HfExamplesInfo("MiniMaxAI/MiniMax-VL-01", # noqa: E501
                                                trust_remote_code=True,
@@ -13319,10 +13319,23 @@ index 48ec611df..09e6d8af7 100644
                      continue
              for param_name, weight_name, shard_id in stacked_params_mapping:
 diff --git a/vllm/model_executor/models/minicpmv.py b/vllm/model_executor/models/minicpmv.py
-index 70f2d4a64..3aa16bb9a 100644
+index 70f2d4a64..816ea00d2 100644
 --- a/vllm/model_executor/models/minicpmv.py
 +++ b/vllm/model_executor/models/minicpmv.py
-@@ -38,6 +38,8 @@ from typing_extensions import TypeVar
+@@ -27,17 +27,21 @@ import math
+ from collections import defaultdict
+ from collections.abc import Iterable, Mapping, Sequence
+ from functools import partial
++from itertools import chain
+ from typing import Any, Callable, Literal, Optional, TypedDict, Union
+ 
+ import numpy as np
+ import torch
+ import torch.types
+ from torch import nn
++from torch.nn.init import trunc_normal_
+ from transformers import BatchFeature, PretrainedConfig
+ from typing_extensions import TypeVar
  
  from vllm.config import VllmConfig
  from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -13331,7 +13344,203 @@ index 70f2d4a64..3aa16bb9a 100644
  from vllm.model_executor.layers.resampler import (BaseResampler, Resampler2,
                                                    get_2d_sincos_pos_embed)
  from vllm.model_executor.model_loader.utils import set_default_torch_dtype
-@@ -331,17 +333,17 @@ class MiniCPMVProcessingInfo(BaseProcessingInfo):
+@@ -45,6 +49,7 @@ from vllm.model_executor.models.llama import LlamaForCausalLM
+ from vllm.model_executor.models.minicpm import MiniCPMForCausalLM
+ from vllm.model_executor.models.module_mapping import MultiModelKeys
+ from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
++from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM
+ from vllm.model_executor.sampling_metadata import SamplingMetadata
+ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalKwargs
+ from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalFieldConfig,
+@@ -203,6 +208,187 @@ class Resampler2_5(BaseResampler):
+         return x
+ 
+ 
++class Resampler4_5(Resampler2_5):
++
++    def __init__(self,
++                 num_queries: int,
++                 embed_dim: int,
++                 num_heads: int,
++                 kv_dim: Optional[int] = None,
++                 norm_layer: Callable[[int], nn.LayerNorm] = DEFAULT_LN,
++                 max_size: tuple[int, int] = (70, 70),
++                 max_temporal_size: int = 36000,
++                 quant_config: Optional[QuantizationConfig] = None,
++                 prefix: str = "") -> None:
++        super().__init__(num_queries,
++                         embed_dim,
++                         num_heads,
++                         kv_dim,
++                         norm_layer,
++                         max_size,
++                         quant_config=quant_config,
++                         prefix=prefix)
++
++        trunc_normal_(self.query, std=.02)
++        self.max_temporal_size = max_temporal_size
++        self._set_temporal_pos_cache(self.max_temporal_size)
++        self.apply(self._init_weights)
++
++    def get_1d_sincos_pos_embed_from_temporal_size(self, embed_dim: int,
++                                                   pos: np.ndarray):
++        """
++        embed_dim: output dimension for each position
++        pos: a list of positions to be encoded: size (M,)
++        out: (M, D)
++        """
++        assert embed_dim % 2 == 0
++        omega = np.arange(embed_dim // 2, dtype=np.float32)
++        omega /= embed_dim / 2.
++        omega = 1. / 10000**omega  # (D/2,)
++
++        pos = pos.reshape(-1)  # (M,)
++        out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
++
++        emb_sin = np.sin(out)  # (M, D/2)
++        emb_cos = np.cos(out)  # (M, D/2)
++
++        emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
++        return emb
++
++    def _set_temporal_pos_cache(self,
++                                max_temporal_size: int,
++                                device: torch.types.Device = "cpu") -> None:
++        temporal_size = np.arange(max_temporal_size, dtype=np.float32)
++        pos_embed = torch.from_numpy(
++            self.get_1d_sincos_pos_embed_from_temporal_size(
++                self.embed_dim, temporal_size)).float().to(device)
++        self.register_buffer("temporal_pos_embed", pos_embed, persistent=False)
++
++    def _adjust_temporal_pos_cache(self,
++                                   max_temporal_size: int,
++                                   device: torch.types.Device = "cpu"):
++        if max_temporal_size > self.max_temporal_size:
++            self.max_temporal_size = max_temporal_size
++            self._set_temporal_pos_cache(self.max_temporal_size, device)
++
++    def _init_weights(self, m: Union[nn.Linear, nn.LayerNorm]):
++        if isinstance(m, nn.Linear):
++            trunc_normal_(m.weight, std=.02)
++            if isinstance(m, nn.Linear) and m.bias is not None:
++                nn.init.constant_(m.bias, 0)
++        elif isinstance(m, nn.LayerNorm):
++            nn.init.constant_(m.bias, 0)
++            nn.init.constant_(m.weight, 1.0)
++
++    def forward(
++        self,
++        x: torch.Tensor,
++        tgt_sizes: torch.Tensor,
++        # temporal_ids for high refresh rate videos
++        temporal_ids=None
++    ) -> torch.Tensor:
++        assert x.shape[0] == tgt_sizes.shape[0]
++        bs = x.shape[0]
++
++        device = x.device
++        dtype = x.dtype
++
++        patch_len = tgt_sizes[:, 0] * tgt_sizes[:, 1]
++
++        self._adjust_pos_cache(tgt_sizes, device=device)
++
++        temporal_pos_emb = False
++        temporal_ids_flatten = None
++        if temporal_ids is not None:
++            # example: [[-1], [-1], [2, 6, 9]]
++            temporal_ids_flatten = list(chain.from_iterable(temporal_ids))
++            max_temporal_size = max(temporal_ids_flatten, default=0)
++            if max_temporal_size > -1:
++                temporal_pos_emb = True
++            if max_temporal_size > self.max_temporal_size:
++                self._adjust_temporal_pos_cache(max_temporal_size, device)
++
++        max_patch_len = patch_len.max().item()
++        assert isinstance(max_patch_len, int)
++
++        key_padding_mask = torch.zeros((bs, max_patch_len),
++                                       dtype=torch.bool,
++                                       device=device)
++
++        x, _ = self.kv_proj(x)  # B * L * D
++        x = self.ln_kv(x).permute(1, 0, 2)  # L * B * D
++        q = self.ln_q(self.query)  # Q * D
++
++        pos_embed_2d = []
++        pos_embed_temporal = []
++        for i in range(bs):
++            tgt_h, tgt_w = tgt_sizes[i]
++            if temporal_pos_emb:
++                if temporal_ids_flatten[i] == -1:
++                    pos_embed_temporal.append(
++                        torch.zeros(self.embed_dim, dtype=dtype,
++                                    device=device))
++                else:
++                    pos_embed_temporal.append(self.temporal_pos_embed[
++                        temporal_ids_flatten[i]].to(dtype))  # D
++
++            pos_embed_2d.append(self.pos_embed[:tgt_h, :tgt_w, :].reshape(
++                (tgt_h * tgt_w, -1)).to(dtype))  # patches * D
++            key_padding_mask[i, patch_len[i]:] = True
++
++        pos_embed_2d = torch.nn.utils.rnn.pad_sequence(
++            pos_embed_2d, batch_first=True,
++            padding_value=0.0).permute(1, 0, 2)  # BLD => L * B * D
++
++        k = x
++        v = x + pos_embed_2d
++        if pos_embed_temporal:
++            k += torch.stack(pos_embed_temporal, dim=0)
++            bs = len(temporal_ids)
++            merge_k = []
++            merge_v = []
++            merge_key_padding_mask = []
++
++            start = 0
++            for tp in temporal_ids:
++                end = start + len(tp)
++                # L * (end-start) * D -> (end-start) * L * D
++                # -> 1 * L*(end-start) * D
++                merge_k.append(k[:, start:end, :].permute(1, 0, 2).reshape(
++                    -1, self.embed_dim))
++                merge_v.append(v[:, start:end, :].permute(1, 0, 2).reshape(
++                    -1, self.embed_dim))
++                merge_key_padding_mask.append(
++                    key_padding_mask[start:end, :].reshape(-1, 1))
++
++                start = end
++
++            k = torch.nn.utils.rnn.pad_sequence(merge_k,
++                                                batch_first=True,
++                                                padding_value=0.0).permute(
++                                                    1, 0, 2)  # L*(end-start)
++            v = torch.nn.utils.rnn.pad_sequence(merge_v,
++                                                batch_first=True,
++                                                padding_value=0.0).permute(
++                                                    1, 0, 2)  # L*(end-start)
++            key_padding_mask = torch.nn.utils.rnn.pad_sequence(
++                merge_key_padding_mask, batch_first=True,
++                padding_value=True).squeeze(-1)
++
++        out = self.attn(
++            self._repeat(q, bs),  # Q * B * D
++            k,  # L * B * D +  L * B * D
++            v,
++            key_padding_mask=key_padding_mask,
++        )[0]
++        #  out: Q * B * D
++        x = out.permute(1, 0, 2)  # B * Q * D
++
++        x = self.ln_post(x)
++        x = x @ self.proj
++        return x
++
++
+ def get_version_by_config(config: PretrainedConfig) -> tuple[int, ...]:
+     version_float = getattr(config, "version", None)
+ 
+@@ -331,17 +517,15 @@ class MiniCPMVProcessingInfo(BaseProcessingInfo):
  
          return hf_processor
  
@@ -13348,23 +13557,20 @@ index 70f2d4a64..3aa16bb9a 100644
      def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
          mm_limits = {"image": None}
 -        if self.get_model_version() == (2, 6):
-+        if self.get_model_version() == (2,
-+                                        6) or self.get_model_version() == (4,
-+                                                                           0):
++        if self.get_model_version() in {(2, 6), (4, 0), (4, 5)}:
              mm_limits["video"] = None
  
          return mm_limits
-@@ -622,7 +624,8 @@ class MiniCPMVMultiModalProcessor(BaseMultiModalProcessor[_I]):
+@@ -622,7 +806,7 @@ class MiniCPMVMultiModalProcessor(BaseMultiModalProcessor[_I]):
          out_keys: set[str],
      ) -> dict[str, NestedTensors]:
          # This processor supports zipping prompt and mm_data together
 -        if self.info.get_model_version() == (2, 6):
-+        if self.info.get_model_version() == (
-+                2, 6) or self.info.get_model_version() == (4, 0):
++        if self.info.get_model_version() in {(2, 6), (4, 0), (4, 5)}:
              inputs = super()._call_hf_processor(
                  prompt=prompts,  # type: ignore
                  mm_data=mm_data,
-@@ -681,10 +684,18 @@ class MiniCPMVMultiModalProcessor(BaseMultiModalProcessor[_I]):
+@@ -681,10 +865,18 @@ class MiniCPMVMultiModalProcessor(BaseMultiModalProcessor[_I]):
          hf_processor_mm_kwargs: Mapping[str, object],
          out_mm_kwargs: MultiModalKwargs,
      ) -> Sequence[PromptUpdate]:
@@ -13387,7 +13593,7 @@ index 70f2d4a64..3aa16bb9a 100644
  
          def get_image_replacement(item_idx: int):
              images = mm_items.get_items(
-@@ -716,9 +727,9 @@ class MiniCPMVMultiModalProcessor(BaseMultiModalProcessor[_I]):
+@@ -716,9 +908,9 @@ class MiniCPMVMultiModalProcessor(BaseMultiModalProcessor[_I]):
  
          return [
              PromptReplacement(modality=modality,
@@ -13399,7 +13605,7 @@ index 70f2d4a64..3aa16bb9a 100644
          ]
  
      def _get_mm_fields_config(
-@@ -1264,11 +1275,124 @@ class MiniCPMV2_6(MiniCPMVBaseModel, SupportsLoRA):
+@@ -1264,11 +1456,234 @@ class MiniCPMV2_6(MiniCPMVBaseModel, SupportsLoRA):
  
          return self.resampler(vision_embedding, tgt_sizes)
  
@@ -13515,16 +13721,126 @@ index 70f2d4a64..3aa16bb9a 100644
 +                                   skip_prefixes=["apm.", "audio", "tts"])
 +        return loader.load_weights(weights)
 +
++
++class MiniCPMV4_5(MiniCPMVBaseModel, SupportsLoRA):
++    packed_modules_mapping = {
++        "qkv_proj": [
++            "q_proj",
++            "k_proj",
++            "v_proj",
++        ],
++        "gate_up_proj": [
++            "gate_proj",
++            "up_proj",
++        ],
++    }
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        super().__init__(vllm_config=vllm_config, prefix=prefix)
++        assert self.version == (4, 5)
++
++    def _maybe_ignore_quant_config(self, quant_config: QuantizationConfig):
++        if isinstance(quant_config, (AWQConfig, AWQMarlinConfig)):
++            return None
++        return quant_config
++
++    def init_llm(
++        self,
++        vllm_config: VllmConfig,
++        prefix: str = "",
++    ) -> nn.Module:
++        return Qwen3ForCausalLM(vllm_config=vllm_config, prefix=prefix)
++
++    def init_vision_module(
++        self,
++        config: PretrainedConfig,
++        quant_config: Optional[QuantizationConfig] = None,
++        prefix: str = "",
++    ) -> nn.Module:
++        quant_config = self._maybe_ignore_quant_config(quant_config)
++        model = Idefics2VisionTransformer(config.vision_config,
++                                          quant_config=quant_config,
++                                          prefix=prefix)
++        if self.config.drop_vision_last_layer:
++            model.encoder.layers = model.encoder.layers[:-1]
++        return model
++
++    def init_resampler(
++        self,
++        embed_dim: int,
++        vision_dim: int,
++        quant_config: Optional[QuantizationConfig] = None,
++        prefix: str = "",
++    ) -> nn.Module:
++        quant_config = self._maybe_ignore_quant_config(quant_config)
++        with set_default_torch_dtype(torch.float16):
++            # The resampler in 4.0 remains consistent with the one in 2.5/2.6.
++            resampler = Resampler4_5(num_queries=self.config.query_num,
++                                     embed_dim=embed_dim,
++                                     num_heads=embed_dim // 128,
++                                     kv_dim=vision_dim,
++                                     quant_config=quant_config,
++                                     prefix=prefix)
++
++        return resampler.to(device=current_platform.device_type,
++                            dtype=torch.get_default_dtype())
++
++    def get_vision_hidden_states(
++            self, data: MiniCPMVImagePixelInputs) -> torch.Tensor:
++        pixel_values = data["pixel_values"]
++        tgt_sizes = data["tgt_sizes"]
++        temporal_ids = data.get('temporal_ids', None)
++
++        B = len(pixel_values)
++        P = pixel_values[0].shape[-2]
++        L = max(item.shape[-1] for item in pixel_values)
++        device = pixel_values[0].device
++        dtype = pixel_values[0].dtype
++
++        all_pixel_values = torch.zeros((B, 3, P, L),
++                                       dtype=dtype,
++                                       device=device)
++        all_temporal_ids = None if temporal_ids is None else flatten_2d_lists(
++            temporal_ids)
++        for i, pixel_values_item in enumerate(pixel_values):
++            L_item = pixel_values_item.shape[-1]
++            all_pixel_values[i, ..., :L_item] = pixel_values_item
++
++        num_patches = tgt_sizes.prod(-1)
++        max_patches = num_patches.max().item()
++        assert isinstance(max_patches, int)
++
++        patch_attn_mask = torch.zeros((B, max_patches),
++                                      dtype=torch.bool,
++                                      device=device)
++        for i, num_patches_item in enumerate(num_patches):
++            patch_attn_mask[i, :num_patches_item] = True
++
++        vision_embedding = self.vpm(
++            all_pixel_values,
++            patch_attention_mask=patch_attn_mask.unsqueeze(1),
++            tgt_sizes=tgt_sizes,
++        )
++
++        return self.resampler(vision_embedding, tgt_sizes, all_temporal_ids)
++
++    def load_weights(self, weights: Iterable[tuple[str,
++                                                   torch.Tensor]]) -> set[str]:
++        loader = AutoWeightsLoader(self,
++                                   skip_prefixes=["apm.", "audio", "tts"])
++        return loader.load_weights(weights)
++
  
  _SUPPORT_VERSION = {
      (2, 0): MiniCPMV2_0,
      (2, 5): MiniCPMV2_5,
      (2, 6): MiniCPMV2_6,
 +    (4, 0): MiniCPMV4_0,
++    (4, 5): MiniCPMV4_5,
  }
  
  
-@@ -1296,8 +1420,10 @@ class MiniCPMV(MiniCPMVBaseModel, SupportsMultiModal, SupportsLoRA):
+@@ -1296,8 +1711,10 @@ class MiniCPMV(MiniCPMVBaseModel, SupportsMultiModal, SupportsLoRA):
          # Dispatch class based on version
          instance_cls = _SUPPORT_VERSION.get(version)
          if instance_cls is None:
@@ -14152,6 +14468,135 @@ index 51c78ddc1..93bf5ec25 100644
      plugins = load_plugins_by_group(group=DEFAULT_PLUGINS_GROUP)
      # general plugins, we only need to execute the loaded functions
      for func in plugins.values():
+diff --git a/vllm/transformers_utils/chat_templates/registry.py b/vllm/transformers_utils/chat_templates/registry.py
+index e0ef7f099..d09c5fa92 100644
+--- a/vllm/transformers_utils/chat_templates/registry.py
++++ b/vllm/transformers_utils/chat_templates/registry.py
+@@ -20,6 +20,16 @@ def _get_qwen_chat_template_fallback(
+     return CHAT_TEMPLATES_DIR / "template_basic.jinja"
+ 
+ 
++def _get_minicpmv_chat_template_fallback(
++        tokenizer_name_or_path: str) -> Optional[Path]:
++    # MiniCPM-V-4.5 version uses a dedicated template
++    if "4.5" in tokenizer_name_or_path or "4_5" in tokenizer_name_or_path:
++        return CHAT_TEMPLATES_DIR / "template_minicpmv45.jinja"
++
++    # Other versions use chatml template
++    return CHAT_TEMPLATES_DIR / "template_chatml.jinja"
++
++
+ # yapf: disable
+ _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK: dict[str, ChatTemplatePath] = {
+     "blip-2": CHAT_TEMPLATES_DIR / "template_blip2.jinja",
+@@ -27,6 +37,7 @@ _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK: dict[str, ChatTemplatePath] = {
+     "deepseek_vl_v2": CHAT_TEMPLATES_DIR / "template_deepseek_vl2.jinja",
+     "florence2": CHAT_TEMPLATES_DIR / "template_basic.jinja",
+     "fuyu": CHAT_TEMPLATES_DIR / "template_fuyu.jinja",
++    "minicpmv": _get_minicpmv_chat_template_fallback,
+     "paligemma": CHAT_TEMPLATES_DIR / "template_basic.jinja",
+     "qwen": _get_qwen_chat_template_fallback,
+ }
+diff --git a/vllm/transformers_utils/chat_templates/template_minicpmv45.jinja b/vllm/transformers_utils/chat_templates/template_minicpmv45.jinja
+new file mode 100644
+index 000000000..661ebd1cf
+--- /dev/null
++++ b/vllm/transformers_utils/chat_templates/template_minicpmv45.jinja
+@@ -0,0 +1,93 @@
++{%- set enable_thinking = enable_thinking | default(false) %}
++{%- if tools %}
++    {{- '<|im_start|>system\n' }}
++    {%- if messages[0].role == 'system' %}
++        {{- messages[0].content + '\n\n' }}
++    {%- endif %}
++    {{- "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
++    {%- for tool in tools %}
++        {{- "\n" }}
++        {{- tool | tojson }}
++    {%- endfor %}
++    {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
++{%- else %}
++    {%- if messages[0].role == 'system' %}
++        {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
++    {%- endif %}
++{%- endif %}
++
++{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
++{%- for message in messages[::-1] %}
++    {%- set index = (messages|length - 1) - loop.index0 %}
++    {%- if ns.multi_step_tool and message.role == "user" and not(message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}
++        {%- set ns.multi_step_tool = false %}
++        {%- set ns.last_query_index = index %}
++    {%- endif %}
++{%- endfor %}
++
++{%- for message in messages %}
++    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
++        {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>' + '\n' }}
++    {%- elif message.role == "assistant" %}
++        {%- set content = message.content %}
++        {%- set reasoning_content = '' %}
++        {%- if message.reasoning_content is defined and message.reasoning_content is not none %}
++            {%- set reasoning_content = message.reasoning_content %}
++        {%- else %}
++            {%- if '</think>' in message.content %}
++                {%- set content = message.content.split('</think>')[-1].lstrip('\n') %}
++                {%- set reasoning_content = message.content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
++            {%- endif %}
++        {%- endif %}
++        {%- if loop.index0 > ns.last_query_index %}
++            {%- if loop.last or (not loop.last and reasoning_content) %}
++                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
++            {%- else %}
++                {{- '<|im_start|>' + message.role + '\n' + content }}
++            {%- endif %}
++        {%- else %}
++            {{- '<|im_start|>' + message.role + '\n' + content }}
++        {%- endif %}
++
++        {%- if message.tool_calls %}
++            {%- for tool_call in message.tool_calls %}
++                {%- if (loop.first and content) or (not loop.first) %}
++                    {{- '\n' }}
++                {%- endif %}
++                {%- if tool_call.function %}
++                    {%- set tool_call = tool_call.function %}
++                {%- endif %}
++                {{- '<tool_call>\n{"name": "' }}
++                {{- tool_call.name }}
++                {{- '", "arguments": ' }}
++                {%- if tool_call.arguments is string %}
++                    {{- tool_call.arguments }}
++                {%- else %}
++                    {{- tool_call.arguments | tojson }}
++                {%- endif %}
++                {{- '}\n</tool_call>' }}
++            {%- endfor %}
++        {%- endif %}
++        {{- '<|im_end|>\n' }}
++    {%- elif message.role == "tool" %}
++        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
++            {{- '<|im_start|>user' }}
++        {%- endif %}
++        {{- '\n<tool_response>\n' }}
++        {{- message.content }}
++        {{- '\n</tool_response>' }}
++        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
++            {{- '<|im_end|>\n' }}
++        {%- endif %}
++    {%- endif %}
++{%- endfor %}
++
++{%- if add_generation_prompt %}
++    {{- '<|im_start|>assistant\n' }}
++    {%- if enable_thinking is defined and enable_thinking is false %}
++        {{- '<think>\n\n</think>\n\n' }}
++    {%- endif %}
++    {%- if enable_thinking is defined and enable_thinking is true %}
++        {{- '<think>\n' }}
++    {%- endif %}
++{%- endif %}
+\ No newline at end of file
 diff --git a/vllm/transformers_utils/config.py b/vllm/transformers_utils/config.py
 index 8d1f59e6e..0d96bcfef 100644
 --- a/vllm/transformers_utils/config.py
