@@ -15,16 +15,20 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
 # Install dependencies and Python 3.10
     apt-get update -y && \
     apt-get install -y software-properties-common libgl1 && \
+    apt-get install -y libxrender1 libxfixes3 libx11-dev libxi6 libxxf86vm1 libxcursor1 libxrandr2 libxinerama1 libxkbcommon0 libsm6 && \
     add-apt-repository ppa:deadsnakes/ppa && \
     apt-get update -y && \
     apt-get install -y python3.10 python3.10-distutils python3.10-dev && \
     curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
-    pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/xpu && \
-    pip install intel-extension-for-pytorch==2.7.10+xpu oneccl_bind_pt==2.7.0+xpu --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/cn/ && \
+    pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/xpu && \
+    pip install intel-extension-for-pytorch==2.8.10+xpu oneccl_bind_pt==2.8.0+xpu --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/cn/ && \
     pip install bigdl-core-xe-all==2.6.0 --extra-index-url https://download.pytorch.org/whl/xpu && \
     apt remove python3-blinker -y && \
-# Install xDit related dependencies
+    wget https://download.blender.org/pypi/bpy/bpy-4.0.0-cp310-cp310-manylinux_2_28_x86_64.whl && \
+    pip install bpy-4.0.0-cp310-cp310-manylinux_2_28_x86_64.whl && \
+    rm bpy-4.0.0-cp310-cp310-manylinux_2_28_x86_64.whl && \
+    # Install xDit related dependencies
     mkdir /llm && \
     cd /llm && \
     ln -s /usr/bin/python3 /usr/bin/python && \
