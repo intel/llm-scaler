@@ -14896,7 +14896,7 @@ index fc8649d58..b7d1b84cc 100644
  
  
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index 7779b559c..9989fe371 100644
+index 7779b559c..346638da3 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
 @@ -109,6 +109,12 @@ class EngineCore:
@@ -14912,24 +14912,6 @@ index 7779b559c..9989fe371 100644
          self.scheduler: SchedulerInterface = Scheduler(
              vllm_config=vllm_config,
              kv_cache_config=kv_cache_config,
-@@ -261,7 +267,7 @@ class EngineCore:
- 
-         # Check for any requests remaining in the scheduler - unfinished,
-         # or finished and not yet removed from the batch.
--        if not self.scheduler.has_requests():
-+        if not self.scheduler.has_unfinished_requests():
-             return {}, False
-         scheduler_output = self.scheduler.schedule()
-         model_output = self.execute_model_with_error_logging(
-@@ -655,7 +661,7 @@ class EngineCoreProc(EngineCore):
-         """Exits when an engine step needs to be performed."""
- 
-         waited = False
--        while not self.engines_running and not self.scheduler.has_requests():
-+        while not self.engines_running and not self.scheduler.has_unfinished_requests():
-             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
-                 logger.debug("EngineCore waiting for work.")
-                 waited = True
 diff --git a/vllm/v1/executor/abstract.py b/vllm/v1/executor/abstract.py
 index 50b9634a4..1649b8ff7 100644
 --- a/vllm/v1/executor/abstract.py
