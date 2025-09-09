@@ -2660,6 +2660,13 @@ At this point, multi-node distributed inference with **PP + TP** is running, coo
 |       GLM-4.5-Air                 |        language MOE model         |                                 |
 |       Qwen2-VL-7B-Instruct        |        multimodal model           |                                 |
 |       MiniCPM-V-2.6               |        multimodal model           | use bf16 to avoid nan error     |
+|       MiniCPM-V-4                 |        multimodal model           | use bf16 to avoid nan error     |
+|       MiniCPM-V-4.5               |        multimodal model           |                                 |
+|       InternVL2-8B                |        multimodal model           |                                 |
+|       InternVL3-8B                |        multimodal model           |                                 |
+|       InternVL3_5-8B              |        multimodal model           |                                 |
+|       GLM-4.1V-Thinking           |        multimodal model           |                                 |
+|       dots.ocr                    |        multimodal model           |                                 |
 |       Qwen2.5-VL 7B/32B/72B       |        multimodal model           | pip install transformers==4.52.4         |
 |       UI-TARS-7B-DPO              |        multimodal model           | pip install transformers==4.49.0         |
 |       Gemma-3-12B                 |        multimodal model           | only can run bf16 with no quantization   |
