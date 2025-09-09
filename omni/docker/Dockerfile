@@ -15,7 +15,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
 # Install dependencies and Python 3.10
     apt-get update -y && \
     apt-get install -y software-properties-common libgl1 && \
-    apt-get install -y libxrender1 libxfixes3 libx11-dev libxi6 libxxf86vm1 libxcursor1 libxrandr2 libxinerama1 libxkbcommon0 libsm6 && \
+    apt-get install -y libxrender1 libxfixes3 libx11-dev libxi6 libxxf86vm1 libxcursor1 libxrandr2 libxinerama1 libxkbcommon0 libsm6 ffmpeg && \
     add-apt-repository ppa:deadsnakes/ppa && \
     apt-get update -y && \
     apt-get install -y python3.10 python3.10-distutils python3.10-dev && \
