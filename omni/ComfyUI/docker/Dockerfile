@@ -22,7 +22,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
     pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/xpu && \
-    pip install intel-extension-for-pytorch==2.8.10+xpu oneccl_bind_pt==2.8.0+xpu --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/cn/ && \
+    pip install oneccl_bind_pt==2.8.0+xpu --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/cn/ && \
     pip install bigdl-core-xe-all==2.6.0 --extra-index-url https://download.pytorch.org/whl/xpu && \
     apt remove python3-blinker -y && \
     wget https://download.blender.org/pypi/bpy/bpy-4.0.0-cp310-cp310-manylinux_2_28_x86_64.whl && \
