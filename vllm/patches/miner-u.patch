@@ -1,0 +1,53 @@
+diff --git a/mineru/backend/pipeline/pipeline_analyze.py b/mineru/backend/pipeline/pipeline_analyze.py
+index de933059..6c421595 100644
+--- a/mineru/backend/pipeline/pipeline_analyze.py
++++ b/mineru/backend/pipeline/pipeline_analyze.py
+@@ -125,7 +125,7 @@ def doc_analyze(
+             f'Batch {index + 1}/{len(batch_images)}: '
+             f'{processed_images_count} pages/{len(images_with_extra_info)} pages'
+         )
+-        batch_results = batch_image_analyze(batch_image, formula_enable, table_enable)
++        batch_results = batch_image_analyze(batch_image, formula_enable, table_enable, len(images_with_extra_info))
+         results.extend(batch_results)
+
+     # 构建返回结果
+@@ -149,7 +149,9 @@ def doc_analyze(
+ def batch_image_analyze(
+         images_with_extra_info: List[Tuple[PIL.Image.Image, bool, str]],
+         formula_enable=True,
+-        table_enable=True):
++        table_enable=True,
++        paths=0,
++        ):
+     # os.environ['CUDA_VISIBLE_DEVICES'] = str(idx)
+
+     from .batch_analyze import BatchAnalyze
+@@ -198,6 +200,15 @@ def batch_image_analyze(
+     else:
+         enable_ocr_det_batch = True
+
++    batch_ratio = 16
++    min_path =  int(os.getenv('MIN_ENABLE_OCR_DET_BATCH_PATH', 20))
++    if paths >= min_path:
++        enable_ocr_det_batch = True
++    print(f"enable_ocr_det_batch: {enable_ocr_det_batch}")
++
++    batch_model = BatchAnalyze(model_manager, batch_ratio, formula_enable, table_enable, enable_ocr_det_batch)
++
++
+     batch_model = BatchAnalyze(model_manager, batch_ratio, formula_enable, table_enable, enable_ocr_det_batch)
+     results = batch_model(images_with_extra_info)
+
+diff --git a/mineru/utils/config_reader.py b/mineru/utils/config_reader.py
+index f6d013ea..85a70ede 100644
+--- a/mineru/utils/config_reader.py
++++ b/mineru/utils/config_reader.py
+@@ -79,6 +79,8 @@ def get_device():
+     else:
+         if torch.cuda.is_available():
+             return "cuda"
++        elif torch.xpu.is_available():
++            return "xpu"
+         elif torch.backends.mps.is_available():
+             return "mps"
+         else:

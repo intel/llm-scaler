@@ -40,6 +40,7 @@ RUN apt-get update -y && \
 
 WORKDIR /llm
 COPY ./patches/vllm_for_multi_arc.patch /tmp/
+COPY ./patches/miner-u.patch /tmp/
 
 # Set environment variables early
 ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/local/lib/"
@@ -56,6 +57,15 @@ RUN git clone -b v0.10.0 https://github.com/vllm-project/vllm.git && \
     pip install --no-cache-dir -r requirements/xpu.txt && \
     export CPATH=/opt/intel/oneapi/dpcpp-ct/2025.1/include/:${CPATH} && \
     python3 setup.py install
+
+# Clone + patch miner-U
+RUN git clone https://github.com/opendatalab/MinerU.git && \
+    git checkout de41fa58590263e43b783fe224b6d07cae290a33 && \
+    cd MinerU && \
+    git apply /tmp/miner-u.patch && \
+    pip install -e .[core] && \
+    sed -i 's/select_device(self.args.device, verbose=verbose)/torch.device(self.args.device)/' /usr/local/lib/python3.12/dist-packages/ultralytics/engine/predictor.py
+
 
 # ======= Add oneCCL build =======
 # RUN apt-get update && apt-get install -y \
