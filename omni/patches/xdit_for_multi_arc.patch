@@ -1,0 +1,919 @@
+diff --git a/benchmark/fid/compute_fid.py b/benchmark/fid/compute_fid.py
+index ee64747..6c06543 100644
+--- a/benchmark/fid/compute_fid.py
++++ b/benchmark/fid/compute_fid.py
+@@ -15,14 +15,14 @@ def setup_logging():
+         ]
+     )
+ 
+-def compute_fid_score(ref_path: str, sample_path: str, device: str = "cuda") -> float:
++def compute_fid_score(ref_path: str, sample_path: str, device: str = "xpu") -> float:
+     """
+     Compute FID score
+     
+     Args:
+         ref_path: Path to ref images directory
+         sample_path: Path to sample images directory
+-        device: Computing device ('cuda' or 'cpu')
++        device: Computing device ('xpu' or 'cpu')
+     
+     Returns:
+         float: FID score
+@@ -69,8 +69,8 @@ def main():
+                       help='Path to ref images directory')
+     parser.add_argument('--sample', type=str, required=True,
+                       help='Path to sample images directory')
+-    parser.add_argument('--device', type=str, default="cuda",
+-                      choices=['cuda', 'cpu'], help='Computing device')
++    parser.add_argument('--device', type=str, default="xpu",
++                      choices=['xpu', 'cpu'], help='Computing device')
+     
+     args = parser.parse_args()
+     
+diff --git a/benchmark/fid/flux_generate.py b/benchmark/fid/flux_generate.py
+index 7bf7ed7..f1ab121 100644
+--- a/benchmark/fid/flux_generate.py
++++ b/benchmark/fid/flux_generate.py
+@@ -16,7 +16,7 @@ CFG = 1.5
+ 
+ def flush():
+     gc.collect()
+-    torch.cuda.empty_cache()
++    torch.xpu.empty_cache()
+ 
+ def main():
+     parser = FlexibleArgumentParser(description='xFuser Arguments')
+@@ -38,7 +38,7 @@ def main():
+         pipe.enable_sequential_cpu_offload(gpu_id=local_rank)
+         logging.info(f'rank {local_rank} sequential CPU offload enabled')
+     else:
+-        pipe = pipe.to(f'cuda:{local_rank}')
++        pipe = pipe.to(f'xpu:{local_rank}')
+ 
+     pipe.prepare_run(input_config, steps=1)
+ 
+@@ -64,7 +64,7 @@ def main():
+             output_type=input_config.output_type,
+             max_sequence_length=256,
+             guidance_scale=CFG,
+-            generator=torch.Generator(device='cuda').manual_seed(input_config.seed),
++            generator=torch.Generator(device='xpu').manual_seed(input_config.seed),
+         )
+         if input_config.output_type == 'pil':
+             if pipe.is_dp_last_group():
+diff --git a/benchmark/fid/pixartalpha_generate.py b/benchmark/fid/pixartalpha_generate.py
+index cd12db7..04c08dc 100644
+--- a/benchmark/fid/pixartalpha_generate.py
++++ b/benchmark/fid/pixartalpha_generate.py
+@@ -16,7 +16,7 @@ CFG = 2.0
+ 
+ def flush():
+     gc.collect()
+-    torch.cuda.empty_cache()
++    torch.xpu.empty_cache()
+ 
+ def main():
+     parser = FlexibleArgumentParser(description='xFuser Arguments')
+@@ -31,13 +31,13 @@ def main():
+         pretrained_model_name_or_path=engine_config.model_config.model,
+         engine_config=engine_config,
+         torch_dtype=torch.float16,
+-    ).to(f"cuda:{local_rank}")
++    ).to(f"xpu:{local_rank}")
+ 
+     if args.enable_sequential_cpu_offload:
+         pipe.enable_sequential_cpu_offload(gpu_id=local_rank)
+         logging.info(f'rank {local_rank} sequential CPU offload enabled')
+     else:
+-        pipe = pipe.to(f'cuda:{local_rank}')
++        pipe = pipe.to(f'xpu:{local_rank}')
+ 
+     pipe.prepare_run(input_config, steps=1)
+ 
+@@ -63,7 +63,7 @@ def main():
+             output_type=input_config.output_type,
+             max_sequence_length=256,
+             guidance_scale=CFG,
+-            generator=torch.Generator(device='cuda').manual_seed(input_config.seed),
++            generator=torch.Generator(device='xpu').manual_seed(input_config.seed),
+         )
+         if input_config.output_type == 'pil':
+             if pipe.is_dp_last_group():
+diff --git a/docs/developer/adding_models/adding_model_cfg.md b/docs/developer/adding_models/adding_model_cfg.md
+index 0ed916c..8ff1349 100644
+--- a/docs/developer/adding_models/adding_model_cfg.md
++++ b/docs/developer/adding_models/adding_model_cfg.md
+@@ -51,7 +51,7 @@ Ensure the model checkpoint is loaded on all GPUs by copying the pipe from the C
+ ```python
+ from xfuser.core.distributed import get_world_group
+ local_rank = get_world_group().local_rank
+-device = torch.device(f"cuda:{local_rank}")
++device = torch.device(f"xpu:{local_rank}")
+ pipe.to(device)
+ ```
+ 
+diff --git a/docs/developer/adding_models/adding_model_cfg.py b/docs/developer/adding_models/adding_model_cfg.py
+index c0cebe6..c67fa2f 100644
+--- a/docs/developer/adding_models/adding_model_cfg.py
++++ b/docs/developer/adding_models/adding_model_cfg.py
+@@ -76,21 +76,21 @@ if __name__ == "__main__":
+         torch_dtype=torch.bfloat16,
+     )
+     local_rank = get_world_group().local_rank
+-    device = torch.device(f"cuda:{local_rank}")
++    device = torch.device(f"xpu:{local_rank}")
+     pipe = pipe.to(device)
+ 
+     pipe.vae.enable_tiling()
+ 
+     parallelize_transformer(pipe)
+     
+-    torch.cuda.reset_peak_memory_stats()
++    torch.xpu.reset_peak_memory_stats()
+     start_time = time.time()
+ 
+     output = pipe(
+         num_frames=9,
+         prompt="A little girl is riding a bicycle at high speed. Focused, detailed, realistic.",
+         num_inference_steps=20,
+-        generator=torch.Generator(device="cuda").manual_seed(42),
++        generator=torch.Generator(device="xpu").manual_seed(42),
+     ).frames[0]
+ 
+     end_time = time.time()
+diff --git a/docs/developer/adding_models/adding_model_cfg_usp.py b/docs/developer/adding_models/adding_model_cfg_usp.py
+index 16f8a70..ca41260 100644
+--- a/docs/developer/adding_models/adding_model_cfg_usp.py
++++ b/docs/developer/adding_models/adding_model_cfg_usp.py
+@@ -239,21 +239,21 @@ if __name__ == "__main__":
+         torch_dtype=torch.bfloat16,
+     )
+     local_rank = get_world_group().local_rank
+-    device = torch.device(f"cuda:{local_rank}")
++    device = torch.device(f"xpu:{local_rank}")
+     pipe = pipe.to(device)
+ 
+     pipe.vae.enable_tiling()
+ 
+     parallelize_transformer(pipe)
+ 
+-    torch.cuda.reset_peak_memory_stats()
++    torch.xpu.reset_peak_memory_stats()
+     start_time = time.time()
+ 
+     output = pipe(
+         num_frames=9,
+         prompt="A little girl is riding a bicycle at high speed. Focused, detailed, realistic.",
+         num_inference_steps=20,
+-        generator=torch.Generator(device="cuda").manual_seed(42),
++        generator=torch.Generator(device="xpu").manual_seed(42),
+     ).frames[0]
+ 
+     end_time = time.time()
+diff --git a/docs/developer/adding_models/adding_model_usp.md b/docs/developer/adding_models/adding_model_usp.md
+index b183162..b0e062f 100644
+--- a/docs/developer/adding_models/adding_model_usp.md
++++ b/docs/developer/adding_models/adding_model_usp.md
+@@ -69,7 +69,7 @@ Ensure that the model checkpoint is loaded on all GPUs. `diffusers` place the mo
+ ```python
+ from xfuser.core.distributed import get_world_group
+ local_rank = get_world_group().local_rank
+-device = torch.device(f"cuda:{local_rank}")
++device = torch.device(f"xpu:{local_rank}")
+ pipe.to(device)
+ ```
+ 
+diff --git a/docs/developer/adding_models/adding_model_usp.py b/docs/developer/adding_models/adding_model_usp.py
+index 1492ad1..5cf7982 100644
+--- a/docs/developer/adding_models/adding_model_usp.py
++++ b/docs/developer/adding_models/adding_model_usp.py
+@@ -231,21 +231,21 @@ if __name__ == "__main__":
+         torch_dtype=torch.bfloat16,
+     )
+     local_rank = get_world_group().local_rank
+-    device = torch.device(f"cuda:{local_rank}")
++    device = torch.device(f"xpu:{local_rank}")
+     pipe = pipe.to(device)
+ 
+     pipe.vae.enable_tiling()
+ 
+     parallelize_transformer(pipe)
+ 
+-    torch.cuda.reset_peak_memory_stats()
++    torch.xpu.reset_peak_memory_stats()
+     start_time = time.time()
+ 
+     output = pipe(
+         num_frames=9,
+         prompt="A little girl is riding a bicycle at high speed. Focused, detailed, realistic.",
+         num_inference_steps=20,
+-        generator=torch.Generator(device="cuda").manual_seed(42),
++        generator=torch.Generator(device="xpu").manual_seed(42),
+     ).frames[0]
+ 
+     end_time = time.time()
+diff --git a/docs/developer/adding_models/adding_model_usp_text_replica.py b/docs/developer/adding_models/adding_model_usp_text_replica.py
+index c39228b..ed2edfc 100644
+--- a/docs/developer/adding_models/adding_model_usp_text_replica.py
++++ b/docs/developer/adding_models/adding_model_usp_text_replica.py
+@@ -239,21 +239,21 @@ if __name__ == "__main__":
+         torch_dtype=torch.bfloat16,
+     )
+     local_rank = get_world_group().local_rank
+-    device = torch.device(f"cuda:{local_rank}")
++    device = torch.device(f"xpu:{local_rank}")
+     pipe = pipe.to(device)
+ 
+     pipe.vae.enable_tiling()
+ 
+     parallelize_transformer(pipe)
+ 
+-    torch.cuda.reset_peak_memory_stats()
++    torch.xpu.reset_peak_memory_stats()
+     start_time = time.time()
+ 
+     output = pipe(
+         num_frames=9,
+         prompt="A little girl is riding a bicycle at high speed. Focused, detailed, realistic.",
+         num_inference_steps=20,
+-        generator=torch.Generator(device="cuda").manual_seed(42),
++        generator=torch.Generator(device="xpu").manual_seed(42),
+     ).frames[0]
+ 
+     end_time = time.time()
+diff --git a/entrypoints/launch.py b/entrypoints/launch.py
+index 2f39f85..b29d7f8 100644
+--- a/entrypoints/launch.py
++++ b/entrypoints/launch.py
+@@ -92,7 +92,7 @@ class ImageGenerator:
+             pretrained_model_name_or_path=xfuser_args.model,
+             engine_config=self.engine_config,
+             torch_dtype=torch.float16,
+-        ).to("cuda")
++        ).to("xpu")
+         
+         self.pipe.prepare_run(self.input_config)
+         self.logger.info("Model initialization completed")
+@@ -106,7 +106,7 @@ class ImageGenerator:
+                 prompt=request.prompt,
+                 num_inference_steps=request.num_inference_steps,
+                 output_type="pil",
+-                generator=torch.Generator(device="cuda").manual_seed(request.seed),
++                generator=torch.Generator(device="xpu").manual_seed(request.seed),
+                 guidance_scale=request.cfg,
+                 max_sequence_length=self.input_config.max_sequence_length
+             )
+diff --git a/examples/cogvideox_example.py b/examples/cogvideox_example.py
+index 948f3bd..3146dac 100644
+--- a/examples/cogvideox_example.py
++++ b/examples/cogvideox_example.py
+@@ -38,7 +38,7 @@ def main():
+         pipe.enable_model_cpu_offload(gpu_id=local_rank)
+         logging.info(f"rank {local_rank} model CPU offload enabled")
+     else:
+-        device = torch.device(f"cuda:{local_rank}")
++        device = torch.device(f"xpu:{local_rank}")
+         pipe = pipe.to(device)
+ 
+     if args.enable_tiling:
+@@ -54,10 +54,10 @@ def main():
+         num_frames=input_config.num_frames,
+         prompt=input_config.prompt,
+         num_inference_steps=1,
+-        generator=torch.Generator(device="cuda").manual_seed(input_config.seed),
++        generator=torch.Generator(device="xpu").manual_seed(input_config.seed),
+     ).frames[0]
+ 
+-    torch.cuda.reset_peak_memory_stats()
++    torch.xpu.reset_peak_memory_stats()
+     start_time = time.time()
+ 
+     output = pipe(
+@@ -67,12 +67,12 @@ def main():
+         prompt=input_config.prompt,
+         num_inference_steps=input_config.num_inference_steps,
+         guidance_scale=input_config.guidance_scale,
+-        generator=torch.Generator(device="cuda").manual_seed(input_config.seed),
++        generator=torch.Generator(device="xpu").manual_seed(input_config.seed),
+     ).frames[0]
+ 
+     end_time = time.time()
+     elapsed_time = end_time - start_time
+-    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    peak_memory = torch.xpu.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     parallel_info = (
+         f"dp{engine_args.data_parallel_degree}_cfg{engine_config.parallel_config.cfg_degree}_"
+diff --git a/examples/cogvideox_usp_example.py b/examples/cogvideox_usp_example.py
+index 56e5485..3623b25 100644
+--- a/examples/cogvideox_usp_example.py
++++ b/examples/cogvideox_usp_example.py
+@@ -147,7 +147,7 @@ def main():
+         pipe.enable_model_cpu_offload(gpu_id=local_rank)
+         logging.info(f"rank {local_rank} model CPU offload enabled")
+     else:
+-        device = torch.device(f"cuda:{local_rank}")
++        device = torch.device(f"xpu:{local_rank}")
+         pipe = pipe.to(device)
+ 
+     if args.enable_tiling:
+@@ -156,7 +156,7 @@ def main():
+     if args.enable_slicing:
+         pipe.vae.enable_slicing()
+     
+-    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     initialize_runtime_state(pipe, engine_config)
+     get_runtime_state().set_video_input_parameters(
+@@ -199,7 +199,7 @@ def main():
+ 
+     end_time = time.time()
+     elapsed_time = end_time - start_time
+-    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     parallel_info = (
+         f"dp{engine_args.data_parallel_degree}_cfg{engine_config.parallel_config.cfg_degree}_"
+diff --git a/examples/consisid_example.py b/examples/consisid_example.py
+index 26346bf..e3eefd5 100644
+--- a/examples/consisid_example.py
++++ b/examples/consisid_example.py
+@@ -36,7 +36,7 @@ def main():
+         print(f"Base Model already exists in {engine_config.model_config.model}, skipping download.")
+ 
+     # 2. Load Pipeline
+-    device = torch.device(f"cuda:{local_rank}")
++    device = torch.device(f"xpu:{local_rank}")
+     pipe = xFuserConsisIDPipeline.from_pretrained(
+         pretrained_model_name_or_path=engine_config.model_config.model,
+         engine_config=engine_config,
+@@ -96,7 +96,7 @@ def main():
+ 
+     end_time = time.time()
+     elapsed_time = end_time - start_time
+-    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     parallel_info = (
+         f"dp{engine_args.data_parallel_degree}_cfg{engine_config.parallel_config.cfg_degree}_"
+diff --git a/examples/consisid_usp_example.py b/examples/consisid_usp_example.py
+index 4db1cbb..7299601 100644
+--- a/examples/consisid_usp_example.py
++++ b/examples/consisid_usp_example.py
+@@ -141,7 +141,7 @@ def main():
+         print(f"Base Model already exists in {engine_config.model_config.model}, skipping download.")
+ 
+     # 2. Load Pipeline
+-    device = torch.device(f"cuda:{local_rank}")
++    device = torch.device(f"xpu:{local_rank}")
+     pipe = ConsisIDPipeline.from_pretrained(
+         pretrained_model_name_or_path=engine_config.model_config.model,
+         torch_dtype=torch.bfloat16,
+@@ -165,7 +165,7 @@ def main():
+     if args.enable_slicing:
+         pipe.vae.enable_slicing()
+ 
+-    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     initialize_runtime_state(pipe, engine_config)
+     get_runtime_state().set_video_input_parameters(
+@@ -233,7 +233,7 @@ def main():
+ 
+     end_time = time.time()
+     elapsed_time = end_time - start_time
+-    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     parallel_info = (
+         f"dp{engine_args.data_parallel_degree}_cfg{engine_config.parallel_config.cfg_degree}_"
+diff --git a/examples/flux_control_example.py b/examples/flux_control_example.py
+index 5bdb298..e386598 100644
+--- a/examples/flux_control_example.py
++++ b/examples/flux_control_example.py
+@@ -50,9 +50,9 @@ def main():
+         pipe.enable_sequential_cpu_offload(gpu_id=local_rank)
+         logging.info(f"rank {local_rank} sequential CPU offload enabled")
+     else:
+-        pipe = pipe.to(f"cuda:{local_rank}")
++        pipe = pipe.to(f"xpu:{local_rank}")
+ 
+-    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     pipe.prepare_run(input_config, steps=input_config.num_inference_steps)
+ 
+@@ -74,7 +74,7 @@ def main():
+     )
+     end_time = time.time()
+     elapsed_time = end_time - start_time
+-    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     parallel_info = (
+         f"dp{engine_args.data_parallel_degree}_cfg{engine_config.parallel_config.cfg_degree}_"
+diff --git a/examples/flux_example.py b/examples/flux_example.py
+index 9e0ac84..48b5a46 100644
+--- a/examples/flux_example.py
++++ b/examples/flux_example.py
+@@ -53,9 +53,9 @@ def main():
+         pipe.enable_sequential_cpu_offload(gpu_id=local_rank)
+         logging.info(f"rank {local_rank} sequential CPU offload enabled")
+     else:
+-        pipe = pipe.to(f"cuda:{local_rank}")
++        pipe = pipe.to(f"xpu:{local_rank}")
+ 
+-    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     pipe.prepare_run(input_config, steps=input_config.num_inference_steps)
+ 
+@@ -73,7 +73,7 @@ def main():
+     )
+     end_time = time.time()
+     elapsed_time = end_time - start_time
+-    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     parallel_info = (
+         f"dp{engine_args.data_parallel_degree}_cfg{engine_config.parallel_config.cfg_degree}_"
+diff --git a/examples/flux_usp_example.py b/examples/flux_usp_example.py
+index 1f3287c..5aea6dd 100644
+--- a/examples/flux_usp_example.py
++++ b/examples/flux_usp_example.py
+@@ -106,9 +106,9 @@ def main():
+         pipe.enable_sequential_cpu_offload(gpu_id=local_rank)
+         logging.info(f"rank {local_rank} sequential CPU offload enabled")
+     else:
+-        pipe = pipe.to(f"cuda:{local_rank}")
++        pipe = pipe.to(f"xpu:{local_rank}")
+ 
+-    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     initialize_runtime_state(pipe, engine_config)
+     get_runtime_state().set_input_parameters(
+@@ -151,7 +151,7 @@ def main():
+     )
+     end_time = time.time()
+     elapsed_time = end_time - start_time
+-    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     parallel_info = (
+         f"dp{engine_args.data_parallel_degree}_cfg{engine_config.parallel_config.cfg_degree}_"
+diff --git a/examples/hunyuan_video_usp_example.py b/examples/hunyuan_video_usp_example.py
+index 03856f1..501732e 100644
+--- a/examples/hunyuan_video_usp_example.py
++++ b/examples/hunyuan_video_usp_example.py
+@@ -248,7 +248,7 @@ def main():
+         pipe.enable_model_cpu_offload(gpu_id=local_rank)
+         logging.info(f"rank {local_rank} model CPU offload enabled")
+     else:
+-        device = torch.device(f"cuda:{local_rank}")
++        device = torch.device(f"xpu:{local_rank}")
+         pipe = pipe.to(device)
+ 
+     if args.enable_tiling:
+@@ -266,7 +266,7 @@ def main():
+         pipe.vae.enable_slicing()
+ 
+     parameter_peak_memory = torch.cuda.max_memory_allocated(
+-        device=f"cuda:{local_rank}")
++        device=f"xpu:{local_rank}")
+ 
+     if engine_config.runtime_config.use_torch_compile:
+         torch._inductor.config.reorder_for_compute_comm_overlap = True
+@@ -301,7 +301,7 @@ def main():
+ 
+     end_time = time.time()
+     elapsed_time = end_time - start_time
+-    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     parallel_info = (
+         f"dp{engine_args.data_parallel_degree}_cfg{engine_config.parallel_config.cfg_degree}_"
+diff --git a/examples/hunyuandit_example.py b/examples/hunyuandit_example.py
+index 50c6bb5..5da7bbd 100644
+--- a/examples/hunyuandit_example.py
++++ b/examples/hunyuandit_example.py
+@@ -32,9 +32,9 @@ def main():
+         engine_config=engine_config,
+         torch_dtype=torch.float16,
+         text_encoder_2=text_encoder_2,
+-    ).to(f"cuda:{local_rank}")
++    ).to(f"xpu:{local_rank}")
+ 
+-    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     pipe.prepare_run(input_config)
+ 
+@@ -52,7 +52,7 @@ def main():
+     )
+     end_time = time.time()
+     elapsed_time = end_time - start_time
+-    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     parallel_info = (
+         f"dp{engine_args.data_parallel_degree}_cfg{engine_config.parallel_config.cfg_degree}_"
+diff --git a/examples/latte_example.py b/examples/latte_example.py
+index 6e88aa5..d0d7b77 100644
+--- a/examples/latte_example.py
++++ b/examples/latte_example.py
+@@ -24,14 +24,14 @@ def main():
+         pretrained_model_name_or_path=engine_config.model_config.model,
+         engine_config=engine_config,
+         torch_dtype=torch.float16,
+-    ).to(f"cuda:{local_rank}")
++    ).to(f"xpu:{local_rank}")
+     # pipe.latte_prepare_run(input_config)
+ 
+     vae = AutoencoderKLTemporalDecoder.from_pretrained(
+         engine_config.model_config.model,
+         subfolder="vae_temporal_decoder",
+         torch_dtype=torch.float16,
+-    ).to(f"cuda:{local_rank}")
++    ).to(f"xpu:{local_rank}")
+     pipe.vae = vae
+ 
+     torch.cuda.reset_peak_memory_stats()
+@@ -48,7 +48,7 @@ def main():
+     )
+     end_time = time.time()
+     elapsed_time = end_time - start_time
+-    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     parallel_info = (
+         f"dp{engine_args.data_parallel_degree}_cfg{engine_config.parallel_config.cfg_degree}_"
+diff --git a/examples/pixartalpha_example.py b/examples/pixartalpha_example.py
+index 63847d4..eb5bfc0 100644
+--- a/examples/pixartalpha_example.py
++++ b/examples/pixartalpha_example.py
+@@ -32,8 +32,8 @@ def main():
+         engine_config=engine_config,
+         torch_dtype=torch.float16,
+         text_encoder=text_encoder,
+-    ).to(f"cuda:{local_rank}")
+-    model_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    ).to(f"xpu:{local_rank}")
++    model_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+     pipe.prepare_run(input_config)
+ 
+     torch.cuda.reset_peak_memory_stats()
+@@ -50,7 +50,7 @@ def main():
+     )
+     end_time = time.time()
+     elapsed_time = end_time - start_time
+-    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     parallel_info = (
+         f"dp{engine_args.data_parallel_degree}_cfg{engine_config.parallel_config.cfg_degree}_"
+diff --git a/examples/pixartsigma_example.py b/examples/pixartsigma_example.py
+index 17cb0bb..56e84c2 100644
+--- a/examples/pixartsigma_example.py
++++ b/examples/pixartsigma_example.py
+@@ -32,7 +32,7 @@ def main():
+         engine_config=engine_config,
+         torch_dtype=torch.float16,
+         text_encoder=text_encoder,
+-    ).to(f"cuda:{local_rank}")
++    ).to(f"xpu:{local_rank}")
+     pipe.prepare_run(input_config)
+ 
+     torch.cuda.reset_peak_memory_stats()
+@@ -50,7 +50,7 @@ def main():
+     )
+     end_time = time.time()
+     elapsed_time = end_time - start_time
+-    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     parallel_info = (
+         f"dp{engine_args.data_parallel_degree}_cfg{engine_config.parallel_config.cfg_degree}_"
+diff --git a/examples/ray/ray_flux_example.py b/examples/ray/ray_flux_example.py
+index 7c05e3e..56a04b1 100644
+--- a/examples/ray/ray_flux_example.py
++++ b/examples/ray/ray_flux_example.py
+@@ -52,7 +52,7 @@ def main():
+         output_type=input_config.output_type,
+         max_sequence_length=256,
+         guidance_scale=0.0,
+-        generator=torch.Generator(device="cuda").manual_seed(input_config.seed),
++        generator=torch.Generator(device="xpu").manual_seed(input_config.seed),
+     )
+     end_time = time.time()
+     elapsed_time = end_time - start_time
+diff --git a/examples/sana_example.py b/examples/sana_example.py
+index 82e9071..9fd32f6 100644
+--- a/examples/sana_example.py
++++ b/examples/sana_example.py
+@@ -41,12 +41,12 @@ def main():
+         pretrained_model_name_or_path=engine_config.model_config.model,
+         engine_config=engine_config,
+         torch_dtype=data_type,
+-    ).to(f"cuda:{local_rank}")
++    ).to(f"xpu:{local_rank}")
+     pipe.vae.to(torch.bfloat16)
+     pipe.text_encoder.to(torch.bfloat16)
+     pipe.vae.enable_tiling(tile_sample_min_width=1024, tile_sample_min_height=1024)
+ 
+-    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     pipe.prepare_run(input_config)
+ 
+@@ -63,7 +63,7 @@ def main():
+     )
+     end_time = time.time()
+     elapsed_time = end_time - start_time
+-    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     parallel_info = (
+         f"dp{engine_args.data_parallel_degree}_cfg{engine_config.parallel_config.cfg_degree}_"
+diff --git a/examples/sana_sprint_example.py b/examples/sana_sprint_example.py
+index 0191feb..ba8fb06 100644
+--- a/examples/sana_sprint_example.py
++++ b/examples/sana_sprint_example.py
+@@ -24,11 +24,11 @@ def main():
+         pretrained_model_name_or_path=engine_config.model_config.model,
+         engine_config=engine_config,
+         torch_dtype=torch.bfloat16,
+-    ).to(f"cuda:{local_rank}")
++    ).to(f"xpu:{local_rank}")
+     pipe.vae.to(torch.bfloat16)
+     pipe.text_encoder.to(torch.bfloat16)
+ 
+-    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     pipe.prepare_run(input_config)
+ 
+@@ -46,7 +46,7 @@ def main():
+     )
+     end_time = time.time()
+     elapsed_time = end_time - start_time
+-    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     parallel_info = (
+         f"dp{engine_args.data_parallel_degree}_cfg{engine_config.parallel_config.cfg_degree}_"
+diff --git a/examples/sd3_example.py b/examples/sd3_example.py
+index 04aba6b..7691172 100644
+--- a/examples/sd3_example.py
++++ b/examples/sd3_example.py
+@@ -32,9 +32,9 @@ def main():
+         engine_config=engine_config,
+         torch_dtype=torch.float16,
+         text_encoder_3=text_encoder_3,
+-    ).to(f"cuda:{local_rank}")
++    ).to(f"xpu:{local_rank}")
+ 
+-    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     pipe.prepare_run(input_config)
+ 
+@@ -51,7 +51,7 @@ def main():
+     )
+     end_time = time.time()
+     elapsed_time = end_time - start_time
+-    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     parallel_info = (
+         f"dp{engine_args.data_parallel_degree}_cfg{engine_config.parallel_config.cfg_degree}_"
+diff --git a/examples/sdxl_example.py b/examples/sdxl_example.py
+index ff8da90..9133958 100644
+--- a/examples/sdxl_example.py
++++ b/examples/sdxl_example.py
+@@ -36,10 +36,10 @@ def main():
+         pipe.enable_sequential_cpu_offload(gpu_id=local_rank)
+         logging.info(f"rank {local_rank} sequential CPU offload enabled")
+     else:
+-        pipe = pipe.to(f"cuda:{local_rank}")
++        pipe = pipe.to(f"xpu:{local_rank}")
+ 
+     # Record initial memory usage
+-    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     # Prepare for inference
+     pipe.prepare_run(input_config, steps=input_config.num_inference_steps)
+@@ -58,7 +58,7 @@ def main():
+     )
+     end_time = time.time()
+     elapsed_time = end_time - start_time
+-    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
++    peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{local_rank}")
+ 
+     # Generate parallel configuration info string
+     parallel_info = (
+diff --git a/tests/context_parallel/test_diffusers_adapters.py b/tests/context_parallel/test_diffusers_adapters.py
+index 97fb57d..545b610 100644
+--- a/tests/context_parallel/test_diffusers_adapters.py
++++ b/tests/context_parallel/test_diffusers_adapters.py
+@@ -144,7 +144,7 @@ class DiffusionPipelineTest(DTensorTestBase):
+ 
+         pipe = self.new_pipe(dtype, device)
+ 
+-        parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{self.rank}")
++        parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"xpu:{self.rank}")
+         print(f"Parameter memory: {parameter_peak_memory / 1e9:.2f} GB")
+ 
+         initialize_runtime_state(pipe, engine_config)
+diff --git a/tests/core/test_xfuser_attn.py b/tests/core/test_xfuser_attn.py
+index d164be1..55ef5a2 100644
+--- a/tests/core/test_xfuser_attn.py
++++ b/tests/core/test_xfuser_attn.py
+@@ -59,7 +59,7 @@ class TestRingFlashAttn(unittest.TestCase):
+         cls.dtype = torch.float16
+ 
+         cls.rank, cls.world_size, cls.ring_degree, cls.ulysses_degree = init_dist()
+-        cls.device = torch.device(f"cuda:{cls.rank}")
++        cls.device = torch.device(f"xpu:{cls.rank}")
+ 
+     def setUp(self):
+         torch.manual_seed(42 + self.rank)
+diff --git a/tests/parallel_test.py b/tests/parallel_test.py
+index 78be80f..144c925 100644
+--- a/tests/parallel_test.py
++++ b/tests/parallel_test.py
+@@ -17,7 +17,7 @@ def main():
+     pipe = StableDiffusion3Pipeline.from_pretrained(
+         pretrained_model_name_or_path=engine_config.model_config.model,
+         torch_dtype=torch.float16,
+-    ).to(f"cuda:{local_rank}")
++    ).to(f"xpu:{local_rank}")
+ 
+     paralleler = xDiTParallel(pipe, engine_config, input_config)
+ 
+diff --git a/xfuser/config/config.py b/xfuser/config/config.py
+index d903c83..68bbbe2 100644
+--- a/xfuser/config/config.py
++++ b/xfuser/config/config.py
+@@ -8,7 +8,7 @@ from torch import distributed as dist
+ 
+ from xfuser.logger import init_logger
+ import xfuser.envs as envs
+-from xfuser.envs import CUDA_VERSION, TORCH_VERSION, PACKAGES_CHECKER
++from xfuser.envs import TORCH_VERSION, PACKAGES_CHECKER
+ 
+ logger = init_logger(__name__)
+ 
+@@ -31,8 +31,8 @@ def check_packages():
+ 
+ def check_env():
+     # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/cudagraph.html
+-    if CUDA_VERSION < version.parse("11.3"):
+-        raise RuntimeError("NCCL CUDA Graph support requires CUDA 11.3 or above")
++    # if CUDA_VERSION < version.parse("11.3"):
++    #     raise RuntimeError("NCCL CUDA Graph support requires CUDA 11.3 or above")
+     if TORCH_VERSION < version.parse("2.2.0"):
+         # https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/
+         raise RuntimeError(
+diff --git a/xfuser/core/distributed/parallel_state.py b/xfuser/core/distributed/parallel_state.py
+index 9130341..d0597b0 100644
+--- a/xfuser/core/distributed/parallel_state.py
++++ b/xfuser/core/distributed/parallel_state.py
+@@ -7,7 +7,7 @@ from typing import List, Optional
+ 
+ import torch
+ import torch.distributed
+-from torch.cuda import set_device, device_count
++# from torch.cuda import set_device, device_count
+ import xfuser.envs as envs
+ from xfuser.logger import init_logger
+ from .group_coordinator import (
+@@ -232,7 +232,7 @@ def init_distributed_environment(
+             world_size=world_size,
+             rank=rank,
+         )
+-        set_device(torch.distributed.get_rank() % device_count())
++        # set_device(torch.distributed.get_rank() % device_count())
+     # set the local rank
+     # local_rank is not available in torch ProcessGroup,
+     # see https://github.com/pytorch/pytorch/issues/122816
+diff --git a/xfuser/core/long_ctx_attention/ring/ring_flash_attn.py b/xfuser/core/long_ctx_attention/ring/ring_flash_attn.py
+index bdc4003..344459c 100644
+--- a/xfuser/core/long_ctx_attention/ring/ring_flash_attn.py
++++ b/xfuser/core/long_ctx_attention/ring/ring_flash_attn.py
+@@ -95,7 +95,8 @@ def xdit_ring_flash_attn_forward(
+             key, value = k, v
+ 
+         if not causal or step <= comm.rank:
+-            fn = select_flash_attn_impl(attn_type, stage="fwd-only", attn_processor=attn_processor)
++            # fn = select_flash_attn_impl(attn_type, stage="fwd-only", attn_processor=attn_processor)
++            fn = pytorch_attn_forward
+             if attn_type == AttnType.FA3: 
+                 block_out, block_lse = fn(
+                     q,
+diff --git a/xfuser/envs.py b/xfuser/envs.py
+index 498782d..a00407a 100644
+--- a/xfuser/envs.py
++++ b/xfuser/envs.py
+@@ -63,11 +63,21 @@ def _is_musa():
+         return False
+ 
+ 
++def _is_xpu():
++    try:
++        if hasattr(torch, "xpu") and torch.xpu.is_available():
++            return True
++    except ModuleNotFoundError:
++        return False
++
++
+ def get_device(local_rank: int) -> torch.device:
+     if torch.cuda.is_available():
+         return torch.device("cuda", local_rank)
+     elif _is_musa():
+         return torch.device("musa", local_rank)
++    elif _is_xpu():
++        return torch.device("xpu", local_rank)
+     else:
+         return torch.device("cpu")
+ 
+@@ -97,6 +107,7 @@ def get_device_version():
+ 
+ 
+ def get_torch_distributed_backend() -> str:
++    return "ccl"
+     if torch.cuda.is_available():
+         return "nccl"
+     elif _is_musa():
+@@ -110,7 +121,7 @@ def get_torch_distributed_backend() -> str:
+ variables: Dict[str, Callable[[], Any]] = {
+     # ================== Other Vars ==================
+     # used in version checking
+-    "CUDA_VERSION": lambda: version.parse(get_device_version()),
++    # "CUDA_VERSION": lambda: version.parse(get_device_version()),
+     "TORCH_VERSION": lambda: version.parse(
+         version.parse(torch.__version__).base_version
+     ),
+@@ -159,6 +170,7 @@ class PackagesEnvChecker:
+         }
+ 
+     def check_flash_attn(self):
++        return False
+         if _is_musa():
+             logger.info(
+                 "Flash Attention library is not supported on MUSA for the moment."
+diff --git a/xfuser/model_executor/pipelines/base_pipeline.py b/xfuser/model_executor/pipelines/base_pipeline.py
+index 94b9d54..454028a 100644
+--- a/xfuser/model_executor/pipelines/base_pipeline.py
++++ b/xfuser/model_executor/pipelines/base_pipeline.py
+@@ -105,7 +105,7 @@ class xFuserVAEWrapper:
+     
+     def execute(self, output_type:str):
+         if self.vae is not None:
+-            device = f"cuda:{get_world_group().local_rank}"
++            device = f"xpu:{get_world_group().local_rank}"
+             rank = get_world_group().rank
+             dit_parallel_size = self.dit_parallel_size
+             dtype = self.dtype
+@@ -573,7 +573,7 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
+             return latents
+ 
+         rank = get_world_group().rank
+-        device = f"cuda:{get_world_group().local_rank}"
++        device = f"xpu:{get_world_group().local_rank}"
+         dit_parallel_size = get_dit_world_size()
+ 
+         # Gather only from DP last groups to the first VAE worker
+@@ -609,7 +609,7 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
+         
+         # ---------gather latents from dp last group-----------
+         rank = get_world_group().rank
+-        device = f"cuda:{get_world_group().local_rank}"
++        device = f"xpu:{get_world_group().local_rank}"
+ 
+         # all gather dp last group rank list
+         dp_rank_list = [torch.zeros(1, dtype=int, device=device) for _ in range(get_world_group().world_size)]
+diff --git a/xfuser/ray/worker/worker.py b/xfuser/ray/worker/worker.py
+index 45a1ada..d25b924 100644
+--- a/xfuser/ray/worker/worker.py
++++ b/xfuser/ray/worker/worker.py
+@@ -72,7 +72,7 @@ class DiTWorker(WorkerBase):
+             pretrained_model_name_or_path=pretrained_model_name_or_path,
+             engine_config=engine_config,
+             **kwargs
+-        ).to(f"cuda:{local_rank}")
++        ).to(f"xpu:{local_rank}")
+         self.pipe = pipe
+         return
+     
+@@ -131,7 +131,7 @@ class VAEWorker(WorkerBase):
+             return_org_pipeline=True,
+             **kwargs
+         ).to("cpu")
+-        vae = getattr(pipe, "vae", None).to(f"cuda:{local_rank}")
++        vae = getattr(pipe, "vae", None).to(f"xpu:{local_rank}")
+         
+         self.vae = xFuserVAEWrapper(
+             vae,

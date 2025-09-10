@@ -8,6 +8,10 @@ ARG https_proxy
 ARG http_proxy
 ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python3.10/dist-packages/torch/lib:$LD_LIBRARY_PATH"
 
+COPY ./patches/yunchang_for_multi_arc.patch /tmp/
+COPY ./patches/xdit_for_multi_arc.patch /tmp/
+COPY ./patches/raylight_for_multi_arc.patch /tmp/
+
 # Add Intel oneAPI repo and PPA for GPU support
 RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
     echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list && \
@@ -32,12 +36,16 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     mkdir /llm && \
     cd /llm && \
     ln -s /usr/bin/python3 /usr/bin/python && \
-    git clone https://github.com/analytics-zoo/long-context-attention.git -b xpu-main && \
+    git clone https://github.com/feifeibear/long-context-attention.git && \
     cd long-context-attention && \
+    git checkout fc5d55e61b78b3102fd824bea1791cf406cc2a4b && \
+    git apply /tmp/yunchang_for_multi_arc.patch && \
     pip install -e . && \
     cd /llm && \
-    git clone https://github.com/analytics-zoo/xDiT.git -b xpu-main && \
+    git clone https://github.com/xdit-project/xDiT.git && \
     cd xDiT && \
+    git checkout fb8fb0e437a8745b9629020759de31d1626a4a7b && \
+    git apply /tmp/xdit_for_multi_arc.patch && \
     pip install -e . && \
 # Install ComfyUI
     cd /llm && \
@@ -50,13 +58,17 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cd comfyui-videohelpersuite && \
     pip install -r requirements.txt && \
     cd .. && \
-    git clone https://github.com/xiangyuT/raylight.git -b xpu_main && \
+    git clone https://github.com/komikndr/raylight.git && \
     cd raylight && \
+    git checkout 290c934cdd498b003fbf083e74e91ffc8edb961a && \
+    git apply /tmp/raylight_for_multi_arc.patch && \
     pip install -r requirements.txt && \
     cd .. && \
     git clone https://github.com/yolain/ComfyUI-Easy-Use.git comfyui-easy-use && \
     cd comfyui-easy-use && \
-    pip install -r requirements.txt
+    pip install -r requirements.txt && \
+    # Clean
+    rm -rf /tmp/*
 
 COPY ./workflows/* /llm/ComfyUI/user/default/workflows/
 

@@ -1,0 +1,154 @@
+diff --git a/yunchang/kernels/attention.py b/yunchang/kernels/attention.py
+index 826d2ab..a1f54fe 100644
+--- a/yunchang/kernels/attention.py
++++ b/yunchang/kernels/attention.py
+@@ -26,6 +26,66 @@ import torch.nn.functional as F
+ import torch
+ aten = torch.ops.aten
+ 
++naned = False
++import torch.nn.functional as F
++
++_original_F_sdpa = F.scaled_dot_product_attention
++def chunk_scaled_dot_product_attention(
++    query,
++    key,
++    value,
++    attn_mask=None,
++    dropout_p=0.0,
++    is_causal=False,
++    scale=None,
++    chunk_size=1024,
++):
++    if chunk_size is None or query.size(2) <= chunk_size:
++        return _original_F_sdpa(
++            query, key, value, attn_mask, dropout_p, is_causal, scale=scale
++        )
++
++    if scale is not None:
++        return _original_F_sdpa(
++            query, key, value, attn_mask, dropout_p, is_causal, scale=scale
++        )
++    
++    if is_causal:
++        warnings.warn("Chunked computation may not work correctly with causal attention. "
++                      "Consider setting chunk_size=None for causal attention.")
++    
++    if dropout_p > 0:
++        warnings.warn("Dropout is applied independently to each chunk, which may "
++                      "result in slightly different behavior compared to non-chunked version.")
++    
++    Lq = query.size(2)
++    query_chunks = torch.split(query, chunk_size, dim=2)
++    
++    mask_chunks = None
++    if attn_mask is not None:
++        split_dim = -2 if attn_mask.dim() >= 2 else 0
++        if attn_mask.size(split_dim) == 1:
++            mask_chunks = [attn_mask] * len(query_chunks)
++        elif attn_mask.size(split_dim) == Lq:
++            mask_chunks = torch.split(attn_mask, chunk_size, dim=split_dim)
++        else:
++            raise ValueError(f"Attention mask size {attn_mask.size()} is incompatible "
++                             f"with query size {query.size()} for chunked computation")
++    else:
++        mask_chunks = [None] * len(query_chunks)
++    
++    output_chunks = []
++    
++    for q_chunk, m_chunk in zip(query_chunks, mask_chunks):
++        chunk_output = F.scaled_dot_product_attention(
++            q_chunk, key, value, 
++            attn_mask=m_chunk,
++            dropout_p=dropout_p,
++            is_causal=is_causal
++        )
++        output_chunks.append(chunk_output)
++    
++    return torch.cat(output_chunks, dim=2)
+ 
+ def pytorch_attn_forward(
+     q: torch.Tensor,
+@@ -51,14 +111,61 @@ def pytorch_attn_forward(
+     v = v.transpose(1, 2)
+ 
+     if op_type == "flash":
+-        out, lse = aten._scaled_dot_product_flash_attention(
+-            q,
+-            k,
+-            v,
+-            dropout_p=dropout_p,
+-            is_causal=causal,
+-            scale=softmax_scale,
+-        )[:2]
++        #out, lse = aten._scaled_dot_product_flash_attention(
++        #    q,
++        #    k,
++        #    v,
++        #    dropout_p=dropout_p,
++        #    is_causal=causal,
++        #    scale=softmax_scale,
++        #)[:2]
++
++        # dtype = torch.float32
++        # out = chunk_scaled_dot_product_attention(
++        #    q.contiguous(),
++        #    k.contiguous(),
++        #    v.contiguous(),
++        #    dropout_p=dropout_p,
++        #    is_causal=causal,
++        #    scale=softmax_scale,
++        #    chunk_size=512,
++        # )
++
++        import xe_addons
++        import math
++        head_size = q.shape[-1]
++        attn_mask = None
++        dtype = torch.float16
++        scale = 1 / math.sqrt(head_size)
++        out = xe_addons.sdp_non_causal(
++            q.contiguous().to(dtype),
++            k.contiguous().to(dtype),
++            v.contiguous().to(dtype),
++            attn_mask,
++            scale)
++        
++        global naned
++        def has_nan(x):
++            return torch.isnan(x).any()
++
++        if not naned:
++            if has_nan(q):
++                print("q naned: ", q.device, " ", q.shape)
++                naned = True
++            if has_nan(k):
++                print("k naned: ", k.device, " ", k.shape)
++                naned = True
++            if has_nan(v):
++                print("v naned: ", v.device, " ", v.shape)
++                naned = True
++            if has_nan(out):
++                print("out naned: ", out.device, " ", out.shape)
++                naned = True
++
++        out = out.contiguous().to(q.dtype)
++        
++        lse = torch.ones((q.shape[0], q.shape[1], q.shape[2]),  device=out.device, dtype=q.dtype)
++        # torch.xpu.empty_cache()
+     elif op_type == "efficient":
+         out, lse = aten._scaled_dot_product_efficient_attention(
+             q,
+diff --git a/yunchang/ring/ring_flashinfer_attn.py b/yunchang/ring/ring_flashinfer_attn.py
+index e8f8bed..3f70a75 100644
+--- a/yunchang/ring/ring_flashinfer_attn.py
++++ b/yunchang/ring/ring_flashinfer_attn.py
+@@ -6,7 +6,7 @@ from .utils import RingComm, update_out_and_lse
+ from yunchang.kernels import select_flash_attn_impl, AttnType
+ import torch.utils.cpp_extension as torch_cpp_ext
+ 
+-torch_cpp_ext._get_cuda_arch_flags()
++# torch_cpp_ext._get_cuda_arch_flags()
+ 
+ 
+ def ring_flashinfer_attn_forward(

@@ -1,0 +1,154 @@
+diff --git a/src/raylight/distributed_worker/ray_worker.py b/src/raylight/distributed_worker/ray_worker.py
+index b3fcd2a..804fd6d 100644
+--- a/src/raylight/distributed_worker/ray_worker.py
++++ b/src/raylight/distributed_worker/ray_worker.py
+@@ -98,6 +98,13 @@ def usp_inject_callback(
+         )
+ 
+ 
++try:
++    import intel_extension_for_pytorch as ipex
++except:
++    pass
++
++import oneccl_bindings_for_pytorch
++
+ class RayWorker:
+     def __init__(self, local_rank, world_size, device_id, parallel_dict):
+         self.model = None
+@@ -109,7 +116,7 @@ class RayWorker:
+ 
+         self.parallel_dict = parallel_dict
+         self.parallel_dict["is_fsdp_wrapped"] = False
+-        self.device = torch.device(f"cuda:{self.device_id}")
++        self.device = torch.device(f"xpu:{self.device_id}")
+ 
+         if self.model is not None:
+             self.is_model_load = True
+@@ -117,9 +124,10 @@ class RayWorker:
+             self.is_model_load = False
+ 
+         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
+-            os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
++            #os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
++            torch.xpu.set_device(local_rank)
+             dist.init_process_group(
+-                "nccl",
++                "ccl",
+                 rank=local_rank,
+                 world_size=self.world_size,
+                 timeout=timedelta(minutes=1)
+@@ -303,8 +311,8 @@ class RayWorker:
+             out["samples"] = samples
+ 
+         # Temporary for reducing change of OOM before VAE
+-        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] == "0":
+-            self.model.detach()
++        #if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] == "0":
++        #    self.model.detach()
+         self.model.detach()
+         comfy.model_management.soft_empty_cache()
+         gc.collect()
+diff --git a/src/raylight/nodes.py b/src/raylight/nodes.py
+index 7a552d8..cff7cb7 100644
+--- a/src/raylight/nodes.py
++++ b/src/raylight/nodes.py
+@@ -50,9 +50,9 @@ class RayInitializer:
+ 
+         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
+         world_size = GPU
+-        max_world_size = torch.cuda.device_count()
+-        if world_size > max_world_size:
+-            raise ValueError("To many gpus")
++        #max_world_size = torch.xpu.device_count()
++        #if world_size > max_world_size:
++        #    raise ValueError("To many gpus")
+         if world_size == 0:
+             raise ValueError("Num of cuda/cudalike device is 0")
+         if world_size < ulysses_degree * ring_degree:
+@@ -101,7 +101,7 @@ class RayInitializer:
+         gpu_actors = []
+         for local_rank in range(world_size):
+             gpu_actors.append(
+-                gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
++                gpu_actor.options(name=f"RayWorker:{local_rank}").remote(
+                     local_rank=local_rank,
+                     world_size=world_size,
+                     device_id=0,
+diff --git a/src/raylight/distributed_worker/ray_worker.py b/src/raylight/distributed_worker/ray_worker.py
+index b3fcd2a..804fd6d 100644
+--- a/src/raylight/distributed_worker/ray_worker.py
++++ b/src/raylight/distributed_worker/ray_worker.py
+@@ -98,6 +98,13 @@ def usp_inject_callback(
+         )
+ 
+ 
++try:
++    import intel_extension_for_pytorch as ipex
++except:
++    pass
++
++import oneccl_bindings_for_pytorch
++
+ class RayWorker:
+     def __init__(self, local_rank, world_size, device_id, parallel_dict):
+         self.model = None
+@@ -109,7 +116,7 @@ class RayWorker:
+ 
+         self.parallel_dict = parallel_dict
+         self.parallel_dict["is_fsdp_wrapped"] = False
+-        self.device = torch.device(f"cuda:{self.device_id}")
++        self.device = torch.device(f"xpu:{self.device_id}")
+ 
+         if self.model is not None:
+             self.is_model_load = True
+@@ -117,9 +124,10 @@ class RayWorker:
+             self.is_model_load = False
+ 
+         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
+-            os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
++            #os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
++            torch.xpu.set_device(local_rank)
+             dist.init_process_group(
+-                "nccl",
++                "ccl",
+                 rank=local_rank,
+                 world_size=self.world_size,
+                 timeout=timedelta(minutes=1)
+@@ -303,8 +311,8 @@ class RayWorker:
+             out["samples"] = samples
+ 
+         # Temporary for reducing change of OOM before VAE
+-        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] == "0":
+-            self.model.detach()
++        #if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] == "0":
++        #    self.model.detach()
+         self.model.detach()
+         comfy.model_management.soft_empty_cache()
+         gc.collect()
+diff --git a/src/raylight/nodes.py b/src/raylight/nodes.py
+index 7a552d8..cff7cb7 100644
+--- a/src/raylight/nodes.py
++++ b/src/raylight/nodes.py
+@@ -50,9 +50,9 @@ class RayInitializer:
+ 
+         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
+         world_size = GPU
+-        max_world_size = torch.cuda.device_count()
+-        if world_size > max_world_size:
+-            raise ValueError("To many gpus")
++        #max_world_size = torch.xpu.device_count()
++        #if world_size > max_world_size:
++        #    raise ValueError("To many gpus")
+         if world_size == 0:
+             raise ValueError("Num of cuda/cudalike device is 0")
+         if world_size < ulysses_degree * ring_degree:
+@@ -101,7 +101,7 @@ class RayInitializer:
+         gpu_actors = []
+         for local_rank in range(world_size):
+             gpu_actors.append(
+-                gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
++                gpu_actor.options(name=f"RayWorker:{local_rank}").remote(
+                     local_rank=local_rank,
+                     world_size=world_size,
+                     device_id=0,
