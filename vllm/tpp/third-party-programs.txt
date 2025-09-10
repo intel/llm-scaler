@@ -10,7 +10,9 @@ Third party programs and their corresponding required notices and/or license
 terms are listed below.
 
 -------------------------------------------------------------
-1. Khronos OpenCL ICD Loader
+1. vllm
+
+   Khronos OpenCL ICD Loader
 
    threading_building_blocks
   
