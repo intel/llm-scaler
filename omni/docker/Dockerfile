@@ -67,6 +67,8 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     git clone https://github.com/yolain/ComfyUI-Easy-Use.git comfyui-easy-use && \
     cd comfyui-easy-use && \
     pip install -r requirements.txt && \
+# Install Xinference
+    pip install "xinference[transformers]" && \
     # Clean
     rm -rf /tmp/*
 

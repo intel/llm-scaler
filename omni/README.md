@@ -25,6 +25,7 @@ Run docker image:
 export DOCKER_IMAGE=intel/llm-scaler-omni:0.1-b1
 export CONTAINER_NAME=comfyui
 export MODEL_DIR=<your_model_dir>
+export COMFYUI_MODEL_DIR=<your_comfyui_model_dir>
 sudo docker run -itd \
         --privileged \
         --net=host \
@@ -32,6 +33,7 @@ sudo docker run -itd \
         -e no_proxy=localhost,127.0.0.1 \
         --name=$CONTAINER_NAME \
         -v $MODEL_DIR:/llm/models/ \
+        -v $COMFYUI_MODEL_DIR:/llm/ComfyUI/models \
         --shm-size="64g" \
         --entrypoint=/bin/bash \
         $DOCKER_IMAGE
@@ -106,13 +108,63 @@ Set the `GPU` and `ulysses_degree` in `Ray Init Actor` node to GPU nums you want
 
 ## XInference
 
-```
+```bash
+export ZE_AFFINITY_MASK=0 # In multi XPU environment, clearly select GPU index to avoid bugs.
 xinference-local --host 0.0.0.0 --port 9997
 ```
 Supported models:
 - Stable Diffusion 3.5 Medium
 - Kokoro 82M
 - whisper large v3
+
+### WebUI Usage
+
+#### 1. Access Xinference Web UI 
+
+#### 2. Select model and configure `model_path`
+
+#### 3. Find running model and launch Gradio UI for this model
+
+#### 4. Generate within Gradio UI
+
+### OpenAI API Usage
+
+> Visit http://127.0.0.1:9997/docs to inspect the API docs.
+
+For TTS model (`Kokoro 82M` for example):
+```bash
+curl http://localhost:9997/v1/audio/speech   -H "Content-Type: application/json"   -d '{
+    "model": "Kokoro-82M",
+    "input": "kokoro, hello, I am kokoro." 
+  }'   --output output.wav
+```
+
+For STT models (`whisper large v3` for example):
+```bash
+AUDIO_FILE_PATH=<your_audio_file_path>
+
+curl -X 'POST' \
+  "http://localhost:9997/v1/audio/translations" \
+  -H 'accept: application/json' \
+  -F "model=whisper-large-v3" \
+  -F "file=@${AUDIO_FILE_PATH}"
+
+{"text":" Cacaro's hello, I am Cacaro."}
+```
+
+For text-to-image models (`Stable Diffusion 3.5 Medium` for example):
+```bash
+curl http://localhost:9997/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "sd3.5-medium",
+    "prompt": "A Shiba Inu chasing butterflies on a sunny grassy field, cartoon style, with vibrant colors.",
+    "n": 1,
+    "size": "1024x1024",
+    "quality": "standard",
+    "response_format": "url"
+  }'
+```
 
 ## Stand-alone Examples 
 
