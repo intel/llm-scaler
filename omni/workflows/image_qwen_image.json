@@ -2,7 +2,7 @@
   "id": "91f6bbe2-ed41-4fd6-bac7-71d5b5864ecb",
   "revision": 0,
   "last_node_id": 74,
-  "last_link_id": 130,
+  "last_link_id": 131,
   "nodes": [
     {
       "id": 39,
@@ -262,7 +262,7 @@
         600
       ],
       "flags": {},
-      "order": 15,
+      "order": 14,
       "mode": 0,
       "inputs": [
         {
@@ -301,13 +301,13 @@
         58
       ],
       "flags": {},
-      "order": 12,
+      "order": 11,
       "mode": 0,
       "inputs": [
         {
           "name": "model",
           "type": "MODEL",
-          "link": 130
+          "link": 131
         }
       ],
       "outputs": [
@@ -334,53 +334,6 @@
       },
       "widgets_values": [
         3.1000000000000005
-      ]
-    },
-    {
-      "id": 73,
-      "type": "LoraLoaderModelOnly",
-      "pos": [
-        460,
-        60
-      ],
-      "size": [
-        270,
-        82
-      ],
-      "flags": {},
-      "order": 11,
-      "mode": 4,
-      "inputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "link": 129
-        }
-      ],
-      "outputs": [
-        {
-          "name": "MODEL",
-          "type": "MODEL",
-          "links": [
-            130
-          ]
-        }
-      ],
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.3.49",
-        "Node name for S&R": "LoraLoaderModelOnly",
-        "models": [
-          {
-            "name": "Qwen-Image-Lightning-8steps-V1.0.safetensors",
-            "url": "https://huggingface.co/lightx2v/Qwen-Image-Lightning/resolve/main/Qwen-Image-Lightning-8steps-V1.0.safetensors",
-            "directory": "loras"
-          }
-        ]
-      },
-      "widgets_values": [
-        "Qwen-Image-Lightning-8steps-V1.0.safetensors",
-        1
       ]
     },
     {
@@ -446,7 +399,7 @@
       "flags": {
         "collapsed": false
       },
-      "order": 14,
+      "order": 13,
       "mode": 0,
       "inputs": [
         {
@@ -497,7 +450,7 @@
         474
       ],
       "flags": {},
-      "order": 13,
+      "order": 12,
       "mode": 0,
       "inputs": [
         {
@@ -575,7 +528,7 @@
           "type": "MODEL",
           "slot_index": 0,
           "links": [
-            129
+            131
           ]
         }
       ],
@@ -753,16 +706,8 @@
       "LATENT"
     ],
     [
-      129,
+      131,
       37,
-      0,
-      73,
-      0,
-      "MODEL"
-    ],
-    [
-      130,
-      73,
       0,
       66,
       0,
@@ -808,31 +753,18 @@
       "color": "#3f789e",
       "font_size": 24,
       "flags": {}
-    },
-    {
-      "id": 4,
-      "title": "Lightx2v 8steps LoRA",
-      "bounding": [
-        380,
-        -20,
-        450,
-        170
-      ],
-      "color": "#3f789e",
-      "font_size": 24,
-      "flags": {}
     }
   ],
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.2480466293395618,
+      "scale": 0.9419566621258255,
       "offset": [
-        4246.689662080242,
-        988.9239858025617
+        625.601792561767,
+        213.52542956746314
       ]
     },
-    "frontendVersion": "1.26.6",
+    "frontendVersion": "1.25.11",
     "ue_links": [],
     "links_added_by_ue": [],
     "VHS_latentpreview": false,

@@ -2,7 +2,7 @@
   "id": "91f6bbe2-ed41-4fd6-bac7-71d5b5864ecb",
   "revision": 0,
   "last_node_id": 100,
-  "last_link_id": 186,
+  "last_link_id": 187,
   "nodes": [
     {
       "id": 39,
@@ -33,9 +33,9 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "VAELoader",
         "cnr_id": "comfy-core",
         "ver": "0.3.48",
+        "Node name for S&R": "VAELoader",
         "models": [
           {
             "name": "qwen_image_vae.safetensors",
@@ -99,9 +99,9 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "TextEncodeQwenImageEdit",
         "cnr_id": "comfy-core",
         "ver": "0.3.50",
+        "Node name for S&R": "TextEncodeQwenImageEdit",
         "enableTabs": false,
         "tabWidth": 65,
         "tabXOffset": 10,
@@ -133,7 +133,7 @@
         60
       ],
       "flags": {},
-      "order": 13,
+      "order": 9,
       "mode": 0,
       "inputs": [
         {
@@ -152,9 +152,9 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "CFGNorm",
         "cnr_id": "comfy-core",
         "ver": "0.3.50",
+        "Node name for S&R": "CFGNorm",
         "enableTabs": false,
         "tabWidth": 65,
         "tabXOffset": 10,
@@ -184,13 +184,13 @@
         60
       ],
       "flags": {},
-      "order": 9,
+      "order": 7,
       "mode": 0,
       "inputs": [
         {
           "name": "model",
           "type": "MODEL",
-          "link": 185
+          "link": 187
         }
       ],
       "outputs": [
@@ -203,9 +203,9 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "ModelSamplingAuraFlow",
         "cnr_id": "comfy-core",
         "ver": "0.3.48",
+        "Node name for S&R": "ModelSamplingAuraFlow",
         "enableTabs": false,
         "tabWidth": 65,
         "tabXOffset": 10,
@@ -233,7 +233,7 @@
       "flags": {
         "collapsed": false
       },
-      "order": 15,
+      "order": 14,
       "mode": 0,
       "inputs": [
         {
@@ -258,9 +258,9 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "VAEDecode",
         "cnr_id": "comfy-core",
         "ver": "0.3.48",
+        "Node name for S&R": "VAEDecode",
         "enableTabs": false,
         "tabWidth": 65,
         "tabXOffset": 10,
@@ -293,14 +293,14 @@
           "type": "MODEL",
           "slot_index": 0,
           "links": [
-            184
+            187
           ]
         }
       ],
       "properties": {
-        "Node name for S&R": "UNETLoader",
         "cnr_id": "comfy-core",
         "ver": "0.3.48",
+        "Node name for S&R": "UNETLoader",
         "models": [
           {
             "name": "qwen_image_edit_fp8_e4m3fn.safetensors",
@@ -349,9 +349,9 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "CLIPLoader",
         "cnr_id": "comfy-core",
         "ver": "0.3.48",
+        "Node name for S&R": "CLIPLoader",
         "models": [
           {
             "name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
@@ -410,9 +410,9 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "VAEEncode",
         "cnr_id": "comfy-core",
         "ver": "0.3.50",
+        "Node name for S&R": "VAEEncode",
         "enableTabs": false,
         "tabWidth": 65,
         "tabXOffset": 10,
@@ -456,9 +456,9 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "LoadImage",
         "cnr_id": "comfy-core",
         "ver": "0.3.50",
+        "Node name for S&R": "LoadImage",
         "enableTabs": false,
         "tabWidth": 65,
         "tabXOffset": 10,
@@ -476,66 +476,6 @@
       "widgets_values": [
         "Qwen-Image_00043_.png",
         "image"
-      ]
-    },
-    {
-      "id": 89,
-      "type": "LoraLoaderModelOnly",
-      "pos": [
-        170,
-        30
-      ],
-      "size": [
-        270,
-        82
-      ],
-      "flags": {},
-      "order": 7,
-      "mode": 4,
-      "inputs": [
-        {
-          "name": "model",
-          "type": "MODEL",
-          "link": 184
-        }
-      ],
-      "outputs": [
-        {
-          "name": "MODEL",
-          "type": "MODEL",
-          "links": [
-            185
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "LoraLoaderModelOnly",
-        "cnr_id": "comfy-core",
-        "ver": "0.3.50",
-        "models": [
-          {
-            "name": "Qwen-Image-Lightning-4steps-V1.0.safetensors",
-            "url": "https://huggingface.co/lightx2v/Qwen-Image-Lightning/resolve/main/Qwen-Image-Lightning-4steps-V1.0.safetensors",
-            "directory": "loras"
-          }
-        ],
-        "enableTabs": false,
-        "tabWidth": 65,
-        "tabXOffset": 10,
-        "hasSecondTab": false,
-        "secondTabText": "Send Back",
-        "secondTabOffset": 80,
-        "secondTabWidth": 65,
-        "ue_properties": {
-          "widget_ue_connectable": {
-            "lora_name": true,
-            "strength_model": true
-          }
-        }
-      },
-      "widgets_values": [
-        "Qwen-Image-Lightning-4steps-V1.0.safetensors",
-        1
       ]
     },
     {
@@ -597,7 +537,7 @@
         474
       ],
       "flags": {},
-      "order": 14,
+      "order": 13,
       "mode": 0,
       "inputs": [
         {
@@ -632,9 +572,9 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "KSampler",
         "cnr_id": "comfy-core",
         "ver": "0.3.48",
+        "Node name for S&R": "KSampler",
         "enableTabs": false,
         "tabWidth": 65,
         "tabXOffset": 10,
@@ -666,7 +606,7 @@
         650
       ],
       "flags": {},
-      "order": 16,
+      "order": 15,
       "mode": 0,
       "inputs": [
         {
@@ -677,9 +617,9 @@
       ],
       "outputs": [],
       "properties": {
-        "Node name for S&R": "SaveImage",
         "cnr_id": "comfy-core",
         "ver": "0.3.48",
+        "Node name for S&R": "SaveImage",
         "enableTabs": false,
         "tabWidth": 65,
         "tabXOffset": 10,
@@ -736,9 +676,9 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "TextEncodeQwenImageEdit",
         "cnr_id": "comfy-core",
         "ver": "0.3.50",
+        "Node name for S&R": "TextEncodeQwenImageEdit",
         "enableTabs": false,
         "tabWidth": 65,
         "tabXOffset": 10,
@@ -817,9 +757,9 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "ImageScaleToTotalPixels",
         "cnr_id": "comfy-core",
         "ver": "0.3.50",
+        "Node name for S&R": "ImageScaleToTotalPixels",
         "enableTabs": false,
         "tabWidth": 65,
         "tabXOffset": 10,
@@ -970,26 +910,18 @@
       "IMAGE"
     ],
     [
-      184,
-      37,
-      0,
-      89,
-      0,
-      "MODEL"
-    ],
-    [
-      185,
-      89,
-      0,
-      66,
-      0,
-      "MODEL"
-    ],
-    [
       186,
       75,
       0,
       3,
+      0,
+      "MODEL"
+    ],
+    [
+      187,
+      37,
+      0,
+      66,
       0,
       "MODEL"
     ]
@@ -1044,7 +976,7 @@
         99.771400280708
       ]
     },
-    "frontendVersion": "1.26.5",
+    "frontendVersion": "1.25.11",
     "ue_links": [],
     "links_added_by_ue": [],
     "VHS_latentpreview": false,
