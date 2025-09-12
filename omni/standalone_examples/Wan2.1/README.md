@@ -9,7 +9,7 @@ bash build.sh
 Run docker image:
 
 ```bash
-export DOCKER_IMAGE=llm-scaler-visualai:latest-wan2.1
+export DOCKER_IMAGE=llm-scaler-omni:latest-wan2.1
 export CONTAINER_NAME=wan-2.1
 export MODEL_DIR=<your_model_dir>
 sudo docker run -itd \

@@ -9,7 +9,7 @@ bash build.sh
 Run docker image:
 
 ```bash
-export DOCKER_IMAGE=llm-scaler-visualai:latest
+export DOCKER_IMAGE=llm-scaler-omni:latest-hunyuan3d2.1
 export CONTAINER_NAME=hunyuan3d-2.1
 sudo docker run -itd \
         --privileged \

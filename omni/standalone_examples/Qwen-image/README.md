@@ -9,7 +9,7 @@ bash build.sh
 Run docker image:
 
 ```bash
-export DOCKER_IMAGE=llm-scaler-visualai:qwen-image
+export DOCKER_IMAGE=llm-scaler-omni:qwen-image
 export CONTAINER_NAME=qwen-image
 export MODEL_DIR=<your_model_dir>
 sudo docker run -itd \
