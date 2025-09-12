@@ -111,7 +111,7 @@ Set the `GPU` and `ulysses_degree` in `Ray Init Actor` node to GPU nums you want
 ## XInference
 
 ```bash
-export ZE_AFFINITY_MASK=0 # In multi XPU environment, clearly select GPU index to avoid bugs.
+export ZE_AFFINITY_MASK=0 # In multi XPU environment, clearly select GPU index to avoid issues.
 xinference-local --host 0.0.0.0 --port 9997
 ```
 Supported models:
@@ -136,6 +136,18 @@ Supported models:
 ### OpenAI API Usage
 
 > Visit http://127.0.0.1:9997/docs to inspect the API docs.
+
+#### 1. Launch API service
+You can select model and launch service via WebUI (refer to [here](#1-access-xinference-web-ui)) or by command:
+
+```bash
+export ZE_AFFINITY_MASK=0 # In multi XPU environment, clearly select GPU index to avoid issues.
+xinference-local --host 0.0.0.0 --port 9997
+
+xinference launch --model-name sd3.5-medium --model-type image --model-path /llm/models/stable-diffusion-3.5-medium/
+```
+
+#### 2. Post request in OpenAI API format
 
 For TTS model (`Kokoro 82M` for example):
 ```bash
