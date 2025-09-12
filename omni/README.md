@@ -119,13 +119,17 @@ Supported models:
 
 ### WebUI Usage
 
-#### 1. Access Xinference Web UI 
+#### 1. Access Xinference Web UI
+![xinference_launch](./assets/xinference_launch.png)
 
 #### 2. Select model and configure `model_path`
+![xinference_model](./assets/xinference_configure.png)
 
 #### 3. Find running model and launch Gradio UI for this model
+![xinference_gradio](./assets/xinference_gradio.png)
 
 #### 4. Generate within Gradio UI
+![xinference_example](./assets/xinference_sd.png)
 
 ### OpenAI API Usage
 
