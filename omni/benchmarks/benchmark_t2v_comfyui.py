@@ -337,6 +337,3 @@ if __name__ == "__main__":
         wan22_ti2v_5b_workflow_json, model_name="Wan2.2_ti2v_5B Workflow"
     )
 
-    # You can add other configurations or workflows here if you have them, e.g.:
-    # another_workflow_json = { ... } # Define another workflow JSON
-    # benchmark_t2v_model(another_workflow_json, model_name="My Custom Workflow")

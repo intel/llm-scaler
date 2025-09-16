@@ -8,9 +8,6 @@ from xinference.client import Client
 
 x_client = Client(BASE_URL)
 
-
-# MODEL_NAME = "sd3.5-medium"
-
 PROMPT = "A Shiba Inu chasing butterflies on a sunny grassy field, cartoon style, with vibrant colors."
 IMAGE_SIZE = "1024x1024"
 NUM_IMAGES = 1
