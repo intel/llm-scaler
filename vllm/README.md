@@ -2648,6 +2648,7 @@ At this point, multi-node distributed inference with **PP + TP** is running, coo
 |       DeepSeek-R1-0528-Qwen3-8B   |        language model             |                                 |
 |       DeepSeek-R1-Distill-1.5B/7B/8B/14B/32B/70B             |         language model  |                |
 |       Qwen3-8B/14B/32B            |        language model             |                                 |
+|       DeepSeek-V2-Lite            |        language model             | export VLLM_MLA_DISABLE=1       |
 |       QwQ-32B                     |        language model             |                                 |
 |       Ministral-8B                |        language model             |                                 |
 |       Mixtral-8x7B                |        language model             |                                 |
@@ -2656,6 +2657,8 @@ At this point, multi-node distributed inference with **PP + TP** is running, coo
 |       codegeex4-all-9b            |        language model             |       with chat_template        |
 |       DeepSeek-Coder-33B          |        language model             |                                 |
 |       GLM-4-0414-9B/32B           |        language model             |                                 |
+|       Seed-OSS-36B-Instruct       |        language model             |                                 |
+|       Hunyuan-7B-Instruct         |        language model             |  follow the guide in [here](#31-how-to-use-hunyuan-7b-instruct)   |
 |Qwen3 30B-A3B/Coder-30B-A3B-Instruct|       language MOE model         |                                 |
 |       GLM-4.5-Air                 |        language MOE model         |                                 |
 |       Qwen2-VL-7B-Instruct        |        multimodal model           |                                 |
@@ -2665,6 +2668,7 @@ At this point, multi-node distributed inference with **PP + TP** is running, coo
 |       InternVL2-8B                |        multimodal model           |                                 |
 |       InternVL3-8B                |        multimodal model           |                                 |
 |       InternVL3_5-8B              |        multimodal model           |                                 |
+|       InternVL3_5-30B-A3B         |        multimodal MOE model       |                                 |
 |       GLM-4.1V-Thinking           |        multimodal model           |                                 |
 |       dots.ocr                    |        multimodal model           |                                 |
 |       Qwen2.5-VL 7B/32B/72B       |        multimodal model           | pip install transformers==4.52.4         |
@@ -2674,10 +2678,34 @@ At this point, multi-node distributed inference with **PP + TP** is running, coo
 |       Qwen2.5-Omni-7B             |        omni model                 | pip install librosa soundfile            |
 |       whisper-medium/large-v3-turb|        audio model                | pip install transformers==4.52.4 librosa |
 |       Qwen3-Embedding             |        Embedding                  |                                 |
-|       bge-large, bge-m3           |        Embedding                  |                                 |
+|      bge-large,bge-m3,bce-base-v1 |        Embedding                  |                                 |
 |       Qwen3-Reranker              |        Rerank                     |                                 |
 |       bge-reranker-large, bge-reranker-v2-m3 |  Rerank                |                                 |
 --- 
+
+### 3.1 how to use Hunyuan-7B-Instruct 
+install new transformers version
+```bash
+pip install transformers==4.56.1
+```
+
+Need to use the followng format like [here](https://huggingface.co/tencent/Hunyuan-7B-Instruct#use-with-transformers), and you can decide to use `think` or not.
+```bash
+curl http://localhost:8001/v1/chat/completions -H 'Content-Type: application/json' -d '{
+"model": "Hunyuan-7B-Instruct",
+"messages": [
+    {
+        "role": "system",
+        "content": [{"type": "text", "text": "You are a helpful assistant."}]
+    },
+    {
+        "role": "user",
+        "content": [{"type": "text", "text": "/no_thinkWhat is AI?"}]
+    }
+],
+"max_tokens": 128
+}'
+```
 
 ## 4. Troubleshooting
 
