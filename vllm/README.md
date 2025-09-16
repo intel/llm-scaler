@@ -2658,7 +2658,7 @@ At this point, multi-node distributed inference with **PP + TP** is running, coo
 |       DeepSeek-Coder-33B          |        language model             |                                 |
 |       GLM-4-0414-9B/32B           |        language model             |                                 |
 |       Seed-OSS-36B-Instruct       |        language model             |                                 |
-|       Hunyuan-7B-Instruct         |        language model             |  follow the guide in [here](#31-how-to-use-hunyuan-7b-instruct)   |
+|       Hunyuan-0.5B/7B-Instruct    |        language model             |  follow the guide in [here](#31-how-to-use-hunyuan-7b-instruct)   |
 |Qwen3 30B-A3B/Coder-30B-A3B-Instruct|       language MOE model         |                                 |
 |       GLM-4.5-Air                 |        language MOE model         |                                 |
 |       Qwen2-VL-7B-Instruct        |        multimodal model           |                                 |
