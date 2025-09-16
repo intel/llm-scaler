@@ -21,6 +21,9 @@ WS_BASE_URL = f"ws://{SERVER_ADDRESS}/ws"
 # --- Benchmark Parameters ---
 NUM_WARMUP = 1  # Number of warm-up requests
 NUM_TRIALS = 3  # Number of benchmark trials for timed results
+WS_TIMEOUT_SECONDS = (
+    1200  # WebSocket receive timeout for waiting for completion (e.g., 10 minutes)
+)
 
 # --- Workflow Specific Parameters (can be overridden or modified dynamically within the function) ---
 DEFAULT_SAMPLER_SEED = 898471028164125
@@ -28,7 +31,12 @@ DEFAULT_STEPS = 20
 DEFAULT_CFG = 5
 DEFAULT_WIDTH = 1280
 DEFAULT_HEIGHT = 704
-DEFAULT_LENGTH = 121  # Number of frames for video
+DEFAULT_LENGTH = 121  # Number of frames for video (original workflow uses 121)
+DEFAULT_POSITIVE_PROMPT = "Low contrast. In a retro 1970s-style subway station, a street musician plays in dim colors and rough textures. He wears an old jacket, playing guitar with focus. Commuters hurry by, and a small crowd gathers to listen. The camera slowly moves right, capturing the blend of music and city noise, with old subway signs and mottled walls in the background."
+DEFAULT_NEGATIVE_PROMPT = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+DEFAULT_UNET_MODEL = "wan2.2_ti2v_5B_fp16.safetensors"
+DEFAULT_CLIP_MODEL = "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+DEFAULT_VAE_MODEL = "wan2.2_vae.safetensors"
 
 # --- ComfyUI Workflow JSON ---
 wan22_ti2v_5b_workflow_json = {
@@ -49,18 +57,12 @@ wan22_ti2v_5b_workflow_json = {
         "_meta": {"title": "KSampler"},
     },
     "6": {
-        "inputs": {
-            "text": "Low contrast. In a retro 1970s-style subway station, a street musician plays in dim colors and rough textures. He wears an old jacket, playing guitar with focus. Commuters hurry by, and a small crowd gathers to listen. The camera slowly moves right, capturing the blend of music and city noise, with old subway signs and mottled walls in the background.",
-            "clip": ["38", 0],
-        },
+        "inputs": {"text": DEFAULT_POSITIVE_PROMPT, "clip": ["38", 0]},
         "class_type": "CLIPTextEncode",
         "_meta": {"title": "CLIP Text Encode (Positive Prompt)"},
     },
     "7": {
-        "inputs": {
-            "text": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
-            "clip": ["38", 0],
-        },
+        "inputs": {"text": DEFAULT_NEGATIVE_PROMPT, "clip": ["38", 0]},
         "class_type": "CLIPTextEncode",
         "_meta": {"title": "CLIP Text Encode (Negative Prompt)"},
     },
@@ -70,24 +72,17 @@ wan22_ti2v_5b_workflow_json = {
         "_meta": {"title": "VAE Decode"},
     },
     "37": {
-        "inputs": {
-            "unet_name": "wan2.2_ti2v_5B_fp16.safetensors",
-            "weight_dtype": "default",
-        },
+        "inputs": {"unet_name": DEFAULT_UNET_MODEL, "weight_dtype": "default"},
         "class_type": "UNETLoader",
         "_meta": {"title": "Load Diffusion Model"},
     },
     "38": {
-        "inputs": {
-            "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-            "type": "wan",
-            "device": "default",
-        },
+        "inputs": {"clip_name": DEFAULT_CLIP_MODEL, "type": "wan", "device": "default"},
         "class_type": "CLIPLoader",
         "_meta": {"title": "Load CLIP"},
     },
     "39": {
-        "inputs": {"vae_name": "wan2.2_vae.safetensors"},
+        "inputs": {"vae_name": DEFAULT_VAE_MODEL},
         "class_type": "VAELoader",
         "_meta": {"title": "Load VAE"},
     },
@@ -143,88 +138,73 @@ def queue_prompt(workflow, client_id):
         return prompt_info
     except requests.exceptions.ConnectionError:
         print(
-            f"Error: Could not connect to ComfyUI server at {HTTP_PROMPT_URL}. Is it running?"
+            f"ERROR: Could not connect to ComfyUI server at {HTTP_PROMPT_URL}. Is it running?"
         )
-        return None
+        sys.exit(1)  # Exit if server is not reachable
     except requests.exceptions.HTTPError as e:
-        print(f"Error submitting prompt: {e}")
+        print(f"ERROR submitting prompt: {e}")
         print(f"Response: {response.text}")
-        return None
+        sys.exit(1)  # Exit on unrecoverable HTTP error
     except Exception as e:
-        print(f"An unexpected error occurred during prompt submission: {e}")
-        return None
+        print(f"ERROR: An unexpected error occurred during prompt submission: {e}")
+        sys.exit(1)  # Exit on other unexpected errors
 
 
-def wait_for_completion(ws_url, client_id, prompt_id):
+def wait_for_completion(
+    ws_url, client_id, prompt_id, timeout_seconds=WS_TIMEOUT_SECONDS
+):
     """
-    Listens via WebSocket for ComfyUI task completion.
+    Listens via WebSocket for the specific ComfyUI task completion signal.
     """
     ws = None
     try:
         ws = websocket.WebSocket()
         ws.connect(ws_url)
-        # print(f"  Connected to WebSocket: {ws_url}") # Too verbose for each run
+        ws.settimeout(timeout_seconds)  # Set a receive timeout for the WebSocket
 
-        queue_empty_for_client = False
-        prompt_finished_executing = False
+        print(
+            f"  Waiting for prompt {prompt_id} completion (Timeout: {timeout_seconds}s)..."
+        )
 
-        # Keep track of active prompt_ids seen on this client
-        active_prompts = {prompt_id}
+        while True:
+            # Try to receive a message. This will raise a timeout exception if no message is received
+            # within the timeout_seconds.
+            try:
+                message = ws.recv()
+            except websocket._exceptions.WebSocketTimeoutException:
+                print(
+                    f"  WebSocket timed out after {timeout_seconds} seconds waiting for prompt {prompt_id}."
+                )
+                return False  # Indicate failure due to timeout
 
-        while not (queue_empty_for_client and prompt_finished_executing):
-            message = ws.recv()
             if not isinstance(message, str):
-                continue  # Skip non-string messages (e.g., binary)
+                # print(f"  Received non-string message: {message[:50]}...") # Debug: show non-string messages
+                continue  # Skip non-string messages (e.g., binary payloads which we don't need for status)
 
             message_obj = json.loads(message)
 
-            if message_obj.get("type") == "status":
+            if message_obj.get("type") == "executing":
                 data = message_obj["data"]
-                if "sid" in data and data["sid"] == client_id:
-                    if data["status"]["exec_info"]["queue_remaining"] == 0:
-                        queue_empty_for_client = True
-                        # print(f"  [WS Status] Queue empty for client {client_id}.")
-                    else:
-                        queue_empty_for_client = False
+                # The prompt is finished if 'node' is null and it's our prompt_id
+                if data.get("prompt_id") == prompt_id and data.get("node") is None:
+                    print(f"  Prompt {prompt_id} finished execution.")
+                    return True  # Success!
 
-            elif message_obj.get("type") == "executing":
-                data = message_obj["data"]
-
-                # If this message is for our prompt_id
-                if data.get("prompt_id") == prompt_id:
-                    if data.get("node") is None:
-                        # Our prompt has finished execution (node is null)
-                        prompt_finished_executing = True
-                        # print(f"  [WS Executing] Prompt {prompt_id} finished execution.")
-                    else:
-                        pass  # Still executing a node
-                # For other prompts on this client_id, just track completion
-                elif data.get("client_id") == client_id:
-                    if (
-                        data.get("node") is None
-                        and data.get("prompt_id") in active_prompts
-                    ):
-                        active_prompts.remove(data.get("prompt_id"))  # Mark as done
-                    elif data.get("node") is not None:
-                        active_prompts.add(data.get("prompt_id"))
-
-            # Exit condition: if our specific prompt_id is no longer active AND queue is empty
-            if prompt_id not in active_prompts and queue_empty_for_client:
-                prompt_finished_executing = True
-                break
-
-        return True
+            # Optional: Add progress reporting if desired
+            # elif message_obj.get('type') == 'progress':
+            #     progress_data = message_obj['data']
+            #     print(f"  Progress: {progress_data.get('value', '')} / {progress_data.get('max', '')} ({progress_data.get('node_title', '')})")
 
     except websocket._exceptions.WebSocketConnectionClosedException:
         print("  Websocket connection closed unexpectedly.")
         return False
     except Exception as e:
-        print(f"  Error during WebSocket communication: {e}")
+        print(f"  ERROR during WebSocket communication for prompt {prompt_id}: {e}")
         return False
     finally:
         if ws:
             ws.close()
-            # print("  WebSocket connection closed.") # Too verbose for each run
+            # print("  WebSocket connection closed.") # Debug: indicate WS close
 
 
 # ==============================================================================
@@ -257,9 +237,7 @@ def benchmark_t2v_model(workflow_json_template, model_name="ComfyUI Workflow"):
         # Deep copy the workflow template to avoid modifying the original
         workflow = copy.deepcopy(workflow_json_template)
 
-        # Optionally, modify seed for each warm-up run
-        # For a truly consistent benchmark, you might fix the seed,
-        # but varying it ensures all parts of the graph are exercised if dependencies exist.
+        # Update seed for current run (optional, for benchmarking often fixed for consistency)
         workflow["3"]["inputs"]["seed"] = DEFAULT_SAMPLER_SEED + i
 
         client_id = str(uuid.uuid4())
@@ -267,19 +245,17 @@ def benchmark_t2v_model(workflow_json_template, model_name="ComfyUI Workflow"):
 
         start_time = time.perf_counter()
         prompt_response = queue_prompt(workflow, client_id)
-        if not prompt_response:
-            print(
-                "  Warm-up request failed during prompt submission. Exiting benchmark."
-            )
-            sys.exit(1)
+        # queue_prompt already exits if submission fails, so we just check for successful processing
 
         if not wait_for_completion(ws_url, client_id, prompt_response["prompt_id"]):
-            print("  Warm-up request failed during WebSocket wait. Exiting benchmark.")
-            sys.exit(1)
+            print(
+                "  Warm-up request failed during WebSocket wait or timed out. Exiting benchmark."
+            )
+            sys.exit(1)  # Exit if warm-up fails, as trials might also fail
 
         end_time = time.perf_counter()
         duration = end_time - start_time
-        print(f"  Warm-up request successful. Latency: {duration:.4f} seconds.")
+        print(f"  Warm-up request successful. Total duration: {duration:.4f} seconds.")
 
     # --- Benchmark Trials ---
     print(f"\n--- Starting Benchmark Trials ({NUM_TRIALS} requests) ---")
@@ -290,8 +266,7 @@ def benchmark_t2v_model(workflow_json_template, model_name="ComfyUI Workflow"):
         # Deep copy for each trial
         workflow = copy.deepcopy(workflow_json_template)
 
-        # Best practice for benchmarking: ensure new unique seeds for each generative run
-        # if the output needs to be different, but for raw speed, it often doesn't matter.
+        # Ensure new unique seeds for each generative run if the output needs to be different.
         workflow["3"]["inputs"]["seed"] = DEFAULT_SAMPLER_SEED + NUM_WARMUP + i
 
         client_id = str(uuid.uuid4())
@@ -299,20 +274,18 @@ def benchmark_t2v_model(workflow_json_template, model_name="ComfyUI Workflow"):
 
         start_time = time.perf_counter()
         prompt_response = queue_prompt(workflow, client_id)
-        if not prompt_response:
-            print(
-                "  Trial request failed during prompt submission. Stopping benchmark."
-            )
-            break
+        # queue_prompt already exits on failure
 
         if not wait_for_completion(ws_url, client_id, prompt_response["prompt_id"]):
-            print("  Trial request failed during WebSocket wait. Stopping benchmark.")
-            break
+            print(
+                "  Trial request failed during WebSocket wait or timed out. Stopping benchmark."
+            )
+            break  # Stop trials if a failure occurs
 
         end_time = time.perf_counter()
         duration = end_time - start_time
         latencies.append(duration)
-        print(f"  Trial successful. Latency: {duration:.4f} seconds.")
+        print(f"  Trial successful. Total duration: {duration:.4f} seconds.")
 
     # --- Results ---
     print("\n--- Benchmark Results ---")
@@ -323,7 +296,7 @@ def benchmark_t2v_model(workflow_json_template, model_name="ComfyUI Workflow"):
         print(f"Configuration:")
         print(f"  ComfyUI Server: {SERVER_ADDRESS}")
         print(f"  Workflow Name: {model_name}")
-        print(f"  Prompt (Positive): '{workflow_json_template['6']['inputs']['text']}'")
+        print(f"  Positive Prompt (sample): '{DEFAULT_POSITIVE_PROMPT[:70]}...'")
         print(
             f"  Image/Video Resolution: {workflow_json_template['55']['inputs']['width']}x{workflow_json_template['55']['inputs']['height']}"
         )
@@ -364,3 +337,6 @@ if __name__ == "__main__":
         wan22_ti2v_5b_workflow_json, model_name="Wan2.2_ti2v_5B Workflow"
     )
 
+    # You can add other configurations or workflows here if you have them, e.g.:
+    # another_workflow_json = { ... } # Define another workflow JSON
+    # benchmark_t2v_model(another_workflow_json, model_name="My Custom Workflow")
