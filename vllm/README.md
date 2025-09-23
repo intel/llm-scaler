@@ -121,7 +121,7 @@ docker run -it \
   bash
 ````
 
-Once you enter the docker container, go to /opt/intel/multi-arc directory, collaterals/tools/scripts put there.
+Once you enter the docker container, go to /opt/intel/multi-arc directory, all related collaterals, tools and scripts are there.
 
 ```bash
 root@da47dbf0a2f4:/opt/intel/multi-arc/multi-arc-bmg-offline-installer-25.32.1.2# ls -l

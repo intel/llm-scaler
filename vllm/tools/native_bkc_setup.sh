@@ -147,7 +147,7 @@ else
 fi
 
 update-initramfs -u
-rm -rf $WORK_DIR
+rm $FIRMWARE_DIR/* -rf
 echo -e "✅ Update GPU firmware successfully"
 
 echo -e "\n[INFO] Disabling intel_iommu..."
