@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ======== Base Stage ========
-FROM amr-registry.caas.intel.com/intelanalytics/llm-scaler-platform:25.38.4.1 AS vllm-base
+FROM intel/llm-scaler-platform:25.38.4.2 AS vllm-base
 
 ARG https_proxy
 ARG http_proxy
