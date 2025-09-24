@@ -67,6 +67,7 @@ Currently, the following workflows are supported on B60:
 - Qwen-Image (refer to https://raw.githubusercontent.com/Comfy-Org/example_workflows/main/image/qwen/image_qwen_image_distill.json)
 - Qwen-Image-Edit (refer to https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_image_edit.json)
 - Wan2.2-TI2V-5B (refer to https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_wan2_2_5B_ti2v.json)
+- Wan2.2-T2V-14B (refer to https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_wan2_2_14B_t2v.json)
 - Wan2.2-T2V-14B with raylight (refer to https://github.com/komikndr/raylight/blob/main/example_workflows/WanT2V_Raylight.json)
 - Flux.1 Kontext Dev(Basic) workflow in ComfyUI examples (refer to https://docs.comfy.org/tutorials/flux/flux-1-kontext-dev)
 - SD3.5 Simple in ComfyUI examples (refer to https://comfyanonymous.github.io/ComfyUI_examples/sd3/)
@@ -81,12 +82,9 @@ Only `Qwen-Image Native Workflow Example` part is validated and there are some i
 
 ComfyUI tutorial for qwen-image-edit: https://docs.comfy.org/tutorials/image/qwen/qwen-image-edit
 
-#### Wan2.2-TI2V-5B
+#### Wan2.2-TI2V-5B && Wan2.2-T2V-14B
 
 ComfyUI tutorial for wan2.2: https://docs.comfy.org/tutorials/video/wan/wan2_2
-
-Due to memory limit with single device, only `
-Wan2.2 TI2V 5B Hybrid Version Workflow Example` is validated.
 
 #### Wan2.2-T2V-14B with raylight
 
