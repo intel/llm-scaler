@@ -191,7 +191,7 @@ index 0000000..8ad06fc
 +# Add Intel oneAPI repo and PPA for GPU support
 +RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
 +    echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list && \
-+    add-apt-repository -y ppa:kobuk-team/intel-graphics-testing
++    add-apt-repository -y ppa:kobuk-team/intel-graphics
 +
 +# Install dependencies and Python 3.10
 +RUN apt-get update -y && \

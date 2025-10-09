@@ -7966,7 +7966,7 @@ index 7d5a589eb..25a9fd7cd 100644
 -RUN rm /etc/apt/sources.list.d/intel-graphics.list
 +RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
 +    echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list && \
-+    add-apt-repository -y ppa:kobuk-team/intel-graphics-testing
++    add-apt-repository -y ppa:kobuk-team/intel-graphics
  
 -RUN apt-get update -y && \
 +RUN apt clean && apt-get update -y && \
