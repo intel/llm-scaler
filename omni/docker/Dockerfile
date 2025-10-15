@@ -11,6 +11,10 @@ ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python3.10/dist-packages/torc
 COPY ./patches/yunchang_for_multi_arc.patch /tmp/
 COPY ./patches/xdit_for_multi_arc.patch /tmp/
 COPY ./patches/raylight_for_multi_arc.patch /tmp/
+COPY ./patches/xinference_device_utils.patch /tmp/
+COPY ./patches/comfyui_for_multi_arc.patch /tmp/
+COPY ./patches/comfyui_voxcpm_for_xpu.patch /tmp/
+
 
 # Add Intel oneAPI repo and PPA for GPU support
 RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
@@ -50,7 +54,8 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cd /llm && \
     git clone https://github.com/comfyanonymous/ComfyUI.git && \
     cd ComfyUI && \
-    git checkout 72212fef660bcd7d9702fa52011d089c027a64d8 && \
+    git checkout 51696e3fdcdfad657cb15854345fbcbbe70eef8d && \
+    git apply /tmp/comfyui_for_multi_arc.patch && \
     pip install -r requirements.txt && \
     cd custom_nodes && \
     git clone https://github.com/ltdrdata/ComfyUI-Manager.git comfyui-manager && \
@@ -60,19 +65,32 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cd .. && \
     git clone https://github.com/komikndr/raylight.git && \
     cd raylight && \
-    git checkout 290c934cdd498b003fbf083e74e91ffc8edb961a && \
+    git checkout ff8e90ba1f2c2d23e3ac23746910ddfb523fc8f1 && \
     git apply /tmp/raylight_for_multi_arc.patch && \
     pip install -r requirements.txt && \
     cd .. && \
     git clone https://github.com/yolain/ComfyUI-Easy-Use.git comfyui-easy-use && \
     cd comfyui-easy-use && \
     pip install -r requirements.txt && \
+    cd .. && \
+    git clone https://github.com/Fannovel16/comfyui_controlnet_aux.git && \
+    cd comfyui_controlnet_aux && \
+    apt install libcairo2-dev pkg-config python3-dev -y && \
+    pip install -r requirements.txt && \
+    cd .. && \
+    git clone https://github.com/wildminder/ComfyUI-VoxCPM.git comfyui-voxcpm && \
+    cd comfyui-voxcpm && \
+    git checkout 044dd93c0effc9090fb279117de5db4cd90242a0 && \
+    git apply /tmp/comfyui_voxcpm_for_xpu.patch && \
+    pip install -r requirements.txt && \
 # Install Xinference
     pip install "xinference[transformers]" && \
+    patch /usr/local/lib/python3.10/dist-packages/xinference/device_utils.py < /tmp/xinference_device_utils.patch && \
     pip install kokoro Jinja2==3.1.6 jieba ordered-set pypinyin cn2an pypinyin-dict && \
     # Clean
     rm -rf /tmp/*
 
 COPY ./workflows/* /llm/ComfyUI/user/default/workflows/
+COPY ./example_inputs/* /llm/ComfyUI/input/
 
 WORKDIR /llm/ComfyUI

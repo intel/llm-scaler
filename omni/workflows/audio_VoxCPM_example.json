@@ -1,0 +1,217 @@
+{
+  "id": "332f7ac5-c30f-44aa-991a-aff51b05038a",
+  "revision": 0,
+  "last_node_id": 7,
+  "last_link_id": 14,
+  "nodes": [
+    {
+      "id": 6,
+      "type": "MarkdownNote",
+      "pos": [
+        -1840.9210205078125,
+        -874.2627563476562
+      ],
+      "size": [
+        360.7866516113281,
+        348.9750061035156
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "## 🎤 Achieving High-Quality Voice Clones\n\nTo achieve the best voice cloning results, providing an accurate `prompt_text` is **critical**. This text acts as a transcript that aligns the sound of the `prompt_audio` with the words being spoken, teaching the model the speaker's unique vocal characteristics.\n\n### How to Use `prompt_text` Effectively\n\n#### 1. **Provide a Verbatim Transcript**\nThe `prompt_text` must be a word-for-word transcript of the `prompt_audio`. Do not summarize or describe the audio.\n\n✅ **Correct:** `The quick brown fox jumps over the lazy dog.`\n\n❌ **Incorrect:** `A person saying a sentence about a fox.`\n\n#### 2. **Punctuation is Important**\nUse accurate punctuation to capture the speaker's intonation. The model learns how the speaker ends sentences, asks questions, or shows excitement.\n\n-   **For a statement:** `This is a great example.`\n-   **For a question:** `Is this a great example?`\n-   **For excitement:** `This is a great example!`\n\n#### 3. **Match Audio and Text Length**\nThe audio clip should be long enough to capture the speaker's natural pacing and rhythm.\n\n👍 **Good:** A 5-15 second clip of continuous, clear speech.\n\n👌 **Okay:** A 3-5 second clip.\n\n⚠️ **Warning:** Very short clips (< 3 seconds) may result in a less stable or robotic-sounding clone.\n\n\n> **Note:**\n> For the best results, use a clean, high-quality `prompt_audio` with minimal background noise, reverb, or music. The model will try to clone the *entire* acoustic environment, not just the voice."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2,
+      "type": "LoadAudio",
+      "pos": [
+        -1828.2386474609375,
+        -1061.6014404296875
+      ],
+      "size": [
+        350.4437255859375,
+        136
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            14
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.52",
+        "Node name for S&R": "LoadAudio",
+        "ue_properties": {
+          "widget_ue_connectable": {
+            "audio": true,
+            "audioUI": true,
+            "upload": true
+          },
+          "version": "7.0.1"
+        }
+      },
+      "widgets_values": [
+        "example.wav",
+        null,
+        null
+      ]
+    },
+    {
+      "id": 7,
+      "type": "SaveAudio",
+      "pos": [
+        -991.1134643554688,
+        -1058.956787109375
+      ],
+      "size": [
+        277.3636474609375,
+        112
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 12
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.65",
+        "Node name for S&R": "SaveAudio"
+      },
+      "widgets_values": [
+        "audio/ComfyUI"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "MarkdownNote",
+      "pos": [
+        -992.263427734375,
+        -871.535400390625
+      ],
+      "size": [
+        311.074462890625,
+        346.9256286621094
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Note",
+      "properties": {},
+      "widgets_values": [
+        "# ComfyUI-VoxCPM\n\n**VoxCPM**  a novel tokenizer-free TTS system for context-aware speech generation and true-to-life voice cloning.\n\n## Models\nThis node automatically downloads the required model files.\n\n| Model | Parameters | Hugging Face Link |\n|:---|:---:|:---|\n| VoxCPM-0.5B | 0.5B | [openbmb/VoxCPM-0.5B](https://huggingface.co/openbmb/VoxCPM-0.5B) |\n\n## Support \n\n- Don't know how to update PyTorch?\n- Need help with ComfyUI?\n- Need technical support?\n\n### Or do you just have questions? Then join the [@TokenDiffusion Hub](https://t.me/TokenDiff_hub) group\n\n### AI news [TokenDiffusion](https://t.me/TokenDiff)"
+      ],
+      "color": "#233",
+      "bgcolor": "#355"
+    },
+    {
+      "id": 5,
+      "type": "VoxCPM_TTS",
+      "pos": [
+        -1438.1444091796875,
+        -1058.956787109375
+      ],
+      "size": [
+        399.0082702636719,
+        531.7355346679688
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "prompt_audio",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": 14
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Generated Audio",
+          "type": "AUDIO",
+          "links": [
+            12
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "wildminder/ComfyUI-VoxCPM",
+        "ver": "044dd93c0effc9090fb279117de5db4cd90242a0",
+        "Node name for S&R": "VoxCPM_TTS"
+      },
+      "widgets_values": [
+        "VoxCPM-0.5B",
+        "You're baking with ingredients from the Realm of Madness?! I am… impressed. And deeply concerned.",
+        2,
+        20,
+        true,
+        779450847354054,
+        "fixed",
+        false,
+        "xpu",
+        3,
+        5,
+        "Just by listening a few minutes a day, you'll be able to eliminate negative thoughts by conditioning your mind to be more positive."
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    }
+  ],
+  "links": [
+    [
+      12,
+      5,
+      0,
+      7,
+      0,
+      "AUDIO"
+    ],
+    [
+      14,
+      2,
+      0,
+      5,
+      0,
+      "AUDIO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 1.0673289000000004,
+      "offset": [
+        2223.298594030723,
+        1247.7797601466536
+      ]
+    },
+    "frontendVersion": "1.27.10",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}
