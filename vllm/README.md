@@ -182,6 +182,26 @@ This way, only the first GPU will be mapped into the Docker container.
 
 ---
 
+**Note — Intel oneAPI Environment**
+> How you start the container determines whether you need to manually source the Intel oneAPI environment (`source /opt/intel/oneapi/setvars.sh --force`):
+>
+> * **Interactive shell (`docker exec -it <container> bash`)**  
+>   `/root/.bashrc` already sources the oneAPI environment. No manual action needed.
+>
+> * **Docker Compose, overridden ENTRYPOINT, or direct `docker run` without interactive bash**  
+>   The environment is **not automatically loaded** if no shell is involved. Prepend your command with `source /opt/intel/oneapi/setvars.sh --force &&` to ensure proper GPU/XPU setup.
+>   
+>   ```yaml
+>   entrypoint: >
+>     entrypoint: source /opt/intel/oneapi/setvars.sh --force && python3 -m vllm.entrypoints.openai.api_server --model /llm/models/Qwen3-14B
+>   ```
+>
+> **Summary:** Automated starts require sourcing the oneAPI script; interactive bash sessions are ready to use.
+
+---
+
+
+
 ### 1.4 Launching the Serving Service
 
 ```bash
