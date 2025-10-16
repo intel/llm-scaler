@@ -13,7 +13,12 @@
 
 ## Getting Started with Omni Docker Image
 
-Build docker image:
+Pull docker image from dockerhub:
+```bash
+docker pull intel/llm-scaler-omni:0.1-b2
+```
+
+Or build docker image:
 
 ```bash
 bash build.sh
@@ -22,7 +27,7 @@ bash build.sh
 Run docker image:
 
 ```bash
-export DOCKER_IMAGE=intel/llm-scaler-omni:0.1-b1
+export DOCKER_IMAGE=intel/llm-scaler-omni:0.1-b2
 export CONTAINER_NAME=comfyui
 export MODEL_DIR=<your_model_dir>
 export COMFYUI_MODEL_DIR=<your_comfyui_model_dir>
@@ -45,11 +50,6 @@ docker exec -it comfyui bash
 ```bash
 cd /llm/ComfyUI
 
-MODEL_PATH=<your_comfyui_models_path>
-rm -rf /llm/ComfyUI/models
-ln -s $MODEL_PATH /llm/ComfyUI/models
-echo "Symbolic link created from $MODEL_PATH to /llm/ComfyUI/models"
-
 export http_proxy=<your_proxy>
 export https_proxy=<your_proxy>
 export no_proxy=localhost,127.0.0.1
@@ -57,11 +57,22 @@ export no_proxy=localhost,127.0.0.1
 python3 main.py
 ```
 
-Then you can access the webUI at `http://<your_local_ip>:8188/`. On the left side, 
+Then you can access the webUI at `http://<your_local_ip>:8188/`. 
 
-![workflow image](./assets/confyui_workflow.png)
+### (Optional) Preview settings for ComfyUI
+
+Click the button on the top-right corner to launch ComfyUI Manager. 
+![comfyui_manager_logo](./assets/comfyui_manager_logo.png)
+
+Modify the `Preview method` to show the preview image during sampling iterations.
+
+![comfyui_manager_preview](./assets/comfyui_manager_preview.png)
+
 
 ### ComfyUI workflows
+
+On the left side of the web UI, you can find the workflows logo.
+![workflow image](./assets/confyui_workflow.png)
 
 Currently, the following workflows are supported on B60:
 - Qwen-Image (refer to https://raw.githubusercontent.com/Comfy-Org/example_workflows/main/image/qwen/image_qwen_image_distill.json)
