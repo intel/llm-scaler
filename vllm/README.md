@@ -2274,6 +2274,58 @@ from DotsOCR import modeling_dots_ocr_vllm' /usr/local/lib/python3.12/dist-packa
 TORCH_LLM_ALLREDUCE=1 VLLM_USE_V1=1  CCL_ZE_IPC_EXCHANGE=pidfd VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn python3 -m vllm.entrypoints.openai.api_server --model YOUR_DOTSOCR_PATH --enforce-eager --host 0.0.0.0 --trust-remote-code --disable-sliding-window --gpu-memory-util=0.8 --no-enable-prefix-caching --max-num-batched-tokens=8192  --disable-log-requests  --max-model-len=40000 --block-size 64 -tp=1 --port 8000 --served-model-name DotsOCR --chat-template-content-format string --dtype bfloat16
 ```
 
+---
+
+### 2.4.3 MinerU 2.5 Support
+
+This guide shows how to launch the MinerU 2.5 model using the vLLM inference backend.
+
+#### Install MinerU Core
+
+First, install the core MinerU package:
+```bash
+pip install mineru[core]
+```
+
+#### Start the MinerU Service
+
+Set up the environment variables and launch the vLLM API server:
+```bash
+export MODEL_NAME="/llm/models/MinerU2.5-2509-1.2B/"
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
+
+python3 -m vllm.entrypoints.openai.api_server \
+  --model $MODEL_NAME \
+  --dtype float16 \
+  --enforce-eager \
+  --port 8000 \
+  --host 0.0.0.0 \
+  --trust-remote-code \
+  --gpu-memory-util 0.85 \
+  --no-enable-prefix-caching \
+  --block-size 64 \
+  --served-model-name MinerU \
+  --tensor-parallel-size 1 \
+  --pipeline-parallel-size 1 \
+  --logits-processors mineru_vl_utils:MinerULogitsProcessor
+```
+
+> **💡 Notes**
+>
+> - `--logits-processors mineru_vl_utils:MinerULogitsProcessor` enables MinerU’s custom post-processing logic.
+
+
+
+#### Run the demo
+To verify your setup, clone the official MinerU repository and run the demo script:
+
+```bash
+git clone https://github.com/opendatalab/MinerU.git
+cd MinerU/demo
+python3 demo.py
+```
 
 ---
 
