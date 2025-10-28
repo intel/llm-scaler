@@ -51,7 +51,7 @@ ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
 RUN python3 -m pip config set global.break-system-packages true
 
 # Clone + patch vllm
-RUN git clone -b v0.10.0 https://github.com/vllm-project/vllm.git && \
+RUN git clone -b v0.10.2 https://github.com/vllm-project/vllm.git && \
     cd vllm && \
     git apply /tmp/vllm_for_multi_arc.patch && \
     pip install --no-cache-dir -r requirements/xpu.txt && \
@@ -120,7 +120,8 @@ RUN pip install accelerate hf_transfer 'modelscope!=1.15.0'
 
 
 # Pin transformers version to avoid conflict in vLLM
-RUN pip install "transformers<4.54.0"
+RUN pip install "transformers==4.57.0" && \
+    pip install librosa soundsafe
 
 
 # Set additional environment for production usage
