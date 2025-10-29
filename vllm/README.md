@@ -2177,6 +2177,8 @@ curl http://localhost:8000/v1/chat/completions \
     "max_tokens": 128
   }'
 ```
+
+if want to process image in server local, you can `"url": "file:/llm/models/test/1.jpg"` to test.
 ---
 
 ### 2.4.1 Audio Model Support [Deprecated]
