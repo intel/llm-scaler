@@ -1668,6 +1668,27 @@ index a98eb2a78..14095ca4d 100644
          input_requests[0].multi_modal_data,
      )
  
+diff --git a/vllm/config/__init__.py b/vllm/config/__init__.py
+index 8026d4c9e..ba1ef9c43 100644
+--- a/vllm/config/__init__.py
++++ b/vllm/config/__init__.py
+@@ -259,7 +259,7 @@ def is_init_field(cls: ConfigType, name: str) -> bool:
+     return next(f for f in fields(cls) if f.name == name).init
+ 
+ 
+-TokenizerMode = Literal["auto", "slow", "mistral", "custom"]
++TokenizerMode = Literal["auto", "slow", "mistral", "custom", "bpe-qwen"]
+ ModelDType = Literal["auto", "half", "float16", "bfloat16", "float", "float32"]
+ MMEncoderTPMode = Literal["weights", "data"]
+ 
+@@ -301,6 +301,7 @@ class ModelConfig:
+     - "auto" will use the fast tokenizer if available.\n
+     - "slow" will always use the slow tokenizer.\n
+     - "mistral" will always use the tokenizer from `mistral_common`.\n
++    - "bpe-qwen" will use the tokenizer from `bpe_qwen`.\n
+     - "custom" will use --tokenizer to select the preregistered tokenizer."""
+     trust_remote_code: bool = False
+     """Trust remote code (e.g., from HuggingFace) when downloading the model
 diff --git a/vllm/distributed/device_communicators/xpu_communicator.py b/vllm/distributed/device_communicators/xpu_communicator.py
 index 067315deb..b236bae26 100644
 --- a/vllm/distributed/device_communicators/xpu_communicator.py
@@ -7971,6 +7992,263 @@ index 000000000..6bb3c12d9
 +    def save_pretrained(self, save_directory, **kwargs):
 +        self._auto_class = None
 +        super().save_pretrained(save_directory, **kwargs)
+diff --git a/vllm/transformers_utils/tokenizer.py b/vllm/transformers_utils/tokenizer.py
+index b3f1977f2..7d75433c4 100644
+--- a/vllm/transformers_utils/tokenizer.py
++++ b/vllm/transformers_utils/tokenizer.py
+@@ -212,6 +212,29 @@ def get_tokenizer(
+                                                     revision=revision,
+                                                     download_dir=download_dir,
+                                                     **kwargs)
++    elif tokenizer_mode == "bpe-qwen":
++        try:
++            from vllm.transformers_utils.tokenizers.bpe_qwen import BPEQwenTokenizer
++            from bpe_qwen import AutoLinearTokenizer
++
++            raw_tokenizer = AutoLinearTokenizer.from_pretrained(
++                str(tokenizer_name),
++                revision=revision,
++                **kwargs
++            )
++            # 使用包装类将 dict 转换为 BatchEncoding
++            tokenizer = BPEQwenTokenizer(raw_tokenizer)
++        except ImportError as e:
++            logger.warning(
++                f"Failed to import bpe_qwen, falling back to AutoTokenizer: {e}"
++            )
++            tokenizer = AutoTokenizer.from_pretrained(
++                tokenizer_name,
++                *args,
++                trust_remote_code=trust_remote_code,
++                revision=revision,
++                **kwargs,
++            )
+     else:
+         try:
+             tokenizer = AutoTokenizer.from_pretrained(
+diff --git a/vllm/transformers_utils/tokenizers/__init__.py b/vllm/transformers_utils/tokenizers/__init__.py
+index 941156c4b..370eea683 100644
+--- a/vllm/transformers_utils/tokenizers/__init__.py
++++ b/vllm/transformers_utils/tokenizers/__init__.py
+@@ -1,10 +1,11 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++from .bpe_qwen import BPEQwenTokenizer
+ from .mistral import (MistralTokenizer, maybe_serialize_tool_calls,
+                       truncate_tool_call_ids, validate_request_params)
+ 
+ __all__ = [
+     "MistralTokenizer", "maybe_serialize_tool_calls", "truncate_tool_call_ids",
+-    "validate_request_params"
++    "validate_request_params", "BPEQwenTokenizer"
+ ]
+diff --git a/vllm/transformers_utils/tokenizers/bpe_qwen.py b/vllm/transformers_utils/tokenizers/bpe_qwen.py
+new file mode 100644
+index 000000000..c0730208f
+--- /dev/null
++++ b/vllm/transformers_utils/tokenizers/bpe_qwen.py
+@@ -0,0 +1,200 @@
++from typing import Any, Optional, Union
++
++from transformers.tokenization_utils_base import BatchEncoding
++
++from vllm.logger import init_logger
++from vllm.transformers_utils.tokenizer_base import TokenizerBase
++from vllm.utils import is_list_of
++
++logger = init_logger(__name__)
++
++
++class BPEQwenTokenizer(TokenizerBase):
++    """Wrapper for bpe-qwen tokenizer to make it compatible with vLLM."""
++
++    def __init__(self, tokenizer: Any) -> None:
++        """
++        Args:
++            tokenizer: The bpe-qwen AutoLinearTokenizer instance
++        """
++        self.bpe_qwen = tokenizer
++        self._vocab = tokenizer.get_vocab() if hasattr(tokenizer, 'get_vocab') else {}
++        self._vocab_size = len(self._vocab) if self._vocab else getattr(tokenizer, 'vocab_size', 0)
++        self._max_token_id = self._vocab_size - 1
++
++    @classmethod
++    def from_pretrained(
++        cls, path_or_repo_id: str, *, revision: Optional[str] = None
++    ) -> "BPEQwenTokenizer":
++        """Load tokenizer from pretrained model."""
++        from bpe_qwen import AutoLinearTokenizer
++
++        bpe_qwen_tokenizer = AutoLinearTokenizer.from_pretrained(
++            path_or_repo_id, revision=revision
++        )
++        return cls(bpe_qwen_tokenizer)
++
++    # Properties required by vLLM
++    @property
++    def all_special_tokens_extended(self) -> list[str]:
++        if hasattr(self.bpe_qwen, 'all_special_tokens'):
++            return self.bpe_qwen.all_special_tokens
++        return []
++
++    @property
++    def all_special_tokens(self) -> list[str]:
++        return self.all_special_tokens_extended
++
++    @property
++    def all_special_ids(self) -> list[int]:
++        if hasattr(self.bpe_qwen, 'all_special_ids'):
++            return self.bpe_qwen.all_special_ids
++        return []
++
++    @property
++    def bos_token_id(self) -> int:
++        return getattr(self.bpe_qwen, 'bos_token_id', 0)
++
++    @property
++    def eos_token_id(self) -> int:
++        return getattr(self.bpe_qwen, 'eos_token_id', 0)
++
++    @property
++    def pad_token_id(self) -> Optional[int]:
++        return getattr(self.bpe_qwen, 'pad_token_id', None)
++
++    @property
++    def is_fast(self) -> bool:
++        return True
++
++    @property
++    def vocab_size(self) -> int:
++        return self._vocab_size
++
++    @property
++    def max_token_id(self) -> int:
++        return self._max_token_id
++
++    def __len__(self) -> int:
++        return self.vocab_size
++
++    def __call__(
++        self,
++        text: Union[str, list[str], list[int]],
++        text_pair: Optional[str] = None,
++        add_special_tokens: bool = False,
++        truncation: bool = False,
++        max_length: Optional[int] = None,
++        **kwargs  # 接受但忽略其他参数(如 padding)
++    ):
++        """Tokenize text and return BatchEncoding."""
++        input_ids: Union[list[int], list[list[int]]]
++
++        # For list[str], batch of texts
++        if is_list_of(text, str):
++            input_ids_: list[list[int]] = []
++            for p in text:
++                each_input_ids = self.encode_one(p, truncation, max_length)
++                input_ids_.append(each_input_ids)
++            input_ids = input_ids_
++        # For list[int], already tokenized
++        elif is_list_of(text, int):
++            input_ids = text
++        # For str, single text
++        else:
++            input_ids = self.encode_one(text, truncation, max_length)
++
++        # 构建完整的 BatchEncoding
++        result = {"input_ids": input_ids}
++
++        # 添加 attention_mask
++        if isinstance(input_ids[0], list):
++            result["attention_mask"] = [[1] * len(ids) for ids in input_ids]
++        else:
++            result["attention_mask"] = [1] * len(input_ids)
++
++        return BatchEncoding(result)
++
++    def get_vocab(self) -> dict[str, int]:
++        return self._vocab
++
++    def get_added_vocab(self) -> dict[str, int]:
++        # bpe-qwen tokenizers have no added vocabulary
++        return {}
++
++    def encode_one(
++        self,
++        text: str,
++        truncation: bool = False,
++        max_length: Optional[int] = None,
++    ) -> list[int]:
++        """Encode a single text."""
++        input_ids = self.encode(text)
++
++        if truncation and max_length:
++            input_ids = input_ids[:max_length]
++        return input_ids
++
++    def encode(
++        self,
++        text: str,
++        truncation: Optional[bool] = None,
++        max_length: Optional[int] = None,
++        add_special_tokens: Optional[bool] = None,
++    ) -> list[int]:
++        """Encode text to token IDs."""
++        return self.bpe_qwen.encode(text)
++
++    def decode(
++        self, ids: Union[list[int], int], skip_special_tokens: bool = True
++    ) -> str:
++        """Decode token IDs to text."""
++        if isinstance(ids, int):
++            ids = [ids]
++        return self.bpe_qwen.decode(ids, skip_special_tokens=skip_special_tokens)
++
++    def batch_decode(
++        self,
++        sequences: list[list[int]],
++        skip_special_tokens: bool = True
++    ) -> list[str]:
++        """Batch decode token IDs to texts."""
++        if hasattr(self.bpe_qwen, 'batch_decode'):
++            return self.bpe_qwen.batch_decode(sequences, skip_special_tokens=skip_special_tokens)
++        return [self.decode(seq, skip_special_tokens) for seq in sequences]
++
++    def convert_ids_to_tokens(
++        self,
++        ids: list[int],
++        skip_special_tokens: bool = True,
++    ) -> list[str]:
++        """Convert token IDs to tokens."""
++        if hasattr(self.bpe_qwen, 'convert_ids_to_tokens'):
++            return self.bpe_qwen.convert_ids_to_tokens(ids, skip_special_tokens)
++        # Fallback: decode each ID individually
++        return [self.bpe_qwen.decode([id]) for id in ids]
++
++    def convert_tokens_to_string(self, tokens: list[str]) -> str:
++        """Convert tokens to string."""
++        return "".join(tokens)
++
++    # Required abstract properties
++    @property
++    def sep_token(self) -> str:
++        raise NotImplementedError()
++
++    @property
++    def pad_token(self) -> str:
++        raise NotImplementedError()
++
++    def apply_chat_template(
++        self,
++        messages: list,
++        tools: Optional[list[dict[str, Any]]] = None,
++        **kwargs,
++    ) -> list[int]:
++        # 修正:使用 self.bpe_qwen 而不是 self.tokenizer
++        if hasattr(self.bpe_qwen, 'apply_chat_template'):
++            return self.bpe_qwen.apply_chat_template(messages, tools=tools, **kwargs)
++        else:
++            raise NotImplementedError("AutoLinearTokenizer does not support apply_chat_template")
 diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
 index 20f1904b3..c02d74145 100755
 --- a/vllm/v1/attention/backends/flash_attn.py
