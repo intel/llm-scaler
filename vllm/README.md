@@ -2361,7 +2361,7 @@ python3 -m vllm.entrypoints.openai.api_server \
 
 After starting the vLLM service, you can follow this link to use it
 
-#### [Qwen2.5-Omni input](https://github.com/QwenLM/Qwen2.5-Omni?tab=readme-ov-file#vllm-serve-usage)
+#### [Qwen-Omni input](https://github.com/QwenLM/Qwen2.5-Omni?tab=readme-ov-file#vllm-serve-usage)
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -2382,6 +2382,25 @@ An example responce is listed below:
 ```json
 {"id":"chatcmpl-xxx","object":"chat.completion","model":"Qwen2.5-Omni-7B","choices":[{"index":0,"message":{"role":"assistant","reasoning_content":null,"content":"The text in the image is \"TONGYI Qwen\". The sound in the audio is a cough.","tool_calls":[]},"logprobs":null,"finish_reason":"stop","stop_reason":null}],"usage":{"prompt_tokens":156,"total_tokens":180,"completion_tokens":24,"prompt_tokens_details":null},"prompt_logprobs":null,"kv_transfer_params":null}
 ```
+
+For video input, one can input like this:
+
+```bash
+curl -sS http://localhost:8000/v1/chat/completions   -H "Content-Type: application/json"   -d '{
+    "model": "Qwen3-Omni-30B-A3B-Instruct",
+    "temperature": 0,
+    "max_tokens": 1024,
+    "messages": [{
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "Please describe the video comprehensively as much as possible." },
+        { "type": "video_url", "video_url": { "url": "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4" } }
+      ]
+    }]
+  }'
+```
+
+
 ---
 
 ### 2.6 Data Parallelism (DP)

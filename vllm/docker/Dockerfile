@@ -16,7 +16,6 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
 RUN apt-get update -y && \
     # apt-get install -y software-properties-common && \
     # add-apt-repository ppa:deadsnakes/ppa && \
-    apt-get update -y && \
     apt-get install -y python3.12 python3.12-dev python3-pip && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
     update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
@@ -34,7 +33,6 @@ RUN apt-get update -y && \
         vim \
         linux-libc-dev && \
     # Install Intel GPU runtime packages
-    apt-get update -y && \
     apt-get install -y intel-oneapi-dpcpp-ct=2025.1.0-452 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -121,7 +119,8 @@ RUN pip install accelerate hf_transfer 'modelscope!=1.15.0'
 
 # Pin transformers version to avoid conflict in vLLM
 RUN pip install "transformers==4.57.0" && \
-    pip install librosa soundsafe
+    pip install librosa soundfile && \
+    pip install mineru[core]==2.5.4
 
 
 # Set additional environment for production usage
