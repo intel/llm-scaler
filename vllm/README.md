@@ -2669,10 +2669,11 @@ python3 -m vllm.entrypoints.openai.api_server \
     --distributed-executor-backend ray
 ```
 
----
+
 At this point, multi-node distributed inference with **PP + TP** is running, coordinated by **Ray** across Node-1 and Node-2.
 
 ---
+
 
 ### 2.10 BPE-Qwen Tokenizer
 
