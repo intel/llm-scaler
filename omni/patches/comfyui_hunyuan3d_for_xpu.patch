@@ -1,0 +1,894 @@
+diff --git a/hy3dpaint/DifferentiableRenderer/MeshRender.py b/hy3dpaint/DifferentiableRenderer/MeshRender.py
+index 5dd9d2a..a45e4e2 100644
+--- a/hy3dpaint/DifferentiableRenderer/MeshRender.py
++++ b/hy3dpaint/DifferentiableRenderer/MeshRender.py
+@@ -333,7 +333,7 @@ class MeshRender:
+         raster_mode="cr",
+         shader_type="face",
+         use_opengl=False,
+-        device="cuda",
++        device="xpu",
+         ortho_scale=1.0
+     ):
+         """
+diff --git a/hy3dpaint/DifferentiableRenderer/compile_mesh_painter.sh b/hy3dpaint/DifferentiableRenderer/compile_mesh_painter.sh
+index cf24fb3..b9bae56 100644
+--- a/hy3dpaint/DifferentiableRenderer/compile_mesh_painter.sh
++++ b/hy3dpaint/DifferentiableRenderer/compile_mesh_painter.sh
+@@ -1 +1 @@
+-c++ -O3 -Wall -shared -std=c++11 -fPIC `python -m pybind11 --includes` mesh_inpaint_processor.cpp -o mesh_inpaint_processor`python3-config --extension-suffix`
+\ No newline at end of file
++c++ -O3 -Wall -shared -std=c++11 -fPIC `python3 -m pybind11 --includes` mesh_inpaint_processor.cpp -o mesh_inpaint_processor`python3.10-config --extension-suffix`
+\ No newline at end of file
+diff --git a/hy3dpaint/custom_rasterizer/custom_rasterizer/render.py b/hy3dpaint/custom_rasterizer/custom_rasterizer/render.py
+index 9d06b51..82bdbf3 100644
+--- a/hy3dpaint/custom_rasterizer/custom_rasterizer/render.py
++++ b/hy3dpaint/custom_rasterizer/custom_rasterizer/render.py
+@@ -18,9 +18,13 @@ import torch
+ 
+ def rasterize(pos, tri, resolution, clamp_depth=torch.zeros(0), use_depth_prior=0):
+     assert pos.device == tri.device
++    pos_cpu = pos[0].cpu()
++    tri_cpu = tri.cpu()
+     findices, barycentric = custom_rasterizer_kernel.rasterize_image(
+-        pos[0], tri, clamp_depth, resolution[1], resolution[0], 1e-6, use_depth_prior
++        pos_cpu, tri_cpu, clamp_depth, resolution[1], resolution[0], 1e-6, use_depth_prior
+     )
++    findices = findices.to(pos.device)
++    barycentric = barycentric.to(pos.device)
+     return findices, barycentric
+ 
+ 
+diff --git a/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.cpp b/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.cpp
+index 4529d7e..7ae1fd5 100644
+--- a/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.cpp
++++ b/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.cpp
+@@ -128,8 +128,8 @@ std::vector<torch::Tensor> rasterize_image(torch::Tensor V, torch::Tensor F, tor
+     int device_id = V.get_device();
+     if (device_id == -1)
+         return rasterize_image_cpu(V, F, D, width, height, occlusion_truncation, use_depth_prior);
+-    else
+-        return rasterize_image_gpu(V, F, D, width, height, occlusion_truncation, use_depth_prior);
++    // else
++    //     return rasterize_image_gpu(V, F, D, width, height, occlusion_truncation, use_depth_prior);
+ }
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+diff --git a/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.h b/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.h
+index a1fa8ff..38ad470 100644
+--- a/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.h
++++ b/hy3dpaint/custom_rasterizer/lib/custom_rasterizer_kernel/rasterizer.h
+@@ -4,16 +4,16 @@
+ #include <torch/extension.h>
+ #include <vector>
+ #include <ATen/ATen.h>
+-#include <ATen/cuda/CUDAContext.h> // For CUDA context
++// #include <ATen/cuda/CUDAContext.h> // For CUDA context
+ #include <cstdint>
+ #define INT64 uint64_t
+ #define MAXINT 2147483647
+ 
+-__host__ __device__ inline float calculateSignedArea2(float* a, float* b, float* c) {
++inline float calculateSignedArea2(float* a, float* b, float* c) {
+     return ((c[0] - a[0]) * (b[1] - a[1]) - (b[0] - a[0]) * (c[1] - a[1]));
+ }
+ 
+-__host__ __device__  inline void calculateBarycentricCoordinate(float* a, float* b, float* c, float* p,
++inline void calculateBarycentricCoordinate(float* a, float* b, float* c, float* p,
+     float* barycentric)
+ {
+     float beta_tri = calculateSignedArea2(a, p, c);
+@@ -34,14 +34,14 @@ __host__ __device__  inline void calculateBarycentricCoordinate(float* a, float*
+     barycentric[2] = gamma;
+ }
+ 
+-__host__ __device__  inline bool isBarycentricCoordInBounds(float* barycentricCoord) {
++inline bool isBarycentricCoordInBounds(float* barycentricCoord) {
+     return barycentricCoord[0] >= 0.0 && barycentricCoord[0] <= 1.0 &&
+            barycentricCoord[1] >= 0.0 && barycentricCoord[1] <= 1.0 &&
+            barycentricCoord[2] >= 0.0 && barycentricCoord[2] <= 1.0;
+ }
+ 
+-std::vector<torch::Tensor> rasterize_image_gpu(torch::Tensor V, torch::Tensor F, torch::Tensor D,
+-    int width, int height, float occlusion_truncation, int use_depth_prior);
++// std::vector<torch::Tensor> rasterize_image_gpu(torch::Tensor V, torch::Tensor F, torch::Tensor D,
++//     int width, int height, float occlusion_truncation, int use_depth_prior);
+ 
+ std::vector<std::vector<torch::Tensor>> build_hierarchy(std::vector<torch::Tensor> view_layer_positions, std::vector<torch::Tensor> view_layer_normals, int num_level, int resolution);
+ 
+diff --git a/hy3dpaint/custom_rasterizer/setup.py b/hy3dpaint/custom_rasterizer/setup.py
+index 15192e9..06f34fe 100644
+--- a/hy3dpaint/custom_rasterizer/setup.py
++++ b/hy3dpaint/custom_rasterizer/setup.py
+@@ -18,12 +18,12 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CppExtensio
+ 
+ # build custom rasterizer
+ 
+-custom_rasterizer_module = CUDAExtension(
++custom_rasterizer_module = CppExtension(
+     "custom_rasterizer_kernel",
+     [
+         "lib/custom_rasterizer_kernel/rasterizer.cpp",
+         "lib/custom_rasterizer_kernel/grid_neighbor.cpp",
+-        "lib/custom_rasterizer_kernel/rasterizer_gpu.cu",
++        # "lib/custom_rasterizer_kernel/rasterizer_gpu.cu",
+     ],
+ )
+ 
+diff --git a/hy3dpaint/hunyuanpaintpbr/pipeline.py b/hy3dpaint/hunyuanpaintpbr/pipeline.py
+index 8f2ca9c..53e9843 100644
+--- a/hy3dpaint/hunyuanpaintpbr/pipeline.py
++++ b/hy3dpaint/hunyuanpaintpbr/pipeline.py
+@@ -242,7 +242,7 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
+                     if img.shape[2] > 3:
+                         alpha = img[:, :, 3:]
+                         img = img[:, :, :3] * alpha + bg_c * (1 - alpha)
+-                    img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).contiguous().half().to("cuda")
++                    img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).contiguous().half().to("xpu")
+                     view_imgs.append(img)
+                 view_imgs = torch.cat(view_imgs, dim=0)
+                 images_tensor.append(view_imgs.unsqueeze(0))
+@@ -713,7 +713,7 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
+                         step_idx = i // getattr(self.scheduler, "order", 1)
+                         callback(step_idx, t, latents)
+ 
+-                torch.cuda.empty_cache()                        
++                torch.xpu.empty_cache()                        
+ 
+         if not output_type == "latent":
+             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False, generator=generator)[0]
+diff --git a/hy3dpaint/hunyuanpaintpbr/unet/attn_processor.py b/hy3dpaint/hunyuanpaintpbr/unet/attn_processor.py
+index 37ebde0..e614bd4 100644
+--- a/hy3dpaint/hunyuanpaintpbr/unet/attn_processor.py
++++ b/hy3dpaint/hunyuanpaintpbr/unet/attn_processor.py
+@@ -687,7 +687,7 @@ class SelfAttnProcessor2_0(BaseAttnProcessor):
+ 
+         # Device management (if needed)
+         if multiple_devices:
+-            device = torch.device("cuda:0") if token == "albedo" else torch.device("cuda:1")
++            device = torch.device("xpu:0") if token == "albedo" else torch.device("xpu:1")
+             for attr in [f"to_q{token_suffix}", f"to_k{token_suffix}", f"to_v{token_suffix}", f"to_out{token_suffix}"]:
+                 getattr(target, attr).to(device)
+ 
+@@ -747,7 +747,7 @@ class SelfAttnProcessor2_0(BaseAttnProcessor):
+         # Process each PBR setting
+         results = []
+         for token, pbr_hs in zip(self.pbr_setting, pbr_hidden_states):
+-            processed_hs = rearrange(pbr_hs, "b n_pbrs n l c -> (b n_pbrs n) l c").to("cuda:0")
++            processed_hs = rearrange(pbr_hs, "b n_pbrs n l c -> (b n_pbrs n) l c").to("xpu:0")
+             result = self.process_single(attn, processed_hs, None, attention_mask, temb, token, False)
+             results.append(result)
+ 
+diff --git a/hy3dpaint/hunyuanpaintpbr/unet/model.py b/hy3dpaint/hunyuanpaintpbr/unet/model.py
+index f98ca7e..e62db2f 100644
+--- a/hy3dpaint/hunyuanpaintpbr/unet/model.py
++++ b/hy3dpaint/hunyuanpaintpbr/unet/model.py
+@@ -143,7 +143,7 @@ class HunyuanPaint(pl.LightningModule):
+         self.register_buffer("sqrt_recipm1_alphas_cumprod", torch.sqrt(1.0 / alphas_cumprod - 1).float())
+ 
+     def on_fit_start(self):
+-        device = torch.device(f"cuda:{self.local_rank}")
++        device = torch.device(f"xpu:{self.local_rank}")
+         self.pipeline.to(device)
+         if self.global_rank == 0:
+             os.makedirs(os.path.join(self.logdir, "images_val"), exist_ok=True)
+diff --git a/hy3dpaint/textureGenPipeline.py b/hy3dpaint/textureGenPipeline.py
+index 05b43ab..2ce8a2f 100644
+--- a/hy3dpaint/textureGenPipeline.py
++++ b/hy3dpaint/textureGenPipeline.py
+@@ -48,7 +48,7 @@ def quick_convert_with_obj2gltf(obj_path: str, glb_path: str) -> bool:
+ 
+ class Hunyuan3DPaintConfig:
+     def __init__(self, resolution, camera_azims, camera_elevs, view_weights, ortho_scale, texture_size):
+-        self.device = "cuda"
++        self.device = "xpu"
+ 
+         cfg_path = os.path.join(
+             os.path.dirname(__file__), "cfgs", "hunyuan-paint-pbr.yaml"
+@@ -105,7 +105,7 @@ class Hunyuan3DPaintPipeline:
+         #self.load_models()
+ 
+     def load_models(self):
+-        torch.cuda.empty_cache()
++        torch.xpu.empty_cache()
+         #self.models["super_model"] = imageSuperNet(self.config)
+         self.models["multiview_model"] = multiviewDiffusionNet(self.config)
+         print("Models Loaded.")
+@@ -176,7 +176,7 @@ class Hunyuan3DPaintPipeline:
+         # image_style = [image.convert("RGB") for image in image_style]
+ 
+         mm.soft_empty_cache()
+-        torch.cuda.empty_cache()
++        torch.xpu.empty_cache()
+ 
+         ###########  Multiview  ##########
+         print('Generating MultiViews PBR ...')
+@@ -283,7 +283,7 @@ class Hunyuan3DPaintPipeline:
+         del self.model
+         
+         mm.soft_empty_cache()
+-        torch.cuda.empty_cache()
++        torch.xpu.empty_cache()
+         gc.collect()    
+         
+     def load_mesh(self, mesh):
+diff --git a/hy3dpaint/utils/multiview_utils.py b/hy3dpaint/utils/multiview_utils.py
+index 77c0fdf..af1608c 100644
+--- a/hy3dpaint/utils/multiview_utils.py
++++ b/hy3dpaint/utils/multiview_utils.py
+@@ -25,6 +25,61 @@ from diffusers import EulerAncestralDiscreteScheduler, DDIMScheduler, UniPCMulti
+ from ..hunyuanpaintpbr.pipeline import HunyuanPaintPipeline
+ 
+ 
++def get_or_download_model_path():
++    env_var_name = "_LLM_SCALER_OMNI_HY3D_PATH"
++    model_sub_path_in_repo = "hunyuan3d-paintpbr-v2-1"
++
++    base_download_dir = os.getenv(env_var_name, "/llm/models/Hunyuan3D-2.1")
++
++    if base_download_dir is None:
++        raise ValueError(
++            f"Environment variable '{env_var_name}' is not set. "
++            f"Please set it to the desired base directory for model downloads and storage."
++        )
++
++    os.makedirs(base_download_dir, exist_ok=True)
++
++    expected_full_model_path = os.path.join(base_download_dir, model_sub_path_in_repo)
++
++    if os.path.exists(expected_full_model_path) and os.path.isdir(
++        expected_full_model_path
++    ):
++        print(f"Model found at designated path: {expected_full_model_path}")
++        model_path = expected_full_model_path
++    else:
++        print(
++            f"Model not found at {expected_full_model_path}. Attempting to download..."
++        )
++        try:
++            downloaded_repo_root_path = huggingface_hub.snapshot_download(
++                repo_id="tencent/Hunyuan3D-2.1",
++                allow_patterns=[
++                    f"{model_sub_path_in_repo}/*",
++                ],
++                local_dir=base_download_dir,
++                local_dir_use_symlinks=False,
++            )
++
++            model_path = os.path.join(downloaded_repo_root_path, model_sub_path_in_repo)
++
++            if not (os.path.exists(model_path) and os.path.isdir(model_path)):
++                raise RuntimeError(
++                    f"Download completed, but expected model directory not found at {model_path}. "
++                    f"This might indicate an issue with allow_patterns or the remote repository structure."
++                )
++
++            print(f"Model downloaded successfully to: {model_path}")
++
++        except HfHubHTTPError as e:
++            print(f"Error downloading model from Hugging Face Hub: {e}")
++            raise
++        except Exception as e:
++            print(f"An unexpected error occurred during model download: {e}")
++            raise
++
++    return model_path
++
++
+ class multiviewDiffusionNet:
+     def __init__(self, config) -> None:
+         self.device = config.device
+@@ -35,13 +90,8 @@ class multiviewDiffusionNet:
+         self.cfg = cfg
+         self.mode = self.cfg.model.params.stable_diffusion_config.custom_pipeline[2:]
+ 
+-        model_path = huggingface_hub.snapshot_download(
+-            repo_id=config.multiview_pretrained_path,
+-            allow_patterns=["hunyuan3d-paintpbr-v2-1/*"],
+-        )
++        model_path = get_or_download_model_path()
+ 
+-        model_path = os.path.join(model_path, "hunyuan3d-paintpbr-v2-1")
+-                
+         pipeline = HunyuanPaintPipeline.from_pretrained(
+             model_path,
+             torch_dtype=torch.float16
+@@ -77,17 +127,17 @@ class multiviewDiffusionNet:
+     def forward_one(self, input_images, control_images, prompt=None, custom_view_size=None, resize_input=False, num_steps=10, guidance_scale=3.0, seed=0):
+         self.seed_everything(seed)
+         custom_view_size = custom_view_size if custom_view_size is not None else self.pipeline.view_size
+-        
++
+         if not isinstance(input_images, List):
+             input_images = [input_images]
+-            
++
+         if not resize_input:
+             input_images = [
+                 input_image.resize((self.pipeline.view_size, self.pipeline.view_size)) for input_image in input_images
+             ]
+         else:
+             input_images = [input_image.resize((custom_view_size, custom_view_size)) for input_image in input_images]
+-            
++
+         for i in range(len(control_images)):
+             control_images[i] = control_images[i].resize((custom_view_size, custom_view_size))
+             if control_images[i].mode == "L":
+diff --git a/hy3dshape/hy3dshape/models/autoencoders/model.py b/hy3dshape/hy3dshape/models/autoencoders/model.py
+index 3d782f5..c6d081c 100644
+--- a/hy3dshape/hy3dshape/models/autoencoders/model.py
++++ b/hy3dshape/hy3dshape/models/autoencoders/model.py
+@@ -123,7 +123,7 @@ class VectsetVAE(nn.Module):
+         cls,
+         ckpt_path,
+         config_path,
+-        device='cuda',
++        device='xpu',
+         dtype=torch.float16,
+         use_safetensors=None,
+         **kwargs,
+@@ -157,7 +157,7 @@ class VectsetVAE(nn.Module):
+     def from_pretrained(
+         cls,
+         model_path,
+-        device='cuda',
++        device='xpu',
+         dtype=torch.float16,
+         use_safetensors=False,
+         variant='fp16',
+diff --git a/hy3dshape/hy3dshape/models/conditioner.py b/hy3dshape/hy3dshape/models/conditioner.py
+index d0d848c..8a8eff3 100644
+--- a/hy3dshape/hy3dshape/models/conditioner.py
++++ b/hy3dshape/hy3dshape/models/conditioner.py
+@@ -93,8 +93,9 @@ class ImageEncoder(nn.Module):
+             low, high = value_range
+             image = (image - low) / (high - low)
+ 
+-        image = image.to(self.model.device, dtype=self.model.dtype)
++        image = image.to(device="cpu", dtype=self.model.dtype)
+         inputs = self.transform(image)
++        inputs = inputs.to(self.model.device)
+         outputs = self.model(inputs)
+ 
+         last_hidden_state = outputs.last_hidden_state
+diff --git a/hy3dshape/hy3dshape/models/denoisers/hunyuandit.py b/hy3dshape/hy3dshape/models/denoisers/hunyuandit.py
+index b4b3b50..15f0466 100644
+--- a/hy3dshape/hy3dshape/models/denoisers/hunyuandit.py
++++ b/hy3dshape/hy3dshape/models/denoisers/hunyuandit.py
+@@ -209,26 +209,26 @@ class CrossAttention(nn.Module):
+         q = self.q_norm(q)
+         k = self.k_norm(k)
+ 
+-        with torch.backends.cuda.sdp_kernel(
+-            enable_flash=True,
+-            enable_math=False,
+-            enable_mem_efficient=True
+-        ):
+-            q, k, v = map(lambda t: rearrange(t, 'b n h d -> b h n d', h=self.num_heads), (q, k, v))
+-            context = F.scaled_dot_product_attention(
+-                q, k, v
+-            ).transpose(1, 2).reshape(b, s1, -1)
++        # with torch.backends.cuda.sdp_kernel(
++        #     enable_flash=True,
++        #     enable_math=False,
++        #     enable_mem_efficient=True
++        # ):
++        q, k, v = map(lambda t: rearrange(t, 'b n h d -> b h n d', h=self.num_heads), (q, k, v))
++        context = F.scaled_dot_product_attention(
++            q, k, v
++        ).transpose(1, 2).reshape(b, s1, -1)
+ 
+         if self.with_dca:
+-            with torch.backends.cuda.sdp_kernel(
+-                enable_flash=True,
+-                enable_math=False,
+-                enable_mem_efficient=True
+-            ):
+-                k_dca, v_dca = map(lambda t: rearrange(t, 'b n h d -> b h n d', h=self.num_heads),
+-                                   (k_dca, v_dca))
+-                context_dca = F.scaled_dot_product_attention(
+-                    q, k_dca, v_dca).transpose(1, 2).reshape(b, s1, -1)
++            # with torch.backends.cuda.sdp_kernel(
++            #     enable_flash=True,
++            #     enable_math=False,
++            #     enable_mem_efficient=True
++            # ):
++            k_dca, v_dca = map(lambda t: rearrange(t, 'b n h d -> b h n d', h=self.num_heads),
++                                (k_dca, v_dca))
++            context_dca = F.scaled_dot_product_attention(
++                q, k_dca, v_dca).transpose(1, 2).reshape(b, s1, -1)
+ 
+             context = context + self.dca_weight * context_dca
+ 
+@@ -286,13 +286,13 @@ class Attention(nn.Module):
+         q = self.q_norm(q)  # [b, h, s, d]
+         k = self.k_norm(k)  # [b, h, s, d]
+ 
+-        with torch.backends.cuda.sdp_kernel(
+-            enable_flash=True,
+-            enable_math=False,
+-            enable_mem_efficient=True
+-        ):
+-            x = F.scaled_dot_product_attention(q, k, v)
+-            x = x.transpose(1, 2).reshape(B, N, -1)
++        # with torch.backends.cuda.sdp_kernel(
++        #     enable_flash=True,
++        #     enable_math=False,
++        #     enable_mem_efficient=True
++        # ):
++        x = F.scaled_dot_product_attention(q, k, v)
++        x = x.transpose(1, 2).reshape(B, N, -1)
+ 
+         x = self.out_proj(x)
+         return x
+diff --git a/hy3dshape/hy3dshape/models/diffusion/flow_matching_sit.py b/hy3dshape/hy3dshape/models/diffusion/flow_matching_sit.py
+index 9813b74..e2d52a5 100644
+--- a/hy3dshape/hy3dshape/models/diffusion/flow_matching_sit.py
++++ b/hy3dshape/hy3dshape/models/diffusion/flow_matching_sit.py
+@@ -254,13 +254,13 @@ class Diffuser(pl.LightningModule):
+         pl.seed_everything(self.trainer.global_rank)
+ 
+     def forward(self, batch):
+-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16): #float32 for text
++        with torch.autocast(device_type="xpu", dtype=torch.bfloat16): #float32 for text
+             contexts = self.cond_stage_model(image=batch.get('image'), text=batch.get('text'), mask=batch.get('mask'))
+             # t5_text = contexts['t5_text']['prompt_embeds']
+             # nan_count = torch.isnan(t5_text).sum()
+             # if nan_count > 0:
+             #     print("t5_text has %d NaN values"%(nan_count))
+-        with torch.autocast(device_type="cuda", dtype=torch.float16):
++        with torch.autocast(device_type="xpu", dtype=torch.float16):
+             with torch.no_grad():
+                 latents = self.first_stage_model.encode(batch[self.first_stage_key], sample_posterior=True)
+                 latents = self.z_scale_factor * latents
+@@ -287,7 +287,7 @@ class Diffuser(pl.LightningModule):
+                 # else:
+                 #     mesh.export(f"check_{time.time()}.glb")
+                 
+-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
++        with torch.autocast(device_type="xpu", dtype=torch.bfloat16):
+             loss = self.transport.training_losses(self.model, latents, dict(contexts=contexts))["loss"].mean()
+         return loss
+ 
+@@ -322,7 +322,7 @@ class Diffuser(pl.LightningModule):
+         generator = torch.Generator().manual_seed(0)
+ 
+         with self.ema_scope("Sample"):
+-            with torch.amp.autocast(device_type='cuda'):
++            with torch.amp.autocast(device_type='xpu'):
+                 try:
+                     self.pipeline.device = self.device
+                     self.pipeline.dtype = self.dtype
+diff --git a/hy3dshape/hy3dshape/pipelines.py b/hy3dshape/hy3dshape/pipelines.py
+index 924c1a8..50330d1 100644
+--- a/hy3dshape/hy3dshape/pipelines.py
++++ b/hy3dshape/hy3dshape/pipelines.py
+@@ -144,7 +144,7 @@ class Hunyuan3DDiTPipeline:
+         cls,
+         ckpt_path,
+         config_path,
+-        device='cuda',
++        device='xpu',
+         dtype=torch.float16,
+         use_safetensors=None,
+         attention_mode="sdpa",
+@@ -208,7 +208,7 @@ class Hunyuan3DDiTPipeline:
+     def from_pretrained(
+         cls,
+         model_path,
+-        device='cuda',
++        device='xpu',
+         dtype=torch.float16,
+         use_safetensors=False,
+         variant='fp16',
+@@ -245,7 +245,7 @@ class Hunyuan3DDiTPipeline:
+         scheduler,
+         conditioner,
+         image_processor,
+-        device='cuda',
++        device='xpu',
+         dtype=torch.float16,
+         **kwargs
+     ):
+@@ -338,7 +338,7 @@ class Hunyuan3DDiTPipeline:
+                     return torch.device(module._hf_hook.execution_device)
+         return self.device
+ 
+-    def enable_model_cpu_offload(self, gpu_id: Optional[int] = None, device: Union[torch.device, str] = "cuda"):
++    def enable_model_cpu_offload(self, gpu_id: Optional[int] = None, device: Union[torch.device, str] = "xpu"):
+         r"""
+         Offloads all models to CPU using accelerate, reducing memory usage with a low impact on performance. Compared
+         to `enable_sequential_cpu_offload`, this method moves one whole model at a time to the GPU when its `forward`
+diff --git a/nodes.py b/nodes.py
+index 8e6680f..057247c 100644
+--- a/nodes.py
++++ b/nodes.py
+@@ -35,6 +35,9 @@ from .hy3dshape.hy3dshape.models.autoencoders import ShapeVAE
+ 
+ from .hy3dshape.hy3dshape.meshlib import postprocessmesh
+ 
++from .xpu_convert import convert_to_xpu
++convert_to_xpu()
++
+ from spandrel import ModelLoader, ImageModelDescriptor
+ 
+ import folder_paths
+@@ -204,7 +207,7 @@ def _convert_texture_format(tex: Union[np.ndarray, torch.Tensor, Image.Image],
+ 
+ def convert_ndarray_to_pil(texture):
+     texture_size = len(texture)
+-    tex = _convert_texture_format(texture,(texture_size, texture_size),"cuda")
++    tex = _convert_texture_format(texture,(texture_size, texture_size),"xpu")
+     tex = tex.cpu().numpy()
+     processed_texture = (tex * 255).astype(np.uint8)
+     pil_texture = Image.fromarray(processed_texture)    
+@@ -308,7 +311,7 @@ class Hy3DMeshGenerator:
+         #del vae
+         
+         mm.soft_empty_cache()
+-        torch.cuda.empty_cache()
++        torch.xpu.empty_cache()
+         gc.collect()            
+         
+         return (latents,)
+@@ -389,7 +392,7 @@ class Hy3DMeshGenerator:
+         # #del vae
+         
+         # mm.soft_empty_cache()
+-        # torch.cuda.empty_cache()
++        # torch.xpu.empty_cache()
+         # gc.collect()            
+         
+         # return (latents,)        
+@@ -532,7 +535,7 @@ class Hy3DInPaint:
+         del pipeline
+         
+         mm.soft_empty_cache()
+-        torch.cuda.empty_cache()
++        torch.xpu.empty_cache()
+         gc.collect()        
+         
+         return (texture_tensor, texture_mr_tensor, trimesh, output_glb_path)         
+@@ -702,7 +705,7 @@ class Hy3D21VAEDecode:
+         offload_device = mm.unet_offload_device()
+ 
+         mm.soft_empty_cache()
+-        torch.cuda.empty_cache()
++        torch.xpu.empty_cache()
+ 
+         vae.to(device)
+         
+@@ -731,7 +734,7 @@ class Hy3D21VAEDecode:
+         del vae
+         
+         mm.soft_empty_cache()
+-        torch.cuda.empty_cache()
++        torch.xpu.empty_cache()
+         gc.collect()
+         
+         return (mesh_output, )        
+@@ -1350,7 +1353,7 @@ class Hy3D21MeshGenerationBatch:
+                     mesh_output.export(output_glb_path, file_type=file_format)              
+                                     
+                     mm.soft_empty_cache()
+-                    torch.cuda.empty_cache()
++                    torch.xpu.empty_cache()
+                     gc.collect()     
+                 else:
+                     print(f'Skipping file {file}')
+@@ -1361,7 +1364,7 @@ class Hy3D21MeshGenerationBatch:
+             del vae
+             
+             mm.soft_empty_cache()
+-            torch.cuda.empty_cache()
++            torch.xpu.empty_cache()
+             gc.collect() 
+             
+         return (input_folder, output_folder, processed_input_images, processed_output_meshes, ) 
+@@ -1573,7 +1576,7 @@ class Hy3D21GenerateMultiViewsBatch:
+                             del paint_pipeline
+                             
+                             mm.soft_empty_cache()
+-                            torch.cuda.empty_cache()
++                            torch.xpu.empty_cache()
+                             gc.collect() 
+                         else:
+                             print(f'Skipping {file}') 
+@@ -1588,7 +1591,7 @@ class Hy3D21GenerateMultiViewsBatch:
+             print('Nothing to process')       
+         
+         mm.soft_empty_cache()
+-        torch.cuda.empty_cache()
++        torch.xpu.empty_cache()
+         gc.collect() 
+             
+         return (processed_meshes, )    
+@@ -1833,7 +1836,7 @@ class Hy3DBakeMultiViewsWithMetaData:
+         del pipeline
+         
+         mm.soft_empty_cache()
+-        torch.cuda.empty_cache()
++        torch.xpu.empty_cache()
+         gc.collect() 
+         
+         return (texture_tensor, texture_mr_tensor, trimesh, output_glb_path)  
+diff --git a/requirements.txt b/requirements.txt
+index b0eec02..306fef6 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,5 +1,5 @@
+ trimesh
+-pymeshlab
++pymeshlab==2022.2.post3
+ pygltflib
+ xatlas
+ open3d
+diff --git a/xpu_convert.py b/xpu_convert.py
+new file mode 100644
+index 0000000..f408557
+--- /dev/null
++++ b/xpu_convert.py
+@@ -0,0 +1,263 @@
++import torch
++from torch import nn
++import torch.nn.functional as F
++from diffusers.models.attention_processor import AttnProcessor2_0, Attention
++from typing import Callable, List, Optional, Tuple, Union
++import math
++
++_original_layer_norm_forward = nn.LayerNorm.forward
++
++def _new_layer_norm_forward(self, hidden_states: torch.Tensor):
++    if (
++        hidden_states.device.type == 'xpu' and 
++        hidden_states.dtype in (torch.float, torch.half) and
++        self.weight is not None
++    ):
++        try:
++            import bigdl_core
++            hidden_size = math.prod(self.normalized_shape)
++            x_2d = hidden_states.reshape(-1, hidden_size).contiguous()
++            output = bigdl_core.layer_norm(x_2d, self.weight, self.bias, self.eps)
++            return output.reshape(hidden_states.shape)
++
++        except ImportError:
++            return _original_layer_norm_forward(self, hidden_states)
++    else:
++        print(hidden_states.dtype)
++        return _original_layer_norm_forward(self, hidden_states)
++
++
++_original_F_sdpa = F.scaled_dot_product_attention
++def chunk_scaled_dot_product_attention(
++    query,
++    key,
++    value,
++    attn_mask=None,
++    dropout_p=0.0,
++    is_causal=False,
++    scale=None,
++    chunk_size=1024,
++):
++    if chunk_size is None or query.size(2) <= chunk_size:
++        return _original_F_sdpa(
++            query, key, value, attn_mask, dropout_p, is_causal, scale=scale
++        )
++
++    if scale is not None:
++        return _original_F_sdpa(
++            query, key, value, attn_mask, dropout_p, is_causal, scale=scale
++        )
++    
++    if is_causal:
++        warnings.warn("Chunked computation may not work correctly with causal attention. "
++                      "Consider setting chunk_size=None for causal attention.")
++    
++    if dropout_p > 0:
++        warnings.warn("Dropout is applied independently to each chunk, which may "
++                      "result in slightly different behavior compared to non-chunked version.")
++    
++    Lq = query.size(2)
++    query_chunks = torch.split(query, chunk_size, dim=2)
++    
++    mask_chunks = None
++    if attn_mask is not None:
++        split_dim = -2 if attn_mask.dim() >= 2 else 0
++        if attn_mask.size(split_dim) == 1:
++            mask_chunks = [attn_mask] * len(query_chunks)
++        elif attn_mask.size(split_dim) == Lq:
++            mask_chunks = torch.split(attn_mask, chunk_size, dim=split_dim)
++        else:
++            raise ValueError(f"Attention mask size {attn_mask.size()} is incompatible "
++                             f"with query size {query.size()} for chunked computation")
++    else:
++        mask_chunks = [None] * len(query_chunks)
++    
++    output_chunks = []
++    
++    for q_chunk, m_chunk in zip(query_chunks, mask_chunks):
++        chunk_output = F.scaled_dot_product_attention(
++            q_chunk, key, value, 
++            attn_mask=m_chunk,
++            dropout_p=dropout_p,
++            is_causal=is_causal
++        )
++        output_chunks.append(chunk_output)
++    
++    return torch.cat(output_chunks, dim=2)
++
++def chunked_diffusers_attention_processor_call(
++    self,
++    attn: Attention,
++    hidden_states: torch.Tensor,
++    encoder_hidden_states: Optional[torch.Tensor] = None,
++    attention_mask: Optional[torch.Tensor] = None,
++    temb: Optional[torch.Tensor] = None,
++    *args,
++    **kwargs,
++) -> torch.Tensor:
++    if len(args) > 0 or kwargs.get("scale", None) is not None:
++        deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
++        deprecate("scale", "1.0.0", deprecation_message)
++
++    residual = hidden_states
++    if attn.spatial_norm is not None:
++        hidden_states = attn.spatial_norm(hidden_states, temb)
++
++    input_ndim = hidden_states.ndim
++
++    if input_ndim == 4:
++        batch_size, channel, height, width = hidden_states.shape
++        hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
++
++    batch_size, sequence_length, _ = (
++        hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
++    )
++
++    if attention_mask is not None:
++        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
++        # scaled_dot_product_attention expects attention_mask shape to be
++        # (batch, heads, source_length, target_length)
++        attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
++
++    if attn.group_norm is not None:
++        hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
++
++    query = attn.to_q(hidden_states)
++
++    if encoder_hidden_states is None:
++        encoder_hidden_states = hidden_states
++    elif attn.norm_cross:
++        encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
++
++    key = attn.to_k(encoder_hidden_states)
++    value = attn.to_v(encoder_hidden_states)
++
++    inner_dim = key.shape[-1]
++    head_dim = inner_dim // attn.heads
++
++    query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
++
++    key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
++    value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
++
++    if attn.norm_q is not None:
++        query = attn.norm_q(query)
++    if attn.norm_k is not None:
++        key = attn.norm_k(key)
++
++    # the output of sdp = (batch, num_heads, seq_len, head_dim)
++    # TODO: add support for attn.scale when we move to Torch 2.1
++    hidden_states = chunk_scaled_dot_product_attention(
++        query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
++    )
++
++    hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
++    hidden_states = hidden_states.to(query.dtype)
++
++    # linear proj
++    hidden_states = attn.to_out[0](hidden_states)
++    # dropout
++    hidden_states = attn.to_out[1](hidden_states)
++
++    if input_ndim == 4:
++        hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
++
++    if attn.residual_connection:
++        hidden_states = hidden_states + residual
++
++    hidden_states = hidden_states / attn.rescale_output_factor
++
++    return hidden_states
++
++from realesrgan import RealESRGANer
++def process_on_xpu(self):
++    self.output = self.model(self.img.to("xpu"))
++
++import torch
++import torch.nn.functional as F
++import functools  # Used to preserve function metadata like docstrings
++
++# Global variables to store the original function and patch status
++_original_interpolate_func = None
++_is_interpolate_patched = False
++
++
++def patch_xpu_interpolate_to_cpu():
++    """
++     patches torch.nn.functional.interpolate. If an input tensor is on an XPU device,
++    it will be moved to CPU for interpolation, and the result will be moved back
++    to the original XPU device.
++    """
++    global _original_interpolate_func, _is_interpolate_patched
++
++    if _is_interpolate_patched:
++        print("torch.nn.functional.interpolate is already patched for XPU. Skipping.")
++        return
++
++    # Store the original function
++    _original_interpolate_func = F.interpolate
++
++    @functools.wraps(_original_interpolate_func)
++    def _custom_interpolate(input_tensor, *args, **kwargs):
++        """
++        Custom wrapper for interpolate. Moves XPU tensors to CPU for computation.
++        """
++
++        if input_tensor.device.type == "xpu":
++            # print(
++            #     f"Intercepted interpolate call for XPU tensor at device {input_tensor.device}. Moving to CPU for computation."
++            # )
++            original_device = input_tensor.device
++
++            # Move input to CPU
++            input_on_cpu = input_tensor.to("cpu")
++
++            # Call the original interpolate function on CPU
++            result_on_cpu = _original_interpolate_func(input_on_cpu, *args, **kwargs)
++
++            # Move the result back to the original XPU device
++            result_on_xpu = result_on_cpu.to(original_device)
++            # print(
++            #     f"Interpolation completed on CPU, result moved back to {original_device}."
++            # )
++            return result_on_xpu
++        else:
++            # If not an XPU tensor, just call the original function directly
++            return _original_interpolate_func(input_tensor, *args, **kwargs)
++
++    # Replace the original function with our custom one
++    F.interpolate = _custom_interpolate
++    _is_interpolate_patched = True
++    print(
++        "Successfully patched torch.nn.functional.interpolate to handle XPU tensors on CPU."
++    )
++
++
++def unpatch_xpu_interpolate_to_cpu():
++    """
++    Restores the original torch.nn.functional.interpolate function if it was patched.
++    """
++    global _original_interpolate_func, _is_interpolate_patched
++
++    if not _is_interpolate_patched:
++        print(
++            "torch.nn.functional.interpolate is not currently patched. Skipping unpatch."
++        )
++        return
++
++    if _original_interpolate_func is not None:
++        F.interpolate = _original_interpolate_func
++        _original_interpolate_func = None
++        _is_interpolate_patched = False
++        print("Successfully unpatched torch.nn.functional.interpolate.")
++    else:
++        print("Error: Could not unpatch. Original function reference missing.")
++
++def convert_to_xpu():
++    nn.LayerNorm.forward = _new_layer_norm_forward
++    # AttnProcessor2_0.__call__ = chunked_diffusers_attention_processor_call
++    F.scaled_dot_product_attention = chunk_scaled_dot_product_attention
++    RealESRGANer.process = process_on_xpu
++    # patch_xpu_interpolate_to_cpu()
++
++    print("Converted to XPU compatible functions.")

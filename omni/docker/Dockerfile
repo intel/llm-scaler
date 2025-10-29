@@ -14,6 +14,7 @@ COPY ./patches/raylight_for_multi_arc.patch /tmp/
 COPY ./patches/xinference_device_utils.patch /tmp/
 COPY ./patches/comfyui_for_multi_arc.patch /tmp/
 COPY ./patches/comfyui_voxcpm_for_xpu.patch /tmp/
+COPY ./patches/comfyui_hunyuan3d_for_xpu.patch /tmp/
 
 
 # Add Intel oneAPI repo and PPA for GPU support
@@ -67,6 +68,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cd raylight && \
     git checkout ff8e90ba1f2c2d23e3ac23746910ddfb523fc8f1 && \
     git apply /tmp/raylight_for_multi_arc.patch && \
+    pip install ray==2.49.2 && \
     pip install -r requirements.txt && \
     cd .. && \
     git clone https://github.com/yolain/ComfyUI-Easy-Use.git comfyui-easy-use && \
@@ -83,14 +85,31 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     git checkout 044dd93c0effc9090fb279117de5db4cd90242a0 && \
     git apply /tmp/comfyui_voxcpm_for_xpu.patch && \
     pip install -r requirements.txt && \
+    cd .. && \
+    git clone https://github.com/visualbruno/ComfyUI-Hunyuan3d-2-1.git && \
+    cd ComfyUI-Hunyuan3d-2-1 && \
+    git checkout 9d7ef32509101495a7840b3ae8e718c8d1183305 && \
+    git apply /tmp/comfyui_hunyuan3d_for_xpu.patch && \
+    pip install bigdl-core==2.4.0b1 rembg realesrgan && \
+    pip install -r requirements.txt && \
+    cd hy3dpaint/custom_rasterizer && \
+    python setup.py install && \
+    cd ../DifferentiableRenderer && \
+    python setup.py install && \
+    cd /llm/ComfyUI/custom_nodes && \
 # Install Xinference
     pip install "xinference[transformers]" && \
     patch /usr/local/lib/python3.10/dist-packages/xinference/device_utils.py < /tmp/xinference_device_utils.patch && \
     pip install kokoro Jinja2==3.1.6 jieba ordered-set pypinyin cn2an pypinyin-dict && \
     # Clean
     rm -rf /tmp/*
+RUN cd /llm/ComfyUI/custom_nodes && \
+    git clone https://github.com/kijai/ComfyUI-KJNodes.git && \
+    cd ComfyUI-KJNodes && \
+    pip install -r requirements.txt
 
 COPY ./workflows/* /llm/ComfyUI/user/default/workflows/
 COPY ./example_inputs/* /llm/ComfyUI/input/
+COPY ./tools/* /llm/tools/
 
 WORKDIR /llm/ComfyUI
