@@ -2319,12 +2319,11 @@ python3 -m vllm.entrypoints.openai.api_server \
 
 
 #### Run the demo
-To verify your setup, clone the official MinerU repository and run the demo script:
+To verify mineru
 
 ```bash
-git clone https://github.com/opendatalab/MinerU.git
-cd MinerU/demo
-python3 demo.py
+#mineru -p <input_path> -o <output_path> -b vlm-http-client -u http://127.0.0.1:8000
+mineru -p /llm/MinerU/demo/pdfs/small_ocr.pdf -o ./ -b vlm-http-client -u http://127.0.0.1:8000
 ```
 
 ---
