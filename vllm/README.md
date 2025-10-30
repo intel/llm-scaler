@@ -2278,16 +2278,9 @@ TORCH_LLM_ALLREDUCE=1 VLLM_USE_V1=1  CCL_ZE_IPC_EXCHANGE=pidfd VLLM_ALLOW_LONG_M
 
 ---
 
-### 2.4.3 MinerU 2.5 Support
+### 2.4.3 MinerU 2.6 Support
 
-This guide shows how to launch the MinerU 2.5 model using the vLLM inference backend.
-
-#### Install MinerU Core
-
-First, install the core MinerU package:
-```bash
-pip install mineru[core]
-```
+This guide shows how to launch the MinerU 2.6 model using the vLLM inference backend.
 
 #### Start the MinerU Service
 
@@ -2320,13 +2313,38 @@ python3 -m vllm.entrypoints.openai.api_server \
 
 
 
-#### Run the demo
-To verify mineru
+#### how to use MinerU
+1.To verify mineru by command line
 
 ```bash
 #mineru -p <input_path> -o <output_path> -b vlm-http-client -u http://127.0.0.1:8000
 mineru -p /llm/MinerU/demo/pdfs/small_ocr.pdf -o ./ -b vlm-http-client -u http://127.0.0.1:8000
 ```
+
+2.Using by gradio
+
+```bash
+mineru-gradio --server-name 0.0.0.0 --server-port 8002
+```
+
+```python
+from gradio_client import Client, handle_file
+
+client = Client("http://localhost:8002/")
+result = client.predict(
+    file_path=handle_file('/llm/MinerU/demo/pdfs/small_ocr.pdf'),
+    end_pages=500,
+    is_ocr=False,
+    formula_enable=True,
+    table_enable=True,
+    language="ch",
+    backend="vlm-http-client",
+    url="http://localhost:8000",
+    api_name="/to_markdown"
+)
+print(result)
+```
+More details you can refer to gradio's [api guide](http://your_ip:8002/?view=api)
 
 ---
 
