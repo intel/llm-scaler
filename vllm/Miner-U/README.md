@@ -53,3 +53,5 @@ mineru-gradio --server-name 0.0.0.0 --server-port 7860
 ```
 
 Refer to [here](https://opendatalab.github.io/MinerU/zh/usage/quick_usage/#_2) for more details.
+
+### Refer to [here](https://github.com/intel/llm-scaler/tree/main/vllm#243-mineru-26-support) for new version 2.6.1 of mineru-vllm, which has performance improvements.
