@@ -57,12 +57,12 @@ RUN git clone -b v0.10.2 https://github.com/vllm-project/vllm.git && \
     python3 setup.py install
 
 # Clone + patch miner-U
-RUN git clone https://github.com/opendatalab/MinerU.git && \
+RUN git clone -b release-2.6.2 https://github.com/opendatalab/MinerU.git && \
     cd MinerU && \
-    git checkout de41fa58590263e43b783fe224b6d07cae290a33 && \
-    git apply /tmp/miner-u.patch && \
-    pip install -e .[core] && \
-    sed -i 's/select_device(self.args.device, verbose=verbose)/torch.device(self.args.device)/' /usr/local/lib/python3.12/dist-packages/ultralytics/engine/predictor.py
+    pip install -e .[core] --no-deps && \
+    pip install mineru_vl_utils==0.1.14 && \
+    sed -i 's/max_concurrency: int = 100,/max_concurrency: int = 200,/' /usr/local/lib/python3.12/dist-packages/mineru_vl_utils/mineru_client.py && \
+    sed -i 's/http_timeout: int = 600,/http_timeout: int = 1200,/' /usr/local/lib/python3.12/dist-packages/mineru_vl_utils/mineru_client.py
 
 
 # ======= Add oneCCL build =======
