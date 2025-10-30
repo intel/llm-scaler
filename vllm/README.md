@@ -2300,7 +2300,10 @@ python3 -m vllm.entrypoints.openai.api_server \
   --trust-remote-code \
   --gpu-memory-util 0.85 \
   --no-enable-prefix-caching \
+  --max-num-batched-tokens=32768 \
+  --max-model-len=32768 \
   --block-size 64 \
+  --max-num-seqs 256 \
   --served-model-name MinerU \
   --tensor-parallel-size 1 \
   --pipeline-parallel-size 1 \
