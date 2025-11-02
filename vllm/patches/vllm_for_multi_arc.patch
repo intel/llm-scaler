@@ -9517,10 +9517,27 @@ index 8cac47b5a..47577ff9c 100644
      # Update the `method_to_config` with customized quantization methods.
      method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
 diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
-index 3d94626e5..72c77e15c 100644
+index 3d94626e5..7a85c7490 100644
 --- a/vllm/model_executor/layers/quantization/fp8.py
 +++ b/vllm/model_executor/layers/quantization/fp8.py
-@@ -309,10 +309,14 @@ class Fp8LinearMethod(LinearMethodBase):
+@@ -143,6 +143,7 @@ class Fp8Config(QuantizationConfig):
+         from vllm.attention.layer import Attention
+         from vllm.model_executor.layers.quantization.ipex_quant import (
+             XPUFp8LinearMethod, XPUFp8MoEMethod)
++        modules_to_not_convert=["visual", "vision", "vpm", "resampler"]
+         fp8_config = Fp8Config(
+             is_checkpoint_fp8_serialized=self.is_checkpoint_fp8_serialized,
+             activation_scheme=self.activation_scheme,
+@@ -152,7 +153,7 @@ class Fp8Config(QuantizationConfig):
+         if isinstance(layer, LinearBase):
+             if is_layer_skipped(prefix=prefix,
+                                 ignored_layers=self.ignored_layers,
+-                                fused_mapping=self.packed_modules_mapping):
++                                fused_mapping=self.packed_modules_mapping) or any(key in prefix for key in modules_to_not_convert):
+                 return UnquantizedLinearMethod()
+             return XPUFp8LinearMethod(fp8_config)
+         elif isinstance(layer, FusedMoE):
+@@ -309,10 +310,14 @@ class Fp8LinearMethod(LinearMethodBase):
                          if self.quant_config.is_checkpoint_fp8_serialized else
                          params_dtype)
  
@@ -9536,7 +9553,7 @@ index 3d94626e5..72c77e15c 100644
                                        input_dim=1,
                                        output_dim=0,
                                        weight_loader=weight_loader)
-@@ -631,8 +635,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -631,8 +636,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
              num_experts,
              2 * intermediate_size_per_partition,
              hidden_size,
@@ -9548,7 +9565,7 @@ index 3d94626e5..72c77e15c 100644
          layer.register_parameter("w13_weight", w13_weight)
          set_weight_attrs(w13_weight, extra_weight_attrs)
  
-@@ -640,7 +646,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -640,7 +647,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
              num_experts,
              hidden_size,
              intermediate_size_per_partition,
@@ -10755,7 +10772,7 @@ index 0acb5ea74..c4b8c66eb 100644
          updates = [audio_start_token_id]
          added_audio_len = 0
 diff --git a/vllm/model_executor/model_loader/utils.py b/vllm/model_executor/model_loader/utils.py
-index 0c2441a6d..828ad2acf 100644
+index 0c2441a6d..2e7032094 100644
 --- a/vllm/model_executor/model_loader/utils.py
 +++ b/vllm/model_executor/model_loader/utils.py
 @@ -15,6 +15,7 @@ from typing_extensions import assert_never
@@ -10774,18 +10791,19 @@ index 0c2441a6d..828ad2acf 100644
  
  logger = init_logger(__name__)
  
-@@ -96,7 +98,9 @@ def initialize_model(
+@@ -96,7 +98,10 @@ def initialize_model(
  
  def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
                                    target_device: torch.device) -> None:
 -    for _, module in model.named_modules():
 +    # gc: Any changes here need to be added to SymInt4Config.get_quant_method
++    # gc: Any changes here need to be added to Fp8Config.get_quant_method
 +    modules_to_not_convert=["visual", "vision", "vpm", "resampler"]
 +    for name, module in model.named_modules():
          if isinstance(module, QKVCrossParallelLinear):
              # NOTE(Isotr0py): special case for cross QKV layer because
              # q and kv proj aren't registered as submodules intentionally
-@@ -104,12 +108,18 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
+@@ -104,12 +109,18 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
              continue
          quant_method = getattr(module, "quant_method", None)
          if isinstance(quant_method, QuantizeMethodBase):
@@ -10810,7 +10828,7 @@ index 0c2441a6d..828ad2acf 100644
                  quant_method.process_weights_after_loading(module)
  
      # Currently only used by MLA.
-@@ -125,7 +135,8 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
+@@ -125,7 +136,8 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
  
  @contextmanager
  def device_loading_context(module: torch.nn.Module,
@@ -10820,7 +10838,7 @@ index 0c2441a6d..828ad2acf 100644
      if target_device.type == "cpu":
          # If target is CPU, no need to move anything
          yield module
-@@ -134,36 +145,41 @@ def device_loading_context(module: torch.nn.Module,
+@@ -134,36 +146,41 @@ def device_loading_context(module: torch.nn.Module,
      original_device_states: dict[str, torch.device] = {}
  
      # Store original device states and move parameters to GPU if they're on CPU
