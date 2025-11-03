@@ -2316,8 +2316,8 @@ python3 -m vllm.entrypoints.openai.api_server \
 
 
 
-#### how to use MinerU
-1.To verify mineru by command line
+#### Run the demo
+To verify mineru
 
 ```bash
 #mineru -p <input_path> -o <output_path> -b vlm-http-client -u http://127.0.0.1:8000
