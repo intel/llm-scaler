@@ -11840,6 +11840,19 @@ index 97aace5a2..bcff65a71 100644
  
      @property
      def dtype(self) -> torch.dtype:
+diff --git a/vllm/model_executor/models/glm4.py b/vllm/model_executor/models/glm4.py
+index 5e2908a82..adbe89007 100644
+--- a/vllm/model_executor/models/glm4.py
++++ b/vllm/model_executor/models/glm4.py
+@@ -255,6 +255,8 @@ class Glm4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+         self.model = Glm4Model(vllm_config=vllm_config,
+                                prefix=maybe_prefix(prefix, "model"))
+ 
++        if "text_config" in config:
++            config = config.text_config
+         if get_pp_group().is_last_rank:
+             if config.tie_word_embeddings:
+                 self.lm_head = self.model.embed_tokens
 diff --git a/vllm/model_executor/models/glm4_1v.py b/vllm/model_executor/models/glm4_1v.py
 index 539381b61..a1e699310 100644
 --- a/vllm/model_executor/models/glm4_1v.py
@@ -12093,6 +12106,19 @@ index 710b805ac..04824db1b 100644
  
              q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
  
+diff --git a/vllm/model_executor/models/llama.py b/vllm/model_executor/models/llama.py
+index f8ea2111f..866b203a7 100644
+--- a/vllm/model_executor/models/llama.py
++++ b/vllm/model_executor/models/llama.py
+@@ -344,6 +344,8 @@ class LlamaModel(nn.Module):
+         self.quant_config = quant_config
+         lora_vocab = (lora_config.lora_extra_vocab_size *
+                       (lora_config.max_loras or 1)) if lora_config else 0
++        if "text_config" in config:
++            config = config.text_config
+         self.vocab_size = config.vocab_size + lora_vocab
+         self.org_vocab_size = config.vocab_size
+         if get_pp_group().is_first_rank or (config.tie_word_embeddings
 diff --git a/vllm/model_executor/models/phi4mm_audio.py b/vllm/model_executor/models/phi4mm_audio.py
 index a1c452053..a74e8cdb7 100644
 --- a/vllm/model_executor/models/phi4mm_audio.py
