@@ -7943,9 +7943,29 @@ index d4761e84f..307e9658f 100644
          && sccache --show-stats \
          && python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38 \
 diff --git a/docker/Dockerfile.xpu b/docker/Dockerfile.xpu
-index ef4223525..ffa7c6ea7 100644
+index ef4223525..cfd3dfa4b 100644
 --- a/docker/Dockerfile.xpu
 +++ b/docker/Dockerfile.xpu
+@@ -26,8 +26,8 @@ RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
+ 
+ RUN apt install -y libze1 libze-dev libze-intel-gpu1 intel-opencl-icd libze-intel-gpu-raytracing
+ 
+-RUN wget https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.4/intel-oneccl-2021.15.4.11_offline.sh
+-RUN bash intel-oneccl-2021.15.4.11_offline.sh -a --silent --eula accept && echo "source /opt/intel/oneapi/setvars.sh --force" >> /root/.bashrc
++RUN wget https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.6/intel-oneccl-2021.15.6.2_offline.sh
++RUN bash intel-oneccl-2021.15.6.2_offline.sh -a --silent --eula accept && echo "source /opt/intel/oneapi/setvars.sh --force" >> /root/.bashrc
+ SHELL ["bash", "-c"]
+ CMD ["bash", "-c", "source /root/.bashrc && exec bash"]
+ 
+@@ -54,7 +54,7 @@ ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
+ 
+ RUN --mount=type=cache,target=/root/.cache/pip \
+     --mount=type=bind,source=.git,target=.git \
+-    python3 setup.py install
++    pip install --no-build-isolation .
+ 
+ CMD ["/bin/bash"]
+ 
 @@ -62,7 +62,7 @@ FROM vllm-base AS vllm-openai
  
  # install additional dependencies for openai api server
@@ -8924,7 +8944,7 @@ index 000000000..ae4909b29
 +
 +exit 0
 diff --git a/vllm/_ipex_ops.py b/vllm/_ipex_ops.py
-index c2868c040..41ee138bc 100644
+index c2868c040..0e30e8192 100644
 --- a/vllm/_ipex_ops.py
 +++ b/vllm/_ipex_ops.py
 @@ -15,6 +15,7 @@ try:
@@ -8952,11 +8972,13 @@ index c2868c040..41ee138bc 100644
  
      @staticmethod
      def batched_rotary_embedding(positions: torch.Tensor, query: torch.Tensor,
-@@ -162,14 +165,23 @@ class ipex_ops:
+@@ -162,14 +165,26 @@ class ipex_ops:
      @staticmethod
      def rms_norm(input: torch.Tensor, weight: torch.Tensor,
                   epsilon: float) -> torch.Tensor:
-+        # return ipex.llm.functional.rms_norm(input, weight, epsilon)
++        # out = torch.empty_like(input)
++        # torch.ops.torch_ipex.rms_norm_vllm(out, input.contiguous(), weight, epsilon)
++        # return out
 +        tmp = torch.empty_like(input)
 +        vllm._C.ops.rms_norm(tmp, input, weight, epsilon)
 +        return tmp
@@ -8972,6 +8994,7 @@ index c2868c040..41ee138bc 100644
 -        tmp = ipex.llm.functional.add_rms_norm(residual, input, weight, None,
 -                                               epsilon, True)
 -        input.copy_(tmp)
++        # torch.ops.torch_ipex.fused_add_rms_norm_vllm(input, residual, weight, epsilon)
 +        # tmp = ipex.llm.functional.add_rms_norm(residual, input, weight, None,
 +        #                                        epsilon, True)
 +        # input.copy_(tmp)
@@ -8979,7 +9002,7 @@ index c2868c040..41ee138bc 100644
  
      @staticmethod
      def varlen_attention(
-@@ -207,6 +219,12 @@ class ipex_ops:
+@@ -207,6 +222,12 @@ class ipex_ops:
                                                   is_causal, return_softmax,
                                                   gen_)
          else:  # XPU build
@@ -8992,7 +9015,30 @@ index c2868c040..41ee138bc 100644
              ipex.llm.functional.varlen_attention(
                  query.contiguous(), key.contiguous(), value.contiguous(), out,
                  seqlen_q.int(), seqlen_k.int(), alibi_slopes, max_seqlen_q,
-@@ -300,6 +318,7 @@ class ipex_ops:
+@@ -273,14 +294,6 @@ class ipex_ops:
+         num_splits=0,
+         s_aux: Optional[torch.Tensor] = None,
+     ):
+-        if cu_seqlens_k is None:
+-            # cu_seqlens_k is not used in ipex kernel.
+-            cu_seqlens_k = torch.cumsum(seqused_k, dim=0)
+-            cu_seqlens_k = torch.cat([
+-                torch.tensor([0], device=seqused_k.device, dtype=torch.int32),
+-                cu_seqlens_k
+-            ]).to(torch.int32)
+-
+         real_window_size: tuple[int, int]
+         if window_size is None:
+             real_window_size = (-1, -1)
+@@ -293,13 +306,14 @@ class ipex_ops:
+             k,
+             v,
+             cu_seqlens_q,
+-            cu_seqlens_k,
++            seqused_k,
+             max_seqlen_q,
+             max_seqlen_k,
+             softmax_scale,
              causal,
              block_table,
              alibi_slopes,
@@ -9444,10 +9490,23 @@ index ac770ac4c..c20997bbb 100755
  
  # --8<-- [end:env-vars-definition]
 diff --git a/vllm/model_executor/layers/fused_moe/layer.py b/vllm/model_executor/layers/fused_moe/layer.py
-index a90a71159..5638da392 100644
+index a90a71159..09f4946a8 100644
 --- a/vllm/model_executor/layers/fused_moe/layer.py
 +++ b/vllm/model_executor/layers/fused_moe/layer.py
-@@ -601,7 +601,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
+@@ -356,10 +356,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
+ 
+         if current_platform.is_xpu():
+             import intel_extension_for_pytorch as ipex
++            ep_rank_start = self.moe.ep_rank * self.moe.num_local_experts
+             layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
+                 layer.w13_weight,
+                 layer.w2_weight,
+                 use_prepack=True,
++                experts_start_id=ep_rank_start,
+             )
+         elif current_platform.is_cpu():
+             from vllm.model_executor.layers.fused_moe import cpu_fused_moe
+@@ -601,7 +603,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                  logical_replica_count is not None:
              raise NotImplementedError("Expert load balancing is not supported "
                                        "for XPU.")
@@ -9455,7 +9514,7 @@ index a90a71159..5638da392 100644
          return layer.ipex_fusion(
              x,
              use_grouped_topk,
-@@ -610,6 +609,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
+@@ -610,6 +611,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
              renormalize,
              topk_group,
              num_expert_group,
@@ -9463,6 +9522,14 @@ index a90a71159..5638da392 100644
          )
  
      def forward_tpu(
+@@ -938,6 +940,7 @@ class FusedMoE(CustomOp):
+         # need full intermediate size pre-sharding for WNA16 act order
+         if (self.quant_method.__class__.__name__
+                 in ("GPTQMarlinMoEMethod",
++                    "XPUGPTQMarlinMoEMethod",
+                     "CompressedTensorsWNA16MarlinMoEMethod",
+                     "CompressedTensorsWNA16MoEMethod")):
+             moe_quant_params["intermediate_size_full"] = intermediate_size
 diff --git a/vllm/model_executor/layers/layernorm.py b/vllm/model_executor/layers/layernorm.py
 index f875f712b..687629720 100644
 --- a/vllm/model_executor/layers/layernorm.py
@@ -9575,35 +9642,88 @@ index 3d94626e5..7a85c7490 100644
                                         requires_grad=False)
          layer.register_parameter("w2_weight", w2_weight)
          set_weight_attrs(w2_weight, extra_weight_attrs)
+diff --git a/vllm/model_executor/layers/quantization/gptq_marlin.py b/vllm/model_executor/layers/quantization/gptq_marlin.py
+index 76de3a59c..5308fbd33 100644
+--- a/vllm/model_executor/layers/quantization/gptq_marlin.py
++++ b/vllm/model_executor/layers/quantization/gptq_marlin.py
+@@ -540,7 +540,8 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
+         set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
+ 
+         device = layer.w13_qweight.device
+-        layer.workspace = marlin_make_workspace_new(device, 4)
++        if current_platform.is_cuda():
++            layer.workspace = marlin_make_workspace_new(device, 4)
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+ 
 diff --git a/vllm/model_executor/layers/quantization/ipex_quant.py b/vllm/model_executor/layers/quantization/ipex_quant.py
-index 5f9d48142..6364d5cf5 100644
+index 5f9d48142..58078ad58 100644
 --- a/vllm/model_executor/layers/quantization/ipex_quant.py
 +++ b/vllm/model_executor/layers/quantization/ipex_quant.py
-@@ -9,6 +9,7 @@ from torch.nn import Module
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+-from typing import Any, Callable, Optional
++from typing import Any, Callable, Optional, Union
+ 
+ import torch
+ from packaging import version
+@@ -9,8 +9,11 @@ from torch.nn import Module
  from torch.nn.parameter import Parameter
  
  from vllm._ipex_ops import ipex_ops as ops
++from vllm.distributed import get_tensor_model_parallel_world_size
 +import vllm.envs as envs
  from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
                                                    FusedMoeWeightScaleSupported)
++from vllm.model_executor.layers.fused_moe.layer import FusedMoE
  from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
-@@ -45,6 +46,7 @@ class IPEXConfig(QuantizationConfig):
+                                                UnquantizedLinearMethod)
+ from vllm.model_executor.layers.quantization import QuantizationMethods
+@@ -23,6 +26,8 @@ from vllm.model_executor.layers.quantization.fp8 import (Fp8Config,
+ from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
+ from vllm.model_executor.utils import set_weight_attrs
+ from vllm.platforms import current_platform
++from vllm.scalar_type import scalar_types
++from vllm.utils import round_up
+ 
+ MIN_IPEX_VERSION = "2.6.0"
+ 
+@@ -45,15 +50,20 @@ class IPEXConfig(QuantizationConfig):
          modules_to_not_convert: Optional[list[str]] = None,
          desc_act: Optional[bool] = None,
          lm_head_quantized: Optional[bool] = None,
 +        is_qweight_sym: Optional[bool] = None,
++        full_config: dict[str, Any] = None,
      ) -> None:
          super().__init__()
          self.method = method
-@@ -62,6 +64,7 @@ class IPEXConfig(QuantizationConfig):
++        self.linear_quant_method = method
+         self.weight_bits = weight_bits
+         self.group_size = group_size
+         self.modules_to_not_convert = modules_to_not_convert or []
+         self.desc_act = desc_act
+         self.lm_head_quantized = lm_head_quantized
++        self.full_config = full_config
+         self.pack_factor = 32 // self.weight_bits
++        self.bit8_pack_factor = 8 // self.weight_bits
+ 
+         if self.weight_bits not in [4]:
+             raise ValueError(f"IPEX quantization supports weight bits [4], "
+@@ -62,6 +72,11 @@ class IPEXConfig(QuantizationConfig):
          if self.method not in ["awq", "gptq"]:
              raise ValueError(f"IPEX quantization supports [awq, gptq], "
                               f"but got {self.method}.")
 +        self.is_qweight_sym = is_qweight_sym
++
++        # used to identify GPTQ model quantized by autoround
++        self.autoround_version = full_config.get(
++            "autoround_version", "") if full_config is not None else ""
  
      def __repr__(self) -> str:
          return (f"IPEXConfig(method={self.method},"
-@@ -96,16 +99,18 @@ class IPEXConfig(QuantizationConfig):
+@@ -96,16 +111,18 @@ class IPEXConfig(QuantizationConfig):
                                             ["q_group_size", "group_size"])
              modules_to_not_convert = cls.get_from_keys_or(
                  config, ["modules_to_not_convert"], None)
@@ -9620,11 +9740,21 @@ index 5f9d48142..6364d5cf5 100644
 +        is_qweight_sym = cls.get_from_keys_or(config, ["sym"], default=True)
          return cls(method, weight_bits, group_size, [], desc_act,
 -                   lm_head_quantized)
-+                   lm_head_quantized, is_qweight_sym)
++                   lm_head_quantized, is_qweight_sym, config)
  
      @classmethod
      def override_quantization_method(
-@@ -183,7 +188,8 @@ class IPEXGPTQLinearMethod(GPTQLinearMethod):
+@@ -129,6 +146,9 @@ class IPEXConfig(QuantizationConfig):
+                 return IPEXAWQLinearMethod(self)
+             if self.method == "gptq":
+                 return IPEXGPTQLinearMethod(self)
++        if isinstance(layer, FusedMoE):
++            if self.method == "gptq":
++                return XPUGPTQMarlinMoEMethod(self, layer.moe_config)
+         return None
+ 
+ 
+@@ -183,7 +203,8 @@ class IPEXGPTQLinearMethod(GPTQLinearMethod):
              g_idx=g_idx,
              bias=bias,
              group_size=self.quant_config.group_size,
@@ -9634,7 +9764,7 @@ index 5f9d48142..6364d5cf5 100644
          )
  
      def apply(self,
-@@ -249,7 +255,8 @@ class IPEXAWQLinearMethod(AWQLinearMethod):
+@@ -249,7 +270,8 @@ class IPEXAWQLinearMethod(AWQLinearMethod):
              qconfig=qconfig,
              bias=bias,
              group_size=self.quant_config.group_size,
@@ -9644,7 +9774,7 @@ index 5f9d48142..6364d5cf5 100644
          )
  
      def apply(self,
-@@ -302,12 +309,12 @@ class XPUFp8MoEMethod(FusedMoEMethodBase):
+@@ -302,12 +324,12 @@ class XPUFp8MoEMethod(FusedMoEMethodBase):
          layer.num_experts = num_experts
          layer.orig_dtype = params_dtype
          layer.weight_block_size = None
@@ -9659,7 +9789,7 @@ index 5f9d48142..6364d5cf5 100644
                                          requires_grad=False)
          layer.register_parameter("w13_weight", w13_weight)
          set_weight_attrs(w13_weight, extra_weight_attrs)
-@@ -316,7 +323,8 @@ class XPUFp8MoEMethod(FusedMoEMethodBase):
+@@ -316,7 +338,8 @@ class XPUFp8MoEMethod(FusedMoEMethodBase):
              num_experts,
              hidden_size,
              intermediate_size_per_partition,
@@ -9669,8 +9799,258 @@ index 5f9d48142..6364d5cf5 100644
                                         requires_grad=False)
          layer.register_parameter("w2_weight", w2_weight)
          set_weight_attrs(w2_weight, extra_weight_attrs)
+@@ -365,6 +388,7 @@ class XPUFp8MoEMethod(FusedMoEMethodBase):
+             layer.w2_weight = torch.nn.Parameter(w2_weight,
+                                                  requires_grad=False)
+         import intel_extension_for_pytorch as ipex
++        ep_rank_start = self.moe.ep_rank * self.moe.num_local_experts
+         layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
+             layer.w13_weight,
+             layer.w2_weight,
+@@ -373,6 +397,7 @@ class XPUFp8MoEMethod(FusedMoEMethodBase):
+             a1_scale_inv=layer.w13_input_scale,
+             a2_scale_inv=layer.w2_input_scale,
+             use_prepack=True,
++            experts_start_id=ep_rank_start,
+         )
+ 
+     def apply(
+@@ -408,3 +433,233 @@ class XPUFp8MoEMethod(FusedMoEMethodBase):
+             num_expert_group,
+             custom_routing_function=custom_routing_function,
+         )
++
++class XPUGPTQMarlinMoEMethod(FusedMoEMethodBase):
++
++    TYPE_MAP = {
++        (4, True): scalar_types.uint4b8,
++        (8, True): scalar_types.uint8b128,
++    }
++
++    def __init__(
++        self,
++        quant_config: IPEXConfig,
++        moe: "FusedMoEConfig",
++    ) -> None:
++        super().__init__(moe)
++        self.quant_config = quant_config
++
++        weight_bits = quant_config.weight_bits
++        is_qweight_sym = quant_config.is_qweight_sym
++        self.quant_type = self.TYPE_MAP[(weight_bits, is_qweight_sym)]
++
++        if self.quant_type.size_bits != 4:
++            raise ValueError(
++                "XPUGPTQMarlinMoEMethod only supports int4 now.")
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        num_experts: int,
++        hidden_size: int,
++        intermediate_size_per_partition: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ):
++        intermediate_size_full = extra_weight_attrs.pop(
++            "intermediate_size_full")
++
++        self.is_k_full = (not self.quant_config.desc_act) or (
++            intermediate_size_per_partition == intermediate_size_full)
++
++        tp_size = get_tensor_model_parallel_world_size()
++        if tp_size == 4:
++            intermediate_size_per_partition = round_up(
++                intermediate_size_per_partition, 256)
++        elif tp_size == 8:
++            intermediate_size_per_partition = round_up(
++                intermediate_size_per_partition, 128)
++
++        if self.quant_config.group_size != -1:
++            scales_size13 = hidden_size // self.quant_config.group_size
++            w2_scales_size = (intermediate_size_full
++                              if self.quant_config.desc_act else
++                              intermediate_size_per_partition)
++            scales_size2 = (w2_scales_size // self.quant_config.group_size)
++            strategy = FusedMoeWeightScaleSupported.GROUP.value
++        else:
++            scales_size13 = 1
++            scales_size2 = 1
++            strategy = FusedMoeWeightScaleSupported.CHANNEL.value
++
++        extra_weight_attrs.update({
++            "quant_method": strategy,
++            "is_transposed": True
++        })
++        # Fused gate_up_proj (column parallel)
++        w13_qweight = torch.nn.Parameter(
++            torch.empty(
++                num_experts,
++                hidden_size // self.quant_config.pack_factor,
++                2 * intermediate_size_per_partition,
++                dtype=torch.int32,
++            ),
++            requires_grad=False,
++        )
++        layer.register_parameter("w13_qweight", w13_qweight)
++        set_weight_attrs(w13_qweight, extra_weight_attrs)
++        # down_proj (row parallel)
++        w2_qweight = torch.nn.Parameter(
++            torch.empty(
++                num_experts,
++                intermediate_size_per_partition //
++                self.quant_config.pack_factor,
++                hidden_size,
++                dtype=torch.int32,
++            ),
++            requires_grad=False,
++        )
++        layer.register_parameter("w2_qweight", w2_qweight)
++        set_weight_attrs(w2_qweight, extra_weight_attrs)
++        # up_proj scales
++        w13_scales = torch.nn.Parameter(
++            torch.empty(num_experts,
++                        scales_size13,
++                        2 * intermediate_size_per_partition,
++                        dtype=params_dtype),
++            requires_grad=False,
++        )
++        layer.register_parameter("w13_scales", w13_scales)
++        set_weight_attrs(w13_scales, extra_weight_attrs)
++        # down_proj scales
++        w2_scales = torch.nn.Parameter(
++            torch.empty(num_experts,
++                        scales_size2,
++                        hidden_size,
++                        dtype=params_dtype),
++            requires_grad=False,
++        )
++        layer.register_parameter("w2_scales", w2_scales)
++        set_weight_attrs(w2_scales, extra_weight_attrs)
++        # don't shard the w2 scales when running act order
++        set_weight_attrs(w2_scales,
++                         {"load_full_w2": self.quant_config.desc_act})
++        # up_proj scales
++        w13_qzeros = torch.nn.Parameter(
++            torch.empty(num_experts,
++                        scales_size13,
++                        2 * intermediate_size_per_partition //
++                        self.quant_config.pack_factor,
++                        dtype=params_dtype),
++            requires_grad=False,
++        )
++        layer.register_parameter("w13_qzeros", w13_qzeros)
++        set_weight_attrs(w13_qzeros, extra_weight_attrs)
++        # down_proj scales
++        w2_qzeros = torch.nn.Parameter(
++            torch.empty(num_experts,
++                        scales_size2,
++                        hidden_size // self.quant_config.pack_factor,
++                        dtype=params_dtype),
++            requires_grad=False,
++        )
++        layer.register_parameter("w2_qzeros", w2_qzeros)
++        set_weight_attrs(w2_qzeros, extra_weight_attrs)
++        # don't shard the w2 scales when running act order
++        set_weight_attrs(w2_qzeros,
++                         {"load_full_w2": self.quant_config.desc_act})
++        w13_g_idx = torch.nn.Parameter(
++            torch.empty(
++                num_experts,
++                hidden_size,
++                dtype=torch.int32,
++            ),
++            requires_grad=False,
++        )
++        layer.register_parameter("w13_g_idx", w13_g_idx)
++        set_weight_attrs(w13_g_idx, extra_weight_attrs)
++        w2_g_idx = torch.nn.Parameter(
++            torch.empty(
++                num_experts,
++                intermediate_size_per_partition,
++                dtype=torch.int32,
++            ),
++            requires_grad=False,
++        )
++        layer.register_parameter("w2_g_idx", w2_g_idx)
++        set_weight_attrs(w2_g_idx, extra_weight_attrs)
++        w13_g_idx_sort_indices = torch.nn.Parameter(
++            torch.empty(
++                num_experts,
++                hidden_size,
++                dtype=torch.int32,
++            ),
++            requires_grad=False,
++        )
++        layer.register_parameter("w13_g_idx_sort_indices",
++                                 w13_g_idx_sort_indices)
++        set_weight_attrs(w13_g_idx_sort_indices, extra_weight_attrs)
++        w2_g_idx_sort_indices = torch.nn.Parameter(
++            torch.empty(
++                num_experts,
++                intermediate_size_per_partition,
++                dtype=torch.int32,
++            ),
++            requires_grad=False,
++        )
++        layer.register_parameter("w2_g_idx_sort_indices",
++                                 w2_g_idx_sort_indices)
++        set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
++
++        device = layer.w13_qweight.device
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        import intel_extension_for_pytorch as ipex
++        if self.quant_config.linear_quant_method == "gptq":
++            layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
++                layer.w13_qweight.permute(0, 2, 1),
++                layer.w2_qweight.permute(0, 2, 1),
++                w1_scale_inv=layer.w13_scales.permute(0, 2, 1),
++                w2_scale_inv=layer.w2_scales.permute(0, 2, 1),
++                is_int4=True
++            )
++        else:
++            raise NotImplementedError(
++                f"Unsupported quant method {self.quant_config.linear_quant_method} "
++                "for XPU MOE.")
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        router_logits: torch.Tensor,
++        top_k: int,
++        renormalize: bool,
++        use_grouped_topk: bool = False,
++        topk_group: Optional[int] = None,
++        num_expert_group: Optional[int] = None,
++        global_num_experts: int = -1,
++        expert_map: Optional[torch.Tensor] = None,
++        custom_routing_function: Optional[Callable] = None,
++        scoring_func: str = "softmax",
++        routed_scaling_factor: float = 1.0,
++        e_score_correction_bias: Optional[torch.Tensor] = None,
++        apply_router_weight_on_input: bool = False,
++        activation: str = "silu",
++        enable_eplb: bool = False,
++        expert_load_view: Optional[torch.Tensor] = None,
++        logical_to_physical_map: Optional[torch.Tensor] = None,
++        logical_replica_count: Optional[torch.Tensor] = None,
++    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
++        res = layer.ipex_fusion(
++            x,
++            use_grouped_topk,
++            top_k,
++            router_logits,
++            renormalize,
++            topk_group=topk_group,
++            num_expert_group=num_expert_group,
++            custom_routing_function=custom_routing_function,
++            scoring_func=scoring_func,
++        )
++        return res
 diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
-index f935bdd84..9a80b80e7 100644
+index f935bdd84..ba177b181 100644
 --- a/vllm/model_executor/layers/quantization/mxfp4.py
 +++ b/vllm/model_executor/layers/quantization/mxfp4.py
 @@ -95,6 +95,9 @@ def get_mxfp4_backend():
@@ -9715,7 +10095,7 @@ index f935bdd84..9a80b80e7 100644
  
              layer.params_dtype = params_dtype
              layer.num_experts = num_experts
-@@ -949,3 +959,63 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+@@ -949,3 +959,65 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
              )
          else:
              raise ValueError(f"Unsupported backend: {self.mxfp4_backend}")
@@ -9733,6 +10113,7 @@ index f935bdd84..9a80b80e7 100644
 +        import intel_extension_for_pytorch as ipex
 +        layer.w13_weight.data = layer.w13_weight.data.view(torch.int32)
 +        layer.w2_weight.data = layer.w2_weight.data.view(torch.int32)
++        ep_rank_start = self.moe_config.ep_rank * self.moe_config.num_local_experts
 +        layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
 +            layer.w13_weight,
 +            layer.w2_weight,
@@ -9741,6 +10122,7 @@ index f935bdd84..9a80b80e7 100644
 +            w13_bias=layer.w13_bias,
 +            w2_bias=layer.w2_bias,
 +            is_mxfp4=True,
++            experts_start_id=ep_rank_start,
 +        )
 +
 +    def apply(
@@ -10038,6 +10420,21 @@ index 7ac2e4bb6..450d0cee1 100644
 +        offsets: Optional[torch.Tensor] = None,
 +    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
 +        return self.forward_native(positions, query, key, offsets)
+diff --git a/vllm/model_executor/layers/rotary_embedding/llama4_vision_rope.py b/vllm/model_executor/layers/rotary_embedding/llama4_vision_rope.py
+index 37ead43e2..4c1776900 100644
+--- a/vllm/model_executor/layers/rotary_embedding/llama4_vision_rope.py
++++ b/vllm/model_executor/layers/rotary_embedding/llama4_vision_rope.py
+@@ -79,3 +79,10 @@ class Llama4VisionRotaryEmbedding(RotaryEmbedding):
+         key: Optional[torch.Tensor] = None,
+     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+         return self.forward_native(query, key)
++
++    def forward_xpu(  # type: ignore[override]
++        self,
++        query: torch.Tensor,
++        key: Optional[torch.Tensor] = None,
++    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
++        return self.forward_native(query, key)
 diff --git a/vllm/model_executor/layers/rotary_embedding/mrope.py b/vllm/model_executor/layers/rotary_embedding/mrope.py
 index 0acb5ea74..c4b8c66eb 100644
 --- a/vllm/model_executor/layers/rotary_embedding/mrope.py
@@ -12521,10 +12918,34 @@ index dddb47048..0e8bf0d32 100644
          q, k = self.rotary_emb(positions, q, k)
          attn_output = self.attn(q, k, v)
 diff --git a/vllm/model_executor/models/qwen3_moe.py b/vllm/model_executor/models/qwen3_moe.py
-index 85429b3a0..b4336c633 100644
+index 85429b3a0..027896a61 100644
 --- a/vllm/model_executor/models/qwen3_moe.py
 +++ b/vllm/model_executor/models/qwen3_moe.py
-@@ -277,12 +277,14 @@ class Qwen3MoeAttention(nn.Module):
+@@ -49,6 +49,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.model_executor.layers.quantization.gptq import GPTQConfig
+ from vllm.model_executor.layers.quantization.gptq_marlin import (
+     GPTQMarlinConfig)
++from vllm.model_executor.layers.quantization.ipex_quant import IPEXConfig
+ from vllm.model_executor.layers.rotary_embedding import get_rope
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     ParallelLMHead, VocabParallelEmbedding)
+@@ -56,6 +57,7 @@ from vllm.model_executor.model_loader.weight_utils import (
+     default_weight_loader, maybe_remap_kv_scale_name)
+ from vllm.model_executor.sampling_metadata import SamplingMetadata
+ from vllm.sequence import IntermediateTensors
++from vllm.utils import round_up
+ 
+ from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
+ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
+@@ -165,6 +167,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
+         if isinstance(
+                 quant_config,
+             (GPTQConfig,
++             IPEXConfig,
+              GPTQMarlinConfig)) and not quant_config.autoround_version:
+             return None
+         return quant_config
+@@ -277,12 +280,14 @@ class Qwen3MoeAttention(nn.Module):
          # Add qk-norm
          q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
                             self.head_dim)
@@ -12541,7 +12962,7 @@ index 85429b3a0..b4336c633 100644
          k = k_by_head.view(k.shape)
          q, k = self.rotary_emb(positions, q, k)
          attn_output = self.attn(q, k, v)
-@@ -378,7 +380,7 @@ class Qwen3MoeModel(nn.Module):
+@@ -378,7 +383,7 @@ class Qwen3MoeModel(nn.Module):
      def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
          super().__init__()
  
@@ -12550,6 +12971,47 @@ index 85429b3a0..b4336c633 100644
          cache_config = vllm_config.cache_config
          quant_config = vllm_config.quant_config
          parallel_config = vllm_config.parallel_config
+@@ -467,7 +472,40 @@ class Qwen3MoeModel(nn.Module):
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
+         expert_params_mapping = self.get_expert_mapping()
++        is_padding_needed = False
++        quantization_config = getattr(self.config, "quantization_config", None)
++        if quantization_config is not None:
++            quant_method = quantization_config.get("quant_method", "").lower()
++            tp_size = get_tensor_model_parallel_world_size()
++            if (quant_method in ("gptq")) and (tp_size == 4 or tp_size == 8):
++                is_padding_needed = True
+         for name, loaded_weight in weights:
++            if is_padding_needed:
++                if ".down_proj.g_idx" in name:
++                    shape0 = loaded_weight.shape[0]
++                    target_size = round_up(shape0, 1024)
++                    pad_size = target_size - shape0
++                    loaded_weight = torch.nn.functional.pad(loaded_weight, (0, pad_size), value=0)
++                elif ".down_proj.qweight" in name:
++                    shape0 = loaded_weight.shape[0]
++                    target_size = round_up(shape0, 128)
++                    pad_size = target_size - shape0
++                    loaded_weight = torch.nn.functional.pad(loaded_weight, (0, 0, 0, pad_size), value=0)
++                elif ".down_proj.scales" in name or ".down_proj.qzeros" in name:
++                    shape0 = loaded_weight.shape[0]
++                    target_size = round_up(shape0, 8)
++                    pad_size = target_size - shape0
++                    loaded_weight = torch.nn.functional.pad(loaded_weight, (0, 0, 0, pad_size), value=0)
++                elif ".gate_proj.qweight" in name or ".gate_proj.scales" in name or ".up_proj.qweight" in name or ".up_proj.scales" in name:
++                    shape1 = loaded_weight.shape[1]
++                    target_size = round_up(shape1, 1024)
++                    pad_size = target_size - shape1
++                    loaded_weight = torch.nn.functional.pad(loaded_weight, (0, pad_size), value=0)
++                elif ".gate_proj.qzeros" in name or ".up_proj.qzeros" in name:
++                    shape1 = loaded_weight.shape[1]
++                    target_size = round_up(shape1, 128)
++                    pad_size = target_size - shape1
++                    loaded_weight = torch.nn.functional.pad(loaded_weight, (0, pad_size), value=0)
+             for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                 # Skip non-stacked layers and experts (experts handled below).
+                 if weight_name not in name:
 diff --git a/vllm/model_executor/models/qwen3_omni_moe_thinker.py b/vllm/model_executor/models/qwen3_omni_moe_thinker.py
 new file mode 100755
 index 000000000..d388da846
@@ -16045,6 +16507,19 @@ index c16aa5ac6..0b58caa3e 100644
 -    return torch.cat(hs_pool, dim=-1)
 \ No newline at end of file
 +    return torch.cat(hs_pool, dim=-1)
+diff --git a/vllm/multimodal/profiling.py b/vllm/multimodal/profiling.py
+index ffc69a2db..0d25524b3 100644
+--- a/vllm/multimodal/profiling.py
++++ b/vllm/multimodal/profiling.py
+@@ -130,7 +130,7 @@ class BaseDummyInputsBuilder(ABC, Generic[_I]):
+     ) -> list[npt.NDArray]:
+         if num_videos == 0:
+             return []
+-        video = np.full((num_frames, width, height, 3), 255)
++        video = np.full((num_frames, width, height, 3), 255, dtype=np.uint8)
+         return [video] * num_videos
+ 
+ 
 diff --git a/vllm/multimodal/video.py b/vllm/multimodal/video.py
 index df6e19da8..8c6627186 100644
 --- a/vllm/multimodal/video.py
@@ -16737,9 +17212,18 @@ index 5e00f6380..c296b3f28 100644
          except Exception as e:
              raise ValueError("Invalid structural tag specification.") from e
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index ebb18e81c..9055c6610 100644
+index ebb18e81c..c70ec0072 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -119,7 +119,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+         self._invalid_req_indices = invalid_req_indices
+ 
+         # Event on the copy stream so we can synchronize the non-blocking copy.
+-        self._async_copy_ready_event = torch.cuda.Event()
++        self._async_copy_ready_event = torch.Event()
+ 
+         # Keep a reference to the device tensor to avoid it being
+         # deallocated until we finish copying it to the host.
 @@ -246,6 +246,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
          # NOTE(Jiayi): currently we put the entire draft model on
          # the last PP rank. This is not ideal if there are many
@@ -16750,6 +17234,18 @@ index ebb18e81c..9055c6610 100644
          if self.speculative_config and get_pp_group().is_last_rank:
              if self.speculative_config.method == "ngram":
                  self.drafter = NgramProposer(self.vllm_config)
+@@ -346,9 +349,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+ 
+         # CUDA event to synchronize use of reused CPU tensors between steps
+         # when async scheduling is enabled.
+-        self.prepare_inputs_event: Optional[torch.cuda.Event] = None
++        self.prepare_inputs_event: Optional[torch.Event] = None
+         if self.use_async_scheduling:
+-            self.prepare_inputs_event = torch.cuda.Event()
++            self.prepare_inputs_event = torch.Event()
+             # Start in a completed state.
+             self.prepare_inputs_event.record(torch.cuda.default_stream())
+ 
 @@ -362,6 +365,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                         self.max_num_tokens),
                                     dtype=np.int64)
@@ -16767,6 +17263,15 @@ index ebb18e81c..9055c6610 100644
          # Layer pairings for cross-layer KV sharing.
          # If an Attention layer `layer_name` is in the keys of this dict, it
          # means this layer will perform attention using the keys and values
+@@ -396,7 +409,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+         # Cached outputs.
+         self._draft_token_ids: Optional[Union[list[list[int]],
+                                               torch.Tensor]] = None
+-        self.transfer_event = torch.cuda.Event()
++        self.transfer_event = torch.Event()
+         self.sampled_token_ids_pinned_cpu = torch.empty(
+             (self.max_model_len, 1),
+             dtype=torch.int64,
 @@ -944,6 +957,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
          seq_lens = self.seq_lens.gpu[:num_reqs]
          max_seq_len = self.seq_lens.np[:num_reqs].max().item()
@@ -16790,25 +17295,27 @@ index ebb18e81c..9055c6610 100644
          else:
              # Get the number of draft tokens for each request.
              # Iterate over the dictionary rather than all requests since not all
-@@ -982,6 +1004,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+@@ -982,6 +1004,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
              logits_indices = spec_decode_metadata.logits_indices
              self.num_draft_tokens.np[:num_reqs] = num_draft_tokens
              self.num_draft_tokens.np[num_reqs:].fill(0)
 +            if self.num_draft_tokens.gpu is None:
-+                self.num_draft_tokens.gpu = self.num_draft_tokens.cpu.to(self.device)
++                self.num_draft_tokens.gpu = self.num_draft_tokens.cpu.to(
++                    self.device)
              self.num_draft_tokens.copy_to_gpu()
  
          logits_indices_padded = None
-@@ -1001,6 +1025,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+@@ -1001,6 +1026,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
              self.num_accepted_tokens.np[:num_reqs] = (
                  self.input_batch.num_accepted_tokens_cpu[:num_reqs])
              self.num_accepted_tokens.np[num_reqs:].fill(1)
 +            if self.num_accepted_tokens.gpu is None:
-+                self.num_accepted_tokens.gpu = self.num_accepted_tokens.cpu.to(self.device)
++                self.num_accepted_tokens.gpu = self.num_accepted_tokens.cpu.to(
++                    self.device)
              self.num_accepted_tokens.copy_to_gpu()
  
          # Prepare the attention metadata for each KV cache group and make layers
-@@ -1041,6 +1067,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+@@ -1041,6 +1069,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
              common_attn_metadata = CommonAttentionMetadata(
                  query_start_loc=query_start_loc,
                  query_start_loc_cpu=query_start_loc_cpu,
@@ -16817,7 +17324,7 @@ index ebb18e81c..9055c6610 100644
                  seq_lens=seq_lens,
                  seq_lens_cpu=seq_lens_cpu,
                  num_computed_tokens_cpu=num_computed_tokens_cpu,
-@@ -2734,6 +2762,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+@@ -2734,6 +2764,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                      query_start_loc=self.query_start_loc.gpu[:num_reqs + 1],
                      query_start_loc_cpu=self.query_start_loc.cpu[:num_reqs +
                                                                   1],
@@ -16826,7 +17333,7 @@ index ebb18e81c..9055c6610 100644
                      seq_lens=self.seq_lens.gpu[:num_reqs],
                      seq_lens_cpu=self.seq_lens.cpu[:num_reqs],
                      num_computed_tokens_cpu=self.input_batch.
-@@ -2997,6 +3027,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+@@ -2997,6 +3029,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                      max_mm_items_per_batch = mm_budget \
                          .max_items_per_batch_by_modality[dummy_modality]
  
@@ -16836,7 +17343,7 @@ index ebb18e81c..9055c6610 100644
                      logger.info(
                          "Encoder cache will be initialized with a budget of "
                          "%s tokens, and profiled with %s %s items of the "
-@@ -3025,11 +3058,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+@@ -3025,11 +3060,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                      # Cache the dummy encoder outputs.
                      self.encoder_cache["tmp"] = dict(
                          enumerate(dummy_encoder_outputs))
@@ -16872,20 +17379,32 @@ index 37dd431fd..5a4e63177 100644
                      hidden_states=last_hidden_states)
  
 diff --git a/vllm/v1/worker/xpu_model_runner.py b/vllm/v1/worker/xpu_model_runner.py
-index fb892211f..ea69bc2c8 100644
+index fb892211f..5ba4631cd 100644
 --- a/vllm/v1/worker/xpu_model_runner.py
 +++ b/vllm/v1/worker/xpu_model_runner.py
-@@ -47,6 +47,10 @@ def _torch_cuda_wrapper():
+@@ -38,16 +38,12 @@ class XPUModelRunner(GPUModelRunner):
+ @contextmanager
+ def _torch_cuda_wrapper():
+ 
+-    class _EventPlaceholder:
+-
+-        def __init__(self, *args, **kwargs) -> None:
+-            self.record = lambda: None
+-            self.synchronize = lambda: None
+-
      try:
-         # replace cuda Event with xpu Event, this should work by default
-         torch.cuda.Event = torch.xpu.Event
+-        # replace cuda Event with xpu Event, this should work by default
+-        torch.cuda.Event = torch.xpu.Event
++        # replace cuda APIs with xpu APIs
 +        torch.cuda.Stream = torch.xpu.Stream
 +        torch.cuda.current_stream = torch.xpu.current_stream
 +        torch.cuda.stream = torch.xpu.stream
 +        torch.cuda.default_stream = torch.xpu.current_stream
          yield
      finally:
-         # if anything goes wrong, just patch it with a placeholder
+-        # if anything goes wrong, just patch it with a placeholder
+-        torch.cuda.Event = _EventPlaceholder
++        pass
 diff --git a/vllm/v1/worker/xpu_worker.py b/vllm/v1/worker/xpu_worker.py
 index 7355206f3..ff7870be6 100644
 --- a/vllm/v1/worker/xpu_worker.py
