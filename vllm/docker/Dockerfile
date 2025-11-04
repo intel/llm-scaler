@@ -59,8 +59,8 @@ RUN git clone -b v0.10.2 https://github.com/vllm-project/vllm.git && \
 # Clone + patch miner-U
 RUN git clone -b release-2.6.2 https://github.com/opendatalab/MinerU.git && \
     cd MinerU && \
-    pip install -e .[core] --no-deps && \
-    pip install mineru_vl_utils==0.1.14 gradio gradio-client gradio-pdf && \
+    pip install -e .[core] && \
+    # pip install mineru_vl_utils==0.1.14 gradio gradio-client gradio-pdf && \
     sed -i 's/kwargs.get("max_concurrency", 100)/kwargs.get("max_concurrency", 200)/' /llm/MinerU/mineru/backend/vlm/vlm_analyze.py && \
     sed -i 's/kwargs.get("http_timeout", 600)/kwargs.get("http_timeout", 1200)/' /llm/MinerU/mineru/backend/vlm/vlm_analyze.py
 
@@ -119,8 +119,7 @@ RUN pip install accelerate hf_transfer 'modelscope!=1.15.0'
 
 # Pin transformers version to avoid conflict in vLLM
 RUN pip install "transformers==4.57.0" && \
-    pip install librosa soundfile && \
-    pip install mineru[core]==2.5.4
+    pip install librosa soundfile
 
 
 # Set additional environment for production usage
