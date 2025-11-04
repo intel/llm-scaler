@@ -8353,7 +8353,7 @@ index b8665104b..a52745f69 100644
  filelock >= 3.16.1 # need to contain https://github.com/tox-dev/filelock/pull/317
  partial-json-parser # used for parsing partial JSON outputs
 diff --git a/requirements/xpu.txt b/requirements/xpu.txt
-index 74f5b05b2..c0203a754 100644
+index 74f5b05b2..3fdf84543 100644
 --- a/requirements/xpu.txt
 +++ b/requirements/xpu.txt
 @@ -11,9 +11,10 @@ jinja2>=3.1.6
@@ -8367,7 +8367,7 @@ index 74f5b05b2..c0203a754 100644
  --extra-index-url=https://download.pytorch.org/whl/xpu
  
 -intel-extension-for-pytorch @ https://intel-extension-for-pytorch.s3.us-east-1.amazonaws.com/ipex_dev/xpu/intel_extension_for_pytorch-2.8.10.post0%2Bxpu-cp312-cp312-linux_x86_64.whl
-+intel-extension-for-pytorch @ https://intel-extension-for-pytorch.s3.us-east-1.amazonaws.com/ipex_dev/xpu/intel_extension_for_pytorch-2.8.10.post1%2Bxpu-cp312-cp312-linux_x86_64.whl
++intel-extension-for-pytorch @ https://ubit-artifactory-ba.intel.com/artifactory/aipc_releases-ba-local//gpu/new/validation/IPEX/nightly/PVC/UBUNTU/VLLM_nightly/20251027/f7903ad79/intel_extension_for_pytorch-2.8.10.post1+xpu-cp312-cp312-linux_x86_64.whl
 diff --git a/setup.py b/setup.py
 index 67f65d9b9..d2bfb2880 100644
 --- a/setup.py
