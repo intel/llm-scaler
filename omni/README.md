@@ -8,7 +8,7 @@
 2. [ComfyUI](#comfyui)
 3. [XInference](#xinference)
 4. [Stand-alone Examples](#stand-alone-examples)
-5. [ComfyUI for Windows](#comfyui-for-windows)
+5. [ComfyUI for Windows (experimental)](#comfyui-for-windows-experimental)
 
 ---
 
