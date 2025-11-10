@@ -8,6 +8,7 @@
 2. [ComfyUI](#comfyui)
 3. [XInference](#xinference)
 4. [Stand-alone Examples](#stand-alone-examples)
+5. [ComfyUI for Windows](#comfyui-for-windows)
 
 ---
 
@@ -200,3 +201,18 @@ Supported models:
 - Qwen Image
 - Wan 2.1 / 2.2
 
+## ComfyUI for Windows (experimental)
+
+We have provided a conda-install method to use `llm-scaler-omni` version ComfyUI on Windows.
+
+```powershell
+.\init_conda_env.bat
+```
+
+After installation, you can enter the `ComfyUI` directory and start ComfyUI server.
+
+```powershell
+cd ComfyUI
+conda activate omni_env
+python .\main.py --listen 0.0.0.0
+```
