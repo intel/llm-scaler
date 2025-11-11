@@ -24,8 +24,6 @@ echo ============================================
 
 REM Install PyTorch and dependencies using conda run
 call conda run -n omni_env pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/xpu
-call conda run -n omni_env pip install oneccl_bind_pt==2.8.0+xpu --index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/cn/
-call conda run -n omni_env pip install bigdl-core-xe-all==2.7.0b20250625
 
 echo.
 echo ============================================

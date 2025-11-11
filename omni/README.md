@@ -206,6 +206,8 @@ Supported models:
 We have provided a conda-install method to use `llm-scaler-omni` version ComfyUI on Windows.
 
 ```powershell
+git clone https://github.com/intel/llm-scaler.git
+cd llm-scaler\omni\
 .\init_conda_env.bat
 ```
 
@@ -214,5 +216,7 @@ After installation, you can enter the `ComfyUI` directory and start ComfyUI serv
 ```powershell
 cd ComfyUI
 conda activate omni_env
+$env:HTTP_PROXY = <your_proxy>
+$env:HTTPS_PROXY = <your_proxy>
 python .\main.py --listen 0.0.0.0
 ```
