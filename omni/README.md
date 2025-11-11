@@ -81,7 +81,8 @@ The following models are supported in ComfyUI workflows:
 | **Image Generation** | Qwen-Image | Text-to-Image, Image Editing | `image_qwen_image.json`, `image_qwen_image_distill.json`, `image_qwen_image_edit.json`, `image_qwen_image_edit_2509.json` |
 | **Image Generation** | Stable Diffusion 3.5 | Text-to-Image, ControlNet | `image_sd3.5_simple_example.json`, `image_sd3.5_midium.json`, `image_sd3.5_large_canny_controlnet_example.json` |
 | **Image Generation** | Flux.1 Kontext Dev | Text-to-Image, Multi-Image Reference, ControlNet | `image_flux_kontext_dev_basic.json`, `image_flux_controlnet_example.json` |
-| **Video Generation** | Wan2.2 (5B/14B) | Text-to-Video, Image-to-Video, Animation | `video_wan2_2_5B_ti2v.json`, `video_wan2_2_14B_t2v.json`, `video_wan2_2_14B_t2v_rapid_aio_multi_xpu.json`, `video_wan2.2_14B_i2v_rapid_aio_multi_xpu.json`, `video_wan2_2_animate_basic.json` |
+| **Video Generation** | Wan2.2 (5B/14B) | Text-to-Video, Image-to-Video | `video_wan2_2_5B_ti2v.json`, `video_wan2_2_14B_t2v.json`, `video_wan2_2_14B_t2v_rapid_aio_multi_xpu.json`, `video_wan2.2_14B_i2v_rapid_aio_multi_xpu.json` |
+| **Video Generation** | Wan2.2 Animate 14B | Video Animation | `video_wan2_2_animate_basic.json` |
 | **3D Generation** | Hunyuan3D | Text/Image-to-3D | `3d_hunyuan3d.json` |
 | **Audio Generation** | VoxCPM | Text-to-Speech | `audio_VoxCPM_example.json` |
 
@@ -146,7 +147,6 @@ ComfyUI tutorial: https://docs.comfy.org/tutorials/video/wan/wan2_2
 - **video_wan2_2_14B_t2v.json**: Text-to-Video with 14B model
 - **video_wan2_2_14B_t2v_rapid_aio_multi_xpu.json**: 14B Text-to-Video with multi-XPU support (using raylight)
 - **video_wan2.2_14B_i2v_rapid_aio_multi_xpu.json**: 14B Image-to-Video with multi-XPU support
-- **video_wan2_2_animate_basic.json**: Basic animation workflow with control video support
 
 **Multi-XPU Support with Raylight:**
 
@@ -168,6 +168,13 @@ For workflows using [WAN2.2-14B-Rapid-AllInOne](https://huggingface.co/Phr00t/WA
    - Click the `Run` button or use the shortcut `Ctrl(cmd) + Enter` to run the workflow
 
 > **Note:** Model weights can be obtained from [ModelScope](https://modelscope.cn/models/Phr00t/WAN2.2-14B-Rapid-AllInOne/files). You may need to extract the unet and VAE parts separately using `tools/extract.py`.
+
+##### Wan2.2 Animate 14B
+
+**Available Workflows:**
+- **video_wan2_2_animate_basic.json**: Video animation workflow with control video support
+
+This is a separate model from the standard Wan2.2 T2V/I2V models, designed specifically for video animation with control video inputs.
 
 #### 3D Generation Workflows
 
