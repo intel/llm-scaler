@@ -78,12 +78,12 @@ The following models are supported in ComfyUI workflows:
 
 | Model Category | Model Name | Type | Workflow Files |
 |---------------|------------|------|----------------|
-| **Image Generation** | Qwen-Image | Text-to-Image, Image Editing | `image_qwen_image.json`, `image_qwen_image_distill.json`, `image_qwen_image_edit.json`, `image_qwen_image_edit_2509.json` |
+| **Image Generation** | Qwen-Image, Qwen-Image-Edit | Text-to-Image, Image Editing | `image_qwen_image.json`, `image_qwen_image_distill.json`, `image_qwen_image_edit.json`, `image_qwen_image_edit_2509.json` |
 | **Image Generation** | Stable Diffusion 3.5 | Text-to-Image, ControlNet | `image_sd3.5_simple_example.json`, `image_sd3.5_midium.json`, `image_sd3.5_large_canny_controlnet_example.json` |
-| **Image Generation** | Flux.1 Kontext Dev | Text-to-Image, Multi-Image Reference, ControlNet | `image_flux_kontext_dev_basic.json`, `image_flux_controlnet_example.json` |
-| **Video Generation** | Wan2.2 (5B/14B) | Text-to-Video, Image-to-Video | `video_wan2_2_5B_ti2v.json`, `video_wan2_2_14B_t2v.json`, `video_wan2_2_14B_t2v_rapid_aio_multi_xpu.json`, `video_wan2.2_14B_i2v_rapid_aio_multi_xpu.json` |
+| **Image Generation** | Flux.1, Flux.1 Kontext dev | Text-to-Image, Multi-Image Reference, ControlNet | `image_flux_kontext_dev_basic.json`, `image_flux_controlnet_example.json` |
+| **Video Generation** | Wan2.2 TI2V 5B, Wan2.2 T2V 14B, Wan2.2 I2V 14B | Text-to-Video, Image-to-Video | `video_wan2_2_5B_ti2v.json`, `video_wan2_2_14B_t2v.json`, `video_wan2_2_14B_t2v_rapid_aio_multi_xpu.json`, `video_wan2.2_14B_i2v_rapid_aio_multi_xpu.json` |
 | **Video Generation** | Wan2.2 Animate 14B | Video Animation | `video_wan2_2_animate_basic.json` |
-| **3D Generation** | Hunyuan3D | Text/Image-to-3D | `3d_hunyuan3d.json` |
+| **3D Generation** | Hunyuan3D 2.1 | Text/Image-to-3D | `3d_hunyuan3d.json` |
 | **Audio Generation** | VoxCPM | Text-to-Speech | `audio_VoxCPM_example.json` |
 
 ### ComfyUI Workflows
@@ -132,9 +132,6 @@ ComfyUI tutorial: https://docs.comfy.org/tutorials/flux/flux-1-kontext-dev
 
 **Available Workflows:**
 - **image_flux_kontext_dev_basic.json**: Basic workflow with multi-image reference support
-- **image_flux_controlnet_example.json**: Workflow with ControlNet for guided generation
-
-Flux Kontext Dev supports multiple image references and advanced control mechanisms for image generation.
 
 #### Video Generation Workflows
 
