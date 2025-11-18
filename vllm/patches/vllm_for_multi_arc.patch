@@ -9047,7 +9047,7 @@ index c2868c040..0e30e8192 100644
              window_size_left=real_window_size[0],
              window_size_right=real_window_size[1],
 diff --git a/vllm/attention/layer.py b/vllm/attention/layer.py
-index bb05b468f..e4207020c 100644
+index bb05b468f..6d620bb24 100644
 --- a/vllm/attention/layer.py
 +++ b/vllm/attention/layer.py
 @@ -23,6 +23,7 @@ from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -9189,7 +9189,7 @@ index bb05b468f..e4207020c 100644
              query, key, value = (x.transpose(1, 2)
                                   for x in (query, key, value))
              out = F.scaled_dot_product_attention(query,
-@@ -463,6 +524,87 @@ def maybe_save_kv_layer_to_connector(
+@@ -463,6 +524,88 @@ def maybe_save_kv_layer_to_connector(
                              attn_metadata[layer_name])
  
  
@@ -9239,7 +9239,8 @@ index bb05b468f..e4207020c 100644
 +        head_dim = q.shape[-1]
 +        scale = 1 / math.sqrt(head_dim) if self.scale is None else self.scale
 +        tmp = [0]
-+        tmp.append(q_len)
++        for i in range(bsz):
++            tmp.append(q_len)
 +        seqlen = torch.tensor(tmp)
 +        cu_seqlens = torch.cumsum(seqlen, dim=0).to(device=query.device)
 +        max_seqlen = q_len
@@ -17169,7 +17170,7 @@ index 009943fa7..647b3e88a 100644
          seq_lens=seq_lens_cpu.to(device=device, non_blocking=True),
          num_computed_tokens_cpu=torch.from_numpy(num_computed_tokens_local),
 diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
-index 2c0eac3dd..c4a229b78 100644
+index 2c0eac3dd..ce17fff65 100644
 --- a/vllm/v1/core/kv_cache_utils.py
 +++ b/vllm/v1/core/kv_cache_utils.py
 @@ -1048,7 +1048,7 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
@@ -17181,6 +17182,18 @@ index 2c0eac3dd..c4a229b78 100644
          return
  
      logger.warning(
+@@ -1109,7 +1109,10 @@ def get_kv_cache_config(
+     """
+     check_enough_kv_cache_memory(vllm_config, kv_cache_spec, available_memory)
+     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
+-        unify_hybrid_kv_cache_specs(kv_cache_spec)
++        if vllm_config.model_config.hf_config.model_type == "whisper":
++            pass
++        else:
++            unify_hybrid_kv_cache_specs(kv_cache_spec)
+ 
+     if is_kv_cache_type_attention_free(kv_cache_spec):
+         # This returns a kv_cache config with 0 kv_cache groups and 1 block
 diff --git a/vllm/v1/spec_decode/eagle.py b/vllm/v1/spec_decode/eagle.py
 index 7132d507c..a9ade77ea 100644
 --- a/vllm/v1/spec_decode/eagle.py
@@ -17385,6 +17398,20 @@ index 37dd431fd..5a4e63177 100644
 +            elif not self.model_runner.use_spec_decode:
                  self.model_runner._dummy_sampler_run(
                      hidden_states=last_hidden_states)
+ 
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index be05d02ff..516c76469 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -280,7 +280,8 @@ def bind_kv_cache(
+                 # not in a way that's impacted by ignoring this.
+                 pass
+             else:
+-                raise NotImplementedError
++                pass
++                #raise NotImplementedError
+         layer_name = layer_names[0]
+         runner_kv_caches.append(kv_caches[layer_name])
  
 diff --git a/vllm/v1/worker/xpu_model_runner.py b/vllm/v1/worker/xpu_model_runner.py
 index fb892211f..5ba4631cd 100644
