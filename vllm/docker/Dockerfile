@@ -119,7 +119,7 @@ RUN pip install accelerate hf_transfer 'modelscope!=1.15.0'
 
 # Pin transformers version to avoid conflict in vLLM
 RUN pip install "transformers==4.57.0" && \
-    pip install librosa soundfile
+    pip install librosa soundfile decord
 
 
 # Set additional environment for production usage
