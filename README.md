@@ -21,5 +21,9 @@ llm-scaler-omni supports running image/voice/video generation etc using ComfyUI,
 - [Xinference Support](omni/README.md/#xinference)
 
 ---
+## Releases
+- Please check out the Docker image releases for [llm-scaler-vllm](Releases.md/#llm-scaler-vllm) and [llm-scaler-omni](Releases.md/#llm-scaler-omni)
+
+---
 ## Get Support
 - Please report a bug or raise a feature request by opening a [Github Issue](https://github.com/intel/llm-scaler/issues)

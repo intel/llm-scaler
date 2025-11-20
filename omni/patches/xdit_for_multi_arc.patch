@@ -814,7 +814,7 @@ index bdc4003..344459c 100644
                  block_out, block_lse = fn(
                      q,
 diff --git a/xfuser/envs.py b/xfuser/envs.py
-index 498782d..a00407a 100644
+index 498782d..efff82b 100644
 --- a/xfuser/envs.py
 +++ b/xfuser/envs.py
 @@ -63,11 +63,21 @@ def _is_musa():
@@ -843,7 +843,7 @@ index 498782d..a00407a 100644
  
  
  def get_torch_distributed_backend() -> str:
-+    return "ccl"
++    return "xccl"
      if torch.cuda.is_available():
          return "nccl"
      elif _is_musa():

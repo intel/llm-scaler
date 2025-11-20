@@ -8,12 +8,18 @@
 2. [ComfyUI](#comfyui)
 3. [XInference](#xinference)
 4. [Stand-alone Examples](#stand-alone-examples)
+5. [ComfyUI for Windows (experimental)](#comfyui-for-windows-experimental)
 
 ---
 
 ## Getting Started with Omni Docker Image
 
-Build docker image:
+Pull docker image from dockerhub:
+```bash
+docker pull intel/llm-scaler-omni:0.1.0-b3
+```
+
+Or build docker image:
 
 ```bash
 bash build.sh
@@ -22,7 +28,7 @@ bash build.sh
 Run docker image:
 
 ```bash
-export DOCKER_IMAGE=intel/llm-scaler-omni:0.1-b1
+export DOCKER_IMAGE=intel/llm-scaler-omni:0.1.0-b3
 export CONTAINER_NAME=comfyui
 export MODEL_DIR=<your_model_dir>
 export COMFYUI_MODEL_DIR=<your_comfyui_model_dir>
@@ -41,14 +47,12 @@ sudo docker run -itd \
 docker exec -it comfyui bash
 ```
 
-## ComfyUI:
+## ComfyUI
+
+### Starting ComfyUI
+
 ```bash
 cd /llm/ComfyUI
-
-MODEL_PATH=<your_comfyui_models_path>
-rm -rf /llm/ComfyUI/models
-ln -s $MODEL_PATH /llm/ComfyUI/models
-echo "Symbolic link created from $MODEL_PATH to /llm/ComfyUI/models"
 
 export http_proxy=<your_proxy>
 export https_proxy=<your_proxy>
@@ -57,59 +61,139 @@ export no_proxy=localhost,127.0.0.1
 python3 main.py
 ```
 
-Then you can access the webUI at `http://<your_local_ip>:8188/`. On the left side, 
+Then you can access the webUI at `http://<your_local_ip>:8188/`. 
 
+### (Optional) Preview settings for ComfyUI
+
+Click the button on the top-right corner to launch ComfyUI Manager. 
+![comfyui_manager_logo](./assets/comfyui_manager_logo.png)
+
+Modify the `Preview method` to show the preview image during sampling iterations.
+
+![comfyui_manager_preview](./assets/comfyui_manager_preview.png)
+
+### Supported Models
+
+The following models are supported in ComfyUI workflows:
+
+| Model Category | Model Name | Type | Workflow Files |
+|---------------|------------|------|----------------|
+| **Image Generation** | Qwen-Image, Qwen-Image-Edit | Text-to-Image, Image Editing | `image_qwen_image.json`, `image_qwen_image_distill.json`, `image_qwen_image_edit.json`, `image_qwen_image_edit_2509.json` |
+| **Image Generation** | Stable Diffusion 3.5 | Text-to-Image, ControlNet | `image_sd3.5_simple_example.json`, `image_sd3.5_midium.json`, `image_sd3.5_large_canny_controlnet_example.json` |
+| **Image Generation** | Flux.1, Flux.1 Kontext dev | Text-to-Image, Multi-Image Reference, ControlNet | `image_flux_kontext_dev_basic.json`, `image_flux_controlnet_example.json` |
+| **Video Generation** | Wan2.2 TI2V 5B, Wan2.2 T2V 14B, Wan2.2 I2V 14B | Text-to-Video, Image-to-Video | `video_wan2_2_5B_ti2v.json`, `video_wan2_2_14B_t2v.json`, `video_wan2_2_14B_t2v_rapid_aio_multi_xpu.json`, `video_wan2.2_14B_i2v_rapid_aio_multi_xpu.json` |
+| **Video Generation** | Wan2.2 Animate 14B | Video Animation | `video_wan2_2_animate_basic.json` |
+| **3D Generation** | Hunyuan3D 2.1 | Text/Image-to-3D | `3d_hunyuan3d.json` |
+| **Audio Generation** | VoxCPM | Text-to-Speech | `audio_VoxCPM_example.json` |
+
+### ComfyUI Workflows
+
+On the left side of the web UI, you can find the workflows logo to load and manage workflows.
 ![workflow image](./assets/confyui_workflow.png)
 
-### ComfyUI workflows
+All workflow files are available in the `workflows/` directory. Below are detailed descriptions of supported workflows organized by category.
 
-Currently, the following workflows are supported on B60:
-- Qwen-Image (refer to https://raw.githubusercontent.com/Comfy-Org/example_workflows/main/image/qwen/image_qwen_image_distill.json)
-- Qwen-Image-Edit (refer to https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_image_edit.json)
-- Wan2.2-TI2V-5B (refer to https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_wan2_2_5B_ti2v.json)
-- Wan2.2-T2V-14B (refer to https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_wan2_2_14B_t2v.json)
-- Wan2.2-T2V-14B with raylight (refer to https://github.com/komikndr/raylight/blob/main/example_workflows/WanT2V_Raylight.json)
-- Flux.1 Kontext Dev(Basic) workflow in ComfyUI examples (refer to https://docs.comfy.org/tutorials/flux/flux-1-kontext-dev)
-- SD3.5 Simple in ComfyUI examples (refer to https://comfyanonymous.github.io/ComfyUI_examples/sd3/)
+#### Image Generation Workflows
 
-#### Qwen-Image
+##### Qwen-Image
 
-ComfyUI tutorial for qwen-image: https://docs.comfy.org/tutorials/image/qwen/qwen-image
+ComfyUI tutorial: https://docs.comfy.org/tutorials/image/qwen/qwen-image
 
-Only `Qwen-Image Native Workflow Example` part is validated and there are some issues using LoRA. It's recommended to run the Distilled version for better performance.
+**Available Workflows:**
+- **image_qwen_image.json**: Native Qwen-Image workflow for text-to-image generation
+- **image_qwen_image_distill.json**: Distilled version with better performance (recommended)
 
-#### Qwen-Image-Edit
+> **Note:** Only the native workflow is fully validated. There are some issues using LoRA. It's recommended to use the distilled version for better performance.
 
-ComfyUI tutorial for qwen-image-edit: https://docs.comfy.org/tutorials/image/qwen/qwen-image-edit
+##### Qwen-Image-Edit
 
-#### Wan2.2-TI2V-5B && Wan2.2-T2V-14B
+ComfyUI tutorial: https://docs.comfy.org/tutorials/image/qwen/qwen-image-edit
 
-ComfyUI tutorial for wan2.2: https://docs.comfy.org/tutorials/video/wan/wan2_2
+**Available Workflows:**
+- **image_qwen_image_edit.json**: Standard image editing workflow
+- **image_qwen_image_edit_2509.json**: Updated version with enhanced features
 
-#### Wan2.2-T2V-14B with raylight
+These workflows enable image editing based on text prompts, allowing you to modify existing images.
 
-Currently using [WAN2.2-14B-Rapid-AllInOne](https://huggingface.co/Phr00t/WAN2.2-14B-Rapid-AllInOne) and [raylight](https://github.com/komikndr/raylight) as a faster solution with multi-XPU support. The model weights can get from [here](https://modelscope.cn/models/Phr00t/WAN2.2-14B-Rapid-AllInOne/files), and you may need to extract the unet part and VAE part seperately with `tools/extract.py`.
+##### Stable Diffusion 3.5
+
+ComfyUI tutorial: https://comfyanonymous.github.io/ComfyUI_examples/sd3/
+
+**Available Workflows:**
+- **image_sd3.5_simple_example.json**: Simple text-to-image workflow
+- **image_sd3.5_midium.json**: Medium model variant
+- **image_sd3.5_large_canny_controlnet_example.json**: Large model with Canny edge ControlNet for precise control
+
+Stable Diffusion 3.5 provides high-quality text-to-image generation with optional ControlNet support for guided generation.
+
+##### Flux.1 Kontext Dev
+
+ComfyUI tutorial: https://docs.comfy.org/tutorials/flux/flux-1-kontext-dev
+
+**Available Workflows:**
+- **image_flux_kontext_dev_basic.json**: Basic workflow with multi-image reference support
+
+#### Video Generation Workflows
+
+##### Wan2.2
+
+ComfyUI tutorial: https://docs.comfy.org/tutorials/video/wan/wan2_2
+
+**Available Workflows:**
+- **video_wan2_2_5B_ti2v.json**: Text+Image-to-Video with 5B model
+- **video_wan2_2_14B_t2v.json**: Text-to-Video with 14B model
+- **video_wan2_2_14B_t2v_rapid_aio_multi_xpu.json**: 14B Text-to-Video with multi-XPU support (using raylight)
+- **video_wan2.2_14B_i2v_rapid_aio_multi_xpu.json**: 14B Image-to-Video with multi-XPU support
+
+**Multi-XPU Support with Raylight:**
+
+For workflows using [WAN2.2-14B-Rapid-AllInOne](https://huggingface.co/Phr00t/WAN2.2-14B-Rapid-AllInOne) with [raylight](https://github.com/komikndr/raylight) for faster inference with multi-XPU support:
 
 ![wan_raylight](./assets/wan_raylight.png)
 
-##### Follow the Steps to Complete the Workflow
+**Steps to Complete Multi-XPU Workflows:**
 
-1. Model Loading
+1. **Model Loading**
+   - Ensure the `Load Diffusion Model (Ray)` node loads the diffusion model part from WAN2.2-14B-Rapid-AllInOne
+   - Ensure the `Load VAE` node loads the VAE part from WAN2.2-14B-Rapid-AllInOne
+   - Ensure the `Load CLIP` node loads `umt5_xxl_fp8_e4m3fn_scaled.safetensors`
 
-- Ensure the `Load Diffusion Model (Ray)` node loads the diffusion model part from WAN2.2-14B-Rapid-AllInOne.
-- Ensure the `Load VAE` node loads the VAE part from WAN2.2-14B-Rapid-AllInOne.
-- Ensure the `Load CLIP` node loads `umt5_xxl_fp8_e4m3fn_scaled.safetensors`
+2. **Ray Configuration**
+   - Set the `GPU` and `ulysses_degree` in `Ray Init Actor` node to the number of GPUs you want to use
 
-2. Ray configuration
+3. **Run the Workflow**
+   - Click the `Run` button or use the shortcut `Ctrl(cmd) + Enter` to run the workflow
 
-Set the `GPU` and `ulysses_degree` in `Ray Init Actor` node to GPU nums you want to use.
+> **Note:** Model weights can be obtained from [ModelScope](https://modelscope.cn/models/Phr00t/WAN2.2-14B-Rapid-AllInOne/files). You may need to extract the unet and VAE parts separately using `tools/extract.py`.
 
-3. Click the `Run` button or use the shortcut `Ctrl(cmd) + Enter` to run the workflow
+##### Wan2.2 Animate 14B
+
+**Available Workflows:**
+- **video_wan2_2_animate_basic.json**: Video animation workflow with control video support
+
+This is a separate model from the standard Wan2.2 T2V/I2V models, designed specifically for video animation with control video inputs.
+
+#### 3D Generation Workflows
+
+##### Hunyuan3D
+
+**Available Workflows:**
+- **3d_hunyuan3d.json**: Text/Image-to-3D mesh generation
+
+This workflow generates 3D models from text descriptions or images using the Hunyuan3D model.
+
+#### Audio Generation Workflows
+
+##### VoxCPM
+
+**Available Workflows:**
+- **audio_VoxCPM_example.json**: Text-to-Speech synthesis
+
+This workflow generates speech audio from text input using the VoxCPM model.
 
 ## XInference
 
 ```bash
-export ZE_AFFINITY_MASK=0 # In multi XPU environment, clearly select GPU index to avoid issues.
 xinference-local --host 0.0.0.0 --port 9997
 ```
 Supported models:
@@ -139,10 +223,9 @@ Supported models:
 You can select model and launch service via WebUI (refer to [here](#1-access-xinference-web-ui)) or by command:
 
 ```bash
-export ZE_AFFINITY_MASK=0 # In multi XPU environment, clearly select GPU index to avoid issues.
 xinference-local --host 0.0.0.0 --port 9997
 
-xinference launch --model-name sd3.5-medium --model-type image --model-path /llm/models/stable-diffusion-3.5-medium/
+xinference launch --model-name sd3.5-medium --model-type image --model-path /llm/models/stable-diffusion-3.5-medium/ --gpu-idx 0
 ```
 
 #### 2. Post request in OpenAI API format
@@ -191,3 +274,22 @@ Supported models:
 - Qwen Image
 - Wan 2.1 / 2.2
 
+## ComfyUI for Windows (experimental)
+
+We have provided a conda-install method to use `llm-scaler-omni` version ComfyUI on Windows.
+
+```powershell
+git clone https://github.com/intel/llm-scaler.git
+cd llm-scaler\omni\
+.\init_conda_env.bat
+```
+
+After installation, you can enter the `ComfyUI` directory and start ComfyUI server.
+
+```powershell
+cd ComfyUI
+conda activate omni_env
+$env:HTTP_PROXY = <your_proxy>
+$env:HTTPS_PROXY = <your_proxy>
+python .\main.py --listen 0.0.0.0
+```

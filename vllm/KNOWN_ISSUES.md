@@ -12,9 +12,9 @@ Workaround: Change the PCIe slot configuration in BIOS from Auto/x16 to x8/x8.
 With this change, over 40 GB/s bi-directional P2P bandwidth can be achieved.
 Root cause analysis is still in progress.
 
-# 03. Container OOM killed by using `--enable-auto-tool-choice` and starting container not by /bin/bash and not run `source /opt/intel/oneapi/setvars.sh`
+# 03. Container OOM killed (and vllm performance drop) when starting container not by /bin/bash and not run `source /opt/intel/oneapi/setvars.sh`
 
-When using `--enable-auto-tool-choice` and deploy container by docker-compose without `source /opt/intel/oneapi/setvars.sh`, the LD_LIBRARY_PATH will be different and cause the container OOM. It can be reproduced by this two command:
+When using `--enable-auto-tool-choice` and deploy container by docker-compose without `source /opt/intel/oneapi/setvars.sh`, the LD_LIBRARY_PATH will be different and cause the container OOM (or performance drop). It can be reproduced by this two command:
 
 ```bash
 docker run --rm  --entrypoint "/bin/bash" --name=test intel/llm-scaler-vllm:latest -c env | grep LD_LIBRARY_PATH

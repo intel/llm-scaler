@@ -1,0 +1,93 @@
+diff --git a/src/voxcpm/model/utils.py b/src/voxcpm/model/utils.py
+index f92efaa..8663af9 100644
+--- a/src/voxcpm/model/utils.py
++++ b/src/voxcpm/model/utils.py
+@@ -130,6 +130,15 @@ def _is_hip_available():
+         return False
+ 
+ 
++def _is_xpu_available():
++    try:
++        _ = torch.xpu.device_count()
++        xpu_available = torch.xpu.is_available()
++    except:
++        xpu_available = False
++    return xpu_available
++
++
+ def get_dtype(dtype: str):
+     """Gets the torch dtype, automatically downgrading for incompatible hardware."""
+     device = "cpu"
+@@ -140,6 +149,8 @@ def get_dtype(dtype: str):
+                 device = "hip"
+     elif _is_directml_available():
+         device = "directml"
++    elif _is_xpu_available():
++        device = "xpu"
+     elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+         device = "mps"
+ 
+diff --git a/src/voxcpm/model/voxcpm.py b/src/voxcpm/model/voxcpm.py
+index 5c49e5b..9cb48b7 100644
+--- a/src/voxcpm/model/voxcpm.py
++++ b/src/voxcpm/model/voxcpm.py
+@@ -73,7 +73,7 @@ class VoxCPMConfig(BaseModel):
+     dit_config: VoxCPMDitConfig
+ 
+     max_length: int = 4096
+-    device: str = "cuda"
++    device: str = "xpu"
+     dtype: str = "bfloat16"
+ 
+ 
+diff --git a/voxcpm_nodes.py b/voxcpm_nodes.py
+index 0046094..01b29b4 100644
+--- a/voxcpm_nodes.py
++++ b/voxcpm_nodes.py
+@@ -24,7 +24,10 @@ def get_available_devices():
+     devices = []
+     if torch.cuda.is_available():
+         devices.append("cuda")
+-    
++
++    if torch.xpu.is_available():
++        devices.append("xpu")
++
+     # Check for DirectML on Windows
+     try:
+         import platform
+@@ -37,14 +40,14 @@ def get_available_devices():
+     if hasattr(torch.version, 'hip') and torch.version.hip is not None:
+         try:
+             if torch.cuda.is_available() and torch.cuda.get_device_name(0).lower().find('amd') != -1:
+-                 devices.append("hip")
++                devices.append("hip")
+         except:
+             pass
+ 
+     # Check for MPS on Apple Silicon
+     if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+         devices.append("mps")
+-        
++
+     devices.append("cpu")
+     return devices
+ 
+@@ -54,6 +57,8 @@ def set_seed(seed: int):
+     torch.manual_seed(seed)
+     if torch.cuda.is_available():
+         torch.cuda.manual_seed_all(seed)
++    if torch.xpu.is_available():
++        torch.xpu.manual_seed_all(seed)
+ 
+ class VoxCPMNode(io.ComfyNode):
+     CATEGORY = "audio/tts"
+@@ -112,7 +117,7 @@ class VoxCPMNode(io.ComfyNode):
+         if is_cloning and not prompt_text:
+             raise ValueError("Prompt text is required when providing prompt audio for voice cloning.")
+ 
+-        if device == "cuda":
++        if device in ["cuda", "xpu"]:
+             load_device = model_management.get_torch_device()
+             offload_device = model_management.intermediate_device()
+         else:

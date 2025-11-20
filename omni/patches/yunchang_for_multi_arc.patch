@@ -1,5 +1,5 @@
 diff --git a/yunchang/kernels/attention.py b/yunchang/kernels/attention.py
-index 826d2ab..a1f54fe 100644
+index 826d2ab..0dae135 100644
 --- a/yunchang/kernels/attention.py
 +++ b/yunchang/kernels/attention.py
 @@ -26,6 +26,66 @@ import torch.nn.functional as F
@@ -69,7 +69,7 @@ index 826d2ab..a1f54fe 100644
  
  def pytorch_attn_forward(
      q: torch.Tensor,
-@@ -51,14 +111,61 @@ def pytorch_attn_forward(
+@@ -51,14 +111,64 @@ def pytorch_attn_forward(
      v = v.transpose(1, 2)
  
      if op_type == "flash":
@@ -81,64 +81,85 @@ index 826d2ab..a1f54fe 100644
 -            is_causal=causal,
 -            scale=softmax_scale,
 -        )[:2]
-+        #out, lse = aten._scaled_dot_product_flash_attention(
++        # out, lse = aten._scaled_dot_product_flash_attention(
 +        #    q,
 +        #    k,
 +        #    v,
 +        #    dropout_p=dropout_p,
 +        #    is_causal=causal,
 +        #    scale=softmax_scale,
-+        #)[:2]
++        # )[:2]
 +
-+        # dtype = torch.float32
-+        # out = chunk_scaled_dot_product_attention(
-+        #    q.contiguous(),
-+        #    k.contiguous(),
-+        #    v.contiguous(),
-+        #    dropout_p=dropout_p,
-+        #    is_causal=causal,
-+        #    scale=softmax_scale,
-+        #    chunk_size=512,
-+        # )
++        out = F.scaled_dot_product_attention(
++            q, k, v, attn_mask=None, is_causal=causal, dropout_p=dropout_p, scale=softmax_scale
++        )
++        # # dtype = torch.float32
++        # # out = chunk_scaled_dot_product_attention(
++        # #    q.contiguous(),
++        # #    k.contiguous(),
++        # #    v.contiguous(),
++        # #    dropout_p=dropout_p,
++        # #    is_causal=causal,
++        # #    scale=softmax_scale,
++        # #    chunk_size=512,
++        # # )
 +
-+        import xe_addons
-+        import math
-+        head_size = q.shape[-1]
-+        attn_mask = None
-+        dtype = torch.float16
-+        scale = 1 / math.sqrt(head_size)
-+        out = xe_addons.sdp_non_causal(
-+            q.contiguous().to(dtype),
-+            k.contiguous().to(dtype),
-+            v.contiguous().to(dtype),
-+            attn_mask,
-+            scale)
-+        
-+        global naned
-+        def has_nan(x):
-+            return torch.isnan(x).any()
++        # import xe_addons
++        # import math
++        # head_size = q.shape[-1]
++        # attn_mask = None
++        # dtype = torch.float16
++        # scale = 1 / math.sqrt(head_size)
++        # out = xe_addons.sdp_non_causal(
++        #     q.contiguous().to(dtype),
++        #     k.contiguous().to(dtype),
++        #     v.contiguous().to(dtype),
++        #     attn_mask,
++        #     scale)
 +
-+        if not naned:
-+            if has_nan(q):
-+                print("q naned: ", q.device, " ", q.shape)
-+                naned = True
-+            if has_nan(k):
-+                print("k naned: ", k.device, " ", k.shape)
-+                naned = True
-+            if has_nan(v):
-+                print("v naned: ", v.device, " ", v.shape)
-+                naned = True
-+            if has_nan(out):
-+                print("out naned: ", out.device, " ", out.shape)
-+                naned = True
++        # global naned
++        # def has_nan(x):
++        #     return torch.isnan(x).any()
 +
-+        out = out.contiguous().to(q.dtype)
-+        
++        # if not naned:
++        #     if has_nan(q):
++        #         print("q naned: ", q.device, " ", q.shape)
++        #         naned = True
++        #     if has_nan(k):
++        #         print("k naned: ", k.device, " ", k.shape)
++        #         naned = True
++        #     if has_nan(v):
++        #         print("v naned: ", v.device, " ", v.shape)
++        #         naned = True
++        #     if has_nan(out):
++        #         print("out naned: ", out.device, " ", out.shape)
++        #         naned = True
++
++        # out = out.contiguous().to(q.dtype)
++
 +        lse = torch.ones((q.shape[0], q.shape[1], q.shape[2]),  device=out.device, dtype=q.dtype)
 +        # torch.xpu.empty_cache()
      elif op_type == "efficient":
          out, lse = aten._scaled_dot_product_efficient_attention(
              q,
+@@ -72,7 +182,7 @@ def pytorch_attn_forward(
+         )[:2]
+     else:
+         raise ValueError(f"Invalid op_type: {op_type}")
+-    
++
+     out = out.transpose(1, 2)
+     lse = lse.to(q.dtype)
+     return out, lse
+@@ -190,7 +300,7 @@ def flash_attn_backward(dout, q, k, v, out, softmax_lse, block_dq_buffer, block_
+             deterministic,
+             rng_state,
+         )
+-    
++
+ 
+ def flash_attn3_func_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax):
+     assert HAS_FLASH_ATTN_HOPPER
 diff --git a/yunchang/ring/ring_flashinfer_attn.py b/yunchang/ring/ring_flashinfer_attn.py
 index e8f8bed..3f70a75 100644
 --- a/yunchang/ring/ring_flashinfer_attn.py

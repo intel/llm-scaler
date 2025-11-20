@@ -22,7 +22,8 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    2.6 [Data Parallelism (DP)](#26-data-parallelism-dp)  
    2.7 [Finding maximum Context Length](#27-finding-maximum-context-length)   
    2.8 [Multi-Modal Webui](#28-multi-modal-webui)  
-   2.9 [Multi-node Distributed Deployment (PP/TP)](#29-multi-node-distributed-deployment-pptp)
+   2.9 [Multi-node Distributed Deployment (PP/TP)](#29-multi-node-distributed-deployment-pptp)  
+   2.10 [BPE-Qwen Tokenizer](#210-bpe-qwen-tokenizer)
 4. [Supported Models](#3-supported-models)  
 5. [Troubleshooting](#4-troubleshooting)
 6. [Performance tuning](#5-performance-tuning)
@@ -232,7 +233,7 @@ you can add the argument `--api-key xxx` for user authentication. Users are supp
 ### 1.5 Benchmarking the Service
 
 ```bash
-python3 /llm/vllm/benchmarks/benchmark_serving.py \
+vllm bench serve \
     --model /llm/models/DeepSeek-R1-Distill-Qwen-7B \
     --dataset-name random \
     --served-model-name DeepSeek-R1-Distill-Qwen-7B \
@@ -2036,6 +2037,7 @@ To use fp8 online quantization, simply replace `--quantization sym_int4` with:
 ```
 
 For those models that have been quantized before, such as AWQ-Int4/GPTQ-Int4/FP8 models, user do not need to specify the `--quantization` option.
+
 ---
 
 ### 2.3 Embedding and Reranker Model Support
@@ -2065,6 +2067,7 @@ python3 -m vllm.entrypoints.openai.api_server \
 
 ---
 After starting the vLLM service, you can follow this link to use it.
+
 #### [Embedding api](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#embeddings-api_1)
 
 ```bash
@@ -2085,7 +2088,7 @@ VLLM_WORKER_MULTIPROC_METHOD=spawn \
 python3 -m vllm.entrypoints.openai.api_server \
     --model /llm/models/bge-reranker-base \
     --served-model-name bge-reranker-base \
-    --task classify \
+    --task score \
     --dtype=float16 \
     --enforce-eager \
     --port 8000 \
@@ -2177,6 +2180,9 @@ curl http://localhost:8000/v1/chat/completions \
     "max_tokens": 128
   }'
 ```
+
+if want to process image in server local, you can `"url": "file:/llm/models/test/1.jpg"` to test.
+
 ---
 
 ### 2.4.1 Audio Model Support [Deprecated]
@@ -2226,54 +2232,113 @@ curl http://localhost:8000/v1/audio/transcriptions \
 
 ### 2.4.2 dots.ocr Support
 
-Git clone the repo:
+To launch `dots.ocr`, follow the instructions in [1.4 Launching the Serving Service](#14-launching-the-serving-service), specifying the dots.ocr model, setting the model path to `/llm/models/dots.ocr`, the served-model-name to `model`, and the port to 8000.
+
+
+Once the service is running, you can use the method provided in the `dots.ocr` repository to launch Gradio for testing.
+
+---
+
+#### Clone the repository
 
 ```bash
-https://github.com/rednote-hilab/dots.ocr.git
+git clone https://github.com/rednote-hilab/dots.ocr.git
 cd dots.ocr
 ```
 
-Then, we should comment out the following two items in `requirements.txt`:
+#### Modify dependencies
 
-> flash-attn==2.8.0.post2 and accelerate  # because these two dependencies will require cuda
+Comment out the following two lines in `requirements.txt`:
 
-After commenting out these two elements, we can install the dependencies:
+```
+flash-attn==2.8.0.post2
+transformers  # These two dependencies can cause conflicts
+```
+
+Then install the dependencies:
 
 ```bash
-# Assuming you have installed torch/ipex etc.
-pip install --no-deps accelerate
 pip install -e .
 ```
 
-To download model weights in `dots.ocr`:
-```bash
-# In dots.ocr
-python3 tools/download_model.py
-
-# with modelscope
-python3 tools/download_model.py --type modelscope
-```
-
-In order to run dots.ocr, we will need to change codes in `./weights/DotsOCR`:
+#### Launch Gradio for testing
 
 ```bash
-cd ./weights/DotsOCR
-patch -p1 < YOUR_PATH/dots_ocr.patch
+python demo/demo_gradio.py
 ```
 
-Then, you're ready to start:
+---
+
+### 2.4.3 MinerU 2.6 Support
+
+This guide shows how to launch the MinerU 2.6 model using the vLLM inference backend.
+
+#### Start the MinerU Service
+
+Set up the environment variables and launch the vLLM API server:
+```bash
+export MODEL_NAME="/llm/models/MinerU2.5-2509-1.2B/"
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
+
+python3 -m vllm.entrypoints.openai.api_server \
+  --model $MODEL_NAME \
+  --dtype float16 \
+  --enforce-eager \
+  --port 8000 \
+  --host 0.0.0.0 \
+  --trust-remote-code \
+  --gpu-memory-util 0.85 \
+  --no-enable-prefix-caching \
+  --max-num-batched-tokens=32768 \
+  --max-model-len=32768 \
+  --block-size 64 \
+  --max-num-seqs 256 \
+  --served-model-name MinerU \
+  --tensor-parallel-size 1 \
+  --pipeline-parallel-size 1 \
+  --logits-processors mineru_vl_utils:MinerULogitsProcessor
+```
+
+> **💡 Notes**
+>
+> - `--logits-processors mineru_vl_utils:MinerULogitsProcessor` enables MinerU’s custom post-processing logic.
+
+
+
+#### Run the demo
+To verify mineru
 
 ```bash
-export hf_model_path=./weights/DotsOCR  # Path to your downloaded model weights, Please use a directory name without periods (e.g., `DotsOCR` instead of `dots.ocr`) for the model save path. This is a temporary workaround pending our integration with Transformers.
-export PYTHONPATH=$(dirname "$hf_model_path"):$PYTHONPATH
-sed -i '/^from vllm\.version import __version__ as VLLM_VERSION$/a\
-from DotsOCR import modeling_dots_ocr_vllm' /usr/local/lib/python3.12/dist-packages/vllm-0.10.1.dev0+g6d8d0a24c.d20250825.xpu-py3.12-linux-x86_64.egg/vllm/entrypoints/openai/api_server.py  
-# If you downloaded model weights by yourself, please replace `DotsOCR` by your model saved directory name, and remember to use a directory name without periods (e.g., `DotsOCR` instead of `dots.ocr`) 
-
-# Start the service:
-TORCH_LLM_ALLREDUCE=1 VLLM_USE_V1=1  CCL_ZE_IPC_EXCHANGE=pidfd VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn python3 -m vllm.entrypoints.openai.api_server --model YOUR_DOTSOCR_PATH --enforce-eager --host 0.0.0.0 --trust-remote-code --disable-sliding-window --gpu-memory-util=0.8 --no-enable-prefix-caching --max-num-batched-tokens=8192  --disable-log-requests  --max-model-len=40000 --block-size 64 -tp=1 --port 8000 --served-model-name DotsOCR --chat-template-content-format string --dtype bfloat16
+#mineru -p <input_path> -o <output_path> -b vlm-http-client -u http://127.0.0.1:8000
+mineru -p /llm/MinerU/demo/pdfs/small_ocr.pdf -o ./ -b vlm-http-client -u http://127.0.0.1:8000
 ```
 
+2.Using by gradio
+
+```bash
+mineru-gradio --server-name 0.0.0.0 --server-port 8002
+```
+
+```python
+from gradio_client import Client, handle_file
+
+client = Client("http://localhost:8002/")
+result = client.predict(
+    file_path=handle_file('/llm/MinerU/demo/pdfs/small_ocr.pdf'),
+    end_pages=500,
+    is_ocr=False,
+    formula_enable=True,
+    table_enable=True,
+    language="ch",
+    backend="vlm-http-client",
+    url="http://localhost:8000",
+    api_name="/to_markdown"
+)
+print(result)
+```
+More details you can refer to gradio's [api guide](http://your_ip:8002/?view=api)
 
 ---
 
@@ -2309,7 +2374,7 @@ python3 -m vllm.entrypoints.openai.api_server \
 
 After starting the vLLM service, you can follow this link to use it
 
-#### [Qwen2.5-Omni input](https://github.com/QwenLM/Qwen2.5-Omni?tab=readme-ov-file#vllm-serve-usage)
+#### [Qwen-Omni input](https://github.com/QwenLM/Qwen2.5-Omni?tab=readme-ov-file#vllm-serve-usage)
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -2330,6 +2395,25 @@ An example responce is listed below:
 ```json
 {"id":"chatcmpl-xxx","object":"chat.completion","model":"Qwen2.5-Omni-7B","choices":[{"index":0,"message":{"role":"assistant","reasoning_content":null,"content":"The text in the image is \"TONGYI Qwen\". The sound in the audio is a cough.","tool_calls":[]},"logprobs":null,"finish_reason":"stop","stop_reason":null}],"usage":{"prompt_tokens":156,"total_tokens":180,"completion_tokens":24,"prompt_tokens_details":null},"prompt_logprobs":null,"kv_transfer_params":null}
 ```
+
+For video input, one can input like this:
+
+```bash
+curl -sS http://localhost:8000/v1/chat/completions   -H "Content-Type: application/json"   -d '{
+    "model": "Qwen3-Omni-30B-A3B-Instruct",
+    "temperature": 0,
+    "max_tokens": 1024,
+    "messages": [{
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "Please describe the video comprehensively as much as possible." },
+        { "type": "video_url", "video_url": { "url": "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4" } }
+      ]
+    }]
+  }'
+```
+
+
 ---
 
 ### 2.6 Data Parallelism (DP)
@@ -2625,8 +2709,21 @@ python3 -m vllm.entrypoints.openai.api_server \
     --distributed-executor-backend ray
 ```
 
----
+
 At this point, multi-node distributed inference with **PP + TP** is running, coordinated by **Ray** across Node-1 and Node-2.
+
+---
+
+
+### 2.10 BPE-Qwen Tokenizer
+
+We have integrated the **bpe-qwen tokenizer** to accelerate tokenization for Qwen models.
+
+To enable it when launching the API server, add:
+
+```bash
+--tokenizer-mode bpe_qwen
+```
 
 ---
 

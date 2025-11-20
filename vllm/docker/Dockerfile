@@ -16,7 +16,6 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
 RUN apt-get update -y && \
     # apt-get install -y software-properties-common && \
     # add-apt-repository ppa:deadsnakes/ppa && \
-    apt-get update -y && \
     apt-get install -y python3.12 python3.12-dev python3-pip && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
     update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
@@ -34,7 +33,6 @@ RUN apt-get update -y && \
         vim \
         linux-libc-dev && \
     # Install Intel GPU runtime packages
-    apt-get update -y && \
     apt-get install -y intel-oneapi-dpcpp-ct=2025.1.0-452 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -51,7 +49,7 @@ ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
 RUN python3 -m pip config set global.break-system-packages true
 
 # Clone + patch vllm
-RUN git clone -b v0.10.0 https://github.com/vllm-project/vllm.git && \
+RUN git clone -b v0.10.2 https://github.com/vllm-project/vllm.git && \
     cd vllm && \
     git apply /tmp/vllm_for_multi_arc.patch && \
     pip install --no-cache-dir -r requirements/xpu.txt && \
@@ -59,12 +57,12 @@ RUN git clone -b v0.10.0 https://github.com/vllm-project/vllm.git && \
     python3 setup.py install
 
 # Clone + patch miner-U
-RUN git clone https://github.com/opendatalab/MinerU.git && \
+RUN git clone -b release-2.6.2 https://github.com/opendatalab/MinerU.git && \
     cd MinerU && \
-    git checkout de41fa58590263e43b783fe224b6d07cae290a33 && \
-    git apply /tmp/miner-u.patch && \
     pip install -e .[core] && \
-    sed -i 's/select_device(self.args.device, verbose=verbose)/torch.device(self.args.device)/' /usr/local/lib/python3.12/dist-packages/ultralytics/engine/predictor.py
+    # pip install mineru_vl_utils==0.1.14 gradio gradio-client gradio-pdf && \
+    sed -i 's/kwargs.get("max_concurrency", 100)/kwargs.get("max_concurrency", 200)/' /llm/MinerU/mineru/backend/vlm/vlm_analyze.py && \
+    sed -i 's/kwargs.get("http_timeout", 600)/kwargs.get("http_timeout", 1200)/' /llm/MinerU/mineru/backend/vlm/vlm_analyze.py
 
 
 # ======= Add oneCCL build =======
@@ -120,7 +118,8 @@ RUN pip install accelerate hf_transfer 'modelscope!=1.15.0'
 
 
 # Pin transformers version to avoid conflict in vLLM
-RUN pip install "transformers<4.54.0"
+RUN pip install "transformers==4.57.0" && \
+    pip install librosa soundfile
 
 
 # Set additional environment for production usage
