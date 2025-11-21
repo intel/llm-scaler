@@ -191,6 +191,74 @@ This workflow generates 3D models from text descriptions or images using the Hun
 
 This workflow generates speech audio from text input using the VoxCPM model.
 
+##### IndexTTS 2
+
+**Available Workflows:**
+- **audio_indextts2.json**: Voice cloning
+
+This workflow synthesizes new speech using a single reference audio file for voice cloning.
+
+**Usage Steps:**
+
+1. **Prepare Models**
+
+   Download the following models and place them in the `<your comfyui model path>/TTS` directory:
+   - `IndexTeam/IndexTTS-2`
+   - `nvidia/bigvgan_v2_22khz_80band_256x`
+   - `funasr/campplus`
+   - `amphion/MaskGCT`
+   - `facebook/w2v-bert-2.0`
+
+   Ensure your file structure matches the following hierarchy:
+
+   ```text
+   TTS/
+   ├── bigvgan_v2_22khz_80band_256x/
+   │   ├── bigvgan_generator.pt
+   │   └── config.json
+   ├── campplus/
+   │   └── campplus_cn_common.bin
+   ├── IndexTTS-2/
+   │   ├── .gitattributes
+   │   ├── bpe.model
+   │   ├── config.yaml
+   │   ├── feat1.pt
+   │   ├── feat2.pt
+   │   ├── gpt.pth
+   │   ├── README.md
+   │   ├── s2mel.pth
+   │   ├── wav2vec2bert_stats.pt
+   │   └── qwen0.6bemo4-merge/
+   │       ├── added_tokens.json
+   │       ├── chat_template.jinja
+   │       ├── config.json
+   │       ├── generation_config.json
+   │       ├── merges.txt
+   │       ├── model.safetensors
+   │       ├── Modelfile
+   │       ├── special_tokens_map.json
+   │       ├── tokenizer.json
+   │       ├── tokenizer_config.json
+   │       └── vocab.json
+   ├── MaskGCT/
+   │   └── semantic_codec/
+   │       └── model.safetensors
+   └── w2v-bert-2.0/
+       ├── .gitattributes
+       ├── config.json
+       ├── conformer_shaw.pt
+       ├── model.safetensors
+       ├── preprocessor_config.json
+       └── README.md
+   ```
+
+2. **Configure Workflow**
+   - Load the reference audio file.
+   - Set the desired input text.
+
+3. **Run the Workflow**
+   - Execute the workflow to generate the speech.
+
 ## XInference
 
 ```bash
