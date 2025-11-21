@@ -127,7 +127,7 @@ if errorlevel 1 (
     echo WARNING: Patch may not have applied cleanly. Check for .rej files.
     echo Continuing installation...
 )
-
+call conda run -n omni_env pip install -r requirements.txt
 cd ..
 
 echo.
