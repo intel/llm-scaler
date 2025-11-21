@@ -1,0 +1,231 @@
+{
+  "id": "f616e4a5-ddda-4c3e-a13c-bfe3aee9ecc7",
+  "revision": 0,
+  "last_node_id": 63,
+  "last_link_id": 114,
+  "nodes": [
+    {
+      "id": 62,
+      "type": "LoadAudio",
+      "pos": [
+        442.48858642578125,
+        71.31970977783203
+      ],
+      "size": [
+        274.080078125,
+        136
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            112
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.65",
+        "Node name for S&R": "LoadAudio"
+      },
+      "widgets_values": [
+        "voice_01.wav",
+        null,
+        null
+      ]
+    },
+    {
+      "id": 63,
+      "type": "IndexTTS2Run",
+      "pos": [
+        780.3184204101562,
+        56.75355911254883
+      ],
+      "size": [
+        400,
+        630
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 112
+        },
+        {
+          "name": "text",
+          "type": "STRING",
+          "link": 113
+        },
+        {
+          "name": "dialogue_audio_s2",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "name": "emo_audio_prompt",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "name": "emo_audio_prompt_s2",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            114
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "billwuhao/ComfyUI_IndexTTS",
+        "ver": "e88d59465f40f6bb3fce2590fad785faab1098de",
+        "Node name for S&R": "IndexTTS2Run"
+      },
+      "widgets_values": [
+        30,
+        0.8,
+        0.8,
+        3,
+        1500,
+        120,
+        false,
+        false,
+        true,
+        1,
+        "",
+        false,
+        "",
+        false,
+        1,
+        "",
+        false,
+        "",
+        false
+      ]
+    },
+    {
+      "id": 11,
+      "type": "MultiLinePromptIndex",
+      "pos": [
+        445.8247985839844,
+        269.2752990722656
+      ],
+      "size": [
+        267.9230041503906,
+        205.40167236328125
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "text",
+          "type": "STRING",
+          "links": [
+            113
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "billwuhao/ComfyUI_IndexTTS",
+        "ver": "e88d59465f40f6bb3fce2590fad785faab1098de",
+        "Node name for S&R": "MultiLinePromptIndex"
+      },
+      "widgets_values": [
+        "Translate for me, what is a surprise!"
+      ]
+    },
+    {
+      "id": 57,
+      "type": "SaveAudioMP3",
+      "pos": [
+        1234.3994140625,
+        58.34811019897461
+      ],
+      "size": [
+        270,
+        136
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 114
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.65",
+        "Node name for S&R": "SaveAudioMP3"
+      },
+      "widgets_values": [
+        "IN会话",
+        "V0"
+      ]
+    }
+  ],
+  "links": [
+    [
+      112,
+      62,
+      0,
+      63,
+      0,
+      "AUDIO"
+    ],
+    [
+      113,
+      11,
+      0,
+      63,
+      1,
+      "STRING"
+    ],
+    [
+      114,
+      63,
+      0,
+      57,
+      0,
+      "AUDIO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 1.2100000000000006,
+      "offset": [
+        -258.83094218627053,
+        7.791742922700692
+      ]
+    },
+    "frontendVersion": "1.27.10",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}

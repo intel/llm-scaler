@@ -128,6 +128,24 @@ if errorlevel 1 (
     echo Continuing installation...
 )
 
+cd ..
+
+echo.
+echo ============================================
+echo Installing ComfyUI-IndexTTS
+echo ============================================
+
+if exist ComfyUI_IndexTTS (
+    echo ComfyUI_IndexTTS already exists, skipping
+) else (
+    git clone https://github.com/billwuhao/ComfyUI_IndexTTS.git
+)
+cd ComfyUI_IndexTTS
+curl -L -o "pynini-2.1.6.post1-cp312-cp312-win_amd64.whl" "https://github.com/billwuhao/pynini-windows-wheels/releases/download/v2.1.6.post1/pynini-2.1.6.post1-cp312-cp312-win_amd64.whl"
+call conda run -n omni_env pip install pynini-2.1.6.post1-cp312-cp312-win_amd64.whl
+del pynini-2.1.6.post1-cp312-cp312-win_amd64.whl
+call conda run -n omni_env pip install importlib_resources 
+call conda run -n omni_env pip install WeTextProcessing>=1.0.4 --no-deps 
 call conda run -n omni_env pip install -r requirements.txt
 cd ..
 
