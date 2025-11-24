@@ -131,12 +131,23 @@ https://github.com/intel/llm-scaler/blob/main/vllm/KNOWN_ISSUES.md
 
 First, pull the image for **Intel Arc B60 GPUs**:
 
+> **⚠️ Important**
+> Do **NOT** use the `latest` tag.
+> Instead, go to the **Releases** page and pull the *exact* beta version:
+> [https://github.com/intel/llm-scaler/blob/main/Releases.md/#latest-beta-release](https://github.com/intel/llm-scaler/blob/main/Releases.md/#latest-beta-release)
+>
+> This ensures you can precisely identify which version you are using.
+
+Example:
+
 ```bash
-docker pull intel/llm-scaler-vllm:latest
+# Replace <VERSION> with the latest beta release version from the link above
+docker pull intel/llm-scaler-vllm:<VERSION>
 ```
+
 **Notes:**
-* `intel/llm-scaler-vllm:1.0` → PV release image
-* `intel/llm-scaler-vllm:latest` → Latest development version
+* `intel/llm-scaler-vllm:1.0` → PV release image (stable)
+* `intel/llm-scaler-vllm:<VERSION>` → Recommended beta release (instead of `latest`)
 
 **Supplement: For Intel Arc A770 GPUs**
 ```bash
@@ -158,7 +169,7 @@ sudo docker run -td \
     -e https_proxy=$https_proxy \
     --shm-size="32g" \
     --entrypoint /bin/bash \
-    intel/llm-scaler-vllm:latest
+    intel/llm-scaler-vllm:<VERSION>
 ```
 
 Enter the container:

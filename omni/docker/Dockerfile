@@ -97,6 +97,9 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cd ../DifferentiableRenderer && \
     python setup.py install && \
     cd /llm/ComfyUI/custom_nodes && \
+    git clone https://github.com/billwuhao/ComfyUI_IndexTTS.git && \
+    cd ComfyUI_IndexTTS && \
+    pip install -r requirements.txt && \
 # Install Xinference
     pip install "xinference[transformers]" && \
     patch /usr/local/lib/python3.10/dist-packages/xinference/device_utils.py < /tmp/xinference_device_utils.patch && \
