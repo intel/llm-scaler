@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ======== Base Stage ========
-FROM intel/llm-scaler-platform:25.38.4.2 AS vllm-base
+FROM intel/llm-scaler-platform:25.45.5.4 AS vllm-base
 
 ARG https_proxy
 ARG http_proxy
@@ -94,7 +94,7 @@ RUN git clone -b release-2.6.2 https://github.com/opendatalab/MinerU.git && \
 #     bash intel-oneccl-2021.15.4.11_offline.sh -a --silent --eula accept
 
 # Install pypi dependencies
-RUN pip install bigdl-core==2.4.0b1
+RUN pip install bigdl-core==2.4.0b2
 
 # Cleanup patch file
 RUN rm -rf /tmp/*
@@ -119,13 +119,14 @@ RUN pip install accelerate hf_transfer 'modelscope!=1.15.0'
 
 # Pin transformers version to avoid conflict in vLLM
 RUN pip install "transformers==4.57.0" && \
-    pip install librosa soundfile
+    pip install librosa soundfile decord
 
 
 # Set additional environment for production usage
 ENV VLLM_QUANTIZE_Q40_LIB="/usr/local/lib/python3.12/dist-packages/vllm_int4_for_multi_arc.so"
 ENV VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 ENV VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+ENV UR_L0_USE_IMMEDIATE_COMMANDLISTS=0
 
 RUN pip uninstall oneccl oneccl-devel -y
 
