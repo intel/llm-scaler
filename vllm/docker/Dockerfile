@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ======== Base Stage ========
-FROM intel/llm-scaler-platform:25.45.5.2 AS vllm-base
+FROM intel/llm-scaler-platform:25.45.5.4 AS vllm-base
 
 ARG https_proxy
 ARG http_proxy
@@ -126,6 +126,7 @@ RUN pip install "transformers==4.57.0" && \
 ENV VLLM_QUANTIZE_Q40_LIB="/usr/local/lib/python3.12/dist-packages/vllm_int4_for_multi_arc.so"
 ENV VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 ENV VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+ENV UR_L0_USE_IMMEDIATE_COMMANDLISTS=0
 
 RUN pip uninstall oneccl oneccl-devel -y
 
