@@ -9585,27 +9585,30 @@ index 8cac47b5a..47577ff9c 100644
      # Update the `method_to_config` with customized quantization methods.
      method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
 diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
-index 3d94626e5..7a85c7490 100644
+index 3d94626e5..d23b7ba21 100644
 --- a/vllm/model_executor/layers/quantization/fp8.py
 +++ b/vllm/model_executor/layers/quantization/fp8.py
-@@ -143,6 +143,7 @@ class Fp8Config(QuantizationConfig):
+@@ -143,6 +143,8 @@ class Fp8Config(QuantizationConfig):
          from vllm.attention.layer import Attention
          from vllm.model_executor.layers.quantization.ipex_quant import (
              XPUFp8LinearMethod, XPUFp8MoEMethod)
 +        modules_to_not_convert=["visual", "vision", "vpm", "resampler"]
++        modules_to_convert=["vision_experts"]
          fp8_config = Fp8Config(
              is_checkpoint_fp8_serialized=self.is_checkpoint_fp8_serialized,
              activation_scheme=self.activation_scheme,
-@@ -152,7 +153,7 @@ class Fp8Config(QuantizationConfig):
+@@ -152,7 +154,9 @@ class Fp8Config(QuantizationConfig):
          if isinstance(layer, LinearBase):
              if is_layer_skipped(prefix=prefix,
                                  ignored_layers=self.ignored_layers,
 -                                fused_mapping=self.packed_modules_mapping):
-+                                fused_mapping=self.packed_modules_mapping) or any(key in prefix for key in modules_to_not_convert):
++                                fused_mapping=self.packed_modules_mapping) or \
++                                (any(key in prefix for key in modules_to_not_convert) \
++                                 and not any(key in prefix for key in modules_to_convert)):
                  return UnquantizedLinearMethod()
              return XPUFp8LinearMethod(fp8_config)
          elif isinstance(layer, FusedMoE):
-@@ -309,10 +310,14 @@ class Fp8LinearMethod(LinearMethodBase):
+@@ -309,10 +313,14 @@ class Fp8LinearMethod(LinearMethodBase):
                          if self.quant_config.is_checkpoint_fp8_serialized else
                          params_dtype)
  
@@ -9621,7 +9624,7 @@ index 3d94626e5..7a85c7490 100644
                                        input_dim=1,
                                        output_dim=0,
                                        weight_loader=weight_loader)
-@@ -631,8 +636,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -631,8 +639,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
              num_experts,
              2 * intermediate_size_per_partition,
              hidden_size,
@@ -9633,7 +9636,7 @@ index 3d94626e5..7a85c7490 100644
          layer.register_parameter("w13_weight", w13_weight)
          set_weight_attrs(w13_weight, extra_weight_attrs)
  
-@@ -640,7 +647,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -640,7 +650,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
              num_experts,
              hidden_size,
              intermediate_size_per_partition,
@@ -10164,14 +10167,13 @@ index f935bdd84..ba177b181 100644
 +        return hidden_states
 diff --git a/vllm/model_executor/layers/quantization/sym_int4.py b/vllm/model_executor/layers/quantization/sym_int4.py
 new file mode 100644
-index 000000000..10d1d3d56
+index 000000000..ff99bd763
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/sym_int4.py
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,399 @@
 +# SPDX-License-Identifier: Apache-2.0
 +
-+from typing import Any, Dict, List, Optional, Tuple
-+# from vllm.model_executor.layers.quantization import register_quantization_config
++from typing import Any, Dict, List, Optional, Tuple, Callable, Union
 +from vllm.model_executor.layers.quantization.base_config import (
 +    QuantizationConfig, QuantizeMethodBase)
 +from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
@@ -10180,46 +10182,116 @@ index 000000000..10d1d3d56
 +                                           ModelWeightParameter,
 +                                           PerTensorScaleParameter)
 +
++from vllm.model_executor.layers.fused_moe.layer import FusedMoE
++from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
++from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
++from vllm.model_executor.utils import set_weight_attrs
 +import torch
 +from torch.nn import Module
 +from torch.nn.parameter import Parameter
-+# from vllm.model_executor.layers.quantization.ipex_quant import MIN_IPEX_VERSION
 +
 +from vllm.envs import VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT, VLLM_QUANTIZE_Q40_LIB
 +import ctypes
 +
 +MIN_IPEX_VERSION = "2.5.0"
-+class SymInt4Config(QuantizationConfig):
-+    """SYM_INT4 quantization config class which uses IPEX kernel behind the scene...
-+    The weight will be quantized according to GPTQ setups...
-+    """
-+    def __init__(
-+        self,
-+    ) -> None:
-+        super().__init__()
++QK4_GROUP_SIZE: int = 128
++QK4_PACK_FACTOR: int = 8
 +
++_QLIB_CACHE = None
++
++def _get_quant_lib():
++    """
++    Lazy loads the quantization library and sets up argtypes.
++    Singleton pattern to avoid reloading the DLL multiple times.
++    """
++    global _QLIB_CACHE
++    if _QLIB_CACHE is not None:
++        return _QLIB_CACHE
++
++    try:
++        clib = ctypes.CDLL(VLLM_QUANTIZE_Q40_LIB)
++    except OSError as e:
++        raise RuntimeError(f"Failed to load required quantization lib at {VLLM_QUANTIZE_Q40_LIB}: {e}")
++
++    # Updated argtypes to match C signature:
++    # (float *src, int32_t *qweight, ggml_fp16_t *scale, int out_features, int in_features, int block_size)
++    clib.quantize_q4_0_to_qweight_and_scale.argtypes = [
++        ctypes.POINTER(ctypes.c_float),
++        ctypes.POINTER(ctypes.c_int32),
++        ctypes.POINTER(ctypes.c_uint16),
++        ctypes.c_int,
++        ctypes.c_int,
++        ctypes.c_int,  # [New] block_size argument
++    ]
++    clib.quantize_q4_0_to_qweight_and_scale.restype = ctypes.c_size_t
++
++    _QLIB_CACHE = clib
++    return clib
++
++def ggml_quantize_tensor(weight: torch.Tensor,
++                         out_qweight: torch.Tensor,
++                         out_scale: torch.Tensor,
++                         out_features: int,
++                         in_features: int,
++                         block_size: int = QK4_GROUP_SIZE):
++    """
++    Shared implementation for quantizing a tensor using the C library.
++    """
++    # Assertions
++    assert weight.dim() == 2
++    # Validate shapes considering packing factor and block size
++    assert out_qweight.shape == (out_features, in_features // QK4_PACK_FACTOR)
++    assert out_scale.shape == (out_features, in_features // block_size)
++
++    assert weight.dtype == torch.float32
++    assert out_qweight.dtype == torch.int32
++    assert out_scale.dtype == torch.float16
++
++    assert out_qweight.is_contiguous()
++    assert out_scale.is_contiguous()
++
++    # Ctypes casting
++    src = ctypes.cast(weight.data.data_ptr(), ctypes.POINTER(ctypes.c_float))
++    qweight = ctypes.cast(out_qweight.data.data_ptr(), ctypes.POINTER(ctypes.c_int32))
++    scale = ctypes.cast(out_scale.data.data_ptr(), ctypes.POINTER(ctypes.c_uint16))
++
++    clib = _get_quant_lib()
++
++    # Call C function with the new block_size parameter
++    clib.quantize_q4_0_to_qweight_and_scale(src, qweight, scale, out_features, in_features, block_size)
++
++    # Transpose logic (as per original implementation requirement)
++    # The C code fills row-wise, but IPEX/PyTorch logic here seems to want column-major 
++    # or specific layout for the final parameter, so we transpose results.
++    out_qweight_ret = out_qweight.transpose(0, 1).contiguous()
++    out_scale_ret = out_scale.transpose(0, 1).contiguous()
++
++    return out_qweight_ret, out_scale_ret
++
++# ==============================================================================
++#  Classes
++# ==============================================================================
++
++class SymInt4Config(QuantizationConfig):
++    """SYM_INT4 quantization config class which uses IPEX kernel behind the scene..."""
++    def __init__(self) -> None:
++        super().__init__()
 +
 +    @classmethod
 +    def get_name(cls) -> str:
 +        return "sym_int4"
 +
-+
 +    @classmethod
 +    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
 +        return [torch.half]
 +
-+
 +    @classmethod
 +    def get_min_capability(cls) -> int:
-+        # TODO: check if this will affect things...
-+        # May need to check platform xpu
 +        return -1
-+
 +
 +    @classmethod
 +    def get_config_filenames(cls) -> List[str]:
 +        return []
-+
 +
 +    @classmethod
 +    def from_config(cls, config: Dict[str, Any]) -> "SymInt4Config":
@@ -10228,68 +10300,22 @@ index 000000000..10d1d3d56
 +    @classmethod
 +    def get_quant_method(self, layer: torch.nn.Module,
 +                         prefix: str) -> Optional["QuantizeMethodBase"]:
-+        """Get the quantize method to use for the quantized layer.
-+
-+        Args:
-+            layer: The layer for the quant method.
-+            prefix: The full name of the layer in the state dict
-+        Returns:
-+            The quantize method. None if the given layer doesn't support quant
-+            method.
-+        """
-+        modules_to_not_convert=["visual", "vision", "vpm", "resampler"]
++        modules_to_not_convert = ["visual", "vision", "vpm", "resampler"]
 +        if any(key in prefix for key in modules_to_not_convert):
 +            return UnquantizedLinearMethod()
 +        if isinstance(layer, LinearBase):
 +            return SymInt4LinearMethod(self)
++        if isinstance(layer, FusedMoE):
++            return XPUGPTQInt4LinearMoEMethod(self, layer.moe_config)
 +        else:
 +            return None
-+
 +
 +
 +class SymInt4LinearMethod(LinearMethodBase):
 +    def __init__(self, quant_config: SymInt4Config):
 +        self.quant_config = quant_config
-+        # Initialize the quant_config
-+        try:
-+            self.clib = ctypes.CDLL(VLLM_QUANTIZE_Q40_LIB)
-+        except OSError as e:
-+            raise RuntimeError(f"Failed to load required quantization lib at {VLLM_QUANTIZE_Q40_LIB}: {e}")
-+        self.clib.quantize_q4_0_to_qweight_and_scale.argtypes = [
-+            ctypes.POINTER(ctypes.c_float),
-+            ctypes.POINTER(ctypes.c_int32),
-+            ctypes.POINTER(ctypes.c_uint16),
-+            ctypes.c_int,
-+            ctypes.c_int,
-+        ]
-+        self.clib.quantize_q4_0_to_qweight_and_scale.restype = ctypes.c_size_t
-+
-+    def ggml_quantize_tensor(self, weight: torch.Tensor, out_qweight: torch.Tensor, out_scale:torch.Tensor, out_features: int, in_features: int):
-+        # Convert src to float *
-+        # Currently, only handles dimension = 2
-+        assert(weight.dim()==2)
-+        assert out_qweight.shape == (out_features, in_features // 8)
-+        assert out_scale.shape == (out_features, in_features // 64)
-+
-+        assert weight.dtype == torch.float32
-+        assert out_qweight.dtype == torch.int32
-+        assert out_scale.dtype == torch.float16
-+
-+        assert(out_qweight.is_contiguous())
-+        assert(out_scale.is_contiguous())
-+        src = weight.data.data_ptr()
-+        src = ctypes.cast(src, ctypes.POINTER(ctypes.c_float))
-+
-+        qweight = out_qweight.data.data_ptr()
-+        qweight = ctypes.cast(qweight, ctypes.POINTER(ctypes.c_int32))
-+
-+        scale = out_scale.data.data_ptr()
-+        scale = ctypes.cast(scale, ctypes.POINTER(ctypes.c_uint16))
-+        self.clib.quantize_q4_0_to_qweight_and_scale(src, qweight, scale, out_features, in_features)
-+        out_qweight = out_qweight.transpose(0,1).contiguous()
-+        out_scale = out_scale.transpose(0,1).contiguous()
-+        return out_qweight, out_scale
-+
++        # Ensure lib is loaded on init
++        _get_quant_lib()
 +
 +    def create_weights(
 +        self,
@@ -10305,7 +10331,6 @@ index 000000000..10d1d3d56
 +        weight_loader = extra_weight_attrs.get("weight_loader")
 +
 +        layer.logical_widths = output_partition_sizes
-+
 +        layer.input_size_per_partition = input_size_per_partition
 +        layer.output_size_per_partition = output_size_per_partition
 +        layer.orig_dtype = params_dtype
@@ -10321,7 +10346,6 @@ index 000000000..10d1d3d56
 +                                      weight_loader=weight_loader)
 +        layer.register_parameter("weight", weight)
 +
-+
 +    def apply(self,
 +              layer: torch.nn.Module,
 +              x: torch.Tensor,
@@ -10333,15 +10357,18 @@ index 000000000..10d1d3d56
 +            out.add_(bias)
 +        return out.reshape(x.shape[:-1] + (layer.ipex_output_size, ))
 +
-+
 +    def process_weights_after_loading(self, layer: Module) -> None:
 +        weight = layer.weight.float()
 +        out_features = layer.weight.shape[0]
 +        in_features = layer.weight.shape[1]
 +
-+        qweight = torch.zeros((out_features, in_features // 8), dtype=torch.int32, device=layer.weight.device)
-+        scale = torch.zeros((out_features, in_features // 64), dtype=torch.float16, device=layer.weight.device)
-+        qweight, scale = self.ggml_quantize_tensor(weight, qweight, scale, out_features, in_features)
++        qweight = torch.zeros((out_features, in_features // QK4_PACK_FACTOR), dtype=torch.int32, device=layer.weight.device)
++        scale = torch.zeros((out_features, in_features // QK4_GROUP_SIZE), dtype=torch.float16, device=layer.weight.device)
++
++        # Use the extracted global function
++        qweight, scale = ggml_quantize_tensor(
++            weight, qweight, scale, out_features, in_features, block_size=QK4_GROUP_SIZE
++        )
 +        
 +        qweight = qweight.to("xpu")
 +        scale = scale.to("xpu")
@@ -10350,7 +10377,7 @@ index 000000000..10d1d3d56
 +        layer.weight = Parameter(qweight, requires_grad=False)
 +        # qweight_scale
 +        layer.weight_scale = Parameter(scale, requires_grad=False)
-+        # layer.input_scale = None
++
 +        try:
 +            import intel_extension_for_pytorch as ipex
 +            if ipex.__version__ < MIN_IPEX_VERSION:
@@ -10364,16 +10391,15 @@ index 000000000..10d1d3d56
 +                f"intel_extension_for_pytorch>={MIN_IPEX_VERSION} via "
 +                f"`pip install intel_extension_for_pytorch>={MIN_IPEX_VERSION}`"
 +                " to use IPEX-AWQ linear method.") from err
++
 +        lowp_mode = ipex.quantization.WoqLowpMode.INT8
-+        # The weight will be de-packed from INT4 to INT8.
 +        weight_dtype = ipex.quantization.WoqWeightDtype.INT4
-+        # The float activation will be quantized (dynamic, per-token) to INT8.
 +        act_quant_mode = ipex.quantization.WoqActQuantMode.PER_BATCH_IC_BLOCK
 +        qconfig = ipex.quantization.get_weight_only_quant_qconfig_mapping(
 +            weight_dtype=weight_dtype,
 +            lowp_mode=lowp_mode,
 +            act_quant_mode=act_quant_mode,
-+            group_size=64,
++            group_size=QK4_GROUP_SIZE,
 +        )
 +        layer.ipex_output_size = layer.weight.shape[-1]
 +        g_idx = None
@@ -10387,10 +10413,164 @@ index 000000000..10d1d3d56
 +            qconfig=qconfig,
 +            g_idx=g_idx,
 +            bias=None,
-+            group_size=64,
++            group_size=QK4_GROUP_SIZE,
 +            # For GPTQ layout
 +            quant_method=0
 +        )
++
++
++class XPUGPTQInt4LinearMoEMethod(FusedMoEMethodBase):
++    def __init__(
++        self,
++        quant_config: SymInt4Config,
++        moe: "FusedMoEConfig",
++    ) -> None:
++        super().__init__(moe)
++        self.quant_config = quant_config
++        # Ensure lib is loaded
++        _get_quant_lib()
++
++    def create_weights(self, layer: Module, num_experts: int, hidden_size: int,
++                       intermediate_size_per_partition: int,
++                       params_dtype: torch.dtype, **extra_weight_attrs):
++        # Just normally loads the weights, obey VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT...
++        layer.intermediate_size_per_partition = intermediate_size_per_partition
++        layer.hidden_size = hidden_size
++        layer.num_experts = num_experts
++        layer.orig_dtype = params_dtype
++        layer.weight_block_size = None
++
++        # w13 shape: [d_ff * 2, d_model]
++        w13_weight = torch.nn.Parameter(torch.empty(
++            num_experts,
++            2 * intermediate_size_per_partition,
++            hidden_size,
++            dtype=params_dtype,
++            device="cpu"),
++                                        requires_grad=False)
++        layer.register_parameter("w13_weight", w13_weight)
++        set_weight_attrs(w13_weight, extra_weight_attrs)
++
++        # w2 shape: [d_model, d_ff]
++        w2_weight = torch.nn.Parameter(torch.empty(
++            num_experts,
++            hidden_size,
++            intermediate_size_per_partition,
++            dtype=params_dtype,
++            device="cpu"),
++                                       requires_grad=False)
++        layer.register_parameter("w2_weight", w2_weight)
++        set_weight_attrs(w2_weight, extra_weight_attrs)
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        import intel_extension_for_pytorch as ipex
++        E = layer.num_experts
++        d_model = layer.hidden_size
++        d_ff = layer.intermediate_size_per_partition
++
++        assert d_model % QK4_PACK_FACTOR == 0 and d_ff % QK4_PACK_FACTOR == 0, "INT4 packing requires feature dims % 8 == 0"
++        assert d_model % QK4_GROUP_SIZE == 0 and d_ff % QK4_GROUP_SIZE == 0, f"group_size={QK4_GROUP_SIZE} requires dims % {QK4_GROUP_SIZE} == 0"
++
++        # Allocating CPU tensors
++        w13_qweight = torch.empty(E, 2 * d_ff, d_model // QK4_PACK_FACTOR, dtype=torch.int32, device="cpu")
++        w2_qweight  = torch.empty(E, d_model,    d_ff // QK4_PACK_FACTOR, dtype=torch.int32, device="cpu")
++        w13_scales  = torch.empty(E, 2 * d_ff, d_model // QK4_GROUP_SIZE, dtype=torch.float16, device="cpu")
++        w2_scales   = torch.empty(E, d_model,    d_ff // QK4_GROUP_SIZE, dtype=torch.float16, device="cpu")
++
++        # Quantize per expert
++        num_loop = getattr(layer, "local_num_experts", E)
++
++        for e in range(num_loop):
++            # Ensure fp32 contiguous
++            w13_e = layer.w13_weight[e].float().contiguous().to("cpu")  # [2*d_ff, d_model]
++            w2_e  = layer.w2_weight[e].float().contiguous().to("cpu")   # [d_model, d_ff]
++
++            # --- w13 ---
++            q13_buf = torch.zeros((2 * d_ff, d_model // QK4_PACK_FACTOR),  dtype=torch.int32,  device="cpu")
++            s13_buf = torch.zeros((2 * d_ff, d_model // QK4_GROUP_SIZE), dtype=torch.float16, device="cpu")
++
++            # Use extracted function, pass QK4_GROUP_SIZE
++            q13_inT, s13_inT = ggml_quantize_tensor(
++                w13_e, q13_buf, s13_buf, 2 * d_ff, d_model, block_size=QK4_GROUP_SIZE
++            )
++
++            q13 = q13_inT.transpose(0, 1).contiguous()  # [2*d_ff, d_model//8]
++            s13 = s13_inT.transpose(0, 1).contiguous()  # [2*d_ff, d_model//64]
++
++            w13_qweight[e].copy_(q13)
++            w13_scales[e].copy_(s13)
++
++            # --- w2 ---
++            q2_buf = torch.zeros((d_model, d_ff // QK4_PACK_FACTOR),  dtype=torch.int32,  device="cpu")
++            s2_buf = torch.zeros((d_model, d_ff // QK4_GROUP_SIZE), dtype=torch.float16, device="cpu")
++
++            q2_inT, s2_inT = ggml_quantize_tensor(
++                w2_e, q2_buf, s2_buf, d_model, d_ff, block_size=QK4_GROUP_SIZE
++            )
++
++            q2 = q2_inT.transpose(0, 1).contiguous()  # [d_model, d_ff//8]
++            s2 = s2_inT.transpose(0, 1).contiguous()  # [d_model, d_ff//64]
++
++
++            w2_qweight[e].copy_(q2)
++            w2_scales[e].copy_(s2)
++
++        # Move to XPU
++        w13_qweight = w13_qweight.to("xpu")
++        w2_qweight  = w2_qweight.to("xpu")
++        w13_scales  = w13_scales.to("xpu")
++        w2_scales   = w2_scales.to("xpu")
++
++        # Override parameters
++        layer.w13_weight = torch.nn.Parameter(w13_qweight, requires_grad=False)
++        layer.w2_weight  = torch.nn.Parameter(w2_qweight,  requires_grad=False)
++        layer.w13_scales = torch.nn.Parameter(w13_scales, requires_grad=False)
++        layer.w2_scales  = torch.nn.Parameter(w2_scales,  requires_grad=False)
++
++        layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
++            layer.w13_weight,                      # [E, 2*d_ff, d_model//8]
++            layer.w2_weight,                       # [E, d_model, d_ff//8]
++            w1_scale_inv=layer.w13_scales,          # [E, 2*d_ff, d_model//64]
++            w2_scale_inv=layer.w2_scales,           # [E, d_model, d_ff//64]
++            is_int4=True
++        )
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        router_logits: torch.Tensor,
++        top_k: int,
++        renormalize: bool,
++        use_grouped_topk: bool = False,
++        topk_group: Optional[int] = None,
++        num_expert_group: Optional[int] = None,
++        global_num_experts: int = -1,
++        expert_map: Optional[torch.Tensor] = None,
++        custom_routing_function: Optional[Callable] = None,
++        scoring_func: str = "softmax",
++        routed_scaling_factor: float = 1.0,
++        e_score_correction_bias: Optional[torch.Tensor] = None,
++        apply_router_weight_on_input: bool = False,
++        activation: str = "silu",
++        enable_eplb: bool = False,
++        expert_load_view: Optional[torch.Tensor] = None,
++        logical_to_physical_map: Optional[torch.Tensor] = None,
++        logical_replica_count: Optional[torch.Tensor] = None,
++    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
++        res = layer.ipex_fusion(
++            x,
++            use_grouped_topk,
++            top_k,
++            router_logits,
++            renormalize,
++            topk_group=topk_group,
++            num_expert_group=num_expert_group,
++            custom_routing_function=custom_routing_function,
++            scoring_func=scoring_func,
++        )
++        return res
+\ No newline at end of file
 diff --git a/vllm/model_executor/layers/rotary_embedding/__init__.py b/vllm/model_executor/layers/rotary_embedding/__init__.py
 index 564f9a5c0..c9653aa9e 100644
 --- a/vllm/model_executor/layers/rotary_embedding/__init__.py
@@ -11178,7 +11358,7 @@ index 0acb5ea74..7bdcdf99c 100644
          updates = [audio_start_token_id]
          added_audio_len = 0
 diff --git a/vllm/model_executor/model_loader/utils.py b/vllm/model_executor/model_loader/utils.py
-index 0c2441a6d..2e7032094 100644
+index 0c2441a6d..a7336456d 100644
 --- a/vllm/model_executor/model_loader/utils.py
 +++ b/vllm/model_executor/model_loader/utils.py
 @@ -15,6 +15,7 @@ from typing_extensions import assert_never
@@ -11197,7 +11377,7 @@ index 0c2441a6d..2e7032094 100644
  
  logger = init_logger(__name__)
  
-@@ -96,7 +98,10 @@ def initialize_model(
+@@ -96,7 +98,13 @@ def initialize_model(
  
  def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
                                    target_device: torch.device) -> None:
@@ -11205,11 +11385,14 @@ index 0c2441a6d..2e7032094 100644
 +    # gc: Any changes here need to be added to SymInt4Config.get_quant_method
 +    # gc: Any changes here need to be added to Fp8Config.get_quant_method
 +    modules_to_not_convert=["visual", "vision", "vpm", "resampler"]
++
++    # jian: for enable ERNIE
++    modules_to_convert=["vision_experts"]
 +    for name, module in model.named_modules():
          if isinstance(module, QKVCrossParallelLinear):
              # NOTE(Isotr0py): special case for cross QKV layer because
              # q and kv proj aren't registered as submodules intentionally
-@@ -104,12 +109,18 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
+@@ -104,12 +112,18 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
              continue
          quant_method = getattr(module, "quant_method", None)
          if isinstance(quant_method, QuantizeMethodBase):
@@ -11228,13 +11411,13 @@ index 0c2441a6d..2e7032094 100644
 +                # to be on the global target device. This scope is for the
 +                # case where cpu offloading is used, where we will move the
 +                # parameters onto device for processing and back off after.
-+                if any(key in name for key in modules_to_not_convert):
++                if any(key in name for key in modules_to_not_convert) and not any(key in name for key in modules_to_convert):
 +                    continue
 +
                  quant_method.process_weights_after_loading(module)
  
      # Currently only used by MLA.
-@@ -125,7 +136,8 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
+@@ -125,7 +139,8 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
  
  @contextmanager
  def device_loading_context(module: torch.nn.Module,
@@ -11244,7 +11427,7 @@ index 0c2441a6d..2e7032094 100644
      if target_device.type == "cpu":
          # If target is CPU, no need to move anything
          yield module
-@@ -134,36 +146,41 @@ def device_loading_context(module: torch.nn.Module,
+@@ -134,36 +149,41 @@ def device_loading_context(module: torch.nn.Module,
      original_device_states: dict[str, torch.device] = {}
  
      # Store original device states and move parameters to GPU if they're on CPU
@@ -12192,18 +12375,21 @@ index 000000000..f24cb6d52
 +        loader = AutoWeightsLoader(self)
 +        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 diff --git a/vllm/model_executor/models/ernie45_vl.py b/vllm/model_executor/models/ernie45_vl.py
-index 97aace5a2..bcff65a71 100644
+index 97aace5a2..377713e80 100644
 --- a/vllm/model_executor/models/ernie45_vl.py
 +++ b/vllm/model_executor/models/ernie45_vl.py
-@@ -34,6 +34,7 @@ import torch.nn.functional as F
+@@ -32,8 +32,10 @@ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
  from einops import rearrange, repeat
++from vllm._ipex_ops import ipex_ops
  from transformers import BatchFeature
  
 +from vllm.attention.layer import check_upstream_fa_availability
  from vllm.config import VllmConfig
  from vllm.distributed import parallel_state
  from vllm.distributed import utils as dist_utils
-@@ -170,7 +171,16 @@ class Ernie4_5_VisionAttention(nn.Module):
+@@ -170,10 +172,19 @@ class Ernie4_5_VisionAttention(nn.Module):
                                        prefix=f"{prefix}.proj")
  
          # Detect attention implementation.
@@ -12220,8 +12406,12 @@ index 97aace5a2..bcff65a71 100644
 +
          if self.attn_backend not in {
                  _Backend.FLASH_ATTN, _Backend.TORCH_SDPA, _Backend.XFORMERS,
-                 _Backend.ROCM_AITER_FA
-@@ -233,7 +243,10 @@ class Ernie4_5_VisionAttention(nn.Module):
+-                _Backend.ROCM_AITER_FA
++                _Backend.ROCM_AITER_FA, _Backend.IPEX
+         }:
+             raise RuntimeError(
+                 f"Ernie45-VL does not support {self.attn_backend} backend now."
+@@ -233,7 +244,10 @@ class Ernie4_5_VisionAttention(nn.Module):
              if self.attn_backend == _Backend.ROCM_AITER_FA:
                  from aiter import flash_attn_varlen_func
              else:
@@ -12233,7 +12423,44 @@ index 97aace5a2..bcff65a71 100644
  
              q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
  
-@@ -457,7 +470,11 @@ class Ernie4_5_VisionTransformer(nn.Module):
+@@ -247,6 +261,36 @@ class Ernie4_5_VisionAttention(nn.Module):
+                                             dropout_p=0.0,
+                                             causal=False)
+ 
++            context_layer = rearrange(output,
++                                      "(b s) ... -> b s ...",
++                                      b=batch_size)
++        elif self.attn_backend == _Backend.IPEX:
++            q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
++
++            output = torch.empty(
++                q.shape,
++                dtype=q.dtype,
++                device=q.device)
++            ipex_ops.varlen_attention(
++                    q,
++                    k,
++                    v,
++                    output,
++                    cu_seqlens,
++                    cu_seqlens,
++                    None,
++                    max_seqlen,
++                    max_seqlen,
++                    pdropout=0.0,
++                    softmax_scale=1.0/(q.shape[-1] ** 0.5),
++                    zero_tensors=False,
++                    is_causal=False,
++                    return_softmax=False,
++                    gen_=None,
++                    window_size_left=-1,
++                    window_size_right=-1,
++                    logits_soft_cap=-1,
++            )
+             context_layer = rearrange(output,
+                                       "(b s) ... -> b s ...",
+                                       b=batch_size)
+@@ -457,7 +501,11 @@ class Ernie4_5_VisionTransformer(nn.Module):
                  ), "vit's config.hidden must be equal to config.embed_dim"
          self.ln = nn.LayerNorm(hidden_size, eps=1e-6)
  
@@ -12246,6 +12473,15 @@ index 97aace5a2..bcff65a71 100644
  
      @property
      def dtype(self) -> torch.dtype:
+@@ -496,7 +544,7 @@ class Ernie4_5_VisionTransformer(nn.Module):
+             self, cu_seqlens: torch.Tensor
+     ) -> tuple[Optional[int], Optional[list[int]]]:
+         max_seqlen, seqlens = None, None
+-        if self.attn_backend == _Backend.FLASH_ATTN:
++        if self.attn_backend == _Backend.FLASH_ATTN or self.attn_backend == _Backend.IPEX:
+             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+         elif self.attn_backend == _Backend.XFORMERS:
+             seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
 diff --git a/vllm/model_executor/models/glm4.py b/vllm/model_executor/models/glm4.py
 index 5e2908a82..adbe89007 100644
 --- a/vllm/model_executor/models/glm4.py
