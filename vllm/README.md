@@ -22,7 +22,8 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    2.6 [Data Parallelism (DP)](#26-data-parallelism-dp)  
    2.7 [Finding maximum Context Length](#27-finding-maximum-context-length)   
    2.8 [Multi-Modal Webui](#28-multi-modal-webui)  
-   2.9 [Multi-node Distributed Deployment (PP/TP)](#29-multi-node-distributed-deployment-pptp)
+   2.9 [Multi-node Distributed Deployment (PP/TP)](#29-multi-node-distributed-deployment-pptp)  
+   2.10 [BPE-Qwen Tokenizer](#210-bpe-qwen-tokenizer)
 4. [Supported Models](#3-supported-models)  
 5. [Troubleshooting](#4-troubleshooting)
 6. [Performance tuning](#5-performance-tuning)
@@ -130,12 +131,23 @@ https://github.com/intel/llm-scaler/blob/main/vllm/KNOWN_ISSUES.md
 
 First, pull the image for **Intel Arc B60 GPUs**:
 
+> **⚠️ Important**
+> Do **NOT** use the `latest` tag.
+> Instead, go to the **Releases** page and pull the *exact* beta version:
+> [https://github.com/intel/llm-scaler/blob/main/Releases.md/#latest-beta-release](https://github.com/intel/llm-scaler/blob/main/Releases.md/#latest-beta-release)
+>
+> This ensures you can precisely identify which version you are using.
+
+Example:
+
 ```bash
-docker pull intel/llm-scaler-vllm:latest
+# Replace <VERSION> with the latest beta release version from the link above
+docker pull intel/llm-scaler-vllm:<VERSION>
 ```
+
 **Notes:**
-* `intel/llm-scaler-vllm:1.0` → PV release image
-* `intel/llm-scaler-vllm:latest` → Latest development version
+* `intel/llm-scaler-vllm:1.0` → PV release image (stable)
+* `intel/llm-scaler-vllm:<VERSION>` → Recommended beta release (instead of `latest`)
 
 **Supplement: For Intel Arc A770 GPUs**
 ```bash
@@ -157,7 +169,7 @@ sudo docker run -td \
     -e https_proxy=$https_proxy \
     --shm-size="32g" \
     --entrypoint /bin/bash \
-    intel/llm-scaler-vllm:latest
+    intel/llm-scaler-vllm:<VERSION>
 ```
 
 Enter the container:
@@ -232,7 +244,7 @@ you can add the argument `--api-key xxx` for user authentication. Users are supp
 ### 1.5 Benchmarking the Service
 
 ```bash
-python3 /llm/vllm/benchmarks/benchmark_serving.py \
+vllm bench serve \
     --model /llm/models/DeepSeek-R1-Distill-Qwen-7B \
     --dataset-name random \
     --served-model-name DeepSeek-R1-Distill-Qwen-7B \
@@ -2036,6 +2048,7 @@ To use fp8 online quantization, simply replace `--quantization sym_int4` with:
 ```
 
 For those models that have been quantized before, such as AWQ-Int4/GPTQ-Int4/FP8 models, user do not need to specify the `--quantization` option.
+
 ---
 
 ### 2.3 Embedding and Reranker Model Support
@@ -2065,6 +2078,7 @@ python3 -m vllm.entrypoints.openai.api_server \
 
 ---
 After starting the vLLM service, you can follow this link to use it.
+
 #### [Embedding api](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#embeddings-api_1)
 
 ```bash
@@ -2085,7 +2099,7 @@ VLLM_WORKER_MULTIPROC_METHOD=spawn \
 python3 -m vllm.entrypoints.openai.api_server \
     --model /llm/models/bge-reranker-base \
     --served-model-name bge-reranker-base \
-    --task classify \
+    --task score \
     --dtype=float16 \
     --enforce-eager \
     --port 8000 \
@@ -2179,6 +2193,7 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 if want to process image in server local, you can `"url": "file:/llm/models/test/1.jpg"` to test.
+
 ---
 
 ### 2.4.1 Audio Model Support [Deprecated]
@@ -2228,52 +2243,39 @@ curl http://localhost:8000/v1/audio/transcriptions \
 
 ### 2.4.2 dots.ocr Support
 
-Git clone the repo:
+To launch `dots.ocr`, follow the instructions in [1.4 Launching the Serving Service](#14-launching-the-serving-service), specifying the dots.ocr model, setting the model path to `/llm/models/dots.ocr`, the served-model-name to `model`, and the port to 8000.
+
+
+Once the service is running, you can use the method provided in the `dots.ocr` repository to launch Gradio for testing.
+
+---
+
+#### Clone the repository
 
 ```bash
-https://github.com/rednote-hilab/dots.ocr.git
+git clone https://github.com/rednote-hilab/dots.ocr.git
 cd dots.ocr
 ```
 
-Then, we should comment out the following two items in `requirements.txt`:
+#### Modify dependencies
 
-> flash-attn==2.8.0.post2 and accelerate  # because these two dependencies will require cuda
+Comment out the following two lines in `requirements.txt`:
 
-After commenting out these two elements, we can install the dependencies:
+```
+flash-attn==2.8.0.post2
+transformers  # These two dependencies can cause conflicts
+```
+
+Then install the dependencies:
 
 ```bash
-# Assuming you have installed torch/ipex etc.
-pip install --no-deps accelerate
 pip install -e .
 ```
 
-To download model weights in `dots.ocr`:
-```bash
-# In dots.ocr
-python3 tools/download_model.py
-
-# with modelscope
-python3 tools/download_model.py --type modelscope
-```
-
-In order to run dots.ocr, we will need to change codes in `./weights/DotsOCR`:
+#### Launch Gradio for testing
 
 ```bash
-cd ./weights/DotsOCR
-patch -p1 < YOUR_PATH/dots_ocr.patch
-```
-
-Then, you're ready to start:
-
-```bash
-export hf_model_path=./weights/DotsOCR  # Path to your downloaded model weights, Please use a directory name without periods (e.g., `DotsOCR` instead of `dots.ocr`) for the model save path. This is a temporary workaround pending our integration with Transformers.
-export PYTHONPATH=$(dirname "$hf_model_path"):$PYTHONPATH
-sed -i '/^from vllm\.version import __version__ as VLLM_VERSION$/a\
-from DotsOCR import modeling_dots_ocr_vllm' /usr/local/lib/python3.12/dist-packages/vllm-0.10.1.dev0+g6d8d0a24c.d20250825.xpu-py3.12-linux-x86_64.egg/vllm/entrypoints/openai/api_server.py  
-# If you downloaded model weights by yourself, please replace `DotsOCR` by your model saved directory name, and remember to use a directory name without periods (e.g., `DotsOCR` instead of `dots.ocr`) 
-
-# Start the service:
-TORCH_LLM_ALLREDUCE=1 VLLM_USE_V1=1  CCL_ZE_IPC_EXCHANGE=pidfd VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn python3 -m vllm.entrypoints.openai.api_server --model YOUR_DOTSOCR_PATH --enforce-eager --host 0.0.0.0 --trust-remote-code --disable-sliding-window --gpu-memory-util=0.8 --no-enable-prefix-caching --max-num-batched-tokens=8192  --disable-log-requests  --max-model-len=40000 --block-size 64 -tp=1 --port 8000 --served-model-name DotsOCR --chat-template-content-format string --dtype bfloat16
+python demo/demo_gradio.py
 ```
 
 ---
@@ -2718,8 +2720,21 @@ python3 -m vllm.entrypoints.openai.api_server \
     --distributed-executor-backend ray
 ```
 
----
+
 At this point, multi-node distributed inference with **PP + TP** is running, coordinated by **Ray** across Node-1 and Node-2.
+
+---
+
+
+### 2.10 BPE-Qwen Tokenizer
+
+We have integrated the **bpe-qwen tokenizer** to accelerate tokenization for Qwen models.
+
+To enable it when launching the API server, add:
+
+```bash
+--tokenizer-mode bpe_qwen
+```
 
 ---
 
