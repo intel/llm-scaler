@@ -3,10 +3,16 @@
 ## LLM-Scaler-vLLM
 
 ### Latest Beta Release 
-* `intel/llm-scaler-vllm:0.10.2-b5` [11/04/2025]:
-    - Support Qwen3-VL series models
-    - Support Qwen3-Omni series models
-    - Support gpt-oss models 
+* `intel/llm-scaler-vllm:0.10.2-b6` [11/25/2025]:
+    - MoE-Int4 support for Qwen3-30B-A3B
+    - Bpe-Qwen tokenizer support
+    - Enable Qwen3-VL Dense/MoE models
+    - Enable Qwen3-Omni models
+    - MinerU 2.5 Support
+    - Enable whisper transcription models
+    - Fix minicpmv4.5 OOM issue and output error
+    - Enable ERNIE-4.5-vl models
+    - Enable Glyph based GLM-4.1V-9B-Base
 
 ### 1.0 Release 
 * `intel/llm-scaler-vllm:1.0` [08/10/2025]: 
@@ -15,6 +21,9 @@
 ### Previous Releases
 * `intel/llm-scaler-vllm:1.1-preview` [09/29/2025]:
     - Same image as intel/llm-scaler-vllm:0.10.0-b2
+
+* `intel/llm-scaler-vllm:0.10.2-b5` [11/04/2025]:
+    - Support gpt-oss models 
 
 * `intel/llm-scaler-vllm:0.10.0-b3` [09/23/2025]:
     - Support Seed-oss model
