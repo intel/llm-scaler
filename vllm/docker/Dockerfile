@@ -94,7 +94,7 @@ RUN git clone -b release-2.6.2 https://github.com/opendatalab/MinerU.git && \
 #     bash intel-oneccl-2021.15.4.11_offline.sh -a --silent --eula accept
 
 # Install pypi dependencies
-RUN pip install bigdl-core==2.4.0b1
+RUN pip install bigdl-core==2.4.0b2
 
 # Cleanup patch file
 RUN rm -rf /tmp/*
