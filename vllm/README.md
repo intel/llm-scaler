@@ -2730,10 +2730,15 @@ At this point, multi-node distributed inference with **PP + TP** is running, coo
 
 We have integrated the **bpe-qwen tokenizer** to accelerate tokenization for Qwen models.
 
+**Note:** You need to install it first:
+```
+pip install bpe-qwen
+```
+
 To enable it when launching the API server, add:
 
 ```bash
---tokenizer-mode bpe_qwen
+--tokenizer-mode bpe-qwen
 ```
 
 ---
