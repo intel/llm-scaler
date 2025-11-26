@@ -2784,6 +2784,7 @@ To enable it when launching the API server, add:
 | Multimodal Model     | Qwen/Qwen2.5-VL-72B-Instruct               |  ✅  |         ✅         |                      |       |  pip install transformers==4.52.4  |
 | Multimodal Model     | Qwen/Qwen3-VL-4B-Instruct                  |  ✅  |         ✅          |          ✅           |       |                           |
 | Multimodal Model     | Qwen/Qwen3-VL-8B-Instruct                  |  ✅  |         ✅          |          ✅           |       |                           |
+| Multimodal MOE Model | Qwen/Qwen3-VL-30B-A3B-Instruct             |  ✅  |         ✅          |          ✅           |       |                           |
 | Multimodal Model     | openbmb/MiniCPM-V-2_6                      |      |                    |                      |       |  use bf16 to avoid nan error  |
 | Multimodal Model     | openbmb/MiniCPM-V-4                        |      |                    |                      |       |  use bf16 to avoid nan error  |
 | Multimodal Model     | openbmb/MiniCPM-V-4_5                      |      |                    |                      |       |                           |
