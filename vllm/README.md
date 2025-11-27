@@ -2745,72 +2745,72 @@ To enable it when launching the API server, add:
 
 ## 3. Supported Models
 
+
 | Category             | Model Name                                 | FP16 | Dynamic Online FP8 | Dynamic Online Int4 | MXFP4 | Notes                     |
 |----------------------|--------------------------------------------|------|--------------------|----------------------|-------|---------------------------|
 | Language Model       | openai/gpt-oss-20b                         |      |                    |                      |   ✅   |                           |
 | Language Model       | openai/gpt-oss-120b                        |      |                    |                      |   ✅   |                           |
-| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B  |  ✅  |         ✅        |          ✅           |       |                           |
-| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Qwen-7B    |  ✅  |         ✅          |          ✅           |       |                           |
-| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Llama-8B   |  ✅  |         ✅          |          ✅           |       |                           |
-| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Qwen-14B   |  ✅  |         ✅          |          ✅         |       |                           |
-| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Qwen-32B   |  ✅  |         ✅          |          ✅          |       |                           |
-| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Llama-70B  |  ✅  |         ✅          |          ✅           |       |                           |
-| Language Model       | deepseek-ai/DeepSeek-R1-0528-Qwen3-8B      |  ✅  |         ✅          |         ✅         |       |                           |
-| Language Model       | deepseek-ai/DeepSeek-V2-Lite               |  ✅  |         ✅          |                      |       | export VLLM_MLA_DISABLE=1 |
-| Language Model       | deepseek-ai/deepseek-coder-33b-instruct    |  ✅  |         ✅          |        ✅            |       |                           |
-| Language Model       | Qwen/Qwen3-8B                              |  ✅  |         ✅          |        ✅            |       |                           |
-| Language Model       | Qwen/Qwen3-14B                             |  ✅  |         ✅          |        ✅            |       |                           |
-| Language Model       | Qwen/Qwen3-32B                             |  ✅  |         ✅          |        ✅            |       |                           |
-| Language MOE Model   | Qwen/Qwen3-30B-A3B                         |  ✅  |         ✅          |          ✅           |       |                           |
+| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B  |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Qwen-7B    |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Llama-8B   |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Qwen-14B   |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Qwen-32B   |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Llama-70B  |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | deepseek-ai/DeepSeek-R1-0528-Qwen3-8B      |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | deepseek-ai/DeepSeek-V2-Lite               |  ✅  |         ✅         |                      |       | export VLLM_MLA_DISABLE=1 |
+| Language Model       | deepseek-ai/deepseek-coder-33b-instruct    |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | Qwen/Qwen3-8B                              |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | Qwen/Qwen3-14B                             |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | Qwen/Qwen3-32B                             |  ✅  |         ✅         |          ✅          |       |                           |
+| Language MOE Model   | Qwen/Qwen3-30B-A3B                         |  ✅  |         ✅         |          ✅          |       |                           |
 | Language MOE Model   | Qwen/Qwen3-235B-A22B                       |      |                    |                      |       |                           |
-| Language MOE Model   | Qwen/Qwen3-Coder-30B-A3B-Instruct          |  ✅  |         ✅          |        ✅         |       |                           |
-| Language Model       | Qwen/QwQ-32B                               |  ✅  |         ✅          |        ✅            |       |                           |
-| Language Model       | mistralai/Ministral-8B-Instruct-2410       |  ✅  |         ✅         |         ✅           |       |                           |
-| Language Model       | mistralai/Mixtral-8x7B-Instruct-v0.1       |  ✅  |         ✅         |         ✅           |       |                           |
-| Language Model       | meta-llama/Llama-3.1-8B                    |  ✅  |         ✅         |         ✅           |       |                           |
-| Language Model       | meta-llama/Llama-3.1-70B                   |  ✅  |         ✅         |         ✅           |       |                           |
-| Language Model       | baichuan-inc/Baichuan2-7B-Chat             |  ✅  |         ✅         |         ✅           |       | with chat_template        |
-| Language Model       | baichuan-inc/Baichuan2-13B-Chat            |  ✅  |         ✅         |         ✅           |       | with chat_template        |
-| Language Model       | THUDM/CodeGeex4-All-9B                     |  ✅  |         ✅         |         ✅           |       | with chat_template    |
-| Language Model       | zai-org/GLM-4-9B-0414                      |      |          ✅        |                      |       | use bfloat16 |
-| Language Model       | zai-org/GLM-4-32B-0414                     |      |          ✅        |                      |       | use bfloat16 |
+| Language MOE Model   | Qwen/Qwen3-Coder-30B-A3B-Instruct          |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | Qwen/QwQ-32B                               |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | mistralai/Ministral-8B-Instruct-2410       |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | mistralai/Mixtral-8x7B-Instruct-v0.1       |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | meta-llama/Llama-3.1-8B                    |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | meta-llama/Llama-3.1-70B                   |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | baichuan-inc/Baichuan2-7B-Chat             |  ✅  |         ✅         |          ✅          |       | with chat_template        |
+| Language Model       | baichuan-inc/Baichuan2-13B-Chat            |  ✅  |         ✅         |          ✅          |       | with chat_template        |
+| Language Model       | THUDM/CodeGeex4-All-9B                     |  ✅  |         ✅         |          ✅          |       | with chat_template        |
+| Language Model       | zai-org/GLM-4-9B-0414                      |      |         ✅        |                      |       | use bfloat16 |
+| Language Model       | zai-org/GLM-4-32B-0414                     |      |         ✅        |                      |       | use bfloat16 |
 | Language MOE Model   | zai-org/GLM-4.5-Air                        |  ✅  |         ✅         |                      |       |                           |
 | Language Model       | ByteDance-Seed/Seed-OSS-36B-Instruct       |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | tencent/Hunyuan-0.5B-Instruct              |      |                    |                      |       |  follow the guide in [here](#31-how-to-use-hunyuan-7b-instruct)   |
-| Language Model       | tencent/Hunyuan-7B-Instruct                |      |                    |                      |       |  follow the guide in [here](#31-how-to-use-hunyuan-7b-instruct)   |
-| Multimodal Model     | Qwen/Qwen2-VL-7B-Instruct                  |  ✅  |         ✅         |         ✅           |       |                           |
-| Multimodal Model     | Qwen/Qwen2.5-VL-7B-Instruct                |  ✅  |         ✅         |         ✅           |       |    |
-| Multimodal Model     | Qwen/Qwen2.5-VL-32B-Instruct               |  ✅  |         ✅         |         ✅           |       |    |
-| Multimodal Model     | Qwen/Qwen2.5-VL-72B-Instruct               |  ✅  |         ✅         |         ✅           |       |    |
-| Multimodal Model     | Qwen/Qwen3-VL-4B-Instruct                  |  ✅  |         ✅          |          ✅           |       |                           |
-| Multimodal Model     | Qwen/Qwen3-VL-8B-Instruct                  |  ✅  |         ✅          |          ✅           |       |                           |
-| Multimodal MOE Model | Qwen/Qwen3-VL-30B-A3B-Instruct             |  ✅  |         ✅          |          ✅           |       |                           |
-| Multimodal Model     | openbmb/MiniCPM-V-2_6                      |  ✅  |         ✅         |         ✅           |       |    |
-| Multimodal Model     | openbmb/MiniCPM-V-4                        |  ✅  |         ✅         |         ✅           |       |    |
-| Multimodal Model     | openbmb/MiniCPM-V-4_5                      |  ✅  |         ✅         |         ✅           |       |                           |
+| Language Model       | tencent/Hunyuan-0.5B-Instruct              |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](#31-how-to-use-hunyuan-7b-instruct)   |
+| Language Model       | tencent/Hunyuan-7B-Instruct                |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](#31-how-to-use-hunyuan-7b-instruct)   |
+| Multimodal Model     | Qwen/Qwen2-VL-7B-Instruct                  |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | Qwen/Qwen2.5-VL-7B-Instruct                |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | Qwen/Qwen2.5-VL-32B-Instruct               |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | Qwen/Qwen2.5-VL-72B-Instruct               |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | Qwen/Qwen3-VL-4B-Instruct                  |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | Qwen/Qwen3-VL-8B-Instruct                  |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal MOE Model | Qwen/Qwen3-VL-30B-A3B-Instruct             |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | openbmb/MiniCPM-V-2_6                      |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | openbmb/MiniCPM-V-4                        |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | openbmb/MiniCPM-V-4_5                      |  ✅  |         ✅         |          ✅          |       |                           |
 | Multimodal Model     | OpenGVLab/InternVL2-8B                     |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | OpenGVLab/InternVL3-8B                     |  ✅  |         ✅          |          ✅           |       |                           |
-| Multimodal Model     | OpenGVLab/InternVL3_5-8B                   |  ✅  |         ✅          |          ✅           |       |                           |
-| Multimodal MOE Model | OpenGVLab/InternVL3_5-30B-A3B              |  ✅  |         ✅        |         ✅         |       |                           |
-| Multimodal Model     | rednote-hilab/dots.ocr                     |      |                    |                      |       |                           |
-| Multimodal Model     | ByteDance-Seed/UI-TARS-7B-DPO              |      |                    |                      |       |  pip install transformers==4.49.0  |
-| Multimodal Model     | google/gemma-3-12b-it                      |      |                    |                      |       |  only can run bf16 with no quantization  |
-| Multimodal Model     | THUDM/GLM-4v-9B                            |  ✅  |         ✅         |           ✅         |       |  with --hf-overrides and chat_template  |
-| Multimodal Model     | zai-org/GLM-4.1V-9B-Base                   |  ✅  |         ✅          |          ✅           |       |                           |
-| Multimodal Model     | zai-org/GLM-4.1V-9B-Thinking               |  ✅  |         ✅          |          ✅           |       |                           |
-| Multimodal Model     | zai-org/Glyph                              |  ✅  |         ✅          |          ✅           |       |                           |
-| Multimodal Model     | opendatalab/MinerU2.5-2509-1.2B            |  ✅  |                    |                      |       |                           |
-| omni                 | Qwen/Qwen2.5-Omni-7B                       |      |                    |                      |       |  pip install librosa soundfile  |
-| omni                 | Qwen/Qwen3-Omni-30B-A3B-Instruct           |  ✅  |         ✅          |          ✅           |       |                           |
-| audio                | openai/whisper-medium                      |      |                    |                      |       |  pip install transformers==4.52.4 librosa  |
-| audio                | openai/whisper-large-v3-turbo              |      |                    |                      |       |  pip install transformers==4.52.4 librosa  |
-| Embedding Model      | Qwen/Qwen3-Embedding-8B                    |  ✅  |         ✅         |                      |       |                           |
-| Embedding Model      | BAAI/bge-m3                                |  ✅  |                    |                      |       |                           |
-| Embedding Model      | BAAI/bge-large-en-v1.5                     |  ✅  |                    |                      |       |                           |
-| Embedding Model      | maidalun1020/bce-embedding-base_v1         |  ✅  |                    |                      |       |                           |
-| Reranker Model       | Qwen/Qwen3-Reranker-8B                     |  ✅  |         ✅         |                      |       |                           |
-| Reranker Model       | BAAI/bge-reranker-large                    |  ✅  |                    |                      |       |                           |
-| Reranker Model       | BAAI/bge-reranker-v2-m3                    |  ✅  |                    |                      |       |                           |
+| Multimodal Model     | OpenGVLab/InternVL3-8B                     |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | OpenGVLab/InternVL3_5-8B                   |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal MOE Model | OpenGVLab/InternVL3_5-30B-A3B              |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | rednote-hilab/dots.ocr                     |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | ByteDance-Seed/UI-TARS-7B-DPO              |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | google/gemma-3-12b-it                      |      |         ✅         |                      |       |  use bfloat16  |
+| Multimodal Model     | THUDM/GLM-4v-9B                            |  ✅  |         ✅         |          ✅         |       |  with --hf-overrides and chat_template  |
+| Multimodal Model     | zai-org/GLM-4.1V-9B-Base                   |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | zai-org/GLM-4.1V-9B-Thinking               |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | zai-org/Glyph                              |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | opendatalab/MinerU2.5-2509-1.2B            |  ✅  |         ✅         |          ✅          |       |                           |
+| omni                 | Qwen/Qwen2.5-Omni-7B                       |  ✅  |         ✅         |          ✅          |       |                           |
+| omni                 | Qwen/Qwen3-Omni-30B-A3B-Instruct           |  ✅  |         ✅         |          ✅          |       |                           |
+| audio                | openai/whisper-medium                      |  ✅  |         ✅         |          ✅          |       |                           |
+| audio                | openai/whisper-large-v3                    |  ✅  |         ✅         |          ✅          |       |                           |
+| Embedding Model      | Qwen/Qwen3-Embedding-8B                    |  ✅  |         ✅         |          ✅          |       |                           |
+| Embedding Model      | BAAI/bge-m3                                |  ✅  |         ✅         |          ✅          |       |                           |
+| Embedding Model      | BAAI/bge-large-en-v1.5                     |  ✅  |         ✅         |          ✅          |       |                           |
+| Reranker Model       | Qwen/Qwen3-Reranker-8B                     |  ✅  |         ✅         |          ✅          |       |                           |
+| Reranker Model       | BAAI/bge-reranker-large                    |  ✅  |         ✅         |          ✅          |       |                           |
+| Reranker Model       | BAAI/bge-reranker-v2-m3                    |  ✅  |         ✅         |          ✅          |       |                           |
 
 
 --- 
