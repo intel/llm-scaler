@@ -126,7 +126,7 @@ Please follow the instructions in the [Getting Started](omni/README.md/#getting-
 | Model Category | Model | Type | 
 |----------------------|------------|---------------|
 | **Image Generation** | Qwen-Image, Qwen-Image-Edit | Text-to-Image, Image Editing | 
-| **Image Generation** | Stable Diffusion 3.5 | Text-to-Image, ControlNet | 
+| **Image Generation** | Stable Diffusion 3.5, Z-Image-Turbo | Text-to-Image, ControlNet | 
 | **Image Generation** | Flux.1, Flux.1 Kontext dev | Text-to-Image, Multi-Image Reference, ControlNet | 
 | **Video Generation** | Wan2.2 TI2V 5B, Wan2.2 T2V 14B, Wan2.2 I2V 14B | Text-to-Video, Image-to-Video | 
 | **Video Generation** | Wan2.2 Animate 14B | Video Animation | 
