@@ -2,6 +2,12 @@
 
 llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapted for Intel’s Multi GPU platform. This project enhances vLLM’s core architecture with Intel-specific performance optimizations, advanced features, and tailored support for customer use cases.
 
+Below is the support matrix for OS and Kernel. 
+| | 6.14.0 | 6.6 |
+| --- | ---| --- |
+| Ubuntu 25.04 (Desktop/Server) | Production Release | Evaluation Release |
+| Ubuntu 24.04 (Desktop/Server) | Evaluation Release | Evaluation Release |
+
 ---
 
 ## Table of Contents
@@ -56,7 +62,7 @@ Currently, we include the following features for basic platform evaluation such 
 
 ### 1.1 Install Bare Metal Environment
 
-First, install a standard Ubuntu 25.04
+First, install a standard Ubuntu 25.04 from the following link. 
 - [Ubuntu 25.04 Desktop](https://releases.ubuntu.com/25.04/ubuntu-25.04-desktop-amd64.iso) (for Xeon-W)
 - [Ubuntu 25.04 Server](https://releases.ubuntu.com/25.04/ubuntu-25.04-live-server-amd64.iso) (for Xeon-SP).
 
@@ -88,7 +94,7 @@ Installation log: ./install_log_20250921_191057.log
 After the reboot, go to /opt/intel/multi-arc directory, tools/scripts are there.
 
 ```bash
-root@edgeaihost15:/home/edgeai/james/multi-arc-bmg-offline-installer-25.38.4.1# ls -l
+root@edgeaihost15:/home/edgeai/multi-arc-bmg-offline-installer-25.38.4.1# ls -l
 total 80
 drwxr-xr-x 4 edgeai edgeai  4096 Sep  5 18:32 base
 drwxr-xr-x 2 edgeai edgeai  4096 Sep 20 17:15 firmware
@@ -108,7 +114,7 @@ Please read the README.md firstly to understand all of our offerings. Then your 
 to perform a quick evaluation with report under results. We also provide a reference perf under results/
 
 ```bash
-root@edgeaihost15:/home/edgeai/james/multi-arc-bmg-offline-installer-25.38.4.1# ls results/ -la
+root@edgeaihost15:/home/edgeai/multi-arc-bmg-offline-installer-25.38.4.1# ls results/ -la
 total 12
 drwxr-xr-x  2 edgeai edgeai 4096 Sep 21 20:18 .
 drwxr-xr-x 10 edgeai edgeai 4096 Sep 21 20:17 ..
@@ -117,7 +123,7 @@ drwxr-xr-x 10 edgeai edgeai 4096 Sep 21 20:17 ..
 
 When you meet issue requiring our support, you can use below script to get necesary information of your system.
 ```bash
-root@edgeaihost15:/home/edgeai/james/multi-arc-bmg-offline-installer-25.38.4.1# ls scripts/debug/collect_sysinfo.sh
+root@edgeaihost15:/home/edgeai/multi-arc-bmg-offline-installer-25.38.4.1# ls scripts/debug/collect_sysinfo.sh
 scripts/debug/collect_sysinfo.sh
 ````
 
