@@ -200,4 +200,3 @@ index 5631ad0..a6af288 100644
 +        max_world_size = 8  # For Intel GPU, just set max to 8 for now
          if world_size > max_world_size:
              raise ValueError("To many gpus")
- 
