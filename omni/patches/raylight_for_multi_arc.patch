@@ -1,8 +1,8 @@
 diff --git a/src/raylight/distributed_worker/ray_worker.py b/src/raylight/distributed_worker/ray_worker.py
-index 992b2cc..bdf0c2b 100644
+index 3865197..b48ce92 100644
 --- a/src/raylight/distributed_worker/ray_worker.py
 +++ b/src/raylight/distributed_worker/ray_worker.py
-@@ -109,6 +109,13 @@ def usp_inject_callback(
+@@ -34,6 +34,13 @@ from ray.exceptions import RayActorError
  # If called from ray actor within. dist.barrier() become the sync.
  
  # Comfy cli args, does not get pass through into ray actor
@@ -14,10 +14,10 @@ index 992b2cc..bdf0c2b 100644
 +# import oneccl_bindings_for_pytorch
 +
  class RayWorker:
-     def __init__(self, local_rank, world_size, device_id, parallel_dict):
+     def __init__(self, local_rank, device_id, parallel_dict):
          self.model = None
-@@ -120,22 +127,27 @@ class RayWorker:
-         self.world_size = world_size
+@@ -47,9 +54,13 @@ class RayWorker:
+ 
          self.device_id = device_id
          self.parallel_dict = parallel_dict
 -        self.device = torch.device(f"cuda:{self.device_id}")
@@ -26,37 +26,75 @@ index 992b2cc..bdf0c2b 100644
 -        self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability()))
 +        # self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability()))
 +        self.compute_capability = 86  # For Intel GPU, just set to 8.6 for now
-+        
++
 +        self.parallel_dict["is_fsdp_wrapped"] = False
 +        self.device = torch.device(f"xpu:{self.device_id}")
  
          self.is_model_loaded = False
+         self.is_cpu_offload = self.parallel_dict.get("fsdp_cpu_offload", False)
+@@ -58,27 +69,19 @@ class RayWorker:
+         os.environ["NCCL_DEBUG"] = "WARN"
  
          if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
 -            os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
-+            #os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
+-            if sys.platform.startswith("linux"):
+-                dist.init_process_group(
+-                    "nccl",
+-                    rank=local_rank,
+-                    world_size=self.global_world_size,
+-                    timeout=timedelta(minutes=1),
+-                    # device_id=self.device
+-                )
+-            elif sys.platform.startswith("win"):
+-                os.environ["USE_LIBUV"] = "0"
+-                dist.init_process_group(
+-                    "gloo",
+-                    rank=local_rank,
+-                    world_size=self.global_world_size,
+-                    timeout=timedelta(minutes=1),
+-                    # device_id=self.device
+-                )
++            # os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
 +            torch.xpu.set_device(local_rank)
-             dist.init_process_group(
--                "nccl",
++            dist.init_process_group(
 +                "xccl",
-                 rank=local_rank,
-                 world_size=self.world_size,
-                 timeout=timedelta(minutes=1),
-                 # device_id=self.device
-             )
--            self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.world_size,))
-+            self.device_mesh = dist.device_mesh.init_device_mesh("xpu", mesh_shape=(self.world_size,))
-             pg = dist.group.WORLD
-             cp.set_cp_group(pg, list(range(self.world_size)), local_rank)
++                rank=local_rank,
++                world_size=self.global_world_size,
++                timeout=timedelta(minutes=1),
++                # device_id=self.device
++            )
++            self.device_mesh = dist.device_mesh.init_device_mesh(
++                "xpu", mesh_shape=(self.global_world_size,)
++            )
+ 
+-            # (TODO-Komikndr) Should be modified so it can do support DP on top of FSDP
+-            self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
          else:
-@@ -361,12 +373,12 @@ class RayWorker:
+             print(f"Running Ray in normal seperate sampler with: {self.global_world_size} number of workers")
+ 
+@@ -380,10 +383,10 @@ class RayWorker:
+             out = latent.copy()
+             out["samples"] = samples
+ 
+-        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
+-            self.model.detach()
+-        else:
+-            self.model.detach()
++        # if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
++        #     self.model.detach()
++        # else:
++        self.model.detach()
+         comfy.model_management.soft_empty_cache()
+         gc.collect()
+         return out
+@@ -455,12 +458,12 @@ class RayWorker:
              out = latent.copy()
              out["samples"] = samples
  
 -        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
 -            self.model.detach()
 +        # if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
-+            # self.model.detach()
++        # self.model.detach()
  
          # I haven't implemented for non FSDP detached, so all rank model will be move into RAM
 -        else:
@@ -66,24 +104,55 @@ index 992b2cc..bdf0c2b 100644
          comfy.model_management.soft_empty_cache()
          gc.collect()
          return (out,)
-@@ -377,11 +389,13 @@ class RayNCCLTester:
-         local_rank = local_rank
-         world_size = world_size
-         device_id = device_id
+@@ -468,29 +471,25 @@ class RayWorker:
+ 
+ class RayCOMMTester:
+     def __init__(self, local_rank, world_size, device_id):
 -        device = torch.device(f"cuda:{device_id}")
 -        os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
++        local_rank = local_rank
++        world_size = world_size
++        device_id = device_id
 +        # device = torch.device(f"cuda:{device_id}")
 +        # os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
 +        device = torch.device(f"xpu:{device_id}")
 +        os.environ["ZE_AFFINITY_MASK"] = str(device_id)
- 
-         dist.init_process_group(
--            "nccl",
++
++        dist.init_process_group(
 +            "xccl",
-             rank=local_rank,
-             world_size=world_size,
-             timeout=timedelta(minutes=1),
-@@ -421,7 +435,7 @@ def ray_nccl_tester(world_size):
++            rank=local_rank,
++            world_size=world_size,
++            timeout=timedelta(minutes=1),
++            device_id=device
++        )
++        # pg = dist.group.WORLD
++        # cp.set_cp_group(pg, list(range(world_size)), local_rank)
+ 
+-        if sys.platform.startswith("linux"):
+-            dist.init_process_group(
+-                "nccl",
+-                rank=local_rank,
+-                world_size=world_size,
+-                timeout=timedelta(minutes=1),
+-                # device_id=self.device
+-            )
+-        elif sys.platform.startswith("win"):
+-            os.environ["USE_LIBUV"] = "0"
+-            if local_rank == 0:
+-                print("Windows detected, falling back to GLOO backend, consider using WSL, GLOO is slower than NCCL")
+-            dist.init_process_group(
+-                "gloo",
+-                rank=local_rank,
+-                world_size=world_size,
+-                timeout=timedelta(minutes=1),
+-                # device_id=self.device
+-            )
+-        print("Running COMM pre-run")
++        print("Running NCCL COMM pre-run")
+ 
+         # Each rank contributes rank+1
+         x = torch.ones(1, device=device) * (local_rank + 1)
+@@ -520,7 +519,7 @@ def ray_nccl_tester(world_size):
  
      for local_rank in range(world_size):
          gpu_actors.append(
@@ -92,41 +161,38 @@ index 992b2cc..bdf0c2b 100644
                  local_rank=local_rank,
                  world_size=world_size,
                  device_id=0,
-@@ -449,7 +463,7 @@ def make_ray_actor_fn(
+@@ -547,7 +546,7 @@ def make_ray_actor_fn(
  
          for local_rank in range(world_size):
              gpu_actors.append(
 -                gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
 +                gpu_actor.options(name=f"RayWorker:{local_rank}").remote(
                      local_rank=local_rank,
-                     world_size=world_size,
                      device_id=0,
+                     parallel_dict=parallel_dict,
 diff --git a/src/raylight/nodes.py b/src/raylight/nodes.py
-index 5caae8c..012c325 100644
+index 26518f9..4f9d486 100644
 --- a/src/raylight/nodes.py
 +++ b/src/raylight/nodes.py
-@@ -70,9 +70,9 @@ class RayInitializer:
+@@ -80,9 +80,9 @@ class RayInitializer:
+         self.parallel_dict = dict()
  
-         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
          world_size = GPU
 -        max_world_size = torch.cuda.device_count()
 -        if world_size > max_world_size:
--            raise ValueError("To many gpus")
+-            raise ValueError("Too many gpus")
 +        #max_world_size = torch.xpu.device_count()
 +        #if world_size > max_world_size:
 +        #    raise ValueError("To many gpus")
          if world_size == 0:
              raise ValueError("Num of cuda/cudalike device is 0")
-         if world_size < ulysses_degree * ring_degree:
+         if world_size < ulysses_degree * ring_degree * cfg_degree:
 diff --git a/src/raylight/nodes_debug.py b/src/raylight/nodes_debug.py
-index 4372420..c84494e 100644
+index 5631ad0..a6af288 100644
 --- a/src/raylight/nodes_debug.py
 +++ b/src/raylight/nodes_debug.py
-@@ -62,10 +62,10 @@ class RayInitializerDebug:
-         os.environ["TOKENIZERS_PARALLELISM"] = "false"
-         self.parallel_dict = dict()
+@@ -75,7 +75,8 @@ class RayInitializerDebug:
  
--
          # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
          world_size = GPU
 -        max_world_size = torch.cuda.device_count()
@@ -135,27 +201,3 @@ index 4372420..c84494e 100644
          if world_size > max_world_size:
              raise ValueError("To many gpus")
  
-diff --git a/src/raylight/wan/distributed/xdit_context_parallel.py b/src/raylight/wan/distributed/xdit_context_parallel.py
-index 2bc8db1..46f5c27 100644
---- a/src/raylight/wan/distributed/xdit_context_parallel.py
-+++ b/src/raylight/wan/distributed/xdit_context_parallel.py
-@@ -320,7 +320,7 @@ def usp_t2v_cross_attn_forward(self, x, context, **kwargs):
-     return x
- 
- 
--def usp_i2v_cross_attn_forward(self, x, context, context_img_len):
-+def usp_i2v_cross_attn_forward(self, x, context, context_img_len, **kwargs):
-     r"""
-     Args:
-         x(Tensor): Shape [B, L1, C]
-@@ -343,7 +343,9 @@ def usp_i2v_cross_attn_forward(self, x, context, context_img_len):
-     return x
- 
- 
--def usp_audio_injector(self, x, block_id, audio_emb, audio_emb_global, seq_len):
-+def usp_audio_injector(
-+    self, x, block_id, audio_emb, audio_emb_global, seq_len, **kwargs
-+):
-     audio_attn_id = self.injected_block_id.get(block_id, None)
-     x = get_sp_group().all_gather(x, dim=1)
-     if audio_attn_id is None:

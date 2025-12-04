@@ -66,7 +66,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cd .. && \
     git clone https://github.com/komikndr/raylight.git && \
     cd raylight && \
-    git checkout ff8e90ba1f2c2d23e3ac23746910ddfb523fc8f1 && \
+    git checkout 6e27efc540c49fa82d2bb779959cd5ad76b5faf5 && \
     git apply /tmp/raylight_for_multi_arc.patch && \
     pip install ray==2.49.2 && \
     pip install -r requirements.txt && \
