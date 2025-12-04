@@ -274,7 +274,7 @@
         true,
         614301733573909,
         "randomize",
-        6
+        1
       ]
     },
     {
@@ -388,7 +388,7 @@
         "Node name for S&R": "RayModelSamplingSD3"
       },
       "widgets_values": [
-        7
+        5
       ]
     },
     {
@@ -431,7 +431,7 @@
         "Node name for S&R": "RayUNETLoader"
       },
       "widgets_values": [
-        "hunyuanvideo1_5_480p.safetensors",
+        "hunyuanvideo1.5_480p_i2v_cfg_distilled_fp8_scaled.safetensors",
         "default"
       ]
     },
@@ -602,7 +602,7 @@
         "ver": "0.3.68"
       },
       "widgets_values": [
-        "Flux2_00033_.png",
+        "Hunyuan_1_5_I2V_Raylight.jpg",
         "image"
       ]
     },
@@ -724,7 +724,7 @@
       },
       "widgets_values": [
         "simple",
-        10,
+        50,
         1
       ]
     },
