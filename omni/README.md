@@ -84,6 +84,7 @@ The following models are supported in ComfyUI workflows:
 | **Image Generation** | Flux.1, Flux.1 Kontext dev | Text-to-Image, Multi-Image Reference, ControlNet | `image_flux_kontext_dev_basic.json`, `image_flux_controlnet_example.json` |
 | **Video Generation** | Wan2.2 TI2V 5B, Wan2.2 T2V 14B, Wan2.2 I2V 14B | Text-to-Video, Image-to-Video | `video_wan2_2_5B_ti2v.json`, `video_wan2_2_14B_t2v.json`, `video_wan2_2_14B_t2v_rapid_aio_multi_xpu.json`, `video_wan2.2_14B_i2v_rapid_aio_multi_xpu.json` |
 | **Video Generation** | Wan2.2 Animate 14B | Video Animation | `video_wan2_2_animate_basic.json` |
+| **Video Generation** | HunyuanVideo 1.5 8.3B | Image-to-Video | `video_hunyuan_1_5_I2V_multi_xpu.json` |
 | **3D Generation** | Hunyuan3D 2.1 | Text/Image-to-3D | `3d_hunyuan3d.json` |
 | **Audio Generation** | VoxCPM | Text-to-Speech | `audio_VoxCPM_example.json` |
 
@@ -180,6 +181,13 @@ For workflows using [WAN2.2-14B-Rapid-AllInOne](https://huggingface.co/Phr00t/WA
 - **video_wan2_2_animate_basic.json**: Video animation workflow with control video support
 
 This is a separate model from the standard Wan2.2 T2V/I2V models, designed specifically for video animation with control video inputs.
+
+##### HunyuanVideo 1.5 8.3B
+
+**Available Workflows:**
+- **video_hunyuan_1_5_I2V_multi_xpu.json**: 8.3B Image-to-Video multi-XPU support with [raylight](https://github.com/komikndr/raylight)
+
+The workflow’s default parameter configuration is optimized for 480p FP8 Image-to-Video.
 
 #### 3D Generation Workflows
 

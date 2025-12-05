@@ -131,6 +131,7 @@ Please follow the instructions in the [Getting Started](omni/README.md/#getting-
 | **Image Generation** | Flux.1, Flux.1 Kontext dev | Text-to-Image, Multi-Image Reference, ControlNet | 
 | **Video Generation** | Wan2.2 TI2V 5B, Wan2.2 T2V 14B, Wan2.2 I2V 14B | Text-to-Video, Image-to-Video | 
 | **Video Generation** | Wan2.2 Animate 14B | Video Animation | 
+| **Video Generation** | HunyuanVideo 1.5 8.3B | Image-to-Video | 
 | **3D Generation** | Hunyuan3D 2.1 | Text/Image-to-3D | 
 | **Audio Generation** | VoxCPM | Text-to-Speech | 
 
