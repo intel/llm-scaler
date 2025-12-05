@@ -184,6 +184,8 @@ This is a separate model from the standard Wan2.2 T2V/I2V models, designed speci
 
 ##### HunyuanVideo 1.5 8.3B
 
+ComfyUI tutorial: https://docs.comfy.org/tutorials/video/hunyuan/hunyuan-video-1-5
+
 **Available Workflows:**
 
 - **video_hunyuan_video_1.5_t2v.json**: Basic workflow for Text-to-Video generation
