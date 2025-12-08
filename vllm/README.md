@@ -2445,6 +2445,24 @@ To enable data parallelism, add:
 --dp 2
 ```
 
+#### Limitation for MoE Models
+
+Currently, **MoE models cannot run correctly with DP enabled** on XPU and may hang or fail to start.
+Based on our investigation and testing, this is a known limitation at the moment.
+
+#### Recommended Alternative: Load Balancer
+
+As a workaround for MoE models, we recommend using the **load balancer–based deployment** instead of DP. In our internal tests, the load balancer solution achieves **slightly better performance than DP**, while also being more stable for MoE workloads 🚀
+
+##### Steps
+
+```bash
+cd vllm/docker-compose/load_balancer
+docker compose -f docker-compose.yml up
+```
+
+Once started, you can directly send requests to `http://localhost:8000`. No additional DP configuration is required when using the load balancer setup.
+
 ---
 
 ### 2.7 Finding maximum Context Length
