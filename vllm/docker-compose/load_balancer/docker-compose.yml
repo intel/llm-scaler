@@ -1,0 +1,83 @@
+version: "3.9"
+
+services:
+  vllm_1:
+    image: intel/llm-scaler-vllm
+    container_name: vllm_1
+    privileged: true
+    network_mode: host
+    devices:
+      - "/dev/dri:/dev/dri"
+    shm_size: "32gb"
+    working_dir: /llm
+    entrypoint: >
+      bash -lc "source /opt/intel/oneapi/setvars.sh --force &&
+      python3 -m vllm.entrypoints.openai.api_server
+      --model /llm/models/DeepSeek-R1-Distill-Qwen-7B
+      --served-model-name model
+      --dtype=float16
+      --enforce-eager
+      --port 8008
+      --host 0.0.0.0
+      --disable-log-requests
+      --trust-remote-code
+      --gpu-memory-util=0.9
+      --no-enable-prefix-caching
+      --max-num-batched-tokens=8192
+      --max-model-len=32768
+      --max-num-seqs 256
+      --block-size 64
+      -tp=1"
+    environment:
+      PWD: "/llm"
+      VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+      ZE_AFFINITY_MASK: "2"
+      VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT: "1"
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+    volumes:
+      - /home/intel/LLM/:/llm/models/
+
+  vllm_2:
+    image: intel/llm-scaler-vllm
+    container_name: vllm_2
+    privileged: true
+    network_mode: host
+    devices:
+      - "/dev/dri:/dev/dri"
+    shm_size: "32gb"
+    working_dir: /llm
+    entrypoint: >
+      bash -lc "source /opt/intel/oneapi/setvars.sh --force &&
+      python3 -m vllm.entrypoints.openai.api_server
+      --model /llm/models/DeepSeek-R1-Distill-Qwen-7B
+      --served-model-name model
+      --dtype=float16
+      --enforce-eager
+      --port 8009
+      --host 0.0.0.0
+      --disable-log-requests
+      --trust-remote-code
+      --gpu-memory-util=0.9
+      --no-enable-prefix-caching
+      --max-num-batched-tokens=8192
+      --max-model-len=32768
+      --max-num-seqs 256
+      --block-size 64
+      -tp=1"
+    environment:
+      PWD: "/llm"
+      VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+      ZE_AFFINITY_MASK: "3"
+      VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT: "1"
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+    volumes:
+      - /home/intel/LLM/:/llm/models/
+
+  haproxy:
+    image: haproxy:latest
+    container_name: llm_haproxy
+    network_mode: host
+    volumes:
+      - /home/intel/LLM/load_balancer/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg
+    restart: always
+
