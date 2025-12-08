@@ -6,9 +6,10 @@
 
 1. [Getting Started with Omni Docker Image](#getting-started-with-omni-docker-image)
 2. [ComfyUI](#comfyui)
-3. [XInference](#xinference)
-4. [Stand-alone Examples](#stand-alone-examples)
-5. [ComfyUI for Windows (experimental)](#comfyui-for-windows-experimental)
+3. [SGLang Diffusion](#sglang-diffusion-experimental)
+4. [XInference](#xinference)
+5. [Stand-alone Examples](#stand-alone-examples)
+6. [ComfyUI for Windows (experimental)](#comfyui-for-windows-experimental)
 
 ---
 
@@ -281,6 +282,72 @@ This workflow synthesizes new speech using a single reference audio file for voi
 
 3. **Run the Workflow**
    - Execute the workflow to generate the speech.
+
+## SGLang Diffusion (experimental)
+
+SGLang Diffusion provides OpenAI-compatible API for image/video generation models.
+
+### 1. CLI Generation
+
+```bash
+sglang generate --model-path /llm/models/Wan2.1-T2V-1.3B-Diffusers \
+    --text-encoder-cpu-offload --pin-cpu-memory \
+    --prompt "A curious raccoon" \
+    --save-output
+```
+
+### 2. OpenAI API Server
+
+**Start the server:**
+
+```bash
+# Configure proxy if needed
+export http_proxy=<your_http_proxy>
+export https_proxy=<your_https_proxy>
+export no_proxy=localhost,127.0.0.1
+
+# Start server
+sglang serve --model-path /llm/models/Z-Image-Turbo/ \
+    --vae-cpu-offload --pin-cpu-memory \
+    --num-gpus 1 --port 30010
+```
+
+Or use the provided script:
+
+```bash
+bash /llm/entrypoints/start_sgl_diffusion.sh
+```
+
+**cURL example:**
+
+```bash
+curl http://localhost:30010/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Z-Image-Turbo",
+    "prompt": "A beautiful sunset over the ocean",
+    "size": "1024x1024"
+  }'
+```
+
+**Python example (OpenAI SDK):**
+
+```python
+from openai import OpenAI
+import base64
+
+client = OpenAI(base_url="http://localhost:30010/v1", api_key="EMPTY")
+
+response = client.images.generate(
+    model="Z-Image-Turbo",
+    prompt="A beautiful sunset over the ocean",
+    size="1024x1024",
+)
+
+# Save image from base64 response
+with open("output.png", "wb") as f:
+    f.write(base64.b64decode(response.data[0].b64_json))
+```
 
 ## XInference
 

@@ -104,6 +104,19 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     pip install "xinference[transformers]" && \
     patch /usr/local/lib/python3.10/dist-packages/xinference/device_utils.py < /tmp/xinference_device_utils.patch && \
     pip install kokoro Jinja2==3.1.6 jieba ordered-set pypinyin cn2an pypinyin-dict && \
+# Install SGlang Diffusion
+    cd /llm && \
+    git clone https://github.com/sgl-project/sglang.git && \
+    git checkout 236a7c237002250b148c79bd93780d870b8b50d2 && \
+    git apply /tmp/sglang_diffusion_for_multi_arc.patch && \
+    cd sglang && \
+    pip install -e "python[diffusion]" && \
+    pip install pytorch-triton-xpu==3.3.0 --index-url https://download.pytorch.org/whl/xpu && \
+    pip install triton==3.3.0 triton-xpu==3.3.0b1 && \
+    cd /llm && \
+    git clone https://github.com/sgl-project/sgl-kernel-xpu.git && \
+    cd sgl-kernel-xpu && \
+    pip install -v . && \
     # Clean
     rm -rf /tmp/*
 RUN cd /llm/ComfyUI/custom_nodes && \
@@ -114,5 +127,6 @@ RUN cd /llm/ComfyUI/custom_nodes && \
 COPY ./workflows/* /llm/ComfyUI/user/default/workflows/
 COPY ./example_inputs/* /llm/ComfyUI/input/
 COPY ./tools/* /llm/tools/
+COPY ./entrypoints/* /llm/entrypoints/
 
 WORKDIR /llm/ComfyUI
