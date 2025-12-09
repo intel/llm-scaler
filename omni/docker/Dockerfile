@@ -119,4 +119,6 @@ COPY ./example_inputs/* /llm/ComfyUI/input/
 COPY ./tools/* /llm/tools/
 COPY ./entrypoints/* /llm/entrypoints/
 
-WORKDIR /llm/ComfyUI
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
+
+WORKDIR /llm/entrypoints
