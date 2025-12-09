@@ -15,6 +15,7 @@ COPY ./patches/xinference_device_utils.patch /tmp/
 COPY ./patches/comfyui_for_multi_arc.patch /tmp/
 COPY ./patches/comfyui_voxcpm_for_xpu.patch /tmp/
 COPY ./patches/comfyui_hunyuan3d_for_xpu.patch /tmp/
+COPY ./patches/sglang_diffusion_for_multi_arc.patch /tmp/
 
 
 # Add Intel oneAPI repo and PPA for GPU support
@@ -86,17 +87,6 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     git apply /tmp/comfyui_voxcpm_for_xpu.patch && \
     pip install -r requirements.txt && \
     cd .. && \
-    git clone https://github.com/visualbruno/ComfyUI-Hunyuan3d-2-1.git && \
-    cd ComfyUI-Hunyuan3d-2-1 && \
-    git checkout 9d7ef32509101495a7840b3ae8e718c8d1183305 && \
-    git apply /tmp/comfyui_hunyuan3d_for_xpu.patch && \
-    pip install bigdl-core==2.4.0b1 rembg realesrgan && \
-    pip install -r requirements.txt && \
-    cd hy3dpaint/custom_rasterizer && \
-    python setup.py install && \
-    cd ../DifferentiableRenderer && \
-    python setup.py install && \
-    cd /llm/ComfyUI/custom_nodes && \
     git clone https://github.com/billwuhao/ComfyUI_IndexTTS.git && \
     cd ComfyUI_IndexTTS && \
     pip install -r requirements.txt && \
@@ -107,12 +97,12 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
 # Install SGlang Diffusion
     cd /llm && \
     git clone https://github.com/sgl-project/sglang.git && \
+    cd sglang && \
     git checkout 236a7c237002250b148c79bd93780d870b8b50d2 && \
     git apply /tmp/sglang_diffusion_for_multi_arc.patch && \
-    cd sglang && \
     pip install -e "python[diffusion]" && \
-    pip install pytorch-triton-xpu==3.3.0 --index-url https://download.pytorch.org/whl/xpu && \
-    pip install triton==3.3.0 triton-xpu==3.3.0b1 && \
+    pip install triton==3.5.0 && \
+    pip install pytorch-triton-xpu==3.5.0 --index-url https://download.pytorch.org/whl/xpu --force-reinstall && \
     cd /llm && \
     git clone https://github.com/sgl-project/sgl-kernel-xpu.git && \
     cd sgl-kernel-xpu && \
