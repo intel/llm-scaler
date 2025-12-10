@@ -17,7 +17,7 @@
 
 Pull docker image from dockerhub:
 ```bash
-docker pull intel/llm-scaler-omni:0.1.0-b3
+docker pull intel/llm-scaler-omni:0.1.0-b4
 ```
 
 Or build docker image:

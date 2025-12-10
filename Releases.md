@@ -68,6 +68,13 @@
 ## LLM-Scaler-Omni
 
 ### Latest Beta Release 
+* `intel/llm-scaler-omni:0.1.0-b4` [12/10/2025]:
+    - More workflows support:
+        - Z-Image-Turbo
+        - Hunyuan-Video-1.5 T2V/I2V with multi-XPU support
+    - Initial support for SGLang Diffusion. 10% perf improvement compared to ComfyUI in 1*B60 scenario.
+
+### Previous Releases
 * `intel/llm-scaler-omni:0.1.0-b3` [11/19/2025]:
     - More workflows support:
         - Hunyuan 3D 2.1
@@ -76,7 +83,6 @@
         - AnimateDiff lightning
     - Add Windows installation
 
-### Previous Releases
 * `intel/llm-scaler-omni:0.1.0-b2` [10/17/2025]:
     - Fix issues:
         - Fix ComfyUI interpolate issue
