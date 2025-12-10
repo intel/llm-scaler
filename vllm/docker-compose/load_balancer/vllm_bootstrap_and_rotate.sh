@@ -7,7 +7,7 @@ cd "${COMPOSE_DIR}"
 
 HAPROXY_SOCK=127.0.0.1:9999
 LOG_FILE=/tmp/vllm_rotate.log
-CRON_CMD="*/5 * * * * ${COMPOSE_DIR}/vllm_bootstrap_and_rotate.sh >> ${LOG_FILE} 2>&1"
+CRON_CMD="* 3 * * * ${COMPOSE_DIR}/vllm_bootstrap_and_rotate.sh >> ${LOG_FILE} 2>&1"
 echo "${CRON_CMD}"
 # ==== Step 0: 确保 HAProxy + 至少一个 vLLM 运行 ====
 echo "==> Ensuring HAProxy + at least one vLLM is running..."

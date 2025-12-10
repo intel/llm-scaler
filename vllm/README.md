@@ -23,7 +23,7 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    2.7 [Finding maximum Context Length](#27-finding-maximum-context-length)   
    2.8 [Multi-Modal Webui](#28-multi-modal-webui)  
    2.9 [Multi-node Distributed Deployment (PP/TP)](#29-multi-node-distributed-deployment-pptp)  
-   2.10 [BPE-Qwen Tokenizer](#210-bpe-qwen-tokenizer)
+   2.10 [BPE-Qwen Tokenizer](#210-bpe-qwen-tokenizer)  
    2.11 [Load Balancer Solution](#211-load-balancer-solution)
 4. [Supported Models](#3-supported-models)  
 5. [Troubleshooting](#4-troubleshooting)
@@ -2775,6 +2775,12 @@ cd vllm/docker-compose/load_balancer
 docker compose up -d
 ```
 
+You can view logs in real time to monitor service status:
+
+```bash
+docker compose logs -f
+```
+
 After startup, all requests can be sent directly to:
 
 ```
@@ -2796,6 +2802,12 @@ Start with Rotation Enabled
 cd vllm/docker-compose/load_balancer
 chmod +x vllm_bootstrap_and_rotate.sh
 bash vllm_bootstrap_and_rotate.sh
+```
+
+You can view logs in real time to monitor service status:
+
+```bash
+docker compose logs -f
 ```
 
 Once started, requests continue to be served at:
