@@ -24,6 +24,7 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    2.8 [Multi-Modal Webui](#28-multi-modal-webui)  
    2.9 [Multi-node Distributed Deployment (PP/TP)](#29-multi-node-distributed-deployment-pptp)  
    2.10 [BPE-Qwen Tokenizer](#210-bpe-qwen-tokenizer)
+   2.11 [Load Balancer Solution](#211-load-balancer-solution)
 4. [Supported Models](#3-supported-models)  
 5. [Troubleshooting](#4-troubleshooting)
 6. [Performance tuning](#5-performance-tuning)
@@ -2445,23 +2446,11 @@ To enable data parallelism, add:
 --dp 2
 ```
 
-#### Limitation for MoE Models
+> **Note**
+> In addition to DP, a **load balancer–based deployment** is also supported as a drop-in alternative.
+> It provides slightly better performance in some scenarios and supports periodic instance rotation for long-running services.
+> See [Section 2.11 Load Balancer](#211-load-balancer-solution) for details.
 
-Currently, **MoE models cannot run correctly with DP enabled** on XPU and may hang or fail to start.
-Based on our investigation and testing, this is a known limitation at the moment.
-
-#### Recommended Alternative: Load Balancer
-
-As a workaround for MoE models, we recommend using the **load balancer–based deployment** instead of DP. In our internal tests, the load balancer solution achieves **slightly better performance than DP**, while also being more stable for MoE workloads 🚀
-
-##### Steps
-
-```bash
-cd vllm/docker-compose/load_balancer
-docker compose -f docker-compose.yml up
-```
-
-Once started, you can directly send requests to `http://localhost:8000`. No additional DP configuration is required when using the load balancer setup.
 
 ---
 
@@ -2758,6 +2747,71 @@ To enable it when launching the API server, add:
 ```bash
 --tokenizer-mode bpe-qwen
 ```
+
+---
+
+### 2.11 Load Balancer Solution
+
+This document describes a **load balancer–based deployment** for vLLM using Docker Compose.
+The load balancer routes traffic to multiple vLLM instances and exposes a single endpoint.
+
+Once started, send requests to:
+
+```
+http://localhost:8000
+```
+
+
+#### Use Case 1: Drop-in Alternative to DP
+
+Use this setup as a **drop-in alternative to DP**.
+
+Compared to DP, the load balancer approach provides **slightly better performance** in our testing and does not require any DP-specific configuration.
+
+Start the Load Balancer
+
+```bash
+cd vllm/docker-compose/load_balancer
+docker compose up -d
+```
+
+After startup, all requests can be sent directly to:
+
+```
+http://localhost:8000
+```
+
+Stop / clean up:
+```
+docker compose down
+```
+
+#### Use Case 2: Periodic vLLM Rotation (Long-Running Service)
+
+Use this when running vLLM for a long time and you want to periodically restart instances (e.g., once per day) to avoid degradation, without service interruption.
+
+Start with Rotation Enabled
+
+```bash
+cd vllm/docker-compose/load_balancer
+chmod +x vllm_bootstrap_and_rotate.sh
+bash vllm_bootstrap_and_rotate.sh
+```
+
+Once started, requests continue to be served at:
+
+```
+http://localhost:8000
+```
+
+To stop the rotation and clean up resources:
+
+```bash
+docker compose down
+crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
+```
+
+> This will stop all containers and remove the cron job that triggers periodic rotation.
 
 ---
 

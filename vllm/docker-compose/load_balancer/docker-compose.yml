@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   vllm_1:
     image: intel/llm-scaler-vllm
@@ -78,6 +76,6 @@ services:
     container_name: llm_haproxy
     network_mode: host
     volumes:
-      - /home/intel/LLM/load_balancer/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg
     restart: always
 
