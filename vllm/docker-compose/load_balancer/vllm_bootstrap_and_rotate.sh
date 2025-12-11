@@ -12,7 +12,7 @@ echo "${CRON_CMD}"
 # ==== Step 0: 确保 HAProxy + 至少一个 vLLM 运行 ====
 echo "==> Ensuring HAProxy + at least one vLLM is running..."
 
-docker compose up -d haproxy
+docker compose -f docker-compose.yml -f docker-compose.env-override.yml up -d haproxy
 
 # 检查 vLLM 容器是否运行
 VLLM_1_RUNNING=$(docker ps --filter "name=vllm_1" --filter "status=running" | grep -q vllm_1 && echo 1 || echo 0)
@@ -20,7 +20,8 @@ VLLM_2_RUNNING=$(docker ps --filter "name=vllm_2" --filter "status=running" | gr
 
 if [[ "$VLLM_1_RUNNING" == "0" && "$VLLM_2_RUNNING" == "0" ]]; then
   echo "==> No vLLM running, starting vllm_1..."
-  docker compose up -d vllm_1
+  docker compose -f docker-compose.yml -f docker-compose.env-override.yml up -d vllm_1
+
 else
   echo "==> At least one vLLM already running, skipping initial start"
 fi
@@ -54,7 +55,7 @@ METRIC_PORT_NEW=$([ "$NEW" == "vllm_1" ] && echo 8008 || echo 8009)
 
 # ==== Step 2: 启动新 vLLM ====
 echo "==> Starting new vLLM: ${NEW}"
-docker compose up -d ${NEW}
+docker compose -f docker-compose.yml -f docker-compose.env-override.yml up -d ${NEW}
 
 # ==== Step 3: 等待新 vLLM 健康 ====
 echo "==> Waiting for ${NEW} to be healthy..."
