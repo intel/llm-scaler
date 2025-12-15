@@ -2,12 +2,6 @@
 
 llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapted for Intel’s Multi GPU platform. This project enhances vLLM’s core architecture with Intel-specific performance optimizations, advanced features, and tailored support for customer use cases.
 
-Below is the support matrix for OS and Kernel. 
-| | 6.14.0 | 6.6 |
-| --- | ---| --- |
-| Ubuntu 25.04 (Desktop/Server) | Production Release | Evaluation Release |
-| Ubuntu 24.04 (Desktop/Server) | Evaluation Release | Evaluation Release |
-
 ---
 
 ## Table of Contents
