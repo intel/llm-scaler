@@ -8137,7 +8137,7 @@ index 36d805a32..2a4233b6a 100644
                  args.max_num_seqs,
                  args.max_model_len,
 diff --git a/examples/offline_inference/vision_language.py b/examples/offline_inference/vision_language.py
-index b104113b8..58fb423e8 100644
+index b104113b8..3b9ccd606 100644
 --- a/examples/offline_inference/vision_language.py
 +++ b/examples/offline_inference/vision_language.py
 @@ -126,6 +126,23 @@ def run_chameleon(questions: list[str], modality: str) -> ModelRequestData:
@@ -8164,7 +8164,40 @@ index b104113b8..58fb423e8 100644
  def run_command_a_vision(questions: list[str], modality: str) -> ModelRequestData:
      assert modality == "image"
  
-@@ -1431,7 +1448,9 @@ def run_qwen2_5_vl(questions: list[str], modality: str) -> ModelRequestData:
+@@ -1198,6 +1215,32 @@ def run_ovis2_5(questions: list[str], modality: str) -> ModelRequestData:
+     )
+ 
+ 
++# PaddleOCR-VL
++def run_paddleocr_vl(questions: list[str], modality: str) -> ModelRequestData:
++    assert modality == "image"
++
++    model_name = "PaddlePaddle/PaddleOCR-VL"
++
++    engine_args = EngineArgs(
++        model=model_name,
++        max_model_len=4096,
++        max_num_seqs=2,
++        limit_mm_per_prompt={modality: 1},
++        trust_remote_code=True,
++    )
++
++    placeholder = "<|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>"
++    prompts = [
++        (f"<|begin_of_sentence|>User: {question}{placeholder}\nAssistant: ")
++        for question in questions
++    ]
++
++    return ModelRequestData(
++        engine_args=engine_args,
++        prompts=prompts,
++    )
++
++
+ # PaliGemma
+ def run_paligemma(questions: list[str], modality: str) -> ModelRequestData:
+     assert modality == "image"
+@@ -1431,7 +1474,9 @@ def run_qwen2_5_vl(questions: list[str], modality: str) -> ModelRequestData:
              "max_pixels": 1280 * 28 * 28,
              "fps": 1,
          },
@@ -8175,7 +8208,7 @@ index b104113b8..58fb423e8 100644
      )
  
      if modality == "image":
-@@ -1497,6 +1516,80 @@ def run_qwen2_5_omni(questions: list[str], modality: str):
+@@ -1497,6 +1542,80 @@ def run_qwen2_5_omni(questions: list[str], modality: str):
      )
  
  
@@ -8256,7 +8289,7 @@ index b104113b8..58fb423e8 100644
  # R-4B
  def run_r_vl(questions: list[str], modality: str) -> ModelRequestData:
      assert modality == "image"
-@@ -1662,6 +1755,7 @@ model_example_map = {
+@@ -1662,6 +1781,7 @@ model_example_map = {
      "aya_vision": run_aya_vision,
      "blip-2": run_blip2,
      "chameleon": run_chameleon,
@@ -8264,7 +8297,15 @@ index b104113b8..58fb423e8 100644
      "command_a_vision": run_command_a_vision,
      "deepseek_vl_v2": run_deepseek_vl2,
      "ernie45_vl": run_ernie45_vl,
-@@ -1707,6 +1801,8 @@ model_example_map = {
+@@ -1697,6 +1817,7 @@ model_example_map = {
+     "NVLM_D": run_nvlm_d,
+     "ovis": run_ovis,
+     "ovis2_5": run_ovis2_5,
++    "paddleocr_vl": run_paddleocr_vl,
+     "paligemma": run_paligemma,
+     "paligemma2": run_paligemma2,
+     "phi3_v": run_phi3v,
+@@ -1707,6 +1828,8 @@ model_example_map = {
      "qwen2_vl": run_qwen2_vl,
      "qwen2_5_vl": run_qwen2_5_vl,
      "qwen2_5_omni": run_qwen2_5_omni,
@@ -8273,7 +8314,7 @@ index b104113b8..58fb423e8 100644
      "rvl": run_r_vl,
      "skywork_chat": run_skyworkr1v,
      "smolvlm": run_smolvlm,
-@@ -1716,6 +1812,15 @@ model_example_map = {
+@@ -1716,6 +1839,15 @@ model_example_map = {
  }
  
  
@@ -8290,10 +8331,38 @@ index b104113b8..58fb423e8 100644
      """
      return {
 diff --git a/examples/offline_inference/vision_language_multi_image.py b/examples/offline_inference/vision_language_multi_image.py
-index 01c2905cf..2649c992b 100644
+index 01c2905cf..86b08935c 100644
 --- a/examples/offline_inference/vision_language_multi_image.py
 +++ b/examples/offline_inference/vision_language_multi_image.py
-@@ -982,12 +982,14 @@ def load_qwen2_5_vl(question: str, image_urls: list[str]) -> ModelRequestData:
+@@ -747,6 +747,27 @@ def load_ovis2_5(question: str, image_urls: list[str]) -> ModelRequestData:
+     )
+ 
+ 
++def load_paddleocr_vl(question: str, image_urls: list[str]) -> ModelRequestData:
++    model_name = "PaddlePaddle/PaddleOCR-VL"
++
++    engine_args = EngineArgs(
++        model=model_name,
++        trust_remote_code=True,
++        max_model_len=8192,
++        max_num_seqs=2,
++        limit_mm_per_prompt={"image": len(image_urls)},
++    )
++
++    placeholders = "<|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>" * len(image_urls)
++    prompt = f"<|begin_of_sentence|>User: {question}{placeholders}\nAssistant: "
++
++    return ModelRequestData(
++        engine_args=engine_args,
++        prompt=prompt,
++        image_data=[fetch_image(url) for url in image_urls],
++    )
++
++
+ def load_pixtral_hf(question: str, image_urls: list[str]) -> ModelRequestData:
+     model_name = "mistral-community/pixtral-12b"
+ 
+@@ -982,12 +1003,14 @@ def load_qwen2_5_vl(question: str, image_urls: list[str]) -> ModelRequestData:
          )
          smart_resize = None
  
@@ -8310,6 +8379,14 @@ index 01c2905cf..2649c992b 100644
          limit_mm_per_prompt={"image": len(image_urls)},
      )
  
+@@ -1257,6 +1280,7 @@ model_example_map = {
+     "NVLM_D": load_nvlm_d,
+     "ovis": load_ovis,
+     "ovis2_5": load_ovis2_5,
++    "paddleocr_vl": load_paddleocr_vl,
+     "phi3_v": load_phi3v,
+     "phi4_mm": load_phi4mm,
+     "phi4_multimodal": load_phi4_multimodal,
 diff --git a/examples/online_serving/structured_outputs/structured_outputs.py b/examples/online_serving/structured_outputs/structured_outputs.py
 index 2a8f46372..990b47f22 100644
 --- a/examples/online_serving/structured_outputs/structured_outputs.py
@@ -8353,21 +8430,35 @@ index b8665104b..a52745f69 100644
  filelock >= 3.16.1 # need to contain https://github.com/tox-dev/filelock/pull/317
  partial-json-parser # used for parsing partial JSON outputs
 diff --git a/requirements/xpu.txt b/requirements/xpu.txt
-index 74f5b05b2..3fdf84543 100644
+index 74f5b05b2..54f010302 100644
 --- a/requirements/xpu.txt
 +++ b/requirements/xpu.txt
-@@ -11,9 +11,10 @@ jinja2>=3.1.6
+@@ -1,19 +1,19 @@
+ # Common dependencies
+ -r common.txt
+-
++# 
+ ray>=2.9
+ cmake>=3.26.1
+ packaging>=24.2
+ setuptools-scm>=8
+-setuptools>=77.0.3,<80.0.0
++setuptools>=77.0.3,<81.0.0
+ wheel
+ jinja2>=3.1.6
  datasets # for benchmark scripts
  numba == 0.60.0 # v0.61 doesn't support Python 3.9. Required for N-gram speculative decoding
- nixl==0.3.0 # for PD disaggregation
-+
- torch==2.8.0+xpu
+-nixl==0.3.0 # for PD disaggregation
+-torch==2.8.0+xpu
++tblib # for test
++--extra-index-url=https://download.pytorch.org/whl/xpu
++torch==2.9.0+xpu
  torchaudio
  torchvision
- --extra-index-url=https://download.pytorch.org/whl/xpu
+---extra-index-url=https://download.pytorch.org/whl/xpu
  
 -intel-extension-for-pytorch @ https://intel-extension-for-pytorch.s3.us-east-1.amazonaws.com/ipex_dev/xpu/intel_extension_for_pytorch-2.8.10.post0%2Bxpu-cp312-cp312-linux_x86_64.whl
-+intel-extension-for-pytorch @ https://ubit-artifactory-ba.intel.com/artifactory/aipc_releases-ba-local//gpu/new/validation/IPEX/nightly/PVC/UBUNTU/VLLM_nightly/20251027/f7903ad79/intel_extension_for_pytorch-2.8.10.post1+xpu-cp312-cp312-linux_x86_64.whl
++intel-extension-for-pytorch @ https://ubit-artifactory-ba.intel.com/artifactory/aipc_releases-ba-local//gpu/new/validation/IPEX/nightly/PVC/UBUNTU/VLLM_nightly/20251113/1ec7b272e/intel_extension_for_pytorch-2.9.10.post0+xpu-cp312-cp312-linux_x86_64.whl
 diff --git a/setup.py b/setup.py
 index 67f65d9b9..d2bfb2880 100644
 --- a/setup.py
@@ -8944,49 +9035,17 @@ index 000000000..ae4909b29
 +
 +exit 0
 diff --git a/vllm/_ipex_ops.py b/vllm/_ipex_ops.py
-index c2868c040..0e30e8192 100644
+index c2868c040..e7df13e98 100644
 --- a/vllm/_ipex_ops.py
 +++ b/vllm/_ipex_ops.py
-@@ -15,6 +15,7 @@ try:
- except ImportError as e:
-     logger.warning("Import error msg: %s", e.msg)
- 
-+import vllm._C.ops
- 
- class ipex_ops:
- 
-@@ -143,10 +144,12 @@ class ipex_ops:
-         cos_sin_cache: torch.Tensor,  # [cos_sin_dim, rot_dim]
-         is_neox: bool,
-     ) -> None:
--        rot_dim = cos_sin_cache.size(1)
--        ipex.llm.functional.rotary_embedding_batched(positions, query, key,
--                                                     head_size, cos_sin_cache,
--                                                     is_neox, rot_dim)
-+        # rot_dim = cos_sin_cache.size(1)
-+        # ipex.llm.functional.rotary_embedding_batched(positions, query, key,
-+        #                                              head_size, cos_sin_cache,
-+        #                                              is_neox, rot_dim)
-+        import vllm._C.ops
-+        vllm._C.ops.rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox)
- 
-     @staticmethod
-     def batched_rotary_embedding(positions: torch.Tensor, query: torch.Tensor,
-@@ -162,14 +165,26 @@ class ipex_ops:
+@@ -162,14 +162,14 @@ class ipex_ops:
      @staticmethod
      def rms_norm(input: torch.Tensor, weight: torch.Tensor,
                   epsilon: float) -> torch.Tensor:
-+        # out = torch.empty_like(input)
-+        # torch.ops.torch_ipex.rms_norm_vllm(out, input.contiguous(), weight, epsilon)
-+        # return out
-+        tmp = torch.empty_like(input)
-+        vllm._C.ops.rms_norm(tmp, input, weight, epsilon)
-+        return tmp
-+
-+    @staticmethod
-+    def rms_norm_origin(input: torch.Tensor, weight: torch.Tensor,
-+                 epsilon: float) -> torch.Tensor:
-         return ipex.llm.functional.rms_norm(input, weight, epsilon)
+-        return ipex.llm.functional.rms_norm(input, weight, epsilon)
++        out = torch.empty_like(input)
++        torch.ops.torch_ipex.rms_norm_vllm(out, input.contiguous(), weight, epsilon)
++        return out
  
      @staticmethod
      def fused_add_rms_norm(input: torch.Tensor, residual: torch.Tensor,
@@ -8994,15 +9053,11 @@ index c2868c040..0e30e8192 100644
 -        tmp = ipex.llm.functional.add_rms_norm(residual, input, weight, None,
 -                                               epsilon, True)
 -        input.copy_(tmp)
-+        # torch.ops.torch_ipex.fused_add_rms_norm_vllm(input, residual, weight, epsilon)
-+        # tmp = ipex.llm.functional.add_rms_norm(residual, input, weight, None,
-+        #                                        epsilon, True)
-+        # input.copy_(tmp)
-+        vllm._C.ops.fused_add_rms_norm(input, residual, weight, epsilon)
++        torch.ops.torch_ipex.fused_add_rms_norm_vllm(input, residual, weight, epsilon)
  
      @staticmethod
      def varlen_attention(
-@@ -207,6 +222,12 @@ class ipex_ops:
+@@ -207,6 +207,12 @@ class ipex_ops:
                                                   is_causal, return_softmax,
                                                   gen_)
          else:  # XPU build
@@ -9015,7 +9070,7 @@ index c2868c040..0e30e8192 100644
              ipex.llm.functional.varlen_attention(
                  query.contiguous(), key.contiguous(), value.contiguous(), out,
                  seqlen_q.int(), seqlen_k.int(), alibi_slopes, max_seqlen_q,
-@@ -273,14 +294,6 @@ class ipex_ops:
+@@ -273,14 +279,6 @@ class ipex_ops:
          num_splits=0,
          s_aux: Optional[torch.Tensor] = None,
      ):
@@ -9030,7 +9085,7 @@ index c2868c040..0e30e8192 100644
          real_window_size: tuple[int, int]
          if window_size is None:
              real_window_size = (-1, -1)
-@@ -293,13 +306,14 @@ class ipex_ops:
+@@ -293,13 +291,14 @@ class ipex_ops:
              k,
              v,
              cu_seqlens_q,
@@ -9046,6 +9101,13 @@ index c2868c040..0e30e8192 100644
              softcap=softcap,
              window_size_left=real_window_size[0],
              window_size_right=real_window_size[1],
+@@ -401,4 +400,4 @@ class ipex_ops:
+         scale = torch.zeros(1, device=input.device, dtype=torch.float32)
+         torch.ops.torch_ipex.dynamic_scaled_fp8_quant(output, input, scale)
+ 
+-        return output, scale
++        return output, scale
+\ No newline at end of file
 diff --git a/vllm/attention/layer.py b/vllm/attention/layer.py
 index bb05b468f..6d620bb24 100644
 --- a/vllm/attention/layer.py
@@ -9278,6 +9340,194 @@ index bb05b468f..6d620bb24 100644
  def unified_attention(
      query: torch.Tensor,
      key: torch.Tensor,
+diff --git a/vllm/attention/ops/vit_attn_wrappers.py b/vllm/attention/ops/vit_attn_wrappers.py
+new file mode 100644
+index 000000000..639bc7ac8
+--- /dev/null
++++ b/vllm/attention/ops/vit_attn_wrappers.py
+@@ -0,0 +1,181 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""
++This file contains ops for ViT attention to be compatible with torch.compile
++as there are operations here not supported by torch.compile (for instance,
++`to_list` in xformers attn, or `.item()` in flash attention)
++
++Using these ops and wrapping vision blocks with `torch.compile` can speed up
++throughput in vision models by ~5% relative on H100, and improve token
++latencies by ~7% (see qwen2_5_vl for example usage)
++
++To use these ops, you must have a recent version of PyTorch installed (>= 2.4.0)
++"""
++
++import einops
++import torch
++import torch.nn.functional as F
++
++from vllm.utils import direct_register_custom_op
++
++
++def xformers_attn_seqlens_wrapper(
++    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seqlens: torch.Tensor
++) -> torch.Tensor:
++    from xformers import ops as xops
++    from xformers.ops.fmha.attn_bias import BlockDiagonalMask
++
++    attn_bias = BlockDiagonalMask.from_seqlens(
++        q_seqlen=seqlens.tolist(), kv_seqlen=None, device=q.device
++    )
++    context_layer = xops.memory_efficient_attention_forward(
++        q, k, v, attn_bias=attn_bias, p=0, scale=None
++    )
++    context_layer = einops.rearrange(context_layer, "b s h d -> s b (h d)").contiguous()
++    return context_layer
++
++
++def xformers_attn_seqlens_wrapper_fake(
++    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seqlens: torch.Tensor
++) -> torch.Tensor:
++    b, s, h, d = q.shape
++    return torch.empty((s, b, h * d), dtype=q.dtype, device=q.device)
++
++
++direct_register_custom_op(
++    op_name="xformers_attn_seqlens_wrapper",
++    op_func=xformers_attn_seqlens_wrapper,
++    fake_impl=xformers_attn_seqlens_wrapper_fake,
++    mutates_args=[],
++)
++
++
++def vit_xformers_attn_wrapper(
++    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seqlens: torch.Tensor
++) -> torch.Tensor:
++    return torch.ops.vllm.xformers_attn_seqlens_wrapper(q, k, v, seqlens)
++
++
++def flash_attn_maxseqlen_wrapper(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    cu_seqlens: torch.Tensor,
++    max_seqlen: torch.Tensor,
++    batch_size: int,
++    is_rocm_aiter: bool,
++    use_upstream_fa: bool,
++) -> torch.Tensor:
++    if is_rocm_aiter:
++        from aiter import flash_attn_varlen_func
++    else:
++        if use_upstream_fa:
++            from flash_attn import flash_attn_varlen_func
++        else:
++            from vllm.attention.utils.fa_utils import flash_attn_varlen_func
++    q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
++    output = flash_attn_varlen_func(
++        q,
++        k,
++        v,
++        cu_seqlens_q=cu_seqlens,
++        cu_seqlens_k=cu_seqlens,
++        max_seqlen_q=max_seqlen.item(),
++        max_seqlen_k=max_seqlen.item(),
++        dropout_p=0.0,
++        causal=False,
++    )
++    context_layer = einops.rearrange(
++        output, "(b s) h d -> s b (h d)", b=batch_size
++    ).contiguous()
++    return context_layer
++
++
++def flash_attn_maxseqlen_wrapper_fake(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    cu_seqlens: torch.Tensor,
++    max_seqlen: torch.Tensor,
++    batch_size: int,
++    is_rocm_aiter: bool,
++    use_upstream_fa: bool,
++) -> torch.Tensor:
++    b, s, h, d = q.shape
++    return torch.empty((s, b, h * d), dtype=q.dtype, device=q.device)
++
++
++direct_register_custom_op(
++    op_name="flash_attn_maxseqlen_wrapper",
++    op_func=flash_attn_maxseqlen_wrapper,
++    fake_impl=flash_attn_maxseqlen_wrapper_fake,
++    mutates_args=[],
++)
++
++
++def vit_flash_attn_wrapper(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    cu_seqlens: torch.Tensor,
++    max_seqlen: torch.Tensor,
++    batch_size: int,
++    is_rocm_aiter: bool,
++    use_upstream_fa: bool,
++) -> torch.Tensor:
++    return torch.ops.vllm.flash_attn_maxseqlen_wrapper(
++        q, k, v, cu_seqlens, max_seqlen, batch_size, is_rocm_aiter, use_upstream_fa
++    )
++
++
++# TODO: Once we have a torch 2.10, we can use tensor slices
++# so we won't need to wrap this in custom ops
++def torch_sdpa_wrapper(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    cu_seqlens: torch.Tensor,
++) -> torch.Tensor:
++    outputs = []
++    for i in range(1, len(cu_seqlens)):
++        start_idx = cu_seqlens[i - 1]
++        end_idx = cu_seqlens[i]
++        q_i = q[:, start_idx:end_idx]
++        k_i = k[:, start_idx:end_idx]
++        v_i = v[:, start_idx:end_idx]
++        q_i, k_i, v_i = (
++            einops.rearrange(x, "b s h d -> b h s d") for x in [q_i, k_i, v_i]
++        )
++        output_i = F.scaled_dot_product_attention(q_i, k_i, v_i, dropout_p=0.0)
++        output_i = einops.rearrange(output_i, "b h s d -> b s h d ")
++        outputs.append(output_i)
++    context_layer = torch.cat(outputs, dim=1)
++    context_layer = einops.rearrange(context_layer, "b s h d -> s b (h d)").contiguous()
++    return context_layer
++
++
++def torch_sdpa_wrapper_fake(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    cu_seqlens: torch.Tensor,
++) -> torch.Tensor:
++    b, s, h, d = q.shape
++    return torch.empty((s, b, h * d), dtype=q.dtype, device=q.device)
++
++
++direct_register_custom_op(
++    op_name="torch_sdpa_wrapper",
++    op_func=torch_sdpa_wrapper,
++    fake_impl=torch_sdpa_wrapper_fake,
++    mutates_args=[],
++)
++
++
++def vit_torch_sdpa_wrapper(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    cu_seqlens: torch.Tensor,
++) -> torch.Tensor:
++    return torch.ops.vllm.torch_sdpa_wrapper(q, k, v, cu_seqlens)
+\ No newline at end of file
 diff --git a/vllm/benchmarks/serve.py b/vllm/benchmarks/serve.py
 index a98eb2a78..14095ca4d 100644
 --- a/vllm/benchmarks/serve.py
@@ -10167,10 +10417,10 @@ index f935bdd84..ba177b181 100644
 +        return hidden_states
 diff --git a/vllm/model_executor/layers/quantization/sym_int4.py b/vllm/model_executor/layers/quantization/sym_int4.py
 new file mode 100644
-index 000000000..ff99bd763
+index 000000000..35cc6b8dc
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/sym_int4.py
-@@ -0,0 +1,399 @@
+@@ -0,0 +1,418 @@
 +# SPDX-License-Identifier: Apache-2.0
 +
 +from typing import Any, Dict, List, Optional, Tuple, Callable, Union
@@ -10182,6 +10432,7 @@ index 000000000..ff99bd763
 +                                           ModelWeightParameter,
 +                                           PerTensorScaleParameter)
 +
++from vllm.distributed import get_tensor_model_parallel_world_size
 +from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 +from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
 +from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
@@ -10189,6 +10440,7 @@ index 000000000..ff99bd763
 +import torch
 +from torch.nn import Module
 +from torch.nn.parameter import Parameter
++from vllm.utils import round_up
 +
 +from vllm.envs import VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT, VLLM_QUANTIZE_Q40_LIB
 +import ctypes
@@ -10427,6 +10679,7 @@ index 000000000..ff99bd763
 +    ) -> None:
 +        super().__init__(moe)
 +        self.quant_config = quant_config
++        self.moe_config = moe
 +        # Ensure lib is loaded
 +        _get_quant_lib()
 +
@@ -10439,7 +10692,23 @@ index 000000000..ff99bd763
 +        layer.num_experts = num_experts
 +        layer.orig_dtype = params_dtype
 +        layer.weight_block_size = None
-+
++        tp_size = get_tensor_model_parallel_world_size()
++        if tp_size == 4:
++            intermediate_size_per_partition = round_up(intermediate_size_per_partition, 256)
++        elif tp_size == 8:
++            if self.moe_config.hidden_dim == 2048:
++                # For qwen3-30b-a3b
++                intermediate_size_per_partition = round_up(intermediate_size_per_partition, 128)
++            elif self.moe_config.hidden_dim == 4096:
++                # For qwen3-235b-a22b
++                intermediate_size_per_partition = round_up(intermediate_size_per_partition, 256)
++            else:
++                raise ValueError("Unsupported hidden_dim")
++        elif tp_size == 16:
++            # For qwen3-235b
++            assert self.moe_config.hidden_dim == 4096, f"Currently TP_SIZE=16 only supports qwen3-235b-a22b"
++            intermediate_size_per_partition = round_up(intermediate_size_per_partition, 128)
++        layer.d_ff = intermediate_size_per_partition
 +        # w13 shape: [d_ff * 2, d_model]
 +        w13_weight = torch.nn.Parameter(torch.empty(
 +            num_experts,
@@ -10466,7 +10735,7 @@ index 000000000..ff99bd763
 +        import intel_extension_for_pytorch as ipex
 +        E = layer.num_experts
 +        d_model = layer.hidden_size
-+        d_ff = layer.intermediate_size_per_partition
++        d_ff = layer.d_ff
 +
 +        assert d_model % QK4_PACK_FACTOR == 0 and d_ff % QK4_PACK_FACTOR == 0, "INT4 packing requires feature dims % 8 == 0"
 +        assert d_model % QK4_GROUP_SIZE == 0 and d_ff % QK4_GROUP_SIZE == 0, f"group_size={QK4_GROUP_SIZE} requires dims % {QK4_GROUP_SIZE} == 0"
@@ -10572,15 +10841,16 @@ index 000000000..ff99bd763
 +        return res
 \ No newline at end of file
 diff --git a/vllm/model_executor/layers/rotary_embedding/__init__.py b/vllm/model_executor/layers/rotary_embedding/__init__.py
-index 564f9a5c0..c9653aa9e 100644
+index 564f9a5c0..4878f8769 100644
 --- a/vllm/model_executor/layers/rotary_embedding/__init__.py
 +++ b/vllm/model_executor/layers/rotary_embedding/__init__.py
-@@ -103,6 +103,8 @@ def get_rope(
+@@ -103,6 +103,9 @@ def get_rope(
                      is_neox_style,
                      dtype,
                      mrope_section=rope_scaling["mrope_section"],
 +                    mrope_interleaved=rope_scaling.get("mrope_interleaved",
 +                                                       False),
++                    model_type=rope_scaling["model_type"] if "model_type" in rope_scaling else None,
                  )
              else:
                  rotary_emb = RotaryEmbedding(
@@ -10617,7 +10887,7 @@ index 37ead43e2..4c1776900 100644
 +    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
 +        return self.forward_native(query, key)
 diff --git a/vllm/model_executor/layers/rotary_embedding/mrope.py b/vllm/model_executor/layers/rotary_embedding/mrope.py
-index 0acb5ea74..7bdcdf99c 100644
+index 0acb5ea74..a7eecdf62 100644
 --- a/vllm/model_executor/layers/rotary_embedding/mrope.py
 +++ b/vllm/model_executor/layers/rotary_embedding/mrope.py
 @@ -177,6 +177,18 @@ def triton_mrope(
@@ -10639,29 +10909,30 @@ index 0acb5ea74..7bdcdf99c 100644
  class MRotaryEmbedding(RotaryEmbedding):
      """Rotary Embedding with Multimodal Sections."""
  
-@@ -189,6 +201,7 @@ class MRotaryEmbedding(RotaryEmbedding):
+@@ -189,6 +201,8 @@ class MRotaryEmbedding(RotaryEmbedding):
          is_neox_style: bool,
          dtype: torch.dtype,
          mrope_section: Optional[list[int]] = None,
 +        mrope_interleaved: Optional[bool] = False,
++        model_type: Optional[str] = None,
      ) -> None:
          # In Qwen2.5-VL, the maximum index value is related to the duration of
          # the input video. We enlarge max_position_embeddings to 4 times to get
-@@ -198,6 +211,7 @@ class MRotaryEmbedding(RotaryEmbedding):
+@@ -198,6 +212,8 @@ class MRotaryEmbedding(RotaryEmbedding):
                           base, is_neox_style, dtype)
  
          self.mrope_section = mrope_section
 +        self.mrope_interleaved = mrope_interleaved
++        self.model_type = model_type
          if self.mrope_section:
              assert sum(self.mrope_section) == rotary_dim // 2
  
-@@ -220,22 +234,28 @@ class MRotaryEmbedding(RotaryEmbedding):
+@@ -219,23 +235,26 @@ class MRotaryEmbedding(RotaryEmbedding):
+         """
          assert positions.ndim == 1 or positions.ndim == 2
          assert key is not None
- 
-+        return self.forward_xpu(positions, query, key)
+-
 +        
-+
          num_tokens = positions.shape[-1]
          cos_sin = self.cos_sin_cache[positions]
          cos, sin = cos_sin.chunk(2, dim=-1)
@@ -10695,7 +10966,7 @@ index 0acb5ea74..7bdcdf99c 100644
  
          query_shape = query.shape
          query = query.view(num_tokens, -1, self.head_size)
-@@ -265,6 +285,10 @@ class MRotaryEmbedding(RotaryEmbedding):
+@@ -265,6 +284,10 @@ class MRotaryEmbedding(RotaryEmbedding):
          assert positions.ndim == 1 or positions.ndim == 2
          assert key is not None
  
@@ -10706,23 +10977,26 @@ index 0acb5ea74..7bdcdf99c 100644
          num_tokens = positions.shape[-1]
          cos_sin = self.cos_sin_cache[positions]
          cos, sin = cos_sin.chunk(2, dim=-1)
-@@ -300,6 +324,15 @@ class MRotaryEmbedding(RotaryEmbedding):
+@@ -300,6 +323,18 @@ class MRotaryEmbedding(RotaryEmbedding):
          key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
          return query, key
  
-+    # def forward_xpu(
-+    #     self,
-+    #     positions: torch.Tensor,
-+    #     query: torch.Tensor,
-+    #     key: Optional[torch.Tensor] = None,
-+    #     offsets: Optional[torch.Tensor] = None,
-+    # ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-+    #     return self.forward_native(positions, query, key, offsets)
++    def forward_xpu(
++        self,
++        positions: torch.Tensor,
++        query: torch.Tensor,
++        key: Optional[torch.Tensor] = None,
++        offsets: Optional[torch.Tensor] = None,
++    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
++        if self.model_type is not None and self.mrope_section == [16, 24, 24]:
++            return super().forward_xpu(positions, query, key)
++        else:
++            return self.forward_native(positions, query, key, offsets)
 +
      @classmethod
      def get_input_positions(
          cls,
-@@ -370,6 +403,15 @@ class MRotaryEmbedding(RotaryEmbedding):
+@@ -370,6 +405,15 @@ class MRotaryEmbedding(RotaryEmbedding):
                  context_len=context_len,
                  seq_len=seq_len,
              )
@@ -10738,7 +11012,7 @@ index 0acb5ea74..7bdcdf99c 100644
          elif hf_config.model_type in ["ernie4_5_moe_vl", "ernie4_5_vl"]:
              return cls._ernie_get_input_positions_tensor(
                  input_tokens=input_tokens,
-@@ -508,6 +550,98 @@ class MRotaryEmbedding(RotaryEmbedding):
+@@ -508,6 +552,98 @@ class MRotaryEmbedding(RotaryEmbedding):
                                  len(input_tokens)).item()
          return llm_positions, mrope_position_delta
  
@@ -10837,7 +11111,7 @@ index 0acb5ea74..7bdcdf99c 100644
      @classmethod
      def _ernie_get_input_positions_tensor(
          cls,
-@@ -715,15 +849,23 @@ class MRotaryEmbedding(RotaryEmbedding):
+@@ -715,15 +851,23 @@ class MRotaryEmbedding(RotaryEmbedding):
              st_idx = llm_pos_ids_list[-1].max() + 1 if len(
                  llm_pos_ids_list) > 0 else 0
              llm_pos_ids_list.append(
@@ -10870,7 +11144,7 @@ index 0acb5ea74..7bdcdf99c 100644
              llm_pos_ids_list.append(
                  torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
              st = ed + llm_grid_t * llm_grid_h * llm_grid_w
-@@ -772,7 +914,6 @@ class MRotaryEmbedding(RotaryEmbedding):
+@@ -772,7 +916,6 @@ class MRotaryEmbedding(RotaryEmbedding):
  
          st = 0
          remain_images, remain_videos = image_nums, video_nums
@@ -10878,7 +11152,7 @@ index 0acb5ea74..7bdcdf99c 100644
          image_index, video_index = 0, 0
          for _ in range(image_nums + video_nums):
              video_second_per_grid_t = 0.0
-@@ -819,16 +960,25 @@ class MRotaryEmbedding(RotaryEmbedding):
+@@ -819,16 +962,25 @@ class MRotaryEmbedding(RotaryEmbedding):
              st_idx = llm_pos_ids_list[-1].max() + 1 if len(
                  llm_pos_ids_list) > 0 else 0
              llm_pos_ids_list.append(
@@ -10914,7 +11188,7 @@ index 0acb5ea74..7bdcdf99c 100644
              llm_pos_ids_list.append(
                  torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
              st = ed + llm_grid_t * llm_grid_h * llm_grid_w
-@@ -847,6 +997,339 @@ class MRotaryEmbedding(RotaryEmbedding):
+@@ -847,6 +999,339 @@ class MRotaryEmbedding(RotaryEmbedding):
  
          return llm_positions, mrope_position_delta
  
@@ -11254,7 +11528,7 @@ index 0acb5ea74..7bdcdf99c 100644
      @classmethod
      def _omni_get_input_positions_tensor(
          cls,
-@@ -879,7 +1362,38 @@ class MRotaryEmbedding(RotaryEmbedding):
+@@ -879,7 +1364,38 @@ class MRotaryEmbedding(RotaryEmbedding):
          # TODO(fyabc): refactor and share more code with
          #  _vl_get_input_positions_tensor.
  
@@ -11293,7 +11567,7 @@ index 0acb5ea74..7bdcdf99c 100644
          audio_token_id = thinker_config.audio_token_index
          image_token_id = thinker_config.image_token_index
          video_token_id = thinker_config.video_token_index
-@@ -892,11 +1406,6 @@ class MRotaryEmbedding(RotaryEmbedding):
+@@ -892,11 +1408,6 @@ class MRotaryEmbedding(RotaryEmbedding):
          tokens_per_second = getattr(thinker_config.vision_config,
                                      "tokens_per_second", 25)
  
@@ -11305,7 +11579,7 @@ index 0acb5ea74..7bdcdf99c 100644
          src_item = input_tokens
          audio_seqlens = audio_feature_lengths
          if not second_per_grid_ts:
-@@ -940,7 +1449,7 @@ class MRotaryEmbedding(RotaryEmbedding):
+@@ -940,7 +1451,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                  grid_t = image_grid_thw[image_idx][0]
                  grid_hs = image_grid_thw[:, 1]
                  grid_ws = image_grid_thw[:, 2]
@@ -11314,7 +11588,7 @@ index 0acb5ea74..7bdcdf99c 100644
                  llm_pos_ids = cls._get_llm_pos_ids_for_vision(
                      start_idx, image_idx, spatial_merge_size, t_index, grid_hs,
                      grid_ws)
-@@ -953,9 +1462,11 @@ class MRotaryEmbedding(RotaryEmbedding):
+@@ -953,9 +1464,11 @@ class MRotaryEmbedding(RotaryEmbedding):
                  grid_t = video_grid_thw[video_idx][0]
                  grid_hs = video_grid_thw[:, 1]
                  grid_ws = video_grid_thw[:, 2]
@@ -11329,7 +11603,7 @@ index 0acb5ea74..7bdcdf99c 100644
                  llm_pos_ids = cls._get_llm_pos_ids_for_vision(
                      start_idx, video_idx, spatial_merge_size, t_index, grid_hs,
                      grid_ws)
-@@ -976,9 +1487,11 @@ class MRotaryEmbedding(RotaryEmbedding):
+@@ -976,9 +1489,11 @@ class MRotaryEmbedding(RotaryEmbedding):
                  grid_hs = video_grid_thw[:, 1]
                  grid_ws = video_grid_thw[:, 2]
                  t_ntoken_per_chunk = int(tokens_per_second * seconds_per_chunk)
@@ -11344,7 +11618,7 @@ index 0acb5ea74..7bdcdf99c 100644
                  t_index_split_chunk = cls._split_list_into_ranges(
                      t_index, t_ntoken_per_chunk)
                  place_num = (((audio_seqlen - 1) // 2 + 1 - 2) // 2 + 1) + 2
-@@ -1117,10 +1630,8 @@ class MRotaryEmbedding(RotaryEmbedding):
+@@ -1117,10 +1632,8 @@ class MRotaryEmbedding(RotaryEmbedding):
          grid_h = video_grid_thw[1]
          grid_w = video_grid_thw[2]
          t_ntoken_per_chunk = int(tokens_per_second * seconds_per_chunk)
@@ -12374,6 +12648,34 @@ index 000000000..f24cb6d52
 +                                                   torch.Tensor]]) -> set[str]:
 +        loader = AutoWeightsLoader(self)
 +        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+diff --git a/vllm/model_executor/models/ernie45.py b/vllm/model_executor/models/ernie45.py
+index e7302dc5e..b60944024 100644
+--- a/vllm/model_executor/models/ernie45.py
++++ b/vllm/model_executor/models/ernie45.py
+@@ -22,12 +22,23 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ """Inference-only Erine model compatible with HuggingFace weights."""
++
++from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import VllmConfig
+ from vllm.model_executor.models.llama import LlamaForCausalLM
+ 
+ from .utils import PPMissingLayer
+ 
+ 
++@support_torch_compile(
++    # set dynamic_arg_dims to support mrope
++    dynamic_arg_dims={
++        "input_ids": 0,
++        "positions": -1,
++        "intermediate_tensors": 0,
++        "inputs_embeds": 0,
++    }
++)
+ class Ernie4_5ForCausalLM(LlamaForCausalLM):
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
 diff --git a/vllm/model_executor/models/ernie45_vl.py b/vllm/model_executor/models/ernie45_vl.py
 index 97aace5a2..377713e80 100644
 --- a/vllm/model_executor/models/ernie45_vl.py
@@ -12706,6 +13008,32 @@ index 76737a442..4c337f4f1 100644
  
      def forward(
          self,
+diff --git a/vllm/model_executor/models/intern_vit.py b/vllm/model_executor/models/intern_vit.py
+index 8e9ab9649..0af805004 100644
+--- a/vllm/model_executor/models/intern_vit.py
++++ b/vllm/model_executor/models/intern_vit.py
+@@ -16,7 +16,7 @@ import torch.nn as nn
+ import torch.nn.functional as F
+ from transformers import PretrainedConfig
+ 
+-from vllm.attention.layer import MultiHeadAttention
++from vllm.attention.layer import MultiHeadAttention, SelfMultiHeadAttention
+ from vllm.distributed import (divide, get_tensor_model_parallel_rank,
+                               get_tensor_model_parallel_world_size,
+                               split_tensor_along_last_dim,
+@@ -185,8 +185,10 @@ class InternParallelAttention(nn.Module):
+             prefix=f"{prefix}.proj",
+         )
+ 
+-        self.attn = MultiHeadAttention(self.num_heads_per_partition,
+-                                       self.head_dim, self.scale)
++        # self.attn = MultiHeadAttention(self.num_heads_per_partition,
++        #                                self.head_dim, self.scale)
++        self.attn = SelfMultiHeadAttention(self.num_heads_per_partition, self.head_dim,
++                                       self.scale)
+ 
+     def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor):
+         if self.tp_size > 1:
 diff --git a/vllm/model_executor/models/keye.py b/vllm/model_executor/models/keye.py
 index 710b805ac..04824db1b 100644
 --- a/vllm/model_executor/models/keye.py
@@ -12761,6 +13089,1452 @@ index f8ea2111f..866b203a7 100644
          self.vocab_size = config.vocab_size + lora_vocab
          self.org_vocab_size = config.vocab_size
          if get_pp_group().is_first_rank or (config.tie_word_embeddings
+diff --git a/vllm/model_executor/models/paddleocr_vl.py b/vllm/model_executor/models/paddleocr_vl.py
+new file mode 100644
+index 000000000..e3b368a2d
+--- /dev/null
++++ b/vllm/model_executor/models/paddleocr_vl.py
+@@ -0,0 +1,1440 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Copyright (c) 2025 PaddlePaddle Authors. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import math
++from collections.abc import Iterable, Mapping, Sequence
++from functools import partial
++from typing import Annotated, Literal, Optional
++
++import numpy as np
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from einops import rearrange, repeat
++from transformers import BatchFeature, PretrainedConfig
++from transformers.activations import GELUActivation
++from transformers.modeling_outputs import (
++    BaseModelOutputWithPooling,
++)
++from transformers.utils import torch_int
++from vllm.model_executor.sampling_metadata import SamplingMetadata
++from vllm.platforms import _Backend, current_platform
++from vllm.attention.layer import (
++    check_upstream_fa_availability,
++    #maybe_get_vit_flash_attn_backend,
++)
++from vllm.attention.utils.fa_utils import flash_attn_varlen_func
++from vllm.attention.ops.vit_attn_wrappers import (
++    vit_flash_attn_wrapper,
++    vit_xformers_attn_wrapper,
++)
++from vllm.config import VllmConfig
++#from vllm.config.multimodal import BaseDummyOptions
++from vllm.distributed import parallel_state
++from vllm.distributed import utils as dist_utils
++from vllm.model_executor.layers.activation import get_act_fn
++from vllm.model_executor.layers.linear import (
++    ColumnParallelLinear,
++    QKVParallelLinear,
++    RowParallelLinear,
++)
++from vllm.model_executor.layers.quantization import QuantizationConfig
++# from vllm.model_executor.layers.rotary_embedding.common import (
++#     dispatch_rotary_emb_function,
++# )
++from vllm.model_executor.model_loader.weight_utils import (
++    default_weight_loader,
++    maybe_remap_kv_scale_name,
++)
++from vllm.multimodal import MULTIMODAL_REGISTRY
++from vllm.multimodal.inputs import (
++    MultiModalDataDict,
++    MultiModalFieldConfig,
++    MultiModalKwargs,
++)
++from vllm.multimodal.parse import (
++    ImageProcessorItems,
++    ImageSize,
++    MultiModalDataItems,
++)
++from vllm.multimodal.processing import (
++    BaseMultiModalProcessor,
++    BaseProcessingInfo,
++    PromptReplacement,
++    PromptUpdate,
++)
++from vllm.multimodal.profiling import BaseDummyInputsBuilder
++from vllm.sequence import IntermediateTensors
++from vllm.utils.tensor_schema import TensorSchema, TensorShape
++
++from .ernie45 import Ernie4_5ForCausalLM
++# from .interfaces import MultiModalEmbeddings, SupportsMRoPE, SupportsMultiModal
++from .interfaces import MultiModalEmbeddings, SupportsMultiModal
++
++from .utils import (
++    AutoWeightsLoader,
++    PPMissingLayer,
++    WeightsMapper,
++    is_pp_missing_parameter,
++    maybe_prefix,
++    merge_multimodal_embeddings,
++)
++from .vision import get_vit_attn_backend
++
++
++def smart_resize(
++    height: int,
++    width: int,
++    factor: int = 28,
++    min_pixels: int = 28 * 28 * 130,
++    max_pixels: int = 28 * 28 * 1280,
++):
++    """Rescales the image so that the following conditions are met:
++
++    1. Both dimensions (height and width) are divisible by 'factor'.
++
++    2. The total number of pixels is within the range ['min_pixels', 'max_pixels'].
++
++    3. The aspect ratio of the image is maintained as closely as possible.
++
++    """
++
++    if height < factor:
++        width = round((width * factor) / height)
++        height = factor
++
++    if width < factor:
++        height = round((height * factor) / width)
++        width = factor
++
++    if max(height, width) / min(height, width) > 200:
++        raise ValueError(
++            f"absolute aspect ratio must be smaller than 200, "
++            f"got {max(height, width) / min(height, width)}"
++        )
++    h_bar = round(height / factor) * factor
++    w_bar = round(width / factor) * factor
++    if h_bar * w_bar > max_pixels:
++        beta = math.sqrt((height * width) / max_pixels)
++        h_bar = math.floor(height / beta / factor) * factor
++        w_bar = math.floor(width / beta / factor) * factor
++    elif h_bar * w_bar < min_pixels:
++        beta = math.sqrt(min_pixels / (height * width))
++        h_bar = math.ceil(height * beta / factor) * factor
++        w_bar = math.ceil(width * beta / factor) * factor
++    return h_bar, w_bar
++
++
++def rotate_half(x: torch.Tensor, interleaved: bool = False) -> torch.Tensor:
++    if not interleaved:
++        x1, x2 = x.chunk(2, dim=-1)
++        return torch.cat((-x2, x1), dim=-1)
++    x1, x2 = x[..., ::2], x[..., 1::2]
++    return rearrange(torch.stack((-x2, x1), dim=-1), "... d two -> ... (d two)", two=2)
++
++
++def apply_rotary_emb_torch(
++    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
++) -> torch.Tensor:
++    """
++    x: (batch_size, seqlen, nheads, headdim)
++    cos, sin: (seqlen, rotary_dim / 2) or (batch_size, seqlen, rotary_dim / 2)
++    """
++    ro_dim = cos.shape[-1] * 2
++    assert ro_dim <= x.shape[-1]
++    cos = repeat(
++        cos, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)"
++    )
++    sin = repeat(
++        sin, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)"
++    )
++    return torch.cat(
++        [
++            x[..., :ro_dim] * cos + rotate_half(x[..., :ro_dim], interleaved) * sin,
++            x[..., ro_dim:],
++        ],
++        dim=-1,
++    )
++
++
++def apply_rotary_pos_emb_vision(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
++    # rotary_emb_function = dispatch_rotary_emb_function(default=apply_rotary_emb_torch)
++    rotary_emb_function = apply_rotary_emb_torch
++    t_ = t.float()
++    cos = freqs.cos()
++    sin = freqs.sin()
++    output = rotary_emb_function(t_, cos, sin).type_as(t)
++    return output
++
++
++class PaddleOCRVLProcessingInfo(BaseProcessingInfo):
++    def get_hf_config(self):
++        return self.ctx.get_hf_config()
++
++    def get_hf_processor(self, **kwargs: object):
++        return self.ctx.get_hf_processor(**kwargs)
++
++    def get_image_processor(self, **kwargs: object):
++        return self.get_hf_processor(**kwargs).image_processor
++
++    def get_supported_mm_limits(self):
++        return {"image": None}
++
++    def get_num_image_tokens(
++        self,
++        *,
++        image_width: int,
++        image_height: int,
++        image_processor,
++    ) -> int:
++        if image_processor is None:
++            image_processor = self.get_image_processor()
++
++        do_resize = True
++        hf_config = self.get_hf_config()
++        vision_config = hf_config.vision_config
++        patch_size = vision_config.patch_size
++        merge_size = vision_config.spatial_merge_size
++
++        if do_resize:
++            resized_height, resized_width = smart_resize(
++                height=image_height,
++                width=image_width,
++                factor=patch_size * merge_size,
++                min_pixels=image_processor.min_pixels,
++                max_pixels=image_processor.max_pixels,
++            )
++            preprocessed_size = ImageSize(width=resized_width, height=resized_height)
++        else:
++            preprocessed_size = ImageSize(width=image_width, height=image_height)
++
++        grid_t = 1
++        grid_h = preprocessed_size.height // patch_size
++        grid_w = preprocessed_size.width // patch_size
++
++        num_patches = grid_t * grid_h * grid_w
++        num_image_tokens = num_patches // (merge_size**2)
++
++        return num_image_tokens
++
++    def get_image_size_with_most_features(self) -> ImageSize:
++        hf_config = self.get_hf_config()
++        image_size = hf_config.vision_config.image_size
++        return ImageSize(height=image_size, width=image_size)
++
++
++class PaddleOCRVLDummyInputsBuilder(BaseDummyInputsBuilder[PaddleOCRVLProcessingInfo]):
++    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
++        num_images = mm_counts.get("image", 0)
++
++        processor = self.info.get_hf_processor()
++        image_token = processor.image_token
++
++        return image_token * num_images
++
++    def get_dummy_mm_data(
++        self,
++        seq_len: int,
++        mm_counts: Mapping[str, int],
++        #mm_options: Mapping[str, BaseDummyOptions] | None = None,
++    ) -> MultiModalDataDict:
++        num_images = mm_counts.get("image", 0)
++
++        max_image_size = self.info.get_image_size_with_most_features()
++        #image_overrides = mm_options.get("image") if mm_options else None
++
++        return {
++            "image": self._get_dummy_images(
++                width=max_image_size.width,
++                height=max_image_size.height,
++                num_images=num_images,
++                #overrides=image_overrides,
++            )
++        }
++
++
++class PaddleOCRVLMultiModalProcessor(
++    BaseMultiModalProcessor[PaddleOCRVLProcessingInfo]
++):
++    def _call_hf_processor(
++        self,
++        prompt: str,
++        mm_data: Mapping[str, object],
++        mm_kwargs: Mapping[str, object],
++        tok_kwargs: Mapping[str, object],
++    ) -> BatchFeature:
++        if mm_data:
++            processed_outputs = self.info.ctx.call_hf_processor(
++                self.info.get_hf_processor(**mm_kwargs),
++                dict(text=prompt, **mm_data),
++                dict(**mm_kwargs, **tok_kwargs),
++            )
++            num_patches_per_image = processed_outputs["image_grid_thw"].prod(-1)
++            processed_outputs["pixel_values"] = processed_outputs["pixel_values"].split(
++                num_patches_per_image.tolist()
++            )
++        else:
++            tokenizer = self.info.get_tokenizer()
++            processed_outputs = tokenizer(
++                prompt, add_special_tokens=True, return_tensors="pt"
++            )
++        return processed_outputs
++
++    def _get_mm_fields_config(
++        self,
++        hf_inputs: BatchFeature,
++        hf_processor_mm_kwargs: Mapping[str, object],
++    ) -> Mapping[str, MultiModalFieldConfig]:
++        return dict(
++            pixel_values=MultiModalFieldConfig.batched("image"),
++            image_grid_thw=MultiModalFieldConfig.batched("image"),
++        )
++
++    def _get_prompt_updates(
++        self,
++        mm_items: MultiModalDataItems,
++        hf_processor_mm_kwargs: Mapping[str, object],
++        out_mm_kwargs: MultiModalKwargs,
++    ) -> Sequence[PromptUpdate]:
++        image_processor = self.info.get_image_processor(**hf_processor_mm_kwargs)
++        hf_config = self.info.get_hf_config()
++        image_token_id = hf_config.image_token_id
++
++        def get_replacement(item_idx: int, image_processor):
++            images = mm_items.get_items("image", ImageProcessorItems)
++
++            image_size = images.get_image_size(item_idx)
++            num_image_tokens = self.info.get_num_image_tokens(
++                image_width=image_size.width,
++                image_height=image_size.height,
++                image_processor=image_processor,
++            )
++
++            return [image_token_id] * num_image_tokens
++
++        return [
++            PromptReplacement(
++                modality="image",
++                target=[image_token_id],
++                replacement=partial(get_replacement, image_processor=image_processor),
++            ),
++        ]
++
++
++class Projector(nn.Module):
++    def __init__(
++        self,
++        text_config: PretrainedConfig,
++        vision_config: PretrainedConfig,
++        prefix: str = "",
++    ):
++        super().__init__()
++        self.text_config = text_config
++        self.vision_config = vision_config
++        self.merge_kernel_size = (2, 2)
++
++        self.hidden_size = (
++            self.vision_config.hidden_size
++            * self.merge_kernel_size[0]
++            * self.merge_kernel_size[1]
++        )
++
++        self.pre_norm = torch.nn.LayerNorm(self.vision_config.hidden_size, eps=1e-05)
++        self.linear_1 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
++        self.act = GELUActivation()
++        self.linear_2 = nn.Linear(
++            self.hidden_size, self.text_config.hidden_size, bias=True
++        )
++
++    def forward(
++        self,
++        image_features: torch.Tensor,
++        image_grid_thw: torch.Tensor,
++    ) -> torch.Tensor:
++        m1, m2 = self.merge_kernel_size
++        if isinstance(image_features, (list, tuple)):
++            processed_features = list()
++            for image_feature, image_grid in zip(image_features, image_grid_thw):
++                image_feature = self.pre_norm(image_feature)
++                t, h, w = image_grid
++
++                image_feature = rearrange(
++                    image_feature,
++                    "(t h p1 w p2) d -> (t h w) (p1 p2 d)",
++                    t=t,
++                    h=h // m1,
++                    p1=m1,
++                    w=w // m2,
++                    p2=m2,
++                )
++                hidden_states = self.linear_1(image_feature)
++                hidden_states = self.act(hidden_states)
++                hidden_states = self.linear_2(hidden_states)
++                processed_features.append(hidden_states)
++
++            return processed_features
++
++        dims = image_features.shape[:-1]
++        dim = image_features.shape[-1]
++        image_features = image_features.view(np.prod(dims), dim)
++        hidden_states = self.pre_norm(image_features).view(-1, self.hidden_size)
++        hidden_states = self.linear_1(hidden_states)
++        hidden_states = self.act(hidden_states)
++        hidden_states = self.linear_2(hidden_states)
++
++        return hidden_states.view(*dims, -1)
++
++
++class PaddleOCRImagePixelInputs(TensorSchema):
++    type: Literal["pixel_values"]
++    pixel_values: Annotated[
++        torch.Tensor,
++        TensorShape("bn", "p", 3, "patch_size", "patch_size", dynamic_dims={"p"}),
++    ]
++    image_grid_thw: Annotated[
++        torch.Tensor,
++        TensorShape("bn", 3),
++    ]
++
++
++class SiglipVisionEmbeddings(nn.Module):
++    def __init__(self, config: PretrainedConfig):
++        super().__init__()
++        self.config = config
++        self.embed_dim = config.hidden_size
++        self.image_size = config.image_size
++        self.patch_size = config.patch_size
++
++        self.patch_embedding = nn.Conv2d(
++            in_channels=config.num_channels,
++            out_channels=self.embed_dim,
++            kernel_size=self.patch_size,
++            stride=self.patch_size,
++            padding="valid",
++        )
++
++        self.num_patches = (self.image_size // self.patch_size) ** 2
++        self.num_positions = self.num_patches
++        self.cache_position_embedding = dict()
++        self.cache_position_count = dict()
++        self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
++        self.packing_position_embedding = nn.Embedding(32768, self.embed_dim)
++
++        self.register_buffer(
++            "position_ids",
++            torch.arange(self.num_positions).expand((1, -1)),
++            persistent=False,
++        )
++
++    def interpolate_pos_encoding(
++        self,
++        embeddings: torch.Tensor,
++        height: int,
++        width: int,
++        is_after_patchify: bool = False,
++    ) -> torch.Tensor:
++        num_positions = self.position_embedding.weight.shape[0]
++
++        patch_pos_embed = self.position_embedding.weight.unsqueeze(0)
++
++        dim = embeddings.shape[-1]
++
++        if is_after_patchify:
++            new_height = height
++            new_width = width
++        else:
++            new_height = height // self.patch_size
++            new_width = width // self.patch_size
++
++        sqrt_num_positions = torch_int(num_positions**0.5)
++        patch_pos_embed = patch_pos_embed.reshape(
++            1, sqrt_num_positions, sqrt_num_positions, dim
++        )
++        patch_pos_embed = patch_pos_embed.permute(0, 3, 1, 2)
++
++        patch_pos_embed = nn.functional.interpolate(
++            patch_pos_embed,
++            size=(new_height, new_width),
++            mode="bilinear",
++            align_corners=False,
++        )
++
++        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
++        return patch_pos_embed
++
++    def fetch_position_embedding_lfu_cache(
++        self, embeddings: torch.Tensor, h: int, w: int, max_cache: int = 20
++    ):
++        grid = (h, w)
++        if grid in self.cache_position_embedding:
++            self.cache_position_count[grid] += 1
++            return self.cache_position_embedding[grid]
++
++        if len(self.cache_position_embedding) >= max_cache:
++            min_hit_grid = min(
++                self.cache_position_count,
++                key=self.cache_position_count.get,
++            )
++            self.cache_position_count.pop(min_hit_grid)
++            self.cache_position_embedding.pop(min_hit_grid)
++
++        position_embedding = self.interpolate_pos_encoding(embeddings, h, w, True)
++        self.cache_position_count[grid] = 1
++        self.cache_position_embedding[grid] = position_embedding
++        return position_embedding
++
++    def forward(
++        self,
++        pixel_values: torch.FloatTensor,
++        position_ids: torch.Tensor | None = None,
++        image_grid_thw: list[tuple[int, int, int] | list[tuple[int, int, int]]]
++        | None = None,
++        interpolate_pos_encoding=False,
++    ) -> torch.Tensor:
++        if pixel_values.dim() == 4:
++            pixel_values = pixel_values.unsqueeze(0)
++        if pixel_values.dim() == 5:
++            if position_ids is None:
++                raise ValueError(
++                    "position_ids cannot be None when pixel_values.dim() is 5."
++                )
++            (
++                batch_size,
++                squence_len,
++                channel,
++                height,
++                width,
++            ) = pixel_values.shape
++            target_dtype = self.patch_embedding.weight.dtype
++            pixel_values = rearrange(pixel_values, "b l c h w -> (b l) c h w")
++            patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))
++            embeddings = patch_embeds.flatten(-2).squeeze(-1)
++
++            if interpolate_pos_encoding and image_grid_thw is not None:
++                start = 0
++                tmp_embeddings = list()
++                for image_grid in image_grid_thw:
++                    t, h, w = image_grid
++                    end = start + t * h * w
++                    image_embeddings = embeddings[start:end, :]
++                    position_embedding = (
++                        self.interpolate_pos_encoding(image_embeddings, h, w, True)
++                        .squeeze(0)
++                        .repeat(t, 1)
++                    )
++                    image_embeddings = image_embeddings + position_embedding
++                    tmp_embeddings.append(image_embeddings)
++                    start = end
++                embeddings = torch.concat(tmp_embeddings, dim=0).unsqueeze(0)
++            else:
++                embeddings = embeddings + self.packing_position_embedding(position_ids)
++            return embeddings
++        else:
++            raise ValueError(
++                "Unsupported pixel_values dimension:"
++                f" {pixel_values.dim()}. Expected 4 or 5."
++            )
++
++
++def all_gather_interleave(local_tensor: torch.Tensor, hidden_size: int, tp_size: int):
++    """All-gather the input tensor interleavely across model parallel group."""
++    import torch.distributed as dist
++
++    gathered_tensors = [torch.zeros_like(local_tensor) for _ in range(tp_size)]
++    dist.all_gather(
++        gathered_tensors, local_tensor, group=parallel_state.get_tp_group().device_group
++    )
++
++    gathered_tensors_split = [
++        torch.split(tensor, hidden_size // tp_size, -1) for tensor in gathered_tensors
++    ]
++    ordered_tensors = [
++        tensor for pair in zip(*gathered_tensors_split) for tensor in pair
++    ]
++    result_tensor = torch.cat(ordered_tensors, dim=-1)
++    return result_tensor
++
++
++class SiglipAttention(nn.Module):
++    """SigLIP vision attention adapted from Qwen2.5-VisionAttention."""
++
++    def __init__(
++        self,
++        *,
++        embed_dim: int,
++        num_heads: int,
++        projection_size: int,
++        quant_config: QuantizationConfig | None = None,
++        prefix: str = "",
++        attn_backend: _Backend = _Backend.TORCH_SDPA,
++        attn_backend_override: _Backend | None = None,
++        use_upstream_fa: bool = False,
++    ) -> None:
++        super().__init__()
++
++        self.tp_size = parallel_state.get_tensor_model_parallel_world_size()
++        self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
++        self.hidden_size_per_attention_head = dist_utils.divide(
++            projection_size, num_heads
++        )
++        self.num_attention_heads_per_partition = dist_utils.divide(
++            num_heads, self.tp_size
++        )
++
++        self.qkv_proj = QKVParallelLinear(
++            hidden_size=embed_dim,
++            head_size=self.hidden_size_per_attention_head,
++            total_num_heads=num_heads,
++            total_num_kv_heads=num_heads,
++            bias=True,
++            quant_config=quant_config,
++            prefix=f"{prefix}.qkv_proj",
++        )
++        self.out_proj = RowParallelLinear(
++            input_size=projection_size,
++            output_size=embed_dim,
++            quant_config=quant_config,
++            prefix=f"{prefix}.out_proj",
++        )
++
++        self.attn_backend = attn_backend
++        self.use_upstream_fa = use_upstream_fa
++        # self.attn_backend, self.flash_attn_varlen_func = (
++        #     maybe_get_vit_flash_attn_backend(
++        #         self.attn_backend,
++        #         self.use_upstream_fa,
++        #         attn_backend_override=attn_backend_override,
++        #     )
++        # )
++        self.flash_attn_varlen_func = flash_attn_varlen_func
++        self.is_flash_attn_backend = self.attn_backend in {
++            _Backend.FLASH_ATTN,
++            _Backend.ROCM_AITER_FA,
++        }
++        self.attn_backend = _Backend.TORCH_SDPA
++
++    def split_qkv(self, qkv: torch.Tensor) -> tuple[torch.Tensor, ...]:
++        seq_len, bs, _ = qkv.shape
++        if self.tp_size > 1:
++            qkv = all_gather_interleave(qkv, self.qkv_proj.hidden_size, self.tp_size)
++
++        q, k, v = qkv.chunk(3, dim=2)
++
++        if self.tp_size > 1:
++            splitter = partial(
++                dist_utils.split_tensor_along_last_dim, num_partitions=self.tp_size
++            )
++            q = splitter(q)[self.tp_rank]
++            k = splitter(k)[self.tp_rank]
++            v = splitter(v)[self.tp_rank]
++
++        new_shape = (
++            seq_len,
++            bs,
++            self.num_attention_heads_per_partition,
++            self.hidden_size_per_attention_head,
++        )
++        q, k, v = (x.view(*new_shape) for x in (q, k, v))
++        return q, k, v
++
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        *,
++        cu_seqlens: torch.Tensor,
++        rotary_pos_emb: torch.Tensor | None,
++        max_seqlen: torch.Tensor | None,
++        seqlens: torch.Tensor | None,
++    ) -> torch.Tensor:
++        batch_size, _, _ = hidden_states.shape
++
++        x = rearrange(hidden_states, "b s d -> s b d")
++        x, _ = self.qkv_proj(x)
++        q, k, v = self.split_qkv(x)
++        q, k, v = (rearrange(t, "s b h d -> b s h d") for t in (q, k, v))
++
++        if rotary_pos_emb is not None:
++            qk_concat = torch.cat([q, k], dim=0)
++            qk_rotated = apply_rotary_pos_emb_vision(qk_concat, rotary_pos_emb)
++            q, k = torch.chunk(qk_rotated, 2, dim=0)
++
++        if self.is_flash_attn_backend:
++            if max_seqlen is None:
++                raise ValueError("Flash attention backend requires max_seqlen.")
++            context_layer = vit_flash_attn_wrapper(
++                q,
++                k,
++                v,
++                cu_seqlens,
++                max_seqlen,
++                batch_size,
++                self.attn_backend == _Backend.ROCM_AITER_FA,
++                self.use_upstream_fa,
++            )
++        elif self.attn_backend == _Backend.TORCH_SDPA:
++            outputs = []
++            for i in range(1, len(cu_seqlens)):
++                start_idx = cu_seqlens[i - 1]
++                end_idx = cu_seqlens[i]
++                q_i = q[:, start_idx:end_idx]
++                k_i = k[:, start_idx:end_idx]
++                v_i = v[:, start_idx:end_idx]
++                q_i, k_i, v_i = (
++                    rearrange(tensor, "b s h d -> b h s d")
++                    for tensor in (q_i, k_i, v_i)
++                )
++                output_i = F.scaled_dot_product_attention(q_i, k_i, v_i, dropout_p=0.0)
++                output_i = rearrange(output_i, "b h s d -> b s h d")
++                outputs.append(output_i)
++            context_layer = torch.cat(outputs, dim=1)
++            context_layer = rearrange(
++                context_layer, "b s h d -> s b (h d)"
++            ).contiguous()
++        elif self.attn_backend == _Backend.XFORMERS:
++            if seqlens is None:
++                raise ValueError("xFormers attention backend requires seqlens tensor.")
++            context_layer = vit_xformers_attn_wrapper(q, k, v, seqlens)
++        else:
++            raise RuntimeError(
++                f"PaddleOCR-VL does not support {self.attn_backend} backend now."
++            )
++
++        output, _ = self.out_proj(context_layer)
++        output = rearrange(output, "s b d -> b s d")
++        return output
++
++
++class SigLIPRotaryEmbedding(nn.Module):
++    def __init__(self, dim: int, theta: float = 10000.0) -> None:
++        super().__init__()
++        self.dim = dim
++        self.theta = theta
++        self.rope_init()
++
++    def rope_init(self):
++        inv_freq = 1.0 / (
++            self.theta ** (torch.arange(0, self.dim, 2, dtype=torch.float) / self.dim)
++        )
++        self.register_buffer("inv_freq", inv_freq, persistent=False)
++
++    def forward(self, seqlen: int) -> torch.Tensor:
++        seq = torch.arange(
++            seqlen,
++            device=self.inv_freq.device,
++            dtype=self.inv_freq.dtype,
++        )
++        freqs = torch.outer(seq, self.inv_freq)
++        return freqs
++
++
++class SiglipMLP(nn.Module):
++    def __init__(
++        self,
++        config: PretrainedConfig,
++        quant_config: QuantizationConfig | None = None,
++        prefix: str = "",
++    ) -> None:
++        super().__init__()
++
++        self.config = config
++        self.activation_fn = get_act_fn(config.hidden_act)
++        # Special handling for BNB and torchao quantization
++        if quant_config and quant_config.get_name() in ["bitsandbytes", "torchao"]:
++            quantizable = True
++        else:
++            # For other quantization, we require the hidden size to be a
++            # multiple of 64
++            quantizable = (
++                config.hidden_size % 64 == 0 and config.intermediate_size % 64 == 0
++            )
++        self.fc1 = ColumnParallelLinear(
++            config.hidden_size,
++            config.intermediate_size,
++            quant_config=quant_config if quantizable else None,
++            prefix=f"{prefix}.fc1",
++        )
++        self.fc2 = RowParallelLinear(
++            config.intermediate_size,
++            config.hidden_size,
++            quant_config=quant_config if quantizable else None,
++            prefix=f"{prefix}.fc2",
++        )
++
++    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        hidden_states, _ = self.fc1(hidden_states)
++        hidden_states = self.activation_fn(hidden_states)
++        hidden_states, _ = self.fc2(hidden_states)
++        return hidden_states
++
++
++class SiglipEncoderLayer(nn.Module):
++    def __init__(
++        self,
++        config: PretrainedConfig,
++        quant_config: QuantizationConfig | None = None,
++        prefix: str = "",
++        *,
++        attn_backend: _Backend = _Backend.TORCH_SDPA,
++        attn_backend_override: _Backend | None = None,
++        use_upstream_fa: bool = False,
++    ):
++        super().__init__()
++        self.embed_dim = config.hidden_size
++        self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
++        self.self_attn = SiglipAttention(
++            embed_dim=config.hidden_size,
++            num_heads=config.num_attention_heads,
++            projection_size=config.hidden_size,
++            quant_config=quant_config,
++            prefix=f"{prefix}.self_attn",
++            attn_backend=attn_backend,
++            attn_backend_override=attn_backend_override,
++            use_upstream_fa=use_upstream_fa,
++        )
++        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
++        self.mlp = SiglipMLP(
++            config,
++            quant_config=quant_config,
++            prefix=f"{prefix}.mlp",
++        )
++
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        *,
++        cu_seqlens: torch.Tensor,
++        rotary_pos_emb: torch.Tensor | None,
++        max_seqlen: torch.Tensor | None,
++        seqlens: torch.Tensor | None,
++    ) -> torch.Tensor:
++        residual = hidden_states
++
++        hidden_states = self.layer_norm1(hidden_states)
++        hidden_states = self.self_attn(
++            hidden_states=hidden_states,
++            cu_seqlens=cu_seqlens,
++            rotary_pos_emb=rotary_pos_emb,
++            max_seqlen=max_seqlen,
++            seqlens=seqlens,
++        )
++
++        hidden_states = residual + hidden_states
++
++        residual = hidden_states
++        hidden_states = self.layer_norm2(hidden_states)
++        hidden_states = self.mlp(hidden_states)
++
++        hidden_states = residual + hidden_states
++
++        return hidden_states
++
++
++class SiglipEncoder(nn.Module):
++    def __init__(
++        self,
++        config: PretrainedConfig,
++        quant_config: QuantizationConfig | None = None,
++        prefix: str = "",
++        attn_backend_override: _Backend | None = None,
++    ):
++        super().__init__()
++        self.config = config
++        embed_dim = config.hidden_size
++        num_heads = config.num_attention_heads
++        head_dim = embed_dim // num_heads
++        self.attn_backend = get_vit_attn_backend(
++            head_size=head_dim,
++            dtype=torch.get_default_dtype(),
++            #attn_backend_override=attn_backend_override,
++        )
++        self.use_upstream_fa = False
++        if self.attn_backend not in {
++            _Backend.FLASH_ATTN,
++            _Backend.ROCM_AITER_FA,
++        } and check_upstream_fa_availability(torch.get_default_dtype()):
++            self.attn_backend = _Backend.FLASH_ATTN
++            self.use_upstream_fa = True
++        if self.attn_backend not in {
++            _Backend.FLASH_ATTN,
++            _Backend.TORCH_SDPA,
++            _Backend.XFORMERS,
++            _Backend.ROCM_AITER_FA,
++            _Backend.IPEX,
++        }:
++            raise RuntimeError(
++                f"PaddleOCR-VL does not support {self.attn_backend} backend now."
++            )
++        self.layers = nn.ModuleList(
++            [
++                SiglipEncoderLayer(
++                    config,
++                    quant_config=quant_config,
++                    prefix=f"{prefix}.layers.{layer_idx}",
++                    attn_backend=self.attn_backend,
++                    attn_backend_override=attn_backend_override,
++                    use_upstream_fa=self.use_upstream_fa,
++                )
++                for layer_idx in range(config.num_hidden_layers)
++            ]
++        )
++        self.rotary_pos_emb = SigLIPRotaryEmbedding(head_dim // 2)
++
++    @staticmethod
++    def flatten_list(image_grid_thw):
++        tmp_image_grid_thw = list()
++        for image_grid in image_grid_thw:
++            if isinstance(image_grid, list):
++                tmp_image_grid_thw.extend(image_grid)
++            else:
++                tmp_image_grid_thw.append(image_grid)
++        return tmp_image_grid_thw
++
++    def forward(
++        self,
++        inputs_embeds,
++        cu_seqlens: torch.Tensor | None = None,
++        image_grid_thw: list[tuple[int, int, int] | list[tuple[int, int, int]]]
++        | None = None,
++        height_position_ids: torch.Tensor | None = None,
++        width_position_ids: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        device = inputs_embeds.device
++        hidden_states = inputs_embeds
++
++        flatten_image_grid_thw = self.flatten_list(image_grid_thw)
++
++        if width_position_ids is None or height_position_ids is None:
++            split_hids = list()
++            split_wids = list()
++            for t, h, w in flatten_image_grid_thw:
++                image_pids = torch.arange(t * h * w, device=device) % (h * w)
++                sample_hids = image_pids // w
++                sample_wids = image_pids % w
++                split_hids.append(sample_hids)
++                split_wids.append(sample_wids)
++            width_position_ids = torch.concat(split_wids, dim=0)
++            height_position_ids = torch.concat(split_hids, dim=0)
++
++        pids = torch.stack(
++            [height_position_ids, width_position_ids],
++            dim=-1,
++        )
++        max_grid_size = pids.max() + 1
++        rope_emb_max_grid = self.rotary_pos_emb(max_grid_size)
++        rotary_pos_emb = rope_emb_max_grid[pids].flatten(1)
++
++        if cu_seqlens is None:
++            raise ValueError("cu_seqlens cannot be None for SiglipEncoder.")
++        if not isinstance(cu_seqlens, torch.Tensor):
++            cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
++        else:
++            cu_seqlens = cu_seqlens.to(device=device)
++
++        max_seqlen = None
++        seqlens = None
++        if self.attn_backend in {_Backend.FLASH_ATTN, _Backend.ROCM_AITER_FA}:
++            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
++        elif self.attn_backend == _Backend.XFORMERS:
++            seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
++
++        hidden_states = inputs_embeds
++        for encoder_layer in self.layers:
++            hidden_states = encoder_layer(
++                hidden_states,
++                cu_seqlens=cu_seqlens,
++                rotary_pos_emb=rotary_pos_emb,
++                max_seqlen=max_seqlen,
++                seqlens=seqlens,
++            )
++        return hidden_states
++
++
++class SiglipVisionTransformer(nn.Module):
++    def __init__(
++        self,
++        config: PretrainedConfig,
++        quant_config: QuantizationConfig | None = None,
++        prefix: str = "",
++        attn_backend_override: _Backend | None = None,
++    ):
++        super().__init__()
++        self.config = config
++        embed_dim = config.hidden_size
++
++        self.embeddings = SiglipVisionEmbeddings(config)
++        self.encoder = SiglipEncoder(
++            config,
++            quant_config=quant_config,
++            prefix=f"{prefix}.encoder",
++            attn_backend_override=attn_backend_override,
++        )
++        self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
++
++    def forward(
++        self,
++        pixel_values: torch.Tensor,
++        interpolate_pos_encoding: bool | None = False,
++        position_ids: torch.Tensor | None = None,
++        height_position_ids: torch.Tensor | None = None,
++        width_position_ids: torch.Tensor | None = None,
++        cu_seqlens: torch.Tensor | None = None,
++        image_grid_thw: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        hidden_states = self.embeddings(
++            pixel_values,
++            interpolate_pos_encoding=interpolate_pos_encoding,
++            position_ids=position_ids,
++            image_grid_thw=image_grid_thw,
++        )
++
++        last_hidden_state = self.encoder(
++            inputs_embeds=hidden_states,
++            cu_seqlens=cu_seqlens,
++            image_grid_thw=image_grid_thw,
++            height_position_ids=height_position_ids,
++            width_position_ids=width_position_ids,
++        )
++
++        last_hidden_state = self.post_layernorm(last_hidden_state)
++        return last_hidden_state
++
++
++class SiglipVisionModel(nn.Module):
++    def __init__(
++        self,
++        config,
++        quant_config: QuantizationConfig | None = None,
++        prefix: str = "",
++        attn_backend_override: _Backend | None = None,
++    ):
++        super().__init__()
++
++        self.vision_model = SiglipVisionTransformer(
++            config,
++            quant_config=quant_config,
++            prefix=f"{prefix}.vision_model",
++            attn_backend_override=attn_backend_override,
++        )
++        self.quant_config = quant_config
++
++    @property
++    def dtype(self) -> torch.dtype:
++        return self.vision_model.embeddings.patch_embedding.weight.dtype
++
++    @property
++    def device(self) -> torch.device:
++        return self.vision_model.embeddings.patch_embedding.weight.device
++
++    def get_input_embeddings(self) -> nn.Module:
++        return self.vision_model.embeddings.patch_embedding
++
++    def forward(
++        self,
++        pixel_values,
++        interpolate_pos_encoding: bool = False,
++        position_ids: torch.Tensor | None = None,
++        image_grid_thw: list[tuple[int, int, int] | list[tuple[int, int, int]]]
++        | None = None,
++        cu_seqlens: torch.Tensor | None = None,
++    ) -> BaseModelOutputWithPooling:
++        return self.vision_model(
++            pixel_values=pixel_values,
++            interpolate_pos_encoding=interpolate_pos_encoding,
++            position_ids=position_ids,
++            image_grid_thw=image_grid_thw,
++            cu_seqlens=cu_seqlens,
++        )
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        stacked_params_mapping = [
++            ("qkv_proj", "q_proj", "q"),
++            ("qkv_proj", "k_proj", "k"),
++            ("qkv_proj", "v_proj", "v"),
++        ]
++        params_dict = dict(self.named_parameters(remove_duplicate=False))
++        loaded_params: set[str] = set()
++        for name, loaded_weight in weights:
++            if "rotary_emb.inv_freq" in name:
++                continue
++            if "head.attention" in name or "head.layernorm" in name:
++                continue
++            if "head.mlp" in name or "head.probe" in name:
++                continue
++            if self.quant_config is not None and (
++                scale_name := self.quant_config.get_cache_scale(name)
++            ):
++                param = params_dict[scale_name]
++                weight_loader = getattr(
++                    param,
++                    "weight_loader",
++                    default_weight_loader,
++                )
++                loaded_weight = (
++                    loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
++                )
++                weight_loader(param, loaded_weight)
++                loaded_params.add(scale_name)
++                continue
++            for (
++                param_name,
++                weight_name,
++                shard_id,
++            ) in stacked_params_mapping:
++                if weight_name not in name:
++                    continue
++                name = name.replace(weight_name, param_name)
++                if name.endswith(".bias") and name not in params_dict:
++                    continue
++                if is_pp_missing_parameter(name, self):
++                    continue
++                param = params_dict[name]
++                weight_loader = param.weight_loader
++                weight_loader(param, loaded_weight, shard_id)
++                break
++            else:
++                if name.endswith(".bias") and name not in params_dict:
++                    continue
++                name = maybe_remap_kv_scale_name(name, params_dict)
++                if name is None:
++                    continue
++                if is_pp_missing_parameter(name, self):
++                    continue
++                param = params_dict[name]
++                weight_loader = getattr(
++                    param,
++                    "weight_loader",
++                    default_weight_loader,
++                )
++                weight_loader(param, loaded_weight)
++            loaded_params.add(name)
++        return loaded_params
++
++
++@MULTIMODAL_REGISTRY.register_processor(
++    PaddleOCRVLMultiModalProcessor,
++    info=PaddleOCRVLProcessingInfo,
++    dummy_inputs=PaddleOCRVLDummyInputsBuilder,
++)
++class PaddleOCRVLForConditionalGeneration(nn.Module, SupportsMultiModal):
++    merge_by_field_config = True
++
++    hf_to_vllm_mapper = WeightsMapper(
++        orig_to_new_prefix={
++            "model.": "language_model.model.",
++            "lm_head.": "language_model.lm_head.",
++        }
++    )
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        super().__init__()
++        config = vllm_config.model_config.hf_config
++        quant_config = vllm_config.quant_config
++        multimodal_config = vllm_config.model_config.multimodal_config
++
++        self.config = config
++        self.multimodal_config = multimodal_config
++
++        # attn_backend_override = (
++        #     multimodal_config.mm_encoder_attn_backend
++        #     if multimodal_config is not None
++        #     else None
++        # )
++        attn_backend_override = None
++
++        self.visual = SiglipVisionModel(
++            config=config.vision_config,
++            quant_config=quant_config,
++            prefix=maybe_prefix(prefix, "visual"),
++            attn_backend_override=attn_backend_override,
++        )
++        self.mlp_AR = Projector(config, config.vision_config)
++
++        self.language_model = Ernie4_5ForCausalLM(
++            vllm_config=vllm_config,
++            prefix=maybe_prefix(prefix, "language_model"),
++        )
++
++        for layer in self.language_model.model.layers:
++            if not isinstance(layer, PPMissingLayer):
++                layer.self_attn.rotary_emb.is_neox_style = True
++
++        self.make_empty_intermediate_tensors = (
++            self.language_model.make_empty_intermediate_tensors
++        )
++
++    def compute_logits(
++        self,
++        hidden_states: torch.Tensor,
++        sampling_metadata: SamplingMetadata,
++    ) -> torch.Tensor | None:
++        return self.language_model.compute_logits(hidden_states, sampling_metadata)
++
++    def get_mrope_input_positions(
++        self,
++        input_tokens: list[int],
++        hf_config: PretrainedConfig,
++        image_grid_thw: list[list[int]] | torch.Tensor,
++        video_grid_thw: list[list[int]] | torch.Tensor,
++        second_per_grid_ts: list[float],
++        context_len: int = 0,
++        seq_len: int | None = None,
++        audio_feature_lengths: torch.Tensor | None = None,
++        use_audio_in_video: bool = False,
++    ) -> tuple[torch.Tensor, int]:
++        """Get mrope input positions and delta value."""
++
++        image_token_id = hf_config.image_token_id
++        video_token_id = hf_config.video_token_id
++        vision_start_token_id = hf_config.vision_start_token_id
++        spatial_merge_size = hf_config.vision_config.spatial_merge_size
++        tokens_per_second = getattr(hf_config.vision_config, "tokens_per_second", 1.0)
++
++        input_tokens_tensor = torch.tensor(input_tokens)
++        vision_start_indices = torch.argwhere(
++            input_tokens_tensor == vision_start_token_id
++        ).squeeze(1)
++        vision_tokens = input_tokens_tensor[vision_start_indices + 1]
++        image_nums = (vision_tokens == image_token_id).sum()
++        video_nums = (vision_tokens == video_token_id).sum()
++        llm_pos_ids_list: list = []
++
++        st = 0
++        remain_images, remain_videos = image_nums, video_nums
++
++        image_index, video_index = 0, 0
++        for _ in range(image_nums + video_nums):
++            video_second_per_grid_t = 0.0
++            if remain_images > 0:
++                try:
++                    ed_image = input_tokens.index(image_token_id, st)
++                except ValueError:
++                    ed_image = len(input_tokens) + 1
++            else:
++                ed_image = len(input_tokens) + 1
++            if remain_videos > 0:
++                try:
++                    ed_video = input_tokens.index(video_token_id, st)
++                except ValueError:
++                    ed_video = len(input_tokens) + 1
++            else:
++                ed_video = len(input_tokens) + 1
++            if ed_image < ed_video:
++                t, h, w = (
++                    image_grid_thw[image_index][0],
++                    image_grid_thw[image_index][1],
++                    image_grid_thw[image_index][2],
++                )
++                image_index += 1
++                remain_images -= 1
++                ed = ed_image
++            else:
++                t, h, w = (
++                    video_grid_thw[video_index][0],
++                    video_grid_thw[video_index][1],
++                    video_grid_thw[video_index][2],
++                )
++                video_second_per_grid_t = 1.0
++                if second_per_grid_ts:
++                    video_second_per_grid_t = second_per_grid_ts[video_index]
++                video_index += 1
++                remain_videos -= 1
++                ed = ed_video
++
++            llm_grid_t, llm_grid_h, llm_grid_w = (
++                t,
++                h // spatial_merge_size,
++                w // spatial_merge_size,
++            )
++            text_len = ed - st
++
++            st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
++            llm_pos_ids_list.append(
++                torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
++            )
++
++            t_index = (
++                (
++                    torch.arange(llm_grid_t)
++                    .view(-1, 1)
++                    .expand(-1, llm_grid_h * llm_grid_w)
++                    * video_second_per_grid_t
++                    * tokens_per_second
++                )
++                .long()
++                .flatten()
++            )
++
++            h_index = (
++                torch.arange(llm_grid_h)
++                .view(1, -1, 1)
++                .expand(llm_grid_t, -1, llm_grid_w)
++                .flatten()
++            )
++            w_index = (
++                torch.arange(llm_grid_w)
++                .view(1, 1, -1)
++                .expand(llm_grid_t, llm_grid_h, -1)
++                .flatten()
++            )
++            llm_pos_ids_list.append(
++                torch.stack([t_index, h_index, w_index]) + text_len + st_idx
++            )
++            st = ed + llm_grid_t * llm_grid_h * llm_grid_w
++
++        if st < len(input_tokens):
++            st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
++            text_len = len(input_tokens) - st
++            llm_pos_ids_list.append(
++                torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
++            )
++
++        llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
++        mrope_position_delta = (llm_positions.max() + 1 - len(input_tokens)).item()
++        llm_positions = llm_positions[:, context_len:seq_len]
++
++        return llm_positions, mrope_position_delta
++
++    def get_language_model(self) -> nn.Module:
++        return self.language_model
++
++    def _parse_and_validate_image_input(
++        self, **kwargs: object
++    ) -> PaddleOCRImagePixelInputs | None:
++        pixel_values = kwargs.pop("pixel_values", None)
++        image_grid_thw = kwargs.pop("image_grid_thw", None)
++
++        if pixel_values is None:
++            return None
++
++        if pixel_values.ndim == 6:
++            pixel_values = pixel_values.flatten(0, 1)
++        
++        if image_grid_thw is not None:
++            if not isinstance(image_grid_thw, torch.Tensor):
++                image_grid_thw = torch.tensor(image_grid_thw)
++            
++            if image_grid_thw.ndim == 3:
++                image_grid_thw = image_grid_thw.flatten(0, 1)
++
++        return PaddleOCRImagePixelInputs(
++            type="pixel_values",
++            pixel_values=pixel_values,
++            image_grid_thw=image_grid_thw,
++        )
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        intermediate_tensors: IntermediateTensors | None = None,
++        inputs_embeds: torch.Tensor | None = None,
++        **kwargs,
++    ):
++        if intermediate_tensors is not None:
++            inputs_embeds = None
++
++        elif inputs_embeds is None:
++            vision_embeddings = self.get_multimodal_embeddings(**kwargs)
++            is_multimodal = kwargs.pop("is_multimodal", None)
++            handle_oov_mm_token = kwargs.pop("handle_oov_mm_token", False)
++            inputs_embeds = self.get_input_embeddings(
++                input_ids,
++                vision_embeddings,
++                is_multimodal=is_multimodal,
++                handle_oov_mm_token=handle_oov_mm_token,
++            )
++            input_ids = None
++
++        return self.language_model(
++            input_ids, positions, intermediate_tensors, inputs_embeds
++        )
++
++    @classmethod
++    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
++        if modality.startswith("image"):
++            return "<|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>"
++
++        raise ValueError("Only image modality is supported")
++
++    def encode_image(
++        self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor
++    ) -> torch.Tensor:
++        pixel_values = pixel_values.type(self.visual.dtype)
++        siglip_position_ids = list()
++        image_grid_hws = list()
++        cu_seqlens = [0]
++
++        thw_tuple = tuple(image_grid_thw.tolist())
++        numel = np.prod(thw_tuple)
++        image_grid_hws.append(thw_tuple)
++        image_position_ids = torch.arange(numel) % np.prod(thw_tuple[1:])
++        siglip_position_ids.append(image_position_ids)
++        cu_seqlens.append(cu_seqlens[-1] + numel)
++
++        siglip_position_ids = torch.concat(siglip_position_ids, dim=0).to(
++            pixel_values.device
++        )
++        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32).to(pixel_values.device)
++
++        vision_outputs = self.visual(
++            pixel_values=pixel_values,
++            image_grid_thw=image_grid_hws,
++            position_ids=siglip_position_ids,
++            interpolate_pos_encoding=True,
++            cu_seqlens=cu_seqlens,
++        )
++        return vision_outputs
++
++    def _process_image_input(
++        self, image_input: PaddleOCRImagePixelInputs
++    ) -> MultiModalEmbeddings:
++        pixel_values = image_input.pixel_values
++        image_grid_thw = image_input.image_grid_thw
++        vision_outputs = tuple(
++            self.encode_image(pixel, grid).squeeze(0)
++            for pixel, grid in zip(pixel_values, image_grid_thw)
++        )
++        image_embeds = self.mlp_AR(vision_outputs, image_grid_thw)
++        return image_embeds
++
++    def get_multimodal_embeddings(self, **kwargs) -> MultiModalEmbeddings:
++        image_input = self._parse_and_validate_image_input(**kwargs)
++        if image_input is None:
++            return ()
++
++        multimodal_embeddings: tuple[torch.Tensor, ...] = ()
++        image_embeds = self._process_image_input(image_input)
++        multimodal_embeddings += tuple(image_embeds)
++
++        return multimodal_embeddings
++
++    def get_input_embeddings(
++        self,
++        input_ids: torch.Tensor,
++        multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
++    ) -> torch.Tensor:
++        inputs_embeds = self.language_model.get_input_embeddings(input_ids)
++        if multimodal_embeddings is not None \
++            and len(multimodal_embeddings) != 0:
++            inputs_embeds = merge_multimodal_embeddings(
++                input_ids, inputs_embeds, multimodal_embeddings,
++                [self.config.image_token_id])
++        return inputs_embeds
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        loader = AutoWeightsLoader(self)
++        autoloaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
++        return autoloaded_weights
 diff --git a/vllm/model_executor/models/phi4mm_audio.py b/vllm/model_executor/models/phi4mm_audio.py
 index a1c452053..a74e8cdb7 100644
 --- a/vllm/model_executor/models/phi4mm_audio.py
@@ -13144,26 +14918,8 @@ index 90a1ad2a6..8ba467034 100644
          return max_seqlen, seqlens
  
      def forward(
-diff --git a/vllm/model_executor/models/qwen3.py b/vllm/model_executor/models/qwen3.py
-index dddb47048..0e8bf0d32 100644
---- a/vllm/model_executor/models/qwen3.py
-+++ b/vllm/model_executor/models/qwen3.py
-@@ -147,11 +147,11 @@ class Qwen3Attention(nn.Module):
-         # Add qk-norm
-         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
-                            self.head_dim)
--        q_by_head = self.q_norm(q_by_head)
-+        q_by_head = self.q_norm.forward(q_by_head.contiguous())
-         q = q_by_head.view(q.shape)
-         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim,
-                            self.head_dim)
--        k_by_head = self.k_norm(k_by_head)
-+        k_by_head = self.k_norm.forward(k_by_head.contiguous())
-         k = k_by_head.view(k.shape)
-         q, k = self.rotary_emb(positions, q, k)
-         attn_output = self.attn(q, k, v)
 diff --git a/vllm/model_executor/models/qwen3_moe.py b/vllm/model_executor/models/qwen3_moe.py
-index 85429b3a0..027896a61 100644
+index 85429b3a0..1b734feed 100644
 --- a/vllm/model_executor/models/qwen3_moe.py
 +++ b/vllm/model_executor/models/qwen3_moe.py
 @@ -49,6 +49,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -13190,24 +14946,7 @@ index 85429b3a0..027896a61 100644
               GPTQMarlinConfig)) and not quant_config.autoround_version:
              return None
          return quant_config
-@@ -277,12 +280,14 @@ class Qwen3MoeAttention(nn.Module):
-         # Add qk-norm
-         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
-                            self.head_dim)
--        q_by_head = self.q_norm(q_by_head)
-+        q_by_head = self.q_norm.forward(q_by_head.contiguous())
-+        # q_by_head = self.q_norm(q_by_head)
-         q = q_by_head.view(q.shape)
- 
-         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim,
-                            self.head_dim)
--        k_by_head = self.k_norm(k_by_head)
-+        k_by_head = self.k_norm.forward(k_by_head.contiguous())
-+        # k_by_head = self.k_norm(k_by_head)
-         k = k_by_head.view(k.shape)
-         q, k = self.rotary_emb(positions, q, k)
-         attn_output = self.attn(q, k, v)
-@@ -378,7 +383,7 @@ class Qwen3MoeModel(nn.Module):
+@@ -378,7 +381,7 @@ class Qwen3MoeModel(nn.Module):
      def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
          super().__init__()
  
@@ -13216,16 +14955,31 @@ index 85429b3a0..027896a61 100644
          cache_config = vllm_config.cache_config
          quant_config = vllm_config.quant_config
          parallel_config = vllm_config.parallel_config
-@@ -467,7 +472,40 @@ class Qwen3MoeModel(nn.Module):
+@@ -387,6 +390,7 @@ class Qwen3MoeModel(nn.Module):
+         self.num_redundant_experts = eplb_config.num_redundant_experts
+ 
+         self.padding_idx = config.pad_token_id
++        self.quant_config = quant_config
+         self.vocab_size = config.vocab_size
+         self.config = config
+         self.embed_tokens = VocabParallelEmbedding(
+@@ -467,7 +471,57 @@ class Qwen3MoeModel(nn.Module):
          params_dict = dict(self.named_parameters())
          loaded_params: set[str] = set()
          expert_params_mapping = self.get_expert_mapping()
 +        is_padding_needed = False
 +        quantization_config = getattr(self.config, "quantization_config", None)
-+        if quantization_config is not None:
-+            quant_method = quantization_config.get("quant_method", "").lower()
++        if quantization_config is not None or self.quant_config is not None:
++            if quantization_config is not None:
++                quant_method = quantization_config.get("quant_method", "").lower()
++            elif self.quant_config is not None:
++                quant_method = self.quant_config.get_name()
 +            tp_size = get_tensor_model_parallel_world_size()
-+            if (quant_method in ("gptq")) and (tp_size == 4 or tp_size == 8):
++            if (quant_method in ("gptq", "sym_int4")) and (tp_size == 4 or tp_size == 8 or tp_size == 16):
++                # For qwen3-30b-a3b, moe intermediate_size is 768.  For tp_size 4, we will need to pad it to 1024
++                # For qwen3-30b-a3b, moe intermediate_size is 768.  For tp_size 8, we will need to pad it to 1024
++                # For qwen3-235b-a3b, moe intermediate_size is 1536.  For tp_size 8, we will need to pad it to 2048
++                # For qwen3-235b-a3b, moe intermediate_size is 1536.  For tp_size 16, we will need to pad it to 2048
 +                is_padding_needed = True
          for name, loaded_weight in weights:
 +            if is_padding_needed:
@@ -13252,6 +15006,16 @@ index 85429b3a0..027896a61 100644
 +                elif ".gate_proj.qzeros" in name or ".up_proj.qzeros" in name:
 +                    shape1 = loaded_weight.shape[1]
 +                    target_size = round_up(shape1, 128)
++                    pad_size = target_size - shape1
++                    loaded_weight = torch.nn.functional.pad(loaded_weight, (0, pad_size), value=0)
++                elif ".gate_proj.weight" in name or ".up_proj.weight" in name:
++                    shape0 = loaded_weight.shape[0]
++                    target_size = round_up(shape0, 1024)
++                    pad_size = target_size - shape0
++                    loaded_weight = torch.nn.functional.pad(loaded_weight, (0, 0, 0, pad_size), value=0)
++                elif ".down_proj.weight" in name:
++                    shape1 = loaded_weight.shape[1]
++                    target_size = round_up(shape1, 1024)
 +                    pad_size = target_size - shape1
 +                    loaded_weight = torch.nn.functional.pad(loaded_weight, (0, pad_size), value=0)
              for (param_name, weight_name, shard_id) in stacked_params_mapping:
@@ -16588,7 +18352,7 @@ index 000000000..a800e94ab
 +            for _ in range(self.deepstack_num_level)
 +        ] if self.use_deepstack else None
 diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
-index 7d7654e84..81e460413 100644
+index 7d7654e84..ce3fc12d4 100644
 --- a/vllm/model_executor/models/registry.py
 +++ b/vllm/model_executor/models/registry.py
 @@ -142,6 +142,7 @@ _TEXT_GENERATION_MODELS = {
@@ -16607,7 +18371,22 @@ index 7d7654e84..81e460413 100644
      "Ernie4_5_VLMoeForConditionalGeneration": ("ernie45_vl", "Ernie4_5_VLMoeForConditionalGeneration"),  # noqa: E501
      "FuyuForCausalLM": ("fuyu", "FuyuForCausalLM"),
      "Gemma3ForConditionalGeneration": ("gemma3_mm", "Gemma3ForConditionalGeneration"),  # noqa: E501
-@@ -256,14 +258,33 @@ _MULTIMODAL_MODELS = {
+@@ -249,21 +251,47 @@ _MULTIMODAL_MODELS = {
+     "NVLM_D": ("nvlm_d", "NVLM_D_Model"),
+     "Ovis": ("ovis", "Ovis"),
+     "Ovis2_5": ("ovis2_5", "Ovis2_5"),
+-    "PaliGemmaForConditionalGeneration": ("paligemma", "PaliGemmaForConditionalGeneration"),  # noqa: E501
++    "PaddleOCRVLForConditionalGeneration": (
++        "paddleocr_vl",
++        "PaddleOCRVLForConditionalGeneration",
++    ),
++    "PaliGemmaForConditionalGeneration": (
++        "paligemma",
++        "PaliGemmaForConditionalGeneration",
++    ),
+     "Phi3VForCausalLM": ("phi3v", "Phi3VForCausalLM"),
+     "Phi4MMForCausalLM": ("phi4mm", "Phi4MMForCausalLM"),
+     "Phi4MultimodalForCausalLM": ("phi4_multimodal", "Phi4MultimodalForCausalLM"),  # noqa: E501
      "PixtralForConditionalGeneration": ("pixtral", "PixtralForConditionalGeneration"),  # noqa: E501
      "QwenVLForConditionalGeneration": ("qwen_vl", "QwenVLForConditionalGeneration"),  # noqa: E501
      "Qwen2VLForConditionalGeneration": ("qwen2_vl", "Qwen2VLForConditionalGeneration"),  # noqa: E501
@@ -16752,6 +18531,37 @@ index c16aa5ac6..0b58caa3e 100644
 -    return torch.cat(hs_pool, dim=-1)
 \ No newline at end of file
 +    return torch.cat(hs_pool, dim=-1)
+diff --git a/vllm/multimodal/processing.py b/vllm/multimodal/processing.py
+index e5db356b6..4a75d640d 100644
+--- a/vllm/multimodal/processing.py
++++ b/vllm/multimodal/processing.py
+@@ -1732,14 +1732,18 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
+                 # NOTE: If you are a model developer, this can also arise from
+                 # an inconsistency between `_call_hf_processor` and
+                 # `_get_mm_fields_config` implementations
+-                raise RuntimeError(
+-                    f"Expected there to be {item_count} prompt updates "
+-                    f"corresponding to {item_count} {modality} items, but "
+-                    f"instead found {len(placeholders)} prompt updates! "
+-                    "This is likely because you forgot to include input "
+-                    "placeholder tokens (e.g., `<image>`, `<|image_pad|>`) "
+-                    "in the prompt. If the model has a chat template, make "
+-                    "sure you have applied it before calling `LLM.generate`.")
++                from vllm.model_executor.models.glm4_1v import Glm4vMultiModalProcessor
++                if isinstance(self, Glm4vMultiModalProcessor):
++                    pass
++                else:
++                    raise RuntimeError(
++                        f"Expected there to be {item_count} prompt updates "
++                        f"corresponding to {item_count} {modality} items, but "
++                        f"instead found {len(placeholders)} prompt updates! "
++                        "This is likely because you forgot to include input "
++                        "placeholder tokens (e.g., `<image>`, `<|image_pad|>`) "
++                        "in the prompt. If the model has a chat template, make "
++                        "sure you have applied it before calling `LLM.generate`.")
+ 
+     def _maybe_apply_prompt_updates(
+         self,
 diff --git a/vllm/multimodal/profiling.py b/vllm/multimodal/profiling.py
 index ffc69a2db..0d25524b3 100644
 --- a/vllm/multimodal/profiling.py
@@ -16909,6 +18719,21 @@ index 32208e7ff..7a4b1679a 100644
  
      @classmethod
      def is_data_center_gpu(cls) -> bool:
+diff --git a/vllm/transformers_utils/config.py b/vllm/transformers_utils/config.py
+index 2852d16ec..0a99b6c0a 100644
+--- a/vllm/transformers_utils/config.py
++++ b/vllm/transformers_utils/config.py
+@@ -371,7 +371,9 @@ def patch_rope_scaling(config: PretrainedConfig) -> None:
+     rope_scaling = getattr(config, "rope_scaling", None)
+     if rope_scaling is not None:
+         patch_rope_scaling_dict(rope_scaling)
+-
++        arch = getattr(config, "architectures", None)
++        if arch is not None and arch[0] == "Qwen2_5_VLForConditionalGeneration":
++            rope_scaling["model_type"] = "qwen2_5_vl"
+ 
+ def patch_rope_scaling_dict(rope_scaling: dict[str, Any]) -> None:
+     if "rope_type" in rope_scaling and "type" in rope_scaling:
 diff --git a/vllm/transformers_utils/configs/__init__.py b/vllm/transformers_utils/configs/__init__.py
 index cdae59ccc..bc78ad544 100644
 --- a/vllm/transformers_utils/configs/__init__.py
@@ -17004,11 +18829,46 @@ index 000000000..6bb3c12d9
 +    def save_pretrained(self, save_directory, **kwargs):
 +        self._auto_class = None
 +        super().save_pretrained(save_directory, **kwargs)
+diff --git a/vllm/transformers_utils/configs/qwen3_next.py b/vllm/transformers_utils/configs/qwen3_next.py
+index c7af26acd..ecc424f3e 100644
+--- a/vllm/transformers_utils/configs/qwen3_next.py
++++ b/vllm/transformers_utils/configs/qwen3_next.py
+@@ -18,7 +18,7 @@
+ 
+ from transformers.configuration_utils import (PretrainedConfig,
+                                               layer_type_validation)
+-from transformers.modeling_rope_utils import rope_config_validation
++# from transformers.modeling_rope_utils import rope_config_validation
+ from transformers.utils import logging
+ 
+ logger = logging.get_logger(__name__)
+@@ -243,7 +243,7 @@ class Qwen3NextConfig(PretrainedConfig):
+         self.attention_bias = attention_bias
+         self.attention_dropout = attention_dropout
+         self.head_dim = head_dim
+-        rope_config_validation(self)
++        # rope_config_validation(self)
+ 
+         self.layer_types = layer_types
+         if self.layer_types is None:
 diff --git a/vllm/transformers_utils/tokenizer.py b/vllm/transformers_utils/tokenizer.py
-index b3f1977f2..7d75433c4 100644
+index b3f1977f2..2de3ab27c 100644
 --- a/vllm/transformers_utils/tokenizer.py
 +++ b/vllm/transformers_utils/tokenizer.py
-@@ -212,6 +212,29 @@ def get_tokenizer(
+@@ -95,8 +95,10 @@ def get_cached_tokenizer(tokenizer: AnyTokenizer) -> AnyTokenizer:
+ 
+     tokenizer_all_special_ids = tokenizer.all_special_ids
+     tokenizer_all_special_tokens = tokenizer.all_special_tokens
+-    tokenizer_all_special_tokens_extended = (
+-        tokenizer.all_special_tokens_extended)
++    if hasattr(tokenizer, "all_special_tokens_extended"):
++        tokenizer_all_special_tokens_extended = (tokenizer.all_special_tokens_extended)
++    else:
++        tokenizer_all_special_tokens_extended = (tokenizer.all_special_tokens)
+     tokenizer_vocab = tokenizer.get_vocab()
+     tokenizer_len = len(tokenizer)
+ 
+@@ -212,6 +214,29 @@ def get_tokenizer(
                                                      revision=revision,
                                                      download_dir=download_dir,
                                                      **kwargs)
