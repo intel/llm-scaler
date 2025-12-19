@@ -8,8 +8,5 @@ pip install -r requirements.txt && \
 cd hy3dpaint/custom_rasterizer && \
 python setup.py install && \
 cd ../DifferentiableRenderer && \
-<<<<<<< HEAD
 python setup.py install 
-=======
-python setup.py install 
->>>>>>> 954033b8087234f342f9d44b3281e9e409de3a48
+
