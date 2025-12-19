@@ -9,3 +9,4 @@ cd hy3dpaint/custom_rasterizer && \
 python setup.py install && \
 cd ../DifferentiableRenderer && \
 python setup.py install 
+
