@@ -1,10 +1,12 @@
 # LLM Scaler
 
-LLM Scaler is an GenAI solution for text generation, image generation, video generation etc. running on [Intel® Arc™ Pro B60 GPUs](https://www.intel.com/content/www/us/en/products/docs/discrete-gpus/arc/workstations/b-series/overview.html). LLM Scalar leverages standard frameworks such as vLLM, ComfyUI, Xinference etc and ensures the best performance for State-of-Art GenAI models running on Arc Pro B60 GPUs.
+LLM Scaler is an GenAI solution for text generation, image generation, video generation etc. running on [Intel® Arc™ Pro B60 GPUs](https://www.intel.com/content/www/us/en/products/docs/discrete-gpus/arc/workstations/b-series/overview.html). LLM Scalar leverages standard frameworks such as vLLM, ComfyUI, SGLang Diffusion, Xinference etc and ensures the best performance for State-of-Art GenAI models running on Arc Pro B60 GPUs.
 
 ---
 
 ## Latest Update
+- [2025.12] We released `intel/llm-scaler-vllm:1.2`, same image as `intel/llm-scaler-vllm:0.10.2-b6` 
+- [2025.12] We released `intel/llm-scaler-omni:0.1.0-b4` to support ComfyUI workflows for Z-Image-Turbo, Hunyuan-Video-1.5 T2V/I2V with multi-XPU, and experimentially support SGLang Diffusion. 
 - [2025.11] We released `intel/llm-scaler-vllm:0.10.2-b6` to support Qwen3-VL (Dense/MoE), Qwen3-Omni, Qwen3-30B-A3B (MoE Int4), MinerU 2.5, ERNIE-4.5-vl etc. 
 - [2025.11] We released `intel/llm-scaler-vllm:0.10.2-b5` to support gpt-oss models and released `intel/llm-scaler-omni:0.1.0-b3` to support more ComfyUI workflows, and Windows installation.
 - [2025.10] We released `intel/llm-scaler-omni:0.1.0-b2` to support more models with ComfyUI workflows and Xinference.
@@ -105,7 +107,7 @@ Please follow the instructions in the [Getting Started](vllm/README.md/#1-gettin
 
 ## LLM Scaler Omni (experimental)
 
-`llm-scaler-omni` supports running image/voice/video generation etc. using ComfyUI, Xinference etc., featuring ComfyUI support (or `Omni Studio` mode) and Xinference support (or `Omni Serving` mode).  
+`llm-scaler-omni` supports running image/voice/video generation etc., featuring `Omni Studio` mode (using ComfyUI) and `Omni Serving` mode (via SGLang Diffusion or Xinference).  
 
 
 Please follow the instructions in the [Getting Started](omni/README.md/#getting-started-with-omni-docker-image) to use `llm-scaler-omni`. 

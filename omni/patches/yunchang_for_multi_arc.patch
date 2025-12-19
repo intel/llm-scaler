@@ -1,3 +1,105 @@
+diff --git a/yunchang/comm/all_to_all.py b/yunchang/comm/all_to_all.py
+index 036d246..bd86bf5 100644
+--- a/yunchang/comm/all_to_all.py
++++ b/yunchang/comm/all_to_all.py
+@@ -2,14 +2,34 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ 
+-
++import os
+ import torch
++import time
+ 
+ from typing import Any, Tuple
+ from torch import Tensor
+ from torch.nn import Module
+ 
+ import torch.distributed as dist
++from torch.distributed._functional_collectives import all_to_all_single as ft_all_to_all_single
++
++# Debug flag
++_DEBUG_NAN = os.environ.get("RAYLIGHT_DEBUG_NAN", "0") == "1"
++_all_to_all_call_count = [0]
++
++# Use functional collectives (ft_c) version of all_to_all_single to workaround XCCL bug
++# where dist.all_to_all_single produces incorrect results on 4+ GPUs
++_USE_FT_ALL_TO_ALL = os.environ.get("USE_FT_ALL_TO_ALL", "1") == "1"
++
++
++def _all_to_all_single_wrapper(output, input_t, group):
++    """Wrapper to choose between dist and ft_c all_to_all_single"""
++    if _USE_FT_ALL_TO_ALL:
++        # ft_c version returns the output directly (functional style)
++        result = ft_all_to_all_single(input_t, output_split_sizes=None, input_split_sizes=None, group=group)
++        output.copy_(result)
++    else:
++        dist.all_to_all_single(output, input_t, group=group)
+ 
+ 
+ def all_to_all_4D(
+@@ -53,7 +73,20 @@ def all_to_all_4D(
+         # (P, seq_len/P, bs, hc/P, hs) scatter seqlen -all2all-> (P, seq_len/P, bs, hc/P, hs) scatter head
+ 
+         if seq_world_size > 1:
+-            dist.all_to_all_single(output, input_t, group=group)
++            _all_to_all_call_count[0] += 1
++            call_id = _all_to_all_call_count[0]
++            rank = dist.get_rank(group) if group else dist.get_rank()
++            
++            if _DEBUG_NAN:
++                print(f"[ALL2ALL_DEBUG] Rank {rank}: all_to_all_4D call={call_id}, scatter=2->gather=1, input_shape={input.shape}, world_size={seq_world_size}")
++                start_time = time.time()
++            
++            _all_to_all_single_wrapper(output, input_t, group)
++            
++            if _DEBUG_NAN:
++                elapsed = time.time() - start_time
++                print(f"[ALL2ALL_DEBUG] Rank {rank}: all_to_all_4D call={call_id} done in {elapsed:.3f}s")
++            
+             if use_sync:
+                 torch.cuda.synchronize()
+         else:
+@@ -87,7 +120,20 @@ def all_to_all_4D(
+         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
+         # (P, bs x hc/P, seqlen/P, hs) scatter seqlen -all2all-> (P, bs x seq_len/P, hc/P, hs) scatter head
+         if seq_world_size > 1:
+-            dist.all_to_all_single(output, input_t, group=group)
++            _all_to_all_call_count[0] += 1
++            call_id = _all_to_all_call_count[0]
++            rank = dist.get_rank(group) if group else dist.get_rank()
++            
++            if _DEBUG_NAN:
++                print(f"[ALL2ALL_DEBUG] Rank {rank}: all_to_all_4D call={call_id}, scatter=1->gather=2, input_shape={input.shape}, world_size={seq_world_size}")
++                start_time = time.time()
++            
++            _all_to_all_single_wrapper(output, input_t, group)
++            
++            if _DEBUG_NAN:
++                elapsed = time.time() - start_time
++                print(f"[ALL2ALL_DEBUG] Rank {rank}: all_to_all_4D call={call_id} done in {elapsed:.3f}s")
++            
+             if use_sync:
+                 torch.cuda.synchronize()
+         else:
+@@ -177,7 +223,7 @@ def all_to_all_5D(
+         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
+         # (P, seq_len/P, 3, bs, hc/P, hs) scatter seqlen -all2all-> (P, seq_len/P, 3, bs, hc/P, hs) scatter head
+         if seq_world_size > 1:
+-            dist.all_to_all_single(output, input_t, group=group)
++            _all_to_all_single_wrapper(output, input_t, group)
+             if use_sync:
+                 torch.cuda.synchronize()
+         else:
+@@ -211,7 +257,7 @@ def all_to_all_5D(
+         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
+         # (P, bs x hc/P, seqlen/P, hs) scatter seqlen -all2all-> (P, bs x seq_len/P, hc/P, hs) scatter head
+         if seq_world_size > 1:
+-            dist.all_to_all_single(output, input_t, group=group)
++            _all_to_all_single_wrapper(output, input_t, group)
+             if use_sync:
+                 torch.cuda.synchronize()
+         else:
 diff --git a/yunchang/globals.py b/yunchang/globals.py
 index 6c650ab..abf070b 100644
 --- a/yunchang/globals.py

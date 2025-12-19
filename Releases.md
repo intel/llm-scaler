@@ -2,7 +2,11 @@
 
 ## LLM-Scaler-vLLM
 
-### Latest Beta Release 
+### Latest Production Release 1.2
+* `intel/llm-scaler-vllm:1.2` [12/11/2025]: 
+    - Same image as intel/llm-scaler-vllm:0.10.2-b6
+
+### Previous Releases
 * `intel/llm-scaler-vllm:0.10.2-b6` [11/25/2025]:
     - MoE-Int4 support for Qwen3-30B-A3B
     - Bpe-Qwen tokenizer support
@@ -14,11 +18,6 @@
     - Enable ERNIE-4.5-vl models
     - Enable Glyph based GLM-4.1V-9B-Base
 
-### 1.0 Release 
-* `intel/llm-scaler-vllm:1.0` [08/10/2025]: 
-    - Same image as intel/llm-scaler-vllm:0.2.0-b2 
-
-### Previous Releases
 * `intel/llm-scaler-vllm:1.1-preview` [09/29/2025]:
     - Same image as intel/llm-scaler-vllm:0.10.0-b2
 
@@ -51,7 +50,8 @@
     - Optimize vLLM memory usage by updating profile_run logic
     - Enable/Optimize pipeline parallelism with Ray backend
    
-
+* `intel/llm-scaler-vllm:1.0` [08/10/2025]: 
+    - Same image as intel/llm-scaler-vllm:0.2.0-b2 
 
 * `intel/llm-scaler-vllm:0.2.0-b2` [07/25/2025]:
     - Support by-layer online quantization to reduce the required GPU memory

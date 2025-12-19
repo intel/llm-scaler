@@ -1,5 +1,5 @@
 diff --git a/src/raylight/distributed_worker/ray_worker.py b/src/raylight/distributed_worker/ray_worker.py
-index 3865197..b48ce92 100644
+index 4414fd0..bc6b3b8 100644
 --- a/src/raylight/distributed_worker/ray_worker.py
 +++ b/src/raylight/distributed_worker/ray_worker.py
 @@ -34,6 +34,13 @@ from ray.exceptions import RayActorError
@@ -32,47 +32,34 @@ index 3865197..b48ce92 100644
  
          self.is_model_loaded = False
          self.is_cpu_offload = self.parallel_dict.get("fsdp_cpu_offload", False)
-@@ -58,27 +69,19 @@ class RayWorker:
-         os.environ["NCCL_DEBUG"] = "WARN"
+@@ -59,8 +70,16 @@ class RayWorker:
+         os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
  
-         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
--            os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
--            if sys.platform.startswith("linux"):
--                dist.init_process_group(
--                    "nccl",
--                    rank=local_rank,
--                    world_size=self.global_world_size,
--                    timeout=timedelta(minutes=1),
--                    # device_id=self.device
--                )
--            elif sys.platform.startswith("win"):
--                os.environ["USE_LIBUV"] = "0"
--                dist.init_process_group(
--                    "gloo",
--                    rank=local_rank,
--                    world_size=self.global_world_size,
--                    timeout=timedelta(minutes=1),
--                    # device_id=self.device
--                )
-+            # os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
+         if sys.platform.startswith("linux"):
++            # dist.init_process_group(
++            #     "nccl",
++            #     rank=local_rank,
++            #     world_size=self.global_world_size,
++            #     timeout=timedelta(minutes=1),
++            #     # device_id=self.device
++            # )
 +            torch.xpu.set_device(local_rank)
-+            dist.init_process_group(
+             dist.init_process_group(
+-                "nccl",
 +                "xccl",
-+                rank=local_rank,
-+                world_size=self.global_world_size,
-+                timeout=timedelta(minutes=1),
-+                # device_id=self.device
-+            )
-+            self.device_mesh = dist.device_mesh.init_device_mesh(
-+                "xpu", mesh_shape=(self.global_world_size,)
-+            )
+                 rank=local_rank,
+                 world_size=self.global_world_size,
+                 timeout=timedelta(minutes=1),
+@@ -78,7 +97,7 @@ class RayWorker:
  
--            # (TODO-Komikndr) Should be modified so it can do support DP on top of FSDP
+         # (TODO-Komikndr) Should be modified so it can do support DP on top of FSDP
+         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
 -            self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
++            self.device_mesh = dist.device_mesh.init_device_mesh("xpu", mesh_shape=(self.global_world_size,))
          else:
              print(f"Running Ray in normal seperate sampler with: {self.global_world_size} number of workers")
  
-@@ -380,10 +383,10 @@ class RayWorker:
+@@ -385,10 +404,10 @@ class RayWorker:
              out = latent.copy()
              out["samples"] = samples
  
@@ -87,7 +74,7 @@ index 3865197..b48ce92 100644
          comfy.model_management.soft_empty_cache()
          gc.collect()
          return out
-@@ -455,12 +458,12 @@ class RayWorker:
+@@ -460,12 +479,12 @@ class RayWorker:
              out = latent.copy()
              out["samples"] = samples
  
@@ -104,7 +91,7 @@ index 3865197..b48ce92 100644
          comfy.model_management.soft_empty_cache()
          gc.collect()
          return (out,)
-@@ -468,29 +471,25 @@ class RayWorker:
+@@ -473,29 +492,25 @@ class RayWorker:
  
  class RayCOMMTester:
      def __init__(self, local_rank, world_size, device_id):
@@ -152,7 +139,7 @@ index 3865197..b48ce92 100644
  
          # Each rank contributes rank+1
          x = torch.ones(1, device=device) * (local_rank + 1)
-@@ -520,7 +519,7 @@ def ray_nccl_tester(world_size):
+@@ -525,7 +540,7 @@ def ray_nccl_tester(world_size):
  
      for local_rank in range(world_size):
          gpu_actors.append(
@@ -161,7 +148,7 @@ index 3865197..b48ce92 100644
                  local_rank=local_rank,
                  world_size=world_size,
                  device_id=0,
-@@ -547,7 +546,7 @@ def make_ray_actor_fn(
+@@ -552,7 +567,7 @@ def make_ray_actor_fn(
  
          for local_rank in range(world_size):
              gpu_actors.append(
@@ -171,11 +158,11 @@ index 3865197..b48ce92 100644
                      device_id=0,
                      parallel_dict=parallel_dict,
 diff --git a/src/raylight/nodes.py b/src/raylight/nodes.py
-index 26518f9..4f9d486 100644
+index 27b39ef..483668d 100644
 --- a/src/raylight/nodes.py
 +++ b/src/raylight/nodes.py
-@@ -80,9 +80,9 @@ class RayInitializer:
-         self.parallel_dict = dict()
+@@ -174,9 +174,9 @@ class RayInitializer:
+         _monkey()
  
          world_size = GPU
 -        max_world_size = torch.cuda.device_count()
@@ -188,16 +175,16 @@ index 26518f9..4f9d486 100644
              raise ValueError("Num of cuda/cudalike device is 0")
          if world_size < ulysses_degree * ring_degree * cfg_degree:
 diff --git a/src/raylight/nodes_debug.py b/src/raylight/nodes_debug.py
-index 5631ad0..a6af288 100644
+index 0e0f2b8..ca56612 100644
 --- a/src/raylight/nodes_debug.py
 +++ b/src/raylight/nodes_debug.py
-@@ -75,7 +75,8 @@ class RayInitializerDebug:
+@@ -76,7 +76,8 @@ class RayInitializerDebug:
+         self.parallel_dict = dict()
  
-         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
          world_size = GPU
 -        max_world_size = torch.cuda.device_count()
 +        # max_world_size = torch.cuda.device_count()
 +        max_world_size = 8  # For Intel GPU, just set max to 8 for now
          if world_size > max_world_size:
-             raise ValueError("To many gpus")
- 
+             raise ValueError("Too many gpus")
+         if world_size == 0:
