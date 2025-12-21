@@ -59,7 +59,7 @@ export http_proxy=<your_proxy>
 export https_proxy=<your_proxy>
 export no_proxy=localhost,127.0.0.1
 
-python3 main.py
+python3 main.py --listen 0.0.0.0
 ```
 
 Then you can access the webUI at `http://<your_local_ip>:8188/`. 
