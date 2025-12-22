@@ -2891,6 +2891,9 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | Multimodal Model     | zai-org/GLM-4.1V-9B-Thinking               |  ✅  |         ✅         |          ✅          |       |                           |
 | Multimodal Model     | zai-org/Glyph                              |  ✅  |         ✅         |          ✅          |       |                           |
 | Multimodal Model     | opendatalab/MinerU2.5-2509-1.2B            |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | baidu/ERNIE-4.5-VL-28B-A3B-Thinking        |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | zai-org/GLM-4.6V-Flash                     |  ✅  |         ✅         |          ✅          |       |   pip install transformers==5.0.0rc0 first            |
+| Multimodal Model     | PaddlePaddle/PaddleOCR-VL                  |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](#32-how-to-use-paddleocr)     |
 | omni                 | Qwen/Qwen2.5-Omni-7B                       |  ✅  |         ✅         |          ✅          |       |                           |
 | omni                 | Qwen/Qwen3-Omni-30B-A3B-Instruct           |  ✅  |         ✅         |          ✅          |       |                           |
 | audio                | openai/whisper-medium                      |  ✅  |         ✅         |          ✅          |       |                           |
@@ -2927,6 +2930,53 @@ curl http://localhost:8001/v1/chat/completions -H 'Content-Type: application/jso
 ],
 "max_tokens": 128
 }'
+```
+
+### 3.2 how to use paddleocr
+
+Need to use the specified format to use paddleocr.
+```bash
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="EMPTY",
+    base_url="http://localhost:8002/v1",
+    timeout=3600
+)
+
+# Task-specific base prompts
+TASKS = {
+    "ocr": "OCR:",
+    "table": "Table Recognition:",
+    "formula": "Formula Recognition:",
+    "chart": "Chart Recognition:",
+}
+
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://ofasys-multimodal-wlcb-3-toshanghai.oss-accelerate.aliyuncs.com/wpf272043/keepme/image/receipt.png"
+                }
+            },
+            {
+                "type": "text",
+                "text": TASKS["ocr"]
+            }
+        ]
+    }
+]
+
+response = client.chat.completions.create(
+    model="PaddleOCR-VL",
+    messages=messages,
+    temperature=0.0,
+    max_tokens=128,
+)
+print(f"Generated text: {response.choices[0].message.content}")
 ```
 
 ## 4. Troubleshooting
