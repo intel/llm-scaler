@@ -50,6 +50,8 @@ docker exec -it comfyui bash
 
 ## ComfyUI
 
+> **📖 Detailed Documentation**: See [ComfyUI Detailed Guide](./docs/ComfyUI_Guide.md) for complete model configuration, directory structure, and official reference links. [中文文档](./docs/ComfyUI_Guide_CN.md)
+
 ### Starting ComfyUI
 
 ```bash
@@ -75,11 +77,11 @@ Modify the `Preview method` to show the preview image during sampling iterations
 
 ### Supported Models
 
-The following models are supported in ComfyUI workflows:
+The following models are supported in ComfyUI workflows. For detailed model files and directory structure, see the [ComfyUI Guide](./docs/ComfyUI_Guide.md#model-directory-structure).
 
 | Model Category | Model Name | Type | Workflow Files |
 |---------------|------------|------|----------------|
-| **Image Generation** | Qwen-Image, Qwen-Image-Edit | Text-to-Image, Image Editing | `image_qwen_image.json`, `image_qwen_image_distill.json`, `image_qwen_image_edit.json`, `image_qwen_image_edit_2509.json` |
+| **Image Generation** | Qwen-Image, Qwen-Image-Edit | Text-to-Image, Image Editing | `image_qwen_image.json`, `image_qwen_image_distill.json`, `image_qwen_image_edit.json`, `image_qwen_image_edit_2509.json`, `image_qwen_image_layered.json` |
 | **Image Generation** | Stable Diffusion 3.5 | Text-to-Image, ControlNet | `image_sd3.5_simple_example.json`, `image_sd3.5_midium.json`, `image_sd3.5_large_canny_controlnet_example.json` |
 | **Image Generation** | Z-Image-Turbo | Text-to-Image |  `image_z_image_turbo.json` |
 | **Image Generation** | Flux.1, Flux.1 Kontext dev | Text-to-Image, Multi-Image Reference, ControlNet | `image_flux_kontext_dev_basic.json`, `image_flux_controlnet_example.json` |
@@ -87,7 +89,7 @@ The following models are supported in ComfyUI workflows:
 | **Video Generation** | Wan2.2 Animate 14B | Video Animation | `video_wan2_2_animate_basic.json` |
 | **Video Generation** | HunyuanVideo 1.5 8.3B | Text-to-Video, Image-to-Video | `video_hunyuan_video_1.5_t2v.json`, `video_hunyuan_video_1.5_i2v.json`, `video_hunyuan_video_1.5_i2v_multi_xpu.json` |
 | **3D Generation** | Hunyuan3D 2.1 | Text/Image-to-3D | `3d_hunyuan3d.json` |
-| **Audio Generation** | VoxCPM | Text-to-Speech | `audio_VoxCPM_example.json` |
+| **Audio Generation** | VoxCPM, IndexTTS 2 | Text-to-Speech, Voice Cloning | `audio_VoxCPM_example.json`, `audio_indextts2.json` |
 
 ### ComfyUI Workflows
 
@@ -98,6 +100,8 @@ All workflow files are available in the `workflows/` directory. Below are detail
 
 #### Image Generation Workflows
 
+> **📖 Detailed Documentation**: For model files, directory structure and download links, see [Image Generation Models](./docs/ComfyUI_Guide.md#image-generation-models).
+
 ##### Qwen-Image
 
 ComfyUI tutorial: https://docs.comfy.org/tutorials/image/qwen/qwen-image
@@ -105,6 +109,7 @@ ComfyUI tutorial: https://docs.comfy.org/tutorials/image/qwen/qwen-image
 **Available Workflows:**
 - **image_qwen_image.json**: Native Qwen-Image workflow for text-to-image generation
 - **image_qwen_image_distill.json**: Distilled version with better performance (recommended)
+- **image_qwen_image_layered.json**: Layered image generation workflow
 
 > **Note:** Only the native workflow is fully validated. There are some issues using LoRA. It's recommended to use the distilled version for better performance.
 
@@ -144,6 +149,8 @@ ComfyUI tutorial: https://docs.comfy.org/tutorials/flux/flux-1-kontext-dev
 - **image_flux_kontext_dev_basic.json**: Basic workflow with multi-image reference support
 
 #### Video Generation Workflows
+
+> **📖 Detailed Documentation**: For model files, directory structure and download links, see [Video Generation Models](./docs/ComfyUI_Guide.md#video-generation-models).
 
 ##### Wan2.2
 
@@ -199,6 +206,8 @@ The default parameter configurations of these workflows are optimized for 480p F
 
 #### 3D Generation Workflows
 
+> **📖 Detailed Documentation**: For model configuration details, see [3D Generation Models](./docs/ComfyUI_Guide.md#3d-generation-models).
+
 ##### Hunyuan3D
 
 **Available Workflows:**
@@ -207,6 +216,8 @@ The default parameter configurations of these workflows are optimized for 480p F
 This workflow generates 3D models from text descriptions or images using the Hunyuan3D model.
 
 #### Audio Generation Workflows
+
+> **📖 Detailed Documentation**: For model files and setup instructions, see [Audio Generation Models](./docs/ComfyUI_Guide.md#audio-generation-models).
 
 ##### VoxCPM
 
