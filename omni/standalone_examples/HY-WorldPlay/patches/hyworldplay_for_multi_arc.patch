@@ -242,13 +242,13 @@ index 6c5c81c..5766d5d 100644
 +) -> torch.Tensor:
 +    """
 +    Memory-efficient chunked scaled dot-product attention.
-+    Chunk the query sequence to reduce peak memory usage.
++    Compute attention by chunking the query to reduce peak memory usage.
 +    
 +    Args:
 +        query: [B, H, L_q, D]
 +        key: [B, H, L_kv, D]  
 +        value: [B, H, L_kv, D]
-+        chunk_size: Query chunk size.
++        chunk_size: Query chunk size
 +        attn_mask: Optional attention mask
 +        
 +    Returns:
@@ -257,7 +257,7 @@ index 6c5c81c..5766d5d 100644
 +    B, H, L_q, D = query.shape
 +    L_kv = key.shape[2]
 +    
-+    # 如果序列长度小于 chunk_size，直接用标准 SDPA
++    # If sequence length is smaller than chunk_size, use standard SDPA directly
 +    if L_q <= chunk_size:
 +        return F.scaled_dot_product_attention(
 +            query, key, value,
@@ -266,7 +266,7 @@ index 6c5c81c..5766d5d 100644
 +            is_causal=False
 +        )
 +    
-+    # 分块计算
++    # Chunked computation
 +    outputs = []
 +    num_chunks = (L_q + chunk_size - 1) // chunk_size
 +    
@@ -276,14 +276,14 @@ index 6c5c81c..5766d5d 100644
 +        
 +        q_chunk = query[:, :, start_idx:end_idx, :]
 +        
-+        # 处理 mask（如果有）
++        # Process mask (if any)
 +        chunk_mask = None
 +        if attn_mask is not None:
 +            # attn_mask shape: [B, 1, L_q, L_kv] or [B, 1, L_q, 1] & [B, 1, 1, L_kv]
 +            if attn_mask.dim() == 4:
 +                chunk_mask = attn_mask[:, :, start_idx:end_idx, :]
 +        
-+        # 计算当前 chunk 的注意力
++        # Compute attention for current chunk
 +        out_chunk = F.scaled_dot_product_attention(
 +            q_chunk, key, value,
 +            attn_mask=chunk_mask,
@@ -292,12 +292,12 @@ index 6c5c81c..5766d5d 100644
 +        )
 +        outputs.append(out_chunk)
 +        
-+        # 释放中间变量
++        # Free intermediate variables
 +        del q_chunk, out_chunk
 +        if chunk_mask is not None:
 +            del chunk_mask
 +    
-+    # 拼接结果
++    # Concatenate results
 +    output = torch.cat(outputs, dim=2)
 +    return output
 +
@@ -351,7 +351,7 @@ index 6c5c81c..5766d5d 100644
 +            attn_mask2 = einops.rearrange(attn_mask1, 'b 1 l 1 -> b 1 1 l')
 +            attn_mask = attn_mask1 & attn_mask2
 +        
-+        # Use chunked attention, where chunk_size is obtained from infer_state
++        # Use chunked attention, get chunk_size from infer_state
 +        chunk_size = get_infer_state().attn_chunk_size if get_infer_state() else 2048
 +        hidden_states = chunked_sdpa(
 +            query, key, value,
@@ -930,7 +930,7 @@ index 97aa0d6..8fc8a92 100644
  AR_DISTILL_ACTION_MODEL_PATH=    # Path to our HY-World 1.5 autoregressive distilled checkpoints
  POSE_JSON_PATH=./assets/pose/test_forward_32_latents.json   # Path to the customized camera trajectory
 -NUM_FRAMES=125
-+NUM_FRAMES=125     # Restore original frame count; use chunked attention to reduce memory usage
++NUM_FRAMES=125     # Restored original frame count, using chunked attention to reduce memory usage
  WIDTH=832
  HEIGHT=480
  
