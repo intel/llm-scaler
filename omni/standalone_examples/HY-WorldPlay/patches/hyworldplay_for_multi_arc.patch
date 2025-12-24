@@ -351,7 +351,7 @@ index 6c5c81c..5766d5d 100644
 +            attn_mask2 = einops.rearrange(attn_mask1, 'b 1 l 1 -> b 1 1 l')
 +            attn_mask = attn_mask1 & attn_mask2
 +        
-+        # 使用分块注意力，chunk_size 从 infer_state 获取
++        # Use chunked attention, where chunk_size is obtained from infer_state
 +        chunk_size = get_infer_state().attn_chunk_size if get_infer_state() else 2048
 +        hidden_states = chunked_sdpa(
 +            query, key, value,
