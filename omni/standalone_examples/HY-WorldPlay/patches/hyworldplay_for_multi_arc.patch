@@ -242,13 +242,13 @@ index 6c5c81c..5766d5d 100644
 +) -> torch.Tensor:
 +    """
 +    Memory-efficient chunked scaled dot-product attention.
-+    将 Query 分块计算，减少峰值显存使用。
++    Chunk the query sequence to reduce peak memory usage.
 +    
 +    Args:
 +        query: [B, H, L_q, D]
 +        key: [B, H, L_kv, D]  
 +        value: [B, H, L_kv, D]
-+        chunk_size: Query 分块大小
++        chunk_size: Query chunk size.
 +        attn_mask: Optional attention mask
 +        
 +    Returns:
