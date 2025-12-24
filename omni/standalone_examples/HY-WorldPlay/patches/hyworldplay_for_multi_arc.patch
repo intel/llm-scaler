@@ -1,0 +1,965 @@
+diff --git a/generate.py b/generate.py
+index bc13f45..63963a1 100644
+--- a/generate.py
++++ b/generate.py
+@@ -32,8 +32,23 @@ from hyvideo.pipelines.worldplay_video_pipeline import HunyuanVideo_1_5_Pipeline
+ from hyvideo.commons.parallel_states import initialize_parallel_state
+ from hyvideo.commons.infer_state import initialize_infer_state
+ 
+-parallel_dims = initialize_parallel_state(sp=int(os.environ.get('WORLD_SIZE', '1')))
+-torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
++# parallel_dims = initialize_parallel_state(sp=int(os.environ.get('WORLD_SIZE', '1')))
++# torch.xpu.set_device(int(os.environ.get('LOCAL_RANK', '0')))
++
++import torch.distributed as dist
++local_rank = int(os.environ.get('LOCAL_RANK', '0'))
++world_size = int(os.environ.get('WORLD_SIZE', '1'))
++from datetime import timedelta
++
++dist.init_process_group(
++    "xccl",
++    rank=local_rank,
++    world_size=world_size,
++    timeout=timedelta(minutes=1),
++    # device_id=self.device
++)
++torch.xpu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
++parallel_dims = initialize_parallel_state(sp=int(os.environ.get("WORLD_SIZE", "1")))
+ 
+ mapping = {
+             (0,0,0,0): 0,
+@@ -123,7 +138,7 @@ def pose_to_input(pose_json_path, latent_chunk_num, tps=False):
+     rotate_one_label = one_hot_to_one_dimension(rotate_one_hot)
+     action_one_label = trans_one_label * 9 + rotate_one_label
+ 
+-    return torch.tensor(w2c_list), torch.tensor(intrinsic_list), action_one_label
++    return torch.from_numpy(w2c_list), intrinsic_list, action_one_label
+ 
+ def save_video(video, path):
+     if video.ndim == 5:
+@@ -349,6 +364,15 @@ def main():
+         '--width', type=int, default=None,
+         help='width for generation (recommended to set as 832)'
+     )
++    parser.add_argument(
++        '--chunked_attn', type=str_to_bool, nargs='?', const=True, default=False,
++        help='Enable chunked attention for memory efficiency (default: false). '
++             'Use --chunked_attn or --chunked_attn true/1 to enable'
++    )
++    parser.add_argument(
++        '--attn_chunk_size', type=int, default=8192,
++        help='Chunk size for chunked attention (default: 8192). Smaller = less memory but slower'
++    )
+ 
+     args = parser.parse_args()
+     
+diff --git a/hyvideo/commons/__init__.py b/hyvideo/commons/__init__.py
+index 1ea2d80..94f33b4 100644
+--- a/hyvideo/commons/__init__.py
++++ b/hyvideo/commons/__init__.py
+@@ -132,6 +132,7 @@ TRANSFORMER_VERSION_TO_SR_VERSION = {
+ }
+ 
+ def is_flash2_available():
++    return False
+     try:
+         from flash_attn import flash_attn_varlen_qkvpacked_func
+         return True
+@@ -139,6 +140,7 @@ def is_flash2_available():
+         return False
+ 
+ def is_flash3_available():
++    return False
+     try:
+         from flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_v3  # noqa: F401
+         return True
+@@ -146,12 +148,15 @@ def is_flash3_available():
+         return False
+ 
+ def is_flash_available():
++    return False
+     return is_flash2_available() or is_flash3_available()
+ 
+ def is_sparse_attn_supported():
++    return False
+     return 'nvidia h' in torch.cuda.get_device_properties(0).name.lower()
+ 
+ def is_sparse_attn_available():
++    return False
+     if not is_sparse_attn_supported():
+         return False
+     try:
+@@ -206,6 +211,13 @@ def maybe_fallback_attn_mode(attn_mode, infer_state=None, block_idx=None):
+         if not is_flash2_available():
+             warnings.warn("flash2 is not available. Falling back to torch attention.")
+             attn_mode = 'torch'
++    
++    # Use chunked attention for memory efficiency if configured (after flash fallback)
++    if infer_state is not None and infer_state.enable_chunked_attn:
++        if attn_mode == 'torch':
++            attn_mode = 'torch_chunked'
++            return attn_mode
++    
+     if attn_mode in ('flex-block-attn'):
+         from hyvideo.commons import is_sparse_attn_available
+         if not is_sparse_attn_available():
+@@ -228,12 +240,13 @@ def auto_offload_model(models, device, enabled=True):
+                 model.to(torch.device('cpu'))
+ 
+ def get_gpu_memory(device=None):
+-    if not torch.cuda.is_available():
++    return 20 * 1024 * 1024 * 1024
++    if not torch.xpu.is_available():
+         return 0
+-    device = device if device is not None else torch.cuda.current_device()
+-    props = torch.cuda.get_device_properties(device)
+-    if hasattr(torch.cuda, 'get_per_process_memory_fraction'):
+-        memory_fraction = torch.cuda.get_per_process_memory_fraction()
++    device = device if device is not None else torch.xpu.current_device()
++    props = torch.xpu.get_device_properties(device)
++    if hasattr(torch.xpu, 'get_per_process_memory_fraction'):
++        memory_fraction = torch.xpu.get_per_process_memory_fraction()
+     else:
+         memory_fraction = 1.0
+     return props.total_memory * memory_fraction
+diff --git a/hyvideo/commons/infer_state.py b/hyvideo/commons/infer_state.py
+index 63ac5e7..4d6fb15 100644
+--- a/hyvideo/commons/infer_state.py
++++ b/hyvideo/commons/infer_state.py
+@@ -22,6 +22,8 @@ class InferState:
+     enable_sageattn: bool = False  # whether to use SageAttention
+     sage_blocks_range: Optional[range] = None  # block range to use SageAttention
+     enable_torch_compile: bool = False  # whether to use torch compile
++    enable_chunked_attn: bool = False  # whether to use chunked attention for memory efficiency
++    attn_chunk_size: int = 8192  # chunk size for chunked attention
+ 
+ __infer_state = None
+ 
+@@ -37,10 +39,18 @@ def initialize_infer_state(args):
+     sage_blocks_range = None
+     # Map CLI argument use_sageattn to internal enable_sageattn field
+     use_sageattn = False
++    # Enable chunked attention for memory efficiency
++    enable_chunked_attn = getattr(args, 'chunked_attn', False)
++    attn_chunk_size = getattr(args, 'attn_chunk_size', 2048)
++    
++    print(f"[InferState] enable_chunked_attn={enable_chunked_attn}, attn_chunk_size={attn_chunk_size}")
++    
+     __infer_state = InferState(
+         enable_sageattn = use_sageattn,
+         sage_blocks_range = sage_blocks_range,
+         enable_torch_compile = args.enable_torch_compile,
++        enable_chunked_attn = enable_chunked_attn,
++        attn_chunk_size = attn_chunk_size,
+     )
+     return __infer_state
+ 
+diff --git a/hyvideo/commons/parallel_states.py b/hyvideo/commons/parallel_states.py
+index 190c5f0..6769a16 100644
+--- a/hyvideo/commons/parallel_states.py
++++ b/hyvideo/commons/parallel_states.py
+@@ -31,7 +31,7 @@ class ParallelDims:
+                 self.world_size = dist.get_world_size()
+             else:
+                 self.world_size = int(os.getenv("WORLD_SIZE", "1"))
+-        self.build_mesh("cuda")
++        self.build_mesh("xpu")
+ 
+     def build_mesh(self, device_type):
+         assert self.world_size % self.sp == 0, "world_size must be divisible by sp"
+diff --git a/hyvideo/models/autoencoders/hunyuanvideo_15_vae_w_cache.py b/hyvideo/models/autoencoders/hunyuanvideo_15_vae_w_cache.py
+index 1c2456a..6161fc5 100644
+--- a/hyvideo/models/autoencoders/hunyuanvideo_15_vae_w_cache.py
++++ b/hyvideo/models/autoencoders/hunyuanvideo_15_vae_w_cache.py
+@@ -942,8 +942,30 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
+             row = []
+             for j in range(0, W, overlap_size):
+                 tile = z[:, :, :, i: i + self.tile_latent_min_size, j: j + self.tile_latent_min_size]
+-                decoded = self.decoder(tile)
++                # Decode tile frame by frame to save memory
++                self.clear_cache()
++                decoded_frames = []
++                for t in range(T):
++                    self._conv_idx = [0]
++                    if t == 0:
++                        frame_out = self.decoder(
++                            tile[:, :, t:t+1, :, :], 
++                            feat_cache=self._feat_map, 
++                            feat_idx=self._conv_idx, 
++                            first_chunk=True
++                        )
++                    else:
++                        frame_out = self.decoder(
++                            tile[:, :, t:t+1, :, :], 
++                            feat_cache=self._feat_map, 
++                            feat_idx=self._conv_idx
++                        )
++                    decoded_frames.append(frame_out)
++                decoded = torch.cat(decoded_frames, dim=2)
++                self.clear_cache()
+                 row.append(decoded)
++                # Free memory after each tile
++                torch.xpu.empty_cache()
+             rows.append(row)
+ 
+         result_rows = []
+diff --git a/hyvideo/models/text_encoders/byT5/__init__.py b/hyvideo/models/text_encoders/byT5/__init__.py
+index 5937758..1dbc74a 100644
+--- a/hyvideo/models/text_encoders/byT5/__init__.py
++++ b/hyvideo/models/text_encoders/byT5/__init__.py
+@@ -70,7 +70,7 @@ def create_byt5(args, device):
+ 
+     # Load custom checkpoint if provided
+     if args['byT5_ckpt_path'] is not None:
+-        if "cuda" not in str(device):
++        if "xpu" not in str(device):
+             byt5_state_dict = torch.load(args['byT5_ckpt_path'], map_location=device)
+         else:
+             byt5_state_dict = torch.load(args['byT5_ckpt_path'], map_location=device)
+@@ -165,7 +165,7 @@ def load_byt5_and_byt5_tokenizer(
+         cache_dir=huggingface_cache_dir,
+     ).get_encoder()
+ 
+-    if "cuda" not in str(device):
++    if "xpu" not in str(device):
+         device = torch.device(device)
+     else:
+         device = torch.device(device)
+diff --git a/hyvideo/models/transformers/modules/attention.py b/hyvideo/models/transformers/modules/attention.py
+index 6c5c81c..5766d5d 100644
+--- a/hyvideo/models/transformers/modules/attention.py
++++ b/hyvideo/models/transformers/modules/attention.py
+@@ -47,6 +47,75 @@ from hyvideo.models.transformers.modules.ssta_attention import ssta_3d_attention
+ from hyvideo.commons.infer_state import get_infer_state
+ 
+ 
++def chunked_sdpa(
++    query: torch.Tensor,
++    key: torch.Tensor, 
++    value: torch.Tensor,
++    chunk_size: int = 4096,
++    attn_mask: Optional[torch.Tensor] = None,
++) -> torch.Tensor:
++    """
++    Memory-efficient chunked scaled dot-product attention.
++    将 Query 分块计算，减少峰值显存使用。
++    
++    Args:
++        query: [B, H, L_q, D]
++        key: [B, H, L_kv, D]  
++        value: [B, H, L_kv, D]
++        chunk_size: Query 分块大小
++        attn_mask: Optional attention mask
++        
++    Returns:
++        output: [B, H, L_q, D]
++    """
++    B, H, L_q, D = query.shape
++    L_kv = key.shape[2]
++    
++    # 如果序列长度小于 chunk_size，直接用标准 SDPA
++    if L_q <= chunk_size:
++        return F.scaled_dot_product_attention(
++            query, key, value,
++            attn_mask=attn_mask,
++            dropout_p=0.0,
++            is_causal=False
++        )
++    
++    # 分块计算
++    outputs = []
++    num_chunks = (L_q + chunk_size - 1) // chunk_size
++    
++    for i in range(num_chunks):
++        start_idx = i * chunk_size
++        end_idx = min(start_idx + chunk_size, L_q)
++        
++        q_chunk = query[:, :, start_idx:end_idx, :]
++        
++        # 处理 mask（如果有）
++        chunk_mask = None
++        if attn_mask is not None:
++            # attn_mask shape: [B, 1, L_q, L_kv] or [B, 1, L_q, 1] & [B, 1, 1, L_kv]
++            if attn_mask.dim() == 4:
++                chunk_mask = attn_mask[:, :, start_idx:end_idx, :]
++        
++        # 计算当前 chunk 的注意力
++        out_chunk = F.scaled_dot_product_attention(
++            q_chunk, key, value,
++            attn_mask=chunk_mask,
++            dropout_p=0.0,
++            is_causal=False
++        )
++        outputs.append(out_chunk)
++        
++        # 释放中间变量
++        del q_chunk, out_chunk
++        if chunk_mask is not None:
++            del chunk_mask
++    
++    # 拼接结果
++    output = torch.cat(outputs, dim=2)
++    return output
++
++
+ 
+ @torch.compiler.disable
+ def attention(
+@@ -269,6 +338,9 @@ def sequence_parallel_attention(q, k, v,
+     query, encoder_query = q
+     key, encoder_key = k
+     value, encoder_value = v
++    
++    # Save original dtype for later use (before query is deleted)
++    original_dtype = query.dtype
+ 
+     parallel_dims = get_parallel_state()
+     enable_sp = parallel_dims.sp_enabled
+@@ -322,6 +394,7 @@ def sequence_parallel_attention(q, k, v,
+                 attn_mask = attn_mask.to(query.dtype)
+                 raise NotImplementedError(f'Float attention mask is not implemented for torch attention.')
+             
++        torch.xpu.empty_cache()
+         # transpose q,k,v dim to fit scaled_dot_product_attention
+         query = query.transpose(1, 2)  # B * Head_num * length * dim
+         key = key.transpose(1, 2)      # B * Head_num * length * dim
+@@ -342,6 +415,41 @@ def sequence_parallel_attention(q, k, v,
+         # transpose back
+         hidden_states = hidden_states.transpose(1, 2)
+ 
++    # Memory-efficient chunked attention
++    elif attn_mode == "torch_chunked":
++        query = torch.cat([query, encoder_query], dim=1)
++        key = torch.cat([key, encoder_key], dim=1)
++        value = torch.cat([value, encoder_value], dim=1)
++        if text_mask is not None:
++            attn_mask = F.pad(text_mask, (sequence_length, 0), value=True)
++        else:
++            attn_mask = None
++
++        if attn_mask is not None:
++            if attn_mask.dtype != torch.bool and attn_mask.dtype in [torch.int64, torch.int32]:
++                attn_mask = attn_mask.to(torch.bool)
++            
++        torch.xpu.empty_cache()
++        # transpose q,k,v dim to fit scaled_dot_product_attention
++        query = query.transpose(1, 2)  # B * Head_num * length * dim
++        key = key.transpose(1, 2)      # B * Head_num * length * dim
++        value = value.transpose(1, 2)  # B * Head_num * length * dim
++        if attn_mask is not None:
++            attn_mask1 = einops.rearrange(attn_mask, 'b l -> b 1 l 1')
++            attn_mask2 = einops.rearrange(attn_mask1, 'b 1 l 1 -> b 1 1 l')
++            attn_mask = attn_mask1 & attn_mask2
++        
++        # 使用分块注意力，chunk_size 从 infer_state 获取
++        chunk_size = get_infer_state().attn_chunk_size if get_infer_state() else 2048
++        hidden_states = chunked_sdpa(
++            query, key, value,
++            chunk_size=chunk_size,
++            attn_mask=attn_mask,
++        )
++        
++        # transpose back
++        hidden_states = hidden_states.transpose(1, 2)
++
+     # add new attn for chunk-wise attn
+     elif attn_mode == "torch_causal":  # now: we set text_mask = None
+         # attention: here we concat the encoder text sequence first, then apply causal attention
+@@ -476,15 +584,20 @@ def sequence_parallel_attention(q, k, v,
+             f'Unsupported attention mode: {attn_mode}.'
+         )
+ 
++    # Free intermediate variables to reduce memory pressure before all_gather
++    del query, key, value, encoder_query, encoder_key, encoder_value
++    torch.xpu.empty_cache()
+ 
+     if enable_sp:
+         hidden_states, encoder_hidden_states = hidden_states.split_with_sizes(
+                                                                         (sequence_length, encoder_sequence_length), 
+                                                                         dim=1)
+         hidden_states = all_to_all_4D(hidden_states, sp_group, scatter_dim=1, gather_dim=2)
++        # Clear cache before all_gather to ensure memory is available
++        torch.xpu.empty_cache()
+         encoder_hidden_states = all_gather(encoder_hidden_states, dim=2, group=sp_group).contiguous()
+-        hidden_states = hidden_states.to(query.dtype)
+-        encoder_hidden_states = encoder_hidden_states.to(query.dtype)
++        hidden_states = hidden_states.to(original_dtype)
++        encoder_hidden_states = encoder_hidden_states.to(original_dtype)
+         hidden_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
+ 
+     b, s, a, d = hidden_states.shape
+diff --git a/hyvideo/models/transformers/worldplay_1_5_transformer.py b/hyvideo/models/transformers/worldplay_1_5_transformer.py
+index c97f10b..c163fbc 100644
+--- a/hyvideo/models/transformers/worldplay_1_5_transformer.py
++++ b/hyvideo/models/transformers/worldplay_1_5_transformer.py
+@@ -1326,6 +1326,9 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin):
+                     is_flash=force_full_attn,
+                     block_idx=index,
+                 )
++            # Periodically clear cache to prevent memory accumulation
++            if (index + 1) % 5 == 0:
++                torch.xpu.empty_cache()
+ 
+         # Final Layer
+         img = self.final_layer(img, vec)
+diff --git a/hyvideo/pipelines/hunyuan_video_sr_pipeline.py b/hyvideo/pipelines/hunyuan_video_sr_pipeline.py
+index 50c2564..a5c50b4 100644
+--- a/hyvideo/pipelines/hunyuan_video_sr_pipeline.py
++++ b/hyvideo/pipelines/hunyuan_video_sr_pipeline.py
+@@ -403,7 +403,7 @@ class HunyuanVideo_1_5_SR_Pipeline(HunyuanVideo_1_5_Pipeline):
+                     else None
+                 )
+ 
+-                with torch.autocast(device_type="cuda", dtype=self.target_dtype, enabled=self.autocast_enabled):
++                with torch.autocast(device_type="xpu", dtype=self.target_dtype, enabled=self.autocast_enabled):
+                     output = self.transformer(
+                         latent_model_input,
+                         t_expand,
+@@ -456,7 +456,7 @@ class HunyuanVideo_1_5_SR_Pipeline(HunyuanVideo_1_5_Pipeline):
+ 
+             if hasattr(self.vae, 'enable_tile_parallelism'):
+                 self.vae.enable_tile_parallelism()
+-            with (torch.autocast(device_type="cuda", dtype=self.vae_dtype, enabled=self.vae_autocast_enabled),
++            with (torch.autocast(device_type="xpu", dtype=self.vae_dtype, enabled=self.vae_autocast_enabled),
+                   auto_offload_model(self.vae, self.execution_device, enabled=self.enable_offloading)):
+                 self.vae.enable_tiling()
+                 video_frames = self.vae.decode(latents, return_dict=False, generator=generator)[0]
+diff --git a/hyvideo/pipelines/worldplay_video_pipeline.py b/hyvideo/pipelines/worldplay_video_pipeline.py
+index 460950b..9d53714 100644
+--- a/hyvideo/pipelines/worldplay_video_pipeline.py
++++ b/hyvideo/pipelines/worldplay_video_pipeline.py
+@@ -156,7 +156,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+             self.byt5_model = None
+             self.byt5_tokenizer = None
+ 
+-
+         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+         self.text_len = text_encoder.max_length
+@@ -180,7 +179,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+             "1080p": {"bucket_hw_base_size": 1440, "bucket_hw_bucket_stride": 16},
+         }
+ 
+-
+     @classmethod
+     def _create_scheduler(cls, flow_shift):
+         scheduler = FlowMatchDiscreteScheduler(
+@@ -220,7 +218,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+                 )
+                 byT5_google_path = "google/byt5-small"
+ 
+-
+             multilingual_prompt_format_color_path = os.path.join(glyph_root, "assets/color_idx.json")
+             multilingual_prompt_format_font_path = os.path.join(glyph_root, "assets/multilingual_10-lang_idx.json")
+ 
+@@ -241,7 +238,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+         except Exception as e:
+             raise RuntimeError("Error loading byT5 glyph processor") from e
+ 
+-
+     def encode_prompt(
+         self,
+         prompt,
+@@ -411,7 +407,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+             negative_attention_mask,
+         )
+ 
+-
+     def prepare_extra_func_kwargs(self, func, kwargs):
+         """
+         Prepare extra keyword arguments for scheduler functions.
+@@ -427,7 +422,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+                 extra_step_kwargs[k] = v
+         return extra_step_kwargs
+ 
+-
+     def prepare_latents(
+         self,
+         batch_size,
+@@ -606,23 +600,23 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+         """
+         byt5_embeddings = torch.zeros((1, self.byt5_max_length, 1472), device=device)
+         byt5_mask = torch.zeros((1, self.byt5_max_length), device=device, dtype=torch.int64)
+-        
++
+         glyph_texts = self._extract_glyph_texts(prompt_text)
+-        
++
+         if len(glyph_texts) > 0:
+             text_styles = [{'color': None, 'font-family': None} for _ in range(len(glyph_texts))]
+             formatted_text = self.prompt_format.format_prompt(glyph_texts, text_styles)
+-            
++
+             text_ids, text_mask = self.get_byt5_text_tokens(
+                 self.byt5_tokenizer, self.byt5_max_length, formatted_text
+             )
+             text_ids = text_ids.to(device=device)
+             text_mask = text_mask.to(device=device)
+-            
++
+             byt5_outputs = self.byt5_model(text_ids, attention_mask=text_mask.float())
+             byt5_embeddings = byt5_outputs[0]
+             byt5_mask = text_mask
+-            
++
+         return byt5_embeddings, byt5_mask
+ 
+     def _prepare_byt5_embeddings(self, prompts, device):
+@@ -641,7 +635,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+         """
+         if not self.config.glyph_byT5_v2:
+             return {}
+-            
++
+         if isinstance(prompts, str):
+             prompt_list = [prompts]
+         elif isinstance(prompts, list):
+@@ -666,11 +660,11 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+ 
+         byt5_positive = torch.cat(positive_embeddings, dim=0)
+         byt5_positive_mask = torch.cat(positive_masks, dim=0)
+-        
++
+         if self.do_classifier_free_guidance:
+             byt5_negative = torch.cat(negative_embeddings, dim=0)
+             byt5_negative_mask = torch.cat(negative_masks, dim=0)
+-            
++
+             byt5_embeddings = torch.cat([byt5_negative, byt5_positive], dim=0)
+             byt5_masks = torch.cat([byt5_negative_mask, byt5_positive_mask], dim=0)
+         else:
+@@ -733,11 +727,11 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+                 vision_states = vision_states.last_hidden_state.to(device=device, dtype=self.target_dtype)
+             else:
+                 vision_states = None
+-        
++
+         # Repeat image features for batch size if needed (for classifier-free guidance)
+         if self.do_classifier_free_guidance and vision_states is not None:
+             vision_states = vision_states.repeat(2, 1, 1)
+-        
++
+         return vision_states
+ 
+     def _prepare_cond_latents(self, task_type, cond_latents, latents, multitask_mask):
+@@ -757,7 +751,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+         """
+         latents_concat = None
+         mask_concat = None
+-        
++
+         if cond_latents is not None and task_type == 'i2v':
+             latents_concat = cond_latents.repeat(1, 1, latents.shape[2], 1, 1)
+             latents_concat[:, :, 1:, :, :] = 0.0
+@@ -769,7 +763,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+                                     latents.shape[3], 
+                                     latents.shape[4]
+                                     ).to(latents.device)
+-        
++
+         mask_zeros = torch.zeros(latents.shape[0], 1, latents.shape[2], latents.shape[3], latents.shape[4])
+         mask_ones = torch.ones(latents.shape[0], 1, latents.shape[2], latents.shape[3], latents.shape[4])
+         mask_concat = merge_tensor_by_mask(
+@@ -780,7 +774,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+                                         ).to(device=latents.device)
+ 
+         cond_latents = torch.concat([latents_concat, mask_concat], dim=1)
+-        
++
+         return cond_latents
+ 
+     def get_task_mask(self, task_type, latent_target_length):
+@@ -823,7 +817,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+ 
+         return self.get_closest_resolution_given_original_size(origin_size, target_resolution)
+ 
+-
+     def get_closest_resolution_given_original_size(
+                                                 self, 
+                                                 origin_size, 
+@@ -861,14 +854,14 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+ 
+         elif task_type == "i2v":
+             origin_size = reference_image.size
+-            
++
+             target_height, target_width = height, width
+             original_width, original_height = origin_size
+-            
++
+             scale_factor = max(target_width / original_width, target_height / original_height)
+             resize_width = int(round(original_width * scale_factor))
+             resize_height = int(round(original_height * scale_factor))
+-            
++
+             ref_image_transform = transforms.Compose([
+                 transforms.Resize((resize_height, resize_width),
+                                   interpolation=transforms.InterpolationMode.LANCZOS),
+@@ -876,17 +869,17 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+                 transforms.ToTensor(),
+                 transforms.Normalize([0.5], [0.5])
+             ])
+-            
++
+             ref_images_pixel_values = ref_image_transform(reference_image)
+             ref_images_pixel_values = ref_images_pixel_values.unsqueeze(0).unsqueeze(2).to(self.execution_device)
+-            
+-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
++
++            with torch.autocast(device_type="xpu", dtype=torch.float16, enabled=True):
+                 cond_latents = self.vae.encode(ref_images_pixel_values).latent_dist.mode()
+                 cond_latents.mul_(self.vae.config.scaling_factor)
+-            
++
+         else:
+             raise ValueError(f"Unsupported task_type: {task_type}. Must be 't2v' or 'i2v'")
+-        
++
+         return cond_latents
+ 
+     @property
+@@ -943,7 +936,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+         positive_idx = 1 if self.do_classifier_free_guidance else 0
+         stabilization_level = 15
+         # text, siglip, byt5 embedding cache
+-        with (torch.autocast(device_type="cuda", dtype=self.target_dtype, enabled=self.autocast_enabled),
++        with (torch.autocast(device_type="xpu", dtype=self.target_dtype, enabled=self.autocast_enabled),
+               auto_offload_model(self.transformer, self.execution_device, enabled=self.enable_offloading)):
+             extra_kwargs_pos = {
+                 "byt5_text_states": extra_kwargs["byt5_text_states"][positive_idx, None, ...],
+@@ -1015,7 +1008,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+                 context_timestep = torch.full((len(selected_frame_indices),), stabilization_level - 1,
+                                               device=device, dtype=timesteps.dtype)
+                 # compute kv cache
+-                with (torch.autocast(device_type="cuda", dtype=self.target_dtype, enabled=self.autocast_enabled),
++                with (torch.autocast(device_type="xpu", dtype=self.target_dtype, enabled=self.autocast_enabled),
+                       auto_offload_model(self.transformer, self.execution_device,enabled=self.enable_offloading)):
+                     self._kv_cache = self.transformer(
+                         bi_inference=False,
+@@ -1073,7 +1066,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+                     latents_concat = torch.concat([latent_model_input, cond_latents_input], dim=1)
+                     latents_concat = self.scheduler.scale_model_input(latents_concat, t)
+ 
+-                    with torch.autocast(device_type="cuda", dtype=self.target_dtype, enabled=self.autocast_enabled):
++                    with torch.autocast(device_type="xpu", dtype=self.target_dtype, enabled=self.autocast_enabled):
+                         noise_pred = self.transformer(
+                             bi_inference=False,
+                             ar_txt_inference=False,
+@@ -1204,11 +1197,12 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+                     batch_size = latents_concat.shape[0]
+                     t_expand_txt = t.repeat(batch_size)
+                     t_expand = timestep_input.repeat(batch_size)
++                    torch.xpu.empty_cache()
+                     viewmats_input = repeat(viewmats_input, 'B L H W -> (B R) L H W', R=batch_size).to(device)
+                     Ks_input = repeat(Ks_input, 'B L H W -> (B R) L H W', R=batch_size).to(device)
+                     action_input = repeat(action_input, 'B L -> (B R) L', R=batch_size).reshape(-1).to(device)
+ 
+-                    with torch.autocast(device_type="cuda", dtype=self.target_dtype, enabled=self.autocast_enabled):
++                    with torch.autocast(device_type="xpu", dtype=self.target_dtype, enabled=self.autocast_enabled):
+                         output = self.transformer(
+                             bi_inference=True,
+                             ar_txt_inference=False,
+@@ -1244,6 +1238,12 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+ 
+                     latent_model_input = self.scheduler.step(noise_pred, t, latent_model_input, return_dict=False)[0]
+                     latents[:, :, start_idx: end_idx] = latent_model_input[:, :, -self.chunk_latent_frames:]
++                    
++                    # Clear intermediate variables and cache to reduce memory pressure
++                    del noise_pred, viewmats_input, Ks_input, action_input, latents_concat
++                    if self.do_classifier_free_guidance:
++                        del noise_pred_uncond, noise_pred_text
++                    torch.xpu.empty_cache()
+ 
+                     # Update progress bar
+                     if i == len(timesteps) - 1 or ((i + 1) > self.num_warmup_steps
+@@ -1392,7 +1392,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+                 except Exception as e:
+                     loguru.logger.warning(f"Failed to rewrite prompt: {e}")
+                     prompt = user_prompt
+-                
++
+             if dist.is_initialized() and get_parallel_state().sp_enabled:
+                 obj_list = [prompt]
+                 # not use group_src to support old PyTorch
+@@ -1445,7 +1445,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+         n_tokens = latent_target_length * latent_height * latent_width
+         multitask_mask = self.get_task_mask(task_type, latent_target_length)
+ 
+-
+         self._guidance_scale = guidance_scale
+         self._guidance_rescale = kwargs.get("guidance_rescale", 0.0)
+         self._clip_skip = kwargs.get("clip_skip", None)
+@@ -1593,6 +1592,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+                                       action=action,
+                                       device=device)
+         elif model_type == "bi":
++            torch.xpu.empty_cache()
+             latents = self.bi_rollout(latents=latents,
+                                       timesteps=timesteps,
+                                       prompt_embeds=prompt_embeds,
+@@ -1635,15 +1635,38 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+             else:
+                 latents = latents / self.vae.config.scaling_factor
+ 
+-
+             if return_pre_sr_video or not enable_sr:
+-                with (torch.autocast(device_type="cuda", dtype=self.vae_dtype, enabled=self.vae_autocast_enabled),
+-                      auto_offload_model(self.vae, self.execution_device, enabled=self.enable_offloading)):
+-                    video_frames = self.vae.decode(latents, return_dict=False, generator=generator)[0]
++                # Enable spatial tiling with smaller tile size to reduce memory usage during VAE decode
++                self.vae.enable_spatial_tiling(use_tiling=True)
++                # Set smaller tile size for memory efficiency (default may be too large)
++                # tile_sample_min_size=256 means each tile is 256x256 in pixel space
++                # which is 32x32 in latent space (256/8=32)
++                self.vae.set_tile_sample_min_size(sample_size=256, tile_overlap_factor=0.25)
++                
++                # Only decode on rank 0 to save memory, then broadcast
++                parallel_dims = get_parallel_state()
++                if parallel_dims.sp_enabled:
++                    # Only rank 0 does VAE decode
++                    if dist.get_rank() == 0:
++                        with (torch.autocast(device_type="xpu", dtype=self.vae_dtype, enabled=self.vae_autocast_enabled),
++                              auto_offload_model(self.vae, self.execution_device, enabled=self.enable_offloading)):
++                            torch.xpu.empty_cache()
++                            video_frames = self.vae.decode(latents, return_dict=False, generator=generator)[0]
++                        if video_frames is not None:
++                            video_frames = (video_frames / 2 + 0.5).clamp(0, 1).cpu().float()
++                    else:
++                        video_frames = None
++                    # Synchronize
++                    dist.barrier()
++                else:
++                    with (torch.autocast(device_type="xpu", dtype=self.vae_dtype, enabled=self.vae_autocast_enabled),
++                          auto_offload_model(self.vae, self.execution_device, enabled=self.enable_offloading)):
++                        torch.xpu.empty_cache()
++                        video_frames = self.vae.decode(latents, return_dict=False, generator=generator)[0]
++
++                    if video_frames is not None:
++                        video_frames = (video_frames / 2 + 0.5).clamp(0, 1).cpu().float()
+ 
+-                if video_frames is not None:
+-                    video_frames = (video_frames / 2 + 0.5).clamp(0, 1).cpu().float()
+-                    
+             else:
+                 video_frames = sr_out.videos
+ 
+@@ -1686,7 +1709,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+     def create_sr_pipeline(self, cached_folder, sr_version, transformer_dtype=torch.bfloat16, device=None):
+         from .hunyuan_video_sr_pipeline import HunyuanVideo_1_5_SR_Pipeline
+ 
+-
+         transformer, upsampler = self.load_sr_transformer_upsampler(
+                                                                 cached_folder, 
+                                                                 sr_version, 
+@@ -1706,7 +1728,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+             byt5_tokenizer=self.byt5_tokenizer,
+             byt5_max_length=self.byt5_max_length,
+             prompt_format=self.prompt_format,
+-            execution_device='cuda',
++            execution_device='xpu',
+             vision_encoder=self.vision_encoder,
+             enable_offloading=self.enable_offloading,
+             **SR_PIPELINE_CONFIGS[sr_version],
+@@ -1736,7 +1758,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+             device = torch.device('cpu')
+         else:
+             if device is None:
+-                device = torch.device('cuda')
++                device = torch.device('xpu')
+ 
+         if enable_group_offloading:
+             # Assuming the user does not have sufficient GPU memory, we initialize the models on CPU
+@@ -1767,16 +1789,20 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+ 
+         transformer = transformer.to(transformer_dtype).to(transformer_init_device)
+ 
+-        vae = hunyuanvideo_15_vae_w_cache.AutoencoderKLConv3D.from_pretrained(
+-            os.path.join(cached_folder, "vae"), 
+-            torch_dtype=vae_inference_config['dtype']
+-        ).to(device)
++        vae = (
++            hunyuanvideo_15_vae_w_cache.AutoencoderKLConv3D.from_pretrained(
++                os.path.join(cached_folder, "vae"),
++                torch_dtype=vae_inference_config["dtype"],
++            )
++            .to(transformer_dtype)
++            .to(device)
++        )
+         scheduler = FlowMatchDiscreteScheduler.from_pretrained(os.path.join(cached_folder, "scheduler"))
+ 
+         if force_sparse_attn:
+             if not is_sparse_attn_supported():
+                 raise RuntimeError(
+-                    f"Current GPU is {torch.cuda.get_device_properties(0).name}, "
++                    f"Current GPU is {torch.xpu.get_device_properties(0).name}, "
+                     f"which does not support sparse attention."
+                 )
+             if transformer.config.attn_mode != 'flex-block-attn':
+@@ -1792,7 +1818,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+         vision_encoder = cls._load_vision_encoder(cached_folder, device=device)
+ 
+         group_offloading_kwargs = {
+-            'onload_device': torch.device('cuda'),
++            'onload_device': torch.device('xpu'),
+             'num_blocks_per_group': 4,
+         }
+         if overlap_group_offloading:
+@@ -1816,7 +1842,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+             byt5_tokenizer=byt5_kwargs["byt5_tokenizer"],
+             byt5_max_length=byt5_kwargs["byt5_max_length"],
+             prompt_format=prompt_format,
+-            execution_device='cuda',
++            execution_device='xpu',
+             vision_encoder=vision_encoder,
+             enable_offloading=enable_offloading,
+             **PIPELINE_CONFIGS[transformer_version],
+@@ -1835,7 +1861,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+ 
+         return pipeline
+ 
+-
+     @staticmethod
+     def get_vae_inference_config(memory_limitation=None):
+         if memory_limitation is None:
+@@ -1851,7 +1876,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
+             dtype = torch.float32
+         return {'sample_size': sample_size, 'tile_overlap_factor': tile_overlap_factor, 'dtype': dtype}
+ 
+-
+     @classmethod
+     def _load_text_encoders(cls, pretrained_model_path, device):
+         text_encoder_path = f'{pretrained_model_path}/text_encoder/llm'
+diff --git a/hyvideo/utils/communications.py b/hyvideo/utils/communications.py
+index c140674..be3a0e9 100644
+--- a/hyvideo/utils/communications.py
++++ b/hyvideo/utils/communications.py
+@@ -17,6 +17,7 @@
+ from typing import Any, Tuple
+ import torch
+ import torch.distributed as dist
++from torch.distributed._functional_collectives import all_to_all_single as ft_all_to_all_single
+ 
+ from torch.nn import functional as F
+ 
+@@ -76,11 +77,18 @@ def _all_to_all_4D(
+             .contiguous()
+         )
+ 
+-        output = torch.empty_like(input_t)
+         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
+         # (P, seq_len/P, bs, hc/P, hs) scatter seqlen -all2all-> (P, seq_len/P, bs, hc/P, hs) scatter head
+         if seq_world_size > 1:
+-            dist.all_to_all_single(output, input_t, group=group)
++            # Use functional_collectives version to avoid XCCL IPC issues
++            input_flat = input_t.reshape(-1)
++            output_flat = ft_all_to_all_single(
++                input_flat,
++                output_split_sizes=None,
++                input_split_sizes=None,
++                group=group
++            )
++            output = output_flat.reshape(input_t.shape)
+         else:
+             output = input_t
+         # if scattering the seq-dim, transpose the heads back to the original dimension
+@@ -123,11 +131,18 @@ def _all_to_all_4D(
+             .reshape(seq_world_size, shard_hc, shard_seqlen, bs, hs)
+         )
+ 
+-        output = torch.empty_like(input_t)
+         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
+         # (P, bs x hc/P, seqlen/P, hs) scatter seqlen -all2all-> (P, bs x seq_len/P, hc/P, hs) scatter head
+         if seq_world_size > 1:
+-            dist.all_to_all_single(output, input_t, group=group)
++            # Use functional_collectives version to avoid XCCL IPC issues
++            input_flat = input_t.reshape(-1)
++            output_flat = ft_all_to_all_single(
++                input_flat,
++                output_split_sizes=None,
++                input_split_sizes=None,
++                group=group
++            )
++            output = output_flat.reshape(input_t.shape)
+         else:
+             output = input_t
+ 
+@@ -262,6 +277,8 @@ class _AllGather(torch.autograd.Function):
+         dist.all_gather(tensor_list, input_, group=group)
+ 
+         output = torch.cat(tensor_list, dim=dim)
++        # Explicitly delete tensor_list to free memory
++        del tensor_list
+         return output
+ 
+     @staticmethod
+diff --git a/requirements.txt b/requirements.txt
+index 2cd677f..4e04ce8 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,5 +1,5 @@
+ tqdm==4.67.1
+-torch>=2.6.0
++torch==2.9.0+xpu
+ peft==0.17.0
+ openai==2.8.0
+ einops==0.8.0
+@@ -9,10 +9,8 @@ pillow==11.3.0
+ imageio==2.37.0
+ imageio-ffmpeg==0.6.0
+ omegaconf>=2.3.0
+-torchaudio==2.6.0
+ diffusers==0.35.0
+ safetensors==0.4.5
+-torchvision==0.21.0
+ qwen-vl-utils==0.0.8
+ huggingface-hub==0.34.0
+ huggingface_hub[cli]
+diff --git a/run.sh b/run.sh
+index 97aa0d6..8fc8a92 100644
+--- a/run.sh
++++ b/run.sh
+@@ -10,23 +10,25 @@ SEED=1
+ ASPECT_RATIO=16:9
+ RESOLUTION=480p                  # Now we only provide the 480p model
+ OUTPUT_PATH=./outputs/
+-MODEL_PATH=                      # Path to pretrained hunyuanvideo-1.5 model
++MODEL_PATH=/llm/models/HunyuanVideo-1.5/                      # Path to pretrained hunyuanvideo-1.5 model
+ AR_ACTION_MODEL_PATH=            # Path to our HY-World 1.5 autoregressive checkpoints
+-BI_ACTION_MODEL_PATH=            # Path to our HY-World 1.5 bidirectional checkpoints
++BI_ACTION_MODEL_PATH=/llm/models/HY-WorldPlay/bidirectional_model.safe_tensors            # Path to our HY-World 1.5 bidirectional checkpoints
+ AR_DISTILL_ACTION_MODEL_PATH=    # Path to our HY-World 1.5 autoregressive distilled checkpoints
+ POSE_JSON_PATH=./assets/pose/test_forward_32_latents.json   # Path to the customized camera trajectory
+-NUM_FRAMES=125
++NUM_FRAMES=125     # 恢复原帧数，使用 chunked attention 减少显存
+ WIDTH=832
+ HEIGHT=480
+ 
+ # Configuration for faster inference
+ # The maximum number recommended is 8.
+-N_INFERENCE_GPU=8 # Parallel inference GPU count.
++N_INFERENCE_GPU=4 # Parallel inference GPU count.
+ 
+ # Configuration for better quality
+ REWRITE=false # Enable prompt rewriting. Please ensure rewrite vLLM server is deployed and configured.
+ ENABLE_SR=false # Enable super resolution. When the NUM_FRAMES <= 121, you can set it to true
+ 
++# export CCL_LOG_LEVEL=debug
++
+ # inference with bidirectional model
+ torchrun --nproc_per_node=$N_INFERENCE_GPU generate.py  \
+   --prompt "$PROMPT" \
+@@ -41,10 +43,12 @@ torchrun --nproc_per_node=$N_INFERENCE_GPU generate.py  \
+   --output_path $OUTPUT_PATH \
+   --model_path $MODEL_PATH \
+   --action_ckpt $BI_ACTION_MODEL_PATH \
+-  --few_step false \
++  --few_step true \
+   --width $WIDTH \
+   --height $HEIGHT \
+-  --model_type 'bi'
++  --model_type 'bi' --offloading \
++  --chunked_attn true \
++  --attn_chunk_size 2048
+ 
+ # inference with autoregressive model
+ #torchrun --nproc_per_node=$N_INFERENCE_GPU generate.py  \
