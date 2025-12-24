@@ -1,8 +1,8 @@
 diff --git a/comfy/model_management.py b/comfy/model_management.py
-index 709ebc40..c43e8eab 100644
+index 1889ab0a..954dfec5 100644
 --- a/comfy/model_management.py
 +++ b/comfy/model_management.py
-@@ -148,6 +148,90 @@ def is_intel_xpu():
+@@ -150,6 +150,90 @@ def is_intel_xpu():
              return True
      return False
  
@@ -93,7 +93,7 @@ index 709ebc40..c43e8eab 100644
  def is_ascend_npu():
      global npu_available
      if npu_available:
-@@ -720,7 +804,6 @@ def cleanup_models_gc():
+@@ -738,7 +822,6 @@ def cleanup_models_gc():
                  logging.warning("WARNING, memory leak with model {}. Please make sure it is not being referenced from somewhere.".format(cur.real_model().__class__.__name__))
  
  
@@ -101,7 +101,7 @@ index 709ebc40..c43e8eab 100644
  def cleanup_models():
      to_delete = []
      for i in range(len(current_loaded_models)):
-@@ -1399,7 +1482,7 @@ def unload_all_models():
+@@ -1527,7 +1610,7 @@ def unload_all_models():
      free_memory(1e30, get_torch_device())
  
  
