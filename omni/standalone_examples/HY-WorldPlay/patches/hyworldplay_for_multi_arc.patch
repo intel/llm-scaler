@@ -930,7 +930,7 @@ index 97aa0d6..8fc8a92 100644
  AR_DISTILL_ACTION_MODEL_PATH=    # Path to our HY-World 1.5 autoregressive distilled checkpoints
  POSE_JSON_PATH=./assets/pose/test_forward_32_latents.json   # Path to the customized camera trajectory
 -NUM_FRAMES=125
-+NUM_FRAMES=125     # 恢复原帧数，使用 chunked attention 减少显存
++NUM_FRAMES=125     # Restore original frame count; use chunked attention to reduce memory usage
  WIDTH=832
  HEIGHT=480
  
