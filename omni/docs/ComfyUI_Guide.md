@@ -317,6 +317,7 @@ The text prompt is intended to describe the overall content of the input imageâ€
 | UNet (Low Noise) | `wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors` | `diffusion_models/` | [HuggingFace](https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors) |
 | VAE | `wan_2.1_vae.safetensors` | `vae/` | [HuggingFace](https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors) |
 
+##### Image to Video (14B)
 | Type | Filename | Directory | Download Link |
 |------|----------|-----------|---------------|
 | UNet | `wan2.2_i2v_14B_fp8_scaled.safetensors` | `diffusion_models/` | [HuggingFace](https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_14B_fp8_scaled.safetensors) |
