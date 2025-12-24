@@ -429,9 +429,52 @@ Use [WAN2.2-14B-Rapid-AllInOne](https://huggingface.co/Phr00t/WAN2.2-14B-Rapid-A
 |----------|-------------|
 | `video_hunyuan_video_1.5_t2v.json` | Text to video |
 | `video_hunyuan_video_1.5_i2v.json` | Image to video |
-| `video_hunyuan_video_1.5_i2v_multi_xpu.json` | Image to video + multi-XPU support |
+| `video_hunyuan_video_1.5_i2v_multi_xpu.json` | Image to video + multi-XPU support (Raylight) |
 
 > **Note**: Default parameter configurations are optimized for 480p FP8 image-to-video.
+
+#### Multi-XPU Configuration (Raylight)
+
+For `video_hunyuan_video_1.5_i2v_multi_xpu.json`, use [Raylight](https://github.com/komikndr/raylight) for multi-GPU acceleration:
+
+##### Additional Model Files for Multi-XPU
+
+| Type | Filename | Directory | Download Link |
+|------|----------|-----------|---------------|
+| UNet (480p I2V Distilled) | `hunyuanvideo1.5_480p_i2v_cfg_distilled_fp8_scaled.safetensors` | `diffusion_models/` | [HuggingFace](https://huggingface.co/Comfy-Org/HunyuanVideo_1.5_repackaged/resolve/main/split_files/diffusion_models/hunyuanvideo1.5_480p_i2v_cfg_distilled_fp8_scaled.safetensors) |
+| CLIP Vision | `sigclip_vision_patch14_384.safetensors` | `clip_vision/` | [HuggingFace](https://huggingface.co/Comfy-Org/sigclip_vision_384/resolve/main/sigclip_vision_patch14_384.safetensors) |
+
+##### Model Storage Location (Multi-XPU)
+
+```text
+📂 ComfyUI/
+└── 📂 models/
+    ├── 📂 text_encoders/
+    │   ├── qwen_2.5_vl_7b_fp8_scaled.safetensors
+    │   └── byt5_small_glyphxl_fp16.safetensors
+    ├── 📂 diffusion_models/
+    │   └── hunyuanvideo1.5_480p_i2v_cfg_distilled_fp8_scaled.safetensors
+    ├── 📂 clip_vision/
+    │   └── sigclip_vision_patch14_384.safetensors
+    └── 📂 vae/
+        └── hunyuanvideo15_vae_fp16.safetensors
+```
+
+##### Ray Configuration
+
+1. **Ray Initializer**
+   - Configure `GPU` count and parallelism settings (`ulysses_degree`, `ring_degree`) in the `RayInitializer` node
+   - Set to the number of GPUs you want to use (e.g., 2 or 4)
+
+2. **Model Loading**
+   - `RayUNETLoader` node loads the diffusion model with Ray distributed support
+   - `DualCLIPLoader` loads text encoders (Qwen + ByT5)
+   - `VAELoader` loads the VAE
+   - `CLIPVisionLoader` loads the CLIP Vision model for image conditioning
+
+3. **Sampling**
+   - `XFuserSamplerCustom` performs distributed sampling across multiple GPUs
+   - `RayModelSamplingSD3` configures the model sampling parameters
 
 ---
 

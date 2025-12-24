@@ -432,9 +432,52 @@ Qwen-Image-Layered 是阿里巴巴 Qwen 团队开发的模型，能够将图像�
 |--------|------|
 | `video_hunyuan_video_1.5_t2v.json` | 文本生成视频 |
 | `video_hunyuan_video_1.5_i2v.json` | 图像生成视频 |
-| `video_hunyuan_video_1.5_i2v_multi_xpu.json` | 图生视频 + 多 XPU 支持 |
+| `video_hunyuan_video_1.5_i2v_multi_xpu.json` | 图生视频 + 多 XPU 支持 (Raylight) |
 
 > **注意**: 默认参数配置针对 480p FP8 图生视频进行了优化。
+
+#### Multi-XPU 配置 (Raylight)
+
+对于 `video_hunyuan_video_1.5_i2v_multi_xpu.json`，使用 [Raylight](https://github.com/komikndr/raylight) 实现多 GPU 加速：
+
+##### Multi-XPU 额外模型文件
+
+| 类型 | 文件名 | 存放目录 | 下载链接 |
+|------|--------|----------|----------|
+| UNet (480p I2V Distilled) | `hunyuanvideo1.5_480p_i2v_cfg_distilled_fp8_scaled.safetensors` | `diffusion_models/` | [HuggingFace](https://huggingface.co/Comfy-Org/HunyuanVideo_1.5_repackaged/resolve/main/split_files/diffusion_models/hunyuanvideo1.5_480p_i2v_cfg_distilled_fp8_scaled.safetensors) |
+| CLIP Vision | `sigclip_vision_patch14_384.safetensors` | `clip_vision/` | [HuggingFace](https://huggingface.co/Comfy-Org/sigclip_vision_384/resolve/main/sigclip_vision_patch14_384.safetensors) |
+
+##### 模型存放位置 (Multi-XPU)
+
+```text
+📂 ComfyUI/
+└── 📂 models/
+    ├── 📂 text_encoders/
+    │   ├── qwen_2.5_vl_7b_fp8_scaled.safetensors
+    │   └── byt5_small_glyphxl_fp16.safetensors
+    ├── 📂 diffusion_models/
+    │   └── hunyuanvideo1.5_480p_i2v_cfg_distilled_fp8_scaled.safetensors
+    ├── 📂 clip_vision/
+    │   └── sigclip_vision_patch14_384.safetensors
+    └── 📂 vae/
+        └── hunyuanvideo15_vae_fp16.safetensors
+```
+
+##### Ray 配置
+
+1. **Ray 初始化器**
+   - 在 `RayInitializer` 节点中配置 `GPU` 数量和并行设置（`ulysses_degree`、`ring_degree`）
+   - 设置为您要使用的 GPU 数量（例如 2 或 4）
+
+2. **模型加载**
+   - `RayUNETLoader` 节点使用 Ray 分布式支持加载扩散模型
+   - `DualCLIPLoader` 加载文本编码器（Qwen + ByT5）
+   - `VAELoader` 加载 VAE
+   - `CLIPVisionLoader` 加载 CLIP Vision 模型用于图像条件
+
+3. **采样**
+   - `XFuserSamplerCustom` 在多个 GPU 上执行分布式采样
+   - `RayModelSamplingSD3` 配置模型采样参数
 
 ---
 
