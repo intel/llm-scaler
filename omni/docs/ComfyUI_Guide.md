@@ -542,7 +542,6 @@ VoxCPM is a tokenizer-free TTS system that supports context-aware speech generat
     └── 📂 tts/
         └── 📂 VoxCPM/
             └── 📂 VoxCPM1.5/
-            └── 📂 VoxCPM-0.5B/
 ```
 
 > Models are automatically downloaded when running the workflow for the first time.
