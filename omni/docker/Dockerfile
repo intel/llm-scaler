@@ -102,6 +102,21 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     git clone https://github.com/kijai/ComfyUI-KJNodes.git && \
     cd ComfyUI-KJNodes && \
     pip install -r requirements.txt && \
+# Install ComfyUI Hunyuan3D Node
+    cd /llm/ComfyUI/custom_nodes && \
+    apt remove python3-blinker -y && \
+    apt update -y && \
+    apt install -y libopengl0 libglx0 libgl1 libxrender1 libxfixes3 libx11-dev libxi6 libxxf86vm1 libxcursor1 libxrandr2 libxinerama1 libxkbcommon0 libsm6 ffmpeg && \
+    git clone https://github.com/visualbruno/ComfyUI-Hunyuan3d-2-1.git && \
+    cd ComfyUI-Hunyuan3d-2-1 && \
+    git checkout 9d7ef32509101495a7840b3ae8e718c8d1183305 && \
+    git apply /tmp/comfyui_hunyuan3d_for_xpu.patch && \
+    pip install bigdl-core==2.4.0b1 rembg realesrgan && \
+    pip install -r requirements.txt && \
+    cd hy3dpaint/custom_rasterizer && \
+    python setup.py install && \
+    cd ../DifferentiableRenderer && \
+    python setup.py install && \
     # Install Xinference
     pip install "xinference[transformers]" && \
     patch /usr/local/lib/python3.12/dist-packages/xinference/device_utils.py < /tmp/xinference_device_utils.patch && \
