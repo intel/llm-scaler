@@ -525,14 +525,15 @@ Hunyuan3D 使用自定义节点 `ComfyUI-Hunyuan3d-2-1`，模型会自动下载�
 
 ## 音频生成模型
 
-### VoxCPM
+### VoxCPM1.5
 
-VoxCPM 是一种无分词器的 TTS 系统，支持上下文感知语音生成和真实声音克隆。
+VoxCPM1.5 是一种无分词器的 TTS 系统，支持上下文感知语音生成和真实声音克隆。
 
 #### 模型信息
 
 | 模型 | 参数量 | HuggingFace 链接 |
 |------|--------|------------------|
+| VoxCPM1.5 | 800M | [openbmb/VoxCPM1.5](https://huggingface.co/openbmb/VoxCPM1.5) |
 | VoxCPM-0.5B | 0.5B | [openbmb/VoxCPM-0.5B](https://huggingface.co/openbmb/VoxCPM-0.5B) |
 
 #### 模型存放位置
@@ -540,9 +541,9 @@ VoxCPM 是一种无分词器的 TTS 系统，支持上下文感知语音生成�
 ```text
 📂 ComfyUI/
 └── 📂 models/
-    └── 📂 TTS/
-        └── 📂 VoxCPM-0.5B/
-            └── (模型文件)
+    └── 📂 tts/
+        └── 📂 VoxCPM/
+            └── 📂 VoxCPM1.5/
 ```
 
 #### 工作流文件

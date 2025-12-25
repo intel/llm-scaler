@@ -1,79 +1,142 @@
-diff --git a/src/voxcpm/model/utils.py b/src/voxcpm/model/utils.py
-index f92efaa..8663af9 100644
---- a/src/voxcpm/model/utils.py
-+++ b/src/voxcpm/model/utils.py
-@@ -130,6 +130,15 @@ def _is_hip_available():
-         return False
- 
- 
-+def _is_xpu_available():
-+    try:
-+        _ = torch.xpu.device_count()
-+        xpu_available = torch.xpu.is_available()
-+    except:
-+        xpu_available = False
-+    return xpu_available
-+
-+
- def get_dtype(dtype: str):
-     """Gets the torch dtype, automatically downgrading for incompatible hardware."""
-     device = "cpu"
-@@ -140,6 +149,8 @@ def get_dtype(dtype: str):
-                 device = "hip"
-     elif _is_directml_available():
-         device = "directml"
-+    elif _is_xpu_available():
-+        device = "xpu"
-     elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-         device = "mps"
- 
+diff --git a/requirements.txt b/requirements.txt
+index d1e429e..93cfc4a 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,5 +1,3 @@
+-torch>=2.5.0
+-torchaudio>=2.5.0
+ transformers>=4.36.2
+ safetensors
+ huggingface_hub
 diff --git a/src/voxcpm/model/voxcpm.py b/src/voxcpm/model/voxcpm.py
-index 5c49e5b..9cb48b7 100644
+index c6de34b..78dec34 100644
 --- a/src/voxcpm/model/voxcpm.py
 +++ b/src/voxcpm/model/voxcpm.py
-@@ -73,7 +73,7 @@ class VoxCPMConfig(BaseModel):
-     dit_config: VoxCPMDitConfig
+@@ -81,7 +81,7 @@ class VoxCPMConfig(BaseModel):
+     audio_vae_config: Optional[AudioVAEConfig] = None
  
      max_length: int = 4096
 -    device: str = "cuda"
 +    device: str = "xpu"
      dtype: str = "bfloat16"
+     dit_mean_mode: bool = False
  
+@@ -121,7 +121,7 @@ class VoxCPMModel(nn.Module):
+         self.device = config.device
+         
+         # ComfyUI handles device management generally, but we keep this for initialization logic
+-        if not torch.cuda.is_available():
++        if not torch.xpu.is_available():
+             if torch.backends.mps.is_available():
+                 self.device = "mps"
+             else:
+diff --git a/src/voxcpm/modules/minicpm4/model.py b/src/voxcpm/modules/minicpm4/model.py
+index 8945a46..1541f69 100644
+--- a/src/voxcpm/modules/minicpm4/model.py
++++ b/src/voxcpm/modules/minicpm4/model.py
+@@ -151,29 +151,31 @@ class MiniCPMAttention(nn.Module):
+         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
  
+         cos, sin = position_emb
+-
+         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+         
+-        # ref: https://github.com/pytorch/pytorch/issues/163597
+-        # there is a bug in MPS for non-contiguous tensors, so we need to make them contiguous
++        # Keep original KV heads for cache stability
++        kv_for_cache = (key_states.contiguous(), value_states.contiguous())
++
++        # Manual GQA broadcast to avoid XPU SDPA indexing errors
++        if self.num_key_value_groups > 1:
++            key_states_exec = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
++            value_states_exec = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
++        else:
++            key_states_exec, value_states_exec = key_states, value_states
++
+         query_states = query_states.contiguous()
+-        key_states = key_states.contiguous()
+-        value_states = value_states.contiguous()
++        key_states_exec = key_states_exec.contiguous()
++        value_states_exec = value_states_exec.contiguous()
++
+         attn_output = torch.nn.functional.scaled_dot_product_attention(
+-            query_states,
+-            key_states,
+-            value_states,
+-            is_causal=is_causal,
+-            enable_gqa=True,
++            query_states, key_states_exec, value_states_exec, is_causal=is_causal,
+         )
+ 
+         attn_output = attn_output.transpose(1, 2).contiguous()
+         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+-
+         attn_output = self.o_proj(attn_output)
+ 
+-        past_key_value = (key_states, value_states)
+-        return attn_output, past_key_value
++        return attn_output, kv_for_cache
+ 
+     def forward_step(
+         self,
+@@ -193,27 +195,29 @@ class MiniCPMAttention(nn.Module):
+         value_states = value_states.view(bsz, 1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+ 
+         cos, sin = position_emb
+-
+         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+ 
+         key_cache, value_cache = kv_cache
++        
++        # Slice-based assignment to maintain 4D tensor rank for XPU compatibility
++        key_cache[:, :, position_id:position_id+1, :] = key_states
++        value_cache[:, :, position_id:position_id+1, :] = value_states
+ 
+-        key_cache[:, :, position_id, :] = key_states
+-        value_cache[:, :, position_id, :] = value_states
++        current_key_cache = key_cache[:, :, :position_id + 1, :]
++        current_value_cache = value_cache[:, :, :position_id + 1, :]
+ 
+-        attn_mask = torch.arange(key_cache.size(2), device=key_cache.device) <= position_id
++        # Broadcast KV heads for XPU SDPA path compatibility
++        if self.num_key_value_groups > 1:
++            key_exec = current_key_cache.repeat_interleave(self.num_key_value_groups, dim=1)
++            value_exec = current_value_cache.repeat_interleave(self.num_key_value_groups, dim=1)
++        else:
++            key_exec, value_exec = current_key_cache, current_value_cache
+ 
+-        # ref: https://github.com/pytorch/pytorch/issues/163597
+-        # there is a bug in MPS for non-contiguous tensors, so we need to make them contiguous
+         query_states = query_states.contiguous()
+-        key_cache = key_cache.contiguous()
+-        value_cache = value_cache.contiguous()
++        key_exec, value_exec = key_exec.contiguous(), value_exec.contiguous()
++
+         attn_output = torch.nn.functional.scaled_dot_product_attention(
+-            query_states,
+-            key_cache,
+-            value_cache,
+-            attn_mask=attn_mask,
+-            enable_gqa=True,
++            query_states, key_exec, value_exec, attn_mask=None,
+         )
+ 
+         attn_output = attn_output.transpose(1, 2).contiguous()
 diff --git a/voxcpm_nodes.py b/voxcpm_nodes.py
-index 0046094..01b29b4 100644
+index 431a0f5..fa2bf2f 100644
 --- a/voxcpm_nodes.py
 +++ b/voxcpm_nodes.py
-@@ -24,7 +24,10 @@ def get_available_devices():
+@@ -25,6 +25,9 @@ def get_available_devices():
      devices = []
      if torch.cuda.is_available():
          devices.append("cuda")
--    
 +
 +    if torch.xpu.is_available():
 +        devices.append("xpu")
-+
-     # Check for DirectML on Windows
+     
      try:
          import platform
-@@ -37,14 +40,14 @@ def get_available_devices():
-     if hasattr(torch.version, 'hip') and torch.version.hip is not None:
-         try:
-             if torch.cuda.is_available() and torch.cuda.get_device_name(0).lower().find('amd') != -1:
--                 devices.append("hip")
-+                devices.append("hip")
-         except:
-             pass
- 
-     # Check for MPS on Apple Silicon
-     if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-         devices.append("mps")
--        
-+
-     devices.append("cpu")
-     return devices
- 
-@@ -54,6 +57,8 @@ def set_seed(seed: int):
+@@ -52,6 +55,8 @@ def set_seed(seed: int):
      torch.manual_seed(seed)
      if torch.cuda.is_available():
          torch.cuda.manual_seed_all(seed)
@@ -82,12 +145,12 @@ index 0046094..01b29b4 100644
  
  class VoxCPMNode(io.ComfyNode):
      CATEGORY = "audio/tts"
-@@ -112,7 +117,7 @@ class VoxCPMNode(io.ComfyNode):
-         if is_cloning and not prompt_text:
+@@ -118,7 +123,7 @@ class VoxCPMNode(io.ComfyNode):
+         if is_cloning and prompt_text is None:
              raise ValueError("Prompt text is required when providing prompt audio for voice cloning.")
  
 -        if device == "cuda":
-+        if device in ["cuda", "xpu"]:
++        if device in["cuda", "xpu"]:
              load_device = model_management.get_torch_device()
              offload_device = model_management.intermediate_device()
          else:
