@@ -531,6 +531,7 @@ VoxCPM is a tokenizer-free TTS system that supports context-aware speech generat
 
 | Model | Parameters | HuggingFace Link |
 |-------|------------|------------------|
+| VoxCPM1.5 | 800M | [openbmb/VoxCPM1.5](https://huggingface.co/openbmb/VoxCPM1.5) |
 | VoxCPM-0.5B | 0.5B | [openbmb/VoxCPM-0.5B](https://huggingface.co/openbmb/VoxCPM-0.5B) |
 
 #### Model Storage Location
@@ -540,7 +541,7 @@ VoxCPM is a tokenizer-free TTS system that supports context-aware speech generat
 └── 📂 models/
     └── 📂 TTS/
         └── 📂 VoxCPM-0.5B/
-            └── ... (auto-downloaded model files)
+        └── 📂 VoxCPM1.5/
 ```
 
 > Models are automatically downloaded when running the workflow for the first time.

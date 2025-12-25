@@ -91,7 +91,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cd .. && \
     git clone https://github.com/wildminder/ComfyUI-VoxCPM.git comfyui-voxcpm && \
     cd comfyui-voxcpm && \
-    git checkout 044dd93c0effc9090fb279117de5db4cd90242a0 && \
+    git checkout 7875a8a36a531b7efef8cac96dc74001d3cb5895 && \
     git apply /tmp/comfyui_voxcpm_for_xpu.patch && \
     pip install -r requirements.txt && \
     cd .. && \

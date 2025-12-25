@@ -138,7 +138,7 @@ Please follow the instructions in the [Getting Started](omni/README.md/#getting-
 | **Video Generation** | Wan2.2 Animate 14B | Video Animation | 
 | **Video Generation** | HunyuanVideo 1.5 8.3B | Text-to-Video, Image-to-Video | 
 | **3D Generation** | Hunyuan3D 2.1 | Text/Image-to-3D | 
-| **Audio Generation** | VoxCPM | Text-to-Speech | 
+| **Audio Generation** | VoxCPM1.5, VoxCPM | Text-to-Speech | 
 
 
 Please check [ComfyUI Support](omni/README.md/#comfyui) for more details.

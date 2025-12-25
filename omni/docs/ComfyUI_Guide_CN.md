@@ -533,6 +533,7 @@ VoxCPM 是一种无分词器的 TTS 系统，支持上下文感知语音生成�
 
 | 模型 | 参数量 | HuggingFace 链接 |
 |------|--------|------------------|
+| VoxCPM1.5 | 800M | [openbmb/VoxCPM1.5](https://huggingface.co/openbmb/VoxCPM1.5) |
 | VoxCPM-0.5B | 0.5B | [openbmb/VoxCPM-0.5B](https://huggingface.co/openbmb/VoxCPM-0.5B) |
 
 #### 模型存放位置
@@ -542,7 +543,7 @@ VoxCPM 是一种无分词器的 TTS 系统，支持上下文感知语音生成�
 └── 📂 models/
     └── 📂 TTS/
         └── 📂 VoxCPM-0.5B/
-            └── (模型文件)
+        └── 📂 VoxCPM1.5/
 ```
 
 #### 工作流文件
