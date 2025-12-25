@@ -89,7 +89,7 @@ The following models are supported in ComfyUI workflows. For detailed model file
 | **Video Generation** | Wan2.2 Animate 14B | Video Animation | `video_wan2_2_animate_basic.json` |
 | **Video Generation** | HunyuanVideo 1.5 8.3B | Text-to-Video, Image-to-Video | `video_hunyuan_video_1.5_t2v.json`, `video_hunyuan_video_1.5_i2v.json`, `video_hunyuan_video_1.5_i2v_multi_xpu.json` |
 | **3D Generation** | Hunyuan3D 2.1 | Text/Image-to-3D | `3d_hunyuan3d.json` |
-| **Audio Generation** | VoxCPM1.5, VoxCPM, IndexTTS 2 | Text-to-Speech, Voice Cloning | `audio_VoxCPM_example.json`, `audio_indextts2.json` |
+| **Audio Generation** | VoxCPM1.5, IndexTTS 2 | Text-to-Speech, Voice Cloning | `audio_VoxCPM_example.json`, `audio_indextts2.json` |
 
 ### ComfyUI Workflows
 
@@ -219,7 +219,7 @@ This workflow generates 3D models from text descriptions or images using the Hun
 
 > **📖 Detailed Documentation**: For model files and setup instructions, see [Audio Generation Models](./docs/ComfyUI_Guide.md#audio-generation-models).
 
-##### VoxCPM
+##### VoxCPM1.5
 
 **Available Workflows:**
 - **audio_VoxCPM_example.json**: Text-to-Speech synthesis

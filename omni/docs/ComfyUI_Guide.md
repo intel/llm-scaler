@@ -523,7 +523,7 @@ Hunyuan3D uses the custom node `ComfyUI-Hunyuan3d-2-1`. Models will be automatic
 
 ## Audio Generation Models
 
-### VoxCPM
+### VoxCPM1.5
 
 VoxCPM is a tokenizer-free TTS system that supports context-aware speech generation and realistic voice cloning.
 
@@ -539,9 +539,10 @@ VoxCPM is a tokenizer-free TTS system that supports context-aware speech generat
 ```text
 📂 ComfyUI/
 └── 📂 models/
-    └── 📂 TTS/
-        └── 📂 VoxCPM-0.5B/
-        └── 📂 VoxCPM1.5/
+    └── 📂 tts/
+        └── 📂 VoxCPM/
+            └── 📂 VoxCPM1.5/
+            └── 📂 VoxCPM-0.5B/
 ```
 
 > Models are automatically downloaded when running the workflow for the first time.
