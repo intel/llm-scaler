@@ -1,0 +1,30 @@
+# docker image
+REPO: "intel/llm-scaler-vllm"
+VERSION: "0.10.2-b6"
+
+# support both absolute and relative paths, multiple model paths 
+# should be separated by `;`. The script will automatically match 
+# the models to their paths.
+Path:
+  ModelPath: "/home/intel/LLM/;/home/intel/LLM2/"
+  LogPath: "auto_test_log" # default path
+  AnalysisPath: "analysis" # default path
+
+Dataset: 
+    name: "random"
+    random-input-len: 1024
+    random-output-len: 512
+
+# server-visible xpu `ZE_AFFINITY_MASK`
+XPU: "4,5"
+
+Model:
+  - name:  "Qwen2.5-1.5B-Instruct"
+    tp: 1
+    quantization: "fp8"  
+    batch: "1,2,4"
+    extra_param: {} # (optional) can add specific parameters yourself.
+  - name: "Qwen3-0.6B"
+    quantization: "fp8"  
+    tp: 1
+    batch: "1,2,4"
