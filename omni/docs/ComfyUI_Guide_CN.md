@@ -33,7 +33,8 @@
 | 模型 | 官方教程 | HuggingFace 模型 |
 |------|----------|------------------|
 | **Qwen-Image** | https://docs.comfy.org/tutorials/image/qwen/qwen-image | [Comfy-Org/Qwen-Image_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI) |
-| **Qwen-Image-Edit** | https://docs.comfy.org/tutorials/image/qwen/qwen-image-edit | [Comfy-Org/Qwen-Image_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI) |
+| **Qwen-Image-Edit** | https://docs.comfy.org/tutorials/image/qwen/qwen-image-edit | [Comfy-Org/Qwen-Image-Edit_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI) |
+| **Qwen-Image-Edit-2511** | https://docs.comfy.org/tutorials/image/qwen/qwen-image-edit-2511 | [Comfy-Org/Qwen-Image-Edit_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI) |
 | **Qwen-Image-Layered** | https://docs.comfy.org/tutorials/image/qwen/qwen-image-layered | [Comfy-Org/Qwen-Image-Layered_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image-Layered_ComfyUI) |
 | **Stable Diffusion 3.5** | https://comfyanonymous.github.io/ComfyUI_examples/sd3/ | [stabilityai/stable-diffusion-3.5-medium](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium) |
 | **Z-Image-Turbo** | https://docs.comfy.org/tutorials/image/z-image/z-image-turbo | [Comfy-Org/z_image_turbo](https://huggingface.co/Comfy-Org/z_image_turbo) |
@@ -128,6 +129,63 @@ ComfyUI 是一个基于节点的图形用户界面，用于构建和执行 Stabl
 |--------|------|
 | `image_qwen_image_edit.json` | 标准图像编辑工作流 |
 | `image_qwen_image_edit_2509.json` | 增强版本 |
+
+---
+
+### Qwen-Image-Edit-2511 (Edit Plus)
+
+**官方教程**: https://docs.comfy.org/tutorials/image/qwen/qwen-image-edit-2511
+
+Qwen-Image-Edit-2511 是 Qwen-Image-Edit 的增强版本，通过 `TextEncodeQwenImageEditPlus` 节点支持多图参考编辑。该模型支持高级编辑场景，如图像之间的材质转换。
+
+**主要特性**:
+- **多图参考**：支持最多 3 张参考图像，用于复杂编辑任务
+- **材质转换**：将纹理、图案或材质从一张图像转移到另一张图像
+
+#### 模型文件
+
+| 类型 | 文件名 | 存放目录 | 下载链接 |
+|------|--------|----------|----------|
+| CLIP | `qwen_2.5_vl_7b_fp8_scaled.safetensors` | `text_encoders/` | [HuggingFace](https://huggingface.co/Comfy-Org/HunyuanVideo_1.5_repackaged/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors) |
+| VAE | `qwen_image_vae.safetensors` | `vae/` | [HuggingFace](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors) |
+| DiT | `qwen_image_edit_2511_bf16.safetensors` | `diffusion_models/` | [HuggingFace](https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_edit_2511_bf16.safetensors) |
+
+#### 模型存放位置
+
+```text
+📂 ComfyUI/
+└── 📂 models/
+    ├── 📂 text_encoders/
+    │   └── qwen_2.5_vl_7b_fp8_scaled.safetensors
+    ├── 📂 diffusion_models/
+    │   └── qwen_image_edit_2511_bf16.safetensors
+    └── 📂 vae/
+        └── qwen_image_vae.safetensors
+```
+
+> CLIP 和 VAE 与 Qwen-Image/Qwen-Image-Edit 共用。DiT 模型为 Qwen-Image-Edit-2511 专用。
+
+#### 工作流设置
+
+| 设置 | 标准 | Comfy 默认 |
+|------|------|------------|
+| Steps | 40 | 20 |
+| CFG | 4.0 | 4.0 |
+
+> **注意**: 默认工作流使用 20 步。使用 40 步可获得更好效果（生成时间更长）。
+
+#### 工作流文件
+
+| 工作流 | 说明 |
+|--------|------|
+| `image_qwen_image_edit_2511.json` | 多图参考编辑工作流 (Edit Plus) |
+
+#### 使用提示
+
+1. **图像 1**: 要编辑的源图像
+2. **图像 2**: 用于材质/纹理转换的参考图像
+3. **图像 3** (可选): 额外的参考图像
+4. **提示词**: 描述编辑操作（例如："将图像 1 中家具的皮革材质更改为图像 2 中的毛皮材质"）
 
 ---
 
