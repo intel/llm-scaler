@@ -33,7 +33,8 @@ This document provides a comprehensive guide for using ComfyUI in the Omni proje
 | Model | Official Tutorial | HuggingFace Model |
 |-------|-------------------|-------------------|
 | **Qwen-Image** | https://docs.comfy.org/tutorials/image/qwen/qwen-image | [Comfy-Org/Qwen-Image_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI) |
-| **Qwen-Image-Edit** | https://docs.comfy.org/tutorials/image/qwen/qwen-image-edit | [Comfy-Org/Qwen-Image_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI) |
+| **Qwen-Image-Edit** | https://docs.comfy.org/tutorials/image/qwen/qwen-image-edit | [Comfy-Org/Qwen-Image-Edit_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI) |
+| **Qwen-Image-Edit-2511** | https://docs.comfy.org/tutorials/image/qwen/qwen-image-edit-2511 | [Comfy-Org/Qwen-Image-Edit_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI) |
 | **Qwen-Image-Layered** | https://docs.comfy.org/tutorials/image/qwen/qwen-image-layered | [Comfy-Org/Qwen-Image-Layered_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image-Layered_ComfyUI) |
 | **Stable Diffusion 3.5** | https://comfyanonymous.github.io/ComfyUI_examples/sd3/ | [stabilityai/stable-diffusion-3.5-medium](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium) |
 | **Z-Image-Turbo** | https://docs.comfy.org/tutorials/image/z-image/z-image-turbo | [Comfy-Org/z_image_turbo](https://huggingface.co/Comfy-Org/z_image_turbo) |
@@ -128,6 +129,63 @@ ComfyUI is a node-based graphical user interface for building and executing work
 |----------|-------------|
 | `image_qwen_image_edit.json` | Standard image editing workflow |
 | `image_qwen_image_edit_2509.json` | Enhanced version |
+
+---
+
+### Qwen-Image-Edit-2511 (Edit Plus)
+
+**Official Tutorial**: https://docs.comfy.org/tutorials/image/qwen/qwen-image-edit-2511
+
+Qwen-Image-Edit-2511 is an enhanced version of Qwen-Image-Edit, supporting multi-image reference editing with the `TextEncodeQwenImageEditPlus` node. This model enables advanced editing scenarios like material transfer between images.
+
+**Key Features**:
+- **Multi-Image Reference**: Support up to 3 reference images for complex editing tasks
+- **Material Transfer**: Transfer textures, patterns, or materials from one image to another
+
+#### Model Files
+
+| Type | Filename | Directory | Download Link |
+|------|----------|-----------|---------------|
+| CLIP | `qwen_2.5_vl_7b_fp8_scaled.safetensors` | `text_encoders/` | [HuggingFace](https://huggingface.co/Comfy-Org/HunyuanVideo_1.5_repackaged/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors) |
+| VAE | `qwen_image_vae.safetensors` | `vae/` | [HuggingFace](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors) |
+| DiT | `qwen_image_edit_2511_bf16.safetensors` | `diffusion_models/` | [HuggingFace](https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_edit_2511_bf16.safetensors) |
+
+#### Model Storage Location
+
+```text
+📂 ComfyUI/
+└── 📂 models/
+    ├── 📂 text_encoders/
+    │   └── qwen_2.5_vl_7b_fp8_scaled.safetensors
+    ├── 📂 diffusion_models/
+    │   └── qwen_image_edit_2511_bf16.safetensors
+    └── 📂 vae/
+        └── qwen_image_vae.safetensors
+```
+
+> CLIP and VAE are shared with Qwen-Image/Qwen-Image-Edit. DiT model is specific to Qwen-Image-Edit-2511.
+
+#### Workflow Settings
+
+| Setting | Standard | Comfy Default |
+|---------|----------|---------------|
+| Steps | 40 | 20 |
+| CFG | 4.0 | 4.0 |
+
+> **Note**: By default, the workflow uses 20 steps. Use 40 steps for better results (longer generation time).
+
+#### Workflow Files
+
+| Workflow | Description |
+|----------|-------------|
+| `image_qwen_image_edit_2511.json` | Multi-image reference editing workflow (Edit Plus) |
+
+#### Usage Tips
+
+1. **Image 1**: The source image to be edited
+2. **Image 2**: Reference image for material/texture transfer
+3. **Image 3** (Optional): Additional reference image
+4. **Prompt**: Describe the editing operation (e.g., "Change the furniture leather in image 1 to the fur material in image 2")
 
 ---
 
