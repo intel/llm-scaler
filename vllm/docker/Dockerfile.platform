@@ -1,4 +1,4 @@
-FROM intel/deep-learning-essentials:2025.1.3-0-devel-ubuntu24.04
+FROM intel/deep-learning-essentials:2025.2.2-0-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ARG BUILD_ENV=docker
