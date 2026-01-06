@@ -107,22 +107,24 @@ All workflow files are available in the `workflows/` directory. Below are detail
 ComfyUI tutorial: https://docs.comfy.org/tutorials/image/qwen/qwen-image
 
 **Available Workflows:**
-- **image_qwen_image.json**: Native Qwen-Image workflow for text-to-image generation
-- **image_qwen_image_distill.json**: Distilled version with better performance (recommended)
-- **image_qwen_image_layered.json**: Layered image generation workflow
+- **image_qwen_image.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_image.json)): Native Qwen-Image workflow for text-to-image generation
+- **image_qwen_image_distill.json** ([official](https://raw.githubusercontent.com/Comfy-Org/example_workflows/main/image/qwen/image_qwen_image_distill.json)): Distilled version with better performance (recommended)
+- **image_qwen_image_layered.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_image_layered.json)): Layered image generation workflow
 
-> **Note:** Only the native workflow is fully validated. There are some issues using LoRA. It's recommended to use the distilled version for better performance.
+> **Note:** Use fp8 format for all diffusion models to optimize memory usage and performance. It's recommended to use the distilled version for better performance.
 
 ##### Qwen-Image-Edit
 
 ComfyUI tutorial: https://docs.comfy.org/tutorials/image/qwen/qwen-image-edit
 
 **Available Workflows:**
-- **image_qwen_image_edit.json**: Standard image editing workflow
-- **image_qwen_image_edit_2509.json**: Updated version with enhanced features
-- **image_qwen_image_edit_2511.json**: Multi-image reference editing workflow (Edit Plus)
+- **image_qwen_image_edit.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_image_edit.json)): Standard image editing workflow
+
+- **image_qwen_image_edit_2511.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_image.json)): Multi-image reference editing workflow (Edit Plus)
 
 These workflows enable image editing based on text prompts, allowing you to modify existing images. The 2511 version supports multi-image reference for advanced editing scenarios like material transfer.
+
+> **Note:** Use fp8 format for all diffusion models to optimize memory usage and performance. 
 
 ##### Stable Diffusion 3.5
 
@@ -140,7 +142,7 @@ Stable Diffusion 3.5 provides high-quality text-to-image generation with optiona
 Comfyui tutorial: https://docs.comfy.org/tutorials/image/z-image/z-image-turbo
 
 **Available Workflows:**
-- **image_z_image_turbo.json**: Basic workflow for text-to-image generation
+- **image_z_image_turbo.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_z_image_turbo.json)): Basic workflow for text-to-image generation
 
 ##### Flux.1 Kontext Dev
 
@@ -158,8 +160,9 @@ ComfyUI tutorial: https://docs.comfy.org/tutorials/flux/flux-1-kontext-dev
 ComfyUI tutorial: https://docs.comfy.org/tutorials/video/wan/wan2_2
 
 **Available Workflows:**
-- **video_wan2_2_5B_ti2v.json**: Text+Image-to-Video with 5B model
-- **video_wan2_2_14B_t2v.json**: Text-to-Video with 14B model
+- **video_wan2_2_5B_ti2v.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_wan2_2_5B_ti2v.json)): Text+Image-to-Video with 5B model
+- **video_wan2_2_14B_t2v.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_wan2_2_14B_t2v.json)): Text-to-Video with 14B model
+- **video_wan2_2_14B_i2v.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_wan2_2_14B_i2v.json)): Image-to-Video with 14B model
 - **video_wan2_2_14B_t2v_rapid_aio_multi_xpu.json**: 14B Text-to-Video with multi-XPU support (using raylight)
 - **video_wan2.2_14B_i2v_rapid_aio_multi_xpu.json**: 14B Image-to-Video with multi-XPU support
 
