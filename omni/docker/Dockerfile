@@ -16,6 +16,7 @@ COPY ./patches/comfyui_for_multi_arc.patch /tmp/
 COPY ./patches/comfyui_voxcpm_for_xpu.patch /tmp/
 COPY ./patches/comfyui_hunyuan3d_for_xpu.patch /tmp/
 COPY ./patches/sglang_diffusion_for_multi_arc.patch /tmp/
+COPY ./patches/comfyui_hy_motion1.patch /tmp/
 
 
 # Add Intel oneAPI repo and PPA for GPU support
@@ -117,8 +118,15 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     python setup.py install && \
     cd ../DifferentiableRenderer && \
     python setup.py install && \
+# Install HY-Motion1 Node
+    cd /llm/ComfyUI/custom_nodes && \
+    git clone https://github.com/jtydhr88/ComfyUI-HY-Motion1.git && \
+    cd ComfyUI-HY-Motion1 && \
+    git checkout 47b1d0d96eeac6d4b99509ede91490eaba93440a && \
+    git apply /tmp/comfyui_hy_motion1.patch && \
+    pip install -r requirements.txt && \
     # Install Xinference
-    pip install "xinference[transformers]" && \
+    pip install "xinference[transformers]==1.15.0" && \
     patch /usr/local/lib/python3.12/dist-packages/xinference/device_utils.py < /tmp/xinference_device_utils.patch && \
     pip install kokoro Jinja2==3.1.6 jieba ordered-set pypinyin cn2an pypinyin-dict && \
 # Install SGlang Diffusion
