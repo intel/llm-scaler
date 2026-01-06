@@ -25,9 +25,7 @@ parser.add_argument("--host", type=str, default="127.0.0.1")
 parser.add_argument("--port", type=int, default=8003)
 args = parser.parse_args()
 
-
 client = OpenAI(api_key="EMPTY", base_url=args.model_url)
-
 
 def is_image_file(filename: str) -> bool:
     image_exts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp']
@@ -90,15 +88,10 @@ def predict(messages: List[Dict[str, Any]]):
         
         yield error_message, True 
 
-
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
     gr.Markdown("# 🎥 Qwen2.5-VL-7B-Instruct Model Serving")
-    
-
     chatbot = gr.Chatbot(height=1200, label="Qwen2.5-VL-7B-Instruct",  avatar_images=("👨", "🤖"), render_markdown=True)
-    
     upload_visible = gr.State(False)
-
 
     def toggle_upload(visible):
         new_visible = not visible
@@ -131,8 +124,6 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         show_progress=False
     )
 
-
-
     with gr.Row():
         submit_btn = gr.Button("🚀 提交", variant="primary")
         clear_btn = gr.Button("🧹 清空")
@@ -140,7 +131,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     api_history_state = gr.State([])
 
     def user_and_bot_response(
-        gradio_history: List[Tuple[str, str]],
+        gradio_history: List[Dict[str, str]],
         api_history: List[Dict[str, Any]],
         user_message: str,
         files: Optional[List[Any]]
@@ -189,20 +180,28 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             yield gradio_history, api_history
             return
         api_history.append({"role": "user", "content": api_user_content})
-        gradio_history.append((ui_display_string, None))
+        gradio_history.append({"role": "user", "content": ui_display_string})
         yield gradio_history, api_history
         response_stream = predict(api_history)
         full_response = ""
         is_error = False
+
+        gradio_history.append({"role": "assistant", "content": full_response})
         for partial_response, error_flag in response_stream:
-            full_response += partial_response
             is_error = error_flag
-            gradio_history[-1] = (ui_display_string, full_response)
-            yield gradio_history, api_history
             if is_error:
+                # remove assistant content
+                gradio_history.pop()
                 break
+
+            full_response += partial_response
+            gradio_history[-1]["content"] = full_response
+            yield gradio_history, api_history
+
         if is_error:
+            # remove user content
             api_history.pop()
+            gradio_history.pop()
         else:
             api_history.append({"role": "assistant", "content": full_response})
         yield gradio_history, api_history
