@@ -81,7 +81,7 @@ The following models are supported in ComfyUI workflows. For detailed model file
 
 | Model Category | Model Name | Type | Workflow Files |
 |---------------|------------|------|----------------|
-| **Image Generation** | Qwen-Image, Qwen-Image-Edit, Qwen-Image-Edit-2511 | Text-to-Image, Image Editing | `image_qwen_image.json`, `image_qwen_image_distill.json`, `image_qwen_image_edit.json`, `image_qwen_image_edit_2509.json`, `image_qwen_image_edit_2511.json`, `image_qwen_image_layered.json` |
+| **Image Generation** | Qwen-Image, Qwen-Image-Edit, Qwen-Image-Edit-2511 | Text-to-Image, Image Editing | `image_qwen_image.json`, `image_qwen_image_2512.json`, `image_qwen_image_distill.json`, `image_qwen_image_edit.json`, `image_qwen_image_edit_2509.json`, `image_qwen_image_edit_2511.json`, `image_qwen_image_layered.json` |
 | **Image Generation** | Stable Diffusion 3.5 | Text-to-Image, ControlNet | `image_sd3.5_simple_example.json`, `image_sd3.5_midium.json`, `image_sd3.5_large_canny_controlnet_example.json` |
 | **Image Generation** | Z-Image-Turbo | Text-to-Image |  `image_z_image_turbo.json` |
 | **Image Generation** | Flux.1, Flux.1 Kontext dev | Text-to-Image, Multi-Image Reference, ControlNet | `image_flux_kontext_dev_basic.json`, `image_flux_controlnet_example.json` |
@@ -108,6 +108,7 @@ ComfyUI tutorial: https://docs.comfy.org/tutorials/image/qwen/qwen-image
 
 **Available Workflows:**
 - **image_qwen_image.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_image.json)): Native Qwen-Image workflow for text-to-image generation
+- **image_qwen_image_2512.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_Image_2512.json)): Significant improvements in image quality and realism
 - **image_qwen_image_distill.json** ([official](https://raw.githubusercontent.com/Comfy-Org/example_workflows/main/image/qwen/image_qwen_image_distill.json)): Distilled version with better performance (recommended)
 - **image_qwen_image_layered.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_image_layered.json)): Layered image generation workflow
 
