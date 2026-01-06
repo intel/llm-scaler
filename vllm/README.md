@@ -2264,25 +2264,16 @@ git clone https://github.com/rednote-hilab/dots.ocr.git
 cd dots.ocr
 ```
 
-#### Modify dependencies
-
-Comment out the following two lines in `requirements.txt`:
-
-```
-flash-attn==2.8.0.post2
-transformers  # These two dependencies can cause conflicts
-```
-
-Then install the dependencies:
-
+#### Install dependencies
 ```bash
-pip install -e .
+pip install -e . --no-deps
+pip install gradio gradio_image_annotation PyMuPDF qwen_vl_utils
 ```
 
 #### Launch Gradio for testing
 
 ```bash
-python demo/demo_gradio.py
+python demo/demo_gradio.py 9000
 ```
 
 ---
