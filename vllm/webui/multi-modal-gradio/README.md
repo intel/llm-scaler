@@ -35,38 +35,36 @@ sudo docker run -td \
 docker exec -it yourcontainername bash
 ```
 ```bash
-TORCH_LLM_ALLREDUCE=1 \
-VLLM_USE_V1=1 \
-CCL_ZE_IPC_EXCHANGE=pidfd \
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
 python3 -m vllm.entrypoints.openai.api_server \
-    --model /llm/models/Qwen2.5-VL-7B-Instruct \
-    --dtype=float16 \
-    --device=xpu \
-    --enforce-eager \
-    --port 8000 \
-    --host 0.0.0.0 \
-    --trust-remote-code \
-    --gpu-memory-util=0.9 \
-    --no-enable-prefix-caching \
-    --max-num-batched-tokens=8192 \
-    --disable-log-requests \
-    --max-model-len=32768 \
-    --block-size 64 \
-    --quantization fp8 \
-    -tp=2
+--model /llm/models/yourmodelname \
+--served-model-name yourmodelname \
+--dtype=float16 \
+--enforce-eager \
+--port 8000 \
+--host 0.0.0.0 \
+--trust-remote-code \
+--gpu-memory-util=0.9 \
+--no-enable-prefix-caching \
+--max-num-batched-tokens=8192 \
+--disable-log-requests \
+--max-model-len=32768 \
+--block-size 64 \
+--quantization fp8 \
+-tp=2
 ```
 
 ### 3. Launch Gradio Interface on Host
 ```bash
 conda create -n qwen_gradio python=3.11
 conda activate qwen_gradio
-pip install gradio
+pip install gradio openai opencv-python
 ```
 ```bash
-python /llm-scaler/vllm/webui/multi-modal-gradio/main.py --model /llm/models/Qwen2.5-VL-7B-Instruct 
-# The model need to be downloaded in advance to the directory
+python /llm-scaler/vllm/webui/multi-modal-gradio/main.py --model yourmodelname [--model-url 'http://localhost:8000/v1']
+# The model needs to be downloaded in advance to the directory
+# The model url is optional and needs to correspond to the vLLM service.
 ```
 
 ## 🌐 Access Interface
