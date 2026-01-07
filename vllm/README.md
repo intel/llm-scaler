@@ -209,7 +209,7 @@ This way, only the first GPU will be mapped into the Docker container.
 >   
 >   ```yaml
 >   entrypoint: >
->     entrypoint: source /opt/intel/oneapi/setvars.sh --force && python3 -m vllm.entrypoints.openai.api_server --model /llm/models/Qwen3-14B
+>     entrypoint: source /opt/intel/oneapi/setvars.sh --force && vllm serve --model /llm/models/Qwen3-14B
 >   ```
 >
 > **Summary:** Automated starts require sourcing the oneAPI script; interactive bash sessions are ready to use.
@@ -223,7 +223,7 @@ This way, only the first GPU will be mapped into the Docker container.
 ```bash
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-python3 -m vllm.entrypoints.openai.api_server \
+vllm serve \
     --model /llm/models/DeepSeek-R1-Distill-Qwen-7B \
     --served-model-name DeepSeek-R1-Distill-Qwen-7B \
     --dtype=float16 \
@@ -2027,7 +2027,7 @@ The following example shows how to launch the server with `sym_int4` quantizatio
 ```bash
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-python3 -m vllm.entrypoints.openai.api_server \
+vllm serve \
     --model /llm/models/DeepSeek-R1-Distill-Qwen-7B \
     --dtype=float16 \
     --enforce-eager \
@@ -2061,7 +2061,7 @@ For those models that have been quantized before, such as AWQ-Int4/GPTQ-Int4/FP8
 ```bash
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-python3 -m vllm.entrypoints.openai.api_server \
+vllm serve \
     --model /llm/models/bge-m3 \
     --served-model-name bge-m3 \
     --task embed \
@@ -2100,7 +2100,7 @@ curl http://localhost:8000/v1/embeddings \
 ```bash
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-python3 -m vllm.entrypoints.openai.api_server \
+vllm serve \
     --model /llm/models/bge-reranker-base \
     --served-model-name bge-reranker-base \
     --task score \
@@ -2147,7 +2147,7 @@ curl -X 'POST' \
 ```bash
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-python3 -m vllm.entrypoints.openai.api_server \
+vllm serve \
     --model /llm/models/Qwen2.5-VL-7B-Instruct \
     --served-model-name Qwen2.5-VL-7B-Instruct \
     --allowed-local-media-path /llm/models/test \
@@ -2288,7 +2288,7 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 
-python3 -m vllm.entrypoints.openai.api_server \
+vllm serve \
   --model $MODEL_NAME \
   --dtype float16 \
   --enforce-eager \
@@ -2359,7 +2359,7 @@ pip install librosa soundfile
 ```bash
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-python3 -m vllm.entrypoints.openai.api_server \
+vllm serve \
     --model /llm/models/Qwen2.5-Omni-7B \
     --served-model-name Qwen2.5-Omni-7B \
     --allowed-local-media-path /llm/models/test \
@@ -2702,7 +2702,7 @@ export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 export CCL_ATL_TRANSPORT=ofi
 export VLLM_HOST_IP=10.0.1.19
 
-python3 -m vllm.entrypoints.openai.api_server \
+vllm serve \
     --model $MODEL_NAME \
     --dtype=float16 \
     --enforce-eager \
