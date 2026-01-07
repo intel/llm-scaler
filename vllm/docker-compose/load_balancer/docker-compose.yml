@@ -10,7 +10,7 @@ services:
     working_dir: /llm
     entrypoint: >
       bash -lc "source /opt/intel/oneapi/setvars.sh --force &&
-      python3 -m vllm.entrypoints.openai.api_server
+      vllm serve
       --model /llm/models/DeepSeek-R1-Distill-Qwen-7B
       --served-model-name model
       --dtype=float16
@@ -46,7 +46,7 @@ services:
     working_dir: /llm
     entrypoint: >
       bash -lc "source /opt/intel/oneapi/setvars.sh --force &&
-      python3 -m vllm.entrypoints.openai.api_server
+      vllm serve
       --model /llm/models/DeepSeek-R1-Distill-Qwen-7B
       --served-model-name model
       --dtype=float16

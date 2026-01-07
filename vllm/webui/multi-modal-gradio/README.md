@@ -37,7 +37,7 @@ docker exec -it yourcontainername bash
 ```bash
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-python3 -m vllm.entrypoints.openai.api_server \
+vllm serve \
 --model /llm/models/yourmodelname \
 --served-model-name yourmodelname \
 --dtype=float16 \

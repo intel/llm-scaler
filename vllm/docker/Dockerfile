@@ -134,5 +134,5 @@ RUN pip uninstall oneccl oneccl-devel -y
 RUN cd /llm/vllm && \
     python3 -m pip install -e tests/vllm_test_utils
     
-ENTRYPOINT ["bash", "-c", "source /opt/intel/oneapi/setvars.sh --force && python3 -m vllm.entrypoints.openai.api_server"]
+ENTRYPOINT ["bash", "-c", "source /opt/intel/oneapi/setvars.sh --force && vllm serve"]
 

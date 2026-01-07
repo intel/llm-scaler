@@ -209,7 +209,7 @@ This way, only the first GPU will be mapped into the Docker container.
 >   
 >   ```yaml
 >   entrypoint: >
->     entrypoint: source /opt/intel/oneapi/setvars.sh --force && python3 -m vllm.entrypoints.openai.api_server --model /llm/models/Qwen3-14B
+>     entrypoint: source /opt/intel/oneapi/setvars.sh --force && vllm serve --model /llm/models/Qwen3-14B
 >   ```
 >
 > **Summary:** Automated starts require sourcing the oneAPI script; interactive bash sessions are ready to use.
@@ -221,9 +221,10 @@ This way, only the first GPU will be mapped into the Docker container.
 ### 1.4 Launching the Serving Service
 
 ```bash
+# Start the vLLM service, logging to both file /llm/vllm.log and Docker logs
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-python3 -m vllm.entrypoints.openai.api_server \
+vllm serve \
     --model /llm/models/DeepSeek-R1-Distill-Qwen-7B \
     --served-model-name DeepSeek-R1-Distill-Qwen-7B \
     --dtype=float16 \
@@ -239,7 +240,14 @@ python3 -m vllm.entrypoints.openai.api_server \
     --max-model-len=8192 \
     --block-size 64 \
     --quantization fp8 \
-    -tp=1
+    -tp=1 \
+    2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
+
+# Use tail to view logs in the current terminal
+# If the user wants to see logs in real-time in the current terminal, 
+# they can remove '> /proc/1/fd/1 &' and run in the foreground:
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn vllm serve ... 2>&1 | tee /llm/vllm.log
+tail -f /llm/vllm.log
 ```
 you can add the argument `--api-key xxx` for user authentication. Users are supposed to send their requests with request header bearing the API key.
 
@@ -2027,7 +2035,7 @@ The following example shows how to launch the server with `sym_int4` quantizatio
 ```bash
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-python3 -m vllm.entrypoints.openai.api_server \
+vllm serve \
     --model /llm/models/DeepSeek-R1-Distill-Qwen-7B \
     --dtype=float16 \
     --enforce-eager \
@@ -2042,7 +2050,14 @@ python3 -m vllm.entrypoints.openai.api_server \
     --max-model-len=8192 \
     --block-size 64 \
     --quantization sym_int4 \
-    -tp=1
+    -tp=1 \
+    2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
+
+# Use tail to view logs in the current terminal
+# If the user wants to see logs in real-time in the current terminal, 
+# they can remove '> /proc/1/fd/1 &' and run in the foreground:
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn vllm serve ... 2>&1 | tee /llm/vllm.log
+tail -f /llm/vllm.log
 ```
 
 To use fp8 online quantization, simply replace `--quantization sym_int4` with:
@@ -2061,7 +2076,7 @@ For those models that have been quantized before, such as AWQ-Int4/GPTQ-Int4/FP8
 ```bash
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-python3 -m vllm.entrypoints.openai.api_server \
+vllm serve \
     --model /llm/models/bge-m3 \
     --served-model-name bge-m3 \
     --task embed \
@@ -2100,7 +2115,7 @@ curl http://localhost:8000/v1/embeddings \
 ```bash
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-python3 -m vllm.entrypoints.openai.api_server \
+vllm serve \
     --model /llm/models/bge-reranker-base \
     --served-model-name bge-reranker-base \
     --task score \
@@ -2116,7 +2131,14 @@ python3 -m vllm.entrypoints.openai.api_server \
     --disable-log-requests \
     --max-model-len=2048 \
     --block-size 64 \
-    -tp=1
+    -tp=1 \
+    2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
+
+# Use tail to view logs in the current terminal
+# If the user wants to see logs in real-time in the current terminal, 
+# they can remove '> /proc/1/fd/1 &' and run in the foreground:
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn vllm serve ... 2>&1 | tee /llm/vllm.log
+tail -f /llm/vllm.log
 ```
 After starting the vLLM service, you can follow this link to use it.
 #### [Rerank api](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#re-rank-api)
@@ -2147,7 +2169,7 @@ curl -X 'POST' \
 ```bash
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-python3 -m vllm.entrypoints.openai.api_server \
+vllm serve \
     --model /llm/models/Qwen2.5-VL-7B-Instruct \
     --served-model-name Qwen2.5-VL-7B-Instruct \
     --allowed-local-media-path /llm/models/test \
@@ -2163,7 +2185,14 @@ python3 -m vllm.entrypoints.openai.api_server \
     --max-model-len=5120 \
     --block-size 64 \
     --quantization fp8 \
-    -tp=1
+    -tp=1 \
+    2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
+
+# Use tail to view logs in the current terminal
+# If the user wants to see logs in real-time in the current terminal, 
+# they can remove '> /proc/1/fd/1 &' and run in the foreground:
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn vllm serve ... 2>&1 | tee /llm/vllm.log
+tail -f /llm/vllm.log
 ```
 
 After starting the vLLM service, you can follow this link to use it
@@ -2288,7 +2317,7 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 
-python3 -m vllm.entrypoints.openai.api_server \
+vllm serve \
   --model $MODEL_NAME \
   --dtype float16 \
   --enforce-eager \
@@ -2304,7 +2333,14 @@ python3 -m vllm.entrypoints.openai.api_server \
   --served-model-name MinerU \
   --tensor-parallel-size 1 \
   --pipeline-parallel-size 1 \
-  --logits-processors mineru_vl_utils:MinerULogitsProcessor
+  --logits-processors mineru_vl_utils:MinerULogitsProcessor \
+  2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
+
+# Use tail to view logs in the current terminal
+# If the user wants to see logs in real-time in the current terminal, 
+# they can remove '> /proc/1/fd/1 &' and run in the foreground:
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn vllm serve ... 2>&1 | tee /llm/vllm.log
+tail -f /llm/vllm.log
 ```
 
 > **💡 Notes**
@@ -2359,7 +2395,7 @@ pip install librosa soundfile
 ```bash
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-python3 -m vllm.entrypoints.openai.api_server \
+vllm serve \
     --model /llm/models/Qwen2.5-Omni-7B \
     --served-model-name Qwen2.5-Omni-7B \
     --allowed-local-media-path /llm/models/test \
@@ -2375,7 +2411,14 @@ python3 -m vllm.entrypoints.openai.api_server \
     --max-model-len=5120 \
     --block-size 64 \
     --quantization fp8 \
-    -tp=1
+    -tp=1 \
+    2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
+
+# Use tail to view logs in the current terminal
+# If the user wants to see logs in real-time in the current terminal, 
+# they can remove '> /proc/1/fd/1 &' and run in the foreground:
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn vllm serve ... 2>&1 | tee /llm/vllm.log
+tail -f /llm/vllm.log
 ```
 
 After starting the vLLM service, you can follow this link to use it
@@ -2702,7 +2745,7 @@ export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 export CCL_ATL_TRANSPORT=ofi
 export VLLM_HOST_IP=10.0.1.19
 
-python3 -m vllm.entrypoints.openai.api_server \
+vllm serve \
     --model $MODEL_NAME \
     --dtype=float16 \
     --enforce-eager \
@@ -2718,7 +2761,14 @@ python3 -m vllm.entrypoints.openai.api_server \
     --block-size 64 \
     --served-model-name test \
     -tp=2 -pp=1 \
-    --distributed-executor-backend ray
+    --distributed-executor-backend ray \
+    2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
+
+# Use tail to view logs in the current terminal
+# If the user wants to see logs in real-time in the current terminal, 
+# they can remove '> /proc/1/fd/1 &' and run in the foreground:
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn vllm serve ... 2>&1 | tee /llm/vllm.log
+tail -f /llm/vllm.log
 ```
 
 
