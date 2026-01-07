@@ -2050,7 +2050,14 @@ vllm serve \
     --max-model-len=8192 \
     --block-size 64 \
     --quantization sym_int4 \
-    -tp=1
+    -tp=1 \
+    2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
+
+# Use tail to view logs in the current terminal
+# If the user wants to see logs in real-time in the current terminal, 
+# they can remove '> /proc/1/fd/1 &' and run in the foreground:
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn vllm serve ... 2>&1 | tee /llm/vllm.log
+tail -f /llm/vllm.log
 ```
 
 To use fp8 online quantization, simply replace `--quantization sym_int4` with:
@@ -2124,7 +2131,14 @@ vllm serve \
     --disable-log-requests \
     --max-model-len=2048 \
     --block-size 64 \
-    -tp=1
+    -tp=1 \
+    2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
+
+# Use tail to view logs in the current terminal
+# If the user wants to see logs in real-time in the current terminal, 
+# they can remove '> /proc/1/fd/1 &' and run in the foreground:
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn vllm serve ... 2>&1 | tee /llm/vllm.log
+tail -f /llm/vllm.log
 ```
 After starting the vLLM service, you can follow this link to use it.
 #### [Rerank api](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#re-rank-api)
@@ -2171,7 +2185,14 @@ vllm serve \
     --max-model-len=5120 \
     --block-size 64 \
     --quantization fp8 \
-    -tp=1
+    -tp=1 \
+    2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
+
+# Use tail to view logs in the current terminal
+# If the user wants to see logs in real-time in the current terminal, 
+# they can remove '> /proc/1/fd/1 &' and run in the foreground:
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn vllm serve ... 2>&1 | tee /llm/vllm.log
+tail -f /llm/vllm.log
 ```
 
 After starting the vLLM service, you can follow this link to use it
@@ -2312,7 +2333,14 @@ vllm serve \
   --served-model-name MinerU \
   --tensor-parallel-size 1 \
   --pipeline-parallel-size 1 \
-  --logits-processors mineru_vl_utils:MinerULogitsProcessor
+  --logits-processors mineru_vl_utils:MinerULogitsProcessor \
+  2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
+
+# Use tail to view logs in the current terminal
+# If the user wants to see logs in real-time in the current terminal, 
+# they can remove '> /proc/1/fd/1 &' and run in the foreground:
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn vllm serve ... 2>&1 | tee /llm/vllm.log
+tail -f /llm/vllm.log
 ```
 
 > **💡 Notes**
@@ -2383,7 +2411,14 @@ vllm serve \
     --max-model-len=5120 \
     --block-size 64 \
     --quantization fp8 \
-    -tp=1
+    -tp=1 \
+    2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
+
+# Use tail to view logs in the current terminal
+# If the user wants to see logs in real-time in the current terminal, 
+# they can remove '> /proc/1/fd/1 &' and run in the foreground:
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn vllm serve ... 2>&1 | tee /llm/vllm.log
+tail -f /llm/vllm.log
 ```
 
 After starting the vLLM service, you can follow this link to use it
@@ -2726,7 +2761,14 @@ vllm serve \
     --block-size 64 \
     --served-model-name test \
     -tp=2 -pp=1 \
-    --distributed-executor-backend ray
+    --distributed-executor-backend ray \
+    2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
+
+# Use tail to view logs in the current terminal
+# If the user wants to see logs in real-time in the current terminal, 
+# they can remove '> /proc/1/fd/1 &' and run in the foreground:
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn vllm serve ... 2>&1 | tee /llm/vllm.log
+tail -f /llm/vllm.log
 ```
 
 
