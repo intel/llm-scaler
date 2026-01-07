@@ -221,6 +221,7 @@ This way, only the first GPU will be mapped into the Docker container.
 ### 1.4 Launching the Serving Service
 
 ```bash
+# Start the vLLM service, logging to both file /llm/vllm.log and Docker logs
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
 vllm serve \
@@ -239,7 +240,14 @@ vllm serve \
     --max-model-len=8192 \
     --block-size 64 \
     --quantization fp8 \
-    -tp=1
+    -tp=1 \
+    2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
+
+# Use tail to view logs in the current terminal
+# If the user wants to see logs in real-time in the current terminal, 
+# they can remove '> /proc/1/fd/1 &' and run in the foreground:
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn vllm serve ... 2>&1 | tee /llm/vllm.log
+tail -f /llm/vllm.log
 ```
 you can add the argument `--api-key xxx` for user authentication. Users are supposed to send their requests with request header bearing the API key.
 
