@@ -2245,108 +2245,9 @@ curl http://localhost:8000/v1/audio/transcriptions \
 ```
 ---
 
-### 2.4.2 dots.ocr Support
+### 2.4.2 OCR Model Support
 
-To launch `dots.ocr`, follow the instructions in [1.4 Launching the Serving Service](#14-launching-the-serving-service), specifying the dots.ocr model, setting the model path to `/llm/models/dots.ocr`, the served-model-name to `model`, and the port to 8000.
-
-
-Once the service is running, you can use the method provided in the `dots.ocr` repository to launch Gradio for testing.
-
----
-
-#### Clone the repository
-
-```bash
-git clone https://github.com/rednote-hilab/dots.ocr.git
-cd dots.ocr
-```
-
-#### Install dependencies
-```bash
-pip install -e . --no-deps
-pip install gradio gradio_image_annotation PyMuPDF qwen_vl_utils
-```
-
-#### Launch Gradio for testing
-
-```bash
-python demo/demo_gradio.py 9000
-```
-
----
-
-### 2.4.3 MinerU 2.6 Support
-
-This guide shows how to launch the MinerU 2.6 model using the vLLM inference backend.
-
-#### Start the MinerU Service
-
-Set up the environment variables and launch the vLLM API server:
-```bash
-export MODEL_NAME="/llm/models/MinerU2.5-2509-1.2B/"
-export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
-
-python3 -m vllm.entrypoints.openai.api_server \
-  --model $MODEL_NAME \
-  --dtype float16 \
-  --enforce-eager \
-  --port 8000 \
-  --host 0.0.0.0 \
-  --trust-remote-code \
-  --gpu-memory-util 0.85 \
-  --no-enable-prefix-caching \
-  --max-num-batched-tokens=32768 \
-  --max-model-len=32768 \
-  --block-size 64 \
-  --max-num-seqs 256 \
-  --served-model-name MinerU \
-  --tensor-parallel-size 1 \
-  --pipeline-parallel-size 1 \
-  --logits-processors mineru_vl_utils:MinerULogitsProcessor
-```
-
-> **💡 Notes**
->
-> - `--logits-processors mineru_vl_utils:MinerULogitsProcessor` enables MinerU’s custom post-processing logic.
-
-
-
-#### Run the demo
-To verify mineru
-
-```bash
-#mineru -p <input_path> -o <output_path> -b vlm-http-client -u http://127.0.0.1:8000
-mineru -p /llm/MinerU/demo/pdfs/small_ocr.pdf -o ./ -b vlm-http-client -u http://127.0.0.1:8000
-```
-
-2.Using by gradio
-
-```bash
-mineru-gradio --server-name 0.0.0.0 --server-port 8002
-```
-
-```python
-from gradio_client import Client, handle_file
-
-client = Client("http://localhost:8002/")
-result = client.predict(
-    file_path=handle_file('/llm/MinerU/demo/pdfs/small_ocr.pdf'),
-    end_pages=500,
-    is_ocr=False,
-    formula_enable=True,
-    table_enable=True,
-    language="ch",
-    backend="vlm-http-client",
-    url="http://localhost:8000",
-    api_name="/to_markdown"
-)
-print(result)
-```
-More details you can refer to gradio's [api guide](http://your_ip:8002/?view=api)
-
----
+Refer to [here](OCR/README.md) for details.
 
 ### 2.5 Omni Model Support
 
@@ -2881,7 +2782,7 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | Multimodal Model     | opendatalab/MinerU2.5-2509-1.2B            |  ✅  |         ✅         |          ✅          |       |                           |
 | Multimodal Model     | baidu/ERNIE-4.5-VL-28B-A3B-Thinking        |  ✅  |         ✅         |          ✅          |       |                           |
 | Multimodal Model     | zai-org/GLM-4.6V-Flash                     |  ✅  |         ✅         |          ✅          |       |   pip install transformers==5.0.0rc0 first            |
-| Multimodal Model     | PaddlePaddle/PaddleOCR-VL                  |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](#32-how-to-use-paddleocr)     |
+| Multimodal Model     | PaddlePaddle/PaddleOCR-VL                  |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](OCR/README.md#3-paddler-ocr-support)     |
 | omni                 | Qwen/Qwen2.5-Omni-7B                       |  ✅  |         ✅         |          ✅          |       |                           |
 | omni                 | Qwen/Qwen3-Omni-30B-A3B-Instruct           |  ✅  |         ✅         |          ✅          |       |                           |
 | audio                | openai/whisper-medium                      |  ✅  |         ✅         |          ✅          |       |                           |
@@ -2918,53 +2819,6 @@ curl http://localhost:8001/v1/chat/completions -H 'Content-Type: application/jso
 ],
 "max_tokens": 128
 }'
-```
-
-### 3.2 how to use paddleocr
-
-Need to use the specified format to use paddleocr.
-```bash
-from openai import OpenAI
-
-client = OpenAI(
-    api_key="EMPTY",
-    base_url="http://localhost:8002/v1",
-    timeout=3600
-)
-
-# Task-specific base prompts
-TASKS = {
-    "ocr": "OCR:",
-    "table": "Table Recognition:",
-    "formula": "Formula Recognition:",
-    "chart": "Chart Recognition:",
-}
-
-messages = [
-    {
-        "role": "user",
-        "content": [
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": "https://ofasys-multimodal-wlcb-3-toshanghai.oss-accelerate.aliyuncs.com/wpf272043/keepme/image/receipt.png"
-                }
-            },
-            {
-                "type": "text",
-                "text": TASKS["ocr"]
-            }
-        ]
-    }
-]
-
-response = client.chat.completions.create(
-    model="PaddleOCR-VL",
-    messages=messages,
-    temperature=0.0,
-    max_tokens=128,
-)
-print(f"Generated text: {response.choices[0].message.content}")
 ```
 
 ## 4. Troubleshooting
