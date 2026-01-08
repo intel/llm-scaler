@@ -9,7 +9,7 @@
 # ==============================================================================
 
 # --- Configuration Variables ---
-FILE_PATH="/usr/local/lib/python3.10/dist-packages/basicsr/data/degradations.py"
+FILE_PATH="/usr/local/lib/python3.12/dist-packages/basicsr/data/degradations.py"
 OLD_STRING="from torchvision.transforms.functional_tensor import rgb_to_grayscale"
 NEW_STRING="from torchvision.transforms.functional import rgb_to_grayscale"
 BACKUP_EXTENSION=".bak" # Extension for the backup file
@@ -23,7 +23,7 @@ echo "Target file: $FILE_PATH"
 # 1. Check if the target file exists
 if [ ! -f "$FILE_PATH" ]; then
     echo "Error: Target file not found at '$FILE_PATH'."
-    echo "Please ensure basicsr is installed for Python 3.10."
+    echo "Please ensure basicsr is installed for Python 3.12."
     echo "Exiting."
     exit 1
 fi

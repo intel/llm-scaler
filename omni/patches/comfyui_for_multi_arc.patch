@@ -1,8 +1,42 @@
+diff --git a/comfy/float.py b/comfy/float.py
+index 521316fd..92ccd263 100644
+--- a/comfy/float.py
++++ b/comfy/float.py
+@@ -1,4 +1,10 @@
+ import torch
++import os
++import comfy.model_management
++
++# Environment variable to disable the XPU negative zero fix
++# Set _LLM_SCALER_DISABLE_STOCHASTIC_FIX=1 to disable the fix
++_DISABLE_STOCHASTIC_FIX = os.environ.get("_LLM_SCALER_DISABLE_STOCHASTIC_FIX", "0") == "1"
+ 
+ def calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, generator=None):
+     mantissa_scaled = torch.where(
+@@ -43,10 +49,17 @@ def manual_stochastic_round_to_float8(x, dtype, generator=None):
+ 
+     inf = torch.finfo(dtype)
+     torch.clamp(sign, min=inf.min, max=inf.max, out=sign)
++    
++    # FIX: Convert negative zeros to positive zeros to avoid Intel XPU NaN bug
++    # XPU has a bug where -0.0 converted to float8 becomes NaN
++    # Can be disabled by setting _LLM_SCALER_DISABLE_STOCHASTIC_FIX=1
++    if not _DISABLE_STOCHASTIC_FIX and comfy.model_management.is_intel_xpu():
++        is_neg_zero = (sign == 0) & (torch.signbit(sign))
++        sign = torch.where(is_neg_zero, torch.zeros_like(sign), sign)
++    
+     return sign
+ 
+ 
+-
+ def stochastic_rounding(value, dtype, seed=0):
+     if dtype == torch.float32:
+         return value.to(dtype=torch.float32)
 diff --git a/comfy/model_management.py b/comfy/model_management.py
-index 709ebc40..c43e8eab 100644
+index 1889ab0a..954dfec5 100644
 --- a/comfy/model_management.py
 +++ b/comfy/model_management.py
-@@ -148,6 +148,90 @@ def is_intel_xpu():
+@@ -150,6 +150,90 @@ def is_intel_xpu():
              return True
      return False
  
@@ -93,7 +127,7 @@ index 709ebc40..c43e8eab 100644
  def is_ascend_npu():
      global npu_available
      if npu_available:
-@@ -720,7 +804,6 @@ def cleanup_models_gc():
+@@ -738,7 +822,6 @@ def cleanup_models_gc():
                  logging.warning("WARNING, memory leak with model {}. Please make sure it is not being referenced from somewhere.".format(cur.real_model().__class__.__name__))
  
  
@@ -101,7 +135,7 @@ index 709ebc40..c43e8eab 100644
  def cleanup_models():
      to_delete = []
      for i in range(len(current_loaded_models)):
-@@ -1399,7 +1482,7 @@ def unload_all_models():
+@@ -1527,7 +1610,7 @@ def unload_all_models():
      free_memory(1e30, get_torch_device())
  
  

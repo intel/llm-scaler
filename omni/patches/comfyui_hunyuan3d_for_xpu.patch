@@ -116,10 +116,39 @@ index 15192e9..06f34fe 100644
  )
  
 diff --git a/hy3dpaint/hunyuanpaintpbr/pipeline.py b/hy3dpaint/hunyuanpaintpbr/pipeline.py
-index 8f2ca9c..53e9843 100644
+index 8f2ca9c..25033ab 100644
 --- a/hy3dpaint/hunyuanpaintpbr/pipeline.py
 +++ b/hy3dpaint/hunyuanpaintpbr/pipeline.py
-@@ -242,7 +242,7 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
+@@ -62,12 +62,25 @@ def to_rgb_image(maybe_rgba: Image.Image):
+         return maybe_rgba
+     elif maybe_rgba.mode == "RGBA":
+         rgba = maybe_rgba
+-        img = numpy.random.randint(127, 128, size=[rgba.size[1], rgba.size[0], 3], dtype=numpy.uint8)
+-        img = Image.fromarray(img, "RGB")
++        # Use white background instead of random gray for better color preservation
++        img = Image.new("RGB", rgba.size, (255, 255, 255))
+         img.paste(rgba, mask=rgba.getchannel("A"))
+         return img
++    elif maybe_rgba.mode == "P":
++        # Palette mode: convert to RGBA if has transparency, otherwise convert to RGB directly
++        if "transparency" in maybe_rgba.info:
++            return to_rgb_image(maybe_rgba.convert("RGBA"))
++        else:
++            return maybe_rgba.convert("RGB")
++    elif maybe_rgba.mode == "L":
++        # Grayscale image: convert to RGB directly
++        return maybe_rgba.convert("RGB")
++    elif maybe_rgba.mode == "LA":
++        # Grayscale with alpha: convert to RGBA first then process recursively
++        return to_rgb_image(maybe_rgba.convert("RGBA"))
+     else:
+-        raise ValueError("Unsupported image type.", maybe_rgba.mode)
++        # Other modes: attempt generic conversion to RGB
++        return maybe_rgba.convert("RGB")
+ 
+ 
+ class HunyuanPaintPipeline(StableDiffusionPipeline):
+@@ -242,7 +255,7 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
                      if img.shape[2] > 3:
                          alpha = img[:, :, 3:]
                          img = img[:, :, :3] * alpha + bg_c * (1 - alpha)
@@ -128,7 +157,7 @@ index 8f2ca9c..53e9843 100644
                      view_imgs.append(img)
                  view_imgs = torch.cat(view_imgs, dim=0)
                  images_tensor.append(view_imgs.unsqueeze(0))
-@@ -713,7 +713,7 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
+@@ -713,7 +726,7 @@ class HunyuanPaintPipeline(StableDiffusionPipeline):
                          step_idx = i // getattr(self.scheduler, "order", 1)
                          callback(step_idx, t, latents)
  
@@ -500,7 +529,7 @@ index 924c1a8..50330d1 100644
          Offloads all models to CPU using accelerate, reducing memory usage with a low impact on performance. Compared
          to `enable_sequential_cpu_offload`, this method moves one whole model at a time to the GPU when its `forward`
 diff --git a/nodes.py b/nodes.py
-index 8e6680f..057247c 100644
+index 8e6680f..e28b258 100644
 --- a/nodes.py
 +++ b/nodes.py
 @@ -35,6 +35,9 @@ from .hy3dshape.hy3dshape.models.autoencoders import ShapeVAE
@@ -567,7 +596,23 @@ index 8e6680f..057247c 100644
          gc.collect()
          
          return (mesh_output, )        
-@@ -1350,7 +1353,7 @@ class Hy3D21MeshGenerationBatch:
+@@ -820,7 +823,14 @@ class Hy3D21LoadImageWithTransparency:
+         for i in ImageSequence.Iterator(img):
+             i = node_helpers.pillow(ImageOps.exif_transpose, i)
+             
+-            output_images_ori.append(pil2tensor(i))
++            # Convert P mode with transparency to RGBA, otherwise keep original mode
++            if i.mode == 'P' and 'transparency' in i.info:
++                i_for_ori = i.convert('RGBA')
++            elif i.mode == 'P':
++                i_for_ori = i.convert('RGB')
++            else:
++                i_for_ori = i
++            output_images_ori.append(pil2tensor(i_for_ori))
+ 
+             if i.mode == 'I':
+                 i = i.point(lambda i: i * (1 / 255))
+@@ -1350,7 +1360,7 @@ class Hy3D21MeshGenerationBatch:
                      mesh_output.export(output_glb_path, file_type=file_format)              
                                      
                      mm.soft_empty_cache()
@@ -576,7 +621,7 @@ index 8e6680f..057247c 100644
                      gc.collect()     
                  else:
                      print(f'Skipping file {file}')
-@@ -1361,7 +1364,7 @@ class Hy3D21MeshGenerationBatch:
+@@ -1361,7 +1371,7 @@ class Hy3D21MeshGenerationBatch:
              del vae
              
              mm.soft_empty_cache()
@@ -585,7 +630,7 @@ index 8e6680f..057247c 100644
              gc.collect() 
              
          return (input_folder, output_folder, processed_input_images, processed_output_meshes, ) 
-@@ -1573,7 +1576,7 @@ class Hy3D21GenerateMultiViewsBatch:
+@@ -1573,7 +1583,7 @@ class Hy3D21GenerateMultiViewsBatch:
                              del paint_pipeline
                              
                              mm.soft_empty_cache()
@@ -594,7 +639,7 @@ index 8e6680f..057247c 100644
                              gc.collect() 
                          else:
                              print(f'Skipping {file}') 
-@@ -1588,7 +1591,7 @@ class Hy3D21GenerateMultiViewsBatch:
+@@ -1588,7 +1598,7 @@ class Hy3D21GenerateMultiViewsBatch:
              print('Nothing to process')       
          
          mm.soft_empty_cache()
@@ -603,7 +648,7 @@ index 8e6680f..057247c 100644
          gc.collect() 
              
          return (processed_meshes, )    
-@@ -1833,7 +1836,7 @@ class Hy3DBakeMultiViewsWithMetaData:
+@@ -1833,7 +1843,7 @@ class Hy3DBakeMultiViewsWithMetaData:
          del pipeline
          
          mm.soft_empty_cache()
@@ -612,20 +657,9 @@ index 8e6680f..057247c 100644
          gc.collect() 
          
          return (texture_tensor, texture_mr_tensor, trimesh, output_glb_path)  
-diff --git a/requirements.txt b/requirements.txt
-index b0eec02..306fef6 100644
---- a/requirements.txt
-+++ b/requirements.txt
-@@ -1,5 +1,5 @@
- trimesh
--pymeshlab
-+pymeshlab==2022.2.post3
- pygltflib
- xatlas
- open3d
 diff --git a/xpu_convert.py b/xpu_convert.py
 new file mode 100644
-index 0000000..f408557
+index 0000000..3871630
 --- /dev/null
 +++ b/xpu_convert.py
 @@ -0,0 +1,263 @@
@@ -885,7 +919,7 @@ index 0000000..f408557
 +        print("Error: Could not unpatch. Original function reference missing.")
 +
 +def convert_to_xpu():
-+    nn.LayerNorm.forward = _new_layer_norm_forward
++    # nn.LayerNorm.forward = _new_layer_norm_forward
 +    # AttnProcessor2_0.__call__ = chunked_diffusers_attention_processor_call
 +    F.scaled_dot_product_attention = chunk_scaled_dot_product_attention
 +    RealESRGANer.process = process_on_xpu

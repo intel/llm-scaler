@@ -50,6 +50,8 @@ docker exec -it comfyui bash
 
 ## ComfyUI
 
+> **📖 Detailed Documentation**: See [ComfyUI Detailed Guide](./docs/ComfyUI_Guide.md) for complete model configuration, directory structure, and official reference links. [中文文档](./docs/ComfyUI_Guide_CN.md)
+
 ### Starting ComfyUI
 
 ```bash
@@ -59,7 +61,7 @@ export http_proxy=<your_proxy>
 export https_proxy=<your_proxy>
 export no_proxy=localhost,127.0.0.1
 
-python3 main.py
+python3 main.py --listen 0.0.0.0
 ```
 
 Then you can access the webUI at `http://<your_local_ip>:8188/`. 
@@ -75,11 +77,11 @@ Modify the `Preview method` to show the preview image during sampling iterations
 
 ### Supported Models
 
-The following models are supported in ComfyUI workflows:
+The following models are supported in ComfyUI workflows. For detailed model files and directory structure, see the [ComfyUI Guide](./docs/ComfyUI_Guide.md#model-directory-structure).
 
 | Model Category | Model Name | Type | Workflow Files |
 |---------------|------------|------|----------------|
-| **Image Generation** | Qwen-Image, Qwen-Image-Edit | Text-to-Image, Image Editing | `image_qwen_image.json`, `image_qwen_image_distill.json`, `image_qwen_image_edit.json`, `image_qwen_image_edit_2509.json` |
+| **Image Generation** | Qwen-Image, Qwen-Image-Edit, Qwen-Image-Edit-2511 | Text-to-Image, Image Editing | `image_qwen_image.json`, `image_qwen_image_2512.json`, `image_qwen_image_distill.json`, `image_qwen_image_edit.json`, `image_qwen_image_edit_2509.json`, `image_qwen_image_edit_2511.json`, `image_qwen_image_layered.json` |
 | **Image Generation** | Stable Diffusion 3.5 | Text-to-Image, ControlNet | `image_sd3.5_simple_example.json`, `image_sd3.5_midium.json`, `image_sd3.5_large_canny_controlnet_example.json` |
 | **Image Generation** | Z-Image-Turbo | Text-to-Image |  `image_z_image_turbo.json` |
 | **Image Generation** | Flux.1, Flux.1 Kontext dev | Text-to-Image, Multi-Image Reference, ControlNet | `image_flux_kontext_dev_basic.json`, `image_flux_controlnet_example.json` |
@@ -87,7 +89,7 @@ The following models are supported in ComfyUI workflows:
 | **Video Generation** | Wan2.2 Animate 14B | Video Animation | `video_wan2_2_animate_basic.json` |
 | **Video Generation** | HunyuanVideo 1.5 8.3B | Text-to-Video, Image-to-Video | `video_hunyuan_video_1.5_t2v.json`, `video_hunyuan_video_1.5_i2v.json`, `video_hunyuan_video_1.5_i2v_multi_xpu.json` |
 | **3D Generation** | Hunyuan3D 2.1 | Text/Image-to-3D | `3d_hunyuan3d.json` |
-| **Audio Generation** | VoxCPM | Text-to-Speech | `audio_VoxCPM_example.json` |
+| **Audio Generation** | VoxCPM1.5, IndexTTS 2 | Text-to-Speech, Voice Cloning | `audio_VoxCPM_example.json`, `audio_indextts2.json` |
 
 ### ComfyUI Workflows
 
@@ -98,25 +100,32 @@ All workflow files are available in the `workflows/` directory. Below are detail
 
 #### Image Generation Workflows
 
+> **📖 Detailed Documentation**: For model files, directory structure and download links, see [Image Generation Models](./docs/ComfyUI_Guide.md#image-generation-models).
+
 ##### Qwen-Image
 
 ComfyUI tutorial: https://docs.comfy.org/tutorials/image/qwen/qwen-image
 
 **Available Workflows:**
-- **image_qwen_image.json**: Native Qwen-Image workflow for text-to-image generation
-- **image_qwen_image_distill.json**: Distilled version with better performance (recommended)
+- **image_qwen_image.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_image.json)): Native Qwen-Image workflow for text-to-image generation
+- **image_qwen_image_2512.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_Image_2512.json)): Significant improvements in image quality and realism
+- **image_qwen_image_distill.json** ([official](https://raw.githubusercontent.com/Comfy-Org/example_workflows/main/image/qwen/image_qwen_image_distill.json)): Distilled version with better performance (recommended)
+- **image_qwen_image_layered.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_image_layered.json)): Layered image generation workflow
 
-> **Note:** Only the native workflow is fully validated. There are some issues using LoRA. It's recommended to use the distilled version for better performance.
+> **Note:** Use fp8 format for all diffusion models to optimize memory usage and performance. It's recommended to use the distilled version for better performance.
 
 ##### Qwen-Image-Edit
 
 ComfyUI tutorial: https://docs.comfy.org/tutorials/image/qwen/qwen-image-edit
 
 **Available Workflows:**
-- **image_qwen_image_edit.json**: Standard image editing workflow
-- **image_qwen_image_edit_2509.json**: Updated version with enhanced features
+- **image_qwen_image_edit.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_image_edit.json)): Standard image editing workflow
 
-These workflows enable image editing based on text prompts, allowing you to modify existing images.
+- **image_qwen_image_edit_2511.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_image.json)): Multi-image reference editing workflow (Edit Plus)
+
+These workflows enable image editing based on text prompts, allowing you to modify existing images. The 2511 version supports multi-image reference for advanced editing scenarios like material transfer.
+
+> **Note:** Use fp8 format for all diffusion models to optimize memory usage and performance. 
 
 ##### Stable Diffusion 3.5
 
@@ -134,7 +143,7 @@ Stable Diffusion 3.5 provides high-quality text-to-image generation with optiona
 Comfyui tutorial: https://docs.comfy.org/tutorials/image/z-image/z-image-turbo
 
 **Available Workflows:**
-- **image_z_image_turbo.json**: Basic workflow for text-to-image generation
+- **image_z_image_turbo.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_z_image_turbo.json)): Basic workflow for text-to-image generation
 
 ##### Flux.1 Kontext Dev
 
@@ -145,13 +154,16 @@ ComfyUI tutorial: https://docs.comfy.org/tutorials/flux/flux-1-kontext-dev
 
 #### Video Generation Workflows
 
+> **📖 Detailed Documentation**: For model files, directory structure and download links, see [Video Generation Models](./docs/ComfyUI_Guide.md#video-generation-models).
+
 ##### Wan2.2
 
 ComfyUI tutorial: https://docs.comfy.org/tutorials/video/wan/wan2_2
 
 **Available Workflows:**
-- **video_wan2_2_5B_ti2v.json**: Text+Image-to-Video with 5B model
-- **video_wan2_2_14B_t2v.json**: Text-to-Video with 14B model
+- **video_wan2_2_5B_ti2v.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_wan2_2_5B_ti2v.json)): Text+Image-to-Video with 5B model
+- **video_wan2_2_14B_t2v.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_wan2_2_14B_t2v.json)): Text-to-Video with 14B model
+- **video_wan2_2_14B_i2v.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_wan2_2_14B_i2v.json)): Image-to-Video with 14B model
 - **video_wan2_2_14B_t2v_rapid_aio_multi_xpu.json**: 14B Text-to-Video with multi-XPU support (using raylight)
 - **video_wan2.2_14B_i2v_rapid_aio_multi_xpu.json**: 14B Image-to-Video with multi-XPU support
 
@@ -199,6 +211,8 @@ The default parameter configurations of these workflows are optimized for 480p F
 
 #### 3D Generation Workflows
 
+> **📖 Detailed Documentation**: For model configuration details, see [3D Generation Models](./docs/ComfyUI_Guide.md#3d-generation-models).
+
 ##### Hunyuan3D
 
 **Available Workflows:**
@@ -208,12 +222,14 @@ This workflow generates 3D models from text descriptions or images using the Hun
 
 #### Audio Generation Workflows
 
-##### VoxCPM
+> **📖 Detailed Documentation**: For model files and setup instructions, see [Audio Generation Models](./docs/ComfyUI_Guide.md#audio-generation-models).
+
+##### VoxCPM1.5
 
 **Available Workflows:**
 - **audio_VoxCPM_example.json**: Text-to-Speech synthesis
 
-This workflow generates speech audio from text input using the VoxCPM model.
+This workflow generates speech audio from text input using the VoxCPM1.5 or VoxCPM model.
 
 ##### IndexTTS 2
 

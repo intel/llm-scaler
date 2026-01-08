@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ======== Base Stage ========
-FROM intel/llm-scaler-platform:25.38.4.2
+FROM intel/llm-scaler-platform:25.45.5.4
 
 ARG https_proxy
 ARG http_proxy
-ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python3.10/dist-packages/torch/lib:$LD_LIBRARY_PATH"
+ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python3.12/dist-packages/torch/lib:$LD_LIBRARY_PATH"
 
 COPY ./patches/yunchang_for_multi_arc.patch /tmp/
 COPY ./patches/xdit_for_multi_arc.patch /tmp/
@@ -21,26 +21,35 @@ COPY ./patches/sglang_diffusion_for_multi_arc.patch /tmp/
 # Add Intel oneAPI repo and PPA for GPU support
 RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
     echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list && \
+    add-apt-repository -y ppa:kobuk-team/intel-graphics && \
 # Install dependencies and Python 3.10
     apt-get update -y && \
-    apt-get install -y software-properties-common libgl1 && \
-    apt-get install -y libxrender1 libxfixes3 libx11-dev libxi6 libxxf86vm1 libxcursor1 libxrandr2 libxinerama1 libxkbcommon0 libsm6 ffmpeg && \
-    add-apt-repository ppa:deadsnakes/ppa && \
-    apt-get update -y && \
-    apt-get install -y python3.10 python3.10-distutils python3.10-dev && \
-    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10 && \
-    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
-    pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/xpu && \
-    pip install oneccl_bind_pt==2.8.0+xpu --index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/cn/ && \
-    pip install bigdl-core-xe-all==2.7.0b20250625 && \
-    apt remove python3-blinker -y && \
-    wget https://download.blender.org/pypi/bpy/bpy-4.0.0-cp310-cp310-manylinux_2_28_x86_64.whl && \
-    pip install bpy-4.0.0-cp310-cp310-manylinux_2_28_x86_64.whl && \
-    rm bpy-4.0.0-cp310-cp310-manylinux_2_28_x86_64.whl && \
+    # apt-get install -y software-properties-common && \
+    # add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get install -y python3.12 python3.12-dev python3-pip && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
+    apt-get install -y --no-install-recommends --fix-missing \
+        curl \
+        ffmpeg \
+        git \
+        libsndfile1 \
+        libsm6 \
+        libxext6 \
+        libgl1 \
+        lsb-release \
+        numactl \
+        wget \
+        vim \
+        linux-libc-dev && \
+    # Install Intel GPU runtime packages
+    apt-get install -y intel-oneapi-dpcpp-ct=2025.2.0-517 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    python3 -m pip config set global.break-system-packages true && \
+    pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/xpu && \
     # Install xDit related dependencies
     mkdir /llm && \
     cd /llm && \
-    ln -s /usr/bin/python3 /usr/bin/python && \
     git clone https://github.com/feifeibear/long-context-attention.git && \
     cd long-context-attention && \
     git checkout fc5d55e61b78b3102fd824bea1791cf406cc2a4b && \
@@ -56,7 +65,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cd /llm && \
     git clone https://github.com/comfyanonymous/ComfyUI.git && \
     cd ComfyUI && \
-    git checkout f8b981ae9a5676311624bbafa636a1874db79459 && \
+    git checkout 532e2850794c7b497174a0a42ac0cb1fe5b62499 && \
     git apply /tmp/comfyui_for_multi_arc.patch && \
     pip install -r requirements.txt && \
     cd custom_nodes && \
@@ -67,7 +76,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cd .. && \
     git clone https://github.com/komikndr/raylight.git && \
     cd raylight && \
-    git checkout 6e27efc540c49fa82d2bb779959cd5ad76b5faf5 && \
+    git checkout c91ef47afb02e522bf08ff199ea2182642de0368 && \
     git apply /tmp/raylight_for_multi_arc.patch && \
     pip install ray==2.49.2 && \
     pip install -r requirements.txt && \
@@ -78,21 +87,39 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cd .. && \
     git clone https://github.com/Fannovel16/comfyui_controlnet_aux.git && \
     cd comfyui_controlnet_aux && \
-    apt install libcairo2-dev pkg-config python3-dev -y && \
     pip install -r requirements.txt && \
     cd .. && \
     git clone https://github.com/wildminder/ComfyUI-VoxCPM.git comfyui-voxcpm && \
     cd comfyui-voxcpm && \
-    git checkout 044dd93c0effc9090fb279117de5db4cd90242a0 && \
+    git checkout 7875a8a36a531b7efef8cac96dc74001d3cb5895 && \
     git apply /tmp/comfyui_voxcpm_for_xpu.patch && \
     pip install -r requirements.txt && \
     cd .. && \
     git clone https://github.com/billwuhao/ComfyUI_IndexTTS.git && \
     cd ComfyUI_IndexTTS && \
     pip install -r requirements.txt && \
-# Install Xinference
+    cd /llm/ComfyUI/custom_nodes && \
+    git clone https://github.com/kijai/ComfyUI-KJNodes.git && \
+    cd ComfyUI-KJNodes && \
+    pip install -r requirements.txt && \
+# Install ComfyUI Hunyuan3D Node
+    cd /llm/ComfyUI/custom_nodes && \
+    apt remove python3-blinker -y && \
+    apt update -y && \
+    apt install -y libopengl0 libglx0 libgl1 libxrender1 libxfixes3 libx11-dev libxi6 libxxf86vm1 libxcursor1 libxrandr2 libxinerama1 libxkbcommon0 libsm6 ffmpeg && \
+    git clone https://github.com/visualbruno/ComfyUI-Hunyuan3d-2-1.git && \
+    cd ComfyUI-Hunyuan3d-2-1 && \
+    git checkout 9d7ef32509101495a7840b3ae8e718c8d1183305 && \
+    git apply /tmp/comfyui_hunyuan3d_for_xpu.patch && \
+    pip install bigdl-core==2.4.0b1 rembg realesrgan && \
+    pip install -r requirements.txt && \
+    cd hy3dpaint/custom_rasterizer && \
+    python setup.py install && \
+    cd ../DifferentiableRenderer && \
+    python setup.py install && \
+    # Install Xinference
     pip install "xinference[transformers]" && \
-    patch /usr/local/lib/python3.10/dist-packages/xinference/device_utils.py < /tmp/xinference_device_utils.patch && \
+    patch /usr/local/lib/python3.12/dist-packages/xinference/device_utils.py < /tmp/xinference_device_utils.patch && \
     pip install kokoro Jinja2==3.1.6 jieba ordered-set pypinyin cn2an pypinyin-dict && \
 # Install SGlang Diffusion
     cd /llm && \
@@ -109,16 +136,13 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     pip install -v . && \
     # Clean
     rm -rf /tmp/*
-RUN cd /llm/ComfyUI/custom_nodes && \
-    git clone https://github.com/kijai/ComfyUI-KJNodes.git && \
-    cd ComfyUI-KJNodes && \
-    pip install -r requirements.txt
 
 COPY ./workflows/* /llm/ComfyUI/user/default/workflows/
 COPY ./example_inputs/* /llm/ComfyUI/input/
 COPY ./tools/* /llm/tools/
 COPY ./entrypoints/* /llm/entrypoints/
 
-RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
+ENV CCL_SYCL_ALLTOALL_ARC_LL=1
+ENV CCL_SYCL_CCL_BARRIER=1
 
 WORKDIR /llm/entrypoints
