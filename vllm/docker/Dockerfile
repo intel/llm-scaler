@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ======== Base Stage ========
-FROM intel/llm-scaler-platform:25.45.5.4 AS vllm-base
+FROM intel/llm-scaler-platform:25.50.6.0 AS vllm-base
 
 ARG https_proxy
 ARG http_proxy
@@ -33,7 +33,7 @@ RUN apt-get update -y && \
         vim \
         linux-libc-dev && \
     # Install Intel GPU runtime packages
-    apt-get install -y intel-oneapi-dpcpp-ct=2025.1.0-452 && \
+    apt-get install -y intel-oneapi-dpcpp-ct=2025.2.0-517 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /llm
@@ -53,7 +53,7 @@ RUN git clone -b v0.10.2 https://github.com/vllm-project/vllm.git && \
     cd vllm && \
     git apply /tmp/vllm_for_multi_arc.patch && \
     pip install --no-cache-dir -r requirements/xpu.txt && \
-    export CPATH=/opt/intel/oneapi/dpcpp-ct/2025.1/include/:${CPATH} && \
+    export CPATH=/opt/intel/oneapi/dpcpp-ct/2025.2/include/:${CPATH} && \
     python3 setup.py install
 
 # Clone + patch miner-U
@@ -64,34 +64,6 @@ RUN git clone -b release-2.6.2 https://github.com/opendatalab/MinerU.git && \
     sed -i 's/kwargs.get("max_concurrency", 100)/kwargs.get("max_concurrency", 200)/' /llm/MinerU/mineru/backend/vlm/vlm_analyze.py && \
     sed -i 's/kwargs.get("http_timeout", 600)/kwargs.get("http_timeout", 1200)/' /llm/MinerU/mineru/backend/vlm/vlm_analyze.py
 
-
-# ======= Add oneCCL build =======
-# RUN apt-get update && apt-get install -y \
-#     cmake \
-#     g++ \
-#     && rm -rf /var/lib/apt/lists/*
-
-# TODO: update
-# Build 1ccl
-# RUN git clone https://github.com/oneapi-src/oneCCL.git && \
-#     cd oneCCL && \
-#     git checkout def870543749186b6f38cdc865b44d52174c7492 && \
-#     git apply /tmp/0001-oneccl-align-global-V0.1.1.patch && \
-#     mkdir build && cd build && \
-#     export IGC_VISAOptions=-activeThreadsOnlyBarrier && \
-#     /usr/bin/cmake .. \
-#         -DCMAKE_INSTALL_PREFIX=_install \
-#         -DCMAKE_C_COMPILER=icx \
-#         -DCMAKE_CXX_COMPILER=icpx \
-#         -DCOMPUTE_BACKEND=dpcpp \
-#         -DCCL_ENABLE_ARCB=1 && \
-#     make -j && make install && \
-#     mv _install /opt/intel/oneapi/ccl/2021.15.3 && \
-#     cd /opt/intel/oneapi/ccl/ && \
-#     ln -snf 2021.15.3 latest
-# RUN cd /tmp/ && \
-#     wget https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.4/intel-oneccl-2021.15.4.11_offline.sh && \
-#     bash intel-oneccl-2021.15.4.11_offline.sh -a --silent --eula accept
 
 # Install pypi dependencies
 RUN pip install bigdl-core==2.4.0b2
