@@ -17,6 +17,8 @@ COPY ./patches/comfyui_voxcpm_for_xpu.patch /tmp/
 COPY ./patches/comfyui_hunyuan3d_for_xpu.patch /tmp/
 COPY ./patches/sglang_diffusion_for_multi_arc.patch /tmp/
 COPY ./patches/comfyui_hy_motion1.patch /tmp/
+COPY ./patches/comfyui_gguf_xpu.patch /tmp/
+
 
 
 # Add Intel oneAPI repo and PPA for GPU support
@@ -125,7 +127,14 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     git checkout 47b1d0d96eeac6d4b99509ede91490eaba93440a && \
     git apply /tmp/comfyui_hy_motion1.patch && \
     pip install -r requirements.txt && \
-    # Install Xinference
+# Install ComfyUI-GGUF Node
+    cd /llm/ComfyUI/custom_nodes && \
+    git clone https://github.com/city96/ComfyUI-GGUF.git && \
+    cd ComfyUI-GGUF && \
+    git checkout 795e45156ece99afbc3efef911e63fcb46e6a20d && \
+    git apply /tmp/comfyui_gguf_xpu.patch && \
+    pip install -r requirements.txt && \
+# Install Xinference
     pip install "xinference[transformers]==1.15.0" && \
     patch /usr/local/lib/python3.12/dist-packages/xinference/device_utils.py < /tmp/xinference_device_utils.patch && \
     pip install kokoro Jinja2==3.1.6 jieba ordered-set pypinyin cn2an pypinyin-dict && \
