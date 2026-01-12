@@ -1,10 +1,12 @@
+FROM scratch AS src
+
+ADD --unpack=true multi-arc-*.tar.xz /
+
 FROM intel/deep-learning-essentials:2025.2.2-0-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ARG BUILD_ENV=docker
 ENV BUILD_ENV=${BUILD_ENV}
-
-COPY *.tar.xz /
 
 # Install all dependencies required to run the installer
 RUN set -eux; \
@@ -32,26 +34,21 @@ RUN set -eux; \
         libnuma1 \
         libxext6 \
         xz-utils \
-&& apt-get clean && rm -rf /var/lib/apt/lists/*; \
-        \
-        # Prepare multi-arc directory
-        mkdir -p /opt/intel/multi-arc; \
-        cd /tmp; \
-    \
-    # Download offline installer (ensure it's a direct tar.xz)
-    mv /*.tar.xz /opt/intel/multi-arc/; \
-    cd /opt/intel/multi-arc; \
-    \
-    # Extract and run installer
-    tar -xf multi-arc-bmg-offline-installer*.tar.xz; \
-    cd multi-arc-bmg-offline-installer-*; \
-    chmod +x installer.sh; \
-    ./installer.sh; \
-    \
-    # Cleanup
-    cd /opt/intel/multi-arc; \
-    rm -rf multi-arc-bmg-offline-installer*.tar.xz; \
-    rm -rf multi-arc-bmg-offline-installer-*/*.sh multi-arc-bmg-offline-installer-*/oneapi multi-arc-bmg-offline-installer-*/kernel multi-arc-bmg-offline-installer-*/firmware
+&& apt-get clean && rm -rf /var/lib/apt/lists/*;
+
+RUN --mount=from=src,rw,target=/src <<EOF
+    SRC_DIR=$(ls -d /src/multi-arc-*)
+    DST_DIR=/opt/intel/multi-arc
+
+    cd "$SRC_DIR" && ./installer.sh
+
+    install -d "$DST_DIR"
+    for item in scripts tools results; do
+        cp -rf "$SRC_DIR/$item" "$DST_DIR/"
+    done
+
+    cp "$SRC_DIR/README.md" "$SRC_DIR/VERSION" "$DST_DIR/"
+EOF
 
 # Set up UTF-8 locale
 RUN locale-gen en_US.UTF-8
