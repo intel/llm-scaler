@@ -258,9 +258,14 @@ ComfyUI-Portable/
 
 If you encounter issues not covered above:
 
-1. Check ComfyUI logs in the terminal window
-2. Search existing issues on [ComfyUI GitHub](https://github.com/comfyanonymous/ComfyUI/issues)
-3. Join the [ComfyUI Discord](https://discord.gg/comfyui) community
+1. Check ComfyUI logs in the terminal window for detailed error messages
+2. Search existing issues:
+   - [ComfyUI GitHub Issues](https://github.com/comfyanonymous/ComfyUI/issues) - For general ComfyUI problems
+   - [LLM Scaler Issues](https://github.com/intel/llm-scaler/issues) - For Intel XPU specific issues
+3. Submit a new issue on [LLM Scaler repository](https://github.com/intel/llm-scaler/issues) with:
+   - Your system information (GPU model, driver version)
+   - Complete error logs from the terminal
+   - Steps to reproduce the issue
 
 ---
 
@@ -279,10 +284,6 @@ git stash
 git fetch origin
 git pull
 git stash pop
-```
-Then re-apply the XPU patch:
-```cmd
-git apply ..\patches\comfyui_for_multi_arc.patch
 ```
 
 > **Note**: After updating, there may be patch conflicts if ComfyUI has significant changes. If the patch fails to apply, you may need to download the latest setup script and patch files, then perform a fresh installation.
@@ -312,7 +313,7 @@ git apply ..\patches\comfyui_for_multi_arc.patch
 ## Version Information
 
 | Component | Version |
-|-----------|---------||
+|-----------|---------|
 | Python | 3.12.10 |
 | PyTorch | 2.9.0+xpu |
 | ComfyUI | Commit 532e285 |
@@ -323,7 +324,3 @@ git apply ..\patches\comfyui_for_multi_arc.patch
 ## License
 
 This setup script is provided for use with Intel XPU hardware. ComfyUI and its custom nodes are subject to their respective licenses.
-
-## Support
-
-For Intel XPU-specific issues, please contact Intel support or visit the [Intel Developer Zone](https://www.intel.com/content/www/us/en/developer/overview.html).
