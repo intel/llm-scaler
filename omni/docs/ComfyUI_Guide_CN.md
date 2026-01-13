@@ -41,6 +41,7 @@
 | **Flux.1 Kontext Dev** | https://docs.comfy.org/tutorials/flux/flux-1-kontext-dev | [black-forest-labs/FLUX.1-Kontext-dev](https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev) |
 | **Wan2.2** | https://docs.comfy.org/tutorials/video/wan/wan2_2 | [Comfy-Org/Wan_2.2_ComfyUI_Repackaged](https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged) |
 | **HunyuanVideo 1.5** | https://docs.comfy.org/tutorials/video/hunyuan/hunyuan-video-1-5 | [Comfy-Org/HunyuanVideo_1.5_repackaged](https://huggingface.co/Comfy-Org/HunyuanVideo_1.5_repackaged) |
+| **LTX-2** | https://blog.comfy.org/p/ltx-2-open-source-audio-video-ai | [Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2) |
 
 ---
 
@@ -536,6 +537,43 @@ Qwen-Image-Layered 是阿里巴巴 Qwen 团队开发的模型，能够将图像�
 3. **采样**
    - `XFuserSamplerCustom` 在多个 GPU 上执行分布式采样
    - `RayModelSamplingSD3` 配置模型采样参数
+
+---
+
+### LTX-2
+
+**官方教程**: https://blog.comfy.org/p/ltx-2-open-source-audio-video-ai
+
+#### 模型文件
+
+| 类型 | 文件名 | 存放目录 | 下载链接 |
+|------|--------|----------|----------|
+| Checkpoint | `ltx-2-19b-dev-fp8.safetensors` | `checkpoints/` | [HuggingFace](https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev-fp8.safetensors) |
+| Text Encoder | `gemma_3_12B_it_fp4_mixed.safetensors` | `text_encoders/` | [HuggingFace](https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors) |
+| Upscaler | `ltx-2-spatial-upscaler-x2-1.0.safetensors` | `latent_upscale_models/` | [HuggingFace](https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-spatial-upscaler-x2-1.0.safetensors) |
+| LoRA | `ltx-2-19b-distilled-lora-384.safetensors` | `loras/` | [HuggingFace](https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-distilled-lora-384.safetensors) |
+
+#### 模型存放位置
+
+```text
+📂 ComfyUI/
+└── 📂 models/
+    ├── 📂 checkpoints/
+    │   └── ltx-2-19b-dev-fp8.safetensors
+    ├── 📂 text_encoders/
+    │   └── gemma_3_12B_it_fp4_mixed.safetensors
+    ├── 📂 latent_upscale_models/
+    │   └── ltx-2-spatial-upscaler-x2-1.0.safetensors
+    └── 📂 loras/
+        └── ltx-2-19b-distilled-lora-384.safetensors
+```
+
+#### 工作流文件
+
+| 工作流 | 说明 |
+|--------|------|
+| `video_ltx2_t2v.json` | 文本生视频（含音频/动作） |
+| `video_ltx2_i2v.json` | 图像生视频（含音频/动作） |
 
 ---
 

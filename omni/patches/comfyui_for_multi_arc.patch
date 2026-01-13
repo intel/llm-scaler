@@ -1,5 +1,5 @@
 diff --git a/comfy/float.py b/comfy/float.py
-index 521316fd..92ccd263 100644
+index c806af76..375d2a6e 100644
 --- a/comfy/float.py
 +++ b/comfy/float.py
 @@ -1,4 +1,10 @@
@@ -33,10 +33,10 @@ index 521316fd..92ccd263 100644
      if dtype == torch.float32:
          return value.to(dtype=torch.float32)
 diff --git a/comfy/model_management.py b/comfy/model_management.py
-index 1889ab0a..954dfec5 100644
+index 9d39be7b..acb459c1 100644
 --- a/comfy/model_management.py
 +++ b/comfy/model_management.py
-@@ -150,6 +150,90 @@ def is_intel_xpu():
+@@ -149,6 +149,90 @@ def is_intel_xpu():
              return True
      return False
  
@@ -127,7 +127,7 @@ index 1889ab0a..954dfec5 100644
  def is_ascend_npu():
      global npu_available
      if npu_available:
-@@ -738,7 +822,6 @@ def cleanup_models_gc():
+@@ -749,7 +833,6 @@ def cleanup_models_gc():
                  logging.warning("WARNING, memory leak with model {}. Please make sure it is not being referenced from somewhere.".format(cur.real_model().__class__.__name__))
  
  
@@ -135,9 +135,9 @@ index 1889ab0a..954dfec5 100644
  def cleanup_models():
      to_delete = []
      for i in range(len(current_loaded_models)):
-@@ -1527,7 +1610,7 @@ def unload_all_models():
-     free_memory(1e30, get_torch_device())
- 
+@@ -1568,7 +1651,7 @@ def debug_memory_summary():
+         return torch.cuda.memory.memory_summary()
+     return ""
  
 -#TODO: might be cleaner to put this somewhere else
 +# TODO: might be cleaner to put this somewhere else
