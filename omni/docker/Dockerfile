@@ -134,6 +134,11 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     git checkout 795e45156ece99afbc3efef911e63fcb46e6a20d && \
     git apply /tmp/comfyui_gguf_xpu.patch && \
     pip install -r requirements.txt && \
+# Install ComfyUI-CacheDiT Node
+    cd /llm/ComfyUI/custom_nodes && \
+    git clone https://github.com/xlite-dev/comfyui-cache-dit.git && \
+    cd comfyui-cache-dit && \
+    pip install -r requirements.txt && \
 # Install Xinference
     pip install "xinference[transformers]==1.15.0" && \
     patch /usr/local/lib/python3.12/dist-packages/xinference/device_utils.py < /tmp/xinference_device_utils.patch && \
@@ -151,6 +156,9 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     git clone https://github.com/sgl-project/sgl-kernel-xpu.git && \
     cd sgl-kernel-xpu && \
     pip install -v . && \
+# Install SGlang Diffusion for ComfyUI
+    cd /llm/ComfyUI/custom_nodes && \
+    cp -r /llm/sglang/python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion . && \
     # Clean
     rm -rf /tmp/*
 
