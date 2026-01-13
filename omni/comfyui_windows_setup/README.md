@@ -16,7 +16,7 @@ This guide provides step-by-step instructions for setting up a portable ComfyUI 
 
 ## Overview
 
-This setup script creates a fully portable ComfyUI installation optimized for Intel XPU (Arc GPUs and Intel Data Center GPUs). The installation includes:
+This setup script creates a fully portable ComfyUI installation optimized for Intel XPU (Arc GPUs). The installation includes:
 
 - **Python 3.12 Embedded** - Self-contained Python environment
 - **PyTorch with XPU Support** - Intel GPU acceleration
@@ -60,12 +60,19 @@ set "NO_PROXY=localhost,127.0.0.1"
 
 ### Step 1: Download Setup Files
 
-Download or clone the setup files to your desired location:
+Clone the LLM Scaler repository to your desired location:
 
+```cmd
+git clone https://github.com/intel/llm-scaler.git
+cd llm-scaler\omni\comfyui_windows_setup
 ```
-C:\ComfyUI-Portable\
-├── setup_portable_env.bat
-└── ..\patches\
+
+The required files are located in:
+```
+llm-scaler\omni\
+├── comfyui_windows_setup\
+│   └── setup_portable_env.bat
+└── patches\
     ├── comfyui_for_multi_arc.patch
     └── comfyui_gguf_xpu.patch
 ```
@@ -86,10 +93,9 @@ The script will automatically:
 
 ### Step 3: Verify Installation
 
-After installation, verify that everything is set up correctly:
+After installation, navigate to the `comfyui_windows_setup` folder and verify that everything is set up correctly:
 
 ```cmd
-cd C:\ComfyUI-Portable
 python_embeded\python.exe -c "import torch; print(f'XPU available: {torch.xpu.is_available()}')"
 ```
 
@@ -172,10 +178,10 @@ Use ComfyUI-Manager (pre-installed) to install additional custom nodes:
 
 ## Directory Structure
 
-After installation, your directory will look like:
+After installation, your `comfyui_windows_setup` directory will look like:
 
 ```
-ComfyUI-Portable/
+comfyui_windows_setup/
 ├── python_embeded/          # Python environment
 │   ├── python.exe
 │   ├── Lib/
