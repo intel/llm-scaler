@@ -68,7 +68,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cd /llm && \
     git clone https://github.com/comfyanonymous/ComfyUI.git && \
     cd ComfyUI && \
-    git checkout c2b65e2fceea821276c143ad52478552633922bf && \
+    git checkout acd0e536533cdf038bbaa32730cd12a438cc3a60 && \
     git apply /tmp/comfyui_for_multi_arc.patch && \
     pip install -r requirements.txt && \
     cd custom_nodes && \
