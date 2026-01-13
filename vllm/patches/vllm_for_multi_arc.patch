@@ -11607,6 +11607,94 @@ index 40b80ce23..b6a0d4530 100755
          )
          self.mlp = Qwen3_VisionMLP(
              dim,
+diff --git a/vllm/model_executor/models/qwen3_vl_moe.py b/vllm/model_executor/models/qwen3_vl_moe.py
+index 5c3205faf..a1875a406 100644
+--- a/vllm/model_executor/models/qwen3_vl_moe.py
++++ b/vllm/model_executor/models/qwen3_vl_moe.py
+@@ -52,7 +52,9 @@ from .qwen3_vl import (
+     Qwen3VLMultiModalProcessor,
+     Qwen3VLProcessingInfo,
+ )
++from vllm.distributed import get_tensor_model_parallel_world_size
+ from .utils import is_pp_missing_parameter, maybe_prefix
++from vllm.utils.math_utils import cdiv, round_up
+ 
+ logger = init_logger(__name__)
+ 
+@@ -184,7 +186,73 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
+             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
+         ]
+         num_experts = self.config.num_experts
++        is_padding_needed = False
++        if getattr(self, "quant_config", None) is not None:
++            quant_method = self.quant_config.get_name()
++            tp_size = get_tensor_model_parallel_world_size()
++            if quant_method in ("sym_int4") and (tp_size == 4):
++                is_padding_needed = True
+         for name, loaded_weight in weights:
++            if is_padding_needed:
++
++                if ".down_proj" in name:
++                    if not any(x in name for x in ["scales", "qzeros", "g_idx", "scale", "bias"]):
++
++                        target_dim_val = 768
++                        target_padded_val = 1024
++                        found_dim_index = -1
++
++                        for i, dim_size in enumerate(loaded_weight.shape):
++                            if dim_size == target_dim_val:
++                                found_dim_index = i
++                                break
++
++                        if found_dim_index != -1:
++
++                            pad_len = target_padded_val - target_dim_val
++
++                            ndim = loaded_weight.dim()
++                            pad_args = [0] * (2 * ndim)
++
++                            dim_from_last = ndim - 1 - found_dim_index
++
++                            pad_args[2 * dim_from_last + 1] = pad_len
++
++                            loaded_weight = torch.nn.functional.pad(loaded_weight, tuple(pad_args), value=0)
++
++                elif ".gate_up_proj" in name:
++                    if not any(x in name for x in ["scales", "qzeros", "g_idx", "scale", "bias"]):
++                        target_dim_val = 1536
++                        target_padded_val = 2048
++
++                        found_dim_index = -1
++                        for i, dim_size in enumerate(loaded_weight.shape):
++                            if dim_size == target_dim_val:
++                                found_dim_index = i
++                                break
++
++                        if found_dim_index != -1:
++                            chunks = loaded_weight.chunk(2, dim=found_dim_index)
++                            w1 = chunks[0]
++                            w3 = chunks[1]
++
++                            single_pad_len = 1024 - 768 # = 256
++
++                            ndim = loaded_weight.dim()
++                            pad_args = [0] * (2 * ndim)
++                            dim_from_last = ndim - 1 - found_dim_index
++                            pad_args[2 * dim_from_last + 1] = single_pad_len
++
++                            w1_padded = torch.nn.functional.pad(w1, tuple(pad_args), value=0)
++                            w3_padded = torch.nn.functional.pad(w3, tuple(pad_args), value=0)
++
++                            loaded_weight = torch.cat([w1_padded, w3_padded], dim=found_dim_index)
++                elif ".gate_proj" in name or ".up_proj" in name:
++                    shape0 = loaded_weight.shape[1]
++                    target_size = round_up(shape0, 1024)
++                    if target_size > shape0:
++                        pad_size = target_size - shape0
++                        loaded_weight = torch.nn.functional.pad(loaded_weight, (0, 0, 0, pad_size), value=0)
+             for param_name, weight_name, shard_id in stacked_params_mapping:
+                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:
+                     is_fused_expert = True
 diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
 index a2de597c8..6a1409a17 100644
 --- a/vllm/model_executor/models/registry.py
