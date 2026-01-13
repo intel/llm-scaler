@@ -1,5 +1,5 @@
 diff --git a/comfy/float.py b/comfy/float.py
-index 521316fd..92ccd263 100644
+index 521316fd..ddb7b8fc 100644
 --- a/comfy/float.py
 +++ b/comfy/float.py
 @@ -1,4 +1,10 @@
@@ -13,30 +13,26 @@ index 521316fd..92ccd263 100644
  
  def calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, generator=None):
      mantissa_scaled = torch.where(
-@@ -43,10 +49,17 @@ def manual_stochastic_round_to_float8(x, dtype, generator=None):
+@@ -43,6 +49,14 @@ def manual_stochastic_round_to_float8(x, dtype, generator=None):
  
      inf = torch.finfo(dtype)
      torch.clamp(sign, min=inf.min, max=inf.max, out=sign)
-+    
++
 +    # FIX: Convert negative zeros to positive zeros to avoid Intel XPU NaN bug
 +    # XPU has a bug where -0.0 converted to float8 becomes NaN
 +    # Can be disabled by setting _LLM_SCALER_DISABLE_STOCHASTIC_FIX=1
 +    if not _DISABLE_STOCHASTIC_FIX and comfy.model_management.is_intel_xpu():
 +        is_neg_zero = (sign == 0) & (torch.signbit(sign))
 +        sign = torch.where(is_neg_zero, torch.zeros_like(sign), sign)
-+    
++
      return sign
  
  
--
- def stochastic_rounding(value, dtype, seed=0):
-     if dtype == torch.float32:
-         return value.to(dtype=torch.float32)
 diff --git a/comfy/model_management.py b/comfy/model_management.py
-index 1889ab0a..954dfec5 100644
+index 92828209..f44c9a32 100644
 --- a/comfy/model_management.py
 +++ b/comfy/model_management.py
-@@ -150,6 +150,90 @@ def is_intel_xpu():
+@@ -150,6 +150,89 @@ def is_intel_xpu():
              return True
      return False
  
@@ -83,7 +79,6 @@ index 1889ab0a..954dfec5 100644
 +
 +                # Call the original interpolate function on CPU
 +                result_on_cpu = _original_interpolate_func(input_on_cpu, *args, **kwargs)
-+
 +                # Move the result back to the original XPU device
 +                result_on_xpu = result_on_cpu.to(original_device)
 +                # print(
@@ -93,7 +88,6 @@ index 1889ab0a..954dfec5 100644
 +            else:
 +                # If not an XPU tensor, just call the original function directly
 +                return _original_interpolate_func(input_tensor, *args, **kwargs)
-+
 +        # Replace the original function with our custom one
 +        F.interpolate = _custom_interpolate
 +        _is_interpolate_patched = True
@@ -124,23 +118,7 @@ index 1889ab0a..954dfec5 100644
 +
 +
 +    patch_xpu_interpolate_to_cpu()
++
  def is_ascend_npu():
      global npu_available
      if npu_available:
-@@ -738,7 +822,6 @@ def cleanup_models_gc():
-                 logging.warning("WARNING, memory leak with model {}. Please make sure it is not being referenced from somewhere.".format(cur.real_model().__class__.__name__))
- 
- 
--
- def cleanup_models():
-     to_delete = []
-     for i in range(len(current_loaded_models)):
-@@ -1527,7 +1610,7 @@ def unload_all_models():
-     free_memory(1e30, get_torch_device())
- 
- 
--#TODO: might be cleaner to put this somewhere else
-+# TODO: might be cleaner to put this somewhere else
- import threading
- 
- class InterruptProcessingException(Exception):
