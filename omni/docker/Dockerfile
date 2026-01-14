@@ -147,7 +147,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cd /llm && \
     git clone https://github.com/sgl-project/sglang.git && \
     cd sglang && \
-    git checkout 236a7c237002250b148c79bd93780d870b8b50d2 && \
+    git checkout a83484275daf46efa6d61f89dc333059fd0a04a5 && \
     git apply /tmp/sglang_diffusion_for_multi_arc.patch && \
     pip install -e "python[diffusion]" && \
     pip install triton==3.5.0 && \
