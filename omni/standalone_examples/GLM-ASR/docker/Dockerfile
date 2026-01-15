@@ -33,7 +33,8 @@ RUN mkdir /audio && \
     cd /audio && \
     git clone https://github.com/zai-org/GLM-ASR.git && \
     cd GLM-ASR && \
-    git checkout ecdd2c1d28ae40a6f2cec4647d4b23241fcffa8as && \
-    pip install transformers==4.51.3
+    git checkout ecdd2c1d28ae40a6f2cec4647d4b23241fcffa8a && \
+    pip install transformers==4.51.3 && \
+    pip install torchcodec soxr
 
 WORKDIR /audio/GLM-ASR

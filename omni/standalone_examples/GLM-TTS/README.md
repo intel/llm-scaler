@@ -1,4 +1,4 @@
-# GLM-Audio with Intel XPU Support
+# GLM-TTS with Intel XPU Support
 
 This project demonstrates how to run [GLM-TTS](https://github.com/zai-org/GLM-TTS) on Intel GPUs (XPU) using Docker.
 
