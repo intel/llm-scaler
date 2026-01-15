@@ -1,0 +1,176 @@
+diff --git a/cosyvoice/cli/cosyvoice.py b/cosyvoice/cli/cosyvoice.py
+index 316b5f1..4ce8257 100644
+--- a/cosyvoice/cli/cosyvoice.py
++++ b/cosyvoice/cli/cosyvoice.py
+@@ -44,9 +44,12 @@ class CosyVoice:
+                                           '{}/spk2info.pt'.format(model_dir),
+                                           configs['allowed_special'])
+         self.sample_rate = configs['sample_rate']
+-        if torch.cuda.is_available() is False and (load_jit is True or load_trt is True or fp16 is True):
++        if torch.xpu.is_available():
++            load_jit, load_trt = False, False
++            logging.warning('xpu device detected, set load_jit/load_trt to False')
++        if torch.xpu.is_available() is False and (load_jit is True or load_trt is True or fp16 is True):
+             load_jit, load_trt, fp16 = False, False, False
+-            logging.warning('no cuda device, set load_jit/load_trt/fp16 to False')
++            logging.warning('no xpu device, set load_jit/load_trt/fp16 to False')
+         self.model = CosyVoiceModel(configs['llm'], configs['flow'], configs['hift'], fp16)
+         self.model.load('{}/llm.pt'.format(model_dir),
+                         '{}/flow.pt'.format(model_dir),
+@@ -156,9 +159,12 @@ class CosyVoice2(CosyVoice):
+                                           '{}/spk2info.pt'.format(model_dir),
+                                           configs['allowed_special'])
+         self.sample_rate = configs['sample_rate']
+-        if torch.cuda.is_available() is False and (load_jit is True or load_trt is True or load_vllm is True or fp16 is True):
++        if torch.xpu.is_available():
++            load_jit, load_trt, load_vllm = False, False, False
++            logging.warning('xpu device detected, set load_jit/load_trt/load_vllm to False')
++        if torch.xpu.is_available() is False and (load_jit is True or load_trt is True or load_vllm is True or fp16 is True):
+             load_jit, load_trt, load_vllm, fp16 = False, False, False, False
+-            logging.warning('no cuda device, set load_jit/load_trt/load_vllm/fp16 to False')
++            logging.warning('no xpu device, set load_jit/load_trt/load_vllm/fp16 to False')
+         self.model = CosyVoice2Model(configs['llm'], configs['flow'], configs['hift'], fp16)
+         self.model.load('{}/llm.pt'.format(model_dir),
+                         '{}/flow.pt'.format(model_dir),
+@@ -206,9 +212,12 @@ class CosyVoice3(CosyVoice2):
+                                           '{}/spk2info.pt'.format(model_dir),
+                                           configs['allowed_special'])
+         self.sample_rate = configs['sample_rate']
+-        if torch.cuda.is_available() is False and (load_trt is True or fp16 is True):
++        if torch.xpu.is_available():
++            load_trt, load_vllm = False, False
++            logging.warning('xpu device detected, set load_trt/load_vllm to False')
++        if torch.xpu.is_available() is False and (load_trt is True or fp16 is True):
+             load_trt, fp16 = False, False
+-            logging.warning('no cuda device, set load_trt/fp16 to False')
++            logging.warning('no xpu device, set load_trt/fp16 to False')
+         self.model = CosyVoice3Model(configs['llm'], configs['flow'], configs['hift'], fp16)
+         self.model.load('{}/llm.pt'.format(model_dir),
+                         '{}/flow.pt'.format(model_dir),
+diff --git a/cosyvoice/cli/frontend.py b/cosyvoice/cli/frontend.py
+index 0942da6..8882cac 100644
+--- a/cosyvoice/cli/frontend.py
++++ b/cosyvoice/cli/frontend.py
+@@ -47,7 +47,7 @@ class CosyVoiceFrontEnd:
+                  allowed_special: str = 'all'):
+         self.tokenizer = get_tokenizer()
+         self.feat_extractor = feat_extractor
+-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
++        self.device = torch.device('xpu' if torch.xpu.is_available() else 'cpu')
+         option = onnxruntime.SessionOptions()
+         option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+         option.intra_op_num_threads = 1
+diff --git a/cosyvoice/cli/model.py b/cosyvoice/cli/model.py
+index 8e67b0c..6370794 100644
+--- a/cosyvoice/cli/model.py
++++ b/cosyvoice/cli/model.py
+@@ -98,7 +98,8 @@ class CosyVoiceModel:
+         return {'min_shape': min_shape, 'opt_shape': opt_shape, 'max_shape': max_shape, 'input_names': input_names}
+ 
+     def llm_job(self, text, prompt_text, llm_prompt_speech_token, llm_embedding, uuid):
+-        with self.llm_context, torch.cuda.amp.autocast(self.fp16 is True and hasattr(self.llm, 'vllm') is False):
++        # with self.llm_context, torch.cuda.amp.autocast(self.fp16 is True and hasattr(self.llm, 'vllm') is False):
++        with self.llm_context, torch.autocast(device_type="xpu", enabled=(self.fp16 is True and hasattr(self.llm, 'vllm') is False)):
+             if isinstance(text, Generator):
+                 assert isinstance(self, CosyVoice2Model) and not hasattr(self.llm, 'vllm'), 'streaming input text is only implemented for CosyVoice2 and do not support vllm!'
+                 for i in self.llm.inference_bistream(text=text,
+@@ -125,7 +126,8 @@ class CosyVoiceModel:
+         self.llm_end_dict[uuid] = True
+ 
+     def token2wav(self, token, prompt_token, prompt_feat, embedding, uuid, finalize=False, speed=1.0):
+-        with torch.cuda.amp.autocast(self.fp16):
++        # with torch.cuda.amp.autocast(self.fp16):
++        with torch.amp.autocast(device_type="xpu", enabled=self.fp16):
+             tts_mel, self.flow_cache_dict[uuid] = self.flow.inference(token=token.to(self.device, dtype=torch.int32),
+                                                                       token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
+                                                                       prompt_token=prompt_token.to(self.device),
+@@ -277,7 +279,8 @@ class CosyVoice2Model(CosyVoiceModel):
+         del self.llm.llm.model.model.layers
+ 
+     def token2wav(self, token, prompt_token, prompt_feat, embedding, token_offset, uuid, stream=False, finalize=False, speed=1.0):
+-        with torch.cuda.amp.autocast(self.fp16):
++        # with torch.cuda.amp.autocast(self.fp16):
++        with torch.amp.autocast(device_type="xpu", enabled=self.fp16):
+             tts_mel, _ = self.flow.inference(token=token.to(self.device, dtype=torch.int32),
+                                              token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
+                                              prompt_token=prompt_token.to(self.device),
+@@ -387,7 +390,7 @@ class CosyVoice3Model(CosyVoice2Model):
+                  flow: torch.nn.Module,
+                  hift: torch.nn.Module,
+                  fp16: bool = False):
+-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
++        self.device = torch.device('xpu' if torch.xpu.is_available() else 'cpu')
+         self.llm = llm
+         self.flow = flow
+         self.hift = hift
+@@ -395,7 +398,7 @@ class CosyVoice3Model(CosyVoice2Model):
+         # NOTE must matching training static_chunk_size
+         self.token_hop_len = 25
+         # rtf and decoding related
+-        self.llm_context = torch.cuda.stream(torch.cuda.Stream(self.device)) if torch.cuda.is_available() else nullcontext()
++        self.llm_context = torch.xpu.stream(torch.xpu.Stream(self.device)) if torch.xpu.is_available() else nullcontext()
+         self.lock = threading.Lock()
+         # dict used to store session related variable
+         self.tts_speech_token_dict = {}
+@@ -403,7 +406,8 @@ class CosyVoice3Model(CosyVoice2Model):
+         self.hift_cache_dict = {}
+ 
+     def token2wav(self, token, prompt_token, prompt_feat, embedding, token_offset, uuid, stream=False, finalize=False, speed=1.0):
+-        with torch.cuda.amp.autocast(self.fp16):
++        # with torch.xpu.amp.autocast(self.fp16):
++        with torch.amp.autocast(device_type="xpu", enabled=self.fp16):
+             tts_mel, _ = self.flow.inference(token=token.to(self.device, dtype=torch.int32),
+                                              token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
+                                              prompt_token=prompt_token.to(self.device),
+diff --git a/cosyvoice/flow/flow.py b/cosyvoice/flow/flow.py
+index d07c181..f790456 100644
+--- a/cosyvoice/flow/flow.py
++++ b/cosyvoice/flow/flow.py
+@@ -410,7 +410,7 @@ if __name__ == '__main__':
+     with open('./pretrained_models/Fun-CosyVoice3-0.5B/cosyvoice3.yaml', 'r') as f:
+         configs = load_hyperpyyaml(f, overrides={'llm': None, 'hift': None})
+     model = configs['flow']
+-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
++    device = 'xpu' if torch.xpu.is_available() else 'cpu'
+     model.to(device)
+     model.eval()
+     max_len = 10 * model.decoder.estimator.static_chunk_size
+diff --git a/cosyvoice/hifigan/generator.py b/cosyvoice/hifigan/generator.py
+index 045cb4e..a6e3a6d 100644
+--- a/cosyvoice/hifigan/generator.py
++++ b/cosyvoice/hifigan/generator.py
+@@ -733,7 +733,7 @@ if __name__ == '__main__':
+     with open('./pretrained_models/Fun-CosyVoice3-0.5B/cosyvoice3.yaml', 'r') as f:
+         configs = load_hyperpyyaml(f, overrides={'llm': None, 'flow': None})
+     model = configs['hift']
+-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
++    device = 'xpu' if torch.xpu.is_available() else 'cpu'
+     model.to(device)
+     model.eval()
+     max_len, chunk_size, context_size = 300, 30, 8
+diff --git a/cosyvoice/utils/common.py b/cosyvoice/utils/common.py
+index 5d307ae..d7906ef 100644
+--- a/cosyvoice/utils/common.py
++++ b/cosyvoice/utils/common.py
+@@ -181,7 +181,7 @@ def set_all_random_seed(seed):
+     random.seed(seed)
+     np.random.seed(seed)
+     torch.manual_seed(seed)
+-    torch.cuda.manual_seed_all(seed)
++    torch.xpu.manual_seed_all(seed)
+ 
+ 
+ def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+diff --git a/cosyvoice/utils/executor.py b/cosyvoice/utils/executor.py
+index f08fa09..efdb915 100644
+--- a/cosyvoice/utils/executor.py
++++ b/cosyvoice/utils/executor.py
+@@ -32,7 +32,7 @@ class Executor:
+         self.step = 0
+         self.epoch = 0
+         self.rank = int(os.environ.get('RANK', 0))
+-        self.device = torch.device('cuda:{}'.format(self.rank))
++        self.device = torch.device('xpu:{}'.format(self.rank))
+ 
+     def train_one_epoc(self, model, optimizer, scheduler, train_data_loader, cv_data_loader, writer, info_dict, scaler, group_join, ref_model=None):
+         ''' Train one epoch
