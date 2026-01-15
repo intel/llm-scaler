@@ -26,7 +26,7 @@ set "GET_PIP_URL=https://bootstrap.pypa.io/get-pip.py"
 
 REM ComfyUI Git Configuration (matching Dockerfile)
 set "COMFYUI_REPO=https://github.com/comfyanonymous/ComfyUI.git"
-set "COMFYUI_COMMIT=532e2850794c7b497174a0a42ac0cb1fe5b62499"
+set "COMFYUI_COMMIT=acd0e536533cdf038bbaa32730cd12a438cc3a60"
 set "COMFYUI_PATCH=%PATCHES_DIR%\comfyui_for_multi_arc.patch"
 
 echo ============================================
