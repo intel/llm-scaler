@@ -41,25 +41,10 @@ RUN mkdir -p /audio && \
     git checkout 2d6bb9bd80aad0f46c4324dd0b5ee23a30b090a3 && \
     git submodule update --init --recursive && \
     \
-    # 1. Apply patch for XPU logic adaptation
+    # Apply patch for XPU logic adaptation
     git apply /tmp/cosyvoice.patch && \
     \
-    # 2. Clean requirements.txt from incompatible or redundant packages
-    # - cu12/tensorrt/onnxruntime-gpu: These are for NVIDIA CUDA only
-    # - torch: Prevent overwriting the Intel-optimized Torch
-    # - deepspeed: Avoid CUDA-specific detection errors during inference
-    # - ttsfrd/bpy: Avoid Python 3.12 compatibility issues and broken local paths
-    sed -i '/cu12/d; /tensorrt/d; /torch/d; /deepspeed/d; /grpcio/d; /file:\/\/\//d; /bpy/d; /ttsfrd/d' requirements.txt && \
-    \
-    # 3. Install critical compatible versions to resolve specific errors
-    # - Fix Protobuf/Grpc conflict
-    pip install "grpcio<1.63.0" "grpcio-tools<1.63.0" "protobuf==4.25.0" && \
-    # - Fix 'max_depth' AttributeError in ruamel.yaml used by HyperPyYAML
-    pip install "ruamel.yaml==0.17.40" "HyperPyYAML==1.2.2" && \
-    # - Install inference essentials (x-transformers for DiT, torchcodec for audio loading)
-    pip install onnxruntime x-transformers torchcodec soundfile && \
-    \
-    # 5. Install remaining general dependencies (will use wetext fallback as ttsfrd is removed)
+    # Install remaining general dependencies (will use wetext fallback as ttsfrd is removed)
     pip install -r requirements.txt
 
 # Prepare FunASR (Speech Recognition)
@@ -76,5 +61,8 @@ RUN cd /audio && \
 # We reinstall the XPU-specific Triton last to fix any namespace pollution
 RUN pip uninstall -y triton pytorch-triton-xpu && \
     pip install pytorch-triton-xpu==3.5.0 --index-url https://download.pytorch.org/whl/xpu
+
+COPY ./cosyvoice3_example.py /audio/CosyVoice/
+COPY ./Fun_ASR_Nano_2512_example.py /audio/FunASR/
 
 WORKDIR /audio
