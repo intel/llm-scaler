@@ -37,28 +37,22 @@ RUN mkdir -p /audio && \
     cd /audio && \
     git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git && \
     cd CosyVoice && \
-    # Using specific commit compatible with the patch
     git checkout 2d6bb9bd80aad0f46c4324dd0b5ee23a30b090a3 && \
     git submodule update --init --recursive && \
     \
-    # Apply patch for XPU logic adaptation
     git apply /tmp/cosyvoice.patch && \
     \
-    # Install remaining general dependencies (will use wetext fallback as ttsfrd is removed)
     pip install -r requirements.txt
 
 # Prepare FunASR (Speech Recognition)
 RUN cd /audio && \
     git clone https://github.com/modelscope/FunASR.git && \
     cd FunASR && \
-    # Checkout stable version
     git checkout 36656aa8f7f30cece85ceda7e2c6ec5952a59925 && \
     pip3 install -e . && \
-    # Add extra requirements that might be needed for specific models (like SenseVoice)
     pip install torchaudio-augmentations humanfriendly positional_encodings
 
-# FINAL STEP: The "Triton Hammer"
-# We reinstall the XPU-specific Triton last to fix any namespace pollution
+# Reinstall the XPU-specific Triton last to fix any namespace pollution
 RUN pip uninstall -y triton pytorch-triton-xpu && \
     pip install pytorch-triton-xpu==3.5.0 --index-url https://download.pytorch.org/whl/xpu
 
