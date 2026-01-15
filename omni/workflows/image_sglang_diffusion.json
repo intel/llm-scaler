@@ -1,0 +1,303 @@
+{
+  "id": "2403ef07-c158-42cf-a1c6-be27cab073a4",
+  "revision": 0,
+  "last_node_id": 12,
+  "last_link_id": 7,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "SGLDiffusionServerModel",
+      "pos": [
+        1262.9804745185982,
+        712.6936472297415
+      ],
+      "size": [
+        278.9810546875,
+        102
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "sgld_client",
+          "type": "SGLD_CLIENT",
+          "links": [
+            1
+          ]
+        },
+        {
+          "name": "model_info",
+          "type": "STRING",
+          "links": [
+            2
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SGLDiffusionServerModel"
+      },
+      "widgets_values": [
+        "http://localhost:30000/v1",
+        "sk-proj-1234567890"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "easy showAnything",
+      "pos": [
+        1656.1362256115888,
+        711.6316142228135
+      ],
+      "size": [
+        322.5856304728179,
+        173.37900291883614
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "anything",
+          "shape": 7,
+          "type": "*",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "*",
+          "links": null
+        }
+      ],
+      "properties": {
+        "aux_id": "yolain/ComfyUI-Easy-Use",
+        "ver": "d9c2072a2de5f51ef9898ec50ccd4dda82e16126",
+        "Node name for S&R": "easy showAnything"
+      },
+      "widgets_values": [
+        "=== SGLDiffusion Model Info ===\nmodel_path: /llm/models/Z-Image-Turbo/\nnum_gpus: 2\ntask_type: T2I\ndit_precision: bf16\nvae_precision: fp32\npipeline_name: ZImagePipeline\npipeline_class: ZImagePipeline"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "SGLDiffusionGenerateImage",
+      "pos": [
+        2081.255731364527,
+        706.2270508906723
+      ],
+      "size": [
+        295.5650390625,
+        270
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "sgld_client",
+          "type": "SGLD_CLIENT",
+          "link": 1
+        },
+        {
+          "name": "image",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 4
+        },
+        {
+          "name": "positive_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "positive_prompt"
+          },
+          "link": 7
+        }
+      ],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [
+            5
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SGLDiffusionGenerateImage"
+      },
+      "widgets_values": [
+        "",
+        "",
+        2797673607,
+        "randomize",
+        9,
+        6,
+        1024,
+        1024,
+        false
+      ]
+    },
+    {
+      "id": 8,
+      "type": "PreviewImage",
+      "pos": [
+        2426.5529783759207,
+        705.960487336833
+      ],
+      "size": [
+        394.7628739380648,
+        447.6497235943673
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 5
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.8.2",
+        "Node name for S&R": "PreviewImage"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 7,
+      "type": "EmptyImage",
+      "pos": [
+        1685.6282285802488,
+        949.9807242368505
+      ],
+      "size": [
+        270,
+        130
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.8.2",
+        "Node name for S&R": "EmptyImage"
+      },
+      "widgets_values": [
+        1024,
+        1024,
+        1,
+        0
+      ]
+    },
+    {
+      "id": 12,
+      "type": "PrimitiveStringMultiline",
+      "pos": [
+        1262.3184941849897,
+        890.0366036564229
+      ],
+      "size": [
+        351.7153490882265,
+        187.72424446841637
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": [
+            7
+          ]
+        }
+      ],
+      "title": "Prompt",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.8.2",
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "A beautiful landscape with mountains and a lake at sunset, highly detailed, 8k"
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "SGLD_CLIENT"
+    ],
+    [
+      2,
+      1,
+      1,
+      4,
+      0,
+      "STRING"
+    ],
+    [
+      4,
+      7,
+      0,
+      2,
+      1,
+      "IMAGE"
+    ],
+    [
+      5,
+      2,
+      0,
+      8,
+      0,
+      "IMAGE"
+    ],
+    [
+      7,
+      12,
+      0,
+      2,
+      2,
+      "STRING"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.8886696123121235,
+      "offset": [
+        -494.2858318688919,
+        -599.8929124465857
+      ]
+    },
+    "workflowRendererVersion": "LG",
+    "frontendVersion": "1.36.13",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}
