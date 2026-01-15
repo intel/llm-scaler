@@ -279,54 +279,6 @@ if exist comfyui-manager (
     )
 )
 
-REM --- ComfyUI-VideoHelperSuite ---
-echo.
-echo Installing ComfyUI-VideoHelperSuite...
-if exist comfyui-videohelpersuite (
-    echo ComfyUI-VideoHelperSuite already exists, skipping...
-) else (
-    git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git comfyui-videohelpersuite
-    if errorlevel 1 (
-        echo WARNING: Failed to clone ComfyUI-VideoHelperSuite
-    ) else (
-        cd comfyui-videohelpersuite
-        "%PYTHON_EXE%" -m pip install -r requirements.txt
-        cd ..
-    )
-)
-
-REM --- ComfyUI-Easy-Use ---
-echo.
-echo Installing ComfyUI-Easy-Use...
-if exist comfyui-easy-use (
-    echo ComfyUI-Easy-Use already exists, skipping...
-) else (
-    git clone https://github.com/yolain/ComfyUI-Easy-Use.git comfyui-easy-use
-    if errorlevel 1 (
-        echo WARNING: Failed to clone ComfyUI-Easy-Use
-    ) else (
-        cd comfyui-easy-use
-        "%PYTHON_EXE%" -m pip install -r requirements.txt
-        cd ..
-    )
-)
-
-REM --- comfyui_controlnet_aux ---
-echo.
-echo Installing comfyui_controlnet_aux...
-if exist comfyui_controlnet_aux (
-    echo comfyui_controlnet_aux already exists, skipping...
-) else (
-    git clone https://github.com/Fannovel16/comfyui_controlnet_aux.git
-    if errorlevel 1 (
-        echo WARNING: Failed to clone comfyui_controlnet_aux
-    ) else (
-        cd comfyui_controlnet_aux
-        "%PYTHON_EXE%" -m pip install -r requirements.txt
-        cd ..
-    )
-)
-
 REM --- ComfyUI-GGUF ---
 echo.
 echo Installing ComfyUI-GGUF...
@@ -349,22 +301,6 @@ if exist ComfyUI-GGUF (
                 echo WARNING: Failed to apply GGUF patch
             )
         )
-        "%PYTHON_EXE%" -m pip install -r requirements.txt
-        cd ..
-    )
-)
-
-REM --- ComfyUI-KJNodes ---
-echo.
-echo Installing ComfyUI-KJNodes...
-if exist ComfyUI-KJNodes (
-    echo ComfyUI-KJNodes already exists, skipping...
-) else (
-    git clone https://github.com/kijai/ComfyUI-KJNodes.git
-    if errorlevel 1 (
-        echo WARNING: Failed to clone ComfyUI-KJNodes
-    ) else (
-        cd ComfyUI-KJNodes
         "%PYTHON_EXE%" -m pip install -r requirements.txt
         cd ..
     )
@@ -456,11 +392,7 @@ echo   +-- python_embeded/           (Python environment)
 echo   +-- ComfyUI/                  (ComfyUI application)
 echo   ^|   +-- custom_nodes/        (Custom nodes)
 echo   ^|       +-- comfyui-manager
-echo   ^|       +-- comfyui-videohelpersuite
-echo   ^|       +-- comfyui-easy-use
-echo   ^|       +-- comfyui_controlnet_aux
 echo   ^|       +-- ComfyUI-GGUF
-echo   ^|       +-- ComfyUI-KJNodes
 echo   +-- run_comfyui.bat           (Launcher)
 echo   +-- run_comfyui_lowvram.bat   (Low VRAM Launcher)
 echo   +-- run_comfyui_cpu.bat       (CPU-only Launcher)
