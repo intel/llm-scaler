@@ -2,11 +2,22 @@
 
 ## LLM-Scaler-vLLM
 
-### Latest Production Release 1.2
+### Latest Beta Release 
+* `intel/llm-scaler-vllm:0.11.1-b7` [1/16/2026]:
+    - Supported sym_int4 for Qwen3-30B-A3B on TP 4/8.
+    - Supported sym_int4 for Qwen3-235B-A22B on TP 16.
+    - Added support for the PaddleOCR model.
+    - Added support for GLM-4.6v-Flash.
+    - Fixed crash errors with 2DP + 4TP configuration.
+    - Fixed abnormal output observed during JMeter stress testing.
+    - Fixed UR_ERROR_DEVICE_LOST errors triggered by frequent preemption under high load.
+    - Fixed output errors for InternVL-38B.
+    - Refine logic for profile_run to provide more GPU blocks by default
+
+### Previous Releases
 * `intel/llm-scaler-vllm:1.2` [12/11/2025]: 
     - Same image as intel/llm-scaler-vllm:0.10.2-b6
 
-### Previous Releases
 * `intel/llm-scaler-vllm:0.10.2-b6` [11/25/2025]:
     - MoE-Int4 support for Qwen3-30B-A3B
     - Bpe-Qwen tokenizer support
@@ -68,13 +79,32 @@
 ## LLM-Scaler-Omni
 
 ### Latest Beta Release 
+* `intel/llm-scaler-omni:0.1.0-b5` [1/16/2026]:
+    - Core Upgrades
+        - Upgraded to Python 3.12 and PyTorch 2.9 for improved performance and compatibility
+    - ComfyUI
+        - Fixed a stochastic rounding issue on XPU, resolving the LoRA black-screen output problem. LoRA workflows are now fully supported.
+        - Added support for new models and workflows: Qwen-Image-Layered, Qwen-Image-Edit-2511, Qwen-Image-2512, HY-Motion, and more.
+        - Added support for ComfyUI-GGUF, enabling GGUF models (e.g., FLUX.2-dev Q4_0) with reduced VRAM usage.
+        - Fixed image format issue in the Hunyuan3D-2.1 workflow.
+        - Refined documentation for improved clarity.
+        - LTX2 support on XPU.
+        - Updated Windows environment setup script.
+    - SGLang Diffusion
+        - Added support for CacheDiT.
+        - Added Tensor Parallelism (TP) support for multi-XPU inference. Z-Image-Turbo now achieves up to 50% speedup with 2 TP to 2 USP.
+        - Added SGLD ComfyUI custom node support, allowing SGLang Diffusion to serve as a backend for ComfyUI image generation workflows.
+    - Standalone Examples
+        - Added support for HY-WorldPlay.
+        - Add audio models in standalone example
+
+### Previous Releases
 * `intel/llm-scaler-omni:0.1.0-b4` [12/10/2025]:
     - More workflows support:
         - Z-Image-Turbo
         - Hunyuan-Video-1.5 T2V/I2V with multi-XPU support
     - Initial support for SGLang Diffusion. 10% perf improvement compared to ComfyUI in 1*B60 scenario.
-
-### Previous Releases
+      
 * `intel/llm-scaler-omni:0.1.0-b3` [11/19/2025]:
     - More workflows support:
         - Hunyuan 3D 2.1
