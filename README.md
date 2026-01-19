@@ -5,7 +5,9 @@ LLM Scaler is an GenAI solution for text generation, image generation, video gen
 ---
 
 ## Latest Update
-- [2025.12] We released `intel/llm-scaler-vllm:1.2`, same image as `intel/llm-scaler-vllm:0.10.2-b6` 
+- [2026.01] We released `intel/llm-scaler-vllm:0.11.1-b7` for vllm 0.11.1 and PyTorch 2.9 support, various new model support and performance improvements.
+- [2026.01] We released `intel/llm-scaler-omni:0.1.0-b5` for Python 3.12 and PyTorch 2.9 support, various ComfyUI workflows and experimental SGLang Diffusion support.
+- [2025.12] We released `intel/llm-scaler-vllm:1.2`, same image as `intel/llm-scaler-vllm:0.10.2-b6`. 
 - [2025.12] We released `intel/llm-scaler-omni:0.1.0-b4` to support ComfyUI workflows for Z-Image-Turbo, Hunyuan-Video-1.5 T2V/I2V with multi-XPU, and experimentially support SGLang Diffusion. 
 - [2025.11] We released `intel/llm-scaler-vllm:0.10.2-b6` to support Qwen3-VL (Dense/MoE), Qwen3-Omni, Qwen3-30B-A3B (MoE Int4), MinerU 2.5, ERNIE-4.5-vl etc. 
 - [2025.11] We released `intel/llm-scaler-vllm:0.10.2-b5` to support gpt-oss models and released `intel/llm-scaler-omni:0.1.0-b3` to support more ComfyUI workflows, and Windows installation.
