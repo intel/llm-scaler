@@ -4,6 +4,12 @@
 
 ### Latest Beta Release 
 * `intel/llm-scaler-vllm:0.11.1-b7` [1/16/2026]:
+    - Upgrade: vLLM upgrade to 0.11.1, Pytorch upgrade to 2.9.  oneAPI upgrade to 2025.2.2(hotfix), oneccl upgrade to 2021.15.7.6.
+    - 8 New models supported: Qwen3-Next-80B-A3B-Instruct, Qwen3-Next-80B-A3B-Thinking, InternVL3.5-30B-A3B, DeepSeek-OCR,PaddleOCR-VL, Seed-OSS-36B-Instruct, Qwen3-30B-A3B-Instruct-2507 and openai/whisper-large-v3.
+    - Key bug fixes for timeout/accuracy issues found in long time stress run.
+    - Key bug fixes communication accuracy issue on long run scenarios. Sub-communicator hang issue on oneCCL side.
+    - vLLM 0.11.1 with new features: cpu kv cache offload, speculative decoding support with 2 more methods(medusa, suffix), experimental feature:FP8 kv cache, Experts parallelism is supported with scenarios TP+EP and DP+EP.
+    - Bug fixes.
     - Supported sym_int4 for Qwen3-30B-A3B on TP 4/8.
     - Supported sym_int4 for Qwen3-235B-A22B on TP 16.
     - Added support for the PaddleOCR model.
