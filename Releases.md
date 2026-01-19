@@ -89,7 +89,7 @@
     - Core Upgrades
         - Upgraded to Python 3.12 and PyTorch 2.9 for improved performance and compatibility
     - ComfyUI
-        - Fixed a stochastic rounding issue on XPU, resolving the LoRA black-screen output problem. LoRA workflows are now fully supported.
+        - Fixed a stochastic rounding issue on XPU, resolving the LoRA black-screen output problem. LoRA workflows are now supported (e.g, Z-Image-Turbo, Qwen-Image, Qwen-Image-Edit).
         - Added support for new models and workflows: Qwen-Image-Layered, Qwen-Image-Edit-2511, Qwen-Image-2512, HY-Motion, and more.
         - Added support for ComfyUI-GGUF, enabling GGUF models (e.g., FLUX.2-dev Q4_0) with reduced VRAM usage.
         - Fixed image format issue in the Hunyuan3D-2.1 workflow.
@@ -98,7 +98,7 @@
         - Updated Windows environment setup script.
     - SGLang Diffusion
         - Added support for CacheDiT.
-        - Added Tensor Parallelism (TP) support for multi-XPU inference. Z-Image-Turbo now achieves up to 50% speedup with 2 TP to 2 USP.
+        - Added Tensor Parallelism (TP) support for selected model with better performance (e.g, Z-Image-Turbo).
         - Added SGLD ComfyUI custom node support, allowing SGLang Diffusion to serve as a backend for ComfyUI image generation workflows.
     - Standalone Examples
         - Added support for HY-WorldPlay.
