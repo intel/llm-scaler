@@ -330,7 +330,7 @@ if exist comfyui_controlnet_aux (
 REM --- ComfyUI-GGUF ---
 echo.
 echo Installing ComfyUI-GGUF...
-set "GGUF_COMMIT=795e45156ece99afbc3efef911e63fcb46e6a20d"
+set "GGUF_COMMIT=6ea2651e7df66d7585f6ffee804b20e92fb38b8a"
 set "GGUF_PATCH=%PATCHES_DIR%\comfyui_gguf_xpu.patch"
 
 if exist ComfyUI-GGUF (
