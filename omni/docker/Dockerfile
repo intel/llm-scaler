@@ -131,7 +131,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cd /llm/ComfyUI/custom_nodes && \
     git clone https://github.com/city96/ComfyUI-GGUF.git && \
     cd ComfyUI-GGUF && \
-    git checkout 795e45156ece99afbc3efef911e63fcb46e6a20d && \
+    git checkout 6ea2651e7df66d7585f6ffee804b20e92fb38b8a && \
     git apply /tmp/comfyui_gguf_xpu.patch && \
     pip install -r requirements.txt && \
 # Install ComfyUI-CacheDiT Node
