@@ -17,7 +17,7 @@
 
 Pull docker image from dockerhub:
 ```bash
-docker pull intel/llm-scaler-omni:0.1.0-b4
+docker pull intel/llm-scaler-omni:0.1.0-b5
 ```
 
 Or build docker image:
@@ -29,7 +29,7 @@ bash build.sh
 Run docker image:
 
 ```bash
-export DOCKER_IMAGE=intel/llm-scaler-omni:0.1.0-b4
+export DOCKER_IMAGE=intel/llm-scaler-omni:0.1.0-b5
 export CONTAINER_NAME=comfyui
 export MODEL_DIR=<your_model_dir>
 export COMFYUI_MODEL_DIR=<your_comfyui_model_dir>
