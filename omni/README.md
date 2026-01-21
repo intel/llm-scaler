@@ -114,6 +114,10 @@ ComfyUI tutorial: https://docs.comfy.org/tutorials/image/qwen/qwen-image
 - **image_qwen_image_layered.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_image_layered.json)): Layered image generation workflow
 
 > **Note:** Use fp8 format for all diffusion models to optimize memory usage and performance. It's recommended to use the distilled version for better performance.
+>
+> **Q:** What should I do if I encounter Out of Memory (OOM) errors?
+>
+> **A:** You can add the `--reserve-vram 4` parameter when starting ComfyUI to reserve more VRAM.
 
 ##### Qwen-Image-Edit
 
