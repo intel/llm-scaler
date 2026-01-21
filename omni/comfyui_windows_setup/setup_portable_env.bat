@@ -394,7 +394,7 @@ REM Create run_comfyui.bat
     echo pause
 ) > run_comfyui.bat
 
-REM Create run_comfyui_lowvram.bat
+REM Create run_comfyui_disable_smart_memory.bat
 (
     echo @echo off
     echo setlocal
@@ -402,7 +402,7 @@ REM Create run_comfyui_lowvram.bat
     echo set "PYTHON_EXE=%%SCRIPT_DIR%%python_embeded\python.exe"
     echo.
     echo cd /d "%%SCRIPT_DIR%%ComfyUI"
-    echo "%%PYTHON_EXE%%" main.py --lowvram %%*
+    echo "%%PYTHON_EXE%%" main.py --disable-smart-memory %%*
     echo.
     echo pause
 ) > run_comfyui_lowvram.bat

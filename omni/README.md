@@ -117,7 +117,9 @@ ComfyUI tutorial: https://docs.comfy.org/tutorials/image/qwen/qwen-image
 >
 > **Q:** What should I do if I encounter Out of Memory (OOM) errors?
 >
-> **A:** You can add the `--reserve-vram 4` parameter when starting ComfyUI to reserve more VRAM.
+> **A:** You can try the following solutions:
+> 1. Add `--disable-smart-memory` parameter when starting ComfyUI.
+> 2. If the OOM issue persists, you can try adding `--reserve-vram 4` parameter to reserve more VRAM.
 
 ##### Qwen-Image-Edit
 

@@ -118,12 +118,12 @@ run_comfyui.bat
 
 > **Note**: The first launch will take longer time for initialization and dependency checking. Please be patient.
 
-### Low VRAM Mode
+### Disable Smart Memory Mode
 
-For GPUs with limited VRAM (6-8 GB), use the low VRAM launcher:
+For GPUs with Out of Memory (OOM), use the disable smart memory launcher:
 
 ```cmd
-run_comfyui_lowvram.bat
+run_comfyui_disable_smart_memory.bat
 ```
 
 ### CPU Mode
