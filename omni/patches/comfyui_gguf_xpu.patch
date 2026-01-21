@@ -1,8 +1,8 @@
 diff --git a/dequant.py b/dequant.py
-index 78f5f26..2783ad3 100644
+index 78f5f26..b7dc6d4 100644
 --- a/dequant.py
 +++ b/dequant.py
-@@ -2,6 +2,262 @@
+@@ -2,6 +2,268 @@
  import gguf
  import torch
  from tqdm import tqdm
@@ -11,14 +11,20 @@ index 78f5f26..2783ad3 100644
 +# ============================================================================
 +# Triton Kernel Support
 +# ============================================================================
-+try:
-+    import triton
-+    import triton.language as tl
-+    HAS_TRITON = True
-+    logging.info("ComfyUI-GGUF: Triton available, enabling optimized kernels")
-+except ImportError:
++import platform
++
++if platform.system() == "Windows":
 +    HAS_TRITON = False
-+    logging.info("ComfyUI-GGUF: Triton not available, using PyTorch fallback")
++    logging.info("ComfyUI-GGUF: Triton not supported on Windows, using PyTorch fallback")
++else:
++    try:
++        import triton
++        import triton.language as tl
++        HAS_TRITON = True
++        logging.info("ComfyUI-GGUF: Triton available, enabling optimized kernels")
++    except ImportError:
++        HAS_TRITON = False
++        logging.info("ComfyUI-GGUF: Triton not available, using PyTorch fallback")
 +
 +# Configuration flags
 +USE_TRITON_KERNELS = True  # Set to False to disable Triton even if available
@@ -265,7 +271,7 @@ index 78f5f26..2783ad3 100644
  
  
  TORCH_COMPATIBLE_QTYPES = (None, gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16)
-@@ -32,14 +288,36 @@ def dequantize(data, qtype, oshape, dtype=None):
+@@ -32,14 +294,36 @@ def dequantize(data, qtype, oshape, dtype=None):
      Dequantize tensor back to usable shape/dtype
      """
      block_size, type_size = gguf.GGML_QUANT_SIZES[qtype]
@@ -304,7 +310,7 @@ index 78f5f26..2783ad3 100644
      blocks = dequantize_blocks(blocks, block_size, type_size, dtype)
      return blocks.reshape(oshape)
  
-@@ -63,10 +341,17 @@ def dequantize_blocks_BF16(blocks, block_size, type_size, dtype=None):
+@@ -63,10 +347,17 @@ def dequantize_blocks_BF16(blocks, block_size, type_size, dtype=None):
  
  # Legacy Quants #
  def dequantize_blocks_Q8_0(blocks, block_size, type_size, dtype=None):
@@ -326,7 +332,7 @@ index 78f5f26..2783ad3 100644
  
  def dequantize_blocks_Q5_1(blocks, block_size, type_size, dtype=None):
      n_blocks = blocks.shape[0]
-@@ -100,27 +385,67 @@ def dequantize_blocks_Q5_0(blocks, block_size, type_size, dtype=None):
+@@ -100,27 +391,67 @@ def dequantize_blocks_Q5_0(blocks, block_size, type_size, dtype=None):
      qs = (ql | (qh << 4)).to(torch.int8) - 16
      return (d * qs)
  
@@ -410,22 +416,27 @@ index 78f5f26..2783ad3 100644
  QK_K = 256
 diff --git a/dequant_triton.py b/dequant_triton.py
 new file mode 100644
-index 0000000..80641fc
+index 0000000..46754f4
 --- /dev/null
 +++ b/dequant_triton.py
-@@ -0,0 +1,335 @@
+@@ -0,0 +1,340 @@
 +# (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
 +# Triton kernel optimizations for GGUF dequantization on Intel XPU
 +import torch
 +import logging
++import platform
 +
-+try:
-+    import triton
-+    import triton.language as tl
-+    HAS_TRITON = True
-+except ImportError:
++if platform.system() == "Windows":
 +    HAS_TRITON = False
-+    logging.warning("ComfyUI-GGUF: Triton not available, falling back to PyTorch implementation")
++    logging.info("ComfyUI-GGUF: Triton not supported on Windows, falling back to PyTorch implementation")
++else:
++    try:
++        import triton
++        import triton.language as tl
++        HAS_TRITON = True
++    except ImportError:
++        HAS_TRITON = False
++        logging.warning("ComfyUI-GGUF: Triton not available, falling back to PyTorch implementation")
 +
 +
 +if HAS_TRITON:
