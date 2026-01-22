@@ -104,6 +104,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cd /llm/ComfyUI/custom_nodes && \
     git clone https://github.com/kijai/ComfyUI-KJNodes.git && \
     cd ComfyUI-KJNodes && \
+    git checkout c6ce76d00bb8177d1b0286cad891df08eff5226e && \
     pip install -r requirements.txt && \
 # Install ComfyUI Hunyuan3D Node
     cd /llm/ComfyUI/custom_nodes && \
