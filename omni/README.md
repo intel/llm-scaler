@@ -88,7 +88,7 @@ The following models are supported in ComfyUI workflows. For detailed model file
 | **Video Generation** | Wan2.2 TI2V 5B, Wan2.2 T2V 14B, Wan2.2 I2V 14B | Text-to-Video, Image-to-Video | `video_wan2_2_5B_ti2v.json`, `video_wan2_2_14B_t2v.json`, `video_wan2_2_14B_t2v_rapid_aio_multi_xpu.json`, `video_wan2.2_14B_i2v_rapid_aio_multi_xpu.json` |
 | **Video Generation** | Wan2.2 Animate 14B | Video Animation | `video_wan2_2_animate_basic.json` |
 | **Video Generation** | HunyuanVideo 1.5 8.3B | Text-to-Video, Image-to-Video | `video_hunyuan_video_1.5_t2v.json`, `video_hunyuan_video_1.5_i2v.json`, `video_hunyuan_video_1.5_i2v_multi_xpu.json` |
-| **Video Generation** | LTX-2 T2V, LTX-2 I2V, | Text-to-Video, Image-to-Video | `video_ltx2_t2v.json`, `video_ltx2_i2v.json`, `video_ltx_2_t2v_distilled.json`, `video_ltx_2_i2v_distilled.json` |
+| **Video Generation** | LTX-2 T2V 19B, LTX-2 I2V 19B, | Text-to-Video, Image-to-Video | `video_ltx2_19B_t2v.json`, `video_ltx2_19B_i2v.json`, `video_ltx_2_19B_t2v_distilled.json`, `video_ltx_2_19B_i2v_distilled.json` |
 | **3D Generation** | Hunyuan3D 2.1 | Text/Image-to-3D | `3d_hunyuan3d.json` |
 | **Audio Generation** | VoxCPM1.5, IndexTTS 2 | Text-to-Speech, Voice Cloning | `audio_VoxCPM_example.json`, `audio_indextts2.json` |
 
@@ -222,13 +222,13 @@ ComfyUI tutorial: https://blog.comfy.org/p/ltx-2-open-source-audio-video-ai
 
 **Available Workflows:**
 
-- **video_ltx2_t2v.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_ltx2_t2v.json)): Text to Video with motion, dialogue, SFX, and music
+- **video_ltx2_19B_t2v.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_ltx2_t2v.json)): Text to Video with motion, dialogue, SFX, and music
 
-- **video_ltx2_i2v.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_ltx2_i2v.json)): Image to Video with motion, dialogue, SFX, and music
+- **video_ltx2_19B_i2v.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_ltx2_i2v.json)): Image to Video with motion, dialogue, SFX, and music
 
-- **video_ltx_2_t2v_distilled.json**: Distilled Text-to-Video workflow (only 1 sampler stage)
+- **video_ltx_2_19B_t2v_distilled.json**: Distilled Text-to-Video workflow (only 1 sampler stage)
 
-- **video_ltx_2_i2v_distilled.json**: Distilled Image-to-Video workflow (only 1 sampler stage)
+- **video_ltx_2_19B_i2v_distilled.json**: Distilled Image-to-Video workflow (only 1 sampler stage)
 
 > **Note:** Model weights of distilled workflow can be obtained from [Kijai/LTXV2_comfy](https://huggingface.co/Kijai/LTXV2_comfy).
 

@@ -570,8 +570,10 @@ For `video_hunyuan_video_1.5_i2v_multi_xpu.json`, use [Raylight](https://github.
 
 | Workflow | Description |
 |----------|-------------|
-| `video_ltx2_t2v.json` | Text to video with audio/motion |
-| `video_ltx2_i2v.json` | Image to video with audio/motion |
+| `video_ltx2_19B_t2v.json` | Text to video with audio/motion |
+| `video_ltx2_19B_i2v.json` | Image to video with audio/motion |
+| `video_ltx_2_19B_t2v_distilled.json` | Distilled workflow for text to video with audio/motion |
+| `video_ltx_2_19B_i2v_distilled.json` | Distilled workflow for image to video with audio/motion |
 
 ---
 
