@@ -22,6 +22,8 @@ docker pull intel/llm-scaler-omni:0.1.0-b5
 
 Or build docker image:
 
+Edit `build.sh` to configure your proxy and select optional nodes to install. Please replace the placeholders `<...>` with your actual settings.
+
 ```bash
 bash build.sh
 ```

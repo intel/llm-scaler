@@ -6,6 +6,9 @@ FROM intel/llm-scaler-platform:25.45.5.4
 
 ARG https_proxy
 ARG http_proxy
+ARG INSTALL_AUDIO_NODES=false
+ARG INSTALL_HY_MOTION1_NODES=false
+ARG INSTALL_HUNYUAN3D_NODES=false
 ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python3.12/dist-packages/torch/lib:$LD_LIBRARY_PATH"
 
 COPY ./patches/yunchang_for_multi_arc.patch /tmp/
@@ -92,42 +95,48 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cd comfyui_controlnet_aux && \
     pip install -r requirements.txt && \
     cd .. && \
-    git clone https://github.com/wildminder/ComfyUI-VoxCPM.git comfyui-voxcpm && \
-    cd comfyui-voxcpm && \
-    git checkout 7875a8a36a531b7efef8cac96dc74001d3cb5895 && \
-    git apply /tmp/comfyui_voxcpm_for_xpu.patch && \
-    pip install -r requirements.txt && \
-    cd .. && \
-    git clone https://github.com/billwuhao/ComfyUI_IndexTTS.git && \
-    cd ComfyUI_IndexTTS && \
-    pip install -r requirements.txt && \
-    cd /llm/ComfyUI/custom_nodes && \
-    git clone https://github.com/kijai/ComfyUI-KJNodes.git && \
-    cd ComfyUI-KJNodes && \
-    git checkout c6ce76d00bb8177d1b0286cad891df08eff5226e && \
-    pip install -r requirements.txt && \
+    if [ "$INSTALL_AUDIO_NODES" = "true" ]; then \
+        git clone https://github.com/wildminder/ComfyUI-VoxCPM.git comfyui-voxcpm && \
+        cd comfyui-voxcpm && \
+        git checkout 7875a8a36a531b7efef8cac96dc74001d3cb5895 && \
+        git apply /tmp/comfyui_voxcpm_for_xpu.patch && \
+        pip install -r requirements.txt && \
+        cd .. && \
+        git clone https://github.com/billwuhao/ComfyUI_IndexTTS.git && \
+        cd ComfyUI_IndexTTS && \
+        pip install -r requirements.txt && \
+        cd /llm/ComfyUI/custom_nodes && \
+        git clone https://github.com/kijai/ComfyUI-KJNodes.git && \
+        cd ComfyUI-KJNodes && \
+        git checkout c6ce76d00bb8177d1b0286cad891df08eff5226e && \
+        pip install -r requirements.txt; \
+    fi && \
 # Install ComfyUI Hunyuan3D Node
-    cd /llm/ComfyUI/custom_nodes && \
-    apt remove python3-blinker -y && \
-    apt update -y && \
-    apt install -y libopengl0 libglx0 libgl1 libxrender1 libxfixes3 libx11-dev libxi6 libxxf86vm1 libxcursor1 libxrandr2 libxinerama1 libxkbcommon0 libsm6 ffmpeg && \
-    git clone https://github.com/visualbruno/ComfyUI-Hunyuan3d-2-1.git && \
-    cd ComfyUI-Hunyuan3d-2-1 && \
-    git checkout 9d7ef32509101495a7840b3ae8e718c8d1183305 && \
-    git apply /tmp/comfyui_hunyuan3d_for_xpu.patch && \
-    pip install bigdl-core==2.4.0b1 rembg realesrgan && \
-    pip install -r requirements.txt && \
-    cd hy3dpaint/custom_rasterizer && \
-    python setup.py install && \
-    cd ../DifferentiableRenderer && \
-    python setup.py install && \
+    if [ "$INSTALL_HUNYUAN3D_NODES" = "true" ]; then \
+        cd /llm/ComfyUI/custom_nodes && \
+        apt remove python3-blinker -y && \
+        apt update -y && \
+        apt install -y libopengl0 libglx0 libgl1 libxrender1 libxfixes3 libx11-dev libxi6 libxxf86vm1 libxcursor1 libxrandr2 libxinerama1 libxkbcommon0 libsm6 ffmpeg && \
+        git clone https://github.com/visualbruno/ComfyUI-Hunyuan3d-2-1.git && \
+        cd ComfyUI-Hunyuan3d-2-1 && \
+        git checkout 9d7ef32509101495a7840b3ae8e718c8d1183305 && \
+        git apply /tmp/comfyui_hunyuan3d_for_xpu.patch && \
+        pip install bigdl-core==2.4.0b1 rembg realesrgan && \
+        pip install -r requirements.txt && \
+        cd hy3dpaint/custom_rasterizer && \
+        python setup.py install && \
+        cd ../DifferentiableRenderer && \
+        python setup.py install && \
+    fi && \
 # Install HY-Motion1 Node
-    cd /llm/ComfyUI/custom_nodes && \
-    git clone https://github.com/jtydhr88/ComfyUI-HY-Motion1.git && \
-    cd ComfyUI-HY-Motion1 && \
-    git checkout 47b1d0d96eeac6d4b99509ede91490eaba93440a && \
-    git apply /tmp/comfyui_hy_motion1.patch && \
-    pip install -r requirements.txt && \
+    if [ "$INSTALL_HY_MOTION1_NODES" = "true" ]; then \
+        cd /llm/ComfyUI/custom_nodes && \
+        git clone https://github.com/jtydhr88/ComfyUI-HY-Motion1.git && \
+        cd ComfyUI-HY-Motion1 && \
+        git checkout 47b1d0d96eeac6d4b99509ede91490eaba93440a && \
+        git apply /tmp/comfyui_hy_motion1.patch && \
+        pip install -r requirements.txt && \
+    fi && \
 # Install ComfyUI-GGUF Node
     cd /llm/ComfyUI/custom_nodes && \
     git clone https://github.com/city96/ComfyUI-GGUF.git && \
