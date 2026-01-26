@@ -159,11 +159,8 @@ The setup script automatically installs the following custom nodes:
 | Node | Description | Repository |
 |------|-------------|------------|
 | **ComfyUI-Manager** | Plugin manager for easy node installation | [ltdrdata/ComfyUI-Manager](https://github.com/ltdrdata/ComfyUI-Manager) |
-| **VideoHelperSuite** | Video processing and generation tools | [Kosinkadink/ComfyUI-VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite) |
-| **Easy-Use** | Simplified workflow nodes | [yolain/ComfyUI-Easy-Use](https://github.com/yolain/ComfyUI-Easy-Use) |
-| **ControlNet Aux** | ControlNet preprocessors | [Fannovel16/comfyui_controlnet_aux](https://github.com/Fannovel16/comfyui_controlnet_aux) |
 | **ComfyUI-GGUF** | GGUF model format support | [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) |
-| **KJNodes** | Utility nodes collection | [kijai/ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) |
+
 
 ### Installing Additional Nodes
 
@@ -191,11 +188,7 @@ comfyui_windows_setup/
 │   ├── main.py
 │   ├── custom_nodes/         # Custom nodes
 │   │   ├── comfyui-manager/
-│   │   ├── comfyui-videohelpersuite/
-│   │   ├── comfyui-easy-use/
-│   │   ├── comfyui_controlnet_aux/
-│   │   ├── ComfyUI-GGUF/
-│   │   └── ComfyUI-KJNodes/
+│   │   └── ComfyUI-GGUF/
 │   ├── models/               # Model files (download separately)
 │   │   ├── checkpoints/
 │   │   ├── loras/
