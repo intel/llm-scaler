@@ -113,13 +113,66 @@ You can refer to the MinerU [usage guide](https://opendatalab.github.io/MinerU/u
 
 ## 3. Paddler-OCR Support
 
+### Start vLLM Service
+```
+ZE_AFFINITY_MASK=6 \
+vllm serve --model /llm/models/LLM2/PaddleOCR-VL \
+    --served-model-name PaddleOCR-VL-0.9B \
+    --trust-remote-code \
+    --max-num-batched-tokens 16384 \
+    --no-enable-prefix-caching \
+    --mm-processor-cache-gb 0 \
+    --enforce-eager 
+```
+
+### Install Paddle Dependencies
+```
+pip install "paddleocr[doc-parser]" paddlepaddle
+paddlex --install serving
+```
+
+### Deploy Paddle Service
+
+- generate configuration
+```
+# include PP-DocLayoutV2 and PaddleOCR-VL-0.9B by default
+paddlex --get_pipeline_config PaddleOCR-VL
+```
+
+- replace native backend to vllm server
+```
+SubModules:
+    LayoutDetection:
+        module_name: layout_detection
+        model_name: PP-DocLayoutV2
+        ...
+    VLRecognition:
+        ...
+        # replaced part
+        genai_config:
+            backend: vllm-server
+            server_url: http://127.0.0.1:8000/v1
+```
+
+- start paddlex service
+```
+paddlex --serve --pipeline ./PaddleOCR-VL.yaml
+```
+
+### Run the demo
+
+<details>
+
+
+<summary>1.Call vLLM Service</summary>
 Need to use the specified format to use paddleocr.
-```bash
+
+```python
 from openai import OpenAI
 
 client = OpenAI(
     api_key="EMPTY",
-    base_url="http://localhost:8002/v1",
+    base_url="http://localhost:8000/v1",
     timeout=3600
 )
 
@@ -150,7 +203,7 @@ messages = [
 ]
 
 response = client.chat.completions.create(
-    model="PaddleOCR-VL",
+    model="PaddleOCR-VL-0.9B",
     messages=messages,
     temperature=0.0,
     max_tokens=128,
@@ -158,7 +211,52 @@ response = client.chat.completions.create(
 print(f"Generated text: {response.choices[0].message.content}")
 ```
 
-You can refer to the Paddler-OCR [guide](https://www.paddleocr.ai/main/) for more details.
+</details>
+
+<details open>
+<summary>2.Call Paddle Service</summary>
+
+```python
+import requests
+request_data = {
+    "file": "https://ofasys-multimodal-wlcb-3-toshanghai.oss-accelerate.aliyuncs.com/wpf272043/keepme/image/receipt.png",
+    "fileType": 1,
+    "useLayoutDetection": True, # default value is True, used for layout_det_res
+}
+
+response = requests.post(
+    url="http://localhost:8080/layout-parsing",
+    json=request_data,
+    timeout=3600
+)
+
+# print result from PaddleOCR-VL-0.9B
+print(response.json()['result']['layoutParsingResults'][0]['markdown']['text'])
+
+# print result from PP-DocLayoutV2
+print(response.json()['result']['layoutParsingResults'][0]['prunedResult']['layout_det_res'])
+```
+
+</details>
+
+<details >
+<summary>3.Offline Paddle Service</summary>
+
+Use PP-DocLayoutV2 model offline. Refer to [this](https://huggingface.co/PaddlePaddle/PP-DocLayoutV2).
+
+```python
+from paddleocr import LayoutDetection
+
+model = LayoutDetection(model_name="PP-DocLayoutV2")
+output = model.predict("./layout.jpg", batch_size=1, layout_nms=True)
+for res in output:
+    res.print()
+    res.save_to_img(save_path="./output/")
+    res.save_to_json(save_path="./output/res.json")
+```
+</details>
+
+You can refer to the Paddler-OCR [guide](https://github.com/PaddlePaddle/PaddleOCR/blob/437943ff0d462a2e3abbc4a409074ebdbd2deafd/docs/version3.x/pipeline_usage/PaddleOCR-VL.md#43-%E5%AE%A2%E6%88%B7%E7%AB%AF%E8%B0%83%E7%94%A8%E6%96%B9%E5%BC%8F) for more details.
 
 ---
 
