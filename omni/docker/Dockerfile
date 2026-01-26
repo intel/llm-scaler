@@ -161,7 +161,13 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cd /llm/ComfyUI/custom_nodes && \
     cp -r /llm/sglang/python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion . && \
     # Clean
-    rm -rf /tmp/*
+    rm -rf /tmp/* && \
+# Disable Custom Nodes with Low Usage Rates
+    cd /llm/ComfyUI/custom_nodes && \
+    mv comfyui-voxcpm comfyui-voxcpm.disabled && \
+    mv ComfyUI_IndexTTS ComfyUI_IndexTTS.disabled && \
+    mv ComfyUI-Hunyuan3d-2-1 ComfyUI-Hunyuan3d-2-1.disabled && \
+    mv ComfyUI-HY-Motion1 ComfyUI-HY-Motion1.disabled
 
 COPY ./workflows/* /llm/ComfyUI/user/default/workflows/
 COPY ./example_inputs/* /llm/ComfyUI/input/

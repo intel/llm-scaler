@@ -92,6 +92,17 @@ The following models are supported in ComfyUI workflows. For detailed model file
 | **3D Generation** | Hunyuan3D 2.1 | Text/Image-to-3D | `3d_hunyuan3d.json` |
 | **Audio Generation** | VoxCPM1.5, IndexTTS 2 | Text-to-Speech, Voice Cloning | `audio_VoxCPM_example.json`, `audio_indextts2.json` |
 
+### Enabling Optional Nodes
+
+Some nodes are disabled by default to save resources. To use **Hunyuan3D**, **VoxCPM**, **IndexTTS**, or **HY-Motion1**, you can enable them using **ComfyUI Manager**:
+
+1. Click the **Manager** button in the ComfyUI menu.
+2. In the Manager window, use the **Filter** dropdown to select **Disabled**.
+3. Locate the node you want to enable (e.g., `IndexTTS`, `VoxCPM`) and click **Enable**.
+4. Restart ComfyUI and refresh the page to apply changes.
+
+![comfyui_manager_enable](./assets/comfyui_manager_enable.png)
+
 ### ComfyUI Workflows
 
 On the left side of the web UI, you can find the workflows logo to load and manage workflows.
