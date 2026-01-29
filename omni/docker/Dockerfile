@@ -68,6 +68,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
 # Install omni_xpu_kernel (Intel XPU optimized kernels)
     cd /tmp/omni_xpu_kernel && \
     pip install . --no-build-isolation && \
+    pip install pytest && \
 # Install ComfyUI
     cd /llm && \
     git clone https://github.com/comfyanonymous/ComfyUI.git && \

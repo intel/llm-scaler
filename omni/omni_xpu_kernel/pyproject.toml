@@ -34,11 +34,6 @@ dev = [
     "numpy",
 ]
 
-[project.urls]
-Homepage = "https://github.com/intel/omni_xpu_kernel"
-Repository = "https://github.com/intel/omni_xpu_kernel"
-Issues = "https://github.com/intel/omni_xpu_kernel/issues"
-
 [tool.setuptools.dynamic]
 version = {attr = "omni_xpu_kernel.__version__"}
 

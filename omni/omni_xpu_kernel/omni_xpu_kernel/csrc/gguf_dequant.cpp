@@ -12,8 +12,6 @@
 // Output layouts:
 //   - INTERLEAVED: output[2i]=low, output[2i+1]=high (standard GGUF)
 //   - SEQUENTIAL: output[0-15]=low, output[16-31]=high (ComfyUI)
-//
-// Performance: ~340 GB/s on Intel Data Center GPU Max (Ponte Vecchio)
 // ============================================================================
 
 #include <torch/extension.h>

@@ -2,7 +2,8 @@
 omni_xpu_kernel - High-performance Intel XPU kernels
 
 A collection of optimized SYCL/ESIMD kernels for Intel GPUs, including:
-- GGUF Q4_0 dequantization (~340 GB/s on PVC)
+- GGUF Q4_0 dequantization
+- RMSNorm and LayerNorm
 - More kernels to come...
 
 Usage:

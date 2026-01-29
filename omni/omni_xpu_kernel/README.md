@@ -34,11 +34,6 @@ pip install . --no-build-isolation
 pip install -e . --no-build-isolation
 ```
 
-Quick build script:
-```bash
-./scripts/build.sh
-```
-
 ### Windows
 
 1. Install Intel oneAPI Base Toolkit from:
