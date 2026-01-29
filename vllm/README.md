@@ -65,7 +65,7 @@ First, install a standard Ubuntu 25.04 from the following link.
 - [Ubuntu 25.04 Server](https://releases.ubuntu.com/25.04/ubuntu-25.04-live-server-amd64.iso) (for Xeon-SP).
 
 Download Offline Installer from Intel RDC webiste. This can be download directly without registration requirement. 
-[RDC Download Link](https://cdrdv2.intel.com/v1/dl/getContent/871223/871005?filename=multi-arc-bmg-offline-installer-25.45.5.4.tar.xz)
+[RDC Download Link](https://cdrdv2.intel.com/v1/dl/getContent/873591/873592)
 
 Switch to root user, extract and installer and run installation script.
 
@@ -84,7 +84,7 @@ If everything is ok, you can see below installation completion message. Then ple
 Tools installed: gemm / 1ccl / xpu-smi in /usr/bin
 level-zero-tests: ./tools/level-zero-tests
 Support scripts: ./scripts
-Installation log: ./install_log_20250921_191057.log
+Installation log: ./install_log_20260129_164959.log
 ````
 
 ### 1.2 Run Platform Evaluation
@@ -92,37 +92,35 @@ Installation log: ./install_log_20250921_191057.log
 After the reboot, go to /opt/intel/multi-arc directory, tools/scripts are there.
 
 ```bash
-root@edgeaihost15:/home/intel/multi-arc-bmg-offline-installer-25.38.4.1# ls -l
-total 80
-drwxr-xr-x 4 edgeai edgeai  4096 Sep  5 18:32 base
-drwxr-xr-x 2 edgeai edgeai  4096 Sep 20 17:15 firmware
-drwxr-xr-x 6 edgeai edgeai  4096 Aug 28 05:46 gfxdrv
--rwxr-xr-x 1 edgeai edgeai  6668 Sep  5 18:32 installer.sh
--rw-r--r-- 1 root   root   28674 Sep 21 19:11 install_log_20250921_191057.log
-drwxr-xr-x 2 edgeai edgeai  4096 Aug 28 06:05 kernel
-drwxr-xr-x 2 edgeai edgeai  4096 Sep 20 17:14 oneapi
--rw-r--r-- 1 edgeai edgeai   818 Sep  1 18:11 README.md
-drwxr-xr-x 4 edgeai edgeai  4096 Sep 21 19:23 results
-drwxr-xr-x 7 edgeai edgeai  4096 Aug 28 06:25 scripts
-drwxr-xr-x 6 edgeai edgeai  4096 Sep 20 17:14 tools
--rw-r--r-- 1 edgeai edgeai    94 Sep  1 18:10 VERSION
+(base) root@intel:~/multi-arc-bmg-offline-installer-26.5.6.1# ll
+total 48
+drwxrwxr-x  6 intel intel 4096 Jan 26 16:16 ./
+drwx------ 19 root  root  4096 Jan 29 16:55 ../
+-rwxrwxr-x  1 intel intel 5769 Jan 23 11:21 install*
+-rwxrwxr-x  1 intel intel 3439 Jan 23 11:31 installer.sh*
+-rw-rw-r--  1 intel intel  818 Jan 23 11:31 README.md
+drwxrwxr-x  2 intel intel 4096 Jan 20 19:58 results/
+drwxrwxr-x  7 intel intel 4096 Jan 23 11:21 scripts/
+drwxrwxr-x  3 intel intel 4096 Jan 20 19:58 tools/
+drwxrwxr-x  9 intel intel 4096 Jan 19 15:31 ubuntu-25.04-desktop/
+-rwxrwxr-x  1 intel intel  409 Jan 23 11:21 uninstall*
+-rw-rw-r--  1 intel intel  587 Jan 23 11:31 VERSION
 ````
 
 Please read the README.md firstly to understand all of our offerings. Then your may use scripts/evaluation/platform_basic_evaluation.sh
 to perform a quick evaluation with report under results. We also provide a reference perf under results/
 
 ```bash
-root@edgeaihost15:/home/intel/multi-arc-bmg-offline-installer-25.38.4.1# ls results/ -la
-total 12
-drwxr-xr-x  2 edgeai edgeai 4096 Sep 21 20:18 .
-drwxr-xr-x 10 edgeai edgeai 4096 Sep 21 20:17 ..
--rw-r--r--  1 edgeai edgeai  550 Sep 20 17:46 reference_perf.csv
+(base) root@intel:~/multi-arc-bmg-offline-installer-26.5.6.1# ls results/ -l
+total 8
+-rw-rw-r-- 1 intel intel 552 Jan 23 11:31 reference_perf_b60.csv
+-rw-rw-r-- 1 intel intel 535 Jan 23 11:31 reference_perf_b70.csv
 ````
 
 When you meet issue requiring our support, you can use below script to get necesary information of your system.
 ```bash
-root@edgeaihost15:/home/intel/multi-arc-bmg-offline-installer-25.38.4.1# ls scripts/debug/collect_sysinfo.sh
-scripts/debug/collect_sysinfo.sh
+(base) root@intel:~/multi-arc-bmg-offline-installer-26.5.6.1# ll scripts/debug/collect_sysinfo.sh
+-rwxrwxr-x 1 intel intel 2701 Jan 23 11:31 scripts/debug/collect_sysinfo.sh*
 ````
 
 You can also check our FAQ and known issues for more details.
