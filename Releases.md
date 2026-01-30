@@ -2,7 +2,11 @@
 
 ## LLM-Scaler-vLLM
 
-### Latest Beta Release 
+### Latest Production Release 1.3
+* `intel/llm-scaler-vllm:1.3` [1/30/2026]: 
+    - Same image as intel/llm-scaler-vllm:0.11.1-b7
+
+### Previous Releases
 * `intel/llm-scaler-vllm:0.11.1-b7` [1/16/2026]:
     - Upgrade: vLLM upgrade to 0.11.1, Pytorch upgrade to 2.9.  oneAPI upgrade to 2025.2.2(hotfix), oneccl upgrade to 2021.15.7.6.
     - 8 New models supported: Qwen3-Next-80B-A3B-Instruct, Qwen3-Next-80B-A3B-Thinking, InternVL3.5-30B-A3B, DeepSeek-OCR,PaddleOCR-VL, Seed-OSS-36B-Instruct, Qwen3-30B-A3B-Instruct-2507 and openai/whisper-large-v3.
@@ -20,7 +24,6 @@
     - Fixed output errors for InternVL-38B.
     - Refine logic for profile_run to provide more GPU blocks by default
 
-### Previous Releases
 * `intel/llm-scaler-vllm:1.2` [12/11/2025]: 
     - Same image as intel/llm-scaler-vllm:0.10.2-b6
 
