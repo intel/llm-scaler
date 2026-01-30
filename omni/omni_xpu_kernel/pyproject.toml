@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "cmake>=3.18"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omni_xpu_kernel"
+dynamic = ["version"]
+description = "High-performance Intel XPU kernels for PyTorch"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Intel"}
+]
+keywords = ["intel", "xpu", "sycl", "esimd", "pytorch", "gpu", "kernels", "quantization", "gguf"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+]
+dependencies = [
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "numpy",
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "omni_xpu_kernel.__version__"}
+
+[tool.setuptools.packages.find]
+exclude = ["tests*", "scripts*"]

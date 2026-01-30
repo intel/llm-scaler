@@ -18,6 +18,7 @@ COPY ./patches/comfyui_hunyuan3d_for_xpu.patch /tmp/
 COPY ./patches/sglang_diffusion_for_multi_arc.patch /tmp/
 COPY ./patches/comfyui_hy_motion1.patch /tmp/
 COPY ./patches/comfyui_gguf_xpu.patch /tmp/
+COPY ./omni_xpu_kernel /tmp/omni_xpu_kernel
 
 
 
@@ -64,6 +65,10 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     git checkout fb8fb0e437a8745b9629020759de31d1626a4a7b && \
     git apply /tmp/xdit_for_multi_arc.patch && \
     pip install -e . && \
+# Install omni_xpu_kernel (Intel XPU optimized kernels)
+    cd /tmp/omni_xpu_kernel && \
+    pip install . --no-build-isolation && \
+    pip install pytest && \
 # Install ComfyUI
     cd /llm && \
     git clone https://github.com/comfyanonymous/ComfyUI.git && \
