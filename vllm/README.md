@@ -67,7 +67,7 @@ First, install a standard Ubuntu 25.04 from the following link.
 Download Offline Installer from Intel RDC webiste. This can be download directly without registration requirement. 
 [RDC Download Link](https://cdrdv2.intel.com/v1/dl/getContent/873591/873592)
 
-**Note: Above RDC version (26.5.6.1) only supports Ubuntu 25.04 desktop. For 25.04 server and other support, please check with your Intel support team.
+**Note: Above RDC version (26.5.6.1) only supports Ubuntu 25.04 desktop. For 25.04 server and other support, please check with your Intel support team**
 
 Switch to root user, extract and installer and run installation script.
 
