@@ -218,7 +218,7 @@ This way, only the first GPU will be mapped into the Docker container.
 
 ### 1.4 Launching the Serving Service
 
-If you don't download hf models before, you can try to start by this way, But you may meet network error. We recommend to start service by download models first and mount models on staring docker container.
+If you don't download hf models before, you can try to start by this way, But you may meet network error. We recommend to start service by download models first and mount models on staring docker container. And the roject [hf-mirror](https://hf-mirror.com/) is recommended to solve model download network error.
 ```bash
 HF_TOKEN="<your_api_token>"
 HF_HOME="/llm/models"
@@ -226,6 +226,8 @@ vllm serve \
     --model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
     --served-model-name DeepSeek-R1-Distill-Qwen-7B \
 ```
+
+Start the Serving Service using local model
 
 ```bash
 # Start the vLLM service, logging to both file /llm/vllm.log and Docker logs
