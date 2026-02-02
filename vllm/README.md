@@ -218,6 +218,18 @@ This way, only the first GPU will be mapped into the Docker container.
 
 ### 1.4 Launching the Serving Service
 
+### 1.4.0 (Optional)
+If you don't download hf models before, you can try to start by this way, But you may meet network error. We recommend to start service by download models first and mount models on staring docker container. And the project [hf-mirror](https://hf-mirror.com/) is recommended to solve model download network error.
+```bash
+HF_TOKEN="<your_api_token>"
+HF_HOME="/llm/models"
+vllm serve \
+    --model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+    --served-model-name DeepSeek-R1-Distill-Qwen-7B
+```
+
+### 1.4.1 Start the Serving Service using local model
+
 ```bash
 # Start the vLLM service, logging to both file /llm/vllm.log and Docker logs
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
@@ -1063,6 +1075,7 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | Language Model       | zai-org/GLM-4-32B-0414                     |      |         ✅        |                      |       | use bfloat16 |
 | Language MOE Model   | zai-org/GLM-4.5-Air                        |  ✅  |         ✅         |                      |       |                           |
 | Language Model       | ByteDance-Seed/Seed-OSS-36B-Instruct       |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | miromind-ai/MiroThinker-v1.5-30B           |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | tencent/Hunyuan-0.5B-Instruct              |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](#31-how-to-use-hunyuan-7b-instruct)   |
 | Language Model       | tencent/Hunyuan-7B-Instruct                |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](#31-how-to-use-hunyuan-7b-instruct)   |
 | Multimodal Model     | Qwen/Qwen2-VL-7B-Instruct                  |  ✅  |         ✅         |          ✅          |       |                           |
@@ -1082,6 +1095,7 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | Multimodal Model     | rednote-hilab/dots.ocr                     |  ✅  |         ✅         |          ✅          |       |                           |
 | Multimodal Model     | ByteDance-Seed/UI-TARS-7B-DPO              |  ✅  |         ✅         |          ✅          |       |                           |
 | Multimodal Model     | google/gemma-3-12b-it                      |      |         ✅         |                      |       |  use bfloat16  |
+| Multimodal Model     | google/gemma-3-27b-it                      |      |         ✅         |                      |       |  use bfloat16  |
 | Multimodal Model     | THUDM/GLM-4v-9B                            |  ✅  |         ✅         |          ✅         |       |  with --hf-overrides and chat_template  |
 | Multimodal Model     | zai-org/GLM-4.1V-9B-Base                   |  ✅  |         ✅         |          ✅          |       |                           |
 | Multimodal Model     | zai-org/GLM-4.1V-9B-Thinking               |  ✅  |         ✅         |          ✅          |       |                           |
@@ -1090,6 +1104,8 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | Multimodal Model     | baidu/ERNIE-4.5-VL-28B-A3B-Thinking        |  ✅  |         ✅         |          ✅          |       |                           |
 | Multimodal Model     | zai-org/GLM-4.6V-Flash                     |  ✅  |         ✅         |          ✅          |       |   pip install transformers==5.0.0rc0 first            |
 | Multimodal Model     | PaddlePaddle/PaddleOCR-VL                  |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](OCR/README.md#3-paddler-ocr-support)     |
+| Multimodal Model     | deepseek-ai/DeepSeek-OCR                   |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | moonshotai/Kimi-VL-A3B-Thinking-2506       |  ✅  |         ✅         |          ✅          |       |                           |
 | omni                 | Qwen/Qwen2.5-Omni-7B                       |  ✅  |         ✅         |          ✅          |       |                           |
 | omni                 | Qwen/Qwen3-Omni-30B-A3B-Instruct           |  ✅  |         ✅         |          ✅          |       |                           |
 | audio                | openai/whisper-medium                      |  ✅  |         ✅         |          ✅          |       |                           |
