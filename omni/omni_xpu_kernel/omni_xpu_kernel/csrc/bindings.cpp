@@ -2,6 +2,10 @@
 // omni_xpu_kernel - Python Bindings
 // ============================================================================
 // Unified Python interface for Intel XPU optimized kernels
+// 
+// Currently supported:
+//   - GGUF Dequantization: Q4_0, Q8_0, Q4_K, Q6_K
+//   - Normalization: RMSNorm, LayerNorm
 // ============================================================================
 
 #include <torch/extension.h>
@@ -12,6 +16,9 @@ namespace gguf {
     torch::Tensor dequantize_q4_0(const torch::Tensor& input, torch::ScalarType dtype);
     torch::Tensor dequantize_q4_0_comfyui(const torch::Tensor& input, torch::ScalarType dtype);
     torch::Tensor dequantize_q4_0_impl(const torch::Tensor& input, torch::ScalarType dtype, bool sequential_layout);
+    torch::Tensor dequantize_q8_0(const torch::Tensor& input, torch::ScalarType dtype);
+    torch::Tensor dequantize_q4_k(const torch::Tensor& input, torch::ScalarType dtype);
+    torch::Tensor dequantize_q6_k(const torch::Tensor& input, torch::ScalarType dtype);
     double benchmark(const torch::Tensor& input, torch::ScalarType dtype, int warmup_iters, int bench_iters);
 }
 namespace norm {
@@ -21,10 +28,10 @@ namespace norm {
 }
 
 PYBIND11_MODULE(_C, m) {
-    m.doc() = "omni_xpu_kernel - High-performance Intel XPU kernels";
+    m.doc() = "omni_xpu_kernel - High-performance Intel XPU ESIMD kernels";
     
-    // GGUF Q4_0 dequantization
-    auto gguf = m.def_submodule("gguf", "GGUF quantization kernels");
+    // GGUF Dequantization kernels
+    auto gguf = m.def_submodule("gguf", "GGUF dequantization kernels (Q4_0, Q8_0, Q4_K, Q6_K)");
     
     gguf.def("dequantize_q4_0", &omni_xpu::gguf::dequantize_q4_0,
         "Dequantize Q4_0 tensor (interleaved output)",
@@ -45,6 +52,24 @@ PYBIND11_MODULE(_C, m) {
         py::arg("sequential_layout") = false
     );
     
+    gguf.def("dequantize_q8_0", &omni_xpu::gguf::dequantize_q8_0,
+        "Dequantize Q8_0 tensor",
+        py::arg("input"),
+        py::arg("dtype") = torch::kFloat16
+    );
+    
+    gguf.def("dequantize_q4_k", &omni_xpu::gguf::dequantize_q4_k,
+        "Dequantize Q4_K tensor",
+        py::arg("input"),
+        py::arg("dtype") = torch::kFloat16
+    );
+    
+    gguf.def("dequantize_q6_k", &omni_xpu::gguf::dequantize_q6_k,
+        "Dequantize Q6_K tensor",
+        py::arg("input"),
+        py::arg("dtype") = torch::kFloat16
+    );
+    
     gguf.def("benchmark", &omni_xpu::gguf::benchmark,
         "Benchmark Q4_0 dequantization",
         py::arg("input"),
@@ -54,7 +79,7 @@ PYBIND11_MODULE(_C, m) {
     );
     
     // Normalization kernels
-    auto norm = m.def_submodule("norm", "Normalization kernels");
+    auto norm = m.def_submodule("norm", "Normalization kernels (RMSNorm, LayerNorm)");
     
     norm.def("rms_norm", &omni_xpu::norm::rms_norm,
         "RMSNorm using ESIMD optimization",
@@ -71,3 +96,4 @@ PYBIND11_MODULE(_C, m) {
         py::arg("eps") = 1e-5
     );
 }
+

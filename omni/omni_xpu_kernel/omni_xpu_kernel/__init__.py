@@ -53,12 +53,10 @@ def is_available():
 # Submodule imports
 from . import gguf
 from . import norm
-from . import ops
 
 __all__ = [
     "gguf",
     "norm",
-    "ops",
     "is_available",
     "__version__",
 ]
