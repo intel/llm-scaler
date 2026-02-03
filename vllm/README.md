@@ -246,7 +246,6 @@ vllm serve \
     --trust-remote-code \
     --disable-sliding-window \
     --gpu-memory-util=0.9 \
-    --no-enable-prefix-caching \
     --max-num-batched-tokens=8192 \
     --disable-log-requests \
     --max-model-len=8192 \
@@ -261,6 +260,11 @@ vllm serve \
 # VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 VLLM_WORKER_MULTIPROC_METHOD=spawn vllm serve ... 2>&1 | tee /llm/vllm.log
 tail -f /llm/vllm.log
 ```
+
+> **Note — Prefix Caching**
+
+> By default, vLLM enables **prefix caching**, which reuses computed KV cache for prompts that share common prefixes (e.g., system prompts). This can significantly improve throughput for workloads with repeated prefixes. If you encounter memory issues or want to disable this feature for debugging/test purposes, add `--no-enable-prefix-caching` to the startup command.
+
 you can add the argument `--api-key xxx` for user authentication. Users are supposed to send their requests with request header bearing the API key.
 
 ---
@@ -307,6 +311,16 @@ export CCL_TOPO_P2P_ACCESS=0  # USM mode
 
 ### 2.2 INT4 and FP8 Quantized Online Serving
 To enable online quantization using `llm-scaler-vllm`, specify the desired quantization method with the `--quantization` option when starting the service.
+
+| Quantization Method | `--quantization` Value | Description | Applicable Models |
+|---------------------|------------------------|-------------|-------------------|
+| **MXFP4** | `mxfp4` | Microscaling FP4 quantization | `gpt-oss-20b`, `gpt-oss-120b` only |
+| **Online FP8** | `fp8` | Dynamic FP8 quantization at runtime | All supported models |
+| **Online INT4** | `sym_int4` | Dynamic symmetric INT4 quantization at runtime | All supported models |
+| **Pre-quantized AWQ** | Not required | Auto-detected from model config (`quantization_config.quant_method: awq`) | AWQ-quantized models |
+| **Pre-quantized GPTQ** | Not required | Auto-detected from model config (`quantization_config.quant_method: gptq`) | GPTQ-quantized models |
+
+> **Note:** For pre-quantized models (AWQ/GPTQ), vLLM automatically detects the quantization method from the model's `config.json` file, so you do not need to specify the `--quantization` option.
 
 The following example shows how to launch the server with `sym_int4` quantization:
 
