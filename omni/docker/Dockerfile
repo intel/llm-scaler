@@ -142,8 +142,8 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     pip install -r requirements.txt && \
 # Install ComfyUI-CacheDiT Node
     cd /llm/ComfyUI/custom_nodes && \
-    git clone https://github.com/xlite-dev/comfyui-cache-dit.git && \
-    cd comfyui-cache-dit && \
+    git clone https://github.com/Jasonzzt/ComfyUI-CacheDiT.git && \
+    cd ComfyUI-CacheDiT && \
     pip install -r requirements.txt && \
 # Install Xinference
     pip install "xinference[transformers]==1.15.0" && \
