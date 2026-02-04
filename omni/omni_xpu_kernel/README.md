@@ -5,14 +5,13 @@ High-performance Intel XPU ESIMD kernels for PyTorch.
 ## Features
 
 ### GGUF Dequantization
-Optimized for ComfyUI-GGUF with up to **90x speedup** over PyTorch reference:
 
-| Format | Block Size | Elements | Performance |
-|--------|------------|----------|-------------|
-| Q4_0   | 18 bytes   | 32       | ~25-47x faster |
-| Q8_0   | 34 bytes   | 32       | ~4-6x faster |
-| Q4_K   | 144 bytes  | 256      | ~15-90x faster |
-| Q6_K   | 210 bytes  | 256      | ~20-62x faster |
+| Format | Block Size | Elements |
+|--------|------------|----------|
+| Q4_0   | 18 bytes   | 32       |
+| Q8_0   | 34 bytes   | 32       |
+| Q4_K   | 144 bytes  | 256      |
+| Q6_K   | 210 bytes  | 256      |
 
 ### Normalization Kernels
 - RMSNorm and LayerNorm
