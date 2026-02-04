@@ -215,15 +215,15 @@ void dequantize_q4_k_kernel(
                         sc_low = scales_data[j_low] & 63;
                         m_low = scales_data[j_low + 4] & 63;
                     } else {
-                        sc_low = (scales_data[j_low + 4] & 0xF) | ((scales_data[j_low - 4] >> 6) << 4);
-                        m_low = (scales_data[j_low + 4] >> 4) | ((scales_data[j_low] >> 6) << 4);
+                        sc_low = (scales_data[j_low + 4] & 0xF) | ((scales_data[j_low - 4] >> 2) & 0x30);
+                        m_low = (scales_data[j_low + 4] >> 4) | ((scales_data[j_low] >> 2) & 0x30);
                     }
                     if (j_high < 4) {
                         sc_high = scales_data[j_high] & 63;
                         m_high = scales_data[j_high + 4] & 63;
                     } else {
-                        sc_high = (scales_data[j_high + 4] & 0xF) | ((scales_data[j_high - 4] >> 6) << 4);
-                        m_high = (scales_data[j_high + 4] >> 4) | ((scales_data[j_high] >> 6) << 4);
+                        sc_high = (scales_data[j_high + 4] & 0xF) | ((scales_data[j_high - 4] >> 2) & 0x30);
+                        m_high = (scales_data[j_high + 4] >> 4) | ((scales_data[j_high] >> 2) & 0x30);
                     }
                     
                     fp16 d_sc_low = d * fp16(sc_low);
