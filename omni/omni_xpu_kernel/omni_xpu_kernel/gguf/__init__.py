@@ -35,9 +35,9 @@ def dequantize_q4_0(
     - 2 bytes: FP16 scale
     - 16 bytes: packed 4-bit values (2 per byte)
     
-    Output layout (ComfyUI compatible):
-    - output[0:16] = low nibbles
-    - output[16:32] = high nibbles
+    Output layout (ComfyUI compatible, Python slice notation):
+    - output[0:16] contains low nibbles (indices 0–15)
+    - output[16:32] contains high nibbles (indices 16–31)
     """
     return _get_native().dequantize_q4_0(input, dtype)
 
