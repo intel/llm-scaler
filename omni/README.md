@@ -237,9 +237,9 @@ ComfyUI tutorial: https://blog.comfy.org/p/ltx-2-open-source-audio-video-ai
 
 - **video_ltx2_19B_i2v.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_ltx2_i2v.json)): Image to Video with motion, dialogue, SFX, and music
 
-- **video_ltx_2_19B_t2v_distilled.json**: Distilled Text-to-Video workflow (only 1 sampler stage)
+- **video_ltx_2_19B_t2v_distilled.json**: Distilled Text-to-Video workflow
 
-- **video_ltx_2_19B_i2v_distilled.json**: Distilled Image-to-Video workflow (only 1 sampler stage)
+- **video_ltx_2_19B_i2v_distilled.json**: Distilled Image-to-Video workflow
 
 > **Note:** Model weights of distilled workflow can be obtained from [Kijai/LTXV2_comfy](https://huggingface.co/Kijai/LTXV2_comfy).
 
