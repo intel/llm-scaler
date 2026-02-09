@@ -130,7 +130,7 @@ class ICPXBuildExt(build_ext):
                 f"/link",
                 f"/LIBPATH:{torch_lib}",
                 f"/LIBPATH:{python_lib_dir}",
-                "torch.lib", "torch_python.lib", "torch_cpu.lib", "c10.lib",
+                "torch.lib", "torch_python.lib", "torch_cpu.lib", "torch_xpu.lib", "c10.lib", "c10_xpu.lib",
                 f"python{python_version}.lib",
             ]
         else:
@@ -147,7 +147,7 @@ class ICPXBuildExt(build_ext):
                 f"-I{torch_include}/torch/csrc/api/include",
                 f"-I{src_dir}",
                 f"-L{torch_lib}",
-                "-ltorch", "-ltorch_python", "-ltorch_cpu", "-lc10",
+                "-ltorch", "-ltorch_python", "-ltorch_cpu", "-ltorch_xpu", "-lc10", "-lc10_xpu",
                 "-Wl,-rpath," + str(torch_lib),
                 "-o", str(output_path),
             ] + [str(s) for s in sources]
