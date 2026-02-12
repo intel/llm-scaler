@@ -1,0 +1,46 @@
+From 0ba312394064eef85a0701e5539e56d0c7b99fe8 Mon Sep 17 00:00:00 2001
+From: Zhan Xue <zhan.xue@intel.com>
+Date: Wed, 19 Nov 2025 17:29:43 +0800
+Subject: [PATCH] Enable xpu gdr
+
+Signed-off-by: Cherry Zhang <cherry.zhang@intel.com>
+Signed-off-by: Yihua Xu <yihua.xu@intel.com>
+---
+ src/uct/ib/base/ib_md.c      | 6 ++++++
+ src/uct/ze/copy/ze_copy_md.c | 3 ++-
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/uct/ib/base/ib_md.c b/src/uct/ib/base/ib_md.c
+index 265d53e0a..f14a57512 100644
+--- a/src/uct/ib/base/ib_md.c
++++ b/src/uct/ib/base/ib_md.c
+@@ -1341,6 +1341,12 @@ ucs_status_t uct_ib_md_open_common(uct_ib_md_t *md,
+         /* check if ROCM KFD driver is loaded */
+         uct_ib_check_gpudirect_driver(md, "/dev/kfd", UCS_MEMORY_TYPE_ROCM);
+ 
++#if HAVE_ZE
++	uct_ib_check_gpudirect_driver(
++		md, "/sys/module/xe/srcversion",
++		UCS_MEMORY_TYPE_ZE_DEVICE);
++#endif
++
+         /* Check for dma-buf support */
+         uct_ib_md_check_dmabuf(md);
+     }
+diff --git a/src/uct/ze/copy/ze_copy_md.c b/src/uct/ze/copy/ze_copy_md.c
+index 9a4b2d512..e70153d26 100644
+--- a/src/uct/ze/copy/ze_copy_md.c
++++ b/src/uct/ze/copy/ze_copy_md.c
+@@ -48,7 +48,8 @@ static ucs_status_t uct_ze_copy_md_query(uct_md_h md, uct_md_attr_v2_t *md_attr)
+     md_attr->alloc_mem_types  = UCS_BIT(UCS_MEMORY_TYPE_ZE_HOST) |
+                                 UCS_BIT(UCS_MEMORY_TYPE_ZE_DEVICE) |
+                                 UCS_BIT(UCS_MEMORY_TYPE_ZE_MANAGED);
+-    md_attr->access_mem_types = UCS_BIT(UCS_MEMORY_TYPE_ZE_HOST) |
++    md_attr->access_mem_types = UCS_BIT(UCS_MEMORY_TYPE_HOST) |
++                                UCS_BIT(UCS_MEMORY_TYPE_ZE_HOST) |
+                                 UCS_BIT(UCS_MEMORY_TYPE_ZE_DEVICE) |
+                                 UCS_BIT(UCS_MEMORY_TYPE_ZE_MANAGED);
+     md_attr->detect_mem_types = UCS_BIT(UCS_MEMORY_TYPE_ZE_HOST) |
+-- 
+2.43.0
+
