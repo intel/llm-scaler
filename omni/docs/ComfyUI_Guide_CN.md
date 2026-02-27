@@ -761,7 +761,7 @@ SeedVR2 是一个基于扩散模型的视频超分辨率模型，可对视频进
         └── ema_vae_fp16.safetensors               （VAE）
 ```
 
-> 模型**首次使用时自动下载**。也可手动从 [numz/SeedVR2_comfyUI](https://huggingface.co/numz/SeedVR2_comfyUI) 和 [AInVFX/SeedVR2_comfyUI](https://huggingface.co/AInVFX/SeedVR2_comfyUI) 下载。
+> 模型**首次使用时自动下载**。也可手动从 [numz/SeedVR2_comfyUI](https://huggingface.co/numz/SeedVR2_comfyUI)。
 
 ---
 

@@ -18,3 +18,378 @@ index 73d2db0..bf2a5fc 100644
 -gguf
 -matplotlib
 \ No newline at end of file
+diff --git a/src/common/distributed/basic.py b/src/common/distributed/basic.py
+index d92610e..6149fe6 100644
+--- a/src/common/distributed/basic.py
++++ b/src/common/distributed/basic.py
+@@ -43,6 +43,13 @@ def get_world_size() -> int:
+     """
+     return int(os.environ.get("WORLD_SIZE", "1"))
+ 
++def get_device() -> torch.device:
++    """
++    Get current rank device.
++    """
++    if hasattr(torch, 'xpu') and torch.xpu.is_available():
++        return torch.device("xpu")
++    return torch.device("cuda", get_local_rank())
+ 
+ def get_device() -> torch.device:
+     """
+diff --git a/src/core/generation_phases.py b/src/core/generation_phases.py
+index 3b7e6ea..efefc12 100644
+--- a/src/core/generation_phases.py
++++ b/src/core/generation_phases.py
+@@ -492,7 +492,7 @@ def encode_all_batches(
+             del transformed_video, rgb_video
+             
+             # Convert from VAE dtype to compute dtype and offload to avoid VRAM accumulation
+-            if ctx['tensor_offload_device'] is not None and (cond_latents[0].is_cuda or cond_latents[0].is_mps):
++            if ctx['tensor_offload_device'] is not None and (cond_latents[0].is_cuda or cond_latents[0].is_mps or cond_latents[0].is_xpu):
+                 ctx['all_latents'][encode_idx] = manage_tensor(
+                     tensor=cond_latents[0],
+                     target_device=ctx['tensor_offload_device'],
+@@ -731,7 +731,7 @@ def upscale_all_batches(
+             debug.end_timer(f"dit_inference_{upscale_idx+1}", f"DiT inference {upscale_idx+1}")
+             
+             # Offload upscaled latents to avoid VRAM accumulation
+-            if ctx['tensor_offload_device'] is not None and (upscaled_latents[0].is_cuda or upscaled_latents[0].is_mps):
++            if ctx['tensor_offload_device'] is not None and (upscaled_latents[0].is_cuda or upscaled_latents[0].is_mps or upscaled_latents[0].is_xpu):
+                 ctx['all_upscaled_latents'][upscale_idx] = manage_tensor(
+                     tensor=upscaled_latents[0],
+                     target_device=ctx['tensor_offload_device'],
+diff --git a/src/core/model_loader.py b/src/core/model_loader.py
+index 3ce1078..d5efdef 100644
+--- a/src/core/model_loader.py
++++ b/src/core/model_loader.py
+@@ -123,6 +123,9 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
+             # MPS allocator fallback: some PyTorch/macOS versions have issues with
+             # direct MPS loading (allocation failures, watermark errors, etc.)
+             error_msg = str(e).lower()
++            is_xpu_alloc_error = device.type == "xpu" and any(
++                keyword in error_msg for keyword in ["watermark", "allocat", "memory"]
++            )
+             is_mps_alloc_error = device.type == "mps" and any(
+                 keyword in error_msg for keyword in ["watermark", "allocat", "memory"]
+             )
+@@ -134,6 +137,13 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
+                             category="info", indent_level=1)
+                 state = load_safetensors_file(checkpoint_path, device="cpu")
+                 # Tensors will be moved to MPS during model.load_state_dict()
++            elif is_xpu_alloc_error:
++                # Transparent fallback - only log if debug enabled
++                if debug:
++                    debug.log("Using CPU intermediate loading for XPU compatibility", 
++                            category="info", indent_level=1)
++                state = load_safetensors_file(checkpoint_path, device="cpu")
++                # Tensors will be moved to XPU during model.load_state_dict()
+             else:
+                 # Re-raise if it's a different error (file corruption, etc.)
+                 raise
+diff --git a/src/data/image/transforms/area_resize.py b/src/data/image/transforms/area_resize.py
+index fc025da..c9fb624 100644
+--- a/src/data/image/transforms/area_resize.py
++++ b/src/data/image/transforms/area_resize.py
+@@ -34,6 +34,8 @@ class AreaResize:
+         self.interpolation = interpolation
+         if is_mps_available():
+             self.interpolation = InterpolationMode.BILINEAR
++        if hasattr(torch, 'xpu') and torch.xpu.is_available():
++            self.interpolation = InterpolationMode.BILINEAR
+ 
+     def __call__(self, image: Union[torch.Tensor, Image.Image]):
+ 
+@@ -51,7 +53,7 @@ class AreaResize:
+ 
+         resized_height, resized_width = round(height * scale), round(width * scale)
+ 
+-        antialias = not (isinstance(image, torch.Tensor) and image.device.type == 'mps')
++        antialias = not (isinstance(image, torch.Tensor) and image.device.type in ('mps', 'xpu'))
+         return TVF.resize(
+             image,
+             size=(resized_height, resized_width),
+diff --git a/src/data/image/transforms/na_resize.py b/src/data/image/transforms/na_resize.py
+index e1111c7..2d93b92 100644
+--- a/src/data/image/transforms/na_resize.py
++++ b/src/data/image/transforms/na_resize.py
+@@ -27,7 +27,7 @@ def NaResize(
+     max_resolution: int = 0,
+     interpolation: InterpolationMode = InterpolationMode.BICUBIC,
+ ):
+-    Interpolation = InterpolationMode.BILINEAR if is_mps_available() else interpolation
++    Interpolation = InterpolationMode.BILINEAR if (is_mps_available() or (hasattr(torch, 'xpu') and torch.xpu.is_available())) else interpolation
+     if mode == "area":
+         return AreaResize(
+             max_area=resolution**2,
+diff --git a/src/data/image/transforms/side_resize.py b/src/data/image/transforms/side_resize.py
+index 01362ae..52f24b7 100644
+--- a/src/data/image/transforms/side_resize.py
++++ b/src/data/image/transforms/side_resize.py
+@@ -31,7 +31,7 @@ class SideResize:
+         self.max_size = max_size
+         self.downsample_only = downsample_only
+         self.interpolation = interpolation
+-        if is_mps_available():
++        if is_mps_available() or (hasattr(torch, 'xpu') and torch.xpu.is_available()):
+             self.interpolation = InterpolationMode.BILINEAR
+ 
+     def __call__(self, image: Union[torch.Tensor, Image.Image]):
+@@ -57,8 +57,8 @@ class SideResize:
+         else:
+             size = self.size
+ 
+-        # Resize to shortest edge (disable antialias only for MPS tensors - not supported)
+-        antialias = not (isinstance(image, torch.Tensor) and image.device.type == 'mps')
++        # Resize to shortest edge (disable antialias only for MPS and XPU tensors - not supported)
++        antialias = not (isinstance(image, torch.Tensor) and image.device.type in ('mps', 'xpu'))
+         resized = TVF.resize(image, size, self.interpolation, antialias=antialias)
+         
+         # Apply max_size constraint if specified
+diff --git a/src/interfaces/video_upscaler.py b/src/interfaces/video_upscaler.py
+index 159ca2d..5962f1c 100644
+--- a/src/interfaces/video_upscaler.py
++++ b/src/interfaces/video_upscaler.py
+@@ -518,7 +518,7 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
+ 
+             # Ensure CPU tensor in float32 for maximum ComfyUI compatibility
+             if torch.is_tensor(sample):
+-                if sample.is_cuda or sample.is_mps:
++                if sample.is_cuda or sample.is_mps or sample.is_xpu:
+                     sample = sample.cpu()
+                 if sample.dtype != torch.float32:
+                     src_dtype = sample.dtype
+diff --git a/src/optimization/compatibility.py b/src/optimization/compatibility.py
+index c462022..b15b029 100644
+--- a/src/optimization/compatibility.py
++++ b/src/optimization/compatibility.py
+@@ -760,6 +760,12 @@ class CompatibleDiT(torch.nn.Module):
+                 self.debug.start_timer("_force_nadit_precision")
+                 self._force_nadit_precision(target_dtype=self.compute_dtype)
+                 self.debug.end_timer("_force_nadit_precision", "NaDiT parameters/buffers conversion")
++        if not skip_conversion and hasattr(torch, 'xpu') and torch.xpu.is_available():
++                if self.model_dtype != self.compute_dtype:
++                    self.debug.log(f"Converting NaDiT parameters/buffers to {self.compute_dtype} for XPU backend", category="setup", force=True)
++                    self.debug.start_timer("_force_nadit_precision")
++                    self._force_nadit_precision(target_dtype=self.compute_dtype)
++                    self.debug.end_timer("_force_nadit_precision", "NaDiT parameters/buffers conversion")
+             
+         # Apply RoPE stabilization for numerical stability
+         self.debug.log(f"Stabilizing RoPE computations for numerical stability", category="setup")
+@@ -798,6 +804,8 @@ class CompatibleDiT(torch.nn.Module):
+                     if module.rope.freqs.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                         if module.rope.freqs.device.type == "mps":
+                             module.rope.freqs.data = module.rope.freqs.to("cpu").to(target_dtype).to("mps")
++                        elif module.rope.freqs.device.type == "xpu":
++                            module.rope.freqs.data = module.rope.freqs.to("cpu").to(target_dtype).to("xpu")
+                         else:
+                             module.rope.freqs.data = module.rope.freqs.to(target_dtype)
+                         converted += 1
+@@ -823,6 +831,11 @@ class CompatibleDiT(torch.nn.Module):
+                     temp_converted = temp_cpu.to(target_dtype)
+                     param.data = temp_converted.to("mps")
+                     del temp_cpu, temp_converted
++                elif param.device.type == "xpu":
++                    temp_cpu = param.data.to("cpu")
++                    temp_converted = temp_cpu.to(target_dtype)
++                    param.data = temp_converted.to("xpu")
++                    del temp_cpu, temp_converted
+                 else:
+                     param.data = param.data.to(target_dtype)
+                 converted_count += 1
+@@ -838,6 +851,11 @@ class CompatibleDiT(torch.nn.Module):
+                     temp_converted = temp_cpu.to(target_dtype)
+                     buffer.data = temp_converted.to("mps")
+                     del temp_cpu, temp_converted
++                elif buffer.device.type == "xpu":
++                    temp_cpu = buffer.data.to("cpu")
++                    temp_converted = temp_cpu.to(target_dtype)
++                    buffer.data = temp_converted.to("xpu")
++                    del temp_cpu, temp_converted
+                 else:
+                     buffer.data = buffer.data.to(target_dtype)
+                 converted_count += 1
+diff --git a/src/optimization/memory_manager.py b/src/optimization/memory_manager.py
+index 780c690..ed81efc 100644
+--- a/src/optimization/memory_manager.py
++++ b/src/optimization/memory_manager.py
+@@ -17,13 +17,20 @@ from typing import Tuple, Dict, Any, Optional, List, Union
+ def _device_str(device: Union[torch.device, str]) -> str:
+     """Normalized uppercase device string for comparison and logging. MPS variants → 'MPS'."""
+     s = str(device).upper()
+-    return 'MPS' if s.startswith('MPS') else s
++    if s.startswith("MPS"):
++        return "MPS"
++    if s.startswith("XPU"):
++        return "XPU"
++    return s
+ 
+ 
+ def is_mps_available() -> bool:
+     """Check if MPS (Apple Metal) backend is available."""
+     return hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+ 
++def is_xpu_available() -> bool:
++    """Check if XPU backend is available."""
++    return hasattr(torch, 'xpu') and torch.xpu.is_available()
+ 
+ def is_cuda_available() -> bool:
+     """Check if CUDA backend is available."""
+@@ -42,6 +49,8 @@ def get_gpu_backend() -> str:
+         return 'cuda'
+     if is_mps_available():
+         return 'mps'
++    if is_xpu_available():
++        return 'xpu'
+     return 'cpu'
+ 
+ 
+@@ -61,7 +70,8 @@ def get_device_list(include_none: bool = False, include_cpu: bool = False) -> Li
+     devs = []
+     has_cuda = False
+     has_mps = False
+-    
++    has_xpu = False
++
+     try:
+         if is_cuda_available():
+             devs += [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+@@ -76,6 +86,13 @@ def get_device_list(include_none: bool = False, include_cpu: bool = False) -> Li
+     except Exception:
+         pass
+     
++    try:
++        if is_xpu_available():
++            devs.append("xpu")  # XPU doesn't use device indices
++            has_xpu = True
++    except Exception:
++        pass
++    
+     # Build result list with optional prefixes
+     result = []
+     if include_none:
+@@ -86,7 +103,7 @@ def get_device_list(include_none: bool = False, include_cpu: bool = False) -> Li
+     # 2. Either CUDA is available OR MPS is not the only option
+     # Rationale: On MPS-only systems with unified memory architecture,
+     # CPU offloading is semantically meaningless as CPU and GPU share the same memory pool
+-    if include_cpu and (has_cuda or not has_mps):
++    if include_cpu and (has_cuda or not has_mps or has_xpu):
+         result.append("cpu")
+     
+     result.extend(devs)
+@@ -118,8 +135,14 @@ def get_basic_vram_info(device: Optional[torch.device] = None) -> Dict[str, Any]
+             mem = psutil.virtual_memory()
+             free_memory = mem.total - mem.used
+             total_memory = mem.total
++        elif is_xpu_available():
++            # XPU doesn't support per-device queries or mem_get_info
++            # Use system memory as proxy (similar to MPS)
++            mem = psutil.virtual_memory()
++            free_memory = mem.total - mem.used
++            total_memory = mem.total
+         else:
+-            return {"error": "No GPU backend available (CUDA/MPS)"}
++            return {"error": "No GPU backend available (CUDA/MPS/XPU)"}
+         
+         return {
+             "free_gb": free_memory / (1024**3),
+@@ -132,7 +155,12 @@ def get_basic_vram_info(device: Optional[torch.device] = None) -> Dict[str, Any]
+ # Initial VRAM check at module load
+ vram_info = get_basic_vram_info(device=None)
+ if "error" not in vram_info:
+-    backend = "MPS" if is_mps_available() else "CUDA"
++    if is_xpu_available():
++        backend = "XPU"
++    elif is_mps_available():
++        backend = "MPS"
++    else:
++        backend = "CUDA"
+     print(f"📊 Initial {backend} memory: {vram_info['free_gb']:.2f}GB free / {vram_info['total_gb']:.2f}GB total")
+ else:
+     print(f"⚠️ Memory check failed: {vram_info['error']} - No available backend!")
+@@ -168,6 +196,12 @@ def get_vram_usage(device: Optional[torch.device] = None, debug: Optional['Debug
+             reserved = torch.mps.driver_allocated_memory() / (1024**3)
+             # MPS doesn't track peak separately
+             return allocated, reserved, allocated, reserved
++        elif is_xpu_available():
++            # MPS doesn't support per-device queries - uses global memory tracking
++            allocated = torch.xpu.memory_allocated() / (1024**3)
++            reserved = torch.xpu.memory_reserved() / (1024**3)
++            max_allocated = allocated  # XPU doesn't track peak separately
++            return allocated, reserved, max_allocated, max_allocated  # XPU doesn't support per-device queries - uses global memory tracking
+     except Exception as e:
+         if debug:
+             debug.log(f"Failed to get VRAM usage: {e}", level="WARNING", category="memory", force=True)
+@@ -269,10 +303,11 @@ def clear_memory(debug: Optional['Debug'] = None, deep: bool = False, force: boo
+                 should_clear = True
+                 if debug:
+                     backend = "Unified Memory" if is_mps_available() else "VRAM"
++                    backend = "XPU" if (hasattr(torch, 'xpu') and torch.xpu.is_available()) else backend
+                     debug.log(f"{backend} pressure: {mem_info['free_gb']:.2f}GB free of {mem_info['total_gb']:.2f}GB", category="memory")
+         
+         # For non-MPS systems, also check system RAM separately
+-        if not should_clear and not is_mps_available():
++        if not should_clear and not is_mps_available() and not (hasattr(torch, 'xpu') and torch.xpu.is_available()):
+             mem = psutil.virtual_memory()
+             if mem.available < mem.total * 0.05:
+                 should_clear = True
+@@ -300,6 +335,8 @@ def clear_memory(debug: Optional['Debug'] = None, deep: bool = False, force: boo
+         torch.cuda.ipc_collect()
+     elif is_mps_available():
+         torch.mps.empty_cache()
++    elif is_xpu_available():
++        torch.xpu.empty_cache()
+     
+     if debug:
+         debug.end_timer(gpu_timer, "GPU cache clearing")
+@@ -344,6 +381,16 @@ def clear_memory(debug: Optional['Debug'] = None, deep: bool = False, force: boo
+                     if libc_path:
+                         _os_memory_lib = ctypes.CDLL(libc_path)
+                 
++                if _os_memory_lib:
++                    _os_memory_lib.sync()
++            elif hasattr(torch, 'xpu') and torch.xpu.is_available():
++                import ctypes  # Import only when needed
++                import ctypes.util
++                if _os_memory_lib is None:
++                    libc_path = ctypes.util.find_library('c')
++                    if libc_path:
++                        _os_memory_lib = ctypes.CDLL(libc_path)
++                
+                 if _os_memory_lib:
+                     _os_memory_lib.sync()
+         except Exception as e:
+@@ -561,14 +608,14 @@ def release_model_memory(model: Optional[torch.nn.Module], debug: Optional['Debu
+         released_buffers = 0
+         
+         for param in model.parameters():
+-            if param.is_cuda or param.is_mps:
++            if param.is_cuda or param.is_mps or param.is_xpu:
+                 if param.numel() > 0:
+                     param.data.set_()
+                     released_params += 1
+                 param.grad = None
+                 
+         for buffer in model.buffers():
+-            if buffer.is_cuda or buffer.is_mps:
++            if buffer.is_cuda or buffer.is_mps or buffer.is_xpu:
+                 if buffer.numel() > 0:
+                     buffer.data.set_()
+                     released_buffers += 1
+@@ -766,7 +813,7 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
+         # Check if any parameter is on GPU (for accurate logging)
+         actual_source_device = None
+         for param in model.parameters():
+-            if param.device.type in ['cuda', 'mps']:
++            if param.device.type in ['cuda', 'mps', 'xpu']:
+                 actual_source_device = param.device
+                 break
+         
+@@ -916,7 +963,7 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
+         cleared_count = 0
+         for module in model.modules():
+             if hasattr(module, 'memory') and module.memory is not None:
+-                if torch.is_tensor(module.memory) and (module.memory.is_cuda or module.memory.is_mps):
++                if torch.is_tensor(module.memory) and (module.memory.is_cuda or module.memory.is_mps or module.memory.is_xpu):
+                     module.memory = None
+                     cleared_count += 1
+         if cleared_count > 0 and debug:

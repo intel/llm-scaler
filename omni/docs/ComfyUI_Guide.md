@@ -732,7 +732,7 @@ SeedVR2 is a diffusion-based video super-resolution model that restores and upsc
         └── ema_vae_fp16.safetensors               (VAE)
 ```
 
-> Models are **automatically downloaded on first use**. You can also manually download from [numz/SeedVR2_comfyUI](https://huggingface.co/numz/SeedVR2_comfyUI) and [AInVFX/SeedVR2_comfyUI](https://huggingface.co/AInVFX/SeedVR2_comfyUI).
+> Models are **automatically downloaded on first use**. You can also manually download from [numz/SeedVR2_comfyUI](https://huggingface.co/numz/SeedVR2_comfyUI).
 
 #### Workflow Files
 
