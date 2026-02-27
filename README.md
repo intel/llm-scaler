@@ -145,7 +145,8 @@ Please follow the instructions in the [Getting Started](omni/README.md/#getting-
 | **Video Generation** | HunyuanVideo 1.5 8.3B | Text-to-Video, Image-to-Video | 
 | **Video Generation** | LTX-2 | Text-to-Video, Image-to-Video | 
 | **3D Generation** | Hunyuan3D 2.1 | Text/Image-to-3D | 
-| **Audio Generation** | VoxCPM1.5 | Text-to-Speech | 
+| **Audio Generation** | VoxCPM1.5, IndexTTS 2 | Text-to-Speech, Voice Cloning | 
+| **Video Upscaling** | SeedVR2 | Video Restoration and Upscaling | 
 
 
 Please check [ComfyUI Support](omni/README.md/#comfyui) for more details.

@@ -13,7 +13,8 @@ This document provides a comprehensive guide for using ComfyUI in the Omni proje
 5. [Video Generation Models](#video-generation-models)
 6. [3D Generation Models](#3d-generation-models)
 7. [Audio Generation Models](#audio-generation-models)
-8. [FAQ](#faq)
+8. [Video Upscale Models](#video-upscale-models)
+9. [FAQ](#faq)
 
 ---
 
@@ -712,6 +713,33 @@ IndexTTS 2 is a voice cloning TTS model that synthesizes new speech using a sing
 | Workflow | Description |
 |----------|-------------|
 | `audio_indextts2.json` | Voice cloning |
+
+---
+
+## Video Upscale Models
+
+### SeedVR2
+
+SeedVR2 is a diffusion-based video super-resolution model that restores and upscales video content.
+
+#### Model Storage Location
+
+```text
+📂 ComfyUI/
+└── 📂 models/
+    └── 📂 SEEDVR2/
+        ├── seedvr2_ema_3b_fp8_e4m3fn.safetensors  (DiT)
+        └── ema_vae_fp16.safetensors               (VAE)
+```
+
+> Models are **automatically downloaded on first use**. You can also manually download from [numz/SeedVR2_comfyUI](https://huggingface.co/numz/SeedVR2_comfyUI) and [AInVFX/SeedVR2_comfyUI](https://huggingface.co/AInVFX/SeedVR2_comfyUI).
+
+#### Workflow Files
+
+| Workflow | Description |
+|----------|-------------|
+| `video_upscale_SeedVR2.json` | Video restoration and upscaling |
+
 
 ---
 

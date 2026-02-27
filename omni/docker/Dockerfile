@@ -145,6 +145,13 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     git clone https://github.com/Jasonzzt/ComfyUI-CacheDiT.git && \
     cd ComfyUI-CacheDiT && \
     pip install -r requirements.txt && \
+# Install ComfyUI-SeedVR2_VideoUpscaler Node
+    cd /llm/ComfyUI/custom_nodes && \
+    git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git && \
+    cd ComfyUI-SeedVR2_VideoUpscaler && \
+    git checkout 4490bd1f482e026674543386bb2a4d176da245b9 && \
+    git apply /tmp/comfyui_seedvr2_xpu.patch && \
+    pip install -r requirements.txt && \
 # Install Xinference
     pip install "xinference[transformers]==1.15.0" && \
     patch /usr/local/lib/python3.12/dist-packages/xinference/device_utils.py < /tmp/xinference_device_utils.patch && \
@@ -172,7 +179,8 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     mv comfyui-voxcpm comfyui-voxcpm.disabled && \
     mv ComfyUI_IndexTTS ComfyUI_IndexTTS.disabled && \
     mv ComfyUI-Hunyuan3d-2-1 ComfyUI-Hunyuan3d-2-1.disabled && \
-    mv ComfyUI-HY-Motion1 ComfyUI-HY-Motion1.disabled
+    mv ComfyUI-HY-Motion1 ComfyUI-HY-Motion1.disabled && \
+    mv ComfyUI-SeedVR2_VideoUpscaler ComfyUI-SeedVR2_VideoUpscaler.disabled
 
 COPY ./workflows/* /llm/ComfyUI/user/default/workflows/
 COPY ./example_inputs/* /llm/ComfyUI/input/

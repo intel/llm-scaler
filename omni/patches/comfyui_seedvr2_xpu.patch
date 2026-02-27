@@ -1,0 +1,20 @@
+diff --git a/requirements.txt b/requirements.txt
+index 73d2db0..bf2a5fc 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,14 +1 @@
+-torch
+-torchvision
+-safetensors
+-numpy
+-tqdm
+-psutil
+-einops
+-omegaconf>=2.3.0
+-diffusers>=0.33.1
+-peft>=0.17.0
+ rotary_embedding_torch>=0.5.3
+-opencv-python
+-gguf
+-matplotlib
+\ No newline at end of file

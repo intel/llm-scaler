@@ -91,6 +91,7 @@ The following models are supported in ComfyUI workflows. For detailed model file
 | **Video Generation** | LTX-2 T2V 19B, LTX-2 I2V 19B, | Text-to-Video, Image-to-Video | `video_ltx2_19B_t2v.json`, `video_ltx2_19B_i2v.json`, `video_ltx_2_19B_t2v_distilled.json`, `video_ltx_2_19B_i2v_distilled.json` |
 | **3D Generation** | Hunyuan3D 2.1 | Text/Image-to-3D | `3d_hunyuan3d.json` |
 | **Audio Generation** | VoxCPM1.5, IndexTTS 2 | Text-to-Speech, Voice Cloning | `audio_VoxCPM_example.json`, `audio_indextts2.json` |
+| **Video Upscaling** | SeedVR2 | Video Restoration and Upscaling | `video_upscale_SeedVR2.json` |
 
 ### Enabling Optional Nodes
 
@@ -254,6 +255,20 @@ ComfyUI tutorial: https://blog.comfy.org/p/ltx-2-open-source-audio-video-ai
 - **3d_hunyuan3d.json**: Text/Image-to-3D mesh generation
 
 This workflow generates 3D models from text descriptions or images using the Hunyuan3D model.
+
+#### Video Upscaling Workflows
+
+> **📖 Detailed Documentation**: For model configuration details, see [Video Upscale Models](./docs/ComfyUI_Guide.md#video-upscale-models).
+
+##### SeedVR2
+
+GitHub: https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler
+
+**Available Workflows:**
+- **video_upscale_SeedVR2.json**: Video restoration and upscaling workflow
+
+This workflow uses SeedVR2, a diffusion-based video super-resolution model, to upscale and restore video quality.
+
 
 #### Audio Generation Workflows
 

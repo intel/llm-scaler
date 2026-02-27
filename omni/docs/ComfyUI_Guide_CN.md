@@ -13,7 +13,8 @@
 5. [视频生成模型](#视频生成模型)
 6. [3D 生成模型](#3d-生成模型)
 7. [音频生成模型](#音频生成模型)
-8. [常见问题](#常见问题)
+8. [视频超分模型](#视频超分模型)
+9. [常见问题](#常见问题)
 
 ---
 
@@ -741,6 +742,26 @@ TTS/
 | 工作流 | 说明 |
 |--------|------|
 | `audio_indextts2.json` | 声音克隆 |
+
+---
+
+## 视频超分模型
+
+### SeedVR2
+
+SeedVR2 是一个基于扩散模型的视频超分辨率模型，可对视频进行修复和超清放大。
+
+#### 模型存放位置
+
+```text
+📂 ComfyUI/
+└── 📂 models/
+    └── 📂 SEEDVR2/
+        ├── seedvr2_ema_3b_fp8_e4m3fn.safetensors  （DiT）
+        └── ema_vae_fp16.safetensors               （VAE）
+```
+
+> 模型**首次使用时自动下载**。也可手动从 [numz/SeedVR2_comfyUI](https://huggingface.co/numz/SeedVR2_comfyUI) 和 [AInVFX/SeedVR2_comfyUI](https://huggingface.co/AInVFX/SeedVR2_comfyUI) 下载。
 
 ---
 
