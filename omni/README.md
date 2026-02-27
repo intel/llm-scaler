@@ -95,7 +95,7 @@ The following models are supported in ComfyUI workflows. For detailed model file
 
 ### Enabling Optional Nodes
 
-Some nodes are disabled by default to save resources. To use **Hunyuan3D**, **VoxCPM**, **IndexTTS**, or **HY-Motion1**, you can enable them using **ComfyUI Manager**:
+Some nodes are disabled by default to save resources. To use **SeedVR2**, **Hunyuan3D**, **VoxCPM**, **IndexTTS**, or **HY-Motion1**, you can enable them using **ComfyUI Manager**:
 
 1. Click the **Manager** button in the ComfyUI menu.
 2. In the Manager window, use the **Filter** dropdown to select **Disabled**.
@@ -103,6 +103,36 @@ Some nodes are disabled by default to save resources. To use **Hunyuan3D**, **Vo
 4. Restart ComfyUI and refresh the page to apply changes.
 
 ![comfyui_manager_enable](./assets/comfyui_manager_enable.png)
+
+### Cache-DiT & torch.compile Acceleration
+
+[Cache-DiT](https://github.com/vipshop/cache-dit) accelerates diffusion model inference by caching and reusing intermediate DiT block outputs across denoising steps, skipping redundant computation without retraining. Combined with `torch.compile`, it provides further speedup through graph-level kernel fusion. The ComfyUI integration is powered by [ComfyUI-CacheDiT](https://github.com/Jasonzzt/ComfyUI-CacheDiT).
+
+The table below shows a comparison on **Z-Image-Turbo** across three configurations:
+
+| No Acceleration | Cache-DiT | Cache-DiT + torch.compile |
+|:-:|:-:|:-:|
+| <img width="280" src="./assets/comfyui_z_image_turbo_without_anything.png"> | <img width="280" src="./assets/comfyui_z_image_turbo_with_cachedit.png"> | <img width="280" src="./assets/comfyui_z_image_turbo_with_cachedit&torch_compile.png"> |
+| Baseline | ~1.5x speedup | ~2.2x speedup |
+
+#### Usage in ComfyUI
+
+Insert the acceleration node(s) **between** the model loader and the sampler.
+
+**Cache-DiT only** — add `⚡ CacheDit Accelerator` after the model loader:
+
+![cachedit_workflow](./assets/comfyui_cachedit_node.png)
+
+**Cache-DiT + torch.compile** — chain `TorchCompileModel` after `⚡ CacheDit Accelerator`:
+
+![cachedit_compile_workflow](./assets/comfyui_cachedit&torch_compile_node.png)
+
+> **Note:** Cache-DiT is best suited for high step-count workflows (≥ 8 steps). `torch.compile` incurs a one-time warm-up cost on the first run.
+
+#### Cache-DiT Supported Models
+- Z-Image, Z-Image-Turbo, Qwen-Image-2512, Flux.2 Klein 4B, Flux.2 Klein 9B
+- LTX-2 T2V, LTX-2 I2V, WAN2.2 14B T2V, WAN2.2 14B I2V
+
 
 ### ComfyUI Workflows
 
