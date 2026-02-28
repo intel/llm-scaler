@@ -113,7 +113,7 @@ The table below shows a comparison on **Z-Image-Turbo** across three configurati
 | No Acceleration | Cache-DiT | torch.compile | Cache-DiT + torch.compile |
 |:-:|:-:|:-:|:-:|
 | <img height="200" src="./assets/comfyui_z_image_turbo_without_anything.png"> | <img height="200" src="./assets/comfyui_z_image_turbo_with_cachedit.png"> | <img height="200" src="./assets/comfyui_z_image_turbo_with_torch_compile.png"> | <img height="200" src="./assets/comfyui_z_image_turbo_with_cachedit&torch_compile.png"> |
-| Baseline | ~1.5x speedup | ~1.6x speedup | ~2.2x speedup |
+| Baseline | ~1.5x speedup | ~1.45x speedup | ~2.2x speedup |
 
 #### Usage in ComfyUI
 
