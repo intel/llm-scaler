@@ -1193,6 +1193,18 @@ export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 
 ## 5. Performance tuning
 
+### 5.1 Avoid Memory Fragmentation
+
+To avoid GPU memory fragmentation (which can lead to out-of-memory errors even when sufficient memory appears available), enable PyTorch's expandable segments feature:
+
+```bash
+export PYTORCH_ALLOC_CONF="expandable_segments:True"
+```
+
+Set this environment variable **before** launching the vLLM service. This allows PyTorch's memory allocator to use expandable segments instead of fixed-size blocks, significantly reducing fragmentation over long-running sessions.
+
+### 5.2 CPU Affinity (NUMA Binding)
+
 To improve performance, you can optimize CPU affinity based on the GPU–NUMA topology.
 
 For example, if your process uses two GPUs that are both connected to NUMA node 0, you can use lscpu to identify the CPU cores associated with that NUMA node:
