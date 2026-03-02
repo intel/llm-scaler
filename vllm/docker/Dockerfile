@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ======== Base Stage ========
-FROM vllm-platform:26.13.7.1 AS vllm-base
+FROM intel/llm-scaler-platform::26.13.7.1 AS vllm-base
 
 ARG https_proxy
 ARG http_proxy
