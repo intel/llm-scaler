@@ -2,11 +2,24 @@
 
 ## LLM-Scaler-vLLM
 
-### Latest Production Release 1.3
+### Latest Beta Release 0.14.0-b8
+* `intel/llm-scaler-vllm:0.14.0-b8` [3/2/2026]: 
+    - Upgrade: vLLM upgrade to 0.14.0, Pytorch upgrade to 2.10. oneAPI uplifted to 2025.3.2(hotfix) with LTS support on UR adaptor v2. Oneccl upgrade to 2021.15.7.8.
+    - Int4 onednn optimizations are included and up to 25% throughput improvement is achieved VS last release.
+    - G31 validation has been added in this release and all models are functional. The key models' performance is measured on a non-golden setup B70 system (limited perf for allreduce with small message size), compare with G21: 1.49x geomean under SLA constraints and 1.13x geomean at fixed batch size. The throughput should be better on system with golden BKC setup.
+    - Bug fixes.
+    - Added support for Qwen3-VL-Reranker-2B/8B
+    - Added support for Qwen3-VL-Embedding-2B/8B
+    - Added support for GLM-4.7-Flash
+    - Added support for Ministral models
+    - Added support for DeepSeek-OCR-2
+    - Added support for Qwen3-Coder-Next
+    - Fix InternVL issue
+
+### Previous Releases
 * `intel/llm-scaler-vllm:1.3` [1/30/2026]: 
     - Same image as intel/llm-scaler-vllm:0.11.1-b7
 
-### Previous Releases
 * `intel/llm-scaler-vllm:0.11.1-b7` [1/16/2026]:
     - Upgrade: vLLM upgrade to 0.11.1, Pytorch upgrade to 2.9.  oneAPI upgrade to 2025.2.2(hotfix), oneccl upgrade to 2021.15.7.6.
     - 8 New models supported: Qwen3-Next-80B-A3B-Instruct, Qwen3-Next-80B-A3B-Thinking, InternVL3.5-30B-A3B, DeepSeek-OCR,PaddleOCR-VL, Seed-OSS-36B-Instruct, Qwen3-30B-A3B-Instruct-2507 and openai/whisper-large-v3.
