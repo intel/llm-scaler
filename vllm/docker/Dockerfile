@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ======== Base Stage ========
-FROM intel/llm-scaler-platform:26.5.6.1 AS vllm-base
+FROM vllm-platform:26.13.7.1 AS vllm-base
 
 ARG https_proxy
 ARG http_proxy
@@ -54,7 +54,7 @@ RUN python3 -m pip config set global.break-system-packages true
 
 # Clone + patch vllm
 RUN --mount=type=cache,target=/root/.cache/pip \
-    git clone -b v0.11.1 https://github.com/vllm-project/vllm.git && \
+    git clone -b v0.14.0 https://github.com/vllm-project/vllm.git && \
     cd vllm && \
     git apply /tmp/vllm_for_multi_arc.patch && \
     pip install -r requirements/xpu.txt && \
@@ -100,8 +100,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Pin transformers version to avoid conflict in vLLM
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "transformers==4.57.3" && \
+    # pip install "transformers==4.57.3" && \
     pip install librosa soundfile decord
+
+# FIX triton
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip uninstall triton triton-xpu -y && \
+    pip install triton-xpu==3.6.0 --extra-index-url=https://download.pytorch.org/whl/test/xpu
 
 
 # Set additional environment for production usage
@@ -116,26 +121,9 @@ RUN cd /llm/vllm && \
     
 RUN pip uninstall oneccl oneccl-devel -y
 
-ENV TBBROOT=/opt/intel/oneapi/tbb/2022.2/env/.. \
-    CCL_ROOT=/opt/intel/oneapi/ccl/2021.15.7-down.1 \
-    CMPLR_ROOT=/opt/intel/oneapi/compiler/2025.2 \
-    MKLROOT=/opt/intel/oneapi/mkl/2025.2 \
-    DPL_ROOT=/opt/intel/oneapi/dpl/2022.9 \
-    DNNLROOT=/opt/intel/oneapi/dnnl/2025.2 \
-    I_MPI_ROOT=/opt/intel/oneapi/mpi/2021.16
+RUN rm /usr/lib/python3/dist-packages/PyJWT-2.7.0.dist-info/ -rf
 
+RUN echo "source /opt/intel/oneapi/setvars.sh --force" >> /root/.bashrc
 
-ENV PKG_CONFIG_PATH=/opt/intel/oneapi/tbb/2022.2/env/../lib/pkgconfig:/opt/intel/oneapi/mpi/2021.16/lib/pkgconfig:/opt/intel/oneapi/mkl/2025.2/lib/pkgconfig:/opt/intel/oneapi/dpl/2022.9/lib/pkgconfig:/opt/intel/oneapi/dnnl/2025.2/lib/pkgconfig:/opt/intel/oneapi/compiler/2025.2/lib/pkgconfig:/opt/intel/oneapi/ccl/2021.15.7-down.1/lib/pkgconfig/
-
-ENV CMAKE_PREFIX_PATH=/opt/intel/oneapi/tbb/2022.2/env/..:/opt/intel/oneapi/pti/0.13/lib/cmake/pti:/opt/intel/oneapi/mkl/2025.2/lib/cmake:/opt/intel/oneapi/dpl/2022.9/lib/cmake/oneDPL:/opt/intel/oneapi/dnnl/2025.2/lib/cmake:/opt/intel/oneapi/compiler/2025.2:/opt/intel/oneapi/ccl/2021.15.7-down.1/lib/cmake/oneCCL
-
-ENV LIBRARY_PATH=/opt/intel/oneapi/tcm/1.4/lib:/opt/intel/oneapi/umf/0.11/lib:/opt/intel/oneapi/tbb/2022.2/env/../lib/intel64/gcc4.8:/opt/intel/oneapi/pti/0.13/lib:/opt/intel/oneapi/mpi/2021.16/lib:/opt/intel/oneapi/mkl/2025.2/lib:/opt/intel/oneapi/dnnl/2025.2/lib:/opt/intel/oneapi/compiler/2025.2/lib:/opt/intel/oneapi/ccl/2021.15.7-down.1/lib
-
-ENV LD_LIBRARY_PATH=/opt/intel/oneapi/tcm/1.4/lib:/opt/intel/oneapi/umf/0.11/lib:/opt/intel/oneapi/tbb/2022.2/env/../lib/intel64/gcc4.8:/opt/intel/oneapi/pti/0.13/lib:/opt/intel/oneapi/mpi/2021.16/opt/mpi/libfabric/lib:/opt/intel/oneapi/mpi/2021.16/lib:/opt/intel/oneapi/mkl/2025.2/lib:/opt/intel/oneapi/dnnl/2025.2/lib:/opt/intel/oneapi/debugger/2025.2/opt/debugger/lib:/opt/intel/oneapi/compiler/2025.2/opt/compiler/lib:/opt/intel/oneapi/compiler/2025.2/lib:/opt/intel/oneapi/ccl/2021.15.7-down.1/lib:/usr/local/lib/
-
-ENV CPLUS_INCLUDE_PATH=/opt/intel/oneapi/umf/0.11/include:/opt/intel/oneapi/tbb/2022.2/env/../include:/opt/intel/oneapi/pti/0.13/include:/opt/intel/oneapi/mpi/2021.16/include:/opt/intel/oneapi/mkl/2025.2/include:/opt/intel/oneapi/dpl/2022.9/include:/opt/intel/oneapi/dpcpp-ct/2025.2/include
-ENV CPATH=/opt/intel/oneapi/umf/0.11/include:/opt/intel/oneapi/mkl/2025.2/include:/opt/intel/oneapi/dnnl/2025.2/include:/opt/intel/oneapi/dev-utilities/2025.2/include:/opt/intel/oneapi/ccl/2021.15.7-down.1/include
-
-# ENTRYPOINT ["bash", "-c", "source /opt/intel/oneapi/setvars.sh --force && python3 -m vllm.entrypoints.openai.api_server"]
 ENTRYPOINT ["bash", "-c", "vllm serve"]
 
