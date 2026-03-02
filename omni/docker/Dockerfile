@@ -106,6 +106,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     git clone https://github.com/billwuhao/ComfyUI_IndexTTS.git && \
     cd ComfyUI_IndexTTS && \
     pip install -r requirements.txt && \
+    pip install torchcodec==0.9.0 && \
     cd /llm/ComfyUI/custom_nodes && \
     git clone https://github.com/kijai/ComfyUI-KJNodes.git && \
     cd ComfyUI-KJNodes && \
