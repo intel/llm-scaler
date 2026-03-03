@@ -306,6 +306,15 @@ GitHub: https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler
 
 This workflow uses SeedVR2, a diffusion-based video super-resolution model, to upscale and restore video quality.
 
+##### FlashVSR
+
+GitHub: https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast
+
+**Available Workflows:**
+- **video_upscale_FlashVSR.json**: Video restoration and upscaling workflow
+
+This workflow uses FlashVSR-v1.1, a diffusion-based video super-resolution model, to upscale and restore video quality.
+
 
 #### Audio Generation Workflows
 
