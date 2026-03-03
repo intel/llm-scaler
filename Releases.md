@@ -6,7 +6,6 @@
 * `intel/llm-scaler-vllm:0.14.0-b8` [3/2/2026]: 
     - Upgrade: vLLM upgrade to 0.14.0, Pytorch upgrade to 2.10. oneAPI uplifted to 2025.3.2(hotfix) with LTS support on UR adaptor v2. Oneccl upgrade to 2021.15.7.8.
     - Int4 onednn optimizations are included and up to 25% throughput improvement is achieved VS last release.
-    - G31 validation has been added in this release and all models are functional. The key models' performance is measured on a non-golden setup B70 system (limited perf for allreduce with small message size), compare with G21: 1.49x geomean under SLA constraints and 1.13x geomean at fixed batch size. The throughput should be better on system with golden BKC setup.
     - Bug fixes.
     - Added support for Qwen3-VL-Reranker-2B/8B
     - Added support for Qwen3-VL-Embedding-2B/8B
