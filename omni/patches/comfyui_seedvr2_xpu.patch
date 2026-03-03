@@ -159,10 +159,22 @@ index 159ca2d..5962f1c 100644
                  if sample.dtype != torch.float32:
                      src_dtype = sample.dtype
 diff --git a/src/optimization/compatibility.py b/src/optimization/compatibility.py
-index c462022..b15b029 100644
+index c462022..a3c4a6e 100644
 --- a/src/optimization/compatibility.py
 +++ b/src/optimization/compatibility.py
-@@ -760,6 +760,12 @@ class CompatibleDiT(torch.nn.Module):
+@@ -660,7 +660,10 @@ if not os.environ.get("SEEDVR2_OPTIMIZATIONS_LOGGED"):
+         print("💡 For best performance: pip install sageattention flash-attn triton")
+     else:
+         icon = "⚡" if num_available >= 2 else "⚠️ "
+-        print(f"{icon} SeedVR2 optimizations check: SageAttention {sage_status} | Flash Attention {flash_status} | Triton {triton_status}")
++        if torch.xpu.is_available():
++            print(f"⚡ SeedVR2 optimizations check: Triton {triton_status}")
++        else:
++            print(f"{icon} SeedVR2 optimizations check: SageAttention {sage_status} | Flash Attention {flash_status} | Triton {triton_status}")
+         
+         # Build install suggestions for missing packages
+         missing = []
+@@ -760,6 +763,12 @@ class CompatibleDiT(torch.nn.Module):
                  self.debug.start_timer("_force_nadit_precision")
                  self._force_nadit_precision(target_dtype=self.compute_dtype)
                  self.debug.end_timer("_force_nadit_precision", "NaDiT parameters/buffers conversion")
@@ -175,7 +187,7 @@ index c462022..b15b029 100644
              
          # Apply RoPE stabilization for numerical stability
          self.debug.log(f"Stabilizing RoPE computations for numerical stability", category="setup")
-@@ -798,6 +804,8 @@ class CompatibleDiT(torch.nn.Module):
+@@ -798,6 +807,8 @@ class CompatibleDiT(torch.nn.Module):
                      if module.rope.freqs.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
                          if module.rope.freqs.device.type == "mps":
                              module.rope.freqs.data = module.rope.freqs.to("cpu").to(target_dtype).to("mps")
@@ -184,7 +196,7 @@ index c462022..b15b029 100644
                          else:
                              module.rope.freqs.data = module.rope.freqs.to(target_dtype)
                          converted += 1
-@@ -823,6 +831,11 @@ class CompatibleDiT(torch.nn.Module):
+@@ -823,6 +834,11 @@ class CompatibleDiT(torch.nn.Module):
                      temp_converted = temp_cpu.to(target_dtype)
                      param.data = temp_converted.to("mps")
                      del temp_cpu, temp_converted
@@ -196,7 +208,7 @@ index c462022..b15b029 100644
                  else:
                      param.data = param.data.to(target_dtype)
                  converted_count += 1
-@@ -838,6 +851,11 @@ class CompatibleDiT(torch.nn.Module):
+@@ -838,6 +854,11 @@ class CompatibleDiT(torch.nn.Module):
                      temp_converted = temp_cpu.to(target_dtype)
                      buffer.data = temp_converted.to("mps")
                      del temp_cpu, temp_converted
