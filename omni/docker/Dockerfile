@@ -19,6 +19,9 @@ COPY ./patches/sglang_diffusion_for_multi_arc.patch /tmp/
 COPY ./patches/comfyui_hy_motion1.patch /tmp/
 COPY ./patches/comfyui_gguf_xpu.patch /tmp/
 COPY ./omni_xpu_kernel /tmp/omni_xpu_kernel
+COPY ./patches/comfyui_indextts.patch /tmp/
+COPY ./patches/comfyui_flashvsr_ultra_fast_xpu.patch /tmp/
+COPY ./patches/comfyui_seedvr2_xpu.patch /tmp/
 
 
 
