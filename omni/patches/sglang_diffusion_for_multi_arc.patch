@@ -1,130 +1,79 @@
-diff --git a/local_install.sh b/local_install.sh
-new file mode 100644
-index 000000000..f807cd600
---- /dev/null
-+++ b/local_install.sh
-@@ -0,0 +1,5 @@
-+export http_proxy=http://proxy.iil.intel.com:911
-+export https_proxy=http://proxy.iil.intel.com:911
-+export no_proxy=localhost,127.0.0.1,10.240.203.53
-+
-+pip install -e "python[diffusion]" --no-deps 
-diff --git a/python/pyproject.toml b/python/pyproject.toml
-index 016be10c0..aa4192225 100755
---- a/python/pyproject.toml
-+++ b/python/pyproject.toml
-@@ -62,10 +62,6 @@ dependencies = [
-   "soundfile==0.13.1",
-   "tiktoken",
-   "timm==1.0.16",
--  "torch_memory_saver==0.0.9",
--  "torch==2.9.1",
--  "torchaudio==2.9.1",
--  "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
-   "torchvision",
-   "torchao==0.9.0",
-   "tqdm",
-@@ -91,8 +87,6 @@ diffusion = [
-   "moviepy>=2.0.0",
-   "opencv-python-headless==4.10.0.84",
-   "remote-pdb",
--  "st_attn ==0.0.7",
--  "vsa==0.0.4",
-   "yunchang==0.6.3.post1",
-   "runai_model_streamer",
-   "cache-dit==1.1.8"
-diff --git a/python/sglang/multimodal_gen/csrc/attn/vmoba_attn/vmoba/vmoba.py b/python/sglang/multimodal_gen/csrc/attn/vmoba_attn/vmoba/vmoba.py
-index 8a29360a9..f7c92e60d 100644
---- a/python/sglang/multimodal_gen/csrc/attn/vmoba_attn/vmoba/vmoba.py
-+++ b/python/sglang/multimodal_gen/csrc/attn/vmoba_attn/vmoba/vmoba.py
-@@ -962,21 +962,26 @@ def process_moba_output(
- def generate_data(batch_size, seqlen, num_head, head_dim, dtype):
-     random.seed(0)
-     torch.manual_seed(0)
--    torch.cuda.manual_seed(0)
--    device = torch.cuda.current_device()
-+    # Determine device type
-+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
-+        torch.xpu.manual_seed(0)
-+        device = "xpu"
-+    else:
-+        torch.cuda.manual_seed(0)
-+        device = "cuda"
+diff --git a/python/pyproject_xpu.toml b/python/pyproject_xpu.toml
+index 14d1c0d3d..de95830a5 100644
+--- a/python/pyproject_xpu.toml
++++ b/python/pyproject_xpu.toml
+@@ -73,6 +73,21 @@ dependencies = [
+ ]
  
-     q = torch.randn((batch_size, seqlen, num_head, head_dim), requires_grad=True).to(
--        dtype=dtype, device="cuda"
-+        dtype=dtype, device=device
-     )
-     k = torch.randn((batch_size, seqlen, num_head, head_dim), requires_grad=True).to(
--        dtype=dtype, device="cuda"
-+        dtype=dtype, device=device
-     )
-     v = torch.randn((batch_size, seqlen, num_head, head_dim), requires_grad=True).to(
--        dtype=dtype, device="cuda"
-+        dtype=dtype, device=device
-     )
-     print(f"q.shape: {q.shape}, k.shape: {k.shape}, v.shape: {v.shape}")
-     cu_seqlens = torch.arange(
--        0, q.shape[0] * q.shape[1] + 1, q.shape[1], dtype=torch.int32, device="cuda"
-+        0, q.shape[0] * q.shape[1] + 1, q.shape[1], dtype=torch.int32, device=device
-     )
-     max_seqlen = q.shape[1]
-     q = rearrange(q, "b s ... -> (b s) ...")
-@@ -1017,7 +1022,11 @@ def test_attn_varlen_moba_speed(
-         )
-         torch.autograd.backward(o, vo_grad)
+ [project.optional-dependencies]
++diffusion = [
++  "PyYAML==6.0.1",
++  "cloudpickle",
++  "diffusers==0.36.0",
++  "imageio==2.36.0",
++  "imageio-ffmpeg==0.5.1",
++  "moviepy>=2.0.0",
++  "opencv-python-headless==4.10.0.84",
++  "remote-pdb",
++  "st_attn==0.0.7 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
++  "vsa==0.0.4 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
++  "runai_model_streamer>=0.15.5",
++  "cache-dit==1.2.0",
++  "addict"
++]
+ tracing = [
+   "opentelemetry-sdk",
+   "opentelemetry-api",
+diff --git a/python/sglang/jit_kernel/diffusion/triton/scale_shift.py b/python/sglang/jit_kernel/diffusion/triton/scale_shift.py
+index b3a27b64c..1d7a1ff7f 100644
+--- a/python/sglang/jit_kernel/diffusion/triton/scale_shift.py
++++ b/python/sglang/jit_kernel/diffusion/triton/scale_shift.py
+@@ -224,7 +224,7 @@ def fuse_scale_shift_kernel(
+     block_l: int = 128,
+     block_c: int = 128,
+ ):
+-    assert x.is_cuda and scale.is_cuda
++    assert (x.is_cuda and scale.is_cuda) or (x.is_xpu and scale.is_xpu)
+     assert x.is_contiguous()
  
--    torch.cuda.synchronize()
-+    # Device-agnostic synchronize
-+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
-+        torch.xpu.synchronize()
-+    else:
-+        torch.cuda.synchronize()
-     start_flash = time.perf_counter()
-     for _ in range(perf_test_iters):
-         o = flash_attn_varlen_func(
-@@ -1025,7 +1034,10 @@ def test_attn_varlen_moba_speed(
-         )
-         torch.autograd.backward(o, vo_grad)
+     B, L, C = x.shape
+diff --git a/python/sglang/multimodal_gen/runtime/cache/cache_dit_integration.py b/python/sglang/multimodal_gen/runtime/cache/cache_dit_integration.py
+index e08124881..6a207ab2e 100644
+--- a/python/sglang/multimodal_gen/runtime/cache/cache_dit_integration.py
++++ b/python/sglang/multimodal_gen/runtime/cache/cache_dit_integration.py
+@@ -12,6 +12,7 @@ from typing import List, Optional
+ import torch
+ import torch.distributed as dist
  
--    torch.cuda.synchronize()
-+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
-+        torch.xpu.synchronize()
-+    else:
-+        torch.cuda.synchronize()
-     time_flash = (time.perf_counter() - start_flash) / perf_test_iters * 1000
++from sglang.multimodal_gen.runtime.platforms import current_platform
+ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
  
-     # Warmup
-@@ -1044,7 +1056,10 @@ def test_attn_varlen_moba_speed(
-         )
-         torch.autograd.backward(om, vo_grad)
+ logger = init_logger(__name__)
+@@ -87,8 +88,16 @@ def _patch_cache_dit_similarity():
+             mean_diff = (t1 - t2).abs().mean()
+             mean_t1 = t1.abs().mean()
  
--    torch.cuda.synchronize()
-+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
-+        torch.xpu.synchronize()
-+    else:
-+        torch.cuda.synchronize()
-     start_moba = time.perf_counter()
-     for _ in range(perf_test_iters):
-         om = moba_attn_varlen(
-@@ -1061,7 +1076,10 @@ def test_attn_varlen_moba_speed(
-         )
-         torch.autograd.backward(om, vo_grad)
+-        dist.all_reduce(mean_diff, op=dist.ReduceOp.AVG, group=target_group)
+-        dist.all_reduce(mean_t1, op=dist.ReduceOp.AVG, group=target_group)
++        # Use SUM + divide instead of AVG on XPU, because XCCL in torch 2.9+xpu have issues for AVG
++        if current_platform.is_xpu():
++            world_size = dist.get_world_size(target_group)
++            dist.all_reduce(mean_diff, op=dist.ReduceOp.SUM, group=target_group)
++            dist.all_reduce(mean_t1, op=dist.ReduceOp.SUM, group=target_group)
++            mean_diff = mean_diff / world_size
++            mean_t1 = mean_t1 / world_size
++        else:
++            dist.all_reduce(mean_diff, op=dist.ReduceOp.AVG, group=target_group)
++            dist.all_reduce(mean_t1, op=dist.ReduceOp.AVG, group=target_group)
  
--    torch.cuda.synchronize()
-+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
-+        torch.xpu.synchronize()
-+    else:
-+        torch.cuda.synchronize()
-     time_moba = (time.perf_counter() - start_moba) / perf_test_iters * 1000
- 
-     print(f"Flash: {time_flash:.2f}ms, MoBA: {time_moba:.2f}ms")
+         diff = (mean_diff / mean_t1).item()
+         self.add_residual_diff(diff)
 diff --git a/python/sglang/multimodal_gen/runtime/distributed/device_communicators/xpu_communicator.py b/python/sglang/multimodal_gen/runtime/distributed/device_communicators/xpu_communicator.py
 new file mode 100644
-index 000000000..297734b57
+index 000000000..c00453514
 --- /dev/null
 +++ b/python/sglang/multimodal_gen/runtime/distributed/device_communicators/xpu_communicator.py
-@@ -0,0 +1,359 @@
+@@ -0,0 +1,234 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""
 +Intel XPU Communicator for SGLang Diffusion.
@@ -155,7 +104,7 @@ index 000000000..297734b57
 +class XpuCommunicator(DeviceCommunicatorBase):
 +    """
 +    Communicator for Intel XPU devices using oneCCL backend.
-+    
++
 +    Intel XPU uses the XCCL (Collective Communications Library) backend through
 +    PyTorch's distributed communication interface. Unlike NVIDIA NCCL, XCCL
 +    is directly integrated into PyTorch for XPU devices.
@@ -170,7 +119,7 @@ index 000000000..297734b57
 +    ):
 +        """
 +        Initialize XPU communicator.
-+        
++
 +        Args:
 +            cpu_group: CPU process group for control-plane communication
 +            device: XPU device (e.g., torch.device('xpu:0'))
@@ -178,14 +127,14 @@ index 000000000..297734b57
 +            unique_name: Unique identifier for this communicator
 +        """
 +        super().__init__(cpu_group, device, device_group, unique_name)
-+        
++
 +        # Verify we're on XPU device
 +        if device is not None and device.type != "xpu":
 +            logger.warning(
 +                f"XpuCommunicator initialized with non-XPU device: {device}. "
 +                "This may cause unexpected behavior."
 +            )
-+        
++
 +        # Check if XCCL backend is available
 +        if device_group is not None:
 +            backend = dist.get_backend(device_group)
@@ -204,131 +153,37 @@ index 000000000..297734b57
 +    ) -> torch.Tensor:
 +        """
 +        Perform all-reduce operation on XPU.
-+        
++
 +        Args:
 +            input_: Input tensor to reduce
 +            op: Reduction operation (default: SUM)
-+            
++
 +        Returns:
 +            Reduced tensor (in-place operation)
 +        """
 +        if op is None:
 +            op = ReduceOp.SUM
-+            
++
 +        # Verify tensor is on XPU device
-+        assert input_.device.type == "xpu", (
-+            f"Input tensor must be on XPU device, got: {input_.device}"
-+        )
-+        
++        assert (
++            input_.device.type == "xpu"
++        ), f"Input tensor must be on XPU device, got: {input_.device}"
++
 +        # Perform all-reduce using device group
 +        dist.all_reduce(input_, op=op, group=self.device_group)
 +        return input_
 +
-+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-+        """
-+        Perform all-gather operation on XPU.
-+        
-+        Args:
-+            input_: Input tensor to gather
-+            dim: Dimension along which to concatenate gathered tensors
-+            
-+        Returns:
-+            Concatenated tensor from all ranks
-+        """
-+        assert -input_.dim() <= dim < input_.dim(), (
-+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-+        )
-+        if dim < 0:
-+            # Convert negative dim to positive
-+            dim += input_.dim()
-+        
-+        input_size = input_.size()
-+        
-+        # Allocate output tensor
-+        output_tensor = torch.empty(
-+            (self.world_size,) + input_size, 
-+            dtype=input_.dtype, 
-+            device=input_.device
-+        )
-+        
-+        # All-gather into tensor
-+        dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
-+        
-+        # Reshape to concatenate along specified dimension
-+        output_tensor = output_tensor.movedim(0, dim)
-+        output_tensor = output_tensor.reshape(
-+            input_size[:dim]
-+            + (self.world_size * input_size[dim],)
-+            + input_size[dim + 1:]
-+        )
-+        
-+        return output_tensor
-+
-+    def gather(
-+        self, input_: torch.Tensor, dst: int = 0, dim: int = -1
-+    ) -> torch.Tensor | None:
-+        """
-+        Gather tensors from all ranks to a destination rank.
-+        
-+        Args:
-+            input_: Input tensor to gather
-+            dst: Destination rank (local rank within group)
-+            dim: Dimension along which to concatenate
-+            
-+        Returns:
-+            Gathered tensor at destination rank, None at other ranks
-+        """
-+        assert -input_.dim() <= dim < input_.dim(), (
-+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-+        )
-+        if dim < 0:
-+            dim += input_.dim()
-+        
-+        # XPU gather implementation using all_gather
-+        # (similar to vLLM's approach due to potential issues with direct gather)
-+        input_size = input_.size()
-+        output_tensor = torch.empty(
-+            (self.world_size,) + input_size,
-+            dtype=input_.dtype,
-+            device=input_.device
-+        )
-+        
-+        # All-gather
-+        dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
-+        
-+        if self.rank_in_group == dst:
-+            # Reshape and return at destination
-+            output_tensor = output_tensor.movedim(0, dim)
-+            output_tensor = output_tensor.reshape(
-+                input_size[:dim]
-+                + (self.world_size * input_size[dim],)
-+                + input_size[dim + 1:]
-+            )
-+            return output_tensor
-+        else:
-+            return None
-+
-+    def broadcast(self, input_: torch.Tensor, src: int = 0) -> None:
-+        """
-+        Broadcast tensor from source rank to all ranks.
-+        
-+        Args:
-+            input_: Tensor to broadcast (modified in-place)
-+            src: Source rank (local rank within group)
-+        """
-+        dist.broadcast(input_, src=self.ranks[src], group=self.device_group)
-+
 +    def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
 +        """
 +        Send tensor to destination rank (point-to-point communication).
-+        
++
 +        Args:
 +            tensor: Tensor to send
 +            dst: Destination rank (local rank, defaults to next rank)
 +        """
 +        if dst is None:
 +            dst = (self.rank_in_group + 1) % self.world_size
-+        
++
 +        dist.send(tensor, dst=self.ranks[dst], group=self.device_group)
 +
 +    def recv(
@@ -336,51 +191,20 @@ index 000000000..297734b57
 +    ) -> torch.Tensor:
 +        """
 +        Receive tensor from source rank (point-to-point communication).
-+        
++
 +        Args:
 +            size: Shape of tensor to receive
 +            dtype: Data type of tensor to receive
 +            src: Source rank (local rank, defaults to previous rank)
-+            
++
 +        Returns:
 +            Received tensor
 +        """
 +        if src is None:
 +            src = (self.rank_in_group - 1) % self.world_size
-+        
++
 +        tensor = torch.empty(size, dtype=dtype, device=self.device)
 +        dist.recv(tensor, src=self.ranks[src], group=self.device_group)
-+        return tensor
-+
-+    def barrier(self) -> None:
-+        """
-+        Synchronization barrier across all ranks.
-+        """
-+        dist.barrier(group=self.device_group)
-+
-+    def destroy(self) -> None:
-+        """
-+        Cleanup communicator resources.
-+        
-+        Note: For XPU with PyTorch distributed, cleanup is handled
-+        automatically by PyTorch's process group management.
-+        """
-+        logger.info(
-+            f"XpuCommunicator destroyed for rank {self.rank} "
-+            f"(unique_name: {self.unique_name})"
-+        )
-+        # No explicit cleanup needed for PyTorch XCCL backend
-+        pass
-+
-+    def _maybe_wait(self, tensor: torch.Tensor) -> torch.Tensor:
-+        """
-+        Wait for async tensor if needed.
-+        
-+        When using functional collectives, the result may be an AsyncCollectiveTensor.
-+        This method waits for the operation to complete.
-+        """
-+        if isinstance(tensor, ft_c.AsyncCollectiveTensor):
-+            return tensor.wait()
 +        return tensor
 +
 +    def all_to_all_4D(
@@ -388,22 +212,22 @@ index 000000000..297734b57
 +    ) -> torch.Tensor:
 +        """
 +        Perform all-to-all operation on 4D tensors for XPU.
-+        
++
 +        This implementation uses torch.distributed._functional_collectives.all_to_all_single
 +        instead of torch.distributed.all_to_all_single because the latter has a known bug
 +        on Intel XPU with XCCL backend that causes data corruption.
-+        
++
 +        This operation is used for redistributing attention heads and sequence dimensions
 +        in distributed attention computation (e.g., Ulysses attention).
-+        
++
 +        Args:
 +            input_: 4D input tensor [B, S, H, D] or similar
 +            scatter_dim: Dimension to scatter (default: 2, heads)
 +            gather_dim: Dimension to gather (default: 1, sequence)
-+            
++
 +        Returns:
 +            Redistributed tensor
-+            
++
 +        Supported modes:
 +        - scatter_dim=2, gather_dim=1: Redistribute heads, used for forward pass
 +          [B, shard_S, H, D] -> [B, S, shard_H, D]
@@ -413,9 +237,9 @@ index 000000000..297734b57
 +        if self.world_size == 1:
 +            return input_
 +
-+        assert input_.dim() == 4, (
-+            f"input must be 4D tensor, got {input_.dim()} with shape {input_.shape}"
-+        )
++        assert (
++            input_.dim() == 4
++        ), f"input must be 4D tensor, got {input_.dim()} with shape {input_.shape}"
 +
 +        if scatter_dim == 2 and gather_dim == 1:
 +            # Forward pass: scatter heads, gather sequence
@@ -425,7 +249,7 @@ index 000000000..297734b57
 +
 +            # Transpose to [H, shard_seqlen, B, D] for all-to-all
 +            input_t = input_.transpose(0, 2).contiguous()
-+            
++
 +            # Use ft_c.all_to_all_single instead of dist.all_to_all_single
 +            # to avoid XCCL data corruption bug
 +            input_shape = input_t.shape
@@ -433,14 +257,14 @@ index 000000000..297734b57
 +                input_t.flatten(),
 +                output_split_sizes=None,
 +                input_split_sizes=None,
-+                group=self.device_group
++                group=self.device_group,
 +            )
 +            output = self._maybe_wait(output)
 +            output = output.reshape(input_shape)
 +
 +            # Split and concatenate: [H, shard_seqlen, B, D] -> [shard_H, seqlen, B, D]
 +            output = torch.cat(output.split(shard_hn), dim=1)
-+            
++
 +            # Transpose back to [B, seqlen, shard_H, D]
 +            output = output.transpose(0, 2).contiguous()
 +
@@ -469,7 +293,7 @@ index 000000000..297734b57
 +                input_t.flatten(),
 +                output_split_sizes=None,
 +                input_split_sizes=None,
-+                group=self.device_group
++                group=self.device_group,
 +            )
 +            output = self._maybe_wait(output)
 +            output = output.reshape(input_shape)
@@ -485,30 +309,10 @@ index 000000000..297734b57
 +                f"Only (scatter_dim=2, gather_dim=1) and (scatter_dim=1, gather_dim=2) are supported."
 +            )
 diff --git a/python/sglang/multimodal_gen/runtime/distributed/group_coordinator.py b/python/sglang/multimodal_gen/runtime/distributed/group_coordinator.py
-index d9915fd8c..f30f8be5e 100644
+index cabd056ff..dca718edf 100644
 --- a/python/sglang/multimodal_gen/runtime/distributed/group_coordinator.py
 +++ b/python/sglang/multimodal_gen/runtime/distributed/group_coordinator.py
-@@ -46,11 +46,14 @@ _group_name_counter: dict[str, int] = {}
- def get_local_torch_device() -> torch.device:
-     """Return the torch device for the current rank."""
- 
--    return (
--        torch.device(f"cuda:{envs.LOCAL_RANK}")
--        if current_platform.is_cuda_alike()
--        else torch.device("mps")
--    )
-+    if current_platform.is_cuda() or current_platform.is_rocm():
-+        return torch.device(f"cuda:{envs.LOCAL_RANK}")
-+    elif current_platform.is_xpu():
-+        return torch.device(f"xpu:{envs.LOCAL_RANK}")
-+    elif current_platform.is_mps():
-+        return torch.device("mps")
-+    else:
-+        return torch.device("cpu")
- 
- 
- def _get_unique_name(name: str) -> str:
-@@ -208,6 +211,20 @@ class GroupCoordinator:
+@@ -201,6 +201,20 @@ class GroupCoordinator:
                      device_group=self.device_group,
                      unique_name=self.unique_name,
                  )
@@ -529,16 +333,7 @@ index d9915fd8c..f30f8be5e 100644
              else:
                  # For MPS and CPU, use the CPU communicator
                  self.device_communicator = CpuCommunicator(
-@@ -290,7 +307,7 @@ class GroupCoordinator:
-         # Platform-aware graph capture
-         from sglang.multimodal_gen.runtime.platforms import current_platform
- 
--        if current_platform.is_cuda_alike():
-+        if current_platform.is_cuda() or current_platform.is_rocm():
-             if graph_capture_context is None:
-                 stream = torch.cuda.Stream()
-                 graph_capture_context = GraphCaptureContext(stream)
-@@ -305,6 +322,22 @@ class GroupCoordinator:
+@@ -295,6 +309,22 @@ class GroupCoordinator:
  
              with torch.cuda.stream(stream):
                  yield graph_capture_context
@@ -562,10 +357,10 @@ index d9915fd8c..f30f8be5e 100644
              # For non-CUDA platforms (MPS, CPU), just yield the context without stream management
              if graph_capture_context is None:
 diff --git a/python/sglang/multimodal_gen/runtime/distributed/parallel_state.py b/python/sglang/multimodal_gen/runtime/distributed/parallel_state.py
-index adbabaec9..7a4ced5b3 100644
+index 147cf1444..e1db7c48b 100644
 --- a/python/sglang/multimodal_gen/runtime/distributed/parallel_state.py
 +++ b/python/sglang/multimodal_gen/runtime/distributed/parallel_state.py
-@@ -223,10 +223,15 @@ def init_distributed_environment(
+@@ -225,10 +225,17 @@ def init_distributed_environment(
      # Determine the appropriate backend based on the platform
      from sglang.multimodal_gen.runtime.platforms import current_platform
  
@@ -581,25 +376,35 @@ index adbabaec9..7a4ced5b3 100644
 +        elif not current_platform.is_cuda_alike():
 +            # Use gloo backend for non-CUDA platforms (MPS, CPU)
 +            backend = "gloo"
-+            logger.info("Using gloo backend for %s platform", current_platform.device_name)
++            logger.info(
++                "Using gloo backend for %s platform", current_platform.device_name
++            )
  
      logger.debug(
-         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
-@@ -243,7 +248,20 @@ def init_distributed_environment(
+         "world_size=%d rank=%d local_rank=%d "
+@@ -246,22 +253,27 @@ def init_distributed_environment(
+             "distributed environment"
          )
  
-         # For MPS, don't pass device_id as it doesn't support device indices
--        extra_args = {} if current_platform.is_mps() else dict(device_id=device_id)
-+        # For Gloo backend (CPU-only), don't pass device_id to avoid device association errors
-+        # For XPU with XCCL backend, don't pass device_id to avoid issues when creating
-+        # subsequent Gloo CPU groups (PyTorch will check the global process group's device)
-+        extra_args = {}
-+        if (not current_platform.is_mps() 
-+            and backend not in ["gloo", "xccl"]
-+            and not current_platform.is_xpu()):
-+            # Only pass device_id for CUDA/ROCm with NCCL backend
-+            extra_args = dict(device_id=device_id)
-+
+-        # For MPS and MUSA, don't pass device_id as it doesn't support device indices
++        # For MPS, MUSA, NPU, and XPU (with XCCL backend), don't pass device_id
++        # as it doesn't support device indices or causes issues with subsequent groups
+         extra_args = (
+             {}
+             if (
+                 current_platform.is_mps()
+                 or current_platform.is_musa()
+                 or current_platform.is_npu()
++                or current_platform.is_xpu()
+             )
+             else dict(device_id=device_id)
+         )
+ 
+         if timeout is not None:
+-
+             extra_args["timeout"] = datetime.timedelta(seconds=timeout)
+             logger.info(f"Setting distributed timeout to {timeout} seconds")
+ 
 +        # Set XPU device before init
 +        if current_platform.is_xpu():
 +            torch.xpu.set_device(local_rank)
@@ -607,259 +412,379 @@ index adbabaec9..7a4ced5b3 100644
          torch.distributed.init_process_group(
              backend=backend,
              init_method=distributed_init_method,
-@@ -612,10 +630,14 @@ def maybe_init_distributed_environment_and_model_parallel(
-         sequence_parallel_degree=sp_size,
-     )
- 
--    # Only set CUDA device if we're on a CUDA platform
-+    # Only set device if we're on a CUDA-alike platform
-     if current_platform.is_cuda_alike():
--        device = torch.device(f"cuda:{local_rank}")
--        torch.cuda.set_device(device)
-+        if hasattr(torch, 'xpu') and torch.xpu.is_available():
-+            device = torch.device(f"xpu:{local_rank}")
-+            torch.xpu.set_device(device)
-+        else:
-+            device = torch.device(f"cuda:{local_rank}")
-+            torch.cuda.set_device(device)
- 
- 
- def model_parallel_is_initialized() -> bool:
-diff --git a/python/sglang/multimodal_gen/runtime/layers/attention/turbo_layer.py b/python/sglang/multimodal_gen/runtime/layers/attention/turbo_layer.py
-index 3074dc802..749dd170c 100644
---- a/python/sglang/multimodal_gen/runtime/layers/attention/turbo_layer.py
-+++ b/python/sglang/multimodal_gen/runtime/layers/attention/turbo_layer.py
-@@ -4,6 +4,7 @@ from typing import Any, Callable, List, Tuple, Union
- 
- import torch
- import torch.distributed as dist
-+import torch.distributed._functional_collectives as ft_c
- import torch.nn as nn
- import torch.nn.functional as F
- import triton
-@@ -14,6 +15,68 @@ from torch.distributed import ProcessGroup
- from torch.nn import Module
- 
- 
-+def _is_xpu_platform() -> bool:
-+    """Check if running on Intel XPU platform."""
-+    return hasattr(torch, 'xpu') and torch.xpu.is_available()
+diff --git a/python/sglang/multimodal_gen/runtime/layers/attention/backends/intel_xpu.py b/python/sglang/multimodal_gen/runtime/layers/attention/backends/intel_xpu.py
+new file mode 100644
+index 000000000..b899c60a4
+--- /dev/null
++++ b/python/sglang/multimodal_gen/runtime/layers/attention/backends/intel_xpu.py
+@@ -0,0 +1,336 @@
++# SPDX-License-Identifier: Apache-2.0
++"""
++XPU Flash Attention backend for Intel XPU (GPU) devices.
++
++Calls ``torch.ops.sgl_kernel.fwd`` (cutlass-based flash attention kernel)
++directly with the correct 27-argument signature.  Falls back to
++``torch.nn.functional.scaled_dot_product_attention`` when sgl-kernel is not
++available or the device does not support flash attention.
++
++"""
++
++from __future__ import annotations
++
++from functools import lru_cache
++from typing import TYPE_CHECKING, Optional
++
++import torch
++
++from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
++    AttentionBackend,
++    AttentionImpl,
++    AttentionMetadata,
++)
++from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
++from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
++
++if TYPE_CHECKING:
++    pass
++
++logger = init_logger(__name__)
 +
 +
-+def _get_device_stream_context():
-+    """Get the appropriate stream context for XPU or CUDA."""
-+    if _is_xpu_platform():
-+        return torch.xpu.Stream(), torch.xpu.stream, torch.xpu.current_stream
-+    else:
-+        return torch.cuda.Stream(), torch.cuda.stream, torch.cuda.current_stream
++# ---------------------------------------------------------------------------
++# Helper: check if sgl-kernel XPU flash attention is usable
++# ---------------------------------------------------------------------------
++@lru_cache(maxsize=1)
++def _sgl_kernel_flash_attn_available() -> bool:
++    """Return *True* if sgl-kernel XPU flash attention can be used."""
++    try:
++        from sgl_kernel.flash_attn import is_fa3_supported  # noqa: F401
++
++        # Verify the fwd op is registered
++        _ = torch.ops.sgl_kernel.fwd.default
++        return is_fa3_supported()
++    except Exception:
++        return False
 +
 +
-+def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
-+    """Wait for async tensor if needed (for functional collectives)."""
-+    if isinstance(tensor, ft_c.AsyncCollectiveTensor):
-+        return tensor.wait()
-+    return tensor
-+
-+
-+def _xpu_safe_all_to_all_single(
-+    output: torch.Tensor, 
-+    input_: torch.Tensor, 
-+    group: ProcessGroup, 
-+    async_op: bool = False
++# ---------------------------------------------------------------------------
++# Thin wrapper that calls torch.ops.sgl_kernel.fwd with the correct
++# 27-argument signature (matching chunked_prefill.cpp / torch_extension_sycl.cc).
++#
++# fwd(q, k, v, q_v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, page_table,
++#     kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary,
++#     q_descale, k_descale, v_descale, softmax_scale, sinks,
++#     is_causal, window_size_left, window_size_right, softcap,
++#     is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa,
++#     sm_margin) -> Tensor[]
++# ---------------------------------------------------------------------------
++def _flash_attn_varlen_func(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    cu_seqlens_q: Optional[torch.Tensor] = None,
++    cu_seqlens_k: Optional[torch.Tensor] = None,
++    max_seqlen_q: int = 0,
++    max_seqlen_k: int = 0,
++    softmax_scale: Optional[float] = None,
++    causal: bool = False,
++    qv: Optional[torch.Tensor] = None,
++    q_descale: Optional[torch.Tensor] = None,
++    k_descale: Optional[torch.Tensor] = None,
++    v_descale: Optional[torch.Tensor] = None,
++    window_size: tuple[int, int] = (-1, -1),
++    softcap: float = 0.0,
++    num_splits: int = 1,
++    pack_gqa: Optional[bool] = None,
++    sm_margin: int = 0,
 +) -> torch.Tensor:
++    """flash_attn_varlen_func compatible wrapper for sgl-kernel XPU.
++
++    Accepts the same high-level parameters as the upstream
++    ``flash_attn_varlen_func`` but calls ``torch.ops.sgl_kernel.fwd``
++    directly with the correct 27-argument C++ signature.
++
++    When *cu_seqlens_q* is ``None`` the inputs are assumed to be in the
++    dense ``(batch, seq_len, heads, head_dim)`` layout.  They will be
++    reshaped to ``(total_q, heads, head_dim)`` and ``cu_seqlens_q`` will
++    be constructed automatically.
 +    """
-+    XPU-safe all_to_all_single that uses ft_c API to avoid XCCL data corruption bug.
-+    
-+    On Intel XPU with XCCL backend, torch.distributed.all_to_all_single has a known bug
-+    that causes data corruption. This function uses torch.distributed._functional_collectives
-+    .all_to_all_single which works correctly.
-+    
-+    Args:
-+        output: Output tensor (will be filled with result)
-+        input_: Input tensor
-+        group: Process group
-+        async_op: Whether to run asynchronously (NOTE: async_op is not supported 
-+                  with ft_c.all_to_all_single, will run synchronously)
-+    
-+    Returns:
-+        The output tensor
-+    """
-+    if _is_xpu_platform():
-+        # Use ft_c.all_to_all_single for XPU to avoid XCCL bug
-+        # Note: ft_c doesn't support in-place output, so we need to copy
-+        input_shape = input_.shape
-+        result = ft_c.all_to_all_single(
-+            input_.flatten(),
-+            output_split_sizes=None,
-+            input_split_sizes=None,
-+            group=group
++    if softmax_scale is None:
++        softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
++            -0.5
 +        )
-+        result = _maybe_wait(result)
-+        output.copy_(result.reshape(input_shape))
-+        return output
-+    else:
-+        # Use dist.all_to_all_single for CUDA/other platforms
-+        dist.all_to_all_single(output, input_, group=group, async_op=async_op)
-+        return output
++
++    # --- handle dense (batch, seqlen, heads, hdim) layout ----------------
++    is_dense = cu_seqlens_q is None
++    if is_dense:
++        assert q.dim() == 4, "expected (batch, seq_len, heads, head_dim)"
++        batch_size, seqlen_q = q.shape[0], q.shape[1]
++        cu_seqlens_q = (
++            torch.arange(0, batch_size + 1, dtype=torch.int32, device=q.device)
++            * seqlen_q
++        )
++        max_seqlen_q = seqlen_q
++        # q must be (total_q, heads, head_dim) for the varlen kernel
++        q = q.reshape(-1, q.shape[-2], q.shape[-1]).contiguous()
++
++    if cu_seqlens_k is None and k.dim() == 4:
++        batch_size_k, seqlen_k = k.shape[0], k.shape[1]
++        # For paged k/v format, cu_seqlens_k is per-sequence lengths (batch_size,)
++        # NOT cumulative (batch_size+1,).  This matches flash_attn_with_kvcache
++        # which sets cu_seqlens_k = cache_seqlens.
++        cu_seqlens_k = torch.full(
++            (batch_size_k,), seqlen_k, dtype=torch.int32, device=k.device
++        )
++        # k, v stay as (batch, seq_len, heads_k, head_dim) = paged layout
++        # where num_pages = batch, page_size = seq_len
++        # The kernel requires page_block_size to be a multiple of 256.
++        _PAGE_ALIGN = 256
++        if seqlen_k % _PAGE_ALIGN != 0:
++            pad_len = _PAGE_ALIGN - (seqlen_k % _PAGE_ALIGN)
++            k = torch.nn.functional.pad(k, (0, 0, 0, 0, 0, pad_len))
++            v = torch.nn.functional.pad(v, (0, 0, 0, 0, 0, pad_len))
++    elif cu_seqlens_k is None:
++        cu_seqlens_k = cu_seqlens_q
++
++    batch_size = cu_seqlens_q.numel() - 1
++
++    # page_table: trivial identity mapping (one page per sequence)
++    page_table = (
++        torch.arange(batch_size, device=q.device, dtype=torch.int32)
++        .reshape(batch_size, 1)
++        .contiguous()
++    )
++
++    # Call 27-arg fwd op  --------------------------------------------------
++    out, softmax_lse, *rest = torch.ops.sgl_kernel.fwd.default(
++        q,  # 1  Tensor!  q
++        k,  # 2  Tensor   k
++        v,  # 3  Tensor   v
++        qv,  # 4  Tensor?  q_v
++        cu_seqlens_q,  # 5  Tensor   cu_seqlens_q
++        cu_seqlens_k,  # 6  Tensor   cu_seqlens_k
++        max_seqlen_q,  # 7  int      max_seqlen_q
++        page_table,  # 8  Tensor   page_table
++        None,  # 9  Tensor?  kv_batch_idx
++        None,  # 10 Tensor?  leftpad_k
++        None,  # 11 Tensor?  rotary_cos
++        None,  # 12 Tensor?  rotary_sin
++        None,  # 13 Tensor?  seqlens_rotary
++        q_descale,  # 14 Tensor?  q_descale
++        k_descale,  # 15 Tensor?  k_descale
++        v_descale,  # 16 Tensor?  v_descale
++        softmax_scale,  # 17 float    softmax_scale
++        None,  # 18 Tensor?  sinks
++        causal,  # 19 bool     is_causal
++        window_size[0],  # 20 int      window_size_left
++        window_size[1],  # 21 int      window_size_right
++        softcap,  # 22 float    softcap
++        False,  # 23 bool     is_rotary_interleaved
++        None,  # 24 Tensor?  scheduler_metadata
++        num_splits,  # 25 int      num_splits
++        pack_gqa,  # 26 bool?    pack_gqa
++        sm_margin,  # 27 int      sm_margin
++    )
++
++    # Reshape back to dense layout if input was dense
++    if is_dense:
++        out = out.reshape(batch_size, -1, out.shape[-2], out.shape[-1])
++
++    return out
 +
 +
- def post_all2all(local_seq_2_local_head, seq_world_size):
-     def post_func(input):
-         # b, s, n, h
-@@ -54,7 +117,8 @@ def single_all_to_all(input, local_seq_2_local_head, group, async_op=False):
-         post_all2all_fun = post_all2all(local_seq_2_local_head, seq_world_size)
- 
-     output = torch.empty_like(input_t)
--    dist.all_to_all_single(output, input_t, group=group, async_op=async_op)
-+    # Use XPU-safe all_to_all_single to avoid XCCL data corruption bug
-+    _xpu_safe_all_to_all_single(output, input_t, group=group, async_op=async_op)
- 
-     res = post_all2all_fun(output)
-     return res
-@@ -64,52 +128,81 @@ def async_a2a_communicate(
-     a2a_inputs: Union[torch.Tensor, List[torch.Tensor]],
-     cp_size: int,
-     cp_group: ProcessGroup,
--    cp_stream: torch.cuda.Stream,
-+    cp_stream,  # torch.cuda.Stream or torch.xpu.Stream
-     local_seq_2_local_head: bool,
- ) -> Union[torch.Tensor, List[torch.Tensor]]:
-     """
-     A2A communication for context parallelism. best used in communicate qkv
-     Modified from Nvidia Transformer Engine.
-+    
-+    Note: On Intel XPU, async_op is not supported with ft_c.all_to_all_single,
-+    so operations are performed synchronously to avoid XCCL data corruption.
-     """
-+    # Determine stream context based on device type
-+    is_xpu = _is_xpu_platform()
-+    stream_context = torch.xpu.stream if is_xpu else torch.cuda.stream
-+    current_stream_fn = torch.xpu.current_stream if is_xpu else torch.cuda.current_stream
-+    
-     a2a_inputs = [a2a_inputs] if not isinstance(a2a_inputs, list) else a2a_inputs
-     a2a_outputs, a2a_reqs = [None] * len(a2a_inputs), [None] * len(a2a_inputs)
-     a2a_post_fns = [None] * len(a2a_inputs)
--    if local_seq_2_local_head:
--        for i in range(len(a2a_inputs) + 2):
--            if 0 < i < len(a2a_inputs) + 1:
--                a2a_outputs[i - 1] = torch.empty_like(a2a_inputs[i - 1])
--                a2a_reqs[i - 1] = torch.distributed.all_to_all_single(
--                    a2a_outputs[i - 1], a2a_inputs[i - 1], group=cp_group, async_op=True
--                )
--                a2a_post_fns[i - 1] = post_all2all(local_seq_2_local_head, cp_size)
--            if i > 1:
--                with torch.cuda.stream(cp_stream):
--                    a2a_reqs[i - 2].wait()
--                    a2a_outputs[i - 2] = a2a_post_fns[i - 2](a2a_outputs[i - 2])
--            if i < len(a2a_inputs):
-+    
-+    if is_xpu:
-+        # XPU path: use synchronous ft_c.all_to_all_single to avoid XCCL bug
-+        if local_seq_2_local_head:
-+            for i in range(len(a2a_inputs)):
-                 a2a_inputs[i] = rearrange(
-                     a2a_inputs[i], "bs seq_len (w h) d -> w bs seq_len h d", w=cp_size
-                 ).contiguous()
--    else:
--        for i in range(len(a2a_inputs) + 2):
--            if 0 < i < len(a2a_inputs) + 1:
--                a2a_outputs[i - 1] = torch.empty_like(a2a_inputs[i - 1])
--                a2a_reqs[i - 1] = torch.distributed.all_to_all_single(
--                    a2a_outputs[i - 1], a2a_inputs[i - 1], group=cp_group, async_op=True
--                )
--                a2a_post_fns[i - 1] = post_all2all(local_seq_2_local_head, cp_size)
--            if i < len(a2a_inputs):
-+                a2a_outputs[i] = torch.empty_like(a2a_inputs[i])
-+                _xpu_safe_all_to_all_single(a2a_outputs[i], a2a_inputs[i], group=cp_group)
-+                a2a_outputs[i] = post_all2all(local_seq_2_local_head, cp_size)(a2a_outputs[i])
-+        else:
-+            for i in range(len(a2a_inputs)):
-                 a2a_inputs[i] = rearrange(
-                     a2a_inputs[i], "bs (w s) h d -> w bs s h d", w=cp_size
-                 ).contiguous()
--            if i > 1:
--                with torch.cuda.stream(cp_stream):
--                    a2a_reqs[i - 2].wait()
--                    a2a_outputs[i - 2] = a2a_post_fns[i - 2](a2a_outputs[i - 2])
--    torch.cuda.current_stream().wait_stream(cp_stream)
-+                a2a_outputs[i] = torch.empty_like(a2a_inputs[i])
-+                _xpu_safe_all_to_all_single(a2a_outputs[i], a2a_inputs[i], group=cp_group)
-+                a2a_outputs[i] = post_all2all(local_seq_2_local_head, cp_size)(a2a_outputs[i])
-+    else:
-+        # CUDA path: use asynchronous dist.all_to_all_single
-+        if local_seq_2_local_head:
-+            for i in range(len(a2a_inputs) + 2):
-+                if 0 < i < len(a2a_inputs) + 1:
-+                    a2a_outputs[i - 1] = torch.empty_like(a2a_inputs[i - 1])
-+                    a2a_reqs[i - 1] = torch.distributed.all_to_all_single(
-+                        a2a_outputs[i - 1], a2a_inputs[i - 1], group=cp_group, async_op=True
-+                    )
-+                    a2a_post_fns[i - 1] = post_all2all(local_seq_2_local_head, cp_size)
-+                if i > 1:
-+                    with stream_context(cp_stream):
-+                        a2a_reqs[i - 2].wait()
-+                        a2a_outputs[i - 2] = a2a_post_fns[i - 2](a2a_outputs[i - 2])
-+                if i < len(a2a_inputs):
-+                    a2a_inputs[i] = rearrange(
-+                        a2a_inputs[i], "bs seq_len (w h) d -> w bs seq_len h d", w=cp_size
-+                    ).contiguous()
-+        else:
-+            for i in range(len(a2a_inputs) + 2):
-+                if 0 < i < len(a2a_inputs) + 1:
-+                    a2a_outputs[i - 1] = torch.empty_like(a2a_inputs[i - 1])
-+                    a2a_reqs[i - 1] = torch.distributed.all_to_all_single(
-+                        a2a_outputs[i - 1], a2a_inputs[i - 1], group=cp_group, async_op=True
-+                    )
-+                    a2a_post_fns[i - 1] = post_all2all(local_seq_2_local_head, cp_size)
-+                if i < len(a2a_inputs):
-+                    a2a_inputs[i] = rearrange(
-+                        a2a_inputs[i], "bs (w s) h d -> w bs s h d", w=cp_size
-+                    ).contiguous()
-+                if i > 1:
-+                    with stream_context(cp_stream):
-+                        a2a_reqs[i - 2].wait()
-+                        a2a_outputs[i - 2] = a2a_post_fns[i - 2](a2a_outputs[i - 2])
-+        current_stream_fn().wait_stream(cp_stream)
-+    
-     return a2a_outputs[0] if len(a2a_inputs) == 1 else a2a_outputs
- 
--
- @triton.jit
- def _attn_fwd(
-     Q,
-@@ -260,7 +353,7 @@ class _SeqAllToAllQKV(torch.autograd.Function):
-         k: Tensor,
-         v: Tensor,
-         cp_size: int,
--        cp_stream: torch.cuda.Stream,
-+        cp_stream,  # torch.cuda.Stream or torch.xpu.Stream
-         local_seq_2_local_head: bool,
-     ) -> Tuple[Tensor, Tensor, Tensor]:
-         ctx.group = group
++# ---------------------------------------------------------------------------
++# Backend
++# ---------------------------------------------------------------------------
++class XpuFlashAttentionBackend(AttentionBackend):
++    """XPU attention backend backed by sgl-kernel flash attention."""
++
++    accept_output_buffer: bool = True
++
++    @staticmethod
++    def get_supported_head_sizes() -> list[int]:
++        return [32, 64, 96, 128, 160, 192, 224, 256]
++
++    @staticmethod
++    def get_enum() -> AttentionBackendEnum:
++        return AttentionBackendEnum.INTEL_XPU
++
++    @staticmethod
++    def get_impl_cls() -> type[XpuFlashAttentionImpl]:
++        return XpuFlashAttentionImpl
++
++    @staticmethod
++    def get_metadata_cls() -> type[AttentionMetadata]:
++        raise NotImplementedError
++
++    @staticmethod
++    def get_builder_cls():
++        return None
++
++
++# ---------------------------------------------------------------------------
++# Implementation
++# ---------------------------------------------------------------------------
++class XpuFlashAttentionImpl(AttentionImpl):
++    """
++    XPU attention implementation.
++
++    When sgl-kernel flash attention is available (BMG / Xe2 and later), the
++    forward pass calls ``sgl_kernel.flash_attn.flash_attn_varlen_func``
++    which invokes the cutlass-based ``torch.ops.sgl_kernel.fwd`` kernel.
++
++    Otherwise, it falls back to ``torch.nn.functional.scaled_dot_product_attention``.
++    """
++
++    _logged_backend: bool = False  # class-level flag to log backend choice once
++
++    def __init__(
++        self,
++        num_heads: int,
++        head_size: int,
++        causal: bool,
++        softmax_scale: float,
++        num_kv_heads: int | None = None,
++        prefix: str = "",
++        **extra_impl_args,
++    ) -> None:
++        self.num_heads = num_heads
++        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
++        self.head_size = head_size
++        self.causal = causal
++        self.softmax_scale = softmax_scale
++        self.dropout = extra_impl_args.get("dropout_p", 0.0)
++
++        self._use_flash = _sgl_kernel_flash_attn_available()
++        if not XpuFlashAttentionImpl._logged_backend:
++            XpuFlashAttentionImpl._logged_backend = True
++            if self._use_flash:
++                logger.info(
++                    "XPU attention: using sgl-kernel flash attention "
++                    "(cutlass-based, torch.ops.sgl_kernel.fwd)"
++                )
++            else:
++                logger.info(
++                    "XPU attention: sgl-kernel flash attention not available, "
++                    "falling back to torch.nn.functional.scaled_dot_product_attention"
++                )
++
++    # ------------------------------------------------------------------ #
++    # Forward
++    # ------------------------------------------------------------------ #
++    def forward(
++        self,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        attn_metadata: AttentionMetadata = None,
++    ) -> torch.Tensor:
++        """
++        Parameters
++        ----------
++        query : Tensor
++            ``(batch, seq_len_q, num_heads, head_dim)``
++        key : Tensor
++            ``(batch, seq_len_k, num_kv_heads, head_dim)``
++        value : Tensor
++            ``(batch, seq_len_k, num_kv_heads, head_dim)``
++        attn_metadata : AttentionMetadata, optional
++            Currently unused.
++
++        Returns
++        -------
++        Tensor
++            ``(batch, seq_len_q, num_heads, head_dim)``
++        """
++        if self._use_flash:
++            return self._forward_flash(query, key, value)
++        return self._forward_sdpa(query, key, value)
++
++    # ------------------------------------------------------------------ #
++    # sgl-kernel flash attention path (via _flash_attn_varlen_func)
++    # ------------------------------------------------------------------ #
++    def _forward_flash(
++        self,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++    ) -> torch.Tensor:
++        """Call the cutlass-based ``torch.ops.sgl_kernel.fwd`` kernel via
++        our ``_flash_attn_varlen_func`` wrapper (27-arg signature).
++
++        Input layout: ``(batch, seq_len, heads, head_dim)``.
++        ``_flash_attn_varlen_func`` handles reshaping to varlen format
++        internally when ``cu_seqlens_q=None``.
++        """
++        output = _flash_attn_varlen_func(
++            q=query,
++            k=key,
++            v=value,
++            cu_seqlens_q=None,
++            cu_seqlens_k=None,
++            max_seqlen_q=query.shape[1],
++            max_seqlen_k=key.shape[1],
++            softmax_scale=self.softmax_scale,
++            causal=self.causal,
++        )
++        return output
++
++    # ------------------------------------------------------------------ #
++    # SDPA fallback path
++    # ------------------------------------------------------------------ #
++    def _forward_sdpa(
++        self,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++    ) -> torch.Tensor:
++        # SDPA expects (batch, heads, seq_len, head_dim)
++        q = query.transpose(1, 2)
++        k = key.transpose(1, 2)
++        v = value.transpose(1, 2)
++
++        attn_kwargs = {
++            "attn_mask": None,
++            "dropout_p": self.dropout,
++            "is_causal": self.causal,
++            "scale": self.softmax_scale,
++        }
++        if q.shape[1] != k.shape[1]:
++            attn_kwargs["enable_gqa"] = True
++
++        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, **attn_kwargs)
++        # back to (batch, seq_len, heads, head_dim)
++        return out.transpose(1, 2)
 diff --git a/python/sglang/multimodal_gen/runtime/layers/custom_op.py b/python/sglang/multimodal_gen/runtime/layers/custom_op.py
-index f4cd030d6..118139ae6 100644
+index fd7355a3f..a9e0e214d 100644
 --- a/python/sglang/multimodal_gen/runtime/layers/custom_op.py
 +++ b/python/sglang/multimodal_gen/runtime/layers/custom_op.py
-@@ -42,6 +42,14 @@ class CustomOp(nn.Module):
-         # ROCm kernels follow the CUDA path by default.
-         return self.forward_cuda(*args, **kwargs)
+@@ -69,6 +69,11 @@ class CustomOp(nn.Module):
+         # PyTorch-native implementation.
+         return self.forward_native(*args, **kwargs)
  
 +    def forward_xpu(self, *args, **kwargs) -> Any:
-+        # By default, assume XPU ops are compatible with CUDA ops
-+        return self.forward_cuda(*args, **kwargs)
++        # By default, we assume that XPU ops are compatible with the
++        # PyTorch-native implementation.
++        return self.forward_native(*args, **kwargs)
 +
-+    def forward_npu(self, *args, **kwargs) -> Any:
-+        # By default, assume NPU ops are compatible with CUDA ops
-+        return self.forward_cuda(*args, **kwargs)
-+
-     def forward_cpu(self, *args, **kwargs) -> Any:
-         # By default, we assume that CPU ops are compatible with CUDA ops.
-         return self.forward_cuda(*args, **kwargs)
+     def dispatch_forward(self) -> Callable:
+         if _is_cuda:
+             return self.forward_cuda
 diff --git a/python/sglang/multimodal_gen/runtime/layers/layernorm.py b/python/sglang/multimodal_gen/runtime/layers/layernorm.py
-index a9f5811e2..55085d378 100644
+index 888824f60..df0cd0b88 100644
 --- a/python/sglang/multimodal_gen/runtime/layers/layernorm.py
 +++ b/python/sglang/multimodal_gen/runtime/layers/layernorm.py
-@@ -126,6 +126,32 @@ class RMSNorm(CustomOp):
+@@ -14,7 +14,8 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
+ 
+ _is_cuda = current_platform.is_cuda()
+ _is_npu = current_platform.is_npu()
+-if _is_cuda:
++_is_xpu = current_platform.is_xpu()
++if _is_cuda or _is_xpu:
+     from sgl_kernel import fused_add_rmsnorm, rmsnorm
+ 
+ if _is_npu:
+@@ -145,6 +146,38 @@ class RMSNorm(CustomOp):
      ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
          return self.forward_native(x, residual)
  
@@ -869,16 +794,22 @@ index a9f5811e2..55085d378 100644
 +        residual: Optional[torch.Tensor] = None,
 +    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
 +        """XPU-specific implementation of RMSNorm.
-+        
++
 +        Uses sgl_kernel if available, otherwise falls back to native implementation.
 +        """
 +        shape = x.shape
++        x = x.contiguous()
 +        x = x.view(-1, shape[-1])
 +        if x.dtype == torch.float or self.variance_size_override is not None:
 +            return self.forward_native(x.view(shape), residual)
 +        if residual is not None:
 +            try:
-+                fused_add_rmsnorm(x, residual.view(-1, shape[-1]), self.weight.data, self.variance_epsilon)
++                fused_add_rmsnorm(
++                    x,
++                    residual.view(-1, shape[-1]),
++                    self.weight.data,
++                    self.variance_epsilon,
++                )
 +                return x.view(shape), residual
 +            except Exception:
 +                return self.forward_native(x.view(shape), residual)
@@ -889,164 +820,38 @@ index a9f5811e2..55085d378 100644
 +        except Exception:
 +            return self.forward_native(x.view(shape), residual)
 +
-     def forward_hip(
+     def forward_npu(
          self,
          x: torch.Tensor,
-diff --git a/python/sglang/multimodal_gen/runtime/layers/triton_ops.py b/python/sglang/multimodal_gen/runtime/layers/triton_ops.py
-index 761b13763..0a630d886 100644
---- a/python/sglang/multimodal_gen/runtime/layers/triton_ops.py
-+++ b/python/sglang/multimodal_gen/runtime/layers/triton_ops.py
-@@ -224,7 +224,7 @@ def fuse_scale_shift_kernel(
-     block_l: int = 128,
-     block_c: int = 128,
- ):
--    assert x.is_cuda and scale.is_cuda
-+    # assert x.is_cuda and scale.is_cuda
-     assert x.is_contiguous()
- 
-     B, L, C = x.shape
-@@ -518,9 +518,20 @@ def triton_autotune_configs():
-     # Maximum threads per block is architecture-dependent in theory, but in reality all are 1024
-     max_threads_per_block = 1024
-     # Default to warp size 32 if not defined by device
--    warp_size = getattr(
--        torch.cuda.get_device_properties(torch.cuda.current_device()), "warp_size", 32
+@@ -519,9 +552,16 @@ def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
+     weight = norm.weight.tensor_split(tp_size)[tp_rank].float()
+     x_fp32 = x.float()
+     variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+-    variance = get_tp_group().all_reduce(
+-        variance, op=torch._C._distributed_c10d.ReduceOp.AVG
 -    )
-+    warp_size = 32  # Default warp size
-+    
-+    # Try to get warp size from device properties (XPU or CUDA)
-+    try:
-+        if hasattr(torch, 'xpu') and torch.xpu.is_available():
-+            # XPU doesn't have warp_size property, use default 32
-+            warp_size = 32
-+        elif torch.cuda.is_available():
-+            warp_size = getattr(
-+                torch.cuda.get_device_properties(torch.cuda.current_device()), "warp_size", 32
-+            )
-+    except Exception:
-+        pass  # Use default warp_size = 32
-+    
-     # Autotune for warp counts which are powers of 2 and do not exceed thread per block limit
-     return [
-         triton.Config({}, num_warps=warp_count)
-@@ -815,7 +826,12 @@ def _layer_norm_fwd_impl(
-     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
-     if N > BLOCK_N:
-         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
--    with torch.cuda.device(x.device.index):
-+    # Use appropriate device context based on tensor device type
-+    if x.device.type == 'xpu':
-+        device_ctx = torch.xpu.device(x.device.index)
++    # Use SUM + divide instead of AVG on XPU, because XCCL in torch 2.9+xpu have issues for AVG
++    if current_platform.is_xpu():
++        variance = get_tp_group().all_reduce(
++            variance, op=torch._C._distributed_c10d.ReduceOp.SUM
++        )
++        variance = variance / tp_size
 +    else:
-+        device_ctx = torch.cuda.device(x.device.index)
-+    with device_ctx:
-         torch.library.wrap_triton(_layer_norm_fwd_1pass_kernel)[(M,)](
-             x,
-             out,
-diff --git a/python/sglang/multimodal_gen/runtime/loader/component_loader.py b/python/sglang/multimodal_gen/runtime/loader/component_loader.py
-index 9ad2b2753..6c37a5c3a 100644
---- a/python/sglang/multimodal_gen/runtime/loader/component_loader.py
-+++ b/python/sglang/multimodal_gen/runtime/loader/component_loader.py
-@@ -217,11 +217,13 @@ class ComponentLoader(ABC):
-                 trust_remote_code=server_args.trust_remote_code,
-                 revision=server_args.revision,
-             )
-+            # Load model to CPU first to avoid CUDA initialization issues on XPU
-             return AutoModel.from_pretrained(
-                 component_model_path,
-                 config=config,
-                 trust_remote_code=server_args.trust_remote_code,
-                 revision=server_args.revision,
-+                device_map="cpu",  # Load to CPU first, then move to target device
-             )
-         elif transformers_or_diffusers == "diffusers":
-             from diffusers import AutoModel
-@@ -310,6 +312,9 @@ class TextEncoderLoader(ComponentLoader):
-         should_offload = server_args.text_encoder_cpu_offload
-         if not should_offload:
-             return False
-+        # For native models (no model_config), respect user's offload setting directly
-+        if model_config is None:
-+            return should_offload
-         # _fsdp_shard_conditions is in arch_config, not directly on model_config
-         arch_config = (
-             getattr(model_config, "arch_config", model_config) if model_config else None
-@@ -522,6 +527,9 @@ class ImageEncoderLoader(TextEncoderLoader):
-         should_offload = server_args.image_encoder_cpu_offload
-         if not should_offload:
-             return False
-+        # For native models (no model_config), respect user's offload setting directly
-+        if model_config is None:
-+            return should_offload
-         # _fsdp_shard_conditions is in arch_config, not directly on model_config
-         arch_config = (
-             getattr(model_config, "arch_config", model_config) if model_config else None
-diff --git a/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py b/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
-index 69b65f183..44f5f084e 100644
---- a/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
-+++ b/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
-@@ -70,7 +70,11 @@ class GPUWorker:
-     def init_device_and_model(self) -> None:
-         """Initialize the device and load the model."""
-         setproctitle(f"sgl_diffusion::scheduler_TP{self.local_rank}")
--        torch.cuda.set_device(self.local_rank)
-+        # Set device based on available platform
-+        if hasattr(torch, 'xpu') and torch.xpu.is_available():
-+            torch.xpu.set_device(self.local_rank)
-+        elif torch.cuda.is_available():
-+            torch.cuda.set_device(self.local_rank)
-         # Set environment variables for distributed initialization
-         os.environ["MASTER_ADDR"] = "localhost"
-         os.environ["MASTER_PORT"] = str(self.master_port)
-@@ -120,7 +124,11 @@ class GPUWorker:
-         output_batch = None
-         try:
-             if self.rank == 0:
--                torch.cuda.reset_peak_memory_stats()
-+                # Reset peak memory stats based on device type
-+                if hasattr(torch, 'xpu') and torch.xpu.is_available():
-+                    torch.xpu.reset_peak_memory_stats()
-+                elif torch.cuda.is_available():
-+                    torch.cuda.reset_peak_memory_stats()
++        variance = get_tp_group().all_reduce(
++            variance, op=torch._C._distributed_c10d.ReduceOp.AVG
++        )
+     output = x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * weight
+     return output.to(dtype=src_dtype)
  
-             start_time = time.monotonic()
- 
-@@ -139,7 +147,13 @@ class GPUWorker:
-                 output_batch = result
- 
-             if self.rank == 0:
--                peak_memory_bytes = torch.cuda.max_memory_allocated()
-+                # Get peak memory based on device type
-+                if hasattr(torch, 'xpu') and torch.xpu.is_available():
-+                    peak_memory_bytes = torch.xpu.max_memory_allocated()
-+                elif torch.cuda.is_available():
-+                    peak_memory_bytes = torch.cuda.max_memory_allocated()
-+                else:
-+                    peak_memory_bytes = 0
-                 output_batch.peak_memory_mb = peak_memory_bytes / (1024**2)
-                 peak_memory_gb = peak_memory_bytes / (1024**3)
-                 remaining_gpu_mem_gb = (
 diff --git a/python/sglang/multimodal_gen/runtime/models/encoders/clip.py b/python/sglang/multimodal_gen/runtime/models/encoders/clip.py
-index 9dd279d8f..c22bc9860 100644
+index 83fdefd8c..07808f942 100644
 --- a/python/sglang/multimodal_gen/runtime/models/encoders/clip.py
 +++ b/python/sglang/multimodal_gen/runtime/models/encoders/clip.py
-@@ -230,18 +230,50 @@ class CLIPAttention(nn.Module):
-             key_states = key_states.transpose(1, 2)
-             value_states = value_states.transpose(1, 2)
- 
--            if current_platform.is_rocm():
--                # ROCm: Using both is_causal=True and attn_mask causes NaN.
--                # Use is_causal=True alone (padding mask not needed for CLIP
--                # since pooler_output comes from EOS token before padding).
--                attn_output = torch.nn.functional.scaled_dot_product_attention(
--                    query_states,
--                    key_states,
--                    value_states,
--                    attn_mask=None,
--                    is_causal=True,
--                    scale=self.scale,
--                )
-+            if current_platform.is_xpu():
+@@ -245,6 +245,57 @@ class CLIPAttention(nn.Module):
+                     is_causal=True,
+                     scale=self.scale,
+                 )
++            elif current_platform.is_xpu():
 +                # XPU: Using both is_causal=True and attn_mask causes error:
 +                # "attn_bias cannot present with is_causal"
 +                if attention_mask is not None:
@@ -1055,8 +860,13 @@ index 9dd279d8f..c22bc9860 100644
 +                    seq_len = query_states.shape[2]
 +                    # Create causal mask: [1, 1, S, S]
 +                    causal_mask = torch.triu(
-+                        torch.ones(seq_len, seq_len, dtype=torch.bool, device=query_states.device),
-+                        diagonal=1
++                        torch.ones(
++                            seq_len,
++                            seq_len,
++                            dtype=torch.bool,
++                            device=query_states.device,
++                        ),
++                        diagonal=1,
 +                    )
 +                    causal_mask = causal_mask[None, None, :, :].expand(
 +                        query_states.shape[0], 1, -1, -1
@@ -1072,7 +882,9 @@ index 9dd279d8f..c22bc9860 100644
 +                    else:
 +                        attn_mask = attention_mask
 +                    # Combine causal mask with attention mask
-+                    attn_mask = attn_mask.masked_fill(causal_mask, torch.finfo(query_states.dtype).min)
++                    attn_mask = attn_mask.masked_fill(
++                        causal_mask, torch.finfo(query_states.dtype).min
++                    )
 +                    attn_output = torch.nn.functional.scaled_dot_product_attention(
 +                        query_states,
 +                        key_states,
@@ -1093,67 +905,85 @@ index 9dd279d8f..c22bc9860 100644
              else:
                  if attention_mask is not None:
                      # SDPA requires [B, 1, 1, S] or [B, S, S] format mask
-diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/text_encoding.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/text_encoding.py
-index 6423e45d2..a88687fe4 100644
---- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/text_encoding.py
-+++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/text_encoding.py
-@@ -239,6 +239,13 @@ class TextEncodingStage(PipelineStage):
-                 if i < len(text_encoder_extra_args) and text_encoder_extra_args[i]
-                 else {}
-             )
-+            
-+            # Determine the device where text_encoder resides
-+            # This handles CPU offload case where model is on CPU
-+            try:
-+                encoder_device = next(text_encoder.parameters()).device
-+            except StopIteration:
-+                encoder_device = target_device
+diff --git a/python/sglang/multimodal_gen/runtime/models/vaes/parallel/wan_dist_utils.py b/python/sglang/multimodal_gen/runtime/models/vaes/parallel/wan_dist_utils.py
+index 83fa12ea0..5d844971d 100644
+--- a/python/sglang/multimodal_gen/runtime/models/vaes/parallel/wan_dist_utils.py
++++ b/python/sglang/multimodal_gen/runtime/models/vaes/parallel/wan_dist_utils.py
+@@ -134,29 +134,48 @@ def halo_exchange(
+     recv_top_buf = _ensure_recv_buf(recv_top_buf, top_row)
+     recv_bottom_buf = _ensure_recv_buf(recv_bottom_buf, bottom_row)
  
-             processed_text_list: list[str] = []
-             for prompt_str in texts:
-@@ -253,7 +260,7 @@ class TextEncodingStage(PipelineStage):
+-    # use batched P2P operations
+-    p2p_ops = []
+-
+-    if rank > 0:
+-        # has previous neighbor, recv previous rank's data to recv_top_buf and send top_row to it.
+-        prev_rank = group_ranks[rank - 1]
+-        p2p_ops.append(dist.P2POp(dist.irecv, recv_top_buf, prev_rank, group))
+-        p2p_ops.append(dist.P2POp(dist.isend, top_row, prev_rank, group))
+-    if rank < world_size - 1:
+-        # has next neighbor, send bottom_row to next rank and recv next rank's data to recv_bottom_buf.
+-        next_rank = group_ranks[rank + 1]
+-        p2p_ops.append(dist.P2POp(dist.isend, bottom_row, next_rank, group))
+-        p2p_ops.append(dist.P2POp(dist.irecv, recv_bottom_buf, next_rank, group))
+-
+-    if rank == 0:
+-        recv_top_buf.zero_()
+-    if rank == world_size - 1:
+-        recv_bottom_buf.zero_()
+-
+-    if p2p_ops:
+-        reqs = dist.batch_isend_irecv(p2p_ops)
++    if current_platform.is_xpu():
++        # Use individual irecv/isend for XPU/XCCL compatibility
++        reqs = []
++
++        if rank > 0:
++            prev_rank = group_ranks[rank - 1]
++            reqs.append(dist.irecv(recv_top_buf, src=prev_rank, group=group))
++            reqs.append(dist.isend(top_row, dst=prev_rank, group=group))
++        if rank < world_size - 1:
++            next_rank = group_ranks[rank + 1]
++            reqs.append(dist.isend(bottom_row, dst=next_rank, group=group))
++            reqs.append(dist.irecv(recv_bottom_buf, src=next_rank, group=group))
++
++        if rank == 0:
++            recv_top_buf.zero_()
++        if rank == world_size - 1:
++            recv_bottom_buf.zero_()
++
+         for req in reqs:
+             req.wait()
++    else:
++        # use batched P2P operations
++        p2p_ops = []
++
++        if rank > 0:
++            prev_rank = group_ranks[rank - 1]
++            p2p_ops.append(dist.P2POp(dist.irecv, recv_top_buf, prev_rank, group))
++            p2p_ops.append(dist.P2POp(dist.isend, top_row, prev_rank, group))
++        if rank < world_size - 1:
++            next_rank = group_ranks[rank + 1]
++            p2p_ops.append(dist.P2POp(dist.isend, bottom_row, next_rank, group))
++            p2p_ops.append(dist.P2POp(dist.irecv, recv_bottom_buf, next_rank, group))
++
++        if rank == 0:
++            recv_top_buf.zero_()
++        if rank == world_size - 1:
++            recv_bottom_buf.zero_()
++
++        if p2p_ops:
++            reqs = dist.batch_isend_irecv(p2p_ops)
++            for req in reqs:
++                req.wait()
  
-             text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
-                 processed_text_list, tokenizer, tok_kwargs
--            ).to(target_device)
-+            ).to(encoder_device)  # Use encoder_device to match text_encoder's device
- 
-             input_ids = text_inputs["input_ids"]
-             is_flux_v1 = isinstance(
-@@ -262,7 +269,7 @@ class TextEncodingStage(PipelineStage):
-             is_flux_t5 = is_flux_v1 and i == 1
- 
-             if is_flux_t5:
--                attention_mask = torch.ones(input_ids.shape[:2], device=target_device)
-+                attention_mask = torch.ones(input_ids.shape[:2], device=encoder_device)
-             else:
-                 attention_mask = text_inputs["attention_mask"]
-             with set_forward_context(current_timestep=0, attn_metadata=None):
-@@ -275,10 +282,18 @@ class TextEncodingStage(PipelineStage):
-             prompt_embeds = postprocess_func(outputs, text_inputs)
-             if dtype is not None:
-                 prompt_embeds = prompt_embeds.to(dtype=dtype)
-+            
-+            # Move embeddings to target device (needed when encoder is on CPU due to offload)
-+            if encoder_device != target_device:
-+                prompt_embeds = prompt_embeds.to(target_device)
-+                attention_mask = attention_mask.to(target_device)
- 
-             embeds_list.append(prompt_embeds)
-             if is_flux_v1:
--                pooled_embeds_list.append(outputs.pooler_output)
-+                pooler_output = outputs.pooler_output
-+                if encoder_device != target_device and pooler_output is not None:
-+                    pooler_output = pooler_output.to(target_device)
-+                pooled_embeds_list.append(pooler_output)
-             if return_attention_mask:
-                 attn_masks_list.append(attention_mask)
- 
+     return (
+         torch.concat([recv_top_buf, x, recv_bottom_buf], dim=-2),
 diff --git a/python/sglang/multimodal_gen/runtime/platforms/__init__.py b/python/sglang/multimodal_gen/runtime/platforms/__init__.py
-index ee515bb24..a2ff1dfc4 100644
+index 55aa8ad5d..afa965787 100644
 --- a/python/sglang/multimodal_gen/runtime/platforms/__init__.py
 +++ b/python/sglang/multimodal_gen/runtime/platforms/__init__.py
-@@ -101,9 +101,28 @@ def rocm_platform_plugin() -> str | None:
+@@ -101,6 +101,22 @@ def rocm_platform_plugin() -> str | None:
      )
  
  
@@ -1170,19 +1000,21 @@ index ee515bb24..a2ff1dfc4 100644
 +    except Exception as e:
 +        logger.info("Intel XPU platform is unavailable: %s", e)
 +
-+    return (
-+        "sglang.multimodal_gen.runtime.platforms.xpu.XpuPlatform" if is_xpu else None
-+    )
++    return "sglang.multimodal_gen.runtime.platforms.xpu.XpuPlatform" if is_xpu else None
 +
 +
- builtin_platform_plugins = {
-     "cuda": cuda_platform_plugin,
-     "rocm": rocm_platform_plugin,
-+    "xpu": xpu_platform_plugin,
-     "mps": mps_platform_plugin,
+ def npu_platform_plugin() -> str | None:
+     is_npu = False
+ 
+@@ -145,6 +161,7 @@ builtin_platform_plugins = {
      "cpu": cpu_platform_plugin,
+     "npu": npu_platform_plugin,
+     "musa": musa_platform_plugin,
++    "xpu": xpu_platform_plugin,
  }
-@@ -118,6 +137,11 @@ def resolve_current_platform_cls_qualname() -> str:
+ 
+ 
+@@ -157,6 +174,11 @@ def resolve_current_platform_cls_qualname() -> str:
      if platform_cls_qualname is not None:
          return platform_cls_qualname
  
@@ -1195,52 +1027,49 @@ index ee515bb24..a2ff1dfc4 100644
      platform_cls_qualname = rocm_platform_plugin()
      if platform_cls_qualname is not None:
 diff --git a/python/sglang/multimodal_gen/runtime/platforms/interface.py b/python/sglang/multimodal_gen/runtime/platforms/interface.py
-index abdb55dc0..ab231b05f 100644
+index 8c03fb324..67673bae3 100644
 --- a/python/sglang/multimodal_gen/runtime/platforms/interface.py
 +++ b/python/sglang/multimodal_gen/runtime/platforms/interface.py
-@@ -42,6 +42,7 @@ class AttentionBackendEnum(enum.Enum):
- class PlatformEnum(enum.Enum):
-     CUDA = enum.auto()
-     ROCM = enum.auto()
-+    XPU = enum.auto()  # Intel XPU (GPU) support
-     TPU = enum.auto()
-     CPU = enum.auto()
-     MPS = enum.auto()
-@@ -147,7 +148,7 @@ class Platform:
-     @lru_cache(maxsize=1)
-     def is_cuda_alike(self) -> bool:
-         """Stateless version of :func:`torch.cuda.is_available`."""
--        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM)
-+        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM, PlatformEnum.XPU)
+@@ -36,6 +36,7 @@ class AttentionBackendEnum(enum.Enum):
+     AITER = enum.auto()
+     SLA_ATTN = enum.auto()
+     SAGE_SLA_ATTN = enum.auto()
++    INTEL_XPU = enum.auto()
+     NO_ATTENTION = enum.auto()
  
-     @lru_cache(maxsize=1)
-     def is_mps(self) -> bool:
-@@ -225,6 +226,8 @@ class Platform:
+     def __str__(self):
+@@ -61,6 +62,7 @@ class PlatformEnum(enum.Enum):
+     MPS = enum.auto()
+     NPU = enum.auto()
+     MUSA = enum.auto()
++    XPU = enum.auto()  # Intel XPU (GPU) support
+     OOT = enum.auto()
+     UNSPECIFIED = enum.auto()
+ 
+@@ -262,6 +264,8 @@ class Platform:
      def get_device(self, local_rank: int) -> torch.device:
          if self.is_cuda() or self.is_rocm():
              return torch.device("cuda", local_rank)
 +        elif self.is_xpu():
 +            return torch.device("xpu", local_rank)
+         elif self.is_npu():
+             return torch.device("npu", local_rank)
          elif self.is_musa():
-             return torch.device("musa", local_rank)
-         elif self.is_mps():
-@@ -234,7 +237,9 @@ class Platform:
- 
-     @lru_cache(maxsize=1)
-     def get_torch_distributed_backend_str(self) -> str:
--        if self.is_cuda_alike():
-+        if self.is_xpu():
-+            return "xccl"
-+        elif self.is_cuda_alike():
-             return "nccl"
-         elif self.is_musa():
+@@ -281,6 +285,8 @@ class Platform:
              return "mccl"
+         elif self.is_mps():
+             return "gloo"
++        elif self.is_xpu():
++            return "xccl"
+         else:
+             raise NotImplementedError(
+                 "No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available"
 diff --git a/python/sglang/multimodal_gen/runtime/platforms/xpu.py b/python/sglang/multimodal_gen/runtime/platforms/xpu.py
 new file mode 100644
-index 000000000..c3247ba6e
+index 000000000..035057a42
 --- /dev/null
 +++ b/python/sglang/multimodal_gen/runtime/platforms/xpu.py
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,258 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""
 +Intel XPU Platform support for SGLang Diffusion.
@@ -1253,6 +1082,7 @@ index 000000000..c3247ba6e
 +
 +import torch
 +
++from sglang.multimodal_gen import envs
 +from sglang.multimodal_gen.runtime.platforms.interface import (
 +    AttentionBackendEnum,
 +    DeviceCapability,
@@ -1288,18 +1118,34 @@ index 000000000..c3247ba6e
 +    device_control_env_var: str = "ZE_AFFINITY_MASK"  # Intel GPU environment variable
 +
 +    @classmethod
++    def get_local_torch_device(cls) -> torch.device:
++        return torch.device(f"xpu:{envs.LOCAL_RANK}")
++
++    @classmethod
 +    @lru_cache(maxsize=8)
 +    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
 +        """
-+        XPU doesn't have a direct equivalent to CUDA compute capability.
-+        We return a placeholder capability based on device generation.
++        Query XPU device capability via sgl_kernel.
++
++        Uses ``torch.ops.sgl_kernel.query_device`` when available, which maps
++        Intel GPU architectures to (major, minor) pairs:
++          - Xe2 (BMG-G21): (2, 0)
++          - (more architectures to be added)
++
++        Falls back to a generic (1, 0) if sgl_kernel is not installed or the
++        query fails.
 +        """
 +        try:
-+            # XPU doesn't expose compute capability like CUDA
-+            # Return a generic capability (major=1, minor=0) for compatibility
-+            return DeviceCapability(major=1, minor=0)
++            major, minor = torch.ops.sgl_kernel.query_device.default(device_id)
++            return DeviceCapability(major=int(major), minor=int(minor))
 +        except Exception:
-+            return None
++            # sgl_kernel not loaded or unsupported architecture – fall back
++            logger.warning(
++                "sgl_kernel.query_device not available; returning generic "
++                "XPU capability (1, 0). Install sgl-kernel-xpu for real "
++                "device capability detection."
++            )
++            return DeviceCapability(major=1, minor=0)
 +
 +    @classmethod
 +    @lru_cache(maxsize=8)
@@ -1381,7 +1227,7 @@ index 000000000..c3247ba6e
 +    ) -> float:
 +        """
 +        Get available GPU memory on XPU device.
-+        
++
 +        Returns:
 +            float: Available memory in GiB.
 +        """
@@ -1426,6 +1272,15 @@ index 000000000..c3247ba6e
 +            if hasattr(torch.xpu, "manual_seed_all"):
 +                torch.xpu.manual_seed_all(seed)
 +
++    # Backend class paths
++    _INTEL_XPU_CLS = (
++        "sglang.multimodal_gen.runtime.layers.attention.backends"
++        ".intel_xpu.XpuFlashAttentionBackend"
++    )
++    _SDPA_BACKEND_CLS = (
++        "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
++    )
++
 +    @classmethod
 +    def get_attn_backend_cls_str(
 +        cls,
@@ -1435,331 +1290,81 @@ index 000000000..c3247ba6e
 +    ) -> str:
 +        """
 +        Get the attention backend class for XPU.
-+        
-+        XPU currently only supports Torch SDPA backend.
-+        Flash Attention and other CUDA-specific backends are not available.
++
++        By default, uses the XPU flash-attention backend backed by
++        ``sgl-kernel-xpu`` (cutlass-based ``torch.ops.sgl_kernel.fwd``).
++        When sgl-kernel is unavailable, the backend internally falls back to
++        ``torch.nn.functional.scaled_dot_product_attention``.
++
++        Use ``--attention-backend TORCH_SDPA`` to force the pure SDPA path.
 +        """
-+        # Log the requested backend
-+        if selected_backend is not None:
-+            logger.info(f"Requested attention backend: {selected_backend}")
-+        
-+        # XPU-specific backends that are not supported
-+        unsupported_backends = [
-+            AttentionBackendEnum.FA,
-+            AttentionBackendEnum.FA2,
-+            AttentionBackendEnum.SLIDING_TILE_ATTN,
-+            AttentionBackendEnum.SAGE_ATTN,
-+            AttentionBackendEnum.SAGE_ATTN_3,
-+            AttentionBackendEnum.VIDEO_SPARSE_ATTN,
-+            AttentionBackendEnum.VMOBA_ATTN,
-+        ]
-+        
-+        if selected_backend in unsupported_backends:
++        # Explicit SDPA request
++        if selected_backend == AttentionBackendEnum.TORCH_SDPA:
++            logger.info("Using Torch SDPA backend for XPU (explicitly requested).")
++            return cls._SDPA_BACKEND_CLS
++
++        # Non-XPU/SDPA backends are not supported on XPU
++        if (
++            selected_backend is not None
++            and selected_backend != AttentionBackendEnum.INTEL_XPU
++        ):
 +            logger.warning(
 +                f"{selected_backend.name} is not supported on XPU. "
-+                "Falling back to Torch SDPA backend."
++                "Falling back to XPU flash-attention backend."
 +            )
-+            selected_backend = AttentionBackendEnum.TORCH_SDPA
-+        
-+        # AIter is also CUDA/ROCm specific
-+        if selected_backend == AttentionBackendEnum.AITER:
-+            logger.warning(
-+                "AIter backend is not supported on XPU. "
-+                "Falling back to Torch SDPA backend."
-+            )
-+            selected_backend = AttentionBackendEnum.TORCH_SDPA
-+        
-+        # Default to SDPA for XPU
-+        if selected_backend is None or selected_backend == AttentionBackendEnum.TORCH_SDPA:
-+            logger.info("Using Torch SDPA backend for XPU.")
-+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
-+        
-+        # Fallback to SDPA for any other unhandled case
-+        logger.warning(
-+            f"Unhandled backend {selected_backend}, falling back to SDPA."
++
++        logger.info(
++            "Using XPU flash-attention backend "
++            "(sgl-kernel cutlass flash attention with SDPA fallback)."
 +        )
-+        return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
++        return cls._INTEL_XPU_CLS
 +
 +    @classmethod
 +    def get_device_communicator_cls(cls) -> str:
 +        """
 +        Get device communicator class for XPU distributed communication.
-+        
++
 +        Returns the XPU communicator that uses oneCCL backend through PyTorch.
 +        """
 +        logger.info("Using XPU communicator with oneCCL backend.")
 +        return "sglang.multimodal_gen.runtime.distributed.device_communicators.xpu_communicator.XpuCommunicator"
-diff --git a/python/sglang/multimodal_gen/runtime/utils/common.py b/python/sglang/multimodal_gen/runtime/utils/common.py
-index 134609b2a..62eac0c5c 100644
---- a/python/sglang/multimodal_gen/runtime/utils/common.py
-+++ b/python/sglang/multimodal_gen/runtime/utils/common.py
-@@ -242,6 +242,26 @@ def get_zmq_socket(
- # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
- 
- 
-+@lru_cache(maxsize=1)
-+def is_hip() -> bool:
-+    return torch.version.hip is not None
-+
-+
-+@lru_cache(maxsize=1)
-+def is_cuda() -> bool:
-+    return torch.cuda.is_available() and torch.version.cuda is not None
-+
-+
-+@lru_cache(maxsize=1)
-+def is_cuda_alike() -> bool:
-+    return is_cuda() or is_hip() or is_xpu()
-+
-+
-+@lru_cache(maxsize=1)
-+def is_xpu() -> bool:
-+    return hasattr(torch, "xpu") and torch.xpu.is_available()
-+
-+
- @lru_cache(maxsize=1)
- def is_host_cpu_x86() -> bool:
-     machine = platform.machine().lower()
-@@ -256,9 +276,113 @@ def is_host_cpu_x86() -> bool:
- 
- 
- def set_cuda_arch():
--    capability = torch.cuda.get_device_capability()
--    arch = f"{capability[0]}.{capability[1]}"
--    os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
-+    """Set CUDA architecture for the current device. Kept for backward compatibility."""
-+    set_device_arch()
-+
-+
-+def set_device_arch():
-+    """Set device-specific architecture environment variables."""
-+    if is_cuda():
-+        capability = torch.cuda.get_device_capability()
-+        arch = f"{capability[0]}.{capability[1]}"
-+        os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
-+    elif is_xpu():
-+        # XPU doesn't have compute capability like CUDA
-+        # Set a generic marker if needed
-+        os.environ["TORCH_XPU_ARCH"] = "xpu"
-+    # For other devices, no action needed
-+
-+
-+# Device abstraction utilities
-+
-+
-+def get_device_type() -> str:
-+    """
-+    Get the current device type as a string.
-+    
-+    Returns:
-+        str: 'cuda', 'xpu', 'cpu', etc.
-+    """
-+    if is_cuda():
-+        return "cuda"
-+    elif is_xpu():
-+        return "xpu"
-+    elif is_hip():
-+        return "cuda"  # ROCm uses 'cuda' backend string in PyTorch
-+    else:
-+        return "cpu"
-+
-+
-+def get_device_module():
-+    """
-+    Get the appropriate torch device module (torch.cuda, torch.xpu, etc.).
-+    
-+    Returns:
-+        The torch device module for the current platform.
-+    """
-+    device_type = get_device_type()
-+    if device_type == "cuda":
-+        return torch.cuda
-+    elif device_type == "xpu":
-+        return torch.xpu
-+    else:
-+        raise RuntimeError(f"Unsupported device type: {device_type}")
-+
-+
-+def device_synchronize(device: torch.device | None = None):
-+    """
-+    Synchronize the device (equivalent to torch.cuda.synchronize for any device).
-+    
-+    Args:
-+        device: The device to synchronize. If None, synchronizes the current device.
-+    """
-+    if is_cuda() or is_hip():
-+        torch.cuda.synchronize(device)
-+    elif is_xpu():
-+        torch.xpu.synchronize(device)
-+
-+
-+def set_device(device_id: int):
-+    """
-+    Set the current device (equivalent to torch.cuda.set_device for any device).
-+    
-+    Args:
-+        device_id: The device ID to set as current.
-+    """
-+    if is_cuda() or is_hip():
-+        torch.cuda.set_device(device_id)
-+    elif is_xpu():
-+        torch.xpu.set_device(device_id)
-+
-+
-+def reset_peak_memory_stats(device: torch.device | None = None):
-+    """
-+    Reset peak memory statistics for the device.
-+    
-+    Args:
-+        device: The device for which to reset stats. If None, uses current device.
-+    """
-+    if is_cuda() or is_hip():
-+        torch.cuda.reset_peak_memory_stats(device)
-+    elif is_xpu():
-+        torch.xpu.reset_peak_memory_stats(device)
-+
-+
-+def max_memory_allocated(device: torch.device | None = None) -> int:
-+    """
-+    Get the maximum memory allocated on the device.
-+    
-+    Args:
-+        device: The device to query. If None, uses current device.
-+        
-+    Returns:
-+        int: Maximum memory allocated in bytes.
-+    """
-+    if is_cuda() or is_hip():
-+        return torch.cuda.max_memory_allocated(device)
-+    elif is_xpu():
-+        return torch.xpu.max_memory_allocated(device)
-+    return 0
- 
- 
- # env var managements
-diff --git a/python/sglang/multimodal_gen/runtime/utils/layerwise_offload.py b/python/sglang/multimodal_gen/runtime/utils/layerwise_offload.py
-index 36d83f472..f2e286091 100644
---- a/python/sglang/multimodal_gen/runtime/utils/layerwise_offload.py
-+++ b/python/sglang/multimodal_gen/runtime/utils/layerwise_offload.py
-@@ -39,11 +39,18 @@ class LayerwiseOffloadManager:
-         self.num_layers = num_layers
-         self.pin_cpu_memory = pin_cpu_memory
- 
--        self.enabled = bool(enabled and torch.cuda.is_available())
-+        # Check for available device (XPU or CUDA)
-+        self._is_xpu = hasattr(torch, 'xpu') and torch.xpu.is_available()
-+        self._is_cuda = torch.cuda.is_available()
-+        self.enabled = bool(enabled and (self._is_xpu or self._is_cuda))
-         if not self.enabled:
-             return
--        self.device = torch.device("cuda", torch.cuda.current_device())
--        self.copy_stream = torch.cuda.Stream()
-+        if self._is_xpu:
-+            self.device = torch.device("xpu", torch.xpu.current_device())
-+            self.copy_stream = torch.xpu.Stream()
-+        else:
-+            self.device = torch.device("cuda", torch.cuda.current_device())
-+            self.copy_stream = torch.cuda.Stream()
- 
-         self._layer_name_re = re.compile(
-             rf"(^|\.){re.escape(layers_attr_str)}\.(\d+)(\.|$)"
-@@ -135,7 +142,10 @@ class LayerwiseOffloadManager:
-     def prepare_for_next_denoise(self, non_blocking=True):
-         self.prefetch_layer(0, non_blocking=non_blocking)
-         if not non_blocking and self.copy_stream is not None:
--            torch.cuda.current_stream().wait_stream(self.copy_stream)
-+            if self._is_xpu:
-+                torch.xpu.current_stream().wait_stream(self.copy_stream)
-+            else:
-+                torch.cuda.current_stream().wait_stream(self.copy_stream)
- 
-     def get_target_with_name(self, name: str) -> torch.Tensor:
-         """get the target model weight/buffer to be replaced"""
-@@ -155,11 +165,18 @@ class LayerwiseOffloadManager:
-             return
-         if layer_idx not in self._consolidated_cpu_weights:
-             return
--        self.copy_stream.wait_stream(torch.cuda.current_stream())
-+        if self._is_xpu:
-+            self.copy_stream.wait_stream(torch.xpu.current_stream())
-+        else:
-+            self.copy_stream.wait_stream(torch.cuda.current_stream())
- 
-         # create gpu buffer and load from CPU buffer
-         gpu_buffers: Dict[torch.dtype, torch.Tensor] = {}
--        with torch.cuda.stream(self.copy_stream):
-+        if self._is_xpu:
-+            stream_context = torch.xpu.stream(self.copy_stream)
-+        else:
-+            stream_context = torch.cuda.stream(self.copy_stream)
-+        with stream_context:
-             for dtype, cpu_buffer in self._consolidated_cpu_weights[layer_idx].items():
-                 gpu_buffer = torch.empty(
-                     cpu_buffer.shape, dtype=dtype, device=self.device
-diff --git a/python/sglang/multimodal_gen/runtime/utils/perf_logger.py b/python/sglang/multimodal_gen/runtime/utils/perf_logger.py
-index 7c60d9352..5062cf91f 100644
---- a/python/sglang/multimodal_gen/runtime/utils/perf_logger.py
-+++ b/python/sglang/multimodal_gen/runtime/utils/perf_logger.py
-@@ -153,9 +153,11 @@ class StageProfiler:
-             if (
-                 os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-                 and self.stage_name.startswith("denoising_step_")
--                and torch.cuda.is_available()
-             ):
--                torch.cuda.synchronize()
-+                if hasattr(torch, 'xpu') and torch.xpu.is_available():
-+                    torch.xpu.synchronize()
-+                elif torch.cuda.is_available():
-+                    torch.cuda.synchronize()
-             self.start_time = time.perf_counter()
- 
-         return self
-@@ -167,9 +169,11 @@ class StageProfiler:
-         if (
-             os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-             and self.stage_name.startswith("denoising_step_")
--            and torch.cuda.is_available()
-         ):
--            torch.cuda.synchronize()
-+            if hasattr(torch, 'xpu') and torch.xpu.is_available():
-+                torch.xpu.synchronize()
-+            elif torch.cuda.is_available():
-+                torch.cuda.synchronize()
-         execution_time_s = time.perf_counter() - self.start_time
- 
-         if exc_type:
 diff --git a/python/sglang/multimodal_gen/runtime/utils/profiler.py b/python/sglang/multimodal_gen/runtime/utils/profiler.py
-index 037133e8a..c9f5a9f63 100644
+index d01a51f86..ba48bcb4d 100644
 --- a/python/sglang/multimodal_gen/runtime/utils/profiler.py
 +++ b/python/sglang/multimodal_gen/runtime/utils/profiler.py
-@@ -106,7 +106,9 @@ class SGLDiffusionProfiler:
-             return
-         self.has_stopped = True
+@@ -59,6 +59,8 @@ class SGLDiffusionProfiler:
+             activities.append(torch.profiler.ProfilerActivity.CUDA)
+         if current_platform.is_npu():
+             activities.append(torch_npu.profiler.ProfilerActivity.NPU)
++        if hasattr(torch, "xpu") and torch.xpu.is_available():
++            activities.append(torch.profiler.ProfilerActivity.XPU)
+ 
+         common_torch_profiler_args = dict(
+             activities=activities,
+@@ -129,9 +131,11 @@ class SGLDiffusionProfiler:
          logger.info("Stopping Profiler...")
--        if torch.cuda.is_available():
-+        if hasattr(torch, 'xpu') and torch.xpu.is_available():
-+            torch.xpu.synchronize()
-+        elif torch.cuda.is_available():
+         if torch.cuda.is_available():
              torch.cuda.synchronize()
+-        if current_platform.is_npu():
++        elif current_platform.is_npu():
+             torch.npu.synchronize()
+             export_trace = False  # set to false because our internal torch_npu.profiler will generate trace file
++        elif hasattr(torch, "xpu") and torch.xpu.is_available():
++            torch.xpu.synchronize()
          self.profiler.stop()
  
+         if export_trace:
 diff --git a/python/sglang/multimodal_gen/utils.py b/python/sglang/multimodal_gen/utils.py
-index 25db24574..6d00cb616 100644
+index 97cd59acc..552410750 100644
 --- a/python/sglang/multimodal_gen/utils.py
 +++ b/python/sglang/multimodal_gen/utils.py
-@@ -74,22 +74,32 @@ def find_nccl_library() -> str:
+@@ -74,22 +74,23 @@ def find_nccl_library() -> str:
      return str(so_file)
  
  
 -prev_set_stream = torch.cuda.set_stream
 +# Platform-aware stream management
-+# Check if XPU is available and set up appropriate stream patching
-+_is_xpu_available = hasattr(torch, "xpu") and torch.xpu.is_available()
-+
-+if _is_xpu_available:
-+    prev_set_stream = torch.xpu.set_stream
-+else:
-+    prev_set_stream = torch.cuda.set_stream
++prev_set_stream = torch.get_device_module().set_stream
  
  _current_stream = None
  
@@ -1773,10 +1378,7 @@ index 25db24574..6d00cb616 100644
  
  
 -torch.cuda.set_stream = _patched_set_stream
-+if _is_xpu_available:
-+    torch.xpu.set_stream = _patched_set_stream
-+else:
-+    torch.cuda.set_stream = _patched_set_stream
++torch.get_device_module().set_stream = _patched_set_stream
  
  
 -def current_stream() -> torch.cuda.Stream | None:
@@ -1784,7 +1386,7 @@ index 25db24574..6d00cb616 100644
      """
      replace `torch.cuda.current_stream()` with `sglang.multimodal_gen.utils.current_stream()`.
      it turns out that `torch.cuda.current_stream()` is quite expensive,
-@@ -102,7 +112,7 @@ def current_stream() -> torch.cuda.Stream | None:
+@@ -102,7 +103,7 @@ def current_stream() -> torch.cuda.Stream | None:
      """
      from sglang.multimodal_gen.runtime.platforms import current_platform
  
@@ -1793,7 +1395,7 @@ index 25db24574..6d00cb616 100644
      if not current_platform.is_cuda_alike():
          return None
  
-@@ -110,14 +120,15 @@ def current_stream() -> torch.cuda.Stream | None:
+@@ -110,14 +111,15 @@ def current_stream() -> torch.cuda.Stream | None:
      if _current_stream is None:
          # when this function is called before any stream is set,
          # we return the default stream.
@@ -1805,15 +1407,15 @@ index 25db24574..6d00cb616 100644
 -            if current_platform.is_rocm()
 -            else torch.cuda.current_stream()
 -        )
-+        if current_platform.is_xpu():
-+            _current_stream = torch.xpu.Stream()
-+        elif current_platform.is_rocm():
++        if current_platform.is_rocm():
 +            # On ROCm using the default 0 stream in combination with RCCL
 +            # is hurting performance. Therefore creating a dedicated stream
 +            # per process
 +            _current_stream = torch.cuda.Stream()
++        elif current_platform.is_xpu():
++            _current_stream = torch.xpu.Stream()
 +        else:
 +            _current_stream = torch.cuda.current_stream()
      return _current_stream
  
- 
+

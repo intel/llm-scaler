@@ -97,7 +97,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # ComfyUI custom nodes (active)
 COPY ./patches/raylight_for_multi_arc.patch /tmp/
-COPY ./patches/comfyui_gguf_xpu.patch /tmp/
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/ComfyUI/custom_nodes && \
@@ -123,13 +122,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/ComfyUI/custom_nodes && \
     git clone --depth 1 https://github.com/Jasonzzt/ComfyUI-CacheDiT.git && \
     pip install -r ComfyUI-CacheDiT/requirements.txt && \
-    git clone --depth 1 https://github.com/city96/ComfyUI-GGUF.git && \
-    cd ComfyUI-GGUF && \
-    git fetch --depth 1 origin 6ea2651e7df66d7585f6ffee804b20e92fb38b8a && \
-    git checkout 6ea2651e7df66d7585f6ffee804b20e92fb38b8a && \
-    git apply /tmp/comfyui_gguf_xpu.patch && \
+    git clone --depth 1 https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git && \
+    cd ComfyUI-GGUF-XPU && \
     pip install -r requirements.txt && \
-    rm -f /tmp/raylight_for_multi_arc.patch /tmp/comfyui_gguf_xpu.patch
+    rm -f /tmp/raylight_for_multi_arc.patch
 
 # ComfyUI disabled custom nodes (optional: --build-arg INSTALL_DISABLED_NODES=true)
 ARG INSTALL_DISABLED_NODES=false
@@ -155,7 +151,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git fetch --depth 1 origin 9d7ef32509101495a7840b3ae8e718c8d1183305 && \
     git checkout 9d7ef32509101495a7840b3ae8e718c8d1183305 && \
     git apply /tmp/comfyui_hunyuan3d_for_xpu.patch && \
-    pip install bigdl-core==2.4.0b1 rembg realesrgan -r requirements.txt && \
+    pip install rembg realesrgan -r requirements.txt && \
     cd hy3dpaint/custom_rasterizer && python setup.py install && \
     cd ../DifferentiableRenderer && python setup.py install && \
     cd /llm/ComfyUI/custom_nodes && \
@@ -192,9 +188,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm && \
     git clone --depth 1 https://github.com/sgl-project/sglang.git && \
     cd sglang && \
-    git fetch --depth 1 origin a83484275daf46efa6d61f89dc333059fd0a04a5 && \
-    git checkout a83484275daf46efa6d61f89dc333059fd0a04a5 && \
+    git fetch --depth 1 origin 0e53cee1f69beba0b1ae598e6fd5646fc52afb32 && \
+    git checkout 0e53cee1f69beba0b1ae598e6fd5646fc52afb32 && \
     git apply /tmp/sglang_diffusion_for_multi_arc.patch && \
+    cp python/pyproject_xpu.toml python/pyproject.toml && \
+    sed -i '/sgl-kernel/d' python/pyproject.toml && \
     pip install -e "python[diffusion]" && \
     pip install triton==3.5.0 && \
     pip install pytorch-triton-xpu==3.5.0 \

@@ -7,8 +7,6 @@
 **/build
 **/dist
 **/*.egg-info
-**/benchmark_outputs
-**/benchmark_video_outputs
 **/outputs
 **/logs
 **/models
