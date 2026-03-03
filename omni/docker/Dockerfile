@@ -2,7 +2,6 @@
 # Copyright (C) 2025 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-# -- Shared build arguments --
 ARG BASE_IMAGE=intel/llm-scaler-platform:25.45.5.4
 ARG PYTHON_VERSION=3.12
 ARG TORCH_VERSION=2.9.0
@@ -10,9 +9,7 @@ ARG TORCHVISION_VERSION=0.24.0
 ARG TORCHAUDIO_VERSION=2.9.0
 ARG ONEAPI_VERSION=2025.2.0-517
 
-# ################################################################
 # ======== Builder Stage ========
-# ################################################################
 FROM ${BASE_IMAGE} AS builder
 
 ARG https_proxy
@@ -25,9 +22,7 @@ ARG ONEAPI_VERSION
 
 ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python${PYTHON_VERSION}/dist-packages/torch/lib:${LD_LIBRARY_PATH}"
 
-# ============================================================
-# Stage 1: System packages (changes rarely => good cache layer)
-# ============================================================
+# System packages
 RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
         | gpg --dearmor \
         | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
@@ -41,7 +36,6 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     apt-get install -y --no-install-recommends --fix-missing \
         curl ffmpeg git libsndfile1 libsm6 libxext6 libgl1 \
         lsb-release numactl wget vim linux-libc-dev \
-        # Hunyuan3D deps (install once, avoid second apt-get update)
         libopengl0 libglx0 libxrender1 libxfixes3 libx11-dev \
         libxi6 libxxf86vm1 libxcursor1 libxrandr2 libxinerama1 \
         libxkbcommon0 && \
@@ -49,9 +43,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     apt-get install -y intel-oneapi-dpcpp-ct=${ONEAPI_VERSION} && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ============================================================
-# Stage 2: Core Python/PyTorch packages (changes less often)
-# ============================================================
+# PyTorch
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip config set global.break-system-packages true && \
     pip install \
@@ -61,18 +53,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         --index-url https://download.pytorch.org/whl/xpu && \
     pip install pytest
 
-# ============================================================
-# Stage 3: Install omni_xpu_kernel (Intel XPU optimized kernels)
-# ============================================================
+# omni_xpu_kernel
 COPY ./omni_xpu_kernel /tmp/omni_xpu_kernel
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /tmp/omni_xpu_kernel && \
     pip install . --no-build-isolation && \
     rm -rf /tmp/omni_xpu_kernel
 
-# ============================================================
-# Stage 4: xDiT / long-context-attention
-# ============================================================
+# xDiT / long-context-attention
 COPY ./patches/yunchang_for_multi_arc.patch /tmp/
 COPY ./patches/xdit_for_multi_arc.patch /tmp/
 
@@ -94,9 +82,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -e . && \
     rm -f /tmp/yunchang_for_multi_arc.patch /tmp/xdit_for_multi_arc.patch
 
-# ============================================================
-# Stage 5: ComfyUI core
-# ============================================================
+# ComfyUI core
 COPY ./patches/comfyui_for_multi_arc.patch /tmp/
 
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -109,20 +95,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt && \
     rm -f /tmp/comfyui_for_multi_arc.patch
 
-# ============================================================
-# Stage 6: ComfyUI custom nodes (active only)
-# ============================================================
+# ComfyUI custom nodes (active)
 COPY ./patches/raylight_for_multi_arc.patch /tmp/
 COPY ./patches/comfyui_gguf_xpu.patch /tmp/
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/ComfyUI/custom_nodes && \
-    # ComfyUI-Manager (no requirements.txt)
     git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Manager.git comfyui-manager && \
-    # VideoHelperSuite
     git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git comfyui-videohelpersuite && \
     pip install -r comfyui-videohelpersuite/requirements.txt && \
-    # Raylight
     git clone --depth 1 https://github.com/komikndr/raylight.git && \
     cd raylight && \
     git fetch --depth 1 origin c91ef47afb02e522bf08ff199ea2182642de0368 && \
@@ -130,23 +111,18 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git apply /tmp/raylight_for_multi_arc.patch && \
     pip install ray==2.49.2 -r requirements.txt && \
     cd /llm/ComfyUI/custom_nodes && \
-    # Easy-Use
     git clone --depth 1 https://github.com/yolain/ComfyUI-Easy-Use.git comfyui-easy-use && \
     pip install -r comfyui-easy-use/requirements.txt && \
-    # ControlNet Aux
     git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux.git && \
     pip install -r comfyui_controlnet_aux/requirements.txt && \
-    # KJNodes
     git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git && \
     cd ComfyUI-KJNodes && \
     git fetch --depth 1 origin c6ce76d00bb8177d1b0286cad891df08eff5226e && \
     git checkout c6ce76d00bb8177d1b0286cad891df08eff5226e && \
     pip install -r requirements.txt && \
     cd /llm/ComfyUI/custom_nodes && \
-    # CacheDiT
     git clone --depth 1 https://github.com/Jasonzzt/ComfyUI-CacheDiT.git && \
     pip install -r ComfyUI-CacheDiT/requirements.txt && \
-    # ComfyUI-GGUF
     git clone --depth 1 https://github.com/city96/ComfyUI-GGUF.git && \
     cd ComfyUI-GGUF && \
     git fetch --depth 1 origin 6ea2651e7df66d7585f6ffee804b20e92fb38b8a && \
@@ -155,9 +131,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt && \
     rm -f /tmp/raylight_for_multi_arc.patch /tmp/comfyui_gguf_xpu.patch
 
-# ============================================================
-# Stage 7: ComfyUI disabled custom nodes (optional, via build arg)
-# ============================================================
+# ComfyUI disabled custom nodes (optional: --build-arg INSTALL_DISABLED_NODES=true)
 ARG INSTALL_DISABLED_NODES=false
 COPY ./patches/comfyui_voxcpm_for_xpu.patch /tmp/
 COPY ./patches/comfyui_hunyuan3d_for_xpu.patch /tmp/
@@ -167,7 +141,6 @@ COPY ./patches/comfyui_seedvr2_xpu.patch /tmp/
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "${INSTALL_DISABLED_NODES}" = "true" ]; then \
     cd /llm/ComfyUI/custom_nodes && \
-    # VoxCPM (disabled by default)
     git clone --depth 1 https://github.com/wildminder/ComfyUI-VoxCPM.git comfyui-voxcpm.disabled && \
     cd comfyui-voxcpm.disabled && \
     git fetch --depth 1 origin 7875a8a36a531b7efef8cac96dc74001d3cb5895 && \
@@ -175,10 +148,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git apply /tmp/comfyui_voxcpm_for_xpu.patch && \
     pip install -r requirements.txt && \
     cd /llm/ComfyUI/custom_nodes && \
-    # IndexTTS (disabled by default)
     git clone --depth 1 https://github.com/billwuhao/ComfyUI_IndexTTS.git ComfyUI_IndexTTS.disabled && \
     pip install -r ComfyUI_IndexTTS.disabled/requirements.txt torchcodec==0.9.0 && \
-    # Hunyuan3D (disabled by default)
     git clone --depth 1 https://github.com/visualbruno/ComfyUI-Hunyuan3d-2-1.git ComfyUI-Hunyuan3d-2-1.disabled && \
     cd ComfyUI-Hunyuan3d-2-1.disabled && \
     git fetch --depth 1 origin 9d7ef32509101495a7840b3ae8e718c8d1183305 && \
@@ -188,7 +159,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd hy3dpaint/custom_rasterizer && python setup.py install && \
     cd ../DifferentiableRenderer && python setup.py install && \
     cd /llm/ComfyUI/custom_nodes && \
-    # HY-Motion1 (disabled by default)
     git clone --depth 1 https://github.com/jtydhr88/ComfyUI-HY-Motion1.git ComfyUI-HY-Motion1.disabled && \
     cd ComfyUI-HY-Motion1.disabled && \
     git fetch --depth 1 origin 47b1d0d96eeac6d4b99509ede91490eaba93440a && \
@@ -196,7 +166,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git apply /tmp/comfyui_hy_motion1.patch && \
     pip install -r requirements.txt && \
     cd /llm/ComfyUI/custom_nodes && \
-    # SeedVR2 (disabled by default)
     git clone --depth 1 https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git ComfyUI-SeedVR2_VideoUpscaler.disabled && \
     cd ComfyUI-SeedVR2_VideoUpscaler.disabled && \
     git fetch --depth 1 origin 4490bd1f482e026674543386bb2a4d176da245b9 && \
@@ -206,9 +175,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     fi && \
     rm -f /tmp/*.patch
 
-# ============================================================
-# Stage 8: Xinference
-# ============================================================
+# Xinference
 COPY ./patches/xinference_device_utils.patch /tmp/
 
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -218,9 +185,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         < /tmp/xinference_device_utils.patch && \
     rm -f /tmp/xinference_device_utils.patch
 
-# ============================================================
-# Stage 9: SGLang Diffusion + sgl-kernel-xpu
-# ============================================================
+# SGLang Diffusion + sgl-kernel-xpu
 COPY ./patches/sglang_diffusion_for_multi_arc.patch /tmp/
 
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -240,37 +205,28 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git fetch --depth 1 origin 374c2e85a7ec13d59919a6f6ac6db5724ef41577 && \
     git checkout 374c2e85a7ec13d59919a6f6ac6db5724ef41577 && \
     pip install -v . && \
-    # Install ComfyUI SGLDiffusion node
     cp -r /llm/sglang/python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion \
         /llm/ComfyUI/custom_nodes/ && \
     rm -f /tmp/sglang_diffusion_for_multi_arc.patch
 
-# ============================================================
-# Builder: Copy application files into /llm
-# ============================================================
+# Application files
 COPY ./workflows/* /llm/ComfyUI/user/default/workflows/
 COPY ./example_inputs/* /llm/ComfyUI/input/
 COPY ./tools/* /llm/tools/
 COPY ./entrypoints/* /llm/entrypoints/
 
-# ============================================================
-# Builder: Final cleanup — strip .git, __pycache__, build caches
-# ============================================================
+# Builder cleanup
 RUN find /llm -name '.git' -type d -exec rm -rf {} + 2>/dev/null; \
     find /llm -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null; \
     find /llm -name '*.pyc' -delete 2>/dev/null; \
     find /llm -name '.gitignore' -delete 2>/dev/null; \
     find /llm -name '.gitmodules' -delete 2>/dev/null; \
     rm -rf /tmp/* /root/.cache/pip /root/.cache/torch; \
-    # Remove egg-info and dist-info that are not needed at runtime
     find /usr/local/lib/python${PYTHON_VERSION}/dist-packages \
         -name '*.dist-info' -path '*/SOURCES.txt' -delete 2>/dev/null; \
     true
 
-
-# ################################################################
 # ======== Runtime Stage ========
-# ################################################################
 FROM ${BASE_IMAGE} AS runtime
 
 ARG https_proxy
@@ -278,9 +234,7 @@ ARG http_proxy
 ARG PYTHON_VERSION=3.12
 ARG ONEAPI_VERSION=2025.2.0-517
 
-# ============================================================
-# Runtime: Install system packages (including dev tools for debugging)
-# ============================================================
+# System packages
 RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
         | gpg --dearmor \
         | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
@@ -292,11 +246,8 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
     update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
     apt-get install -y --no-install-recommends --fix-missing \
-        # Dev tools (kept for development/debugging)
-        curl git wget vim lsb-release linux-libc-dev \
-        # Core runtime libs
-        ffmpeg libsndfile1 libsm6 libxext6 libgl1 numactl \
-        # GL/X11 runtime libs (Hunyuan3D, rendering)
+        curl ffmpeg git libsndfile1 libsm6 libxext6 libgl1 \
+        lsb-release numactl wget vim linux-libc-dev \
         libopengl0 libglx0 libxrender1 libxfixes3 libx11-dev \
         libxi6 libxxf86vm1 libxcursor1 libxrandr2 libxinerama1 \
         libxkbcommon0 && \
@@ -305,21 +256,12 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     python3 -m pip config set global.break-system-packages true
 
-# ============================================================
-# Runtime: Copy built artifacts from builder
-# ============================================================
-# Python packages (site-packages + scripts)
+# Copy built artifacts from builder
 COPY --from=builder /usr/local/lib/python${PYTHON_VERSION}/ /usr/local/lib/python${PYTHON_VERSION}/
 COPY --from=builder /usr/local/bin/ /usr/local/bin/
-# Shared libraries installed by pip packages (e.g. torch C++ extensions)
 COPY --from=builder /usr/local/lib/*.so* /usr/local/lib/
-
-# Application directory (ComfyUI, xDiT, sglang, etc.)
 COPY --from=builder /llm/ /llm/
 
-# ============================================================
-# Runtime: Environment
-# ============================================================
 ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python${PYTHON_VERSION}/dist-packages/torch/lib:${LD_LIBRARY_PATH}"
 ENV CCL_SYCL_ALLTOALL_ARC_LL=1
 ENV CCL_SYCL_CCL_BARRIER=1
