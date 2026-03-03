@@ -1,0 +1,187 @@
+diff --git a/nodes.py b/nodes.py
+index 37e9b3e..f1379cd 100644
+--- a/nodes.py
++++ b/nodes.py
+@@ -372,7 +372,7 @@ class FlashVSRNodeInitPipe:
+     def main(self, model, mode, alt_vae, force_offload, precision, device, attention_mode):
+         _device = device
+         if device == "auto":
+-            _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else device
++            _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "xpu" if torch.xpu.is_available() else device
+         if _device == "auto" or _device not in device_choices:
+             raise RuntimeError("No devices found to run FlashVSR!")
+             
+@@ -408,10 +408,10 @@ class FlashVSRNodeAdv:
+                 "frames": ("IMAGE", {
+                     "tooltip": "Sequential video frames as IMAGE tensor batch"
+                 }),
+-                "scale": ("INT", {
+-                    "default": 2,
+-                    "min": 2,
+-                    "max": 4,
++                "scale": ("INT", {
++                    "default": 2,
++                    "min": 2,
++                    "max": 4,
+                 }),
+                 "color_fix": ("BOOLEAN", {
+                     "default": True,
+@@ -426,14 +426,14 @@ class FlashVSRNodeAdv:
+                     "tooltip": "Significantly reduces VRAM usage at the cost of speed."
+                 }),
+                 "tile_size": ("INT", {
+-                    "default": 256,
+-                    "min": 32,
++                    "default": 256,
++                    "min": 32,
+                     "max": 1024,
+                     "step": 32,
+                 }),
+                 "tile_overlap": ("INT", {
+-                    "default": 24,
+-                    "min": 8,
++                    "default": 24,
++                    "min": 8,
+                     "max": 512,
+                     "step": 8,
+                 }),
+@@ -441,33 +441,33 @@ class FlashVSRNodeAdv:
+                     "default": False,
+                     "tooltip": "Unload DiT before decoding to reduce VRAM peak at the cost of speed."
+                 }),
+-                "sparse_ratio": ("FLOAT", {
+-                    "default": 2.0,
+-                    "min": 1.5,
++                "sparse_ratio": ("FLOAT", {
++                    "default": 2.0,
++                    "min": 1.5,
+                     "max": 2.0,
+                     "step": 0.1,
+                     "display": "slider",
+-                    "tooltip": "Recommended: 1.5 or 2.0\n1.5 → faster; 2.0 → more stable"
++                    "tooltip": "Recommended: 1.5 or 2.0\n1.5 → faster; 2.0 → more stable"
+                 }),
+-                "kv_ratio": ("FLOAT", {
+-                    "default": 3.0,
+-                    "min": 1.0,
++                "kv_ratio": ("FLOAT", {
++                    "default": 3.0,
++                    "min": 1.0,
+                     "max": 3.0,
+                     "step": 0.1,
+                     "display": "slider",
+-                    "tooltip": "Recommended: 1.0 to 3.0\n1.0 → less vram; 3.0 → high quality"
++                    "tooltip": "Recommended: 1.0 to 3.0\n1.0 → less vram; 3.0 → high quality"
+                 }),
+-                "local_range": ("INT", {
+-                    "default": 11,
+-                    "min": 9,
++                "local_range": ("INT", {
++                    "default": 11,
++                    "min": 9,
+                     "max": 11,
+                     "step": 2,
+-                    "tooltip": "Recommended: 9 or 11\nlocal_range=9 → sharper details; 11 → more stable results"
++                    "tooltip": "Recommended: 9 or 11\nlocal_range=9 → sharper details; 11 → more stable results"
+                 }),
+-                "seed": ("INT", {
+-                    "default": 0,
+-                    "min": 0,
+-                    "max": 1125899906842624
++                "seed": ("INT", {
++                    "default": 0,
++                    "min": 0,
++                    "max": 1125899906842624
+                 }),
+             }
+         }
+@@ -499,10 +499,10 @@ class FlashVSRNode:
+                     "default": "tiny",
+                     "tooltip": 'Using "tiny-long" mode can significantly reduce VRAM used with long video input.'
+                 }),
+-                "scale": ("INT", {
+-                    "default": 2,
+-                    "min": 2,
+-                    "max": 4,
++                "scale": ("INT", {
++                    "default": 2,
++                    "min": 2,
++                    "max": 4,
+                 }),
+                 "tiled_vae": ("BOOLEAN", {
+                     "default": True,
+@@ -516,10 +516,10 @@ class FlashVSRNode:
+                     "default": False,
+                     "tooltip": "Unload DiT before decoding to reduce VRAM peak at the cost of speed."
+                 }),
+-                "seed": ("INT", {
+-                    "default": 0,
+-                    "min": 0,
+-                    "max": 1125899906842624
++                "seed": ("INT", {
++                    "default": 0,
++                    "min": 0,
++                    "max": 1125899906842624
+                 }),
+             }
+         }
+@@ -532,7 +532,7 @@ class FlashVSRNode:
+     
+     def main(self, model, frames, mode, scale, tiled_vae, tiled_dit, unload_dit, seed):
+         wan_video_dit.USE_BLOCK_ATTN = False
+-        _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "auto"
++        _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "xpu" if torch.xpu.is_available() else "auto"
+         if _device == "auto" or _device not in device_choices:
+             raise RuntimeError("No devices found to run FlashVSR!")
+             
+diff --git a/src/models/utils.py b/src/models/utils.py
+index 94eaa66..ceab1f6 100644
+--- a/src/models/utils.py
++++ b/src/models/utils.py
+@@ -192,6 +192,8 @@ def clean_vram():
+     if torch.cuda.is_available():
+         torch.cuda.empty_cache()
+         torch.cuda.ipc_collect()
++    if torch.xpu.is_available():
++        torch.xpu.empty_cache()
+     if torch.backends.mps.is_available():
+         torch.mps.empty_cache()
+ 
+@@ -202,6 +204,11 @@ def get_device_list():
+             devs += [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+     except Exception:
+         pass
++    try:
++        if hasattr(torch, "xpu") and hasattr(torch.xpu, "is_available") and torch.xpu.is_available():
++            devs += [f"xpu:{i}" for i in range(torch.xpu.device_count())]
++    except Exception:
++        pass
+     try:
+         if hasattr(torch, "mps") and hasattr(torch.mps, "is_available") and torch.backends.mps.is_available():
+             devs += [f"mps:{i}" for i in range(torch.mps.device_count())]
+diff --git a/src/models/wan_video_dit.py b/src/models/wan_video_dit.py
+index 328e743..8b548ed 100644
+--- a/src/models/wan_video_dit.py
++++ b/src/models/wan_video_dit.py
+@@ -17,7 +17,7 @@ except ModuleNotFoundError:
+ 
+ try:
+     import flash_attn
+-    FLASH_ATTN_2_AVAILABLE = True
++    FLASH_ATTN_2_AVAILABLE = callable(getattr(flash_attn, 'flash_attn_func', None))
+ except ModuleNotFoundError:
+     FLASH_ATTN_2_AVAILABLE = False
+ 
+diff --git a/src/pipelines/base.py b/src/pipelines/base.py
+index e9f6a4d..b8be0bb 100644
+--- a/src/pipelines/base.py
++++ b/src/pipelines/base.py
+@@ -119,6 +119,8 @@ class BasePipeline(torch.nn.Module):
+         # fresh the cuda cache
+         if torch.cuda.is_available():
+             torch.cuda.empty_cache()
++        if torch.xpu.is_available():
++            torch.xpu.empty_cache()
+         if torch.backends.mps.is_available():
+             torch.mps.empty_cache()
+ 

@@ -91,11 +91,11 @@ The following models are supported in ComfyUI workflows. For detailed model file
 | **Video Generation** | LTX-2 T2V 19B, LTX-2 I2V 19B, | Text-to-Video, Image-to-Video | `video_ltx2_19B_t2v.json`, `video_ltx2_19B_i2v.json`, `video_ltx_2_19B_t2v_distilled.json`, `video_ltx_2_19B_i2v_distilled.json` |
 | **3D Generation** | Hunyuan3D 2.1 | Text/Image-to-3D | `3d_hunyuan3d.json` |
 | **Audio Generation** | VoxCPM1.5, IndexTTS 2 | Text-to-Speech, Voice Cloning | `audio_VoxCPM_example.json`, `audio_indextts2.json` |
-| **Video Upscaling** | SeedVR2 | Video Restoration and Upscaling | `video_upscale_SeedVR2.json` |
+| **Video Upscaling** | SeedVR2, FlashVSR-v1.1 | Video Restoration and Upscaling | `video_upscale_SeedVR2.json`, `video_upscale_FlashVSR.json` |
 
 ### Enabling Optional Nodes
 
-Some nodes are disabled by default to save resources. To use **SeedVR2**, **Hunyuan3D**, **VoxCPM**, **IndexTTS**, or **HY-Motion1**, you can enable them using **ComfyUI Manager**:
+Some nodes are disabled by default to save resources. To use **SeedVR2**, **FlashVSR** **Hunyuan3D**, **VoxCPM**, **IndexTTS**, or **HY-Motion1**, you can enable them using **ComfyUI Manager**:
 
 1. Click the **Manager** button in the ComfyUI menu.
 2. In the Manager window, use the **Filter** dropdown to select **Disabled**.
@@ -305,6 +305,15 @@ GitHub: https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler
 - **video_upscale_SeedVR2.json**: Video restoration and upscaling workflow
 
 This workflow uses SeedVR2, a diffusion-based video super-resolution model, to upscale and restore video quality.
+
+##### FlashVSR
+
+GitHub: https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast
+
+**Available Workflows:**
+- **video_upscale_FlashVSR.json**: Video restoration and upscaling workflow
+
+This workflow uses FlashVSR-v1.1, a diffusion-based video super-resolution model, to upscale and restore video quality.
 
 
 #### Audio Generation Workflows

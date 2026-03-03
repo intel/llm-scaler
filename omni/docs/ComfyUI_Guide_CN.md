@@ -763,6 +763,33 @@ SeedVR2 是一个基于扩散模型的视频超分辨率模型，可对视频进
 
 > 模型**首次使用时自动下载**。也可手动从 [numz/SeedVR2_comfyUI](https://huggingface.co/numz/SeedVR2_comfyUI)。
 
+#### 工作流文件
+
+| 工作流 | 说明 |
+|--------|------|
+| `video_upscale_SeedVR2.json` | 视频修复放大 |
+
+### FlashVSR
+
+FlashVSR 是一个基于扩散模型的视频超分辨率模型，可对视频进行修复和超清放大。
+
+#### 模型存放位置
+
+```text
+📂 ComfyUI/
+└── 📂 models/
+    └── 📂 FlashVSR-v1.1/
+```
+
+> 模型**首次使用时自动下载**。也可手动从 [JunhaoZhuang/FlashVSR-v1.1](https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1)。
+
+#### 工作流文件
+
+| 工作流 | 说明 |
+|--------|------|
+| `video_upscale_FlashVSR.json` | 视频修复放大 |
+
+
 ---
 
 ## 常见问题

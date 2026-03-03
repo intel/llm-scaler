@@ -153,6 +153,12 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     git checkout 4490bd1f482e026674543386bb2a4d176da245b9 && \
     git apply /tmp/comfyui_seedvr2_xpu.patch && \
     pip install -r requirements.txt && \
+# Install ComfyUI-FlashVSR_Ultra_Fast Node
+    cd /llm/ComfyUI/custom_nodes && \
+    git clone https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast.git && \
+    cd ComfyUI-FlashVSR_Ultra_Fast && \
+    git checkout 4820b3f02347bddcbbb9a5a85ab7638fe976366e && \
+    git apply /tmp/comfyui_flashvsr_ultra_fast_xpu.patch && \
 # Install Xinference
     pip install "xinference[transformers]==1.15.0" && \
     patch /usr/local/lib/python3.12/dist-packages/xinference/device_utils.py < /tmp/xinference_device_utils.patch && \
@@ -181,7 +187,8 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     mv ComfyUI_IndexTTS ComfyUI_IndexTTS.disabled && \
     mv ComfyUI-Hunyuan3d-2-1 ComfyUI-Hunyuan3d-2-1.disabled && \
     mv ComfyUI-HY-Motion1 ComfyUI-HY-Motion1.disabled && \
-    mv ComfyUI-SeedVR2_VideoUpscaler ComfyUI-SeedVR2_VideoUpscaler.disabled
+    mv ComfyUI-SeedVR2_VideoUpscaler ComfyUI-SeedVR2_VideoUpscaler.disabled && \
+    mv ComfyUI-FlashVSR_Ultra_Fast ComfyUI-FlashVSR_Ultra_Fast.disabled
 
 COPY ./workflows/* /llm/ComfyUI/user/default/workflows/
 COPY ./example_inputs/* /llm/ComfyUI/input/
