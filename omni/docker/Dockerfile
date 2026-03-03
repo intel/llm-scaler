@@ -19,6 +19,9 @@ COPY ./patches/sglang_diffusion_for_multi_arc.patch /tmp/
 COPY ./patches/comfyui_hy_motion1.patch /tmp/
 COPY ./patches/comfyui_gguf_xpu.patch /tmp/
 COPY ./omni_xpu_kernel /tmp/omni_xpu_kernel
+COPY ./patches/comfyui_indextts.patch /tmp/
+COPY ./patches/comfyui_flashvsr_ultra_fast_xpu.patch /tmp/
+COPY ./patches/comfyui_seedvr2_xpu.patch /tmp/
 
 
 
@@ -105,6 +108,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     cd .. && \
     git clone https://github.com/billwuhao/ComfyUI_IndexTTS.git && \
     cd ComfyUI_IndexTTS && \
+    git apply /tmp/comfyui_indextts.patch && \
     pip install -r requirements.txt && \
     pip install torchcodec==0.9.0 && \
     cd /llm/ComfyUI/custom_nodes && \

@@ -1,0 +1,20 @@
+diff --git a/indexttsnode.py b/indexttsnode.py
+index f6f5b5f..12ddc01 100644
+--- a/indexttsnode.py
++++ b/indexttsnode.py
+@@ -78,7 +78,14 @@ class AudioCacheManager:
+             ) as tmp_file:
+                 temp_filepath = tmp_file.name
+ 
+-            torchaudio.save(temp_filepath, audio_tensor, sample_rate)
++            # torchaudio.save(temp_filepath, audio_tensor, sample_rate)
++            # XPU fallback to soundfile if torchaudio fails
++            try:
++                torchaudio.save(temp_filepath, audio_tensor.cpu(), sample_rate)
++            except Exception as e:
++                print(f"Warning: torchaudio failed to save audio tensor, falling back to soundfile: {e}")
++                import soundfile as sf
++                sf.write(temp_filepath, audio_tensor.cpu().numpy().T, sample_rate)
+ 
+             return temp_filepath
+         except Exception as e:
