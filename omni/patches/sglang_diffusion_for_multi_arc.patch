@@ -24,6 +24,15 @@ index 14d1c0d3d..de95830a5 100644
  tracing = [
    "opentelemetry-sdk",
    "opentelemetry-api",
+@@ -94,5 +109,8 @@ all = []
+ dev = ["sglang[test]"]
+ 
++[project.scripts]
++sglang = "sglang.cli.main:main"
++
+ [project.urls]
+ "Homepage" = "https://github.com/sgl-project/sglang"
+ "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 diff --git a/python/sglang/jit_kernel/diffusion/triton/scale_shift.py b/python/sglang/jit_kernel/diffusion/triton/scale_shift.py
 index b3a27b64c..1d7a1ff7f 100644
 --- a/python/sglang/jit_kernel/diffusion/triton/scale_shift.py
