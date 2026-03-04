@@ -177,7 +177,7 @@ ComfyUI tutorial: https://docs.comfy.org/tutorials/image/qwen/qwen-image-edit
 **Available Workflows:**
 - **image_qwen_image_edit.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_image_edit.json)): Standard image editing workflow
 
-- **image_qwen_image_edit_2511.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_image.json)): Multi-image reference editing workflow (Edit Plus)
+- **image_qwen_image_edit_2511.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_image_edit_2511.json)): Multi-image reference editing workflow (Edit Plus)
 
 These workflows enable image editing based on text prompts, allowing you to modify existing images. The 2511 version supports multi-image reference for advanced editing scenarios like material transfer.
 
