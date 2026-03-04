@@ -89,8 +89,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm && \
     git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git && \
     cd ComfyUI && \
-    git fetch --depth 1 origin acd0e536533cdf038bbaa32730cd12a438cc3a60 && \
-    git checkout acd0e536533cdf038bbaa32730cd12a438cc3a60 && \
+    git fetch --depth 1 origin 3dd10a59c00248d00f0cb0ab794ff1bb9fb00a5f && \
+    git checkout 3dd10a59c00248d00f0cb0ab794ff1bb9fb00a5f && \
     git apply /tmp/comfyui_for_multi_arc.patch && \
     pip install -r requirements.txt && \
     rm -f /tmp/comfyui_for_multi_arc.patch
@@ -130,9 +130,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # ComfyUI disabled custom nodes (optional: --build-arg INSTALL_DISABLED_NODES=true)
 ARG INSTALL_DISABLED_NODES=false
 COPY ./patches/comfyui_voxcpm_for_xpu.patch /tmp/
+COPY ./patches/comfyui_indextts.patch /tmp/
 COPY ./patches/comfyui_hunyuan3d_for_xpu.patch /tmp/
 COPY ./patches/comfyui_hy_motion1.patch /tmp/
 COPY ./patches/comfyui_seedvr2_xpu.patch /tmp/
+COPY ./patches/comfyui_flashvsr_ultra_fast_xpu.patch /tmp/
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "${INSTALL_DISABLED_NODES}" = "true" ]; then \
@@ -145,7 +147,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt && \
     cd /llm/ComfyUI/custom_nodes && \
     git clone --depth 1 https://github.com/billwuhao/ComfyUI_IndexTTS.git ComfyUI_IndexTTS.disabled && \
-    pip install -r ComfyUI_IndexTTS.disabled/requirements.txt torchcodec==0.9.0 && \
+    cd ComfyUI_IndexTTS.disabled && \
+    git apply /tmp/comfyui_indextts.patch && \
+    pip install -r requirements.txt torchcodec==0.9.0 && \
+    cd /llm/ComfyUI/custom_nodes && \
     git clone --depth 1 https://github.com/visualbruno/ComfyUI-Hunyuan3d-2-1.git ComfyUI-Hunyuan3d-2-1.disabled && \
     cd ComfyUI-Hunyuan3d-2-1.disabled && \
     git fetch --depth 1 origin 9d7ef32509101495a7840b3ae8e718c8d1183305 && \
@@ -167,7 +172,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git fetch --depth 1 origin 4490bd1f482e026674543386bb2a4d176da245b9 && \
     git checkout 4490bd1f482e026674543386bb2a4d176da245b9 && \
     git apply /tmp/comfyui_seedvr2_xpu.patch && \
-    pip install -r requirements.txt ; \
+    pip install -r requirements.txt && \
+    cd /llm/ComfyUI/custom_nodes && \
+    git clone --depth 1 https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast.git ComfyUI-FlashVSR_Ultra_Fast.disabled && \
+    cd ComfyUI-FlashVSR_Ultra_Fast.disabled && \
+    git fetch --depth 1 origin 4820b3f02347bddcbbb9a5a85ab7638fe976366e && \
+    git checkout 4820b3f02347bddcbbb9a5a85ab7638fe976366e && \
+    git apply /tmp/comfyui_flashvsr_ultra_fast_xpu.patch ; \
     fi && \
     rm -f /tmp/*.patch
 

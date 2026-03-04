@@ -740,6 +740,26 @@ SeedVR2 is a diffusion-based video super-resolution model that restores and upsc
 |----------|-------------|
 | `video_upscale_SeedVR2.json` | Video restoration and upscaling |
 
+### FlashVSR
+
+FlashVSR is a diffusion-based video super-resolution model that restores and upscales video content.
+
+#### Model Storage Location
+
+```text
+📂 ComfyUI/
+└── 📂 models/
+    └── 📂 FlashVSR-v1.1/
+```
+
+> Models are **automatically downloaded on first use**. You can also manually download from [JunhaoZhuang/FlashVSR-v1.1](https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1).
+
+#### Workflow Files
+
+| Workflow | Description |
+|----------|-------------|
+| `video_upscale_FlashVSR.json` | Video restoration and upscaling |
+
 
 ---
 
