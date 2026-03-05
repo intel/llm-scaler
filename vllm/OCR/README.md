@@ -262,7 +262,8 @@ You can refer to the Paddler-OCR [guide](https://github.com/PaddlePaddle/PaddleO
 
 ## 4. DeepSeek-OCR Support
 
-You can refer to the DeepSeek-OCR [guide](https://github.com/deepseek-ai/DeepSeek-OCR?tab=readme-ov-file#vllm-inference) for details.
+You can refer to [here](https://docs.vllm.ai/projects/recipes/en/latest/DeepSeek/DeepSeek-OCR.html) to know how to use.
+Or You can refer to the DeepSeek-OCR [guide](https://github.com/deepseek-ai/DeepSeek-OCR?tab=readme-ov-file#vllm-inference) for details.
 
 ---
 

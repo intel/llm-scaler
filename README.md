@@ -56,6 +56,7 @@ Please follow the instructions in the [Getting Started](vllm/README.md/#1-gettin
 | Language MOE Model   | Qwen/Qwen3-30B-A3B                         |  ✅  |         ✅         |          ✅          |       |                           |
 | Language MOE Model   | Qwen/Qwen3-235B-A22B                       |      |         ✅         |                      |       |                           |
 | Language MOE Model   | Qwen/Qwen3-Coder-30B-A3B-Instruct          |  ✅  |         ✅         |          ✅          |       |                           |
+| Language MOE Model   | Qwen/Qwen3-Coder-Next                      |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | Qwen/QwQ-32B                               |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | mistralai/Ministral-8B-Instruct-2410       |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | mistralai/Mixtral-8x7B-Instruct-v0.1       |  ✅  |         ✅         |          ✅          |       |                           |
@@ -67,6 +68,7 @@ Please follow the instructions in the [Getting Started](vllm/README.md/#1-gettin
 | Language Model       | zai-org/GLM-4-9B-0414                      |      |         ✅        |                      |       | use bfloat16 |
 | Language Model       | zai-org/GLM-4-32B-0414                     |      |         ✅        |                      |       | use bfloat16 |
 | Language MOE Model   | zai-org/GLM-4.5-Air                        |  ✅  |         ✅         |                      |       |                           |
+| Language MOE Model   | zai-org/GLM-4.7-Flash                      |  ✅  |         ✅         |                      |       |                           |
 | Language Model       | ByteDance-Seed/Seed-OSS-36B-Instruct       |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | miromind-ai/MiroThinker-v1.5-30B           |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | tencent/Hunyuan-0.5B-Instruct              |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](./vllm/README.md#31-how-to-use-hunyuan-7b-instruct)   |
@@ -98,15 +100,18 @@ Please follow the instructions in the [Getting Started](vllm/README.md/#1-gettin
 | Multimodal Model     | zai-org/GLM-4.6V-Flash                     |  ✅  |         ✅         |          ✅          |       |   pip install transformers==5.0.0rc0 first            |
 | Multimodal Model     | PaddlePaddle/PaddleOCR-VL                  |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](./vllm/README.md#32-how-to-use-paddleocr)     |
 | Multimodal Model     | deepseek-ai/DeepSeek-OCR                   |  ✅  |         ✅         |          ✅          |       |                           |
+| Multimodal Model     | deepseek-ai/DeepSeek-OCR-2                 |  ✅  |         ✅         |          ✅          |       |  There may be accuracy issues when using `--quantization fp8`             |
 | Multimodal Model     | moonshotai/Kimi-VL-A3B-Thinking-2506       |  ✅  |         ✅         |          ✅          |       |                           |
 | omni                 | Qwen/Qwen2.5-Omni-7B                       |  ✅  |         ✅         |          ✅          |       |                           |
 | omni                 | Qwen/Qwen3-Omni-30B-A3B-Instruct           |  ✅  |         ✅         |          ✅          |       |                           |
 | audio                | openai/whisper-medium                      |  ✅  |         ✅         |          ✅          |       |                           |
 | audio                | openai/whisper-large-v3                    |  ✅  |         ✅         |          ✅          |       |                           |
 | Embedding Model      | Qwen/Qwen3-Embedding-8B                    |  ✅  |         ✅         |          ✅          |       |                           |
+| VL Embedding Model   | Qwen3-VL-Embedding-2B/8B                   |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](https://github.com/vllm-project/vllm/blob/2f4226fe5280b60c47b4f6f01d9b18ac9cda2038/examples/pooling/embed/vision_embedding_online.py)                    |
 | Embedding Model      | BAAI/bge-m3                                |  ✅  |         ✅         |          ✅          |       |                           |
 | Embedding Model      | BAAI/bge-large-en-v1.5                     |  ✅  |         ✅         |          ✅          |       |                           |
 | Reranker Model       | Qwen/Qwen3-Reranker-8B                     |  ✅  |         ✅         |          ✅          |       |                           |
+| VL Reranker Model    | Qwen3-VL-Reranker-2B/8B                    |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](https://github.com/vllm-project/vllm/blob/2f4226fe5280b60c47b4f6f01d9b18ac9cda2038/examples/pooling/score/vision_rerank_api_online.py)                    |
 | Reranker Model       | BAAI/bge-reranker-large                    |  ✅  |         ✅         |          ✅          |       |                           |
 | Reranker Model       | BAAI/bge-reranker-v2-m3                    |  ✅  |         ✅         |          ✅          |       |                           |
 
