@@ -370,6 +370,22 @@ if exist ComfyUI-KJNodes (
     )
 )
 
+REM --- ComfyUI-CacheDiT ---
+echo.
+echo Installing ComfyUI-CacheDiT...
+if exist ComfyUI-CacheDiT (
+    echo ComfyUI-CacheDiT already exists, skipping...
+) else (
+    git clone https://github.com/Jasonzzt/ComfyUI-CacheDiT.git
+    if errorlevel 1 (
+        echo WARNING: Failed to clone ComfyUI-CacheDiT
+    ) else (
+        cd ComfyUI-CacheDiT
+        "%PYTHON_EXE%" -m pip install cache-dit --no-deps
+        cd ..
+    )
+)
+
 echo.
 echo Custom nodes installation complete.
 
@@ -467,6 +483,7 @@ echo   ^|       +-- comfyui-easy-use
 echo   ^|       +-- comfyui_controlnet_aux
 echo   ^|       +-- ComfyUI-GGUF
 echo   ^|       +-- ComfyUI-KJNodes
+echo   ^|       +-- ComfyUI-CacheDiT
 echo   +-- run_comfyui.bat           (Launcher)
 echo   +-- run_comfyui_lowvram.bat   (Low VRAM Launcher)
 echo   +-- run_comfyui_cpu.bat       (CPU-only Launcher)
