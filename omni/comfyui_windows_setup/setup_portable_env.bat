@@ -464,8 +464,8 @@ echo Pip version:
 
 echo.
 echo PyTorch verification:
-"%PYTHON_EXE%" -c "import torch; print('PyTorch version: ' + torch.__version__)"
-"%PYTHON_EXE%" -c "import torch; xpu = getattr(torch, 'xpu', None); print('XPU available: ' + str(xpu.is_available() if xpu else 'N/A'))"
+"%PYTHON_EXE%" -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+"%PYTHON_EXE%" -c "import torch; print(f'XPU available: {torch.xpu.is_available() if hasattr(torch, \"xpu\") else \"N/A\"}')"
 
 echo.
 echo Installed Custom Nodes:
