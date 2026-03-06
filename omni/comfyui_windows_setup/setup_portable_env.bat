@@ -370,6 +370,22 @@ if exist ComfyUI-KJNodes (
     )
 )
 
+REM --- ComfyUI-CacheDiT ---
+echo.
+echo Installing ComfyUI-CacheDiT...
+if exist ComfyUI-CacheDiT (
+    echo ComfyUI-CacheDiT already exists, skipping...
+) else (
+    git clone https://github.com/Jasonzzt/ComfyUI-CacheDiT.git
+    if errorlevel 1 (
+        echo WARNING: Failed to clone ComfyUI-CacheDiT
+    ) else (
+        cd ComfyUI-CacheDiT
+        "%PYTHON_EXE%" -m pip install cache-dit --no-deps
+        cd ..
+    )
+)
+
 echo.
 echo Custom nodes installation complete.
 
@@ -386,11 +402,13 @@ REM Create run_comfyui.bat
     echo @echo off
     echo setlocal
     echo set "SCRIPT_DIR=%%~dp0"
-    echo set "PYTHON_EXE=%%SCRIPT_DIR%%python_embeded\python.exe"
-    echo.
+    echo set "PY_DIR=%%SCRIPT_DIR%%python_embeded"
+    echo set "PATH=%%PY_DIR%%;%%PY_DIR%%\Scripts;%%PY_DIR%%\Library\bin;%%PATH%%"
+    echo set PYTHONPATH=
+    echo set PYTHONHOME=
+    echo set "PYTHON_EXE=%%PY_DIR%%\python.exe"
     echo cd /d "%%SCRIPT_DIR%%ComfyUI"
     echo "%%PYTHON_EXE%%" main.py %%*
-    echo.
     echo pause
 ) > run_comfyui.bat
 
@@ -399,11 +417,13 @@ REM Create run_comfyui_disable_smart_memory.bat
     echo @echo off
     echo setlocal
     echo set "SCRIPT_DIR=%%~dp0"
-    echo set "PYTHON_EXE=%%SCRIPT_DIR%%python_embeded\python.exe"
-    echo.
+    echo set "PY_DIR=%%SCRIPT_DIR%%python_embeded"
+    echo set "PATH=%%PY_DIR%%;%%PY_DIR%%\Scripts;%%PY_DIR%%\Library\bin;%%PATH%%"
+    echo set PYTHONPATH=
+    echo set PYTHONHOME=
+    echo set "PYTHON_EXE=%%PY_DIR%%\python.exe"
     echo cd /d "%%SCRIPT_DIR%%ComfyUI"
     echo "%%PYTHON_EXE%%" main.py --disable-smart-memory %%*
-    echo.
     echo pause
 ) > run_comfyui_lowvram.bat
 
@@ -412,11 +432,13 @@ REM Create run_comfyui_cpu.bat for CPU-only mode
     echo @echo off
     echo setlocal
     echo set "SCRIPT_DIR=%%~dp0"
-    echo set "PYTHON_EXE=%%SCRIPT_DIR%%python_embeded\python.exe"
-    echo.
+    echo set "PY_DIR=%%SCRIPT_DIR%%python_embeded"
+    echo set "PATH=%%PY_DIR%%;%%PY_DIR%%\Scripts;%%PY_DIR%%\Library\bin;%%PATH%%"
+    echo set PYTHONPATH=
+    echo set PYTHONHOME=
+    echo set "PYTHON_EXE=%%PY_DIR%%\python.exe"
     echo cd /d "%%SCRIPT_DIR%%ComfyUI"
     echo "%%PYTHON_EXE%%" main.py --cpu %%*
-    echo.
     echo pause
 ) > run_comfyui_cpu.bat
 
@@ -427,6 +449,10 @@ REM Verification
 REM ============================================
 echo.
 echo Verifying installation...
+
+set PYTHONPATH=
+set PYTHONHOME=
+set "PATH=%PYTHON_DIR%;%PYTHON_DIR%\Scripts;%PYTHON_DIR%\Library\bin;%PATH%"
 
 echo.
 echo Python version:
@@ -461,6 +487,7 @@ echo   ^|       +-- comfyui-easy-use
 echo   ^|       +-- comfyui_controlnet_aux
 echo   ^|       +-- ComfyUI-GGUF
 echo   ^|       +-- ComfyUI-KJNodes
+echo   ^|       +-- ComfyUI-CacheDiT
 echo   +-- run_comfyui.bat           (Launcher)
 echo   +-- run_comfyui_lowvram.bat   (Low VRAM Launcher)
 echo   +-- run_comfyui_cpu.bat       (CPU-only Launcher)
