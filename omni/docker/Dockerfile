@@ -128,7 +128,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     rm -f /tmp/raylight_for_multi_arc.patch
 
 # ComfyUI disabled custom nodes (optional: --build-arg INSTALL_DISABLED_NODES=true)
-ARG INSTALL_DISABLED_NODES=false
+ARG INSTALL_DISABLED_NODES=true
 COPY ./patches/comfyui_voxcpm_for_xpu.patch /tmp/
 COPY ./patches/comfyui_indextts.patch /tmp/
 COPY ./patches/comfyui_hunyuan3d_for_xpu.patch /tmp/
