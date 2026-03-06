@@ -383,7 +383,7 @@ cd /d "%SCRIPT_DIR%"
 
 REM Create run_comfyui.bat
 (
-    echo @echo offset
+    echo @echo off
     echo setlocal
     echo set "SCRIPT_DIR=%~dp0"
     echo set "PY_DIR=%SCRIPT_DIR%python_embeded"
@@ -398,7 +398,7 @@ REM Create run_comfyui.bat
 
 REM Create run_comfyui_disable_smart_memory.bat
 (
-    echo @echo offset
+    echo @echo off
     echo setlocal
     echo set "SCRIPT_DIR=%~dp0"
     echo set "PY_DIR=%SCRIPT_DIR%python_embeded"
@@ -413,7 +413,7 @@ REM Create run_comfyui_disable_smart_memory.bat
 
 REM Create run_comfyui_cpu.bat for CPU-only mode
 (
-    echo @echo offset
+    echo @echo off
     echo setlocal
     echo set "SCRIPT_DIR=%~dp0"
     echo set "PY_DIR=%SCRIPT_DIR%python_embeded"
