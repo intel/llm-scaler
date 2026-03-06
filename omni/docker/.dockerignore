@@ -1,0 +1,20 @@
+# Build context exclusions
+**/.git
+**/__pycache__
+**/*.pyc
+**/node_modules
+**/.env
+**/build
+**/dist
+**/*.egg-info
+**/outputs
+**/logs
+**/models
+**/.vscode
+**/tmp
+README.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+SECURITY.md
+LICENSE
+Releases.md
