@@ -383,40 +383,46 @@ cd /d "%SCRIPT_DIR%"
 
 REM Create run_comfyui.bat
 (
-    echo @echo off
+    echo @echo offset
     echo setlocal
-    echo set "SCRIPT_DIR=%%~dp0"
-    echo set "PYTHON_EXE=%%SCRIPT_DIR%%python_embeded\python.exe"
-    echo.
-    echo cd /d "%%SCRIPT_DIR%%ComfyUI"
-    echo "%%PYTHON_EXE%%" main.py %%*
-    echo.
+    echo set "SCRIPT_DIR=%~dp0"
+    echo set "PY_DIR=%SCRIPT_DIR%python_embeded"
+    echo set "PATH=%PY_DIR%;%PY_DIR%\Scripts;%PY_DIR%\Library\bin;%PATH%"
+    echo set PYTHONPATH=
+    echo set PYTHONHOME=
+    echo set "PYTHON_EXE=%PY_DIR%\python.exe"
+    echo cd /d "%SCRIPT_DIR%ComfyUI"
+    echo "%PYTHON_EXE%" main.py %*
     echo pause
 ) > run_comfyui.bat
 
 REM Create run_comfyui_disable_smart_memory.bat
 (
-    echo @echo off
+    echo @echo offset
     echo setlocal
-    echo set "SCRIPT_DIR=%%~dp0"
-    echo set "PYTHON_EXE=%%SCRIPT_DIR%%python_embeded\python.exe"
-    echo.
-    echo cd /d "%%SCRIPT_DIR%%ComfyUI"
-    echo "%%PYTHON_EXE%%" main.py --disable-smart-memory %%*
-    echo.
+    echo set "SCRIPT_DIR=%~dp0"
+    echo set "PY_DIR=%SCRIPT_DIR%python_embeded"
+    echo set "PATH=%PY_DIR%;%PY_DIR%\Scripts;%PY_DIR%\Library\bin;%PATH%"
+    echo set PYTHONPATH=
+    echo set PYTHONHOME=
+    echo set "PYTHON_EXE=%PY_DIR%\python.exe"
+    echo cd /d "%SCRIPT_DIR%ComfyUI"
+    echo "%PYTHON_EXE%" main.py --disable-smart-memory %*
     echo pause
 ) > run_comfyui_lowvram.bat
 
 REM Create run_comfyui_cpu.bat for CPU-only mode
 (
-    echo @echo off
+    echo @echo offset
     echo setlocal
-    echo set "SCRIPT_DIR=%%~dp0"
-    echo set "PYTHON_EXE=%%SCRIPT_DIR%%python_embeded\python.exe"
-    echo.
-    echo cd /d "%%SCRIPT_DIR%%ComfyUI"
-    echo "%%PYTHON_EXE%%" main.py --cpu %%*
-    echo.
+    echo set "SCRIPT_DIR=%~dp0"
+    echo set "PY_DIR=%SCRIPT_DIR%python_embeded"
+    echo set "PATH=%PY_DIR%;%PY_DIR%\Scripts;%PY_DIR%\Library\bin;%PATH%"
+    echo set PYTHONPATH=
+    echo set PYTHONHOME=
+    echo set "PYTHON_EXE=%PY_DIR%\python.exe"
+    echo cd /d "%SCRIPT_DIR%ComfyUI"
+    echo "%PYTHON_EXE%" main.py --cpu %*
     echo pause
 ) > run_comfyui_cpu.bat
 
