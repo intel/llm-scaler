@@ -401,14 +401,14 @@ REM Create run_comfyui.bat
 (
     echo @echo off
     echo setlocal
-    echo set "SCRIPT_DIR=%~dp0"
-    echo set "PY_DIR=%SCRIPT_DIR%python_embeded"
-    echo set "PATH=%PY_DIR%;%PY_DIR%\Scripts;%PY_DIR%\Library\bin;%PATH%"
+    echo set "SCRIPT_DIR=%%~dp0"
+    echo set "PY_DIR=%%SCRIPT_DIR%%python_embeded"
+    echo set "PATH=%%PY_DIR%%;%%PY_DIR%%\Scripts;%%PY_DIR%%\Library\bin;%%PATH%%"
     echo set PYTHONPATH=
     echo set PYTHONHOME=
-    echo set "PYTHON_EXE=%PY_DIR%\python.exe"
-    echo cd /d "%SCRIPT_DIR%ComfyUI"
-    echo "%PYTHON_EXE%" main.py %*
+    echo set "PYTHON_EXE=%%PY_DIR%%\python.exe"
+    echo cd /d "%%SCRIPT_DIR%%ComfyUI"
+    echo "%%PYTHON_EXE%%" main.py %%*
     echo pause
 ) > run_comfyui.bat
 
@@ -416,14 +416,14 @@ REM Create run_comfyui_disable_smart_memory.bat
 (
     echo @echo off
     echo setlocal
-    echo set "SCRIPT_DIR=%~dp0"
-    echo set "PY_DIR=%SCRIPT_DIR%python_embeded"
-    echo set "PATH=%PY_DIR%;%PY_DIR%\Scripts;%PY_DIR%\Library\bin;%PATH%"
+    echo set "SCRIPT_DIR=%%~dp0"
+    echo set "PY_DIR=%%SCRIPT_DIR%%python_embeded"
+    echo set "PATH=%%PY_DIR%%;%%PY_DIR%%\Scripts;%%PY_DIR%%\Library\bin;%%PATH%%"
     echo set PYTHONPATH=
     echo set PYTHONHOME=
-    echo set "PYTHON_EXE=%PY_DIR%\python.exe"
-    echo cd /d "%SCRIPT_DIR%ComfyUI"
-    echo "%PYTHON_EXE%" main.py --disable-smart-memory %*
+    echo set "PYTHON_EXE=%%PY_DIR%%\python.exe"
+    echo cd /d "%%SCRIPT_DIR%%ComfyUI"
+    echo "%%PYTHON_EXE%%" main.py --disable-smart-memory %%*
     echo pause
 ) > run_comfyui_lowvram.bat
 
@@ -431,14 +431,14 @@ REM Create run_comfyui_cpu.bat for CPU-only mode
 (
     echo @echo off
     echo setlocal
-    echo set "SCRIPT_DIR=%~dp0"
-    echo set "PY_DIR=%SCRIPT_DIR%python_embeded"
-    echo set "PATH=%PY_DIR%;%PY_DIR%\Scripts;%PY_DIR%\Library\bin;%PATH%"
+    echo set "SCRIPT_DIR=%%~dp0"
+    echo set "PY_DIR=%%SCRIPT_DIR%%python_embeded"
+    echo set "PATH=%%PY_DIR%%;%%PY_DIR%%\Scripts;%%PY_DIR%%\Library\bin;%%PATH%%"
     echo set PYTHONPATH=
     echo set PYTHONHOME=
-    echo set "PYTHON_EXE=%PY_DIR%\python.exe"
-    echo cd /d "%SCRIPT_DIR%ComfyUI"
-    echo "%PYTHON_EXE%" main.py --cpu %*
+    echo set "PYTHON_EXE=%%PY_DIR%%\python.exe"
+    echo cd /d "%%SCRIPT_DIR%%ComfyUI"
+    echo "%%PYTHON_EXE%%" main.py --cpu %%*
     echo pause
 ) > run_comfyui_cpu.bat
 
@@ -450,6 +450,10 @@ REM ============================================
 echo.
 echo Verifying installation...
 
+set PYTHONPATH=
+set PYTHONHOME=
+set "PATH=%PYTHON_DIR%;%PYTHON_DIR%\Scripts;%PYTHON_DIR%\Library\bin;%PATH%"
+
 echo.
 echo Python version:
 "%PYTHON_EXE%" --version
@@ -460,8 +464,8 @@ echo Pip version:
 
 echo.
 echo PyTorch verification:
-"%PYTHON_EXE%" -c "import torch; print(f'PyTorch version: {torch.__version__}')"
-"%PYTHON_EXE%" -c "import torch; print(f'XPU available: {torch.xpu.is_available() if hasattr(torch, \"xpu\") else \"N/A\"}')"
+"%PYTHON_EXE%" -c "import torch; print('PyTorch version: ' + torch.__version__)"
+"%PYTHON_EXE%" -c "import torch; xpu = getattr(torch, 'xpu', None); print('XPU available: ' + str(xpu.is_available() if xpu else 'N/A'))"
 
 echo.
 echo Installed Custom Nodes:
