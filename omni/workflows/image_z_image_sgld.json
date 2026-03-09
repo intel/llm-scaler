@@ -1,0 +1,314 @@
+{
+  "id": "6fac8be8-5236-43fd-a36b-dabda4577ba0",
+  "revision": 0,
+  "last_node_id": 6,
+  "last_link_id": 5,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "SGLDiffusionServerModel",
+      "pos": [
+        809.415693744137,
+        -977.4248113268784
+      ],
+      "size": [
+        278.9810546875,
+        102
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "sgld_client",
+          "type": "SGLD_CLIENT",
+          "links": [
+            3
+          ]
+        },
+        {
+          "name": "model_info",
+          "type": "STRING",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SGLDiffusionServerModel"
+      },
+      "widgets_values": [
+        "http://localhost:30010/v1",
+        "sk-proj-1234567890"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "easy showAnything",
+      "pos": [
+        1138.0276659877197,
+        -949.9958300136168
+      ],
+      "size": [
+        291.6165005846258,
+        151.31275641142065
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "anything",
+          "shape": 7,
+          "type": "*",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "*",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "easy showAnything"
+      },
+      "widgets_values": [
+        "=== SGLDiffusion Model Info ===\nmodel_path: /llm/models/Z-Image-Turbo/\nnum_gpus: 2\ntask_type: T2I\ndit_precision: bf16\nvae_precision: fp32\npipeline_name: ZImagePipeline\npipeline_class: ZImagePipeline"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "SGLDiffusionGenerateImage",
+      "pos": [
+        1517.1295899419747,
+        -968.4545523993027
+      ],
+      "size": [
+        295.5650390625,
+        270
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "sgld_client",
+          "type": "SGLD_CLIENT",
+          "link": 3
+        },
+        {
+          "name": "image",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "positive_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "positive_prompt"
+          },
+          "link": 4
+        },
+        {
+          "name": "negative_prompt",
+          "shape": 7,
+          "type": "STRING",
+          "widget": {
+            "name": "negative_prompt"
+          },
+          "link": 5
+        }
+      ],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [
+            2
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SGLDiffusionGenerateImage"
+      },
+      "widgets_values": [
+        "",
+        "",
+        1431015554,
+        "randomize",
+        9,
+        1,
+        1024,
+        1024,
+        false
+      ]
+    },
+    {
+      "id": 3,
+      "type": "SaveImage",
+      "pos": [
+        1887.2154076904164,
+        -977.5959474434796
+      ],
+      "size": [
+        483.055745868111,
+        535.5766456447591
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 2
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.15.1",
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "ComfyUI"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "PrimitiveStringMultiline",
+      "pos": [
+        810.3117558806451,
+        -768.3007015690104
+      ],
+      "size": [
+        400,
+        200
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "title": "Prompt (positive)",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.15.1",
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "cute anime style girl with massive fluffy fennec ears and a big fluffy tail blonde messy long hair blue eyes wearing a maid outfit with a long black gold leaf pattern dress and a white apron, it is a postcard held by a hand in front of a beautiful realistic city at sunset and there is cursive writing that says \"ZImage, Now in ComfyUI\""
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 6,
+      "type": "PrimitiveStringMultiline",
+      "pos": [
+        810.1627758091702,
+        -517.5806757355001
+      ],
+      "size": [
+        400,
+        200
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": [
+            5
+          ]
+        }
+      ],
+      "title": "Prompt (negative)",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.15.1",
+        "Node name for S&R": "PrimitiveStringMultiline"
+      },
+      "widgets_values": [
+        "blurry ugly bad"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      1,
+      2,
+      0,
+      "STRING"
+    ],
+    [
+      2,
+      4,
+      0,
+      3,
+      0,
+      "IMAGE"
+    ],
+    [
+      3,
+      1,
+      0,
+      4,
+      0,
+      "SGLD_CLIENT"
+    ],
+    [
+      4,
+      5,
+      0,
+      4,
+      2,
+      "STRING"
+    ],
+    [
+      5,
+      6,
+      0,
+      4,
+      3,
+      "STRING"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "workflowRendererVersion": "LG",
+    "ds": {
+      "scale": 0.6727499949325629,
+      "offset": [
+        -144.4675478147117,
+        1312.1105325223152
+      ]
+    },
+    "frontendVersion": "1.39.19",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}

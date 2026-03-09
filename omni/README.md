@@ -397,6 +397,8 @@ This workflow synthesizes new speech using a single reference audio file for voi
 
 ## SGLang Diffusion (experimental)
 
+> **📖 Detailed Documentation**: See [SGLang Diffusion Guide](./docs/SGLang_Diffusion_Guide.md) for complete server configuration, API reference, and multi-GPU setup. For ComfyUI integration, see [SGLang Diffusion ComfyUI Guide](./docs/SGLang_Diffusion_ComfyUI_Guide.md).
+
 SGLang Diffusion provides OpenAI-compatible API for image/video generation models.
 
 ### 1. CLI Generation
