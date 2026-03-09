@@ -356,15 +356,15 @@ The text prompt is intended to describe the overall content of the input imageâ€
 
 ### FireRed-Image-Edit-1.1
 
-**HuggingFace**: https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.0-ComfyUI
+**HuggingFace**: https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.1-ComfyUI
 
 #### Model Files
 
 | Type | Filename | Directory | Download Link |
 |------|----------|-----------|---------------|
 | CLIP | `qwen_2.5_vl_7b_fp8_scaled.safetensors` | `text_encoders/` | [HuggingFace](https://huggingface.co/Comfy-Org/HunyuanVideo_1.5_repackaged/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors) |
-| VAE | `qwen_image_vae.safetensors` | `vae/` | [HuggingFace](https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.0-ComfyUI/resolve/main/qwen_image_vae.safetensors) |
-| DiT (GGUF) | `FireRed-Image-Edit-1.1-transformer-q4_k_m.gguf` | `diffusion_models/` | [HuggingFace](https://huggingface.co/FireRedTeam) |
+| VAE | `qwen_image_vae.safetensors` | `vae/` | [HuggingFace](https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.1-ComfyUI/resolve/main/qwen_image_vae.safetensors) |
+| DiT (GGUF) | `FireRed-Image-Edit-1.1-transformer-q4_k_m.gguf` | `diffusion_models/` | [HuggingFace](https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.1-ComfyUI/resolve/main/FireRed-Image-Edit-1.1-transformer-q4_k_m.gguf) |
 | LoRA (Optional) | `FireRed-Image-Edit-1.0-Lightning-8steps-v1.0.safetensors` | `loras/` | [HuggingFace](https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.0-ComfyUI/resolve/main/FireRed-Image-Edit-1.0-Lightning-8steps-v1.0.safetensors) |
 
 #### Model Storage Location
