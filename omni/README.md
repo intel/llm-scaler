@@ -85,6 +85,7 @@ The following models are supported in ComfyUI workflows. For detailed model file
 | **Image Generation** | Stable Diffusion 3.5 | Text-to-Image, ControlNet | `image_sd3.5_simple_example.json`, `image_sd3.5_midium.json`, `image_sd3.5_large_canny_controlnet_example.json` |
 | **Image Generation** | Z-Image-Turbo | Text-to-Image |  `image_z_image_turbo.json` |
 | **Image Generation** | Flux.1, Flux.1 Kontext dev | Text-to-Image, Multi-Image Reference, ControlNet | `image_flux_kontext_dev_basic.json`, `image_flux_controlnet_example.json` |
+| **Image Generation** | FireRed-Image-Edit-1.1 | Image Editing | `image_firered_image_edit_1.1.json` |
 | **Video Generation** | Wan2.2 TI2V 5B, Wan2.2 T2V 14B, Wan2.2 I2V 14B | Text-to-Video, Image-to-Video | `video_wan2_2_5B_ti2v.json`, `video_wan2_2_14B_t2v.json`, `video_wan2_2_14B_t2v_rapid_aio_multi_xpu.json`, `video_wan2.2_14B_i2v_rapid_aio_multi_xpu.json` |
 | **Video Generation** | Wan2.2 Animate 14B | Video Animation | `video_wan2_2_animate_basic.json` |
 | **Video Generation** | HunyuanVideo 1.5 8.3B | Text-to-Video, Image-to-Video | `video_hunyuan_video_1.5_t2v.json`, `video_hunyuan_video_1.5_i2v.json`, `video_hunyuan_video_1.5_i2v_multi_xpu.json` |
@@ -207,6 +208,13 @@ ComfyUI tutorial: https://docs.comfy.org/tutorials/flux/flux-1-kontext-dev
 
 **Available Workflows:**
 - **image_flux_kontext_dev_basic.json**: Basic workflow with multi-image reference support
+
+##### FireRed-Image-Edit-1.1
+
+HuggingFace: https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.1-ComfyUI
+
+**Available Workflows:**
+- **image_firered_image_edit_1.1.json**: Multi-image reference image editing workflow with optional Lightning LoRA acceleration
 
 #### Video Generation Workflows
 
