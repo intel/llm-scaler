@@ -40,6 +40,7 @@
 | **Stable Diffusion 3.5** | https://comfyanonymous.github.io/ComfyUI_examples/sd3/ | [stabilityai/stable-diffusion-3.5-medium](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium) |
 | **Z-Image-Turbo** | https://docs.comfy.org/tutorials/image/z-image/z-image-turbo | [Comfy-Org/z_image_turbo](https://huggingface.co/Comfy-Org/z_image_turbo) |
 | **Flux.1 Kontext Dev** | https://docs.comfy.org/tutorials/flux/flux-1-kontext-dev | [black-forest-labs/FLUX.1-Kontext-dev](https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev) |
+| **FireRed-Image-Edit-1.1** | - | [FireRedTeam/FireRed-Image-Edit-1.0-ComfyUI](https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.1-ComfyUI) |
 | **Wan2.2** | https://docs.comfy.org/tutorials/video/wan/wan2_2 | [Comfy-Org/Wan_2.2_ComfyUI_Repackaged](https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged) |
 | **HunyuanVideo 1.5** | https://docs.comfy.org/tutorials/video/hunyuan/hunyuan-video-1-5 | [Comfy-Org/HunyuanVideo_1.5_repackaged](https://huggingface.co/Comfy-Org/HunyuanVideo_1.5_repackaged) |
 | **LTX-2** | https://blog.comfy.org/p/ltx-2-open-source-audio-video-ai | [Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2) |
@@ -352,6 +353,50 @@ Qwen-Image-Layered 是阿里巴巴 Qwen 团队开发的模型，能够将图像�
 | `image_flux_controlnet_example.json` | Flux ControlNet 工作流 |
 
 ---
+
+### FireRed-Image-Edit-1.1
+
+**HuggingFace**: https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.1-ComfyUI
+
+#### 模型文件
+
+| 类型 | 文件名 | 存放目录 | 下载链接 |
+|------|--------|----------|----------|
+| CLIP | `qwen_2.5_vl_7b_fp8_scaled.safetensors` | `text_encoders/` | [HuggingFace](https://huggingface.co/Comfy-Org/HunyuanVideo_1.5_repackaged/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors) |
+| VAE | `qwen_image_vae.safetensors` | `vae/` | [HuggingFace](https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.0-ComfyUI/resolve/main/qwen_image_vae.safetensors) |
+| DiT (GGUF) | `FireRed-Image-Edit-1.1-transformer-q4_k_m.gguf` | `diffusion_models/` | [HuggingFace](https://huggingface.co/FireRedTeam) |
+| LoRA（可选）| `FireRed-Image-Edit-1.0-Lightning-8steps-v1.0.safetensors` | `loras/` | [HuggingFace](https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.0-ComfyUI/resolve/main/FireRed-Image-Edit-1.0-Lightning-8steps-v1.0.safetensors) |
+
+#### 模型存放位置
+
+```text
+📂 ComfyUI/
+└── 📂 models/
+    ├── 📂 text_encoders/
+    │   └── qwen_2.5_vl_7b_fp8_scaled.safetensors
+    ├── 📂 diffusion_models/
+    │   └── FireRed-Image-Edit-1.1-transformer-q4_k_m.gguf
+    ├── 📂 vae/
+    │   └── qwen_image_vae.safetensors
+    └── 📂 loras/
+        └── FireRed-Image-Edit-1.0-Lightning-8steps-v1.0.safetensors  （可选）
+```
+
+> CLIP 与 Qwen-Image 系列模型共用。VAE 和 DiT 为 FireRed-Image-Edit 专用。
+
+#### 工作流文件
+
+| 工作流 | 说明 |
+|--------|------|
+| `image_firered_image_edit_1.1.json` | 支持可选 Lightning LoRA 的多图参考编辑工作流 |
+
+#### 使用提示
+
+1. **图像 1（主图）**: 要编辑的源图像
+2. **图像 2**: 用于材质/纹理转换的参考图像
+3. **图像 3**（可选）: 额外的参考图像
+4. **提示词**: 描述编辑操作（例如："在书本封面 Python 文字下方添加一行英文 '2nd Edition'"）
+
 
 ## 视频生成模型
 
