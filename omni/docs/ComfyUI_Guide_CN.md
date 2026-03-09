@@ -40,7 +40,7 @@
 | **Stable Diffusion 3.5** | https://comfyanonymous.github.io/ComfyUI_examples/sd3/ | [stabilityai/stable-diffusion-3.5-medium](https://huggingface.co/stabilityai/stable-diffusion-3.5-medium) |
 | **Z-Image-Turbo** | https://docs.comfy.org/tutorials/image/z-image/z-image-turbo | [Comfy-Org/z_image_turbo](https://huggingface.co/Comfy-Org/z_image_turbo) |
 | **Flux.1 Kontext Dev** | https://docs.comfy.org/tutorials/flux/flux-1-kontext-dev | [black-forest-labs/FLUX.1-Kontext-dev](https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev) |
-| **FireRed-Image-Edit-1.1** | - | [FireRedTeam/FireRed-Image-Edit-1.0-ComfyUI](https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.1-ComfyUI) |
+| **FireRed-Image-Edit-1.1** | - | [FireRedTeam/FireRed-Image-Edit-1.2-ComfyUI](https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.1-ComfyUI) |
 | **Wan2.2** | https://docs.comfy.org/tutorials/video/wan/wan2_2 | [Comfy-Org/Wan_2.2_ComfyUI_Repackaged](https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged) |
 | **HunyuanVideo 1.5** | https://docs.comfy.org/tutorials/video/hunyuan/hunyuan-video-1-5 | [Comfy-Org/HunyuanVideo_1.5_repackaged](https://huggingface.co/Comfy-Org/HunyuanVideo_1.5_repackaged) |
 | **LTX-2** | https://blog.comfy.org/p/ltx-2-open-source-audio-video-ai | [Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2) |
@@ -365,7 +365,7 @@ Qwen-Image-Layered 是阿里巴巴 Qwen 团队开发的模型，能够将图像�
 | CLIP | `qwen_2.5_vl_7b_fp8_scaled.safetensors` | `text_encoders/` | [HuggingFace](https://huggingface.co/Comfy-Org/HunyuanVideo_1.5_repackaged/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors) |
 | VAE | `qwen_image_vae.safetensors` | `vae/` | [HuggingFace](https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.1-ComfyUI/resolve/main/qwen_image_vae.safetensors) |
 | DiT (GGUF) | `FireRed-Image-Edit-1.1-transformer-q4_k_m.gguf` | `diffusion_models/` | [HuggingFace](https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.1-ComfyUI/resolve/main/FireRed-Image-Edit-1.1-transformer-q4_k_m.gguf) |
-| LoRA（可选）| `FireRed-Image-Edit-1.0-Lightning-8steps-v1.0.safetensors` | `loras/` | [HuggingFace](https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.0-ComfyUI/resolve/main/FireRed-Image-Edit-1.0-Lightning-8steps-v1.0.safetensors) |
+| LoRA（可选）| `FireRed-Image-Edit-1.0-Lightning-8steps-v1.0.safetensors` | `loras/` | [HuggingFace](https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.1-ComfyUI/resolve/main/FireRed-Image-Edit-1.0-Lightning-8steps-v1.0.safetensors) |
 
 #### 模型存放位置
 
