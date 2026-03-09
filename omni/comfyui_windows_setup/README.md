@@ -9,6 +9,7 @@ This guide provides step-by-step instructions for setting up a portable ComfyUI 
 - [Installation](#installation)
 - [Running ComfyUI](#running-comfyui)
 - [Installed Custom Nodes](#installed-custom-nodes)
+- [Cache-DiT Acceleration](#cache-dit-acceleration)
 - [Troubleshooting](#troubleshooting)
 - [FAQ](#faq)
 
@@ -164,6 +165,26 @@ The setup script automatically installs the following custom nodes:
 | **ControlNet Aux** | ControlNet preprocessors | [Fannovel16/comfyui_controlnet_aux](https://github.com/Fannovel16/comfyui_controlnet_aux) |
 | **ComfyUI-GGUF** | GGUF model format support | [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) |
 | **KJNodes** | Utility nodes collection | [kijai/ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) |
+| **ComfyUI-CacheDiT** | DiT model inference acceleration via caching | [Jasonzzt/ComfyUI-CacheDiT](https://github.com/Jasonzzt/ComfyUI-CacheDiT) |
+
+### Cache-DiT Acceleration
+
+[Cache-DiT](https://github.com/vipshop/cache-dit) accelerates diffusion model inference by caching and reusing intermediate DiT block outputs across denoising steps, skipping redundant computation without retraining. The ComfyUI integration is provided by the pre-installed **ComfyUI-CacheDiT** node.
+
+#### Supported Models
+
+| Category | Models |
+|----------|--------|
+| **Image** | Z-Image, Z-Image-Turbo, Qwen-Image-2512, Flux.2 Klein 4B / 9B |
+| **Video** | LTX-2 T2V / I2V, Wan2.2 14B T2V / I2V |
+
+#### Usage
+
+Insert the `⚡ CacheDiT Accelerator` node **between** the model loader and the sampler:
+
+![cachedit_workflow](../assets/comfyui_cachedit_node.png)
+
+> **Note:** Cache-DiT is best suited for workflows with ≥ 8 steps.
 
 ### Installing Additional Nodes
 
@@ -195,7 +216,8 @@ comfyui_windows_setup/
 │   │   ├── comfyui-easy-use/
 │   │   ├── comfyui_controlnet_aux/
 │   │   ├── ComfyUI-GGUF/
-│   │   └── ComfyUI-KJNodes/
+│   │   ├── ComfyUI-KJNodes/
+│   │   └── ComfyUI-CacheDiT/
 │   ├── models/               # Model files (download separately)
 │   │   ├── checkpoints/
 │   │   ├── loras/
