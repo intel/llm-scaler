@@ -169,7 +169,7 @@ The setup script automatically installs the following custom nodes:
 
 ### Cache-DiT Acceleration
 
-[Cache-DiT](https://github.com/vipshop/cache-dit) accelerates diffusion model inference by caching and reusing intermediate DiT block outputs across denoising steps, skipping redundant computation without retraining, delivering a **1.4–1.6x speedup**. The ComfyUI integration is provided by the pre-installed **ComfyUI-CacheDiT** node.
+[Cache-DiT](https://github.com/vipshop/cache-dit) accelerates diffusion model inference by caching and reusing intermediate DiT block outputs across denoising steps, skipping redundant computation without retraining. The ComfyUI integration is provided by the pre-installed **ComfyUI-CacheDiT** node.
 
 #### Supported Models
 
