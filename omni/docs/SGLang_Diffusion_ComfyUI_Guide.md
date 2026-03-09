@@ -41,7 +41,7 @@ Connects to a running SGLang Diffusion server and retrieves model information.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `base_url` | STRING | `http://localhost:3000/v1` | Server API endpoint |
+| `base_url` | STRING | `http://localhost:30010/v1` | Server API endpoint |
 | `api_key` | STRING | `sk-proj-1234567890` | API key for authentication |
 
 | Output | Type | Description |
