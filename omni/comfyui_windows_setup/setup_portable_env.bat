@@ -327,28 +327,20 @@ if exist comfyui_controlnet_aux (
     )
 )
 
-REM --- ComfyUI-GGUF ---
+REM --- ComfyUI-GGUF-XPU ---
 echo.
-echo Installing ComfyUI-GGUF...
-set "GGUF_COMMIT=6ea2651e7df66d7585f6ffee804b20e92fb38b8a"
-set "GGUF_PATCH=%PATCHES_DIR%\comfyui_gguf_xpu.patch"
+echo Installing ComfyUI-GGUF-XPU...
+set "GGUF_COMMIT=4b8a633e8434036820a2bb9d18cb77ae691e788c"
 
-if exist ComfyUI-GGUF (
-    echo ComfyUI-GGUF already exists, skipping...
+if exist ComfyUI-GGUF-XPU (
+    echo ComfyUI-GGUF-XPU already exists, skipping...
 ) else (
-    git clone https://github.com/city96/ComfyUI-GGUF.git
+    git clone https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git
     if errorlevel 1 (
-        echo WARNING: Failed to clone ComfyUI-GGUF
+        echo WARNING: Failed to clone ComfyUI-GGUF-XPU
     ) else (
-        cd ComfyUI-GGUF
+        cd ComfyUI-GGUF-XPU
         git checkout %GGUF_COMMIT%
-        if exist "%GGUF_PATCH%" (
-            echo Applying XPU patch to ComfyUI-GGUF...
-            git apply "%GGUF_PATCH%"
-            if errorlevel 1 (
-                echo WARNING: Failed to apply GGUF patch
-            )
-        )
         "%PYTHON_EXE%" -m pip install -r requirements.txt
         cd ..
     )
@@ -485,7 +477,7 @@ echo   ^|       +-- comfyui-manager
 echo   ^|       +-- comfyui-videohelpersuite
 echo   ^|       +-- comfyui-easy-use
 echo   ^|       +-- comfyui_controlnet_aux
-echo   ^|       +-- ComfyUI-GGUF
+echo   ^|       +-- ComfyUI-GGUF-XPU
 echo   ^|       +-- ComfyUI-KJNodes
 echo   ^|       +-- ComfyUI-CacheDiT
 echo   +-- run_comfyui.bat           (Launcher)
