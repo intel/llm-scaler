@@ -5,8 +5,9 @@ LLM Scaler is an GenAI solution for text generation, image generation, video gen
 ---
 
 ## Latest Update
-- [2026.03] We released `intel/llm-scaler-vllm:0.14.0-b8` for vllm 0.14.0 and PyTorch 2.10 support, various new models support and performance improvement. 
-- [2026.01] We released `intel/llm-scaler-vllm:1.3` (or, `intel/llm-scaler-vllm:0.11.1-b7`) for vllm 0.11.1 and PyTorch 2.9 support, various new models support and performance improvement.
+- 🔥 [2026.03] We released `intel/llm-scaler-omni:0.1.0-b6` for ComfyUI to support CacheDiT and torch.compile(), ComfyUI-GGUF, and more model workflows, and support FP8 for SGLang Diffusion.
+- 🔥 [2026.03] We released `intel/llm-scaler-vllm:0.14.0-b8` for vLLM 0.14.0 and PyTorch 2.10 support, various new models support and performance improvement. 
+- [2026.01] We released `intel/llm-scaler-vllm:1.3` (or, `intel/llm-scaler-vllm:0.11.1-b7`) for vLLM 0.11.1 and PyTorch 2.9 support, various new models support and performance improvement.
 - [2026.01] We released `intel/llm-scaler-omni:0.1.0-b5` for Python 3.12 and PyTorch 2.9 support, various ComfyUI workflows and more SGLang Diffusion support.
 - [2025.12] We released `intel/llm-scaler-vllm:1.2`, same image as `intel/llm-scaler-vllm:0.10.2-b6`. 
 - [2025.12] We released `intel/llm-scaler-omni:0.1.0-b4` to support ComfyUI workflows for Z-Image-Turbo, Hunyuan-Video-1.5 T2V/I2V with multi-XPU, and experimentially support SGLang Diffusion. 

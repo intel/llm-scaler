@@ -100,6 +100,18 @@
 ## LLM-Scaler-Omni
 
 ### Latest Beta Release 
+* `intel/llm-scaler-omni:0.1.0-b6` [3/10/2026]:
+    - ComfyUI 
+        - Added CacheDiT and torch.compile() acceleration support
+        - Added support for new models and workflows: SeedVR2, FlashVSR, Anima, FireRed-Image-Edit-1.1
+        - Introduced initial SYCL acceleration for ComfyUI-GGUF via omni_xpu_kernel (Q4_K, Q4_0, and Q8_0 optimized)
+        - Fixed IndexTTS-2 workflow and Wan2.2-I2V-14B-multi-XPU workflow
+    - SGLang Diffusion
+        - Added FP8 precision support on XPU
+        - Code cleanup and refactoring
+      
+
+### Previous Releases
 * `intel/llm-scaler-omni:0.1.0-b5` [1/16/2026]:
     - Core Upgrades
         - Upgraded to Python 3.12 and PyTorch 2.9 for improved performance and compatibility
@@ -119,7 +131,6 @@
         - Added support for HY-WorldPlay.
         - Add audio models in standalone example
 
-### Previous Releases
 * `intel/llm-scaler-omni:0.1.0-b4` [12/10/2025]:
     - More workflows support:
         - Z-Image-Turbo
