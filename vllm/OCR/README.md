@@ -242,28 +242,33 @@ print(response.json()['result']['layoutParsingResults'][0]['prunedResult']['layo
 <details >
 <summary>3.Offline Paddle Service</summary>
 
-Use PP-DocLayoutV2 model offline. Refer to [this](https://huggingface.co/PaddlePaddle/PP-DocLayoutV2).
+Use PP-DocLayoutV2 model offline.
 
 ```python
-from paddleocr import LayoutDetection
+from paddleocr import PaddleOCRVL
 
-model = LayoutDetection(model_name="PP-DocLayoutV2")
-output = model.predict("./layout.jpg", batch_size=1, layout_nms=True)
-for res in output:
-    res.print()
-    res.save_to_img(save_path="./output/")
-    res.save_to_json(save_path="./output/res.json")
+doclayout_model_path = "/path/to/your/PP-DocLayoutV2/"
+
+pipeline = PaddleOCRVL(vl_rec_backend="vllm-server", 
+                       vl_rec_server_url="http://localhost:8000/v1", 
+                       layout_detection_model_name="PP-DocLayoutV2",  
+                       layout_detection_model_dir=doclayout_model_path)
+
+output = pipeline.predict("https://paddle-model-ecology.bj.bcebos.com/paddlex/imgs/demo_image/paddleocr_vl_demo.png")
+
+for i, res in enumerate(output):
+    res.save_to_json(save_path=f"output_{i}.json")
+    res.save_to_markdown(save_path=f"output_{i}.md")
 ```
 </details>
 
-You can refer to the Paddler-OCR [guide](https://github.com/PaddlePaddle/PaddleOCR/blob/437943ff0d462a2e3abbc4a409074ebdbd2deafd/docs/version3.x/pipeline_usage/PaddleOCR-VL.md#43-%E5%AE%A2%E6%88%B7%E7%AB%AF%E8%B0%83%E7%94%A8%E6%96%B9%E5%BC%8F) for more details.
+You can refer to the vLLM Paddler-OCR [guide](https://docs.vllm.ai/projects/recipes/en/latest/PaddlePaddle/PaddleOCR-VL.html) for more details.
 
 ---
 
 ## 4. DeepSeek-OCR Support
 
 You can refer to [here](https://docs.vllm.ai/projects/recipes/en/latest/DeepSeek/DeepSeek-OCR.html) to know how to use.
-Or You can refer to the DeepSeek-OCR [guide](https://github.com/deepseek-ai/DeepSeek-OCR?tab=readme-ov-file#vllm-inference) for details.
 
 ---
 
