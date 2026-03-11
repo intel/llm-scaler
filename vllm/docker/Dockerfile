@@ -17,21 +17,21 @@ RUN apt-get update -y && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
     update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
     apt-get install -y --no-install-recommends --fix-missing \
-        curl \
-        ffmpeg \
-        git \
-        libsndfile1 \
-        libsm6 \
-        libxext6 \
-        libaio-dev \
-        libgl1 \
-        lsb-release \
-        numactl \
-        wget \
-        vim \
-        linux-libc-dev \
+    curl \
+    ffmpeg \
+    git \
+    libsndfile1 \
+    libsm6 \
+    libxext6 \
+    libaio-dev \
+    libgl1 \
+    lsb-release \
+    numactl \
+    wget \
+    vim \
+    linux-libc-dev \
     # Install Intel GPU runtime packages
-        intel-oneapi-dpcpp-ct=2025.2.0-517 && \
+    intel-oneapi-dpcpp-ct=2025.2.0-517 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 
@@ -42,6 +42,7 @@ RUN apt-get update -y && \
 
 WORKDIR /llm
 COPY ./patches/vllm_for_multi_arc.patch /tmp/
+COPY ./patches/vllm_0_14_0.patch /tmp/
 # COPY ./patches/miner-u.patch /tmp/
 
 # Set environment variables early
@@ -61,7 +62,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install arctic-inference==0.1.1 && \
     # pip install --no-cache-dir arctic-inference==0.1.1 && \
     export CPATH=/opt/intel/oneapi/dpcpp-ct/2025.2/include/:${CPATH} && \
-    pip install --no-build-isolation . 
+    pip install --no-build-isolation .  && \
+    pip uninstall -y vllm && \
+    cd .. && \
+    rm -rf vllm && \
+    git clone -b v0.14.0 https://github.com/vllm-project/vllm.git && \
+    cd vllm && \
+    git apply /tmp/vllm_0_14_0.patch && \
+    pip install --no-build-isolation .
 
 # Clone + patch miner-U
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -100,8 +108,22 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Pin transformers version to avoid conflict in vLLM
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "transformers==4.57.3" && \
+    pip install git+https://github.com/huggingface/transformers.git && \
+    pip install ijson && \
     pip install librosa soundfile decord
+
+# Build vllm-xpu-kernels from source
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm && \
+    git clone https://github.com/vllm-project/vllm-xpu-kernels.git && \
+    cd vllm-xpu-kernels && \
+    git checkout 4c83144 && \
+    sed -i 's|^--extra-index-url=https://download.pytorch.org/whl/xpu|# --extra-index-url=https://download.pytorch.org/whl/xpu|' requirements.txt && \
+    sed -i 's|^torch==2.10.0+xpu|# torch==2.10.0+xpu|' requirements.txt && \
+    sed -i 's|^triton-xpu|# triton-xpu|' requirements.txt && \
+    sed -i 's|^transformers|# transformers|' requirements.txt && \
+    pip install -r requirements.txt && \
+    pip install --no-build-isolation .
 
 
 # Set additional environment for production usage
@@ -113,7 +135,7 @@ ENV VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 # install development dependencies (for testing)
 RUN cd /llm/vllm && \
     python3 -m pip install -e tests/vllm_test_utils
-    
+
 RUN pip uninstall oneccl oneccl-devel -y
 
 ENV TBBROOT=/opt/intel/oneapi/tbb/2022.2/env/.. \
