@@ -100,8 +100,21 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Pin transformers version to avoid conflict in vLLM
 RUN --mount=type=cache,target=/root/.cache/pip \
-    # pip install "transformers==4.57.3" && \
-    pip install librosa soundfile decord
+    pip install librosa soundfile decord && \
+    pip install git+https://github.com/huggingface/transformers.git && \
+    pip install ijson
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm && \
+    git clone https://github.com/vllm-project/vllm-xpu-kernels.git && \
+    cd vllm-xpu-kernels && \
+    git checkout 4c83144 && \
+    sed -i 's|^--extra-index-url=https://download.pytorch.org/whl/xpu|# --extra-index-url=https://download.pytorch.org/whl/xpu|' requirements.txt && \
+    sed -i 's|^torch==2.10.0+xpu|# torch==2.10.0+xpu|' requirements.txt && \
+    sed -i 's|^triton-xpu|# triton-xpu|' requirements.txt && \
+    sed -i 's|^transformers|# transformers|' requirements.txt && \
+    pip install -r requirements.txt && \
+    pip install --no-build-isolation .
 
 # FIX triton
 RUN --mount=type=cache,target=/root/.cache/pip \
