@@ -2,7 +2,12 @@
 
 ## LLM-Scaler-vLLM
 
-### Latest Beta Release 0.14.0-b8
+### Latest Beta Release
+* `intel/llm-scaler-vllm:0.14.0-b8.1` [3/11/2026]: 
+    - Added support for Qwen3.5-27B, Qwen3.5-35B-A3B and Qwen3.5-122B-A10B (FP8 and INT4)
+    - Added support for Qwen3-ASR-1.7B
+    
+### Previous Releases
 * `intel/llm-scaler-vllm:0.14.0-b8` [3/2/2026]: 
     - Upgrade: vLLM upgrade to 0.14.0, Pytorch upgrade to 2.10. oneAPI uplifted to 2025.3.2(hotfix) with LTS support on UR adaptor v2. Oneccl upgrade to 2021.15.7.8.
     - Int4 onednn optimizations are included and up to 25% throughput improvement is achieved VS last release.
@@ -15,7 +20,6 @@
     - Added support for Qwen3-Coder-Next
     - Fix InternVL issue
 
-### Previous Releases
 * `intel/llm-scaler-vllm:1.3` [1/30/2026]: 
     - Same image as intel/llm-scaler-vllm:0.11.1-b7
 
