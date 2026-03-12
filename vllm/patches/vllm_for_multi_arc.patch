@@ -516,7 +516,7 @@ index a0a56160f..fe95735b9 100644
  Flags: `--tool-call-parser glm47`
  
 diff --git a/docs/models/supported_models.md b/docs/models/supported_models.md
-index f6ac29877..da0199019 100644
+index f6ac29877..564d4d4e7 100644
 --- a/docs/models/supported_models.md
 +++ b/docs/models/supported_models.md
 @@ -665,6 +665,8 @@ These models primarily accept the [`LLM.generate`](./generative_models.md#llmgen
@@ -528,6 +528,15 @@ index f6ac29877..da0199019 100644
  | `Ernie4_5_VLMoeForConditionalGeneration` | Ernie4.5-VL | T + I<sup>+</sup>/ V<sup>+</sup> | `baidu/ERNIE-4.5-VL-28B-A3B-PT`, `baidu/ERNIE-4.5-VL-424B-A47B-PT` | | ✅︎ |
  | `FuyuForCausalLM` | Fuyu | T + I | `adept/fuyu-8b`, etc. | | ✅︎ |
  | `Gemma3ForConditionalGeneration` | Gemma 3 | T + I<sup>E+</sup> | `google/gemma-3-4b-it`, `google/gemma-3-27b-it`, etc. | ✅︎ | ✅︎ |
+@@ -712,6 +714,8 @@ These models primarily accept the [`LLM.generate`](./generative_models.md#llmgen
+ | `Qwen2VLForConditionalGeneration` | QVQ, Qwen2-VL | T + I<sup>E+</sup> + V<sup>E+</sup> | `Qwen/QVQ-72B-Preview`, `Qwen/Qwen2-VL-7B-Instruct`, `Qwen/Qwen2-VL-72B-Instruct`, etc. | ✅︎ | ✅︎ |
+ | `Qwen2_5_VLForConditionalGeneration` | Qwen2.5-VL | T + I<sup>E+</sup> + V<sup>E+</sup> | `Qwen/Qwen2.5-VL-3B-Instruct`, `Qwen/Qwen2.5-VL-72B-Instruct`, etc. | ✅︎ | ✅︎ |
+ | `Qwen2_5OmniThinkerForConditionalGeneration` | Qwen2.5-Omni | T + I<sup>E+</sup> + V<sup>E+</sup> + A<sup>+</sup> | `Qwen/Qwen2.5-Omni-3B`, `Qwen/Qwen2.5-Omni-7B` | ✅︎ | ✅︎ |
++| `Qwen3_5ForConditionalGeneration` | Qwen3.5 | T + I<sup>E+</sup> + V<sup>E+</sup> | `Qwen/Qwen3.5-9B-Instruct`, etc. | ✅︎ | ✅︎ |
++| `Qwen3_5MoeForConditionalGeneration` | Qwen3.5-MOE | T + I<sup>E+</sup> + V<sup>E+</sup> | `Qwen/Qwen3.5-35B-A3B-Instruct`, etc. | ✅︎ | ✅︎ |
+ | `Qwen3VLForConditionalGeneration` | Qwen3-VL | T + I<sup>E+</sup> + V<sup>E+</sup> | `Qwen/Qwen3-VL-4B-Instruct`, etc. | ✅︎ | ✅︎ |
+ | `Qwen3VLMoeForConditionalGeneration` | Qwen3-VL-MOE | T + I<sup>E+</sup> + V<sup>E+</sup> | `Qwen/Qwen3-VL-30B-A3B-Instruct`, etc. | ✅︎ | ✅︎ |
+ | `Qwen3OmniMoeThinkerForConditionalGeneration` | Qwen3-Omni | T + I<sup>E+</sup> + V<sup>E+</sup> + A<sup>+</sup> | `Qwen/Qwen3-Omni-30B-A3B-Instruct`, `Qwen/Qwen3-Omni-30B-A3B-Thinking` | ✅︎ | ✅︎ |
 diff --git a/examples/bmg/reasoning.py b/examples/bmg/reasoning.py
 new file mode 100644
 index 000000000..04f91786e
@@ -991,7 +1000,7 @@ index 23459963f..2031a8d66 100644
 +            f"entries are not being properly freed."
 +        )
 diff --git a/tests/models/registry.py b/tests/models/registry.py
-index a506408a0..ef64f6534 100644
+index a506408a0..d7b059745 100644
 --- a/tests/models/registry.py
 +++ b/tests/models/registry.py
 @@ -266,6 +266,11 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
@@ -1016,7 +1025,34 @@ index a506408a0..ef64f6534 100644
      "DotsOCRForCausalLM": _HfExamplesInfo(
          "rednote-hilab/dots.ocr", trust_remote_code=True
      ),
-@@ -1021,6 +1029,11 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
+@@ -897,6 +905,26 @@ _MULTIMODAL_EXAMPLE_MODELS = {
+         max_model_len=4096,
+         min_transformers_version="4.57",
+     ),
++    "Qwen3_5ForConditionalGeneration": _HfExamplesInfo(
++        "Qwen/Qwen3.5-9B-Instruct",
++        max_model_len=4096,
++        min_transformers_version="5.1.0",
++    ),
++    "Qwen3_5MoeForConditionalGeneration": _HfExamplesInfo(
++        "Qwen/Qwen3.5-35B-A3B-Instruct",
++        max_model_len=4096,
++        min_transformers_version="5.1.0",
++    ),
++    "Qwen3_5MTP": _HfExamplesInfo(
++        "Qwen/Qwen3.5-9B-Instruct",
++        speculative_model="Qwen/Qwen3.5-9B-Instruct",
++        min_transformers_version="5.1.0",
++    ),
++    "Qwen3_5MoeMTP": _HfExamplesInfo(
++        "Qwen/Qwen3.5-35B-A3B-Instruct",
++        speculative_model="Qwen/Qwen3.5-35B-A3B-Instruct",
++        min_transformers_version="5.1.0",
++    ),
+     "Qwen3OmniMoeForConditionalGeneration": _HfExamplesInfo(
+         "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+         max_model_len=4096,
+@@ -1021,6 +1049,11 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
          "zai-org/GLM-4.5",
          speculative_model="zai-org/GLM-4.5",
      ),
@@ -1861,7 +1897,7 @@ index 9d6298927..00546dd5c 100644
      )
  
 diff --git a/vllm/config/model.py b/vllm/config/model.py
-index f46918029..04d650f07 100644
+index f46918029..75cc84a24 100644
 --- a/vllm/config/model.py
 +++ b/vllm/config/model.py
 @@ -77,7 +77,7 @@ logger = init_logger(__name__)
@@ -1881,11 +1917,96 @@ index f46918029..04d650f07 100644
      - Other custom values can be supported via plugins."""
      trust_remote_code: bool = False
      """Trust remote code (e.g., from HuggingFace) when downloading the model
+@@ -299,6 +300,7 @@ class ModelConfig:
+     multimodal_config: MultiModalConfig | None = None
+     """Configuration for multimodal model. If `None`, this will be inferred
+     from the architecture of `self.model`."""
++    language_model_only: InitVar[bool] = False
+     limit_mm_per_prompt: InitVar[dict[str, int | dict[str, int]] | None] = None
+     enable_mm_embeds: InitVar[bool | None] = None
+     media_io_kwargs: InitVar[dict[str, dict[str, Any]] | None] = None
+@@ -413,6 +415,7 @@ class ModelConfig:
+     def __post_init__(
+         self,
+         # Multimodal config init vars
++        language_model_only: bool,
+         limit_mm_per_prompt: dict[str, int | dict[str, int]] | None,
+         enable_mm_embeds: bool | None,
+         media_io_kwargs: dict[str, dict[str, Any]] | None,
+@@ -576,6 +579,7 @@ class ModelConfig:
+                 mm_encoder_tp_mode = "weights"
+ 
+             mm_config_kwargs = dict(
++                language_model_only=language_model_only,
+                 limit_per_prompt=limit_mm_per_prompt,
+                 enable_mm_embeds=enable_mm_embeds,
+                 media_io_kwargs=media_io_kwargs,
+@@ -1225,8 +1229,8 @@ class ModelConfig:
+             if attn_type_list:
+                 return sum(t == 1 for t in attn_type_list[start:end])
+ 
+-            # Hybrid model Qwen3Next
+-            layer_types_value = getattr(self.hf_config, "layer_types", None)
++            # Hybrid model Qwen3Next Qwen3.5 Series
++            layer_types_value = getattr(self.hf_text_config, "layer_types", None)
+             if layer_types_value is not None:
+                 if block_type == "attention":
+                     return sum(
+diff --git a/vllm/config/multimodal.py b/vllm/config/multimodal.py
+index ecb346af8..937687bac 100644
+--- a/vllm/config/multimodal.py
++++ b/vllm/config/multimodal.py
+@@ -55,8 +55,12 @@ DummyOptions: TypeAlias = (
+ class MultiModalConfig:
+     """Controls the behavior of multimodal models."""
+ 
++    language_model_only: bool = False
++    """If True, disables all multimodal inputs by setting all modality limits
++    to 0. Equivalent to setting --limit-mm-per-prompt to 0 for every
++    modality."""
+     limit_per_prompt: dict[str, DummyOptions] = Field(default_factory=dict)
+-    """The maximum number of input items and options allowed per 
++    """The maximum number of input items and options allowed per
+         prompt for each modality.
+     Defaults to 999 for each modality.
+ 
+@@ -64,11 +68,11 @@ class MultiModalConfig:
+         {"image": 16, "video": 2}
+ 
+     Configurable format (with options):
+-        {"video": {"count": 1, "num_frames": 32, "width": 512, "height": 512}, 
++        {"video": {"count": 1, "num_frames": 32, "width": 512, "height": 512},
+         "image": {"count": 5, "width": 512, "height": 512}}
+ 
+     Mixed format (combining both):
+-        {"image": 16, "video": {"count": 1, "num_frames": 32, "width": 512, 
++        {"image": 16, "video": {"count": 1, "num_frames": 32, "width": 512,
+         "height": 512}}
+     """
+     enable_mm_embeds: bool = False
+@@ -205,6 +209,7 @@ class MultiModalConfig:
+         the final hidden states.
+         """
+         factors: list[Any] = [
++            self.language_model_only,
+             self.mm_encoder_attn_backend.name
+             if self.mm_encoder_attn_backend is not None
+             else None
+@@ -217,6 +222,9 @@ class MultiModalConfig:
+         Get the maximum number of input items allowed per prompt
+         for the given modality (backward compatible).
+         """
++        if self.language_model_only:
++            return 0
++
+         limit_data = self.limit_per_prompt.get(modality)
+ 
+         if limit_data is None:
 diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
-index cba00daaa..fe370d645 100644
+index cba00daaa..5a2ff79ca 100644
 --- a/vllm/config/speculative.py
 +++ b/vllm/config/speculative.py
-@@ -32,6 +32,7 @@ MTPModelTypes = Literal[
+@@ -32,9 +32,11 @@ MTPModelTypes = Literal[
      "deepseek_mtp",
      "mimo_mtp",
      "glm4_moe_mtp",
@@ -1893,7 +2014,11 @@ index cba00daaa..fe370d645 100644
      "ernie_mtp",
      "exaone_moe_mtp",
      "qwen3_next_mtp",
-@@ -205,6 +206,17 @@ class SpeculativeConfig:
++    "qwen3_5_mtp",
+     "longcat_flash_mtp",
+     "mtp",
+     "pangu_ultra_moe_mtp",
+@@ -205,6 +207,17 @@ class SpeculativeConfig:
                  }
              )
  
@@ -1911,6 +2036,23 @@ index cba00daaa..fe370d645 100644
          if hf_config.model_type == "ernie4_5_moe":
              hf_config.model_type = "ernie_mtp"
          if hf_config.model_type == "ernie_mtp":
+@@ -229,6 +242,16 @@ class SpeculativeConfig:
+                 {"n_predict": n_predict, "architectures": ["ExaoneMoeMTP"]}
+             )
+ 
++        if hf_config.model_type in ("qwen3_5", "qwen3_5_moe"):
++            is_moe = hf_config.model_type == "qwen3_5_moe"
++            hf_config.model_type = "qwen3_5_mtp"
++            n_predict = getattr(hf_config, "mtp_num_hidden_layers", None)
++            hf_config.update(
++                {
++                    "n_predict": n_predict,
++                    "architectures": ["Qwen3_5MoeMTP" if is_moe else "Qwen3_5MTP"],
++                }
++            )
+         if hf_config.model_type == "longcat_flash":
+             hf_config.model_type = "longcat_flash_mtp"
+             n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
 index ec699b629..72da0a11f 100644
 --- a/vllm/config/vllm.py
@@ -2139,6 +2281,36 @@ index f3d9262d2..b4b5b0378 100644
      def gather(
          self, input_: torch.Tensor, dst: int = 0, dim: int = -1
      ) -> torch.Tensor | None:
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 3a36ca797..6638d4de4 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -455,6 +455,7 @@ class EngineArgs:
+     allow_deprecated_quantization: bool = ModelConfig.allow_deprecated_quantization
+     enforce_eager: bool = ModelConfig.enforce_eager
+     disable_custom_all_reduce: bool = ParallelConfig.disable_custom_all_reduce
++    language_model_only: bool = MultiModalConfig.language_model_only
+     limit_mm_per_prompt: dict[str, int | dict[str, int]] = get_field(
+         MultiModalConfig, "limit_per_prompt"
+     )
+@@ -955,6 +956,9 @@ class EngineArgs:
+             title="MultiModalConfig",
+             description=MultiModalConfig.__doc__,
+         )
++        multimodal_group.add_argument(
++            "--language-model-only", **multimodal_kwargs["language_model_only"]
++        )
+         multimodal_group.add_argument(
+             "--limit-mm-per-prompt", **multimodal_kwargs["limit_per_prompt"]
+         )
+@@ -1250,6 +1254,7 @@ class EngineArgs:
+             skip_tokenizer_init=self.skip_tokenizer_init,
+             enable_prompt_embeds=self.enable_prompt_embeds,
+             served_model_name=self.served_model_name,
++            language_model_only=self.language_model_only,
+             limit_mm_per_prompt=self.limit_mm_per_prompt,
+             enable_mm_embeds=self.enable_mm_embeds,
+             interleave_mm_strings=self.interleave_mm_strings,
 diff --git a/vllm/entrypoints/openai/translations/speech_to_text.py b/vllm/entrypoints/openai/translations/speech_to_text.py
 new file mode 100644
 index 000000000..c993e1ebd
@@ -3167,6 +3339,20 @@ index 3df20796b..2a1e804ce 100644
  ]
  
  
+diff --git a/vllm/model_executor/layers/mamba/abstract.py b/vllm/model_executor/layers/mamba/abstract.py
+index 4f45dd6ca..4336cde92 100644
+--- a/vllm/model_executor/layers/mamba/abstract.py
++++ b/vllm/model_executor/layers/mamba/abstract.py
+@@ -43,7 +43,8 @@ class MambaBase(AttentionLayerBase):
+     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+         if (
+             vllm_config.speculative_config is not None
+-            and vllm_config.model_config.hf_config.model_type not in ["qwen3_next"]
++            and vllm_config.model_config.hf_config.model_type
++            not in ["qwen3_next", "qwen3_5", "qwen3_5_moe"]
+         ):
+             raise NotImplementedError(
+                 "Mamba with speculative decoding is not supported yet."
 diff --git a/vllm/model_executor/layers/mla.py b/vllm/model_executor/layers/mla.py
 index 65541d2a4..bf0957cd1 100644
 --- a/vllm/model_executor/layers/mla.py
@@ -6663,7 +6849,7 @@ index 297237fd1..fa4f1278e 100644
          self.output_dropout = torch.nn.Dropout(config.dropout_prob)
  
 diff --git a/vllm/model_executor/models/idefics2_vision_model.py b/vllm/model_executor/models/idefics2_vision_model.py
-index c78ad6479..d523e25bd 100644
+index c78ad6479..ce1bddd27 100644
 --- a/vllm/model_executor/models/idefics2_vision_model.py
 +++ b/vllm/model_executor/models/idefics2_vision_model.py
 @@ -30,6 +30,7 @@ from transformers.models.idefics2.configuration_idefics2 import (
@@ -6689,6 +6875,23 @@ index c78ad6479..d523e25bd 100644
          )
  
      def forward(
+@@ -176,7 +180,15 @@ class Idefics2VisionAttention(nn.Module):
+         query_states, key_states, value_states = qkv.chunk(3, dim=-1)
+ 
+         # Use unified MMEncoderAttention implementation
+-        out = self.attn(query_states, key_states, value_states)
++        # add cu_seqlens and max_seqlen for variable-length attention support
++        bsz, q_len, _ = query_states.size()
++        tmp = [0]
++        for i in range(bsz):
++            tmp.append(q_len)
++        seqlen = torch.tensor(tmp)
++        cu_seqlens = torch.cumsum(seqlen, dim=0).to(device=query_states.device)
++        max_seqlen = q_len
++        out = self.attn(query_states, key_states, value_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+         attn_output, _ = self.out_proj(out)
+         return attn_output
+ 
 diff --git a/vllm/model_executor/models/interfaces.py b/vllm/model_executor/models/interfaces.py
 index a8a476abb..0770c87be 100644
 --- a/vllm/model_executor/models/interfaces.py
@@ -6911,9 +7114,1618 @@ index 3b0dce7fc..4627f6954 100644
          )
  
          self.apply_rotary_emb = ApplyRotaryEmb(enforce_enable=True)
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+new file mode 100644
+index 000000000..68e83d66e
+--- /dev/null
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -0,0 +1,1152 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++# Copyright 2025 The vLLM team.
++# Copyright 2025 The Qwen Team.
++# Copyright 2025 The HuggingFace Inc. team.
++# All rights reserved.
++#
++# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
++# and OPT implementations in this library. It has been modified from its
++# original forms to accommodate minor architectural differences compared
++# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
++
++import typing
++from collections.abc import Callable, Iterable
++
++import torch
++from einops import rearrange
++from torch import nn
++from transformers.activations import ACT2FN
++from vllm.utils.math_utils import round_up
++from transformers.models.qwen3_5.configuration_qwen3_5 import (
++    Qwen3_5Config,
++    Qwen3_5TextConfig,
++)
++from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
++    Qwen3_5MoeConfig,
++    Qwen3_5MoeTextConfig,
++)
++
++from vllm.compilation.decorators import support_torch_compile
++from vllm.config import (
++    CacheConfig,
++    ModelConfig,
++    SpeculativeConfig,
++    VllmConfig,
++    get_current_vllm_config,
++)
++from vllm.distributed import (
++    divide,
++    get_pp_group,
++    get_tensor_model_parallel_rank,
++    get_tensor_model_parallel_world_size,
++)
++from vllm.logger import init_logger
++from vllm.model_executor.layers.layernorm import (
++    GemmaRMSNorm as Qwen3_5RMSNorm,
++)
++from vllm.model_executor.layers.layernorm import RMSNormGated
++from vllm.model_executor.layers.linear import (
++    ColumnParallelLinear,
++    MergedColumnParallelLinear,
++    RowParallelLinear,
++)
++from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.mamba.mamba_mixer2 import (
++    mamba_v2_sharded_weight_loader,
++)
++from vllm.model_executor.layers.mamba.mamba_utils import (
++    # MambaStateCopyFunc,
++    # MambaStateCopyFuncCalculator,
++    MambaStateDtypeCalculator,
++    MambaStateShapeCalculator,
++)
++from vllm.model_executor.layers.quantization import QuantizationConfig
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    VocabParallelEmbedding,
++)
++from vllm.model_executor.model_loader.weight_utils import (
++    default_weight_loader,
++    sharded_weight_loader,
++)
++from vllm.model_executor.utils import set_weight_attrs
++from vllm.forward_context import get_forward_context
++from vllm.multimodal import MULTIMODAL_REGISTRY
++from vllm.platforms import current_platform
++from vllm.sequence import IntermediateTensors
++
++from .interfaces import (
++    HasInnerState,
++    IsHybrid,
++    MixtureOfExperts,
++    MultiModalEmbeddings,
++    SupportsLoRA,
++    SupportsPP,
++    _require_is_multimodal,
++)
++from .qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
++from .qwen3_next import (
++    Qwen3NextAttention,
++    Qwen3NextDecoderLayer,
++    Qwen3NextGatedDeltaNet,
++    Qwen3NextModel,
++    Qwen3NextSparseMoeBlock,
++    QwenNextMixtureOfExperts,
++)
++from .qwen3_vl import (
++    Qwen3_VisionTransformer,
++    Qwen3VLDummyInputsBuilder,
++    Qwen3VLForConditionalGeneration,
++    Qwen3VLMultiModalProcessor,
++    Qwen3VLProcessingInfo,
++)
++from .utils import (
++    AutoWeightsLoader,
++    PPMissingLayer,
++    _merge_multimodal_embeddings,
++    extract_layer_index,
++    is_pp_missing_parameter,
++    make_empty_intermediate_tensors_factory,
++    make_layers,
++    maybe_prefix,
++)
++
++logger = init_logger(__name__)
++
++
++class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
++    def get_hf_config(self):
++        return self.ctx.get_hf_config(Qwen3_5Config)
++
++
++class Qwen3_5MoeProcessingInfo(Qwen3VLProcessingInfo):
++    def get_hf_config(self):
++        return self.ctx.get_hf_config(Qwen3_5MoeConfig)
++
++
++class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
++    def __init__(
++        self,
++        config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig,
++        model_config: ModelConfig | None = None,
++        cache_config: CacheConfig | None = None,
++        quant_config: QuantizationConfig | None = None,
++        speculative_config: SpeculativeConfig | None = None,
++        prefix: str = "",
++    ) -> None:
++        super(Qwen3NextGatedDeltaNet, self).__init__()
++        self.tp_size = get_tensor_model_parallel_world_size()
++        self.tp_rank = get_tensor_model_parallel_rank()
++        self.hidden_size = config.hidden_size
++        self.num_v_heads = config.linear_num_value_heads
++        self.num_k_heads = config.linear_num_key_heads
++        self.head_k_dim = config.linear_key_head_dim
++        self.head_v_dim = config.linear_value_head_dim
++        self.key_dim = self.head_k_dim * self.num_k_heads
++        self.value_dim = self.head_v_dim * self.num_v_heads
++
++        self.conv_kernel_size = config.linear_conv_kernel_dim
++        self.layer_idx = extract_layer_index(prefix)
++        self.activation = config.hidden_act
++        self.act = ACT2FN[config.hidden_act]
++        self.layer_norm_epsilon = config.rms_norm_eps
++        self.prefix = prefix
++
++        self.config = config
++        self.model_config = model_config
++        self.cache_config = cache_config
++        self.quant_config = quant_config
++        self.speculative_config = speculative_config
++        self.num_spec = (
++            self.speculative_config.num_speculative_tokens
++            if self.speculative_config
++            else 0
++        )
++
++        # QKV
++        self.conv_dim = self.key_dim * 2 + self.value_dim
++        self.conv1d = ColumnParallelLinear(
++            input_size=self.conv_kernel_size,
++            output_size=self.conv_dim,
++            bias=False,
++            prefix=f"{prefix}.conv1d",
++        )
++        self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
++
++        self.in_proj_qkv = MergedColumnParallelLinear(
++            input_size=self.hidden_size,
++            output_sizes=[self.key_dim, self.key_dim, self.value_dim],
++            bias=False,
++            quant_config=quant_config,
++            prefix=f"{prefix}.in_proj_qkv",
++        )
++        self.in_proj_z = ColumnParallelLinear(
++            input_size=self.hidden_size,
++            output_size=self.value_dim,
++            bias=False,
++            quant_config=quant_config,
++            prefix=f"{prefix}.in_proj_z",
++        )
++        self.in_proj_b = ColumnParallelLinear(
++            input_size=self.hidden_size,
++            output_size=self.num_v_heads,
++            bias=False,
++            quant_config=quant_config,
++            prefix=f"{prefix}.in_proj_ba",
++        )
++        self.in_proj_a = ColumnParallelLinear(
++            input_size=self.hidden_size,
++            output_size=self.num_v_heads,
++            bias=False,
++            quant_config=quant_config,
++            prefix=f"{prefix}.in_proj_a",
++        )
++
++        query_key_settings = (self.key_dim, 0, False)
++        value_settings = (self.value_dim, 0, False)
++
++        delattr(self.conv1d.weight, "weight_loader")
++        set_weight_attrs(
++            self.conv1d.weight,
++            {
++                "weight_loader": mamba_v2_sharded_weight_loader(
++                    [
++                        query_key_settings,
++                        query_key_settings,
++                        value_settings,
++                    ],
++                    self.tp_size,
++                    self.tp_rank,
++                )
++            },
++        )
++
++        # selective projection used to make dt, B and C input dependant
++
++        # time step projection (discretization)
++        # instantiate once and copy inv_dt in init_weights of PretrainedModel
++        self.dt_bias = nn.Parameter(
++            torch.ones(self.num_v_heads // self.tp_size),
++        )
++        self.A_log = nn.Parameter(
++            torch.empty(
++                divide(self.num_v_heads, self.tp_size),
++            )
++        )
++
++        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
++        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
++
++        self.norm = RMSNormGated(
++            self.head_v_dim,
++            eps=self.layer_norm_epsilon,
++            group_size=None,
++            norm_before_gate=True,
++            device=current_platform.current_device(),
++            dtype=config.dtype,
++        )
++
++        self.out_proj = RowParallelLinear(
++            self.value_dim,
++            self.hidden_size,
++            bias=False,
++            input_is_parallel=True,
++            quant_config=quant_config,
++            prefix=f"{prefix}.out_proj",
++        )
++
++        compilation_config = get_current_vllm_config().compilation_config
++        if prefix in compilation_config.static_forward_context:
++            raise ValueError(f"Duplicate layer name: {prefix}")
++        compilation_config.static_forward_context[prefix] = self
++
++    def fix_query_key_value_ordering(
++        self,
++        mixed_qkv,
++        z,
++        b,
++        a,
++    ):
++        raise NotImplementedError(
++            "Qwen3.5 Series dont need to fix query key value ordering"
++        )
++
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        output: torch.Tensor,
++    ):
++        if current_platform.is_xpu():
++            self.forward_xpu(hidden_states, output)
++        else:
++            self.forward_cuda(hidden_states, output)
++
++    def forward_xpu(
++        self,
++        hidden_states: torch.Tensor,
++        output: torch.Tensor,
++    ):
++        """
++        Forward pass for XPU with three parts:
++        1. Input projection (separate projections + rearrangement)
++        2. Core attention (XPU kernel)
++        3. Output projection
++        """
++        num_tokens = hidden_states.size(0)
++
++        # ============================================================
++        # Part 1: Input Projection
++        # ============================================================
++        mixed_qkv, _ = self.in_proj_qkv(hidden_states)
++        z_raw, _ = self.in_proj_z(hidden_states)
++        b_raw, _ = self.in_proj_b(hidden_states)
++        a_raw, _ = self.in_proj_a(hidden_states)
++
++        # Rearrange separate projections to GQA-interleaved format
++        # expected by the XPU kernel.
++        # Layout per k_head group: [q, k, v_group, z_group]
++        num_k_groups = self.num_k_heads // self.tp_size
++        v_per_group = self.num_v_heads // self.num_k_heads
++        q_dim = self.key_dim // self.tp_size
++        k_dim = self.key_dim // self.tp_size
++
++        q = mixed_qkv[..., :q_dim].reshape(
++            num_tokens, num_k_groups, self.head_k_dim)
++        k = mixed_qkv[..., q_dim:q_dim + k_dim].reshape(
++            num_tokens, num_k_groups, self.head_k_dim)
++        v = mixed_qkv[..., q_dim + k_dim:].reshape(
++            num_tokens, num_k_groups, v_per_group * self.head_v_dim)
++        z = z_raw.reshape(
++            num_tokens, num_k_groups, v_per_group * self.head_v_dim)
++
++        projected_states_qkvz = torch.cat(
++            [q, k, v, z], dim=-1
++        ).reshape(num_tokens, -1).contiguous()
++
++        b = b_raw.reshape(num_tokens, num_k_groups, v_per_group)
++        a = a_raw.reshape(num_tokens, num_k_groups, v_per_group)
++        projected_states_ba = torch.cat(
++            [b, a], dim=-1
++        ).reshape(num_tokens, -1).contiguous()
++
++        # ============================================================
++        # Part 2: Core Attention (XPU Kernel)
++        # ============================================================
++        forward_context = get_forward_context()
++        attn_metadata = forward_context.attn_metadata
++        core_attn_out = torch.zeros(
++            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
++            dtype=hidden_states.dtype,
++            device=hidden_states.device,
++        )
++        z_out = torch.empty_like(core_attn_out)
++        if attn_metadata is not None:
++            attn_metadata = attn_metadata[self.prefix]
++
++            # TODO: xpu does not support this param yet
++            spec_sequence_masks = attn_metadata.spec_sequence_masks
++            if spec_sequence_masks is not None:
++                raise NotImplementedError(
++                    "XPU gdn_attention does not yet support 'spec_sequence_masks'."
++                )
++
++            conv_weights = self.conv1d.weight.view(
++                self.conv1d.weight.size(0), self.conv1d.weight.size(2)
++            )
++
++            self_kv_cache = self.kv_cache[forward_context.virtual_engine]
++            conv_state = self_kv_cache[0]
++            ssm_state = self_kv_cache[1]
++
++            torch.ops._xpu_C.gdn_attention(
++                core_attn_out,
++                z_out,
++                projected_states_qkvz,
++                projected_states_ba,
++                self.num_k_heads,
++                self.num_v_heads,
++                self.head_k_dim,
++                self.head_v_dim,
++                conv_state=conv_state,
++                ssm_state=ssm_state,
++                conv_weights=conv_weights,
++                conv_bias=self.conv1d.bias,
++                activation=self.activation,
++                A_log=self.A_log,
++                dt_bias=self.dt_bias,
++                num_prefills=attn_metadata.num_prefills,
++                num_decodes=attn_metadata.num_decodes,
++                has_initial_state=attn_metadata.has_initial_state,
++                non_spec_query_start_loc=attn_metadata.non_spec_query_start_loc,
++                non_spec_state_indices_tensor=attn_metadata.non_spec_state_indices_tensor,
++                num_actual_tokens=attn_metadata.num_actual_tokens,
++                tp_size=self.tp_size,
++            )
++
++        # ============================================================
++        # Part 3: Output Projection
++        # ============================================================
++        z_shape_og = z_out.shape
++        # Reshape input data into 2D tensor
++        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
++        z_out = z_out.reshape(-1, z_out.shape[-1])
++        core_attn_out = self.norm(core_attn_out, z_out)
++        core_attn_out = core_attn_out.reshape(z_shape_og)
++        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
++        output[:num_tokens], _ = self.out_proj(core_attn_out)
++
++    def forward_cuda(
++        self,
++        hidden_states: torch.Tensor,
++        output: torch.Tensor,
++    ):
++        """
++        Forward pass with three parts:
++        1. Input projection
++        2. Core attention (custom op)
++        3. Output projection
++        """
++        num_tokens = hidden_states.size(0)
++
++        # ============================================================
++        # Part 1: Input Projection
++        # ============================================================
++        mixed_qkv, _ = self.in_proj_qkv(hidden_states)
++        z, _ = self.in_proj_z(hidden_states)
++        z = z.reshape(z.size(0), -1, self.head_v_dim)
++        b, _ = self.in_proj_b(hidden_states)
++        a, _ = self.in_proj_a(hidden_states)
++
++        b = b.contiguous()
++        a = a.contiguous()
++
++        # ============================================================
++        # Part 2: Core Attention (Custom Op)
++        # ============================================================
++        # Note: we should not use torch.empty here like other attention backends,
++        # see discussions in https://github.com/vllm-project/vllm/pull/28182
++        core_attn_out = torch.zeros(
++            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
++            dtype=hidden_states.dtype,
++            device=hidden_states.device,
++        )
++
++        torch.ops.vllm.gdn_attention_core(
++            mixed_qkv,
++            b,
++            a,
++            core_attn_out,
++            self.prefix,
++        )
++
++        # ============================================================
++        # Part 3: Output Projection
++        # ============================================================
++        z_shape_og = z.shape
++        # Reshape input data into 2D tensor
++        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
++        z = z.reshape(-1, z.shape[-1])
++        core_attn_out = self.norm(core_attn_out, z)
++        core_attn_out = core_attn_out.reshape(z_shape_og)
++        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
++        output[:num_tokens], _ = self.out_proj(core_attn_out)
++
++
++class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
++    def __init__(
++        self,
++        vllm_config: VllmConfig,
++        layer_type: str,
++        prefix: str = "",
++    ) -> None:
++        super(Qwen3NextDecoderLayer, self).__init__()
++
++        config = vllm_config.model_config.hf_text_config
++        model_config = vllm_config.model_config
++        cache_config = vllm_config.cache_config
++        quant_config = vllm_config.quant_config
++        speculative_config = vllm_config.speculative_config
++
++        self.layer_type = layer_type
++        self.layer_idx = extract_layer_index(prefix)
++
++        if self.layer_type == "linear_attention":
++            self.linear_attn = Qwen3_5GatedDeltaNet(
++                config,
++                model_config=model_config,
++                cache_config=cache_config,
++                quant_config=quant_config,
++                speculative_config=speculative_config,
++                prefix=f"{prefix}.linear_attn",
++            )
++        elif self.layer_type == "full_attention":
++            self.self_attn = Qwen3NextAttention(
++                config,
++                model_config=model_config,
++                cache_config=cache_config,
++                quant_config=quant_config,
++                prefix=f"{prefix}.self_attn",
++            )
++        else:
++            raise ValueError(f"Invalid layer_type {self.layer_type}")
++
++        # NOTE: Determine the MLP type based on the model type
++        # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
++        if config.model_type == "qwen3_5_moe_text":
++            self.mlp = Qwen3NextSparseMoeBlock(
++                vllm_config=vllm_config,
++                prefix=f"{prefix}.mlp",
++            )
++        elif config.model_type == "qwen3_5_text":
++            self.mlp = Qwen3NextMLP(
++                hidden_size=config.hidden_size,
++                intermediate_size=config.intermediate_size,
++                hidden_act=config.hidden_act,
++                quant_config=quant_config,
++                prefix=f"{prefix}.mlp",
++            )
++        else:
++            raise ValueError(f"Invalid model_type {config.model_type}")
++
++        self.input_layernorm = Qwen3_5RMSNorm(
++            config.hidden_size, eps=config.rms_norm_eps
++        )
++        self.post_attention_layernorm = Qwen3_5RMSNorm(
++            config.hidden_size, eps=config.rms_norm_eps
++        )
++
++        self.layer_scale = getattr(config, "layer_scale", False)
++        if self.layer_scale:
++            self.attn_layer_scale = torch.nn.Parameter(
++                torch.zeros(
++                    1,
++                    1,
++                    config.hidden_size,
++                    dtype=config.dtype,
++                ),
++            )
++            self.ffn_layer_scale = torch.nn.Parameter(
++                torch.zeros(
++                    1,
++                    1,
++                    config.hidden_size,
++                    dtype=config.dtype,
++                ),
++            )
++
++
++@support_torch_compile(
++    dynamic_arg_dims={
++        "input_ids": 0,
++        # positions is of shape (3, seq_len) if mrope is enabled for qwen2-vl,
++        # otherwise (seq_len, ).
++        "positions": -1,
++        "intermediate_tensors": 0,
++        "inputs_embeds": 0,
++    }
++)
++class Qwen3_5Model(Qwen3NextModel):
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        super(Qwen3NextModel, self).__init__()
++
++        config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig = (
++            vllm_config.model_config.hf_text_config
++        )
++        parallel_config = vllm_config.parallel_config
++
++        eplb_config = parallel_config.eplb_config
++        self.num_redundant_experts = eplb_config.num_redundant_experts
++
++        self.config = config
++        self.quant_config = vllm_config.quant_config
++
++        self.vocab_size = config.vocab_size
++
++        self.embed_tokens = VocabParallelEmbedding(
++            self.vocab_size,
++            config.hidden_size,
++        )
++
++        def get_layer(prefix: str):
++            return Qwen3_5DecoderLayer(
++                vllm_config,
++                layer_type=config.layer_types[extract_layer_index(prefix)],
++                prefix=prefix,
++            )
++
++        self.start_layer, self.end_layer, self.layers = make_layers(
++            config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
++        )
++        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
++            ["hidden_states", "residual"], config.hidden_size
++        )
++
++        if get_pp_group().is_last_rank:
++            self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        else:
++            self.norm = PPMissingLayer()
++
++    def load_fused_expert_weights(
++        self,
++        name: str,
++        params_dict: dict,
++        loaded_weight: torch.Tensor,
++        shard_id: str,
++        num_experts: int,
++    ) -> bool:
++        param = params_dict[name]
++        weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
++        loaded_local_expert = False
++        for expert_id in range(num_experts):
++            curr_expert_weight = loaded_weight[expert_id]
++            success = weight_loader(
++                param,
++                curr_expert_weight,
++                name,
++                shard_id,
++                expert_id,
++                return_success=True,
++            )
++            if success:
++                loaded_local_expert = True
++
++        return loaded_local_expert
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        stacked_params_mapping = [
++            # (param_name, shard_name, shard_id)
++            ("qkv_proj", "q_proj", "q"),
++            ("qkv_proj", "k_proj", "k"),
++            ("qkv_proj", "v_proj", "v"),
++            ("gate_up_proj", "gate_proj", 0),
++            ("gate_up_proj", "up_proj", 1),
++        ]
++
++        params_dict = dict(self.named_parameters())
++        loaded_params: set[str] = set()
++        expert_params_mapping = self.get_expert_mapping()
++        is_fused_expert = False
++        fused_expert_params_mapping = [
++            ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
++            ("experts.w2_weight", "experts.down_proj", 0, "w2"),
++        ]
++        num_experts = (
++            self.config.num_experts if hasattr(self.config, "num_experts") else 0
++        )
++
++        is_padding_needed = False
++        quantization_config = getattr(self.config, "quantization_config", None)
++        if quantization_config is not None or self.quant_config is not None:
++            if quantization_config is not None:
++                quant_method = quantization_config.get("quant_method", "").lower()
++            elif self.quant_config is not None:
++                quant_method = self.quant_config.get_name()
++            tp_size = get_tensor_model_parallel_world_size()
++            if (quant_method in ("sym_int4")) and (tp_size == 4 or tp_size == 8):
++                is_padding_needed = True
++        for name, loaded_weight in weights:
++            if "rotary_emb.inv_freq" in name:
++                continue
++
++            if name.startswith("mtp."):
++                continue
++
++            for param_name, weight_name, shard_id in stacked_params_mapping:
++                if "experts.gate_up_proj" in name or "experts.down_proj" in name:
++                    is_fused_expert = True
++                    expert_params_mapping = fused_expert_params_mapping
++
++                if weight_name not in name:
++                    continue
++
++                if "mlp.experts" in name:
++                    continue
++
++                name = name.replace(weight_name, param_name)
++                # Skip loading extra bias for GPTQ models.
++                if name.endswith(".bias") and name not in params_dict:
++                    continue
++                # Skip layers on other devices.
++                if is_pp_missing_parameter(name, self):
++                    continue
++                # name = apply_attn_prefix(name, params_dict)
++                if name not in params_dict:
++                    continue
++                param = params_dict[name]
++                weight_loader = param.weight_loader
++                weight_loader(param, loaded_weight, shard_id)
++                break
++            else:
++                is_expert_weight = False
++                for mapping in expert_params_mapping:
++                    param_name, weight_name, expert_id, shard_id = mapping
++                    if weight_name not in name:
++                        continue
++                    is_expert_weight = True
++                    name_mapped = name.replace(weight_name, param_name)
++                    # Skip layers on other devices.
++                    if is_pp_missing_parameter(name_mapped, self):
++                        continue
++                    if is_fused_expert:
++                        # qwen3.5 no need to transpose
++                        # loaded_weight = loaded_weight.transpose(-1, -2)
++                        if "experts.gate_up_proj" in name:
++                            loaded_weight = loaded_weight.chunk(2, dim=-2)
++                            
++                            if is_padding_needed:
++                                shape0 = loaded_weight[0].shape[1]
++                                target_size = round_up(shape0, 1024)
++                                pad_size = target_size - shape0
++                                loaded_weight0 = torch.nn.functional.pad(loaded_weight[0], (0, 0, 0, pad_size), value=0)
++
++                                shape1 = loaded_weight[1].shape[1]
++                                target_size = round_up(shape1, 1024)
++                                pad_size = target_size - shape1
++                                loaded_weight1 = torch.nn.functional.pad(loaded_weight[1], (0, 0, 0, pad_size), value=0)
++                            else:
++                                loaded_weight0 = loaded_weight[0]
++                                loaded_weight1 = loaded_weight[1]
++                            success_w1 = self.load_fused_expert_weights(
++                                name_mapped,
++                                params_dict,
++                                loaded_weight0,
++                                "w1",
++                                num_experts,
++                            )
++                            success_w3 = self.load_fused_expert_weights(
++                                name_mapped,
++                                params_dict,
++                                loaded_weight1,
++                                "w3",
++                                num_experts,
++                            )
++                            success = success_w1 and success_w3
++                        else:
++                            # down_proj
++                            if is_padding_needed:
++                                shape1 = loaded_weight.shape[-1]
++                                target_size = round_up(shape1, 1024)
++                                pad_size = target_size - shape1
++                                loaded_weight = torch.nn.functional.pad(loaded_weight, (0, pad_size), value=0)
++
++                            success = self.load_fused_expert_weights(
++                                name_mapped,
++                                params_dict,
++                                loaded_weight,
++                                shard_id,
++                                num_experts,
++                            )
++                        if success:
++                            name = name_mapped
++                            break
++                    else:
++                        # Skip loading extra bias for GPTQ models.
++                        if (
++                            name_mapped.endswith(".bias")
++                            or name_mapped.endswith("_bias")
++                        ) and name_mapped not in params_dict:
++                            continue
++                        param = params_dict[name_mapped]
++                        weight_loader = param.weight_loader
++                        success = weight_loader(
++                            param,
++                            loaded_weight,
++                            name_mapped,
++                            shard_id=shard_id,
++                            expert_id=expert_id,
++                            return_success=True,
++                        )
++                    if success:
++                        name = name_mapped
++                        break
++                else:
++                    if is_expert_weight:
++                        # We've checked that this is an expert weight
++                        # However it's not mapped locally to this rank
++                        # So we simply skip it
++                        continue
++                    # Skip loading extra bias for GPTQ models.
++                    if name.endswith(".bias") and name not in params_dict:
++                        continue
++                    if is_pp_missing_parameter(name, self):
++                        continue
++                    if name not in params_dict:
++                        logger.warning_once(
++                            f"Parameter {name} not found in params_dict, skip loading"
++                        )
++                        continue
++                    param = params_dict[name]
++                    weight_loader = getattr(
++                        param, "weight_loader", default_weight_loader
++                    )
++                    weight_loader(param, loaded_weight)
++            loaded_params.add(name)
++        return loaded_params
++
++
++class Qwen3_5ForCausalLMBase(
++    nn.Module,
++    HasInnerState,
++    SupportsLoRA,
++    SupportsPP,
++):
++    packed_modules_mapping = {
++        "qkv_proj": [
++            "q_proj",
++            "k_proj",
++            "v_proj",
++        ],
++        "gate_up_proj": ["gate_proj", "up_proj"],
++    }
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        config = vllm_config.model_config.hf_text_config
++        self.vllm_config = vllm_config
++        self.model_config = vllm_config.model_config
++        cache_config = vllm_config.cache_config
++
++        scheduler_config = vllm_config.scheduler_config
++        assert not cache_config.enable_prefix_caching, (
++            "Qwen3Next currently does not support prefix caching"
++        )
++        self.quant_config = vllm_config.quant_config
++
++        super().__init__()
++        self.config = config
++        self.scheduler_config = scheduler_config
++        self.model = Qwen3_5Model(
++            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
++        )
++
++        if get_pp_group().is_last_rank:
++            if config.tie_word_embeddings:
++                self.lm_head = self.model.embed_tokens
++            else:
++                self.lm_head = ParallelLMHead(
++                    config.vocab_size,
++                    config.hidden_size,
++                    prefix=maybe_prefix(prefix, "lm_head"),
++                )
++        else:
++            self.lm_head = PPMissingLayer()
++
++        self.logits_processor = LogitsProcessor(config.vocab_size)
++        self.make_empty_intermediate_tensors = (
++            self.model.make_empty_intermediate_tensors
++        )
++
++    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.model.embed_input_ids(input_ids)
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        intermediate_tensors: IntermediateTensors | None = None,
++        inputs_embeds: torch.Tensor | None = None,
++        **kwargs: object,
++    ):
++        hidden_states = self.model(
++            input_ids, positions, intermediate_tensors, inputs_embeds
++        )
++
++        return hidden_states
++
++    def compute_logits(
++        self,
++        hidden_states: torch.Tensor,
++    ) -> torch.Tensor | None:
++        return self.logits_processor(self.lm_head, hidden_states)
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        loader = AutoWeightsLoader(
++            self,
++            skip_prefixes=["mtp."],
++        )
++        return loader.load_weights(weights)
++
++
++class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
++    pass
++
++
++class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        super().__init__(vllm_config=vllm_config, prefix=prefix)
++
++        # set MoE hyperparameters
++        self.set_moe_parameters()
++
++    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
++        return self.model.get_expert_mapping()
++
++
++########################################################
++# Qwen3_5-Dense
++########################################################
++
++
++@MULTIMODAL_REGISTRY.register_processor(
++    Qwen3VLMultiModalProcessor,
++    info=Qwen3_5ProcessingInfo,
++    dummy_inputs=Qwen3VLDummyInputsBuilder,
++)
++class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        # protocols have not __init__ method, so we need to use nn.Module.__init__
++        nn.Module.__init__(self)
++        config: Qwen3_5Config = vllm_config.model_config.hf_config
++        quant_config = vllm_config.quant_config
++        multimodal_config = vllm_config.model_config.multimodal_config
++
++        self.config = config
++        self.multimodal_config = multimodal_config
++        self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
++        self.video_pruning_rate = multimodal_config.video_pruning_rate
++        self.is_multimodal_pruning_enabled = (
++            multimodal_config.is_multimodal_pruning_enabled()
++        )
++
++        # with self._mark_tower_model(vllm_config, {"image", "video"}):
++        self.visual = Qwen3_VisionTransformer(
++            config.vision_config,
++            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
++            quant_config=quant_config,
++            prefix=maybe_prefix(prefix, "visual"),
++        )
++
++        # with self._mark_language_model(vllm_config):
++        self.language_model = Qwen3_5ForCausalLM(
++            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "language_model")
++        )
++
++        self.make_empty_intermediate_tensors = (
++            self.language_model.make_empty_intermediate_tensors
++        )
++
++    def get_language_model(self) -> torch.nn.Module:
++        return self.language_model
++
++    def embed_input_ids(
++        self,
++        input_ids: torch.Tensor,
++        multimodal_embeddings: MultiModalEmbeddings | None = None,
++        *,
++        is_multimodal: torch.Tensor | None = None,
++        handle_oov_mm_token: bool = False,
++    ) -> torch.Tensor:
++        inputs_embeds = self._embed_text_input_ids(
++            input_ids,
++            self.language_model.embed_input_ids,
++            is_multimodal=is_multimodal,
++            handle_oov_mm_token=handle_oov_mm_token,
++        )
++
++        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
++            return inputs_embeds
++
++        is_multimodal = _require_is_multimodal(is_multimodal)
++
++        inputs_embeds = _merge_multimodal_embeddings(
++            inputs_embeds=inputs_embeds,
++            multimodal_embeddings=multimodal_embeddings,
++            is_multimodal=is_multimodal,
++        )
++
++        return inputs_embeds
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        intermediate_tensors: IntermediateTensors | None = None,
++        inputs_embeds: torch.Tensor | None = None,
++        **kwargs: object,
++    ) -> torch.Tensor | IntermediateTensors:
++        """Run forward pass for Qwen3.5.
++
++        Args:
++            input_ids: Flattened (concatenated) input_ids corresponding to a
++                batch.
++            positions: Flattened (concatenated) position ids corresponding to a
++                batch.
++                **NOTE**: If mrope is enabled (default setting for Qwen3VL
++                opensource models), the shape will be `(3, seq_len)`,
++                otherwise it will be `(seq_len,).
++            intermediate_tensors: Intermediate tensors from previous pipeline
++                stages.
++            inputs_embeds: Pre-computed input embeddings.
++            **kwargs: Additional keyword arguments including:
++                - pixel_values: Pixel values to be fed to a model.
++                    `None` if no images are passed.
++                - image_grid_thw: Tensor `(n_images, 3)` of image 3D grid in
++                    LLM. `None` if no images are passed.
++                - pixel_values_videos: Pixel values of videos to be fed to a
++                    model. `None` if no videos are passed.
++                - video_grid_thw: Tensor `(n_videos, 3)` of video 3D grid in
++                    LLM. `None` if no videos are passed.
++        """
++
++        if intermediate_tensors is not None:
++            inputs_embeds = None
++
++        hidden_states = self.language_model.model(
++            input_ids=input_ids,
++            positions=positions,
++            intermediate_tensors=intermediate_tensors,
++            inputs_embeds=inputs_embeds,
++        )
++
++        return hidden_states
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        loader = AutoWeightsLoader(
++            self,
++            skip_prefixes=["mtp."],
++        )
++        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
++
++    @classmethod
++    def get_mamba_state_dtype_from_config(
++        cls,
++        vllm_config: "VllmConfig",
++    ) -> tuple[torch.dtype, torch.dtype]:
++        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
++            vllm_config.model_config.dtype, vllm_config.cache_config.mamba_cache_dtype
++        )
++
++    @classmethod
++    def get_mamba_state_shape_from_config(
++        cls, vllm_config: "VllmConfig"
++    ) -> tuple[tuple[int, int], tuple[int, int]]:
++        parallel_config = vllm_config.parallel_config
++        hf_config = vllm_config.model_config.hf_text_config
++        tp_size = parallel_config.tensor_parallel_size
++        num_spec = (
++            vllm_config.speculative_config.num_speculative_tokens
++            if vllm_config.speculative_config
++            else 0
++        )
++        return MambaStateShapeCalculator.gated_delta_net_state_shape(
++            tp_size,
++            hf_config.linear_num_key_heads,
++            hf_config.linear_num_value_heads,
++            hf_config.linear_key_head_dim,
++            hf_config.linear_value_head_dim,
++            hf_config.linear_conv_kernel_dim,
++            num_spec,
++        )
++
++    # @classmethod
++    # def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
++    #     return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
++
++
++########################################################
++# Qwen3_5-MoE
++########################################################
++
++
++class Qwen3_5_MoeMixtureOfExperts(MixtureOfExperts):
++    def update_physical_experts_metadata(
++        self,
++        num_physical_experts: int,
++        num_local_physical_experts: int,
++    ) -> None:
++        assert self.num_local_physical_experts == num_local_physical_experts
++        self.num_physical_experts = num_physical_experts
++        self.num_local_physical_experts = num_local_physical_experts
++        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
++        for layer in self.language_model.model.layers:
++            if isinstance(layer.mlp, Qwen3NextSparseMoeBlock):
++                moe = layer.mlp
++                moe.n_local_physical_experts = num_local_physical_experts
++                moe.n_physical_experts = num_physical_experts
++                moe.n_redundant_experts = self.num_redundant_experts
++                moe.experts.update_expert_map()
++
++    def set_moe_parameters(self):
++        self.expert_weights = []
++
++        self.moe_layers = []
++        example_moe = None
++        for layer in self.language_model.model.layers:
++            if isinstance(layer, Qwen3_5DecoderLayer) and isinstance(
++                layer.mlp, Qwen3NextSparseMoeBlock
++            ):
++                example_moe = layer.mlp
++                self.moe_layers.append(layer.mlp.experts)
++
++        if example_moe is None:
++            raise RuntimeError(
++                "No Qwen3_5 layer found in the language_model.model.layers."
++            )
++
++        # Set MoE hyperparameters
++        self.num_moe_layers = len(self.moe_layers)
++        self.num_expert_groups = 1
++        self.num_shared_experts = 0
++        self.num_logical_experts = example_moe.n_logical_experts
++        self.num_physical_experts = example_moe.n_physical_experts
++        self.num_local_physical_experts = example_moe.n_local_physical_experts
++        self.num_routed_experts = example_moe.n_routed_experts
++        self.num_redundant_experts = example_moe.n_redundant_experts
++
++
++@MULTIMODAL_REGISTRY.register_processor(
++    Qwen3VLMultiModalProcessor,
++    info=Qwen3_5MoeProcessingInfo,
++    dummy_inputs=Qwen3VLDummyInputsBuilder,
++)
++class Qwen3_5MoeForConditionalGeneration(
++    Qwen3_5ForConditionalGeneration, Qwen3_5_MoeMixtureOfExperts
++):
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        # protocols have not __init__ method, so we need to use nn.Module.__init__
++        nn.Module.__init__(self)
++        config: Qwen3_5MoeConfig = vllm_config.model_config.hf_config
++        quant_config = vllm_config.quant_config
++        multimodal_config = vllm_config.model_config.multimodal_config
++
++        self.config = config
++        self.multimodal_config = multimodal_config
++        self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
++        self.video_pruning_rate = multimodal_config.video_pruning_rate
++        self.is_multimodal_pruning_enabled = (
++            multimodal_config.is_multimodal_pruning_enabled()
++        )
++
++        #with self._mark_tower_model(vllm_config, {"image", "video"}):
++        self.visual = Qwen3_VisionTransformer(
++            config.vision_config,
++            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
++            quant_config=quant_config,
++            prefix=maybe_prefix(prefix, "visual"),
++        )
++
++        #with self._mark_language_model(vllm_config):
++        self.language_model = Qwen3_5MoeForCausalLM(
++            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "language_model")
++        )
++
++        self.make_empty_intermediate_tensors = (
++            self.language_model.make_empty_intermediate_tensors
++        )
++
++        # set MoE hyperparameters
++        self.set_moe_parameters()
+diff --git a/vllm/model_executor/models/qwen3_5_mtp.py b/vllm/model_executor/models/qwen3_5_mtp.py
+new file mode 100644
+index 000000000..547c1885a
+--- /dev/null
++++ b/vllm/model_executor/models/qwen3_5_mtp.py
+@@ -0,0 +1,445 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Inference-only Qwen3_5 MTP model."""
++
++import typing
++from collections.abc import Callable, Iterable
++
++import torch
++from torch import nn
++from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
++from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
++    Qwen3_5MoeTextConfig,
++)
++
++from vllm.compilation.decorators import support_torch_compile
++from vllm.config import VllmConfig
++from vllm.distributed.parallel_state import get_pp_group
++from vllm.logger import init_logger
++from vllm.model_executor.layers.fused_moe import FusedMoE
++from vllm.model_executor.layers.linear import ColumnParallelLinear
++from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    VocabParallelEmbedding,
++)
++from vllm.model_executor.model_loader.weight_utils import default_weight_loader
++from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5RMSNorm
++from vllm.model_executor.models.qwen3_next import QwenNextMixtureOfExperts
++from vllm.sequence import IntermediateTensors
++
++from .interfaces import (
++    MultiModalEmbeddings,
++    SupportsMultiModal,
++    _require_is_multimodal,
++)
++from .utils import (
++    AutoWeightsLoader,
++    PPMissingLayer,
++    _merge_multimodal_embeddings,
++    is_pp_missing_parameter,
++    make_empty_intermediate_tensors_factory,
++    maybe_prefix,
++)
++
++logger = init_logger(__name__)
++
++
++@support_torch_compile(
++    dynamic_arg_dims={
++        "input_ids": 0,
++        # positions is of shape (3, seq_len) if mrope is enabled for qwen2-vl,
++        # otherwise (seq_len, ).
++        "positions": -1,
++        "intermediate_tensors": 0,
++        "inputs_embeds": 0,
++        "hidden_states": 0,
++    }
++)
++class Qwen3_5MultiTokenPredictor(nn.Module):
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        super().__init__()
++
++        model_config = vllm_config.model_config
++        quant_config = vllm_config.quant_config
++
++        config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig = model_config.hf_text_config
++
++        self.config = config
++
++        self.vocab_size = config.vocab_size
++
++        self.mtp_start_layer_idx = config.num_hidden_layers
++        self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
++
++        self.embed_tokens = VocabParallelEmbedding(
++            self.vocab_size,
++            config.hidden_size,
++        )
++
++        self.fc = ColumnParallelLinear(
++            self.config.hidden_size * 2,
++            self.config.hidden_size,
++            gather_output=True,
++            bias=False,
++            return_bias=False,
++            quant_config=quant_config,
++            prefix=f"{prefix}.fc",
++        )
++
++        self.layers = torch.nn.ModuleList(
++            Qwen3_5DecoderLayer(
++                vllm_config,
++                layer_type="full_attention",
++                prefix=f"{prefix}.layers.{idx}",
++            )
++            for idx in range(self.num_mtp_layers)
++        )
++
++        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
++            ["hidden_states", "residual"], config.hidden_size
++        )
++
++        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        self.pre_fc_norm_hidden = Qwen3_5RMSNorm(
++            config.hidden_size, eps=config.rms_norm_eps
++        )
++        self.pre_fc_norm_embedding = Qwen3_5RMSNorm(
++            config.hidden_size, eps=config.rms_norm_eps
++        )
++
++    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.embed_tokens(input_ids)
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++        intermediate_tensors: IntermediateTensors | None = None,
++        inputs_embeds: torch.Tensor | None = None,
++        spec_step_idx: int = 0,
++    ) -> torch.Tensor:
++        if get_pp_group().is_first_rank:
++            if inputs_embeds is None:
++                inputs_embeds = self.embed_input_ids(input_ids)
++            assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
++            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
++            hidden_states = self.pre_fc_norm_hidden(hidden_states)
++            hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
++            hidden_states = self.fc(hidden_states)
++            residual = None
++        else:
++            assert intermediate_tensors is not None
++            hidden_states = intermediate_tensors["hidden_states"]
++            residual = intermediate_tensors["residual"]
++
++        current_step_idx = spec_step_idx % self.num_mtp_layers
++        hidden_states, residual = self.layers[current_step_idx](
++            positions=positions,
++            hidden_states=hidden_states,
++            residual=residual,
++        )
++
++        if not get_pp_group().is_last_rank:
++            return IntermediateTensors(
++                {"hidden_states": hidden_states, "residual": residual}
++            )
++
++        hidden_states, _ = self.norm(hidden_states, residual)
++        return hidden_states
++
++    def load_fused_expert_weights(
++        self,
++        name: str,
++        params_dict: dict,
++        loaded_weight: torch.Tensor,
++        shard_id: str,
++        num_experts: int,
++    ) -> bool:
++        param = params_dict[name]
++        weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
++        loaded_local_expert = False
++        for expert_id in range(num_experts):
++            curr_expert_weight = loaded_weight[expert_id]
++            success = weight_loader(
++                param,
++                curr_expert_weight,
++                name,
++                shard_id,
++                expert_id,
++                return_success=True,
++            )
++            if success:
++                loaded_local_expert = True
++
++        return loaded_local_expert
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        stacked_params_mapping = [
++            # (param_name, shard_name, shard_id)
++            ("qkv_proj", "q_proj", "q"),
++            ("qkv_proj", "k_proj", "k"),
++            ("qkv_proj", "v_proj", "v"),
++            ("gate_up_proj", "gate_proj", 0),
++            ("gate_up_proj", "up_proj", 1),
++        ]
++
++        # Params for weights, fp8 weight scales, fp8 activation scales
++        # (param_name, weight_name, expert_id, shard_id)
++        expert_params_mapping = FusedMoE.make_expert_params_mapping(
++            self,
++            ckpt_gate_proj_name="gate_proj",
++            ckpt_down_proj_name="down_proj",
++            ckpt_up_proj_name="up_proj",
++            num_experts=self.config.num_experts
++            if hasattr(self.config, "num_experts")
++            else 0,
++        )
++
++        params_dict = dict(self.named_parameters())
++        loaded_params: set[str] = set()
++        is_fused_expert = False
++        fused_expert_params_mapping = [
++            ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
++            ("experts.w2_weight", "experts.down_proj", 0, "w2"),
++        ]
++        num_experts = (
++            self.config.num_experts if hasattr(self.config, "num_experts") else 0
++        )
++        for name, loaded_weight in weights:
++            if "rotary_emb.inv_freq" in name:
++                continue
++
++            for param_name, weight_name, shard_id in stacked_params_mapping:
++                if "experts.gate_up_proj" in name or "experts.down_proj" in name:
++                    is_fused_expert = True
++                    expert_params_mapping = fused_expert_params_mapping
++
++                if weight_name not in name:
++                    continue
++
++                if "mlp.experts" in name:
++                    continue
++
++                name = name.replace(weight_name, param_name)
++                # Skip loading extra bias for GPTQ models.
++                if name.endswith(".bias") and name not in params_dict:
++                    continue
++                # Skip layers on other devices.
++                if is_pp_missing_parameter(name, self):
++                    continue
++                if name not in params_dict:
++                    continue
++                param = params_dict[name]
++                weight_loader = param.weight_loader
++                weight_loader(param, loaded_weight, shard_id)
++                break
++            else:
++                is_expert_weight = False
++                for mapping in expert_params_mapping:
++                    param_name, weight_name, expert_id, shard_id = mapping
++                    if weight_name not in name:
++                        continue
++                    is_expert_weight = True
++                    name_mapped = name.replace(weight_name, param_name)
++                    # Skip layers on other devices.
++                    if is_pp_missing_parameter(name_mapped, self):
++                        continue
++                    if is_fused_expert:
++                        # qwen3.5 no need to transpose
++                        # loaded_weight = loaded_weight.transpose(-1, -2)
++                        if "experts.gate_up_proj" in name:
++                            loaded_weight = loaded_weight.chunk(2, dim=-2)
++                            success_w1 = self.load_fused_expert_weights(
++                                name_mapped,
++                                params_dict,
++                                loaded_weight[0],
++                                "w1",
++                                num_experts,
++                            )
++                            success_w3 = self.load_fused_expert_weights(
++                                name_mapped,
++                                params_dict,
++                                loaded_weight[1],
++                                "w3",
++                                num_experts,
++                            )
++                            success = success_w1 and success_w3
++                        else:
++                            # down_proj
++                            success = self.load_fused_expert_weights(
++                                name_mapped,
++                                params_dict,
++                                loaded_weight,
++                                shard_id,
++                                num_experts,
++                            )
++                        if success:
++                            name = name_mapped
++                            break
++                    else:
++                        # Skip loading extra bias for GPTQ models.
++                        if (
++                            name_mapped.endswith(".bias")
++                            or name_mapped.endswith("_bias")
++                        ) and name_mapped not in params_dict:
++                            continue
++                        param = params_dict[name_mapped]
++                        weight_loader = param.weight_loader
++                        success = weight_loader(
++                            param,
++                            loaded_weight,
++                            name_mapped,
++                            shard_id=shard_id,
++                            expert_id=expert_id,
++                            return_success=True,
++                        )
++                    if success:
++                        name = name_mapped
++                        break
++                else:
++                    if is_expert_weight:
++                        # We've checked that this is an expert weight
++                        # However it's not mapped locally to this rank
++                        # So we simply skip it
++                        continue
++                    # Skip loading extra bias for GPTQ models.
++                    if name.endswith(".bias") and name not in params_dict:
++                        continue
++                    if is_pp_missing_parameter(name, self):
++                        continue
++                    if name not in params_dict:
++                        logger.warning_once(
++                            f"Parameter {name} not found in params_dict, skip loading"
++                        )
++                        continue
++                    param = params_dict[name]
++                    weight_loader = getattr(
++                        param, "weight_loader", default_weight_loader
++                    )
++                    weight_loader(param, loaded_weight)
++            loaded_params.add(name)
++        return loaded_params
++
++
++@support_torch_compile(
++    dynamic_arg_dims={
++        "input_ids": 0,
++        # positions is of shape (3, seq_len) if mrope is enabled for qwen2-vl,
++        # otherwise (seq_len, ).
++        "positions": -1,
++        "intermediate_tensors": 0,
++        "inputs_embeds": 0,
++        "hidden_states": 0,
++    }
++)
++class Qwen3_5MTP(nn.Module, SupportsMultiModal):
++    packed_modules_mapping = {
++        "qkv_proj": [
++            "q_proj",
++            "k_proj",
++            "v_proj",
++        ],
++        "gate_up_proj": ["up_proj", "down_proj"],
++    }
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        config = vllm_config.model_config.hf_text_config
++        self.vllm_config = vllm_config
++        cache_config = vllm_config.cache_config
++        assert not cache_config.enable_prefix_caching, (
++            "Qwen3Next currently does not support prefix caching"
++        )
++
++        self.quant_config = vllm_config.quant_config
++
++        super().__init__()
++        self.config = config
++        self.model = Qwen3_5MultiTokenPredictor(
++            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
++        )
++
++        if get_pp_group().is_last_rank:
++            if config.tie_word_embeddings:
++                self.lm_head = self.model.embed_tokens
++            else:
++                self.lm_head = ParallelLMHead(
++                    config.vocab_size,
++                    config.hidden_size,
++                    prefix=maybe_prefix(prefix, "lm_head"),
++                )
++        else:
++            self.lm_head = PPMissingLayer()
++
++        self.logits_processor = LogitsProcessor(config.vocab_size)
++
++    def embed_input_ids(
++        self,
++        input_ids: torch.Tensor,
++        multimodal_embeddings: MultiModalEmbeddings | None = None,
++        *,
++        is_multimodal: torch.Tensor | None = None,
++        handle_oov_mm_token: bool = False,
++    ) -> torch.Tensor:
++        inputs_embeds = self._embed_text_input_ids(
++            input_ids,
++            self.model.embed_input_ids,
++            is_multimodal=is_multimodal,
++            handle_oov_mm_token=handle_oov_mm_token,
++        )
++
++        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
++            return inputs_embeds
++
++        is_multimodal = _require_is_multimodal(is_multimodal)
++
++        inputs_embeds = _merge_multimodal_embeddings(
++            inputs_embeds=inputs_embeds,
++            multimodal_embeddings=multimodal_embeddings,
++            is_multimodal=is_multimodal,
++        )
++
++        return inputs_embeds
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++        intermediate_tensors: IntermediateTensors | None = None,
++        inputs_embeds: torch.Tensor | None = None,
++        **kwargs: object,
++    ):
++        hidden_states = self.model(
++            input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds
++        )
++        return hidden_states
++
++    def compute_logits(
++        self,
++        hidden_states: torch.Tensor,
++        spec_step_idx: int = 0,
++    ) -> torch.Tensor | None:
++        return self.logits_processor(self.lm_head, hidden_states)
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        def remap_weight_names(weights):
++            for name, weight in weights:
++                if name.startswith("mtp."):
++                    name = name.replace("mtp.", "model.")
++                elif any(key in name for key in ["embed_tokens", "lm_head"]):
++                    if "embed_tokens" in name:
++                        name = name.replace("language_model.", "")
++                else:
++                    continue
++                yield name, weight
++
++        loader = AutoWeightsLoader(self)
++        return loader.load_weights(remap_weight_names(weights))
++
++
++class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
++        super().__init__(vllm_config=vllm_config, prefix=prefix)
++        self.set_moe_parameters()
 diff --git a/vllm/model_executor/models/qwen3_asr.py b/vllm/model_executor/models/qwen3_asr.py
 new file mode 100644
-index 000000000..26397732c
+index 000000000..11eea76ac
 --- /dev/null
 +++ b/vllm/model_executor/models/qwen3_asr.py
 @@ -0,0 +1,587 @@
@@ -6998,7 +8810,7 @@ index 000000000..26397732c
 +    PromptUpdate,
 +)
 +from vllm.sequence import IntermediateTensors
-+from vllm.transformers_utils.tokenizer import cached_tokenizer_from_config
++from vllm.tokenizers import cached_tokenizer_from_config
 +from vllm.transformers_utils.configs.qwen3_asr import (
 +    Qwen3ASRConfig,
 +    Qwen3ASRThinkerConfig,
@@ -7243,9 +9055,9 @@ index 000000000..26397732c
 +
 +        return Qwen2_5OmniAudioFeatureInputs(
 +            type="audio_features",
-+            input_features=input_audio_features.squeeze(0),
-+            audio_feature_lengths=audio_feature_lengths.squeeze(0),
-+            feature_attention_mask=feature_attention_mask.squeeze(0),
++            input_features=input_audio_features,
++            audio_feature_lengths=audio_feature_lengths,
++            feature_attention_mask=feature_attention_mask,
 +        )
 +
 +    def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
@@ -7642,6 +9454,163 @@ index f2f354604..ad88271b9 100644
                  # Skip non-stacked layers and experts (experts handled below).
                  if weight_name not in name:
                      continue
+diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
+index 0f73a7746..b4bca126e 100644
+--- a/vllm/model_executor/models/qwen3_next.py
++++ b/vllm/model_executor/models/qwen3_next.py
+@@ -104,7 +104,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+-        config = vllm_config.model_config.hf_config
++        config = vllm_config.model_config.hf_text_config
+         parallel_config = vllm_config.parallel_config
+         quant_config = vllm_config.quant_config
+ 
+@@ -175,7 +175,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+             hidden_size=config.hidden_size,
+             intermediate_size=config.moe_intermediate_size,
+             reduce_results=False,
+-            renormalize=config.norm_topk_prob,
++            renormalize=getattr(config, "norm_topk_prob", True),
+             quant_config=quant_config,
+             prefix=f"{prefix}.experts",
+             enable_eplb=self.enable_eplb,
+@@ -441,6 +441,98 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
+         self,
+         hidden_states: torch.Tensor,
+         output: torch.Tensor,
++    ):
++        if current_platform.is_xpu():
++            self.forward_xpu(hidden_states, output)
++        else:
++            self.forward_cuda(hidden_states, output)
++
++    def forward_xpu(
++        self,
++        hidden_states: torch.Tensor,
++        output: torch.Tensor,
++    ):
++        """
++        Forward pass with three parts:
++        1. Input projection
++        2. Core attention (custom op)
++        3. Output projection
++        """
++        num_tokens = hidden_states.size(0)
++
++        # ============================================================
++        # Part 1: Input Projection
++        # ============================================================
++        projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
++        projected_states_ba, _ = self.in_proj_ba(hidden_states)
++
++        # ============================================================
++        # Part 2: Core Attention
++        # ============================================================
++        forward_context = get_forward_context()
++        attn_metadata: AttentionMetadata = forward_context.attn_metadata
++        core_attn_out = torch.zeros(
++            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
++            dtype=hidden_states.dtype,
++            device=hidden_states.device,
++        )
++        z = torch.empty_like(core_attn_out)
++        if attn_metadata is not None:
++            attn_metadata = attn_metadata[self.prefix]
++
++            # TODO: xpu does not support this param yet
++            spec_sequence_masks = attn_metadata.spec_sequence_masks
++            assert spec_sequence_masks is None
++
++            conv_weights = self.conv1d.weight.view(
++                self.conv1d.weight.size(0), self.conv1d.weight.size(2)
++            )
++
++            self_kv_cache = self.kv_cache[forward_context.virtual_engine]
++            conv_state = self_kv_cache[0]
++            ssm_state = self_kv_cache[1]
++
++            torch.ops._xpu_C.gdn_attention(
++                core_attn_out,
++                z,
++                projected_states_qkvz,
++                projected_states_ba,
++                self.num_k_heads,
++                self.num_v_heads,
++                self.head_k_dim,
++                self.head_v_dim,
++                conv_state=conv_state,
++                ssm_state=ssm_state,
++                conv_weights=conv_weights,
++                conv_bias=self.conv1d.bias,
++                activation=self.activation,
++                A_log=self.A_log,
++                dt_bias=self.dt_bias,
++                num_prefills=attn_metadata.num_prefills,
++                num_decodes=attn_metadata.num_decodes,
++                has_initial_state=attn_metadata.has_initial_state,
++                non_spec_query_start_loc=attn_metadata.non_spec_query_start_loc,
++                non_spec_state_indices_tensor=attn_metadata.non_spec_state_indices_tensor,
++                num_actual_tokens=attn_metadata.num_actual_tokens,
++                tp_size=self.tp_size,
++            )
++
++        # ============================================================
++        # Part 3: Output Projection
++        # ============================================================
++        z_shape_og = z.shape
++        # Reshape input data into 2D tensor
++        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
++        z = z.reshape(-1, z.shape[-1])
++        core_attn_out = self.norm(core_attn_out, z)
++        core_attn_out = core_attn_out.reshape(z_shape_og)
++        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
++        output[:num_tokens], _ = self.out_proj(core_attn_out)
++
++    def forward_cuda(
++        self,
++        hidden_states: torch.Tensor,
++        output: torch.Tensor,
+     ):
+         """
+         Forward pass with three parts:
+@@ -965,7 +1057,7 @@ class Qwen3NextModel(nn.Module):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+-        config: Qwen3NextConfig = vllm_config.model_config.hf_config
++        config: Qwen3NextConfig = vllm_config.model_config.hf_text_config
+         parallel_config = vllm_config.parallel_config
+ 
+         eplb_config = parallel_config.eplb_config
+@@ -1042,7 +1134,7 @@ class Qwen3NextModel(nn.Module):
+             ckpt_gate_proj_name="gate_proj",
+             ckpt_down_proj_name="down_proj",
+             ckpt_up_proj_name="up_proj",
+-            num_experts=self.config.num_experts,
++            num_experts=getattr(self.config, "num_experts", 0),
+             num_redundant_experts=self.num_redundant_experts,
+         )
+ 
+@@ -1201,7 +1293,7 @@ class Qwen3NextForCausalLM(
+     }
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+-        config = vllm_config.model_config.hf_config
++        config = vllm_config.model_config.hf_text_config
+         self.vllm_config = vllm_config
+         self.model_config = vllm_config.model_config
+         cache_config = vllm_config.cache_config
+@@ -1263,7 +1355,7 @@ class Qwen3NextForCausalLM(
+         cls, vllm_config: "VllmConfig"
+     ) -> tuple[tuple[int, int], tuple[int, int]]:
+         parallel_config = vllm_config.parallel_config
+-        hf_config = vllm_config.model_config.hf_config
++        hf_config = vllm_config.model_config.hf_text_config
+         tp_size = parallel_config.tensor_parallel_size
+         num_spec = (
+             vllm_config.speculative_config.num_speculative_tokens
 diff --git a/vllm/model_executor/models/qwen3_vl_moe.py b/vllm/model_executor/models/qwen3_vl_moe.py
 index 318680448..e89a4441f 100644
 --- a/vllm/model_executor/models/qwen3_vl_moe.py
@@ -7731,7 +9700,7 @@ index 318680448..e89a4441f 100644
                  if "experts.gate_up_proj" in name or "experts.down_proj" in name:
                      is_fused_expert = True
 diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
-index 362028ebf..ffe3e21b4 100644
+index 362028ebf..333f5baa1 100644
 --- a/vllm/model_executor/models/registry.py
 +++ b/vllm/model_executor/models/registry.py
 @@ -112,6 +112,7 @@ _TEXT_GENERATION_MODELS = {
@@ -7750,7 +9719,7 @@ index 362028ebf..ffe3e21b4 100644
      "DotsOCRForCausalLM": ("dots_ocr", "DotsOCRForCausalLM"),
      "Ernie4_5_VLMoeForConditionalGeneration": (
          "ernie45_vl",
-@@ -420,6 +422,10 @@ _MULTIMODAL_MODELS = {
+@@ -420,11 +422,23 @@ _MULTIMODAL_MODELS = {
          "qwen3_omni_moe_thinker",
          "Qwen3OmniMoeThinkerForConditionalGeneration",
      ),
@@ -7761,7 +9730,20 @@ index 362028ebf..ffe3e21b4 100644
      "Qwen3VLForConditionalGeneration": ("qwen3_vl", "Qwen3VLForConditionalGeneration"),  # noqa: E501
      "Qwen3VLMoeForConditionalGeneration": (
          "qwen3_vl_moe",
-@@ -462,6 +468,7 @@ _SPECULATIVE_DECODING_MODELS = {
+         "Qwen3VLMoeForConditionalGeneration",
+     ),
++    "Qwen3_5ForConditionalGeneration": (
++        "qwen3_5",
++        "Qwen3_5ForConditionalGeneration",
++    ),
++    "Qwen3_5MoeForConditionalGeneration": (
++        "qwen3_5",
++        "Qwen3_5MoeForConditionalGeneration",
++    ),
+     "SkyworkR1VChatModel": ("skyworkr1v", "SkyworkR1VChatModel"),
+     "Step3VLForConditionalGeneration": ("step3_vl", "Step3VLForConditionalGeneration"),  # noqa: E501
+     "TarsierForConditionalGeneration": ("tarsier", "TarsierForConditionalGeneration"),  # noqa: E501
+@@ -462,9 +476,13 @@ _SPECULATIVE_DECODING_MODELS = {
      "ExaoneMoeMTP": ("exaone_moe_mtp", "ExaoneMoeMTP"),
      "LongCatFlashMTPModel": ("longcat_flash_mtp", "LongCatFlashMTP"),
      "Glm4MoeMTPModel": ("glm4_moe_mtp", "Glm4MoeMTP"),
@@ -7769,6 +9751,12 @@ index 362028ebf..ffe3e21b4 100644
      "MedusaModel": ("medusa", "Medusa"),
      "OpenPanguMTPModel": ("openpangu_mtp", "OpenPanguMTP"),
      "Qwen3NextMTP": ("qwen3_next_mtp", "Qwen3NextMTP"),
++    "Step3p5MTP": ("step3p5_mtp", "Step3p5MTP"),
++    "Qwen3_5MTP": ("qwen3_5_mtp", "Qwen3_5MTP"),
++    "Qwen3_5MoeMTP": ("qwen3_5_mtp", "Qwen3_5MoeMTP"),
+     # Temporarily disabled.
+     # # TODO(woosuk): Re-enable this once the MLP Speculator is supported in V1.
+     # "MLPSpeculatorPreTrainedModel": ("mlp_speculator", "MLPSpeculator"),
 diff --git a/vllm/model_executor/models/siglip.py b/vllm/model_executor/models/siglip.py
 index 1bda00653..d70addc8f 100644
 --- a/vllm/model_executor/models/siglip.py
@@ -7910,18 +9898,21 @@ index 07165430b..c53815e3a 100644
  
              connection = self.connection
 diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
-index b2d7bf38d..b282bc92a 100644
+index b2d7bf38d..1c0bc445f 100644
 --- a/vllm/platforms/xpu.py
 +++ b/vllm/platforms/xpu.py
-@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
+@@ -6,7 +6,10 @@ import os
+ from typing import TYPE_CHECKING, Optional
  
  import torch
++import vllm_xpu_kernels._C
++import vllm_xpu_kernels._xpu_C
  
 +import vllm.envs as envs
  from vllm.logger import init_logger
  from vllm.v1.attention.backends.registry import AttentionBackendEnum
  
-@@ -78,9 +79,10 @@ class XPUPlatform(Platform):
+@@ -78,9 +81,10 @@ class XPUPlatform(Platform):
  
      @classmethod
      def get_supported_vit_attn_backends(cls) -> list["AttentionBackendEnum"]:
@@ -7933,7 +9924,7 @@ index b2d7bf38d..b282bc92a 100644
          ]
  
      @classmethod
-@@ -206,7 +208,10 @@ class XPUPlatform(Platform):
+@@ -206,7 +210,10 @@ class XPUPlatform(Platform):
  
      @classmethod
      def fp8_dtype(cls) -> torch.dtype:
@@ -8201,10 +10192,18 @@ index 0a7cfffd4..1e302fe75 100644
      lfm2_moe="Lfm2MoeConfig",
      tarsier2="Tarsier2Config",
 diff --git a/vllm/transformers_utils/configs/__init__.py b/vllm/transformers_utils/configs/__init__.py
-index 00d5ecd25..e1af45e1f 100644
+index 00d5ecd25..9f0c8ec97 100644
 --- a/vllm/transformers_utils/configs/__init__.py
 +++ b/vllm/transformers_utils/configs/__init__.py
-@@ -88,6 +88,7 @@ __all__ = [
+@@ -49,6 +49,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
+     "Step3VLConfig": "vllm.transformers_utils.configs.step3_vl",
+     "Step3VisionEncoderConfig": "vllm.transformers_utils.configs.step3_vl",
+     "Step3TextConfig": "vllm.transformers_utils.configs.step3_vl",
++    "Qwen3ASRConfig": "vllm.transformers_utils.configs.qwen3_asr",
+     "Qwen3NextConfig": "vllm.transformers_utils.configs.qwen3_next",
+     "Tarsier2Config": "vllm.transformers_utils.configs.tarsier2",
+     # Special case: DeepseekV3Config is from HuggingFace Transformers
+@@ -88,6 +89,7 @@ __all__ = [
      "Step3VLConfig",
      "Step3VisionEncoderConfig",
      "Step3TextConfig",
@@ -8654,6 +10653,30 @@ index 000000000..28fa96e72
 +
 +
 +__all__ = ["Qwen3ASRConfig", "Qwen3ASRThinkerConfig", "Qwen3ASRAudioEncoderConfig"]
+diff --git a/vllm/transformers_utils/model_arch_config_convertor.py b/vllm/transformers_utils/model_arch_config_convertor.py
+index dc067a094..071e0a7af 100644
+--- a/vllm/transformers_utils/model_arch_config_convertor.py
++++ b/vllm/transformers_utils/model_arch_config_convertor.py
+@@ -369,6 +369,11 @@ class Qwen3NextMTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
+         return getattr(self.hf_text_config, "num_nextn_predict_layers", 0)
+ 
+ 
++class Qwen3_5MTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
++    def get_num_hidden_layers(self) -> int:
++        return getattr(self.hf_text_config, "mtp_num_hidden_layers", 0)
++
++
+ class PanguUltraMoeMTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
+     def get_num_hidden_layers(self) -> int:
+         return getattr(self.hf_text_config, "num_nextn_predict_layers", 0)
+@@ -394,6 +399,7 @@ MODEL_ARCH_CONFIG_CONVERTORS = {
+     "nemotron-nas": NemotronNasModelArchConfigConvertor,
+     "deepseek_mtp": DeepSeekMTPModelArchConfigConvertor,
+     "qwen3_next_mtp": Qwen3NextMTPModelArchConfigConvertor,
++    "qwen3_5_mtp": Qwen3_5MTPModelArchConfigConvertor,
+     "mimo_mtp": MimoMTPModelArchConfigConvertor,
+     "glm4_moe_mtp": GLM4MoeMTPModelArchConfigConvertor,
+     "ernie_mtp": ErnieMTPModelArchConfigConvertor,
 diff --git a/vllm/transformers_utils/processors/deepseek_ocr.py b/vllm/transformers_utils/processors/deepseek_ocr.py
 index bb7aa0c17..77e494836 100644
 --- a/vllm/transformers_utils/processors/deepseek_ocr.py
@@ -9307,6 +11330,22 @@ index 000000000..88a46f416
 +        yield
 +    finally:
 +        pass
+diff --git a/vllm/v1/spec_decode/eagle.py b/vllm/v1/spec_decode/eagle.py
+index 9820f5109..3380637d6 100644
+--- a/vllm/v1/spec_decode/eagle.py
++++ b/vllm/v1/spec_decode/eagle.py
+@@ -1040,6 +1040,11 @@ class EagleProposer:
+             if self.get_model_name(target_model) in [
+                 "Qwen2_5_VLForConditionalGeneration",
+                 "Qwen3VLForConditionalGeneration",
++                "Qwen3VLMoeForConditionalGeneration",
++                "HunYuanVLForConditionalGeneration",
++                "GlmOcrForConditionalGeneration",
++                "Qwen3_5ForConditionalGeneration",
++                "Qwen3_5MoeForConditionalGeneration",
+             ]:
+                 self.model.config.image_token_index = target_model.config.image_token_id
+             elif self.get_model_name(target_model) == "PixtralForConditionalGeneration":
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
 index 525ad5db4..3da119bd9 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
@@ -9368,10 +11407,10 @@ index 85acc1679..c2912e482 100644
          runner_kv_caches.append(kv_caches[layer_name])
  
 diff --git a/vllm/v1/worker/xpu_worker.py b/vllm/v1/worker/xpu_worker.py
-index fe0850771..84e2cce62 100644
+index fe0850771..5101bbd9d 100644
 --- a/vllm/v1/worker/xpu_worker.py
 +++ b/vllm/v1/worker/xpu_worker.py
-@@ -67,9 +67,11 @@ class XPUWorker(Worker):
+@@ -67,63 +67,100 @@ class XPUWorker(Worker):
      def determine_available_memory(self) -> int:
          """Profiles the peak memory usage of the model to determine how many
          KV blocks may be allocated without OOMs.
@@ -9383,12 +11422,20 @@ index fe0850771..84e2cce62 100644
          .. tip::
              You may limit the usage of GPU memory
              by adjusting the `gpu_memory_utilization` parameter.
-@@ -77,53 +79,44 @@ class XPUWorker(Worker):
+         """
++        fallback_profile = os.getenv("VLLM_FALLBACK_PROFILE", "0") == "1"
++
++        if fallback_profile:
++            return self._determine_available_memory_fallback()
++        else:
++            return self._determine_available_memory_default()
++
++    def _determine_available_memory_fallback(self) -> int:
++        """Upstream profiling method using memory_allocated()."""
          # Profile the memory usage of the model and get the maximum number of
          # cache blocks that can be allocated with the remaining free memory.
          torch.xpu.empty_cache()
-+        torch.xpu.synchronize()
-         torch.xpu.reset_peak_memory_stats()
+-        torch.xpu.reset_peak_memory_stats()
  
 -        free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info()
 -        current_allocated_bytes = torch.xpu.memory_allocated()
@@ -9401,7 +11448,59 @@ index fe0850771..84e2cce62 100644
 -        logger.info(msg)
          # Execute a forward pass with dummy inputs to profile the memory usage
          # of the model.
--        self.model_runner.profile_run()
+         self.model_runner.profile_run()
+ 
+-        free_gpu_memory, _ = self.xpu_get_mem_info()
++        # Calculate the number of blocks that can be allocated with the
++        # profiled peak memory.
++        torch.xpu.synchronize()
++        used_memory = torch.xpu.memory_allocated()
++        total_gpu_memory = torch.xpu.get_device_properties(self.local_rank).total_memory
++        free_gpu_memory = total_gpu_memory - used_memory
++
+         # NOTE(woosuk): Here we assume that the other processes using the same
+         # GPU did not change their memory usage during the profiling.
+-        assert self.init_gpu_memory > free_gpu_memory, (
++        peak_memory = self.init_gpu_memory - free_gpu_memory
++        assert peak_memory > 0, (
+             "Error in memory profiling. "
+             f"Initial free memory {self.init_gpu_memory}, current free memory"
+             f" {free_gpu_memory}. This happens when the GPU memory was "
+             "not properly cleaned up before initializing the vLLM instance."
+         )
+ 
+-        # Get the peak memory allocation recorded by torch
+-        peak_memory = torch.xpu.memory_stats()["allocated_bytes.all.peak"]
+-
+         torch.xpu.empty_cache()
+-        torch_allocated_bytes = torch.xpu.memory_stats()["allocated_bytes.all.current"]
+-        total_allocated_bytes = self.xpu_get_mem_info()[1] - self.xpu_get_mem_info()[0]
+ 
+-        non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
+-        if non_torch_allocations > 0:
+-            peak_memory += non_torch_allocations
+         available_kv_cache_memory = (
+             total_gpu_memory * self.cache_config.gpu_memory_utilization - peak_memory
+         )
+ 
+-        msg = (
+-            "After memory profiling run, "
+-            f"peak memory usage is {peak_memory / 1024**2:.2f} MB,"
+-            f"torch mem is {torch_allocated_bytes / 1024**2:.2f} MB, "
+-            f"non-torch mem is {non_torch_allocations / 1024**2:.2f} MB, "
+-            f"free gpu memory is {free_gpu_memory / 1024**2:.2f} MB."
++        return int(available_kv_cache_memory)
++
++    def _determine_available_memory_default(self) -> int:
++        """Custom profiling method using peak memory stats."""
++        # Profile the memory usage of the model and get the maximum number of
++        # cache blocks that can be allocated with the remaining free memory.
++        torch.xpu.empty_cache()
++        torch.xpu.synchronize()
++        torch.xpu.reset_peak_memory_stats()
++
++        # Execute a forward pass with dummy inputs to profile the memory usage
++        # of the model.
 +        if "Qwen3ASR" in self.model_runner.model_config.architecture:
 +            pass
 +        else:
@@ -9411,19 +11510,9 @@ index fe0850771..84e2cce62 100644
 +        # profiled peak memory.
 +        torch.xpu.synchronize()
 +        total_gpu_memory = torch.xpu.get_device_properties(self.local_rank).total_memory
- 
--        free_gpu_memory, _ = self.xpu_get_mem_info()
-         # NOTE(woosuk): Here we assume that the other processes using the same
-         # GPU did not change their memory usage during the profiling.
--        assert self.init_gpu_memory > free_gpu_memory, (
--            "Error in memory profiling. "
--            f"Initial free memory {self.init_gpu_memory}, current free memory"
--            f" {free_gpu_memory}. This happens when the GPU memory was "
--            "not properly cleaned up before initializing the vLLM instance."
--        )
--
--        # Get the peak memory allocation recorded by torch
--        peak_memory = torch.xpu.memory_stats()["allocated_bytes.all.peak"]
++
++        # NOTE(woosuk): Here we assume that the other processes using the same
++        # GPU did not change their memory usage during the profiling.
 +        stats = torch.xpu.memory_stats()
 +        peak_allocated = stats.get("allocated_bytes.all.peak", 0)
 +        current_reserved = torch.xpu.memory_reserved()
@@ -9439,24 +11528,10 @@ index fe0850771..84e2cce62 100644
 +        print(f"  > Model memory usage          : {model_memory:.2f} GB")
 +        print(f"  > Current Reserved (Footprint): {reserved_gb:.2f} GB")
 +        print(f"  > Fragmentation (Wasted)      : {fragmentation_gb:.2f} GB")
- 
-         torch.xpu.empty_cache()
--        torch_allocated_bytes = torch.xpu.memory_stats()["allocated_bytes.all.current"]
--        total_allocated_bytes = self.xpu_get_mem_info()[1] - self.xpu_get_mem_info()[0]
- 
--        non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
--        if non_torch_allocations > 0:
--            peak_memory += non_torch_allocations
-         available_kv_cache_memory = (
--            total_gpu_memory * self.cache_config.gpu_memory_utilization - peak_memory
--        )
--
--        msg = (
--            "After memory profiling run, "
--            f"peak memory usage is {peak_memory / 1024**2:.2f} MB,"
--            f"torch mem is {torch_allocated_bytes / 1024**2:.2f} MB, "
--            f"non-torch mem is {non_torch_allocations / 1024**2:.2f} MB, "
--            f"free gpu memory is {free_gpu_memory / 1024**2:.2f} MB."
++
++        torch.xpu.empty_cache()
++
++        available_kv_cache_memory = (
 +            total_gpu_memory * self.cache_config.gpu_memory_utilization - peak_allocated
          )
 -        logger.info(msg)
