@@ -1,8 +1,30 @@
+diff --git a/indextts/cli.py b/indextts/cli.py
+index e0e2f51..7f2b2e9 100644
+--- a/indextts/cli.py
++++ b/indextts/cli.py
+@@ -47,6 +47,8 @@ def main():
+     if args.device is None:
+         if torch.cuda.is_available():
+             args.device = "cuda:0"
++        elif torch.xpu.is_available():
++            args.device = "xpu"
+         elif torch.mps.is_available():
+             args.device = "mps"
+         else:
 diff --git a/indexttsnode.py b/indexttsnode.py
-index f6f5b5f..12ddc01 100644
+index f6f5b5f..e75ed13 100644
 --- a/indexttsnode.py
 +++ b/indexttsnode.py
-@@ -78,7 +78,14 @@ class AudioCacheManager:
+@@ -49,6 +49,8 @@ speakers_dir = os.path.join(models_dir, "TTS", "speakers")
+ 
+ if torch.cuda.is_available():
+     device = "cuda"
++elif torch.xpu.is_available():
++    device = "xpu"
+ elif hasattr(torch, "mps") and torch.backends.mps.is_available():
+     device = "mps"
+ else:
+@@ -78,7 +80,14 @@ class AudioCacheManager:
              ) as tmp_file:
                  temp_filepath = tmp_file.name
  
@@ -17,4 +39,44 @@ index f6f5b5f..12ddc01 100644
 +                sf.write(temp_filepath, audio_tensor.cpu().numpy().T, sample_rate)
  
              return temp_filepath
+         except Exception as e:
+@@ -143,6 +152,10 @@ class IndexTTS2:
+             self.device = "cuda:0"
+             self.is_fp16 = is_fp16
+             self.use_cuda_kernel = use_cuda_kernel is None or use_cuda_kernel
++        elif torch.xpu.is_available():
++            self.device = "xpu"
++            self.is_fp16 = is_fp16
++            self.use_cuda_kernel = False  # Custom CUDA kernels are not compatible with XPU
+         elif hasattr(torch, "mps") and torch.backends.mps.is_available():
+             self.device = "mps"
+             self.is_fp16 = False  # Use float16 on MPS is overhead than float32
+@@ -301,6 +314,8 @@ class IndexTTS2:
+         try:
+             if "cuda" in str(self.device):
+                 torch.cuda.empty_cache()
++            elif "xpu" in str(self.device):
++                torch.xpu.empty_cache()
+             elif "mps" in str(self.device):
+                 torch.mps.empty_cache()
+         except Exception as e:
+@@ -806,6 +821,10 @@ class IndexTTS:
+             self.device = "cuda:0"
+             self.is_fp16 = is_fp16
+             self.use_cuda_kernel = use_cuda_kernel is None or use_cuda_kernel
++        elif torch.xpu.is_available():
++            self.device = "xpu"
++            self.is_fp16 = is_fp16
++            self.use_cuda_kernel = False
+         elif hasattr(torch, "mps") and torch.backends.mps.is_available():
+             self.device = "mps"
+             self.is_fp16 = False # Use float16 on MPS is overhead than float32
+@@ -1037,6 +1056,8 @@ class IndexTTS:
+         try:
+             if "cuda" in str(self.device):
+                 torch.cuda.empty_cache()
++            elif "xpu" in str(self.device):
++                torch.xpu.empty_cache()
+             elif "mps" in str(self.device):
+                 torch.mps.empty_cache()
          except Exception as e:
