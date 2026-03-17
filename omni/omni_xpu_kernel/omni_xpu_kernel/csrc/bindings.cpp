@@ -19,6 +19,7 @@ namespace gguf {
 namespace norm {
     torch::Tensor rms_norm(torch::Tensor weight, torch::Tensor input, double eps);
     torch::Tensor layer_norm(torch::Tensor input, std::optional<torch::Tensor> weight, std::optional<torch::Tensor> bias, double eps);
+    void fused_add_rms_norm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 }
 }
 
@@ -54,4 +55,8 @@ PYBIND11_MODULE(_C, m) {
     norm.def("layer_norm", &omni_xpu::norm::layer_norm,
         "LayerNorm using ESIMD optimization",
         py::arg("input"), py::arg("weight") = py::none(), py::arg("bias") = py::none(), py::arg("eps") = 1e-5);
+    
+    norm.def("fused_add_rms_norm", &omni_xpu::norm::fused_add_rms_norm,
+        "Fused Add + RMSNorm using ESIMD optimization (in-place: residual += input, input = rmsnorm(residual) * weight)",
+        py::arg("input"), py::arg("residual"), py::arg("weight"), py::arg("eps") = 1e-6);
 }

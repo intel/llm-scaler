@@ -80,7 +80,41 @@ def layer_norm(
     return _get_native().layer_norm(input, weight, bias, eps)
 
 
+def fused_add_rms_norm(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6
+) -> None:
+    """
+    Fused Add + RMSNorm using ESIMD optimization (in-place).
+    
+    Performs in-place:
+        residual += input
+        input = rmsnorm(residual) * weight
+    
+    This fuses the residual addition and RMSNorm into a single kernel,
+    reducing memory bandwidth by avoiding an extra read/write pass.
+    
+    Args:
+        input: Input tensor of shape [batch_size, hidden_size]. Modified in-place
+               to contain the normalized output.
+        residual: Residual tensor of shape [batch_size, hidden_size]. Modified
+                  in-place to contain residual + original input.
+        weight: Weight tensor of shape [hidden_size].
+        eps: Small constant for numerical stability.
+    
+    Note:
+        - Both input and residual are modified in-place
+        - Tensors must be 2D [batch_size, hidden_size]
+        - hidden_size must be <= 8192 and divisible by 32
+        - Supports fp32, fp16, bf16
+    """
+    _get_native().fused_add_rms_norm(input, residual, weight, eps)
+
+
 __all__ = [
     "rms_norm",
     "layer_norm",
+    "fused_add_rms_norm",
 ]

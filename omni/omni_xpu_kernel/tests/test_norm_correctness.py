@@ -105,5 +105,47 @@ class TestLayerNormCorrectness:
         torch.testing.assert_close(output_esimd, output_ref, rtol=1e-4, atol=1e-4)
 
 
+class TestFusedAddRMSNormCorrectness:
+    """Correctness tests for Fused Add + RMSNorm kernel."""
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    @pytest.mark.parametrize("batch_size", [1, 8, 32, 128])
+    @pytest.mark.parametrize("hidden_size", [2048, 4096, 8192])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    def test_fused_add_rms_norm_correctness(self, batch_size, hidden_size, dtype):
+        """Test fused_add_rms_norm correctness against PyTorch reference."""
+        from omni_xpu_kernel import norm
+
+        eps = 1e-6
+        x = torch.randn(batch_size, hidden_size, device="xpu", dtype=dtype)
+        residual = torch.randn(batch_size, hidden_size, device="xpu", dtype=dtype)
+        weight = torch.randn(hidden_size, device="xpu", dtype=dtype)
+
+        # Save originals for reference computation
+        x_ref = x.clone()
+        residual_ref = residual.clone()
+
+        # ESIMD kernel (in-place)
+        x_esimd = x.clone()
+        residual_esimd = residual.clone()
+        norm.fused_add_rms_norm(x_esimd, residual_esimd, weight, eps=eps)
+
+        # PyTorch reference (in fp32 for accuracy)
+        residual_expected = (residual_ref.float() + x_ref.float()).to(dtype)
+        r_fp32 = residual_expected.float()
+        rms = torch.sqrt(torch.mean(r_fp32 ** 2, dim=-1, keepdim=True) + eps)
+        x_expected = ((r_fp32 / rms) * weight.float()).to(dtype)
+
+        if dtype == torch.float32:
+            rtol, atol = 1e-4, 1e-4
+        else:
+            rtol, atol = 1e-2, 1e-2
+
+        # Check residual was updated correctly
+        torch.testing.assert_close(residual_esimd, residual_expected, rtol=rtol, atol=atol)
+        # Check normalized output
+        torch.testing.assert_close(x_esimd, x_expected, rtol=rtol, atol=atol)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
