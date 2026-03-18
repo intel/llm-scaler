@@ -121,10 +121,7 @@ def run_bench(container, model:ModelSpec, batch,config:ScriptConfig):
         outstr += '--random-input-len=%d ' % config.Dataset.input_len
         outstr += '--random-output-len=%d ' % config.Dataset.output_len
     else:
-        # TODO: Missing '--' flag prefix and trailing space. This produces
-        # 'dataset-path /some/path--ignore-eos' instead of '--dataset-path /some/path --ignore-eos'.
-        # Fix: outstr += '--dataset-path %s ' % config.Dataset.path
-        outstr += 'dataset-path %s' % config.Dataset.path
+        outstr += '--dataset-path %s ' % config.Dataset.path
     outstr += '--ignore-eos '
     outstr += '--num-prompt %d ' % batch
     outstr += '--trust_remote_code '
