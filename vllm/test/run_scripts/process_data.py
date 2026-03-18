@@ -35,9 +35,8 @@ def parse_model_and_tag(text: str):
     return model, tag
 
 def parse_batch_size(text: str):
-    # TODO: re.findall returns an empty list if no digits are found, causing an
-    # IndexError on [0]. Add a guard: matches = re.findall(r"\d+", text); return matches[0] if matches else ""
-    return re.findall(r"\d+", text)[0]
+    matches = re.findall(r"\d+", text)
+    return matches[0] if matches else ""
 
 def extract_config_info(path: str, add_config_header) -> str:
     if not add_config_header:
