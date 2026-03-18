@@ -167,10 +167,7 @@ class ScriptConfig:
         )
         dataset_obj = DatasetConfig(
             name=dataset.get("name", "random"),
-            # TODO: dataset.get("path") returns None when "path" key is absent, but
-            # DatasetConfig.path is typed as str. Passing None can cause issues downstream
-            # when the path is used. Use a default empty string: dataset.get("path", "").
-            path=dataset.get("path"),
+            path=dataset.get("path", ""),
             input_len=int(dataset.get("random-input-len", 1024)),
             output_len=int(dataset.get("random-output-len", 512)),
         )
