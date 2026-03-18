@@ -74,10 +74,8 @@ if __name__ == '__main__':
     results = []
     current_group = []
 
-    # TODO: No existence check before opening raw_data. If the file does not exist,
-    # this raises a FileNotFoundError with no helpful context. Add:
-    #   if not os.path.exists(raw_data):
-    #       raise FileNotFoundError(f"Input file not found: {raw_data}")
+    if not os.path.exists(raw_data):
+        raise FileNotFoundError(f"Input file not found: {raw_data}")
     with open(raw_data, encoding="UTF-8") as f:
         for dataline in f:
             dataline = dataline.strip()
