@@ -3303,10 +3303,32 @@ index 3b3a789f6..712bdf85c 100644
              "CompressedTensorsWNA16MoEMethod",
          ):
 diff --git a/vllm/model_executor/layers/layernorm.py b/vllm/model_executor/layers/layernorm.py
-index d962ab8bb..7fd73a7b3 100644
+index d962ab8bb..6bb7479ce 100644
 --- a/vllm/model_executor/layers/layernorm.py
 +++ b/vllm/model_executor/layers/layernorm.py
-@@ -432,6 +432,20 @@ class RMSNormGated(CustomOp):
+@@ -326,6 +326,21 @@ class GemmaRMSNorm(CustomOp):
+             self._is_compiled = True
+         return self.forward_native(x, residual)
+ 
++    def forward_xpu(
++        self,
++        x: torch.Tensor,
++        residual: torch.Tensor | None = None,
++    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++        from vllm._ipex_ops import ipex_ops as ops
++
++        # Gemma weight semantics: x * (1 + w) instead of x * w
++        w = self.weight.data + 1.0
++
++        if residual is not None:
++            ops.fused_add_rms_norm(x, residual, w, self.variance_epsilon)
++            return x, residual
++        return ops.rms_norm(x, w, self.variance_epsilon)
++
+ 
+ # --8<-- [start:rms_norm_gated]
+ @CustomOp.register("rms_norm_gated")
+@@ -432,6 +447,20 @@ class RMSNormGated(CustomOp):
              norm_before_gate=self.norm_before_gate,
          )
  
