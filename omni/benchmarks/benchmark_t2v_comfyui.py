@@ -323,6 +323,10 @@ def benchmark_t2v_model(workflow_json_template, model_name="ComfyUI Workflow"):
 
     print(f"\nBenchmark for ComfyUI Workflow: '{model_name}' finished.")
 
+    # TODO: avg_latency is only assigned inside the `if not latencies` else-branch.
+    # If no trials succeed (latencies is empty), avg_latency is never defined and this
+    # return statement raises a NameError. Fix: initialize avg_latency = None before
+    # the results block and guard the return, or return None when latencies is empty.
     return avg_latency
 
 

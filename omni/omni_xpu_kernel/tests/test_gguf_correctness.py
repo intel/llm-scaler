@@ -113,6 +113,10 @@ class TestGGUFDequantCorrectness:
         """Test ComfyUI layout correctness."""
         from omni_xpu_kernel import gguf
         
+        # TODO: gguf.dequantize_q4_0_comfyui() is not exposed in the public API
+        # (omni_xpu_kernel/gguf/__init__.py only exports dequantize_q4_0). Calling
+        # this will raise an AttributeError at runtime. Either export the ComfyUI
+        # variant in gguf/__init__.py or update this test to use the correct function.
         output = gguf.dequantize_q4_0_comfyui(q4_0_data, torch.float16)
         reference = reference_dequantize_q4_0(q4_0_data, sequential=True)
         

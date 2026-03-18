@@ -35,6 +35,8 @@ def parse_model_and_tag(text: str):
     return model, tag
 
 def parse_batch_size(text: str):
+    # TODO: re.findall returns an empty list if no digits are found, causing an
+    # IndexError on [0]. Add a guard: matches = re.findall(r"\d+", text); return matches[0] if matches else ""
     return re.findall(r"\d+", text)[0]
 
 def extract_config_info(path: str, add_config_header) -> str:
@@ -73,6 +75,10 @@ if __name__ == '__main__':
     results = []
     current_group = []
 
+    # TODO: No existence check before opening raw_data. If the file does not exist,
+    # this raises a FileNotFoundError with no helpful context. Add:
+    #   if not os.path.exists(raw_data):
+    #       raise FileNotFoundError(f"Input file not found: {raw_data}")
     with open(raw_data, encoding="UTF-8") as f:
         for dataline in f:
             dataline = dataline.strip()

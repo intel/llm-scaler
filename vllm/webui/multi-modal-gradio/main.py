@@ -12,8 +12,11 @@ import shutil
 from uuid import uuid4
 
 VIDEO_TEMP_DIR = Path("gradio_temp_videos")
+# TODO: Race condition - if multiple instances start simultaneously or a concurrent request
+# is using VIDEO_TEMP_DIR when the directory is deleted, it will fail. Consider using a
+# unique temp directory per session (e.g., tempfile.mkdtemp()) or adding a lock.
 if VIDEO_TEMP_DIR.exists():
-    shutil.rmtree(VIDEO_TEMP_DIR) 
+    shutil.rmtree(VIDEO_TEMP_DIR)
 VIDEO_TEMP_DIR.mkdir()
 
 parser = argparse.ArgumentParser(description='Multimodal Chatbot with Video Support')
@@ -45,10 +48,18 @@ def extract_frames_from_video(video_path: str, num_frames: int = 10) -> List[str
         total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
         if total_frames <= 0: return []
         
+        # TODO: frame_indices is computed here but never used. The loop below uses
+        # range(total_frames//15) instead, which extracts a variable number of frames
+        # (not num_frames=10 as intended) and ignores the evenly-spaced indices.
+        # Fix: replace the loop with `for frame_index in frame_indices:` to use the
+        # calculated indices and respect the num_frames parameter.
         # <--- MODIFIED: 修正了抽帧逻辑，使用均匀间隔的帧索引
         frame_indices = [int(i) for i in (total_frames / (num_frames + 1) * (j + 1) for j in range(num_frames))]
         temp_files = []
-        
+
+        # TODO: This loop ignores frame_indices above and iterates over total_frames//15
+        # frames regardless of the num_frames argument. Replace with:
+        #   for frame_index in frame_indices:
         for frame_index in range(total_frames//15):
             video.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
             success, frame = video.read()
@@ -82,6 +93,12 @@ def predict(messages: List[Dict[str, Any]]):
             if chunk.choices[0].delta.content is not None:
                 yield chunk.choices[0].delta.content, False 
     except APIError as e:
+        # TODO: APIError does not have a `.message` attribute in the openai SDK.
+        # Accessing e.message will raise an AttributeError. Use str(e) or e.body
+        # to get a string representation of the error. Example fix:
+        #   error_text = str(e)
+        #   error_message = f"抱歉，调用模型时出错: {error_text}"
+        #   if "longer than the maximum model length" in error_text:
         error_message = f"抱歉，调用模型时出错: {e.message}"
         if "longer than the maximum model length" in e.message:
             error_message = "❌ **输入内容过长** ❌\n\n抱歉，您上传的文本、图片或视频帧的总长度超过了模型的处理上限。请尝试：\n\n- 缩短文字描述\n- 上传尺寸更小的图片\n- 截取更短时间的视频片段"
