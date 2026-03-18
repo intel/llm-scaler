@@ -1,4 +1,6 @@
 import argparse
+import json
+import shlex
 
 from script_config import ScriptConfig, default_config, ModelSpec
 
@@ -64,21 +66,15 @@ def run_model(container, model:ModelSpec, config:ScriptConfig):
         outstr += '--quantization %s ' % model.quantization
     outstr += '-tp=%d ' % model.tp
     if model.spec_config:
-        # TODO: The triple-backslash escaping for the JSON string is fragile. If
-        # model.spec_config.method or model.spec_config.model contain special shell
-        # characters (spaces, quotes, backslashes), the generated bash command will
-        # be malformed or unsafe (potential shell injection). Consider using json.dumps()
-        # to serialize the config dict and then properly shell-quote the result.
-        outstr += '--speculative_config=\'{\\"method\\": \\"%s\\", \
-        \\"model\\": \\"%s\\", \\"num_speculative_tokens\\": %d}\' ' \
-        % (model.spec_config.method, model.spec_config.model,
-           model.spec_config.num_speculative_tokens)
+        spec_dict = {
+            "method": model.spec_config.method,
+            "model": model.spec_config.model,
+            "num_speculative_tokens": model.spec_config.num_speculative_tokens,
+        }
+        outstr += '--speculative_config=%s ' % shlex.quote(json.dumps(spec_dict))
     if model.extra_param:
-        # TODO: extra_param values are interpolated directly into the shell command without
-        # sanitization, allowing arbitrary flag injection if a value contains spaces or
-        # shell metacharacters. Validate or quote values before inserting them.
         for flag, value in model.extra_param.items():
-            outstr += '%s=%s ' % (flag,value)
+            outstr += '%s=%s ' % (flag, shlex.quote(str(value)))
     outstr += '" 2>&1 | tee -a "${EXPDIR}/model.log" &'
     print(outstr + "\n")
 
