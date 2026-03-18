@@ -153,9 +153,7 @@ class ScriptConfig:
         print("model %s not found" % model_name)
         return "", False
 
-    # TODO: Missing @staticmethod decorator. Without it, calling
-    # ScriptConfig.build_sub_obj(data) will pass `data` as `self` and fail with a
-    # TypeError. Add @staticmethod above this method definition.
+    @staticmethod
     def build_sub_obj(data: Dict[str, Any]) :
         path = data.get("Path", {})
         dataset = data.get("Dataset", {})
