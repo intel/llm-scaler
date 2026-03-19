@@ -209,7 +209,17 @@ void unpack_svdq_int4_kernel(
                     #pragma unroll
                     for (int i = 0; i < 16; ++i) offsets[i] = i;
 
-                    simd<uint8_t, 16> bytes = gather<uint8_t, 16>(src + b, offsets);
+                    simd<uint8_t, 16> bytes;
+                    if (chunk_size == 16) {
+                        bytes = gather<uint8_t, 16>(src + b, offsets);
+                    } else {
+                        // Scalar fallback for tail: avoid OOB read from gather
+                        #pragma unroll
+                        for (int i = 0; i < 16; ++i) {
+                            bytes[i] = (i < static_cast<int>(chunk_size))
+                                           ? *(src + b + i) : uint8_t(0);
+                        }
+                    }
 
                     // Unpack nibbles
                     simd<uint8_t, 16> low_u = bytes & (uint8_t)0x0F;

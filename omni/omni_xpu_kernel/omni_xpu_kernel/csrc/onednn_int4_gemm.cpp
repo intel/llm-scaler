@@ -18,9 +18,11 @@
 #include <oneapi/dnnl/dnnl.hpp>
 #include <oneapi/dnnl/dnnl_sycl.hpp>
 
+#include <cstdio>
 #include <map>
-#include <tuple>
 #include <mutex>
+#include <tuple>
+#include <unordered_map>
 
 #include "utils.h"
 
@@ -45,18 +47,19 @@ static std::map<CacheKey, CachedPrimitive> g_cache;       // plain GEMM
 static std::map<CacheKey, CachedPrimitive> g_cache_sum;   // GEMM + append_sum
 static std::mutex g_cache_mutex;
 
-// Persistent engine/stream (created once per device)
-static bool g_engine_initialized = false;
-static dnnl::engine g_engine;
-static dnnl::stream g_stream;
+// Per-device engine/stream (keyed by device index for multi-XPU support)
+static std::map<int, std::pair<dnnl::engine, dnnl::stream>> g_engine_map;
 
-static void ensure_engine_initialized(const torch::Device& device) {
-    if (!g_engine_initialized) {
-        sycl::queue& q = omni_xpu::utils::get_queue(device);
-        g_engine = dnnl::sycl_interop::make_engine(q.get_device(), q.get_context());
-        g_stream = dnnl::sycl_interop::make_stream(g_engine, q);
-        g_engine_initialized = true;
-    }
+static std::pair<dnnl::engine, dnnl::stream>& ensure_engine_initialized(const torch::Device& device) {
+    int dev_idx = device.index();
+    auto it = g_engine_map.find(dev_idx);
+    if (it != g_engine_map.end()) return it->second;
+
+    sycl::queue& q = omni_xpu::utils::get_queue(device);
+    auto eng = dnnl::sycl_interop::make_engine(q.get_device(), q.get_context());
+    auto strm = dnnl::sycl_interop::make_stream(eng, q);
+    auto [ins, _] = g_engine_map.emplace(dev_idx, std::make_pair(std::move(eng), std::move(strm)));
+    return ins->second;
 }
 
 template <dnnl::memory::data_type ActDT>
@@ -65,14 +68,16 @@ static CachedPrimitive& get_or_create_primitive(
     const CacheKey& key,
     int64_t M, int64_t K, int64_t N, int64_t group_size,
     bool use_sum_postop,
-    dnnl::memory::data_type dst_dt
+    dnnl::memory::data_type dst_dt,
+    const dnnl::engine& eng,
+    const dnnl::stream& strm
 ) {
     auto it = cache.find(key);
     if (it != cache.end()) return it->second;
 
     CachedPrimitive cp;
-    cp.eng = g_engine;
-    cp.strm = g_stream;
+    cp.eng = eng;
+    cp.strm = strm;
 
     cp.src_md = dnnl::memory::desc({M, K}, ActDT, dnnl::memory::format_tag::ab);
     cp.wei_md = dnnl::memory::desc({K, N}, dnnl::memory::data_type::u4,
@@ -129,9 +134,9 @@ static void onednn_int4_gemm_kernel(
     CachedPrimitive* cached = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_cache_mutex);
-        ensure_engine_initialized(device);
+        auto& [eng, strm] = ensure_engine_initialized(device);
         cached = &get_or_create_primitive<ActDT>(
-            g_cache, key, M, K, N, group_size, false, ActDT);
+            g_cache, key, M, K, N, group_size, false, ActDT, eng, strm);
     }
 
     std::unordered_map<int, dnnl::memory> args = {
@@ -164,9 +169,9 @@ static void onednn_int4_gemm_sum_kernel(
     CachedPrimitive* cached = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_cache_mutex);
-        ensure_engine_initialized(device);
+        auto& [eng, strm] = ensure_engine_initialized(device);
         cached = &get_or_create_primitive<ActDT>(
-            g_cache_sum, key, M, K, N, group_size, true, DstDT);
+            g_cache_sum, key, M, K, N, group_size, true, DstDT, eng, strm);
     }
 
     std::unordered_map<int, dnnl::memory> args = {

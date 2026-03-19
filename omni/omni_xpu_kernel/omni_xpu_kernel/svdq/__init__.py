@@ -203,7 +203,7 @@ def prepare_onednn_weights(
         (packed_u4 [N, K/2] uint8, scales_f16 [num_groups, N] f16)
     """
     packed_u4 = (packed ^ 0x88).contiguous()
-    scales_f16 = wscales.to(torch.float16).clone().contiguous()
+    scales_f16 = wscales.to(torch.float16).contiguous()
     return packed_u4, scales_f16
 
 
