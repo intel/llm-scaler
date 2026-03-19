@@ -1,17 +1,16 @@
 """
-omni_xpu_kernel - High-performance Intel XPU kernels
+omni_xpu_kernel - High-performance Intel XPU ESIMD kernels for PyTorch.
 
-A collection of optimized SYCL/ESIMD kernels for Intel GPUs, including:
-- GGUF Q4_0 dequantization
-- RMSNorm and LayerNorm
-- More kernels to come...
+Optimised SYCL/ESIMD kernels for Intel GPUs:
 
-Usage:
-    import omni_xpu_kernel
-    from omni_xpu_kernel import gguf
-    
-    # Dequantize Q4_0 quantized tensor
-    output = gguf.dequantize_q4_0(input_tensor, torch.float16)
+* **gguf** — GGUF dequantization (Q4_0, Q8_0, Q4_K, Q6_K)
+* **norm** — RMSNorm, LayerNorm, fused Add+RMSNorm
+* **svdq** — SVDQuant W4A4: ESIMD dequant, oneDNN INT4 GEMM, fused post-processing
+* **rotary** — Fused rotary position embedding
+
+Usage::
+
+    from omni_xpu_kernel import svdq, norm, rotary, gguf
 """
 
 import os
@@ -53,10 +52,14 @@ def is_available():
 # Submodule imports
 from . import gguf
 from . import norm
+from . import svdq
+from . import rotary
 
 __all__ = [
     "gguf",
     "norm",
+    "svdq",
+    "rotary",
     "is_available",
     "__version__",
 ]
