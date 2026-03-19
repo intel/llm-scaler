@@ -2,11 +2,11 @@
 # Copyright (C) 2025 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-ARG BASE_IMAGE=intel/llm-scaler-platform:25.45.5.4
+ARG BASE_IMAGE=intel/llm-scaler-platform:26.13.7.1
 ARG PYTHON_VERSION=3.12
-ARG TORCH_VERSION=2.9.0
-ARG TORCHVISION_VERSION=0.24.0
-ARG TORCHAUDIO_VERSION=2.9.0
+ARG TORCH_VERSION=2.10.0
+ARG TORCHVISION_VERSION=0.25.0
+ARG TORCHAUDIO_VERSION=2.10.0
 ARG ONEAPI_VERSION=2025.2.0-517
 
 # ======== Builder Stage ========
@@ -204,15 +204,19 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git apply /tmp/sglang_diffusion_for_multi_arc.patch && \
     cp python/pyproject_xpu.toml python/pyproject.toml && \
     sed -i '/sgl-kernel/d' python/pyproject.toml && \
+    sed -E 's/(torch[a-z]*)([=<>!~ ]+[0-9.]+)/\1/g' python/pyproject.toml && \
     pip install -e "python[diffusion]" && \
+    pip install \
+        torch==${TORCH_VERSION} \
+        torchvision==${TORCHVISION_VERSION} \
+        torchaudio==${TORCHAUDIO_VERSION} \
+        --index-url https://download.pytorch.org/whl/xpu && \
     pip install triton==3.5.0 && \
     pip install pytorch-triton-xpu==3.5.0 \
         --index-url https://download.pytorch.org/whl/xpu --force-reinstall && \
     cd /llm && \
     git clone --depth 1 https://github.com/sgl-project/sgl-kernel-xpu.git && \
     cd sgl-kernel-xpu && \
-    git fetch --depth 1 origin 374c2e85a7ec13d59919a6f6ac6db5724ef41577 && \
-    git checkout 374c2e85a7ec13d59919a6f6ac6db5724ef41577 && \
     pip install -v . && \
     cp -r /llm/sglang/python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion \
         /llm/ComfyUI/custom_nodes/ && \
@@ -223,17 +227,6 @@ COPY ./workflows/* /llm/ComfyUI/user/default/workflows/
 COPY ./example_inputs/* /llm/ComfyUI/input/
 COPY ./tools/* /llm/tools/
 COPY ./entrypoints/* /llm/entrypoints/
-
-# Builder cleanup
-RUN find /llm -name '.git' -type d -exec rm -rf {} + 2>/dev/null; \
-    find /llm -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null; \
-    find /llm -name '*.pyc' -delete 2>/dev/null; \
-    find /llm -name '.gitignore' -delete 2>/dev/null; \
-    find /llm -name '.gitmodules' -delete 2>/dev/null; \
-    rm -rf /tmp/* /root/.cache/pip /root/.cache/torch; \
-    find /usr/local/lib/python${PYTHON_VERSION}/dist-packages \
-        -name '*.dist-info' -path '*/SOURCES.txt' -delete 2>/dev/null; \
-    true
 
 # ======== Runtime Stage ========
 FROM ${BASE_IMAGE} AS runtime
@@ -272,10 +265,11 @@ COPY --from=builder /usr/local/lib/*.so* /usr/local/lib/
 COPY --from=builder /llm/ /llm/
 
 # Fix for multi-XPU support: copy SYCL native binary files to a common library path
-RUN cp /opt/intel/oneapi/compiler/2025.1/lib/libsycl-native-*.spv /usr/local/lib/
+RUN cp /opt/intel/oneapi/compiler/2025.3/lib/libsycl-native-*.spv /usr/local/lib/
 
 ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python${PYTHON_VERSION}/dist-packages/torch/lib:${LD_LIBRARY_PATH}"
 ENV CCL_SYCL_ALLTOALL_ARC_LL=1
 ENV CCL_SYCL_CCL_BARRIER=1
+ENV _LLM_SCALER_DISABLE_INTERPOLATE_FIX=1
 
 WORKDIR /llm/entrypoints
