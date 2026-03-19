@@ -107,6 +107,34 @@ class ICPXBuildExt(build_ext):
         print(f"Source files: {[s.name for s in sources]}")
         print(f"Output: {output_path}")
         
+        # Detect oneDNN (dnnl) installation
+        onednn_include = os.environ.get("ONEDNN_INCLUDE", "")
+        onednn_lib = os.environ.get("ONEDNN_LIB", "")
+        
+        if not onednn_include or not onednn_lib:
+            # Auto-detect from common oneAPI paths
+            onednn_candidates = [
+                "/opt/intel/oneapi/dnnl/2025.1",
+                "/opt/intel/oneapi/dnnl/latest",
+                "/opt/intel/oneapi/2025.1",
+            ]
+            for candidate in onednn_candidates:
+                inc = os.path.join(candidate, "include")
+                lib = os.path.join(candidate, "lib")
+                if os.path.exists(os.path.join(inc, "oneapi", "dnnl", "dnnl.hpp")):
+                    if not onednn_include:
+                        onednn_include = inc
+                    if not onednn_lib:
+                        onednn_lib = lib
+                    break
+        
+        has_onednn = bool(onednn_include and os.path.isdir(onednn_include))
+        if has_onednn:
+            print(f"oneDNN include: {onednn_include}")
+            print(f"oneDNN lib: {onednn_lib}")
+        else:
+            print("WARNING: oneDNN not found. onednn_int4_gemm will not be available.")
+        
         if IS_WINDOWS:
             # Windows compile command using icx
             # Find Python library
@@ -126,13 +154,18 @@ class ICPXBuildExt(build_ext):
                 f"/I{src_dir}",
                 "/LD",  # Create DLL
                 f"/Fe:{output_path}",  # Output file
-            ] + [str(s) for s in sources] + [
+            ]
+            if has_onednn:
+                cmd.append(f"/I{onednn_include}")
+            cmd += [str(s) for s in sources] + [
                 f"/link",
                 f"/LIBPATH:{torch_lib}",
                 f"/LIBPATH:{python_lib_dir}",
                 "torch.lib", "torch_python.lib", "torch_cpu.lib", "torch_xpu.lib", "c10.lib", "c10_xpu.lib",
                 f"python{python_version}.lib",
             ]
+            if has_onednn:
+                cmd += [f"/LIBPATH:{onednn_lib}", "dnnl.lib"]
         else:
             # Linux compile command
             cmd = [
@@ -146,8 +179,17 @@ class ICPXBuildExt(build_ext):
                 f"-I{torch_include}",
                 f"-I{torch_include}/torch/csrc/api/include",
                 f"-I{src_dir}",
+            ]
+            if has_onednn:
+                cmd.append(f"-I{onednn_include}")
+            cmd += [
                 f"-L{torch_lib}",
                 "-ltorch", "-ltorch_python", "-ltorch_cpu", "-ltorch_xpu", "-lc10", "-lc10_xpu",
+            ]
+            if has_onednn:
+                cmd += [f"-L{onednn_lib}", "-ldnnl",
+                        "-Wl,-rpath," + onednn_lib]
+            cmd += [
                 "-Wl,-rpath," + str(torch_lib),
                 "-o", str(output_path),
             ] + [str(s) for s in sources]
