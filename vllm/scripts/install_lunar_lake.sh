@@ -62,23 +62,19 @@ sudo dnf install -y \
     cmake gcc gcc-c++ git wget curl \
     python3 python3-pip python3-devel python3-virtualenv \
     numactl \
-    level-zero level-zero-devel \
     mesa-vulkan-drivers \
     libdrm-devel \
     2>&1 | tail -5
 
 log_info "System dependencies installed."
 
-# ── Phase 2: Intel oneAPI Base Toolkit ────────────────────────────────────────
+# ── Phase 2: Intel oneAPI Base Toolkit + Level-Zero ───────────────────────────
 
-log_info "Phase 2/5: Installing Intel oneAPI Base Toolkit..."
+log_info "Phase 2/5: Installing Intel oneAPI Base Toolkit + Level-Zero..."
 
-if [ -f /opt/intel/oneapi/setvars.sh ]; then
-    log_info "oneAPI already installed. Skipping."
-else
-    # Add Intel oneAPI repo for Fedora/RHEL
-    if [ ! -f /etc/yum.repos.d/oneAPI.repo ]; then
-        cat << 'REPO' | sudo tee /etc/yum.repos.d/oneAPI.repo
+# Add Intel repos first (needed for both oneAPI and Level-Zero)
+if [ ! -f /etc/yum.repos.d/oneAPI.repo ]; then
+    cat << 'REPO' | sudo tee /etc/yum.repos.d/oneAPI.repo
 [oneAPI]
 name=Intel oneAPI repository
 baseurl=https://yum.repos.intel.com/oneapi
@@ -87,9 +83,47 @@ gpgcheck=1
 repo_gpgcheck=1
 gpgkey=https://yum.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
 REPO
-    fi
+fi
 
-    log_info "Installing oneAPI (this takes a while)..."
+# Intel compute-runtime repo (provides Level-Zero + Intel GPU runtime)
+if [ ! -f /etc/yum.repos.d/intel-graphics.repo ]; then
+    sudo dnf install -y 'dnf-command(config-manager)' 2>/dev/null || true
+    # Try Intel's RPM repo for compute runtime
+    sudo tee /etc/yum.repos.d/intel-graphics.repo > /dev/null << 'REPO'
+[intel-graphics]
+name=Intel Graphics Drivers
+baseurl=https://repositories.intel.com/gpu/rhel/9/lts/2350/unified/leapfrog/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=0
+gpgkey=https://repositories.intel.com/gpu/intel-graphics.key
+REPO
+fi
+
+# Install Level-Zero (try multiple package names across distros)
+log_info "Installing Level-Zero GPU runtime..."
+sudo dnf install -y --skip-unavailable \
+    level-zero level-zero-devel \
+    intel-level-zero-gpu intel-level-zero-gpu-devel \
+    oneapi-level-zero level-zero-loader \
+    2>&1 | tail -5 || true
+
+# Check if Level-Zero is available (may already be present via xe driver)
+if ldconfig -p 2>/dev/null | grep -q libze_loader; then
+    log_info "Level-Zero runtime found."
+elif [ -f /usr/lib64/libze_loader.so ] || [ -f /usr/lib/x86_64-linux-gnu/libze_loader.so ]; then
+    log_info "Level-Zero library found."
+else
+    log_warn "Level-Zero not found in system libraries."
+    log_warn "It may be installed with oneAPI below, or already bundled with the xe driver."
+    log_warn "Continuing — will verify with PyTorch XPU in Phase 3."
+fi
+
+# Install oneAPI
+if [ -f /opt/intel/oneapi/setvars.sh ]; then
+    log_info "oneAPI already installed. Skipping."
+else
+    log_info "Installing oneAPI (this takes a while — ~15GB download)..."
     sudo dnf install -y intel-oneapi-base-toolkit 2>&1 | tail -10
 
     # Add to bashrc
