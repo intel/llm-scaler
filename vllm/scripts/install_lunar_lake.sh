@@ -1,0 +1,232 @@
+#!/bin/bash
+# ==============================================================================
+# Lunar Lake Native Install — llm-scaler vLLM on Nobara/Fedora
+# ------------------------------------------------------------------------------
+# Installs the SYCL/oneAPI + vLLM stack on Lunar Lake systems running
+# Nobara or Fedora (no Docker required).
+#
+# Target: Intel Core Ultra 7 258V + Arc 140V (Xe2) on MSI Claw 8 AI+
+# OS:     Nobara 43 / Fedora 42+ (DNF-based)
+#
+# Usage:
+#   chmod +x install_lunar_lake.sh
+#   ./install_lunar_lake.sh
+#
+# After install:
+#   source ~/.bashrc
+#   cd ~/llm-scaler-vllm
+#   ./lunar_lake_serve.sh <model> --quantization int4
+# ==============================================================================
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+INSTALL_DIR="$HOME/llm-scaler-vllm"
+VENV_DIR="$INSTALL_DIR/venv"
+
+# ── Preflight checks ──────────────────────────────────────────────────────────
+
+log_info "Checking system..."
+
+# Check for Intel GPU
+if ! lspci -nn | grep -qi '8086:64a0'; then
+    log_warn "Arc 140V (64a0) not detected. Checking for any Intel GPU..."
+    if ! lspci | grep -qi 'intel.*vga\|intel.*display\|intel.*3d'; then
+        log_error "No Intel GPU detected. This script requires Lunar Lake Xe2."
+        exit 1
+    fi
+fi
+log_info "Intel GPU detected."
+
+# Check xe driver
+if lsmod | grep -q "^xe "; then
+    log_info "xe driver loaded."
+else
+    log_warn "xe driver not loaded. It may load as 'i915' instead."
+    log_warn "For best SYCL support, switch to xe driver (see OpenClaw-on-MSI-Claw-8 guide)."
+fi
+
+# ── Phase 1: System dependencies ─────────────────────────────────────────────
+
+log_info "Phase 1/5: Installing system dependencies..."
+
+sudo dnf install -y \
+    cmake gcc gcc-c++ git wget curl \
+    python3 python3-pip python3-devel python3-virtualenv \
+    numactl \
+    level-zero level-zero-devel \
+    mesa-vulkan-drivers \
+    libdrm-devel \
+    2>&1 | tail -5
+
+log_info "System dependencies installed."
+
+# ── Phase 2: Intel oneAPI Base Toolkit ────────────────────────────────────────
+
+log_info "Phase 2/5: Installing Intel oneAPI Base Toolkit..."
+
+if [ -f /opt/intel/oneapi/setvars.sh ]; then
+    log_info "oneAPI already installed. Skipping."
+else
+    # Add Intel oneAPI repo for Fedora/RHEL
+    if [ ! -f /etc/yum.repos.d/oneAPI.repo ]; then
+        cat << 'REPO' | sudo tee /etc/yum.repos.d/oneAPI.repo
+[oneAPI]
+name=Intel oneAPI repository
+baseurl=https://yum.repos.intel.com/oneapi
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://yum.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+REPO
+    fi
+
+    log_info "Installing oneAPI (this takes a while)..."
+    sudo dnf install -y intel-oneapi-base-toolkit 2>&1 | tail -10
+
+    # Add to bashrc
+    if ! grep -q "setvars.sh" ~/.bashrc; then
+        echo 'source /opt/intel/oneapi/setvars.sh --force 2>/dev/null' >> ~/.bashrc
+    fi
+fi
+
+# Source it now
+source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
+log_info "oneAPI configured."
+
+# ── Phase 3: Python venv + PyTorch XPU ───────────────────────────────────────
+
+log_info "Phase 3/5: Setting up Python environment..."
+
+mkdir -p "$INSTALL_DIR"
+cd "$INSTALL_DIR"
+
+if [ ! -d "$VENV_DIR" ]; then
+    python3 -m venv "$VENV_DIR"
+fi
+source "$VENV_DIR/bin/activate"
+
+pip install --upgrade pip wheel setuptools 2>&1 | tail -3
+
+log_info "Installing PyTorch XPU..."
+pip install torch==2.10.0+xpu \
+    --extra-index-url=https://download.pytorch.org/whl/xpu \
+    2>&1 | tail -5
+
+# Verify PyTorch XPU
+python3 -c "
+import torch
+assert torch.xpu.is_available(), 'XPU not available!'
+print(f'PyTorch {torch.__version__} with XPU: OK')
+print(f'Device: {torch.xpu.get_device_properties(0).name}')
+" || {
+    log_error "PyTorch XPU verification failed."
+    log_error "Ensure Level-Zero is installed and xe driver is loaded."
+    exit 1
+}
+log_info "PyTorch XPU working."
+
+# ── Phase 4: Clone and build vLLM with multi-arc patches ────────────────────
+
+log_info "Phase 4/5: Building vLLM with Intel XPU support..."
+
+REPO_URL="${LLM_SCALER_REPO:-https://github.com/MegaStood/llm-scaler.git}"
+BRANCH="${LLM_SCALER_BRANCH:-claude/check-lunar-lake-compatibility-CB5w6}"
+
+if [ ! -d "$INSTALL_DIR/llm-scaler" ]; then
+    git clone -b "$BRANCH" "$REPO_URL" "$INSTALL_DIR/llm-scaler"
+fi
+
+# Build patched vLLM
+if ! python3 -c "import vllm" 2>/dev/null; then
+    cd "$INSTALL_DIR/llm-scaler/vllm"
+
+    if [ ! -d "$INSTALL_DIR/vllm" ]; then
+        git clone -b v0.14.0 https://github.com/vllm-project/vllm.git "$INSTALL_DIR/vllm"
+    fi
+
+    cd "$INSTALL_DIR/vllm"
+    git apply "$INSTALL_DIR/llm-scaler/vllm/patches/vllm_for_multi_arc.patch" 2>/dev/null || \
+        log_warn "Patch already applied or failed. Continuing..."
+
+    pip install -r requirements/xpu.txt 2>&1 | tail -5
+    pip install arctic-inference==0.1.1 2>&1 | tail -3
+
+    export VLLM_TARGET_DEVICE=xpu
+    export CPATH=/opt/intel/oneapi/dpcpp-ct/latest/include/:${CPATH:-}
+    pip install --no-build-isolation . 2>&1 | tail -10
+
+    log_info "vLLM built successfully."
+else
+    log_info "vLLM already installed. Skipping build."
+fi
+
+# Install extras
+pip install accelerate hf_transfer transformers ijson 2>&1 | tail -3
+
+# ── Phase 5: Install XPU kernels + configure ─────────────────────────────────
+
+log_info "Phase 5/5: Installing XPU kernels and configuring environment..."
+
+if [ ! -d "$INSTALL_DIR/vllm-xpu-kernels" ]; then
+    cd "$INSTALL_DIR"
+    git clone https://github.com/vllm-project/vllm-xpu-kernels.git
+    cd vllm-xpu-kernels
+    git checkout 4c83144
+    # Remove conflicting version pins
+    sed -i 's|^--extra-index-url=https://download.pytorch.org/whl/xpu|# &|' requirements.txt
+    sed -i 's|^torch==2.10.0+xpu|# &|' requirements.txt
+    sed -i 's|^triton-xpu|# &|' requirements.txt
+    sed -i 's|^transformers|# &|' requirements.txt
+    pip install -r requirements.txt 2>&1 | tail -3
+    pip install --no-build-isolation . 2>&1 | tail -5
+fi
+
+# Install triton-xpu
+pip install triton-xpu==3.6.0 --extra-index-url=https://download.pytorch.org/whl/test/xpu 2>&1 | tail -3
+
+# Copy launch script
+cp "$INSTALL_DIR/llm-scaler/vllm/scripts/lunar_lake_serve.sh" "$INSTALL_DIR/"
+chmod +x "$INSTALL_DIR/lunar_lake_serve.sh"
+
+# Add activation helper to bashrc
+if ! grep -q "llm-scaler-vllm" ~/.bashrc; then
+    cat << 'BASHRC' >> ~/.bashrc
+
+# llm-scaler-vllm (Lunar Lake)
+alias vllm-activate='source ~/llm-scaler-vllm/venv/bin/activate && source /opt/intel/oneapi/setvars.sh --force 2>/dev/null'
+alias vllm-serve='cd ~/llm-scaler-vllm && source venv/bin/activate && source /opt/intel/oneapi/setvars.sh --force 2>/dev/null && ./lunar_lake_serve.sh'
+BASHRC
+fi
+
+# ── Done ──────────────────────────────────────────────────────────────────────
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info "Installation complete!"
+echo ""
+echo "  Install dir:  $INSTALL_DIR"
+echo "  Python venv:  $VENV_DIR"
+echo "  Launch script: $INSTALL_DIR/lunar_lake_serve.sh"
+echo ""
+echo "  Quick start:"
+echo "    vllm-activate"
+echo "    cd ~/llm-scaler-vllm"
+echo "    ./lunar_lake_serve.sh Qwen/Qwen3-8B --quantization int4"
+echo ""
+echo "  Or use the alias:"
+echo "    vllm-serve Qwen/Qwen3-8B --quantization int4"
+echo ""
+echo "  Recommended models for 32GB Lunar Lake:"
+echo "    Qwen/Qwen3-8B --quantization fp8         (best balance)"
+echo "    Qwen/Qwen3-14B --quantization int4        (needs INT4)"
+echo "    Qwen/Qwen3.5-35B-A3B --quantization int4 --max-model-len 8192"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
