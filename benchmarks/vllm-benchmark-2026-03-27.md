@@ -66,3 +66,52 @@
 - Concurrency 2 nearly doubles aggregate throughput vs single (25.5 vs 13.6 tok/s), per-worker speed unchanged
 - Concurrency 5 shows aggregate throughput drops to 19.3 tok/s — per-worker latency degrades (~10.7 tok/s), suggesting GPU memory/compute saturation
 - 1 worker timed out at concurrency 5 (>600s), indicating queue pressure at high concurrency
+
+---
+
+## Concurrency 5 — Capped Output Test (max_tokens=3000, timeout=900s)
+
+**Goal:** Verify no worker timeouts when output length is capped.
+
+**Test Configuration:**
+- Model: /shared/models/qwen3-8b-int4-autoround
+- Max output tokens: 3,000 (capped)
+- Timeout: 900s
+- Concurrency: 5
+
+**Results:**
+
+| Metric | Value |
+|---|---|
+| Wall time | 362.52s |
+| Total output tokens | 13,183 |
+| Aggregate throughput | 36.4 tok/s |
+| Peak RAM (vLLM) | 45 MB (baseline: 18 MB, delta: +28 MB) |
+
+| Worker | Tokens | Time | Tok/s | Finish |
+|---|---|---|---|---|
+| 0 | 3,000 | 362.5s | 8.3 | length (hit cap) |
+| 1 | 2,994 | 362.0s | 8.3 | stop |
+| 2 | 1,237 | 141.4s | 8.7 | stop |
+| 3 | 2,952 | 356.5s | 8.3 | stop |
+| 4 | 3,000 | 362.5s | 8.3 | length (hit cap) |
+
+**Outcome:** ✅ No timeouts — all 5 workers completed successfully.
+
+**Observations:**
+- Capping max_tokens=3000 eliminates timeout risk at concurrency 5
+- Aggregate throughput jumps to 36.4 tok/s (vs 19.3 tok/s uncapped) due to shorter wall time
+- Per-worker speed drops to ~8.3 tok/s under 5-way concurrency (vs 13.8 tok/s single)
+- RAM delta only +28 MB — GPU VRAM is the real constraint, not system RAM
+- Workers 0 and 4 hit the length cap (3000 tok), indicating the model wanted to generate more
+
+## Final Summary
+
+| Concurrency | max_tokens | Aggregate tok/s | Per-worker tok/s | Timeouts | Peak RAM |
+|---|---|---|---|---|---|
+| 1 | 7800 | 13.6 | 13.6 | 0/1 | 79 MB |
+| 2 | 7800 | 25.5 | ~13.0 | 0/2 | 79 MB |
+| 5 | 7800 | 19.3 | ~10.7 | 2/5 | 80 MB |
+| 5 | 3000 | 36.4 | ~8.3 | 0/5 | 45 MB |
+
+**Recommendation:** Concurrency 2 with uncapped output for quality; concurrency 5 with max_tokens≤3000 for maximum throughput.
