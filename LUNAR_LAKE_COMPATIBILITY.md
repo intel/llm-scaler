@@ -76,15 +76,44 @@ source /root/.bashrc
 ./lunar_lake_serve.sh /llm/models/Qwen3-8B --quantization fp8
 ```
 
-## Recommended Models for 32GB Lunar Lake
+## Model Compatibility on Xe2 (Lunar Lake)
+
+### Critical Blockers
+
+Not all model architectures work on Lunar Lake XPU. Key blockers discovered during testing:
+
+| Blocker | Affected Models | Root Cause |
+|---------|----------------|------------|
+| **Triton XPU backend broken on Xe2** | Qwen3.5 (all sizes) | `triton.backends` fails to import; `@triton.jit` kernels don't launch. Qwen3.5 uses fla/linear attention ops written entirely as Triton kernels. |
+| **Marlin kernels are CUDA-only** | AWQ, GPTQ (compressed-tensors format) | `gptq_marlin_repack` is an NVIDIA CUDA kernel. AWQ/GPTQ MoE models route to `CompressedTensorsWNA16MarlinMoEMethod`. |
+| **Pre-quantized 2x memory** | AutoRound, GPTQ (>14B) | Loading INT4→FP16 intermediate doubles peak memory. 35B models OOM on 32GB. |
+
+### What DOES Work
+
+Only models meeting **all three** criteria work on Lunar Lake XPU:
+1. **Standard attention** (not fla/linear attention — avoids Triton dependency)
+2. **FP16/BF16 base weights** with **online quantization** (`--quantization fp8` or `--quantization int4`)
+3. **Steady-state VRAM ≤ ~20GB** (leaving room for OS on 32GB shared memory)
+
+### Recommended Models for 32GB Lunar Lake
 
 | Model | Quantization | VRAM Needed | Context | Notes |
 |-------|-------------|-------------|---------|-------|
-| Qwen3-8B | FP8 | ~10GB | 32k | Best balance |
-| DeepSeek-R1-Distill-Qwen-7B | FP8 | ~8GB | 32k | Good reasoning |
-| Qwen3-14B | INT4 | ~10GB | 16k | Needs INT4 |
-| Qwen3.5-35B-A3B (MoE) | INT4 | ~14GB | 8k | MoE, only 3B active |
+| Qwen3-8B | FP8 (online) | ~10GB | 32k | **Best choice** — standard attention, proven to load |
+| DeepSeek-R1-Distill-Qwen-7B | FP8 (online) | ~8GB | 32k | Good reasoning |
+| Qwen3-14B | INT4 (online) | ~10GB | 16k | Needs `--quantization int4` |
 | Qwen3-8B | FP16 | ~18GB | 16k | No quantization loss |
+
+### Models That Do NOT Work
+
+| Model | Format | Failure Mode |
+|-------|--------|-------------|
+| Qwen3.5-* (any size) | Any | Triton kernel crash (`fla/ops` linear attention) |
+| GLM-4.7-flash AWQ | AWQ 4-bit | Marlin CUDA kernel missing |
+| GLM-4.7-flash AutoRound INT4 | AutoRound | 27B OOM (>24GB after FP16 unpack) |
+| Qwen3.5-35B-A3B GPTQ | GPTQ INT4 | OOM + GPU DEVICE_LOST at 79% loading |
+| Qwen3.5-35B-A3B AutoRound | AutoRound INT4 | OOM (14GB on disk → ~28GB peak) |
+| Any MLX format | MLX | Apple Silicon only (Metal GPU framework) |
 
 ## Environment Variables
 
@@ -154,6 +183,9 @@ Additionally, the `all_reduce` warmup in `vllm/v1/worker/xpu_worker.py` (lines ~
 6. **Large models may OOM** — Pre-quantized models (AutoRound/GPTQ) require unpacking INT4 weights to FP16 during loading, doubling peak memory. The Qwen3.5-35B-A3B INT4 AutoRound model (~14GB on disk) OOMs during initialization on 32GB shared memory. Use online `--quantization int4` instead, or choose models ≤14B.
 7. **GPU crash requires reboot** — If vLLM OOMs and the GPU enters `UR_RESULT_ERROR_DEVICE_LOST` state, a full system reboot is required to reset the GPU.
 8. **Build time** — vllm-xpu-kernels compilation (933 SYCL files) takes **1.5-2 hours** on Lunar Lake. Ensure the device is plugged in and sleep is disabled (`systemctl mask sleep.target suspend.target`).
+9. **Triton XPU broken on Xe2** — The `triton-xpu` package installs but `triton.backends` fails to import on Lunar Lake. Any model architecture using `@triton.jit` kernels (e.g., Qwen3.5's fla/linear attention) will crash with `TypeError: 'function' object is not subscriptable`. This is a triton-xpu packaging/driver issue, not a vLLM bug.
+10. **Marlin kernels CUDA-only** — AWQ and GPTQ models using compressed-tensors format route to Marlin repack kernels (`_C.gptq_marlin_repack`), which are NVIDIA CUDA kernels with no XPU equivalent. Pre-quantized AWQ/GPTQ models cannot be used on XPU.
+11. **Download FP16 base models** — The only reliable path on Lunar Lake is downloading FP16/BF16 base weights and using vLLM's online quantization (`--quantization fp8` or `--quantization int4`). This uses layer-by-layer loading without the 2x memory spike of pre-quantized formats.
 
 ## Alternative: llama.cpp with Vulkan
 
