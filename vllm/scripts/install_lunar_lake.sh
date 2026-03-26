@@ -137,8 +137,10 @@ fi
 # with our set -euo pipefail
 log_info "Sourcing oneAPI environment..."
 set +euo pipefail
-source /opt/intel/oneapi/setvars.sh --force 2>&1 | grep -E "^::|initialized" || true
+source /opt/intel/oneapi/setvars.sh --force > /tmp/oneapi_init.log 2>&1 || true
 set -euo pipefail
+grep -E "^::|initialized" /tmp/oneapi_init.log || true
+rm -f /tmp/oneapi_init.log
 log_info "oneAPI configured."
 
 # ── Phase 3: Python venv + PyTorch XPU ───────────────────────────────────────
