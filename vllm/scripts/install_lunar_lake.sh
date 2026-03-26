@@ -228,7 +228,8 @@ if [ ! -d "$INSTALL_DIR/llm-scaler" ]; then
 fi
 
 # Build patched vLLM
-if ! python3 -c "import vllm" 2>/dev/null; then
+# Use pip show (not import) to avoid false positives from local vllm/ directories
+if ! pip show vllm &>/dev/null; then
     cd "$INSTALL_DIR/llm-scaler/vllm"
 
     if [ ! -d "$INSTALL_DIR/vllm" ]; then
