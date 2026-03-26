@@ -132,9 +132,13 @@ else
     fi
 fi
 
-# Source it now (skip MPI to avoid network probe hangs over SSH)
-log_info "Sourcing oneAPI environment (excluding MPI to avoid SSH hangs)..."
-ONEAPI_SETVARS_MPI_INSTALL=0 source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
+# Source it now — temporarily relax strict mode because setvars.sh
+# has unbound variables and non-zero exits internally that conflict
+# with our set -euo pipefail
+log_info "Sourcing oneAPI environment..."
+set +euo pipefail
+source /opt/intel/oneapi/setvars.sh --force 2>&1 | grep -E "^::|initialized" || true
+set -euo pipefail
 log_info "oneAPI configured."
 
 # ── Phase 3: Python venv + PyTorch XPU ───────────────────────────────────────
