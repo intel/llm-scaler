@@ -189,7 +189,7 @@ log_info "Venv Python: $VENV_PY_VERSION"
 pip install --upgrade pip wheel setuptools 2>&1 | tail -3
 
 log_info "Installing PyTorch XPU (this downloads ~2-3 GB, may take a while)..."
-pip install torch torchvision torchaudio \
+pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
     --index-url https://download.pytorch.org/whl/xpu
 
 # Verify PyTorch XPU
