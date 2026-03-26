@@ -261,6 +261,10 @@ pip install accelerate hf_transfer transformers ijson
 
 log_info "Phase 5/5: Installing XPU kernels and configuring environment..."
 
+# Remove stale build if previous attempt failed
+if [ -d "$INSTALL_DIR/vllm-xpu-kernels" ] && ! pip show vllm-xpu-kernels &>/dev/null; then
+    rm -rf "$INSTALL_DIR/vllm-xpu-kernels"
+fi
 if [ ! -d "$INSTALL_DIR/vllm-xpu-kernels" ]; then
     cd "$INSTALL_DIR"
     git clone https://github.com/vllm-project/vllm-xpu-kernels.git
@@ -271,12 +275,12 @@ if [ ! -d "$INSTALL_DIR/vllm-xpu-kernels" ]; then
     sed -i 's|^torch==2.10.0+xpu|# &|' requirements.txt
     sed -i 's|^triton-xpu|# &|' requirements.txt
     sed -i 's|^transformers|# &|' requirements.txt
-    pip install -r requirements.txt 2>&1 | tail -3
-    pip install --no-build-isolation . 2>&1 | tail -5
+    pip install -r requirements.txt
+    pip install --no-build-isolation .
 fi
 
 # Install triton-xpu
-pip install triton-xpu==3.6.0 --extra-index-url=https://download.pytorch.org/whl/test/xpu 2>&1 | tail -3
+pip install triton-xpu==3.6.0 --extra-index-url=https://download.pytorch.org/whl/test/xpu
 
 # Copy launch script
 cp "$INSTALL_DIR/llm-scaler/vllm/scripts/lunar_lake_serve.sh" "$INSTALL_DIR/"
