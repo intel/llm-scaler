@@ -284,8 +284,12 @@ if [ ! -d "$INSTALL_DIR/vllm-xpu-kernels" ]; then
     sed -i 's|^transformers|# &|' requirements.txt
     pip install -r requirements.txt
     # Limit parallel SYCL compilations to avoid OOM on 32GB shared-memory systems
-    # Each icpx process can use ~4GB; -j=8 default causes OOM kills
-    export MAX_JOBS=2
+    # Each icpx process can use ~4GB on heavy SYCL kernels; -j=8 causes OOM kills
+    # MAX_JOBS=6 uses 75% CPU while keeping peak memory ~24GB (safe for 32GB)
+    # NOTE: This compiles 933 SYCL kernel files and can take 1.5-2 hours on Lunar Lake.
+    #       Ensure the device is plugged in before starting!
+    export MAX_JOBS=${MAX_JOBS:-6}
+    log_info "Building XPU kernels with MAX_JOBS=$MAX_JOBS (933 SYCL files, expect 1.5-2 hours)..."
     pip install --no-build-isolation .
 fi
 
