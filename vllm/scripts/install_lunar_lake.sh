@@ -100,23 +100,34 @@ gpgkey=https://repositories.intel.com/gpu/intel-graphics.key
 REPO
 fi
 
-# Install Level-Zero (try multiple package names across distros)
-log_info "Installing Level-Zero GPU runtime..."
+# Install Level-Zero + Intel compute runtime (GPU userspace driver)
+# intel-compute-runtime provides libze_intel_gpu.so which bridges Level-Zero to the xe kernel driver
+log_info "Installing Level-Zero GPU runtime + Intel compute runtime..."
 sudo dnf install -y --skip-unavailable \
     level-zero level-zero-devel \
     intel-level-zero-gpu intel-level-zero-gpu-devel \
     oneapi-level-zero level-zero-loader \
-    2>&1 | tail -5 || true
+    intel-compute-runtime \
+    intel-ocloc \
+    2>&1 | tail -10 || true
 
-# Check if Level-Zero is available (may already be present via xe driver)
+# Check if Level-Zero loader is available
 if ldconfig -p 2>/dev/null | grep -q libze_loader; then
-    log_info "Level-Zero runtime found."
-elif [ -f /usr/lib64/libze_loader.so ] || [ -f /usr/lib/x86_64-linux-gnu/libze_loader.so ]; then
-    log_info "Level-Zero library found."
+    log_info "Level-Zero loader found."
 else
-    log_warn "Level-Zero not found in system libraries."
-    log_warn "It may be installed with oneAPI below, or already bundled with the xe driver."
-    log_warn "Continuing — will verify with PyTorch XPU in Phase 3."
+    log_warn "Level-Zero loader not found in ldconfig."
+fi
+
+# Check if GPU driver (compute runtime) is available
+if ldconfig -p 2>/dev/null | grep -q libze_intel_gpu; then
+    log_info "Intel GPU compute runtime found."
+elif find /usr/lib64 /usr/local/lib64 /opt/intel -name "libze_intel_gpu.so*" 2>/dev/null | head -1 | grep -q .; then
+    log_info "Intel GPU compute runtime found (not in ldconfig, may need LD_LIBRARY_PATH)."
+else
+    log_warn "Intel GPU compute runtime (libze_intel_gpu.so) NOT found."
+    log_warn "This is required for XPU to detect your GPU."
+    log_warn "Try: sudo dnf install intel-compute-runtime"
+    log_warn "Or check: https://github.com/intel/compute-runtime/releases"
 fi
 
 # Install oneAPI
