@@ -23,7 +23,17 @@ NC='\033[0m'
 
 # === Source oneAPI ===
 if [ -f /opt/intel/oneapi/setvars.sh ]; then
-    source /opt/intel/oneapi/setvars.sh --force 2>/dev/null
+    set +euo pipefail
+    source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
+    set -euo pipefail
+fi
+
+# === Fix MKL library path ===
+# PyTorch bundles MKL stubs with relative RPATHs that break in venvs.
+# Preload the real oneAPI MKL libraries to avoid "Cannot load libmkl_core.so" errors.
+if [ -n "${MKLROOT:-}" ] && [ -f "$MKLROOT/lib/libmkl_core.so.2" ]; then
+    export LD_PRELOAD="${MKLROOT}/lib/libmkl_core.so.2:${MKLROOT}/lib/libmkl_intel_thread.so.2:${MKLROOT}/lib/libmkl_intel_lp64.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
+    echo -e "${GREEN}[Lunar Lake vLLM]${NC} MKL preloaded from $MKLROOT"
 fi
 
 # === Validate args ===

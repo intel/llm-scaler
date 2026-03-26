@@ -154,6 +154,13 @@ grep -E "^::|initialized" /tmp/oneapi_init.log || true
 rm -f /tmp/oneapi_init.log
 log_info "oneAPI configured."
 
+# Fix MKL library path — PyTorch's bundled MKL stubs use relative RPATHs that
+# break inside venvs. Preload the real oneAPI MKL to avoid runtime errors.
+if [ -n "${MKLROOT:-}" ] && [ -f "$MKLROOT/lib/libmkl_core.so.2" ]; then
+    export LD_PRELOAD="${MKLROOT}/lib/libmkl_core.so.2:${MKLROOT}/lib/libmkl_intel_thread.so.2:${MKLROOT}/lib/libmkl_intel_lp64.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
+    log_info "MKL preloaded from $MKLROOT"
+fi
+
 # ── Phase 3: Python venv + PyTorch XPU ───────────────────────────────────────
 
 log_info "Phase 3/5: Setting up Python environment..."
@@ -276,6 +283,9 @@ if [ ! -d "$INSTALL_DIR/vllm-xpu-kernels" ]; then
     sed -i 's|^triton-xpu|# &|' requirements.txt
     sed -i 's|^transformers|# &|' requirements.txt
     pip install -r requirements.txt
+    # Limit parallel SYCL compilations to avoid OOM on 32GB shared-memory systems
+    # Each icpx process can use ~4GB; -j=8 default causes OOM kills
+    export MAX_JOBS=2
     pip install --no-build-isolation .
 fi
 
