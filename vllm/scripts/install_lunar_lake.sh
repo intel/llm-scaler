@@ -132,8 +132,9 @@ else
     fi
 fi
 
-# Source it now
-source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
+# Source it now (skip MPI to avoid network probe hangs over SSH)
+log_info "Sourcing oneAPI environment (excluding MPI to avoid SSH hangs)..."
+ONEAPI_SETVARS_MPI_INSTALL=0 source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
 log_info "oneAPI configured."
 
 # ── Phase 3: Python venv + PyTorch XPU ───────────────────────────────────────
@@ -143,10 +144,41 @@ log_info "Phase 3/5: Setting up Python environment..."
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 
+# Detect Python version — PyTorch XPU requires Python 3.10-3.12
+# Nobara 43 ships Python 3.14 which is too new for PyTorch XPU wheels
+PY_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+log_info "System Python: $PY_VERSION"
+
+VENV_PYTHON="python3"
+if python3 -c "import sys; sys.exit(0 if sys.version_info[:2] <= (3,12) else 1)" 2>/dev/null; then
+    log_info "Python $PY_VERSION is compatible with PyTorch XPU."
+else
+    log_warn "Python $PY_VERSION is too new for PyTorch XPU (needs <=3.12)."
+    # Try to find Python 3.12
+    if command -v python3.12 &> /dev/null; then
+        VENV_PYTHON="python3.12"
+        log_info "Found python3.12, will use it for the venv."
+    else
+        log_info "Installing Python 3.12..."
+        sudo dnf install -y python3.12 python3.12-devel 2>&1 | tail -5
+        if command -v python3.12 &> /dev/null; then
+            VENV_PYTHON="python3.12"
+            log_info "Python 3.12 installed."
+        else
+            log_error "Cannot install Python 3.12. PyTorch XPU requires Python <=3.12."
+            log_error "Install manually: sudo dnf install python3.12 python3.12-devel"
+            exit 1
+        fi
+    fi
+fi
+
 if [ ! -d "$VENV_DIR" ]; then
-    python3 -m venv "$VENV_DIR"
+    $VENV_PYTHON -m venv "$VENV_DIR"
 fi
 source "$VENV_DIR/bin/activate"
+
+VENV_PY_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+log_info "Venv Python: $VENV_PY_VERSION"
 
 pip install --upgrade pip wheel setuptools 2>&1 | tail -3
 
