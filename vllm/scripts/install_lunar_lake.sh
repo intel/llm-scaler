@@ -239,12 +239,14 @@ if ! python3 -c "import vllm" 2>/dev/null; then
     git apply "$INSTALL_DIR/llm-scaler/vllm/patches/vllm_for_multi_arc.patch" 2>/dev/null || \
         log_warn "Patch already applied or failed. Continuing..."
 
-    pip install -r requirements/xpu.txt 2>&1 | tail -5
-    pip install arctic-inference==0.1.1 2>&1 | tail -3
+    log_info "Installing vLLM XPU requirements..."
+    pip install -r requirements/xpu.txt
+    pip install arctic-inference==0.1.1 || log_warn "arctic-inference install failed, continuing..."
 
     export VLLM_TARGET_DEVICE=xpu
     export CPATH=/opt/intel/oneapi/dpcpp-ct/latest/include/:${CPATH:-}
-    pip install --no-build-isolation . 2>&1 | tail -10
+    log_info "Building vLLM (this may take 10-30 minutes)..."
+    pip install --no-build-isolation .
 
     log_info "vLLM built successfully."
 else
@@ -252,7 +254,7 @@ else
 fi
 
 # Install extras
-pip install accelerate hf_transfer transformers ijson 2>&1 | tail -3
+pip install accelerate hf_transfer transformers ijson
 
 # ── Phase 5: Install XPU kernels + configure ─────────────────────────────────
 
