@@ -261,6 +261,20 @@ else
     log_info "vLLM already installed. Skipping build."
 fi
 
+# Patch xpu_worker.py: disable CCL all_reduce warmup for single-GPU
+# oneCCL's KVS init fails on devices without wired Ethernet (e.g. handhelds).
+# The all_reduce warmup at lines ~201-203 is unnecessary for single-GPU (TP=1).
+XPU_WORKER=$(python3 -c "import vllm; import os; print(os.path.join(os.path.dirname(vllm.__file__), 'v1/worker/xpu_worker.py'))" 2>/dev/null || true)
+if [ -n "$XPU_WORKER" ] && [ -f "$XPU_WORKER" ]; then
+    if grep -q "torch.distributed.all_reduce" "$XPU_WORKER"; then
+        log_info "Patching xpu_worker.py to disable CCL all_reduce warmup (single-GPU fix)..."
+        sed -i '/torch\.distributed\.all_reduce(/,/)/s/^/#/' "$XPU_WORKER"
+        log_info "xpu_worker.py patched."
+    else
+        log_info "xpu_worker.py already patched or no all_reduce found."
+    fi
+fi
+
 # Install extras
 pip install accelerate hf_transfer transformers ijson
 
@@ -305,7 +319,7 @@ if ! grep -q "llm-scaler-vllm" ~/.bashrc; then
     cat << 'BASHRC' >> ~/.bashrc
 
 # llm-scaler-vllm (Lunar Lake)
-alias vllm-activate='source ~/llm-scaler-vllm/venv/bin/activate && source /opt/intel/oneapi/setvars.sh --force 2>/dev/null'
+alias vllm-activate='source ~/llm-scaler-vllm/venv/bin/activate && source /opt/intel/oneapi/setvars.sh --force 2>/dev/null && export VLLM_TARGET_DEVICE=xpu'
 alias vllm-serve='cd ~/llm-scaler-vllm && source venv/bin/activate && source /opt/intel/oneapi/setvars.sh --force 2>/dev/null && ./lunar_lake_serve.sh'
 BASHRC
 fi

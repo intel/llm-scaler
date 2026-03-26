@@ -105,8 +105,10 @@ source /opt/intel/oneapi/setvars.sh --force
 ## vLLM Launch Flags
 
 ```bash
+# Device is set via environment variable, NOT a CLI flag
+export VLLM_TARGET_DEVICE=xpu
+
 vllm serve <model> \
-    --device xpu \
     --tensor-parallel-size 1 \
     --gpu-memory-utilization 0.7 \
     --enforce-eager \
@@ -115,11 +117,32 @@ vllm serve <model> \
 ```
 
 Key flags:
-- `--device xpu` — Use Intel XPU (Xe2 iGPU via SYCL)
+- `VLLM_TARGET_DEVICE=xpu` — **Environment variable** (NOT `--device xpu`, which is not a valid CLI flag)
 - `--tensor-parallel-size 1` — Single iGPU (no multi-GPU)
 - `--gpu-memory-utilization 0.7` — Conservative for shared memory (leave room for OS)
 - `--enforce-eager` — Disable CUDA graphs (XPU uses eager mode)
-- `--quantization int4` — Essential for fitting larger models in shared memory
+- `--quantization int4` — Online INT4 quantization for fitting larger models in shared memory
+- `--allow-deprecated-quantization` — Required for pre-quantized AutoRound/GPTQ models
+
+## CCL Single-GPU Workaround
+
+On Lunar Lake handhelds/laptops without wired Ethernet, oneCCL's internal KVS initialization fails with:
+
+```
+fill_local_host_ip: can't find non-loopback interface
+```
+
+This happens because CCL tries to find a network interface for collective communications, even for single-GPU (TP=1). The `lunar_lake_serve.sh` script handles this automatically, but if launching manually, set these env vars:
+
+```bash
+export MASTER_ADDR=127.0.0.1
+export CCL_ZE_ENABLE=0
+export CCL_ATL_TRANSPORT=ofi
+export FI_PROVIDER=tcp
+export CCL_SOCKET_IFNAME=wlo1  # or your WiFi interface name
+```
+
+Additionally, the `all_reduce` warmup in `vllm/v1/worker/xpu_worker.py` (lines ~201-203) must be patched out for single-GPU. The `install_lunar_lake.sh` script does this automatically.
 
 ## Known Limitations
 
@@ -128,6 +151,9 @@ Key flags:
 3. **No PCIe P2P** — CCL collective operations run in USM mode, not P2P.
 4. **Bandwidth-bound TG** — Token generation speed is limited by LPDDR5x bandwidth (136.5 GB/s), similar to the Vulkan path.
 5. **Platform installer** — The B60 offline installer (BMG firmware, Xeon kernel) does not apply. Use native oneAPI install instead.
+6. **Large models may OOM** — Pre-quantized models (AutoRound/GPTQ) require unpacking INT4 weights to FP16 during loading, doubling peak memory. The Qwen3.5-35B-A3B INT4 AutoRound model (~14GB on disk) OOMs during initialization on 32GB shared memory. Use online `--quantization int4` instead, or choose models ≤14B.
+7. **GPU crash requires reboot** — If vLLM OOMs and the GPU enters `UR_RESULT_ERROR_DEVICE_LOST` state, a full system reboot is required to reset the GPU.
+8. **Build time** — vllm-xpu-kernels compilation (933 SYCL files) takes **1.5-2 hours** on Lunar Lake. Ensure the device is plugged in and sleep is disabled (`systemctl mask sleep.target suspend.target`).
 
 ## Alternative: llama.cpp with Vulkan
 
@@ -139,4 +165,4 @@ For simpler setup without the oneAPI stack, [llama.cpp with Vulkan](https://gith
 
 ---
 
-*Updated: 2026-03-25*
+*Updated: 2026-03-26*

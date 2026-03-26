@@ -62,6 +62,12 @@ ENV VLLM_TARGET_DEVICE=xpu
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
 # Disable multi-GPU features not applicable to iGPU
 ENV CCL_TOPO_P2P_ACCESS=0
+# CCL single-GPU workaround: force local TCP transport to avoid
+# "fill_local_host_ip: can't find non-loopback interface" on handhelds
+ENV MASTER_ADDR=127.0.0.1
+ENV CCL_ZE_ENABLE=0
+ENV CCL_ATL_TRANSPORT=ofi
+ENV FI_PROVIDER=tcp
 # Memory-aware: offload weights to CPU before quantization (essential for shared memory)
 ENV VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 ENV VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
@@ -79,6 +85,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install arctic-inference==0.1.1 && \
     export CPATH=/opt/intel/oneapi/dpcpp-ct/2025.2/include/:${CPATH} && \
     pip install --no-build-isolation .
+
+# Patch xpu_worker.py: disable CCL all_reduce warmup for single-GPU
+# oneCCL's KVS init fails in containers without real network interfaces.
+RUN XPU_WORKER=$(python3 -c "import vllm; import os; print(os.path.join(os.path.dirname(vllm.__file__), 'v1/worker/xpu_worker.py'))") && \
+    if grep -q "torch.distributed.all_reduce" "$XPU_WORKER"; then \
+        sed -i '/torch\.distributed\.all_reduce(/,/)/s/^/#/' "$XPU_WORKER"; \
+    fi
 
 # Install pypi dependencies
 RUN --mount=type=cache,target=/root/.cache/pip \

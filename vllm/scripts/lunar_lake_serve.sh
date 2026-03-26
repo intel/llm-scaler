@@ -79,16 +79,34 @@ export PYTORCH_ALLOC_CONF="expandable_segments:True"
 # USM mode for shared memory (no P2P needed)
 export CCL_TOPO_P2P_ACCESS=0
 
+# === CCL single-GPU workaround ===
+# oneCCL's KVS init tries to resolve a network interface even for single-GPU.
+# On laptops/handhelds without wired Ethernet this can fail with
+# "fill_local_host_ip: can't find non-loopback interface".
+# These env vars force CCL to use a local TCP transport instead.
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=${MASTER_PORT:-29500}
+export CCL_ZE_ENABLE=0
+export CCL_ATL_TRANSPORT=ofi
+export FI_PROVIDER=tcp
+# Use WiFi interface if available, fallback to loopback
+if ip link show wlo1 &>/dev/null; then
+    export CCL_SOCKET_IFNAME=wlo1
+elif ip link show wlan0 &>/dev/null; then
+    export CCL_SOCKET_IFNAME=wlan0
+else
+    export CCL_SOCKET_IFNAME=lo
+fi
+
 echo -e "${GREEN}[Lunar Lake vLLM]${NC} Launching vLLM serve..."
 echo "───────────────────────────────────────────────────────────────────────────────"
 
 # === Launch vLLM ===
-# --device xpu:              Use Intel XPU (Xe2 iGPU)
+# Device is set via VLLM_TARGET_DEVICE=xpu (not a CLI flag)
 # --tensor-parallel-size 1:  Single GPU (integrated)
 # --gpu-memory-utilization:  Conservative for shared memory (leave room for OS + KV cache)
 # --enforce-eager:           Disable CUDA graphs (not supported on XPU)
 exec vllm serve "$MODEL" \
-    --device xpu \
     --tensor-parallel-size 1 \
     --gpu-memory-utilization 0.7 \
     --enforce-eager \
