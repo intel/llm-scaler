@@ -233,6 +233,67 @@ For simpler setup without the oneAPI stack, [llama.cpp with Vulkan](https://gith
 - FP8/INT4 dynamic online quantization
 - Multimodal model support
 
+## Qwen3-TTS on Lunar Lake (XPU)
+
+**Model:** Qwen/Qwen3-TTS-12Hz-1.7B-Base (~3.6GB) + Qwen/Qwen3-TTS-Tokenizer-12Hz (~651MB)
+**VRAM:** ~2GB on XPU
+**Use case:** Voice cloning from 3-second reference audio, 10 languages supported
+
+### Setup
+
+```bash
+# 1. Create venv using Python 3.12 from vLLM install (Nobara ships 3.14, PyTorch XPU needs ≤3.12)
+~/llm-scaler-vllm/venv/bin/python3.12 -m venv ~/qwen-tts-env --system-site-packages
+
+# 2. Link XPU PyTorch from vLLM venv
+echo "$HOME/llm-scaler-vllm/venv/lib64/python3.12/site-packages" > \
+    ~/qwen-tts-env/lib64/python3.12/site-packages/vllm-xpu.pth
+
+# 3. Install qwen-tts + deps (no CUDA torch)
+source ~/qwen-tts-env/bin/activate
+pip install qwen-tts --no-deps
+pip install transformers==4.57.3 huggingface_hub
+pip install librosa soundfile sox onnxruntime einops accelerate torchaudio --no-deps
+
+# 4. Download models
+huggingface-cli download Qwen/Qwen3-TTS-Tokenizer-12Hz --local-dir /shared/models/qwen3-tts-tokenizer-12hz
+huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-Base --local-dir /shared/models/qwen3-tts-12hz-1.7b-base
+```
+
+### Usage — Voice Cloning
+
+```bash
+source ~/qwen-tts-env/bin/activate
+oneapi   # alias for: source /opt/intel/oneapi/setvars.sh --force
+```
+
+```python
+import torch
+import soundfile as sf
+from qwen_tts import Qwen3TTSModel
+
+model = Qwen3TTSModel.from_pretrained(
+    "/shared/models/qwen3-tts-12hz-1.7b-base",
+    device_map="xpu:0",
+    dtype=torch.bfloat16,
+)
+
+wavs, sr = model.generate_voice_clone(
+    text="Hello, this is a test of Qwen3 text to speech on Intel Lunar Lake.",
+    language="English",
+    ref_audio="/path/to/reference.wav",   # 3-second voice sample
+    ref_text="Transcript of the reference audio.",
+)
+sf.write("output.wav", wavs[0], sr)
+```
+
+### Notes
+
+- Flash-attn warning is harmless — it falls back to PyTorch SDPA attention on XPU
+- The Base model requires a reference audio for voice cloning; for preset voices use `Qwen3-TTS-12Hz-1.7B-CustomVoice` with `generate_custom_voice()`
+- Can run simultaneously with vLLM — TTS uses ~2GB, leaving plenty for LLM serving
+- `transformers==4.57.3` is required (newer versions break the `check_model_inputs` decorator)
+
 ---
 
 *Updated: 2026-03-27*
