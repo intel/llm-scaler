@@ -131,7 +131,7 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
     slmPingpongStore = slmPingpongStore * 64 * 128 * sizeof(fp16);
     auto tempQkAsFp16 = tempOutput.template bit_cast_view<fp16>();
     simd<fp16, 512> fp16VState;
-    simd<fp16, 32> compensationTemp;  // declared at loop scope for use after barrier
+    simd<float, 16> fp32CompSaved;    // fp32 compensation saved for overflow-safe multiply
     tempOutput = 0;
 
     // ===== Q @ K^T =====
@@ -166,6 +166,16 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
       __ESIMD_ENS::cache_hint::cached, __ESIMD_ENS::cache_hint::cached>(payloadV);
     vCoordY += 64;
     payloadV.set_y(vCoordY);
+
+    // ===== Prefetch next K block early — maximize prefetch distance =====
+    #pragma unroll
+    for (int32_t kk = 0; kk < 2; kk++) {
+      __ESIMD_ENS::lsc_prefetch_2d<uint32_t, 16, 8, 1, false, false,
+        __ESIMD_ENS::cache_hint::cached, __ESIMD_ENS::cache_hint::cached>(payloadPrefK);
+      payloadPrefK.set_x(prefCoordX + 16 * kk);
+    }
+    prefCoordYK += 64;
+    payloadPrefK.set_y(prefCoordYK);
 
     // ===== Softmax =====
     {
@@ -225,9 +235,8 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
       fp32SoftMaxCompensation = __ESIMD_NS::exp2<float, 16, float>(fp32SoftMaxCompensation);
       fp32SoftMaxTemp.select<16, 1>(0) = fp32SoftMaxTemp.select<16, 1>(0) * fp32SoftMaxCompensation.select<16, 1>(0);
 
-      // EARLY fp16 convert — before sum reduction, so sum ALU overlaps with convert latency
-      compensationTemp.select<16, 1>(0) = fp32SoftMaxCompensation;
-      compensationTemp.select<16, 1>(16) = fp32SoftMaxCompensation;
+      // Save fp32 compensation for overflow-safe multiply after barrier
+      fp32CompSaved = fp32SoftMaxCompensation;
 
       // Sum reduction
       #pragma unroll
@@ -272,37 +281,61 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
       }
     }
 
-    barrier();  // moved before compensation — SLM ready, comp ALU can overlap with SLM loads
+    barrier();  // ensures previous iter's SLM scatter is visible
 
     // ===== Interleaved compensation + S×V by output-dim half =====
+    // Pipeline: issue first SLM load BEFORE compensation so load latency
+    // overlaps with compensation ALU work (they use disjoint registers).
     {
       // --- l=0: finalOutput[0..1023] ---
-      // Compensate l=0 half
+      // Pre-load first V block (nn=0) — SLM load issued early
+      #pragma unroll
+      for (int ll = 0; ll < 2; ll++) {
+        tempQkAsFp16.select<512, 1>(1024 + 512 * ll) =
+          slm_block_load<fp16, 512>(slmOffsetBaseV +
+            slmPingpongLoad +
+            512 * ll * sizeof(fp16));
+      }
+      // Compensate l=0 half — fp32 multiply + clamp (overlaps with SLM load above)
       #pragma unroll
       for (int kk = 0; kk < 32; kk++) {
-        finalOutput.select<32, 1>(32 * kk) = finalOutput.select<32, 1>(32 * kk) * compensationTemp.select<32, 1>(0);
+        simd<float, 32> f32tmp = finalOutput.select<32, 1>(32 * kk);
+        f32tmp.select<16, 1>(0) *= fp32CompSaved;
+        f32tmp.select<16, 1>(16) *= fp32CompSaved;
+        f32tmp = __ESIMD_NS::min<float>(f32tmp, simd<float, 32>(65504.0f));
+        f32tmp = __ESIMD_NS::max<float>(f32tmp, simd<float, 32>(-65504.0f));
+        finalOutput.select<32, 1>(32 * kk) = simd<fp16, 32>(f32tmp);
       }
       // Block 1 (V rows 0-31), l=0
+      // nn=0: V data already loaded above
       #pragma unroll
-      for (int nn = 0; nn < 2; nn++) {
-        #pragma unroll
-        for (int ll = 0; ll < 2; ll++) {
-          tempQkAsFp16.select<512, 1>(1024 + 512 * ll) =
-            slm_block_load<fp16, 512>(slmOffsetBaseV +
-              slmPingpongLoad +
-              16 * 128 * nn * sizeof(fp16) +
-              512 * ll * sizeof(fp16));
-        }
-        #pragma unroll
-        for (int ll = 0; ll < 8; ll++) {
-          auto ccTile = finalOutput.select<128, 1>(128 * ll);
-          auto aaTile = tempBufferAsFp16.select<256, 1>(256 * nn);
-          auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
-          ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
-            simd<fp16, 128>(ccTile.data()),
-            simd<fp16, 256>(aaTile.data()),
-            simd<fp16, 128>(bbTile.data()));
-        }
+      for (int ll = 0; ll < 8; ll++) {
+        auto ccTile = finalOutput.select<128, 1>(128 * ll);
+        auto aaTile = tempBufferAsFp16.select<256, 1>(0);
+        auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
+        ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
+          simd<fp16, 128>(ccTile.data()),
+          simd<fp16, 256>(aaTile.data()),
+          simd<fp16, 128>(bbTile.data()));
+      }
+      // nn=1: load then DPAS
+      #pragma unroll
+      for (int ll = 0; ll < 2; ll++) {
+        tempQkAsFp16.select<512, 1>(1024 + 512 * ll) =
+          slm_block_load<fp16, 512>(slmOffsetBaseV +
+            slmPingpongLoad +
+            16 * 128 * sizeof(fp16) +
+            512 * ll * sizeof(fp16));
+      }
+      #pragma unroll
+      for (int ll = 0; ll < 8; ll++) {
+        auto ccTile = finalOutput.select<128, 1>(128 * ll);
+        auto aaTile = tempBufferAsFp16.select<256, 1>(256);
+        auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
+        ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
+          simd<fp16, 128>(ccTile.data()),
+          simd<fp16, 256>(aaTile.data()),
+          simd<fp16, 128>(bbTile.data()));
       }
       // Block 2 (V rows 32-63), l=0
       #pragma unroll
@@ -329,33 +362,56 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
       }
 
       // --- l=1: finalOutput[1024..2047] ---
-      // Compensate l=1 half (overlaps with l=0 DPAS pipeline)
+      // Pre-load first V block for l=1 (nn=0) — SLM load issued early
+      #pragma unroll
+      for (int ll = 0; ll < 2; ll++) {
+        tempQkAsFp16.select<512, 1>(1024 + 512 * ll) =
+          slm_block_load<fp16, 512>(slmOffsetBaseV +
+            slmPingpongLoad +
+            16 * 64 * sizeof(fp16) +
+            512 * ll * sizeof(fp16));
+      }
+      // Compensate l=1 half — fp32 multiply + clamp (overlaps with SLM load above)
       #pragma unroll
       for (int kk = 32; kk < 64; kk++) {
-        finalOutput.select<32, 1>(32 * kk) = finalOutput.select<32, 1>(32 * kk) * compensationTemp.select<32, 1>(0);
+        simd<float, 32> f32tmp = finalOutput.select<32, 1>(32 * kk);
+        f32tmp.select<16, 1>(0) *= fp32CompSaved;
+        f32tmp.select<16, 1>(16) *= fp32CompSaved;
+        f32tmp = __ESIMD_NS::min<float>(f32tmp, simd<float, 32>(65504.0f));
+        f32tmp = __ESIMD_NS::max<float>(f32tmp, simd<float, 32>(-65504.0f));
+        finalOutput.select<32, 1>(32 * kk) = simd<fp16, 32>(f32tmp);
       }
       // Block 1 (V rows 0-31), l=1
+      // nn=0: V data already pre-loaded above
       #pragma unroll
-      for (int nn = 0; nn < 2; nn++) {
-        #pragma unroll
-        for (int ll = 0; ll < 2; ll++) {
-          tempQkAsFp16.select<512, 1>(1024 + 512 * ll) =
-            slm_block_load<fp16, 512>(slmOffsetBaseV +
-              slmPingpongLoad +
-              16 * 128 * nn * sizeof(fp16) +
-              16 * 64 * sizeof(fp16) +
-              512 * ll * sizeof(fp16));
-        }
-        #pragma unroll
-        for (int ll = 0; ll < 8; ll++) {
-          auto ccTile = finalOutput.select<128, 1>(1024 + 128 * ll);
-          auto aaTile = tempBufferAsFp16.select<256, 1>(256 * nn);
-          auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
-          ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
-            simd<fp16, 128>(ccTile.data()),
-            simd<fp16, 256>(aaTile.data()),
-            simd<fp16, 128>(bbTile.data()));
-        }
+      for (int ll = 0; ll < 8; ll++) {
+        auto ccTile = finalOutput.select<128, 1>(1024 + 128 * ll);
+        auto aaTile = tempBufferAsFp16.select<256, 1>(0);
+        auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
+        ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
+          simd<fp16, 128>(ccTile.data()),
+          simd<fp16, 256>(aaTile.data()),
+          simd<fp16, 128>(bbTile.data()));
+      }
+      // nn=1: load then DPAS
+      #pragma unroll
+      for (int ll = 0; ll < 2; ll++) {
+        tempQkAsFp16.select<512, 1>(1024 + 512 * ll) =
+          slm_block_load<fp16, 512>(slmOffsetBaseV +
+            slmPingpongLoad +
+            16 * 128 * sizeof(fp16) +
+            16 * 64 * sizeof(fp16) +
+            512 * ll * sizeof(fp16));
+      }
+      #pragma unroll
+      for (int ll = 0; ll < 8; ll++) {
+        auto ccTile = finalOutput.select<128, 1>(1024 + 128 * ll);
+        auto aaTile = tempBufferAsFp16.select<256, 1>(256);
+        auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
+        ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
+          simd<fp16, 128>(ccTile.data()),
+          simd<fp16, 256>(aaTile.data()),
+          simd<fp16, 128>(bbTile.data()));
       }
       // Block 2 (V rows 32-63), l=1
       #pragma unroll
@@ -395,15 +451,7 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
       }
     }
 
-    // Prefetch
-    #pragma unroll
-    for (int32_t kk = 0; kk < 2; kk++) {
-      __ESIMD_ENS::lsc_prefetch_2d<uint32_t, 16, 8, 1, false, false,
-        __ESIMD_ENS::cache_hint::cached, __ESIMD_ENS::cache_hint::cached>(payloadPrefK);
-      payloadPrefK.set_x(prefCoordX + 16 * kk);
-    }
-    prefCoordYK += 64;
-    payloadPrefK.set_y(prefCoordYK);
+    // (K prefetch moved earlier — right after V load, before softmax)
   }
 
   // ===== LAST LOOP - boundary checking =====
@@ -411,7 +459,7 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
     uint32_t slmPingpongLoad = (loopIdx) & 0x1;
     slmPingpongLoad = slmPingpongLoad * 64 * 128 * sizeof(fp16);
     auto tempQkAsFp16 = tempOutput.template bit_cast_view<fp16>();
-    simd<fp16, 32> compensationTemp;  // declared at scope for use after barrier
+    simd<float, 16> fp32CompSaved;    // fp32 compensation for overflow-safe multiply
     tempOutput = 0;
 
     // Q @ K^T
@@ -508,9 +556,8 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
         fp32SoftMaxTemp.select<16, 1>(0) = fp32SoftMaxTemp.select<16, 1>(0) * fp32SoftMaxCompensation.select<16, 1>(0);
       }
 
-      // EARLY fp16 convert — before sum reduction
-      compensationTemp.select<16, 1>(0) = fp32SoftMaxCompensation;
-      compensationTemp.select<16, 1>(16) = fp32SoftMaxCompensation;
+      // Save fp32 compensation for overflow-safe multiply after barrier
+      fp32CompSaved = fp32SoftMaxCompensation;
 
       #pragma unroll
       for (int kk = 0; kk < 4; kk++) {
@@ -562,7 +609,12 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
         // --- l=0: finalOutput[0..1023] ---
         #pragma unroll
         for (int kk = 0; kk < 32; kk++) {
-          finalOutput.select<32, 1>(32 * kk) = finalOutput.select<32, 1>(32 * kk) * compensationTemp.select<32, 1>(0);
+          simd<float, 32> f32tmp = finalOutput.select<32, 1>(32 * kk);
+          f32tmp.select<16, 1>(0) *= fp32CompSaved;
+          f32tmp.select<16, 1>(16) *= fp32CompSaved;
+          f32tmp = __ESIMD_NS::min<float>(f32tmp, simd<float, 32>(65504.0f));
+          f32tmp = __ESIMD_NS::max<float>(f32tmp, simd<float, 32>(-65504.0f));
+          finalOutput.select<32, 1>(32 * kk) = simd<fp16, 32>(f32tmp);
         }
       }
       // Block 1, l=0
@@ -615,7 +667,12 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
         // --- l=1: finalOutput[1024..2047] ---
         #pragma unroll
         for (int kk = 32; kk < 64; kk++) {
-          finalOutput.select<32, 1>(32 * kk) = finalOutput.select<32, 1>(32 * kk) * compensationTemp.select<32, 1>(0);
+          simd<float, 32> f32tmp = finalOutput.select<32, 1>(32 * kk);
+          f32tmp.select<16, 1>(0) *= fp32CompSaved;
+          f32tmp.select<16, 1>(16) *= fp32CompSaved;
+          f32tmp = __ESIMD_NS::min<float>(f32tmp, simd<float, 32>(65504.0f));
+          f32tmp = __ESIMD_NS::max<float>(f32tmp, simd<float, 32>(-65504.0f));
+          finalOutput.select<32, 1>(32 * kk) = simd<fp16, 32>(f32tmp);
         }
       }
       // Block 1, l=1
