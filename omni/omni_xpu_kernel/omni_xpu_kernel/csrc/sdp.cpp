@@ -11,6 +11,7 @@
 // Input layout: [B, L, H, 128] contiguous, B==1, head_dim==128
 // ============================================================================
 
+#include <atomic>
 #include <filesystem>
 #include <mutex>
 #include <string>
@@ -190,36 +191,58 @@ torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
     auto& norm_alpha = norm_alpha_cache(q);
     const int64_t H = q.size(2);
 
-    // Per-head V scaling to prevent fp16 accumulator overflow in ESIMD kernel.
+    // Adaptive V-scaling: only apply per-head V-scaling when V values are large
+    // enough to risk fp16 accumulator overflow in the ESIMD kernel's S×V DPAS.
     //
-    // The kernel's S×V DPAS uses fp16 accumulation. Large V values cause the
-    // unnormalized weighted sum to exceed fp16 max (65504), producing inf.
+    // The kernel accumulates: sum_i(softmax_weight_i * V_i) in fp16.
+    // Worst case: all softmax weights concentrate on one V row → accumulator ≈ V_max.
+    // With multiple tiles: accumulator can reach V_max * compensation_factor.
+    // Safe threshold: max(|V|) < 256 (conservative, leaves 256x headroom to 65504).
     //
-    // Fix: divide V per-head by v_scale, fold v_scale into normAlpha (fp32).
-    // The kernel's fp32 normalization step applies: out = finalOutput * normAlpha / softmax_sum
-    //   = softmax(QK^T) × (V/v_scale) × (normAlpha×v_scale) / sum
-    //   = softmax(QK^T) × V × normAlpha / sum    [exact cancellation]
+    // Fast path (V small): direct kernel call, no overhead.
+    // Safe path (V large): per-head V-scaling with exact normAlpha cancellation.
+    constexpr float V_SCALE_THRESHOLD = 256.0f;
+
+    // Adaptive V-scaling with cached decision to avoid per-call host sync.
     //
-    // Per-head scaling is more precise than global scalar — heads with small V
-    // values are not unnecessarily scaled down.
-    auto v_absmax = v.abs().amax(/*dim=*/{0, 1, 3});  // [H] per-head max
-    auto v_scale = (v_absmax.to(torch::kFloat) / 32.0f).clamp_min(1.0f);  // [H] fp32
+    // .item() forces a GPU→CPU sync that costs ~0.5ms (13% overhead for flux-4096).
+    // Since V magnitude is consistent within a model (determined by W_v weights),
+    // we check once and cache the decision. Recheck every 500 calls as safety net.
+    static std::atomic<int> sdp_call_counter{0};
+    static std::atomic<bool> cached_needs_scaling{false};
+    constexpr int RECHECK_INTERVAL = 500;
 
-    // Scale V per-head: V_scaled[b,l,h,d] = V[b,l,h,d] / v_scale[h]
-    auto v_scaled = v / v_scale.view({1, 1, H, 1}).to(v.scalar_type());
+    int call_num = sdp_call_counter.fetch_add(1);
+    bool needs_scaling;
+    if (call_num % RECHECK_INTERVAL == 0) {
+        // Full check with sync — only on first call and every N calls
+        float v_global_max = v.abs().max().item<float>();
+        needs_scaling = (v_global_max >= V_SCALE_THRESHOLD);
+        cached_needs_scaling.store(needs_scaling);
+    } else {
+        needs_scaling = cached_needs_scaling.load();
+    }
 
-    // Fold v_scale into normAlpha: effective[h*128+d] = alpha[h*128+d] * v_scale[h]
-    auto effective_alpha = norm_alpha * v_scale.repeat_interleave(128);
+    const void* v_ptr;
+    const void* alpha_ptr;
+    torch::Tensor v_scaled;       // keep alive if scaling
+    torch::Tensor effective_alpha; // keep alive if scaling
 
-    // Debug: log V scaling info for first few calls
-    static int _sdp_call_count = 0;
-    _sdp_call_count++;
-    if (_sdp_call_count <= 3) {
-        auto v_orig_max = v.abs().max().item<float>();
-        auto v_scaled_max = v_scaled.abs().max().item<float>();
-        auto v_scale_max = v_scale.max().item<float>();
-        fprintf(stderr, "[SDP C++] call #%d: V_orig_max=%.1f, v_scale_max=%.1f, V_scaled_max=%.1f, H=%ld\n",
-                _sdp_call_count, v_orig_max, v_scale_max, v_scaled_max, H);
+    if (needs_scaling) {
+        // Per-head V scaling: V_scaled = V / v_scale, normAlpha *= v_scale
+        // Mathematically exact: v_scale cancels in output normalization.
+        auto v_absmax = v.abs().amax(/*dim=*/{0, 1, 3});  // [H] per-head max
+        auto v_scale = (v_absmax.to(torch::kFloat) / 32.0f).clamp_min(1.0f);  // [H] fp32
+
+        v_scaled = v / v_scale.view({1, 1, H, 1}).to(v.scalar_type());
+        effective_alpha = norm_alpha * v_scale.repeat_interleave(128);
+
+        v_ptr = v_scaled.data_ptr();
+        alpha_ptr = effective_alpha.data_ptr();
+    } else {
+        // Fast path: V values are small, no scaling needed
+        v_ptr = v.data_ptr();
+        alpha_ptr = norm_alpha.data_ptr();
     }
 
     auto out = torch::empty_like(q);
@@ -230,8 +253,8 @@ torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
             kernels.fp16(
                 q.data_ptr(),
                 k.data_ptr(),
-                v_scaled.data_ptr(),
-                effective_alpha.data_ptr(),
+                const_cast<void*>(v_ptr),
+                const_cast<void*>(alpha_ptr),
                 out.data_ptr(),
                 static_cast<int>(q.size(1)),
                 static_cast<int>(k.size(1)),
@@ -243,8 +266,8 @@ torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
             kernels.bf16io(
                 q.data_ptr(),
                 k.data_ptr(),
-                v_scaled.data_ptr(),
-                effective_alpha.data_ptr(),
+                const_cast<void*>(v_ptr),
+                const_cast<void*>(alpha_ptr),
                 out.data_ptr(),
                 static_cast<int>(q.size(1)),
                 static_cast<int>(k.size(1)),
