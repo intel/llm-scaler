@@ -154,6 +154,13 @@ grep -E "^::|initialized" /tmp/oneapi_init.log || true
 rm -f /tmp/oneapi_init.log
 log_info "oneAPI configured."
 
+# Fix MKL library path — PyTorch's bundled MKL stubs use relative RPATHs that
+# break inside venvs. Preload the real oneAPI MKL to avoid runtime errors.
+if [ -n "${MKLROOT:-}" ] && [ -f "$MKLROOT/lib/libmkl_core.so.2" ]; then
+    export LD_PRELOAD="${MKLROOT}/lib/libmkl_core.so.2:${MKLROOT}/lib/libmkl_intel_thread.so.2:${MKLROOT}/lib/libmkl_intel_lp64.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
+    log_info "MKL preloaded from $MKLROOT"
+fi
+
 # ── Phase 3: Python venv + PyTorch XPU ───────────────────────────────────────
 
 log_info "Phase 3/5: Setting up Python environment..."
@@ -228,7 +235,8 @@ if [ ! -d "$INSTALL_DIR/llm-scaler" ]; then
 fi
 
 # Build patched vLLM
-if ! python3 -c "import vllm" 2>/dev/null; then
+# Use pip show (not import) to avoid false positives from local vllm/ directories
+if ! pip show vllm &>/dev/null; then
     cd "$INSTALL_DIR/llm-scaler/vllm"
 
     if [ ! -d "$INSTALL_DIR/vllm" ]; then
@@ -239,25 +247,45 @@ if ! python3 -c "import vllm" 2>/dev/null; then
     git apply "$INSTALL_DIR/llm-scaler/vllm/patches/vllm_for_multi_arc.patch" 2>/dev/null || \
         log_warn "Patch already applied or failed. Continuing..."
 
-    pip install -r requirements/xpu.txt 2>&1 | tail -5
-    pip install arctic-inference==0.1.1 2>&1 | tail -3
+    log_info "Installing vLLM XPU requirements..."
+    pip install -r requirements/xpu.txt
+    pip install arctic-inference==0.1.1 || log_warn "arctic-inference install failed, continuing..."
 
     export VLLM_TARGET_DEVICE=xpu
     export CPATH=/opt/intel/oneapi/dpcpp-ct/latest/include/:${CPATH:-}
-    pip install --no-build-isolation . 2>&1 | tail -10
+    log_info "Building vLLM (this may take 10-30 minutes)..."
+    pip install --no-build-isolation .
 
     log_info "vLLM built successfully."
 else
     log_info "vLLM already installed. Skipping build."
 fi
 
+# Patch xpu_worker.py: disable CCL all_reduce warmup for single-GPU
+# oneCCL's KVS init fails on devices without wired Ethernet (e.g. handhelds).
+# The all_reduce warmup at lines ~201-203 is unnecessary for single-GPU (TP=1).
+XPU_WORKER=$(python3 -c "import vllm; import os; print(os.path.join(os.path.dirname(vllm.__file__), 'v1/worker/xpu_worker.py'))" 2>/dev/null || true)
+if [ -n "$XPU_WORKER" ] && [ -f "$XPU_WORKER" ]; then
+    if grep -q "torch.distributed.all_reduce" "$XPU_WORKER"; then
+        log_info "Patching xpu_worker.py to disable CCL all_reduce warmup (single-GPU fix)..."
+        sed -i '/torch\.distributed\.all_reduce(/,/)/s/^/#/' "$XPU_WORKER"
+        log_info "xpu_worker.py patched."
+    else
+        log_info "xpu_worker.py already patched or no all_reduce found."
+    fi
+fi
+
 # Install extras
-pip install accelerate hf_transfer transformers ijson 2>&1 | tail -3
+pip install accelerate hf_transfer transformers ijson
 
 # ── Phase 5: Install XPU kernels + configure ─────────────────────────────────
 
 log_info "Phase 5/5: Installing XPU kernels and configuring environment..."
 
+# Remove stale build if previous attempt failed
+if [ -d "$INSTALL_DIR/vllm-xpu-kernels" ] && ! pip show vllm-xpu-kernels &>/dev/null; then
+    rm -rf "$INSTALL_DIR/vllm-xpu-kernels"
+fi
 if [ ! -d "$INSTALL_DIR/vllm-xpu-kernels" ]; then
     cd "$INSTALL_DIR"
     git clone https://github.com/vllm-project/vllm-xpu-kernels.git
@@ -268,12 +296,19 @@ if [ ! -d "$INSTALL_DIR/vllm-xpu-kernels" ]; then
     sed -i 's|^torch==2.10.0+xpu|# &|' requirements.txt
     sed -i 's|^triton-xpu|# &|' requirements.txt
     sed -i 's|^transformers|# &|' requirements.txt
-    pip install -r requirements.txt 2>&1 | tail -3
-    pip install --no-build-isolation . 2>&1 | tail -5
+    pip install -r requirements.txt
+    # Limit parallel SYCL compilations to avoid OOM on 32GB shared-memory systems
+    # Each icpx process can use ~4GB on heavy SYCL kernels; -j=8 causes OOM kills
+    # MAX_JOBS=6 uses 75% CPU while keeping peak memory ~24GB (safe for 32GB)
+    # NOTE: This compiles 933 SYCL kernel files and can take 1.5-2 hours on Lunar Lake.
+    #       Ensure the device is plugged in before starting!
+    export MAX_JOBS=${MAX_JOBS:-6}
+    log_info "Building XPU kernels with MAX_JOBS=$MAX_JOBS (933 SYCL files, expect 1.5-2 hours)..."
+    pip install --no-build-isolation .
 fi
 
 # Install triton-xpu
-pip install triton-xpu==3.6.0 --extra-index-url=https://download.pytorch.org/whl/test/xpu 2>&1 | tail -3
+pip install triton-xpu==3.6.0 --extra-index-url=https://download.pytorch.org/whl/test/xpu
 
 # Copy launch script
 cp "$INSTALL_DIR/llm-scaler/vllm/scripts/lunar_lake_serve.sh" "$INSTALL_DIR/"
@@ -284,7 +319,7 @@ if ! grep -q "llm-scaler-vllm" ~/.bashrc; then
     cat << 'BASHRC' >> ~/.bashrc
 
 # llm-scaler-vllm (Lunar Lake)
-alias vllm-activate='source ~/llm-scaler-vllm/venv/bin/activate && source /opt/intel/oneapi/setvars.sh --force 2>/dev/null'
+alias vllm-activate='source ~/llm-scaler-vllm/venv/bin/activate && source /opt/intel/oneapi/setvars.sh --force 2>/dev/null && export VLLM_TARGET_DEVICE=xpu'
 alias vllm-serve='cd ~/llm-scaler-vllm && source venv/bin/activate && source /opt/intel/oneapi/setvars.sh --force 2>/dev/null && ./lunar_lake_serve.sh'
 BASHRC
 fi
