@@ -240,11 +240,12 @@ std::shared_ptr<FP8PrimitiveState> get_or_create_fp8_primitive_state(
     int64_t n,
     bool has_bias,
     const torch::Device& device,
-    const sycl::queue& queue
+    const sycl::queue& queue,
+    DT weight_type = DT::f8_e4m3
 ) {
     FP8CacheKey key{
         device.index(),
-        static_cast<int>(InputType),
+        static_cast<int>(InputType) * 100 + static_cast<int>(weight_type),  // unique per input+weight type combo
         m,
         k,
         n,
@@ -266,7 +267,7 @@ std::shared_ptr<FP8PrimitiveState> get_or_create_fp8_primitive_state(
         queue.get_context()
     );
     dnnl::memory::desc x_md({m, k}, InputType, dnnl::memory::format_tag::ab);
-    dnnl::memory::desc w_md({k, n}, DT::f8_e4m3, dnnl::memory::format_tag::ba);
+    dnnl::memory::desc w_md({k, n}, weight_type, dnnl::memory::format_tag::ba);
     dnnl::memory::desc scales_md({n}, DT::f32, dnnl::memory::format_tag::a);
     dnnl::memory::desc out_md({m, n}, InputType, dnnl::memory::format_tag::ab);
     dnnl::memory::desc bias_md({1, n}, InputType, dnnl::memory::format_tag::ab);
@@ -311,10 +312,11 @@ void onednn_w8a16_fp8_impl(
     int64_t m,
     int64_t k,
     int64_t n,
-    const torch::Device& device
+    const torch::Device& device,
+    DT weight_type = DT::f8_e4m3
 ) {
     sycl::queue& queue = utils::get_queue(device);
-    auto state = get_or_create_fp8_primitive_state<InputType>(m, k, n, bias != nullptr, device, queue);
+    auto state = get_or_create_fp8_primitive_state<InputType>(m, k, n, bias != nullptr, device, queue, weight_type);
     dnnl::stream stream = dnnl::sycl_interop::make_stream(state->engine, queue);
 
     std::unordered_map<int, dnnl::memory> args = {
@@ -368,8 +370,8 @@ torch::Tensor onednn_w8a16_fp8(
         "x must have dtype float16 or bfloat16"
     );
     TORCH_CHECK(
-        weight.scalar_type() == ST::Float8_e4m3fn,
-        "weight must have dtype float8_e4m3fn"
+        weight.scalar_type() == ST::Float8_e4m3fn || weight.scalar_type() == ST::Float8_e5m2,
+        "weight must have dtype float8_e4m3fn or float8_e5m2"
     );
     TORCH_CHECK(scales.scalar_type() == ST::Float, "scales must have dtype float32");
 
@@ -426,6 +428,9 @@ torch::Tensor onednn_w8a16_fp8(
         return output;
     }
 
+    // Determine oneDNN weight data type from PyTorch scalar type
+    DT wt = (weight_materialized.scalar_type() == ST::Float8_e5m2) ? DT::f8_e5m2 : DT::f8_e4m3;
+
     auto dispatch = [&](auto fn, void* x_ptr, void* w_ptr, void* s_ptr, void* b_ptr, void* out_ptr, int64_t m_, int64_t k_, int64_t n_) {
         fn(
             x_ptr,
@@ -436,7 +441,8 @@ torch::Tensor onednn_w8a16_fp8(
             m_,
             k_,
             n_,
-            x_materialized.device()
+            x_materialized.device(),
+            wt
         );
     };
 
