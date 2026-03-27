@@ -225,6 +225,56 @@ Additionally, the `all_reduce` warmup in `vllm/v1/worker/xpu_worker.py` (lines ~
 - Expected Vulkan speed: similar ballpark (both are LPDDR5x bandwidth-bound for token generation)
 - vLLM advantage: continuous batching, OpenAI-compatible API, higher aggregate throughput
 
+## Running Recipes (MSI Claw 8 AI+)
+
+All services run on the same machine. Use `127.0.0.1` since OpenClaw/Lyra accesses them locally.
+
+### LLM — Qwen3-8B INT4 (port 8000)
+
+```bash
+vllm-activate
+vllm serve /shared/models/qwen3-8b-int4-autoround \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.8 \
+    --enforce-eager \
+    --max-model-len 8192 \
+    --allow-deprecated-quantization \
+    --host 127.0.0.1 --port 8000
+```
+
+### ASR — Qwen3-ASR-1.7B (port 8001)
+
+```bash
+vllm-activate
+vllm serve /shared/models/qwen3-asr-1.7b \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.25 \
+    --enforce-eager \
+    --max-model-len 2048 \
+    --trust-remote-code \
+    --host 127.0.0.1 --port 8001
+```
+
+Test: `curl http://127.0.0.1:8001/v1/audio/transcriptions -F file=@audio.wav -F model=/shared/models/qwen3-asr-1.7b`
+
+### TTS — Qwen3-TTS-1.7B (Python script)
+
+```bash
+source ~/qwen-tts-env/bin/activate
+oneapi
+python3 tts_generate.py
+```
+
+### Memory Budget (32GB LPDDR5x)
+
+| Service | GPU Memory | Notes |
+|---------|-----------|-------|
+| LLM (Qwen3-8B INT4) | ~22.9 GB (0.8 × 28.6) | 5.7GB model + KV cache |
+| ASR (Qwen3-ASR-1.7B) | ~7.2 GB (0.25 × 28.6) | 3.9GB model + KV cache |
+| TTS (Qwen3-TTS-1.7B) | ~2 GB | Loaded on demand |
+| **LLM + ASR together** | ~30 GB | Tight — reduce LLM to 0.7 |
+| **ASR + TTS together** | ~9 GB | Comfortable |
+
 ## Alternative: llama.cpp with Vulkan
 
 For simpler setup without the oneAPI stack, [llama.cpp with Vulkan](https://github.com/MegaStood/OpenClaw-on-MSI-Claw-8) is a proven alternative on Lunar Lake. The SYCL/vLLM path offers advantages for:
@@ -232,6 +282,49 @@ For simpler setup without the oneAPI stack, [llama.cpp with Vulkan](https://gith
 - OpenAI-compatible API serving
 - FP8/INT4 dynamic online quantization
 - Multimodal model support
+
+## Qwen3-ASR on Lunar Lake (vLLM XPU)
+
+**Model:** Qwen/Qwen3-ASR-1.7B (~3.9 GiB loaded)
+**VRAM:** ~7.2 GB with `--gpu-memory-utilization 0.25`
+**API:** OpenAI Whisper-compatible `/v1/audio/transcriptions`
+
+### Setup
+
+```bash
+# Download model
+huggingface-cli download Qwen/Qwen3-ASR-1.7B --local-dir /shared/models/qwen3-asr-1.7b
+```
+
+No separate venv needed — runs directly via vLLM.
+
+### Serve
+
+```bash
+vllm-activate
+vllm serve /shared/models/qwen3-asr-1.7b \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.25 \
+    --enforce-eager \
+    --max-model-len 2048 \
+    --trust-remote-code \
+    --host 127.0.0.1 --port 8001
+```
+
+### Test
+
+```bash
+curl http://127.0.0.1:8001/v1/audio/transcriptions \
+  -F file=@/path/to/audio.wav \
+  -F model=/shared/models/qwen3-asr-1.7b
+```
+
+### Notes
+
+- `0.25` GPU utilization is sufficient — allocates 30K+ tokens of KV cache (14x concurrency for 2048 token sequences)
+- `--trust-remote-code` is required for the ASR architecture
+- Init time: ~2.4 seconds (fast due to small model + low memory allocation)
+- Can run alongside TTS (~9GB combined) or alongside LLM (reduce LLM to 0.7 utilization)
 
 ## Qwen3-TTS on Lunar Lake (XPU)
 
