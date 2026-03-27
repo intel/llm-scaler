@@ -21,9 +21,15 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
   uint32_t headQ,
   uint32_t headKv,
   sycl::nd_item<2>& ndi) {
+  // Configuration from sdp_config.h
+  constexpr int WG_SZ    = Cfg::WG_SIZE;
+  constexpr int HD       = Cfg::HEAD_DIM;
+  constexpr int KV_T     = Cfg::KV_TILE;
+  constexpr int Q_GRP    = Cfg::Q_GROUP;
+
   constexpr float matMulQuantCoeff = 0.08838834764831844f;
   constexpr float attnScoreMul = matMulQuantCoeff * sycl::ext::intel::esimd::detail::log2e;
-  constexpr uint32_t slmSizeV = 2 * 64 * 128 * sizeof(fp16);
+  constexpr uint32_t slmSizeV = 2 * KV_T * HD * sizeof(fp16);
   constexpr uint32_t slmSize = slmSizeV;
   constexpr uint32_t baseOffsetInc16[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
   __ESIMD_NS::slm_init(slmSize);
@@ -56,20 +62,20 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
   simd<float, 16> fp32HistoricMaxTemp = FP32_MIN;
   simd<uint32_t, 16> baseOffsetInc16AsVector(baseOffsetInc16);
 
-  int32_t kvSeqOutLoopCount = (kvSeqLen + 63) / 64;
+  int32_t kvSeqOutLoopCount = (kvSeqLen + KV_T - 1) / KV_T;
 
-  uint32_t widthInByteQ = headQ * 128 * sizeof(fp16) - 1;
-  uint32_t widthInByteKV = headKv * 128 * sizeof(fp16) - 1;
+  uint32_t widthInByteQ = headQ * HD * sizeof(fp16) - 1;
+  uint32_t widthInByteKV = headKv * HD * sizeof(fp16) - 1;
   uint32_t heightQ = activationLength - 1;
   uint32_t heightKv = kvSeqLen - 1;
 
-  uint32_t qCoordX = headIdx * 128 >> 1;
-  uint32_t qCoordY = h * 256 + hhq * 16;
-  uint32_t kCoordX = kvHeadIdx * 128;
+  uint32_t qCoordX = headIdx * HD >> 1;
+  uint32_t qCoordY = h * Q_GRP + hhq * 16;
+  uint32_t kCoordX = kvHeadIdx * HD;
   uint32_t kCoordY = 0;
-  uint32_t vCoordX = kvHeadIdx * 128 + hhv * 32;
+  uint32_t vCoordX = kvHeadIdx * HD + hhv * 32;
   uint32_t vCoordY = vvv * 16;
-  uint32_t prefCoordX = (kvHeadIdx * 128 >> 1) + hhpref * 32;
+  uint32_t prefCoordX = (kvHeadIdx * HD >> 1) + hhpref * 32;
   uint32_t prefCoordYK = vvpref * 8;
 
   __ESIMD_ENS::config_2d_mem_access<fp16, 16, 16, 1> payloadK(
@@ -142,8 +148,8 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
   for (loopIdx = 0; loopIdx < kvSeqOutLoopCount - 1; loopIdx++) {
     uint32_t slmPingpongLoad = loopIdx & 0x1;
     uint32_t slmPingpongStore = (loopIdx + 1) & 0x1;
-    slmPingpongLoad = slmPingpongLoad * 64 * 128 * sizeof(fp16);
-    slmPingpongStore = slmPingpongStore * 64 * 128 * sizeof(fp16);
+    slmPingpongLoad = slmPingpongLoad * KV_T * HD * sizeof(fp16);
+    slmPingpongStore = slmPingpongStore * KV_T * HD * sizeof(fp16);
     auto tempQkAsFp16 = tempOutput.template bit_cast_view<fp16>();
     auto tempQkAsBf16 = tempOutput.template bit_cast_view<bf16>();
     simd<fp16, 512> fp16VState;
@@ -385,7 +391,7 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
   // ===== LAST LOOP - boundary checking =====
   {
     uint32_t slmPingpongLoad = (loopIdx) & 0x1;
-    slmPingpongLoad = slmPingpongLoad * 64 * 128 * sizeof(fp16);
+    slmPingpongLoad = slmPingpongLoad * KV_T * HD * sizeof(fp16);
     auto tempQkAsFp16 = tempOutput.template bit_cast_view<fp16>();
     auto tempQkAsBf16 = tempOutput.template bit_cast_view<bf16>();
     tempOutput = 0;
@@ -600,7 +606,7 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
   // Output normalization — fp16 accumulator, convert to bf16 at the end
   simd<float, 16> softMaxDividor;
   simd<float, 128> alphaV;
-  alphaV = block_load<float, 128>((float*)normAlpha + headIdx * 128);
+  alphaV = block_load<float, 128>((float*)normAlpha + headIdx * HD);
   simd<uint32_t, 16> simdOffsets;
   simd_mask<16> mask;
   softMaxDividor.select<16, 1>(0) = fp32SoftMaxTemp;
@@ -619,9 +625,9 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
   }
 
   simdOffsets = baseOffsetInc16AsVector;
-  simdOffsets = simdOffsets + 256 * h + 16 * hhq;
+  simdOffsets = simdOffsets + Q_GRP * h + 16 * hhq;
   mask = simdOffsets < activationLength;
-  simdOffsets = simdOffsets * headQ * 128 * sizeof(bf16) + headIdx * 128 * sizeof(bf16);
+  simdOffsets = simdOffsets * headQ * HD * sizeof(bf16) + headIdx * HD * sizeof(bf16);
   #pragma unroll
   for (int kk = 0; kk < 16; kk++) {
     __ESIMD_ENS::lsc_scatter<uint32_t, 4, __ESIMD_ENS::lsc_data_size::u32,
