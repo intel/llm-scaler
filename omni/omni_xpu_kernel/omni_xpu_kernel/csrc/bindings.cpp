@@ -17,6 +17,10 @@ namespace gguf {
     torch::Tensor dequantize_q8_0(const torch::Tensor& input, torch::ScalarType dtype);
     torch::Tensor dequantize_q4_k(const torch::Tensor& input, torch::ScalarType dtype);
     torch::Tensor dequantize_q6_k(const torch::Tensor& input, torch::ScalarType dtype);
+    std::vector<torch::Tensor> dequantize_batch(
+        const std::vector<torch::Tensor>& inputs,
+        const std::vector<std::string>& formats,
+        torch::ScalarType dtype);
 }
 namespace norm {
     torch::Tensor rms_norm(torch::Tensor weight, torch::Tensor input, double eps);
@@ -63,7 +67,15 @@ PYBIND11_MODULE(_C, m) {
     gguf.def("dequantize_q6_k", &omni_xpu::gguf::dequantize_q6_k,
         "Dequantize Q6_K tensor (210 bytes/block -> 256 elements)",
         py::arg("input"), py::arg("dtype") = torch::kFloat16);
-    
+
+    gguf.def("dequantize_batch", &omni_xpu::gguf::dequantize_batch,
+        "Batch dequantize multiple tensors in fewer kernel launches.\n"
+        "Groups tensors by format, concatenates, launches one kernel per format group,\n"
+        "then splits outputs. Reduces N submissions to num_format_types submissions.\n"
+        "Input: inputs=[tensor1, tensor2, ...], formats=['q4_0', 'q8_0', ...], dtype\n"
+        "Output: list of dequantized tensors in same order as inputs",
+        py::arg("inputs"), py::arg("formats"), py::arg("dtype") = torch::kFloat16);
+
     // Normalization
     auto norm = m.def_submodule("norm", "Normalization kernels");
     

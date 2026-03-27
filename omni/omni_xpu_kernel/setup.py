@@ -152,9 +152,10 @@ class ICPXBuildExt(build_ext):
             ]
             
             if is_lgrf:
+                device_target = os.environ.get("OMNI_XPU_DEVICE", "bmg")
                 cmd += [
                     "-fsycl-targets=spir64_gen",
-                    "-Xs", "-device ptl-h -options -doubleGRF",
+                    "-Xs", f"-device {device_target} -options -doubleGRF",
                     "/O2", "/DNDEBUG",
                     "-DBUILD_ESIMD_KERNEL_LIB",
                     "/LD",  # Create DLL
@@ -195,10 +196,12 @@ class ICPXBuildExt(build_ext):
             ]
             
             if is_lgrf:
+                # Device target: set OMNI_XPU_DEVICE env var to override
+                # Common values: bmg (Arc B-series), pvc (Data Center GPU Max), ptl-h (Panther Lake)
+                device_target = os.environ.get("OMNI_XPU_DEVICE", "bmg")
                 cmd += [
                     "-fsycl-targets=spir64_gen",
-                    # Fallback to pvc if ptl-h is not supported in the compiler
-                    "-Xs", "-device pvc -options -doubleGRF",
+                    "-Xs", f"-device {device_target} -options -doubleGRF",
                     "-O3", "-DNDEBUG",
                     "-DBUILD_ESIMD_KERNEL_LIB",
                     "-fPIC", "-shared",

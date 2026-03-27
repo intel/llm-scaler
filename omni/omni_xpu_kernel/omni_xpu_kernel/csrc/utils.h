@@ -28,13 +28,15 @@ inline sycl::queue& get_queue(const torch::Device& device) {
 }
 
 // Submit SYCL kernel with profiling support
+// Uses template to avoid std::function heap allocation and virtual dispatch overhead
+template<typename KernelFunc>
 inline sycl::event submit_kernel(
-    std::function<void(sycl::handler&)> kernel,
+    KernelFunc&& kernel,
     const at::Device& device,
     [[maybe_unused]] const char* desc
 ) {
     sycl::queue& queue = get_queue(device);
-    sycl::event event = queue.submit(kernel);
+    sycl::event event = queue.submit(std::forward<KernelFunc>(kernel));
 #if TORCH_VERSION_MAJOR >= 2 && TORCH_VERSION_MINOR >= 3
     // Profiler support for newer versions
     // xpu::profiler_record(desc, event);
