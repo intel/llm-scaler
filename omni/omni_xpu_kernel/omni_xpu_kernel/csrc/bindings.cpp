@@ -10,6 +10,8 @@
 // ============================================================================
 
 #include <torch/extension.h>
+#include <tuple>
+#include <optional>
 
 namespace omni_xpu {
 namespace gguf {
@@ -36,6 +38,11 @@ namespace svdq {
 }
 namespace rotary {
     torch::Tensor rotary_emb(const torch::Tensor& x, const torch::Tensor& cos_cache, const torch::Tensor& sin_cache, int64_t seq_len, int64_t heads);
+}
+namespace linear {
+    torch::Tensor onednn_w8a16_fp8(torch::Tensor input, torch::Tensor weight, torch::Tensor scale_w, std::optional<torch::Tensor> bias);
+    void fp8_cache_clear();
+    std::tuple<int64_t, int64_t, int64_t> fp8_cache_stats();
 }
 }
 
@@ -148,4 +155,20 @@ PYBIND11_MODULE(_C, m) {
         "Output: [total_rows, head_dim] same dtype as x",
         py::arg("x"), py::arg("cos_cache"), py::arg("sin_cache"),
         py::arg("seq_len"), py::arg("heads"));
+
+    // Linear
+    auto linear = m.def_submodule("linear", "Linear kernels");
+    linear.def("onednn_w8a16_fp8", &omni_xpu::linear::onednn_w8a16_fp8,
+        "FP8 GEMM using oneDNN (weight=E4M3, activation=FP16)",
+        py::arg("input"), py::arg("weight"), py::arg("scale_w"), py::arg("bias") = py::none());
+    linear.def("fp8_cache_clear", &omni_xpu::linear::fp8_cache_clear,
+        "Clear cached oneDNN FP8 primitives");
+    linear.def("fp8_cache_stats", []() {
+        auto [hits, misses, size] = omni_xpu::linear::fp8_cache_stats();
+        py::dict stats;
+        stats["hits"] = hits;
+        stats["misses"] = misses;
+        stats["size"] = size;
+        return stats;
+    }, "Get cached oneDNN FP8 primitive stats");
 }
