@@ -92,14 +92,15 @@ Not all model architectures work on Lunar Lake XPU. Key blockers discovered duri
 
 Only models meeting **all three** criteria work on Lunar Lake XPU:
 1. **Standard attention** (not fla/linear attention — avoids Triton dependency)
-2. **FP16/BF16 base weights** with **online quantization** (`--quantization fp8` or `--quantization int4`)
+2. **FP16/BF16 base weights** with **online quantization** (`--quantization fp8` or `--quantization int4`), OR **AutoRound INT4** pre-quantized (for models ≤8B)
 3. **Steady-state VRAM ≤ ~20GB** (leaving room for OS on 32GB shared memory)
 
 ### Recommended Models for 32GB Lunar Lake
 
 | Model | Quantization | VRAM Needed | Context | Notes |
 |-------|-------------|-------------|---------|-------|
-| Qwen3-8B | FP8 (online) | ~10GB | 32k | **Best choice** — standard attention, proven to load |
+| **Intel/Qwen3-8B-int4-AutoRound** | AutoRound INT4 | **5.69 GiB** | 8k | **Tested & working** — 17.6 tok/s single, 90 tok/s peak batched |
+| Qwen3-8B | FP8 (online) | ~10GB | 32k | Standard attention, online quantization |
 | DeepSeek-R1-Distill-Qwen-7B | FP8 (online) | ~8GB | 32k | Good reasoning |
 | Qwen3-14B | INT4 (online) | ~10GB | 16k | Needs `--quantization int4` |
 | Qwen3-8B | FP16 | ~18GB | 16k | No quantization loss |
@@ -187,6 +188,43 @@ Additionally, the `all_reduce` warmup in `vllm/v1/worker/xpu_worker.py` (lines ~
 10. **Marlin kernels CUDA-only** — AWQ and GPTQ models using compressed-tensors format route to Marlin repack kernels (`_C.gptq_marlin_repack`), which are NVIDIA CUDA kernels with no XPU equivalent. Pre-quantized AWQ/GPTQ models cannot be used on XPU.
 11. **Download FP16 base models** — The only reliable path on Lunar Lake is downloading FP16/BF16 base weights and using vLLM's online quantization (`--quantization fp8` or `--quantization int4`). This uses layer-by-layer loading without the 2x memory spike of pre-quantized formats.
 
+## Benchmark Results (vLLM SYCL on Lunar Lake)
+
+**Hardware:** MSI Claw 8 AI+ — Intel Core Ultra 7 258V, Arc 140V iGPU, 32GB LPDDR5x (136.5 GB/s)
+**Model:** Intel/Qwen3-8B-int4-AutoRound (5.7GB on disk, 5.69 GiB loaded)
+**Server config:** `--max-model-len 8192 --gpu-memory-utilization 0.8 --enforce-eager --allow-deprecated-quantization`
+**Tool:** `vllm bench serve` with random dataset, request rate 1.0
+
+### Throughput
+
+| Workload | Prompts | Output tok/s | Peak tok/s | Total tok/s |
+|----------|---------|-------------|-----------|------------|
+| 128 in / 128 out | 5 | 44.8 | 90.0 | 89.6 |
+| 1024 in / 1024 out | 5 | 54.0 | 80.0 | 108.0 |
+| 4096 in / 2048 out | 10 | 50.2 | 70.0 | 150.5 |
+
+### Latency
+
+| Workload | TTFT (mean) | TPOT (mean) | ITL (median) | P99 ITL |
+|----------|------------|------------|-------------|---------|
+| 128 in / 128 out | 3,846 ms | 56.7 ms | 56.1 ms | 61.4 ms |
+| 1024 in / 1024 out | 5,764 ms | 83.9 ms | 91.2 ms | 110.6 ms |
+| 4096 in / 2048 out | 20,978 ms | 186.4 ms | 173.8 ms | 233.5 ms |
+
+### Analysis
+
+- **Single-request generation:** ~17.6 tok/s (1000 / 56.7ms TPOT)
+- **Batched throughput scales well:** 90 tok/s peak with 5 concurrent short requests
+- **Bandwidth-bound:** TPOT scales ~linearly with KV cache size. Long context (4K+2K) is 3.3x slower than short (128+128) due to LPDDR5x read bandwidth limits
+- **TTFT scales with input length:** 3.8s (128 tokens) → 21s (4096 tokens) — prefill throughput ~820 tok/s
+- **Memory efficient:** Model uses 5.69 GiB, KV cache stays under 44% even with 10 concurrent long-context requests
+
+### Comparison Notes
+
+- For llama.cpp Vulkan comparison, use the same Qwen3-8B model in GGUF Q4_K_M format
+- Expected Vulkan speed: similar ballpark (both are LPDDR5x bandwidth-bound for token generation)
+- vLLM advantage: continuous batching, OpenAI-compatible API, higher aggregate throughput
+
 ## Alternative: llama.cpp with Vulkan
 
 For simpler setup without the oneAPI stack, [llama.cpp with Vulkan](https://github.com/MegaStood/OpenClaw-on-MSI-Claw-8) is a proven alternative on Lunar Lake. The SYCL/vLLM path offers advantages for:
@@ -197,4 +235,4 @@ For simpler setup without the oneAPI stack, [llama.cpp with Vulkan](https://gith
 
 ---
 
-*Updated: 2026-03-26*
+*Updated: 2026-03-27*
