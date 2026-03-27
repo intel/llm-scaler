@@ -215,10 +215,12 @@ torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
     int call_num = sdp_call_counter.fetch_add(1);
     bool needs_scaling;
     if (call_num % RECHECK_INTERVAL == 0) {
-        // Full check with sync — only on first call and every N calls
         float v_global_max = v.abs().max().item<float>();
         needs_scaling = (v_global_max >= V_SCALE_THRESHOLD);
         cached_needs_scaling.store(needs_scaling);
+        OMNI_DEBUG("sdp", "call #%d: V_max=%.1f threshold=%.0f needs_scaling=%d q=[%ld,%ld,%ld,%ld]",
+                   call_num, v_global_max, V_SCALE_THRESHOLD, needs_scaling,
+                   q.size(0), q.size(1), q.size(2), q.size(3));
     } else {
         needs_scaling = cached_needs_scaling.load();
     }
@@ -229,13 +231,13 @@ torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
     torch::Tensor effective_alpha; // keep alive if scaling
 
     if (needs_scaling) {
-        // Per-head V scaling: V_scaled = V / v_scale, normAlpha *= v_scale
-        // Mathematically exact: v_scale cancels in output normalization.
         auto v_absmax = v.abs().amax(/*dim=*/{0, 1, 3});  // [H] per-head max
         auto v_scale = (v_absmax.to(torch::kFloat) / 32.0f).clamp_min(1.0f);  // [H] fp32
 
         v_scaled = v / v_scale.view({1, 1, H, 1}).to(v.scalar_type());
         effective_alpha = norm_alpha * v_scale.repeat_interleave(128);
+        OMNI_DEBUG("sdp", "V-scaling applied: v_scale_max=%.2f V_scaled_max=%.1f",
+                   v_scale.max().item<float>(), v_scaled.abs().max().item<float>());
 
         v_ptr = v_scaled.data_ptr();
         alpha_ptr = effective_alpha.data_ptr();

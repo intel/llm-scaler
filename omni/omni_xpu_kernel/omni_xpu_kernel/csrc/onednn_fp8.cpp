@@ -102,8 +102,10 @@ std::unordered_map<FP8CacheKey, std::shared_ptr<FP8PrimitiveState>, FP8CacheKeyH
     return cache;
 }
 
+// Legacy FP8 debug — now routed through unified OMNI_DEBUG("fp8", ...)
+// OMNI_FP8_DEBUG still works: checked by OMNI_XPU_DEBUG=fp8 or OMNI_FP8_DEBUG=1
 bool fp8_debug_enabled() {
-    return std::getenv("OMNI_FP8_DEBUG") != nullptr;
+    return omni_xpu::debug::is_enabled("fp8") || std::getenv("OMNI_FP8_DEBUG") != nullptr;
 }
 
 int fp8_diag_stage() {
@@ -113,8 +115,7 @@ int fp8_diag_stage() {
 
 void fp8_debug_log(const char* message) {
     if (fp8_debug_enabled()) {
-        std::printf("[omni_xpu_kernel::linear::onednn_w8a16_fp8][debug] %s\n", message);
-        std::fflush(stdout);
+        OMNI_DEBUG("fp8", "%s", message);
     }
 }
 
@@ -259,6 +260,7 @@ std::shared_ptr<FP8PrimitiveState> get_or_create_fp8_primitive_state(
     auto it = cache.find(key);
     if (it != cache.end()) {
         ++counters.hits;
+        OMNI_DEBUG("fp8", "cache HIT (M=%ld K=%ld N=%ld hits=%ld)", m, k, n, counters.hits);
         return it->second;
     }
 
@@ -281,11 +283,12 @@ std::shared_ptr<FP8PrimitiveState> get_or_create_fp8_primitive_state(
         : dnnl::matmul::primitive_desc(engine, x_md, w_md, out_md, attr);
 
     const std::string impl = pd.impl_info_str();
+    OMNI_DEBUG("fp8", "cache MISS: impl=%s (M=%ld K=%ld N=%ld wtype=%d)",
+               impl.c_str(), m, k, n, static_cast<int>(weight_type));
     if (impl.find("ref") != std::string::npos) {
-        std::printf(
-            "[omni_xpu_kernel::linear::onednn_w8a16_fp8] WARNING: oneDNN selected reference implementation: %s\n",
-            impl.c_str()
-        );
+        // Always warn about reference fallback, even without debug enabled
+        std::fprintf(stderr, "[omni_xpu::fp8] WARNING: oneDNN reference impl for M=%ld K=%ld N=%ld: %s\n",
+                     m, k, n, impl.c_str());
     }
 
     auto state = std::make_shared<FP8PrimitiveState>(

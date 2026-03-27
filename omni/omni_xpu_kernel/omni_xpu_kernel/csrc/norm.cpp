@@ -598,10 +598,10 @@ torch::Tensor fused_rms_norm_linear(
     TORCH_CHECK(input.size(1) == norm_weight.size(0), "Input K must match norm_weight size");
     TORCH_CHECK(input.size(1) == proj_weight.size(1), "Input K must match proj_weight K");
 
-    // Step 1: RMSNorm — output stays on device, not returned to Python
-    auto normed = rms_norm(norm_weight, input, eps);
+    OMNI_DEBUG("norm", "fused_rms_norm_linear: input=[%ld,%ld] proj=[%ld,%ld]",
+               input.size(0), input.size(1), proj_weight.size(0), proj_weight.size(1));
 
-    // Step 2: Linear projection — reads normed data (warm in L3 cache)
+    auto normed = rms_norm(norm_weight, input, eps);
     // proj_weight is [N, K], we need normed @ proj_weight.T = [M, N]
     auto output = torch::mm(normed, proj_weight.t());
 
