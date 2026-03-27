@@ -26,6 +26,7 @@ namespace norm {
     torch::Tensor rms_norm(torch::Tensor weight, torch::Tensor input, double eps);
     torch::Tensor layer_norm(torch::Tensor input, std::optional<torch::Tensor> weight, std::optional<torch::Tensor> bias, double eps);
     void fused_add_rms_norm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
+    torch::Tensor fused_rms_norm_linear(torch::Tensor input, torch::Tensor norm_weight, torch::Tensor proj_weight, double eps);
 }
 namespace svdq {
     torch::Tensor dequantize_svdq_w4(const torch::Tensor& packed, const torch::Tensor& scales, torch::ScalarType out_dtype);
@@ -90,6 +91,14 @@ PYBIND11_MODULE(_C, m) {
     norm.def("fused_add_rms_norm", &omni_xpu::norm::fused_add_rms_norm,
         "Fused Add + RMSNorm using ESIMD optimization (in-place: residual += input, input = rmsnorm(residual) * weight)",
         py::arg("input"), py::arg("residual"), py::arg("weight"), py::arg("eps") = 1e-6);
+
+    norm.def("fused_rms_norm_linear", &omni_xpu::norm::fused_rms_norm_linear,
+        "Fused RMSNorm + Linear projection in single C++ call.\n"
+        "Chains norm and matmul without Python roundtrip, keeping normalized data in L3 cache.\n"
+        "output = RMSNorm(input, norm_weight, eps) @ proj_weight.T\n"
+        "Input: input [M, K], norm_weight [K], proj_weight [N, K]\n"
+        "Output: [M, N]",
+        py::arg("input"), py::arg("norm_weight"), py::arg("proj_weight"), py::arg("eps") = 1e-6);
 
     // SVDQuant W4A4 Dequantization/Quantization (nunchaku)
     auto svdq = m.def_submodule("svdq", "SVDQuant W4A4 dequantization and quantization kernels for nunchaku");
