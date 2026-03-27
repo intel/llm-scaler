@@ -190,11 +190,13 @@ PYBIND11_MODULE(_C, m) {
     linear.def("fp8_cache_stats", &omni_xpu::linear::fp8_cache_stats,
         "Return FP8 cache stats as (hits, misses, size)");
 
+    // Scaled Dot-Product Attention (ESIMD Flash Attention)
     auto sdp = m.def_submodule("sdp", "Scaled dot-product attention kernels");
     sdp.def("sdp", &omni_xpu::sdp::sdp,
-        "Standalone scaled dot-product attention for Intel XPU\n"
+        "ESIMD Flash Attention for Intel XPU\n"
         "Input: q/k/v [B, L, H, 128] fp16/bf16 contiguous on XPU\n"
-        "Current constraints: B == 1, head_dim == 128\n"
+        "Constraints: B == 1, head_dim == 128\n"
+        "V is automatically per-head scaled to prevent fp16 accumulator overflow.\n"
         "Output: [B, Lq, H, 128] same dtype as q",
         py::arg("q"), py::arg("k"), py::arg("v"));
 }

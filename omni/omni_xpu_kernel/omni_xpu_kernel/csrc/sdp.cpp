@@ -1,3 +1,16 @@
+// ============================================================================
+// SDP (Scaled Dot-Product Attention) - ESIMD Flash Attention via lgrf sidecar
+// ============================================================================
+// Loads the pre-compiled ESIMD Flash Attention kernel from a sidecar shared
+// library (lgrf_sdp.so / lgrf_sdp.pyd) built with doubleGRF for Xe2 ISA.
+//
+// The sidecar exports two C functions:
+//   sdp_fp16  — FP16 optimized Flash Attention
+//   sdp_bf16io — BF16 I/O hybrid (bf16 QK DPAS + fp16 SxV DPAS)
+//
+// Input layout: [B, L, H, 128] contiguous, B==1, head_dim==128
+// ============================================================================
+
 #include <filesystem>
 #include <mutex>
 #include <string>
@@ -175,6 +188,40 @@ torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
 
     auto& kernels = get_kernel_library();
     auto& norm_alpha = norm_alpha_cache(q);
+    const int64_t H = q.size(2);
+
+    // Per-head V scaling to prevent fp16 accumulator overflow in ESIMD kernel.
+    //
+    // The kernel's S×V DPAS uses fp16 accumulation. Large V values cause the
+    // unnormalized weighted sum to exceed fp16 max (65504), producing inf.
+    //
+    // Fix: divide V per-head by v_scale, fold v_scale into normAlpha (fp32).
+    // The kernel's fp32 normalization step applies: out = finalOutput * normAlpha / softmax_sum
+    //   = softmax(QK^T) × (V/v_scale) × (normAlpha×v_scale) / sum
+    //   = softmax(QK^T) × V × normAlpha / sum    [exact cancellation]
+    //
+    // Per-head scaling is more precise than global scalar — heads with small V
+    // values are not unnecessarily scaled down.
+    auto v_absmax = v.abs().amax(/*dim=*/{0, 1, 3});  // [H] per-head max
+    auto v_scale = (v_absmax.to(torch::kFloat) / 32.0f).clamp_min(1.0f);  // [H] fp32
+
+    // Scale V per-head: V_scaled[b,l,h,d] = V[b,l,h,d] / v_scale[h]
+    auto v_scaled = v / v_scale.view({1, 1, H, 1}).to(v.scalar_type());
+
+    // Fold v_scale into normAlpha: effective[h*128+d] = alpha[h*128+d] * v_scale[h]
+    auto effective_alpha = norm_alpha * v_scale.repeat_interleave(128);
+
+    // Debug: log V scaling info for first few calls
+    static int _sdp_call_count = 0;
+    _sdp_call_count++;
+    if (_sdp_call_count <= 3) {
+        auto v_orig_max = v.abs().max().item<float>();
+        auto v_scaled_max = v_scaled.abs().max().item<float>();
+        auto v_scale_max = v_scale.max().item<float>();
+        fprintf(stderr, "[SDP C++] call #%d: V_orig_max=%.1f, v_scale_max=%.1f, V_scaled_max=%.1f, H=%ld\n",
+                _sdp_call_count, v_orig_max, v_scale_max, v_scaled_max, H);
+    }
+
     auto out = torch::empty_like(q);
     sycl::queue& queue = utils::get_queue(q.device());
 
@@ -183,8 +230,8 @@ torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
             kernels.fp16(
                 q.data_ptr(),
                 k.data_ptr(),
-                v.data_ptr(),
-                norm_alpha.data_ptr(),
+                v_scaled.data_ptr(),
+                effective_alpha.data_ptr(),
                 out.data_ptr(),
                 static_cast<int>(q.size(1)),
                 static_cast<int>(k.size(1)),
@@ -196,8 +243,8 @@ torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
             kernels.bf16io(
                 q.data_ptr(),
                 k.data_ptr(),
-                v.data_ptr(),
-                norm_alpha.data_ptr(),
+                v_scaled.data_ptr(),
+                effective_alpha.data_ptr(),
                 out.data_ptr(),
                 static_cast<int>(q.size(1)),
                 static_cast<int>(k.size(1)),
