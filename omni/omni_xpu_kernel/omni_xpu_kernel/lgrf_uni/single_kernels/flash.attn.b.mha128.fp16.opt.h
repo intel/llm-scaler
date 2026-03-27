@@ -281,22 +281,12 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
       }
     }
 
-    barrier();  // ensures previous iter's SLM scatter is visible
+    barrier();  // moved before compensation — SLM ready, comp ALU can overlap with SLM loads
 
     // ===== Interleaved compensation + S×V by output-dim half =====
-    // Pipeline: issue first SLM load BEFORE compensation so load latency
-    // overlaps with compensation ALU work (they use disjoint registers).
     {
       // --- l=0: finalOutput[0..1023] ---
-      // Pre-load first V block (nn=0) — SLM load issued early
-      #pragma unroll
-      for (int ll = 0; ll < 2; ll++) {
-        tempQkAsFp16.select<512, 1>(1024 + 512 * ll) =
-          slm_block_load<fp16, 512>(slmOffsetBaseV +
-            slmPingpongLoad +
-            512 * ll * sizeof(fp16));
-      }
-      // Compensate l=0 half — fp32 multiply + clamp (overlaps with SLM load above)
+      // Compensate l=0 half — fp32 multiply + clamp to prevent fp16 overflow
       #pragma unroll
       for (int kk = 0; kk < 32; kk++) {
         simd<float, 32> f32tmp = finalOutput.select<32, 1>(32 * kk);
@@ -307,35 +297,26 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
         finalOutput.select<32, 1>(32 * kk) = simd<fp16, 32>(f32tmp);
       }
       // Block 1 (V rows 0-31), l=0
-      // nn=0: V data already loaded above
       #pragma unroll
-      for (int ll = 0; ll < 8; ll++) {
-        auto ccTile = finalOutput.select<128, 1>(128 * ll);
-        auto aaTile = tempBufferAsFp16.select<256, 1>(0);
-        auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
-        ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
-          simd<fp16, 128>(ccTile.data()),
-          simd<fp16, 256>(aaTile.data()),
-          simd<fp16, 128>(bbTile.data()));
-      }
-      // nn=1: load then DPAS
-      #pragma unroll
-      for (int ll = 0; ll < 2; ll++) {
-        tempQkAsFp16.select<512, 1>(1024 + 512 * ll) =
-          slm_block_load<fp16, 512>(slmOffsetBaseV +
-            slmPingpongLoad +
-            16 * 128 * sizeof(fp16) +
-            512 * ll * sizeof(fp16));
-      }
-      #pragma unroll
-      for (int ll = 0; ll < 8; ll++) {
-        auto ccTile = finalOutput.select<128, 1>(128 * ll);
-        auto aaTile = tempBufferAsFp16.select<256, 1>(256);
-        auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
-        ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
-          simd<fp16, 128>(ccTile.data()),
-          simd<fp16, 256>(aaTile.data()),
-          simd<fp16, 128>(bbTile.data()));
+      for (int nn = 0; nn < 2; nn++) {
+        #pragma unroll
+        for (int ll = 0; ll < 2; ll++) {
+          tempQkAsFp16.select<512, 1>(1024 + 512 * ll) =
+            slm_block_load<fp16, 512>(slmOffsetBaseV +
+              slmPingpongLoad +
+              16 * 128 * nn * sizeof(fp16) +
+              512 * ll * sizeof(fp16));
+        }
+        #pragma unroll
+        for (int ll = 0; ll < 8; ll++) {
+          auto ccTile = finalOutput.select<128, 1>(128 * ll);
+          auto aaTile = tempBufferAsFp16.select<256, 1>(256 * nn);
+          auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
+          ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
+            simd<fp16, 128>(ccTile.data()),
+            simd<fp16, 256>(aaTile.data()),
+            simd<fp16, 128>(bbTile.data()));
+        }
       }
       // Block 2 (V rows 32-63), l=0
       #pragma unroll
@@ -362,16 +343,7 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
       }
 
       // --- l=1: finalOutput[1024..2047] ---
-      // Pre-load first V block for l=1 (nn=0) — SLM load issued early
-      #pragma unroll
-      for (int ll = 0; ll < 2; ll++) {
-        tempQkAsFp16.select<512, 1>(1024 + 512 * ll) =
-          slm_block_load<fp16, 512>(slmOffsetBaseV +
-            slmPingpongLoad +
-            16 * 64 * sizeof(fp16) +
-            512 * ll * sizeof(fp16));
-      }
-      // Compensate l=1 half — fp32 multiply + clamp (overlaps with SLM load above)
+      // Compensate l=1 half — fp32 multiply + clamp
       #pragma unroll
       for (int kk = 32; kk < 64; kk++) {
         simd<float, 32> f32tmp = finalOutput.select<32, 1>(32 * kk);
@@ -382,36 +354,27 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
         finalOutput.select<32, 1>(32 * kk) = simd<fp16, 32>(f32tmp);
       }
       // Block 1 (V rows 0-31), l=1
-      // nn=0: V data already pre-loaded above
       #pragma unroll
-      for (int ll = 0; ll < 8; ll++) {
-        auto ccTile = finalOutput.select<128, 1>(1024 + 128 * ll);
-        auto aaTile = tempBufferAsFp16.select<256, 1>(0);
-        auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
-        ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
-          simd<fp16, 128>(ccTile.data()),
-          simd<fp16, 256>(aaTile.data()),
-          simd<fp16, 128>(bbTile.data()));
-      }
-      // nn=1: load then DPAS
-      #pragma unroll
-      for (int ll = 0; ll < 2; ll++) {
-        tempQkAsFp16.select<512, 1>(1024 + 512 * ll) =
-          slm_block_load<fp16, 512>(slmOffsetBaseV +
-            slmPingpongLoad +
-            16 * 128 * sizeof(fp16) +
-            16 * 64 * sizeof(fp16) +
-            512 * ll * sizeof(fp16));
-      }
-      #pragma unroll
-      for (int ll = 0; ll < 8; ll++) {
-        auto ccTile = finalOutput.select<128, 1>(1024 + 128 * ll);
-        auto aaTile = tempBufferAsFp16.select<256, 1>(256);
-        auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
-        ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
-          simd<fp16, 128>(ccTile.data()),
-          simd<fp16, 256>(aaTile.data()),
-          simd<fp16, 128>(bbTile.data()));
+      for (int nn = 0; nn < 2; nn++) {
+        #pragma unroll
+        for (int ll = 0; ll < 2; ll++) {
+          tempQkAsFp16.select<512, 1>(1024 + 512 * ll) =
+            slm_block_load<fp16, 512>(slmOffsetBaseV +
+              slmPingpongLoad +
+              16 * 128 * nn * sizeof(fp16) +
+              16 * 64 * sizeof(fp16) +
+              512 * ll * sizeof(fp16));
+        }
+        #pragma unroll
+        for (int ll = 0; ll < 8; ll++) {
+          auto ccTile = finalOutput.select<128, 1>(1024 + 128 * ll);
+          auto aaTile = tempBufferAsFp16.select<256, 1>(256 * nn);
+          auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
+          ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
+            simd<fp16, 128>(ccTile.data()),
+            simd<fp16, 256>(aaTile.data()),
+            simd<fp16, 128>(bbTile.data()));
+        }
       }
       // Block 2 (V rows 32-63), l=1
       #pragma unroll

@@ -1,13 +1,12 @@
 // BF16-IO Flash Attention kernel — bf16 input/output, hybrid bf16/fp16 internal
 // Strategy: Q/K stay bf16 (no conversion), V converted bf16→fp16 before SLM scatter.
 //   QK uses bf16 DPAS (same throughput), SxV uses fp16 DPAS + fp16 accumulator.
-//   Compensation is native fp16 multiply (no bf16 ALU overhead).
+//   Compensation is overflow-safe fp32 multiply + clamp.
 //   Only 512 bf16→fp16 conversions per loop iteration (V only), vs 8192 for K-converting approach.
+//   Fast exp2 approximation for softmax (~3x faster than hw exp2).
 //
 // QK DPAS: dpas<8,8,float,float,bf16,bf16> (bf16 inputs, fp32 accum for softmax precision)
 // S×V DPAS: dpas<8,8,fp16,fp16,fp16,fp16> (fp16 inputs, fp16 accum — native compensation)
-// Softmax weights: packed as fp16 VNNI (same as fp16 kernel)
-// Non-causal only.
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 
