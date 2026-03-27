@@ -8,10 +8,11 @@ Optimised SYCL/ESIMD kernels for Intel GPUs:
 * **svdq** — SVDQuant W4A4: ESIMD dequant, oneDNN INT4 GEMM, fused post-processing
 * **rotary** — Fused rotary position embedding
 * **sdp** — Standalone scaled dot-product attention
+* **linear** — FP8 GEMM (oneDNN W8A16, E4M3/E5M2)
 
 Usage::
 
-    from omni_xpu_kernel import svdq, norm, rotary, gguf, sdp
+    from omni_xpu_kernel import svdq, norm, rotary, gguf, sdp, linear
 """
 
 import os
@@ -56,6 +57,7 @@ from . import norm
 from . import svdq
 from . import rotary
 from . import sdp
+from . import linear
 
 __all__ = [
     "gguf",
@@ -63,6 +65,7 @@ __all__ = [
     "svdq",
     "rotary",
     "sdp",
+    "linear",
     "is_available",
     "__version__",
 ]

@@ -45,6 +45,11 @@ namespace rotary {
 namespace sdp {
     torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v);
 }
+namespace linear {
+    torch::Tensor onednn_w8a16_fp8(torch::Tensor input, torch::Tensor weight, torch::Tensor scale_w, std::optional<torch::Tensor> bias);
+    void fp8_cache_clear();
+    std::tuple<int64_t, int64_t, int64_t> fp8_cache_stats();
+}
 }
 
 PYBIND11_MODULE(_C, m) {
@@ -172,6 +177,18 @@ PYBIND11_MODULE(_C, m) {
         "Output: [total_rows, head_dim] same dtype as x",
         py::arg("x"), py::arg("cos_cache"), py::arg("sin_cache"),
         py::arg("seq_len"), py::arg("heads"));
+
+    // FP8 Linear (oneDNN W8A16)
+    auto linear = m.def_submodule("linear", "FP8 linear kernels");
+    linear.def("onednn_w8a16_fp8", &omni_xpu::linear::onednn_w8a16_fp8,
+        "FP8 GEMM: W8A16 matmul with E4M3/E5M2 weights via oneDNN.\n"
+        "Input: x [M, K] fp16/bf16, weight [N, K] float8, scales [N] f32\n"
+        "Output: [M, N] same dtype as x",
+        py::arg("input"), py::arg("weight"), py::arg("scale_w"), py::arg("bias") = py::none());
+    linear.def("fp8_cache_clear", &omni_xpu::linear::fp8_cache_clear,
+        "Clear FP8 primitive cache");
+    linear.def("fp8_cache_stats", &omni_xpu::linear::fp8_cache_stats,
+        "Return FP8 cache stats as (hits, misses, size)");
 
     auto sdp = m.def_submodule("sdp", "Scaled dot-product attention kernels");
     sdp.def("sdp", &omni_xpu::sdp::sdp,
