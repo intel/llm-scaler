@@ -1,10 +1,9 @@
 diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
 --- a/vllm/model_executor/models/registry.py
 +++ b/vllm/model_executor/models/registry.py
-@@ -1126,7 +1126,8 @@
-
-         input_bytes = cloudpickle.dumps((fn, output_filepath))
-
+@@ -1144,7 +1144,8 @@
+         # cannot use `sys.executable __file__` here because the script
+         # contains relative imports
          returned = subprocess.run(
 -            _SUBPROCESS_COMMAND, input=input_bytes, capture_output=True
 +            _SUBPROCESS_COMMAND, input=input_bytes, capture_output=True,
