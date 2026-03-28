@@ -42,6 +42,7 @@ RUN apt-get update -y && \
 
 WORKDIR /llm
 COPY ./patches/vllm_for_multi_arc.patch /tmp/
+COPY ./patches/fix_registry_subprocess_env.patch /tmp/
 # COPY ./patches/miner-u.patch /tmp/
 
 # Set environment variables early
@@ -57,6 +58,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git clone -b v0.14.0 https://github.com/vllm-project/vllm.git && \
     cd vllm && \
     git apply /tmp/vllm_for_multi_arc.patch && \
+    git apply /tmp/fix_registry_subprocess_env.patch && \
     pip install -r requirements/xpu.txt && \
     pip install arctic-inference==0.1.1 && \
     # pip install --no-cache-dir arctic-inference==0.1.1 && \
