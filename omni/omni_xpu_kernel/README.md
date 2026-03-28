@@ -2,9 +2,9 @@
 
 High-performance Intel XPU ESIMD kernels for PyTorch.
 
-## Features
+## Modules
 
-### GGUF Dequantization
+### gguf — GGUF Dequantization
 
 | Format | Block Size | Elements |
 |--------|------------|----------|
@@ -13,81 +13,89 @@ High-performance Intel XPU ESIMD kernels for PyTorch.
 | Q4_K   | 144 bytes  | 256      |
 | Q6_K   | 210 bytes  | 256      |
 
-### Normalization Kernels
-- RMSNorm and LayerNorm
-- Supports fp32, fp16, bf16
-- Hidden size up to 8192
+```python
+from omni_xpu_kernel import gguf
+
+output = gguf.dequantize_q4_0(quantized, torch.float16)
+output = gguf.dequantize_q8_0(quantized, torch.float16)
+output = gguf.dequantize_q4_k(quantized, torch.float16)
+output = gguf.dequantize_q6_k(quantized, torch.float16)
+```
+
+### norm — Normalization
+
+RMSNorm, LayerNorm, and fused Add+RMSNorm using ESIMD.
+Supports fp32/fp16/bf16, hidden_size ≤ 8192 (divisible by 32).
+
+```python
+from omni_xpu_kernel import norm
+
+output = norm.rms_norm(weight, input, eps=1e-6)
+output = norm.layer_norm(input, weight=weight, bias=None, eps=1e-5)
+norm.fused_add_rms_norm(input, residual, weight, eps=1e-6)  # in-place
+```
+
+### svdq — SVDQuant W4A4
+
+INT4 weight dequantization, activation quantization, and oneDNN fused
+dequant+GEMM for SVDQuant W4A4 inference.
+
+```python
+from omni_xpu_kernel import svdq
+
+# ESIMD dequantization
+dequantized = svdq.dequantize_w4(packed, scales, out_dtype=torch.bfloat16)
+unpacked = svdq.unpack_int4(packed, signed=True)
+packed_act, act_scales = svdq.quantize_act_int4(activation, group_size=64)
+
+# oneDNN INT4 GEMM (pre-convert weights once, then use preconverted variant)
+packed_u4, scales_f16 = svdq.prepare_onednn_weights(packed, wscales)
+output = svdq.onednn_int4_gemm_preconverted(act_f16, packed_u4, scales_f16)
+
+# Fused f16→bf16 convert + add
+svdq.fused_convert_add(out_bf16, result_f16, residual_bf16)
+```
+
+### rotary — Rotary Position Embedding
+
+Fused bf16→f32 + rotary rotation + f32→bf16 in a single ESIMD kernel.
+
+```python
+from omni_xpu_kernel import rotary
+
+output = rotary.rotary_emb(x, cos_cache, sin_cache, seq_len, heads)
+```
 
 ## Requirements
 
-- Intel oneAPI DPC++/C++ Compiler
-- PyTorch >= 2.0 with XPU support
-- CMake >= 3.18
+- Intel oneAPI DPC++/C++ Compiler (icpx)
+- PyTorch ≥ 2.0 with XPU support
+- oneDNN (for INT4 GEMM; auto-detected from oneAPI)
 
 ## Installation
 
 ```bash
-# Source Intel oneAPI environment
 source /opt/intel/oneapi/setvars.sh
-
-# Install
-pip install . --no-build-isolation
+pip install -e . --no-build-isolation
 ```
 
-## Usage
+On Windows, see [WHL_BUILD_INSTALL.md](WHL_BUILD_INSTALL.md).
 
-### GGUF Dequantization
+## Tests & Benchmarks
 
-```python
-import torch
-from omni_xpu_kernel import gguf
+```bash
+# Correctness tests
+python -m pytest tests/
 
-# Q4_0: 18 bytes -> 32 elements
-quantized_q4_0 = torch.randint(0, 256, (1000 * 18,), dtype=torch.uint8, device="xpu")
-output = gguf.dequantize_q4_0(quantized_q4_0, torch.float16)
+# All kernel benchmarks
+python -m tests.benchmarks.run_all
 
-# Q8_0: 34 bytes -> 32 elements
-quantized_q8_0 = torch.randint(0, 256, (1000 * 34,), dtype=torch.uint8, device="xpu")
-output = gguf.dequantize_q8_0(quantized_q8_0, torch.float16)
-
-# Q4_K: 144 bytes -> 256 elements
-quantized_q4_k = torch.randint(0, 256, (1000 * 144,), dtype=torch.uint8, device="xpu")
-output = gguf.dequantize_q4_k(quantized_q4_k, torch.float16)
-
-# Q6_K: 210 bytes -> 256 elements
-quantized_q6_k = torch.randint(0, 256, (1000 * 210,), dtype=torch.uint8, device="xpu")
-output = gguf.dequantize_q6_k(quantized_q6_k, torch.float16)
+# Individual benchmarks
+python -m tests.benchmarks.run_all --svdq
+python -m tests.benchmarks.run_all --onednn
+python -m tests.benchmarks.run_all --rmsnorm
+python -m tests.benchmarks.run_all --rotary
 ```
-
-### Normalization
-
-```python
-import torch
-from omni_xpu_kernel import norm
-
-input = torch.randn(32, 4096, device="xpu", dtype=torch.float16)
-weight = torch.ones(4096, device="xpu", dtype=torch.float16)
-
-# RMSNorm
-output = norm.rms_norm(weight, input, eps=1e-6)
-
-# LayerNorm
-output = norm.layer_norm(input, weight=weight, bias=None, eps=1e-5)
-```
-
-## API Reference
-
-### gguf module
-
-- `dequantize_q4_0(input, dtype=torch.float16)` - Q4_0 dequantization
-- `dequantize_q8_0(input, dtype=torch.float16)` - Q8_0 dequantization
-- `dequantize_q4_k(input, dtype=torch.float16)` - Q4_K dequantization
-- `dequantize_q6_k(input, dtype=torch.float16)` - Q6_K dequantization
-
-### norm module
-
-- `rms_norm(weight, input, eps=1e-6)` - RMSNorm
-- `layer_norm(input, weight=None, bias=None, eps=1e-5)` - LayerNorm
 
 ## License
 
