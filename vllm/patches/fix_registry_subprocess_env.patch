@@ -1,13 +1,18 @@
 diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
 --- a/vllm/model_executor/models/registry.py
 +++ b/vllm/model_executor/models/registry.py
-@@ -1144,7 +1144,8 @@
+@@ -1144,7 +1144,11 @@
          # cannot use `sys.executable __file__` here because the script
          # contains relative imports
++        # On XPU, the subprocess must not initialize SYCL/Level Zero
++        # devices. Force CPU target to avoid the SYCL "No device of
++        # requested type available" crash during model inspection.
++        sub_env = os.environ.copy()
++        sub_env["VLLM_TARGET_DEVICE"] = "cpu"
          returned = subprocess.run(
 -            _SUBPROCESS_COMMAND, input=input_bytes, capture_output=True
 +            _SUBPROCESS_COMMAND, input=input_bytes, capture_output=True,
-+            env=os.environ.copy(),
++            env=sub_env,
          )
 
          # check if the subprocess is successful
