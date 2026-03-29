@@ -389,6 +389,44 @@ sf.write("output.wav", wavs[0], sr)
 - Can run simultaneously with vLLM — TTS uses ~2GB, leaving plenty for LLM serving
 - `transformers==4.57.3` is required (newer versions break the `check_model_inputs` decorator)
 
+## Meteor Lake / Arrow Lake Compatibility
+
+The vLLM XPU stack also works on other Intel iGPU platforms with shared system memory. An install script is provided for these platforms.
+
+### Supported Platforms
+
+| Platform | Architecture | Example CPUs | iGPU | PCI Device IDs | Install Script |
+|----------|-------------|-------------|------|----------------|---------------|
+| **Lunar Lake** | Xe2 | Core Ultra 258V, 238V | Arc 140V | `64a0` | `install_lunar_lake.sh` |
+| **Meteor Lake** | Xe-LPG | Core Ultra 155H, 135H | Arc Graphics | `7d55`, `7dd5`, `7d40`, `7d45` | `install_meteor_arrow_lake.sh` |
+| **Arrow Lake-H** | Xe-LPG+ | Core Ultra 255H, 245H | Arc 130T/140T | `7d51`, `7dd1`, `7d41`, `7d67` | `install_meteor_arrow_lake.sh` |
+
+### Meteor Lake Notes
+
+- Meteor Lake uses **i915 driver by default**. For SYCL/oneAPI XPU support, switch to the `xe` driver:
+  ```
+  # Add to GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub:
+  i915.force_probe=!<device_id> xe.force_probe=<device_id>
+  ```
+- Some Meteor Lake laptops ship with **single-channel RAM** (16GB), which limits both iGPU performance and model size. Dual-channel is strongly recommended.
+- Arc Graphics branding (device `7d55`) requires dual-channel memory + OEM enablement. Single-channel configs show as "Intel Graphics" (`7dd5`).
+
+### Arrow Lake-H Notes
+
+- Arrow Lake uses the `xe` driver by default on kernel 6.8+.
+- Arrow Lake-H laptops support up to **96GB DDR5**, giving significantly more headroom for models compared to Lunar Lake's 32GB.
+- The Arc 130T/140T iGPU has similar Xe-core count to Lunar Lake's Arc 140V.
+
+### Install
+
+```bash
+cd llm-scaler/vllm/scripts
+chmod +x install_meteor_arrow_lake.sh
+./install_meteor_arrow_lake.sh
+```
+
+The script auto-detects your platform and adjusts memory recommendations accordingly.
+
 ---
 
-*Updated: 2026-03-27*
+*Updated: 2026-03-29*
