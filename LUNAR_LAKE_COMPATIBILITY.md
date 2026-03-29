@@ -87,7 +87,7 @@ Not all model architectures work on Lunar Lake XPU. Key blockers discovered duri
 | **Triton XPU backend broken on Xe2** | Qwen3.5 (all sizes) | `triton.backends` fails to import; `@triton.jit` kernels don't launch. Qwen3.5 uses fla/linear attention ops written entirely as Triton kernels. |
 | **Marlin kernels are CUDA-only** | AWQ, GPTQ (compressed-tensors format) | `gptq_marlin_repack` is an NVIDIA CUDA kernel. AWQ/GPTQ MoE models route to `CompressedTensorsWNA16MarlinMoEMethod`. |
 | **Pre-quantized 2x memory** | AutoRound, GPTQ (>14B) | Loading INT4→FP16 intermediate doubles peak memory. 35B models OOM on 32GB. |
-| **transformers 5.x vs vLLM mismatch** | Qwen3.5 multimodal models | vLLM pins `transformers<5`. Upgrading to 5.5.0.dev0 enables `qwen3_5`/`glm4_moe_lite` architecture recognition but breaks `Qwen2VLImageProcessor.max_pixels` API. Catch-22: 4.x can't recognize, 5.x breaks the image processor. |
+| **transformers 5.x `max_pixels` rename** | Qwen3.5 multimodal models | vLLM pins `transformers<5`. Upgrading to 5.x enables `qwen3_5`/`glm4_moe_lite` architecture recognition but renames `image_processor.max_pixels` → `size["longest_edge"]`. Fix: `getattr()` fallback in `qwen2_vl.py` (see limitation #12). Intel's Docker image applies `vllm_for_multi_arc.patch` which includes full Qwen3.5 support. |
 
 ### What DOES Work
 
@@ -117,7 +117,7 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 | Qwen3.5-35B-A3B AutoRound | AutoRound INT4 | OOM (14GB on disk → ~28GB peak) |
 | Qwen3-30B-A3B GPTQ INT4 | GPTQ INT4 | Loads 15.7 GiB via IPEX, OOM during MoE expert weight shuffle → DEVICE_LOST |
 | Qwen3-Coder-30B-A3B AWQ | AWQ 4-bit | Marlin CUDA kernel missing (same as GLM AWQ) |
-| Qwen3.5-4B AutoRound INT4 | AutoRound | transformers 5.x breaks vLLM's `Qwen2VLImageProcessor.max_pixels` — multimodal model incompatibility |
+| Qwen3.5-4B AutoRound INT4 | AutoRound | transformers 5.x renames `max_pixels` → `size["longest_edge"]` — fixable with `getattr()` patch (see limitation #12) |
 | LFM2-24B-A2B AWQ | AWQ 4-bit | Custom Liquid AI tokenizer (`TokenizersBackend`) not supported |
 | Any MLX format | MLX | Apple Silicon only (Metal GPU framework) |
 
@@ -192,7 +192,16 @@ Additionally, the `all_reduce` warmup in `vllm/v1/worker/xpu_worker.py` (lines ~
 9. **Triton XPU broken on Xe2** — The `triton-xpu` package installs but `triton.backends` fails to import on Lunar Lake. Any model architecture using `@triton.jit` kernels (e.g., Qwen3.5's fla/linear attention) will crash with `TypeError: 'function' object is not subscriptable`. This is a triton-xpu packaging/driver issue, not a vLLM bug.
 10. **Marlin kernels CUDA-only** — AWQ and GPTQ models using compressed-tensors format route to Marlin repack kernels (`_C.gptq_marlin_repack`), which are NVIDIA CUDA kernels with no XPU equivalent. Pre-quantized AWQ/GPTQ models cannot be used on XPU.
 11. **Download FP16 base models** — The only reliable path on Lunar Lake is downloading FP16/BF16 base weights and using vLLM's online quantization (`--quantization fp8` or `--quantization int4`). This uses layer-by-layer loading without the 2x memory spike of pre-quantized formats.
-12. **transformers version catch-22** — vLLM pins `transformers<5,>=4.56.0`. Newer model architectures (Qwen3.5 `qwen3_5`, GLM-4.7 `glm4_moe_lite`) require transformers 5.5.0.dev0+ for recognition. However, upgrading breaks vLLM's multimodal code (`Qwen2VLImageProcessor.max_pixels` removed in 5.x). Qwen3-8B (text-only, `qwen3` architecture) works fine with either version. Upgrading is safe for text-only models but blocks multimodal Qwen3.5 models.
+12. **transformers 5.x `max_pixels` rename** — vLLM pins `transformers<5,>=4.56.0`. Upgrading to 5.x for Qwen3.5/GLM-4.7 architecture recognition breaks `Qwen2VLImageProcessor.max_pixels` — the attribute was renamed to `size["longest_edge"]` (and `min_pixels` to `size["shortest_edge"]`). Intel's llm-scaler Docker image installs transformers from git HEAD and applies `vllm_for_multi_arc.patch` which adds full Qwen3.5 support. On a native install without the patch, apply the one-line fix below:
+    ```python
+    # In vllm/model_executor/models/qwen2_vl.py, line ~944
+    # Change:
+    max_pixels = image_processor.max_pixels or image_processor.size["longest_edge"]
+    # To:
+    max_pixels = getattr(image_processor, "max_pixels", None) or image_processor.size["longest_edge"]
+    # Same for min_pixels on the next line:
+    min_pixels = getattr(image_processor, "min_pixels", None) or image_processor.size["shortest_edge"]
+    ```
 
 ## Benchmark Results (vLLM SYCL on Lunar Lake)
 
