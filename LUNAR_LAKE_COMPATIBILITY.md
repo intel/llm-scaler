@@ -87,6 +87,7 @@ Not all model architectures work on Lunar Lake XPU. Key blockers discovered duri
 | **Triton XPU backend broken on Xe2** | Qwen3.5 (all sizes) | `triton.backends` fails to import; `@triton.jit` kernels don't launch. Qwen3.5 uses fla/linear attention ops written entirely as Triton kernels. |
 | **Marlin kernels are CUDA-only** | AWQ, GPTQ (compressed-tensors format) | `gptq_marlin_repack` is an NVIDIA CUDA kernel. AWQ/GPTQ MoE models route to `CompressedTensorsWNA16MarlinMoEMethod`. |
 | **Pre-quantized 2x memory** | AutoRound, GPTQ (>14B) | Loading INT4→FP16 intermediate doubles peak memory. 35B models OOM on 32GB. |
+| **transformers 5.x vs vLLM mismatch** | Qwen3.5 multimodal models | vLLM pins `transformers<5`. Upgrading to 5.5.0.dev0 enables `qwen3_5`/`glm4_moe_lite` architecture recognition but breaks `Qwen2VLImageProcessor.max_pixels` API. Catch-22: 4.x can't recognize, 5.x breaks the image processor. |
 
 ### What DOES Work
 
@@ -116,6 +117,8 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 | Qwen3.5-35B-A3B AutoRound | AutoRound INT4 | OOM (14GB on disk → ~28GB peak) |
 | Qwen3-30B-A3B GPTQ INT4 | GPTQ INT4 | Loads 15.7 GiB via IPEX, OOM during MoE expert weight shuffle → DEVICE_LOST |
 | Qwen3-Coder-30B-A3B AWQ | AWQ 4-bit | Marlin CUDA kernel missing (same as GLM AWQ) |
+| Qwen3.5-4B AutoRound INT4 | AutoRound | transformers 5.x breaks vLLM's `Qwen2VLImageProcessor.max_pixels` — multimodal model incompatibility |
+| LFM2-24B-A2B AWQ | AWQ 4-bit | Custom Liquid AI tokenizer (`TokenizersBackend`) not supported |
 | Any MLX format | MLX | Apple Silicon only (Metal GPU framework) |
 
 ## Environment Variables
@@ -189,43 +192,78 @@ Additionally, the `all_reduce` warmup in `vllm/v1/worker/xpu_worker.py` (lines ~
 9. **Triton XPU broken on Xe2** — The `triton-xpu` package installs but `triton.backends` fails to import on Lunar Lake. Any model architecture using `@triton.jit` kernels (e.g., Qwen3.5's fla/linear attention) will crash with `TypeError: 'function' object is not subscriptable`. This is a triton-xpu packaging/driver issue, not a vLLM bug.
 10. **Marlin kernels CUDA-only** — AWQ and GPTQ models using compressed-tensors format route to Marlin repack kernels (`_C.gptq_marlin_repack`), which are NVIDIA CUDA kernels with no XPU equivalent. Pre-quantized AWQ/GPTQ models cannot be used on XPU.
 11. **Download FP16 base models** — The only reliable path on Lunar Lake is downloading FP16/BF16 base weights and using vLLM's online quantization (`--quantization fp8` or `--quantization int4`). This uses layer-by-layer loading without the 2x memory spike of pre-quantized formats.
+12. **transformers version catch-22** — vLLM pins `transformers<5,>=4.56.0`. Newer model architectures (Qwen3.5 `qwen3_5`, GLM-4.7 `glm4_moe_lite`) require transformers 5.5.0.dev0+ for recognition. However, upgrading breaks vLLM's multimodal code (`Qwen2VLImageProcessor.max_pixels` removed in 5.x). Qwen3-8B (text-only, `qwen3` architecture) works fine with either version. Upgrading is safe for text-only models but blocks multimodal Qwen3.5 models.
 
 ## Benchmark Results (vLLM SYCL on Lunar Lake)
 
 **Hardware:** MSI Claw 8 AI+ — Intel Core Ultra 7 258V, Arc 140V iGPU, 32GB LPDDR5x (136.5 GB/s)
 **Model:** Intel/Qwen3-8B-int4-AutoRound (5.7GB on disk, 5.69 GiB loaded)
 **Server config:** `--max-model-len 8192 --gpu-memory-utilization 0.8 --enforce-eager --allow-deprecated-quantization`
-**Tool:** `vllm bench serve` with random dataset, request rate 1.0
+**Tool:** `vllm bench serve` with random dataset
 
-### Throughput
+### Single-User Performance (`--max-concurrency 1`)
 
-| Workload | Prompts | Output tok/s | Peak tok/s | Total tok/s |
-|----------|---------|-------------|-----------|------------|
-| 128 in / 128 out | 5 | 44.8 | 90.0 | 89.6 |
-| 1024 in / 1024 out | 5 | 54.0 | 80.0 | 108.0 |
-| 4096 in / 2048 out | 10 | 50.2 | 70.0 | 150.5 |
+The most relevant benchmark for interactive chat (OpenClaw/Lyra). Requests run strictly one at a time.
 
-### Latency
+#### Prefill Speed (Time to First Token)
 
-| Workload | TTFT (mean) | TPOT (mean) | ITL (median) | P99 ITL |
-|----------|------------|------------|-------------|---------|
-| 128 in / 128 out | 3,846 ms | 56.7 ms | 56.1 ms | 61.4 ms |
-| 1024 in / 1024 out | 5,764 ms | 83.9 ms | 91.2 ms | 110.6 ms |
-| 4096 in / 2048 out | 20,978 ms | 186.4 ms | 173.8 ms | 233.5 ms |
+| Input Length | TTFT (median) | Prefill Throughput |
+|-------------|--------------|-------------------|
+| 128 tokens | **120 ms** | **1,067 tok/s** |
+| 1,024 tokens | **278 ms** | **3,683 tok/s** |
+| 4,096 tokens | **382 ms** | **10,723 tok/s** |
+
+Prefill throughput scales dramatically with prompt length — the Xe2 GPU is better utilized with larger matrix operations. Short prompts underutilize the GPU.
+
+#### Decode Speed (Token Generation)
+
+| Context Length | TPOT (median) | Decode Speed | ITL P99 |
+|---------------|--------------|-------------|---------|
+| 128 in / 128 out | **53.7 ms** | **18.6 tok/s** | 54.4 ms |
+| 1,024 in / 1,024 out | **72.6 ms** | **13.8 tok/s** | 92.5 ms |
+| 4,096 in / 4,096 out | **81.7 ms** | **12.2 tok/s** | 103.3 ms |
+
+Decode speed degrades with longer context due to growing KV cache attention computation and LPDDR5x bandwidth limits.
+
+### Batched Throughput (5 concurrent, `--request-rate inf`)
+
+| Workload | Output tok/s | Peak tok/s | TPOT | Server Prefill tok/s |
+|----------|-------------|-----------|------|---------------------|
+| 128 in / 128 out | 23.0 | 90.0 | 56.7 ms | 64 |
+| 1,024 in / 1,024 out | 48.6 | 80.0 | 82.6 ms | 512 |
+| 4,096 in / 4,096 out | 37.3 | 60.0 | 126.5 ms | 1,638 (peak) |
 
 ### Analysis
 
-- **Single-request generation:** ~17.6 tok/s (1000 / 56.7ms TPOT)
-- **Batched throughput scales well:** 90 tok/s peak with 5 concurrent short requests
-- **Bandwidth-bound:** TPOT scales ~linearly with KV cache size. Long context (4K+2K) is 3.3x slower than short (128+128) due to LPDDR5x read bandwidth limits
-- **TTFT scales with input length:** 3.8s (128 tokens) → 21s (4096 tokens) — prefill throughput ~820 tok/s
-- **Memory efficient:** Model uses 5.69 GiB, KV cache stays under 44% even with 10 concurrent long-context requests
+- **Interactive chat (single-user):** 13-19 tok/s decode depending on context length — comfortable for real-time chat
+- **Prefill is fast:** 1K-11K tok/s, far exceeding llama.cpp (~300 tok/s). Longer prompts prefill faster per-token due to better GPU utilization
+- **Batched decode barely faster:** 5 concurrent requests only marginally increase per-request TPOT (56.7→53.7ms for short), showing the iGPU is already well-utilized for single requests
+- **Concurrency kills TTFT:** 5 concurrent requests push TTFT from 120ms to 20,600ms due to prefill queuing with chunked prefill (`max_num_batched_tokens=2048`)
+- **Long context penalty:** Decode at 4K context is ~1.5x slower than short context (81.7ms vs 53.7ms), but still usable at 12.2 tok/s
+- **Memory efficient:** Model uses 5.69 GiB, KV cache peaks at ~35% with 5 concurrent long-context requests
+
+### Server-Side Observations (10-prompt long-context run)
+
+From the vLLM engine logs during `4096 in / 2048 out × 10 prompts`:
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| **Generation throughput (5 concurrent)** | 55 → 35 tok/s | Declines as KV cache grows |
+| **Generation throughput (3 concurrent)** | 48 → 27 tok/s | Better per-request latency |
+| **Generation throughput (1 sequential)** | 12-13 tok/s | Single long request, consistent |
+| **Prompt throughput (burst)** | 1,638 tok/s | Batched prefill for 5 requests |
+| **KV cache peak (5 concurrent, 4K+2K)** | ~35% | Well within budget |
+| **KV cache per single long request** | ~7% | Very efficient |
+| **Prefix cache hit rate** | 0% → 62.5% | Improves across repeated runs at same input length |
+| **Request queuing** | 2 running + 3 waiting | Memory-limited batching with chunked prefill |
+
+**Key insight:** Generation speed degrades with context length — from 77 tok/s (short context, 5 concurrent) to 35 tok/s (long context, 5 concurrent) to 12-13 tok/s (single very long request). This is the attention computation overhead growing with sequence length on shared LPDDR5x.
 
 ### Comparison Notes
 
 - For llama.cpp Vulkan comparison, use the same Qwen3-8B model in GGUF Q4_K_M format
-- Expected Vulkan speed: similar ballpark (both are LPDDR5x bandwidth-bound for token generation)
-- vLLM advantage: continuous batching, OpenAI-compatible API, higher aggregate throughput
+- Expected Vulkan speed: similar decode (both LPDDR5x bandwidth-bound), but slower prefill
+- vLLM advantage: much faster prefill (1K-11K vs ~300 tok/s), continuous batching, OpenAI-compatible API
 
 ## Running Recipes (MSI Claw 8 AI+)
 
@@ -429,4 +467,4 @@ The script auto-detects your platform and adjusts memory recommendations accordi
 
 ---
 
-*Updated: 2026-03-29*
+*Updated: 2026-03-30*
