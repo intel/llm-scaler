@@ -84,7 +84,7 @@ Not all model architectures work on Lunar Lake XPU. Key blockers discovered duri
 
 | Blocker | Affected Models | Root Cause |
 |---------|----------------|------------|
-| **Triton XPU backend broken on Xe2** | Qwen3.5 (all sizes) | `triton.backends` fails to import; `@triton.jit` kernels don't launch. Qwen3.5 uses fla/linear attention ops written entirely as Triton kernels. |
+| **Triton XPU backend broken on Xe2** | Qwen3.5 (all sizes) | `triton.backends` fails to import; `@triton.jit` kernels don't launch. Qwen3.5 uses fla/linear attention ops written entirely as Triton kernels. Even Intel's `forward_xpu` path routes through `fla/ops/layernorm_guard.py` which calls `layer_norm_fwd_kernel[grid](...)` — a Triton kernel launch. Confirmed: Qwen3.5-4B loads at 3.68 GiB (well within budget) but crashes at warmup. |
 | **Marlin kernels are CUDA-only** | AWQ, GPTQ (compressed-tensors format) | `gptq_marlin_repack` is an NVIDIA CUDA kernel. AWQ/GPTQ MoE models route to `CompressedTensorsWNA16MarlinMoEMethod`. |
 | **Pre-quantized 2x memory** | AutoRound, GPTQ (>14B) | Loading INT4→FP16 intermediate doubles peak memory. 35B models OOM on 32GB. |
 | **transformers 5.x `max_pixels` rename** | Qwen3.5 multimodal models | vLLM pins `transformers<5`. Upgrading to 5.x enables `qwen3_5`/`glm4_moe_lite` architecture recognition but renames `image_processor.max_pixels` → `size["longest_edge"]`. Fix: `getattr()` fallback in `qwen2_vl.py` (see limitation #12). Intel's Docker image applies `vllm_for_multi_arc.patch` which includes full Qwen3.5 support. |
@@ -117,7 +117,7 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 | Qwen3.5-35B-A3B AutoRound | AutoRound INT4 | OOM (14GB on disk → ~28GB peak) |
 | Qwen3-30B-A3B GPTQ INT4 | GPTQ INT4 | Loads 15.7 GiB via IPEX, OOM during MoE expert weight shuffle → DEVICE_LOST |
 | Qwen3-Coder-30B-A3B AWQ | AWQ 4-bit | Marlin CUDA kernel missing (same as GLM AWQ) |
-| Qwen3.5-4B AutoRound INT4 | AutoRound | transformers 5.x renames `max_pixels` → `size["longest_edge"]` — fixable with `getattr()` patch (see limitation #12) |
+| Qwen3.5-4B AutoRound INT4 | AutoRound | Loads at **3.68 GiB** (would fit!), but crashes on Triton kernel in `fla/ops/layernorm_guard.py` — same Xe2 Triton blocker as all Qwen3.5 models. Requires `getattr()` fix for `max_pixels` first (see limitation #12). |
 | LFM2-24B-A2B AWQ | AWQ 4-bit | Custom Liquid AI tokenizer (`TokenizersBackend`) not supported |
 | Any MLX format | MLX | Apple Silicon only (Metal GPU framework) |
 
