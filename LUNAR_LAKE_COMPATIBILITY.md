@@ -100,7 +100,8 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 
 | Model | Quantization | VRAM Needed | Context | Notes |
 |-------|-------------|-------------|---------|-------|
-| **Intel/Qwen3-8B-int4-AutoRound** | AutoRound INT4 | **5.69 GiB** | 8k | **Tested & working** — 17.6 tok/s single, 90 tok/s peak batched |
+| **Qwen3.5-4B-int4-AutoRound** | AutoRound INT4 | **3.68 GiB** | 4k | **Tested & working** — 23.4 tok/s single, 159 tok/s peak batched. Hybrid Mamba+attention (Triton fla/ops). |
+| **Intel/Qwen3-8B-int4-AutoRound** | AutoRound INT4 | **5.69 GiB** | 8k | **Tested & working** — 18.6 tok/s single, 90 tok/s peak batched |
 | Qwen3-8B | FP8 (online) | ~10GB | 32k | Standard attention, online quantization |
 | DeepSeek-R1-Distill-Qwen-7B | FP8 (online) | ~8GB | 32k | Good reasoning |
 | Qwen3-14B | INT4 (online) | ~10GB | 16k | Needs `--quantization int4` |
@@ -110,14 +111,14 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 
 | Model | Format | Failure Mode |
 |-------|--------|-------------|
-| ~~Qwen3.5-* (any size)~~ | Any | ~~Triton kernel crash~~ **RESOLVED** — was a packaging bug (plain `triton` shadowing `triton-xpu`). With correct install + `torch.cuda→torch.xpu` patches + `oneapi-level-zero-devel`, Qwen3.5 should work. |
+| ~~Qwen3.5-* (any size)~~ | Any | ~~Triton kernel crash~~ **RESOLVED & VERIFIED** — was a packaging bug (plain `triton` shadowing `triton-xpu`). Qwen3.5-4B now runs successfully with correct triton-xpu install + `torch.cuda→torch.xpu` patches + `oneapi-level-zero-devel`. See benchmark results below. |
 | GLM-4.7-flash AWQ | AWQ 4-bit | Marlin CUDA kernel missing |
 | GLM-4.7-flash AutoRound INT4 | AutoRound | 27B OOM (>24GB after FP16 unpack) |
 | Qwen3.5-35B-A3B GPTQ | GPTQ INT4 | OOM + GPU DEVICE_LOST at 79% loading |
 | Qwen3.5-35B-A3B AutoRound | AutoRound INT4 | OOM (14GB on disk → ~28GB peak) |
 | Qwen3-30B-A3B GPTQ INT4 | GPTQ INT4 | Loads 15.7 GiB via IPEX, OOM during MoE expert weight shuffle → DEVICE_LOST |
 | Qwen3-Coder-30B-A3B AWQ | AWQ 4-bit | Marlin CUDA kernel missing (same as GLM AWQ) |
-| Qwen3.5-4B AutoRound INT4 | AutoRound | Loads at **3.68 GiB** — **Triton blocker RESOLVED** (was packaging bug, not hardware). Requires: (1) correct `triton-xpu` install (uninstall plain `triton` first), (2) `oneapi-level-zero-devel` for JIT, (3) `torch.cuda→torch.xpu` patches from `vllm_for_multi_arc.patch`, (4) `getattr()` fix for `max_pixels` (see limitation #12). Should now work — pending re-test. |
+| ~~Qwen3.5-4B AutoRound INT4~~ | AutoRound | **NOW WORKING** — 3.68 GiB, 23.4 tok/s single-user, 159 tok/s batched. Moved to recommended models. Required fixes: (1) `triton-xpu` clean install, (2) `oneapi-level-zero-devel`, (3) `torch.cuda→torch.xpu` patches, (4) `getattr()` fix for `max_pixels`. |
 | LFM2-24B-A2B AWQ | AWQ 4-bit | Custom Liquid AI tokenizer (`TokenizersBackend`) not supported |
 | Any MLX format | MLX | Apple Silicon only (Metal GPU framework) |
 
@@ -274,6 +275,63 @@ From the vLLM engine logs during `4096 in / 2048 out × 10 prompts`:
 - Expected Vulkan speed: similar decode (both LPDDR5x bandwidth-bound), but slower prefill
 - vLLM advantage: much faster prefill (1K-11K vs ~300 tok/s), continuous batching, OpenAI-compatible API
 
+## Benchmark Results: Qwen3.5-4B (Hybrid Mamba + Attention with Triton)
+
+**Model:** Qwen3.5-4B-int4-AutoRound (3.68 GiB loaded) — first Triton-dependent model running on Lunar Lake
+**Server config:** `--max-model-len 4096 --gpu-memory-utilization 0.8 --enforce-eager --allow-deprecated-quantization`
+**Tool:** `vllm bench serve` with random dataset
+**Prerequisites:** `triton-xpu==3.6.0` (clean install), `oneapi-level-zero-devel`, `torch.cuda→torch.xpu` patches from `vllm_for_multi_arc.patch`
+
+### Single-User Performance (`--max-concurrency 1`)
+
+#### Decode Speed (Token Generation)
+
+| Context Length | TPOT (median) | Decode Speed | ITL P99 |
+|---------------|--------------|-------------|---------|
+| 128 in / 128 out | **42.7 ms** | **23.4 tok/s** | 44.5 ms |
+| 1,024 in / 1,024 out | **61.2 ms** | **16.3 tok/s** | 68.8 ms |
+| 2,048 in / 2,048 out | **61.2 ms** | **16.3 tok/s** | 70.3 ms |
+
+#### Prefill Speed (Time to First Token)
+
+| Input Length | TTFT (median) | Notes |
+|-------------|--------------|-------|
+| 128 tokens | **232 ms** | Higher than Qwen3-8B (120ms) — Triton JIT overhead on first kernel |
+| 1,024 tokens | **836 ms** | |
+| 2,048 tokens | **1,541 ms** | |
+
+### Batched Throughput (ad-hoc 8 concurrent requests)
+
+| Metric | Value |
+|--------|-------|
+| **Peak generation throughput** | **158.8 tok/s** (8 concurrent, 256 output tokens each) |
+| **Server-reported peak** | **110.2 tok/s** (server log 10s window) |
+| **Server-reported 8 concurrent** | **94.6 tok/s** (steady state) |
+| **Per-request throughput** | **19.9 tok/s** (each of 8 requests) |
+| **KV cache usage at peak** | **1.8%** |
+
+### Qwen3.5-4B vs Qwen3-8B Comparison
+
+| Metric | Qwen3-8B (5.69 GiB) | Qwen3.5-4B (3.68 GiB) | Delta |
+|--------|---------------------|----------------------|-------|
+| **Short decode (128 tok)** | 18.6 tok/s (53.7ms) | **23.4 tok/s** (42.7ms) | **+26% faster** |
+| **Medium decode (1K tok)** | 13.8 tok/s (72.6ms) | **16.3 tok/s** (61.2ms) | **+18% faster** |
+| **Long decode (2K/4K tok)** | 12.2 tok/s (81.7ms) | **16.3 tok/s** (61.2ms) | **+34% faster** |
+| **Peak single-user** | 24 tok/s | 24 tok/s | Same ceiling |
+| **Batched peak** | 90 tok/s | **159 tok/s** | **+77% higher** |
+| **TTFT (128 tok)** | 120 ms | 232 ms | Slower (Triton JIT) |
+| **KV cache capacity** | 62,720 tokens | 140,160 tokens | **2.2x more** (smaller model) |
+| **Memory footprint** | 5.69 GiB | 3.68 GiB | **35% smaller** |
+
+### Analysis: Qwen3.5-4B on Lunar Lake
+
+- **Fastest single-user decode so far** — 23.4 tok/s at short context, staying at 16.3 tok/s even at 2K context (Qwen3-8B drops to 12.2 at 4K)
+- **Decode speed plateau at 1K+** — TPOT stays flat at ~61ms from 1K to 2K context, suggesting the Mamba hybrid attention has a different scaling curve than pure attention
+- **Massive batched throughput** — 159 tok/s aggregate with 8 concurrent requests, 77% more than Qwen3-8B's 90 tok/s. The smaller model leaves far more room for KV cache batching
+- **TTFT is higher** — 232ms vs 120ms at 128 tokens. The Triton Intel backend JIT-compiles `spirv_utils.so` and SPIR-V kernels on first use, adding one-time overhead
+- **Triton works on Xe2 iGPU** — This is the first confirmed Triton-dependent model running on Lunar Lake. The `fla/ops` linear attention kernels (Flash Linear Attention) execute correctly via triton-xpu's Intel backend
+- **Server logs confirm stability** — Steady 16.1-16.8 tok/s generation over extended runs, no degradation or GPU faults
+
 ## Running Recipes (MSI Claw 8 AI+)
 
 All services run on the same machine. Use `127.0.0.1` since OpenClaw/Lyra accesses them locally.
@@ -290,6 +348,21 @@ vllm serve /shared/models/qwen3-8b-int4-autoround \
     --allow-deprecated-quantization \
     --host 127.0.0.1 --port 8000
 ```
+
+### LLM — Qwen3.5-4B INT4 (port 8000) — Fastest option
+
+```bash
+vllm-activate
+vllm serve /shared/models/qwen3.5-4b-int4-autoround \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.8 \
+    --enforce-eager \
+    --max-model-len 4096 \
+    --allow-deprecated-quantization \
+    --host 127.0.0.1 --port 8000
+```
+
+**Requires:** correct `triton-xpu` install (see install script), `oneapi-level-zero-devel`, and `torch.cuda→torch.xpu` patches from `vllm_for_multi_arc.patch`.
 
 ### ASR — Qwen3-ASR-1.7B (port 8001)
 
