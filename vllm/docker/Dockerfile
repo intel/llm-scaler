@@ -63,7 +63,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install arctic-inference==0.1.1 && \
     # pip install --no-cache-dir arctic-inference==0.1.1 && \
     export CPATH=/opt/intel/oneapi/dpcpp-ct/2025.2/include/:${CPATH} && \
-    pip install --no-build-isolation . 
+    MAX_JOBS=2 pip install --no-build-isolation .
 
 # Clone + patch miner-U
 RUN --mount=type=cache,target=/root/.cache/pip \
