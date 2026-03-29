@@ -106,7 +106,7 @@ log_info "Installing Level-Zero GPU runtime + Intel compute runtime..."
 sudo dnf install -y --skip-unavailable \
     level-zero level-zero-devel \
     intel-level-zero-gpu intel-level-zero-gpu-devel \
-    oneapi-level-zero level-zero-loader \
+    oneapi-level-zero oneapi-level-zero-devel level-zero-loader \
     intel-compute-runtime \
     intel-ocloc \
     2>&1 | tail -10 || true
@@ -307,7 +307,12 @@ if [ ! -d "$INSTALL_DIR/vllm-xpu-kernels" ]; then
     pip install --no-build-isolation .
 fi
 
-# Install triton-xpu
+# Install triton-xpu — MUST uninstall plain triton first!
+# vllm-xpu-kernels pulls in plain 'triton' as a transitive dependency.
+# Plain triton's libtriton.so lacks the Intel backend, causing:
+#   ImportError: cannot import name 'intel' from 'triton._C.libtriton'
+# which degrades @triton.jit kernels to plain functions (TypeError: not subscriptable).
+pip uninstall triton triton-xpu -y 2>/dev/null || true
 pip install triton-xpu==3.6.0 --extra-index-url=https://download.pytorch.org/whl/test/xpu
 
 # Copy launch script

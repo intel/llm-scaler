@@ -84,7 +84,7 @@ Not all model architectures work on Lunar Lake XPU. Key blockers discovered duri
 
 | Blocker | Affected Models | Root Cause |
 |---------|----------------|------------|
-| **Triton XPU backend broken on Xe2** | Qwen3.5 (all sizes) | `triton.backends` fails to import on Xe2 iGPU; `@triton.jit` kernels degrade to plain functions. Qwen3.5 uses fla/linear attention ops with Triton kernels (`layer_norm_fwd_kernel[grid](...)` in `layernorm_guard.py`). Intel's `vllm_for_multi_arc.patch` adds `torch.cuda→torch.xpu` fixes for surrounding code, but the Triton kernel itself cannot compile on Xe2 — confirmed by applying all patch fixes and still hitting `TypeError: 'function' object is not subscriptable`. Intel's Docker works because discrete GPUs (B60/A770) have working `triton.backends`. Qwen3.5-4B loads at 3.68 GiB (fits!) but cannot execute. |
+| **~~Triton XPU backend broken on Xe2~~** RESOLVED | Qwen3.5 (all sizes) | **Root cause: packaging bug, NOT hardware limitation.** The `install_lunar_lake.sh` script installed `triton-xpu` without first uninstalling the plain `triton` package (pulled in as a transitive dependency by vllm-xpu-kernels). Plain `triton`'s `libtriton.so` lacks the Intel backend, causing `ImportError: cannot import name 'intel'` and `TypeError: 'function' object is not subscriptable`. **Fix:** `pip uninstall triton triton-xpu -y && pip install triton-xpu==3.6.0`. Also requires `oneapi-level-zero-devel` for Triton's JIT compilation of `driver.c → spirv_utils.so` (needs `level_zero/ze_api.h`). Install scripts updated. Intel's Docker always did the uninstall-first pattern — that's why it worked. |
 | **Marlin kernels are CUDA-only** | AWQ, GPTQ (compressed-tensors format) | `gptq_marlin_repack` is an NVIDIA CUDA kernel. AWQ/GPTQ MoE models route to `CompressedTensorsWNA16MarlinMoEMethod`. |
 | **Pre-quantized 2x memory** | AutoRound, GPTQ (>14B) | Loading INT4→FP16 intermediate doubles peak memory. 35B models OOM on 32GB. |
 | **transformers 5.x `max_pixels` rename** | Qwen3.5 multimodal models | vLLM pins `transformers<5`. Upgrading to 5.x enables `qwen3_5`/`glm4_moe_lite` architecture recognition but renames `image_processor.max_pixels` → `size["longest_edge"]`. Fix: `getattr()` fallback in `qwen2_vl.py` (see limitation #12). Intel's Docker image applies `vllm_for_multi_arc.patch` which includes full Qwen3.5 support. |
@@ -92,7 +92,7 @@ Not all model architectures work on Lunar Lake XPU. Key blockers discovered duri
 ### What DOES Work
 
 Only models meeting **all three** criteria work on Lunar Lake XPU:
-1. **Standard attention** (not fla/linear attention — avoids Triton dependency)
+1. **Standard attention** or **fla/linear attention with Triton** (requires correct `triton-xpu` install — see blocker fix above)
 2. **FP16/BF16 base weights** with **online quantization** (`--quantization fp8` or `--quantization int4`), OR **AutoRound INT4** pre-quantized (for models ≤8B)
 3. **Steady-state VRAM ≤ ~20GB** (leaving room for OS on 32GB shared memory)
 
@@ -110,14 +110,14 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 
 | Model | Format | Failure Mode |
 |-------|--------|-------------|
-| Qwen3.5-* (any size) | Any | Triton kernel crash (`fla/ops` linear attention) |
+| ~~Qwen3.5-* (any size)~~ | Any | ~~Triton kernel crash~~ **RESOLVED** — was a packaging bug (plain `triton` shadowing `triton-xpu`). With correct install + `torch.cuda→torch.xpu` patches + `oneapi-level-zero-devel`, Qwen3.5 should work. |
 | GLM-4.7-flash AWQ | AWQ 4-bit | Marlin CUDA kernel missing |
 | GLM-4.7-flash AutoRound INT4 | AutoRound | 27B OOM (>24GB after FP16 unpack) |
 | Qwen3.5-35B-A3B GPTQ | GPTQ INT4 | OOM + GPU DEVICE_LOST at 79% loading |
 | Qwen3.5-35B-A3B AutoRound | AutoRound INT4 | OOM (14GB on disk → ~28GB peak) |
 | Qwen3-30B-A3B GPTQ INT4 | GPTQ INT4 | Loads 15.7 GiB via IPEX, OOM during MoE expert weight shuffle → DEVICE_LOST |
 | Qwen3-Coder-30B-A3B AWQ | AWQ 4-bit | Marlin CUDA kernel missing (same as GLM AWQ) |
-| Qwen3.5-4B AutoRound INT4 | AutoRound | Loads at **3.68 GiB** (would fit!), but crashes on `layer_norm_fwd_kernel[grid]()` — Triton backends don't load on Xe2 iGPU. Applying Intel's `torch.cuda→torch.xpu` patch fixes doesn't help — the `@triton.jit` kernel itself can't compile. Requires `getattr()` fix for `max_pixels` first (see limitation #12). |
+| Qwen3.5-4B AutoRound INT4 | AutoRound | Loads at **3.68 GiB** — **Triton blocker RESOLVED** (was packaging bug, not hardware). Requires: (1) correct `triton-xpu` install (uninstall plain `triton` first), (2) `oneapi-level-zero-devel` for JIT, (3) `torch.cuda→torch.xpu` patches from `vllm_for_multi_arc.patch`, (4) `getattr()` fix for `max_pixels` (see limitation #12). Should now work — pending re-test. |
 | LFM2-24B-A2B AWQ | AWQ 4-bit | Custom Liquid AI tokenizer (`TokenizersBackend`) not supported |
 | Any MLX format | MLX | Apple Silicon only (Metal GPU framework) |
 
@@ -189,7 +189,7 @@ Additionally, the `all_reduce` warmup in `vllm/v1/worker/xpu_worker.py` (lines ~
 6. **Large models may OOM** — Pre-quantized models (AutoRound/GPTQ) require unpacking INT4 weights to FP16 during loading, doubling peak memory. The Qwen3.5-35B-A3B INT4 AutoRound model (~14GB on disk) OOMs during initialization on 32GB shared memory. Use online `--quantization int4` instead, or choose models ≤14B.
 7. **GPU crash requires reboot** — If vLLM OOMs and the GPU enters `UR_RESULT_ERROR_DEVICE_LOST` state, a full system reboot is required to reset the GPU.
 8. **Build time** — vllm-xpu-kernels compilation (933 SYCL files) takes **1.5-2 hours** on Lunar Lake. Ensure the device is plugged in and sleep is disabled (`systemctl mask sleep.target suspend.target`).
-9. **Triton XPU broken on Xe2** — The `triton-xpu` package installs but `triton.backends` fails to import on Lunar Lake Xe2 iGPU. When Triton is disabled, `@triton.jit` decorated functions become plain Python functions that can't be subscripted with `[grid]`. Any model using Triton kernels (e.g., Qwen3.5's `fla/ops/layernorm_guard.py`) crashes with `TypeError: 'function' object is not subscriptable`. Intel's `vllm_for_multi_arc.patch` adds `torch.cuda→torch.xpu` fixes for code *around* the kernels, but the Triton kernel launch itself fails. Confirmed: even with all patch fixes applied, Qwen3.5-4B still crashes at the same point. This works on Intel discrete GPUs (B60, A770) where `triton.backends` imports successfully.
+9. **~~Triton XPU broken on Xe2~~ RESOLVED — packaging bug** — The native install scripts installed `triton-xpu` without first removing the plain `triton` package. The `vllm-xpu-kernels` build pulls in plain `triton` as a transitive dependency, and its `libtriton.so` (which lacks the Intel backend) shadows `triton-xpu`'s version. This caused `ImportError: cannot import name 'intel' from 'triton._C.libtriton'`, which made `@triton.jit` kernels degrade to plain functions (`TypeError: 'function' object is not subscriptable`). **Fix:** `pip uninstall triton triton-xpu -y && pip install triton-xpu==3.6.0`. Additionally, `oneapi-level-zero-devel` must be installed for Triton's Intel backend to JIT-compile `driver.c → spirv_utils.so` (requires `level_zero/ze_api.h` header). Intel's Docker images always did the uninstall-first pattern — the bug was only in the native install scripts. The `triton-xpu` source code explicitly recognizes `lnl` (Lunar Lake) as a valid architecture — there is NO iGPU exclusion. Install scripts have been updated.
 10. **Marlin kernels CUDA-only** — AWQ and GPTQ models using compressed-tensors format route to Marlin repack kernels (`_C.gptq_marlin_repack`), which are NVIDIA CUDA kernels with no XPU equivalent. Pre-quantized AWQ/GPTQ models cannot be used on XPU.
 11. **Download FP16 base models** — The only reliable path on Lunar Lake is downloading FP16/BF16 base weights and using vLLM's online quantization (`--quantization fp8` or `--quantization int4`). This uses layer-by-layer loading without the 2x memory spike of pre-quantized formats.
 12. **transformers 5.x `max_pixels` rename** — vLLM pins `transformers<5,>=4.56.0`. Upgrading to 5.x for Qwen3.5/GLM-4.7 architecture recognition breaks `Qwen2VLImageProcessor.max_pixels` — the attribute was renamed to `size["longest_edge"]` (and `min_pixels` to `size["shortest_edge"]`). Intel's llm-scaler Docker image installs transformers from git HEAD and applies `vllm_for_multi_arc.patch` which adds full Qwen3.5 support. On a native install without the patch, apply the one-line fix below:
