@@ -16,3 +16,17 @@ diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models
          )
 
          # check if the subprocess is successful
+
+diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
+--- a/vllm/platforms/xpu.py
++++ b/vllm/platforms/xpu.py
+@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Optional
+
+ import torch
+-import vllm_xpu_kernels._C
+-import vllm_xpu_kernels._xpu_C
++if os.environ.get("VLLM_TARGET_DEVICE", "").lower() != "cpu":
++    import vllm_xpu_kernels._C
++    import vllm_xpu_kernels._xpu_C
+
+ import vllm.envs as envs
