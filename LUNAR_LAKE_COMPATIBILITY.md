@@ -304,20 +304,20 @@ Single-user decode is virtually identical across all three memory configs — ex
 
 | Context | Metric | 0.8 (8K ctx) | 0.42 (32K ctx) | 0.35 (32K ctx) |
 |---------|--------|:------------:|:--------------:|:--------------:|
-| **128/128** | Output tok/s | **17.2** ⚠️ | **59.3** | **100.3** |
-| | Peak tok/s | **115.0** | **115.0** | **115.0** |
-| | TPOT | 45.7 ms | 44.6 ms | 45.0 ms |
-| | TTFT | 31,388 ms ⚠️ | 5,120 ms | 664 ms |
-| **1024/1024** | Output tok/s | **54.0** | **71.7** | **76.4** |
+| **128/128** | Output tok/s | **22.7** | **59.3** | **100.3** |
+| | Peak tok/s | **110.0** | **115.0** | **115.0** |
+| | TPOT | 45.9 ms | 44.6 ms | 45.0 ms |
+| | TTFT | 22,370 ms | 5,120 ms | 664 ms |
+| **1024/1024** | Output tok/s | **50.2** | **71.7** | **76.4** |
 | | Peak tok/s | **100.0** | **100.0** | **100.0** |
-| | TPOT | 67.4 ms | 65.9 ms | 62.9 ms |
-| | TTFT | 25,869 ms ⚠️ | 3,916 ms | 2,577 ms |
-| **2048/2048** | Output tok/s | **46.7** | **50.5** | **52.6** |
+| | TPOT | 67.1 ms | 65.9 ms | 62.9 ms |
+| | TTFT | 33,178 ms | 3,916 ms | 2,577 ms |
+| **2048/2048** | Output tok/s | **46.9** | **50.5** | **52.6** |
 | | Peak tok/s | **85.0** | **70.0** | **80.0** |
-| | TPOT | 92.3 ms | 95.4 ms | 93.1 ms |
-| | TTFT | 30,094 ms ⚠️ | 7,290 ms | 4,118 ms |
+| | TPOT | 90.1 ms | 95.4 ms | 93.1 ms |
+| | TTFT | 33,727 ms | 7,290 ms | 4,118 ms |
 
-> ⚠️ **0.8 util batched TTFT is inflated** — these tests ran first after server start and caught full Triton JIT compilation warmup (25-31s). The TPOT values are valid; TTFT would normalize on subsequent runs. A previous ad-hoc 8-concurrent test at 0.8/4K peaked at 158.8 tok/s after warmup.
+> **0.8 util has genuinely high batched TTFT (22-34s)** — confirmed across two runs (cold and warmed up). This is NOT JIT warmup; it's KV cache management overhead. The 141K token KV cache creates massive scheduling/prefill latency when 5 requests arrive simultaneously. TTFT scales with KV cache size: 0.35 (34K) → 664ms, 0.42 (51K) → 5,120ms, 0.8 (141K) → 22,370ms at 128 tokens. TPOT (decode speed) is identical across all configs.
 
 All three configs use identical methodology (5 prompts, `--request-rate inf`).
 
@@ -325,7 +325,7 @@ All three configs use identical methodology (5 prompts, `--request-rate inf`).
 
 | Setting | KV Cache | Max Context | Init Time | Single-User | Batched Peak | Best For |
 |---------|----------|-------------|-----------|-------------|-------------|----------|
-| **0.8** | 141,120 tokens | 8,192 | ~47s | 23.0 tok/s | 115 tok/s (159 post-warmup) | Max throughput benchmark |
+| **0.8** | 141,120 tokens | 8,192 | ~47s | 23.0 tok/s | 110 tok/s (22s TTFT!) | Benchmark only, high TTFT |
 | **0.42** | ~51,520 tokens | 32,768 | ~13s | 23.2 tok/s | 115 tok/s | **OpenClaw (recommended)** |
 | **0.35** | ~34,560 tokens | 32,768 | ~13s | 21.9 tok/s | 115 tok/s | Tight memory budget |
 
@@ -337,7 +337,7 @@ All three configs use identical methodology (5 prompts, `--request-rate inf`).
 | **Medium decode (1K tok)** | 13.8 tok/s (72.6ms) | **16.8 tok/s** (59.5ms) | **+22% faster** |
 | **Long decode (2K/4K tok)** | 12.2 tok/s (81.7ms) | **16.4 tok/s** (61.1ms) | **+34% faster** |
 | **Peak single-user** | 24 tok/s | 24 tok/s | Same ceiling |
-| **Batched peak (0.8 util)** | 90 tok/s | **115 tok/s** (159 post-warmup) | **+28% higher** |
+| **Batched peak (0.8 util)** | 90 tok/s | **110 tok/s** (22s TTFT!) | **+22% higher** |
 | **Batched peak (0.42 util)** | — | **115 tok/s** | 32K context mode |
 | **TTFT (128 tok, single)** | 120 ms | 207 ms | Slower (Triton JIT) |
 | **KV cache (0.8 util)** | 62,720 tokens | 141,120 tokens | **2.2x more** |
