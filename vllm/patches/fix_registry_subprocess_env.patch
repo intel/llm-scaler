@@ -1,12 +1,6 @@
-diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
---- a/vllm/model_executor/models/registry.py
-+++ b/vllm/model_executor/models/registry.py
-@@ -391,9 +391,34 @@
- def _try_inspect_model_cls(
-     model_arch: str,
-     model: _BaseRegisteredModel,
- ) -> _ModelInfo | None:
-     try:
+--- a/vllm/model_executor/models/registry.py	2026-03-30 18:41:07.648440903 +0000
++++ b/vllm/model_executor/models/registry.py	2026-03-30 18:41:44.553139191 +0000
+@@ -784,6 +784,31 @@
          return model.inspect_model_cls()
      except Exception:
          logger.exception("Error in inspecting model architecture '%s'", model_arch)
@@ -37,7 +31,9 @@ diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models
 +            )
          return None
  
-@@ -1144,7 +1169,18 @@
+ 
+@@ -1201,8 +1226,19 @@
+ 
          # cannot use `sys.executable __file__` here because the script
          # contains relative imports
 +        # On XPU, the subprocess must not initialize SYCL/Level Zero
@@ -57,11 +53,11 @@ diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models
          )
  
          # check if the subprocess is successful
- 
-diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
---- a/vllm/platforms/xpu.py
-+++ b/vllm/platforms/xpu.py
-@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional
+---
+--- a/vllm/platforms/xpu.py	2026-03-30 18:41:07.650777687 +0000
++++ b/vllm/platforms/xpu.py	2026-03-30 18:41:51.413139599 +0000
+@@ -6,8 +6,9 @@
+ from typing import TYPE_CHECKING, Optional
  
  import torch
 -import vllm_xpu_kernels._C
@@ -71,3 +67,4 @@ diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
 +    import vllm_xpu_kernels._xpu_C
  
  import vllm.envs as envs
+ from vllm.logger import init_logger
