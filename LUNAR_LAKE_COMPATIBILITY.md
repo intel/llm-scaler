@@ -300,15 +300,22 @@ From the vLLM engine logs during `4096 in / 2048 out × 10 prompts`:
 | 1,024 tokens | **836 ms** | |
 | 2,048 tokens | **1,541 ms** | |
 
-### Batched Throughput (ad-hoc 8 concurrent requests)
+### Batched Throughput (5 concurrent, `--request-rate inf`)
 
-| Metric | Value |
-|--------|-------|
-| **Peak generation throughput** | **158.8 tok/s** (8 concurrent, 256 output tokens each) |
-| **Server-reported peak** | **110.2 tok/s** (server log 10s window) |
-| **Server-reported 8 concurrent** | **94.6 tok/s** (steady state) |
-| **Per-request throughput** | **19.9 tok/s** (each of 8 requests) |
-| **KV cache usage at peak** | **1.8%** |
+#### At `--gpu-memory-utilization 0.8` (140K KV cache, benchmark mode)
+
+| Workload | Output tok/s | Peak tok/s | TPOT | Notes |
+|----------|-------------|-----------|------|-------|
+| 128 in / 128 out | — | 158.8 | — | Ad-hoc 8-concurrent test |
+| Server-reported peak | 110.2 | — | — | 10s server log window |
+
+#### At `--gpu-memory-utilization 0.35` (34K KV cache, 32K context, OpenClaw mode)
+
+| Workload | Output tok/s | Peak tok/s | TPOT | TTFT (median) |
+|----------|-------------|-----------|------|--------------|
+| 128 in / 128 out | **86.5** | **115.0** | 44.8 ms | 1,710 ms |
+| 1,024 in / 1,024 out | **70.4** | **100.0** | 66.4 ms | 4,743 ms |
+| 2,048 in / 2,048 out | **51.3** | **85.0** | 95.1 ms | 4,995 ms |
 
 ### Qwen3.5-4B vs Qwen3-8B Comparison
 
@@ -318,17 +325,20 @@ From the vLLM engine logs during `4096 in / 2048 out × 10 prompts`:
 | **Medium decode (1K tok)** | 13.8 tok/s (72.6ms) | **16.3 tok/s** (61.2ms) | **+18% faster** |
 | **Long decode (2K/4K tok)** | 12.2 tok/s (81.7ms) | **16.3 tok/s** (61.2ms) | **+34% faster** |
 | **Peak single-user** | 24 tok/s | 24 tok/s | Same ceiling |
-| **Batched peak** | 90 tok/s | **159 tok/s** | **+77% higher** |
+| **Batched peak (0.8 util)** | 90 tok/s | **159 tok/s** | **+77% higher** |
+| **Batched peak (0.35 util)** | — | **115 tok/s** | Reduced KV cache |
 | **TTFT (128 tok)** | 120 ms | 232 ms | Slower (Triton JIT) |
-| **KV cache capacity** | 62,720 tokens | 140,160 tokens | **2.2x more** (smaller model) |
+| **KV cache (0.8 util)** | 62,720 tokens | 140,160 tokens | **2.2x more** |
+| **KV cache (0.35 util)** | — | 34,560 tokens | 32K context mode |
 | **Memory footprint** | 5.69 GiB | 3.68 GiB | **35% smaller** |
 
 ### Analysis: Qwen3.5-4B on Lunar Lake
 
 - **Fastest single-user decode so far** — 23.4 tok/s at short context, staying at 16.3 tok/s even at 2K context (Qwen3-8B drops to 12.2 at 4K)
 - **Decode speed plateau at 1K+** — TPOT stays flat at ~61ms from 1K to 2K context, suggesting the Mamba hybrid attention has a different scaling curve than pure attention
-- **Massive batched throughput** — 159 tok/s aggregate with 8 concurrent requests, 77% more than Qwen3-8B's 90 tok/s. The smaller model leaves far more room for KV cache batching
-- **TTFT is higher** — 232ms vs 120ms at 128 tokens. The Triton Intel backend JIT-compiles `spirv_utils.so` and SPIR-V kernels on first use, adding one-time overhead
+- **Massive batched throughput** — 159 tok/s aggregate at 0.8 util, 115 tok/s even at 0.35 util with 32K context mode
+- **0.35 util penalty is moderate** — Batched peak drops from 115→85 tok/s as context grows from 128→2048, but single-request TPOT (44.8→95.1ms) stays usable
+- **TTFT is higher** — 232ms single-user vs 1,710ms batched at 128 tokens. The Triton Intel backend JIT overhead plus chunked prefill queuing with 5 concurrent requests
 - **Triton works on Xe2 iGPU** — This is the first confirmed Triton-dependent model running on Lunar Lake. The `fla/ops` linear attention kernels (Flash Linear Attention) execute correctly via triton-xpu's Intel backend
 - **Server logs confirm stability** — Steady 16.1-16.8 tok/s generation over extended runs, no degradation or GPU faults
 
