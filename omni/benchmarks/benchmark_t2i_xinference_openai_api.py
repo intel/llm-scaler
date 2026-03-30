@@ -136,15 +136,17 @@ def benchmark_t2i_model(model_uid, model_path=None, relaunch=True):
 
     return avg_latency
 
-benchmark_t2i_model(
-    model_uid="sd3.5-medium",
-    model_path="/llm/models/stable-diffusion-3.5-medium/",
-)
-benchmark_t2i_model(
-    model_uid="FLUX.1-dev",
-    model_path="/llm/models/FLUX.1-dev/",
-)
-benchmark_t2i_model(
-    model_uid="HunyuanDiT-v1.2",
-    model_path="/llm/models/HunyuanDiT-v1.2-Diffusers/",
-)
+if __name__ == "__main__":
+    # This file is executable as a script and should be side-effect free when imported.
+    benchmark_t2i_model(
+        model_uid="sd3.5-medium",
+        model_path="/llm/models/stable-diffusion-3.5-medium/",
+    )
+    benchmark_t2i_model(
+        model_uid="FLUX.1-dev",
+        model_path="/llm/models/FLUX.1-dev/",
+    )
+    benchmark_t2i_model(
+        model_uid="HunyuanDiT-v1.2",
+        model_path="/llm/models/HunyuanDiT-v1.2-Diffusers/",
+    )
