@@ -64,6 +64,7 @@ def run_model(container, model:ModelSpec, config:ScriptConfig):
     outstr += '--block-size 64 '
     if model.quantization:
         outstr += '--quantization %s ' % model.quantization
+        outstr += '--allow-deprecated-quantization '
     outstr += '-tp=%d ' % model.tp
     if model.spec_config:
         spec_dict = {
