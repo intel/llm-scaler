@@ -283,47 +283,49 @@ From the vLLM engine logs during `4096 in / 2048 out × 10 prompts`:
 
 ### Single-User Performance (`--max-concurrency 1`) — Side-by-Side
 
-| Context | Metric | 0.8 (4K ctx) | 0.42 (32K ctx) | 0.35 (32K ctx) |
+| Context | Metric | 0.8 (8K ctx) | 0.42 (32K ctx) | 0.35 (32K ctx) |
 |---------|--------|:------------:|:--------------:|:--------------:|
-| **128/128** | Decode | **23.4 tok/s** | **23.2 tok/s** | **21.9 tok/s** |
-| | TPOT | 42.7 ms | 43.1 ms | 44.1 ms |
-| | TTFT | 232 ms | 207 ms | 204 ms |
-| | ITL P99 | 44.5 ms | 44.2 ms | 47.9 ms |
-| **1024/1024** | Decode | **16.3 tok/s** | **16.8 tok/s** | **16.2 tok/s** |
-| | TPOT | 61.2 ms | 59.5 ms | 61.6 ms |
-| | TTFT | 836 ms | 790 ms | 794 ms |
-| | ITL P99 | 68.8 ms | 66.4 ms | 70.1 ms |
-| **2048/2048** | Decode | **16.3 tok/s** | **16.4 tok/s** | **16.1 tok/s** |
-| | TPOT | 61.2 ms | 61.1 ms | 61.7 ms |
-| | TTFT | 1,541 ms | 1,510 ms | 1,496 ms |
-| | ITL P99 | 70.3 ms | 67.3 ms | 70.1 ms |
+| **128/128** | Decode | **23.0 tok/s** | **23.2 tok/s** | **21.9 tok/s** |
+| | TPOT | 43.7 ms | 43.1 ms | 44.1 ms |
+| | TTFT | 220 ms | 207 ms | 204 ms |
+| | ITL P99 | 51.1 ms | 44.2 ms | 47.9 ms |
+| **1024/1024** | Decode | **16.4 tok/s** | **16.8 tok/s** | **16.2 tok/s** |
+| | TPOT | 60.8 ms | 59.5 ms | 61.6 ms |
+| | TTFT | 1,044 ms | 790 ms | 794 ms |
+| | ITL P99 | 67.8 ms | 66.4 ms | 70.1 ms |
+| **2048/2048** | Decode | **15.5 tok/s** | **16.4 tok/s** | **16.1 tok/s** |
+| | TPOT | 62.0 ms | 61.1 ms | 61.7 ms |
+| | TTFT | 1,885 ms | 1,510 ms | 1,496 ms |
+| | ITL P99 | 68.1 ms | 67.3 ms | 70.1 ms |
 
 Single-user decode is virtually identical across all three memory configs — expected since single requests don't benefit from larger KV cache. The ~1 tok/s variance at 0.35 is within run-to-run noise.
 
 ### Batched Throughput (5 concurrent, `--request-rate inf`) — Side-by-Side
 
-| Context | Metric | 0.8 (4K ctx) | 0.42 (32K ctx) | 0.35 (32K ctx) |
+| Context | Metric | 0.8 (8K ctx) | 0.42 (32K ctx) | 0.35 (32K ctx) |
 |---------|--------|:------------:|:--------------:|:--------------:|
-| **128/128** | Output tok/s | — | **59.3** | **100.3** |
-| | Peak tok/s | **158.8** (8-conc) | **115.0** | **115.0** |
-| | TPOT | — | 44.6 ms | 45.0 ms |
-| | TTFT | — | 5,120 ms | 664 ms |
-| **1024/1024** | Output tok/s | — | **71.7** | **76.4** |
-| | Peak tok/s | — | **100.0** | **100.0** |
-| | TPOT | — | 65.9 ms | 62.9 ms |
-| | TTFT | — | 3,916 ms | 2,577 ms |
-| **2048/2048** | Output tok/s | — | **50.5** | **52.6** |
-| | Peak tok/s | — | **70.0** | **80.0** |
-| | TPOT | — | 95.4 ms | 93.1 ms |
-| | TTFT | — | 7,290 ms | 4,118 ms |
+| **128/128** | Output tok/s | **17.2** ⚠️ | **59.3** | **100.3** |
+| | Peak tok/s | **115.0** | **115.0** | **115.0** |
+| | TPOT | 45.7 ms | 44.6 ms | 45.0 ms |
+| | TTFT | 31,388 ms ⚠️ | 5,120 ms | 664 ms |
+| **1024/1024** | Output tok/s | **54.0** | **71.7** | **76.4** |
+| | Peak tok/s | **100.0** | **100.0** | **100.0** |
+| | TPOT | 67.4 ms | 65.9 ms | 62.9 ms |
+| | TTFT | 25,869 ms ⚠️ | 3,916 ms | 2,577 ms |
+| **2048/2048** | Output tok/s | **46.7** | **50.5** | **52.6** |
+| | Peak tok/s | **85.0** | **70.0** | **80.0** |
+| | TPOT | 92.3 ms | 95.4 ms | 93.1 ms |
+| | TTFT | 30,094 ms ⚠️ | 7,290 ms | 4,118 ms |
 
-Note: 0.8 util batched tests were ad-hoc (8-concurrent, not standardized 5-concurrent). 0.35 and 0.42 use identical methodology (5 prompts, `--request-rate inf`). 0.35 batched data is from the same session as the 0.35 single-user tests above (fresh run).
+> ⚠️ **0.8 util batched TTFT is inflated** — these tests ran first after server start and caught full Triton JIT compilation warmup (25-31s). The TPOT values are valid; TTFT would normalize on subsequent runs. A previous ad-hoc 8-concurrent test at 0.8/4K peaked at 158.8 tok/s after warmup.
+
+All three configs use identical methodology (5 prompts, `--request-rate inf`).
 
 ### Configuration Summary
 
 | Setting | KV Cache | Max Context | Init Time | Single-User | Batched Peak | Best For |
 |---------|----------|-------------|-----------|-------------|-------------|----------|
-| **0.8** | 140,160 tokens | 4,096 | ~172s | 23.4 tok/s | 159 tok/s | Max throughput benchmark |
+| **0.8** | 141,120 tokens | 8,192 | ~47s | 23.0 tok/s | 115 tok/s (159 post-warmup) | Max throughput benchmark |
 | **0.42** | ~51,520 tokens | 32,768 | ~13s | 23.2 tok/s | 115 tok/s | **OpenClaw (recommended)** |
 | **0.35** | ~34,560 tokens | 32,768 | ~13s | 21.9 tok/s | 115 tok/s | Tight memory budget |
 
@@ -335,18 +337,18 @@ Note: 0.8 util batched tests were ad-hoc (8-concurrent, not standardized 5-concu
 | **Medium decode (1K tok)** | 13.8 tok/s (72.6ms) | **16.8 tok/s** (59.5ms) | **+22% faster** |
 | **Long decode (2K/4K tok)** | 12.2 tok/s (81.7ms) | **16.4 tok/s** (61.1ms) | **+34% faster** |
 | **Peak single-user** | 24 tok/s | 24 tok/s | Same ceiling |
-| **Batched peak (0.8 util)** | 90 tok/s | **159 tok/s** | **+77% higher** |
+| **Batched peak (0.8 util)** | 90 tok/s | **115 tok/s** (159 post-warmup) | **+28% higher** |
 | **Batched peak (0.42 util)** | — | **115 tok/s** | 32K context mode |
 | **TTFT (128 tok, single)** | 120 ms | 207 ms | Slower (Triton JIT) |
-| **KV cache (0.8 util)** | 62,720 tokens | 140,160 tokens | **2.2x more** |
+| **KV cache (0.8 util)** | 62,720 tokens | 141,120 tokens | **2.2x more** |
 | **KV cache (0.42 util)** | — | ~45,000 tokens | 32K context mode |
 | **Memory footprint** | 5.69 GiB | 3.68 GiB | **35% smaller** |
 
 ### Analysis: Qwen3.5-4B on Lunar Lake
 
-- **Fastest single-user decode so far** — 23.4 tok/s at short context, staying at 16.3 tok/s even at 2K context (Qwen3-8B drops to 12.2 at 4K)
+- **Fastest single-user decode so far** — 23.0 tok/s at short context, staying at 15.5-16.4 tok/s even at 2K context (Qwen3-8B drops to 12.2 at 4K)
 - **Decode speed plateau at 1K+** — TPOT stays flat at ~61ms from 1K to 2K context, suggesting the Mamba hybrid attention has a different scaling curve than pure attention
-- **Massive batched throughput** — 159 tok/s aggregate at 0.8 util, 115 tok/s even at 0.35 util with 32K context mode
+- **Massive batched throughput** — 115 tok/s peak across all configs, 159 tok/s in ad-hoc 8-concurrent post-warmup test
 - **0.35 util penalty is minimal** — Single-user decode at 0.35 is identical to 0.42 and 0.8 (21.9→16.1 tok/s). Batched peak drops from 115→80 tok/s as context grows, but TPOT (45→93ms) matches 0.42 exactly. The only real difference: 35K KV cache leaves razor-thin headroom for 32K context
 - **TTFT is higher** — 232ms single-user vs 1,710ms batched at 128 tokens. The Triton Intel backend JIT overhead plus chunked prefill queuing with 5 concurrent requests
 - **Triton works on Xe2 iGPU** — This is the first confirmed Triton-dependent model running on Lunar Lake. The `fla/ops` linear attention kernels (Flash Linear Attention) execute correctly via triton-xpu's Intel backend
@@ -377,7 +379,7 @@ vllm serve /shared/models/qwen3.5-4b-int4-autoround \
     --tensor-parallel-size 1 \
     --gpu-memory-utilization 0.8 \
     --enforce-eager \
-    --max-model-len 4096 \
+    --max-model-len 8192 \
     --allow-deprecated-quantization \
     --host 127.0.0.1 --port 8000
 ```
