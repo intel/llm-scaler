@@ -106,6 +106,8 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 | DeepSeek-R1-Distill-Qwen-7B | FP8 (online) | ~8GB | 32k | Good reasoning |
 | Qwen3-14B | INT4 (online) | ~10GB | 16k | Needs `--quantization int4` |
 | Qwen3-8B | FP16 | ~18GB | 16k | No quantization loss |
+| qwen3.5-9b-claude-distilled | BF16 (none) | **17.66 GiB** | 32k | **Tested — too slow** (5 tok/s single-user, 205ms TPOT). ~18B total Mamba hybrid params. Not viable for interactive chat. |
+| Intel/Qwen3.5-9B-int4-AutoRound | AutoRound INT4 | **~9 GiB** | 32k | Untested. Would still be ~2x slower than 4B due to larger Mamba state. |
 
 ### Models That Do NOT Work
 
@@ -355,6 +357,31 @@ All three configs use identical methodology (5 prompts, `--request-rate inf`).
 - **TTFT is higher** — 232ms single-user vs 1,710ms batched at 128 tokens. The Triton Intel backend JIT overhead plus chunked prefill queuing with 5 concurrent requests
 - **Triton works on Xe2 iGPU** — This is the first confirmed Triton-dependent model running on Lunar Lake. The `fla/ops` linear attention kernels (Flash Linear Attention) execute correctly via triton-xpu's Intel backend
 - **Server logs confirm stability** — Steady 16.1-16.8 tok/s generation over extended runs, no degradation or GPU faults
+
+## Benchmark Results: Qwen3.5-9B Claude Distilled (BF16 — Too Slow)
+
+**Model:** qwen3.5-9b-claude-4.6-opus-reasoning-distilled (17.66 GiB loaded, BF16, no quantization)
+**Architecture:** `Qwen3_5ForConditionalGeneration` — hybrid Mamba + attention (same as 4B), multimodal with image processor
+**Note:** Despite the "9B" name, the Mamba state-space layers add ~80% more weights — total is ~18B parameters at BF16.
+**Server config:** `--max-model-len 32768 --gpu-memory-utilization 0.8 --enforce-eager`
+**KV cache:** 26,240 tokens (0.8 util with 17.66 GiB model leaves minimal room)
+
+### Batched Throughput (5 concurrent, `--request-rate inf`)
+
+| Context | Output tok/s | TPOT | TTFT | Notes |
+|---------|:----------:|:----:|:----:|-------|
+| **128/128** | 6.0 | 205 ms | 81,417 ms | TTFT inflated by 404 errors (multimodal `/v1/completions` routing) |
+| **1024/1024** | 16.3 | 268 ms | 40,104 ms | Steady ~16.5-18.5 tok/s total across 5 concurrent |
+| **2048/2048** | 15.4 | 299 ms | 52,743 ms | Memory pressure evident |
+
+### Analysis: Qwen3.5-9B Distilled on Lunar Lake
+
+- **~4-5x slower than Qwen3.5-4B** — 205ms TPOT vs 43ms at 128 tokens, 299ms vs 61ms at 2K tokens
+- **Not viable for interactive chat** — ~5 tok/s single-user (~200ms per token) feels sluggish. Qwen3.5-4B delivers 23 tok/s.
+- **17.66 GiB at BF16 eats nearly all shared memory** — only 26K tokens KV cache at 0.8 util, vs 141K for the 4B model
+- **Multimodal routing issue** — `/v1/completions` returns 404; must use `/v1/chat/completions` endpoint. Benchmark client eventually retried correctly.
+- **Would need INT4 quantization to be practical** — `Intel/Qwen3.5-9B-int4-AutoRound` (~9 GiB) would free up memory, but the ~9B Mamba hybrid is still ~2x slower decode than the 4B variant
+- **Verdict: Qwen3.5-4B remains the best model for Lunar Lake** — 3.68 GiB, 23 tok/s, room for 32K context + ASR + TTS
 
 ## Running Recipes (MSI Claw 8 AI+)
 
