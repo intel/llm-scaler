@@ -323,11 +323,13 @@ All three configs use identical methodology (5 prompts, `--request-rate inf`).
 
 ### Configuration Summary
 
-| Setting | KV Cache | Max Context | Init Time | Single-User | Batched Peak | Best For |
-|---------|----------|-------------|-----------|-------------|-------------|----------|
-| **0.8** | 141,120 tokens | 8,192 | ~47s | 23.0 tok/s | 110 tok/s (22s TTFT!) | Benchmark only, high TTFT |
-| **0.42** | ~51,520 tokens | 32,768 | ~13s | 23.2 tok/s | 115 tok/s | **OpenClaw (recommended)** |
-| **0.35** | ~34,560 tokens | 32,768 | ~13s | 21.9 tok/s | 115 tok/s | Tight memory budget |
+| Setting | KV Cache | Max Context | KV Headroom | Init Time | Single-User | Batched TTFT (128 tok) | Batched Peak | Best For |
+|---------|----------|-------------|-------------|-----------|-------------|----------------------|-------------|----------|
+| **0.8** | 141,120 tokens | 8,192 | 17x | ~47s | 23.0 tok/s | **22,370 ms** | 110 tok/s | Benchmark only |
+| **0.42** | ~51,520 tokens | 32,768 | 57% over 32K | ~13s | 23.2 tok/s | **5,120 ms** | 115 tok/s | **OpenClaw (recommended)** |
+| **0.35** | ~34,560 tokens | 32,768 | 5% over 32K | ~13s | 21.9 tok/s | **664 ms** | 115 tok/s | LLM + ASR + TTS |
+
+> **Sweet spot analysis:** 0.35 has the best batched TTFT but only 5% KV headroom — risky for full 32K conversations. 0.42 trades 4.5s extra batched TTFT for 57% safety margin. Single-user TTFT is identical across all three configs (~204-220ms). For OpenClaw single-user chat, 0.42 gives the best balance of safety and performance.
 
 ### Qwen3.5-4B vs Qwen3-8B Comparison
 
