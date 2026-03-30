@@ -1,7 +1,7 @@
 diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
 --- a/vllm/model_executor/models/registry.py
 +++ b/vllm/model_executor/models/registry.py
-@@ -770,9 +770,34 @@
+@@ -391,9 +391,34 @@
  def _try_inspect_model_cls(
      model_arch: str,
      model: _BaseRegisteredModel,
