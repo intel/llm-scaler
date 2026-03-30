@@ -57,7 +57,7 @@ RUN python3 -m pip config set global.break-system-packages true
 RUN --mount=type=cache,target=/root/.cache/pip \
     git clone -b v0.14.0 https://github.com/vllm-project/vllm.git && \
     cd vllm && \
-    git apply /tmp/vllm_for_multi_arc.patch && \
+    git apply --whitespace=nowarn /tmp/vllm_for_multi_arc.patch && \
     git apply /tmp/fix_registry_subprocess_env.patch && \
     pip install -r requirements/xpu.txt && \
     pip install arctic-inference==0.1.1 && \
