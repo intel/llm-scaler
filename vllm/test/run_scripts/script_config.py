@@ -153,6 +153,7 @@ class ScriptConfig:
         print("model %s not found" % model_name)
         return "", False
 
+    @staticmethod
     def build_sub_obj(data: Dict[str, Any]) :
         path = data.get("Path", {})
         dataset = data.get("Dataset", {})
@@ -166,7 +167,7 @@ class ScriptConfig:
         )
         dataset_obj = DatasetConfig(
             name=dataset.get("name", "random"),
-            path=dataset.get("path"),
+            path=dataset.get("path", ""),
             input_len=int(dataset.get("random-input-len", 1024)),
             output_len=int(dataset.get("random-output-len", 512)),
         )

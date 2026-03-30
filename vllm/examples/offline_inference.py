@@ -16,6 +16,8 @@ sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
 def main():
     # Create an LLM.
+    # TODO: "MODEL_PATH" is a placeholder. Replace with the actual path or Hugging Face
+    # model ID before running (e.g., LLM(model="/path/to/model") or LLM(model="Qwen/Qwen2.5-7B-Instruct")).
     llm = LLM(model="MODEL_PATH")
     # Generate texts from the prompts.
     # The output is a list of RequestOutput objects

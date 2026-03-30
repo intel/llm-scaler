@@ -35,7 +35,8 @@ def parse_model_and_tag(text: str):
     return model, tag
 
 def parse_batch_size(text: str):
-    return re.findall(r"\d+", text)[0]
+    matches = re.findall(r"\d+", text)
+    return matches[0] if matches else ""
 
 def extract_config_info(path: str, add_config_header) -> str:
     if not add_config_header:
@@ -73,6 +74,8 @@ if __name__ == '__main__':
     results = []
     current_group = []
 
+    if not os.path.exists(raw_data):
+        raise FileNotFoundError(f"Input file not found: {raw_data}")
     with open(raw_data, encoding="UTF-8") as f:
         for dataline in f:
             dataline = dataline.strip()

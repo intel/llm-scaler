@@ -11,10 +11,7 @@ import tempfile
 import shutil
 from uuid import uuid4
 
-VIDEO_TEMP_DIR = Path("gradio_temp_videos")
-if VIDEO_TEMP_DIR.exists():
-    shutil.rmtree(VIDEO_TEMP_DIR) 
-VIDEO_TEMP_DIR.mkdir()
+VIDEO_TEMP_DIR = Path(tempfile.mkdtemp(prefix="gradio_temp_videos_"))
 
 parser = argparse.ArgumentParser(description='Multimodal Chatbot with Video Support')
 parser.add_argument('--model-url', type=str, default='http://localhost:8000/v1', help='Model URL')
@@ -45,11 +42,10 @@ def extract_frames_from_video(video_path: str, num_frames: int = 10) -> List[str
         total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
         if total_frames <= 0: return []
         
-        # <--- MODIFIED: 修正了抽帧逻辑，使用均匀间隔的帧索引
         frame_indices = [int(i) for i in (total_frames / (num_frames + 1) * (j + 1) for j in range(num_frames))]
         temp_files = []
-        
-        for frame_index in range(total_frames//15):
+
+        for frame_index in frame_indices:
             video.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
             success, frame = video.read()
             if success:
@@ -82,8 +78,9 @@ def predict(messages: List[Dict[str, Any]]):
             if chunk.choices[0].delta.content is not None:
                 yield chunk.choices[0].delta.content, False 
     except APIError as e:
-        error_message = f"抱歉，调用模型时出错: {e.message}"
-        if "longer than the maximum model length" in e.message:
+        error_text = str(e)
+        error_message = f"抱歉，调用模型时出错: {error_text}"
+        if "longer than the maximum model length" in error_text:
             error_message = "❌ **输入内容过长** ❌\n\n抱歉，您上传的文本、图片或视频帧的总长度超过了模型的处理上限。请尝试：\n\n- 缩短文字描述\n- 上传尺寸更小的图片\n- 截取更短时间的视频片段"
         
         yield error_message, True 

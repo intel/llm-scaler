@@ -288,6 +288,7 @@ def benchmark_t2v_model(workflow_json_template, model_name="ComfyUI Workflow"):
         print(f"  Trial successful. Total duration: {duration:.4f} seconds.")
 
     # --- Results ---
+    avg_latency = None
     print("\n--- Benchmark Results ---")
     if not latencies:
         print("No successful trials completed to report statistics.")

@@ -1,4 +1,6 @@
 import argparse
+import json
+import shlex
 
 from script_config import ScriptConfig, default_config, ModelSpec
 
@@ -64,13 +66,15 @@ def run_model(container, model:ModelSpec, config:ScriptConfig):
         outstr += '--quantization %s ' % model.quantization
     outstr += '-tp=%d ' % model.tp
     if model.spec_config:
-        outstr += '--speculative_config=\'{\\"method\\": \\"%s\\", \
-        \\"model\\": \\"%s\\", \\"num_speculative_tokens\\": %d}\' ' \
-        % (model.spec_config.method, model.spec_config.model, 
-           model.spec_config.num_speculative_tokens)
+        spec_dict = {
+            "method": model.spec_config.method,
+            "model": model.spec_config.model,
+            "num_speculative_tokens": model.spec_config.num_speculative_tokens,
+        }
+        outstr += '--speculative_config=%s ' % shlex.quote(json.dumps(spec_dict))
     if model.extra_param:
         for flag, value in model.extra_param.items():
-            outstr += '%s=%s ' % (flag,value)
+            outstr += '%s=%s ' % (flag, shlex.quote(str(value)))
     outstr += '" 2>&1 | tee -a "${EXPDIR}/model.log" &'
     print(outstr + "\n")
 
@@ -113,7 +117,7 @@ def run_bench(container, model:ModelSpec, batch,config:ScriptConfig):
         outstr += '--random-input-len=%d ' % config.Dataset.input_len
         outstr += '--random-output-len=%d ' % config.Dataset.output_len
     else:
-        outstr += 'dataset-path %s' % config.Dataset.path
+        outstr += '--dataset-path %s ' % config.Dataset.path
     outstr += '--ignore-eos '
     outstr += '--num-prompt %d ' % batch
     outstr += '--trust_remote_code '
