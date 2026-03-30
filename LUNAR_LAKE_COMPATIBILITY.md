@@ -382,20 +382,30 @@ vllm serve /shared/models/qwen3.5-4b-int4-autoround \
     --host 127.0.0.1 --port 8000
 ```
 
-### LLM — Qwen3.5-4B INT4 (port 8082) — OpenClaw backup chatbot, 32K context
+### LLM — Qwen3.5-4B INT4 (port 8082) — OpenClaw fallback model, 32K context + tool calling
 
 ```bash
 vllm-activate
 vllm serve /shared/models/qwen3.5-4b-int4-autoround \
     --tensor-parallel-size 1 \
-    --gpu-memory-utilization 0.35 \
+    --gpu-memory-utilization 0.42 \
     --enforce-eager \
     --max-model-len 32768 \
     --allow-deprecated-quantization \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
     --host 127.0.0.1 --port 8082
 ```
 
-**Memory budget at 0.35 util:** 34,560 token KV cache — fits 1 full 32K conversation or ~4 short (<4K) concurrent chats. Use 0.45 for safer headroom (~50K tokens). Use 0.8 for benchmarking (140K tokens, 4+ concurrent 32K requests).
+**Flags explained:**
+- `--reasoning-parser qwen3` — parses `<think>...</think>` reasoning blocks from Qwen3.5's hybrid thinking mode
+- `--enable-auto-tool-choice` — lets the model decide when to call tools (required for OpenClaw agent)
+- `--tool-call-parser qwen3_coder` — parses Qwen3.5's JSON tool call format into OpenAI-compatible `tool_calls` responses
+
+> **Note:** If tool calls fail or return malformed JSON, try `--tool-call-parser qwen3_xml` as a fallback parser. A dedicated `qwen35_coder` parser is in development ([vllm-project/vllm#35347](https://github.com/vllm-project/vllm/pull/35347)).
+
+**Memory budget at 0.42 util:** ~51,520 token KV cache — fits 1 full 32K conversation with comfortable headroom.
 
 | `--gpu-memory-utilization` | KV Cache | 32K Concurrency | Use Case |
 |---------------------------|----------|-----------------|----------|
