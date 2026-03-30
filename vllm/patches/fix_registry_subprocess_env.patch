@@ -1,7 +1,7 @@
 diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
 --- a/vllm/model_executor/models/registry.py
 +++ b/vllm/model_executor/models/registry.py
-@@ -770,9 +770,30 @@
+@@ -770,9 +770,34 @@
  def _try_inspect_model_cls(
      model_arch: str,
      model: _BaseRegisteredModel,
@@ -36,8 +36,8 @@ diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models
 +                supports_transcription_only=False,
 +            )
          return None
-
-@@ -1144,7 +1165,17 @@
+ 
+@@ -1144,7 +1169,18 @@
          # cannot use `sys.executable __file__` here because the script
          # contains relative imports
 +        # On XPU, the subprocess must not initialize SYCL/Level Zero
@@ -55,19 +55,19 @@ diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models
 +            _SUBPROCESS_COMMAND, input=input_bytes, capture_output=True,
 +            env=sub_env,
          )
-
+ 
          # check if the subprocess is successful
-
+ 
 diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
 --- a/vllm/platforms/xpu.py
 +++ b/vllm/platforms/xpu.py
 @@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional
-
+ 
  import torch
 -import vllm_xpu_kernels._C
 -import vllm_xpu_kernels._xpu_C
 +if os.environ.get("VLLM_TARGET_DEVICE", "").lower() != "cpu":
 +    import vllm_xpu_kernels._C
 +    import vllm_xpu_kernels._xpu_C
-
+ 
  import vllm.envs as envs
