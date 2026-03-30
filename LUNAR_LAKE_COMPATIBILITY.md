@@ -211,48 +211,41 @@ Additionally, the `all_reduce` warmup in `vllm/v1/worker/xpu_worker.py` (lines ~
 **Hardware:** MSI Claw 8 AI+ — Intel Core Ultra 7 258V, Arc 140V iGPU, 32GB LPDDR5x (136.5 GB/s)
 **Model:** Intel/Qwen3-8B-int4-AutoRound (5.7GB on disk, 5.69 GiB loaded)
 **Server config:** `--max-model-len 8192 --gpu-memory-utilization 0.8 --enforce-eager --allow-deprecated-quantization`
+**KV cache:** 116,672 tokens (14.2x concurrency at 8K context)
 **Tool:** `vllm bench serve` with random dataset
 
 ### Single-User Performance (`--max-concurrency 1`)
 
 The most relevant benchmark for interactive chat (OpenClaw/Lyra). Requests run strictly one at a time.
 
-#### Prefill Speed (Time to First Token)
-
-| Input Length | TTFT (median) | Prefill Throughput |
-|-------------|--------------|-------------------|
-| 128 tokens | **120 ms** | **1,067 tok/s** |
-| 1,024 tokens | **278 ms** | **3,683 tok/s** |
-| 4,096 tokens | **382 ms** | **10,723 tok/s** |
-
-Prefill throughput scales dramatically with prompt length — the Xe2 GPU is better utilized with larger matrix operations. Short prompts underutilize the GPU.
-
 #### Decode Speed (Token Generation)
 
-| Context Length | TPOT (median) | Decode Speed | ITL P99 |
-|---------------|--------------|-------------|---------|
-| 128 in / 128 out | **53.7 ms** | **18.6 tok/s** | 54.4 ms |
-| 1,024 in / 1,024 out | **72.6 ms** | **13.8 tok/s** | 92.5 ms |
-| 4,096 in / 4,096 out | **81.7 ms** | **12.2 tok/s** | 103.3 ms |
+| Context Length | TPOT (median) | Decode Speed | ITL P99 | TTFT (median) |
+|---------------|--------------|-------------|---------|---------------|
+| 128 in / 128 out | **53.5 ms** | **18.7 tok/s** | 59.7 ms | 168 ms |
+| 1,024 in / 1,024 out | **72.8 ms** | **13.7 tok/s** | 73.4 ms | 1,510 ms |
+| 2,048 in / 2,048 out | **75.4 ms** | **13.3 tok/s** | 76.3 ms | 1,347 ms |
 
-Decode speed degrades with longer context due to growing KV cache attention computation and LPDDR5x bandwidth limits.
+Decode speed degrades with longer context due to growing KV cache attention computation and LPDDR5x bandwidth limits. TPOT is remarkably consistent across runs (verified twice).
 
 ### Batched Throughput (5 concurrent, `--request-rate inf`)
 
-| Workload | Output tok/s | Peak tok/s | TPOT | Server Prefill tok/s |
-|----------|-------------|-----------|------|---------------------|
-| 128 in / 128 out | 23.0 | 90.0 | 56.7 ms | 64 |
-| 1,024 in / 1,024 out | 48.6 | 80.0 | 82.6 ms | 512 |
-| 4,096 in / 4,096 out | 37.3 | 60.0 | 126.5 ms | 1,638 (peak) |
+| Workload | Output tok/s | Peak tok/s | TPOT | TTFT (median) |
+|----------|-------------|-----------|------|---------------|
+| 128 in / 128 out | 18.9 | 90.0 | 56.4 ms | 26,693 ms |
+| 1,024 in / 1,024 out | 48.6 | 80.0 | 81.7 ms | 21,829 ms |
+| 2,048 in / 2,048 out | 45.3 | 75.0 | 97.9 ms | 25,591 ms |
+
+> **High batched TTFT (21-27s)** matches the Qwen3.5-4B pattern at 0.8 util — the 116K token KV cache creates massive scheduling overhead when 5 requests arrive simultaneously.
 
 ### Analysis
 
 - **Interactive chat (single-user):** 13-19 tok/s decode depending on context length — comfortable for real-time chat
-- **Prefill is fast:** 1K-11K tok/s, far exceeding llama.cpp (~300 tok/s). Longer prompts prefill faster per-token due to better GPU utilization
-- **Batched decode barely faster:** 5 concurrent requests only marginally increase per-request TPOT (56.7→53.7ms for short), showing the iGPU is already well-utilized for single requests
-- **Concurrency kills TTFT:** 5 concurrent requests push TTFT from 120ms to 20,600ms due to prefill queuing with chunked prefill (`max_num_batched_tokens=2048`)
-- **Long context penalty:** Decode at 4K context is ~1.5x slower than short context (81.7ms vs 53.7ms), but still usable at 12.2 tok/s
-- **Memory efficient:** Model uses 5.69 GiB, KV cache peaks at ~35% with 5 concurrent long-context requests
+- **TPOT scales linearly with context:** 53.5ms (128 tok) → 72.8ms (1K) → 75.4ms (2K) — pure attention overhead
+- **Batched TPOT only ~5% worse than single-user:** 56.4ms vs 53.5ms at 128 tokens — iGPU already well-utilized for single requests
+- **Concurrency kills TTFT:** 5 concurrent requests push TTFT from 168ms to 26,693ms due to KV cache management at 0.8 util
+- **Long context penalty:** Decode at 2K context is ~1.4x slower than short context (75.4ms vs 53.5ms), but still usable at 13.3 tok/s
+- **Memory efficient:** Model uses 5.71 GiB, KV cache peaks at ~18% with 5 concurrent 2K-context requests
 
 ### Server-Side Observations (10-prompt long-context run)
 
@@ -337,20 +330,20 @@ All three configs use identical methodology (5 prompts, `--request-rate inf`).
 
 | Metric | Qwen3-8B (5.69 GiB) | Qwen3.5-4B (3.68 GiB) | Delta |
 |--------|---------------------|----------------------|-------|
-| **Short decode (128 tok)** | 18.6 tok/s (53.7ms) | **23.2 tok/s** (43.1ms) | **+25% faster** |
-| **Medium decode (1K tok)** | 13.8 tok/s (72.6ms) | **16.8 tok/s** (59.5ms) | **+22% faster** |
-| **Long decode (2K/4K tok)** | 12.2 tok/s (81.7ms) | **16.4 tok/s** (61.1ms) | **+34% faster** |
-| **Peak single-user** | 24 tok/s | 24 tok/s | Same ceiling |
+| **Short decode (128 tok)** | 18.7 tok/s (53.5ms) | **23.2 tok/s** (43.1ms) | **+24% faster** |
+| **Medium decode (1K tok)** | 13.7 tok/s (72.8ms) | **16.8 tok/s** (59.5ms) | **+23% faster** |
+| **Long decode (2K tok)** | 13.3 tok/s (75.4ms) | **16.4 tok/s** (61.1ms) | **+23% faster** |
+| **Peak single-user** | 19 tok/s | 23 tok/s | **+21% faster** |
 | **Batched peak (0.8 util)** | 90 tok/s | **110 tok/s** (22s TTFT!) | **+22% higher** |
 | **Batched peak (0.42 util)** | — | **115 tok/s** | 32K context mode |
-| **TTFT (128 tok, single)** | 120 ms | 207 ms | Slower (Triton JIT) |
-| **KV cache (0.8 util)** | 62,720 tokens | 141,120 tokens | **2.2x more** |
-| **KV cache (0.42 util)** | — | ~45,000 tokens | 32K context mode |
-| **Memory footprint** | 5.69 GiB | 3.68 GiB | **35% smaller** |
+| **TTFT (128 tok, single)** | 168 ms | 207 ms | Slightly slower (Triton JIT) |
+| **KV cache (0.8 util)** | 116,672 tokens | 141,120 tokens | **+21% more** |
+| **KV cache (0.42 util)** | — | ~51,520 tokens | 32K context mode |
+| **Memory footprint** | 5.71 GiB | 3.68 GiB | **36% smaller** |
 
 ### Analysis: Qwen3.5-4B on Lunar Lake
 
-- **Fastest single-user decode so far** — 23.0 tok/s at short context, staying at 15.5-16.4 tok/s even at 2K context (Qwen3-8B drops to 12.2 at 4K)
+- **Fastest single-user decode so far** — 23.0 tok/s at short context, staying at 15.5-16.4 tok/s even at 2K context (Qwen3-8B drops to 13.3 at 2K)
 - **Decode speed plateau at 1K+** — TPOT stays flat at ~61ms from 1K to 2K context, suggesting the Mamba hybrid attention has a different scaling curve than pure attention
 - **Massive batched throughput** — 115 tok/s peak across all configs, 159 tok/s in ad-hoc 8-concurrent post-warmup test
 - **0.35 util penalty is minimal** — Single-user decode at 0.35 is identical to 0.42 and 0.8 (21.9→16.1 tok/s). Batched peak drops from 115→80 tok/s as context grows, but TPOT (45→93ms) matches 0.42 exactly. The only real difference: 35K KV cache leaves razor-thin headroom for 32K context
