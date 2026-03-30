@@ -102,8 +102,8 @@ class ScriptConfig:
     DATE: str = ""
     Port: int = 8000
     XPU: Optional[str] = None
-    Path: PathConfig = field(default_factory=lambda: PathConfig(ModelPath="", TestPath="", LogPath="",AnalysisPath=""))
-    Dataset: DatasetConfig = field(default_factory=lambda: DatasetConfig(name="random", input_len=1024, output_len=512))
+    Path: PathConfig = field(default_factory=lambda: PathConfig(ModelPath=[], TestPath="", LogPath="",AnalysisPath=""))
+    Dataset: DatasetConfig = field(default_factory=lambda: DatasetConfig(name="random", path="", input_len=1024, output_len=512))
     Model: List[ModelSpec] = field(default_factory=list)
 
     def __post_init__(self):

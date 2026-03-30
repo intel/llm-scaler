@@ -7,4 +7,4 @@ scrape_configs:
   - job_name: vllm
     static_configs:
       - targets:
-          - 'host.docker.internal:8000' # the default port used by vLLM service
+          - 'host.docker.internal:8000' # Docker Desktop (Mac/Windows); on Linux use the host IP, e.g. 172.17.0.1:8000
