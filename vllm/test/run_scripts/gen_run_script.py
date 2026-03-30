@@ -1,8 +1,28 @@
 import argparse
 import json
 import shlex
+import re
 
 from script_config import ScriptConfig, default_config, ModelSpec
+
+SAFE_EXTRA_PARAM_KEY = re.compile(r"^--[a-zA-Z0-9][a-zA-Z0-9-_]*$")
+
+
+def validate_extra_param_keys(config: ScriptConfig):
+    for model in config.Model:
+        if not model.extra_param:
+            continue
+        for key in model.extra_param.keys():
+            if not SAFE_EXTRA_PARAM_KEY.match(key):
+                raise ValueError(
+                    f"Invalid extra_param key '{key}' for model '{model.name}'. "
+                    "Expected pattern: ^--[a-zA-Z0-9][a-zA-Z0-9-_]*$"
+                )
+
+
+def q(value):
+    return shlex.quote(str(value))
+
 
 def create_container(container,config:ScriptConfig):
     outstr = '# create container version %s\n' % config.VERSION
@@ -10,11 +30,11 @@ def create_container(container,config:ScriptConfig):
     outstr += '--privileged '
     outstr += '--net=host '
     outstr += '--device=/dev/dri '
-    outstr += '--name=%s ' % container
+    outstr += '--name=%s ' % q(container)
     for path, path_map in config.Path.ModelPathMap.items():
-        outstr += '-v %s:%s ' % (path, path_map)
+        outstr += '-v %s:%s ' % (q(path), q(path_map))
     if config.Path.TestPath and config.Path.TestPath != "":
-        outstr += '-v %s:/llm/test/ ' % (config.Path.TestPath)
+        outstr += '-v %s:%s ' % (q(config.Path.TestPath), q('/llm/test/'))
     outstr += '-e no_proxy=localhost,127.0.0.1 '
     outstr += '-e http_proxy=$http_proxy '
     outstr += '-e https_proxy=$https_proxy '
@@ -24,32 +44,32 @@ def create_container(container,config:ScriptConfig):
     print(outstr + "\n")
 
 def start_container(container):
-    outstr = 'sudo docker start %s ' % container
+    outstr = 'sudo docker start %s ' % q(container)
     print(outstr + "\n")
 
 def stop_container(container):
-    outstr = 'sudo docker stop %s ' % container
+    outstr = 'sudo docker stop %s ' % q(container)
     print(outstr + "\n")
 
 def rm_container(container): 
-    outstr = 'sudo docker rm %s ' % container
+    outstr = 'sudo docker rm %s ' % q(container)
     print(outstr + "\n")
 
 def run_model(container, model:ModelSpec, config:ScriptConfig):
     outstr = '# start model %s\n' % model.name
     if model.tag and model.tag != "":
-        outstr += 'EXPDIR="%s/%s/%s+%s" && ' % (config.Path.LogPath, container, model.name, model.tag)
+        outstr += 'EXPDIR=%s && ' % q(f"{config.Path.LogPath}/{container}/{model.name}+{model.tag}")
     else:
-        outstr += 'EXPDIR="%s/%s/%s" && ' % (config.Path.LogPath, container, model.name)
+        outstr += 'EXPDIR=%s && ' % q(f"{config.Path.LogPath}/{container}/{model.name}")
     outstr += 'mkdir -p ${EXPDIR} && touch "${EXPDIR}/model.log" && '
-    outstr += 'docker exec -i %s bash -lc "' % container
+    outstr += 'docker exec -i %s bash -lc "' % q(container)
     if config.XPU:
-        outstr += 'ZE_AFFINITY_MASK=%s ' % config.XPU 
+        outstr += 'ZE_AFFINITY_MASK=%s ' % q(config.XPU)
     outstr += 'VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 '
     outstr += 'VLLM_WORKER_MULTIPROC_METHOD=spawn '
     outstr += 'python3 -m vllm.entrypoints.openai.api_server '
-    outstr += '--model %s ' % model.path
-    outstr += '--served-model-name %s ' % model.name
+    outstr += '--model %s ' % q(model.path)
+    outstr += '--served-model-name %s ' % q(model.name)
     outstr += '--dtype=float16 '
     outstr += '--enforce-eager '
     outstr += '--port %d ' % config.Port
@@ -63,7 +83,7 @@ def run_model(container, model:ModelSpec, config:ScriptConfig):
     outstr += '--max-model-len=2048 '
     outstr += '--block-size 64 '
     if model.quantization:
-        outstr += '--quantization %s ' % model.quantization
+        outstr += '--quantization %s ' % q(model.quantization)
         outstr += '--allow-deprecated-quantization '
     outstr += '-tp=%d ' % model.tp
     if model.spec_config:
@@ -75,7 +95,7 @@ def run_model(container, model:ModelSpec, config:ScriptConfig):
         outstr += '--speculative_config=%s ' % shlex.quote(json.dumps(spec_dict))
     if model.extra_param:
         for flag, value in model.extra_param.items():
-            outstr += '%s=%s ' % (flag, shlex.quote(str(value)))
+            outstr += '%s=%s ' % (q(flag), q(value))
     outstr += '" 2>&1 | tee -a "${EXPDIR}/model.log" &'
     print(outstr + "\n")
 
@@ -84,12 +104,12 @@ def check_ready(config:ScriptConfig):
     print(outstr + "\n")
 
 def process_data(container, config:ScriptConfig):
-    outstr = 'find %s/%s -type f -name \'*.out\' -print0' % (config.Path.LogPath, container)
-    outstr += '| xargs -0 -I{} python run_scripts/process_data.py --raw_data "{}" --add_config_header True --output %s ' % (config.Path.AnalysisPath) 
+    outstr = 'find %s -type f -name \'*.out\' -print0' % q(f"{config.Path.LogPath}/{container}")
+    outstr += '| xargs -0 -I{} python run_scripts/process_data.py --raw_data "{}" --add_config_header True --output %s ' % q(config.Path.AnalysisPath)
     print(outstr + "\n")
 
 def post_process_data(config:ScriptConfig):
-    outstr = 'find %s/%s -type f -name \'*.csv\' -print0' % (config.Path.AnalysisPath, config.DATE)
+    outstr = 'find %s -type f -name \'*.csv\' -print0' % q(f"{config.Path.AnalysisPath}/{config.DATE}")
     outstr += '| xargs -0 -I{} python run_scripts/post_process_data.py "{}"'
     print(outstr + "\n")
 
@@ -107,18 +127,18 @@ def run_bench(container, model:ModelSpec, batch,config:ScriptConfig):
     if model.tag and model.tag != "":
         name_and_tag += "+" + model.tag
     outstr = '# start bench for model %s\n' % name
-    outstr += 'EXPDIR="%s/%s/%s" && ' % (config.Path.LogPath,container, name_and_tag)
+    outstr += 'EXPDIR=%s && ' % q(f"{config.Path.LogPath}/{container}/{name_and_tag}")
     outstr += 'mkdir -p "${EXPDIR}" && touch "${EXPDIR}/bs-%s.out" && ' % batch
-    outstr += 'docker exec -i %s bash -lc "' % container
+    outstr += 'docker exec -i %s bash -lc "' % q(container)
     outstr += 'vllm bench serve '
-    outstr += '--model %s ' % model.path
-    outstr += '--served-model-name %s ' % name
-    outstr += '--dataset-name %s ' %  config.Dataset.name
+    outstr += '--model %s ' % q(model.path)
+    outstr += '--served-model-name %s ' % q(name)
+    outstr += '--dataset-name %s ' % q(config.Dataset.name)
     if config.Dataset.name == "random":
         outstr += '--random-input-len=%d ' % config.Dataset.input_len
         outstr += '--random-output-len=%d ' % config.Dataset.output_len
     else:
-        outstr += '--dataset-path %s ' % config.Dataset.path
+        outstr += '--dataset-path %s ' % q(config.Dataset.path)
     outstr += '--ignore-eos '
     outstr += '--num-prompt %d ' % batch
     outstr += '--trust_remote_code '
@@ -129,6 +149,7 @@ def run_bench(container, model:ModelSpec, batch,config:ScriptConfig):
     print(outstr + "\n")
 
 def gen_run_scripts(config:ScriptConfig):
+    validate_extra_param_keys(config)
     print('#!/bin/bash\n')
     container = config.DATE + "-" + config.VERSION.replace(' ', "_").replace('(',"_").replace(')',"_")
     
@@ -156,7 +177,11 @@ def main():
         config = ScriptConfig.from_dict(default_config)
     else:
         config = ScriptConfig.from_yaml(config_path)
-    gen_run_scripts(config)
+    try:
+        gen_run_scripts(config)
+    except ValueError as err:
+        print(f"Config validation error: {err}")
+        raise SystemExit(1)
 
 if __name__ == "__main__":
     main()
