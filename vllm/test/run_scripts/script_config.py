@@ -146,12 +146,33 @@ class ScriptConfig:
         return yaml.safe_dump(self.to_dict(), allow_unicode=True, sort_keys=False)
 
     def check_and_get_model_path(self, model_name: str):
+        model_name = model_name.strip()
         for path in self.Path.ModelPath:
-            if os.path.exists(path+model_name):
-                model_path = self.Path.ModelPathMap[path] + model_name
-                return model_path, True
+            for candidate in self._build_model_candidates(model_name):
+                if os.path.exists(path + candidate):
+                    model_path = self.Path.ModelPathMap[path] + candidate
+                    return model_path, True
         print("model %s not found" % model_name)
         return "", False
+
+    @staticmethod
+    def _build_model_candidates(model_name: str) -> List[str]:
+        """
+        Build possible local directory names for a model.
+        This allows configs to use either local folder names
+        (e.g. `Qwen3.5-9B-Instruct`) or Hub repo ids
+        (e.g. `Qwen/Qwen3.5-9B-Instruct`).
+        """
+        candidates = [model_name]
+
+        if "/" in model_name:
+            _, suffix = model_name.split("/", 1)
+            candidates.append(suffix)
+            candidates.append(model_name.replace("/", "--"))
+            candidates.append(f"models--{model_name.replace('/', '--')}")
+
+        # Keep ordering stable while removing duplicates.
+        return list(dict.fromkeys(candidates))
 
     @staticmethod
     def build_sub_obj(data: Dict[str, Any]) :
