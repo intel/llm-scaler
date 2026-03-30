@@ -1,4 +1,5 @@
 import os
+import csv
 from datetime import datetime
 import unicodedata  # 处理 ASCII 码的包
 import argparse
@@ -38,9 +39,9 @@ def parse_batch_size(text: str):
     matches = re.findall(r"\d+", text)
     return matches[0] if matches else ""
 
-def extract_config_info(path: str, add_config_header) -> str:
+def extract_config_info(path: str, add_config_header) -> List[str]:
     if not add_config_header:
-        return ",,,,,"
+        return []
     
     parts = path.strip().split(os.sep)
     for i in range(len(parts)):
@@ -50,13 +51,13 @@ def extract_config_info(path: str, add_config_header) -> str:
             continue
         date, version = m.group(1), m.group(2)
         if i+2 >=len(parts):
-            return ',,,,,'
+            return ["", "", "", "", ""]
 
         model_and_tag = parts[i + 1]
         model,tag = parse_model_and_tag(model_and_tag)
         batch_size = parse_batch_size(parts[i+2])
-        return ", ".join([date, version, model, tag, batch_size])+", "
-    return ',,,,,'
+        return [date, version, model, tag, batch_size]
+    return ["", "", "", "", ""]
 
 if __name__ == '__main__':
 
@@ -127,16 +128,20 @@ if __name__ == '__main__':
         headers = result_headers
     
 
-    with open(f'{filename}_unrounded.csv', 'a') as f:
+    with open(f'{filename}_unrounded.csv', 'a', newline='') as f:
+        writer = csv.writer(f)
         if f.tell() == 0:
-            f.write(", ".join(headers) + '\n')
+            writer.writerow(headers)
         for result in results:
-            f.write(config_info + ", ".join(map(str, result)) + '\n')
+            row = config_info + list(map(str, result)) if add_config_header else list(map(str, result))
+            writer.writerow(row)
 
-    with open(f'{filename}.csv', 'a') as f:
+    with open(f'{filename}.csv', 'a', newline='') as f:
+        writer = csv.writer(f)
         if f.tell() == 0:
-            f.write(", ".join(headers) + '\n')
+            writer.writerow(headers)
         for result in results:
-            f.write(config_info + ", ".join(f'{value:.2f}' if isinstance(value, float) else str(value) for value in result) + '\n')
-
+            rounded_result = [f'{value:.2f}' if isinstance(value, float) else str(value) for value in result]
+            row = config_info + rounded_result if add_config_header else rounded_result
+            writer.writerow(row)
 
