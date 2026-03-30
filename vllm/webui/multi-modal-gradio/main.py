@@ -12,6 +12,13 @@ import shutil
 from uuid import uuid4
 
 VIDEO_TEMP_DIR = Path(tempfile.mkdtemp(prefix="gradio_temp_videos_"))
+VIDEO_MIME_TYPES = {
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo",
+    ".mkv": "video/x-matroska",
+}
 
 parser = argparse.ArgumentParser(description='Multimodal Chatbot with Video Support')
 parser.add_argument('--model-url', type=str, default='http://localhost:8000/v1', help='Model URL')
@@ -31,6 +38,12 @@ def is_image_file(filename: str) -> bool:
 def is_video_file(filename: str) -> bool:
     video_exts = ['.mp4', '.avi', '.mkv', '.mov', '.webm']
     return any(filename.lower().endswith(ext) for ext in video_exts)
+
+def get_video_mime_type(filename: str) -> Tuple[str, bool]:
+    extension = Path(filename).suffix.lower()
+    mime_type = VIDEO_MIME_TYPES.get(extension, "application/octet-stream")
+    is_fallback = extension not in VIDEO_MIME_TYPES
+    return mime_type, is_fallback
 
 def encode_file_to_base64(filepath: str) -> str:
     with open(filepath, "rb") as file:
@@ -160,9 +173,12 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
 
                     with open(new_video_path, "rb") as f:
                         base64_data = base64.b64encode(f.read()).decode()
+                    mime_type, is_fallback_mime = get_video_mime_type(filename)
                     ui_display_string += f"""<video controls width="50%">
-                            <source src="data:video/mp4;base64,{base64_data}" type="video/mp4">
+                            <source src="data:{mime_type};base64,{base64_data}" type="{mime_type}">
                         </video>"""
+                    if is_fallback_mime:
+                        ui_display_string += "\n\n> ⚠️ Unknown video extension. Falling back to `application/octet-stream`."
 
                     print(ui_display_string)
 
