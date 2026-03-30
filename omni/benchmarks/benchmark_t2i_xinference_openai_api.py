@@ -72,6 +72,7 @@ def benchmark_t2i_model(model_uid, model_path=None, relaunch=True):
 
     # --- Benchmark Trials ---
     print(f"\n--- Starting Benchmark Trials ({NUM_TRIALS} requests) ---")
+    avg_latency = None
     latencies = []
     for i in range(NUM_TRIALS):
         print(f"Trial request {i+1}/{NUM_TRIALS}...")
@@ -101,6 +102,7 @@ def benchmark_t2i_model(model_uid, model_path=None, relaunch=True):
     print("\n--- Benchmark Results ---")
     if not latencies:
         print("No successful trials completed to report statistics.")
+        print("Average latency unavailable due to 0 successful trials.")
     else:
         print(f"Total successful trials: {len(latencies)}")
         print(f"Configuration:")
