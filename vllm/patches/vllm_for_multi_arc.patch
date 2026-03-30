@@ -21,17 +21,17 @@ index 000000000..1649fadad
 +on:
 +  pull_request:
 +    branches:
-+      - '**release**'  
-+    types: [opened, synchronize, reopened]  # 
++      - '**release**'
++    types: [opened, synchronize, reopened]  #
 +
 +jobs:
 +  run-xpu-BMG-CI:
 +    if: |
 +        github.event_name == 'pull_request' ||
-+        (github.event_name == 'issue_comment' && 
++        (github.event_name == 'issue_comment' &&
 +        github.event.issue.pull_request &&
 +        contains(github.event.comment.body, '/BMG_CI'))
-+    runs-on: BMG 
++    runs-on: BMG
 +
 +    steps:
 +    - name: Fix workspace permissions
@@ -51,7 +51,7 @@ index 000000000..1649fadad
 +      with:
 +        ref: ${{ github.event.pull_request.head.ref }}
 +        path: target_code
-+        fetch-depth: 0  # 
++        fetch-depth: 0  #
 +
 +    - name: Merge PR into Release Branch
 +      run: |
@@ -86,7 +86,7 @@ index 000000000..1649fadad
 +
 +        # No-proxy configuration
 +        NO_PROXY=".intel.com,intel.com,localhost,127.0.0.1"
-+        #docker builder prune -f  #clean cache     
++        #docker builder prune -f  #clean cache
 +        docker builder prune --all --force
 +
 +        #Loop through proxy configurations
@@ -94,7 +94,7 @@ index 000000000..1649fadad
 +          proxy_index=$(( (attempt-1) % ${#PROXIES[@]} ))
 +          proxy=${PROXIES[$proxy_index]}
 +          echo "=== Attempt $attempt/$MAX_RETRIES (Proxy: $proxy) ===" | tee -a "$LOG_FILE"
-+          
++
 +          if [ $attempt -eq 1 ]; then
 +            # First attempt without no_proxy
 +            timeout $TIMEOUT docker build \
@@ -134,7 +134,7 @@ index 000000000..1649fadad
 +
 +        echo "Removing old container if exists..."
 +        docker rm -f vllm_internal_ci || true
-+    
++
 +    - name: Run benchmark inside local Docker image
 +      run: |
 +        # Reuse the image_name from previous step
@@ -170,7 +170,7 @@ index 000000000..1649fadad
 +
 +    - name: Fix permissions
 +      run: sudo chmod -R 755 ${{ runner.workspace }}/applications.ai.gpu.vllm-xpu/qa_ci_code/benchmarks/results/
-+    
++
 +    - name: Debug path
 +      run: ls -la ${{ runner.workspace }}/applications.ai.gpu.vllm-xpu/qa_ci_code/benchmarks/results/
 +
@@ -189,11 +189,11 @@ index 000000000..1649fadad
 +          echo "❌ Benchmark analysis file not found!"
 +          exit 1
 +        fi
-+        
++
 +        echo "📊 Benchmark Results:"
 +        cat "$RESULTS_FILE"
 +        FAILURES=$(jq -r '.[] | select(.function != "pass") | .case_name' "$RESULTS_FILE")
-+        
++
 +        if [ -n "$FAILURES" ]; then
 +          echo "❌ Failed cases detected:"
 +          echo "$FAILURES"
@@ -212,8 +212,8 @@ index 000000000..4a061f324
 +on:
 +  pull_request:
 +    branches:
-+      - '**release**' 
-+    types: [opened, synchronize, reopened]  # 
++      - '**release**'
++    types: [opened, synchronize, reopened]  #
 +
 +jobs:
 +  run-xpu-PVC-CI:
@@ -226,7 +226,7 @@ index 000000000..4a061f324
 +        sudo chmod -R 755 "$GITHUB_WORKSPACE"
 +        sudo rm -f "$GITHUB_WORKSPACE/.git/index.lock" || true
 +
-+    - name: Checkout QA_ci (test code)  # 
++    - name: Checkout QA_ci (test code)  #
 +      uses: actions/checkout@v4
 +      with:
 +        ref: QA_ci
@@ -237,9 +237,9 @@ index 000000000..4a061f324
 +      with:
 +        ref: ${{ github.event.pull_request.head.ref }}
 +        path: target_code
-+        fetch-depth: 0  # 
++        fetch-depth: 0  #
 +
-+    # 
++    #
 +    - name: Merge PR into Release Branch
 +      run: |
 +        cd target_code
@@ -272,15 +272,15 @@ index 000000000..4a061f324
 +
 +        # No-proxy configuration
 +        NO_PROXY=".intel.com,intel.com,localhost,127.0.0.1"
-+        #docker builder prune -f  #clean cache  
++        #docker builder prune -f  #clean cache
 +        docker builder prune --all --force
-+  
++
 +        # Loop through proxy configurations
 +        for (( attempt=1; attempt<=$MAX_RETRIES; attempt++ )); do
 +                  proxy_index=$(( (attempt-1) % ${#PROXIES[@]} ))
 +                  proxy=${PROXIES[$proxy_index]}
 +                  echo "=== Attempt $attempt/$MAX_RETRIES (Proxy: $proxy) ===" | tee -a "$LOG_FILE"
-+                  
++
 +                  if [ $attempt -eq 1 ]; then
 +                    # First attempt without no_proxy
 +                    timeout $TIMEOUT docker build \
@@ -320,7 +320,7 @@ index 000000000..4a061f324
 +
 +        echo "Removing old container if exists..."
 +        docker rm -f vllm_internal_ci || true
-+    
++
 +    - name: Run benchmark inside local Docker image
 +      run: |
 +        # Reuse the image_name from previous step
@@ -356,7 +356,7 @@ index 000000000..4a061f324
 +
 +    - name: Fix permissions
 +      run: sudo chmod -R 755 ${{ runner.workspace }}/applications.ai.gpu.vllm-xpu/qa_ci_code/benchmarks/results/
-+    
++
 +    - name: Debug path
 +      run: ls -la ${{ runner.workspace }}/applications.ai.gpu.vllm-xpu/qa_ci_code/benchmarks/results/
 +
@@ -375,12 +375,12 @@ index 000000000..4a061f324
 +          echo "❌ Benchmark analysis file not found!"
 +          exit 1
 +        fi
-+        
++
 +        echo "📊 Benchmark Results:"
 +        cat "$RESULTS_FILE"
-+        
++
 +        FAILURES=$(jq -r '.[] | select(.function != "pass") | .case_name' "$RESULTS_FILE")
-+        
++
 +        if [ -n "$FAILURES" ]; then
 +          echo "❌ Failed cases detected:"
 +          echo "$FAILURES"
@@ -1634,7 +1634,7 @@ index 000000000..3e9e2cb73
 +      --disable-log-requests \
 +      --dtype float16 \
 +      --enforce-eager"
-+  echo ${BASELINE_BASE_CMD}      
++  echo ${BASELINE_BASE_CMD}
 +  bash -c "${BASELINE_BASE_CMD}" &
 +  sleep 10
 +  wait_for_server ${BASELINE_HOST} ${BASELINE_PORT}
@@ -1700,7 +1700,7 @@ index 000000000..3e9e2cb73
 +  --prefiller-host ${PREFILL_HOST} --prefiller-port ${PREFILL_PORT} \
 +  --decoder-host ${DECODE_HOST} --decoder-port ${DECODE_PORT} \
 +  --host=${PROXY_HOST} --port ${PROXY_PORT}"
-+  echo ${PROXY_BASE_CMD} 
++  echo ${PROXY_BASE_CMD}
 +  bash -c "${PROXY_BASE_CMD}" &
 +  sleep 2
 +}
@@ -2121,7 +2121,7 @@ index f3d9262d2..b4b5b0378 100644
          unique_name: str = "",
      ):
          super().__init__(cpu_group, device, device_group, unique_name)
-+ 
++
 +        from vllm.config import get_current_vllm_config_or_none
 +        config = get_current_vllm_config_or_none()
 +
@@ -3159,7 +3159,7 @@ index 44e990d29..1089087e6 100644
 +
 +        from vllm._ipex_ops import ipex_ops
 +
-+        bsz, q_len = query.size()[:2]  
++        bsz, q_len = query.size()[:2]
 +        kv_len = key.size(1)
 +        is_reshaped = query.dim() != 4
 +
@@ -3802,7 +3802,7 @@ index 475bd8536..0f548843c 100644
 +            input_scale=layer.input_scale,
 +            bias=bias,
 +            )
-+        
++
          weight = layer.weight.data
          weight_scale = layer.weight_scale.data
 +        # In case of pooler models, pooled_data may change to head_dtype like float
@@ -4212,7 +4212,7 @@ index 000000000..f2686cf7f
 +    clib.quantize_q4_0_to_qweight_and_scale(src, qweight, scale, out_features, in_features, block_size)
 +
 +    # Transpose logic (as per original implementation requirement)
-+    # The C code fills row-wise, but IPEX/PyTorch logic here seems to want column-major 
++    # The C code fills row-wise, but IPEX/PyTorch logic here seems to want column-major
 +    # or specific layout for the final parameter, so we transpose results.
 +    out_qweight_ret = out_qweight.transpose(0, 1).contiguous()
 +    out_scale_ret = out_scale.transpose(0, 1).contiguous()
@@ -4330,7 +4330,7 @@ index 000000000..f2686cf7f
 +        qweight, scale = ggml_quantize_tensor(
 +            weight, qweight, scale, out_features, in_features, block_size=QK4_GROUP_SIZE
 +        )
-+        
++
 +        qweight = qweight.to("xpu")
 +        scale = scale.to("xpu")
 +
@@ -7851,7 +7851,7 @@ index 000000000..68e83d66e
 +                        # loaded_weight = loaded_weight.transpose(-1, -2)
 +                        if "experts.gate_up_proj" in name:
 +                            loaded_weight = loaded_weight.chunk(2, dim=-2)
-+                            
++
 +                            if is_padding_needed:
 +                                shape0 = loaded_weight[0].shape[1]
 +                                target_size = round_up(shape0, 1024)
