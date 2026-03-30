@@ -99,6 +99,7 @@ def benchmark_t2i_model(model_uid, model_path=None, relaunch=True):
             break
 
     # --- Results ---
+    avg_latency = None
     print("\n--- Benchmark Results ---")
     if not latencies:
         print("No successful trials completed to report statistics.")
