@@ -15,22 +15,53 @@ def parse_p2p_bandwidth(lines):
     keep_sizes = ["128 MB", "256 MB"]
     results = []
 
+    row_pattern = re.compile(r"^\s*([\d]+\s*[KM]?B)\s*:\s*([\d\.]+)\b")
+
     i = 0
     while i < len(lines):
         line = lines[i]
+        matched_section = None
         for name, pattern in TARGETS.items():
             if re.search(pattern, line):
-                i += 1
-                while i < len(lines) and "BW [GBPS]" in lines[i]:
-                    match = re.search(r"([\d]+ ?[KM]?B):\s+([\d\.]+)", lines[i])
-                    if match:
-                        size = match.group(1).strip()
-                        if size in keep_sizes:
-                            bw = float(match.group(2))
-                            results.append(["p2p", name, size, bw])
-                    i += 1
+                matched_section = name
                 break
+
+        if not matched_section:
+            i += 1
+            continue
+
         i += 1
+        seen_data = False
+        stopped_on_next_section = False
+        while i < len(lines):
+            current = lines[i]
+            stripped = current.strip()
+
+            if stripped == "":
+                break
+
+            if any(re.search(pattern, current) for pattern in TARGETS.values()):
+                stopped_on_next_section = True
+                break
+
+            match = row_pattern.search(current)
+            if match:
+                seen_data = True
+                size = re.sub(r"\s+", " ", match.group(1).strip())
+                if size in keep_sizes:
+                    bw = float(match.group(2))
+                    results.append(["p2p", matched_section, size, bw])
+                i += 1
+                continue
+
+            if not seen_data:
+                i += 1
+                continue
+
+            break
+
+        if not stopped_on_next_section:
+            i += 1
 
     return results
 
