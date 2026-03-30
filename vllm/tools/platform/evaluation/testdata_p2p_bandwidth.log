@@ -1,0 +1,14 @@
+Bandwidth Write : Device( 0 )->Device( 1 )
+P2P Throughput Measurement
+Size [MB]   BW [GBPS]
+----------------------
+64 MB: 80.0
+128 MB: 100.5
+256 MB: 110.25
+512 MB: 95.5
+
+Bandwidth Read : Device( 0 )<-Device( 1 )
+Size [MB]   BW [GBPS]
+128 MB: 98.0
+256 MB: 99.5
+End of report block
