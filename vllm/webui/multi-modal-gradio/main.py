@@ -187,19 +187,15 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         for partial_response, error_flag in response_stream:
             is_error = error_flag
             if is_error:
-                # remove assistant content
-                gradio_history.pop()
+                gradio_history[-1]["content"] = partial_response
+                yield gradio_history, api_history
                 break
 
             full_response += partial_response
             gradio_history[-1]["content"] = full_response
             yield gradio_history, api_history
 
-        if is_error:
-            # remove user content
-            api_history.pop()
-            gradio_history.pop()
-        else:
+        if not is_error:
             api_history.append({"role": "assistant", "content": full_response})
         yield gradio_history, api_history
 
