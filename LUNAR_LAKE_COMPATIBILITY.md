@@ -107,6 +107,7 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 | Qwen3-14B | INT4 (online) | ~10GB | 16k | Needs `--quantization int4` |
 | Qwen3-8B | FP16 | ~18GB | 16k | No quantization loss |
 | qwen3.5-9b-claude-distilled | BF16 (none) | **17.66 GiB** | 32k | **Tested — too slow** (5 tok/s single-user, 205ms TPOT). ~18B total Mamba hybrid params. Not viable for interactive chat. |
+| qwen3.5-9b-claude-distilled | FP8 (online) | **11.22 GiB** | 32k | **Tested — still slow** (~8.5 tok/s est. single-user, 117ms TPOT batched). 37% smaller than BF16. FP8 is the only working online quantization on XPU native. |
 | Intel/Qwen3.5-9B-int4-AutoRound | AutoRound INT4 | **~9 GiB** | 32k | Untested. Would still be ~2x slower than 4B due to larger Mamba state. |
 
 ### Models That Do NOT Work
@@ -375,6 +376,45 @@ All three configs use identical methodology (5 prompts, `--request-rate inf`).
 - **Multimodal routing issue** — `/v1/completions` returns 404; must use `/v1/chat/completions` endpoint. Benchmark client eventually retried correctly.
 - **Would need INT4 quantization to be practical** — `Intel/Qwen3.5-9B-int4-AutoRound` (~9 GiB) would free up memory, but the ~9B Mamba hybrid is still ~2x slower decode than the 4B variant
 - **Verdict: Qwen3.5-4B remains the best model for Lunar Lake** — 3.68 GiB, 23 tok/s, room for 32K context + ASR + TTS
+
+## Benchmark Results: Qwen3.5-9B Claude Distilled (FP8 Online Quantization)
+
+**Model:** qwen3.5-9b-claude-4.6-opus-reasoning-distilled (11.22 GiB loaded, FP8 online quantization)
+**Architecture:** `Qwen3_5ForConditionalGeneration` — hybrid Mamba + attention, multimodal
+**Quantization:** `--quantization fp8` (online FP8 — the only working online quantization method on XPU native install)
+**Memory savings:** 11.22 GiB vs 17.66 GiB BF16 = **37% reduction**
+**Server config:** `--max-model-len 32768 --gpu-memory-utilization 0.8 --enforce-eager --quantization fp8`
+**KV cache:** 79,040 tokens (0.8 util — 3x more than BF16's 26,240 tokens, fits 9.8x concurrent 8K contexts)
+**Peak allocated:** 13.19 GB
+
+### Batched Throughput (5 concurrent, `--request-rate inf`)
+
+| Context | Output tok/s | TPOT | TTFT | Peak tok/s | Notes |
+|---------|:----------:|:----:|:----:|:----------:|-------|
+| **128/128** | 13.66 | 117 ms | 31,949 ms | 45 | ~1.7x faster than BF16 (205ms) |
+| **1024/1024** | 28.97 | 149 ms | 24,099 ms | 45 | Steady 27-43.5 tok/s generation |
+| **2048/2048** | 26.89 | 171 ms | 30,487 ms | 40 | Memory pressure but stable |
+
+### Analysis: FP8 vs BF16 for Qwen3.5-9B Distilled
+
+| Metric | BF16 | FP8 | Improvement |
+|--------|------|-----|-------------|
+| Model size | 17.66 GiB | 11.22 GiB | **37% smaller** |
+| KV cache tokens | 26,240 | 79,040 | **3x more** |
+| TPOT (128 batched) | 205 ms | 117 ms | **1.75x faster** |
+| TPOT (1024 batched) | 268 ms | 149 ms | **1.80x faster** |
+| TPOT (2048 batched) | 299 ms | 171 ms | **1.75x faster** |
+| Est. single-user tok/s | ~5 | ~8.5 | **1.7x faster** |
+
+- **FP8 significantly improves both speed and memory** — 37% less memory, 1.75x faster decode. The smaller model reads less data per forward pass, improving bandwidth utilization.
+- **Still not fast enough for interactive chat** — estimated ~8.5 tok/s single-user (117ms TPOT) vs Qwen3.5-4B's 23 tok/s. Borderline usable but noticeably slower.
+- **KV cache dramatically improved** — 79K tokens vs 26K at BF16. Can now handle 9.8x concurrent 8K contexts instead of 3.3x.
+- **FP8 is the only viable online quantization on XPU native install:**
+  - `sym_int4` — requires `/opt/lib/vllm_int4_for_multi_arc.so` (Docker-only, missing on native)
+  - `inc` — IPEX `varlen_attention` arg count mismatch in vision encoder (19 args given, max 18)
+  - `rtn` — hardcoded `.cuda()` call in `rtn.py:147` (CUDA-only, deprecated)
+  - `fp8` — **works** ✓
+- **Next step: try `Intel/Qwen3.5-9B-int4-AutoRound`** (~9 GiB pre-quantized INT4) — may be faster than FP8 online since INT4 reads even less data per forward pass
 
 ## Running Recipes (MSI Claw 8 AI+)
 
