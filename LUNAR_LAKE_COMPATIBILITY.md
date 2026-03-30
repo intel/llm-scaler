@@ -278,27 +278,28 @@ From the vLLM engine logs during `4096 in / 2048 out × 10 prompts`:
 ## Benchmark Results: Qwen3.5-4B (Hybrid Mamba + Attention with Triton)
 
 **Model:** Qwen3.5-4B-int4-AutoRound (3.68 GiB loaded) — first Triton-dependent model running on Lunar Lake
-**Server config:** `--max-model-len 4096 --gpu-memory-utilization 0.8 --enforce-eager --allow-deprecated-quantization`
 **Tool:** `vllm bench serve` with random dataset
 **Prerequisites:** `triton-xpu==3.6.0` (clean install), `oneapi-level-zero-devel`, `torch.cuda→torch.xpu` patches from `vllm_for_multi_arc.patch`
 
 ### Single-User Performance (`--max-concurrency 1`)
 
-#### Decode Speed (Token Generation)
+#### At `--gpu-memory-utilization 0.8`, `--max-model-len 4096`
 
-| Context Length | TPOT (median) | Decode Speed | ITL P99 |
-|---------------|--------------|-------------|---------|
-| 128 in / 128 out | **42.7 ms** | **23.4 tok/s** | 44.5 ms |
-| 1,024 in / 1,024 out | **61.2 ms** | **16.3 tok/s** | 68.8 ms |
-| 2,048 in / 2,048 out | **61.2 ms** | **16.3 tok/s** | 70.3 ms |
+| Context Length | TPOT (median) | Decode Speed | TTFT (median) | ITL P99 |
+|---------------|--------------|-------------|--------------|---------|
+| 128 in / 128 out | **42.7 ms** | **23.4 tok/s** | 232 ms | 44.5 ms |
+| 1,024 in / 1,024 out | **61.2 ms** | **16.3 tok/s** | 836 ms | 68.8 ms |
+| 2,048 in / 2,048 out | **61.2 ms** | **16.3 tok/s** | 1,541 ms | 70.3 ms |
 
-#### Prefill Speed (Time to First Token)
+#### At `--gpu-memory-utilization 0.42`, `--max-model-len 32768` (OpenClaw mode)
 
-| Input Length | TTFT (median) | Notes |
-|-------------|--------------|-------|
-| 128 tokens | **232 ms** | Higher than Qwen3-8B (120ms) — Triton JIT overhead on first kernel |
-| 1,024 tokens | **836 ms** | |
-| 2,048 tokens | **1,541 ms** | |
+| Context Length | TPOT (median) | Decode Speed | TTFT (median) | ITL P99 |
+|---------------|--------------|-------------|--------------|---------|
+| 128 in / 128 out | **43.1 ms** | **23.2 tok/s** | 207 ms | 44.2 ms |
+| 1,024 in / 1,024 out | **59.5 ms** | **16.8 tok/s** | 790 ms | 66.4 ms |
+| 2,048 in / 2,048 out | **61.1 ms** | **16.4 tok/s** | 1,510 ms | 67.3 ms |
+
+Single-user decode is virtually identical across memory configs — expected since single requests don't benefit from larger KV cache.
 
 ### Batched Throughput (5 concurrent, `--request-rate inf`)
 
@@ -309,7 +310,15 @@ From the vLLM engine logs during `4096 in / 2048 out × 10 prompts`:
 | 128 in / 128 out | — | 158.8 | — | Ad-hoc 8-concurrent test |
 | Server-reported peak | 110.2 | — | — | 10s server log window |
 
-#### At `--gpu-memory-utilization 0.35` (34K KV cache, 32K context, OpenClaw mode)
+#### At `--gpu-memory-utilization 0.42` (~45K KV cache, 32K context, OpenClaw mode)
+
+| Workload | Output tok/s | Peak tok/s | TPOT | TTFT (median) |
+|----------|-------------|-----------|------|--------------|
+| 128 in / 128 out | **59.3** | **115.0** | 44.6 ms | 5,120 ms |
+| 1,024 in / 1,024 out | **71.7** | **100.0** | 65.9 ms | 3,916 ms |
+| 2,048 in / 2,048 out | **50.5** | **70.0** | 95.4 ms | 7,290 ms |
+
+#### At `--gpu-memory-utilization 0.35` (~34K KV cache, 32K context)
 
 | Workload | Output tok/s | Peak tok/s | TPOT | TTFT (median) |
 |----------|-------------|-----------|------|--------------|
@@ -321,15 +330,15 @@ From the vLLM engine logs during `4096 in / 2048 out × 10 prompts`:
 
 | Metric | Qwen3-8B (5.69 GiB) | Qwen3.5-4B (3.68 GiB) | Delta |
 |--------|---------------------|----------------------|-------|
-| **Short decode (128 tok)** | 18.6 tok/s (53.7ms) | **23.4 tok/s** (42.7ms) | **+26% faster** |
-| **Medium decode (1K tok)** | 13.8 tok/s (72.6ms) | **16.3 tok/s** (61.2ms) | **+18% faster** |
-| **Long decode (2K/4K tok)** | 12.2 tok/s (81.7ms) | **16.3 tok/s** (61.2ms) | **+34% faster** |
+| **Short decode (128 tok)** | 18.6 tok/s (53.7ms) | **23.2 tok/s** (43.1ms) | **+25% faster** |
+| **Medium decode (1K tok)** | 13.8 tok/s (72.6ms) | **16.8 tok/s** (59.5ms) | **+22% faster** |
+| **Long decode (2K/4K tok)** | 12.2 tok/s (81.7ms) | **16.4 tok/s** (61.1ms) | **+34% faster** |
 | **Peak single-user** | 24 tok/s | 24 tok/s | Same ceiling |
 | **Batched peak (0.8 util)** | 90 tok/s | **159 tok/s** | **+77% higher** |
-| **Batched peak (0.35 util)** | — | **115 tok/s** | Reduced KV cache |
-| **TTFT (128 tok)** | 120 ms | 232 ms | Slower (Triton JIT) |
+| **Batched peak (0.42 util)** | — | **115 tok/s** | 32K context mode |
+| **TTFT (128 tok, single)** | 120 ms | 207 ms | Slower (Triton JIT) |
 | **KV cache (0.8 util)** | 62,720 tokens | 140,160 tokens | **2.2x more** |
-| **KV cache (0.35 util)** | — | 34,560 tokens | 32K context mode |
+| **KV cache (0.42 util)** | — | ~45,000 tokens | 32K context mode |
 | **Memory footprint** | 5.69 GiB | 3.68 GiB | **35% smaller** |
 
 ### Analysis: Qwen3.5-4B on Lunar Lake
