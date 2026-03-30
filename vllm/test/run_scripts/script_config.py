@@ -204,10 +204,14 @@ class ScriptConfig:
                     num_speculative_tokens=spec.get("num_speculative_tokens"),
                 )
 
+            tp = int(model.get("tp", 1))
+            if tp < 1:
+                raise ValueError("ModelSpec.tp must be >= 1")
+
             model_obj = ModelSpec(
                 name=model.get("name"),
                 tag=model.get("tag",""),
-                tp=int(model.get("tp")),
+                tp=tp,
                 quantization=model.get("quantization"),
                 batch=[int(x) for x in model.get("batch").split(',')],
                 spec_config=spec_obj,
