@@ -349,7 +349,7 @@ vllm serve /shared/models/qwen3-8b-int4-autoround \
     --host 127.0.0.1 --port 8000
 ```
 
-### LLM — Qwen3.5-4B INT4 (port 8000) — Fastest option
+### LLM — Qwen3.5-4B INT4 (port 8000) — Fastest option, benchmark mode
 
 ```bash
 vllm-activate
@@ -361,6 +361,28 @@ vllm serve /shared/models/qwen3.5-4b-int4-autoround \
     --allow-deprecated-quantization \
     --host 127.0.0.1 --port 8000
 ```
+
+### LLM — Qwen3.5-4B INT4 (port 8082) — OpenClaw backup chatbot, 32K context
+
+```bash
+vllm-activate
+vllm serve /shared/models/qwen3.5-4b-int4-autoround \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.35 \
+    --enforce-eager \
+    --max-model-len 32768 \
+    --allow-deprecated-quantization \
+    --host 127.0.0.1 --port 8082
+```
+
+**Memory budget at 0.35 util:** 34,560 token KV cache — fits 1 full 32K conversation or ~4 short (<4K) concurrent chats. Use 0.45 for safer headroom (~50K tokens). Use 0.8 for benchmarking (140K tokens, 4+ concurrent 32K requests).
+
+| `--gpu-memory-utilization` | KV Cache | 32K Concurrency | Use Case |
+|---------------------------|----------|-----------------|----------|
+| **0.8** | ~140K tokens | ~4 concurrent | LLM only / benchmarking |
+| **0.5** | ~70K tokens | ~2 concurrent | LLM + ASR on same GPU |
+| **0.45** | ~50K tokens | 1 (comfortable) | Backup chatbot (recommended) |
+| **0.35** | ~34K tokens | 1 (tight) | LLM + ASR + TTS on same GPU |
 
 **Requires:** correct `triton-xpu` install (see install script), `oneapi-level-zero-devel`, and `torch.cuda→torch.xpu` patches from `vllm_for_multi_arc.patch`.
 
