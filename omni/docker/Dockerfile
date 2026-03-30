@@ -265,7 +265,7 @@ COPY --from=builder /usr/local/lib/*.so* /usr/local/lib/
 COPY --from=builder /llm/ /llm/
 
 # Fix for multi-XPU support: copy SYCL native binary files to a common library path
-RUN cp /opt/intel/oneapi/compiler/2025.3/lib/libsycl-native-*.spv /usr/local/lib/
+RUN cp /opt/intel/oneapi/compiler/*/lib/libsycl-native-*.spv /usr/local/lib/
 
 ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python${PYTHON_VERSION}/dist-packages/torch/lib:${LD_LIBRARY_PATH}"
 ENV CCL_SYCL_ALLTOALL_ARC_LL=1
