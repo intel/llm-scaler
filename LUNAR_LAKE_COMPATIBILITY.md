@@ -112,12 +112,12 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 | Model | Format | Failure Mode |
 |-------|--------|-------------|
 | ~~Qwen3.5-* (any size)~~ | Any | ~~Triton kernel crash~~ **RESOLVED & VERIFIED** — was a packaging bug (plain `triton` shadowing `triton-xpu`). Qwen3.5-4B now runs successfully with correct triton-xpu install + `torch.cuda→torch.xpu` patches + `oneapi-level-zero-devel`. See benchmark results below. |
-| GLM-4.7-flash AWQ | AWQ 4-bit | Marlin CUDA kernel missing |
-| GLM-4.7-flash AutoRound INT4 | AutoRound | 27B OOM (>24GB after FP16 unpack) |
+| GLM-4.7-flash AWQ | AWQ 4-bit | `CompressedTensorsWNA16MarlinMoEMethod` → `gptq_marlin_repack` CUDA kernel missing. Dense layers work via `XPUwNa16LinearKernel` but MoE layers still route to Marlin. compressed-tensors MoE has no XPU redirect. |
+| GLM-4.7-flash AutoRound INT4 | AutoRound | IPEX routing works (no Marlin error) but **OOM → DEVICE_LOST** during weight init. 27B model peaks >24GB even at INT4 during FP16 unpack in `create_weights`. Confirmed with 32GB swap enabled. |
 | Qwen3.5-35B-A3B GPTQ | GPTQ INT4 | OOM + GPU DEVICE_LOST at 79% loading |
 | Qwen3.5-35B-A3B AutoRound | AutoRound INT4 | OOM (14GB on disk → ~28GB peak) |
 | Qwen3-30B-A3B GPTQ INT4 | GPTQ INT4 | Loads 15.7 GiB via IPEX, OOM during MoE expert weight shuffle → DEVICE_LOST |
-| Qwen3-Coder-30B-A3B AWQ | AWQ 4-bit | Marlin CUDA kernel missing (same as GLM AWQ) |
+| Qwen3-Coder-30B-A3B AWQ | AWQ 4-bit | Same compressed-tensors MoE Marlin issue as GLM AWQ + 30B OOM risk |
 | ~~Qwen3.5-4B AutoRound INT4~~ | AutoRound | **NOW WORKING** — 3.68 GiB, 23.4 tok/s single-user, 159 tok/s batched. Moved to recommended models. Required fixes: (1) `triton-xpu` clean install, (2) `oneapi-level-zero-devel`, (3) `torch.cuda→torch.xpu` patches, (4) `getattr()` fix for `max_pixels`. |
 | LFM2-24B-A2B AWQ | AWQ 4-bit | Custom Liquid AI tokenizer (`TokenizersBackend`) not supported |
 | Any MLX format | MLX | Apple Silicon only (Metal GPU framework) |
