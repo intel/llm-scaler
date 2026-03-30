@@ -1,32 +1,73 @@
 diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
 --- a/vllm/model_executor/models/registry.py
 +++ b/vllm/model_executor/models/registry.py
-@@ -1144,7 +1144,13 @@
+@@ -770,9 +770,30 @@
+ def _try_inspect_model_cls(
+     model_arch: str,
+     model: _BaseRegisteredModel,
+ ) -> _ModelInfo | None:
+     try:
+         return model.inspect_model_cls()
+     except Exception:
+         logger.exception("Error in inspecting model architecture '%s'", model_arch)
++        if os.environ.get("VLLM_SKIP_MODEL_INSPECT", "0") == "1":
++            logger.warning(
++                "VLLM_SKIP_MODEL_INSPECT is set; returning default "
++                "ModelInfo for '%s'", model_arch)
++            return _ModelInfo(
++                architecture=model_arch,
++                is_text_generation_model=True,
++                is_pooling_model=False,
++                attn_type="decoder",
++                default_seq_pooling_type="LAST",
++                default_tok_pooling_type="ALL",
++                supports_cross_encoding=False,
++                supports_multimodal=True,
++                supports_multimodal_raw_input_only=False,
++                requires_raw_input_tokens=False,
++                supports_multimodal_encoder_tp_data=False,
++                supports_pp=True,
++                has_inner_state=False,
++                is_attention_free=False,
++                is_hybrid=False,
++                has_noops=False,
++                supports_mamba_prefix_caching=False,
++                supports_transcription=False,
++                supports_transcription_only=False,
++            )
+         return None
+
+@@ -1144,7 +1165,17 @@
          # cannot use `sys.executable __file__` here because the script
          # contains relative imports
 +        # On XPU, the subprocess must not initialize SYCL/Level Zero
-+        # devices. Force CPU target to avoid the SYCL "No device of
-+        # requested type available" crash during model inspection.
++        # devices. Force CPU target and strip Intel GPU env vars to
++        # avoid the SYCL "No device of requested type available" crash
++        # during model inspection.
 +        sub_env = os.environ.copy()
 +        sub_env["VLLM_TARGET_DEVICE"] = "cpu"
++        for key in list(sub_env.keys()):
++            if key.startswith(("ZE_", "SYCL_")):
++                del sub_env[key]
++        sub_env.pop("ONEAPI_DEVICE_SELECTOR", None)
          returned = subprocess.run(
 -            _SUBPROCESS_COMMAND, input=input_bytes, capture_output=True
 +            _SUBPROCESS_COMMAND, input=input_bytes, capture_output=True,
 +            env=sub_env,
          )
- 
+
          # check if the subprocess is successful
 
 diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
 --- a/vllm/platforms/xpu.py
 +++ b/vllm/platforms/xpu.py
 @@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional
- 
+
  import torch
 -import vllm_xpu_kernels._C
 -import vllm_xpu_kernels._xpu_C
 +if os.environ.get("VLLM_TARGET_DEVICE", "").lower() != "cpu":
 +    import vllm_xpu_kernels._C
 +    import vllm_xpu_kernels._xpu_C
- 
+
  import vllm.envs as envs
