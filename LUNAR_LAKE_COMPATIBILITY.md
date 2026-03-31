@@ -425,16 +425,16 @@ All three configs use identical methodology (5 prompts, `--request-rate inf`).
 | Context | Output tok/s | TPOT (median) | TTFT (median) | Notes |
 |---------|:----------:|:----:|:----:|-------|
 | **128/128** | 14.7 | 68 ms | 298 ms | **Best single-user decode speed for 9B model** |
-| **1024/128** | 11.2 | 89 ms | 1,327 ms | Slight slowdown from longer prefill |
-| **2048/128** | 11.2 | 90 ms | 2,542 ms | Stable decode despite longer context |
+| **1024/1024** | 10.59 | 89 ms | 1,377 ms | Remarkably stable ~11 tok/s throughout 1024 output tokens |
+| **2048/2048** | 10.49 | 92 ms | 2,519 ms | Minimal degradation even at 4K total context |
 
 ### Batched Throughput (5 concurrent, `--request-rate inf`)
 
 | Context | Output tok/s | TPOT (median) | TTFT (median) | Peak tok/s | Notes |
 |---------|:----------:|:----:|:----:|:----------:|-------|
 | **128/128** | 18.61 | 82 ms | 24,010 ms | 70 | Good batched throughput |
-| **1024/128** | 17.42 | 81 ms | 26,402 ms | 65 | Minimal degradation from context |
-| **2048/128** | 13.77 | 122 ms | 30,752 ms | 60 | Memory pressure at large context |
+| **1024/1024** | 37.15 | 100 ms | 35,065 ms | 65 | Strong aggregate throughput |
+| **2048/2048** | 34.21 | 129 ms | 35,240 ms | 60 | KV cache grows to 6.1%, still stable |
 
 ### Analysis: sym_int4 vs FP8 vs BF16 for Qwen3.5-9B Distilled
 
@@ -443,14 +443,16 @@ All three configs use identical methodology (5 prompts, `--request-rate inf`).
 | Model size | 17.66 GiB | 11.22 GiB | 8.11 GiB | **sym_int4 (54% smaller)** |
 | KV cache tokens | 26,240 | 79,040 | 104,640 | **sym_int4 (4x more)** |
 | Single-user tok/s (128) | ~5 | ~8.5 | **14.7** | **sym_int4 (2.9x vs BF16)** |
+| Single-user tok/s (1024) | ~4 | ~6.7 | **10.6** | **sym_int4 (2.7x vs BF16)** |
+| Single-user tok/s (2048) | ~3.3 | ~5.8 | **10.5** | **sym_int4 (3.2x vs BF16)** |
 | TPOT 128 batched | 205 ms | 117 ms | 82 ms | **sym_int4 (2.5x faster)** |
-| TPOT 1024 batched | 268 ms | 149 ms | 81 ms | **sym_int4 (3.3x faster)** |
-| TPOT 2048 batched | 299 ms | 171 ms | 122 ms | **sym_int4 (2.5x faster)** |
+| TPOT 1024 batched | 268 ms | 149 ms | 100 ms | **sym_int4 (2.7x faster)** |
+| TPOT 2048 batched | 299 ms | 171 ms | 129 ms | **sym_int4 (2.3x faster)** |
 
 - **sym_int4 is the clear winner** — smallest memory footprint, fastest decode, most KV cache headroom
-- **14.7 tok/s single-user is approaching usable for chat** — still slower than Qwen3.5-4B's 23 tok/s, but much more capable model
+- **14.7 tok/s single-user at short context, 10.5 tok/s at 2K** — usable for chat with the 9B model. Still slower than Qwen3.5-4B's 23 tok/s, but much more capable model with 2.3x the parameters
+- **Remarkably stable decode speed** — single-user TPOT stays 68-92ms across all context lengths (server logs show steady ~11 tok/s). KV cache usage stays under 1.2% single-user, under 6.1% batched
 - **Both `.so` and env var are required** — `vllm_int4_for_multi_arc.so` at `/opt/lib/` provides the C quantization function (loaded via `ctypes.CDLL()`), and `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1` ensures weights are quantized on CPU to avoid GPU OOM.
-- **Note:** These benchmarks used 128-token output for 1024/2048 input tests. Full matching I/O benchmarks (1024/1024, 2048/2048) pending.
 
 - **Online quantization status on XPU native install:**
   - `sym_int4` — **NOW WORKS** ✓ (requires `vllm_int4_for_multi_arc.so` at `/opt/lib/` + `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1`, see below)
