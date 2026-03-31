@@ -55,13 +55,13 @@ Please follow the instructions in the [Getting Started](vllm/README.md/#1-gettin
 | Language Model       | Qwen/Qwen3-8B                              |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | Qwen/Qwen3-14B                             |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | Qwen/Qwen3-32B                             |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | Qwen/Qwen3.5-27B                             |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | Qwen/Qwen3.5-27B-Instruct                    |  ✅  |         ✅         |          ✅          |       |                           |
 | Language MOE Model   | Qwen/Qwen3-30B-A3B                         |  ✅  |         ✅         |          ✅          |       |                           |
 | Language MOE Model   | Qwen/Qwen3-235B-A22B                       |      |         ✅         |                      |       |                           |
 | Language MOE Model   | Qwen/Qwen3-Coder-30B-A3B-Instruct          |  ✅  |         ✅         |          ✅          |       |                           |
 | Language MOE Model   | Qwen/Qwen3-Coder-Next                      |  ✅  |         ✅         |          ✅          |       |                           |
-| Language MOE Model   | Qwen/Qwen3.5-35B-A3B                         |  ✅  |         ✅         |          ✅          |       |                           |
-| Language MOE Model   | Qwen/Qwen3.5-122B-A10B                       |      |         ✅         |          ✅          |       |                           |
+| Language MOE Model   | Qwen/Qwen3.5-35B-A3B-Instruct                |  ✅  |         ✅         |          ✅          |       |                           |
+| Language MOE Model   | Qwen/Qwen3.5-122B-A10B-Instruct              |      |         ✅         |          ✅          |       |                           |
 | Language Model       | Qwen/QwQ-32B                               |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | mistralai/Ministral-8B-Instruct-2410       |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | mistralai/Mixtral-8x7B-Instruct-v0.1       |  ✅  |         ✅         |          ✅          |       |                           |
