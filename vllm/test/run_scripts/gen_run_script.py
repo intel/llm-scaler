@@ -82,10 +82,7 @@ def run_model(container, model:ModelSpec, config:ScriptConfig):
     outstr += '--port %d ' % config.Port
     outstr += '--host 0.0.0.0 '
     outstr += '--trust-remote-code '
-    outstr += '--disable-sliding-window '
     outstr += '--gpu-memory-util=0.9 '
-    if not config.EnablePrefixCaching:
-        outstr += '--no-enable-prefix-caching '
     outstr += '--max-num-batched-tokens=2048 '
     outstr += '--disable-log-requests '
     outstr += '--block-size 64 '

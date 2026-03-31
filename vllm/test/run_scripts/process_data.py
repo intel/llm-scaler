@@ -60,7 +60,7 @@ def extract_config_info(path: str, add_config_header) -> List[str]:
         return [date, version, model, tag, batch_size]
     return ["", "", "", "", ""]
 
-def process_file(raw_data: str, add_config_header: bool, output: str):
+def process_file(raw_data: str, add_config_header: bool, output: str, write_unrounded: bool):
     results = []
     current_group = []
 
@@ -110,14 +110,6 @@ def process_file(raw_data: str, add_config_header: bool, output: str):
 
     headers = config_headers+result_headers if add_config_header else result_headers
 
-    with open(f'{filename}_unrounded.csv', 'a', newline='') as f:
-        writer = csv.writer(f)
-        if f.tell() == 0:
-            writer.writerow(headers)
-        for result in results:
-            row = config_info + list(map(str, result)) if add_config_header else list(map(str, result))
-            writer.writerow(row)
-
     with open(f'{filename}.csv', 'a', newline='') as f:
         writer = csv.writer(f)
         if f.tell() == 0:
@@ -127,17 +119,33 @@ def process_file(raw_data: str, add_config_header: bool, output: str):
             row = config_info + rounded_result if add_config_header else rounded_result
             writer.writerow(row)
 
+    if write_unrounded:
+        with open(f'{filename}_unrounded.csv', 'a', newline='') as f:
+            writer = csv.writer(f)
+            if f.tell() == 0:
+                writer.writerow(headers)
+            for result in results:
+                row = config_info + list(map(str, result)) if add_config_header else list(map(str, result))
+                writer.writerow(row)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="LLM Scaler Benchmark Process Data Config")
     parser.add_argument("--raw_data", nargs="+", required=True)
     parser.add_argument("--add_config_header", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--write_unrounded", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--format", type=str, required=False)
     parser.add_argument("--output", type=str, required=False)
     args = parser.parse_args()
     add_config_header = args.add_config_header
+    write_unrounded = args.write_unrounded
     output = args.output
     if not output:
         output = ANALYSIS_PATH
     for raw_data in args.raw_data:
-        process_file(raw_data=raw_data, add_config_header=add_config_header, output=output)
+        process_file(
+            raw_data=raw_data,
+            add_config_header=add_config_header,
+            output=output,
+            write_unrounded=write_unrounded,
+        )
