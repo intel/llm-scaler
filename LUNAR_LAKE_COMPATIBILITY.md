@@ -102,6 +102,7 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 
 | Model | Quantization | VRAM Needed | Context | Notes |
 |-------|-------------|-------------|---------|-------|
+| **openai/gpt-oss-20b** | MXFP4 (pre-quant) | **13.27 GiB** | 8k | **Tested & working** — 13B actual params. Uses `ipex marlin` XPU backend. Requires `VLLM_SKIP_PROFILE_RUN=1` patch + `--num-gpu-blocks-override 256`. See [running recipe](#running-gpt-oss-20b-on-lunar-lake) below. |
 | **Qwen3.5-4B-int4-AutoRound** | AutoRound INT4 | **3.68 GiB** | 4k | **Tested & working** — 23.4 tok/s single, 159 tok/s peak batched. Hybrid Mamba+attention (Triton fla/ops). |
 | **Intel/Qwen3-8B-int4-AutoRound** | AutoRound INT4 | **5.69 GiB** | 8k | **Tested & working** — 18.6 tok/s single, 90 tok/s peak batched |
 | Qwen3-8B | FP8 (online) | ~10GB | 32k | Standard attention, online quantization |
@@ -125,7 +126,7 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 | Qwen3-30B-A3B GPTQ INT4 | GPTQ INT4 | Loads 15.7 GiB via IPEX, OOM during MoE expert weight shuffle → DEVICE_LOST |
 | Qwen3-Coder-30B-A3B AWQ | AWQ 4-bit | Same compressed-tensors MoE Marlin issue as GLM AWQ + 30B OOM risk |
 | ~~Qwen3.5-4B AutoRound INT4~~ | AutoRound | **NOW WORKING** — 3.68 GiB, 23.4 tok/s single-user, 159 tok/s batched. Moved to recommended models. Required fixes: (1) `triton-xpu` clean install, (2) `oneapi-level-zero-devel`, (3) `torch.cuda→torch.xpu` patches, (4) `getattr()` fix for `max_pixels`. |
-| gpt-oss-20b | MXFP4 (pre-quant) | Loads 13.27 GiB successfully via `ipex marlin` backend, then **hangs indefinitely** during KV cache profiling/warmup. Process goes to 0% CPU/GPU. Requires `--dtype bfloat16` (MXFP4 rejects FP16). sym_int4 fails (quantization method mismatch — already MXFP4). |
+| ~~gpt-oss-20b~~ | MXFP4 (pre-quant) | **RESOLVED** — was hanging during `profile_run()` in KV cache init. Fixed by setting `VLLM_SKIP_PROFILE_RUN=1` (see patch `vllm_xpu_worker_skip_profile.patch`). Now loads and serves successfully. See "Recommended Models" table above. |
 | LFM2-24B-A2B AWQ | AWQ 4-bit | Custom Liquid AI tokenizer (`TokenizersBackend`) not supported |
 | Any MLX format | MLX | Apple Silicon only (Metal GPU framework) |
 
@@ -140,6 +141,9 @@ export PYTORCH_ALLOC_CONF="expandable_segments:True"
 
 # Shared memory mode (no P2P)
 export CCL_TOPO_P2P_ACCESS=0
+
+# Skip profile_run() — required for Lunar Lake iGPU (hangs during dummy forward pass)
+export VLLM_SKIP_PROFILE_RUN=1
 
 # Source oneAPI
 source /opt/intel/oneapi/setvars.sh --force
@@ -186,6 +190,79 @@ export CCL_SOCKET_IFNAME=wlo1  # or your WiFi interface name
 ```
 
 Additionally, the `all_reduce` warmup in `vllm/v1/worker/xpu_worker.py` (lines ~201-203) must be patched out for single-GPU. The `install_lunar_lake.sh` script does this automatically.
+
+## Running gpt-oss-20b on Lunar Lake
+
+The `openai/gpt-oss-20b` model ships pre-quantized in MXFP4 format (13B actual parameters, 13.27 GiB). It runs on Lunar Lake's Arc 140V via the `ipex marlin` XPU backend.
+
+### Prerequisites
+
+1. Apply the `vllm_xpu_worker_skip_profile.patch` to your vLLM installation:
+   ```bash
+   cd /path/to/vllm
+   git apply /path/to/llm-scaler/vllm/patches/vllm_xpu_worker_skip_profile.patch
+   ```
+
+2. Ensure oneAPI is installed and sourced.
+
+### Why the patch is needed
+
+vLLM's XPU worker runs a dummy forward pass (`profile_run()`) during startup to measure peak GPU memory for KV cache sizing. On Lunar Lake's Xe2 iGPU, this forward pass **hangs indefinitely** (EngineCore at 100% CPU, no progress). The patch adds `VLLM_SKIP_PROFILE_RUN=1` support which skips the dummy forward pass and estimates peak memory from current allocation + 20% overhead instead.
+
+### Quick start (using lunar_lake_serve.sh)
+
+```bash
+./vllm/scripts/lunar_lake_serve.sh /shared/models/gpt-oss-20b \
+    --max-model-len 8192 \
+    --num-gpu-blocks-override 256
+```
+
+The script automatically sets all required environment variables including `VLLM_SKIP_PROFILE_RUN=1`.
+
+### Manual launch
+
+```bash
+source /opt/intel/oneapi/setvars.sh --force
+
+export VLLM_TARGET_DEVICE=xpu
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_SKIP_PROFILE_RUN=1
+export PYTORCH_ALLOC_CONF="expandable_segments:True"
+export CCL_TOPO_P2P_ACCESS=0
+
+vllm serve /shared/models/gpt-oss-20b \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.7 \
+    --enforce-eager \
+    --max-model-len 8192 \
+    --num-gpu-blocks-override 256
+```
+
+### Startup log (expected)
+
+```
+Model loading took 13.27 GiB memory and ~25 seconds
+[VLLM_SKIP_PROFILE_RUN] Skipping profile_run, estimating peak from allocated memory
+[Memory Profiling Analysis]
+  > Peak Allocated (Real Need)  : 15.94 GB
+  > Model memory usage          : 13.27 GB
+Overriding num_gpu_blocks=2770 with num_gpu_blocks_override=256
+GPU KV cache size: 8,192 tokens
+Maximum concurrency for 8,192 tokens per request: 1.57x
+Application startup complete.
+```
+
+The server listens on `http://127.0.0.1:8000` (OpenAI-compatible API).
+
+### Key notes
+
+- **No `--quantization` flag needed** — MXFP4 is auto-detected from the model's `config.json`
+- **No `--device xpu` flag** — device is set via `VLLM_TARGET_DEVICE=xpu` environment variable (NOT a CLI flag)
+- **`--num-gpu-blocks-override 256`** — required because `VLLM_SKIP_PROFILE_RUN` estimates memory conservatively; this sets 256 KV cache blocks (~8K tokens, 1.57x concurrency)
+- **`--dtype bfloat16`** is the default; MXFP4 rejects FP16
+- **sym_int4 does NOT work** on this model (quantization method mismatch — already MXFP4)
 
 ## Known Limitations
 
