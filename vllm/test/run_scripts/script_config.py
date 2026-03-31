@@ -8,7 +8,7 @@ LOG_PATH = "auto_test_log"
 ANALYSIS_PATH = "analysis"
 
 default_config = {
-    "VERSION": "0.10.2-b6",
+    "VERSION": "0.14.0-b8.1",
     "REPO": "intel/llm-scaler-vllm",
     "Port": 8000,
     "Path": {
@@ -149,11 +149,68 @@ class ScriptConfig:
         model_name = model_name.strip()
         for path in self.Path.ModelPath:
             for candidate in self._build_model_candidates(model_name):
-                if os.path.exists(path + candidate):
-                    model_path = self.Path.ModelPathMap[path] + candidate
+                resolved_candidate = self._resolve_candidate(path, candidate)
+                if resolved_candidate:
+                    model_path = self.Path.ModelPathMap[path] + resolved_candidate
                     return model_path, True
         print("model %s not found" % model_name)
         return "", False
+
+    @staticmethod
+    def _resolve_candidate(base_path: str, candidate: str) -> Optional[str]:
+        candidate_path = os.path.join(base_path, candidate)
+        if not os.path.exists(candidate_path):
+            return None
+
+        snapshot_relative = ScriptConfig._resolve_hf_snapshot_candidate(candidate_path, candidate)
+        if snapshot_relative:
+            return snapshot_relative
+        return candidate
+
+    @staticmethod
+    def _resolve_hf_snapshot_candidate(candidate_path: str, candidate: str) -> Optional[str]:
+        snapshots_dir = os.path.join(candidate_path, "snapshots")
+        if not os.path.isdir(snapshots_dir):
+            return None
+
+        active_snapshot = ScriptConfig._resolve_active_snapshot_from_refs(candidate_path, snapshots_dir)
+        if active_snapshot:
+            return os.path.join(candidate, "snapshots", active_snapshot)
+
+        latest_snapshot = ScriptConfig._resolve_latest_snapshot(snapshots_dir)
+        if latest_snapshot:
+            return os.path.join(candidate, "snapshots", latest_snapshot)
+        return None
+
+    @staticmethod
+    def _resolve_active_snapshot_from_refs(candidate_path: str, snapshots_dir: str) -> Optional[str]:
+        refs_main_path = os.path.join(candidate_path, "refs", "main")
+        if not os.path.isfile(refs_main_path):
+            return None
+
+        with open(refs_main_path, "r", encoding="utf-8") as f:
+            snapshot_hash = f.read().strip()
+
+        if not snapshot_hash:
+            return None
+
+        if os.path.isdir(os.path.join(snapshots_dir, snapshot_hash)):
+            return snapshot_hash
+        return None
+
+    @staticmethod
+    def _resolve_latest_snapshot(snapshots_dir: str) -> Optional[str]:
+        snapshot_dirs = []
+        for entry in os.listdir(snapshots_dir):
+            entry_path = os.path.join(snapshots_dir, entry)
+            if os.path.isdir(entry_path):
+                snapshot_dirs.append(entry_path)
+
+        if not snapshot_dirs:
+            return None
+
+        latest_snapshot_path = max(snapshot_dirs, key=os.path.getmtime)
+        return os.path.basename(latest_snapshot_path)
 
     @staticmethod
     def _build_model_candidates(model_name: str) -> List[str]:
