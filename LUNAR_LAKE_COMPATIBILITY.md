@@ -418,7 +418,7 @@ All three configs use identical methodology (5 prompts, `--request-rate inf`).
 **Server config:** `--max-model-len 8192 --gpu-memory-utilization 0.8 --enforce-eager --quantization sym_int4 --dtype float16`
 **KV cache:** 104,640 tokens (0.8 util — 4x more than BF16's 26,240, 1.3x more than FP8's 79,040)
 **Peak allocated:** 10.08 GB
-**Note:** Uses vLLM's built-in Python INT4 quantization path (no native .so kernels loaded)
+**Note:** Uses `vllm_int4_for_multi_arc.so` for CPU-side quantization via ctypes, then IPEX `IPEXWeightOnlyQuantizedLinear` for INT4 GEMM on XPU
 
 ### Single-User Throughput (`--max-concurrency 1`)
 
@@ -449,22 +449,27 @@ All three configs use identical methodology (5 prompts, `--request-rate inf`).
 
 - **sym_int4 is the clear winner** — smallest memory footprint, fastest decode, most KV cache headroom
 - **14.7 tok/s single-user is approaching usable for chat** — still slower than Qwen3.5-4B's 23 tok/s, but much more capable model
-- **Key enabler is `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1`** — without it, loading the 17.66 GiB BF16 model onto GPU for quantization causes OOM. The .so files from BigDL-core are NOT required.
+- **Both `.so` and env var are required** — `vllm_int4_for_multi_arc.so` at `/opt/lib/` provides the C quantization function (loaded via `ctypes.CDLL()`), and `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1` ensures weights are quantized on CPU to avoid GPU OOM.
 - **Note:** These benchmarks used 128-token output for 1024/2048 input tests. Full matching I/O benchmarks (1024/1024, 2048/2048) pending.
 
 - **Online quantization status on XPU native install:**
-  - `sym_int4` — **NOW WORKS** ✓ (key enabler: `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1`, see below)
+  - `sym_int4` — **NOW WORKS** ✓ (requires `vllm_int4_for_multi_arc.so` at `/opt/lib/` + `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1`, see below)
   - `fp8` — **works** ✓
   - `inc` — IPEX `varlen_attention` arg count mismatch in vision encoder (19 args given, max 18)
   - `rtn` — hardcoded `.cuda()` call in `rtn.py:147` (CUDA-only, deprecated)
 
 ## Building sym_int4 Support for Native XPU Install
 
-The `sym_int4` online quantization works on native XPU install. The critical enabler is `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1`, which performs INT4 quantization on CPU before sending weights to GPU — without this flag, loading large BF16 models OOMs on Lunar Lake's shared memory.
+The `sym_int4` online quantization works on native XPU install. It requires **two things**:
 
-**Important finding:** The `vllm_int4_for_multi_arc.so` and `bigdl_core_llm.so` from [intel/BigDL-core](https://github.com/intel/BigDL-core) are **NOT required** for sym_int4 to work. vLLM has a built-in Python/PyTorch INT4 quantization path. The .so files are optional optimizations (faster C quantizer and fused INT4 GEMM kernel). Process memory maps confirmed neither .so was loaded during successful sym_int4 inference.
+1. **`vllm_int4_for_multi_arc.so` at `/opt/lib/`** — The C library that performs the actual INT4 quantization. Intel's vLLM patch (`sym_int4.py`) loads it via `ctypes.CDLL()` and will **crash with RuntimeError** if not found. The default search path is hardcoded to `/opt/lib/vllm_int4_for_multi_arc.so` (configurable via `VLLM_QUANTIZE_Q40_LIB` env var).
+2. **`VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1`** — Loads BF16 weights to CPU first, then the .so quantizes them to INT4 on CPU, then sends INT4 weights to GPU. Without this flag on Lunar Lake, loading 17.66 GiB BF16 weights directly to GPU causes OOM.
 
-The .so files can still be built from source for potential performance gains:
+**Source code reference:** The sym_int4 implementation lives in Intel's `vllm_for_multi_arc.patch` in the [intel/llm-scaler](https://github.com/intel/llm-scaler) repo at `vllm/patches/vllm_for_multi_arc.patch`, which adds `vllm/model_executor/layers/quantization/sym_int4.py` to vLLM. The quantization function `quantize_q4_0_to_qweight_and_scale()` is called via ctypes from the C library, then the quantized weights are handed to IPEX's `IPEXWeightOnlyQuantizedLinear` for INT4 GEMM on XPU.
+
+**Note:** The .so is loaded transiently via `ctypes.CDLL()` during weight loading only, which is why it may not appear in `/proc/maps` after model loading completes.
+
+The .so and optional GPU GEMM kernel can be built from source from [intel/BigDL-core](https://github.com/intel/BigDL-core):
 
 ### 1. Build the CPU-side quantizer (required)
 
