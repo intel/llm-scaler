@@ -5,7 +5,6 @@ import time
 import uuid
 import statistics
 import sys
-import copy  # For deep copying workflow_json
 
 # ==============================================================================
 #                 ComfyUI Benchmark Configuration
@@ -150,18 +149,18 @@ def queue_prompt(workflow, client_id):
         sys.exit(1)  # Exit on other unexpected errors
 
 
-def wait_for_completion(
-    ws_url, client_id, prompt_id, timeout_seconds=WS_TIMEOUT_SECONDS
-):
+def connect_websocket(ws_url, timeout_seconds=WS_TIMEOUT_SECONDS):
+    ws = websocket.WebSocket()
+    ws.connect(ws_url)
+    ws.settimeout(timeout_seconds)
+    return ws
+
+
+def wait_for_completion(ws, prompt_id, timeout_seconds=WS_TIMEOUT_SECONDS):
     """
     Listens via WebSocket for the specific ComfyUI task completion signal.
     """
-    ws = None
     try:
-        ws = websocket.WebSocket()
-        ws.connect(ws_url)
-        ws.settimeout(timeout_seconds)  # Set a receive timeout for the WebSocket
-
         print(
             f"  Waiting for prompt {prompt_id} completion (Timeout: {timeout_seconds}s)..."
         )
@@ -201,10 +200,6 @@ def wait_for_completion(
     except Exception as e:
         print(f"  ERROR during WebSocket communication for prompt {prompt_id}: {e}")
         return False
-    finally:
-        if ws:
-            ws.close()
-            # print("  WebSocket connection closed.") # Debug: indicate WS close
 
 
 # ==============================================================================
@@ -226,66 +221,61 @@ def benchmark_t2v_model(workflow_json_template, model_name="ComfyUI Workflow"):
     print(f"ComfyUI Server: {SERVER_ADDRESS}")
     print(f"Warm-up requests: {NUM_WARMUP}, Trial requests: {NUM_TRIALS}")
 
-    # --- Warm-up requests ---
-    print(f"\n--- Starting Warm-up ({NUM_WARMUP} requests) ---")
-    print(
-        "These requests are to let the service initialize and are not timed for results."
-    )
-    for i in range(NUM_WARMUP):
-        print(f"  Warm-up request {i+1}/{NUM_WARMUP}...")
+    client_id = str(uuid.uuid4())
+    ws_url = f"{WS_BASE_URL}?clientId={client_id}"
+    workflow = workflow_json_template
 
-        # Deep copy the workflow template to avoid modifying the original
-        workflow = copy.deepcopy(workflow_json_template)
+    try:
+        ws = connect_websocket(ws_url)
+    except Exception as e:
+        print(f"ERROR: Could not connect to ComfyUI websocket at {ws_url}: {e}")
+        sys.exit(1)
 
-        # Update seed for current run (optional, for benchmarking often fixed for consistency)
-        workflow["3"]["inputs"]["seed"] = DEFAULT_SAMPLER_SEED + i
+    try:
+        # --- Warm-up requests ---
+        print(f"\n--- Starting Warm-up ({NUM_WARMUP} requests) ---")
+        print(
+            "These requests are to let the service initialize and are not timed for results."
+        )
+        for i in range(NUM_WARMUP):
+            print(f"  Warm-up request {i+1}/{NUM_WARMUP}...")
+            workflow["3"]["inputs"]["seed"] = DEFAULT_SAMPLER_SEED + i
 
-        client_id = str(uuid.uuid4())
-        ws_url = f"{WS_BASE_URL}?clientId={client_id}"
+            start_time = time.perf_counter()
+            prompt_response = queue_prompt(workflow, client_id)
 
-        start_time = time.perf_counter()
-        prompt_response = queue_prompt(workflow, client_id)
-        # queue_prompt already exits if submission fails, so we just check for successful processing
+            if not wait_for_completion(ws, prompt_response["prompt_id"]):
+                print(
+                    "  Warm-up request failed during WebSocket wait or timed out. Exiting benchmark."
+                )
+                sys.exit(1)
 
-        if not wait_for_completion(ws_url, client_id, prompt_response["prompt_id"]):
-            print(
-                "  Warm-up request failed during WebSocket wait or timed out. Exiting benchmark."
-            )
-            sys.exit(1)  # Exit if warm-up fails, as trials might also fail
+            end_time = time.perf_counter()
+            duration = end_time - start_time
+            print(f"  Warm-up request successful. Total duration: {duration:.4f} seconds.")
 
-        end_time = time.perf_counter()
-        duration = end_time - start_time
-        print(f"  Warm-up request successful. Total duration: {duration:.4f} seconds.")
+        # --- Benchmark Trials ---
+        print(f"\n--- Starting Benchmark Trials ({NUM_TRIALS} requests) ---")
+        latencies = []
+        for i in range(NUM_TRIALS):
+            print(f"  Trial request {i+1}/{NUM_TRIALS}...")
+            workflow["3"]["inputs"]["seed"] = DEFAULT_SAMPLER_SEED + NUM_WARMUP + i
 
-    # --- Benchmark Trials ---
-    print(f"\n--- Starting Benchmark Trials ({NUM_TRIALS} requests) ---")
-    latencies = []
-    for i in range(NUM_TRIALS):
-        print(f"  Trial request {i+1}/{NUM_TRIALS}...")
+            start_time = time.perf_counter()
+            prompt_response = queue_prompt(workflow, client_id)
 
-        # Deep copy for each trial
-        workflow = copy.deepcopy(workflow_json_template)
+            if not wait_for_completion(ws, prompt_response["prompt_id"]):
+                print(
+                    "  Trial request failed during WebSocket wait or timed out. Stopping benchmark."
+                )
+                break
 
-        # Ensure new unique seeds for each generative run if the output needs to be different.
-        workflow["3"]["inputs"]["seed"] = DEFAULT_SAMPLER_SEED + NUM_WARMUP + i
-
-        client_id = str(uuid.uuid4())
-        ws_url = f"{WS_BASE_URL}?clientId={client_id}"
-
-        start_time = time.perf_counter()
-        prompt_response = queue_prompt(workflow, client_id)
-        # queue_prompt already exits on failure
-
-        if not wait_for_completion(ws_url, client_id, prompt_response["prompt_id"]):
-            print(
-                "  Trial request failed during WebSocket wait or timed out. Stopping benchmark."
-            )
-            break  # Stop trials if a failure occurs
-
-        end_time = time.perf_counter()
-        duration = end_time - start_time
-        latencies.append(duration)
-        print(f"  Trial successful. Total duration: {duration:.4f} seconds.")
+            end_time = time.perf_counter()
+            duration = end_time - start_time
+            latencies.append(duration)
+            print(f"  Trial successful. Total duration: {duration:.4f} seconds.")
+    finally:
+        ws.close()
 
     # --- Results ---
     avg_latency = None
@@ -337,4 +327,3 @@ if __name__ == "__main__":
     benchmark_t2v_model(
         wan22_ti2v_5b_workflow_json, model_name="Wan2.2_ti2v_5B Workflow"
     )
-
