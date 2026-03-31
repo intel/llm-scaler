@@ -9,15 +9,21 @@ from script_config import ANALYSIS_PATH
 # Capture signed ints/floats, including scientific notation.
 NUMBER_PATTERN = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 
+def _parse_num(token: str):
+    if "." in token or "e" in token.lower():
+        return float(token)
+    return int(token)
+
+
 def get_num(line: str, index: int = 0) -> float:
-    # Regex extraction avoids repeatedly splitting and validating each token.
-    candidates = []
-    for token in NUMBER_PATTERN.findall(line):
-        if "." in token or "e" in token.lower():
-            candidates.append(float(token))
-        else:
-            candidates.append(int(token))
-    return candidates[index] if index < len(candidates) else 0
+    if index == 0:
+        match = NUMBER_PATTERN.search(line)
+        return _parse_num(match.group(0)) if match else 0
+
+    for pos, token in enumerate(NUMBER_PATTERN.findall(line)):
+        if pos == index:
+            return _parse_num(token)
+    return 0
 
 
 def parse_model_and_tag(text: str):
@@ -54,19 +60,7 @@ def extract_config_info(path: str, add_config_header) -> List[str]:
         return [date, version, model, tag, batch_size]
     return ["", "", "", "", ""]
 
-if __name__ == '__main__':
-
-    parser = argparse.ArgumentParser(description="LLM Scaler Benchmark Process Data Config")
-    parser.add_argument("--raw_data", type=str, required=True)
-    parser.add_argument("--add_config_header", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--format", type=str, required=False)
-    parser.add_argument("--output", type=str, required=False)
-    args = parser.parse_args()
-    raw_data = args.raw_data
-    add_config_header = args.add_config_header
-    format = args.format
-    output = args.output
-
+def process_file(raw_data: str, add_config_header: bool, output: str):
     results = []
     current_group = []
 
@@ -75,8 +69,6 @@ if __name__ == '__main__':
     with open(raw_data, encoding="UTF-8") as f:
         for dataline in f:
             dataline = dataline.strip()
-            # if dataline.startswith('Running benchmark with batch size'):
-            #     current_group = [get_num(dataline)]
             if dataline.startswith('Successful requests:'):
                 current_group.append(get_num(dataline))
             elif dataline.startswith('Benchmark duration (s):'):
@@ -97,14 +89,10 @@ if __name__ == '__main__':
                 current_group.append(get_num(dataline))
             elif dataline.startswith('Mean ITL (ms):'):
                 current_group.append(get_num(dataline))
-                # Finish one benchmark group and reset to avoid value accumulation
-                # across groups (which inflates processing time and corrupts rows).
                 results.append(current_group)
                 current_group = []
 
     config_info = extract_config_info(path=raw_data,add_config_header=add_config_header)
-    if not output:
-        output = ANALYSIS_PATH
     directory = '%s/%s/' % (output, datetime.now().strftime("%Y_%m_%d"))
     os.makedirs(directory, exist_ok=True)
     filename = directory + "result"
@@ -120,11 +108,7 @@ if __name__ == '__main__':
         "Total Token Throughput (tok/s)", "Mean TTFT (ms)", "Mean TPOT (ms)", "Mean ITL (ms)"
     ]
 
-    if add_config_header:
-        headers = config_headers+result_headers
-    else:
-        headers = result_headers
-    
+    headers = config_headers+result_headers if add_config_header else result_headers
 
     with open(f'{filename}_unrounded.csv', 'a', newline='') as f:
         writer = csv.writer(f)
@@ -142,3 +126,18 @@ if __name__ == '__main__':
             rounded_result = [f'{value:.2f}' if isinstance(value, float) else str(value) for value in result]
             row = config_info + rounded_result if add_config_header else rounded_result
             writer.writerow(row)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="LLM Scaler Benchmark Process Data Config")
+    parser.add_argument("--raw_data", nargs="+", required=True)
+    parser.add_argument("--add_config_header", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--format", type=str, required=False)
+    parser.add_argument("--output", type=str, required=False)
+    args = parser.parse_args()
+    add_config_header = args.add_config_header
+    output = args.output
+    if not output:
+        output = ANALYSIS_PATH
+    for raw_data in args.raw_data:
+        process_file(raw_data=raw_data, add_config_header=add_config_header, output=output)

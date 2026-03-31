@@ -11,6 +11,8 @@ default_config = {
     "VERSION": "0.14.0-b8.1",
     "REPO": "intel/llm-scaler-vllm",
     "Port": 8000,
+    "EnablePrefixCaching": True,
+    "EnforceEager": False,
     "Path": {
         "ModelPath": "/home/intel/LLM/",
     },
@@ -103,6 +105,8 @@ class ScriptConfig:
     DATE: str = ""
     Port: int = 8000
     XPU: Optional[str] = None
+    EnablePrefixCaching: bool = True
+    EnforceEager: bool = False
     Path: PathConfig = field(default_factory=lambda: PathConfig(ModelPath=[], TestPath="", LogPath="",AnalysisPath=""))
     Dataset: DatasetConfig = field(default_factory=lambda: DatasetConfig(name="random", path="", input_len=1024, output_len=512))
     Model: List[ModelSpec] = field(default_factory=list)
@@ -404,6 +408,8 @@ class ScriptConfig:
             REPO=str(data.get("REPO", "")),
             Port=int(data.get("Port", 8000)),
             XPU=(str(data["XPU"]) if "XPU" in data and data["XPU"] is not None else None),
+            EnablePrefixCaching=bool(data.get("EnablePrefixCaching", True)),
+            EnforceEager=bool(data.get("EnforceEager", False)),
             Path=path_obj,
             Dataset=dataset_obj,
             Model=model_objs,
