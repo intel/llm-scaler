@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
+import atexit
 import gradio as gr
 from openai import OpenAI, APIError
 from typing import List, Dict, Any, Optional, Tuple
@@ -27,9 +28,18 @@ parser.add_argument('--temp', type=float, default=0.8, help='Temperature for gen
 parser.add_argument('--stop-token-ids', type=str, default='', help='Comma-separated stop token IDs')
 parser.add_argument("--host", type=str, default="127.0.0.1")
 parser.add_argument("--port", type=int, default=8003)
+parser.add_argument("--share", action=argparse.BooleanOptionalAction, default=False)
 args = parser.parse_args()
 
 client = OpenAI(api_key="EMPTY", base_url=args.model_url)
+
+
+def cleanup_video_temp_dir() -> None:
+    if VIDEO_TEMP_DIR.exists():
+        shutil.rmtree(VIDEO_TEMP_DIR, ignore_errors=True)
+
+
+atexit.register(cleanup_video_temp_dir)
 
 def is_image_file(filename: str) -> bool:
     image_exts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp']
@@ -241,6 +251,6 @@ if __name__ == "__main__":
     demo.queue().launch(
         server_name=args.host,
         server_port=args.port,
-        share=True,
+        share=args.share,
         allowed_paths=[str(VIDEO_TEMP_DIR)]
     )

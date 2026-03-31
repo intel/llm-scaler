@@ -58,7 +58,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description="LLM Scaler Benchmark Process Data Config")
     parser.add_argument("--raw_data", type=str, required=True)
-    parser.add_argument("--add_config_header", type=lambda x: x.lower() == 'true', required=False)
+    parser.add_argument("--add_config_header", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--format", type=str, required=False)
     parser.add_argument("--output", type=str, required=False)
     args = parser.parse_args()

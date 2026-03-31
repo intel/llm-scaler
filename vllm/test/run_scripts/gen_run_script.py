@@ -80,7 +80,6 @@ def run_model(container, model:ModelSpec, config:ScriptConfig):
     outstr += '--no-enable-prefix-caching '
     outstr += '--max-num-batched-tokens=2048 '
     outstr += '--disable-log-requests '
-    outstr += '--max-model-len=2048 '
     outstr += '--block-size 64 '
     if model.quantization:
         outstr += '--quantization %s ' % q(model.quantization)
@@ -105,7 +104,7 @@ def check_ready(config:ScriptConfig):
 
 def process_data(container, config:ScriptConfig):
     outstr = 'find %s -type f -name \'*.out\' -print0' % q(f"{config.Path.LogPath}/{container}")
-    outstr += '| xargs -0 -I{} python run_scripts/process_data.py --raw_data "{}" --add_config_header True --output %s ' % q(config.Path.AnalysisPath)
+    outstr += '| xargs -0 -I{} python run_scripts/process_data.py --raw_data "{}" --add_config_header --output %s ' % q(config.Path.AnalysisPath)
     print(outstr + "\n")
 
 def post_process_data(config:ScriptConfig):
@@ -141,7 +140,7 @@ def run_bench(container, model:ModelSpec, batch,config:ScriptConfig):
         outstr += '--dataset-path %s ' % q(config.Dataset.path)
     outstr += '--ignore-eos '
     outstr += '--num-prompt %d ' % batch
-    outstr += '--trust_remote_code '
+    outstr += '--trust-remote-code '
     outstr += '--request-rate inf '
     outstr += '--backend vllm '
     outstr += '--port=%d ' % config.Port
