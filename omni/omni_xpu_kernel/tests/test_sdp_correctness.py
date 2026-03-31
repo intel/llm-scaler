@@ -151,12 +151,12 @@ class TestStandaloneSDPKernel:
             sdp.sdp(q, k, v)
 
     @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
-    def test_sdp_rejects_head_dim_not_128(self, xpu_device):
+    def test_sdp_rejects_unsupported_head_dim(self, xpu_device):
         from omni_xpu_kernel import sdp
 
-        q, k, v = make_qkv(xpu_device, dim=64, dtype=torch.float16)
+        q, k, v = make_qkv(xpu_device, dim=96, dtype=torch.float16)
 
-        with pytest.raises(RuntimeError, match="128|head_dim"):
+        with pytest.raises(RuntimeError, match="64 or 128|head_dim"):
             sdp.sdp(q, k, v)
 
     @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
@@ -188,3 +188,41 @@ class TestStandaloneSDPKernel:
         out_ref = torch_sdpa_reference(q, k, v)
 
         torch.testing.assert_close(out_kernel, out_ref, rtol=5e-2, atol=5e-2)
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_sdp_hd64_matches_torch_sdpa_reference(self, xpu_device, dtype):
+        from omni_xpu_kernel import sdp
+
+        q, k, v = make_qkv(xpu_device, q_len=64, kv_len=64, heads=8, dim=64, dtype=dtype)
+
+        out_kernel = sdp.sdp(q, k, v)
+        out_ref = torch_sdpa_reference(q, k, v)
+
+        rtol, atol = (5e-2, 5e-2) if dtype == torch.bfloat16 else (1e-2, 1e-2)
+        torch.testing.assert_close(out_kernel, out_ref, rtol=rtol, atol=atol)
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    def test_sdp_hd64_cross_attention(self, xpu_device):
+        from omni_xpu_kernel import sdp
+
+        q, k, v = make_qkv(xpu_device, q_len=128, kv_len=32, heads=12, dim=64, dtype=torch.bfloat16)
+
+        out_kernel = sdp.sdp(q, k, v)
+        out_ref = torch_sdpa_reference(q, k, v)
+
+        torch.testing.assert_close(out_kernel, out_ref, rtol=5e-2, atol=5e-2)
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("q_len", [64, 256, 512])
+    def test_sdp_hd64_various_seq_lengths(self, xpu_device, dtype, q_len):
+        from omni_xpu_kernel import sdp
+
+        q, k, v = make_qkv(xpu_device, q_len=q_len, kv_len=q_len, heads=8, dim=64, dtype=dtype)
+
+        out_kernel = sdp.sdp(q, k, v)
+        out_ref = torch_sdpa_reference(q, k, v)
+
+        rtol, atol = (5e-2, 5e-2) if dtype == torch.bfloat16 else (1e-2, 1e-2)
+        torch.testing.assert_close(out_kernel, out_ref, rtol=rtol, atol=atol)

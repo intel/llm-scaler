@@ -45,9 +45,16 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
   int32_t h = ndi.get_group(1);
   int32_t v = ndi.get_group(0);
 
-  int32_t headIdx = v;
+  int32_t headIdx = v % headQ;
+  int32_t batchIdx = v / headQ;
   int32_t groupSize = headQ / headKv;
   int32_t kvHeadIdx = headIdx / groupSize;
+
+  // Offset pointers for batch
+  qState  += batchIdx * activationLength * headQ * HD * sizeof(fp16);
+  kState  += batchIdx * kvSeqLen * headKv * HD * sizeof(fp16);
+  vState  += batchIdx * kvSeqLen * headKv * HD * sizeof(fp16);
+  out     += batchIdx * activationLength * headQ * HD * sizeof(fp16);
 
   // Q stored as bf16 (no conversion needed — used directly in bf16 QK DPAS)
   simd<bf16, 16 * 128> bf16QState;
@@ -270,15 +277,17 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
       fp32SoftMaxTemp.select<16, 1>(0) = fp32SoftMaxTemp.select<16, 1>(0) + ttemp.select<16, 1>(0);
       fp32HistoricMaxTemp = fp32CurrentMaxTemp;
 
-      // Compensation — fp32 multiply + clamp to prevent fp16 accumulator overflow
-      #pragma unroll
-      for (int kk = 0; kk < 64; kk++) {
-        simd<float, 32> f32tmp = finalOutput.select<32, 1>(32 * kk);
-        f32tmp.select<16, 1>(0) *= fp32SoftMaxCompensation;
-        f32tmp.select<16, 1>(16) *= fp32SoftMaxCompensation;
-        f32tmp = __ESIMD_NS::min<float>(f32tmp, simd<float, 32>(65504.0f));
-        f32tmp = __ESIMD_NS::max<float>(f32tmp, simd<float, 32>(-65504.0f));
-        finalOutput.select<32, 1>(32 * kk) = simd<fp16, 32>(f32tmp);
+      // Compensation — fp16 multiply + clamp (inf → 65504) to prevent accumulator overflow
+      {
+        simd<fp16, 32> fp16CompTemp;
+        fp16CompTemp.select<16, 1>(0) = fp32SoftMaxCompensation;
+        fp16CompTemp.select<16, 1>(16) = fp32SoftMaxCompensation;
+        #pragma unroll
+        for (int kk = 0; kk < 64; kk++) {
+          finalOutput.select<32, 1>(32 * kk) = finalOutput.select<32, 1>(32 * kk) * fp16CompTemp;
+          finalOutput.select<32, 1>(32 * kk).merge(FP16_MAX, finalOutput.select<32, 1>(32 * kk) > FP16_MAX);
+          finalOutput.select<32, 1>(32 * kk).merge(FP16_MIN_NEG, finalOutput.select<32, 1>(32 * kk) < FP16_MIN_NEG);
+        }
       }
 
       // Pack softmax weights fp32 → fp16 VNNI (same as fp16 kernel)
@@ -508,15 +517,14 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
       fp32HistoricMaxTemp = fp32CurrentMaxTemp;
 
       if (loopIdx != 0) {
-        // fp32 multiply + clamp to prevent fp16 accumulator overflow
+        simd<fp16, 32> fp16CompTemp;
+        fp16CompTemp.select<16, 1>(0) = fp32SoftMaxCompensation;
+        fp16CompTemp.select<16, 1>(16) = fp32SoftMaxCompensation;
         #pragma unroll
         for (int kk = 0; kk < 64; kk++) {
-          simd<float, 32> f32tmp = finalOutput.select<32, 1>(32 * kk);
-          f32tmp.select<16, 1>(0) *= fp32SoftMaxCompensation;
-          f32tmp.select<16, 1>(16) *= fp32SoftMaxCompensation;
-          f32tmp = __ESIMD_NS::min<float>(f32tmp, simd<float, 32>(65504.0f));
-          f32tmp = __ESIMD_NS::max<float>(f32tmp, simd<float, 32>(-65504.0f));
-          finalOutput.select<32, 1>(32 * kk) = simd<fp16, 32>(f32tmp);
+          finalOutput.select<32, 1>(32 * kk) = finalOutput.select<32, 1>(32 * kk) * fp16CompTemp;
+          finalOutput.select<32, 1>(32 * kk).merge(FP16_MAX, finalOutput.select<32, 1>(32 * kk) > FP16_MAX);
+          finalOutput.select<32, 1>(32 * kk).merge(FP16_MIN_NEG, finalOutput.select<32, 1>(32 * kk) < FP16_MIN_NEG);
         }
       }
 

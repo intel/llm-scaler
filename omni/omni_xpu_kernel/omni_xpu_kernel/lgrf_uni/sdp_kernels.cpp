@@ -20,16 +20,32 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 #undef  ESIMD_INLINE
 #define ESIMD_INLINE inline __attribute__((always_inline))
 #define FP32_MIN -3.402823466e+38f
+constexpr fp16 FP16_MAX = (fp16)65504.0f;
+constexpr fp16 FP16_MIN_NEG = (fp16)-65504.0f;
 
 using namespace sycl::ext::intel::esimd;
 using namespace sycl::ext::intel::esimd::xmx;
 using namespace sycl::ext::intel::experimental::esimd;
 
-// Import active configuration
+// Import active configuration (HD=128)
 using Cfg = sdp_config::ActiveConfig;
 
 #include "single_kernels/flash.attn.b.mha128.fp16.opt.h"
 #include "single_kernels/flash.attn.b.mha128.bf16io.h"
+
+// Parameterized kernel instantiations (HD=128 fast + HD=64)
+namespace param_hd128 {
+using Cfg = sdp_config::ActiveConfig;
+#include "single_kernels/flash.attn.b.mha.fp16.opt.h"
+}
+namespace hd64 {
+using Cfg = sdp_config::ConfigBMG_HD64;
+#include "single_kernels/flash.attn.b.mha.fp16.opt.h"
+}
+namespace hd64_bf16 {
+using Cfg = sdp_config::ConfigBMG_HD64;
+#include "single_kernels/flash.attn.b.mha.bf16io.opt.h"
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // sdp_fp16: FP16 optimized Flash Attention
@@ -101,6 +117,123 @@ extern "C" ESIMD_KERNEL_API void sdp_bf16io(
     q.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(ndr, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
             flashAttnBMha128Bf16IoPrecomputed(
+                pQ, pK, pV, pA, pO,
+                aLen, kvLen, hQ, hKv, ndi);
+        });
+    }).wait();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// sdp_fp16_fast: FP16 Flash Attention without compensation clamp (HD=128)
+// Use when V values are small (no overflow risk) for ~9% better performance.
+// ──────────────────────────────────────────────────────────────────────────────
+extern "C" ESIMD_KERNEL_API void sdp_fp16_fast(
+    void* Q, void* K, void* V,
+    void* normAlpha,
+    void* out,
+    int q_len, int kv_len,
+    int headQ, int headKv,
+    void* sycl_queue_ptr)
+{
+    sycl::queue& q = *reinterpret_cast<sycl::queue*>(sycl_queue_ptr);
+
+    int groupH = headQ;
+    int groupV = (q_len + Cfg::Q_GROUP - 1) / Cfg::Q_GROUP;
+    sycl::nd_range<2> ndr(
+        {(size_t)(Cfg::WG_SIZE * groupH), (size_t)groupV},
+        {(size_t)Cfg::WG_SIZE, 1});
+
+    uint8_t* pQ = reinterpret_cast<uint8_t*>(Q);
+    uint8_t* pK = reinterpret_cast<uint8_t*>(K);
+    uint8_t* pV = reinterpret_cast<uint8_t*>(V);
+    uint8_t* pA = reinterpret_cast<uint8_t*>(normAlpha);
+    uint8_t* pO = reinterpret_cast<uint8_t*>(out);
+    uint32_t aLen  = (uint32_t)q_len;
+    uint32_t kvLen = (uint32_t)kv_len;
+    uint32_t hQ    = (uint32_t)headQ;
+    uint32_t hKv   = (uint32_t)headKv;
+
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(ndr, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+            param_hd128::flashAttnBMhaFp16OptPrecomputed<false>(
+                pQ, pK, pV, pA, pO,
+                aLen, kvLen, hQ, hKv, ndi);
+        });
+    }).wait();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// sdp_fp16_hd64: FP16 Flash Attention for head_dim=64
+// ──────────────────────────────────────────────────────────────────────────────
+extern "C" ESIMD_KERNEL_API void sdp_fp16_hd64(
+    void* Q, void* K, void* V,
+    void* normAlpha,
+    void* out,
+    int q_len, int kv_len,
+    int headQ, int headKv,
+    void* sycl_queue_ptr)
+{
+    using C64 = sdp_config::ConfigBMG_HD64;
+    sycl::queue& q = *reinterpret_cast<sycl::queue*>(sycl_queue_ptr);
+
+    int groupH = headQ;
+    int groupV = (q_len + C64::Q_GROUP - 1) / C64::Q_GROUP;
+    sycl::nd_range<2> ndr(
+        {(size_t)(C64::WG_SIZE * groupH), (size_t)groupV},
+        {(size_t)C64::WG_SIZE, 1});
+
+    uint8_t* pQ = reinterpret_cast<uint8_t*>(Q);
+    uint8_t* pK = reinterpret_cast<uint8_t*>(K);
+    uint8_t* pV = reinterpret_cast<uint8_t*>(V);
+    uint8_t* pA = reinterpret_cast<uint8_t*>(normAlpha);
+    uint8_t* pO = reinterpret_cast<uint8_t*>(out);
+    uint32_t aLen  = (uint32_t)q_len;
+    uint32_t kvLen = (uint32_t)kv_len;
+    uint32_t hQ    = (uint32_t)headQ;
+    uint32_t hKv   = (uint32_t)headKv;
+
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(ndr, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+            hd64::flashAttnBMhaFp16OptPrecomputed(
+                pQ, pK, pV, pA, pO,
+                aLen, kvLen, hQ, hKv, ndi);
+        });
+    }).wait();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// sdp_bf16io_hd64: BF16 I/O hybrid Flash Attention for head_dim=64
+// ──────────────────────────────────────────────────────────────────────────────
+extern "C" ESIMD_KERNEL_API void sdp_bf16io_hd64(
+    void* Q, void* K, void* V,
+    void* normAlpha,
+    void* out,
+    int q_len, int kv_len,
+    int headQ, int headKv,
+    void* sycl_queue_ptr)
+{
+    using C64 = sdp_config::ConfigBMG_HD64;
+    sycl::queue& q = *reinterpret_cast<sycl::queue*>(sycl_queue_ptr);
+
+    int groupH = headQ;
+    int groupV = (q_len + C64::Q_GROUP - 1) / C64::Q_GROUP;
+    sycl::nd_range<2> ndr(
+        {(size_t)(C64::WG_SIZE * groupH), (size_t)groupV},
+        {(size_t)C64::WG_SIZE, 1});
+
+    uint8_t* pQ = reinterpret_cast<uint8_t*>(Q);
+    uint8_t* pK = reinterpret_cast<uint8_t*>(K);
+    uint8_t* pV = reinterpret_cast<uint8_t*>(V);
+    uint8_t* pA = reinterpret_cast<uint8_t*>(normAlpha);
+    uint8_t* pO = reinterpret_cast<uint8_t*>(out);
+    uint32_t aLen  = (uint32_t)q_len;
+    uint32_t kvLen = (uint32_t)kv_len;
+    uint32_t hQ    = (uint32_t)headQ;
+    uint32_t hKv   = (uint32_t)headKv;
+
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(ndr, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+            hd64_bf16::flashAttnBMhaBf16IoOptPrecomputed(
                 pQ, pK, pV, pA, pO,
                 aLen, kvLen, hQ, hKv, ndi);
         });

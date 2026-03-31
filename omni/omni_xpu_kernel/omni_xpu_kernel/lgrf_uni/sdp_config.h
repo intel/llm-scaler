@@ -82,6 +82,15 @@ struct ConfigLNL : SdpConfigBase {
     // static constexpr int Q_GROUP = 128;
 };
 
+// HEAD_DIM=64 variants — for SD3.5, z-Image, LTX-Video
+struct ConfigBMG_HD64 : SdpConfigBase {
+    static constexpr int HEAD_DIM    = 64;
+    static constexpr int SLM_V_BYTES = 2 * KV_TILE * HEAD_DIM * 2;  // 16384 bytes (16KB)
+    static constexpr int SLM_TOTAL   = SLM_V_BYTES;
+    static constexpr int QK_K_BLOCKS = HEAD_DIM / 16;  // 4
+    static constexpr int SV_DPAS_PER_NN = HEAD_DIM / 16;  // 4
+};
+
 // ============================================================================
 // Active configuration — change this to switch hardware target
 // ============================================================================
