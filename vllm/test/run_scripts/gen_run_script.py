@@ -5,7 +5,7 @@ import re
 
 from script_config import ScriptConfig, default_config, ModelSpec
 
-SAFE_EXTRA_PARAM_KEY = re.compile(r"^--[a-zA-Z0-9][a-zA-Z0-9-_]*$")
+SAFE_EXTRA_PARAM_KEY = re.compile(r"^--[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 
 
 def validate_extra_param_keys(config: ScriptConfig):
@@ -16,12 +16,18 @@ def validate_extra_param_keys(config: ScriptConfig):
             if not SAFE_EXTRA_PARAM_KEY.match(key):
                 raise ValueError(
                     f"Invalid extra_param key '{key}' for model '{model.name}'. "
-                    "Expected pattern: ^--[a-zA-Z0-9][a-zA-Z0-9-_]*$"
+                    "Expected pattern: ^--[a-zA-Z0-9][a-zA-Z0-9_-]*$"
                 )
 
 
 def q(value):
     return shlex.quote(str(value))
+
+
+def render_extra_param(flag, value):
+    if value is None:
+        return q(flag)
+    return '%s=%s' % (q(flag), q(value))
 
 
 def create_container(container,config:ScriptConfig):
@@ -94,7 +100,7 @@ def run_model(container, model:ModelSpec, config:ScriptConfig):
         outstr += '--speculative_config=%s ' % shlex.quote(json.dumps(spec_dict))
     if model.extra_param:
         for flag, value in model.extra_param.items():
-            outstr += '%s=%s ' % (q(flag), q(value))
+            outstr += '%s ' % render_extra_param(flag, value)
     outstr += '" 2>&1 | tee -a "${EXPDIR}/model.log" &'
     print(outstr + "\n")
 

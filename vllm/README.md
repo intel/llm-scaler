@@ -261,6 +261,30 @@ vllm serve \
 tail -f /llm/vllm.log
 ```
 
+### 1.4.2 Qwen3.5 launch example
+
+```bash
+# Qwen3.5-27B-Instruct (FP8) example
+VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+vllm serve \
+    --model Qwen/Qwen3.5-27B-Instruct \
+    --served-model-name Qwen3.5-27B-Instruct \
+    --dtype=float16 \
+    --enforce-eager \
+    --port 8000 \
+    --host 0.0.0.0 \
+    --trust-remote-code \
+    --disable-sliding-window \
+    --gpu-memory-util=0.9 \
+    --max-num-batched-tokens=8192 \
+    --disable-log-requests \
+    --max-model-len=8192 \
+    --block-size 64 \
+    --quantization fp8 \
+    -tp=1
+```
+
 > **Note — Prefix Caching**
 
 > By default, vLLM enables **prefix caching**, which reuses computed KV cache for prompts that share common prefixes (e.g., system prompts). This can significantly improve throughput for workloads with repeated prefixes. If you encounter memory issues or want to disable this feature for debugging/test purposes, add `--no-enable-prefix-caching` to the startup command.
@@ -1076,11 +1100,14 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | Language Model       | Qwen/Qwen3-8B                              |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | Qwen/Qwen3-14B                             |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | Qwen/Qwen3-32B                             |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | Qwen/Qwen3.5-27B-Instruct                  |  ✅  |         ✅         |          ✅          |       |                           |
 | Language MOE Model   | Qwen/Qwen3-30B-A3B                         |  ✅  |         ✅         |          ✅          |       |                           |
 | Language MOE Model   | Qwen/Qwen3-Next-80B-A3B                    |  ✅  |         ✅         |                      |       |                           |
 | Language MOE Model   | Qwen/Qwen3-235B-A22B                       |      |         ✅         |                      |       |                           |
 | Language MOE Model   | Qwen/Qwen3-Coder-30B-A3B-Instruct          |  ✅  |         ✅         |          ✅          |       |                           |
 | Language MOE Model   | Qwen/Qwen3-Coder-Next                      |  ✅  |         ✅         |          ✅          |       |                           |
+| Language MOE Model   | Qwen/Qwen3.5-35B-A3B-Instruct              |  ✅  |         ✅         |          ✅          |       |                           |
+| Language MOE Model   | Qwen/Qwen3.5-122B-A10B-Instruct            |      |         ✅         |          ✅          |       |                           |
 | Language Model       | Qwen/QwQ-32B                               |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | mistralai/Ministral-8B-Instruct-2410       |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | mistralai/Mixtral-8x7B-Instruct-v0.1       |  ✅  |         ✅         |          ✅          |       |                           |

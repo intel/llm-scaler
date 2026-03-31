@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 import yaml
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -85,10 +85,11 @@ class ModelSpec:
     name: str
     tag: str
     quantization: str
+    revision: str = ""
     tp: int = 1
     batch: List[int] = field(default_factory=list)
     spec_config: SpecConfig = None
-    extra_param: Dict[str, str] = field(default_factory=dict)
+    extra_param: Dict[str, Any] = field(default_factory=dict)
     path: str = ""
 
     def __post_init__(self):
@@ -124,7 +125,10 @@ class ScriptConfig:
                 if not ok:
                     raise ValueError("model %s spec config not found" % model.name)
                 model.spec_config.model = model_path
-            model_path, ok = self.check_and_get_model_path(model.name)
+            if model.revision:
+                model_path, ok = self.check_and_get_model_path_with_revision(model.name, model.revision)
+            else:
+                model_path, ok = self.check_and_get_model_path(model.name)
 
             if not ok:
                 raise ValueError("model %s  not found" % model.name)
@@ -156,54 +160,126 @@ class ScriptConfig:
         print("model %s not found" % model_name)
         return "", False
 
+    def check_and_get_model_path_with_revision(self, model_name: str, revision: str):
+        model_name = model_name.strip()
+        revision = revision.strip()
+        for path in self.Path.ModelPath:
+            for candidate in self._build_model_candidates(model_name):
+                resolved_candidate = self._resolve_candidate(path, candidate, revision)
+                if resolved_candidate:
+                    model_path = self.Path.ModelPathMap[path] + resolved_candidate
+                    return model_path, True
+        print("model %s (revision %s) not found" % (model_name, revision))
+        return "", False
+
     @staticmethod
-    def _resolve_candidate(base_path: str, candidate: str) -> Optional[str]:
+    def _resolve_candidate(base_path: str, candidate: str, revision: str = "") -> Optional[str]:
         candidate_path = os.path.join(base_path, candidate)
         if not os.path.exists(candidate_path):
             return None
 
-        snapshot_relative = ScriptConfig._resolve_hf_snapshot_candidate(candidate_path, candidate)
+        snapshot_relative = ScriptConfig._resolve_hf_snapshot_candidate(candidate_path, candidate, revision)
         if snapshot_relative:
             return snapshot_relative
         return candidate
 
     @staticmethod
-    def _resolve_hf_snapshot_candidate(candidate_path: str, candidate: str) -> Optional[str]:
+    def _resolve_hf_snapshot_candidate(candidate_path: str, candidate: str, revision: str = "") -> Optional[str]:
         snapshots_dir = os.path.join(candidate_path, "snapshots")
         if not os.path.isdir(snapshots_dir):
             return None
 
-        active_snapshot = ScriptConfig._resolve_active_snapshot_from_refs(candidate_path, snapshots_dir)
-        if active_snapshot:
-            return os.path.join(candidate, "snapshots", active_snapshot)
+        if revision:
+            revision_snapshot = ScriptConfig._resolve_snapshot_by_revision(candidate_path, snapshots_dir, revision)
+            if revision_snapshot:
+                return os.path.join(candidate, "snapshots", revision_snapshot)
+
+        for snapshot in ScriptConfig._resolve_snapshot_candidates_from_refs(candidate_path, snapshots_dir):
+            if ScriptConfig._snapshot_has_required_files(os.path.join(snapshots_dir, snapshot)):
+                return os.path.join(candidate, "snapshots", snapshot)
 
         latest_snapshot = ScriptConfig._resolve_latest_snapshot(snapshots_dir)
-        if latest_snapshot:
+        if latest_snapshot and ScriptConfig._snapshot_has_required_files(os.path.join(snapshots_dir, latest_snapshot)):
             return os.path.join(candidate, "snapshots", latest_snapshot)
         return None
 
     @staticmethod
-    def _resolve_active_snapshot_from_refs(candidate_path: str, snapshots_dir: str) -> Optional[str]:
-        refs_main_path = os.path.join(candidate_path, "refs", "main")
-        if not os.path.isfile(refs_main_path):
-            return None
+    def _resolve_snapshot_by_revision(candidate_path: str, snapshots_dir: str, revision: str) -> Optional[str]:
+        refs_revision_path = os.path.join(candidate_path, "refs", revision)
+        if os.path.isfile(refs_revision_path):
+            with open(refs_revision_path, "r", encoding="utf-8") as f:
+                snapshot_hash = f.read().strip()
+            if snapshot_hash and os.path.isdir(os.path.join(snapshots_dir, snapshot_hash)):
+                if ScriptConfig._snapshot_has_required_files(os.path.join(snapshots_dir, snapshot_hash)):
+                    return snapshot_hash
 
-        with open(refs_main_path, "r", encoding="utf-8") as f:
-            snapshot_hash = f.read().strip()
-
-        if not snapshot_hash:
-            return None
-
-        if os.path.isdir(os.path.join(snapshots_dir, snapshot_hash)):
-            return snapshot_hash
+        if os.path.isdir(os.path.join(snapshots_dir, revision)):
+            if ScriptConfig._snapshot_has_required_files(os.path.join(snapshots_dir, revision)):
+                return revision
         return None
+
+    @staticmethod
+    def _resolve_snapshot_candidates_from_refs(candidate_path: str, snapshots_dir: str) -> List[str]:
+        refs_dir = os.path.join(candidate_path, "refs")
+        if not os.path.isdir(refs_dir):
+            return []
+
+        preferred_refs = ["main", "master"]
+        other_refs = sorted(
+            entry for entry in os.listdir(refs_dir)
+            if entry not in preferred_refs and os.path.isfile(os.path.join(refs_dir, entry))
+        )
+        ordered_refs = preferred_refs + other_refs
+
+        snapshots = []
+        seen = set()
+        for ref_name in ordered_refs:
+            ref_path = os.path.join(refs_dir, ref_name)
+            if not os.path.isfile(ref_path):
+                continue
+            with open(ref_path, "r", encoding="utf-8") as f:
+                snapshot_hash = f.read().strip()
+            if not snapshot_hash or snapshot_hash in seen:
+                continue
+            if os.path.isdir(os.path.join(snapshots_dir, snapshot_hash)):
+                seen.add(snapshot_hash)
+                snapshots.append(snapshot_hash)
+        return snapshots
+
+    @staticmethod
+    def _snapshot_has_required_files(snapshot_path: str) -> bool:
+        if not os.path.isdir(snapshot_path):
+            return False
+
+        entries = set(os.listdir(snapshot_path))
+        has_config = "config.json" in entries
+        has_tokenizer = any(
+            name in entries for name in ("tokenizer.json", "tokenizer.model", "tokenizer_config.json")
+        )
+        has_weights = any(
+            ScriptConfig._matches_any_pattern(
+                name,
+                ("*.safetensors", "*.bin", "*.gguf", "model.safetensors.index.json"),
+            )
+            for name in entries
+        )
+        return has_config and has_tokenizer and has_weights
+
+    @staticmethod
+    def _matches_any_pattern(value: str, patterns: Iterable[str]) -> bool:
+        for pattern in patterns:
+            if pattern == value:
+                return True
+            if pattern.startswith("*") and value.endswith(pattern[1:]):
+                return True
+        return False
 
     @staticmethod
     def _resolve_latest_snapshot(snapshots_dir: str) -> Optional[str]:
         snapshot_dirs = []
         for entry in os.listdir(snapshots_dir):
             entry_path = os.path.join(snapshots_dir, entry)
-            if os.path.isdir(entry_path):
+            if os.path.isdir(entry_path) and ScriptConfig._snapshot_has_required_files(entry_path):
                 snapshot_dirs.append(entry_path)
 
         if not snapshot_dirs:
@@ -309,6 +385,7 @@ class ScriptConfig:
                 tag=model.get("tag",""),
                 tp=tp,
                 quantization=model.get("quantization"),
+                revision=model.get("revision", ""),
                 batch=ScriptConfig._parse_batch(model.get("batch", ""), model.get("name", "")),
                 spec_config=spec_obj,
                 extra_param=model.get("extra_param"),
