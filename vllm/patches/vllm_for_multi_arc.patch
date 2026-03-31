@@ -1895,7 +1895,7 @@ diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
 index 3a36ca797..6638d4de4 100644
 --- a/vllm/engine/arg_utils.py
 +++ b/vllm/engine/arg_utils.py
-@@ -455,6 +455,8 @@ class EngineArgs:
+@@ -455,6 +455,7 @@ class EngineArgs:
 -    allow_deprecated_quantization: bool = ModelConfig.allow_deprecated_quantization
 +    allow_deprecated_quantization: bool = True  # XPU builds use ipex quantization
      enforce_eager: bool = ModelConfig.enforce_eager
