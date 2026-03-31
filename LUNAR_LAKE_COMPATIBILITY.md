@@ -85,11 +85,13 @@ Not all model architectures work on Lunar Lake XPU. Key blockers discovered duri
 | Blocker | Affected Models | Root Cause |
 |---------|----------------|------------|
 | **~~Triton XPU backend broken on Xe2~~** RESOLVED | Qwen3.5 (all sizes) | **Root cause: packaging bug, NOT hardware limitation.** The `install_lunar_lake.sh` script installed `triton-xpu` without first uninstalling the plain `triton` package (pulled in as a transitive dependency by vllm-xpu-kernels). Plain `triton`'s `libtriton.so` lacks the Intel backend, causing `ImportError: cannot import name 'intel'` and `TypeError: 'function' object is not subscriptable`. **Fix:** `pip uninstall triton triton-xpu -y && pip install triton-xpu==3.6.0`. Also requires `oneapi-level-zero-devel` for Triton's JIT compilation of `driver.c → spirv_utils.so` (needs `level_zero/ze_api.h`). Install scripts updated. Intel's Docker always did the uninstall-first pattern — that's why it worked. |
-| **Marlin kernels are CUDA-only** | AWQ, GPTQ (compressed-tensors format) | `gptq_marlin_repack` is an NVIDIA CUDA kernel. AWQ/GPTQ MoE models route to `CompressedTensorsWNA16MarlinMoEMethod`. |
-| **Pre-quantized 2x memory** | AutoRound, GPTQ (>14B) | Loading INT4→FP16 intermediate doubles peak memory. 35B models OOM on 32GB. |
+| **Marlin kernels are CUDA-only** | AWQ, GPTQ (compressed-tensors format) | `gptq_marlin_repack` is an NVIDIA CUDA kernel. AWQ/GPTQ MoE models route to `CompressedTensorsWNA16MarlinMoEMethod`. **Note:** Intel has an `ipex marlin` backend for MXFP4 (used by gpt-oss-20b), but this is a separate implementation — GPTQ/AWQ Marlin is NOT ported to XPU. |
+| **Pre-quantized 2x memory** | AutoRound, GPTQ (>14B) | Loading INT4→FP16 intermediate doubles peak memory. 35B models OOM on 32GB. Upstream fix: [vLLM #30359 (QeRL RFC)](https://github.com/vllm-project/vllm/issues/30359) proposes layerwise weight processing, still WIP. `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT` does NOT help here (designed for online quant only). |
 | **transformers 5.x `max_pixels` rename** | Qwen3.5 multimodal models | vLLM pins `transformers<5`. Upgrading to 5.x enables `qwen3_5`/`glm4_moe_lite` architecture recognition but renames `image_processor.max_pixels` → `size["longest_edge"]`. Fix: `getattr()` fallback in `qwen2_vl.py` (see limitation #12). Intel's Docker image applies `vllm_for_multi_arc.patch` which includes full Qwen3.5 support. |
 
 ### What DOES Work
+
+**Practical model size limit for sym_int4 on 32GB Lunar Lake:** ≤ ~10B dense params. sym_int4 requires loading the full BF16 model into CPU RAM for quantization — on the Claw, CPU and GPU share the same 32GB. A 10B model = ~20 GiB BF16, leaving room for OS + KV cache. Models >10B need pre-quantized formats (AutoRound/GGUF) or llama.cpp with Vulkan.
 
 Only models meeting **all three** criteria work on Lunar Lake XPU:
 1. **Standard attention** or **fla/linear attention with Triton** (requires correct `triton-xpu` install — see blocker fix above)
@@ -108,6 +110,7 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 | Qwen3-8B | FP16 | ~18GB | 16k | No quantization loss |
 | qwen3.5-9b-claude-distilled | BF16 (none) | **17.66 GiB** | 32k | **Tested — too slow** (5 tok/s single-user, 205ms TPOT). ~18B total Mamba hybrid params. Not viable for interactive chat. |
 | qwen3.5-9b-claude-distilled | FP8 (online) | **11.22 GiB** | 32k | **Tested — still slow** (~8.5 tok/s est. single-user, 117ms TPOT batched). 37% smaller than BF16. FP8 is the only working online quantization on XPU native. |
+| qwen3.5-9b-claude-distilled | sym_int4 (online) | **8.11 GiB** | 8k | **Tested — best 9B result** 14.7 tok/s single-user, 68ms TPOT. 54% smaller than BF16, 2.9x faster. Requires `vllm_int4_for_multi_arc.so` + `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1`. |
 | Intel/Qwen3.5-9B-int4-AutoRound | AutoRound INT4 | **~9 GiB** | 32k | Untested. Would still be ~2x slower than 4B due to larger Mamba state. |
 
 ### Models That Do NOT Work
@@ -122,6 +125,7 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 | Qwen3-30B-A3B GPTQ INT4 | GPTQ INT4 | Loads 15.7 GiB via IPEX, OOM during MoE expert weight shuffle → DEVICE_LOST |
 | Qwen3-Coder-30B-A3B AWQ | AWQ 4-bit | Same compressed-tensors MoE Marlin issue as GLM AWQ + 30B OOM risk |
 | ~~Qwen3.5-4B AutoRound INT4~~ | AutoRound | **NOW WORKING** — 3.68 GiB, 23.4 tok/s single-user, 159 tok/s batched. Moved to recommended models. Required fixes: (1) `triton-xpu` clean install, (2) `oneapi-level-zero-devel`, (3) `torch.cuda→torch.xpu` patches, (4) `getattr()` fix for `max_pixels`. |
+| gpt-oss-20b | MXFP4 (pre-quant) | Loads 13.27 GiB successfully via `ipex marlin` backend, then **hangs indefinitely** during KV cache profiling/warmup. Process goes to 0% CPU/GPU. Requires `--dtype bfloat16` (MXFP4 rejects FP16). sym_int4 fails (quantization method mismatch — already MXFP4). |
 | LFM2-24B-A2B AWQ | AWQ 4-bit | Custom Liquid AI tokenizer (`TokenizersBackend`) not supported |
 | Any MLX format | MLX | Apple Silicon only (Metal GPU framework) |
 
