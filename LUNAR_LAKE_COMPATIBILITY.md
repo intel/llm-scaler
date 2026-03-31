@@ -469,6 +469,17 @@ The `sym_int4` online quantization works on native XPU install. It requires **tw
 
 **Note:** The .so is loaded transiently via `ctypes.CDLL()` during weight loading only, which is why it may not appear in `/proc/maps` after model loading completes.
 
+### The 12KB File That Saved 10GB of Downloads
+
+**The discovery:** Intel ships `vllm_int4_for_multi_arc.so` only inside their Docker images (`intel/llm-scaler-platform`, ~10+ GB). On a mobile device with limited data (8GB plan), downloading these images is impractical. Investigation revealed:
+
+1. **The file is just a renamed `libquantize.so`** — built from `intel/BigDL-core` at `bigdl-core-xe/ggml/quantize.c`. It's a pure C library (~12KB compiled) that implements GGML Q4_0 quantization: `quantize_q4_0_to_qweight_and_scale()`.
+2. **Intel's `vllm_for_multi_arc.patch`** hardcodes the default path as `/opt/lib/vllm_int4_for_multi_arc.so` in `vllm/envs.py`. The Docker image copies the file there during build.
+3. **Building from source takes ~10 seconds** — just `cmake .. && cmake --build .` in the ggml directory, then rename the output. No GPU SDK, no SYCL, no special dependencies.
+4. **The naming is misleading** — `vllm_int4_for_multi_arc` sounds like a complex vLLM-specific library, but it's literally just the BigDL-core GGML quantizer renamed. The "multi_arc" refers to multi-architecture Intel GPU support.
+
+This saved downloading ~10 GB of Docker layers over mobile data to extract a 12KB file. A pre-built copy is available in this repo at `artifacts/vllm_int4_for_multi_arc.so` (x86_64 Linux only).
+
 The .so and optional GPU GEMM kernel can be built from source from [intel/BigDL-core](https://github.com/intel/BigDL-core):
 
 ### 1. Build the CPU-side quantizer (required)
