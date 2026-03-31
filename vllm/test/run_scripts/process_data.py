@@ -1,27 +1,22 @@
 import os
 import csv
 from datetime import datetime
-import unicodedata  # 处理 ASCII 码的包
 import argparse
 import re
 from typing import List
 from script_config import ANALYSIS_PATH
 
-def is_number(s):
-    try:
-        float(s)
-        return True
-    except ValueError:
-        pass
-    try:
-        unicodedata.numeric(s)
-        return True
-    except (TypeError, ValueError):
-        pass
-    return False
+# Capture signed ints/floats, including scientific notation.
+NUMBER_PATTERN = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 
 def get_num(line: str, index: int = 0) -> float:
-    candidates = [float(i) if '.' in i else int(i) for i in line.split() if is_number(i)]
+    # Regex extraction avoids repeatedly splitting and validating each token.
+    candidates = []
+    for token in NUMBER_PATTERN.findall(line):
+        if "." in token or "e" in token.lower():
+            candidates.append(float(token))
+        else:
+            candidates.append(int(token))
     return candidates[index] if index < len(candidates) else 0
 
 
@@ -102,7 +97,10 @@ if __name__ == '__main__':
                 current_group.append(get_num(dataline))
             elif dataline.startswith('Mean ITL (ms):'):
                 current_group.append(get_num(dataline))
+                # Finish one benchmark group and reset to avoid value accumulation
+                # across groups (which inflates processing time and corrupts rows).
                 results.append(current_group)
+                current_group = []
 
     config_info = extract_config_info(path=raw_data,add_config_header=add_config_header)
     if not output:
@@ -144,4 +142,3 @@ if __name__ == '__main__':
             rounded_result = [f'{value:.2f}' if isinstance(value, float) else str(value) for value in result]
             row = config_info + rounded_result if add_config_header else rounded_result
             writer.writerow(row)
-
