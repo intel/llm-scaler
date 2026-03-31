@@ -409,15 +409,62 @@ All three configs use identical methodology (5 prompts, `--request-rate inf`).
 - **FP8 significantly improves both speed and memory** — 37% less memory, 1.75x faster decode. The smaller model reads less data per forward pass, improving bandwidth utilization.
 - **Still not fast enough for interactive chat** — estimated ~8.5 tok/s single-user (117ms TPOT) vs Qwen3.5-4B's 23 tok/s. Borderline usable but noticeably slower.
 - **KV cache dramatically improved** — 79K tokens vs 26K at BF16. Can now handle 9.8x concurrent 8K contexts instead of 3.3x.
+## Benchmark Results: Qwen3.5-9B Claude Distilled (sym_int4 Online Quantization)
+
+**Model:** qwen3.5-9b-claude-4.6-opus-reasoning-distilled (8.11 GiB loaded, sym_int4 online quantization)
+**Architecture:** `Qwen3_5ForConditionalGeneration` — hybrid Mamba + attention, multimodal
+**Quantization:** `--quantization sym_int4` with `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1`
+**Memory savings:** 8.11 GiB vs 17.66 GiB BF16 = **54% reduction** (vs FP8's 37%)
+**Server config:** `--max-model-len 8192 --gpu-memory-utilization 0.8 --enforce-eager --quantization sym_int4 --dtype float16`
+**KV cache:** 104,640 tokens (0.8 util — 4x more than BF16's 26,240, 1.3x more than FP8's 79,040)
+**Peak allocated:** 10.08 GB
+**Note:** Uses vLLM's built-in Python INT4 quantization path (no native .so kernels loaded)
+
+### Single-User Throughput (`--max-concurrency 1`)
+
+| Context | Output tok/s | TPOT (median) | TTFT (median) | Notes |
+|---------|:----------:|:----:|:----:|-------|
+| **128/128** | 14.7 | 68 ms | 298 ms | **Best single-user decode speed for 9B model** |
+| **1024/128** | 11.2 | 89 ms | 1,327 ms | Slight slowdown from longer prefill |
+| **2048/128** | 11.2 | 90 ms | 2,542 ms | Stable decode despite longer context |
+
+### Batched Throughput (5 concurrent, `--request-rate inf`)
+
+| Context | Output tok/s | TPOT (median) | TTFT (median) | Peak tok/s | Notes |
+|---------|:----------:|:----:|:----:|:----------:|-------|
+| **128/128** | 18.61 | 82 ms | 24,010 ms | 70 | Good batched throughput |
+| **1024/128** | 17.42 | 81 ms | 26,402 ms | 65 | Minimal degradation from context |
+| **2048/128** | 13.77 | 122 ms | 30,752 ms | 60 | Memory pressure at large context |
+
+### Analysis: sym_int4 vs FP8 vs BF16 for Qwen3.5-9B Distilled
+
+| Metric | BF16 | FP8 | sym_int4 | Best |
+|--------|------|-----|----------|------|
+| Model size | 17.66 GiB | 11.22 GiB | 8.11 GiB | **sym_int4 (54% smaller)** |
+| KV cache tokens | 26,240 | 79,040 | 104,640 | **sym_int4 (4x more)** |
+| Single-user tok/s (128) | ~5 | ~8.5 | **14.7** | **sym_int4 (2.9x vs BF16)** |
+| TPOT 128 batched | 205 ms | 117 ms | 82 ms | **sym_int4 (2.5x faster)** |
+| TPOT 1024 batched | 268 ms | 149 ms | 81 ms | **sym_int4 (3.3x faster)** |
+| TPOT 2048 batched | 299 ms | 171 ms | 122 ms | **sym_int4 (2.5x faster)** |
+
+- **sym_int4 is the clear winner** — smallest memory footprint, fastest decode, most KV cache headroom
+- **14.7 tok/s single-user is approaching usable for chat** — still slower than Qwen3.5-4B's 23 tok/s, but much more capable model
+- **Key enabler is `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1`** — without it, loading the 17.66 GiB BF16 model onto GPU for quantization causes OOM. The .so files from BigDL-core are NOT required.
+- **Note:** These benchmarks used 128-token output for 1024/2048 input tests. Full matching I/O benchmarks (1024/1024, 2048/2048) pending.
+
 - **Online quantization status on XPU native install:**
-  - `sym_int4` — **NOW WORKS** ✓ (requires building `vllm_int4_for_multi_arc.so` from source, see below)
+  - `sym_int4` — **NOW WORKS** ✓ (key enabler: `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1`, see below)
   - `fp8` — **works** ✓
   - `inc` — IPEX `varlen_attention` arg count mismatch in vision encoder (19 args given, max 18)
   - `rtn` — hardcoded `.cuda()` call in `rtn.py:147` (CUDA-only, deprecated)
 
 ## Building sym_int4 Support for Native XPU Install
 
-The `sym_int4` online quantization requires `vllm_int4_for_multi_arc.so`, which Intel only ships inside their Docker images. It can be built from source from [intel/BigDL-core](https://github.com/intel/BigDL-core).
+The `sym_int4` online quantization works on native XPU install. The critical enabler is `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1`, which performs INT4 quantization on CPU before sending weights to GPU — without this flag, loading large BF16 models OOMs on Lunar Lake's shared memory.
+
+**Important finding:** The `vllm_int4_for_multi_arc.so` and `bigdl_core_llm.so` from [intel/BigDL-core](https://github.com/intel/BigDL-core) are **NOT required** for sym_int4 to work. vLLM has a built-in Python/PyTorch INT4 quantization path. The .so files are optional optimizations (faster C quantizer and fused INT4 GEMM kernel). Process memory maps confirmed neither .so was loaded during successful sym_int4 inference.
+
+The .so files can still be built from source for potential performance gains:
 
 ### 1. Build the CPU-side quantizer (required)
 
