@@ -51,11 +51,20 @@ def main():
         vae_prefix_sdxl = "vae."
 
         found_unet_components = False
+        found_vae_components = False
         for k, v in state_dict.items():
             if k.startswith(unet_prefix):
                 clean_k = k[len(unet_prefix):]
                 unet_state_dict[clean_k] = v
                 found_unet_components = True
+            elif k.startswith(vae_prefix_sd1):
+                clean_k = k[len(vae_prefix_sd1):]
+                vae_state_dict[clean_k] = v
+                found_vae_components = True
+            elif k.startswith(vae_prefix_sdxl):
+                clean_k = k[len(vae_prefix_sdxl):]
+                vae_state_dict[clean_k] = v
+                found_vae_components = True
 
         if not found_unet_components:
             print(f"Warning: No UNet keys found in {full_checkpoint_path} with prefix '{unet_prefix}'.")
@@ -66,17 +75,6 @@ def main():
             save_file(unet_state_dict, output_unet_path)
             print(f"Successfully extracted UNet and saved to: {output_unet_path}")
             print(f"Number of UNet parameters extracted: {len(unet_state_dict)}.")
-
-        found_vae_components = False
-        for k, v in state_dict.items():
-            if k.startswith(vae_prefix_sd1):
-                clean_k = k[len(vae_prefix_sd1):]
-                vae_state_dict[clean_k] = v
-                found_vae_components = True
-            elif k.startswith(vae_prefix_sdxl):
-                clean_k = k[len(vae_prefix_sdxl):]
-                vae_state_dict[clean_k] = v
-                found_vae_components = True
 
         if not found_vae_components:
             print(f"Warning: No VAE keys found in {full_checkpoint_path} with prefixes '{vae_prefix_sd1}' or '{vae_prefix_sdxl}'.")
