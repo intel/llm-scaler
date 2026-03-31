@@ -7,7 +7,10 @@ if len(sys.argv) < 2:
 csv_file = sys.argv[1]
 df = pd.read_csv(csv_file)
 df.columns = df.columns.str.strip()
-df = df.sort_values(by=df.columns[:5].tolist(), ascending=True)
+config_sort_columns = ["Date", "Version", "Model", "Tag", "Batch Size"]
+available_config_columns = [c for c in config_sort_columns if c in df.columns]
+if available_config_columns:
+    df = df.sort_values(by=available_config_columns, ascending=True)
 
 base = os.path.splitext(csv_file)[0]
 order_file = base + "_ordered.csv"

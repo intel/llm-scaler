@@ -175,13 +175,52 @@ class ScriptConfig:
         return list(dict.fromkeys(candidates))
 
     @staticmethod
+    def _parse_model_paths(raw_model_paths: Any) -> List[str]:
+        if isinstance(raw_model_paths, str):
+            return [p.strip() for p in raw_model_paths.split(';') if p.strip()]
+        if isinstance(raw_model_paths, list):
+            parsed = []
+            for idx, p in enumerate(raw_model_paths):
+                if not isinstance(p, str):
+                    raise TypeError(f"Path.ModelPath[{idx}] must be a string")
+                normalized = p.strip()
+                if normalized:
+                    parsed.append(normalized)
+            return parsed
+        raise TypeError(
+            f"Path.ModelPath must be a ';' separated string or list[str], got {type(raw_model_paths).__name__}"
+        )
+
+    @staticmethod
+    def _parse_batch(raw_batch: Any, model_name: str) -> List[int]:
+        if isinstance(raw_batch, str):
+            tokens = [x.strip() for x in raw_batch.split(',') if x.strip()]
+        elif isinstance(raw_batch, list):
+            tokens = raw_batch
+        else:
+            raise TypeError(
+                f"Model '{model_name}' batch must be CSV string or list[int], got {type(raw_batch).__name__}"
+            )
+
+        batch = []
+        for idx, value in enumerate(tokens):
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError) as err:
+                raise ValueError(
+                    f"Model '{model_name}' batch[{idx}]='{value}' is not an integer"
+                ) from err
+            batch.append(parsed)
+        return batch
+
+    @staticmethod
     def build_sub_obj(data: Dict[str, Any]) :
         path = data.get("Path", {})
         dataset = data.get("Dataset", {})
         models = data.get("Model", [])
 
         path_obj = PathConfig(
-            ModelPath=path.get("ModelPath", "").split(';'),
+            ModelPath=ScriptConfig._parse_model_paths(path.get("ModelPath", "")),
             TestPath=path.get("TestPath", ""),
             LogPath=path.get("LogPath", ""),
             AnalysisPath=path.get("AnalysisPath",""),
@@ -213,7 +252,7 @@ class ScriptConfig:
                 tag=model.get("tag",""),
                 tp=tp,
                 quantization=model.get("quantization"),
-                batch=[int(x) for x in model.get("batch").split(',')],
+                batch=ScriptConfig._parse_batch(model.get("batch", ""), model.get("name", "")),
                 spec_config=spec_obj,
                 extra_param=model.get("extra_param"),
             )
