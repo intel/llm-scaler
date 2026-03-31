@@ -102,7 +102,7 @@ Only models meeting **all three** criteria work on Lunar Lake XPU:
 
 | Model | Quantization | VRAM Needed | Context | Notes |
 |-------|-------------|-------------|---------|-------|
-| **openai/gpt-oss-20b** | MXFP4 (pre-quant) | **13.27 GiB** | 8k | **Tested & working** — 13B actual params. Uses `ipex marlin` XPU backend. Requires `VLLM_SKIP_PROFILE_RUN=1` patch + `--num-gpu-blocks-override 256`. See [running recipe](#running-gpt-oss-20b-on-lunar-lake) below. |
+| **openai/gpt-oss-20b** | MXFP4 (pre-quant) | **13.27 GiB** | 8k | **Tested & working** — 13B actual params. **22.5 tok/s single-user**, 70 tok/s peak batched. Uses `ipex marlin` XPU backend. Requires `VLLM_SKIP_PROFILE_RUN=1` patch + `--num-gpu-blocks-override 256`. See [benchmarks](#benchmark-results-gpt-oss-20b-mxfp4) and [running recipe](#running-gpt-oss-20b-on-lunar-lake) below. |
 | **Qwen3.5-4B-int4-AutoRound** | AutoRound INT4 | **3.68 GiB** | 4k | **Tested & working** — 23.4 tok/s single, 159 tok/s peak batched. Hybrid Mamba+attention (Triton fla/ops). |
 | **Intel/Qwen3-8B-int4-AutoRound** | AutoRound INT4 | **5.69 GiB** | 8k | **Tested & working** — 18.6 tok/s single, 90 tok/s peak batched |
 | Qwen3-8B | FP8 (online) | ~10GB | 32k | Standard attention, online quantization |
@@ -190,6 +190,47 @@ export CCL_SOCKET_IFNAME=wlo1  # or your WiFi interface name
 ```
 
 Additionally, the `all_reduce` warmup in `vllm/v1/worker/xpu_worker.py` (lines ~201-203) must be patched out for single-GPU. The `install_lunar_lake.sh` script does this automatically.
+
+## Benchmark Results: gpt-oss-20b (MXFP4)
+
+**Model:** openai/gpt-oss-20b (13.27 GiB loaded, MXFP4 pre-quantized)
+**Architecture:** Dense transformer, 13B actual parameters (despite "20b" name)
+**Backend:** `ipex marlin` XPU backend (MXFP4-specific, not the CUDA GPTQ/AWQ Marlin)
+**Server config:** `--max-model-len 8192 --gpu-memory-utilization 0.7 --enforce-eager --num-gpu-blocks-override 256`
+**Patch required:** `VLLM_SKIP_PROFILE_RUN=1` (profile_run() hangs on Lunar Lake Xe2 iGPU)
+**KV cache:** 256 blocks = ~8,192 tokens
+
+### Single-User Performance (`--max-concurrency 1`)
+
+| Workload | TPOT (median) | tok/s | TTFT (median) | Notes |
+|----------|:---:|:---:|:---:|-------|
+| **128/128** | **44.4 ms** | **22.5 tok/s** | 225 ms | Fastest decode — excellent for interactive chat |
+| **1024/1024** | **58.6 ms** | **17.1 tok/s** | 1,485 ms | Stable, no degradation vs steady state |
+| **2048/2048** | **58.5 ms** | **17.1 tok/s** | 2,486 ms | Rock steady — identical to 1024 |
+
+Decode speed is remarkably consistent at longer contexts (58.5ms at 2048 = same as 1024). Only short-context (128) is faster at 44ms due to smaller KV cache reads.
+
+### Batched Throughput (5 concurrent, `--request-rate inf`)
+
+| Workload | Output tok/s | Peak tok/s | TPOT (median) | TTFT (median) | Notes |
+|----------|:----------:|:----------:|:---:|:---:|-------|
+| **128/128** | 55.2 | 70 | 74.7 ms | 2,168 ms | Good aggregate throughput |
+| **1024/1024** | 45.5 | 75 | 105.3 ms | 4,791 ms | KV cache fills to 100%, starts queuing |
+| **2048/2048** | 33.3 | 75 | 113.8 ms | 7,802 ms | Degrades as requests compete for KV cache |
+
+### Comparison: gpt-oss-20b vs Qwen3.5-9B sym_int4
+
+| Metric | 9B sym_int4 (8.11 GiB) | gpt-oss-20b MXFP4 (13.27 GiB) | Winner |
+|--------|:---:|:---:|:---:|
+| Single 128 tok/s | 14.7 | **22.5** | gpt-oss-20b (1.53x) |
+| Single 1024 tok/s | 10.6 | **17.1** | gpt-oss-20b (1.61x) |
+| Single 2048 tok/s | 10.5 | **17.1** | gpt-oss-20b (1.63x) |
+| Batched 128 TPOT | 82 ms | **74.7 ms** | gpt-oss-20b |
+| Batched 1024 TPOT | **100 ms** | 105.3 ms | 9B sym_int4 |
+| Batched 2048 TPOT | 129 ms | **113.8 ms** | gpt-oss-20b |
+| Model size | **8.11 GiB** | 13.27 GiB | 9B sym_int4 (39% smaller) |
+
+**Key insight:** gpt-oss-20b is significantly faster in single-user despite being 64% larger. The MXFP4 + ipex marlin backend is more efficient than sym_int4's IPEX WOQ path. At 22.5 tok/s single-user, it's comfortably above the 15-20 tok/s interactive chat threshold.
 
 ## Running gpt-oss-20b on Lunar Lake
 
