@@ -77,13 +77,15 @@ def run_model(container, model:ModelSpec, config:ScriptConfig):
     outstr += '--model %s ' % q(model.path)
     outstr += '--served-model-name %s ' % q(model.name)
     outstr += '--dtype=float16 '
-    outstr += '--enforce-eager '
+    if config.EnforceEager:
+        outstr += '--enforce-eager '
     outstr += '--port %d ' % config.Port
     outstr += '--host 0.0.0.0 '
     outstr += '--trust-remote-code '
     outstr += '--disable-sliding-window '
     outstr += '--gpu-memory-util=0.9 '
-    outstr += '--no-enable-prefix-caching '
+    if not config.EnablePrefixCaching:
+        outstr += '--no-enable-prefix-caching '
     outstr += '--max-num-batched-tokens=2048 '
     outstr += '--disable-log-requests '
     outstr += '--block-size 64 '
@@ -104,18 +106,23 @@ def run_model(container, model:ModelSpec, config:ScriptConfig):
     outstr += '" 2>&1 | tee -a "${EXPDIR}/model.log" &'
     print(outstr + "\n")
 
+def stop_model(container):
+    outstr = '# stop model server\n'
+    outstr += 'docker exec -i %s bash -lc "pkill -f \'vllm.entrypoints.openai.api_server\' || true"' % q(container)
+    print(outstr + "\n")
+
 def check_ready(config:ScriptConfig):
     outstr = 'until [ $(curl -o /dev/null -s -w "%%{http_code}\\n" http://localhost:%d/health) = "200" ]; do sleep 1; done' % config.Port
     print(outstr + "\n")
 
 def process_data(container, config:ScriptConfig):
     outstr = 'find %s -type f -name \'*.out\' -print0' % q(f"{config.Path.LogPath}/{container}")
-    outstr += '| xargs -0 -I{} python run_scripts/process_data.py --raw_data "{}" --add_config_header --output %s ' % q(config.Path.AnalysisPath)
+    outstr += '| xargs -0 python run_scripts/process_data.py --raw_data --add_config_header --output %s ' % q(config.Path.AnalysisPath)
     print(outstr + "\n")
 
 def post_process_data(config:ScriptConfig):
     outstr = 'find %s -type f -name \'*.csv\' -print0' % q(f"{config.Path.AnalysisPath}/{config.DATE}")
-    outstr += '| xargs -0 -I{} python run_scripts/post_process_data.py "{}"'
+    outstr += '| xargs -0 python run_scripts/post_process_data.py'
     print(outstr + "\n")
 
 def date():
@@ -158,16 +165,17 @@ def gen_run_scripts(config:ScriptConfig):
     print('#!/bin/bash\n')
     container = config.DATE + "-" + config.VERSION.replace(' ', "_").replace('(',"_").replace(')',"_")
     
+    create_container(container=container,config=config)
     for model in config.Model:
-        create_container(container=container,config=config)
         date()
         echo(model)
         run_model(container=container,model=model,config=config)
         check_ready(config=config)
         for batch in model.batch:
             run_bench(container=container,model=model,batch=batch,config=config)
-        stop_container(container=container)
-        rm_container(container=container)
+        stop_model(container=container)
+    stop_container(container=container)
+    rm_container(container=container)
     date()
     process_data(container,config=config)
     post_process_data(config=config)
