@@ -409,12 +409,76 @@ All three configs use identical methodology (5 prompts, `--request-rate inf`).
 - **FP8 significantly improves both speed and memory** — 37% less memory, 1.75x faster decode. The smaller model reads less data per forward pass, improving bandwidth utilization.
 - **Still not fast enough for interactive chat** — estimated ~8.5 tok/s single-user (117ms TPOT) vs Qwen3.5-4B's 23 tok/s. Borderline usable but noticeably slower.
 - **KV cache dramatically improved** — 79K tokens vs 26K at BF16. Can now handle 9.8x concurrent 8K contexts instead of 3.3x.
-- **FP8 is the only viable online quantization on XPU native install:**
-  - `sym_int4` — requires `/opt/lib/vllm_int4_for_multi_arc.so` (Docker-only, missing on native)
+- **Online quantization status on XPU native install:**
+  - `sym_int4` — **NOW WORKS** ✓ (requires building `vllm_int4_for_multi_arc.so` from source, see below)
+  - `fp8` — **works** ✓
   - `inc` — IPEX `varlen_attention` arg count mismatch in vision encoder (19 args given, max 18)
   - `rtn` — hardcoded `.cuda()` call in `rtn.py:147` (CUDA-only, deprecated)
-  - `fp8` — **works** ✓
-- **Next step: try `Intel/Qwen3.5-9B-int4-AutoRound`** (~9 GiB pre-quantized INT4) — may be faster than FP8 online since INT4 reads even less data per forward pass
+
+## Building sym_int4 Support for Native XPU Install
+
+The `sym_int4` online quantization requires `vllm_int4_for_multi_arc.so`, which Intel only ships inside their Docker images. It can be built from source from [intel/BigDL-core](https://github.com/intel/BigDL-core).
+
+### 1. Build the CPU-side quantizer (required)
+
+Converts FP16/BF16 weights to INT4 at model load time. Pure C, no GPU SDK needed.
+
+```bash
+git clone https://github.com/intel/BigDL-core.git
+cd BigDL-core/bigdl-core-xe/ggml
+mkdir build && cd build
+cmake ..
+cmake --build .
+# Rename and install
+sudo mkdir -p /opt/lib
+sudo cp libquantize.so /opt/lib/vllm_int4_for_multi_arc.so
+```
+
+### 2. Build the GPU-side fused INT4 GEMM kernel (optional, for max performance)
+
+Allows the Xe GPU to compute directly on packed INT4 weights without dequanting to FP16. Requires `icpx` (oneAPI DPC++ compiler).
+
+```bash
+cd BigDL-core/bigdl-core-xe/bigdl-core-xe-addons
+CPLUS_INCLUDE_PATH="/opt/intel/oneapi/compiler/2025.3/include/sycl:$CPLUS_INCLUDE_PATH" \
+  CXX=icpx CC=icx python3 setup.py build_ext --inplace
+# Copy the .so to the venv
+cp bigdl_core_llm.cpython-312-x86_64-linux-gnu.so \
+  $(python3 -c "import site; print(site.getsitepackages()[0])")/
+```
+
+### 3. IPEX patch required for PyTorch 2.10+
+
+PyTorch 2.10 removed `_PYBIND11_*` attributes that IPEX's build system expects. Patch two lines in `intel_extension_for_pytorch/xpu/cpp_extension.py`:
+
+```python
+# Line ~239: change
+val = getattr(torch._C, f"_PYBIND11_{name}")
+# to
+val = getattr(torch._C, f"_PYBIND11_{name}", None)
+
+# Line ~1213: same change
+pval = getattr(torch._C, f"_PYBIND11_{pname}")
+# to
+pval = getattr(torch._C, f"_PYBIND11_{pname}", None)
+```
+
+This patch only affects the IPEX C++ extension build system, not inference. It will be overwritten if IPEX is upgraded.
+
+### 4. Launch vLLM with sym_int4
+
+```bash
+export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1  # CPU-side quant, avoids GPU OOM during loading
+
+vllm serve /shared/models/<model> \
+    --quantization sym_int4 \
+    --dtype float16 \
+    --enforce-eager \
+    --gpu-memory-utilization 0.8 \
+    --host 127.0.0.1 --port 8090
+```
+
+**Note:** `sym_int4` requires `--dtype float16` (BF16 not supported). The `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1` flag enables CPU-side quantization, which avoids the FP16 unpack memory spike that causes OOM on large models.
 
 ## Running Recipes (MSI Claw 8 AI+)
 
