@@ -67,3 +67,24 @@ Date: 2026-03-31
 - **Why this is a bug/risk:** Accidental internet exposure can leak prompts, uploaded files, and model outputs.
 - **Impact:** Security/privacy risk in environments where users expect local-only access.
 - **Suggested fix:** Default `share=False` and gate public sharing behind an explicit CLI flag.
+
+## 9) Qwen3.5 patch uses incorrect `super(...)` targets, skipping parent initialization
+- **Location:** `vllm/patches/vllm_for_multi_arc.patch` (Qwen3.5 classes)
+- **Bug:** `Qwen3_5GatedDeltaNet`, `Qwen3_5DecoderLayer`, and `Qwen3_5Model` call `super(Qwen3Next..., self).__init__()` instead of `super().__init__()` (or `super(Qwen3_5..., self)`).
+- **Why this is a bug:** This pattern resolves past the intended parent class in MRO and can skip critical parent initialization logic.
+- **Impact:** Qwen3.5 model construction can miss required state, causing load-time errors or subtle runtime failures.
+- **Suggested fix:** Replace these with correct `super()` calls and add a minimal constructor smoke test for Qwen3.5 dense/MoE classes.
+
+## 10) Qwen3.5 XPU path hard-fails when speculative decoding metadata is present
+- **Location:** `vllm/patches/vllm_for_multi_arc.patch` (`Qwen3_5GatedDeltaNet.forward_xpu`)
+- **Bug:** The code raises `NotImplementedError` when `attn_metadata.spec_sequence_masks` is not `None`.
+- **Why this is a bug:** Speculative decoding is a documented Qwen3.5 serving mode. Encountering this metadata aborts generation instead of falling back safely.
+- **Impact:** Qwen3.5 inference can crash at runtime on XPU under speculative configurations.
+- **Suggested fix:** Implement XPU support for `spec_sequence_masks` or gracefully disable speculative behavior for this backend with a clear warning and fallback.
+
+## 11) Generated serving command hard-caps context to 2048 tokens, which cripples Qwen3.5 operation
+- **Location:** `vllm/test/run_scripts/gen_run_script.py`
+- **Bug:** `run_model()` always emits `--max-model-len=2048`.
+- **Why this is a bug:** Qwen3.5 models are designed for much longer contexts; this hard cap truncates effective capacity and can invalidate long-context testing.
+- **Impact:** Operational behavior is artificially degraded (prompt truncation/rejection), leading to misleading Qwen3.5 results.
+- **Suggested fix:** Make max context configurable per model (or default to model config), and validate requested lengths against available memory.
