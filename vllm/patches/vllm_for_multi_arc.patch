@@ -11169,16 +11169,16 @@ index fe0850771..5101bbd9d 100644
  
          return int(available_kv_cache_memory)
  
-@@ -155,9 +192,11 @@ class XPUWorker(Worker):
-             raise RuntimeError(
-                 f"Not support device type: {self.device_config.device}")
- 
+@@ -145,9 +182,11 @@ class XPUWorker(Worker):
+         else:
+             raise RuntimeError(f"Not support device type: {self.device_config.device}")
+
 +        ENV_CCL_ZE_IPC_EXCHANGE = os.getenv("CCL_ZE_IPC_EXCHANGE", "pidfd")
          ENV_CCL_ATL_TRANSPORT = os.getenv("CCL_ATL_TRANSPORT", "ofi")
-         ENV_LOCAL_WORLD_SIZE = os.getenv("LOCAL_WORLD_SIZE",
-                                          str(self.parallel_config.world_size))
+         ENV_LOCAL_WORLD_SIZE = os.getenv(
+             "LOCAL_WORLD_SIZE", str(self.parallel_config.world_size)
+         )
 +        os.environ["CCL_ZE_IPC_EXCHANGE"] = ENV_CCL_ZE_IPC_EXCHANGE
          os.environ["CCL_ATL_TRANSPORT"] = ENV_CCL_ATL_TRANSPORT
          os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
          os.environ["LOCAL_RANK"] = str(self.local_rank)
-
