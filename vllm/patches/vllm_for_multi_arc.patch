@@ -1727,7 +1727,7 @@ diff --git a/vllm/distributed/device_communicators/xpu_communicator.py b/vllm/di
 index f3d9262d2..b4b5b0378 100644
 --- a/vllm/distributed/device_communicators/xpu_communicator.py
 +++ b/vllm/distributed/device_communicators/xpu_communicator.py
-@@ -22,24 +22,156 @@ class XpuCommunicator(DeviceCommunicatorBase):
+@@ -22,24 +22,155 @@ class XpuCommunicator(DeviceCommunicatorBase):
          unique_name: str = "",
      ):
          super().__init__(cpu_group, device, device_group, unique_name)
