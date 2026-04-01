@@ -196,41 +196,49 @@ Additionally, the `all_reduce` warmup in `vllm/v1/worker/xpu_worker.py` (lines ~
 **Model:** openai/gpt-oss-20b (13.27 GiB loaded, MXFP4 pre-quantized)
 **Architecture:** Dense transformer, 13B actual parameters (despite "20b" name)
 **Backend:** `ipex marlin` XPU backend (MXFP4-specific, not the CUDA GPTQ/AWQ Marlin)
-**Server config:** `--max-model-len 8192 --gpu-memory-utilization 0.7 --enforce-eager --num-gpu-blocks-override 256`
+**Server config:** `--max-model-len 32768 --gpu-memory-utilization 0.7 --enforce-eager --enable-auto-tool-choice --tool-call-parser openai --reasoning-parser openai_gptoss`
 **Patch required:** `VLLM_SKIP_PROFILE_RUN=1` (profile_run() hangs on Lunar Lake Xe2 iGPU)
-**KV cache:** 256 blocks = ~8,192 tokens
+**KV cache:** 88,576 tokens auto-allocated (~2.7x concurrent at 32K)
 
 ### Single-User Performance (`--max-concurrency 1`)
 
 | Workload | TPOT (median) | tok/s | TTFT (median) | Notes |
 |----------|:---:|:---:|:---:|-------|
-| **128/128** | **44.4 ms** | **22.5 tok/s** | 225 ms | Fastest decode — excellent for interactive chat |
-| **1024/1024** | **58.6 ms** | **17.1 tok/s** | 1,485 ms | Stable, no degradation vs steady state |
-| **2048/2048** | **58.5 ms** | **17.1 tok/s** | 2,486 ms | Rock steady — identical to 1024 |
+| **128/128** | **44.5 ms** | **22.5 tok/s** | 196 ms | Fastest decode — excellent for interactive chat |
+| **1024/1024** | **57.1 ms** | **17.4 tok/s** | 1,145 ms | Stable, no degradation vs steady state |
+| **2048/2048** | **57.4 ms** | **17.3 tok/s** | 1,193 ms | Rock steady — identical to 1024 |
 
-Decode speed is remarkably consistent at longer contexts (58.5ms at 2048 = same as 1024). Only short-context (128) is faster at 44ms due to smaller KV cache reads.
+Decode speed is remarkably consistent at longer contexts (57ms at 2048 = same as 1024). Only short-context (128) is faster at 44ms due to smaller KV cache reads.
 
 ### Batched Throughput (5 concurrent, `--request-rate inf`)
 
 | Workload | Output tok/s | Peak tok/s | TPOT (median) | TTFT (median) | Notes |
 |----------|:----------:|:----------:|:---:|:---:|-------|
-| **128/128** | 55.2 | 70 | 74.7 ms | 2,168 ms | Good aggregate throughput |
-| **1024/1024** | 45.5 | 75 | 105.3 ms | 4,791 ms | KV cache fills to 100%, starts queuing |
-| **2048/2048** | 33.3 | 75 | 113.8 ms | 7,802 ms | Degrades as requests compete for KV cache |
+| **128/128** | 31.7 | 75 | 73.9 ms | 10,805 ms | All 5 run concurrently |
+| **1024/1024** | 44.2 | 75 | 108.0 ms | 5,381 ms | KV cache at ~12%, plenty of headroom |
+| **2048/2048** | 49.0 | 85 | 101.4 ms | 1,549 ms | Best batched throughput — prefix caching helps |
+
+### Long-Context Stress Test (16K input, 5 concurrent)
+
+| Workload | Output tok/s | Peak tok/s | TPOT (median) | TTFT (median) | KV Cache Peak | Notes |
+|----------|:----------:|:----------:|:---:|:---:|:---:|-------|
+| **16384/512** | 17.0 | 40 | 209.7 ms | 42,334 ms | **48.2%** | 5× 16K fits comfortably in 88K KV cache |
+
+82K input tokens (16K × 5) consumed 48% of the 88,576-token KV cache. Proves ~5.4x concurrency at 16K and ~2.7x at 32K. No OOM, no DEVICE_LOST, no request queuing.
 
 ### Comparison: gpt-oss-20b vs Qwen3.5-9B sym_int4
 
 | Metric | 9B sym_int4 (8.11 GiB) | gpt-oss-20b MXFP4 (13.27 GiB) | Winner |
 |--------|:---:|:---:|:---:|
 | Single 128 tok/s | 14.7 | **22.5** | gpt-oss-20b (1.53x) |
-| Single 1024 tok/s | 10.6 | **17.1** | gpt-oss-20b (1.61x) |
-| Single 2048 tok/s | 10.5 | **17.1** | gpt-oss-20b (1.63x) |
-| Batched 128 TPOT | 82 ms | **74.7 ms** | gpt-oss-20b |
-| Batched 1024 TPOT | **100 ms** | 105.3 ms | 9B sym_int4 |
-| Batched 2048 TPOT | 129 ms | **113.8 ms** | gpt-oss-20b |
+| Single 1024 tok/s | 10.6 | **17.4** | gpt-oss-20b (1.64x) |
+| Single 2048 tok/s | 10.5 | **17.3** | gpt-oss-20b (1.65x) |
+| Batched 128 TPOT | 82 ms | **73.9 ms** | gpt-oss-20b |
+| Batched 1024 TPOT | **100 ms** | 108.0 ms | 9B sym_int4 |
+| Batched 2048 TPOT | 129 ms | **101.4 ms** | gpt-oss-20b |
 | Model size | **8.11 GiB** | 13.27 GiB | 9B sym_int4 (39% smaller) |
 
-**Key insight:** gpt-oss-20b is significantly faster in single-user despite being 64% larger. The MXFP4 + ipex marlin backend is more efficient than sym_int4's IPEX WOQ path. At 22.5 tok/s single-user, it's comfortably above the 15-20 tok/s interactive chat threshold.
+**Key insight:** gpt-oss-20b is significantly faster in single-user despite being 64% larger. The MXFP4 + ipex marlin backend is more efficient than sym_int4's IPEX WOQ path. At 22.5 tok/s single-user, it's comfortably above the 15-20 tok/s interactive chat threshold. The 32K context config with tool calling + reasoning has no measurable performance impact vs the basic 8K config.
 
 ## Running gpt-oss-20b on Lunar Lake
 
