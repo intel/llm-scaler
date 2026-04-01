@@ -170,9 +170,7 @@ def main():
     output_file = sys.argv[3]
 
     with open(input_file, "r") as f:
-        lines = f.readlines()
-
-    all_results = parse_all_benchmarks(lines)
+        all_results = parse_all_benchmarks(f)
     reference = load_reference(reference_file)
 
     with open(output_file, "w", newline="") as csvfile:

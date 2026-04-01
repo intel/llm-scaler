@@ -27,7 +27,7 @@ except Exception as e:
     sys.exit(1)
 
 
-def benchmark_t2i_model(model_uid, model_path=None, relaunch=True):
+def benchmark_t2i_model(model_uid, model_path=None, relaunch=False):
     if relaunch:
         model_uid = x_client.launch_model(
             model_uid=model_uid,
@@ -137,17 +137,38 @@ def benchmark_t2i_model(model_uid, model_path=None, relaunch=True):
 
     return avg_latency
 
+
+def benchmark_models(models, reuse_service_session=True):
+    for model_uid, model_path in models:
+        if reuse_service_session:
+            launched_uid = x_client.launch_model(
+                model_uid=model_uid,
+                model_name=model_uid,
+                model_engine="transformers",
+                model_type="image",
+                model_path=model_path,
+            )
+            try:
+                benchmark_t2i_model(
+                    model_uid=launched_uid,
+                    model_path=model_path,
+                    relaunch=False,
+                )
+            finally:
+                x_client.terminate_model(model_uid=launched_uid)
+        else:
+            benchmark_t2i_model(
+                model_uid=model_uid,
+                model_path=model_path,
+                relaunch=True,
+            )
+
+
 if __name__ == "__main__":
     # This file is executable as a script and should be side-effect free when imported.
-    benchmark_t2i_model(
-        model_uid="sd3.5-medium",
-        model_path="/llm/models/stable-diffusion-3.5-medium/",
-    )
-    benchmark_t2i_model(
-        model_uid="FLUX.1-dev",
-        model_path="/llm/models/FLUX.1-dev/",
-    )
-    benchmark_t2i_model(
-        model_uid="HunyuanDiT-v1.2",
-        model_path="/llm/models/HunyuanDiT-v1.2-Diffusers/",
-    )
+    model_targets = [
+        ("sd3.5-medium", "/llm/models/stable-diffusion-3.5-medium/"),
+        ("FLUX.1-dev", "/llm/models/FLUX.1-dev/"),
+        ("HunyuanDiT-v1.2", "/llm/models/HunyuanDiT-v1.2-Diffusers/"),
+    ]
+    benchmark_models(model_targets, reuse_service_session=True)

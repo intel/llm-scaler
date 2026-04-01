@@ -85,6 +85,18 @@ def extract_config_info(path: str, add_config_header) -> List[str]:
 def parse_file_results(raw_data: str) -> List[List[float]]:
     results = []
     current_group = []
+    metric_prefixes = {
+        "Successful requests:": False,
+        "Benchmark duration (s):": False,
+        "Total input tokens:": False,
+        "Total generated tokens:": False,
+        "Request throughput (req/s):": False,
+        "Output token throughput (tok/s):": False,
+        "Total Token throughput (tok/s):": False,
+        "Mean TTFT (ms):": False,
+        "Mean TPOT (ms):": False,
+        "Mean ITL (ms):": True,
+    }
 
     if not os.path.exists(raw_data):
         raise FileNotFoundError(f"Input file not found: {raw_data}")
@@ -92,28 +104,16 @@ def parse_file_results(raw_data: str) -> List[List[float]]:
     with open(raw_data, encoding="UTF-8") as f:
         for dataline in f:
             dataline = dataline.strip()
-            if dataline.startswith("Successful requests:"):
-                current_group.append(get_num(dataline))
-            elif dataline.startswith("Benchmark duration (s):"):
-                current_group.append(get_num(dataline))
-            elif dataline.startswith("Total input tokens:"):
-                current_group.append(get_num(dataline))
-            elif dataline.startswith("Total generated tokens:"):
-                current_group.append(get_num(dataline))
-            elif dataline.startswith("Request throughput (req/s):"):
-                current_group.append(get_num(dataline))
-            elif dataline.startswith("Output token throughput (tok/s):"):
-                current_group.append(get_num(dataline))
-            elif dataline.startswith("Total Token throughput (tok/s):"):
-                current_group.append(get_num(dataline))
-            elif dataline.startswith("Mean TTFT (ms):"):
-                current_group.append(get_num(dataline))
-            elif dataline.startswith("Mean TPOT (ms):"):
-                current_group.append(get_num(dataline))
-            elif dataline.startswith("Mean ITL (ms):"):
-                current_group.append(get_num(dataline))
-                results.append(current_group)
-                current_group = []
+            for prefix, is_terminal_metric in metric_prefixes.items():
+                if not dataline.startswith(prefix):
+                    continue
+                match = NUMBER_PATTERN.search(dataline)
+                value = _parse_num(match.group(0)) if match else 0
+                current_group.append(value)
+                if is_terminal_metric:
+                    results.append(current_group)
+                    current_group = []
+                break
 
     return results
 
