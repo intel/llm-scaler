@@ -239,7 +239,7 @@ For OpenClaw agent use: first conversation turn incurs full cold prefill, but su
 
 82K input tokens (16K × 5) consumed 48% of the 88,576-token KV cache. Proves ~5.4x concurrency at 16K and ~2.7x at 32K. No OOM, no DEVICE_LOST, no request queuing.
 
-*\*Prefix cache warm (57.7% hit rate). Cold-start TTFT ~9-15s.*
+*\*Prefix cache warm (57.7% hit rate). Cold-start TTFT: 20,337ms (measured).*
 
 ### Comparison: gpt-oss-20b vs Qwen3.5-9B sym_int4
 
@@ -543,7 +543,7 @@ All three configs use identical methodology (5 prompts, `--request-rate inf`).
 - **17.66 GiB at BF16 eats nearly all shared memory** — only 26K tokens KV cache at 0.8 util, vs 141K for the 4B model
 - **Multimodal routing issue** — `/v1/completions` returns 404; must use `/v1/chat/completions` endpoint. Benchmark client eventually retried correctly.
 - **Would need INT4 quantization to be practical** — `Intel/Qwen3.5-9B-int4-AutoRound` (~9 GiB) would free up memory, but the ~9B Mamba hybrid is still ~2x slower decode than the 4B variant
-- **Verdict: Qwen3.5-4B remains the best model for Lunar Lake** — 3.68 GiB, 23 tok/s, room for 32K context + ASR + TTS
+- **Verdict: Use gpt-oss-20b as default** (22.5 tok/s, 13.27 GiB, tool calling + reasoning). Qwen3.5-4B (23 tok/s, 3.68 GiB) is the best fallback when running LLM + ASR + TTS simultaneously
 
 ## Benchmark Results: Qwen3.5-9B Claude Distilled (FP8 Online Quantization)
 
@@ -717,33 +717,38 @@ vllm serve /shared/models/<model> \
 
 All services run on the same machine. Use `127.0.0.1` since OpenClaw/Lyra accesses them locally.
 
-### LLM — Qwen3-8B INT4 (port 8000)
+### LLM — gpt-oss-20b MXFP4 (port 8000) — Default OpenClaw agent model
+
+**Recommended primary model.** 22.5 tok/s single-user, 32K context, tool calling + 3-level reasoning.
 
 ```bash
 vllm-activate
-vllm serve /shared/models/qwen3-8b-int4-autoround \
+export VLLM_SKIP_PROFILE_RUN=1
+
+vllm serve /shared/models/gpt-oss-20b \
     --tensor-parallel-size 1 \
-    --gpu-memory-utilization 0.8 \
+    --gpu-memory-utilization 0.7 \
     --enforce-eager \
-    --max-model-len 8192 \
-    --allow-deprecated-quantization \
-    --host 127.0.0.1 --port 8000
+    --max-model-len 32768 \
+    --enable-auto-tool-choice \
+    --tool-call-parser openai \
+    --reasoning-parser openai_gptoss
 ```
 
-### LLM — Qwen3.5-4B INT4 (port 8000) — Fastest option, benchmark mode
-
+Or using the launch script (sets all env vars automatically):
 ```bash
-vllm-activate
-vllm serve /shared/models/qwen3.5-4b-int4-autoround \
-    --tensor-parallel-size 1 \
-    --gpu-memory-utilization 0.8 \
-    --enforce-eager \
-    --max-model-len 8192 \
-    --allow-deprecated-quantization \
-    --host 127.0.0.1 --port 8000
+./vllm/scripts/lunar_lake_serve.sh /shared/models/gpt-oss-20b \
+    --max-model-len 32768 \
+    --enable-auto-tool-choice \
+    --tool-call-parser openai \
+    --reasoning-parser openai_gptoss
 ```
+
+See [running gpt-oss-20b on Lunar Lake](#running-gpt-oss-20b-on-lunar-lake) for full details, prerequisites, and startup log.
 
 ### LLM — Qwen3.5-4B INT4 (port 8082) — OpenClaw fallback model, 32K context + tool calling
+
+For multi-service use (LLM + ASR + TTS) when gpt-oss-20b is too memory-heavy.
 
 ```bash
 vllm-activate
@@ -777,6 +782,19 @@ vllm serve /shared/models/qwen3.5-4b-int4-autoround \
 
 **Requires:** correct `triton-xpu` install (see install script), `oneapi-level-zero-devel`, and `torch.cuda→torch.xpu` patches from `vllm_for_multi_arc.patch`.
 
+### LLM — Qwen3-8B INT4 / Qwen3.5-4B INT4 — Benchmark mode
+
+```bash
+vllm-activate
+vllm serve /shared/models/qwen3.5-4b-int4-autoround \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.8 \
+    --enforce-eager \
+    --max-model-len 8192 \
+    --allow-deprecated-quantization \
+    --host 127.0.0.1 --port 8000
+```
+
 ### ASR — Qwen3-ASR-1.7B (port 8001)
 
 ```bash
@@ -804,11 +822,14 @@ python3 tts_generate.py
 
 | Service | GPU Memory | Notes |
 |---------|-----------|-------|
+| **LLM (gpt-oss-20b MXFP4)** | **~21.6 GB (0.7 × 30.9)** | **13.27 GiB model + 88K KV cache — default/recommended** |
+| LLM (Qwen3.5-4B INT4) | ~13 GB (0.42 × 30.9) | 3.68 GiB model + 51K KV cache — fallback for multi-service |
 | LLM (Qwen3-8B INT4) | ~22.9 GB (0.8 × 28.6) | 5.7GB model + KV cache |
 | ASR (Qwen3-ASR-1.7B) | ~7.2 GB (0.25 × 28.6) | 3.9GB model + KV cache |
 | TTS (Qwen3-TTS-1.7B) | ~2 GB | Loaded on demand |
-| **LLM + ASR together** | ~30 GB | Tight — reduce LLM to 0.7 |
-| **ASR + TTS together** | ~9 GB | Comfortable |
+| **gpt-oss-20b alone** | ~25 GB | Comfortable — 6GB headroom for OS |
+| **Qwen3.5-4B + ASR** | ~20 GB | Comfortable — room for TTS too |
+| **gpt-oss-20b + ASR** | ~29 GB | Tight — reduce gpt-oss to 0.6 util or skip ASR |
 
 ## Alternative: llama.cpp with Vulkan
 
@@ -962,4 +983,4 @@ The script auto-detects your platform and adjusts memory recommendations accordi
 
 ---
 
-*Updated: 2026-03-30*
+*Updated: 2026-04-01*
