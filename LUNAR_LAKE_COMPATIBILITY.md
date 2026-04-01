@@ -207,11 +207,20 @@ Additionally, the `all_reduce` warmup in `vllm/v1/worker/xpu_worker.py` (lines ~
 | **128/128** | **44.5 ms** | **22.5 tok/s** | 196 ms | Fastest decode — excellent for interactive chat |
 | **1024/1024** | **57.1 ms** | **17.4 tok/s** | 1,145 ms | Stable, no degradation vs steady state |
 | **2048/2048** | **57.4 ms** | **17.3 tok/s** | 1,193 ms | Rock steady — identical to 1024 |
-| **16384/512** | **63.5 ms** | **15.7 tok/s** | 398 ms* | Long-context decode — slight KV cache bandwidth slowdown |
+| **16384/512** | **64.3 ms** | **15.6 tok/s** | 20,337 ms | Long-context — 20s cold prefill (8 chunks × ~2.5s) |
 
-Decode speed is remarkably consistent at longer contexts (57ms at 2048 = same as 1024). At 16K context, decode slows to 63.5ms (~15.7 tok/s) due to larger KV cache attention reads — still well above interactive threshold.
+Decode speed is remarkably consistent at longer contexts (57ms at 2048 = same as 1024). At 16K context, decode slows to 64ms (~15.6 tok/s) due to larger KV cache attention reads — still well above interactive threshold.
 
-*\*16K TTFT of 398ms is with prefix caching (57.7% hit rate from prior runs with same random seed). Cold-start 16K TTFT estimated ~9-15s (chunked prefill: 16,384 / 2,048 = 8 chunks).*
+**Prefill speed:** ~807 tok/s effective (16,384 tokens / 20.3s cold). Chunked prefill processes 2,048 tokens per forward pass, so 16K input requires 8 sequential chunks.
+
+**Prefix caching impact on TTFT (16K input):**
+
+| Condition | TTFT | Speedup | Notes |
+|-----------|------|---------|-------|
+| Cold start (0% cache) | **20,337 ms** | baseline | Fresh server, first request ever |
+| Warm cache (57.7% hit) | **398 ms** | **51× faster** | Same input seen before, most KV blocks reused |
+
+For OpenClaw agent use: first conversation turn incurs full cold prefill, but subsequent turns reuse the cached system prompt + prior context, dropping TTFT dramatically.
 
 ### Batched Throughput (5 concurrent, `--request-rate inf`)
 
