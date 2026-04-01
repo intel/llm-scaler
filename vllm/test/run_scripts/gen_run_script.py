@@ -109,7 +109,20 @@ def stop_model(container):
     print(outstr + "\n")
 
 def check_ready(config:ScriptConfig):
-    outstr = 'until [ $(curl -o /dev/null -s -w "%%{http_code}\\n" http://localhost:%d/health) = "200" ]; do sleep 1; done' % config.Port
+    max_wait_seconds = 600
+    outstr = (
+        'timeout %d bash -lc \''
+        'attempt=0; '
+        'until [ "$(curl -o /dev/null -s -w "%%{http_code}" http://localhost:%d/health)" = "200" ]; do '
+        'attempt=$((attempt+1)); '
+        'sleep_for=$((attempt<5 ? attempt : 5)); '
+        'sleep "$sleep_for"; '
+        'done'
+        '\' || { '
+        'echo "{\\"event\\":\\"model_readiness_timeout\\",\\"port\\":%d,\\"max_wait_seconds\\":%d}" 1>&2; '
+        'exit 1; '
+        '}'
+    ) % (max_wait_seconds, config.Port, config.Port, max_wait_seconds)
     print(outstr + "\n")
 
 def process_data(container, config:ScriptConfig):
