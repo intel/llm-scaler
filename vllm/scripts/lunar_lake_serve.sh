@@ -78,6 +78,10 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export PYTORCH_ALLOC_CONF="expandable_segments:True"
 # USM mode for shared memory (no P2P needed)
 export CCL_TOPO_P2P_ACCESS=0
+# Skip profile_run() during KV cache init — the dummy forward pass hangs
+# indefinitely on Lunar Lake iGPU (Xe2/BMG). Instead, estimate peak memory
+# from current allocation. Requires the corresponding xpu_worker.py patch.
+export VLLM_SKIP_PROFILE_RUN=1
 
 # === CCL single-GPU workaround ===
 # oneCCL's KVS init tries to resolve a network interface even for single-GPU.

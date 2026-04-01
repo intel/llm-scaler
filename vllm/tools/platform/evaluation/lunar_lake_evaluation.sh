@@ -38,8 +38,14 @@ detect_gpu() {
     local gpu_id
     gpu_id=$(lspci -nn | grep -i 'vga\|3d\|display' | grep -oP '8086:\K[0-9a-fA-F]+' | head -1)
 
-    case "$gpu_id" in
+    case "${gpu_id,,}" in
+        # Lunar Lake — Xe2
         64a0) echo "lunar_lake" ;;
+        # Meteor Lake — Xe-LPG
+        7d55|7dd5|7d40|7d45) echo "meteor_lake" ;;
+        # Arrow Lake — Xe-LPG+
+        7d51|7dd1|7d41|7d67) echo "arrow_lake" ;;
+        # Discrete GPUs
         e211|e210) echo "arc_pro_b60" ;;
         56a0) echo "arc_a770" ;;
         *) echo "unknown:$gpu_id" ;;
@@ -49,8 +55,8 @@ detect_gpu() {
 GPU_TYPE=$(detect_gpu)
 step "Detected GPU type: $GPU_TYPE"
 
-if [[ "$GPU_TYPE" != "lunar_lake" ]]; then
-    print_warn "This script is optimized for Lunar Lake Xe2 (Arc 140V)."
+if [[ "$GPU_TYPE" != "lunar_lake" && "$GPU_TYPE" != "meteor_lake" && "$GPU_TYPE" != "arrow_lake" ]]; then
+    print_warn "This script is optimized for Intel Xe iGPUs (Lunar/Meteor/Arrow Lake)."
     print_warn "Detected: $GPU_TYPE. Proceeding anyway..."
 fi
 
