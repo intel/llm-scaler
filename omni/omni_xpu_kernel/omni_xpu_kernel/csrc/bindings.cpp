@@ -10,6 +10,7 @@
 // ============================================================================
 
 #include <torch/extension.h>
+#include <pybind11/stl.h>
 
 namespace omni_xpu {
 namespace gguf {
@@ -194,9 +195,10 @@ PYBIND11_MODULE(_C, m) {
     auto sdp = m.def_submodule("sdp", "Scaled dot-product attention kernels");
     sdp.def("sdp", &omni_xpu::sdp::sdp,
         "ESIMD Flash Attention for Intel XPU\n"
-        "Input: q/k/v [B, L, H, 128] fp16/bf16 contiguous on XPU\n"
-        "Constraints: B == 1, head_dim == 128\n"
+        "Input: q/k/v [B, L, H, D] fp16/bf16 contiguous on XPU, D in {64, 128}\n"
+        "Constraints: B == 1\n"
         "V is automatically per-head scaled to prevent fp16 accumulator overflow.\n"
-        "Output: [B, Lq, H, 128] same dtype as q",
+        "Returns: (output, has_nonfinite) where has_nonfinite is True if kernel\n"
+        "detected inf/nan (e.g. degenerate softmax), signaling SDPA fallback needed.",
         py::arg("q"), py::arg("k"), py::arg("v"));
 }

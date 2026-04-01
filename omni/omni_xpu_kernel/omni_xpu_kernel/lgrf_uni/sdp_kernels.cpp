@@ -47,6 +47,18 @@ using Cfg = sdp_config::ConfigBMG_HD64;
 #include "single_kernels/flash.attn.b.mha.bf16io.opt.h"
 }
 
+// Helper macro: common entry-point boilerplate
+#define SDP_ENTRY_VARS \
+    uint8_t* pQ = reinterpret_cast<uint8_t*>(Q); \
+    uint8_t* pK = reinterpret_cast<uint8_t*>(K); \
+    uint8_t* pV = reinterpret_cast<uint8_t*>(V); \
+    uint8_t* pA = reinterpret_cast<uint8_t*>(normAlpha); \
+    uint8_t* pO = reinterpret_cast<uint8_t*>(out); \
+    uint32_t aLen   = (uint32_t)q_len; \
+    uint32_t kvLen  = (uint32_t)kv_len; \
+    uint32_t hQ     = (uint32_t)headQ; \
+    uint32_t hKv    = (uint32_t)headKv;
+
 // ──────────────────────────────────────────────────────────────────────────────
 // sdp_fp16: FP16 optimized Flash Attention
 // ──────────────────────────────────────────────────────────────────────────────
@@ -59,22 +71,12 @@ extern "C" ESIMD_KERNEL_API void sdp_fp16(
     void* sycl_queue_ptr)
 {
     sycl::queue& q = *reinterpret_cast<sycl::queue*>(sycl_queue_ptr);
-
     int groupH = headQ;
     int groupV = (q_len + Cfg::Q_GROUP - 1) / Cfg::Q_GROUP;
     sycl::nd_range<2> ndr(
         {(size_t)(Cfg::WG_SIZE * groupH), (size_t)groupV},
         {(size_t)Cfg::WG_SIZE, 1});
-
-    uint8_t* pQ = reinterpret_cast<uint8_t*>(Q);
-    uint8_t* pK = reinterpret_cast<uint8_t*>(K);
-    uint8_t* pV = reinterpret_cast<uint8_t*>(V);
-    uint8_t* pA = reinterpret_cast<uint8_t*>(normAlpha);
-    uint8_t* pO = reinterpret_cast<uint8_t*>(out);
-    uint32_t aLen  = (uint32_t)q_len;
-    uint32_t kvLen = (uint32_t)kv_len;
-    uint32_t hQ    = (uint32_t)headQ;
-    uint32_t hKv   = (uint32_t)headKv;
+    SDP_ENTRY_VARS
 
     q.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(ndr, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
@@ -97,22 +99,12 @@ extern "C" ESIMD_KERNEL_API void sdp_bf16io(
     void* sycl_queue_ptr)
 {
     sycl::queue& q = *reinterpret_cast<sycl::queue*>(sycl_queue_ptr);
-
     int groupH = headQ;
     int groupV = (q_len + Cfg::Q_GROUP - 1) / Cfg::Q_GROUP;
     sycl::nd_range<2> ndr(
         {(size_t)(Cfg::WG_SIZE * groupH), (size_t)groupV},
         {(size_t)Cfg::WG_SIZE, 1});
-
-    uint8_t* pQ = reinterpret_cast<uint8_t*>(Q);
-    uint8_t* pK = reinterpret_cast<uint8_t*>(K);
-    uint8_t* pV = reinterpret_cast<uint8_t*>(V);
-    uint8_t* pA = reinterpret_cast<uint8_t*>(normAlpha);
-    uint8_t* pO = reinterpret_cast<uint8_t*>(out);
-    uint32_t aLen  = (uint32_t)q_len;
-    uint32_t kvLen = (uint32_t)kv_len;
-    uint32_t hQ    = (uint32_t)headQ;
-    uint32_t hKv   = (uint32_t)headKv;
+    SDP_ENTRY_VARS
 
     q.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(ndr, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
@@ -125,7 +117,6 @@ extern "C" ESIMD_KERNEL_API void sdp_bf16io(
 
 // ──────────────────────────────────────────────────────────────────────────────
 // sdp_fp16_fast: FP16 Flash Attention without compensation clamp (HD=128)
-// Use when V values are small (no overflow risk) for ~9% better performance.
 // ──────────────────────────────────────────────────────────────────────────────
 extern "C" ESIMD_KERNEL_API void sdp_fp16_fast(
     void* Q, void* K, void* V,
@@ -136,22 +127,12 @@ extern "C" ESIMD_KERNEL_API void sdp_fp16_fast(
     void* sycl_queue_ptr)
 {
     sycl::queue& q = *reinterpret_cast<sycl::queue*>(sycl_queue_ptr);
-
     int groupH = headQ;
     int groupV = (q_len + Cfg::Q_GROUP - 1) / Cfg::Q_GROUP;
     sycl::nd_range<2> ndr(
         {(size_t)(Cfg::WG_SIZE * groupH), (size_t)groupV},
         {(size_t)Cfg::WG_SIZE, 1});
-
-    uint8_t* pQ = reinterpret_cast<uint8_t*>(Q);
-    uint8_t* pK = reinterpret_cast<uint8_t*>(K);
-    uint8_t* pV = reinterpret_cast<uint8_t*>(V);
-    uint8_t* pA = reinterpret_cast<uint8_t*>(normAlpha);
-    uint8_t* pO = reinterpret_cast<uint8_t*>(out);
-    uint32_t aLen  = (uint32_t)q_len;
-    uint32_t kvLen = (uint32_t)kv_len;
-    uint32_t hQ    = (uint32_t)headQ;
-    uint32_t hKv   = (uint32_t)headKv;
+    SDP_ENTRY_VARS
 
     q.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(ndr, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
@@ -175,22 +156,12 @@ extern "C" ESIMD_KERNEL_API void sdp_fp16_hd64(
 {
     using C64 = sdp_config::ConfigBMG_HD64;
     sycl::queue& q = *reinterpret_cast<sycl::queue*>(sycl_queue_ptr);
-
     int groupH = headQ;
     int groupV = (q_len + C64::Q_GROUP - 1) / C64::Q_GROUP;
     sycl::nd_range<2> ndr(
         {(size_t)(C64::WG_SIZE * groupH), (size_t)groupV},
         {(size_t)C64::WG_SIZE, 1});
-
-    uint8_t* pQ = reinterpret_cast<uint8_t*>(Q);
-    uint8_t* pK = reinterpret_cast<uint8_t*>(K);
-    uint8_t* pV = reinterpret_cast<uint8_t*>(V);
-    uint8_t* pA = reinterpret_cast<uint8_t*>(normAlpha);
-    uint8_t* pO = reinterpret_cast<uint8_t*>(out);
-    uint32_t aLen  = (uint32_t)q_len;
-    uint32_t kvLen = (uint32_t)kv_len;
-    uint32_t hQ    = (uint32_t)headQ;
-    uint32_t hKv   = (uint32_t)headKv;
+    SDP_ENTRY_VARS
 
     q.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(ndr, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
@@ -214,22 +185,12 @@ extern "C" ESIMD_KERNEL_API void sdp_bf16io_hd64(
 {
     using C64 = sdp_config::ConfigBMG_HD64;
     sycl::queue& q = *reinterpret_cast<sycl::queue*>(sycl_queue_ptr);
-
     int groupH = headQ;
     int groupV = (q_len + C64::Q_GROUP - 1) / C64::Q_GROUP;
     sycl::nd_range<2> ndr(
         {(size_t)(C64::WG_SIZE * groupH), (size_t)groupV},
         {(size_t)C64::WG_SIZE, 1});
-
-    uint8_t* pQ = reinterpret_cast<uint8_t*>(Q);
-    uint8_t* pK = reinterpret_cast<uint8_t*>(K);
-    uint8_t* pV = reinterpret_cast<uint8_t*>(V);
-    uint8_t* pA = reinterpret_cast<uint8_t*>(normAlpha);
-    uint8_t* pO = reinterpret_cast<uint8_t*>(out);
-    uint32_t aLen  = (uint32_t)q_len;
-    uint32_t kvLen = (uint32_t)kv_len;
-    uint32_t hQ    = (uint32_t)headQ;
-    uint32_t hKv   = (uint32_t)headKv;
+    SDP_ENTRY_VARS
 
     q.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(ndr, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {

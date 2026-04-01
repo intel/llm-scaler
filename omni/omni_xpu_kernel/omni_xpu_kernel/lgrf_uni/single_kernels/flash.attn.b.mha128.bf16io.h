@@ -1,12 +1,12 @@
-// BF16-IO Flash Attention kernel — bf16 input/output, hybrid bf16/fp16 internal
-// Strategy: Q/K stay bf16 (no conversion), V converted bf16→fp16 before SLM scatter.
-//   QK uses bf16 DPAS (same throughput), SxV uses fp16 DPAS + fp16 accumulator.
-//   Compensation is overflow-safe fp32 multiply + clamp.
-//   Only 512 bf16→fp16 conversions per loop iteration (V only), vs 8192 for K-converting approach.
+// BF16-IO Flash Attention kernel — bf16 input/output, pure bf16 S×V path
+// Strategy: Q/K stay bf16 (no conversion), V stays bf16 in SLM (no conversion).
+//   QK uses bf16 DPAS (same throughput), SxV uses bf16 DPAS + bf16 accumulator.
+//   Compensation is direct bf16 multiply (no clamp needed — bf16 range sufficient).
+//   Zero bf16→fp16 conversions per loop iteration.
 //   Fast exp2 approximation for softmax (~3x faster than hw exp2).
 //
 // QK DPAS: dpas<8,8,float,float,bf16,bf16> (bf16 inputs, fp32 accum for softmax precision)
-// S×V DPAS: dpas<8,8,fp16,fp16,fp16,fp16> (fp16 inputs, fp16 accum — native compensation)
+// S×V DPAS: dpas<8,8,bf16,bf16,bf16,bf16> (bf16 inputs, bf16 accum — native compensation)
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 
@@ -63,8 +63,8 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
   auto tempBufferAsFp16 = tempBuffer.template bit_cast_view<fp16>();
   auto tempBufferAsBf16 = tempBuffer.template bit_cast_view<bf16>();
   auto ui32Temp = tempBuffer.template bit_cast_view<uint32_t>();
-  // SxV accumulator is fp16 (native compensation multiply)
-  simd<fp16, 16 * 128> finalOutput = 0;
+  // SxV accumulator is bf16 (native compensation multiply)
+  simd<bf16, 16 * 128> finalOutput = 0;
   simd<float, 16> fp32SoftMaxTemp = 0;
   simd<float, 16> fp32HistoricMaxTemp = FP32_MIN;
   simd<uint32_t, 16> baseOffsetInc16AsVector(baseOffsetInc16);
@@ -107,19 +107,12 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
     payloadPrefK.set_y(prefCoordYK);
   }
 
-  // Load first V block (bf16 bits loaded as fp16)
+  // Load first V block (bf16 bits loaded as fp16 — no conversion, stays bf16)
   tempBufferAsFp16.select<512, 1>(0) =
     __ESIMD_ENS::lsc_load_2d<fp16, 16, 16, 2, false, true,
     __ESIMD_ENS::cache_hint::cached, __ESIMD_ENS::cache_hint::cached>(payloadV);
   vCoordY += 64;
   payloadV.set_y(vCoordY);
-
-  // Convert first V block: bf16→fp16 in-place (V goes to fp16 SLM for fp16 SxV DPAS)
-  #pragma unroll
-  for (int ci = 0; ci < 32; ci++) {
-    simd<float, 16> cvt = tempBufferAsBf16.select<16, 1>(16 * ci);
-    tempBufferAsFp16.select<16, 1>(16 * ci) = cvt;
-  }
 
   // Load Q as bf16 (no conversion — used directly in bf16 QK DPAS)
   {
@@ -135,7 +128,7 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
     }
   }
 
-  // Store first V to SLM (already converted to fp16)
+  // Store first V to SLM (bf16 bits, no conversion)
   {
     simd<uint32_t, 32> simdSlmOffsetsV;
     simdSlmOffsetsV.select<16, 1>(0) = baseOffsetInc16AsVector;
@@ -159,7 +152,7 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
     slmPingpongStore = slmPingpongStore * KV_T * HD * sizeof(fp16);
     auto tempQkAsFp16 = tempOutput.template bit_cast_view<fp16>();
     auto tempQkAsBf16 = tempOutput.template bit_cast_view<bf16>();
-    simd<fp16, 512> fp16VState;
+    simd<bf16, 512> bf16VState;
     tempOutput = 0;
 
     // ===== Q @ K^T (bf16 DPAS — no conversion needed for Q or K) =====
@@ -188,8 +181,8 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
       kCoordY += 64;
     }
 
-    // ===== V load (bf16 bits) — NO conversion here, conversion moves to SxV section =====
-    fp16VState =
+    // ===== V load (bf16 bits) — stays bf16, no conversion =====
+    bf16VState.template bit_cast_view<fp16>() =
       __ESIMD_ENS::lsc_load_2d<fp16, 16, 16, 2, false, true,
       __ESIMD_ENS::cache_hint::cached, __ESIMD_ENS::cache_hint::cached>(payloadV);
     vCoordY += 64;
@@ -277,51 +270,47 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
       fp32SoftMaxTemp.select<16, 1>(0) = fp32SoftMaxTemp.select<16, 1>(0) + ttemp.select<16, 1>(0);
       fp32HistoricMaxTemp = fp32CurrentMaxTemp;
 
-      // Compensation — fp16 multiply + clamp (inf → 65504) to prevent accumulator overflow
+      // Compensation — bf16 multiply (no clamp needed — bf16 range sufficient)
       {
-        simd<fp16, 32> fp16CompTemp;
-        fp16CompTemp.select<16, 1>(0) = fp32SoftMaxCompensation;
-        fp16CompTemp.select<16, 1>(16) = fp32SoftMaxCompensation;
+        simd<bf16, 32> bf16CompTemp;
+        bf16CompTemp.select<16, 1>(0) = fp32SoftMaxCompensation;
+        bf16CompTemp.select<16, 1>(16) = fp32SoftMaxCompensation;
         #pragma unroll
         for (int kk = 0; kk < 64; kk++) {
-          finalOutput.select<32, 1>(32 * kk) = finalOutput.select<32, 1>(32 * kk) * fp16CompTemp;
-          finalOutput.select<32, 1>(32 * kk).merge(FP16_MAX, finalOutput.select<32, 1>(32 * kk) > FP16_MAX);
-          finalOutput.select<32, 1>(32 * kk).merge(FP16_MIN_NEG, finalOutput.select<32, 1>(32 * kk) < FP16_MIN_NEG);
+          finalOutput.select<32, 1>(32 * kk) = finalOutput.select<32, 1>(32 * kk) * bf16CompTemp;
         }
       }
 
-      // Pack softmax weights fp32 → fp16 VNNI (same as fp16 kernel)
+      // Pack softmax weights fp32 → bf16 VNNI
       #pragma unroll
       for (int k = 0; k < 4; k++) {
         #pragma unroll
         for (int kk = 0; kk < 2; kk++) {
-          tempBufferAsFp16.select<32, 2>(128 * k + 64 * kk) = tempOutput.select<32, 1>(128 * k + 64 * kk);
+          tempBufferAsBf16.select<32, 2>(128 * k + 64 * kk) = tempOutput.select<32, 1>(128 * k + 64 * kk);
         }
         #pragma unroll
         for (int kk = 0; kk < 2; kk++) {
-          tempBufferAsFp16.select<32, 2>(128 * k + 64 * kk + 1) = tempOutput.select<32, 1>(128 * k + 64 * kk + 32);
+          tempBufferAsBf16.select<32, 2>(128 * k + 64 * kk + 1) = tempOutput.select<32, 1>(128 * k + 64 * kk + 32);
         }
       }
       #pragma unroll
       for (int k = 0; k < 4; k++) {
         #pragma unroll
         for (int kk = 0; kk < 2; kk++) {
-          tempQkAsFp16.select<32, 2>(128 * k + 64 * kk) = tempOutput.select<32, 1>(128 * k + 512 + 64 * kk);
+          tempQkAsBf16.select<32, 2>(128 * k + 64 * kk) = tempOutput.select<32, 1>(128 * k + 512 + 64 * kk);
         }
         #pragma unroll
         for (int kk = 0; kk < 2; kk++) {
-          tempQkAsFp16.select<32, 2>(128 * k + 64 * kk + 1) = tempOutput.select<32, 1>(128 * k + 512 + 64 * kk + 32);
+          tempQkAsBf16.select<32, 2>(128 * k + 64 * kk + 1) = tempOutput.select<32, 1>(128 * k + 512 + 64 * kk + 32);
         }
       }
     }
 
     barrier();
 
-    // ===== S×V — fp16 DPAS with V conversion interleaved in first half =====
-    // V conversion (32 chunks) hidden behind SxV DPAS: XVE converts while XMX computes
+    // ===== S×V — bf16 DPAS (no V conversion needed) =====
     {
-      auto vAsBf16 = fp16VState.template bit_cast_view<bf16>();
-      // First half: 32 DPAS + 32 V conversion chunks interleaved
+      // First half: 32 DPAS (no V conversion needed — bf16 throughout)
       #pragma unroll
       for (int nn = 0; nn < 2; nn++) {
         #pragma unroll
@@ -338,22 +327,16 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
           #pragma unroll
           for (int ll = 0; ll < 8; ll++) {
             auto ccTile = finalOutput.select<128, 1>(1024 * l + 128 * ll);
-            auto aaTile = tempBufferAsFp16.select<256, 1>(256 * nn);
-            auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
-            ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
-              simd<fp16, 128>(ccTile.data()),
-              simd<fp16, 256>(aaTile.data()),
-              simd<fp16, 128>(bbTile.data()));
-            // V conversion: 1 chunk per DPAS (XVE works while XMX processes DPAS)
-            {
-              int32_t ci = nn * 16 + l * 8 + ll;
-              simd<float, 16> cvt = vAsBf16.select<16, 1>(16 * ci);
-              fp16VState.select<16, 1>(16 * ci) = cvt;
-            }
+            auto aaTile = tempBufferAsBf16.select<256, 1>(256 * nn);
+            auto bbTile = tempQkAsBf16.select<128, 1>(1024 + 128 * ll);
+            ccTile = dpas<8, 8, bf16, bf16, bf16, bf16>(
+              simd<bf16, 128>(ccTile.data()),
+              simd<bf16, 256>(aaTile.data()),
+              simd<bf16, 128>(bbTile.data()));
           }
         }
       }
-      // Second half: 32 DPAS, no conversion needed (already done)
+      // Second half: 32 DPAS
       #pragma unroll
       for (int nn = 0; nn < 2; nn++) {
         #pragma unroll
@@ -371,17 +354,17 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
           #pragma unroll
           for (int ll = 0; ll < 8; ll++) {
             auto ccTile = finalOutput.select<128, 1>(1024 * l + 128 * ll);
-            auto aaTile = tempQkAsFp16.select<256, 1>(256 * nn);
-            auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
-            ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
-              simd<fp16, 128>(ccTile.data()),
-              simd<fp16, 256>(aaTile.data()),
-              simd<fp16, 128>(bbTile.data()));
+            auto aaTile = tempQkAsBf16.select<256, 1>(256 * nn);
+            auto bbTile = tempQkAsBf16.select<128, 1>(1024 + 128 * ll);
+            ccTile = dpas<8, 8, bf16, bf16, bf16, bf16>(
+              simd<bf16, 128>(ccTile.data()),
+              simd<bf16, 256>(aaTile.data()),
+              simd<bf16, 128>(bbTile.data()));
           }
         }
       }
 
-      // SLM scatter for next V block (fp16VState now converted to fp16)
+      // SLM scatter for next V block (bf16VState stays bf16)
       simd<uint32_t, 32> simdSlmOffsetsV;
       simdSlmOffsetsV.select<16, 1>(0) = baseOffsetInc16AsVector;
       simdSlmOffsetsV.select<16, 1>(16) = baseOffsetInc16AsVector + 16;
@@ -390,7 +373,7 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
       for (int kk = 0; kk < 2; kk++) {
         __ESIMD_ENS::lsc_slm_scatter<uint32_t, 8, __ESIMD_ENS::lsc_data_size::u32, 16>(
           simdSlmOffsetsV.select<16, 1>(16 * kk),
-          fp16VState.template bit_cast_view<uint32_t>().select<128, 1>(128 * kk));
+          bf16VState.template bit_cast_view<uint32_t>().select<128, 1>(128 * kk));
       }
     }
 
@@ -517,45 +500,43 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
       fp32HistoricMaxTemp = fp32CurrentMaxTemp;
 
       if (loopIdx != 0) {
-        simd<fp16, 32> fp16CompTemp;
-        fp16CompTemp.select<16, 1>(0) = fp32SoftMaxCompensation;
-        fp16CompTemp.select<16, 1>(16) = fp32SoftMaxCompensation;
+        simd<bf16, 32> bf16CompTemp;
+        bf16CompTemp.select<16, 1>(0) = fp32SoftMaxCompensation;
+        bf16CompTemp.select<16, 1>(16) = fp32SoftMaxCompensation;
         #pragma unroll
         for (int kk = 0; kk < 64; kk++) {
-          finalOutput.select<32, 1>(32 * kk) = finalOutput.select<32, 1>(32 * kk) * fp16CompTemp;
-          finalOutput.select<32, 1>(32 * kk).merge(FP16_MAX, finalOutput.select<32, 1>(32 * kk) > FP16_MAX);
-          finalOutput.select<32, 1>(32 * kk).merge(FP16_MIN_NEG, finalOutput.select<32, 1>(32 * kk) < FP16_MIN_NEG);
+          finalOutput.select<32, 1>(32 * kk) = finalOutput.select<32, 1>(32 * kk) * bf16CompTemp;
         }
       }
 
-      // Pack softmax weights fp32 → fp16 VNNI
+      // Pack softmax weights fp32 → bf16 VNNI
       #pragma unroll
       for (int k = 0; k < 4; k++) {
         #pragma unroll
         for (int kk = 0; kk < 2; kk++) {
-          tempBufferAsFp16.select<32, 2>(128 * k + 64 * kk) = tempOutput.select<32, 1>(128 * k + 64 * kk);
+          tempBufferAsBf16.select<32, 2>(128 * k + 64 * kk) = tempOutput.select<32, 1>(128 * k + 64 * kk);
         }
         #pragma unroll
         for (int kk = 0; kk < 2; kk++) {
-          tempBufferAsFp16.select<32, 2>(128 * k + 64 * kk + 1) = tempOutput.select<32, 1>(128 * k + 64 * kk + 32);
+          tempBufferAsBf16.select<32, 2>(128 * k + 64 * kk + 1) = tempOutput.select<32, 1>(128 * k + 64 * kk + 32);
         }
       }
       #pragma unroll
       for (int k = 0; k < 4; k++) {
         #pragma unroll
         for (int kk = 0; kk < 2; kk++) {
-          tempQkAsFp16.select<32, 2>(128 * k + 64 * kk) = tempOutput.select<32, 1>(128 * k + 512 + 64 * kk);
+          tempQkAsBf16.select<32, 2>(128 * k + 64 * kk) = tempOutput.select<32, 1>(128 * k + 512 + 64 * kk);
         }
         #pragma unroll
         for (int kk = 0; kk < 2; kk++) {
-          tempQkAsFp16.select<32, 2>(128 * k + 64 * kk + 1) = tempOutput.select<32, 1>(128 * k + 512 + 64 * kk + 32);
+          tempQkAsBf16.select<32, 2>(128 * k + 64 * kk + 1) = tempOutput.select<32, 1>(128 * k + 512 + 64 * kk + 32);
         }
       }
     }
 
     barrier();
 
-    // S×V — fp16 DPAS (last iteration, no SLM scatter)
+    // S×V — bf16 DPAS (last iteration, no SLM scatter)
     {
       #pragma unroll
       for (int nn = 0; nn < 2; nn++) {
@@ -573,12 +554,12 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
           #pragma unroll
           for (int ll = 0; ll < 8; ll++) {
             auto ccTile = finalOutput.select<128, 1>(1024 * l + 128 * ll);
-            auto aaTile = tempBufferAsFp16.select<256, 1>(256 * nn);
-            auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
-            ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
-              simd<fp16, 128>(ccTile.data()),
-              simd<fp16, 256>(aaTile.data()),
-              simd<fp16, 128>(bbTile.data()));
+            auto aaTile = tempBufferAsBf16.select<256, 1>(256 * nn);
+            auto bbTile = tempQkAsBf16.select<128, 1>(1024 + 128 * ll);
+            ccTile = dpas<8, 8, bf16, bf16, bf16, bf16>(
+              simd<bf16, 128>(ccTile.data()),
+              simd<bf16, 256>(aaTile.data()),
+              simd<bf16, 128>(bbTile.data()));
           }
         }
       }
@@ -599,19 +580,19 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
           #pragma unroll
           for (int ll = 0; ll < 8; ll++) {
             auto ccTile = finalOutput.select<128, 1>(1024 * l + 128 * ll);
-            auto aaTile = tempQkAsFp16.select<256, 1>(256 * nn);
-            auto bbTile = tempQkAsFp16.select<128, 1>(1024 + 128 * ll);
-            ccTile = dpas<8, 8, fp16, fp16, fp16, fp16>(
-              simd<fp16, 128>(ccTile.data()),
-              simd<fp16, 256>(aaTile.data()),
-              simd<fp16, 128>(bbTile.data()));
+            auto aaTile = tempQkAsBf16.select<256, 1>(256 * nn);
+            auto bbTile = tempQkAsBf16.select<128, 1>(1024 + 128 * ll);
+            ccTile = dpas<8, 8, bf16, bf16, bf16, bf16>(
+              simd<bf16, 128>(ccTile.data()),
+              simd<bf16, 256>(aaTile.data()),
+              simd<bf16, 128>(bbTile.data()));
           }
         }
       }
     }
   }
 
-  // Output normalization — fp16 accumulator, convert to bf16 at the end
+  // Output normalization — bf16 accumulator, convert to bf16 output
   simd<float, 16> softMaxDividor;
   simd<float, 128> alphaV;
   alphaV = block_load<float, 128>((float*)normAlpha + headIdx * HD);

@@ -17,6 +17,7 @@
 #include <atomic>
 #include <filesystem>
 #include <mutex>
+#include <tuple>
 #include <string>
 #include <vector>
 
@@ -200,6 +201,29 @@ torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
     TORCH_CHECK(q.size(2) == k.size(2), "q, k, v must have the same head count");
     TORCH_CHECK(q.size(3) == k.size(3) && q.size(3) == v.size(3), "q, k, v must have the same head_dim");
 
+    // Pad kv_len to multiple of 16 if needed.
+    // The ESIMD kernel's 2D block loads read 16 rows at a time. When kv_len is
+    // not a multiple of 16, the hardware may return garbage (not zero) for
+    // out-of-bounds rows on some platforms (e.g., BMG/Xe2), causing NaN output.
+    // Padding K/V with zeros ensures all 2D loads access valid memory.
+    // Pad K/V seq_len to multiple of 16 if needed.
+    // The ESIMD kernel's 2D block loads read 16 rows at a time. When kv_len is
+    // not a multiple of 16, the hardware returns garbage (not zero) for
+    // out-of-bounds rows on BMG/Xe2, causing NaN output.
+    // Padding with zeros ensures all 2D loads access valid memory.
+    // The kernel receives ORIGINAL kv_len for softmax boundary masking, so the
+    // padded zero rows are correctly excluded from the attention computation.
+    const int64_t kv_len = k.size(1);
+    const int64_t kv_pad = (16 - kv_len % 16) % 16;
+    if (kv_pad > 0) {
+        auto k_new = torch::zeros({k.size(0), kv_len + kv_pad, k.size(2), k.size(3)}, k.options());
+        k_new.narrow(1, 0, kv_len).copy_(k);
+        k = k_new;
+        auto v_new = torch::zeros({v.size(0), kv_len + kv_pad, v.size(2), v.size(3)}, v.options());
+        v_new.narrow(1, 0, kv_len).copy_(v);
+        v = v_new;
+    }
+
     auto& kernels = get_kernel_library();
     auto& norm_alpha = norm_alpha_cache(q);
     const int64_t H = q.size(2);
@@ -312,7 +336,7 @@ torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
             const_cast<void*>(alpha_ptr),
             out.data_ptr(),
             static_cast<int>(q.size(1)),
-            static_cast<int>(k.size(1)),
+            static_cast<int>(kv_len + kv_pad),
             static_cast<int>(q.size(2)),
             static_cast<int>(k.size(2)),
             &queue);
