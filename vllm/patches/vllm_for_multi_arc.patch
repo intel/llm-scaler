@@ -6752,7 +6752,7 @@ new file mode 100644
 index 000000000..68e83d66e
 --- /dev/null
 +++ b/vllm/model_executor/models/qwen3_5.py
-@@ -0,0 +1,1152 @@
+@@ -0,0 +1,1150 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -9107,7 +9107,7 @@ index 0f73a7746..b4bca126e 100644
              quant_config=quant_config,
              prefix=f"{prefix}.experts",
              enable_eplb=self.enable_eplb,
-@@ -441,6 +441,98 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
+@@ -441,6 +441,99 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
          self,
          hidden_states: torch.Tensor,
          output: torch.Tensor,
