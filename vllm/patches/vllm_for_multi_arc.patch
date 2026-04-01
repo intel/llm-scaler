@@ -1763,14 +1763,13 @@ index f3d9262d2..b4b5b0378 100644
 +            else:  # type: ignore[has-type]
 +                logger.warning(
 +                    "`%s` all2all manager is not supported on XPU. "
-+                    "Falling back to AgRs manager for XPU, "
-+                    "which is the Default backend",
++                    "Falling back to `naive` all2all manager for XPU.",
 +                    self.all2all_backend,  # type: ignore[has-type]
 +                )
-+                from .all2all import AgRsAll2AllManager
++                from .all2all import NaiveAll2AllManager
 +
-+                self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
-+                logger.info("Using AgRs manager on XPU device.")
++                self.all2all_manager = NaiveAll2AllManager(self.cpu_group)
++                logger.info("Using naive all2all manager.")
 +
      def all_reduce(self, input_) -> torch.Tensor:
          dist.all_reduce(input_, group=self.device_group)
@@ -1877,7 +1876,7 @@ index f3d9262d2..b4b5b0378 100644
 +                dist.all_gather(all_gather_list, input_)
 +                output_tensor = torch.cat(all_gather_list, dim=0)
 +            else:
-+                dist.all_gather([output_tensor], input_)
++                dist.all_gather_into_tensor(output_tensor, input_)
 +            return output_tensor
 +
 +        if isinstance(input_, torch.Tensor):
@@ -11170,3 +11169,16 @@ index fe0850771..5101bbd9d 100644
  
          return int(available_kv_cache_memory)
  
+@@ -155,9 +192,11 @@ class XPUWorker(Worker):
+             raise RuntimeError(
+                 f"Not support device type: {self.device_config.device}")
+ 
++        ENV_CCL_ZE_IPC_EXCHANGE = os.getenv("CCL_ZE_IPC_EXCHANGE", "pidfd")
+         ENV_CCL_ATL_TRANSPORT = os.getenv("CCL_ATL_TRANSPORT", "ofi")
+         ENV_LOCAL_WORLD_SIZE = os.getenv("LOCAL_WORLD_SIZE",
+                                          str(self.parallel_config.world_size))
++        os.environ["CCL_ZE_IPC_EXCHANGE"] = ENV_CCL_ZE_IPC_EXCHANGE
+         os.environ["CCL_ATL_TRANSPORT"] = ENV_CCL_ATL_TRANSPORT
+         os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
+         os.environ["LOCAL_RANK"] = str(self.local_rank)
+
