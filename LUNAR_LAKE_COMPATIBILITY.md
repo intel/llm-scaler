@@ -299,7 +299,7 @@ Model loading took 13.27 GiB memory and ~25 seconds
   > Peak Allocated (Real Need)  : 15.94 GB
   > Model memory usage          : 13.27 GB
 GPU KV cache size: 88,576 tokens
-Maximum concurrency for 32,768 tokens per request: 5.06x
+Maximum concurrency for 32,768 tokens per request: ~2.7x
 Application startup complete.
 ```
 
@@ -324,7 +324,7 @@ gpt-oss-20b supports three thinking levels controlled via system prompt:
 
 - **No `--quantization` flag needed** — MXFP4 is auto-detected from the model's `config.json`
 - **No `--device xpu` flag** — device is set via `VLLM_TARGET_DEVICE=xpu` environment variable (NOT a CLI flag)
-- **No `--num-gpu-blocks-override` needed** — vLLM auto-allocates 88,576 KV cache tokens at `--gpu-memory-utilization 0.7`, enough for 5x concurrent 32K conversations
+- **No `--num-gpu-blocks-override` needed** — vLLM auto-allocates 88,576 KV cache tokens at `--gpu-memory-utilization 0.7`, enough for ~2.7x concurrent 32K conversations
 - **`--dtype bfloat16`** is the default; MXFP4 rejects FP16
 - **sym_int4 does NOT work** on this model (quantization method mismatch — already MXFP4)
 
