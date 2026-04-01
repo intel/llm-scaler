@@ -207,8 +207,11 @@ Additionally, the `all_reduce` warmup in `vllm/v1/worker/xpu_worker.py` (lines ~
 | **128/128** | **44.5 ms** | **22.5 tok/s** | 196 ms | Fastest decode — excellent for interactive chat |
 | **1024/1024** | **57.1 ms** | **17.4 tok/s** | 1,145 ms | Stable, no degradation vs steady state |
 | **2048/2048** | **57.4 ms** | **17.3 tok/s** | 1,193 ms | Rock steady — identical to 1024 |
+| **16384/512** | **63.5 ms** | **15.7 tok/s** | 398 ms* | Long-context decode — slight KV cache bandwidth slowdown |
 
-Decode speed is remarkably consistent at longer contexts (57ms at 2048 = same as 1024). Only short-context (128) is faster at 44ms due to smaller KV cache reads.
+Decode speed is remarkably consistent at longer contexts (57ms at 2048 = same as 1024). At 16K context, decode slows to 63.5ms (~15.7 tok/s) due to larger KV cache attention reads — still well above interactive threshold.
+
+*\*16K TTFT of 398ms is with prefix caching (57.7% hit rate from prior runs with same random seed). Cold-start 16K TTFT estimated ~9-15s (chunked prefill: 16,384 / 2,048 = 8 chunks).*
 
 ### Batched Throughput (5 concurrent, `--request-rate inf`)
 
@@ -218,13 +221,16 @@ Decode speed is remarkably consistent at longer contexts (57ms at 2048 = same as
 | **1024/1024** | 44.2 | 75 | 108.0 ms | 5,381 ms | KV cache at ~12%, plenty of headroom |
 | **2048/2048** | 49.0 | 85 | 101.4 ms | 1,549 ms | Best batched throughput — prefix caching helps |
 
-### Long-Context Stress Test (16K input, 5 concurrent)
+### Long-Context Stress Test (16K input)
 
-| Workload | Output tok/s | Peak tok/s | TPOT (median) | TTFT (median) | KV Cache Peak | Notes |
-|----------|:----------:|:----------:|:---:|:---:|:---:|-------|
-| **16384/512** | 17.0 | 40 | 209.7 ms | 42,334 ms | **48.2%** | 5× 16K fits comfortably in 88K KV cache |
+| Workload | Concurrency | Output tok/s | TPOT (median) | TTFT (median) | KV Cache Peak | Notes |
+|----------|:---:|:----------:|:---:|:---:|:---:|-------|
+| **16384/512** | 1 | 15.7 | 63.5 ms | 398 ms* | 9.6% | Single-user 16K — decode at 15.7 tok/s |
+| **16384/512** | 5 | 17.0 | 209.7 ms | 42,334 ms | **48.2%** | 5× 16K fits comfortably in 88K KV cache |
 
 82K input tokens (16K × 5) consumed 48% of the 88,576-token KV cache. Proves ~5.4x concurrency at 16K and ~2.7x at 32K. No OOM, no DEVICE_LOST, no request queuing.
+
+*\*Prefix cache warm (57.7% hit rate). Cold-start TTFT ~9-15s.*
 
 ### Comparison: gpt-oss-20b vs Qwen3.5-9B sym_int4
 
