@@ -1,31 +1,39 @@
 diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
-index 362028ebf..7b26de8a5 100644
+index 362028ebf..a1eb68f16 100644
 --- a/vllm/model_executor/models/registry.py
 +++ b/vllm/model_executor/models/registry.py
-@@ -1,5 +1,6 @@
+@@ -12,6 +12,7 @@ import pickle
+ import subprocess
+ import sys
+ import tempfile
 +import traceback
-@@ -766,6 +766,58 @@ def _try_inspect_model_cls(
+ from abc import ABC, abstractmethod
+ from collections.abc import Callable, Set
+ from dataclasses import asdict, dataclass, field
+@@ -765,7 +766,50 @@ def _try_inspect_model_cls(
+     try:
          return model.inspect_model_cls()
      except Exception:
-         err_text = traceback.format_exc()
-         is_sycl_no_device = "No device of requested type available" in err_text
-         log_traceback = os.environ.get("VLLM_LOG_TRACEBACK", "0") == "1"
-
-         if is_sycl_no_device:
-             logger.error(
-                 "Model inspection failed: SYCL runtime could not find a usable "
-                 "device. Set VLLM_TARGET_DEVICE=cpu (or "
-                 "VLLM_SKIP_MODEL_INSPECT=1) to continue."
-             )
-         else:
-             logger.error(
-                 "Error in inspecting model architecture '%s'",
-                 model_arch,
-                 exc_info=log_traceback,
-             )
-
-         if is_sycl_no_device and log_traceback:
-             logger.debug("Full model inspection traceback", exc_info=True)
+-        logger.exception("Error in inspecting model architecture '%s'", model_arch)
++        err_text = traceback.format_exc()
++        is_sycl_no_device = "No device of requested type available" in err_text
++        log_traceback = os.environ.get("VLLM_LOG_TRACEBACK", "0") == "1"
++
++        if is_sycl_no_device:
++            logger.error(
++                "Model inspection failed: SYCL runtime could not find a usable "
++                "device. Set VLLM_TARGET_DEVICE=cpu (or "
++                "VLLM_SKIP_MODEL_INSPECT=1) to continue."
++            )
++        else:
++            logger.error(
++                "Error in inspecting model architecture '%s'",
++                model_arch,
++                exc_info=log_traceback,
++            )
++
++        if is_sycl_no_device and log_traceback:
++            logger.debug("Full model inspection traceback", exc_info=True)
 +        if os.environ.get("VLLM_SKIP_MODEL_INSPECT", "0") == "1":
 +            logger.warning(
 +                "VLLM_SKIP_MODEL_INSPECT is set; returning default "
@@ -54,7 +62,7 @@ index 362028ebf..7b26de8a5 100644
          return None
  
  
-@@ -1183,8 +1208,19 @@ def _run_in_subprocess(fn: Callable[[], _T]) -> _T:
+@@ -1183,8 +1227,19 @@ def _run_in_subprocess(fn: Callable[[], _T]) -> _T:
  
          # cannot use `sys.executable __file__` here because the script
          # contains relative imports
