@@ -11182,3 +11182,124 @@ index fe0850771..5101bbd9d 100644
          os.environ["CCL_ATL_TRANSPORT"] = ENV_CCL_ATL_TRANSPORT
          os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
          os.environ["LOCAL_RANK"] = str(self.local_rank)
+
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@
++import atexit
++import contextlib
++import signal
++
+@@
++class MultiprocExecutor:
++    def _cleanup_ipc_primitives(self) -> None:
++        """Best-effort cleanup for leaked IPC primitives."""
++        for shm in getattr(self, "_shared_memory_segments", []):
++            with contextlib.suppress(FileNotFoundError, BufferError, OSError):
++                shm.close()
++            with contextlib.suppress(FileNotFoundError, OSError):
++                shm.unlink()
++
++        for sem in getattr(self, "_semaphores", []):
++            with contextlib.suppress(FileNotFoundError, OSError, ValueError):
++                sem.release()
++            with contextlib.suppress(FileNotFoundError, OSError):
++                sem.unlink()
++
++        self._shared_memory_segments = []
++        self._semaphores = []
++
++    def _reap_workers(self) -> None:
++        for proc in getattr(self, "_workers", []):
++            if proc is None:
++                continue
++            with contextlib.suppress(Exception):
++                proc.join(timeout=0)
++            if proc.is_alive():
++                with contextlib.suppress(Exception):
++                    proc.terminate()
++                with contextlib.suppress(Exception):
++                    proc.join(timeout=5)
++
++    def _handle_worker_fatal(self, *_args) -> None:
++        self._reap_workers()
++        self._cleanup_ipc_primitives()
++
++    def _register_cleanup_hooks(self) -> None:
++        if getattr(self, "_cleanup_hooks_registered", False):
++            return
++
++        atexit.register(self._cleanup_ipc_primitives)
++        signal.signal(signal.SIGTERM, self._handle_worker_fatal)
++        signal.signal(signal.SIGINT, self._handle_worker_fatal)
++        self._cleanup_hooks_registered = True
++
+@@
+-    def start(self) -> None:
+-        self._init_ipc_primitives()
+-        self._spawn_workers()
++    def start(self) -> None:
++        self._register_cleanup_hooks()
++        self._init_ipc_primitives()
++        try:
++            self._spawn_workers()
++        except Exception:
++            self._reap_workers()
++            self._cleanup_ipc_primitives()
++            raise
++
+@@
+-    def shutdown(self) -> None:
+-        self._reap_workers()
++    def shutdown(self) -> None:
++        try:
++            self._reap_workers()
++        finally:
++            self._cleanup_ipc_primitives()
++
+diff --git a/tests/v1/executor/test_multiproc_executor_crash_cleanup.py b/tests/v1/executor/test_multiproc_executor_crash_cleanup.py
+new file mode 100644
+--- /dev/null
++++ b/tests/v1/executor/test_multiproc_executor_crash_cleanup.py
+@@
++import multiprocessing as mp
++
++import pytest
++
++from vllm.v1.executor.multiproc_executor import MultiprocExecutor
++
++
++def test_startup_failure_cleans_up_ipc_and_workers(monkeypatch, caplog):
++    executor = MultiprocExecutor.__new__(MultiprocExecutor)
++    executor._workers = []
++    executor._shared_memory_segments = []
++    executor._semaphores = []
++
++    def _init_ipc_primitives():
++        executor._shared_memory_segments.append(type("S", (), {
++            "close": staticmethod(lambda: None),
++            "unlink": staticmethod(lambda: None),
++        })())
++        executor._semaphores.append(type("P", (), {
++            "release": staticmethod(lambda: None),
++            "unlink": staticmethod(lambda: None),
++        })())
++
++    def _spawn_workers():
++        p = mp.Process(target=lambda: None)
++        p.start()
++        executor._workers.append(p)
++        raise RuntimeError("boom during initialization")
++
++    monkeypatch.setattr(executor, "_register_cleanup_hooks", lambda: None)
++    monkeypatch.setattr(executor, "_init_ipc_primitives", _init_ipc_primitives)
++    monkeypatch.setattr(executor, "_spawn_workers", _spawn_workers)
++
++    with pytest.raises(RuntimeError, match="boom during initialization"):
++        executor.start()
++
++    assert not executor._workers or all(not p.is_alive() for p in executor._workers)
++    assert executor._shared_memory_segments == []
++    assert executor._semaphores == []
++    assert "leaked" not in caplog.text.lower()
