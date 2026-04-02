@@ -426,15 +426,23 @@ torch::Tensor onednn_w8a16_fp8(
     const int64_t k = x_materialized.size(1);
     const int64_t n = weight_materialized.size(0);
 
+    // Check N-chunking first: some large-N shapes are split into smaller chunks
+    // that individually satisfy the per-primitive shape constraints.
+    auto selected_chunk_n = select_chunk_n_for_shape(m, k, n, x_materialized.scalar_type());
+
     // Shape guard: only enable FP8 for shapes where it's faster than bf16 GEMM.
     // Empirically on BMG/B60, FP8 is beneficial when N <= 4096, M <= 8192, K >= 2048.
-    // Outside this range: large M causes primitive failure, large N needs chunking
-    // (overhead > savings), small K has insufficient compute to amortize FP8 overhead.
-    TORCH_CHECK(
-        n <= 4096 && m <= 8192 && k >= 2048,
-        "FP8 GEMM shape outside efficient range (M=", m, " K=", k, " N=", n,
-        "); requires M<=8192, K>=2048, N<=4096"
-    );
+    // For chunked shapes, validate the chunk size rather than the original N.
+    {
+        int64_t effective_n = selected_chunk_n.has_value() ? *selected_chunk_n : n;
+        TORCH_CHECK(
+            effective_n <= 4096 && m <= 8192 && k >= 2048,
+            "FP8 GEMM shape outside efficient range (M=", m, " K=", k, " N=", n,
+            selected_chunk_n.has_value() ? " chunk_N=" : "",
+            selected_chunk_n.has_value() ? std::to_string(effective_n) : "",
+            "); requires M<=8192, K>=2048, effective_N<=4096"
+        );
+    }
 
     torch::Tensor output = allocate_output_with_storage({m, n}, x_materialized.options());
 
@@ -467,8 +475,6 @@ torch::Tensor onednn_w8a16_fp8(
         checked_data_ptr(output, "output");
         return output;
     }
-
-    auto selected_chunk_n = select_chunk_n_for_shape(m, k, n, x_materialized.scalar_type());
 
     if (selected_chunk_n.has_value()) {
         // N-chunking: split along N dimension

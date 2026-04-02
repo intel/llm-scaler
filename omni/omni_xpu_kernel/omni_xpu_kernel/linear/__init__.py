@@ -49,7 +49,8 @@ def fp8_cache_clear() -> None:
 
 def fp8_cache_stats() -> dict[str, int]:
     """Return FP8 primitive cache counters and size."""
-    return _get_native().fp8_cache_stats()
+    hits, misses, size = _get_native().fp8_cache_stats()
+    return {"hits": hits, "misses": misses, "size": size}
 
 
 __all__ = [

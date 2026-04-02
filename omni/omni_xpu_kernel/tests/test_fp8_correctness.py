@@ -70,7 +70,7 @@ class TestFP8GEMMCorrectness:
             xpu_device,
             m=1,
             n=1024,
-            k=1024,
+            k=2048,
             dtype=torch.float16,
             has_bias=False,
         )
@@ -95,7 +95,7 @@ class TestFP8GEMMCorrectness:
             xpu_device,
             m=1,
             n=1024,
-            k=1024,
+            k=2048,
             dtype=torch.float16,
             has_bias=False,
         )
@@ -103,7 +103,7 @@ class TestFP8GEMMCorrectness:
             xpu_device,
             m=16,
             n=1024,
-            k=1024,
+            k=2048,
             dtype=torch.float16,
             has_bias=False,
         )
@@ -118,7 +118,7 @@ class TestFP8GEMMCorrectness:
     @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
     @pytest.mark.parametrize("m", [1, 16, 67]) # Including non-power-of-two shape
     @pytest.mark.parametrize("n", [1024, 4096])
-    @pytest.mark.parametrize("k", [1024, 4097]) # Including non-power-of-two shape
+    @pytest.mark.parametrize("k", [2048, 4097]) # K>=2048 required by shape guard; includes non-power-of-two
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("has_bias", [True, False])
     def test_onednn_w8a16_fp8_correctness(self, xpu_device, m, n, k, dtype, has_bias):
