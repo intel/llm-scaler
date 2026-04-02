@@ -100,9 +100,15 @@ class ICPXBuildExt(build_ext):
         output_path = Path(self.get_ext_fullpath(ext.name))
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
+        is_lgrf = ext.name.endswith("lgrf_sdp")
+        
         # Source directory
-        src_dir = Path(ext.sourcedir) / "omni_xpu_kernel" / "csrc"
-        sources = list(src_dir.glob("*.cpp"))
+        if is_lgrf:
+            src_dir = Path(ext.sourcedir) / "omni_xpu_kernel" / "lgrf_uni"
+            sources = [src_dir / "sdp_kernels.cpp"]
+        else:
+            src_dir = Path(ext.sourcedir) / "omni_xpu_kernel" / "csrc"
+            sources = list(src_dir.glob("*.cpp"))
         
         print(f"Source files: {[s.name for s in sources]}")
         print(f"Output: {output_path}")
@@ -137,62 +143,96 @@ class ICPXBuildExt(build_ext):
         
         if IS_WINDOWS:
             # Windows compile command using icx
-            # Find Python library
             python_lib_dir = sysconfig.get_config_var("LIBDIR") or str(Path(sys.executable).parent / "libs")
             python_version = f"{sys.version_info.major}{sys.version_info.minor}"
             
             cmd = [
                 icpx,
                 "-fsycl",
-                "-fsycl-esimd-force-stateless-mem",
-                "/O2", "/DNDEBUG",
-                "/EHsc",  # Enable C++ exception handling
-                "/std:c++17",
-                f"/I{python_include}",
-                f"/I{torch_include}",
-                f"/I{torch_include}\\torch\\csrc\\api\\include",
-                f"/I{src_dir}",
-                "/LD",  # Create DLL
-                f"/Fe:{output_path}",  # Output file
             ]
-            if has_onednn:
-                cmd.append(f"/I{onednn_include}")
-            cmd += [str(s) for s in sources] + [
-                f"/link",
-                f"/LIBPATH:{torch_lib}",
-                f"/LIBPATH:{python_lib_dir}",
-                "torch.lib", "torch_python.lib", "torch_cpu.lib", "torch_xpu.lib", "c10.lib", "c10_xpu.lib",
-                f"python{python_version}.lib",
-            ]
-            if has_onednn:
-                cmd += [f"/LIBPATH:{onednn_lib}", "dnnl.lib"]
+            
+            if is_lgrf:
+                device_target = os.environ.get("OMNI_XPU_DEVICE", "bmg")
+                cmd += [
+                    "-fsycl-targets=spir64_gen",
+                    "-Xs", f"-device {device_target} -options -doubleGRF",
+                    "/O2", "/DNDEBUG",
+                    "-DBUILD_ESIMD_KERNEL_LIB",
+                    "/LD",  # Create DLL
+                    f"/Fe:{output_path}",  # Output file
+                ]
+                if has_onednn:
+                    cmd.append(f"/I{onednn_include}")
+                cmd += [str(s) for s in sources]
+            else:
+                cmd += [
+                    "-fsycl-esimd-force-stateless-mem",
+                    "/O2", "/DNDEBUG",
+                    "/EHsc",  # Enable C++ exception handling
+                    "/std:c++17",
+                    f"/I{python_include}",
+                    f"/I{torch_include}",
+                    f"/I{torch_include}\\torch\\csrc\\api\\include",
+                    f"/I{src_dir}",
+                    "/LD",  # Create DLL
+                    f"/Fe:{output_path}",  # Output file
+                ]
+                if has_onednn:
+                    cmd.append(f"/I{onednn_include}")
+                cmd += [str(s) for s in sources] + [
+                    f"/link",
+                    f"/LIBPATH:{torch_lib}",
+                    f"/LIBPATH:{python_lib_dir}",
+                    "torch.lib", "torch_python.lib", "torch_cpu.lib", "torch_xpu.lib", "c10.lib", "c10_xpu.lib",
+                    f"python{python_version}.lib",
+                ]
+                if has_onednn:
+                    cmd += [f"/LIBPATH:{onednn_lib}", "dnnl.lib"]
         else:
             # Linux compile command
             cmd = [
                 icpx,
                 "-fsycl",
-                "-fsycl-esimd-force-stateless-mem",
-                "-O3", "-DNDEBUG",
-                "-fPIC", "-shared",
-                "-std=c++17",
-                f"-I{python_include}",
-                f"-I{torch_include}",
-                f"-I{torch_include}/torch/csrc/api/include",
-                f"-I{src_dir}",
             ]
-            if has_onednn:
-                cmd.append(f"-I{onednn_include}")
-            cmd += [
-                f"-L{torch_lib}",
-                "-ltorch", "-ltorch_python", "-ltorch_cpu", "-ltorch_xpu", "-lc10", "-lc10_xpu",
-            ]
-            if has_onednn:
-                cmd += [f"-L{onednn_lib}", "-ldnnl",
-                        "-Wl,-rpath," + onednn_lib]
-            cmd += [
-                "-Wl,-rpath," + str(torch_lib),
-                "-o", str(output_path),
-            ] + [str(s) for s in sources]
+            
+            if is_lgrf:
+                # Device target: set OMNI_XPU_DEVICE env var to override
+                # Common values: bmg (Arc B-series), pvc (Data Center GPU Max), ptl-h (Panther Lake)
+                device_target = os.environ.get("OMNI_XPU_DEVICE", "bmg")
+                cmd += [
+                    "-fsycl-targets=spir64_gen",
+                    "-Xs", f"-device {device_target} -options -doubleGRF",
+                    "-O3", "-DNDEBUG",
+                    "-DBUILD_ESIMD_KERNEL_LIB",
+                    "-fPIC", "-shared",
+                ]
+                if has_onednn:
+                    cmd.append(f"-I{onednn_include}")
+                cmd += ["-o", str(output_path)] + [str(s) for s in sources]
+            else:
+                cmd += [
+                    "-fsycl-esimd-force-stateless-mem",
+                    "-O3", "-DNDEBUG",
+                    "-fPIC", "-shared",
+                    "-std=c++17",
+                    f"-I{python_include}",
+                    f"-I{torch_include}",
+                    f"-I{torch_include}/torch/csrc/api/include",
+                    f"-I{src_dir}",
+                ]
+                if has_onednn:
+                    cmd.append(f"-I{onednn_include}")
+                cmd += [
+                    f"-L{torch_lib}",
+                    "-ltorch", "-ltorch_python", "-ltorch_cpu", "-ltorch_xpu", "-lc10", "-lc10_xpu",
+                ]
+                if has_onednn:
+                    cmd += [f"-L{onednn_lib}", "-ldnnl",
+                            "-Wl,-rpath," + onednn_lib]
+                cmd += [
+                    "-Wl,-rpath," + str(torch_lib),
+                    "-o", str(output_path),
+                ] + [str(s) for s in sources]
         
         print(f"Compile command: {' '.join(cmd)}")
         
@@ -243,7 +283,10 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/intel/omni_xpu_kernel",
     packages=find_packages(exclude=["tests", "scripts"]),
-    ext_modules=[ICPXExtension("omni_xpu_kernel._C", sourcedir=".")],
+    ext_modules=[
+        ICPXExtension("omni_xpu_kernel._C", sourcedir="."),
+        ICPXExtension("omni_xpu_kernel.lgrf_uni.lgrf_sdp", sourcedir=".")
+    ],
     cmdclass={"build_ext": ICPXBuildExt},
     python_requires=">=3.9",
     install_requires=[

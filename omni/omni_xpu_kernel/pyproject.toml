@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "cmake>=3.18"]
+requires = ["setuptools>=45", "wheel", "cmake>=3.18", "torch>=2.0"]
 build-backend = "setuptools.build_meta"
 
 [project]

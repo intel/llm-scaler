@@ -14,7 +14,19 @@ Usage:
 """
 
 import argparse
+import importlib.util
+from pathlib import Path
 import torch
+
+
+def _load_benchmark_module(module_filename: str):
+    benchmark_path = Path(__file__).with_name(module_filename)
+    spec = importlib.util.spec_from_file_location(f"omni_bench_{benchmark_path.stem}", benchmark_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load benchmark module from {benchmark_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def has_xpu():
@@ -26,7 +38,7 @@ def has_xpu():
 
 
 _BENCHMARKS = [
-    "gguf", "norm", "svdq", "rmsnorm", "rotary", "onednn", "postproc",
+    "gguf", "norm", "svdq", "rmsnorm", "rotary", "onednn", "postproc", "sdp",
 ]
 
 
@@ -45,45 +57,51 @@ def main():
     run_all = len(selected) == 0
 
     if run_all or "gguf" in selected:
-        from .bench_gguf import run_benchmarks as run_gguf
+        run_gguf = _load_benchmark_module("bench_gguf.py").run_benchmarks
         print("=" * 60, " GGUF Dequantization ", "=" * 60)
         run_gguf()
         print()
 
     if run_all or "norm" in selected:
-        from .bench_norm import run_benchmarks as run_norm
+        run_norm = _load_benchmark_module("bench_norm.py").run_benchmarks
         print("=" * 60, " Normalization ", "=" * 60)
         run_norm()
         print()
 
     if run_all or "svdq" in selected:
-        from .bench_svdq import run_benchmarks as run_svdq
+        run_svdq = _load_benchmark_module("bench_svdq.py").run_benchmarks
         print("=" * 60, " SVDQuant Dequant ", "=" * 60)
         run_svdq()
         print()
 
     if run_all or "rmsnorm" in selected:
-        from .bench_rmsnorm import main as run_rmsnorm
+        run_rmsnorm = _load_benchmark_module("bench_rmsnorm.py").main
         print("=" * 60, " RMSNorm ESIMD ", "=" * 60)
         run_rmsnorm()
         print()
 
     if run_all or "rotary" in selected:
-        from .bench_rotary import main as run_rotary
+        run_rotary = _load_benchmark_module("bench_rotary.py").main
         print("=" * 60, " Rotary Embedding ESIMD ", "=" * 60)
         run_rotary()
         print()
 
     if run_all or "onednn" in selected:
-        from .bench_onednn_int4 import main as run_onednn
+        run_onednn = _load_benchmark_module("bench_onednn_int4.py").main
         print("=" * 60, " oneDNN INT4 GEMM ", "=" * 60)
         run_onednn()
         print()
 
     if run_all or "postproc" in selected:
-        from .bench_fused_postproc import main as run_postproc
+        run_postproc = _load_benchmark_module("bench_fused_postproc.py").main
         print("=" * 60, " Fused Convert+Add ", "=" * 60)
         run_postproc()
+        print()
+
+    if run_all or "sdp" in selected:
+        run_sdp = _load_benchmark_module("bench_sdp.py").run_benchmarks
+        print("=" * 60, " SDP ", "=" * 60)
+        run_sdp()
         print()
 
 

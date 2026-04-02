@@ -13,6 +13,7 @@
 #include <torch/extension.h>
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
+#include <unordered_map>
 
 #include "utils.h"
 
@@ -450,6 +451,77 @@ torch::Tensor dequantize_q6_k(const torch::Tensor& input, torch::ScalarType dtyp
         TORCH_CHECK(false, "Unsupported dtype");
     }
     return output;
+}
+
+// ============================================================================
+// Batch dequantization: process multiple tensors in one kernel launch
+// Reduces per-tensor submit overhead by grouping same-format tensors
+// ============================================================================
+
+std::vector<torch::Tensor> dequantize_batch(
+    const std::vector<torch::Tensor>& inputs,
+    const std::vector<std::string>& formats,
+    torch::ScalarType dtype
+) {
+    TORCH_CHECK(inputs.size() == formats.size(),
+        "inputs and formats must have the same length");
+    TORCH_CHECK(!inputs.empty(), "inputs must not be empty");
+
+    struct FormatGroup {
+        std::vector<size_t> indices;
+        std::vector<torch::Tensor> tensors;
+        std::vector<int64_t> n_blocks_vec;
+        int qk = 0;
+    };
+
+    std::unordered_map<std::string, FormatGroup> groups;
+
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        TORCH_CHECK(inputs[i].is_contiguous(), "Input tensor ", i, " must be contiguous");
+        TORCH_CHECK(inputs[i].scalar_type() == torch::kByte, "Input ", i, " must be uint8");
+
+        const auto& fmt = formats[i];
+        auto& g = groups[fmt];
+
+        int bs, qk;
+        if (fmt == "q4_0") { bs = Q4_0_BLOCK_SIZE; qk = Q4_0_QK; }
+        else if (fmt == "q8_0") { bs = Q8_0_BLOCK_SIZE; qk = Q8_0_QK; }
+        else if (fmt == "q4_k") { bs = Q4_K_BLOCK_SIZE; qk = Q4_K_QK; }
+        else if (fmt == "q6_k") { bs = Q6_K_BLOCK_SIZE; qk = Q6_K_QK; }
+        else { TORCH_CHECK(false, "Unsupported format: ", fmt); bs = 0; qk = 0; }
+
+        TORCH_CHECK(inputs[i].numel() % bs == 0,
+            "Input ", i, " size not divisible by block size for ", fmt);
+
+        g.qk = qk;
+        g.indices.push_back(i);
+        g.tensors.push_back(inputs[i]);
+        g.n_blocks_vec.push_back(inputs[i].numel() / bs);
+    }
+
+    std::vector<torch::Tensor> outputs(inputs.size());
+
+    for (auto& [fmt, g] : groups) {
+        // Use torch::cat for efficient GPU-side concatenation
+        torch::Tensor concat_input = torch::cat(g.tensors, 0);
+
+        // Single kernel launch for all tensors of this format
+        torch::Tensor concat_output;
+        if (fmt == "q4_0") concat_output = dequantize_q4_0(concat_input, dtype);
+        else if (fmt == "q8_0") concat_output = dequantize_q8_0(concat_input, dtype);
+        else if (fmt == "q4_k") concat_output = dequantize_q4_k(concat_input, dtype);
+        else if (fmt == "q6_k") concat_output = dequantize_q6_k(concat_input, dtype);
+
+        // Split output back (narrow returns a view, no copy)
+        int64_t out_offset = 0;
+        for (size_t j = 0; j < g.indices.size(); ++j) {
+            int64_t n_elements = g.n_blocks_vec[j] * g.qk;
+            outputs[g.indices[j]] = concat_output.narrow(0, out_offset, n_elements);
+            out_offset += n_elements;
+        }
+    }
+
+    return outputs;
 }
 
 }  // namespace gguf
