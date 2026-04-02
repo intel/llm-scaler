@@ -56,6 +56,31 @@ Skip Marlin shuffle entirely, use IPEX native MoE GEMM path.
 - **Result**: `expected self and mat2 to have the same dtype, but got: c10::BFloat16 != int`
   The native path doesn't dequantize INT4 packed weights - it expects FP16/BF16.
 
+## Key Discovery: MXFP4 Bypasses the Reshuffle Entirely
+
+gpt-oss-20b is also an MoE model (20B params, 3.6B activated per token) and loads
+fine on the same 32GB Lunar Lake — even **two instances simultaneously**. The difference
+is the quantization format:
+
+| Format | Works on XPU? | Needs marlin_shuffle? | MoE on 32GB shared? |
+|--------|--------------|----------------------|---------------------|
+| **MXFP4** | Yes | **No** — weights are pre-formatted for Marlin | **Yes** (gpt-oss-20b proves it) |
+| **INT4 AutoRound** | Yes | **Yes** — must reshuffle at runtime | **No** — OOM during shuffle |
+| **GPTQ** | No | N/A — requires CUDA-only Marlin kernels | No |
+| **AWQ** | No | N/A — requires CUDA-only Marlin kernels | No |
+| **FP8** | Yes | No — uses `GatedMLPMOE(is_fp8=True)` | No — 30B model → ~30 GiB, won't fit |
+| **GGUF** | No (vLLM) | N/A — vLLM GGUF is CUDA-only | Yes — via llama.cpp with SYCL backend |
+
+**The root cause is not MoE itself, but INT4 AutoRound → marlin_shuffle_weight.**
+MXFP4 stores weights already in the Marlin kernel's expected layout, so no runtime
+reshuffling is needed. If an MXFP4 version of GLM-4.7-Flash existed, it would likely
+load without OOM, just like gpt-oss-20b.
+
+### Implication for shared-memory iGPUs
+On shared-memory systems, **MXFP4 is the only vLLM-compatible quantization format
+that works for MoE models**. INT4/GPTQ/AWQ all require either reshuffling (OOM) or
+CUDA-only kernels (unsupported). The alternative path is llama.cpp GGUF via SYCL.
+
 ## Ideas for Future Investigation
 
 ### A. Patch IPEX native path to dequantize INT4
@@ -84,9 +109,17 @@ The `GLM-4.7-Flash-Q4_K_M.gguf` (18 GB) in `/shared/models/gguf/` can be served
 via llama.cpp with SYCL backend, which handles INT4 dequantization differently
 and doesn't need Marlin shuffle.
 
-### E. FP8 quantization
+### E. FP8 quantization (ruled out for 32GB)
 Re-quantize the model to FP8 instead of INT4. The IPEX FP8 MoE path
 (`XPUFp8MoEMethod`) doesn't need Marlin shuffle. Uses `GatedMLPMOE(..., is_fp8=True)`.
+However, GLM-4.7-Flash has ~30B parameters; FP8 = 1 byte/param = ~30 GiB, which
+exceeds the 30.9 GiB shared memory pool. Only viable on discrete GPUs with ≥32GB VRAM.
+
+### F. MXFP4 re-quantization (most promising)
+If GLM-4.7-Flash could be quantized to MXFP4 format, it would bypass marlin_shuffle
+entirely — proven by gpt-oss-20b (also MoE) loading without issues. MXFP4 stores
+weights pre-formatted for the Marlin kernel layout. This would need Intel's MXFP4
+quantization tooling or a community-quantized model on HuggingFace.
 
 ## Related Files
 
