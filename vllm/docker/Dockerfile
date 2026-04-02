@@ -140,5 +140,7 @@ RUN rm /usr/lib/python3/dist-packages/PyJWT-2.7.0.dist-info/ -rf
 
 RUN echo "source /opt/intel/oneapi/setvars.sh --force" >> /root/.bashrc
 
-ENTRYPOINT ["bash", "-c", "vllm serve"]
+COPY ./docker/start_vllm_openai.sh /llm/start_vllm_openai.sh
+RUN chmod +x /llm/start_vllm_openai.sh
 
+ENTRYPOINT ["/llm/start_vllm_openai.sh"]
