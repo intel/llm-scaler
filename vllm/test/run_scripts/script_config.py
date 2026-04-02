@@ -89,6 +89,7 @@ class ModelSpec:
     quantization: str
     revision: str = ""
     tp: int = 1
+    tp_auto: bool = False
     batch: List[int] = field(default_factory=list)
     spec_config: SpecConfig = None
     extra_param: Dict[str, Any] = field(default_factory=dict)
@@ -380,14 +381,20 @@ class ScriptConfig:
                     num_speculative_tokens=spec.get("num_speculative_tokens"),
                 )
 
-            tp = int(model.get("tp", 1))
-            if tp < 1:
-                raise ValueError("ModelSpec.tp must be >= 1")
+            raw_tp = model.get("tp", 1)
+            tp_auto = isinstance(raw_tp, str) and raw_tp.strip().lower() == "auto"
+            if tp_auto:
+                tp = 1
+            else:
+                tp = int(raw_tp)
+                if tp < 1:
+                    raise ValueError("ModelSpec.tp must be >= 1, or 'auto'")
 
             model_obj = ModelSpec(
                 name=model.get("name"),
                 tag=model.get("tag",""),
                 tp=tp,
+                tp_auto=tp_auto,
                 quantization=model.get("quantization"),
                 revision=model.get("revision", ""),
                 batch=ScriptConfig._parse_batch(model.get("batch", ""), model.get("name", "")),

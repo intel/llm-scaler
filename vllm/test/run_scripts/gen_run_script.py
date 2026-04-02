@@ -73,6 +73,28 @@ def run_model(container, model:ModelSpec, config:ScriptConfig):
         outstr += 'ZE_AFFINITY_MASK=%s ' % q(config.XPU)
     outstr += 'VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 '
     outstr += 'VLLM_WORKER_MULTIPROC_METHOD=spawn '
+    outstr += 'DETECTED_XPU_COUNT=$(python3 -c \'import os, re; '
+    outstr += 'count=None; '
+    outstr += 'try:\\n import torch;\\n has_xpu=getattr(torch, "xpu", None) is not None and torch.xpu.is_available();\\n '
+    outstr += 'count=torch.xpu.device_count() if has_xpu else 0\\n'
+    outstr += 'except Exception:\\n count=None\\n'
+    outstr += 'if count is None or count <= 0:\\n '
+    outstr += 'mask=os.environ.get("ZE_AFFINITY_MASK", "").strip();\\n '
+    outstr += 'if not mask:\\n  count=0\\n '
+    outstr += 'else:\\n  tokens=[t.strip() for t in re.split(r"[,.]", mask) if t.strip()];\\n count=len(tokens)\\n'
+    outstr += 'print(max(count, 0))\') && '
+    if model.tp_auto:
+        outstr += 'TP_SIZE=${DETECTED_XPU_COUNT} && '
+        outstr += 'if [ "${TP_SIZE}" -lt 1 ]; then '
+        outstr += 'echo "tensor_parallel_size=auto resolved to ${TP_SIZE}, but detected XPU device count must be >= 1." >&2; '
+        outstr += 'exit 1; '
+        outstr += 'fi && '
+    else:
+        outstr += 'TP_SIZE=%d && ' % model.tp
+        outstr += 'if [ "${TP_SIZE}" -gt "${DETECTED_XPU_COUNT}" ]; then '
+        outstr += 'echo "Invalid tensor_parallel_size: configured=${TP_SIZE}, detected_xpu_devices=${DETECTED_XPU_COUNT}. Reduce TP or expose more XPUs." >&2; '
+        outstr += 'exit 1; '
+        outstr += 'fi && '
     outstr += 'python3 -m vllm.entrypoints.openai.api_server '
     outstr += '--model %s ' % q(model.path)
     outstr += '--served-model-name %s ' % q(model.name)
@@ -89,7 +111,7 @@ def run_model(container, model:ModelSpec, config:ScriptConfig):
     if model.quantization:
         outstr += '--quantization %s ' % q(model.quantization)
         outstr += '--allow-deprecated-quantization '
-    outstr += '-tp=%d ' % model.tp
+    outstr += '-tp=${TP_SIZE} '
     if model.spec_config:
         spec_dict = {
             "method": model.spec_config.method,
