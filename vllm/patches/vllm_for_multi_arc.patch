@@ -1931,6 +1931,7 @@ index 000000000..c993e1ebd
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +import asyncio
 +import io
++import logging
 +import math
 +import time
 +import zlib
@@ -1996,6 +1997,10 @@ index 000000000..c993e1ebd
 +)
 +
 +logger = init_logger(__name__)
++
++
++def _should_log_traceback(log_error_stack: bool) -> bool:
++    return log_error_stack or logger.isEnabledFor(logging.DEBUG)
 +
 +
 +class OpenAISpeechToText(OpenAIServing):
@@ -2106,10 +2111,11 @@ index 000000000..c993e1ebd
 +            warmup_elapsed = time.perf_counter() - warmup_start
 +            logger.info("Audio preprocessing warmup completed in %.2fs", warmup_elapsed)
 +        except Exception:
-+            # Don't fail initialization if warmup fails - log exception and continue
-+            logger.exception(
-+                "Audio preprocessing warmup failed (non-fatal): %s. "
++            # Don't fail initialization if warmup fails - keep traceback only in debug
++            logger.warning(
++                "Audio preprocessing warmup failed (non-fatal). "
 +                "First request may experience higher latency.",
++                exc_info=_should_log_traceback(self.log_error_stack),
 +            )
 +
 +    def _warmup_input_processor(self) -> None:
@@ -2166,10 +2172,11 @@ index 000000000..c993e1ebd
 +            warmup_elapsed = time.perf_counter() - warmup_start
 +            logger.info("Input processor warmup completed in %.2fs", warmup_elapsed)
 +        except Exception:
-+            # Don't fail initialization if warmup fails - log warning and continue
-+            logger.exception(
-+                "Input processor warmup failed (non-fatal): %s. "
-+                "First request may experience higher latency."
++            # Don't fail initialization if warmup fails - keep traceback only in debug
++            logger.warning(
++                "Input processor warmup failed (non-fatal). "
++                "First request may experience higher latency.",
++                exc_info=_should_log_traceback(self.log_error_stack),
 +            )
 +
 +    @cached_property
@@ -2366,7 +2373,11 @@ index 000000000..c993e1ebd
 +            )
 +
 +        except ValueError as e:
-+            logger.exception("Error in preprocessing prompt inputs")
++            logger.warning(
++                "Error preprocessing speech-to-text inputs: %s",
++                e,
++                exc_info=_should_log_traceback(self.log_error_stack),
++            )
 +            return self.create_error_response(e)
 +
 +        list_result_generator: list[AsyncGenerator[RequestOutput, None]] | None = None
@@ -2604,7 +2615,12 @@ index 000000000..c993e1ebd
 +            )
 +
 +        except Exception as e:
-+            logger.exception("Error in %s stream generator.", self.task_type)
++            logger.error(
++                "Error in %s stream generator: %s",
++                self.task_type,
++                e,
++                exc_info=_should_log_traceback(self.log_error_stack),
++            )
 +            data = self.create_streaming_error_response(e)
 +            yield f"data: {data}\n\n"
 +        # Send the final done message after all response.n are finished
