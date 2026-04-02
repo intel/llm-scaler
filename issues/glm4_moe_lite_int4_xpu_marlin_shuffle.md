@@ -130,8 +130,62 @@ quantization tooling or a community-quantized model on HuggingFace.
 | `vllm/model_executor/layers/quantization/ipex_quant.py:742-757` | vLLM creates IPEX GatedMLPMOE |
 | `vllm/model_executor/layers/fused_moe/layer.py:1995` | MoE forward dispatch |
 
+## GPU Memory and KV Cache Sizing on Shared Memory
+
+### Usable GPU memory ≠ physical RAM
+On shared-memory iGPUs, the advertised 32 GB LPDDR5x does not all go to the GPU.
+The Level Zero driver, firmware, and display framebuffer reserve a portion. The actual
+usable GPU memory can be queried at runtime:
+
+```python
+import torch
+torch.xpu.get_device_properties(0).total_memory  # returns bytes
+```
+
+On our MSI Claw 8 AI+: **28.57 GiB usable** out of 32 GB physical. This number can
+vary with different driver versions or runtime stacks.
+
+### gpu-memory-utilization is a fraction of usable GPU memory
+vLLM's `--gpu-memory-utilization` is applied to the **usable** GPU memory (28.57 GiB),
+not the physical RAM. The KV cache budget is:
+
+```
+KV cache = (usable_gpu × gpu_util) - peak_model_memory
+```
+
+For gpt-oss-20b at 0.6 utilization:
+```
+28.57 × 0.6 = 17.14 GiB budget
+17.14 - 13.95 = 3.19 GiB KV cache
+KV per token ≈ 48 KB → 69,696 tokens capacity
+```
+
+### VLLM_SKIP_PROFILE_RUN overhead multiplier matters
+The skip-profile patch estimates peak memory as `memory_allocated × multiplier`. The
+multiplier directly affects KV cache capacity:
+
+| Multiplier | Peak estimate | KV cache (0.6 util) | Tokens |
+|-----------|--------------|--------------------:|-------:|
+| 1.20 (default) | 15.94 GiB | 1.20 GiB | 26,176 |
+| 1.05 (tuned) | 13.95 GiB | 3.19 GiB | 69,696 |
+
+The 1.05x multiplier is safe for gpt-oss-20b (verified stable under load) and yields
+**2.67× more KV cache**. For models with larger activation spikes during inference,
+a higher multiplier may be needed.
+
+### Multi-model memory planning
+When running multiple models simultaneously, `gpu-memory-utilization` values must sum
+to less than 1.0 (since each is a fraction of the same shared pool):
+
+```
+gpt-oss-20b:    0.55  →  15.7 GiB
+Qwen3-ASR-1.7B: 0.15  →   4.3 GiB
+Qwen3.5-4B:     0.20  →   5.7 GiB
+Total:          0.90  →  25.7 GiB (leaves 2.9 GiB for OS)
+```
+
 ## Environment
 - Intel Core Ultra 7 258V (Lunar Lake), Arc 140V iGPU
-- 32 GB LPDDR5x shared memory
+- 32 GB LPDDR5x shared memory (28.57 GiB usable by GPU)
 - vLLM 0.14.1.dev0, IPEX XPU
 - Model: glm-4.7-flash-int4-autoround (16.52 GB loaded)
