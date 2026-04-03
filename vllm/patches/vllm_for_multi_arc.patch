@@ -11102,7 +11102,8 @@ index fe0850771..5101bbd9d 100644
 +        # profiled peak memory.
 +        torch.xpu.synchronize()
 +        used_memory = torch.xpu.memory_allocated()
-+        total_gpu_memory = torch.xpu.get_device_properties(self.local_rank).total_memory
++        total_gpu_memory = torch.xpu.get_device_properties(
++            torch.xpu.current_device()).total_memory
 +        free_gpu_memory = total_gpu_memory - used_memory
 +
          # NOTE(woosuk): Here we assume that the other processes using the same
@@ -11143,7 +11144,6 @@ index fe0850771..5101bbd9d 100644
 +        # Profile the memory usage of the model and get the maximum number of
 +        # cache blocks that can be allocated with the remaining free memory.
 +        torch.xpu.empty_cache()
-+        torch.xpu.synchronize()
 +        torch.xpu.reset_peak_memory_stats()
 +
 +        # Execute a forward pass with dummy inputs to profile the memory usage
@@ -11156,7 +11156,8 @@ index fe0850771..5101bbd9d 100644
 +        # Calculate the number of blocks that can be allocated with the
 +        # profiled peak memory.
 +        torch.xpu.synchronize()
-+        total_gpu_memory = torch.xpu.get_device_properties(self.local_rank).total_memory
++        total_gpu_memory = torch.xpu.get_device_properties(
++            torch.xpu.current_device()).total_memory
 +
 +        # NOTE(woosuk): Here we assume that the other processes using the same
 +        # GPU did not change their memory usage during the profiling.
@@ -11189,12 +11190,15 @@ index fe0850771..5101bbd9d 100644
          else:
              raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
-+        ENV_CCL_ZE_IPC_EXCHANGE = os.getenv("CCL_ZE_IPC_EXCHANGE", "pidfd")
-         ENV_CCL_ATL_TRANSPORT = os.getenv("CCL_ATL_TRANSPORT", "ofi")
++        # Only set CCL_ZE_IPC_EXCHANGE if the user has not already set it.
++        # Forcing "pidfd" can cause SYCL "No device" failures on systems
++        # where pidfd_getfd is unavailable or blocked by container policy.
++        if "CCL_ZE_IPC_EXCHANGE" not in os.environ:
++            os.environ["CCL_ZE_IPC_EXCHANGE"] = "drmfd"
++        ENV_CCL_ATL_TRANSPORT = os.getenv("CCL_ATL_TRANSPORT", "ofi")
          ENV_LOCAL_WORLD_SIZE = os.getenv(
              "LOCAL_WORLD_SIZE", str(self.parallel_config.world_size)
          )
-+        os.environ["CCL_ZE_IPC_EXCHANGE"] = ENV_CCL_ZE_IPC_EXCHANGE
          os.environ["CCL_ATL_TRANSPORT"] = ENV_CCL_ATL_TRANSPORT
          os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
          os.environ["LOCAL_RANK"] = str(self.local_rank)
