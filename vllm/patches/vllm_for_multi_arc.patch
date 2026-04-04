@@ -6899,14 +6899,33 @@ index 000000000..68e83d66e
 +logger = init_logger(__name__)
 +
 +
++def _patch_image_processor_pixels(processor: object) -> object:
++    """Patch max_pixels/min_pixels onto Qwen2VLImageProcessor instances that
++    predate transformers adding those as stored attributes.  Qwen3VL processing
++    info accesses them directly, so they must exist."""
++    img_proc = getattr(processor, "image_processor", None)
++    if img_proc is not None:
++        if not hasattr(img_proc, "max_pixels"):
++            img_proc.max_pixels = 1280 * 28 * 28  # Qwen2VL default
++        if not hasattr(img_proc, "min_pixels"):
++            img_proc.min_pixels = 4 * 28 * 28      # Qwen2VL default
++    return processor
++
++
 +class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
 +    def get_hf_config(self):
 +        return self.ctx.get_hf_config(Qwen3_5Config)
++
++    def get_hf_processor(self, **kwargs):
++        return _patch_image_processor_pixels(super().get_hf_processor(**kwargs))
 +
 +
 +class Qwen3_5MoeProcessingInfo(Qwen3VLProcessingInfo):
 +    def get_hf_config(self):
 +        return self.ctx.get_hf_config(Qwen3_5MoeConfig)
++
++    def get_hf_processor(self, **kwargs):
++        return _patch_image_processor_pixels(super().get_hf_processor(**kwargs))
 +
 +
 +class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
