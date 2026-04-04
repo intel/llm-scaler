@@ -31,7 +31,75 @@ should_run_preflight() {
     return 1
 }
 
+
+extract_sycl_xpu_count() {
+    local sycl_output="${1:-}"
+    local count=0
+
+    count=$(echo "$sycl_output" | grep -Eio "(level_zero|ext_oneapi_level_zero).*(gpu|xpu)" | wc -l || true)
+    if [[ "$count" -eq 0 ]]; then
+        count=$(echo "$sycl_output" | grep -Eio "opencl.*(gpu|xpu)" | wc -l || true)
+    fi
+
+    echo "$count"
+}
+
+extract_int_arg() {
+    local key="$1"
+    shift
+    local args=("$@")
+    local i=0
+
+    while [[ $i -lt ${#args[@]} ]]; do
+        local token="${args[$i]}"
+        if [[ "$token" == "$key" ]]; then
+            if [[ $((i + 1)) -lt ${#args[@]} ]]; then
+                echo "${args[$((i + 1))]}"
+                return 0
+            fi
+        elif [[ "$token" =~ ^${key}=(.+)$ ]]; then
+            echo "${BASH_REMATCH[1]}"
+            return 0
+        fi
+        ((i += 1))
+    done
+
+    echo ""
+}
+
+validate_parallelism_settings() {
+    local sycl_xpu_count="$1"
+    shift
+
+    local dp_raw tp_raw dp tp total_required
+    dp_raw="$(extract_int_arg "--dp" "$@")"
+    tp_raw="$(extract_int_arg "--tensor-parallel-size" "$@")"
+
+    if [[ -z "$tp_raw" ]]; then
+        tp_raw="$(extract_int_arg "-tp" "$@")"
+    fi
+
+    if [[ "$dp_raw" =~ ^[0-9]+$ ]]; then
+        dp="$dp_raw"
+    else
+        dp=1
+    fi
+
+    if [[ "$tp_raw" =~ ^[0-9]+$ ]]; then
+        tp="$tp_raw"
+    else
+        tp=1
+    fi
+
+    total_required=$((dp * tp))
+    if [[ "$sycl_xpu_count" -gt 0 && "$total_required" -gt "$sycl_xpu_count" ]]; then
+        log "ERROR: Requested parallelism requires $total_required XPU devices (dp=$dp, tp=$tp), but sycl-ls reports $sycl_xpu_count."
+        log "Adjust --dp/--tensor-parallel-size (or -tp), or fix device filtering env vars like ZE_AFFINITY_MASK/ONEAPI_DEVICE_SELECTOR."
+        exit 65
+    fi
+}
 preflight_intel_gpu() {
+    local sycl_xpu_count=0
     local has_render_nodes=0
     local has_sycl_gpu=0
     local sycl_output=""
@@ -42,7 +110,8 @@ preflight_intel_gpu() {
 
     if command -v sycl-ls > /dev/null 2>&1; then
         sycl_output="$(sycl-ls 2>&1 || true)"
-        if echo "$sycl_output" | grep -Eqi "(level_zero|ext_oneapi_level_zero).*(gpu|xpu)|opencl.*(gpu|xpu)"; then
+        sycl_xpu_count="$(extract_sycl_xpu_count "$sycl_output")"
+        if [[ "$sycl_xpu_count" -gt 0 ]]; then
             has_sycl_gpu=1
         fi
     fi
@@ -53,12 +122,17 @@ preflight_intel_gpu() {
         echo "$sycl_output"
     fi
 
-    if [[ $has_render_nodes -eq 1 || $has_sycl_gpu -eq 1 ]]; then
-        log "Intel GPU preflight passed."
+    if [[ $has_sycl_gpu -eq 1 ]]; then
+        validate_parallelism_settings "$sycl_xpu_count" "$@"
+        log "Intel GPU preflight passed (detected $sycl_xpu_count XPU device(s) via sycl-ls)."
         return 0
     fi
 
-    log "ERROR: No Intel GPU/XPU detected before starting vLLM OpenAI server."
+    if [[ $has_render_nodes -eq 1 ]]; then
+        log "ERROR: Render nodes are visible, but oneAPI cannot detect a usable Intel GPU/XPU device."
+    else
+        log "ERROR: No Intel GPU/XPU detected before starting vLLM OpenAI server."
+    fi
     if [[ -f "/.dockerenv" ]]; then
         log "Container runtime hint: map GPU devices and required flags."
         log "Example docker run flags:"
@@ -67,6 +141,7 @@ preflight_intel_gpu() {
         log "  devices: [\"/dev/dri:/dev/dri\"]"
     fi
     log "Install oneAPI runtime tools (for sycl-ls) and verify host GPU drivers."
+    log "If running non-interactively, make sure oneAPI env is sourced: source /opt/intel/oneapi/setvars.sh --force"
 
     if is_truthy "${VLLM_PREFLIGHT_CPU_FALLBACK:-0}"; then
         export VLLM_TARGET_DEVICE=cpu
@@ -80,7 +155,7 @@ preflight_intel_gpu() {
 
 main() {
     if should_run_preflight "$@"; then
-        preflight_intel_gpu
+        preflight_intel_gpu "$@"
     fi
 
     if [[ $# -eq 0 || "$1" == "serve" ]]; then
