@@ -11076,7 +11076,7 @@ diff --git a/vllm/v1/worker/xpu_worker.py b/vllm/v1/worker/xpu_worker.py
 index fe0850771..5101bbd9d 100644
 --- a/vllm/v1/worker/xpu_worker.py
 +++ b/vllm/v1/worker/xpu_worker.py
-@@ -67,63 +67,100 @@ class XPUWorker(Worker):
+@@ -67,63 +67,101 @@ class XPUWorker(Worker):
      def determine_available_memory(self) -> int:
          """Profiles the peak memory usage of the model to determine how many
          KV blocks may be allocated without OOMs.
@@ -11205,7 +11205,7 @@ index fe0850771..5101bbd9d 100644
  
          return int(available_kv_cache_memory)
  
-@@ -145,9 +182,11 @@ class XPUWorker(Worker):
+@@ -145,10 +182,16 @@ class XPUWorker(Worker):
          else:
              raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
@@ -11221,6 +11221,7 @@ index fe0850771..5101bbd9d 100644
          os.environ["CCL_ATL_TRANSPORT"] = ENV_CCL_ATL_TRANSPORT
          os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
          os.environ["LOCAL_RANK"] = str(self.local_rank)
+
 
 diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
 --- a/vllm/v1/executor/multiproc_executor.py
