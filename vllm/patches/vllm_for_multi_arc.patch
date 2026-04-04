@@ -6767,7 +6767,7 @@ new file mode 100644
 index 000000000..68e83d66e
 --- /dev/null
 +++ b/vllm/model_executor/models/qwen3_5.py
-@@ -0,0 +1,1150 @@
+@@ -0,0 +1,1169 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
