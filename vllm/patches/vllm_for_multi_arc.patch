@@ -6899,14 +6899,33 @@ index 000000000..68e83d66e
 +logger = init_logger(__name__)
 +
 +
++def _patch_image_processor_pixels(processor: object) -> object:
++    """Patch max_pixels/min_pixels onto Qwen2VLImageProcessor instances that
++    predate transformers adding those as stored attributes.  Qwen3VL processing
++    info accesses them directly, so they must exist."""
++    img_proc = getattr(processor, "image_processor", None)
++    if img_proc is not None:
++        if not hasattr(img_proc, "max_pixels"):
++            img_proc.max_pixels = 1280 * 28 * 28  # Qwen2VL default
++        if not hasattr(img_proc, "min_pixels"):
++            img_proc.min_pixels = 4 * 28 * 28      # Qwen2VL default
++    return processor
++
++
 +class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
 +    def get_hf_config(self):
 +        return self.ctx.get_hf_config(Qwen3_5Config)
++
++    def get_hf_processor(self, **kwargs):
++        return _patch_image_processor_pixels(super().get_hf_processor(**kwargs))
 +
 +
 +class Qwen3_5MoeProcessingInfo(Qwen3VLProcessingInfo):
 +    def get_hf_config(self):
 +        return self.ctx.get_hf_config(Qwen3_5MoeConfig)
++
++    def get_hf_processor(self, **kwargs):
++        return _patch_image_processor_pixels(super().get_hf_processor(**kwargs))
 +
 +
 +class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
@@ -11194,7 +11213,7 @@ index fe0850771..5101bbd9d 100644
 +        # Forcing "pidfd" can cause SYCL "No device" failures on systems
 +        # where pidfd_getfd is unavailable or blocked by container policy.
 +        if "CCL_ZE_IPC_EXCHANGE" not in os.environ:
-+            os.environ["CCL_ZE_IPC_EXCHANGE"] = "drmfd"
++            os.environ["CCL_ZE_IPC_EXCHANGE"] = "sockets"
 +        ENV_CCL_ATL_TRANSPORT = os.getenv("CCL_ATL_TRANSPORT", "ofi")
          ENV_LOCAL_WORLD_SIZE = os.getenv(
              "LOCAL_WORLD_SIZE", str(self.parallel_config.world_size)
