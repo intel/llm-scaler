@@ -11205,24 +11205,6 @@ index fe0850771..5101bbd9d 100644
  
          return int(available_kv_cache_memory)
  
-@@ -145,10 +182,16 @@ class XPUWorker(Worker):
-         else:
-             raise RuntimeError(f"Not support device type: {self.device_config.device}")
-
-+        # Only set CCL_ZE_IPC_EXCHANGE if the user has not already set it.
-+        # Forcing "pidfd" can cause SYCL "No device" failures on systems
-+        # where pidfd_getfd is unavailable or blocked by container policy.
-+        if "CCL_ZE_IPC_EXCHANGE" not in os.environ:
-+            os.environ["CCL_ZE_IPC_EXCHANGE"] = "sockets"
-+        ENV_CCL_ATL_TRANSPORT = os.getenv("CCL_ATL_TRANSPORT", "ofi")
-         ENV_LOCAL_WORLD_SIZE = os.getenv(
-             "LOCAL_WORLD_SIZE", str(self.parallel_config.world_size)
-         )
-         os.environ["CCL_ATL_TRANSPORT"] = ENV_CCL_ATL_TRANSPORT
-         os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
-         os.environ["LOCAL_RANK"] = str(self.local_rank)
-
-
 diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
 --- a/vllm/v1/executor/multiproc_executor.py
 +++ b/vllm/v1/executor/multiproc_executor.py
