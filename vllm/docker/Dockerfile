@@ -116,7 +116,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     sed -i 's|^triton-xpu|# triton-xpu|' requirements.txt && \
     sed -i 's|^transformers|# transformers|' requirements.txt && \
     pip install -r requirements.txt && \
-    pip install --no-build-isolation .
+    MAX_JOBS=2 pip install --no-build-isolation .
 
 # FIX triton
 RUN --mount=type=cache,target=/root/.cache/pip \
