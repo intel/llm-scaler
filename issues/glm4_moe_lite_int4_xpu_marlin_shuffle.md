@@ -184,8 +184,31 @@ Qwen3.5-4B:     0.20  →   5.7 GiB
 Total:          0.90  →  25.7 GiB (leaves 2.9 GiB for OS)
 ```
 
+## Build Parallelism on Shared-Memory Systems
+
+When building vLLM, IPEX, or llama.cpp natively on shared-memory iGPUs, the
+compiler can OOM if too many parallel jobs run simultaneously. Use RAM-based
+`MAX_JOBS` auto-detection:
+
+```bash
+TOTAL_RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
+if [ "$TOTAL_RAM_GB" -le 16 ]; then
+    export MAX_JOBS=3   # Claw A1M (16GB Meteor Lake)
+elif [ "$TOTAL_RAM_GB" -le 32 ]; then
+    export MAX_JOBS=6   # Claw 8 AI+ (32GB Lunar Lake)
+else
+    export MAX_JOBS=8   # Discrete GPU systems with more RAM
+fi
+cmake --build build -j$MAX_JOBS   # or: pip install with MAX_JOBS set
+```
+
+The `MAX_JOBS` environment variable is respected by both CMake and Python
+setuptools/pip builds.
+
 ## Environment
 - Intel Core Ultra 7 258V (Lunar Lake), Arc 140V iGPU
 - 32 GB LPDDR5x shared memory (28.57 GiB usable by GPU)
+- Intel Core Ultra 7 155H (Meteor Lake), Xe-LPG iGPU
+- 16 GB LPDDR5 shared memory
 - vLLM 0.14.1.dev0, IPEX XPU
 - Model: glm-4.7-flash-int4-autoround (16.52 GB loaded)
