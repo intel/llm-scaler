@@ -162,9 +162,10 @@ main() {
         if [[ "${1:-}" == "serve" ]]; then
             shift
         fi
-        # Use drmfd (not pidfd) for Level Zero IPC — pidfd is blocked by
-        # container seccomp on many hosts and causes "No device" SYCL crashes.
-        export CCL_ZE_IPC_EXCHANGE="${CCL_ZE_IPC_EXCHANGE:-drmfd}"
+        # Use sockets (not pidfd) for Level Zero IPC — pidfd requires the
+        # pidfd_getfd syscall which is blocked by container seccomp on many
+        # hosts and causes "No device of requested type" SYCL crashes.
+        export CCL_ZE_IPC_EXCHANGE="${CCL_ZE_IPC_EXCHANGE:-sockets}"
         exec vllm serve "$@"
     fi
 

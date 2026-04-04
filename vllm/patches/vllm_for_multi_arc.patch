@@ -11194,7 +11194,7 @@ index fe0850771..5101bbd9d 100644
 +        # Forcing "pidfd" can cause SYCL "No device" failures on systems
 +        # where pidfd_getfd is unavailable or blocked by container policy.
 +        if "CCL_ZE_IPC_EXCHANGE" not in os.environ:
-+            os.environ["CCL_ZE_IPC_EXCHANGE"] = "drmfd"
++            os.environ["CCL_ZE_IPC_EXCHANGE"] = "sockets"
 +        ENV_CCL_ATL_TRANSPORT = os.getenv("CCL_ATL_TRANSPORT", "ofi")
          ENV_LOCAL_WORLD_SIZE = os.getenv(
              "LOCAL_WORLD_SIZE", str(self.parallel_config.world_size)
