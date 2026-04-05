@@ -53,15 +53,21 @@ ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
 RUN python3 -m pip config set global.break-system-packages true
 
 # Clone + patch vllm
+# MAX_JOBS: auto-detect based on available RAM to avoid OOM during compilation
+# 16GB systems (e.g. Claw A1M): 3 jobs, 32GB (Claw 8 AI+): 6 jobs
 RUN --mount=type=cache,target=/root/.cache/pip \
+    TOTAL_RAM_GB=$(free -g | awk '/^Mem:/{print $2}') && \
+    if [ "$TOTAL_RAM_GB" -le 16 ]; then export MAX_JOBS=3; \
+    elif [ "$TOTAL_RAM_GB" -le 32 ]; then export MAX_JOBS=6; \
+    else export MAX_JOBS=8; fi && \
+    echo "RAM: ${TOTAL_RAM_GB}GB -> MAX_JOBS=$MAX_JOBS" && \
     git clone -b v0.14.0 https://github.com/vllm-project/vllm.git && \
     cd vllm && \
     git apply /tmp/vllm_for_multi_arc.patch && \
     pip install -r requirements/xpu.txt && \
     pip install arctic-inference==0.1.1 && \
-    # pip install --no-cache-dir arctic-inference==0.1.1 && \
     export CPATH=/opt/intel/oneapi/dpcpp-ct/2025.2/include/:${CPATH} && \
-    pip install --no-build-isolation . 
+    pip install --no-build-isolation .
 
 # Clone + patch miner-U
 RUN --mount=type=cache,target=/root/.cache/pip \
