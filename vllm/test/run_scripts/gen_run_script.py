@@ -73,6 +73,7 @@ def run_model(container, model:ModelSpec, config:ScriptConfig):
         outstr += 'ZE_AFFINITY_MASK=%s ' % q(config.XPU)
     outstr += 'VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 '
     outstr += 'VLLM_WORKER_MULTIPROC_METHOD=spawn '
+    outstr += 'CCL_ZE_IPC_EXCHANGE="${CCL_ZE_IPC_EXCHANGE:-sockets}" '
     outstr += 'DETECTED_XPU_COUNT=$(python3 -c \'import os, re; '
     outstr += 'count=None; '
     outstr += 'try:\\n import torch;\\n has_xpu=getattr(torch, "xpu", None) is not None and torch.xpu.is_available();\\n '

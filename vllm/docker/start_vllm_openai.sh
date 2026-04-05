@@ -171,6 +171,10 @@ main() {
 
     if [[ "$1" == "vllm" && "${2:-}" == "serve" ]]; then
         shift 2
+        # Use sockets (not pidfd) for Level Zero IPC — pidfd requires the
+        # pidfd_getfd syscall which is blocked by container seccomp on many
+        # hosts and causes "No device of requested type" SYCL crashes.
+        export CCL_ZE_IPC_EXCHANGE="${CCL_ZE_IPC_EXCHANGE:-sockets}"
         exec vllm serve "$@"
     fi
 

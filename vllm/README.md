@@ -556,7 +556,7 @@ pip install transformers==4.52.4 librosa
 ```bash
 TORCH_LLM_ALLREDUCE=1 \
 VLLM_USE_V1=0 \
-CCL_ZE_IPC_EXCHANGE=pidfd \
+CCL_ZE_IPC_EXCHANGE=sockets \
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
 python3 -m vllm.entrypoints.openai.api_server \
