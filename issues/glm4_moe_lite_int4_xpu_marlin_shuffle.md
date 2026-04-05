@@ -205,10 +205,55 @@ cmake --build build -j$MAX_JOBS   # or: pip install with MAX_JOBS set
 The `MAX_JOBS` environment variable is respected by both CMake and Python
 setuptools/pip builds.
 
+## Future Development: Multi-Device Architecture
+
+### Planned Setup
+
+| Device | Role | Hardware |
+|--------|------|----------|
+| 2x DGX Spark | LLM server (120B+ models) | Grace Blackwell, 128GB each |
+| MSI Claw 8 AI+ | Portable LLM (20B MoE) + vLLM serving | Lunar Lake, 32GB |
+| MSI Claw A1M | Edge client, voice I/O, lightweight tasks | Meteor Lake, 16GB |
+
+### Claw A1M as Edge Client
+
+The A1M (16GB) is too constrained to run large LLMs and ASR/TTS simultaneously.
+Planned architecture splits workloads across devices:
+
+```
+A1M (OpenClaw UI) ──→ DGX Spark (120B LLM via vLLM)
+    ├── ASR: Whisper on NPU (zero iGPU memory cost)
+    ├── ASR: SenseVoice/Qwen2-Audio on CPU (fallback, no NPU op support)
+    ├── TTS: local on CPU/iGPU
+    └── If standalone: 4B LLM on iGPU + Whisper on NPU
+```
+
+### OpenVINO NPU Inference on Meteor Lake
+
+The Intel NPU (Neural Processing Unit) on 155H can offload small models,
+freeing iGPU memory for other tasks:
+
+- **Runtime**: OpenVINO 2026.0+ (`pip install openvino`)
+- **NPU driver**: intel/linux-npu-driver v1.30.0+
+- **Supported on NPU**: Whisper (built-in GenAI pipeline), small vision models
+- **CPU/GPU only**: Qwen2-Audio, SenseVoice, Paraformer (complex ops not on NPU)
+- **Convert any PyTorch model**: `ov.convert_model()` → run on CPU/GPU/NPU
+
+```python
+import openvino_genai as ov_genai
+# ASR on NPU — dedicated hardware, no iGPU memory competition
+pipe = ov_genai.WhisperPipeline("whisper-base", device="NPU")
+result = pipe.generate("audio.wav")
+```
+
+Key insight: NPU has its own dedicated compute — it does NOT share iGPU memory.
+This makes it ideal for always-on ASR/TTS while the iGPU handles LLM inference.
+
 ## Environment
 - Intel Core Ultra 7 258V (Lunar Lake), Arc 140V iGPU
 - 32 GB LPDDR5x shared memory (28.57 GiB usable by GPU)
 - Intel Core Ultra 7 155H (Meteor Lake), Xe-LPG iGPU
 - 16 GB LPDDR5 shared memory
+- 2x NVIDIA DGX Spark (Grace Blackwell) — home server for large models
 - vLLM 0.14.1.dev0, IPEX XPU
 - Model: glm-4.7-flash-int4-autoround (16.52 GB loaded)
