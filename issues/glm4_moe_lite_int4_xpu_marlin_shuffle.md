@@ -249,6 +249,79 @@ result = pipe.generate("audio.wav")
 Key insight: NPU has its own dedicated compute — it does NOT share iGPU memory.
 This makes it ideal for always-on ASR/TTS while the iGPU handles LLM inference.
 
+## vLLM Native Build Steps (from llm-scaler Dockerfile)
+
+### Build Order
+
+The build must follow this order because `--no-build-isolation` means each
+step relies on packages installed in the previous step:
+
+```
+Step 1: System deps        (oneAPI, compilers, Python 3.12)
+Step 2: Set env vars        (VLLM_TARGET_DEVICE=xpu, CPATH for DPCPP)
+Step 3: Clone vLLM v0.14.0 + apply vllm_for_multi_arc.patch
+Step 4: pip install -r requirements/xpu.txt   ← PyTorch XPU, IPEX, etc.
+        pip install arctic-inference==0.1.1
+Step 5: pip install --no-build-isolation .     ← builds vLLM against Step 4
+Step 6: Build vllm-xpu-kernels (commit 4c83144)
+Step 7: Fix triton-xpu==3.6.0
+Step 8: Configure production env vars in ~/.bashrc
+```
+
+`--no-build-isolation` tells pip to use the already-installed PyTorch XPU
+and IPEX from Step 4, instead of creating a fresh isolated build environment
+(which would pull CPU PyTorch and break the XPU build).
+
+### Built .so Libraries
+
+| Library | Source | Purpose |
+|---------|--------|---------|
+| `vllm_int4_for_multi_arc.so` | bigdl-core | INT4 quantization kernel for XPU |
+| `vllm_xpu_kernels*.so` | vllm-xpu-kernels | XPU compute kernels (attention, etc.) |
+| `libtriton_xpu*.so` | triton-xpu | Triton JIT compiler for XPU |
+| IPEX `*.so` libraries | intel-extension-for-pytorch | Marlin kernel, MoE fusion, etc. |
+
+The `vllm_for_multi_arc.patch` (466KB) modifies vLLM's Python source to add
+XPU device support. It is NOT a separate .so — it patches the Python code
+which then calls into the .so kernels above for actual GPU compute.
+
+Referenced by env var:
+```bash
+export VLLM_QUANTIZE_Q40_LIB="<python-site>/vllm_int4_for_multi_arc.so"
+```
+
+### Docker Build vs Native Build
+
+**Docker build** — everything happens inside the container:
+```bash
+cd ~/llm-scaler
+docker build -f vllm/docker/Dockerfile -t vllm-xpu .
+# Run with GPU access:
+docker run --device /dev/dri -p 8000:8000 vllm-xpu \
+    vllm serve /models/gpt-oss-20b --device xpu
+```
+- No need to build vLLM locally first — Docker does it all
+- Pins to specific versions (reproducible)
+- Adds ~15-20GB disk overhead for the image
+- GPU access via `--device /dev/dri`
+- Models mounted via `-v /shared/models:/models`
+
+**Native build** — installs directly on the host:
+```bash
+sudo bash ~/llm-scaler/vllm/scripts/install_vllm_native.sh
+# Or the post-install script:
+sudo bash ~/OpenClaw-on-MSI-Claw-8/scripts/claw-post-install-vllm.sh
+```
+- No Docker overhead (saves RAM on 16GB machines)
+- More flexible (can use any vLLM version)
+- Dependencies may conflict with system packages
+- Uses MAX_JOBS auto-detection for OOM prevention
+
+**Recommendation:**
+- Claw A1M (16GB): **native build** — Docker daemon eats precious RAM
+- Claw 8 AI+ (32GB): either works, Docker is cleaner
+- DGX Spark (server): **Docker** — reproducible, isolated, easy to update
+
 ## Environment
 - Intel Core Ultra 7 258V (Lunar Lake), Arc 140V iGPU
 - 32 GB LPDDR5x shared memory (28.57 GiB usable by GPU)
