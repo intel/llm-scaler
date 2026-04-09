@@ -188,11 +188,17 @@ Note: IPEX is being retired after version 2.8. Intel is directing users to PyTor
 native XPU support. Future vLLM versions using PyTorch >= 2.9 native XPU may
 eventually support non-XMX platforms through this path.
 
-## Alternative: Use IPEX-LLM (Ollama) for Meteor Lake
+## Alternatives for LLM Inference on Meteor Lake
 
-[IPEX-LLM](https://github.com/intel/ipex-llm) (formerly BigDL-LLM) **does work on
-Meteor Lake** because it uses a llama.cpp backend with a software SDP fallback that
-does not require XMX:
+vLLM is blocked, but other frameworks work because they use standard SYCL parallel
+patterns (compiled to SPIR-V, JIT-compiled at runtime) and DP4a instructions instead
+of DPAS/XMX systolic array operations.
+
+### Option 1: IPEX-LLM + Ollama (Recommended)
+
+[IPEX-LLM](https://github.com/intel/ipex-llm) (formerly BigDL-LLM) explicitly supports
+Meteor Lake — it detects the device as `"mtl"` and applies architecture-specific
+optimizations (automatic KV cache compression, tuned batch forwarding).
 
 ```bash
 export BIGDL_LLM_XMX_DISABLED=1
@@ -206,8 +212,37 @@ docker run -d --device /dev/dri --name ollama \
   intelanalytics/ipex-llm-inference-cpp-xpu:latest
 ```
 
-This is currently the **only viable path** for LLM inference on Meteor Lake iGPU.
-Performance will be lower than on XMX-equipped GPUs, but it works.
+Notes:
+- First-run JIT compilation takes **5-10 minutes** on Meteor Lake iGPU (SPIR-V → native ISA)
+- Set `SYCL_CACHE_PERSISTENT=1` to cache compiled kernels across restarts
+- Practical for models up to **~7-8B parameters in Q4 quantization** given 16GB shared memory
+- IPEX-LLM's SDP kernels do NOT check for XMX — they use standard SYCL patterns that work on all Intel GPUs
+
+### Option 2: llama.cpp with SYCL Backend
+
+[llama.cpp's SYCL backend](https://github.com/ggml-org/llama.cpp/blob/master/docs/backend/SYCL.md)
+lists "built-in Arc GPU in Meteor Lake" as verified hardware.
+
+```bash
+# Build llama.cpp with SYCL support
+cmake -B build -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
+cmake --build build --config Release -j
+
+# Run inference
+./build/bin/llama-cli -m model.gguf -ngl 99 --device xpu
+```
+
+### Option 3: OpenVINO
+
+[OpenVINO](https://docs.openvino.ai/) also supports Meteor Lake iGPU for inference,
+including through its GenAI integration with Hugging Face models.
+
+### Performance Expectations
+
+Without XMX, Meteor Lake uses **DP4a** (Dot-Product of 4 elements and Accumulate)
+instructions for INT8/INT4 operations — the older, scalar path vs. the DPAS systolic
+array path that XMX enables. Expect roughly **2-4x lower throughput** compared to
+XMX-equipped GPUs (Lunar Lake, Arc A770, B580) at the same model and quantization.
 
 ## References
 
@@ -225,3 +260,10 @@ Performance will be lower than on XMX-equipped GPUs, but it works.
   — original issue for missing SDPA backend selection on XPU
 - [Intel oneAPI: Programming XMX with joint_matrix](https://www.intel.com/content/www/us/en/docs/oneapi/optimization-guide-gpu/2023-2/programming-intel-xmx-using-sycl-joint-matrix.html)
   — confirms "no emulation or fall back strategy" for joint_matrix on non-XMX hardware
+- [llama.cpp SYCL Backend](https://github.com/ggml-org/llama.cpp/blob/master/docs/backend/SYCL.md)
+  — lists Meteor Lake iGPU as verified hardware
+- [Intel: Run LLMs on GPUs Using llama.cpp](https://www.intel.com/content/www/us/en/developer/articles/technical/run-llms-on-gpus-using-llama-cpp.html)
+- [HuggingFace: Phi-2 on Meteor Lake](https://huggingface.co/blog/phi2-intel-meteor-lake)
+  — demonstrates LLM inference on Meteor Lake via BigDL-LLM/IPEX-LLM
+- [IPEX-LLM Linux GPU Install Guide](https://github.com/intel/ipex-llm/blob/main/docs/mddocs/Quickstart/install_linux_gpu.md)
+  — lists Meteor Lake as verified, with driver/kernel instructions
