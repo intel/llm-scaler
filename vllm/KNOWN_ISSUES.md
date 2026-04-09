@@ -99,3 +99,99 @@ actually used — vLLM just needs the backend to initialize without hanging.
   users can continue using `xccl` (the default) since it works, but `gloo` is
   also fine.
 - This issue does not affect discrete Arc GPUs (A770, B580) or Data Center GPUs.
+
+# 05. vLLM Cannot Run Inference on Meteor Lake iGPU (Missing XMX)
+
+**Affected:** Intel Core Ultra 1xx (Meteor Lake) — Xe-LPG integrated GPU  
+**Not affected:** Intel Core Ultra 2xx (Lunar Lake) — Xe2-LPG integrated GPU  
+**Not affected:** Discrete Arc GPUs (A770, B580, etc.)
+
+## Symptom
+
+vLLM loads the model successfully on Meteor Lake, but crashes on the first inference
+request with:
+
+```
+RuntimeError: SDP kernel requires XMX, but the current platform has no XMX
+  ...intel_extension_for_pytorch/transformers/models/xpu/fusions/mha_fusion.py
+  ...torch.ops.torch_ipex.chunked_prefill()
+```
+
+## Root Cause
+
+Meteor Lake's Xe-LPG architecture is derived from Xe-HPG (Arc A770) but **deliberately
+omits XMX (Xe Matrix Extensions)** — the matrix multiplication units on execution Port 2.
+This was confirmed by [Chips and Cheese's Meteor Lake deep-dive](https://chipsandcheese.com/p/intels-ambitious-meteor-lake-igpu):
+
+> "It's basically the same idea as Xe-HPG, just without the matrix multiplication units
+> that would have been present on Port 2."
+
+vLLM's XPU attention path calls IPEX's `chunked_prefill()` and `paged_attention_v1()`
+ops, which invoke XMX-accelerated SDP (Scaled Dot-Product) kernels. When XMX hardware
+is absent, IPEX throws a fatal error with no fallback.
+
+This is a **hardware limitation**, not a driver or software configuration issue.
+
+## What Does NOT Work
+
+| Approach | Result |
+|---|---|
+| `VLLM_ATTENTION_BACKEND=TORCH_SDPA` | Not supported for XPU main attention path (only CPU) |
+| `ENABLE_SDP_FUSION=0` | Controls fusion, not XMX usage — does not help |
+| `BIGDL_LLM_XMX_DISABLED=1` | Only affects IPEX-LLM (llama.cpp), not vLLM's IPEX |
+| `vllm_for_multi_arc.patch` | Does not add non-XMX attention for LLM path |
+| Triton attention backend | Triton XPU also leverages XMX for dot products |
+
+## Hardware Comparison
+
+| Device | GPU | Architecture | XMX | vLLM |
+|---|---|---|---|---|
+| Claw A1M (Meteor Lake) | Arc Graphics | Xe-LPG (1st gen) | **No** | **Blocked** |
+| Claw 8 AI+ (Lunar Lake) | Arc 140V | Xe2-LPG (2nd gen) | Yes | Works |
+| Arrow Lake (desktop) | Arc Graphics | Xe-LPG Plus | Yes | Should work |
+| Arc A770 (discrete) | DG2 | Xe-HPG | Yes | Works |
+| Arc B580 (discrete) | BMG | Xe2-HPG | Yes | Works |
+| Data Center Max (PVC) | Max 1550 | Xe-HPC | Yes | Works (primary target) |
+
+Note: Arrow Lake added XMX back via "Xe-LPG Plus", indicating Intel recognized the
+omission in Meteor Lake was a limitation.
+
+## Upstream Status
+
+- [vllm-project/vllm#28362](https://github.com/vllm-project/vllm/issues/28362):
+  "Can't get vLLM to run on Intel 125H with XPU" — marked **NOT_PLANNED**
+- No plans from vLLM project to support non-XMX Intel GPUs
+- Post Feb 2026, vLLM switched from IPEX to `vllm-xpu-kernels` (designed for PVC/BMG
+  only), which also doesn't support Xe-LPG
+
+## Alternative: Use IPEX-LLM (Ollama) for Meteor Lake
+
+[IPEX-LLM](https://github.com/intel/ipex-llm) (formerly BigDL-LLM) **does work on
+Meteor Lake** because it uses a llama.cpp backend with a software SDP fallback that
+does not require XMX:
+
+```bash
+export BIGDL_LLM_XMX_DISABLED=1
+export SYCL_CACHE_PERSISTENT=1
+
+# Run via IPEX-LLM's patched Ollama
+docker run -d --device /dev/dri --name ollama \
+  -e BIGDL_LLM_XMX_DISABLED=1 \
+  -v ollama:/root/.ollama \
+  -p 11434:11434 \
+  intelanalytics/ipex-llm-inference-cpp-xpu:latest
+```
+
+This is currently the **only viable path** for LLM inference on Meteor Lake iGPU.
+Performance will be lower than on XMX-equipped GPUs, but it works.
+
+## References
+
+- [Chips and Cheese: Intel's Ambitious Meteor Lake iGPU](https://chipsandcheese.com/p/intels-ambitious-meteor-lake-igpu)
+  — confirms XMX omission on Xe-LPG Port 2
+- [Tom's Hardware: Arrow Lake Xe-LPG Plus with XMX](https://www.tomshardware.com/desktops/intels-next-gen-arrow-lake-gpu-will-have-new-xe-lpg-plus-architecture-with-xmx)
+  — Arrow Lake restores XMX
+- [Intel XMX documentation](https://www.intel.com/content/www/us/en/support/articles/000091112/graphics.html)
+- [vllm-project/vllm#28362](https://github.com/vllm-project/vllm/issues/28362) — Meteor Lake vLLM issue (NOT_PLANNED)
+- [IPEX-LLM FAQ](https://github.com/intel/ipex-llm/blob/main/docs/mddocs/Overview/FAQ/faq.md)
+  — `BIGDL_LLM_XMX_DISABLED=1` documentation
