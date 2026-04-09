@@ -194,7 +194,7 @@ vLLM is blocked, but other frameworks work because they use standard SYCL parall
 patterns (compiled to SPIR-V, JIT-compiled at runtime) and DP4a instructions instead
 of DPAS/XMX systolic array operations.
 
-### Option 1: IPEX-LLM + Ollama (Recommended)
+### Option 1: IPEX-LLM + Ollama
 
 [IPEX-LLM](https://github.com/intel/ipex-llm) (formerly BigDL-LLM) explicitly supports
 Meteor Lake — it detects the device as `"mtl"` and applies architecture-specific
@@ -216,26 +216,91 @@ Notes:
 - First-run JIT compilation takes **5-10 minutes** on Meteor Lake iGPU (SPIR-V → native ISA)
 - Set `SYCL_CACHE_PERSISTENT=1` to cache compiled kernels across restarts
 - Practical for models up to **~7-8B parameters in Q4 quantization** given 16GB shared memory
-- IPEX-LLM's SDP kernels do NOT check for XMX — they use standard SYCL patterns that work on all Intel GPUs
+- IPEX-LLM's SDP kernels do NOT check for XMX — they use standard SYCL patterns
 
-### Option 2: llama.cpp with SYCL Backend
+**Limitation:** Based on llama.cpp (GGUF format only). New model architectures need to
+be added to llama.cpp first — there is always a lag between model release and support.
+Novel architectures may never be supported.
+
+### Option 2: OpenVINO GenAI (Best for New Model Support)
+
+[OpenVINO GenAI](https://docs.openvino.ai/2025/openvino-workflow-generative/inference-with-genai.html)
+supports Meteor Lake iGPU and can auto-convert HuggingFace models via
+[Optimum-Intel](https://huggingface.co/docs/optimum/intel/index). This is the best
+option for running **new models that aren't yet in llama.cpp/GGUF**.
+
+```python
+from optimum.intel import OVModelForCausalLM
+from transformers import AutoTokenizer
+
+model = OVModelForCausalLM.from_pretrained(
+    "Qwen/Qwen3-8B",
+    export=True,        # auto-converts from HuggingFace
+    device="GPU",       # uses iGPU
+    load_in_4bit=True,  # INT4 weight compression
+)
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+```
+
+For serving, [OpenVINO Model Server](https://docs.openvino.ai/2025/ovms_what_is_openvino_model_server.html)
+provides a REST/gRPC API (similar to vLLM's OpenAI-compatible endpoint).
+
+Advantages over IPEX-LLM/Ollama:
+- Supports most HuggingFace models directly (auto-conversion)
+- No GGUF dependency — works with any model that Optimum-Intel can export
+- Intel maintains it with dedicated iGPU optimizations (no XMX dependency)
+- OpenVINO 2026.0 adds MoE models, multimodal, hybrid CPU/GPU/NPU execution
+
+### Option 3: HuggingFace Transformers with Eager Attention on XPU
+
+For maximum model compatibility with minimal setup, use HuggingFace Transformers
+directly with `attn_implementation="eager"`, which bypasses SDPA entirely and uses
+plain `torch.matmul + softmax` (no XMX needed):
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen3-8B",
+    attn_implementation="eager",  # plain matmul, no XMX
+    torch_dtype=torch.float16,
+    device_map="xpu",
+)
+```
+
+**Any HuggingFace model works immediately**, but this is significantly slower than
+optimized backends — no flash attention, no paged KV cache, no continuous batching.
+Useful for testing/prototyping, not production serving.
+
+### Option 4: llama.cpp (SYCL or Vulkan)
 
 [llama.cpp's SYCL backend](https://github.com/ggml-org/llama.cpp/blob/master/docs/backend/SYCL.md)
-lists "built-in Arc GPU in Meteor Lake" as verified hardware.
+lists "built-in Arc GPU in Meteor Lake" as verified hardware. The Vulkan backend also
+works and requires no oneAPI installation.
 
 ```bash
-# Build llama.cpp with SYCL support
+# SYCL build (needs oneAPI)
 cmake -B build -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
 cmake --build build --config Release -j
 
-# Run inference
-./build/bin/llama-cli -m model.gguf -ngl 99 --device xpu
+# Vulkan build (simpler, just needs GPU drivers)
+cmake -B build -DGGML_VULKAN=ON
+cmake --build build --config Release -j
 ```
 
-### Option 3: OpenVINO
+Note: SYCL is faster for prompt processing (prefill), but Vulkan can be faster for
+token generation — especially on MoE models. Both are limited to GGUF format.
 
-[OpenVINO](https://docs.openvino.ai/) also supports Meteor Lake iGPU for inference,
-including through its GenAI integration with Hugging Face models.
+## Choosing an Alternative
+
+| Need | Best Option |
+|---|---|
+| Run latest HuggingFace models on Meteor Lake | **OpenVINO GenAI** |
+| Production serving with API endpoint | **OpenVINO Model Server** |
+| Quick setup, established models (Llama, Qwen, etc.) | **IPEX-LLM + Ollama** |
+| Testing/prototyping any HF model | **HF Transformers + eager attention** |
+| Minimal dependencies, no oneAPI | **llama.cpp Vulkan** |
 
 ### Performance Expectations
 
@@ -267,3 +332,11 @@ XMX-equipped GPUs (Lunar Lake, Arc A770, B580) at the same model and quantizatio
   — demonstrates LLM inference on Meteor Lake via BigDL-LLM/IPEX-LLM
 - [IPEX-LLM Linux GPU Install Guide](https://github.com/intel/ipex-llm/blob/main/docs/mddocs/Quickstart/install_linux_gpu.md)
   — lists Meteor Lake as verified, with driver/kernel instructions
+- [OpenVINO GenAI](https://docs.openvino.ai/2025/openvino-workflow-generative/inference-with-genai.html)
+  — HuggingFace model auto-conversion and iGPU inference
+- [OpenVINO 2026.0 Release](https://medium.com/openvino-toolkit/openvino-2026-0-new-models-enhanced-genai-and-smarter-compression-bf846a59cda8)
+  — MoE models, multimodal, hybrid CPU/GPU/NPU execution
+- [Optimum-Intel](https://huggingface.co/docs/optimum/intel/index)
+  — HuggingFace integration for OpenVINO model conversion
+- [llama.cpp SYCL vs Vulkan on MoE models](https://github.com/ggml-org/llama.cpp/issues/19918)
+  — Vulkan faster for token generation in some cases
