@@ -339,8 +339,32 @@ Or download prebuilt binaries — "Ubuntu x64 (OpenVINO)" is now an official rel
 For a 4B model, expect roughly **2× these speeds** (~25 tok/s on Meteor Lake) since
 decode is memory-bandwidth-bound and a 4B model is half the size of 8B.
 
+**Backend comparison on Intel iGPU** (llama-bench, 7B Q4_0 models):
+
+| Backend | Prefill pp512 (t/s) | Decode tg128 (t/s) | Notes |
+|---|---|---|---|
+| **Vulkan (no coopmat)** | ~45 | ~5-8 | **Meteor Lake** — no cooperative matrix! |
+| **Vulkan (with coopmat)** | ~657 | ~12 | Lunar Lake only (Xe2), driver issues |
+| **SYCL** | ~630 (LL) / ~16 (ML) | ~19 (LL) / ~8 (ML) | LL=Lunar Lake, ML=Meteor Lake |
+| **IPEX-LLM** | ~655 | ~23 | Best overall, but model support lags |
+| **OpenVINO** | expected fastest | 12.8 (8B INT4) | Preview, graph-level optimization |
+
+Sources: [llama.cpp #10879](https://github.com/ggml-org/llama.cpp/discussions/10879),
+[ipex-llm #12318](https://github.com/intel-analytics/ipex-llm/issues/12318),
+[llama.cpp SYCL MUL_MAT PR #12035](https://github.com/ggml-org/llama.cpp/pull/12035)
+
+**Critical: Meteor Lake + Vulkan = crippled prefill.** Meteor Lake's Xe-LPG architecture
+does not support `VK_KHR_cooperative_matrix`. Without cooperative matrix, Vulkan prefill
+is **~14× slower** than SYCL/OpenVINO on the same hardware. Decode is also ~2-3× slower.
+For a 4B model, scale by model size (roughly 2× the 7B numbers above).
+
+As [Intel's SYCL maintainer noted](https://github.com/ggml-org/llama.cpp/discussions/16801):
+*"IPEX and OpenVINO are commercial software with more engineers to optimize performance
+on Intel GPU."* The OpenVINO backend leverages these optimizations directly.
+
 **Advantages over SYCL/Vulkan:**
 - OpenVINO's graph compiler fuses operations (better efficiency than op-by-op SYCL)
+- **Much faster prefill than Vulkan** on Meteor Lake (no cooperative matrix limitation)
 - No oneAPI installation needed (unlike SYCL)
 - NPU support (unique to this backend)
 - Prebuilt release binaries available
