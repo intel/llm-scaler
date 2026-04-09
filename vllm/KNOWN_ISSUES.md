@@ -292,90 +292,65 @@ cmake --build build --config Release -j
 Note: SYCL is faster for prompt processing (prefill), but Vulkan can be faster for
 token generation — especially on MoE models. Both are limited to GGUF format.
 
-### Option 5: llama.cpp OpenVINO Backend (Recommended for llama.cpp)
+### ~~Option 5: llama.cpp OpenVINO Backend~~ (BROKEN — Do Not Use)
 
-As of March 2026, [llama.cpp has an official OpenVINO backend](https://github.com/ggml-org/llama.cpp/blob/master/docs/backend/OPENVINO.md)
-([PR #15307](https://github.com/ggml-org/llama.cpp/pull/15307), merged March 14, 2026).
-This is now the **recommended llama.cpp backend for Intel iGPU** — it combines llama.cpp's
-GGUF model ecosystem with OpenVINO's graph-level JIT compilation and kernel fusion.
+> **Status: BROKEN** (tested April 2026 on MSI Claw A1M, Meteor Lake iGPU)
+>
+> Despite being [merged March 2026](https://github.com/ggml-org/llama.cpp/pull/15307)
+> and having official release binaries, the OpenVINO backend **does not work** with
+> K-quant models (Q4_K_M, Q4_K_XL, Q5_K_M) — which are the standard quantizations
+> used in practice.
 
-**How it works:** Instead of converting models, the backend translates GGML computation
-graphs to OpenVINO operations at runtime. GGUF files work directly — no IR conversion.
+**Tested failures:**
 
-```bash
-# Build (just needs OpenVINO Runtime, no oneAPI)
-cmake -B build -DGGML_OPENVINO=ON
-cmake --build build --parallel
+1. **GPU with `-fa 1`**: Crashes immediately with `CPY operation not supported` —
+   the backend doesn't implement the KV cache copy operation needed for flash attention
+2. **GPU without `-fa`**: `"failed to decode prompt batch, res = -3"` — Q4_K_M
+   quantization type not supported by the OpenVINO GGML backend
+3. **CPU fallback**: Same `res = -3` failure — the issue is the quant format, not the device
+4. **GPU device init**: `"Failed to get OpenCL device: -1"` even though `clinfo` shows
+   the device correctly — OpenVINO's internal initialization fails
 
-# Run on iGPU
-GGML_OPENVINO_DEVICE=GPU ./llama-cli -m model-Q4_K_M.gguf -p "Hello" -fa 1
+The backend only supports basic quantizations (Q4_0, Q8_0, FP16) which are rarely used
+in practice. K-quants (Q4_K_M, Q5_K_M, Q6_K) provide better quality-per-bit and are
+the standard recommendation, but none of them work.
 
-# Serve with OpenAI-compatible API
-GGML_OPENVINO_DEVICE=GPU ./llama-server -m model-Q4_K_M.gguf -fa 1
-```
+**Use SYCL instead** — see Option 4 above. SYCL works with all quantization formats,
+provides similar long-context scaling advantages over Vulkan, and is actively maintained.
 
-Or download prebuilt binaries — "Ubuntu x64 (OpenVINO)" is now an official release target.
+**Backend comparison on Intel Meteor Lake iGPU** (llama-bench, real measurements on MSI Claw A1M):
 
-**Supported quantizations:** FP16, Q8_0, Q4_0, Q4_1, Q4_K, Q4_K_M, Q5_K, Q6_K  
-**Supported devices:** CPU, GPU (iGPU + discrete), **NPU** (unique — no other backend supports NPU)  
-**Validated on:** Core Ultra Series 1 (Meteor Lake) and Series 2 (Lunar Lake)
+Gemma 4 E4B Q4_K_M (7.5B params, 4.62 GiB):
 
-**Environment variables:**
+| Backend | pp512 | pp1024 | pp2048 | pp4096 | pp8192 | pp16384 | pp32768 | tg128 |
+|---|---|---|---|---|---|---|---|---|
+| **SYCL** | 309 | 314 | 316 | 310 | 304 | 290 | 258 | 15.1 |
+| **Vulkan** | 318 | 299 | 264 | 265 | 246 | 169 | 172 | 14.2 |
+| **OpenVINO** | — | — | — | — | — | — | — | — |
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `GGML_OPENVINO_DEVICE` | CPU | Target: `CPU`, `GPU`, or `NPU` |
-| `GGML_OPENVINO_CACHE_DIR` | (unset) | Cache compiled graphs across runs |
-| `GGML_OPENVINO_STATEFUL_EXECUTION` | 0 | Enable internal KV cache management (required for GPU) |
+Key findings:
+- **SYCL scales much better at long context** — only 17% drop from pp512→pp32768
+  vs 46% drop for Vulkan (1.5× faster at 32K)
+- **Vulkan is slightly faster at short context** (pp512) but loses advantage past pp1024
+- **OpenVINO is completely non-functional** with K-quant models
+- **Token generation is comparable** between SYCL (15.1) and Vulkan (14.2)
 
-**Benchmark** (OpenVINO 2026.1, DeepSeek-R1-Distill-Llama-8B INT4):
+SYCL extended token generation (same model, Meteor Lake):
 
-| Hardware | Device | Decode Speed |
-|---|---|---|
-| Core Ultra 7 (Meteor Lake class) | iGPU | 12.8 tok/s |
-| Core Ultra 9 (Lunar Lake class) | iGPU | 19.8 tok/s |
-| Core Ultra 7 | NPU | 6.1 tok/s |
+| tg128 | tg256 | tg512 | tg1024 | tg2048 |
+|---|---|---|---|---|
+| 15.1 | 15.0 | 14.7 | 14.6 | 14.0 |
 
-For a 4B model, expect roughly **2× these speeds** (~25 tok/s on Meteor Lake) since
-decode is memory-bandwidth-bound and a 4B model is half the size of 8B.
-
-**Backend comparison on Intel iGPU** (llama-bench, 7B Q4_0 models):
-
-| Backend | Prefill pp512 (t/s) | Decode tg128 (t/s) | Notes |
-|---|---|---|---|
-| **Vulkan (no coopmat)** | ~45 | ~5-8 | **Meteor Lake** — no cooperative matrix! |
-| **Vulkan (with coopmat)** | ~657 | ~12 | Lunar Lake only (Xe2), driver issues |
-| **SYCL** | ~630 (LL) / ~16 (ML) | ~19 (LL) / ~8 (ML) | LL=Lunar Lake, ML=Meteor Lake |
-| **IPEX-LLM** | ~655 | ~23 | Best overall, but model support lags |
-| **OpenVINO** | expected fastest | 12.8 (8B INT4) | Preview, graph-level optimization |
+TG scales linearly — only 7% drop from 128→2048 tokens generated.
 
 Sources: [llama.cpp #10879](https://github.com/ggml-org/llama.cpp/discussions/10879),
 [ipex-llm #12318](https://github.com/intel-analytics/ipex-llm/issues/12318),
 [llama.cpp SYCL MUL_MAT PR #12035](https://github.com/ggml-org/llama.cpp/pull/12035)
 
-**Critical: Meteor Lake + Vulkan = crippled prefill.** Meteor Lake's Xe-LPG architecture
-does not support `VK_KHR_cooperative_matrix`. Without cooperative matrix, Vulkan prefill
-is **~14× slower** than SYCL/OpenVINO on the same hardware. Decode is also ~2-3× slower.
-For a 4B model, scale by model size (roughly 2× the 7B numbers above).
-
-As [Intel's SYCL maintainer noted](https://github.com/ggml-org/llama.cpp/discussions/16801):
-*"IPEX and OpenVINO are commercial software with more engineers to optimize performance
-on Intel GPU."* The OpenVINO backend leverages these optimizations directly.
-
-**Advantages over SYCL/Vulkan:**
-- OpenVINO's graph compiler fuses operations (better efficiency than op-by-op SYCL)
-- **Much faster prefill than Vulkan** on Meteor Lake (no cooperative matrix limitation)
-- No oneAPI installation needed (unlike SYCL)
-- NPU support (unique to this backend)
-- Prebuilt release binaries available
-
-**Current limitations:**
-- `llama-server` limited to **single session** with stateful execution
-- GPU requires `GGML_OPENVINO_STATEFUL_EXECUTION=1` (known issue)
-- First token has extra latency (graph compilation, cached on subsequent runs)
-- No `--context-shift` support
-- Still a **preview feature** — accuracy/performance optimization ongoing
-- For multi-session serving or 32K context, use **OpenVINO GenAI** (serve_ov.py) instead
+**Meteor Lake + Vulkan prefill degrades at long context** because Xe-LPG lacks
+`VK_KHR_cooperative_matrix`. SYCL avoids this by routing through oneMKL's hand-tuned
+GEMM kernels. SYCL does NOT require XMX — oneMKL dispatches to the best available
+instruction path (DP4a on Meteor Lake, DPAS/XMX on Lunar Lake).
 
 ## Choosing an Alternative
 
@@ -383,11 +358,11 @@ on Intel GPU."* The OpenVINO backend leverages these optimizations directly.
 |---|---|
 | Run latest HuggingFace models on Meteor Lake | **OpenVINO GenAI** |
 | Production serving with API endpoint (32K context) | **OpenVINO GenAI** (serve_ov.py) |
-| Quick setup, any GGUF model, no Python | **llama.cpp OpenVINO backend** |
+| Quick setup, any GGUF model, best long-context | **llama.cpp SYCL backend** |
 | Quick setup, established models (Llama, Qwen, etc.) | **IPEX-LLM + Ollama** |
 | Testing/prototyping any HF model | **HF Transformers + eager attention** |
-| Minimal dependencies, no oneAPI | **llama.cpp Vulkan** or **llama.cpp OpenVINO** |
-| NPU inference | **llama.cpp OpenVINO backend** (only option) |
+| Minimal dependencies, no oneAPI | **llama.cpp Vulkan** |
+| NPU inference | **OpenVINO GenAI** (llama.cpp OpenVINO backend broken) |
 
 ### Performance Expectations
 
