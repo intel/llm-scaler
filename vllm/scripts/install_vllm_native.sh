@@ -63,6 +63,85 @@ echo "  Repo root:     $REPO_ROOT"
 echo ""
 
 # ============================================================
+# Swap optimization
+# On 16GB systems the xpu-kernels build peaks at ~21GB (14GB RAM + 8GB swap).
+# Without disk swap, the OOM killer will terminate the compilation.
+# On 32GB systems, swap is optional overflow but recommended.
+# ============================================================
+ZRAM_ACTIVE=$(swapon --show=NAME,TYPE --noheadings 2>/dev/null | grep -c zram || true)
+SWAPFILE="$REAL_HOME/swapfile"
+FS_TYPE=$(df -T "$REAL_HOME" | awk 'NR==2{print $2}')
+
+create_swapfile() {
+    local size="$1"
+    if [ -f "$SWAPFILE" ]; then
+        echo "  Swapfile already exists at $SWAPFILE. Activating."
+    else
+        echo "  Creating ${size} disk swapfile..."
+        if [ "$FS_TYPE" = "btrfs" ]; then
+            btrfs filesystem mkswapfile --size "$size" "$SWAPFILE"
+        else
+            fallocate -l "$size" "$SWAPFILE"
+            chmod 600 "$SWAPFILE"
+            mkswap "$SWAPFILE"
+        fi
+    fi
+}
+
+if [ "$TOTAL_RAM_GB" -le 16 ]; then
+    echo -e "${YELLOW}[swap] 16GB system — disk swap required for compilation${NC}"
+
+    # zram wastes precious RAM on 16GB systems; replace with disk swap
+    if [ "$ZRAM_ACTIVE" -gt 0 ]; then
+        echo "  Disabling zram (frees RAM for the build)..."
+        swapoff /dev/zram0 2>/dev/null || true
+        zramctl --reset /dev/zram0 2>/dev/null || true
+        systemctl mask systemd-zram-setup@zram0.service 2>/dev/null || true
+    fi
+
+    if ! swapon --show=NAME --noheadings 2>/dev/null | grep -q "$SWAPFILE"; then
+        create_swapfile 16G
+        swapon "$SWAPFILE"
+        sysctl vm.swappiness=10
+        echo "vm.swappiness=10" > /etc/sysctl.d/99-swappiness.conf
+
+        if ! grep -q "$SWAPFILE" /etc/fstab 2>/dev/null; then
+            echo "$SWAPFILE none swap defaults 0 0" >> /etc/fstab
+        fi
+        echo -e "${GREEN}  16GB disk swapfile active. zram permanently disabled.${NC}"
+    else
+        echo "  Disk swapfile already active."
+    fi
+    echo ""
+
+elif [ "$TOTAL_RAM_GB" -le 32 ]; then
+    echo -e "${YELLOW}[swap] 32GB system — optional disk swap for overflow${NC}"
+
+    if ! swapon --show=NAME --noheadings 2>/dev/null | grep -q "$SWAPFILE"; then
+        read -p "  Create 32GB disk swapfile as overflow safety net? (y/n): " SWAP_CHOICE
+        if [ "$SWAP_CHOICE" = "y" ] || [ "$SWAP_CHOICE" = "Y" ]; then
+            create_swapfile 32G
+            swapon --priority 10 "$SWAPFILE"
+
+            if ! grep -q "$SWAPFILE" /etc/fstab 2>/dev/null; then
+                echo "$SWAPFILE none swap pri=10 0 0" >> /etc/fstab
+            fi
+            echo -e "${GREEN}  32GB disk swapfile active (priority 10, below zram).${NC}"
+        fi
+    else
+        echo "  Disk swapfile already active."
+    fi
+
+    # Temporarily disable zram to free all 32GB RAM for the build
+    if [ "$ZRAM_ACTIVE" -gt 0 ]; then
+        echo "  Temporarily disabling zram for the build (returns on reboot)..."
+        swapoff /dev/zram0 2>/dev/null || true
+        zramctl --reset /dev/zram0 2>/dev/null || true
+    fi
+    echo ""
+fi
+
+# ============================================================
 # Phase 1: System dependencies
 # ============================================================
 echo -e "${YELLOW}[1/8] Installing system dependencies...${NC}"
