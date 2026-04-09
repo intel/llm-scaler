@@ -292,15 +292,78 @@ cmake --build build --config Release -j
 Note: SYCL is faster for prompt processing (prefill), but Vulkan can be faster for
 token generation — especially on MoE models. Both are limited to GGUF format.
 
+### Option 5: llama.cpp OpenVINO Backend (Recommended for llama.cpp)
+
+As of March 2026, [llama.cpp has an official OpenVINO backend](https://github.com/ggml-org/llama.cpp/blob/master/docs/backend/OPENVINO.md)
+([PR #15307](https://github.com/ggml-org/llama.cpp/pull/15307), merged March 14, 2026).
+This is now the **recommended llama.cpp backend for Intel iGPU** — it combines llama.cpp's
+GGUF model ecosystem with OpenVINO's graph-level JIT compilation and kernel fusion.
+
+**How it works:** Instead of converting models, the backend translates GGML computation
+graphs to OpenVINO operations at runtime. GGUF files work directly — no IR conversion.
+
+```bash
+# Build (just needs OpenVINO Runtime, no oneAPI)
+cmake -B build -DGGML_OPENVINO=ON
+cmake --build build --parallel
+
+# Run on iGPU
+GGML_OPENVINO_DEVICE=GPU ./llama-cli -m model-Q4_K_M.gguf -p "Hello" -fa 1
+
+# Serve with OpenAI-compatible API
+GGML_OPENVINO_DEVICE=GPU ./llama-server -m model-Q4_K_M.gguf -fa 1
+```
+
+Or download prebuilt binaries — "Ubuntu x64 (OpenVINO)" is now an official release target.
+
+**Supported quantizations:** FP16, Q8_0, Q4_0, Q4_1, Q4_K, Q4_K_M, Q5_K, Q6_K  
+**Supported devices:** CPU, GPU (iGPU + discrete), **NPU** (unique — no other backend supports NPU)  
+**Validated on:** Core Ultra Series 1 (Meteor Lake) and Series 2 (Lunar Lake)
+
+**Environment variables:**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GGML_OPENVINO_DEVICE` | CPU | Target: `CPU`, `GPU`, or `NPU` |
+| `GGML_OPENVINO_CACHE_DIR` | (unset) | Cache compiled graphs across runs |
+| `GGML_OPENVINO_STATEFUL_EXECUTION` | 0 | Enable internal KV cache management (required for GPU) |
+
+**Benchmark** (OpenVINO 2026.1, DeepSeek-R1-Distill-Llama-8B INT4):
+
+| Hardware | Device | Decode Speed |
+|---|---|---|
+| Core Ultra 7 (Meteor Lake class) | iGPU | 12.8 tok/s |
+| Core Ultra 9 (Lunar Lake class) | iGPU | 19.8 tok/s |
+| Core Ultra 7 | NPU | 6.1 tok/s |
+
+For a 4B model, expect roughly **2× these speeds** (~25 tok/s on Meteor Lake) since
+decode is memory-bandwidth-bound and a 4B model is half the size of 8B.
+
+**Advantages over SYCL/Vulkan:**
+- OpenVINO's graph compiler fuses operations (better efficiency than op-by-op SYCL)
+- No oneAPI installation needed (unlike SYCL)
+- NPU support (unique to this backend)
+- Prebuilt release binaries available
+
+**Current limitations:**
+- `llama-server` limited to **single session** with stateful execution
+- GPU requires `GGML_OPENVINO_STATEFUL_EXECUTION=1` (known issue)
+- First token has extra latency (graph compilation, cached on subsequent runs)
+- No `--context-shift` support
+- Still a **preview feature** — accuracy/performance optimization ongoing
+- For multi-session serving or 32K context, use **OpenVINO GenAI** (serve_ov.py) instead
+
 ## Choosing an Alternative
 
 | Need | Best Option |
 |---|---|
 | Run latest HuggingFace models on Meteor Lake | **OpenVINO GenAI** |
-| Production serving with API endpoint | **OpenVINO Model Server** |
+| Production serving with API endpoint (32K context) | **OpenVINO GenAI** (serve_ov.py) |
+| Quick setup, any GGUF model, no Python | **llama.cpp OpenVINO backend** |
 | Quick setup, established models (Llama, Qwen, etc.) | **IPEX-LLM + Ollama** |
 | Testing/prototyping any HF model | **HF Transformers + eager attention** |
-| Minimal dependencies, no oneAPI | **llama.cpp Vulkan** |
+| Minimal dependencies, no oneAPI | **llama.cpp Vulkan** or **llama.cpp OpenVINO** |
+| NPU inference | **llama.cpp OpenVINO backend** (only option) |
 
 ### Performance Expectations
 
@@ -637,3 +700,9 @@ GPU, enough even with FP16 KV cache.
   — HuggingFace integration for OpenVINO model conversion
 - [llama.cpp SYCL vs Vulkan on MoE models](https://github.com/ggml-org/llama.cpp/issues/19918)
   — Vulkan faster for token generation in some cases
+- [llama.cpp OpenVINO Backend](https://github.com/ggml-org/llama.cpp/blob/master/docs/backend/OPENVINO.md)
+  — official docs for the OpenVINO GGML backend
+- [llama.cpp PR #15307](https://github.com/ggml-org/llama.cpp/pull/15307)
+  — "Add OpenVINO backend" (merged March 14, 2026)
+- [OpenVINO 2026.1 Release](https://www.phoronix.com/news/OpenVINO-2026.1-Released)
+  — llama.cpp OpenVINO backend benchmarks (8B INT4: 12.8 tok/s on Core Ultra 7 iGPU)
