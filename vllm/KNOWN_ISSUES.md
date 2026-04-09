@@ -417,6 +417,7 @@ scheduler_config = ov_genai.SchedulerConfig()
 scheduler_config.cache_size = 2              # limit KV cache to 2 GB
 scheduler_config.max_num_batched_tokens = 2048  # chunk prefill into 2K blocks
 scheduler_config.dynamic_split_fuse = True   # enable chunked prefill
+scheduler_config.enable_prefix_caching = False  # CRITICAL: avoid memory explosion bug
 
 pipe = ov_genai.LLMPipeline(model_path, "GPU", scheduler_config=scheduler_config)
 ```
@@ -424,6 +425,11 @@ pipe = ov_genai.LLMPipeline(model_path, "GPU", scheduler_config=scheduler_config
 `dynamic_split_fuse` splits long prompts into chunks that fit within
 `max_num_batched_tokens`, processing them sequentially and building the KV cache
 incrementally. This avoids the quadratic memory explosion.
+
+**Important:** `enable_prefix_caching = False` is critical. There is a known bug
+([openvino.genai#2406](https://github.com/openvinotoolkit/openvino.genai/issues/2406))
+where prefix caching with Qwen3-4B causes an integer overflow in memory calculation
+(requesting 2.3 exabytes), leading to immediate crash.
 
 ### 2. Use CPU for Long-Context Prefill
 
@@ -479,13 +485,32 @@ tokens from the cache when memory is full:
 
 ```python
 cache_eviction_config = ov_genai.CacheEvictionConfig()
-# Configure eviction to keep cache within memory limits
-# Recent tokens (most important) are always kept
+cache_eviction_config.max_cache_size = 4096   # max tokens in KV cache (must be multiple of block_size)
+cache_eviction_config.start_size = 64         # initial tokens always kept
+cache_eviction_config.recent_size = 512       # recent tokens always kept
+# Evictable region: max_cache_size - start_size - recent_size = 3520 tokens
+# Uses SnapKV-based attention scoring to evict least-important tokens
 ```
 
 This allows processing arbitrarily long contexts within a fixed memory budget, at the
 cost of some accuracy for very distant tokens. For OpenClaw's large-context use case,
 this may be acceptable since the most relevant context is usually recent.
+
+### 7. Use NPU for Prefill (Experimental)
+
+Meteor Lake includes a dedicated NPU (Neural Processing Unit) with its own memory
+management. OpenVINO 2025.3+ supports Qwen3-4B on NPU. The NPU has a separate
+memory pool, avoiding the shared GPU/CPU memory contention:
+
+```python
+# NPU with chunked prefill
+pipe = ov_genai.LLMPipeline(model_path, "NPU")
+# NPUW_LLM_PREFILL_CHUNK_SIZE controls prefill chunk size (default: 1024)
+# Set to 256 for lower peak memory
+```
+
+**Status: Experimental.** NPU inference for LLMs is new and may have performance or
+compatibility issues.
 
 ## Path to 32K Context on 16 GB Meteor Lake
 
@@ -494,9 +519,10 @@ For OpenClaw's requirement of 32K token input context, the recommended approach 
 1. **Switch to Qwen3.5-4B** (hybrid attention, far better long-context memory profile)
 2. **Use ContinuousBatchingPipeline** with `dynamic_split_fuse=True` and
    `max_num_batched_tokens=2048`
-3. **Limit cache_size** to 2-3 GB to leave headroom for model weights + system
-4. **Enable KV cache eviction** as a safety net
-5. If still OOM: fall back to **CPU prefill** for prompts > 4K tokens
+3. **Disable prefix caching** (`enable_prefix_caching = False`) — avoids memory explosion bug
+4. **Limit cache_size** to 2-3 GB to leave headroom for model weights + system
+5. **Enable KV cache eviction** as a safety net
+6. If still OOM: fall back to **CPU prefill** for prompts > 4K tokens
 
 Alternatively, on the **Claw 8 AI+ (Lunar Lake, 32 GB)**, the larger RAM budget
 makes 32K prefill feasible without these workarounds — 32 GB provides ~16 GB for
@@ -517,6 +543,15 @@ GPU, enough for the full KV cache and attention intermediates.
 - [OpenVINO KV Cache Eviction Algorithm](https://github.com/openvinotoolkit/openvino.genai/blob/master/site/docs/concepts/optimization-techniques/kvcache-eviction-algorithm.md)
   — automatic token eviction for bounded memory
 - [LMCache KV Cache Calculator](https://docs.lmcache.ai/getting_started/kv_cache_calculator.html)
+  — KV cache size estimation tool
+- [openvinotoolkit/openvino#31781](https://github.com/openvinotoolkit/openvino/issues/31781)
+  — CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST on Core Ultra 5 125H (Meteor Lake)
+- [openvinotoolkit/openvino#32665](https://github.com/openvinotoolkit/openvino/issues/32665)
+  — GPU memory leak with xe driver during inference
+- [openvinotoolkit/openvino_notebooks#2632](https://github.com/openvinotoolkit/openvino_notebooks/issues/2632)
+  — Qwen2 GPU memory error (CL_OUT_OF_RESOURCES) on iGPU
+- [OpenVINO CacheEvictionConfig API](https://docs.openvino.ai/2025/api/genai_api/_autosummary/openvino_genai.CacheEvictionConfig.html)
+  — max_cache_size, start_size, recent_size parameters
   — KV cache size estimation tool
 
 ---
