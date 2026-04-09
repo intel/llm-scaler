@@ -58,6 +58,48 @@ INSTALL_DIR="${INSTALL_DIR:-$REAL_HOME/llm}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# ============================================================
+# Precompiled wheel configuration
+# Set VLLM_BUILD_FROM_SOURCE=1 to skip wheel download and force compilation.
+# Wheels are hosted on GitHub Releases for the llm-scaler repo.
+# ============================================================
+WHEEL_REPO="MegaStood/llm-scaler"
+WHEEL_TAG="vllm-xpu-wheels-v0.14.0"
+WHEEL_BASE_URL="https://github.com/${WHEEL_REPO}/releases/download/${WHEEL_TAG}"
+VLLM_WHEEL="vllm-0.14.0-cp312-cp312-linux_x86_64.whl"
+XPU_KERNELS_WHEEL="vllm_xpu_kernels-0.0.1-cp312-cp312-linux_x86_64.whl"
+BUILD_FROM_SOURCE="${VLLM_BUILD_FROM_SOURCE:-0}"
+
+# Helper: try to download and install a precompiled wheel.
+# Returns 0 on success, 1 on failure (triggers source build fallback).
+try_install_wheel() {
+    local wheel_name="$1"
+    local wheel_url="${WHEEL_BASE_URL}/${wheel_name}"
+    local wheel_path="${INSTALL_DIR}/${wheel_name}"
+
+    if [ "$BUILD_FROM_SOURCE" = "1" ]; then
+        echo "  VLLM_BUILD_FROM_SOURCE=1, skipping wheel download."
+        return 1
+    fi
+
+    echo "  Trying precompiled wheel: $wheel_name"
+    if wget -q --spider "$wheel_url" 2>/dev/null; then
+        echo "  Downloading from GitHub Releases..."
+        wget -q --show-progress -O "$wheel_path" "$wheel_url"
+        if pip install "$wheel_path" 2>&1 | tail -3; then
+            rm -f "$wheel_path"
+            return 0
+        else
+            echo -e "${YELLOW}  Wheel install failed. Falling back to source build.${NC}"
+            rm -f "$wheel_path"
+            return 1
+        fi
+    else
+        echo "  Precompiled wheel not available yet. Building from source."
+        return 1
+    fi
+}
+
 echo "  Install dir:   $INSTALL_DIR"
 echo "  Repo root:     $REPO_ROOT"
 echo ""
@@ -296,20 +338,25 @@ if [ "$VLLM_CHECK" -gt 0 ]; then
     echo -e "${GREEN}  vLLM already installed in venv. Skipping build.${NC}"
     echo "  To rebuild: pip uninstall vllm -y && re-run this script."
 else
+    # XPU requirements are needed regardless of wheel or source build
     cd "$VLLM_DIR"
-
     echo "  Installing XPU requirements..."
     pip install -r requirements/xpu.txt 2>&1 | tail -3
     pip install arctic-inference==0.1.1 2>&1 | tail -1
 
-    echo "  Building vLLM (MAX_JOBS=$MAX_JOBS)..."
-    echo "  On 16GB RAM this can take 30-60 minutes. Do not interrupt."
-    pip install --no-build-isolation . 2>&1 | tail -5
+    # Try precompiled wheel first, fall back to source build
+    if try_install_wheel "$VLLM_WHEEL"; then
+        echo -e "${GREEN}  vLLM installed from precompiled wheel (~2 min vs 30-60 min).${NC}"
+    else
+        echo "  Building vLLM from source (MAX_JOBS=$MAX_JOBS)..."
+        echo "  On 16GB RAM this can take 30-60 minutes. Do not interrupt."
+        pip install --no-build-isolation . 2>&1 | tail -5
+    fi
 
     if pip show vllm &>/dev/null; then
-        echo -e "${GREEN}  vLLM built and installed successfully.${NC}"
+        echo -e "${GREEN}  vLLM installed successfully.${NC}"
     else
-        echo -e "${RED}  vLLM build failed. Check errors above.${NC}"
+        echo -e "${RED}  vLLM install failed. Check errors above.${NC}"
         echo "  Retry: cd $VLLM_DIR && MAX_JOBS=$MAX_JOBS pip install --no-build-isolation ."
         exit 1
     fi
@@ -355,38 +402,44 @@ XPU_KERNELS_CHECK=$(pip show vllm-xpu-kernels 2>/dev/null | grep -c "Name:" || t
 if [ "$XPU_KERNELS_CHECK" -gt 0 ]; then
     echo -e "${GREEN}  vllm-xpu-kernels already installed. Skipping.${NC}"
 else
-    XPU_KERNELS_DIR="$INSTALL_DIR/vllm-xpu-kernels"
-    if [ -d "$XPU_KERNELS_DIR" ]; then
-        echo "  $XPU_KERNELS_DIR already exists. Skipping clone."
+    # Try precompiled wheel first — saves 30-70 minutes of SYCL compilation
+    if try_install_wheel "$XPU_KERNELS_WHEEL"; then
+        echo -e "${GREEN}  vllm-xpu-kernels installed from precompiled wheel.${NC}"
     else
-        sudo -u "$REAL_USER" git clone https://github.com/vllm-project/vllm-xpu-kernels.git "$XPU_KERNELS_DIR"
+        # Fall back to source build
+        XPU_KERNELS_DIR="$INSTALL_DIR/vllm-xpu-kernels"
+        if [ -d "$XPU_KERNELS_DIR" ]; then
+            echo "  $XPU_KERNELS_DIR already exists. Skipping clone."
+        else
+            sudo -u "$REAL_USER" git clone https://github.com/vllm-project/vllm-xpu-kernels.git "$XPU_KERNELS_DIR"
+        fi
+
+        cd "$XPU_KERNELS_DIR"
+        sudo -u "$REAL_USER" git checkout 4c83144 2>/dev/null || true
+
+        # Comment out conflicting pinned deps (we already installed them)
+        sed -i 's|^--extra-index-url=https://download.pytorch.org/whl/xpu|# &|' requirements.txt
+        sed -i 's|^torch==2.10.0+xpu|# &|' requirements.txt
+        sed -i 's|^triton-xpu|# &|' requirements.txt
+        sed -i 's|^transformers|# &|' requirements.txt
+
+        # Fix ownership — sed ran as root, leaving root-owned files that pip (as user) can't write
+        chown -R "$REAL_USER:$REAL_USER" "$XPU_KERNELS_DIR"
+
+        # Clean stale build artifacts from previous failed attempts
+        rm -rf "$XPU_KERNELS_DIR/build"
+
+        pip install -r requirements.txt 2>&1 | tail -1
+
+        echo ""
+        echo -e "${YELLOW}  Compiling vllm-xpu-kernels (oneDNN + SYCL kernels)...${NC}"
+        echo -e "${YELLOW}  This takes 30-70 minutes. Do not close this window.${NC}"
+        echo ""
+        pip install --no-build-isolation . 2>&1 | tail -5
     fi
 
-    cd "$XPU_KERNELS_DIR"
-    sudo -u "$REAL_USER" git checkout 4c83144 2>/dev/null || true
-
-    # Comment out conflicting pinned deps (we already installed them)
-    sed -i 's|^--extra-index-url=https://download.pytorch.org/whl/xpu|# &|' requirements.txt
-    sed -i 's|^torch==2.10.0+xpu|# &|' requirements.txt
-    sed -i 's|^triton-xpu|# &|' requirements.txt
-    sed -i 's|^transformers|# &|' requirements.txt
-
-    # Fix ownership — sed ran as root, leaving root-owned files that pip (as user) can't write
-    chown -R "$REAL_USER:$REAL_USER" "$XPU_KERNELS_DIR"
-
-    # Clean stale build artifacts from previous failed attempts
-    rm -rf "$XPU_KERNELS_DIR/build"
-
-    pip install -r requirements.txt 2>&1 | tail -1
-
-    echo ""
-    echo -e "${YELLOW}  Compiling vllm-xpu-kernels (oneDNN + SYCL kernels)...${NC}"
-    echo -e "${YELLOW}  This takes 30-70 minutes. Do not close this window.${NC}"
-    echo ""
-    pip install --no-build-isolation . 2>&1 | tail -5
-
     if pip show vllm-xpu-kernels &>/dev/null; then
-        echo -e "${GREEN}  vllm-xpu-kernels built successfully.${NC}"
+        echo -e "${GREEN}  vllm-xpu-kernels installed successfully.${NC}"
     else
         echo -e "${RED}  vllm-xpu-kernels build failed. Check errors above.${NC}"
     fi
