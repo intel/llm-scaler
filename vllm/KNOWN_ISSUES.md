@@ -141,6 +141,8 @@ This is a **hardware limitation**, not a driver or software configuration issue.
 | `BIGDL_LLM_XMX_DISABLED=1` | Only affects IPEX-LLM (llama.cpp), not vLLM's IPEX |
 | `vllm_for_multi_arc.patch` | Does not add non-XMX attention for LLM path |
 | Triton attention backend | Triton XPU also leverages XMX for dot products |
+| vllm-xpu-kernels flash attention | Uses SYCL `joint_matrix` — Intel docs say "no emulation or fall back strategy" for non-XMX |
+| Any IPEX env var to disable XMX | Does not exist — no `IPEX_XPU_ONEDNN` or `IPEX_SDPA_MATH_MODE` variable |
 
 ## Hardware Comparison
 
@@ -163,6 +165,28 @@ omission in Meteor Lake was a limitation.
 - No plans from vLLM project to support non-XMX Intel GPUs
 - Post Feb 2026, vLLM switched from IPEX to `vllm-xpu-kernels` (designed for PVC/BMG
   only), which also doesn't support Xe-LPG
+
+## Potential Future Path: PyTorch >= 2.9 Math SDP Backend
+
+[PyTorch PR #156669](https://github.com/pytorch/pytorch/pull/156669) (merged July 2025)
+added `SDPBackend.MATH` support on XPU. This enables a math-based SDP fallback that
+does not require XMX. In theory, vLLM could be patched to use this:
+
+```python
+from torch.nn.attention import sdpa_kernel, SDPBackend
+with sdpa_kernel(SDPBackend.MATH):
+    # attention operations bypass XMX-dependent oneDNN kernel
+```
+
+**Status: Unvalidated.** This would require:
+1. PyTorch >= 2.9 with XPU support
+2. Patching vLLM's `TORCH_SDPA` backend to wrap attention in `sdpa_kernel(MATH)`
+3. Ensuring paged attention / KV cache ops also work without XMX
+4. Significant performance testing (math SDP is much slower than XMX-accelerated SDP)
+
+Note: IPEX is being retired after version 2.8. Intel is directing users to PyTorch
+native XPU support. Future vLLM versions using PyTorch >= 2.9 native XPU may
+eventually support non-XMX platforms through this path.
 
 ## Alternative: Use IPEX-LLM (Ollama) for Meteor Lake
 
@@ -195,3 +219,9 @@ Performance will be lower than on XMX-equipped GPUs, but it works.
 - [vllm-project/vllm#28362](https://github.com/vllm-project/vllm/issues/28362) — Meteor Lake vLLM issue (NOT_PLANNED)
 - [IPEX-LLM FAQ](https://github.com/intel/ipex-llm/blob/main/docs/mddocs/Overview/FAQ/faq.md)
   — `BIGDL_LLM_XMX_DISABLED=1` documentation
+- [PyTorch PR #156669](https://github.com/pytorch/pytorch/pull/156669)
+  — adds `SDPBackend.MATH` on XPU (merged Jul 2025, available in PyTorch >= 2.9)
+- [torch-xpu-ops #1724](https://github.com/intel/torch-xpu-ops/issues/1724)
+  — original issue for missing SDPA backend selection on XPU
+- [Intel oneAPI: Programming XMX with joint_matrix](https://www.intel.com/content/www/us/en/docs/oneapi/optimization-guide-gpu/2023-2/programming-intel-xmx-using-sycl-joint-matrix.html)
+  — confirms "no emulation or fall back strategy" for joint_matrix on non-XMX hardware
