@@ -306,8 +306,20 @@ token generation — especially on MoE models. Both are limited to GGUF format.
 
 Without XMX, Meteor Lake uses **DP4a** (Dot-Product of 4 elements and Accumulate)
 instructions for INT8/INT4 operations — the older, scalar path vs. the DPAS systolic
-array path that XMX enables. Expect roughly **2-4x lower throughput** compared to
-XMX-equipped GPUs (Lunar Lake, Arc A770, B580) at the same model and quantization.
+array path that XMX enables.
+
+**Actual benchmark** (Qwen3-4B INT4 on MSI Claw A1M, Meteor Lake iGPU, OpenVINO GenAI):
+
+| Metric | Short prompt (~6 words) | Long prompt (~450 words) |
+|---|---|---|
+| TTFT (prefill) | **176 ms** | **993 ms** |
+| Decode speed | **26.4 tokens/s** | **24.5 tokens/s** |
+| Total time (100 tokens) | 3.85s | 4.86s |
+
+This is **comparable to vLLM on Lunar Lake** (which has XMX) for the same model class.
+The bottleneck for 4B-class models on iGPU is memory bandwidth (LPDDR5), not compute,
+so the XMX absence has less impact than expected. OpenVINO's graph-level optimizations
+(kernel fusion, layout optimization) compensate for the missing hardware acceleration.
 
 ## References
 
