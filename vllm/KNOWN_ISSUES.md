@@ -325,6 +325,206 @@ so the XMX absence has less impact than expected. OpenVINO's graph-level optimiz
 
 - [Chips and Cheese: Intel's Ambitious Meteor Lake iGPU](https://chipsandcheese.com/p/intels-ambitious-meteor-lake-igpu)
   — confirms XMX omission on Xe-LPG Port 2
+
+# 06. OpenVINO GenAI Prefill Crashes at 8K+ Tokens on Meteor Lake iGPU (OOM)
+
+**Affected:** Intel Core Ultra 1xx (Meteor Lake) — 16 GB LPDDR5 shared memory  
+**Likely affected:** Any iGPU system with ≤ 16 GB shared memory  
+**Not affected:** Systems with 32 GB+ RAM, discrete GPUs
+
+## Symptom
+
+OpenVINO GenAI's `LLMPipeline` crashes during prefill (prompt processing) when the
+input exceeds ~8K tokens on Meteor Lake iGPU:
+
+```
+[GPU] CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST
+```
+
+Observed with Qwen3-4B INT4 on MSI Claw A1M (16 GB LPDDR5). Prefill works up to 4K
+tokens but shows significant performance degradation at 4K (throughput drops from
+674 → 378 tokens/s) before crashing at 8K.
+
+## Root Cause: Quadratic Attention Memory
+
+During prefill, the self-attention operation computes attention scores for the entire
+prompt at once. For standard SDPA (Scaled Dot-Product Attention), this requires
+materializing an attention score matrix of size:
+
+```
+[batch, num_query_heads, seq_len, seq_len] × sizeof(float16)
+```
+
+This grows **quadratically** with sequence length. For Qwen3-4B (32 Q-heads, 8 KV-heads,
+128 head_dim, 36 layers):
+
+| Context Length | KV Cache (FP16) | Attention Peak (1 layer, all heads) | Total Est. GPU Memory |
+|---|---|---|---|
+| 512 | 72 MB | 32 MB | ~2.6 GB |
+| 1K | 144 MB | 128 MB | ~2.8 GB |
+| 2K | 288 MB | 512 MB | ~3.3 GB |
+| 4K | 576 MB | **2 GB** | ~5.1 GB |
+| 8K | 1,152 MB | **8 GB** | **~11.7 GB** ← crashes |
+| 16K | 2,304 MB | **32 GB** | impossible |
+| 32K | 4,608 MB | **128 GB** | impossible |
+
+**KV cache formula:** `2 × 36 layers × 8 KV-heads × 128 dim × 2 bytes = 147,456 bytes/token`
+
+**Attention score formula:** `32 Q-heads × seq_len² × 2 bytes` per layer
+
+Note: The actual peak depends on how OpenVINO's GPU plugin tiles the attention
+computation. If it processes heads in groups rather than all at once, the peak is
+lower — but the quadratic scaling remains.
+
+On 16 GB shared memory, the GPU typically gets ~8 GB (configurable in BIOS). At 8K
+tokens the combined model weights (2.5 GB) + KV cache (1.1 GB) + attention intermediates
+push past this limit.
+
+## Why 4K Shows a Performance Cliff
+
+The 4K benchmark data shows prefill throughput dropping from 674 tokens/s (at 2K) to
+378 tokens/s (at 4K). This is because at 4K, the attention scores reach ~2 GB per layer,
+which approaches the GPU allocator's comfort zone. The GPU starts swapping or fragmenting
+memory, causing massive slowdown before the hard crash at 8K.
+
+**Pre-2025.4 OpenVINO had a 4.2 GB single-allocation limit** for GPU buffers. If the
+installed version is older, this limit alone could cause the crash. OpenVINO 2025.4+
+removed this limit via `GPU_ENABLE_LARGE_ALLOCATIONS`.
+
+## Benchmark Data
+
+Prefill benchmark on MSI Claw A1M (Meteor Lake, 16 GB), Qwen3-4B INT4, OpenVINO GenAI:
+
+| Context | TTFT | Prefill Throughput | Status |
+|---|---|---|---|
+| 512 tokens | 773 ms | 663 tokens/s | OK |
+| 1K tokens | 1,695 ms | 604 tokens/s | OK |
+| 2K tokens | 3,040 ms | 674 tokens/s | OK |
+| 4K tokens | 10,841 ms | 378 tokens/s | Slow (memory pressure) |
+| 8K tokens | — | — | **CRASH** (CL_EXEC_STATUS_ERROR) |
+
+## Workarounds
+
+### 1. Use ContinuousBatchingPipeline with SchedulerConfig
+
+OpenVINO GenAI's `ContinuousBatchingPipeline` uses PagedAttention and supports
+`dynamic_split_fuse` — which chunks the prefill into smaller batches:
+
+```python
+import openvino_genai as ov_genai
+
+scheduler_config = ov_genai.SchedulerConfig()
+scheduler_config.cache_size = 2              # limit KV cache to 2 GB
+scheduler_config.max_num_batched_tokens = 2048  # chunk prefill into 2K blocks
+scheduler_config.dynamic_split_fuse = True   # enable chunked prefill
+
+pipe = ov_genai.LLMPipeline(model_path, "GPU", scheduler_config=scheduler_config)
+```
+
+`dynamic_split_fuse` splits long prompts into chunks that fit within
+`max_num_batched_tokens`, processing them sequentially and building the KV cache
+incrementally. This avoids the quadratic memory explosion.
+
+### 2. Use CPU for Long-Context Prefill
+
+CPU has access to full system RAM (16 GB) without the GPU allocation limit. CPU prefill
+is slower but avoids the OOM entirely:
+
+```python
+# CPU pipeline — no GPU memory limits
+pipe = ov_genai.LLMPipeline(model_path, "CPU")
+
+# Or use ContinuousBatchingPipeline on CPU for long-context
+scheduler_config = ov_genai.SchedulerConfig()
+scheduler_config.cache_size = 4  # 4 GB KV cache on system RAM
+pipe = ov_genai.LLMPipeline(model_path, "CPU", scheduler_config=scheduler_config)
+```
+
+For OpenClaw's 32K context requirement, CPU prefill may be the only viable option on
+16 GB systems. Expected TTFT: 30-60 seconds for 32K tokens on Meteor Lake CPU
+(slower than GPU but doesn't crash).
+
+### 3. Use a Model with Sliding Window Attention
+
+Models with **hybrid attention** (sliding window + sparse full attention) use far less
+memory for long contexts because most layers only attend to a local window:
+
+- **Qwen3.5-4B**: Only 8 of 36 layers use full attention; 28 use sliding window.
+  At 32K tokens, KV cache is ~8× smaller than Qwen3-4B's, and attention intermediates
+  are bounded by the window size for most layers.
+- **Gemma 4 E4B**: MoE architecture (2.3B active / 5.1B total) with 128K context
+  support. Likely designed for efficient long-context inference.
+
+### 4. Upgrade to OpenVINO 2025.4+
+
+If running an older version, the 4.2 GB single-allocation limit may be the immediate
+cause. OpenVINO 2025.4 removed this limit:
+
+```bash
+pip install --upgrade openvino openvino-genai
+```
+
+### 5. Increase GPU Memory Allocation in BIOS
+
+MSI Claw BIOS may have a "GPU Shared Memory" or "DVMT Pre-Allocated" setting.
+Increasing from the default (typically 256 MB pre-allocated + up to 50% dynamic) to
+the maximum can help. Check:
+- BIOS → Advanced → Graphics Configuration → DVMT Pre-Allocated
+- Set to maximum available (e.g., 8 GB or "MAX")
+
+### 6. Use KV Cache Eviction for Bounded Memory
+
+OpenVINO GenAI supports KV cache eviction — automatically dropping least-important
+tokens from the cache when memory is full:
+
+```python
+cache_eviction_config = ov_genai.CacheEvictionConfig()
+# Configure eviction to keep cache within memory limits
+# Recent tokens (most important) are always kept
+```
+
+This allows processing arbitrarily long contexts within a fixed memory budget, at the
+cost of some accuracy for very distant tokens. For OpenClaw's large-context use case,
+this may be acceptable since the most relevant context is usually recent.
+
+## Path to 32K Context on 16 GB Meteor Lake
+
+For OpenClaw's requirement of 32K token input context, the recommended approach is:
+
+1. **Switch to Qwen3.5-4B** (hybrid attention, far better long-context memory profile)
+2. **Use ContinuousBatchingPipeline** with `dynamic_split_fuse=True` and
+   `max_num_batched_tokens=2048`
+3. **Limit cache_size** to 2-3 GB to leave headroom for model weights + system
+4. **Enable KV cache eviction** as a safety net
+5. If still OOM: fall back to **CPU prefill** for prompts > 4K tokens
+
+Alternatively, on the **Claw 8 AI+ (Lunar Lake, 32 GB)**, the larger RAM budget
+makes 32K prefill feasible without these workarounds — 32 GB provides ~16 GB for
+GPU, enough for the full KV cache and attention intermediates.
+
+## References
+
+- [OpenVINO GPU Plugin Memory Allocation](https://github.com/openvinotoolkit/openvino/wiki/Memory-allocation-in-GPU-plugin)
+  — GPU memory allocation types and limits (CL_DEVICE_GLOBAL_MEM_SIZE)
+- [OpenVINO 2025.4 Release Notes](https://www.intel.com/content/www/us/en/developer/articles/release-notes/openvino/2025-4.html)
+  — removed 4.2 GB single-allocation limit via GPU_ENABLE_LARGE_ALLOCATIONS
+- [openvinotoolkit/openvino.genai#2406](https://github.com/openvinotoolkit/openvino.genai/issues/2406)
+  — exceed_allocatable_mem_size GPU memory allocation failure
+- [openvinotoolkit/openvino#34416](https://github.com/openvinotoolkit/openvino/issues/34416)
+  — OOM on iGPU with 20B model (Core Ultra 7 265)
+- [OpenVINO SchedulerConfig API](https://docs.openvino.ai/2025/api/genai_api/_autosummary/openvino_genai.SchedulerConfig.html)
+  — cache_size, num_kv_blocks, dynamic_split_fuse, max_num_batched_tokens
+- [OpenVINO KV Cache Eviction Algorithm](https://github.com/openvinotoolkit/openvino.genai/blob/master/site/docs/concepts/optimization-techniques/kvcache-eviction-algorithm.md)
+  — automatic token eviction for bounded memory
+- [LMCache KV Cache Calculator](https://docs.lmcache.ai/getting_started/kv_cache_calculator.html)
+  — KV cache size estimation tool
+
+---
+
+## References (Issue #05 — XMX Blocker)
+
+- [Chips and Cheese: Intel's Ambitious Meteor Lake iGPU](https://chipsandcheese.com/p/intels-ambitious-meteor-lake-igpu)
+  — confirms XMX omission on Xe-LPG Port 2
 - [Tom's Hardware: Arrow Lake Xe-LPG Plus with XMX](https://www.tomshardware.com/desktops/intels-next-gen-arrow-lake-gpu-will-have-new-xe-lpg-plus-architecture-with-xmx)
   — Arrow Lake restores XMX
 - [Intel XMX documentation](https://www.intel.com/content/www/us/en/support/articles/000091112/graphics.html)
