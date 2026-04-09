@@ -407,24 +407,44 @@ Prefill benchmark on MSI Claw A1M (Meteor Lake, 16 GB), Qwen3-4B INT4, OpenVINO 
 
 ### 1. Use ContinuousBatchingPipeline with SchedulerConfig
 
-OpenVINO GenAI's `ContinuousBatchingPipeline` uses PagedAttention and supports
-`dynamic_split_fuse` — which chunks the prefill into smaller batches:
+The default `LLMPipeline` (StatefulLLMPipeline / SDPA backend) processes the entire
+prompt in one pass with a contiguous KV cache — it has **no chunked prefill, no paged
+KV cache, and no eviction**. This is what crashes at 8K tokens.
+
+Passing a `SchedulerConfig` activates the `ContinuousBatchingPipeline` backend, which
+uses PagedAttention and `dynamic_split_fuse` to chunk the prefill:
 
 ```python
 import openvino_genai as ov_genai
 
 scheduler_config = ov_genai.SchedulerConfig()
-scheduler_config.cache_size = 2              # limit KV cache to 2 GB
-scheduler_config.max_num_batched_tokens = 2048  # chunk prefill into 2K blocks
-scheduler_config.dynamic_split_fuse = True   # enable chunked prefill
+scheduler_config.cache_size = 3              # limit KV cache to 3 GB
+scheduler_config.max_num_batched_tokens = 512  # chunk prefill into 512-token blocks
+scheduler_config.dynamic_split_fuse = True   # enable chunked prefill (default: True)
 scheduler_config.enable_prefix_caching = False  # CRITICAL: avoid memory explosion bug
 
-pipe = ov_genai.LLMPipeline(model_path, "GPU", scheduler_config=scheduler_config)
+pipe = ov_genai.LLMPipeline(
+    model_path, "GPU",
+    scheduler_config=scheduler_config,
+    KV_CACHE_PRECISION="u8",   # INT8 KV cache (default on iGPU), or "u4" for INT4
+)
 ```
 
-`dynamic_split_fuse` splits long prompts into chunks that fit within
-`max_num_batched_tokens`, processing them sequentially and building the KV cache
-incrementally. This avoids the quadratic memory explosion.
+`dynamic_split_fuse` splits long prompts into chunks of `max_num_batched_tokens`
+(default: 256), processing them across multiple iterations and building the KV cache
+incrementally. A 32K prompt with 512-token chunks = ~63 iterations instead of one
+monolithic pass. This avoids the quadratic attention memory explosion.
+
+**KV cache precision options:**
+
+| `KV_CACHE_PRECISION` | Memory vs FP16 | Quality | Notes |
+|---|---|---|---|
+| `f16` / `bf16` | 1× (baseline) | Best | May OOM at 32K on 16GB |
+| `u8` | 0.5× | Good | **Default on iGPU** (auto-detected) |
+| `u4` | 0.25× | Acceptable | Best for 32K on 16GB — reduces 4.5 GB → ~1.1 GB KV |
+
+You can also set `KEY_CACHE_PRECISION` and `VALUE_CACHE_PRECISION` separately for
+fine-grained control.
 
 **Important:** `enable_prefix_caching = False` is critical. There is a known bug
 ([openvino.genai#2406](https://github.com/openvinotoolkit/openvino.genai/issues/2406))
@@ -514,19 +534,49 @@ compatibility issues.
 
 ## Path to 32K Context on 16 GB Meteor Lake
 
-For OpenClaw's requirement of 32K token input context, the recommended approach is:
+For OpenClaw's requirement of 32K token input context, the recommended configuration:
 
-1. **Switch to Qwen3.5-4B** (hybrid attention, far better long-context memory profile)
-2. **Use ContinuousBatchingPipeline** with `dynamic_split_fuse=True` and
-   `max_num_batched_tokens=2048`
+```python
+import openvino_genai as ov_genai
+
+# --- Recommended 32K config for Claw A1M (16 GB) ---
+scheduler_config = ov_genai.SchedulerConfig()
+scheduler_config.cache_size = 3                    # 3 GB KV cache budget
+scheduler_config.max_num_batched_tokens = 512      # chunked prefill (512 tokens/iter)
+scheduler_config.dynamic_split_fuse = True         # enable chunked prefill
+scheduler_config.enable_prefix_caching = False     # avoid bug #2406
+
+pipe = ov_genai.LLMPipeline(
+    "model_path",  # Qwen3.5-4B or Qwen3-4B INT4
+    "GPU",
+    scheduler_config=scheduler_config,
+    KV_CACHE_PRECISION="u4",    # INT4 KV cache: 4.5 GB → ~1.1 GB at 32K
+)
+```
+
+**Memory budget at 32K with this config (Qwen3-4B INT4):**
+- Model weights: ~2.5 GB
+- KV cache (U4): ~1.1 GB (vs 4.5 GB at FP16)
+- Attention intermediates: bounded by 512-token chunks (~small)
+- **Total: ~4-5 GB** — fits within 8 GB GPU allocation
+
+**Recommended steps** (in order of priority):
+
+1. **Use ContinuousBatchingPipeline** (pass `SchedulerConfig`) — the default
+   StatefulLLMPipeline has no chunked prefill and will always crash at 8K+
+2. **Set `KV_CACHE_PRECISION="u4"`** — reduces KV cache 4× (critical for 32K)
 3. **Disable prefix caching** (`enable_prefix_caching = False`) — avoids memory explosion bug
-4. **Limit cache_size** to 2-3 GB to leave headroom for model weights + system
-5. **Enable KV cache eviction** as a safety net
-6. If still OOM: fall back to **CPU prefill** for prompts > 4K tokens
+4. **Set `max_num_batched_tokens=512`** — chunks 32K prompt into ~63 iterations
+5. **Switch to Qwen3.5-4B** if available — hybrid sliding-window attention uses less memory
+6. **Enable KV cache eviction** (`CacheEvictionConfig`) as a safety net
+7. If still OOM: fall back to **CPU** for prompts > 4K tokens
+
+**Note:** CPU prefill + GPU decode is **not supported** in OpenVINO GenAI — there is
+no mechanism to transfer KV cache state between device pipelines. Use a single device.
 
 Alternatively, on the **Claw 8 AI+ (Lunar Lake, 32 GB)**, the larger RAM budget
-makes 32K prefill feasible without these workarounds — 32 GB provides ~16 GB for
-GPU, enough for the full KV cache and attention intermediates.
+makes 32K prefill feasible with less aggressive settings — 32 GB provides ~16 GB for
+GPU, enough even with FP16 KV cache.
 
 ## References
 
