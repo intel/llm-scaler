@@ -280,8 +280,8 @@ lists "built-in Arc GPU in Meteor Lake" as verified hardware. The Vulkan backend
 works and requires no oneAPI installation.
 
 ```bash
-# SYCL build (needs oneAPI)
-cmake -B build -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
+# SYCL FP16 build (needs oneAPI — recommended, +49% faster prefill)
+cmake -B build -DGGML_SYCL=ON -DGGML_SYCL_F16=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
 cmake --build build --config Release -j
 
 # Vulkan build (simpler, just needs GPU drivers)
@@ -289,8 +289,9 @@ cmake -B build -DGGML_VULKAN=ON
 cmake --build build --config Release -j
 ```
 
-Note: SYCL is faster for prompt processing (prefill), but Vulkan can be faster for
-token generation — especially on MoE models. Both are limited to GGUF format.
+Note: SYCL FP16 is +49% faster for prompt processing (prefill) than Vulkan. Token
+generation is similar (~15 tok/s). SYCL is the recommended backend on Intel iGPU.
+Both are limited to GGUF format.
 
 ### ~~Option 5: llama.cpp OpenVINO Backend~~ (BROKEN — Do Not Use)
 
