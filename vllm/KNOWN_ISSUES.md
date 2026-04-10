@@ -318,30 +318,23 @@ the standard recommendation, but none of them work.
 **Use SYCL instead** — see Option 4 above. SYCL works with all quantization formats,
 provides similar long-context scaling advantages over Vulkan, and is actively maintained.
 
-**Backend comparison on Intel Meteor Lake iGPU** (llama-bench, real measurements on MSI Claw A1M):
+**Backend comparison on Intel Meteor Lake iGPU** (llama-bench, real measurements on MSI Claw A1M, 5 runs averaged):
 
 Gemma 4 E4B Q4_K_M (7.5B params, 4.62 GiB):
 
-| Backend | pp512 | pp1024 | pp2048 | pp4096 | pp8192 | pp16384 | pp32768 | tg128 |
-|---|---|---|---|---|---|---|---|---|
-| **SYCL** | 309 | 314 | 316 | 310 | 304 | 290 | 258 | 15.1 |
-| **Vulkan** | 318 | 299 | 264 | 265 | 246 | 169 | 172 | 14.2 |
-| **OpenVINO** | — | — | — | — | — | — | — | — |
+| Backend | pp512 | pp1024 | pp2048 | pp4096 | pp8192 | pp16384 | pp32768 | tg128 | tg256 | tg512 | tg1024 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| **SYCL** | 311 | 317 | 318 | 314 | 305 | 290 | 257 | 15.0 | 15.6 | 15.5 | 15.2 |
+| **Vulkan** | 292 | 278 | 281 | 286 | 267 | 237 | 188 | 14.6 | 14.6 | 14.4 | 14.1 |
+| **OpenVINO** | — | — | — | — | — | — | — | — | — | — | — |
 
 Key findings:
 - **SYCL scales much better at long context** — only 17% drop from pp512→pp32768
-  vs 46% drop for Vulkan (1.5× faster at 32K)
-- **Vulkan is slightly faster at short context** (pp512) but loses advantage past pp1024
+  vs 36% drop for Vulkan (1.4× faster at 32K)
+- **SYCL is faster at all context lengths**, including short context
 - **OpenVINO is completely non-functional** with K-quant models
-- **Token generation is comparable** between SYCL (15.1) and Vulkan (14.2)
-
-SYCL extended token generation (same model, Meteor Lake):
-
-| tg128 | tg256 | tg512 | tg1024 | tg2048 |
-|---|---|---|---|---|
-| 15.1 | 15.0 | 14.7 | 14.6 | 14.0 |
-
-TG scales linearly — only 7% drop from 128→2048 tokens generated.
+- **Token generation**: SYCL 15.0-15.6 vs Vulkan 14.1-14.6 (~7% faster)
+- **SYCL TG improves after warmup** (tg256 > tg128) — GPU scheduler ramp-up effect
 
 Sources: [llama.cpp #10879](https://github.com/ggml-org/llama.cpp/discussions/10879),
 [ipex-llm #12318](https://github.com/intel-analytics/ipex-llm/issues/12318),
