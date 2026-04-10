@@ -324,23 +324,26 @@ Gemma 4 E4B Q4_K_M (7.5B params, 4.62 GiB):
 
 | Backend | pp512 | pp1024 | pp2048 | pp4096 | pp8192 | pp16384 | pp32768 | tg128 | tg256 | tg512 | tg1024 |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| **SYCL (JIT)** | 311 | 317 | 318 | 314 | 305 | 290 | 257 | 15.0 | 15.6 | 15.5 | 15.2 |
+| **SYCL FP16** | **463** | **468** | **466** | **452** | **434** | **401** | **345** | 14.6 | 14.6 | 14.5 | 14.2 |
+| **SYCL FP32** | 311 | 317 | 318 | 314 | 305 | 290 | 257 | **15.0** | **15.6** | **15.5** | **15.2** |
 | **SYCL AOT (mtl_h)** | 309 | 319 | 318 | 314 | 306 | 290 | 259 | 15.0 | 15.0 | 14.9 | 14.6 |
 | **Vulkan** | 292 | 278 | 281 | 286 | 267 | 237 | 188 | 14.6 | 14.6 | 14.4 | 14.1 |
 | **OpenVINO** | — | — | — | — | — | — | — | — | — | — | — |
 
-SYCL AOT = compiled with `-DGGML_SYCL_DEVICE_ARCH=mtl_h` (ahead-of-time for Meteor Lake-H).
-SYCL JIT = default build without device arch (just-in-time compilation at runtime).
+Build flags tested:
+- SYCL FP16 = `-DGGML_SYCL=ON -DGGML_SYCL_F16=ON` (FP16 intermediate accumulation)
+- SYCL FP32 = `-DGGML_SYCL=ON` (default FP32 accumulation)
+- SYCL AOT = `-DGGML_SYCL=ON -DGGML_SYCL_DEVICE_ARCH=mtl_h` (ahead-of-time for Meteor Lake-H)
+- Vulkan = `-DGGML_VULKAN=ON`
 
 Key findings:
-- **SYCL scales much better at long context** — only 17% drop from pp512→pp32768
-  vs 36% drop for Vulkan (1.4× faster at 32K)
-- **SYCL is faster at all context lengths**, including short context
+- **SYCL FP16 prefill is +49% faster** than FP32 (311→463 at pp512) — the biggest win
+- **SYCL FP16 at 32K is 1.8× faster than Vulkan** (345 vs 188 tok/s)
+- FP16 TG is ~5% slower than FP32 (15.2→14.2 at tg1024) — compute overhead on memory-bound path
+- **AOT does NOT improve performance** — prefill identical to FP32 JIT, TG ~4% slower
 - **OpenVINO is completely non-functional** with K-quant models
-- **Token generation**: SYCL JIT 15.0-15.6 vs Vulkan 14.1-14.6 (~7% faster)
-- **AOT does NOT improve performance** — prefill identical, TG ~4% slower than JIT
-- **SYCL TG improves after warmup** (tg256 > tg128) — more pronounced with JIT build
-- **Recommendation: use default SYCL build (JIT)** — AOT adds build complexity with no benefit
+- SYCL FP32 has best TG (15.0-15.6) with warmup effect (tg256 > tg128)
+- **Recommendation: SYCL FP16 for prefill-heavy workloads, SYCL FP32 for TG-heavy workloads**
 
 Sources: [llama.cpp #10879](https://github.com/ggml-org/llama.cpp/discussions/10879),
 [ipex-llm #12318](https://github.com/intel-analytics/ipex-llm/issues/12318),
