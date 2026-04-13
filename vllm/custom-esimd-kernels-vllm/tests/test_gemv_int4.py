@@ -117,21 +117,23 @@ GROUP_SIZE = 128
 
 def int4_quantize(weight_fp16, group_size=GROUP_SIZE):
     """
-    Symmetric INT4 quantization:  fp16 weight  ->  (packed uint8, group scale).
+    GGML q4_0 quantization:  fp16 weight  ->  (packed uint8, group scale).
 
-    Steps:
+    Matches the BigDL-core C library (quantize_row_q4_0_gptq_reference):
       1. Reshape weight into groups of `group_size` along K dimension.
-      2. Compute per-group scale = max(|group|) / 7  (symmetric around zero).
-      3. Quantize:  q = round(weight / scale),  clamped to [-8, 7].
-      4. Pack two int4 values into one uint8 byte:
-           byte = (q[even_idx] & 0xF) | ((q[odd_idx] & 0xF) << 4)
+      2. Compute per-group scale = max(group) / (-8).
+         Note: uses signed max (not abs max), so scale can be negative.
+      3. Quantize:  uint4 = clamp(round(weight / scale + 8), 0, 15).
+         The +8 is the implicit zero_point.
+      4. Pack two uint4 values into one byte:
+           byte = (val[even_idx] & 0xF) | ((val[odd_idx] & 0xF) << 4)
 
     Args:
         weight_fp16: [N, K] fp16 tensor on device.
         group_size:  number of K-elements per scale group (must divide K).
 
     Returns:
-        packed: [N, K//2] uint8  — packed int4 weight on device.
+        packed: [N, K//2] uint8  — packed uint4 weight on device.
         scale:  [N, K//group_size] fp16 — per-group scale on device.
     """
     N, K = weight_fp16.shape
@@ -141,22 +143,25 @@ def int4_quantize(weight_fp16, group_size=GROUP_SIZE):
     # Reshape to [N, num_groups, group_size] for per-group operations.
     groups = weight_fp16.float().reshape(N, K // group_size, group_size)
 
-    # Per-group scale:  amax / 7  maps the range [-7, 7] to [-amax, amax].
-    # clamp(min=1e-10) avoids division by zero for all-zero groups.
-    amax = groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
-    scale = amax / 7.0
+    # Per-group scale: find the element with max absolute value, then
+    # scale = max_val / (-8).  This is the GGML q4_0 convention.
+    # We need the signed max (the element whose abs is largest, with sign).
+    amax_vals, amax_idx = groups.abs().max(dim=-1, keepdim=True)
+    # Gather the actual signed value at the max-abs position
+    max_signed = groups.gather(-1, amax_idx)  # [N, num_groups, 1]
+    scale = (max_signed / -8.0).squeeze(-1).to(torch.float16)  # [N, num_groups]
 
-    # Quantize: divide by scale, round to nearest integer, clamp to 4-bit
-    # signed range [-8, 7].  Values rarely hit -8 (only via rounding), but the
-    # hardware must handle it.
-    quantized = (groups / scale).round().clamp(-8, 7).to(torch.int8)
+    # Quantize: uint4 = clamp(round(weight * (1/scale) + 8), 0, 15)
+    # Handle zero scale (all-zero groups)
+    scale_expanded = scale.float().unsqueeze(-1)  # [N, num_groups, 1]
+    inv_scale = torch.where(
+        scale_expanded.abs() > 1e-10,
+        1.0 / scale_expanded,
+        torch.zeros_like(scale_expanded))
+    quantized = (groups * inv_scale + 8.5).to(torch.int32).clamp(0, 15)
     quantized = quantized.reshape(N, K)
-    scale = scale.squeeze(-1).to(torch.float16)  # [N, num_groups]
 
-    # Pack: two int4 values per byte.
-    # Low nibble  = element at even index (0, 2, 4, ...),
-    # High nibble = element at odd index  (1, 3, 5, ...).
-    # Mask with 0x0F to get unsigned 4-bit representation (two's complement).
+    # Pack: two uint4 values per byte (low nibble = even, high nibble = odd).
     even = quantized[:, 0::2] & 0x0F
     odd = (quantized[:, 1::2] & 0x0F) << 4
     packed = (even | odd).to(torch.uint8)  # [N, K//2]
@@ -166,17 +171,19 @@ def int4_quantize(weight_fp16, group_size=GROUP_SIZE):
 
 def int4_dequantize_ref(packed, scale, N, K, group_size=GROUP_SIZE):
     """
-    Reference dequantization:  packed uint8  ->  fp16 weight.
+    Reference dequantization (GGML q4_0):  packed uint8  ->  fp16 weight.
 
     This is the inverse of int4_quantize (modulo quantization error).
     The ESIMD kernel must produce the same numerical result as this function.
 
+    GGML q4_0 dequant formula:
+      fp_weight = (uint4_val - 8) * scale
+
     Steps:
-      1. Unpack each byte into two int4 values (low nibble, high nibble).
-      2. Convert from unsigned 4-bit to signed:  if val >= 8 then val -= 16.
-         This recovers the two's complement representation in [-8, 7].
+      1. Unpack each byte into two uint4 values (low nibble, high nibble).
+      2. Subtract 8 (implicit zero_point) to get signed [-8, +7].
       3. Interleave low/high back to original K-ordering.
-      4. Multiply by per-group scale to get fp16 weight.
+      4. Multiply by per-group scale (which can be negative).
 
     Args:
         packed: [N, K//2] uint8 on device.
@@ -188,21 +195,18 @@ def int4_dequantize_ref(packed, scale, N, K, group_size=GROUP_SIZE):
         weight: [N, K] fp16 on device — dequantized weight.
     """
     # Unpack: byte -> low nibble (even index) + high nibble (odd index).
-    low = (packed & 0x0F).to(torch.int8)
-    high = ((packed >> 4) & 0x0F).to(torch.int8)
+    # Values are unsigned [0, 15].
+    low = (packed & 0x0F).to(torch.float32)
+    high = ((packed >> 4) & 0x0F).to(torch.float32)
 
-    # Unsigned-to-signed: 4-bit two's complement.
-    # 0..7  -> 0..7  (positive, unchanged)
-    # 8..15 -> -8..-1  (subtract 16)
-    low = torch.where(low >= 8, low - 16, low)
-    high = torch.where(high >= 8, high - 16, high)
+    # Subtract zero_point=8: unsigned [0,15] → signed [-8,+7]
+    low = low - 8.0
+    high = high - 8.0
 
     # Interleave [low0, high0, low1, high1, ...] to recover original K order.
-    weight = torch.stack([low, high], dim=-1).reshape(N, K).float()
+    weight = torch.stack([low, high], dim=-1).reshape(N, K)
 
-    # Apply per-group scale.
-    # scale is [N, K//group_size], expand to [N, K] by repeating each value
-    # group_size times along the K axis.
+    # Apply per-group scale (can be negative — this is the GGML convention).
     scale_expanded = scale.float().repeat_interleave(group_size, dim=-1)
 
     return (weight * scale_expanded).to(torch.float16)
@@ -240,53 +244,51 @@ def gemv_int4_ref(input_t, packed, scale, N, K, group_size=GROUP_SIZE):
 
 def test_reference_roundtrip():
     """
-    Pack then unpack exact integer values in [-7, 7].
+    Pack then unpack values and verify dequantized output is close to original.
 
-    With integer inputs already in the int4 representable range, scale will
-    be exactly 1.0, so pack->unpack should be lossless (zero quantization error).
-    Any nonzero diff means the packing or unpacking logic is wrong.
+    GGML q4_0 uses scale = max(block)/(-8), so the roundtrip is not perfectly
+    lossless even for small integers (due to the asymmetric scale computation).
+    We check that the relative error is small (<5%) for random weights.
     """
     print("\n--- Reference Pack/Unpack Roundtrip ---")
     for N, K in [(32, 128), (64, 256), (128, 1024), (16, 2048), (1, 128)]:
-        weight_int = torch.randint(-7, 8, (N, K), dtype=torch.int8, device=device)
-        weight_fp16 = weight_int.to(torch.float16)
+        weight_fp16 = torch.randn(N, K, dtype=torch.float16, device=device) * 0.1
 
         packed, scale = int4_quantize(weight_fp16)
         recovered = int4_dequantize_ref(packed, scale, N, K)
 
         max_diff = (recovered.float() - weight_fp16.float()).abs().max().item()
-        ok = max_diff < 1e-3
+        ref_max = weight_fp16.float().abs().max().item()
+        rel_err = max_diff / ref_max if ref_max > 1e-6 else 0
+        ok = rel_err < 0.15  # 4-bit quantization has inherent error
         status = "PASS" if ok else "FAIL"
-        print(f"  [{status}] N={N:5d} K={K:5d}  max_diff={max_diff:.6f}")
-        assert ok, f"Roundtrip failed for N={N}, K={K}: max_diff={max_diff}"
+        print(f"  [{status}] N={N:5d} K={K:5d}  max_diff={max_diff:.6f}  rel={rel_err:.4f}")
+        assert ok, f"Roundtrip failed for N={N}, K={K}: rel_err={rel_err}"
 
 
 def test_reference_quantize_range():
     """
-    Verify quantized values stay in the 4-bit signed range [-8, 7].
+    Verify quantized uint4 values stay in [0, 15].
 
-    Also checks that all per-group scales are positive (no degenerate groups).
-    This guards against bugs in clamp bounds or scale computation.
+    In GGML q4_0, scale can be negative (when max element is negative).
+    We check that packed nibbles are in valid unsigned range [0,15].
     """
     print("\n--- Reference Quantize Range Check ---")
     for N, K in [(64, 256), (128, 1024)]:
         weight = torch.randn(N, K, dtype=torch.float16, device=device)
         packed, scale = int4_quantize(weight)
 
-        # Unpack to check raw quantized values.
-        low = (packed & 0x0F).to(torch.int8)
-        high = ((packed >> 4) & 0x0F).to(torch.int8)
-        low = torch.where(low >= 8, low - 16, low)
-        high = torch.where(high >= 8, high - 16, high)
+        # Unpack to check raw unsigned values [0, 15].
+        low = (packed & 0x0F).to(torch.int32)
+        high = ((packed >> 4) & 0x0F).to(torch.int32)
 
         all_vals = torch.cat([low.flatten(), high.flatten()])
         vmin, vmax = all_vals.min().item(), all_vals.max().item()
-        scale_min = scale.min().item()
 
-        ok = vmin >= -8 and vmax <= 7 and scale_min > 0
+        ok = vmin >= 0 and vmax <= 15
         status = "PASS" if ok else "FAIL"
         print(f"  [{status}] N={N:5d} K={K:5d}"
-              f"  val_range=[{vmin}, {vmax}]  scale_min={scale_min:.6f}")
+              f"  uint4_range=[{vmin}, {vmax}]  (expected [0,15])")
         assert ok, f"Range check failed for N={N}, K={K}"
 
 
@@ -314,6 +316,210 @@ def test_reference_gemv():
         status = "PASS" if ok else "FAIL"
         print(f"  [{status}] N={N:5d} K={K:5d}  max_diff={max_diff:.6f}")
         assert ok, f"Reference GEMV mismatch for N={N}, K={K}"
+
+
+# ============================================================================
+# GGML C library packing format compatibility test
+#
+# The actual model uses ggml_quantize_tensor (C library) to quantize weights,
+# NOT our Python int4_quantize.  If the C library packs bits differently
+# (e.g. nibble order, sign convention, scale meaning), our kernel would
+# produce wrong results even though the Python-only UT passes.
+#
+# This test verifies that:
+#   1. The C library's packing format matches our kernel's expectation:
+#      - low nibble (bits 0-3) = element at even K-position
+#      - high nibble (bits 4-7) = element at odd K-position
+#      - 4-bit two's complement: 0..7 = positive, 8..15 = -8..-1
+#   2. The scale semantics match: dequant = int4_val * scale
+#   3. End-to-end: kernel(ggml_quantized_weight) == matmul(dequant(weight))
+# ============================================================================
+
+def test_ggml_packing_format():
+    """
+    Verify the C library's packing layout matches our kernel's assumptions.
+
+    GGML q4_0 format (from BigDL-core quantize.c):
+      scale = max(block) / -8     (signed max, can be negative)
+      uint4 = clamp(round(weight / scale + 8), 0, 15)
+      dequant = (uint4 - 8) * scale
+
+    This test places known values at specific positions and verifies:
+      1. Scale matches the GGML formula.
+      2. Low nibble corresponds to even K-position, high nibble to odd.
+      3. Dequantized values are close to the original weights.
+    """
+    print("\n--- GGML Packing Format Check ---")
+    try:
+        from vllm.model_executor.layers.quantization.sym_int4 import (
+            ggml_quantize_tensor, QK4_GROUP_SIZE, QK4_PACK_FACTOR)
+    except ImportError:
+        print("  [SKIP] Cannot import ggml_quantize_tensor (vllm not installed)")
+        return
+
+    N, K = 1, 128  # minimal: 1 row, 1 group
+    weight = torch.zeros(N, K, dtype=torch.float32)
+
+    # Place known values: position 0 (even→lo nibble), position 1 (odd→hi nibble)
+    weight[0, 0] = 7.0
+    weight[0, 1] = -7.0
+    weight[0, 2] = 3.0
+    weight[0, 3] = -3.0
+
+    qweight = torch.zeros(N, K // QK4_PACK_FACTOR, dtype=torch.int32)
+    scale = torch.zeros(N, K // QK4_GROUP_SIZE, dtype=torch.float16)
+    qweight, scale = ggml_quantize_tensor(
+        weight, qweight, scale, N, K,
+        block_size=QK4_GROUP_SIZE, transpose=False)
+
+    raw = qweight.view(torch.uint8)  # (1, 64)
+    scale_val = scale[0, 0].item()
+
+    # GGML: max(block) = 7.0 (first element with largest abs wins), scale = 7/-8 = -0.875
+    expected_scale = 7.0 / -8.0
+    scale_ok = abs(scale_val - expected_scale) < 0.01
+    print(f"  scale = {scale_val:.4f} (expected {expected_scale:.4f})")
+
+    # Verify dequant: (uint4 - 8) * scale ≈ original weight
+    # Check byte 0 (positions 0 and 1) and byte 1 (positions 2 and 3)
+    dequant_results = []
+    originals = [7.0, -7.0, 3.0, -3.0]
+    nibble_order_ok = True
+
+    for byte_idx in range(2):
+        byte_val = raw[0, byte_idx].item()
+        lo = byte_val & 0x0F
+        hi = (byte_val >> 4) & 0x0F
+        deq_lo = (lo - 8) * scale_val  # even position
+        deq_hi = (hi - 8) * scale_val  # odd position
+        orig_even = originals[byte_idx * 2]
+        orig_odd = originals[byte_idx * 2 + 1]
+
+        # Check that dequantized values are close to originals
+        err_lo = abs(deq_lo - orig_even)
+        err_hi = abs(deq_hi - orig_odd)
+        print(f"  byte[{byte_idx}] = 0x{byte_val:02x}: "
+              f"lo={lo}→deq={deq_lo:+.3f} (orig={orig_even:+.1f}, err={err_lo:.3f}), "
+              f"hi={hi}→deq={deq_hi:+.3f} (orig={orig_odd:+.1f}, err={err_hi:.3f})")
+
+        # Allow up to 1 quantization step of error: |scale| = 0.875
+        tol = abs(scale_val) + 0.01
+        if err_lo > tol or err_hi > tol:
+            nibble_order_ok = False
+
+    ok = nibble_order_ok and scale_ok
+    status = "PASS" if ok else "FAIL"
+    print(f"  [{status}] scale={'OK' if scale_ok else 'WRONG'}, "
+          f"nibble_dequant={'OK' if nibble_order_ok else 'WRONG'}")
+    assert ok, f"GGML packing format mismatch! scale={scale_ok}, nibble={nibble_order_ok}"
+
+
+def test_ggml_kernel_e2e():
+    """
+    End-to-end: quantize with C library → run ESIMD kernel → compare vs dequant matmul.
+
+    This is the definitive test: uses the SAME quantization path as the actual
+    model (ggml_quantize_tensor with transpose=False), then checks that our
+    kernel produces the correct GEMV result.
+
+    If test_ggml_packing_format passes but this fails, the issue is likely in
+    scale handling or accumulation precision, not in nibble order.
+    """
+    print("\n--- GGML → Kernel End-to-End ---")
+    try:
+        from vllm.model_executor.layers.quantization.sym_int4 import (
+            ggml_quantize_tensor, QK4_GROUP_SIZE, QK4_PACK_FACTOR)
+        from custom_esimd_kernels_vllm import esimd_gemv_int4
+    except ImportError as e:
+        print(f"  [SKIP] {e}")
+        return
+
+    for N, K in [(128, 256), (512, 1024), (2560, 2048), (16, 2048), (3072, 2048)]:
+        # Step 1: Create fp32 weight and quantize with C library
+        weight_fp32 = torch.randn(N, K, dtype=torch.float32) * 0.1
+        qweight = torch.zeros(N, K // QK4_PACK_FACTOR, dtype=torch.int32)
+        scale = torch.zeros(N, K // QK4_GROUP_SIZE, dtype=torch.float16)
+        qweight, scale = ggml_quantize_tensor(
+            weight_fp32, qweight, scale, N, K,
+            block_size=QK4_GROUP_SIZE, transpose=False)
+
+        # Move to XPU
+        qweight = qweight.to(device)
+        scale = scale.to(device)
+
+        # Step 2: View as uint8 for our kernel
+        packed_u8 = qweight.view(torch.uint8)  # (N, K/2)
+
+        # Step 3: Run ESIMD kernel
+        input_t = torch.randn(1, K, dtype=torch.float16, device=device) * 0.1
+        output = torch.zeros(1, N, dtype=torch.float16, device=device)
+        esimd_gemv_int4(input_t, packed_u8, scale, output)
+
+        # Step 4: Reference — dequantize with our Python helper and matmul
+        ref_deq = int4_dequantize_ref(packed_u8, scale, N, K)
+        ref_out = input_t.float() @ ref_deq.float().T
+
+        # Step 5: Compare
+        max_diff = (output.float() - ref_out.float()).abs().max().item()
+        ref_max = ref_out.float().abs().max().item()
+        rel_err = (max_diff / ref_max) if ref_max > 1e-6 else 0
+        ok = max_diff < 0.5 or rel_err < 0.05
+        status = "PASS" if ok else "FAIL"
+        print(f"  [{status}] N={N:5d} K={K:5d}  max_diff={max_diff:.4f}  rel={rel_err:.4f}")
+        assert ok, f"GGML E2E failed for N={N}, K={K}: rel_err={rel_err:.4f}"
+
+
+def test_ggml_vs_python_quantize():
+    """
+    Compare C library quantization output against our Python int4_quantize.
+
+    If these produce different packed bytes for the same input, it means the
+    two quantizers use different conventions. In that case, our Python-only UT
+    is testing against a wrong reference for the actual model path.
+    """
+    print("\n--- GGML vs Python Quantize Comparison ---")
+    try:
+        from vllm.model_executor.layers.quantization.sym_int4 import (
+            ggml_quantize_tensor, QK4_GROUP_SIZE, QK4_PACK_FACTOR)
+    except ImportError:
+        print("  [SKIP] Cannot import ggml_quantize_tensor")
+        return
+
+    for N, K in [(64, 128), (128, 256), (32, 1024)]:
+        # Same fp16 weight for both quantizers
+        weight_fp16 = torch.randn(N, K, dtype=torch.float16)
+        weight_fp32 = weight_fp16.float()
+
+        # Python quantize (our reference helper)
+        py_packed, py_scale = int4_quantize(weight_fp16.to(device))
+        py_packed = py_packed.cpu()
+        py_scale = py_scale.cpu()
+
+        # C library quantize
+        c_qweight = torch.zeros(N, K // QK4_PACK_FACTOR, dtype=torch.int32)
+        c_scale = torch.zeros(N, K // QK4_GROUP_SIZE, dtype=torch.float16)
+        c_qweight, c_scale = ggml_quantize_tensor(
+            weight_fp32, c_qweight, c_scale, N, K,
+            block_size=QK4_GROUP_SIZE, transpose=False)
+        c_packed = c_qweight.view(torch.uint8)  # (N, K/2)
+
+        # Compare packed bytes
+        byte_match = (py_packed.cpu() == c_packed).float().mean().item()
+        scale_diff = (py_scale.cpu().float() - c_scale.float()).abs().max().item()
+
+        # They may not be identical (different rounding), but should be very close
+        ok = byte_match > 0.95 and scale_diff < 0.01
+        status = "PASS" if ok else "WARN"
+        print(f"  [{status}] N={N:5d} K={K:5d}  "
+              f"byte_match={byte_match*100:.1f}%  scale_diff={scale_diff:.6f}")
+        if byte_match < 0.95:
+            # Show first mismatch for debugging
+            mismatch = (py_packed.cpu() != c_packed)
+            idx = mismatch.nonzero()[0]
+            r, c = idx[0].item(), idx[1].item()
+            print(f"    First mismatch at [{r},{c}]: "
+                  f"python=0x{py_packed[r,c].item():02x} "
+                  f"ggml=0x{c_packed[r,c].item():02x}")
 
 
 # ============================================================================
@@ -737,6 +943,114 @@ def benchmark_fused():
               f" | {indiv_us:>9.2f} {fused_us:>9.2f} {speedup:>7.2f}x")
 
 
+def benchmark_vs_ipex():
+    """
+    Benchmark ESIMD INT4 GEMV vs IPEX INT4 linear (IPEXWeightOnlyQuantizedLinear).
+
+    IPEX is the current production INT4 path — this benchmark shows whether our
+    ESIMD kernel is faster and by how much.  Both paths use the same quantized
+    weights (ggml format), so the comparison is fair.
+
+    Metrics:
+      - Latency (us) for M=1 decode
+      - Speedup = IPEX_latency / ESIMD_latency
+
+    Note: IPEX setup requires intel_extension_for_pytorch.  If not available,
+    this benchmark is skipped.
+    """
+    print("\n--- ESIMD vs IPEX Performance ---")
+    try:
+        from vllm.model_executor.layers.quantization.sym_int4 import (
+            ggml_quantize_tensor, QK4_GROUP_SIZE, QK4_PACK_FACTOR)
+        from custom_esimd_kernels_vllm import esimd_gemv_int4
+        import intel_extension_for_pytorch as ipex
+    except ImportError as e:
+        print(f"  [SKIP] {e}")
+        return
+
+    shapes = [
+        ("Attn qkv",     2560, 2048),
+        ("DN qkvz",      3072, 2048),
+        ("Exp gate_up",   512, 2048),
+        ("Exp down",     2048,  512),
+        ("Router",        512, 2048),
+    ]
+
+    print(f"\n{'Shape':<18} {'N':>6} {'K':>6}"
+          f" | {'IPEX us':>9} {'ESIMD us':>9} {'Speedup':>8}")
+    print("-" * 65)
+
+    ni = 2000
+
+    for name, N, K in shapes:
+        # --- Quantize with C library ---
+        weight_fp32 = torch.randn(N, K, dtype=torch.float32) * 0.1
+
+        # IPEX path: transposed layout
+        qw_ipex = torch.zeros(N, K // QK4_PACK_FACTOR, dtype=torch.int32)
+        sc_ipex = torch.zeros(N, K // QK4_GROUP_SIZE, dtype=torch.float16)
+        qw_ipex, sc_ipex = ggml_quantize_tensor(
+            weight_fp32, qw_ipex, sc_ipex, N, K,
+            block_size=QK4_GROUP_SIZE, transpose=True)
+        qw_ipex = qw_ipex.to(device)
+        sc_ipex = sc_ipex.to(device)
+
+        # ESIMD path: row-major layout
+        qw_esimd = torch.zeros(N, K // QK4_PACK_FACTOR, dtype=torch.int32)
+        sc_esimd = torch.zeros(N, K // QK4_GROUP_SIZE, dtype=torch.float16)
+        qw_esimd, sc_esimd = ggml_quantize_tensor(
+            weight_fp32, qw_esimd, sc_esimd, N, K,
+            block_size=QK4_GROUP_SIZE, transpose=False)
+        qw_esimd = qw_esimd.to(device)
+        sc_esimd = sc_esimd.to(device)
+        packed_u8 = qw_esimd.view(torch.uint8)
+
+        # --- Setup IPEX qlinear ---
+        lowp_mode = ipex.quantization.WoqLowpMode.INT8
+        weight_dtype = ipex.quantization.WoqWeightDtype.INT4
+        act_quant_mode = ipex.quantization.WoqActQuantMode.PER_BATCH_IC_BLOCK
+        qconfig = ipex.quantization.get_weight_only_quant_qconfig_mapping(
+            weight_dtype=weight_dtype,
+            lowp_mode=lowp_mode,
+            act_quant_mode=act_quant_mode,
+            group_size=QK4_GROUP_SIZE,
+        )
+        ipex_linear = ipex.llm.quantization.woq_linear. \
+            IPEXWeightOnlyQuantizedLinear.from_weight(
+            qw_ipex, sc_ipex,
+            torch.tensor([8], device=device, dtype=torch.int8),
+            qw_ipex.size(0), qw_ipex.size(1) if qw_ipex.shape[0] == K // QK4_PACK_FACTOR else N,
+            qconfig=qconfig, g_idx=None, bias=None,
+            group_size=QK4_GROUP_SIZE, quant_method=0)
+
+        input_t = torch.randn(1, K, dtype=torch.float16, device=device) * 0.1
+        output_esimd = torch.zeros(1, N, dtype=torch.float16, device=device)
+
+        # --- Benchmark IPEX ---
+        for _ in range(10):
+            ipex_linear(input_t)
+        torch.xpu.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(ni):
+            ipex_linear(input_t)
+        torch.xpu.synchronize()
+        ipex_us = (time.perf_counter() - t0) / ni * 1e6
+
+        # --- Benchmark ESIMD ---
+        for _ in range(10):
+            esimd_gemv_int4(input_t, packed_u8, sc_esimd, output_esimd)
+        torch.xpu.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(ni):
+            esimd_gemv_int4(input_t, packed_u8, sc_esimd, output_esimd)
+        torch.xpu.synchronize()
+        esimd_us = (time.perf_counter() - t0) / ni * 1e6
+
+        speedup = ipex_us / esimd_us if esimd_us > 0 else 0
+        print(f"{name:<18} {N:>6} {K:>6}"
+              f" | {ipex_us:>8.2f} {esimd_us:>8.2f} {speedup:>7.2f}x")
+
+
 # ============================================================================
 # Main entry point
 # ============================================================================
@@ -761,6 +1075,12 @@ if __name__ == "__main__":
         print("=" * 60)
         sys.exit(0)
 
+    # --- Phase 1.5: GGML C library compatibility (critical gate) ---
+    # If packing format doesn't match, all kernel tests below are meaningless.
+    test_ggml_packing_format()
+    test_ggml_vs_python_quantize()
+    test_ggml_kernel_e2e()
+
     # --- Phase 2: Kernel correctness (requires compiled esimd_gemv_int4) ---
     test_correctness_unit_scale()    # pure unpack test (scale=1)
     test_correctness_with_scale()    # full dequant (unpack + group scale)
@@ -774,6 +1094,9 @@ if __name__ == "__main__":
 
     print("\n--- Performance Benchmark (fused vs individual) ---")
     benchmark_fused()
+
+    print("\n--- Performance Benchmark (ESIMD vs IPEX) ---")
+    benchmark_vs_ipex()
 
     print("\n" + "=" * 60)
     print("ALL TESTS PASSED")

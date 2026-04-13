@@ -9,23 +9,27 @@
 // It targets the Qwen3.5-122B-A10B model running on vLLM, where decode-phase
 // GEMV (batch size = 1) is the dominant latency contributor.
 //
-// ---- Weight format ----
+// ---- Weight format (GGML q4_0) ----
 //
-// Symmetric INT4, packed 2 values per uint8 byte:
+// Unsigned INT4 [0,15] with implicit zero_point=8, packed 2 values per byte:
 //   byte[i] = (val[2i] & 0xF) | ((val[2i+1] & 0xF) << 4)
 //   Low nibble  (bits 0-3) = element at even K-position (2i)
 //   High nibble (bits 4-7) = element at odd  K-position (2i+1)
 //
-// Weight tensor shape: [N, K/2] uint8
+// Within each int32 (8 values): z-th value at bits [4*z : 4*z+3].
+// On little-endian, viewing int32 as uint8 gives the standard byte layout above.
+//
+// Weight tensor shape: [N, K/2] uint8 (equivalently [N, K/8] int32)
 //
 // ---- Scale format ----
 //
 // Per-group fp16 scale, one scale per GROUP_SIZE (128) elements along K:
 //   scale shape: [N, K / GROUP_SIZE]
+//   scale = max(block) / (-8)   — CAN BE NEGATIVE (from GGML convention)
 //
 // Dequantization formula (per element):
-//   int4_val ∈ [-8, 7]  (4-bit two's complement)
-//   fp16_weight = int4_val * group_scale
+//   uint4_val ∈ [0, 15]  (unsigned)
+//   fp16_weight = (uint4_val - 8) * scale
 //
 // ---- Key differences from FP8 GEMV (fp8_GEMV_v2.h) ----
 //
@@ -68,16 +72,20 @@ static constexpr int INT4_GROUP_SIZE = 128;
 // ============================================================================
 // INT4 unpacking:  uint8[VL/2]  →  two float[VL/2] vectors
 //
-// Each input byte contains two 4-bit signed integers:
-//   low nibble  (bits 0-3) = weight at even K-position
-//   high nibble (bits 4-7) = weight at odd  K-position
+// GGML q4_0 format (from BigDL-core quantize.c):
+//   - Each byte contains two unsigned 4-bit values [0, 15]:
+//     low nibble  (bits 0-3) = weight at even K-position
+//     high nibble (bits 4-7) = weight at odd  K-position
+//   - Implicit zero_point = 8 (not stored)
+//   - scale = max(block) / -8  (can be negative!)
+//   - Dequantization: fp_weight = (uint4_val - 8) * scale
 //
-// Signed conversion (4-bit two's complement):
-//   0..7   →  0..7    (positive, unchanged)
-//   8..15  → -8..-1   (subtract 16)
+// The subtraction of 8 maps unsigned [0,15] to signed [-8,7]:
+//   uint4=0 → -8,  uint4=8 → 0,  uint4=15 → +7
 //
 // The caller must pair wf_even with even-indexed input elements, and
 // wf_odd with odd-indexed input elements, to compute the correct dot product.
+// The caller also multiplies by the per-group scale (which may be negative).
 // ============================================================================
 
 template<int VL>
@@ -86,19 +94,16 @@ SYCL_ESIMD_FUNCTION inline void int4_dequant(
     simd<float, VL/2>& wf_even,
     simd<float, VL/2>& wf_odd) {
 
-    // Widen to int16 for arithmetic.
-    // (uint8 → uint16 first to avoid sign issues, then reinterpret as int16.)
-    simd<int16_t, VL/2> u16 = convert<int16_t>(convert<uint16_t>(raw));
+    // Widen to uint16 for nibble extraction.
+    simd<uint16_t, VL/2> u16 = convert<uint16_t>(raw);
 
-    // Low nibble → even-position weights.
-    simd<int16_t, VL/2> lo = u16 & 0x000F;
-    lo.merge(lo - 16, lo >= 8);   // unsigned [0,15] → signed [-8,7]
-    wf_even = convert<float>(lo);
+    // Low nibble → even-position weights: unsigned [0,15] → subtract 8 → [-8,7]
+    simd<uint16_t, VL/2> lo = u16 & 0x000F;
+    wf_even = convert<float>(lo) - 8.0f;
 
-    // High nibble → odd-position weights.
-    simd<int16_t, VL/2> hi = (u16 >> 4) & 0x000F;
-    hi.merge(hi - 16, hi >= 8);
-    wf_odd = convert<float>(hi);
+    // High nibble → odd-position weights: same treatment
+    simd<uint16_t, VL/2> hi = (u16 >> 4) & 0x000F;
+    wf_odd = convert<float>(hi) - 8.0f;
 }
 
 
