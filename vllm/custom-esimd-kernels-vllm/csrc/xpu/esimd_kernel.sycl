@@ -1,0 +1,281 @@
+#include <ATen/ATen.h>
+#include <ATen/Parallel.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/python.h>
+
+#include <cstdint>
+#include <sycl/sycl.hpp>
+
+#include "esimd_kernels/fp8_GEMV_v2.h"
+#include "esimd_kernels/qkv_split_norm_rope.h"
+#include "esimd_kernels/norm_gemv_fused.h"
+#include "esimd_kernels/fused_add_rms_norm.h"
+#include "esimd_kernels/resadd_norm_gemv_fused.h"
+#include "esimd_kernels/resadd_norm_gemv2_fused.h"
+
+#define EXTRACT_PTR(var, tensor) auto var = reinterpret_cast<uint8_t*>(tensor.data_ptr())
+
+// 0=E4M3, 1=E5M2
+inline int get_fp8_mode(const at::Tensor& weight) {
+    return (weight.scalar_type() == at::ScalarType::Float8_e5m2) ? 1 : 0;
+}
+
+// Get queue for the specific device (multi-card safe)
+static inline sycl::queue& get_device_queue(const at::Tensor& tensor) {
+    return c10::xpu::getCurrentXPUStream(tensor.device().index()).queue();
+}
+
+at::Tensor esimd_gemv_fp8_pern(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output,
+    int64_t N, int64_t K) {
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_w, weight);
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    GEMV_fp8_pern_host(p_in, p_w, p_sc, p_out, N, K, get_fp8_mode(weight), dpcpp_queue);
+    return output;
+}
+
+at::Tensor esimd_gemv_fp8_pern_fused2(
+    at::Tensor input,
+    at::Tensor w0, at::Tensor s0, at::Tensor o0, int64_t N0,
+    at::Tensor w1, at::Tensor s1, at::Tensor o1, int64_t N1,
+    int64_t K) {
+    EXTRACT_PTR(p_in, input);
+    EXTRACT_PTR(pw0, w0); EXTRACT_PTR(ps0, s0); EXTRACT_PTR(po0, o0);
+    EXTRACT_PTR(pw1, w1); EXTRACT_PTR(ps1, s1); EXTRACT_PTR(po1, o1);
+    auto& dpcpp_queue = get_device_queue(input);
+    uint8_t* wp[2] = {pw0, pw1};
+    uint8_t* sp[2] = {ps0, ps1};
+    uint8_t* op[2] = {po0, po1};
+    uint32_t ns[2] = {(uint32_t)N0, (uint32_t)N1};
+    GEMV_fp8_pern_fused_host<2>(p_in, wp, sp, op, ns, (uint32_t)K, get_fp8_mode(w0), dpcpp_queue);
+    return o0;
+}
+
+at::Tensor esimd_gemv_fp8_pern_fused3(
+    at::Tensor input,
+    at::Tensor w0, at::Tensor s0, at::Tensor o0, int64_t N0,
+    at::Tensor w1, at::Tensor s1, at::Tensor o1, int64_t N1,
+    at::Tensor w2, at::Tensor s2, at::Tensor o2, int64_t N2,
+    int64_t K) {
+    EXTRACT_PTR(p_in, input);
+    EXTRACT_PTR(pw0, w0); EXTRACT_PTR(ps0, s0); EXTRACT_PTR(po0, o0);
+    EXTRACT_PTR(pw1, w1); EXTRACT_PTR(ps1, s1); EXTRACT_PTR(po1, o1);
+    EXTRACT_PTR(pw2, w2); EXTRACT_PTR(ps2, s2); EXTRACT_PTR(po2, o2);
+    auto& dpcpp_queue = get_device_queue(input);
+    uint8_t* wp[3] = {pw0, pw1, pw2};
+    uint8_t* sp[3] = {ps0, ps1, ps2};
+    uint8_t* op[3] = {po0, po1, po2};
+    uint32_t ns[3] = {(uint32_t)N0, (uint32_t)N1, (uint32_t)N2};
+    GEMV_fp8_pern_fused_host<3>(p_in, wp, sp, op, ns, (uint32_t)K, get_fp8_mode(w0), dpcpp_queue);
+    return o0;
+}
+
+// ---- Per-tensor scale variants (N/K auto-detected from tensor shapes) ----
+
+at::Tensor esimd_gemv_fp8_pert(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output) {
+    int64_t N = weight.size(0);
+    int64_t K = weight.size(1);
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_w, weight);
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    GEMV_fp8_pert_host(p_in, p_w, p_sc, p_out, N, K, get_fp8_mode(weight), dpcpp_queue);
+    return output;
+}
+
+at::Tensor esimd_gemv_fp8_pert_fused2(
+    at::Tensor input,
+    at::Tensor w0, at::Tensor s0, at::Tensor o0,
+    at::Tensor w1, at::Tensor s1, at::Tensor o1) {
+    int64_t K = w0.size(1);
+    int64_t N0 = w0.size(0), N1 = w1.size(0);
+    EXTRACT_PTR(p_in, input);
+    EXTRACT_PTR(pw0, w0); EXTRACT_PTR(ps0, s0); EXTRACT_PTR(po0, o0);
+    EXTRACT_PTR(pw1, w1); EXTRACT_PTR(ps1, s1); EXTRACT_PTR(po1, o1);
+    auto& dpcpp_queue = get_device_queue(input);
+    uint8_t* wp[2] = {pw0, pw1};
+    uint8_t* sp[2] = {ps0, ps1};
+    uint8_t* op[2] = {po0, po1};
+    uint32_t ns[2] = {(uint32_t)N0, (uint32_t)N1};
+    GEMV_fp8_pert_fused_host<2>(p_in, wp, sp, op, ns, (uint32_t)K, get_fp8_mode(w0), dpcpp_queue);
+    return o0;
+}
+
+at::Tensor esimd_gemv_fp8_pert_fused3(
+    at::Tensor input,
+    at::Tensor w0, at::Tensor s0, at::Tensor o0,
+    at::Tensor w1, at::Tensor s1, at::Tensor o1,
+    at::Tensor w2, at::Tensor s2, at::Tensor o2) {
+    int64_t K = w0.size(1);
+    int64_t N0 = w0.size(0), N1 = w1.size(0), N2 = w2.size(0);
+    EXTRACT_PTR(p_in, input);
+    EXTRACT_PTR(pw0, w0); EXTRACT_PTR(ps0, s0); EXTRACT_PTR(po0, o0);
+    EXTRACT_PTR(pw1, w1); EXTRACT_PTR(ps1, s1); EXTRACT_PTR(po1, o1);
+    EXTRACT_PTR(pw2, w2); EXTRACT_PTR(ps2, s2); EXTRACT_PTR(po2, o2);
+    auto& dpcpp_queue = get_device_queue(input);
+    uint8_t* wp[3] = {pw0, pw1, pw2};
+    uint8_t* sp[3] = {ps0, ps1, ps2};
+    uint8_t* op[3] = {po0, po1, po2};
+    uint32_t ns[3] = {(uint32_t)N0, (uint32_t)N1, (uint32_t)N2};
+    GEMV_fp8_pert_fused_host<3>(p_in, wp, sp, op, ns, (uint32_t)K, get_fp8_mode(w0), dpcpp_queue);
+    return o0;
+}
+
+// ---- QKV Split + RMSNorm + RoPE fused kernel ----
+
+// Persistent cos/sin cache (allocated once, FP64 precision on host -> FP16 on device)
+// cos_sin_cache now passed directly from caller (no static cache needed)
+
+at::Tensor esimd_qkv_split_norm_rope(
+    at::Tensor qkv_state,
+    at::Tensor q_out,
+    at::Tensor gate_out,
+    at::Tensor k_out,
+    at::Tensor v_out,
+    at::Tensor norm_wq,
+    at::Tensor norm_wk,
+    at::Tensor positions,
+    int64_t q_heads, int64_t kv_heads, bool attn_output_gate,
+    int64_t rotary_dim,
+    at::Tensor cos_sin_cache) {
+
+    EXTRACT_PTR(p_qkv, qkv_state);
+    EXTRACT_PTR(p_q, q_out);
+    EXTRACT_PTR(p_gate, gate_out);
+    EXTRACT_PTR(p_k, k_out);
+    EXTRACT_PTR(p_v, v_out);
+    EXTRACT_PTR(p_nwq, norm_wq);
+    EXTRACT_PTR(p_nwk, norm_wk);
+    auto p_pos = reinterpret_cast<uint32_t*>(positions.data_ptr());
+    // cos_sin_cache: [max_pos, rotary_dim] fp16, interleaved [cos, sin] per position
+    auto p_cs = reinterpret_cast<sycl::half*>(cos_sin_cache.data_ptr());
+
+    uint32_t ntoks = qkv_state.size(0);
+    uint32_t hiddenDim = qkv_state.size(1);
+
+    auto& dpcpp_queue = get_device_queue(qkv_state);
+    qkv_split_norm_rope_host(
+        p_qkv, p_q, p_gate, p_k, p_v,
+        p_nwq, p_nwk, p_pos, p_cs,
+        ntoks, hiddenDim,
+        (uint32_t)q_heads, (uint32_t)kv_heads,
+        attn_output_gate, (uint32_t)rotary_dim, dpcpp_queue);
+    return q_out;
+}
+
+// ---- Fused ResidualAdd + RMSNorm + FP8 GEMV ----
+
+at::Tensor esimd_resadd_norm_gemv_fp8_pert(
+    at::Tensor hidden_states,  // [1, K] fp16
+    at::Tensor residual,       // [1, K] fp16 — updated in-place
+    at::Tensor norm_weight,    // [K] fp16 — Gemma (w+1.0)
+    at::Tensor gemv_weight,    // [N, K] FP8
+    at::Tensor gemv_scale,     // [1] float32
+    at::Tensor output,         // [1, N] fp16 — router logits
+    at::Tensor normed_out,     // [1, K] fp16 — normed hidden for experts
+    double eps)
+{
+    int N = (int)gemv_weight.size(0);
+    int K = (int)gemv_weight.size(1);
+    int fp8_mode = get_fp8_mode(gemv_weight);
+
+    auto& dpcpp_queue = get_device_queue(hidden_states);
+
+    resadd_norm_gemv_fp8_pert_host(
+        reinterpret_cast<fp16*>(hidden_states.data_ptr()),
+        reinterpret_cast<fp16*>(residual.data_ptr()),
+        reinterpret_cast<const fp16*>(norm_weight.data_ptr()),
+        reinterpret_cast<const uint8_t*>(gemv_weight.data_ptr()),
+        gemv_scale.data_ptr<float>(),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        reinterpret_cast<fp16*>(normed_out.data_ptr()),
+        N, K, (float)eps, fp8_mode,
+        dpcpp_queue);
+
+    return output;
+}
+
+// ---- Fused RMSNormGated + FP8 GEMV (out_proj) ----
+
+at::Tensor esimd_norm_gemv_fp8_pert(
+    at::Tensor x,             // [HV, V] fp16 — core_attn_out
+    at::Tensor z,             // [HV, V] fp16 — z_out
+    at::Tensor norm_weight,   // [V] fp16
+    at::Tensor gemv_weight,   // [N, K] FP8, K = HV*V
+    at::Tensor gemv_scale,    // [1] float32
+    at::Tensor output,        // [1, N] fp16
+    int64_t HV, int64_t V,
+    double eps)
+{
+    int N = (int)gemv_weight.size(0);
+    int fp8_mode = get_fp8_mode(gemv_weight);
+
+    auto& dpcpp_queue = get_device_queue(x);
+
+    norm_gemv_fp8_pert_host(
+        reinterpret_cast<const fp16*>(x.data_ptr()),
+        reinterpret_cast<const fp16*>(z.data_ptr()),
+        reinterpret_cast<const fp16*>(norm_weight.data_ptr()),
+        reinterpret_cast<const uint8_t*>(gemv_weight.data_ptr()),
+        gemv_scale.data_ptr<float>(),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        N, (int)HV, (int)V, (float)eps, fp8_mode,
+        dpcpp_queue);
+
+    return output;
+}
+
+// ---- Fused ResidualAdd + RMSNorm + 2-matrix FP8 GEMV ----
+
+at::Tensor esimd_resadd_norm_gemv2_fp8_pert(
+    at::Tensor hidden_states,
+    at::Tensor residual,
+    at::Tensor norm_weight,
+    at::Tensor w0, at::Tensor s0, at::Tensor o0,
+    at::Tensor w1, at::Tensor s1, at::Tensor o1,
+    double eps)
+{
+    int N0 = (int)w0.size(0);
+    int N1 = (int)w1.size(0);
+    int K = (int)w0.size(1);
+    int fp8_mode = get_fp8_mode(w0);
+    auto& dpcpp_queue = get_device_queue(hidden_states);
+
+    resadd_norm_gemv2_fp8_pert_host(
+        reinterpret_cast<fp16*>(hidden_states.data_ptr()),
+        reinterpret_cast<fp16*>(residual.data_ptr()),
+        reinterpret_cast<const fp16*>(norm_weight.data_ptr()),
+        reinterpret_cast<const uint8_t*>(w0.data_ptr()),
+        s0.data_ptr<float>(),
+        reinterpret_cast<fp16*>(o0.data_ptr()),
+        reinterpret_cast<const uint8_t*>(w1.data_ptr()),
+        s1.data_ptr<float>(),
+        reinterpret_cast<fp16*>(o1.data_ptr()),
+        N0, N1, K, (float)eps, fp8_mode,
+        dpcpp_queue);
+
+    return o0;
+}
+
+// ---- Fused Add + RMSNorm (Gemma-style, replace IPEX fused_add_rms_norm) ----
+
+at::Tensor esimd_fused_add_rms_norm(
+    at::Tensor hidden_states,  // [1, K] — input/output (normalized result)
+    at::Tensor residual,       // [1, K] — updated in-place
+    at::Tensor weight,         // [K] — Gemma weight (w+1.0)
+    double eps)
+{
+    int K = (int)hidden_states.size(-1);
+    auto& dpcpp_queue = get_device_queue(hidden_states);
+
+    fused_add_rms_norm_host(
+        reinterpret_cast<fp16*>(hidden_states.data_ptr()),
+        reinterpret_cast<fp16*>(residual.data_ptr()),
+        reinterpret_cast<const fp16*>(weight.data_ptr()),
+        K, (float)eps, dpcpp_queue);
+
+    return hidden_states;
+}

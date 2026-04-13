@@ -29,9 +29,7 @@ RUN apt-get update -y && \
         numactl \
         wget \
         vim \
-        linux-libc-dev \
-    # Install Intel GPU runtime packages
-        intel-oneapi-dpcpp-ct=2025.2.0-517 && \
+        linux-libc-dev && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 
@@ -43,6 +41,7 @@ RUN apt-get update -y && \
 WORKDIR /llm
 COPY ./patches/vllm_for_multi_arc.patch /tmp/
 # COPY ./patches/miner-u.patch /tmp/
+COPY ./custom-esimd-kernels-vllm /tmp/custom-esimd-kernels-vllm
 
 # Set environment variables early
 ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/local/lib/"
@@ -62,6 +61,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     # pip install --no-cache-dir arctic-inference==0.1.1 && \
     export CPATH=/opt/intel/oneapi/dpcpp-ct/2025.2/include/:${CPATH} && \
     pip install --no-build-isolation . 
+
+# Install unified custom ESIMD kernels (6 modules: core, lgrf, moe, gemm, eagle, moe_batch)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /tmp/custom-esimd-kernels-vllm && \
+    TORCH_XPU_ARCH_LIST=bmg-g21 MAX_JOBS=1 python3 setup.py bdist_wheel && \
+    pip install dist/*.whl --no-deps && \
+    rm -rf /tmp/custom-esimd-kernels-vllm
 
 # Clone + patch miner-U
 RUN --mount=type=cache,target=/root/.cache/pip \
