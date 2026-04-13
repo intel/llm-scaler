@@ -708,3 +708,74 @@ GPU, enough even with FP16 KV cache.
   — "Add OpenVINO backend" (merged March 14, 2026)
 - [OpenVINO 2026.1 Release](https://www.phoronix.com/news/OpenVINO-2026.1-Released)
   — llama.cpp OpenVINO backend benchmarks (8B INT4: 12.8 tok/s on Core Ultra 7 iGPU)
+
+# 07. Gemma 4 26B-A4B INT4 AutoRound: Model Architecture Not Supported on vLLM v0.14.0
+
+**Affected:** llm-scaler vLLM v0.14.0 (all patches)  
+**Model:** `intel/gemma-4-26B-A4B-it-int4-mixed-AutoRound` (~15 GB INT4)  
+**Target:** Lunar Lake 32GB (Intel Arc 140V, 28.57 GiB shared memory)
+
+## Problem
+
+Gemma 4 introduces a new model architecture (`Gemma4ForCausalLM`) with:
+- 128 fine-grained experts, top-8 routing (26B total / 4B active)
+- Custom `Gemma4Router` with RMSNorm preprocessing + per-dimension scaling
+- Dual attention: alternating sliding-window (local) and global attention
+- Custom GELU-activated FFN in MoE experts
+
+vLLM v0.14.0 does not have the `gemma4` model implementation. The model registry
+only includes up to `Gemma3ForConditionalGeneration`. Attempting to load Gemma 4
+will fail with an architecture-not-found error.
+
+## Gemma 4 Support Timeline
+
+- **vLLM v0.19.0+**: Native Gemma 4 support added (April 2, 2026)
+- **Requires:** `transformers>=5.5.0`
+
+## AutoRound MoE Path Analysis
+
+If Gemma 4 architecture support were backported, the INT4 AutoRound MoE path
+on XPU would work as follows:
+
+1. `AutoRoundConfig.get_quant_method()` detects XPU → calls `apply_ipex_quant_layer()`
+2. For `LinearBase` layers: creates `IPEXConfig` → `IPEXGPTQLinearMethod` ✓
+3. For `FusedMoE` layers: `apply_ipex_quant_layer()` currently returns `None` (missing)
+   - **Fix needed:** add FusedMoE handling that delegates to `XPUGPTQMarlinMoEMethod`
+   - `XPUGPTQMarlinMoEMethod` uses IPEX's `GatedMLPMOE` — no marlin_shuffle needed
+   - This bypasses the marlin_shuffle DEVICE_LOST crash documented in issue #glm4_moe_lite
+
+4. The ~15 GB model on 28.57 GiB GPU leaves ~13.5 GiB headroom — sufficient for
+   KV cache with `--max-model-len 4096`
+
+## Required Changes (when upgrading to vLLM v0.19.0+)
+
+1. **Upgrade vLLM base** from v0.14.0 to v0.19.0+
+2. **Rebase patches** for the new codebase
+3. **Add FusedMoE to `apply_ipex_quant_layer`** in `auto_round.py`:
+   ```python
+   # In AutoRoundConfig.apply_ipex_quant_layer():
+   if isinstance(layer, FusedMoE) and "gptq" in self.packing_format:
+       config = IPEXConfig(
+           method="gptq",
+           weight_bits=weight_bits,
+           group_size=group_size,
+           is_qweight_sym=sym,
+           dynamic={},
+           full_config={},
+       )
+       return XPUGPTQMarlinMoEMethod(config, layer.moe_config)
+   ```
+
+## Workaround
+
+Use models already supported on vLLM v0.14.0 XPU:
+- **GPT-OSS-20B** (MXFP4): works on Lunar Lake, even dual-instance
+- **Qwen3.5-35B-A3B**: if GPTQ-quantized variant is available
+- **GLM-4.7-Flash**: FP8 online quantization (but marlin_shuffle crash for INT4)
+
+## References
+
+- [vLLM Gemma 4 announcement](https://vllm-project.github.io/2026/04/02/gemma4.html)
+- [vLLM Gemma 4 recipe](https://docs.vllm.ai/projects/recipes/en/latest/Google/Gemma4.html)
+- [Intel AutoRound Gemma 4](https://huggingface.co/Intel/gemma-4-26B-A4B-it-int4-mixed-AutoRound)
+- [marlin_shuffle DEVICE_LOST issue](https://github.com/intel/llm-scaler/blob/main/issues/glm4_moe_lite_int4_xpu_marlin_shuffle.md)
