@@ -20,6 +20,9 @@ from custom_esimd_kernels_vllm.ops import (
     esimd_gemv_fp8_pert,
     esimd_gemv_fp8_pert_fused2,
     esimd_gemv_fp8_pert_fused3,
+    # INT4 GEMV ops
+    esimd_gemv_int4,
+    esimd_gemv_int4_fused2,
     esimd_qkv_split_norm_rope,
     esimd_gdn_conv_fused,
     esimd_fused_add_rms_norm,

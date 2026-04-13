@@ -87,6 +87,48 @@ def esimd_gemv_fp8_pert_fused3(
     return _ops.esimd_gemv_fp8_pert_fused3(input, w0, s0, o0, w1, s1, o1, w2, s2, o2)
 
 
+# ---- INT4 GEMV with per-group scale (group_size=128) ----
+
+def esimd_gemv_int4(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Symmetric INT4 weight GEMV with per-group scale, FP32 accumulation.
+
+    Computes: output[1, N] = input[1, K] @ dequant(weight)^T
+    where dequant unpacks int4 values and multiplies by per-group scale.
+
+    input:        [1, K]            fp16  — input activation vector
+    weight:       [N, K/2]          uint8 — packed INT4 (2 values per byte,
+                                            low nibble = even index)
+    weight_scale: [N, K/128]        fp16  — per-group scale (group_size=128)
+    output:       [1, N]            fp16  — pre-allocated output buffer
+
+    N inferred from weight.size(0), K inferred from weight.size(1) * 2.
+    K must be a multiple of 128 (group_size).
+    """
+    return _ops.esimd_gemv_int4(input, weight, weight_scale, output)
+
+
+def esimd_gemv_int4_fused2(
+    input: torch.Tensor,
+    w0: torch.Tensor, s0: torch.Tensor, o0: torch.Tensor,
+    w1: torch.Tensor, s1: torch.Tensor, o1: torch.Tensor,
+) -> torch.Tensor:
+    """Fused 2-matrix INT4 GEMV: two GEMVs sharing the same input, single kernel.
+
+    Saves one kernel launch overhead (~20-50 us) compared to two separate calls.
+    Used for GDN input projection: in_proj_qkvz (w0) + in_proj_ba (w1).
+
+    input: [1, K]       fp16 — shared input
+    w0:    [N0, K/2]    uint8, s0: [N0, K/128] fp16, o0: [1, N0] fp16
+    w1:    [N1, K/2]    uint8, s1: [N1, K/128] fp16, o1: [1, N1] fp16
+
+    Returns o0. Both o0 and o1 are written.
+    """
+    return _ops.esimd_gemv_int4_fused2(input, w0, s0, o0, w1, s1, o1)
+
+
 # ---- Fused QKV Split + RMSNorm + RoPE ----
 
 def esimd_qkv_split_norm_rope(

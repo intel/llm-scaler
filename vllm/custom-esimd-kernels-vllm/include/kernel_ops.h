@@ -174,6 +174,24 @@ at::Tensor esimd_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output);
 
+// ======================== INT4 GEMV ========================
+// Symmetric INT4 weight GEMV with per-group scale (group_size=128).
+// Optimized for decode (M=1). FP32 accumulation → fp16 output.
+// Weight: [N, K/2] uint8 (packed, 2 int4 per byte, low nibble = even index).
+// Scale:  [N, K/128] fp16 (per-group). N and K inferred from tensor shapes.
+
+// Single INT4 GEMV: output[1,N] = input[1,K] @ dequant(weight[N,K/2])^T
+at::Tensor esimd_gemv_int4(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output);
+
+// Fused 2-matrix INT4 GEMV: two GEMVs sharing the same input, single kernel submit.
+// Used for GDN input projection (in_proj_qkvz + in_proj_ba).
+at::Tensor esimd_gemv_int4_fused2(
+    at::Tensor input,
+    at::Tensor w0, at::Tensor s0, at::Tensor o0,
+    at::Tensor w1, at::Tensor s1, at::Tensor o1);
+
 // MoE grouped GEMM — FP8 E5M2 with per-tensor scale (one scalar per expert)
 at::Tensor esimd_moe_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor scale,

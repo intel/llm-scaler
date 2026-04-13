@@ -39,6 +39,18 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
         "Tensor w2, Tensor s2, Tensor o2) -> Tensor");
   m.impl("esimd_gemv_fp8_pert_fused3", torch::kXPU, &esimd_gemv_fp8_pert_fused3);
 
+  // INT4 GEMV with per-group scale (group_size=128)
+  // Weight [N, K/2] uint8 packed, scale [N, K/128] fp16. N/K auto-detected.
+  m.def("esimd_gemv_int4(Tensor input, Tensor weight, Tensor weight_scale, "
+        "Tensor output) -> Tensor");
+  m.impl("esimd_gemv_int4", torch::kXPU, &esimd_gemv_int4);
+
+  // Fused 2-matrix INT4 GEMV (GDN in_proj_qkvz + in_proj_ba)
+  m.def("esimd_gemv_int4_fused2(Tensor input, "
+        "Tensor w0, Tensor s0, Tensor o0, "
+        "Tensor w1, Tensor s1, Tensor o1) -> Tensor");
+  m.impl("esimd_gemv_int4_fused2", torch::kXPU, &esimd_gemv_int4_fused2);
+
   // Fused QKV Split + RMSNorm + RoPE
   m.def("esimd_qkv_split_norm_rope(Tensor qkv_state, "
         "Tensor q_out, Tensor gate_out, Tensor k_out, Tensor v_out, "
