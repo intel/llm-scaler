@@ -10,6 +10,7 @@
 // ============================================================================
 
 #include <torch/extension.h>
+#include <pybind11/stl.h>
 
 namespace omni_xpu {
 namespace gguf {
@@ -17,11 +18,16 @@ namespace gguf {
     torch::Tensor dequantize_q8_0(const torch::Tensor& input, torch::ScalarType dtype);
     torch::Tensor dequantize_q4_k(const torch::Tensor& input, torch::ScalarType dtype);
     torch::Tensor dequantize_q6_k(const torch::Tensor& input, torch::ScalarType dtype);
+    std::vector<torch::Tensor> dequantize_batch(
+        const std::vector<torch::Tensor>& inputs,
+        const std::vector<std::string>& formats,
+        torch::ScalarType dtype);
 }
 namespace norm {
     torch::Tensor rms_norm(torch::Tensor weight, torch::Tensor input, double eps);
     torch::Tensor layer_norm(torch::Tensor input, std::optional<torch::Tensor> weight, std::optional<torch::Tensor> bias, double eps);
     void fused_add_rms_norm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
+    torch::Tensor fused_rms_norm_linear(torch::Tensor input, torch::Tensor norm_weight, torch::Tensor proj_weight, double eps);
 }
 namespace svdq {
     torch::Tensor dequantize_svdq_w4(const torch::Tensor& packed, const torch::Tensor& scales, torch::ScalarType out_dtype);
@@ -36,6 +42,14 @@ namespace svdq {
 }
 namespace rotary {
     torch::Tensor rotary_emb(const torch::Tensor& x, const torch::Tensor& cos_cache, const torch::Tensor& sin_cache, int64_t seq_len, int64_t heads);
+}
+namespace sdp {
+    torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v);
+}
+namespace linear {
+    torch::Tensor onednn_w8a16_fp8(torch::Tensor input, torch::Tensor weight, torch::Tensor scale_w, std::optional<torch::Tensor> bias);
+    void fp8_cache_clear();
+    std::tuple<int64_t, int64_t, int64_t> fp8_cache_stats();
 }
 }
 
@@ -60,7 +74,15 @@ PYBIND11_MODULE(_C, m) {
     gguf.def("dequantize_q6_k", &omni_xpu::gguf::dequantize_q6_k,
         "Dequantize Q6_K tensor (210 bytes/block -> 256 elements)",
         py::arg("input"), py::arg("dtype") = torch::kFloat16);
-    
+
+    gguf.def("dequantize_batch", &omni_xpu::gguf::dequantize_batch,
+        "Batch dequantize multiple tensors in fewer kernel launches.\n"
+        "Groups tensors by format, concatenates, launches one kernel per format group,\n"
+        "then splits outputs. Reduces N submissions to num_format_types submissions.\n"
+        "Input: inputs=[tensor1, tensor2, ...], formats=['q4_0', 'q8_0', ...], dtype\n"
+        "Output: list of dequantized tensors in same order as inputs",
+        py::arg("inputs"), py::arg("formats"), py::arg("dtype") = torch::kFloat16);
+
     // Normalization
     auto norm = m.def_submodule("norm", "Normalization kernels");
     
@@ -75,6 +97,14 @@ PYBIND11_MODULE(_C, m) {
     norm.def("fused_add_rms_norm", &omni_xpu::norm::fused_add_rms_norm,
         "Fused Add + RMSNorm using ESIMD optimization (in-place: residual += input, input = rmsnorm(residual) * weight)",
         py::arg("input"), py::arg("residual"), py::arg("weight"), py::arg("eps") = 1e-6);
+
+    norm.def("fused_rms_norm_linear", &omni_xpu::norm::fused_rms_norm_linear,
+        "Fused RMSNorm + Linear projection in single C++ call.\n"
+        "Chains norm and matmul without Python roundtrip, keeping normalized data in L3 cache.\n"
+        "output = RMSNorm(input, norm_weight, eps) @ proj_weight.T\n"
+        "Input: input [M, K], norm_weight [K], proj_weight [N, K]\n"
+        "Output: [M, N]",
+        py::arg("input"), py::arg("norm_weight"), py::arg("proj_weight"), py::arg("eps") = 1e-6);
 
     // SVDQuant W4A4 Dequantization/Quantization (nunchaku)
     auto svdq = m.def_submodule("svdq", "SVDQuant W4A4 dequantization and quantization kernels for nunchaku");
@@ -148,4 +178,27 @@ PYBIND11_MODULE(_C, m) {
         "Output: [total_rows, head_dim] same dtype as x",
         py::arg("x"), py::arg("cos_cache"), py::arg("sin_cache"),
         py::arg("seq_len"), py::arg("heads"));
+
+    // FP8 Linear (oneDNN W8A16)
+    auto linear = m.def_submodule("linear", "FP8 linear kernels");
+    linear.def("onednn_w8a16_fp8", &omni_xpu::linear::onednn_w8a16_fp8,
+        "FP8 GEMM: W8A16 matmul with E4M3/E5M2 weights via oneDNN.\n"
+        "Input: x [M, K] fp16/bf16, weight [N, K] float8, scales [N] f32\n"
+        "Output: [M, N] same dtype as x",
+        py::arg("input"), py::arg("weight"), py::arg("scale_w"), py::arg("bias") = py::none());
+    linear.def("fp8_cache_clear", &omni_xpu::linear::fp8_cache_clear,
+        "Clear FP8 primitive cache");
+    linear.def("fp8_cache_stats", &omni_xpu::linear::fp8_cache_stats,
+        "Return FP8 cache stats as (hits, misses, size)");
+
+    // Scaled Dot-Product Attention (ESIMD Flash Attention)
+    auto sdp = m.def_submodule("sdp", "Scaled dot-product attention kernels");
+    sdp.def("sdp", &omni_xpu::sdp::sdp,
+        "ESIMD Flash Attention for Intel XPU\n"
+        "Input: q/k/v [B, L, H, D] fp16/bf16 contiguous on XPU, D in {64, 128}\n"
+        "Constraints: B == 1\n"
+        "V is automatically per-head scaled to prevent fp16 accumulator overflow.\n"
+        "Returns: (output, has_nonfinite) where has_nonfinite is True if kernel\n"
+        "detected inf/nan (e.g. degenerate softmax), signaling SDPA fallback needed.",
+        py::arg("q"), py::arg("k"), py::arg("v"));
 }
