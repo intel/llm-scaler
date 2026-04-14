@@ -66,7 +66,7 @@ struct ResAddNormGEMV_int4_pert_kernel {
             sq.select<8,1>(0)  += sq.select<8,1>(8);
             sq.select<4,1>(0)  += sq.select<4,1>(4);
             sq.select<2,1>(0)  += sq.select<2,1>(2);
-            sum_sq += sq[0] + sq[1];
+            sum_sq += (float)sq[0] + (float)sq[1];
         }
 
         float inv_rms = sycl::ext::intel::esimd::rsqrt(
