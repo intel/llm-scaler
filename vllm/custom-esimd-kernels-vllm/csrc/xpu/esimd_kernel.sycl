@@ -12,6 +12,7 @@
 #include "esimd_kernels/fused_add_rms_norm.h"
 #include "esimd_kernels/resadd_norm_gemv_fused.h"
 #include "esimd_kernels/resadd_norm_gemv2_fused.h"
+#include "esimd_kernels/rms_norm_gated.h"
 
 #define EXTRACT_PTR(var, tensor) auto var = reinterpret_cast<uint8_t*>(tensor.data_ptr())
 
@@ -261,6 +262,27 @@ at::Tensor esimd_resadd_norm_gemv2_fp8_pert(
 }
 
 // ---- Fused Add + RMSNorm (Gemma-style, replace IPEX fused_add_rms_norm) ----
+
+at::Tensor esimd_rms_norm_gated(
+    at::Tensor x,       // [rows, V]
+    at::Tensor z,       // [rows, V]
+    at::Tensor weight,  // [V]
+    at::Tensor output,  // [rows, V]
+    double eps)
+{
+    int rows = (int)x.size(0);
+    int V = (int)x.size(1);
+    auto& dpcpp_queue = get_device_queue(x);
+
+    rms_norm_gated_host(
+        reinterpret_cast<const fp16*>(x.data_ptr()),
+        reinterpret_cast<const fp16*>(z.data_ptr()),
+        reinterpret_cast<const fp16*>(weight.data_ptr()),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        rows, V, (float)eps, dpcpp_queue);
+
+    return output;
+}
 
 at::Tensor esimd_fused_add_rms_norm(
     at::Tensor hidden_states,  // [1, K] — input/output (normalized result)

@@ -185,6 +185,21 @@ def esimd_fused_add_rms_norm(
     return _ops.esimd_fused_add_rms_norm(hidden_states, residual, weight, eps)
 
 
+def esimd_rms_norm_gated(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """ESIMD RMSNormGated: output = rmsnorm(x) * weight * silu(z).
+
+    x, z: [rows, V] fp16. weight: [V] fp16. output: [rows, V] fp16.
+    Single kernel replaces ~6 PyTorch dispatches (87us → ~5us).
+    """
+    return _ops.esimd_rms_norm_gated(x, z, weight, output, eps)
+
+
 def esimd_resadd_norm_gemv_fp8_pert(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
