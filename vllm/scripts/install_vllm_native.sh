@@ -38,10 +38,29 @@ else
     export MAX_JOBS=8
 fi
 
+# ============================================================
+# GPU detection — identify Intel iGPU platform
+# ============================================================
+detect_intel_gpu() {
+    local gpu_id
+    gpu_id=$(lspci -nn | grep -i 'vga\|3d\|display' | grep -oP '8086:\K[0-9a-fA-F]+' | head -1)
+    case "${gpu_id,,}" in
+        64a0)           echo "lunar_lake $gpu_id" ;;
+        7d55|7dd5|7d40|7d45) echo "meteor_lake $gpu_id" ;;
+        7d51|7dd1|7d41|7d67) echo "arrow_lake $gpu_id" ;;
+        e211|e210)      echo "arc_pro_b60 $gpu_id" ;;
+        56a0)           echo "arc_a770 $gpu_id" ;;
+        *)              echo "unknown $gpu_id" ;;
+    esac
+}
+
+read -r PLATFORM GPU_ID <<< "$(detect_intel_gpu)"
+
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN} vLLM XPU Native Install (llm-scaler)${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
+echo "  Platform:      ${PLATFORM} (8086:${GPU_ID})"
 echo "  RAM detected:  ${TOTAL_RAM_GB}GB"
 echo "  Build jobs:    MAX_JOBS=${MAX_JOBS}"
 echo ""
@@ -229,17 +248,69 @@ apt-get install -y --no-install-recommends \
 echo -e "${GREEN}[1/8] System dependencies installed.${NC}"
 echo ""
 
+# ── xe vs i915 driver check ─────────────────────────────────
+if lsmod | grep -q "^xe "; then
+    echo -e "${GREEN}  xe driver loaded — good.${NC}"
+elif lsmod | grep -q "^i915 "; then
+    echo -e "${YELLOW}  i915 driver loaded instead of xe.${NC}"
+    if [ "$PLATFORM" = "meteor_lake" ] || [ "$PLATFORM" = "arrow_lake" ]; then
+        echo -e "${YELLOW}  For best SYCL/oneAPI support, switch to the xe driver:${NC}"
+        echo ""
+        echo -e "    Add to GRUB: ${GREEN}i915.force_probe=!${GPU_ID} xe.force_probe=${GPU_ID}${NC}"
+        echo ""
+        echo -e "${YELLOW}  Then: sudo update-grub && sudo reboot${NC}"
+        echo -e "${YELLOW}  The install will continue, but XPU features may not work until you switch.${NC}"
+    else
+        echo -e "${YELLOW}  For best SYCL support, switch to xe driver.${NC}"
+    fi
+fi
+
+# ── Memory-based recommendations ────────────────────────────
+GPU_UTIL_RECOMMEND="0.8"
+if [ "$TOTAL_RAM_GB" -le 16 ]; then
+    echo -e "${YELLOW}  ${TOTAL_RAM_GB}GB RAM — only small models (≤8B) will fit.${NC}"
+    echo -e "${YELLOW}  Use --gpu-memory-utilization 0.6 and --quantization int4.${NC}"
+    GPU_UTIL_RECOMMEND="0.6"
+elif [ "$TOTAL_RAM_GB" -le 32 ]; then
+    echo -e "${GREEN}  ${TOTAL_RAM_GB}GB RAM — good for 8B-14B models with INT4/FP8.${NC}"
+    GPU_UTIL_RECOMMEND="0.7"
+else
+    echo -e "${GREEN}  ${TOTAL_RAM_GB}GB RAM — plenty for most models up to 14B FP16.${NC}"
+fi
+echo ""
+
 # ============================================================
 # Phase 2: Create Python 3.12 virtual environment
 # ============================================================
 echo -e "${YELLOW}[2/8] Setting up Python environment...${NC}"
 
+# Detect Python version — PyTorch XPU requires Python 3.10-3.12
+# Ubuntu 25.04+ may ship Python 3.13+ which is too new for PyTorch XPU wheels
+PY_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "unknown")
+echo "  System Python: $PY_VERSION"
+
+VENV_PYTHON="python3.12"
+if command -v python3.12 &>/dev/null; then
+    echo "  Found python3.12 for venv."
+elif python3 -c "import sys; sys.exit(0 if sys.version_info[:2] <= (3,12) else 1)" 2>/dev/null; then
+    VENV_PYTHON="python3"
+    echo "  System Python $PY_VERSION is compatible with PyTorch XPU."
+else
+    echo -e "${YELLOW}  Python $PY_VERSION is too new for PyTorch XPU (needs <=3.12).${NC}"
+    echo "  Installing Python 3.12..."
+    apt-get install -y python3.12 python3.12-dev python3.12-venv 2>&1 | tail -3
+    if ! command -v python3.12 &>/dev/null; then
+        echo -e "${RED}  Cannot install Python 3.12. PyTorch XPU requires Python <=3.12.${NC}"
+        exit 1
+    fi
+fi
+
 VLLM_VENV="$REAL_HOME/vllm-venv"
 if [ -d "$VLLM_VENV" ] && [ -f "$VLLM_VENV/bin/python" ]; then
-    echo "  Python 3.12 venv already exists at $VLLM_VENV"
+    echo "  Python venv already exists at $VLLM_VENV"
 else
-    echo "  Creating Python 3.12 virtual environment at $VLLM_VENV..."
-    sudo -u "$REAL_USER" python3.12 -m venv "$VLLM_VENV"
+    echo "  Creating Python virtual environment at $VLLM_VENV..."
+    sudo -u "$REAL_USER" $VENV_PYTHON -m venv "$VLLM_VENV"
 fi
 
 # Activate venv — all pip/python commands below use Python 3.12
@@ -270,10 +341,23 @@ export VLLM_TARGET_DEVICE=xpu
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 # Source oneAPI if available
+# Temporarily relax strict mode because setvars.sh has unbound variables
+# and non-zero exits internally that conflict with set -e
 if [ -f /opt/intel/oneapi/setvars.sh ]; then
-    source /opt/intel/oneapi/setvars.sh --force 2>/dev/null || true
+    set +e
+    source /opt/intel/oneapi/setvars.sh --force > /tmp/oneapi_init.log 2>&1 || true
+    set -e
+    grep -E "^::|initialized" /tmp/oneapi_init.log || true
+    rm -f /tmp/oneapi_init.log
 else
     echo -e "${RED}  Warning: /opt/intel/oneapi/setvars.sh not found. Build may fail.${NC}"
+fi
+
+# Fix MKL library path — PyTorch's bundled MKL stubs use relative RPATHs that
+# break inside venvs. Preload the real oneAPI MKL to avoid runtime errors.
+if [ -n "${MKLROOT:-}" ] && [ -f "$MKLROOT/lib/libmkl_core.so.2" ]; then
+    export LD_PRELOAD="${MKLROOT}/lib/libmkl_core.so.2:${MKLROOT}/lib/libmkl_intel_thread.so.2:${MKLROOT}/lib/libmkl_intel_lp64.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
+    echo "  MKL preloaded from $MKLROOT"
 fi
 
 # Add DPCPP include path for vLLM compilation
@@ -359,6 +443,20 @@ else
         echo -e "${RED}  vLLM install failed. Check errors above.${NC}"
         echo "  Retry: cd $VLLM_DIR && MAX_JOBS=$MAX_JOBS pip install --no-build-isolation ."
         exit 1
+    fi
+fi
+
+# Patch xpu_worker.py: disable CCL all_reduce warmup for single-GPU
+# oneCCL's KVS init fails on devices without wired Ethernet (e.g. handhelds).
+# The all_reduce warmup is unnecessary for single-GPU (TP=1).
+XPU_WORKER=$(python -c "import vllm; import os; print(os.path.join(os.path.dirname(vllm.__file__), 'v1/worker/xpu_worker.py'))" 2>/dev/null || true)
+if [ -n "$XPU_WORKER" ] && [ -f "$XPU_WORKER" ]; then
+    if grep -q "torch.distributed.all_reduce" "$XPU_WORKER"; then
+        echo "  Patching xpu_worker.py to disable CCL all_reduce warmup (single-GPU fix)..."
+        sed -i '/torch\.distributed\.all_reduce(/,/)/s/^/#/' "$XPU_WORKER"
+        echo "  xpu_worker.py patched."
+    else
+        echo "  xpu_worker.py already patched or no all_reduce found."
     fi
 fi
 
@@ -484,8 +582,12 @@ export VLLM_QUANTIZE_Q40_LIB="${Q40_LIB}"
 export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export LD_LIBRARY_PATH="\${LD_LIBRARY_PATH}:/usr/local/lib/"
+
+# Convenience aliases
+alias vllm-activate='source ${VLLM_VENV}/bin/activate && source /opt/intel/oneapi/setvars.sh --force 2>/dev/null && export VLLM_TARGET_DEVICE=xpu'
+alias oneapi='source /opt/intel/oneapi/setvars.sh --force'
 VLLM_ENV
-    echo "  Added vLLM environment to $BASHRC"
+    echo "  Added vLLM environment + aliases to $BASHRC"
 else
     echo "  vLLM env vars already in ~/.bashrc, skipping."
 fi
@@ -504,27 +606,38 @@ echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN} Installation Complete!${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
-echo "  RAM:        ${TOTAL_RAM_GB}GB"
-echo "  MAX_JOBS:   ${MAX_JOBS}"
-echo "  vLLM:       ${INSTALL_DIR}/vllm"
-echo "  XPU kernels: ${INSTALL_DIR}/vllm-xpu-kernels"
-echo "  Venv:       $VLLM_VENV"
+echo "  Platform:     ${PLATFORM} (8086:${GPU_ID})"
+echo "  RAM:          ${TOTAL_RAM_GB}GB"
+echo "  MAX_JOBS:     ${MAX_JOBS}"
+echo "  vLLM:         ${INSTALL_DIR}/vllm"
+echo "  XPU kernels:  ${INSTALL_DIR}/vllm-xpu-kernels"
+echo "  Venv:         $VLLM_VENV"
 echo ""
-echo "  To use vLLM, open a new terminal (or source ~/.bashrc) then:"
+echo "  Quick start:"
+echo "    vllm-activate"
+echo "    vllm serve <model> \\"
+echo "        --tensor-parallel-size 1 \\"
+echo "        --gpu-memory-utilization ${GPU_UTIL_RECOMMEND} \\"
+echo "        --enforce-eager \\"
+echo "        --quantization fp8 \\"
+echo "        --host 127.0.0.1 --port 8000"
 echo ""
-echo "    # Serve a model"
-echo "    vllm serve /path/to/model --device xpu"
-echo ""
-echo "    # With memory tuning for iGPU shared memory"
-echo "    vllm serve /path/to/model --device xpu \\"
-echo "        --gpu-memory-utilization 0.6 \\"
-echo "        --enforce-eager"
-echo ""
+echo "  Recommended models:"
 if [ "$TOTAL_RAM_GB" -le 16 ]; then
-    echo -e "${YELLOW}  Note: 16GB RAM limits you to ~4B-8B models.${NC}"
-    echo -e "${YELLOW}  Recommended: Qwen3.5-4B, Phi-4-mini, or similar.${NC}"
+    echo "    Qwen/Qwen3-8B --quantization int4     (fits in ${TOTAL_RAM_GB}GB)"
 elif [ "$TOTAL_RAM_GB" -le 32 ]; then
-    echo -e "${YELLOW}  Note: 32GB shared memory supports up to ~20B MoE models.${NC}"
-    echo -e "${YELLOW}  Recommended: gpt-oss-20b (MXFP4), Qwen3.5-4B.${NC}"
+    echo "    Qwen/Qwen3-8B --quantization fp8      (best balance)"
+    echo "    Qwen/Qwen3-14B --quantization int4     (needs INT4)"
+else
+    echo "    Qwen/Qwen3-8B --quantization fp8      (best balance)"
+    echo "    Qwen/Qwen3-14B --quantization int4     (needs INT4)"
+    echo "    Qwen/Qwen3-8B                          (FP16, no quant loss)"
+fi
+
+if [ "$PLATFORM" = "meteor_lake" ] && lsmod | grep -q "^i915 "; then
+    echo ""
+    echo -e "  ${YELLOW}⚠ IMPORTANT: Switch to xe driver for XPU support:${NC}"
+    echo -e "    Add to GRUB: ${GREEN}i915.force_probe=!${GPU_ID} xe.force_probe=${GPU_ID}${NC}"
+    echo "    Then: sudo update-grub && sudo reboot"
 fi
 echo ""
