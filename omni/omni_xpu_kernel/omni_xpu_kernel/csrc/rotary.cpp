@@ -126,15 +126,19 @@ void rotary_emb_kernel(
     constexpr int HALF_HD = HD / 2;
     constexpr int N_PAIR_BLOCKS = HALF_HD / BS;  // number of blocks of BS pairs
 
-    sycl::range<1> global_size(total_rows);
-    sycl::range<1> local_size(1);
+    // Use workgroup size 16 for better EU occupancy (power-of-2 preferred on Intel GPUs)
+    constexpr int WG_SIZE = 16;
+    int64_t padded_rows = ((total_rows + WG_SIZE - 1) / WG_SIZE) * WG_SIZE;
+    sycl::range<1> global_size(padded_rows);
+    sycl::range<1> local_size(WG_SIZE);
 
     auto cgf = [&](sycl::handler& handle) {
         handle.parallel_for(
             sycl::nd_range<1>(global_size, local_size),
             [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
                 const int row = item.get_global_id(0);
-                
+                if (row >= total_rows) return;
+
                 // Compute sequence position for this row
                 // Layout: x was [B, S, heads, HD] reshaped to [B*S*heads, HD]
                 // row = b * S * heads + s * heads + h

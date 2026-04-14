@@ -88,9 +88,40 @@ def dequantize_q6_k(
     return _get_native().dequantize_q6_k(input, dtype)
 
 
+def dequantize_batch(
+    inputs: list,
+    formats: list,
+    dtype: torch.dtype = torch.float16
+) -> list:
+    """
+    Batch dequantize multiple tensors with fewer kernel launches.
+
+    Groups tensors by format, concatenates data, launches one kernel per
+    format type, then splits outputs back. For N tensors of the same format,
+    this reduces N kernel submissions to 1.
+
+    Args:
+        inputs: List of uint8 tensors (quantized data on XPU)
+        formats: List of format strings ('q4_0', 'q8_0', 'q4_k', 'q6_k')
+        dtype: Output dtype (default: torch.float16)
+
+    Returns:
+        List of dequantized tensors in same order as inputs
+
+    Example:
+        outputs = gguf.dequantize_batch(
+            [tensor1, tensor2, tensor3],
+            ['q4_0', 'q4_0', 'q8_0'],
+            torch.float16
+        )
+    """
+    return _get_native().dequantize_batch(inputs, formats, dtype)
+
+
 __all__ = [
     'dequantize_q4_0',
     'dequantize_q8_0',
     'dequantize_q4_k',
     'dequantize_q6_k',
+    'dequantize_batch',
 ]
