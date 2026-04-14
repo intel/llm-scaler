@@ -262,6 +262,34 @@ def esimd_norm_gemv_fp8_pert(
         HV, V, eps)
 
 
+def esimd_norm_gemv_int4_pert(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    norm_weight: torch.Tensor,
+    gemv_weight: torch.Tensor,
+    gemv_scale: torch.Tensor,
+    output: torch.Tensor,
+    HV: int,
+    V: int,
+    eps: float,
+) -> torch.Tensor:
+    """Fused RMSNormGated + INT4 GEMV for GDN out_proj decode path.
+
+    Combines norm(x, z) + out_proj(normed) into a single kernel.
+    INT4 analogue of esimd_norm_gemv_fp8_pert.
+
+    x:            [HV, V] fp16 — core_attn_out
+    z:            [HV, V] fp16 — z_out
+    norm_weight:  [V] fp16 — RMSNorm weight
+    gemv_weight:  [N, K//8] int32 packed INT4, K = HV*V — out_proj weight
+    gemv_scale:   [N, K//128] fp16 — per-block INT4 scale
+    output:       [1, N] fp16 — pre-allocated output buffer
+    """
+    return _ops.esimd_norm_gemv_int4_pert(
+        x, z, norm_weight, gemv_weight, gemv_scale, output,
+        HV, V, eps)
+
+
 def esimd_gdn_conv_fused_seq(
     qkvz: torch.Tensor,
     conv_state: torch.Tensor,

@@ -12,6 +12,7 @@
 #include "esimd_kernels/fused_add_rms_norm.h"
 #include "esimd_kernels/resadd_norm_gemv_fused.h"
 #include "esimd_kernels/resadd_norm_gemv2_fused.h"
+#include "esimd_kernels/norm_gemv_int4.h"
 
 #define EXTRACT_PTR(var, tensor) auto var = reinterpret_cast<uint8_t*>(tensor.data_ptr())
 
@@ -258,6 +259,34 @@ at::Tensor esimd_resadd_norm_gemv2_fp8_pert(
         dpcpp_queue);
 
     return o0;
+}
+
+// ---- Fused RMSNormGated + INT4 GEMV (out_proj) ----
+
+at::Tensor esimd_norm_gemv_int4_pert(
+    at::Tensor x,             // [HV, V] fp16 — core_attn_out
+    at::Tensor z,             // [HV, V] fp16 — z_out
+    at::Tensor norm_weight,   // [V] fp16
+    at::Tensor gemv_weight,   // [N, K/8] int32 packed, K = HV*V
+    at::Tensor gemv_scale,    // [N, K/128] fp16 per-block
+    at::Tensor output,        // [1, N] fp16
+    int64_t HV, int64_t V,
+    double eps)
+{
+    int N = (int)gemv_weight.size(0);
+    auto& dpcpp_queue = get_device_queue(x);
+
+    norm_gemv_int4_host(
+        reinterpret_cast<const fp16*>(x.data_ptr()),
+        reinterpret_cast<const fp16*>(z.data_ptr()),
+        reinterpret_cast<const fp16*>(norm_weight.data_ptr()),
+        gemv_weight.data_ptr<int32_t>(),
+        reinterpret_cast<const fp16*>(gemv_scale.data_ptr()),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        N, (int)HV, (int)V, (float)eps,
+        dpcpp_queue);
+
+    return output;
 }
 
 // ---- Fused Add + RMSNorm (Gemma-style, replace IPEX fused_add_rms_norm) ----
