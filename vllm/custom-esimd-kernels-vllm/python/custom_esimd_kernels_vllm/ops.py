@@ -216,6 +216,37 @@ def esimd_resadd_norm_gemv_fp8_pert(
         gemv_weight, gemv_scale, output, normed_out, eps)
 
 
+def esimd_resadd_norm_gemv_int4_pert(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    gemv_weight: torch.Tensor,
+    gemv_scale: torch.Tensor,
+    output: torch.Tensor,
+    normed_out: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Fused ResidualAdd + RMSNorm + INT4 GEMV.
+
+    Combines post_attention_layernorm + MoE router GEMV (INT4 quantized):
+      1. residual = hidden_states + residual  (in-place)
+      2. normed = rmsnorm(residual) * norm_weight
+      3. output = normed @ dequant(int4_weight^T) (per-block scale)
+      4. normed_out = normed  (for MoE expert consumption)
+
+    hidden_states: [1, K] fp16
+    residual:      [1, K] fp16 (updated in-place)
+    norm_weight:   [K] fp16
+    gemv_weight:   [N, K//8] int32 packed INT4
+    gemv_scale:    [N, K//128] fp16 — per-block scale
+    output:        [1, N] fp16 — router logits
+    normed_out:    [1, K] fp16 — normed hidden for experts
+    """
+    return _ops.esimd_resadd_norm_gemv_int4_pert(
+        hidden_states, residual, norm_weight,
+        gemv_weight, gemv_scale, output, normed_out, eps)
+
+
 def esimd_resadd_norm_gemv2_fp8_pert(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,

@@ -24,6 +24,7 @@ from custom_esimd_kernels_vllm.ops import (
     esimd_gdn_conv_fused,
     esimd_fused_add_rms_norm,
     esimd_resadd_norm_gemv_fp8_pert,
+    esimd_resadd_norm_gemv_int4_pert,
     esimd_resadd_norm_gemv2_fp8_pert,
     esimd_norm_gemv_fp8_pert,
     esimd_norm_gemv_int4_pert,
