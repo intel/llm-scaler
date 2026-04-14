@@ -17,12 +17,14 @@
  * The kernel reads qkvz/ba at correct offsets for sequential layout.
  * Everything else (conv1d, GDN, state update, z extraction) is identical.
  *
- * Thread→qkvz offset mapping for sequential layout (64 elements each):
- *   tid 0..7:   q region → head=tid/2, offset = head*K + (tid%2)*64
- *   tid 8..15:  k region → head=(tid-8)/2, offset = H*K + head*K + ((tid-8)%2)*64
- *   tid 16..31: v region → vhv=(tid-16)/2, offset = 2*H*K + vhv*V + ((tid-16)%2)*64
+ * Thread→qkvz offset mapping for sequential layout:
+ *   tid 0..7:   q region (64 elem each) → head=tid/2, offset = head*K + (tid%2)*64
+ *   tid 8..15:  k region (64 elem each) → head=(tid-8)/2, offset = H*K + head*K + ((tid-8)%2)*64
+ *   tid 16..31: v region
+ *     non-double_v (HV<=8): 64 elem each → vhv=(tid-16)/2, offset = 2*H*K + vhv*V + ((tid-16)%2)*64
+ *     double_v    (HV>8):  128 elem each → vhv=tid-16,     offset = 2*H*K + vhv*V (lo) / +64 (hi)
  *
- * z is at offset: 2*H*K + HV*V + hv*V + half*64
+ * z is at offset: 2*H*K + HV*V + hv*V [+ half*64]
  *
  * ba sequential layout:
  *   b_col = hv (lane within b_all)
@@ -113,6 +115,7 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
     fp16* __restrict__ z_out_ptr,
     int N, int H, int HV, int gdn_K, int gdn_V,
     float attn_scale, int64_t conv_stride0, int64_t ssm_stride0,
+    int inline_conv_shift,   // 1 = do conv_state shift inline (safe when N*HV<=32)
     nd_item<3>& ndi)
 {
     slm_init<2048>();
@@ -124,68 +127,101 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
     const int heads_per_group = HV / H;
     const int i_h = hv / heads_per_group;
 
+    // double_v: v-threads handle 128 elements each instead of 64
+    const bool double_v = (HV > (32 - 4 * H) / 2);  // true when HV > 8
+
     const int conv_idx = conv_state_indices_ptr[seq_idx];
     const int ssm_idx = ssm_state_indices_ptr[seq_idx];
 
     // ---- Sequential layout base offsets ----
+    const int dim = 2 * H * gdn_K + HV * gdn_V;  // conv_state row width
     const int q_base = 0;
     const int k_base = H * gdn_K;
     const int v_base = 2 * H * gdn_K;
     const int z_base = v_base + HV * gdn_V;
 
-    // ---- Compute qkvz read offset for this thread (SEQUENTIAL layout) ----
-    int qkvz_offset;
+    // ---- Compute qkvz read offset and conv_state chunk_start ----
+    int qkvz_offset = 0;
+    int chunk_start = 0;
+    int qkvz_offset_hi = 0;
+    int chunk_start_hi = 0;
+
     if (tid < 2 * H) {
-        // q region: tid 0..(2*H-1)
+        // q region: tid 0..(2*H-1), 64 elements each
         int q_head = tid / 2;
         qkvz_offset = q_base + q_head * gdn_K + (tid & 1) * 64;
+        chunk_start = qkvz_offset;
     } else if (tid < 4 * H) {
-        // k region: tid (2*H)..(4*H-1)
+        // k region: tid (2*H)..(4*H-1), 64 elements each
         int k_tid = tid - 2 * H;
         int k_head = k_tid / 2;
         qkvz_offset = k_base + k_head * gdn_K + (k_tid & 1) * 64;
+        chunk_start = qkvz_offset;
+    } else if (double_v) {
+        // v region (double): tid (4*H)..31, 128 elements each (one full v_head)
+        int v_tid = tid - 4 * H;
+        int v_hv = v_tid;
+        qkvz_offset = v_base + v_hv * gdn_V;
+        qkvz_offset_hi = qkvz_offset + 64;
+        chunk_start = qkvz_offset;
+        chunk_start_hi = chunk_start + 64;
     } else {
-        // v region: tid (4*H)..(32-1)
+        // v region (original): tid (4*H)..31, 64 elements each (half v_head)
         int v_tid = tid - 4 * H;
         int v_hv = v_tid / 2;
         qkvz_offset = v_base + v_hv * gdn_V + (v_tid & 1) * 64;
+        chunk_start = qkvz_offset;
     }
 
-    // conv_state is in mixed_qkv dim order, NOT interleaved.
-    // For sequential layout, the thread's conv_state chunk matches qkvz_offset.
-    const int chunk_start = qkvz_offset;
-
-    // ---- Phase 1: Conv1d (all 32 threads, 64 dims each) ----
+    // ---- Phase 1: Conv1d ----
     const fp16* qkvz_row = qkvz_ptr + (int64_t)seq_idx * qkvz_stride0;
     fp16* cstate_base = conv_state_ptr + (int64_t)conv_idx * conv_stride0;
 
-    // Read x from qkvz at mapped offset (contiguous 64 fp16)
+    // -- lo chunk (all threads) --
     simd<fp16, 64> x_fp16 = block_load<fp16, 64>(qkvz_row + qkvz_offset);
     simd<float, 64> x_f32 = x_fp16;
 
-    // State and weight are in sequential dim order (chunk_start)
-    simd<float, 64> s0 = block_load<fp16, 64>(cstate_base + 0 * 2048 + chunk_start);
-    simd<float, 64> s1 = block_load<fp16, 64>(cstate_base + 1 * 2048 + chunk_start);
-    simd<float, 64> s2 = block_load<fp16, 64>(cstate_base + 2 * 2048 + chunk_start);
+    simd<float, 64> s0 = block_load<fp16, 64>(cstate_base + 0 * dim + chunk_start);
+    simd<float, 64> s1 = block_load<fp16, 64>(cstate_base + 1 * dim + chunk_start);
+    simd<float, 64> s2 = block_load<fp16, 64>(cstate_base + 2 * dim + chunk_start);
 
     simd<fp16, 256> w_raw = block_load<fp16, 256>(conv_weight_ptr + (int64_t)chunk_start * 4);
-    simd<float, 64> w0 = w_raw.select<64, 4>(0);
-    simd<float, 64> w1 = w_raw.select<64, 4>(1);
-    simd<float, 64> w2 = w_raw.select<64, 4>(2);
-    simd<float, 64> w3 = w_raw.select<64, 4>(3);
-
-    simd<float, 64> bias = block_load<fp16, 64>(conv_bias_ptr + chunk_start);
-    simd<float, 64> conv_result = s0 * w0 + s1 * w1 + s2 * w2 + x_f32 * w3 + bias;
+    simd<float, 64> conv_result =
+        s0 * w_raw.select<64, 4>(0) + s1 * w_raw.select<64, 4>(1) +
+        s2 * w_raw.select<64, 4>(2) + x_f32 * w_raw.select<64, 4>(3) +
+        (simd<float, 64>)block_load<fp16, 64>(conv_bias_ptr + chunk_start);
 
     // SiLU
     {
-        simd<float, 64> neg_r = -conv_result;
-        simd<float, 64> exp_neg = sycl::ext::intel::esimd::exp(neg_r);
-        simd<float, 64> sigmoid_val = 1.0f / (1.0f + exp_neg);
-        conv_result = conv_result * sigmoid_val;
+        simd<float, 64> exp_neg = sycl::ext::intel::esimd::exp(-conv_result);
+        conv_result = conv_result / (1.0f + exp_neg);
     }
 
-    // Store q/k/v to SLM (only the relevant threads)
+    // -- hi chunk (v-threads only, when double_v) --
+    simd<fp16, 64> x_fp16_hi;
+    simd<float, 64> s0_hi, s1_hi, s2_hi, conv_result_hi;
+
+    if (double_v && tid >= 4 * H) {
+        x_fp16_hi = block_load<fp16, 64>(qkvz_row + qkvz_offset_hi);
+        simd<float, 64> x_f32_hi = x_fp16_hi;
+
+        s0_hi = block_load<fp16, 64>(cstate_base + 0 * dim + chunk_start_hi);
+        s1_hi = block_load<fp16, 64>(cstate_base + 1 * dim + chunk_start_hi);
+        s2_hi = block_load<fp16, 64>(cstate_base + 2 * dim + chunk_start_hi);
+
+        simd<fp16, 256> w_raw_hi = block_load<fp16, 256>(
+            conv_weight_ptr + (int64_t)chunk_start_hi * 4);
+        conv_result_hi =
+            s0_hi * w_raw_hi.select<64, 4>(0) + s1_hi * w_raw_hi.select<64, 4>(1) +
+            s2_hi * w_raw_hi.select<64, 4>(2) + x_f32_hi * w_raw_hi.select<64, 4>(3) +
+            (simd<float, 64>)block_load<fp16, 64>(conv_bias_ptr + chunk_start_hi);
+
+        // SiLU
+        simd<float, 64> exp_neg_hi = sycl::ext::intel::esimd::exp(-conv_result_hi);
+        conv_result_hi = conv_result_hi / (1.0f + exp_neg_hi);
+    }
+
+    // ---- Store q/k/v to SLM ----
     {
         const int q_tid_lo = 2 * i_h;
         if (tid == q_tid_lo)     slm_block_store<float, 64>(SLM_Q_LO_SEQ, conv_result);
@@ -195,9 +231,16 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
         if (tid == k_tid_lo)     slm_block_store<float, 64>(SLM_K_LO_SEQ, conv_result);
         if (tid == k_tid_lo + 1) slm_block_store<float, 64>(SLM_K_HI_SEQ, conv_result);
 
-        const int v_tid_lo = 4 * H + 2 * hv;
-        if (tid == v_tid_lo)     slm_block_store<float, 64>(SLM_V_SEQ, conv_result);
-        if (tid == v_tid_lo + 1) slm_block_store<float, 64>(SLM_V_SEQ + 256, conv_result);
+        if (double_v) {
+            if (tid == 4 * H + hv) {
+                slm_block_store<float, 64>(SLM_V_SEQ, conv_result);
+                slm_block_store<float, 64>(SLM_V_SEQ + 256, conv_result_hi);
+            }
+        } else {
+            const int v_tid_lo = 4 * H + 2 * hv;
+            if (tid == v_tid_lo)     slm_block_store<float, 64>(SLM_V_SEQ, conv_result);
+            if (tid == v_tid_lo + 1) slm_block_store<float, 64>(SLM_V_SEQ + 256, conv_result);
+        }
     }
 
     barrier();
@@ -298,29 +341,134 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
             out, simd<fp16, 4>(0.0f));
     }
 
-    // ---- Phase 3: conv_state shift + z extraction ----
-    if (conv_idx >= 0) {
-        simd<float, 64> s1_copy = block_load<fp16, 64>(cstate_base + 1 * 2048 + chunk_start);
-        simd<float, 64> s2_copy = block_load<fp16, 64>(cstate_base + 2 * 2048 + chunk_start);
-        block_store<fp16, 64>(cstate_base + 0 * 2048 + chunk_start, simd<fp16, 64>(s1_copy));
-        block_store<fp16, 64>(cstate_base + 1 * 2048 + chunk_start, simd<fp16, 64>(s2_copy));
-        block_store<fp16, 64>(cstate_base + 2 * 2048 + chunk_start, x_fp16);
+    // ---- Phase 3: conv_state shift (inline path, only when N*HV <= 32) ----
+    // When N*HV > 32, the shift is done by a separate kernel to avoid a
+    // cross-WG race: one WG's shift writes could land before another WG's
+    // Phase 1 reads for the same seq_idx.
+    // Uses register-cached s1, s2, x_fp16 from Phase 1 (not re-read from memory).
+    if (inline_conv_shift && conv_idx >= 0 && hv == 0) {
+        // lo chunk (all threads)
+        block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start, simd<fp16, 64>(s1));
+        block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start, simd<fp16, 64>(s2));
+        block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start, x_fp16);
+
+        // hi chunk (v-threads only, when double_v)
+        if (double_v && tid >= 4 * H) {
+            block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start_hi, simd<fp16, 64>(s1_hi));
+            block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start_hi, simd<fp16, 64>(s2_hi));
+            block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start_hi, x_fp16_hi);
+        }
     }
 
     // ---- z extraction: v-threads copy z from SEQUENTIAL qkvz to z_out ----
     if (tid >= 4 * H) {
         int v_tid = tid - 4 * H;
+        if (double_v) {
+            // One thread per v_head, two 64-element loads
+            int v_hv = v_tid;
+            int z_off = z_base + v_hv * gdn_V;
+
+            simd<fp16, 64> z_lo = block_load<fp16, 64>(qkvz_row + z_off);
+            simd<fp16, 64> z_hi = block_load<fp16, 64>(qkvz_row + z_off + 64);
+
+            fp16* z_dst = z_out_ptr + (int64_t)seq_idx * HV * gdn_V
+                        + (int64_t)v_hv * gdn_V;
+            block_store<fp16, 64>(z_dst, z_lo);
+            block_store<fp16, 64>(z_dst + 64, z_hi);
+        } else {
+            // Two threads per v_head (original)
+            int v_hv = v_tid / 2;
+            int v_half = v_tid & 1;
+            int z_qkvz_offset = z_base + v_hv * gdn_V + v_half * 64;
+
+            simd<fp16, 64> z_data = block_load<fp16, 64>(qkvz_row + z_qkvz_offset);
+
+            fp16* z_dst = z_out_ptr + (int64_t)seq_idx * HV * gdn_V
+                        + (int64_t)v_hv * gdn_V + v_half * 64;
+            block_store<fp16, 64>(z_dst, z_data);
+        }
+    }
+}
+
+/* ============================================================
+ * Conv-state shift kernel (sequential layout) — runs AFTER the
+ * main fused kernel to avoid cross-WG race on conv_state.
+ *
+ * Grid: N × 1 × WG_SIZE  (one WG per sequence)
+ * Each thread shifts its chunk: row0←row1, row1←row2, row2←x_new.
+ * conv_state dim = 2*H*K + HV*V (computed, not hardcoded).
+ * ============================================================ */
+ESIMD_INLINE void conv_state_shift_seq_kernel(
+    const fp16* __restrict__ qkvz_ptr,
+    int64_t qkvz_stride0,
+    fp16* __restrict__ conv_state_ptr,
+    const int* __restrict__ conv_state_indices_ptr,
+    int N, int H, int HV, int gdn_K, int gdn_V,
+    int64_t conv_stride0,
+    nd_item<3>& ndi)
+{
+    const int seq_idx = ndi.get_group(0);
+    const int tid = ndi.get_local_id(2);
+
+    const int conv_idx = conv_state_indices_ptr[seq_idx];
+    if (conv_idx < 0) return;
+
+    // Sequential layout offsets (same as main kernel)
+    const int dim = 2 * H * gdn_K + HV * gdn_V;
+    const bool double_v = (HV > (32 - 4 * H) / 2);
+    const int q_base = 0;
+    const int k_base = H * gdn_K;
+    const int v_base = 2 * H * gdn_K;
+
+    int qkvz_offset = 0;
+    int chunk_start = 0;
+    int qkvz_offset_hi = 0;
+    int chunk_start_hi = 0;
+
+    if (tid < 2 * H) {
+        int q_head = tid / 2;
+        qkvz_offset = q_base + q_head * gdn_K + (tid & 1) * 64;
+        chunk_start = qkvz_offset;
+    } else if (tid < 4 * H) {
+        int k_tid = tid - 2 * H;
+        int k_head = k_tid / 2;
+        qkvz_offset = k_base + k_head * gdn_K + (k_tid & 1) * 64;
+        chunk_start = qkvz_offset;
+    } else if (double_v) {
+        int v_tid = tid - 4 * H;
+        int v_hv = v_tid;
+        qkvz_offset = v_base + v_hv * gdn_V;
+        qkvz_offset_hi = qkvz_offset + 64;
+        chunk_start = qkvz_offset;
+        chunk_start_hi = chunk_start + 64;
+    } else {
+        int v_tid = tid - 4 * H;
         int v_hv = v_tid / 2;
-        int v_half = v_tid & 1;
+        qkvz_offset = v_base + v_hv * gdn_V + (v_tid & 1) * 64;
+        chunk_start = qkvz_offset;
+    }
 
-        // z in sequential layout: z_base + hv*V + half*64
-        int z_qkvz_offset = z_base + v_hv * gdn_V + v_half * 64;
+    const fp16* qkvz_row = qkvz_ptr + (int64_t)seq_idx * qkvz_stride0;
+    fp16* cstate_base = conv_state_ptr + (int64_t)conv_idx * conv_stride0;
 
-        simd<fp16, 64> z_data = block_load<fp16, 64>(qkvz_row + z_qkvz_offset);
+    // lo chunk (all threads)
+    simd<float, 64> s1_val = block_load<fp16, 64>(cstate_base + 1 * dim + chunk_start);
+    simd<float, 64> s2_val = block_load<fp16, 64>(cstate_base + 2 * dim + chunk_start);
+    simd<fp16, 64> x_new = block_load<fp16, 64>(qkvz_row + qkvz_offset);
 
-        fp16* z_dst = z_out_ptr + (int64_t)seq_idx * HV * gdn_V
-                    + (int64_t)v_hv * gdn_V + v_half * 64;
-        block_store<fp16, 64>(z_dst, z_data);
+    block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start, simd<fp16, 64>(s1_val));
+    block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start, simd<fp16, 64>(s2_val));
+    block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start, x_new);
+
+    // hi chunk (v-threads only, when double_v)
+    if (double_v && tid >= 4 * H) {
+        simd<float, 64> s1_hi = block_load<fp16, 64>(cstate_base + 1 * dim + chunk_start_hi);
+        simd<float, 64> s2_hi = block_load<fp16, 64>(cstate_base + 2 * dim + chunk_start_hi);
+        simd<fp16, 64> x_hi = block_load<fp16, 64>(qkvz_row + qkvz_offset_hi);
+
+        block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start_hi, simd<fp16, 64>(s1_hi));
+        block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start_hi, simd<fp16, 64>(s2_hi));
+        block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start_hi, x_hi);
     }
 }
 
@@ -349,6 +497,12 @@ inline void gdn_conv_fused_seq_host(
     sycl::queue& q)
 {
     constexpr int WG_SIZE = 32;
+    const int total_wgs = N * HV;
+
+    // When total WGs fit in a single scheduling wave (<=32), all WGs run
+    // concurrently so the hv==0 inline conv_state shift is safe.  Otherwise
+    // split into two kernels to avoid the cross-WG read/write race.
+    const int inline_shift = (total_wgs <= WG_SIZE) ? 1 : 0;
 
     sycl::nd_range<3> Range(
         sycl::range<3>(N, HV, WG_SIZE),
@@ -362,7 +516,26 @@ inline void gdn_conv_fused_seq_host(
                 A_log_ptr, dt_bias_ptr, ba_ptr, ba_stride0,
                 ssm_state_ptr, ssm_state_indices_ptr,
                 output_ptr, z_out_ptr,
-                N, H, HV, K, V, scale, conv_stride0, ssm_stride0, ndi);
+                N, H, HV, K, V, scale, conv_stride0, ssm_stride0,
+                inline_shift, ndi);
         });
     });
+
+    if (!inline_shift) {
+        // Separate kernel for conv_state shift — runs after kernel 1
+        // completes (in-order queue guarantees ordering).
+        sycl::nd_range<3> ShiftRange(
+            sycl::range<3>(N, 1, WG_SIZE),
+            sycl::range<3>(1, 1, WG_SIZE));
+
+        q.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(ShiftRange, [=](sycl::nd_item<3> ndi) SYCL_ESIMD_KERNEL {
+                conv_state_shift_seq_kernel(
+                    qkvz_ptr, qkvz_stride0, conv_state_ptr,
+                    conv_state_indices_ptr,
+                    N, H, HV, K, V,
+                    conv_stride0, ndi);
+            });
+        });
+    }
 }
