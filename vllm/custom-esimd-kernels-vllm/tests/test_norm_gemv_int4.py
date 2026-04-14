@@ -4,7 +4,7 @@ import torch
 import ctypes
 import os
 
-from custom_esimd_kernels_vllm import esimd_norm_gemv_int4_pert
+from custom_esimd_kernels_vllm import esimd_norm_gemv_int4_pert, esimd_norm_gemv_fp8_pert
 
 DEVICE = "xpu"
 CLIB_PATH = os.environ.get(
@@ -186,6 +186,154 @@ def test_norm_gemv_zero_z(HV, V, N):
     # silu(0) = 0 * sigmoid(0) = 0, so gated output = normed * 0 = 0
     assert output.cpu().abs().max().item() == 0.0, \
         f"Expected zero output for zero z gate, got max={output.cpu().abs().max().item()}"
+
+
+@pytest.mark.parametrize("HV,V,N", [
+    (8, 128, 256),
+    (8, 128, 2048),     # Qwen3-Next-80B: HV=8, V=128, out_proj N=2048
+])
+def test_norm_gemv_int4_vs_fp8(HV, V, N):
+    """INT4 and FP8 fused kernels should produce similar results from same fp16 weight."""
+    torch.manual_seed(42)
+    eps = 1e-6
+    K = HV * V
+
+    x = torch.randn(HV, V, dtype=torch.float16, device=DEVICE)
+    z = torch.randn(HV, V, dtype=torch.float16, device=DEVICE)
+    norm_weight = torch.randn(V, dtype=torch.float16, device=DEVICE) * 0.1 + 1.0
+
+    weight_fp16 = torch.randn(N, K, dtype=torch.float16)
+
+    # INT4 path: CPU quantize → kernel
+    qw, sc = cpu_quantize(weight_fp16, block_size=128)
+    qw = qw.to(DEVICE)
+    sc = sc.to(DEVICE)
+    out_int4 = torch.empty(1, N, dtype=torch.float16, device=DEVICE)
+    esimd_norm_gemv_int4_pert(x, z, norm_weight, qw, sc, out_int4, HV, V, eps)
+
+    # FP8 path: cast weight to fp8 → kernel
+    weight_xpu = weight_fp16.to(DEVICE)
+    # Re-scale weight so dequant(fp8) * scale ≈ original
+    fp8_scale_val = weight_xpu.float().abs().max().item() / 448.0  # E4M3 max ≈ 448
+    weight_scaled = (weight_xpu.float() / fp8_scale_val).to(torch.float8_e4m3fn)
+    scale_tensor = torch.tensor([fp8_scale_val], dtype=torch.float32, device=DEVICE)
+    out_fp8 = torch.empty(1, N, dtype=torch.float16, device=DEVICE)
+    esimd_norm_gemv_fp8_pert(x, z, norm_weight, weight_scaled, scale_tensor, out_fp8, HV, V, eps)
+
+    torch.xpu.synchronize()
+
+    # Both are quantized approximations of the same fp16 weight — compare against fp16 ref
+    ref_output, _ = ref_norm_gemv_fp16(x, z, norm_weight, weight_xpu, HV, V, eps)
+
+    int4_err = (out_int4.cpu().float() - ref_output).abs().mean().item()
+    fp8_err = (out_fp8.cpu().float() - ref_output).abs().mean().item()
+    ref_mag = ref_output.abs().mean().item() + 1e-6
+
+    int4_rel = int4_err / ref_mag
+    fp8_rel = fp8_err / ref_mag
+
+    int4_max = (out_int4.cpu().float() - ref_output).abs().max().item()
+    fp8_max = (out_fp8.cpu().float() - ref_output).abs().max().item()
+
+    print(f"\n  HV={HV}, N={N}:"
+          f"\n    REF:  first 8 = {ref_output[0, :8].tolist()}"
+          f"\n    INT4: first 8 = {out_int4.cpu().float()[0, :8].tolist()}"
+          f"\n    FP8:  first 8 = {out_fp8.cpu().float()[0, :8].tolist()}"
+          f"\n    INT4: mean_abs_err={int4_err:.4f}, max_abs_err={int4_max:.4f}, rel_err={int4_rel:.4f}"
+          f"\n    FP8:  mean_abs_err={fp8_err:.4f}, max_abs_err={fp8_max:.4f}, rel_err={fp8_rel:.4f}")
+
+    # Both should be reasonable approximations (< 20% relative error)
+    assert int4_rel < 0.2, f"INT4 rel_err too large: {int4_rel:.4f}"
+    assert fp8_rel < 0.2, f"FP8 rel_err too large: {fp8_rel:.4f}"
+
+    # INT4 and FP8 outputs should be in the same ballpark (cosine similarity > 0.9)
+    cos_sim = torch.nn.functional.cosine_similarity(
+        out_int4.cpu().float(), out_fp8.cpu().float(), dim=-1).item()
+    assert cos_sim > 0.9, \
+        f"INT4 vs FP8 cosine similarity too low: {cos_sim:.4f} (HV={HV}, V={V}, N={N})"
+
+
+def cpu_dequantize(qweight, scale, N, K, block_size=128):
+    """Dequantize INT4 packed weight back to fp16 on CPU."""
+    weight = torch.zeros(N, K, dtype=torch.float32)
+    qw = qweight.cpu()
+    sc = scale.cpu().float()
+    for n in range(N):
+        for blk in range(K // block_size):
+            s = sc[n, blk].item()
+            for i in range(block_size // 8):
+                packed = qw[n, blk * (block_size // 8) + i].item() & 0xFFFFFFFF
+                for b in range(8):
+                    k_idx = blk * block_size + i * 8 + b
+                    q = (packed >> (b * 4)) & 0xF
+                    weight[n, k_idx] = (q - 8) * s
+    return weight.half()
+
+
+@pytest.mark.parametrize("HV,V,N", [
+    (8, 128, 256),
+    (8, 128, 2048),
+])
+def test_norm_gemv_int4_vs_fp8_dequant(HV, V, N):
+    """Compare INT4 kernel vs FP8 kernel, using INT4-dequantized weight as the fp16 source.
+
+    This isolates the kernel computation error from INT4 quantization error:
+    the fp16 reference and FP8 path both use the INT4-dequantized weight,
+    so the only difference is FP8 re-quantization loss vs INT4 kernel precision.
+    """
+    torch.manual_seed(42)
+    eps = 1e-6
+    K = HV * V
+
+    x = torch.randn(HV, V, dtype=torch.float16, device=DEVICE)
+    z = torch.randn(HV, V, dtype=torch.float16, device=DEVICE)
+    norm_weight = torch.randn(V, dtype=torch.float16, device=DEVICE) * 0.1 + 1.0
+
+    # Quantize to INT4, then dequantize back to fp16 as the "ground truth"
+    weight_fp16_orig = torch.randn(N, K, dtype=torch.float16)
+    qw, sc = cpu_quantize(weight_fp16_orig, block_size=128)
+    weight_deq = cpu_dequantize(qw, sc, N, K, block_size=128)
+
+    # INT4 path: use the same qw/sc
+    qw_xpu = qw.to(DEVICE)
+    sc_xpu = sc.to(DEVICE)
+    out_int4 = torch.empty(1, N, dtype=torch.float16, device=DEVICE)
+    esimd_norm_gemv_int4_pert(x, z, norm_weight, qw_xpu, sc_xpu, out_int4, HV, V, eps)
+
+    # FP8 path: use dequantized weight as fp16 source → cast to fp8
+    weight_deq_xpu = weight_deq.to(DEVICE)
+    fp8_scale_val = weight_deq_xpu.float().abs().max().item() / 448.0
+    weight_scaled = (weight_deq_xpu.float() / fp8_scale_val).to(torch.float8_e4m3fn)
+    scale_tensor = torch.tensor([fp8_scale_val], dtype=torch.float32, device=DEVICE)
+    out_fp8 = torch.empty(1, N, dtype=torch.float16, device=DEVICE)
+    esimd_norm_gemv_fp8_pert(x, z, norm_weight, weight_scaled, scale_tensor, out_fp8, HV, V, eps)
+
+    torch.xpu.synchronize()
+
+    # Reference: norm+gate with dequantized weight (exact INT4 values, fp32 matmul)
+    ref_output, _ = ref_norm_gemv_fp16(x, z, norm_weight, weight_deq_xpu, HV, V, eps)
+
+    int4_err = (out_int4.cpu().float() - ref_output).abs().mean().item()
+    fp8_err = (out_fp8.cpu().float() - ref_output).abs().mean().item()
+    ref_mag = ref_output.abs().mean().item() + 1e-6
+
+    int4_rel = int4_err / ref_mag
+    fp8_rel = fp8_err / ref_mag
+
+    int4_max = (out_int4.cpu().float() - ref_output).abs().max().item()
+    fp8_max = (out_fp8.cpu().float() - ref_output).abs().max().item()
+
+    print(f"\n  HV={HV}, N={N} (dequant weight as source):"
+          f"\n    REF:  first 8 = {ref_output[0, :8].tolist()}"
+          f"\n    INT4: first 8 = {out_int4.cpu().float()[0, :8].tolist()}"
+          f"\n    FP8:  first 8 = {out_fp8.cpu().float()[0, :8].tolist()}"
+          f"\n    INT4: mean_abs_err={int4_err:.4f}, max_abs_err={int4_max:.4f}, rel_err={int4_rel:.4f}"
+          f"\n    FP8:  mean_abs_err={fp8_err:.4f}, max_abs_err={fp8_max:.4f}, rel_err={fp8_rel:.4f}")
+
+    # INT4 kernel should be very close to ref (same quantized weights, only fp32 accumulation diff)
+    assert int4_rel < 0.05, f"INT4 rel_err too large vs dequant ref: {int4_rel:.6f}"
+    # FP8 has additional re-quantization loss on top
+    assert fp8_rel < 0.2, f"FP8 rel_err too large vs dequant ref: {fp8_rel:.4f}"
 
 
 if __name__ == "__main__":
