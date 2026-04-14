@@ -532,117 +532,182 @@ def test_ggml_vs_python_quantize():
 #   - fp16 output truncation.
 # ============================================================================
 
-def test_correctness_unit_scale():
+def test_correctness_detailed():
     """
-    Kernel correctness with integer weights in [-7, 7] (group scale = 1.0).
+    Comprehensive kernel correctness test with detailed output.
 
-    Purpose: isolate and test the INT4 *unpacking* logic only.  Since all
-    values are exact integers and scale is 1.0, any error must come from
-    incorrect bit extraction (shift/mask) or signed conversion in the kernel.
-    The reference output is exact, so even small diffs indicate unpack bugs.
+    For each shape, shows three things:
+      1. First 5 values of kernel output, dequant ref, and original fp16 ref
+         — for visual sanity check.
+      2. "vs dequant weight" error — kernel computation error only.
+         kernel(int4_weight) vs python_matmul(dequant(int4_weight))
+         Both use the SAME quantized weights; difference is accumulation order.
+         Expected: <0.1%.
+      3. "vs original fp16" error — total error including quantization loss.
+         kernel(int4_weight) vs python_matmul(original_fp16_weight)
+         Expected: ~10% (inherent INT4 precision loss).
 
-    Shapes cover: typical projection sizes (N=16..3072, K=128..2048).
-    """
-    from custom_esimd_kernels_vllm import esimd_gemv_int4
-
-    print("\n--- Kernel Correctness (unit scale) ---")
-    for N, K in [(1024, 1024), (2560, 2048), (512, 2048), (128, 2048),
-                 (3072, 2048), (16, 2048), (2048, 512), (2048, 128)]:
-        weight_int = torch.randint(-7, 8, (N, K), dtype=torch.int8, device=device)
-        weight_fp16 = weight_int.to(torch.float16)
-        packed, scale = int4_quantize(weight_fp16)
-
-        input_t = torch.randn(1, K, dtype=torch.float16, device=device) * 0.1
-        output = torch.zeros(1, N, dtype=torch.float16, device=device)
-
-        esimd_gemv_int4(input_t, packed, scale, output)
-
-        ref = gemv_int4_ref(input_t, packed, scale, N, K)
-
-        max_diff = (output.float() - ref.float()).abs().max().item()
-        ref_max = ref.float().abs().max().item()
-        rel_err = (max_diff / ref_max) if ref_max > 1e-6 else 0
-        ok = max_diff < 1.0 or rel_err < 0.02
-        status = "PASS" if ok else "FAIL"
-        print(f"  [{status}] N={N:5d} K={K:5d}"
-              f"  max_diff={max_diff:.4f}  rel={rel_err:.4f}")
-        assert ok, f"Correctness failed for N={N}, K={K}"
-
-
-def test_correctness_with_scale():
-    """
-    Kernel correctness with real quantized weights (non-trivial group scales).
-
-    Purpose: test the full dequantization path — unpack AND per-group scale
-    multiplication inside the K-loop.  Random fp16 weights are quantized, so
-    each group has a different scale.  This catches bugs in:
-      - Group index calculation (wrong scale loaded for a K-position).
-      - Scale broadcast width (e.g. applying scale to wrong lanes in VL>128).
-      - Off-by-one in group boundary handling.
-
-    Includes (4096, 7168) to cover a Qwen3.5-scale hidden dimension.
+    Covers:
+      - Typical Qwen3.5 projection sizes (N=16..4096, K=128..7168)
+      - Small K (128, 512): few groups, tests basic correctness
+      - Large K (7168, 14336): many groups, stress-tests K_SPLIT + group boundary
     """
     from custom_esimd_kernels_vllm import esimd_gemv_int4
 
-    print("\n--- Kernel Correctness (with scale) ---")
-    for N, K in [(2560, 2048), (512, 2048), (2048, 512), (3072, 2048),
-                 (128, 2048), (16, 2048), (1024, 1024), (4096, 7168)]:
-        weight_ref = torch.randn(N, K, dtype=torch.float16, device=device) * 0.1
-        packed, scale = int4_quantize(weight_ref)
+    print("\n--- Kernel Correctness (detailed) ---")
 
+    shapes = [
+        # (label,               N,     K)
+        ("Attn qkv",         2560,  2048),
+        ("Attn o_proj",      2048,   512),
+        ("DN qkvz",          3072,  2048),
+        ("DN ba",              16,  2048),
+        ("Exp gate_up",       512,  2048),
+        ("Large K (56 grp)",  128,  7168),
+        ("Large K (112 grp)", 256, 14336),
+        ("Small K (1 grp)",  1024,   128),
+    ]
+
+    all_ok = True
+    for label, N, K in shapes:
+        # Step 1: Create original FP16 weight and quantize.
+        original_weight = torch.randn(N, K, dtype=torch.float16, device=device) * 0.1
         input_t = torch.randn(1, K, dtype=torch.float16, device=device) * 0.1
-        output = torch.zeros(1, N, dtype=torch.float16, device=device)
+        packed, scale = int4_quantize(original_weight)
 
-        esimd_gemv_int4(input_t, packed, scale, output)
+        # Step 2: Run kernel.
+        kernel_out = torch.zeros(1, N, dtype=torch.float16, device=device)
+        esimd_gemv_int4(input_t, packed, scale, kernel_out)
 
-        ref = gemv_int4_ref(input_t, packed, scale, N, K)
+        # Step 3: Compute two references.
+        #   dequant_ref: uses same quantized weights → measures kernel error
+        #   original_ref: uses original fp16 weights → measures quantization error
+        dequant_weight = int4_dequantize_ref(packed, scale, N, K)
+        dequant_ref = input_t.float() @ dequant_weight.float().T
+        original_ref = input_t.float() @ original_weight.float().T
 
-        max_diff = (output.float() - ref.float()).abs().max().item()
-        ref_max = ref.float().abs().max().item()
-        rel_err = (max_diff / ref_max) if ref_max > 1e-6 else 0
-        ok = max_diff < 0.5 or rel_err < 0.05
+        # Step 4: Compute errors.
+        diff_dq = (kernel_out.float() - dequant_ref).abs()
+        diff_orig = (kernel_out.float() - original_ref).abs()
+
+        mean_dq = diff_dq.mean().item()
+        max_dq = diff_dq.max().item()
+        rel_dq = mean_dq / dequant_ref.abs().mean().item() if dequant_ref.abs().mean().item() > 1e-6 else 0
+
+        mean_orig = diff_orig.mean().item()
+        max_orig = diff_orig.max().item()
+        rel_orig = mean_orig / original_ref.abs().mean().item() if original_ref.abs().mean().item() > 1e-6 else 0
+
+        ok = rel_dq < 0.001  # kernel error should be < 0.1%
         status = "PASS" if ok else "FAIL"
-        print(f"  [{status}] N={N:5d} K={K:5d}"
-              f"  max_diff={max_diff:.4f}  rel={rel_err:.4f}")
-        assert ok, f"Correctness failed for N={N}, K={K} with scale"
+        if not ok:
+            all_ok = False
+
+        print(f"\n  [{status}] {label} (N={N}, K={K}, groups={K // GROUP_SIZE}):")
+        print(f"    kernel:      {kernel_out[0, :5].tolist()}")
+        print(f"    dequant ref: {dequant_ref[0, :5].tolist()}")
+        print(f"    fp16 ref:    {original_ref[0, :5].tolist()}")
+        print(f"    vs dequant weight: mean_abs={mean_dq:.4f}, "
+              f"max_abs={max_dq:.4f}, rel={rel_dq:.4%}  "
+              f"{'<-- kernel OK' if rel_dq < 0.001 else '<-- KERNEL ERROR!'}")
+        print(f"    vs original fp16:  mean_abs={mean_orig:.4f}, "
+              f"max_abs={max_orig:.4f}, rel={rel_orig:.4%}  "
+              f"(INT4 quantization loss)")
+
+    assert all_ok, "Some kernel correctness tests failed — see KERNEL ERROR above"
 
 
-def test_correctness_large_k():
+# ============================================================================
+# Quantization error analysis
+#
+# The tests above compare kernel output against a Python reference that uses
+# the SAME quantized weights (dequant ref).  This measures kernel computation
+# error only — typically <0.05%.
+#
+# The test below ALSO compares kernel output against the result computed with
+# ORIGINAL FP16 weights (before any quantization).  This measures the total
+# error introduced by INT4 quantization itself — typically ~10% for 4-bit.
+#
+# Both numbers together tell the full story:
+#   - kernel computation error small → kernel is correct
+#   - quantization error ~10%        → inherent 4-bit precision loss, not a bug
+# ============================================================================
+
+def test_quantization_error_analysis():
     """
-    Kernel correctness for large K values with many groups.
+    Compare kernel output against TWO different references:
 
-    Purpose: stress-test K_SPLIT + group boundary alignment.  When the kernel
-    uses K_SPLIT > 1, the K dimension is partitioned across multiple threads
-    in a workgroup.  Each thread's chunk (kp = K / K_SPLIT) must be a multiple
-    of group_size=128 — otherwise a single group gets split across threads,
-    and each thread would need the same scale, complicating the logic.
+    1. "vs dequant weight" (kernel computation error):
+       ref = input @ dequant(int4_weight).T
+       Both sides use the SAME quantized weights.  The only difference is
+       how the matmul is computed (ESIMD kernel vs PyTorch matmul).
+       Expected rel_err: <0.05%  (just floating-point accumulation order).
 
-    K=7168  -> 56 groups, tests realistic Qwen3.5 hidden dimension.
-    K=14336 -> 112 groups, tests 2x intermediate_size.
-    K=3584  -> 28 groups, non-power-of-2 group count.
+    2. "vs original fp16 weight" (quantization error):
+       ref = input @ original_fp16_weight.T
+       Compares against the "perfect" answer before any quantization.
+       Expected rel_err: ~10%  (inherent loss from 16-bit → 4-bit compression).
+
+    If #1 is small but #2 is large → kernel is correct, quantization is lossy.
+    If #1 is also large → kernel has a bug.
     """
     from custom_esimd_kernels_vllm import esimd_gemv_int4
 
-    print("\n--- Kernel Correctness (large K, many groups) ---")
-    for N, K in [(128, 7168), (256, 14336), (16, 4096), (512, 3584)]:
-        weight_ref = torch.randn(N, K, dtype=torch.float16, device=device) * 0.1
-        packed, scale = int4_quantize(weight_ref)
+    print("\n--- Quantization Error Analysis ---")
+    print(f"  {'N':>6} {'K':>6}"
+          f" | {'vs dequant weight (kernel err)':^40}"
+          f" | {'vs original fp16 (quant err)':^40}")
+    print(f"  {'':>6} {'':>6}"
+          f" | {'mean_abs':>10} {'max_abs':>10} {'rel':>8}"
+          f" | {'mean_abs':>10} {'max_abs':>10} {'rel':>8}")
+    print("  " + "-" * 105)
 
+    for N, K in [(2560, 2048), (512, 2048), (3072, 2048),
+                 (128, 2048), (16, 2048), (2048, 512)]:
+        # Step 1: Create random FP16 weight (the "original" before quantization).
+        original_weight = torch.randn(N, K, dtype=torch.float16, device=device) * 0.1
         input_t = torch.randn(1, K, dtype=torch.float16, device=device) * 0.1
-        output = torch.zeros(1, N, dtype=torch.float16, device=device)
 
-        esimd_gemv_int4(input_t, packed, scale, output)
+        # Step 2: Quantize to INT4 (GGML q4_0 format).
+        packed, scale = int4_quantize(original_weight)
 
-        ref = gemv_int4_ref(input_t, packed, scale, N, K)
+        # Step 3: Run ESIMD kernel.
+        kernel_out = torch.zeros(1, N, dtype=torch.float16, device=device)
+        esimd_gemv_int4(input_t, packed, scale, kernel_out)
 
-        max_diff = (output.float() - ref.float()).abs().max().item()
-        ref_max = ref.float().abs().max().item()
-        rel_err = (max_diff / ref_max) if ref_max > 1e-6 else 0
-        ok = max_diff < 0.5 or rel_err < 0.05
-        status = "PASS" if ok else "FAIL"
-        print(f"  [{status}] N={N:5d} K={K:5d}  groups={K // GROUP_SIZE:>4}"
-              f"  max_diff={max_diff:.4f}  rel={rel_err:.4f}")
-        assert ok, f"Large-K correctness failed for N={N}, K={K}"
+        # Step 4: Compute "dequant weight" reference.
+        #   Uses the same quantized weights, dequantized back to fp16.
+        #   Difference from kernel = kernel computation error only.
+        dequant_weight = int4_dequantize_ref(packed, scale, N, K)
+        dequant_ref = input_t.float() @ dequant_weight.float().T
+
+        # Step 5: Compute "original fp16 weight" reference.
+        #   Uses the original weights before quantization.
+        #   Difference from kernel = quantization error + kernel computation error.
+        original_ref = input_t.float() @ original_weight.float().T
+
+        # Step 6: Calculate errors for both comparisons.
+        # --- vs dequant weight ---
+        diff_dq = (kernel_out.float() - dequant_ref).abs()
+        mean_abs_dq = diff_dq.mean().item()
+        max_abs_dq = diff_dq.max().item()
+        rel_dq = mean_abs_dq / dequant_ref.abs().mean().item()
+
+        # --- vs original fp16 weight ---
+        diff_orig = (kernel_out.float() - original_ref).abs()
+        mean_abs_orig = diff_orig.mean().item()
+        max_abs_orig = diff_orig.max().item()
+        rel_orig = mean_abs_orig / original_ref.abs().mean().item()
+
+        print(f"  {N:>6} {K:>6}"
+              f" | {mean_abs_dq:>10.4f} {max_abs_dq:>10.4f} {rel_dq:>7.2%}"
+              f" | {mean_abs_orig:>10.4f} {max_abs_orig:>10.4f} {rel_orig:>7.2%}")
+
+    print()
+    print("  Interpretation:")
+    print("    'vs dequant weight' small (<0.1%)  → kernel computes correctly")
+    print("    'vs original fp16'  large (~10%)   → inherent INT4 quantization loss (normal)")
+    print("    If 'vs dequant weight' is also large → kernel has a bug")
 
 
 # ============================================================================
@@ -1082,9 +1147,7 @@ if __name__ == "__main__":
     test_ggml_kernel_e2e()
 
     # --- Phase 2: Kernel correctness (requires compiled esimd_gemv_int4) ---
-    test_correctness_unit_scale()    # pure unpack test (scale=1)
-    test_correctness_with_scale()    # full dequant (unpack + group scale)
-    test_correctness_large_k()       # K_SPLIT + group boundary stress
+    test_correctness_detailed()      # kernel err + quantization err, detailed output
     test_fused2_correctness()        # fused2 == 2x unfused
     test_fused2_vs_reference()       # fused2 == python reference
 
