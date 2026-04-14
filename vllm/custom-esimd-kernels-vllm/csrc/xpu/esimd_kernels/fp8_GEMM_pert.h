@@ -3907,6 +3907,109 @@ inline void dpas_v5_auto_dispatch(
 }
 #endif // GEMM_EXPERIMENTAL — V5, V2, old dispatchers
 
+// ============================================================================
+// Tiny-N M-parallel kernel with K-split: for N<=16, any M.
+// Grid: nd_range<1>({M * K_SPLIT}, {K_SPLIT})
+// Each WG has K_SPLIT threads processing one output row m.
+// Each thread computes partial sums for all N columns over K/K_SPLIT elements.
+// SLM reduction merges partials across threads.
+// Weight (N*K bytes, e.g. 32KB for N=16 K=2048) stays in L3 across WGs.
+// ============================================================================
+template<int VL, int K_SPLIT, int MAX_N>
+struct GEMM_fp8_pert_mpar_kernel {
+    const fp16*    input;      // [M, K]
+    const uint8_t* weight;     // [N, K]
+    const float*   scale_ptr;
+    fp16*          output;     // [M, N]
+    int M, N, K;
+    int fp8_mode;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        // SLM: K_SPLIT * MAX_N floats
+        constexpr int SLM_SIZE = K_SPLIT * MAX_N * (int)sizeof(float);
+        slm_init<SLM_SIZE>();
+
+        int m   = item.get_group(0);
+        int tid = item.get_local_id(0);
+        if (m >= M) return;
+
+        int kp = K / K_SPLIT;
+        int ks = tid * kp;
+
+        // N accumulators
+        simd<float, MAX_N> acc = 0.0f;
+
+        const fp16* in_row = input + (size_t)m * K;
+
+        for (int k = ks; k < ks + kp; k += VL) {
+            simd<fp16, VL> iv = block_load<fp16, VL>(in_row + k);
+            simd<float, VL> input_f = iv;
+
+            #pragma unroll
+            for (int n = 0; n < MAX_N; n++) {
+                if (n < N) {
+                    simd<uint8_t, VL> raw = block_load<uint8_t, VL>(
+                        weight + (size_t)n * K + k);
+                    simd<float, VL> wf = fp8_dequant<VL>(raw, fp8_mode);
+                    // Dot product: multiply and tree-reduce
+                    simd<float, VL> prod = input_f * wf;
+                    acc[n] += reduce<float>(prod, std::plus<>());
+                }
+            }
+        }
+
+        if constexpr (K_SPLIT == 1) {
+            float s = *scale_ptr;
+            fp16* out_row = output + (size_t)m * N;
+            for (int n = 0; n < N; n++)
+                out_row[n] = fp16(acc[n] * s);
+        } else {
+            // Store partials to SLM
+            uint32_t slm_off = tid * MAX_N * (uint32_t)sizeof(float);
+            if constexpr (MAX_N == 16) {
+                slm_block_store<float, 16>(slm_off, acc);
+            } else {
+                for (int n = 0; n < MAX_N; n++)
+                    slm_block_store<float, 1>(slm_off + n * sizeof(float),
+                                              simd<float, 1>(acc[n]));
+            }
+
+            barrier();
+
+            if (tid == 0) {
+                simd<float, MAX_N> total = slm_block_load<float, MAX_N>(0);
+                #pragma unroll
+                for (int t = 1; t < K_SPLIT; t++) {
+                    simd<float, MAX_N> partial = slm_block_load<float, MAX_N>(
+                        t * MAX_N * (uint32_t)sizeof(float));
+                    total += partial;
+                }
+                float s = *scale_ptr;
+                total *= s;
+                fp16* out_row = output + (size_t)m * N;
+                simd<fp16, MAX_N> out_fp16 = convert<fp16>(total);
+                // Store N elements (scalar for safety with small N)
+                for (int n = 0; n < N; n++)
+                    out_row[n] = out_fp16[n];
+            }
+        }
+    }
+};
+
+template<int VL, int K_SPLIT, int MAX_N>
+inline void mpar_gemm_fp8_pert_host(
+    const fp16* input, const uint8_t* weight, const float* scale_ptr,
+    fp16* output, uint32_t M, uint32_t N, uint32_t K,
+    int fp8_mode, sycl::queue& q) {
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>({(size_t)(M * K_SPLIT)}, {(size_t)K_SPLIT}),
+            GEMM_fp8_pert_mpar_kernel<VL, K_SPLIT, MAX_N>{
+                input, weight, scale_ptr, output,
+                (int)M, (int)N, (int)K, fp8_mode});
+    });
+}
+
 // Direct-typed unified dispatcher (no uint8_t casts needed)
 inline void GEMM_fp8_pert_dispatch(
     const fp16*    input,
@@ -3919,12 +4022,21 @@ inline void GEMM_fp8_pert_dispatch(
 
     if (M == 1) {
         batched_gemv_fp8_pert_host(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
-    } else if (N <= 32 && K % 64 == 0 && K >= 2048 && M <= 16) {
-        // Tiny-N projection (e.g. Qwen3-Next ba: N=16, K=2048).
-        // V7 KT=4 MT=2 is far better than auto for this regime:
-        // M=4..10: 48us vs auto 109us. See DECODE_BSZ12_KERNEL_INVESTIGATION.md.
-        dpas_v7_gemm_fp8_pert_host<4, 2>(
-            input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+    } else if (N <= 16 && M >= 2) {
+        // Tiny-N M-parallel: one WG per input row, K_SPLIT threads per WG.
+        // Grid={M×K_SPLIT}. Weight (N*K bytes) in L3. Avoids N-parallel
+        // underutilization that causes 2x cliff at M=9 in V7/WS kernels.
+        // K_SPLIT chosen so K/K_SPLIT is divisible by VL=128.
+        if (K >= 2048 && K % (8 * 128) == 0) {
+            mpar_gemm_fp8_pert_host<128, 8, 16>(
+                input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        } else if (K % (4 * 128) == 0) {
+            mpar_gemm_fp8_pert_host<128, 4, 16>(
+                input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        } else {
+            mpar_gemm_fp8_pert_host<128, 1, 16>(
+                input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
+        }
     } else if (K % 64 == 0 && fp8_mode == 0) {
         // V9: Transposed load + fused dequant-VNNI (E4M3 only, best for M>=2)
         dpas_v9_auto_dispatch(input, weight, scale_ptr, output, M, N, K, q);
