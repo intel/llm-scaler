@@ -106,6 +106,19 @@ at::Tensor esimd_resadd_norm_gemv_fp8_pert(
     at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output, at::Tensor normed_out,
     double eps);
 
+// Fused ResidualAdd + RMSNorm + INT4 GEMV (post_attn_norm + router)
+// hidden_states: [1, K] fp16
+// residual:      [1, K] fp16 (updated in-place)
+// norm_weight:   [K] fp16
+// gemv_weight:   [N, K/8] int32 — packed INT4
+// gemv_scale:    [N, K/128] fp16 — per-block scale
+// output:        [1, N] fp16
+// normed_out:    [1, K] fp16
+at::Tensor esimd_resadd_norm_gemv_int4_pert(
+    at::Tensor hidden_states, at::Tensor residual, at::Tensor norm_weight,
+    at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output, at::Tensor normed_out,
+    double eps);
+
 // Fused ResidualAdd + RMSNorm + 2-matrix FP8 GEMV (input_norm + GDN in_proj)
 at::Tensor esimd_resadd_norm_gemv2_fp8_pert(
     at::Tensor hidden_states, at::Tensor residual, at::Tensor norm_weight,
