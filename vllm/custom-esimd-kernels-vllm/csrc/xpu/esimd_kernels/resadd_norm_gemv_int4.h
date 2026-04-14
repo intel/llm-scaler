@@ -87,12 +87,11 @@ struct ResAddNormGEMV_int4_pert_kernel {
             simd<uint32_t, 16> u_packed =
                 packed.template bit_cast_view<uint32_t>().read();
             float s = (float)gemv_scale[(size_t)n * num_blocks_per_row + c];
+            float neg_8s = -8.0f * s;
             #pragma unroll
             for (int i = 0; i < 16; i++) {
                 simd<uint32_t, 8> nib = (simd<uint32_t, 8>(u_packed[i]) >> nib_shifts) & 0xFu;
-                simd<float, 8> w = simd<float, 8>(
-                    nib.template bit_cast_view<int32_t>().read()) - 8.0f;
-                w *= s;
+                simd<float, 8> w = convert<float>(nib) * s + neg_8s;
                 acc.select<8, 1>(i * 8) += normed.select<8, 1>(i * 8) * w;
             }
         }
@@ -160,24 +159,25 @@ struct ResAddNormGEMV_int4_pert_kernel {
                 block_store<fp16, VL>(normed_out + offset, simd<fp16, VL>(normed));
             }
 
+            // Coalesced weight load: 4 blocks × 16 int32 = 64 int32 at once
+            constexpr int PACKED_PER_VL = VL / PACK;  // 64
+            simd<int32_t, PACKED_PER_VL> all_packed = block_load<int32_t, PACKED_PER_VL>(
+                gemv_weight + (size_t)n * packed_K + c * PACKED_PER_VL);
+            simd<uint32_t, PACKED_PER_VL> all_u =
+                all_packed.template bit_cast_view<uint32_t>().read();
+
             #pragma unroll
             for (int blk = 0; blk < BLOCKS_PER_VL; blk++) {
-                int blk_global = c * BLOCKS_PER_VL + blk;
                 int blk_off = blk * BLOCK_SIZE;
 
-                simd<int32_t, 16> packed = block_load<int32_t, 16>(
-                    gemv_weight + (size_t)n * packed_K + blk_global * 16);
-                simd<uint32_t, 16> u_packed =
-                    packed.template bit_cast_view<uint32_t>().read();
-
-                float s = (float)gemv_scale[(size_t)n * num_blocks_per_row + blk_global];
+                float s = (float)gemv_scale[(size_t)n * num_blocks_per_row + c * BLOCKS_PER_VL + blk];
+                float neg_8s = -8.0f * s;
 
                 #pragma unroll
                 for (int i = 0; i < 16; i++) {
-                    simd<uint32_t, 8> nib = (simd<uint32_t, 8>(u_packed[i]) >> nib_shifts) & 0xFu;
-                    simd<float, 8> w = simd<float, 8>(
-                        nib.template bit_cast_view<int32_t>().read()) - 8.0f;
-                    w *= s;
+                    simd<uint32_t, 8> nib = (simd<uint32_t, 8>(all_u[blk * 16 + i]) >> nib_shifts) & 0xFu;
+                    // FMA dequant: nib * s + (-8*s) = (nib - 8) * s
+                    simd<float, 8> w = convert<float>(nib) * s + neg_8s;
                     acc.select<8, 1>(i * 8) +=
                         normed.select<8, 1>(blk_off + i * 8) * w;
                 }

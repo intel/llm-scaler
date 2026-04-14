@@ -115,16 +115,14 @@ struct NormGEMV_int4_kernel {
                 packed.template bit_cast_view<uint32_t>().read();
 
             float s = (float)gemv_scale[(size_t)n * num_blocks_per_row + h];
+            float neg_8s = -8.0f * s;
 
             // Process per pack: broadcast int32 → 8-wide shift → extract nibbles
-            // Each int32 pack[i] holds 8 nibbles for K indices [i*8 .. i*8+7]
-            // normed[i*8 .. i*8+7] are contiguous → no scatter needed
+            // FMA dequant: nib * s + (-8*s) = (nib - 8) * s
             #pragma unroll
             for (int i = 0; i < 16; i++) {
                 simd<uint32_t, 8> nib = (simd<uint32_t, 8>(u_packed[i]) >> nib_shifts) & 0xFu;
-                simd<float, 8> w = simd<float, 8>(
-                    nib.template bit_cast_view<int32_t>().read()) - 8.0f;
-                w *= s;
+                simd<float, 8> w = convert<float>(nib) * s + neg_8s;
                 acc.select<8, 1>(i * 8) += normed.select<8, 1>(i * 8) * w;
             }
         }
