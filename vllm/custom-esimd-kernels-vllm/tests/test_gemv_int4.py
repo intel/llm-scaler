@@ -1008,6 +1008,160 @@ def benchmark_fused():
               f" | {indiv_us:>9.2f} {fused_us:>9.2f} {speedup:>7.2f}x")
 
 
+def benchmark_int4_vs_fp8():
+    """
+    Benchmark INT4 GEMV vs FP8 GEMV on identical (N, K) shapes.
+
+    Purpose: ensure INT4 kernel performance hasn't regressed relative to FP8.
+    Since INT4 loads half the weight bytes (0.5 B/element vs 1 B/element),
+    the INT4 kernel should be faster on memory-bound shapes.
+
+    For each shape, reports:
+      - INT4 latency (us) and effective bandwidth (GB/s)
+      - FP8  latency (us) and effective bandwidth (GB/s)
+      - INT4/FP8 speedup ratio
+      - Weight size ratio (INT4 is always 0.5x of FP8)
+
+    A speedup < 1.0 means INT4 is slower than FP8 — potential regression.
+    Theoretical speedup ≈ 1.5-2.0x for large shapes (memory-bound regime),
+    less for small shapes where launch overhead or compute dominates.
+
+    Both kernels use per-tensor-style scaling for fairest comparison:
+      - FP8:  esimd_gemv_fp8_pert — single float scalar scale
+      - INT4: esimd_gemv_int4    — per-group fp16 scale (group_size=128)
+
+    Cache-busting is applied to both paths identically (rotate through
+    multiple weight copies exceeding L3 size).
+    """
+    print("\n--- INT4 vs FP8 Performance Comparison ---")
+    try:
+        from custom_esimd_kernels_vllm import esimd_gemv_int4, esimd_gemv_fp8_pert
+    except ImportError as e:
+        print(f"  [SKIP] {e}")
+        return
+
+    TARGET_BW = 450.0  # GB/s BMG theoretical peak
+
+    shapes = [
+        # (name,            N,     K)     — Qwen3.5-122B TP4 decode shapes
+        ("Attn qkv",      2560,  2048),
+        ("Attn o_proj",   2048,  1024),
+        ("DN qkvz",       3072,  2048),
+        ("DN ba",           16,  2048),
+        ("DN out_proj",   2048,  1024),
+        ("Exp gate_up",    512,  2048),
+        ("Exp down",      2048,   512),
+        ("Sh gate_up",     128,  2048),
+        ("Sh down",       2048,   128),
+        ("Router",         512,  2048),
+    ]
+
+    print(f"\n{'Shape':<16} {'N':>5} {'K':>5}"
+          f" | {'INT4':>8} {'GB/s':>6} {'BW%':>5}"
+          f" | {'FP8':>8} {'GB/s':>6} {'BW%':>5}"
+          f" | {'Speedup':>7} {'Note':>12}")
+    print("-" * 105)
+
+    ni = 2000
+
+    for name, N, K in shapes:
+        n_groups = K // GROUP_SIZE
+
+        # ---- Byte counts for bandwidth calculation ----
+        # INT4: weight=N*K/2, scale=N*n_groups*2, input=K*2, output=N*2
+        int4_wt = N * K // 2
+        int4_sc = N * n_groups * 2
+        int4_io = K * 2 + N * 2
+        int4_total = int4_wt + int4_sc + int4_io
+
+        # FP8: weight=N*K, scale=4 (single float), input=K*2, output=N*2
+        fp8_wt = N * K
+        fp8_sc = 4
+        fp8_io = K * 2 + N * 2
+        fp8_total = fp8_wt + fp8_sc + fp8_io
+
+        # ---- Prepare INT4 tensors ----
+        weight_fp16 = torch.randn(N, K, dtype=torch.float16, device=device) * 0.1
+        int4_packed, int4_scale = int4_quantize(weight_fp16)
+
+        # ---- Prepare FP8 tensors ----
+        # Use random uint8 as FP8 weight (we're benchmarking throughput, not correctness)
+        fp8_weight = torch.randint(0, 256, (N, K), dtype=torch.uint8, device=device)
+        fp8_scale = torch.tensor([0.01], dtype=torch.float32, device=device)
+
+        input_t = torch.randn(1, K, dtype=torch.float16, device=device) * 0.1
+        output_int4 = torch.zeros(1, N, dtype=torch.float16, device=device)
+        output_fp8 = torch.zeros(1, N, dtype=torch.float16, device=device)
+
+        # ---- Cache-bust: rotate weight copies to avoid L3 hits ----
+        target_mem = 32 * 1024 * 1024
+        nc = max(16, target_mem // max(int4_wt, fp8_wt, 1))
+        nc = min(nc, 256)
+
+        int4_copies = [(int4_packed, int4_scale)]
+        fp8_copies = [(fp8_weight, fp8_scale)]
+        for _ in range(1, nc):
+            w = torch.randn(N, K, dtype=torch.float16, device=device) * 0.1
+            p, s = int4_quantize(w)
+            int4_copies.append((p, s))
+            fp8_copies.append((
+                torch.randint(0, 256, (N, K), dtype=torch.uint8, device=device),
+                fp8_scale))
+
+        # ---- Benchmark INT4 ----
+        for i in range(10):
+            p, s = int4_copies[i % nc]
+            esimd_gemv_int4(input_t, p, s, output_int4)
+        torch.xpu.synchronize()
+
+        t0 = time.perf_counter()
+        for i in range(ni):
+            p, s = int4_copies[i % nc]
+            esimd_gemv_int4(input_t, p, s, output_int4)
+        torch.xpu.synchronize()
+        int4_us = (time.perf_counter() - t0) / ni * 1e6
+
+        # ---- Benchmark FP8 ----
+        for i in range(10):
+            w, sc = fp8_copies[i % nc]
+            esimd_gemv_fp8_pert(input_t, w, sc, output_fp8)
+        torch.xpu.synchronize()
+
+        t0 = time.perf_counter()
+        for i in range(ni):
+            w, sc = fp8_copies[i % nc]
+            esimd_gemv_fp8_pert(input_t, w, sc, output_fp8)
+        torch.xpu.synchronize()
+        fp8_us = (time.perf_counter() - t0) / ni * 1e6
+
+        # ---- Compute metrics ----
+        int4_bw = (int4_total / 1e9) / (int4_us / 1e6)
+        fp8_bw = (fp8_total / 1e9) / (fp8_us / 1e6)
+        int4_bw_pct = int4_bw / TARGET_BW * 100
+        fp8_bw_pct = fp8_bw / TARGET_BW * 100
+        speedup = fp8_us / int4_us if int4_us > 0 else 0
+
+        note = ""
+        if speedup < 0.95:
+            note = "<-- REGRESS!"
+        elif speedup < 1.05:
+            note = "(~same)"
+        elif speedup >= 1.5:
+            note = "OK (BW win)"
+        else:
+            note = "OK"
+
+        print(f"{name:<16} {N:>5} {K:>5}"
+              f" | {int4_us:>7.1f}u {int4_bw:>5.0f} {int4_bw_pct:>4.0f}%"
+              f" | {fp8_us:>7.1f}u {fp8_bw:>5.0f} {fp8_bw_pct:>4.0f}%"
+              f" | {speedup:>6.2f}x {note:>12}")
+
+    print()
+    print("  Speedup = FP8_latency / INT4_latency (>1.0 means INT4 is faster)")
+    print("  INT4 weight is 0.5x the size of FP8 → expect ~1.5-2.0x speedup")
+    print("  Speedup < 1.0 indicates potential INT4 kernel regression")
+
+
 def benchmark_vs_ipex():
     """
     Benchmark ESIMD INT4 GEMV vs IPEX INT4 linear (IPEXWeightOnlyQuantizedLinear).
@@ -1157,6 +1311,9 @@ if __name__ == "__main__":
 
     print("\n--- Performance Benchmark (fused vs individual) ---")
     benchmark_fused()
+
+    print("\n--- Performance Benchmark (INT4 vs FP8) ---")
+    benchmark_int4_vs_fp8()
 
     print("\n--- Performance Benchmark (ESIMD vs IPEX) ---")
     benchmark_vs_ipex()
