@@ -15,9 +15,11 @@
  *
  * Optimizations (referenced from IPEX patterns):
  *   - K_SPLIT: multiple threads per WG split HV heads, SLM cooperative reduce
- *   - Vectorized INT4 dequant: pack-level broadcast+shift, no scatter
+ *     (auto-disabled for large N where WG count provides sufficient occupancy)
+ *   - Byte-level nibble extraction: bit_cast int32→uint8, extract low/high
+ *     nibbles as 64-wide vectors, stride-2 dot product with normed
  *   - Hierarchical simd reduction for sum-of-squares and dot product
- *   - Fused dequant+FMA: avoid materializing full weight vector
+ *   - lsc_prefetch for next head's weight
  *
  * INT4 dequant: value = (nibble - 8) * scale
  * With V=128 and BLOCK_SIZE=128, exactly one scale per head iteration.
@@ -86,11 +88,7 @@ struct NormGEMV_int4_kernel {
         // Pre-load norm weight [V=128] — all threads load (L3 cached)
         simd<float, 128> norm_w = block_load<fp16, 128>(norm_w_ptr);
 
-        // Nibble shift amounts: extract 8 nibbles from one int32
-        // nibble[b] = (packed >> (b*4)) & 0xF for b in 0..7
-        simd<uint32_t, 8> nib_shifts(0u, 4u);  // {0, 4, 8, 12, 16, 20, 24, 28}
-
-        simd<float, 128> acc = 0.0f;
+        float my_sum = 0.0f;
 
         // Prefetch first head's weight (16 int32 = 64B)
         if (h_start < h_end) {
@@ -123,28 +121,34 @@ struct NormGEMV_int4_kernel {
             simd<float, 128> exp_neg_z = sycl::ext::intel::esimd::exp(-z_f);
             normed *= z_f / (1.0f + exp_neg_z);
 
-            // ── INT4 dequant + FMA (vectorized pack-level) ──
+            // ── INT4 dequant + dot product (byte-level nibble extraction) ──
             // Load 16 packed int32 = 128 INT4 values = one block
             simd<int32_t, 16> packed = block_load<int32_t, 16>(
                 gemv_weight + (size_t)n * packed_K + offset / PACK);
-            simd<uint32_t, 16> u_packed =
-                packed.template bit_cast_view<uint32_t>().read();
+
+            // Reinterpret 64 bytes: each byte holds 2 nibbles (lo=even, hi=odd)
+            simd<uint32_t, 64> u32 = convert<uint32_t>(
+                packed.template bit_cast_view<uint8_t>().read());
 
             float s = (float)gemv_scale[(size_t)n * num_blocks_per_row + h];
             float neg_8s = -8.0f * s;
 
-            // Process per pack: broadcast int32 → 8-wide shift → extract nibbles
-            // FMA dequant: nib * s + (-8*s) = (nib - 8) * s
-            #pragma unroll
-            for (int i = 0; i < 16; i++) {
-                simd<uint32_t, 8> nib = (simd<uint32_t, 8>(u_packed[i]) >> nib_shifts) & 0xFu;
-                simd<float, 8> w = convert<float>(nib) * s + neg_8s;
-                acc.select<8, 1>(i * 8) += normed.select<8, 1>(i * 8) * w;
-            }
-        }
+            // Dequant: low nibbles → even positions, high nibbles → odd positions
+            simd<float, 64> w_lo = convert<float>(u32 & 0xFu) * s + neg_8s;
+            simd<float, 64> w_hi = convert<float>((u32 >> 4) & 0xFu) * s + neg_8s;
 
-        // ── Reduction ──
-        float my_sum = hreduce128(acc);
+            // Stride-2 dot product: even × lo + odd × hi
+            simd<float, 64> prod = normed.select<64, 2>(0) * w_lo
+                                 + normed.select<64, 2>(1) * w_hi;
+
+            // Hierarchical reduction: 64 → scalar
+            prod.select<32,1>(0) += prod.select<32,1>(32);
+            prod.select<16,1>(0) += prod.select<16,1>(16);
+            prod.select<8,1>(0)  += prod.select<8,1>(8);
+            prod.select<4,1>(0)  += prod.select<4,1>(4);
+            prod.select<2,1>(0)  += prod.select<2,1>(2);
+            my_sum += (float)prod[0] + (float)prod[1];
+        }
 
         if constexpr (K_SPLIT == 1) {
             output[n] = fp16(my_sum);
@@ -160,7 +164,7 @@ struct NormGEMV_int4_kernel {
 };
 
 /* ================================================================
- * Host dispatcher — auto-selects K_SPLIT based on HV
+ * Host dispatcher — auto-selects K_SPLIT based on HV and N
  * ================================================================ */
 inline void norm_gemv_int4_host(
     const fp16* x_ptr,
@@ -173,11 +177,14 @@ inline void norm_gemv_int4_host(
     float eps,
     sycl::queue& q)
 {
-    // K_SPLIT = min(HV, 8), must divide HV evenly
+    // K_SPLIT: split heads across threads for small N (EU occupancy).
+    // Large N (>512) has enough WGs — use K_SPLIT=1 to avoid SLM overhead.
     int ks = 1;
-    if      (HV >= 8) ks = 8;
-    else if (HV >= 4) ks = 4;
-    else if (HV >= 2) ks = 2;
+    if (N <= 512) {
+        if      (HV >= 8) ks = 8;
+        else if (HV >= 4) ks = 4;
+        else if (HV >= 2) ks = 2;
+    }
 
     int global = N * ks;
     int local  = ks;
