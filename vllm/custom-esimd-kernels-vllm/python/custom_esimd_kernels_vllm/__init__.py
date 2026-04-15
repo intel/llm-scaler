@@ -23,6 +23,8 @@ from custom_esimd_kernels_vllm.ops import (
     esimd_qkv_split_norm_rope,
     esimd_gdn_conv_fused,
     esimd_fused_add_rms_norm,
+    esimd_rms_norm_gated,
+    esimd_fused_add_rms_norm_batched,
     esimd_resadd_norm_gemv_fp8_pert,
     esimd_resadd_norm_gemv2_fp8_pert,
     esimd_norm_gemv_fp8_pert,

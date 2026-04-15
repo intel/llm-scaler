@@ -130,6 +130,14 @@ at::Tensor esimd_fused_add_rms_norm(
     at::Tensor hidden_states, at::Tensor residual,
     at::Tensor weight, double eps);
 
+at::Tensor esimd_rms_norm_gated(
+    at::Tensor x, at::Tensor z, at::Tensor weight,
+    at::Tensor output, double eps);
+
+at::Tensor esimd_fused_add_rms_norm_batched(
+    at::Tensor hidden_states, at::Tensor residual,
+    at::Tensor weight, double eps);
+
 // ======================== MoE Auxiliary Ops ========================
 
 // Fused softmax + top-8 + normalize

@@ -70,6 +70,14 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
   m.def("esimd_fused_add_rms_norm(Tensor hidden_states, Tensor residual, "
         "Tensor weight, float eps) -> Tensor");
   m.impl("esimd_fused_add_rms_norm", torch::kXPU, &esimd_fused_add_rms_norm);
+
+  m.def("esimd_rms_norm_gated(Tensor x, Tensor z, Tensor weight, "
+        "Tensor output, float eps) -> Tensor");
+  m.impl("esimd_rms_norm_gated", torch::kXPU, &esimd_rms_norm_gated);
+
+  m.def("esimd_fused_add_rms_norm_batched(Tensor hidden_states, Tensor residual, "
+        "Tensor weight, float eps) -> Tensor");
+  m.impl("esimd_fused_add_rms_norm_batched", torch::kXPU, &esimd_fused_add_rms_norm_batched);
 }
 
 PyMODINIT_FUNC PyInit_custom_esimd_kernels() {
