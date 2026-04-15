@@ -27,6 +27,8 @@
 #include "utils.h"
 #include <cstdint>
 
+namespace xesimd = sycl::ext::intel::experimental::esimd;
+
 /* Hierarchical reduction for simd<float, 128> → scalar.
  * 7 additions instead of 127 for sequential accumulation. */
 ESIMD_INLINE float hreduce128(simd<float, 128> v) {
@@ -90,8 +92,22 @@ struct NormGEMV_int4_kernel {
 
         simd<float, 128> acc = 0.0f;
 
+        // Prefetch first head's weight (16 int32 = 64B)
+        if (h_start < h_end) {
+            xesimd::lsc_prefetch<int32_t, 16, xesimd::lsc_data_size::default_size,
+                xesimd::cache_hint::uncached, xesimd::cache_hint::cached>(
+                gemv_weight + (size_t)n * packed_K + h_start * V / PACK);
+        }
+
         for (int h = h_start; h < h_end; h++) {
             const int offset = h * V;
+
+            // Prefetch next head's weight
+            if (h + 1 < h_end) {
+                xesimd::lsc_prefetch<int32_t, 16, xesimd::lsc_data_size::default_size,
+                    xesimd::cache_hint::uncached, xesimd::cache_hint::cached>(
+                    gemv_weight + (size_t)n * packed_K + (h + 1) * V / PACK);
+            }
 
             // ── Load x, z for this head ──
             simd<float, 128> x_f = block_load<fp16, 128>(x_ptr + offset);

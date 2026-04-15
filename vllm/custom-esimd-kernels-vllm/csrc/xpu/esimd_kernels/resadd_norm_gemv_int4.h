@@ -30,6 +30,8 @@
 #include "utils.h"
 #include <cstdint>
 
+namespace xesimd = sycl::ext::intel::experimental::esimd;
+
 struct ResAddNormGEMV_int4_pert_kernel {
     fp16*          hidden_ptr;
     fp16*          residual_ptr;
@@ -71,8 +73,20 @@ struct ResAddNormGEMV_int4_pert_kernel {
             simd<float, 8>(sum_sq / (float)K + eps))[0];
 
         simd<float, VL> acc = 0.0f;
+        // Prefetch first chunk's weight
+        if (n_chunks > 0) {
+            xesimd::lsc_prefetch<int32_t, 16, xesimd::lsc_data_size::default_size,
+                xesimd::cache_hint::uncached, xesimd::cache_hint::cached>(
+                gemv_weight + (size_t)n * packed_K);
+        }
         for (int c = 0; c < n_chunks; c++) {
             int off = c * VL;
+            // Prefetch next chunk's weight (16 int32 = 64B)
+            if (c + 1 < n_chunks) {
+                xesimd::lsc_prefetch<int32_t, 16, xesimd::lsc_data_size::default_size,
+                    xesimd::cache_hint::uncached, xesimd::cache_hint::cached>(
+                    gemv_weight + (size_t)n * packed_K + (c + 1) * (VL / PACK));
+            }
             simd<float, VL> hv = block_load<fp16, VL>(hidden_ptr + off);
             simd<float, VL> rv = block_load<fp16, VL>(residual_ptr + off);
             simd<float, VL> added = hv + rv;
@@ -148,9 +162,24 @@ struct ResAddNormGEMV_int4_pert_kernel {
 
         // Pass 2: normalize from register array + INT4 GEMV
         simd<float, 128> acc = 0.0f;
+        constexpr int PACKED_PER_VL = VL / PACK;  // 64
+
+        // Prefetch first chunk's weight (64 int32 = 256B)
+        if (n_chunks > 0) {
+            xesimd::lsc_prefetch<int32_t, 64, xesimd::lsc_data_size::default_size,
+                xesimd::cache_hint::uncached, xesimd::cache_hint::cached>(
+                gemv_weight + (size_t)n * packed_K);
+        }
 
         for (int c = 0; c < n_chunks; c++) {
             int offset = c * VL;
+
+            // Prefetch next chunk's weight (64 int32 = 256B)
+            if (c + 1 < n_chunks) {
+                xesimd::lsc_prefetch<int32_t, 64, xesimd::lsc_data_size::default_size,
+                    xesimd::cache_hint::uncached, xesimd::cache_hint::cached>(
+                    gemv_weight + (size_t)n * packed_K + (c + 1) * PACKED_PER_VL);
+            }
 
             simd<float, VL> nw = block_load<fp16, VL>(norm_w_ptr + offset);
             simd<float, VL> normed = res_chunks[c] * inv_rms * nw;
@@ -160,7 +189,6 @@ struct ResAddNormGEMV_int4_pert_kernel {
             }
 
             // Coalesced weight load: 4 blocks × 16 int32 = 64 int32 at once
-            constexpr int PACKED_PER_VL = VL / PACK;  // 64
             simd<int32_t, PACKED_PER_VL> all_packed = block_load<int32_t, PACKED_PER_VL>(
                 gemv_weight + (size_t)n * packed_K + c * PACKED_PER_VL);
             simd<uint32_t, PACKED_PER_VL> all_u =
@@ -277,9 +305,23 @@ struct ResAddNormGEMV_int4_ksplit_kernel {
         // ── Pass 2: re-read h+r (L3 hit), normalize, write-back, INT4 GEMV ──
         simd<float, VL> acc = 0.0f;
 
+        // Prefetch first chunk's weight (16 int32 = 64B)
+        if (n_chunks > 0) {
+            xesimd::lsc_prefetch<int32_t, 16, xesimd::lsc_data_size::default_size,
+                xesimd::cache_hint::uncached, xesimd::cache_hint::cached>(
+                gemv_weight + (size_t)n * packed_K + k_start / PACK);
+        }
+
         for (int c = 0; c < n_chunks; c++) {
             int off = k_start + c * VL;
             int blk_idx = off / BLOCK_SIZE;
+
+            // Prefetch next chunk's weight
+            if (c + 1 < n_chunks) {
+                xesimd::lsc_prefetch<int32_t, 16, xesimd::lsc_data_size::default_size,
+                    xesimd::cache_hint::uncached, xesimd::cache_hint::cached>(
+                    gemv_weight + (size_t)n * packed_K + (k_start + (c + 1) * VL) / PACK);
+            }
 
             simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + off);
             simd<float, VL> r = block_load<fp16, VL>(residual_ptr + off);
