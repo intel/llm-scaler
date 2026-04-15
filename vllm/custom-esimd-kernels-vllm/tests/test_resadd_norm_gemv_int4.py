@@ -58,8 +58,10 @@ def ref_resadd_norm_gemv_fp16(hidden, residual, norm_weight, weight_fp16, eps):
 @pytest.mark.parametrize("N,K", [
     (16, 128),
     (32, 256),
-    (128, 2048),     # Qwen3-Next: router N=128, K=2048
-    (128, 4096),     # Qwen3.5: router N=128, K=4096
+    (256, 512),      # K_SPLIT=2 path
+    (512, 2048),     # K_SPLIT=4 path
+    (128, 2048),     # Qwen3-Next: router N=128, K=2048 (K_SPLIT=8)
+    (128, 4096),     # Qwen3.5: router N=128, K=4096 (K_SPLIT=8)
 ])
 def test_resadd_norm_gemv_correctness(N, K):
     """Fused kernel should match step-by-step reference."""

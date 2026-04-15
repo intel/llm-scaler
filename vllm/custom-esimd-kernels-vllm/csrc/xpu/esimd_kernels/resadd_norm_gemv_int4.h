@@ -205,18 +205,179 @@ struct ResAddNormGEMV_int4_pert_kernel {
     }
 };
 
+/* ================================================================
+ * K_SPLIT variant: multiple threads per WG split K-dimension.
+ * Two-pass memory re-read (mirrors resadd_norm_gemv2_fused.h):
+ *   Pass 1: each thread computes partial sum_sq → SLM reduce → inv_rms
+ *   Pass 2: each thread re-reads h+r (L3 hit), normalizes, INT4 GEMV
+ *           → SLM reduce → output dot product
+ *
+ * Eliminates register arrays; L3 cache absorbs the redundant reads.
+ * Grid: N work-groups × K_SPLIT threads per WG.
+ * Each thread handles K/K_SPLIT elements (multiple of BLOCK_SIZE=128).
+ * ================================================================ */
+template<int K_SPLIT>
+struct ResAddNormGEMV_int4_ksplit_kernel {
+    fp16*          hidden_ptr;
+    fp16*          residual_ptr;
+    const fp16*    norm_w_ptr;
+    const int32_t* gemv_weight;
+    const fp16*    gemv_scale;
+    fp16*          output;
+    fp16*          normed_out;
+    int N, K;
+    float eps;
+
+    static constexpr int BLOCK_SIZE = 128;
+    static constexpr int PACK = 8;
+    static constexpr int VL = 128;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        static_assert(K_SPLIT > 1, "Use ResAddNormGEMV_int4_pert_kernel for K_SPLIT=1");
+        slm_init<K_SPLIT * sizeof(float)>();
+
+        int n   = item.get_group(0);
+        int lid = item.get_local_id(0);
+        if (n >= N) return;
+
+        const int packed_K = K / PACK;
+        const int num_blocks = K / BLOCK_SIZE;
+        const int k_per_thread = K / K_SPLIT;
+        const int k_start = lid * k_per_thread;
+        const int n_chunks = k_per_thread / VL;
+
+        simd<uint32_t, 8> nib_shifts(0u, 4u);
+
+        // ── Pass 1: partial sum_sq ──
+        float partial_sq = 0.0f;
+        for (int c = 0; c < n_chunks; c++) {
+            int off = k_start + c * VL;
+            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + off);
+            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + off);
+            simd<float, VL> added = h + r;
+
+            simd<float, VL> sq = added * added;
+            sq.select<64,1>(0) += sq.select<64,1>(64);
+            sq.select<32,1>(0) += sq.select<32,1>(32);
+            sq.select<16,1>(0) += sq.select<16,1>(16);
+            sq.select<8,1>(0)  += sq.select<8,1>(8);
+            sq.select<4,1>(0)  += sq.select<4,1>(4);
+            sq.select<2,1>(0)  += sq.select<2,1>(2);
+            partial_sq += (float)sq[0] + (float)sq[1];
+        }
+
+        // SLM reduce for sum_sq — all threads compute inv_rms redundantly
+        slm_block_store<float, 1>(lid * sizeof(float), simd<float, 1>(partial_sq));
+        barrier();
+        simd<float, K_SPLIT> sq_parts = slm_block_load<float, K_SPLIT>(0);
+        float total_sq = reduce<float>(sq_parts, std::plus<>());
+        float inv_rms = sycl::ext::intel::esimd::rsqrt(
+            simd<float, 8>(total_sq / (float)K + eps))[0];
+
+        // ── Pass 2: re-read h+r (L3 hit), normalize, write-back, INT4 GEMV ──
+        simd<float, VL> acc = 0.0f;
+
+        for (int c = 0; c < n_chunks; c++) {
+            int off = k_start + c * VL;
+            int blk_idx = off / BLOCK_SIZE;
+
+            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + off);
+            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + off);
+            simd<float, VL> nw = block_load<fp16, VL>(norm_w_ptr + off);
+            simd<float, VL> added = h + r;
+            simd<float, VL> normed = added * inv_rms * nw;
+
+            // WG 0: each thread writes its own K-range
+            if (n == 0) {
+                block_store<fp16, VL>(residual_ptr + off, simd<fp16, VL>(added));
+                block_store<fp16, VL>(normed_out + off, simd<fp16, VL>(normed));
+            }
+
+            // INT4 dequant + FMA (one block per VL=128 chunk)
+            simd<int32_t, 16> packed = block_load<int32_t, 16>(
+                gemv_weight + (size_t)n * packed_K + off / PACK);
+            simd<uint32_t, 16> u_packed =
+                packed.template bit_cast_view<uint32_t>().read();
+
+            float s = (float)gemv_scale[(size_t)n * num_blocks + blk_idx];
+            float neg_8s = -8.0f * s;
+
+            #pragma unroll
+            for (int i = 0; i < 16; i++) {
+                simd<uint32_t, 8> nib = (simd<uint32_t, 8>(u_packed[i]) >> nib_shifts) & 0xFu;
+                simd<float, 8> w = convert<float>(nib) * s + neg_8s;
+                acc.select<8, 1>(i * 8) += normed.select<8, 1>(i * 8) * w;
+            }
+        }
+
+        // Reduce acc → scalar partial dot
+        acc.select<64,1>(0) += acc.select<64,1>(64);
+        acc.select<32,1>(0) += acc.select<32,1>(32);
+        acc.select<16,1>(0) += acc.select<16,1>(16);
+        acc.select<8,1>(0)  += acc.select<8,1>(8);
+        acc.select<4,1>(0)  += acc.select<4,1>(4);
+        acc.select<2,1>(0)  += acc.select<2,1>(2);
+        float my_dot = (float)acc[0] + (float)acc[1];
+
+        // SLM reduce for dot product → thread 0 writes output
+        slm_block_store<float, 1>(lid * sizeof(float), simd<float, 1>(my_dot));
+        barrier();
+        if (lid == 0) {
+            simd<float, K_SPLIT> dot_parts = slm_block_load<float, K_SPLIT>(0);
+            output[n] = fp16(reduce<float>(dot_parts, std::plus<>()));
+        }
+    }
+};
+
+/* Host dispatcher — auto-selects K_SPLIT based on N and K */
 inline void resadd_norm_gemv_int4_pert_host(
     fp16* hidden_ptr, fp16* residual_ptr, const fp16* norm_w_ptr,
     const int32_t* gemv_weight, const fp16* gemv_scale,
     fp16* output, fp16* normed_out,
     int N, int K, float eps, sycl::queue& q)
 {
-    q.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(
-            sycl::nd_range<1>(N, 1),
-            ResAddNormGEMV_int4_pert_kernel{
-                hidden_ptr, residual_ptr, norm_w_ptr,
-                gemv_weight, gemv_scale, output, normed_out,
-                N, K, eps});
-    });
+    // K_SPLIT: more threads per WG when N is small and K is large.
+    // Mirrors fp8_GEMV_v2.h select_vl_ks() thresholds.
+    int ks = 1;
+    if      (N <= 128 && K >= 2048) ks = 8;
+    else if (N <= 512 && K >= 2048) ks = 4;
+    else if (N <= 512 && K >= 512)  ks = 2;
+
+    // Safety: k_per_thread must be a multiple of BLOCK_SIZE=128
+    while (ks > 1 && (K % (ks * 128) != 0)) ks /= 2;
+
+    if (ks <= 1) {
+        // Original optimized kernel (VL=512 register-cached path)
+        q.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<1>(N, 1),
+                ResAddNormGEMV_int4_pert_kernel{
+                    hidden_ptr, residual_ptr, norm_w_ptr,
+                    gemv_weight, gemv_scale, output, normed_out,
+                    N, K, eps});
+        });
+        return;
+    }
+
+    int global = N * ks;
+    int local  = ks;
+
+    #define LAUNCH_RESADD_INT4_KS(S) \
+        q.submit([&](sycl::handler& cgh) { \
+            cgh.parallel_for( \
+                sycl::nd_range<1>(global, local), \
+                ResAddNormGEMV_int4_ksplit_kernel<S>{ \
+                    hidden_ptr, residual_ptr, norm_w_ptr, \
+                    gemv_weight, gemv_scale, output, normed_out, \
+                    N, K, eps}); \
+        });
+
+    switch (ks) {
+        case 8: LAUNCH_RESADD_INT4_KS(8); break;
+        case 4: LAUNCH_RESADD_INT4_KS(4); break;
+        case 2: LAUNCH_RESADD_INT4_KS(2); break;
+        default: break;
+    }
+
+    #undef LAUNCH_RESADD_INT4_KS
 }

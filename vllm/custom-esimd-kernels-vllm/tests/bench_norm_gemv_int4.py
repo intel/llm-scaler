@@ -100,7 +100,7 @@ def main():
         (4,  128, 32,   "small:   HV=4  N=32"),
         (8,  128, 256,  "mid:     HV=8  N=256"),
         (8,  128, 2048, "Qwen3-Next-80B: HV=8  N=2048"),
-        (16, 128, 4096, "large:   HV=16 N=4096"),
+        (8,  128, 3072, "Qwen3.5-122B-A10B: HV=8  N=3072"),
     ]
 
     print(f"{'Config':<40} {'Fused (us)':>10} {'Separate (us)':>14} {'Speedup':>8}")

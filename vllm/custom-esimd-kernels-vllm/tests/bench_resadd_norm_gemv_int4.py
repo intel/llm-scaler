@@ -78,12 +78,14 @@ def main():
     args = parser.parse_args()
 
     configs = [
-        # (N, K, label)
-        (16, 128,  "minimal:  N=16   K=128"),
-        (32, 256,  "small:    N=32   K=256"),
-        (128, 2048, "Qwen3-Next: N=128  K=2048"),
-        (128, 4096, "Qwen3.5:    N=128  K=4096"),
-        (512, 2048, "large:    N=512  K=2048"),
+        # (N, K, label)                              K_SPLIT
+        (16, 128,  "minimal:  N=16   K=128"),       # ks=1
+        (32, 256,  "small:    N=32   K=256"),        # ks=1
+        (256, 512, "ks=2:     N=256  K=512"),        # ks=2
+        (512, 2048, "ks=4:    N=512  K=2048"),       # ks=4
+        (128, 2048, "Qwen3-Next: N=128  K=2048"),    # ks=8
+        (128, 4096, "Qwen3.5:    N=128  K=4096"),    # ks=8
+        (256, 3072, "Qwen3.5-122B-A10B: N=256  K=3072"),  # ks=4
     ]
 
     print(f"{'Config':<40} {'INT4 (us)':>10} {'FP8 (us)':>10} {'Ratio':>8}")
