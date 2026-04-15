@@ -725,3 +725,62 @@ def moe_forward_full(
         shared_down_weight, shared_down_scale,
         shared_expert_gate_weight,
         top_k, num_shared_experts, n_routed_experts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MoE INT4 Batch ops
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_moe_int4 = torch.ops.moe_int4_ops
+
+
+def moe_router_forward_int4(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """INT4 router GEMV: x @ dequant(weight).T → logits.
+
+    x:      [n_tokens, hidden_size] fp16
+    weight: [num_experts, hidden_size//8] int32 (IPEX physically transposed to [E, K_packed])
+    scale:  [hidden_size//128, num_experts] fp16 (original layout, kernel handles stride)
+    Returns: [n_tokens, num_experts] fp16
+    """
+    return _moe_int4.moe_router_forward_int4(x, weight, scale)
+
+
+def moe_forward_full_int4(
+    x: torch.Tensor,
+    logits: torch.Tensor,
+    gate_up_qweight: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    down_qweight: torch.Tensor,
+    down_scales: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_expert_gate_weight: torch.Tensor,
+    top_k: int,
+    num_shared_experts: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """INT4 MoE full forward: topk + up + down + finalize in one C++ call.
+
+    Routed expert weights are INT4 (packed int32 + per-group fp16 scales).
+    Shared expert weights are FP16 (NOT quantized, no scale parameter).
+
+    gate_up_qweight:          [E, 2*d_ff, d_model//8] int32
+    gate_up_scales:           [E, 2*d_ff, d_model//128] fp16
+    shared_gate_up_weight:    [2*d_ff_shared, d_model] fp16
+    down_qweight:             [E, d_model, d_ff//8] int32
+    down_scales:              [E, d_model, d_ff//128] fp16
+    shared_down_weight:       [d_model, d_ff_shared] fp16
+    shared_expert_gate_weight: [1, d_model] fp16
+    """
+    return _moe_int4.moe_forward_full_int4(
+        x, logits,
+        gate_up_qweight, gate_up_scales,
+        shared_gate_up_weight,
+        down_qweight, down_scales,
+        shared_down_weight,
+        shared_expert_gate_weight,
+        top_k, num_shared_experts, n_routed_experts)

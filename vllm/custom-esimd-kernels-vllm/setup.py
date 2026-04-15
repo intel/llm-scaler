@@ -146,14 +146,16 @@ ext_modules.append(
 )
 ### Eagle kernels
 
-### MoE Batch kernels (Router, TopK, Up/Down, Accumulate) — from custom-esimd-kernels-vllm-moe-batch-test
+### MoE Batch kernels (Router, TopK, Up/Down, Accumulate) — FP8
 ext_modules.append(
     SyclExtension(
         name="custom_esimd_kernels_vllm.moe_ops",
         sources=[
             "csrc/moe_batch/moe.sycl",
         ],
-        include_dirs=[],
+        include_dirs=[
+            root / "csrc" / "moe_batch",
+        ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++20"],
             "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
@@ -163,7 +165,28 @@ ext_modules.append(
         py_limited_api=False,
     )
 )
-### MoE Batch kernels
+### MoE Batch kernels (FP8)
+
+### MoE INT4 Batch kernels (Router, TopK, Up/Down, Finalize) — INT4
+ext_modules.append(
+    SyclExtension(
+        name="custom_esimd_kernels_vllm.moe_int4_ops",
+        sources=[
+            "csrc/moe_batch/moe_int4.sycl",
+        ],
+        include_dirs=[
+            root / "csrc" / "moe_batch",
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++20"],
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     f"-I{torch_include}"],
+        },
+        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+        py_limited_api=False,
+    )
+)
+### MoE INT4 Batch kernels
 
 setup(
     name="custom-esimd-kernels-vllm",

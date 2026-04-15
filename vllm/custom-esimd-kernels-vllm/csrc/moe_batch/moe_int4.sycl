@@ -1,0 +1,866 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// INT4 ESIMD MOE Kernels for Qwen3.5-35B-A3B (sym_int4 quantization)
+//
+// Weight format: GGML Q4_0 — 8 INT4 nibbles packed per int32, per-group fp16
+// scale with group_size=128. Dequant: float_val = (nibble_unsigned - 8) * scale.
+//
+// IPEX GatedMLPMOE modifies expert weights IN-PLACE from [E, N, K_packed] to
+// [E, K_packed, N] (contiguous, physically moved). This kernel reads IPEX's
+// format directly — no weight cloning needed.
+//
+// Router uses IPEX's IPEXWeightOnlyQuantizedLinear (gate weight is internally
+// repacked by IPEX in a format we don't replicate).
+//
+// Shared expert weights: FP16 (NOT quantized, no scale).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+
+#include "moe_topk.h"
+
+using fp16 = sycl::half;
+using namespace sycl::ext::intel::esimd;
+using namespace sycl::ext::intel::esimd::xmx;
+namespace xesimd = sycl::ext::intel::experimental::esimd;
+
+static inline sycl::event submit_kernel(
+    std::function<void(sycl::handler&)> kernel,
+    const torch::Device& device,
+    const char* desc) {
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(device.index()).queue();
+    return queue.submit(kernel);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Router GEMV (INT4)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Gate weight after IPEX: physically transposed to [E, K_packed] in memory.
+// Gate scale: NOT modified by IPEX, remains [K_groups, E] — kernel reads with stride.
+// Weight: [num_experts, hidden_size//8] int32 (packed, row per expert)
+// Scale:  [hidden_size//128, num_experts] fp16 (K_groups-major, NOT transposed)
+
+// -- Option A: weight-reuse, 1 WI per expert, n_tokens <= 4 --
+void moe_router_forward_int4_kernel(
+    const fp16* x,
+    const uint32_t* weight,
+    const fp16* scale,
+    fp16* output,
+    const int n_tokens, const int hidden_size, const int num_experts,
+    const torch::Device& device) {
+
+    const int K_packed = hidden_size / 8;
+    const int n_groups = hidden_size / 128;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeRouterForwardInt4>(
+            sycl::range<1>(num_experts),
+            [=](sycl::id<1> idx) SYCL_ESIMD_KERNEL {
+                const int row = (int)idx[0];
+                const uint32_t* w_row = weight + (size_t)row * K_packed;
+
+                simd<float, 64> acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
+
+                for (int k = 0; k < hidden_size; k += 64) {
+                    int kp = k / 8;
+                    int gi = k / 128;
+                    // scale layout: [K_groups, num_experts] — strided access
+                    fp16 s = scale[gi * num_experts + row];
+
+                    simd<uint32_t, 8> packed = block_load<uint32_t, 8>(w_row + kp);
+                    // Dequant 8 int32 → 64 fp16
+                    simd<fp16, 64> wv;
+                    #pragma unroll
+                    for (int i = 0; i < 8; i++) {
+                        uint32_t p = packed[i];
+                        #pragma unroll
+                        for (int b = 0; b < 8; b++) {
+                            uint32_t nibble = (p >> (b * 4)) & 0xFu;
+                            wv[i * 8 + b] = fp16(float(nibble) - 8.f) * s;
+                        }
+                    }
+
+                    simd<fp16, 64> xv0 = block_load<fp16, 64>(x + k);
+                    acc0 += convert<float>(xv0 * wv);
+                    if (n_tokens > 1) {
+                        simd<fp16, 64> xv1 = block_load<fp16, 64>(x + (size_t)1 * hidden_size + k);
+                        acc1 += convert<float>(xv1 * wv);
+                    }
+                    if (n_tokens > 2) {
+                        simd<fp16, 64> xv2 = block_load<fp16, 64>(x + (size_t)2 * hidden_size + k);
+                        acc2 += convert<float>(xv2 * wv);
+                    }
+                    if (n_tokens > 3) {
+                        simd<fp16, 64> xv3 = block_load<fp16, 64>(x + (size_t)3 * hidden_size + k);
+                        acc3 += convert<float>(xv3 * wv);
+                    }
+                }
+
+                output[0 * num_experts + row] = fp16(sycl::ext::intel::esimd::detail::sum<float, float, 64>(acc0));
+                if (n_tokens > 1)
+                    output[1 * num_experts + row] = fp16(sycl::ext::intel::esimd::detail::sum<float, float, 64>(acc1));
+                if (n_tokens > 2)
+                    output[2 * num_experts + row] = fp16(sycl::ext::intel::esimd::detail::sum<float, float, 64>(acc2));
+                if (n_tokens > 3)
+                    output[3 * num_experts + row] = fp16(sycl::ext::intel::esimd::detail::sum<float, float, 64>(acc3));
+            });
+    };
+    submit_kernel(cgf, device, "moe router forward int4");
+}
+
+// -- Option C: 1 WI per (token, expert), n_tokens > 4 --
+void moe_router_forward_int4_wide_kernel(
+    const fp16* x,
+    const uint32_t* weight,
+    const fp16* scale,
+    fp16* output,
+    const int n_tokens, const int hidden_size, const int num_experts,
+    const torch::Device& device) {
+
+    const int K_packed = hidden_size / 8;
+    const int n_groups = hidden_size / 128;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeRouterForwardInt4Wide>(
+            sycl::range<2>(n_tokens, num_experts),
+            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
+                const int token = (int)idx[0];
+                const int row   = (int)idx[1];
+                const uint32_t* w_row = weight + (size_t)row * K_packed;
+
+                simd<float, 64> acc(0.f);
+                for (int k = 0; k < hidden_size; k += 64) {
+                    int kp = k / 8;
+                    int gi = k / 128;
+                    // scale layout: [K_groups, num_experts]
+                    fp16 s = scale[gi * num_experts + row];
+
+                    simd<uint32_t, 8> packed = block_load<uint32_t, 8>(w_row + kp);
+                    simd<fp16, 64> wv;
+                    #pragma unroll
+                    for (int i = 0; i < 8; i++) {
+                        uint32_t p = packed[i];
+                        #pragma unroll
+                        for (int b = 0; b < 8; b++) {
+                            uint32_t nibble = (p >> (b * 4)) & 0xFu;
+                            wv[i * 8 + b] = fp16(float(nibble) - 8.f) * s;
+                        }
+                    }
+
+                    simd<fp16, 64> xv = block_load<fp16, 64>(
+                        x + (size_t)token * hidden_size + k);
+                    acc += convert<float>(xv * wv);
+                }
+
+                output[token * num_experts + row] = fp16(
+                    sycl::ext::intel::esimd::detail::sum<float, float, 64>(acc));
+            });
+    };
+    submit_kernel(cgf, device, "moe router forward int4 wide");
+}
+
+// -- Host dispatch --
+torch::Tensor moe_router_forward_int4(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor scale) {
+
+    TORCH_CHECK(x.dim() == 2 && x.is_contiguous() && x.scalar_type() == torch::kHalf);
+    TORCH_CHECK(weight.scalar_type() == torch::kInt);
+    TORCH_CHECK(scale.scalar_type() == torch::kHalf);
+
+    int n_tokens = x.size(0);
+    int hidden_size = x.size(1);
+    int K_packed = hidden_size / 8;
+
+    TORCH_CHECK(hidden_size % 128 == 0);
+
+    // Gate weight may be [E, K_packed] (IPEX transposed) or [K_packed, E] (SymInt4 original).
+    // For square matrices (35B: 256×256) both look the same.
+    // For non-square (122B: 384×256) we detect and transpose if needed.
+    if (weight.size(0) == K_packed && weight.size(1) != K_packed) {
+        // [K_packed, E] → transpose to [E, K_packed]
+        weight = weight.t().contiguous();
+    }
+    int num_experts = weight.size(0);
+    TORCH_CHECK(weight.size(1) == K_packed,
+        "gate weight shape mismatch: got [", weight.size(0), ", ", weight.size(1),
+        "], expected [num_experts, ", K_packed, "]");
+
+    // Scale may be [K_groups, E] or [E, K_groups] — kernel reads [K_groups, E] with stride
+    // Detect and transpose if needed
+    int K_groups = hidden_size / 128;
+    if (scale.size(0) == num_experts && scale.size(1) == K_groups) {
+        // [E, K_groups] → transpose to [K_groups, E]
+        scale = scale.t().contiguous();
+    }
+    TORCH_CHECK(scale.size(0) == K_groups && scale.size(1) == num_experts,
+        "gate scale shape mismatch: got [", scale.size(0), ", ", scale.size(1),
+        "], expected [", K_groups, ", ", num_experts, "]");
+
+    torch::Tensor output = torch::empty({n_tokens, num_experts},
+        torch::device(x.device()).dtype(torch::kHalf));
+
+    if (n_tokens <= 4) {
+        moe_router_forward_int4_kernel(
+            (const fp16*)x.data_ptr(), (const uint32_t*)weight.data_ptr(),
+            (const fp16*)scale.data_ptr(), (fp16*)output.data_ptr(),
+            n_tokens, hidden_size, num_experts, x.device());
+    } else {
+        moe_router_forward_int4_wide_kernel(
+            (const fp16*)x.data_ptr(), (const uint32_t*)weight.data_ptr(),
+            (const fp16*)scale.data_ptr(), (fp16*)output.data_ptr(),
+            n_tokens, hidden_size, num_experts, x.device());
+    }
+    return output;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Kernel 1: Fused Gate+Up+SiLU — Routed experts (INT4, IPEX K-major + marlin shuffled)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Weight layout (IPEX): [E, K_packed, 2*d_ff] int32, marlin shuffled nibbles
+// Scale layout (IPEX):  [E, K_groups, 2*d_ff] fp16
+// 1 WI computes 16 consecutive outputs along N (contiguous in IPEX layout)
+
+void moe_up_routed_int4_kernel(
+    const fp16* x,
+    const uint32_t* gate_up_qweight,  // [E, K_packed, 2*d_ff] IPEX format
+    const fp16* gate_up_scales,       // [E, K_groups, 2*d_ff] IPEX format
+    const int* selected_experts,
+    fp16* intermediates,
+    const int n_tokens, const int hidden_size, const int intermediate_size,
+    const int top_k, const int rows_per_token,
+    const torch::Device& device) {
+
+    const int K_packed = hidden_size / 8;
+    const int K_groups = hidden_size / 128;
+    const int two_dff = 2 * intermediate_size;
+    const int n_out_tiles = intermediate_size / 16;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeUpRoutedInt4>(
+            sycl::range<2>(n_tokens * top_k, n_out_tiles),
+            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
+                const int route_idx = (int)idx[0];
+                const int tile_idx  = (int)idx[1];
+                const int token     = route_idx / top_k;
+                const int k_idx     = route_idx % top_k;
+                const int n_start   = tile_idx * 16;
+
+                const int eid = selected_experts[route_idx];
+                const fp16* x_row = x + (size_t)token * hidden_size;
+
+                // IPEX K-major: base at [eid, 0, 0]
+                const uint32_t* w_base = gate_up_qweight + (size_t)eid * K_packed * two_dff;
+                const fp16* s_base = gate_up_scales + (size_t)eid * K_groups * two_dff;
+
+                const int g_offset = n_start;
+                const int u_offset = intermediate_size + n_start;
+
+                simd<float, 16> gate_acc(0.f), up_acc(0.f);
+
+                // Marlin unshuffle: nibble position → K offset mapping
+                // IPEX shuffled nibble order: [K0, K4, K1, K5, K2, K6, K3, K7]
+                // To read K values 0..7 in order, read from positions:
+                //   K0→pos0, K1→pos2, K2→pos4, K3→pos6, K4→pos1, K5→pos3, K6→pos5, K7→pos7
+                constexpr int unshuffle[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+
+                for (int kp = 0; kp < K_packed; kp++) {
+                    // block_load 16 int32 along N (contiguous in IPEX layout)
+                    simd<uint32_t, 16> g_packed = block_load<uint32_t, 16>(
+                        w_base + (size_t)kp * two_dff + g_offset);
+                    simd<uint32_t, 16> u_packed = block_load<uint32_t, 16>(
+                        w_base + (size_t)kp * two_dff + u_offset);
+
+                    // Scale: [E, K_groups, N] — changes every 16 kp
+                    int kg = kp / 16;
+                    simd<fp16, 16> g_scale = block_load<fp16, 16>(
+                        s_base + (size_t)kg * two_dff + g_offset);
+                    simd<fp16, 16> u_scale = block_load<fp16, 16>(
+                        s_base + (size_t)kg * two_dff + u_offset);
+
+                    #pragma unroll
+                    for (int b = 0; b < 8; b++) {
+                        int nib_pos = unshuffle[b];  // reverse marlin shuffle
+                        simd<uint32_t, 16> g_nib = (g_packed >> (nib_pos * 4)) & 0xFu;
+                        simd<uint32_t, 16> u_nib = (u_packed >> (nib_pos * 4)) & 0xFu;
+
+                        simd<float, 16> g_dq = (convert<float>(g_nib) - 8.f)
+                                             * convert<float>(g_scale);
+                        simd<float, 16> u_dq = (convert<float>(u_nib) - 8.f)
+                                             * convert<float>(u_scale);
+
+                        float xv = (float)x_row[kp * 8 + b];
+                        gate_acc += g_dq * xv;
+                        up_acc   += u_dq * xv;
+                    }
+                }
+
+                simd<float, 16> silu = gate_acc / (1.f + exp(-gate_acc));
+                simd<float, 16> result = silu * up_acc;
+
+                const int routed_row = token * rows_per_token + k_idx;
+                block_store<fp16, 16>(
+                    intermediates + (size_t)routed_row * intermediate_size + n_start,
+                    convert<fp16>(result));
+            });
+    };
+
+    submit_kernel(cgf, device, "moe up routed int4");
+}
+
+// ── SLM reduction version: GS work-items cooperate on 16 outputs ────────────
+// Used when WI count is too low (small D or small batch).
+// GS WIs split the K-loop, accumulate partial sums in SLM, then reduce.
+
+void moe_up_routed_int4_slm_kernel(
+    const fp16* x,
+    const uint32_t* gate_up_qweight,
+    const fp16* gate_up_scales,
+    const int* selected_experts,
+    fp16* intermediates,
+    const int n_tokens, const int hidden_size, const int intermediate_size,
+    const int top_k, const int rows_per_token,
+    const torch::Device& device) {
+
+    const int K_packed = hidden_size / 8;
+    const int K_groups = hidden_size / 128;
+    const int two_dff = 2 * intermediate_size;
+    const int n_out_tiles = intermediate_size / 16;
+    constexpr int GS = 16;  // group size: WIs cooperating per output tile
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeUpRoutedInt4SLM>(
+            sycl::nd_range<2>(
+                sycl::range<2>(n_tokens * top_k, n_out_tiles * GS),
+                sycl::range<2>(1, GS)),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                // SLM: GS slots × 2 (gate+up) × 16 floats = GS*128 bytes
+                slm_init<GS * 2 * 16 * sizeof(float)>();
+
+                const int route_idx = (int)item.get_global_id(0);
+                const int tile_idx  = (int)item.get_group(1);
+                const int tid       = (int)item.get_local_id(1);
+                const int token     = route_idx / top_k;
+                const int k_idx     = route_idx % top_k;
+                const int n_start   = tile_idx * 16;
+
+                const int eid = selected_experts[route_idx];
+                const fp16* x_row = x + (size_t)token * hidden_size;
+
+                const uint32_t* w_base = gate_up_qweight + (size_t)eid * K_packed * two_dff;
+                const fp16* s_base = gate_up_scales + (size_t)eid * K_groups * two_dff;
+
+                const int g_offset = n_start;
+                const int u_offset = intermediate_size + n_start;
+
+                constexpr int unshuffle[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+
+                // Each WI processes a subset of K_packed
+                simd<float, 16> gate_acc(0.f), up_acc(0.f);
+                for (int kp = tid; kp < K_packed; kp += GS) {
+                    simd<uint32_t, 16> g_packed = block_load<uint32_t, 16>(
+                        w_base + (size_t)kp * two_dff + g_offset);
+                    simd<uint32_t, 16> u_packed = block_load<uint32_t, 16>(
+                        w_base + (size_t)kp * two_dff + u_offset);
+
+                    int kg = kp / 16;
+                    simd<fp16, 16> g_scale = block_load<fp16, 16>(
+                        s_base + (size_t)kg * two_dff + g_offset);
+                    simd<fp16, 16> u_scale = block_load<fp16, 16>(
+                        s_base + (size_t)kg * two_dff + u_offset);
+
+                    #pragma unroll
+                    for (int b = 0; b < 8; b++) {
+                        int nib_pos = unshuffle[b];
+                        simd<uint32_t, 16> g_nib = (g_packed >> (nib_pos * 4)) & 0xFu;
+                        simd<uint32_t, 16> u_nib = (u_packed >> (nib_pos * 4)) & 0xFu;
+
+                        simd<float, 16> g_dq = (convert<float>(g_nib) - 8.f) * convert<float>(g_scale);
+                        simd<float, 16> u_dq = (convert<float>(u_nib) - 8.f) * convert<float>(u_scale);
+
+                        float xv = (float)x_row[kp * 8 + b];
+                        gate_acc += g_dq * xv;
+                        up_acc   += u_dq * xv;
+                    }
+                }
+
+                // Write partial sums to SLM
+                uint32_t slm_off = (uint32_t)(tid * 2 * 16) * 4u;  // tid * 128 bytes
+                slm_block_store<float, 16>(slm_off, gate_acc);
+                slm_block_store<float, 16>(slm_off + 64u, up_acc);
+
+                barrier();
+
+                // Thread 0 reduces all partial sums
+                if (tid == 0) {
+                    simd<float, 16> g_sum(0.f), u_sum(0.f);
+                    #pragma unroll
+                    for (int i = 0; i < GS; i++) {
+                        uint32_t off = (uint32_t)(i * 2 * 16) * 4u;
+                        g_sum += slm_block_load<float, 16>(off);
+                        u_sum += slm_block_load<float, 16>(off + 64u);
+                    }
+
+                    simd<float, 16> silu = g_sum / (1.f + exp(-g_sum));
+                    simd<float, 16> result = silu * u_sum;
+
+                    const int routed_row = token * rows_per_token + k_idx;
+                    block_store<fp16, 16>(
+                        intermediates + (size_t)routed_row * intermediate_size + n_start,
+                        convert<fp16>(result));
+                }
+            });
+    };
+
+    submit_kernel(cgf, device, "moe up routed int4 slm");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Kernel 2: Fused Gate+Up+SiLU — Shared expert (FP16, NOT quantized)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Weight: [2*inter_shared, hidden_size] fp16 (standard PyTorch layout, unchanged)
+
+void moe_up_shared_fp16_kernel(
+    const fp16* x,
+    const fp16* shared_gate_up_weight,
+    fp16* intermediates,
+    const int n_tokens, const int hidden_size,
+    const int shared_inter_size,    // actual shared expert intermediate_size
+    const int buffer_row_width,     // intermediates buffer row width (= routed d_ff, may be larger)
+    const int top_k, const int num_shared_experts, const int rows_per_token,
+    const torch::Device& device) {
+
+    const int two_inter = 2 * shared_inter_size;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeUpSharedFP16>(
+            sycl::range<2>(n_tokens * num_shared_experts, shared_inter_size),
+            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
+                const int idx0  = (int)idx[0];
+                const int token = idx0 / num_shared_experts;
+                const int sid   = idx0 % num_shared_experts;
+                const int row   = (int)idx[1];
+
+                const fp16* x_row = x + (size_t)token * hidden_size;
+                const fp16* gw = shared_gate_up_weight
+                    + (size_t)sid * two_inter * hidden_size
+                    + (size_t)row * hidden_size;
+                const fp16* uw = shared_gate_up_weight
+                    + (size_t)sid * two_inter * hidden_size
+                    + (size_t)(shared_inter_size + row) * hidden_size;
+
+                simd<float, 64> ag(0.f), au(0.f);
+                for (int k = 0; k < hidden_size; k += 64) {
+                    auto xv = block_load<fp16, 64>(x_row + k);
+                    auto g  = block_load<fp16, 64>(gw + k);
+                    auto u  = block_load<fp16, 64>(uw + k);
+                    ag += convert<float>(xv * g);
+                    au += convert<float>(xv * u);
+                }
+
+                float gv = sycl::ext::intel::esimd::detail::sum<float, float, 64>(ag);
+                float uv = sycl::ext::intel::esimd::detail::sum<float, float, 64>(au);
+
+                float silu_g = gv / (1.f + sycl::exp(-gv));
+                const int shared_row = token * rows_per_token + top_k + sid;
+                // Use buffer_row_width as stride (may differ from shared_inter_size)
+                intermediates[(size_t)shared_row * buffer_row_width + row] = fp16(silu_g * uv);
+            });
+    };
+
+    submit_kernel(cgf, device, "moe up shared fp16");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Kernel 3: Down projection — Routed experts (INT4, IPEX K-major + marlin shuffled)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Weight (IPEX): [E, K_packed_inter, d_model] int32, marlin shuffled
+// Scale (IPEX):  [E, K_groups_inter, d_model] fp16
+// 1 WI computes 16 consecutive hidden outputs along N
+
+void moe_down_routed_int4_kernel(
+    const fp16* intermediates,
+    const uint32_t* down_qweight,     // [E, K_packed_inter, d_model] IPEX format
+    const fp16* down_scales,          // [E, K_groups_inter, d_model] IPEX format
+    const fp16* routing_weights,
+    const int* selected_experts,
+    fp16* output,
+    const int n_tokens, const int hidden_size, const int intermediate_size,
+    const int top_k, const int rows_per_token,
+    const torch::Device& device) {
+
+    const int K_packed = intermediate_size / 8;
+    const int K_groups = intermediate_size / 128;
+    const int n_out_tiles = hidden_size / 16;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeDownRoutedInt4>(
+            sycl::range<2>(n_tokens * top_k, n_out_tiles),
+            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
+                const int route_idx = (int)idx[0];
+                const int tile_idx  = (int)idx[1];
+                const int token     = route_idx / top_k;
+                const int k_idx     = route_idx % top_k;
+                const int n_start   = tile_idx * 16;
+
+                const int eid = selected_experts[route_idx];
+                const int routed_row = token * rows_per_token + k_idx;
+                const fp16* hi = intermediates + (size_t)routed_row * intermediate_size;
+
+                // IPEX K-major layout
+                const uint32_t* w_base = down_qweight + (size_t)eid * K_packed * hidden_size;
+                const fp16* s_base = down_scales + (size_t)eid * K_groups * hidden_size;
+
+                constexpr int unshuffle[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+                simd<float, 16> acc(0.f);
+
+                for (int kp = 0; kp < K_packed; kp++) {
+                    simd<uint32_t, 16> packed = block_load<uint32_t, 16>(
+                        w_base + (size_t)kp * hidden_size + n_start);
+
+                    int kg = kp / 16;
+                    simd<fp16, 16> scale = block_load<fp16, 16>(
+                        s_base + (size_t)kg * hidden_size + n_start);
+
+                    #pragma unroll
+                    for (int b = 0; b < 8; b++) {
+                        int nib_pos = unshuffle[b];
+                        simd<uint32_t, 16> nib = (packed >> (nib_pos * 4)) & 0xFu;
+                        simd<float, 16> dq = (convert<float>(nib) - 8.f)
+                                           * convert<float>(scale);
+                        float hv = (float)hi[kp * 8 + b];
+                        acc += dq * hv;
+                    }
+                }
+
+                float w = (float)routing_weights[route_idx];
+                block_store<fp16, 16>(
+                    output + (size_t)routed_row * hidden_size + n_start,
+                    convert<fp16>(acc * w));
+            });
+    };
+
+    submit_kernel(cgf, device, "moe down routed int4");
+}
+
+// ── SLM reduction version for down routed ────────────────────────────────────
+
+void moe_down_routed_int4_slm_kernel(
+    const fp16* intermediates,
+    const uint32_t* down_qweight,
+    const fp16* down_scales,
+    const fp16* routing_weights,
+    const int* selected_experts,
+    fp16* output,
+    const int n_tokens, const int hidden_size, const int intermediate_size,
+    const int top_k, const int rows_per_token,
+    const torch::Device& device) {
+
+    const int K_packed = intermediate_size / 8;
+    const int K_groups = intermediate_size / 128;
+    const int n_out_tiles = hidden_size / 16;
+    constexpr int GS = 16;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeDownRoutedInt4SLM>(
+            sycl::nd_range<2>(
+                sycl::range<2>(n_tokens * top_k, n_out_tiles * GS),
+                sycl::range<2>(1, GS)),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                slm_init<GS * 16 * sizeof(float)>();
+
+                const int route_idx = (int)item.get_global_id(0);
+                const int tile_idx  = (int)item.get_group(1);
+                const int tid       = (int)item.get_local_id(1);
+                const int token     = route_idx / top_k;
+                const int k_idx     = route_idx % top_k;
+                const int n_start   = tile_idx * 16;
+
+                const int eid = selected_experts[route_idx];
+                const int routed_row = token * rows_per_token + k_idx;
+                const fp16* hi = intermediates + (size_t)routed_row * intermediate_size;
+
+                const uint32_t* w_base = down_qweight + (size_t)eid * K_packed * hidden_size;
+                const fp16* s_base = down_scales + (size_t)eid * K_groups * hidden_size;
+
+                constexpr int unshuffle[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+                simd<float, 16> acc(0.f);
+
+                for (int kp = tid; kp < K_packed; kp += GS) {
+                    simd<uint32_t, 16> packed = block_load<uint32_t, 16>(
+                        w_base + (size_t)kp * hidden_size + n_start);
+
+                    int kg = kp / 16;
+                    simd<fp16, 16> scale = block_load<fp16, 16>(
+                        s_base + (size_t)kg * hidden_size + n_start);
+
+                    #pragma unroll
+                    for (int b = 0; b < 8; b++) {
+                        int nib_pos = unshuffle[b];
+                        simd<uint32_t, 16> nib = (packed >> (nib_pos * 4)) & 0xFu;
+                        simd<float, 16> dq = (convert<float>(nib) - 8.f) * convert<float>(scale);
+                        float hv = (float)hi[kp * 8 + b];
+                        acc += dq * hv;
+                    }
+                }
+
+                uint32_t slm_off = (uint32_t)(tid * 16) * 4u;
+                slm_block_store<float, 16>(slm_off, acc);
+
+                barrier();
+
+                if (tid == 0) {
+                    simd<float, 16> sum(0.f);
+                    #pragma unroll
+                    for (int i = 0; i < GS; i++)
+                        sum += slm_block_load<float, 16>((uint32_t)(i * 16) * 4u);
+
+                    float w = (float)routing_weights[route_idx];
+                    block_store<fp16, 16>(
+                        output + (size_t)routed_row * hidden_size + n_start,
+                        convert<fp16>(sum * w));
+                }
+            });
+    };
+
+    submit_kernel(cgf, device, "moe down routed int4 slm");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Kernel 4: Down Finalize — gate + shared_down(FP16) + accumulate
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void moe_down_finalize_fp16_kernel(
+    const fp16* x,
+    const fp16* intermediates,
+    const fp16* routed_output,
+    const fp16* shared_down_weight,
+    const fp16* shared_expert_gate_weight,
+    fp16* final_output,
+    const int n_tokens, const int hidden_size,
+    const int shared_inter_size,    // actual shared expert intermediate_size
+    const int buffer_row_width,     // intermediates buffer row width (= routed d_ff)
+    const int top_k, const int num_shared_experts, const int rows_per_token,
+    const torch::Device& device) {
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeDownFinalizeFP16>(
+            sycl::range<2>(n_tokens, hidden_size),
+            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
+                const int token = (int)idx[0], j = (int)idx[1];
+
+                // Accumulate routed expert outputs
+                float sum = 0.f;
+                for (int k = 0; k < top_k; k++)
+                    sum += (float)routed_output[
+                        (size_t)(token * rows_per_token + k) * hidden_size + j];
+
+                // Shared experts: gate sigmoid + FP16 down GEMV
+                const fp16* x_row = x + (size_t)token * hidden_size;
+                for (int sid = 0; sid < num_shared_experts; sid++) {
+                    // Gate sigmoid
+                    simd<float, 64> gate_acc(0.f);
+                    for (int gk = 0; gk < hidden_size; gk += 64)
+                        gate_acc += convert<float>(block_load<fp16, 64>(x_row + gk))
+                                  * convert<float>(block_load<fp16, 64>(
+                                        shared_expert_gate_weight + sid * hidden_size + gk));
+                    float gate_w = 1.f / (1.f + sycl::exp(
+                        -sycl::ext::intel::esimd::detail::sum<float, float, 64>(gate_acc)));
+
+                    // Shared down GEMV (FP16) — use buffer_row_width for intermediates stride
+                    const int shared_row = token * rows_per_token + top_k + sid;
+                    const fp16* hi = intermediates + (size_t)shared_row * buffer_row_width;
+                    const fp16* dw = shared_down_weight
+                        + (size_t)sid * hidden_size * shared_inter_size
+                        + (size_t)j * shared_inter_size;
+
+                    simd<float, 64> acc(0.f);
+                    for (int k = 0; k < shared_inter_size; k += 64) {
+                        auto d_fp16 = block_load<fp16, 64>(dw + k);
+                        acc += convert<float>(d_fp16 * block_load<fp16, 64>(hi + k));
+                    }
+                    sum += sycl::ext::intel::esimd::detail::sum<float, float, 64>(acc) * gate_w;
+                }
+
+                final_output[(size_t)token * hidden_size + j] = fp16(sum);
+            });
+    };
+
+    submit_kernel(cgf, device, "moe down finalize fp16");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// moe_forward_full_int4 — Full pipeline: TopK → Up → Down → Finalize
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static thread_local torch::Tensor s_int4_topk_idx, s_int4_topk_weight;
+static thread_local torch::Tensor s_int4_routed_output, s_int4_final_output;
+static thread_local torch::Tensor s_int4_intermediates;
+static thread_local int s_int4_cached_ntokens = -1;
+
+static void ensure_int4_moe_buffers(int n_tokens, int top_k, int num_shared_experts,
+                                     int hidden_size, int intermediate_size,
+                                     const torch::Device& dev) {
+    int rows_per_token = top_k + num_shared_experts;
+    if (s_int4_cached_ntokens != n_tokens) {
+        s_int4_topk_idx = torch::empty({n_tokens, top_k},
+            torch::device(dev).dtype(torch::kInt32));
+        s_int4_topk_weight = torch::empty({n_tokens, top_k},
+            torch::device(dev).dtype(torch::kHalf));
+        s_int4_routed_output = torch::empty(
+            {n_tokens * rows_per_token, hidden_size},
+            torch::device(dev).dtype(torch::kHalf));
+        s_int4_final_output = torch::empty({n_tokens, hidden_size},
+            torch::device(dev).dtype(torch::kHalf));
+        s_int4_intermediates = torch::empty(
+            {n_tokens * rows_per_token, intermediate_size},
+            torch::device(dev).dtype(torch::kHalf));
+        s_int4_cached_ntokens = n_tokens;
+    }
+}
+
+torch::Tensor moe_forward_full_int4(
+    torch::Tensor x, torch::Tensor logits,
+    // Routed experts — INT4 (IPEX K-major layout)
+    torch::Tensor gate_up_qweight, torch::Tensor gate_up_scales,
+    // Shared expert — FP16
+    torch::Tensor shared_gate_up_weight,
+    // Routed experts — INT4 (IPEX K-major layout)
+    torch::Tensor down_qweight, torch::Tensor down_scales,
+    // Shared expert — FP16
+    torch::Tensor shared_down_weight,
+    // Shared expert gate — FP16
+    torch::Tensor shared_expert_gate_weight,
+    int64_t top_k, int64_t num_shared_experts, int64_t n_routed_experts) {
+
+    TORCH_CHECK(x.scalar_type() == torch::kHalf);
+    TORCH_CHECK(gate_up_qweight.scalar_type() == torch::kInt);
+    TORCH_CHECK(gate_up_scales.scalar_type() == torch::kHalf);
+    TORCH_CHECK(shared_gate_up_weight.scalar_type() == torch::kHalf);
+    TORCH_CHECK(down_qweight.scalar_type() == torch::kInt);
+    TORCH_CHECK(down_scales.scalar_type() == torch::kHalf);
+    TORCH_CHECK(shared_down_weight.scalar_type() == torch::kHalf);
+
+    int n_tokens = x.size(0), hidden_size = x.size(1);
+    // IPEX K-major layout: gate_up_qweight [E, K_packed, 2*d_ff]
+    int two_dff = gate_up_qweight.size(2);
+    int intermediate_size = two_dff / 2;
+    int rows_per_token = top_k + num_shared_experts;
+
+    // Shared expert intermediate size
+    int shared_intermediate_size = shared_gate_up_weight.size(0) / 2;
+
+    TORCH_CHECK(intermediate_size % 16 == 0, "intermediate_size must be divisible by 16");
+    TORCH_CHECK(hidden_size % 16 == 0, "hidden_size must be divisible by 16");
+
+    ensure_int4_moe_buffers(n_tokens, top_k, num_shared_experts, hidden_size,
+                            intermediate_size, x.device());
+
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+
+    // ── TopK ──
+    moe_topk_forward_kernel_impl<class MoeTopKInt4>(
+        (const fp16*)logits.data_ptr(),
+        s_int4_topk_idx.data_ptr<int>(),
+        (fp16*)s_int4_topk_weight.data_ptr(),
+        n_tokens, (int)n_routed_experts, (int)top_k, /*norm=*/true,
+        queue);
+
+    // ── Up: routed (INT4) — hybrid dispatch based on WI count ──
+    int up_wis = n_tokens * top_k * (intermediate_size / 16);
+    if (up_wis < 2048) {
+        // Few WIs → use SLM reduction for better GPU utilization
+        moe_up_routed_int4_slm_kernel(
+            (const fp16*)x.data_ptr(),
+            (const uint32_t*)gate_up_qweight.data_ptr(),
+            (const fp16*)gate_up_scales.data_ptr(),
+            s_int4_topk_idx.data_ptr<int>(),
+            (fp16*)s_int4_intermediates.data_ptr(),
+            n_tokens, hidden_size, intermediate_size,
+            top_k, rows_per_token, x.device());
+    } else {
+        moe_up_routed_int4_kernel(
+            (const fp16*)x.data_ptr(),
+            (const uint32_t*)gate_up_qweight.data_ptr(),
+            (const fp16*)gate_up_scales.data_ptr(),
+            s_int4_topk_idx.data_ptr<int>(),
+            (fp16*)s_int4_intermediates.data_ptr(),
+            n_tokens, hidden_size, intermediate_size,
+            top_k, rows_per_token, x.device());
+    }
+
+    // ── Up: shared (FP16) — use intermediate_size as buffer stride ──
+    moe_up_shared_fp16_kernel(
+        (const fp16*)x.data_ptr(),
+        (const fp16*)shared_gate_up_weight.data_ptr(),
+        (fp16*)s_int4_intermediates.data_ptr(),
+        n_tokens, hidden_size, shared_intermediate_size,
+        intermediate_size,
+        top_k, num_shared_experts, rows_per_token, x.device());
+
+    // ── Down: routed (INT4) — hybrid dispatch ──
+    int down_wis = n_tokens * top_k * (hidden_size / 16);
+    if (down_wis < 2048) {
+        moe_down_routed_int4_slm_kernel(
+            (const fp16*)s_int4_intermediates.data_ptr(),
+            (const uint32_t*)down_qweight.data_ptr(),
+            (const fp16*)down_scales.data_ptr(),
+            (const fp16*)s_int4_topk_weight.data_ptr(),
+            s_int4_topk_idx.data_ptr<int>(),
+            (fp16*)s_int4_routed_output.data_ptr(),
+            n_tokens, hidden_size, intermediate_size,
+            top_k, rows_per_token, x.device());
+    } else {
+        moe_down_routed_int4_kernel(
+            (const fp16*)s_int4_intermediates.data_ptr(),
+            (const uint32_t*)down_qweight.data_ptr(),
+            (const fp16*)down_scales.data_ptr(),
+            (const fp16*)s_int4_topk_weight.data_ptr(),
+            s_int4_topk_idx.data_ptr<int>(),
+            (fp16*)s_int4_routed_output.data_ptr(),
+            n_tokens, hidden_size, intermediate_size,
+            top_k, rows_per_token, x.device());
+    }
+
+    // ── Down Finalize: shared (FP16) + accumulate ──
+    moe_down_finalize_fp16_kernel(
+        (const fp16*)x.data_ptr(),
+        (const fp16*)s_int4_intermediates.data_ptr(),
+        (const fp16*)s_int4_routed_output.data_ptr(),
+        (const fp16*)shared_down_weight.data_ptr(),
+        (const fp16*)shared_expert_gate_weight.data_ptr(),
+        (fp16*)s_int4_final_output.data_ptr(),
+        n_tokens, hidden_size, shared_intermediate_size,
+        intermediate_size,  // buffer_row_width = routed d_ff
+        top_k, num_shared_experts, rows_per_token, x.device());
+
+    return s_int4_final_output;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Registration
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TORCH_LIBRARY_FRAGMENT(moe_int4_ops, m) {
+    m.def("moe_router_forward_int4(Tensor x, Tensor weight, Tensor scale) -> Tensor");
+    m.def("moe_forward_full_int4(Tensor x, Tensor logits, "
+          "Tensor gate_up_qweight, Tensor gate_up_scales, "
+          "Tensor shared_gate_up_weight, "
+          "Tensor down_qweight, Tensor down_scales, "
+          "Tensor shared_down_weight, "
+          "Tensor shared_expert_gate_weight, "
+          "int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(moe_int4_ops, XPU, m) {
+    m.impl("moe_router_forward_int4", &moe_router_forward_int4);
+    m.impl("moe_forward_full_int4", &moe_forward_full_int4);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("moe_router_forward_int4", &moe_router_forward_int4);
+    m.def("moe_forward_full_int4", &moe_forward_full_int4);
+}

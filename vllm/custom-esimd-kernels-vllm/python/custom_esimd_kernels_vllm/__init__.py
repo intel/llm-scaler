@@ -12,6 +12,9 @@ from custom_esimd_kernels_vllm import eagle_ops
 # MoE Batch kernels — registers torch.ops.moe_ops.*
 from custom_esimd_kernels_vllm import moe_ops
 
+# MoE INT4 Batch kernels — registers torch.ops.moe_int4_ops.*
+from custom_esimd_kernels_vllm import moe_int4_ops
+
 from custom_esimd_kernels_vllm.ops import (
     # Core ESIMD ops
     esimd_gemv_fp8_pern,
@@ -47,4 +50,7 @@ from custom_esimd_kernels_vllm.ops import (
     moe_accumulate,
     moe_forward_fused,
     moe_forward_full,
+    # MoE INT4 Batch ops
+    moe_router_forward_int4,
+    moe_forward_full_int4,
 )
