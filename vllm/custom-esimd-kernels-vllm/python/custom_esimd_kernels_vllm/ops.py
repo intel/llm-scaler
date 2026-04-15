@@ -185,6 +185,21 @@ def esimd_fused_add_rms_norm(
     return _ops.esimd_fused_add_rms_norm(hidden_states, residual, weight, eps)
 
 
+def esimd_fused_add_rms_norm_batched(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Batched fused residual add + RMSNorm (Gemma-style).
+
+    residual[i] = hidden_states[i] + residual[i]  (in-place)
+    hidden_states[i] = rmsnorm(residual[i]) * weight  (output)
+    weight must be pre-adjusted (w+1.0). Works for any number of rows.
+    """
+    return _ops.esimd_fused_add_rms_norm_batched(hidden_states, residual, weight, eps)
+
+
 def esimd_rms_norm_gated(
     x: torch.Tensor,
     z: torch.Tensor,
