@@ -88,7 +88,7 @@ struct NormGEMV_int4_kernel {
         // Pre-load norm weight [V=128] — all threads load (L3 cached)
         simd<float, 128> norm_w = block_load<fp16, 128>(norm_w_ptr);
 
-        float my_sum = 0.0f;
+        simd<float, 64> acc = 0.0f;
 
         // Prefetch first head's weight (16 int32 = 64B)
         if (h_start < h_end) {
@@ -137,18 +137,18 @@ struct NormGEMV_int4_kernel {
             simd<float, 64> w_lo = convert<float>(u32 & 0xFu) * s + neg_8s;
             simd<float, 64> w_hi = convert<float>((u32 >> 4) & 0xFu) * s + neg_8s;
 
-            // Stride-2 dot product: even × lo + odd × hi
-            simd<float, 64> prod = normed.select<64, 2>(0) * w_lo
-                                 + normed.select<64, 2>(1) * w_hi;
-
-            // Hierarchical reduction: 64 → scalar
-            prod.select<32,1>(0) += prod.select<32,1>(32);
-            prod.select<16,1>(0) += prod.select<16,1>(16);
-            prod.select<8,1>(0)  += prod.select<8,1>(8);
-            prod.select<4,1>(0)  += prod.select<4,1>(4);
-            prod.select<2,1>(0)  += prod.select<2,1>(2);
-            my_sum += (float)prod[0] + (float)prod[1];
+            // Stride-2 dot product accumulated across heads (reduce once at end)
+            acc += normed.select<64, 2>(0) * w_lo
+                 + normed.select<64, 2>(1) * w_hi;
         }
+
+        // Hierarchical reduction: 64 → scalar (once, not per-head)
+        acc.select<32,1>(0) += acc.select<32,1>(32);
+        acc.select<16,1>(0) += acc.select<16,1>(16);
+        acc.select<8,1>(0)  += acc.select<8,1>(8);
+        acc.select<4,1>(0)  += acc.select<4,1>(4);
+        acc.select<2,1>(0)  += acc.select<2,1>(2);
+        float my_sum = (float)acc[0] + (float)acc[1];
 
         if constexpr (K_SPLIT == 1) {
             output[n] = fp16(my_sum);
