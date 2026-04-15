@@ -1,154 +1,51 @@
---- a/vllm/v1/worker/xpu_worker.py	2026-03-31 22:53:27.530257234 +0900
-+++ b/vllm/v1/worker/xpu_worker.py	2026-03-31 22:27:53.255789217 +0900
-@@ -67,63 +67,111 @@
-     def determine_available_memory(self) -> int:
-         """Profiles the peak memory usage of the model to determine how many
-         KV blocks may be allocated without OOMs.
-+
-         The engine will first conduct a profiling of the existing memory usage.
-         Then, it calculates the maximum possible number of GPU and CPU blocks
-         that can be allocated with the remaining free memory.
-+
-         .. tip::
-             You may limit the usage of GPU memory
-             by adjusting the `gpu_memory_utilization` parameter.
-         """
-+        fallback_profile = os.getenv("VLLM_FALLBACK_PROFILE", "0") == "1"
-+
-+        if fallback_profile:
-+            return self._determine_available_memory_fallback()
-+        else:
-+            return self._determine_available_memory_default()
-+
-+    def _determine_available_memory_fallback(self) -> int:
-+        """Upstream profiling method using memory_allocated()."""
-         # Profile the memory usage of the model and get the maximum number of
+--- vllm/v1/worker/xpu_worker.py	2026-04-14 19:39:54.213875700 +0900
++++ vllm/v1/worker/xpu_worker.py	2026-04-14 21:35:16.872088911 +0900
+@@ -124,24 +124,33 @@
          # cache blocks that can be allocated with the remaining free memory.
          torch.xpu.empty_cache()
+         torch.xpu.synchronize()
 -        torch.xpu.reset_peak_memory_stats()
  
--        free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info()
--        current_allocated_bytes = torch.xpu.memory_allocated()
--        msg = (
--            "Before memory profiling run, "
--            f"total GPU memory: {total_gpu_memory / 1024**2:.2f} MB, "
--            f"model load takes {current_allocated_bytes / 1024**2:.2f} MB, "
--            f"free gpu memory is {free_gpu_memory / 1024**2:.2f} MB."
--        )
--        logger.info(msg)
-         # Execute a forward pass with dummy inputs to profile the memory usage
-         # of the model.
-         self.model_runner.profile_run()
- 
--        free_gpu_memory, _ = self.xpu_get_mem_info()
-+        # Calculate the number of blocks that can be allocated with the
-+        # profiled peak memory.
-+        torch.xpu.synchronize()
-+        used_memory = torch.xpu.memory_allocated()
-+        total_gpu_memory = torch.xpu.get_device_properties(self.local_rank).total_memory
-+        free_gpu_memory = total_gpu_memory - used_memory
-+
-         # NOTE(woosuk): Here we assume that the other processes using the same
-         # GPU did not change their memory usage during the profiling.
--        assert self.init_gpu_memory > free_gpu_memory, (
-+        peak_memory = self.init_gpu_memory - free_gpu_memory
-+        assert peak_memory > 0, (
-             "Error in memory profiling. "
-             f"Initial free memory {self.init_gpu_memory}, current free memory"
-             f" {free_gpu_memory}. This happens when the GPU memory was "
-             "not properly cleaned up before initializing the vLLM instance."
-         )
- 
--        # Get the peak memory allocation recorded by torch
--        peak_memory = torch.xpu.memory_stats()["allocated_bytes.all.peak"]
--
-         torch.xpu.empty_cache()
--        torch_allocated_bytes = torch.xpu.memory_stats()["allocated_bytes.all.current"]
--        total_allocated_bytes = self.xpu_get_mem_info()[1] - self.xpu_get_mem_info()[0]
- 
--        non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
--        if non_torch_allocations > 0:
--            peak_memory += non_torch_allocations
-         available_kv_cache_memory = (
-             total_gpu_memory * self.cache_config.gpu_memory_utilization - peak_memory
-         )
- 
--        msg = (
--            "After memory profiling run, "
--            f"peak memory usage is {peak_memory / 1024**2:.2f} MB,"
--            f"torch mem is {torch_allocated_bytes / 1024**2:.2f} MB, "
--            f"non-torch mem is {non_torch_allocations / 1024**2:.2f} MB, "
--            f"free gpu memory is {free_gpu_memory / 1024**2:.2f} MB."
-+        return int(available_kv_cache_memory)
-+
-+    def _determine_available_memory_default(self) -> int:
-+        """Custom profiling method using peak memory stats."""
-+        # Profile the memory usage of the model and get the maximum number of
-+        # cache blocks that can be allocated with the remaining free memory.
-+        torch.xpu.empty_cache()
-+        torch.xpu.synchronize()
-+
+-        # Execute a forward pass with dummy inputs to profile the memory usage
+-        # of the model.
+-        if "Qwen3ASR" in self.model_runner.model_config.architecture:
+-            pass
+-        else:
+-            self.model_runner.profile_run()
 +        skip_profile = os.getenv("VLLM_SKIP_PROFILE_RUN", "0") == "1"
-+
-+        if not skip_profile:
++        arch = self.model_runner.model_config.architecture
++        # Skip profile_run for architectures known to hang or OOM during profiling
++        skip_archs = ("Qwen3ASR", "Glm4MoeLite", "Gemma4")
+ 
+-        # Calculate the number of blocks that can be allocated with the
+-        # profiled peak memory.
+-        torch.xpu.synchronize()
+-        total_gpu_memory = torch.xpu.get_device_properties(self.local_rank).total_memory
++        if not skip_profile and not any(a in arch for a in skip_archs):
 +            torch.xpu.reset_peak_memory_stats()
-+
-+            # Execute a forward pass with dummy inputs to profile the memory usage
-+            # of the model.
-+            if "Qwen3ASR" in self.model_runner.model_config.architecture:
-+                pass
-+            else:
-+                self.model_runner.profile_run()
-+
++            self.model_runner.profile_run()
+ 
+-        # NOTE(woosuk): Here we assume that the other processes using the same
+-        # GPU did not change their memory usage during the profiling.
+-        stats = torch.xpu.memory_stats()
+-        peak_allocated = stats.get("allocated_bytes.all.peak", 0)
 +            # Calculate the number of blocks that can be allocated with the
 +            # profiled peak memory.
 +            torch.xpu.synchronize()
-+            total_gpu_memory = torch.xpu.get_device_properties(self.local_rank).total_memory
-+
-+            # NOTE(woosuk): Here we assume that the other processes using the same
-+            # GPU did not change their memory usage during the profiling.
++            total_gpu_memory = torch.xpu.get_device_properties(
++                self.local_rank).total_memory
 +            stats = torch.xpu.memory_stats()
 +            peak_allocated = stats.get("allocated_bytes.all.peak", 0)
 +        else:
-+            total_gpu_memory = torch.xpu.get_device_properties(self.local_rank).total_memory
-+            # Skip profile_run — estimate peak from current allocation + 20% overhead
++            total_gpu_memory = torch.xpu.get_device_properties(
++                self.local_rank).total_memory
++            # Skip profile_run — estimate peak from model memory + 5% overhead
++            # MoE models only activate a fraction of experts per token,
++            # so runtime overhead above model weights is minimal
 +            used_memory = torch.xpu.memory_allocated()
-+            peak_allocated = int(used_memory * 1.2)
-+            print(f"\n[VLLM_SKIP_PROFILE_RUN] Skipping profile_run, estimating peak from allocated memory")
-+
-+        current_reserved = torch.xpu.memory_reserved()
-+
-+        fragmentation_bytes = current_reserved - peak_allocated
-+        fragmentation_gb = fragmentation_bytes / 1024**3
-+        peak_gb = peak_allocated / 1024**3
-+        reserved_gb = current_reserved / 1024**3
-+        model_memory = self.model_runner.model_memory_usage / 1024 ** 3
-+
-+        print(f"\n[Memory Profiling Analysis]")
-+        print(f"  > Peak Allocated (Real Need)  : {peak_gb:.2f} GB")
-+        print(f"  > Model memory usage          : {model_memory:.2f} GB")
-+        print(f"  > Current Reserved (Footprint): {reserved_gb:.2f} GB")
-+        print(f"  > Fragmentation (Wasted)      : {fragmentation_gb:.2f} GB")
-+
-+        torch.xpu.empty_cache()
-+
-+        available_kv_cache_memory = (
-+            total_gpu_memory * self.cache_config.gpu_memory_utilization - peak_allocated
-         )
--        logger.info(msg)
++            peak_allocated = int(used_memory * 1.05)
++            print(f"\n[VLLM_SKIP_PROFILE_RUN] Skipping profile_run for {arch}, "
++                  f"estimating peak from allocated memory * 1.05")
+         current_reserved = torch.xpu.memory_reserved()
  
-         return int(available_kv_cache_memory)
- 
-@@ -161,9 +209,9 @@
-         )
- 
-         # global all_reduce needed for overall oneccl warm up
--        torch.distributed.all_reduce(
--            torch.zeros(1).xpu(), group=get_world_group().device_group
--        )
-+#        torch.distributed.all_reduce(
-+#            torch.zeros(1).xpu(), group=get_world_group().device_group
-+#        )
- 
-         # Set random seed.
-         set_random_seed(self.model_config.seed)
+         fragmentation_bytes = current_reserved - peak_allocated

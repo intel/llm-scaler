@@ -1,0 +1,62 @@
+diff --git a/vllm/model_executor/layers/quantization/ipex_quant.py b/vllm/model_executor/layers/quantization/ipex_quant.py
+index abc1234..def5678 100644
+--- a/vllm/model_executor/layers/quantization/ipex_quant.py
++++ b/vllm/model_executor/layers/quantization/ipex_quant.py
+@@ -795,11 +795,55 @@ class XPUGPTQMarlinMoEMethod(FusedMoEMethodBase):
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         import intel_extension_for_pytorch as ipex
+
+         if self.quant_config.linear_quant_method == "gptq":
+-            layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
+-                layer.w13_qweight.permute(0, 2, 1).contiguous(),
+-                layer.w2_qweight.permute(0, 2, 1).contiguous(),
+-                w1_scale_inv=layer.w13_scales.permute(0, 2, 1).contiguous(),
+-                w2_scale_inv=layer.w2_scales.permute(0, 2, 1).contiguous(),
++            # Move MoE weights to CPU for GatedMLPMOE construction.
++            # IPEX's marlin_shuffle_weight creates large temporaries that
++            # cause DEVICE_LOST on the XPU allocator. Using CPU tensors
++            # makes the shuffle use the uncapped CPU allocator instead.
++            device = layer.w13_qweight.device
++            w13_cpu = layer.w13_qweight.permute(0, 2, 1).contiguous().cpu()
++            w2_cpu = layer.w2_qweight.permute(0, 2, 1).contiguous().cpu()
++            s13_cpu = layer.w13_scales.permute(0, 2, 1).contiguous().cpu()
++            s2_cpu = layer.w2_scales.permute(0, 2, 1).contiguous().cpu()
++
++            # Free XPU originals to make room for shuffled result
++            layer.w13_qweight.data = torch.empty(
++                0, dtype=torch.int32, device=device)
++            layer.w2_qweight.data = torch.empty(
++                0, dtype=torch.int32, device=device)
++            layer.w13_scales.data = torch.empty(
++                0, dtype=layer.w13_scales.dtype, device=device)
++            layer.w2_scales.data = torch.empty(
++                0, dtype=layer.w2_scales.dtype, device=device)
++            torch.xpu.empty_cache()
++
++            # GatedMLPMOE shuffles on CPU (qweight.device == cpu)
++            layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
++                w13_cpu, w2_cpu,
++                w1_scale_inv=s13_cpu,
++                w2_scale_inv=s2_cpu,
+                 is_int4=True,
+             )
++
++            # Move shuffled weights back to XPU for memory accounting.
++            # Mark as pre-shuffled so init_on_device skips re-shuffle.
++            del w13_cpu, w2_cpu, s13_cpu, s2_cpu
++            fusion = layer.ipex_fusion
++            fusion.W13 = fusion.W13.to(device)
++            fusion.W13._marlin_shuffled = True
++            fusion.W2 = fusion.W2.to(device)
++            fusion.W2._marlin_shuffled = True
++            if hasattr(fusion, 'w13_weight_scale_inv'):
++                fusion.w13_weight_scale_inv = \
++                    fusion.w13_weight_scale_inv.to(device)
++            if hasattr(fusion, 'w2_weight_scale_inv'):
++                fusion.w2_weight_scale_inv = \
++                    fusion.w2_weight_scale_inv.to(device)
+         else:
+             raise NotImplementedError(
++                f"Unsupported quant method {self.quant_config.linear_quant_method} "
++                "for XPU MOE."
+             )

@@ -1,0 +1,15 @@
+diff --git a/vllm/v1/attention/backends/mla/common.py b/vllm/v1/attention/backends/mla/common.py
+index abc1234..def5678 100644
+--- a/vllm/v1/attention/backends/mla/common.py
++++ b/vllm/v1/attention/backends/mla/common.py
+@@ -1381,6 +1381,10 @@ class MLACommonImpl(MLACommonBackend):
+
+         if is_vllm_fa:
+             kwargs["return_softmax_lse"] = return_softmax_lse
++        elif current_platform.is_xpu():
++            # XPU/IPEX flash_attn doesn't support return_attn_probs or
++            # return_softmax_lse -- skip the parameter entirely
++            pass
+         else:
+             # ROCm leverages the upstream flash_attn, which takes a parameter
+             # called "return_attn_probs" instead of return_softmax_lse

@@ -1,0 +1,33 @@
+diff --git a/intel_extension_for_pytorch/transformers/models/xpu/fusions/linear_fusion.py b/intel_extension_for_pytorch/transformers/models/xpu/fusions/linear_fusion.py
+index abc1234..def5678 100644
+--- a/intel_extension_for_pytorch/transformers/models/xpu/fusions/linear_fusion.py
++++ b/intel_extension_for_pytorch/transformers/models/xpu/fusions/linear_fusion.py
+@@ -148,17 +148,20 @@ class _MoEGEMMXpu(nn.Module):
+             os.environ.get("IPEX_MOE_GEMM_NATIVE", "0") == "1"
+         )
+
+-        if self.is_mxfp4 or self.is_int4:
++        _pre_shuffled = getattr(W13, '_marlin_shuffled', False)
++        if (self.is_mxfp4 or self.is_int4) and not _pre_shuffled:
+             self.W13 = self.marlin_shuffle_weight(self.W13)
+             self.W2 = self.marlin_shuffle_weight(self.W2)
+             self.w13_weight_scale_inv.data = torch.transpose(
+                 w1_scale_inv, 1, 2
+             ).contiguous()
+             self.w2_weight_scale_inv.data = torch.transpose(
+                 w2_scale_inv, 1, 2
+             ).contiguous()
+
+-        # delete original weight to avoid memory pressure
+-        W13.data = self.W13
+-        W2.data = self.W2
+-        if W3 is not None:
+-            W3.data = self.W13
+-        torch.xpu.empty_cache()
++        if not _pre_shuffled:
++            # delete original weight to avoid memory pressure
++            W13.data = self.W13
++            W2.data = self.W2
++            if W3 is not None:
++                W3.data = self.W13
++            torch.xpu.empty_cache()

@@ -1,0 +1,52 @@
+diff --git a/vllm/model_executor/layers/quantization/gptq.py b/vllm/model_executor/layers/quantization/gptq.py
+index abc1234..def5678 100644
+--- a/vllm/model_executor/layers/quantization/gptq.py
++++ b/vllm/model_executor/layers/quantization/gptq.py
+@@ -248,10 +248,11 @@ class GPTQLinearMethod(LinearMethodBase):
+         del output_size  # Unused.
+         weight_loader = extra_weight_attrs.get("weight_loader")
+         if input_size_per_partition % self.quant_config.group_size != 0:
+-            raise ValueError(
+-                "The input size is not aligned with the quantized "
+-                "weight shape. Please use a compatible group size. "
+-                f"Got input_size_per_partition={input_size_per_partition} "
+-                f"and group_size={self.quant_config.group_size}."
+-            )
++            logger.warning(
++                "Input size %d is not aligned with group size %d. "
++                "Using ceiling division for scale/zero sizes.",
++                input_size_per_partition, self.quant_config.group_size)
+         output_size_per_partition = sum(output_partition_sizes)
+         if output_size_per_partition % self.quant_config.pack_factor.numerator != 0:
+             raise ValueError(
+@@ -264,12 +265,14 @@ class GPTQLinearMethod(LinearMethodBase):
+         else:
+             group_size = input_size
+         exllama_state = ExllamaState.UNINITIALIZED
+-        scale_and_zero_size = input_size // group_size
++        scale_and_zero_size = math.ceil(input_size / group_size)
+         scale_and_zero_input_dim = None
+         if (
+             input_size != input_size_per_partition
+             and self.quant_config.group_size != -1
+         ):
++            scale_and_zero_size = math.ceil(
++                input_size_per_partition / group_size)
+             # For act-order models, we cannot use Exllama for row parallel layer
+             if self.quant_config.desc_act:
+                 exllama_state = ExllamaState.UNUSED
+@@ -277,14 +280,14 @@ class GPTQLinearMethod(LinearMethodBase):
+                 # we need to partition qzeros and scales for exllama kernel
+-                scale_and_zero_size = input_size_per_partition // group_size
++                scale_and_zero_size = math.ceil(
++                    input_size_per_partition / group_size)
+                 scale_and_zero_input_dim = 0
+
+         qweight = PackedvLLMParameter(
+             data=torch.empty(
+-                input_size_per_partition // self.quant_config.pack_factor,
++                math.ceil(input_size_per_partition /
++                          self.quant_config.pack_factor),
+                 output_size_per_partition,
+                 dtype=torch.int32,
+             ),

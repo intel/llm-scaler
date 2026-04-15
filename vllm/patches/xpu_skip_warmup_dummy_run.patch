@@ -1,0 +1,20 @@
+diff --git a/vllm/v1/worker/xpu_worker.py b/vllm/v1/worker/xpu_worker.py
+index abc1234..def5678 100644
+--- a/vllm/v1/worker/xpu_worker.py
++++ b/vllm/v1/worker/xpu_worker.py
+@@ -173,6 +173,16 @@ class XPUWorker(Worker):
+
+         return int(available_kv_cache_memory)
+
++    def compile_or_warm_up_model(self) -> None:
++        if os.getenv("VLLM_SKIP_PROFILE_RUN", "0") == "1":
++            logger.info(
++                "Skipping compile_or_warm_up_model on XPU "
++                "(VLLM_SKIP_PROFILE_RUN=1)")
++            set_random_seed(self.model_config.seed)
++            return
++        super().compile_or_warm_up_model()
++
+     def init_device(self):
+         device = self.device_config.device
+         if (
