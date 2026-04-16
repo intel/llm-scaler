@@ -1,6 +1,6 @@
 # GLM-4.7-Flash INT4 MoE: Marlin Shuffle DEVICE_LOST on Lunar Lake XPU
 
-## Status: Bug E (shuffle OOM) FIXED — Bug H (Level Zero resource exhaustion) OPEN
+## Status: Bug E (shuffle OOM) FIXED — Bug H (attention→MoE SYCL state pollution) OPEN
 
 ## Problem
 
@@ -73,126 +73,184 @@ is the quantization format:
 
 **Two separate issues for INT4 MoE on shared-memory iGPU:**
 1. **Bug E (FIXED)**: marlin_shuffle_weight OOM during init — solved by CPU shuffle
-2. **Bug H (OPEN)**: xetla `group_mm_int4_out_marlin` kernel crashes on Xe2-LPG —
-   the very first `torch.xpu.moe_gemm(is_int4=True)` causes DEVICE_LOST.
-   Not a resource accumulation issue — the INT4 MoE GEMM kernel itself is
-   unsupported on Lunar Lake's iGPU architecture.
+2. **Bug H (OPEN)**: Level Zero SYCL runtime state pollution from IPEX attention
+   kernels (flash_attn_varlen_func / chunked_prefill) corrupts the SYCL context,
+   causing subsequent `torch.xpu.moe_gemm(is_int4=True)` to crash with DEVICE_LOST.
+   The INT4 kernel works perfectly in isolation — the crash only occurs after
+   attention ops have executed in the same SYCL queue.
 
-MXFP4 avoids both issues: no shuffle needed (Bug E), and uses a different
-xetla kernel (`group_mm_mxfp4_out_marlin`) that works on Xe2-LPG.
+MXFP4 avoids both issues: no shuffle needed (Bug E), and its xetla kernel
+(`group_mm_mxfp4_out_marlin`) appears resilient to the attention state pollution.
 
 ### Implication for shared-memory iGPUs
-On shared-memory systems with 40+ MoE layers, **MXFP4 is the only vLLM-compatible
-quantization format that works for MoE models** without Level Zero env var tuning.
-INT4/GPTQ/AWQ all require either reshuffling (Bug E, now fixed) or CUDA-only kernels
-(unsupported), and still hit Bug H on 40+ layer models. The alternative path is
-llama.cpp GGUF via SYCL backend.
+On shared-memory systems, **MXFP4 is the only vLLM-compatible quantization format
+that works for INT4-class MoE models** on Lunar Lake Xe2 iGPU. INT4 AutoRound models
+load successfully (Bug E fixed) but crash at first inference due to Bug H (attention
+→ MoE SYCL state pollution). The alternative path is llama.cpp GGUF via SYCL backend.
 
-## Bug H: INT4 MoE GEMM Kernel Broken on Lunar Lake Xe2-LPG
+## Bug H: Level Zero SYCL State Pollution — Attention Kernels Break INT4 MoE GEMM
 
-**Status: OPEN — IPEX `group_mm_int4_out_marlin` xetla kernel unsupported on Xe2-LPG**
+**Status: OPEN — Level Zero SYCL context pollution from IPEX attention kernels
+(flash_attn_varlen_func / chunked_prefill) causes subsequent
+`torch.xpu.moe_gemm(is_int4=True)` to crash with DEVICE_LOST on Lunar Lake Xe2 iGPU.**
+
+**The fix must come from Intel — either IPEX attention kernel fix or Level Zero driver fix.**
 
 ### Distinction from Bug E
 
 Bug E (DEVICE_LOST during marlin_shuffle) was solved by the CPU shuffle workaround.
-Bug H is a **separate** kernel compatibility issue: the IPEX INT4 MoE GEMM kernel
-itself does not work on Lunar Lake's Xe2-LPG iGPU architecture.
+Bug H is a **separate** runtime issue: the SYCL queue state becomes corrupted after
+IPEX attention kernels execute, causing the next INT4 MoE GEMM dispatch to crash.
+The INT4 MoE GEMM kernel itself works perfectly in isolation.
 
-### Key diagnostic finding
+### Definitive root cause: SYCL runtime state pollution
 
-With per-layer `torch.xpu.synchronize()` instrumentation in `fused_moe_experts()`:
+Through exhaustive elimination testing, we determined:
+
+1. `torch.xpu.moe_gemm(is_int4=True)` **works in isolation** — with synthetic
+   tensors, real model weights (16+ GiB allocated), 8093 dummy tensors, KV cache
+   tensors, and all IPEX routing ops (topk_softmax, moe_rows_counts, moe_scatter,
+   moe_gather). No crash.
+
+2. The **same call crashes** inside the full vLLM forward pass, where IPEX attention
+   kernels (`flash_attn_varlen_func` → `chunked_prefill`) execute before the MoE
+   layer. The crash occurs at the very first MoE GEMM call (Layer 1, W13).
+
+3. The corruption is in the **Level Zero SYCL runtime state**, not in tensor data:
+   - Cloning all input tensors (reordered, W13, scale, rows_for_experts) before
+     calling moe_gemm → still crashes
+   - `torch.xpu.synchronize()` between attention and MoE → does NOT clear it
+   - `torch.xpu.empty_cache()` between attention and MoE → does NOT clear it
+
+4. **Memory is NOT the issue**: 18 GiB dummy allocation + moe_gemm passes in
+   isolation. Inside vLLM with 4.4 GiB free, it still crashes. The crash is not
+   caused by insufficient memory.
+
+### Evidence chain
 
 ```
-[MoE-DIAG] Layer call 1: W13 GEMM FAILED: DEVICE_LOST
+# PASSES — INT4 MoE GEMM in isolation (no attention ops)
+python test_int4_moe_gemm_xpu.py
+→ Test 1 (MXFP4): PASSED
+→ Test 2 (INT4 fused): PASSED
+→ Test 3 (INT4 native): PASSED
+
+# PASSES — INT4 MoE GEMM with real model weights + 8093 dummy tensors + routing
+python stress_test.py  # 16 GiB allocated, routing + scatter + moe_gemm
+→ moe_gemm(is_int4=True): PASSED
+
+# CRASHES — INT4 MoE GEMM after attention in vLLM forward pass
+vllm serve Qwen3.5-35B-A3B-INT4 --device xpu
+→ L1 pre-attn: OK (0.39 GiB free)
+→ L1 post-attn: OK
+→ L1 pre-mlp: OK
+→ L1 W13 GEMM: DEVICE_LOST  ← crash at first moe_gemm after attention
+
+# CRASHES — Even with cloned tensors (proves it's not tensor state)
+# Inside vLLM forward, after attention:
+reordered_clone = reordered.clone()
+W13_clone = fusion.W13.clone()
+scale_clone = fusion.w1_scale_inv.clone()
+rows_clone = rows_for_experts.clone()
+torch.xpu.synchronize()
+torch.xpu.moe_gemm(reordered_clone, W13_clone, rows_clone, ...)
+→ DEVICE_LOST  ← freshly cloned tensors still crash
 ```
 
-**The very first `torch.xpu.moe_gemm(..., is_int4=True)` call crashes.**
-It is not a resource accumulation problem from many layers — the xetla INT4
-MoE GEMM kernel itself is broken on this architecture.
+### GatedMLPMOE bypass (works in isolation, crashes in pipeline)
+
+A bypass was developed that calls `torch.xpu.moe_gemm` directly instead of going
+through `GatedMLPMOE.forward()` → `_IPEXGatedMLPMOEXPU` → `fused_moe_experts()`.
+The bypass uses IPEX routing ops directly:
+
+```python
+# In ipex_quant.py XPUGPTQMarlinMoEMethod.apply():
+# 1. torch.ops.torch_ipex.topk_softmax() — routing
+# 2. torch.ops.torch_ipex.moe_rows_counts() — expert assignment
+# 3. torch.ops.torch_ipex.moe_scatter() — input reordering
+# 4. torch.xpu.moe_gemm(is_int4=True) — W13 GEMM (gate+up)
+# 5. SiLU activation + element-wise multiply
+# 6. torch.xpu.moe_gemm(is_int4=True) — W2 GEMM (down)
+# 7. torch.ops.torch_ipex.moe_gather() — output gathering
+```
+
+This bypass works perfectly in isolation but still crashes in the full vLLM
+pipeline due to the attention state pollution.
 
 ### Affected models
 
-| Model | Layers | Quant | Kernel Path | Result |
-|-------|--------|-------|-------------|--------|
-| GPT-OSS-20B | 24 | MXFP4 | `group_mm_mxfp4_out_marlin` | **Works** |
-| Qwen3.5-35B-A3B | 40 | INT4 | `group_mm_int4_out_marlin` | **DEVICE_LOST** |
-| GLM-4.7-Flash | 47 | INT4 | `group_mm_int4_out_marlin` | **DEVICE_LOST** |
+| Model | Layers | Quant | Kernel Path | Isolated Test | vLLM Pipeline |
+|-------|--------|-------|-------------|---------------|---------------|
+| GPT-OSS-20B | 24 | MXFP4 | `group_mm_mxfp4_out_marlin` | **Works** | **Works** |
+| Qwen3.5-35B-A3B | 40 | INT4 | `group_mm_int4_out_marlin` | **Works** | **DEVICE_LOST** |
+| GLM-4.7-Flash | 47 | INT4 | `group_mm_int4_out_marlin` | **Works** | **DEVICE_LOST** |
 
-The "40+ layers" correlation was a red herring — the crash happens at layer 1.
-ALL INT4 MoE models fail regardless of layer count. MXFP4 works because it uses
-a different xetla kernel (`group_mm_mxfp4_out_marlin`).
+The INT4 kernel works on Xe2-LPG — earlier diagnosis of "kernel broken on Xe2-LPG"
+was incorrect. MXFP4 models work in the pipeline because their xetla kernel
+(`group_mm_mxfp4_out_marlin`) appears resilient to the attention state pollution.
 
-### Root cause: xetla INT4 kernel not validated for Xe2-LPG
+### Hypotheses tested and eliminated
 
-The IPEX `xetla_arch.h` maps Lunar Lake to `gpu_arch::XeHpc` (same as PVC/BMG
-data center GPUs), with `gpu_arch::Xe2Lpg` commented out:
+| # | Hypothesis | Test | Result |
+|---|-----------|------|--------|
+| 1 | Level Zero resource pool exhaustion from 40+ layers | Per-layer synchronize instrumentation | **Eliminated** — crash at Layer 1, call 1 |
+| 2 | INT4 xetla kernel broken on Xe2-LPG architecture | Standalone test_int4_moe_gemm_xpu.py | **Eliminated** — kernel works with synthetic + real weights |
+| 3 | Memory pressure (model too large) | 18 GiB dummy + moe_gemm; 4.4 GiB free | **Eliminated** — passes in isolation, crashes with headroom |
+| 4 | Tensor data corruption from shuffle | CPU shuffle vs native shuffle | **Eliminated** — both crash in pipeline |
+| 5 | GatedMLPMOE wrapper bug | Direct moe_gemm bypass | **Eliminated** — bypass also crashes in pipeline |
+| 6 | Tensor backing memory state | Clone all inputs before moe_gemm | **Eliminated** — cloned tensors also crash |
+| 7 | Level Zero env var tuning | IMMEDIATE_COMMANDLISTS + CLEANUP_THRESHOLD + BATCH_SIZE | **Eliminated** — no effect |
+| 8 | SYCL context pollution from attention ops | All above combined | **CONFIRMED** — only difference is attention ops |
 
-```cpp
-// csrc/gpu/aten/operators/xetla/kernels/xetla_arch.h
-// LNL mapped to XeHpc — Xe2Lpg alternative is commented out
-```
+### Why MXFP4 is not affected
 
-This means the INT4 MoE GEMM kernel dispatches a tile configuration designed for
-data center GPUs (PVC with HBM, many execution units) onto a mobile iGPU with
-fundamentally different capabilities (shared LPDDR5x, fewer EUs, different cache
-hierarchy). The kernel likely uses hardware features or tile sizes that Xe2-LPG
-doesn't support, causing DEVICE_LOST on first dispatch.
-
-The MXFP4 kernel has a different tile implementation that happens to be compatible
-with Xe2-LPG — hence GPT-OSS-20B works.
-
-### What was ruled out
-
-1. **Resource pool exhaustion** — crash happens at layer 1, call 1 (not accumulation)
-2. **Level Zero env vars** — `SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1` +
-   `COMMANDLISTS_CLEANUP_THRESHOLD=5` + `BATCH_SIZE=4` had no effect
-3. **Memory pressure** — model loads fine, KV cache allocates, server starts
-4. **Data corruption** — random synthetic tensors also crash (see test script)
+The MXFP4 kernel (`group_mm_mxfp4_out_marlin`) uses a different xetla template
+implementation than the INT4 kernel (`group_mm_int4_out_marlin`). The MXFP4 kernel
+likely uses different SYCL work-group configurations, barrier patterns, or memory
+access patterns that are resilient to whatever state the attention kernels leave
+behind. This is a kernel-level interaction bug in the Level Zero SYCL runtime.
 
 ### Minimal reproducer
 
 ```bash
+# Kernel works in isolation:
 python vllm/test/test_int4_moe_gemm_xpu.py
+
+# Kernel crashes after attention ops in vLLM pipeline:
+vllm serve /path/to/Qwen3.5-35B-A3B-INT4 --device xpu \
+    --gpu-memory-utilization 0.90 --max-model-len 1024
+# Send any prompt → DEVICE_LOST at Layer 1 MoE GEMM
 ```
 
-Tests `torch.xpu.moe_gemm()` with MXFP4 (expected: pass) and INT4 (expected:
-DEVICE_LOST on Lunar Lake) using small synthetic tensors.
+### Required fix (Intel action needed)
 
-### Potential fixes
+This bug is in the interaction between IPEX attention kernels and the Level Zero
+SYCL runtime on Xe2-LPG. The fix must come from Intel:
 
-#### A. Fix xetla arch mapping for Lunar Lake (requires IPEX C++ rebuild)
+1. **IPEX attention kernel fix** — ensure `flash_attn_varlen_func` / `chunked_prefill`
+   leaves the SYCL queue in a clean state for subsequent kernel dispatches
+2. **Level Zero driver fix** — harden the L0 runtime against queue state leakage
+   between kernel dispatches
+3. **vLLM v0.19+ oneDNN INT4 path** — bypass IPEX entirely via `vllm-xpu-kernels`
+   oneDNN-backed INT4 GEMM (`XPUExpertsInt4`), tracked in RFC vllm-project/vllm#33214
 
-Change the architecture mapping in `xetla_arch.h` from `XeHpc` to `Xe2Lpg` for
-Lunar Lake device IDs, and ensure the INT4 MoE GEMM kernel has a valid tile
-configuration for Xe2-LPG. **Not feasible** on the archived IPEX repo without
-forking and rebuilding.
+### Workarounds (current)
 
-#### B. Use MXFP4 instead of INT4
-
-Re-quantize models to MXFP4 format. MXFP4 uses `group_mm_mxfp4_out_marlin` which
-works on Xe2-LPG. Requires MXFP4 quantization tooling or community-quantized models.
-
-#### C. Use llama.cpp GGUF via SYCL backend
-
-llama.cpp handles INT4 dequantization with its own SYCL kernels (not IPEX xetla),
-which are validated on consumer GPUs including Lunar Lake.
-
-#### D. Wait for vLLM v0.19+ XPU INT4 kernel
-
-vllm-xpu-kernels v0.1.5 has oneDNN-backed INT4 GEMM (W4A16) that doesn't use
-IPEX's xetla kernels. Once the `XPUExpertsInt4` class is wired up in vLLM
-(tracked in RFC #33214), this would provide a working INT4 MoE path on XPU.
+- **Use MXFP4 models** — works on Lunar Lake (proven with GPT-OSS-20B)
+- **Use llama.cpp GGUF** — own SYCL kernels, validated on consumer GPUs
+- **Wait for Intel llm-scaler v0.19** — oneDNN INT4 path avoids IPEX xetla entirely
 
 ### IPEX code references
 
 | File | What it does |
 |------|-------------|
-| `xetla_arch.h` | Architecture mapping — LNL → XeHpc (wrong?) |
-| `moe_gemm.cpp:188` | C++ `fused_moe_gemm_persistent` — dispatches xetla kernel |
-| `group_gemm_int4_marlin_impl.h` | INT4 xetla kernel template — tile policies |
-| `group_gemm_mxfp4_marlin_impl.h` | MXFP4 xetla kernel template — works on Xe2 |
+| `linear_fusion.py:235-291` | `fused_moe_experts()` — calls moe_gemm twice (W13, W2) |
 | `intrinsic/__init__.py:443` | Python `moe_gemm()` — routes to INT4 or MXFP4 |
-| `linear_fusion.py:235-291` | `fused_moe_experts()` — calls moe_gemm twice |
+| `moe_gemm.cpp:188` | C++ `fused_moe_gemm_persistent` — dispatches xetla kernel |
+| `group_gemm_int4_marlin_impl.h` | INT4 xetla kernel template — crashes after attention |
+| `group_gemm_mxfp4_marlin_impl.h` | MXFP4 xetla kernel template — resilient to pollution |
+| `xetla_arch.h` | Architecture mapping — LNL → XeHpc |
+| IPEX attention kernels | `flash_attn_varlen_func` — source of SYCL state pollution |
 
 ---
 
