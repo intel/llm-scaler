@@ -205,8 +205,10 @@ GPT-OSS-20B works because: (1) fewer layers, (2) MXFP4 uses a different kernel p
 ### Attempted Mitigations
 
 - `ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE`: No effect
+- `SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1`: No effect — immediate command lists don't reduce kernel object count
 - `IPEX_MOE_GEMM_NATIVE=1`: Fixes resource exhaustion but causes dtype mismatch (`BFloat16 != int`) — native GEMM path doesn't support INT4 packed weights
 - Reducing `gpu-memory-utilization`: No effect (not a memory issue)
+- Different model (Qwen3.5 40L vs GLM 47L): Both fail — even 40 layers exceeds the limit
 - Different model sizes (40 vs 47 layers): Both exceed the resource limit
 
 ### Root Cause
@@ -264,6 +266,25 @@ vLLM / IPEX — the dequantization should produce the model's configured dtype (
 | G | N/A | architectural insight | No |
 | **H** | **OPEN** | **Level Zero driver limit** | **YES — all INT4 GPTQ MoE** |
 | I | Workaround | site-packages | Blocked by H |
+
+### Next steps
+
+1. **Upgrade compute-runtime** from `25.48.36300.8` to latest (`26.09.37435.1`+) — newer versions include Level Zero resource pooling improvements that may fix Bug H
+2. **Report to Intel IPEX** — `_IPEXGatedMLPMOEXPU` should reuse kernel objects across layers instead of creating one per layer
+3. **Consider MXFP4 quantization** for new MoE models — MXFP4 avoids the `_IPEXGatedMLPMOEXPU` path entirely and works on Lunar Lake (proven by GPT-OSS-20B)
+
+### Environment
+
+| Component | Version |
+|-----------|---------|
+| vLLM | 0.14.1.dev0+gb17039bcc.d20260414 |
+| IPEX | 2.7.10+xpu |
+| PyTorch | 2.10.0+xpu |
+| compute-runtime | 25.48.36300.8 |
+| Level Zero loader | 1.26.3 |
+| Level Zero driver | 1.14.36300+8 |
+| Kernel | 6.19.11-201.nobara.fc43.x86_64 (xe driver) |
+| GPU | Intel Arc Graphics (Lunar Lake, Xe2, 28.6 GiB shared LPDDR5x) |
 
 ### End-to-end test results
 
