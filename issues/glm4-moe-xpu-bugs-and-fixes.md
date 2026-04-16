@@ -194,13 +194,14 @@ The error is **not** memory-related (error 39 = OOM, error 40 = resource exhaust
 
 ### Affected Models
 
-| Model | Layers | Experts | Attention | Est. Kernel Objects | Result |
-|-------|--------|---------|-----------|-------------------|--------|
-| GPT-OSS-20B (MXFP4) | 24 | 32 | GQA | ~50-60 | **Works** |
-| Qwen3.5-35B-A3B (INT4) | 40 | 256 | GQA | ~80-90 | **OUT_OF_RESOURCES** |
-| GLM-4.7-Flash (INT4) | 47 | 64 | MLA+Triton | ~150+ | **OUT_OF_RESOURCES** |
+| Model | Layers | Experts | Attention | Quant | Result |
+|-------|--------|---------|-----------|-------|--------|
+| GPT-OSS-20B | 24 | 32 | GQA | MXFP4 | **Works** |
+| Qwen3.5-35B-A3B | 40 | 256 | GQA | INT4 AutoRound | **OUT_OF_RESOURCES** |
+| GLM-4.7-Flash | 47 | 64 | MLA+Triton | INT4 AutoRound | **OUT_OF_RESOURCES** |
+| Qwen3-VL-30B-A3B | 48 | 128 | GQA+Vision | INT4 AutoRound | **OUT_OF_RESOURCES** |
 
-GPT-OSS-20B works because: (1) fewer layers, (2) MXFP4 uses a different kernel path (no `_IPEXGatedMLPMOEXPU`), (3) GQA uses simpler IPEX attention kernels.
+GPT-OSS-20B works because: (1) fewer layers, (2) MXFP4 uses a different kernel path (no `_IPEXGatedMLPMOEXPU`), (3) GQA uses simpler IPEX attention kernels. All INT4 AutoRound GPTQ MoE models with 40+ layers are blocked.
 
 ### Attempted Mitigations
 
@@ -292,26 +293,52 @@ vLLM / IPEX — the dequantization should produce the model's configured dtype (
 
 ### End-to-end test results
 
-#### GLM-4.7-Flash (INT4 AutoRound, 47 layers, MoE+MLA)
+#### GLM-4.7-Flash (INT4 AutoRound, 47 layers, 64 experts, MoE+MLA)
 
-- Model loads: 16.12 GiB ✓
-- CPU shuffle: completes in ~2 min ✓
-- KV cache: 116,928 tokens at 0.8 util ✓
-- Server starts: ✓
-- **Inference: BLOCKED by Bug H (OUT_OF_RESOURCES)**
+| Stage | Time | Cumulative |
+|-------|------|-----------|
+| Weight loading | 21s | 0:21 |
+| CPU shuffle (47L × 64E) | 3m 12s | 3:33 |
+| KV cache + engine init | 1s | 3:34 |
+| Server ready | ~17s | **~3:51** |
 
-#### Qwen3.5-35B-A3B (INT4 AutoRound, 40 layers, MoE+GQA)
+- Model memory: 16.12 GiB, KV cache: 31,936 tokens (gpu-util=0.65)
+- **Inference: FAIL — DEVICE_LOST (error 20)**
 
-- Model loads: 18.98 GiB ✓
-- CPU shuffle: completes in ~4 min (256 experts × 40 layers) ✓
-- KV cache: 19,456 tokens at 0.75 util ✓
-- Server starts: ✓
-- **Inference: BLOCKED by Bug I (dtype mismatch) then Bug H (OUT_OF_RESOURCES)**
+#### Qwen3.5-35B-A3B (INT4 AutoRound, 40 layers, 256 experts, MoE+GQA)
+
+| Stage | Time | Cumulative |
+|-------|------|-----------|
+| Weight loading | 34s | 0:34 |
+| CPU shuffle (40L × 256E) | 2m 52s | 3:26 |
+| KV cache + engine init | 1s | 3:27 |
+| Server ready | ~11s | **~3:38** |
+
+- Model memory: 18.98 GiB, KV cache: 19,456 tokens (gpu-util=0.75)
+- **Inference: FAIL — dtype mismatch (Bug I) then DEVICE_LOST (error 20)**
+
+#### Qwen3-VL-30B-A3B (INT4 AutoRound, 48 layers, 128 experts, MoE+GQA+Vision)
+
+| Stage | Time | Cumulative |
+|-------|------|-----------|
+| Weight loading | 22s | 0:22 |
+| CPU shuffle (48L × 128E) | 2m 45s | 3:07 |
+| KV cache + engine init | 3s | 3:10 |
+| Server ready | ~9s | **~3:19** |
+
+- Model memory: 16.00 GiB, KV cache: 50,432 tokens (gpu-util=0.75)
+- **Inference: FAIL — OUT_OF_RESOURCES (error 40)**
 
 #### GLM-4.7-Flash AWQ-4bit (compressed-tensors)
 
 - Uses `CompressedTensorsWNA16MarlinMoEMethod` (Marlin MoE)
 - **BLOCKED at load: `gptq_marlin_repack` is CUDA-only** (vllm._C missing on XPU)
+
+#### Qwen3-30B-A3B (native GPTQ, not AutoRound)
+
+- Uses `GPTQConfig` → `MoeWNA16Method` → Marlin MoE (CUDA-only)
+- Different code path from AutoRound — our fixes (A-F) do NOT apply
+- **Would be BLOCKED at load** by missing Marlin CUDA kernels (not tested)
 
 ### Memory profiles
 
