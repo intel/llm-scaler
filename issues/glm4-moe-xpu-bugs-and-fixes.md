@@ -704,3 +704,40 @@ Not directly — `vllm-xpu-kernels` requires vLLM 0.16+ infrastructure (modular 
 1. **Short term**: Use MXFP4 on vLLM 0.14 (works today)
 2. **Medium term**: Upgrade to vLLM 0.19 when INT4 MoE support lands
 3. **Long term**: Contribute the GPTQ→uint8 format bridge for INT4 MoE to vllm-xpu-kernels
+
+---
+
+## Future Plan: INT4 MoE on vLLM 0.19 + vllm-xpu-kernels
+
+### Prerequisites
+
+1. Check vLLM 0.19 compatibility with current stack (torch 2.10.0+xpu, oneAPI 2025.2)
+2. Build vLLM 0.19 for XPU (fresh compile required — 0.14 and 0.19 are incompatible)
+3. Install vllm-xpu-kernels (pre-built wheel, no compile needed)
+
+### Contribution: INT4 MoE format bridge
+
+**What exists**: `cutlass_grouped_gemm_interface(is_B_int4=True)` works with uint8-packed weights
+
+**What's needed**: GPTQ int32-packed → uint8-packed weight conversion for MoE
+
+**Files to create/modify**:
+- `vllm/model_executor/layers/fused_moe/xpu_fused_moe.py` — add `XPUExpertsInt4` class
+- `vllm_xpu_kernels/fused_moe_interface.py` — weight format conversion (or in vLLM side)
+- Oracle/quant selection — register INT4 quant key for XPU MoE
+
+**Estimated scope**: ~200 lines Python, no C++/SYCL changes needed
+
+### Steps
+
+1. Verify vLLM 0.19 builds and runs on Lunar Lake (unquantized MoE first)
+2. Port GPTQ INT4 weight unpacking from PR #33662 (linear layers) to MoE
+3. Add `XPUExpertsInt4` with `is_int4=True` and GPTQ weight conversion in `process_weights_after_loading`
+4. Test with Qwen3-VL-30B-A3B INT4 AutoRound
+5. Submit PR to vllm-project/vllm referencing RFC #33214 checklist item "int4 moe support"
+
+### Dependencies to watch
+
+- [PR #33662](https://github.com/vllm-project/vllm/pull/33662) — INT4 GEMM for linear layers (WIP, same format bridge needed)
+- [RFC #33214](https://github.com/vllm-project/vllm/issues/33214) — XPU kernel migration checklist
+- vllm-xpu-kernels releases — check for INT4 MoE additions
