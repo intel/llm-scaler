@@ -581,3 +581,32 @@ The difference between our passing test and vLLM's failing forward:
 ### Next investigation
 
 The crash vector is in vLLM's custom op dispatch chain, not the IPEX kernels themselves. Need to trace which vLLM layer wraps the call and what state it adds.
+
+### Component-by-component test results (all PASS in isolation)
+
+| Test | XPU Alloc | Result |
+|------|-----------|--------|
+| `torch.xpu.moe_gemm` alone | 0.2 GiB | PASS |
+| + 18 GiB dummy tensors | 18.2 GiB | PASS |
+| + 56K model tensors (16.66 GiB) | 16.7 GiB | PASS |
+| + KV cache (paged blocks) | 16.7 GiB | PASS |
+| + `reshape_and_cache_flash` | 0.3 GiB | PASS |
+| + paged attention | 0.3 GiB | PASS |
+| + IPEX routing ops (topk, scatter, gather) | 0.3 GiB | PASS |
+| + shuffled weights (Bug E pipeline) | 0.3 GiB | PASS |
+| + full model + attention + shuffled MoE | 17.0 GiB | PASS |
+| + `GatedMLPMOE.forward()` with `init_on_device` | 0.3 GiB | PASS |
+| vLLM custom op bypass (`forward_impl` direct) | 16.6 GiB | **FAIL** |
+| vLLM attention bypass (`use_direct_call`) | 16.6 GiB | **FAIL** |
+| vLLM full pipeline | 16.6 GiB | **FAIL** |
+
+### Conclusion
+
+Every IPEX kernel, every weight format, every memory configuration works correctly in standalone Python scripts — even with the full 17 GiB model loaded, KV cache allocated, and all operations chained. The crash occurs ONLY through vLLM's model runner execution path.
+
+The root cause is in vLLM's model graph execution infrastructure — likely the `ForwardContext`, `no_compile_layers` registry, tensor buffer pinning, or scheduler metadata management that runs during the full model forward but not in isolated tests.
+
+This requires either:
+1. Systematic binary search through vLLM's model runner components
+2. Intel investigation with the reproduction evidence provided here
+3. Testing with a future vLLM version that may change the execution path
