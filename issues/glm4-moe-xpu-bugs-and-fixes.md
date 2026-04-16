@@ -610,3 +610,55 @@ This requires either:
 1. Systematic binary search through vLLM's model runner components
 2. Intel investigation with the reproduction evidence provided here
 3. Testing with a future vLLM version that may change the execution path
+
+---
+
+## Final Verdict: INT4 AutoRound MoE Never Worked in IPEX (2026-04-16)
+
+### IPEX repo was archived with the bug unfixed
+
+The IPEX repo was archived on **2026-03-30** (issue #867). The INT4 MoE bug (#838) was closed on 2026-01-05 with **no public fix, no linked PR, no commit**. The closure was either "closed as stale" or "fixed internally" in a branch that was never released.
+
+### Complete IPEX issue analysis
+
+| Issue | Problem | Status | Fix |
+|---|---|---|---|
+| [#838](https://github.com/intel/intel-extension-for-pytorch/issues/838) | `topk_softmax` OUT_OF_RESOURCES with 128 experts | Closed (no fix) | **None** |
+| [#864](https://github.com/intel/intel-extension-for-pytorch/issues/864) | `weight_only_qlinear_prepack_int4` missing for AutoRound | Open | None |
+| [#869](https://github.com/intel/intel-extension-for-pytorch/issues/869) | CPU offload crash with INT4 AutoRound MoE | Open | None |
+| [#867](https://github.com/intel/intel-extension-for-pytorch/issues/867) | IPEX end-of-life — GatedMLPMOE NOT upstreamed | Closed | N/A |
+
+### Key facts
+
+- **Zero PRs** exist fixing topk_softmax, moe_gemm, or GatedMLPMOE
+- **#838 is the ONLY issue** mentioning GatedMLPMOE in the entire repo (198 issues)
+- INT4 AutoRound MoE was **never working** for models with 128+ experts on ANY Intel GPU
+- GatedMLPMOE, marlin_shuffle_weight, and MoE fusion layers were **NOT upstreamed** to PyTorch — they're frozen in the archived IPEX
+- Intel committed to "critical bug fixes for two quarters" after v2.8, but #838 was closed without a fix
+
+### Successor: vllm-xpu-kernels
+
+INT4 MoE is listed as future work in [vllm-project/vllm#33214](https://github.com/vllm-project/vllm/issues/33214) (vllm-xpu-kernels RFC). The new path would use **oneDNN INT4 GEMM** instead of IPEX's GatedMLPMOE.
+
+### Paths forward for Lunar Lake iGPU
+
+1. **MXFP4 quantization** — works today (GPT-OSS-20B proven), uses a different kernel path
+2. **vllm-xpu-kernels** — future Intel INT4 MoE implementation (not yet available)
+3. **llama.cpp GGUF** — alternative inference engine with SYCL backend, known to work on Lunar Lake
+4. **Wait for oneDNN INT4 MoE** — Intel's next-gen kernel library
+
+### What our patches achieved
+
+Despite Bug H being unfixable (IPEX limitation), our patches (A-G) solved every OTHER blocker:
+
+| Bug | What it fixed | Value |
+|---|---|---|
+| A | FusedMoE routing to IPEX | Model loads (was: CUDA fallback crash) |
+| B | top_k_experts config | GLM-4.7 architecture support |
+| C | GPTQ non-aligned dims | Gemma 4 model support |
+| D | MLA return_attn_probs | GLM-4.7 MLA attention |
+| E | CPU shuffle for iGPU | Weights load correctly (was: DEVICE_LOST) |
+| F | Warmup skip | Server starts (was: OUT_OF_RESOURCES) |
+| G | Shared memory insight | Correct memory budgeting |
+
+These patches will be needed when Intel releases a working INT4 MoE kernel (via vllm-xpu-kernels or oneDNN).

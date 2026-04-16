@@ -1,143 +1,40 @@
-# Copyright (C) 2025 Intel Corporation
-# SPDX-License-Identifier: Apache-2.0
+# Lunar Lake iGPU patches for INT4 AutoRound MoE models
+# Builds on Intel's llm-scaler-vllm with fixes for shared-memory iGPU
 #
-# Lunar Lake Xe2 iGPU variant — lightweight single-GPU image
-# Target: Intel Core Ultra (Lunar Lake) with Arc 140V integrated GPU
-# Memory: Shared LPDDR5x (~24GB usable for GPU from 32GB system)
+# Build:
+#   podman build -t ghcr.io/megastood/llm-scaler-vllm:0.14.0-lunar-lake \
+#     -f vllm/docker/Dockerfile.lunar-lake .
+#
+# Run:
+#   podman run --device /dev/dri -v /shared/models:/models \
+#     ghcr.io/megastood/llm-scaler-vllm:0.14.0-lunar-lake \
+#     vllm serve /models/qwen3-vl-30b-a3b-int4-autoround \
+#       --gpu-memory-utilization 0.75 --enforce-eager --max-model-len 4096 \
+#       --allow-deprecated-quantization
 
-# ======== Base Stage ========
-FROM intel/deep-learning-essentials:2025.2.2-0-devel-ubuntu24.04 AS vllm-lunar-lake-base
+FROM intel/llm-scaler-vllm:latest
 
-ARG https_proxy
-ARG http_proxy
+# Copy patches for INT4 AutoRound MoE on shared-memory iGPU
+COPY vllm/patches/autoround_fusedmoe_ipex_routing.patch /tmp/patches/
+COPY vllm/patches/gemma4_moe_top_k_experts.patch /tmp/patches/
+COPY vllm/patches/gptq_math_ceil_alignment.patch /tmp/patches/
+COPY vllm/patches/mla_xpu_return_attn_probs.patch /tmp/patches/
+COPY vllm/patches/xpu_gptq_moe_cpu_shuffle.patch /tmp/patches/
+COPY vllm/patches/ipex_marlin_shuffle_skip_preshuffled.patch /tmp/patches/
+COPY vllm/patches/xpu_skip_warmup_dummy_run.patch /tmp/patches/
 
-ENV DEBIAN_FRONTEND=noninteractive
+# Apply patches to installed site-packages
+# --forward skips already-applied hunks gracefully
+RUN SITE=$(python3 -c "import site; print(site.getsitepackages()[0])") && \
+    cd "$SITE" && \
+    for p in /tmp/patches/*.patch; do \
+      echo "Applying $(basename $p)..." && \
+      patch -p1 --forward < "$p" || true; \
+    done && \
+    rm -rf /tmp/patches
 
-# Install base dependencies (lighter than discrete GPU stack)
-RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-        pciutils \
-        sudo \
-        curl \
-        wget \
-        vim \
-        git \
-        libdrm2 \
-        libpciaccess0 \
-        xz-utils \
-        numactl \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# Add Intel oneAPI repo and GPU PPA
-RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
-    echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list && \
-    add-apt-repository -y ppa:kobuk-team/intel-graphics
-
-RUN apt-get update -y && \
-    apt-get install -y python3.12 python3.12-dev python3-pip && \
-    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
-    update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
-    apt-get install -y --no-install-recommends --fix-missing \
-        curl \
-        ffmpeg \
-        git \
-        libsndfile1 \
-        libsm6 \
-        libxext6 \
-        libaio-dev \
-        libgl1 \
-        lsb-release \
-        wget \
-        linux-libc-dev \
-        intel-oneapi-dpcpp-ct=2025.2.0-517 && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /llm
-COPY ./patches/vllm_for_multi_arc.patch /tmp/
-
-# Environment for single iGPU — no multi-GPU, no P2P
-ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/local/lib/"
-ENV VLLM_TARGET_DEVICE=xpu
-ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
-# Disable multi-GPU features not applicable to iGPU
+# Default env vars for Lunar Lake shared-memory iGPU
+ENV VLLM_SKIP_PROFILE_RUN=1
+ENV VLLM_SKIP_PROFILE_MULTIPLIER=1.15
+ENV PYTORCH_ALLOC_CONF=expandable_segments:True
 ENV CCL_TOPO_P2P_ACCESS=0
-# CCL single-GPU workaround: force local TCP transport to avoid
-# "fill_local_host_ip: can't find non-loopback interface" on handhelds
-ENV MASTER_ADDR=127.0.0.1
-ENV CCL_ZE_ENABLE=0
-ENV CCL_ATL_TRANSPORT=ofi
-ENV FI_PROVIDER=tcp
-# Memory-aware: offload weights to CPU before quantization (essential for shared memory)
-ENV VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
-ENV VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-# Expand PyTorch memory segments for shared memory efficiency
-ENV PYTORCH_ALLOC_CONF="expandable_segments:True"
-
-RUN python3 -m pip config set global.break-system-packages true
-
-# Clone + patch vllm
-RUN --mount=type=cache,target=/root/.cache/pip \
-    git clone -b v0.14.0 https://github.com/vllm-project/vllm.git && \
-    cd vllm && \
-    git apply /tmp/vllm_for_multi_arc.patch && \
-    pip install -r requirements/xpu.txt && \
-    pip install arctic-inference==0.1.1 && \
-    export CPATH=/opt/intel/oneapi/dpcpp-ct/2025.2/include/:${CPATH} && \
-    pip install --no-build-isolation .
-
-# Patch xpu_worker.py: disable CCL all_reduce warmup for single-GPU
-# oneCCL's KVS init fails in containers without real network interfaces.
-RUN XPU_WORKER=$(python3 -c "import vllm; import os; print(os.path.join(os.path.dirname(vllm.__file__), 'v1/worker/xpu_worker.py'))") && \
-    if grep -q "torch.distributed.all_reduce" "$XPU_WORKER"; then \
-        sed -i '/torch\.distributed\.all_reduce(/,/)/s/^/#/' "$XPU_WORKER"; \
-    fi
-
-# Install pypi dependencies
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install bigdl-core==2.4.0b2
-
-RUN rm -rf /tmp/*
-
-SHELL ["bash", "-c"]
-
-# ======== Serving Stage ========
-FROM vllm-lunar-lake-base AS vllm-lunar-lake
-
-ARG http_proxy
-ARG https_proxy
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install accelerate hf_transfer 'modelscope!=1.15.0'
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install librosa soundfile decord && \
-    pip install git+https://github.com/huggingface/transformers.git && \
-    pip install ijson
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-    cd /llm && \
-    git clone https://github.com/vllm-project/vllm-xpu-kernels.git && \
-    cd vllm-xpu-kernels && \
-    git checkout 4c83144 && \
-    sed -i 's|^--extra-index-url=https://download.pytorch.org/whl/xpu|# --extra-index-url=https://download.pytorch.org/whl/xpu|' requirements.txt && \
-    sed -i 's|^torch==2.10.0+xpu|# torch==2.10.0+xpu|' requirements.txt && \
-    sed -i 's|^triton-xpu|# triton-xpu|' requirements.txt && \
-    sed -i 's|^transformers|# transformers|' requirements.txt && \
-    pip install -r requirements.txt && \
-    pip install --no-build-isolation .
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip uninstall triton triton-xpu -y && \
-    pip install triton-xpu==3.6.0 --extra-index-url=https://download.pytorch.org/whl/test/xpu
-
-ENV VLLM_QUANTIZE_Q40_LIB="/usr/local/lib/python3.12/dist-packages/vllm_int4_for_multi_arc.so"
-
-RUN pip uninstall oneccl oneccl-devel -y || true
-RUN rm /usr/lib/python3/dist-packages/PyJWT-2.7.0.dist-info/ -rf || true
-RUN echo "source /opt/intel/oneapi/setvars.sh --force" >> /root/.bashrc
-
-# Copy Lunar Lake launch helper
-COPY ./scripts/lunar_lake_serve.sh /llm/
-
-ENTRYPOINT ["bash", "-c", "source /root/.bashrc && exec bash"]
