@@ -389,9 +389,9 @@ The INT4 MoE situation has two independent layers:
 | **vllm-xpu-kernels** (CUTLASS kernel library) | **Done since v0.1.0** (Jan 29, 2026) | PR #88 (INT4 grouped GEMM), PR #98 (fused MoE INT4), PR #114 (expert parallelism) |
 | **vLLM** (model layer integration) | **Not done** | INT4 GEMM dense is WIP ([vllm#33662](https://github.com/vllm-project/vllm/pull/33662)), INT4 MoE is "Planned" — no PR yet |
 
-**The CUTLASS INT4 MoE kernels work.** The blocker is vLLM model-layer
-integration — someone needs to write the Python glue that routes INT4 MoE
-models through vllm-xpu-kernels instead of the dead IPEX `GatedMLPMOE`.
+**The CUTLASS INT4 MoE kernels exist but have a Xe2 iGPU limitation.**
+See "CUTLASS testing on Lunar Lake" below for details. We wrote the vLLM
+integration glue using a sequential expert loop workaround.
 
 #### vllm-xpu-kernels INT4 MoE kernel PRs (all at vllm-project/vllm-xpu-kernels)
 
@@ -430,23 +430,73 @@ PR #88 benchmarks (E=16, B60 hardware):
 
 vLLM v0.19.0 pins `vllm_xpu_kernels==0.1.4` in `requirements/xpu.txt`.
 
+#### CUTLASS testing on Lunar Lake (Xe2-LPG iGPU)
+
+We tested `torch.ops._xpu_C.cutlass_grouped_gemm_interface(is_B_int4=True)`
+directly on Lunar Lake Arc 140V:
+
+**What works:**
+- CUTLASS INT4 grouped GEMM with small workloads: 8 experts, small dimensions
+- Weight conversion: GPTQ int32 → uint8 → implement_zp (signed int4) — no
+  marlin_shuffle_weight needed at all
+- The `_xpu_C` ops register correctly when vllm-xpu-kernels is imported
+  (the .so contains `cutlass_grouped_gemm_interface` symbol)
+
+**What crashes (same pattern as IPEX):**
+- Batched grouped GEMM with 50+ active expert groups at real model dimensions
+  (128 experts, 2048×1536) → DEVICE_LOST
+- 128 experts with zero weights passes; with real non-zero weights crashes
+- The trigger is the **routing pattern**: 56 active experts × 2 tokens each
+  crashes, but 8 experts × 14 tokens each works
+- This is the same limitation as IPEX — the Xe2 iGPU cannot dispatch 50+
+  simultaneous expert group GEMMs regardless of kernel framework
+
+**Root cause:** The Xe2-LPG iGPU (64 EUs, shared memory) has a hardware limit
+on simultaneous workgroup dispatch. Both IPEX's xetla `moe_gemm` and CUTLASS's
+`grouped_gemm_interface` hit this when many expert groups are active at once.
+llama.cpp avoids this by processing experts **sequentially** (one GEMM at a
+time), which is why it can run Qwen3.5-35B (256 experts) on the same hardware.
+
+**Solution: Sequential expert loop** (implemented in `vllm_for_multi_arc.patch`).
+Instead of batched grouped GEMM, loop over active experts and run one CUTLASS
+GEMM per expert. Each individual expert GEMM is small enough for Xe2. This is
+the same strategy llama.cpp uses. The implementation:
+
+1. **Weight prep** (`process_weights_after_loading`): GPTQ int32 → uint8 →
+   `implement_zp()` on CPU. No marlin shuffle. No IPEX import needed.
+2. **Routing** (`apply`): Standard PyTorch `topk` + `softmax`. No IPEX
+   `topk_softmax` / `moe_scatter` / `moe_gather` ops.
+3. **Compute** (`apply`): For each active expert, run two CUTLASS GEMMs
+   (gate_up + down) with `cutlass_grouped_gemm_interface(num_experts=1)`.
+4. **Accumulate**: Weighted sum of per-expert outputs.
+
+This completely eliminates the IPEX dependency for INT4 MoE inference.
+Performance is slower than batched grouped GEMM (sequential vs parallel),
+but it **actually works** on Xe2 iGPU — which is better than crashing.
+
+**Status: NEEDS TESTING** — The sequential loop was implemented and the
+individual CUTLASS GEMMs work, but the full end-to-end vLLM server test
+with a real model has not yet been confirmed working.
+
 #### Migration options (ranked)
 
-1. **Write INT4 MoE integration for vLLM v0.19** — The CUTLASS kernels exist
-   in vllm-xpu-kernels v0.1.4. The missing piece is a vLLM-side
-   `XPUInt4MoEMethod` class that calls `vllm_xpu_kernels.fused_moe()` with
-   `is_int4=True` instead of IPEX's `GatedMLPMOE`. This is primarily Python
-   glue code. Could be contributed upstream as a PR.
+1. **CUTLASS sequential expert loop on vLLM v0.14** (implemented, needs testing)
+   — Patch `XPUGPTQMarlinMoEMethod` to use CUTLASS per-expert GEMMs instead
+   of IPEX batched `moe_gemm`. No marlin shuffle, no IPEX dependency for MoE.
+   Uses vllm-xpu-kernels v0.1.4 already installed. See patch in
+   `vllm_for_multi_arc.patch`. **NEEDS END-TO-END TESTING.**
 
-2. **Wait for upstream INT4 MoE integration** — Intel is working on it
+2. **Use MXFP4 models** — works on Lunar Lake now (GPT-OSS-20B, 36 experts).
+   Limited model selection but fully proven.
+
+3. **Use llama.cpp GGUF** — own SYCL kernels, no GatedMLPMOE dependency.
+   Works for GLM-4.7-Flash-Q4_K_M.gguf today. Sequential expert loop
+   (same strategy as our CUTLASS approach).
+
+4. **Wait for upstream vLLM v0.19+ INT4 MoE** — Intel is working on it
    (RFC #33214 tracks it as "Planned"). INT4 dense GEMM ([#33662](https://github.com/vllm-project/vllm/pull/33662))
-   is the prerequisite and is under review.
-
-3. **Use MXFP4 models on vLLM v0.19** — MXFP4 MoE is fully integrated and
-   works (GPT-OSS-20B, 36 experts). Limited model selection.
-
-4. **Use llama.cpp GGUF** — own SYCL kernels, no GatedMLPMOE dependency.
-   Works for GLM-4.7-Flash-Q4_K_M.gguf today.
+   is the prerequisite and is under review. When landed, batched grouped
+   GEMM may still crash on Xe2 iGPU — may need the sequential workaround.
 
 #### Why vLLM v0.14 + IPEX is a dead end
 
@@ -458,15 +508,14 @@ vLLM v0.19.0 pins `vllm_xpu_kernels==0.1.4` in `requirements/xpu.txt`.
 
 ### What Intel supports vs what we need
 
-| | Dense INT4 | MoE INT4 (IPEX) | MoE INT4 (vllm-xpu-kernels) | MoE MXFP4 |
-|---|---|---|---|---|
-| Code path | `compressed-tensors` w4a16 | `GatedMLPMOE` | CUTLASS XE fused MoE | CUTLASS XE fused MoE |
-| Kernel exists? | Yes | Yes (broken) | **Yes** (v0.1.0+) | **Yes** |
-| vLLM wired up? | Yes ([#33973](https://github.com/vllm-project/vllm/pull/33973)) | Yes (v0.14) | **No** (planned) | **Yes** |
-| Works in v0.19? | **Yes** | N/A (IPEX removed) | **No** (needs integration PR) | **Yes** |
-| Works on discrete? | Yes | No (128+ crash) | Unknown (needs testing) | Yes |
-| Works on iGPU? | Yes (too big) | No (64+ crash) | Unknown (needs testing) | Yes (GPT-OSS-20B) |
-| Status | Stable | **Dead** (archived) | **Kernel ready, integration pending** | Stable |
+| | Dense INT4 | MoE INT4 (IPEX) | MoE INT4 (CUTLASS batched) | MoE INT4 (CUTLASS sequential) | MoE MXFP4 |
+|---|---|---|---|---|---|
+| Code path | `compressed-tensors` w4a16 | `GatedMLPMOE` | `cutlass_grouped_gemm_interface` | Per-expert CUTLASS GEMM loop | CUTLASS XE fused MoE |
+| Kernel exists? | Yes | Yes (broken) | **Yes** (v0.1.0+) | **Yes** (v0.1.0+) | **Yes** |
+| vLLM wired up? | Yes ([#33973](https://github.com/vllm-project/vllm/pull/33973)) | Yes (v0.14) | Planned (v0.19+) | **Yes** (our patch) | **Yes** |
+| Works on discrete? | Yes | No (128+ crash) | Likely | Likely | Yes |
+| Works on iGPU? | Yes (too big) | No (64+ crash) | **No** (50+ experts crash) | **Needs testing** | Yes (GPT-OSS-20B) |
+| Status | Stable | **Dead** (archived) | Xe2 iGPU limited | **Implemented, needs testing** | Stable |
 
 ### IPEX code references
 
