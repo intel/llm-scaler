@@ -662,3 +662,45 @@ Despite Bug H being unfixable (IPEX limitation), our patches (A-G) solved every 
 | G | Shared memory insight | Correct memory budgeting |
 
 These patches will be needed when Intel releases a working INT4 MoE kernel (via vllm-xpu-kernels or oneDNN).
+
+---
+
+## vLLM 0.19 / vllm-xpu-kernels Analysis (2026-04-16)
+
+### New XPU MoE path (bypasses IPEX entirely)
+
+vLLM 0.16+ migrated from IPEX to `vllm-xpu-kernels` ([RFC #33214](https://github.com/vllm-project/vllm/issues/33214)). The new `XPUExperts` class uses CUTLASS grouped GEMM instead of IPEX's GatedMLPMOE:
+
+| Component | Old (IPEX) | New (vllm-xpu-kernels) |
+|---|---|---|
+| MoE routing | `torch.ops.torch_ipex.topk_softmax` | `torch.ops._moe_C.remap_hidden_states` |
+| MoE GEMM | `torch.xpu.moe_gemm` / `GatedMLPMOE` | `torch.ops._xpu_C.cutlass_grouped_gemm_interface` |
+| Weight shuffle | `marlin_shuffle_weight` | `implement_zp()` (uint8 conversion) |
+| Weight format | INT32-packed GPTQ (8 nibbles/int32) | UINT8-packed (2 nibbles/byte, signed) |
+
+### RFC migration status
+
+- [x] Unquantized MoE — Done
+- [x] FP8 MoE — Done
+- [x] MXFP4 MoE — Done
+- [ ] **INT4 MoE** — NOT done (no PR)
+- [ ] INT4 GEMM (AWQ/GPTQ linear) — WIP ([PR #33662](https://github.com/vllm-project/vllm/pull/33662))
+
+### INT4 MoE kernel exists but needs format bridging
+
+`xpu_fused_moe(..., is_int4=True)` is implemented in vllm-xpu-kernels and uses CUTLASS with `is_B_int4=True`. However:
+
+1. It expects **uint8-packed** weights (via `implement_zp()`)
+2. GPTQ/AutoRound models have **int32-packed** weights with group scales
+3. A format conversion layer is needed (this is what PR #33662 is building for linear layers)
+4. Once PR #33662 lands, extending it to MoE should be straightforward
+
+### Can we backport to vLLM 0.14?
+
+Not directly — `vllm-xpu-kernels` requires vLLM 0.16+ infrastructure (modular kernel API, `FusedMoEExpertsModular`, `_moe_C` ops). The APIs don't exist in 0.14.
+
+### Recommendation
+
+1. **Short term**: Use MXFP4 on vLLM 0.14 (works today)
+2. **Medium term**: Upgrade to vLLM 0.19 when INT4 MoE support lands
+3. **Long term**: Contribute the GPTQ→uint8 format bridge for INT4 MoE to vllm-xpu-kernels
