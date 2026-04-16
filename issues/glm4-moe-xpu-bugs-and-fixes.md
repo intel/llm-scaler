@@ -494,3 +494,47 @@ The README's INT4 support refers to "Dynamic Online Int4" (quantize at load time
 | On iGPU | Unknown | Broken (this investigation) |
 
 Testing Online INT4 on Lunar Lake iGPU would require FP16 base model weights (~60 GiB for Qwen3-30B) which don't fit in 32 GiB shared memory.
+
+---
+
+## Critical Finding: INT4 AutoRound MoE Never Tested by Intel (2026-04-16)
+
+### The #324 user ran a DENSE model, not MoE
+
+Issue [#324](https://github.com/intel/llm-scaler/issues/324) reported `Intel/Qwen3.5-27B-int4-autoround` working on Arc B60. But **Qwen3.5-27B is a dense model** (`Qwen3.5ForCausalLM`), not MoE. Dense models use `IPEXGPTQLinearMethod` for linear layers — no `FusedMoE`, no `GatedMLPMOE`, no `marlin_shuffle_weight`. This path works fine.
+
+Our models are all MoE (`Qwen3MoeForCausalLM`, `Qwen3VLMoeForConditionalGeneration`, `Glm4MoeLiteForCausalLM`) which require `XPUGPTQMarlinMoEMethod` → `GatedMLPMOE`. This path is broken.
+
+### IPEX Issue #838: Exact Same Bug
+
+[intel/intel-extension-for-pytorch#838](https://github.com/intel/intel-extension-for-pytorch/issues/838) reports the identical `UR_RESULT_ERROR_OUT_OF_RESOURCES` (error 40) on `torch.ops.torch_ipex.topk_softmax()` when running `Qwen/Qwen3-30B-A3B` with `GatedMLPMOE` on Intel Data Center GPU Max 1550 (discrete GPU!).
+
+Key details:
+- **Filed**: 2025-06-14
+- **Closed**: 2026-01-05 by ZhaoqiongZ (no linked PR, no public fix)
+- **Hardware**: Intel Data Center GPU Max 1550 (discrete, NOT iGPU)
+- **The bug affects discrete GPU too** — not just Lunar Lake iGPU
+- Smaller MoE models (Llama-4-Scout-17B-16E, Falcon3-MoE-2x7B) work; Qwen3-30B-A3B (128 experts) fails
+- Same IPEX version `2.10.10.post1+xpu` — no public fix available
+
+### Docker image doesn't help
+
+The Docker image `intel/llm-scaler-vllm:latest` (b8.1) has:
+- Same compute-runtime `25.48.36300.8` as our native install
+- Same IPEX `2.10.10.post1+xpu`
+- Bug A unfixed (no FusedMoE routing in AutoRound)
+- No CPU shuffle workaround (Bug E)
+- Same `GatedMLPMOE.forward()` code path
+
+### What Intel supports vs what we need
+
+| | Dense INT4 AutoRound | MoE INT4 AutoRound | MoE FP8/FP16 | MoE MXFP4 |
+|---|---|---|---|---|
+| Code path | `IPEXGPTQLinearMethod` | `XPUGPTQMarlinMoEMethod` | `XPUGPTQInt4LinearMoEMethod` | Direct MoE kernel |
+| Intel tested | ✅ | ❌ (IPEX #838 open) | ✅ | ✅ |
+| Works on discrete | ✅ | ❌ (128 experts crashes) | ✅ | ✅ |
+| Works on iGPU | ✅ (too big for 32GB) | ❌ | ❌ (FP16 too big) | ✅ (GPT-OSS-20B) |
+
+### Conclusion
+
+INT4 AutoRound MoE inference via `GatedMLPMOE` is broken on ALL Intel GPUs for models with 128+ experts. The fix is in Intel's internal IPEX but hasn't been released. Our patches (Bugs A-F) correctly route and prepare the weights, but the underlying IPEX `GatedMLPMOE.forward()` → `topk_softmax()` / `moe_gemm()` path has a known unfixed bug (#838).
