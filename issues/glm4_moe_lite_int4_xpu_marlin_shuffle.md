@@ -1,6 +1,6 @@
 # GLM-4.7-Flash INT4 MoE: Marlin Shuffle DEVICE_LOST on Lunar Lake XPU
 
-## Status: BLOCKED - XPU driver limitation
+## Status: Bug E (shuffle OOM) FIXED — Bug H (Level Zero resource exhaustion) OPEN
 
 ## Problem
 
@@ -65,21 +65,155 @@ is the quantization format:
 | Format | Works on XPU? | Needs marlin_shuffle? | MoE on 32GB shared? |
 |--------|--------------|----------------------|---------------------|
 | **MXFP4** | Yes | **No** — weights are pre-formatted for Marlin | **Yes** (gpt-oss-20b proves it) |
-| **INT4 AutoRound** | Yes | **Yes** — must reshuffle at runtime | **No** — OOM during shuffle |
+| **INT4 AutoRound** | Yes | **Yes** — must reshuffle at runtime | Bug E fixed (CPU shuffle), Bug H open (40+ layers) |
 | **GPTQ** | No | N/A — requires CUDA-only Marlin kernels | No |
 | **AWQ** | No | N/A — requires CUDA-only Marlin kernels | No |
 | **FP8** | Yes | No — uses `GatedMLPMOE(is_fp8=True)` | No — 30B model → ~30 GiB, won't fit |
 | **GGUF** | No (vLLM) | N/A — vLLM GGUF is CUDA-only | Yes — via llama.cpp with SYCL backend |
 
-**The root cause is not MoE itself, but INT4 AutoRound → marlin_shuffle_weight.**
-MXFP4 stores weights already in the Marlin kernel's expected layout, so no runtime
-reshuffling is needed. If an MXFP4 version of GLM-4.7-Flash existed, it would likely
-load without OOM, just like gpt-oss-20b.
+**Two separate issues for INT4 MoE on shared-memory iGPU:**
+1. **Bug E (FIXED)**: marlin_shuffle_weight OOM during init — solved by CPU shuffle
+2. **Bug H (OPEN)**: Level Zero resource pool exhaustion on 40+ layer models — even
+   after Bug E fix, the runtime kernel submissions (~320/token) exhaust the driver
+
+MXFP4 avoids both issues: no shuffle needed (Bug E), and fewer kernel objects
+because the weights are pre-formatted for the Marlin kernel layout.
 
 ### Implication for shared-memory iGPUs
-On shared-memory systems, **MXFP4 is the only vLLM-compatible quantization format
-that works for MoE models**. INT4/GPTQ/AWQ all require either reshuffling (OOM) or
-CUDA-only kernels (unsupported). The alternative path is llama.cpp GGUF via SYCL.
+On shared-memory systems with 40+ MoE layers, **MXFP4 is the only vLLM-compatible
+quantization format that works for MoE models** without Level Zero env var tuning.
+INT4/GPTQ/AWQ all require either reshuffling (Bug E, now fixed) or CUDA-only kernels
+(unsupported), and still hit Bug H on 40+ layer models. The alternative path is
+llama.cpp GGUF via SYCL backend.
+
+## Bug H: Level Zero OUT_OF_RESOURCES (error 40) on 40+ Layer INT4 MoE
+
+**Status: OPEN — requires Level Zero env var tuning or compute-runtime upgrade**
+
+### Distinction from Bug E
+
+Bug E (DEVICE_LOST during marlin_shuffle) was solved by the CPU shuffle workaround.
+Bug H is a **separate** resource exhaustion issue that persists even with Bug E + F
+fixes applied. Models load successfully, KV cache allocates, server starts — but
+the model crashes with error 40 during warmup or first inference.
+
+### Affected models
+
+| Model | Layers | Experts/Layer | Attention | Result |
+|-------|--------|---------------|-----------|--------|
+| GPT-OSS-20B (MXFP4) | 24 | 36 | GQA | Works |
+| Qwen3.5-35B-A3B (INT4) | 40 | 256 | GQA | **Bug H** |
+| GLM-4.7-Flash (INT4) | 47 | 64 | MLA | **Bug H** |
+
+### Root cause: IPEX creates SYCL kernel objects with no caching or reuse
+
+Each MoE layer's forward pass generates ~7-8 `queue.submit()` calls via the
+`DPCPP_Q_SUBMIT` macro (`csrc/gpu/utils/DPCPP.h:94`):
+
+```
+Per layer per token:
+  topk_softmax       → 1 queue.submit()
+  moe_rows_counts    → 1 queue.submit()
+  moe_scatter        → 1 queue.submit()
+  moe_gemm W13       → 1 queue.submit() (fused group GEMM via xetla)
+  silu_and_mul       → 1 queue.submit()
+  moe_gemm W2        → 1 queue.submit() (fused group GEMM via xetla)
+  moe_gather         → 1 queue.submit()
+  = ~7-8 SYCL kernel submissions per layer
+```
+
+Each `queue.submit()` creates Level Zero objects (command lists, kernel handles,
+events). The `DPCPP_Q_SUBMIT` macro has **no kernel caching, no command list reuse,
+no resource pooling**:
+
+```cpp
+// csrc/gpu/utils/DPCPP.h:94 — no caching
+#define DPCPP_Q_SUBMIT(q, cgf, ...)
+  { auto e = (q).submit((cgf), ##__VA_ARGS__); (q).throw_asynchronous(); }
+```
+
+**Why 24 layers works but 40+ doesn't:**
+- GPT-OSS-20B (24 layers, MXFP4): ~192 kernel objects at runtime — within pool
+- Qwen3.5-35B-A3B (40 layers, INT4): ~320 per token — exceeds pool
+- GLM-4.7-Flash (47 layers, INT4+MLA): ~376+ per token (MLA adds Triton kernels)
+
+### IPEX has no device-adaptive resource management
+
+After exhaustive search of the IPEX codebase (`xpu-main` branch):
+
+1. **No iGPU detection**: `DeviceInfo` tracks `device_type` (cpu/gpu) but has no
+   `is_integrated` field, no `host_unified_memory` flag, no shared memory detection
+2. **No resource caps**: Zero references to Level Zero resource limits
+   (`ze_device_properties_t`, `maxHardwareContexts`, etc.)
+3. **No kernel sharing across layers**: Each `_IPEXGatedMLPMOEXPU` instance is
+   independent — no shared kernel cache between layers
+4. **No cleanup**: `DPCPP_Q_SUBMIT` creates new submissions each time, no periodic
+   `synchronize()` to flush and reclaim resources
+5. **One BMG-specific workaround exists** (work group size cap in `Norm.h`) — that's
+   the only hardware-specific resource adjustment in the entire codebase
+6. **MoE GEMM hardcodes** `PERSISTENT_SG_NUMS = 20 * 32 = 640` sub-groups — no
+   device-adaptive sizing
+
+### Error handling just translates, doesn't recover
+
+```cpp
+// csrc/gpu/utils/DPCPP.h:60
+inline constexpr std::string_view OUT_OF_RESOURCES("PI_ERROR_OUT_OF_RESOURCES");
+```
+
+The `DPCPP_EXCEP_CATCH` macro catches `PI_ERROR_OUT_OF_RESOURCES` and converts it
+to the misleading message "Allocation is out of device memory on current platform."
+No retry logic, no resource scaling, no fallback path.
+
+### Potential mitigations
+
+#### A. Level Zero environment variables (no code changes)
+
+```bash
+# Bypass command list pool — use immediate command lists
+export SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
+
+# Force aggressive cleanup of completed command lists (default: 20)
+export SYCL_PI_LEVEL_ZERO_COMMANDLISTS_CLEANUP_THRESHOLD=5
+
+# Reduce batch size to limit in-flight kernel objects
+export SYCL_PI_LEVEL_ZERO_BATCH_SIZE=4
+
+# Ensure event reuse is enabled (should be default=1)
+export SYCL_PI_LEVEL_ZERO_REUSE_DISCARDED_EVENTS=1
+```
+
+#### B. Periodic synchronize() in IPEX (code change)
+
+Add `torch.xpu.synchronize()` at the end of each `_MoEGEMMXpu.__init__()` to
+flush the SYCL queue and release intermediate Level Zero resources between layers.
+Also add periodic sync during inference forward passes.
+
+#### C. Upgrade compute-runtime
+
+compute-runtime 26.09.37435.1 includes memory pool enhancements and
+"defer backing" enabled by default. May increase Level Zero resource pools.
+Requires full RPM rebuild on Nobara/Fedora.
+
+#### D. Reduce kernel template instantiations
+
+The xetla MoE GEMM kernel instantiates 4 tile policies (GEMV, GEMV_16, GEMV_32,
+GEMM) per dtype. On iGPU, limiting to a single policy would reduce compiled
+kernel variants. Requires IPEX C++ changes (not feasible on frozen repo).
+
+### IPEX code references
+
+| File | What it does |
+|------|-------------|
+| `linear_fusion.py:106-167` | `_MoEGEMMXpu.__init__` — per-layer init, no sharing |
+| `linear_fusion.py:169-208` | `marlin_shuffle_weight` — 65 experts × tensor ops on XPU |
+| `intrinsic/__init__.py:443` | `moe_gemm()` — calls `group_mm_int4_out_marlin` |
+| `intrinsic/__init__.py:489-533` | Native fallback — per-expert loop (even worse) |
+| `moe_gemm.cpp:188` | C++ `fused_moe_gemm_persistent` — returns `cgfs_t{cgf}` |
+| `DPCPP.h:94` | `DPCPP_Q_SUBMIT` — no caching macro |
+| `CachingDeviceAllocator.cpp` | Fixed constants (kSmallSize=1MB, kLargeBuffer=20MB), no device-adaptive sizing |
+
+---
 
 ## Ideas for Future Investigation
 
