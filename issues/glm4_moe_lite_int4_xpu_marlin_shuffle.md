@@ -155,7 +155,26 @@ rows_clone = rows_for_experts.clone()
 torch.xpu.synchronize()
 torch.xpu.moe_gemm(reordered_clone, W13_clone, rows_clone, ...)
 → DEVICE_LOST  ← freshly cloned tensors still crash
+
+# CRASHES — Pure Python routing (no IPEX ops at all) after attention
+# Inside vLLM forward apply(), after L1 attention completes:
+torch.xpu.synchronize()      # flush all pending ops
+torch.xpu.empty_cache()      # free unused memory
+gc.collect()                  # Python garbage collection
+# Then pure Python routing: x.repeat_interleave(), manual row counting
+# No moe_scatter, no moe_rows_counts — zero IPEX routing ops
+torch.xpu.moe_gemm(repeated_input, W13, manual_rows, ..., is_int4=True)
+→ DEVICE_LOST  ← attention alone poisons the context
+
+# NEVER REACHED — IPEX routing test
+# Device already dead after pure Python test above
 ```
+
+**Final elimination**: The pure Python routing test (Test 2) removes ALL IPEX
+ops between attention and moe_gemm — no `moe_scatter()`, no `moe_rows_counts()`,
+no `topk_softmax()`. Only standard PyTorch ops (`repeat_interleave`, tensor
+indexing) and then `torch.xpu.moe_gemm`. Still crashes. This proves the Level
+Zero context is irrecoverably poisoned by the attention kernel alone.
 
 ### GatedMLPMOE bypass (works in isolation, crashes in pipeline)
 
@@ -200,7 +219,9 @@ was incorrect. MXFP4 models work in the pipeline because their xetla kernel
 | 5 | GatedMLPMOE wrapper bug | Direct moe_gemm bypass | **Eliminated** — bypass also crashes in pipeline |
 | 6 | Tensor backing memory state | Clone all inputs before moe_gemm | **Eliminated** — cloned tensors also crash |
 | 7 | Level Zero env var tuning | IMMEDIATE_COMMANDLISTS + CLEANUP_THRESHOLD + BATCH_SIZE | **Eliminated** — no effect |
-| 8 | SYCL context pollution from attention ops | All above combined | **CONFIRMED** — only difference is attention ops |
+| 8 | IPEX routing ops (moe_scatter etc.) poison queue | Pure Python routing + moe_gemm (no IPEX routing ops) | **Eliminated** — crashes without any IPEX routing ops |
+| 9 | Stale allocator state | synchronize + empty_cache + gc.collect before moe_gemm | **Eliminated** — full cleanup doesn't help |
+| 10 | SYCL context pollution from attention ops | All above combined | **CONFIRMED** — attention alone poisons context |
 
 ### Why MXFP4 is not affected
 
