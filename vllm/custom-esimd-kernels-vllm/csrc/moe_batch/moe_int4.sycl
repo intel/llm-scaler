@@ -177,24 +177,24 @@ torch::Tensor moe_router_forward_int4(
 
     TORCH_CHECK(hidden_size % 128 == 0);
 
-    // Gate weight may be [E, K_packed] (IPEX transposed) or [K_packed, E] (SymInt4 original).
-    // For square matrices (35B: 256×256) both look the same.
-    // For non-square (122B: 384×256) we detect and transpose if needed.
-    if (weight.size(0) == K_packed && weight.size(1) != K_packed) {
-        // [K_packed, E] → transpose to [E, K_packed]
-        weight = weight.t().contiguous();
-    }
-    int num_experts = weight.size(0);
+    // IPEX OneDNN does column-major in-place repack on gate weight:
+    //   Shape stays [K_packed, E], but flat memory becomes [E, K_packed] row-major.
+    //   Fix: reshape to [E, K_packed] (no data copy, just reinterpret shape).
+    //   For square (35B: K_packed==E), reshape is no-op.
+    int num_experts = weight.numel() / K_packed;
+    weight = weight.reshape({num_experts, K_packed});
     TORCH_CHECK(weight.size(1) == K_packed,
         "gate weight shape mismatch: got [", weight.size(0), ", ", weight.size(1),
         "], expected [num_experts, ", K_packed, "]");
 
-    // Scale may be [K_groups, E] or [E, K_groups] — kernel reads [K_groups, E] with stride
-    // Detect and transpose if needed
+    // Scale: kernel reads as [K_groups, num_experts] with stride access.
+    // IPEX may or may not modify scale. Detect layout and adjust.
     int K_groups = hidden_size / 128;
-    if (scale.size(0) == num_experts && scale.size(1) == K_groups) {
-        // [E, K_groups] → transpose to [K_groups, E]
-        scale = scale.t().contiguous();
+    if (scale.size(0) != K_groups || scale.size(1) != num_experts) {
+        // Try reshape (column-major repack) or transpose
+        if (scale.numel() == K_groups * num_experts) {
+            scale = scale.reshape({K_groups, num_experts});
+        }
     }
     TORCH_CHECK(scale.size(0) == K_groups && scale.size(1) == num_experts,
         "gate scale shape mismatch: got [", scale.size(0), ", ", scale.size(1),

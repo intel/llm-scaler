@@ -146,17 +146,20 @@ def test_router_forward():
             x = (torch.randn(n_tokens, H) * 0.1).half()
             ref_out = (x.float() @ gate_dq.float().t()).half()
 
-            # Kernel auto-detects layout: [E, K_packed] or [K_packed, E]
-            # Test both layouts only when non-square (auto-detect works)
+            # Kernel uses reshape to handle IPEX column-major repack.
+            # Test: [E,K] (direct) and [K,E] (IPEX OneDNN column-major repack simulation)
             K_packed = H // PACK_FACTOR
             layouts = ["[E,K]"]
             if K_packed != E:
-                layouts.append("[K,E]")  # non-square: test auto-detect
+                layouts.append("[K,E]_colmaj")  # simulate IPEX OneDNN column-major repack
             for layout in layouts:
                 if layout == "[E,K]":
                     qw = qweight.to(DEVICE)
                 else:
-                    qw = qweight.t().contiguous().to(DEVICE)  # simulate SymInt4 transpose
+                    # Simulate IPEX OneDNN: store [E,K] data in [K,E] shape (column-major repack)
+                    # flat memory of [E,K] row-major = [K,E] column-major
+                    qw_flat = qweight.flatten()  # [E*K_packed] in [E,K] row-major order
+                    qw = qw_flat.reshape(K_packed, E).to(DEVICE)  # reinterpret as [K,E]
                 sc = scales.t().contiguous().to(DEVICE)
 
                 kernel_out = moe_int4_ops.moe_router_forward_int4(
