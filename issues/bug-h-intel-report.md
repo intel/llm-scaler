@@ -115,27 +115,68 @@ This proves the Level Zero SYCL context is irrecoverably corrupted by the attent
 
 ## Key observation
 
-MXFP4 (`group_mm_mxfp4_out_marlin`) is resilient to whatever state the attention kernels leave in the SYCL context, while INT4 (`group_mm_int4_out_marlin`) is not. This suggests the INT4 xetla kernel makes assumptions about the SYCL queue/context state that are violated after attention kernel execution on Xe2-LPG.
+MXFP4 (`group_mm_mxfp4_out_marlin`) is resilient to whatever state the attention kernels leave in the SYCL context, while INT4 (`group_mm_int4_out_marlin`) is not.
 
 This does NOT happen on discrete GPUs (e.g. B580 Xe2-HPG) — only on the Xe2-LPG iGPU with shared memory architecture.
+
+## Source code analysis: INT4 vs MXFP4 kernel differences
+
+Reading the IPEX xetla kernel source reveals these are fundamentally different kernels:
+
+| Aspect | INT4 (`XEGEMM_INT4_marlin`) | MXFP4 (`XEGEMM_MXFP4_marlin`) |
+|--------|------|-------|
+| **Kernel class** | `int4_group_gemm_universal_t` | `persistent_mxfp4_group_gemm_universal_t` |
+| **Dispatch model** | **Non-persistent** (one WG per tile, relies on SYCL scheduler) | **Persistent** (atomic self-scheduling via `atomic_buffer`) |
+| **Compute policy** | `compute_policy_int4_dequantize_v2` | `compute_policy_mxfp4_dequantize` |
+| **Input dtype** | `sycl::half` (FP16) | `sycl::ext::oneapi::bfloat16` (BF16) |
+| **Scale dtype** | `sycl::half` (FP16) | `uint8_t` |
+| **GEMM tile (wg_m×wg_n)** | **256×256** | **128×128** |
+| **GEMV tile** | 8×64 (same) | 8×64 (same) |
+| **Zero-point param** | `weight_zp` (always nullptr) | N/A |
+
+### Primary suspect: 4× larger workgroup tiles
+
+The INT4 GEMM policy uses 256×256 workgroup tiles vs MXFP4's 128×128. On Xe2-LPG (64 EUs), this demands significantly more SLM, registers, and synchronization barriers. After attention kernels leave residual SYCL state, the INT4 kernel's larger resource demands may push past a threshold.
+
+**Tile policy is selected by `average_m = total_tokens / num_experts`:**
+- `average_m ≤ 4` → GEMV (8×64) — **same tiles for both INT4 and MXFP4**
+- `average_m > 128` → GEMM (256×256 INT4 vs 128×128 MXFP4)
+
+If sending a 1-token prompt (GEMV policy) works after attention, the tile size is confirmed as root cause.
+
+### Secondary suspect: Non-persistent vs persistent dispatch
+
+Persistent kernels self-schedule via atomic counters — they don't depend on the SYCL runtime scheduler. Non-persistent kernels (INT4) rely on the runtime. If attention corrupts scheduler state, non-persistent dispatch fails.
+
+### Third suspect: FP16 vs BF16 input type mismatch
+
+The INT4 C++ hardcodes `using dtype_a = sycl::half` but vLLM default is BF16. If BF16 tensors reach the INT4 kernel without explicit cast, this could cause issues on Xe2-LPG.
 
 ## Expected behavior
 
 `torch.xpu.moe_gemm(is_int4=True)` should work correctly after `flash_attn_varlen_func` / `chunked_prefill` in the same forward pass, just as `torch.xpu.moe_gemm(is_mxfp4=True)` does.
 
-## Possible root causes (for Intel investigation)
+## Suggested fixes (for Intel investigation)
 
-1. **Attention kernel leaves dirty SYCL queue state** — barriers, events, or command list state that the INT4 xetla kernel template doesn't handle
-2. **Level Zero iGPU driver bug** — the shared-memory UMA driver path doesn't properly reset context between heterogeneous kernel dispatches (attention → MoE GEMM)
-3. **INT4 xetla kernel assumes clean context** — `group_gemm_int4_marlin_impl.h` may assume a pristine queue state that the MXFP4 kernel doesn't require
+1. **Reduce INT4 GEMM tile to 128×128** (matching MXFP4) in `GEMM_INT4_marlin.h` — if the 256×256 tile exceeds Xe2-LPG resources after attention
+2. **Switch INT4 to persistent dispatch** — use `persistent_int4_group_gemm_universal_t` (if it exists or can be templated from the MXFP4 version)
+3. **Fix attention kernel SYCL cleanup** — ensure `flash_attn_varlen_func` releases all SLM/barriers before returning
+4. **Level Zero iGPU driver hardening** — prevent residual state from one kernel affecting subsequent dispatches
+5. **Add Xe2-LPG-specific tile policies** — detect iGPU at runtime and use smaller tiles
 
-## IPEX code references
+## IPEX source files (analyzed)
 
 | File | Relevance |
 |------|-----------|
+| `XEGEMM_INT4_marlin.cpp:61-115` | INT4 C++ dispatch: `group_mm_int4_out_marlin()` |
+| `XEGEMM_MXFP4_marlin.cpp:54-96` | MXFP4 C++ dispatch: `group_mm_mxfp4_out_marlin()` |
+| `XEGEMM_INT4_marlin.h:80-178` | INT4 launch: tile policy switch (GEMV→GEMM) |
+| `XEGEMM_MXFP4_marlin.h:56-142` | MXFP4 launch: tile policy switch |
+| `xetla/GEMM_INT4_marlin.h:52-62` | INT4 GEMM policy: **wg 256×256** |
+| `xetla/GEMM_MXFP4_marlin.h:53-63` | MXFP4 GEMM policy: **wg 128×128** |
+| `kernels/GEMM/group_gemm_int4_marlin_impl.h` | INT4 xetla kernel: `int4_group_gemm_universal_t` |
+| `kernels/GEMM/group_gemm_mxfp4_marlin_impl.h` | MXFP4 xetla kernel: `persistent_mxfp4_group_gemm_universal_t` |
 | `linear_fusion.py:235-291` | `fused_moe_experts()` — calls moe_gemm (crash site) |
-| `intrinsic/__init__.py:443` | Python `moe_gemm()` dispatch |
-| `moe_gemm.cpp:188` | C++ `fused_moe_gemm_persistent` — xetla dispatch |
-| `group_gemm_int4_marlin_impl.h` | INT4 xetla kernel — crashes after attention |
+| `intrinsic/__init__.py:412-533` | Python `moe_gemm()` dispatch |
 | `group_gemm_mxfp4_marlin_impl.h` | MXFP4 xetla kernel — survives after attention |
 | IPEX flash attention | `flash_attn_varlen_func` — source of context pollution |

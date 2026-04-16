@@ -226,10 +226,79 @@ was incorrect. MXFP4 models work in the pipeline because their xetla kernel
 ### Why MXFP4 is not affected
 
 The MXFP4 kernel (`group_mm_mxfp4_out_marlin`) uses a different xetla template
-implementation than the INT4 kernel (`group_mm_int4_out_marlin`). The MXFP4 kernel
-likely uses different SYCL work-group configurations, barrier patterns, or memory
-access patterns that are resilient to whatever state the attention kernels leave
-behind. This is a kernel-level interaction bug in the Level Zero SYCL runtime.
+implementation than the INT4 kernel (`group_mm_int4_out_marlin`). Source code
+analysis of the IPEX xetla kernels reveals **5 critical differences**:
+
+#### Kernel-level differences (from IPEX source)
+
+| Aspect | INT4 (`XEGEMM_INT4_marlin.cpp`) | MXFP4 (`XEGEMM_MXFP4_marlin.cpp`) |
+|--------|------|-------|
+| **Kernel class** | `int4_group_gemm_universal_t` | `persistent_mxfp4_group_gemm_universal_t` |
+| **Dispatch model** | Non-persistent (one WG per tile) | **Persistent** (atomic coordination) |
+| **Compute policy** | `compute_policy_int4_dequantize_v2` | `compute_policy_mxfp4_dequantize` |
+| **Input dtype** | `sycl::half` (FP16) | `sycl::ext::oneapi::bfloat16` (BF16) |
+| **Scale dtype** | `sycl::half` (FP16) | `uint8_t` |
+| **Accumulator** | `fp16` → `float` | `bf16` → `float` |
+| **GEMM tile (wg_m×wg_n)** | **256×256** | **128×128** |
+| **GEMV tile** | 8×64 (same) | 8×64 (same) |
+| **Zero-point param** | `weight_zp` (always None) | None |
+
+#### Primary suspect: 4× larger workgroup tiles (256×256 vs 128×128)
+
+The INT4 GEMM policy uses 256×256 workgroup tiles — 4× the area of MXFP4's
+128×128. On Xe2-LPG (64 EUs), this demands significantly more:
+- Shared Local Memory (SLM) per workgroup
+- Register file per subgroup
+- SYCL barrier synchronization points
+
+After attention kernels leave residual SYCL state (incomplete barriers, unreleased
+SLM, stale command lists), the INT4 kernel's larger resource demands may push past
+a threshold that causes DEVICE_LOST. MXFP4's smaller 128×128 tiles fit within
+available resources even with residual state.
+
+**Tile policy selection is based on `average_m`** (`total_tokens / num_experts`):
+- `average_m ≤ 4` → GEMV (8×64) — same for both
+- `average_m ≤ 32` → GEMV_16 (16×64) — same for both
+- `average_m ≤ 128` → GEMV_32 (32×64) — same for both
+- `average_m > 128` → GEMM (256×256 INT4 vs 128×128 MXFP4)
+
+**Testable**: If sending a 1-token prompt (forcing GEMV policy, same tiles as
+MXFP4) survives after attention → tile size is the root cause.
+
+#### Secondary suspect: Non-persistent vs persistent dispatch
+
+Persistent kernels manage their own workgroup scheduling via atomic counters
+(pre-allocated `atomic_buffer`). Non-persistent kernels rely on the SYCL runtime
+scheduler for workgroup dispatch. If attention corrupts the SYCL runtime scheduler
+state, non-persistent dispatch (INT4) would fail while persistent dispatch (MXFP4)
+remains functional because it self-schedules.
+
+#### Third suspect: FP16 vs BF16 input type
+
+The INT4 C++ kernel hardcodes `using dtype_a = sycl::half` (FP16). vLLM default
+is BF16. If the INT4 path receives BF16 input without explicit conversion, this
+could cause a type mismatch that only manifests after attention (which outputs BF16).
+The MXFP4 kernel natively expects BF16, matching vLLM's default.
+
+#### Source files examined
+
+| File | Purpose |
+|------|---------|
+| `csrc/gpu/aten/operators/XEGEMM_INT4_marlin.cpp` | INT4 C++: `group_mm_int4_out_marlin()` |
+| `csrc/gpu/aten/operators/XEGEMM_MXFP4_marlin.cpp` | MXFP4 C++: `group_mm_mxfp4_out_marlin()` |
+| `csrc/gpu/aten/operators/XEGEMM_INT4_marlin.h` | INT4 tile policy switch |
+| `csrc/gpu/aten/operators/XEGEMM_MXFP4_marlin.h` | MXFP4 tile policy switch |
+| `csrc/gpu/aten/operators/xetla/GEMM_INT4_marlin.h` | INT4 policies: GEMM=256×256 |
+| `csrc/gpu/aten/operators/xetla/GEMM_MXFP4_marlin.h` | MXFP4 policies: GEMM=128×128 |
+| `csrc/gpu/aten/operators/xetla/kernels/GEMM/group_gemm_int4_marlin_impl.h` | INT4 xetla kernel |
+| `csrc/gpu/aten/operators/xetla/kernels/GEMM/group_gemm_mxfp4_marlin_impl.h` | MXFP4 xetla kernel |
+
+#### Note: Marlin shuffle is identical for both
+
+Both MXFP4 and INT4 go through the same `marlin_shuffle_weight()` in
+`__init__()` (line 151-153 of `linear_fusion.py`). The "CPU shuffle" in the
+SymInt4 path is CPU *quantization* (`ggml_quantize_tensor`), not CPU Marlin
+shuffling. The Marlin nibble rearrangement always runs on XPU inside `__init__()`.
 
 ### Minimal reproducer
 
