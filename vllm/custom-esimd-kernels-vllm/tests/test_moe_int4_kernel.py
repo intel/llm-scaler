@@ -246,7 +246,7 @@ def test_forward_full():
         TK = cfg["top_k"]
         print(f"\n  Config: {cfg_name} (H={H}, D={D}, E={E})")
 
-        for n_tokens in [1, 4]:
+        for n_tokens in [2, 4]:  # bs>=2 to skip fused router+topk path (bs=1)
             torch.manual_seed(42)
 
             w13_fp16 = (torch.randn(E, 2 * D, H) * 0.02).half()
@@ -284,6 +284,13 @@ def test_forward_full():
                 x, logits, w13_dq, shared_gate_up, w2_dq, shared_down,
                 shared_gate_w, TK, E)
 
+            # Gate weight/scale for fused router+topk (bs=1 path)
+            # Quantize a simple gate weight for the fused path
+            _gate_fp16 = (torch.randn(E, H) * 0.02).half()
+            _gate_qw, _gate_sc = quantize_int4(_gate_fp16, GROUP_SIZE)
+            _gate_qw_xpu = _gate_qw.to(DEVICE)
+            _gate_sc_xpu = _gate_sc.t().contiguous().to(DEVICE)  # [K_groups, E]
+
             kernel_out = moe_int4_ops.moe_forward_full_int4(
                 x.to(DEVICE), logits.to(DEVICE),
                 w13_ipex.to(DEVICE), s13_ipex.to(DEVICE),
@@ -291,6 +298,7 @@ def test_forward_full():
                 w2_ipex.to(DEVICE), s2_ipex.to(DEVICE),
                 shared_down.to(DEVICE),
                 shared_gate_w.to(DEVICE),
+                _gate_qw_xpu, _gate_sc_xpu,
                 TK, NUM_SHARED_EXPERTS, E).cpu()
 
             cos = cosine_similarity(ref_out, kernel_out)

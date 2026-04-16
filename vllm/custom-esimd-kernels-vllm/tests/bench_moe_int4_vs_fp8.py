@@ -21,7 +21,7 @@ PACK_FACTOR = 8
 
 WARMUP = 50
 RUNS = 200
-BATCH_SIZES = [1, 2, 4, 6, 8, 12, 16, 32]
+BATCH_SIZES = [1, 2, 3, 4, 8, 12, 16, 32]
 
 # Two configs to benchmark
 CONFIGS = [
@@ -141,6 +141,10 @@ def bench_config(cfg):
     shared_d = torch.randn(H, D_S, dtype=torch.float16, device=DEVICE) * 0.02
     shared_gw = torch.randn(1, H, dtype=torch.float16, device=DEVICE) * 0.02
 
+    # Gate weight/scale for fused router+topk (bs=1)
+    gate_qw = torch.randint(0, 2**31, (E, H // PACK_FACTOR), dtype=torch.int32, device=DEVICE)
+    gate_sc = (torch.randn(H // GROUP_SIZE, E, dtype=torch.float16, device=DEVICE) * 0.01).abs()
+
     fp8_w13 = torch.randn(E, H, 2 * D, dtype=torch.float16, device=DEVICE).to(torch.float8_e5m2)
     fp8_w13_s = torch.ones(E, dtype=torch.float32, device=DEVICE) * 0.01
     fp8_w2 = torch.randn(E, D, H, dtype=torch.float16, device=DEVICE).to(torch.float8_e5m2)
@@ -172,7 +176,7 @@ def bench_config(cfg):
         for _ in range(WARMUP):
             moe_int4_ops.moe_forward_full_int4(x, logits,
                 w13_qw, w13_sc, shared_gu, w2_qw, w2_sc, shared_d, shared_gw,
-                TK, NUM_SHARED_EXPERTS, E)
+                gate_qw, gate_sc, TK, NUM_SHARED_EXPERTS, E)
         torch.xpu.synchronize()
         int4_t = []
         for _ in range(RUNS):
@@ -180,7 +184,7 @@ def bench_config(cfg):
             t0 = time.perf_counter()
             moe_int4_ops.moe_forward_full_int4(x, logits,
                 w13_qw, w13_sc, shared_gu, w2_qw, w2_sc, shared_d, shared_gw,
-                TK, NUM_SHARED_EXPERTS, E)
+                gate_qw, gate_sc, TK, NUM_SHARED_EXPERTS, E)
             torch.xpu.synchronize()
             int4_t.append((time.perf_counter() - t0) * 1e6)
 
