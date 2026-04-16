@@ -16,24 +16,27 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1(
   uint32_t pStride,
   uint32_t maxStride,
   uint32_t headKv,
+  uint32_t gqaRatio,
   sycl::nd_item<3>& ndi) {
   constexpr uint32_t baseOffsetInc16[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
   constexpr float matMulQuantCoeff = 0.0625f;
-  constexpr uint32_t gqaRatio = 4;
   constexpr uint32_t headDim = 256;
   constexpr uint32_t maxPGroupOut = 128;
   constexpr uint32_t outputPerGroup = 64;
-  constexpr uint32_t slmSize = (4 * maxPGroupOut * gqaRatio * sizeof(float));
+  uint32_t slmSize = (4 * maxPGroupOut * 4 * sizeof(float));
   constexpr uint32_t loopCount = outputPerGroup / 16;
-  __ESIMD_NS::slm_init(slmSize);
+  __ESIMD_NS::slm_init<4 * 128 * 4 * sizeof(float)>();
   int localLinearId = ndi.get_local_id(0);
-  int globalLinearId0 = ndi.get_group(0); // [0, kvHead)
+  int globalLinearId0 = ndi.get_group(0); // [0, kvHead * gqaRatio/4)
   int globalLinearId1 = ndi.get_group(1); // [0, keSeqLen / 64)
   int globalLinearId2 = ndi.get_group(2); // [0, bs)
   int hh = localLinearId & 0x3;
   int vv = localLinearId >> 2;
   int batchIdx = globalLinearId2;
-  int qHeadIdx = globalLinearId0 * 4;
+  uint32_t gqaGroups = gqaRatio / 4;
+  int kvHeadIdx = globalLinearId0 / gqaGroups;
+  int qGroupIdx = globalLinearId0 % gqaGroups;
+  int qHeadIdx = kvHeadIdx * gqaRatio + qGroupIdx * 4;
   uint32_t pageTableSize = 1 << pageTableSizeLog2;
   uint32_t pageTableLoopMask = pageTableSize - 1;
   uint32_t kvSeqLen = batchKvSeqLen[batchIdx];
@@ -52,7 +55,7 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1(
   uint32_t outputMaxOffset = qHeadIdx * maxStride + globalLinearId1 + hh * maxStride + batchIdx * headQ * maxStride;
   uint32_t offsetQ = qHeadIdx * headDim * sizeof(fp16) + hh * 32 * sizeof(fp16) + batchIdx * headQ * headDim * sizeof(fp16);
   uint32_t baseCoordK = globalLinearId1 * outputPerGroup;
-  uint32_t offsetBaseK = hh * 32 * sizeof(fp16) + headDim * globalLinearId0 * sizeof(fp16);
+  uint32_t offsetBaseK = hh * 32 * sizeof(fp16) + headDim * kvHeadIdx * sizeof(fp16);
   uint32_t kvSeqOffset = baseCoordK;
 
   if (baseCoordK >= kvSeqLen) {
@@ -208,23 +211,26 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
   uint32_t pStride,
   uint32_t maxStride,
   uint32_t headKv,
+  uint32_t gqaRatio,
   sycl::nd_item<3>& ndi) {
-  constexpr uint32_t gqaRatio = 4;
   constexpr uint32_t headDim = 256;
   constexpr uint32_t maxPGroupOut = 128;
   constexpr uint32_t outputPerGroup = 64;
   constexpr float matMulQuantCoeff = 0.0625f;
-  constexpr uint32_t slmSizeOut = 2 * gqaRatio * 16 * sizeof(float);
-  constexpr uint32_t slmSizeSoftmaxSum = 2 * gqaRatio * sizeof(float);
+  constexpr uint32_t slmSizeOut = 2 * 4 * 16 * sizeof(float);
+  constexpr uint32_t slmSizeSoftmaxSum = 2 * 4 * sizeof(float);
   constexpr uint32_t slmSize = slmSizeOut + slmSizeSoftmaxSum;
-  __ESIMD_NS::slm_init(slmSize);
+  __ESIMD_NS::slm_init<slmSize>();
   int localLinearId = ndi.get_local_id(0);
   int globalLinearId0 = ndi.get_group(0); // [0, head dim / 16)
-  int globalLinearId1 = ndi.get_group(1); // [0, kvHead)
+  int globalLinearId1 = ndi.get_group(1); // [0, kvHead * gqaRatio/4)
   int globalLinearId2 = ndi.get_group(2); // [0, bs)
   int hh = localLinearId & 0x1;
   int vv = localLinearId >> 1;
   int batchIdx = globalLinearId2;
+  uint32_t gqaGroups = gqaRatio / 4;
+  int kvHeadIdx = globalLinearId1 / gqaGroups;
+  int qGroupIdx = globalLinearId1 % gqaGroups;
   uint32_t kvSeqLen = batchKvSeqLen[batchIdx];
   int kvSeqOutLoopCount = (kvSeqLen + 0x3f) >> 6;
   uint32_t pageTableSize = 1 << pageTableSizeLog2;
@@ -240,12 +246,13 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
   simd<float, 32> vvScale;
 
   uint32_t headQ = headKv * gqaRatio;
-  uint32_t outputOffset = globalLinearId1 * gqaRatio * headDim + globalLinearId0 * 16 + hh * 2 * headDim + batchIdx * headQ * headDim;
-  uint32_t offsetP = globalLinearId1 * gqaRatio * pStride + hh * 32 + batchIdx * headQ * pStride;
-  uint32_t offsetMax = globalLinearId1 * gqaRatio * maxStride + batchIdx * headQ * maxStride;
+  uint32_t qBaseIdx = kvHeadIdx * gqaRatio + qGroupIdx * 4;
+  uint32_t outputOffset = qBaseIdx * headDim + globalLinearId0 * 16 + hh * 2 * headDim + batchIdx * headQ * headDim;
+  uint32_t offsetP = qBaseIdx * pStride + hh * 32 + batchIdx * headQ * pStride;
+  uint32_t offsetMax = qBaseIdx * maxStride + batchIdx * headQ * maxStride;
   uint32_t widthV = headKv * headDim * sizeof(fp16) - 1;
   uint32_t heightV = pageTableSize - 1;
-  uint32_t vX = globalLinearId0 * 16 + headDim * globalLinearId1;
+  uint32_t vX = globalLinearId0 * 16 + headDim * kvHeadIdx;
   uint32_t vY = 32 * hh;
   uint32_t totalPages = (kvSeqLen + pageTableSize - 1) >> pageTableSizeLog2;
   uint32_t lastPageHeight = (kvSeqLen - 1) & (pageTableSize - 1);
