@@ -458,3 +458,13 @@ This is an Intel issue in either:
 ### Workaround attempted
 
 Bypassing `GatedMLPMOE` and calling `torch.xpu.moe_gemm` directly doesn't help — the context pollution comes from the attention layer, not the MoE wrapper.
+
+### Test 2+3 Results (2026-04-16)
+
+| Test | What it bypasses | Result |
+|------|-----------------|--------|
+| Test 3: sync + empty_cache + gc | Stale allocator state | Still crashes |
+| Test 2: Python routing (no IPEX scatter) + moe_gemm | IPEX routing ops | **DEVICE_LOST** |
+| Test IPEX: IPEX routing + moe_gemm | (nothing — crashed before reaching) | N/A |
+
+**Conclusion**: `torch.xpu.moe_gemm(is_int4=True)` cannot execute after IPEX attention in the same process on Lunar Lake Xe2 iGPU with compute-runtime 25.48.36300.8. The Level Zero context is fatally corrupted by the attention kernel dispatch. No userspace workaround exists — requires Intel driver or IPEX fix.
