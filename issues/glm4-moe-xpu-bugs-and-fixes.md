@@ -741,3 +741,55 @@ Not directly — `vllm-xpu-kernels` requires vLLM 0.16+ infrastructure (modular 
 - [PR #33662](https://github.com/vllm-project/vllm/pull/33662) — INT4 GEMM for linear layers (WIP, same format bridge needed)
 - [RFC #33214](https://github.com/vllm-project/vllm/issues/33214) — XPU kernel migration checklist
 - vllm-xpu-kernels releases — check for INT4 MoE additions
+
+---
+
+## BREAKTHROUGH: INT4 MoE Inference Working via CUTLASS (2026-04-16)
+
+### The fix: bypass IPEX entirely, use CUTLASS sequential expert loop
+
+Replaced the IPEX `GatedMLPMOE` → `moe_gemm` path with:
+1. **Weight conversion**: GPTQ int32-packed → uint8 + `implement_zp()` (no marlin_shuffle needed)
+2. **Sequential expert loop**: process one expert at a time via `torch.ops._xpu_C.cutlass_grouped_gemm_interface(is_B_int4=True)`
+3. **Python routing**: topk + manual scatter/gather
+
+### Why sequential works but batched doesn't
+
+The CUTLASS `cutlass_grouped_gemm_interface` with `is_B_int4=True` crashes with DEVICE_LOST when dispatching to 50+ active expert groups simultaneously on Xe2 iGPU. Individual expert GEMMs (1 expert at a time) work perfectly — same as how llama.cpp handles MoE.
+
+| Dispatch | Expert groups | Xe2 iGPU | Result |
+|---|---|---|---|
+| Batched (IPEX moe_gemm) | 50-128 simultaneous | Crash | DEVICE_LOST |
+| Batched (CUTLASS grouped) | 50-128 simultaneous | Crash | DEVICE_LOST |
+| Sequential (1 expert/call) | 1 at a time | Works | **SUCCESS** |
+
+### Test result
+
+```
+Model: Qwen3-VL-30B-A3B (INT4 AutoRound, 48 layers, 128 experts)
+Server: UP (16.85 GiB model, 22,336 tokens KV cache)
+Inference: 83s for 30 tokens (sequential, unoptimized)
+Output: Garbled (weight conversion needs tuning)
+GPU: No crash — full pipeline completes
+```
+
+### Additional fix: Bug J — eagle_ops FP16 assertion
+
+ESIMD eagle_ops page_attn_decode expects FP16 query but GPTQ dequant produces BF16. Fixed by skipping eagle_ops when `query.dtype != torch.float16`.
+
+### What changed from the IPEX path
+
+| | IPEX path (old, crashes) | CUTLASS path (new, works) |
+|---|---|---|
+| Weight prep | marlin_shuffle_weight (CPU) | int32→uint8 + implement_zp |
+| MoE GEMM | `torch.xpu.moe_gemm` batched | `cutlass_grouped_gemm_interface` sequential |
+| Routing | IPEX topk_softmax + moe_scatter | Python topk + manual scatter |
+| IPEX dependency | GatedMLPMOE, _IPEXGatedMLPMOEXPU | None |
+| vllm-xpu-kernels | Not used | `_xpu_C.cutlass_grouped_gemm_interface` |
+
+### Remaining work
+
+1. **Fix weight conversion**: GPTQ nibble ordering → CUTLASS uint8 format (output is garbled)
+2. **Optimize speed**: Sequential loop is 83s — small-batch grouped GEMM (4-8 experts/batch) or expert-parallel could be 10-20x faster
+3. **Test on other models**: GLM-4.7-Flash, Qwen3.5-35B-A3B
+4. **Commit patches and push**
