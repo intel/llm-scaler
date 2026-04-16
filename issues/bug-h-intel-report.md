@@ -202,28 +202,52 @@ The [IPEX repository was archived on March 30, 2026](https://github.com/intel/in
 `GatedMLPMOE` and `marlin_shuffle_weight` were **never upstreamed to PyTorch**.
 No fix for Bug H will be released in IPEX.
 
-### Replacement: vllm-xpu-kernels (CUTLASS XE)
+### Replacement: vllm-xpu-kernels (CUTLASS XE + SYCL-TLA)
 
 Intel replaced the broken IPEX xetla kernels with CUTLASS XE kernels in
-[intel/vllm-xpu-kernels](https://github.com/intel/vllm-xpu-kernels):
+[vllm-project/vllm-xpu-kernels](https://github.com/vllm-project/vllm-xpu-kernels)
+(originally at `intel/vllm-xpu-kernels`, now an official vLLM component).
 
-| PR | Description | Status |
-|----|-------------|--------|
-| [#88](https://github.com/intel/vllm-xpu-kernels/pull/88) | Initial INT4 MoE GEMM (CUTLASS XE) | Merged |
-| [#98](https://github.com/intel/vllm-xpu-kernels/pull/98) | INT4 MoE optimization + expert routing | Merged |
-| [#114](https://github.com/intel/vllm-xpu-kernels/pull/114) | INT4 AutoRound MoE end-to-end | Merged |
-| [#252](https://github.com/intel/vllm-xpu-kernels/pull/252) | Fix expert scaling for 1024 experts | Open |
-| [#253](https://github.com/intel/vllm-xpu-kernels/pull/253) | Fix expert scaling for 128-256 experts | Open |
+#### Kernel library status: INT4 MoE kernels EXIST
 
-**PRs #252 and #253 are actively fixing the exact expert count scaling issue
-reported here.** This confirms Intel is aware and fixing it in vllm-xpu-kernels,
-not in IPEX.
+| PR | Description | Status | Merged |
+|----|-------------|--------|--------|
+| [#88](https://github.com/vllm-project/vllm-xpu-kernels/pull/88) | CUTLASS INT4/FP8/MXFP4 grouped GEMM | Merged | 2025-12-10 |
+| [#98](https://github.com/vllm-project/vllm-xpu-kernels/pull/98) | Fused MoE with INT4/FP8/FP4 weights | Merged | 2025-12-15 |
+| [#114](https://github.com/vllm-project/vllm-xpu-kernels/pull/114) | Expert parallelism (ep_rank/ep_size) | Merged | 2026-01-06 |
+| [#252](https://github.com/vllm-project/vllm-xpu-kernels/pull/252) | Fused softmax/topk for 1024 experts | Open | — |
+| [#253](https://github.com/vllm-project/vllm-xpu-kernels/pull/253) | Optimized fused_grouped_topk kernel | Open | — |
+
+PR #88 benchmarks (E=16, B60): prefill 50.8–81.1 TFLOPS, decode 406–478 GB/s.
+INT4 grouped GEMM has been in vllm-xpu-kernels since v0.1.0 (Jan 29, 2026).
+
+#### vLLM integration status: INT4 MoE NOT wired up
+
+Per RFC [vllm#33214](https://github.com/vllm-project/vllm/issues/33214):
+
+| Feature | Kernel ready? | vLLM integrated? | Works in v0.19? |
+|---------|:------------:|:----------------:|:---------------:|
+| Unquantized MoE | Yes | Yes | **Yes** |
+| FP8 MoE | Yes | Yes | **Yes** |
+| MXFP4 MoE | Yes | Yes | **Yes** |
+| INT4 GEMM (dense) | Yes | WIP ([#33662](https://github.com/vllm-project/vllm/pull/33662)) | **No** |
+| **INT4 MoE** | **Yes** | **Planned (no PR)** | **No** |
+
+**The CUTLASS INT4 MoE kernels exist and work.** The blocker is the vLLM
+model-layer Python integration that routes INT4 MoE models to the new kernels.
+
+vLLM v0.19.0 pins `vllm_xpu_kernels==0.1.4` in `requirements/xpu.txt`.
+The v0.1.4 wheel contains the INT4 MoE kernels from PRs #88/#98/#114, but
+vLLM doesn't call them for INT4 MoE yet.
 
 ### Migration path
 
-vLLM v0.16+ uses `vllm-xpu-kernels` instead of IPEX for XPU compute. The
-CUTLASS XE `XPUExpertsInt4` class replaces `GatedMLPMOE`. Upgrading from
-vLLM v0.14 + IPEX to vLLM v0.16+ with vllm-xpu-kernels is the recommended fix.
+1. **Write or wait for INT4 MoE integration PR for vLLM** — The CUTLASS
+   kernels exist. The missing piece is a vLLM-side `XPUInt4MoEMethod` that
+   calls `vllm_xpu_kernels.fused_moe(is_int4=True)` instead of IPEX's
+   `GatedMLPMOE`. Primarily Python glue code.
+2. **Use MXFP4 MoE** — fully integrated and working in vLLM v0.19.
+3. **Use llama.cpp GGUF** — own SYCL kernels, works today.
 
 ## IPEX source files (analyzed)
 
