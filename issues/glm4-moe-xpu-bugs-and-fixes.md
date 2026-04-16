@@ -184,32 +184,70 @@ N/A (architectural insight)
 ## Bug H: Level Zero OUT_OF_RESOURCES during inference (HARD BLOCKER)
 
 **Error**: `UR_RESULT_ERROR_OUT_OF_RESOURCES` (Level Zero error 40)
-**Location**: Sampler (`logits.softmax()`, `probs.div_(q).argmax()`)
+**Location**: Various — sampler, attention, any kernel after resource pool exhaustion
 
 ### Problem
 
-The model loads successfully (16.12 GiB), KV cache allocates, and the server starts. But the first inference request triggers `init_on_device` for all 46 MoE layers, each creating an `_IPEXGatedMLPMOEXPU` object with its own XPU kernel handles and command queue resources. Combined with 47 MLA Triton-compiled attention kernels, this exceeds the Level Zero driver's internal resource pool for the Lunar Lake iGPU.
+The model loads successfully, KV cache allocates, and the server starts. But the first inference request triggers `init_on_device` for all MoE layers, each creating an `_IPEXGatedMLPMOEXPU` object with its own XPU kernel handles and command queue resources. This exhausts the Level Zero driver's internal resource pool for the Lunar Lake iGPU.
 
 The error is **not** memory-related (error 39 = OOM, error 40 = resource exhaustion). It's a driver-level limit on the number of concurrent kernel objects, command lists, or event pools.
+
+### Affected Models
+
+| Model | Layers | Experts | Attention | Est. Kernel Objects | Result |
+|-------|--------|---------|-----------|-------------------|--------|
+| GPT-OSS-20B (MXFP4) | 24 | 32 | GQA | ~50-60 | **Works** |
+| Qwen3.5-35B-A3B (INT4) | 40 | 256 | GQA | ~80-90 | **OUT_OF_RESOURCES** |
+| GLM-4.7-Flash (INT4) | 47 | 64 | MLA+Triton | ~150+ | **OUT_OF_RESOURCES** |
+
+GPT-OSS-20B works because: (1) fewer layers, (2) MXFP4 uses a different kernel path (no `_IPEXGatedMLPMOEXPU`), (3) GQA uses simpler IPEX attention kernels.
 
 ### Attempted Mitigations
 
 - `ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE`: No effect
-- `IPEX_MOE_GEMM_NATIVE=1`: Fixes resource exhaustion but causes dtype mismatch (`BFloat16 != int`) because the native GEMM path doesn't handle INT4 packed weights
-- Reducing `gpu-memory-utilization` from 0.8 to 0.65: No effect (not a memory issue)
+- `IPEX_MOE_GEMM_NATIVE=1`: Fixes resource exhaustion but causes dtype mismatch (`BFloat16 != int`) — native GEMM path doesn't support INT4 packed weights
+- Reducing `gpu-memory-utilization`: No effect (not a memory issue)
+- Different model sizes (40 vs 47 layers): Both exceed the resource limit
 
 ### Root Cause
 
-The Lunar Lake iGPU's Level Zero driver has a limited resource pool. GLM-4.7-Flash requires:
-- 46 `_IPEXGatedMLPMOEXPU` objects (each with 2 MoE GEMM kernels)
-- 47 MLA attention kernels (Triton-compiled)
-- Embedding, norm, and sampler kernels
+IPEX's `_IPEXGatedMLPMOEXPU` creates per-layer XPU kernel objects via `init_on_device` (lazy init on first forward). Each layer's MoE fusion allocates Level Zero command queue resources that are never released. With 40+ layers, the cumulative resource usage exceeds the Lunar Lake iGPU's Level Zero resource pool.
 
-Total: ~150+ kernel objects competing for Level Zero resources. This exceeds the iGPU's capacity.
+GPT-OSS-20B avoids this because MXFP4 quantization uses pre-formatted weights that don't go through `_IPEXGatedMLPMOEXPU` — they use a different, more resource-efficient kernel dispatch.
 
 ### Upstream
 
-Intel Level Zero driver / IPEX — needs either kernel object reuse across layers or a larger resource pool for iGPU.
+Intel Level Zero driver / IPEX — needs either:
+1. Kernel object reuse across layers (share one `_IPEXGatedMLPMOEXPU` instance)
+2. Lazy resource release (free command queue resources after kernel dispatch)
+3. Larger resource pool for iGPU in Level Zero driver
+
+---
+
+## Bug I: Attention query/key dtype mismatch (Qwen3.5-35B-A3B)
+
+**Error**: `The datatype of key should be the same as query`
+**File**: `intel_extension_for_pytorch/transformers/models/xpu/fusions/mha_fusion.py:599`
+
+### Problem
+
+INT4 GPTQ dequantization produces Float16 query projections, but the KV cache stores BFloat16. IPEX's `chunked_prefill` kernel requires matching dtypes.
+
+Observed: `q=torch.float16, k=torch.bfloat16, v=torch.bfloat16`
+
+### Fix
+
+Cast k/v to match q dtype before calling IPEX flash attention:
+```python
+# In vllm/_ipex_ops.py, flash_attn_varlen_func (paged attention path):
+if q.dtype != k.dtype:
+    k = k.to(q.dtype)
+    v = v.to(q.dtype)
+```
+
+### Upstream
+
+vLLM / IPEX — the dequantization should produce the model's configured dtype (BFloat16), not Float16.
 
 ---
 
@@ -220,20 +258,39 @@ Intel Level Zero driver / IPEX — needs either kernel object reuse across layer
 | A | Fixed | site-packages + patch | No |
 | B | Fixed | site-packages + patch | No |
 | C | Fixed | site-packages + patch | No |
-| D | Fixed | site-packages + patch | No |
+| D | Fixed | site-packages + patch | No (GLM-4.7 MLA only) |
 | E | Fixed | site-packages + patch | No |
 | F | Fixed | site-packages + patch | No |
 | G | N/A | architectural insight | No |
-| **H** | **OPEN** | **Level Zero driver limit** | **YES** |
+| **H** | **OPEN** | **Level Zero driver limit** | **YES — all INT4 GPTQ MoE** |
+| I | Workaround | site-packages | Blocked by H |
 
-### End-to-end test result
+### End-to-end test results
 
-- Model loads: 16.12 GiB (OK)
-- KV cache: 31,296 tokens at 0.65 util / 116,928 tokens at 0.8 util (OK)
-- Server starts: OK (with warmup skip)
-- **Inference: BLOCKED by Level Zero OUT_OF_RESOURCES (Bug H)**
+#### GLM-4.7-Flash (INT4 AutoRound, 47 layers, MoE+MLA)
 
-### Memory profile (gpu-memory-utilization=0.65, max-model-len=16384)
+- Model loads: 16.12 GiB ✓
+- CPU shuffle: completes in ~2 min ✓
+- KV cache: 116,928 tokens at 0.8 util ✓
+- Server starts: ✓
+- **Inference: BLOCKED by Bug H (OUT_OF_RESOURCES)**
+
+#### Qwen3.5-35B-A3B (INT4 AutoRound, 40 layers, MoE+GQA)
+
+- Model loads: 18.98 GiB ✓
+- CPU shuffle: completes in ~4 min (256 experts × 40 layers) ✓
+- KV cache: 19,456 tokens at 0.75 util ✓
+- Server starts: ✓
+- **Inference: BLOCKED by Bug I (dtype mismatch) then Bug H (OUT_OF_RESOURCES)**
+
+#### GLM-4.7-Flash AWQ-4bit (compressed-tensors)
+
+- Uses `CompressedTensorsWNA16MarlinMoEMethod` (Marlin MoE)
+- **BLOCKED at load: `gptq_marlin_repack` is CUDA-only** (vllm._C missing on XPU)
+
+### Memory profiles
+
+#### GLM-4.7-Flash (gpu-memory-utilization=0.65, max-model-len=16384)
 
 | Phase | RAM Used | Available | Swap | Note |
 |-------|----------|-----------|------|------|
@@ -243,6 +300,18 @@ Intel Level Zero driver / IPEX — needs either kernel object reuse across layer
 | Shuffle done | 20.1 GiB | 11.5 GiB | 6.1 GiB | Temps freed |
 | Server ready | 23.1 GiB | 8.4 GiB | 5.9 GiB | KV cache allocated |
 
-### Alternative: AWQ model (glm-4.7-flash-awq-4bit)
+#### Qwen3.5-35B-A3B (gpu-memory-utilization=0.75, max-model-len=16384)
 
-The AWQ variant uses `compressed-tensors` format (not GPTQ/AWQ), which goes through vLLM's native FusedMoE path instead of IPEX's GatedMLPMOE. This avoids bugs A-F entirely but may hit Bug H or have its own XPU compatibility issues. Testing pending.
+| Phase | RAM Used | Available | Swap | Note |
+|-------|----------|-----------|------|------|
+| Pre-load | 16.6 GiB | 15.0 GiB | 1.7 GiB | Clean state |
+| Weights loaded | 24.8 GiB | 6.8 GiB | 5.5 GiB | 40s load (21 GiB model) |
+| CPU shuffle peak | 25.7 GiB | 5.9 GiB | 5.8 GiB | 40 layers × 256 experts |
+| Shuffle done | 24.1 GiB | 7.5 GiB | 6.0 GiB | Temps freed |
+| Server ready | 26.4 GiB | 5.2 GiB | 5.9 GiB | KV cache allocated |
+
+### Key insight: why GPT-OSS-20B works but INT4 GPTQ MoE models don't
+
+GPT-OSS-20B uses **MXFP4 quantization** which stores weights pre-formatted for the XPU MoE kernel — no runtime shuffle, no `_IPEXGatedMLPMOEXPU` per-layer objects, no Level Zero resource accumulation. INT4 GPTQ models go through IPEX's `GatedMLPMOE` → `_IPEXGatedMLPMOEXPU` path which creates heavy per-layer kernel objects that exhaust the iGPU's resource pool.
+
+The fix must come from Intel (IPEX or Level Zero driver) — either share kernel objects across layers or increase the resource pool for iGPU.
