@@ -793,3 +793,14 @@ ESIMD eagle_ops page_attn_decode expects FP16 query but GPTQ dequant produces BF
 2. **Optimize speed**: Sequential loop is 83s — small-batch grouped GEMM (4-8 experts/batch) or expert-parallel could be 10-20x faster
 3. **Test on other models**: GLM-4.7-Flash, Qwen3.5-35B-A3B
 4. **Commit patches and push**
+
+### Weight conversion findings (2026-04-16)
+
+The CUTLASS INT4 kernel uses a **column-interleaved** nibble packing, not row-sequential:
+- Each uint8 byte packs nibbles from **two different output columns** (N dimension)
+- Low nibble non-zero values produce NaN → low nibble is used differently
+- High nibble maps linearly: hi=4→0.75/elem, hi=8→1.5/elem, hi=9→2.25/elem
+
+GPTQ packs 8 nibbles along the **K dimension** (input) per int32. CUTLASS interleaves across **N dimension** (output). This requires a full layout transformation, not just int32→uint8 repacking.
+
+Next step: study the CUTLASS INT4 packed format from vllm-xpu-kernels source to implement correct GPTQ→CUTLASS conversion.
