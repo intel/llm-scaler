@@ -181,16 +181,68 @@ N/A (architectural insight)
 
 ---
 
+## Bug H: Level Zero OUT_OF_RESOURCES during inference (HARD BLOCKER)
+
+**Error**: `UR_RESULT_ERROR_OUT_OF_RESOURCES` (Level Zero error 40)
+**Location**: Sampler (`logits.softmax()`, `probs.div_(q).argmax()`)
+
+### Problem
+
+The model loads successfully (16.12 GiB), KV cache allocates, and the server starts. But the first inference request triggers `init_on_device` for all 46 MoE layers, each creating an `_IPEXGatedMLPMOEXPU` object with its own XPU kernel handles and command queue resources. Combined with 47 MLA Triton-compiled attention kernels, this exceeds the Level Zero driver's internal resource pool for the Lunar Lake iGPU.
+
+The error is **not** memory-related (error 39 = OOM, error 40 = resource exhaustion). It's a driver-level limit on the number of concurrent kernel objects, command lists, or event pools.
+
+### Attempted Mitigations
+
+- `ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE`: No effect
+- `IPEX_MOE_GEMM_NATIVE=1`: Fixes resource exhaustion but causes dtype mismatch (`BFloat16 != int`) because the native GEMM path doesn't handle INT4 packed weights
+- Reducing `gpu-memory-utilization` from 0.8 to 0.65: No effect (not a memory issue)
+
+### Root Cause
+
+The Lunar Lake iGPU's Level Zero driver has a limited resource pool. GLM-4.7-Flash requires:
+- 46 `_IPEXGatedMLPMOEXPU` objects (each with 2 MoE GEMM kernels)
+- 47 MLA attention kernels (Triton-compiled)
+- Embedding, norm, and sampler kernels
+
+Total: ~150+ kernel objects competing for Level Zero resources. This exceeds the iGPU's capacity.
+
+### Upstream
+
+Intel Level Zero driver / IPEX — needs either kernel object reuse across layers or a larger resource pool for iGPU.
+
+---
+
 ## Status
 
-| Bug | Status | Applied to |
-|-----|--------|-----------|
-| A | Fixed | site-packages |
-| B | Fixed | site-packages |
-| C | Fixed | site-packages |
-| D | Fixed | site-packages |
-| E | Fixed | site-packages |
-| F | Fixed | site-packages |
-| G | N/A | architectural insight |
+| Bug | Status | Applied to | Blocker? |
+|-----|--------|-----------|----------|
+| A | Fixed | site-packages + patch | No |
+| B | Fixed | site-packages + patch | No |
+| C | Fixed | site-packages + patch | No |
+| D | Fixed | site-packages + patch | No |
+| E | Fixed | site-packages + patch | No |
+| F | Fixed | site-packages + patch | No |
+| G | N/A | architectural insight | No |
+| **H** | **OPEN** | **Level Zero driver limit** | **YES** |
 
-**End-to-end test result**: Model loads (16.12 GiB), KV cache allocates (116K tokens), server starts. First inference pending clean reboot (swap thrashing from debug iterations).
+### End-to-end test result
+
+- Model loads: 16.12 GiB (OK)
+- KV cache: 31,296 tokens at 0.65 util / 116,928 tokens at 0.8 util (OK)
+- Server starts: OK (with warmup skip)
+- **Inference: BLOCKED by Level Zero OUT_OF_RESOURCES (Bug H)**
+
+### Memory profile (gpu-memory-utilization=0.65, max-model-len=16384)
+
+| Phase | RAM Used | Available | Swap | Note |
+|-------|----------|-----------|------|------|
+| Pre-load | 17.2 GiB | 14.4 GiB | 1.6 GiB | Clean state |
+| Weights loaded | 20.6 GiB | 11.0 GiB | 5.7 GiB | 18.75s load |
+| CPU shuffle peak | 22.6 GiB | 9.0 GiB | 5.5 GiB | 46 layers × 64 experts |
+| Shuffle done | 20.1 GiB | 11.5 GiB | 6.1 GiB | Temps freed |
+| Server ready | 23.1 GiB | 8.4 GiB | 5.9 GiB | KV cache allocated |
+
+### Alternative: AWQ model (glm-4.7-flash-awq-4bit)
+
+The AWQ variant uses `compressed-tensors` format (not GPTQ/AWQ), which goes through vLLM's native FusedMoE path instead of IPEX's GatedMLPMOE. This avoids bugs A-F entirely but may hit Bug H or have its own XPU compatibility issues. Testing pending.
