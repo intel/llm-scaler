@@ -1,0 +1,11 @@
+--- /home/nobara-user/llm-scaler-vllm/vllm/vllm/v1/attention/backends/flash_attn.py	2026-04-14 19:39:54.212751142 +0900
++++ /home/nobara-user/llm-scaler-vllm/venv/lib64/python3.12/site-packages/vllm/v1/attention/backends/flash_attn.py	2026-04-16 23:17:12.354318208 +0900
+@@ -729,7 +729,7 @@
+                     except ImportError:
+                         eagle_ops = None
+ 
+-                    if eagle_ops is not None:
++                    if eagle_ops is not None and query.dtype == torch.float16:
+                         eagle_ops.page_attn_decode(
+                             query[:num_actual_tokens],
+                             kv_cache,

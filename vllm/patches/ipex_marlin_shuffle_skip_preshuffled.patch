@@ -1,28 +1,53 @@
-diff --git a/intel_extension_for_pytorch/transformers/models/xpu/fusions/linear_fusion.py b/intel_extension_for_pytorch/transformers/models/xpu/fusions/linear_fusion.py
-index abc1234..def5678 100644
---- a/intel_extension_for_pytorch/transformers/models/xpu/fusions/linear_fusion.py
-+++ b/intel_extension_for_pytorch/transformers/models/xpu/fusions/linear_fusion.py
-@@ -148,17 +148,20 @@ class _MoEGEMMXpu(nn.Module):
+--- /home/nobara-user/llm-scaler-vllm/venv/lib64/python3.12/site-packages/intel_extension_for_pytorch/transformers/models/xpu/fusions/linear_fusion.py.bak	2026-04-02 02:31:01.508539846 +0900
++++ /home/nobara-user/llm-scaler-vllm/venv/lib64/python3.12/site-packages/intel_extension_for_pytorch/transformers/models/xpu/fusions/linear_fusion.py	2026-04-16 16:45:43.906975477 +0900
+@@ -122,14 +122,21 @@
+     ):
+         super().__init__()
+         self.num_experts = W2.shape[0]
+-        if W3 is None:
+-            self.W13 = torch.transpose(W13, 1, 2)
++        _pre_shuffled = getattr(W13, '_marlin_shuffled', False)
++        if _pre_shuffled:
++            # Weights were already transposed, shuffled, and made contiguous
++            # during process_weights_after_loading. Use as-is to avoid
++            # re-allocating via transpose+contiguous on tight XPU memory.
++            self.W13 = W13
++            self.W2 = W2
+         else:
+-            self.W13 = torch.transpose(torch.cat((W13, W3), dim=1), 1, 2)
+-        self.W2 = torch.transpose(W2, 1, 2)
+-
+-        self.W2 = self.W2.contiguous()
+-        self.W13 = self.W13.contiguous()
++            if W3 is None:
++                self.W13 = torch.transpose(W13, 1, 2)
++            else:
++                self.W13 = torch.transpose(torch.cat((W13, W3), dim=1), 1, 2)
++            self.W2 = torch.transpose(W2, 1, 2)
++            self.W2 = self.W2.contiguous()
++            self.W13 = self.W13.contiguous()
+ 
+         self.w13_weight_scale_inv = w1_scale_inv if w1_scale_inv is not None else None
+         self.w2_weight_scale_inv = w2_scale_inv if w2_scale_inv is not None else None
+@@ -148,7 +155,7 @@
              os.environ.get("IPEX_MOE_GEMM_NATIVE", "0") == "1"
          )
-
+ 
 -        if self.is_mxfp4 or self.is_int4:
-+        _pre_shuffled = getattr(W13, '_marlin_shuffled', False)
 +        if (self.is_mxfp4 or self.is_int4) and not _pre_shuffled:
              self.W13 = self.marlin_shuffle_weight(self.W13)
              self.W2 = self.marlin_shuffle_weight(self.W2)
              self.w13_weight_scale_inv.data = torch.transpose(
-                 w1_scale_inv, 1, 2
-             ).contiguous()
-             self.w2_weight_scale_inv.data = torch.transpose(
+@@ -158,26 +165,23 @@
                  w2_scale_inv, 1, 2
              ).contiguous()
-
+ 
 -        # delete original weight to avoid memory pressure
 -        W13.data = self.W13
 -        W2.data = self.W2
 -        if W3 is not None:
 -            W3.data = self.W13
+-
 -        torch.xpu.empty_cache()
 +        if not _pre_shuffled:
 +            # delete original weight to avoid memory pressure
@@ -31,3 +56,133 @@ index abc1234..def5678 100644
 +            if W3 is not None:
 +                W3.data = self.W13
 +            torch.xpu.empty_cache()
+ 
+     def marlin_shuffle_weight(self, qweight):
+         # qweight: [E, K, N]
+-        # Perform shuffle on CPU to avoid XPU device lost errors on iGPUs
+-        orig_device = qweight.device
+-        qweight = qweight.cpu()
+         E, K, N = qweight.shape
+         k = K * 8
+         shuffled_idx = np.array([0, 4, 1, 5, 2, 6, 3, 7])
+         pack_idx = np.array([0, 1, 2, 3, 4, 5, 6, 7])
+ 
+         shuffled_weight = torch.zeros(
+-            [E, k // 8, N], dtype=torch.int32, device="cpu"
++            [E, k // 8, N], dtype=torch.int32, device=qweight.device
+         )
+ 
+         for e in range(E):
+@@ -186,7 +190,7 @@
+                 torch.tensor(
+                     shuffled_idx[[i % 8 for i in range(k)]],
+                     dtype=torch.int32,
+-                    device="cpu",
++                    device=qweight.device,
+                 )[:, None].expand([-1, N])
+                 * 4
+             )
+@@ -196,7 +200,7 @@
+                 torch.tensor(
+                     pack_idx[[i % 8 for i in range(k)]],
+                     dtype=torch.int32,
+-                    device="cpu",
++                    device=qweight.device,
+                 )[:, None].expand([-1, N])
+                 * 4
+             )
+@@ -208,7 +212,7 @@
+                     tmp = torch.bitwise_or(tmp, dst_data[j, :])
+                 shuffled_weight[e, i // 8, :] = tmp
+ 
+-        return shuffled_weight.to(orig_device)
++        return shuffled_weight
+ 
+     def linear_silu_mul(self, x):
+         half = x.shape[-1] // 2
+@@ -231,6 +235,8 @@
+         else:
+             raise ValueError(f"Unsupported activation function: {activation}")
+ 
++    _moe_call_count = 0
++
+     def fused_moe_experts(
+         self,
+         hidden_states,
+@@ -238,33 +244,50 @@
+         activation: Optional[str] = "silu",
+         residual=None,
+     ):
+-        hidden_states = torch.xpu.moe_gemm(
+-            hidden_states,
+-            self.W13,
+-            rows_for_experts,
+-            self.num_experts,
+-            self.w13_input_scale_inv,
+-            self.w13_weight_scale_inv,
+-            bias=self.w13_bias,
+-            is_mxfp4=self.is_mxfp4,
+-            is_fp8=self.is_fp8,
+-            is_int4=self.is_int4,
+-            use_native=self.moe_gemm_using_native_impl,
+-        )
++        _IPEXGatedMLPMOEXPU._moe_call_count += 1
++        cnt = _IPEXGatedMLPMOEXPU._moe_call_count
++        try:
++            hidden_states = torch.xpu.moe_gemm(
++                hidden_states,
++                self.W13,
++                rows_for_experts,
++                self.num_experts,
++                self.w13_input_scale_inv,
++                self.w13_weight_scale_inv,
++                bias=self.w13_bias,
++                is_mxfp4=self.is_mxfp4,
++                is_fp8=self.is_fp8,
++                is_int4=self.is_int4,
++                use_native=self.moe_gemm_using_native_impl,
++            )
++            torch.xpu.synchronize()
++            if cnt <= 48:
++                print(f"[MoE-DIAG] Layer call {cnt}: W13 GEMM OK "
++                      f"(W13={list(self.W13.shape)} int4={self.is_int4})")
++        except Exception as e:
++            print(f"[MoE-DIAG] Layer call {cnt}: W13 GEMM FAILED: {e}")
++            raise
+         hidden_states = self.linear_activaion(hidden_states, activation)
+-        hidden_states = torch.xpu.moe_gemm(
+-            hidden_states,
+-            self.W2,
+-            rows_for_experts,
+-            self.num_experts,
+-            self.w2_input_scale_inv,
+-            self.w2_weight_scale_inv,
+-            bias=self.w2_bias,
+-            is_mxfp4=self.is_mxfp4,
+-            is_fp8=self.is_fp8,
+-            is_int4=self.is_int4,
+-            use_native=self.moe_gemm_using_native_impl,
+-        )
++        try:
++            hidden_states = torch.xpu.moe_gemm(
++                hidden_states,
++                self.W2,
++                rows_for_experts,
++                self.num_experts,
++                self.w2_input_scale_inv,
++                self.w2_weight_scale_inv,
++                bias=self.w2_bias,
++                is_mxfp4=self.is_mxfp4,
++                is_fp8=self.is_fp8,
++                is_int4=self.is_int4,
++                use_native=self.moe_gemm_using_native_impl,
++            )
++            torch.xpu.synchronize()
++            if cnt <= 48:
++                print(f"[MoE-DIAG] Layer call {cnt}: W2 GEMM OK")
++        except Exception as e:
++            print(f"[MoE-DIAG] Layer call {cnt}: W2 GEMM FAILED: {e}")
++            raise
+         return hidden_states
+ 
+     def forward(

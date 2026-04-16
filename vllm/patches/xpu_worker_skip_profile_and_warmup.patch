@@ -1,0 +1,69 @@
+--- /home/nobara-user/llm-scaler-vllm/vllm/vllm/v1/worker/xpu_worker.py	2026-04-14 19:39:54.213875700 +0900
++++ /home/nobara-user/llm-scaler-vllm/venv/lib64/python3.12/site-packages/vllm/v1/worker/xpu_worker.py	2026-04-16 17:39:12.471962581 +0900
+@@ -124,24 +124,35 @@
+         # cache blocks that can be allocated with the remaining free memory.
+         torch.xpu.empty_cache()
+         torch.xpu.synchronize()
+-        torch.xpu.reset_peak_memory_stats()
+ 
+-        # Execute a forward pass with dummy inputs to profile the memory usage
+-        # of the model.
+-        if "Qwen3ASR" in self.model_runner.model_config.architecture:
+-            pass
+-        else:
+-            self.model_runner.profile_run()
++        skip_profile = os.getenv("VLLM_SKIP_PROFILE_RUN", "0") == "1"
++        arch = self.model_runner.model_config.architecture
++        # Skip profile_run for architectures known to hang or OOM during profiling
++        skip_archs = ("Qwen3ASR", "Glm4MoeLite", "Gemma4")
+ 
+-        # Calculate the number of blocks that can be allocated with the
+-        # profiled peak memory.
+-        torch.xpu.synchronize()
+-        total_gpu_memory = torch.xpu.get_device_properties(self.local_rank).total_memory
++        if not skip_profile and not any(a in arch for a in skip_archs):
++            torch.xpu.reset_peak_memory_stats()
++            self.model_runner.profile_run()
+ 
+-        # NOTE(woosuk): Here we assume that the other processes using the same
+-        # GPU did not change their memory usage during the profiling.
+-        stats = torch.xpu.memory_stats()
+-        peak_allocated = stats.get("allocated_bytes.all.peak", 0)
++            # Calculate the number of blocks that can be allocated with the
++            # profiled peak memory.
++            torch.xpu.synchronize()
++            total_gpu_memory = torch.xpu.get_device_properties(
++                self.local_rank).total_memory
++            stats = torch.xpu.memory_stats()
++            peak_allocated = stats.get("allocated_bytes.all.peak", 0)
++        else:
++            total_gpu_memory = torch.xpu.get_device_properties(
++                self.local_rank).total_memory
++            # Skip profile_run — estimate peak from model memory + overhead
++            # INT4 MoE models need scratch space for dequantization during
++            # moe_gemm. The multiplier reserves headroom so KV cache doesn't
++            # fill the entire budget.
++            used_memory = torch.xpu.memory_allocated()
++            multiplier = float(os.getenv("VLLM_SKIP_PROFILE_MULTIPLIER", "1.15"))
++            peak_allocated = int(used_memory * multiplier)
++            print(f"\n[VLLM_SKIP_PROFILE_RUN] Skipping profile_run for {arch}, "
++                  f"estimating peak from allocated memory * {multiplier}")
+         current_reserved = torch.xpu.memory_reserved()
+ 
+         fragmentation_bytes = current_reserved - peak_allocated
+@@ -164,6 +175,15 @@
+ 
+         return int(available_kv_cache_memory)
+ 
++    def compile_or_warm_up_model(self) -> None:
++        if os.getenv("VLLM_SKIP_PROFILE_RUN", "0") == "1":
++            logger.info(
++                "Skipping compile_or_warm_up_model on XPU "
++                "(VLLM_SKIP_PROFILE_RUN=1)")
++            set_random_seed(self.model_config.seed)
++            return
++        super().compile_or_warm_up_model()
++
+     def init_device(self):
+         device = self.device_config.device
+         if (
