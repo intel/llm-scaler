@@ -428,3 +428,33 @@ Both tests use identical real model weights from safetensors, same shapes, same 
 ### Workaround path
 
 A potential workaround would be to bypass `GatedMLPMOE` entirely and call `torch.xpu.moe_gemm` directly in `XPUGPTQMarlinMoEMethod.apply()`, implementing the routing/gating logic in Python/PyTorch instead of relying on IPEX's fused implementation.
+
+---
+
+## Bug H Final Root Cause: Level Zero Context Pollution (2026-04-16)
+
+### Definitive proof chain
+
+1. `torch.xpu.moe_gemm(is_int4=True)` **works in isolation** — any memory level, any tensor count, KV cache allocated, routing ops applied, real model weights
+2. `GatedMLPMOE.forward()` **crashes** — even in isolation with 0.28 GiB allocated (IPEX wrapper bug)
+3. Direct `torch.xpu.moe_gemm` bypass in `apply()` **also crashes** — but only inside vLLM's forward pass, after attention ran
+4. **Cloned tensors crash too** — ruling out tensor state/strides as the cause
+
+### Root cause
+
+IPEX's attention kernels (`flash_attn_varlen_func` → `chunked_prefill` or `PagedAttention`) configure the Level Zero context/SYCL queue in a way that corrupts subsequent `torch.xpu.moe_gemm` INT4 kernel dispatch. Even `torch.xpu.synchronize()` + `empty_cache()` cannot reset this state. The corruption persists at the Level Zero driver level.
+
+### Why GPT-OSS-20B works
+
+GPT-OSS-20B uses MXFP4 (not INT4 GPTQ). The `moe_gemm` kernel with `is_mxfp4=True` may use a different internal code path that isn't affected by the attention context pollution. Or the simpler 24-layer architecture doesn't trigger the same attention kernel configuration.
+
+### Fix required
+
+This is an Intel issue in either:
+1. **IPEX attention kernel** — leaves Level Zero context in a dirty state
+2. **IPEX moe_gemm INT4 kernel** — doesn't properly initialize its Level Zero context, inheriting corrupted state from attention
+3. **Level Zero driver (compute-runtime 25.48.36300)** — context isolation between different kernel types is broken on Xe2 iGPU
+
+### Workaround attempted
+
+Bypassing `GatedMLPMOE` and calling `torch.xpu.moe_gemm` directly doesn't help — the context pollution comes from the attention layer, not the MoE wrapper.
