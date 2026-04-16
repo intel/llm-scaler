@@ -269,7 +269,11 @@ vLLM / IPEX — the dequantization should produce the model's configured dtype (
 
 ### Next steps
 
-1. **Upgrade compute-runtime** from `25.48.36300.8` to latest (`26.09.37435.1`+) — newer versions include Level Zero resource pooling improvements that may fix Bug H
+1. **Upgrade compute-runtime** from `25.48.36300.8` to `26.09.37435.1` — newer versions include Level Zero resource pooling improvements that may fix Bug H
+   - **NOTE**: Partial upgrade (swapping `.so` only) fails with `built_ins.cpp` abort — ALL components (`libze_intel_gpu`, `intel-opencl`, `intel-ocloc`, `libigdgmm`) must be upgraded together as a matching set
+   - `LD_LIBRARY_PATH` override also fails — built-in kernel format is incompatible across versions
+   - Intel only ships DEBs on GitHub; Nobara/Fedora repos are stuck at `25.48.36300.8`
+   - Options: (a) rebuild all RPMs from source, (b) Docker container with Ubuntu + newer runtime, (c) wait for Nobara/Fedora packaging
 2. **Report to Intel IPEX** — `_IPEXGatedMLPMOEXPU` should reuse kernel objects across layers instead of creating one per layer
 3. **Consider MXFP4 quantization** for new MoE models — MXFP4 avoids the `_IPEXGatedMLPMOEXPU` path entirely and works on Lunar Lake (proven by GPT-OSS-20B)
 
