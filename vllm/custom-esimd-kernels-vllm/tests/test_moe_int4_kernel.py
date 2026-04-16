@@ -119,6 +119,22 @@ def ipex_transform_expert_weights(qweight, scales, E, N, K_packed, K_groups):
     return qw_t, sc_t
 
 
+def ipex_column_major_repack(qweight):
+    """Simulate IPEX IPEXWeightOnlyQuantizedLinear column-major repack.
+
+    Input:  qweight [K_packed, N] row-major (GPTQ convention)
+    Output: same shape [K_packed, N] but flat memory rearranged so that
+            reshape({N, K_packed}) gives new[n, kp] = original[kp, n].
+
+    IPEX stores column-major of [K_packed, N]: element [kp, n] at offset n*K_packed+kp.
+    PyTorch sees it as row-major [K_packed, N].
+    """
+    K_packed, N = qweight.shape
+    # Transpose gives [N, K_packed] row-major, flatten gives flat[n*K_packed+kp] = original[kp, n]
+    flat = qweight.t().contiguous().flatten()
+    return flat.reshape(K_packed, N)
+
+
 def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     return F.cosine_similarity(a.flatten().float().unsqueeze(0),
                                b.flatten().float().unsqueeze(0)).item()
@@ -285,20 +301,16 @@ def test_forward_full():
                 shared_gate_w, TK, E)
 
             # Gate weight/scale for fused router+topk (bs=1 path)
-            # Quantize a simple gate weight for the fused path
-            _gate_fp16 = (torch.randn(E, H) * 0.02).half()
-            _gate_qw, _gate_sc = quantize_int4(_gate_fp16, GROUP_SIZE)
-            _gate_qw_xpu = _gate_qw.to(DEVICE)
-            _gate_sc_xpu = _gate_sc.t().contiguous().to(DEVICE)  # [K_groups, E]
+            # Shared expert is FP16 in UT — pass dummy scales (empty tensor)
+            _dummy_scale = torch.empty(0, device=DEVICE, dtype=torch.float16)
 
             kernel_out = moe_int4_ops.moe_forward_full_int4(
                 x.to(DEVICE), logits.to(DEVICE),
                 w13_ipex.to(DEVICE), s13_ipex.to(DEVICE),
-                shared_gate_up.to(DEVICE),
+                shared_gate_up.to(DEVICE), _dummy_scale,
                 w2_ipex.to(DEVICE), s2_ipex.to(DEVICE),
-                shared_down.to(DEVICE),
+                shared_down.to(DEVICE), _dummy_scale,
                 shared_gate_w.to(DEVICE),
-                _gate_qw_xpu, _gate_sc_xpu,
                 TK, NUM_SHARED_EXPERTS, E).cpu()
 
             cos = cosine_similarity(ref_out, kernel_out)
@@ -312,6 +324,116 @@ def test_forward_full():
                 return False
 
     print("  All forward_full tests passed!\n")
+    return True
+
+
+# ─── Test 2b: moe_forward_full_int4 with INT4 shared expert ─────────────────
+
+def test_forward_full_int4_shared():
+    from custom_esimd_kernels_vllm import moe_int4_ops
+
+    print("=" * 60)
+    print("Test 2b: moe_forward_full_int4 (INT4 shared expert)")
+    print("=" * 60)
+
+    for cfg_name, cfg in CONFIGS.items():
+        H = cfg["hidden_size"]
+        D = cfg["intermediate_size"]
+        D_S = cfg["shared_intermediate_size"]
+        E = cfg["num_experts"]
+        TK = cfg["top_k"]
+        print(f"\n  Config: {cfg_name} (H={H}, D={D}, D_S={D_S}, E={E})")
+
+        for n_tokens in [2, 4]:
+            torch.manual_seed(42)
+
+            # Routed expert weights
+            w13_fp16 = (torch.randn(E, 2 * D, H) * 0.02).half()
+            w2_fp16 = (torch.randn(E, H, D) * 0.02).half()
+            # Shared expert weights (will be quantized to INT4)
+            shared_gate_up_fp16 = (torch.randn(2 * D_S, H) * 0.02).half()
+            shared_down_fp16 = (torch.randn(H, D_S) * 0.02).half()
+            shared_gate_w = (torch.randn(1, H) * 0.02).half()
+            x = (torch.randn(n_tokens, H) * 0.1).half()
+
+            # Quantize routed experts
+            w13_qw_list, w13_sc_list, w2_qw_list, w2_sc_list = [], [], [], []
+            for e_idx in range(E):
+                qw, sc = quantize_int4(w13_fp16[e_idx], GROUP_SIZE)
+                w13_qw_list.append(qw); w13_sc_list.append(sc)
+                qw, sc = quantize_int4(w2_fp16[e_idx], GROUP_SIZE)
+                w2_qw_list.append(qw); w2_sc_list.append(sc)
+            w13_qweight = torch.stack(w13_qw_list)
+            w13_scales = torch.stack(w13_sc_list)
+            w2_qweight = torch.stack(w2_qw_list)
+            w2_scales = torch.stack(w2_sc_list)
+
+            # Dequantize for reference
+            w13_dq = torch.stack([dequantize_int4(w13_qweight[e_idx], w13_scales[e_idx],
+                                  2 * D, H, GROUP_SIZE) for e_idx in range(E)])
+            w2_dq = torch.stack([dequantize_int4(w2_qweight[e_idx], w2_scales[e_idx],
+                                  H, D, GROUP_SIZE) for e_idx in range(E)])
+
+            # IPEX transform for routed experts (transpose + marlin shuffle)
+            w13_ipex, s13_ipex = ipex_transform_expert_weights(
+                w13_qweight, w13_scales, E, 2 * D, H // PACK_FACTOR, H // GROUP_SIZE)
+            w2_ipex, s2_ipex = ipex_transform_expert_weights(
+                w2_qweight, w2_scales, E, H, D // PACK_FACTOR, D // GROUP_SIZE)
+
+            # Quantize shared expert
+            # gate_up_proj: [2*D_S, H] → GPTQ: [H//8, 2*D_S]
+            shared_gu_qw, shared_gu_sc = quantize_int4(shared_gate_up_fp16, GROUP_SIZE)
+            # shape: [2*D_S, H//8] — this is [N, K_packed]
+            # GPTQ convention: [K_packed, N] — need to transpose to match
+            # Actually quantize_int4 returns [N, K_packed] where N=2*D_S, K_packed=H//8
+            # GPTQ/SymInt4 stores as [K_packed, N]:
+            shared_gu_qw_gptq = shared_gu_qw.t().contiguous()   # [H//8, 2*D_S] = [K_packed, N]
+            shared_gu_sc_gptq = shared_gu_sc.t().contiguous()   # [H//128, 2*D_S] = [K_groups, N]
+
+            # down_proj: [H, D_S] → quantize → [H, D_S//8] = [N, K_packed]
+            shared_dw_qw, shared_dw_sc = quantize_int4(shared_down_fp16, GROUP_SIZE)
+            shared_dw_qw_gptq = shared_dw_qw.t().contiguous()   # [D_S//8, H] = [K_packed, N]
+            shared_dw_sc_gptq = shared_dw_sc.t().contiguous()   # [D_S//128, H] = [K_groups, N]
+
+            # Simulate IPEX OneDNN format:
+            # qweight: column-major repack (flat memory rearranged)
+            # scales: NOT repacked (just contiguous, same as original transposed)
+            shared_gu_ipex = ipex_column_major_repack(shared_gu_qw_gptq)  # [K_packed, N] repacked
+            shared_dw_ipex = ipex_column_major_repack(shared_dw_qw_gptq)
+            # Scales stay in [K_groups, N] layout (no repack)
+            shared_gu_sc_ipex = shared_gu_sc_gptq  # [K_groups, 2*D_S]
+            shared_dw_sc_ipex = shared_dw_sc_gptq  # [K_groups_down, H]
+
+            # Dequantize shared for reference
+            shared_gu_dq = dequantize_int4(shared_gu_qw, shared_gu_sc, 2 * D_S, H, GROUP_SIZE)
+            shared_dw_dq = dequantize_int4(shared_dw_qw, shared_dw_sc, H, D_S, GROUP_SIZE)
+
+            logits = (torch.randn(n_tokens, E) * 0.1).half()
+
+            ref_out = _ref_moe_forward_full(
+                x, logits, w13_dq, shared_gu_dq, w2_dq, shared_dw_dq,
+                shared_gate_w, TK, E)
+
+            kernel_out = moe_int4_ops.moe_forward_full_int4(
+                x.to(DEVICE), logits.to(DEVICE),
+                w13_ipex.to(DEVICE), s13_ipex.to(DEVICE),
+                shared_gu_ipex.int().to(DEVICE), shared_gu_sc_ipex.to(DEVICE),
+                w2_ipex.to(DEVICE), s2_ipex.to(DEVICE),
+                shared_dw_ipex.int().to(DEVICE), shared_dw_sc_ipex.to(DEVICE),
+                shared_gate_w.to(DEVICE),
+                TK, NUM_SHARED_EXPERTS, E).cpu()
+
+            cos = cosine_similarity(ref_out, kernel_out)
+            mae = (ref_out.float() - kernel_out.float()).abs().max().item()
+            passed = cos > 0.95 and mae < 1.0
+            status = "PASS" if passed else "FAIL"
+            print(f"    n={n_tokens:>3d}  cos={cos:.6f}  mae={mae:.4f}  [{status}]")
+            if not passed:
+                print(f"      ref[:5]={ref_out[0,:5].tolist()}")
+                print(f"      ker[:5]={kernel_out[0,:5].tolist()}")
+                return False
+
+    print("  All INT4 shared expert tests passed!\n")
     return True
 
 
@@ -342,6 +464,7 @@ if __name__ == "__main__":
     all_pass = True
     all_pass &= test_router_forward()
     all_pass &= test_forward_full()
+    all_pass &= test_forward_full_int4_shared()
     all_pass &= test_edge_cases()
 
     if all_pass:

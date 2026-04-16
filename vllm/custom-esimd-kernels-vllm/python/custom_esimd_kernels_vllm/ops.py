@@ -755,29 +755,27 @@ def moe_forward_full_int4(
     gate_up_qweight: torch.Tensor,
     gate_up_scales: torch.Tensor,
     shared_gate_up_weight: torch.Tensor,
+    shared_gate_up_scale: torch.Tensor,
     down_qweight: torch.Tensor,
     down_scales: torch.Tensor,
     shared_down_weight: torch.Tensor,
+    shared_down_scale: torch.Tensor,
     shared_expert_gate_weight: torch.Tensor,
-    gate_weight: torch.Tensor,
-    gate_scale: torch.Tensor,
     top_k: int,
     num_shared_experts: int,
     n_routed_experts: int,
 ) -> torch.Tensor:
     """INT4 MoE full forward: topk + up + down + finalize in one C++ call.
 
-    For bs=1: fuses router+topk into 1 submit (saves ~13us launch overhead).
-    For bs>1: uses separate logits + topk.
-
-    gate_weight/gate_scale: router gate INT4 weights for fused router+topk.
+    Supports both INT4 and FP16 shared expert weights (auto-detected by dtype).
+    When shared expert is INT4: shared_gate_up_scale/shared_down_scale are used.
+    When shared expert is FP16: pass dummy tensors for scales (ignored).
     """
     return _moe_int4.moe_forward_full_int4(
         x, logits,
         gate_up_qweight, gate_up_scales,
-        shared_gate_up_weight,
+        shared_gate_up_weight, shared_gate_up_scale,
         down_qweight, down_scales,
-        shared_down_weight,
+        shared_down_weight, shared_down_scale,
         shared_expert_gate_weight,
-        gate_weight, gate_scale,
         top_k, num_shared_experts, n_routed_experts)

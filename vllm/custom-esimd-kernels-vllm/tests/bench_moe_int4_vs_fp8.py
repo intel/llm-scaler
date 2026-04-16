@@ -174,17 +174,21 @@ def bench_config(cfg):
             fp8_t.append((time.perf_counter() - t0) * 1e6)
 
         for _ in range(WARMUP):
+            _dummy_sc = torch.empty(0, device=DEVICE, dtype=torch.float16)
             moe_int4_ops.moe_forward_full_int4(x, logits,
-                w13_qw, w13_sc, shared_gu, w2_qw, w2_sc, shared_d, shared_gw,
-                gate_qw, gate_sc, TK, NUM_SHARED_EXPERTS, E)
+                w13_qw, w13_sc, shared_gu, _dummy_sc,
+                w2_qw, w2_sc, shared_d, _dummy_sc, shared_gw,
+                TK, NUM_SHARED_EXPERTS, E)
         torch.xpu.synchronize()
         int4_t = []
         for _ in range(RUNS):
             torch.xpu.synchronize()
             t0 = time.perf_counter()
+            _dummy_sc = torch.empty(0, device=DEVICE, dtype=torch.float16)
             moe_int4_ops.moe_forward_full_int4(x, logits,
-                w13_qw, w13_sc, shared_gu, w2_qw, w2_sc, shared_d, shared_gw,
-                gate_qw, gate_sc, TK, NUM_SHARED_EXPERTS, E)
+                w13_qw, w13_sc, shared_gu, _dummy_sc,
+                w2_qw, w2_sc, shared_d, _dummy_sc, shared_gw,
+                TK, NUM_SHARED_EXPERTS, E)
             torch.xpu.synchronize()
             int4_t.append((time.perf_counter() - t0) * 1e6)
 
