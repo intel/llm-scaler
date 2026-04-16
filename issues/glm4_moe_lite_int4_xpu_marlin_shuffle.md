@@ -97,7 +97,11 @@ load successfully (Bug E fixed) but crash at first inference due to Bug H (atten
 MoE models with 64+ experts. Affects BOTH discrete and integrated GPUs.
 Closed by Intel (2026-01-05) with no public fix.**
 
-**The fix exists internally at Intel but hasn't been released.**
+**Intel never fixed GatedMLPMOE. They replaced it with CUTLASS XE kernels in
+[vllm-xpu-kernels](https://github.com/intel/vllm-xpu-kernels).** The IPEX repo
+was [archived on March 30, 2026](https://github.com/intel/intel-extension-for-pytorch)
+with Bug H unfixed. `GatedMLPMOE` and `marlin_shuffle_weight` were never
+upstreamed to PyTorch.
 
 ### IPEX #838: The same bug on discrete GPU
 
@@ -108,10 +112,21 @@ Max 1550 — a **discrete** GPU with dedicated HBM. This proves Bug H is NOT
 specific to Lunar Lake iGPU or shared memory.
 
 - **Filed**: 2025-06-14
-- **Closed**: 2026-01-05 (no linked PR, no public fix)
+- **Closed**: 2026-01-05 (no linked PR, no public fix — **zero PRs** found in IPEX)
 - **Crash point**: `torch.ops.torch_ipex.topk_softmax()` (routing, before moe_gemm)
-- Smaller MoE models (Falcon3-MoE-2x7B, Llama-4-Scout-17B-16E) work
+- Smaller MoE models (Falcon3-MoE-2x7B, Llama-4-Scout-17B-16E with 16 experts) work
 - Same IPEX version `2.10.10.post1+xpu` as our install
+- **IPEX archived March 30, 2026** — no further fixes will be released
+
+### Other unfixed IPEX issues (related)
+
+| Issue | Model | Problem | Status |
+|-------|-------|---------|--------|
+| [#838](https://github.com/intel/intel-extension-for-pytorch/issues/838) | Qwen3-30B-A3B (128 experts) | OUT_OF_RESOURCES on Max 1550 | Closed, no fix |
+| [#864](https://github.com/intel/intel-extension-for-pytorch/issues/864) | GPT-OSS-20B-Int4 | INT4 variant of GPT-OSS-20B fails | Open (archived) |
+| [#869](https://github.com/intel/intel-extension-for-pytorch/issues/869) | CPU offload | CPU offload broken for XPU models | Open (archived) |
+
+All three remain unfixed in the archived IPEX repo.
 
 ### The #324 dense model red herring
 
@@ -123,18 +138,24 @@ This code path works fine. It's irrelevant to our MoE models.
 
 ### Revised understanding
 
-| Expert count | Discrete GPU (Max 1550) | iGPU (Lunar Lake) |
-|---|---|---|
-| 2-16 experts | Works | Likely works |
-| 36 experts (GPT-OSS-20B MXFP4) | Works | **Works** |
-| 64 experts (GLM-4.7-Flash INT4) | Unknown | **DEVICE_LOST** |
-| 128 experts (Qwen3-30B-A3B) | **OUT_OF_RESOURCES** (#838) | **DEVICE_LOST** |
-| 256 experts (Qwen3.5-35B-A3B) | Unknown | **DEVICE_LOST** |
+| Expert count | Discrete GPU (Max 1550) | iGPU (Lunar Lake) | Cross-platform |
+|---|---|---|---|
+| 2-16 experts | Works | Works | Works |
+| 16 experts (Llama-4-Scout-17B-16E) | Works (IPEX #838 reporter) | Likely works | Works |
+| 36 experts (GPT-OSS-20B MXFP4) | Works | **Works** | N/A (Intel-only model) |
+| 64 experts (GLM-4.7-Flash INT4) | Unknown | **DEVICE_LOST** | Unknown |
+| 128 experts (Qwen3-30B-A3B) | **OUT_OF_RESOURCES** (#838) | **DEVICE_LOST** | **Crashes on NVIDIA too** ([vLLM #35922](https://github.com/vllm-project/vllm/issues/35922), [SGLang #9872](https://github.com/sgl-project/sglang/issues/9872)) |
+| 256 experts (Qwen3.5-35B-A3B) | Unknown | **DEVICE_LOST** | Unknown |
 
 The crash correlates with expert count. `GatedMLPMOE` has internal resource
 scaling that exceeds Level Zero limits above a threshold (around 64 experts on
 iGPU, 128 on discrete). GPT-OSS-20B (36 experts, MXFP4) works because it's
 below this threshold, not because MXFP4 is inherently more resilient.
+
+**Cross-platform note**: 128-expert Qwen3-30B-A3B also crashes on NVIDIA A100
+([vLLM #35922](https://github.com/vllm-project/vllm/issues/35922)) and RTX 4090
+([SGLang #9872](https://github.com/sgl-project/sglang/issues/9872)), suggesting
+the 128-expert MoE architecture is problematic across all inference frameworks.
 
 ### Distinction from Bug E
 
@@ -351,27 +372,60 @@ vllm serve /path/to/Qwen3.5-35B-A3B-INT4 --device xpu \
 # Send any prompt → DEVICE_LOST at Layer 1 MoE GEMM
 ```
 
-### Required fix (Intel has internal fix — not released)
+### Path forward: vllm-xpu-kernels replaces GatedMLPMOE
 
-IPEX #838 was closed 2026-01-05 with no linked PR or public release. The fix
-exists internally at Intel but has not been released in any IPEX pip package
-or llm-scaler Docker image. Our options:
+Intel never fixed `GatedMLPMOE` in IPEX. Instead, they built replacement kernels
+in [intel/vllm-xpu-kernels](https://github.com/intel/vllm-xpu-kernels) using
+CUTLASS XE (not xetla). The IPEX repo was archived March 30, 2026.
 
-1. **Request the fix from Intel** — reference #838, ask for the patch or a
-   new IPEX release containing it
-2. **vLLM v0.19+ oneDNN INT4 path** — bypass IPEX entirely via `vllm-xpu-kernels`
-   oneDNN-backed INT4 GEMM (`XPUExpertsInt4`), tracked in RFC vllm-project/vllm#33214
-3. **Use MXFP4 models** — works on Lunar Lake (GPT-OSS-20B, 36 experts)
-4. **Use llama.cpp GGUF** — own SYCL kernels, no GatedMLPMOE dependency
+#### vllm-xpu-kernels INT4 MoE support
+
+| PR | Description | Status |
+|----|-------------|--------|
+| [#88](https://github.com/intel/vllm-xpu-kernels/pull/88) | Initial INT4 MoE GEMM support (CUTLASS XE) | Merged |
+| [#98](https://github.com/intel/vllm-xpu-kernels/pull/98) | INT4 MoE optimization + expert routing | Merged |
+| [#114](https://github.com/intel/vllm-xpu-kernels/pull/114) | INT4 AutoRound MoE end-to-end | Merged |
+| [#252](https://github.com/intel/vllm-xpu-kernels/pull/252) | Fix expert scaling for 1024 experts | Open |
+| [#253](https://github.com/intel/vllm-xpu-kernels/pull/253) | Fix expert scaling for 128-256 experts | Open |
+
+PRs #252 and #253 are actively fixing the exact expert count scaling issue we
+hit. This confirms Intel is aware of the problem and fixing it in the new
+kernel library, not in IPEX.
+
+#### Migration options (ranked)
+
+1. **vLLM v0.16+ with vllm-xpu-kernels** (recommended) — bypass IPEX entirely.
+   vLLM v0.16+ uses `vllm-xpu-kernels` instead of IPEX for XPU compute kernels.
+   The CUTLASS XE INT4 MoE path (PRs #88, #98, #114) replaces `GatedMLPMOE`.
+   Expert scaling fixes (#252, #253) are in progress.
+
+2. **Use MXFP4 models on current stack** — works on Lunar Lake now
+   (GPT-OSS-20B, 36 experts). Limited model selection.
+
+3. **Use llama.cpp GGUF** — own SYCL kernels, no GatedMLPMOE dependency.
+   Works for GLM-4.7-Flash-Q4_K_M.gguf today.
+
+4. **Request IPEX fix from Intel** — IPEX is archived; unlikely to get a fix.
+   Reference #838 if attempting.
+
+#### Why vLLM v0.14 + IPEX is a dead end
+
+- IPEX archived March 30, 2026 with `GatedMLPMOE` broken for 64+ experts
+- `GatedMLPMOE` and `marlin_shuffle_weight` were NEVER upstreamed to PyTorch
+- No public fix exists in any IPEX release
+- vllm-xpu-kernels is the actively maintained replacement
+- vLLM v0.16+ dropped IPEX dependency for XPU compute
 
 ### What Intel supports vs what we need
 
-| | Dense INT4 AutoRound | MoE INT4 AutoRound | MoE MXFP4 |
-|---|---|---|---|
-| Code path | `IPEXGPTQLinearMethod` | `XPUGPTQMarlinMoEMethod` → `GatedMLPMOE` | Direct MoE kernel |
-| Intel tested | Yes | **No** (IPEX #838 open) | Yes |
-| Works on discrete | Yes | **No** (128+ experts crash) | Yes |
-| Works on iGPU | Yes (too big for 32GB) | **No** (64+ experts crash) | Yes (GPT-OSS-20B) |
+| | Dense INT4 AutoRound | MoE INT4 AutoRound (IPEX) | MoE INT4 AutoRound (vllm-xpu-kernels) | MoE MXFP4 |
+|---|---|---|---|---|
+| Code path | `IPEXGPTQLinearMethod` | `GatedMLPMOE` | CUTLASS XE `XPUExpertsInt4` | Direct MoE kernel |
+| vLLM version | v0.14+ | v0.14+ | **v0.16+** | v0.14+ |
+| Intel tested | Yes | **No** (IPEX #838) | Yes (PRs #88, #98, #114) | Yes |
+| Works on discrete | Yes | **No** (128+ experts crash) | **In progress** (#252, #253) | Yes |
+| Works on iGPU | Yes (too big for 32GB) | **No** (64+ experts crash) | Unknown (needs testing) | Yes (GPT-OSS-20B) |
+| Status | Stable | **Dead** (IPEX archived) | **Active development** | Stable |
 
 ### IPEX code references
 

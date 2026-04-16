@@ -2,7 +2,12 @@
 
 **Related**: [intel/intel-extension-for-pytorch#838](https://github.com/intel/intel-extension-for-pytorch/issues/838)
 — identical crash on Data Center GPU Max 1550 with Qwen3-30B-A3B (128 experts).
-Closed 2026-01-05 with no public fix.
+Closed 2026-01-05 with **zero PRs** — no public fix was ever released.
+IPEX repo [archived March 30, 2026](https://github.com/intel/intel-extension-for-pytorch).
+
+**Fix is in vllm-xpu-kernels**: Intel replaced GatedMLPMOE with CUTLASS XE kernels
+in [intel/vllm-xpu-kernels](https://github.com/intel/vllm-xpu-kernels) (PRs #88,
+#98, #114). Expert scaling fixes for 128-1024 experts are in progress (PRs #252, #253).
 
 ## Title
 
@@ -113,9 +118,13 @@ This proves the Level Zero SYCL context is irrecoverably corrupted by the attent
 
 | Model | Layers | Experts | Quant | xetla kernel | Isolated | After attention |
 |-------|--------|---------|-------|-------------|----------|-----------------|
+| Llama-4-Scout-17B-16E | 48 | 16 | INT4 | `group_mm_int4_out_marlin` | PASS | **PASS** (IPEX #838 reporter confirms) |
 | GPT-OSS-20B | 24 | 36 | MXFP4 | `group_mm_mxfp4_out_marlin` | PASS | **PASS** |
-| Qwen3.5-35B-A3B | 40 | 256 | INT4 | `group_mm_int4_out_marlin` | PASS | **DEVICE_LOST** |
 | GLM-4.7-Flash | 47 | 64 | INT4 | `group_mm_int4_out_marlin` | PASS | **DEVICE_LOST** |
+| Qwen3-30B-A3B | 48 | 128 | INT4 | `group_mm_int4_out_marlin` | PASS | **OUT_OF_RESOURCES** (IPEX #838, discrete GPU) |
+| Qwen3.5-35B-A3B | 40 | 256 | INT4 | `group_mm_int4_out_marlin` | PASS | **DEVICE_LOST** |
+
+**Expert count crash threshold**: 16 experts works, 64+ crashes on iGPU, 128+ crashes on discrete GPU.
 
 ## Key observation
 
@@ -167,6 +176,54 @@ The INT4 C++ hardcodes `using dtype_a = sycl::half` but vLLM default is BF16. If
 3. **Fix attention kernel SYCL cleanup** — ensure `flash_attn_varlen_func` releases all SLM/barriers before returning
 4. **Level Zero iGPU driver hardening** — prevent residual state from one kernel affecting subsequent dispatches
 5. **Add Xe2-LPG-specific tile policies** — detect iGPU at runtime and use smaller tiles
+
+## Cross-platform references
+
+The 128-expert MoE architecture is problematic across ALL inference frameworks, not just IPEX:
+
+| Issue | Platform | Model | Error |
+|-------|----------|-------|-------|
+| [IPEX #838](https://github.com/intel/intel-extension-for-pytorch/issues/838) | Intel Max 1550 | Qwen3-30B-A3B (128 experts) | OUT_OF_RESOURCES |
+| [vLLM #35922](https://github.com/vllm-project/vllm/issues/35922) | NVIDIA A100 | Qwen3-30B-A3B (128 experts) | Crashes |
+| [SGLang #9872](https://github.com/sgl-project/sglang/issues/9872) | NVIDIA RTX 4090 | Qwen3-30B-A3B (128 experts) | Crashes |
+| This report | Intel Arc 140V (Lunar Lake) | GLM-4.7-Flash (64 experts) | DEVICE_LOST |
+| This report | Intel Arc 140V (Lunar Lake) | Qwen3.5-35B-A3B (256 experts) | DEVICE_LOST |
+
+## Other unfixed IPEX issues (related)
+
+| Issue | Model | Problem | Status |
+|-------|-------|---------|--------|
+| [#864](https://github.com/intel/intel-extension-for-pytorch/issues/864) | GPT-OSS-20B-Int4 | INT4 variant of GPT-OSS-20B fails | Open (archived) |
+| [#869](https://github.com/intel/intel-extension-for-pytorch/issues/869) | CPU offload | CPU offload broken for XPU models | Open (archived) |
+
+## IPEX archived — GatedMLPMOE is a dead end
+
+The [IPEX repository was archived on March 30, 2026](https://github.com/intel/intel-extension-for-pytorch).
+`GatedMLPMOE` and `marlin_shuffle_weight` were **never upstreamed to PyTorch**.
+No fix for Bug H will be released in IPEX.
+
+### Replacement: vllm-xpu-kernels (CUTLASS XE)
+
+Intel replaced the broken IPEX xetla kernels with CUTLASS XE kernels in
+[intel/vllm-xpu-kernels](https://github.com/intel/vllm-xpu-kernels):
+
+| PR | Description | Status |
+|----|-------------|--------|
+| [#88](https://github.com/intel/vllm-xpu-kernels/pull/88) | Initial INT4 MoE GEMM (CUTLASS XE) | Merged |
+| [#98](https://github.com/intel/vllm-xpu-kernels/pull/98) | INT4 MoE optimization + expert routing | Merged |
+| [#114](https://github.com/intel/vllm-xpu-kernels/pull/114) | INT4 AutoRound MoE end-to-end | Merged |
+| [#252](https://github.com/intel/vllm-xpu-kernels/pull/252) | Fix expert scaling for 1024 experts | Open |
+| [#253](https://github.com/intel/vllm-xpu-kernels/pull/253) | Fix expert scaling for 128-256 experts | Open |
+
+**PRs #252 and #253 are actively fixing the exact expert count scaling issue
+reported here.** This confirms Intel is aware and fixing it in vllm-xpu-kernels,
+not in IPEX.
+
+### Migration path
+
+vLLM v0.16+ uses `vllm-xpu-kernels` instead of IPEX for XPU compute. The
+CUTLASS XE `XPUExpertsInt4` class replaces `GatedMLPMOE`. Upgrading from
+vLLM v0.14 + IPEX to vLLM v0.16+ with vllm-xpu-kernels is the recommended fix.
 
 ## IPEX source files (analyzed)
 
