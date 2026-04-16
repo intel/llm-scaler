@@ -3551,8 +3551,9 @@ index 475bd8536..0f548843c 100644
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  
 -from typing import Any, Optional
++import os
 +from typing import Any
- 
+
  import torch
  from packaging import version
 +from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
@@ -4152,6 +4153,59 @@ index 475bd8536..0f548843c 100644
 +                f"{self.quant_config.linear_quant_method} for XPU MOE."
 +            )
 +
++    # Max experts per CUTLASS grouped GEMM dispatch. Matches the 8 Xe-cores
++    # on Lunar Lake Arc 140V — one expert group per Xe-core. Dispatching
++    # 50+ expert groups simultaneously causes DEVICE_LOST due to workgroup
++    # scheduler oversubscription. Chunking to 8 gives ~8x speedup over
++    # sequential (1-at-a-time) while staying within hardware limits.
++    # On B580 (20 Xe-cores) this could be raised to ~16-20.
++    EXPERTS_PER_CHUNK = int(os.environ.get(
++        "VLLM_XPU_MOE_CHUNK_SIZE", "8"))
++
++    def _chunked_moe_gemm(self, input_by_expert, weights, scales,
++                           expert_ids, N, K, output_dim, dtype, device):
++        """Run CUTLASS grouped GEMM on a chunk of experts.
++
++        Groups up to EXPERTS_PER_CHUNK experts into a single
++        cutlass_grouped_gemm_interface call. The interface expects:
++          - ptr_A: concatenated input rows [total_tokens, K]
++          - ptr_B: stacked expert weights [num_experts_in_chunk, ...]
++          - expert_first_token_offset: cumulative token offsets [num+1]
++        """
++        chunk_size = len(expert_ids)
++        # Build concatenated input and offset array
++        inputs = [input_by_expert[eid] for eid in expert_ids]
++        counts = [inp.shape[0] for inp in inputs]
++        total = sum(counts)
++        if total == 0:
++            return {}
++
++        cat_input = torch.cat(inputs, dim=0)  # [total, K]
++        # Cumulative offsets: [0, n0, n0+n1, ..., total]
++        offsets = torch.zeros(chunk_size + 1, dtype=torch.int64,
++                              device=device)
++        for i, c in enumerate(counts):
++            offsets[i + 1] = offsets[i] + c
++
++        # Stack weights and scales for this chunk
++        w_chunk = weights[expert_ids]   # [chunk, ...]
++        s_chunk = scales[expert_ids]    # [chunk, ...]
++
++        out = torch.empty(total, output_dim, dtype=dtype, device=device)
++        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
++            cat_input, w_chunk, s_chunk,
++            None, out, offsets,
++            N, K, chunk_size, True, False)
++
++        # Split output back per expert
++        results = {}
++        for i, eid in enumerate(expert_ids):
++            start = offsets[i].item()
++            end = offsets[i + 1].item()
++            if end > start:
++                results[eid] = out[start:end]
++        return results
++
 +    def apply(
 +        self,
 +        layer: FusedMoE,
@@ -4159,10 +4213,10 @@ index 475bd8536..0f548843c 100644
 +        x: torch.Tensor,
 +        router_logits: torch.Tensor,
 +    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-+        # CUTLASS sequential expert loop — bypasses IPEX GatedMLPMOE entirely.
-+        # Processes one expert at a time to avoid the batched grouped GEMM
-+        # crash on Xe2 iGPU (DEVICE_LOST with 50+ active expert groups).
-+        # Same strategy as llama.cpp: sequential per-expert GEMMs.
++        # CUTLASS chunked expert dispatch — bypasses IPEX GatedMLPMOE.
++        # Processes EXPERTS_PER_CHUNK experts at a time (default 8,
++        # matching Lunar Lake's 8 Xe-cores) to avoid DEVICE_LOST from
++        # workgroup scheduler oversubscription with 50+ expert groups.
 +        from vllm_xpu_kernels import _xpu_C  # noqa: F401
 +
 +        num_tokens, hidden_dim = x.shape
@@ -4172,8 +4226,6 @@ index 475bd8536..0f548843c 100644
 +        S13 = layer.cutlass_s13
 +        S2 = layer.cutlass_s2
 +        num_experts = W13.shape[0]
-+        # W13 is [E, 2*inter_size_packed, hidden_dim] in uint8
-+        # After int32→uint8: shape[-2] = original_packed * 4
 +        inter_size = W13.shape[1] // 2
 +
 +        # Routing: topk softmax
@@ -4184,48 +4236,53 @@ index 475bd8536..0f548843c 100644
 +            topk_weights = topk_weights / topk_weights.sum(
 +                dim=-1, keepdim=True)
 +
-+        # Sequential expert loop: one CUTLASS GEMM per active expert
++        # Pre-sort tokens by expert: build per-expert input tensors
++        # and track (token_idx, slot_idx) for weighted accumulation
++        expert_inputs = {}   # eid -> input tensor [n, hidden_dim]
++        expert_meta = {}     # eid -> (token_indices, expert_weights)
++        active_experts = []
++        for eid in range(num_experts):
++            mask = (topk_ids == eid)
++            if not mask.any():
++                continue
++            tok_idx, slot_idx = mask.nonzero(as_tuple=True)
++            expert_inputs[eid] = x[tok_idx]
++            expert_meta[eid] = (tok_idx,
++                                topk_weights[tok_idx, slot_idx])
++            active_experts.append(eid)
++
 +        output = torch.zeros(num_tokens, hidden_dim,
 +                             dtype=x.dtype, device=x.device)
 +
-+        for expert_id in range(num_experts):
-+            # Find which (token, slot) pairs route to this expert
-+            mask = (topk_ids == expert_id)
-+            if not mask.any():
-+                continue
++        # Process active experts in chunks of EXPERTS_PER_CHUNK
++        chunk_sz = self.EXPERTS_PER_CHUNK
++        for ci in range(0, len(active_experts), chunk_sz):
++            chunk_eids = active_experts[ci:ci + chunk_sz]
 +
-+            token_indices, slot_indices = mask.nonzero(as_tuple=True)
-+            expert_weights = topk_weights[token_indices, slot_indices]
-+            expert_input = x[token_indices]
-+            n = expert_input.shape[0]
++            # GEMM1: gate_up projection [n, hidden] -> [n, 2*inter]
++            g1_results = self._chunked_moe_gemm(
++                expert_inputs, W13, S13, chunk_eids,
++                2 * inter_size, hidden_dim,
++                2 * inter_size, x.dtype, x.device)
 +
-+            # CUTLASS GEMM1: expert_input @ W13[expert_id] (gate+up)
-+            offsets = torch.tensor([0, n], dtype=torch.int64,
-+                                   device=x.device)
-+            g1_out = torch.empty(n, 2 * inter_size, dtype=x.dtype,
-+                                 device=x.device)
-+            torch.ops._xpu_C.cutlass_grouped_gemm_interface(
-+                expert_input, W13[expert_id:expert_id+1],
-+                S13[expert_id:expert_id+1],
-+                None, g1_out, offsets,
-+                2 * inter_size, hidden_dim, 1, True, False)
++            # SiLU activation + prepare input for GEMM2
++            activated_inputs = {}
++            for eid, g1_out in g1_results.items():
++                activated_inputs[eid] = (
++                    torch.nn.functional.silu(g1_out[:, :inter_size])
++                    * g1_out[:, inter_size:]
++                ).contiguous()
 +
-+            # SiLU activation: gate * up
-+            activated = (torch.nn.functional.silu(g1_out[:, :inter_size])
-+                         * g1_out[:, inter_size:])
++            # GEMM2: down projection [n, inter] -> [n, hidden]
++            g2_results = self._chunked_moe_gemm(
++                activated_inputs, W2, S2, chunk_eids,
++                hidden_dim, inter_size,
++                hidden_dim, x.dtype, x.device)
 +
-+            # CUTLASS GEMM2: activated @ W2[expert_id] (down)
-+            g2_out = torch.empty(n, hidden_dim, dtype=x.dtype,
-+                                 device=x.device)
-+            torch.ops._xpu_C.cutlass_grouped_gemm_interface(
-+                activated.contiguous(),
-+                W2[expert_id:expert_id+1],
-+                S2[expert_id:expert_id+1],
-+                None, g2_out, offsets,
-+                hidden_dim, inter_size, 1, True, False)
-+
-+            # Weighted accumulate into output
-+            output[token_indices] += expert_weights.unsqueeze(1) * g2_out
++            # Weighted accumulate
++            for eid, g2_out in g2_results.items():
++                tok_idx, weights = expert_meta[eid]
++                output[tok_idx] += weights.unsqueeze(1) * g2_out
 +
 +        return output
 diff --git a/vllm/model_executor/layers/quantization/sym_int4.py b/vllm/model_executor/layers/quantization/sym_int4.py

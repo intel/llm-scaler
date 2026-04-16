@@ -457,34 +457,46 @@ on simultaneous workgroup dispatch. Both IPEX's xetla `moe_gemm` and CUTLASS's
 llama.cpp avoids this by processing experts **sequentially** (one GEMM at a
 time), which is why it can run Qwen3.5-35B (256 experts) on the same hardware.
 
-**Solution: Sequential expert loop** (implemented in `vllm_for_multi_arc.patch`).
-Instead of batched grouped GEMM, loop over active experts and run one CUTLASS
-GEMM per expert. Each individual expert GEMM is small enough for Xe2. This is
-the same strategy llama.cpp uses. The implementation:
+**Solution: Chunked expert dispatch** (implemented in `vllm_for_multi_arc.patch`).
+Instead of dispatching all experts at once (crashes) or one at a time (too slow),
+dispatch `EXPERTS_PER_CHUNK` experts per CUTLASS call (default 8, matching the
+8 Xe-cores on Lunar Lake).
+
+| Strategy | Kernel launches (56 active experts) | Relative speed |
+|----------|:-----------------------------------:|:--------------:|
+| All at once | 1 | Fastest — **crashes** |
+| Chunked (8 at a time) | 7 | **~8x faster** than sequential |
+| Sequential (1 at a time) | 56 | Baseline — too slow |
+
+The implementation:
 
 1. **Weight prep** (`process_weights_after_loading`): GPTQ int32 → uint8 →
    `implement_zp()` on CPU. No marlin shuffle. No IPEX import needed.
 2. **Routing** (`apply`): Standard PyTorch `topk` + `softmax`. No IPEX
    `topk_softmax` / `moe_scatter` / `moe_gather` ops.
-3. **Compute** (`apply`): For each active expert, run two CUTLASS GEMMs
-   (gate_up + down) with `cutlass_grouped_gemm_interface(num_experts=1)`.
+3. **Compute** (`apply`): Group active experts into chunks of 8, run one
+   `cutlass_grouped_gemm_interface(num_experts=chunk_size)` per chunk.
+   Concatenate per-expert inputs, build cumulative offset array, stack
+   weights/scales for the chunk.
 4. **Accumulate**: Weighted sum of per-expert outputs.
 
-This completely eliminates the IPEX dependency for INT4 MoE inference.
-Performance is slower than batched grouped GEMM (sequential vs parallel),
-but it **actually works** on Xe2 iGPU — which is better than crashing.
+Chunk size is configurable via `VLLM_XPU_MOE_CHUNK_SIZE` env var (default 8).
+On B580 (20 Xe-cores) set to ~16-20 for better throughput.
 
-**Status: NEEDS TESTING** — The sequential loop was implemented and the
-individual CUTLASS GEMMs work, but the full end-to-end vLLM server test
-with a real model has not yet been confirmed working.
+This completely eliminates the IPEX dependency for INT4 MoE inference.
+
+**Status: NEEDS END-TO-END TESTING** — The chunked CUTLASS dispatch is
+implemented in the patch. Individual CUTLASS GEMMs with 8 experts work on
+Lunar Lake. Full vLLM server test with a real model not yet confirmed.
 
 #### Migration options (ranked)
 
-1. **CUTLASS sequential expert loop on vLLM v0.14** (implemented, needs testing)
-   — Patch `XPUGPTQMarlinMoEMethod` to use CUTLASS per-expert GEMMs instead
-   of IPEX batched `moe_gemm`. No marlin shuffle, no IPEX dependency for MoE.
-   Uses vllm-xpu-kernels v0.1.4 already installed. See patch in
-   `vllm_for_multi_arc.patch`. **NEEDS END-TO-END TESTING.**
+1. **CUTLASS chunked expert dispatch on vLLM v0.14** (implemented, needs testing)
+   — Patch `XPUGPTQMarlinMoEMethod` to use CUTLASS grouped GEMM in chunks
+   of 8 experts (matching 8 Xe-cores) instead of IPEX batched `moe_gemm`.
+   No marlin shuffle, no IPEX dependency for MoE. Uses vllm-xpu-kernels
+   v0.1.4 already installed. Configurable via `VLLM_XPU_MOE_CHUNK_SIZE`.
+   See patch in `vllm_for_multi_arc.patch`. **NEEDS END-TO-END TESTING.**
 
 2. **Use MXFP4 models** — works on Lunar Lake now (GPT-OSS-20B, 36 experts).
    Limited model selection but fully proven.
