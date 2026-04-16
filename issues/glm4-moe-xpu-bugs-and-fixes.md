@@ -367,3 +367,64 @@ vLLM / IPEX — the dequantization should produce the model's configured dtype (
 GPT-OSS-20B uses **MXFP4 quantization** which stores weights pre-formatted for the XPU MoE kernel — no runtime shuffle, no `_IPEXGatedMLPMOEXPU` per-layer objects, no Level Zero resource accumulation. INT4 GPTQ models go through IPEX's `GatedMLPMOE` → `_IPEXGatedMLPMOEXPU` path which creates heavy per-layer kernel objects that exhaust the iGPU's resource pool.
 
 The fix must come from Intel (IPEX or Level Zero driver) — either share kernel objects across layers or increase the resource pool for iGPU.
+
+---
+
+## Bug H Final Diagnosis: IPEX GatedMLPMOE INT4 broken on Lunar Lake (2026-04-16)
+
+### Root cause identified
+
+`GatedMLPMOE.forward()` with `is_int4=True` crashes with `DEVICE_LOST` (error 20) on Lunar Lake Xe2 iGPU. This is an **IPEX bug**, not a memory, resource pool, or shuffle issue.
+
+### Proof
+
+```python
+# Direct kernel call — WORKS (even with 18 GiB allocated)
+torch.xpu.moe_gemm(x, W13, rows, E, None, scale,
+    is_int4=True, ...)  # → SUCCESS
+
+# GatedMLPMOE wrapper — CRASHES (even with 0.28 GiB allocated)
+moe = ipex.llm.modules.GatedMLPMOE(W13, W2,
+    w1_scale_inv=s13, w2_scale_inv=s2, is_int4=True)
+moe.W13 = moe.W13.to("xpu")
+moe.W2 = moe.W2.to("xpu")
+moe(x, router_logits=logits, ...)  # → DEVICE_LOST
+```
+
+Both tests use identical real model weights from safetensors, same shapes, same dtypes. The only difference is whether the call goes through `_IPEXGatedMLPMOEXPU.fused_moe_experts()` or directly to `torch.xpu.moe_gemm()`.
+
+### Tested configurations (all crash via GatedMLPMOE)
+
+| Config | XPU Allocated | Result |
+|--------|--------------|--------|
+| Pre-shuffled (_marlin_shuffled=True) | 0.28 GiB | DEVICE_LOST |
+| Native IPEX shuffle (no flag) | 0.28 GiB | DEVICE_LOST |
+| Full model + 0.75 util | 19.02 GiB | DEVICE_LOST |
+| Full model + 0.85 util | 20.63 GiB | DEVICE_LOST |
+| Full model + 0.65 util | 17.77 GiB | DEVICE_LOST |
+
+### Tested configurations (all pass via direct moe_gemm)
+
+| Config | XPU Allocated | Result |
+|--------|--------------|--------|
+| Zero weights, 2 experts | 0.01 GiB | PASS |
+| Real weights, 128 experts | 0.19 GiB | PASS |
+| Real weights + shuffle | 0.19 GiB | PASS |
+| Real weights + 18 GiB dummy | 18.19 GiB | PASS |
+| Real weights + KV cache blocks | 0.34 GiB | PASS |
+
+### What this means
+
+1. **Our CPU shuffle (Bug E) is correct** — the weights are in the right format
+2. **Memory is not the issue** — crashes at 0.28 GiB allocated
+3. **Level Zero resources are not the issue** — crashes with a single MoE layer
+4. **The bug is in `_IPEXGatedMLPMOEXPU`** — specifically how it wraps `torch.xpu.moe_gemm` with routing, activation, and expert dispatch logic
+5. The `fused_moe_experts()` method or the routing/gather/scatter around it produces invalid kernel state on Lunar Lake
+
+### Upstream
+
+**Intel IPEX** — `_IPEXGatedMLPMOEXPU.fused_moe_experts()` or its `forward()` method is broken on Xe2 iGPU with `is_int4=True`. The underlying `torch.xpu.moe_gemm` kernel works correctly when called directly.
+
+### Workaround path
+
+A potential workaround would be to bypass `GatedMLPMOE` entirely and call `torch.xpu.moe_gemm` directly in `XPUGPTQMarlinMoEMethod.apply()`, implementing the routing/gating logic in Python/PyTorch instead of relying on IPEX's fused implementation.
