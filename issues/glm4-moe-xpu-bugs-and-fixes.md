@@ -538,3 +538,46 @@ The Docker image `intel/llm-scaler-vllm:latest` (b8.1) has:
 ### Conclusion
 
 INT4 AutoRound MoE inference via `GatedMLPMOE` is broken on ALL Intel GPUs for models with 128+ experts. The fix is in Intel's internal IPEX but hasn't been released. Our patches (Bugs A-F) correctly route and prepare the weights, but the underlying IPEX `GatedMLPMOE.forward()` → `topk_softmax()` / `moe_gemm()` path has a known unfixed bug (#838).
+
+---
+
+## Bug H Deep Dive: vLLM Execution Path is the Trigger (2026-04-16)
+
+### Kernel dispatch diagnostics
+
+```
+INT4 dispatch: total_m=72 n_experts=128 average_m=0 policy=GEMV
+  input_dtype=torch.bfloat16 scale_dtype=torch.bfloat16
+  k=2048 n=1536 group_size=128 has_2d_block=True has_xmx=True
+```
+
+- **GEMV policy** (8×64 tiles) — NOT the large 256×256 GEMM tiles
+- **BF16 input** — not FP16 (C++ kernel uses `sycl::half` internally but accepts BF16)
+- **Fused kernel path** taken (has_2d_block + has_xmx)
+
+### Hypotheses tested and eliminated
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| A: Large tile size (256×256) | Kernel uses GEMV (8×64), average_m=0 | **Eliminated** |
+| C: BF16→FP16 dtype mismatch | Both BF16 and FP16 work in isolation | **Eliminated** |
+| Attention state pollution | Paged attention → moe_gemm in same process | **Works** |
+| Full model memory pressure | 16.66 GiB + 56K tensors + attention → moe_gemm | **Works** |
+
+### The remaining suspect: vLLM execution framework
+
+All isolated tests pass — even with the full model loaded (16.66 GiB, 56,466 tensors), KV cache allocated, and paged attention executed. The crash ONLY occurs through vLLM's model runner.
+
+The difference between our passing test and vLLM's failing forward:
+
+| | Isolated test | vLLM forward |
+|---|---|---|
+| Weight loading | `load_file().to("xpu")` | vLLM `DefaultModelLoader` + `weight_loader` |
+| Attention | Direct `PagedAttention.flash_attn_varlen_func` | Through `torch.ops.vllm.unified_attention_with_output` custom op |
+| MoE dispatch | Direct `torch.xpu.moe_gemm` | Through `FusedMoE.forward_native` → `torch.ops.vllm.moe_forward_shared` |
+| Compilation | None (eager) | `torch._dynamo` + custom ops registration |
+| Tensor management | Simple Python references | vLLM's tensor pinning, input/output buffers, scheduler metadata |
+
+### Next investigation
+
+The crash vector is in vLLM's custom op dispatch chain, not the IPEX kernels themselves. Need to trace which vLLM layer wraps the call and what state it adds.
