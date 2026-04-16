@@ -1,8 +1,12 @@
-# Intel Bug Report: IPEX attention kernel corrupts Level Zero SYCL context for INT4 MoE GEMM on Lunar Lake Xe2 iGPU
+# Intel Bug Report: GatedMLPMOE crashes with OUT_OF_RESOURCES on INT4 MoE (64+ experts) — same as IPEX #838
+
+**Related**: [intel/intel-extension-for-pytorch#838](https://github.com/intel/intel-extension-for-pytorch/issues/838)
+— identical crash on Data Center GPU Max 1550 with Qwen3-30B-A3B (128 experts).
+Closed 2026-01-05 with no public fix.
 
 ## Title
 
-`flash_attn_varlen_func` corrupts SYCL context — subsequent `torch.xpu.moe_gemm(is_int4=True)` crashes with DEVICE_LOST on Lunar Lake Xe2-LPG
+`GatedMLPMOE` → `group_mm_int4_out_marlin` crashes with DEVICE_LOST / OUT_OF_RESOURCES on INT4 MoE models with 64+ experts (iGPU and discrete)
 
 ## Environment
 

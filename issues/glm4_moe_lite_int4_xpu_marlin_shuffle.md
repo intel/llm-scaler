@@ -1,6 +1,6 @@
 # GLM-4.7-Flash INT4 MoE: Marlin Shuffle DEVICE_LOST on Lunar Lake XPU
 
-## Status: Bug E (shuffle OOM) FIXED — Bug H (attention→MoE SYCL state pollution) OPEN
+## Status: Bug E (shuffle OOM) FIXED — Bug H (GatedMLPMOE broken for 64+ expert INT4 MoE) OPEN — Same as [IPEX #838](https://github.com/intel/intel-extension-for-pytorch/issues/838)
 
 ## Problem
 
@@ -73,14 +73,16 @@ is the quantization format:
 
 **Two separate issues for INT4 MoE on shared-memory iGPU:**
 1. **Bug E (FIXED)**: marlin_shuffle_weight OOM during init — solved by CPU shuffle
-2. **Bug H (OPEN)**: Level Zero SYCL runtime state pollution from IPEX attention
-   kernels (flash_attn_varlen_func / chunked_prefill) corrupts the SYCL context,
-   causing subsequent `torch.xpu.moe_gemm(is_int4=True)` to crash with DEVICE_LOST.
-   The INT4 kernel works perfectly in isolation — the crash only occurs after
-   attention ops have executed in the same SYCL queue.
+2. **Bug H (OPEN)**: `GatedMLPMOE` crashes with `OUT_OF_RESOURCES` / `DEVICE_LOST`
+   on INT4 MoE models with 64+ experts. Same bug as
+   [IPEX #838](https://github.com/intel/intel-extension-for-pytorch/issues/838)
+   which crashes on discrete GPU Max 1550 with 128 experts. Intel closed #838
+   (2026-01-05) with no public fix. Root cause: IPEX `GatedMLPMOE` exhausts
+   Level Zero kernel resources (command lists, SLM, barriers) at scale.
 
-MXFP4 avoids both issues: no shuffle needed (Bug E), and its xetla kernel
-(`group_mm_mxfp4_out_marlin`) appears resilient to the attention state pollution.
+MXFP4 avoids both issues: no shuffle needed (Bug E), and GPT-OSS-20B only has
+36 experts (below the crash threshold). Dense INT4 models also work — they use
+`IPEXGPTQLinearMethod` instead of `GatedMLPMOE`.
 
 ### Implication for shared-memory iGPUs
 On shared-memory systems, **MXFP4 is the only vLLM-compatible quantization format
@@ -88,24 +90,61 @@ that works for INT4-class MoE models** on Lunar Lake Xe2 iGPU. INT4 AutoRound mo
 load successfully (Bug E fixed) but crash at first inference due to Bug H (attention
 → MoE SYCL state pollution). The alternative path is llama.cpp GGUF via SYCL backend.
 
-## Bug H: Level Zero SYCL State Pollution — Attention Kernels Break INT4 MoE GEMM
+## Bug H: GatedMLPMOE Broken for INT4 MoE with 64+ Experts — Known IPEX Bug
 
-**Status: OPEN — Level Zero SYCL context pollution from IPEX attention kernels
-(flash_attn_varlen_func / chunked_prefill) causes subsequent
-`torch.xpu.moe_gemm(is_int4=True)` to crash with DEVICE_LOST on Lunar Lake Xe2 iGPU.**
+**Status: OPEN — Same bug as [IPEX #838](https://github.com/intel/intel-extension-for-pytorch/issues/838).
+`GatedMLPMOE` crashes with `OUT_OF_RESOURCES` / `DEVICE_LOST` on INT4 AutoRound
+MoE models with 64+ experts. Affects BOTH discrete and integrated GPUs.
+Closed by Intel (2026-01-05) with no public fix.**
 
-**The fix must come from Intel — either IPEX attention kernel fix or Level Zero driver fix.**
+**The fix exists internally at Intel but hasn't been released.**
+
+### IPEX #838: The same bug on discrete GPU
+
+[intel/intel-extension-for-pytorch#838](https://github.com/intel/intel-extension-for-pytorch/issues/838)
+reports the identical `UR_RESULT_ERROR_OUT_OF_RESOURCES` (error 40) when running
+`Qwen/Qwen3-30B-A3B` (128 experts) with `GatedMLPMOE` on Intel Data Center GPU
+Max 1550 — a **discrete** GPU with dedicated HBM. This proves Bug H is NOT
+specific to Lunar Lake iGPU or shared memory.
+
+- **Filed**: 2025-06-14
+- **Closed**: 2026-01-05 (no linked PR, no public fix)
+- **Crash point**: `torch.ops.torch_ipex.topk_softmax()` (routing, before moe_gemm)
+- Smaller MoE models (Falcon3-MoE-2x7B, Llama-4-Scout-17B-16E) work
+- Same IPEX version `2.10.10.post1+xpu` as our install
+
+### The #324 dense model red herring
+
+Issue [intel/llm-scaler#324](https://github.com/intel/llm-scaler/issues/324)
+reported INT4 AutoRound working on Arc B60 with `Qwen3.5-27B`. But Qwen3.5-27B
+is a **dense model** (`Qwen3.5ForCausalLM`), not MoE. Dense models use
+`IPEXGPTQLinearMethod` — no `FusedMoE`, no `GatedMLPMOE`, no `marlin_shuffle_weight`.
+This code path works fine. It's irrelevant to our MoE models.
+
+### Revised understanding
+
+| Expert count | Discrete GPU (Max 1550) | iGPU (Lunar Lake) |
+|---|---|---|
+| 2-16 experts | Works | Likely works |
+| 36 experts (GPT-OSS-20B MXFP4) | Works | **Works** |
+| 64 experts (GLM-4.7-Flash INT4) | Unknown | **DEVICE_LOST** |
+| 128 experts (Qwen3-30B-A3B) | **OUT_OF_RESOURCES** (#838) | **DEVICE_LOST** |
+| 256 experts (Qwen3.5-35B-A3B) | Unknown | **DEVICE_LOST** |
+
+The crash correlates with expert count. `GatedMLPMOE` has internal resource
+scaling that exceeds Level Zero limits above a threshold (around 64 experts on
+iGPU, 128 on discrete). GPT-OSS-20B (36 experts, MXFP4) works because it's
+below this threshold, not because MXFP4 is inherently more resilient.
 
 ### Distinction from Bug E
 
 Bug E (DEVICE_LOST during marlin_shuffle) was solved by the CPU shuffle workaround.
-Bug H is a **separate** runtime issue: the SYCL queue state becomes corrupted after
-IPEX attention kernels execute, causing the next INT4 MoE GEMM dispatch to crash.
-The INT4 MoE GEMM kernel itself works perfectly in isolation.
+Bug H is a **separate** `GatedMLPMOE` scaling bug: the IPEX MoE fusion layer
+exhausts Level Zero resources when the number of experts is too high.
 
-### Definitive root cause: SYCL runtime state pollution
+### Our diagnostic evidence (still valid)
 
-Through exhaustive elimination testing, we determined:
+Our elimination testing showed:
 
 1. `torch.xpu.moe_gemm(is_int4=True)` **works in isolation** — with synthetic
    tensors, real model weights (16+ GiB allocated), 8093 dummy tensors, KV cache
@@ -312,23 +351,27 @@ vllm serve /path/to/Qwen3.5-35B-A3B-INT4 --device xpu \
 # Send any prompt → DEVICE_LOST at Layer 1 MoE GEMM
 ```
 
-### Required fix (Intel action needed)
+### Required fix (Intel has internal fix — not released)
 
-This bug is in the interaction between IPEX attention kernels and the Level Zero
-SYCL runtime on Xe2-LPG. The fix must come from Intel:
+IPEX #838 was closed 2026-01-05 with no linked PR or public release. The fix
+exists internally at Intel but has not been released in any IPEX pip package
+or llm-scaler Docker image. Our options:
 
-1. **IPEX attention kernel fix** — ensure `flash_attn_varlen_func` / `chunked_prefill`
-   leaves the SYCL queue in a clean state for subsequent kernel dispatches
-2. **Level Zero driver fix** — harden the L0 runtime against queue state leakage
-   between kernel dispatches
-3. **vLLM v0.19+ oneDNN INT4 path** — bypass IPEX entirely via `vllm-xpu-kernels`
+1. **Request the fix from Intel** — reference #838, ask for the patch or a
+   new IPEX release containing it
+2. **vLLM v0.19+ oneDNN INT4 path** — bypass IPEX entirely via `vllm-xpu-kernels`
    oneDNN-backed INT4 GEMM (`XPUExpertsInt4`), tracked in RFC vllm-project/vllm#33214
+3. **Use MXFP4 models** — works on Lunar Lake (GPT-OSS-20B, 36 experts)
+4. **Use llama.cpp GGUF** — own SYCL kernels, no GatedMLPMOE dependency
 
-### Workarounds (current)
+### What Intel supports vs what we need
 
-- **Use MXFP4 models** — works on Lunar Lake (proven with GPT-OSS-20B)
-- **Use llama.cpp GGUF** — own SYCL kernels, validated on consumer GPUs
-- **Wait for Intel llm-scaler v0.19** — oneDNN INT4 path avoids IPEX xetla entirely
+| | Dense INT4 AutoRound | MoE INT4 AutoRound | MoE MXFP4 |
+|---|---|---|---|
+| Code path | `IPEXGPTQLinearMethod` | `XPUGPTQMarlinMoEMethod` → `GatedMLPMOE` | Direct MoE kernel |
+| Intel tested | Yes | **No** (IPEX #838 open) | Yes |
+| Works on discrete | Yes | **No** (128+ experts crash) | Yes |
+| Works on iGPU | Yes (too big for 32GB) | **No** (64+ experts crash) | Yes (GPT-OSS-20B) |
 
 ### IPEX code references
 
