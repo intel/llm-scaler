@@ -240,7 +240,7 @@ void moe_up_routed_int4_kernel(
     const int K_packed = hidden_size / 8;
     const int K_groups = hidden_size / 128;
     const int two_dff = 2 * intermediate_size;
-    const int n_out_tiles = intermediate_size / 16;
+    const int n_out_tiles = intermediate_size / 64;  // 64-wide tiles (4×16)
 
     auto cgf = [&](sycl::handler& cgh) {
         cgh.parallel_for<class MoeUpRoutedInt4>(
@@ -250,67 +250,67 @@ void moe_up_routed_int4_kernel(
                 const int tile_idx  = (int)idx[1];
                 const int token     = route_idx / top_k;
                 const int k_idx     = route_idx % top_k;
-                const int n_start   = tile_idx * 16;
+                const int n_start   = tile_idx * 64;
 
                 const int eid = selected_experts[route_idx];
                 const fp16* x_row = x + (size_t)token * hidden_size;
 
-                // IPEX K-major: base at [eid, 0, 0]
                 const uint32_t* w_base = gate_up_qweight + (size_t)eid * K_packed * two_dff;
                 const fp16* s_base = gate_up_scales + (size_t)eid * K_groups * two_dff;
 
-                const int g_offset = n_start;
-                const int u_offset = intermediate_size + n_start;
+                // 4 sub-tiles of 16 for gate and up
+                const int g0 = n_start, g1 = n_start + 16, g2 = n_start + 32, g3 = n_start + 48;
+                const int u0 = intermediate_size + n_start, u1 = u0 + 16, u2 = u0 + 32, u3 = u0 + 48;
 
-                simd<float, 16> gate_acc(0.f), up_acc(0.f);
+                simd<float, 16> ga0(0.f), ga1(0.f), ga2(0.f), ga3(0.f);
+                simd<float, 16> ua0(0.f), ua1(0.f), ua2(0.f), ua3(0.f);
 
-                // Marlin unshuffle: nibble position → K offset mapping
-                // IPEX shuffled nibble order: [K0, K4, K1, K5, K2, K6, K3, K7]
-                // To read K values 0..7 in order, read from positions:
-                //   K0→pos0, K1→pos2, K2→pos4, K3→pos6, K4→pos1, K5→pos3, K6→pos5, K7→pos7
                 constexpr int unshuffle[8] = {0, 2, 4, 6, 1, 3, 5, 7};
 
                 for (int kp = 0; kp < K_packed; kp++) {
-                    // Preload 8 x values (corresponding to 8 nibbles in this packed int32)
                     simd<fp16, 8> x_chunk = block_load<fp16, 8>(x_row + kp * 8);
 
-                    // block_load 16 int32 along N (contiguous in IPEX layout)
-                    simd<uint32_t, 16> g_packed = block_load<uint32_t, 16>(
-                        w_base + (size_t)kp * two_dff + g_offset);
-                    simd<uint32_t, 16> u_packed = block_load<uint32_t, 16>(
-                        w_base + (size_t)kp * two_dff + u_offset);
+                    simd<uint32_t, 16> gp0 = block_load<uint32_t, 16>(w_base + (size_t)kp * two_dff + g0);
+                    simd<uint32_t, 16> gp1 = block_load<uint32_t, 16>(w_base + (size_t)kp * two_dff + g1);
+                    simd<uint32_t, 16> gp2 = block_load<uint32_t, 16>(w_base + (size_t)kp * two_dff + g2);
+                    simd<uint32_t, 16> gp3 = block_load<uint32_t, 16>(w_base + (size_t)kp * two_dff + g3);
+                    simd<uint32_t, 16> up0 = block_load<uint32_t, 16>(w_base + (size_t)kp * two_dff + u0);
+                    simd<uint32_t, 16> up1 = block_load<uint32_t, 16>(w_base + (size_t)kp * two_dff + u1);
+                    simd<uint32_t, 16> up2 = block_load<uint32_t, 16>(w_base + (size_t)kp * two_dff + u2);
+                    simd<uint32_t, 16> up3 = block_load<uint32_t, 16>(w_base + (size_t)kp * two_dff + u3);
 
-                    // Scale: [E, K_groups, N] — changes every 16 kp
                     int kg = kp / 16;
-                    simd<fp16, 16> g_scale = block_load<fp16, 16>(
-                        s_base + (size_t)kg * two_dff + g_offset);
-                    simd<fp16, 16> u_scale = block_load<fp16, 16>(
-                        s_base + (size_t)kg * two_dff + u_offset);
+                    simd<fp16, 16> gs0 = block_load<fp16, 16>(s_base + (size_t)kg * two_dff + g0);
+                    simd<fp16, 16> gs1 = block_load<fp16, 16>(s_base + (size_t)kg * two_dff + g1);
+                    simd<fp16, 16> gs2 = block_load<fp16, 16>(s_base + (size_t)kg * two_dff + g2);
+                    simd<fp16, 16> gs3 = block_load<fp16, 16>(s_base + (size_t)kg * two_dff + g3);
+                    simd<fp16, 16> us0 = block_load<fp16, 16>(s_base + (size_t)kg * two_dff + u0);
+                    simd<fp16, 16> us1 = block_load<fp16, 16>(s_base + (size_t)kg * two_dff + u1);
+                    simd<fp16, 16> us2 = block_load<fp16, 16>(s_base + (size_t)kg * two_dff + u2);
+                    simd<fp16, 16> us3 = block_load<fp16, 16>(s_base + (size_t)kg * two_dff + u3);
 
                     #pragma unroll
                     for (int b = 0; b < 8; b++) {
-                        int nib_pos = unshuffle[b];  // reverse marlin shuffle
-                        simd<uint32_t, 16> g_nib = (g_packed >> (nib_pos * 4)) & 0xFu;
-                        simd<uint32_t, 16> u_nib = (u_packed >> (nib_pos * 4)) & 0xFu;
-
-                        simd<float, 16> g_dq = (convert<float>(g_nib) - 8.f)
-                                             * convert<float>(g_scale);
-                        simd<float, 16> u_dq = (convert<float>(u_nib) - 8.f)
-                                             * convert<float>(u_scale);
-
+                        int shift = unshuffle[b] * 4;
                         float xv = (float)(fp16)x_chunk[b];
-                        gate_acc += g_dq * xv;
-                        up_acc   += u_dq * xv;
+
+                        ga0 += (convert<float>((gp0 >> shift) & 0xFu) - 8.f) * convert<float>(gs0) * xv;
+                        ga1 += (convert<float>((gp1 >> shift) & 0xFu) - 8.f) * convert<float>(gs1) * xv;
+                        ga2 += (convert<float>((gp2 >> shift) & 0xFu) - 8.f) * convert<float>(gs2) * xv;
+                        ga3 += (convert<float>((gp3 >> shift) & 0xFu) - 8.f) * convert<float>(gs3) * xv;
+                        ua0 += (convert<float>((up0 >> shift) & 0xFu) - 8.f) * convert<float>(us0) * xv;
+                        ua1 += (convert<float>((up1 >> shift) & 0xFu) - 8.f) * convert<float>(us1) * xv;
+                        ua2 += (convert<float>((up2 >> shift) & 0xFu) - 8.f) * convert<float>(us2) * xv;
+                        ua3 += (convert<float>((up3 >> shift) & 0xFu) - 8.f) * convert<float>(us3) * xv;
                     }
                 }
 
-                simd<float, 16> silu = gate_acc / (1.f + exp(-gate_acc));
-                simd<float, 16> result = silu * up_acc;
-
                 const int routed_row = token * rows_per_token + k_idx;
-                block_store<fp16, 16>(
-                    intermediates + (size_t)routed_row * intermediate_size + n_start,
-                    convert<fp16>(result));
+                fp16* out = intermediates + (size_t)routed_row * intermediate_size + n_start;
+                block_store<fp16, 16>(out,      convert<fp16>(ga0 / (1.f + exp(-ga0)) * ua0));
+                block_store<fp16, 16>(out + 16, convert<fp16>(ga1 / (1.f + exp(-ga1)) * ua1));
+                block_store<fp16, 16>(out + 32, convert<fp16>(ga2 / (1.f + exp(-ga2)) * ua2));
+                block_store<fp16, 16>(out + 48, convert<fp16>(ga3 / (1.f + exp(-ga3)) * ua3));
             });
     };
 
@@ -578,7 +578,7 @@ void moe_down_routed_int4_kernel(
 
     const int K_packed = intermediate_size / 8;
     const int K_groups = intermediate_size / 128;
-    const int n_out_tiles = hidden_size / 16;
+    const int n_out_tiles = hidden_size / 64;  // 64-wide tiles (4×16)
 
     auto cgf = [&](sycl::handler& cgh) {
         cgh.parallel_for<class MoeDownRoutedInt4>(
@@ -588,43 +588,49 @@ void moe_down_routed_int4_kernel(
                 const int tile_idx  = (int)idx[1];
                 const int token     = route_idx / top_k;
                 const int k_idx     = route_idx % top_k;
-                const int n_start   = tile_idx * 16;
+                const int n_start   = tile_idx * 64;
 
                 const int eid = selected_experts[route_idx];
                 const int routed_row = token * rows_per_token + k_idx;
                 const fp16* hi = intermediates + (size_t)routed_row * intermediate_size;
 
-                // IPEX K-major layout
                 const uint32_t* w_base = down_qweight + (size_t)eid * K_packed * hidden_size;
                 const fp16* s_base = down_scales + (size_t)eid * K_groups * hidden_size;
 
                 constexpr int unshuffle[8] = {0, 2, 4, 6, 1, 3, 5, 7};
-                simd<float, 16> acc(0.f);
+                simd<float, 16> acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
 
                 for (int kp = 0; kp < K_packed; kp++) {
                     simd<fp16, 8> hi_chunk = block_load<fp16, 8>(hi + kp * 8);
-                    simd<uint32_t, 16> packed = block_load<uint32_t, 16>(
-                        w_base + (size_t)kp * hidden_size + n_start);
+
+                    simd<uint32_t, 16> pk0 = block_load<uint32_t, 16>(w_base + (size_t)kp * hidden_size + n_start);
+                    simd<uint32_t, 16> pk1 = block_load<uint32_t, 16>(w_base + (size_t)kp * hidden_size + n_start + 16);
+                    simd<uint32_t, 16> pk2 = block_load<uint32_t, 16>(w_base + (size_t)kp * hidden_size + n_start + 32);
+                    simd<uint32_t, 16> pk3 = block_load<uint32_t, 16>(w_base + (size_t)kp * hidden_size + n_start + 48);
 
                     int kg = kp / 16;
-                    simd<fp16, 16> scale = block_load<fp16, 16>(
-                        s_base + (size_t)kg * hidden_size + n_start);
+                    simd<fp16, 16> sc0 = block_load<fp16, 16>(s_base + (size_t)kg * hidden_size + n_start);
+                    simd<fp16, 16> sc1 = block_load<fp16, 16>(s_base + (size_t)kg * hidden_size + n_start + 16);
+                    simd<fp16, 16> sc2 = block_load<fp16, 16>(s_base + (size_t)kg * hidden_size + n_start + 32);
+                    simd<fp16, 16> sc3 = block_load<fp16, 16>(s_base + (size_t)kg * hidden_size + n_start + 48);
 
                     #pragma unroll
                     for (int b = 0; b < 8; b++) {
-                        int nib_pos = unshuffle[b];
-                        simd<uint32_t, 16> nib = (packed >> (nib_pos * 4)) & 0xFu;
-                        simd<float, 16> dq = (convert<float>(nib) - 8.f)
-                                           * convert<float>(scale);
+                        int shift = unshuffle[b] * 4;
                         float hv = (float)(fp16)hi_chunk[b];
-                        acc += dq * hv;
+                        acc0 += (convert<float>((pk0 >> shift) & 0xFu) - 8.f) * convert<float>(sc0) * hv;
+                        acc1 += (convert<float>((pk1 >> shift) & 0xFu) - 8.f) * convert<float>(sc1) * hv;
+                        acc2 += (convert<float>((pk2 >> shift) & 0xFu) - 8.f) * convert<float>(sc2) * hv;
+                        acc3 += (convert<float>((pk3 >> shift) & 0xFu) - 8.f) * convert<float>(sc3) * hv;
                     }
                 }
 
                 float w = (float)routing_weights[route_idx];
-                block_store<fp16, 16>(
-                    output + (size_t)routed_row * hidden_size + n_start,
-                    convert<fp16>(acc * w));
+                fp16* out = output + (size_t)routed_row * hidden_size + n_start;
+                block_store<fp16, 16>(out,      convert<fp16>(acc0 * w));
+                block_store<fp16, 16>(out + 16, convert<fp16>(acc1 * w));
+                block_store<fp16, 16>(out + 32, convert<fp16>(acc2 * w));
+                block_store<fp16, 16>(out + 48, convert<fp16>(acc3 * w));
             });
     };
 
