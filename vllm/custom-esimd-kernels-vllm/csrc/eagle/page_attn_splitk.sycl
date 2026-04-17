@@ -1,0 +1,260 @@
+// page_attn_splitk.sycl — split-K paged attention decode
+//
+// Interface change: partition_tokens → num_partitions.
+// The grid size and buffer size are now O(num_partitions), completely
+// independent of max_model_len.  Each WG computes its token range
+// from the actual per-batch seq_lens on device.
+
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+#include <unordered_map>
+#include <mutex>
+using fp16 = sycl::half;
+using namespace sycl::ext::intel::esimd;
+namespace xesimd = sycl::ext::intel::experimental::esimd;
+
+static inline sycl::event submit_kernel_splitk(
+    std::function<void(sycl::handler&)> kernel,
+    const torch::Device& device,
+    const char* desc) {
+  sycl::queue& queue = c10::xpu::getCurrentXPUStream(device.index()).queue();
+  return queue.submit(kernel);
+}
+
+static inline uint32_t getHighestBitSplitK(uint32_t in) {
+  uint32_t ret = 0;
+  uint32_t temp = in - 1;
+  while (temp != 0) { temp >>= 1; ret++; }
+  return ret;
+}
+
+// ── per-device workspace cache ────────────────────────────────────────
+
+struct Workspace {
+  torch::Tensor buf;
+  size_t capacity{0};
+  std::mutex mu;
+};
+
+static std::unordered_map<int, Workspace> g_ws;
+static std::mutex g_ws_mu;
+
+static Workspace& get_workspace(int device_index) {
+  std::lock_guard<std::mutex> lk(g_ws_mu);
+  return g_ws[device_index];
+}
+
+// ── include kernel headers ────────────────────────────────────────────
+
+#include "page.attn.h"
+#include "page.attn.splitk.h"
+
+// ── host launcher ─────────────────────────────────────────────────────
+
+static void page_attention_splitk_forward(
+  uint8_t* qState,
+  uint8_t* kvCache,
+  uint32_t* pageTable,
+  uint32_t* kvSeqLens,
+  uint8_t* out,
+  float* pState,
+  float* pMax,
+  uint8_t* tmpOut,
+  float* expSums,
+  float* maxLogits,
+  uint32_t batches,
+  uint32_t headQk,
+  uint32_t headV,
+  uint32_t headDim,
+  uint32_t kvCacheStride0,
+  uint32_t kvCacheStride1,
+  uint32_t pageTableBatchStride,
+  uint32_t pageTableSizeLog2,
+  uint32_t pStride,
+  uint32_t maxStride,
+  uint32_t maxKvSeqLen,
+  uint32_t numPartitions,
+  const torch::Device& device) {
+
+  // ── Phase 1: unchanged ──
+  {
+    uint32_t groupH = headV;
+    uint32_t groupV = (maxKvSeqLen + 63) / 64;
+    uint32_t groupD = batches;
+    sycl::range<3> global(groupH * 4, groupV, groupD);
+    sycl::range<3> local(4, 1, 1);
+    sycl::nd_range<3> range(global, local);
+
+    auto kernel = [&](sycl::handler& cgh) {
+      cgh.parallel_for<class paPhase1SplitK>(
+        range, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL {
+          sdpaDecodeGqa4Phase1(
+            qState, kvCache, (uint8_t*)pState, pMax,
+            pageTable, kvSeqLens, batches,
+            kvCacheStride0, kvCacheStride1,
+            pageTableBatchStride, pageTableSizeLog2,
+            pStride, maxStride, headV, idx);
+        });
+    };
+    submit_kernel_splitk(kernel, device, "page_attn_splitk_ph1");
+  }
+
+  // ── Phase 2: split-K ──
+  {
+    uint32_t groupH = (headDim / 16) * 2;
+    uint32_t groupV = headV;
+    uint32_t groupD = batches * numPartitions;
+    sycl::range<3> global(groupH, groupV, groupD);
+    sycl::range<3> local(2, 1, 1);
+    sycl::nd_range<3> range(global, local);
+
+    auto kernel = [&](sycl::handler& cgh) {
+      cgh.parallel_for<class paPhase2SplitK>(
+        range, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL {
+          sdpaDecodeGqa4Phase2SplitK(
+            (uint8_t*)pState, pMax, kvCache,
+            tmpOut, expSums, maxLogits,
+            pageTable, kvSeqLens, batches,
+            kvCacheStride0, kvCacheStride1,
+            pageTableBatchStride, pageTableSizeLog2,
+            pStride, maxStride, headV,
+            numPartitions, idx);
+        });
+    };
+    submit_kernel_splitk(kernel, device, "page_attn_splitk_ph2");
+  }
+
+  // ── Reduce ──
+  {
+    uint32_t groupH = headDim / 16;
+    uint32_t groupV = headQk;
+    uint32_t groupD = batches;
+    sycl::range<3> global(groupH, groupV, groupD);
+    sycl::range<3> local(1, 1, 1);
+    sycl::nd_range<3> range(global, local);
+
+    auto kernel = [&](sycl::handler& cgh) {
+      cgh.parallel_for<class paReduceSplitK>(
+        range, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL {
+          sdpaDecodeGqa4Reduce(
+            tmpOut, expSums, maxLogits, out,
+            kvSeqLens, numPartitions,
+            headQk, idx);
+        });
+    };
+    submit_kernel_splitk(kernel, device, "page_attn_splitk_reduce");
+  }
+}
+
+// ── torch op entry point ──────────────────────────────────────────────
+
+void page_attn_decode_splitk(
+  torch::Tensor query,
+  torch::Tensor kv_cache,
+  torch::Tensor block_table,
+  torch::Tensor seq_lens,
+  torch::Tensor& out,
+  int64_t max_query_len,
+  int64_t max_seq_len,
+  int64_t num_partitions
+) {
+  TORCH_CHECK(block_table.dim() == 2);
+  TORCH_CHECK(seq_lens.dim() == 1);
+  TORCH_CHECK(kv_cache.dim() == 5);
+  TORCH_CHECK(query.scalar_type() == torch::kHalf);
+  TORCH_CHECK(kv_cache.scalar_type() == torch::kHalf);
+  TORCH_CHECK(out.scalar_type() == torch::kHalf);
+  TORCH_CHECK(num_partitions >= 1 && num_partitions <= 64,
+    "num_partitions must be in [1, 64]");
+
+  uint32_t kvCacheStride0 = kv_cache.stride(0);
+  uint32_t kvCacheStride1 = kv_cache.stride(1);
+  uint32_t totalDimsKv = kv_cache.dim();
+
+  uint32_t headDim  = kv_cache.size(totalDimsKv - 1);
+  uint32_t headV    = kv_cache.size(totalDimsKv - 2);
+  uint32_t pageSize = kv_cache.size(totalDimsKv - 3);
+  uint32_t batches  = seq_lens.size(0);
+  uint32_t headQk   = headV << 2;
+  uint32_t maxSeqLen = (uint32_t)max_seq_len;
+  uint32_t hiddenDimP    = ((maxSeqLen + 63) / 64) * 64;
+  uint32_t hiddenDimPMax = ((maxSeqLen + 63) / 64);
+  uint32_t pageTableSizeLog2     = getHighestBitSplitK(pageSize);
+  uint32_t pageTableBatchStride  = block_table.stride(0);
+  uint32_t numParts = (uint32_t)num_partitions;
+
+  TORCH_CHECK(headDim == 256);
+  TORCH_CHECK(max_query_len == 1);
+
+  // ── Workspace sizes (independent of max_model_len for split-K buffers) ──
+  // Region 0: temp_p (Phase 1) — still depends on max_seq_len (same as original)
+  size_t temp_p_bytes = (size_t)batches * headQk * (hiddenDimP + hiddenDimPMax) * sizeof(float);
+
+  // Region 1: tmp_out [batches, numParts, headQk, headDim] fp16
+  size_t tmp_out_bytes = (size_t)batches * numParts * headQk * headDim * sizeof(fp16);
+
+  // Region 2+3: exp_sums + max_logits [batches, numParts, headQk] fp32 each
+  size_t meta_bytes = (size_t)batches * numParts * headQk * sizeof(float);
+
+  auto align256 = [](size_t x) -> size_t { return (x + 255) & ~(size_t)255; };
+  size_t off_tmp_out    = align256(temp_p_bytes);
+  size_t off_exp_sums   = off_tmp_out + align256(tmp_out_bytes);
+  size_t off_max_logits = off_exp_sums + align256(meta_bytes);
+  size_t total_bytes    = off_max_logits + align256(meta_bytes);
+
+  // ── Get or grow workspace ──
+  int dev_idx = kv_cache.device().index();
+  Workspace& ws = get_workspace(dev_idx);
+  {
+    std::lock_guard<std::mutex> lk(ws.mu);
+    if (ws.capacity < total_bytes) {
+      size_t alloc_bytes = total_bytes + total_bytes / 2;
+      ws.buf = torch::empty({(int64_t)alloc_bytes},
+                  torch::device(kv_cache.device()).dtype(torch::kUInt8));
+      ws.capacity = alloc_bytes;
+    }
+  }
+
+  uint8_t* base = (uint8_t*)ws.buf.data_ptr();
+  float*   pState     = (float*)(base);
+  float*   pMax       = (float*)(base + (size_t)batches * headQk * hiddenDimP * sizeof(float));
+  uint8_t* tmpOut     = base + off_tmp_out;
+  float*   expSums    = (float*)(base + off_exp_sums);
+  float*   maxLogitsP = (float*)(base + off_max_logits);
+
+  page_attention_splitk_forward(
+    (uint8_t*)query.data_ptr(),
+    (uint8_t*)kv_cache.data_ptr(),
+    (uint32_t*)block_table.data_ptr(),
+    (uint32_t*)seq_lens.data_ptr(),
+    (uint8_t*)out.data_ptr(),
+    pState, pMax,
+    tmpOut, expSums, maxLogitsP,
+    batches, headQk, headV, headDim,
+    kvCacheStride0, kvCacheStride1,
+    pageTableBatchStride, pageTableSizeLog2,
+    hiddenDimP, hiddenDimPMax, maxSeqLen,
+    numParts,
+    kv_cache.device()
+  );
+}
+
+// ── torch library registration ────────────────────────────────────────
+
+TORCH_LIBRARY_FRAGMENT(page_attn_splitk_ops, m) {
+  m.def("page_attn_decode_splitk("
+        "Tensor query, Tensor kv_cache, Tensor block_table, Tensor seq_lens, "
+        "Tensor! out, int max_query_len, int max_seq_len, int num_partitions"
+        ") -> ()");
+}
+
+TORCH_LIBRARY_IMPL(page_attn_splitk_ops, XPU, m) {
+  m.impl("page_attn_decode_splitk", &page_attn_decode_splitk);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("page_attn_decode_splitk", &page_attn_decode_splitk,
+        "Split-K paged attention decode");
+}
