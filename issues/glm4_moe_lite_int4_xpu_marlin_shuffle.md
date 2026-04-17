@@ -470,8 +470,11 @@ dispatch `EXPERTS_PER_CHUNK` experts per CUTLASS call (default 8, matching the
 
 The implementation:
 
-1. **Weight prep** (`process_weights_after_loading`): GPTQ int32 → uint8 →
-   `implement_zp()` on CPU. No marlin shuffle. No IPEX import needed.
+1. **Weight prep** (`process_weights_after_loading`): GPTQ int32
+   `[E, K/8, N]` → unpack to `[E, K, N]` int8 → **transpose K↔N to
+   `[E, N, K]`** → repack pairs into uint8 `[E, N, K/2]` → apply
+   `implement_zp()` (u4 → sign-magnitude s4). All on CPU. No marlin
+   shuffle. No IPEX import.
 2. **Routing** (`apply`): Standard PyTorch `topk` + `softmax`. No IPEX
    `topk_softmax` / `moe_scatter` / `moe_gather` ops.
 3. **Compute** (`apply`): Group active experts into chunks of 8, run one
@@ -485,9 +488,37 @@ On B580 (20 Xe-cores) set to ~16-20 for better throughput.
 
 This completely eliminates the IPEX dependency for INT4 MoE inference.
 
-**Status: NEEDS END-TO-END TESTING** — The chunked CUTLASS dispatch is
-implemented in the patch. Individual CUTLASS GEMMs with 8 experts work on
-Lunar Lake. Full vLLM server test with a real model not yet confirmed.
+**Format root cause (fixed 2026-04-17)**: The initial implementation of
+`_gptq_int32_to_uint8` was missing the K↔N transpose. GPTQ stores weights
+K-major (`[E, K/8, N]`), but CUTLASS grouped GEMM requires N-major
+(`[E, N, K/2]` — see docstring in
+`vllm_xpu_kernels/fused_moe_interface.py:132-137`). The K-major output
+appeared to work with zero/random weights but crashed with DEVICE_LOST
+or produced garbage output with real model weights. The fix unpacks
+nibbles, transposes to `[E, N, K]`, then repacks consecutive K pairs into
+bytes (low = even-K, high = odd-K).
+
+#### Alternative backend: oneDNN `int4_gemm_w4a16`
+
+A secondary code path selectable via `VLLM_XPU_MOE_BACKEND=onednn` uses
+the oneDNN per-linear `torch.ops._xpu_C.int4_gemm_w4a16` kernel inside a
+sequential per-expert loop. Advantages:
+
+- Uses GPTQ's native `[K/8, N]` int32 layout — no uint8 conversion, no
+  shuffling, no `implement_zp`. Only needs K-contiguous strides (via
+  `transpose(0,1).contiguous().transpose(0,1)` trick) and scalar ZP=8.
+- Known-good kernel (already used for INT4 dense GEMM in vLLM).
+
+Disadvantages:
+
+- One kernel call per expert per gemm — slower than chunked CUTLASS.
+- Still limited to symmetric quantization (ZP=8). AutoRound sym=True OK.
+
+Use as a fallback when CUTLASS misbehaves on a specific model shape.
+
+**Status: NEEDS END-TO-END TESTING** — Both paths implemented in the
+patch. Individual CUTLASS GEMMs with 8 experts work on Lunar Lake. Full
+vLLM server test with a real model (post format-fix) not yet confirmed.
 
 #### Migration options (ranked)
 
