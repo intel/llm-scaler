@@ -3901,7 +3901,7 @@ index 475bd8536..0f548843c 100644
  
          import intel_extension_for_pytorch as ipex
  
-@@ -401,3 +567,223 @@ class XPUFp8MoEMethod(Fp8OnlineMoEMethod):
+@@ -401,3 +567,336 @@ class XPUFp8MoEMethod(Fp8OnlineMoEMethod):
              layer.num_expert_group,
              custom_routing_function=layer.custom_routing_function,
          )
@@ -4120,50 +4120,94 @@ index 475bd8536..0f548843c 100644
 +        return pack(hi_s, lo_s)
 +
 +    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-+        if self.quant_config.linear_quant_method == "gptq":
-+            # Convert GPTQ int32-packed weights to CUTLASS uint8 format.
-+            # GPTQ stores [E, K/8, N] int32 (K-major); CUTLASS grouped GEMM
-+            # requires [E, N, K/2] uint8 (N-major). The conversion below
-+            # unpacks, transposes K<->N, then repacks nibble pairs.
-+            # _implement_zp then converts uint4 -> signed int4 (sign-mag).
-+            # NOTE: assumes symmetric quantization (ZP=8). AutoRound with
-+            # sym=True satisfies this; asymmetric GPTQ models are not
-+            # supported by this path.
-+            # No marlin_shuffle needed — CUTLASS uses a different layout.
-+            # This completely bypasses IPEX GatedMLPMOE and its broken
-+            # moe_gemm path (Bug H / IPEX #838).
-+            device = layer.w13_qweight.device
-+            num_experts = layer.w13_qweight.shape[0]
-+
-+            # Convert int32 → uint8 on CPU (avoids XPU allocator pressure)
-+            w13_uint8 = self._gptq_int32_to_uint8(layer.w13_qweight.cpu())
-+            w2_uint8 = self._gptq_int32_to_uint8(layer.w2_qweight.cpu())
-+
-+            # Apply implement_zp (uint4 → signed int4) on CPU
-+            for i in range(num_experts):
-+                w13_uint8[i] = self._implement_zp(w13_uint8[i])
-+                w2_uint8[i] = self._implement_zp(w2_uint8[i])
-+
-+            # Free original int32 weights to reduce memory
-+            layer.w13_qweight.data = torch.empty(
-+                0, dtype=torch.int32, device=device)
-+            layer.w2_qweight.data = torch.empty(
-+                0, dtype=torch.int32, device=device)
-+            torch.xpu.empty_cache()
-+
-+            # Store CUTLASS-format weights as layer attributes
-+            layer.cutlass_w13 = w13_uint8.contiguous().to(device)
-+            layer.cutlass_w2 = w2_uint8.contiguous().to(device)
-+            # Scales: CUTLASS expects [E, N, K//group_size]
-+            layer.cutlass_s13 = layer.w13_scales.permute(
-+                0, 2, 1).contiguous()
-+            layer.cutlass_s2 = layer.w2_scales.permute(
-+                0, 2, 1).contiguous()
-+        else:
++        if self.quant_config.linear_quant_method != "gptq":
 +            raise NotImplementedError(
 +                f"Unsupported quant method "
 +                f"{self.quant_config.linear_quant_method} for XPU MOE."
 +            )
++        # Backend selector: "cutlass" (default) or "onednn".
++        # Both bypass IPEX GatedMLPMOE (Bug H / IPEX #838).
++        if self.MOE_BACKEND == "onednn":
++            return self._prep_onednn(layer)
++        # --- CUTLASS path ---
++        # Convert GPTQ int32-packed weights to CUTLASS uint8 format.
++        # GPTQ stores [E, K/8, N] int32 (K-major); CUTLASS grouped GEMM
++        # requires [E, N, K/2] uint8 (N-major). The conversion below
++        # unpacks, transposes K<->N, then repacks nibble pairs.
++        # _implement_zp then converts uint4 -> signed int4 (sign-mag).
++        # NOTE: assumes symmetric quantization (ZP=8). AutoRound with
++        # sym=True satisfies this; asymmetric GPTQ models are not
++        # supported by this path.
++        device = layer.w13_qweight.device
++        num_experts = layer.w13_qweight.shape[0]
++
++        # Convert int32 → uint8 on CPU (avoids XPU allocator pressure)
++        w13_uint8 = self._gptq_int32_to_uint8(layer.w13_qweight.cpu())
++        w2_uint8 = self._gptq_int32_to_uint8(layer.w2_qweight.cpu())
++
++        # Apply implement_zp (uint4 → signed int4) on CPU
++        for i in range(num_experts):
++            w13_uint8[i] = self._implement_zp(w13_uint8[i])
++            w2_uint8[i] = self._implement_zp(w2_uint8[i])
++
++        # Free original int32 weights to reduce memory
++        layer.w13_qweight.data = torch.empty(
++            0, dtype=torch.int32, device=device)
++        layer.w2_qweight.data = torch.empty(
++            0, dtype=torch.int32, device=device)
++        torch.xpu.empty_cache()
++
++        # Store CUTLASS-format weights as layer attributes
++        layer.cutlass_w13 = w13_uint8.contiguous().to(device)
++        layer.cutlass_w2 = w2_uint8.contiguous().to(device)
++        # Scales: CUTLASS expects [E, N, K//group_size]
++        layer.cutlass_s13 = layer.w13_scales.permute(0, 2, 1).contiguous()
++        layer.cutlass_s2 = layer.w2_scales.permute(0, 2, 1).contiguous()
++
++    def _prep_onednn(self, layer: torch.nn.Module) -> None:
++        """Prepare GPTQ weights for oneDNN int4_gemm_w4a16.
++
++        oneDNN expects weights K-contiguous in their original GPTQ shape
++        [K/8, N] int32. The transpose(0,1).contiguous().transpose(0,1)
++        trick produces K-contiguous strides without changing the shape.
++        No uint8 conversion, no shuffling, no implement_zp. For symmetric
++        GPTQ (AutoRound sym=True) the zero-point is a scalar 8.
++        """
++        device = layer.w13_qweight.device
++        num_experts = layer.w13_qweight.shape[0]
++        w13_list, w2_list = [], []
++        s13_list, s2_list = [], []
++        for e in range(num_experts):
++            w13_e = layer.w13_qweight[e].cpu()
++            w2_e = layer.w2_qweight[e].cpu()
++            w13_list.append(
++                w13_e.transpose(0, 1).contiguous().transpose(0, 1))
++            w2_list.append(
++                w2_e.transpose(0, 1).contiguous().transpose(0, 1))
++            s13_list.append(layer.w13_scales[e].cpu().contiguous())
++            s2_list.append(layer.w2_scales[e].cpu().contiguous())
++        # Free original tensors
++        layer.w13_qweight.data = torch.empty(
++            0, dtype=torch.int32, device=device)
++        layer.w2_qweight.data = torch.empty(
++            0, dtype=torch.int32, device=device)
++        torch.xpu.empty_cache()
++        layer.int4_w13 = [w.to(device) for w in w13_list]
++        layer.int4_w2 = [w.to(device) for w in w2_list]
++        layer.int4_s13 = [s.to(device) for s in s13_list]
++        layer.int4_s2 = [s.to(device) for s in s2_list]
++        # Symmetric GPTQ: scalar zero-point = 8
++        layer.int4_zp = torch.tensor(
++            [8], dtype=torch.int8, device=device)
++        layer.int4_num_experts = num_experts
++        layer.int4_group_size = self.quant_config.group_size
++
++    # Backend selector: "cutlass" (default) or "onednn".
++    # - cutlass: grouped GEMM with chunked dispatch (fast, requires weight
++    #   conversion to [E, N, K/2] uint8).
++    # - onednn:  per-expert int4_gemm_w4a16 via torch_ipex (slower but uses
++    #   GPTQ's native int32 layout, no weight conversion).
++    MOE_BACKEND = os.environ.get("VLLM_XPU_MOE_BACKEND", "cutlass").lower()
 +
 +    # Max experts per CUTLASS grouped GEMM dispatch. Matches the 8 Xe-cores
 +    # on Lunar Lake Arc 140V — one expert group per Xe-core. Dispatching
@@ -4225,6 +4269,8 @@ index 475bd8536..0f548843c 100644
 +        x: torch.Tensor,
 +        router_logits: torch.Tensor,
 +    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++        if self.MOE_BACKEND == "onednn":
++            return self._apply_onednn(layer, x, router_logits)
 +        # CUTLASS chunked expert dispatch — bypasses IPEX GatedMLPMOE.
 +        # Processes EXPERTS_PER_CHUNK experts at a time (default 8,
 +        # matching Lunar Lake's 8 Xe-cores) to avoid DEVICE_LOST from
@@ -4295,6 +4341,73 @@ index 475bd8536..0f548843c 100644
 +            for eid, g2_out in g2_results.items():
 +                tok_idx, weights = expert_meta[eid]
 +                output[tok_idx] += weights.unsqueeze(1) * g2_out
++
++        return output
++
++    def _apply_onednn(
++        self,
++        layer: FusedMoE,
++        x: torch.Tensor,
++        router_logits: torch.Tensor,
++    ) -> torch.Tensor:
++        """Sequential per-expert MoE using oneDNN int4_gemm_w4a16.
++
++        Uses the native GPTQ int32 layout (no CUTLASS conversion). One
++        kernel call per expert per gemm — slower than the chunked CUTLASS
++        path but known-good on oneDNN. Useful as a fallback when the
++        CUTLASS path has issues on a given model/shape.
++        """
++        num_tokens, hidden_dim = x.shape
++        top_k = layer.top_k
++        num_experts = layer.int4_num_experts
++        group_size = layer.int4_group_size
++        zp = layer.int4_zp
++        inter_size = layer.int4_w13[0].shape[1] // 2  # W13: [K//8, 2N]
++
++        topk_weights, topk_ids = torch.topk(
++            router_logits.float(), k=top_k, dim=-1)
++        topk_weights = torch.softmax(topk_weights, dim=-1)
++        if layer.renormalize:
++            topk_weights = topk_weights / topk_weights.sum(
++                dim=-1, keepdim=True)
++
++        output = torch.zeros(num_tokens, hidden_dim,
++                             dtype=x.dtype, device=x.device)
++
++        for expert_id in range(num_experts):
++            mask = (topk_ids == expert_id)
++            if not mask.any():
++                continue
++            token_indices, slot_indices = mask.nonzero(as_tuple=True)
++            expert_weights = topk_weights[token_indices, slot_indices]
++            expert_input = x[token_indices]
++
++            # GEMM1: [n, hidden] -> [n, 2*inter]
++            g1_out = torch.ops._xpu_C.int4_gemm_w4a16(
++                expert_input,
++                layer.int4_w13[expert_id],
++                None,  # bias
++                layer.int4_s13[expert_id],
++                zp,
++                group_size,
++                None,  # g_idx
++            )
++
++            activated = (torch.nn.functional.silu(g1_out[:, :inter_size])
++                         * g1_out[:, inter_size:])
++
++            # GEMM2: [n, inter] -> [n, hidden]
++            g2_out = torch.ops._xpu_C.int4_gemm_w4a16(
++                activated.contiguous(),
++                layer.int4_w2[expert_id],
++                None,
++                layer.int4_s2[expert_id],
++                zp,
++                group_size,
++                None,
++            )
++
++            output[token_indices] += expert_weights.unsqueeze(1) * g2_out
 +
 +        return output
 diff --git a/vllm/model_executor/layers/quantization/sym_int4.py b/vllm/model_executor/layers/quantization/sym_int4.py
