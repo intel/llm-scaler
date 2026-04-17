@@ -23,9 +23,9 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1(
   constexpr uint32_t headDim = 256;
   constexpr uint32_t maxPGroupOut = 128;
   constexpr uint32_t outputPerGroup = 64;
-  uint32_t slmSize = (4 * maxPGroupOut * 4 * sizeof(float));
   constexpr uint32_t loopCount = outputPerGroup / 16;
-  __ESIMD_NS::slm_init<4 * 128 * 4 * sizeof(float)>();
+  constexpr uint32_t slmSizePhase1 = 4 * maxPGroupOut * 4 * sizeof(float);
+  __ESIMD_NS::slm_init<slmSizePhase1>();
   int localLinearId = ndi.get_local_id(0);
   int globalLinearId0 = ndi.get_group(0); // [0, kvHead * gqaRatio/4)
   int globalLinearId1 = ndi.get_group(1); // [0, keSeqLen / 64)

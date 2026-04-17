@@ -304,7 +304,7 @@ void page_attn_decode(
   TORCH_CHECK(block_table.dim() == 2);
   TORCH_CHECK(seq_lens.dim() == 1);
   TORCH_CHECK(kv_cache.dim() == 5);
-  TORCH_CHECK(query.dim() == 3, "query must be [num_tokens, num_q_heads, head_dim]");
+  TORCH_CHECK(query.dim() == 3, "query must be [batches, num_q_heads, head_dim]");
   TORCH_CHECK(query.scalar_type() == torch::kHalf);
   TORCH_CHECK(kv_cache.scalar_type() == torch::kHalf);
   TORCH_CHECK(out.scalar_type() == torch::kHalf);
@@ -319,6 +319,7 @@ void page_attn_decode(
   uint32_t batches = seq_lens.size(0);
   // Derive headQk from query tensor shape instead of hardcoding gqaRatio=4
   uint32_t headQk = query.size(1);
+  TORCH_CHECK(headV > 0, "num_kv_heads must be positive");
   uint32_t gqaRatio = headQk / headV;
   TORCH_CHECK(gqaRatio * headV == headQk, "num_q_heads must be a multiple of num_kv_heads");
   TORCH_CHECK(gqaRatio >= 4 && gqaRatio % 4 == 0, "gqaRatio must be a multiple of 4, got ", gqaRatio);
