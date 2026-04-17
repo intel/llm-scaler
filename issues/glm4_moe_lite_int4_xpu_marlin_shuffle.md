@@ -488,58 +488,87 @@ On B580 (20 Xe-cores) set to ~16-20 for better throughput.
 
 This completely eliminates the IPEX dependency for INT4 MoE inference.
 
-**Format root cause (fixed 2026-04-17)**: The initial implementation of
-`_gptq_int32_to_uint8` was missing the K↔N transpose. GPTQ stores weights
-K-major (`[E, K/8, N]`), but CUTLASS grouped GEMM requires N-major
-(`[E, N, K/2]` — see docstring in
-`vllm_xpu_kernels/fused_moe_interface.py:132-137`). The K-major output
-appeared to work with zero/random weights but crashed with DEVICE_LOST
-or produced garbage output with real model weights. The fix unpacks
-nibbles, transposes to `[E, N, K]`, then repacks consecutive K pairs into
-bytes (low = even-K, high = odd-K).
+**Format root cause (discovered 2026-04-17)**: CUTLASS
+`cutlass_grouped_gemm_interface(is_B_int4=True)` is **NOT a real INT4
+kernel**. Despite the `is_B_int4` parameter name, it treats nibbles as
+**FP4 E2M1** (microscaling format with 2 exponent bits + 1 mantissa bit):
 
-#### Alternative backend: oneDNN `int4_gemm_w4a16`
+| Nibble (unsigned) | INT4 dequant: `(n-8)*s` | FP4 E2M1 decode |
+|:-:|:-:|:-:|
+| 0 | -8 × scale | +0.0 |
+| 1 | -7 × scale | +0.5 |
+| 7 | -1 × scale | +3.0 |
+| 8 | 0 × scale | -0.0 |
+| 14 | +6 × scale | -3.0 |
+| **15** | +7 × scale | **NaN** |
 
-A secondary code path selectable via `VLLM_XPU_MOE_BACKEND=onednn` uses
-the oneDNN per-linear `torch.ops._xpu_C.int4_gemm_w4a16` kernel inside a
-sequential per-expert loop. Advantages:
+This means the entire `implement_zp()` → sign-magnitude conversion pipeline
+was mapping GPTQ nibbles into FP4 E2M1 values that are exponentially wrong.
+Value 15 (which is a valid GPTQ nibble) maps to NaN. The CUTLASS INT4 path
+produces garbage output with real model weights by design.
 
-- Uses GPTQ's native `[K/8, N]` int32 layout — no uint8 conversion, no
-  shuffling, no `implement_zp`. Only needs K-contiguous strides (via
-  `transpose(0,1).contiguous().transpose(0,1)` trick) and scalar ZP=8.
-- Known-good kernel (already used for INT4 dense GEMM in vLLM).
+#### Correct kernel: oneDNN `int4_gemm_w4a16`
 
-Disadvantages:
+The correct kernel for GPTQ INT4 on XPU is `torch.ops._xpu_C.int4_gemm_w4a16`.
+This is a oneDNN-backed kernel that reads GPTQ int32-packed weights natively
+and does proper `(unsigned_nibble - zp) * scale` dequantization during the
+GEMM compute. No preprocessing needed — no `implement_zp`, no nibble repack,
+no transpose.
 
-- One kernel call per expert per gemm — slower than chunked CUTLASS.
-- Still limited to symmetric quantization (ZP=8). AutoRound sym=True OK.
+| | `int4_gemm_w4a16` (oneDNN) | `cutlass_grouped_gemm_interface` |
+|---|---|---|
+| Backend | oneDNN | CUTLASS/SYCL-TLA |
+| Weight format | GPTQ int32 (native) | uint8 + implement_zp (FP4-like) |
+| Dequant | `(nibble - zp) * scale` internally | FP4 E2M1 decode (NOT real INT4) |
+| Zero point | Explicit `B_zp` parameter | Baked into implement_zp |
+| Layout | `[K//8, N]` K-contiguous strides | `[E, N, K//2]` |
+| Batching | Single expert per call | Grouped (multi-expert) |
+| Works on Xe2 | Yes (sequential) | Crashes at 50+ experts |
 
-Use as a fallback when CUTLASS misbehaves on a specific model shape.
+The implementation (now the default `VLLM_XPU_MOE_BACKEND=onednn`):
 
-**Status: NEEDS END-TO-END TESTING** — Both paths implemented in the
-patch. Individual CUTLASS GEMMs with 8 experts work on Lunar Lake. Full
-vLLM server test with a real model (post format-fix) not yet confirmed.
+1. **Weight prep** (`_prep_onednn`): Make each expert's weight K-contiguous
+   via `transpose(0,1).contiguous().transpose(0,1)` trick (oneDNN requires
+   K-contiguous strides). Scales stay as-is. Scalar ZP=8 for symmetric GPTQ.
+2. **Routing**: Standard PyTorch `topk` + `softmax`.
+3. **Compute** (`_apply_onednn`): Loop over active experts, one
+   `int4_gemm_w4a16` call per expert per gemm (gate_up + down = 2 calls).
+4. **Accumulate**: Weighted sum of per-expert outputs.
+
+Throughput bottleneck: ~50 active experts × 2 gemms × 48 layers ≈ 4800 kernel
+calls per token batch. Each call has Python overhead + SYCL enqueue overhead.
+Profiling is needed to determine if Python dispatch or kernel execution
+dominates. Possible optimizations:
+
+- Reduce Python loop overhead (torch.compile, Triton on XPU)
+- Batch tokens per expert (already done — all tokens for same expert in
+  one call)
+- Future: oneDNN grouped/batched INT4 kernel (would eliminate per-expert loop)
+
+**Status: NEEDS END-TO-END TESTING** — The oneDNN path is implemented and
+produces correct dequantization. Full vLLM server test with a real INT4
+MoE model needed to verify coherent output and measure throughput.
 
 #### Migration options (ranked)
 
-1. **CUTLASS chunked expert dispatch on vLLM v0.14** (implemented, needs testing)
-   — Patch `XPUGPTQMarlinMoEMethod` to use CUTLASS grouped GEMM in chunks
-   of 8 experts (matching 8 Xe-cores) instead of IPEX batched `moe_gemm`.
-   No marlin shuffle, no IPEX dependency for MoE. Uses vllm-xpu-kernels
-   v0.1.4 already installed. Configurable via `VLLM_XPU_MOE_CHUNK_SIZE`.
-   See patch in `vllm_for_multi_arc.patch`. **NEEDS END-TO-END TESTING.**
+1. **oneDNN `int4_gemm_w4a16` sequential expert dispatch** (implemented, needs testing)
+   — Patch `XPUGPTQMarlinMoEMethod` to use per-expert oneDNN INT4 GEMM.
+   Reads native GPTQ int32 weights, proper INT4 dequantization. No IPEX
+   dependency. Default via `VLLM_XPU_MOE_BACKEND=onednn`. Slower than
+   batched approaches but correct. See `vllm_for_multi_arc.patch`.
+   **NEEDS END-TO-END TESTING.**
 
 2. **Use MXFP4 models** — works on Lunar Lake now (GPT-OSS-20B, 36 experts).
    Limited model selection but fully proven.
 
 3. **Use llama.cpp GGUF** — own SYCL kernels, no GatedMLPMOE dependency.
    Works for GLM-4.7-Flash-Q4_K_M.gguf today. Sequential expert loop
-   (same strategy as our CUTLASS approach).
+   (same strategy as our oneDNN approach).
 
 4. **Wait for upstream vLLM v0.19+ INT4 MoE** — Intel is working on it
    (RFC #33214 tracks it as "Planned"). INT4 dense GEMM ([#33662](https://github.com/vllm-project/vllm/pull/33662))
-   is the prerequisite and is under review. When landed, batched grouped
-   GEMM may still crash on Xe2 iGPU — may need the sequential workaround.
+   is the prerequisite and is under review. When landed, a grouped oneDNN
+   INT4 kernel would eliminate the per-expert loop overhead.
 
 #### Why vLLM v0.14 + IPEX is a dead end
 

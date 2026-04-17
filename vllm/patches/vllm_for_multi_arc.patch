@@ -4202,12 +4202,14 @@ index 475bd8536..0f548843c 100644
 +        layer.int4_num_experts = num_experts
 +        layer.int4_group_size = self.quant_config.group_size
 +
-+    # Backend selector: "cutlass" (default) or "onednn".
-+    # - cutlass: grouped GEMM with chunked dispatch (fast, requires weight
-+    #   conversion to [E, N, K/2] uint8).
-+    # - onednn:  per-expert int4_gemm_w4a16 via torch_ipex (slower but uses
-+    #   GPTQ's native int32 layout, no weight conversion).
-+    MOE_BACKEND = os.environ.get("VLLM_XPU_MOE_BACKEND", "cutlass").lower()
++    # Backend selector: "onednn" (default) or "cutlass".
++    # - onednn:  per-expert int4_gemm_w4a16 — reads native GPTQ int32 and
++    #   does proper (nibble - zp) * scale dequantization. Correct for INT4.
++    # - cutlass: BROKEN for INT4. cutlass_grouped_gemm_interface(is_B_int4)
++    #   actually treats nibbles as FP4 E2M1 (microscaling format), NOT as
++    #   integer 4-bit. Value 15 → NaN, other values exponentially wrong.
++    #   Kept only for reference/debugging — do NOT use for production.
++    MOE_BACKEND = os.environ.get("VLLM_XPU_MOE_BACKEND", "onednn").lower()
 +
 +    # Max experts per CUTLASS grouped GEMM dispatch. Matches the 8 Xe-cores
 +    # on Lunar Lake Arc 140V — one expert group per Xe-core. Dispatching
