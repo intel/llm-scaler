@@ -861,3 +861,26 @@ Optimization paths:
 | Routing | Python topk + manual scatter/gather | ✓ |
 | Attention dtype | Cast k/v + skip eagle_ops for BF16 | ✓ |
 | Profile/warmup | Skip both on XPU | ✓ |
+
+### Performance optimization (2026-04-17)
+
+Optimized `apply()` method — 7.7x speedup:
+
+| Change | Before | After |
+|--------|--------|-------|
+| Expert discovery | Loop all 128, check `.any()` | `.unique()` on active only |
+| Accumulation | `output[idx] += w * g2` | `index_add_()` in-place |
+| Python overhead/layer | ~128ms | ~17ms |
+| **Generation throughput** | **0.16 tok/s** | **0.9 tok/s** |
+| **30 tokens** | **315s** | **41s** |
+
+### Kernel benchmarks (Xe2 iGPU, K=2048, N=768)
+
+| Kernel | M=1 | M=4 | Notes |
+|--------|-----|-----|-------|
+| `int4_gemm_w4a16` (oneDNN) | 33μs | 28μs | Our path — fastest |
+| `cutlass_grouped_gemm` (FP4) | 72μs | 45μs | Wrong format for INT4 |
+| `torch.mm` BF16 | 1209μs | 62μs | Reference |
+
+Theoretical max: 30μs × 50 experts × 2 GEMMs × 48 layers = 144ms/token = ~7 tok/s.
+Current: ~1.1s/token = 0.9 tok/s. Python overhead is ~88% of total time.

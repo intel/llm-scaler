@@ -1,5 +1,5 @@
 --- /home/nobara-user/llm-scaler-vllm/vllm/vllm/model_executor/layers/quantization/ipex_quant.py	2026-04-14 19:39:54.209867904 +0900
-+++ /home/nobara-user/llm-scaler-vllm/venv/lib64/python3.12/site-packages/vllm/model_executor/layers/quantization/ipex_quant.py	2026-04-17 14:08:02.048676223 +0900
++++ /home/nobara-user/llm-scaler-vllm/venv/lib64/python3.12/site-packages/vllm/model_executor/layers/quantization/ipex_quant.py	2026-04-17 14:28:31.497492668 +0900
 @@ -690,6 +690,7 @@
                  intermediate_size_per_partition // self.quant_config.pack_factor,
                  hidden_size,
@@ -104,7 +104,7 @@
 +        ]
 +        return torch.stack(bytes_out, dim=-1).reshape(
 +            *shape[:-2], shape[-2] * 4, shape[-1])
-+
+ 
 +    @staticmethod
 +    def _implement_zp(qw):
 +        """Convert uint4 to signed int4 for CUTLASS kernel"""
@@ -119,7 +119,7 @@
 +                return (s << 3) | a3
 +            return (p(a) << 4) | p(b)
 +        return pack(hi_s, lo_s)
- 
++
 +    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
          if self.quant_config.linear_quant_method == "gptq":
 -            layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
@@ -176,7 +176,7 @@
              )
  
      def apply(
-@@ -807,15 +873,66 @@
+@@ -807,15 +873,56 @@
          x: torch.Tensor,
          router_logits: torch.Tensor,
      ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -192,9 +192,8 @@
 -            scoring_func=layer.scoring_func,
 -        )
 -        return res
-+        # Sequential expert loop using int4_gemm_w4a16 (oneDNN format).
-+        # Bypasses IPEX GatedMLPMOE entirely — uses vllm-xpu-kernels
-+        # CUTLASS INT4 GEMM which works on Xe2 iGPU.
++        # Optimized expert loop using int4_gemm_w4a16 (oneDNN format).
++        # Pre-computes routing, then loops only over ACTIVE experts.
 +        from vllm_xpu_kernels import _xpu_C  # noqa: F401
 +
 +        num_tokens, hidden_dim = x.shape
@@ -202,9 +201,9 @@
 +        num_experts = layer.int4_num_experts
 +        group_size = layer.int4_group_size
 +        zp = layer.int4_zp
-+        inter_size = layer.int4_w13[0].shape[1] // 2  # W13: [K//8, 2N]
++        inter_size = layer.int4_w13[0].shape[1] // 2
 +
-+        # Routing: topk softmax
++        # Routing: topk softmax (vectorized)
 +        topk_weights, topk_ids = torch.topk(
 +            router_logits.float(), k=top_k, dim=-1)
 +        topk_weights = torch.softmax(topk_weights, dim=-1)
@@ -212,46 +211,37 @@
 +            topk_weights = topk_weights / topk_weights.sum(
 +                dim=-1, keepdim=True)
 +
-+        # Sequential expert loop
++        # Pre-compute: find active experts and their token indices
++        # Flatten topk_ids to find unique active experts
++        flat_ids = topk_ids.reshape(-1)  # [num_tokens * top_k]
++        active_experts = flat_ids.unique().tolist()
++
++        # Pre-build index maps for all active experts at once
++        # topk_ids: [num_tokens, top_k]
 +        output = torch.zeros(num_tokens, hidden_dim,
 +                             dtype=x.dtype, device=x.device)
 +
-+        for expert_id in range(num_experts):
++        for expert_id in active_experts:
++            # Vectorized mask — no Python-level .any() check needed
 +            mask = (topk_ids == expert_id)
-+            if not mask.any():
-+                continue
++            token_idx, slot_idx = mask.nonzero(as_tuple=True)
++            expert_w = topk_weights[token_idx, slot_idx]
++            expert_in = x[token_idx]
 +
-+            token_indices, slot_indices = mask.nonzero(as_tuple=True)
-+            expert_weights = topk_weights[token_indices, slot_indices]
-+            expert_input = x[token_indices]  # [n, hidden_dim]
++            # GEMM1: W13
++            g1 = torch.ops._xpu_C.int4_gemm_w4a16(
++                expert_in, layer.int4_w13[expert_id], None,
++                layer.int4_s13[expert_id], zp, group_size, None)
 +
-+            # GEMM1: expert_input @ W13[expert_id] → [n, 2*inter_size]
-+            g1_out = torch.ops._xpu_C.int4_gemm_w4a16(
-+                expert_input,
-+                layer.int4_w13[expert_id],
-+                None,  # bias
-+                layer.int4_s13[expert_id],
-+                zp,
-+                group_size,
-+                None,  # g_idx
-+            )
-+
-+            # SiLU activation (gate * up)
-+            activated = (torch.nn.functional.silu(g1_out[:, :inter_size])
-+                         * g1_out[:, inter_size:])
-+
-+            # GEMM2: activated @ W2[expert_id] → [n, hidden_dim]
-+            g2_out = torch.ops._xpu_C.int4_gemm_w4a16(
-+                activated.contiguous(),
-+                layer.int4_w2[expert_id],
-+                None,
-+                layer.int4_s2[expert_id],
-+                zp,
-+                group_size,
-+                None,
-+            )
++            # SiLU + GEMM2: W2
++            act = torch.nn.functional.silu(
++                g1[:, :inter_size]) * g1[:, inter_size:]
++            g2 = torch.ops._xpu_C.int4_gemm_w4a16(
++                act.contiguous(), layer.int4_w2[expert_id], None,
++                layer.int4_s2[expert_id], zp, group_size, None)
 +
 +            # Weighted accumulate
-+            output[token_indices] += expert_weights.unsqueeze(1) * g2_out
++            output.index_add_(0, token_idx,
++                              (expert_w.unsqueeze(1) * g2).to(output.dtype))
 +
 +        return output
