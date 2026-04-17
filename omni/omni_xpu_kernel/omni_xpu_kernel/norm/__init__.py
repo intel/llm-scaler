@@ -113,8 +113,33 @@ def fused_add_rms_norm(
     _get_native().fused_add_rms_norm(input, residual, weight, eps)
 
 
+def fused_rms_norm_linear(
+    input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    proj_weight: torch.Tensor,
+    eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    Fused RMSNorm + Linear projection in single C++ call.
+
+    Equivalent to: F.linear(rms_norm(norm_weight, input, eps), proj_weight)
+    But avoids Python roundtrip and keeps normalized data warm in L3 cache.
+
+    Args:
+        input: [M, K] activation tensor
+        norm_weight: [K] RMSNorm weight
+        proj_weight: [N, K] linear projection weight
+        eps: RMSNorm epsilon
+
+    Returns:
+        [M, N] projected output
+    """
+    return _get_native().fused_rms_norm_linear(input, norm_weight, proj_weight, eps)
+
+
 __all__ = [
     "rms_norm",
     "layer_norm",
     "fused_add_rms_norm",
+    "fused_rms_norm_linear",
 ]

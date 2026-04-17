@@ -1,0 +1,380 @@
+// ============================================================================
+// SDP (Scaled Dot-Product Attention) - ESIMD Flash Attention via lgrf sidecar
+// ============================================================================
+// Loads the pre-compiled ESIMD Flash Attention kernel from a sidecar shared
+// library (lgrf_sdp.so / lgrf_sdp.pyd) built with doubleGRF for Xe2 ISA.
+//
+// The sidecar exports C functions:
+//   sdp_fp16       — FP16 optimized Flash Attention (HD=128)
+//   sdp_bf16io     — BF16 I/O hybrid (HD=128)
+//   sdp_fp16_fast  — FP16 no-clamp variant (HD=128, small V values)
+//   sdp_fp16_hd64  — FP16 Flash Attention (HD=64)
+//   sdp_bf16io_hd64 — BF16 I/O hybrid (HD=64)
+//
+// Input layout: [B, L, H, D] contiguous, B==1, D in {64, 128}
+// ============================================================================
+
+#include <atomic>
+#include <filesystem>
+#include <mutex>
+#include <tuple>
+#include <string>
+#include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+#include <torch/extension.h>
+
+#include "utils.h"
+
+namespace omni_xpu {
+namespace sdp {
+
+using ST = torch::ScalarType;
+
+namespace {
+
+using sdp_kernel_fn = void (*)(
+    void* Q,
+    void* K,
+    void* V,
+    void* normAlpha,
+    void* out,
+    int q_len,
+    int kv_len,
+    int headQ,
+    int headKv,
+    void* sycl_queue_ptr);
+
+struct KernelLibrary {
+#ifdef _WIN32
+    HMODULE handle{nullptr};
+#else
+    void* handle{nullptr};
+#endif
+    sdp_kernel_fn fp16{nullptr};
+    sdp_kernel_fn bf16io{nullptr};
+    sdp_kernel_fn fp16_fast{nullptr};   // no-clamp variant for small V
+    sdp_kernel_fn fp16_hd64{nullptr};
+    sdp_kernel_fn bf16io_hd64{nullptr};
+};
+
+KernelLibrary& get_kernel_library() {
+    static KernelLibrary library;
+    static std::once_flag load_once;
+    static std::string load_error;
+
+    std::call_once(load_once, []() {
+        namespace fs = std::filesystem;
+        fs::path package_dir;
+
+#ifdef _WIN32
+        HMODULE current_module = nullptr;
+        if (!GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(&get_kernel_library),
+                &current_module)) {
+            load_error = "failed to resolve the omni_xpu_kernel extension path while locating the lgrf sidecar";
+            return;
+        }
+
+        std::wstring path_buffer(MAX_PATH, L'\0');
+        const DWORD path_length = GetModuleFileNameW(current_module, path_buffer.data(), static_cast<DWORD>(path_buffer.size()));
+        if (path_length == 0) {
+            load_error = "failed to read the omni_xpu_kernel extension path while locating the lgrf sidecar";
+            return;
+        }
+
+        path_buffer.resize(path_length);
+        package_dir = fs::path(path_buffer).parent_path();
+        fs::path library_path = package_dir / "lgrf_uni" / "lgrf_sdp.pyd";
+        library.handle = LoadLibraryW(library_path.wstring().c_str());
+        if (library.handle == nullptr) {
+            load_error = "failed to load lgrf sidecar at " + library_path.string();
+            return;
+        }
+
+        library.fp16 = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_fp16"));
+        library.bf16io = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_bf16io"));
+#else
+        Dl_info current_module_info;
+        if (dladdr(reinterpret_cast<void*>(&get_kernel_library), &current_module_info) == 0 || current_module_info.dli_fname == nullptr) {
+            load_error = "failed to resolve the omni_xpu_kernel extension path while locating the lgrf sidecar";
+            return;
+        }
+
+        package_dir = fs::path(current_module_info.dli_fname).parent_path();
+        fs::path library_dir = package_dir / "lgrf_uni";
+        TORCH_CHECK(fs::exists(library_dir), "missing lgrf sidecar directory: ", library_dir.string());
+
+        fs::path library_path;
+        for (const auto& entry : fs::directory_iterator(library_dir)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+
+            const auto name = entry.path().filename().string();
+            if (name.rfind("lgrf_sdp", 0) == 0 && entry.path().extension() == ".so") {
+                library_path = entry.path();
+                break;
+            }
+        }
+
+        if (!fs::exists(library_path)) {
+            load_error = "missing lgrf sidecar artifact under " + library_dir.string();
+            return;
+        }
+
+        library.handle = dlopen(library_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (library.handle == nullptr) {
+            load_error = std::string("failed to load lgrf sidecar at ") + library_path.string() + ": " + dlerror();
+            return;
+        }
+
+        library.fp16 = reinterpret_cast<sdp_kernel_fn>(dlsym(library.handle, "sdp_fp16"));
+        library.bf16io = reinterpret_cast<sdp_kernel_fn>(dlsym(library.handle, "sdp_bf16io"));
+        library.fp16_fast = reinterpret_cast<sdp_kernel_fn>(dlsym(library.handle, "sdp_fp16_fast"));
+        library.fp16_hd64 = reinterpret_cast<sdp_kernel_fn>(dlsym(library.handle, "sdp_fp16_hd64"));
+        library.bf16io_hd64 = reinterpret_cast<sdp_kernel_fn>(dlsym(library.handle, "sdp_bf16io_hd64"));
+#endif
+
+        if (library.fp16 == nullptr || library.bf16io == nullptr) {
+            load_error = "failed to resolve sdp_fp16/sdp_bf16io from lgrf sidecar";
+        }
+    });
+
+    TORCH_CHECK(load_error.empty(), load_error);
+    return library;
+}
+
+torch::Tensor& norm_alpha_cache(const torch::Tensor& q) {
+    static std::mutex cache_mutex;
+    static torch::Tensor cached_norm_alpha;
+    static c10::Device cached_device{c10::DeviceType::CPU};
+    static int64_t cached_head_count = -1;
+    static int64_t cached_head_dim = -1;
+
+    const auto head_count = q.size(2);
+    const auto head_dim = q.size(3);
+
+    std::lock_guard<std::mutex> guard(cache_mutex);
+    if (!cached_norm_alpha.defined() || cached_head_count != head_count ||
+        cached_head_dim != head_dim || cached_device != q.device()) {
+        cached_norm_alpha = torch::ones({head_count * head_dim}, torch::dtype(torch::kFloat).device(q.device()));
+        cached_head_count = head_count;
+        cached_head_dim = head_dim;
+        cached_device = q.device();
+    }
+
+    return cached_norm_alpha;
+}
+}
+
+static void check_sdp_tensor(const torch::Tensor& t, const char* name) {
+    TORCH_CHECK(t.device().type() == c10::DeviceType::XPU, name, " must be on XPU");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(t.dim() == 4, name, " must be 4-D [B, L, H, D]");
+    TORCH_CHECK(t.size(0) == 1, name, " batch size must be 1");
+    TORCH_CHECK(t.size(3) == 64 || t.size(3) == 128, name, " head_dim must be 64 or 128");
+    TORCH_CHECK(
+        t.scalar_type() == ST::Half || t.scalar_type() == ST::BFloat16,
+        name,
+        " dtype must be FP16 or BF16"
+    );
+}
+
+torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
+    check_sdp_tensor(q, "q");
+    check_sdp_tensor(k, "k");
+    check_sdp_tensor(v, "v");
+
+    TORCH_CHECK(
+        q.scalar_type() == k.scalar_type() && q.scalar_type() == v.scalar_type(),
+        "q, k, v must have the same dtype"
+    );
+    TORCH_CHECK(k.size(1) == v.size(1), "k and v must have the same sequence length");
+    TORCH_CHECK(k.size(2) == v.size(2), "k and v must have the same head count");
+    TORCH_CHECK(q.size(2) == k.size(2), "q, k, v must have the same head count");
+    TORCH_CHECK(q.size(3) == k.size(3) && q.size(3) == v.size(3), "q, k, v must have the same head_dim");
+
+    // Pad kv_len to multiple of 16 if needed.
+    // The ESIMD kernel's 2D block loads read 16 rows at a time. When kv_len is
+    // not a multiple of 16, the hardware may return garbage (not zero) for
+    // out-of-bounds rows on some platforms (e.g., BMG/Xe2), causing NaN output.
+    // Padding K/V with zeros ensures all 2D loads access valid memory.
+    // Pad K/V seq_len to multiple of 16 if needed.
+    // The ESIMD kernel's 2D block loads read 16 rows at a time. When kv_len is
+    // not a multiple of 16, the hardware returns garbage (not zero) for
+    // out-of-bounds rows on BMG/Xe2, causing NaN output.
+    // Padding with zeros ensures all 2D loads access valid memory.
+    // The kernel receives ORIGINAL kv_len for softmax boundary masking, so the
+    // padded zero rows are correctly excluded from the attention computation.
+    const int64_t kv_len = k.size(1);
+    const int64_t kv_pad = (16 - kv_len % 16) % 16;
+    if (kv_pad > 0) {
+        auto k_new = torch::zeros({k.size(0), kv_len + kv_pad, k.size(2), k.size(3)}, k.options());
+        k_new.narrow(1, 0, kv_len).copy_(k);
+        k = k_new;
+        auto v_new = torch::zeros({v.size(0), kv_len + kv_pad, v.size(2), v.size(3)}, v.options());
+        v_new.narrow(1, 0, kv_len).copy_(v);
+        v = v_new;
+    }
+
+    auto& kernels = get_kernel_library();
+    auto& norm_alpha = norm_alpha_cache(q);
+    const int64_t H = q.size(2);
+
+    // Adaptive V-scaling: only apply per-head V-scaling when V values are large
+    // enough to risk fp16 accumulator overflow in the ESIMD kernel's S×V DPAS.
+    //
+    // The kernel accumulates: sum_i(softmax_weight_i * V_i) in fp16.
+    // Worst case: all softmax weights concentrate on one V row → accumulator ≈ V_max.
+    // With multiple tiles: accumulator can reach V_max * compensation_factor.
+    // Safe threshold: max(|V|) < 256 (conservative, leaves 256x headroom to 65504).
+    //
+    // Fast path (V small): direct kernel call, no overhead.
+    // Safe path (V large): per-head V-scaling with exact normAlpha cancellation.
+    constexpr float V_SCALE_THRESHOLD = 256.0f;
+
+    // Adaptive V-scaling with cached v_scale to minimize per-call overhead.
+    //
+    // Profiling shows that abs().amax() + repeat_interleave account for ~50% of
+    // total SDP time when V-scaling is active. We cache v_scale and effective_alpha
+    // and only recompute on the first call and every RECHECK_INTERVAL calls.
+    // V division (v / v_scale) cannot be cached since V changes each call.
+    //
+    // Cache layout:
+    //   cached_v_scale: [H] fp32 — per-head scale factors
+    //   cached_v_scale_broadcast: [1, 1, H, 1] — broadcast-ready, in V's dtype
+    //   cached_effective_alpha: [H*128] fp32 — normAlpha * v_scale
+    static std::atomic<int> sdp_call_counter{0};
+    static std::atomic<bool> cached_needs_scaling{false};
+    static std::mutex cache_mutex;
+    static torch::Tensor cached_v_scale_broadcast;    // [1, 1, H, 1] in v.dtype
+    static torch::Tensor cached_effective_alpha;       // [H*128] fp32
+    static int64_t cached_H = -1;
+    static c10::ScalarType cached_dtype = c10::ScalarType::Undefined;
+    constexpr int RECHECK_INTERVAL = 500;
+
+    int call_num = sdp_call_counter.fetch_add(1);
+    bool needs_recheck = (call_num % RECHECK_INTERVAL == 0);
+
+    if (needs_recheck) {
+        float v_global_max = v.abs().max().item<float>();
+        bool needs = (v_global_max >= V_SCALE_THRESHOLD);
+        cached_needs_scaling.store(needs);
+        OMNI_DEBUG("sdp", "call #%d: V_max=%.1f threshold=%.0f needs_scaling=%d q=[%ld,%ld,%ld,%ld]",
+                   call_num, v_global_max, V_SCALE_THRESHOLD, (int)needs,
+                   q.size(0), q.size(1), q.size(2), q.size(3));
+
+        if (needs) {
+            std::lock_guard<std::mutex> guard(cache_mutex);
+            // Recompute per-head v_scale and cache everything
+            auto v_absmax = v.abs().amax(/*dim=*/{0, 1, 3});  // [H] per-head max
+            auto v_scale = (v_absmax.to(torch::kFloat) / 32.0f).clamp_min(1.0f);  // [H] fp32
+
+            cached_v_scale_broadcast = v_scale.view({1, 1, H, 1}).to(v.scalar_type());
+            cached_effective_alpha = norm_alpha * v_scale.repeat_interleave(q.size(3));
+            cached_H = H;
+            cached_dtype = v.scalar_type();
+
+            OMNI_DEBUG("sdp", "V-scaling cached: v_scale_max=%.2f",
+                       v_scale.max().item<float>());
+        }
+    }
+
+    bool needs_scaling = cached_needs_scaling.load();
+
+    const void* v_ptr;
+    const void* alpha_ptr;
+    torch::Tensor v_scaled;       // keep alive if scaling
+
+    if (needs_scaling && cached_H == H && cached_dtype == v.scalar_type()) {
+        // Fast V-scaling: use cached v_scale_broadcast and effective_alpha
+        // Only V division is per-call (V changes each call)
+        v_scaled = v / cached_v_scale_broadcast;
+        v_ptr = v_scaled.data_ptr();
+        alpha_ptr = cached_effective_alpha.data_ptr();
+    } else if (needs_scaling) {
+        // Cache miss (shape/dtype changed) — full recompute
+        auto v_absmax = v.abs().amax(/*dim=*/{0, 1, 3});
+        auto v_scale = (v_absmax.to(torch::kFloat) / 32.0f).clamp_min(1.0f);
+
+        v_scaled = v / v_scale.view({1, 1, H, 1}).to(v.scalar_type());
+        auto effective_alpha = norm_alpha * v_scale.repeat_interleave(q.size(3));
+
+        v_ptr = v_scaled.data_ptr();
+        alpha_ptr = effective_alpha.data_ptr();
+
+        // Update cache
+        std::lock_guard<std::mutex> guard(cache_mutex);
+        cached_v_scale_broadcast = v_scale.view({1, 1, H, 1}).to(v.scalar_type());
+        cached_effective_alpha = effective_alpha;
+        cached_H = H;
+        cached_dtype = v.scalar_type();
+    } else {
+        // Fast path: V values are small, no scaling needed
+        v_ptr = v.data_ptr();
+        alpha_ptr = norm_alpha.data_ptr();
+    }
+
+    auto out = torch::empty_like(q);
+    sycl::queue& queue = utils::get_queue(q.device());
+    const int64_t head_dim = q.size(3);
+
+    // Dispatch based on dtype and head_dim
+    auto call_kernel = [&](sdp_kernel_fn kernel) {
+        TORCH_CHECK(kernel != nullptr, "sdp: kernel not available for this configuration");
+        kernel(
+            q.data_ptr(),
+            k.data_ptr(),
+            const_cast<void*>(v_ptr),
+            const_cast<void*>(alpha_ptr),
+            out.data_ptr(),
+            static_cast<int>(q.size(1)),
+            static_cast<int>(kv_len + kv_pad),
+            static_cast<int>(q.size(2)),
+            static_cast<int>(k.size(2)),
+            &queue);
+    };
+
+    if (head_dim == 64) {
+        switch (q.scalar_type()) {
+            case ST::Half:
+                call_kernel(kernels.fp16_hd64);
+                break;
+            case ST::BFloat16:
+                call_kernel(kernels.bf16io_hd64);
+                break;
+            default:
+                TORCH_CHECK(false, "sdp: head_dim=64 unsupported dtype, only FP16 and BF16 are supported");
+        }
+    } else {
+        // head_dim == 128
+        switch (q.scalar_type()) {
+            case ST::Half:
+                // Use fast kernel (no compensation clamp) when V-scaling is not needed.
+                // When V values are small, fp16 accumulator cannot overflow.
+                if (!needs_scaling && kernels.fp16_fast != nullptr) {
+                    call_kernel(kernels.fp16_fast);
+                } else {
+                    call_kernel(kernels.fp16);
+                }
+                break;
+            case ST::BFloat16:
+                call_kernel(kernels.bf16io);
+                break;
+            default:
+                TORCH_CHECK(false, "sdp: unsupported dtype, only FP16 and BF16 are supported");
+        }
+    }
+
+    return out;
+}
+
+} // namespace sdp
+} // namespace omni_xpu

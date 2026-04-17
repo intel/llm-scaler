@@ -574,5 +574,39 @@ void fused_add_rms_norm(
     }
 }
 
+// ============================================================================
+// Fused RMSNorm + Linear Projection
+// ============================================================================
+// Chains RMSNorm and matmul in a single C++ call to:
+//   1. Eliminate Python roundtrip between norm and linear (~10-50us)
+//   2. Keep normalized data warm in L3 cache for immediate GEMM consumption
+//   3. Avoid materializing intermediate tensor in Python scope
+//
+// Pattern: output = Linear(RMSNorm(input, weight, eps), proj_weight)
+//          output = RMSNorm(input) @ proj_weight.T
+// ============================================================================
+
+torch::Tensor fused_rms_norm_linear(
+    torch::Tensor input,         // [M, K]
+    torch::Tensor norm_weight,   // [K]
+    torch::Tensor proj_weight,   // [N, K] (will be transposed for matmul)
+    double eps
+) {
+    TORCH_CHECK(input.dim() == 2, "Input must be 2D [M, K]");
+    TORCH_CHECK(norm_weight.dim() == 1, "Norm weight must be 1D [K]");
+    TORCH_CHECK(proj_weight.dim() == 2, "Proj weight must be 2D [N, K]");
+    TORCH_CHECK(input.size(1) == norm_weight.size(0), "Input K must match norm_weight size");
+    TORCH_CHECK(input.size(1) == proj_weight.size(1), "Input K must match proj_weight K");
+
+    OMNI_DEBUG("norm", "fused_rms_norm_linear: input=[%ld,%ld] proj=[%ld,%ld]",
+               input.size(0), input.size(1), proj_weight.size(0), proj_weight.size(1));
+
+    auto normed = rms_norm(norm_weight, input, eps);
+    // proj_weight is [N, K], we need normed @ proj_weight.T = [M, N]
+    auto output = torch::mm(normed, proj_weight.t());
+
+    return output;
+}
+
 }  // namespace norm
 }  // namespace omni_xpu
