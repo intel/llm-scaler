@@ -3901,7 +3901,7 @@ index 475bd8536..0f548843c 100644
  
          import intel_extension_for_pytorch as ipex
  
-@@ -401,3 +567,211 @@ class XPUFp8MoEMethod(Fp8OnlineMoEMethod):
+@@ -401,3 +567,223 @@ class XPUFp8MoEMethod(Fp8OnlineMoEMethod):
              layer.num_expert_group,
              custom_routing_function=layer.custom_routing_function,
          )
@@ -4079,20 +4079,25 @@ index 475bd8536..0f548843c 100644
 +
 +    @staticmethod
 +    def _gptq_int32_to_uint8(qw):
-+        """Convert GPTQ int32-packed (8 nibbles/int32) to uint8 (2 nibbles/byte).
++        """Convert GPTQ int32 [E, K/8, N] to CUTLASS uint8 [E, N, K/2].
 +
-+        GPTQ stores 8 x 4-bit weights per int32. CUTLASS expects uint8 with
-+        2 x 4-bit weights per byte. This unpacks and repacks accordingly.
++        GPTQ packs 8 nibbles per int32 along the K axis (K-major).
++        CUTLASS grouped GEMM expects uint8 with 2 nibbles per byte and
++        N as the leading feature axis (N-major). This unpacks, transposes
++        K<->N, then repacks pairs of consecutive K nibbles into bytes
++        (low-nibble = K-row 2*k, high-nibble = K-row 2*k+1).
 +        """
-+        shape = qw.shape
-+        flat = qw.reshape(-1)
-+        nibbles = [(flat >> (4 * i)) & 0xF for i in range(8)]
-+        bytes_out = [
-+            (nibbles[i + 1].to(torch.uint8) << 4) | nibbles[i].to(torch.uint8)
-+            for i in range(0, 8, 2)
-+        ]
-+        return torch.stack(bytes_out, dim=-1).reshape(
-+            *shape[:-2], shape[-2] * 4, shape[-1])
++        assert qw.dtype == torch.int32
++        E, K8, N = qw.shape
++        # Unpack 8 nibbles per int32 along K -> [E, K, N] uint8 (values 0..15)
++        shifts = torch.arange(0, 32, 4, dtype=torch.int32).view(1, 1, 8, 1)
++        nibbles = (qw.unsqueeze(2) >> shifts) & 0xF
++        unpacked = nibbles.reshape(E, K8 * 8, N).to(torch.uint8)
++        # Transpose K<->N -> [E, N, K], then repack pairs along K
++        unpacked = unpacked.transpose(1, 2).contiguous()
++        low = unpacked[..., 0::2]
++        high = unpacked[..., 1::2]
++        return (high << 4) | low
 +
 +    @staticmethod
 +    def _implement_zp(qw):
@@ -4117,6 +4122,13 @@ index 475bd8536..0f548843c 100644
 +    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 +        if self.quant_config.linear_quant_method == "gptq":
 +            # Convert GPTQ int32-packed weights to CUTLASS uint8 format.
++            # GPTQ stores [E, K/8, N] int32 (K-major); CUTLASS grouped GEMM
++            # requires [E, N, K/2] uint8 (N-major). The conversion below
++            # unpacks, transposes K<->N, then repacks nibble pairs.
++            # _implement_zp then converts uint4 -> signed int4 (sign-mag).
++            # NOTE: assumes symmetric quantization (ZP=8). AutoRound with
++            # sym=True satisfies this; asymmetric GPTQ models are not
++            # supported by this path.
 +            # No marlin_shuffle needed — CUTLASS uses a different layout.
 +            # This completely bypasses IPEX GatedMLPMOE and its broken
 +            # moe_gemm path (Bug H / IPEX #838).
