@@ -9,6 +9,15 @@ from custom_esimd_kernels_vllm import custom_esimd_kernels_gemm
 # Eagle kernels — registers torch.ops.eagle_ops.*
 from custom_esimd_kernels_vllm import eagle_ops
 
+# Split-K paged attention — registers torch.ops.page_attn_splitk_ops.*
+from custom_esimd_kernels_vllm import page_attn_splitk_ops
+
+# Fused paged attention — registers torch.ops.page_attn_fused_ops.*
+try:
+    from custom_esimd_kernels_vllm import page_attn_fused_ops
+except ImportError:
+    pass
+
 # MoE Batch kernels — registers torch.ops.moe_ops.*
 from custom_esimd_kernels_vllm import moe_ops
 
@@ -39,6 +48,10 @@ from custom_esimd_kernels_vllm.ops import (
     # Eagle ops
     eagle_gdn,
     eagle_page_attn_decode,
+    # Split-K paged attention
+    eagle_page_attn_decode_splitk,
+    # Fused paged attention
+    eagle_page_attn_decode_fused,
     # MoE Batch ops
     moe_router_forward,
     moe_batch_topk,

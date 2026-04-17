@@ -146,6 +146,27 @@ ext_modules.append(
 )
 ### Eagle kernels
 
+### Split-K paged attention (standalone, does not touch eagle_ops)
+ext_modules.append(
+    SyclExtension(
+        name="custom_esimd_kernels_vllm.page_attn_splitk_ops",
+        sources=[
+            "csrc/eagle/page_attn_splitk.sycl",
+        ],
+        include_dirs=[
+            root / "csrc" / "eagle",
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++20"],
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     f"-I{torch_include}"],
+        },
+        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+        py_limited_api=False,
+    )
+)
+### Split-K paged attention
+
 ### MoE Batch kernels (Router, TopK, Up/Down, Accumulate) — from custom-esimd-kernels-vllm-moe-batch-test
 ext_modules.append(
     SyclExtension(

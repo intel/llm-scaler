@@ -561,6 +561,63 @@ def eagle_page_attn_decode(
         max_query_len, max_seq_len)
 
 
+# ---- Split-K Paged Attention ----
+
+_splitk_ops = torch.ops.page_attn_splitk_ops
+
+
+def eagle_page_attn_decode_splitk(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor,
+    max_query_len: int,
+    max_seq_len: int,
+    num_partitions: int = 8,
+) -> None:
+    """Split-K paged attention decode.
+
+    Same interface as eagle_page_attn_decode with an extra num_partitions
+    parameter that controls how many partitions to split Phase-2 into.
+    Each WG computes its token range from actual seq_lens on device.
+
+    query:          [batches, num_heads, head_dim] fp16
+    kv_cache:       paged KV cache tensor
+    block_table:    [batches, max_blocks] int32
+    seq_lens:       [batches] int32
+    out:            [batches, num_heads, head_dim] fp16 (output)
+    num_partitions: number of Phase-2 partitions (default 8)
+    """
+    return _splitk_ops.page_attn_decode_splitk(
+        query, kv_cache, block_table, seq_lens, out,
+        max_query_len, max_seq_len, num_partitions)
+
+
+# ---- Fused Paged Attention ----
+
+_fused_ops = torch.ops.page_attn_fused_ops
+
+
+def eagle_page_attn_decode_fused(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor,
+    max_query_len: int,
+    max_seq_len: int,
+) -> None:
+    """Fused single-kernel paged attention decode.
+
+    Same interface as eagle_page_attn_decode. Single kernel launch,
+    no intermediate global-memory buffer.
+    """
+    return _fused_ops.page_attn_decode_fused(
+        query, kv_cache, block_table, seq_lens, out,
+        max_query_len, max_seq_len)
+
+
 # ---- MoE Batch Ops (Router, TopK, Up/Down, Accumulate) ----
 
 _moe_batch = torch.ops.moe_ops

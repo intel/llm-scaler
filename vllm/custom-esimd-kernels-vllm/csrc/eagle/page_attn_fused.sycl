@@ -1,0 +1,106 @@
+// page_attn_fused.sycl — fused single-kernel paged attention decode
+//
+// Single kernel, single launch. No intermediate global-memory buffer.
+
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+using fp16 = sycl::half;
+using namespace sycl::ext::intel::esimd;
+namespace xesimd = sycl::ext::intel::experimental::esimd;
+
+static inline sycl::event submit_kernel_fused(
+    std::function<void(sycl::handler&)> kernel,
+    const torch::Device& device,
+    const char* desc) {
+  sycl::queue& queue = c10::xpu::getCurrentXPUStream(device.index()).queue();
+  return queue.submit(kernel);
+}
+
+static inline uint32_t getHighestBitFused(uint32_t in) {
+  uint32_t ret = 0;
+  uint32_t temp = in - 1;
+  while (temp != 0) { temp >>= 1; ret++; }
+  return ret;
+}
+
+#include "page.attn.fused.h"
+
+// ── torch op entry point ──────────────────────────────────────────────
+
+void page_attn_decode_fused(
+  torch::Tensor query,
+  torch::Tensor kv_cache,
+  torch::Tensor block_table,
+  torch::Tensor seq_lens,
+  torch::Tensor& out,
+  int64_t max_query_len,
+  int64_t max_seq_len
+) {
+  TORCH_CHECK(block_table.dim() == 2);
+  TORCH_CHECK(seq_lens.dim() == 1);
+  TORCH_CHECK(kv_cache.dim() == 5);
+  TORCH_CHECK(query.scalar_type() == torch::kHalf);
+  TORCH_CHECK(kv_cache.scalar_type() == torch::kHalf);
+  TORCH_CHECK(out.scalar_type() == torch::kHalf);
+  TORCH_CHECK(max_query_len == 1);
+
+  uint32_t kvCacheStride0 = kv_cache.stride(0);
+  uint32_t kvCacheStride1 = kv_cache.stride(1);
+  uint32_t totalDimsKv    = kv_cache.dim();
+  uint32_t headDim  = kv_cache.size(totalDimsKv - 1);
+  uint32_t headV    = kv_cache.size(totalDimsKv - 2);
+  uint32_t pageSize = kv_cache.size(totalDimsKv - 3);
+  uint32_t batches  = seq_lens.size(0);
+  uint32_t headQk   = headV << 2;
+  uint32_t pageTableSizeLog2    = getHighestBitFused(pageSize);
+  uint32_t pageTableBatchStride = block_table.stride(0);
+
+  TORCH_CHECK(headDim == 256);
+
+  // Extract raw pointers before lambda capture (torch::Tensor is not device-copyable)
+  uint8_t*  qPtr  = (uint8_t*)query.data_ptr();
+  uint8_t*  kvPtr = (uint8_t*)kv_cache.data_ptr();
+  uint8_t*  oPtr  = (uint8_t*)out.data_ptr();
+  uint32_t* btPtr = (uint32_t*)block_table.data_ptr();
+  uint32_t* slPtr = (uint32_t*)seq_lens.data_ptr();
+
+  // Single kernel launch — no intermediate buffers needed
+  uint32_t groupH = headV;     // kvHead
+  uint32_t groupD = batches;
+  sycl::range<2> global(groupH * 4, groupD);
+  sycl::range<2> local(4, 1);
+  sycl::nd_range<2> range(global, local);
+
+  auto kernel = [&](sycl::handler& cgh) {
+    cgh.parallel_for<class paFusedForward>(
+      range, [=](sycl::nd_item<2> idx) SYCL_ESIMD_KERNEL {
+        sdpaDecodeGqa4Fused(
+          qPtr, kvPtr, oPtr, btPtr, slPtr,
+          batches,
+          kvCacheStride0, kvCacheStride1,
+          pageTableBatchStride, pageTableSizeLog2,
+          headV, idx);
+      });
+  };
+  submit_kernel_fused(kernel, kv_cache.device(), "page_attn_fused");
+}
+
+// ── torch library + pybind registration ───────────────────────────────
+
+TORCH_LIBRARY_FRAGMENT(page_attn_fused_ops, m) {
+  m.def("page_attn_decode_fused("
+        "Tensor query, Tensor kv_cache, Tensor block_table, Tensor seq_lens, "
+        "Tensor! out, int max_query_len, int max_seq_len"
+        ") -> ()");
+}
+
+TORCH_LIBRARY_IMPL(page_attn_fused_ops, XPU, m) {
+  m.impl("page_attn_decode_fused", &page_attn_decode_fused);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("page_attn_decode_fused", &page_attn_decode_fused,
+        "Fused paged attention decode");
+}
