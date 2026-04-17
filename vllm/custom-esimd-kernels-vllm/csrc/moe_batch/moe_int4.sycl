@@ -712,6 +712,168 @@ void moe_down_routed_int4_slm_kernel(
 // Kernel 4: Down Finalize — gate + shared_down(FP16) + accumulate
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// BSZ>1 standalone down path: gate_precompute + down_shared + accumulate
+// (Avoids redundant shared expert weight reads in down_finalize)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void moe_down_gate_precompute_int4_kernel(
+    const fp16* x,
+    const fp16* shared_expert_gate_weight,
+    float* gate_values,
+    const int n_tokens, const int hidden_size, const int num_shared_experts,
+    const torch::Device& device) {
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeDownGatePrecomputeInt4>(
+            sycl::range<1>(n_tokens * num_shared_experts),
+            [=](sycl::id<1> idx) SYCL_ESIMD_KERNEL {
+                const int flat = (int)idx[0];
+                const int token = flat / num_shared_experts;
+                const int sid   = flat % num_shared_experts;
+
+                const fp16* x_row = x + (size_t)token * hidden_size;
+
+                simd<float, 64> seg_acc(0.f);
+                for (int k = 0; k < hidden_size; k += 64) {
+                    seg_acc += convert<float>(
+                        block_load<fp16, 64>(x_row + k) *
+                        block_load<fp16, 64>(
+                            shared_expert_gate_weight + (size_t)sid * hidden_size + k));
+                }
+                float seg_dot = sycl::ext::intel::esimd::detail::sum<float, float, 64>(seg_acc);
+                gate_values[flat] = 1.f / (1.f + sycl::exp(-seg_dot));
+            });
+    };
+
+    submit_kernel(cgf, device, "moe down gate precompute int4");
+}
+
+void moe_down_shared_int4_standalone_kernel(
+    const fp16* intermediates,
+    const uint32_t* shared_down_qweight,  // IPEX column-major repacked
+    const fp16* shared_down_scale,        // NOT repacked [K_groups, hidden]
+    const float* gate_values,
+    fp16* output,
+    const int n_tokens, const int hidden_size,
+    const int shared_inter_size,
+    const int buffer_row_width,           // intermediate buffer row width
+    const int K_packed_down, const int K_groups_down,
+    const int top_k, const int num_shared_experts, const int rows_per_token,
+    const torch::Device& device) {
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeDownSharedInt4Standalone>(
+            sycl::range<2>(n_tokens * num_shared_experts, hidden_size),
+            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
+                const int idx0  = (int)idx[0];
+                const int token = idx0 / num_shared_experts;
+                const int sid   = idx0 % num_shared_experts;
+                const int j     = (int)idx[1];
+
+                const int shared_row = token * rows_per_token + top_k + sid;
+                const fp16* hi = intermediates + (size_t)shared_row * buffer_row_width;
+
+                // qweight: [hidden, K_packed_down] row-major (IPEX column-major repacked)
+                const uint32_t* dw_base = shared_down_qweight
+                    + (size_t)sid * K_packed_down * hidden_size;
+                // scales: [K_groups_down, hidden] row-major (NOT repacked)
+                const fp16* ds_base = shared_down_scale
+                    + (size_t)sid * K_groups_down * hidden_size;
+
+                float acc = 0.f;
+                for (int kp = 0; kp < K_packed_down; kp++) {
+                    uint32_t packed = dw_base[(size_t)j * K_packed_down + kp];
+                    int gi = kp / 16;
+                    fp16 s = ds_base[(size_t)gi * hidden_size + j];
+
+                    #pragma unroll
+                    for (int b = 0; b < 8; b++) {
+                        float w_val = (float(((packed >> (b * 4)) & 0xFu)) - 8.f) * (float)s;
+                        acc += w_val * (float)hi[kp * 8 + b];
+                    }
+                }
+
+                float w = gate_values[idx0];
+                output[(size_t)shared_row * hidden_size + j] = fp16(acc * w);
+            });
+    };
+
+    submit_kernel(cgf, device, "moe down shared int4 standalone");
+}
+
+void moe_down_shared_fp16_standalone_kernel(
+    const fp16* intermediates,
+    const fp16* shared_down_weight,
+    const float* gate_values,
+    fp16* output,
+    const int n_tokens, const int hidden_size,
+    const int shared_inter_size,
+    const int buffer_row_width,
+    const int top_k, const int num_shared_experts, const int rows_per_token,
+    const torch::Device& device) {
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeDownSharedFP16Standalone>(
+            sycl::range<2>(n_tokens * num_shared_experts, hidden_size),
+            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
+                const int idx0  = (int)idx[0];
+                const int token = idx0 / num_shared_experts;
+                const int sid   = idx0 % num_shared_experts;
+                const int j     = (int)idx[1];
+
+                const int shared_row = token * rows_per_token + top_k + sid;
+                const fp16* hi = intermediates + (size_t)shared_row * buffer_row_width;
+                const fp16* dw = shared_down_weight
+                    + (size_t)sid * hidden_size * shared_inter_size
+                    + (size_t)j * shared_inter_size;
+
+                simd<float, 64> acc(0.f);
+                for (int k = 0; k < shared_inter_size; k += 64)
+                    acc += convert<float>(
+                        block_load<fp16, 64>(dw + k) * block_load<fp16, 64>(hi + k));
+
+                float w = gate_values[idx0];
+                output[(size_t)shared_row * hidden_size + j] =
+                    fp16(w * sycl::ext::intel::esimd::detail::sum<float, float, 64>(acc));
+            });
+    };
+
+    submit_kernel(cgf, device, "moe down shared fp16 standalone");
+}
+
+void moe_accumulate_int4_kernel(
+    const fp16* partials,
+    fp16* final_output,
+    const int n_tokens, const int hidden_size,
+    const int rows_per_token,
+    const torch::Device& device) {
+
+    const int num_chunks = hidden_size / 64;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeAccumulateInt4>(
+            sycl::range<2>(n_tokens, num_chunks),
+            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
+                const int token = (int)idx[0];
+                const int base  = (int)idx[1] * 64;
+
+                simd<float, 64> sum(0.f);
+                for (int b = 0; b < rows_per_token; b++) {
+                    sum += convert<float>(
+                        block_load<fp16, 64>(partials + (size_t)(token * rows_per_token + b) * hidden_size + base));
+                }
+                block_store<fp16, 64>(final_output + (size_t)token * hidden_size + base, convert<fp16>(sum));
+            });
+    };
+
+    submit_kernel(cgf, device, "moe accumulate int4");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BSZ=1 fused down path (kept for lowest launch overhead)
+// ═══════════════════════════════════════════════════════════════════════════════
+
 void moe_down_finalize_fp16_kernel(
     const fp16* x,
     const fp16* intermediates,
@@ -892,6 +1054,7 @@ void moe_down_finalize_int4_kernel(
 static thread_local torch::Tensor s_int4_topk_idx, s_int4_topk_weight;
 static thread_local torch::Tensor s_int4_routed_output, s_int4_final_output;
 static thread_local torch::Tensor s_int4_intermediates;
+static thread_local torch::Tensor s_int4_gate_values;  // BSZ>1 precomputed gate sigmoid
 static thread_local int s_int4_cached_ntokens = -1;
 
 static void ensure_int4_moe_buffers(int n_tokens, int top_k, int num_shared_experts,
@@ -911,6 +1074,9 @@ static void ensure_int4_moe_buffers(int n_tokens, int top_k, int num_shared_expe
         s_int4_intermediates = torch::empty(
             {n_tokens * rows_per_token, intermediate_size},
             torch::device(dev).dtype(torch::kHalf));
+        s_int4_gate_values = torch::empty(
+            {n_tokens * num_shared_experts},
+            torch::device(dev).dtype(torch::kFloat));
         s_int4_cached_ntokens = n_tokens;
     }
 }
@@ -1055,36 +1221,79 @@ torch::Tensor moe_forward_full_int4(
             top_k, rows_per_token, x.device());
     }
 
-    // ── Down Finalize: shared + accumulate — dispatch INT4 or FP16 ──
-    if (shared_is_int4) {
-        int K_packed_down = shared_intermediate_size / 8;
-        int K_groups_down = shared_intermediate_size / 128;
-        // qweight: IPEX column-major repack → [hidden, K_packed_down] row-major
-        // scales: NOT repacked → [K_groups_down, hidden] row-major
-        auto shared_dw_reshaped = shared_down_weight.reshape(
-            {hidden_size, K_packed_down});
-        moe_down_finalize_int4_kernel(
+    // ── Down Finalize: shared + accumulate ──
+    // BSZ>1: standalone path (gate_precompute → down_shared → accumulate)
+    //   avoids redundant shared expert weight reads per WI
+    // BSZ=1: fused down_finalize (lowest launch overhead)
+    if (n_tokens > 1) {
+        // V2 path: precompute gate sigmoid
+        moe_down_gate_precompute_int4_kernel(
             (const fp16*)x.data_ptr(),
-            (const fp16*)s_int4_intermediates.data_ptr(),
-            (const fp16*)s_int4_routed_output.data_ptr(),
-            (const uint32_t*)shared_dw_reshaped.data_ptr(),
-            (const fp16*)shared_down_scale.data_ptr(),  // scales NOT repacked
             (const fp16*)shared_expert_gate_weight.data_ptr(),
+            s_int4_gate_values.data_ptr<float>(),
+            n_tokens, hidden_size, num_shared_experts, x.device());
+
+        // Shared expert down GEMV (standalone, parallel over tokens × hidden)
+        if (shared_is_int4) {
+            int K_packed_down = shared_intermediate_size / 8;
+            int K_groups_down = shared_intermediate_size / 128;
+            auto shared_dw_reshaped = shared_down_weight.reshape(
+                {hidden_size, K_packed_down});
+            moe_down_shared_int4_standalone_kernel(
+                (const fp16*)s_int4_intermediates.data_ptr(),
+                (const uint32_t*)shared_dw_reshaped.data_ptr(),
+                (const fp16*)shared_down_scale.data_ptr(),
+                s_int4_gate_values.data_ptr<float>(),
+                (fp16*)s_int4_routed_output.data_ptr(),
+                n_tokens, hidden_size, shared_intermediate_size,
+                intermediate_size, K_packed_down, K_groups_down,
+                top_k, num_shared_experts, rows_per_token, x.device());
+        } else {
+            moe_down_shared_fp16_standalone_kernel(
+                (const fp16*)s_int4_intermediates.data_ptr(),
+                (const fp16*)shared_down_weight.data_ptr(),
+                s_int4_gate_values.data_ptr<float>(),
+                (fp16*)s_int4_routed_output.data_ptr(),
+                n_tokens, hidden_size, shared_intermediate_size,
+                intermediate_size,
+                top_k, num_shared_experts, rows_per_token, x.device());
+        }
+
+        // Accumulate all rows (routed + shared) per token
+        moe_accumulate_int4_kernel(
+            (const fp16*)s_int4_routed_output.data_ptr(),
             (fp16*)s_int4_final_output.data_ptr(),
-            n_tokens, hidden_size, shared_intermediate_size,
-            intermediate_size, K_packed_down, K_groups_down,
-            top_k, num_shared_experts, rows_per_token, x.device());
+            n_tokens, hidden_size, rows_per_token, x.device());
     } else {
-        moe_down_finalize_fp16_kernel(
-            (const fp16*)x.data_ptr(),
-            (const fp16*)s_int4_intermediates.data_ptr(),
-            (const fp16*)s_int4_routed_output.data_ptr(),
-            (const fp16*)shared_down_weight.data_ptr(),
-            (const fp16*)shared_expert_gate_weight.data_ptr(),
-            (fp16*)s_int4_final_output.data_ptr(),
-            n_tokens, hidden_size, shared_intermediate_size,
-            intermediate_size,
-            top_k, num_shared_experts, rows_per_token, x.device());
+        // BSZ=1: fused down_finalize (gate sigmoid dedup via SLM)
+        if (shared_is_int4) {
+            int K_packed_down = shared_intermediate_size / 8;
+            int K_groups_down = shared_intermediate_size / 128;
+            auto shared_dw_reshaped = shared_down_weight.reshape(
+                {hidden_size, K_packed_down});
+            moe_down_finalize_int4_kernel(
+                (const fp16*)x.data_ptr(),
+                (const fp16*)s_int4_intermediates.data_ptr(),
+                (const fp16*)s_int4_routed_output.data_ptr(),
+                (const uint32_t*)shared_dw_reshaped.data_ptr(),
+                (const fp16*)shared_down_scale.data_ptr(),
+                (const fp16*)shared_expert_gate_weight.data_ptr(),
+                (fp16*)s_int4_final_output.data_ptr(),
+                n_tokens, hidden_size, shared_intermediate_size,
+                intermediate_size, K_packed_down, K_groups_down,
+                top_k, num_shared_experts, rows_per_token, x.device());
+        } else {
+            moe_down_finalize_fp16_kernel(
+                (const fp16*)x.data_ptr(),
+                (const fp16*)s_int4_intermediates.data_ptr(),
+                (const fp16*)s_int4_routed_output.data_ptr(),
+                (const fp16*)shared_down_weight.data_ptr(),
+                (const fp16*)shared_expert_gate_weight.data_ptr(),
+                (fp16*)s_int4_final_output.data_ptr(),
+                n_tokens, hidden_size, shared_intermediate_size,
+                intermediate_size,
+                top_k, num_shared_experts, rows_per_token, x.device());
+        }
     }
 
     return s_int4_final_output;
