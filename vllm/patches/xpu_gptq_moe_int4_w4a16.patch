@@ -1,0 +1,257 @@
+--- /home/nobara-user/llm-scaler-vllm/vllm/vllm/model_executor/layers/quantization/ipex_quant.py	2026-04-14 19:39:54.209867904 +0900
++++ /home/nobara-user/llm-scaler-vllm/venv/lib64/python3.12/site-packages/vllm/model_executor/layers/quantization/ipex_quant.py	2026-04-17 14:08:02.048676223 +0900
+@@ -690,6 +690,7 @@
+                 intermediate_size_per_partition // self.quant_config.pack_factor,
+                 hidden_size,
+                 dtype=torch.int32,
++
+             ),
+             requires_grad=False,
+         )
+@@ -702,6 +703,7 @@
+                 scales_size13,
+                 2 * intermediate_size_per_partition,
+                 dtype=params_dtype,
++
+             ),
+             requires_grad=False,
+         )
+@@ -709,32 +711,35 @@
+         set_weight_attrs(w13_scales, extra_weight_attrs)
+         # down_proj scales
+         w2_scales = torch.nn.Parameter(
+-            torch.empty(num_experts, scales_size2, hidden_size, dtype=params_dtype),
++            torch.empty(num_experts, scales_size2, hidden_size,
++                        dtype=params_dtype),
+             requires_grad=False,
+         )
+         layer.register_parameter("w2_scales", w2_scales)
+         set_weight_attrs(w2_scales, extra_weight_attrs)
+         # don't shard the w2 scales when running act order
+         set_weight_attrs(w2_scales, {"load_full_w2": self.quant_config.desc_act})
+-        # up_proj scales
++        # up_proj qzeros
+         w13_qzeros = torch.nn.Parameter(
+             torch.empty(
+                 num_experts,
+                 scales_size13,
+                 2 * intermediate_size_per_partition // self.quant_config.pack_factor,
+                 dtype=params_dtype,
++
+             ),
+             requires_grad=False,
+         )
+         layer.register_parameter("w13_qzeros", w13_qzeros)
+         set_weight_attrs(w13_qzeros, extra_weight_attrs)
+-        # down_proj scales
++        # down_proj qzeros
+         w2_qzeros = torch.nn.Parameter(
+             torch.empty(
+                 num_experts,
+                 scales_size2,
+                 hidden_size // self.quant_config.pack_factor,
+                 dtype=params_dtype,
++
+             ),
+             requires_grad=False,
+         )
+@@ -747,6 +752,7 @@
+                 num_experts,
+                 hidden_size,
+                 dtype=torch.int32,
++
+             ),
+             requires_grad=False,
+         )
+@@ -757,6 +763,7 @@
+                 num_experts,
+                 intermediate_size_per_partition,
+                 dtype=torch.int32,
++
+             ),
+             requires_grad=False,
+         )
+@@ -767,6 +774,7 @@
+                 num_experts,
+                 hidden_size,
+                 dtype=torch.int32,
++
+             ),
+             requires_grad=False,
+         )
+@@ -777,27 +785,85 @@
+                 num_experts,
+                 intermediate_size_per_partition,
+                 dtype=torch.int32,
++
+             ),
+             requires_grad=False,
+         )
+         layer.register_parameter("w2_g_idx_sort_indices", w2_g_idx_sort_indices)
+         set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
+ 
+-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+-        import intel_extension_for_pytorch as ipex
++    @staticmethod
++    def _gptq_int32_to_uint8(qw):
++        """Convert GPTQ int32-packed (8 nibbles/int32) to uint8 (2 nibbles/byte)"""
++        shape = qw.shape
++        flat = qw.reshape(-1)
++        nibbles = [(flat >> (4 * i)) & 0xF for i in range(8)]
++        bytes_out = [
++            (nibbles[i + 1].to(torch.uint8) << 4) | nibbles[i].to(torch.uint8)
++            for i in range(0, 8, 2)
++        ]
++        return torch.stack(bytes_out, dim=-1).reshape(
++            *shape[:-2], shape[-2] * 4, shape[-1])
++
++    @staticmethod
++    def _implement_zp(qw):
++        """Convert uint4 to signed int4 for CUTLASS kernel"""
++        hi = (qw >> 4) & 0x0F
++        lo = qw & 0x0F
++        hi_s = hi.to(torch.int8) - 8
++        lo_s = lo.to(torch.int8) - 8
++        def pack(a, b):
++            def p(x):
++                s = (x < 0).to(torch.uint8)
++                a3 = (x.view(torch.uint8) & 0x7).to(torch.uint8)
++                return (s << 3) | a3
++            return (p(a) << 4) | p(b)
++        return pack(hi_s, lo_s)
+ 
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         if self.quant_config.linear_quant_method == "gptq":
+-            layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
+-                layer.w13_qweight.permute(0, 2, 1),
+-                layer.w2_qweight.permute(0, 2, 1),
+-                w1_scale_inv=layer.w13_scales.permute(0, 2, 1),
+-                w2_scale_inv=layer.w2_scales.permute(0, 2, 1),
+-                is_int4=True,
+-            )
++            # Prepare GPTQ weights for int4_gemm_w4a16 (oneDNN format).
++            # No marlin_shuffle, no CUTLASS uint8 conversion needed.
++            # Just make weights K-contiguous and set scalar zero point.
++            device = layer.w13_qweight.device
++            num_experts = layer.w13_qweight.shape[0]
++
++            # oneDNN format: transpose(0,1).contiguous().transpose(0,1)
++            # Makes K-contiguous strides while keeping [K//8, N] shape.
++            # Do per-expert on CPU to avoid XPU memory pressure.
++            w13_list, w2_list = [], []
++            s13_list, s2_list = [], []
++            for e in range(num_experts):
++                w13_e = layer.w13_qweight[e].cpu()  # [K//8, 2N]
++                w2_e = layer.w2_qweight[e].cpu()     # [K//8, N]
++                w13_list.append(
++                    w13_e.transpose(0, 1).contiguous().transpose(0, 1))
++                w2_list.append(
++                    w2_e.transpose(0, 1).contiguous().transpose(0, 1))
++                s13_list.append(layer.w13_scales[e].cpu().contiguous())
++                s2_list.append(layer.w2_scales[e].cpu().contiguous())
++
++            # Free original weights
++            layer.w13_qweight.data = torch.empty(
++                0, dtype=torch.int32, device=device)
++            layer.w2_qweight.data = torch.empty(
++                0, dtype=torch.int32, device=device)
++            torch.xpu.empty_cache()
++
++            # Store per-expert weights on XPU
++            layer.int4_w13 = [w.to(device) for w in w13_list]
++            layer.int4_w2 = [w.to(device) for w in w2_list]
++            layer.int4_s13 = [s.to(device) for s in s13_list]
++            layer.int4_s2 = [s.to(device) for s in s2_list]
++            # Symmetric GPTQ: scalar zero point = 8
++            layer.int4_zp = torch.tensor([8], dtype=torch.int8,
++                                          device=device)
++            layer.int4_num_experts = num_experts
++            layer.int4_group_size = self.quant_config.group_size
+         else:
+             raise NotImplementedError(
+-                f"Unsupported quant method {self.quant_config.linear_quant_method} "
+-                "for XPU MOE."
++                f"Unsupported quant method "
++                f"{self.quant_config.linear_quant_method} for XPU MOE."
+             )
+ 
+     def apply(
+@@ -807,15 +873,66 @@
+         x: torch.Tensor,
+         router_logits: torch.Tensor,
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+-        res = layer.ipex_fusion(
+-            x,
+-            layer.use_grouped_topk,
+-            layer.top_k,
+-            router_logits,
+-            layer.renormalize,
+-            topk_group=layer.topk_group,
+-            num_expert_group=layer.num_expert_group,
+-            custom_routing_function=layer.custom_routing_function,
+-            scoring_func=layer.scoring_func,
+-        )
+-        return res
++        # Sequential expert loop using int4_gemm_w4a16 (oneDNN format).
++        # Bypasses IPEX GatedMLPMOE entirely — uses vllm-xpu-kernels
++        # CUTLASS INT4 GEMM which works on Xe2 iGPU.
++        from vllm_xpu_kernels import _xpu_C  # noqa: F401
++
++        num_tokens, hidden_dim = x.shape
++        top_k = layer.top_k
++        num_experts = layer.int4_num_experts
++        group_size = layer.int4_group_size
++        zp = layer.int4_zp
++        inter_size = layer.int4_w13[0].shape[1] // 2  # W13: [K//8, 2N]
++
++        # Routing: topk softmax
++        topk_weights, topk_ids = torch.topk(
++            router_logits.float(), k=top_k, dim=-1)
++        topk_weights = torch.softmax(topk_weights, dim=-1)
++        if layer.renormalize:
++            topk_weights = topk_weights / topk_weights.sum(
++                dim=-1, keepdim=True)
++
++        # Sequential expert loop
++        output = torch.zeros(num_tokens, hidden_dim,
++                             dtype=x.dtype, device=x.device)
++
++        for expert_id in range(num_experts):
++            mask = (topk_ids == expert_id)
++            if not mask.any():
++                continue
++
++            token_indices, slot_indices = mask.nonzero(as_tuple=True)
++            expert_weights = topk_weights[token_indices, slot_indices]
++            expert_input = x[token_indices]  # [n, hidden_dim]
++
++            # GEMM1: expert_input @ W13[expert_id] → [n, 2*inter_size]
++            g1_out = torch.ops._xpu_C.int4_gemm_w4a16(
++                expert_input,
++                layer.int4_w13[expert_id],
++                None,  # bias
++                layer.int4_s13[expert_id],
++                zp,
++                group_size,
++                None,  # g_idx
++            )
++
++            # SiLU activation (gate * up)
++            activated = (torch.nn.functional.silu(g1_out[:, :inter_size])
++                         * g1_out[:, inter_size:])
++
++            # GEMM2: activated @ W2[expert_id] → [n, hidden_dim]
++            g2_out = torch.ops._xpu_C.int4_gemm_w4a16(
++                activated.contiguous(),
++                layer.int4_w2[expert_id],
++                None,
++                layer.int4_s2[expert_id],
++                zp,
++                group_size,
++                None,
++            )
++
++            # Weighted accumulate
++            output[token_indices] += expert_weights.unsqueeze(1) * g2_out
++
++        return output

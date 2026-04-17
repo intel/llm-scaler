@@ -804,3 +804,60 @@ The CUTLASS INT4 kernel uses a **column-interleaved** nibble packing, not row-se
 GPTQ packs 8 nibbles along the **K dimension** (input) per int32. CUTLASS interleaves across **N dimension** (output). This requires a full layout transformation, not just int32→uint8 repacking.
 
 Next step: study the CUTLASS INT4 packed format from vllm-xpu-kernels source to implement correct GPTQ→CUTLASS conversion.
+
+---
+
+## SOLVED: Correct INT4 MoE Inference on Lunar Lake (2026-04-17)
+
+### The final fix: int4_gemm_w4a16 with oneDNN format
+
+Replaced CUTLASS `cutlass_grouped_gemm_interface(is_B_int4=True)` (which uses FP4 internally, not INT4) with `int4_gemm_w4a16` — a proper GPTQ INT4 W4A16 GEMM kernel.
+
+### Weight format: oneDNN (no shuffle needed!)
+
+```python
+# oneDNN format: K-contiguous strides, original GPTQ int32 packing
+w = qweight.transpose(0, 1).contiguous().transpose(0, 1)  # [K//8, N]
+scale = scales.contiguous()                                 # [K//gs, N]
+zp = torch.tensor([8], dtype=torch.int8)                   # scalar for symmetric GPTQ
+```
+
+No marlin_shuffle, no implement_zp, no uint8 conversion. The kernel reads GPTQ int32 directly.
+
+### Verified: 0.999997 correlation with CPU reference
+
+```
+CUTLASS int4_gemm_w4a16: mean=0.0161, std=0.8711
+CPU float dequant:       mean=0.0162, std=0.8716
+Correlation: 0.999997
+```
+
+### Inference result
+
+```
+Model: Qwen3-VL-30B-A3B (INT4 AutoRound, 48 layers, 128 experts)
+Prompt: "Hello! What are you? Reply in one sentence."
+Output: Chinese text (real language tokens, not garbled)
+Tokens: 50 generated from 19 prompt tokens
+Time: 315s (~0.16 tok/s, sequential expert loop)
+HTTP: 200 OK
+```
+
+### Performance: sequential bottleneck
+
+Current implementation loops over 128 experts, calling `int4_gemm_w4a16` for each active expert (~50 per layer). Each call is M=1-2 tokens — severe GPU underutilization.
+
+Optimization paths:
+1. **Batch experts**: group token-expert pairs into fewer, larger GEMM calls
+2. **Threshold test**: find max expert groups before DEVICE_LOST for grouped GEMM
+3. **Hybrid**: use grouped GEMM for small expert batches (≤8), sequential for rest
+
+### Complete solution stack
+
+| Component | Fix | No IPEX needed |
+|-----------|-----|---------------|
+| Weight format | oneDNN: transpose strides + scalar zp=8 | ✓ |
+| MoE GEMM | `int4_gemm_w4a16` per expert | ✓ |
+| Routing | Python topk + manual scatter/gather | ✓ |
+| Attention dtype | Cast k/v + skip eagle_ops for BF16 | ✓ |
+| Profile/warmup | Skip both on XPU | ✓ |
