@@ -902,3 +902,20 @@ The same `GatedMLPMOE` wrapper that crashes with `is_int4=True` **works fine wit
 | Qwen3-VL-30B-A3B | INT4 GPTQ | oneDNN int4_w4a16 | **0.9** | 48 | 128 |
 
 Normalized per-layer: GPT-OSS gets 3.0/24=0.125 tok/s/layer, Qwen3-VL gets 0.9/48=0.019 tok/s/layer. MXFP4 is **~6.5x faster per layer** due to batched grouped GEMM vs sequential expert loop.
+
+### CUTLASS vs IPEX grouped GEMM comparison (2026-04-17)
+
+CUTLASS `cutlass_grouped_gemm_interface(is_B_mxfp4=True)` with GPT-OSS-20B MXFP4 weights:
+
+| Active experts | CUTLASS MXFP4 | IPEX moe_gemm |
+|---------------|---------------|---------------|
+| 4 | 1.41ms ✓ | Works (GPT-OSS runs fine) |
+| 8 | 2.58ms ✓ | Works |
+| 16 | **DEVICE_LOST** ✗ | Works |
+| 32 | Not tested | Works |
+
+**CUTLASS grouped GEMM crashes at 16+ active experts on Xe2** — same threshold for both MXFP4 and INT4. The bug is in the CUTLASS kernel dispatch, NOT in the data format.
+
+**IPEX's `torch.xpu.moe_gemm`** handles 32 experts without crashing. The difference is in how they dispatch to the GPU — IPEX uses a different SYCL kernel template that's compatible with Xe2's Level Zero resource limits.
+
+This means: if we could use IPEX's `moe_gemm` with proper INT4 support, we'd get the batched performance. The IPEX INT4 path crashes for a different reason (Bug H: kernel bug in INT4 dequant, not resource limits).
