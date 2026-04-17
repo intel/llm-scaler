@@ -725,3 +725,57 @@ def moe_forward_full(
         shared_down_weight, shared_down_scale,
         shared_expert_gate_weight,
         top_k, num_shared_experts, n_routed_experts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MoE INT4 Batch ops
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_moe_int4 = torch.ops.moe_int4_ops
+
+
+def moe_router_forward_int4(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """INT4 router GEMV: x @ dequant(weight).T → logits.
+
+    x:      [n_tokens, hidden_size] fp16
+    weight: [num_experts, hidden_size//8] int32 (IPEX physically transposed to [E, K_packed])
+    scale:  [hidden_size//128, num_experts] fp16 (original layout, kernel handles stride)
+    Returns: [n_tokens, num_experts] fp16
+    """
+    return _moe_int4.moe_router_forward_int4(x, weight, scale)
+
+
+def moe_forward_full_int4(
+    x: torch.Tensor,
+    logits: torch.Tensor,
+    gate_up_qweight: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    shared_gate_up_scale: torch.Tensor,
+    down_qweight: torch.Tensor,
+    down_scales: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_down_scale: torch.Tensor,
+    shared_expert_gate_weight: torch.Tensor,
+    top_k: int,
+    num_shared_experts: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """INT4 MoE full forward: topk + up + down + finalize in one C++ call.
+
+    Supports both INT4 and FP16 shared expert weights (auto-detected by dtype).
+    When shared expert is INT4: shared_gate_up_scale/shared_down_scale are used.
+    When shared expert is FP16: pass dummy tensors for scales (ignored).
+    """
+    return _moe_int4.moe_forward_full_int4(
+        x, logits,
+        gate_up_qweight, gate_up_scales,
+        shared_gate_up_weight, shared_gate_up_scale,
+        down_qweight, down_scales,
+        shared_down_weight, shared_down_scale,
+        shared_expert_gate_weight,
+        top_k, num_shared_experts, n_routed_experts)
