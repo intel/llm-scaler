@@ -177,17 +177,22 @@ void page_attention_forward_kernel(
   uint32_t pStride,
   uint32_t maxStride,
   uint32_t maxKvSeqLen,
+  uint32_t gqaRatio,
   const torch::Device& device) {
   uint32_t groupH, groupV, groupD;
-  groupH = headV;
+  uint32_t gqaGroups = gqaRatio / 4;
+  // Phase1: each work group of 4 threads handles 4 q-heads sharing one kv-head
+  // Total groups in dim0 = headV * gqaGroups (one group per 4-q-head chunk)
+  groupH = headV * gqaGroups;
   groupV = (maxKvSeqLen + 63) / 64;
   groupD = batches;
   sycl::range<3> globalPaPhase1(groupH * 4, groupV, groupD);
   sycl::range<3> localPaPhase1(4, 1, 1);
   sycl::nd_range<3> rangePaPhase1(globalPaPhase1, localPaPhase1);
 
+  // Phase2: each work group of 2 threads handles 4 q-heads for 16 output dims
   groupH = headDim / 16;
-  groupV = headV;
+  groupV = headV * gqaGroups;
   groupD = batches;
   sycl::range<3> globalPaPhase2(groupH * 2, groupV, groupD);
   sycl::range<3> localPaPhase2(2, 1, 1);
@@ -199,7 +204,7 @@ void page_attention_forward_kernel(
     cgh.parallel_for<class paPhase1Forward>(
       rangePaPhase1, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
         sdpaDecodeGqa4Phase1(qState, kvCache, (uint8_t*)pState, pMax, pageTable, kvSeqLens,
-          batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, idx);
+          batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, gqaRatio, idx);
       });
     };
 
@@ -207,7 +212,7 @@ void page_attention_forward_kernel(
     cgh.parallel_for<class paPhase2Forward>(
       rangePaPhase2, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
         sdpaDecodeGqa4Phase2((uint8_t*)pState, pMax, kvCache, out, pageTable, kvSeqLens,
-          batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, idx);
+          batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, gqaRatio, idx);
       });
     };
 
@@ -299,6 +304,7 @@ void page_attn_decode(
   TORCH_CHECK(block_table.dim() == 2);
   TORCH_CHECK(seq_lens.dim() == 1);
   TORCH_CHECK(kv_cache.dim() == 5);
+  TORCH_CHECK(query.dim() == 3, "query must be [batches, num_q_heads, head_dim]");
   TORCH_CHECK(query.scalar_type() == torch::kHalf);
   TORCH_CHECK(kv_cache.scalar_type() == torch::kHalf);
   TORCH_CHECK(out.scalar_type() == torch::kHalf);
@@ -311,7 +317,12 @@ void page_attn_decode(
   uint32_t headV = kv_cache.size(totalDimsKv - 2);
   uint32_t pageSize = kv_cache.size(totalDimsKv - 3);
   uint32_t batches = seq_lens.size(0);
-  uint32_t headQk = headV << 2;
+  // Derive headQk from query tensor shape instead of hardcoding gqaRatio=4
+  uint32_t headQk = query.size(1);
+  TORCH_CHECK(headV > 0, "num_kv_heads must be positive");
+  uint32_t gqaRatio = headQk / headV;
+  TORCH_CHECK(gqaRatio * headV == headQk, "num_q_heads must be a multiple of num_kv_heads");
+  TORCH_CHECK(gqaRatio >= 4 && gqaRatio % 4 == 0, "gqaRatio must be a multiple of 4, got ", gqaRatio);
   uint32_t maxSeqLen = max_seq_len;
   uint32_t hiddenDimP = ((maxSeqLen + 63) / 64) * 64;
   uint32_t hiddenDimPMax = ((maxSeqLen + 63) / 64);
@@ -349,6 +360,7 @@ void page_attn_decode(
     hiddenDimP,
     hiddenDimPMax,
     maxSeqLen,
+    gqaRatio,
     kv_cache.device()
   );
 }
