@@ -104,6 +104,7 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
     fp16* __restrict__ z_out_ptr,
     int N, int H, int HV, int gdn_K, int gdn_V,
     float attn_scale, int64_t conv_stride0, int64_t ssm_stride0,
+    int inline_conv_shift,   // 1 = do conv_state shift inline (safe when N*HV<=32)
     nd_item<3>& ndi)
 {
     slm_init<2048>();
@@ -344,8 +345,11 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
             out, simd<fp16, 4>(0.0f));
     }
 
-    // ---- Phase 3: conv_state shift (hv==0 only to avoid cross-WG race) ----
-    if (conv_idx >= 0 && hv == 0) {
+    // ---- Phase 3: conv_state shift (inline path, only when N*HV <= 32) ----
+    // When N*HV > 32, the shift is done by a separate kernel to avoid a
+    // cross-WG race: hv==0's writes could land before a later-scheduled WG's
+    // Phase 1 reads for the same seq_idx.
+    if (inline_conv_shift && conv_idx >= 0 && hv == 0) {
         // lo chunk (all threads)
         block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start, simd<fp16, 64>(s1));
         block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start, simd<fp16, 64>(s2));
@@ -400,6 +404,97 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
 }
 
 /* ============================================================
+ * Conv-state shift kernel — runs AFTER the main fused kernel
+ * to avoid cross-WG race on conv_state.
+ *
+ * Grid: N × 1 × WG_SIZE  (one WG per sequence, WG_SIZE = 32)
+ * Each thread shifts its chunk: row0←row1, row1←row2, row2←x_new.
+ *
+ * In double_v mode (HV > 8 when H=4), v-threads also shift the
+ * hi-chunk (128 elements per v-head instead of 64).
+ * ============================================================ */
+ESIMD_INLINE void conv_state_shift_kernel(
+    const fp16* __restrict__ qkvz_ptr,
+    int64_t qkvz_stride0,
+    fp16* __restrict__ conv_state_ptr,
+    const int* __restrict__ conv_state_indices_ptr,
+    int N, int H, int HV, int gdn_K, int gdn_V,
+    int64_t conv_stride0,
+    nd_item<3>& ndi)
+{
+    const int seq_idx = ndi.get_group(0);
+    const int tid = ndi.get_local_id(2);
+
+    const int conv_idx = conv_state_indices_ptr[seq_idx];
+    if (conv_idx < 0) return;
+
+    const int heads_per_group = HV / H;
+    const int dim = 2 * H * gdn_K + HV * gdn_V;
+    const bool double_v = (HV > (32 - 4 * H) / 2);
+
+    const int group_dim = gdn_K + gdn_K + heads_per_group * gdn_V * 2;
+
+    // Compute qkvz_offset and chunk_start (same logic as main kernel)
+    int qkvz_offset = 0;
+    int chunk_start = 0;
+    int qkvz_offset_hi = 0;
+    int chunk_start_hi = 0;
+
+    if (tid < 2 * H) {
+        int q_head = tid / 2;
+        qkvz_offset = q_head * group_dim + (tid & 1) * 64;
+        chunk_start = tid * 64;
+    } else if (tid < 4 * H) {
+        int k_tid = tid - 2 * H;
+        int k_head = k_tid / 2;
+        qkvz_offset = k_head * group_dim + gdn_K + (k_tid & 1) * 64;
+        chunk_start = tid * 64;
+    } else if (double_v) {
+        int v_tid = tid - 4 * H;
+        int v_hv = v_tid;
+        int v_group = v_hv / heads_per_group;
+        int v_lane = v_hv % heads_per_group;
+        int base = v_group * group_dim + 2 * gdn_K + v_lane * gdn_V;
+        qkvz_offset = base;
+        qkvz_offset_hi = base + 64;
+        chunk_start = 4 * H * 64 + v_tid * 128;
+        chunk_start_hi = chunk_start + 64;
+    } else {
+        int v_tid = tid - 4 * H;
+        int v_hv = v_tid / 2;
+        int v_group = v_hv / heads_per_group;
+        int v_lane = v_hv % heads_per_group;
+        qkvz_offset = v_group * group_dim + 2 * gdn_K
+                     + v_lane * gdn_V + (v_tid & 1) * 64;
+        chunk_start = tid * 64;
+    }
+
+    const fp16* qkvz_row = qkvz_ptr + (int64_t)seq_idx * qkvz_stride0;
+    fp16* cstate_base = conv_state_ptr + (int64_t)conv_idx * conv_stride0;
+
+    // Read current state and new input
+    simd<float, 64> s1 = block_load<fp16, 64>(cstate_base + 1 * dim + chunk_start);
+    simd<float, 64> s2 = block_load<fp16, 64>(cstate_base + 2 * dim + chunk_start);
+    simd<fp16, 64> x_fp16 = block_load<fp16, 64>(qkvz_row + qkvz_offset);
+
+    // Shift: row0←row1, row1←row2, row2←x
+    block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start, simd<fp16, 64>(s1));
+    block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start, simd<fp16, 64>(s2));
+    block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start, x_fp16);
+
+    // Hi chunk (v-threads only, when double_v)
+    if (double_v && tid >= 4 * H) {
+        simd<float, 64> s1_hi = block_load<fp16, 64>(cstate_base + 1 * dim + chunk_start_hi);
+        simd<float, 64> s2_hi = block_load<fp16, 64>(cstate_base + 2 * dim + chunk_start_hi);
+        simd<fp16, 64> x_fp16_hi = block_load<fp16, 64>(qkvz_row + qkvz_offset_hi);
+
+        block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start_hi, simd<fp16, 64>(s1_hi));
+        block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start_hi, simd<fp16, 64>(s2_hi));
+        block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start_hi, x_fp16_hi);
+    }
+}
+
+/* ============================================================
  * Host Dispatcher
  * ============================================================ */
 inline void gdn_conv_fused_host(
@@ -424,6 +519,12 @@ inline void gdn_conv_fused_host(
     sycl::queue& q)
 {
     constexpr int WG_SIZE = 32;
+    const int total_wgs = N * HV;
+
+    // When total WGs fit in a single scheduling wave (<=32), all WGs run
+    // concurrently so the hv==0 inline conv_state shift is safe.  Otherwise
+    // split into two kernels to avoid the cross-WG read/write race.
+    const int inline_shift = (total_wgs <= WG_SIZE) ? 1 : 0;
 
     sycl::nd_range<3> Range(
         sycl::range<3>(N, HV, WG_SIZE),
@@ -437,7 +538,26 @@ inline void gdn_conv_fused_host(
                 A_log_ptr, dt_bias_ptr, ba_ptr, ba_stride0,
                 ssm_state_ptr, ssm_state_indices_ptr,
                 output_ptr, z_out_ptr,
-                N, H, HV, K, V, scale, conv_stride0, ssm_stride0, ndi);
+                N, H, HV, K, V, scale, conv_stride0, ssm_stride0,
+                inline_shift, ndi);
         });
     });
+
+    if (!inline_shift) {
+        // Separate kernel for conv_state shift — runs after kernel 1
+        // completes (in-order queue guarantees ordering).
+        sycl::nd_range<3> ShiftRange(
+            sycl::range<3>(N, 1, WG_SIZE),
+            sycl::range<3>(1, 1, WG_SIZE));
+
+        q.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(ShiftRange, [=](sycl::nd_item<3> ndi) SYCL_ESIMD_KERNEL {
+                conv_state_shift_kernel(
+                    qkvz_ptr, qkvz_stride0, conv_state_ptr,
+                    conv_state_indices_ptr,
+                    N, H, HV, K, V,
+                    conv_stride0, ndi);
+            });
+        });
+    }
 }
