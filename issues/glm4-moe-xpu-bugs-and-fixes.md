@@ -884,3 +884,21 @@ Optimized `apply()` method — 7.7x speedup:
 
 Theoretical max: 30μs × 50 experts × 2 GEMMs × 48 layers = 144ms/token = ~7 tok/s.
 Current: ~1.1s/token = 0.9 tok/s. Python overhead is ~88% of total time.
+
+### GPT-OSS-20B benchmark (2026-04-17)
+
+GPT-OSS-20B uses **IPEX marlin backend** with `GatedMLPMOE(is_mxfp4=True)`, NOT CUTLASS:
+
+```
+Using ipex marlin backend on XPU
+→ GatedMLPMOE(is_mxfp4=True) → torch.xpu.moe_gemm(is_mxfp4=True)
+```
+
+The same `GatedMLPMOE` wrapper that crashes with `is_int4=True` **works fine with `is_mxfp4=True`** on Xe2 iGPU. The bug is in IPEX's INT4 kernel path, not the MoE wrapper.
+
+| Model | Quant | Kernel | Gen tok/s | Layers | Experts |
+|-------|-------|--------|-----------|--------|---------|
+| GPT-OSS-20B | MXFP4 | IPEX moe_gemm | **3.0** | 24 | 32 |
+| Qwen3-VL-30B-A3B | INT4 GPTQ | oneDNN int4_w4a16 | **0.9** | 48 | 128 |
+
+Normalized per-layer: GPT-OSS gets 3.0/24=0.125 tok/s/layer, Qwen3-VL gets 0.9/48=0.019 tok/s/layer. MXFP4 is **~6.5x faster per layer** due to batched grouped GEMM vs sequential expert loop.
