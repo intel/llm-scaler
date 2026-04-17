@@ -258,36 +258,27 @@ void moe_up_routed_int4_kernel(
                 const uint32_t* w_base = gate_up_qweight + (size_t)eid * K_packed * two_dff;
                 const fp16* s_base = gate_up_scales + (size_t)eid * K_groups * two_dff;
 
-                // 4 sub-tiles of 16 for gate and up
-                const int g0 = n_start, g1 = n_start + 16, g2 = n_start + 32, g3 = n_start + 48;
-                const int u0 = intermediate_size + n_start, u1 = u0 + 16, u2 = u0 + 32, u3 = u0 + 48;
+                // 2 sub-tiles of 32 for gate and up (64 outputs total)
+                const int g0 = n_start, g1 = n_start + 32;
+                const int u0 = intermediate_size + n_start, u1 = u0 + 32;
 
-                simd<float, 16> ga0(0.f), ga1(0.f), ga2(0.f), ga3(0.f);
-                simd<float, 16> ua0(0.f), ua1(0.f), ua2(0.f), ua3(0.f);
+                simd<float, 32> ga0(0.f), ga1(0.f), ua0(0.f), ua1(0.f);
 
                 constexpr int unshuffle[8] = {0, 2, 4, 6, 1, 3, 5, 7};
 
                 for (int kp = 0; kp < K_packed; kp++) {
                     simd<fp16, 8> x_chunk = block_load<fp16, 8>(x_row + kp * 8);
 
-                    simd<uint32_t, 16> gp0 = block_load<uint32_t, 16>(w_base + (size_t)kp * two_dff + g0);
-                    simd<uint32_t, 16> gp1 = block_load<uint32_t, 16>(w_base + (size_t)kp * two_dff + g1);
-                    simd<uint32_t, 16> gp2 = block_load<uint32_t, 16>(w_base + (size_t)kp * two_dff + g2);
-                    simd<uint32_t, 16> gp3 = block_load<uint32_t, 16>(w_base + (size_t)kp * two_dff + g3);
-                    simd<uint32_t, 16> up0 = block_load<uint32_t, 16>(w_base + (size_t)kp * two_dff + u0);
-                    simd<uint32_t, 16> up1 = block_load<uint32_t, 16>(w_base + (size_t)kp * two_dff + u1);
-                    simd<uint32_t, 16> up2 = block_load<uint32_t, 16>(w_base + (size_t)kp * two_dff + u2);
-                    simd<uint32_t, 16> up3 = block_load<uint32_t, 16>(w_base + (size_t)kp * two_dff + u3);
+                    simd<uint32_t, 32> gp0 = block_load<uint32_t, 32>(w_base + (size_t)kp * two_dff + g0);
+                    simd<uint32_t, 32> gp1 = block_load<uint32_t, 32>(w_base + (size_t)kp * two_dff + g1);
+                    simd<uint32_t, 32> up0 = block_load<uint32_t, 32>(w_base + (size_t)kp * two_dff + u0);
+                    simd<uint32_t, 32> up1 = block_load<uint32_t, 32>(w_base + (size_t)kp * two_dff + u1);
 
                     int kg = kp / 16;
-                    simd<fp16, 16> gs0 = block_load<fp16, 16>(s_base + (size_t)kg * two_dff + g0);
-                    simd<fp16, 16> gs1 = block_load<fp16, 16>(s_base + (size_t)kg * two_dff + g1);
-                    simd<fp16, 16> gs2 = block_load<fp16, 16>(s_base + (size_t)kg * two_dff + g2);
-                    simd<fp16, 16> gs3 = block_load<fp16, 16>(s_base + (size_t)kg * two_dff + g3);
-                    simd<fp16, 16> us0 = block_load<fp16, 16>(s_base + (size_t)kg * two_dff + u0);
-                    simd<fp16, 16> us1 = block_load<fp16, 16>(s_base + (size_t)kg * two_dff + u1);
-                    simd<fp16, 16> us2 = block_load<fp16, 16>(s_base + (size_t)kg * two_dff + u2);
-                    simd<fp16, 16> us3 = block_load<fp16, 16>(s_base + (size_t)kg * two_dff + u3);
+                    simd<fp16, 32> gs0 = block_load<fp16, 32>(s_base + (size_t)kg * two_dff + g0);
+                    simd<fp16, 32> gs1 = block_load<fp16, 32>(s_base + (size_t)kg * two_dff + g1);
+                    simd<fp16, 32> us0 = block_load<fp16, 32>(s_base + (size_t)kg * two_dff + u0);
+                    simd<fp16, 32> us1 = block_load<fp16, 32>(s_base + (size_t)kg * two_dff + u1);
 
                     #pragma unroll
                     for (int b = 0; b < 8; b++) {
@@ -296,21 +287,15 @@ void moe_up_routed_int4_kernel(
 
                         ga0 += (convert<float>((gp0 >> shift) & 0xFu) - 8.f) * convert<float>(gs0) * xv;
                         ga1 += (convert<float>((gp1 >> shift) & 0xFu) - 8.f) * convert<float>(gs1) * xv;
-                        ga2 += (convert<float>((gp2 >> shift) & 0xFu) - 8.f) * convert<float>(gs2) * xv;
-                        ga3 += (convert<float>((gp3 >> shift) & 0xFu) - 8.f) * convert<float>(gs3) * xv;
                         ua0 += (convert<float>((up0 >> shift) & 0xFu) - 8.f) * convert<float>(us0) * xv;
                         ua1 += (convert<float>((up1 >> shift) & 0xFu) - 8.f) * convert<float>(us1) * xv;
-                        ua2 += (convert<float>((up2 >> shift) & 0xFu) - 8.f) * convert<float>(us2) * xv;
-                        ua3 += (convert<float>((up3 >> shift) & 0xFu) - 8.f) * convert<float>(us3) * xv;
                     }
                 }
 
                 const int routed_row = token * rows_per_token + k_idx;
                 fp16* out = intermediates + (size_t)routed_row * intermediate_size + n_start;
-                block_store<fp16, 16>(out,      convert<fp16>(ga0 / (1.f + exp(-ga0)) * ua0));
-                block_store<fp16, 16>(out + 16, convert<fp16>(ga1 / (1.f + exp(-ga1)) * ua1));
-                block_store<fp16, 16>(out + 32, convert<fp16>(ga2 / (1.f + exp(-ga2)) * ua2));
-                block_store<fp16, 16>(out + 48, convert<fp16>(ga3 / (1.f + exp(-ga3)) * ua3));
+                block_store<fp16, 32>(out,      convert<fp16>(ga0 / (1.f + exp(-ga0)) * ua0));
+                block_store<fp16, 32>(out + 32, convert<fp16>(ga1 / (1.f + exp(-ga1)) * ua1));
             });
     };
 
@@ -578,7 +563,7 @@ void moe_down_routed_int4_kernel(
 
     const int K_packed = intermediate_size / 8;
     const int K_groups = intermediate_size / 128;
-    const int n_out_tiles = hidden_size / 64;  // 64-wide tiles (4×16)
+    const int n_out_tiles = hidden_size / 64;  // 64-wide tiles (2×32)
 
     auto cgf = [&](sycl::handler& cgh) {
         cgh.parallel_for<class MoeDownRoutedInt4>(
@@ -598,21 +583,17 @@ void moe_down_routed_int4_kernel(
                 const fp16* s_base = down_scales + (size_t)eid * K_groups * hidden_size;
 
                 constexpr int unshuffle[8] = {0, 2, 4, 6, 1, 3, 5, 7};
-                simd<float, 16> acc0(0.f), acc1(0.f), acc2(0.f), acc3(0.f);
+                simd<float, 32> acc0(0.f), acc1(0.f);
 
                 for (int kp = 0; kp < K_packed; kp++) {
                     simd<fp16, 8> hi_chunk = block_load<fp16, 8>(hi + kp * 8);
 
-                    simd<uint32_t, 16> pk0 = block_load<uint32_t, 16>(w_base + (size_t)kp * hidden_size + n_start);
-                    simd<uint32_t, 16> pk1 = block_load<uint32_t, 16>(w_base + (size_t)kp * hidden_size + n_start + 16);
-                    simd<uint32_t, 16> pk2 = block_load<uint32_t, 16>(w_base + (size_t)kp * hidden_size + n_start + 32);
-                    simd<uint32_t, 16> pk3 = block_load<uint32_t, 16>(w_base + (size_t)kp * hidden_size + n_start + 48);
+                    simd<uint32_t, 32> pk0 = block_load<uint32_t, 32>(w_base + (size_t)kp * hidden_size + n_start);
+                    simd<uint32_t, 32> pk1 = block_load<uint32_t, 32>(w_base + (size_t)kp * hidden_size + n_start + 32);
 
                     int kg = kp / 16;
-                    simd<fp16, 16> sc0 = block_load<fp16, 16>(s_base + (size_t)kg * hidden_size + n_start);
-                    simd<fp16, 16> sc1 = block_load<fp16, 16>(s_base + (size_t)kg * hidden_size + n_start + 16);
-                    simd<fp16, 16> sc2 = block_load<fp16, 16>(s_base + (size_t)kg * hidden_size + n_start + 32);
-                    simd<fp16, 16> sc3 = block_load<fp16, 16>(s_base + (size_t)kg * hidden_size + n_start + 48);
+                    simd<fp16, 32> sc0 = block_load<fp16, 32>(s_base + (size_t)kg * hidden_size + n_start);
+                    simd<fp16, 32> sc1 = block_load<fp16, 32>(s_base + (size_t)kg * hidden_size + n_start + 32);
 
                     #pragma unroll
                     for (int b = 0; b < 8; b++) {
@@ -620,17 +601,13 @@ void moe_down_routed_int4_kernel(
                         float hv = (float)(fp16)hi_chunk[b];
                         acc0 += (convert<float>((pk0 >> shift) & 0xFu) - 8.f) * convert<float>(sc0) * hv;
                         acc1 += (convert<float>((pk1 >> shift) & 0xFu) - 8.f) * convert<float>(sc1) * hv;
-                        acc2 += (convert<float>((pk2 >> shift) & 0xFu) - 8.f) * convert<float>(sc2) * hv;
-                        acc3 += (convert<float>((pk3 >> shift) & 0xFu) - 8.f) * convert<float>(sc3) * hv;
                     }
                 }
 
                 float w = (float)routing_weights[route_idx];
                 fp16* out = output + (size_t)routed_row * hidden_size + n_start;
-                block_store<fp16, 16>(out,      convert<fp16>(acc0 * w));
-                block_store<fp16, 16>(out + 16, convert<fp16>(acc1 * w));
-                block_store<fp16, 16>(out + 32, convert<fp16>(acc2 * w));
-                block_store<fp16, 16>(out + 48, convert<fp16>(acc3 * w));
+                block_store<fp16, 32>(out,      convert<fp16>(acc0 * w));
+                block_store<fp16, 32>(out + 32, convert<fp16>(acc1 * w));
             });
     };
 
