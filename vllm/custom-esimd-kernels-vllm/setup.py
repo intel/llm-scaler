@@ -176,6 +176,8 @@ ext_modules.append(
         ],
         include_dirs=[
             root / "csrc" / "moe_batch",
+            root / "csrc" / "xpu" / "esimd_kernels",  # for moe_ops.h (TopK V2)
+            root / "csrc",  # for relative includes
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++20"],

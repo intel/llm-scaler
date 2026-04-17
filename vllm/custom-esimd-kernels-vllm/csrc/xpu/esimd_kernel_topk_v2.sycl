@@ -32,6 +32,8 @@ at::Tensor esimd_moe_topk_v2(
         moe_topk_v2_host<512, 8>(logits_ptr, values_ptr, indices_ptr, (int)T, q);
     } else if (num_experts == 256 && topk == 10) {
         moe_topk_v2_host<256, 10>(logits_ptr, values_ptr, indices_ptr, (int)T, q);
+    } else if (num_experts == 256 && topk == 8) {
+        moe_topk_v2_host<256, 8>(logits_ptr, values_ptr, indices_ptr, (int)T, q);
     } else if (num_experts == 128 && topk == 8) {
         moe_topk_v2_host<128, 8>(logits_ptr, values_ptr, indices_ptr, (int)T, q);
     } else if (num_experts == 128 && topk == 10) {

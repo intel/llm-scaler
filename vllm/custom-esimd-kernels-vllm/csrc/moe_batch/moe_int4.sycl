@@ -20,6 +20,7 @@
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
 
 #include "moe_topk.h"
+#include "../xpu/esimd_kernels/moe_ops.h"  // TopK V2 vectorized argmax
 
 using fp16 = sycl::half;
 using namespace sycl::ext::intel::esimd;
@@ -963,13 +964,21 @@ torch::Tensor moe_forward_full_int4(
 
     sycl::queue& queue = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
 
-    // ── TopK ──
-    moe_topk_forward_kernel_impl<class MoeTopKInt4>(
-        (const fp16*)logits.data_ptr(),
-        s_int4_topk_idx.data_ptr<int>(),
-        (fp16*)s_int4_topk_weight.data_ptr(),
-        n_tokens, (int)n_routed_experts, (int)top_k, /*norm=*/true,
-        queue);
+    // ── TopK (V2 vectorized argmax when supported, fallback to heap-based) ──
+    if (n_routed_experts == 256 && top_k == 8) {
+        moe_topk_v2_host<256, 8>(
+            (const fp16*)logits.data_ptr(),
+            (fp16*)s_int4_topk_weight.data_ptr(),
+            s_int4_topk_idx.data_ptr<int32_t>(),
+            n_tokens, queue);
+    } else {
+        moe_topk_forward_kernel_impl<class MoeTopKInt4>(
+            (const fp16*)logits.data_ptr(),
+            s_int4_topk_idx.data_ptr<int>(),
+            (fp16*)s_int4_topk_weight.data_ptr(),
+            n_tokens, (int)n_routed_experts, (int)top_k, /*norm=*/true,
+            queue);
+    }
 
     // ── Up: routed (INT4) — hybrid dispatch based on WI count ──
     int up_wis = n_tokens * top_k * (intermediate_size / 16);
