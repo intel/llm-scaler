@@ -1,6 +1,13 @@
 # GLM-4.7-Flash INT4 MoE: Marlin Shuffle DEVICE_LOST on Lunar Lake XPU
 
-## Status: Bug E (shuffle OOM) FIXED — Bug H (GatedMLPMOE broken for 64+ expert INT4 MoE) OPEN — Same as [IPEX #838](https://github.com/intel/intel-extension-for-pytorch/issues/838)
+## Status: Bug E FIXED — Bug H PARTIALLY SOLVED (crash fixed, kernel broken on Xe2)
+
+Bug H has two independent failures:
+1. **GatedMLPMOE crash** — SOLVED by bypassing with `torch.topk` + direct IPEX ops + oneDNN `int4_gemm_w4a16`
+2. **IPEX `group_mm_int4_out_marlin` returns zeros/NaN on Xe2** — UNSOLVED, kernel bug, blocks batched path
+
+**Working path**: oneDNN `int4_gemm_w4a16` sequential at 0.9 tok/s (0.999997 correlation with CPU reference).
+**Blocked path**: IPEX marlin batched at ~15 tok/s theoretical (kernel produces wrong output on Xe2).
 
 ## Problem
 
@@ -85,10 +92,12 @@ MXFP4 avoids both issues: no shuffle needed (Bug E), and GPT-OSS-20B only has
 `IPEXGPTQLinearMethod` instead of `GatedMLPMOE`.
 
 ### Implication for shared-memory iGPUs
-On shared-memory systems, **MXFP4 is the only vLLM-compatible quantization format
-that works for INT4-class MoE models** on Lunar Lake Xe2 iGPU. INT4 AutoRound models
-load successfully (Bug E fixed) but crash at first inference due to Bug H (attention
-→ MoE SYCL state pollution). The alternative path is llama.cpp GGUF via SYCL backend.
+INT4 AutoRound MoE inference now works on Lunar Lake Xe2 iGPU via oneDNN
+`int4_gemm_w4a16` sequential expert dispatch (0.9 tok/s, 0.999997 correlation).
+The "attention → MoE SYCL state pollution" theory was disproven — the crash was
+in GatedMLPMOE's `topk_softmax` with 128 experts, not attention corrupting Level Zero.
+The IPEX batched marlin kernel (`group_mm_int4_out_marlin`) returns zeros/NaN on
+Xe2 regardless of weight layout — blocked on Intel kernel fix.
 
 ## Bug H: GatedMLPMOE Broken for INT4 MoE with 64+ Experts — Known IPEX Bug
 
@@ -545,18 +554,23 @@ dominates. Possible optimizations:
   one call)
 - Future: oneDNN grouped/batched INT4 kernel (would eliminate per-expert loop)
 
-**Status: NEEDS END-TO-END TESTING** — The oneDNN path is implemented and
-produces correct dequantization. Full vLLM server test with a real INT4
-MoE model needed to verify coherent output and measure throughput.
+**Status: WORKING** — oneDNN path tested end-to-end on Qwen3-VL-30B-A3B (INT4 AutoRound,
+48 layers, 128 experts) on Lunar Lake Xe2. Produces coherent output (Chinese text
+from Chinese prompt). 0.9 tok/s after `.unique()` + `index_add_()` optimization.
+Bottleneck is 88% Python overhead in sequential expert loop.
+
+**IPEX marlin batched path BLOCKED** — `group_mm_int4_out_marlin` returns all-zero
+output (BF16 input) or NaN (FP16 input) on Xe2-LPG. Tested 4 weight layouts (raw,
+permute, permute+shuffle, raw+shuffle) — none produce correct output. Kernel is
+broken on Xe2. Needs upstream Intel fix.
 
 #### Migration options (ranked)
 
-1. **oneDNN `int4_gemm_w4a16` sequential expert dispatch** (implemented, needs testing)
-   — Patch `XPUGPTQMarlinMoEMethod` to use per-expert oneDNN INT4 GEMM.
+1. **oneDNN `int4_gemm_w4a16` sequential expert dispatch** (WORKING)
+   — Patch: `xpu_gptq_moe_int4_w4a16.patch`. Per-expert oneDNN INT4 GEMM.
    Reads native GPTQ int32 weights, proper INT4 dequantization. No IPEX
-   dependency. Default via `VLLM_XPU_MOE_BACKEND=onednn`. Slower than
-   batched approaches but correct. See `vllm_for_multi_arc.patch`.
-   **NEEDS END-TO-END TESTING.**
+   dependency. 0.9 tok/s on Qwen3-VL-30B-A3B (48 layers, 128 experts).
+   Verified: 0.999997 correlation with CPU float32 reference.
 
 2. **Use MXFP4 models** — works on Lunar Lake now (GPT-OSS-20B, 36 experts).
    Limited model selection but fully proven.

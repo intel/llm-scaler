@@ -30,7 +30,7 @@ Add an `elif isinstance(layer, FusedMoE)` branch after the `LinearBase` block th
 
 ### Patch
 
-[autoround_fusedmoe_ipex_routing.patch](../vllm/patches/autoround_fusedmoe_ipex_routing.patch)
+Fixed upstream in vLLM source tree. Original patch `autoround_fusedmoe_ipex_routing.patch` removed in commit 279a611.
 
 ### Upstream
 
@@ -53,7 +53,7 @@ Add `"top_k_experts"` to the lookup list: `["num_experts_per_tok", "top_k", "top
 
 ### Patch
 
-[gemma4_moe_top_k_experts.patch](../vllm/patches/gemma4_moe_top_k_experts.patch)
+Fixed upstream in vLLM source tree. Original patch `gemma4_moe_top_k_experts.patch` removed in commit 279a611.
 
 ### Upstream
 
@@ -76,7 +76,7 @@ Replace the `raise ValueError` with `logger.warning` and use `math.ceil` for com
 
 ### Patch
 
-[gptq_math_ceil_alignment.patch](../vllm/patches/gptq_math_ceil_alignment.patch)
+Fixed upstream in vLLM source tree. Original patch `gptq_math_ceil_alignment.patch` removed in commit 279a611.
 
 ### Upstream
 
@@ -181,7 +181,7 @@ N/A (architectural insight)
 
 ---
 
-## Bug H: Level Zero OUT_OF_RESOURCES during inference (HARD BLOCKER)
+## Bug H: Level Zero OUT_OF_RESOURCES during inference (HARD BLOCKER — see definitive analysis below)
 
 **Error**: `UR_RESULT_ERROR_OUT_OF_RESOURCES` (Level Zero error 40)
 **Location**: Various — sampler, attention, any kernel after resource pool exhaustion
@@ -254,29 +254,81 @@ vLLM / IPEX — the dequantization should produce the model's configured dtype (
 
 ---
 
+## Bug J: ESIMD decode kernel called for non-FP16 query
+
+**File**: `vllm_xpu_kernels/eagle_ops.py`
+
+### Problem
+
+The `eagle_ops.page_attn_decode` ESIMD kernel only supports FP16 query tensors. INT4 GPTQ models produce BF16 queries, causing a kernel crash.
+
+### Fix
+
+Add a `query.dtype == torch.float16` guard before calling the ESIMD decode path:
+```python
+if query.dtype == torch.float16:
+    eagle_ops.page_attn_decode(...)
+```
+
+### Patch
+
+[eagle_ops_dtype_check.patch](../vllm/patches/eagle_ops_dtype_check.patch)
+
+### Upstream
+
+vllm-xpu-kernels
+
+---
+
+## Bug K: torch.ops.vllm custom op dispatch incompatible with XPU
+
+**Files**: `vllm/attention/layer.py`, `vllm/model_executor/layers/fused_moe/layer.py`
+
+### Problem
+
+vLLM's `torch.ops.vllm.unified_attention_with_output` and `torch.ops.vllm.moe_forward` custom ops route through a torch-compile custom-op dispatch chain. On XPU with IPEX, this dispatch interacts poorly with the XPU allocator and Level Zero context, causing hangs or incorrect dispatch.
+
+### Fix
+
+Force XPU to bypass the custom ops and call `forward_impl` directly:
+
+- `xpu_attention_direct_call.patch`: Routes attention directly to the backend implementation
+- `xpu_moe_direct_call.patch`: Routes MoE directly to the backend implementation
+
+### Patch
+
+[xpu_attention_direct_call.patch](../vllm/patches/xpu_attention_direct_call.patch)
+[xpu_moe_direct_call.patch](../vllm/patches/xpu_moe_direct_call.patch)
+
+### Upstream
+
+vLLM — XPU backend should register its own custom op implementations or bypass the dispatch chain.
+
+---
+
 ## Status
 
-| Bug | Status | Applied to | Blocker? |
-|-----|--------|-----------|----------|
-| A | Fixed | site-packages + patch | No |
-| B | Fixed | site-packages + patch | No |
-| C | Fixed | site-packages + patch | No |
-| D | Fixed | site-packages + patch | No (GLM-4.7 MLA only) |
-| E | Fixed | site-packages + patch | No |
-| F | Fixed | site-packages + patch | No |
-| G | N/A | architectural insight | No |
-| **H** | **OPEN** | **Level Zero driver limit** | **YES — all INT4 GPTQ MoE** |
-| I | Workaround | site-packages | Blocked by H |
+| Bug | Status | Patch | Blocker? |
+|-----|--------|-------|----------|
+| A | Fixed upstream | (removed — in source tree) | No |
+| B | Fixed upstream | (removed — in source tree) | No |
+| C | Fixed upstream | (removed — in source tree) | No |
+| D | Fixed | `mla_xpu_return_attn_probs.patch` | No (GLM-4.7 MLA only) |
+| E | Fixed | `ipex_marlin_shuffle_skip_preshuffled.patch` | No |
+| F | Fixed | `xpu_worker_skip_profile_and_warmup.patch` | No |
+| G | N/A | (architectural insight) | No |
+| **H** | **Partial** | `xpu_gptq_moe_int4_w4a16.patch` | **YES — perf ceiling 0.9 tok/s** |
+| I | Fixed | `ipex_attention_dtype_cast.patch` | No |
+| J | Fixed | `eagle_ops_dtype_check.patch` | No |
+| K | Fixed | `xpu_attention_direct_call.patch` + `xpu_moe_direct_call.patch` | No |
+
+Bug H detail: Crash is solved (oneDNN bypass of GatedMLPMOE). Correctness is solved (0.999997 corr). But throughput is 0.9 tok/s (88% Python overhead in sequential expert loop). Batched IPEX marlin kernel (`group_mm_int4_out_marlin`) returns zeros/NaN on Xe2 — blocked on Intel kernel fix.
 
 ### Next steps
 
-1. **Upgrade compute-runtime** from `25.48.36300.8` to `26.09.37435.1` — newer versions include Level Zero resource pooling improvements that may fix Bug H
-   - **NOTE**: Partial upgrade (swapping `.so` only) fails with `built_ins.cpp` abort — ALL components (`libze_intel_gpu`, `intel-opencl`, `intel-ocloc`, `libigdgmm`) must be upgraded together as a matching set
-   - `LD_LIBRARY_PATH` override also fails — built-in kernel format is incompatible across versions
-   - Intel only ships DEBs on GitHub; Nobara/Fedora repos are stuck at `25.48.36300.8`
-   - Options: (a) rebuild all RPMs from source, (b) Docker container with Ubuntu + newer runtime, (c) wait for Nobara/Fedora packaging
-2. **Report to Intel IPEX** — `_IPEXGatedMLPMOEXPU` should reuse kernel objects across layers instead of creating one per layer
-3. **Consider MXFP4 quantization** for new MoE models — MXFP4 avoids the `_IPEXGatedMLPMOEXPU` path entirely and works on Lunar Lake (proven by GPT-OSS-20B)
+1. **File IPEX upstream bug** — `group_mm_int4_out_marlin` returns all-zero output (BF16) or NaN (FP16) on Xe2-LPG. Include 4-layout test results. This blocks the batched path (~15 tok/s theoretical).
+2. **Optimize oneDNN loop** — use IPEX C++ routing ops (`moe_rows_counts`, `moe_scatter`) to reduce Python overhead in the sequential `int4_gemm_w4a16` path. Target: 2-4 tok/s.
+3. **Consider MXFP4 re-quantization** — convert INT4 AutoRound weights to MXFP4 format. MXFP4 batched path works (GPT-OSS-20B at 3 tok/s). Quality impact unknown.
 
 ### Environment
 
@@ -431,7 +483,9 @@ A potential workaround would be to bypass `GatedMLPMOE` entirely and call `torch
 
 ---
 
-## Bug H Final Root Cause: Level Zero Context Pollution (2026-04-16)
+## Bug H Final Root Cause: Level Zero Context Pollution (2026-04-16) — SUPERSEDED
+
+> **Note (2026-04-17)**: This "context pollution" theory was disproven. Bypassing GatedMLPMOE and calling `group_mm_int4_out_marlin` directly works after attention without crashing (14,400+ calls completed). The real issue is two-fold: (1) GatedMLPMOE/topk_softmax crash with 128 experts (SOLVED by bypass), (2) the INT4 marlin kernel itself returns zeros/NaN on Xe2 (UNSOLVED — kernel bug). See "Bug H Definitive" section below.
 
 ### Definitive proof chain
 
@@ -919,3 +973,58 @@ CUTLASS `cutlass_grouped_gemm_interface(is_B_mxfp4=True)` with GPT-OSS-20B MXFP4
 **IPEX's `torch.xpu.moe_gemm`** handles 32 experts without crashing. The difference is in how they dispatch to the GPU — IPEX uses a different SYCL kernel template that's compatible with Xe2's Level Zero resource limits.
 
 This means: if we could use IPEX's `moe_gemm` with proper INT4 support, we'd get the batched performance. The IPEX INT4 path crashes for a different reason (Bug H: kernel bug in INT4 dequant, not resource limits).
+
+---
+
+## Bug H Definitive: Two Independent Failures (2026-04-17)
+
+Bug H is actually **two separate bugs**, not one:
+
+### Failure 1: GatedMLPMOE crash (SOLVED)
+
+`GatedMLPMOE(is_int4=True)` crashes with DEVICE_LOST on Xe2. Likely causes:
+- `torch.ops.torch_ipex.topk_softmax` with 128 experts (documented in IPEX #838)
+- The wrapper's INT4 code path internally (not the kernel)
+
+**Fix**: Bypass GatedMLPMOE entirely. Use `torch.topk` for routing + direct IPEX C++ ops (`moe_rows_counts`, `moe_scatter`, `group_mm_int4_out_marlin`, `silu_and_mul`, `moe_gather`). With `VLLM_INT4_MOE_MARLIN=1`, the full vLLM pipeline completes 14,400+ INT4 GEMM calls across 48 layers × 150 decodes without DEVICE_LOST or OUT_OF_RESOURCES.
+
+**Correction**: The earlier "Level Zero context pollution from attention" theory (lines 434-497) was wrong. The crash was in the GatedMLPMOE wrapper / topk_softmax, not in attention corrupting the Level Zero context. Direct `group_mm_int4_out_marlin` calls work fine after attention.
+
+### Failure 2: `group_mm_int4_out_marlin` returns wrong output on Xe2 (UNSOLVED)
+
+The kernel runs without crashing but produces **numerically incorrect results**. Tested with 4 weight layout candidates against a CPU float32 reference (1 expert, M=4, K=2048, N=768):
+
+| Layout candidate | BF16 input | FP16 input |
+|---|---|---|
+| A: raw `[E, K/8, N]` | all zero | corr=0.019 (near zero) |
+| B: permute `[E, N, K/8]` | all zero | NaN |
+| C: permute + marlin shuffle `[E, N, K/8]` | all zero | NaN |
+| D: raw + marlin shuffle `[E, K/8, N]` | all zero | NaN |
+
+- **BF16 input**: always returns all-zero output regardless of weight layout
+- **FP16 input**: returns near-zero correlation (layout A) or NaN (all others)
+- **No weight layout produces correct output** — the kernel itself is broken on Xe2
+
+The "unprecedented 15.4 tok/s" run with `VLLM_INT4_MOE_MARLIN=1` was actually the kernel returning zeros from every MoE layer. All-zero MoE contribution → deterministic downstream logits → greedy argmax picks token ID 0 (`!`). Not real computation.
+
+### Why MXFP4 works but INT4 doesn't
+
+`group_mm_mxfp4_out_marlin` (used by GPT-OSS-20B at 3 tok/s) works correctly on Xe2. The INT4 variant uses different SYCL kernel templates:
+- Different dequantization logic (integer vs microscaling float)
+- Different tile configurations (`dequant_s=128` vs `dequant_s=32`)
+- Possibly untested on Xe2-LPG by Intel (discrete GPU focus)
+
+### Current status
+
+| Path | Correct | Speed | Status |
+|---|---|---|---|
+| oneDNN `int4_gemm_w4a16` sequential | ✓ (0.999997 corr) | 0.9 tok/s | **Working** — only correct INT4 MoE path |
+| IPEX `group_mm_int4_out_marlin` batched | ✗ (zeros/NaN) | 15.4 tok/s* | **Blocked** — kernel broken on Xe2 |
+| IPEX `moe_gemm(is_mxfp4)` | ✓ | 3.0 tok/s | Working (different quant, GPT-OSS-20B) |
+| CUTLASS `grouped_gemm` | ✗ (crashes ≥16 experts) | N/A | **Broken** on Xe2 |
+
+\*not real computation — kernel returns zeros
+
+### Upstream action needed
+
+File bug on `intel/intel-extension-for-pytorch`: `group_mm_int4_out_marlin` returns all-zero output (BF16) or NaN (FP16) on Xe2-LPG (Lunar Lake Arc 140V). Include 4-layout test script and results. The MXFP4 variant works correctly on the same hardware, so this is specific to the INT4 kernel path.
