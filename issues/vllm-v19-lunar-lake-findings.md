@@ -384,11 +384,41 @@ Apply in order (all reside in `vllm/patches/`):
 | 4 | `xpu_compressed_tensors_moe_int4_cutlass_v19.patch` (new `f47f4a2`) | AWQ/compressed-tensors MoE → `xpu_fused_moe(is_int4=True)` |
 | 5 | `xpu_autoround_route_to_gptq_awq_v19.patch` | AutoRound XPU routing → GPTQ/AWQ paths |
 
-### Three launcher scripts (`~/bin/`)
+### Four launcher scripts (`~/bin/`)
 
-- `vllm-gptoss` — GPT-OSS-20B MXFP4
-- `vllm-qwen30b` — Qwen3-VL-30B AutoRound (pending re-verification with fixed patches)
-- `vllm-qwen-coder` — Qwen3-Coder-30B AWQ ✅ verified
+- `vllm-gptoss` — GPT-OSS-20B MXFP4 (port **8081**)
+- `vllm-qwen-coder` — Qwen3-Coder-30B AWQ (port 8080, default primary in openclaw)
+- `vllm-qwen30b` — Qwen3-VL-30B AutoRound (port 8080)
+- `vllm-qwen30b-gptq` — Qwen3-30B-A3B GPTQ (port 8080)
+
+Only one `:8080` launcher can run at a time. `vllm-gptoss` on `:8081` can run alongside any `:8080` launcher. openclaw routes the default model to `:8080` and the fallback to `:8081`.
+
+## Three-way INT4 MoE comparison on v0.19 + Lunar Lake (2026-04-19)
+
+All three Qwen3 30B INT4 MoE variants now run via the fixed `xpu_fused_moe(is_int4=True)` path (commit `f47f4a2`). Same bench recipe as above (random 1024 in / 1024 out × 3, concurrency=1) on the same hardware, back-to-back with `drop_caches` between runs.
+
+| Model | Quant format | group_size | Output tok/s | Peak | TTFT med | TPOT med |
+|---|---|---:|---:|---:|---:|---:|
+| **qwen3-coder-30b-a3b-instruct-awq-4bit** | compressed-tensors (pack-quantized) | **32** | **18.22** | 26.00 | 1354 ms | 58.1 ms |
+| qwen3-30b-a3b-gptq-int4 | gptq | 128 | 9.97 | 14.00 | 2085 ms | 99.6 ms |
+| qwen3-vl-30b-a3b-int4-autoround | auto-round | 128 | 9.68 | 13.00 | 2132 ms | 105.0 ms |
+
+### Key observation: group_size dominates throughput
+
+The three models are **architecturally identical** (Qwen3-30B-A3B MoE: hidden=2048, moe_inter=768, 128 experts, top-k=8, 48 layers; the VL variant adds a vision tower but it's not exercised by text-only bench). The only material differences are quant `group_size` and minor quant-method specifics.
+
+- **group_size=128 (GPTQ, AutoRound): 9.7–10.0 tok/s.** These two land within 3% of each other, confirming the AutoRound→GPTQ routing on XPU exposes the same kernel code path.
+- **group_size=32 (compressed-tensors "AWQ"): 18.22 tok/s.** ~1.83× faster.
+
+This suggests `vllm_xpu_kernels` v0.1.5's `cutlass_grouped_gemm_interface(is_B_int4=True)` has a measurably faster code path for group_size=32. Likely the scale-cache or dequant-unroll is tuned for smaller groups. For Lunar Lake users wanting max throughput on INT4 MoE today, **prefer group_size=32 compressed-tensors / AWQ variants when available**.
+
+### Prior-number correction confirmed
+
+The earlier entries in this doc claimed Qwen3-30B GPTQ @ **11.5 tok/s** and Qwen3-VL-30B AutoRound @ **9.3 tok/s**. The first is now measured at **9.97 tok/s** and the second at **9.68 tok/s** under the same recipe. The ~14% regression on GPTQ vs the earlier figure is consistent with the earlier number being bogus (IPEX-ops patch could not have executed on this venv); the VL AutoRound number is close enough that we can say the fixed kernel reproduces prior behavior without the IPEX-ops crash.
+
+### Naming note on "AWQ-4bit"
+
+`qwen3-coder-30b-a3b-instruct-awq-4bit` is labelled "AWQ" but the actual `quant_method` in its `config.json` is `compressed-tensors` with `pack-quantized` format and `symmetric=True` — effectively GPTQ-format INT4 with implicit zp=8, group_size=32. Neural Magic / llm-compressor toolchain defaults to group_size=32. "Classic" AWQ (AutoAWQ tool, asymmetric with explicit zero-points) defaults to group_size=128. So the 32-group here is a compressed-tensors convention, not inherent to AWQ.
 
 ## End-to-end verification on v0.19 + v0.1.5 wheel (2026-04-18, post-reboot)
 
