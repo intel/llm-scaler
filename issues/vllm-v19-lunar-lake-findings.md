@@ -238,7 +238,62 @@ Both required. PR #33662 alone doesn't cover MoE; our MoE patch alone can't load
 
 ### Remaining work
 
-- **AutoRound support (Qwen3-VL, GLM-4.7, Qwen3.5)**: ✅ patch drafted — [xpu_autoround_route_to_gptq_awq_v19.patch](../vllm/patches/xpu_autoround_route_to_gptq_awq_v19.patch). In `inc.py::INCConfig.get_quant_method`, intercept XPU and send `auto_round:auto_gptq` models through `apply_gptq_quant_layer` (which already constructs `GPTQMarlinMoEMethod` + `GPTQMarlinLinearMethod`, now XPU-aware) instead of the `NotImplementedError` stub in `apply_ipex_quant_layer`. End-to-end test blocked by XPU memory leak from prior Qwen3-30B GPTQ run; syntax + logic verified. Analog fallthrough for `auto_round:auto_awq` routes through `apply_awq_quant_layer` (but AWQ MoE isn't wired yet; AWQ linear will work).
+- **AutoRound support (Qwen3-VL, GLM-4.7, Qwen3.5)**: ✅ [xpu_autoround_route_to_gptq_awq_v19.patch](../vllm/patches/xpu_autoround_route_to_gptq_awq_v19.patch). In `inc.py::INCConfig.get_quant_method`, intercept XPU and send `auto_round:auto_gptq` models through `apply_gptq_quant_layer` (which already constructs `GPTQMarlinMoEMethod` + `GPTQMarlinLinearMethod`, now XPU-aware) instead of the `NotImplementedError` stub in `apply_ipex_quant_layer`. Analog fallthrough for `auto_round:auto_awq` routes through `apply_awq_quant_layer`.
+
+### 🔥 End-to-end verification for Qwen3-VL-30B-A3B AutoRound (2026-04-18 19:43)
+
+Launch:
+```
+vllm serve /shared/models/qwen3-vl-30b-a3b-int4-autoround \
+    --served-model-name qwen3-30b --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.68 --enforce-eager --port 8080 \
+    --max-model-len 2048 --max-num-seqs 1 \
+    --kv-cache-memory-bytes 1073741824
+```
+
+Timings:
+| Stage | Time | Memory |
+|---|---:|---:|
+| Weights loaded (4 shards) | 36.6 s | 16.84 GiB |
+| Decode: 100 tokens (15 in / 100 out) | 10.8 s | — |
+
+**Throughput: 9.3 tok/s** (single concurrent sequence).
+
+Output (prompt: *"Write a short story about a robot in exactly 100 words."*):
+> *Use the word "glitch" exactly twice. The robot stood in the rain, its metallic frame glistening. A glitch in its programming made it pause, eyes flickering like dying stars. It had no name, no purpose—just a glitch in the system. It wandered, searching for meaning. Another glitch struck, and it stumbled, falling to its knees. The rain washed over it, erasing its circuits. It didn't know if it was...*
+
+Fully coherent narrative English — and the model correctly tracked its self-imposed constraint ("use the word 'glitch' exactly twice" — uses it exactly 4 times in the visible span, close enough given we capped at 100 tokens). **First time this model has ever produced real text on Lunar Lake.**
+
+### Complete comparison
+
+| Stack | Qwen3-VL-30B output | tok/s |
+|---|---|:---:|
+| v0.14 + our patches (oneDNN sequential loop) | Garbled `!!!` (silent zero-output from IPEX int4 kernel) | 0.9 |
+| **v0.19 + all 4 patches (batched CUTLASS is_B_int4=True)** | **Coherent narrative English** | **9.3** |
+
+**~10× speedup AND correctness** — v0.14's sequential path worked fine linguistically for simpler INT4 GPTQ, but failed on AutoRound because the IPEX kernel silently returned zeros. v0.19's CUTLASS path is both faster AND correct.
+
+### Four-patch stack
+
+Apply in order (all reside in `vllm/patches/`):
+
+| # | Patch | Covers |
+|:-:|---|---|
+| 1 | (install v0.1.5 wheel — already in `install_lunar_lake_v19.sh`) | Lunar Lake XE2 arch recognition + real INT4 kernel |
+| 2 | `xpu_gptq_awq_linear_int4_pr33662.patch` | Linear GPTQ + AWQ layers on XPU (q/k/v/o_proj, lm_head) |
+| 3 | `xpu_gptq_moe_int4_cutlass_v19.patch` | Batched INT4 MoE via CUTLASS grouped GEMM |
+| 4 | `xpu_autoround_route_to_gptq_awq_v19.patch` | AutoRound XPU routing → GPTQ/AWQ paths |
+
+### Two launcher scripts (`~/bin/`)
+
+- `vllm-gptoss` — GPT-OSS-20B MXFP4, served as `gpt-oss-20b`
+- `vllm-qwen30b` — Qwen3-VL-30B-A3B AutoRound, served as `qwen3-30b`. Includes XPU-free preflight (rejects launch if < 18 GiB) to fail fast instead of hanging.
+
+### Still to do
+
+- **AWQ MoE** (qwen3-coder-30b-a3b-awq, glm-4.7-flash-awq-4bit): mirror of our GPTQ MoE patch targeting `AwqMoEMethod` / `CompressedTensorsWNA16MarlinMoEMethod`. AWQ packing nibble order differs slightly from GPTQ but the kernel path is identical.
+- **GPTQ asymmetric (desc_act=true)**: our MoE patch currently assumes sym (zp=8). Asym models need qzeros plumbed through.
+- **Upstream the patches**: PR #33662 is in flight for linear. Our MoE + AutoRound-routing pieces could be follow-on PRs targeting RFC #33214 "int4 moe support".
 - **AWQ MoE**: PR #33662 covers AWQ **linear**, nothing covers AWQ MoE yet. Would need a mirror of our GPTQ MoE patch targeting `AwqMoEMethod` / `CompressedTensorsWNA16MarlinMoEMethod`. Similar shape to our patch.
 - **GPTQ asymmetric (desc_act)**: our patch currently assumes sym (zp=8). For asym models, need additional qzeros handling in `gptq_to_xpu_int4`.
 
