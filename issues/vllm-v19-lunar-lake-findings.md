@@ -238,7 +238,7 @@ Both required. PR #33662 alone doesn't cover MoE; our MoE patch alone can't load
 
 ### Remaining work
 
-- **AutoRound support (Qwen3-VL, GLM-4.7, Qwen3.5)**: add Bug-A-style routing in `auto_round.py` to send XPU FusedMoE → `GPTQMarlinMoEMethod` (which now works), bypassing the `INC not supported during xpu kernel migration` error. One-file change using the same pattern as v0.14's `autoround_fusedmoe_ipex_routing.patch`.
+- **AutoRound support (Qwen3-VL, GLM-4.7, Qwen3.5)**: ✅ patch drafted — [xpu_autoround_route_to_gptq_awq_v19.patch](../vllm/patches/xpu_autoround_route_to_gptq_awq_v19.patch). In `inc.py::INCConfig.get_quant_method`, intercept XPU and send `auto_round:auto_gptq` models through `apply_gptq_quant_layer` (which already constructs `GPTQMarlinMoEMethod` + `GPTQMarlinLinearMethod`, now XPU-aware) instead of the `NotImplementedError` stub in `apply_ipex_quant_layer`. End-to-end test blocked by XPU memory leak from prior Qwen3-30B GPTQ run; syntax + logic verified. Analog fallthrough for `auto_round:auto_awq` routes through `apply_awq_quant_layer` (but AWQ MoE isn't wired yet; AWQ linear will work).
 - **AWQ MoE**: PR #33662 covers AWQ **linear**, nothing covers AWQ MoE yet. Would need a mirror of our GPTQ MoE patch targeting `AwqMoEMethod` / `CompressedTensorsWNA16MarlinMoEMethod`. Similar shape to our patch.
 - **GPTQ asymmetric (desc_act)**: our patch currently assumes sym (zp=8). For asym models, need additional qzeros handling in `gptq_to_xpu_int4`.
 
