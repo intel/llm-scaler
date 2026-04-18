@@ -48,6 +48,19 @@ echo ""
 
 log_info "Checking system..."
 
+# Guard: don't run as root (venv would land in /root/)
+if [ "$EUID" -eq 0 ]; then
+    log_error "Don't run as root — use your normal user. The script calls sudo when needed."
+    exit 1
+fi
+
+# Check GPU access permissions
+if [ ! -r /dev/dri/renderD128 ]; then
+    log_error "/dev/dri/renderD128 not accessible. Add user to render group:"
+    log_error "  sudo usermod -aG render $USER && newgrp render"
+    exit 1
+fi
+
 # Check for Intel GPU
 if ! lspci -nn | grep -qi '8086:64a0'; then
     log_warn "Arc 140V (64a0) not detected. Checking for any Intel GPU..."
@@ -98,6 +111,8 @@ REPO
 fi
 
 # Intel compute-runtime repo (provides Level-Zero + Intel GPU runtime)
+# NOTE: Uses RHEL 9 repo — Intel doesn't publish Fedora-native packages.
+# Works on Nobara/Fedora via --skip-unavailable; verify Level-Zero loaded below.
 if [ ! -f /etc/yum.repos.d/intel-graphics.repo ]; then
     sudo dnf install -y 'dnf-command(config-manager)' 2>/dev/null || true
     sudo tee /etc/yum.repos.d/intel-graphics.repo > /dev/null << 'REPO'
@@ -178,7 +193,7 @@ PY_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.versi
 log_info "System Python: $PY_VERSION"
 
 VENV_PYTHON="python3"
-if python3 -c "import sys; sys.exit(0 if sys.version_info[:2] <= (3,12) else 1)" 2>/dev/null; then
+if python3 -c "import sys; sys.exit(0 if (3,10) <= sys.version_info[:2] <= (3,12) else 1)" 2>/dev/null; then
     log_info "Python $PY_VERSION is compatible with PyTorch XPU."
 else
     log_warn "Python $PY_VERSION is too new for PyTorch XPU (needs <=3.12)."
@@ -263,7 +278,21 @@ XPU_WORKER=$(python3 -c "import vllm; import os; print(os.path.join(os.path.dirn
 if [ -n "$XPU_WORKER" ] && [ -f "$XPU_WORKER" ]; then
     if grep -q "torch.distributed.all_reduce" "$XPU_WORKER"; then
         log_info "Patching xpu_worker.py to disable CCL all_reduce warmup (single-GPU fix)..."
-        sed -i '/torch\.distributed\.all_reduce(/,/)/s/^/#/' "$XPU_WORKER"
+        python3 -c "
+import re, sys
+f = sys.argv[1]
+src = open(f).read()
+# Comment out torch.distributed.all_reduce(...) calls (may span multiple lines)
+patched = re.sub(
+    r'(\n)([ \t]*)(torch\.distributed\.all_reduce\([^)]*\))',
+    r'\1\2# \3  # disabled for single-GPU',
+    src)
+if patched != src:
+    open(f, 'w').write(patched)
+    print('Patched.')
+else:
+    print('No match found.')
+" "$XPU_WORKER"
         log_info "xpu_worker.py patched."
     else
         log_info "xpu_worker.py: no all_reduce warmup found (fixed in v0.19?)."
@@ -271,14 +300,19 @@ if [ -n "$XPU_WORKER" ] && [ -f "$XPU_WORKER" ]; then
 fi
 
 # Install extras
-# CRITICAL: Gemma 4 requires transformers>=5.5.0 but vLLM v0.19 pins transformers<5.
-# Force-install transformers>=5.5.0 after vLLM to override the pin.
-# See: https://github.com/vllm-project/vllm/issues/39204
+# Gemma 4 may need transformers>=5.x for full support, but 5.x is not yet
+# on PyPI stable. Try to install it; fall back to latest 4.x if unavailable.
 pip install --no-deps accelerate hf_transfer ijson 2>&1 | tail -3
-pip install 'transformers>=5.5.0' 2>&1 | tail -3
+if pip install 'transformers>=5.5.0' 2>&1 | tail -3; then
+    log_info "transformers 5.x installed (Gemma 4 full support)."
+else
+    log_warn "transformers 5.x not available on PyPI — installing latest 4.x."
+    log_warn "Gemma 4 models may need transformers>=5.5.0 when it's released."
+    pip install -U transformers 2>&1 | tail -3
+fi
 
 # Verify torch XPU is still intact after all pip installs
-TORCH_XPU_OK=$(python3 -c "import torch; print('yes' if torch.xpu._is_compiled() else 'no')" 2>/dev/null || echo "no")
+TORCH_XPU_OK=$(python3 -c "import torch; print('yes' if torch.xpu.is_available() else 'no')" 2>/dev/null || echo "no")
 if [ "$TORCH_XPU_OK" != "yes" ]; then
     log_warn "torch+xpu was overwritten by a dependency — reinstalling from XPU index..."
     pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
@@ -309,7 +343,7 @@ if [ ! -d "$INSTALL_DIR/vllm-xpu-kernels" ]; then
     # Clean stale build artifacts from previous failed attempts
     rm -rf "$INSTALL_DIR/vllm-xpu-kernels/build"
 
-    export MAX_JOBS=${MAX_JOBS:-6}
+    export MAX_JOBS=${MAX_JOBS:-4}
     log_info "Building XPU kernels with MAX_JOBS=$MAX_JOBS (expect 1.5-2 hours)..."
     pip install --no-build-isolation . 2>&1 | tail -5
 
@@ -321,16 +355,18 @@ if [ ! -d "$INSTALL_DIR/vllm-xpu-kernels" ]; then
     fi
 fi
 
-# Install triton-xpu — MUST uninstall plain triton first!
-pip uninstall triton triton-xpu -y 2>/dev/null || true
-pip install triton-xpu==3.6.0 --extra-index-url=https://download.pytorch.org/whl/test/xpu
+# Install triton-xpu — force-reinstall avoids leaving venv without any triton
+pip install --force-reinstall triton-xpu --extra-index-url=https://download.pytorch.org/whl/test/xpu 2>&1 | tail -5 || {
+    log_warn "triton-xpu install failed — trying to keep existing triton."
+    pip install triton 2>&1 | tail -3 || true
+}
 
 # Add activation helper to bashrc (v19 variant, doesn't conflict with v14 aliases)
 if ! grep -q "llm-scaler-vllm-v19" ~/.bashrc; then
     cat << 'BASHRC' >> ~/.bashrc
 
 # llm-scaler-vllm v0.19 (Lunar Lake)
-alias vllm-v19-activate='source ~/llm-scaler-vllm-v19/venv/bin/activate && source /opt/intel/oneapi/setvars.sh --force 2>/dev/null && export VLLM_TARGET_DEVICE=xpu'
+alias vllm-v19-activate='source ~/llm-scaler-vllm-v19/venv/bin/activate && source /opt/intel/oneapi/setvars.sh --force 2>/dev/null && export VLLM_TARGET_DEVICE=xpu && if [ -n "${MKLROOT:-}" ] && [ -f "$MKLROOT/lib/libmkl_core.so.2" ]; then export LD_PRELOAD="${MKLROOT}/lib/libmkl_core.so.2:${MKLROOT}/lib/libmkl_intel_thread.so.2:${MKLROOT}/lib/libmkl_intel_lp64.so.2${LD_PRELOAD:+:$LD_PRELOAD}"; fi'
 alias oneapi='source /opt/intel/oneapi/setvars.sh --force'
 BASHRC
 fi
