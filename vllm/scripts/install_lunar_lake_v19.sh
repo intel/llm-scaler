@@ -224,8 +224,10 @@ log_info "Venv Python: $VENV_PY_VERSION"
 pip install --upgrade pip wheel setuptools 2>&1 | tail -3
 
 log_info "Installing PyTorch XPU (this downloads ~2-3 GB, may take a while)..."
-pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
-    --index-url https://download.pytorch.org/whl/xpu
+# Pinning matches vLLM 0.19.0 requirements/xpu.txt: torch==2.10.0+xpu via
+# --extra-index-url (so PyPI is still searched for common deps).
+pip install --extra-index-url https://download.pytorch.org/whl/xpu \
+    torch==2.10.0+xpu torchvision==0.25.0 torchaudio==2.10.0
 
 # Verify PyTorch XPU
 python3 -c "
@@ -315,49 +317,59 @@ fi
 TORCH_XPU_OK=$(python3 -c "import torch; print('yes' if torch.xpu.is_available() else 'no')" 2>/dev/null || echo "no")
 if [ "$TORCH_XPU_OK" != "yes" ]; then
     log_warn "torch+xpu was overwritten by a dependency — reinstalling from XPU index..."
-    pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
-        --index-url https://download.pytorch.org/whl/xpu
+    pip install --extra-index-url https://download.pytorch.org/whl/xpu \
+        torch==2.10.0+xpu torchvision==0.25.0 torchaudio==2.10.0
 fi
 
-# ── Phase 5: Install XPU kernels + configure ─────────────────────────────────
+# ── Phase 5: Configure triton-xpu + environment ──────────────────────────────
+#
+# vllm-xpu-kernels: Phase 4's `pip install -r requirements/xpu.txt` already
+# installed the pre-built wheel `vllm_xpu_kernels==0.1.4` (pinned in vLLM
+# 0.19.0's requirements/xpu.txt). The 1.5-2 hour source build below is now
+# OPT-IN via VLLM_BUILD_XPU_KERNELS=1 — only needed if you want newer kernels
+# (e.g. v0.1.5) or a development build.
 
-log_info "Phase 5/5: Installing XPU kernels and configuring environment..."
+log_info "Phase 5/5: Configuring triton-xpu and environment..."
 
-# Remove stale build if previous attempt failed
-if [ -d "$INSTALL_DIR/vllm-xpu-kernels" ] && ! pip show vllm-xpu-kernels &>/dev/null; then
-    rm -rf "$INSTALL_DIR/vllm-xpu-kernels"
-fi
-if [ ! -d "$INSTALL_DIR/vllm-xpu-kernels" ]; then
-    cd "$INSTALL_DIR"
-    git clone https://github.com/vllm-project/vllm-xpu-kernels.git
-    cd vllm-xpu-kernels
-    # Use latest release tag compatible with v0.19 + torch 2.10
-    git checkout v0.1.5 2>/dev/null || git checkout main
-    # Remove conflicting version pins
-    sed -i 's|^--extra-index-url=https://download.pytorch.org/whl/xpu|# &|' requirements.txt 2>/dev/null || true
-    sed -i 's|^torch==2.10.0+xpu|# &|' requirements.txt 2>/dev/null || true
-    sed -i 's|^triton-xpu|# &|' requirements.txt 2>/dev/null || true
-    sed -i 's|^transformers|# &|' requirements.txt 2>/dev/null || true
-    pip install -r requirements.txt 2>&1 | tail -3
-
-    # Clean stale build artifacts from previous failed attempts
-    rm -rf "$INSTALL_DIR/vllm-xpu-kernels/build"
-
-    export MAX_JOBS=${MAX_JOBS:-6}
-    log_info "Building XPU kernels with MAX_JOBS=$MAX_JOBS (expect 1.5-2 hours)..."
-    pip install --no-build-isolation . 2>&1 | tail -5
-
-    if pip show vllm-xpu-kernels &>/dev/null; then
-        log_info "vllm-xpu-kernels installed successfully."
-    else
-        log_error "vllm-xpu-kernels build failed. Check errors above."
-        log_error "Retry: cd $INSTALL_DIR/vllm-xpu-kernels && MAX_JOBS=4 pip install --no-build-isolation ."
+if [ "${VLLM_BUILD_XPU_KERNELS:-0}" = "1" ]; then
+    log_info "VLLM_BUILD_XPU_KERNELS=1 — building vllm-xpu-kernels from source..."
+    if [ -d "$INSTALL_DIR/vllm-xpu-kernels" ] && ! pip show vllm-xpu-kernels &>/dev/null; then
+        rm -rf "$INSTALL_DIR/vllm-xpu-kernels"
     fi
+    if [ ! -d "$INSTALL_DIR/vllm-xpu-kernels" ]; then
+        cd "$INSTALL_DIR"
+        git clone https://github.com/vllm-project/vllm-xpu-kernels.git
+        cd vllm-xpu-kernels
+        git checkout v0.1.5 2>/dev/null || git checkout main
+        # Remove conflicting version pins from requirements.txt
+        sed -i 's|^--extra-index-url=https://download.pytorch.org/whl/xpu|# &|' requirements.txt 2>/dev/null || true
+        sed -i 's|^torch==2.10.0+xpu|# &|' requirements.txt 2>/dev/null || true
+        sed -i 's|^triton-xpu|# &|' requirements.txt 2>/dev/null || true
+        sed -i 's|^transformers|# &|' requirements.txt 2>/dev/null || true
+        pip install -r requirements.txt 2>&1 | tail -3
+        rm -rf "$INSTALL_DIR/vllm-xpu-kernels/build"
+        export MAX_JOBS=${MAX_JOBS:-6}
+        log_info "Building XPU kernels with MAX_JOBS=$MAX_JOBS (expect 1.5-2 hours)..."
+        pip install --no-build-isolation . 2>&1 | tail -5
+    fi
+else
+    log_info "Using pre-built vllm_xpu_kernels from requirements/xpu.txt (v0.1.4)."
+    log_info "Set VLLM_BUILD_XPU_KERNELS=1 to build from source instead."
 fi
 
-# Install triton-xpu — force-reinstall avoids leaving venv without any triton
-pip install --force-reinstall triton-xpu --extra-index-url=https://download.pytorch.org/whl/test/xpu 2>&1 | tail -5 || {
-    log_warn "triton-xpu install failed — trying to keep existing triton."
+if pip show vllm-xpu-kernels &>/dev/null || pip show vllm_xpu_kernels &>/dev/null; then
+    log_info "vllm-xpu-kernels is installed."
+else
+    log_warn "vllm-xpu-kernels not installed — re-run with VLLM_BUILD_XPU_KERNELS=1 if needed."
+fi
+
+# Install triton-xpu per vLLM 0.19.0 XPU docs:
+# https://github.com/vllm-project/vllm/blob/v0.19.0/docs/getting_started/installation/gpu.xpu.inc.md
+# "For torch 2.10 (the version in requirements/xpu.txt), the matching package
+#  is triton-xpu==3.6.0" — from the stable wheel index (NOT test/).
+pip install --force-reinstall triton-xpu==3.6.0 \
+    --extra-index-url=https://download.pytorch.org/whl/xpu 2>&1 | tail -5 || {
+    log_warn "triton-xpu==3.6.0 install failed — keeping existing triton."
     pip install triton 2>&1 | tail -3 || true
 }
 
