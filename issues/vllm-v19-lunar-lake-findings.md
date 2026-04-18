@@ -291,11 +291,104 @@ Apply in order (all reside in `vllm/patches/`):
 
 ### Still to do
 
-- **AWQ MoE** (qwen3-coder-30b-a3b-awq, glm-4.7-flash-awq-4bit): mirror of our GPTQ MoE patch targeting `AwqMoEMethod` / `CompressedTensorsWNA16MarlinMoEMethod`. AWQ packing nibble order differs slightly from GPTQ but the kernel path is identical.
 - **GPTQ asymmetric (desc_act=true)**: our MoE patch currently assumes sym (zp=8). Asym models need qzeros plumbed through.
 - **Upstream the patches**: PR #33662 is in flight for linear. Our MoE + AutoRound-routing pieces could be follow-on PRs targeting RFC #33214 "int4 moe support".
-- **AWQ MoE**: PR #33662 covers AWQ **linear**, nothing covers AWQ MoE yet. Would need a mirror of our GPTQ MoE patch targeting `AwqMoEMethod` / `CompressedTensorsWNA16MarlinMoEMethod`. Similar shape to our patch.
-- **GPTQ asymmetric (desc_act)**: our patch currently assumes sym (zp=8). For asym models, need additional qzeros handling in `gptq_to_xpu_int4`.
+
+## Correction: IPEX-ops bug in the first MoE patch (2026-04-18, evening)
+
+The original `xpu_gptq_moe_int4_cutlass_v19.patch` called `torch.ops.torch_ipex.moe_rows_counts` / `moe_scatter` / `moe_gather` / `silu_and_mul`. **These ops live in `intel_extension_for_pytorch`, which is archived and not installed in v0.19** — the v0.19 XPU stack switched to `vllm_xpu_kernels` entirely.
+
+When we launched Qwen3-Coder-30B-AWQ against the mirror-patched `CompressedTensorsWNA16MarlinMoEMethod`, it crashed with:
+```
+AttributeError: '_OpNamespace' 'torch_ipex' object has no attribute 'moe_rows_counts'
+```
+
+Investigating: `vllm_xpu_kernels v0.1.5` already ships a complete entry point, `vllm_xpu_kernels.fused_moe_interface.xpu_fused_moe(...)`, that does routing + grouped GEMM + activation + gather using `_moe_C` / `_xpu_C` / `_C` namespaces. It also applies the zp=8 transform internally (`implement_zp`), so weights must be packed as **raw u4 nibbles** (no `-8` subtract at pack time).
+
+### Fix (commit `f47f4a2`)
+
+Both `xpu_gptq_moe_int4_cutlass_v19.patch` and the new `xpu_compressed_tensors_moe_int4_cutlass_v19.patch` now:
+1. Pack GPTQ int32 → uint8 raw u4 (`lo | (hi << 4)`), no `-8`.
+2. Replace hand-rolled routing + gemm + activation + gather with a single `xpu_fused_moe(... is_int4=True)` call.
+
+### Prior numbers are suspect
+
+The earlier "Qwen3-30B GPTQ @ 11.5 tok/s" and "Qwen3-VL-30B AutoRound @ 9.3 tok/s" results above were produced while the (same) IPEX-ops patch was in place. Since those ops aren't registered in this venv, the runs that produced those numbers must have either:
+- Been misattributed to a v0.14 IPEX environment left in memory, or
+- Never actually hit the MoE apply path at all.
+
+Flagging them as **not independently reproducible until re-tested with the fixed (`f47f4a2`) patches**.
+
+## Qwen3-Coder-30B-A3B AWQ on v0.19 + Lunar Lake (2026-04-18, evening)
+
+First model **verified from scratch with the fixed patches**. Model: `qwen3-coder-30b-a3b-instruct-awq-4bit` (compressed-tensors `pack-quantized`, symmetric, group_size=32, 128 experts, 48 layers, bf16 activations).
+
+### Launcher: `~/bin/vllm-qwen-coder`
+
+```bash
+vllm serve /shared/models/qwen3-coder-30b-a3b-instruct-awq-4bit \
+    --served-model-name qwen3-coder \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.70 \
+    --enforce-eager \
+    --port 8080 \
+    --max-model-len 4096 \
+    --max-num-seqs 1 \
+    --kv-cache-memory-bytes 2147483648
+```
+
+Preflight rejects launch if XPU free < 18 GiB.
+
+### Quick completion smoke test
+
+Prompt: *"def fibonacci(n):\n    \"\"\"Return the nth Fibonacci number.\"\"\""*
+
+Output: valid, idiomatic recursive Python + usage example, 55 tokens in 5.37 s.
+
+### `vllm bench serve` — 1024 in / 1024 out × 3, concurrency=1
+
+```bash
+vllm bench serve \
+    --backend openai \
+    --base-url http://localhost:8080 \
+    --model qwen3-coder \
+    --tokenizer /shared/models/qwen3-coder-30b-a3b-instruct-awq-4bit \
+    --dataset-name random \
+    --random-input-len 1024 \
+    --random-output-len 1024 \
+    --num-prompts 3 \
+    --max-concurrency 1
+```
+
+| Metric | Value |
+|---|---:|
+| Successful requests | 3/3 |
+| Benchmark duration | 168.6 s |
+| **Output throughput** | **18.22 tok/s** (peak 26.00) |
+| Total throughput (in+out) | 36.44 tok/s |
+| TTFT mean / median / P99 | 2412 / 1354 / 4660 ms |
+| TPOT mean / median / P99 | 52.6 / 58.1 / 58.2 ms |
+| ITL median | 52.6 ms |
+
+TTFT median 1354 ms for 1024 input tokens ≈ **756 tok/s prefill**. TPOT ≈ 52 ms steady-state ≈ **19 tok/s decode** for 30B-class MoE on a 28 GiB unified-memory iGPU — matches MXFP4 (GPT-OSS-20B @ ~23 tok/s) to within the expected int4-vs-mxfp4 overhead, and confirms the batched CUTLASS grouped-GEMM path is delivering real performance.
+
+### Five-patch stack (supersedes earlier "four-patch stack")
+
+Apply in order (all reside in `vllm/patches/`):
+
+| # | Patch | Covers |
+|:-:|---|---|
+| 1 | (install `vllm_xpu_kernels v0.1.5` wheel — in `install_lunar_lake_v19.sh`) | Lunar Lake XE2 recognition + real INT4 kernel + `xpu_fused_moe` |
+| 2 | `xpu_gptq_awq_linear_int4_pr33662.patch` | Linear GPTQ + AWQ layers on XPU (q/k/v/o_proj, lm_head) |
+| 3 | `xpu_gptq_moe_int4_cutlass_v19.patch` (fixed `f47f4a2`) | GPTQ MoE → `xpu_fused_moe(is_int4=True)` |
+| 4 | `xpu_compressed_tensors_moe_int4_cutlass_v19.patch` (new `f47f4a2`) | AWQ/compressed-tensors MoE → `xpu_fused_moe(is_int4=True)` |
+| 5 | `xpu_autoround_route_to_gptq_awq_v19.patch` | AutoRound XPU routing → GPTQ/AWQ paths |
+
+### Three launcher scripts (`~/bin/`)
+
+- `vllm-gptoss` — GPT-OSS-20B MXFP4
+- `vllm-qwen30b` — Qwen3-VL-30B AutoRound (pending re-verification with fixed patches)
+- `vllm-qwen-coder` — Qwen3-Coder-30B AWQ ✅ verified
 
 ## End-to-end verification on v0.19 + v0.1.5 wheel (2026-04-18, post-reboot)
 
