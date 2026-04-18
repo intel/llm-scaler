@@ -140,9 +140,96 @@ With `vllm_xpu_kernels v0.1.5`, `FLASH_ATTN` works on Lunar Lake — no backend 
 
 ## What's not yet tested on v0.19 + Lunar Lake
 
-- End-to-end inference with the v0.1.5 kernel fix (blocked by the shared-mem leak above — needs a clean reboot to verify)
 - INT4 AutoRound MoE models (Qwen3-VL-30B-A3B, GLM-4.7-Flash). Expected to work via vLLM 0.19's new `XPUExperts` + vllm-xpu-kernels modular MoE — but we didn't get that far.
 - Gemma 4 models (would need the transformers v5 path)
+
+## End-to-end verification on v0.19 + v0.1.5 wheel (2026-04-18, post-reboot)
+
+GPT-OSS-20B MXFP4 with `--kv-cache-memory-bytes 2147483648` (2 GiB KV), `max_num_seqs=2`, `max_model_len=2048`, `enforce_eager=True`.
+
+### Model loading
+
+| Stage | Time |
+|---|---:|
+| Safetensors load (3 shards, warm cache) | 19.1 s |
+| Model init total | 23.8 s |
+| Memory | 12.87 GiB |
+
+### Decode benchmarks (`vllm bench serve --dataset-name random --num-prompt 5 --max-concurrency 1 --ignore-eos`)
+
+| Config | Output throughput (avg) | Peak | Median TPOT | Median TTFT |
+|---|---:|---:|---:|---:|
+| 128 in / 128 out | 19.1 tok/s | 24.0 tok/s | 43.1 ms | 214 ms |
+| 1024 in / 1024 out | 15.2 tok/s | 24.0 tok/s | 67.5 ms | 1066 ms |
+
+Steady-state decode is ~23 tok/s — **on par with v0.14's IPEX `GatedMLPMOE(is_mxfp4=True)` baseline of ~22 tok/s**, so MXFP4 models see no meaningful speedup on v0.19 (same kernel underneath; only the routing wrapper changed). The real v0.19 payoff is expected to be INT4 AutoRound MoE, where v0.14 was stuck at 0.9 tok/s due to our Python per-expert loop.
+
+### Serving config for openclaw integration
+
+`~/bin/vllm-gptoss` (one-shot launcher, no systemd needed):
+```bash
+vllm serve /shared/models/gpt-oss-20b \
+    --served-model-name gpt-oss-20b \        # openclaw sends this id
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.70 \
+    --enforce-eager \
+    --port 8080 \                             # matches openclaw's local provider
+    --max-model-len 65536 \                   # 64k context
+    --max-num-seqs 1 \                        # single concurrent seq (fits 3 GiB KV)
+    --kv-cache-memory-bytes 3221225472 \      # 3 GiB; 65536 × 48 KB = 3.07 GiB
+    --enable-auto-tool-choice \
+    --tool-call-parser openai \
+    --reasoning-parser openai_gptoss
+```
+
+**Important**: `--served-model-name` is required when `--model` is a filesystem path. Without it, the OpenAI API only accepts the full path as the `model` field and returns 404 for short ids like `"gpt-oss-20b"`.
+
+**Memory budget math at 64k context:**
+- KV per token (GPT-OSS-20B, GQA 8×64, bf16) = 2 × 8 × 64 × 2 B × 24 layers = 48 KB/token
+- 1 seq × 65536 tokens = 3.07 GiB
+- 2 seqs × 65536 tokens = 6.14 GiB (needs 7 GiB `--kv-cache-memory-bytes` for margin + util=0.82)
+- Single-seq config (above) is the safer default.
+
+## Finding 3 (expanded): XPU shared-memory leak is worse than first thought
+
+The leak is not confined to `SIGKILL` — even graceful shutdowns (Ctrl+C on `exec vllm serve`, SIGTERM to the engine) leak shared-memory mappings on Lunar Lake iGPU. Observed pattern across this session:
+
+| Event | XPU free after |
+|---|---:|
+| Post-reboot, clean | 28 GiB |
+| After 1st run (loaded model, bench, Ctrl+C) | 7-8 GiB |
+| `sync; echo 3 > drop_caches` | 21-27 GiB ← often recovers |
+| After 2nd crashed launch | 0.5-3 GiB |
+| After 3rd crashed launch | 0.5 GiB — stuck |
+| Reboot only reliable reset | 28 GiB |
+
+**Workaround for restart loop:**
+Before each `vllm-gptoss` relaunch:
+```bash
+sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
+```
+Recovers enough free XPU for a fresh launch in most cases. If free stays below ~15 GiB afterwards, reboot.
+
+**Why cache drop helps:** On Lunar Lake's unified memory, the XPU allocator's `mem_get_info()` counts the Linux page cache as "in use" even though it's reclaimable. Dropping caches makes the XPU allocator see the real free pool. This is separate from actual L0 shared-memory leaks, which are not reclaimable without reboot.
+
+**Upstream bug territory**: L0 driver should free mappings on process exit (any exit path) — Linux normally does this automatically for anon mmap, but L0's shared-mem pool has its own lifetime tracking that misses cleanup on some exit paths.
+
+## Summary of commits this session (CB5w6)
+
+| Commit | Purpose |
+|---|---|
+| `cbd1c2f` | Address critical issues in v19 install script (sudo guard, render check, etc.) |
+| `e254ae4` | Revert MAX_JOBS to 6 with rationale |
+| `43e284e` | Align install script with official vLLM 0.19 XPU recipe |
+| `43145e1` | Upgrade vllm-xpu-kernels → v0.1.5 (Lunar Lake XE2 fix) + this findings doc |
+| (next) | End-to-end verification + launcher script + memory-leak docs |
+
+## Files
+
+- `vllm/scripts/install_lunar_lake_v19.sh` — full installer (v0.1.5 fix included)
+- `~/bin/vllm-gptoss` — one-shot launcher (not committed, install manually via the snippet above)
+- `~/.openclaw/openclaw.json` — openclaw config (`providers.local.baseUrl = http://127.0.0.1:8080/v1`, default model set to `local/gpt-oss-20b`)
+- `issues/vllm-v19-lunar-lake-findings.md` — this doc
 
 ## Install script changes
 
