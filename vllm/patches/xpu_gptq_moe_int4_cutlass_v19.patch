@@ -1,83 +1,67 @@
-diff --git a/vllm/model_executor/layers/quantization/gptq_marlin.py b/vllm/model_executor/layers/quantization/gptq_marlin.py
---- a/vllm/model_executor/layers/quantization/gptq_marlin.py
-+++ b/vllm/model_executor/layers/quantization/gptq_marlin.py
-@@ -486,6 +486,17 @@
- class GPTQMarlinMoEMethod(FusedMoEMethodBase):
-     """MoE Marlin method with quantization."""
-
-+    # XPU INT4 MoE wiring (vLLM 0.19 + vllm-xpu-kernels >= v0.1.5)
-+    # Upstream's process_weights_after_loading + apply() on the default path
-+    # calls torch.ops._C.gptq_shuffle which is CUDA-only. The XPU branch below
-+    # replaces both steps with:
-+    #   - weight convert: int32-packed GPTQ  ->  [E, N, K/2] uint8 (2's-comp
-+    #     int4 = (nibble - 8) & 0xF), scales [E, N, K/GS]
-+    #   - apply: topk -> moe_rows_counts -> moe_scatter ->
-+    #            cutlass_grouped_gemm_interface(is_B_int4=True) x2 with silu
-+    #            -> moe_gather
-+    # Verified numerically against CPU fp32 ref: rel_diff < 0.005, corr = 1.0
-+
-     def __init__(
-         self,
-         quant_config: GPTQMarlinConfig,
-@@ -603,6 +614,75 @@
-         # Handle auto-round format: re-quantize when qzeros wasn't saved.
-         ...
-
-+        # --- XPU branch: convert GPTQ int32-packed -> uint8-packed 2's-comp ---
+--- vllm/model_executor/layers/quantization/gptq_marlin.py	(v0.19.0 upstream)
++++ vllm/model_executor/layers/quantization/gptq_marlin.py	(patched)
+@@ -659,6 +659,72 @@
+         layer.workspace = marlin_make_workspace_new(device, 4)
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 +        from vllm.platforms import current_platform
-+        if current_platform.is_xpu():
++
++        if current_platform.is_xpu() and self.quant_config.weight_bits == 4:
++            # XPU INT4 MoE path: upstream GPTQ uses CUDA-only
++            # gptq_marlin_moe_repack + marlin_moe_permute_scales. Instead,
++            # convert GPTQ int32-packed [E, K/8, 2N] -> uint8 2's-complement
++            # [E, 2N, K/2], scales to [E, 2N, K/GS], and route apply()
++            # through vllm_xpu_kernels' cutlass_grouped_gemm_interface
++            # (is_B_int4=True, verified real INT4 in v0.1.5).
 +            device = layer.w13_qweight.device
 +            num_experts = layer.w13_qweight.shape[0]
 +
 +            def gptq_to_xpu_int4(qw_i32):
-+                # qw_i32: [E, K/8, N] int32  (GPTQ: 8 nibbles per int32 along K)
-+                # out: [E, N, K/2] uint8 2's-complement int4, packed 2 nibbles/byte
-+                u32 = qw_i32.to(torch.int64) & 0xFFFFFFFF  # [E, K/8, N]
-+                # Unpack to [E, K, N] uint8 with values 0..15 (GPTQ nibbles)
-+                nibs = torch.stack([
-+                    ((u32 >> (p * 4)) & 0xF).to(torch.int32) for p in range(8)
-+                ], dim=2)  # [E, K/8, 8, N]
++                # qw_i32: [E, K/8, N] int32 (GPTQ: 8 nibbles per int32 along K)
++                # out: [E, N, K/2] uint8 2's-complement int4, 2 nibbles/byte
++                u32 = qw_i32.to(torch.int64) & 0xFFFFFFFF
++                nibs = torch.stack(
++                    [((u32 >> (p * 4)) & 0xF).to(torch.int32) for p in range(8)],
++                    dim=2,
++                )  # [E, K/8, 8, N]
 +                E = qw_i32.shape[0]
 +                N = qw_i32.shape[-1]
 +                unpacked = nibs.reshape(E, -1, N)  # [E, K, N]
-+                # zp=8 (symmetric GPTQ): (nibble - 8) & 0xF -> 2's-comp int4
++                # symmetric GPTQ: (nibble - 8) & 0xF -> 2's-comp int4
 +                int4 = ((unpacked - 8) & 0xF).to(torch.uint8)
-+                # Transpose to [E, N, K] then pack 2 nibbles per byte along K
 +                int4_nk = int4.permute(0, 2, 1).contiguous()  # [E, N, K]
-+                K_dim = int4_nk.shape[-1]
-+                lo = int4_nk[..., 0::2]   # [E, N, K/2]
-+                hi = int4_nk[..., 1::2]   # [E, N, K/2]
-+                packed = (lo | (hi << 4)).to(torch.uint8)     # [E, N, K/2]
-+                return packed
++                lo = int4_nk[..., 0::2]  # [E, N, K/2]
++                hi = int4_nk[..., 1::2]  # [E, N, K/2]
++                return (lo | (hi << 4)).to(torch.uint8)
 +
-+            # Do per-expert on CPU to keep XPU memory free.
++            # Transform per-tensor on CPU (frees XPU allocator).
 +            w13_cpu = layer.w13_qweight.detach().cpu()
-+            w2_cpu  = layer.w2_qweight.detach().cpu()
++            w2_cpu = layer.w2_qweight.detach().cpu()
 +            s13_cpu = layer.w13_scales.detach().cpu().permute(0, 2, 1).contiguous()
-+            s2_cpu  = layer.w2_scales.detach().cpu().permute(0, 2, 1).contiguous()
++            s2_cpu = layer.w2_scales.detach().cpu().permute(0, 2, 1).contiguous()
 +
-+            # Free original (GPTQ-format) XPU weights
-+            layer.w13_qweight.data = torch.empty(
-+                0, dtype=torch.int32, device=device)
-+            layer.w2_qweight.data = torch.empty(
-+                0, dtype=torch.int32, device=device)
++            # Free original GPTQ-format XPU tensors
++            layer.w13_qweight.data = torch.empty(0, dtype=torch.int32, device=device)
++            layer.w2_qweight.data = torch.empty(0, dtype=torch.int32, device=device)
 +            layer.w13_scales.data = torch.empty(
-+                0, dtype=layer.w13_scales.dtype, device=device)
++                0, dtype=layer.w13_scales.dtype, device=device
++            )
 +            layer.w2_scales.data = torch.empty(
-+                0, dtype=layer.w2_scales.dtype, device=device)
++                0, dtype=layer.w2_scales.dtype, device=device
++            )
 +            torch.xpu.empty_cache()
 +
-+            w13_cpu_xpu = gptq_to_xpu_int4(w13_cpu)  # [E, 2I, H/2] uint8
-+            w2_cpu_xpu  = gptq_to_xpu_int4(w2_cpu)   # [E, H, I/2]  uint8
++            w13_packed = gptq_to_xpu_int4(w13_cpu)  # [E, 2I, H/2]
++            w2_packed = gptq_to_xpu_int4(w2_cpu)    # [E, H,  I/2]
 +            del w13_cpu, w2_cpu
 +
-+            layer.xpu_w13 = w13_cpu_xpu.to(device)
-+            del w13_cpu_xpu
-+            layer.xpu_w2  = w2_cpu_xpu.to(device)
-+            del w2_cpu_xpu
++            layer.xpu_w13 = w13_packed.to(device)
++            del w13_packed
++            layer.xpu_w2 = w2_packed.to(device)
++            del w2_packed
 +            layer.xpu_s13 = s13_cpu.to(device)
 +            del s13_cpu
-+            layer.xpu_s2  = s2_cpu.to(device)
++            layer.xpu_s2 = s2_cpu.to(device)
 +            del s2_cpu
 +            torch.xpu.empty_cache()
 +
@@ -86,79 +70,103 @@ diff --git a/vllm/model_executor/layers/quantization/gptq_marlin.py b/vllm/model
 +            layer.xpu_int4_ready = True
 +            return
 +
-         # upstream CUDA path: torch.ops._C.gptq_shuffle(...) etc.
-         ...
-
-@@ -700,6 +780,75 @@
-         x: torch.Tensor,
-         router_logits: torch.Tensor,
-     ) -> torch.Tensor:
-+        # XPU INT4 MoE apply via cutlass_grouped_gemm_interface(is_B_int4=True).
-+        # See gptq_to_xpu_int4() above for weight layout.
+         is_a_8bit = self.input_dtype is not None and self.input_dtype.itemsize == 1
+ 
+         if is_a_8bit:
+@@ -902,6 +968,9 @@
+         topk_ids: torch.Tensor,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 +        if getattr(layer, "xpu_int4_ready", False):
-+            return self._apply_xpu_int4(layer, x, router_logits)
++            return self._apply_xpu_int4(layer, x, topk_weights, topk_ids)
 +
-         return self.kernel.apply(
-             layer, x, router_logits, ...
+         return fused_marlin_moe(
+             x,
+             layer.w13_qweight,
+@@ -927,3 +996,86 @@
+             input_dtype=self.input_dtype,
+             inplace=not self.moe.disable_inplace,
          )
 +
-+    def _apply_xpu_int4(self, layer, x, router_logits):
-+        from vllm_xpu_kernels import _xpu_C, _moe_C   # noqa: F401
++    def _apply_xpu_int4(self, layer, x, topk_weights, topk_ids):
++        # XPU INT4 MoE apply via vllm_xpu_kernels'
++        # cutlass_grouped_gemm_interface(is_B_int4=True) + IPEX routing ops.
++        # Weights were prepared in process_weights_after_loading.
++        from vllm_xpu_kernels import _xpu_C  # noqa: F401
++
 +        num_tokens, hidden_dim = x.shape
-+        top_k = layer.top_k
++        top_k = topk_ids.shape[-1]
 +        num_experts = layer.xpu_int4_num_experts
 +        group_size = layer.xpu_int4_group_size
-+        W13 = layer.xpu_w13      # [E, 2I, H/2] uint8
-+        W2  = layer.xpu_w2       # [E, H,  I/2] uint8
-+        S13 = layer.xpu_s13      # [E, 2I, H/GS]
-+        S2  = layer.xpu_s2       # [E, H,  I/GS]
++        W13 = layer.xpu_w13  # [E, 2I, H/2] uint8
++        W2 = layer.xpu_w2  # [E, H,  I/2] uint8
++        S13 = layer.xpu_s13  # [E, 2I, H/GS]
++        S2 = layer.xpu_s2  # [E, H,  I/GS]
 +        inter_size = W13.shape[1] // 2
 +
-+        # Routing: topk softmax (vectorized)
-+        topk_weights, topk_ids = torch.topk(
-+            router_logits.float(), k=top_k, dim=-1)
-+        topk_weights = torch.softmax(topk_weights, dim=-1)
-+        if layer.renormalize:
-+            topk_weights = topk_weights / topk_weights.sum(
-+                dim=-1, keepdim=True)
-+        topk_ids = topk_ids.to(torch.int32)
++        topk_ids_i32 = topk_ids.to(torch.int32)
++        topk_weights_f32 = topk_weights.to(torch.float32)
 +
-+        # C++ routing
++        # IPEX routing: counts + scatter
 +        rows_for_experts, expert_offsets = torch.ops.torch_ipex.moe_rows_counts(
-+            topk_ids, 0, num_experts)
++            topk_ids_i32, 0, num_experts
++        )
 +        reordered, mapped_slot = torch.ops.torch_ipex.moe_scatter(
-+            x, rows_for_experts, topk_ids, expert_offsets,
-+            0, num_experts, top_k)
++            x,
++            rows_for_experts,
++            topk_ids_i32,
++            expert_offsets,
++            0,
++            num_experts,
++            top_k,
++        )
 +
-+        # Prefix-sum offsets for cutlass_grouped_gemm
-+        ef_offset = torch.cat([
-+            torch.zeros(1, device=x.device, dtype=torch.int64),
-+            torch.cumsum(rows_for_experts.to(torch.int64), dim=0),
-+        ])
++        # Prefix-sum offsets for cutlass grouped gemm
++        ef_offset = torch.cat(
++            [
++                torch.zeros(1, device=x.device, dtype=torch.int64),
++                torch.cumsum(rows_for_experts.to(torch.int64), dim=0),
++            ]
++        )
 +
 +        M = num_tokens * top_k
-+        # Gemm1: W13
++        # GEMM1: W13 (gate+up)
 +        g1 = torch.empty((M, 2 * inter_size), dtype=x.dtype, device=x.device)
 +        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
-+            ptr_A=reordered, ptr_B=W13, ptr_scales=S13, ptr_bias=None,
-+            ptr_D=g1, expert_first_token_offset=ef_offset,
-+            N=2 * inter_size, K=hidden_dim, num_experts=num_experts,
-+            is_B_int4=True, is_B_mxfp4=False)
++            ptr_A=reordered,
++            ptr_B=W13,
++            ptr_scales=S13,
++            ptr_bias=None,
++            ptr_D=g1,
++            expert_first_token_offset=ef_offset,
++            N=2 * inter_size,
++            K=hidden_dim,
++            num_experts=num_experts,
++            is_B_int4=True,
++            is_B_mxfp4=False,
++        )
 +
 +        # SiLU + mul
 +        act = torch.empty((M, inter_size), dtype=x.dtype, device=x.device)
 +        act = torch.ops.torch_ipex.silu_and_mul(g1, act)
 +
-+        # Gemm2: W2
++        # GEMM2: W2 (down)
 +        g2 = torch.empty((M, hidden_dim), dtype=x.dtype, device=x.device)
 +        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
-+            ptr_A=act, ptr_B=W2, ptr_scales=S2, ptr_bias=None,
-+            ptr_D=g2, expert_first_token_offset=ef_offset,
-+            N=hidden_dim, K=inter_size, num_experts=num_experts,
-+            is_B_int4=True, is_B_mxfp4=False)
++            ptr_A=act,
++            ptr_B=W2,
++            ptr_scales=S2,
++            ptr_bias=None,
++            ptr_D=g2,
++            expert_first_token_offset=ef_offset,
++            N=hidden_dim,
++            K=inter_size,
++            num_experts=num_experts,
++            is_B_int4=True,
++            is_B_mxfp4=False,
++        )
 +
-+        # Gather
-+        out = torch.ops.torch_ipex.moe_gather(
-+            g2, topk_weights.to(torch.float32), mapped_slot,
-+            num_experts, top_k, False)
-+        return out
++        # Gather (weighted un-permutation)
++        return torch.ops.torch_ipex.moe_gather(
++            g2, topk_weights_f32, mapped_slot, num_experts, top_k, False
++        )

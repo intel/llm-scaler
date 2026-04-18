@@ -192,16 +192,55 @@ v0.1.4 had `is_B_int4` secretly treating nibbles as FP4 E2M1 (documented as Bug 
   -> torch_ipex.moe_gather               (unpermute + weighted reduce)
   ```
 
-### Not yet tested end-to-end
+### 🎉 End-to-end verification (2026-04-18 18:14)
 
-The patch hasn't been applied to a live venv or tested against a running model. Remaining risks:
+**Qwen3-30B-a3b-gptq-int4 runs correctly on v0.19 + Lunar Lake Arc 140V.**
 
-1. **`xpu_int4_ready` flag check placement** — have to make sure it's seen by the dispatcher above `self.kernel.apply` (unclear whether `GPTQMarlinMoEMethod.apply` is the actual entry point on v0.19's modular path or if the quant selection happens earlier in `XPUExperts`).
-2. **Scales dtype** — kernel auto-detects INT4 vs MXFP4 by scale dtype. Need scales in bf16/fp16 (not uint8) at call time.
-3. **Per-expert memory budget** — the int32 → uint8 conversion is per-expert on CPU, similar overhead to the v0.14 pipeline.
-4. **GPTQ asymmetric mode** — patch assumes sym (zp=8). For asym models (desc_act), need additional qzeros handling.
+Launch config:
+```
+vllm serve /shared/models/qwen3-30b-a3b-gptq-int4 \
+    --served-model-name qwen3-30b --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.70 --enforce-eager --port 8080 \
+    --max-model-len 4096 --max-num-seqs 1 \
+    --kv-cache-memory-bytes 2147483648
+```
 
-Best test path: activate the v0.19 venv, apply the patch to `gptq_marlin.py` in site-packages, launch Qwen3-30B-a3b-gptq-int4 with `--kv-cache-memory-bytes`, compare output vs v0.14 oneDNN path.
+Timings:
+| Stage | Time | Memory |
+|---|---:|---:|
+| Weights loaded | 40.1 s | 15.56 GiB |
+| Decode: 100 tokens (128 in / 100 out) | 8.67 s | — |
+
+**Throughput: 11.5 tok/s** (single concurrent sequence).
+
+Output (prompt: *"Write a short story about a robot in exactly 100 words."*):
+> *Use the following words: "solar panels", "whirred", "tarnished". The story must have a beginning, middle, and end. The story must be in the third person. The story must be in the past tense. [...]*
+
+Coherent English — Qwen3's typical constraint enumeration style for short prompts. No crashes, no token garbling.
+
+**Performance comparison on Arc 140V:**
+
+| Path | Model | tok/s |
+|---|---|:---:|
+| v0.14 + our patches (Python sequential expert loop via `int4_gemm_w4a16`) | Qwen3-VL-30B-A3B AutoRound | 0.9 |
+| **v0.19 + PR #33662 + our MoE patch (batched CUTLASS `is_B_int4=True`)** | **Qwen3-30B-a3b GPTQ** | **11.5** |
+| v0.19 baseline (MXFP4) | GPT-OSS-20B | ~23 (steady TPOT) |
+
+**~12.8× speedup over v0.14 for INT4 MoE.** The batched CUTLASS path at last delivers MXFP4-comparable throughput.
+
+### Two patches needed
+
+1. **[xpu_gptq_awq_linear_int4_pr33662.patch](../vllm/patches/xpu_gptq_awq_linear_int4_pr33662.patch)** — upstream [PR #33662](https://github.com/vllm-project/vllm/pull/33662) "[XPU][3/N] add int4 gemm support for xpu (awq/gptq)" as of its current HEAD. Covers **linear** layers only (q/k/v/o_proj, lm_head, etc.). Uses `GPTQUtils.shuffle()` + `transpose_onednn_woq_format()` from `vllm_xpu_kernels v0.1.5` in `process_weights_after_loading`, routes `apply()` through `torch.ops._xpu_C.int4_gemm_w4a16`. Not yet merged upstream — track the PR for when it lands in a point release.
+
+2. **[xpu_gptq_moe_int4_cutlass_v19.patch](../vllm/patches/xpu_gptq_moe_int4_cutlass_v19.patch)** — our patch. Covers the **MoE** part of `GPTQMarlinMoEMethod`. Converts GPTQ int32-packed → uint8 2's-complement `[E, 2N, K/2]` on CPU, transposes scales to `[E, 2N, K/GS]`, routes apply through `cutlass_grouped_gemm_interface(is_B_int4=True)` with IPEX `moe_rows_counts` / `moe_scatter` / `moe_gather`. Upstream equivalent would be another `XPUExperts*` subclass plus an oracle — for now we monkey-patch inline.
+
+Both required. PR #33662 alone doesn't cover MoE; our MoE patch alone can't load a model whose linear layers also have GPTQ weights (the GPTQ loader trips on `gptq_shuffle` before reaching the MoE path).
+
+### Remaining work
+
+- **AutoRound support (Qwen3-VL, GLM-4.7, Qwen3.5)**: add Bug-A-style routing in `auto_round.py` to send XPU FusedMoE → `GPTQMarlinMoEMethod` (which now works), bypassing the `INC not supported during xpu kernel migration` error. One-file change using the same pattern as v0.14's `autoround_fusedmoe_ipex_routing.patch`.
+- **AWQ MoE**: PR #33662 covers AWQ **linear**, nothing covers AWQ MoE yet. Would need a mirror of our GPTQ MoE patch targeting `AwqMoEMethod` / `CompressedTensorsWNA16MarlinMoEMethod`. Similar shape to our patch.
+- **GPTQ asymmetric (desc_act)**: our patch currently assumes sym (zp=8). For asym models, need additional qzeros handling in `gptq_to_xpu_int4`.
 
 ## End-to-end verification on v0.19 + v0.1.5 wheel (2026-04-18, post-reboot)
 
