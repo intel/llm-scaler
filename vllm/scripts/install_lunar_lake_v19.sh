@@ -343,7 +343,7 @@ if [ ! -d "$INSTALL_DIR/vllm-xpu-kernels" ]; then
     # Clean stale build artifacts from previous failed attempts
     rm -rf "$INSTALL_DIR/vllm-xpu-kernels/build"
 
-    export MAX_JOBS=${MAX_JOBS:-4}
+    export MAX_JOBS=${MAX_JOBS:-6}
     log_info "Building XPU kernels with MAX_JOBS=$MAX_JOBS (expect 1.5-2 hours)..."
     pip install --no-build-isolation . 2>&1 | tail -5
 
