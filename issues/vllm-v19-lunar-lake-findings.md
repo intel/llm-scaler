@@ -140,8 +140,68 @@ With `vllm_xpu_kernels v0.1.5`, `FLASH_ATTN` works on Lunar Lake — no backend 
 
 ## What's not yet tested on v0.19 + Lunar Lake
 
-- INT4 AutoRound MoE models (Qwen3-VL-30B-A3B, GLM-4.7-Flash). Expected to work via vLLM 0.19's new `XPUExperts` + vllm-xpu-kernels modular MoE — but we didn't get that far.
 - Gemma 4 models (would need the transformers v5 path)
+
+## INT4 MoE on v0.19 — current state (2026-04-18)
+
+### What DOES NOT work out of the box
+
+| Quant scheme | Failure mode |
+|---|---|
+| AutoRound INT4 (Qwen3-VL-30B, GLM-4.7-Flash) | `NotImplementedError: INC quantization is not supported during xpu kernel migration` — upstream explicitly disabled |
+| GPTQ INT4 (Qwen3-30B-a3b-gptq-int4) | `AttributeError: '_OpNamespace' '_C' object has no attribute 'gptq_shuffle'` — CUDA-only kernel, not ported |
+| AWQ 4-bit | same (`gptq_marlin_repack` CUDA-only per earlier investigation) |
+
+vLLM's RFC [#33214](https://github.com/vllm-project/vllm/issues/33214) confirms `int4 moe support` has no PR yet.
+
+### Key finding: the INT4 kernel itself IS ready in v0.1.5
+
+`vllm_xpu_kernels==0.1.5`'s `cutlass_grouped_gemm_interface(is_B_int4=True)` is a **real, correct INT4 kernel** on Xe2. Tested against expert 0 of Qwen3-VL-30B-A3B's gate_proj with a CPU fp32 dequant+matmul reference:
+
+```
+rel error:  0.003        (0.3% — bf16 noise floor)
+correlation: 1.000        (perfect)
+output range: [-3.27, 3.09]   vs ref [-3.26, 3.10]
+```
+
+v0.1.4 had `is_B_int4` secretly treating nibbles as FP4 E2M1 (documented as Bug in our earlier findings). v0.1.5 added a separate real INT4 code path: `is_B_int4 = uint8 B with non-uint8 scales`, `is_B_mxfp4 = uint8 B with uint8 E8M0 scales` — distinguished by the scale dtype.
+
+### Weight layout the kernel expects
+
+| Arg | Shape | Dtype | Encoding |
+|---|---|---|---|
+| `ptr_B` | `[E, N, K/2]` | uint8 | 2's complement int4: `(gptq_nibble - 8) & 0xF`, low-K nibble in low byte |
+| `ptr_scales` | `[E, N, K/GS]` | bf16 or fp16 | per-group scales (distinct dtype from uint8 B selects INT4 path) |
+| `ptr_A` | `[M_total, K]` | bf16 or fp16 | activations |
+| `expert_first_token_offset` | `[E+1]` | int64 | cumulative prefix sum of rows-per-expert |
+
+### Draft patch: wire GPTQ MoE through this kernel
+
+[xpu_gptq_moe_int4_cutlass_v19.patch](../vllm/patches/xpu_gptq_moe_int4_cutlass_v19.patch) monkey-patches `vllm/model_executor/layers/quantization/gptq_marlin.py::GPTQMarlinMoEMethod` on XPU:
+
+- **process_weights_after_loading**: converts GPTQ int32-packed `[E, K/8, 2N]` → uint8 2's-complement `[E, 2N, K/2]` on CPU (so XPU allocator isn't stressed), transposes scales to `[E, 2N, K/GS]`, moves to XPU. Sets `layer.xpu_int4_ready = True`.
+- **apply**: skips the CUDA-only `self.kernel.apply(...)` when `xpu_int4_ready`, runs:
+
+  ```
+  topk softmax
+  -> torch_ipex.moe_rows_counts          (routing counts)
+  -> torch_ipex.moe_scatter              (permute inputs)
+  -> cutlass_grouped_gemm(is_B_int4=True)  W13 × M rows
+  -> torch_ipex.silu_and_mul             (activation)
+  -> cutlass_grouped_gemm(is_B_int4=True)  W2  × M rows
+  -> torch_ipex.moe_gather               (unpermute + weighted reduce)
+  ```
+
+### Not yet tested end-to-end
+
+The patch hasn't been applied to a live venv or tested against a running model. Remaining risks:
+
+1. **`xpu_int4_ready` flag check placement** — have to make sure it's seen by the dispatcher above `self.kernel.apply` (unclear whether `GPTQMarlinMoEMethod.apply` is the actual entry point on v0.19's modular path or if the quant selection happens earlier in `XPUExperts`).
+2. **Scales dtype** — kernel auto-detects INT4 vs MXFP4 by scale dtype. Need scales in bf16/fp16 (not uint8) at call time.
+3. **Per-expert memory budget** — the int32 → uint8 conversion is per-expert on CPU, similar overhead to the v0.14 pipeline.
+4. **GPTQ asymmetric mode** — patch assumes sym (zp=8). For asym models (desc_act), need additional qzeros handling.
+
+Best test path: activate the v0.19 venv, apply the patch to `gptq_marlin.py` in site-packages, launch Qwen3-30B-a3b-gptq-int4 with `--kv-cache-memory-bytes`, compare output vs v0.14 oneDNN path.
 
 ## End-to-end verification on v0.19 + v0.1.5 wheel (2026-04-18, post-reboot)
 
