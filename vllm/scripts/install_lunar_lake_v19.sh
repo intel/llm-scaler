@@ -257,6 +257,17 @@ if ! pip show vllm &>/dev/null; then
     log_info "Installing vLLM XPU requirements..."
     pip install -r requirements/xpu.txt 2>&1 | tail -5
 
+    # Upgrade vllm_xpu_kernels v0.1.4 -> v0.1.5
+    # v0.1.4 (pinned in vLLM 0.19.0's requirements/xpu.txt) has a bug where
+    # is_xe2_arch() doesn't include intel_gpu_lnl_m — so Lunar Lake iGPU is
+    # rejected with "Only XE2 cutlass kernel is supported currently." error.
+    # v0.1.5 adds lnl_m to the allowlist. Source:
+    # https://github.com/vllm-project/vllm-xpu-kernels/blob/v0.1.5/csrc/utils.h
+    log_info "Upgrading vllm_xpu_kernels to v0.1.5 (Lunar Lake XE2 fix)..."
+    pip install --force-reinstall --no-deps \
+        https://github.com/vllm-project/vllm-xpu-kernels/releases/download/v0.1.5/vllm_xpu_kernels-0.1.5-cp38-abi3-manylinux_2_28_x86_64.whl \
+        2>&1 | tail -3
+
     export VLLM_TARGET_DEVICE=xpu
     export CPATH=/opt/intel/oneapi/dpcpp-ct/latest/include/:${CPATH:-}
     log_info "Building vLLM (this may take 10-30 minutes)..."
@@ -395,12 +406,21 @@ echo "  Python venv:  $VENV_DIR"
 echo ""
 echo "  Quick start:"
 echo "    vllm-v19-activate"
-echo "    vllm serve google/gemma-4-12b-it \\"
+echo "    vllm serve /shared/models/gpt-oss-20b \\"
 echo "        --enforce-eager \\"
-echo "        --dtype float16 \\"
-echo "        --gpu-memory-utilization 0.85 \\"
-echo "        --max-model-len 4096 \\"
-echo "        --host 127.0.0.1 --port 8000"
+echo "        --gpu-memory-utilization 0.6 \\"
+echo "        --max-model-len 2048 \\"
+echo "        --max-num-seqs 2 \\"
+echo "        --kv-cache-memory-bytes 2147483648 \\"
+echo "        --port 8080"
+echo ""
+echo "  Notes for Lunar Lake (28 GiB shared memory):"
+echo "    - --kv-cache-memory-bytes N bypasses vLLM's memory profile (v0.19"
+echo "      replacement for v0.14's VLLM_SKIP_PROFILE_RUN=1 + multiplier hack)."
+echo "    - XPU mem_get_info excludes page cache. If preflight fails:"
+echo "        sync && echo 3 | sudo tee /proc/sys/vm/drop_caches"
+echo "    - XPU shared memory leaks across crashed launches — reboot if you"
+echo "      hit 'Free memory (< 3 GiB)' on preflight."
 echo ""
 echo "  Gemma 4 models (native support in v0.19):"
 echo "    google/gemma-4-12b-it                     (FP16, ~24 GB)"
