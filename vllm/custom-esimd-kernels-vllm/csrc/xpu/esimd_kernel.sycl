@@ -126,6 +126,45 @@ at::Tensor esimd_gemv_fp8_pert_fused3(
     return o0;
 }
 
+// ---- INT4 GEMV: symmetric INT4 weight with per-group scale (group_size=128) ----
+
+#include "esimd_kernels/int4_GEMV.h"
+
+// Single INT4 GEMV.
+// input [1, K] fp16, weight [N, K/2] uint8 (packed), scale [N, K/128] fp16.
+// N inferred from weight.size(0), K inferred from weight.size(1) * 2.
+at::Tensor esimd_gemv_int4(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output) {
+    int64_t N = weight.size(0);
+    int64_t K = weight.size(1) * 2;  // packed: K/2 bytes → K elements
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_w, weight);
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    GEMV_int4_host(p_in, p_w, p_sc, p_out, N, K, dpcpp_queue);
+    return output;
+}
+
+// Fused 2-matrix INT4 GEMV: two GEMVs sharing the same input vector.
+// Used for GDN input projection (in_proj_qkvz + in_proj_ba).
+at::Tensor esimd_gemv_int4_fused2(
+    at::Tensor input,
+    at::Tensor w0, at::Tensor s0, at::Tensor o0,
+    at::Tensor w1, at::Tensor s1, at::Tensor o1) {
+    int64_t K = w0.size(1) * 2;  // packed: K/2 bytes → K elements
+    int64_t N0 = w0.size(0), N1 = w1.size(0);
+    EXTRACT_PTR(p_in, input);
+    EXTRACT_PTR(pw0, w0); EXTRACT_PTR(ps0, s0); EXTRACT_PTR(po0, o0);
+    EXTRACT_PTR(pw1, w1); EXTRACT_PTR(ps1, s1); EXTRACT_PTR(po1, o1);
+    auto& dpcpp_queue = get_device_queue(input);
+    uint8_t* wp[2] = {pw0, pw1};
+    uint8_t* sp[2] = {ps0, ps1};
+    uint8_t* op[2] = {po0, po1};
+    uint32_t ns[2] = {(uint32_t)N0, (uint32_t)N1};
+    GEMV_int4_fused_host<2>(p_in, wp, sp, op, ns, (uint32_t)K, dpcpp_queue);
+    return o0;
+}
+
 // ---- QKV Split + RMSNorm + RoPE fused kernel ----
 
 // Persistent cos/sin cache (allocated once, FP64 precision on host -> FP16 on device)
