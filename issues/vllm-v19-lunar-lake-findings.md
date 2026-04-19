@@ -515,3 +515,120 @@ Recovers enough free XPU for a fresh launch in most cases. If free stays below ~
 1. Phase 4 now force-reinstalls `vllm_xpu_kernels v0.1.5` after `pip install -r requirements/xpu.txt` pulls in v0.1.4.
 2. Quick-start example updated to show the `--kv-cache-memory-bytes` workaround and the drop-caches / reboot hints.
 3. (From earlier session) Phase 5 source build of vllm-xpu-kernels is now opt-in via `VLLM_BUILD_XPU_KERNELS=1` — pre-built wheel is default, saves ~2h.
+
+## Session 2026-04-19: unified-memory check fix + hybrid-MoE fix + 21 GiB ceiling
+
+### Finding 5: `mem_get_info.free` is wrong on unified memory
+
+`torch.xpu.mem_get_info(device)[0]` ("free") on Intel iGPUs (Lunar Lake / Arrow Lake / Panther Lake) excludes reclaimable Linux page cache. Reading the model safetensors during vLLM startup populates page cache, which drops the reported "free" by 5–10 GiB. The `request_memory()` check in `vllm/v1/worker/utils.py` compares this corrupt "free" against `util × total` and aborts with:
+
+```
+ValueError: Free memory on device xpu:0 (18.79/28.57 GiB) on startup
+is less than desired GPU memory utilization (0.7, 20.0 GiB).
+```
+
+This triggered even seconds after `drop_caches` — the act of vLLM itself reading the safetensors repopulates page cache below the check threshold.
+
+**Local fix (v0.19.0 venv)**: patch `vllm/utils/mem_utils.py::MemorySnapshot.measure()` to add an XPU branch mirroring the existing CUDA UMA branch (Orin/Thor/Spark). On XPU, `self.free_memory` is recomputed as `min(psutil.virtual_memory().available, self.total_memory)`, which correctly includes reclaimable page cache as free.
+
+Applied directly to site-packages:
+```
+/home/nobara-user/llm-scaler-vllm-v19/venv/lib/python3.12/site-packages/vllm/utils/mem_utils.py
+```
+
+Not yet captured as a `.patch` file in `vllm/patches/` (session ran out of time). Should be captured as `xpu_unified_memory_free_check_v19.patch` alongside the rest.
+
+**Upstream PR branch (cleaner shape)**: [`MegaStood/vllm xpu-integrated-gpu-mem`](https://github.com/MegaStood/vllm/tree/xpu-integrated-gpu-mem), targeting `vllm-project/vllm` main.
+
+- `vllm/platforms/xpu.py`: override `is_integrated_gpu()` to return `envs.VLLM_XPU_UNIFIED_MEMORY`
+- `vllm/envs.py`: register `VLLM_XPU_UNIFIED_MEMORY` env var (default `0`)
+- Main's `mem_utils.py` already routes through `is_integrated_gpu()` — refactored after v0.19.0 — so the XPU override slots in cleanly
+
+Default is False (opt-in) because `torch.xpu.get_device_properties()` lacks an `is_integrated` flag (CUDA has one), and a size-ratio heuristic would misclassify PVC-class deployments where HBM happens to match host RAM. Explicit env var is the safer default. Draft PR body at [issues/pr-xpu-integrated-gpu-body.md](./pr-xpu-integrated-gpu-body.md).
+
+### Finding 6: hybrid-MoE KV cache regression in v0.19
+
+v0.19.0 introduced [issue #38979](https://github.com/vllm-project/vllm/issues/38979): hybrid attention+Mamba/DeltaNet models fail at engine init with:
+
+```
+NotImplementedError: The page size of the layer is not divisible by
+the maximum page size. Cannot unify by adjusting block_size.
+```
+
+`unify_kv_cache_spec_page_size()` in `vllm/v1/core/kv_cache_utils.py` was hard-coded to fail when page sizes across layer types aren't evenly divisible. Qwen3.5-35B-A3B and similar hybrid models trip this.
+
+**Upstream fix**: [PR #40128](https://github.com/vllm-project/vllm/pull/40128) (open, not merged, not in v0.19.1). Replaces the hard `NotImplementedError` with LCM-based padding using `page_size_padded`.
+
+**Local cherry-pick** onto v0.19.0 venv's `kv_cache_utils.py` applied successfully — Qwen3.5-35B AutoRound loads and runs after this patch. The `page_size_padded` field on layer specs already exists in v0.19.0 (`kv_cache_interface.py:69`), so the PR drops in cleanly.
+
+Not yet captured as a `.patch` file in `vllm/patches/`. Should be `xpu_hybrid_moe_page_size_pr40128.patch`.
+
+### Four-way INT4 MoE bench update (2026-04-19)
+
+Same recipe (random 1024 in / 1024 out × 3, concurrency=1):
+
+| Model | Arch | Quant | gs | tok/s | TPOT | Notes |
+|---|---|---|---:|---:|---:|---|
+| Qwen3-Coder-30B AWQ | Qwen3-30B-A3B | compressed-tensors | **32** | **18.22** | 58 ms | baseline, GQA 8:1 |
+| Qwen3.5-35B AutoRound | Qwen3.5-35B-A3B (hybrid) | auto-round | 128 | 8.94 | 92 ms | needs PR #40128 cherry-pick |
+| Qwen3-30B-A3B GPTQ | Qwen3-30B-A3B | gptq | 128 | 9.97 | 100 ms | — |
+| Qwen3-VL-30B AutoRound | Qwen3-30B-A3B + vision | auto-round | 128 | 9.68 | 105 ms | — |
+| GLM-4.7-Flash AWQ | Glm4MoeLite (no GQA) | compressed-tensors | **32** | 6.58 | 150 ms | no GQA kills KV bandwidth |
+| GLM-4.7-Flash AutoRound | Glm4MoeLite (no GQA) | auto-round | 128 | 4.71 | 200 ms | worst case: no GQA + gs=128 |
+
+Cross-architecture observations:
+- **group_size=32 is ~1.4–1.8× faster** than gs=128 on the same architecture (still holds across GLM and Qwen3)
+- **GQA matters a lot** — GLM's 20:20 heads (no GQA) is 2–3× slower than Qwen3's 8:1 GQA at same gs, due to 5× higher KV read bandwidth per decode step
+- **Hybrid-MoE models fit** after #40128 cherry-pick
+
+### Finding 7: Hard 21 GiB model-weight ceiling on Lunar Lake
+
+On a 30.9 GiB system RAM / 28.57 GiB XPU-exposed Lunar Lake, the practical ceiling for model weights is **~21 GiB**. Beyond this, vLLM cannot satisfy the `free_memory ≥ util × total` check even with our patches.
+
+**Memory breakdown for a 21 GiB AutoRound model** (Qwen3.5-35B, measured):
+
+| Component | Amount |
+|---|---:|
+| Token/lm_head embeddings (bf16, untouched by INT4) | ~1.2 GiB |
+| MoE experts (int4 packed, w13 + w2 × 40 layers × 256 experts) | ~16.0 GiB |
+| Attention projections (int4) | ~0.24 GiB |
+| Routing gate + shared experts (bf16) | ~0.08 GiB |
+| Layer norms, biases | ~0.1 GiB |
+| **Model weights loaded** | **~19.26 GiB** (per log) |
+| Activations (decode workspace, MoE dispatch bufs) | ~0.5–1.0 GiB |
+| KV cache (`--kv-cache-memory-bytes 2147483648`) | 2.0 GiB |
+| Engine scratch, encoder cache | ~0.3 GiB |
+| **Total XPU footprint at steady state** | **~22.5 GiB** |
+| util budget (0.82 × 28.57) | 23.43 GiB |
+| Margin | ~0.9 GiB |
+| **Host-RAM visible (top / `free -h`)** | **28 / 30.9 GiB** |
+| Reserved: display + GT firmware + GSC + i915 driver + OS | ~2.3 GiB |
+
+**Why 23 GiB GPTQ won't fit** (Qwen3.5-35B GPTQ is 23 GiB on disk):
+- Total XPU footprint: 23 (model) + 1 (act) + 2 (KV) = 26 GiB
+- util needed: 26 / 28.57 = 0.91 → threshold **25.98 GiB free at init**
+- Pre-launch `psutil.available` ≈ 26 GiB, but drops 2 GiB during vLLM imports → 24 GiB
+- **Fails the free check** even with the UMA patch. Physics, not software.
+
+**Consequence**: AutoRound (typically 10–15% smaller than GPTQ for the same bit width, due to tighter quantization granularity) has a practical advantage on tight-memory hardware — it fits where GPTQ doesn't.
+
+### Launcher scripts (`~/bin/`) — updated inventory
+
+- `vllm-gptoss` — GPT-OSS-20B MXFP4 (port **8081**)
+- `vllm-qwen-coder` — Qwen3-Coder-30B AWQ (port 8080, default primary in openclaw, `--tool-call-parser qwen3_coder`)
+- `vllm-qwen30b` — Qwen3-VL-30B AutoRound (port 8080)
+- `vllm-qwen30b-gptq` — Qwen3-30B-A3B GPTQ (port 8080)
+- `vllm-glm-awq` — GLM-4.7-Flash AWQ (port 8080)
+- `vllm-glm-autoround` — GLM-4.7-Flash AutoRound (port 8080)
+- `vllm-qwen35b-autoround` — Qwen3.5-35B-A3B AutoRound (port 8080, `--gpu-memory-utilization 0.82`)
+
+Only one `:8080` launcher can run at a time. `vllm-gptoss` on `:8081` can run alongside any `:8080` launcher.
+
+### Outstanding work for next session
+
+1. **Capture in-venv patches as `.patch` files** in `vllm/patches/`:
+   - `xpu_unified_memory_free_check_v19.patch` (for `mem_utils.py`)
+   - `xpu_hybrid_moe_page_size_pr40128.patch` (cherry-pick of #40128 to `kv_cache_utils.py`)
+2. **Post draft comment to [PR #32899](https://github.com/vllm-project/vllm/pull/32899)** from laptop (draft at `issues/pr-32899-comment-draft.md`, already posted as of 2026-04-18)
+3. **Open PR from `MegaStood/vllm xpu-integrated-gpu-mem` against vllm-project/vllm main** (body at `issues/pr-xpu-integrated-gpu-body.md`)
+4. **Track upstream #38979 and #40128 resolution** — when merged, re-evaluate whether our cherry-pick is still needed or should be dropped
