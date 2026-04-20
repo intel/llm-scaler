@@ -19,6 +19,14 @@ static inline sycl::event submit_kernel(
     return queue.submit(kernel);
 }
 
+static inline bool isPowerOf2(uint32_t in) {
+  if (in == 0) {
+    return false;
+  } else {
+    return (in & (in - 1)) == 0 ? true : false;
+  }
+}
+
 static inline uint32_t getHighestBit(uint32_t in) {
   uint32_t ret = 0;
   uint32_t temp = in - 1;
@@ -164,7 +172,11 @@ void page_attention_forward_kernel(
   uint32_t* kvSeqLens,
   uint8_t* out,
   float* pState,
-  float* pMax,
+  float* pGroupMax,
+  float* pGlobalMax,
+  uint32_t* pPollP,
+  float* pTempOut,
+  float* pGlobalSoftmaxSum,
   uint32_t batches,
   uint32_t nTokens,
   uint32_t headQk,
@@ -180,6 +192,7 @@ void page_attention_forward_kernel(
   uint32_t gqaRatio,
   const torch::Device& device) {
   uint32_t groupH, groupV, groupD;
+  uint32_t flag = maxKvSeqLen > 1024 ? 0 : 1;
   uint32_t gqaGroups = gqaRatio / 4;
   // Phase1: each work group of 4 threads handles 4 q-heads sharing one kv-head
   // Total groups in dim0 = headV * gqaGroups (one group per 4-q-head chunk)
@@ -190,20 +203,28 @@ void page_attention_forward_kernel(
   sycl::range<3> localPaPhase1(4, 1, 1);
   sycl::nd_range<3> rangePaPhase1(globalPaPhase1, localPaPhase1);
 
-  // Phase2: each work group of 2 threads handles 4 q-heads for 16 output dims
-  groupH = headDim / 16;
+  groupH = headDim / 16 * (maxKvSeqLen + 1023) / 1024;
   groupV = headV * gqaGroups;
   groupD = batches;
   sycl::range<3> globalPaPhase2(groupH * 2, groupV, groupD);
   sycl::range<3> localPaPhase2(2, 1, 1);
   sycl::nd_range<3> rangePaPhase2(globalPaPhase2, localPaPhase2);
+
+  groupH = headDim / 16;
+  groupV = headQk;
+  groupD = batches;
+  sycl::range<3> globalPaPhase3(groupH, groupV, groupD);
+  sycl::range<3> localPaPhase3(1, 1, 1);
+  sycl::nd_range<3> rangePaPhase3(globalPaPhase3, localPaPhase3);
+
   std::function<void(sycl::handler&)> kernelPhase1;
   std::function<void(sycl::handler&)> kernelPhase2;
+  std::function<void(sycl::handler&)> kernelPhase3;
 
   kernelPhase1 = [&](sycl::handler& cgh) {
     cgh.parallel_for<class paPhase1Forward>(
       rangePaPhase1, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
-        sdpaDecodeGqa4Phase1(qState, kvCache, (uint8_t*)pState, pMax, pageTable, kvSeqLens,
+        sdpaDecodeGqa4Phase1(qState, kvCache, (uint8_t*)pState, pGroupMax, pGlobalMax, pPollP, pageTable, kvSeqLens,
           batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, gqaRatio, idx);
       });
     };
@@ -211,13 +232,24 @@ void page_attention_forward_kernel(
   kernelPhase2 = [&](sycl::handler& cgh) {
     cgh.parallel_for<class paPhase2Forward>(
       rangePaPhase2, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
-        sdpaDecodeGqa4Phase2((uint8_t*)pState, pMax, kvCache, out, pageTable, kvSeqLens,
-          batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, gqaRatio, idx);
+        sdpaDecodeGqa4Phase2((uint8_t*)pState, pGroupMax, kvCache, pGlobalMax, pTempOut, pGlobalSoftmaxSum, out, pageTable, kvSeqLens,
+          batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, maxKvSeqLen, flag, gqaRatio, idx);
+      });
+    };
+
+  kernelPhase3 = [&](sycl::handler& cgh) {
+    cgh.parallel_for<class paPhase3Forward>(
+      rangePaPhase3, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
+        sdpaDecodeGqa4Phase3(pTempOut, pGlobalSoftmaxSum, out, kvSeqLens,
+          batches, headV, maxKvSeqLen, gqaRatio, idx);
       });
     };
 
   submit_kernel(kernelPhase1, device, "page_attn_ph1 forward");
   submit_kernel(kernelPhase2, device, "page_attn_ph2 forward");
+  if (flag == 0) {
+    submit_kernel(kernelPhase3, device, "page_attn_ph3 forward");
+  }
 }
 
 
@@ -326,19 +358,35 @@ void page_attn_decode(
   uint32_t maxSeqLen = max_seq_len;
   uint32_t hiddenDimP = ((maxSeqLen + 63) / 64) * 64;
   uint32_t hiddenDimPMax = ((maxSeqLen + 63) / 64);
+  uint32_t reduceCount = ((maxSeqLen + 1023) / 1024);
   uint32_t nTokens = 1;
   uint32_t pageTableSizeLog2 = getHighestBit(pageSize);
   uint32_t pageTableBatchStride = block_table.stride(0);
 
   TORCH_CHECK(headDim == 256);
   TORCH_CHECK(max_query_len == 1);
+  TORCH_CHECK(isPowerOf2(pageSize));
+  TORCH_CHECK(pageTableSizeLog2 >= 6);
+  TORCH_CHECK(pageTableSizeLog2 <= 10);
 
-  torch::Tensor temp_p = torch::empty({ batches, headQk, hiddenDimP + hiddenDimPMax },
+  size_t szP = batches * headQk * hiddenDimP;
+  size_t szGroupMax = batches * headQk * hiddenDimPMax;
+  size_t szGlobalMax = batches * gqaRatio * headV;
+  size_t szGlobalPollP = batches * gqaRatio * headV;
+  size_t szOutTemp = batches * reduceCount * headDim * headQk;
+  size_t szGlobalSoftmaxSum = batches * reduceCount * headQk;
+  size_t totalSize = szP + szGroupMax + szGlobalMax + szGlobalPollP + szOutTemp + szGlobalSoftmaxSum;
+
+  torch::Tensor temp_p = torch::zeros({ static_cast<long>(totalSize) },
     torch::device(kv_cache.device()).dtype(torch::kFloat32));
 
-  size_t offsetMax = batches * headQk * hiddenDimP;
   float* pState = (float*)temp_p.data_ptr();
-  float* pMax = pState + offsetMax;
+  float* pGroupMax = pState + szP;
+  float* pGlobalMax = pGroupMax + szGroupMax;
+  uint32_t* pPollP = (uint32_t*)pGlobalMax + szGlobalMax;
+  float* pOutTemp = (float*)pPollP + szGlobalPollP;
+  float* pGloablSoftmaxSum = (float*)pOutTemp + szOutTemp;
+  sycl::queue& queue = c10::xpu::getCurrentXPUStream(kv_cache.device().index()).queue();
 
   page_attention_forward_kernel(
     (uint8_t*)query.data_ptr(),
@@ -347,7 +395,11 @@ void page_attn_decode(
     (uint32_t*)seq_lens.data_ptr(),
     (uint8_t*)out.data_ptr(),
     pState,
-    pMax,
+    pGroupMax,
+    pGlobalMax,
+    pPollP,
+    pOutTemp,
+    pGloablSoftmaxSum,
     batches,
     nTokens,
     headQk,
