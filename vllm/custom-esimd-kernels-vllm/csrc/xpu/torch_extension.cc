@@ -79,6 +79,18 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
         "int HV, int V, float eps) -> Tensor");
   m.impl("esimd_norm_gemv_fp8_pert", torch::kXPU, &esimd_norm_gemv_fp8_pert);
 
+  // Fused ResidualAdd + RMSNorm + INT4 GEMV (post_attn_norm + router)
+  m.def("esimd_resadd_norm_gemv_int4_pert(Tensor hidden_states, Tensor residual, "
+        "Tensor norm_weight, Tensor gemv_weight, Tensor gemv_scale, "
+        "Tensor output, Tensor normed_out, float eps) -> Tensor");
+  m.impl("esimd_resadd_norm_gemv_int4_pert", torch::kXPU, &esimd_resadd_norm_gemv_int4_pert);
+
+  // Fused RMSNormGated + INT4 GEMV (out_proj for GDN layers)
+  m.def("esimd_norm_gemv_int4_pert(Tensor x, Tensor z, Tensor norm_weight, "
+        "Tensor gemv_weight, Tensor gemv_scale, Tensor output, "
+        "int HV, int V, float eps) -> Tensor");
+  m.impl("esimd_norm_gemv_int4_pert", torch::kXPU, &esimd_norm_gemv_int4_pert);
+
   m.def("esimd_fused_add_rms_norm(Tensor hidden_states, Tensor residual, "
         "Tensor weight, float eps) -> Tensor");
   m.impl("esimd_fused_add_rms_norm", torch::kXPU, &esimd_fused_add_rms_norm);

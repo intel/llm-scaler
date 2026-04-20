@@ -106,6 +106,19 @@ at::Tensor esimd_resadd_norm_gemv_fp8_pert(
     at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output, at::Tensor normed_out,
     double eps);
 
+// Fused ResidualAdd + RMSNorm + INT4 GEMV (post_attn_norm + router)
+// hidden_states: [1, K] fp16
+// residual:      [1, K] fp16 (updated in-place)
+// norm_weight:   [K] fp16
+// gemv_weight:   [N, K/8] int32 — packed INT4
+// gemv_scale:    [N, K/128] fp16 — per-block scale
+// output:        [1, N] fp16
+// normed_out:    [1, K] fp16
+at::Tensor esimd_resadd_norm_gemv_int4_pert(
+    at::Tensor hidden_states, at::Tensor residual, at::Tensor norm_weight,
+    at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output, at::Tensor normed_out,
+    double eps);
+
 // Fused ResidualAdd + RMSNorm + 2-matrix FP8 GEMV (input_norm + GDN in_proj)
 at::Tensor esimd_resadd_norm_gemv2_fp8_pert(
     at::Tensor hidden_states, at::Tensor residual, at::Tensor norm_weight,
@@ -121,6 +134,18 @@ at::Tensor esimd_resadd_norm_gemv2_fp8_pert(
 // gemv_scale:   [1] fp32 — per-tensor FP8 scale
 // output:       [1, N] fp16
 at::Tensor esimd_norm_gemv_fp8_pert(
+    at::Tensor x, at::Tensor z, at::Tensor norm_weight,
+    at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output,
+    int64_t HV, int64_t V, double eps);
+
+// Fused RMSNormGated + INT4 GEMV for GDN out_proj decode path
+// x:            [HV, V] fp16 — core_attn_out from GDN kernel
+// z:            [HV, V] fp16 — z_out from GDN kernel
+// norm_weight:  [V] fp16 — RMSNorm weight (per head_v_dim)
+// gemv_weight:  [N, K/8] int32, K = HV*V — packed INT4 out_proj weight
+// gemv_scale:   [N, K/128] fp16 — per-block INT4 scale
+// output:       [1, N] fp16
+at::Tensor esimd_norm_gemv_int4_pert(
     at::Tensor x, at::Tensor z, at::Tensor norm_weight,
     at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output,
     int64_t HV, int64_t V, double eps);
