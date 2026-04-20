@@ -48,6 +48,7 @@ COPY ./patches/vllm_for_multi_arc.patch /tmp/
 ENV LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/local/lib/"
 ENV VLLM_TARGET_DEVICE=xpu
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
+ENV PYTORCH_ALLOC_CONF="expandable_segments:True"
 
 # suppress the python externally managed environment error
 RUN python3 -m pip config set global.break-system-packages true
@@ -61,7 +62,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install arctic-inference==0.1.1 && \
     # pip install --no-cache-dir arctic-inference==0.1.1 && \
     export CPATH=/opt/intel/oneapi/dpcpp-ct/2025.2/include/:${CPATH} && \
-    pip install --no-build-isolation . 
+    pip install --no-build-isolation .
 
 # Clone + patch miner-U
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -104,11 +105,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install git+https://github.com/huggingface/transformers.git && \
     pip install ijson
 
+COPY ./patches/vllm-xpu-kernels-aot.patch /tmp/
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm && \
     git clone https://github.com/vllm-project/vllm-xpu-kernels.git && \
     cd vllm-xpu-kernels && \
     git checkout 4c83144 && \
+    git apply /tmp/vllm-xpu-kernels-aot.patch && \
     sed -i 's|^--extra-index-url=https://download.pytorch.org/whl/xpu|# --extra-index-url=https://download.pytorch.org/whl/xpu|' requirements.txt && \
     sed -i 's|^torch==2.10.0+xpu|# torch==2.10.0+xpu|' requirements.txt && \
     sed -i 's|^triton-xpu|# triton-xpu|' requirements.txt && \
@@ -131,7 +134,7 @@ ENV VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 # install development dependencies (for testing)
 RUN cd /llm/vllm && \
     python3 -m pip install -e tests/vllm_test_utils
-    
+
 RUN pip uninstall oneccl oneccl-devel -y
 
 RUN rm /usr/lib/python3/dist-packages/PyJWT-2.7.0.dist-info/ -rf

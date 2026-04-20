@@ -1,0 +1,41 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index aad3274..d6afef0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -150,6 +150,10 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
+   set(SYCL_FIRST_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/csrc/sycl_first.h")
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -include ${SYCL_FIRST_HEADER}")
+
++  # TODO: make AOT configurable
++  set(AOT_DEVICES "bmg,bmg-g21-a0,bmg-g31-a0")
++  set(XE2_AOT_DEVICES "bmg,bmg-g21-a0,bmg-g31-a0")
++
+   # ============= COMPILE OPTIONS ==================
+   set(SYCL_FLAGS "")
+   set(SYCL_KERNEL_OPTIONS)
+@@ -163,6 +167,9 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
+   set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} ${SYCL_KERNEL_OPTIONS})
+
+   set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} "-O3" "-DNDEBUG")
++  if(AOT_DEVICES)
++    set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} -fsycl-targets=spir64_gen)
++  endif()
+   # Final build option be like: icpx -fsycl -fsycl-target=spir64_gen
+   # ${SYCL_KERNEL_OPTIONS} -fsycl-host-compiler=gcc
+   # -fsycl-host-compiler-options='${CMAKE_HOST_FLAGS}' kernel.cpp -o kernel.o
+@@ -180,9 +187,13 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
+       "-Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate"
+   )
+
++  if(AOT_DEVICES)
++    list(APPEND SYCL_DEVICE_LINK_FLAGS -fsycl-targets=spir64_gen
++         -Xsycl-target-backend=spir64_gen)
++  endif()
+   # TODO: make AOT configurable
+-  set(AOT_DEVICES "pvc,bmg-g21-a0,bmg-g31-a0")
+-  set(XE2_AOT_DEVICES "pvc,bmg-g21-a0,bmg-g31-a0")
++  #set(AOT_DEVICES "bmg")
++  #set(XE2_AOT_DEVICES "bmg")
+
+   # Final link option be like: icpx -fsycl -fsycl-target=spir64_gen
+   # ${SYCL_DEVICE_LINK_FLAGS} -Xsycl-target-backend=spir64_gen
