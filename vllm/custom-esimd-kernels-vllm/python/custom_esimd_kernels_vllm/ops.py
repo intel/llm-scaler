@@ -780,15 +780,21 @@ def moe_router_forward_int4(
     x: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
+    use_ggml_layout: bool = False,
 ) -> torch.Tensor:
     """INT4 router GEMV: x @ dequant(weight).T → logits.
 
     x:      [n_tokens, hidden_size] fp16
-    weight: [num_experts, hidden_size//8] int32 (IPEX physically transposed to [E, K_packed])
-    scale:  [hidden_size//128, num_experts] fp16 (original layout, kernel handles stride)
+    weight: [num_experts, hidden_size//8] int32 (or uint8 viewed as int32)
+    scale:  fp16
+
+    use_ggml_layout=False (IPEX): weight [E, K_packed] after IPEX repack,
+        scale [K_groups, E] (kernel reads with stride).
+    use_ggml_layout=True (GGML): weight_esimd [E, K/2] uint8 → [E, K/8] int32,
+        scale_esimd [E, K_groups] contiguous (kernel reads row-major).
     Returns: [n_tokens, num_experts] fp16
     """
-    return _moe_int4.moe_router_forward_int4(x, weight, scale)
+    return _moe_int4.moe_router_forward_int4(x, weight, scale, use_ggml_layout)
 
 
 def moe_forward_full_int4(
@@ -806,12 +812,17 @@ def moe_forward_full_int4(
     top_k: int,
     num_shared_experts: int,
     n_routed_experts: int,
+    use_ggml_layout: bool = False,
 ) -> torch.Tensor:
     """INT4 MoE full forward: topk + up + down + finalize in one C++ call.
 
     Supports both INT4 and FP16 shared expert weights (auto-detected by dtype).
     When shared expert is INT4: shared_gate_up_scale/shared_down_scale are used.
     When shared expert is FP16: pass dummy tensors for scales (ignored).
+
+    use_ggml_layout: if True, routed expert weights are in GGML N-major layout
+        [E, N, K_packed] with natural nibble order (transpose=False from ggml_quantize_tensor).
+        If False (default), expects IPEX K-major layout [E, K_packed, N] with marlin shuffled nibbles.
     """
     return _moe_int4.moe_forward_full_int4(
         x, logits,
@@ -820,4 +831,5 @@ def moe_forward_full_int4(
         down_qweight, down_scales,
         shared_down_weight, shared_down_scale,
         shared_expert_gate_weight,
-        top_k, num_shared_experts, n_routed_experts)
+        top_k, num_shared_experts, n_routed_experts,
+        use_ggml_layout)

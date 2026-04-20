@@ -179,7 +179,7 @@ def test_router_forward():
                 sc = scales.t().contiguous().to(DEVICE)
 
                 kernel_out = moe_int4_ops.moe_router_forward_int4(
-                    x.to(DEVICE), qw, sc).cpu()
+                    x.to(DEVICE), qw, sc, False).cpu()
 
                 cos = cosine_similarity(ref_out, kernel_out)
                 mae = (ref_out.float() - kernel_out.float()).abs().max().item()
@@ -311,7 +311,7 @@ def test_forward_full():
                 w2_ipex.to(DEVICE), s2_ipex.to(DEVICE),
                 shared_down.to(DEVICE), _dummy_scale,
                 shared_gate_w.to(DEVICE),
-                TK, NUM_SHARED_EXPERTS, E).cpu()
+                TK, NUM_SHARED_EXPERTS, E, False).cpu()
 
             cos = cosine_similarity(ref_out, kernel_out)
             mae = (ref_out.float() - kernel_out.float()).abs().max().item()
@@ -421,7 +421,7 @@ def test_forward_full_int4_shared():
                 w2_ipex.to(DEVICE), s2_ipex.to(DEVICE),
                 shared_dw_ipex.int().to(DEVICE), shared_dw_sc_ipex.to(DEVICE),
                 shared_gate_w.to(DEVICE),
-                TK, NUM_SHARED_EXPERTS, E).cpu()
+                TK, NUM_SHARED_EXPERTS, E, False).cpu()
 
             cos = cosine_similarity(ref_out, kernel_out)
             mae = (ref_out.float() - kernel_out.float()).abs().max().item()
@@ -452,7 +452,7 @@ def test_edge_cases():
     gate_fp16 = (torch.randn(E, H) * 0.02).half()
     qw, sc = quantize_int4(gate_fp16, GROUP_SIZE)
     out = moe_int4_ops.moe_router_forward_int4(
-        x_zero, qw.to(DEVICE), sc.t().contiguous().to(DEVICE))
+        x_zero, qw.to(DEVICE), sc.t().contiguous().to(DEVICE), False)
     all_zero = (out.cpu().abs().max().item() < 1e-3)
     print(f"  Zero input → near-zero output: {'PASS' if all_zero else 'FAIL'}")
 
