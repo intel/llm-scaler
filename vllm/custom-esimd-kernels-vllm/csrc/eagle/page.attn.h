@@ -5,7 +5,9 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1(
   uint8_t* qState,
   uint8_t* kState,
   uint8_t* pState,
-  float* pMax,
+  float* pGroupMax,
+  float* pGlobalMax,
+  uint32_t* pPollP,
   uint32_t* pageTable,
   uint32_t* batchKvSeqLen,
   uint32_t batchSize,
@@ -188,8 +190,31 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1(
 
     {
       block_store<float, 64>((float*)pState + outputOffset, ppOut.select<64, 1>(0));
+      simd<float, 1> zeros = 0.0f;
+      pGroupMax[outputMaxOffset] = ppMax[0];
+      uint32_t atomicOffset = (batchIdx * gqaRatio * headKv + qHeadIdx + hh) * sizeof(float);
+      uint32_t arrivalId =
+        atomic_update<
+        __ESIMD_NS::atomic_op::inc,
+        uint32_t,
+        1,
+        uint32_t>(pPollP, atomicOffset);
 
-      pMax[outputMaxOffset] = ppMax[0];
+      if (0 == arrivalId) {
+        atomic_update<
+          __ESIMD_NS::atomic_op::fcmpxchg,
+          float,
+          1,
+          uint32_t>(pGlobalMax, atomicOffset, ppMax, zeros);
+      }
+      else {
+        atomic_update<
+          __ESIMD_NS::atomic_op::fmax,
+          float,
+          1,
+          uint32_t>(pGlobalMax, atomicOffset, ppMax);
+      }
+
       outputOffset += pStride;
       outputMaxOffset += maxStride;
     }
@@ -198,8 +223,11 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1(
 
 ESIMD_INLINE void sdpaDecodeGqa4Phase2(
   uint8_t* pState,
-  float* pMax,
+  float* pGroupMax,
   uint8_t* vState,
+  float* pGlobalMax,
+  float* pTempOut,
+  float* pSoftmaxSum,
   uint8_t* out,
   uint32_t* pageTable,
   uint32_t* batchKvSeqLen,
@@ -211,6 +239,8 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
   uint32_t pStride,
   uint32_t maxStride,
   uint32_t headKv,
+  uint32_t longestBatch,
+  uint32_t flag,
   uint32_t gqaRatio,
   sycl::nd_item<3>& ndi) {
   constexpr uint32_t headDim = 256;
@@ -221,6 +251,7 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
   constexpr uint32_t slmSizeSoftmaxSum = 2 * 4 * sizeof(float);
   constexpr uint32_t slmSize = slmSizeOut + slmSizeSoftmaxSum;
   __ESIMD_NS::slm_init<slmSize>();
+  constexpr uint32_t baseOffsetInc16[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
   int localLinearId = ndi.get_local_id(0);
   int globalLinearId0 = ndi.get_group(0); // [0, head dim / 16)
   int globalLinearId1 = ndi.get_group(1); // [0, kvHead * gqaRatio/4)
@@ -232,11 +263,21 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
   int kvHeadIdx = globalLinearId1 / gqaGroups;
   int qGroupIdx = globalLinearId1 % gqaGroups;
   uint32_t kvSeqLen = batchKvSeqLen[batchIdx];
-  int kvSeqOutLoopCount = (kvSeqLen + 0x3f) >> 6;
+  int kvSeqOutGroup = (kvSeqLen + 1023) >> 10;
   uint32_t pageTableSize = 1 << pageTableSizeLog2;
   uint32_t pageTableLoopMask = (1 << pageTableSizeLog2) - 1;
   uint32_t pageTableBase = pageTableBatchStride * batchIdx;
-  simd<uint32_t, 32> simdOffsetsVs;
+  uint32_t channelOffset = globalLinearId0 & 0xf;
+  uint32_t groupIdx = globalLinearId0 >> 4;
+
+  simd<uint32_t, 16> simdOffsets(baseOffsetInc16);
+  simd<uint32_t, 16> pageTableIndice;
+  simd<uint32_t, 16> pageTableOffsets;
+
+  simd<uint32_t, 16> pageAlignedOffsets;
+  simd<uint32_t, 16> pageOffsetsInner;
+  simd<uint32_t, 16> pageNumbers;
+
   simd<float, 4 * 32> ppFp32;
   simd<float, 4> historicMax;
   simd<fp16, 32 * 16> vvCache;
@@ -245,14 +286,21 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
   simd<float, 4 * 16> outputFp32;
   simd<float, 32> vvScale;
 
+  if (groupIdx >= kvSeqOutGroup) {
+    return;
+  }
+  uint32_t reduceCount = (longestBatch + 1023) >> 10;
   uint32_t headQ = headKv * gqaRatio;
   uint32_t qBaseIdx = kvHeadIdx * gqaRatio + qGroupIdx * 4;
-  uint32_t outputOffset = qBaseIdx * headDim + globalLinearId0 * 16 + hh * 2 * headDim + batchIdx * headQ * headDim;
-  uint32_t offsetP = qBaseIdx * pStride + hh * 32 + batchIdx * headQ * pStride;
-  uint32_t offsetMax = qBaseIdx * maxStride + batchIdx * headQ * maxStride;
+  uint32_t outputOffset = qBaseIdx * headDim + channelOffset * 16 + hh * 2 * headDim + batchIdx * headQ * headDim;
+  uint32_t outTempOffset = qBaseIdx * headDim + channelOffset * 16 + hh * 2 * headDim + groupIdx * headQ * headDim + batchIdx * reduceCount * headQ * headDim;
+  uint32_t outOffsetSoftmaxSum = qBaseIdx + hh * 2 + groupIdx * headQ + batchIdx * reduceCount * headQ;
+  uint32_t offsetP = qBaseIdx * pStride + hh * 32 + groupIdx * 1024 + batchIdx * headQ * pStride;
+  uint32_t offsetMax = qBaseIdx * maxStride + batchIdx * headQ * maxStride + groupIdx * 16;
+  uint32_t offsetGlobalMax = batchIdx * headQ + qBaseIdx;
   uint32_t widthV = headKv * headDim * sizeof(fp16) - 1;
   uint32_t heightV = pageTableSize - 1;
-  uint32_t vX = globalLinearId0 * 16 + headDim * kvHeadIdx;
+  uint32_t vX = channelOffset * 16 + headDim * kvHeadIdx;
   uint32_t vY = 32 * hh;
   uint32_t totalPages = (kvSeqLen + pageTableSize - 1) >> pageTableSizeLog2;
   uint32_t lastPageHeight = (kvSeqLen - 1) & (pageTableSize - 1);
@@ -265,96 +313,104 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
   softmaxSum = 0;
   outputFp32 = 0;
 
-  for (int loopIdx = 0; loopIdx < kvSeqOutLoopCount; loopIdx++) {
-    simd<float, 4> loopMax;
-    simd<float, 4> currMax;
-    simd<float, 4> compensationP;
-    simd<float, 4> compensationO;
-    simd<uint16_t, 32> mask;
-    uint32_t kvSeqOffset = loopIdx * 64;
-    uint32_t pageTableIdx = kvSeqOffset >> pageTableSizeLog2;
-    uint32_t pageTableOffset = kvSeqOffset & pageTableLoopMask;
-    uint32_t pageIdx = pageTable[pageTableBase + pageTableIdx];
-    uint32_t pageOffset = pageIdx * kvCacheBatchStride1;
-    fp16* currPtrV = vPtrBase + pageOffset;
-    if (pageTableIdx + 1 < totalPages) {
-      heightV = pageTableSize - 1;
-    }
-    else {
-      heightV = lastPageHeight;
-    }
-    vY = pageTableOffset + 32 * hh;
+  simd<float, 4> globalMax;
+  simd<float, 4> currMax;
+  simd<float, 4> compensationP;
+  simd<uint16_t, 16> mask;
+  simd<uint16_t, 16> maskNeg;
+
+  uint32_t kvSeqOffset = groupIdx * 1024;
+  simdOffsets = simdOffsets * 64 + kvSeqOffset;
+  mask = simdOffsets < kvSeqLen;
+  maskNeg = simdOffsets >= kvSeqLen;
+  pageTableIndice = (simdOffsets >> pageTableSizeLog2);
+  pageTableOffsets = pageTableIndice * sizeof(uint32_t) + pageTableBase * sizeof(uint32_t);
+  pageOffsetsInner = simdOffsets & pageTableLoopMask;
+  pageNumbers =
+    gather<
+    uint32_t,
+    16,
+    1,
+    uint32_t>(pageTable, pageTableOffsets, mask);
+
+  pageAlignedOffsets = pageNumbers * kvCacheBatchStride1;
+  pageAlignedOffsets.merge(0, maskNeg);
+  globalMax = block_load<float, 4>(pGlobalMax + offsetGlobalMax);
 
 #pragma unroll
-    for (int pn = 0; pn < 4; pn++) {
-      ppFp32.select<32, 1>(32 * pn) = block_load<float, 32>((float*)pState + offsetP + pStride * pn);
-      currMax[pn] = pMax[offsetMax + maxStride * pn];
-    }
-
-    vvCache.select<256, 1>(0 * 256) =
-      __ESIMD_ENS::lsc_load_2d<
-      fp16,
-      16,
-      16,
-      1,
-      false,
-      false,
-      __ESIMD_ENS::cache_hint::cached,
-      __ESIMD_ENS::cache_hint::cached
-      >(currPtrV, widthV, heightV, widthV, vX, vY);
-    vY += 16;
-
-    vvCache.select<256, 1>(1 * 256) =
-      __ESIMD_ENS::lsc_load_2d<
-      fp16,
-      16,
-      16,
-      1,
-      false,
-      false,
-      __ESIMD_ENS::cache_hint::cached,
-      __ESIMD_ENS::cache_hint::cached>
-      (currPtrV, widthV, heightV, widthV, vX, vY);
-
-    loopMax = __ESIMD_NS::max<float, 4, float>(currMax, historicMax);
-    compensationO = historicMax - loopMax;
-    compensationP = currMax - loopMax;
-    compensationO = exp(compensationO);
-    compensationP = exp(compensationP);
+  for (uint32_t loop = 0; loop < 16; loop++) {
+    if (kvSeqOffset + loop * 64 < kvSeqLen) {
+      fp16* currPtrV = vPtrBase + pageAlignedOffsets[loop];
+      if (pageTableIndice[loop] + 1 < totalPages) {
+        heightV = pageTableSize - 1;
+      }
+      else {
+        heightV = lastPageHeight;
+      }
+      vY = pageOffsetsInner[loop] + 32 * hh;
 
 #pragma unroll
-    for (int oc = 0; oc < 4; oc++) {
-      ppFp32.select<32, 1>(32 * oc) = ppFp32.select<32, 1>(32 * oc) * compensationP[oc];
-    }
+      for (int pn = 0; pn < 4; pn++) {
+        ppFp32.select<32, 1>(32 * pn) = block_load<float, 32>((float*)pState + offsetP + pStride * pn);
+        currMax[pn] = pGroupMax[offsetMax + maxStride * pn];
+      }
+
+      vvCache.select<256, 1>(0 * 256) =
+        __ESIMD_ENS::lsc_load_2d<
+        fp16,
+        16,
+        16,
+        1,
+        false,
+        false,
+        __ESIMD_ENS::cache_hint::cached,
+        __ESIMD_ENS::cache_hint::cached
+        >(currPtrV, widthV, heightV, widthV, vX, vY);
+      vY += 16;
+
+      vvCache.select<256, 1>(1 * 256) =
+        __ESIMD_ENS::lsc_load_2d<
+        fp16,
+        16,
+        16,
+        1,
+        false,
+        false,
+        __ESIMD_ENS::cache_hint::cached,
+        __ESIMD_ENS::cache_hint::cached>
+        (currPtrV, widthV, heightV, widthV, vX, vY);
+
+      compensationP = currMax - globalMax;
+      compensationP = exp(compensationP);
 
 #pragma unroll
-    for (int oc = 0; oc < 4; oc++) {
-      outputFp32.select<16, 1>(16 * oc) = outputFp32.select<16, 1>(16 * oc) * compensationO[oc];
-      softmaxSum.select<16, 1>(16 * oc) = softmaxSum.select<16, 1>(16 * oc) * compensationO[oc];
-    }
+      for (int oc = 0; oc < 4; oc++) {
+        ppFp32.select<32, 1>(32 * oc) = ppFp32.select<32, 1>(32 * oc) * compensationP[oc];
+      }
 
-#pragma unroll
-    for (int oc = 0; oc < 4; oc++) {
-#pragma unroll
-      for (int pk = 0; pk < 2; pk++)
-        softmaxSum.select<16, 1>(16 * oc) = softmaxSum.select<16, 1>(16 * oc) + ppFp32.select<16, 1>(32 * oc + 16 * pk);
-    }
-
-#pragma unroll
-    for (int vk = 0; vk < 2; vk++) {
-      vvFp32 = vvCache.select<256, 1>(256 * vk);
 #pragma unroll
       for (int oc = 0; oc < 4; oc++) {
 #pragma unroll
-        for (int pk = 0; pk < 16; pk++) {
-          outputFp32.select<16, 1>(16 * oc) += vvFp32.select<16, 1>(16 * pk) * ppFp32[32 * oc + 16 * vk + pk];
+        for (int pk = 0; pk < 2; pk++) {
+          softmaxSum.select<16, 1>(16 * oc) = softmaxSum.select<16, 1>(16 * oc) + ppFp32.select<16, 1>(32 * oc + 16 * pk);
         }
       }
-    }
 
-    historicMax = loopMax;
-    offsetP += 64;
-    offsetMax += 1;
+#pragma unroll
+      for (int vk = 0; vk < 2; vk++) {
+        vvFp32 = vvCache.select<256, 1>(256 * vk);
+#pragma unroll
+        for (int oc = 0; oc < 4; oc++) {
+#pragma unroll
+          for (int pk = 0; pk < 16; pk++) {
+            outputFp32.select<16, 1>(16 * oc) += vvFp32.select<16, 1>(16 * pk) * ppFp32[32 * oc + 16 * vk + pk];
+          }
+        }
+      }
+
+      offsetP += 64;
+      offsetMax += 1;
+    }
   }
 
 #pragma unroll
@@ -373,20 +429,123 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
 
   {
     simd<float, 4> dividor;
+    simd<float, 2> softmaxMul;
     simd<float, 64> outputTempFp32;
     dividor = slm_block_load<float, 4>(slmSizeOut + hh * 4 * sizeof(float));
-    dividor.select<2, 2>(0) = dividor.select<2, 2>(0) + dividor.select<2, 2>(1);
-    dividor = 1.0f / dividor;
+    softmaxMul = dividor.select<2, 2>(0) + dividor.select<2, 2>(1);
     outputTempFp32 = slm_block_load<float, 64>(hh * 4 * 16 * sizeof(float));
+
 #pragma unroll
     for (int oc = 0; oc < 2; oc++) {
       outputFp32.select<16, 1>(16 * oc) = outputTempFp32.select<16, 1>(32 * oc) + outputTempFp32.select<16, 1>(32 * oc + 16);
-      outputFp32.select<16, 1>(16 * oc) = outputFp32.select<16, 1>(16 * oc) * dividor[2 * oc];
     }
-    simd<fp16, 32> outputTemp = outputFp32.select<32, 1>(0);
+
+    if ((flag & 0x1) == 1) {
+      softmaxMul = 1.0f / softmaxMul;
 #pragma unroll
-    for (int oc = 0; oc < 2; oc++) {
-      block_store<fp16, 16>((fp16*)out + outputOffset + oc * headDim, outputTemp.select<16, 1>(16 * oc));
+      for (int oc = 0; oc < 2; oc++) {
+        outputFp32.select<16, 1>(16 * oc) = outputFp32.select<16, 1>(16 * oc) * softmaxMul[oc];
+      }
+      simd<fp16, 32> outputTemp = outputFp32.select<32, 1>(0);
+#pragma unroll
+      for (int oc = 0; oc < 2; oc++) {
+        block_store<fp16, 16>((fp16*)out + outputOffset + oc * headDim, outputTemp.select<16, 1>(16 * oc));
+      }
+    }
+    else {
+#pragma unroll
+      for (int oc = 0; oc < 2; oc++) {
+        block_store<float, 16>((float*)pTempOut + outTempOffset + oc * headDim, outputFp32.select<16, 1>(16 * oc));
+      }
+
+      block_store<float, 2>((float*)pSoftmaxSum + outOffsetSoftmaxSum, softmaxMul);
     }
   }
+}
+
+ESIMD_INLINE void sdpaDecodeGqa4Phase3(
+  float* pTempOut,
+  float* pSoftmaxSum,
+  uint8_t* out,
+  uint32_t* batchKvSeqLen,
+  uint32_t batchSize,
+  uint32_t headKv,
+  uint32_t longestBatch,
+  uint32_t gqaRatio,
+  sycl::nd_item<3>& ndi) {
+  constexpr uint32_t headDim = 256;
+  constexpr uint32_t maxPGroupOut = 128;
+  constexpr uint32_t outputPerGroup = 64;
+  constexpr float matMulQuantCoeff = 0.0625f;
+  constexpr uint32_t baseOffsetInc16[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+  int globalLinearId0 = ndi.get_group(0); // [0, head dim / 16)
+  int globalLinearId1 = ndi.get_group(1); // [0, qHead)
+  int globalLinearId2 = ndi.get_group(2); // [0, bs)
+  uint32_t batchIdx = globalLinearId2;
+  uint32_t kvSeqLen = batchKvSeqLen[batchIdx];
+  uint32_t headQ = headKv * gqaRatio;
+  uint32_t reduceCount = (longestBatch + 1023) >> 10;
+  uint32_t effectiveReduceCount = (kvSeqLen + 1023) >> 10;
+  uint32_t channelOffset = globalLinearId0;
+  uint32_t outDim = headQ * headDim * sizeof(float);
+  uint32_t widthT = headQ * headDim * sizeof(float) - 1;
+  uint32_t heightT = effectiveReduceCount - 1;
+  float* batchPTempOut = pTempOut + batchIdx * reduceCount * headQ * headDim;
+  uint32_t vX = channelOffset * 16 + headDim * globalLinearId1;
+  uint32_t vY = 0;
+  uint32_t loopCount = (effectiveReduceCount + 31) >> 5;
+  uint32_t outOffset = channelOffset * 16 + headDim * globalLinearId1 + batchIdx * headQ * headDim;
+  uint32_t offsetBaseSoftmaxSum = globalLinearId1 * sizeof(float) + batchIdx * reduceCount * headQ * sizeof(float);
+  simd<float, 32 * 16> ttFp32;
+  simd<float, 16> smFp32;
+  simd<float, 16> smSumFp32 = 0.0f;
+  simd<float, 16> output = 0.0f;
+  simd<uint32_t, 16> coordReduce(baseOffsetInc16);
+  simd<uint32_t, 16> simdOffsetSoftmaxSum;
+  simd_mask<16> mask;
+  simd_mask<16> negMask;
+
+  for (uint32_t loop = 0; loop < loopCount; loop++) {
+#pragma unroll
+    for (uint32_t kk = 0; kk < 2; kk++) {
+      simdOffsetSoftmaxSum = coordReduce * headQ * sizeof(float) + offsetBaseSoftmaxSum;
+      mask = coordReduce < effectiveReduceCount;
+      negMask = coordReduce >= effectiveReduceCount;
+      smFp32 = 
+        gather<
+        float,
+        16,
+        1,
+        uint32_t>(pSoftmaxSum, simdOffsetSoftmaxSum, mask);
+
+      ttFp32.select<256, 1>(kk * 256) =
+        __ESIMD_ENS::lsc_load_2d<
+        float,
+        16,
+        16,
+        1,
+        false,
+        false,
+        __ESIMD_ENS::cache_hint::cached,
+        __ESIMD_ENS::cache_hint::cached
+        >(batchPTempOut, widthT, heightT, widthT, vX, vY);
+
+#pragma unroll
+      for (uint32_t kkk = 0; kkk < 16; kkk++) {
+        ttFp32.select<16, 1>(256 * kk + 16 * kkk).merge(0.0f, coordReduce.replicate_w<16, 1>(kkk) >= effectiveReduceCount);
+        output = output + ttFp32.select<16, 1>(256 * kk + 16 * kkk);
+      }
+
+      smFp32.merge(0.0f, negMask);
+      smSumFp32 = smSumFp32 + smFp32;
+      vY += 16;
+      coordReduce = coordReduce + 16;
+    }
+  }
+
+  float softmaxMul = __ESIMD_DNS::sum<float, float, 16>(smSumFp32.select<16, 1>(0));
+  softmaxMul = 1.0f / softmaxMul;
+  output.select<16, 1>(0) = output.select<16, 1>(0)* softmaxMul;
+  simd<fp16, 16> outputTemp = output.select<16, 1>(0);
+  block_store<fp16, 16>((fp16*)out + outOffset, outputTemp);
 }
