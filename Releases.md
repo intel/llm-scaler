@@ -1,176 +1,36 @@
-# Docker Image Releases for Intel Arc B60 Pro GPU: 
+# List of llm-scaler Docker Image Releases
 
-## LLM-Scaler-vLLM
+## llm-scaler-vllm
 
-### Latest Beta Release
-* `intel/llm-scaler-vllm:0.14.0-b8.1` [3/11/2026]: 
-    - Added support for Qwen3.5-27B, Qwen3.5-35B-A3B and Qwen3.5-122B-A10B (FP8 and INT4)
-    - Added support for Qwen3-ASR-1.7B
+### Latest Release
+* [`intel/llm-scaler-vllm:0.14.0-b8.1`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.14.0-b8.1/images/sha256-97a2f4e31d47228ea235e23c0e44bfe56971985fb0bb2e6f9f28ff12b6b549bf) [03/2026] 
     
 ### Previous Releases
-* `intel/llm-scaler-vllm:0.14.0-b8` [3/2/2026]: 
-    - Upgrade: vLLM upgrade to 0.14.0, Pytorch upgrade to 2.10. oneAPI uplifted to 2025.3.2(hotfix) with LTS support on UR adaptor v2. Oneccl upgrade to 2021.15.7.8.
-    - Int4 onednn optimizations are included and up to 25% throughput improvement is achieved VS last release.
-    - Bug fixes.
-    - Added support for Qwen3-VL-Reranker-2B/8B
-    - Added support for Qwen3-VL-Embedding-2B/8B
-    - Added support for GLM-4.7-Flash
-    - Added support for Ministral models
-    - Added support for DeepSeek-OCR-2
-    - Added support for Qwen3-Coder-Next
-    - Fix InternVL issue
+* [`intel/llm-scaler-vllm:0.14.0-b8`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.14.0-b8/images/sha256-ea330d73f43d251711739b6563f5eda714cc44cca7a2e922046713942c5d48fa) [03/2026] 
+* [`intel/llm-scaler-vllm:1.3`](https://hub.docker.com/layers/intel/llm-scaler-vllm/1.3/images/sha256-02d5f2c93483204256337b3a48d799dda186c017b8abe9fd4eb9a0b956b38664) [01/2026] 
+* [`intel/llm-scaler-vllm:0.11.1-b7`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.11.1-b7/images/sha256-02d5f2c93483204256337b3a48d799dda186c017b8abe9fd4eb9a0b956b38664) [01/2026]
+* [`intel/llm-scaler-vllm:1.2`](https://hub.docker.com/layers/intel/llm-scaler-vllm/1.2/images/sha256-2dcce842ff345a2cb71b1341d297f40fb13ed880f888aea7e20e124761db2611) [12/2025] 
+* [`intel/llm-scaler-vllm:0.10.2-b6`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.10.2-b6/images/sha256-2dcce842ff345a2cb71b1341d297f40fb13ed880f888aea7e20e124761db2611) [11/2025]
+* [`intel/llm-scaler-vllm:1.1-preview`](https://hub.docker.com/layers/intel/llm-scaler-vllm/1.1-preview/images/sha256-07b8f4c2a888ee6c8b2107f3f90097cb5ce9ebc46f905dda64598e6f01f12f8d) [09/2025]
+* [`intel/llm-scaler-vllm:0.10.2-b5`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.10.2-b5/images/sha256-c59dfa9e31b2bd3cc6c12a5b3c1cc9c102be0ba12db38aee36dfe1f84c6f4118) [11/2025]
+* [`intel/llm-scaler-vllm:0.10.0-b4`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.10.0-b4/images/sha256-6491f92963d4ca22b152ebc72e63bd06930391ef28fa62e6ebe3df91d4276045) [09/2025]
+* [`intel/llm-scaler-vllm:0.10.0-b3`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.10.0-b3/images/sha256-c1a910430619a3ba25eecb4a8204e19cad845c7a9a191a34eaea0f56cc52f8fd) [09/2025]
+* [`intel/llm-scaler-vllm:0.10.0-b2`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.10.0-b2/images/sha256-07b8f4c2a888ee6c8b2107f3f90097cb5ce9ebc46f905dda64598e6f01f12f8d) [09/2025]
+* [`intel/llm-scaler-vllm:0.10.0-b1`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.10.0-b1/images/sha256-5b74e6c0e3843490cce8b908ac5fb1d5d6b2566ae37df4ba5ef3b8f76d1a2313) [08/2025]
+* [`intel/llm-scaler-vllm:0.9.0-b3`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.9.0-b3/images/sha256-1ccce8ebc6683b74e826118a8c0848a1a35a1f607b4f9a3f44404ba5131b3a5b) [08/2025]
+* [`intel/llm-scaler-vllm:1.0`](https://hub.docker.com/layers/intel/llm-scaler-vllm/1.0/images/sha256-b801cffa4508d16a0fcb5ef1696861035931bdac997af87478c891fb4de24efb) [08/2025] 
+* [`intel/llm-scaler-vllm:0.2.0-b2`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.2.0-b1/images/sha256-acf4135c19eb52828d4235b66c97612f8fd1f7a4eba93881da2a5257a16ba2ab) [07/2025]
+* [`intel/llm-scaler-vllm:0.2.0-b2`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.2.0-b1/images/sha256-acf4135c19eb52828d4235b66c97612f8fd1f7a4eba93881da2a5257a16ba2ab) [07/2025]
 
-* `intel/llm-scaler-vllm:1.3` [1/30/2026]: 
-    - Same image as intel/llm-scaler-vllm:0.11.1-b7
 
-* `intel/llm-scaler-vllm:0.11.1-b7` [1/16/2026]:
-    - Upgrade: vLLM upgrade to 0.11.1, Pytorch upgrade to 2.9.  oneAPI upgrade to 2025.2.2(hotfix), oneccl upgrade to 2021.15.7.6.
-    - 8 New models supported: Qwen3-Next-80B-A3B-Instruct, Qwen3-Next-80B-A3B-Thinking, InternVL3.5-30B-A3B, DeepSeek-OCR,PaddleOCR-VL, Seed-OSS-36B-Instruct, Qwen3-30B-A3B-Instruct-2507 and openai/whisper-large-v3.
-    - Key bug fixes for timeout/accuracy issues found in long time stress run.
-    - Key bug fixes communication accuracy issue on long run scenarios. Sub-communicator hang issue on oneCCL side.
-    - vLLM 0.11.1 with new features: cpu kv cache offload, speculative decoding support with 2 more methods(medusa, suffix), experimental feature:FP8 kv cache, Experts parallelism is supported with scenarios TP+EP and DP+EP.
-    - Bug fixes.
-    - Supported sym_int4 for Qwen3-30B-A3B on TP 4/8.
-    - Supported sym_int4 for Qwen3-235B-A22B on TP 16.
-    - Added support for the PaddleOCR model.
-    - Added support for GLM-4.6v-Flash.
-    - Fixed crash errors with 2DP + 4TP configuration.
-    - Fixed abnormal output observed during JMeter stress testing.
-    - Fixed UR_ERROR_DEVICE_LOST errors triggered by frequent preemption under high load.
-    - Fixed output errors for InternVL-38B.
-    - Refine logic for profile_run to provide more GPU blocks by default
+## llm-scaler-omni
 
-* `intel/llm-scaler-vllm:1.2` [12/11/2025]: 
-    - Same image as intel/llm-scaler-vllm:0.10.2-b6
-
-* `intel/llm-scaler-vllm:0.10.2-b6` [11/25/2025]:
-    - MoE-Int4 support for Qwen3-30B-A3B
-    - Bpe-Qwen tokenizer support
-    - Enable Qwen3-VL Dense/MoE models
-    - Enable Qwen3-Omni models
-    - MinerU 2.5 Support
-    - Enable whisper transcription models
-    - Fix minicpmv4.5 OOM issue and output error
-    - Enable ERNIE-4.5-vl models
-    - Enable Glyph based GLM-4.1V-9B-Base
-
-* `intel/llm-scaler-vllm:1.1-preview` [09/29/2025]:
-    - Same image as intel/llm-scaler-vllm:0.10.0-b2
-
-* `intel/llm-scaler-vllm:0.10.2-b5` [11/04/2025]:
-    - Support gpt-oss models 
-
-* `intel/llm-scaler-vllm:0.10.0-b3` [09/23/2025]:
-    - Support Seed-oss model
-    - Support miner-U
-    - Support MiniCPM-V-4_5
-    - Fix internvl_3_5 and deepseek-v2-lite error
-
-* `intel/llm-scaler-vllm:0.10.0-b2` [09/02/2025]:
-    - Bug fix for sym_int4 online quantization on Multi-modal models
-    
-* `intel/llm-scaler-vllm:0.10.0-b1` [08/29/2025]:
-    - Upgrade vLLM to 0.10.0 version
-    - Support async scheduling with option --async-scheduling
-    - Change to V1 engine for embedding/reranker models
-    - Support pipeline parallelism with mp/ray backend
-    - Support internvl3-8b
-    - Support MiniCPM-v-4
-    - Support InternVL3_5-8B
-
-* `intel/llm-scaler-vllm:0.9.0-b3` [08/21/2025]:
-    - Support Whisper
-    - Support GLM-4.5-Air
-    - Support dots.ocr
-    - Support GLM-4.1V-9B-Thinking for image input
-    - Optimize vLLM memory usage by updating profile_run logic
-    - Enable/Optimize pipeline parallelism with Ray backend
-   
-* `intel/llm-scaler-vllm:1.0` [08/10/2025]: 
-    - Same image as intel/llm-scaler-vllm:0.2.0-b2 
-
-* `intel/llm-scaler-vllm:0.2.0-b2` [07/25/2025]:
-    - Support by-layer online quantization to reduce the required GPU memory
-    - Support embedding, rerank models
-    - Enhance the support to multi-modal models
-    - Maximum length auto-detecting
-    - Support data parallelism
-    - Support pipeline parallelism (experimental)
-    - Support torch.compile (experimental)
-    - Support speculative decoding (experimental)
-    - Performance improvements
-    - Bug fixes
-
-## LLM-Scaler-Omni
-
-### Latest Beta Release 
-* `intel/llm-scaler-omni:0.1.0-b6` [3/10/2026]:
-    - ComfyUI 
-        - Added CacheDiT and torch.compile() acceleration support
-        - Added support for new models and workflows: SeedVR2, FlashVSR, Anima, FireRed-Image-Edit-1.1
-        - Introduced initial SYCL acceleration for ComfyUI-GGUF via omni_xpu_kernel (Q4_K, Q4_0, and Q8_0 optimized)
-        - Fixed IndexTTS-2 workflow and Wan2.2-I2V-14B-multi-XPU workflow
-    - SGLang Diffusion
-        - Added FP8 precision support on XPU
-        - Code cleanup and refactoring
-      
+### Latest Release 
+* [`intel/llm-scaler-omni:0.1.0-b6`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b6/images/sha256-fcf14ab440bc8a9b0903ffdb2f9ec6b678ba6d0c5b8217a6e749bacb8ea5fc87) [03/2026]
 
 ### Previous Releases
-* `intel/llm-scaler-omni:0.1.0-b5` [1/16/2026]:
-    - Core Upgrades
-        - Upgraded to Python 3.12 and PyTorch 2.9 for improved performance and compatibility
-    - ComfyUI
-        - Fixed a stochastic rounding issue on XPU, resolving the LoRA black-screen output problem. LoRA workflows are now supported (e.g, Z-Image-Turbo, Qwen-Image, Qwen-Image-Edit).
-        - Added support for new models and workflows: Qwen-Image-Layered, Qwen-Image-Edit-2511, Qwen-Image-2512, HY-Motion, and more.
-        - Added support for ComfyUI-GGUF, enabling GGUF models (e.g., FLUX.2-dev Q4_0) with reduced VRAM usage.
-        - Fixed image format issue in the Hunyuan3D-2.1 workflow.
-        - Refined documentation for improved clarity.
-        - LTX2 support on XPU.
-        - Updated Windows environment setup script.
-    - SGLang Diffusion
-        - Added support for CacheDiT.
-        - Added Tensor Parallelism (TP) support for selected model with better performance (e.g, Z-Image-Turbo).
-        - Added SGLD ComfyUI custom node support, allowing SGLang Diffusion to serve as a backend for ComfyUI image generation workflows.
-    - Standalone Examples
-        - Added support for HY-WorldPlay.
-        - Add audio models in standalone example
-
-* `intel/llm-scaler-omni:0.1.0-b4` [12/10/2025]:
-    - More workflows support:
-        - Z-Image-Turbo
-        - Hunyuan-Video-1.5 T2V/I2V with multi-XPU support
-    - Initial support for SGLang Diffusion. 10% perf improvement compared to ComfyUI in 1*B60 scenario.
-      
-* `intel/llm-scaler-omni:0.1.0-b3` [11/19/2025]:
-    - More workflows support:
-        - Hunyuan 3D 2.1
-        - Controlnet on Stable Diffusion 3.5, FLUX.1
-        - Multi XPU support for Wan 2.2 I2V 14B rapid aio
-        - AnimateDiff lightning
-    - Add Windows installation
-
-* `intel/llm-scaler-omni:0.1.0-b2` [10/17/2025]:
-    - Fix issues:
-        - Fix ComfyUI interpolate issue
-        - Fix Xinference XPU index selection issue
-    - Support more workflows:
-        - ComfyUI
-        - Wan2.2-Animate-14B basic workflow
-        - Qwen-Image-Edit 2509 workflow
-        - VoxCPM workflow
-    - Xinference:
-        - Kokoro-82M-v1.1-zh
-  
-* `intel/llm-scaler-omni:0.1.0-b1` [09/29/2025]:
-    - Integrate ComfyUI on XPU and provide sample workflows for:
-        - Wan2.2 TI2V 5B
-        - Wan2.2 T2V 14B (multi-XPU supported)
-        - FLUX.1 dev
-        - FLUX.1 Kontext dev
-        - Stable Diffusion 3.5 large
-        - Qwen Image, Qwen Image Edit
-    - Add support for xDit, Yunchang, and Raylight usages on XPU
-    - Integrate Xinference with OpenAI-compatible APIs for:
-        - Kokoro 82M
-        - Whisper Large v3
-        - Stable Diffusion 3.5 Medium
+* [`intel/llm-scaler-omni:0.1.0-b5`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b5/images/sha256-3e3347fa47d93b0f7b22c07d45fd19dec46aa08e93e00d45c8181765f5e02433) [01/2026]
+* [`intel/llm-scaler-omni:0.1.0-b4`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b4/images/sha256-0ebf4061275252042ae12578fb0d355be90cbec853d6fe45bfb625f0df9187e8) [12/2025]
+* [`intel/llm-scaler-omni:0.1.0-b3`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b3/images/sha256-33dbd41ba036b9113ec9fe43fbd541a525c0ecd5073d858a2570515700806f16) [11/2025]
+* [`intel/llm-scaler-omni:0.1.0-b2`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b2/images/sha256-8b221b85db2d221674648f94817eec9c4c47b23bac067dc5f88f0952596bd467) [10/2025]
+* [`intel/llm-scaler-omni:0.1.0-b1`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b1/images/sha256-9194ca5af82ed479ab042de37ed2f584e6680d3b2af379a6e67db628c4472074) [09/2025]
