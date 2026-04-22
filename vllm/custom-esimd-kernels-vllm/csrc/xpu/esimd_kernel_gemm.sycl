@@ -12,6 +12,7 @@
 #include <sycl/sycl.hpp>
 
 #include "esimd_kernels/fp8_GEMM_pert.h"
+#include "esimd_kernels/int4_GEMM.h"
 
 #define EXTRACT_PTR(var, tensor) auto var = reinterpret_cast<uint8_t*>(tensor.data_ptr())
 
@@ -41,5 +42,47 @@ at::Tensor esimd_gemm_fp8_pert(
         reinterpret_cast<fp16*>(p_out),
         (uint32_t)M, (uint32_t)N, (uint32_t)K,
         get_fp8_mode(weight), dpcpp_queue);
+    return output;
+}
+
+// ---- INT4 GEMM per-group scale: DPAS kernel for M>=2 ----
+// input: [M, K] fp16, weight: [N, K/2] uint8 packed int4,
+// weight_scale: [N, K/128] fp16 per-group, output: [M, N] fp16 pre-allocated.
+// Complementary to esimd_gemv_int4 (M=1); for M>=2 use this.
+at::Tensor esimd_gemm_int4_pgrp(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output) {
+    int64_t M = input.size(0);
+    int64_t N = weight.size(0);
+    int64_t K = weight.size(1) * 2;   // packed: K/2 bytes → K elements
+
+    TORCH_CHECK(input.scalar_type() == at::ScalarType::Half,
+                "esimd_gemm_int4_pgrp: input must be fp16");
+    TORCH_CHECK(weight.scalar_type() == at::ScalarType::Byte,
+                "esimd_gemm_int4_pgrp: weight must be uint8 (packed int4)");
+    TORCH_CHECK(weight_scale.scalar_type() == at::ScalarType::Half,
+                "esimd_gemm_int4_pgrp: weight_scale must be fp16");
+    TORCH_CHECK(output.scalar_type() == at::ScalarType::Half,
+                "esimd_gemm_int4_pgrp: output must be fp16");
+    TORCH_CHECK(N % 16 == 0,
+                "esimd_gemm_int4_pgrp: N must be a multiple of 16 (DPAS N tile), got N=", N);
+    TORCH_CHECK(K % INT4_GEMM_GROUP_SIZE == 0,
+                "esimd_gemm_int4_pgrp: K must be a multiple of 128 (group_size), got K=", K);
+    TORCH_CHECK(weight_scale.size(0) == N && weight_scale.size(1) == K / INT4_GEMM_GROUP_SIZE,
+                "esimd_gemm_int4_pgrp: weight_scale shape mismatch; expected [", N,
+                ", ", K / INT4_GEMM_GROUP_SIZE, "], got [", weight_scale.size(0),
+                ", ", weight_scale.size(1), "]");
+    TORCH_CHECK(output.size(0) == M && output.size(1) == N,
+                "esimd_gemm_int4_pgrp: output shape mismatch; expected [", M, ", ", N, "]");
+
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_w, weight);
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    GEMM_int4_pgrp_host(
+        reinterpret_cast<const fp16*>(p_in),
+        reinterpret_cast<const uint8_t*>(p_w),
+        reinterpret_cast<const fp16*>(p_sc),
+        reinterpret_cast<fp16*>(p_out),
+        (uint32_t)M, (uint32_t)N, (uint32_t)K, dpcpp_queue);
     return output;
 }
