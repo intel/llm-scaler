@@ -4037,6 +4037,12 @@ inline void GEMM_fp8_pert_dispatch(
             mpar_gemm_fp8_pert_host<128, 1, 16>(
                 input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
         }
+    } else if (M > 64) {
+        // V7/V9 DPAS kernels cap at M_TILES=8 (M=64). For M>64 they silently
+        // only compute rows [0..63] and leave rows [64..M-1] uninitialized,
+        // which propagates NaN through subsequent layers. Fall back to WS
+        // which has a real 2D grid and per-row bounds check.
+        ws_gemm_fp8_pert_host<128, 16>(input, weight, scale_ptr, output, M, N, K, fp8_mode, q);
     } else if (K % 64 == 0 && fp8_mode == 0) {
         // V9: Transposed load + fused dequant-VNNI (E4M3 only, best for M>=2)
         dpas_v9_auto_dispatch(input, weight, scale_ptr, output, M, N, K, q);
