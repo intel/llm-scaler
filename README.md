@@ -1,13 +1,14 @@
 # LLM Scaler
 
-LLM Scaler is an GenAI solution for text generation, image generation, video generation etc. running on [Intel® Arc™ Pro B60 GPUs](https://www.intel.com/content/www/us/en/products/docs/discrete-gpus/arc/workstations/b-series/overview.html). LLM Scalar leverages standard frameworks such as vLLM, ComfyUI, SGLang Diffusion, Xinference etc and ensures the best performance for State-of-Art GenAI models running on Arc Pro B60 GPUs.
+LLM Scaler is an GenAI solution for text generation, image generation, video generation etc. running on Intel® Arc™ Pro B60 and B70 GPUs. LLM Scalar leverages standard frameworks such as vLLM, ComfyUI, SGLang Diffusion, Xinference etc and ensures the best performance for State-of-Art GenAI models running on Arc Pro B60/B70 GPUs.
 
 ---
 
 ## Latest Update
-- 🔥 [2026.03] We released `intel/llm-scaler-vllm:0.14.0-b8.1` to support Qwen3.5-27B, Qwen3.5-35B-A3B and Qwen3.5-122B-A10B (FP8/INT4 online quantization, GPTQ)
-- 🔥 [2026.03] We released `intel/llm-scaler-omni:0.1.0-b6` for ComfyUI to support CacheDiT and torch.compile(), ComfyUI-GGUF, and more model workflows, and support FP8 for SGLang Diffusion.
-- 🔥 [2026.03] We released `intel/llm-scaler-vllm:0.14.0-b8` for vLLM 0.14.0 and PyTorch 2.10 support, various new models support and performance improvement. 
+- 🔥[2026.04] We released `intel/llm-scaler-vllm:0.14.0-b8.2` with new platform image and support Intel® Arc™ Pro B70 GPU 
+- [2026.03] We released `intel/llm-scaler-vllm:0.14.0-b8.1` to support Qwen3.5-27B, Qwen3.5-35B-A3B and Qwen3.5-122B-A10B (FP8/INT4 online quantization, GPTQ)
+- [2026.03] We released `intel/llm-scaler-omni:0.1.0-b6` for ComfyUI to support CacheDiT and torch.compile(), ComfyUI-GGUF, and more model workflows, and support FP8 for SGLang Diffusion.
+- [2026.03] We released `intel/llm-scaler-vllm:0.14.0-b8` for vLLM 0.14.0 and PyTorch 2.10 support, various new models support and performance improvement. 
 - [2026.01] We released `intel/llm-scaler-vllm:1.3` (or, `intel/llm-scaler-vllm:0.11.1-b7`) for vLLM 0.11.1 and PyTorch 2.9 support, various new models support and performance improvement.
 - [2026.01] We released `intel/llm-scaler-omni:0.1.0-b5` for Python 3.12 and PyTorch 2.9 support, various ComfyUI workflows and more SGLang Diffusion support.
 - [2025.12] We released `intel/llm-scaler-vllm:1.2`, same image as `intel/llm-scaler-vllm:0.10.2-b6`. 
@@ -55,13 +56,13 @@ Please follow the instructions in the [Getting Started](vllm/README.md/#1-gettin
 | Language Model       | Qwen/Qwen3-8B                              |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | Qwen/Qwen3-14B                             |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | Qwen/Qwen3-32B                             |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | Qwen/Qwen3.5-27B                             |  ✅  |         ✅         |          ✅          |       |                           |
 | Language MOE Model   | Qwen/Qwen3-30B-A3B                         |  ✅  |         ✅         |          ✅          |       |                           |
 | Language MOE Model   | Qwen/Qwen3-235B-A22B                       |      |         ✅         |                      |       |                           |
 | Language MOE Model   | Qwen/Qwen3-Coder-30B-A3B-Instruct          |  ✅  |         ✅         |          ✅          |       |                           |
 | Language MOE Model   | Qwen/Qwen3-Coder-Next                      |  ✅  |         ✅         |          ✅          |       |                           |
-| Language MOE Model   | Qwen/Qwen3.5-35B-A3B                         |  ✅  |         ✅         |          ✅          |       |                           |
-| Language MOE Model   | Qwen/Qwen3.5-122B-A10B                       |      |         ✅         |          ✅          |       |                           |
+| Language Model       | Qwen/Qwen3.5-27B                           |  ✅  |         ✅         |          ✅          |       |                           |
+| Language MOE Model   | Qwen/Qwen3.5-35B-A3B                       |  ✅  |         ✅         |          ✅          |       |                           |
+| Language MOE Model   | Qwen/Qwen3.5-122B-A10B                     |      |         ✅         |          ✅          |       |                           |
 | Language Model       | Qwen/QwQ-32B                               |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | mistralai/Ministral-8B-Instruct-2410       |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | mistralai/Mixtral-8x7B-Instruct-v0.1       |  ✅  |         ✅         |          ✅          |       |                           |
