@@ -14,6 +14,12 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
   m.def("esimd_gemm_fp8_pert(Tensor input, Tensor weight, Tensor weight_scale, "
         "Tensor output) -> Tensor");
   m.impl("esimd_gemm_fp8_pert", torch::kXPU, &esimd_gemm_fp8_pert);
+
+  // INT4 GEMM DPAS with per-group scale (group_size=128): M>=2.
+  // Weight [N, K/2] uint8 packed, scale [N, K/128] fp16.  N/K auto-detected.
+  m.def("esimd_gemm_int4_pgrp(Tensor input, Tensor weight, Tensor weight_scale, "
+        "Tensor output) -> Tensor");
+  m.impl("esimd_gemm_int4_pgrp", torch::kXPU, &esimd_gemm_int4_pgrp);
 }
 
 PyMODINIT_FUNC PyInit_custom_esimd_kernels_gemm() {

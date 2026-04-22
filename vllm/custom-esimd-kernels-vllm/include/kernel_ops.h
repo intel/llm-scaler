@@ -225,6 +225,14 @@ at::Tensor esimd_gemv_int4_fused2(
     at::Tensor w0, at::Tensor s0, at::Tensor o0,
     at::Tensor w1, at::Tensor s1, at::Tensor o1);
 
+// INT4 GEMM via DPAS with per-group scale (group_size=128): M>=2.
+// input [M, K] fp16, weight [N, K/2] uint8 packed, scale [N, K/128] fp16,
+// output [M, N] fp16 pre-allocated.  N must be a multiple of 16, K a
+// multiple of 128.  Intended complement to esimd_gemv_int4 (M=1).
+at::Tensor esimd_gemm_int4_pgrp(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output);
+
 // MoE grouped GEMM — FP8 E5M2 with per-tensor scale (one scalar per expert)
 at::Tensor esimd_moe_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor scale,
