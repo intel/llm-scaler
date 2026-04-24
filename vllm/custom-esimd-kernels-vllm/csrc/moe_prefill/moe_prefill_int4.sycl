@@ -21,10 +21,22 @@ namespace xmx_ns = sycl::ext::intel::esimd::xmx;
 // ======================== moe_prefill_gather_forward_kernel: Compute routing indices ========================
 // Single work-group kernel using local memory atomics.
 // Local memory layout: [counters: num_experts] [expert_offsets: num_experts]
+//
+// Outputs:
+//   expert_offsets[E]         : exclusive prefix sum of per-expert token counts.
+//   expert_tokens[total]      : pair_idxs sorted by expert. Position i holds
+//                               the pair_idx that belongs to the i-th slot of
+//                               the expert-sorted permuted buffer.  Forward
+//                               permutation: perm_buf[i] = orig[tok[i] // TK]
+//   pair_to_perm[total]       : inverse permutation. pair_to_perm[pair_idx]=i.
+//                               Lets downstream kernels read the permuted
+//                               (expert-sorted) buffer directly from pair_idx
+//                               ordering without a torch.index_select step.
 template<int GS = 1024>
 sycl::event moe_prefill_gather_forward_kernel(
     sycl::queue& q,
     const int* selected_experts, int* expert_offsets, int* expert_tokens,
+    int* pair_to_perm,
     int num_experts, int total_seqlen)
 {
     return q.submit([&](sycl::handler& cgh) {
@@ -69,6 +81,7 @@ sycl::event moe_prefill_gather_forward_kernel(
             }
 
             // Phase 4: Scatter expert_tokens (store pair_idx, not token_idx)
+            //          and simultaneously record the inverse permutation.
             for (int i = lid; i < total_seqlen; i += GS) {
                 int eid = selected_experts[i];
                 sycl::atomic_ref<int, sycl::memory_order::relaxed,
@@ -76,6 +89,7 @@ sycl::event moe_prefill_gather_forward_kernel(
                     sycl::access::address_space::local_space> ref(slm_offsets[eid]);
                 int pos = ref.fetch_add(1);
                 expert_tokens[pos] = i;
+                pair_to_perm[i]    = pos;
             }
 
         }); // parallel_for
@@ -103,7 +117,7 @@ sycl::event moe_prefill_up_forward_kernel(
     int num_experts, int total_seqlen, int hidden_size, int intermediate_size, int top_k)
 {
     static_assert(MAX_M % 16 == 0, "MAX_M must be multiple of 16");
-    static_assert(N == 16,          "IPEX path currently assumes N=16");
+    static_assert(N == 16,          "up kernel currently assumes N=16 to fit the GRF budget");
     static_assert(BS % 16 == 0,     "BS must be multiple of 16 (= 16 kp per group)");
     constexpr int MS      = MAX_M / 16;
     constexpr int NS      = N / 8;          // 2 DPAS N-tiles per WI
@@ -397,6 +411,39 @@ sycl::event moe_prefill_accumulate_forward_kernel(
     });
 }
 
+// ── Accumulate from permuted (expert-sorted) buffer ─────────────────────────
+// Input `output_perm` is in expert-sorted permutation (the order that ipex
+// group_mm_int4_out_marlin produces when fed a pre-permuted input). The map
+// `pair_to_perm[pair_idx]` gives the row in `output_perm` corresponding to
+// each (token, top_k-slot) pair. Fuses the inverse permutation into the
+// weighted-sum loop, so no separate torch.index_select pass is needed.
+template<typename IT>
+sycl::event moe_prefill_accumulate_permuted_forward_kernel(
+    sycl::queue& q,
+    const IT* output_perm, const IT* routing_weights,
+    const int* pair_to_perm, IT* routing_output,
+    int num_tokens, int hidden_size, int top_k)
+{
+    return q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::range<1>(num_tokens),
+            [=](sycl::id<1> id) SYCL_ESIMD_KERNEL {
+                const int tok = (int)id[0];
+                for (int hoff = 0; hoff < hidden_size; hoff += 64) {
+                    simd<float, 64> acc(0.f);
+                    for (int s = 0; s < top_k; s++) {
+                        const int pair_idx = tok * top_k + s;
+                        const int pp       = pair_to_perm[pair_idx];
+                        const float w      = (float)routing_weights[pair_idx];
+                        acc += w * convert<float>(
+                            block_load<IT, 64>(output_perm + (size_t)pp * hidden_size + hoff));
+                    }
+                    block_store<IT, 64>(routing_output + (size_t)tok * hidden_size + hoff, convert<IT>(acc));
+                }
+            });
+    });
+}
+
 // ======================== Torch Wrappers ========================
 
 std::vector<torch::Tensor> moe_prefill_gather_forward_v2(
@@ -411,7 +458,8 @@ std::vector<torch::Tensor> moe_prefill_gather_forward_v2(
 
     auto opts_int = torch::device(selected_experts.device()).dtype(torch::kInt32);
     torch::Tensor expert_offsets = torch::empty({num_experts}, opts_int);
-    torch::Tensor expert_tokens = torch::empty({total_seqlen}, opts_int);
+    torch::Tensor expert_tokens  = torch::empty({total_seqlen}, opts_int);
+    torch::Tensor pair_to_perm   = torch::empty({total_seqlen}, opts_int);
 
     sycl::queue& queue = c10::xpu::getCurrentXPUStream(selected_experts.device().index()).queue();
 
@@ -420,9 +468,10 @@ std::vector<torch::Tensor> moe_prefill_gather_forward_v2(
         selected_experts.data_ptr<int>(),
         expert_offsets.data_ptr<int>(),
         expert_tokens.data_ptr<int>(),
+        pair_to_perm.data_ptr<int>(),
         num_experts, total_seqlen);
 
-    return {expert_offsets, expert_tokens};
+    return {expert_offsets, expert_tokens, pair_to_perm};
 }
 
 // IPEX K-major layout:
@@ -600,6 +649,57 @@ torch::Tensor moe_prefill_accumulate_forward_v2(
     return routing_output;
 }
 
+// Same as moe_prefill_accumulate_forward_v2, but `output_perm` is in
+// expert-sorted (permuted) order and `pair_to_perm` maps pair_idx -> perm row.
+// Useful when fusing the inverse permutation after ipex group_mm_int4_out_marlin.
+torch::Tensor moe_prefill_accumulate_permuted_forward_v2(
+    torch::Tensor output_perm,
+    torch::Tensor routing_weights,
+    torch::Tensor pair_to_perm) {
+
+    TORCH_CHECK(output_perm.dim() == 2);
+    TORCH_CHECK(routing_weights.dim() == 2);
+    TORCH_CHECK(routing_weights.scalar_type() == output_perm.scalar_type());
+    TORCH_CHECK(pair_to_perm.scalar_type() == torch::kInt32);
+    TORCH_CHECK(pair_to_perm.numel() == routing_weights.numel(),
+                "pair_to_perm must have M*top_k entries");
+
+    int num_tokens = routing_weights.size(0);
+    int top_k      = routing_weights.size(1);
+    int hidden_size = output_perm.size(1);
+
+    torch::Tensor routing_output = torch::empty(
+        {num_tokens, hidden_size},
+        torch::device(output_perm.device()).dtype(output_perm.scalar_type()));
+
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(output_perm.device().index()).queue();
+
+    switch (output_perm.scalar_type()) {
+        case at::kHalf:
+            moe_prefill_accumulate_permuted_forward_kernel<fp16>(
+                queue,
+                (const fp16*)output_perm.data_ptr(),
+                (const fp16*)routing_weights.data_ptr(),
+                pair_to_perm.data_ptr<int>(),
+                (fp16*)routing_output.data_ptr(),
+                num_tokens, hidden_size, top_k);
+            break;
+        case at::kBFloat16:
+            moe_prefill_accumulate_permuted_forward_kernel<bf16>(
+                queue,
+                (const bf16*)output_perm.data_ptr(),
+                (const bf16*)routing_weights.data_ptr(),
+                pair_to_perm.data_ptr<int>(),
+                (bf16*)routing_output.data_ptr(),
+                num_tokens, hidden_size, top_k);
+            break;
+        default:
+            TORCH_CHECK(false, "unsupported dtype (expected fp16 or bf16)");
+    }
+
+    return routing_output;
+}
+
 // ======================== Unified host function ========================
 
 #include "../xpu/esimd_kernels/moe_ops.h"  // TopK V2
@@ -677,6 +777,8 @@ TORCH_LIBRARY_FRAGMENT(moe_int4_prefill_ops, m) {
           "Tensor expert_offsets, Tensor expert_tokens) -> Tensor");
     m.def("moe_prefill_accumulate_forward_v2(Tensor output, "
           "Tensor routing_weights) -> Tensor");
+    m.def("moe_prefill_accumulate_permuted_forward_v2(Tensor output_perm, "
+          "Tensor routing_weights, Tensor pair_to_perm) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(moe_int4_prefill_ops, XPU, m) {
@@ -685,6 +787,8 @@ TORCH_LIBRARY_IMPL(moe_int4_prefill_ops, XPU, m) {
     m.impl("moe_prefill_up_forward_v2", &moe_prefill_up_forward_v2);
     m.impl("moe_prefill_down_forward_v2", &moe_prefill_down_forward_v2);
     m.impl("moe_prefill_accumulate_forward_v2", &moe_prefill_accumulate_forward_v2);
+    m.impl("moe_prefill_accumulate_permuted_forward_v2",
+           &moe_prefill_accumulate_permuted_forward_v2);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -693,4 +797,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_prefill_up_forward_v2", &moe_prefill_up_forward_v2);
     m.def("moe_prefill_down_forward_v2", &moe_prefill_down_forward_v2);
     m.def("moe_prefill_accumulate_forward_v2", &moe_prefill_accumulate_forward_v2);
+    m.def("moe_prefill_accumulate_permuted_forward_v2",
+          &moe_prefill_accumulate_permuted_forward_v2);
 }

@@ -314,7 +314,7 @@ def test_gather_v2():
     d = make_inputs(cfg)
     selected = _xpu(d["topk_idx"])
 
-    off_k, tok_k = ops.moe_prefill_gather_forward_v2(selected, cfg["E"])
+    off_k, tok_k, _pp_unused = ops.moe_prefill_gather_forward_v2(selected, cfg["E"])
     off_r, tok_r = ref_gather(d["topk_idx"], cfg["E"])
 
     assert max_abs_diff(off_k.cpu(), off_r) == 0, "expert_offsets mismatch"
@@ -339,7 +339,7 @@ def test_up_v2():
     x_xpu = _xpu(d["x"])
     w13_q = _xpu(d["W13_q"])
     w13_s = _xpu(d["W13_s"])
-    off_xpu, tok_xpu = ops.moe_prefill_gather_forward_v2(_xpu(d["topk_idx"]), cfg["E"])
+    off_xpu, tok_xpu, _pp_unused = ops.moe_prefill_gather_forward_v2(_xpu(d["topk_idx"]), cfg["E"])
     out_k = ops.moe_prefill_up_forward_v2(
         x_xpu, w13_q, w13_s, off_xpu, tok_xpu, cfg["top_k"]
     ).cpu()
@@ -356,7 +356,7 @@ def test_down_v2():
     d = make_inputs(cfg)
 
     x_xpu = _xpu(d["x"])
-    off_xpu, tok_xpu = ops.moe_prefill_gather_forward_v2(_xpu(d["topk_idx"]), cfg["E"])
+    off_xpu, tok_xpu, _pp_unused = ops.moe_prefill_gather_forward_v2(_xpu(d["topk_idx"]), cfg["E"])
     inter_ref = ref_up(d["x"], d["W13_dq"], off_xpu.cpu(), tok_xpu.cpu(), cfg["top_k"])
     inter_xpu = _xpu(inter_ref)
 
@@ -415,7 +415,7 @@ def test_full_end_to_end():
 def _run_routed_pipeline(cfg):
     from custom_esimd_kernels_vllm import moe_int4_prefill_ops as ops
     d = make_inputs(cfg)
-    off_xpu, tok_xpu = ops.moe_prefill_gather_forward_v2(_xpu(d["topk_idx"]), cfg["E"])
+    off_xpu, tok_xpu, _pp_unused = ops.moe_prefill_gather_forward_v2(_xpu(d["topk_idx"]), cfg["E"])
     inter_xpu = ops.moe_prefill_up_forward_v2(
         _xpu(d["x"]), _xpu(d["W13_q"]), _xpu(d["W13_s"]),
         off_xpu, tok_xpu, cfg["top_k"])
