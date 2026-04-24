@@ -1,0 +1,16 @@
+--- /home/nobara-user/llm-scaler-vllm/vllm/vllm/_ipex_ops.py	2026-04-14 19:39:54.208412709 +0900
++++ /home/nobara-user/llm-scaler-vllm/venv/lib64/python3.12/site-packages/vllm/_ipex_ops.py	2026-04-16 13:38:29.254402569 +0900
+@@ -333,6 +333,13 @@
+             )
+             return out
+         else:
++            if q.dtype != k.dtype:
++                import logging
++                logging.warning(
++                    f"flash_attn dtype mismatch: q={q.dtype} k={k.dtype} "
++                    f"v={v.dtype} q.shape={q.shape} k.shape={k.shape}")
++                k = k.to(q.dtype)
++                v = v.to(q.dtype)
+             return ipex.llm.modules.PagedAttention.flash_attn_varlen_func(
+                 out,
+                 q.contiguous(),

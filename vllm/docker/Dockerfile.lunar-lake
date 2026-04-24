@@ -1,0 +1,40 @@
+# Lunar Lake iGPU patches for INT4 AutoRound MoE models
+# Builds on Intel's llm-scaler-vllm with fixes for shared-memory iGPU
+#
+# Build:
+#   podman build -t ghcr.io/megastood/llm-scaler-vllm:0.14.0-lunar-lake \
+#     -f vllm/docker/Dockerfile.lunar-lake .
+#
+# Run:
+#   podman run --device /dev/dri -v /shared/models:/models \
+#     ghcr.io/megastood/llm-scaler-vllm:0.14.0-lunar-lake \
+#     vllm serve /models/qwen3-vl-30b-a3b-int4-autoround \
+#       --gpu-memory-utilization 0.75 --enforce-eager --max-model-len 4096 \
+#       --allow-deprecated-quantization
+
+FROM intel/llm-scaler-vllm:latest
+
+# Copy patches for INT4 AutoRound MoE on shared-memory iGPU
+COPY vllm/patches/autoround_fusedmoe_ipex_routing.patch /tmp/patches/
+COPY vllm/patches/gemma4_moe_top_k_experts.patch /tmp/patches/
+COPY vllm/patches/gptq_math_ceil_alignment.patch /tmp/patches/
+COPY vllm/patches/mla_xpu_return_attn_probs.patch /tmp/patches/
+COPY vllm/patches/xpu_gptq_moe_cpu_shuffle.patch /tmp/patches/
+COPY vllm/patches/ipex_marlin_shuffle_skip_preshuffled.patch /tmp/patches/
+COPY vllm/patches/xpu_skip_warmup_dummy_run.patch /tmp/patches/
+
+# Apply patches to installed site-packages
+# --forward skips already-applied hunks gracefully
+RUN SITE=$(python3 -c "import site; print(site.getsitepackages()[0])") && \
+    cd "$SITE" && \
+    for p in /tmp/patches/*.patch; do \
+      echo "Applying $(basename $p)..." && \
+      patch -p1 --forward < "$p" || true; \
+    done && \
+    rm -rf /tmp/patches
+
+# Default env vars for Lunar Lake shared-memory iGPU
+ENV VLLM_SKIP_PROFILE_RUN=1
+ENV VLLM_SKIP_PROFILE_MULTIPLIER=1.15
+ENV PYTORCH_ALLOC_CONF=expandable_segments:True
+ENV CCL_TOPO_P2P_ACCESS=0

@@ -1,0 +1,54 @@
+From: llm-scaler
+Subject: [PATCH] Enable MLA (Multi-head Latent Attention) for GLM-4.7-Flash on XPU
+
+GLM-4.7-Flash (model_type: glm4_moe_lite) uses MLA architecture but was
+not recognized by vLLM's is_deepseek_mla() check. This caused vLLM to
+fall back to uncompressed KV cache (940 KB/token) instead of compressed
+latent KV (~1.1 KB/token), making 4096 context require 3.67 GiB KV cache
+instead of ~4.5 MiB.
+
+Changes:
+1. Add glm4_moe_lite to MLA model type list in is_deepseek_mla()
+2. Route MLA attention to TRITON_MLA backend on XPU platform
+3. Import flash_attn_varlen_func from fa_utils on XPU for MLA prefill
+
+---
+ vllm/platforms/xpu.py                                        | 3 +++
+ vllm/transformers_utils/model_arch_config_convertor.py       | 1 +
+ vllm/v1/attention/backends/mla/common.py                     | 2 ++
+ 3 files changed, 6 insertions(+)
+
+diff --git a/vllm/transformers_utils/model_arch_config_convertor.py b/vllm/transformers_utils/model_arch_config_convertor.py
+--- a/vllm/transformers_utils/model_arch_config_convertor.py
++++ b/vllm/transformers_utils/model_arch_config_convertor.py
+@@ -189,6 +189,7 @@
+             "deepseek_v3",
+             "deepseek_v32",
+             "deepseek_mtp",
++            "glm4_moe_lite",
+             "kimi_k2",
+             "kimi_linear",
+             "longcat_flash",
+diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
+--- a/vllm/platforms/xpu.py
++++ b/vllm/platforms/xpu.py
+@@ -55,6 +55,9 @@
+         dtype = attn_selector_config.dtype
+         if attn_selector_config.use_sparse:
+             raise NotImplementedError("Sparse Attention is not supported on XPU.")
++        if attn_selector_config.use_mla:
++            logger.info_once("Using Triton MLA backend for MLA attention on XPU.")
++            return AttentionBackendEnum.TRITON_MLA.get_path()
+         if selected_backend == AttentionBackendEnum.TRITON_ATTN:
+             logger.info_once("Using Triton backend.")
+             return AttentionBackendEnum.TRITON_ATTN.get_path()
+diff --git a/vllm/v1/attention/backends/mla/common.py b/vllm/v1/attention/backends/mla/common.py
+--- a/vllm/v1/attention/backends/mla/common.py
++++ b/vllm/v1/attention/backends/mla/common.py
+@@ -259,6 +259,8 @@
+     # For rocm use upstream flash attention
+     if current_platform.is_rocm():
+         from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
++    elif current_platform.is_xpu():
++        from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func  # type: ignore[no-redef]
+     is_vllm_fa = False

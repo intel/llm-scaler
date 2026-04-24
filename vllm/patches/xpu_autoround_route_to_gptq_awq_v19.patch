@@ -1,0 +1,19 @@
+--- vllm/model_executor/layers/quantization/inc.py	(v0.19.0 upstream)
++++ vllm/model_executor/layers/quantization/inc.py	(patched)
+@@ -420,6 +420,16 @@
+                     layer_name == prefix or layer_name == f"model.{prefix}"
+                 ) and self.extra_config[layer_name].get("bits", 16) >= 16:
+                     return UnquantizedLinearMethod()
++        # XPU: AutoRound's auto_round:auto_gptq / auto_round:auto_awq formats
++        # are bit-compatible with GPTQ / AWQ. Route through those paths, which
++        # now have XPU-aware apply() (see PR #33662 for linear and our MoE
++        # patch for GPTQMarlinMoEMethod). The apply_ipex_quant_layer path
++        # otherwise raises NotImplementedError during 'xpu kernel migration'.
++        if current_platform.is_xpu():
++            if "gptq" in self.packing_format:
++                return self.apply_gptq_quant_layer(layer, prefix)
++            if "awq" in self.packing_format:
++                return self.apply_awq_quant_layer(layer, prefix)
+         if (
+             current_platform.is_cpu()
+             or current_platform.is_xpu()

@@ -1,0 +1,112 @@
+diff --git a/vllm/model_executor/layers/quantization/awq.py b/vllm/model_executor/layers/quantization/awq.py
+index 3cf3116f0670..eec9c9909a28 100644
+--- a/vllm/model_executor/layers/quantization/awq.py
++++ b/vllm/model_executor/layers/quantization/awq.py
+@@ -20,6 +20,7 @@
+ )
+ from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+ from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
++from vllm.platforms import current_platform
+ from vllm.transformers_utils.config import get_safetensors_params_metadata
+ 
+ if TYPE_CHECKING:
+@@ -251,6 +252,23 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
+         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
+         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
++        if current_platform.is_xpu():
++            from vllm_xpu_kernels.quantization._quantize_convert import (
++                AWQUtils,
++                transpose_onednn_woq_format,
++            )
++
++            layer.xpu_output_size = (
++                layer.qweight.size(1) * self.quant_config.pack_factor
++            )
++            qweight_new, qzeros_new = AWQUtils.repack(layer.qweight, layer.qzeros)
++            if qweight_new.shape != layer.qweight.data.shape:
++                layer.qweight.data = layer.qweight.data.view_as(qweight_new)
++            if qzeros_new.shape != layer.qzeros.data.shape:
++                layer.qzeros.data = layer.qzeros.data.view_as(qzeros_new)
++            layer.qweight.data.copy_(qweight_new)
++            layer.qzeros.data.copy_(qzeros_new)
++            transpose_onednn_woq_format(layer, "awq", False)
+ 
+     def apply(
+         self,
+@@ -258,6 +276,20 @@ def apply(
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if current_platform.is_xpu():
++            reshaped_x = x.reshape(-1, x.shape[-1])
++            out = torch.ops._xpu_C.int4_gemm_w4a16(
++                reshaped_x,
++                layer.qweight,
++                bias,
++                layer.scales,
++                layer.qzeros,
++                self.quant_config.group_size,
++                None,
++            )
++            out_shape = x.shape[:-1] + (layer.xpu_output_size,)
++            return out.reshape(out_shape)
++
+         qweight = layer.qweight
+         scales = layer.scales
+         qzeros = layer.qzeros
+diff --git a/vllm/model_executor/layers/quantization/gptq.py b/vllm/model_executor/layers/quantization/gptq.py
+index 154347a930a9..355cbfa57f56 100644
+--- a/vllm/model_executor/layers/quantization/gptq.py
++++ b/vllm/model_executor/layers/quantization/gptq.py
+@@ -28,6 +28,7 @@
+     PackedvLLMParameter,
+     RowvLLMParameter,
+ )
++from vllm.platforms import current_platform
+ from vllm.transformers_utils.config import get_safetensors_params_metadata
+ from vllm.utils.collection_utils import is_list_of
+ 
+@@ -355,6 +356,23 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         layer.g_idx = Parameter(layer.g_idx.data, requires_grad=False)
+         layer.scales = Parameter(layer.scales.data, requires_grad=False)
+ 
++        if current_platform.is_xpu():
++            from vllm_xpu_kernels.quantization._quantize_convert import (
++                GPTQUtils,
++                transpose_onednn_woq_format,
++            )
++
++            if self.quant_config.desc_act and layer.g_idx is not None:
++                gptq_utils = GPTQUtils(bits=4, blocksize=self.quant_config.group_size)
++                qweight_new, g_idx_new = gptq_utils.shuffle(layer.qweight, layer.g_idx)
++                layer.qweight.data.copy_(qweight_new)
++                layer.g_idx.data.copy_(g_idx_new)
++                qweight_new = None
++                g_idx_new = None
++                del qweight_new, g_idx_new
++            transpose_onednn_woq_format(layer, "gptq", True)
++            return
++
+         # exllama needs to shuffle the weight after the weight is loaded
+         # here we do the shuffle on first forward pass
+         if layer.exllama_state == ExllamaState.UNINITIALIZED:
+@@ -373,6 +391,18 @@ def apply(
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if current_platform.is_xpu():
++            reshaped_x = x.reshape(-1, x.shape[-1])
++            out = torch.ops._xpu_C.int4_gemm_w4a16(
++                reshaped_x,
++                layer.qweight,
++                bias,
++                layer.scales,
++                layer.qzeros,
++                layer.quant_config.group_size,
++                None,
++            )
++            return out
+         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
+         reshaped_x = x.reshape(-1, x.shape[-1])
+ 
