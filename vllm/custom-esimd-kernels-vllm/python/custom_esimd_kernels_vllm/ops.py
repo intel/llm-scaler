@@ -129,6 +129,30 @@ def esimd_gemv_int4_fused2(
     return _ops.esimd_gemv_int4_fused2(input, w0, s0, o0, w1, s1, o1)
 
 
+def esimd_gemm_int4_pgrp(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """INT4 GEMM via DPAS with per-group scale (group_size=128), for M>=2.
+
+    Complements esimd_gemv_int4 (M=1).  Built on BMG XMX matrix engine;
+    each byte of the packed INT4 weight already pairs (K_even, K_odd) in
+    the layout DPAS's VNNI K-pair expects, so building the B tile is a
+    fully vectorized nibble-extract + fused FMA dequant on simd<uint32,16>.
+
+    input:        [M, K]       fp16
+    weight:       [N, K/2]     uint8 — packed INT4 (2 per byte, low
+                                       nibble = even K index)
+    weight_scale: [N, K/128]   fp16  — per-group scale (group_size=128,
+                                       may be negative per GGML q4_0)
+    output:       [M, N]       fp16 — pre-allocated
+
+    Requirements: N % 16 == 0, K % 128 == 0.  M, N, K inferred from
+    tensor shapes.
+    """
+    return _ops.esimd_gemm_int4_pgrp(input, weight, weight_scale, output)
+
+
 # ---- Fused QKV Split + RMSNorm + RoPE ----
 
 def esimd_qkv_split_norm_rope(
