@@ -1081,6 +1081,9 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | Language MOE Model   | Qwen/Qwen3-235B-A22B                       |      |         ✅         |                      |       |                           |
 | Language MOE Model   | Qwen/Qwen3-Coder-30B-A3B-Instruct          |  ✅  |         ✅         |          ✅          |       |                           |
 | Language MOE Model   | Qwen/Qwen3-Coder-Next                      |  ✅  |         ✅         |          ✅          |       |                           |
+| Language Model       | Qwen/Qwen3.5-27B                           |  ✅  |         ✅         |          ✅          |       |                           |
+| Language MOE Model   | Qwen/Qwen3.5-35B-A3B                       |  ✅  |         ✅         |          ✅          |       |                           |
+| Language MOE Model   | Qwen/Qwen3.5-122B-A10B                     |      |         ✅         |          ✅          |       |                           |
 | Language Model       | Qwen/QwQ-32B                               |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | mistralai/Ministral-8B-Instruct-2410       |  ✅  |         ✅         |          ✅          |       |                           |
 | Language Model       | mistralai/Mixtral-8x7B-Instruct-v0.1       |  ✅  |         ✅         |          ✅          |       |                           |
