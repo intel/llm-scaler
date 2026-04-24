@@ -173,6 +173,17 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
         chunk_start = qkvz_offset;
     }
 
+    // When HV < available v-thread slots, surplus v-threads have OOB offsets.
+    // Clamp to valid range; their results are never stored.
+    const bool v_oob = (tid >= 4 * H) &&
+        (double_v ? (tid - 4 * H >= HV) : ((tid - 4 * H) / 2 >= HV));
+    if (v_oob) {
+        qkvz_offset = v_base;
+        qkvz_offset_hi = v_base + 64;
+        chunk_start = v_base;
+        chunk_start_hi = v_base + 64;
+    }
+
     // ---- Phase 1: Conv1d ----
     const fp16* qkvz_row = qkvz_ptr + (int64_t)seq_idx * qkvz_stride0;
     fp16* cstate_base = conv_state_ptr + (int64_t)conv_idx * conv_stride0;
@@ -201,7 +212,7 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
     simd<fp16, 64> x_fp16_hi;
     simd<float, 64> s0_hi, s1_hi, s2_hi, conv_result_hi;
 
-    if (double_v && tid >= 4 * H) {
+    if (double_v && tid >= 4 * H && !v_oob) {
         x_fp16_hi = block_load<fp16, 64>(qkvz_row + qkvz_offset_hi);
         simd<float, 64> x_f32_hi = x_fp16_hi;
 
@@ -346,7 +357,7 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
     // cross-WG race: one WG's shift writes could land before another WG's
     // Phase 1 reads for the same seq_idx.
     // Uses register-cached s1, s2, x_fp16 from Phase 1 (not re-read from memory).
-    if (inline_conv_shift && conv_idx >= 0 && hv == 0) {
+    if (inline_conv_shift && conv_idx >= 0 && hv == 0 && !v_oob) {
         // lo chunk (all threads)
         block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start, simd<fp16, 64>(s1));
         block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start, simd<fp16, 64>(s2));
@@ -361,7 +372,7 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
     }
 
     // ---- z extraction: v-threads copy z from SEQUENTIAL qkvz to z_out ----
-    if (tid >= 4 * H) {
+    if (tid >= 4 * H && !v_oob) {
         int v_tid = tid - 4 * H;
         if (double_v) {
             // One thread per v_head, two 64-element loads
@@ -447,6 +458,10 @@ ESIMD_INLINE void conv_state_shift_seq_kernel(
         qkvz_offset = v_base + v_hv * gdn_V + (v_tid & 1) * 64;
         chunk_start = qkvz_offset;
     }
+
+    const bool v_oob_s = (tid >= 4 * H) &&
+        (double_v ? (tid - 4 * H >= HV) : ((tid - 4 * H) / 2 >= HV));
+    if (v_oob_s) return;
 
     const fp16* qkvz_row = qkvz_ptr + (int64_t)seq_idx * qkvz_stride0;
     fp16* cstate_base = conv_state_ptr + (int64_t)conv_idx * conv_stride0;
