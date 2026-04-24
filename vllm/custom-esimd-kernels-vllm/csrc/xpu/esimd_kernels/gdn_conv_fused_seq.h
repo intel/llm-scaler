@@ -512,6 +512,16 @@ inline void gdn_conv_fused_seq_host(
     sycl::queue& q)
 {
     constexpr int WG_SIZE = 32;
+    const int max_v_threads = WG_SIZE - 4 * H;
+    TORCH_CHECK(HV > 0 && HV % H == 0,
+        "gdn_conv_fused_seq: HV (", HV, ") must be a positive multiple of H (", H, ")");
+    TORCH_CHECK(HV <= max_v_threads,
+        "gdn_conv_fused_seq: HV (", HV, ") exceeds max v-thread slots (", max_v_threads,
+        "). Supported num_v_heads_global with H=", H, ": ",
+        "multiples of H*TP up to ", max_v_threads, "*TP");
+    TORCH_CHECK(K == 128 && V == 128,
+        "gdn_conv_fused_seq: only K=128, V=128 supported, got K=", K, " V=", V);
+
     const int total_wgs = N * HV;
 
     // When total WGs fit in a single scheduling wave (<=32), all WGs run
