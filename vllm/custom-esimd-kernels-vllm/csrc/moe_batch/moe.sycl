@@ -3,6 +3,9 @@
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
 
+#include "moe_topk.h"
+#include "../xpu/esimd_kernels/moe_ops.h"
+
 using fp16 = sycl::half;
 using namespace sycl::ext::intel::esimd;
 using namespace sycl::ext::intel::esimd::xmx;
@@ -1069,59 +1072,49 @@ SYCL_ESIMD_FUNCTION inline void topk_argmax_zero(
     vals.merge(simd<float,C>(-1.0f), simd<int32_t,C>(0,1) == (oi - base));
 }
 
-// TopK V2: vectorized argmax, ~7x faster than heap-based for 512 experts.
-void moe_topk_forward_kernel(
+// Host dispatcher: pick the correct TopK V2 template specialization by config,
+// falling back to the parameterized heap-based impl for unknown shapes.
+// Matches the dispatch already used by moe_int4.sycl (for sym_int4 models) and
+// esimd_kernel_topk_v2.sycl. Qwen3-Next (512/10) and Qwen3.5-35B-A3B (256/8)
+// both hit fast V2 paths here; other configs degrade to the generic impl.
+template<typename FallbackKernelName>
+void dispatch_moe_topk_forward(
     const fp16* logits, int* topk_idx, fp16* topk_weight,
     const int n_tokens, const int n_experts, const int top_k,
     const bool norm, const torch::Device& device) {
-    constexpr int NE=512, TK=10, C=64, NC=NE/C;
-    auto cgf = [&](sycl::handler& cgh) {
-        cgh.parallel_for<class MoeTopKForwardV2>(
-            sycl::nd_range<1>({(size_t)n_tokens},{1}),
-            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
-                int row = item.get_group(0);
-                if (row >= n_tokens) return;
-                const fp16* rp = logits + (size_t)row * n_experts;
-                simd<float,C> p[NC];
-                #pragma unroll
-                for (int c=0;c<NC;c++) p[c] = simd<float,C>(block_load<fp16,C>(rp+c*C));
-                // softmax
-                float mx = topk_h_max<float,C>(p[0]);
-                #pragma unroll
-                for (int c=1;c<NC;c++) { float m=topk_h_max<float,C>(p[c]); if(m>mx)mx=m; }
-                float tot=0.f;
-                #pragma unroll
-                for (int c=0;c<NC;c++) { p[c]-=mx; p[c]=sycl::ext::intel::esimd::exp<float,C>(p[c]); tot+=topk_h_sum<float,C>(p[c]); }
-                float inv=1.f/tot;
-                #pragma unroll
-                for (int c=0;c<NC;c++) p[c]*=inv;
-                // topk
-                float tv[16]; int32_t ti[16];
-                #pragma unroll
-                for (int k=0;k<TK;k++) {
-                    float bv=-1.f; int bc=0;
-                    #pragma unroll
-                    for (int c=0;c<NC;c++) { float m=topk_h_max<float,C>(p[c]); if(m>bv){bv=m;bc=c;} }
-                    topk_argmax_zero<C>(p[bc],bc*C,tv[k],ti[k]);
-                }
-                float ts=0.f;
-                #pragma unroll
-                for (int k=0;k<TK;k++) ts+=tv[k];
-                float it=1.f/ts;
-                #pragma unroll
-                for (int k=0;k<TK;k++) tv[k]*=it;
-                fp16* vp=topk_weight+(size_t)row*top_k;
-                int32_t* ip=topk_idx+(size_t)row*top_k;
-                simd<fp16,8> sv; simd<int32_t,8> si;
-                #pragma unroll
-                for (int i=0;i<8;i++){sv[i]=(fp16)tv[i];si[i]=ti[i];}
-                block_store<fp16,8>(vp,sv); block_store<int32_t,8>(ip,si);
-                #pragma unroll
-                for (int i=8;i<TK;i++){block_store<fp16,1>(vp+i,simd<fp16,1>((fp16)tv[i])); block_store<int32_t,1>(ip+i,simd<int32_t,1>(ti[i]));}
-            });
-    };
-    submit_kernel(cgf, device, "moe topk forward v2");
+    sycl::queue& q = c10::xpu::getCurrentXPUStream(device.index()).queue();
+    if (norm) {
+        if (n_experts == 512 && top_k == 10) {
+            moe_topk_v2_host<512, 10>(logits, topk_weight, topk_idx, n_tokens, q);
+            return;
+        } else if (n_experts == 512 && top_k == 8) {
+            moe_topk_v2_host<512, 8>(logits, topk_weight, topk_idx, n_tokens, q);
+            return;
+        } else if (n_experts == 256 && top_k == 10) {
+            moe_topk_v2_host<256, 10>(logits, topk_weight, topk_idx, n_tokens, q);
+            return;
+        } else if (n_experts == 256 && top_k == 8) {
+            moe_topk_v2_host<256, 8>(logits, topk_weight, topk_idx, n_tokens, q);
+            return;
+        } else if (n_experts == 128 && top_k == 8) {
+            moe_topk_v2_host<128, 8>(logits, topk_weight, topk_idx, n_tokens, q);
+            return;
+        } else if (n_experts == 128 && top_k == 10) {
+            moe_topk_v2_host<128, 10>(logits, topk_weight, topk_idx, n_tokens, q);
+            return;
+        }
+    }
+    // Fallback: generic parameterized heap-based topk (handles any n_experts<=512,
+    // any top_k<=32, and supports norm=false).
+    moe_topk_forward_kernel_impl<FallbackKernelName>(
+        logits, topk_idx, topk_weight, n_tokens, n_experts, top_k, norm, q);
 }
+
+// NOTE: The old hardcoded-NE=512/TK=10 `moe_topk_forward_kernel` has been
+// removed. All callers now route through `dispatch_moe_topk_forward`, which
+// selects the correct `moe_topk_v2_host<NE,TK>` specialization (from
+// csrc/xpu/esimd_kernels/moe_ops.h) for known configs, or falls back to the
+// parameterized heap impl in csrc/moe_batch/moe_topk.h for anything else.
 
 std::tuple<torch::Tensor, torch::Tensor> moe_topk(
     torch::Tensor logits,
@@ -1144,7 +1137,9 @@ std::tuple<torch::Tensor, torch::Tensor> moe_topk(
     torch::Tensor topk_weight = torch::empty({n_tokens, top_k},
         torch::device(logits.device()).dtype(torch::kHalf));
 
-    moe_topk_forward_kernel(
+    // Dispatch: V2 template for known (n_experts, top_k) combos (incl. Qwen3.5
+    // 256/8 and Qwen3-Next 512/10), fallback to generic heap impl otherwise.
+    dispatch_moe_topk_forward<class MoeTopKFP8Standalone>(
         (const fp16*)logits.data_ptr(),
         topk_idx.data_ptr<int>(),
         (fp16*)topk_weight.data_ptr(),
@@ -1272,8 +1267,9 @@ torch::Tensor moe_forward_full(
     ensure_moe_buffers(n_tokens, top_k, num_shared_experts, hidden_size,
                        intermediate_size, x.device());
 
-    // TopK
-    moe_topk_forward_kernel(
+    // TopK — dispatch by (n_experts, top_k) to pick correct V2 template,
+    // fallback to generic heap-based impl for unsupported shapes.
+    dispatch_moe_topk_forward<class MoeTopKFP8V1>(
         (const fp16*)logits.data_ptr(),
         s_topk_idx.data_ptr<int>(),
         (fp16*)s_topk_weight.data_ptr(),
@@ -1363,8 +1359,9 @@ torch::Tensor moe_forward_full_v2(
     ensure_moe_buffers_v2(n_tokens, top_k, num_shared_experts, hidden_size,
                           intermediate_size, x.device());
 
-    // TopK (V2 vectorized)
-    moe_topk_forward_kernel(
+    // TopK — dispatch by (n_experts, top_k) to pick correct V2 template,
+    // fallback to generic heap-based impl for unsupported shapes.
+    dispatch_moe_topk_forward<class MoeTopKFP8V2>(
         (const fp16*)logits.data_ptr(),
         s2_topk_idx.data_ptr<int>(),
         (fp16*)s2_topk_weight.data_ptr(),
