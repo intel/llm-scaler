@@ -39,3 +39,4 @@ index aad3274..d6afef0 100644
 
    # Final link option be like: icpx -fsycl -fsycl-target=spir64_gen
    # ${SYCL_DEVICE_LINK_FLAGS} -Xsycl-target-backend=spir64_gen
+
