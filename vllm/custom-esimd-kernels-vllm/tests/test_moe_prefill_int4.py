@@ -2,18 +2,19 @@
 Accuracy tests for the prefill INT4 ESIMD MoE kernels
 (csrc/moe_prefill/moe_prefill_int4.sycl).
 
-Weights are consumed in GGML N-major layout (no marlin shuffle, no transpose):
+Weights are consumed in IPEX K-major + marlin-shuffled layout, matching the
+format that llm-scaler's decode-oriented moe_int4_ops already uses. This
+unified layout is required so that prefill and decode can share the same
+layer.w13_weight / layer.w2_weight tensors (no per-kernel repacking).
 
-    gate_up_weight : [E, 2*I, H/2] uint8   (2 nibbles per byte, K-order)
-    gate_up_scale  : [E, 2*I, H/GS] fp16
-    down_weight    : [E, H, I/2] uint8
-    down_scale     : [E, H, I/GS] fp16
+    gate_up_qweight : [E, H/8, 2*I] int32   marlin-shuffled nibbles
+    gate_up_scale   : [E, H/GS, 2*I] fp16
+    down_qweight    : [E, I/8, H] int32
+    down_scale      : [E, I/GS, H] fp16
 
-    byte[i] = (nibble[2i+1] << 4) | nibble[2i]
-    val     = (nibble - 8) * scale
-
-This matches the vLLM storage of `layer.w13_weight` (int32 [E, 2*I, H/8])
-when viewed as uint8 [E, 2*I, H/2].
+    marlin pack shift sequence  = [0, 4, 1, 5, 2, 6, 3, 7]
+    kernel-side unshuffle slots = [0, 2, 4, 6, 1, 3, 5, 7]
+    val = ((nibble - 8) * scale) as fp16
 
 Tests are ordered from simplest to end-to-end:
     1. gather_forward_v2     — pure routing, no compute
@@ -21,6 +22,9 @@ Tests are ordered from simplest to end-to-end:
     3. down_forward_v2       — down projection (one DPAS kernel)
     4. accumulate_forward_v2 — weighted sum over top_k rows
     5. moe_prefill_full_int4 — end-to-end
+    6. 35B-TP4 real-shape sanity
+    7. 122B-TP4 real-shape sanity
+    8. shared-expert composition (shared expert lives outside the kernel)
 
 Usage:
     python -m pytest tests/test_moe_prefill_int4.py -v -s
@@ -32,29 +36,27 @@ import torch.nn.functional as F
 
 DEVICE = "xpu"
 GROUP_SIZE = 128
+PACK_FACTOR = 8
+# IPEX marlin packing: new nibble slot i comes from old nibble at shuffled_idx[i]
+SHUFFLED_IDX = np.array([0, 4, 1, 5, 2, 6, 3, 7])
 
 
-# Small config keeps CPU reference tractable. Kept mostly for smoke-testing.
-CFG_SMALL = dict(M=16, H=256, I=128, E=8, top_k=2)
-
-# Qwen3.5-122B-A10B per-rank shape under TP=4. E here is *local* (256/4=64),
-# M is small on purpose so the per-token reference stays quick on CPU.
-CFG_122B_TP4 = dict(M=16, H=3072, I=256, E=64, top_k=8)
-
-# Mid-shape sanity (35B-A3B style, TP=4).
-CFG_35B_TP4 = dict(M=32, H=2048, I=256, E=64, top_k=8)
+CFG_SMALL       = dict(M=16, H=256,  I=128, E=8,   top_k=2)
+CFG_35B_TP4     = dict(M=32, H=2048, I=256, E=64,  top_k=8)
+CFG_122B_TP4    = dict(M=16, H=3072, I=256, E=64,  top_k=8)
 
 
-# ─── GGML N-major int4 quantize / dequantize (uint8 view, 2 nibbles/byte) ─────
+# ─── IPEX K-major + marlin int4 quantize / dequantize ────────────────────────
 
-def quantize_int4_ggml(weight_fp16: torch.Tensor, group_size: int = GROUP_SIZE):
-    """
-    Quantize [N, K] fp16 into GGML N-major int4:
-        qweight [N, K/2] uint8     byte = (hi << 4) | lo in K-order
-        scale   [N, K/GS] fp16     symmetric, zero-point = 8
+def quantize_int4(weight_fp16: torch.Tensor, group_size: int = GROUP_SIZE):
+    """Quantize [N, K] fp16 into K-last int4:
+        qweight [N, K/8] int32   nibbles in K-order [0..7]
+        scale   [N, K/GS] fp16   symmetric, zero-point = 8
+    This is the pre-shuffle/pre-transpose storage (matches what the llm-scaler
+    test helpers produce).
     """
     N, K = weight_fp16.shape
-    assert K % group_size == 0 and K % 2 == 0
+    assert K % group_size == 0 and K % PACK_FACTOR == 0
     n_groups = K // group_size
 
     w = weight_fp16.float().numpy()
@@ -65,51 +67,79 @@ def quantize_int4_ggml(weight_fp16: torch.Tensor, group_size: int = GROUP_SIZE):
 
     quantized = np.round(
         w_grp / scale_np[:, :, None].astype(np.float32)
-    ).clip(-8, 7).astype(np.int32) + 8                          # [0, 15]
+    ).clip(-8, 7).astype(np.int32) + 8
+
     q_flat = quantized.reshape(N, K)
+    q_packed = q_flat.reshape(N, K // PACK_FACTOR, PACK_FACTOR).astype(np.uint32)
+    packed = np.zeros((N, K // PACK_FACTOR), dtype=np.uint32)
+    for b in range(PACK_FACTOR):
+        packed |= (q_packed[:, :, b] & 0xF) << (b * 4)
 
-    lo = q_flat[:, 0::2].astype(np.uint8)                       # [N, K/2]
-    hi = q_flat[:, 1::2].astype(np.uint8)
-    packed = (lo | (hi << 4))                                   # [N, K/2] uint8
-
-    return torch.from_numpy(packed), torch.from_numpy(scale_np)
+    return (torch.from_numpy(packed.view(np.int32)),      # [N, K/8] int32 (K-order)
+            torch.from_numpy(scale_np))                   # [N, K/GS] fp16
 
 
-def dequantize_int4_ggml(qweight: torch.Tensor, scales: torch.Tensor,
-                         N: int, K: int, group_size: int = GROUP_SIZE) -> torch.Tensor:
-    """Inverse of quantize_int4_ggml → fp16 [N, K]."""
-    packed = qweight.numpy()
+def dequantize_int4(qweight: torch.Tensor, scales: torch.Tensor,
+                    N: int, K: int, group_size: int = GROUP_SIZE) -> torch.Tensor:
+    """Inverse of quantize_int4 (K-order, pre-shuffle) -> fp16 [N, K]."""
+    qw = qweight.numpy().view(np.uint32)
     sc = scales.numpy().astype(np.float32)
     n_groups = K // group_size
 
-    lo = (packed & 0x0F).astype(np.float32) - 8.0               # [N, K/2]
-    hi = ((packed >> 4) & 0x0F).astype(np.float32) - 8.0
-    unpacked = np.empty((N, K), dtype=np.float32)
-    unpacked[:, 0::2] = lo
-    unpacked[:, 1::2] = hi
+    unpacked = np.zeros((N, K), dtype=np.float32)
+    for b in range(PACK_FACTOR):
+        nibbles = ((qw >> (b * 4)) & 0xF).astype(np.float32) - 8.0
+        unpacked[:, b::PACK_FACTOR] = nibbles
 
     unpacked = unpacked.reshape(N, n_groups, group_size) * sc[:, :, None]
     return torch.from_numpy(unpacked.reshape(N, K)).half()
 
 
-def quantize_experts_ggml(W_fp16: torch.Tensor, group_size: int = GROUP_SIZE):
-    """Per-expert wrapper. W_fp16: [E, N, K]. Returns q [E, N, K/2] uint8 + s [E, N, K/GS] fp16."""
-    E, _, _ = W_fp16.shape
-    qs, ss = [], []
+def marlin_shuffle_weight(qweight_np: np.ndarray) -> np.ndarray:
+    """IPEX marlin shuffle: within each int32, reorder nibbles so that slot i
+    stores the original nibble at SHUFFLED_IDX[i]. Vectorised over the whole
+    tensor (no per-expert Python loop).
+    """
+    result = np.zeros_like(qweight_np)
+    for new_pos in range(PACK_FACTOR):
+        old_pos = int(SHUFFLED_IDX[new_pos])
+        nibbles = (qweight_np >> np.uint32(old_pos * 4)) & np.uint32(0xF)
+        result |= nibbles << np.uint32(new_pos * 4)
+    return result
+
+
+def to_ipex_kmajor(qweight_nk: torch.Tensor, scales_nk: torch.Tensor):
+    """Transform per-expert weights from [E, N, K/8] / [E, N, K/GS] (pre-shuffle)
+    to the IPEX K-major + marlin-shuffled form expected by the kernels:
+        qweight -> [E, K/8, N] int32 (marlin shuffled)
+        scales  -> [E, K/GS, N] fp16 (transposed)
+    """
+    # transpose
+    qw_t = qweight_nk.permute(0, 2, 1).contiguous()
+    sc_t = scales_nk.permute(0, 2, 1).contiguous()
+    # marlin shuffle (vectorised; entire expert tensor at once)
+    qw_np = qw_t.numpy().view(np.uint32)
+    qw_np = marlin_shuffle_weight(qw_np)
+    qw_t  = torch.from_numpy(qw_np.view(np.int32))
+    return qw_t, sc_t
+
+
+def quantize_experts_ipex(W_fp16: torch.Tensor, group_size: int = GROUP_SIZE):
+    """Per-expert wrapper: W_fp16 [E, N, K] fp16
+    returns (qweight_ipex [E, K/8, N] int32, scales_ipex [E, K/GS, N] fp16)
+    AND (W_dq [E, N, K] fp16) for reference paths.
+    """
+    E, N, K = W_fp16.shape
+    qs, ss, dqs = [], [], []
     for e in range(E):
-        q, s = quantize_int4_ggml(W_fp16[e], group_size)
+        q, s = quantize_int4(W_fp16[e], group_size)
         qs.append(q); ss.append(s)
-    return torch.stack(qs), torch.stack(ss)
-
-
-def dequantize_experts_ggml(qweight: torch.Tensor, scales: torch.Tensor,
-                             group_size: int = GROUP_SIZE) -> torch.Tensor:
-    E, N, K_half = qweight.shape
-    K = K_half * 2
-    out = torch.empty(E, N, K, dtype=torch.float16)
-    for e in range(E):
-        out[e] = dequantize_int4_ggml(qweight[e], scales[e], N, K, group_size)
-    return out
+        dqs.append(dequantize_int4(q, s, N, K, group_size))
+    qweight_nk = torch.stack(qs)          # [E, N, K/8]
+    scales_nk  = torch.stack(ss)          # [E, N, K/GS]
+    qweight_ipex, scales_ipex = to_ipex_kmajor(qweight_nk, scales_nk)
+    W_dq = torch.stack(dqs)               # [E, N, K] fp16
+    return qweight_ipex, scales_ipex, W_dq
 
 
 # ─── metrics ──────────────────────────────────────────────────────────────────
@@ -130,7 +160,6 @@ def cos_sim(a: torch.Tensor, b: torch.Tensor) -> float:
 # ─── Reference implementations ────────────────────────────────────────────────
 
 def ref_gather(selected_experts: torch.Tensor, num_experts: int):
-    """CPU reference for moe_prefill_gather_forward_v2."""
     se = selected_experts.cpu().numpy().reshape(-1)
     total = se.size
     counts = np.bincount(se, minlength=num_experts).astype(np.int32)
@@ -148,9 +177,6 @@ def ref_gather(selected_experts: torch.Tensor, num_experts: int):
 def ref_up(x: torch.Tensor, W13_fp16: torch.Tensor,
            expert_offsets: torch.Tensor, expert_tokens: torch.Tensor,
            top_k: int) -> torch.Tensor:
-    """Reference for moe_prefill_up_forward_v2. Output [M*top_k, I] fp16.
-    Vectorised per-expert: one matmul covers all rows routed to expert e.
-    """
     M, H = x.shape
     E, two_I, _ = W13_fp16.shape
     I = two_I // 2
@@ -166,11 +192,11 @@ def ref_up(x: torch.Tensor, W13_fp16: torch.Tensor,
             continue
         pairs  = tok[t0:t1].long()
         tokens = pairs // top_k
-        gate_w = W13_fp16[e, :I, :].float()   # [I, H]
-        up_w   = W13_fp16[e, I:, :].float()   # [I, H]
-        x_rows = xf[tokens]                   # [n, H]
-        g = x_rows @ gate_w.t()               # [n, I]
-        u = x_rows @ up_w.t()                 # [n, I]
+        gate_w = W13_fp16[e, :I, :].float()
+        up_w   = W13_fp16[e, I:, :].float()
+        x_rows = xf[tokens]
+        g = x_rows @ gate_w.t()
+        u = x_rows @ up_w.t()
         inter = (g / (1 + torch.exp(-g))) * u
         out[pairs] = inter.half()
     return out
@@ -178,9 +204,6 @@ def ref_up(x: torch.Tensor, W13_fp16: torch.Tensor,
 
 def ref_down(intermediate: torch.Tensor, W2_fp16: torch.Tensor,
              expert_offsets: torch.Tensor, expert_tokens: torch.Tensor) -> torch.Tensor:
-    """Reference for moe_prefill_down_forward_v2. Output [M*top_k, H] fp16.
-    Vectorised per-expert.
-    """
     total, I = intermediate.shape
     E, H, _ = W2_fp16.shape
     out = torch.zeros(total, H, dtype=torch.float16)
@@ -193,17 +216,27 @@ def ref_down(intermediate: torch.Tensor, W2_fp16: torch.Tensor,
         if t0 == t1:
             continue
         pairs = tok[t0:t1].long()
-        w = W2_fp16[e].float()                # [H, I]
+        w = W2_fp16[e].float()
         out[pairs] = (inter_f[pairs] @ w.t()).half()
     return out
+
+
+def ref_accumulate(expert_output: torch.Tensor, routing_weights: torch.Tensor,
+                   top_k: int) -> torch.Tensor:
+    M, _ = routing_weights.shape
+    _, H = expert_output.shape
+    out = torch.zeros(M, H, dtype=torch.float32)
+    eo = expert_output.float()
+    rw = routing_weights.float()
+    for t in range(M):
+        for s in range(top_k):
+            out[t] += rw[t, s] * eo[t * top_k + s]
+    return out.half()
 
 
 def ref_moe_routed(x: torch.Tensor, W13_fp16: torch.Tensor, W2_fp16: torch.Tensor,
                    topk_weights: torch.Tensor, topk_idx: torch.Tensor,
                    num_experts: int) -> torch.Tensor:
-    """Full routed-MoE reference, matching what moe_prefill_full_int4 returns.
-    shared expert is handled by the caller, NOT by this kernel.
-    """
     TK = topk_idx.shape[1]
     off, tok = ref_gather(topk_idx, num_experts)
     inter   = ref_up(x, W13_fp16, off, tok, TK)
@@ -213,11 +246,7 @@ def ref_moe_routed(x: torch.Tensor, W13_fp16: torch.Tensor, W2_fp16: torch.Tenso
 
 def ref_shared_expert(x: torch.Tensor, shared_gate_up_fp16: torch.Tensor,
                       shared_down_fp16: torch.Tensor,
-                      shared_gate_weight: "torch.Tensor | None" = None) -> torch.Tensor:
-    """Reference shared-expert MLP (run outside the prefill kernel):
-        out = silu(x @ gate_up[:I].T) * (x @ gate_up[I:].T) @ down.T
-    Optional sigmoid gate multiplies the whole branch (qwen3_next style).
-    """
+                      shared_gate_weight=None) -> torch.Tensor:
     inter_dim = shared_gate_up_fp16.shape[0] // 2
     xf  = x.float()
     gate = xf @ shared_gate_up_fp16[:inter_dim, :].t().float()
@@ -232,27 +261,9 @@ def ref_shared_expert(x: torch.Tensor, shared_gate_up_fp16: torch.Tensor,
     return out.half()
 
 
-def ref_accumulate(expert_output: torch.Tensor, routing_weights: torch.Tensor,
-                   top_k: int) -> torch.Tensor:
-    """Reference for moe_prefill_accumulate_forward_v2. Output [M, H] fp16."""
-    M, _ = routing_weights.shape
-    _, H = expert_output.shape
-    out = torch.zeros(M, H, dtype=torch.float32)
-    eo = expert_output.float()
-    rw = routing_weights.float()
-    for t in range(M):
-        for s in range(top_k):
-            out[t] += rw[t, s] * eo[t * top_k + s]
-    return out.half()
-
-
 # ─── Input factories ──────────────────────────────────────────────────────────
 
 def make_inputs(cfg, seed=0, with_shared=False):
-    """Build a deterministic MoE input set.
-    with_shared=True additionally creates shared-expert weights (fp16, not
-    quantised) for tests that combine routed + shared.
-    """
     torch.manual_seed(seed)
     np.random.seed(seed)
     M, H, I, E, TK = cfg["M"], cfg["H"], cfg["I"], cfg["E"], cfg["top_k"]
@@ -263,10 +274,9 @@ def make_inputs(cfg, seed=0, with_shared=False):
     W2  = torch.randn(E, H, I,   dtype=torch.float16) * 0.02
     logits = torch.randn(M, E, dtype=torch.float16)
 
-    W13_q, W13_s = quantize_experts_ggml(W13, GROUP_SIZE)
-    W2_q,  W2_s  = quantize_experts_ggml(W2,  GROUP_SIZE)
-    W13_dq = dequantize_experts_ggml(W13_q, W13_s, GROUP_SIZE)
-    W2_dq  = dequantize_experts_ggml(W2_q,  W2_s,  GROUP_SIZE)
+    # IPEX K-major + marlin shuffled for the kernel, plus dequantised fp16 for refs.
+    W13_q, W13_s, W13_dq = quantize_experts_ipex(W13, GROUP_SIZE)
+    W2_q,  W2_s,  W2_dq  = quantize_experts_ipex(W2,  GROUP_SIZE)
 
     probs = F.softmax(logits.float(), dim=-1)
     tw, ti = torch.topk(probs, TK, dim=-1)
@@ -281,8 +291,6 @@ def make_inputs(cfg, seed=0, with_shared=False):
         M=M, H=H, I=I, E=E, top_k=TK, shared_I=SI,
     )
     if with_shared:
-        # Shared expert kept in fp16 for simplicity; vLLM quantises it too
-        # but that is orthogonal to the prefill-kernel accuracy we test here.
         shared_gate_up = torch.randn(2 * SI, H, dtype=torch.float16) * 0.02
         shared_down    = torch.randn(H, SI,   dtype=torch.float16) * 0.02
         shared_gate_w  = torch.randn(1, H,    dtype=torch.float16) * 0.02
@@ -309,11 +317,8 @@ def test_gather_v2():
     off_k, tok_k = ops.moe_prefill_gather_forward_v2(selected, cfg["E"])
     off_r, tok_r = ref_gather(d["topk_idx"], cfg["E"])
 
-    diff_off = max_abs_diff(off_k.cpu(), off_r)
-    print(f"[gather] offsets max_diff = {diff_off}")
-    assert diff_off == 0, "expert_offsets mismatch"
+    assert max_abs_diff(off_k.cpu(), off_r) == 0, "expert_offsets mismatch"
 
-    # Order within each expert is not specified (atomic fetch_add). Compare as sets.
     off_list = off_r.tolist()
     total = selected.numel()
     tk_np = tok_k.cpu().numpy()
@@ -331,18 +336,16 @@ def test_up_v2():
     cfg = CFG_SMALL
     d = make_inputs(cfg)
 
-    x_xpu  = _xpu(d["x"])
-    w13_u8 = _xpu(d["W13_q"])
-    w13_s  = _xpu(d["W13_s"])
-
+    x_xpu = _xpu(d["x"])
+    w13_q = _xpu(d["W13_q"])
+    w13_s = _xpu(d["W13_s"])
     off_xpu, tok_xpu = ops.moe_prefill_gather_forward_v2(_xpu(d["topk_idx"]), cfg["E"])
     out_k = ops.moe_prefill_up_forward_v2(
-        x_xpu, w13_u8, w13_s, off_xpu, tok_xpu, cfg["top_k"]
+        x_xpu, w13_q, w13_s, off_xpu, tok_xpu, cfg["top_k"]
     ).cpu()
-    out_r = ref_up(d["x"], d["W13_dq"], off_xpu.cpu(), tok_xpu.cpu(), cfg["top_k"])
 
-    diff = max_abs_diff(out_k, out_r)
-    cos = cos_sim(out_k, out_r)
+    out_r = ref_up(d["x"], d["W13_dq"], off_xpu.cpu(), tok_xpu.cpu(), cfg["top_k"])
+    diff = max_abs_diff(out_k, out_r); cos = cos_sim(out_k, out_r)
     print(f"[up]   max_diff={diff:.5f}  cos={cos:.6f}")
     assert cos > 0.99, f"cos too low: {cos}"
 
@@ -354,19 +357,15 @@ def test_down_v2():
 
     x_xpu = _xpu(d["x"])
     off_xpu, tok_xpu = ops.moe_prefill_gather_forward_v2(_xpu(d["topk_idx"]), cfg["E"])
-    # Build intermediate via pure-fp16 ref, independent of the up kernel.
     inter_ref = ref_up(d["x"], d["W13_dq"], off_xpu.cpu(), tok_xpu.cpu(), cfg["top_k"])
     inter_xpu = _xpu(inter_ref)
 
-    w2_u8 = _xpu(d["W2_q"])
-    w2_s  = _xpu(d["W2_s"])
     out_k = ops.moe_prefill_down_forward_v2(
-        inter_xpu, w2_u8, w2_s, off_xpu, tok_xpu
+        inter_xpu, _xpu(d["W2_q"]), _xpu(d["W2_s"]), off_xpu, tok_xpu
     ).cpu()
     out_r = ref_down(inter_ref, d["W2_dq"], off_xpu.cpu(), tok_xpu.cpu())
 
-    diff = max_abs_diff(out_k, out_r)
-    cos = cos_sim(out_k, out_r)
+    diff = max_abs_diff(out_k, out_r); cos = cos_sim(out_k, out_r)
     print(f"[down] max_diff={diff:.5f}  cos={cos:.6f}")
     assert cos > 0.99, f"cos too low: {cos}"
 
@@ -379,141 +378,94 @@ def test_accumulate_v2():
 
     torch.manual_seed(1)
     expert_out = torch.randn(M * TK, H, dtype=torch.float16) * 0.1
-
     out_k = ops.moe_prefill_accumulate_forward_v2(
         _xpu(expert_out), _xpu(d["topk_weights"])
     ).cpu()
     out_r = ref_accumulate(expert_out, d["topk_weights"], TK)
 
-    diff = max_abs_diff(out_k, out_r)
-    cos = cos_sim(out_k, out_r)
+    diff = max_abs_diff(out_k, out_r); cos = cos_sim(out_k, out_r)
     print(f"[acc]  max_diff={diff:.5f}  cos={cos:.6f}")
     assert cos > 0.999, f"cos too low: {cos}"
 
 
 def test_full_end_to_end():
-    """End-to-end moe_prefill_full_int4. Uses the 256/8 specialisation path.
-    Loose threshold: kernel runs its own softmax+topk, ties may route to
-    different experts than the numpy reference.
+    """End-to-end: kernel-side softmax+topk may break ties differently from
+    torch.topk, so use a loose cos threshold.
     """
     from custom_esimd_kernels_vllm import moe_int4_prefill_ops as ops
     cfg = dict(M=16, H=256, I=128, E=256, top_k=8)
     d = make_inputs(cfg)
 
-    x_xpu      = _xpu(d["x"])
-    logits_xpu = _xpu(d["logits"])
-    w13_u8     = _xpu(d["W13_q"])
-    w2_u8      = _xpu(d["W2_q"])
-
     out_k = ops.moe_prefill_full_int4(
-        x_xpu, logits_xpu,
-        w13_u8, _xpu(d["W13_s"]),
-        w2_u8,  _xpu(d["W2_s"]),
+        _xpu(d["x"]), _xpu(d["logits"]),
+        _xpu(d["W13_q"]), _xpu(d["W13_s"]),
+        _xpu(d["W2_q"]),  _xpu(d["W2_s"]),
         cfg["top_k"], cfg["E"],
     ).cpu()
 
-    # Reference path: same softmax+topk, same dequantized weights.
-    M, H, I, E, TK = cfg["M"], cfg["H"], cfg["I"], cfg["E"], cfg["top_k"]
-    off_r, tok_r = ref_gather(d["topk_idx"], E)
-    inter = ref_up(d["x"], d["W13_dq"], off_r, tok_r, TK)
-    exp_out = ref_down(inter, d["W2_dq"], off_r, tok_r)
-    out_r = ref_accumulate(exp_out, d["topk_weights"], TK)
-
-    diff = max_abs_diff(out_k, out_r)
-    cos = cos_sim(out_k, out_r)
+    out_r = ref_moe_routed(d["x"], d["W13_dq"], d["W2_dq"],
+                           d["topk_weights"], d["topk_idx"], cfg["E"])
+    diff = max_abs_diff(out_k, out_r); cos = cos_sim(out_k, out_r)
     print(f"[full] max_diff={diff:.5f}  cos={cos:.6f}")
     assert cos > 0.90, f"end-to-end cos too low: {cos}"
 
 
-# ─── 122B-TP4 real-shape sanity (covers larger K tile coverage) ───────────────
+# ─── real-shape sanity ───────────────────────────────────────────────────────
 
 def _run_routed_pipeline(cfg):
-    """Helper: run gather+up+down+accumulate on kernel vs reference for a cfg.
-    Uses deterministic topk (softmax + torch.topk), skipping the kernel-side
-    topk so the test is independent of ties/ordering."""
     from custom_esimd_kernels_vllm import moe_int4_prefill_ops as ops
     d = make_inputs(cfg)
-
-    x_xpu     = _xpu(d["x"])
-    w13_u8    = _xpu(d["W13_q"])
-    w13_s_xpu = _xpu(d["W13_s"])
-    w2_u8     = _xpu(d["W2_q"])
-    w2_s_xpu  = _xpu(d["W2_s"])
-    tw_xpu    = _xpu(d["topk_weights"])
-    ti_xpu    = _xpu(d["topk_idx"])
-
-    off_xpu, tok_xpu = ops.moe_prefill_gather_forward_v2(ti_xpu, cfg["E"])
+    off_xpu, tok_xpu = ops.moe_prefill_gather_forward_v2(_xpu(d["topk_idx"]), cfg["E"])
     inter_xpu = ops.moe_prefill_up_forward_v2(
-        x_xpu, w13_u8, w13_s_xpu, off_xpu, tok_xpu, cfg["top_k"])
+        _xpu(d["x"]), _xpu(d["W13_q"]), _xpu(d["W13_s"]),
+        off_xpu, tok_xpu, cfg["top_k"])
     exp_xpu = ops.moe_prefill_down_forward_v2(
-        inter_xpu, w2_u8, w2_s_xpu, off_xpu, tok_xpu)
-    out_k = ops.moe_prefill_accumulate_forward_v2(exp_xpu, tw_xpu).cpu()
-
+        inter_xpu, _xpu(d["W2_q"]), _xpu(d["W2_s"]), off_xpu, tok_xpu)
+    out_k = ops.moe_prefill_accumulate_forward_v2(exp_xpu, _xpu(d["topk_weights"])).cpu()
     out_r = ref_moe_routed(d["x"], d["W13_dq"], d["W2_dq"],
                            d["topk_weights"], d["topk_idx"], cfg["E"])
     return out_k, out_r
 
 
-def test_122B_TP4_shape():
-    """Qwen3.5-122B-A10B TP=4 per-rank shape: H=3072, I=256, E=64, top_k=8.
-    Exercises the per-K-tile path at the real intermediate size / hidden dim.
-    """
-    cfg = CFG_122B_TP4
-    out_k, out_r = _run_routed_pipeline(cfg)
-    diff = max_abs_diff(out_k, out_r)
-    cos = cos_sim(out_k, out_r)
-    print(f"[122B] max_diff={diff:.5f}  cos={cos:.6f}  (H=3072, I=256, E=64, TK=8)")
-    # fp16 accumulation over K=3072 tolerates ~1e-2 max diff.
-    assert cos > 0.99, f"122B routed cos too low: {cos}"
-
-
 def test_35B_TP4_shape():
-    """Qwen3.5-35B-A3B TP=4 per-rank shape: H=2048, I=256, E=64, top_k=8."""
     cfg = CFG_35B_TP4
     out_k, out_r = _run_routed_pipeline(cfg)
-    diff = max_abs_diff(out_k, out_r)
-    cos = cos_sim(out_k, out_r)
+    diff = max_abs_diff(out_k, out_r); cos = cos_sim(out_k, out_r)
     print(f"[35B]  max_diff={diff:.5f}  cos={cos:.6f}  (H=2048, I=256, E=64, TK=8)")
     assert cos > 0.99, f"35B routed cos too low: {cos}"
 
 
-# ─── Shared-expert composition (emulates SharedFusedMoE external add) ─────────
+def test_122B_TP4_shape():
+    cfg = CFG_122B_TP4
+    out_k, out_r = _run_routed_pipeline(cfg)
+    diff = max_abs_diff(out_k, out_r); cos = cos_sim(out_k, out_r)
+    print(f"[122B] max_diff={diff:.5f}  cos={cos:.6f}  (H=3072, I=256, E=64, TK=8)")
+    assert cos > 0.99, f"122B routed cos too low: {cos}"
+
 
 def test_shared_expert_composition():
-    """vLLM's SharedFusedMoE adds shared-expert output to our routed kernel
-    output externally. This test sanity-checks that composition:
-       final = prefill_kernel(routed) + shared_expert_ref(x)
-    matches a full reference that includes both branches. Validates that the
-    prefill kernel should NOT contain shared-expert computation.
+    """Shared expert lives outside the prefill kernel — verify the composition
+    final = prefill_kernel(routed) + shared_expert_ref(x) is what a full
+    reference computes.
     """
     cfg = dict(M=8, H=256, I=128, E=16, top_k=4, shared_I=128)
     d = make_inputs(cfg, with_shared=True)
-
-    # Routed branch through kernel
     routed_k, routed_r = _run_routed_pipeline(cfg)
-
-    # Shared branch via reference (no kernel yet)
     shared = ref_shared_expert(d["x"], d["shared_gate_up"],
                                d["shared_down"], d["shared_gate_w"])
 
-    # Full reference = routed_ref + shared_ref
     full_r = (routed_r.float() + shared.float()).half()
     full_k = (routed_k.float() + shared.float()).half()
 
-    diff_r = max_abs_diff(full_k, full_r)
-    cos_r = cos_sim(full_k, full_r)
-    # Shared is identical on both sides, so this effectively measures routed
-    # kernel quality but with shared-expert magnitude added in.
-    print(f"[shared] max_diff={diff_r:.5f}  cos={cos_r:.6f}  "
-          f"(routed shape: H={cfg['H']}, I={cfg['I']}, E={cfg['E']}, TK={cfg['top_k']})")
-    assert cos_r > 0.99, f"shared+routed cos too low: {cos_r}"
+    diff = max_abs_diff(full_k, full_r); cos = cos_sim(full_k, full_r)
+    print(f"[shared] max_diff={diff:.5f}  cos={cos:.6f}  "
+          f"(H={cfg['H']}, I={cfg['I']}, E={cfg['E']}, TK={cfg['top_k']})")
+    assert cos > 0.99, f"shared+routed cos too low: {cos}"
 
-    # Also sanity: dropping the shared branch (mimicking what would happen
-    # if the kernel itself tried to include it but we double-added) diverges.
     full_wrong = (routed_k.float() + 2.0 * shared.float()).half()
     cos_wrong = cos_sim(full_wrong, full_r)
     print(f"[shared] control (double-add shared) cos={cos_wrong:.6f}  "
-          f"(expected noticeably lower than {cos_r:.6f})")
+          f"(expected noticeably lower than {cos:.6f})")
 
 
 # ─── standalone runner ────────────────────────────────────────────────────────
@@ -525,6 +477,7 @@ def _run(name, fn):
         print(f"PASS {name}")
         return True
     except Exception as e:
+        import traceback; traceback.print_exc()
         print(f"FAIL {name}: {type(e).__name__}: {e}")
         return False
 
