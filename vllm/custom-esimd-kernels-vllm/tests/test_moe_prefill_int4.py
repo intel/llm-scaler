@@ -388,6 +388,40 @@ def test_accumulate_v2():
     assert cos > 0.999, f"cos too low: {cos}"
 
 
+def test_accumulate_permuted_v2():
+    """Fused inverse-permute + weighted sum. Equivalent to doing
+       down_pair = index_select(down_perm, inv)  # unpermute
+       out      = accumulate_forward_v2(down_pair, topk_weights)
+    in a single kernel pass by reading permuted rows via pair_to_perm.
+    """
+    from custom_esimd_kernels_vllm import moe_int4_prefill_ops as ops
+    cfg = CFG_SMALL
+    d = make_inputs(cfg)
+    M, H, TK = cfg["M"], cfg["H"], cfg["top_k"]
+    total = M * TK
+
+    # Build a synthetic permuted buffer: pair_idx i stores a known row; then
+    # we scatter it via expert_tokens so the kernel must undo the permutation.
+    torch.manual_seed(2)
+    exp_pair = torch.randn(total, H, dtype=torch.float16) * 0.1   # pair-idx ordered
+
+    # Run gather to get expert_tokens + pair_to_perm.
+    off, tok, pair_to_perm = ops.moe_prefill_gather_forward_v2(
+        _xpu(d["topk_idx"]), cfg["E"])
+    # Build the permuted buffer: exp_perm[pos] = exp_pair[tok[pos]]
+    tok_cpu = tok.cpu().long()
+    exp_perm = exp_pair[tok_cpu]                                  # [total, H] fp16
+
+    out_k = ops.moe_prefill_accumulate_permuted_forward_v2(
+        _xpu(exp_perm), _xpu(d["topk_weights"]), pair_to_perm
+    ).cpu()
+    out_r = ref_accumulate(exp_pair, d["topk_weights"], TK)
+
+    diff = max_abs_diff(out_k, out_r); cos = cos_sim(out_k, out_r)
+    print(f"[acc_perm] max_diff={diff:.5f}  cos={cos:.6f}")
+    assert cos > 0.999, f"permuted acc cos too low: {cos}"
+
+
 def test_full_end_to_end():
     """End-to-end: kernel-side softmax+topk may break ties differently from
     torch.topk, so use a loose cos threshold.
@@ -443,6 +477,84 @@ def test_122B_TP4_shape():
     assert cos > 0.99, f"122B routed cos too low: {cos}"
 
 
+def test_ipex_marlin_pipeline():
+    """Reproduces sym_int4.py's _esimd_prefill_moe_apply end-to-end:
+       torch_ipex.topk_softmax(renormalize=True) ->
+         our gather -> index_select -> ipex marlin gate_up ->
+         silu*up -> ipex marlin down -> accumulate_permuted
+    Compared against ref_moe_routed (pure pytorch) on dequantised weights.
+    This is the single test that would have caught the int64-vs-int32
+    rows_for_experts dtype bug end-to-end.
+    """
+    try:
+        import intel_extension_for_pytorch  # noqa: F401
+        _ = torch.ops.torch_ipex.group_mm_int4_out_marlin
+        _ = torch.ops.torch_ipex.topk_softmax
+    except (ImportError, AttributeError):
+        print("[ipex_pipeline] SKIP: ipex or its ops unavailable")
+        return
+
+    from custom_esimd_kernels_vllm import moe_int4_prefill_ops as ops
+    import torch.nn.functional as F
+
+    cfg = CFG_122B_TP4
+    d = make_inputs(cfg)
+    M, H, I, E, TK = cfg["M"], cfg["H"], cfg["I"], cfg["E"], cfg["top_k"]
+    two_I = 2 * I
+    total = M * TK
+
+    x_xpu      = _xpu(d["x"])
+    logits_xpu = _xpu(d["logits"])
+    W13_q      = _xpu(d["W13_q"])
+    W13_s      = _xpu(d["W13_s"])
+    W2_q       = _xpu(d["W2_q"])
+    W2_s       = _xpu(d["W2_s"])
+
+    # 1. topk via ipex (renormalize)
+    tw = torch.empty(M, TK, dtype=torch.float32, device=DEVICE)
+    ti = torch.empty(M, TK, dtype=torch.int32,   device=DEVICE)
+    ix = torch.empty(M, TK, dtype=torch.int32,   device=DEVICE)
+    torch.ops.torch_ipex.topk_softmax(tw, ti, ix, logits_xpu, True)
+    tw_half = tw.to(torch.float16)
+
+    # 2. gather + rows_for_experts (int32!)
+    off, tok, pair_to_perm = ops.moe_prefill_gather_forward_v2(ti, E)
+    rows = torch.empty(E, dtype=torch.int32, device=DEVICE)
+    rows[:-1] = off[1:] - off[:-1]
+    rows[-1]  = int(total) - off[-1]
+
+    # 3. scatter x -> x_perm
+    pair_to_token = tok.to(torch.int64) // TK
+    x_perm = torch.index_select(x_xpu, 0, pair_to_token)
+
+    # 4. ipex marlin gate_up
+    gate_up_perm = torch.empty(total, two_I, dtype=torch.float16, device=DEVICE)
+    torch.ops.torch_ipex.group_mm_int4_out_marlin(
+        gate_up_perm, x_perm, W13_q, W13_s, None, rows, None, GROUP_SIZE)
+
+    # 5. silu * up
+    gate = gate_up_perm[:, :I]
+    up   = gate_up_perm[:, I:]
+    inter_perm = F.silu(gate) * up
+
+    # 6. ipex marlin down
+    down_perm = torch.empty(total, H, dtype=torch.float16, device=DEVICE)
+    torch.ops.torch_ipex.group_mm_int4_out_marlin(
+        down_perm, inter_perm, W2_q, W2_s, None, rows, None, GROUP_SIZE)
+
+    # 7. fused accumulate_permuted
+    out_k = ops.moe_prefill_accumulate_permuted_forward_v2(
+        down_perm, tw_half, pair_to_perm).cpu()
+
+    # Reference: dequantised fp16 ref using the same ti/tw_half.
+    out_r = ref_moe_routed(d["x"], d["W13_dq"], d["W2_dq"],
+                           tw_half.cpu(), ti.cpu(), E)
+
+    diff = max_abs_diff(out_k, out_r); cos = cos_sim(out_k, out_r)
+    print(f"[ipex_pipe] max_diff={diff:.5f}  cos={cos:.6f}")
+    assert cos > 0.99, f"ipex pipeline cos too low: {cos}"
+
+
 def test_shared_expert_composition():
     """Shared expert lives outside the prefill kernel — verify the composition
     final = prefill_kernel(routed) + shared_expert_ref(x) is what a full
@@ -484,14 +596,16 @@ def _run(name, fn):
 
 if __name__ == "__main__":
     tests = [
-        ("gather_v2",          test_gather_v2),
-        ("up_v2",              test_up_v2),
-        ("down_v2",            test_down_v2),
-        ("accumulate_v2",      test_accumulate_v2),
-        ("full",               test_full_end_to_end),
-        ("35B_TP4_shape",      test_35B_TP4_shape),
-        ("122B_TP4_shape",     test_122B_TP4_shape),
-        ("shared_composition", test_shared_expert_composition),
+        ("gather_v2",           test_gather_v2),
+        ("up_v2",               test_up_v2),
+        ("down_v2",             test_down_v2),
+        ("accumulate_v2",       test_accumulate_v2),
+        ("accumulate_permuted", test_accumulate_permuted_v2),
+        ("full",                test_full_end_to_end),
+        ("35B_TP4_shape",       test_35B_TP4_shape),
+        ("122B_TP4_shape",      test_122B_TP4_shape),
+        ("ipex_marlin_pipeline", test_ipex_marlin_pipeline),
+        ("shared_composition",  test_shared_expert_composition),
     ]
     results = [(n, _run(n, f)) for n, f in tests]
 

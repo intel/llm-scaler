@@ -86,11 +86,12 @@ def setup_permutation(d):
     """
     from custom_esimd_kernels_vllm import moe_int4_prefill_ops as ops
     off, tok, pair_to_perm = ops.moe_prefill_gather_forward_v2(d["topk_idx"], d["E"])
-    off64 = off.to(torch.int64)
     total = d["M"] * d["top_k"]
-    rows = torch.empty(d["E"], dtype=torch.int64, device=DEVICE)
-    rows[:-1] = off64[1:] - off64[:-1]
-    rows[-1]  = total - off64[-1]
+    # ipex group_mm_int4_out_marlin reinterprets rows_for_experts as int32*,
+    # so keep the tensor in int32 (int64 silently produces wrong results).
+    rows = torch.empty(d["E"], dtype=torch.int32, device=DEVICE)
+    rows[:-1] = off[1:] - off[:-1]
+    rows[-1]  = int(total) - off[-1]
     return off, tok, pair_to_perm, rows
 
 
