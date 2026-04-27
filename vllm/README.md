@@ -159,6 +159,41 @@ docker pull intelanalytics/multi-arc-serving:latest
 ```
 - Usage Instructions: [VLLM Docker Quickstart for A770](https://github.com/intel/ipex-llm/blob/main/docs/mddocs/DockerGuides/vllm_docker_quickstart.md#3-start-the-docker-container)
 
+---
+
+## (Optional) Run Docker without sudo
+
+By default, Docker requires `sudo`.
+
+To run without `sudo`, follow the official guide:
+[https://docs.docker.com/engine/install/linux-postinstall/](https://docs.docker.com/engine/install/linux-postinstall/)
+
+This typically involves adding your user to the `docker` group.
+
+---
+
+## (Required for Intel Arc GPUs) Device permissions
+
+Intel Arc GPUs require access to Linux DRM devices:
+
+* `/dev/dri/card*` → `video` group
+* `/dev/dri/renderD*` → `render` group
+
+Add your user to required groups:
+
+```bash id="k9d2lw"
+# Docker (if using non-sudo Docker)
+sudo usermod -aG docker $USER
+
+# Intel GPU access
+sudo usermod -aG render $USER
+sudo usermod -aG video $USER
+```
+
+Then **log out and log back in (or reboot)**.
+
+---
+
 Then, run the container:
 
 ```bash
