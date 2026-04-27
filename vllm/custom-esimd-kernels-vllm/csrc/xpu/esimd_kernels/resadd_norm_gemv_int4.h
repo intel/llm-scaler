@@ -120,7 +120,7 @@ struct ResAddNormGEMV_int4_pert_kernel {
     // ── Optimized path (K >= 512): VL=512, register-cached two-pass ──
     void run_large_k(int n) const SYCL_ESIMD_FUNCTION {
         constexpr int VL = 512;
-        constexpr int MAX_CHUNKS = 8;  // supports up to K=4096
+        constexpr int MAX_CHUNKS = 16;  // supports up to K=8192
         constexpr int BLOCKS_PER_VL = VL / BLOCK_SIZE;  // 4
         const int packed_K = K / PACK;
         const int num_blocks_per_row = K / BLOCK_SIZE;

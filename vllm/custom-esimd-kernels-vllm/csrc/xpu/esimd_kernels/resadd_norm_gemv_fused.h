@@ -87,7 +87,7 @@ struct ResAddNormGEMV_fp8_pert_kernel {
         // We store residual chunks in a small register-file buffer.
         // Since VL=512 and K/VL is small (4), unroll explicitly.
         constexpr int VL = 512;
-        constexpr int MAX_CHUNKS = 8;  // supports up to K=4096
+        constexpr int MAX_CHUNKS = 16;  // supports up to K=8192
         simd<float, VL> res_chunks[MAX_CHUNKS];
         int n_chunks = K / VL;
 
