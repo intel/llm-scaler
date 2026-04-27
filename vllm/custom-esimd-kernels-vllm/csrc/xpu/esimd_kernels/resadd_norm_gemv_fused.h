@@ -73,41 +73,27 @@ struct ResAddNormGEMV_fp8_pert_kernel {
     float eps;
     int fp8_mode;
 
-    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
-        int n = item.get_group(0);
-        if (n >= N) return;
-
-        // Pass 1: residual_add + accumulate sum_sq
-        // Store the added residual in register arrays for reuse in pass 2.
-        // For K=2048, VL=512: 4 chunks, 4 * 512 * 4 bytes = 8KB registers.
-        // Fits in standard GRF (256 regs × 64 bytes = 16KB).
-
-        float sum_sq = 0.0f;
-
-        // We store residual chunks in a small register-file buffer.
-        // Since VL=512 and K/VL is small (4), unroll explicitly.
+    template<int MAX_CHUNKS>
+    void run_impl(int n) const SYCL_ESIMD_FUNCTION {
         constexpr int VL = 512;
-        constexpr int MAX_CHUNKS = 16;  // supports up to K=8192
         simd<float, VL> res_chunks[MAX_CHUNKS];
         int n_chunks = K / VL;
+
+        float sum_sq = 0.0f;
 
         for (int c = 0; c < n_chunks; c++) {
             int offset = c * VL;
             simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + offset);
             simd<float, VL> r = block_load<fp16, VL>(residual_ptr + offset);
 
-            // Residual add
             simd<float, VL> added = h + r;
             res_chunks[c] = added;
 
-            // Write back residual (only WG 0 to avoid redundant writes)
             if (n == 0) {
                 block_store<fp16, VL>(residual_ptr + offset, simd<fp16, VL>(added));
             }
 
-            // Accumulate sum of squares for RMS
             simd<float, VL> sq = added * added;
-            // Hierarchical reduction within VL=512
             sq.select<256,1>(0) += sq.select<256,1>(256);
             sq.select<128,1>(0) += sq.select<128,1>(128);
             sq.select<64,1>(0) += sq.select<64,1>(64);
@@ -119,33 +105,27 @@ struct ResAddNormGEMV_fp8_pert_kernel {
             sum_sq += (float)sq[0] + (float)sq[1];
         }
 
-        // Compute inverse RMS
         float inv_rms = sycl::ext::intel::esimd::rsqrt(
             simd<float, 8>(sum_sq / (float)K + eps))[0];
 
-        // Pass 2: normalize + GEMV
         simd<float, VL> acc = 0.0f;
 
         for (int c = 0; c < n_chunks; c++) {
             int offset = c * VL;
 
-            // Normalize: normed = residual * inv_rms * weight
             simd<float, VL> nw = block_load<fp16, VL>(norm_w_ptr + offset);
             simd<float, VL> normed = res_chunks[c] * inv_rms * nw;
 
-            // Write normed hidden_states (only WG 0)
             if (n == 0) {
                 block_store<fp16, VL>(normed_out + offset, simd<fp16, VL>(normed));
             }
 
-            // GEMV: accumulate dot product
             simd<uint8_t, VL> w_raw = block_load<uint8_t, VL>(
                 gemv_weight + (size_t)n * K + offset);
             simd<float, VL> w_f = fp8_dequant_rng<VL>(w_raw, fp8_mode);
             acc += normed * w_f;
         }
 
-        // Final reduction
         acc.select<256,1>(0) += acc.select<256,1>(256);
         acc.select<128,1>(0) += acc.select<128,1>(128);
         acc.select<64,1>(0) += acc.select<64,1>(64);
@@ -156,6 +136,17 @@ struct ResAddNormGEMV_fp8_pert_kernel {
         acc.select<2,1>(0) += acc.select<2,1>(2);
         float dot = ((float)acc[0] + (float)acc[1]) * *gemv_scale;
         output[n] = fp16(dot);
+    }
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        int n = item.get_group(0);
+        if (n >= N) return;
+
+        if (K <= 4096) {
+            run_impl<8>(n);
+        } else {
+            run_impl<16>(n);
+        }
     }
 };
 
