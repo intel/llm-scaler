@@ -181,7 +181,7 @@ Intel Arc GPUs require access to Linux DRM devices:
 
 Add your user to required groups:
 
-```bash id="k9d2lw"
+```
 # Docker (if using non-sudo Docker)
 sudo usermod -aG docker $USER
 
