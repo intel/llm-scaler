@@ -857,6 +857,21 @@ def moe_router_forward_int4(
     return _moe_int4.moe_router_forward_int4(x, weight, scale, use_ggml_layout)
 
 
+def moe_router_topk_int4(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    use_ggml_layout: bool,
+    top_k: int,
+    n_routed_experts: int,
+    norm: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """INT4 router followed by the same C++ TopK path as ``moe_forward_full_int4``."""
+    return _moe_int4.moe_router_topk_int4(
+        x.contiguous(), weight, scale, use_ggml_layout,
+        top_k, n_routed_experts, norm)
+
+
 def moe_forward_full_int4(
     x: torch.Tensor,
     logits: torch.Tensor,
@@ -917,6 +932,18 @@ def moe_shared_expert_forward_int4_nmajor(
     return _moe_int4.moe_shared_expert_forward_int4_nmajor(
         x, gate_up_qweight, gate_up_scale,
         down_qweight, down_scale, gate_weight)
+
+
+def moe_topk_int4(
+    logits: torch.Tensor,
+    top_k: int,
+    n_routed_experts: int,
+    norm: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """INT4 MoE TopK using the same C++ kernel path as ``moe_forward_full_int4``."""
+    return _moe_int4.moe_topk_int4(logits.contiguous(), top_k, n_routed_experts, norm)
+
+
 def to_cutlass_nmajor_int4(qweight: torch.Tensor) -> torch.Tensor:
     """Convert INT4 weights to CUTLASS-style N-major uint8 packing.
 
@@ -1045,10 +1072,12 @@ def moe_forward_routed_cutlass_nmajor_int4(
     w13_scales: torch.Tensor,
     w2_qweight_s4: torch.Tensor,
     w2_scales: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
     num_experts: int,
     route: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    logits: torch.Tensor | None = None,
+    top_k: int = 8,
 ) -> torch.Tensor:
     """Prototype routed MoE forward using CUTLASS N-major INT4 grouped GEMM.
 
@@ -1056,7 +1085,12 @@ def moe_forward_routed_cutlass_nmajor_int4(
     ``prepare_cutlass_nmajor_int4_weight``. Shared experts are not included;
     this isolates the routed path for bring-up and benchmarking.
     """
-    if route is None and hidden_states.shape[0] == 1:
+    if topk_weights is None or topk_ids is None:
+        if logits is None:
+            raise ValueError("pass either topk_weights/topk_ids or logits")
+        topk_weights, topk_ids = moe_topk_int4(logits, top_k, num_experts)
+
+    if route is None and hidden_states.shape[0] <= 4:
         return moe_forward_tiny_cutlass_nmajor_int4(
             hidden_states, w13_qweight_s4, w13_scales,
             w2_qweight_s4, w2_scales, topk_weights, topk_ids)
@@ -1092,6 +1126,132 @@ def moe_forward_routed_cutlass_nmajor_int4(
         rows_per_expert, hidden_size, inter_size, num_experts, True, False)
 
     return moe_route_gather_int4(gemm2_output, sorted_rows, sorted_weights, num_rows)
+
+
+def _moe_topk_from_logits(logits: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if logits.device.type == "xpu":
+        try:
+            topk_weights, topk_ids = moe_topk_int4(logits.contiguous(), top_k, logits.shape[-1], True)
+            return topk_weights.contiguous(), topk_ids.to(torch.int32).contiguous()
+        except (AttributeError, RuntimeError):
+            pass
+    probs = F.softmax(logits.float(), dim=-1)
+    topk_weights, topk_ids = torch.topk(probs, top_k, dim=-1)
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    return topk_weights.to(logits.dtype).contiguous(), topk_ids.to(torch.int32).contiguous()
+
+
+def moe_forward_full_cutlass_nmajor_int4(
+    hidden_states: torch.Tensor,
+    logits: torch.Tensor,
+    w13_qweight_s4: torch.Tensor,
+    w13_scales: torch.Tensor,
+    w2_qweight_s4: torch.Tensor,
+    w2_scales: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_expert_gate_weight: torch.Tensor,
+    top_k: int,
+    num_shared_experts: int,
+    num_experts: int,
+) -> torch.Tensor:
+    """Prototype full MoE forward using CUTLASS N-major INT4 routed GEMMs.
+
+    This path owns TopK internally so timing is comparable to
+    ``moe_forward_full_int4``. Routed experts use CUTLASS grouped GEMM with
+    pre-packed signed-s4 N-major weights. Shared experts are currently the
+    FP16 path used by Qwen3.5 decode bring-up.
+    """
+    if num_shared_experts != 1:
+        raise NotImplementedError("CUTLASS N-major full prototype currently supports one FP16 shared expert")
+
+    shared_inter_size = shared_down_weight.shape[-1]
+    if shared_gate_up_weight.dim() == 3:
+        shared_gate_up = shared_gate_up_weight[0]
+    else:
+        shared_gate_up = shared_gate_up_weight
+    if shared_down_weight.dim() == 3:
+        shared_down = shared_down_weight[0]
+    else:
+        shared_down = shared_down_weight
+    if shared_expert_gate_weight.dim() == 3:
+        shared_gate_weight = shared_expert_gate_weight[0]
+    else:
+        shared_gate_weight = shared_expert_gate_weight
+
+    if hidden_states.shape[0] <= 16:
+        return moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits(
+            hidden_states, logits, w13_qweight_s4, w13_scales,
+            w2_qweight_s4, w2_scales, shared_gate_up, shared_down,
+            shared_gate_weight, top_k, num_shared_experts, num_experts)
+
+    routed = moe_forward_routed_cutlass_nmajor_int4(
+        hidden_states, w13_qweight_s4, w13_scales, w2_qweight_s4, w2_scales,
+        None, None, num_experts, logits=logits, top_k=top_k)
+
+    shared_gate = hidden_states @ shared_gate_up[:shared_inter_size].t()
+    shared_up = hidden_states @ shared_gate_up[shared_inter_size:].t()
+    shared_act = F.silu(shared_gate.float()) * shared_up.float()
+    shared_out = shared_act.to(hidden_states.dtype) @ shared_down.t()
+    gate = torch.sigmoid((hidden_states @ shared_gate_weight.t()).float()).to(hidden_states.dtype)
+    return routed + shared_out * gate
+
+
+def moe_forward_full_cutlass_nmajor_int4_with_router(
+    hidden_states: torch.Tensor,
+    router_qweight: torch.Tensor,
+    router_scales: torch.Tensor,
+    router_use_ggml_layout: bool,
+    w13_qweight_s4: torch.Tensor,
+    w13_scales: torch.Tensor,
+    w2_qweight_s4: torch.Tensor,
+    w2_scales: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_expert_gate_weight: torch.Tensor,
+    top_k: int,
+    num_shared_experts: int,
+    num_experts: int,
+) -> torch.Tensor:
+    """CUTLASS N-major full MoE path with INT4 router logits computed first."""
+    if num_shared_experts != 1:
+        raise NotImplementedError("CUTLASS N-major full prototype currently supports one FP16 shared expert")
+
+    shared_inter_size = shared_down_weight.shape[-1]
+    if shared_gate_up_weight.dim() == 3:
+        shared_gate_up = shared_gate_up_weight[0]
+    else:
+        shared_gate_up = shared_gate_up_weight
+    if shared_down_weight.dim() == 3:
+        shared_down = shared_down_weight[0]
+    else:
+        shared_down = shared_down_weight
+    if shared_expert_gate_weight.dim() == 3:
+        shared_gate_weight = shared_expert_gate_weight[0]
+    else:
+        shared_gate_weight = shared_expert_gate_weight
+
+    topk_weights, topk_ids = moe_router_topk_int4(
+        hidden_states, router_qweight, router_scales, router_use_ggml_layout,
+        top_k, num_experts, True)
+
+    if hidden_states.shape[0] <= 16:
+        return moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared(
+            hidden_states, w13_qweight_s4, w13_scales,
+            w2_qweight_s4, w2_scales, topk_weights, topk_ids,
+            shared_gate_up, shared_down, shared_gate_weight,
+            num_shared_experts)
+
+    routed = moe_forward_routed_cutlass_nmajor_int4(
+        hidden_states, w13_qweight_s4, w13_scales, w2_qweight_s4, w2_scales,
+        topk_weights, topk_ids, num_experts)
+
+    shared_gate = hidden_states @ shared_gate_up[:shared_inter_size].t()
+    shared_up = hidden_states @ shared_gate_up[shared_inter_size:].t()
+    shared_act = F.silu(shared_gate.float()) * shared_up.float()
+    shared_out = shared_act.to(hidden_states.dtype) @ shared_down.t()
+    gate = torch.sigmoid((hidden_states @ shared_gate_weight.t()).float()).to(hidden_states.dtype)
+    return routed + shared_out * gate
 
 
 def moe_forward_tiny_cutlass_nmajor_int4(
@@ -1162,6 +1322,31 @@ def moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared(
         topk_weights.contiguous(), topk_ids.contiguous(),
         shared_gate_up_weight.contiguous(), shared_down_weight.contiguous(),
         shared_expert_gate_weight.contiguous(), num_shared_experts)
+
+
+def moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits(
+    hidden_states: torch.Tensor,
+    logits: torch.Tensor,
+    w13_qweight_s4: torch.Tensor,
+    w13_scales: torch.Tensor,
+    w2_qweight_s4: torch.Tensor,
+    w2_scales: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_expert_gate_weight: torch.Tensor,
+    top_k: int,
+    num_shared_experts: int,
+    num_experts: int,
+) -> torch.Tensor:
+    if hidden_states.device.type != "xpu":
+        raise RuntimeError("tiny CUTLASS N-major INT4 path requires XPU")
+    return _moe_int4.moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits(
+        hidden_states.contiguous(), logits.contiguous(),
+        w13_qweight_s4.contiguous(), w13_scales.contiguous(),
+        w2_qweight_s4.contiguous(), w2_scales.contiguous(),
+        shared_gate_up_weight.contiguous(), shared_down_weight.contiguous(),
+        shared_expert_gate_weight.contiguous(), top_k, num_shared_experts,
+        num_experts)
 
 
 def moe_tiny_fp16_shared_up(
