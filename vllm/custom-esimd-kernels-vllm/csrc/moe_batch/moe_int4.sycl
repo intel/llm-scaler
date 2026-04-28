@@ -1412,6 +1412,199 @@ torch::Tensor moe_forward_full_int4(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// Standalone shared expert forward — CUTLASS N-major uint8 (implement_zp signed)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Weight: [N, K/2] uint8, implement_zp encoding (two's complement int4)
+// Scale:  [N, K/GS] fp16 (N-major, contiguous)
+// Gate:   [num_shared, H] fp16 (always unquantized)
+//
+// Dequant: byte → lo = byte & 0xF, hi = (byte >> 4) & 0xF
+//          val = (nibble >= 8) ? (float)(nibble - 16) : (float)nibble
+
+void moe_up_shared_int4_nmajor_kernel(
+    const fp16* x,
+    const uint8_t* shared_gate_up_qweight,  // [2*inter, H/2] uint8 implement_zp
+    const fp16* shared_gate_up_scale,        // [2*inter, H/GS] fp16 N-major
+    fp16* intermediates,                     // [n_tokens, inter] output
+    const int n_tokens, const int hidden_size,
+    const int shared_inter_size,
+    const int num_shared_experts,
+    const torch::Device& device) {
+
+    const int two_inter = 2 * shared_inter_size;
+    const int K_half = hidden_size / 2;
+    const int n_groups = hidden_size / 128;
+    // K_packed = K_half / 4 = number of uint32 words per weight row
+    // Each uint32 holds 4 bytes = 8 nibbles = 8 K elements
+    const int K_packed = K_half / 4;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeUpSharedInt4NMajor>(
+            sycl::range<2>(n_tokens * num_shared_experts, shared_inter_size),
+            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
+                const int idx0  = (int)idx[0];
+                const int token = idx0 / num_shared_experts;
+                const int sid   = idx0 % num_shared_experts;
+                const int row   = (int)idx[1];
+
+                const fp16* x_row = x + (size_t)token * hidden_size;
+
+                // Reinterpret uint8 weight rows as uint32 for SIMD load
+                const uint32_t* gw_base = reinterpret_cast<const uint32_t*>(
+                    shared_gate_up_qweight + (size_t)sid * two_inter * K_half);
+                const fp16* gs_base = shared_gate_up_scale
+                    + (size_t)sid * two_inter * n_groups;
+
+                const uint32_t* g_row_u32 = gw_base + (size_t)row * K_packed;
+                const uint32_t* u_row_u32 = gw_base + (size_t)(shared_inter_size + row) * K_packed;
+                const fp16* g_scale_row = gs_base + (size_t)row * n_groups;
+                const fp16* u_scale_row = gs_base + (size_t)(shared_inter_size + row) * n_groups;
+
+                float g_acc = 0.f, u_acc = 0.f;
+                // Process 8 K elements per iteration (1 uint32 = 4 bytes = 8 nibbles)
+                for (int kp = 0; kp < K_packed; kp++) {
+                    simd<fp16, 8> x_chunk = block_load<fp16, 8>(x_row + kp * 8);
+                    uint32_t g_packed = g_row_u32[kp];
+                    uint32_t u_packed = u_row_u32[kp];
+                    int gi = kp / 16;  // 16 uint32 words = 128 K elements = 1 group
+                    float g_s = (float)g_scale_row[gi];
+                    float u_s = (float)u_scale_row[gi];
+
+                    #pragma unroll
+                    for (int b = 0; b < 8; b++) {
+                        uint32_t g_nib = (g_packed >> (b * 4)) & 0xFu;
+                        uint32_t u_nib = (u_packed >> (b * 4)) & 0xFu;
+                        float gv = (g_nib >= 8u ? (float)g_nib - 16.f : (float)g_nib) * g_s;
+                        float uv = (u_nib >= 8u ? (float)u_nib - 16.f : (float)u_nib) * u_s;
+                        float xv = (float)(fp16)x_chunk[b];
+                        g_acc += gv * xv;
+                        u_acc += uv * xv;
+                    }
+                }
+
+                float silu_g = g_acc / (1.f + sycl::exp(-g_acc));
+                const int out_row = token * num_shared_experts + sid;
+                intermediates[(size_t)out_row * shared_inter_size + row] = fp16(silu_g * u_acc);
+            });
+    };
+
+    submit_kernel(cgf, device, "moe up shared int4 nmajor");
+}
+
+void moe_down_shared_int4_nmajor_kernel(
+    const fp16* intermediates,               // [n_tokens * num_shared, inter] from up kernel
+    const uint8_t* shared_down_qweight,      // [H, I/2] uint8 implement_zp
+    const fp16* shared_down_scale,           // [H, I/GS] fp16 N-major
+    const float* gate_values,                // [n_tokens * num_shared] sigmoid
+    fp16* output,                            // [n_tokens, H]
+    const int n_tokens, const int hidden_size,
+    const int shared_inter_size,
+    const int num_shared_experts,
+    const torch::Device& device) {
+
+    const int K_half_down = shared_inter_size / 2;
+    const int K_packed_down = K_half_down / 4;  // uint32 words per weight row
+    const int n_groups_down = shared_inter_size / 128;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeDownSharedInt4NMajorStandalone>(
+            sycl::range<2>(n_tokens * num_shared_experts, hidden_size),
+            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
+                const int idx0  = (int)idx[0];
+                const int token = idx0 / num_shared_experts;
+                const int sid   = idx0 % num_shared_experts;
+                const int j     = (int)idx[1];
+
+                const int inter_row = token * num_shared_experts + sid;
+                const fp16* hi = intermediates + (size_t)inter_row * shared_inter_size;
+
+                const uint32_t* dw_base = reinterpret_cast<const uint32_t*>(
+                    shared_down_qweight + (size_t)sid * hidden_size * K_half_down);
+                const fp16* ds_base = shared_down_scale
+                    + (size_t)sid * hidden_size * n_groups_down;
+
+                const uint32_t* w_row_u32 = dw_base + (size_t)j * K_packed_down;
+                const fp16* s_row = ds_base + (size_t)j * n_groups_down;
+
+                float acc = 0.f;
+                for (int kp = 0; kp < K_packed_down; kp++) {
+                    simd<fp16, 8> hi_chunk = block_load<fp16, 8>(hi + kp * 8);
+                    uint32_t packed = w_row_u32[kp];
+                    int gi = kp / 16;
+                    float s = (float)s_row[gi];
+
+                    #pragma unroll
+                    for (int b = 0; b < 8; b++) {
+                        uint32_t nib = (packed >> (b * 4)) & 0xFu;
+                        float wv = (nib >= 8u ? (float)nib - 16.f : (float)nib) * s;
+                        acc += wv * (float)(fp16)hi_chunk[b];
+                    }
+                }
+
+                float w = gate_values[idx0];
+                if (sid == 0) {
+                    output[(size_t)token * hidden_size + j] = fp16(acc * w);
+                } else {
+                    output[(size_t)token * hidden_size + j] =
+                        fp16((float)output[(size_t)token * hidden_size + j] + acc * w);
+                }
+            });
+    };
+
+    submit_kernel(cgf, device, "moe down shared int4 nmajor standalone");
+}
+
+torch::Tensor moe_shared_expert_forward_int4_nmajor(
+    torch::Tensor x,                         // [n_tokens, H] fp16
+    torch::Tensor gate_up_qweight,            // [2*I, H/2] uint8
+    torch::Tensor gate_up_scale,              // [2*I, H/GS] fp16
+    torch::Tensor down_qweight,               // [H, I/2] uint8
+    torch::Tensor down_scale,                 // [H, I/GS] fp16
+    torch::Tensor gate_weight) {              // [num_shared, H] fp16
+
+    const int n_tokens = x.size(0);
+    const int hidden_size = x.size(1);
+    const int num_shared_experts = gate_weight.size(0);
+    const int two_inter = gate_up_qweight.size(0);
+    const int shared_inter_size = two_inter / 2;
+
+    auto intermediates = torch::empty(
+        {n_tokens * num_shared_experts, shared_inter_size},
+        x.options());
+
+    moe_up_shared_int4_nmajor_kernel(
+        (const fp16*)x.data_ptr(),
+        (const uint8_t*)gate_up_qweight.data_ptr(),
+        (const fp16*)gate_up_scale.data_ptr(),
+        (fp16*)intermediates.data_ptr(),
+        n_tokens, hidden_size, shared_inter_size, num_shared_experts,
+        x.device());
+
+    auto gate_values = torch::empty(
+        {n_tokens * num_shared_experts}, x.options().dtype(torch::kFloat32));
+
+    moe_down_gate_precompute_int4_kernel(
+        (const fp16*)x.data_ptr(),
+        (const fp16*)gate_weight.data_ptr(),
+        gate_values.data_ptr<float>(),
+        n_tokens, hidden_size, num_shared_experts,
+        x.device());
+
+    auto output = torch::empty({n_tokens, hidden_size}, x.options());
+
+    moe_down_shared_int4_nmajor_kernel(
+        (const fp16*)intermediates.data_ptr(),
+        (const uint8_t*)down_qweight.data_ptr(),
+        (const fp16*)down_scale.data_ptr(),
+        gate_values.data_ptr<float>(),
+        (fp16*)output.data_ptr(),
+        n_tokens, hidden_size, shared_inter_size, num_shared_experts,
+        x.device());
+
+    return output;
+}
+
 // Registration
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1425,14 +1618,20 @@ TORCH_LIBRARY_FRAGMENT(moe_int4_ops, m) {
           "Tensor shared_expert_gate_weight, "
           "int top_k, int num_shared_experts, int n_routed_experts, "
           "bool use_ggml_layout) -> Tensor");
+    m.def("moe_shared_expert_forward_int4_nmajor(Tensor x, "
+          "Tensor gate_up_qweight, Tensor gate_up_scale, "
+          "Tensor down_qweight, Tensor down_scale, "
+          "Tensor gate_weight) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(moe_int4_ops, XPU, m) {
     m.impl("moe_router_forward_int4", &moe_router_forward_int4);
     m.impl("moe_forward_full_int4", &moe_forward_full_int4);
+    m.impl("moe_shared_expert_forward_int4_nmajor", &moe_shared_expert_forward_int4_nmajor);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_router_forward_int4", &moe_router_forward_int4);
     m.def("moe_forward_full_int4", &moe_forward_full_int4);
+    m.def("moe_shared_expert_forward_int4_nmajor", &moe_shared_expert_forward_int4_nmajor);
 }

@@ -892,3 +892,27 @@ def moe_forward_full_int4(
         shared_expert_gate_weight,
         top_k, num_shared_experts, n_routed_experts,
         use_ggml_layout)
+
+
+def moe_shared_expert_forward_int4_nmajor(
+    x: torch.Tensor,
+    gate_up_qweight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_qweight: torch.Tensor,
+    down_scale: torch.Tensor,
+    gate_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Shared expert forward with CUTLASS N-major uint8 INT4 weights.
+
+    x:                [n_tokens, H] fp16
+    gate_up_qweight:  [2*I, H/2] uint8 (implement_zp signed encoding)
+    gate_up_scale:    [2*I, H/GS] fp16
+    down_qweight:     [H, I/2] uint8 (implement_zp signed encoding)
+    down_scale:       [H, I/GS] fp16
+    gate_weight:      [num_shared, H] fp16
+
+    Returns: [n_tokens, H] fp16
+    """
+    return _moe_int4.moe_shared_expert_forward_int4_nmajor(
+        x, gate_up_qweight, gate_up_scale,
+        down_qweight, down_scale, gate_weight)
