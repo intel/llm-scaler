@@ -1,5 +1,6 @@
 """Python wrappers for custom ESIMD kernels."""
 import torch
+import torch.nn.functional as F
 
 _ops = torch.ops.custom_esimd_kernels_vllm
 
@@ -916,3 +917,276 @@ def moe_shared_expert_forward_int4_nmajor(
     return _moe_int4.moe_shared_expert_forward_int4_nmajor(
         x, gate_up_qweight, gate_up_scale,
         down_qweight, down_scale, gate_weight)
+def to_cutlass_nmajor_int4(qweight: torch.Tensor) -> torch.Tensor:
+    """Convert INT4 weights to CUTLASS-style N-major uint8 packing.
+
+    Input can be GGML/test-style int32 ``[E, N, K/8]`` or ``[N, K/8]`` with
+    8 unsigned int4 values per int32. The output is uint8 ``[E, N, K/2]`` or
+    ``[N, K/2]`` with low nibble = even K and high nibble = odd K.
+
+    If ``qweight`` is already uint8, this returns a contiguous copy/view.
+    """
+    if qweight.dtype == torch.uint8:
+        return qweight.contiguous()
+    if qweight.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"unsupported qweight dtype: {qweight.dtype}")
+    if qweight.dim() not in (2, 3):
+        raise ValueError(f"expected [N,K/8] or [E,N,K/8], got {tuple(qweight.shape)}")
+
+    q_u32 = qweight.to(torch.int64) & 0xFFFFFFFF
+    shifts = torch.arange(8, device=qweight.device, dtype=torch.int64) * 4
+    nibbles = ((q_u32.unsqueeze(-1) >> shifts) & 0xF).to(torch.uint8)
+    nibbles = nibbles.reshape(*qweight.shape[:-1], qweight.shape[-1] * 8)
+    return (nibbles[..., 0::2] | (nibbles[..., 1::2] << 4)).contiguous()
+
+
+def cutlass_nmajor_int4_to_signed(qweight_u4: torch.Tensor) -> torch.Tensor:
+    """Convert unsigned CUTLASS N-major uint4 bytes to signed compact int4.
+
+    This mirrors ``vllm_xpu_kernels.fused_moe_interface.implement_zp`` and is
+    intended to be run once during weight preparation, not inside decode.
+    """
+    if qweight_u4.dtype != torch.uint8:
+        raise TypeError(f"expected uint8 qweight, got {qweight_u4.dtype}")
+    try:
+        from vllm_xpu_kernels.fused_moe_interface import implement_zp
+    except Exception as exc:
+        raise RuntimeError("vllm_xpu_kernels is required for signed INT4 packing") from exc
+
+    if qweight_u4.dim() == 2:
+        return implement_zp(qweight_u4.contiguous())
+    if qweight_u4.dim() != 3:
+        raise ValueError(f"expected [N,K/2] or [E,N,K/2], got {tuple(qweight_u4.shape)}")
+
+    qweight_s4 = torch.empty_like(qweight_u4)
+    for expert in range(qweight_u4.shape[0]):
+        qweight_s4[expert] = implement_zp(qweight_u4[expert].contiguous())
+    return qweight_s4.contiguous()
+
+
+def prepare_cutlass_nmajor_int4_weight(qweight: torch.Tensor) -> torch.Tensor:
+    """Prepare a routed expert INT4 weight for CUTLASS grouped GEMM.
+
+    Converts GGML/test int32 N-major ``[E,N,K/8]`` to CUTLASS uint8 N-major
+    ``[E,N,K/2]`` and then applies the signed-s4 zero-point transform expected
+    by ``cutlass_grouped_gemm_xe2``.
+    """
+    return cutlass_nmajor_int4_to_signed(to_cutlass_nmajor_int4(qweight))
+
+
+def precompute_moe_route(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sort token routes by expert for grouped GEMM.
+
+    Returns ``sorted_rows``, ``sorted_weights`` and ``rows_per_expert``. This is
+    a Python/Torch prototype; a production decode path should replace it with a
+    fused C++/SYCL prologue to avoid many tiny launches.
+    """
+    if topk_weights.device.type == "xpu" and topk_ids.device.type == "xpu":
+        try:
+            return _moe_int4.moe_route_precompute_int4(
+                topk_weights.contiguous(), topk_ids.contiguous(), num_experts)
+        except (AttributeError, RuntimeError):
+            pass
+
+    num_rows = topk_ids.shape[0]
+    top_k = topk_ids.shape[1]
+    flat_experts = topk_ids.reshape(-1).to(torch.int64)
+    flat_weights = topk_weights.reshape(-1)
+    flat_rows = torch.arange(num_rows, device=topk_ids.device, dtype=torch.int64)
+    flat_rows = flat_rows.repeat_interleave(top_k)
+
+    order = torch.argsort(flat_experts, stable=True)
+    sorted_experts = flat_experts[order]
+    sorted_rows = flat_rows[order]
+    sorted_weights = flat_weights[order]
+    rows_per_expert = torch.bincount(sorted_experts, minlength=num_experts).to(torch.int32)
+    return sorted_rows.contiguous(), sorted_weights.contiguous(), rows_per_expert.contiguous()
+
+
+def moe_silu_mul_int4(gate_up: torch.Tensor) -> torch.Tensor:
+    """SiLU(gate) * up for routed MoE intermediate tensors."""
+    if gate_up.device.type == "xpu":
+        try:
+            return _moe_int4.moe_silu_mul_int4(gate_up.contiguous())
+        except (AttributeError, RuntimeError):
+            pass
+    inter_size = gate_up.shape[1] // 2
+    return (F.silu(gate_up[:, :inter_size].float()) *
+            gate_up[:, inter_size:].float()).to(gate_up.dtype).contiguous()
+
+
+def moe_route_gather_int4(
+    route_output: torch.Tensor,
+    sorted_rows: torch.Tensor,
+    sorted_weights: torch.Tensor,
+    n_tokens: int,
+) -> torch.Tensor:
+    """Gather weighted routed outputs back to token-major order."""
+    if route_output.device.type == "xpu":
+        try:
+            return _moe_int4.moe_route_gather_int4(
+                route_output.contiguous(), sorted_rows.contiguous(),
+                sorted_weights.contiguous(), n_tokens)
+        except (AttributeError, RuntimeError):
+            pass
+    output = torch.zeros(n_tokens, route_output.shape[1], dtype=route_output.dtype,
+                         device=route_output.device)
+    output.index_add_(0, sorted_rows, route_output * sorted_weights.unsqueeze(-1))
+    return output
+
+
+def moe_forward_routed_cutlass_nmajor_int4(
+    hidden_states: torch.Tensor,
+    w13_qweight_s4: torch.Tensor,
+    w13_scales: torch.Tensor,
+    w2_qweight_s4: torch.Tensor,
+    w2_scales: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    route: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Prototype routed MoE forward using CUTLASS N-major INT4 grouped GEMM.
+
+    ``w13_qweight_s4`` and ``w2_qweight_s4`` must already be prepared by
+    ``prepare_cutlass_nmajor_int4_weight``. Shared experts are not included;
+    this isolates the routed path for bring-up and benchmarking.
+    """
+    if route is None and hidden_states.shape[0] == 1:
+        return moe_forward_tiny_cutlass_nmajor_int4(
+            hidden_states, w13_qweight_s4, w13_scales,
+            w2_qweight_s4, w2_scales, topk_weights, topk_ids)
+
+    try:
+        from vllm_xpu_kernels.fused_moe_interface import cutlass_grouped_gemm_xe2
+    except Exception as exc:
+        raise RuntimeError("vllm_xpu_kernels is required for CUTLASS grouped GEMM") from exc
+
+    num_rows, hidden_size = hidden_states.shape
+    inter_size = w2_qweight_s4.shape[2] * 2
+    if route is None:
+        sorted_rows, sorted_weights, rows_per_expert = precompute_moe_route(
+            topk_weights, topk_ids, num_experts)
+    else:
+        sorted_rows, sorted_weights, rows_per_expert = route
+
+    gemm1_input = hidden_states.index_select(0, sorted_rows).contiguous()
+    gemm1_output = torch.empty(
+        gemm1_input.shape[0], w13_qweight_s4.shape[1],
+        dtype=hidden_states.dtype, device=hidden_states.device)
+    cutlass_grouped_gemm_xe2(
+        gemm1_input, w13_qweight_s4, w13_scales, None, gemm1_output,
+        rows_per_expert, w13_qweight_s4.shape[1], hidden_size, num_experts,
+        True, False)
+
+    act_output = moe_silu_mul_int4(gemm1_output)
+    gemm2_output = torch.empty(
+        gemm1_input.shape[0], hidden_size,
+        dtype=hidden_states.dtype, device=hidden_states.device)
+    cutlass_grouped_gemm_xe2(
+        act_output, w2_qweight_s4, w2_scales, None, gemm2_output,
+        rows_per_expert, hidden_size, inter_size, num_experts, True, False)
+
+    return moe_route_gather_int4(gemm2_output, sorted_rows, sorted_weights, num_rows)
+
+
+def moe_forward_tiny_cutlass_nmajor_int4(
+    hidden_states: torch.Tensor,
+    w13_qweight_s4: torch.Tensor,
+    w13_scales: torch.Tensor,
+    w2_qweight_s4: torch.Tensor,
+    w2_scales: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    """bs1 tiny-M routed MoE using local CUTLASS N-major INT4 kernels."""
+    if hidden_states.device.type != "xpu":
+        raise RuntimeError("tiny CUTLASS N-major INT4 path requires XPU")
+    return _moe_int4.moe_forward_tiny_cutlass_nmajor_int4(
+        hidden_states.contiguous(),
+        w13_qweight_s4.contiguous(), w13_scales.contiguous(),
+        w2_qweight_s4.contiguous(), w2_scales.contiguous(),
+        topk_weights.contiguous(), topk_ids.contiguous())
+
+
+def moe_tiny_cutlass_nmajor_int4_up(
+    hidden_states: torch.Tensor,
+    w13_qweight_s4: torch.Tensor,
+    w13_scales: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    if hidden_states.device.type != "xpu":
+        raise RuntimeError("tiny CUTLASS N-major INT4 path requires XPU")
+    return _moe_int4.moe_tiny_cutlass_nmajor_int4_up(
+        hidden_states.contiguous(), w13_qweight_s4.contiguous(),
+        w13_scales.contiguous(), topk_ids.contiguous())
+
+
+def moe_tiny_cutlass_nmajor_int4_down(
+    intermediates: torch.Tensor,
+    w2_qweight_s4: torch.Tensor,
+    w2_scales: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    if intermediates.device.type != "xpu":
+        raise RuntimeError("tiny CUTLASS N-major INT4 path requires XPU")
+    return _moe_int4.moe_tiny_cutlass_nmajor_int4_down(
+        intermediates.contiguous(), w2_qweight_s4.contiguous(),
+        w2_scales.contiguous(), topk_weights.contiguous(), topk_ids.contiguous())
+
+
+def moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared(
+    hidden_states: torch.Tensor,
+    w13_qweight_s4: torch.Tensor,
+    w13_scales: torch.Tensor,
+    w2_qweight_s4: torch.Tensor,
+    w2_scales: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_expert_gate_weight: torch.Tensor,
+    num_shared_experts: int,
+) -> torch.Tensor:
+    if hidden_states.device.type != "xpu":
+        raise RuntimeError("tiny CUTLASS N-major INT4 path requires XPU")
+    return _moe_int4.moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared(
+        hidden_states.contiguous(),
+        w13_qweight_s4.contiguous(), w13_scales.contiguous(),
+        w2_qweight_s4.contiguous(), w2_scales.contiguous(),
+        topk_weights.contiguous(), topk_ids.contiguous(),
+        shared_gate_up_weight.contiguous(), shared_down_weight.contiguous(),
+        shared_expert_gate_weight.contiguous(), num_shared_experts)
+
+
+def moe_tiny_fp16_shared_up(
+    hidden_states: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    num_shared_experts: int,
+) -> torch.Tensor:
+    if hidden_states.device.type != "xpu":
+        raise RuntimeError("tiny shared FP16 path requires XPU")
+    return _moe_int4.moe_tiny_fp16_shared_up(
+        hidden_states.contiguous(), shared_gate_up_weight.contiguous(),
+        num_shared_experts)
+
+
+def moe_tiny_fp16_shared_finalize(
+    hidden_states: torch.Tensor,
+    shared_intermediates: torch.Tensor,
+    routed_output: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_expert_gate_weight: torch.Tensor,
+    num_shared_experts: int,
+) -> torch.Tensor:
+    if hidden_states.device.type != "xpu":
+        raise RuntimeError("tiny shared FP16 path requires XPU")
+    return _moe_int4.moe_tiny_fp16_shared_finalize(
+        hidden_states.contiguous(), shared_intermediates.contiguous(),
+        routed_output.contiguous(), shared_down_weight.contiguous(),
+        shared_expert_gate_weight.contiguous(), num_shared_experts)

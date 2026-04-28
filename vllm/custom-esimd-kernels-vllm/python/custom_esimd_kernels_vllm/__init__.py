@@ -58,4 +58,17 @@ from custom_esimd_kernels_vllm.ops import (
     # MoE INT4 Batch ops
     moe_router_forward_int4,
     moe_forward_full_int4,
+    to_cutlass_nmajor_int4,
+    cutlass_nmajor_int4_to_signed,
+    prepare_cutlass_nmajor_int4_weight,
+    precompute_moe_route,
+    moe_silu_mul_int4,
+    moe_route_gather_int4,
+    moe_forward_routed_cutlass_nmajor_int4,
+    moe_forward_tiny_cutlass_nmajor_int4,
+    moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared,
+    moe_tiny_cutlass_nmajor_int4_up,
+    moe_tiny_cutlass_nmajor_int4_down,
+    moe_tiny_fp16_shared_up,
+    moe_tiny_fp16_shared_finalize,
 )
