@@ -1903,6 +1903,246 @@ void moe_tiny_m_up_cutlass_int4_with_shared_fp16_kernel(
     submit_kernel(cgf, device, "moe tiny m up cutlass int4 with shared fp16");
 }
 
+template <typename IndexT> class MoeWsUpRoutedCutlassInt4;
+
+template <typename IndexT>
+static void moe_ws_up_routed_cutlass_int4_kernel(
+    const fp16* x, const uint8_t* w13, const fp16* w13_scales,
+    const IndexT* topk_idx, fp16* routed_intermediates,
+    const int n_tokens, const int top_k, const int hidden_size,
+    const int intermediate_size, const torch::Device& device) {
+
+    const int two_inter = 2 * intermediate_size;
+    const int k_bytes = hidden_size / 2;
+    const int k_groups = hidden_size / 128;
+    constexpr int N_TILE = 8;
+    const int n_col_tiles = intermediate_size / N_TILE;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeWsUpRoutedCutlassInt4<IndexT>>(
+            sycl::range<2>(n_tokens * top_k, n_col_tiles),
+            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
+                const int route_idx = (int)idx[0];
+                const int tile_idx  = (int)idx[1];
+                const int token     = route_idx / top_k;
+                const int k_idx     = route_idx % top_k;
+                const int col_base  = tile_idx * N_TILE;
+                const int expert = (int)topk_idx[(size_t)token * top_k + k_idx];
+                const fp16* x_row = x + (size_t)token * hidden_size;
+
+                constexpr int VL = 64;
+                simd<float, VL> gate_acc[N_TILE];
+                simd<float, VL> up_acc[N_TILE];
+                #pragma unroll
+                for (int t = 0; t < N_TILE; ++t) { gate_acc[t] = 0.f; up_acc[t] = 0.f; }
+
+                for (int kb = 0; kb < k_bytes; kb += VL) {
+                    simd<fp16, 2 * VL> x_chunk = block_load<fp16, 2 * VL>(x_row + kb * 2);
+                    simd<float, VL> xef = x_chunk.select<VL, 2>(0);
+                    simd<float, VL> xof = x_chunk.select<VL, 2>(1);
+                    int group = kb / 64;
+
+                    #pragma unroll
+                    for (int t = 0; t < N_TILE; ++t) {
+                        int col = col_base + t;
+                        simd<uint8_t, VL> g_raw = block_load<uint8_t, VL>(
+                            w13 + ((size_t)expert * two_inter + col) * k_bytes + kb);
+                        simd<uint8_t, VL> u_raw = block_load<uint8_t, VL>(
+                            w13 + ((size_t)expert * two_inter + intermediate_size + col) * k_bytes + kb);
+
+                        simd<uint16_t, VL> g16 = convert<uint16_t>(g_raw);
+                        simd<uint16_t, VL> u16 = convert<uint16_t>(u_raw);
+                        simd<float, VL> g_lo = convert<float>(g16 & 0x0Fu);
+                        simd<float, VL> g_hi = convert<float>((g16 >> 4) & 0x0Fu);
+                        simd<float, VL> u_lo = convert<float>(u16 & 0x0Fu);
+                        simd<float, VL> u_hi = convert<float>((u16 >> 4) & 0x0Fu);
+                        g_lo.merge(g_lo - 16.f, g_lo >= 8.f);
+                        g_hi.merge(g_hi - 16.f, g_hi >= 8.f);
+                        u_lo.merge(u_lo - 16.f, u_lo >= 8.f);
+                        u_hi.merge(u_hi - 16.f, u_hi >= 8.f);
+
+                        float gs = (float)(w13_scales + ((size_t)expert * two_inter + col) * k_groups)[group];
+                        float us = (float)(w13_scales + ((size_t)expert * two_inter + intermediate_size + col) * k_groups)[group];
+
+                        gate_acc[t] += xef * (g_lo * gs) + xof * (g_hi * gs);
+                        up_acc[t]   += xef * (u_lo * us) + xof * (u_hi * us);
+                    }
+                }
+
+                #pragma unroll
+                for (int t = 0; t < N_TILE; ++t) {
+                    float g = sycl::ext::intel::esimd::detail::sum<float, float, VL>(gate_acc[t]);
+                    float u = sycl::ext::intel::esimd::detail::sum<float, float, VL>(up_acc[t]);
+                    float silu = g / (1.f + sycl::exp(-g));
+                    routed_intermediates[((size_t)token * top_k + k_idx) * intermediate_size + col_base + t] = fp16(silu * u);
+                }
+            });
+    };
+    submit_kernel(cgf, device, "moe ws up routed cutlass int4");
+}
+
+template <typename IndexT> class MoeWsUpSharedFP16;
+
+template <typename IndexT>
+static void moe_ws_up_shared_fp16_kernel(
+    const fp16* x, const fp16* shared_gate_up_weight,
+    const fp16* shared_expert_gate_weight,
+    fp16* shared_intermediates, float* shared_gate_values,
+    const int n_tokens, const int hidden_size,
+    const int shared_inter_size, const int num_shared_experts,
+    const torch::Device& device) {
+
+    const int shared_two_inter = 2 * shared_inter_size;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeWsUpSharedFP16<IndexT>>(
+            sycl::range<2>(n_tokens * num_shared_experts, shared_inter_size + 1),
+            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
+                const int flat = (int)idx[0];
+                const int col  = (int)idx[1];
+                const int token = flat / num_shared_experts;
+                const int sid   = flat % num_shared_experts;
+                const fp16* x_row = x + (size_t)token * hidden_size;
+
+                if (col < shared_inter_size) {
+                    const fp16* gw = shared_gate_up_weight + (size_t)sid * shared_two_inter * hidden_size + (size_t)col * hidden_size;
+                    const fp16* uw = shared_gate_up_weight + (size_t)sid * shared_two_inter * hidden_size + (size_t)(shared_inter_size + col) * hidden_size;
+                    constexpr int VL = 64;
+                    simd<float, VL> ga(0.f), ua(0.f);
+                    for (int k = 0; k < hidden_size; k += VL) {
+                        simd<fp16, VL> xv = block_load<fp16, VL>(x_row + k);
+                        ga += simd<float, VL>(xv) * simd<float, VL>(block_load<fp16, VL>(gw + k));
+                        ua += simd<float, VL>(xv) * simd<float, VL>(block_load<fp16, VL>(uw + k));
+                    }
+                    float g = sycl::ext::intel::esimd::detail::sum<float, float, VL>(ga);
+                    float u = sycl::ext::intel::esimd::detail::sum<float, float, VL>(ua);
+                    float silu = g / (1.f + sycl::exp(-g));
+                    shared_intermediates[((size_t)token * num_shared_experts + sid) * shared_inter_size + col] = fp16(silu * u);
+                } else {
+                    const fp16* gate = shared_expert_gate_weight + (size_t)sid * hidden_size;
+                    constexpr int VL = 64;
+                    simd<float, VL> acc(0.f);
+                    for (int k = 0; k < hidden_size; k += VL)
+                        acc += simd<float, VL>(block_load<fp16, VL>(x_row + k)) * simd<float, VL>(block_load<fp16, VL>(gate + k));
+                    float v = sycl::ext::intel::esimd::detail::sum<float, float, VL>(acc);
+                    shared_gate_values[(size_t)token * num_shared_experts + sid] = 1.f / (1.f + sycl::exp(-v));
+                }
+            });
+    };
+    submit_kernel(cgf, device, "moe ws up shared fp16");
+}
+
+template <typename IndexT>
+void moe_ws_up_cutlass_int4_with_shared_fp16_kernel(
+    const fp16* x, const uint8_t* w13, const fp16* w13_scales,
+    const IndexT* topk_idx, const fp16* shared_gate_up_weight,
+    const fp16* shared_expert_gate_weight,
+    fp16* routed_intermediates, fp16* shared_intermediates, float* shared_gate_values,
+    const int n_tokens, const int top_k, const int hidden_size, const int intermediate_size,
+    const int shared_inter_size, const int num_shared_experts,
+    const torch::Device& device) {
+
+    moe_ws_up_routed_cutlass_int4_kernel<IndexT>(
+        x, w13, w13_scales, topk_idx, routed_intermediates,
+        n_tokens, top_k, hidden_size, intermediate_size, device);
+
+    moe_ws_up_shared_fp16_kernel<IndexT>(
+        x, shared_gate_up_weight, shared_expert_gate_weight,
+        shared_intermediates, shared_gate_values,
+        n_tokens, hidden_size, shared_inter_size, num_shared_experts, device);
+}
+
+template <typename IndexT> class MoeWsDownCutlassInt4WithSharedFP16;
+
+template <typename IndexT>
+void moe_ws_down_cutlass_int4_with_shared_fp16_kernel(
+    const fp16* routed_intermediates, const uint8_t* w2, const fp16* w2_scales,
+    const fp16* topk_weight, const IndexT* topk_idx,
+    const fp16* shared_intermediates, const float* shared_gate_values,
+    const fp16* shared_down_weight, fp16* output,
+    const int n_tokens, const int top_k, const int hidden_size, const int intermediate_size,
+    const int shared_inter_size, const int num_shared_experts,
+    const torch::Device& device) {
+
+    const int k_bytes = intermediate_size / 2;
+    const int k_groups = intermediate_size / 128;
+    constexpr int H_TILE = 8;
+    const int h_tiles = hidden_size / H_TILE;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeWsDownCutlassInt4WithSharedFP16<IndexT>>(
+            sycl::range<2>(n_tokens, h_tiles),
+            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
+                const int token  = (int)idx[0];
+                const int h_tile = (int)idx[1];
+                const int h_base = h_tile * H_TILE;
+                constexpr int VL = 64;
+                float sum[H_TILE];
+                #pragma unroll
+                for (int hh = 0; hh < H_TILE; ++hh) sum[hh] = 0.f;
+
+                for (int route = 0; route < top_k; ++route) {
+                    int expert = (int)topk_idx[(size_t)token * top_k + route];
+                    const fp16* in_row = routed_intermediates + ((size_t)token * top_k + route) * intermediate_size;
+                    float rw = (float)topk_weight[(size_t)token * top_k + route];
+                    simd<float, VL> acc[H_TILE];
+                    #pragma unroll
+                    for (int hh = 0; hh < H_TILE; ++hh) acc[hh] = 0.f;
+
+                    for (int kb = 0; kb < k_bytes; kb += VL) {
+                        simd<fp16, 2 * VL> in_chunk = block_load<fp16, 2 * VL>(in_row + kb * 2);
+                        simd<float, VL> ief = in_chunk.select<VL, 2>(0);
+                        simd<float, VL> iof = in_chunk.select<VL, 2>(1);
+                        int group = kb / 64;
+                        #pragma unroll
+                        for (int hh = 0; hh < H_TILE; ++hh) {
+                            int h = h_base + hh;
+                            simd<uint8_t, VL> raw = block_load<uint8_t, VL>(w2 + ((size_t)expert * hidden_size + h) * k_bytes + kb);
+                            simd<uint16_t, VL> raw16 = convert<uint16_t>(raw);
+                            simd<float, VL> lo = convert<float>(raw16 & 0x0Fu);
+                            simd<float, VL> hi = convert<float>((raw16 >> 4) & 0x0Fu);
+                            lo.merge(lo - 16.f, lo >= 8.f);
+                            hi.merge(hi - 16.f, hi >= 8.f);
+                            float s = (float)(w2_scales + ((size_t)expert * hidden_size + h) * k_groups)[group];
+                            acc[hh] += ief * (lo * s) + iof * (hi * s);
+                        }
+                    }
+                    #pragma unroll
+                    for (int hh = 0; hh < H_TILE; ++hh)
+                        sum[hh] += rw * sycl::ext::intel::esimd::detail::sum<float, float, VL>(acc[hh]);
+                }
+
+                for (int sid = 0; sid < num_shared_experts; ++sid) {
+                    float gate = shared_gate_values[(size_t)token * num_shared_experts + sid];
+                    const fp16* hi_row = shared_intermediates + ((size_t)token * num_shared_experts + sid) * shared_inter_size;
+                    simd<float, VL> acc[H_TILE];
+                    #pragma unroll
+                    for (int hh = 0; hh < H_TILE; ++hh) acc[hh] = 0.f;
+                    for (int k = 0; k < shared_inter_size; k += VL) {
+                        simd<fp16, VL> hv = block_load<fp16, VL>(hi_row + k);
+                        simd<float, VL> hvf = hv;
+                        #pragma unroll
+                        for (int hh = 0; hh < H_TILE; ++hh) {
+                            int h = h_base + hh;
+                            simd<fp16, VL> wv = block_load<fp16, VL>(shared_down_weight + (size_t)sid * hidden_size * shared_inter_size + (size_t)h * shared_inter_size + k);
+                            acc[hh] += hvf * simd<float, VL>(wv);
+                        }
+                    }
+                    #pragma unroll
+                    for (int hh = 0; hh < H_TILE; ++hh)
+                        sum[hh] += gate * sycl::ext::intel::esimd::detail::sum<float, float, VL>(acc[hh]);
+                }
+
+                #pragma unroll
+                for (int hh = 0; hh < H_TILE; ++hh)
+                    output[(size_t)token * hidden_size + h_base + hh] = fp16(sum[hh]);
+            });
+    };
+    submit_kernel(cgf, device, "moe ws down cutlass int4 with shared fp16");
+}
+
+
+
 template <typename IndexT>
 void moe_tiny_m_down_cutlass_int4_kernel(
     const fp16* intermediates,
@@ -2333,42 +2573,74 @@ torch::Tensor moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared(
     float* shared_gate_values_ptr = (float*)s_int4_gate_values.data_ptr();
     auto final_output = s_int4_final_output;
 
-    if (topk_idx.scalar_type() == torch::kInt) {
-        moe_tiny_m_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
-            (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
-            (const fp16*)w13_scales.data_ptr(), topk_idx.data_ptr<int32_t>(),
-            (const fp16*)shared_gate_up_weight.data_ptr(),
-            (const fp16*)shared_expert_gate_weight.data_ptr(),
-            routed_intermediates_ptr, shared_intermediates_ptr,
-            shared_gate_values_ptr, n_tokens, top_k, hidden_size,
-            intermediate_size, shared_inter_size, (int)num_shared_experts, x.device());
+    if (n_tokens == 1) {
+        if (topk_idx.scalar_type() == torch::kInt) {
+            moe_tiny_m_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
+                (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
+                (const fp16*)w13_scales.data_ptr(), topk_idx.data_ptr<int32_t>(),
+                (const fp16*)shared_gate_up_weight.data_ptr(),
+                (const fp16*)shared_expert_gate_weight.data_ptr(),
+                routed_intermediates_ptr, shared_intermediates_ptr,
+                shared_gate_values_ptr, n_tokens, top_k, hidden_size,
+                intermediate_size, shared_inter_size, (int)num_shared_experts, x.device());
+            moe_tiny_m_down_cutlass_int4_with_shared_fp16_htile_kernel<int32_t>(
+                (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
+                (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
+                topk_idx.data_ptr<int32_t>(), (const fp16*)shared_intermediates_ptr,
+                (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
+                (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
+                shared_inter_size, (int)num_shared_experts, x.device());
+        } else {
+            moe_tiny_m_up_cutlass_int4_with_shared_fp16_kernel<int64_t>(
+                (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
+                (const fp16*)w13_scales.data_ptr(), topk_idx.data_ptr<int64_t>(),
+                (const fp16*)shared_gate_up_weight.data_ptr(),
+                (const fp16*)shared_expert_gate_weight.data_ptr(),
+                routed_intermediates_ptr, shared_intermediates_ptr,
+                shared_gate_values_ptr, n_tokens, top_k, hidden_size,
+                intermediate_size, shared_inter_size, (int)num_shared_experts, x.device());
+            moe_tiny_m_down_cutlass_int4_with_shared_fp16_htile_kernel<int64_t>(
+                (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
+                (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
+                topk_idx.data_ptr<int64_t>(), (const fp16*)shared_intermediates_ptr,
+                (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
+                (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
+                shared_inter_size, (int)num_shared_experts, x.device());
+        }
     } else {
-        moe_tiny_m_up_cutlass_int4_with_shared_fp16_kernel<int64_t>(
-            (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
-            (const fp16*)w13_scales.data_ptr(), topk_idx.data_ptr<int64_t>(),
-            (const fp16*)shared_gate_up_weight.data_ptr(),
-            (const fp16*)shared_expert_gate_weight.data_ptr(),
-            routed_intermediates_ptr, shared_intermediates_ptr,
-            shared_gate_values_ptr, n_tokens, top_k, hidden_size,
-            intermediate_size, shared_inter_size, (int)num_shared_experts, x.device());
-    }
-
-    if (topk_idx.scalar_type() == torch::kInt) {
-        moe_tiny_m_down_cutlass_int4_with_shared_fp16_htile_kernel<int32_t>(
-            (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
-            (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
-            topk_idx.data_ptr<int32_t>(), (const fp16*)shared_intermediates_ptr,
-            (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
-            (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
-            shared_inter_size, (int)num_shared_experts, x.device());
-    } else {
-        moe_tiny_m_down_cutlass_int4_with_shared_fp16_htile_kernel<int64_t>(
-            (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
-            (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
-            topk_idx.data_ptr<int64_t>(), (const fp16*)shared_intermediates_ptr,
-            (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
-            (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
-            shared_inter_size, (int)num_shared_experts, x.device());
+        if (topk_idx.scalar_type() == torch::kInt) {
+            moe_ws_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
+                (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
+                (const fp16*)w13_scales.data_ptr(), topk_idx.data_ptr<int32_t>(),
+                (const fp16*)shared_gate_up_weight.data_ptr(),
+                (const fp16*)shared_expert_gate_weight.data_ptr(),
+                routed_intermediates_ptr, shared_intermediates_ptr,
+                shared_gate_values_ptr, n_tokens, top_k, hidden_size,
+                intermediate_size, shared_inter_size, (int)num_shared_experts, x.device());
+            moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t>(
+                (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
+                (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
+                topk_idx.data_ptr<int32_t>(), (const fp16*)shared_intermediates_ptr,
+                (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
+                (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
+                shared_inter_size, (int)num_shared_experts, x.device());
+        } else {
+            moe_ws_up_cutlass_int4_with_shared_fp16_kernel<int64_t>(
+                (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
+                (const fp16*)w13_scales.data_ptr(), topk_idx.data_ptr<int64_t>(),
+                (const fp16*)shared_gate_up_weight.data_ptr(),
+                (const fp16*)shared_expert_gate_weight.data_ptr(),
+                routed_intermediates_ptr, shared_intermediates_ptr,
+                shared_gate_values_ptr, n_tokens, top_k, hidden_size,
+                intermediate_size, shared_inter_size, (int)num_shared_experts, x.device());
+            moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int64_t>(
+                (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
+                (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
+                topk_idx.data_ptr<int64_t>(), (const fp16*)shared_intermediates_ptr,
+                (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
+                (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
+                shared_inter_size, (int)num_shared_experts, x.device());
+        }
     }
 
     return final_output;
@@ -3259,6 +3531,21 @@ torch::Tensor moe_forward_cutlass_nmajor_int4_full(
 
     TORCH_CHECK(x.dim()==2 && x.is_contiguous() && x.scalar_type()==torch::kHalf);
     int M=x.size(0),H=x.size(1);
+
+    // For M<=32, use optimized Weight-Stationary tiny_full path
+    if (M <= 32 && num_shared_experts > 0) {
+        int I_ck = (int)w13.size(1) / 2;
+        int s_I_ck = shared_gu_w.numel()>0 ? (int)(shared_gu_w.size(0)/(2*num_shared_experts)) : 0;
+        if (s_I_ck == I_ck && I_ck % 4 == 0) {
+            torch::Tensor sg = shared_gu_w.dim()==3 ? shared_gu_w[0] : shared_gu_w;
+            torch::Tensor sd = shared_d_w.dim()==3 ? shared_d_w[0] : shared_d_w;
+            torch::Tensor sgw = shared_gate_w.dim()==3 ? shared_gate_w[0] : shared_gate_w;
+            return moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits(
+                x, logits, w13, w13_scales, w2, w2_scales,
+                sg, sd, sgw, 8, num_shared_experts, n_routed_experts);
+        }
+    }
+
     int two_I=w13.size(1),I=two_I/2,top_k=8;
     int s_I = shared_gu_w.numel()>0 ? (int)(shared_gu_w.size(0)/(2*num_shared_experts)) : 0;
 
@@ -3379,6 +3666,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_tiny_fp16_shared_up", &moe_tiny_fp16_shared_up);
     m.def("moe_tiny_fp16_shared_finalize", &moe_tiny_fp16_shared_finalize);
     m.def("moe_forward_full_int4", &moe_forward_full_int4);
+    m.def("moe_forward_cutlass_nmajor_int4_full", &moe_forward_cutlass_nmajor_int4_full);
     m.def("moe_shared_expert_forward_int4_nmajor", &moe_shared_expert_forward_int4_nmajor);
     m.def("moe_gemm_int4_nmajor", &moe_gemm_int4_nmajor);
 }

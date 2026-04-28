@@ -201,10 +201,10 @@ def main():
     shared_gate_weight = (torch.randn(1, hidden_size) * 0.02).half().to(DEVICE)
     dummy_scale = torch.empty(0, dtype=torch.float16, device=DEVICE)
 
-    print("config: Qwen3.5-122B-A10B TP4 full moe_forward_full_int4 vs CUTLASS N-major prototype")
-    print("bs, k_major_ipex_us, n_major_ggml_us, cutlass_nmajor_fullish_us, n_vs_k, cutlass_vs_k")
+    print("config: Qwen3.5-122B-A10B TP4 moe_forward_full_int4 vs CUTLASS N-major")
+    print("bs, path, total_us, (vs_ipex)")
 
-    for batch_size in [1, 4, 8, 16, 32, 64]:
+    for batch_size in [1, 4, 8, 16, 24, 32, 48, 64]:
         x = (torch.randn(batch_size, hidden_size) * 0.1).half().to(DEVICE)
         logits = (torch.randn(batch_size, num_experts) * 0.1).half().to(DEVICE)
 
@@ -218,47 +218,73 @@ def main():
                 shared_gate_weight,
                 top_k, num_shared_experts, num_experts, False)
 
-        def run_n_major():
-            return moe_int4_ops.moe_forward_full_int4(
-                x, logits,
-                layout_inputs["w13_q_nm"], layout_inputs["w13_s_nm"],
-                shared_gate_up, dummy_scale,
-                layout_inputs["w2_q_nm"], layout_inputs["w2_s_nm"],
-                shared_down, dummy_scale,
-                shared_gate_weight,
-                top_k, num_shared_experts, num_experts, True)
-
-        def run_cutlass_nmajor():
+        def run_cutlass_auto():
             return run_cutlass_nmajor_fullish(
                 moe_int4_ops, x, logits, layout_inputs,
                 shared_gate_up, shared_down, shared_gate_weight,
                 top_k, num_experts)
 
-        if batch_size in (1, 64):
-            ref = run_k_major()
-            cutlass = run_cutlass_nmajor()
-            torch.xpu.synchronize()
-            diff = (ref - cutlass).abs().float()
-            print(
-                f"correctness_bs{batch_size}: "
-                f"cutlass_vs_k_max={diff.max().item():.6g} "
-                f"cutlass_vs_k_mean={diff.mean().item():.6g}")
+        def run_cutlass_tiny_full():
+            return moe_int4_ops.moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits(
+                x, logits,
+                layout_inputs["w13_q_cutlass"], layout_inputs["w13_s_nm"],
+                layout_inputs["w2_q_cutlass"], layout_inputs["w2_s_nm"],
+                shared_gate_up, shared_down, shared_gate_weight,
+                top_k, num_shared_experts, num_experts)
 
-        k_major_us = bench_once(run_k_major)
-        n_major_us = bench_once(run_n_major)
-        cutlass_nmajor_us = bench_once(run_cutlass_nmajor)
-        ratio = n_major_us / k_major_us if k_major_us else 0.0
-        cutlass_ratio = cutlass_nmajor_us / k_major_us if k_major_us else 0.0
+        def run_cutlass_grouped_gemm():
+            # Force grouped GEMM path by going through the profiler stages.
+            from custom_esimd_kernels_vllm import (
+                moe_forward_routed_cutlass_nmajor_int4,
+            )
+            topk_weights, topk_ids = topk_from_logits(logits, top_k)
+            routed = moe_forward_routed_cutlass_nmajor_int4(
+                x, layout_inputs["w13_q_cutlass"], layout_inputs["w13_s_nm"],
+                layout_inputs["w2_q_cutlass"], layout_inputs["w2_s_nm"],
+                topk_weights, topk_ids, num_experts)
+            shared_gate = x @ shared_gate_up[:shared_intermediate_size].t()
+            shared_up = x @ shared_gate_up[shared_intermediate_size:].t()
+            shared_act = torch.nn.functional.silu(shared_gate.float()) * shared_up.float()
+            shared_out = shared_act.to(x.dtype) @ shared_down.t()
+            gate = torch.sigmoid((x @ shared_gate_weight.t()).float()).to(x.dtype)
+            return routed + shared_out * gate
+
+        ref = run_k_major()
+        cut_auto = run_cutlass_auto()
+        torch.xpu.synchronize()
+        diff_auto = (ref - cut_auto).abs().float().max().item()
+
+        if batch_size >= 4:
+            cut_tiny = run_cutlass_tiny_full()
+            cut_gg = run_cutlass_grouped_gemm()
+            torch.xpu.synchronize()
+            tiny_max = (ref - cut_tiny).abs().float().max().item()
+            gg_max = (ref - cut_gg).abs().float().max().item()
+        else:
+            tiny_max = diff_auto
+            gg_max = float('nan')
+
+        k_us = bench_once(run_k_major)
+        auto_us = bench_once(run_cutlass_auto)
+        tiny_us = bench_once(run_cutlass_tiny_full) if batch_size >= 4 else auto_us
+        gg_us = bench_once(run_cutlass_grouped_gemm) if batch_size >= 4 else float('nan')
+
         print(
-            f"{batch_size}, {k_major_us:.1f}, {n_major_us:.1f}, "
-            f"{cutlass_nmajor_us:.1f}, {ratio:.3f}, {cutlass_ratio:.3f}")
-        if batch_size == 64:
-            breakdown = profile_cutlass_nmajor_fullish(
-                x, logits, layout_inputs, shared_gate_up, shared_down,
-                shared_gate_weight, top_k, num_experts)
+            f"{batch_size}, ipex_k_major, {k_us:.1f}, 1.00, diff_auto={diff_auto:.2e}")
+        print(
+            f"{batch_size}, cutlass_auto, {auto_us:.1f}, {auto_us/k_us:.2f}")
+        if batch_size >= 4:
             print(
-                f"cutlass_breakdown_bs{batch_size}: "
-                + ", ".join(f"{name}={value:.1f}" for name, value in breakdown.items()))
+                f"{batch_size}, cutlass_tiny_full, {tiny_us:.1f}, {tiny_us/k_us:.2f}, diff={tiny_max:.2e}")
+            print(
+                f"{batch_size}, cutlass_grouped_gemm, {gg_us:.1f}, {gg_us/k_us:.2f}, diff={gg_max:.2e}")
+
+        breakdown = profile_cutlass_nmajor_fullish(
+            x, logits, layout_inputs, shared_gate_up, shared_down,
+            shared_gate_weight, top_k, num_experts)
+        print(
+            f"bs{batch_size}_breakdown: "
+            + ", ".join(f"{name}={value:.1f}" for name, value in breakdown.items()))
 
 
 if __name__ == "__main__":

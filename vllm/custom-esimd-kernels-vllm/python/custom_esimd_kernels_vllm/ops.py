@@ -1179,7 +1179,7 @@ def moe_forward_full_cutlass_nmajor_int4(
     else:
         shared_gate_weight = shared_expert_gate_weight
 
-    if hidden_states.shape[0] <= 16:
+    if hidden_states.shape[0] <= 32:
         return moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits(
             hidden_states, logits, w13_qweight_s4, w13_scales,
             w2_qweight_s4, w2_scales, shared_gate_up, shared_down,
@@ -1235,7 +1235,7 @@ def moe_forward_full_cutlass_nmajor_int4_with_router(
         hidden_states, router_qweight, router_scales, router_use_ggml_layout,
         top_k, num_experts, True)
 
-    if hidden_states.shape[0] <= 16:
+    if hidden_states.shape[0] <= 32:
         return moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared(
             hidden_states, w13_qweight_s4, w13_scales,
             w2_qweight_s4, w2_scales, topk_weights, topk_ids,
