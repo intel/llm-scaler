@@ -1608,6 +1608,172 @@ torch::Tensor moe_shared_expert_forward_int4_nmajor(
 // Registration
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// INT4 N-major grouped GEMM (DPAS-based) — standalone for benchmarking
+// ═══════════════════════════════════════════════════════════════════════════════
+#include "int4_nmajor_gemm.h"
+
+// Standalone INT4 N-major GEMM for benchmarking (no MoE routing, no gather/scatter)
+// Computes: output[M, N] = input[M, K] @ dequant(weight[E, N, K]).T
+// Simple version: E=1 expert, all tokens go to expert 0
+torch::Tensor moe_gemm_int4_nmajor(
+    torch::Tensor x,              // [M, K] fp16
+    torch::Tensor weight,          // [E, N, K/2] uint8
+    torch::Tensor scale,           // [E, N, K/GS] fp16
+    torch::Tensor expert_idx,      // [E+1] int32 — cumulative token offsets
+    int64_t group_size) {
+
+    const int M = x.size(0);
+    const int K = x.size(1);
+    const int E = weight.size(0);
+    const int N = weight.size(1);
+    const int K_packed = K / 8;
+    const int K_groups = K / (int)group_size;
+
+    auto output = torch::zeros({M, N}, x.options());
+
+    sycl::queue& q = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+
+    // View uint8 as int32
+    auto w_int32 = weight.view(torch::kInt32).reshape({E, N, K_packed});
+
+    // Simple grouped GEMM: each WI handles one expert × N_TILE=16 N outputs
+    // M loop over MAX_M=32 chunks, DPAS<8,8> inside
+    constexpr int N_TILE = 16;
+    constexpr int MAX_M = 32;
+    constexpr int BS = 128;
+
+    q.submit([&](sycl::handler& cgh) {
+        const fp16* inp = (const fp16*)x.data_ptr();
+        const uint32_t* wt = (const uint32_t*)w_int32.data_ptr();
+        const fp16* sc = (const fp16*)scale.data_ptr();
+        fp16* out = (fp16*)output.data_ptr();
+        const int* eidx = (const int*)expert_idx.data_ptr();
+
+        cgh.parallel_for(
+            sycl::range<2>(E, N / N_TILE),
+            [=](sycl::id<2> id) SYCL_ESIMD_KERNEL {
+                constexpr int MS = MAX_M / 16;
+                constexpr int NS = N_TILE / 8;
+                constexpr int ACC_SZ = MS * NS * 128;
+                constexpr int KP_PER_GROUP = BS / 8;
+
+                const int eid = (int)id[0];
+                const int tid = (int)id[1];
+                const int n_start = tid * N_TILE;
+
+                const int t0 = eidx[eid];
+                const int t1 = eidx[eid + 1];
+                if (t0 >= t1) return;
+
+                const uint32_t* w_base = wt + (size_t)eid * N * K_packed;
+                const fp16* s_base = sc + (size_t)eid * N * K_groups;
+
+                for (int m_base = t0; m_base < t1; m_base += MAX_M) {
+                    int m_end = m_base + MAX_M;
+                    if (m_end > t1) m_end = t1;
+                    int m_count = m_end - m_base;
+
+                    simd<fp16, ACC_SZ> acc(fp16(0));
+
+                    for (int kg = 0; kg < K_groups; kg++) {
+                        // Load scale once per group for N_TILE rows
+                        simd<fp16, N_TILE> scl;
+                        #pragma unroll
+                        for (int ni = 0; ni < N_TILE; ni++) {
+                            scl[ni] = s_base[(n_start + ni) * K_groups + kg];
+                        }
+
+                        for (int kp_off = 0; kp_off < KP_PER_GROUP; kp_off += 2) {
+                            const int kp_start = kg * KP_PER_GROUP + kp_off;
+
+                            // b_tile: load input [MS*16, 16K] using gather (same as prefill)
+                            // Each of 16 M rows loads 8 uint32 = 16 fp16 K elements
+                            simd<fp16, MS * 256> b_tile;
+                            const uint32_t k_byte_off = (uint32_t)(kp_start * 8) * (uint32_t)sizeof(fp16);
+                            #pragma unroll
+                            for (int ms = 0; ms < MS; ms++) {
+                                // Build byte offsets for 16 M rows
+                                simd<uint32_t, 16> row_offs;
+                                #pragma unroll
+                                for (int mi = 0; mi < 16; mi++) {
+                                    int row = m_base + ms * 16 + mi;
+                                    row_offs[mi] = (row < t1)
+                                        ? (uint32_t)row * (uint32_t)(K * sizeof(fp16))
+                                        : (uint32_t)(t1 - 1) * (uint32_t)(K * sizeof(fp16));
+                                }
+                                simd<fp16, 256> btmp;
+                                btmp.template bit_cast_view<uint32_t>() =
+                                    xesimd::lsc_gather<uint32_t, 8,
+                                        xesimd::lsc_data_size::u32,
+                                        xesimd::cache_hint::cached, xesimd::cache_hint::cached,
+                                        16, uint32_t>(
+                                        reinterpret_cast<const uint32_t*>(inp),
+                                        row_offs + k_byte_off);
+                                b_tile.template select<256, 1>(ms * 256) = btmp;
+                            }
+
+                            // a_tile: weight dequant from N-major layout
+                            #pragma unroll
+                            for (int ns = 0; ns < NS; ns++) {
+                                simd<fp16, 128> a_tile;
+                                #pragma unroll
+                                for (int r = 0; r < 8; r++) {
+                                    const int n_col = n_start + ns * 8 + r;
+                                    const uint32_t w0r = w_base[(size_t)n_col * K_packed + kp_start];
+                                    const uint32_t w1r = w_base[(size_t)n_col * K_packed + kp_start + 1];
+                                    const fp16 s = scl[ns * 8 + r];
+                                    simd<fp16, 16> row;
+                                    #pragma unroll
+                                    for (int k = 0; k < 8; k++) {
+                                        uint32_t n0 = (w0r >> (k * 4)) & 0xFu;
+                                        uint32_t n1 = (w1r >> (k * 4)) & 0xFu;
+                                        row[k]     = fp16((int)(n0 >= 8u ? n0 - 16u : n0));
+                                        row[8 + k] = fp16((int)(n1 >= 8u ? n1 - 16u : n1));
+                                    }
+                                    row *= s;
+                                    a_tile.template select<16, 1>(r * 16) = row;
+                                }
+
+                                #pragma unroll
+                                for (int ms = 0; ms < MS; ms++) {
+                                    const int idx = ms * NS * 128 + ns * 128;
+                                    simd<fp16, 128> a = acc.template select<128, 1>(idx);
+                                    simd<fp16, 256> bv = b_tile.template select<256, 1>(ms * 256);
+                                    a = xmx_ns::dpas<8, 8, fp16, fp16, fp16, fp16>(a, bv, a_tile);
+                                    acc.template select<128, 1>(idx) = a;
+                                }
+                            }
+                        }
+                    }
+
+                    // Store output — acc layout is [N_TILE][16M] per (ms, ns)
+                    // acc[ms*NS*128 + ns*128 + n_local*16 + m_local] = out[m, n]
+                    #pragma unroll
+                    for (int ms = 0; ms < MS; ms++) {
+                        #pragma unroll
+                        for (int r = 0; r < N_TILE; r++) {
+                            int ns_local = r / 8;
+                            int n_local  = r % 8;
+                            const int idx = ms * NS * 128 + ns_local * 128 + n_local * 16;
+                            simd<fp16, 16> val = acc.template select<16, 1>(idx);
+                            // val[mi] = output for M row (m_base + ms*16 + mi), N col (n_start + r)
+                            for (int mi = 0; mi < 16; mi++) {
+                                int row = m_base + ms * 16 + mi;
+                                if (row < t1) {
+                                    out[(size_t)row * N + n_start + r] = val[mi];
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+    });
+
+    return output;
+}
+
+
 TORCH_LIBRARY_FRAGMENT(moe_int4_ops, m) {
     m.def("moe_router_forward_int4(Tensor x, Tensor weight, Tensor scale, bool use_ggml_layout) -> Tensor");
     m.def("moe_forward_full_int4(Tensor x, Tensor logits, "
@@ -1622,16 +1788,20 @@ TORCH_LIBRARY_FRAGMENT(moe_int4_ops, m) {
           "Tensor gate_up_qweight, Tensor gate_up_scale, "
           "Tensor down_qweight, Tensor down_scale, "
           "Tensor gate_weight) -> Tensor");
+    m.def("moe_gemm_int4_nmajor(Tensor x, Tensor weight, Tensor scale, "
+          "Tensor expert_idx, int group_size) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(moe_int4_ops, XPU, m) {
     m.impl("moe_router_forward_int4", &moe_router_forward_int4);
     m.impl("moe_forward_full_int4", &moe_forward_full_int4);
     m.impl("moe_shared_expert_forward_int4_nmajor", &moe_shared_expert_forward_int4_nmajor);
+    m.impl("moe_gemm_int4_nmajor", &moe_gemm_int4_nmajor);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_router_forward_int4", &moe_router_forward_int4);
     m.def("moe_forward_full_int4", &moe_forward_full_int4);
     m.def("moe_shared_expert_forward_int4_nmajor", &moe_shared_expert_forward_int4_nmajor);
+    m.def("moe_gemm_int4_nmajor", &moe_gemm_int4_nmajor);
 }
