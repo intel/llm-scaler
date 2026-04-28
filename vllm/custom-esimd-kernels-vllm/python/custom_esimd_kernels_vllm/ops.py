@@ -1189,9 +1189,8 @@ def moe_forward_full_cutlass_nmajor_int4(
         hidden_states, w13_qweight_s4, w13_scales, w2_qweight_s4, w2_scales,
         None, None, num_experts, logits=logits, top_k=top_k)
 
-    shared_gate = hidden_states @ shared_gate_up[:shared_inter_size].t()
-    shared_up = hidden_states @ shared_gate_up[shared_inter_size:].t()
-    shared_act = F.silu(shared_gate.float()) * shared_up.float()
+    shared_gu = hidden_states @ shared_gate_up.t()
+    shared_act = F.silu(shared_gu[:, :shared_inter_size].float()) * shared_gu[:, shared_inter_size:].float()
     shared_out = shared_act.to(hidden_states.dtype) @ shared_down.t()
     gate = torch.sigmoid((hidden_states @ shared_gate_weight.t()).float()).to(hidden_states.dtype)
     return routed + shared_out * gate
@@ -1246,9 +1245,8 @@ def moe_forward_full_cutlass_nmajor_int4_with_router(
         hidden_states, w13_qweight_s4, w13_scales, w2_qweight_s4, w2_scales,
         topk_weights, topk_ids, num_experts)
 
-    shared_gate = hidden_states @ shared_gate_up[:shared_inter_size].t()
-    shared_up = hidden_states @ shared_gate_up[shared_inter_size:].t()
-    shared_act = F.silu(shared_gate.float()) * shared_up.float()
+    shared_gu = hidden_states @ shared_gate_up.t()
+    shared_act = F.silu(shared_gu[:, :shared_inter_size].float()) * shared_gu[:, shared_inter_size:].float()
     shared_out = shared_act.to(hidden_states.dtype) @ shared_down.t()
     gate = torch.sigmoid((hidden_states @ shared_gate_weight.t()).float()).to(hidden_states.dtype)
     return routed + shared_out * gate

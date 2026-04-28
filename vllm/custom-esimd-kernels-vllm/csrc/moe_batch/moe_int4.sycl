@@ -1903,9 +1903,9 @@ void moe_tiny_m_up_cutlass_int4_with_shared_fp16_kernel(
     submit_kernel(cgf, device, "moe tiny m up cutlass int4 with shared fp16");
 }
 
-template <typename IndexT> class MoeWsUpRoutedCutlassInt4;
+template <typename IndexT, int NT> class MoeWsUpRoutedCutlassInt4;
 
-template <typename IndexT>
+template <typename IndexT, int N_TILE>
 static void moe_ws_up_routed_cutlass_int4_kernel(
     const fp16* x, const uint8_t* w13, const fp16* w13_scales,
     const IndexT* topk_idx, fp16* routed_intermediates,
@@ -1915,11 +1915,10 @@ static void moe_ws_up_routed_cutlass_int4_kernel(
     const int two_inter = 2 * intermediate_size;
     const int k_bytes = hidden_size / 2;
     const int k_groups = hidden_size / 128;
-    constexpr int N_TILE = 8;
     const int n_col_tiles = intermediate_size / N_TILE;
 
     auto cgf = [&](sycl::handler& cgh) {
-        cgh.parallel_for<class MoeWsUpRoutedCutlassInt4<IndexT>>(
+        cgh.parallel_for<class MoeWsUpRoutedCutlassInt4<IndexT, N_TILE>>(
             sycl::range<2>(n_tokens * top_k, n_col_tiles),
             [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
                 const int route_idx = (int)idx[0];
@@ -2042,9 +2041,21 @@ void moe_ws_up_cutlass_int4_with_shared_fp16_kernel(
     const int shared_inter_size, const int num_shared_experts,
     const torch::Device& device) {
 
-    moe_ws_up_routed_cutlass_int4_kernel<IndexT>(
-        x, w13, w13_scales, topk_idx, routed_intermediates,
-        n_tokens, top_k, hidden_size, intermediate_size, device);
+    // N_TILE routing: keep WI/EU in sweet spot [8, 50]
+    // N_TILE=16 causes GRF spill (8KB acc fills large GRF), capped at 8
+    if (n_tokens <= 2) {
+        moe_ws_up_routed_cutlass_int4_kernel<IndexT, 2>(
+            x, w13, w13_scales, topk_idx, routed_intermediates,
+            n_tokens, top_k, hidden_size, intermediate_size, device);
+    } else if (n_tokens <= 4) {
+        moe_ws_up_routed_cutlass_int4_kernel<IndexT, 4>(
+            x, w13, w13_scales, topk_idx, routed_intermediates,
+            n_tokens, top_k, hidden_size, intermediate_size, device);
+    } else {
+        moe_ws_up_routed_cutlass_int4_kernel<IndexT, 8>(
+            x, w13, w13_scales, topk_idx, routed_intermediates,
+            n_tokens, top_k, hidden_size, intermediate_size, device);
+    }
 
     moe_ws_up_shared_fp16_kernel<IndexT>(
         x, shared_gate_up_weight, shared_expert_gate_weight,
@@ -2052,9 +2063,9 @@ void moe_ws_up_cutlass_int4_with_shared_fp16_kernel(
         n_tokens, hidden_size, shared_inter_size, num_shared_experts, device);
 }
 
-template <typename IndexT> class MoeWsDownCutlassInt4WithSharedFP16;
+template <typename IndexT, int HT> class MoeWsDownCutlassInt4WithSharedFP16;
 
-template <typename IndexT>
+template <typename IndexT, int H_TILE>
 void moe_ws_down_cutlass_int4_with_shared_fp16_kernel(
     const fp16* routed_intermediates, const uint8_t* w2, const fp16* w2_scales,
     const fp16* topk_weight, const IndexT* topk_idx,
@@ -2066,11 +2077,10 @@ void moe_ws_down_cutlass_int4_with_shared_fp16_kernel(
 
     const int k_bytes = intermediate_size / 2;
     const int k_groups = intermediate_size / 128;
-    constexpr int H_TILE = 8;
     const int h_tiles = hidden_size / H_TILE;
 
     auto cgf = [&](sycl::handler& cgh) {
-        cgh.parallel_for<class MoeWsDownCutlassInt4WithSharedFP16<IndexT>>(
+        cgh.parallel_for<class MoeWsDownCutlassInt4WithSharedFP16<IndexT, H_TILE>>(
             sycl::range<2>(n_tokens, h_tiles),
             [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
                 const int token  = (int)idx[0];
@@ -2617,13 +2627,23 @@ torch::Tensor moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared(
                 routed_intermediates_ptr, shared_intermediates_ptr,
                 shared_gate_values_ptr, n_tokens, top_k, hidden_size,
                 intermediate_size, shared_inter_size, (int)num_shared_experts, x.device());
-            moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t>(
+            if (n_tokens <= 2) {
+                moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t, 4>(
                 (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
                 (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
                 topk_idx.data_ptr<int32_t>(), (const fp16*)shared_intermediates_ptr,
                 (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
                 (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
                 shared_inter_size, (int)num_shared_experts, x.device());
+            } else {
+                moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t, 8>(
+                (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
+                (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
+                topk_idx.data_ptr<int32_t>(), (const fp16*)shared_intermediates_ptr,
+                (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
+                (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
+                shared_inter_size, (int)num_shared_experts, x.device());
+            }
         } else {
             moe_ws_up_cutlass_int4_with_shared_fp16_kernel<int64_t>(
                 (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
@@ -2633,13 +2653,23 @@ torch::Tensor moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared(
                 routed_intermediates_ptr, shared_intermediates_ptr,
                 shared_gate_values_ptr, n_tokens, top_k, hidden_size,
                 intermediate_size, shared_inter_size, (int)num_shared_experts, x.device());
-            moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int64_t>(
+            if (n_tokens <= 2) {
+                moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int64_t, 4>(
                 (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
                 (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
                 topk_idx.data_ptr<int64_t>(), (const fp16*)shared_intermediates_ptr,
                 (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
                 (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
                 shared_inter_size, (int)num_shared_experts, x.device());
+            } else {
+                moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int64_t, 8>(
+                (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
+                (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
+                topk_idx.data_ptr<int64_t>(), (const fp16*)shared_intermediates_ptr,
+                (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
+                (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
+                shared_inter_size, (int)num_shared_experts, x.device());
+            }
         }
     }
 
@@ -3214,10 +3244,10 @@ torch::Tensor moe_gemm_int4_nmajor(
     // View uint8 as int32
     auto w_int32 = weight.view(torch::kInt32).reshape({E, N, K_packed});
 
-    // Simple grouped GEMM: each WI handles one expert × N_TILE=16 N outputs
-    // M loop over MAX_M=32 chunks, DPAS<8,8> inside
+    // Each WI handles one expert × N_TILE N outputs, loops M in MAX_M chunks
+    // Larger N_TILE = fewer WIs, better input reuse, more register pressure
     constexpr int N_TILE = 16;
-    constexpr int MAX_M = 32;
+    constexpr int MAX_M = 16;  // was 32 — smaller M tile, less GRF pressure
     constexpr int BS = 128;
 
     q.submit([&](sycl::handler& cgh) {
