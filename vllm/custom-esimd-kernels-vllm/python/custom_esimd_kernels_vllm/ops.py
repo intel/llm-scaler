@@ -1190,3 +1190,21 @@ def moe_tiny_fp16_shared_finalize(
         hidden_states.contiguous(), shared_intermediates.contiguous(),
         routed_output.contiguous(), shared_down_weight.contiguous(),
         shared_expert_gate_weight.contiguous(), num_shared_experts)
+
+
+def moe_forward_cutlass_nmajor_int4_full(
+    x: torch.Tensor,
+    logits: torch.Tensor,
+    w13: torch.Tensor, w13_scales: torch.Tensor,
+    w2: torch.Tensor, w2_scales: torch.Tensor,
+    shared_gu_w: torch.Tensor,
+    shared_d_w: torch.Tensor,
+    shared_gate_w: torch.Tensor,
+    num_shared_experts: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """Full fused MoE decode: topk + routed INT4 + shared FP16, M>=1."""
+    return _moe_int4.moe_forward_cutlass_nmajor_int4_full(
+        x, logits, w13, w13_scales, w2, w2_scales,
+        shared_gu_w, shared_d_w, shared_gate_w,
+        num_shared_experts, n_routed_experts)
