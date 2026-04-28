@@ -1713,7 +1713,7 @@ torch::Tensor moe_gemm_int4_nmajor(
                                 b_tile.template select<256, 1>(ms * 256) = btmp;
                             }
 
-                            // a_tile: weight dequant from N-major layout
+                            // a_tile: weight dequant from N-major [N, K_packed] int32
                             #pragma unroll
                             for (int ns = 0; ns < NS; ns++) {
                                 simd<fp16, 128> a_tile;
@@ -1747,8 +1747,9 @@ torch::Tensor moe_gemm_int4_nmajor(
                         }
                     }
 
-                    // Store output — acc layout is [N_TILE][16M] per (ms, ns)
-                    // acc[ms*NS*128 + ns*128 + n_local*16 + m_local] = out[m, n]
+                    // Store output — same pattern as prefill kernel
+                    // acc layout: acc[ms*NS*128 + ns*128 + n_local*16 + m_local]
+                    // where n_local ∈ [0,8), m_local ∈ [0,16)
                     #pragma unroll
                     for (int ms = 0; ms < MS; ms++) {
                         #pragma unroll
@@ -1757,12 +1758,10 @@ torch::Tensor moe_gemm_int4_nmajor(
                             int n_local  = r % 8;
                             const int idx = ms * NS * 128 + ns_local * 128 + n_local * 16;
                             simd<fp16, 16> val = acc.template select<16, 1>(idx);
-                            // val[mi] = output for M row (m_base + ms*16 + mi), N col (n_start + r)
                             for (int mi = 0; mi < 16; mi++) {
                                 int row = m_base + ms * 16 + mi;
-                                if (row < t1) {
+                                if (row < t1)
                                     out[(size_t)row * N + n_start + r] = val[mi];
-                                }
                             }
                         }
                     }
