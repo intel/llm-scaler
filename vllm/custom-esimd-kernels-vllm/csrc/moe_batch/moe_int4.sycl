@@ -1714,14 +1714,34 @@ torch::Tensor moe_gemm_int4_nmajor(
                             }
 
                             // a_tile: weight dequant from N-major [N, K_packed] int32
+                            // Use lsc_gather to batch-load 8 N-rows at once
                             #pragma unroll
                             for (int ns = 0; ns < NS; ns++) {
+                                // Gather 8 int32 from 8 different N-rows at kp_start
+                                simd<uint32_t, 8> w0_off, w1_off;
+                                #pragma unroll
+                                for (int r = 0; r < 8; r++) {
+                                    w0_off[r] = (uint32_t)((size_t)(n_start + ns * 8 + r) * K_packed + kp_start) * 4u;
+                                    w1_off[r] = (uint32_t)((size_t)(n_start + ns * 8 + r) * K_packed + kp_start + 1) * 4u;
+                                }
+                                simd<uint32_t, 8> w0_gathered =
+                                    xesimd::lsc_gather<uint32_t, 1,
+                                        xesimd::lsc_data_size::u32,
+                                        xesimd::cache_hint::cached, xesimd::cache_hint::cached,
+                                        8, uint32_t>(
+                                        reinterpret_cast<const uint32_t*>(w_base), w0_off);
+                                simd<uint32_t, 8> w1_gathered =
+                                    xesimd::lsc_gather<uint32_t, 1,
+                                        xesimd::lsc_data_size::u32,
+                                        xesimd::cache_hint::cached, xesimd::cache_hint::cached,
+                                        8, uint32_t>(
+                                        reinterpret_cast<const uint32_t*>(w_base), w1_off);
+
                                 simd<fp16, 128> a_tile;
                                 #pragma unroll
                                 for (int r = 0; r < 8; r++) {
-                                    const int n_col = n_start + ns * 8 + r;
-                                    const uint32_t w0r = w_base[(size_t)n_col * K_packed + kp_start];
-                                    const uint32_t w1r = w_base[(size_t)n_col * K_packed + kp_start + 1];
+                                    const uint32_t w0r = w0_gathered[r];
+                                    const uint32_t w1r = w1_gathered[r];
                                     const fp16 s = scl[ns * 8 + r];
                                     simd<fp16, 16> row;
                                     #pragma unroll
@@ -1747,22 +1767,27 @@ torch::Tensor moe_gemm_int4_nmajor(
                         }
                     }
 
-                    // Store output — same pattern as prefill kernel
+                    // Store output using scatter (16 M-rows per scatter)
                     // acc layout: acc[ms*NS*128 + ns*128 + n_local*16 + m_local]
-                    // where n_local ∈ [0,8), m_local ∈ [0,16)
                     #pragma unroll
                     for (int ms = 0; ms < MS; ms++) {
+                        // Build byte offsets for 16 M rows
+                        simd<uint32_t, 16> store_offs;
+                        #pragma unroll
+                        for (int mi = 0; mi < 16; mi++) {
+                            int row = m_base + ms * 16 + mi;
+                            store_offs[mi] = (row < t1)
+                                ? (uint32_t)((size_t)row * N) * (uint32_t)sizeof(fp16)
+                                : (uint32_t)((size_t)(t1 - 1) * N) * (uint32_t)sizeof(fp16);
+                        }
                         #pragma unroll
                         for (int r = 0; r < N_TILE; r++) {
                             int ns_local = r / 8;
                             int n_local  = r % 8;
                             const int idx = ms * NS * 128 + ns_local * 128 + n_local * 16;
                             simd<fp16, 16> val = acc.template select<16, 1>(idx);
-                            for (int mi = 0; mi < 16; mi++) {
-                                int row = m_base + ms * 16 + mi;
-                                if (row < t1)
-                                    out[(size_t)row * N + n_start + r] = val[mi];
-                            }
+                            uint32_t col_off = (uint32_t)(n_start + r) * (uint32_t)sizeof(fp16);
+                            scatter<fp16, 16>(out, store_offs + col_off, val);
                         }
                     }
                 }
