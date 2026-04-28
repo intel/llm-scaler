@@ -299,24 +299,87 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
         fp16* sstate_base = ssm_state_ptr +
             (int64_t)ssm_idx * ssm_stride0 + (int64_t)hv * gdn_V * gdn_K;
 
+        // Manual unroll to avoid ESIMD compiler codegen issues with
+        // #pragma unroll on lsc load/store heavy loops.
         simd<float, VPT> o_acc;
 
-        #pragma unroll
-        for (int i = 0; i < VPT; i++) {
-            fp16* sr = sstate_base + (int64_t)(vi0 + i) * gdn_K;
-            simd<float, 64> h_lo = lsc_load_state_64_seq(sr);
-            simd<float, 64> h_hi = lsc_load_state_64_seq(sr + 64);
+        if constexpr (VPT == 4) {
+            fp16* sr0 = sstate_base + (int64_t)(vi0 + 0) * gdn_K;
+            fp16* sr1 = sstate_base + (int64_t)(vi0 + 1) * gdn_K;
+            fp16* sr2 = sstate_base + (int64_t)(vi0 + 2) * gdn_K;
+            fp16* sr3 = sstate_base + (int64_t)(vi0 + 3) * gdn_K;
 
-            h_lo *= exp_g; h_hi *= exp_g;
+            simd<float, 64> h0_lo = lsc_load_state_64_seq(sr0);
+            simd<float, 64> h0_hi = lsc_load_state_64_seq(sr0 + 64);
+            simd<float, 64> h1_lo = lsc_load_state_64_seq(sr1);
+            simd<float, 64> h1_hi = lsc_load_state_64_seq(sr1 + 64);
+            simd<float, 64> h2_lo = lsc_load_state_64_seq(sr2);
+            simd<float, 64> h2_hi = lsc_load_state_64_seq(sr2 + 64);
+            simd<float, 64> h3_lo = lsc_load_state_64_seq(sr3);
+            simd<float, 64> h3_hi = lsc_load_state_64_seq(sr3 + 64);
 
-            float kv = gdn_dot128_seq(h_lo, h_hi, k_lo, k_hi);
-            float d = (v_f32[i] - kv) * beta;
-            h_lo += d * k_lo; h_hi += d * k_hi;
+            h0_lo *= exp_g; h0_hi *= exp_g;
+            h1_lo *= exp_g; h1_hi *= exp_g;
+            h2_lo *= exp_g; h2_hi *= exp_g;
+            h3_lo *= exp_g; h3_hi *= exp_g;
 
-            o_acc[i] = gdn_dot128_seq(h_lo, h_hi, q_lo, q_hi);
+            float kv0 = gdn_dot128_seq(h0_lo, h0_hi, k_lo, k_hi);
+            float kv1 = gdn_dot128_seq(h1_lo, h1_hi, k_lo, k_hi);
+            float kv2 = gdn_dot128_seq(h2_lo, h2_hi, k_lo, k_hi);
+            float kv3 = gdn_dot128_seq(h3_lo, h3_hi, k_lo, k_hi);
 
-            lsc_store_state_64_seq(sr, h_lo);
-            lsc_store_state_64_seq(sr + 64, h_hi);
+            float d0 = (v_f32[0] - kv0) * beta;
+            float d1 = (v_f32[1] - kv1) * beta;
+            float d2 = (v_f32[2] - kv2) * beta;
+            float d3 = (v_f32[3] - kv3) * beta;
+
+            h0_lo += d0 * k_lo; h0_hi += d0 * k_hi;
+            h1_lo += d1 * k_lo; h1_hi += d1 * k_hi;
+            h2_lo += d2 * k_lo; h2_hi += d2 * k_hi;
+            h3_lo += d3 * k_lo; h3_hi += d3 * k_hi;
+
+            o_acc[0] = gdn_dot128_seq(h0_lo, h0_hi, q_lo, q_hi);
+            o_acc[1] = gdn_dot128_seq(h1_lo, h1_hi, q_lo, q_hi);
+            o_acc[2] = gdn_dot128_seq(h2_lo, h2_hi, q_lo, q_hi);
+            o_acc[3] = gdn_dot128_seq(h3_lo, h3_hi, q_lo, q_hi);
+
+            lsc_store_state_64_seq(sr0, h0_lo);
+            lsc_store_state_64_seq(sr0 + 64, h0_hi);
+            lsc_store_state_64_seq(sr1, h1_lo);
+            lsc_store_state_64_seq(sr1 + 64, h1_hi);
+            lsc_store_state_64_seq(sr2, h2_lo);
+            lsc_store_state_64_seq(sr2 + 64, h2_hi);
+            lsc_store_state_64_seq(sr3, h3_lo);
+            lsc_store_state_64_seq(sr3 + 64, h3_hi);
+        } else {
+            // VPT == 2 (WG=64)
+            fp16* sr0 = sstate_base + (int64_t)(vi0 + 0) * gdn_K;
+            fp16* sr1 = sstate_base + (int64_t)(vi0 + 1) * gdn_K;
+
+            simd<float, 64> h0_lo = lsc_load_state_64_seq(sr0);
+            simd<float, 64> h0_hi = lsc_load_state_64_seq(sr0 + 64);
+            simd<float, 64> h1_lo = lsc_load_state_64_seq(sr1);
+            simd<float, 64> h1_hi = lsc_load_state_64_seq(sr1 + 64);
+
+            h0_lo *= exp_g; h0_hi *= exp_g;
+            h1_lo *= exp_g; h1_hi *= exp_g;
+
+            float kv0 = gdn_dot128_seq(h0_lo, h0_hi, k_lo, k_hi);
+            float kv1 = gdn_dot128_seq(h1_lo, h1_hi, k_lo, k_hi);
+
+            float d0 = (v_f32[0] - kv0) * beta;
+            float d1 = (v_f32[1] - kv1) * beta;
+
+            h0_lo += d0 * k_lo; h0_hi += d0 * k_hi;
+            h1_lo += d1 * k_lo; h1_hi += d1 * k_hi;
+
+            o_acc[0] = gdn_dot128_seq(h0_lo, h0_hi, q_lo, q_hi);
+            o_acc[1] = gdn_dot128_seq(h1_lo, h1_hi, q_lo, q_hi);
+
+            lsc_store_state_64_seq(sr0, h0_lo);
+            lsc_store_state_64_seq(sr0 + 64, h0_hi);
+            lsc_store_state_64_seq(sr1, h1_lo);
+            lsc_store_state_64_seq(sr1 + 64, h1_hi);
         }
 
         fp16* out = output_ptr + (int64_t)seq_idx * HV * gdn_V + (int64_t)hv * gdn_V + vi0;
