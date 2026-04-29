@@ -2583,96 +2583,54 @@ torch::Tensor moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared(
     float* shared_gate_values_ptr = (float*)s_int4_gate_values.data_ptr();
     auto final_output = s_int4_final_output;
 
+    // Cast topk_idx to int32 if needed (internal topk always produces int32;
+    // external callers may pass int64 which we cast here to avoid double template instantiation)
+    auto topk_idx_i32 = topk_idx.scalar_type() == torch::kInt
+        ? topk_idx : topk_idx.to(torch::kInt);
+
     if (n_tokens == 1) {
-        if (topk_idx.scalar_type() == torch::kInt) {
-            moe_tiny_m_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
-                (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
-                (const fp16*)w13_scales.data_ptr(), topk_idx.data_ptr<int32_t>(),
-                (const fp16*)shared_gate_up_weight.data_ptr(),
-                (const fp16*)shared_expert_gate_weight.data_ptr(),
-                routed_intermediates_ptr, shared_intermediates_ptr,
-                shared_gate_values_ptr, n_tokens, top_k, hidden_size,
-                intermediate_size, shared_inter_size, (int)num_shared_experts, x.device());
-            moe_tiny_m_down_cutlass_int4_with_shared_fp16_htile_kernel<int32_t>(
-                (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
-                (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
-                topk_idx.data_ptr<int32_t>(), (const fp16*)shared_intermediates_ptr,
-                (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
-                (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
-                shared_inter_size, (int)num_shared_experts, x.device());
-        } else {
-            moe_tiny_m_up_cutlass_int4_with_shared_fp16_kernel<int64_t>(
-                (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
-                (const fp16*)w13_scales.data_ptr(), topk_idx.data_ptr<int64_t>(),
-                (const fp16*)shared_gate_up_weight.data_ptr(),
-                (const fp16*)shared_expert_gate_weight.data_ptr(),
-                routed_intermediates_ptr, shared_intermediates_ptr,
-                shared_gate_values_ptr, n_tokens, top_k, hidden_size,
-                intermediate_size, shared_inter_size, (int)num_shared_experts, x.device());
-            moe_tiny_m_down_cutlass_int4_with_shared_fp16_htile_kernel<int64_t>(
-                (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
-                (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
-                topk_idx.data_ptr<int64_t>(), (const fp16*)shared_intermediates_ptr,
-                (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
-                (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
-                shared_inter_size, (int)num_shared_experts, x.device());
-        }
+        moe_tiny_m_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
+            (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
+            (const fp16*)w13_scales.data_ptr(), topk_idx_i32.data_ptr<int32_t>(),
+            (const fp16*)shared_gate_up_weight.data_ptr(),
+            (const fp16*)shared_expert_gate_weight.data_ptr(),
+            routed_intermediates_ptr, shared_intermediates_ptr,
+            shared_gate_values_ptr, n_tokens, top_k, hidden_size,
+            intermediate_size, shared_inter_size, (int)num_shared_experts, x.device());
+        moe_tiny_m_down_cutlass_int4_with_shared_fp16_htile_kernel<int32_t>(
+            (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
+            (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
+            topk_idx_i32.data_ptr<int32_t>(), (const fp16*)shared_intermediates_ptr,
+            (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
+            (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
+            shared_inter_size, (int)num_shared_experts, x.device());
     } else {
-        if (topk_idx.scalar_type() == torch::kInt) {
-            moe_ws_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
-                (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
-                (const fp16*)w13_scales.data_ptr(), topk_idx.data_ptr<int32_t>(),
-                (const fp16*)shared_gate_up_weight.data_ptr(),
-                (const fp16*)shared_expert_gate_weight.data_ptr(),
-                routed_intermediates_ptr, shared_intermediates_ptr,
-                shared_gate_values_ptr, n_tokens, top_k, hidden_size,
-                intermediate_size, shared_inter_size, (int)num_shared_experts, x.device());
-            if (n_tokens <= 2) {
-                moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t, 4>(
+        moe_ws_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
+            (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
+            (const fp16*)w13_scales.data_ptr(), topk_idx_i32.data_ptr<int32_t>(),
+            (const fp16*)shared_gate_up_weight.data_ptr(),
+            (const fp16*)shared_expert_gate_weight.data_ptr(),
+            routed_intermediates_ptr, shared_intermediates_ptr,
+            shared_gate_values_ptr, n_tokens, top_k, hidden_size,
+            intermediate_size, shared_inter_size, (int)num_shared_experts, x.device());
+        if (n_tokens <= 2) {
+            moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t, 4>(
                 (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
                 (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
-                topk_idx.data_ptr<int32_t>(), (const fp16*)shared_intermediates_ptr,
+                topk_idx_i32.data_ptr<int32_t>(), (const fp16*)shared_intermediates_ptr,
                 (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
                 (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
                 shared_inter_size, (int)num_shared_experts, x.device());
-            } else {
-                moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t, 8>(
-                (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
-                (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
-                topk_idx.data_ptr<int32_t>(), (const fp16*)shared_intermediates_ptr,
-                (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
-                (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
-                shared_inter_size, (int)num_shared_experts, x.device());
-            }
         } else {
-            moe_ws_up_cutlass_int4_with_shared_fp16_kernel<int64_t>(
-                (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
-                (const fp16*)w13_scales.data_ptr(), topk_idx.data_ptr<int64_t>(),
-                (const fp16*)shared_gate_up_weight.data_ptr(),
-                (const fp16*)shared_expert_gate_weight.data_ptr(),
-                routed_intermediates_ptr, shared_intermediates_ptr,
-                shared_gate_values_ptr, n_tokens, top_k, hidden_size,
-                intermediate_size, shared_inter_size, (int)num_shared_experts, x.device());
-            if (n_tokens <= 2) {
-                moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int64_t, 4>(
+            moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t, 8>(
                 (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
                 (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
-                topk_idx.data_ptr<int64_t>(), (const fp16*)shared_intermediates_ptr,
+                topk_idx_i32.data_ptr<int32_t>(), (const fp16*)shared_intermediates_ptr,
                 (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
                 (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
                 shared_inter_size, (int)num_shared_experts, x.device());
-            } else {
-                moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int64_t, 8>(
-                (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
-                (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
-                topk_idx.data_ptr<int64_t>(), (const fp16*)shared_intermediates_ptr,
-                (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
-                (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
-                shared_inter_size, (int)num_shared_experts, x.device());
-            }
         }
     }
-
     return final_output;
 }
 

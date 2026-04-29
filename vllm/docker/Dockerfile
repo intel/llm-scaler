@@ -114,9 +114,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm && \
     git clone https://github.com/vllm-project/vllm-xpu-kernels.git && \
     cd vllm-xpu-kernels && \
-    git checkout 4c83144 && \
+    git checkout c968ba9 && \
     sed -i 's|^--extra-index-url=https://download.pytorch.org/whl/xpu|# --extra-index-url=https://download.pytorch.org/whl/xpu|' requirements.txt && \
-    sed -i 's|^torch==2.10.0+xpu|# torch==2.10.0+xpu|' requirements.txt && \
+    sed -i '/^torch==/s/^/# /' requirements.txt && \
     sed -i 's|^triton-xpu|# triton-xpu|' requirements.txt && \
     sed -i 's|^transformers|# transformers|' requirements.txt && \
     pip install -r requirements.txt && \
