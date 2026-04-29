@@ -8,7 +8,6 @@ from custom_esimd_kernels_vllm.ops import (
 )
 import vllm_xpu_kernels
 from vllm_xpu_kernels import _C, _xpu_C, _moe_C
-torch.ops.load_library("/llm/models/test/llm-scaler/vllm/moe_prefill_int4/build/libmoe_prefill_gemm_int4.so")
 torch.serialization.add_safe_globals([getattr])
 
 D = "xpu"; T = torch.float16; GS = 128

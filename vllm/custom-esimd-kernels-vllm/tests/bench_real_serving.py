@@ -15,7 +15,6 @@ import vllm_xpu_kernels
 from vllm_xpu_kernels import _C, _xpu_C, _moe_C
 from custom_esimd_kernels_vllm import moe_int4_ops
 from custom_esimd_kernels_vllm.ops import moe_forward_full_int4
-torch.ops.load_library("/llm/models/test/llm-scaler/vllm/moe_prefill_int4/build/libmoe_prefill_gemm_int4.so")
 
 D = "xpu"; T = torch.float16
 dump_dir = "/llm/models/test/moe_dump"
