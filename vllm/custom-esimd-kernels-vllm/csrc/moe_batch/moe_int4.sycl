@@ -3515,7 +3515,7 @@ torch::Tensor moe_forward_cutlass_nmajor_int4_full(
     torch::Tensor w13, torch::Tensor w13_scales,
     torch::Tensor w2, torch::Tensor w2_scales,
     torch::Tensor shared_gu_w, torch::Tensor shared_d_w, torch::Tensor shared_gate_w,
-    int64_t num_shared_experts, int64_t n_routed_experts) {
+    int64_t top_k, int64_t num_shared_experts, int64_t n_routed_experts) {
 
     TORCH_CHECK(x.dim()==2 && x.is_contiguous() && x.scalar_type()==torch::kHalf);
     int M=x.size(0),H=x.size(1);
@@ -3530,11 +3530,11 @@ torch::Tensor moe_forward_cutlass_nmajor_int4_full(
             torch::Tensor sgw = shared_gate_w.dim()==3 ? shared_gate_w[0] : shared_gate_w;
             return moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits(
                 x, logits, w13, w13_scales, w2, w2_scales,
-                sg, sd, sgw, 8, num_shared_experts, n_routed_experts);
+                sg, sd, sgw, top_k, num_shared_experts, n_routed_experts);
         }
     }
 
-    int two_I=w13.size(1),I=two_I/2,top_k=8;
+    int two_I=w13.size(1),I=two_I/2;
     int s_I = shared_gu_w.numel()>0 ? (int)(shared_gu_w.size(0)/(2*num_shared_experts)) : 0;
 
     sycl::queue& q = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
@@ -3616,7 +3616,7 @@ TORCH_LIBRARY_FRAGMENT(moe_int4_ops, m) {
     m.def("moe_forward_cutlass_nmajor_int4_full(Tensor x, Tensor logits, "
           "Tensor w13, Tensor w13_scales, Tensor w2, Tensor w2_scales, "
           "Tensor shared_gu_w, Tensor shared_d_w, Tensor shared_gate_w, "
-          "int num_shared_experts, int n_routed_experts) -> Tensor");
+          "int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(moe_int4_ops, XPU, m) {
