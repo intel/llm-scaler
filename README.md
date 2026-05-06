@@ -5,7 +5,7 @@ LLM Scaler is an GenAI solution for text generation, image generation, video gen
 ---
 
 ## Latest Update
-- 🔥[2026.04] We released `intel/llm-scaler-vllm:0.14.0-b8.2` with new platform image and support Intel® Arc™ Pro B70 GPU 
+- 🔥[2026.04] We released `intel/llm-scaler-vllm:0.14.0-b8.2.1` with new platform image and support Intel® Arc™ Pro B70 GPU 
 - [2026.03] We released `intel/llm-scaler-vllm:0.14.0-b8.1` to support Qwen3.5-27B, Qwen3.5-35B-A3B and Qwen3.5-122B-A10B (FP8/INT4 online quantization, GPTQ)
 - [2026.03] We released `intel/llm-scaler-omni:0.1.0-b6` for ComfyUI to support CacheDiT and torch.compile(), ComfyUI-GGUF, and more model workflows, and support FP8 for SGLang Diffusion.
 - [2026.03] We released `intel/llm-scaler-vllm:0.14.0-b8` for vLLM 0.14.0 and PyTorch 2.10 support, various new models support and performance improvement. 
