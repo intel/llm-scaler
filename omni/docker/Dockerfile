@@ -89,8 +89,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm && \
     git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git && \
     cd ComfyUI && \
-    git fetch --depth 1 origin 3dd10a59c00248d00f0cb0ab794ff1bb9fb00a5f && \
-    git checkout 3dd10a59c00248d00f0cb0ab794ff1bb9fb00a5f && \
+    git fetch --depth 1 origin 64b8457f55cd7fb54ca7a956d9c73b505e903e0c && \
+    git checkout 64b8457f55cd7fb54ca7a956d9c73b505e903e0c && \
     git apply /tmp/comfyui_for_multi_arc.patch && \
     pip install -r requirements.txt && \
     rm -f /tmp/comfyui_for_multi_arc.patch
@@ -204,8 +204,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git apply /tmp/sglang_diffusion_for_multi_arc.patch && \
     cp python/pyproject_xpu.toml python/pyproject.toml && \
     sed -i '/sgl-kernel/d' python/pyproject.toml && \
+    sed -i 's/"transformers==4\.57\.1"/"transformers"/' python/pyproject.toml && \
     sed -E 's/(torch[a-z]*)([=<>!~ ]+[0-9.]+)/\1/g' python/pyproject.toml && \
     pip install -e "python[diffusion]" && \
+    pip install \
+        'transformers==5.0.0' \
+        'huggingface_hub==1.3.5' \
+        'diffusers==0.38.0' \
+        'peft==0.19.1' && \
     pip install \
         torch==${TORCH_VERSION} \
         torchvision==${TORCHVISION_VERSION} \

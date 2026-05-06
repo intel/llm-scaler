@@ -1,5 +1,5 @@
 diff --git a/comfy/float.py b/comfy/float.py
-index 88c47cd8..f12aba65 100644
+index 184b3d6d..8c893c7d 100644
 --- a/comfy/float.py
 +++ b/comfy/float.py
 @@ -1,4 +1,10 @@
@@ -32,11 +32,254 @@ index 88c47cd8..f12aba65 100644
  def stochastic_rounding(value, dtype, seed=0):
      if dtype == torch.float32:
          return value.to(dtype=torch.float32)
+diff --git a/comfy/ldm/flux/math.py b/comfy/ldm/flux/math.py
+index 6d0aed82..87518139 100644
+--- a/comfy/ldm/flux/math.py
++++ b/comfy/ldm/flux/math.py
+@@ -6,6 +6,62 @@ from comfy.ldm.modules.attention import optimized_attention
+ import comfy.model_management
+ import logging
+ 
++# ---------- omni_xpu_kernel accelerated RoPE ----------
++_omni_rotary = None
++_omni_rotary_logged = False
++
++try:
++    from omni_xpu_kernel import rotary as _omni_rotary
++    logging.info("[omni_xpu_kernel] Loaded rotary — accelerated RoPE enabled")
++except ImportError:
++    pass
++
++
++def _can_use_omni_rope(x):
++    if _omni_rotary is None:
++        return False
++    if not x.is_xpu:
++        return False
++    head_dim = x.shape[-1]
++    if head_dim not in (64, 128):
++        return False
++    return True
++
++
++def _omni_apply_rope1(x: Tensor, freqs_cis: Tensor):
++    """Apply RoPE using omni_xpu_kernel ESIMD rotary kernel."""
++    global _omni_rotary_logged
++
++    # x: [B, H, S, D], freqs_cis: [B, 1, S_freq, D/2, 2, 2]
++    B, H, S, D = x.shape
++    S_freq = freqs_cis.shape[2]
++
++    # Fallback to vanilla implementation if freqs seq_len < x seq_len
++    if S_freq < S:
++        x_ = x.to(dtype=freqs_cis.dtype).reshape(*x.shape[:-1], -1, 1, 2)
++        if x_.shape[2] != 1 and freqs_cis.shape[2] != 1 and x_.shape[2] != freqs_cis.shape[2]:
++            freqs_cis = freqs_cis[:, :, :x_.shape[2]]
++        x_out = freqs_cis[..., 0] * x_[..., 0]
++        x_out.addcmul_(freqs_cis[..., 1], x_[..., 1])
++        return x_out.reshape(*x.shape).type_as(x)
++
++    if not _omni_rotary_logged:
++        _omni_rotary_logged = True
++        logging.info("[omni_xpu_kernel] First use of ESIMD rotary_emb with shape %s", x.shape)
++
++    # Extract cos/sin from rotation matrix pe, truncated to actual seq_len S
++    # pe[..., 0, 0] = cos, pe[..., 1, 0] = sin
++    cos_cache = freqs_cis[0, 0, :S, :, 0, 0].to(dtype=torch.float32).contiguous()  # [S, D/2]
++    sin_cache = freqs_cis[0, 0, :S, :, 1, 0].to(dtype=torch.float32).contiguous()  # [S, D/2]
++
++    # Reshape: [B, H, S, D] -> [B, S, H, D] -> [B*S*H, D]
++    x_flat = x.permute(0, 2, 1, 3).contiguous().reshape(B * S * H, D)
++
++    out = _omni_rotary.rotary_emb(x_flat, cos_cache, sin_cache, S, H)
++
++    # Reshape back: [B*S*H, D] -> [B, S, H, D] -> [B, H, S, D]
++    return out.reshape(B, S, H, D).permute(0, 2, 1, 3).contiguous()
++
+ 
+ def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor, mask=None, transformer_options={}) -> Tensor:
+     if pe is not None:
+@@ -30,6 +86,9 @@ def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
+ 
+ 
+ def _apply_rope1(x: Tensor, freqs_cis: Tensor):
++    if _can_use_omni_rope(x) and x.ndim == 4 and freqs_cis.ndim == 6:
++        return _omni_apply_rope1(x, freqs_cis)
++
+     x_ = x.to(dtype=freqs_cis.dtype).reshape(*x.shape[:-1], -1, 1, 2)
+     if x_.shape[2] != 1 and freqs_cis.shape[2] != 1 and x_.shape[2] != freqs_cis.shape[2]:
+         freqs_cis = freqs_cis[:, :, :x_.shape[2]]
+@@ -56,8 +115,9 @@ try:
+     def apply_rope1(x, freqs_cis):
+         if comfy.model_management.in_training:
+             return _apply_rope1(x, freqs_cis)
+-        else:
+-            return q_apply_rope1(x, freqs_cis)
++        if _can_use_omni_rope(x) and x.ndim == 4 and freqs_cis.ndim == 6:
++            return _omni_apply_rope1(x, freqs_cis)
++        return q_apply_rope1(x, freqs_cis)
+ except:
+     logging.warning("No comfy kitchen, using old apply_rope functions.")
+     apply_rope = _apply_rope
+diff --git a/comfy/ldm/modules/attention.py b/comfy/ldm/modules/attention.py
+index b193fe5e..aebc929e 100644
+--- a/comfy/ldm/modules/attention.py
++++ b/comfy/ldm/modules/attention.py
+@@ -720,6 +720,133 @@ def attention_flash(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
+     return out
+ 
+ 
++# ESIMD Flash Attention — controlled by COMFYUI_ESIMD_SDP env var (default: enabled)
++# Set COMFYUI_ESIMD_SDP=0 to disable ESIMD and use PyTorch SDPA instead.
++import os as _os
++
++ESIMD_SDP_IS_AVAILABLE = False
++_esimd_sdp_enabled = _os.environ.get("COMFYUI_ESIMD_SDP", "1") != "0"
++
++if _esimd_sdp_enabled:
++    try:
++        from omni_xpu_kernel._C import sdp as _esimd_sdp
++        ESIMD_SDP_IS_AVAILABLE = True
++        logging.info("ESIMD Flash Attention kernel loaded from omni_xpu_kernel")
++    except ImportError:
++        logging.info("omni_xpu_kernel not available, ESIMD SDP disabled")
++else:
++    logging.info("ESIMD SDP disabled via COMFYUI_ESIMD_SDP=0")
++
++_esimd_call_count = 0
++_esimd_fallback_count = 0
++_esimd_fallback_reasons = {}
++
++def esimd_sdp_stats():
++    """Print ESIMD SDP usage statistics."""
++    total = _esimd_call_count + _esimd_fallback_count
++    if total == 0:
++        return {"esimd": 0, "fallback": 0, "reasons": {}}
++    logging.info(f"[ESIMD SDP Stats] total={total}, esimd={_esimd_call_count} "
++                 f"({_esimd_call_count*100//max(total,1)}%), fallback={_esimd_fallback_count}")
++    if _esimd_fallback_reasons:
++        for reason, count in sorted(_esimd_fallback_reasons.items(), key=lambda x: -x[1]):
++            logging.info(f"  {reason}: {count}")
++    return {"esimd": _esimd_call_count, "fallback": _esimd_fallback_count, "reasons": dict(_esimd_fallback_reasons)}
++
++@wrap_attn
++def attention_esimd(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
++    """
++    ESIMD Flash Attention for Intel XPU (Xe2 ISA).
++
++    Uses pre-compiled ESIMD kernel (lgrf_sdp.so) with automatic PyTorch SDPA fallback.
++    The kernel includes per-head V-scaling (prevents fp16 accumulator overflow) and
++    fp32 online-softmax compensation (prevents compensation overflow).
++
++    Control:
++      COMFYUI_ESIMD_SDP=0  — disable ESIMD, use PyTorch SDPA
++      COMFYUI_ESIMD_SDP=1  — enable ESIMD (default)
++
++    Fallback to PyTorch SDPA when:
++      - B != 1, head_dim != 128, mask != None, device != XPU, dtype not fp16/bf16
++      - Kernel output contains non-finite values (safety net)
++    """
++    global _esimd_call_count, _esimd_fallback_count
++
++    if skip_reshape:
++        b, _, _, dim_head = q.shape
++    else:
++        b, _, dim_head = q.shape
++        dim_head //= heads
++
++    # Shape/dtype constraint check — fallback with reason logging
++    reasons = []
++    if not ESIMD_SDP_IS_AVAILABLE:
++        reasons.append("kernel_unavailable")
++    if b != 1:
++        reasons.append(f"batch={b}")
++    if mask is not None:
++        reasons.append(f"mask={mask.shape}")
++    if dim_head not in (64, 128):
++        reasons.append(f"dim_head={dim_head}")
++    if q.device.type != "xpu":
++        reasons.append(f"device={q.device.type}")
++    if q.dtype not in (torch.float16, torch.bfloat16):
++        reasons.append(f"dtype={q.dtype}")
++
++    if reasons:
++        _esimd_fallback_count += 1
++        reason_key = ",".join(reasons)
++        _esimd_fallback_reasons[reason_key] = _esimd_fallback_reasons.get(reason_key, 0) + 1
++        if _esimd_fallback_count <= 5:
++            seq_len = q.shape[1] if not skip_reshape else q.shape[2]
++            logging.info(f"[ESIMD SDP] fallback: {reason_key} (seq={seq_len}, heads={heads})")
++        elif _esimd_fallback_count == 6:
++            logging.info("[ESIMD SDP] suppressing further fallback logs")
++        return attention_pytorch(q, k, v, heads, mask=mask, attn_precision=attn_precision,
++                                 skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
++
++    _esimd_call_count += 1
++    if _esimd_call_count <= 3:
++        seq_len = q.shape[1] if not skip_reshape else q.shape[2]
++        logging.info(f"[ESIMD SDP] call #{_esimd_call_count}: heads={heads}, seq={seq_len}, "
++                     f"dtype={q.dtype}, shape={list(q.shape)}")
++
++    # Reshape to [B, L, H, D] for ESIMD kernel
++    if skip_reshape:
++        q_blhd = q.permute(0, 2, 1, 3).contiguous()
++        k_blhd = k.permute(0, 2, 1, 3).contiguous()
++        v_blhd = v.permute(0, 2, 1, 3).contiguous()
++    else:
++        q_blhd = q.view(b, -1, heads, dim_head).contiguous()
++        k_blhd = k.view(b, -1, heads, dim_head).contiguous()
++        v_blhd = v.view(b, -1, heads, dim_head).contiguous()
++
++    # Kernel handles per-head V-scaling internally (C++ sdp.cpp)
++    out = _esimd_sdp.sdp(q_blhd, k_blhd, v_blhd)
++
++    # ── Non-finite detection ─────────────────────────────────────────────────
++    # BF16 models: S×V uses bf16 DPAS with bf16 accumulator (range ±3.39e38),
++    #   so overflow is impossible. No check needed.
++    # FP16 models: S×V uses fp16 accumulator (range ±65504) which can overflow
++    #   for large V values. Full tensor NaN check via (out != out).any().
++    if q.dtype == torch.float16 and (out != out).any():
++        _esimd_fallback_count += 1
++        _esimd_fallback_reasons["output_non_finite"] = _esimd_fallback_reasons.get("output_non_finite", 0) + 1
++        bad_count = _esimd_fallback_reasons["output_non_finite"]
++        if bad_count <= 3:
++            logging.warning(f"[ESIMD SDP] FP16 overflow detected (call #{_esimd_call_count}), "
++                          f"falling back to PyTorch SDPA")
++        elif bad_count == 4:
++            logging.warning("[ESIMD SDP] Sustained non-finite output, suppressing further warnings")
++        return attention_pytorch(q, k, v, heads, mask=mask, attn_precision=attn_precision,
++                                 skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
++
++    if skip_output_reshape:
++        return out.permute(0, 2, 1, 3)
++    else:
++        return out.reshape(b, -1, heads * dim_head)
++
++
+ optimized_attention = attention_basic
+ 
+ if model_management.sage_attention_enabled():
+@@ -732,8 +859,13 @@ elif model_management.flash_attention_enabled():
+     logging.info("Using Flash Attention")
+     optimized_attention = attention_flash
+ elif model_management.pytorch_attention_enabled():
+-    logging.info("Using pytorch attention")
+-    optimized_attention = attention_pytorch
++    if ESIMD_SDP_IS_AVAILABLE:
++        logging.info("Using ESIMD Flash Attention (with pytorch fallback)")
++        logging.info("  Control: set COMFYUI_ESIMD_SDP=0 to disable")
++        optimized_attention = attention_esimd
++    else:
++        logging.info("Using pytorch attention")
++        optimized_attention = attention_pytorch
+ else:
+     if args.use_split_cross_attention:
+         logging.info("Using split optimization for attention")
 diff --git a/comfy/model_management.py b/comfy/model_management.py
-index 1fe56a62..8f862fc7 100644
+index 3b39d608..bc237062 100644
 --- a/comfy/model_management.py
 +++ b/comfy/model_management.py
-@@ -162,6 +162,90 @@ def is_intel_xpu():
+@@ -160,6 +160,91 @@ def is_intel_xpu():
              return True
      return False
  
@@ -124,6 +367,340 @@ index 1fe56a62..8f862fc7 100644
 +
 +
 +    patch_xpu_interpolate_to_cpu()
++
  def is_ascend_npu():
      global npu_available
      if npu_available:
+diff --git a/comfy/ops.py b/comfy/ops.py
+index 7a9b4b84..1a02c4dd 100644
+--- a/comfy/ops.py
++++ b/comfy/ops.py
+@@ -16,6 +16,7 @@
+     along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ """
+ 
++import os
+ import torch
+ import logging
+ import comfy.model_management
+@@ -29,6 +30,45 @@ import comfy.utils
+ import comfy_aimdo.model_vbar
+ import comfy_aimdo.torch
+ 
++log = logging.getLogger(__name__)
++
++# ---------- omni_xpu_kernel accelerated norm ops ----------
++# Control via env var: OMNI_XPU_KERNEL_DISABLE=1 to disable (default: enabled)
++_omni_norm = None
++_omni_disabled_by_env = os.environ.get("OMNI_XPU_KERNEL_DISABLE", "0") == "1"
++_omni_ops_logged_first_use = False
++
++if _omni_disabled_by_env:
++    log.info("[omni_xpu_kernel] Disabled by environment variable OMNI_XPU_KERNEL_DISABLE=1")
++else:
++    try:
++        from omni_xpu_kernel import norm as _omni_norm
++        log.info("[omni_xpu_kernel] Loaded successfully — accelerated LayerNorm/RMSNorm enabled in ops")
++    except ImportError:
++        log.info("[omni_xpu_kernel] Not installed — using PyTorch native norm ops")
++
++
++def _can_use_omni(x):
++    """Check if input is eligible for omni_xpu_kernel norm acceleration."""
++    if _omni_norm is None:
++        return False
++    if not x.is_xpu:
++        return False
++    if x.ndim < 2:
++        return False
++    hidden_size = x.shape[-1]
++    if hidden_size > 8192 or hidden_size % 32 != 0:
++        return False
++    return True
++
++
++def _log_omni_first_use(op_name, shape):
++    """Log once when omni kernel is first used at runtime."""
++    global _omni_ops_logged_first_use
++    if not _omni_ops_logged_first_use:
++        _omni_ops_logged_first_use = True
++        log.info("[omni_xpu_kernel] First use in ops: %s with shape %s", op_name, shape)
++
+ def run_every_op():
+     if torch.compiler.is_compiling():
+         return
+@@ -483,7 +523,14 @@ class disable_weight_init:
+                 weight = None
+                 bias = None
+                 offload_stream = None
+-            x = torch.nn.functional.layer_norm(input, self.normalized_shape, weight, bias, self.eps)
++            if (_can_use_omni(input) and len(self.normalized_shape) == 1
++                    and (weight is None or weight.shape[0] == input.shape[-1])):
++                _log_omni_first_use("LayerNorm", input.shape)
++                orig_shape = input.shape
++                x_2d = input.reshape(-1, orig_shape[-1])
++                x = _omni_norm.layer_norm(x_2d, weight, bias, self.eps).reshape(orig_shape)
++            else:
++                x = torch.nn.functional.layer_norm(input, self.normalized_shape, weight, bias, self.eps)
+             uncast_bias_weight(self, weight, bias, offload_stream)
+             return x
+ 
+@@ -492,6 +539,15 @@ class disable_weight_init:
+             if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
+                 return self.forward_comfy_cast_weights(*args, **kwargs)
+             else:
++                input = args[0] if args else kwargs.get('input')
++                if (input is not None and _can_use_omni(input) and len(self.normalized_shape) == 1
++                        and (self.weight is None or self.weight.shape[0] == input.shape[-1])):
++                    _log_omni_first_use("LayerNorm", input.shape)
++                    orig_shape = input.shape
++                    x_2d = input.reshape(-1, orig_shape[-1])
++                    weight = self.weight
++                    bias = self.bias
++                    return _omni_norm.layer_norm(x_2d, weight, bias, self.eps).reshape(orig_shape)
+                 return super().forward(*args, **kwargs)
+ 
+     class RMSNorm(torch.nn.RMSNorm, CastWeightBiasOp):
+@@ -506,7 +562,14 @@ class disable_weight_init:
+                 weight = None
+                 bias = None
+                 offload_stream = None
+-            x = torch.nn.functional.rms_norm(input, self.normalized_shape, weight, self.eps)
++            if _can_use_omni(input) and weight is not None and weight.shape[0] == input.shape[-1]:
++                _log_omni_first_use("RMSNorm", input.shape)
++                orig_shape = input.shape
++                x_2d = input.reshape(-1, orig_shape[-1])
++                eps = self.eps if self.eps is not None else 1e-6
++                x = _omni_norm.rms_norm(weight, x_2d, eps).reshape(orig_shape)
++            else:
++                x = torch.nn.functional.rms_norm(input, self.normalized_shape, weight, self.eps)
+             uncast_bias_weight(self, weight, bias, offload_stream)
+             return x
+ 
+@@ -515,6 +578,13 @@ class disable_weight_init:
+             if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
+                 return self.forward_comfy_cast_weights(*args, **kwargs)
+             else:
++                input = args[0] if args else kwargs.get('input')
++                if input is not None and _can_use_omni(input) and self.weight is not None and self.weight.shape[0] == input.shape[-1]:
++                    _log_omni_first_use("RMSNorm", input.shape)
++                    orig_shape = input.shape
++                    x_2d = input.reshape(-1, orig_shape[-1])
++                    eps = self.eps if self.eps is not None else 1e-6
++                    return _omni_norm.rms_norm(self.weight, x_2d, eps).reshape(orig_shape)
+                 return super().forward(*args, **kwargs)
+ 
+     class ConvTranspose2d(torch.nn.ConvTranspose2d, CastWeightBiasOp):
+@@ -678,13 +748,31 @@ class manual_cast(disable_weight_init):
+         comfy_cast_weights = True
+ 
+ 
++# ---------- omni_xpu_kernel FP8 GEMM acceleration ----------
++# Uses oneDNN W8A16 FP8 GEMM when available on XPU. Supports E4M3 and E5M2 weight formats.
++# Set COMFYUI_FP8_GEMM=0 to disable and use the original QuantizedTensor dispatch path.
++_omni_fp8_linear = None
++_omni_fp8_logged_first_use = False
++_omni_fp8_enabled = os.environ.get("COMFYUI_FP8_GEMM", "1") != "0"
++if _omni_fp8_enabled:
++    try:
++        from omni_xpu_kernel import linear as _omni_linear_mod
++        _omni_fp8_linear = _omni_linear_mod.onednn_w8a16_fp8
++        log.info("[omni_xpu_kernel] FP8 GEMM (oneDNN W8A16) loaded — accelerated FP8 linear enabled")
++        log.info("  Control: set COMFYUI_FP8_GEMM=0 to disable")
++    except ImportError:
++        pass
++else:
++    log.info("omni_xpu_kernel FP8 GEMM disabled via COMFYUI_FP8_GEMM=0")
++
+ def fp8_linear(self, input):
+     """
+-    Legacy FP8 linear function for backward compatibility.
+-    Uses QuantizedTensor subclass for dispatch.
++    FP8 linear function. Uses omni_xpu_kernel oneDNN W8A16 when available on XPU,
++    falls back to original QuantizedTensor dispatch otherwise.
++    Supports float8_e4m3fn and float8_e5m2 weight dtypes.
+     """
+     dtype = self.weight.dtype
+-    if dtype not in [torch.float8_e4m3fn]:
++    if dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
+         return None
+ 
+     input_dtype = input.dtype
+@@ -696,10 +784,28 @@ def fp8_linear(self, input):
+ 
+     if input.ndim != 2:
+         return None
+-    lora_compute_dtype=comfy.model_management.lora_compute_dtype(input.device)
++
++    lora_compute_dtype = comfy.model_management.lora_compute_dtype(input.device)
+     w, bias, offload_stream = cast_bias_weight(self, input, dtype=dtype, bias_dtype=input_dtype, offloadable=True, compute_dtype=lora_compute_dtype, want_requant=True)
+-    scale_weight = torch.ones((), device=input.device, dtype=torch.float32)
+ 
++    # --- omni_xpu_kernel oneDNN FP8 GEMM (fast path for XPU) ---
++    if _omni_fp8_linear is not None and input.is_xpu:
++        global _omni_fp8_logged_first_use
++        if not _omni_fp8_logged_first_use:
++            _omni_fp8_logged_first_use = True
++            log.info(f"[omni_xpu_kernel] First use of FP8 GEMM: input={list(input.shape)} weight={list(w.shape)} dtype={dtype}")
++        scale_weight = self.scale_weight if hasattr(self, 'scale_weight') and self.scale_weight is not None else torch.ones((), device=input.device, dtype=torch.float32)
++        try:
++            o = _omni_fp8_linear(input, w, scale_weight, bias)
++            uncast_bias_weight(self, w, bias, offload_stream)
++            if tensor_3d:
++                o = o.reshape((input_shape[0], input_shape[1], w.shape[0]))
++            return o
++        except Exception as e:
++            log.info(f"[omni_xpu_kernel] FP8 GEMM failed, falling back: {e}")
++
++    # --- Original path: QuantizedTensor dispatch (kept for non-XPU and fallback) ---
++    scale_weight = torch.ones((), device=input.device, dtype=torch.float32)
+     scale_input = torch.ones((), device=input.device, dtype=torch.float32)
+     input = torch.clamp(input, min=-448, max=448, out=input)
+     input_fp8 = input.to(dtype).contiguous()
+@@ -1056,6 +1162,27 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
+                 return sd
+ 
+             def _forward(self, input, weight, bias):
++                # omni_xpu_kernel FP8 GEMM fast path: intercept when raw FP8 weight is available
++                # After cast_bias_weight(), FP8 QuantizedTensor may be dequantized or remain FP8.
++                # Check the actual tensor dtype to decide.
++                if (_omni_fp8_linear is not None and input.is_xpu and input.ndim == 2 and
++                    hasattr(weight, 'dtype') and weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)):
++                    global _omni_fp8_logged_first_use
++                    if not _omni_fp8_logged_first_use:
++                        _omni_fp8_logged_first_use = True
++                        log.info(f"[omni_xpu_kernel] First use of FP8 GEMM: input={list(input.shape)} "
++                                 f"weight={list(weight.shape)} dtype={weight.dtype}")
++                    try:
++                        scale_w = getattr(self, 'scale_weight', None)
++                        if scale_w is None:
++                            p = getattr(self.weight, 'params', None) or getattr(self.weight, '_layout_params', None)
++                            scale_w = getattr(p, 'scale', None) if p else None
++                        if scale_w is None:
++                            scale_w = torch.ones((), device=input.device, dtype=torch.float32)
++                        return _omni_fp8_linear(input, weight, scale_w, bias)
++                    except Exception as e:
++                        log.info(f"[omni_xpu_kernel] FP8 GEMM failed in MixedPrecisionOps, falling back: {e}")
++                # Original path: F.linear (QuantizedTensor dispatch or native)
+                 return torch.nn.functional.linear(input, weight, bias)
+ 
+             def forward_comfy_cast_weights(self, input, compute_dtype=None, want_requant=False):
+@@ -1067,6 +1194,53 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
+             def forward(self, input, *args, **kwargs):
+                 run_every_op()
+ 
++                # --- omni_xpu_kernel FP8 GEMM fast path for XPU ---
++                # Intercept before comfy_kitchen QuantizedTensor dispatch.
++                # On XPU with FP8 weights, directly call oneDNN W8A16 GEMM.
++                # The weight is stored as QuantizedTensor wrapping FP8 data.
++                # We extract the raw FP8 tensor via _qdata.
++                if (_omni_fp8_linear is not None and input.is_xpu and
++                    getattr(self, 'quant_format', None) in ('float8_e4m3fn', 'float8_e5m2') and
++                    len(self.weight_function) == 0 and len(self.bias_function) == 0):
++                    global _omni_fp8_logged_first_use
++                    input_shape = input.shape
++                    input_2d = input.reshape(-1, input_shape[-1]) if input.ndim == 3 else input
++                    if input_2d.ndim == 2:
++                        try:
++                            # Extract raw FP8 weight from QuantizedTensor
++                            w = self.weight
++                            fp8_dtype = torch.float8_e4m3fn if self.quant_format == 'float8_e4m3fn' else torch.float8_e5m2
++                            if isinstance(w, QuantizedTensor):
++                                # QuantizedTensor._qdata is the underlying FP8 storage.
++                                # Do NOT use w.view(fp8_dtype) — that reinterprets the
++                                # logical dtype (bf16/fp16, 2 bytes) as fp8 (1 byte),
++                                # doubling the K dimension.
++                                w_fp8 = w._qdata
++                                scale_w = getattr(w.params, 'scale', None)
++                            else:
++                                w_fp8 = w if w.dtype == fp8_dtype else w.view(fp8_dtype)
++                                scale_w = getattr(self, 'scale_weight', None)
++                            if scale_w is None:
++                                scale_w = torch.ones((), device=input.device, dtype=torch.float32)
++                            scale_w = comfy.model_management.cast_to_device(scale_w, input.device, torch.float32)
++                            w_fp8 = comfy.model_management.cast_to_device(w_fp8, input.device, None)
++                            bias = comfy.model_management.cast_to_device(self.bias, input.device, input.dtype) if self.bias is not None else None
++
++                            if not _omni_fp8_logged_first_use:
++                                _omni_fp8_logged_first_use = True
++                                log.info(f"[omni_xpu_kernel] First use of FP8 GEMM: input={list(input_2d.shape)} "
++                                         f"weight={list(w_fp8.shape)} dtype={w_fp8.dtype} format={self.quant_format}")
++
++                            o = _omni_fp8_linear(input_2d, w_fp8, scale_w, bias)
++                            if input.ndim == 3:
++                                o = o.reshape(input_shape[0], input_shape[1], -1)
++                            return o
++                        except Exception as e:
++                            if not _omni_fp8_logged_first_use:
++                                _omni_fp8_logged_first_use = True
++                                log.info(f"[omni_xpu_kernel] FP8 GEMM failed, using comfy_kitchen path: {e}")
++
++                # --- Original comfy_kitchen path ---
+                 input_shape = input.shape
+                 reshaped_3d = False
+                 #If cast needs to apply lora, it should be done in the compute dtype
+diff --git a/comfy/rmsnorm.py b/comfy/rmsnorm.py
+index ab7cf14f..91f46d15 100644
+--- a/comfy/rmsnorm.py
++++ b/comfy/rmsnorm.py
+@@ -1,9 +1,60 @@
++import os
+ import torch
++import logging
+ import comfy.model_management
+ 
+ RMSNorm = torch.nn.RMSNorm
+ 
++log = logging.getLogger(__name__)
++
++# ---------- omni_xpu_kernel accelerated RMSNorm ----------
++# Control via env var: OMNI_XPU_KERNEL_DISABLE=1 to disable (default: enabled)
++_omni_norm = None
++_omni_disabled_by_env = os.environ.get("OMNI_XPU_KERNEL_DISABLE", "0") == "1"
++_omni_rmsnorm_logged_first_use = False
++
++if _omni_disabled_by_env:
++    log.info("[omni_xpu_kernel] Disabled by environment variable OMNI_XPU_KERNEL_DISABLE=1")
++else:
++    try:
++        from omni_xpu_kernel import norm as _omni_norm
++        log.info("[omni_xpu_kernel] Loaded successfully — accelerated functional RMSNorm enabled")
++    except ImportError:
++        log.info("[omni_xpu_kernel] Not installed — using PyTorch native RMSNorm")
++
++
++def _can_use_omni_rms(x):
++    """Check if input is eligible for omni_xpu_kernel acceleration."""
++    if _omni_norm is None:
++        return False
++    if not x.is_xpu:
++        return False
++    if x.ndim < 2:
++        return False
++    hidden_size = x.shape[-1]
++    if hidden_size > 8192 or hidden_size % 32 != 0:
++        return False
++    return True
++
++
+ def rms_norm(x, weight=None, eps=1e-6):
++    if _can_use_omni_rms(x):
++        global _omni_rmsnorm_logged_first_use
++        if not _omni_rmsnorm_logged_first_use:
++            _omni_rmsnorm_logged_first_use = True
++            log.info("[omni_xpu_kernel] First use in rmsnorm: functional rms_norm with shape %s", x.shape)
++        orig_shape = x.shape
++        x_2d = x.reshape(-1, orig_shape[-1])
++        if weight is not None:
++            w = comfy.model_management.cast_to(weight, dtype=x.dtype, device=x.device)
++            out = _omni_norm.rms_norm(w, x_2d, eps)
++        else:
++            # omni rms_norm requires weight; create ones
++            w = torch.ones(orig_shape[-1], dtype=x.dtype, device=x.device)
++            out = _omni_norm.rms_norm(w, x_2d, eps)
++        return out.reshape(orig_shape)
++
++    # Fallback to PyTorch
+     if weight is None:
+         return torch.nn.functional.rms_norm(x, (x.shape[-1],), eps=eps)
+     else:
