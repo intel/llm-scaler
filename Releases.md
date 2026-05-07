@@ -27,9 +27,10 @@
 ## llm-scaler-omni
 
 ### Latest Release 
-* [`intel/llm-scaler-omni:0.1.0-b6`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b6/images/sha256-fcf14ab440bc8a9b0903ffdb2f9ec6b678ba6d0c5b8217a6e749bacb8ea5fc87) [03/2026]
+* [`intel/llm-scaler-omni:0.1.0-b7`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b7/images/sha256-0cda2f6c8666027aa64aaa6ce0bd8d6081a043ce046b65e2a28a5b5db2d85f61) [05/2026]
 
 ### Previous Releases
+* [`intel/llm-scaler-omni:0.1.0-b6`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b6/images/sha256-fcf14ab440bc8a9b0903ffdb2f9ec6b678ba6d0c5b8217a6e749bacb8ea5fc87) [03/2026]
 * [`intel/llm-scaler-omni:0.1.0-b5`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b5/images/sha256-3e3347fa47d93b0f7b22c07d45fd19dec46aa08e93e00d45c8181765f5e02433) [01/2026]
 * [`intel/llm-scaler-omni:0.1.0-b4`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b4/images/sha256-0ebf4061275252042ae12578fb0d355be90cbec853d6fe45bfb625f0df9187e8) [12/2025]
 * [`intel/llm-scaler-omni:0.1.0-b3`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b3/images/sha256-33dbd41ba036b9113ec9fe43fbd541a525c0ecd5073d858a2570515700806f16) [11/2025]
