@@ -1080,7 +1080,7 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | Qwen/Qwen3-Next-80B-A3B                    |  ✅  |         ✅         |                      |       |                           |
 | Qwen/Qwen3-235B-A22B                       |      |         ✅         |                      |       |                           |
 | Qwen/Qwen3-Coder-30B-A3B-Instruct          |  ✅  |         ✅         |          ✅          |       |                           |
-| Qwen/Qwen3-Coder-Next                      |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3-Coder-Next                      |  ✅  |         ✅         |                    |       |                           |
 | Qwen/Qwen3.5-27B                           |  ✅  |         ✅         |          ✅          |       |                           |
 | Qwen/Qwen3.5-35B-A3B                       |  ✅  |         ✅         |          ✅          |       |                           |
 | Qwen/Qwen3.5-122B-A10B                     |      |         ✅         |          ✅          |       |                           |
