@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ======== Base Stage ========
-FROM intel/llm-scaler-platform:26.13.7.1 AS vllm-base
+FROM intel/llm-scaler-platform:26.18.8.2 AS vllm-base
 
 ARG https_proxy
 ARG http_proxy
@@ -110,11 +110,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install git+https://github.com/huggingface/transformers.git && \
     pip install ijson
 
+COPY ./patches/vllm_xpu_kernels.patch /tmp/
+
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm && \
     git clone https://github.com/vllm-project/vllm-xpu-kernels.git && \
     cd vllm-xpu-kernels && \
     git checkout c968ba9 && \
+    git apply /tmp/vllm_xpu_kernels.patch && \
     sed -i 's|^--extra-index-url=https://download.pytorch.org/whl/xpu|# --extra-index-url=https://download.pytorch.org/whl/xpu|' requirements.txt && \
     sed -i '/^torch==/s/^/# /' requirements.txt && \
     sed -i 's|^triton-xpu|# triton-xpu|' requirements.txt && \
