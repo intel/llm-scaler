@@ -1095,84 +1095,87 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 ## 3. Supported Models
 
 
-| Category             | Model Name                                 | FP16 | Dynamic Online FP8 | Dynamic Online Int4 | MXFP4 | Notes                     |
-|----------------------|--------------------------------------------|------|--------------------|----------------------|-------|---------------------------|
-| Language Model       | openai/gpt-oss-20b                         |      |                    |                      |   ✅   |                           |
-| Language Model       | openai/gpt-oss-120b                        |      |                    |                      |   ✅   |                           |
-| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B  |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Qwen-7B    |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Llama-8B   |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Qwen-14B   |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Qwen-32B   |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | deepseek-ai/DeepSeek-R1-Distill-Llama-70B  |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | deepseek-ai/DeepSeek-R1-0528-Qwen3-8B      |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | deepseek-ai/DeepSeek-V2-Lite               |  ✅  |         ✅         |                      |       | export VLLM_MLA_DISABLE=1 |
-| Language Model       | deepseek-ai/deepseek-coder-33b-instruct    |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | Qwen/Qwen3-8B                              |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | Qwen/Qwen3-14B                             |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | Qwen/Qwen3-32B                             |  ✅  |         ✅         |          ✅          |       |                           |
-| Language MOE Model   | Qwen/Qwen3-30B-A3B                         |  ✅  |         ✅         |          ✅          |       |                           |
-| Language MOE Model   | Qwen/Qwen3-Next-80B-A3B                    |  ✅  |         ✅         |                      |       |                           |
-| Language MOE Model   | Qwen/Qwen3-235B-A22B                       |      |         ✅         |                      |       |                           |
-| Language MOE Model   | Qwen/Qwen3-Coder-30B-A3B-Instruct          |  ✅  |         ✅         |          ✅          |       |                           |
-| Language MOE Model   | Qwen/Qwen3-Coder-Next                      |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | Qwen/QwQ-32B                               |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | mistralai/Ministral-8B-Instruct-2410       |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | mistralai/Mixtral-8x7B-Instruct-v0.1       |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | meta-llama/Llama-3.1-8B                    |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | meta-llama/Llama-3.1-70B                   |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | baichuan-inc/Baichuan2-7B-Chat             |  ✅  |         ✅         |          ✅          |       | with chat_template        |
-| Language Model       | baichuan-inc/Baichuan2-13B-Chat            |  ✅  |         ✅         |          ✅          |       | with chat_template        |
-| Language Model       | THUDM/CodeGeex4-All-9B                     |  ✅  |         ✅         |          ✅          |       | with chat_template        |
-| Language Model       | zai-org/GLM-4-9B-0414                      |      |         ✅        |                      |       | use bfloat16 |
-| Language Model       | zai-org/GLM-4-32B-0414                     |      |         ✅        |                      |       | use bfloat16 |
-| Language MOE Model   | zai-org/GLM-4.5-Air                        |  ✅  |         ✅         |                      |       |                           |
-| Language MOE Model   | zai-org/GLM-4.7-Flash                      |  ✅  |         ✅         |                      |       |                           |
-| Language Model       | ByteDance-Seed/Seed-OSS-36B-Instruct       |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | miromind-ai/MiroThinker-v1.5-30B           |  ✅  |         ✅         |          ✅          |       |                           |
-| Language Model       | tencent/Hunyuan-0.5B-Instruct              |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](#31-how-to-use-hunyuan-7b-instruct)   |
-| Language Model       | tencent/Hunyuan-7B-Instruct                |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](#31-how-to-use-hunyuan-7b-instruct)   |
-| Multimodal Model     | Qwen/Qwen2-VL-7B-Instruct                  |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | Qwen/Qwen2.5-VL-7B-Instruct                |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | Qwen/Qwen2.5-VL-32B-Instruct               |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | Qwen/Qwen2.5-VL-72B-Instruct               |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | Qwen/Qwen3-VL-4B-Instruct                  |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | Qwen/Qwen3-VL-8B-Instruct                  |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal MOE Model | Qwen/Qwen3-VL-30B-A3B-Instruct             |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | openbmb/MiniCPM-V-2_6                      |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | openbmb/MiniCPM-V-4                        |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | openbmb/MiniCPM-V-4_5                      |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | OpenGVLab/InternVL2-8B                     |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | OpenGVLab/InternVL3-8B                     |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | OpenGVLab/InternVL3_5-8B                   |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal MOE Model | OpenGVLab/InternVL3_5-30B-A3B              |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | rednote-hilab/dots.ocr                     |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | ByteDance-Seed/UI-TARS-7B-DPO              |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | google/gemma-3-12b-it                      |      |         ✅         |                      |       |  use bfloat16  |
-| Multimodal Model     | google/gemma-3-27b-it                      |      |         ✅         |                      |       |  use bfloat16  |
-| Multimodal Model     | THUDM/GLM-4v-9B                            |  ✅  |         ✅         |          ✅         |       |  with --hf-overrides and chat_template  |
-| Multimodal Model     | zai-org/GLM-4.1V-9B-Base                   |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | zai-org/GLM-4.1V-9B-Thinking               |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | zai-org/Glyph                              |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | opendatalab/MinerU2.5-2509-1.2B            |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | baidu/ERNIE-4.5-VL-28B-A3B-Thinking        |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | zai-org/GLM-4.6V-Flash                     |  ✅  |         ✅         |          ✅          |       |   pip install transformers==5.0.0rc0 first            |
-| Multimodal Model     | PaddlePaddle/PaddleOCR-VL                  |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](OCR/README.md#3-paddler-ocr-support)     |
-| Multimodal Model     | deepseek-ai/DeepSeek-OCR                   |  ✅  |         ✅         |          ✅          |       |                           |
-| Multimodal Model     | deepseek-ai/DeepSeek-OCR-2                 |  ✅  |         ✅         |          ✅          |       |  There may be accuracy issues when using `--quantization fp8`             |
-| Multimodal Model     | moonshotai/Kimi-VL-A3B-Thinking-2506       |  ✅  |         ✅         |          ✅          |       |                           |
-| omni                 | Qwen/Qwen2.5-Omni-7B                       |  ✅  |         ✅         |          ✅          |       |                           |
-| omni                 | Qwen/Qwen3-Omni-30B-A3B-Instruct           |  ✅  |         ✅         |          ✅          |       |                           |
-| audio                | openai/whisper-medium                      |  ✅  |         ✅         |          ✅          |       |                           |
-| audio                | openai/whisper-large-v3                    |  ✅  |         ✅         |          ✅          |       |                           |
-| Embedding Model      | Qwen/Qwen3-Embedding-8B                    |  ✅  |         ✅         |          ✅          |       |                           |
-| VL Embedding Model   | Qwen3-VL-Embedding-2B/8B                   |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](https://github.com/vllm-project/vllm/blob/2f4226fe5280b60c47b4f6f01d9b18ac9cda2038/examples/pooling/embed/vision_embedding_online.py)                    |
-| Embedding Model      | BAAI/bge-m3                                |  ✅  |         ✅         |          ✅          |       |                           |
-| Embedding Model      | BAAI/bge-large-en-v1.5                     |  ✅  |         ✅         |          ✅          |       |                           |
-| Reranker Model       | Qwen/Qwen3-Reranker-8B                     |  ✅  |         ✅         |          ✅          |       |                           |
-| VL Reranker Model    | Qwen3-VL-Reranker-2B/8B                    |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](https://github.com/vllm-project/vllm/blob/2f4226fe5280b60c47b4f6f01d9b18ac9cda2038/examples/pooling/score/vision_rerank_api_online.py)                    |
-| Reranker Model       | BAAI/bge-reranker-large                    |  ✅  |         ✅         |          ✅          |       |                           |
-| Reranker Model       | BAAI/bge-reranker-v2-m3                    |  ✅  |         ✅         |          ✅          |       |                           |
+| Model Name                                 | FP16 | Dynamic Online FP8 | Dynamic Online Int4 | MXFP4 | Notes                     |
+|--------------------------------------------|------|--------------------|----------------------|-------|---------------------------|
+| openai/gpt-oss-20b                         |      |                    |                      |   ✅   |                           |
+| openai/gpt-oss-120b                        |      |                    |                      |   ✅   |                           |
+| deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B  |  ✅  |         ✅         |          ✅          |       |                           |
+| deepseek-ai/DeepSeek-R1-Distill-Qwen-7B    |  ✅  |         ✅         |          ✅          |       |                           |
+| deepseek-ai/DeepSeek-R1-Distill-Llama-8B   |  ✅  |         ✅         |          ✅          |       |                           |
+| deepseek-ai/DeepSeek-R1-Distill-Qwen-14B   |  ✅  |         ✅         |          ✅          |       |                           |
+| deepseek-ai/DeepSeek-R1-Distill-Qwen-32B   |  ✅  |         ✅         |          ✅          |       |                           |
+| deepseek-ai/DeepSeek-R1-Distill-Llama-70B  |  ✅  |         ✅         |          ✅          |       |                           |
+| deepseek-ai/DeepSeek-R1-0528-Qwen3-8B      |  ✅  |         ✅         |          ✅          |       |                           |
+| deepseek-ai/DeepSeek-V2-Lite               |  ✅  |         ✅         |                      |       | export VLLM_MLA_DISABLE=1 |
+| deepseek-ai/deepseek-coder-33b-instruct    |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3-8B                              |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3-14B                             |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3-32B                             |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3-30B-A3B                         |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3-Next-80B-A3B                    |  ✅  |         ✅         |                      |       |                           |
+| Qwen/Qwen3-235B-A22B                       |      |         ✅         |                      |       |                           |
+| Qwen/Qwen3-Coder-30B-A3B-Instruct          |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3-Coder-Next                      |  ✅  |         ✅         |                    |       |                           |
+| Qwen/Qwen3.5-27B                           |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3.5-35B-A3B                       |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3.5-122B-A10B                     |      |         ✅         |          ✅          |       |                           |
+| Qwen/QwQ-32B                               |  ✅  |         ✅         |          ✅          |       |                           |
+| mistralai/Ministral-8B-Instruct-2410       |  ✅  |         ✅         |          ✅          |       |                           |
+| mistralai/Mixtral-8x7B-Instruct-v0.1       |  ✅  |         ✅         |          ✅          |       |                           |
+| meta-llama/Llama-3.1-8B                    |  ✅  |         ✅         |          ✅          |       |                           |
+| meta-llama/Llama-3.1-70B                   |  ✅  |         ✅         |          ✅          |       |                           |
+| baichuan-inc/Baichuan2-7B-Chat             |  ✅  |         ✅         |          ✅          |       | with chat_template        |
+| baichuan-inc/Baichuan2-13B-Chat            |  ✅  |         ✅         |          ✅          |       | with chat_template        |
+| THUDM/CodeGeex4-All-9B                     |  ✅  |         ✅         |          ✅          |       | with chat_template        |
+| zai-org/GLM-4-9B-0414                      |      |         ✅        |                      |       | use bfloat16 |
+| zai-org/GLM-4-32B-0414                     |      |         ✅        |                      |       | use bfloat16 |
+| zai-org/GLM-4.5-Air                        |  ✅  |         ✅         |                      |       |                           |
+| zai-org/GLM-4.7-Flash                      |  ✅  |         ✅         |                      |       |                           |
+| ByteDance-Seed/Seed-OSS-36B-Instruct       |  ✅  |         ✅         |          ✅          |       |                           |
+| miromind-ai/MiroThinker-v1.5-30B           |  ✅  |         ✅         |          ✅          |       |                           |
+| tencent/Hunyuan-0.5B-Instruct              |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](#31-how-to-use-hunyuan-7b-instruct)   |
+| tencent/Hunyuan-7B-Instruct                |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](#31-how-to-use-hunyuan-7b-instruct)   |
+| Qwen/Qwen2-VL-7B-Instruct                  |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen2.5-VL-7B-Instruct                |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen2.5-VL-32B-Instruct               |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen2.5-VL-72B-Instruct               |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3-VL-4B-Instruct                  |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3-VL-8B-Instruct                  |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3-VL-30B-A3B-Instruct             |  ✅  |         ✅         |          ✅          |       |                           |
+| openbmb/MiniCPM-V-2_6                      |  ✅  |         ✅         |          ✅          |       |                           |
+| openbmb/MiniCPM-V-4                        |  ✅  |         ✅         |          ✅          |       |                           |
+| openbmb/MiniCPM-V-4_5                      |  ✅  |         ✅         |          ✅          |       |                           |
+| OpenGVLab/InternVL2-8B                     |  ✅  |         ✅         |          ✅          |       |                           |
+| OpenGVLab/InternVL3-8B                     |  ✅  |         ✅         |          ✅          |       |                           |
+| OpenGVLab/InternVL3_5-8B                   |  ✅  |         ✅         |          ✅          |       |                           |
+| OpenGVLab/InternVL3_5-30B-A3B              |  ✅  |         ✅         |          ✅          |       |                           |
+| rednote-hilab/dots.ocr                     |  ✅  |         ✅         |          ✅          |       |                           |
+| ByteDance-Seed/UI-TARS-7B-DPO              |  ✅  |         ✅         |          ✅          |       |                           |
+| google/gemma-3-12b-it                      |      |         ✅         |                      |       |  use bfloat16  |
+| google/gemma-3-27b-it                      |      |         ✅         |                      |       |  use bfloat16  |
+| THUDM/GLM-4v-9B                            |  ✅  |         ✅         |          ✅         |       |  with --hf-overrides and chat_template  |
+| zai-org/GLM-4.1V-9B-Base                   |  ✅  |         ✅         |          ✅          |       |                           |
+| zai-org/GLM-4.1V-9B-Thinking               |  ✅  |         ✅         |          ✅          |       |                           |
+| zai-org/Glyph                              |  ✅  |         ✅         |          ✅          |       |                           |
+| opendatalab/MinerU2.5-2509-1.2B            |  ✅  |         ✅         |          ✅          |       |                           |
+| baidu/ERNIE-4.5-VL-28B-A3B-Thinking        |  ✅  |         ✅         |          ✅          |       |                           |
+| zai-org/GLM-4.6V-Flash                     |  ✅  |         ✅         |          ✅          |       |   pip install transformers==5.0.0rc0 first            |
+| PaddlePaddle/PaddleOCR-VL                  |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](OCR/README.md#3-paddler-ocr-support)     |
+| deepseek-ai/DeepSeek-OCR                   |  ✅  |         ✅         |          ✅          |       |                           |
+| deepseek-ai/DeepSeek-OCR-2                 |  ✅  |         ✅         |          ✅          |       |  There may be accuracy issues when using `--quantization fp8`             |
+| moonshotai/Kimi-VL-A3B-Thinking-2506       |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen2.5-Omni-7B                       |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3-Omni-30B-A3B-Instruct           |  ✅  |         ✅         |          ✅          |       |                           |
+| openai/whisper-medium                      |  ✅  |         ✅         |          ✅          |       |                           |
+| openai/whisper-large-v3                    |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3-Embedding-8B                    |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen3-VL-Embedding-2B/8B                   |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](https://github.com/vllm-project/vllm/blob/2f4226fe5280b60c47b4f6f01d9b18ac9cda2038/examples/pooling/embed/vision_embedding_online.py)                    |
+| BAAI/bge-m3                                |  ✅  |         ✅         |          ✅          |       |                           |
+| BAAI/bge-large-en-v1.5                     |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3-Reranker-8B                     |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen3-VL-Reranker-2B/8B                    |  ✅  |         ✅         |          ✅          |       |  follow the guide in [here](https://github.com/vllm-project/vllm/blob/2f4226fe5280b60c47b4f6f01d9b18ac9cda2038/examples/pooling/score/vision_rerank_api_online.py)                    |
+| BAAI/bge-reranker-large                    |  ✅  |         ✅         |          ✅          |       |                           |
+| BAAI/bge-reranker-v2-m3                    |  ✅  |         ✅         |          ✅          |       |                           |
 
 
 --- 
@@ -1233,17 +1236,7 @@ export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 
 ## 5. Performance tuning
 
-### 5.1 Avoid Memory Fragmentation
-
-To avoid GPU memory fragmentation (which can lead to out-of-memory errors even when sufficient memory appears available), enable PyTorch's expandable segments feature:
-
-```bash
-export PYTORCH_ALLOC_CONF="expandable_segments:True"
-```
-
-Set this environment variable **before** launching the vLLM service. This allows PyTorch's memory allocator to use expandable segments instead of fixed-size blocks, significantly reducing fragmentation over long-running sessions.
-
-### 5.2 CPU Affinity (NUMA Binding)
+### 5.1 CPU Affinity (NUMA Binding)
 
 To improve performance, you can optimize CPU affinity based on the GPU–NUMA topology.
 
