@@ -17,18 +17,51 @@ Usage::
 
 import os
 import sys
+from pathlib import Path
 
 __version__ = "0.1.0"
 __author__ = "Intel"
 
 # Lazy loading of native extension
 _native_module = None
+_dll_directory_handles = []
+
+
+def _add_windows_dll_directories():
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return
+
+    candidates = [
+        Path(sys.executable).parent,
+        Path(sys.prefix) / "Library" / "bin",
+    ]
+
+    try:
+        import torch
+        candidates.append(Path(torch.__file__).parent / "lib")
+    except Exception:
+        pass
+
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    candidates.extend([
+        Path(program_files_x86) / "Intel" / "oneAPI" / "dnnl" / "latest" / "bin",
+        Path(program_files_x86) / "Intel" / "oneAPI" / "compiler" / "latest" / "bin",
+    ])
+
+    for path in candidates:
+        if path.is_dir():
+            try:
+                _dll_directory_handles.append(os.add_dll_directory(str(path)))
+            except OSError:
+                pass
 
 def _load_extension():
     """Load the native C++ extension module."""
     global _native_module
     if _native_module is not None:
         return _native_module
+
+    _add_windows_dll_directories()
     
     try:
         from omni_xpu_kernel import _C
