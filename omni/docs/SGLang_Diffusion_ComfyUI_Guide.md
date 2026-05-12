@@ -218,7 +218,7 @@ All workflow files are available in the `workflows/` directory of ComfyUI.
 1. **Start the Docker container:**
 
    ```bash
-   export DOCKER_IMAGE=intel/llm-scaler-omni:0.1.0-b6
+   export DOCKER_IMAGE=intel/llm-scaler-omni:0.1.0-b7
    export CONTAINER_NAME=comfyui
    export MODEL_DIR=<your_model_dir>
    export COMFYUI_MODEL_DIR=<your_comfyui_model_dir>

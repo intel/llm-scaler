@@ -41,11 +41,11 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
         libxkbcommon0 && \
     apt remove python3-blinker -y && \
     apt-get install -y intel-oneapi-dpcpp-ct=${ONEAPI_VERSION} && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    rm -f /usr/lib/python3*/EXTERNALLY-MANAGED
 
 # PyTorch
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip config set global.break-system-packages true && \
     pip install \
         torch==${TORCH_VERSION} \
         torchvision==${TORCHVISION_VERSION} \
@@ -268,7 +268,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
     apt remove python3-blinker -y && \
     apt-get install -y intel-oneapi-dpcpp-ct=${ONEAPI_VERSION} && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
-    python3 -m pip config set global.break-system-packages true
+    rm -f /usr/lib/python3*/EXTERNALLY-MANAGED
 
 # Copy built artifacts from builder
 COPY --from=builder /usr/local/lib/python${PYTHON_VERSION}/ /usr/local/lib/python${PYTHON_VERSION}/
