@@ -97,6 +97,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # ComfyUI custom nodes (active)
 COPY ./patches/raylight_for_multi_arc.patch /tmp/
+COPY ./patches/comfyui_controlnet_aux_depth_anything_v2_xpu.patch /tmp/
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/ComfyUI/custom_nodes && \
@@ -113,6 +114,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git clone --depth 1 https://github.com/yolain/ComfyUI-Easy-Use.git comfyui-easy-use && \
     pip install -r comfyui-easy-use/requirements.txt && \
     git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux.git && \
+    cd comfyui_controlnet_aux && \
+    git fetch --depth 1 origin e8b689a513c3e6b63edc44066560ca5919c0576e && \
+    git checkout e8b689a513c3e6b63edc44066560ca5919c0576e && \
+    git apply /tmp/comfyui_controlnet_aux_depth_anything_v2_xpu.patch && \
+    cd .. && \
     pip install -r comfyui_controlnet_aux/requirements.txt && \
     git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git && \
     cd ComfyUI-KJNodes && \
@@ -125,7 +131,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git clone --depth 1 https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git && \
     cd ComfyUI-GGUF-XPU && \
     pip install -r requirements.txt && \
-    rm -f /tmp/raylight_for_multi_arc.patch
+    rm -f /tmp/raylight_for_multi_arc.patch /tmp/comfyui_controlnet_aux_depth_anything_v2_xpu.patch
 
 # ComfyUI disabled custom nodes (optional: --build-arg INSTALL_DISABLED_NODES=true)
 ARG INSTALL_DISABLED_NODES=true
