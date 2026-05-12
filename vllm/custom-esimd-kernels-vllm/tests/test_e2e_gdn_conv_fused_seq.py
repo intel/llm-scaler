@@ -11,7 +11,6 @@ Only qkvz and ba differ in layout.
 import torch
 
 NUM_K_HEADS_GLOBAL = 16
-TP_SIZE = 4
 K = 128
 V = 128
 
@@ -59,25 +58,25 @@ def seq_to_interleaved_ba(ba_seq, H, HV):
 
 def make_strided_states(num_cache, HV, DIM, device="xpu"):
     """Create strided conv_state/ssm_state matching vLLM's pool layout."""
-    SLOT_SIZE = 327680
-    pool = torch.zeros(num_cache * SLOT_SIZE, dtype=torch.float16, device=device)
+    slot_size = max(327680, 3 * DIM + HV * V * K + 1024)
+    pool = torch.zeros(num_cache * slot_size, dtype=torch.float16, device=device)
     conv_state = torch.as_strided(
-        pool, size=(num_cache, 3, DIM), stride=(SLOT_SIZE, DIM, 1))
+        pool, size=(num_cache, 3, DIM), stride=(slot_size, DIM, 1))
     ssm_state = torch.as_strided(
-        pool, size=(num_cache, HV, V, K), stride=(SLOT_SIZE, V * K, K, 1),
+        pool, size=(num_cache, HV, V, K), stride=(slot_size, V * K, K, 1),
         storage_offset=3 * DIM)
     return conv_state, ssm_state
 
 
-def test_e2e_seq(N=1, num_v_heads_global=32, num_cache=32, seed=42):
-    H = NUM_K_HEADS_GLOBAL // TP_SIZE
-    HV = num_v_heads_global // TP_SIZE
+def test_e2e_seq(N=1, num_v_heads_global=32, tp_size=4, num_cache=32, seed=42):
+    H = NUM_K_HEADS_GLOBAL // tp_size
+    HV = num_v_heads_global // tp_size
     HPG = HV // H
     DIM = H * K + H * K + HV * V
     QKVZ_DIM = H * (K + K + HPG * V * 2)
 
     print(f"\n=== E2E Test seq: N={N}, H={H}, HV={HV}, K={K}, V={V}, "
-          f"num_v_heads_global={num_v_heads_global} ===")
+          f"num_v_heads_global={num_v_heads_global}, TP={tp_size} ===")
     torch.manual_seed(seed)
     device = "xpu"
 
@@ -88,7 +87,7 @@ def test_e2e_seq(N=1, num_v_heads_global=32, num_cache=32, seed=42):
     # conv_weight/conv_bias use same dim layout for both kernels
     conv_weight = torch.randn(DIM, 4, dtype=torch.float16, device=device) * 0.1
     conv_bias_zeros = torch.zeros(DIM, dtype=torch.float16, device=device)
-    A_log = torch.randn(HV, dtype=torch.float16, device=device) * 0.1
+    A_log = torch.randn(HV, dtype=torch.float32, device=device) * 0.1
     dt_bias = torch.randn(HV, dtype=torch.float16, device=device) * 0.1
     query_start_loc = torch.arange(N + 1, dtype=torch.int32, device=device)
     state_indices = torch.arange(N, dtype=torch.int32, device=device)
@@ -118,7 +117,8 @@ def test_e2e_seq(N=1, num_v_heads_global=32, num_cache=32, seed=42):
         num_prefills=0, num_decodes=N, has_initial_state=None,
         non_spec_query_start_loc=query_start_loc,
         non_spec_state_indices_tensor=state_indices,
-        num_actual_tokens=N, tp_size=TP_SIZE)
+        num_actual_tokens=N, tp_size=tp_size,
+        reorder_input=False)
     torch.xpu.synchronize()
 
     # ---- Our kernel: esimd_gdn_conv_fused_seq (sequential, decode path) ----
@@ -131,7 +131,7 @@ def test_e2e_seq(N=1, num_v_heads_global=32, num_cache=32, seed=42):
 
     esimd_gdn_conv_fused_seq(
         qkvz_seq, conv_ours, conv_weight, conv_bias_zeros, state_indices,
-        A_log, dt_bias, ba_seq,
+        A_log.half(), dt_bias, ba_seq,
         ssm_ours, state_indices, out_ours, z_ours,
         N, H, HV, K, V, float(K ** -0.5))
     torch.xpu.synchronize()
@@ -161,10 +161,24 @@ def test_e2e_seq(N=1, num_v_heads_global=32, num_cache=32, seed=42):
 if __name__ == "__main__":
     import vllm_xpu_kernels._xpu_C
     ok = True
-    # (label, num_v_heads_global): 35B-A3B=32, 27B=48, 122B-A10B=64
-    configs = [("Qwen3.5-35B-A3B", 32), ("Qwen3.5-27B", 48), ("Qwen3.5-122B-A10B", 64)]
-    for label, num_v_heads in configs:
+    # (label, num_v_heads_global, tp_size)
+    # TP=4 configs (original)
+    configs = [
+        ("Qwen3.5-35B-A3B TP4", 32, 4),
+        ("Qwen3.5-27B TP4", 48, 4),
+        ("Qwen3.5-122B-A10B TP4", 64, 4),
+    ]
+    # TP=1 configs — triggers H=16, HV=48 (currently fails: WG_SIZE too small)
+    configs += [
+        ("Qwen3.5-27B TP1", 48, 1),
+        ("Qwen3.6-27B TP1", 48, 1),
+    ]
+    for label, num_v_heads, tp in configs:
         for n in [1, 4, 8]:
-            print(f"\n--- {label} (num_v_heads_global={num_v_heads}) ---")
-            ok &= test_e2e_seq(N=n, num_v_heads_global=num_v_heads)
+            print(f"\n--- {label} (num_v_heads_global={num_v_heads}, TP={tp}) N={n} ---")
+            try:
+                ok &= test_e2e_seq(N=n, num_v_heads_global=num_v_heads, tp_size=tp)
+            except RuntimeError as e:
+                print(f"  CRASH: {e}")
+                ok = False
     print(f"\nOverall: {'ALL PASS' if ok else 'SOME FAILURES'}")
