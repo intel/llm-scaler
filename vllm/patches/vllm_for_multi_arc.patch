@@ -388,6 +388,15 @@ index 000000000..4a061f324
 +        else
 +          echo "✅ All benchmarks passed"
 +        fi
+diff --git a/.gitignore b/.gitignore
+index 864542128..1a1ce2655 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -232,3 +232,4 @@ ep_kernels_workspace/
+ vllm/grpc/vllm_engine_pb2.py
+ vllm/grpc/vllm_engine_pb2_grpc.py
+ vllm/grpc/vllm_engine_pb2.pyi
++qwen3_5_int4_kernel_gap_summary.md
 diff --git a/benchmarks/backend_request_func.py b/benchmarks/backend_request_func.py
 index 831b76b66..6bebc7aee 100644
 --- a/benchmarks/backend_request_func.py
@@ -5770,10 +5779,10 @@ index 475bd8536..b5b405485 100644
 +        return res
 diff --git a/vllm/model_executor/layers/quantization/sym_int4.py b/vllm/model_executor/layers/quantization/sym_int4.py
 new file mode 100644
-index 000000000..ef3fcaffc
+index 000000000..0980c669e
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/sym_int4.py
-@@ -0,0 +1,420 @@
+@@ -0,0 +1,534 @@
 +# SPDX-License-Identifier: Apache-2.0
 +
 +from typing import Any, Dict, List, Optional, Tuple, Callable, Union
@@ -5799,6 +5808,7 @@ index 000000000..ef3fcaffc
 +
 +from vllm.envs import VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT, VLLM_QUANTIZE_Q40_LIB
 +import ctypes
++import os
 +from packaging import version
 +
 +MIN_IPEX_VERSION = "2.5.0"
@@ -5924,7 +5934,8 @@ index 000000000..ef3fcaffc
 +            The quantize method. None if the given layer doesn't support quant
 +            method.
 +        """
-+        modules_to_not_convert = ["visual", "vision", "vpm", "resampler"]
++        modules_to_not_convert = ["visual", "vision", "vpm", "resampler",
++                                  "shared_expert"]
 +        modules_to_convert=["vision_experts"]
 +        if any(key in prefix for key in modules_to_not_convert) and not any(key in prefix for key in modules_to_convert):
 +            return UnquantizedLinearMethod()
@@ -5990,18 +6001,29 @@ index 000000000..ef3fcaffc
 +        qweight = torch.zeros((out_features, in_features // QK4_PACK_FACTOR), dtype=torch.int32, device=layer.weight.device)
 +        scale = torch.zeros((out_features, in_features // QK4_GROUP_SIZE), dtype=torch.float16, device=layer.weight.device)
 +
-+        # Use the extracted global function
++        # transpose=False: C output is [N, K/8] contiguous (GGML row-major).
 +        qweight, scale = ggml_quantize_tensor(
-+            weight, qweight, scale, out_features, in_features, block_size=QK4_GROUP_SIZE
++            weight, qweight, scale, out_features, in_features,
++            block_size=QK4_GROUP_SIZE, transpose=False,
 +        )
-+        
-+        qweight = qweight.to("xpu")
-+        scale = scale.to("xpu")
 +
-+        # Use qweight to replace weight...
-+        layer.weight = Parameter(qweight, requires_grad=False)
-+        # qweight_scale
-+        layer.weight_scale = Parameter(scale, requires_grad=False)
++        # Store [N, K/8] and [N, K/GROUP_SIZE] contiguous on XPU for ESIMD.
++        # IPEX needs [K/8, N] (transposed), so we give it a .t() view.
++        # Note: IPEX transpose_xetla_woq_format mutates the .data of the
++        # tensor it receives, so the ESIMD copy must be separate storage.
++        qweight_xpu = qweight.to("xpu")  # [N, K/8] contiguous
++        scale_xpu = scale.to("xpu")      # [N, K/GROUP_SIZE] contiguous
++
++        # ESIMD kernel weights: [N, K/2] uint8, [N, K/GROUP_SIZE] fp16
++        layer.weight_esimd = Parameter(
++            qweight_xpu.view(torch.uint8), requires_grad=False)
++        layer.scale_esimd = Parameter(scale_xpu, requires_grad=False)
++
++        # For IPEX: transposed view
++        layer.weight = Parameter(qweight_xpu.t(), requires_grad=False)
++        layer.weight_scale = Parameter(scale_xpu.t(), requires_grad=False)
++
++
 +
 +        try:
 +            import intel_extension_for_pytorch as ipex
@@ -6043,6 +6065,81 @@ index 000000000..ef3fcaffc
 +        )
 +
 +
++def _to_cutlass_nmajor(qweight_nk: torch.Tensor):
++    """Repack MoE expert weights from ggml int32 to CUTLASS uint8 N-major.
++
++    Input:  [E, N, K/8] int32 — 8 unsigned nibbles (0-15) per word
++    Output: [E, N, K/2] uint8 — byte-level view, same nibble order
++
++    implement_zp conversion is left to xpu_fused_moe (auto on first call).
++    """
++    E, N, Kp8 = qweight_nk.shape
++    return qweight_nk.view(torch.uint8).reshape(E, N, Kp8 * 4).contiguous()
++
++
++def _esimd_prefill_moe_apply(layer, router, x, router_logits):
++    """End-to-end MoE prefill path for USE_ESIMD_MOE_PREFILL=1.
++
++    Hybrid kernel selection: ESIMD for topk and silu_mul (faster at all M),
++    XPU-K for scatter/remap and gather (faster at all M, especially small M).
++    CUTLASS grouped GEMM for the two INT4 GEMM stages.
++    """
++    from custom_esimd_kernels_vllm import moe_int4_prefill_ops as _ops
++    import vllm_xpu_kernels._xpu_C  # noqa: F401
++    import vllm_xpu_kernels._moe_C  # noqa: F401
++
++    M, H = x.shape
++    TK = int(layer.top_k)
++    E  = int(layer.num_experts)
++    two_I = layer.w13_weight.size(1)
++    I = two_I // 2
++    total = M * TK
++
++    # 1. TopK -- ESIMD (2-3x faster than XPU-K at all M)
++    topk_weights, topk_ids = _ops.moe_topk_softmax(router_logits, TK, E)
++
++    # 2. Scatter/remap -- XPU-K (20-40% faster, fused scatter+offset)
++    topk_ids_i64 = topk_ids.to(torch.int64)
++    x_perm = torch.empty(total, H, dtype=x.dtype, device=x.device)
++    efto = torch.zeros(E + 1, dtype=torch.int64, device=x.device)
++    u2p = torch.empty(M, TK, dtype=torch.int32, device=x.device)
++    torch.ops._moe_C.remap_hidden_states(
++        hidden_states=x, hidden_states_scales=None,
++        remapped_hidden_states=x_perm, remapped_hidden_states_scales=None,
++        expert_map=None, expert_first_token_offset=efto,
++        unpermuted_row_to_permuted_row=u2p,
++        topk_ids=topk_ids_i64,
++        total_experts_num=E, local_experts_num=E)
++
++    # 3. GEMM1 -- CUTLASS grouped GEMM (W13, INT4 N-major)
++    gate_up_perm = torch.empty(total, two_I, dtype=x.dtype, device=x.device)
++    torch.ops._xpu_C.cutlass_grouped_gemm_interface(
++        ptr_A=x_perm, ptr_B=layer.w13_weight,
++        ptr_scales=layer.w13_scales, ptr_bias=None,
++        ptr_D=gate_up_perm, expert_first_token_offset=efto,
++        N=two_I, K=H, num_experts=E,
++        is_B_int4=True, is_B_mxfp4=False)
++
++    # 4. SiLU*Mul -- ESIMD (faster than XPU-K at M<=2048)
++    inter_perm = _ops.moe_prefill_silu_mul_forward(gate_up_perm)
++
++    # 5. GEMM2 -- CUTLASS grouped GEMM (W2, INT4 N-major)
++    down_perm = torch.empty(total, H, dtype=x.dtype, device=x.device)
++    torch.ops._xpu_C.cutlass_grouped_gemm_interface(
++        ptr_A=inter_perm, ptr_B=layer.w2_weight,
++        ptr_scales=layer.w2_scales, ptr_bias=None,
++        ptr_D=down_perm, expert_first_token_offset=efto,
++        N=H, K=I, num_experts=E,
++        is_B_int4=True, is_B_mxfp4=False)
++
++    # 6. Gather -- XPU-K (10x faster than ESIMD at small M)
++    topk_weights_f32 = topk_weights.float()
++    out = torch.empty(M, H, dtype=x.dtype, device=x.device)
++    torch.ops._moe_C.moe_gather(
++        out, down_perm, topk_weights_f32, u2p, efto, E)
++    return out
++
++
 +class XPUGPTQInt4LinearMoEMethod(FusedMoEMethodBase):
 +    def __init__(
 +        self,
@@ -6071,20 +6168,17 @@ index 000000000..ef3fcaffc
 +        layer.weight_block_size = None
 +
 +        tp_size = get_tensor_model_parallel_world_size()
++        # Round up intermediate_size_per_partition for IPEX GatedMLPMOE alignment.
++        # The alignment value must match qwen3_5.py's interleaved padding logic.
 +        if tp_size == 4:
 +            intermediate_size_per_partition = round_up(intermediate_size_per_partition, 256)
 +        elif tp_size == 8:
 +            if self.moe_config.hidden_dim == 2048:
-+                # For qwen3-30b-a3b
 +                intermediate_size_per_partition = round_up(intermediate_size_per_partition, 128)
-+            elif self.moe_config.hidden_dim == 4096:
-+                # For qwen3-235b-a22b
-+                intermediate_size_per_partition = round_up(intermediate_size_per_partition, 256)
 +            else:
-+                raise ValueError("Unsupported hidden_dim")
++                # For hidden_dim=3072 (122B-A10B), 4096 (235B-A22B), etc.
++                intermediate_size_per_partition = round_up(intermediate_size_per_partition, 256)
 +        elif tp_size == 16:
-+            # For qwen3-235b
-+            assert self.moe_config.hidden_dim == 4096, f"Currently TP_SIZE=16 only supports qwen3-235b-a22b"
 +            intermediate_size_per_partition = round_up(intermediate_size_per_partition, 128)
 +        layer.d_ff = intermediate_size_per_partition
 +        # w13 shape: [d_ff * 2, d_model]
@@ -6161,19 +6255,41 @@ index 000000000..ef3fcaffc
 +        w13_scales  = w13_scales.to("xpu")
 +        w2_scales   = w2_scales.to("xpu")
 +
++        # When USE_ESIMD_MOE_PREFILL=1, repack weights into CUTLASS N-major
++        # uint8 layout and apply implement_zp (unsigned→signed int4 encoding).
++        self._use_esimd_prefill = os.environ.get("USE_ESIMD_MOE_PREFILL", "1") == "1"
++        if self._use_esimd_prefill:
++            from vllm_xpu_kernels.fused_moe_interface import implement_zp
++            w13_qweight = _to_cutlass_nmajor(w13_qweight)
++            w2_qweight  = _to_cutlass_nmajor(w2_qweight)
++            w13_tmp = torch.empty_like(w13_qweight)
++            w2_tmp  = torch.empty_like(w2_qweight)
++            for i in range(E):
++                w13_tmp[i] = implement_zp(w13_qweight[i])
++                w2_tmp[i]  = implement_zp(w2_qweight[i])
++            w13_qweight = w13_tmp.contiguous()
++            w2_qweight  = w2_tmp.contiguous()
++
 +        # Override parameters
 +        layer.w13_weight = torch.nn.Parameter(w13_qweight, requires_grad=False)
 +        layer.w2_weight  = torch.nn.Parameter(w2_qweight,  requires_grad=False)
-+        layer.w13_scales = torch.nn.Parameter(w13_scales, requires_grad=False)
-+        layer.w2_scales  = torch.nn.Parameter(w2_scales,  requires_grad=False)
++        layer.w13_scales = torch.nn.Parameter(w13_scales,  requires_grad=False)
++        layer.w2_scales  = torch.nn.Parameter(w2_scales,   requires_grad=False)
 +
-+        layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
-+            layer.w13_weight,                      # [E, 2*d_ff, d_model//8]
-+            layer.w2_weight,                       # [E, d_model, d_ff//8]
-+            w1_scale_inv=layer.w13_scales,          # [E, 2*d_ff, d_model//64]
-+            w2_scale_inv=layer.w2_scales,           # [E, d_model, d_ff//64]
-+            is_int4=True
-+        )
++        if not self._use_esimd_prefill:
++            layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
++                layer.w13_weight,
++                layer.w2_weight,
++                w1_scale_inv=layer.w13_scales,
++                w2_scale_inv=layer.w2_scales,
++                is_int4=True
++            )
++        else:
++            layer.ipex_fusion = None
++            # Mark as already converted so xpu_fused_moe skips implement_zp
++            layer.w13_weight.xpu_fused_moe = True
++            layer.w2_weight.xpu_fused_moe = True
++
 +
 +    def apply(
 +        self,
@@ -6182,6 +6298,13 @@ index 000000000..ef3fcaffc
 +        x: torch.Tensor,
 +        router_logits: torch.Tensor,
 +    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
++        if self._use_esimd_prefill:
++            import os
++            if os.environ.get("DISABLE_CUTLASS_PREFILL", "0") == "1":
++                pass  # fall through to ipex_fusion below
++            else:
++                return _esimd_prefill_moe_apply(layer, router, x, router_logits)
++
 +        res = layer.ipex_fusion(
 +            x,
 +            layer.use_grouped_topk,
@@ -6194,7 +6317,6 @@ index 000000000..ef3fcaffc
 +            scoring_func=layer.scoring_func,
 +        )
 +        return res
-\ No newline at end of file
 diff --git a/vllm/model_executor/layers/quantization/utils/fp8_utils.py b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
 index ac82bbd59..7f71c2ae4 100644
 --- a/vllm/model_executor/layers/quantization/utils/fp8_utils.py
@@ -9294,10 +9416,10 @@ index 3b0dce7fc..e785eca41 100644
  
 diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
 new file mode 100644
-index 000000000..b3166d444
+index 000000000..d91aad7c9
 --- /dev/null
 +++ b/vllm/model_executor/models/qwen3_5.py
-@@ -0,0 +1,1510 @@
+@@ -0,0 +1,1602 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -9598,10 +9720,16 @@ index 000000000..b3166d444
 +        self._cached_attn_scale = float(self.head_k_dim ** -0.5)
 +
 +        # FP8 ESIMD projection kernels (GEMV/GEMM for input projection)
-+        self._use_esimd_proj = hasattr(self.in_proj_qkvz, 'weight_scale')
++        self._is_fp8 = quant_config is not None and quant_config.get_name() == "fp8"
++        self._use_esimd_proj = self._is_fp8 and hasattr(self.in_proj_qkvz, 'weight_scale')
 +
-+        # Fused norm + out_proj GEMV for decode (FP8 only)
-+        # Always allocate: used by both forward_xpu and forward_xpu_with_precomputed_proj
++        # INT4 detection
++        self._is_sym_int4 = (
++            quant_config is not None
++            and quant_config.get_name() == "sym_int4"
++        )
++
++        # Fused norm + out_proj GEMV for decode (FP8 or INT4)
 +        self._use_fused_out_proj = hasattr(self.out_proj, 'weight_scale')
 +        self._decode_outproj_buf = torch.empty(
 +            (1, self.hidden_size),
@@ -9704,6 +9832,21 @@ index 000000000..b3166d444
 +                qkvz_merged,
 +                self.in_proj_ba.weight,
 +                self.in_proj_ba.weight_scale,
++                ba_merged,
++            )
++            projected_states_qkvz = qkvz_merged
++            projected_states_ba = ba_merged
++        elif is_decode and self._is_sym_int4:
++            from custom_esimd_kernels_vllm import esimd_gemv_int4_fused2
++            qkvz_merged = self._decode_qkvz_buf
++            ba_merged = self._decode_ba_buf
++            esimd_gemv_int4_fused2(
++                hidden_states,
++                self.in_proj_qkvz.weight_esimd,
++                self.in_proj_qkvz.scale_esimd,
++                qkvz_merged,
++                self.in_proj_ba.weight_esimd,
++                self.in_proj_ba.scale_esimd,
 +                ba_merged,
 +            )
 +            projected_states_qkvz = qkvz_merged
@@ -9828,7 +9971,7 @@ index 000000000..b3166d444
 +                    conv_weights=conv_weights,
 +                    conv_bias=self.conv1d.bias,
 +                    activation=self.activation,
-+                    A_log=self.A_log,
++                    A_log=self.A_log.float(),
 +                    dt_bias=self.dt_bias,
 +                    num_prefills=attn_metadata.num_prefills,
 +                    num_decodes=attn_metadata.num_decodes,
@@ -9837,6 +9980,7 @@ index 000000000..b3166d444
 +                    non_spec_state_indices_tensor=attn_metadata.non_spec_state_indices_tensor,
 +                    num_actual_tokens=attn_metadata.num_actual_tokens,
 +                    tp_size=self.tp_size,
++                    reorder_input=False,
 +                )
 +
 +        # ============================================================
@@ -9848,21 +9992,34 @@ index 000000000..b3166d444
 +
 +        if is_decode and self._use_fused_out_proj:
 +            # Decode fast path: fused RMSNormGated + out_proj GEMV (single kernel)
-+            from custom_esimd_kernels_vllm import esimd_norm_gemv_fp8_pert
 +            from vllm.distributed import tensor_model_parallel_all_reduce
 +            nv_tp = self._cached_nv_tp
 +            hv = self.head_v_dim
 +            if self._norm_weight_fp16 is None:
 +                self._norm_weight_fp16 = self.norm.weight.data.half()
-+            esimd_norm_gemv_fp8_pert(
-+                core_attn_out.view(nv_tp, hv),
-+                z_out.view(nv_tp, hv),
-+                self._norm_weight_fp16,
-+                self.out_proj.weight,
-+                self.out_proj.weight_scale,
-+                self._decode_outproj_buf,
-+                nv_tp, hv, self.norm.eps,
-+            )
++            if self._is_sym_int4:
++                from custom_esimd_kernels_vllm import esimd_norm_gemv_int4_pert
++                # .t() gives contiguous (N, K/8) layout for block_load
++                esimd_norm_gemv_int4_pert(
++                    core_attn_out.view(nv_tp, hv),
++                    z_out.view(nv_tp, hv),
++                    self._norm_weight_fp16,
++                    self.out_proj.weight.t(),
++                    self.out_proj.weight_scale.t(),
++                    self._decode_outproj_buf,
++                    nv_tp, hv, self.norm.eps,
++                )
++            else:
++                from custom_esimd_kernels_vllm import esimd_norm_gemv_fp8_pert
++                esimd_norm_gemv_fp8_pert(
++                    core_attn_out.view(nv_tp, hv),
++                    z_out.view(nv_tp, hv),
++                    self._norm_weight_fp16,
++                    self.out_proj.weight,
++                    self.out_proj.weight_scale,
++                    self._decode_outproj_buf,
++                    nv_tp, hv, self.norm.eps,
++                )
 +            output[:1] = tensor_model_parallel_all_reduce(
 +                self._decode_outproj_buf)
 +        elif is_decode:
@@ -9922,7 +10079,6 @@ index 000000000..b3166d444
 +    ):
 +        """Decode-only fast path: input projection already done by caller.
 +        Uses sequential [q|k|v|z] layout with esimd_gdn_conv_fused_seq."""
-+        from custom_esimd_kernels_vllm import esimd_norm_gemv_fp8_pert
 +        from vllm.distributed import tensor_model_parallel_all_reduce
 +
 +        # Part 2: Core Attention
@@ -9955,12 +10111,22 @@ index 000000000..b3166d444
 +        hv = self.head_v_dim
 +        if self._norm_weight_fp16 is None:
 +            self._norm_weight_fp16 = self.norm.weight.data.half()
-+        esimd_norm_gemv_fp8_pert(
-+            core_attn_out.view(nv_tp, hv), z_out.view(nv_tp, hv),
-+            self._norm_weight_fp16,
-+            self.out_proj.weight, self.out_proj.weight_scale,
-+            self._decode_outproj_buf, nv_tp, hv, self.norm.eps,
-+        )
++        if self._is_sym_int4:
++            from custom_esimd_kernels_vllm import esimd_norm_gemv_int4_pert
++            esimd_norm_gemv_int4_pert(
++                core_attn_out.view(nv_tp, hv), z_out.view(nv_tp, hv),
++                self._norm_weight_fp16,
++                self.out_proj.weight.t(), self.out_proj.weight_scale.t(),
++                self._decode_outproj_buf, nv_tp, hv, self.norm.eps,
++            )
++        else:
++            from custom_esimd_kernels_vllm import esimd_norm_gemv_fp8_pert
++            esimd_norm_gemv_fp8_pert(
++                core_attn_out.view(nv_tp, hv), z_out.view(nv_tp, hv),
++                self._norm_weight_fp16,
++                self.out_proj.weight, self.out_proj.weight_scale,
++                self._decode_outproj_buf, nv_tp, hv, self.norm.eps,
++            )
 +        output[:1] = tensor_model_parallel_all_reduce(
 +            self._decode_outproj_buf)
 +
@@ -10109,13 +10275,15 @@ index 000000000..b3166d444
 +            )
 +
 +        # Detect dense MLP with FP8 quantization for ESIMD fast path
++        _quant_name = quant_config.get_name() if quant_config is not None else ""
 +        self._dense_mlp_fp8 = (
 +            isinstance(self.mlp, Qwen3NextMLP)
 +            and self.mlp.expert_gate is None
-+            and quant_config is not None
-+            and quant_config.get_name() == "fp8"
++            and _quant_name == "fp8"
 +            and os.environ.get("DISABLE_ESIMD_DENSE", "0") != "1"
 +        )
++        self._dense_mlp_is_int4 = (_quant_name == "sym_int4") if self._dense_mlp_fp8 else False
++        self._max_bsz = 0  # default when no FP8 dense MLP path; overwritten below
 +        if self._dense_mlp_fp8:
 +            _dev = current_platform.current_device()
 +            tp_size = get_tensor_model_parallel_world_size()
@@ -10128,6 +10296,13 @@ index 000000000..b3166d444
 +                1, _hidden, dtype=torch.float16, device=_dev)
 +            self._dense_normed_buf = torch.empty(
 +                1, _hidden, dtype=torch.float16, device=_dev)
++            # BSZ>1 pre-allocated buffers
++            _mb = int(os.environ.get("MAX_DECODE_BSZ", "64"))
++            self._max_bsz = _mb
++            self._m_gate_up = torch.empty(
++                _mb, 2 * _inter_tp, dtype=torch.float16, device=_dev)
++            self._m_down = torch.empty(
++                _mb, _hidden, dtype=torch.float16, device=_dev)
 +            # Lazily cached after weights are loaded
 +            self._dense_post_norm_w_fp16 = None
 +
@@ -10137,6 +10312,7 @@ index 000000000..b3166d444
 +            and hasattr(self.mlp, 'use_fp8')
 +            and self.mlp.use_fp8
 +        )
++        self._moe_is_int4 = (_quant_name == "sym_int4") if self._moe_fp8 else False
 +        if self._moe_fp8:
 +            _dev = current_platform.current_device()
 +            n_exp = self.mlp.gate.weight.shape[0]
@@ -10156,6 +10332,8 @@ index 000000000..b3166d444
 +        if self._fused_input_norm:
 +            _dev = current_platform.current_device()
 +            _hidden = config.hidden_size
++            _mb = int(os.environ.get("MAX_DECODE_BSZ", "64"))
++            self._input_max_bsz = _mb
 +            self._input_norm_w_fp16 = None  # lazily cached
 +            if self.layer_type == "linear_attention":
 +                # GDN: norm + fused 2-GEMV (in_proj_qkvz + in_proj_ba)
@@ -10165,6 +10343,11 @@ index 000000000..b3166d444
 +                    1, _qkvz_sz, dtype=torch.float16, device=_dev)
 +                self._fused_ba_buf = torch.empty(
 +                    1, _ba_sz, dtype=torch.float16, device=_dev)
++                # BSZ>1 input proj buffers
++                self._m_fused_qkvz = torch.empty(
++                    _mb, _qkvz_sz, dtype=torch.float16, device=_dev)
++                self._m_fused_ba = torch.empty(
++                    _mb, _ba_sz, dtype=torch.float16, device=_dev)
 +            elif self.layer_type == "full_attention":
 +                # Full Attn: norm + qkv_proj GEMV
 +                _qkv_sz = self.self_attn.qkv_proj.weight.shape[0]
@@ -10172,6 +10355,12 @@ index 000000000..b3166d444
 +                    1, _qkv_sz, dtype=torch.float16, device=_dev)
 +                self._fused_normed_buf = torch.empty(
 +                    1, _hidden, dtype=torch.float16, device=_dev)
++                # BSZ>1 input proj buffer
++                self._m_fused_qkv = torch.empty(
++                    _mb, _qkv_sz, dtype=torch.float16, device=_dev)
++            # BSZ>1 output buffer (shared by both layer_types)
++            self._m_attn_output = torch.empty(
++                _mb, _hidden, dtype=torch.float16, device=_dev)
 +
 +
 +@support_torch_compile(
@@ -10281,6 +10470,7 @@ index 000000000..b3166d444
 +        )
 +
 +        is_padding_needed = False
++        _pad_align = 0  # padding alignment for intermediate_size_per_partition
 +        quantization_config = getattr(self.config, "quantization_config", None)
 +        if quantization_config is not None or self.quant_config is not None:
 +            if quantization_config is not None:
@@ -10288,8 +10478,17 @@ index 000000000..b3166d444
 +            elif self.quant_config is not None:
 +                quant_method = self.quant_config.get_name()
 +            tp_size = get_tensor_model_parallel_world_size()
-+            if (quant_method in ("sym_int4")) and (tp_size == 4 or tp_size == 8):
-+                is_padding_needed = True
++            hidden_size = self.config.hidden_size if hasattr(self.config, 'hidden_size') else getattr(self.config, 'hidden_size', 0)
++            if quant_method in ("sym_int4"):
++                # Must match sym_int4.py XPUGPTQInt4LinearMoEMethod.create_weights round_up logic
++                if tp_size == 4:
++                    _pad_align = 256
++                elif tp_size == 8:
++                    _pad_align = 128 if hidden_size == 2048 else 256
++                elif tp_size == 16:
++                    _pad_align = 128
++                if _pad_align > 0:
++                    is_padding_needed = True
 +        for name, loaded_weight in weights:
 +            if "rotary_emb.inv_freq" in name:
 +                continue
@@ -10357,15 +10556,23 @@ index 000000000..b3166d444
 +                            loaded_weight = loaded_weight.chunk(2, dim=-2)
 +
 +                            if is_padding_needed:
-+                                shape0 = loaded_weight[0].shape[1]
-+                                target_size = round_up(shape0, 1024)
-+                                pad_size = target_size - shape0
-+                                loaded_weight0 = torch.nn.functional.pad(loaded_weight[0], (0, 0, 0, pad_size), value=0)
-+
-+                                shape1 = loaded_weight[1].shape[1]
-+                                target_size = round_up(shape1, 1024)
-+                                pad_size = target_size - shape1
-+                                loaded_weight1 = torch.nn.functional.pad(loaded_weight[1], (0, 0, 0, pad_size), value=0)
++                                # Interleaved padding: reshape into TP shards, pad each shard, reassemble.
++                                # This ensures each TP rank gets its correct data slice + zero padding.
++                                tp_size = get_tensor_model_parallel_world_size()
++                                for _idx in range(2):  # gate (0) and up (1)
++                                    _w = loaded_weight[_idx]
++                                    _E, _rows, _H = _w.shape
++                                    _real_shard = _rows // tp_size
++                                    _padded_shard = round_up(_real_shard, _pad_align)
++                                    _pad = _padded_shard - _real_shard
++                                    if _pad > 0:
++                                        _shards = _w.reshape(_E, tp_size, _real_shard, _H)
++                                        _shards = torch.nn.functional.pad(_shards, (0, 0, 0, _pad), value=0)
++                                        _w = _shards.reshape(_E, tp_size * _padded_shard, _H)
++                                    if _idx == 0:
++                                        loaded_weight0 = _w
++                                    else:
++                                        loaded_weight1 = _w
 +                            else:
 +                                loaded_weight0 = loaded_weight[0]
 +                                loaded_weight1 = loaded_weight[1]
@@ -10387,10 +10594,17 @@ index 000000000..b3166d444
 +                        else:
 +                            # down_proj
 +                            if is_padding_needed:
-+                                shape1 = loaded_weight.shape[-1]
-+                                target_size = round_up(shape1, 1024)
-+                                pad_size = target_size - shape1
-+                                loaded_weight = torch.nn.functional.pad(loaded_weight, (0, pad_size), value=0)
++                                # Interleaved padding along last dim (d_ff)
++                                tp_size = get_tensor_model_parallel_world_size()
++                                _orig_shape = loaded_weight.shape  # [E, hidden, d_ff] or [hidden, d_ff]
++                                _d_ff = _orig_shape[-1]
++                                _real_shard = _d_ff // tp_size
++                                _padded_shard = round_up(_real_shard, _pad_align)
++                                _pad = _padded_shard - _real_shard
++                                if _pad > 0:
++                                    _shards = loaded_weight.reshape(*_orig_shape[:-1], tp_size, _real_shard)
++                                    _shards = torch.nn.functional.pad(_shards, (0, _pad), value=0)
++                                    loaded_weight = _shards.reshape(*_orig_shape[:-1], tp_size * _padded_shard)
 +
 +                            success = self.load_fused_expert_weights(
 +                                name_mapped,
@@ -11991,10 +12205,10 @@ index f2f354604..ad88271b9 100644
                  if weight_name not in name:
                      continue
 diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
-index 0f73a7746..40d872ee7 100644
+index 0f73a7746..59aaae75e 100644
 --- a/vllm/model_executor/models/qwen3_next.py
 +++ b/vllm/model_executor/models/qwen3_next.py
-@@ -2,10 +2,20 @@
+@@ -2,10 +2,22 @@
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  """Inference-only Qwen3Next model."""
  
@@ -12012,10 +12226,12 @@ index 0f73a7746..40d872ee7 100644
 +from custom_esimd_kernels_vllm import esimd_resadd_norm_gemv2_fp8_pert
 +from custom_esimd_kernels_vllm import esimd_qkv_split_norm_rope
 +from custom_esimd_kernels_vllm import esimd_gdn_conv_fused
++from custom_esimd_kernels_vllm import esimd_rms_norm_gated
++from custom_esimd_kernels_vllm import esimd_fused_add_rms_norm_batched
  from einops import rearrange
  from torch import nn
  from transformers.activations import ACT2FN
-@@ -26,6 +36,7 @@ from vllm.distributed import (
+@@ -26,6 +38,7 @@ from vllm.distributed import (
      get_tensor_model_parallel_rank,
      get_tensor_model_parallel_world_size,
      tensor_model_parallel_all_gather,
@@ -12023,7 +12239,7 @@ index 0f73a7746..40d872ee7 100644
  )
  from vllm.forward_context import ForwardContext, get_forward_context
  from vllm.logger import init_logger
-@@ -49,6 +60,8 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+@@ -49,6 +62,8 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
  from vllm.model_executor.layers.mamba.abstract import MambaBase
  from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
  from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -12032,7 +12248,7 @@ index 0f73a7746..40d872ee7 100644
      MambaStateDtypeCalculator,
      MambaStateShapeCalculator,
  )
-@@ -104,10 +117,15 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+@@ -104,10 +119,17 @@ class Qwen3NextSparseMoeBlock(nn.Module):
      def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
          super().__init__()
  
@@ -12041,15 +12257,17 @@ index 0f73a7746..40d872ee7 100644
          parallel_config = vllm_config.parallel_config
          quant_config = vllm_config.quant_config
  
-+        # Check if FP8 quantization is enabled
++        # Check quantization type
 +        self.use_fp8 = False
++        self._is_sym_int4 = False
 +        if quant_config is not None:
 +            self.use_fp8 = quant_config.get_name() == "fp8"
++            self._is_sym_int4 = quant_config.get_name() == "sym_int4"
 +
          self.tp_size = get_tensor_model_parallel_world_size()
  
          self.ep_group = get_ep_group().device_group
-@@ -175,7 +193,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+@@ -175,7 +197,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
              hidden_size=config.hidden_size,
              intermediate_size=config.moe_intermediate_size,
              reduce_results=False,
@@ -12058,16 +12276,22 @@ index 0f73a7746..40d872ee7 100644
              quant_config=quant_config,
              prefix=f"{prefix}.experts",
              enable_eplb=self.enable_eplb,
-@@ -184,12 +202,53 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+@@ -184,12 +206,114 @@ class Qwen3NextSparseMoeBlock(nn.Module):
              routing_method_type=RoutingMethodType.Renormalize,
          )
  
 +        # Cache env flag and init attribute for precomputed router logits
 +        self._esimd_moe_enabled = (
-+            self.use_fp8
++            (self.use_fp8 or self._is_sym_int4)
 +            and os.environ.get("DISABLE_ESIMD_MOE", "0") != "1"
 +        )
 +        self._precomputed_router_logits = None
++
++        # Pre-load libraries once at init (not per forward)
++        if self._esimd_moe_enabled and self._is_sym_int4:
++            import vllm_xpu_kernels._xpu_C  # noqa: F401
++            import vllm_xpu_kernels._moe_C  # noqa: F401
++
 +
      def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
          # NOTE: hidden_states can have either 1D or 2D shape.
@@ -12075,28 +12299,37 @@ index 0f73a7746..40d872ee7 100644
          num_tokens, hidden_dim = hidden_states.shape
          hidden_states = hidden_states.view(-1, hidden_dim)
  
-+        if num_tokens <= 128 and self._esimd_moe_enabled:
++        if num_tokens <= 128 and self._esimd_moe_enabled and self._is_sym_int4:
++            # ── INT4 decode: ESIMD router + fused kernel ──
++            from custom_esimd_kernels_vllm import moe_int4_ops
++            from custom_esimd_kernels_vllm.ops import moe_forward_cutlass_nmajor_int4_full
++
 +            x = hidden_states
 +
-+            # Use precomputed router logits if available (from fused norm+router)
-+            logits = self._precomputed_router_logits
-+            if logits is not None:
-+                self._precomputed_router_logits = None
++            # Router (ESIMD, 1 dispatch)
++            _gate_w = getattr(self.gate, 'weight_esimd', None)
++            if _gate_w is not None:
++                logits = moe_int4_ops.moe_router_forward_int4(
++                    x, _gate_w, self.gate.scale_esimd, True)
 +            else:
-+                logits = moe_ops.moe_router_forward(
-+                    x, self.gate.weight, self.gate.weight_scale)
++                logits = moe_int4_ops.moe_router_forward_int4(
++                    x, self.gate.weight, self.gate.weight_scale, False)
 +
-+            # Single C++ call: topk + up + down_routed + down_finalize
-+            final_hidden_states = moe_ops.moe_forward_full(
++            # Cache shared expert weights on first call
++            if not hasattr(self, '_shared_gu_w_cached'):
++                self._shared_gu_w_cached = self.shared_expert.gate_up_proj.weight if self.shared_expert is not None else torch.empty(0, device=x.device)
++                self._shared_d_w_cached = self.shared_expert.down_proj.weight if self.shared_expert is not None else torch.empty(0, device=x.device)
++                self._shared_gate_w_cached = self.shared_expert_gate.weight if self.shared_expert_gate is not None else torch.empty(0, device=x.device)
++
++            # Fused: topk + routed INT4 + shared FP16 (1 dispatch)
++            final_hidden_states = moe_forward_cutlass_nmajor_int4_full(
 +                x, logits,
-+                self.experts.w13_weight, self.experts.w13_weight_scale,
-+                self.shared_expert.gate_up_proj.weight,
-+                self.shared_expert.gate_up_proj.weight_scale,
-+                self.experts.w2_weight, self.experts.w2_weight_scale,
-+                self.shared_expert.down_proj.weight,
-+                self.shared_expert.down_proj.weight_scale,
-+                self.shared_expert_gate.weight if self.shared_expert is not None else None,
-+                self.experts.top_k, 1, self.n_routed_experts)
++                self.experts.w13_weight, self.experts.w13_scales,
++                self.experts.w2_weight, self.experts.w2_scales,
++                self._shared_gu_w_cached, self._shared_d_w_cached,
++                self._shared_gate_w_cached,
++                self.experts.top_k,
++                1, self.n_routed_experts)
 +
 +            if self.is_sequence_parallel:
 +                final_hidden_states = tensor_model_parallel_all_gather(
@@ -12109,10 +12342,56 @@ index 0f73a7746..40d872ee7 100644
 +                )
 +            return final_hidden_states.view(orig_shape)
 +
++        elif num_tokens <= 128 and self._esimd_moe_enabled and self.use_fp8:
++            # ── FP8 ESIMD fast path (n_tokens <= 128 only) ──
++            x = hidden_states
++            logits = self._precomputed_router_logits
++            if logits is not None:
++                self._precomputed_router_logits = None
++            else:
++                logits = moe_ops.moe_router_forward(
++                    x, self.gate.weight, self.gate.weight_scale
++                )
++
++            # BSZ=1: down_finalize fused path (optimal for single token)
++            # BSZ>1: v2 standalone down path (weight reuse, saves ~105us/layer at BSZ=12)
++            _moe_fn = moe_ops.moe_forward_full if num_tokens == 1 else moe_ops.moe_forward_full_v2
++            final_hidden_states = _moe_fn(
++                x,
++                logits,
++                self.experts.w13_weight,
++                self.experts.w13_weight_scale,
++                self.shared_expert.gate_up_proj.weight,
++                self.shared_expert.gate_up_proj.weight_scale,
++                self.experts.w2_weight,
++                self.experts.w2_weight_scale,
++                self.shared_expert.down_proj.weight,
++                self.shared_expert.down_proj.weight_scale,
++                self.shared_expert_gate.weight
++                if self.shared_expert is not None
++                else None,
++                self.experts.top_k,
++                1,
++                self.n_routed_experts,
++            )
++
++            if self.is_sequence_parallel:
++                final_hidden_states = tensor_model_parallel_all_gather(
++                    final_hidden_states, 0
++                )
++                final_hidden_states = final_hidden_states[:num_tokens]
++            elif self.tp_size > 1:
++                final_hidden_states = (
++                    self.experts.maybe_all_reduce_tensor_model_parallel(
++                        final_hidden_states
++                    )
++                )
++            return final_hidden_states.view(orig_shape)
++
          if self.is_sequence_parallel:
              hidden_states = sequence_parallel_chunk(hidden_states)
  
-@@ -366,6 +425,39 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
+@@ -366,6 +490,80 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
          if prefix in compilation_config.static_forward_context:
              raise ValueError(f"Duplicate layer name: {prefix}")
          compilation_config.static_forward_context[prefix] = self
@@ -12126,33 +12405,74 @@ index 0f73a7746..40d872ee7 100644
 +        _dev = current_platform.current_device()
 +        self._decode_qkvz_buf = torch.empty(
 +            (1, self.projection_size_qkvz // self.tp_size),
-+            dtype=torch.float16, device=_dev)
++            dtype=torch.float16,
++            device=_dev,
++        )
 +        self._decode_ba_buf = torch.empty(
 +            (1, self.projection_size_ba // self.tp_size),
-+            dtype=torch.float16, device=_dev)
++            dtype=torch.float16,
++            device=_dev,
++        )
 +        self._decode_attn_out_buf = torch.zeros(
 +            (1, self.num_v_heads // self.tp_size, self.head_v_dim),
-+            dtype=torch.float16, device=_dev)
++            dtype=torch.float16,
++            device=_dev,
++        )
 +        self._decode_z_buf = torch.empty(
 +            (1, self.num_v_heads // self.tp_size, self.head_v_dim),
-+            dtype=torch.float16, device=_dev)
++            dtype=torch.float16,
++            device=_dev,
++        )
 +
 +        # Pre-allocated buffer for fused norm+GEMV output (out_proj)
 +        self._decode_outproj_buf = torch.empty(
-+            (1, self.hidden_size),
-+            dtype=torch.float16, device=_dev)
++            (1, self.hidden_size), dtype=torch.float16, device=_dev
++        )
 +        # Cache fp16 norm weight (norm.weight is float32, kernel needs fp16)
 +        self._norm_weight_fp16 = None  # lazily cached after weights loaded
++        # FP8 flag for ESIMD GEMM path
++        self._is_fp8 = quant_config is not None and quant_config.get_name() == "fp8"
++        # BSZ>1 pre-allocated buffers (separate from BSZ=1 to avoid any interference)
++        _mb = int(os.environ.get("MAX_DECODE_BSZ", "64"))
++        self._max_bsz = _mb
++        self._m_qkvz = torch.empty(
++            (_mb, self.projection_size_qkvz // self.tp_size),
++            dtype=torch.float16,
++            device=_dev,
++        )
++        self._m_ba = torch.empty(
++            (_mb, self.projection_size_ba // self.tp_size),
++            dtype=torch.float16,
++            device=_dev,
++        )
++        self._m_attn_out = torch.empty(
++            (_mb, self.num_v_heads // self.tp_size, self.head_v_dim),
++            dtype=torch.float16,
++            device=_dev,
++        )
++        self._m_z = torch.empty(
++            (_mb, self.num_v_heads // self.tp_size, self.head_v_dim),
++            dtype=torch.float16,
++            device=_dev,
++        )
++        self._m_outproj = torch.empty(
++            (_mb, self.hidden_size), dtype=torch.float16, device=_dev
++        )
 +
 +        # Pre-cache values that don't change between forward calls
 +        self._cached_conv_weights = None  # lazily cached after first forward
 +        self._cached_nk_tp = self.num_k_heads // self.tp_size
 +        self._cached_nv_tp = self.num_v_heads // self.tp_size
-+        self._cached_attn_scale = float(self.head_k_dim ** -0.5)
++        self._cached_attn_scale = float(self.head_k_dim**-0.5)
++        # Pre-cached views for decode path — avoids .view() per step
++        nv_tp = self._cached_nv_tp
++        hv = self.head_v_dim
++        self._decode_attn_out_view = self._decode_attn_out_buf.view(nv_tp, hv)
++        self._decode_z_view = self._decode_z_buf.view(nv_tp, hv)
  
      def fix_query_key_value_ordering(
          self,
-@@ -441,6 +533,231 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
+@@ -441,6 +639,363 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
          self,
          hidden_states: torch.Tensor,
          output: torch.Tensor,
@@ -12161,7 +12481,6 @@ index 0f73a7746..40d872ee7 100644
 +            self.forward_xpu(hidden_states, output)
 +        else:
 +            self.forward_cuda(hidden_states, output)
-+
 +
 +    def forward_xpu(
 +        self,
@@ -12175,7 +12494,7 @@ index 0f73a7746..40d872ee7 100644
 +        3. Output projection
 +        """
 +        num_tokens = hidden_states.size(0)
-+        is_decode = (num_tokens == 1)
++        is_decode = num_tokens == 1
 +
 +        # ============================================================
 +        # Part 1: Input Projection
@@ -12194,19 +12513,33 @@ index 0f73a7746..40d872ee7 100644
 +                projected_states_ba,
 +            )
 +        elif num_tokens <= 64:
-+            # M=2-64: ESIMD GEMM (auto-dispatches batched GEMV / WS / DPAS)
-+            N_qkvz = self.in_proj_qkvz.weight.shape[0]
-+            N_ba = self.in_proj_ba.weight.shape[0]
-+            projected_states_qkvz = torch.empty(
-+                (num_tokens, N_qkvz), dtype=torch.float16, device=hidden_states.device)
-+            projected_states_ba = torch.empty(
-+                (num_tokens, N_ba), dtype=torch.float16, device=hidden_states.device)
++            # M=2-64: ESIMD GEMM with pre-allocated buffers
++            if num_tokens <= self._max_bsz:
++                projected_states_qkvz = self._m_qkvz[:num_tokens]
++                projected_states_ba = self._m_ba[:num_tokens]
++            else:
++                N_qkvz = self.in_proj_qkvz.weight.shape[0]
++                N_ba = self.in_proj_ba.weight.shape[0]
++                projected_states_qkvz = torch.empty(
++                    (num_tokens, N_qkvz),
++                    dtype=torch.float16,
++                    device=hidden_states.device,
++                )
++                projected_states_ba = torch.empty(
++                    (num_tokens, N_ba), dtype=torch.float16, device=hidden_states.device
++                )
 +            esimd_gemm_fp8_pert(
-+                hidden_states, self.in_proj_qkvz.weight,
-+                self.in_proj_qkvz.weight_scale, projected_states_qkvz)
++                hidden_states,
++                self.in_proj_qkvz.weight,
++                self.in_proj_qkvz.weight_scale,
++                projected_states_qkvz,
++            )
 +            esimd_gemm_fp8_pert(
-+                hidden_states, self.in_proj_ba.weight,
-+                self.in_proj_ba.weight_scale, projected_states_ba)
++                hidden_states,
++                self.in_proj_ba.weight,
++                self.in_proj_ba.weight_scale,
++                projected_states_ba,
++            )
 +        else:
 +            # Fallback to standard ColumnParallelLinear
 +            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
@@ -12217,12 +12550,15 @@ index 0f73a7746..40d872ee7 100644
 +        # ============================================================
 +        forward_context = get_forward_context()
 +        attn_metadata: AttentionMetadata = forward_context.attn_metadata
-+        # Use pre-allocated buffers only for bsz=1; otherwise allocate dynamically
++        # Pre-allocated buffers: BSZ=1 uses dedicated [1,...], BSZ>1 uses _m_*
 +        if is_decode:
 +            core_attn_out = self._decode_attn_out_buf
 +            z = self._decode_z_buf
++        elif num_tokens <= self._max_bsz:
++            core_attn_out = self._m_attn_out[:num_tokens]
++            z = self._m_z[:num_tokens]
 +        else:
-+            core_attn_out = torch.zeros(
++            core_attn_out = torch.empty(
 +                (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
 +                dtype=hidden_states.dtype,
 +                device=hidden_states.device,
@@ -12242,7 +12578,7 @@ index 0f73a7746..40d872ee7 100644
 +                )
 +            conv_weights = self._cached_conv_weights
 +
-+            _use_esimd_gdn = (
++            _use_esimd_gdn = is_decode or (
 +                attn_metadata.num_prefills == 0
 +                and attn_metadata.num_decodes > 0
 +                and attn_metadata.num_decodes <= 128
@@ -12251,7 +12587,6 @@ index 0f73a7746..40d872ee7 100644
 +            if _use_esimd_gdn:
 +                N_dec = attn_metadata.num_decodes
 +                state_idx = attn_metadata.non_spec_state_indices_tensor[:N_dec]
-+
 +                esimd_gdn_conv_fused(
 +                    projected_states_qkvz,
 +                    conv_state,
@@ -12292,7 +12627,7 @@ index 0f73a7746..40d872ee7 100644
 +                    conv_weights=conv_weights,
 +                    conv_bias=self.conv1d.bias,
 +                    activation=self.activation,
-+                    A_log=self.A_log,
++                    A_log=self.A_log.float(),
 +                    dt_bias=self.dt_bias,
 +                    num_prefills=attn_metadata.num_prefills,
 +                    num_decodes=attn_metadata.num_decodes,
@@ -12301,6 +12636,7 @@ index 0f73a7746..40d872ee7 100644
 +                    non_spec_state_indices_tensor=attn_metadata.non_spec_state_indices_tensor,
 +                    num_actual_tokens=attn_metadata.num_actual_tokens,
 +                    tp_size=self.tp_size,
++                    reorder_input=False,
 +                )
 +
 +        # ============================================================
@@ -12313,16 +12649,40 @@ index 0f73a7746..40d872ee7 100644
 +            if self._norm_weight_fp16 is None:
 +                self._norm_weight_fp16 = self.norm.weight.data.half()
 +            esimd_norm_gemv_fp8_pert(
-+                core_attn_out.view(nv_tp, hv),
-+                z.view(nv_tp, hv),
++                self._decode_attn_out_view,
++                self._decode_z_view,
 +                self._norm_weight_fp16,
 +                self.out_proj.weight,
 +                self.out_proj.weight_scale,
 +                self._decode_outproj_buf,
-+                nv_tp, hv, self.norm.eps,
++                nv_tp,
++                hv,
++                self.norm.eps,
 +            )
-+            output[:1] = tensor_model_parallel_all_reduce(
-+                self._decode_outproj_buf)
++            output[:1] = tensor_model_parallel_all_reduce(self._decode_outproj_buf)
++        elif num_tokens <= 64 and self._is_fp8:
++            # BSZ=2-64: ESIMD norm then ESIMD GEMM for out_proj
++            if self._norm_weight_fp16 is None:
++                self._norm_weight_fp16 = self.norm.weight.data.half()
++            x_flat = core_attn_out.reshape(-1, core_attn_out.shape[-1])
++            z_flat = z.reshape(-1, z.shape[-1])
++            normed = torch.empty_like(x_flat)
++            esimd_rms_norm_gated(x_flat, z_flat, self._norm_weight_fp16,
++                                 normed, self.norm.eps)
++            core_attn_out = normed.reshape(num_tokens, -1)
++            if num_tokens <= self._max_bsz:
++                out_buf = self._m_outproj[:num_tokens]
++            else:
++                out_buf = torch.empty(
++                    num_tokens,
++                    self.hidden_size,
++                    dtype=torch.float16,
++                    device=hidden_states.device,
++                )
++            esimd_gemm_fp8_pert(
++                core_attn_out, self.out_proj.weight, self.out_proj.weight_scale, out_buf
++            )
++            output[:num_tokens] = tensor_model_parallel_all_reduce(out_buf)
 +        else:
 +            z_shape_og = z.shape
 +            core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
@@ -12351,16 +12711,29 @@ index 0f73a7746..40d872ee7 100644
 +            ssm_state = self_kv_cache[1]
 +            if self._cached_conv_weights is None:
 +                self._cached_conv_weights = self.conv1d.weight.view(
-+                    self.conv1d.weight.size(0), self.conv1d.weight.size(2))
++                    self.conv1d.weight.size(0), self.conv1d.weight.size(2)
++                )
 +            N_dec = attn_metadata.num_decodes
 +            state_idx = attn_metadata.non_spec_state_indices_tensor[:N_dec]
 +            esimd_gdn_conv_fused(
-+                projected_states_qkvz, conv_state,
-+                self._cached_conv_weights, self.conv_bias_zeros, state_idx,
-+                self.A_log, self.dt_bias, projected_states_ba,
-+                ssm_state, state_idx, core_attn_out, z,
-+                N_dec, self._cached_nk_tp, self._cached_nv_tp,
-+                self.head_k_dim, self.head_v_dim, self._cached_attn_scale,
++                projected_states_qkvz,
++                conv_state,
++                self._cached_conv_weights,
++                self.conv_bias_zeros,
++                state_idx,
++                self.A_log,
++                self.dt_bias,
++                projected_states_ba,
++                ssm_state,
++                state_idx,
++                core_attn_out,
++                z,
++                N_dec,
++                self._cached_nk_tp,
++                self._cached_nv_tp,
++                self.head_k_dim,
++                self.head_v_dim,
++                self._cached_attn_scale,
 +            )
 +
 +        # Part 3: Output Projection (fused norm + GEMV)
@@ -12369,13 +12742,92 @@ index 0f73a7746..40d872ee7 100644
 +        if self._norm_weight_fp16 is None:
 +            self._norm_weight_fp16 = self.norm.weight.data.half()
 +        esimd_norm_gemv_fp8_pert(
-+            core_attn_out.view(nv_tp, hv), z.view(nv_tp, hv),
++            core_attn_out.view(nv_tp, hv),
++            z.view(nv_tp, hv),
 +            self._norm_weight_fp16,
-+            self.out_proj.weight, self.out_proj.weight_scale,
-+            self._decode_outproj_buf, nv_tp, hv, self.norm.eps,
++            self.out_proj.weight,
++            self.out_proj.weight_scale,
++            self._decode_outproj_buf,
++            nv_tp,
++            hv,
++            self.norm.eps,
 +        )
-+        output[:1] = tensor_model_parallel_all_reduce(
-+            self._decode_outproj_buf)
++        output[:1] = tensor_model_parallel_all_reduce(self._decode_outproj_buf)
++
++    def forward_xpu_batched_precomputed_proj(
++        self,
++        projected_states_qkvz: torch.Tensor,
++        projected_states_ba: torch.Tensor,
++        output: torch.Tensor,
++    ):
++        """BSZ>1 decode fast path: input projection already done by caller."""
++        num_tokens = projected_states_qkvz.size(0)
++        forward_context = get_forward_context()
++        attn_metadata: AttentionMetadata = forward_context.attn_metadata
++
++        # Part 2: Core Attention — pre-allocated buffers, no torch.zeros
++        if num_tokens <= self._max_bsz:
++            core_attn_out = self._m_attn_out[:num_tokens]
++            z = self._m_z[:num_tokens]
++        else:
++            core_attn_out = torch.empty(
++                (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
++                dtype=torch.float16,
++                device=output.device,
++            )
++            z = torch.empty_like(core_attn_out)
++
++        if attn_metadata is not None:
++            attn_metadata = attn_metadata[self.prefix]
++            self_kv_cache = self.kv_cache[forward_context.virtual_engine]
++            conv_state = self_kv_cache[0]
++            ssm_state = self_kv_cache[1]
++            if self._cached_conv_weights is None:
++                self._cached_conv_weights = self.conv1d.weight.view(
++                    self.conv1d.weight.size(0), self.conv1d.weight.size(2)
++                )
++            N_dec = attn_metadata.num_decodes
++            state_idx = attn_metadata.non_spec_state_indices_tensor[:N_dec]
++            esimd_gdn_conv_fused(
++                projected_states_qkvz,
++                conv_state,
++                self._cached_conv_weights,
++                self.conv_bias_zeros,
++                state_idx,
++                self.A_log,
++                self.dt_bias,
++                projected_states_ba,
++                ssm_state,
++                state_idx,
++                core_attn_out,
++                z,
++                N_dec,
++                self._cached_nk_tp,
++                self._cached_nv_tp,
++                self.head_k_dim,
++                self.head_v_dim,
++                self._cached_attn_scale,
++            )
++
++        # Part 3: Output Projection — ESIMD norm + ESIMD GEMM
++        if self._norm_weight_fp16 is None:
++            self._norm_weight_fp16 = self.norm.weight.data.half()
++        x_flat = core_attn_out.reshape(-1, core_attn_out.shape[-1])
++        z_flat = z.reshape(-1, z.shape[-1])
++        normed = torch.empty_like(x_flat)
++        esimd_rms_norm_gated(x_flat, z_flat, self._norm_weight_fp16,
++                             normed, self.norm.eps)
++        core_attn_out = normed.reshape(num_tokens, -1)
++        if num_tokens <= self._max_bsz:
++            out_buf = self._m_outproj[:num_tokens]
++        else:
++            out_buf = torch.empty(
++                num_tokens, self.hidden_size, dtype=torch.float16, device=output.device
++            )
++        esimd_gemm_fp8_pert(
++            core_attn_out, self.out_proj.weight, self.out_proj.weight_scale, out_buf
++        )
++        output[:num_tokens] = tensor_model_parallel_all_reduce(out_buf)
 +
 +    def forward_cuda(
 +        self,
@@ -12384,34 +12836,51 @@ index 0f73a7746..40d872ee7 100644
      ):
          """
          Forward pass with three parts:
-@@ -778,42 +1095,204 @@ class Qwen3NextAttention(nn.Module):
+@@ -778,42 +1333,345 @@ class Qwen3NextAttention(nn.Module):
          self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
          self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
  
 +        # Cache env flag for ESIMD QKV kernel
-+        self._esimd_qkv_enabled = (
-+            os.environ.get("DISABLE_ESIMD_QKV", "0") != "1"
-+        )
++        self._esimd_qkv_enabled = os.environ.get("DISABLE_ESIMD_QKV", "0") != "1"
 +
 +        # FP8 detection: buffers always allocated for FP8 (used by both opt2 and opt3)
 +        # Set DISABLE_ESIMD_ATTN_GEMV=1 to disable opt2 (qkv/o GEMV in forward)
-+        self._is_fp8 = (
-+            quant_config is not None
-+            and quant_config.get_name() == "fp8"
-+        )
++        self._is_fp8 = quant_config is not None and quant_config.get_name() == "fp8"
 +        self._use_esimd_attn_gemv = (
-+            self._is_fp8
-+            and os.environ.get("DISABLE_ESIMD_ATTN_GEMV", "0") != "1"
++            self._is_fp8 and os.environ.get("DISABLE_ESIMD_ATTN_GEMV", "0") != "1"
 +        )
-+        if self._is_fp8:
++        self._max_bsz = 0  # default for non-FP8; overwritten below if FP8
++
++        # INT4 detection
++        self._is_sym_int4 = (
++            quant_config is not None
++            and quant_config.get_name() == "sym_int4"
++        )
++
++        if self._is_fp8 or self._is_sym_int4:
 +            _dev = current_platform.current_device()
 +            # qkv_proj output size (after TP sharding)
 +            _qkv_out = self.q_size * (1 + self.attn_output_gate) + 2 * self.kv_size
 +            self._decode_qkv_buf = torch.empty(
-+                1, _qkv_out, dtype=torch.float16, device=_dev)
++                1, _qkv_out, dtype=torch.float16, device=_dev
++            )
 +            # o_proj output size
 +            self._decode_o_buf = torch.empty(
-+                1, config.hidden_size, dtype=torch.float16, device=_dev)
++                1, config.hidden_size, dtype=torch.float16, device=_dev
++            )
++            # BSZ>1 pre-allocated buffers
++            _mb = int(os.environ.get("MAX_DECODE_BSZ", "64"))
++            self._max_bsz = _mb
++            self._m_qkv = torch.empty(_mb, _qkv_out, dtype=torch.float16, device=_dev)
++            self._m_o = torch.empty(
++                _mb, config.hidden_size, dtype=torch.float16, device=_dev
++            )
++            self._m_q = torch.empty(_mb, self.q_size, dtype=torch.float16, device=_dev)
++            self._m_gate = torch.empty(
++                _mb, self.q_size, dtype=torch.float16, device=_dev
++            )
++            self._m_k = torch.empty(_mb, self.kv_size, dtype=torch.float16, device=_dev)
++            self._m_v = torch.empty(_mb, self.kv_size, dtype=torch.float16, device=_dev)
 +
      def forward(
          self,
@@ -12428,42 +12897,68 @@ index 0f73a7746..40d872ee7 100644
 +                hidden_states,
 +                self.qkv_proj.weight,
 +                self.qkv_proj.weight_scale,
++                self._decode_qkv_buf,
++            )
++            qkv = self._decode_qkv_buf
++        elif _ntoks == 1 and self._is_sym_int4:
++            from custom_esimd_kernels_vllm import esimd_gemv_int4
++            esimd_gemv_int4(
++                hidden_states,
++                self.qkv_proj.weight_esimd,
++                self.qkv_proj.scale_esimd,
 +                self._decode_qkv_buf)
 +            qkv = self._decode_qkv_buf
 +        elif _ntoks <= 128 and self._use_esimd_attn_gemv:
-+            qkv = torch.empty(
-+                _ntoks, self.qkv_proj.weight.shape[0],
-+                dtype=torch.float16, device=hidden_states.device)
++            if _ntoks <= self._max_bsz:
++                qkv = self._m_qkv[:_ntoks]
++            else:
++                qkv = torch.empty(
++                    _ntoks,
++                    self.qkv_proj.weight.shape[0],
++                    dtype=torch.float16,
++                    device=hidden_states.device,
++                )
 +            esimd_gemm_fp8_pert(
-+                hidden_states,
-+                self.qkv_proj.weight,
-+                self.qkv_proj.weight_scale,
-+                qkv)
++                hidden_states, self.qkv_proj.weight, self.qkv_proj.weight_scale, qkv
++            )
 +        else:
 +            qkv, _ = self.qkv_proj(hidden_states)
 +
 +        # ---- QKV split + norm + RoPE ----
 +        if _ntoks <= 128 and self._esimd_qkv_enabled:
 +            # ESIMD fused kernel: split + RMSNorm + RoPE + sigmoid(gate)
-+            q = torch.empty(
-+                (_ntoks, self.q_size), dtype=torch.float16,
-+                device=hidden_states.device,
-+            )
-+            gate = torch.empty(
-+                (_ntoks, self.q_size), dtype=torch.float16,
-+                device=hidden_states.device,
-+            )
-+            k = torch.empty(
-+                (_ntoks, self.kv_size), dtype=torch.float16,
-+                device=hidden_states.device,
-+            )
-+            v = torch.empty(
-+                (_ntoks, self.kv_size), dtype=torch.float16,
-+                device=hidden_states.device,
-+            )
++            if _ntoks <= self._max_bsz:
++                q = self._m_q[:_ntoks]
++                gate = self._m_gate[:_ntoks]
++                k = self._m_k[:_ntoks]
++                v = self._m_v[:_ntoks]
++            else:
++                q = torch.empty(
++                    (_ntoks, self.q_size),
++                    dtype=torch.float16,
++                    device=hidden_states.device,
++                )
++                gate = torch.empty(
++                    (_ntoks, self.q_size),
++                    dtype=torch.float16,
++                    device=hidden_states.device,
++                )
++                k = torch.empty(
++                    (_ntoks, self.kv_size),
++                    dtype=torch.float16,
++                    device=hidden_states.device,
++                )
++                v = torch.empty(
++                    (_ntoks, self.kv_size),
++                    dtype=torch.float16,
++                    device=hidden_states.device,
++                )
 +            esimd_qkv_split_norm_rope(
 +                qkv,
-+                q, gate, k, v,
++                q,
++                gate,
++                k,
++                v,
 +                self.q_norm.weight,
 +                self.k_norm.weight,
 +                positions.to(torch.int32),
@@ -12485,21 +12980,13 @@ index 0f73a7746..40d872ee7 100644
 +                gate = gate.reshape(*orig_shape, -1)
 +            else:
 +                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
- 
--        if self.attn_output_gate:
--            q_gate, k, v = qkv.split(
--                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
++
 +            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
 +                -1, self.num_heads * self.head_dim
 +            )
 +            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
 +                -1, self.num_kv_heads * self.head_dim
-             )
--            orig_shape = q_gate.shape[:-1]
--            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
--            q, gate = torch.chunk(q_gate, 2, dim=-1)
--            q = q.reshape(*orig_shape, -1)
--            gate = gate.reshape(*orig_shape, -1)
++            )
 +
 +            q, k = self.rotary_emb(positions, q, k)
 +
@@ -12508,8 +12995,10 @@ index 0f73a7746..40d872ee7 100644
 +                gate = torch.sigmoid(gate)
 +
 +        attn_output = self.attn(q, k, v)
-+
-+        if self.attn_output_gate:
+ 
+         if self.attn_output_gate:
+-            q_gate, k, v = qkv.split(
+-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
 +            attn_output = attn_output * gate
 +
 +        # ---- o_proj: ESIMD GEMV (M=1) / GEMM (M=2-128) ----
@@ -12518,19 +13007,37 @@ index 0f73a7746..40d872ee7 100644
 +                attn_output,
 +                self.o_proj.weight,
 +                self.o_proj.weight_scale,
++                self._decode_o_buf,
+             )
+-            orig_shape = q_gate.shape[:-1]
+-            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+-            q, gate = torch.chunk(q_gate, 2, dim=-1)
+-            q = q.reshape(*orig_shape, -1)
+-            gate = gate.reshape(*orig_shape, -1)
++            output[:1] = tensor_model_parallel_all_reduce(self._decode_o_buf)
++        elif _ntoks == 1 and self._is_sym_int4:
++            from custom_esimd_kernels_vllm import esimd_gemv_int4
++            esimd_gemv_int4(
++                attn_output,
++                self.o_proj.weight_esimd,
++                self.o_proj.scale_esimd,
 +                self._decode_o_buf)
 +            output[:1] = tensor_model_parallel_all_reduce(
 +                self._decode_o_buf)
 +        elif _ntoks <= 128 and self._use_esimd_attn_gemv:
-+            o_out = torch.empty(
-+                _ntoks, self.o_proj.weight.shape[0],
-+                dtype=torch.float16, device=hidden_states.device)
++            if _ntoks <= self._max_bsz:
++                o_out = self._m_o[:_ntoks]
++            else:
++                o_out = torch.empty(
++                    _ntoks,
++                    self.o_proj.weight.shape[0],
++                    dtype=torch.float16,
++                    device=hidden_states.device,
++                )
 +            esimd_gemm_fp8_pert(
-+                attn_output,
-+                self.o_proj.weight,
-+                self.o_proj.weight_scale,
-+                o_out)
-+            output[:] = tensor_model_parallel_all_reduce(o_out)
++                attn_output, self.o_proj.weight, self.o_proj.weight_scale, o_out
++            )
++            output[:_ntoks] = tensor_model_parallel_all_reduce(o_out)
          else:
 -            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 +            output[:], _ = self.o_proj(attn_output)
@@ -12550,19 +13057,21 @@ index 0f73a7746..40d872ee7 100644
 +        """Decode-only fast path: qkv_proj already done by caller."""
 +        if self._esimd_qkv_enabled:
 +            # ESIMD fused kernel: split + RMSNorm + RoPE + sigmoid(gate)
-+            q = torch.empty(
-+                (1, self.q_size), dtype=torch.float16, device=qkv.device)
-+            gate = torch.empty(
-+                (1, self.q_size), dtype=torch.float16, device=qkv.device)
-+            k = torch.empty(
-+                (1, self.kv_size), dtype=torch.float16, device=qkv.device)
-+            v = torch.empty(
-+                (1, self.kv_size), dtype=torch.float16, device=qkv.device)
++            q = torch.empty((1, self.q_size), dtype=torch.float16, device=qkv.device)
++            gate = torch.empty((1, self.q_size), dtype=torch.float16, device=qkv.device)
++            k = torch.empty((1, self.kv_size), dtype=torch.float16, device=qkv.device)
++            v = torch.empty((1, self.kv_size), dtype=torch.float16, device=qkv.device)
 +            esimd_qkv_split_norm_rope(
-+                qkv, q, gate, k, v,
-+                self.q_norm.weight, self.k_norm.weight,
++                qkv,
++                q,
++                gate,
++                k,
++                v,
++                self.q_norm.weight,
++                self.k_norm.weight,
 +                positions.to(torch.int32),
-+                self.num_heads, self.num_kv_heads,
++                self.num_heads,
++                self.num_kv_heads,
 +                self.attn_output_gate,
 +                int(self.head_dim * getattr(self.config, "partial_rotary_factor", 1.0)),
 +                self.rotary_emb.cos_sin_cache,
@@ -12571,21 +13080,23 @@ index 0f73a7746..40d872ee7 100644
 +            # Standard split + norm + RoPE fallback
 +            if self.attn_output_gate:
 +                q_gate, k, v = qkv.split(
-+                    [self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
++                    [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
++                )
 +                orig_shape = q_gate.shape[:-1]
 +                q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
 +                q, gate = torch.chunk(q_gate, 2, dim=-1)
 +                q = q.reshape(*orig_shape, -1)
 +                gate = gate.reshape(*orig_shape, -1)
 +            else:
-+                q, k, v = qkv.split(
-+                    [self.q_size, self.kv_size, self.kv_size], dim=-1)
++                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
  
 -        q, k = self.rotary_emb(positions, q, k)
 +            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
-+                -1, self.num_heads * self.head_dim)
++                -1, self.num_heads * self.head_dim
++            )
 +            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
-+                -1, self.num_kv_heads * self.head_dim)
++                -1, self.num_kv_heads * self.head_dim
++            )
 +            q, k = self.rotary_emb(positions, q, k)
 +            if self.attn_output_gate:
 +                gate = torch.sigmoid(gate)
@@ -12602,24 +13113,106 @@ index 0f73a7746..40d872ee7 100644
 +            attn_output,
 +            self.o_proj.weight,
 +            self.o_proj.weight_scale,
-+            self._decode_o_buf)
-+        output[:1] = tensor_model_parallel_all_reduce(
-+            self._decode_o_buf)
++            self._decode_o_buf,
++        )
++        output[:1] = tensor_model_parallel_all_reduce(self._decode_o_buf)
++
++    def forward_batched_precomputed_qkv(
++        self,
++        qkv: torch.Tensor,
++        positions: torch.Tensor,
++        output: torch.Tensor,
++    ):
++        """BSZ>1 decode fast path: qkv_proj already done by caller."""
++        _ntoks = qkv.shape[0]
++        if self._esimd_qkv_enabled:
++            if _ntoks <= self._max_bsz:
++                q, gate = self._m_q[:_ntoks], self._m_gate[:_ntoks]
++                k, v = self._m_k[:_ntoks], self._m_v[:_ntoks]
++            else:
++                q = torch.empty(
++                    (_ntoks, self.q_size), dtype=torch.float16, device=qkv.device
++                )
++                gate = torch.empty(
++                    (_ntoks, self.q_size), dtype=torch.float16, device=qkv.device
++                )
++                k = torch.empty(
++                    (_ntoks, self.kv_size), dtype=torch.float16, device=qkv.device
++                )
++                v = torch.empty(
++                    (_ntoks, self.kv_size), dtype=torch.float16, device=qkv.device
++                )
++            esimd_qkv_split_norm_rope(
++                qkv,
++                q,
++                gate,
++                k,
++                v,
++                self.q_norm.weight,
++                self.k_norm.weight,
++                positions.to(torch.int32),
++                self.num_heads,
++                self.num_kv_heads,
++                self.attn_output_gate,
++                int(self.head_dim * getattr(self.config, "partial_rotary_factor", 1.0)),
++                self.rotary_emb.cos_sin_cache,
++            )
++        else:
++            if self.attn_output_gate:
++                q_gate, k, v = qkv.split(
++                    [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
++                )
++                orig_shape = q_gate.shape[:-1]
++                q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
++                q, gate = torch.chunk(q_gate, 2, dim=-1)
++                q = q.reshape(*orig_shape, -1)
++                gate = gate.reshape(*orig_shape, -1)
++            else:
++                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
++            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
++                -1, self.num_heads * self.head_dim
++            )
++            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
++                -1, self.num_kv_heads * self.head_dim
++            )
++            q, k = self.rotary_emb(positions, q, k)
++            if self.attn_output_gate:
++                gate = torch.sigmoid(gate)
++
++        attn_output = self.attn(q, k, v)
++        if self.attn_output_gate:
++            attn_output = attn_output * gate
++
++        # o_proj ESIMD GEMM + all_reduce
++        if _ntoks <= self._max_bsz:
++            o_out = self._m_o[:_ntoks]
++        else:
++            o_out = torch.empty(
++                _ntoks,
++                self.o_proj.weight.shape[0],
++                dtype=torch.float16,
++                device=qkv.device,
++            )
++        esimd_gemm_fp8_pert(
++            attn_output, self.o_proj.weight, self.o_proj.weight_scale, o_out
++        )
++        output[:_ntoks] = tensor_model_parallel_all_reduce(o_out)
  
  
  class Qwen3NextDecoderLayer(nn.Module):
-@@ -900,6 +1379,74 @@ class Qwen3NextDecoderLayer(nn.Module):
+@@ -900,6 +1758,107 @@ class Qwen3NextDecoderLayer(nn.Module):
                  ),
              )
  
-+        # Detect dense MLP with FP8 quantization for ESIMD fast path
++        # Detect dense MLP with FP8/INT4 quantization for ESIMD fast path
++        _quant_name = quant_config.get_name() if quant_config is not None else ""
 +        self._dense_mlp_fp8 = (
 +            isinstance(self.mlp, Qwen3NextMLP)
 +            and self.mlp.expert_gate is None
-+            and quant_config is not None
-+            and quant_config.get_name() == "fp8"
++            and _quant_name in ("fp8", "sym_int4")
 +            and os.environ.get("DISABLE_ESIMD_DENSE", "0") != "1"
 +        )
++        self._dense_mlp_is_int4 = (_quant_name == "sym_int4") if self._dense_mlp_fp8 else False
 +        if self._dense_mlp_fp8:
 +            _dev = current_platform.current_device()
 +            tp_size = get_tensor_model_parallel_world_size()
@@ -12627,40 +13220,53 @@ index 0f73a7746..40d872ee7 100644
 +            _hidden = config.hidden_size
 +            # Pre-allocate decode buffers (bsz=1)
 +            self._dense_gate_up_buf = torch.empty(
-+                1, 2 * _inter_tp, dtype=torch.float16, device=_dev)
++                1, 2 * _inter_tp, dtype=torch.float16, device=_dev
++            )
 +            self._dense_down_buf = torch.empty(
-+                1, _hidden, dtype=torch.float16, device=_dev)
++                1, _hidden, dtype=torch.float16, device=_dev
++            )
 +            self._dense_normed_buf = torch.empty(
-+                1, _hidden, dtype=torch.float16, device=_dev)
++                1, _hidden, dtype=torch.float16, device=_dev
++            )
++            # BSZ>1 pre-allocated buffers
++            _mb = int(os.environ.get("MAX_DECODE_BSZ", "64"))
++            self._max_bsz = _mb
++            self._m_gate_up = torch.empty(
++                _mb, 2 * _inter_tp, dtype=torch.float16, device=_dev
++            )
++            self._m_down = torch.empty(_mb, _hidden, dtype=torch.float16, device=_dev)
 +            # Lazily cached after weights are loaded
 +            self._dense_post_norm_w_fp16 = None
 +
-+        # Detect MoE with FP8 for ESIMD fused norm+router path
++        # Detect MoE with FP8/INT4 for ESIMD fused norm+router path
 +        self._moe_fp8 = (
 +            isinstance(self.mlp, Qwen3NextSparseMoeBlock)
-+            and hasattr(self.mlp, 'use_fp8')
-+            and self.mlp.use_fp8
++            and hasattr(self.mlp, 'gate')
++            and _quant_name in ("fp8", "sym_int4")
 +        )
++        self._moe_is_int4 = (_quant_name == "sym_int4") if self._moe_fp8 else False
 +        if self._moe_fp8:
 +            _dev = current_platform.current_device()
 +            n_exp = self.mlp.gate.weight.shape[0]
 +            self._post_norm_w_fp16 = None  # lazily cached
-+            self._router_buf = torch.empty(
-+                1, n_exp, dtype=torch.float16, device=_dev)
++            self._router_buf = torch.empty(1, n_exp, dtype=torch.float16, device=_dev)
 +            self._normed_buf = torch.empty(
-+                1, config.hidden_size, dtype=torch.float16, device=_dev)
++                1, config.hidden_size, dtype=torch.float16, device=_dev
++            )
 +
 +        # Detect fused input_norm + input_proj opportunity (FP8, decode)
 +        # Set DISABLE_ESIMD_FUSED_INPUT=1 to disable this optimization
-+        _is_fp8 = (quant_config is not None
-+                    and quant_config.get_name() == "fp8")
++        _is_fp8 = quant_config is not None and quant_config.get_name() == "fp8"
 +        self._fused_input_norm = (
-+            _is_fp8 and not self.layer_scale
++            _is_fp8
++            and not self.layer_scale
 +            and os.environ.get("DISABLE_ESIMD_FUSED_INPUT", "0") != "1"
 +        )
 +        if self._fused_input_norm:
 +            _dev = current_platform.current_device()
 +            _hidden = config.hidden_size
++            _mb = int(os.environ.get("MAX_DECODE_BSZ", "64"))
++            self._input_max_bsz = _mb
 +            self._input_norm_w_fp16 = None  # lazily cached
 +            if self.layer_type == "linear_attention":
 +                # GDN: fuse norm + in_proj_qkvz + in_proj_ba (2 GEMVs)
@@ -12668,22 +13274,41 @@ index 0f73a7746..40d872ee7 100644
 +                _qkvz_sz = self.linear_attn.projection_size_qkvz // tp_size
 +                _ba_sz = self.linear_attn.projection_size_ba // tp_size
 +                self._fused_qkvz_buf = torch.empty(
-+                    1, _qkvz_sz, dtype=torch.float16, device=_dev)
++                    1, _qkvz_sz, dtype=torch.float16, device=_dev
++                )
 +                self._fused_ba_buf = torch.empty(
-+                    1, _ba_sz, dtype=torch.float16, device=_dev)
++                    1, _ba_sz, dtype=torch.float16, device=_dev
++                )
++                # BSZ>1 input proj buffers
++                self._m_fused_qkvz = torch.empty(
++                    _mb, _qkvz_sz, dtype=torch.float16, device=_dev
++                )
++                self._m_fused_ba = torch.empty(
++                    _mb, _ba_sz, dtype=torch.float16, device=_dev
++                )
 +            elif self.layer_type == "full_attention":
 +                # Full Attn: fuse norm + qkv_proj (1 GEMV)
 +                _qkv_sz = self.self_attn.qkv_proj.weight.shape[0]
 +                self._fused_qkv_buf = torch.empty(
-+                    1, _qkv_sz, dtype=torch.float16, device=_dev)
++                    1, _qkv_sz, dtype=torch.float16, device=_dev
++                )
 +                # normed_out buffer (needed by kernel, not used later)
 +                self._fused_normed_buf = torch.empty(
-+                    1, _hidden, dtype=torch.float16, device=_dev)
++                    1, _hidden, dtype=torch.float16, device=_dev
++                )
++                # BSZ>1 input proj buffer
++                self._m_fused_qkv = torch.empty(
++                    _mb, _qkv_sz, dtype=torch.float16, device=_dev
++                )
++            # BSZ>1 output buffer
++            self._m_attn_output = torch.empty(
++                _mb, _hidden, dtype=torch.float16, device=_dev
++            )
 +
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -907,27 +1454,78 @@ class Qwen3NextDecoderLayer(nn.Module):
+@@ -907,27 +1866,109 @@ class Qwen3NextDecoderLayer(nn.Module):
          positions: torch.Tensor = None,
          **kwargs: object,
      ):
@@ -12693,52 +13318,6 @@ index 0f73a7746..40d872ee7 100644
 -        else:
 -            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 +        n_tok = hidden_states.shape[0]
-+
-+        # ---- Fused input_norm + input_proj for decode (M=1) ----
-+        if (n_tok == 1 and self._fused_input_norm
-+                and residual is not None):
-+            if self._input_norm_w_fp16 is None:
-+                self._input_norm_w_fp16 = \
-+                    (self.input_layernorm.weight.data + 1.0).half()
-+            _eps = self.input_layernorm.variance_epsilon
-+
-+            if self.layer_type == "linear_attention":
-+                # Separate norm + fused 2-GEMV (fused norm kernel inaccurate)
-+                gdn = self.linear_attn
-+                hidden_states, residual = self.input_layernorm(
-+                    hidden_states, residual)
-+                esimd_gemv_fp8_pert_fused2(
-+                    hidden_states,
-+                    gdn.in_proj_qkvz.weight,
-+                    gdn.in_proj_qkvz.weight_scale,
-+                    self._fused_qkvz_buf,
-+                    gdn.in_proj_ba.weight,
-+                    gdn.in_proj_ba.weight_scale,
-+                    self._fused_ba_buf,
-+                )
-+                # Pass pre-computed projections; skip input_proj in GDN
-+                self_attention_output = torch.empty_like(hidden_states)
-+                gdn.forward_xpu_with_precomputed_proj(
-+                    self._fused_qkvz_buf, self._fused_ba_buf,
-+                    self_attention_output)
-+
-+            elif self.layer_type == "full_attention":
-+                # Separate norm + ESIMD GEMV (fused kernel inaccurate for large N)
-+                attn = self.self_attn
-+                hidden_states, residual = self.input_layernorm(
-+                    hidden_states, residual)
-+                esimd_gemv_fp8_pert(
-+                    hidden_states,
-+                    attn.qkv_proj.weight,
-+                    attn.qkv_proj.weight_scale,
-+                    self._fused_qkv_buf)
-+                self_attention_output = torch.empty_like(hidden_states)
-+                attn.forward_with_precomputed_qkv(
-+                    self._fused_qkv_buf, positions,
-+                    self_attention_output)
-+            else:
-+                raise ValueError("Invalid layer_type")
-+            hidden_states = self_attention_output
  
 -        self_attention_output = torch.empty_like(hidden_states)
 -        if self.layer_type == "linear_attention":
@@ -12752,7 +13331,85 @@ index 0f73a7746..40d872ee7 100644
 -                output=self_attention_output,
 -                positions=positions,
 -            )
-+        # ---- Standard path ----
++        # ---- Fused input_norm + input_proj (BSZ=1: GEMV, BSZ>1: GEMM) ----
++        if (
++            self._fused_input_norm
++            and residual is not None
++            and n_tok <= self._input_max_bsz
++        ):
++            if self._input_norm_w_fp16 is None:
++                self._input_norm_w_fp16 = \
++                    (self.input_layernorm.weight.data + 1.0).half()
++            esimd_fused_add_rms_norm_batched(
++                    hidden_states, residual, self._input_norm_w_fp16,
++                    self.input_layernorm.variance_epsilon)
++
++            if self.layer_type == "linear_attention":
++                gdn = self.linear_attn
++                if n_tok == 1:
++                    # BSZ=1: fused 2-GEMV
++                    esimd_gemv_fp8_pert_fused2(
++                        hidden_states,
++                        gdn.in_proj_qkvz.weight,
++                        gdn.in_proj_qkvz.weight_scale,
++                        self._fused_qkvz_buf,
++                        gdn.in_proj_ba.weight,
++                        gdn.in_proj_ba.weight_scale,
++                        self._fused_ba_buf,
++                    )
++                    self_attention_output = self._m_attn_output[:1]
++                    gdn.forward_xpu_with_precomputed_proj(
++                        self._fused_qkvz_buf, self._fused_ba_buf, self_attention_output
++                    )
++                else:
++                    # Bug B workaround: the GDN BSZ>1 precomputed-proj path
++                    # (forward_xpu_batched_precomputed_proj) has a numerical
++                    # issue - most likely _m_attn_out/_m_z are not zeroed
++                    # before esimd_gdn_conv_fused accumulates into them, or
++                    # state_idx is mis-indexed during prefill.
++                    # Fall back to the standard GDN forward for BSZ>1; this
++                    # re-runs in_proj on the already-normed hidden_states (the
++                    # esimd_fused_add_rms_norm_batched call above writes the
++                    # normed value back in place), matching 0413 behavior.
++                    # ARC-500 recovers from 0.480 to 0.604 (matches base 0.606).
++                    self_attention_output = torch.empty_like(hidden_states)
++                    gdn(
++                        hidden_states=hidden_states,
++                        output=self_attention_output,
++                    )
++
++            elif self.layer_type == "full_attention":
++                attn = self.self_attn
++                if n_tok == 1:
++                    # BSZ=1: GEMV
++                    esimd_gemv_fp8_pert(
++                        hidden_states,
++                        attn.qkv_proj.weight,
++                        attn.qkv_proj.weight_scale,
++                        self._fused_qkv_buf,
++                    )
++                    self_attention_output = self._m_attn_output[:1]
++                    attn.forward_with_precomputed_qkv(
++                        self._fused_qkv_buf, positions, self_attention_output
++                    )
++                else:
++                    # BSZ>1: GEMM
++                    qkv_buf = self._m_fused_qkv[:n_tok]
++                    esimd_gemm_fp8_pert(
++                        hidden_states,
++                        attn.qkv_proj.weight,
++                        attn.qkv_proj.weight_scale,
++                        qkv_buf,
++                    )
++                    self_attention_output = self._m_attn_output[:n_tok]
++                    attn.forward_batched_precomputed_qkv(
++                        qkv_buf, positions, self_attention_output
++                    )
++            else:
++                raise ValueError("Invalid layer_type")
++            hidden_states = self_attention_output
++
++        # ---- Standard path (first layer or fallback) ----
          else:
 -            raise ValueError("Invalid layer_type")
 -        hidden_states = self_attention_output
@@ -12760,8 +13417,7 @@ index 0f73a7746..40d872ee7 100644
 +                residual = hidden_states
 +                hidden_states = self.input_layernorm(hidden_states)
 +            else:
-+                hidden_states, residual = self.input_layernorm(
-+                    hidden_states, residual)
++                hidden_states, residual = self.input_layernorm(hidden_states, residual)
 +
 +            self_attention_output = torch.empty_like(hidden_states)
 +            if self.layer_type == "linear_attention":
@@ -12781,7 +13437,7 @@ index 0f73a7746..40d872ee7 100644
  
          if self.layer_scale:
              if len(hidden_states.shape) == 2:
-@@ -939,9 +1537,83 @@ class Qwen3NextDecoderLayer(nn.Module):
+@@ -939,9 +1980,102 @@ class Qwen3NextDecoderLayer(nn.Module):
                      self.attn_layer_scale.to(hidden_states.dtype) + 1
                  )
  
@@ -12791,84 +13447,103 @@ index 0f73a7746..40d872ee7 100644
 +        n_tokens = hidden_states.shape[0]
 +
 +        # ---- Dense MLP ESIMD fast path (FP8 decode / small batch) ----
-+        if (self._dense_mlp_fp8 and not self.layer_scale
-+                and n_tokens <= 128):
++        if self._dense_mlp_fp8 and not self.layer_scale and n_tokens <= 128:
 +            if self._dense_post_norm_w_fp16 is None:
-+                self._dense_post_norm_w_fp16 = \
-+                    (self.post_attention_layernorm.weight.data + 1.0).half()
++                self._dense_post_norm_w_fp16 = (
++                    self.post_attention_layernorm.weight.data + 1.0
++                ).half()
 +
-+            if n_tokens == 1:
-+                # Decode: fused resadd + norm + gate_up GEMV (one kernel)
-+                esimd_resadd_norm_gemv_fp8_pert(
-+                    hidden_states, residual,
-+                    self._dense_post_norm_w_fp16,
-+                    self.mlp.gate_up_proj.weight,
-+                    self.mlp.gate_up_proj.weight_scale,
-+                    self._dense_gate_up_buf,
-+                    self._dense_normed_buf,
-+                    self.post_attention_layernorm.variance_epsilon,
-+                )
-+                # SiluAndMul
-+                act_out = self.mlp.act_fn(self._dense_gate_up_buf)
-+                # down_proj GEMV
-+                esimd_gemv_fp8_pert(
-+                    act_out,
-+                    self.mlp.down_proj.weight,
-+                    self.mlp.down_proj.weight_scale,
-+                    self._dense_down_buf)
-+                hidden_states = tensor_model_parallel_all_reduce(
-+                    self._dense_down_buf)
++            # ESIMD norm + 2x ESIMD GEMM (M=1..128).
++            # The FP8 GEMV kernels only reach ~23% HBM bandwidth at M=1 on
++            # BMG, while GEMM reaches ~100% even at M=1, so route M=1
++            # through GEMM as well. Slicing _m_gate_up/_m_down with [:1]
++            # is valid since _max_bsz >= 1.
++            esimd_fused_add_rms_norm_batched(
++                hidden_states, residual, self._dense_post_norm_w_fp16,
++                self.post_attention_layernorm.variance_epsilon
++            )
++            if n_tokens <= self._max_bsz:
++                gate_up_out = self._m_gate_up[:n_tokens]
 +            else:
-+                # Small batch (M=2-128): norm + ESIMD GEMM
-+                hidden_states, residual = self.post_attention_layernorm(
-+                    hidden_states, residual)
 +                gate_up_out = torch.empty(
-+                    n_tokens, self.mlp.gate_up_proj.weight.shape[0],
-+                    dtype=torch.float16, device=hidden_states.device)
-+                esimd_gemm_fp8_pert(
-+                    hidden_states,
-+                    self.mlp.gate_up_proj.weight,
-+                    self.mlp.gate_up_proj.weight_scale,
-+                    gate_up_out)
-+                act_out = self.mlp.act_fn(gate_up_out)
++                    n_tokens,
++                    self.mlp.gate_up_proj.weight.shape[0],
++                    dtype=torch.float16,
++                    device=hidden_states.device,
++                )
++            esimd_gemm_fp8_pert(
++                hidden_states,
++                self.mlp.gate_up_proj.weight,
++                self.mlp.gate_up_proj.weight_scale,
++                gate_up_out,
++            )
++            act_out = self.mlp.act_fn(gate_up_out)
++            if n_tokens <= self._max_bsz:
++                down_out = self._m_down[:n_tokens]
++            else:
 +                down_out = torch.empty(
-+                    n_tokens, self.mlp.down_proj.weight.shape[0],
-+                    dtype=torch.float16, device=hidden_states.device)
-+                esimd_gemm_fp8_pert(
-+                    act_out,
-+                    self.mlp.down_proj.weight,
-+                    self.mlp.down_proj.weight_scale,
-+                    down_out)
-+                hidden_states = tensor_model_parallel_all_reduce(down_out)
++                    n_tokens,
++                    self.mlp.down_proj.weight.shape[0],
++                    dtype=torch.float16,
++                    device=hidden_states.device,
++                )
++            esimd_gemm_fp8_pert(
++                act_out,
++                self.mlp.down_proj.weight,
++                self.mlp.down_proj.weight_scale,
++                down_out,
++            )
++            hidden_states = tensor_model_parallel_all_reduce(down_out)
 +
 +        # ---- MoE fused post_attn_norm + router for decode (bsz=1) ----
-+        elif (n_tokens == 1 and self._moe_fp8 and not self.layer_scale):
++        elif n_tokens == 1 and self._moe_fp8 and not self.layer_scale:
 +            if self._post_norm_w_fp16 is None:
 +                self._post_norm_w_fp16 = \
 +                    (self.post_attention_layernorm.weight.data + 1.0).half()
-+            esimd_resadd_norm_gemv_fp8_pert(
-+                hidden_states, residual,
-+                self._post_norm_w_fp16,
-+                self.mlp.gate.weight,
-+                self.mlp.gate.weight_scale,
-+                self._router_buf,
-+                self._normed_buf,
-+                self.post_attention_layernorm.variance_epsilon,
-+            )
++            if self._moe_is_int4:
++                from custom_esimd_kernels_vllm import esimd_resadd_norm_gemv_int4_pert
++                # .t() gives contiguous (N, K/8) layout for block_load
++                esimd_resadd_norm_gemv_int4_pert(
++                    hidden_states, residual,
++                    self._post_norm_w_fp16,
++                    self.mlp.gate.weight.t(),
++                    self.mlp.gate.weight_scale.t(),
++                    self._router_buf,
++                    self._normed_buf,
++                    self.post_attention_layernorm.variance_epsilon,
++                )
++            else:
++                esimd_resadd_norm_gemv_fp8_pert(
++                    hidden_states, residual,
++                    self._post_norm_w_fp16,
++                    self.mlp.gate.weight,
++                    self.mlp.gate.weight_scale,
++                    self._router_buf,
++                    self._normed_buf,
++                    self.post_attention_layernorm.variance_epsilon,
++                )
 +            # Pass pre-computed router logits to MoE via attribute
 +            self.mlp._precomputed_router_logits = self._router_buf
 +            hidden_states = self._normed_buf
 +            hidden_states = self.mlp(hidden_states)
 +
-+        # ---- Standard path ----
++        # ---- Standard path (MoE BSZ>1 or fallback) ----
 +        else:
-+            hidden_states, residual = self.post_attention_layernorm(
-+                hidden_states, residual)
++            if self._moe_fp8 and n_tokens > 1:
++                if self._post_norm_w_fp16 is None:
++                    self._post_norm_w_fp16 = \
++                        (self.post_attention_layernorm.weight.data + 1.0).half()
++                esimd_fused_add_rms_norm_batched(
++                    hidden_states, residual, self._post_norm_w_fp16,
++                    self.post_attention_layernorm.variance_epsilon)
++            else:
++                hidden_states, residual = self.post_attention_layernorm(
++                    hidden_states, residual)
 +            hidden_states = self.mlp(hidden_states)
  
          if self.layer_scale:
              if len(hidden_states.shape) == 2:
-@@ -965,7 +1637,7 @@ class Qwen3NextModel(nn.Module):
+@@ -965,7 +2099,7 @@ class Qwen3NextModel(nn.Module):
      def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
          super().__init__()
  
@@ -12877,7 +13552,7 @@ index 0f73a7746..40d872ee7 100644
          parallel_config = vllm_config.parallel_config
  
          eplb_config = parallel_config.eplb_config
-@@ -1042,7 +1714,7 @@ class Qwen3NextModel(nn.Module):
+@@ -1042,7 +2176,7 @@ class Qwen3NextModel(nn.Module):
              ckpt_gate_proj_name="gate_proj",
              ckpt_down_proj_name="down_proj",
              ckpt_up_proj_name="up_proj",
@@ -12886,7 +13561,7 @@ index 0f73a7746..40d872ee7 100644
              num_redundant_experts=self.num_redundant_experts,
          )
  
-@@ -1201,15 +1873,17 @@ class Qwen3NextForCausalLM(
+@@ -1201,15 +2335,17 @@ class Qwen3NextForCausalLM(
      }
  
      def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -12908,7 +13583,7 @@ index 0f73a7746..40d872ee7 100644
          self.quant_config = vllm_config.quant_config
  
          super().__init__()
-@@ -1263,7 +1937,7 @@ class Qwen3NextForCausalLM(
+@@ -1263,7 +2399,7 @@ class Qwen3NextForCausalLM(
          cls, vllm_config: "VllmConfig"
      ) -> tuple[tuple[int, int], tuple[int, int]]:
          parallel_config = vllm_config.parallel_config
@@ -12917,7 +13592,7 @@ index 0f73a7746..40d872ee7 100644
          tp_size = parallel_config.tensor_parallel_size
          num_spec = (
              vllm_config.speculative_config.num_speculative_tokens
-@@ -1280,6 +1954,10 @@ class Qwen3NextForCausalLM(
+@@ -1280,6 +2416,10 @@ class Qwen3NextForCausalLM(
              num_spec,
          )
  
@@ -14521,7 +15196,7 @@ index 130d85efb..2f5eb177c 100644
      if current_platform.is_xpu():
          return True
 diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
-index 6fec5001b..e28bd677c 100755
+index 6fec5001b..17bc94d7a 100755
 --- a/vllm/v1/attention/backends/flash_attn.py
 +++ b/vllm/v1/attention/backends/flash_attn.py
 @@ -3,6 +3,7 @@
@@ -14589,7 +15264,7 @@ index 6fec5001b..e28bd677c 100755
  
      def forward(
          self,
-@@ -706,6 +719,28 @@ class FlashAttentionImpl(AttentionImpl):
+@@ -706,6 +719,53 @@ class FlashAttentionImpl(AttentionImpl):
                  )
                  return output
              else:
@@ -14597,6 +15272,7 @@ index 6fec5001b..e28bd677c 100755
 +                    current_platform.is_xpu()
 +                    and attn_type == AttentionType.DECODER
 +                    and attn_metadata.max_query_len == 1
++                    and self.head_size == 256
 +                ):
 +                    try:
 +                        eagle_ops = importlib.import_module("custom_esimd_kernels_vllm.eagle_ops")
@@ -14604,16 +15280,40 @@ index 6fec5001b..e28bd677c 100755
 +                        eagle_ops = None
 +
 +                    if eagle_ops is not None:
-+                        eagle_ops.page_attn_decode(
-+                            query[:num_actual_tokens],
-+                            kv_cache,
-+                            block_table,
-+                            seqused_k,
-+                            output[:num_actual_tokens],
-+                            1,
-+                            attn_metadata.max_seq_len,
-+                        )
-+                        return output
++                        _q = query[:num_actual_tokens]
++                        _o = output[:num_actual_tokens]
++                        _num_q = _q.shape[1]
++                        _num_kv = kv_cache.shape[3]
++                        _gqa = _num_q // _num_kv if _num_kv > 0 else 0
++                        _need_pad = (_gqa >= 2 and _gqa % 4 != 0)
++
++                        if _need_pad:
++                            # Pad Q heads per KV group to next multiple of 4
++                            _padded_gqa = ((_gqa + 3) // 4) * 4
++                            _pad_per_kv = _padded_gqa - _gqa
++                            # Interleave pad: reshape [bs, num_kv*gqa, hd] → [bs, num_kv, gqa, hd]
++                            # → pad to [bs, num_kv, padded_gqa, hd] → reshape back
++                            _bs, _, _hd = _q.shape
++                            _q_grouped = _q.reshape(_bs, _num_kv, _gqa, _hd)
++                            _q_pad = torch.nn.functional.pad(
++                                _q_grouped, (0, 0, 0, _pad_per_kv))  # pad gqa dim
++                            _q_pad = _q_pad.reshape(_bs, _num_kv * _padded_gqa, _hd).contiguous()
++                            _o_pad = torch.zeros_like(_q_pad)
++                            eagle_ops.page_attn_decode(
++                                _q_pad, kv_cache, block_table, seqused_k,
++                                _o_pad, 1, attn_metadata.max_seq_len)
++                            # Unpad: reshape back and take first _gqa heads per KV group
++                            _o_grouped = _o_pad.reshape(_bs, _num_kv, _padded_gqa, _hd)
++                            _o.copy_(_o_grouped[:, :, :_gqa, :].reshape(_bs, _num_q, _hd))
++                        elif _gqa >= 4:
++                            eagle_ops.page_attn_decode(
++                                _q, kv_cache, block_table, seqused_k,
++                                _o, 1, attn_metadata.max_seq_len)
++                        else:
++                            eagle_ops = None  # unsupported, fall through
++
++                        if eagle_ops is not None:
++                            return output
 +
                  sliding_window_size = (
                      list(self.sliding_window)
@@ -15903,7 +16603,7 @@ index 662badeb5..c70970fdc 100644
          )
  
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 525ad5db4..0e86e07ce 100644
+index 525ad5db4..17caef6ab 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -154,7 +154,11 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
@@ -16030,7 +16730,141 @@ index 525ad5db4..0e86e07ce 100644
  
      def _init_mrope_positions(self, req_state: CachedRequestState):
          model = self.get_model()
-@@ -2750,7 +2814,6 @@ class GPUModelRunner(
+@@ -1344,6 +1408,92 @@ class GPUModelRunner(
+ 
+         return encoder_seq_lens, encoder_seq_lens_cpu
+ 
++    def _prepare_inputs_decode_fast(
++        self,
++        scheduler_output: "SchedulerOutput",
++        num_reqs: int,
++    ) -> tuple[torch.Tensor, SpecDecodeMetadata | None]:
++        """Fast path for pure-decode steps where every request schedules
++        exactly 1 token.  Avoids heavy numpy array ops on size-1-per-req
++        data and skips unnecessary computation.
++
++        Persistent-buffer caching: query_start_loc and discard_request_mask
++        have fixed decode-mode values ([0,1,...,N,N,N,...] and all-zero).
++        We tag the GPU buffers with a marker once written and skip the H2D
++        on subsequent fast-path calls as long as num_reqs doesn't shrink.
++        """
++        # -- block table: still need full commit (new blocks may arrive) --
++        self.input_batch.block_table.commit_block_table(num_reqs)
++
++        # -- positions: each request's position = num_computed_tokens --
++        computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
++        positions_np = self.positions.np[:num_reqs]
++        positions_np[:] = computed
++
++        # -- input_ids (non-async case): vectorized token lookup --
++        if self.input_batch.prev_sampled_token_ids is None:
++            max_model_len = self.input_batch.token_ids_cpu.shape[1]
++            token_indices = (
++                computed
++                + self.arange_np[:num_reqs] * max_model_len
++            )
++            np.take(
++                self.input_batch.token_ids_cpu.ravel(),
++                token_indices,
++                out=self.input_ids.np[:num_reqs],
++            )
++
++        # -- slot_mapping --
++        req_indices = self.arange_np[:num_reqs]
++        self.input_batch.block_table.compute_slot_mapping(
++            req_indices, positions_np)
++        self.input_batch.block_table.commit_slot_mapping(num_reqs)
++
++        # -- query_start_loc: [0, 1, 2, ..., num_reqs, num_reqs, ...] --
++        # This pattern is invariant for decode. Cache the GPU copy and
++        # only re-upload if the cached size is smaller than current need,
++        # or if the previous call was a non-decode step (slow path).
++        cached_n = getattr(self, '_decode_qsl_cached_n', -1)
++        if cached_n < num_reqs:
++            qsl = self.query_start_loc.np
++            qsl[:num_reqs + 1] = self.arange_np[:num_reqs + 1]
++            qsl[num_reqs + 1:] = num_reqs
++            self.query_start_loc.copy_to_gpu()
++            self._decode_qsl_cached_n = num_reqs
++        elif cached_n > num_reqs:
++            # Old cached GPU has values [0,1,...,cached_n,cached_n,...]; we need
++            # padding region to be num_reqs instead of cached_n. Re-upload.
++            qsl = self.query_start_loc.np
++            qsl[:num_reqs + 1] = self.arange_np[:num_reqs + 1]
++            qsl[num_reqs + 1:] = num_reqs
++            self.query_start_loc.copy_to_gpu()
++            self._decode_qsl_cached_n = num_reqs
++        # else: cached_n == num_reqs, GPU already has correct values. Skip H2D.
++        query_start_loc = self.query_start_loc.gpu[:num_reqs + 1]
++
++        # -- seq_lens: computed + 1 --
++        self.seq_lens.np[:num_reqs] = computed + 1
++        self.seq_lens.np[num_reqs:] = 0
++        self.seq_lens.copy_to_gpu()
++
++        # -- discard_request_mask: always False for decode --
++        # Persistent: once zeroed, no need to re-upload unless slow path
++        # corrupted it.
++        if not getattr(self, '_decode_mask_is_zero', False):
++            self.discard_request_mask.np[:num_reqs] = 0
++            self.discard_request_mask.copy_to_gpu(num_reqs)
++            self._decode_mask_is_zero = True
++
++        # -- H2D for input_ids / positions --
++        # cu_num_tokens for decode = [1, 2, 3, ..., num_reqs]
++        cu_num_tokens = self.arange_np[1:num_reqs + 1].copy()
++        self._prepare_input_ids(
++            scheduler_output, num_reqs, cu_num_tokens)
++        self.positions.copy_to_gpu(num_reqs)
++
++        logits_indices = query_start_loc[1:] - 1
++        return logits_indices, None
++
+     def _prepare_inputs(
+         self,
+         scheduler_output: "SchedulerOutput",
+@@ -1362,6 +1512,21 @@ class GPUModelRunner(
+         num_reqs = self.input_batch.num_reqs
+         assert num_reqs > 0
+ 
++        # Fast path: pure decode, every request scheduling exactly 1 token.
++        # Only safe when req_id_to_index maps to contiguous [0, num_reqs),
++        # which is guaranteed when there are no finished/new requests this step.
++        if (total_num_scheduled_tokens == num_reqs
++                and not self.uses_mrope
++                and not (self.uses_xdrope_dim > 0)
++                and not self.enable_prompt_embeds
++                and not scheduler_output.scheduled_spec_decode_tokens
++                and not self.lora_config
++                and not scheduler_output.finished_req_ids
++                and not scheduler_output.scheduled_new_reqs
++                and not scheduler_output.scheduled_cached_reqs.resumed_req_ids):
++            return self._prepare_inputs_decode_fast(
++                scheduler_output, num_reqs)
++
+         # OPTIMIZATION: Start copying the block table first.
+         # This way, we can overlap the copy with the following CPU operations.
+         self.input_batch.block_table.commit_block_table(num_reqs)
+@@ -1468,6 +1633,8 @@ class GPUModelRunner(
+         self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
+         self.query_start_loc.copy_to_gpu()
+         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
++        # Slow path wrote non-decode values; invalidate fast-path cache.
++        self._decode_qsl_cached_n = -1
+ 
+         self.seq_lens.np[:num_reqs] = (
+             self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+@@ -1485,6 +1652,9 @@ class GPUModelRunner(
+             self.seq_lens.np[:num_reqs] < num_tokens_np
+         )
+         self.discard_request_mask.copy_to_gpu(num_reqs)
++        # Slow path may write non-zero; invalidate fast-path cache if so.
++        if self.discard_request_mask.np[:num_reqs].any():
++            self._decode_mask_is_zero = False
+ 
+         # Copy the tensors to the GPU.
+         self._prepare_input_ids(
+@@ -2750,7 +2920,6 @@ class GPUModelRunner(
              logits,
              sampling_metadata,
          )
@@ -16038,7 +16872,7 @@ index 525ad5db4..0e86e07ce 100644
          return sampler_output
  
      def _bookkeeping_sync(
-@@ -3236,6 +3299,18 @@ class GPUModelRunner(
+@@ -3236,6 +3405,18 @@ class GPUModelRunner(
  
              pad_attn = cudagraph_mode == CUDAGraphMode.FULL
  
@@ -16057,7 +16891,7 @@ index 525ad5db4..0e86e07ce 100644
              use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
              ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
  
-@@ -3414,6 +3489,10 @@ class GPUModelRunner(
+@@ -3414,6 +3595,10 @@ class GPUModelRunner(
          with record_function_or_nullcontext("gpu_model_runner: sample"):
              sampler_output = self._sample(logits, spec_decode_metadata)
  
@@ -16068,7 +16902,7 @@ index 525ad5db4..0e86e07ce 100644
          self._draft_token_ids = None
          self._draft_token_req_ids = None
          self.input_batch.prev_sampled_token_ids = None
-@@ -4712,6 +4791,9 @@ class GPUModelRunner(
+@@ -4712,6 +4897,9 @@ class GPUModelRunner(
                          dummy_modality
                      ]
  
@@ -16078,7 +16912,7 @@ index 525ad5db4..0e86e07ce 100644
                      logger.info(
                          "Encoder cache will be initialized with a budget of "
                          "%s tokens, and profiled with %s %s items of the "
-@@ -4743,7 +4825,7 @@ class GPUModelRunner(
+@@ -4743,7 +4931,7 @@ class GPUModelRunner(
          hidden_states, last_hidden_states = self._dummy_run(
              self.max_num_tokens, is_profile=True
          )
@@ -16087,7 +16921,7 @@ index 525ad5db4..0e86e07ce 100644
              if self.is_pooling_model:
                  output = self._dummy_pooler_run(hidden_states)
              else:
-@@ -5297,6 +5379,24 @@ class GPUModelRunner(
+@@ -5297,6 +5485,24 @@ class GPUModelRunner(
              for kv_cache_group in kv_cache_config.kv_cache_groups
              if not isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec)
          ]
@@ -16112,7 +16946,7 @@ index 525ad5db4..0e86e07ce 100644
  
          if block_sizes != [self.cache_config.block_size] or kernel_block_sizes != [
              self.cache_config.block_size
-@@ -5308,18 +5408,18 @@ class GPUModelRunner(
+@@ -5308,18 +5514,18 @@ class GPUModelRunner(
              )
              self.input_batch = InputBatch(
                  max_num_reqs=self.max_num_reqs,
@@ -16133,7 +16967,7 @@ index 525ad5db4..0e86e07ce 100644
              )
  
      def _allocate_kv_cache_tensors(
-@@ -5638,6 +5738,7 @@ class GPUModelRunner(
+@@ -5638,6 +5844,7 @@ class GPUModelRunner(
          # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
          # tokens each.
          kernel_block_sizes = self._prepare_kernel_block_sizes(kv_cache_config)
@@ -16179,10 +17013,10 @@ index 562664524..4a16a4b4d 100644
          # Reset the seed to ensure that the random state is not affected by
 diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
 new file mode 100644
-index 000000000..699419fd5
+index 000000000..cd601fdd5
 --- /dev/null
 +++ b/vllm/v1/worker/mamba_utils.py
-@@ -0,0 +1,246 @@
+@@ -0,0 +1,247 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +import itertools
@@ -16288,11 +17122,12 @@ index 000000000..699419fd5
 +    assert len(src_state_list) == len(dest_state_list)
 +    assert len(src_state_list) == len(num_elements_list)
 +    device_type = current_platform.device_type
++    # Use uint64 to cover the full device pointer range.
 +    src_state_ptrs = torch.tensor(
-+        src_state_list, device=device_type, dtype=torch.int64
++        src_state_list, device=device_type, dtype=torch.uint64
 +    )
 +    dst_state_ptrs = torch.tensor(
-+        dest_state_list, device=device_type, dtype=torch.int64
++        dest_state_list, device=device_type, dtype=torch.uint64
 +    )
 +    num_elements = torch.tensor(
 +        num_elements_list, device=device_type, dtype=torch.int32
