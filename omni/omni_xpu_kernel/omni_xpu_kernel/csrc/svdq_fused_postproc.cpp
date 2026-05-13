@@ -88,9 +88,10 @@ static void fused_smooth_convert_kernel(
                     simd<float, ELEM_PER_WI> result_f32;
 
                     if (col_start + ELEM_PER_WI <= K) {
-                        // All 32 elements are within a single row — contiguous smooth load
-                        simd<bf16, ELEM_PER_WI> smooth_vec =
-                            block_load<bf16, ELEM_PER_WI>(smooth + col_start);
+                        // All 32 elements are within a single row — contiguous smooth load.
+                        // smooth+col_start may not be aligned; use copy_from.
+                        simd<bf16, ELEM_PER_WI> smooth_vec;
+                        smooth_vec.copy_from(smooth + col_start);
                         simd<float, ELEM_PER_WI> smooth_f32 = smooth_vec;
                         result_f32 = x_f32 / smooth_f32;
                     } else {
@@ -222,8 +223,11 @@ static void fused_smooth_mul_convert_slow(
                     simd<float, ELEM_PER_WI> result_f32;
 
                     if (col_start + ELEM_PER_WI <= K) {
-                        simd<fp16, ELEM_PER_WI> rcp_vec =
-                            block_load<fp16, ELEM_PER_WI>(rcp_smooth + col_start);
+                        // rcp_smooth+col_start is not guaranteed to be aligned
+                        // (col_start = elem_start % K can be any offset), so use
+                        // copy_from which tolerates arbitrary element alignment.
+                        simd<fp16, ELEM_PER_WI> rcp_vec;
+                        rcp_vec.copy_from(rcp_smooth + col_start);
                         simd<float, ELEM_PER_WI> rcp_f32 = rcp_vec;
                         result_f32 = x_f32 * rcp_f32;
                     } else {
