@@ -23,16 +23,21 @@ set "PIP_EXE=%PYTHON_DIR%\Scripts\pip.exe"
 set "PYTHON_VERSION=3.12.10"
 set "PYTHON_EMBED_URL=https://www.python.org/ftp/python/%PYTHON_VERSION%/python-%PYTHON_VERSION%-embed-amd64.zip"
 set "GET_PIP_URL=https://bootstrap.pypa.io/get-pip.py"
+set "PIP_INSTALL_OPTIONS=--retries 10 --timeout 120 --no-warn-script-location"
+if not defined PYTHON_EMBED_SOURCE_DIR if exist "%SCRIPT_DIR%..\..\..\omni\comfyui_windows_setup\python_embeded\python.exe" set "PYTHON_EMBED_SOURCE_DIR=%SCRIPT_DIR%..\..\..\omni\comfyui_windows_setup\python_embeded"
+if not defined OMNI_XPU_KERNEL_WHEEL set "OMNI_XPU_KERNEL_WHEEL=%SCRIPT_DIR%..\..\..\llm_scaler_dist\omni_xpu_kernel-0.1.0-cp312-cp312-win_amd64.whl"
 
 REM ComfyUI Git Configuration (matching Dockerfile)
 set "COMFYUI_REPO=https://github.com/comfyanonymous/ComfyUI.git"
-set "COMFYUI_COMMIT=3dd10a59c00248d00f0cb0ab794ff1bb9fb00a5f"
+set "COMFYUI_COMMIT=64b8457f55cd7fb54ca7a956d9c73b505e903e0c"
 set "COMFYUI_PATCH=%PATCHES_DIR%\comfyui_for_multi_arc.patch"
 
 echo ============================================
 echo  Windows Portable Python Environment Setup
 echo  Target: %PYTHON_DIR%
 echo  ComfyUI: git clone + patch
+echo  omni_xpu_kernel wheel: %OMNI_XPU_KERNEL_WHEEL%
+if defined PYTHON_EMBED_SOURCE_DIR echo  Python source: %PYTHON_EMBED_SOURCE_DIR%
 echo ============================================
 echo.
 
@@ -79,11 +84,21 @@ echo.
 REM ============================================
 REM Step 1: Download and Extract Python Embeddable
 REM ============================================
-echo [Step 1/8] Setting up Python Embeddable Package...
+echo [Step 1/9] Setting up Python Embeddable Package...
 
 if exist "%PYTHON_EXE%" (
     echo Python already exists at %PYTHON_DIR%
     echo Skipping download...
+) else if defined PYTHON_EMBED_SOURCE_DIR if exist "%PYTHON_EMBED_SOURCE_DIR%\python.exe" (
+    echo Copying existing Python embeddable package from %PYTHON_EMBED_SOURCE_DIR%...
+    if not exist "%PYTHON_DIR%" mkdir "%PYTHON_DIR%"
+    powershell -NoProfile -Command "Copy-Item -Path '%PYTHON_EMBED_SOURCE_DIR%\*' -Destination '%PYTHON_DIR%' -Recurse -Force"
+    if errorlevel 1 (
+        echo ERROR: Failed to copy Python embeddable package from %PYTHON_EMBED_SOURCE_DIR%
+        pause
+        exit /b 1
+    )
+    echo Python copied successfully.
 ) else (
     echo Creating python_embeded directory...
     if not exist "%PYTHON_DIR%" mkdir "%PYTHON_DIR%"
@@ -113,7 +128,7 @@ REM ============================================
 REM Step 2: Configure Python Path (Enable pip/site-packages)
 REM ============================================
 echo.
-echo [Step 2/8] Configuring Python path...
+echo [Step 2/9] Configuring Python path...
 
 set "PTH_FILE=%PYTHON_DIR%\python312._pth"
 if exist "%PTH_FILE%" (
@@ -149,11 +164,11 @@ REM ============================================
 REM Step 3: Install pip
 REM ============================================
 echo.
-echo [Step 3/8] Installing pip...
+echo [Step 3/9] Installing pip...
 
 if exist "%PIP_EXE%" (
     echo pip already installed, upgrading...
-    "%PYTHON_EXE%" -m pip install --upgrade pip
+    "%PYTHON_EXE%" -m pip install %PIP_INSTALL_OPTIONS% --upgrade pip
 ) else (
     echo Downloading get-pip.py...
     curl -L -o "%SCRIPT_DIR%get-pip.py" "%GET_PIP_URL%"
@@ -174,7 +189,7 @@ if exist "%PIP_EXE%" (
     del "%SCRIPT_DIR%get-pip.py"
     
     REM Upgrade pip
-    "%PYTHON_EXE%" -m pip install --upgrade pip
+    "%PYTHON_EXE%" -m pip install %PIP_INSTALL_OPTIONS% --upgrade pip
 )
 
 echo pip installed successfully.
@@ -183,20 +198,47 @@ REM ============================================
 REM Step 4: Install PyTorch with Intel XPU Support
 REM ============================================
 echo.
-echo [Step 4/8] Installing PyTorch with Intel XPU support...
+echo [Step 4/9] Installing PyTorch with Intel XPU support...
 
-"%PYTHON_EXE%" -m pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/xpu
+"%PYTHON_EXE%" -m pip install %PIP_INSTALL_OPTIONS% torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/xpu
 if errorlevel 1 (
     echo WARNING: Failed to install PyTorch XPU version
     echo Trying standard PyTorch...
-    "%PYTHON_EXE%" -m pip install torch torchvision torchaudio
+    "%PYTHON_EXE%" -m pip install %PIP_INSTALL_OPTIONS% torch torchvision torchaudio
+    if errorlevel 1 (
+        echo ERROR: Failed to install PyTorch.
+        pause
+        exit /b 1
+    )
 )
 
 REM ============================================
-REM Step 5: Clone and Setup ComfyUI from Git
+REM Step 5: Install omni_xpu_kernel wheel
 REM ============================================
 echo.
-echo [Step 5/8] Setting up ComfyUI from Git...
+echo [Step 5/9] Installing omni_xpu_kernel wheel...
+
+if not exist "%OMNI_XPU_KERNEL_WHEEL%" (
+    echo ERROR: omni_xpu_kernel wheel not found: %OMNI_XPU_KERNEL_WHEEL%
+    echo Build it first from llm-scaler\omni\omni_xpu_kernel, or set OMNI_XPU_KERNEL_WHEEL to a valid wheel path.
+    pause
+    exit /b 1
+)
+
+"%PYTHON_EXE%" -m pip install %PIP_INSTALL_OPTIONS% --force-reinstall --no-deps "%OMNI_XPU_KERNEL_WHEEL%"
+if errorlevel 1 (
+    echo ERROR: Failed to install omni_xpu_kernel wheel
+    pause
+    exit /b 1
+)
+
+echo omni_xpu_kernel wheel installed successfully.
+
+REM ============================================
+REM Step 6: Clone and Setup ComfyUI from Git
+REM ============================================
+echo.
+echo [Step 6/9] Setting up ComfyUI from Git...
 
 cd /d "%SCRIPT_DIR%"
 
@@ -229,13 +271,18 @@ if exist ComfyUI (
 cd ComfyUI
 
 echo Installing ComfyUI requirements...
-"%PYTHON_EXE%" -m pip install -r requirements.txt
+"%PYTHON_EXE%" -m pip install %PIP_INSTALL_OPTIONS% -r requirements.txt
+if errorlevel 1 (
+    echo ERROR: Failed to install ComfyUI requirements.
+    pause
+    exit /b 1
+)
 
 REM ============================================
-REM Step 6: Apply Intel XPU Patch to ComfyUI
+REM Step 7: Apply Intel XPU Patch to ComfyUI
 REM ============================================
 echo.
-echo [Step 6/8] Applying Intel XPU patch to ComfyUI...
+echo [Step 7/9] Applying Intel XPU patch to ComfyUI...
 
 cd /d "%SCRIPT_DIR%\ComfyUI"
 
@@ -260,10 +307,10 @@ if exist "%COMFYUI_PATCH%" (
 )
 
 REM ============================================
-REM Step 7: Install Custom Nodes
+REM Step 8: Install Custom Nodes
 REM ============================================
 echo.
-echo [Step 7/8] Installing Custom Nodes...
+echo [Step 8/9] Installing Custom Nodes...
 
 cd /d "%SCRIPT_DIR%\ComfyUI\custom_nodes"
 
@@ -290,7 +337,12 @@ if exist comfyui-videohelpersuite (
         echo WARNING: Failed to clone ComfyUI-VideoHelperSuite
     ) else (
         cd comfyui-videohelpersuite
-        "%PYTHON_EXE%" -m pip install -r requirements.txt
+        "%PYTHON_EXE%" -m pip install %PIP_INSTALL_OPTIONS% -r requirements.txt
+        if errorlevel 1 (
+            echo ERROR: Failed to install ComfyUI-VideoHelperSuite requirements.
+            pause
+            exit /b 1
+        )
         cd ..
     )
 )
@@ -306,7 +358,12 @@ if exist comfyui-easy-use (
         echo WARNING: Failed to clone ComfyUI-Easy-Use
     ) else (
         cd comfyui-easy-use
-        "%PYTHON_EXE%" -m pip install -r requirements.txt
+        "%PYTHON_EXE%" -m pip install %PIP_INSTALL_OPTIONS% -r requirements.txt
+        if errorlevel 1 (
+            echo ERROR: Failed to install ComfyUI-Easy-Use requirements.
+            pause
+            exit /b 1
+        )
         cd ..
     )
 )
@@ -322,7 +379,12 @@ if exist comfyui_controlnet_aux (
         echo WARNING: Failed to clone comfyui_controlnet_aux
     ) else (
         cd comfyui_controlnet_aux
-        "%PYTHON_EXE%" -m pip install -r requirements.txt
+        "%PYTHON_EXE%" -m pip install %PIP_INSTALL_OPTIONS% -r requirements.txt
+        if errorlevel 1 (
+            echo ERROR: Failed to install comfyui_controlnet_aux requirements.
+            pause
+            exit /b 1
+        )
         cd ..
     )
 )
@@ -341,7 +403,12 @@ if exist ComfyUI-GGUF-XPU (
     ) else (
         cd ComfyUI-GGUF-XPU
         git checkout %GGUF_COMMIT%
-        "%PYTHON_EXE%" -m pip install -r requirements.txt
+        "%PYTHON_EXE%" -m pip install %PIP_INSTALL_OPTIONS% -r requirements.txt
+        if errorlevel 1 (
+            echo ERROR: Failed to install ComfyUI-GGUF-XPU requirements.
+            pause
+            exit /b 1
+        )
         cd ..
     )
 )
@@ -349,15 +416,28 @@ if exist ComfyUI-GGUF-XPU (
 REM --- ComfyUI-KJNodes ---
 echo.
 echo Installing ComfyUI-KJNodes...
+set "KJNODES_COMMIT=c6ce76d00bb8177d1b0286cad891df08eff5226e"
+
 if exist ComfyUI-KJNodes (
-    echo ComfyUI-KJNodes already exists, skipping...
+    echo ComfyUI-KJNodes already exists, updating to specified commit...
+    cd ComfyUI-KJNodes
+    git fetch origin %KJNODES_COMMIT%
+    git checkout %KJNODES_COMMIT%
+    cd ..
 ) else (
     git clone https://github.com/kijai/ComfyUI-KJNodes.git
     if errorlevel 1 (
         echo WARNING: Failed to clone ComfyUI-KJNodes
     ) else (
         cd ComfyUI-KJNodes
-        "%PYTHON_EXE%" -m pip install -r requirements.txt
+        git fetch origin %KJNODES_COMMIT%
+        git checkout %KJNODES_COMMIT%
+        "%PYTHON_EXE%" -m pip install %PIP_INSTALL_OPTIONS% -r requirements.txt
+        if errorlevel 1 (
+            echo ERROR: Failed to install ComfyUI-KJNodes requirements.
+            pause
+            exit /b 1
+        )
         cd ..
     )
 )
@@ -373,7 +453,12 @@ if exist ComfyUI-CacheDiT (
         echo WARNING: Failed to clone ComfyUI-CacheDiT
     ) else (
         cd ComfyUI-CacheDiT
-        "%PYTHON_EXE%" -m pip install cache-dit --no-deps
+        "%PYTHON_EXE%" -m pip install %PIP_INSTALL_OPTIONS% cache-dit --no-deps
+        if errorlevel 1 (
+            echo ERROR: Failed to install cache-dit.
+            pause
+            exit /b 1
+        )
         cd ..
     )
 )
@@ -382,10 +467,10 @@ echo.
 echo Custom nodes installation complete.
 
 REM ============================================
-REM Step 8: Create Launcher Scripts
+REM Step 9: Create Launcher Scripts
 REM ============================================
 echo.
-echo [Step 8/8] Creating launcher scripts...
+echo [Step 9/9] Creating launcher scripts...
 
 cd /d "%SCRIPT_DIR%"
 
@@ -458,6 +543,13 @@ echo.
 echo PyTorch verification:
 "%PYTHON_EXE%" -c "import torch; print(f'PyTorch version: {torch.__version__}')"
 "%PYTHON_EXE%" -c "import torch; print(f'XPU available: {torch.xpu.is_available() if hasattr(torch, \"xpu\") else \"N/A\"}')"
+
+echo.
+echo omni_xpu_kernel verification:
+"%PYTHON_EXE%" -c "import omni_xpu_kernel as ok; print(f'omni_xpu_kernel version: {ok.__version__}'); print(f'omni_xpu_kernel available: {ok.is_available()}')"
+if errorlevel 1 (
+    echo WARNING: omni_xpu_kernel import verification failed.
+)
 
 echo.
 echo Installed Custom Nodes:
