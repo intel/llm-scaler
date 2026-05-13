@@ -88,9 +88,10 @@ static void fused_smooth_convert_kernel(
                     simd<float, ELEM_PER_WI> result_f32;
 
                     if (col_start + ELEM_PER_WI <= K) {
-                        // All 32 elements are within a single row — contiguous smooth load
-                        simd<bf16, ELEM_PER_WI> smooth_vec =
-                            block_load<bf16, ELEM_PER_WI>(smooth + col_start);
+                        // All 32 elements are within a single row — contiguous smooth load.
+                        // smooth+col_start may not be aligned; use copy_from.
+                        simd<bf16, ELEM_PER_WI> smooth_vec;
+                        smooth_vec.copy_from(smooth + col_start);
                         simd<float, ELEM_PER_WI> smooth_f32 = smooth_vec;
                         result_f32 = x_f32 / smooth_f32;
                     } else {
@@ -133,15 +134,64 @@ static void fused_smooth_convert_kernel(
 //         rcp_smooth [K] f16 — pre-computed 1/smooth_factor in f16
 // Output: [M, K] f16
 //
-// The rcp_smooth is in f16 because the output is f16 — this avoids an
-// extra bf16→f16 conversion for the smooth factor.
-//
-// Row-based decomposition: each work-item processes one row-tile of K elements.
-// For K=3840 with ELEM_PER_WI=32, that's 120 iterations per row per WI.
-// With M=4096, total_wi = M * (K / ELEM_PER_WI) = 4096 * 120 = 491520.
+// Two-path design:
+//   Fast path (K % ELEM_PER_WI == 0, the common transformer case):
+//     2D (row, col-tile) work-item grid. Each WI loads ELEM_PER_WI contiguous
+//     elements from a single row, multiplies by the aligned rcp slice, and
+//     stores the fp16 result. No mod, no row-boundary branch, and larger
+//     per-WI granularity (up to 256 B load / store) reduces launch overhead.
+//   Slow path (irregular K): flat 1D fallback equivalent to the legacy impl.
 // ============================================================================
 
-static void fused_smooth_mul_convert_kernel(
+template <int ELEM_PER_WI>
+static void fused_smooth_mul_convert_fast(
+    const bf16* __restrict__ x,
+    const fp16* __restrict__ rcp_smooth,
+    fp16* __restrict__ output,
+    int64_t M,
+    int64_t K,
+    const at::Device& device
+) {
+    const int64_t col_tiles = K / ELEM_PER_WI;
+    constexpr int WG_COLS = 8;   // col tiles per work-group
+    constexpr int WG_ROWS = 4;   // rows per work-group
+    const int64_t global_cols =
+        ((col_tiles + WG_COLS - 1) / WG_COLS) * WG_COLS;
+    const int64_t global_rows = ((M + WG_ROWS - 1) / WG_ROWS) * WG_ROWS;
+
+    auto cgf = [&](sycl::handler& handle) {
+        handle.parallel_for(
+            sycl::nd_range<2>(
+                sycl::range<2>(global_rows, global_cols),
+                sycl::range<2>(WG_ROWS, WG_COLS)
+            ),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                const int64_t row = item.get_global_id(0);
+                const int64_t col_tile = item.get_global_id(1);
+                if (row >= M || col_tile >= col_tiles) return;
+
+                const int64_t col_start = col_tile * ELEM_PER_WI;
+                const int64_t off = row * K + col_start;
+
+                simd<bf16, ELEM_PER_WI> x_vec =
+                    block_load<bf16, ELEM_PER_WI>(x + off);
+                simd<fp16, ELEM_PER_WI> rcp_vec =
+                    block_load<fp16, ELEM_PER_WI>(rcp_smooth + col_start);
+
+                simd<float, ELEM_PER_WI> x_f32 = x_vec;
+                simd<float, ELEM_PER_WI> rcp_f32 = rcp_vec;
+                simd<float, ELEM_PER_WI> result_f32 = x_f32 * rcp_f32;
+
+                simd<fp16, ELEM_PER_WI> out_vec = result_f32;
+                block_store<fp16, ELEM_PER_WI>(output + off, out_vec);
+            }
+        );
+    };
+
+    utils::submit_kernel(cgf, device, "fused_smooth_mul_convert_fast");
+}
+
+static void fused_smooth_mul_convert_slow(
     const bf16* __restrict__ x,
     const fp16* __restrict__ rcp_smooth,
     fp16* __restrict__ output,
@@ -168,18 +218,19 @@ static void fused_smooth_mul_convert_kernel(
                 if (remaining >= ELEM_PER_WI) {
                     simd<bf16, ELEM_PER_WI> x_vec =
                         block_load<bf16, ELEM_PER_WI>(x + elem_start);
-
                     const int64_t col_start = elem_start % K;
                     simd<float, ELEM_PER_WI> x_f32 = x_vec;
                     simd<float, ELEM_PER_WI> result_f32;
 
                     if (col_start + ELEM_PER_WI <= K) {
-                        simd<fp16, ELEM_PER_WI> rcp_vec =
-                            block_load<fp16, ELEM_PER_WI>(rcp_smooth + col_start);
+                        // rcp_smooth+col_start is not guaranteed to be aligned
+                        // (col_start = elem_start % K can be any offset), so use
+                        // copy_from which tolerates arbitrary element alignment.
+                        simd<fp16, ELEM_PER_WI> rcp_vec;
+                        rcp_vec.copy_from(rcp_smooth + col_start);
                         simd<float, ELEM_PER_WI> rcp_f32 = rcp_vec;
                         result_f32 = x_f32 * rcp_f32;
                     } else {
-                        // Elements span a row boundary — per-element column lookup
                         #pragma unroll
                         for (int i = 0; i < ELEM_PER_WI; ++i) {
                             int64_t col = (elem_start + i) % K;
@@ -188,11 +239,9 @@ static void fused_smooth_mul_convert_kernel(
                         }
                     }
 
-                    // Convert f32 → f16 and store
                     simd<fp16, ELEM_PER_WI> out_vec = result_f32;
                     block_store<fp16, ELEM_PER_WI>(output + elem_start, out_vec);
                 } else {
-                    // Partial block at end
                     for (int64_t i = 0; i < remaining; ++i) {
                         int64_t idx = elem_start + i;
                         int64_t col = idx % K;
@@ -205,7 +254,29 @@ static void fused_smooth_mul_convert_kernel(
         );
     };
 
-    utils::submit_kernel(cgf, device, "fused_smooth_mul_convert");
+    utils::submit_kernel(cgf, device, "fused_smooth_mul_convert_slow");
+}
+
+static void fused_smooth_mul_convert_kernel(
+    const bf16* __restrict__ x,
+    const fp16* __restrict__ rcp_smooth,
+    fp16* __restrict__ output,
+    int64_t M,
+    int64_t K,
+    const at::Device& device
+) {
+    // Prefer the 2D fast path when K aligns to a reasonably large tile.
+    // Tile 128 -> 256 B bf16 load / 256 B fp16 store per work-item, well above
+    // the 64 B minimum needed for efficient XPU block transfers.
+    if (K % 128 == 0) {
+        fused_smooth_mul_convert_fast<128>(x, rcp_smooth, output, M, K, device);
+    } else if (K % 64 == 0) {
+        fused_smooth_mul_convert_fast<64>(x, rcp_smooth, output, M, K, device);
+    } else if (K % 32 == 0) {
+        fused_smooth_mul_convert_fast<32>(x, rcp_smooth, output, M, K, device);
+    } else {
+        fused_smooth_mul_convert_slow(x, rcp_smooth, output, M, K, device);
+    }
 }
 
 // ============================================================================
