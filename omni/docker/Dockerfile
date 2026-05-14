@@ -138,14 +138,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm && \
     git clone --depth 1 https://github.com/xiangyuT/nunchaku-torch.git && \
     cd nunchaku-torch && \
-    git fetch --depth 1 origin d39cf71398c5699bbed52a14a2b6c201198fc8df && \
-    git checkout d39cf71398c5699bbed52a14a2b6c201198fc8df && \
+    git fetch --depth 1 origin e09fae78f138fc0f5e86ad630be14433bd9713af && \
+    git checkout e09fae78f138fc0f5e86ad630be14433bd9713af && \
     pip install -e . --no-deps && \
     cd /llm/ComfyUI/custom_nodes && \
     git clone --depth 1 https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git && \
     cd ComfyUI-nunchaku-XPU && \
-    git fetch --depth 1 origin 2f5ec0f6c78dc4cd833fad52a37c24e4d07ad1c8 && \
-    git checkout 2f5ec0f6c78dc4cd833fad52a37c24e4d07ad1c8 && \
+    git fetch --depth 1 origin 1b78483a6af31297d5291f61965502079aed3407 && \
+    git checkout 1b78483a6af31297d5291f61965502079aed3407 && \
     pip install -r requirements.txt
 
 # ComfyUI disabled custom nodes (optional: --build-arg INSTALL_DISABLED_NODES=true)
