@@ -138,8 +138,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm && \
     git clone --depth 1 https://github.com/xiangyuT/nunchaku-torch.git && \
     cd nunchaku-torch && \
-    git fetch --depth 1 origin e074323ef25232c43bdd45ad7db7fd1d08cf97b5 && \
-    git checkout e074323ef25232c43bdd45ad7db7fd1d08cf97b5 && \
+    git fetch --depth 1 origin d39cf71398c5699bbed52a14a2b6c201198fc8df && \
+    git checkout d39cf71398c5699bbed52a14a2b6c201198fc8df && \
     pip install -e . --no-deps && \
     cd /llm/ComfyUI/custom_nodes && \
     git clone --depth 1 https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git && \
