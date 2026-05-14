@@ -1,8 +1,56 @@
 diff --git a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp b/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
-index 10d7a1b..e9994ec 100644
+index 10d7a1b..45664ac 100644
 --- a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
 +++ b/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
-@@ -928,6 +928,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -150,10 +150,34 @@ CUTE_DEVICE void chunk_prepare_kernel(
+             a[(chunk_start_offset + sg_local_id * local_num + c) +
+               v_head_id * total_virtual_seqlen];
+       }
++      // Relative position within this batch of the chunk we're processing.
++      // chunk_id is a global chunk id (cumulative across batches), pre_chunks
++      // is the batch's starting global chunk id, so (chunk_id - pre_chunks)
++      // gives the intra-batch chunk index.
++      const int batch_chunk_idx = chunk_id - pre_chunks;
+       CUTE_UNROLL
+       for (int c = 0; c < local_num; ++c) {
+-        float a_h = g_local[c] + dt_bias_h;
+-        a_h = act_softplus(a_h) * A_log_exp_h;
++        // Absolute position within this batch's logical sequence.
++        const int rel_pos =
++            batch_chunk_idx * chunk_size + sg_local_id * local_num + c;
++        // Fix B2: padding positions (rel_pos >= seq_len) MUST get a_h = 0
++        // so that downstream chunk_compute_A_kernel's
++        //     A[m,n] *= exp(g[m]-g[n]) * beta
++        // does not produce `0 * inf = NaN` for padding rows/cols.
++        //   g[padding] = cumsum(softplus(dt_bias) * -exp(A_log)) is a large
++        //   negative, so exp(g[m]-g[n]) for m<n overflows to inf; combined
++        //   with beta=0 (padding) it yields NaN in fp32 accumulator, which
++        //   leaks through to A's m>n padding entries that are not masked to
++        //   zero by the "if (m < n) A = 0" guard.
++        // Setting a_h = 0 here makes g[padding] = 0, so exp(0) = 1 and
++        // 1 * 0 = 0 cleanly.
++        float a_h;
++        if (rel_pos >= seq_len) {
++          a_h = 0.0f;
++        } else {
++          a_h = g_local[c] + dt_bias_h;
++          a_h = act_softplus(a_h) * A_log_exp_h;
++        }
+         g_local[c] = a_h;
+         g_local_sum += a_h;
+       }
+@@ -309,6 +333,10 @@ CUTE_DEVICE void chunk_compute_A_kernel(
+ 
+         reorder(tSrA_c, tCrA_c);
+         copy(copy_A_c, tCrA_c, tCgA_c);
++
++        ::sycl::atomic_fence(::sycl::memory_order::acq_rel,
++                             ::sycl::memory_scope::device);
++        item.barrier(::sycl::access::fence_space::global_and_local);
+       }
+       chunk_id += global_chunk_range;
+     }
+@@ -928,6 +956,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
      StateT*
          ssm_state,  // [cache_batch_size, num_v_heads, head_v_dim, head_k_dim]
      const int ssm_state_stride_0,
@@ -10,7 +58,7 @@ index 10d7a1b..e9994ec 100644
      const int* query_start_loc,
      const int* cache_indices,
      const bool* has_initial_state,
-@@ -997,6 +998,23 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -997,6 +1026,23 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
          static_cast<int64_t>(cache_indices[batch_id]) * ssm_state_stride_0 +
          v_head_id * head_v_dim * head_k_dim;
  
@@ -34,7 +82,7 @@ index 10d7a1b..e9994ec 100644
      for (int chunk_id = 0; chunk_id < current_chunks; ++chunk_id) {
        const bool has_prev_state = (chunk_id != 0) || initial_state;
        const int out_chunk_offset = seq_start_offset + chunk_id * chunk_size;
-@@ -1049,6 +1067,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1049,6 +1095,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
            make_gmem_ptr(S_ptr),
            make_layout(S_tensor_shape, make_stride(head_k_dim, _1{})));
  
@@ -46,7 +94,7 @@ index 10d7a1b..e9994ec 100644
        Tensor cU = make_identity_tensor(U_tensor.shape());
  
        auto copy_U_c = get_block_2d_copy_C<void>(mma, U_tensor);
-@@ -1190,29 +1213,30 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1190,29 +1241,30 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
                K_tensor_T_shape, make_stride(_1{}, head_k_dim * num_k_heads)));
  
        Tensor cS = make_identity_tensor(S_tensor.shape());
@@ -87,7 +135,7 @@ index 10d7a1b..e9994ec 100644
                tSrS_d(i) *= g_last_value_exp;
              }
            } else {
-@@ -1221,7 +1245,17 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1221,7 +1273,17 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
  
            gemm_TTS_k_multi(
                U_tensor_T, K_tensor_T, tSrS_d, dv, dk, mma, g_multi_slm_ptr);
@@ -106,7 +154,7 @@ index 10d7a1b..e9994ec 100644
            copy(copy_S_d, tCrS_d, tCgS_d);
          }
        }
-@@ -1279,6 +1313,7 @@ void kernel_launcher(
+@@ -1279,6 +1341,7 @@ void kernel_launcher(
      const T* dt_bias,
      StateT* ssm_state,
      const int ssm_state_stride_0,
@@ -114,7 +162,7 @@ index 10d7a1b..e9994ec 100644
      const int* query_start_loc,
      const int* cache_indices,
      const bool* has_initial_state,
-@@ -1507,6 +1542,7 @@ void kernel_launcher(
+@@ -1507,6 +1570,7 @@ void kernel_launcher(
                a,
                ssm_state,
                ssm_state_stride_0,
@@ -122,7 +170,7 @@ index 10d7a1b..e9994ec 100644
                query_start_loc,
                cache_indices,
                has_initial_state,
-@@ -1583,6 +1619,10 @@ void chunk_gated_delta_rule_impl_xe2(
+@@ -1583,6 +1647,10 @@ void chunk_gated_delta_rule_impl_xe2(
        {num_v_heads, total_seqlen + padding_size, head_v_dim},
        torch::dtype(dtype).device(device).requires_grad(false));
  
@@ -133,7 +181,7 @@ index 10d7a1b..e9994ec 100644
  #define KERNEL_LAUNCHER(scalar_t, state_scalar_t)                  \
    kernel_launcher<scalar_t, state_scalar_t>(                       \
        queue,                                                       \
-@@ -1599,6 +1639,7 @@ void chunk_gated_delta_rule_impl_xe2(
+@@ -1599,6 +1667,7 @@ void chunk_gated_delta_rule_impl_xe2(
        reinterpret_cast<scalar_t*>(dt_bias.data_ptr()),             \
        reinterpret_cast<state_scalar_t*>(ssm_state.data_ptr()),     \
        ssm_state_stride_0,                                          \
