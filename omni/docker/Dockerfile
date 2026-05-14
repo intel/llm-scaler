@@ -205,13 +205,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm && \
     git clone --depth 1 https://github.com/sgl-project/sglang.git && \
     cd sglang && \
-    git fetch --depth 1 origin 0e53cee1f69beba0b1ae598e6fd5646fc52afb32 && \
-    git checkout 0e53cee1f69beba0b1ae598e6fd5646fc52afb32 && \
+    git fetch --depth 1 origin 1ae3218d036c554e6c109f18233d1f75bf775c1d && \
+    git checkout 1ae3218d036c554e6c109f18233d1f75bf775c1d && \
     git apply /tmp/sglang_diffusion_for_multi_arc.patch && \
     cp python/pyproject_xpu.toml python/pyproject.toml && \
     sed -i '/sgl-kernel/d' python/pyproject.toml && \
-    sed -i 's/"transformers==4\.57\.1"/"transformers"/' python/pyproject.toml && \
-    sed -E 's/(torch[a-z]*)([=<>!~ ]+[0-9.]+)/\1/g' python/pyproject.toml && \
+    sed -i 's/"transformers==[0-9.]*"/"transformers"/' python/pyproject.toml && \
+    sed -E -i 's/(torch[a-z]*)([=<>!~]+[0-9.+a-z]+)/\1/g' python/pyproject.toml && \
     pip install -e "python[diffusion]" && \
     pip install \
         'transformers==5.0.0' \
