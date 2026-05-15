@@ -4480,7 +4480,7 @@ index 18e17a511..65af42589 100644
              ctx = contextlib.nullcontext()
  
 diff --git a/vllm/model_executor/layers/fused_moe/layer.py b/vllm/model_executor/layers/fused_moe/layer.py
-index 3b3a789f6..24ce30e6a 100644
+index 3b3a789f6..4ed61fca5 100644
 --- a/vllm/model_executor/layers/fused_moe/layer.py
 +++ b/vllm/model_executor/layers/fused_moe/layer.py
 @@ -667,6 +667,7 @@ class FusedMoE(CustomOp):
@@ -4491,7 +4491,19 @@ index 3b3a789f6..24ce30e6a 100644
              "CompressedTensorsWNA16MarlinMoEMethod",
              "CompressedTensorsWNA16MoEMethod",
          ):
-@@ -1697,6 +1698,9 @@ class FusedMoE(CustomOp):
+@@ -1411,7 +1412,10 @@ class FusedMoE(CustomOp):
+                 weight_name = qual_name.replace(weight_name, param_name)
+                 param_name = weight_name.removeprefix(f"{self.layer_name}.")
+                 param = getattr(self, param_name)
+-                success = self.weight_loader(
++                # Use param's weight_loader if available (may be patched for
++                # deferred materialization), otherwise fall back to self
++                loader = getattr(param, "weight_loader", self.weight_loader)
++                success = loader(
+                     param=param,
+                     loaded_weight=loaded_weight,
+                     weight_name=weight_name,
+@@ -1697,6 +1701,9 @@ class FusedMoE(CustomOp):
          """
          Some combine kernels reduce across GPU ranks by default.
          """
@@ -4501,7 +4513,7 @@ index 3b3a789f6..24ce30e6a 100644
          if self.must_reduce_shared_expert_outputs():
              return final_hidden_states
          else:
-@@ -1707,6 +1711,7 @@ class FusedMoE(CustomOp):
+@@ -1707,6 +1714,7 @@ class FusedMoE(CustomOp):
          hidden_states: torch.Tensor,
          router_logits: torch.Tensor,
      ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -4509,7 +4521,7 @@ index 3b3a789f6..24ce30e6a 100644
          og_hidden_states = hidden_states.shape[-1]
          if self.hidden_size != og_hidden_states:
              hidden_states = F.pad(
-@@ -1766,6 +1771,7 @@ class FusedMoE(CustomOp):
+@@ -1766,6 +1774,7 @@ class FusedMoE(CustomOp):
          hidden_states: torch.Tensor,
          router_logits: torch.Tensor,
      ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -4517,7 +4529,7 @@ index 3b3a789f6..24ce30e6a 100644
          return self.forward_native(hidden_states, router_logits)
  
      def forward_impl_chunked(
-@@ -1774,6 +1780,7 @@ class FusedMoE(CustomOp):
+@@ -1774,6 +1783,7 @@ class FusedMoE(CustomOp):
          full_router_logits: torch.Tensor,
          has_separate_shared_experts: bool,
      ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -4525,7 +4537,7 @@ index 3b3a789f6..24ce30e6a 100644
          assert self.batched_hidden_states is not None
          assert self.batched_router_logits is not None
          assert self.batched_hidden_states.dtype == full_hidden_states.dtype
-@@ -1889,6 +1896,7 @@ class FusedMoE(CustomOp):
+@@ -1889,6 +1899,7 @@ class FusedMoE(CustomOp):
          hidden_states: torch.Tensor,
          router_logits: torch.Tensor,
      ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -5060,7 +5072,7 @@ index 5d77d1e3c..0f0fd58c6 100644
                  return IPEXGPTQLinearMethod(config)
              else:
 diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
-index 1c0c35bf6..9ebdcaa50 100644
+index 1c0c35bf6..8e9c93837 100644
 --- a/vllm/model_executor/layers/quantization/fp8.py
 +++ b/vllm/model_executor/layers/quantization/fp8.py
 @@ -185,7 +185,8 @@ class Fp8Config(QuantizationConfig):
@@ -5090,7 +5102,27 @@ index 1c0c35bf6..9ebdcaa50 100644
                  return UnquantizedLinearMethod()
              return XPUFp8LinearMethod(fp8_config)
          elif isinstance(layer, FusedMoE):
-@@ -317,7 +318,7 @@ class Fp8LinearMethod(LinearMethodBase):
+@@ -286,6 +287,19 @@ class CopyNumelCounter(TorchDispatchMode):
+         return out
+ 
+ 
++def _copy_missing_attrs(old: torch.Tensor, new: torch.Tensor) -> None:
++    """Copies any attrs present in `old` but not in `new` to `new`."""
++    new_attrs = set(dir(new))
++    attrs_to_set = {}
++    for attr in dir(old):
++        if attr not in new_attrs:
++            try:
++                attrs_to_set[attr] = getattr(old, attr)
++            except AttributeError:
++                pass
++    set_weight_attrs(new, attrs_to_set)
++
++
+ class Fp8LinearMethod(LinearMethodBase):
+     """Linear method for FP8.
+     Supports loading FP8 checkpoints with static weight scale and
+@@ -317,7 +331,7 @@ class Fp8LinearMethod(LinearMethodBase):
              or envs.VLLM_TEST_FORCE_FP8_MARLIN
          )
          # Disable marlin for rocm
@@ -5099,64 +5131,401 @@ index 1c0c35bf6..9ebdcaa50 100644
              self.use_marlin = False
          if vllm_is_batch_invariant():
              self.use_marlin = False
-@@ -417,15 +418,19 @@ class Fp8LinearMethod(LinearMethodBase):
+@@ -389,12 +403,58 @@ class Fp8LinearMethod(LinearMethodBase):
+             weight = create_fp8_weight_parameter(
+                 output_size_per_partition, input_size_per_partition, weight_loader
+             )
++        elif envs.VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT:
++            # Legacy CPU offload path. Quantization happens later in
++            # device_loading_context which moves weights to XPU before
++            # calling process_weights_after_loading.
++            weight = ModelWeightParameter(
++                data=torch.empty(
++                    output_size_per_partition,
++                    input_size_per_partition,
++                    dtype=params_dtype,
++                    device="cpu",
++                ),
++                input_dim=1,
++                output_dim=0,
++                weight_loader=weight_loader,
++            )
+         else:
++            # Default device path for Linear layers (no streaming).
++            # Weights are loaded directly on XPU, quantized later in
++            # process_weights_after_loading.
++            weight = ModelWeightParameter(
++                data=torch.empty(
++                    output_size_per_partition,
++                    input_size_per_partition,
++                    dtype=params_dtype,
++                ),
++                input_dim=1,
++                output_dim=0,
++                weight_loader=weight_loader,
++            )
++        if False:
++            # Streaming path: use meta device for deferred materialization
++            # to reduce peak memory. Weight is materialized just-in-time
++            # in patched_weight_loader when the first chunk arrives.
+ 
+             def patched_weight_loader(param, loaded_weight, *args, **kwargs):
+-                # track how many elements we have updated
++                # On first call, materialize the meta-device placeholder
+                 if not hasattr(layer, "_loaded_numel"):
+                     layer._loaded_numel = 0
++                    materialized = ModelWeightParameter(
++                        data=torch.empty_like(
++                            layer.weight, device=layer._load_device
++                        ),
++                        input_dim=1,
++                        output_dim=0,
++                        weight_loader=patched_weight_loader,
++                    )
++                    _copy_missing_attrs(layer.weight, materialized)
++                    layer.register_parameter("weight", materialized)
++                    del layer._load_device
++
++                # Refresh param reference after materialization
++                param = layer.weight
+ 
+                 # load the current weight chunk
+                 copy_numel_counter = CopyNumelCounter()
+@@ -405,28 +465,29 @@ class Fp8LinearMethod(LinearMethodBase):
+                 # if we have loaded all of the elements, call
+                 # process_weights_after_loading
+                 target_loaded_numel = layer.weight.numel()
+-                if layer._loaded_numel == target_loaded_numel:
++                if layer._loaded_numel >= target_loaded_numel:
+                     self.process_weights_after_loading(layer)
+ 
+                     # Delete the bookkeeping
+                     del layer._loaded_numel
+-                    # Prevent the usual `process_weights_after_loading` call from doing
+-                    # anything
++                    # Prevent the usual `process_weights_after_loading` call
++                    # from doing anything
+                     layer._already_called_process_weights_after_loading = True
+ 
                  return res
  
-             # For non-serialized checkpoints, use original dtype
-+            # Force offloading weights to cpu if VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT
-+            # enabled, otherwise use original device config which can be gpu or cpu
-+            # (may happen when cpu_offload_gb > 0)
+-            # For non-serialized checkpoints, use original dtype
              weight = ModelWeightParameter(
                  data=torch.empty(
                      output_size_per_partition,
                      input_size_per_partition,
                      dtype=params_dtype,
-+                    device="cpu" if envs.VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT else None,
++                    device="meta",
                  ),
                  input_dim=1,
                  output_dim=0,
--                weight_loader=patched_weight_loader,
-+                weight_loader=weight_loader,
+                 weight_loader=patched_weight_loader,
              )
++            layer._load_device = torch.get_default_device()
          layer.register_parameter("weight", weight)
  
-@@ -715,6 +720,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+         # If checkpoint is serialized fp8, load them.
+@@ -469,6 +530,30 @@ class Fp8LinearMethod(LinearMethodBase):
+         if getattr(layer, "_already_called_process_weights_after_loading", False):
+             return
+ 
++        # Fallback for dummy loading: if weight is still on meta device,
++        # materialize it before quantization
++        if hasattr(layer, "weight") and layer.weight.device == torch.device(
++            "meta"
++        ):
++            device = getattr(layer, "_load_device", None)
++            if device is not None:
++                wl = getattr(layer.weight, "weight_loader", None)
++                if wl is None:
++                    from vllm.model_executor.model_loader.weight_utils import (
++                        default_weight_loader,
++                    )
++                    wl = default_weight_loader
++                materialized = ModelWeightParameter(
++                    data=torch.empty_like(layer.weight, device=device),
++                    input_dim=1,
++                    output_dim=0,
++                    weight_loader=wl,
++                )
++                _copy_missing_attrs(layer.weight, materialized)
++                layer.register_parameter("weight", materialized)
++                if hasattr(layer, "_load_device"):
++                    del layer._load_device
++
+         size_k_first = True
+         input_scale = None
+         # TODO(rob): refactor block quant into separate class.
+@@ -709,12 +794,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+                 )
+ 
+         # WEIGHTS
++        moe_device = "cpu" if envs.VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT else None
+         w13_weight = torch.nn.Parameter(
+             torch.empty(
+                 num_experts,
                  2 * intermediate_size_per_partition,
                  hidden_size,
                  dtype=params_dtype,
-+                device="cpu" if envs.VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT else None,
++                device=moe_device,
              ),
              requires_grad=False,
          )
-@@ -727,6 +733,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -727,6 +814,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                  hidden_size,
                  intermediate_size_per_partition,
                  dtype=params_dtype,
-+                device="cpu" if envs.VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT else None,
++                device=moe_device,
              ),
              requires_grad=False,
          )
-@@ -1112,7 +1119,7 @@ class Fp8OnlineMoEMethod(Fp8MoEMethod):
+@@ -1106,66 +1194,124 @@ class Fp8OnlineMoEMethod(Fp8MoEMethod):
+         layer.orig_dtype = params_dtype
+         layer.weight_block_size = None
+ 
+-        # We are doing online quantization, patch the weight loaded
++        # We are doing online quantization, patch the weight loader
+         # to call `process_weights_after_loading` in a streaming fashion
+         # as soon as the last weight chunk is loaded.
          weight_loader = extra_weight_attrs["weight_loader"]
-         # create a new holder to prevent modifying behavior of any other
-         # objects which might depend on the old one
+-        # create a new holder to prevent modifying behavior of any other
+-        # objects which might depend on the old one
 -        new_extra_weight_attrs = extra_weight_attrs
-+        # new_extra_weight_attrs = extra_weight_attrs
- 
-         def patched_weight_loader(param, loaded_weight, *args, **kwargs):
-             # add a counter to track how many elements we have updated
-@@ -1139,9 +1146,6 @@ class Fp8OnlineMoEMethod(Fp8MoEMethod):
- 
-             return res
- 
+-
+-        def patched_weight_loader(param, loaded_weight, *args, **kwargs):
+-            # add a counter to track how many elements we have updated
+-            if not hasattr(layer, "_loaded_numel"):
+-                layer._loaded_numel = 0
+-
+-            # load the current weight chunk
+-            copy_numel_counter = CopyNumelCounter()
+-            with copy_numel_counter:
+-                res = weight_loader(param, loaded_weight, *args, **kwargs)  # type: ignore[misc]
+-            layer._loaded_numel += copy_numel_counter.copied_numel
+-
+-            # if we have loaded all of the elements, call
+-            # process_weights_after_loading
+-            target_loaded_numel = layer.w13_weight.numel() + layer.w2_weight.numel()
+-            if layer._loaded_numel == target_loaded_numel:
+-                self.process_weights_after_loading(layer)
+-
+-                # Delete the bookkeeping
+-                del layer._loaded_numel
+-                # Prevent the usual `process_weights_after_loading` call
+-                # from doing anything
+-                layer._already_called_process_weights_after_loading = True
+-
+-            return res
+-
 -        new_extra_weight_attrs["weight_loader"] = patched_weight_loader
 -        extra_weight_attrs = new_extra_weight_attrs
+ 
+-        # WEIGHTS
+-        w13_weight = torch.nn.Parameter(
+-            torch.empty(
+-                num_experts,
+-                2 * intermediate_size_per_partition,
+-                hidden_size,
+-                dtype=params_dtype,
+-            ),
+-            requires_grad=False,
+-        )
+-        layer.register_parameter("w13_weight", w13_weight)
+-        set_weight_attrs(w13_weight, extra_weight_attrs)
++        if envs.VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT:
++            # Legacy path: offload weights to CPU before quantization.
++            # Quantization happens later in device_loading_context which
++            # moves weights to XPU before calling process_weights_after_loading.
++            w13_weight = torch.nn.Parameter(
++                torch.empty(
++                    num_experts,
++                    2 * intermediate_size_per_partition,
++                    hidden_size,
++                    dtype=params_dtype,
++                    device="cpu",
++                ),
++                requires_grad=False,
++            )
++            layer.register_parameter("w13_weight", w13_weight)
++            set_weight_attrs(w13_weight, extra_weight_attrs)
++
++            w2_weight = torch.nn.Parameter(
++                torch.empty(
++                    num_experts,
++                    hidden_size,
++                    intermediate_size_per_partition,
++                    dtype=params_dtype,
++                    device="cpu",
++                ),
++                requires_grad=False,
++            )
++            layer.register_parameter("w2_weight", w2_weight)
++            set_weight_attrs(w2_weight, extra_weight_attrs)
+ 
+-        w2_weight = torch.nn.Parameter(
+-            torch.empty(
+-                num_experts,
+-                hidden_size,
+-                intermediate_size_per_partition,
+-                dtype=params_dtype,
+-            ),
+-            requires_grad=False,
+-        )
+-        layer.register_parameter("w2_weight", w2_weight)
+-        set_weight_attrs(w2_weight, extra_weight_attrs)
++        else:
++            # Streaming path: use meta device for deferred materialization
++            # to reduce peak memory.
++
++            def patched_weight_loader(param, loaded_weight, *args, **kwargs):
++                # On first call, materialize meta-device placeholders
++                if not hasattr(layer, "_loaded_numel"):
++                    layer._loaded_numel = 0
++                    w13 = torch.nn.Parameter(
++                        torch.empty_like(
++                            layer.w13_weight, device=layer._load_device
++                        ),
++                        requires_grad=False,
++                    )
++                    w2 = torch.nn.Parameter(
++                        torch.empty_like(
++                            layer.w2_weight, device=layer._load_device
++                        ),
++                        requires_grad=False,
++                    )
++                    mat_attrs = dict(extra_weight_attrs)
++                    mat_attrs["weight_loader"] = patched_weight_loader
++                    set_weight_attrs(w13, mat_attrs)
++                    set_weight_attrs(w2, mat_attrs)
++                    layer.register_parameter("w13_weight", w13)
++                    layer.register_parameter("w2_weight", w2)
++                    del layer._load_device
++
++                # Refresh param reference: after materialization, use the new
++                # params. shard_id "w1"/"w3" → w13_weight, "w2" → w2_weight
++                shard_id = kwargs.get("shard_id", "")
++                if shard_id in ("w1", "w3"):
++                    param = layer.w13_weight
++                else:
++                    param = layer.w2_weight
++
++                # load the current weight chunk using original weight_loader
++                copy_numel_counter = CopyNumelCounter()
++                with copy_numel_counter:
++                    res = weight_loader(param, loaded_weight, *args, **kwargs)  # type: ignore[misc]
++                layer._loaded_numel += copy_numel_counter.copied_numel
++
++                target_loaded_numel = (
++                    layer.w13_weight.numel() + layer.w2_weight.numel()
++                )
++                if layer._loaded_numel >= target_loaded_numel:
++                    self.process_weights_after_loading(layer)
++                    del layer._loaded_numel
++                    layer._already_called_process_weights_after_loading = True
++
++                return res
++
++            # Replace weight_loader in extra_weight_attrs so that the patched
++            # version is what gets set on the parameters
++            extra_weight_attrs = dict(extra_weight_attrs)
++            extra_weight_attrs["weight_loader"] = patched_weight_loader
++
++            w13_weight = torch.nn.Parameter(
++                torch.empty(
++                    num_experts,
++                    2 * intermediate_size_per_partition,
++                    hidden_size,
++                    dtype=params_dtype,
++                    device="meta",
++                ),
++                requires_grad=False,
++            )
++            layer.register_parameter("w13_weight", w13_weight)
++            set_weight_attrs(w13_weight, extra_weight_attrs)
++
++            w2_weight = torch.nn.Parameter(
++                torch.empty(
++                    num_experts,
++                    hidden_size,
++                    intermediate_size_per_partition,
++                    dtype=params_dtype,
++                    device="meta",
++                ),
++                requires_grad=False,
++            )
++            layer.register_parameter("w2_weight", w2_weight)
++            set_weight_attrs(w2_weight, extra_weight_attrs)
++            layer._load_device = torch.get_default_device()
+ 
+         # WEIGHT_SCALES
+         # Allocate 2 scales for w1 and w3 respectively.
+@@ -1188,20 +1334,53 @@ class Fp8OnlineMoEMethod(Fp8MoEMethod):
+         if getattr(layer, "_already_called_process_weights_after_loading", False):
+             return
+ 
+-        # If checkpoint is fp16, quantize in place.
++        # Fallback for dummy loading: materialize meta-device weights
++        if layer.w13_weight.device == torch.device("meta"):
++            device = getattr(layer, "_load_device", None)
++            if device is not None:
++                w13 = torch.nn.Parameter(
++                    torch.empty_like(layer.w13_weight, device=device),
++                    requires_grad=False,
++                )
++                w2 = torch.nn.Parameter(
++                    torch.empty_like(layer.w2_weight, device=device),
++                    requires_grad=False,
++                )
++                layer.register_parameter("w13_weight", w13)
++                layer.register_parameter("w2_weight", w2)
++                if hasattr(layer, "_load_device"):
++                    del layer._load_device
++
++        # If checkpoint is fp16, quantize with minimal peak memory.
++        # Strategy: quantize w13 first, release its BF16, then quantize w2.
++        # This avoids both BF16 tensors + both FP8 tensors co-existing.
+         fp8_dtype = current_platform.fp8_dtype()
+-        w13 = torch.empty_like(layer.w13_weight, dtype=fp8_dtype)
+-        w2 = torch.empty_like(layer.w2_weight, dtype=fp8_dtype)
+-        w13_scale = layer.w13_weight_scale
+-        w2_scale = layer.w2_weight_scale
 -
-         # WEIGHTS
-         w13_weight = torch.nn.Parameter(
-             torch.empty(
+-        for expert in range(layer.local_num_experts):
+-            w13[expert, :, :], w13_scale[expert] = ops.scaled_fp8_quant(
+-                layer.w13_weight[expert, :, :]
++        device = layer.w13_weight.device
++        num_experts = layer.local_num_experts
++
++        # Quantize w13: allocate FP8 buffer, quantize, release BF16
++        w13_bf16 = layer.w13_weight.data
++        layer.w13_weight = None
++        w13 = torch.empty_like(w13_bf16, dtype=fp8_dtype)
++        w13_scale = torch.empty(num_experts, device=device, dtype=torch.float32)
++        for expert in range(num_experts):
++            torch.ops.torch_ipex.dynamic_scaled_fp8_quant(
++                w13[expert], w13_bf16[expert],
++                w13_scale[expert:expert + 1]
+             )
+-            w2[expert, :, :], w2_scale[expert] = ops.scaled_fp8_quant(
+-                layer.w2_weight[expert, :, :]
++        del w13_bf16
++
++        # Quantize w2: allocate FP8 buffer, quantize, release BF16
++        w2_bf16 = layer.w2_weight.data
++        layer.w2_weight = None
++        w2 = torch.empty_like(w2_bf16, dtype=fp8_dtype)
++        w2_scale = torch.empty(num_experts, device=device, dtype=torch.float32)
++        for expert in range(num_experts):
++            torch.ops.torch_ipex.dynamic_scaled_fp8_quant(
++                w2[expert], w2_bf16[expert],
++                w2_scale[expert:expert + 1]
+             )
++        del w2_bf16
+ 
+         # Shuffle weights to runtime format and setup kernel.
+         self._setup_kernel(
 diff --git a/vllm/model_executor/layers/quantization/ipex_quant.py b/vllm/model_executor/layers/quantization/ipex_quant.py
-index 475bd8536..b5b405485 100644
+index 475bd8536..d9a597115 100644
 --- a/vllm/model_executor/layers/quantization/ipex_quant.py
 +++ b/vllm/model_executor/layers/quantization/ipex_quant.py
 @@ -1,20 +1,27 @@
@@ -5189,7 +5558,13 @@ index 475bd8536..b5b405485 100644
      UnquantizedLinearMethod,
  )
  from vllm.model_executor.layers.quantization import (
-@@ -28,9 +35,22 @@ from vllm.model_executor.layers.quantization.fp8 import (
+@@ -23,14 +30,28 @@ from vllm.model_executor.layers.quantization import (
+ )
+ from vllm.model_executor.layers.quantization.awq import AWQLinearMethod
+ from vllm.model_executor.layers.quantization.fp8 import (
++    CopyNumelCounter,
+     Fp8Config,
+     Fp8LinearMethod,
      Fp8OnlineMoEMethod,
  )
  from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
@@ -5213,7 +5588,7 @@ index 475bd8536..b5b405485 100644
  
  MIN_IPEX_VERSION = "2.6.0"
  
-@@ -50,20 +70,28 @@ class IPEXConfig(QuantizationConfig):
+@@ -50,20 +71,28 @@ class IPEXConfig(QuantizationConfig):
          method: str,
          weight_bits: int,
          group_size: int,
@@ -5244,7 +5619,7 @@ index 475bd8536..b5b405485 100644
  
          if self.weight_bits not in [4]:
              raise ValueError(
-@@ -75,12 +103,24 @@ class IPEXConfig(QuantizationConfig):
+@@ -75,12 +104,24 @@ class IPEXConfig(QuantizationConfig):
              raise ValueError(
                  f"IPEX quantization supports [awq, gptq], but got {self.method}."
              )
@@ -5270,7 +5645,7 @@ index 475bd8536..b5b405485 100644
          )
  
      @classmethod
-@@ -104,6 +144,8 @@ class IPEXConfig(QuantizationConfig):
+@@ -104,6 +145,8 @@ class IPEXConfig(QuantizationConfig):
  
      @classmethod
      def from_config(cls, config: dict[str, Any]) -> "IPEXConfig":
@@ -5279,7 +5654,7 @@ index 475bd8536..b5b405485 100644
          method = cls.get_from_keys(config, ["quant_method"]).lower()
          if method == "awq":
              weight_bits = cls.get_from_keys(config, ["w_bit", "bits"])
-@@ -111,24 +153,44 @@ class IPEXConfig(QuantizationConfig):
+@@ -111,24 +154,44 @@ class IPEXConfig(QuantizationConfig):
              modules_to_not_convert = cls.get_from_keys_or(
                  config, ["modules_to_not_convert"], None
              )
@@ -5328,7 +5703,7 @@ index 475bd8536..b5b405485 100644
          )
  
      @classmethod
-@@ -145,9 +207,7 @@ class IPEXConfig(QuantizationConfig):
+@@ -145,9 +208,7 @@ class IPEXConfig(QuantizationConfig):
  
          return None
  
@@ -5339,7 +5714,7 @@ index 475bd8536..b5b405485 100644
          if isinstance(layer, LinearBase):
              if self.method == "awq":
                  if is_layer_skipped(
-@@ -159,9 +219,41 @@ class IPEXConfig(QuantizationConfig):
+@@ -159,9 +220,41 @@ class IPEXConfig(QuantizationConfig):
                      return UnquantizedLinearMethod()
                  return IPEXAWQLinearMethod(self)
              if self.method == "gptq":
@@ -5382,7 +5757,7 @@ index 475bd8536..b5b405485 100644
  
  class IPEXGPTQLinearMethod(GPTQLinearMethod):
      """GPTQ linear method using IPEX for the CPU/XPU backend."""
-@@ -217,7 +309,7 @@ class IPEXGPTQLinearMethod(GPTQLinearMethod):
+@@ -217,7 +310,7 @@ class IPEXGPTQLinearMethod(GPTQLinearMethod):
                  bias=bias,
                  group_size=self.quant_config.group_size,
                  quant_method=IPEXConfig.IPEX_QUANT_METHOD_MAP["gptq"],
@@ -5391,7 +5766,7 @@ index 475bd8536..b5b405485 100644
              )
          )
  
-@@ -288,7 +380,7 @@ class IPEXAWQLinearMethod(AWQLinearMethod):
+@@ -288,7 +381,7 @@ class IPEXAWQLinearMethod(AWQLinearMethod):
                  bias=bias,
                  group_size=self.quant_config.group_size,
                  quant_method=IPEXConfig.IPEX_QUANT_METHOD_MAP["awq"],  # type: ignore
@@ -5400,17 +5775,171 @@ index 475bd8536..b5b405485 100644
              )
          )
  
-@@ -317,6 +409,9 @@ class XPUFp8LinearMethod(Fp8LinearMethod):
+@@ -307,9 +400,154 @@ class XPUFp8LinearMethod(Fp8LinearMethod):
+     def __init__(self, quant_config: Fp8Config):
+         super().__init__(quant_config)
+ 
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ):
++        from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
++            maybe_create_device_identity,
++        )
++        maybe_create_device_identity()
++
++        output_size_per_partition = sum(output_partition_sizes)
++        weight_loader = extra_weight_attrs.get("weight_loader")
++        layer.logical_widths = output_partition_sizes
++        layer.input_size_per_partition = input_size_per_partition
++        layer.output_size_per_partition = output_size_per_partition
++        layer.orig_dtype = params_dtype
++        layer.weight_block_size = None
++
++        if self.quant_config.is_checkpoint_fp8_serialized:
++            # Delegate to parent for serialized FP8 checkpoints
++            from vllm.model_executor.layers.quantization.utils.fp8_utils import (
++                create_fp8_weight_parameter,
++            )
++            weight = create_fp8_weight_parameter(
++                output_size_per_partition, input_size_per_partition,
++                weight_loader,
++            )
++        elif envs.VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT:
++            # Legacy CPU offload path
++            from vllm.model_executor.parameter import ModelWeightParameter
++            weight = ModelWeightParameter(
++                data=torch.empty(
++                    output_size_per_partition, input_size_per_partition,
++                    dtype=params_dtype, device="cpu",
++                ),
++                input_dim=1, output_dim=0,
++                weight_loader=weight_loader,
++            )
++            layer.register_parameter("weight", weight)
++        else:
++            # Streaming path: use meta device for deferred materialization.
++            # Weights are materialized just-in-time on first weight_loader
++            # call, then quantized in-place once fully loaded.
++            from vllm.model_executor.parameter import ModelWeightParameter
++            from vllm.model_executor.layers.quantization.fp8 import (
++                _copy_missing_attrs,
++            )
++            orig_weight_loader = weight_loader
++            layer._load_device = torch.get_default_device()
++
++            def patched_weight_loader(param, loaded_weight, *args, **kwargs):
++                # First call: materialize meta-device weight on XPU
++                if not hasattr(layer, "_loaded_numel"):
++                    layer._loaded_numel = 0
++                    materialized = ModelWeightParameter(
++                        data=torch.empty_like(
++                            layer.weight, device=layer._load_device
++                        ),
++                        input_dim=1, output_dim=0,
++                        weight_loader=patched_weight_loader,
++                    )
++                    _copy_missing_attrs(layer.weight, materialized)
++                    materialized._streaming_patched = True
++                    layer.register_parameter("weight", materialized)
++
++                # Always refresh to the current materialized parameter,
++                # since some call paths pass a stale reference from a
++                # params_dict snapshot.
++                param = layer.weight
++
++                # Load current shard, counting elements actually written
++                copy_numel_counter = CopyNumelCounter()
++                with copy_numel_counter:
++                    res = orig_weight_loader(
++                        param, loaded_weight, *args, **kwargs
++                    )
++                layer._loaded_numel += copy_numel_counter.copied_numel
++
++                # Once fully loaded, quantize in place and release BF16
++                if layer._loaded_numel >= layer.weight.numel():
++                    bf16_weight = layer.weight.data
++                    # Detach parameter before allocating FP8 to avoid holding
++                    # two full copies simultaneously.
++                    layer.weight = None
++                    qweight, weight_scale = ops.scaled_fp8_quant(
++                        bf16_weight, scale=None
++                    )
++                    del bf16_weight
++                    layer.weight = torch.nn.Parameter(
++                        qweight.data, requires_grad=False
++                    )
++                    layer.weight_scale = torch.nn.Parameter(
++                        weight_scale.data, requires_grad=False
++                    )
++                    layer.input_scale = None
++                    del layer._loaded_numel
++                    if hasattr(layer, "_load_device"):
++                        del layer._load_device
++                    layer._already_called_process_weights_after_loading = True
++
++                return res
++
++            weight = ModelWeightParameter(
++                data=torch.empty(
++                    output_size_per_partition, input_size_per_partition,
++                    dtype=params_dtype, device="meta",
++                ),
++                input_dim=1, output_dim=0,
++                weight_loader=patched_weight_loader,
++            )
++            # Mark so model loaders that normally bypass param.weight_loader
++            # (e.g. tuple shard_id paths) know to route through us instead.
++            weight._streaming_patched = True
++            layer.register_parameter("weight", weight)
++
++        # For non-serialized checkpoints, no scale/input_scale at init
++        if not self.quant_config.is_checkpoint_fp8_serialized:
++            layer.register_parameter("input_scale", None)
++
+     def process_weights_after_loading(self, layer: Module) -> None:
+         if getattr(layer, "_already_called_process_weights_after_loading", False):
+             return
++        # Fallback: if weight is still on meta device here, its
++        # weight_loader was never invoked (e.g. tied lm_head or vision
++        # branches skipped by the loader). Materialize zeros on XPU so
++        # downstream quantization doesn't read uninitialized memory.
++        if (hasattr(layer, "weight")
++                and layer.weight is not None
++                and layer.weight.device == torch.device("meta")):
++            device = getattr(layer, "_load_device", None)
++            if device is None:
++                device = torch.device("xpu")
++            from vllm.model_executor.parameter import ModelWeightParameter
++            materialized = ModelWeightParameter(
++                data=torch.zeros_like(layer.weight, device=device),
++                input_dim=1, output_dim=0,
++                weight_loader=getattr(
++                    layer.weight, "weight_loader", lambda p, w, *a, **k: None
++                ),
++            )
++            layer.register_parameter("weight", materialized)
++            if hasattr(layer, "_load_device"):
++                del layer._load_device
+         # If checkpoint not serialized fp8, quantize the weights.
+         if not self.quant_config.is_checkpoint_fp8_serialized:
+             qweight, weight_scale = ops.scaled_fp8_quant(layer.weight, scale=None)
+@@ -317,6 +555,8 @@ class XPUFp8LinearMethod(Fp8LinearMethod):
              replace_parameter(layer, "weight", qweight.data)
              replace_parameter(layer, "weight_scale", weight_scale.data)
              layer.input_scale = None
-+            # print(f"[FP8 QUANT] weight={layer.weight.shape} scale={layer.weight_scale.shape} dtype={layer.weight_scale.dtype}")
 +        elif self.block_quant:
 +            super().process_weights_after_loading(layer)
  
      def apply(
          self,
-@@ -324,12 +419,62 @@ class XPUFp8LinearMethod(Fp8LinearMethod):
+@@ -324,12 +564,62 @@ class XPUFp8LinearMethod(Fp8LinearMethod):
          x: torch.Tensor,
          bias: torch.Tensor | None = None,
      ) -> torch.Tensor:
@@ -5477,7 +6006,7 @@ index 475bd8536..b5b405485 100644
  
  
  class XPUFp8MoEMethod(Fp8OnlineMoEMethod):
-@@ -337,13 +482,76 @@ class XPUFp8MoEMethod(Fp8OnlineMoEMethod):
+@@ -337,33 +627,263 @@ class XPUFp8MoEMethod(Fp8OnlineMoEMethod):
          super().__init__(quant_config, layer)
          self.quant_config = quant_config
  
@@ -5495,6 +6024,142 @@ index 475bd8536..b5b405485 100644
 +        layer.num_experts = num_experts
 +        layer.orig_dtype = params_dtype
 +        layer.weight_block_size = None
++
++        orig_weight_loader = extra_weight_attrs["weight_loader"]
++
++        if envs.VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT:
++            # Legacy CPU offload path
++            weight_device = "cpu"
++        else:
++            # Streaming path: use meta device for deferred materialization.
++            # Weights are materialized just-in-time when the first weight
++            # chunk arrives via patched_weight_loader, then quantized after
++            # all chunks load.
++            weight_device = "meta"
++            layer._load_device = torch.get_default_device()
++
++            def patched_weight_loader(param, loaded_weight, *args, **kwargs):
++                # On first call, materialize the relevant meta-device tensor
++                # We materialize w13 and w2 independently so that whichever
++                # finishes loading first gets quantized immediately.
++                shard_id = kwargs.get("shard_id")
++                if shard_id is None and len(args) >= 2:
++                    shard_id = args[1]
++                is_w13 = shard_id in ("w1", "w3")
++
++                # Materialize w13 on first w1/w3 call
++                if is_w13 and not hasattr(layer, "_w13_materialized"):
++                    layer._w13_materialized = True
++                    layer._w13_loaded_numel = 0
++                    w13 = torch.nn.Parameter(
++                        torch.empty_like(
++                            layer.w13_weight, device=layer._load_device
++                        ),
++                        requires_grad=False,
++                    )
++                    orig_attrs = dict(extra_weight_attrs)
++                    orig_attrs["weight_loader"] = orig_weight_loader
++                    set_weight_attrs(w13, orig_attrs)
++                    layer.register_parameter("w13_weight", w13)
++
++                # Materialize w2 on first w2 call
++                if not is_w13 and not hasattr(layer, "_w2_materialized"):
++                    layer._w2_materialized = True
++                    layer._w2_loaded_numel = 0
++                    w2 = torch.nn.Parameter(
++                        torch.empty_like(
++                            layer.w2_weight, device=layer._load_device
++                        ),
++                        requires_grad=False,
++                    )
++                    orig_attrs = dict(extra_weight_attrs)
++                    orig_attrs["weight_loader"] = orig_weight_loader
++                    set_weight_attrs(w2, orig_attrs)
++                    layer.register_parameter("w2_weight", w2)
++
++                # Clean up _load_device when both materialized
++                if (hasattr(layer, "_w13_materialized")
++                        and hasattr(layer, "_w2_materialized")
++                        and hasattr(layer, "_load_device")):
++                    del layer._load_device
++
++                # Refresh param to the materialized tensor
++                if is_w13:
++                    param = layer.w13_weight
++                else:
++                    param = layer.w2_weight
++
++                # Call original FusedMoE.weight_loader with materialized param
++                copy_numel_counter = CopyNumelCounter()
++                with copy_numel_counter:
++                    res = orig_weight_loader(
++                        param, loaded_weight, *args, **kwargs
++                    )
++
++                # Track w13 and w2 progress separately
++                if is_w13:
++                    layer._w13_loaded_numel += copy_numel_counter.copied_numel
++                    # When w13 fully loaded, quantize it immediately
++                    if layer._w13_loaded_numel >= layer.w13_weight.numel():
++                        num_exp = layer.local_num_experts
++                        w13_bf16 = layer.w13_weight.data
++                        layer.w13_weight = None
++                        fp8_dtype = current_platform.fp8_dtype()
++                        w13_fp8 = torch.empty_like(w13_bf16, dtype=fp8_dtype)
++                        w13_scale = torch.empty(
++                            num_exp, device=w13_bf16.device,
++                            dtype=torch.float32,
++                        )
++                        for e in range(num_exp):
++                            w13_fp8[e], w13_scale[e] = ops.scaled_fp8_quant(
++                                w13_bf16[e]
++                            )
++                        del w13_bf16
++                        layer.w13_weight = torch.nn.Parameter(
++                            w13_fp8, requires_grad=False
++                        )
++                        layer.w13_weight_scale = torch.nn.Parameter(
++                            w13_scale, requires_grad=False
++                        )
++                        del layer._w13_loaded_numel
++                else:
++                    layer._w2_loaded_numel += copy_numel_counter.copied_numel
++                    # When w2 fully loaded, quantize it immediately
++                    if layer._w2_loaded_numel >= layer.w2_weight.numel():
++                        num_exp = layer.local_num_experts
++                        w2_bf16 = layer.w2_weight.data
++                        layer.w2_weight = None
++                        fp8_dtype = current_platform.fp8_dtype()
++                        w2_fp8 = torch.empty_like(w2_bf16, dtype=fp8_dtype)
++                        w2_scale = torch.empty(
++                            num_exp, device=w2_bf16.device,
++                            dtype=torch.float32,
++                        )
++                        for e in range(num_exp):
++                            w2_fp8[e], w2_scale[e] = ops.scaled_fp8_quant(
++                                w2_bf16[e]
++                            )
++                        del w2_bf16
++                        layer.w2_weight = torch.nn.Parameter(
++                            w2_fp8, requires_grad=False
++                        )
++                        layer.w2_weight_scale = torch.nn.Parameter(
++                            w2_scale, requires_grad=False
++                        )
++                        del layer._w2_loaded_numel
++
++                # When both quantized, mark as done
++                if (not hasattr(layer, "_w13_loaded_numel")
++                        and not hasattr(layer, "_w2_loaded_numel")
++                        and hasattr(layer, "_w13_materialized")
++                        and hasattr(layer, "_w2_materialized")):
++                    layer._already_called_process_weights_after_loading = True
++
++                return res
++
++            extra_weight_attrs = dict(extra_weight_attrs)
++            extra_weight_attrs["weight_loader"] = patched_weight_loader
++
 +        # WEIGHTS
 +        w13_weight = torch.nn.Parameter(
 +            torch.empty(
@@ -5502,7 +6167,7 @@ index 475bd8536..b5b405485 100644
 +                2 * intermediate_size_per_partition,
 +                hidden_size,
 +                dtype=params_dtype,
-+                device="cpu" if envs.VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT else None,
++                device=weight_device,
 +            ),
 +            requires_grad=False,
 +        )
@@ -5515,7 +6180,7 @@ index 475bd8536..b5b405485 100644
 +                hidden_size,
 +                intermediate_size_per_partition,
 +                dtype=params_dtype,
-+                device="cpu" if envs.VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT else None,
++                device=weight_device,
 +            ),
 +            requires_grad=False,
 +        )
@@ -5523,7 +6188,6 @@ index 475bd8536..b5b405485 100644
 +        set_weight_attrs(w2_weight, extra_weight_attrs)
 +
 +        # Allocate 2 scales for w1 and w3 respectively.
-+        # They will be combined to a single scale after weight loading.
 +        w13_weight_scale = torch.nn.Parameter(
 +            torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
 +        )
@@ -5542,30 +6206,91 @@ index 475bd8536..b5b405485 100644
 +
      def process_weights_after_loading(self, layer: Module) -> None:
          if getattr(layer, "_already_called_process_weights_after_loading", False):
++            # Already quantized by streaming path, just setup ipex fusion
++            import intel_extension_for_pytorch as ipex
++            ep_rank_start = self.moe.ep_rank * self.moe.num_local_experts
++            layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
++                layer.w13_weight,
++                layer.w2_weight,
++                w1_scale_inv=layer.w13_weight_scale,
++                w2_scale_inv=layer.w2_weight_scale,
++                a1_scale_inv=layer.w13_input_scale,
++                a2_scale_inv=layer.w2_input_scale,
++                use_prepack=True,
++                experts_start_id=ep_rank_start,
++            )
              return
++
          if not self.quant_config.is_checkpoint_fp8_serialized:
              fp8_dtype = current_platform.fp8_dtype()
 -            w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
 -            w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
-+            w13_weight = torch.empty_like(
-+                layer.w13_weight.data, device="xpu", dtype=fp8_dtype
-+            )
-+            w2_weight = torch.empty_like(
-+                layer.w2_weight.data, device="xpu", dtype=fp8_dtype
-+            )
- 
-             # Re-initialize w13_scale because we directly quantize
-             # merged w13 weights and generate a single scaling factor.
-@@ -364,6 +572,8 @@ class XPUFp8MoEMethod(Fp8OnlineMoEMethod):
+-
+-            # Re-initialize w13_scale because we directly quantize
+-            # merged w13 weights and generate a single scaling factor.
+-            layer.w13_weight_scale = torch.nn.Parameter(
+-                torch.ones(
+-                    layer.local_num_experts,
+-                    dtype=torch.float32,
+-                    device=w13_weight.device,
+-                ),
+-                requires_grad=False,
+-            )
+-            for expert in range(layer.local_num_experts):
+-                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+-                    ops.scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
++            device = layer.w13_weight.device
++            if device == torch.device("meta"):
++                device = torch.device("xpu")
++            num_experts = layer.local_num_experts
++
++            # Skip w13 if already quantized by streaming path
++            if layer.w13_weight.dtype != fp8_dtype:
++                w13_bf16 = layer.w13_weight.data
++                layer.w13_weight = None
++                w13_weight = torch.empty_like(
++                    w13_bf16, device=device, dtype=fp8_dtype
++                )
++                w13_scale = torch.empty(
++                    num_experts, dtype=torch.float32, device=device
++                )
++                for expert in range(num_experts):
++                    w13_weight[expert], w13_scale[expert] = (
++                        ops.scaled_fp8_quant(w13_bf16[expert])
++                    )
++                del w13_bf16
++                replace_parameter(layer, "w13_weight", w13_weight)
++                layer.w13_weight_scale = torch.nn.Parameter(
++                    w13_scale, requires_grad=False
                  )
-             replace_parameter(layer, "w13_weight", w13_weight)
-             replace_parameter(layer, "w2_weight", w2_weight)
-+            replace_parameter(layer, "w13_weight_scale", layer.w13_weight_scale)
-+            replace_parameter(layer, "w2_weight_scale", layer.w2_weight_scale)
+-                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+-                    ops.scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
++
++            # Skip w2 if already quantized by streaming path
++            if layer.w2_weight.dtype != fp8_dtype:
++                w2_bf16 = layer.w2_weight.data
++                layer.w2_weight = None
++                w2_weight = torch.empty_like(
++                    w2_bf16, device=device, dtype=fp8_dtype
++                )
++                w2_scale = torch.empty(
++                    num_experts, dtype=torch.float32, device=device
++                )
++                for expert in range(num_experts):
++                    w2_weight[expert], w2_scale[expert] = (
++                        ops.scaled_fp8_quant(w2_bf16[expert])
++                    )
++                del w2_bf16
++                replace_parameter(layer, "w2_weight", w2_weight)
++                layer.w2_weight_scale = torch.nn.Parameter(
++                    w2_scale, requires_grad=False
+                 )
+-            replace_parameter(layer, "w13_weight", w13_weight)
+-            replace_parameter(layer, "w2_weight", w2_weight)
  
          import intel_extension_for_pytorch as ipex
  
-@@ -401,3 +611,211 @@ class XPUFp8MoEMethod(Fp8OnlineMoEMethod):
+@@ -401,3 +921,211 @@ class XPUFp8MoEMethod(Fp8OnlineMoEMethod):
              layer.num_expert_group,
              custom_routing_function=layer.custom_routing_function,
          )
@@ -6422,6 +7147,30 @@ index d63367af5..3bf648b87 100644
          return query, key
  
      def forward_cpu(
+diff --git a/vllm/model_executor/model_loader/base_loader.py b/vllm/model_executor/model_loader/base_loader.py
+index 2238b0cfe..8a7d63735 100644
+--- a/vllm/model_executor/model_loader/base_loader.py
++++ b/vllm/model_executor/model_loader/base_loader.py
+@@ -58,6 +58,19 @@ class BaseModelLoader(ABC):
+             self.load_weights(model, model_config)
+             process_weights_after_loading(model, model_config, target_device)
+ 
++            if target_device.type == "xpu":
++                try:
++                    peak_mem = torch.xpu.max_memory_allocated()
++                    current_mem = torch.xpu.memory_allocated()
++                    logger.info(
++                        "Peak XPU memory after loading weights: "
++                        "peak=%.2f GiB, current=%.2f GiB",
++                        peak_mem / (1024**3),
++                        current_mem / (1024**3),
++                    )
++                except Exception:
++                    pass
++
+         return model.eval()
+ 
+ 
 diff --git a/vllm/model_executor/model_loader/utils.py b/vllm/model_executor/model_loader/utils.py
 index 08d7a851a..9c165d870 100644
 --- a/vllm/model_executor/model_loader/utils.py
@@ -9416,10 +10165,10 @@ index 3b0dce7fc..e785eca41 100644
  
 diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
 new file mode 100644
-index 000000000..d91aad7c9
+index 000000000..f20b837b7
 --- /dev/null
 +++ b/vllm/model_executor/models/qwen3_5.py
-@@ -0,0 +1,1602 @@
+@@ -0,0 +1,1622 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -9996,7 +10745,13 @@ index 000000000..d91aad7c9
 +            nv_tp = self._cached_nv_tp
 +            hv = self.head_v_dim
 +            if self._norm_weight_fp16 is None:
-+                self._norm_weight_fp16 = self.norm.weight.data.half()
++                # .clone().contiguous() to own private storage — the XPU
++                # cache allocator has been observed reusing a shared fp16
++                # half() result's storage for other buffers mid-inference,
++                # corrupting the norm weight and producing NaN cascades.
++                self._norm_weight_fp16 = (
++                    self.norm.weight.data.half().clone().contiguous()
++                )
 +            if self._is_sym_int4:
 +                from custom_esimd_kernels_vllm import esimd_norm_gemv_int4_pert
 +                # .t() gives contiguous (N, K/8) layout for block_load
@@ -10110,7 +10865,13 @@ index 000000000..d91aad7c9
 +        nv_tp = self._cached_nv_tp
 +        hv = self.head_v_dim
 +        if self._norm_weight_fp16 is None:
-+            self._norm_weight_fp16 = self.norm.weight.data.half()
++            # .clone().contiguous() to own private storage — the XPU
++            # cache allocator has been observed reusing a shared fp16
++            # half() result's storage for other buffers mid-inference,
++            # corrupting the norm weight and producing NaN cascades.
++            self._norm_weight_fp16 = (
++                self.norm.weight.data.half().clone().contiguous()
++            )
 +        if self._is_sym_int4:
 +            from custom_esimd_kernels_vllm import esimd_norm_gemv_int4_pert
 +            esimd_norm_gemv_int4_pert(
@@ -10519,21 +11280,29 @@ index 000000000..d91aad7c9
 +                    continue
 +                param = params_dict[name]
 +
-+                # Use weight_loader_v2 for tuple shard_id (GDN projections)
++                # Use weight_loader_v2 for tuple shard_id (GDN projections).
++                # Exception: when FP8 streaming has patched param.weight_loader
++                # (marked with _streaming_patched), dispatch through it so the
++                # hook observes every shard (including tuple shard_id used by
++                # GDN fused projections).
 +                if isinstance(shard_id, tuple):
-+                    # For MergedColumnParallelLinear params, we need to use weight_loader_v2
-+                    # Get the parent module that has weight_loader_v2
-+                    parent_module_name = ".".join(name.split(".")[:-1])
-+                    if parent_module_name:
-+                        parent_module = dict(self.named_modules()).get(parent_module_name)
-+                        if parent_module and hasattr(parent_module, "weight_loader_v2"):
-+                            parent_module.weight_loader_v2(param, loaded_weight, shard_id)
++                    if getattr(param, "_streaming_patched", False):
++                        weight_loader = param.weight_loader
++                        weight_loader(param, loaded_weight, shard_id)
++                    else:
++                        # For MergedColumnParallelLinear params, we need to use weight_loader_v2
++                        # Get the parent module that has weight_loader_v2
++                        parent_module_name = ".".join(name.split(".")[:-1])
++                        if parent_module_name:
++                            parent_module = dict(self.named_modules()).get(parent_module_name)
++                            if parent_module and hasattr(parent_module, "weight_loader_v2"):
++                                parent_module.weight_loader_v2(param, loaded_weight, shard_id)
++                            else:
++                                weight_loader = param.weight_loader
++                                weight_loader(param, loaded_weight, shard_id)
 +                        else:
 +                            weight_loader = param.weight_loader
 +                            weight_loader(param, loaded_weight, shard_id)
-+                    else:
-+                        weight_loader = param.weight_loader
-+                        weight_loader(param, loaded_weight, shard_id)
 +                else:
 +                    weight_loader = param.weight_loader
 +                    weight_loader(param, loaded_weight, shard_id)
@@ -12205,7 +12974,7 @@ index f2f354604..ad88271b9 100644
                  if weight_name not in name:
                      continue
 diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
-index 0f73a7746..59aaae75e 100644
+index 0f73a7746..69176f66a 100644
 --- a/vllm/model_executor/models/qwen3_next.py
 +++ b/vllm/model_executor/models/qwen3_next.py
 @@ -2,10 +2,22 @@
@@ -12472,7 +13241,7 @@ index 0f73a7746..59aaae75e 100644
  
      def fix_query_key_value_ordering(
          self,
-@@ -441,6 +639,363 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
+@@ -441,6 +639,387 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
          self,
          hidden_states: torch.Tensor,
          output: torch.Tensor,
@@ -12647,7 +13416,13 @@ index 0f73a7746..59aaae75e 100644
 +            nv_tp = self._cached_nv_tp
 +            hv = self.head_v_dim
 +            if self._norm_weight_fp16 is None:
-+                self._norm_weight_fp16 = self.norm.weight.data.half()
++                # .clone().contiguous() to own private storage — the XPU
++                # cache allocator has been observed reusing a shared fp16
++                # half() result's storage for other buffers mid-inference,
++                # corrupting the norm weight and producing NaN cascades.
++                self._norm_weight_fp16 = (
++                    self.norm.weight.data.half().clone().contiguous()
++                )
 +            esimd_norm_gemv_fp8_pert(
 +                self._decode_attn_out_view,
 +                self._decode_z_view,
@@ -12663,7 +13438,13 @@ index 0f73a7746..59aaae75e 100644
 +        elif num_tokens <= 64 and self._is_fp8:
 +            # BSZ=2-64: ESIMD norm then ESIMD GEMM for out_proj
 +            if self._norm_weight_fp16 is None:
-+                self._norm_weight_fp16 = self.norm.weight.data.half()
++                # .clone().contiguous() to own private storage — the XPU
++                # cache allocator has been observed reusing a shared fp16
++                # half() result's storage for other buffers mid-inference,
++                # corrupting the norm weight and producing NaN cascades.
++                self._norm_weight_fp16 = (
++                    self.norm.weight.data.half().clone().contiguous()
++                )
 +            x_flat = core_attn_out.reshape(-1, core_attn_out.shape[-1])
 +            z_flat = z.reshape(-1, z.shape[-1])
 +            normed = torch.empty_like(x_flat)
@@ -12740,7 +13521,13 @@ index 0f73a7746..59aaae75e 100644
 +        nv_tp = self._cached_nv_tp
 +        hv = self.head_v_dim
 +        if self._norm_weight_fp16 is None:
-+            self._norm_weight_fp16 = self.norm.weight.data.half()
++            # .clone().contiguous() to own private storage — the XPU
++            # cache allocator has been observed reusing a shared fp16
++            # half() result's storage for other buffers mid-inference,
++            # corrupting the norm weight and producing NaN cascades.
++            self._norm_weight_fp16 = (
++                self.norm.weight.data.half().clone().contiguous()
++            )
 +        esimd_norm_gemv_fp8_pert(
 +            core_attn_out.view(nv_tp, hv),
 +            z.view(nv_tp, hv),
@@ -12811,7 +13598,13 @@ index 0f73a7746..59aaae75e 100644
 +
 +        # Part 3: Output Projection — ESIMD norm + ESIMD GEMM
 +        if self._norm_weight_fp16 is None:
-+            self._norm_weight_fp16 = self.norm.weight.data.half()
++            # .clone().contiguous() to own private storage — the XPU
++            # cache allocator has been observed reusing a shared fp16
++            # half() result's storage for other buffers mid-inference,
++            # corrupting the norm weight and producing NaN cascades.
++            self._norm_weight_fp16 = (
++                self.norm.weight.data.half().clone().contiguous()
++            )
 +        x_flat = core_attn_out.reshape(-1, core_attn_out.shape[-1])
 +        z_flat = z.reshape(-1, z.shape[-1])
 +        normed = torch.empty_like(x_flat)
@@ -12836,7 +13629,7 @@ index 0f73a7746..59aaae75e 100644
      ):
          """
          Forward pass with three parts:
-@@ -778,42 +1333,345 @@ class Qwen3NextAttention(nn.Module):
+@@ -778,42 +1357,345 @@ class Qwen3NextAttention(nn.Module):
          self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
          self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
  
@@ -12999,6 +13792,12 @@ index 0f73a7746..59aaae75e 100644
          if self.attn_output_gate:
 -            q_gate, k, v = qkv.split(
 -                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+-            )
+-            orig_shape = q_gate.shape[:-1]
+-            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+-            q, gate = torch.chunk(q_gate, 2, dim=-1)
+-            q = q.reshape(*orig_shape, -1)
+-            gate = gate.reshape(*orig_shape, -1)
 +            attn_output = attn_output * gate
 +
 +        # ---- o_proj: ESIMD GEMV (M=1) / GEMM (M=2-128) ----
@@ -13008,12 +13807,7 @@ index 0f73a7746..59aaae75e 100644
 +                self.o_proj.weight,
 +                self.o_proj.weight_scale,
 +                self._decode_o_buf,
-             )
--            orig_shape = q_gate.shape[:-1]
--            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
--            q, gate = torch.chunk(q_gate, 2, dim=-1)
--            q = q.reshape(*orig_shape, -1)
--            gate = gate.reshape(*orig_shape, -1)
++            )
 +            output[:1] = tensor_model_parallel_all_reduce(self._decode_o_buf)
 +        elif _ntoks == 1 and self._is_sym_int4:
 +            from custom_esimd_kernels_vllm import esimd_gemv_int4
@@ -13200,7 +13994,7 @@ index 0f73a7746..59aaae75e 100644
  
  
  class Qwen3NextDecoderLayer(nn.Module):
-@@ -900,6 +1758,107 @@ class Qwen3NextDecoderLayer(nn.Module):
+@@ -900,6 +1782,107 @@ class Qwen3NextDecoderLayer(nn.Module):
                  ),
              )
  
@@ -13308,7 +14102,7 @@ index 0f73a7746..59aaae75e 100644
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -907,27 +1866,109 @@ class Qwen3NextDecoderLayer(nn.Module):
+@@ -907,27 +1890,114 @@ class Qwen3NextDecoderLayer(nn.Module):
          positions: torch.Tensor = None,
          **kwargs: object,
      ):
@@ -13338,8 +14132,13 @@ index 0f73a7746..59aaae75e 100644
 +            and n_tok <= self._input_max_bsz
 +        ):
 +            if self._input_norm_w_fp16 is None:
-+                self._input_norm_w_fp16 = \
-+                    (self.input_layernorm.weight.data + 1.0).half()
++                # See _norm_weight_fp16 comment — private storage is required
++                # or the XPU cache allocator may hand this block to another
++                # tensor mid-inference and corrupt the cached norm weight.
++                self._input_norm_w_fp16 = (
++                    (self.input_layernorm.weight.data + 1.0)
++                    .half().clone().contiguous()
++                )
 +            esimd_fused_add_rms_norm_batched(
 +                    hidden_states, residual, self._input_norm_w_fp16,
 +                    self.input_layernorm.variance_epsilon)
@@ -13437,7 +14236,7 @@ index 0f73a7746..59aaae75e 100644
  
          if self.layer_scale:
              if len(hidden_states.shape) == 2:
-@@ -939,9 +1980,102 @@ class Qwen3NextDecoderLayer(nn.Module):
+@@ -939,9 +2009,114 @@ class Qwen3NextDecoderLayer(nn.Module):
                      self.attn_layer_scale.to(hidden_states.dtype) + 1
                  )
  
@@ -13449,9 +14248,15 @@ index 0f73a7746..59aaae75e 100644
 +        # ---- Dense MLP ESIMD fast path (FP8 decode / small batch) ----
 +        if self._dense_mlp_fp8 and not self.layer_scale and n_tokens <= 128:
 +            if self._dense_post_norm_w_fp16 is None:
++                # See _norm_weight_fp16 comment. Observed on 27B FP8 layer.46:
++                # without clone+contiguous, this cache's storage is reused
++                # for another buffer after some decode steps, giving garbage
++                # RMSNorm weight (e.g. max_abs=58560 mean=-548), which then
++                # blows normed to +/-Inf and cascades NaN to logits ('!!!!').
 +                self._dense_post_norm_w_fp16 = (
-+                    self.post_attention_layernorm.weight.data + 1.0
-+                ).half()
++                    (self.post_attention_layernorm.weight.data + 1.0)
++                    .half().clone().contiguous()
++                )
 +
 +            # ESIMD norm + 2x ESIMD GEMM (M=1..128).
 +            # The FP8 GEMV kernels only reach ~23% HBM bandwidth at M=1 on
@@ -13498,8 +14303,11 @@ index 0f73a7746..59aaae75e 100644
 +        # ---- MoE fused post_attn_norm + router for decode (bsz=1) ----
 +        elif n_tokens == 1 and self._moe_fp8 and not self.layer_scale:
 +            if self._post_norm_w_fp16 is None:
-+                self._post_norm_w_fp16 = \
-+                    (self.post_attention_layernorm.weight.data + 1.0).half()
++                # See _dense_post_norm_w_fp16 comment.
++                self._post_norm_w_fp16 = (
++                    (self.post_attention_layernorm.weight.data + 1.0)
++                    .half().clone().contiguous()
++                )
 +            if self._moe_is_int4:
 +                from custom_esimd_kernels_vllm import esimd_resadd_norm_gemv_int4_pert
 +                # .t() gives contiguous (N, K/8) layout for block_load
@@ -13531,8 +14339,11 @@ index 0f73a7746..59aaae75e 100644
 +        else:
 +            if self._moe_fp8 and n_tokens > 1:
 +                if self._post_norm_w_fp16 is None:
-+                    self._post_norm_w_fp16 = \
-+                        (self.post_attention_layernorm.weight.data + 1.0).half()
++                    # See _dense_post_norm_w_fp16 comment.
++                    self._post_norm_w_fp16 = (
++                        (self.post_attention_layernorm.weight.data + 1.0)
++                        .half().clone().contiguous()
++                    )
 +                esimd_fused_add_rms_norm_batched(
 +                    hidden_states, residual, self._post_norm_w_fp16,
 +                    self.post_attention_layernorm.variance_epsilon)
@@ -13543,7 +14354,7 @@ index 0f73a7746..59aaae75e 100644
  
          if self.layer_scale:
              if len(hidden_states.shape) == 2:
-@@ -965,7 +2099,7 @@ class Qwen3NextModel(nn.Module):
+@@ -965,7 +2140,7 @@ class Qwen3NextModel(nn.Module):
      def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
          super().__init__()
  
@@ -13552,7 +14363,7 @@ index 0f73a7746..59aaae75e 100644
          parallel_config = vllm_config.parallel_config
  
          eplb_config = parallel_config.eplb_config
-@@ -1042,7 +2176,7 @@ class Qwen3NextModel(nn.Module):
+@@ -1042,7 +2217,7 @@ class Qwen3NextModel(nn.Module):
              ckpt_gate_proj_name="gate_proj",
              ckpt_down_proj_name="down_proj",
              ckpt_up_proj_name="up_proj",
@@ -13561,7 +14372,7 @@ index 0f73a7746..59aaae75e 100644
              num_redundant_experts=self.num_redundant_experts,
          )
  
-@@ -1201,15 +2335,17 @@ class Qwen3NextForCausalLM(
+@@ -1201,15 +2376,17 @@ class Qwen3NextForCausalLM(
      }
  
      def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -13583,7 +14394,7 @@ index 0f73a7746..59aaae75e 100644
          self.quant_config = vllm_config.quant_config
  
          super().__init__()
-@@ -1263,7 +2399,7 @@ class Qwen3NextForCausalLM(
+@@ -1263,7 +2440,7 @@ class Qwen3NextForCausalLM(
          cls, vllm_config: "VllmConfig"
      ) -> tuple[tuple[int, int], tuple[int, int]]:
          parallel_config = vllm_config.parallel_config
@@ -13592,7 +14403,7 @@ index 0f73a7746..59aaae75e 100644
          tp_size = parallel_config.tensor_parallel_size
          num_spec = (
              vllm_config.speculative_config.num_speculative_tokens
-@@ -1280,6 +2416,10 @@ class Qwen3NextForCausalLM(
+@@ -1280,6 +2457,10 @@ class Qwen3NextForCausalLM(
              num_spec,
          )
  
