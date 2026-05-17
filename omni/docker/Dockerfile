@@ -133,6 +133,21 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt && \
     rm -f /tmp/raylight_for_multi_arc.patch /tmp/comfyui_controlnet_aux_depth_anything_v2_xpu.patch
 
+# nunchaku-torch runtime + ComfyUI-nunchaku-XPU custom node (SVDQuant W4A4/W4A16 diffusion inference)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm && \
+    git clone --depth 1 https://github.com/xiangyuT/nunchaku-torch.git && \
+    cd nunchaku-torch && \
+    git fetch --depth 1 origin e09fae78f138fc0f5e86ad630be14433bd9713af && \
+    git checkout e09fae78f138fc0f5e86ad630be14433bd9713af && \
+    pip install -e . --no-deps && \
+    cd /llm/ComfyUI/custom_nodes && \
+    git clone --depth 1 https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git && \
+    cd ComfyUI-nunchaku-XPU && \
+    git fetch --depth 1 origin 1b78483a6af31297d5291f61965502079aed3407 && \
+    git checkout 1b78483a6af31297d5291f61965502079aed3407 && \
+    pip install -r requirements.txt
+
 # ComfyUI disabled custom nodes (optional: --build-arg INSTALL_DISABLED_NODES=true)
 ARG INSTALL_DISABLED_NODES=true
 COPY ./patches/comfyui_voxcpm_for_xpu.patch /tmp/
