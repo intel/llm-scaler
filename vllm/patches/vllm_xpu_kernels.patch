@@ -1,191 +1,759 @@
-diff --git a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp b/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
-index 10d7a1b..45664ac 100644
---- a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
-+++ b/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
-@@ -150,10 +150,34 @@ CUTE_DEVICE void chunk_prepare_kernel(
-             a[(chunk_start_offset + sg_local_id * local_num + c) +
-               v_head_id * total_virtual_seqlen];
-       }
-+      // Relative position within this batch of the chunk we're processing.
-+      // chunk_id is a global chunk id (cumulative across batches), pre_chunks
-+      // is the batch's starting global chunk id, so (chunk_id - pre_chunks)
-+      // gives the intra-batch chunk index.
-+      const int batch_chunk_idx = chunk_id - pre_chunks;
-       CUTE_UNROLL
-       for (int c = 0; c < local_num; ++c) {
--        float a_h = g_local[c] + dt_bias_h;
--        a_h = act_softplus(a_h) * A_log_exp_h;
-+        // Absolute position within this batch's logical sequence.
-+        const int rel_pos =
-+            batch_chunk_idx * chunk_size + sg_local_id * local_num + c;
-+        // Fix B2: padding positions (rel_pos >= seq_len) MUST get a_h = 0
-+        // so that downstream chunk_compute_A_kernel's
-+        //     A[m,n] *= exp(g[m]-g[n]) * beta
-+        // does not produce `0 * inf = NaN` for padding rows/cols.
-+        //   g[padding] = cumsum(softplus(dt_bias) * -exp(A_log)) is a large
-+        //   negative, so exp(g[m]-g[n]) for m<n overflows to inf; combined
-+        //   with beta=0 (padding) it yields NaN in fp32 accumulator, which
-+        //   leaks through to A's m>n padding entries that are not masked to
-+        //   zero by the "if (m < n) A = 0" guard.
-+        // Setting a_h = 0 here makes g[padding] = 0, so exp(0) = 1 and
-+        // 1 * 0 = 0 cleanly.
-+        float a_h;
-+        if (rel_pos >= seq_len) {
-+          a_h = 0.0f;
-+        } else {
-+          a_h = g_local[c] + dt_bias_h;
-+          a_h = act_softplus(a_h) * A_log_exp_h;
-+        }
-         g_local[c] = a_h;
-         g_local_sum += a_h;
-       }
-@@ -309,6 +333,10 @@ CUTE_DEVICE void chunk_compute_A_kernel(
+From f58db029f7f314056b9e42ae2dbb80c7b11a3061 Mon Sep 17 00:00:00 2001
+From: Johanna Reiml <johanna@reiml.dev>
+Date: Thu, 26 Feb 2026 22:43:45 +0100
+Subject: [PATCH 01/10] [Bugfix] Fix DeepSeek-OCR crash on small images with
+ empty crops
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ vllm/model_executor/models/deepseek_ocr.py | 5 +----
+ 1 file changed, 1 insertion(+), 4 deletions(-)
+
+diff --git a/vllm/model_executor/models/deepseek_ocr.py b/vllm/model_executor/models/deepseek_ocr.py
+index b0fba01a4..caf4dbee7 100644
+--- a/vllm/model_executor/models/deepseek_ocr.py
++++ b/vllm/model_executor/models/deepseek_ocr.py
+@@ -452,10 +452,7 @@ class DeepseekOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
+         # support arbitrary resolutions via pos-encoding interpolation,
+         # so Tiny/Small/Base/Large variants all work with the same weights.
+         base_size = pixel_values.shape[-1]
+-        if images_crop is not None and images_crop.numel() > 0:
+-            image_size = images_crop.shape[-1]
+-        else:
+-            image_size = base_size
++        image_size = images_crop.shape[-1] if images_crop is not None else base_size
  
-         reorder(tSrA_c, tCrA_c);
-         copy(copy_A_c, tCrA_c, tCgA_c);
+         return DeepseekOCRImagePixelInputs(
+             type="pixel_values",
+-- 
+2.43.0
+
+
+From efb1d1ecdf3b680b23287ea5422ebab4038df417 Mon Sep 17 00:00:00 2001
+From: Kunshang Ji <kunshang.ji@intel.com>
+Date: Thu, 5 Feb 2026 17:46:41 +0800
+Subject: [PATCH 02/10] add workaround for mem_get_info on BMG (#126)
+
+* add workaround for mem_get_info on BMG
+
+Signed-off-by: Kunshang Ji <kunshang.ji@intel.com>
+
+* use reserve mem
+
+Signed-off-by: Kunshang Ji <kunshang.ji@intel.com>
+
+---------
+
+Signed-off-by: Kunshang Ji <kunshang.ji@intel.com>
+---
+ vllm/platforms/xpu.py | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
+index c06afcb69..3c5a3573e 100644
+--- a/vllm/platforms/xpu.py
++++ b/vllm/platforms/xpu.py
+@@ -227,6 +227,17 @@ class XPUPlatform(Platform):
+         # ref. https://openucx.readthedocs.io/en/master/faq.html
+         os.environ["UCX_MEMTYPE_CACHE"] = "n"
+ 
++    @classmethod
++    def mem_get_info(cls, device) -> tuple[int, int]:
++        if cls.is_data_center_gpu():
++            # For data center GPU, use torch.xpu.mem_get_info
++            return torch.xpu.mem_get_info(device)
++        # FIXME:kunshang, For client GPU, estimate free memory
++        reserved_mem = torch.xpu.memory_reserved(device)
++        total_mem = torch.xpu.get_device_properties(device).total_memory
++        estimated_free_mem = total_mem - reserved_mem
++        return estimated_free_mem, total_mem
 +
-+        ::sycl::atomic_fence(::sycl::memory_order::acq_rel,
-+                             ::sycl::memory_scope::device);
-+        item.barrier(::sycl::access::fence_space::global_and_local);
-       }
-       chunk_id += global_chunk_range;
-     }
-@@ -928,6 +956,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
-     StateT*
-         ssm_state,  // [cache_batch_size, num_v_heads, head_v_dim, head_k_dim]
-     const int ssm_state_stride_0,
-+    float* ssm_state_f32,  // [batch_size, num_v_heads, head_v_dim, head_k_dim]
-     const int* query_start_loc,
-     const int* cache_indices,
-     const bool* has_initial_state,
-@@ -997,6 +1026,23 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
-         static_cast<int64_t>(cache_indices[batch_id]) * ssm_state_stride_0 +
-         v_head_id * head_v_dim * head_k_dim;
+     @classmethod
+     def support_hybrid_kv_cache(cls) -> bool:
+         return True
+-- 
+2.43.0
+
+
+From 13dab01ee68afe17b2dd04c0a454d3d99cb00bb7 Mon Sep 17 00:00:00 2001
+From: Kunshang Ji <kunshang.ji@intel.com>
+Date: Thu, 22 Jan 2026 02:52:33 -0800
+Subject: [PATCH 03/10] [INT4]remove ipex quant, support gptq, awq dense model
+
+Signed-off-by: Kunshang Ji <kunshang.ji@intel.com>
+
+add xpuwNa16 support (#112)
+
+Signed-off-by: Zhu, Zufang <zufang.zhu@intel.com>
+
+Signed-off-by: Kunshang Ji <kunshang.ji@intel.com>
+
+revert
+
+Signed-off-by: Kunshang Ji <kunshang.ji@intel.com>
+
+Revert "add xpuwNa16 support (#112)"
+
+This reverts commit e9cdfa3724ab9265090911421b9bdb8b22fa10fa.
+
+Signed-off-by: Kunshang Ji <kunshang.ji@intel.com>
+---
+ .../model_executor/layers/quantization/awq.py | 32 +++++++++++++++++++
+ .../layers/quantization/gptq.py               | 30 +++++++++++++++++
+ 2 files changed, 62 insertions(+)
+
+diff --git a/vllm/model_executor/layers/quantization/awq.py b/vllm/model_executor/layers/quantization/awq.py
+index 3cf3116f0..eec9c9909 100644
+--- a/vllm/model_executor/layers/quantization/awq.py
++++ b/vllm/model_executor/layers/quantization/awq.py
+@@ -20,6 +20,7 @@ from vllm.model_executor.layers.quantization.base_config import (
+ )
+ from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+ from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
++from vllm.platforms import current_platform
+ from vllm.transformers_utils.config import get_safetensors_params_metadata
  
-+    float* ssm_state_f32_ptr =
-+        ssm_state_f32 +
-+        static_cast<int64_t>(current_batch_id) * num_v_heads * head_v_dim *
-+            head_k_dim +
-+        static_cast<int64_t>(v_head_id) * head_v_dim * head_k_dim;
+ if TYPE_CHECKING:
+@@ -251,6 +252,23 @@ class AWQLinearMethod(LinearMethodBase):
+         layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
+         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
+         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
++        if current_platform.is_xpu():
++            from vllm_xpu_kernels.quantization._quantize_convert import (
++                AWQUtils,
++                transpose_onednn_woq_format,
++            )
 +
-+    if (initial_state) {
-+      for (int e = local_id; e < head_v_dim * head_k_dim; e += local_range) {
-+        ssm_state_f32_ptr[e] = static_cast<float>(ssm_state_ptr[e]);
-+      }
-+    } else {
-+      for (int e = local_id; e < head_v_dim * head_k_dim; e += local_range) {
-+        ssm_state_f32_ptr[e] = 0.0f;
-+      }
-+    }
-+    item.barrier(sycl::access::fence_space::global_and_local);
++            layer.xpu_output_size = (
++                layer.qweight.size(1) * self.quant_config.pack_factor
++            )
++            qweight_new, qzeros_new = AWQUtils.repack(layer.qweight, layer.qzeros)
++            if qweight_new.shape != layer.qweight.data.shape:
++                layer.qweight.data = layer.qweight.data.view_as(qweight_new)
++            if qzeros_new.shape != layer.qzeros.data.shape:
++                layer.qzeros.data = layer.qzeros.data.view_as(qzeros_new)
++            layer.qweight.data.copy_(qweight_new)
++            layer.qzeros.data.copy_(qzeros_new)
++            transpose_onednn_woq_format(layer, "awq", False)
+ 
+     def apply(
+         self,
+@@ -258,6 +276,20 @@ class AWQLinearMethod(LinearMethodBase):
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if current_platform.is_xpu():
++            reshaped_x = x.reshape(-1, x.shape[-1])
++            out = torch.ops._xpu_C.int4_gemm_w4a16(
++                reshaped_x,
++                layer.qweight,
++                bias,
++                layer.scales,
++                layer.qzeros,
++                self.quant_config.group_size,
++                None,
++            )
++            out_shape = x.shape[:-1] + (layer.xpu_output_size,)
++            return out.reshape(out_shape)
 +
-     for (int chunk_id = 0; chunk_id < current_chunks; ++chunk_id) {
-       const bool has_prev_state = (chunk_id != 0) || initial_state;
-       const int out_chunk_offset = seq_start_offset + chunk_id * chunk_size;
-@@ -1049,6 +1095,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
-           make_gmem_ptr(S_ptr),
-           make_layout(S_tensor_shape, make_stride(head_k_dim, _1{})));
+         qweight = layer.qweight
+         scales = layer.scales
+         qzeros = layer.qzeros
+diff --git a/vllm/model_executor/layers/quantization/gptq.py b/vllm/model_executor/layers/quantization/gptq.py
+index 154347a93..355cbfa57 100644
+--- a/vllm/model_executor/layers/quantization/gptq.py
++++ b/vllm/model_executor/layers/quantization/gptq.py
+@@ -28,6 +28,7 @@ from vllm.model_executor.parameter import (
+     PackedvLLMParameter,
+     RowvLLMParameter,
+ )
++from vllm.platforms import current_platform
+ from vllm.transformers_utils.config import get_safetensors_params_metadata
+ from vllm.utils.collection_utils import is_list_of
  
-+      float* S_f32_ptr = ssm_state_f32_ptr;
-+      auto S_f32_tensor = make_tensor(
-+          make_gmem_ptr(S_f32_ptr),
-+          make_layout(S_tensor_shape, make_stride(head_k_dim, _1{})));
+@@ -355,6 +356,23 @@ class GPTQLinearMethod(LinearMethodBase):
+         layer.g_idx = Parameter(layer.g_idx.data, requires_grad=False)
+         layer.scales = Parameter(layer.scales.data, requires_grad=False)
+ 
++        if current_platform.is_xpu():
++            from vllm_xpu_kernels.quantization._quantize_convert import (
++                GPTQUtils,
++                transpose_onednn_woq_format,
++            )
 +
-       Tensor cU = make_identity_tensor(U_tensor.shape());
- 
-       auto copy_U_c = get_block_2d_copy_C<void>(mma, U_tensor);
-@@ -1190,29 +1241,30 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
-               K_tensor_T_shape, make_stride(_1{}, head_k_dim * num_k_heads)));
- 
-       Tensor cS = make_identity_tensor(S_tensor.shape());
--      auto copy_S_c = get_block_2d_copy_C<void>(mma, S_tensor);
++            if self.quant_config.desc_act and layer.g_idx is not None:
++                gptq_utils = GPTQUtils(bits=4, blocksize=self.quant_config.group_size)
++                qweight_new, g_idx_new = gptq_utils.shuffle(layer.qweight, layer.g_idx)
++                layer.qweight.data.copy_(qweight_new)
++                layer.g_idx.data.copy_(g_idx_new)
++                qweight_new = None
++                g_idx_new = None
++                del qweight_new, g_idx_new
++            transpose_onednn_woq_format(layer, "gptq", True)
++            return
 +
-+      auto copy_S_f32_c = get_block_2d_copy_C<void>(mma, S_f32_tensor);
-+      auto copy_S_f32_d = get_block_2d_copy_D<void>(mma, S_f32_tensor);
-       auto copy_S_d = get_block_2d_copy_D<void>(mma, S_tensor);
--      auto thr_copy_S_c = copy_S_c.get_slice(local_id);
+         # exllama needs to shuffle the weight after the weight is loaded
+         # here we do the shuffle on first forward pass
+         if layer.exllama_state == ExllamaState.UNINITIALIZED:
+@@ -373,6 +391,18 @@ class GPTQLinearMethod(LinearMethodBase):
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if current_platform.is_xpu():
++            reshaped_x = x.reshape(-1, x.shape[-1])
++            out = torch.ops._xpu_C.int4_gemm_w4a16(
++                reshaped_x,
++                layer.qweight,
++                bias,
++                layer.scales,
++                layer.qzeros,
++                layer.quant_config.group_size,
++                None,
++            )
++            return out
+         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
+         reshaped_x = x.reshape(-1, x.shape[-1])
+ 
+-- 
+2.43.0
+
+
+From 4bb777c7232a7e14221813bd594e141f161f4593 Mon Sep 17 00:00:00 2001
+From: Yejing Lai <yejing.lai@intel.com>
+Date: Wed, 4 Mar 2026 10:53:22 +0800
+Subject: [PATCH 04/10] Fix MiniCPM model mete tensor copy error (#149)
+
+Signed-off-by: Lai, Yejing <yejing.lai@intel.com>
+---
+ vllm/model_executor/models/minicpmv.py | 50 ++++++++++++++++++++------
+ 1 file changed, 40 insertions(+), 10 deletions(-)
+
+diff --git a/vllm/model_executor/models/minicpmv.py b/vllm/model_executor/models/minicpmv.py
+index 784a03a60..4ea54fc7c 100644
+--- a/vllm/model_executor/models/minicpmv.py
++++ b/vllm/model_executor/models/minicpmv.py
+@@ -1277,8 +1277,14 @@ class MiniCPMV2_0(MiniCPMVBaseModel):
+                 prefix=prefix,
+             )
+ 
+-        return resampler.to(
+-            device=current_platform.device_type, dtype=torch.get_default_dtype()
++        return (
++            resampler.to_empty(device=current_platform.device_type).to(
++                dtype=torch.get_default_dtype()
++            )
++            if any(p.is_meta for p in resampler.parameters())
++            else resampler.to(
++                device=current_platform.device_type, dtype=torch.get_default_dtype()
++            )
+         )
+ 
+     def get_vision_hidden_states(self, data: MiniCPMVImagePixelInputs) -> torch.Tensor:
+@@ -1359,8 +1365,14 @@ class MiniCPMV2_5(MiniCPMVBaseModel, SupportsLoRA):
+                 prefix=prefix,
+             )
+ 
+-        return resampler.to(
+-            device=current_platform.device_type, dtype=torch.get_default_dtype()
++        return (
++            resampler.to_empty(device=current_platform.device_type).to(
++                dtype=torch.get_default_dtype()
++            )
++            if any(p.is_meta for p in resampler.parameters())
++            else resampler.to(
++                device=current_platform.device_type, dtype=torch.get_default_dtype()
++            )
+         )
+ 
+     def get_vision_hidden_states(self, data: MiniCPMVImagePixelInputs) -> torch.Tensor:
+@@ -1452,8 +1464,14 @@ class MiniCPMV2_6(MiniCPMVBaseModel, SupportsLoRA):
+                 prefix=prefix,
+             )
+ 
+-        return resampler.to(
+-            device=current_platform.device_type, dtype=torch.get_default_dtype()
++        return (
++            resampler.to_empty(device=current_platform.device_type).to(
++                dtype=torch.get_default_dtype()
++            )
++            if any(p.is_meta for p in resampler.parameters())
++            else resampler.to(
++                device=current_platform.device_type, dtype=torch.get_default_dtype()
++            )
+         )
+ 
+     def get_vision_hidden_states(self, data: MiniCPMVImagePixelInputs) -> torch.Tensor:
+@@ -1549,8 +1567,14 @@ class MiniCPMV4_0(MiniCPMVBaseModel, SupportsLoRA):
+                 prefix=prefix,
+             )
+ 
+-        return resampler.to(
+-            device=current_platform.device_type, dtype=torch.get_default_dtype()
++        return (
++            resampler.to_empty(device=current_platform.device_type).to(
++                dtype=torch.get_default_dtype()
++            )
++            if any(p.is_meta for p in resampler.parameters())
++            else resampler.to(
++                device=current_platform.device_type, dtype=torch.get_default_dtype()
++            )
+         )
+ 
+     def get_vision_hidden_states(self, data: MiniCPMVImagePixelInputs) -> torch.Tensor:
+@@ -1646,8 +1670,14 @@ class MiniCPMV4_5(MiniCPMVBaseModel, SupportsLoRA):
+                 prefix=prefix,
+             )
+ 
+-        return resampler.to(
+-            device=current_platform.device_type, dtype=torch.get_default_dtype()
++        return (
++            resampler.to_empty(device=current_platform.device_type).to(
++                dtype=torch.get_default_dtype()
++            )
++            if any(p.is_meta for p in resampler.parameters())
++            else resampler.to(
++                device=current_platform.device_type, dtype=torch.get_default_dtype()
++            )
+         )
+ 
+     def get_vision_hidden_states(self, data: MiniCPMVImagePixelInputs) -> torch.Tensor:
+-- 
+2.43.0
+
+
+From a297ee19c62cd321d306b2ab861303db7f8e532c Mon Sep 17 00:00:00 2001
+From: liuzhenwei <zhenwei.liu@intel.com>
+Date: Fri, 6 Mar 2026 15:23:39 +0800
+Subject: [PATCH 05/10] Add xpu disagg acc test script (#154)
+
+Signed-off-by: zhenwei-intel <zhenwei.liu@intel.com>
+---
+ .../run_xpu_disagg_accuracy_test.sh           | 156 ++++++++++++++++++
+ 1 file changed, 156 insertions(+)
+ create mode 100644 tests/v1/kv_connector/nixl_integration/run_xpu_disagg_accuracy_test.sh
+
+diff --git a/tests/v1/kv_connector/nixl_integration/run_xpu_disagg_accuracy_test.sh b/tests/v1/kv_connector/nixl_integration/run_xpu_disagg_accuracy_test.sh
+new file mode 100644
+index 000000000..3e9e2cb73
+--- /dev/null
++++ b/tests/v1/kv_connector/nixl_integration/run_xpu_disagg_accuracy_test.sh
+@@ -0,0 +1,156 @@
++#!/bin/bash
++set -e
 +
-+      auto thr_copy_S_f32_c = copy_S_f32_c.get_slice(local_id);
-+      auto thr_copy_S_f32_d = copy_S_f32_d.get_slice(local_id);
-       auto thr_copy_S_d = copy_S_d.get_slice(local_id);
- 
-       for (int dv = 0; dv < head_v_dim / chunk_size; ++dv) {
-         for (int dk = 0; dk < head_k_dim / chunk_size; ++dk) {
-           Tensor gS_C =
-               local_tile(cS, wg_tile, make_coord(dv, dk, 0), Step<_1, _1, X>{});
--          auto tCrS_d = thr_copy_S_d.partition_sg_fragment_S(gS_C);
-           auto tCgS_d = thr_copy_S_d.partition_D(gS_C);
-           auto tSrS_d = thr_mma.partition_sg_fragment_C(gS_C);
- 
--          // Seed accumulator with exp(g_last) * S_prev when previous state
--          // exists; otherwise start from zeros.
-           if (has_prev_state) {
--            auto tCgS_c = thr_copy_S_c.partition_S(gS_C);
--            auto tCrS_c = thr_copy_S_c.partition_sg_fragment_D(gS_C);
--            copy(copy_S_c, tCgS_c, tCrS_c);
-+            auto tCgS_f32_c = thr_copy_S_f32_c.partition_S(gS_C);
-+            auto tCrS_f32_c = thr_copy_S_f32_c.partition_sg_fragment_D(gS_C);
-+            copy(copy_S_f32_c, tCgS_f32_c, tCrS_f32_c);
- 
--            reorder(tCrS_c, tSrS_d);
-+            reorder(tCrS_f32_c, tSrS_d);
-             CUTE_UNROLL
--            for (int i = 0; i < tCrS_c.size(); ++i) {
-+            for (int i = 0; i < tCrS_f32_c.size(); ++i) {
-               tSrS_d(i) *= g_last_value_exp;
-             }
-           } else {
-@@ -1221,7 +1273,17 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
- 
-           gemm_TTS_k_multi(
-               U_tensor_T, K_tensor_T, tSrS_d, dv, dk, mma, g_multi_slm_ptr);
--          reorder(tSrS_d, tCrS_d);
++# Hosts / ports
++PREFILL_HOST=${PREFILL_HOST:-"localhost"}
++PREFILL_PORT=${PREFILL_PORT:-8100}
++PREFILL_NIXL_SIDE_PORT=${PREFILL_NIXL_SIDE_PORT:-5577}
++DECODE_HOST=${DECODE_HOST:-"localhost"}
++DECODE_PORT=${DECODE_PORT:-8200}
++PROXY_HOST=${PROXY_HOST:-"localhost"}
++PROXY_PORT=${PROXY_PORT:-8192}
++BASELINE_HOST=${BASELINE_HOST:-"localhost"}
++BASELINE_PORT=${BASELINE_PORT:-9290}
 +
-+          auto tCrS_f32_d = thr_copy_S_f32_d.partition_sg_fragment_S(gS_C);
-+          auto tCgS_f32_d = thr_copy_S_f32_d.partition_D(gS_C);
-+          reorder(tSrS_d, tCrS_f32_d);
-+          copy(copy_S_f32_d, tCrS_f32_d, tCgS_f32_d);
 +
-+          auto tCrS_d = thr_copy_S_d.partition_sg_fragment_S(gS_C);
-+          CUTE_UNROLL
-+          for (int i = 0; i < tCrS_f32_d.size(); ++i) {
-+            tCrS_d(i) = static_cast<StateT>(tCrS_f32_d(i));
-+          }
-           copy(copy_S_d, tCrS_d, tCgS_d);
-         }
-       }
-@@ -1279,6 +1341,7 @@ void kernel_launcher(
-     const T* dt_bias,
-     StateT* ssm_state,
-     const int ssm_state_stride_0,
-+    float* ssm_state_f32,
-     const int* query_start_loc,
-     const int* cache_indices,
-     const bool* has_initial_state,
-@@ -1507,6 +1570,7 @@ void kernel_launcher(
-               a,
-               ssm_state,
-               ssm_state_stride_0,
-+              ssm_state_f32,
-               query_start_loc,
-               cache_indices,
-               has_initial_state,
-@@ -1583,6 +1647,10 @@ void chunk_gated_delta_rule_impl_xe2(
-       {num_v_heads, total_seqlen + padding_size, head_v_dim},
-       torch::dtype(dtype).device(device).requires_grad(false));
++# Model to run.
++MODEL_NAME=${MODEL_NAME:-"Qwen/Qwen3-0.6B"}
++MAX_MODEL_LEN=${MAX_MODEL_LEN:-1024}
++BLOCK_SIZE=${BLOCK_SIZE:-64}
++
++
++# execution env
++GIT_ROOT=$(git rev-parse --show-toplevel)
++EXP_ROOT="${GIT_ROOT}/tests/v1/kv_connector/nixl_integration"
++
++OUTPUT_FILE=${OUTPUT_FILE:-"${EXP_ROOT}/.xpu_accuracy_test_outputs.txt"}
++
++# Trap the SIGINT signal (triggered by Ctrl+C)
++trap 'kill $(jobs -pr)' SIGINT SIGTERM EXIT
++
++cleanup() {
++  echo "Cleaning up any running vLLM instances..."
++  pkill -f "vllm serve" || true
++  sleep 2
++}
++
++wait_for_server() {
++  local host=$1
++  local port=$2
++  timeout 1200 bash -c "
++    until curl -s ${host}:${port}/v1/completions > /dev/null; do
++      sleep 1
++    done" && return 0 || return 1
++}
++
++launch_baseline() {
++  BASELINE_BASE_CMD="
++  ZE_AFFINITY_MASK=0 \
++  VLLM_USE_V1=1 \
++  VLLM_WORKER_MULTIPROC_METHOD=spawn \
++  VLLM_ENABLE_V1_MULTIPROCESSING=1 vllm serve $MODEL_NAME \
++      --host ${BASELINE_HOST} \
++      --port ${BASELINE_PORT} \
++      --max-model-len ${MAX_MODEL_LEN}\
++      --seed 42 \
++      -tp 1 \
++      --block-size ${BLOCK_SIZE} \
++      --gpu-memory-utilization 0.8 \
++      --disable-log-requests \
++      --dtype float16 \
++      --enforce-eager"
++  echo ${BASELINE_BASE_CMD}      
++  bash -c "${BASELINE_BASE_CMD}" &
++  sleep 10
++  wait_for_server ${BASELINE_HOST} ${BASELINE_PORT}
++}
++
++launch_pd() {
++  PREFILL_BASE_CMD="
++  ZE_AFFINITY_MASK=0 \
++  VLLM_MULTIPROC_EXECUTE_MODEL_TIMEOUT_S=200 \
++  VLLM_USE_V1=1 \
++  VLLM_NIXL_SIDE_CHANNEL_HOST=${PREFILL_HOST} \
++  VLLM_NIXL_SIDE_CHANNEL_PORT=${PREFILL_NIXL_SIDE_PORT} \
++  VLLM_WORKER_MULTIPROC_METHOD=spawn \
++  VLLM_ENABLE_V1_MULTIPROCESSING=1 vllm serve $MODEL_NAME \
++      --host ${PREFILL_HOST} \
++      --port ${PREFILL_PORT} \
++      --max-model-len ${MAX_MODEL_LEN}\
++      --seed 42 \
++      --block-size ${BLOCK_SIZE} \
++      --enforce-eager \
++      --dtype float16 \
++      -tp 1 \
++      --gpu-memory-utilization 0.8 \
++      --disable-log-requests \
++      --kv-transfer-config '{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_buffer_device\":\"cpu\"}'"
++
++
++  DECODE_BASE_CMD="
++  ZE_AFFINITY_MASK=1 \
++  VLLM_MULTIPROC_EXECUTE_MODEL_TIMEOUT_S=200 \
++  VLLM_USE_V1=1 \
++  VLLM_WORKER_MULTIPROC_METHOD=spawn \
++  VLLM_ENABLE_V1_MULTIPROCESSING=1 vllm serve $MODEL_NAME \
++      --host ${DECODE_HOST} \
++      --port ${DECODE_PORT} \
++      --max-model-len ${MAX_MODEL_LEN}\
++      --seed 42 \
++      --block-size ${BLOCK_SIZE} \
++      --enforce-eager \
++      -tp 1 \
++      --dtype float16 \
++      --gpu-memory-utilization 0.8 \
++      --disable-log-requests \
++      --kv-transfer-config '{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_buffer_device\":\"cpu\"}'"
++
++  echo ${PREFILL_BASE_CMD}
++  echo ${DECODE_BASE_CMD}
++  sleep 2
++
++  # execute on hosts
++  bash -c "${PREFILL_BASE_CMD}" &
++  bash -c "${DECODE_BASE_CMD}" &
++  sleep 1
++  wait_for_server ${PREFILL_HOST} ${PREFILL_PORT}
++  sleep 1
++  wait_for_server ${DECODE_HOST} ${DECODE_PORT}
++  sleep 1
++}
++
++launch_pd_proxy(){
++  PROXY_BASE_CMD="
++  python3 ${EXP_ROOT}/toy_proxy_server.py \
++  --prefiller-host ${PREFILL_HOST} --prefiller-port ${PREFILL_PORT} \
++  --decoder-host ${DECODE_HOST} --decoder-port ${DECODE_PORT} \
++  --host=${PROXY_HOST} --port ${PROXY_PORT}"
++  echo ${PROXY_BASE_CMD} 
++  bash -c "${PROXY_BASE_CMD}" &
++  sleep 2
++}
++
++run_tests(){
++  local service_url=$1
++  local mode=$2
++  python3 ${EXP_ROOT}/test_disagg_accuracy.py --service_url=${service_url} --model_name=${MODEL_NAME} --mode=${mode} --file_name=${OUTPUT_FILE}
++}
++
++
++# run non-disagg. baseline & save outputs
++launch_baseline
++run_tests "http://${BASELINE_HOST}:${BASELINE_PORT}" "baseline"
++cleanup
++sleep 10
++
++
++# run disagg. & do exact-match with the outputs from baseline
++launch_pd
++launch_pd_proxy
++run_tests "http://${PROXY_HOST}:${PROXY_PORT}" "disagg"
++echo "-----P/D success----"
++
++rm ${OUTPUT_FILE}
++cleanup
++
++exit 0
+-- 
+2.43.0
+
+
+From 139fc0dd43103d20a47dc13f934ed4251bfd0592 Mon Sep 17 00:00:00 2001
+From: Kunshang Ji <kunshang.ji@intel.com>
+Date: Fri, 6 Mar 2026 17:16:56 +0800
+Subject: [PATCH 06/10] add fp8 env var, use e4m3 as default (#156)
+
+* add fp8 env var, use e4m3 as default
+
+Signed-off-by: Kunshang Ji <kunshang.ji@intel.com>
+
+* fix
+
+Signed-off-by: Kunshang Ji <kunshang.ji@intel.com>
+
+---------
+
+Signed-off-by: Kunshang Ji <kunshang.ji@intel.com>
+---
+ vllm/envs.py          |  3 +++
+ vllm/platforms/xpu.py | 11 ++++++++++-
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 02fcd998a..c007bb967 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -245,6 +245,7 @@ if TYPE_CHECKING:
+     VLLM_CUDA_COMPATIBILITY_PATH: str | None = None
+     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
+     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
++    VLLM_XPU_FP8_DTYPE: str = "e4m3"
  
-+  torch::Tensor ssm_state_f32 = torch::zeros(
-+      {batch_size, num_v_heads, head_v_dim, head_k_dim},
-+      torch::dtype(torch::kFloat32).device(device).requires_grad(false));
+ 
+ def get_default_cache_root():
+@@ -1632,6 +1633,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_ELASTIC_EP_DRAIN_REQUESTS": lambda: bool(
+         int(os.getenv("VLLM_ELASTIC_EP_DRAIN_REQUESTS", "0"))
+     ),
++    # fp8 dtype for XPU platform
++    "VLLM_XPU_FP8_DTYPE": lambda: os.environ.get("VLLM_XPU_FP8_DTYPE", "e4m3"),
+ }
+ 
+ 
+diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
+index 3c5a3573e..c3d035541 100644
+--- a/vllm/platforms/xpu.py
++++ b/vllm/platforms/xpu.py
+@@ -12,6 +12,7 @@ import vllm_xpu_kernels._C  # noqa
+ import vllm_xpu_kernels._moe_C  # noqa
+ import vllm_xpu_kernels._xpu_C  # noqa
+ 
++import vllm.envs as envs
+ from vllm.logger import init_logger
+ from vllm.utils.torch_utils import supports_xpu_graph
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+@@ -259,7 +260,15 @@ class XPUPlatform(Platform):
+ 
+     @classmethod
+     def fp8_dtype(cls) -> torch.dtype:
+-        return torch.float8_e4m3fn
++        if envs.VLLM_XPU_FP8_DTYPE == "e4m3":
++            return torch.float8_e4m3fn
++        elif envs.VLLM_XPU_FP8_DTYPE == "e5m2":
++            return torch.float8_e5m2
++        else:
++            raise ValueError(
++                f"Unsupported XPU FP8 dtype: {envs.VLLM_XPU_FP8_DTYPE}. "
++                f"Supported values are 'e4m3' and 'e5m2'."
++            )
+ 
+     @classmethod
+     def is_data_center_gpu(cls) -> bool:
+-- 
+2.43.0
+
+
+From 3f566b2efea2a03b7437d2af5b0fe7ed95d6c676 Mon Sep 17 00:00:00 2001
+From: liuzhenwei <zhenwei.liu@intel.com>
+Date: Tue, 10 Mar 2026 08:45:44 +0800
+Subject: [PATCH 07/10] remove disable-log-requests (#158)
+
+Signed-off-by: zhenwei-intel <zhenwei.liu@intel.com>
+---
+ .../nixl_integration/run_xpu_disagg_accuracy_test.sh           | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/tests/v1/kv_connector/nixl_integration/run_xpu_disagg_accuracy_test.sh b/tests/v1/kv_connector/nixl_integration/run_xpu_disagg_accuracy_test.sh
+index 3e9e2cb73..b8a88bb68 100644
+--- a/tests/v1/kv_connector/nixl_integration/run_xpu_disagg_accuracy_test.sh
++++ b/tests/v1/kv_connector/nixl_integration/run_xpu_disagg_accuracy_test.sh
+@@ -56,7 +56,6 @@ launch_baseline() {
+       -tp 1 \
+       --block-size ${BLOCK_SIZE} \
+       --gpu-memory-utilization 0.8 \
+-      --disable-log-requests \
+       --dtype float16 \
+       --enforce-eager"
+   echo ${BASELINE_BASE_CMD}      
+@@ -83,7 +82,6 @@ launch_pd() {
+       --dtype float16 \
+       -tp 1 \
+       --gpu-memory-utilization 0.8 \
+-      --disable-log-requests \
+       --kv-transfer-config '{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_buffer_device\":\"cpu\"}'"
+ 
+ 
+@@ -102,7 +100,6 @@ launch_pd() {
+       -tp 1 \
+       --dtype float16 \
+       --gpu-memory-utilization 0.8 \
+-      --disable-log-requests \
+       --kv-transfer-config '{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_buffer_device\":\"cpu\"}'"
+ 
+   echo ${PREFILL_BASE_CMD}
+-- 
+2.43.0
+
+
+From 735861d43127d9afe93d593b929309d09b001bdd Mon Sep 17 00:00:00 2001
+From: YiSheng5 <yi.sheng@intel.com>
+Date: Thu, 12 Mar 2026 11:02:15 +0800
+Subject: [PATCH 08/10] cherry-pick
+ https://github.com/vllm-project/vllm/pull/36593 from upstream to internal
+ branch to fix TPxDPxEP issues (#160)
+
+---
+ .../device_communicators/xpu_communicator.py           | 10 +++++-----
+ vllm/v1/worker/xpu_worker.py                           |  3 +++
+ 2 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/distributed/device_communicators/xpu_communicator.py b/vllm/distributed/device_communicators/xpu_communicator.py
+index 85c7f18e3..d2e9e89e5 100644
+--- a/vllm/distributed/device_communicators/xpu_communicator.py
++++ b/vllm/distributed/device_communicators/xpu_communicator.py
+@@ -70,7 +70,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
+             output_shape, dtype=input_tensor.dtype, device=input_tensor.device
+         )
+ 
+-        dist.reduce_scatter_tensor(output, input_tensor)
++        dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
+ 
+         # Reshape before returning
+         return output.movedim(0, dim).contiguous()
+@@ -103,9 +103,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
+         if sizes is not None and sizes.count(sizes[0]) != len(sizes):
+             # if inputs shape in different ranks is not the same using reduce_scatter
+             input_splits = list(input_tensor.split(sizes, dim=0))
+-            dist.reduce_scatter(output, input_splits)
++            dist.reduce_scatter(output, input_splits, group=self.device_group)
+         else:
+-            dist.reduce_scatter_tensor(output, input_tensor)
++            dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
+         # Reshape before returning
+         return output.movedim(0, dim).contiguous()
+ 
+@@ -149,10 +149,10 @@ class XpuCommunicator(DeviceCommunicatorBase):
+                             device=input_.device,
+                         )
+                     )
+-                dist.all_gather(all_gather_list, input_)
++                dist.all_gather(all_gather_list, input_, group=self.device_group)
+                 output_tensor = torch.cat(all_gather_list, dim=0)
+             else:
+-                dist.all_gather([output_tensor], input_)
++                dist.all_gather([output_tensor], input_, group=self.device_group)
+             return output_tensor
+ 
+         if isinstance(input_, torch.Tensor):
+diff --git a/vllm/v1/worker/xpu_worker.py b/vllm/v1/worker/xpu_worker.py
+index 6e45a107c..0e8882f00 100644
+--- a/vllm/v1/worker/xpu_worker.py
++++ b/vllm/v1/worker/xpu_worker.py
+@@ -85,6 +85,9 @@ class XPUWorker(Worker):
+             current_platform.dist_backend,
+         )
+ 
++        # global all_reduce needed for overall oneccl warm up
++        torch.distributed.all_reduce(torch.zeros(1).xpu())
 +
- #define KERNEL_LAUNCHER(scalar_t, state_scalar_t)                  \
-   kernel_launcher<scalar_t, state_scalar_t>(                       \
-       queue,                                                       \
-@@ -1599,6 +1667,7 @@ void chunk_gated_delta_rule_impl_xe2(
-       reinterpret_cast<scalar_t*>(dt_bias.data_ptr()),             \
-       reinterpret_cast<state_scalar_t*>(ssm_state.data_ptr()),     \
-       ssm_state_stride_0,                                          \
-+      reinterpret_cast<float*>(ssm_state_f32.data_ptr()),          \
-       reinterpret_cast<int*>(query_start_loc.data_ptr()),          \
-       reinterpret_cast<int*>(cache_indices.data_ptr()),            \
-       has_initial_state.has_value()                                \
+         # Set random seed.
+         set_random_seed(self.model_config.seed)
+ 
+-- 
+2.43.0
+
+
+From bfd620aa12b0ecbe5b32efc7f9135e95cf8ec8d9 Mon Sep 17 00:00:00 2001
+From: Yan Ma <yan.ma@intel.com>
+Date: Tue, 24 Feb 2026 06:09:44 +0000
+Subject: [PATCH 09/10] [XPU] disable async-scheduling by default on XPU
+
+Signed-off-by: Yan Ma <yan.ma@intel.com>
+---
+ vllm/config/vllm.py | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 44d78d737..01da51b3f 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -685,6 +685,8 @@ class VllmConfig:
+             "external_launcher",
+         )
+ 
++        from vllm.platforms import current_platform
++
+         if self.scheduler_config.async_scheduling:
+             # Async scheduling explicitly enabled, hard fail any incompatibilities.
+             # Currently, async scheduling only support eagle speculative
+@@ -710,8 +712,12 @@ class VllmConfig:
+                     f"`{executor_backend}`."
+                 )
+         elif self.scheduler_config.async_scheduling is None:
++            if current_platform.is_xpu():
++                # We disable async scheduling for xpu if use doesn't explicitly
++                # enable it.
++                self.scheduler_config.async_scheduling = False
+             # Enable async scheduling unless there is an incompatible option.
+-            if (
++            elif (
+                 self.speculative_config is not None
+                 and self.speculative_config.method not in get_args(EagleModelTypes)
+             ):
+@@ -763,8 +769,6 @@ class VllmConfig:
+             else:
+                 self.parallel_config.disable_nccl_for_dp_synchronization = False
+ 
+-        from vllm.platforms import current_platform
+-
+         if (
+             self.model_config is not None
+             and self.scheduler_config.enable_chunked_prefill
+-- 
+2.43.0
+
+
+From 2fc32a643f7a1d9d97b6005d55fc15c8f75109c4 Mon Sep 17 00:00:00 2001
+From: wenjun liu <wenjun.liu@intel.com>
+Date: Fri, 20 Mar 2026 14:33:45 +0800
+Subject: [PATCH 10/10] update kernel to 0.1.4 version (#164)
+
+Signed-off-by: wendyliu235 <wendyliu235@users.noreply.github.com>
+Co-authored-by: wendyliu235 <wendyliu235@users.noreply.github.com>
+---
+ requirements/xpu.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/requirements/xpu.txt b/requirements/xpu.txt
+index 3271f9f39..0cddd6dc6 100644
+--- a/requirements/xpu.txt
++++ b/requirements/xpu.txt
+@@ -15,4 +15,4 @@ torch==2.10.0+xpu
+ torchaudio
+ torchvision
+ 
+-vllm_xpu_kernels @ https://github.com/vllm-project/vllm-xpu-kernels/releases/download/v0.1.3/vllm_xpu_kernels-0.1.3-cp38-abi3-linux_x86_64.whl
++vllm_xpu_kernels @ https://github.com/vllm-project/vllm-xpu-kernels/releases/download/v0.1.4/vllm_xpu_kernels-0.1.4-cp38-abi3-manylinux_2_28_x86_64.whl
+-- 
+2.43.0
+
