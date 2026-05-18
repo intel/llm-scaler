@@ -1,0 +1,151 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// GGML Q4_0 quantization kernel on XPU (BF16/FP16 → INT4 + FP16 scale).
+//
+// Row-major layout (matches ggml_quantize_tensor(..., transpose=False) output):
+//   input:       [M, K]      bfloat16 (or float16), XPU, contiguous
+//   out_qweight: [M, K/8]    int32    — 8 unsigned 4-bit nibbles per int32
+//   out_scale:   [M, K/128]  float16  — per-block scale = amax / -8
+//
+// Packing (must match CPU `vllm_int4_for_multi_arc.so` / downstream INT4
+// GEMV/GEMM kernels; see moe_batch/moe_int4.sycl:79-83):
+//   nibble_i occupies bits [i*4 .. i*4+3] of the int32 word, i=0..7
+// Dequant (consumer side):
+//   float_val = (nibble_unsigned - 8) * scale
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+
+#include <cstdint>
+
+using fp16 = sycl::half;
+using bf16 = sycl::ext::oneapi::bfloat16;
+using namespace sycl::ext::intel::esimd;
+
+namespace {
+
+// One work-item per (row, block). grid = [M, K/128]. No SLM / cross-WI reduction
+// needed — each block lives entirely inside one WI's SIMD register file.
+template <typename scalar_t>
+class Q4_0_Quantize_Kernel;
+
+template <typename scalar_t>
+static sycl::event q4_0_quantize_launch(
+    sycl::queue& q,
+    const scalar_t* __restrict__ input,
+    int32_t*        __restrict__ out_qweight,
+    fp16*           __restrict__ out_scale,
+    int64_t         M,
+    int64_t         K) {
+    constexpr int B = 128;           // block size (QK4_GROUP_SIZE)
+    constexpr int P = 8;             // nibbles per int32 (QK4_PACK_FACTOR)
+
+    const int64_t num_blocks = K / B;
+    const int64_t k_packed   = K / P;
+    const int64_t total_blocks = M * num_blocks;
+    sycl::range<1> grid(static_cast<size_t>(total_blocks));
+
+    return q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<Q4_0_Quantize_Kernel<scalar_t>>(
+            grid,
+            [=](sycl::id<1> id) SYCL_ESIMD_KERNEL {
+                const int64_t flat  = static_cast<int64_t>(id[0]);
+                const int64_t row   = flat / num_blocks;
+                const int64_t block = flat - row * num_blocks;
+
+                const scalar_t* src_ptr =
+                    input + row * K + block * B;
+
+                // Load 128 elements (BF16/FP16) → fp32 working vector.
+                simd<scalar_t, B> src_vec =
+                    block_load<scalar_t, B>(src_ptr);
+                simd<float, B> x = convert<float>(src_vec);
+
+                // GGML Q4_0 scale is signed: max = x[argmax|x|] (keeps sign),
+                //   d = max / -8;  q = clamp(round(x / d) + 8, 0, 15).
+                // Find positive-max and negative-max, compare magnitudes to
+                // pick the signed element with largest |.|. Avoids any
+                // mask-based fabs (not available in ESIMD context).
+                float max_pos = hmax<float>(x);      // largest signed value
+                float neg_max = hmax<float>(-x);     // -min → magnitude of
+                                                     //        most-negative
+                float max_signed = (max_pos >= neg_max) ? max_pos : -neg_max;
+                // And amax = max(|max_signed|) drives the clamp behavior
+                // but we feed max_signed directly to d = max/-8 below.
+
+                // Compute d in fp32. CPU reference (GGML) stores the scale as
+                // fp16 AFTER quantizing each element with the original fp32
+                // reciprocal id = 1/d — so we must not round-trip d through
+                // fp16 before computing id.
+                float d_f32   = max_signed / -8.0f;
+                fp16  d_fp16  = static_cast<fp16>(d_f32);
+                float id_f32  = (d_f32 != 0.0f) ? (1.0f / d_f32) : 0.0f;
+
+                // Store scale (1 fp16 per block).
+                out_scale[row * num_blocks + block] = d_fp16;
+
+                // Quantize: q_i ∈ [0, 15], stored unsigned (value - 8).
+                // Use x + 0.5*sign(x) then truncate — same as the CPU reference
+                // `(int8_t)(x0 + 8.5f)` idiom (d is negative, so x/d sign-flips).
+                simd<float, B> scaled = x * id_f32;
+                simd<float, B> biased = scaled + 8.5f;  // round-to-nearest + offset
+                // Floor via truncation (non-negative after +8.5 for values in
+                // [-8d, 8d] because d<0; clamp guards edge cases).
+                simd<int32_t, B> q_i32 = convert<int32_t>(biased);
+                // Clamp to [0, 15] using merge on masks.
+                simd_mask<B> neg = q_i32 < 0;
+                q_i32.merge(simd<int32_t, B>(0), neg);
+                simd_mask<B> too_big = q_i32 > 15;
+                q_i32.merge(simd<int32_t, B>(15), too_big);
+                simd<uint32_t, B> q = q_i32.template bit_cast_view<uint32_t>();
+
+                // Pack 8 nibbles per int32. Output has K/8 words per row;
+                // block `block` owns words [block*16 .. block*16+15], one word
+                // per 8 consecutive inputs. nibble i → bits [i*4 .. i*4+3].
+                simd<uint32_t, 16> packed(0);
+                #pragma unroll
+                for (int i = 0; i < P; ++i) {
+                    // Gather the i-th element of every group-of-8.
+                    auto slice = q.template select<16, P>(i);
+                    packed |= (slice << (i * 4));
+                }
+
+                // Write per-scalar to avoid any ESIMD block_store alignment /
+                // stride quirks; K/8 is always 16-aligned per block anyway.
+                uint32_t* dst_ptr = reinterpret_cast<uint32_t*>(out_qweight)
+                                    + row * k_packed + block * 16;
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    dst_ptr[i] = packed[i];
+                }
+            });
+    });
+}
+
+}  // namespace
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public host-side launchers (BF16 and FP16 variants).
+// ─────────────────────────────────────────────────────────────────────────────
+
+void q4_0_quantize_bf16_host(
+    sycl::queue& q,
+    const bf16* input,
+    int32_t*    out_qweight,
+    fp16*       out_scale,
+    int64_t     M,
+    int64_t     K) {
+    q4_0_quantize_launch<bf16>(q, input, out_qweight, out_scale, M, K).wait();
+}
+
+void q4_0_quantize_fp16_host(
+    sycl::queue& q,
+    const fp16* input,
+    int32_t*    out_qweight,
+    fp16*       out_scale,
+    int64_t     M,
+    int64_t     K) {
+    q4_0_quantize_launch<fp16>(q, input, out_qweight, out_scale, M, K).wait();
+}

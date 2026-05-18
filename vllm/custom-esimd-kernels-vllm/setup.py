@@ -214,6 +214,30 @@ ext_modules.append(
 )
 ### MoE INT4 Prefill kernels
 
+### Q4_0 quantize kernel (BF16/FP16 → INT4) — AOT BMG only
+ext_modules.append(
+    SyclExtension(
+        name="custom_esimd_kernels_vllm.q4_0_quant_ops",
+        sources=[
+            "csrc/xpu/q4_0_quant.sycl",
+            "csrc/xpu/torch_extension_q4_0.cc",
+        ],
+        include_dirs=[
+            root / "csrc" / "xpu",
+            root / "csrc",
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
+            "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
+                     f"-I{torch_include}"],
+        },
+        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+        py_limited_api=False,
+    )
+)
+### Q4_0 quantize kernel
+
 setup(
     name="custom-esimd-kernels-vllm",
     version="0.1.0",
