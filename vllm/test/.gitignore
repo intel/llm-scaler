@@ -1,9 +1,0 @@
-analysis/
-auto_test_log/
-auto_config/
-
-*.log
-*.sh
-*.pyc
-
-__pycache__/
