@@ -49,8 +49,8 @@ Typically, users have below two use cases:
 
 | Use Case | Description | Required Steps |
 | -------- | ----------- | -------------- |
-| **Platform Evaluation** | For evaluating platform capabilities only, with no intention to run vLLM inference. | 1. Install **Ubuntu 25.04** <br> 2. Download and run offline installer <br> 3. Run platform evaluation script after the installation in bare metal environment |
-| **vLLM Inference Benchmark** | For running inference benchmarks based on vLLM/IPEX. | 1. Install **Ubuntu 25.04** <br> 2. Download and run offline installer  <br> 3. Pull the **vLLM Docker image** from Docker Hub <br> 4. Download the target model <br> 5. Run **vLLM-based inference performance tests** |
+| **Platform Evaluation** | For evaluating platform capabilities only, with no intention to run vLLM inference. | 1. Install **Ubuntu 24.04** <br> 2. Download and run offline installer <br> 3. Run platform evaluation script after the installation in bare metal environment |
+| **vLLM Inference Benchmark** | For running inference benchmarks based on vLLM/IPEX. | 1. Install **Ubuntu 24.04** <br> 2. Download and run offline installer  <br> 3. Pull the **vLLM Docker image** from Docker Hub <br> 4. Download the target model <br> 5. Run **vLLM-based inference performance tests** |
 
 Currently, we include the following features for basic platform evaluation such as GPU memory bandwidth, P2P/collective communication cross GPUs and GeMM (generic matrix multiply) compute.
 
@@ -60,14 +60,14 @@ Currently, we include the following features for basic platform evaluation such 
 
 ### 1.1 Install Bare Metal Environment
 
-First, install a standard Ubuntu 25.04 from the following link. 
-- [Ubuntu 25.04 Desktop](https://releases.ubuntu.com/25.04/ubuntu-25.04-desktop-amd64.iso) (for Xeon-W)
-- [Ubuntu 25.04 Server](https://releases.ubuntu.com/25.04/ubuntu-25.04-live-server-amd64.iso) (for Xeon-SP).
+First, install a standard Ubuntu 24.04 from the following link. 
+- [Ubuntu 24.04 Desktop](https://releases.ubuntu.com/24.04/ubuntu-24.04.4-desktop-amd64.iso)
+- [Ubuntu 24.04 Server](https://releases.ubuntu.com/24.04/ubuntu-24.04.4-live-server-amd64.iso)
 
 Download Offline Installer from Intel RDC webiste. This can be download directly without registration requirement. 
-[RDC Download Link](https://cdrdv2.intel.com/v1/dl/getContent/873591/873592)
+[RDC Download Link](https://cdrdv2.intel.com/v1/dl/getContent/919991/919992?filename=multi-arc-bmg-offline-installer-26.18.8.2-combo.tar.xz)
 
-**Note: Above RDC version (26.5.6.1) supports both Ubuntu 25.04 desktop/server, but make sure it's a fresh installation**
+**Note: Above RDC version (26.18.8.2) supports both Ubuntu 24.04 desktop/server with minor version 3 & 4, but make sure it's a fresh installation**
 
 Switch to root user, extract and installer and run installation script.
 
@@ -94,26 +94,28 @@ Installation log: ./install_log_20260129_164959.log
 After the reboot, go to /opt/intel/multi-arc directory, tools/scripts are there.
 
 ```bash
-(base) root@intel:~/multi-arc-bmg-offline-installer-26.5.6.1# ll
-total 48
-drwxrwxr-x  6 intel intel 4096 Jan 26 16:16 ./
-drwx------ 19 root  root  4096 Jan 29 16:55 ../
--rwxrwxr-x  1 intel intel 5769 Jan 23 11:21 install*
--rwxrwxr-x  1 intel intel 3439 Jan 23 11:31 installer.sh*
--rw-rw-r--  1 intel intel  818 Jan 23 11:31 README.md
-drwxrwxr-x  2 intel intel 4096 Jan 20 19:58 results/
-drwxrwxr-x  7 intel intel 4096 Jan 23 11:21 scripts/
-drwxrwxr-x  3 intel intel 4096 Jan 20 19:58 tools/
-drwxrwxr-x  9 intel intel 4096 Jan 19 15:31 ubuntu-25.04-desktop/
--rwxrwxr-x  1 intel intel  409 Jan 23 11:21 uninstall*
--rw-rw-r--  1 intel intel  587 Jan 23 11:31 VERSION
+root@benchmark-PRC-Desktop-Codex:~/james/multi-arc-bmg-offline-installer-26.18.8.2-combo# ll
+total 60
+drwxrwxr-x  8 benchmark benchmark 4096 Mar 31 21:05 ./
+drwxr-xr-x 20 root      root      4096 May 19 13:07 ../
+drwxrwxr-x  2 benchmark benchmark 4096 Mar 31 20:43 bin/
+-rwxrwxr-x  1 benchmark benchmark 8228 Mar 31 20:42 install*
+-rwxrwxr-x  1 benchmark benchmark 3646 Mar 31 20:42 installer.sh*
+-rw-rw-r--  1 benchmark benchmark  818 Mar 31 20:42 README.md
+drwxrwxr-x  2 benchmark benchmark 4096 Mar 31 20:42 results/
+drwxrwxr-x  7 benchmark benchmark 4096 Mar 31 20:42 scripts/
+drwxrwxr-x  3 benchmark benchmark 4096 Mar 31 20:42 tools/
+drwxrwxr-x  9 benchmark benchmark 4096 Mar 31 11:33 ubuntu-24.04-desktop/
+drwxrwxr-x  9 benchmark benchmark 4096 Mar 31 11:33 ubuntu-24.04-server/
+-rwxrwxr-x  1 benchmark benchmark  445 Mar 31 20:42 uninstall*
+-rw-rw-r--  1 benchmark benchmark  518 Mar 31 21:05 VERSION
 ````
 
 Please read the README.md firstly to understand all of our offerings. Then your may use scripts/evaluation/platform_basic_evaluation.sh
 to perform a quick evaluation with report under results. We also provide a reference perf under results/
 
 ```bash
-(base) root@intel:~/multi-arc-bmg-offline-installer-26.5.6.1# ls results/ -l
+(base) root@intel:~/multi-arc-bmg-offline-installer-26.18.8.2# ls results/ -l
 total 8
 -rw-rw-r-- 1 intel intel 552 Jan 23 11:31 reference_perf_b60.csv
 -rw-rw-r-- 1 intel intel 535 Jan 23 11:31 reference_perf_b70.csv
