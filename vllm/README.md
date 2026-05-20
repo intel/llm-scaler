@@ -123,7 +123,7 @@ total 8
 
 When you meet issue requiring our support, you can use below script to get necesary information of your system.
 ```bash
-(base) root@intel:~/multi-arc-bmg-offline-installer-26.5.6.1# ll scripts/debug/collect_sysinfo.sh
+(base) root@intel:~/multi-arc-bmg-offline-installer-26.18.8.2# ll scripts/debug/collect_sysinfo.sh
 -rwxrwxr-x 1 intel intel 2701 Jan 23 11:31 scripts/debug/collect_sysinfo.sh*
 ````
 
