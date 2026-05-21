@@ -101,6 +101,32 @@ ext_modules.append(
 )
 ### FP8 GEMM kernels
 
+### Prefill FMHA — ESIMD Flash Attention for prefill, paged KV, GQA, causal
+### JIT only (no AOT) — enables larger kernels without GRF overflow from AOT compiler
+ext_modules.append(
+    SyclExtension(
+        name="custom_esimd_kernels_vllm.custom_esimd_kernels_fmha",
+        sources=[
+            "csrc/xpu/esimd_kernel_fmha.sycl",
+            "csrc/xpu/torch_extension_fmha.cc",
+        ],
+        include_dirs=[
+            root / "include",
+            root / "csrc",
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
+            "sycl": ["-O2",
+                     "-fsycl", "-fsycl-targets=spir64",
+                     "-fsycl-device-code-split=per_kernel",
+                     f"-I{torch_include}"],
+        },
+        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+        py_limited_api=False,
+    )
+)
+### Prefill FMHA kernel
+
 ### TopK V2 — vectorized softmax+topk for 512 experts (AOT for BMG)
 ext_modules.append(
     SyclExtension(
@@ -190,28 +216,7 @@ ext_modules.append(
 )
 ### MoE INT4 Batch kernels
 
-### MoE INT4 Prefill kernels (DPAS-based, for large-M prefill) — AOT BMG only
-ext_modules.append(
-    SyclExtension(
-        name="custom_esimd_kernels_vllm.moe_int4_prefill_ops",
-        sources=[
-            "csrc/moe_prefill/moe_prefill_int4.sycl",
-        ],
-        include_dirs=[
-            root / "csrc" / "moe_prefill",
-            root / "csrc" / "xpu" / "esimd_kernels",  # for moe_ops.h (TopK V2)
-            root / "csrc",
-        ],
-        extra_compile_args={
-            "cxx": ["-O3", "-std=c++20"],
-            "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
-                     f"-I{torch_include}"],
-        },
-        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
-        py_limited_api=False,
-    )
-)
+### MoE INT4 Prefill kernels — DISABLED (compiler segfault, restore later)
 ### MoE INT4 Prefill kernels
 
 setup(

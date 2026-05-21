@@ -1,8 +1,51 @@
 """Python wrappers for custom ESIMD kernels."""
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 
 _ops = torch.ops.custom_esimd_kernels_vllm
+
+
+# ============================================================================
+# Prefill Flash Attention (ESIMD)
+# ============================================================================
+
+def esimd_prefill_fmha(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    sm_scale: float,
+    is_causal: bool,
+) -> torch.Tensor:
+    """ESIMD prefill Flash Attention with paged KV cache.
+
+    Args:
+        output:      [total_tokens, num_q_heads, 256] fp16 (pre-allocated)
+        query:       [total_tokens, num_q_heads, 256] fp16
+        key_cache:   [num_blocks, block_size, num_kv_heads, 256] fp16
+        value_cache: [num_blocks, block_size, num_kv_heads, 256] fp16
+        block_table: [batch, max_blocks_per_seq] int32
+        cu_seqlens_q: [batch + 1] int32
+        seqused_k:   [batch] int32
+        max_seqlen_q: max query sequence length
+        max_seqlen_k: max KV sequence length
+        sm_scale:    softmax scale (1/sqrt(head_dim))
+        is_causal:   whether to apply causal mask
+
+    Returns:
+        output tensor (same as input output, modified in-place)
+    """
+    return _ops.esimd_prefill_fmha(
+        output, query, key_cache, value_cache,
+        block_table, cu_seqlens_q, seqused_k,
+        max_seqlen_q, max_seqlen_k, sm_scale, is_causal)
 
 
 def esimd_gemv_fp8_pern(
