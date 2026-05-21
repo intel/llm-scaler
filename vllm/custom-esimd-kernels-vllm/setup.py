@@ -116,7 +116,8 @@ ext_modules.append(
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
-            "sycl": ["-O2", "-doubleGRF",
+            "sycl": ["-O2",
+                     "-fsycl", "-fsycl-targets=spir64",
                      "-fsycl-device-code-split=per_kernel",
                      f"-I{torch_include}"],
         },
