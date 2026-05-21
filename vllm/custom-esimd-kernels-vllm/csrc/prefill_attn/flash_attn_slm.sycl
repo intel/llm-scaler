@@ -1,0 +1,263 @@
+// Task 3: Flash Attention with SLM cooperative V load
+// Change from Task 2: V is cooperatively loaded into SLM by all 8 threads,
+// then each thread reads V from SLM for PV computation.
+//
+// SLM layout: V_tile [KV_TILE, HD] fp16 = 32 * 256 * 2 = 16KB
+// Each thread loads KV_TILE/WG_SIZE = 4 rows of V into SLM.
+//
+// This validates: SLM cooperative load + barrier correctness.
+
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+
+using fp16 = sycl::half;
+using namespace sycl::ext::intel::esimd;
+namespace xesimd = sycl::ext::intel::experimental::esimd;
+
+constexpr int HD = 256;
+constexpr int KV_TILE = 32;
+constexpr int Q_PER_THREAD = 4;
+constexpr int WG_SIZE = 8;
+constexpr int Q_GROUP = WG_SIZE * Q_PER_THREAD;  // 32
+constexpr float SCALE = 0.0625f;  // 1/sqrt(256)
+
+// SLM size: V tile [KV_TILE, HD] fp16 = 32 * 256 * 2 = 16384 bytes
+constexpr int SLM_V_BYTES = KV_TILE * HD * sizeof(fp16);  // 16KB
+// Each thread loads V_ROWS_PER_THREAD rows into SLM
+constexpr int V_ROWS_PER_THREAD = KV_TILE / WG_SIZE;  // 4
+
+ESIMD_INLINE void flash_attn_slm_kernel(
+    uint8_t* Q_ptr,   // [q_len, 256] fp16
+    uint8_t* K_ptr,   // [kv_len, 256] fp16
+    uint8_t* V_ptr,   // [kv_len, 256] fp16
+    uint8_t* O_ptr,   // [q_len, 256] fp16
+    uint32_t q_len,
+    uint32_t kv_len,
+    sycl::nd_item<1>& ndi) {
+
+    slm_init<SLM_V_BYTES>();
+
+    uint32_t tid = ndi.get_local_id(0);
+    uint32_t group_id = ndi.get_group(0);
+
+    uint32_t q_start = group_id * Q_GROUP + tid * Q_PER_THREAD;
+    if (q_start >= q_len) return;
+    uint32_t my_q_count = Q_PER_THREAD;
+    if (q_start + my_q_count > q_len) my_q_count = q_len - q_start;
+
+    // Load Q rows
+    simd<fp16, Q_PER_THREAD * HD> Q_data = 0;
+#pragma unroll
+    for (int r = 0; r < Q_PER_THREAD; r++) {
+        if ((uint32_t)r < my_q_count) {
+#pragma unroll
+            for (int c = 0; c < HD; c += 64) {
+                Q_data.template select<64, 1>(r * HD + c) =
+                    xesimd::lsc_block_load<fp16, 64,
+                        xesimd::lsc_data_size::default_size,
+                        xesimd::cache_hint::cached,
+                        xesimd::cache_hint::cached>(
+                        (fp16*)Q_ptr + (q_start + r) * HD + c);
+            }
+        }
+    }
+
+    // Online softmax state
+    simd<float, Q_PER_THREAD * HD> accum = 0.0f;
+    simd<float, Q_PER_THREAD> row_max;
+    simd<float, Q_PER_THREAD> row_sum = 0.0f;
+    row_max = -1e38f;
+
+    uint32_t kv_tiles = (kv_len + KV_TILE - 1) / KV_TILE;
+
+    for (uint32_t tile = 0; tile < kv_tiles; tile++) {
+        uint32_t kv_offset = tile * KV_TILE;
+        uint32_t tile_len = KV_TILE;
+        if (kv_offset + tile_len > kv_len) tile_len = kv_len - kv_offset;
+
+        // ═══ Phase 1: Compute QK^T scores (each thread loads K independently) ═══
+        simd<float, Q_PER_THREAD * KV_TILE> scores = 0.0f;
+
+        for (uint32_t kv = 0; kv < tile_len; kv++) {
+            simd<fp16, HD> K_row;
+#pragma unroll
+            for (int c = 0; c < HD; c += 64) {
+                K_row.template select<64, 1>(c) =
+                    xesimd::lsc_block_load<fp16, 64,
+                        xesimd::lsc_data_size::default_size,
+                        xesimd::cache_hint::cached,
+                        xesimd::cache_hint::cached>(
+                        (fp16*)K_ptr + (kv_offset + kv) * HD + c);
+            }
+
+#pragma unroll
+            for (int q = 0; q < Q_PER_THREAD; q++) {
+                if ((uint32_t)q >= my_q_count) break;
+                float dot = 0.0f;
+#pragma unroll
+                for (int d = 0; d < HD; d += 16) {
+                    simd<float, 16> q_f = Q_data.template select<16, 1>(q * HD + d);
+                    simd<float, 16> k_f = K_row.template select<16, 1>(d);
+                    dot += reduce<float>(q_f * k_f, std::plus<>());
+                }
+                scores[q * KV_TILE + kv] = dot * SCALE;
+            }
+        }
+
+        // ═══ Phase 2: Online softmax update (rescale accum, update row_sum) ═══
+        // No P array stored — we recompute exp in Phase 4 to save 8 GRF.
+#pragma unroll
+        for (int q = 0; q < Q_PER_THREAD; q++) {
+            if ((uint32_t)q >= my_q_count) continue;
+
+            float tile_max = -1e38f;
+            for (uint32_t kv = 0; kv < tile_len; kv++) {
+                float s = scores[q * KV_TILE + kv];
+                if (s > tile_max) tile_max = s;
+            }
+
+            float old_max = row_max[q];
+            float new_max = (tile_max > old_max) ? tile_max : old_max;
+            float rescale = __builtin_expf(old_max - new_max);
+            row_sum[q] *= rescale;
+#pragma unroll
+            for (int d = 0; d < HD; d++) {
+                accum[q * HD + d] *= rescale;
+            }
+
+            for (uint32_t kv = 0; kv < tile_len; kv++) {
+                row_sum[q] += __builtin_expf(scores[q * KV_TILE + kv] - new_max);
+            }
+            row_max[q] = new_max;
+        }
+
+        // ═══ Phase 3: Cooperative V load into SLM ═══
+        // Each thread loads V_ROWS_PER_THREAD=4 rows of V[kv_offset+..., 256]
+        uint32_t my_v_start = tid * V_ROWS_PER_THREAD;
+        uint32_t slm_base = my_v_start * HD * sizeof(fp16);
+
+#pragma unroll
+        for (int vr = 0; vr < V_ROWS_PER_THREAD; vr++) {
+            uint32_t global_vr = kv_offset + my_v_start + vr;
+            uint32_t slm_row_offset = slm_base + vr * HD * sizeof(fp16);
+            if (global_vr < kv_len) {
+#pragma unroll
+                for (int c = 0; c < HD; c += 64) {
+                    simd<fp16, 64> v_chunk =
+                        xesimd::lsc_block_load<fp16, 64,
+                            xesimd::lsc_data_size::default_size,
+                            xesimd::cache_hint::cached,
+                            xesimd::cache_hint::cached>(
+                            (fp16*)V_ptr + global_vr * HD + c);
+                    slm_block_store<fp16, 64>(
+                        slm_row_offset + c * sizeof(fp16), v_chunk);
+                }
+            } else {
+                // Zero-fill for out-of-bounds rows
+                simd<fp16, 64> zeros = 0;
+#pragma unroll
+                for (int c = 0; c < HD; c += 64) {
+                    slm_block_store<fp16, 64>(
+                        slm_row_offset + c * sizeof(fp16), zeros);
+                }
+            }
+        }
+
+        // Barrier: wait for all threads to finish V load
+        barrier();
+
+        // ═══ Phase 4: PV accumulation from SLM (recompute exp from scores) ═══
+#pragma unroll
+        for (int q = 0; q < Q_PER_THREAD; q++) {
+            if ((uint32_t)q >= my_q_count) continue;
+
+            for (uint32_t kv = 0; kv < tile_len; kv++) {
+                float p = __builtin_expf(scores[q * KV_TILE + kv] - row_max[q]);
+
+                // Read V[kv] from SLM
+                uint32_t v_slm_offset = kv * HD * sizeof(fp16);
+#pragma unroll
+                for (int c = 0; c < HD; c += 64) {
+                    simd<fp16, 64> v_chunk =
+                        slm_block_load<fp16, 64>(v_slm_offset + c * sizeof(fp16));
+                    simd<float, 64> v_f32 = v_chunk;
+#pragma unroll
+                    for (int i = 0; i < 64; i++) {
+                        accum[q * HD + c + i] += p * v_f32[i];
+                    }
+                }
+            }
+        }
+
+        // Barrier before next tile overwrites SLM
+        barrier();
+    }
+
+    // Finalize and store
+#pragma unroll
+    for (int q = 0; q < Q_PER_THREAD; q++) {
+        if ((uint32_t)q >= my_q_count) continue;
+        float inv_sum = 1.0f / row_sum[q];
+#pragma unroll
+        for (int c = 0; c < HD; c += 64) {
+            simd<fp16, 64> out_chunk;
+#pragma unroll
+            for (int i = 0; i < 64; i++) {
+                out_chunk[i] = (fp16)(accum[q * HD + c + i] * inv_sum);
+            }
+            xesimd::lsc_block_store<fp16, 64,
+                xesimd::lsc_data_size::default_size,
+                xesimd::cache_hint::write_back,
+                xesimd::cache_hint::write_back>(
+                (fp16*)O_ptr + (q_start + q) * HD + c,
+                out_chunk);
+        }
+    }
+}
+
+at::Tensor flash_attn_slm_forward(at::Tensor Q, at::Tensor K, at::Tensor V) {
+    TORCH_CHECK(Q.device().is_xpu(), "Q must be on XPU");
+    TORCH_CHECK(Q.dtype() == at::kHalf, "Q must be fp16");
+    TORCH_CHECK(K.dtype() == at::kHalf && V.dtype() == at::kHalf, "K/V must be fp16");
+    TORCH_CHECK(Q.dim() == 2 && Q.size(1) == 256, "Q must be [q_len, 256]");
+    TORCH_CHECK(K.dim() == 2 && K.size(1) == 256, "K must be [kv_len, 256]");
+    TORCH_CHECK(V.dim() == 2 && V.size(1) == 256, "V must be [kv_len, 256]");
+    TORCH_CHECK(K.size(0) == V.size(0), "K and V must have same length");
+    TORCH_CHECK(Q.is_contiguous() && K.is_contiguous() && V.is_contiguous(),
+                "inputs must be contiguous");
+
+    int q_len = Q.size(0);
+    int kv_len = K.size(0);
+    auto out = at::empty_like(Q);
+
+    auto* q_ptr = reinterpret_cast<uint8_t*>(Q.data_ptr());
+    auto* k_ptr = reinterpret_cast<uint8_t*>(K.data_ptr());
+    auto* v_ptr = reinterpret_cast<uint8_t*>(V.data_ptr());
+    auto* o_ptr = reinterpret_cast<uint8_t*>(out.data_ptr());
+
+    uint32_t num_groups = (q_len + Q_GROUP - 1) / Q_GROUP;
+    sycl::nd_range<1> range(num_groups * WG_SIZE, WG_SIZE);
+
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(Q.device().index()).queue();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<class flash_attn_slm_k>(
+            range,
+            [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                flash_attn_slm_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
+                                      q_len, kv_len, ndi);
+            });
+    }).wait();
+
+    return out;
+}
+
+TORCH_LIBRARY(flash_attn_slm, m) {
+    m.def("forward(Tensor Q, Tensor K, Tensor V) -> Tensor");
+}
+TORCH_LIBRARY_IMPL(flash_attn_slm, XPU, m) {
+    m.impl("forward", &flash_attn_slm_forward);
+}

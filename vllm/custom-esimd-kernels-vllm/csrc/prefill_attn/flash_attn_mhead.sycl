@@ -1,0 +1,390 @@
+// Task 5: Multi-Head + GQA Flash Attention with DPAS
+//
+// Extends DPAS kernel to handle multiple heads:
+//   Q: [q_len, num_q_heads, 256] fp16
+//   K: [kv_len, num_kv_heads, 256] fp16
+//   V: [kv_len, num_kv_heads, 256] fp16
+//   O: [q_len, num_q_heads, 256] fp16
+//
+// GQA: num_q_heads / num_kv_heads = gqa_ratio (e.g. 12/2 = 6)
+// WG grid: 2D [q_group_idx, q_head_idx], each WG has WG_SIZE=8 threads
+
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/esimd/xmx/dpas.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+
+using fp16 = sycl::half;
+using namespace sycl::ext::intel::esimd;
+using namespace sycl::ext::intel::esimd::xmx;
+namespace xesimd = sycl::ext::intel::experimental::esimd;
+
+constexpr int HD = 256;
+constexpr int KV_TILE = 32;
+constexpr int Q_PER_THREAD = 4;
+constexpr int WG_SIZE = 8;
+constexpr int Q_GROUP = WG_SIZE * Q_PER_THREAD;
+constexpr float SCALE = 0.0625f;
+
+constexpr int DPAS_M = 8;
+constexpr int DPAS_K = 16;
+constexpr int DPAS_N = 16;
+constexpr int K_ITERS = HD / DPAS_K;        // 16
+constexpr int N_GROUPS = KV_TILE / DPAS_N;   // 2
+
+constexpr int SLM_V_SINGLE = KV_TILE * HD * sizeof(fp16);
+constexpr int SLM_V_TOTAL = 2 * SLM_V_SINGLE;
+constexpr int V_ROWS_PER_THREAD = KV_TILE / WG_SIZE;
+
+constexpr int PV_K_ITERS = KV_TILE / DPAS_K;
+constexpr int PV_N_GROUPS = HD / DPAS_N;
+
+ESIMD_INLINE void flash_attn_mhead_kernel(
+    uint8_t* Q_ptr,    // [q_len, num_q_heads, 256] fp16
+    uint8_t* K_ptr,    // [kv_len, num_kv_heads, 256] fp16
+    uint8_t* V_ptr,    // [kv_len, num_kv_heads, 256] fp16
+    uint8_t* O_ptr,    // [q_len, num_q_heads, 256] fp16
+    uint32_t q_len,
+    uint32_t kv_len,
+    uint32_t num_q_heads,
+    uint32_t num_kv_heads,
+    sycl::nd_item<2>& ndi) {
+
+    slm_init<SLM_V_TOTAL>();
+
+    uint32_t tid = ndi.get_local_id(0);
+    uint32_t q_group_idx = ndi.get_group(0);
+    uint32_t q_head_idx = ndi.get_group(1);
+
+    // GQA mapping
+    uint32_t gqa_ratio = num_q_heads / num_kv_heads;
+    uint32_t kv_head_idx = q_head_idx / gqa_ratio;
+
+    // Strides (row-major [seq, heads, dim])
+    uint32_t q_head_stride = HD;                    // stride between heads within same token
+    uint32_t q_token_stride = num_q_heads * HD;     // stride between tokens
+    uint32_t kv_head_stride = HD;
+    uint32_t kv_token_stride = num_kv_heads * HD;
+
+    // This thread's Q rows
+    uint32_t q_start = q_group_idx * Q_GROUP + tid * Q_PER_THREAD;
+    if (q_start >= q_len) return;
+    uint32_t my_q_count = Q_PER_THREAD;
+    if (q_start + my_q_count > q_len) my_q_count = q_len - q_start;
+
+    // Load Q rows for this thread's head
+    simd<fp16, Q_PER_THREAD * HD> Q_data = 0;
+#pragma unroll
+    for (int r = 0; r < Q_PER_THREAD; r++) {
+        if ((uint32_t)r < my_q_count) {
+            fp16* q_addr = (fp16*)Q_ptr + (q_start + r) * q_token_stride + q_head_idx * q_head_stride;
+#pragma unroll
+            for (int c = 0; c < HD; c += 64) {
+                Q_data.template select<64, 1>(r * HD + c) =
+                    xesimd::lsc_block_load<fp16, 64,
+                        xesimd::lsc_data_size::default_size,
+                        xesimd::cache_hint::cached,
+                        xesimd::cache_hint::cached>(q_addr + c);
+            }
+        }
+    }
+
+    // Online softmax state
+    simd<float, Q_PER_THREAD * HD> accum = 0.0f;
+    simd<float, Q_PER_THREAD> row_max;
+    simd<float, Q_PER_THREAD> row_sum = 0.0f;
+    row_max = -1e38f;
+
+    uint32_t kv_tiles = (kv_len + KV_TILE - 1) / KV_TILE;
+    uint32_t cur_buf = 0;
+
+    // Preload first V tile into SLM
+    if (kv_tiles > 0) {
+        uint32_t slm_base = tid * V_ROWS_PER_THREAD * HD * sizeof(fp16);
+#pragma unroll
+        for (int vr = 0; vr < V_ROWS_PER_THREAD; vr++) {
+            uint32_t global_vr = tid * V_ROWS_PER_THREAD + vr;
+            uint32_t slm_offset = slm_base + vr * HD * sizeof(fp16);
+            if (global_vr < kv_len) {
+                fp16* v_addr = (fp16*)V_ptr + global_vr * kv_token_stride + kv_head_idx * kv_head_stride;
+#pragma unroll
+                for (int c = 0; c < HD; c += 64) {
+                    simd<fp16, 64> v_chunk =
+                        xesimd::lsc_block_load<fp16, 64,
+                            xesimd::lsc_data_size::default_size,
+                            xesimd::cache_hint::cached,
+                            xesimd::cache_hint::cached>(v_addr + c);
+                    slm_block_store<fp16, 64>(slm_offset + c * sizeof(fp16), v_chunk);
+                }
+            } else {
+                simd<fp16, 64> zeros = 0;
+#pragma unroll
+                for (int c = 0; c < HD; c += 64) {
+                    slm_block_store<fp16, 64>(slm_offset + c * sizeof(fp16), zeros);
+                }
+            }
+        }
+        barrier();
+    }
+
+    // Main loop
+    for (uint32_t tile = 0; tile < kv_tiles; tile++) {
+        uint32_t kv_offset = tile * KV_TILE;
+        uint32_t tile_len = KV_TILE;
+        if (kv_offset + tile_len > kv_len) tile_len = kv_len - kv_offset;
+
+        uint32_t read_slm_base = cur_buf * SLM_V_SINGLE;
+
+        // ─── QK^T via DPAS ───
+        simd<float, DPAS_M * DPAS_N> qk_acc[N_GROUPS];
+#pragma unroll
+        for (int ng = 0; ng < N_GROUPS; ng++) qk_acc[ng] = 0.0f;
+
+#pragma unroll
+        for (int ks = 0; ks < K_ITERS; ks++) {
+            int k_base = ks * DPAS_K;
+
+            simd<fp16, DPAS_M * DPAS_K> a_tile = 0;
+#pragma unroll
+            for (int q = 0; q < Q_PER_THREAD; q++) {
+                a_tile.template select<DPAS_K, 1>(q * DPAS_K) =
+                    Q_data.template select<DPAS_K, 1>(q * HD + k_base);
+            }
+
+#pragma unroll
+            for (int ng = 0; ng < N_GROUPS; ng++) {
+                simd<fp16, 16 * 16> k_block = 0;
+#pragma unroll
+                for (int n = 0; n < 16; n++) {
+                    uint32_t kv_row = kv_offset + ng * 16 + n;
+                    if (kv_row < kv_len) {
+                        fp16* k_addr = (fp16*)K_ptr + kv_row * kv_token_stride +
+                                       kv_head_idx * kv_head_stride + k_base;
+                        k_block.template select<16, 1>(n * 16) =
+                            xesimd::lsc_block_load<fp16, 16,
+                                xesimd::lsc_data_size::default_size,
+                                xesimd::cache_hint::cached,
+                                xesimd::cache_hint::cached>(k_addr);
+                    }
+                }
+
+                auto k_u16 = k_block.template bit_cast_view<uint16_t>();
+                simd<uint32_t, 128> b_vnni;
+#pragma unroll
+                for (int kp = 0; kp < 8; kp++) {
+                    simd<uint16_t, 16> lo_vals;
+                    simd<uint16_t, 16> hi_vals;
+#pragma unroll
+                    for (int n = 0; n < 16; n++) {
+                        lo_vals[n] = k_u16[n * 16 + 2 * kp];
+                        hi_vals[n] = k_u16[n * 16 + 2 * kp + 1];
+                    }
+                    b_vnni.template select<16, 1>(kp * 16) =
+                        convert<uint32_t>(lo_vals) | (convert<uint32_t>(hi_vals) << 16);
+                }
+
+                simd<fp16, 256> b_tile = b_vnni.template bit_cast_view<fp16>().read();
+                qk_acc[ng] = dpas<8, 8, float, float, fp16, fp16>(qk_acc[ng], b_tile, a_tile);
+            }
+        }
+
+        // Extract scores
+        simd<float, Q_PER_THREAD * KV_TILE> scores = 0.0f;
+#pragma unroll
+        for (int ng = 0; ng < N_GROUPS; ng++) {
+#pragma unroll
+            for (int q = 0; q < Q_PER_THREAD; q++) {
+                scores.template select<DPAS_N, 1>(q * KV_TILE + ng * DPAS_N) =
+                    qk_acc[ng].template select<DPAS_N, 1>(q * DPAS_N) * SCALE;
+            }
+        }
+
+        // ─── Online softmax ───
+#pragma unroll
+        for (int q = 0; q < Q_PER_THREAD; q++) {
+            if ((uint32_t)q >= my_q_count) continue;
+            float tile_max = -1e38f;
+            for (uint32_t kv = 0; kv < tile_len; kv++) {
+                float s = scores[q * KV_TILE + kv];
+                if (s > tile_max) tile_max = s;
+            }
+            float old_max = row_max[q];
+            float new_max = (tile_max > old_max) ? tile_max : old_max;
+            float rescale = __builtin_expf(old_max - new_max);
+            row_sum[q] *= rescale;
+#pragma unroll
+            for (int c = 0; c < HD; c += 64) {
+                accum.template select<64, 1>(q * HD + c) *= rescale;
+            }
+            for (uint32_t kv = 0; kv < tile_len; kv++) {
+                row_sum[q] += __builtin_expf(scores[q * KV_TILE + kv] - new_max);
+            }
+            row_max[q] = new_max;
+        }
+
+        // ─── PV via DPAS from SLM ───
+        simd<fp16, DPAS_M * KV_TILE> P_fp16 = 0;
+#pragma unroll
+        for (int q = 0; q < Q_PER_THREAD; q++) {
+            if ((uint32_t)q >= my_q_count) continue;
+#pragma unroll
+            for (int kv = 0; kv < KV_TILE; kv++) {
+                if ((uint32_t)kv < tile_len) {
+                    P_fp16[q * KV_TILE + kv] = (fp16)__builtin_expf(
+                        scores[q * KV_TILE + kv] - row_max[q]);
+                }
+            }
+        }
+
+#pragma unroll
+        for (int ng = 0; ng < PV_N_GROUPS; ng++) {
+            simd<float, DPAS_M * DPAS_N> pv_acc;
+#pragma unroll
+            for (int q = 0; q < DPAS_M; q++) {
+                pv_acc.template select<DPAS_N, 1>(q * DPAS_N) =
+                    accum.template select<DPAS_N, 1>(q * HD + ng * DPAS_N);
+            }
+
+#pragma unroll
+            for (int ks = 0; ks < PV_K_ITERS; ks++) {
+                simd<fp16, DPAS_M * DPAS_K> pv_a;
+#pragma unroll
+                for (int q = 0; q < DPAS_M; q++) {
+                    pv_a.template select<DPAS_K, 1>(q * DPAS_K) =
+                        P_fp16.template select<DPAS_K, 1>(q * KV_TILE + ks * DPAS_K);
+                }
+
+                simd<uint32_t, 128> pv_b_vnni;
+#pragma unroll
+                for (int kp = 0; kp < 8; kp++) {
+                    uint32_t row0 = ks * DPAS_K + 2 * kp;
+                    uint32_t row1 = row0 + 1;
+                    uint32_t slm_off0 = read_slm_base + row0 * HD * sizeof(fp16) + ng * DPAS_N * sizeof(fp16);
+                    uint32_t slm_off1 = read_slm_base + row1 * HD * sizeof(fp16) + ng * DPAS_N * sizeof(fp16);
+                    simd<fp16, 16> v_row0 = slm_block_load<fp16, 16>(slm_off0);
+                    simd<fp16, 16> v_row1 = slm_block_load<fp16, 16>(slm_off1);
+                    auto v0_u16 = v_row0.template bit_cast_view<uint16_t>();
+                    auto v1_u16 = v_row1.template bit_cast_view<uint16_t>();
+                    pv_b_vnni.template select<16, 1>(kp * 16) =
+                        convert<uint32_t>(v0_u16.read()) |
+                        (convert<uint32_t>(v1_u16.read()) << 16);
+                }
+
+                simd<fp16, 256> pv_b_tile = pv_b_vnni.template bit_cast_view<fp16>().read();
+                pv_acc = dpas<8, 8, float, float, fp16, fp16>(pv_acc, pv_b_tile, pv_a);
+            }
+
+#pragma unroll
+            for (int q = 0; q < Q_PER_THREAD; q++) {
+                accum.template select<DPAS_N, 1>(q * HD + ng * DPAS_N) =
+                    pv_acc.template select<DPAS_N, 1>(q * DPAS_N);
+            }
+        }
+
+        // ─── Load next V tile ───
+        barrier();
+        uint32_t next_tile = tile + 1;
+        uint32_t next_buf = 1 - cur_buf;
+        if (next_tile < kv_tiles) {
+            uint32_t next_kv_offset = next_tile * KV_TILE;
+            uint32_t next_slm_base = next_buf * SLM_V_SINGLE +
+                                     tid * V_ROWS_PER_THREAD * HD * sizeof(fp16);
+#pragma unroll
+            for (int vr = 0; vr < V_ROWS_PER_THREAD; vr++) {
+                uint32_t global_vr = next_kv_offset + tid * V_ROWS_PER_THREAD + vr;
+                uint32_t slm_offset = next_slm_base + vr * HD * sizeof(fp16);
+                if (global_vr < kv_len) {
+                    fp16* v_addr = (fp16*)V_ptr + global_vr * kv_token_stride + kv_head_idx * kv_head_stride;
+#pragma unroll
+                    for (int c = 0; c < HD; c += 64) {
+                        simd<fp16, 64> v_chunk =
+                            xesimd::lsc_block_load<fp16, 64,
+                                xesimd::lsc_data_size::default_size,
+                                xesimd::cache_hint::cached,
+                                xesimd::cache_hint::cached>(v_addr + c);
+                        slm_block_store<fp16, 64>(slm_offset + c * sizeof(fp16), v_chunk);
+                    }
+                } else {
+                    simd<fp16, 64> zeros = 0;
+#pragma unroll
+                    for (int c = 0; c < HD; c += 64) {
+                        slm_block_store<fp16, 64>(slm_offset + c * sizeof(fp16), zeros);
+                    }
+                }
+            }
+            barrier();
+            cur_buf = next_buf;
+        }
+    }
+
+    // Finalize and store
+#pragma unroll
+    for (int q = 0; q < Q_PER_THREAD; q++) {
+        if ((uint32_t)q >= my_q_count) continue;
+        float inv_sum = 1.0f / row_sum[q];
+        fp16* o_addr = (fp16*)O_ptr + (q_start + q) * q_token_stride + q_head_idx * q_head_stride;
+#pragma unroll
+        for (int c = 0; c < HD; c += 64) {
+            simd<float, 64> out_f32 = accum.template select<64, 1>(q * HD + c) * inv_sum;
+            simd<fp16, 64> out_chunk = out_f32;
+            xesimd::lsc_block_store<fp16, 64,
+                xesimd::lsc_data_size::default_size,
+                xesimd::cache_hint::write_back,
+                xesimd::cache_hint::write_back>(o_addr + c, out_chunk);
+        }
+    }
+}
+
+at::Tensor flash_attn_mhead_forward(at::Tensor Q, at::Tensor K, at::Tensor V) {
+    TORCH_CHECK(Q.device().is_xpu(), "Q must be on XPU");
+    TORCH_CHECK(Q.dtype() == at::kHalf, "Q must be fp16");
+    TORCH_CHECK(K.dtype() == at::kHalf && V.dtype() == at::kHalf, "K/V must be fp16");
+    TORCH_CHECK(Q.dim() == 3 && Q.size(2) == 256, "Q must be [q_len, num_q_heads, 256]");
+    TORCH_CHECK(K.dim() == 3 && K.size(2) == 256, "K must be [kv_len, num_kv_heads, 256]");
+    TORCH_CHECK(V.dim() == 3 && V.size(2) == 256, "V must be [kv_len, num_kv_heads, 256]");
+    TORCH_CHECK(K.size(0) == V.size(0), "K and V must have same length");
+    TORCH_CHECK(K.size(1) == V.size(1), "K and V must have same num_kv_heads");
+    int num_q_heads = Q.size(1);
+    int num_kv_heads = K.size(1);
+    TORCH_CHECK(num_q_heads % num_kv_heads == 0, "num_q_heads must be divisible by num_kv_heads");
+    TORCH_CHECK(Q.is_contiguous() && K.is_contiguous() && V.is_contiguous(),
+                "inputs must be contiguous");
+
+    int q_len = Q.size(0);
+    int kv_len = K.size(0);
+    auto out = at::empty_like(Q);
+
+    auto* q_ptr = reinterpret_cast<uint8_t*>(Q.data_ptr());
+    auto* k_ptr = reinterpret_cast<uint8_t*>(K.data_ptr());
+    auto* v_ptr = reinterpret_cast<uint8_t*>(V.data_ptr());
+    auto* o_ptr = reinterpret_cast<uint8_t*>(out.data_ptr());
+
+    uint32_t num_q_groups = (q_len + Q_GROUP - 1) / Q_GROUP;
+
+    // 2D grid: [q_groups, num_q_heads], workgroup = [WG_SIZE, 1]
+    sycl::nd_range<2> range(
+        sycl::range<2>(num_q_groups * WG_SIZE, num_q_heads),
+        sycl::range<2>(WG_SIZE, 1));
+
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(Q.device().index()).queue();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<class flash_attn_mhead_k>(
+            range,
+            [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+                flash_attn_mhead_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
+                                        q_len, kv_len, num_q_heads, num_kv_heads, ndi);
+            });
+    }).wait();
+
+    return out;
+}
+
+TORCH_LIBRARY(flash_attn_mhead, m) {
+    m.def("forward(Tensor Q, Tensor K, Tensor V) -> Tensor");
+}
+TORCH_LIBRARY_IMPL(flash_attn_mhead, XPU, m) {
+    m.impl("forward", &flash_attn_mhead_forward);
+}

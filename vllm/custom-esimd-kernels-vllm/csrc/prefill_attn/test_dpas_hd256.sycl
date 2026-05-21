@@ -1,0 +1,131 @@
+// Task 0: Verify DPAS works for HD=256 dot product
+// Q[4, 256] × K[32, 256]^T → scores[4, 32]
+// fp16 input, fp32 accumulation
+//
+// This kernel tests:
+//   1. Can we hold 4 Q rows (4×256 fp16 = 2KB) in registers
+//   2. Can we do 256-dim dot product via DPAS (16 iterations of 16-wide DPAS)
+//   3. Do we get correct results with fp32 accumulation
+
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+
+using fp16 = sycl::half;
+using namespace sycl::ext::intel::esimd;
+namespace xesimd = sycl::ext::intel::experimental::esimd;
+
+// Minimal QK dot product kernel
+// One workgroup = one thread, computes Q[4,256] @ K[32,256]^T → out[4,32]
+// Uses manual dot product (no XMX/DPAS first — baseline correctness)
+ESIMD_INLINE void qk_dot_hd256_basic(
+    uint8_t* Q_ptr,     // [4, 256] fp16, row-major
+    uint8_t* K_ptr,     // [32, 256] fp16, row-major
+    uint8_t* out_ptr,   // [4, 32] fp32, row-major
+    sycl::nd_item<1>& ndi) {
+
+    constexpr int Q_ROWS = 4;
+    constexpr int KV_ROWS = 32;
+    constexpr int HD = 256;
+
+    // Load Q: 4 rows × 256 fp16 = 2048 bytes
+    // lsc_block_load max vector size = 64, so load in 4 chunks of 64
+    simd<fp16, Q_ROWS * HD> Q_data;
+#pragma unroll
+    for (int r = 0; r < Q_ROWS; r++) {
+#pragma unroll
+        for (int c = 0; c < HD; c += 64) {
+            Q_data.template select<64, 1>(r * HD + c) =
+                xesimd::lsc_block_load<fp16, 64,
+                    xesimd::lsc_data_size::default_size,
+                    xesimd::cache_hint::cached,
+                    xesimd::cache_hint::cached>(
+                    (fp16*)Q_ptr + r * HD + c);
+        }
+    }
+
+    // For each K row, compute dot product with all 4 Q rows
+    simd<float, Q_ROWS * KV_ROWS> scores = 0.0f;
+
+#pragma unroll
+    for (int kv = 0; kv < KV_ROWS; kv++) {
+        // Load one K row (4 chunks of 64)
+        simd<fp16, HD> K_row;
+#pragma unroll
+        for (int c = 0; c < HD; c += 64) {
+            K_row.template select<64, 1>(c) =
+                xesimd::lsc_block_load<fp16, 64,
+                    xesimd::lsc_data_size::default_size,
+                    xesimd::cache_hint::cached,
+                    xesimd::cache_hint::cached>(
+                    (fp16*)K_ptr + kv * HD + c);
+        }
+
+        // Dot product: Q[q_row] · K[kv] for each q_row
+        // Accumulate in fp32: sum over 256 dimensions
+#pragma unroll
+        for (int q = 0; q < Q_ROWS; q++) {
+            float dot = 0.0f;
+#pragma unroll
+            for (int d = 0; d < HD; d += 16) {
+                simd<float, 16> q_f32 = Q_data.template select<16, 1>(q * HD + d);
+                simd<float, 16> k_f32 = K_row.template select<16, 1>(d);
+                simd<float, 16> prod = q_f32 * k_f32;
+                dot += reduce<float>(prod, std::plus<>());
+            }
+            scores[q * KV_ROWS + kv] = dot;
+        }
+    }
+
+    // Store scores: [4, 32] fp32
+#pragma unroll
+    for (int r = 0; r < Q_ROWS; r++) {
+        xesimd::lsc_block_store<float, KV_ROWS,
+            xesimd::lsc_data_size::default_size,
+            xesimd::cache_hint::write_back,
+            xesimd::cache_hint::write_back>(
+            (float*)out_ptr + r * KV_ROWS,
+            scores.template select<KV_ROWS, 1>(r * KV_ROWS));
+    }
+}
+
+// Torch extension entry point
+at::Tensor test_dpas_hd256_forward(at::Tensor Q, at::Tensor K) {
+    TORCH_CHECK(Q.device().is_xpu(), "Q must be on XPU");
+    TORCH_CHECK(K.device().is_xpu(), "K must be on XPU");
+    TORCH_CHECK(Q.dtype() == at::kHalf, "Q must be fp16");
+    TORCH_CHECK(K.dtype() == at::kHalf, "K must be fp16");
+    TORCH_CHECK(Q.dim() == 2 && Q.size(0) == 4 && Q.size(1) == 256,
+                "Q must be [4, 256]");
+    TORCH_CHECK(K.dim() == 2 && K.size(0) == 32 && K.size(1) == 256,
+                "K must be [32, 256]");
+    TORCH_CHECK(Q.is_contiguous() && K.is_contiguous(), "inputs must be contiguous");
+
+    auto out = at::empty({4, 32}, Q.options().dtype(at::kFloat));
+
+    auto* q_ptr = reinterpret_cast<uint8_t*>(Q.data_ptr());
+    auto* k_ptr = reinterpret_cast<uint8_t*>(K.data_ptr());
+    auto* o_ptr = reinterpret_cast<uint8_t*>(out.data_ptr());
+
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(Q.device().index()).queue();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<class qk_dot_hd256_test>(
+            sycl::nd_range<1>(1, 1),
+            [=](sycl::nd_item<1> ndi) SYCL_ESIMD_KERNEL {
+                qk_dot_hd256_basic(q_ptr, k_ptr, o_ptr, ndi);
+            });
+    }).wait();
+
+    return out;
+}
+
+// Register torch extension
+TORCH_LIBRARY(test_dpas_hd256, m) {
+    m.def("forward(Tensor Q, Tensor K) -> Tensor");
+}
+TORCH_LIBRARY_IMPL(test_dpas_hd256, XPU, m) {
+    m.impl("forward", &test_dpas_hd256_forward);
+}

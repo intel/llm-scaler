@@ -1,0 +1,489 @@
+// Task 4C: Performance optimization — K cooperative load via SLM
+//
+// Key change from flash_attn_causal:
+//   - K tile [16, 16] is cooperatively loaded into SLM by all 8 threads
+//   - Each thread loads 2 rows of K (16 rows / 8 threads = 2)
+//   - After barrier, all threads read the same K from SLM for DPAS
+//   - Eliminates 8x redundant K global memory reads
+//
+// SLM layout:
+//   [0, 32KB):          V double buffer (2 × KV_TILE × HD × fp16)
+//   [32KB, 32KB+1KB):   K tile scratch (16 × 16 × fp16 = 512B, padded to 1KB)
+//
+// Expected improvement: ~3-4x (eliminating K bandwidth bottleneck)
+
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/esimd/xmx/dpas.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+
+using fp16 = sycl::half;
+using namespace sycl::ext::intel::esimd;
+using namespace sycl::ext::intel::esimd::xmx;
+namespace xesimd = sycl::ext::intel::experimental::esimd;
+
+constexpr int HD = 256;
+constexpr int KV_TILE = 32;
+constexpr int Q_PER_THREAD = 4;
+constexpr int WG_SIZE = 8;
+constexpr int Q_GROUP = WG_SIZE * Q_PER_THREAD;
+constexpr float SCALE = 0.0625f;
+constexpr float NEG_INF = -1e38f;
+
+// Fast vectorized exp approximation using exp2:  exp(x) = exp2(x * log2(e))
+// Uses the identity: exp2(x) = exp2(floor(x)) * exp2(frac(x))
+// exp2(floor) is exact (bit manipulation), exp2(frac) approximated by polynomial
+constexpr float LOG2E = 1.4426950408889634f;
+
+ESIMD_INLINE simd<float, 16> fast_exp_16(simd<float, 16> x) {
+    // Simple scalar fallback in SIMD wrapper — still benefits from
+    // eliminating the second exp pass and the vectorized control flow around it
+    simd<float, 16> result;
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+        result[i] = __builtin_expf(x[i]);
+    }
+    return result;
+}
+
+constexpr int DPAS_M = 8;
+constexpr int DPAS_K = 16;
+constexpr int DPAS_N = 16;
+constexpr int K_ITERS = HD / DPAS_K;       // 16
+constexpr int N_GROUPS = KV_TILE / DPAS_N;  // 2
+
+constexpr int SLM_V_SINGLE = KV_TILE * HD * sizeof(fp16);  // 16KB
+constexpr int SLM_V_TOTAL = 2 * SLM_V_SINGLE;              // 32KB
+constexpr int V_ROWS_PER_THREAD = KV_TILE / WG_SIZE;       // 4
+
+// K SLM in VNNI format: for each K_step × N_group, store B tile ready for DPAS
+// Per K_step: [8 kpairs, 16 N-cols] as uint32 = 128 × 4B = 512B
+// Total: K_ITERS(16) × N_GROUPS(2) × 512B = 16KB
+constexpr int SLM_K_OFFSET = SLM_V_TOTAL;   // starts after V buffers (32KB)
+constexpr int SLM_K_VNNI_TILE = 128 * sizeof(uint32_t);  // 512B per (K_step, N_group)
+constexpr int SLM_K_SIZE = K_ITERS * N_GROUPS * SLM_K_VNNI_TILE;  // 16KB
+
+// V stays row-major in SLM (VNNI pack at read time — pairing requires both rows)
+constexpr int SLM_TOTAL = SLM_V_TOTAL + SLM_K_SIZE;  // 48KB
+
+// K cooperative load: 32 rows / 8 threads = 4 rows per thread
+constexpr int K_ROWS_PER_THREAD_FULL = KV_TILE / WG_SIZE;  // 4
+
+constexpr int PV_K_ITERS = KV_TILE / DPAS_K;
+constexpr int PV_N_GROUPS = HD / DPAS_N;
+
+ESIMD_INLINE void flash_attn_opt_kernel(
+    uint8_t* Q_ptr,
+    uint8_t* K_ptr,
+    uint8_t* V_ptr,
+    uint8_t* O_ptr,
+    uint32_t q_len,
+    uint32_t kv_len,
+    uint32_t num_q_heads,
+    uint32_t num_kv_heads,
+    uint32_t q_start_pos,
+    sycl::nd_item<2>& ndi) {
+
+    slm_init<SLM_TOTAL>();
+
+    uint32_t tid = ndi.get_local_id(0);
+    uint32_t q_group_idx = ndi.get_group(0);
+    uint32_t q_head_idx = ndi.get_group(1);
+
+    uint32_t gqa_ratio = num_q_heads / num_kv_heads;
+    uint32_t kv_head_idx = q_head_idx / gqa_ratio;
+
+    uint32_t q_head_stride = HD;
+    uint32_t q_token_stride = num_q_heads * HD;
+    uint32_t kv_head_stride = HD;
+    uint32_t kv_token_stride = num_kv_heads * HD;
+
+    uint32_t q_start = q_group_idx * Q_GROUP + tid * Q_PER_THREAD;
+    if (q_start >= q_len) return;
+    uint32_t my_q_count = Q_PER_THREAD;
+    if (q_start + my_q_count > q_len) my_q_count = q_len - q_start;
+
+    uint32_t my_q_global_start = q_start_pos + q_start;
+    uint32_t max_kv_pos = my_q_global_start + my_q_count - 1;
+
+    // Load Q
+    simd<fp16, Q_PER_THREAD * HD> Q_data = 0;
+#pragma unroll
+    for (int r = 0; r < Q_PER_THREAD; r++) {
+        if ((uint32_t)r < my_q_count) {
+            fp16* q_addr = (fp16*)Q_ptr + (q_start + r) * q_token_stride + q_head_idx * q_head_stride;
+#pragma unroll
+            for (int c = 0; c < HD; c += 64) {
+                Q_data.template select<64, 1>(r * HD + c) =
+                    xesimd::lsc_block_load<fp16, 64,
+                        xesimd::lsc_data_size::default_size,
+                        xesimd::cache_hint::cached,
+                        xesimd::cache_hint::cached>(q_addr + c);
+            }
+        }
+    }
+
+    // Softmax state
+    simd<float, Q_PER_THREAD * HD> accum = 0.0f;
+    simd<float, Q_PER_THREAD> row_max;
+    simd<float, Q_PER_THREAD> row_sum = 0.0f;
+    row_max = NEG_INF;
+
+    uint32_t kv_tiles = (kv_len + KV_TILE - 1) / KV_TILE;
+    uint32_t max_kv_tiles = (max_kv_pos + KV_TILE) / KV_TILE;
+    if (max_kv_tiles < kv_tiles) kv_tiles = max_kv_tiles;
+
+    uint32_t cur_buf = 0;
+
+    // Preload first V tile (row-major in SLM)
+    if (kv_tiles > 0) {
+        uint32_t slm_base = tid * V_ROWS_PER_THREAD * HD * sizeof(fp16);
+#pragma unroll
+        for (int vr = 0; vr < V_ROWS_PER_THREAD; vr++) {
+            uint32_t global_vr = tid * V_ROWS_PER_THREAD + vr;
+            uint32_t slm_offset = slm_base + vr * HD * sizeof(fp16);
+            if (global_vr < kv_len) {
+                fp16* v_addr = (fp16*)V_ptr + global_vr * kv_token_stride + kv_head_idx * kv_head_stride;
+#pragma unroll
+                for (int c = 0; c < HD; c += 64) {
+                    simd<fp16, 64> v_chunk =
+                        xesimd::lsc_block_load<fp16, 64,
+                            xesimd::lsc_data_size::default_size,
+                            xesimd::cache_hint::cached,
+                            xesimd::cache_hint::cached>(v_addr + c);
+                    slm_block_store<fp16, 64>(slm_offset + c * sizeof(fp16), v_chunk);
+                }
+            } else {
+                simd<fp16, 64> zeros = 0;
+#pragma unroll
+                for (int c = 0; c < HD; c += 64) {
+                    slm_block_store<fp16, 64>(slm_offset + c * sizeof(fp16), zeros);
+                }
+            }
+        }
+        barrier();
+    }
+
+    // Main loop
+    for (uint32_t tile = 0; tile < kv_tiles; tile++) {
+        uint32_t kv_offset = tile * KV_TILE;
+        uint32_t tile_len = KV_TILE;
+        if (kv_offset + tile_len > kv_len) tile_len = kv_len - kv_offset;
+
+        uint32_t read_slm_base = cur_buf * SLM_V_SINGLE;
+
+        // ─── QK^T via DPAS — K stored in VNNI format in SLM ───
+        // Cooperative load writes K directly in VNNI layout (scalar SLM stores).
+        // DPAS reads pre-packed B tiles from SLM — no runtime transpose/swizzle.
+        simd<float, DPAS_M * DPAS_N> qk_acc[N_GROUPS];
+#pragma unroll
+        for (int ng = 0; ng < N_GROUPS; ng++) qk_acc[ng] = 0.0f;
+
+        // ── Cooperative K load: store in VNNI format using slm_scatter ──
+        // Each thread loads 4 K rows, packs VNNI, and scatter-stores 8 uint32 per K_step
+        // slm_scatter<uint32_t, 8>(offsets, values) writes 8 positions in one call
+        // Reduces from 512 scalar stores to 64 scatter calls (4 rows × 16 K_steps)
+#pragma unroll
+        for (int kr = 0; kr < K_ROWS_PER_THREAD_FULL; kr++) {
+            uint32_t row_in_tile = tid * K_ROWS_PER_THREAD_FULL + kr;
+            uint32_t ng = row_in_tile / 16;
+            uint32_t n = row_in_tile % 16;
+            uint32_t kv_row = kv_offset + row_in_tile;
+
+            // Pre-compute scatter offsets for this row: kp*16+n for kp=0..7
+            simd<uint32_t, 8> scatter_offsets;
+#pragma unroll
+            for (int kp = 0; kp < 8; kp++) {
+                scatter_offsets[kp] = (kp * 16 + n) * sizeof(uint32_t);
+            }
+
+            if (kv_row < kv_len) {
+                fp16* k_addr = (fp16*)K_ptr + kv_row * kv_token_stride +
+                               kv_head_idx * kv_head_stride;
+#pragma unroll
+                for (int ks = 0; ks < K_ITERS; ks++) {
+                    simd<fp16, 16> k_vals =
+                        xesimd::lsc_block_load<fp16, 16,
+                            xesimd::lsc_data_size::default_size,
+                            xesimd::cache_hint::cached,
+                            xesimd::cache_hint::cached>(k_addr + ks * DPAS_K);
+                    auto k_u16 = k_vals.template bit_cast_view<uint16_t>();
+
+                    // Pack 8 VNNI pairs
+                    simd<uint32_t, 8> packed_vals;
+#pragma unroll
+                    for (int kp = 0; kp < 8; kp++) {
+                        packed_vals[kp] = (uint32_t)k_u16[2 * kp] |
+                                          ((uint32_t)k_u16[2 * kp + 1] << 16);
+                    }
+
+                    // Scatter store: 8 values to 8 different SLM addresses in one call
+                    uint32_t slm_tile_base = SLM_K_OFFSET +
+                        (ks * N_GROUPS + ng) * SLM_K_VNNI_TILE;
+                    slm_scatter<uint32_t, 8>(scatter_offsets + slm_tile_base, packed_vals);
+                }
+            } else {
+                simd<uint32_t, 8> zeros_u32 = 0;
+#pragma unroll
+                for (int ks = 0; ks < K_ITERS; ks++) {
+                    uint32_t slm_tile_base = SLM_K_OFFSET +
+                        (ks * N_GROUPS + ng) * SLM_K_VNNI_TILE;
+                    slm_scatter<uint32_t, 8>(scatter_offsets + slm_tile_base, zeros_u32);
+                }
+            }
+        }
+        barrier();
+
+        // ── DPAS: read pre-packed B tiles directly from SLM ──
+#pragma unroll
+        for (int ng = 0; ng < N_GROUPS; ng++) {
+#pragma unroll
+            for (int ks = 0; ks < K_ITERS; ks++) {
+                simd<fp16, DPAS_M * DPAS_K> a_tile = 0;
+#pragma unroll
+                for (int q = 0; q < Q_PER_THREAD; q++) {
+                    a_tile.template select<DPAS_K, 1>(q * DPAS_K) =
+                        Q_data.template select<DPAS_K, 1>(q * HD + ks * DPAS_K);
+                }
+
+                uint32_t slm_b_addr = SLM_K_OFFSET +
+                    (ks * N_GROUPS + ng) * SLM_K_VNNI_TILE;
+                simd<uint32_t, 128> b_vnni;
+                b_vnni.template select<64, 1>(0) =
+                    slm_block_load<uint32_t, 64>(slm_b_addr);
+                b_vnni.template select<64, 1>(64) =
+                    slm_block_load<uint32_t, 64>(slm_b_addr + 64 * sizeof(uint32_t));
+
+                simd<fp16, 256> b_tile = b_vnni.template bit_cast_view<fp16>().read();
+                qk_acc[ng] = dpas<8, 8, float, float, fp16, fp16>(qk_acc[ng], b_tile, a_tile);
+            }
+        }
+
+        // Extract scores + causal mask
+        simd<float, Q_PER_THREAD * KV_TILE> scores;
+        scores = NEG_INF;
+#pragma unroll
+        for (int ng = 0; ng < N_GROUPS; ng++) {
+#pragma unroll
+            for (int q = 0; q < Q_PER_THREAD; q++) {
+                uint32_t q_global_pos = my_q_global_start + q;
+#pragma unroll
+                for (int n = 0; n < DPAS_N; n++) {
+                    uint32_t kv_pos = kv_offset + ng * DPAS_N + n;
+                    if (kv_pos <= q_global_pos && kv_pos < kv_len) {
+                        scores[q * KV_TILE + ng * DPAS_N + n] =
+                            qk_acc[ng][q * DPAS_N + n] * SCALE;
+                    }
+                }
+            }
+        }
+
+        // ─── Online softmax + P computation (vectorized) ───
+        // Process 16 scores at a time using SIMD exp
+        simd<fp16, DPAS_M * KV_TILE> P_fp16 = 0;
+
+#pragma unroll
+        for (int q = 0; q < Q_PER_THREAD; q++) {
+            if ((uint32_t)q >= my_q_count) continue;
+
+            // Vector max over scores[q, 0:KV_TILE]
+            simd<float, KV_TILE> q_scores = scores.template select<KV_TILE, 1>(q * KV_TILE);
+            // Mask invalid positions to NEG_INF (already done by causal mask above)
+
+            // Find tile max using SIMD reduce
+            simd<float, 16> s0 = q_scores.template select<16, 1>(0);
+            simd<float, 16> s1 = q_scores.template select<16, 1>(16);
+            simd<float, 16> s_max = __ESIMD_NS::merge<float, 16>(s0, s1, s0 > s1);
+            // Reduce 16 → 1
+            float tile_max = NEG_INF;
+#pragma unroll
+            for (int i = 0; i < 16; i++) {
+                float v = s_max[i];
+                if (v > tile_max) tile_max = v;
+            }
+            if (tile_max == NEG_INF) continue;
+
+            // Rescale existing accum
+            float old_max = row_max[q];
+            float new_max = (tile_max > old_max) ? tile_max : old_max;
+            float rescale = __builtin_expf(old_max - new_max);
+            row_sum[q] *= rescale;
+#pragma unroll
+            for (int c = 0; c < HD; c += 64) {
+                accum.template select<64, 1>(q * HD + c) *= rescale;
+            }
+
+            // Vectorized exp: compute P = exp(scores - new_max) in chunks of 16
+            // Clamp masked positions to -80 before exp to avoid overflow
+            // merge(a, b, mask): mask=1 → a, mask=0 → b
+            // We want: if diff < -80 → use -80, else keep diff
+            simd<float, 16> diff0 = s0 - new_max;
+            simd<float, 16> diff1 = s1 - new_max;
+            diff0 = __ESIMD_NS::merge<float, 16>(diff0, simd<float, 16>(-80.0f), diff0 >= -80.0f);
+            diff1 = __ESIMD_NS::merge<float, 16>(diff1, simd<float, 16>(-80.0f), diff1 >= -80.0f);
+            simd<float, 16> exp0 = fast_exp_16(diff0);
+            simd<float, 16> exp1 = fast_exp_16(diff1);
+
+            // Mask out invalid (causal-masked) positions: where score was NEG_INF, set P=0
+            // merge(a, b, mask): mask=1 → a, mask=0 → b
+            // We want: valid (score > NEG_INF) → keep exp, invalid → 0
+            exp0 = __ESIMD_NS::merge<float, 16>(exp0, simd<float, 16>(0.0f), s0 > NEG_INF + 1.0f);
+            exp1 = __ESIMD_NS::merge<float, 16>(exp1, simd<float, 16>(0.0f), s1 > NEG_INF + 1.0f);
+
+            // Update row_sum
+            float sum0 = reduce<float>(exp0, std::plus<>());
+            float sum1 = reduce<float>(exp1, std::plus<>());
+            row_sum[q] += sum0 + sum1;
+
+            // Store P as fp16 for DPAS
+            P_fp16.template select<16, 1>(q * KV_TILE) = convert<fp16>(exp0);
+            P_fp16.template select<16, 1>(q * KV_TILE + 16) = convert<fp16>(exp1);
+
+            row_max[q] = new_max;
+        }
+
+#pragma unroll
+        for (int ng = 0; ng < PV_N_GROUPS; ng++) {
+            simd<float, DPAS_M * DPAS_N> pv_acc;
+#pragma unroll
+            for (int q = 0; q < DPAS_M; q++) {
+                pv_acc.template select<DPAS_N, 1>(q * DPAS_N) =
+                    accum.template select<DPAS_N, 1>(q * HD + ng * DPAS_N);
+            }
+#pragma unroll
+            for (int ks = 0; ks < PV_K_ITERS; ks++) {
+                simd<fp16, DPAS_M * DPAS_K> pv_a;
+#pragma unroll
+                for (int q = 0; q < DPAS_M; q++) {
+                    pv_a.template select<DPAS_K, 1>(q * DPAS_K) =
+                        P_fp16.template select<DPAS_K, 1>(q * KV_TILE + ks * DPAS_K);
+                }
+                // Read V from SLM (row-major) and pack VNNI for DPAS
+                simd<uint32_t, 128> pv_b_vnni;
+#pragma unroll
+                for (int kp = 0; kp < 8; kp++) {
+                    uint32_t row0 = ks * DPAS_K + 2 * kp;
+                    uint32_t row1 = row0 + 1;
+                    uint32_t slm_off0 = read_slm_base + row0 * HD * sizeof(fp16) + ng * DPAS_N * sizeof(fp16);
+                    uint32_t slm_off1 = read_slm_base + row1 * HD * sizeof(fp16) + ng * DPAS_N * sizeof(fp16);
+                    simd<fp16, 16> v_row0 = slm_block_load<fp16, 16>(slm_off0);
+                    simd<fp16, 16> v_row1 = slm_block_load<fp16, 16>(slm_off1);
+                    auto v0_u16 = v_row0.template bit_cast_view<uint16_t>();
+                    auto v1_u16 = v_row1.template bit_cast_view<uint16_t>();
+                    pv_b_vnni.template select<16, 1>(kp * 16) =
+                        convert<uint32_t>(v0_u16.read()) |
+                        (convert<uint32_t>(v1_u16.read()) << 16);
+                }
+                simd<fp16, 256> pv_b_tile = pv_b_vnni.template bit_cast_view<fp16>().read();
+                pv_acc = dpas<8, 8, float, float, fp16, fp16>(pv_acc, pv_b_tile, pv_a);
+            }
+#pragma unroll
+            for (int q = 0; q < Q_PER_THREAD; q++) {
+                accum.template select<DPAS_N, 1>(q * HD + ng * DPAS_N) =
+                    pv_acc.template select<DPAS_N, 1>(q * DPAS_N);
+            }
+        }
+
+        // ─── Load next V tile ───
+        barrier();
+        uint32_t next_tile = tile + 1;
+        uint32_t next_buf = 1 - cur_buf;
+        if (next_tile < kv_tiles) {
+            uint32_t next_kv_offset = next_tile * KV_TILE;
+            uint32_t next_slm_base = next_buf * SLM_V_SINGLE +
+                                     tid * V_ROWS_PER_THREAD * HD * sizeof(fp16);
+#pragma unroll
+            for (int vr = 0; vr < V_ROWS_PER_THREAD; vr++) {
+                uint32_t global_vr = next_kv_offset + tid * V_ROWS_PER_THREAD + vr;
+                uint32_t slm_offset = next_slm_base + vr * HD * sizeof(fp16);
+                if (global_vr < kv_len) {
+                    fp16* v_addr = (fp16*)V_ptr + global_vr * kv_token_stride + kv_head_idx * kv_head_stride;
+#pragma unroll
+                    for (int c = 0; c < HD; c += 64) {
+                        simd<fp16, 64> v_chunk =
+                            xesimd::lsc_block_load<fp16, 64,
+                                xesimd::lsc_data_size::default_size,
+                                xesimd::cache_hint::cached,
+                                xesimd::cache_hint::cached>(v_addr + c);
+                        slm_block_store<fp16, 64>(slm_offset + c * sizeof(fp16), v_chunk);
+                    }
+                } else {
+                    simd<fp16, 64> zeros = 0;
+#pragma unroll
+                    for (int c = 0; c < HD; c += 64) {
+                        slm_block_store<fp16, 64>(slm_offset + c * sizeof(fp16), zeros);
+                    }
+                }
+            }
+            barrier();
+            cur_buf = next_buf;
+        }
+    }
+
+    // Finalize
+#pragma unroll
+    for (int q = 0; q < Q_PER_THREAD; q++) {
+        if ((uint32_t)q >= my_q_count) continue;
+        float rs = row_sum[q];
+        float inv_sum = (rs > 0.0f) ? (1.0f / rs) : 0.0f;
+        fp16* o_addr = (fp16*)O_ptr + (q_start + q) * q_token_stride + q_head_idx * q_head_stride;
+#pragma unroll
+        for (int c = 0; c < HD; c += 64) {
+            simd<float, 64> out_f32 = accum.template select<64, 1>(q * HD + c) * inv_sum;
+            simd<fp16, 64> out_chunk = out_f32;
+            xesimd::lsc_block_store<fp16, 64,
+                xesimd::lsc_data_size::default_size,
+                xesimd::cache_hint::write_back,
+                xesimd::cache_hint::write_back>(o_addr + c, out_chunk);
+        }
+    }
+}
+
+at::Tensor flash_attn_opt_forward(at::Tensor Q, at::Tensor K, at::Tensor V,
+                                   int64_t q_start_pos) {
+    TORCH_CHECK(Q.device().is_xpu(), "Q must be on XPU");
+    TORCH_CHECK(Q.dtype() == at::kHalf, "Q must be fp16");
+    TORCH_CHECK(K.dtype() == at::kHalf && V.dtype() == at::kHalf, "K/V must be fp16");
+    TORCH_CHECK(Q.dim() == 3 && Q.size(2) == 256, "Q must be [q_len, num_q_heads, 256]");
+    TORCH_CHECK(K.dim() == 3 && K.size(2) == 256, "K must be [kv_len, num_kv_heads, 256]");
+    TORCH_CHECK(V.dim() == 3 && V.size(2) == 256, "V must be [kv_len, num_kv_heads, 256]");
+    TORCH_CHECK(K.size(0) == V.size(0) && K.size(1) == V.size(1));
+    int num_q_heads = Q.size(1), num_kv_heads = K.size(1);
+    TORCH_CHECK(num_q_heads % num_kv_heads == 0);
+    TORCH_CHECK(Q.is_contiguous() && K.is_contiguous() && V.is_contiguous());
+
+    int q_len = Q.size(0), kv_len = K.size(0);
+    auto out = at::empty_like(Q);
+
+    auto* q_ptr = reinterpret_cast<uint8_t*>(Q.data_ptr());
+    auto* k_ptr = reinterpret_cast<uint8_t*>(K.data_ptr());
+    auto* v_ptr = reinterpret_cast<uint8_t*>(V.data_ptr());
+    auto* o_ptr = reinterpret_cast<uint8_t*>(out.data_ptr());
+
+    uint32_t num_q_groups = (q_len + Q_GROUP - 1) / Q_GROUP;
+    uint32_t qsp = (uint32_t)q_start_pos;
+    sycl::nd_range<2> range(
+        sycl::range<2>(num_q_groups * WG_SIZE, num_q_heads),
+        sycl::range<2>(WG_SIZE, 1));
+
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(Q.device().index()).queue();
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<class flash_attn_opt_k>(
+            range,
+            [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+                flash_attn_opt_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
+                    q_len, kv_len, num_q_heads, num_kv_heads, qsp, ndi);
+            });
+    }).wait();
+
+    return out;
+}
+
+TORCH_LIBRARY(flash_attn_opt, m) {
+    m.def("forward(Tensor Q, Tensor K, Tensor V, int q_start_pos=0) -> Tensor");
+}
+TORCH_LIBRARY_IMPL(flash_attn_opt, XPU, m) {
+    m.impl("forward", &flash_attn_opt_forward);
+}
