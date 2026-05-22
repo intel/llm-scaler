@@ -383,7 +383,7 @@ index 7a9b4b84..1a02c4dd 100644
  import torch
  import logging
  import comfy.model_management
-@@ -29,6 +30,45 @@ import comfy.utils
+@@ -29,6 +30,47 @@ import comfy.utils
  import comfy_aimdo.model_vbar
  import comfy_aimdo.torch
  
@@ -410,6 +410,8 @@ index 7a9b4b84..1a02c4dd 100644
 +    if _omni_norm is None:
 +        return False
 +    if not x.is_xpu:
++        return False
++    if not x.is_contiguous():
 +        return False
 +    if x.ndim < 2:
 +        return False
@@ -643,7 +645,7 @@ diff --git a/comfy/rmsnorm.py b/comfy/rmsnorm.py
 index ab7cf14f..91f46d15 100644
 --- a/comfy/rmsnorm.py
 +++ b/comfy/rmsnorm.py
-@@ -1,9 +1,60 @@
+@@ -1,9 +1,62 @@
 +import os
  import torch
 +import logging
@@ -674,6 +676,8 @@ index ab7cf14f..91f46d15 100644
 +    if _omni_norm is None:
 +        return False
 +    if not x.is_xpu:
++        return False
++    if not x.is_contiguous():
 +        return False
 +    if x.ndim < 2:
 +        return False
