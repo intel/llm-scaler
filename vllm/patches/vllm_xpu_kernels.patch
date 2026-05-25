@@ -1,5 +1,25 @@
+diff --git a/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp b/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp
+index b9729cd..20fff80 100644
+--- a/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp
++++ b/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp
+@@ -536,8 +536,14 @@ struct chunk_update_states_kernel {
+     T* conv_states_ptr = conv_states + states_id * conv_states_stride_0;
+     const T* conv_states_tmp_ptr =
+         conv_states_tmp + batch_id * (width - 1) * conv_elems;
++    // BUGFIX: clamp i to conv_elems. Without this, the last group writes past conv_elems
++    // and silently overwrites the adjacent ssm_state region in the KV cache padded layout
++    // (conv and ssm share storage; ssm starts at offset conv_elems). This corrupted
++    // ssm_state head 0 elements 0..511, manifesting only on chunk-2 (has_initial_state=True).
++    // Authors: Wenjun + Claude (collaborative debugging)
++    const int i_end = (local_group_id + 1) * elems_per_group;
+     for (int i = elems_start_offset_group + local_id;
+-         i < (local_group_id + 1) * elems_per_group;
++         i < i_end && i < conv_elems;
+          i += group_size) {
+       conv_states_ptr[width_id * conv_elems + i] =
+           conv_states_tmp_ptr[width_id * conv_elems + i];
 diff --git a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp b/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
-index 10d7a1b..45664ac 100644
+index 10d7a1b..66b104c 100644
 --- a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
 +++ b/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
 @@ -150,10 +150,34 @@ CUTE_DEVICE void chunk_prepare_kernel(
@@ -94,7 +114,17 @@ index 10d7a1b..45664ac 100644
        Tensor cU = make_identity_tensor(U_tensor.shape());
  
        auto copy_U_c = get_block_2d_copy_C<void>(mma, U_tensor);
-@@ -1190,29 +1241,30 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1084,7 +1135,8 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+           reorder(tCrU_c, tCrU_d);
+           copy(copy_U_d, tCrU_d, tCgU_d);
+         }
+-        item.barrier(sycl::access::fence_space::local_space);
++        ::sycl::atomic_fence(::sycl::memory_order::acq_rel, ::sycl::memory_scope::device);
++        item.barrier(sycl::access::fence_space::global_and_local);
+       }
+ 
+       auto q_ptr =
+@@ -1190,29 +1242,30 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
                K_tensor_T_shape, make_stride(_1{}, head_k_dim * num_k_heads)));
  
        Tensor cS = make_identity_tensor(S_tensor.shape());
@@ -135,7 +165,7 @@ index 10d7a1b..45664ac 100644
                tSrS_d(i) *= g_last_value_exp;
              }
            } else {
-@@ -1221,7 +1273,17 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1221,7 +1274,17 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
  
            gemm_TTS_k_multi(
                U_tensor_T, K_tensor_T, tSrS_d, dv, dk, mma, g_multi_slm_ptr);
@@ -154,7 +184,7 @@ index 10d7a1b..45664ac 100644
            copy(copy_S_d, tCrS_d, tCgS_d);
          }
        }
-@@ -1279,6 +1341,7 @@ void kernel_launcher(
+@@ -1279,6 +1342,7 @@ void kernel_launcher(
      const T* dt_bias,
      StateT* ssm_state,
      const int ssm_state_stride_0,
@@ -162,7 +192,7 @@ index 10d7a1b..45664ac 100644
      const int* query_start_loc,
      const int* cache_indices,
      const bool* has_initial_state,
-@@ -1507,6 +1570,7 @@ void kernel_launcher(
+@@ -1507,6 +1571,7 @@ void kernel_launcher(
                a,
                ssm_state,
                ssm_state_stride_0,
@@ -170,7 +200,7 @@ index 10d7a1b..45664ac 100644
                query_start_loc,
                cache_indices,
                has_initial_state,
-@@ -1583,6 +1647,10 @@ void chunk_gated_delta_rule_impl_xe2(
+@@ -1583,6 +1648,17 @@ void chunk_gated_delta_rule_impl_xe2(
        {num_v_heads, total_seqlen + padding_size, head_v_dim},
        torch::dtype(dtype).device(device).requires_grad(false));
  
@@ -178,10 +208,17 @@ index 10d7a1b..45664ac 100644
 +      {batch_size, num_v_heads, head_v_dim, head_k_dim},
 +      torch::dtype(torch::kFloat32).device(device).requires_grad(false));
 +
++  // Fix: ensure all torch::zeros memset kernels complete before
++  // launching GDN sub-kernels. On XPU with high memory pressure,
++  // the caching allocator may return buffers whose memset(0) has been
++  // submitted but not completed, causing stale data at offset 0
++  // (v_head_id=0) to corrupt the SSM state recursion.
++  queue.wait();
++
  #define KERNEL_LAUNCHER(scalar_t, state_scalar_t)                  \
    kernel_launcher<scalar_t, state_scalar_t>(                       \
        queue,                                                       \
-@@ -1599,6 +1667,7 @@ void chunk_gated_delta_rule_impl_xe2(
+@@ -1599,6 +1675,7 @@ void chunk_gated_delta_rule_impl_xe2(
        reinterpret_cast<scalar_t*>(dt_bias.data_ptr()),             \
        reinterpret_cast<state_scalar_t*>(ssm_state.data_ptr()),     \
        ssm_state_stride_0,                                          \
