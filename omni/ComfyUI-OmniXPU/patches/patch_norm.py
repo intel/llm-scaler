@@ -22,6 +22,8 @@ _logged_first_use = False
 def _can_use_omni(x):
     if _omni_norm is None or not x.is_xpu:
         return False
+    if not x.is_contiguous():
+        return False
     if x.ndim < 2:
         return False
     h = x.shape[-1]
