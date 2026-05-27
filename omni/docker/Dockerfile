@@ -82,18 +82,22 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -e . && \
     rm -f /tmp/yunchang_for_multi_arc.patch /tmp/xdit_for_multi_arc.patch
 
-# ComfyUI core
-COPY ./patches/comfyui_for_multi_arc.patch /tmp/
-
+# ComfyUI core (upstream, no patches)
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm && \
     git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git && \
     cd ComfyUI && \
     git fetch --depth 1 origin 64b8457f55cd7fb54ca7a956d9c73b505e903e0c && \
     git checkout 64b8457f55cd7fb54ca7a956d9c73b505e903e0c && \
-    git apply /tmp/comfyui_for_multi_arc.patch && \
-    pip install -r requirements.txt && \
-    rm -f /tmp/comfyui_for_multi_arc.patch
+    pip install -r requirements.txt
+
+# ComfyUI-OmniXPU: Intel XPU acceleration via custom node (replaces core patch)
+COPY ./ComfyUI-OmniXPU /llm/ComfyUI/custom_nodes/ComfyUI-OmniXPU
+ARG IMAGE_TAG="0.1.0-dev"
+RUN cd /llm/ComfyUI/custom_nodes/ComfyUI-OmniXPU && \
+    git init && git add -A && \
+    git -c user.name="llm-scaler" -c user.email="noreply@intel.com" \
+        commit --allow-empty -m "ComfyUI-OmniXPU ${IMAGE_TAG}"
 
 # ComfyUI custom nodes (active)
 COPY ./patches/raylight_for_multi_arc.patch /tmp/
@@ -297,6 +301,7 @@ RUN cp /opt/intel/oneapi/compiler/2025.3/lib/libsycl-native-*.spv /usr/local/lib
 ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python${PYTHON_VERSION}/dist-packages/torch/lib:${LD_LIBRARY_PATH}"
 ENV CCL_SYCL_ALLTOALL_ARC_LL=1
 ENV CCL_SYCL_CCL_BARRIER=1
-ENV _LLM_SCALER_DISABLE_INTERPOLATE_FIX=1
+ENV OMNIXPU_INTERPOLATE_FIX=0
+ENV OMNIXPU_ATTENTION=0
 
 WORKDIR /llm/entrypoints
