@@ -107,7 +107,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Pin transformers version to avoid conflict in vLLM
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install librosa soundfile decord && \
-    pip install git+https://github.com/huggingface/transformers.git && \
+    pip install transformers==5.8.0 && \
     pip install ijson
 
 COPY ./patches/vllm_xpu_kernels.patch /tmp/
