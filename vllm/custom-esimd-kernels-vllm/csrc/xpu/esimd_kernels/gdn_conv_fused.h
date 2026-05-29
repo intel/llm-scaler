@@ -120,6 +120,15 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
     // double_v: v-threads handle 128 elements each instead of 64
     const bool double_v = (HV > (32 - 4 * H) / 2);  // true when HV > 8
 
+    // Number of threads (out of WG_SIZE=32) that have a real work assignment.
+    // Designed for H=4/HV=8 (TP=4) where 4*H+2*HV=32 — all 32 threads busy.
+    // For TP=8 (H=2/HV=4) only 16 threads are useful; the remaining 16 must
+    // not perform any qkvz/conv_state/output load or store, otherwise their
+    // out-of-range tid maps to OOB offsets and corrupts neighboring buffers.
+    // They still need to reach barrier() before Phase 2.
+    const int useful_threads = 4 * H + (double_v ? HV : 2 * HV);
+    const bool is_valid = (tid < useful_threads);
+
     const int conv_idx = conv_state_indices_ptr[seq_idx];
     const int ssm_idx = ssm_state_indices_ptr[seq_idx];
 
@@ -143,8 +152,8 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
         int k_head = k_tid / 2;
         qkvz_offset = k_head * group_dim + gdn_K + (k_tid & 1) * 64;
         chunk_start = tid * 64;
-    } else if (double_v) {
-        // v region (double): tid (4*H)..31, 128 elements each (one full v_head)
+    } else if (double_v && is_valid) {
+        // v region (double): tid (4*H)..(4*H+HV-1), 128 elements each
         int v_tid = tid - 4 * H;
         int v_hv = v_tid;  // one thread per v_head
         int v_group = v_hv / heads_per_group;
@@ -154,8 +163,8 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
         qkvz_offset_hi = base + 64;
         chunk_start = 4 * H * 64 + v_tid * 128;
         chunk_start_hi = chunk_start + 64;
-    } else {
-        // v region (original): tid (4*H)..31, 64 elements each (half v_head)
+    } else if (is_valid) {
+        // v region (original): tid (4*H)..(4*H+2*HV-1), 64 elements each
         int v_tid = tid - 4 * H;
         int v_hv = v_tid / 2;
         int v_group = v_hv / heads_per_group;
@@ -164,27 +173,30 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
                      + v_lane * gdn_V + (v_tid & 1) * 64;
         chunk_start = tid * 64;
     }
+    // dead threads: qkvz_offset / chunk_start stay 0 (unused — gated below).
 
-    // ---- Phase 1: Conv1d ----
+    // ---- Phase 1: Conv1d (valid threads only) ----
     const fp16* qkvz_row = qkvz_ptr + (int64_t)seq_idx * qkvz_stride0;
     fp16* cstate_base = conv_state_ptr + (int64_t)conv_idx * conv_stride0;
 
-    // -- lo chunk (all threads) --
-    simd<fp16, 64> x_fp16 = block_load<fp16, 64>(qkvz_row + qkvz_offset);
-    simd<float, 64> x_f32 = x_fp16;
+    // -- lo chunk (only useful_threads load; dead threads keep zero) --
+    simd<fp16, 64> x_fp16(0);
+    simd<float, 64> s0(0.0f), s1(0.0f), s2(0.0f), conv_result(0.0f);
+    if (is_valid) {
+        x_fp16 = block_load<fp16, 64>(qkvz_row + qkvz_offset);
+        simd<float, 64> x_f32 = x_fp16;
 
-    simd<float, 64> s0 = block_load<fp16, 64>(cstate_base + 0 * dim + chunk_start);
-    simd<float, 64> s1 = block_load<fp16, 64>(cstate_base + 1 * dim + chunk_start);
-    simd<float, 64> s2 = block_load<fp16, 64>(cstate_base + 2 * dim + chunk_start);
+        s0 = block_load<fp16, 64>(cstate_base + 0 * dim + chunk_start);
+        s1 = block_load<fp16, 64>(cstate_base + 1 * dim + chunk_start);
+        s2 = block_load<fp16, 64>(cstate_base + 2 * dim + chunk_start);
 
-    simd<fp16, 256> w_raw = block_load<fp16, 256>(conv_weight_ptr + (int64_t)chunk_start * 4);
-    simd<float, 64> conv_result =
-        s0 * w_raw.select<64, 4>(0) + s1 * w_raw.select<64, 4>(1) +
-        s2 * w_raw.select<64, 4>(2) + x_f32 * w_raw.select<64, 4>(3) +
-        (simd<float, 64>)block_load<fp16, 64>(conv_bias_ptr + chunk_start);
+        simd<fp16, 256> w_raw = block_load<fp16, 256>(conv_weight_ptr + (int64_t)chunk_start * 4);
+        conv_result =
+            s0 * w_raw.select<64, 4>(0) + s1 * w_raw.select<64, 4>(1) +
+            s2 * w_raw.select<64, 4>(2) + x_f32 * w_raw.select<64, 4>(3) +
+            (simd<float, 64>)block_load<fp16, 64>(conv_bias_ptr + chunk_start);
 
-    // SiLU
-    {
+        // SiLU
         simd<float, 64> exp_neg = sycl::ext::intel::esimd::exp(-conv_result);
         conv_result = conv_result / (1.0f + exp_neg);
     }
@@ -193,7 +205,7 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
     simd<fp16, 64> x_fp16_hi;
     simd<float, 64> s0_hi, s1_hi, s2_hi, conv_result_hi;
 
-    if (double_v && tid >= 4 * H) {
+    if (double_v && tid >= 4 * H && is_valid) {
         x_fp16_hi = block_load<fp16, 64>(qkvz_row + qkvz_offset_hi);
         simd<float, 64> x_f32_hi = x_fp16_hi;
 
@@ -349,8 +361,8 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
     // When N*HV > 32, the shift is done by a separate kernel to avoid a
     // cross-WG race: hv==0's writes could land before a later-scheduled WG's
     // Phase 1 reads for the same seq_idx.
-    if (inline_conv_shift && conv_idx >= 0 && hv == 0) {
-        // lo chunk (all threads)
+    if (inline_conv_shift && conv_idx >= 0 && hv == 0 && is_valid) {
+        // lo chunk (valid threads only)
         block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start, simd<fp16, 64>(s1));
         block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start, simd<fp16, 64>(s2));
         block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start, x_fp16);
@@ -364,7 +376,7 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
     }
 
     // ---- z extraction: v-threads copy z from qkvz to z_out ----
-    if (tid >= 4 * H) {
+    if (tid >= 4 * H && is_valid) {
         int v_tid = tid - 4 * H;
         if (double_v) {
             // One thread per v_head, two 64-element loads
@@ -431,6 +443,11 @@ ESIMD_INLINE void conv_state_shift_kernel(
     const int heads_per_group = HV / H;
     const int dim = 2 * H * gdn_K + HV * gdn_V;
     const bool double_v = (HV > (32 - 4 * H) / 2);
+
+    // Skip dead threads (only 4*H + (double_v ? HV : 2*HV) threads have work).
+    // Safe to early-return here: no barrier in this kernel.
+    const int useful_threads = 4 * H + (double_v ? HV : 2 * HV);
+    if (tid >= useful_threads) return;
 
     const int group_dim = gdn_K + gdn_K + heads_per_group * gdn_V * 2;
 
