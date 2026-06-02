@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+# Base image built from the original b7 Dockerfile:
+ARG BASE_IMAGE=intel/llm-scaler-omni:0.1.0-b7
+ARG PYTHON_VERSION=3.12
+
+FROM ${BASE_IMAGE}
+
+ARG https_proxy
+ARG http_proxy
+ARG PYTHON_VERSION
+
+ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python${PYTHON_VERSION}/dist-packages/torch/lib:${LD_LIBRARY_PATH}"
+
+COPY ./patches/extention_comfyui_wanvideowrapper.patch /tmp/
+
+# Add custom node
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf ComfyUI-WanVideoWrapper && \
+    git clone --depth 1 https://github.com/kijai/ComfyUI-WanVideoWrapper.git && \
+    cd ComfyUI-WanVideoWrapper && \
+    git fetch --depth 1 origin e091c4a77425d6a4a7f90ab30c513d24f8cb91cf && \
+    git checkout e091c4a77425d6a4a7f90ab30c513d24f8cb91cf && \
+    git apply /tmp/extention_comfyui_wanvideowrapper.patch && \
+    pip install -r requirements.txt && \
+    rm -f /tmp/extention_comfyui_wanvideowrapper.patch
+
+WORKDIR /llm/entrypoints
