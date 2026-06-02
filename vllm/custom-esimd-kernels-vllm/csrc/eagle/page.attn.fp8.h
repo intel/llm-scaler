@@ -28,15 +28,27 @@ ESIMD_INLINE simd<fp16, N> dequantFp8(simd<uint8_t, N> bytes) {
     return out16.template bit_cast_view<fp16>();
   } else {
     // E4M3FN: sign(1)|exp(4)|mant(3).  fp16: sign|exp(5,bias15)|mant(10,bias7+8).
-    // Same byte-stage trick, then re-encode the bit fields.
+    //
+    // Layout:
+    //   in_byte = s eeee mmm
+    //   fp16     = s eeeee mmmmmmmmmm  with exp = e4 + 8, mant = m << 7
+    //
+    // Implementation reuses two simd<u16,N> live values (`b16` and `out`)
+    // instead of materialising sign16/exp4/mant3/norm separately — keeps
+    // dequant pressure off the GRF file (was ~2.5KB live for N=256).
+    //
+    //   out = (b16 & 0x7F) << 7      // (mant<<7) | (exp4<<10)
+    //   out += 0x2000                // bias bump: exp += 8 (8<<10 = 0x2000)
+    //   out |= (b16 & 0x80) << 8     // sign bit
+    //   if (exp4 == 0) out = sign    // subnormal/zero collapse
     simd<uint16_t, N> b16 = 0;
     b16.template bit_cast_view<uint8_t>().template select<N, 2>(0) = bytes;     // low half
-    simd<uint16_t, N> sign16 = (b16 & 0x80) << 8;
-    simd<uint16_t, N> exp4   = (b16 >> 3) & 0xF;
-    simd<uint16_t, N> mant3  = b16 & 0x7;
-    simd<uint16_t, N> norm   = sign16 | ((exp4 + 8) << 10) | (mant3 << 7);
-    norm.merge(sign16, exp4 == 0);   // zero / subnormal -> ±0
-    return norm.template bit_cast_view<fp16>();
+    simd<uint16_t, N> out = (b16 & 0x7F) << 7;
+    out += 0x2000;
+    out |= (b16 & 0x80) << 8;
+    // subnormal path: ((b16 & 0x78) == 0) → keep only sign bit.
+    out.merge((b16 & 0x80) << 8, (b16 & 0x78) == 0);
+    return out.template bit_cast_view<fp16>();
   }
 }
 
@@ -162,39 +174,34 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1Fp8(
         pageTableOffset * headKv * headDim * sizeof(uint8_t)
         ;
 
+      // Pull the entire chunk's 64-col footprint with ONE gather:
+      //   NElts=16 -> 16 lane * 64 byte = 1024 fp8 / gather.  But hh's two
+      //   32-col segments are NOT contiguous (gap of 96 byte in the middle);
+      //   so the "single 64-col gather" version is invalid.  Stay with
+      //   NElts=8 × 2 segments per chunk (proven path below).
 #pragma unroll
       for (int kk = 0; kk < 2; kk++) {
-#pragma unroll
-        for (int kkk = 0; kkk < 2; kkk++) {     // 2 inner gathers per kk
-          // u32 NElts=4 -> 16 lane * 16 byte = 256 fp8 bytes / gather
-          simd<uint32_t, 16 * 4> raw =
-            __ESIMD_ENS::lsc_gather<
-            uint32_t,
-            4,
-            __ESIMD_ENS::lsc_data_size::u32,
-            __ESIMD_ENS::cache_hint::cached,
-            __ESIMD_ENS::cache_hint::cached,
-            16,
-            uint32_t
-            >((uint32_t*)kState, simdOffsetsK, mask);
-          // 256 fp8 -> 256 fp16 (= 128 u32 = 512 byte) into kkCache.
-          simd<uint8_t, 256> rawBytes = raw.template bit_cast_view<uint8_t>();
-          simd<fp16,    256> deq      = dequantFp8<V, 256>(rawBytes);
-          kkCache.template bit_cast_view<uint32_t>().template select<128, 1>(256 * kk + 128 * kkk) =
-            deq.template bit_cast_view<uint32_t>();
-          simdOffsetsK += 16 * sizeof(uint8_t);
-        }
+        // u32 NElts=8 -> 16 lane * 32 byte = 512 fp8 bytes / gather
+        // (halves gather-message count vs the original NElts=4 × 2 inner).
+        simd<uint32_t, 16 * 8> raw =
+          __ESIMD_ENS::lsc_gather<
+          uint32_t,
+          8,
+          __ESIMD_ENS::lsc_data_size::u32,
+          __ESIMD_ENS::cache_hint::cached,
+          __ESIMD_ENS::cache_hint::cached,
+          16,
+          uint32_t
+          >((uint32_t*)kState, simdOffsetsK, mask);
+        simd<uint8_t, 512> rawBytes = raw.template bit_cast_view<uint8_t>();
+        // dequant in two halves: keeps per-call live u16 footprint same
+        // as the proven path (avoids extra spill inside dequantFp8).
+        kkCache.template select<256, 1>(512 * kk + 0)   = dequantFp8<V, 256>(rawBytes.template select<256, 1>(0));
+        kkCache.template select<256, 1>(512 * kk + 256) = dequantFp8<V, 256>(rawBytes.template select<256, 1>(256));
 
-        simdOffsetsK += 96 * sizeof(uint8_t);    // outer +96 fp8 = +96 byte
+        simdOffsetsK += 128 * sizeof(uint8_t);   // jump to next 32-col segment
 
-        // ── Reshuffle (fp8 specific) ─────────────────────────────
-        //  After this kk's 2 fp8 gathers, kkCache_fp16[512*kk .. 512*kk+511]
-        //  holds 32 fp8 cols × 16 tokens, but in fp8-NElt order:
-        //    8 NElt-slices, each 64 fp16 = 16 token × 4 col.
-        //    slice s, lane (= token) i, col p → kkCache_fp16[512*kk + 64*s + 4*i + p]
-        //  For the MAC we need col-major: kkFp32[16*c + i] = K[col c, token i].
-        //  c = s*4 + p, so:
-        //    kkFp32[16*c + 0..15] = kkCache.select<16, 4>(512*kk + 64*s + p)
+        // SoA → col-major reshuffle.  s ∈ [0,8), p ∈ [0,4), c = s*4+p.
 #pragma unroll
         for (int s = 0; s < 8; s++) {
 #pragma unroll
@@ -435,33 +442,24 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2Fp8(
         currMax[pn] = pGroupMax[offsetMax + maxStride * pn];
       }
 
-      // 2D-load 16x16 fp8 bytes -> dequant to fp16 in vvCache.
-      simd<uint8_t, 256> vRaw0 =
+      // Merged 2D-load: a single 16-byte × 32-row message replaces the two
+      // 16×16 loads (1024 byte / 1 message vs 512 byte × 2 messages).
+      // dequant is still applied in two 256-wide halves so the live
+      // simd<u16,N> footprint inside dequantFp8 stays at the same size as
+      // the per-half version (avoids extra GRF spill).
+      simd<uint8_t, 512> vRawAll =
         __ESIMD_ENS::lsc_load_2d<
         uint8_t,
         16,
-        16,
+        32,
         1,
         false,
         false,
         __ESIMD_ENS::cache_hint::cached,
         __ESIMD_ENS::cache_hint::cached
         >(currPtrV, widthV, heightV, widthV, vX, vY);
-      vvCache.select<256, 1>(0 * 256) = dequantFp8<V, 256>(vRaw0);
-      vY += 16;
-
-      simd<uint8_t, 256> vRaw1 =
-        __ESIMD_ENS::lsc_load_2d<
-        uint8_t,
-        16,
-        16,
-        1,
-        false,
-        false,
-        __ESIMD_ENS::cache_hint::cached,
-        __ESIMD_ENS::cache_hint::cached>
-        (currPtrV, widthV, heightV, widthV, vX, vY);
-      vvCache.select<256, 1>(1 * 256) = dequantFp8<V, 256>(vRaw1);
+      vvCache.select<256, 1>(0 * 256) = dequantFp8<V, 256>(vRawAll.select<256, 1>(0));
+      vvCache.select<256, 1>(1 * 256) = dequantFp8<V, 256>(vRawAll.select<256, 1>(256));
 
       compensationP = currMax - globalMax;
       compensationP = exp(compensationP);
