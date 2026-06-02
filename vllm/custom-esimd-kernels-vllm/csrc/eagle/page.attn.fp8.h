@@ -17,20 +17,25 @@ enum class Fp8Variant : uint32_t { E4M3FN = 0, E5M2 = 1 };
 // Convert N fp8 bytes (in a simd<uint8_t,N>) to fp16 in-place.  Returns simd<fp16,N>.
 template <Fp8Variant V, int N>
 ESIMD_INLINE simd<fp16, N> dequantFp8(simd<uint8_t, N> bytes) {
+  static_assert(N % 2 == 0, "dequantFp8 expects an even N");
   if constexpr (V == Fp8Variant::E5M2) {
-    // bit-pattern: sign(1)|exp(5)|mant(2)  ==  fp16 high 8 bits  --> shift left 8.
-    simd<uint16_t, N> u16 = bytes;          // zero-extend to u16
-    u16 = u16 << 8;
-    return u16.template bit_cast_view<fp16>();
+    // bit-pattern: sign(1)|exp(5)|mant(2)  ==  fp16 high 8 bits.
+    // Pack: u16 lane i = bytes[i] << 8.  Avoid u8->u16 implicit cast (sign?)
+    // by writing each byte into the high half of a freshly zero-init u16
+    // through a 2x-wide u8 view.
+    simd<uint16_t, N> out16 = 0;
+    out16.template bit_cast_view<uint8_t>().template select<N, 2>(1) = bytes;
+    return out16.template bit_cast_view<fp16>();
   } else {
     // E4M3FN: sign(1)|exp(4)|mant(3).  fp16: sign|exp(5,bias15)|mant(10,bias7+8).
-    simd<uint16_t, N> b16 = bytes;
+    // Same byte-stage trick, then re-encode the bit fields.
+    simd<uint16_t, N> b16 = 0;
+    b16.template bit_cast_view<uint8_t>().template select<N, 2>(0) = bytes;     // low half
     simd<uint16_t, N> sign16 = (b16 & 0x80) << 8;
     simd<uint16_t, N> exp4   = (b16 >> 3) & 0xF;
     simd<uint16_t, N> mant3  = b16 & 0x7;
     simd<uint16_t, N> norm   = sign16 | ((exp4 + 8) << 10) | (mant3 << 7);
-    // exp4 == 0  =>  zero or sub-normal ; we map both to ±0 (KV-cache tolerance).
-    norm.merge(sign16, exp4 == 0);
+    norm.merge(sign16, exp4 == 0);   // zero / subnormal -> ±0
     return norm.template bit_cast_view<fp16>();
   }
 }
@@ -135,8 +140,14 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1Fp8(
       maskNeg = logicSimdOffsetK >= kvSeqLen;
       simdOffsetsK = baseOffsetInc16AsSimd;
 
-      // Element strides switch from fp16 (2B) to fp8 (1B); kvCacheBatchStride1 is in
-      // elements (page_size*headKv*headDim).
+      // K (fp8) gather mirrors the fp16 path element-for-element:
+      //  * fp16 path:  NElts=4 u32 (16B/lane = 8 fp16) per gather, +16B step.
+      //  * fp8  path:  NElts=4 u32 (16B/lane = 16 fp8) per gather, +16B step.
+      //                Output dequants to 16 fp16 / lane = 32 B / lane.
+      //  We keep the fp16 inner-step element count (8) by issuing TWO halves
+      //  per fp16 step.  Easier: just loop kkk 0..7 with +8B step, NElts=2
+      //  (= 8B/lane = 8 fp8 / lane), so each fp8 gather mirrors exactly one
+      //  fp16 gather byte-for-byte at the lane level.
       simdOffsetsK =
         simdOffsetsK * headKv * headDim * sizeof(uint8_t) +
         offsetBaseK +
@@ -148,7 +159,7 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1Fp8(
       for (int kk = 0; kk < 2; kk++) {
 #pragma unroll
         for (int kkk = 0; kkk < 4; kkk++) {
-          // u32 NElts=2  ->  16 lane * 8 byte = 128 fp8 / gather.
+          // u32 NElts=2 -> 16 lane * 8 byte = 128 fp8 bytes / gather.
           simd<uint32_t, 16 * 2> raw =
             __ESIMD_ENS::lsc_gather<
             uint32_t,
@@ -159,11 +170,12 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1Fp8(
             16,
             uint32_t
             >((uint32_t*)kState, simdOffsetsK, mask);
-          // Dequant 128 fp8 -> 128 fp16, write into the same byte slot the fp16
-          // kernel uses (256*kk + 64*kkk in u32 units of kkCache).
+          // 128 fp8 bytes -> 128 fp16 (= 256 byte = 64 u32) into kkCache.
+          // The fp16 kernel writes 64 u32 per gather to "256*kk + 64*kkk",
+          // and 128 fp16 dequant of 128 fp8 == 64 u32 == same slot size.
           simd<uint8_t, 128> rawBytes = raw.template bit_cast_view<uint8_t>();
-          simd<fp16, 128>    deq      = dequantFp8<V, 128>(rawBytes);
-          kkCache.template bit_cast_view<uint32_t>().select<64, 1>(256 * kk + 64 * kkk) =
+          simd<fp16,    128> deq      = dequantFp8<V, 128>(rawBytes);
+          kkCache.template bit_cast_view<uint32_t>().template select<64, 1>(256 * kk + 64 * kkk) =
             deq.template bit_cast_view<uint32_t>();
           simdOffsetsK += 8 * sizeof(uint8_t);
         }
