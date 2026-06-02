@@ -140,14 +140,21 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1Fp8(
       maskNeg = logicSimdOffsetK >= kvSeqLen;
       simdOffsetsK = baseOffsetInc16AsSimd;
 
-      // K (fp8) gather mirrors the fp16 path element-for-element:
-      //  * fp16 path:  NElts=4 u32 (16B/lane = 8 fp16) per gather, +16B step.
-      //  * fp8  path:  NElts=4 u32 (16B/lane = 16 fp8) per gather, +16B step.
-      //                Output dequants to 16 fp16 / lane = 32 B / lane.
-      //  We keep the fp16 inner-step element count (8) by issuing TWO halves
-      //  per fp16 step.  Easier: just loop kkk 0..7 with +8B step, NElts=2
-      //  (= 8B/lane = 8 fp8 / lane), so each fp8 gather mirrors exactly one
-      //  fp16 gather byte-for-byte at the lane level.
+      // ── K-load (fp8) ─────────────────────────────────────────────
+      // The fp16 K-load uses lsc_gather<u32, NElts=4, simd_size=16> which
+      // returns SoA layout: raw[NElt*16 + lane] = lane's NElt-th u32.  Each
+      // u32 == 4 bytes == 2 fp16, so a gather yields 16 lanes × 8 fp16 =
+      // 128 fp16 = 256 byte / 64 u32.  fp16 then runs 4 inner kkk × 2 outer
+      // kk = 8 gathers, totalling 1024 fp16 in kkCache.
+      //
+      // For fp8 we keep NElts=4 (same 16 byte/lane = 16 fp8/lane), but
+      // *each gather now yields 256 fp8 = 256 dequanted fp16 = 512 byte =
+      // 128 u32* — exactly DOUBLE the fp16 path's per-gather payload.  To
+      // keep kkCache size unchanged we therefore halve the inner kkk loop
+      // (0..1 instead of 0..3) and reshuffle with a different stride.
+      //
+      // Byte step: inner +16 byte = +16 fp8; outer +96 byte = +96 fp8.
+      // (fp16's +192 byte outer is +96 fp16, same element count.)
       simdOffsetsK =
         simdOffsetsK * headKv * headDim * sizeof(uint8_t) +
         offsetBaseK +
@@ -158,34 +165,44 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1Fp8(
 #pragma unroll
       for (int kk = 0; kk < 2; kk++) {
 #pragma unroll
-        for (int kkk = 0; kkk < 4; kkk++) {
-          // u32 NElts=2 -> 16 lane * 8 byte = 128 fp8 bytes / gather.
-          simd<uint32_t, 16 * 2> raw =
+        for (int kkk = 0; kkk < 2; kkk++) {     // 2 inner gathers per kk
+          // u32 NElts=4 -> 16 lane * 16 byte = 256 fp8 bytes / gather
+          simd<uint32_t, 16 * 4> raw =
             __ESIMD_ENS::lsc_gather<
             uint32_t,
-            2,
+            4,
             __ESIMD_ENS::lsc_data_size::u32,
             __ESIMD_ENS::cache_hint::cached,
             __ESIMD_ENS::cache_hint::cached,
             16,
             uint32_t
             >((uint32_t*)kState, simdOffsetsK, mask);
-          // 128 fp8 bytes -> 128 fp16 (= 256 byte = 64 u32) into kkCache.
-          // The fp16 kernel writes 64 u32 per gather to "256*kk + 64*kkk",
-          // and 128 fp16 dequant of 128 fp8 == 64 u32 == same slot size.
-          simd<uint8_t, 128> rawBytes = raw.template bit_cast_view<uint8_t>();
-          simd<fp16,    128> deq      = dequantFp8<V, 128>(rawBytes);
-          kkCache.template bit_cast_view<uint32_t>().template select<64, 1>(256 * kk + 64 * kkk) =
+          // 256 fp8 -> 256 fp16 (= 128 u32 = 512 byte) into kkCache.
+          simd<uint8_t, 256> rawBytes = raw.template bit_cast_view<uint8_t>();
+          simd<fp16,    256> deq      = dequantFp8<V, 256>(rawBytes);
+          kkCache.template bit_cast_view<uint32_t>().template select<128, 1>(256 * kk + 128 * kkk) =
             deq.template bit_cast_view<uint32_t>();
-          simdOffsetsK += 8 * sizeof(uint8_t);
+          simdOffsetsK += 16 * sizeof(uint8_t);
         }
 
-        simdOffsetsK += 3 * 32 * sizeof(uint8_t);
+        simdOffsetsK += 96 * sizeof(uint8_t);    // outer +96 fp8 = +96 byte
 
+        // ── Reshuffle (fp8 specific) ─────────────────────────────
+        //  After this kk's 2 fp8 gathers, kkCache_fp16[512*kk .. 512*kk+511]
+        //  holds 32 fp8 cols × 16 tokens, but in fp8-NElt order:
+        //    8 NElt-slices, each 64 fp16 = 16 token × 4 col.
+        //    slice s, lane (= token) i, col p → kkCache_fp16[512*kk + 64*s + 4*i + p]
+        //  For the MAC we need col-major: kkFp32[16*c + i] = K[col c, token i].
+        //  c = s*4 + p, so:
+        //    kkFp32[16*c + 0..15] = kkCache.select<16, 4>(512*kk + 64*s + p)
 #pragma unroll
-        for (int kkk = 0; kkk < 16; kkk++) {
-          kkFp32.select<16, 1>(32 * kkk + 16 * 0) = kkCache.select<16, 2>(512 * kk + 32 * kkk + 0);
-          kkFp32.select<16, 1>(32 * kkk + 16 * 1) = kkCache.select<16, 2>(512 * kk + 32 * kkk + 1);
+        for (int s = 0; s < 8; s++) {
+#pragma unroll
+          for (int p = 0; p < 4; p++) {
+            int c = s * 4 + p;
+            kkFp32.select<16, 1>(16 * c) =
+              kkCache.template select<16, 4>(512 * kk + 64 * s + p);
+          }
         }
 
 #pragma unroll
