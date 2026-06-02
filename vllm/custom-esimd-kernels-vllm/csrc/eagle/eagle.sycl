@@ -479,6 +479,7 @@ void page_attn_decode(
 // dequantFp8<E5M2 / E4M3FN, 256> path on real hardware in isolation.
 template <Fp8Variant V> class fp8DequantTestK;
 class fp8GatherTestK;
+class fp8Load2dTestK;
 
 template <Fp8Variant V>
 void fp8_dequant_test_kernel(
@@ -535,6 +536,60 @@ void fp8_gather_test_kernel(
   submit_kernel(kernel, device, "fp8_gather_test");
 }
 
+// Standalone lsc_load_2d<uint8_t,16,16,1> test: load a 16-wide x 16-tall
+// 1-byte block from the tensor `surface_in` at (x, y).  Surface is
+// width_in_bytes wide and height tall; pitch == width.
+void fp8_load2d_test_kernel(
+    uint8_t* base_in,
+    uint8_t* out256,
+    uint32_t width_bytes,
+    uint32_t height_rows,
+    uint32_t x_off,
+    uint32_t y_off,
+    const torch::Device& device) {
+  sycl::range<1> globalR(1);
+  sycl::range<1> localR(1);
+  sycl::nd_range<1> ndR(globalR, localR);
+  std::function<void(sycl::handler&)> kernel = [&](sycl::handler& cgh) {
+    cgh.parallel_for<fp8Load2dTestK>(
+        ndR, [=](sycl::nd_item<1> idx) SYCL_ESIMD_KERNEL {
+          simd<uint8_t, 256> blk =
+              __ESIMD_ENS::lsc_load_2d<
+              uint8_t,
+              16,    // width
+              16,    // height
+              1,
+              false,
+              false,
+              __ESIMD_ENS::cache_hint::cached,
+              __ESIMD_ENS::cache_hint::cached
+              >(base_in, width_bytes - 1, height_rows - 1, width_bytes - 1, x_off, y_off);
+          __ESIMD_NS::block_store<uint8_t, 256>(out256, blk);
+        });
+  };
+  submit_kernel(kernel, device, "fp8_load2d_test");
+}
+
+void fp8_load2d_test(
+    torch::Tensor base_in,
+    torch::Tensor& out256,
+    int64_t width_bytes,
+    int64_t height_rows,
+    int64_t x_off,
+    int64_t y_off
+) {
+  TORCH_CHECK(base_in.dtype() == torch::kUInt8);
+  TORCH_CHECK(out256.dtype() == torch::kUInt8 && out256.numel() == 256);
+  fp8_load2d_test_kernel(
+      (uint8_t*)base_in.data_ptr(),
+      (uint8_t*)out256.data_ptr(),
+      (uint32_t)width_bytes,
+      (uint32_t)height_rows,
+      (uint32_t)x_off,
+      (uint32_t)y_off,
+      base_in.device());
+}
+
 void fp8_gather_test(
     torch::Tensor base_in,    // [N] uint8
     torch::Tensor offsets_in, // [16] int32 byte offsets
@@ -577,6 +632,7 @@ TORCH_LIBRARY_FRAGMENT(eagle_ops, m) {
     m.def("page_attn_decode(Tensor query, Tensor kv_cache, Tensor block_table, Tensor seq_lens, Tensor! out, int max_query_len, int max_seq_len, float k_scale=1.0, float v_scale=1.0) -> ()");
     m.def("fp8_dequant_test(Tensor bytes_in, Tensor! out_fp16, int variant) -> ()");
     m.def("fp8_gather_test(Tensor base_in, Tensor offsets_in, Tensor! out128) -> ()");
+    m.def("fp8_load2d_test(Tensor base_in, Tensor! out256, int width_bytes, int height_rows, int x_off, int y_off) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(eagle_ops, XPU, m) {
@@ -584,6 +640,7 @@ TORCH_LIBRARY_IMPL(eagle_ops, XPU, m) {
     m.impl("page_attn_decode", &page_attn_decode);
     m.impl("fp8_dequant_test", &fp8_dequant_test);
     m.impl("fp8_gather_test", &fp8_gather_test);
+    m.impl("fp8_load2d_test", &fp8_load2d_test);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -591,4 +648,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("page_attn_decode", &page_attn_decode, "page_attn_decode");
     m.def("fp8_dequant_test", &fp8_dequant_test, "fp8_dequant_test");
     m.def("fp8_gather_test", &fp8_gather_test, "fp8_gather_test");
+    m.def("fp8_load2d_test", &fp8_load2d_test, "fp8_load2d_test");
 }
