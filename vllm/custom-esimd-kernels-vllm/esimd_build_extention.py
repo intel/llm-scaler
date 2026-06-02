@@ -810,6 +810,18 @@ class BuildExtension(build_ext):
                 sycl_cflags = [shlex.quote(f) for f in sycl_cflags]
                 # sycl_cflags += _wrap_sycl_host_flags(host_cflags)
                 sycl_dlink_post_cflags = list(_SYCL_DLINK_FLAGS)
+                # If extension targets spir64 only (JIT), strip AOT device flags from dlink
+                if any('fsycl-targets=spir64' in f and 'spir64_gen' not in f for f in sycl_post_cflags):
+                    sycl_dlink_post_cflags = [
+                        f for f in sycl_dlink_post_cflags
+                        if '-Xs' not in f
+                    ]
+                    # Replace targets to spir64 only
+                    sycl_dlink_post_cflags = [
+                        f.replace('-fsycl-targets=spir64_gen,spir64', '-fsycl-targets=spir64')
+                        if '-fsycl-targets' in f else f
+                        for f in sycl_dlink_post_cflags
+                    ]
                 # Propagate -doubleGRF from extension compile flags to dlink
                 if any('doubleGRF' in f for f in sycl_post_cflags):
                     sycl_dlink_post_cflags = [

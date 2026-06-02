@@ -238,3 +238,19 @@ at::Tensor esimd_moe_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor scale,
     at::Tensor output, at::Tensor expert_idx,
     int64_t N, int64_t K, int64_t num_experts, int64_t max_tokens_per_expert);
+
+// ======================== Prefill FMHA ========================
+// Flash Attention for prefill with paged KV cache, GQA, causal mask.
+// head_dim=256 (Qwen3.5 series). Replaces IPEX's flash_attn_varlen_func.
+at::Tensor esimd_prefill_fmha(
+    at::Tensor output,
+    at::Tensor query,
+    at::Tensor key_cache,
+    at::Tensor value_cache,
+    at::Tensor block_table,
+    at::Tensor cu_seqlens_q,
+    at::Tensor seqused_k,
+    int64_t max_seqlen_q,
+    int64_t max_seqlen_k,
+    double sm_scale,
+    bool is_causal);

@@ -1,0 +1,91 @@
+/* esimd_kernel_fmha.sycl — Compilation unit for prefill FMHA ESIMD kernel.
+ * Implements Flash Attention for prefill with paged KV cache, GQA, causal mask.
+ */
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/python.h>
+
+#include <cstdint>
+#include <sycl/sycl.hpp>
+
+#include "esimd_kernels/prefill_fmha.h"
+
+static inline sycl::queue& get_device_queue(const at::Tensor& tensor) {
+    return c10::xpu::getCurrentXPUStream(tensor.device().index()).queue();
+}
+
+// ---- Prefill FMHA: paged KV cache, GQA, causal mask ----
+// query:       [total_tokens, num_q_heads, 256] fp16
+// key_cache:   [num_blocks, block_size, num_kv_heads, 256] fp16
+// value_cache: [num_blocks, block_size, num_kv_heads, 256] fp16
+// output:      [total_tokens, num_q_heads, 256] fp16 (pre-allocated)
+// block_table: [batch, max_blocks_per_seq] int32
+// cu_seqlens_q: [batch + 1] int32
+// seqused_k:   [batch] int32
+at::Tensor esimd_prefill_fmha(
+    at::Tensor output,
+    at::Tensor query,
+    at::Tensor key_cache,
+    at::Tensor value_cache,
+    at::Tensor block_table,
+    at::Tensor cu_seqlens_q,
+    at::Tensor seqused_k,
+    int64_t max_seqlen_q,
+    int64_t max_seqlen_k,
+    double sm_scale,
+    bool is_causal) {
+
+    TORCH_CHECK(query.scalar_type() == at::ScalarType::Half,
+                "esimd_prefill_fmha: query must be fp16");
+    TORCH_CHECK(key_cache.scalar_type() == at::ScalarType::Half,
+                "esimd_prefill_fmha: key_cache must be fp16");
+    TORCH_CHECK(value_cache.scalar_type() == at::ScalarType::Half,
+                "esimd_prefill_fmha: value_cache must be fp16");
+    TORCH_CHECK(output.scalar_type() == at::ScalarType::Half,
+                "esimd_prefill_fmha: output must be fp16");
+    TORCH_CHECK(block_table.scalar_type() == at::ScalarType::Int,
+                "esimd_prefill_fmha: block_table must be int32");
+    TORCH_CHECK(cu_seqlens_q.scalar_type() == at::ScalarType::Int,
+                "esimd_prefill_fmha: cu_seqlens_q must be int32");
+    TORCH_CHECK(seqused_k.scalar_type() == at::ScalarType::Int,
+                "esimd_prefill_fmha: seqused_k must be int32");
+
+    TORCH_CHECK(query.is_contiguous(), "query must be contiguous");
+    TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
+    TORCH_CHECK(block_table.is_contiguous(), "block_table must be contiguous");
+    TORCH_CHECK(cu_seqlens_q.is_contiguous(), "cu_seqlens_q must be contiguous");
+    TORCH_CHECK(seqused_k.is_contiguous(), "seqused_k must be contiguous");
+
+    uint32_t num_q_heads = query.size(1);
+    uint32_t head_dim = query.size(2);
+    uint32_t num_kv_heads = key_cache.size(2);
+    uint32_t block_size = key_cache.size(1);
+    uint32_t max_blocks_per_seq = block_table.size(1);
+    uint32_t batch_size = cu_seqlens_q.size(0) - 1;
+
+    TORCH_CHECK(head_dim == 256,
+                "esimd_prefill_fmha: only head_dim=256 supported, got ", head_dim);
+
+    auto& dpcpp_queue = get_device_queue(query);
+
+    prefill_fmha_launch(
+        reinterpret_cast<fp16*>(query.data_ptr()),
+        reinterpret_cast<fp16*>(key_cache.data_ptr()),
+        reinterpret_cast<fp16*>(value_cache.data_ptr()),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        block_table.data_ptr<int32_t>(),
+        cu_seqlens_q.data_ptr<int32_t>(),
+        seqused_k.data_ptr<int32_t>(),
+        (uint32_t)max_seqlen_q,
+        (uint32_t)max_seqlen_k,
+        (float)sm_scale,
+        is_causal,
+        num_q_heads,
+        num_kv_heads,
+        block_size,
+        max_blocks_per_seq,
+        batch_size,
+        dpcpp_queue);
+
+    return output;
+}
