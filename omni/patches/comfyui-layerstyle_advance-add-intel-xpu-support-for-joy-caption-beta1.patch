@@ -1,0 +1,43 @@
+From c1537baaae77fd59c5efb26341872cb721ccef37 Mon Sep 17 00:00:00 2001
+From: Haoming Zhang <haomingzh@126.com>
+Date: Wed, 3 Jun 2026 22:01:42 +0800
+Subject: [PATCH] add intel xpu support for joy caption beta1
+
+---
+ py/joycaption_beta_1.py | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/py/joycaption_beta_1.py b/py/joycaption_beta_1.py
+index 47443dc..8d5ab14 100644
+--- a/py/joycaption_beta_1.py
++++ b/py/joycaption_beta_1.py
+@@ -92,7 +92,7 @@ class JoyCaptionPredictor:
+     def __init__(self, model: str, quantization_mode: str, device:str):
+         checkpoint_path = download_hg_model(model, "LLavacheckpoints")
+         self.device = device
+-        self.processor = AutoProcessor.from_pretrained(checkpoint_path)
++        self.processor = AutoProcessor.from_pretrained(checkpoint_path, use_fast=False)
+ 
+         if quantization_mode == "bf16":
+             self.model = LlavaForConditionalGeneration.from_pretrained(
+@@ -136,7 +136,7 @@ class JoyCaptionPredictor:
+         assert isinstance(convo_string, str)
+ 
+         # Process the inputs
+-        inputs = self.processor(text=[convo_string], images=[image], return_tensors="pt").to('cuda')
++        inputs = self.processor(text=[convo_string], images=[image], return_tensors="pt").to(self.device)
+         inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
+ 
+         # Generate the captions
+@@ -315,7 +315,7 @@ class LS_LoadJoyCaptionB1Model:
+     def INPUT_TYPES(self):
+         model_list = ["fancyfeast/llama-joycaption-beta-one-hf-llava"]
+         quantization_mode_list = list(QUANTIZATION_CONFIGS.keys())
+-        device_list = ["cuda", "cpu"]
++        device_list = ["cuda", "cpu", "xpu"]
+         return {
+             "required": {
+                 "model": (model_list,),
+-- 
+2.43.0
+
