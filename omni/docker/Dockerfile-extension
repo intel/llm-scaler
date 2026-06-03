@@ -15,6 +15,7 @@ ARG PYTHON_VERSION
 ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python${PYTHON_VERSION}/dist-packages/torch/lib:${LD_LIBRARY_PATH}"
 
 COPY ./patches/extention_comfyui_wanvideowrapper.patch /tmp/
+COPY ./patches/extention_comfyui_florence2.patch /tmp/
 
 # Add custom node
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -27,6 +28,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git apply /tmp/extention_comfyui_wanvideowrapper.patch && \
     pip install -r requirements.txt && \
     rm -f /tmp/extention_comfyui_wanvideowrapper.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf comfyui-florence2 && \
+    git clone --depth 1 https://github.com/kijai/ComfyUI-Florence2.git comfyui-florence2 && \
+    cd comfyui-florence2 && \
+    git fetch --depth 1 origin 9ece3de914214c5f581d725167bc9d0eeb0d1120 && \
+    git checkout 9ece3de914214c5f581d725167bc9d0eeb0d1120 && \
+    git apply /tmp/extention_comfyui_florence2.patch && \
+    pip install -r requirements.txt && \
+    rm -f /tmp/extention_comfyui_florence2.patch
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/ComfyUI/custom_nodes && \
