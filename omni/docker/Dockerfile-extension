@@ -28,4 +28,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt && \
     rm -f /tmp/extention_comfyui_wanvideowrapper.patch
 
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf comfyui_layerstyle && \
+    git clone --depth 1 https://github.com/chflame163/ComfyUI_LayerStyle.git comfyui_layerstyle && \
+    cd comfyui_layerstyle && \
+    git fetch --depth 1 origin d94bef1ee5ed3656f5ff1bb2830a4ffd94f40935 && \
+    git checkout d94bef1ee5ed3656f5ff1bb2830a4ffd94f40935 && \
+    pip install -r requirements.txt
+
 WORKDIR /llm/entrypoints
