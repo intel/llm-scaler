@@ -122,8 +122,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r comfyui_controlnet_aux/requirements.txt && \
     git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git && \
     cd ComfyUI-KJNodes && \
-    git fetch --depth 1 origin c6ce76d00bb8177d1b0286cad891df08eff5226e && \
-    git checkout c6ce76d00bb8177d1b0286cad891df08eff5226e && \
+    git fetch --depth 1 origin a41e0d85b822ddc4bbd1256417aa2d58d39e94ce && \
+    git checkout a41e0d85b822ddc4bbd1256417aa2d58d39e94ce && \
     pip install -r requirements.txt && \
     cd /llm/ComfyUI/custom_nodes && \
     git clone --depth 1 https://github.com/Jasonzzt/ComfyUI-CacheDiT.git && \
