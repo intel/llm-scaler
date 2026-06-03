@@ -141,8 +141,25 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1Fp8(
   // qqFp16 layout in this thread: [qn=0..3 q-heads of this hh, qk=0..1 col-half of 64].
   // Each [qn, qk] is 64 fp16 = a contiguous 64-col stripe of one q-head row.
   // For dpas we want A = Q[M=4 qheads × K=16 cols]:
-  //   qqA_dpas[chunk, kk, k_dpas][m * 16 + k] = qqFp16[m * 128 + (kk * 32 + k_dpas * 16 + k)]
-  // => simply select<16,1> at the right offset per dpas K-step.
+  //   qqA_dpas[chunk, kk, k_dpas][m * 16 + k] = qqFp16[m * 64 + (kk * 32 + k_dpas * 16 + k)]
+  //
+  // Q is loop-invariant across the chunk loop, so pre-build the 4 padded
+  // dpas-A tiles up front (one per (kk, k_dpas) ∈ [0,2)×[0,2)).
+  // Each aPad: 8*16 fp16 = 128 fp16 = 8 GRF.  Total 32 GRF for 4 tiles.
+  simd<fp16, 8 * 16> aPadAll[2][2];
+#pragma unroll
+  for (int kk = 0; kk < 2; kk++) {
+#pragma unroll
+    for (int k_dpas = 0; k_dpas < 2; k_dpas++) {
+      simd<fp16, 8 * 16> aPad = 0;
+#pragma unroll
+      for (int qn = 0; qn < 4; qn++) {
+        aPad.template select<16, 1>(qn * 16) =
+          qqFp16.template select<16, 1>(qn * 64 + kk * 32 + k_dpas * 16);
+      }
+      aPadAll[kk][k_dpas] = aPad;
+    }
+  }
 
 #pragma unroll
   for (int loopIdx = 0; loopIdx < loopCount; loopIdx++) {
@@ -273,27 +290,16 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1Fp8(
             dst.template bit_cast_view<uint32_t>() = packed;
           }
 
-          // A: Q[M=4 qheads × K=16 cols] row-major.
-          //   qqFp16[qn * 64 + (kk * 32 + k_dpas * 16 + k)]
-          //   → aTile[qn * 16 + k]
-          simd<fp16, 4 * 16> aTile;
-#pragma unroll
-          for (int qn = 0; qn < 4; qn++) {
-            aTile.template select<16, 1>(qn * 16) =
-              qqFp16.template select<16, 1>(qn * 64 + kk * 32 + k_dpas * 16);
-          }
-
-          // RepeatCount=4 + fp16 is broken on BMG (NaN), so use M=8 with
-          // last 4 rows of A padded to zero.  ppFp32 itself is sized 8*16 to
-          // serve as C in-place — the last 4 rows accumulate 0×B = 0 and are
+          // A is pre-built outside the chunk loop (loop-invariant in Q).
+          // RepeatCount=4 + fp16 is broken on BMG (NaN); we use RepeatCount=8
+          // with last 4 rows of A padded to zero.  ppFp32 itself is sized 8*16
+          // to serve as C in-place — last 4 rows accumulate 0×B = 0 and are
           // never read downstream (SLM store reads only the first 64 floats).
-          simd<fp16, 8 * 16> aPad = 0;
-          aPad.template select<64, 1>(0) = aTile;
           ppFp32 = sycl::ext::intel::esimd::xmx::dpas<
             8, 8, float, float, fp16, fp16,
             sycl::ext::intel::esimd::xmx::dpas_argument_type::fp16,
             sycl::ext::intel::esimd::xmx::dpas_argument_type::fp16>(
-              ppFp32, bVnni, aPad);
+              ppFp32, bVnni, aPadAll[kk][k_dpas]);
         }
       }
 
@@ -442,8 +448,7 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2Fp8(
 
   simd<float, 4 * 32> ppFp32;
   simd<float, 4> historicMax;
-  simd<fp16, 32 * 16> vvCache;             // dequanted, same layout as fp16 kernel
-  simd<float, 16 * 16> vvFp32;
+  // (vvCache/vvFp32 removed: dequant is now fused into the vk loop.)
   simd<float, 4 * 16> softmaxSum;
   // Sized 8*16: first 4 rows (= 64 fp32) are real q-head outputs; last 4 rows
   // are dpas padding (always zero, never read downstream).
@@ -536,8 +541,6 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2Fp8(
         __ESIMD_ENS::cache_hint::cached,
         __ESIMD_ENS::cache_hint::cached
         >(currPtrV, widthV, heightV, widthV, vX, vY);
-      vvCache.select<256, 1>(0 * 256) = dequantFp8<V, 256>(vRawAll.select<256, 1>(0));
-      vvCache.select<256, 1>(1 * 256) = dequantFp8<V, 256>(vRawAll.select<256, 1>(256));
 
       compensationP = currMax - globalMax;
       compensationP = exp(compensationP);
@@ -559,25 +562,25 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2Fp8(
       // outputFp32[oc, 0..15] += sum_pk V[pk, 0..15] * P[oc, 16*vk+pk]
       //
       // dpas:  C[M=qhead=4, N=vcol=16] += A[M=qhead, K=key=16] × B_vnni[K, N]
-      // V is stored row-major in vvCache:
-      //   vvCache_fp16[256*vk + r*16 + c] = V[token=16*vk+r, vcol=c]
+      // V (raw u8) is row-major: vRawAll[256*vk + r*16 + c] = V[16*vk+r, c]
       // VNNI form pairs adjacent K rows:
       //   B_vnni[kp*32 + 2*c + 0] = V[2*kp,   c]  (16 c lanes)
       //   B_vnni[kp*32 + 2*c + 1] = V[2*kp+1, c]
-      // A:
-      //   aTile[oc, k] = P[oc, 16*vk+k]    (M=4, K=16)
-      // RepeatCount=4 + fp16 is broken on BMG (NaN), so pad M to 8.
+      //
+      // dequant is fused into the vk loop: we dequant only the half we need
+      // for this dpas, into a 256-wide scratch.  This shrinks the live fp16
+      // V footprint from 1 KB (whole vvCache) to 512 B (one half).
 #pragma unroll
       for (int vk = 0; vk < 2; vk++) {
-        // VNNI-pack directly from vvCache (skip vTile intermediate).
-        // vvCache_fp16[256*vk + r*16 + c] = V[token=16*vk+r, vcol=c]
+        simd<fp16, 256> vHalf = dequantFp8<V, 256>(vRawAll.template select<256, 1>(256 * vk));
+
         simd<fp16, 16 * 16> bVnni;
         auto bVnniU16 = bVnni.template bit_cast_view<uint16_t>();
-        auto vvU16 = vvCache.template bit_cast_view<uint16_t>();
+        auto vHalfU16 = vHalf.template bit_cast_view<uint16_t>();
 #pragma unroll
         for (int kp = 0; kp < 8; kp++) {
-          simd<uint16_t, 16> lo = vvU16.template select<16, 1>(256 * vk + (2 * kp + 0) * 16);
-          simd<uint16_t, 16> hi = vvU16.template select<16, 1>(256 * vk + (2 * kp + 1) * 16);
+          simd<uint16_t, 16> lo = vHalfU16.template select<16, 1>((2 * kp + 0) * 16);
+          simd<uint16_t, 16> hi = vHalfU16.template select<16, 1>((2 * kp + 1) * 16);
           simd<uint32_t, 16> packed = simd<uint32_t, 16>(lo) | (simd<uint32_t, 16>(hi) << 16);
           auto dst = bVnniU16.template select<32, 1>(kp * 32);
           dst.template bit_cast_view<uint32_t>() = packed;
@@ -585,18 +588,14 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2Fp8(
 
         // A: P slice [qhead=4, key=16] from ppFp32 (currently fp32, 4×32 layout
         // with 32-stride per qhead; we want first/second 16 of each).
-        simd<fp16, 4 * 16> aTile;
+        // Pad A to RepeatCount=8.  outputFp32 already sized 8*16 → use it
+        // directly as C accumulator; padding rows stay zero.
+        simd<fp16, 8 * 16> aPad = 0;
 #pragma unroll
         for (int oc = 0; oc < 4; oc++) {
-          // ppFp32[32*oc + 16*vk + k]  k ∈ [0,16)
-          simd<float, 16> aRow = ppFp32.template select<16, 1>(32 * oc + 16 * vk);
-          aTile.template select<16, 1>(oc * 16) = aRow;     // fp32 → fp16
+          aPad.template select<16, 1>(oc * 16) =
+            ppFp32.template select<16, 1>(32 * oc + 16 * vk);
         }
-
-        // Pad A to RepeatCount=8.  outputFp32 is already sized 8*16 → use
-        // it directly as C accumulator; padding rows stay zero.
-        simd<fp16, 8 * 16> aPad = 0;
-        aPad.template select<64, 1>(0) = aTile;
         outputFp32 = sycl::ext::intel::esimd::xmx::dpas<
           8, 8, float, float, fp16, fp16,
           sycl::ext::intel::esimd::xmx::dpas_argument_type::fp16,

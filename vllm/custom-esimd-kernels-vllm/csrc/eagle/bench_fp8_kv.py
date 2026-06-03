@@ -36,7 +36,7 @@ def bench(seq_len, fp8, iters=500, rounds=5, warmup=50):
     return best
 
 print(f'{"seq_len":>8} {"fp16(us)":>10} {"fp8(us)":>10} {"fp8/fp16":>10}')
-for sl in [128, 256, 512, 741, 1024, 2048, 4096, 8192]:
+for sl in [128, 256, 512, 741, 1024, 2048, 4096, 8192, 12288, 16384, 24576, 32768, 65536, 131072, 262144]:
     t16 = bench(sl, False)
     t8  = bench(sl, True)
     print(f'{sl:>8} {t16:>10.3f} {t8:>10.3f} {t8/t16:>9.1%}', flush=True)
