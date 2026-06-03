@@ -103,7 +103,10 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1Fp8(
 
   simd<uint32_t, 16> baseOffsetInc16AsSimd(baseOffsetInc16);
   simd<fp16, 64 * 4> qqFp16;              // raw Q in HBM layout
-  simd<float, 16 * 4> ppFp32;
+  // ppFp32 is the dpas C accumulator (M=8 row, N=16 col).  We only use the
+  // first 4 rows (= 4 q-heads); the other 4 stay zero throughout.  Sized M=8
+  // because RepeatCount=4 + fp16 dpas is broken on BMG.
+  simd<float, 16 * 8> ppFp32;
   simd<fp16, 16 * 64> kkCache;            // dequanted layout, identical to fp16 kernel
   simd<float, 1> ppMax;
 
@@ -230,33 +233,42 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1Fp8(
         // then VNNI-pack it.  Layout intermediate kSubFp16[c*16 + i] = K[c, i]:
 #pragma unroll
         for (int k_dpas = 0; k_dpas < 2; k_dpas++) {
-          simd<fp16, 16 * 16> kSubColMajor;       // [col=16, token=16]
-#pragma unroll
-          for (int c = 0; c < 16; c++) {
-            int abs_c = k_dpas * 16 + c;          // col within this 32-seg
-            int s = abs_c >> 2;
-            int p = abs_c & 0x3;
-            simd<fp16, 16> col =
-              kkCache.template select<16, 4>(512 * kk + 64 * s + p);
-            // OOB tokens may carry NaN/Inf from undefined gather lanes;
-            // dpas K-accumulation would propagate it across all N=token
-            // lanes.  Zero them out so the dpas adds 0.
-            col.merge(fp16(0.0f), maskNeg);
-            kSubColMajor.template select<16, 1>(16 * c) = col;
-          }
-
-          // VNNI pack: B_vnni[kp*32 + 2*n + r] = kSub[(2*kp + r)*16 + n]
-          // Write via uint32 view to keep DW-aligned writes (avoid potential
-          // odd-fp16-index sub-DW write hazards).
+          // Direct fused extract+VNNI-pack from kkCache into bVnni.
+          // Saves the kSubColMajor intermediate (256 fp16 GRF temp).
+          //
+          //  K[token=i, col=c]  lives at  kkCache_fp16[512*kk + 64*(c/4)*1 + 4*i + (c&3)]
+          //  i.e. token i is at lane stride 4 within each (s,p) group.
+          //  → kkCache.select<16, 4>(512*kk + 64*s + p)  yields the 16 tokens
+          //    of one column.
+          //
+          //  bVnni layout:
+          //    bVnni_u16[kp*32 + 2*n + 0] = K[col=2*kp+0, token=n]   (lo)
+          //    bVnni_u16[kp*32 + 2*n + 1] = K[col=2*kp+1, token=n]   (hi)
+          //  We compute lo/hi as 16-wide fp16 cols, mask OOB tokens to 0,
+          //  pack via uint32 (lo | hi<<16) for DW-aligned writes.
           simd<fp16, 16 * 16> bVnni;
           auto bVnniU16 = bVnni.template bit_cast_view<uint16_t>();
 #pragma unroll
           for (int kp = 0; kp < 8; kp++) {
-            simd<uint16_t, 16> lo =
-              kSubColMajor.template select<16, 1>(2 * kp * 16).template bit_cast_view<uint16_t>();
-            simd<uint16_t, 16> hi =
-              kSubColMajor.template select<16, 1>((2 * kp + 1) * 16).template bit_cast_view<uint16_t>();
-            simd<uint32_t, 16> packed = simd<uint32_t, 16>(lo) | (simd<uint32_t, 16>(hi) << 16);
+            int c_lo = k_dpas * 16 + 2 * kp;
+            int s_lo = c_lo >> 2;
+            int p_lo = c_lo & 0x3;
+            int c_hi = c_lo + 1;
+            int s_hi = c_hi >> 2;
+            int p_hi = c_hi & 0x3;
+
+            simd<fp16, 16> lo =
+              kkCache.template select<16, 4>(512 * kk + 64 * s_lo + p_lo);
+            simd<fp16, 16> hi =
+              kkCache.template select<16, 4>(512 * kk + 64 * s_hi + p_hi);
+            // OOB tokens carry undefined bytes → zero out so dpas adds 0.
+            lo.merge(fp16(0.0f), maskNeg);
+            hi.merge(fp16(0.0f), maskNeg);
+
+            simd<uint16_t, 16> loU = lo.template bit_cast_view<uint16_t>();
+            simd<uint16_t, 16> hiU = hi.template bit_cast_view<uint16_t>();
+            simd<uint32_t, 16> packed =
+              simd<uint32_t, 16>(loU) | (simd<uint32_t, 16>(hiU) << 16);
             auto dst = bVnniU16.template select<32, 1>(kp * 32);
             dst.template bit_cast_view<uint32_t>() = packed;
           }
@@ -271,19 +283,17 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1Fp8(
               qqFp16.template select<16, 1>(qn * 64 + kk * 32 + k_dpas * 16);
           }
 
-          // RepeatCount=8 (M=8) is the safest config on BMG.  We have only 4
-          // q-heads → pad A to 8 rows (last 4 rows = 0), keep first 4 rows of
-          // the resulting C, drop the rest.
+          // RepeatCount=4 + fp16 is broken on BMG (NaN), so use M=8 with
+          // last 4 rows of A padded to zero.  ppFp32 itself is sized 8*16 to
+          // serve as C in-place — the last 4 rows accumulate 0×B = 0 and are
+          // never read downstream (SLM store reads only the first 64 floats).
           simd<fp16, 8 * 16> aPad = 0;
           aPad.template select<64, 1>(0) = aTile;
-          simd<float, 8 * 16> cPad = 0;
-          cPad.template select<64, 1>(0) = ppFp32;
-          cPad = sycl::ext::intel::esimd::xmx::dpas<
+          ppFp32 = sycl::ext::intel::esimd::xmx::dpas<
             8, 8, float, float, fp16, fp16,
             sycl::ext::intel::esimd::xmx::dpas_argument_type::fp16,
             sycl::ext::intel::esimd::xmx::dpas_argument_type::fp16>(
-              cPad, bVnni, aPad);
-          ppFp32 = cPad.template select<64, 1>(0);
+              ppFp32, bVnni, aPad);
         }
       }
 
@@ -435,7 +445,9 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2Fp8(
   simd<fp16, 32 * 16> vvCache;             // dequanted, same layout as fp16 kernel
   simd<float, 16 * 16> vvFp32;
   simd<float, 4 * 16> softmaxSum;
-  simd<float, 4 * 16> outputFp32;
+  // Sized 8*16: first 4 rows (= 64 fp32) are real q-head outputs; last 4 rows
+  // are dpas padding (always zero, never read downstream).
+  simd<float, 8 * 16> outputFp32;
   simd<float, 32> vvScale;
 
   if (groupIdx >= kvSeqOutGroup) {
@@ -557,15 +569,15 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2Fp8(
       // RepeatCount=4 + fp16 is broken on BMG (NaN), so pad M to 8.
 #pragma unroll
       for (int vk = 0; vk < 2; vk++) {
-        // B VNNI pack from row-major V tile.
-        simd<fp16, 16 * 16> vTile = vvCache.template select<256, 1>(256 * vk);
+        // VNNI-pack directly from vvCache (skip vTile intermediate).
+        // vvCache_fp16[256*vk + r*16 + c] = V[token=16*vk+r, vcol=c]
         simd<fp16, 16 * 16> bVnni;
         auto bVnniU16 = bVnni.template bit_cast_view<uint16_t>();
-        auto vTileU16 = vTile.template bit_cast_view<uint16_t>();
+        auto vvU16 = vvCache.template bit_cast_view<uint16_t>();
 #pragma unroll
         for (int kp = 0; kp < 8; kp++) {
-          simd<uint16_t, 16> lo = vTileU16.template select<16, 1>(2 * kp * 16);
-          simd<uint16_t, 16> hi = vTileU16.template select<16, 1>((2 * kp + 1) * 16);
+          simd<uint16_t, 16> lo = vvU16.template select<16, 1>(256 * vk + (2 * kp + 0) * 16);
+          simd<uint16_t, 16> hi = vvU16.template select<16, 1>(256 * vk + (2 * kp + 1) * 16);
           simd<uint32_t, 16> packed = simd<uint32_t, 16>(lo) | (simd<uint32_t, 16>(hi) << 16);
           auto dst = bVnniU16.template select<32, 1>(kp * 32);
           dst.template bit_cast_view<uint32_t>() = packed;
@@ -581,17 +593,15 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2Fp8(
           aTile.template select<16, 1>(oc * 16) = aRow;     // fp32 → fp16
         }
 
-        // Pad to RepeatCount=8 (BMG dpas + fp16 + RepeatCount=4 produces NaN).
+        // Pad A to RepeatCount=8.  outputFp32 is already sized 8*16 → use
+        // it directly as C accumulator; padding rows stay zero.
         simd<fp16, 8 * 16> aPad = 0;
         aPad.template select<64, 1>(0) = aTile;
-        simd<float, 8 * 16> cPad = 0;
-        cPad.template select<64, 1>(0) = outputFp32;
-        cPad = sycl::ext::intel::esimd::xmx::dpas<
+        outputFp32 = sycl::ext::intel::esimd::xmx::dpas<
           8, 8, float, float, fp16, fp16,
           sycl::ext::intel::esimd::xmx::dpas_argument_type::fp16,
           sycl::ext::intel::esimd::xmx::dpas_argument_type::fp16>(
-            cPad, bVnni, aPad);
-        outputFp32 = cPad.template select<64, 1>(0);
+            outputFp32, bVnni, aPad);
       }
 
       offsetP += 64;
