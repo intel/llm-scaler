@@ -16,6 +16,7 @@ ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python${PYTHON_VERSION}/dist-
 
 COPY ./patches/extention_comfyui_wanvideowrapper.patch /tmp/
 COPY ./patches/extention_comfyui_florence2.patch /tmp/
+COPY ./patches/extension_comfyui_segment_anything_2.patch /tmp/
 
 # Add custom node
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -48,5 +49,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git fetch --depth 1 origin d94bef1ee5ed3656f5ff1bb2830a4ffd94f40935 && \
     git checkout d94bef1ee5ed3656f5ff1bb2830a4ffd94f40935 && \
     pip install -r requirements.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf comfyui-segment-anything-2 && \
+    git clone --depth 1 https://github.com/kijai/ComfyUI-segment-anything-2.git comfyui-segment-anything-2 && \
+    cd comfyui-segment-anything-2 && \
+    git fetch --depth 1 origin 0c35fff5f382803e2310103357b5e985f5437f32 && \
+    git checkout 0c35fff5f382803e2310103357b5e985f5437f32 && \
+    git apply /tmp/extension_comfyui_segment_anything_2.patch && \
+    rm -f /tmp/extension_comfyui_segment_anything_2.patch
 
 WORKDIR /llm/entrypoints
