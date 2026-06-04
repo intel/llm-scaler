@@ -15,6 +15,7 @@ ARG PYTHON_VERSION
 ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python${PYTHON_VERSION}/dist-packages/torch/lib:${LD_LIBRARY_PATH}"
 
 COPY ./patches/extention_comfyui_wanvideowrapper.patch /tmp/
+COPY ./patches/comfyui-layerstyle_advance-add-intel-xpu-support-for-joy-caption-beta1.patch /tmp/
 
 # Add custom node
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -26,6 +27,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git checkout e091c4a77425d6a4a7f90ab30c513d24f8cb91cf && \
     git apply /tmp/extention_comfyui_wanvideowrapper.patch && \
     pip install -r requirements.txt && \
-    rm -f /tmp/extention_comfyui_wanvideowrapper.patch
+    rm -f /tmp/extention_comfyui_wanvideowrapper.patch && \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf ComfyUI_LayerStyle_Advance && \
+    git clone --depth 1 https://github.com/chflame163/ComfyUI_LayerStyle_Advance.git && \
+    cd ComfyUI_LayerStyle_Advance && \
+    git fetch --depth 1 orgin 7b678b401a38307a4a7e99ef6630bd48f9cecedb && \
+    git checkout 7b678b401a38307a4a7e99ef6630bd48f9cecedb && \
+    git apply /tmp/comfyui-layerstyle_advance-add-intel-xpu-support-for-joy-caption-beta1.patch && \
+    pip install segment_anything wget blend_modes && \
+    pip install -r requirements.txt && \
+    rm -rf /tmp/comfyui-layerstyle_advance-add-intel-xpu-support-for-joy-caption-beta1.patch
 
 WORKDIR /llm/entrypoints
