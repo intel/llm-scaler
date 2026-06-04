@@ -40,6 +40,7 @@ static inline uint32_t getHighestBit(uint32_t in) {
 #include "eagle.kernels.fp16.h"
 #include "eagle.kernels.bf16.h"
 #include "page.attn.h"
+#include "page.attn.fp8.h"
 
 // ── Kernel 1: MTP causal conv1d update kernel ───────────────────────────────
 void conv1d_forward_kernel(
@@ -190,6 +191,9 @@ void page_attention_forward_kernel(
   uint32_t maxStride,
   uint32_t maxKvSeqLen,
   uint32_t gqaRatio,
+  torch::ScalarType kvDtype,
+  float k_scale,
+  float v_scale,
   const torch::Device& device) {
   uint32_t groupH, groupV, groupD;
   uint32_t flag = maxKvSeqLen > 1024 ? 0 : 1;
@@ -221,22 +225,64 @@ void page_attention_forward_kernel(
   std::function<void(sycl::handler&)> kernelPhase2;
   std::function<void(sycl::handler&)> kernelPhase3;
 
-  kernelPhase1 = [&](sycl::handler& cgh) {
-    cgh.parallel_for<class paPhase1Forward>(
-      rangePaPhase1, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
-        sdpaDecodeGqa4Phase1(qState, kvCache, (uint8_t*)pState, pGroupMax, pGlobalMax, pPollP, pageTable, kvSeqLens,
-          batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, gqaRatio, idx);
-      });
-    };
+  switch (kvDtype) {
+    case torch::kHalf: {
+      // FP16 KV path: untouched from original implementation.
+      kernelPhase1 = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class paPhase1Forward>(
+          rangePaPhase1, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
+            sdpaDecodeGqa4Phase1(qState, kvCache, (uint8_t*)pState, pGroupMax, pGlobalMax, pPollP, pageTable, kvSeqLens,
+              batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, gqaRatio, idx);
+          });
+        };
+      kernelPhase2 = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class paPhase2Forward>(
+          rangePaPhase2, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
+            sdpaDecodeGqa4Phase2((uint8_t*)pState, pGroupMax, kvCache, pGlobalMax, pTempOut, pGlobalSoftmaxSum, out, pageTable, kvSeqLens,
+              batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, maxKvSeqLen, flag, gqaRatio, idx);
+          });
+        };
+      break;
+    }
+    case at::kFloat8_e4m3fn: {
+      kernelPhase1 = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class paPhase1Fp8E4m3Forward>(
+          rangePaPhase1, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
+            sdpaDecodeGqa4Phase1Fp8<Fp8Variant::E4M3FN>(qState, kvCache, (uint8_t*)pState, pGroupMax, pGlobalMax, pPollP, pageTable, kvSeqLens,
+              batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, gqaRatio, k_scale, idx);
+          });
+        };
+      kernelPhase2 = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class paPhase2Fp8E4m3Forward>(
+          rangePaPhase2, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
+            sdpaDecodeGqa4Phase2Fp8<Fp8Variant::E4M3FN>((uint8_t*)pState, pGroupMax, kvCache, pGlobalMax, pTempOut, pGlobalSoftmaxSum, out, pageTable, kvSeqLens,
+              batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, maxKvSeqLen, flag, gqaRatio, v_scale, idx);
+          });
+        };
+      break;
+    }
+    case at::kFloat8_e5m2: {
+      kernelPhase1 = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class paPhase1Fp8E5m2Forward>(
+          rangePaPhase1, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
+            sdpaDecodeGqa4Phase1Fp8<Fp8Variant::E5M2>(qState, kvCache, (uint8_t*)pState, pGroupMax, pGlobalMax, pPollP, pageTable, kvSeqLens,
+              batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, gqaRatio, k_scale, idx);
+          });
+        };
+      kernelPhase2 = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class paPhase2Fp8E5m2Forward>(
+          rangePaPhase2, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
+            sdpaDecodeGqa4Phase2Fp8<Fp8Variant::E5M2>((uint8_t*)pState, pGroupMax, kvCache, pGlobalMax, pTempOut, pGlobalSoftmaxSum, out, pageTable, kvSeqLens,
+              batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, maxKvSeqLen, flag, gqaRatio, v_scale, idx);
+          });
+        };
+      break;
+    }
+    default:
+      TORCH_CHECK(false, "page_attn_decode: unsupported kv-cache dtype ", kvDtype);
+  }
 
-  kernelPhase2 = [&](sycl::handler& cgh) {
-    cgh.parallel_for<class paPhase2Forward>(
-      rangePaPhase2, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
-        sdpaDecodeGqa4Phase2((uint8_t*)pState, pGroupMax, kvCache, pGlobalMax, pTempOut, pGlobalSoftmaxSum, out, pageTable, kvSeqLens,
-          batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, maxKvSeqLen, flag, gqaRatio, idx);
-      });
-    };
-
+  // Phase3 is dtype-agnostic (operates on float scratch produced by phase2).
   kernelPhase3 = [&](sycl::handler& cgh) {
     cgh.parallel_for<class paPhase3Forward>(
       rangePaPhase3, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
@@ -331,14 +377,21 @@ void page_attn_decode(
   torch::Tensor seq_lens,
   torch::Tensor& out,
   int64_t max_query_len,
-  int64_t max_seq_len
+  int64_t max_seq_len,
+  double k_scale,
+  double v_scale
 ) {
   TORCH_CHECK(block_table.dim() == 2);
   TORCH_CHECK(seq_lens.dim() == 1);
   TORCH_CHECK(kv_cache.dim() == 5);
   TORCH_CHECK(query.dim() == 3, "query must be [batches, num_q_heads, head_dim]");
   TORCH_CHECK(query.scalar_type() == torch::kHalf);
-  TORCH_CHECK(kv_cache.scalar_type() == torch::kHalf);
+  TORCH_CHECK(
+    kv_cache.scalar_type() == torch::kHalf
+    || kv_cache.scalar_type() == at::kFloat8_e4m3fn
+    || kv_cache.scalar_type() == at::kFloat8_e5m2,
+    "kv_cache dtype must be float16 / float8_e4m3fn / float8_e5m2, got ",
+    kv_cache.scalar_type());
   TORCH_CHECK(out.scalar_type() == torch::kHalf);
 
   uint32_t kvCacheStride0 = kv_cache.stride(0);
@@ -413,13 +466,16 @@ void page_attn_decode(
     hiddenDimPMax,
     maxSeqLen,
     gqaRatio,
+    kv_cache.scalar_type(),
+    static_cast<float>(k_scale),
+    static_cast<float>(v_scale),
     kv_cache.device()
   );
 }
 
 TORCH_LIBRARY_FRAGMENT(eagle_ops, m) {
     m.def("gdn_eagle(Tensor! qkvz, Tensor! z_out, Tensor conv_w, Tensor? conv_b, Tensor! conv_state, Tensor accepted_tokens, Tensor ba, Tensor a_log, Tensor dt_bias, Tensor! state_in, Tensor ssm_state_idx, Tensor norm_w, int max_query_len) -> Tensor");
-    m.def("page_attn_decode(Tensor query, Tensor kv_cache, Tensor block_table, Tensor seq_lens, Tensor! out, int max_query_len, int max_seq_len) -> ()");
+    m.def("page_attn_decode(Tensor query, Tensor kv_cache, Tensor block_table, Tensor seq_lens, Tensor! out, int max_query_len, int max_seq_len, float k_scale=1.0, float v_scale=1.0) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(eagle_ops, XPU, m) {
