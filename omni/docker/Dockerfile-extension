@@ -16,6 +16,7 @@ ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python${PYTHON_VERSION}/dist-
 
 COPY ./patches/extention_comfyui_wanvideowrapper.patch /tmp/
 COPY ./patches/comfyui-layerstyle_advance-add-intel-xpu-support-for-joy-caption-beta1.patch /tmp/
+COPY ./patches/art-venture-resize-mask-to-match-image-spatial-size.patch /tmp
 
 # Add custom node
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -47,6 +48,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt && \
     pip install --ignore-installed cryptography && \
     pip install pyOpenSSL && \
-    pip install setuptools==70.2.0
+    pip install setuptools==70.2.0 && \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf comfyui-art-venture && \
+    git clone --depth 1 https://github.com/sipherxyz/comfyui-art-venture && \
+    cd comfyui-art-venture && \
+    git fetch --depth 1 origin 210dc072b1f103f91be18a33bdeb13ab315aaae5 && \
+    git checkout 210dc072b1f103f91be18a33bdeb13ab315aaae5 && \
+    git apply /tmp/art-venture-resize-mask-to-match-image-spatial-size.patch && \
+    pip install -r requirements.txt && \
+    rm -rf /tmp/art-venture-resize-mask-to-match-image-spatial-size.patch
 
 WORKDIR /llm/entrypoints

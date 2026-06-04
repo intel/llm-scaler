@@ -1,0 +1,27 @@
+From 7792e2d2602c19b886f44769586eea88c056679a Mon Sep 17 00:00:00 2001
+From: Haoming Zhang <haomingzh@126.com>
+Date: Thu, 4 Jun 2026 18:26:01 +0800
+Subject: [PATCH] resize mask to match image spatial size
+
+---
+ modules/inpaint/lama/__init__.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/modules/inpaint/lama/__init__.py b/modules/inpaint/lama/__init__.py
+index 5f33e56..3c5b88b 100644
+--- a/modules/inpaint/lama/__init__.py
++++ b/modules/inpaint/lama/__init__.py
+@@ -116,6 +116,10 @@ class LaMaInpaint(LoadLaMaModel):
+                 msk = (msk > 0) * 1.0
+                 msk = msk.unsqueeze(0).unsqueeze(0)
+ 
++                # NEW: resize mask to match image spatial size
++                if msk.shape[-2:] != img.shape[-2:]:
++                    msk = F.interpolate(msk, size=img.shape[-2:], mode="nearest")
++
+                 src_image = pad_tensor_to_modulo(img, 8).to(device)
+                 src_mask = pad_tensor_to_modulo(msk, 8).to(device)
+ 
+-- 
+2.43.0
+
