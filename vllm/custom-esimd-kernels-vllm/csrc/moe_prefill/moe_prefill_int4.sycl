@@ -894,6 +894,18 @@ std::vector<torch::Tensor> moe_topk_softmax(
             (fp16*)topk_weights.data_ptr(),
             topk_ids.data_ptr<int32_t>(),
             M, q);
+    } else if (num_experts == 128 && top_k == 8) {
+        moe_topk_v2_host<128, 8>(
+            (const fp16*)router_logits.data_ptr(),
+            (fp16*)topk_weights.data_ptr(),
+            topk_ids.data_ptr<int32_t>(),
+            M, q);
+    } else if (num_experts == 128 && top_k == 10) {
+        moe_topk_v2_host<128, 10>(
+            (const fp16*)router_logits.data_ptr(),
+            (fp16*)topk_weights.data_ptr(),
+            topk_ids.data_ptr<int32_t>(),
+            M, q);
     } else {
         TORCH_CHECK(false, "moe_topk_softmax: unsupported (E=", num_experts,
                     ", top_k=", top_k,
@@ -930,6 +942,18 @@ torch::Tensor moe_prefill_full_int4(
 
     if (num_experts == 256 && top_k == 8) {
         moe_topk_v2_host<256, 8>(
+            (const fp16*)router_logits.data_ptr(),
+            (fp16*)topk_values.data_ptr(),
+            topk_indices.data_ptr<int32_t>(),
+            n_tokens, queue);
+    } else if (num_experts == 128 && top_k == 8) {
+        moe_topk_v2_host<128, 8>(
+            (const fp16*)router_logits.data_ptr(),
+            (fp16*)topk_values.data_ptr(),
+            topk_indices.data_ptr<int32_t>(),
+            n_tokens, queue);
+    } else if (num_experts == 128 && top_k == 10) {
+        moe_topk_v2_host<128, 10>(
             (const fp16*)router_logits.data_ptr(),
             (fp16*)topk_values.data_ptr(),
             topk_indices.data_ptr<int32_t>(),

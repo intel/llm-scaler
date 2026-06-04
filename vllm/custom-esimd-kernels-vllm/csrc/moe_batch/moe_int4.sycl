@@ -324,6 +324,18 @@ std::tuple<torch::Tensor, torch::Tensor> moe_router_topk_int4(
             (fp16*)topk_weight.data_ptr(),
             topk_idx.data_ptr<int32_t>(),
             n_tokens, queue);
+    } else if (num_experts == 128 && top_k == 8) {
+        moe_topk_v2_host<128, 8>(
+            (const fp16*)s_int4_router_logits.data_ptr(),
+            (fp16*)topk_weight.data_ptr(),
+            topk_idx.data_ptr<int32_t>(),
+            n_tokens, queue);
+    } else if (num_experts == 128 && top_k == 10) {
+        moe_topk_v2_host<128, 10>(
+            (const fp16*)s_int4_router_logits.data_ptr(),
+            (fp16*)topk_weight.data_ptr(),
+            topk_idx.data_ptr<int32_t>(),
+            n_tokens, queue);
     } else {
         moe_topk_forward_kernel_impl<class MoeRouterTopKInt4>(
             (const fp16*)s_int4_router_logits.data_ptr(),
@@ -1410,6 +1422,18 @@ std::tuple<torch::Tensor, torch::Tensor> moe_topk_int4(
     sycl::queue& queue = c10::xpu::getCurrentXPUStream(logits.device().index()).queue();
     if (n_routed_experts == 256 && top_k == 8) {
         moe_topk_v2_host<256, 8>(
+            (const fp16*)logits.data_ptr(),
+            (fp16*)topk_weight.data_ptr(),
+            topk_idx.data_ptr<int32_t>(),
+            n_tokens, queue);
+    } else if (n_routed_experts == 128 && top_k == 8) {
+        moe_topk_v2_host<128, 8>(
+            (const fp16*)logits.data_ptr(),
+            (fp16*)topk_weight.data_ptr(),
+            topk_idx.data_ptr<int32_t>(),
+            n_tokens, queue);
+    } else if (n_routed_experts == 128 && top_k == 10) {
+        moe_topk_v2_host<128, 10>(
             (const fp16*)logits.data_ptr(),
             (fp16*)topk_weight.data_ptr(),
             topk_idx.data_ptr<int32_t>(),
@@ -2675,6 +2699,18 @@ torch::Tensor moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits(
             (fp16*)s_int4_topk_weight.data_ptr(),
             s_int4_topk_idx.data_ptr<int32_t>(),
             n_tokens, queue);
+    } else if (n_routed_experts == 128 && top_k == 8) {
+        moe_topk_v2_host<128, 8>(
+            (const fp16*)logits.data_ptr(),
+            (fp16*)s_int4_topk_weight.data_ptr(),
+            s_int4_topk_idx.data_ptr<int32_t>(),
+            n_tokens, queue);
+    } else if (n_routed_experts == 128 && top_k == 10) {
+        moe_topk_v2_host<128, 10>(
+            (const fp16*)logits.data_ptr(),
+            (fp16*)s_int4_topk_weight.data_ptr(),
+            s_int4_topk_idx.data_ptr<int32_t>(),
+            n_tokens, queue);
     } else {
         moe_topk_forward_kernel_impl<class MoeTopKInt4TinyFull>(
             (const fp16*)logits.data_ptr(),
@@ -2810,6 +2846,18 @@ torch::Tensor moe_forward_full_int4(
     // ── TopK (V2 vectorized argmax when supported, fallback to heap-based) ──
     if (n_routed_experts == 256 && top_k == 8) {
         moe_topk_v2_host<256, 8>(
+            (const fp16*)logits.data_ptr(),
+            (fp16*)s_int4_topk_weight.data_ptr(),
+            s_int4_topk_idx.data_ptr<int32_t>(),
+            n_tokens, queue);
+    } else if (n_routed_experts == 128 && top_k == 8) {
+        moe_topk_v2_host<128, 8>(
+            (const fp16*)logits.data_ptr(),
+            (fp16*)s_int4_topk_weight.data_ptr(),
+            s_int4_topk_idx.data_ptr<int32_t>(),
+            n_tokens, queue);
+    } else if (n_routed_experts == 128 && top_k == 10) {
+        moe_topk_v2_host<128, 10>(
             (const fp16*)logits.data_ptr(),
             (fp16*)s_int4_topk_weight.data_ptr(),
             s_int4_topk_idx.data_ptr<int32_t>(),
@@ -3543,6 +3591,10 @@ torch::Tensor moe_forward_cutlass_nmajor_int4_full(
     auto topk_i = torch::empty({M,top_k}, torch::device(x.device()).dtype(torch::kInt));
     if(n_routed_experts==256 && top_k==8)
         moe_topk_v2_host<256,8>((const fp16*)logits.data_ptr(),(fp16*)topk_w.data_ptr(),topk_i.data_ptr<int32_t>(),M,q);
+    else if(n_routed_experts==128 && top_k==8)
+        moe_topk_v2_host<128,8>((const fp16*)logits.data_ptr(),(fp16*)topk_w.data_ptr(),topk_i.data_ptr<int32_t>(),M,q);
+    else if(n_routed_experts==128 && top_k==10)
+        moe_topk_v2_host<128,10>((const fp16*)logits.data_ptr(),(fp16*)topk_w.data_ptr(),topk_i.data_ptr<int32_t>(),M,q);
     else
         moe_topk_forward_kernel_impl<class MoeCNMFullTopK>((const fp16*)logits.data_ptr(),topk_i.data_ptr<int32_t>(),(fp16*)topk_w.data_ptr(),M,(int)n_routed_experts,top_k,true,q);
 
