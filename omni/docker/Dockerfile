@@ -150,7 +150,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd ComfyUI-nunchaku-XPU && \
     git fetch --depth 1 origin 1b78483a6af31297d5291f61965502079aed3407 && \
     git checkout 1b78483a6af31297d5291f61965502079aed3407 && \
-    pip install -r requirements.txt
+    pip install -r requirements.txt && \
+    pip install --no-deps kernels==0.14.0
 
 # ComfyUI disabled custom nodes (optional: --build-arg INSTALL_DISABLED_NODES=true)
 ARG INSTALL_DISABLED_NODES=true
