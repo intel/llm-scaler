@@ -17,6 +17,7 @@ ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python${PYTHON_VERSION}/dist-
 COPY ./patches/extention_comfyui_wanvideowrapper.patch /tmp/
 COPY ./patches/extention_comfyui_florence2.patch /tmp/
 COPY ./patches/extension_comfyui_segment_anything_2.patch /tmp/
+COPY ./patches/extension_comfyui_reactor.patch /tmp/
 
 # Add custom node
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -59,5 +60,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git checkout 0c35fff5f382803e2310103357b5e985f5437f32 && \
     git apply /tmp/extension_comfyui_segment_anything_2.patch && \
     rm -f /tmp/extension_comfyui_segment_anything_2.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf extension_comfyui_reactor && \
+    git clone --depth 1 https://github.com/Gourieff/ComfyUI-ReActor.git extension_comfyui_reactor && \
+    cd extension_comfyui_reactor && \
+    git fetch --depth 1 origin 6ad6b35a4df250d14cb2abf0808c9ffedf59f747 && \
+    git checkout 6ad6b35a4df250d14cb2abf0808c9ffedf59f747 && \
+    git apply /tmp/extension_comfyui_reactor.patch && \
+    python install.py && \
+    rm -f /tmp/extension_comfyui_reactor.patch
 
 WORKDIR /llm/entrypoints
