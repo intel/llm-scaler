@@ -5,6 +5,7 @@ LLM Scaler is an GenAI solution for text generation, image generation, video gen
 ---
 
 ## Latest Update
+- 🔥[2026.06] We released `intel/llm-scaler-vllm:0.14.0-b8.3.1` to enable FP8 KV Cache and fix bugs for Qwen3/Qwen3.5 models. 
 - 🔥[2026.05] We released `intel/llm-scaler-vllm:0.14.0-b8.3` to improve performance for Qwen3.5/3.6 series and Qwen3-Coder-Next, and enabled model streaming load to reduce peak memory. 
 - [2026.05] We released `intel/llm-scaler-vllm:1.4` (or, `intel/llm-scaler-vllm:0.14.0-b8.2.1`) with new platform image and support Intel® Arc™ Pro B70 GPU. 
 - [2026.05] We released `intel/llm-scaler-omni:0.1.0-b7` for more model workflows and performance improvments. 
