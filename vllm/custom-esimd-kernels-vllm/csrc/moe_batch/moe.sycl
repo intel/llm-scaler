@@ -1520,9 +1520,23 @@ static void ensure_moe_buffers_v2(int n_tokens, int top_k, int num_shared_expert
 }
 
 // ========== gemma4: moe_forward_full_gelu_tanh (no shared expert) ==========
+// Scratch buffers (topk + intermediates + routed_output) are reused every
+// call — a single pair is fine because the next call overwrites them only
+// after the previous call's accumulate has consumed them.
+//
+// The final output is different: callers (e.g. vllm Gemma4MoE.forward)
+// hold the returned tensor across the rest of the layer's compute (residual
+// add, allreduce, next layer's input), so we cannot overwrite it on the
+// next call. Use a small ring of output buffers and rotate per call so each
+// returned tensor stays valid until at least SG_FINAL_RING-1 further calls
+// have happened — enough that the consuming work has finished by then.
 static thread_local torch::Tensor sg_topk_idx, sg_topk_weight;
-static thread_local torch::Tensor sg_intermediates, sg_routed_output, sg_final_output;
+static thread_local torch::Tensor sg_intermediates, sg_routed_output;
 static thread_local int sg_cached_ntokens = -1;
+
+static constexpr int SG_FINAL_RING = 4;
+static thread_local torch::Tensor sg_final_outputs[SG_FINAL_RING];
+static thread_local int sg_final_ring_idx = 0;
 
 static void ensure_gemma4_moe_buffers(int n_tokens, int top_k,
     int hidden_size, int intermediate_size, const torch::Device& dev) {
@@ -1534,9 +1548,17 @@ static void ensure_gemma4_moe_buffers(int n_tokens, int top_k,
         torch::device(dev).dtype(torch::kHalf));
     sg_routed_output = torch::empty({n_tokens * rows_per_token, hidden_size},
         torch::device(dev).dtype(torch::kHalf));
-    sg_final_output = torch::empty({n_tokens, hidden_size},
-        torch::device(dev).dtype(torch::kHalf));
+    for (int i = 0; i < SG_FINAL_RING; i++) {
+        sg_final_outputs[i] = torch::empty({n_tokens, hidden_size},
+            torch::device(dev).dtype(torch::kHalf));
+    }
     sg_cached_ntokens = n_tokens;
+}
+
+static torch::Tensor& sg_take_final_output() {
+    auto& t = sg_final_outputs[sg_final_ring_idx];
+    sg_final_ring_idx = (sg_final_ring_idx + 1) % SG_FINAL_RING;
+    return t;
 }
 
 torch::Tensor moe_forward_full_gelu_tanh(
@@ -1579,12 +1601,13 @@ torch::Tensor moe_forward_full_gelu_tanh(
         top_k, rows_per_token, x.device());
 
     // Accumulate (sum over top_k experts per token)
+    auto& final_out = sg_take_final_output();
     moe_accumulate_kernel(
         (const fp16*)sg_routed_output.data_ptr(),
-        (fp16*)sg_final_output.data_ptr(),
+        (fp16*)final_out.data_ptr(),
         n_tokens, hidden_size, rows_per_token, x.device());
 
-    return sg_final_output.narrow(0, 0, n_tokens);
+    return final_out.narrow(0, 0, n_tokens);
 }
 
 
@@ -1631,12 +1654,13 @@ torch::Tensor moe_forward_full_gelu_tanh_routed(
         n_tokens, hidden_size, intermediate_size,
         top_k, rows_per_token, x.device());
 
+    auto& final_out = sg_take_final_output();
     moe_accumulate_kernel(
         (const fp16*)sg_routed_output.data_ptr(),
-        (fp16*)sg_final_output.data_ptr(),
+        (fp16*)final_out.data_ptr(),
         n_tokens, hidden_size, rows_per_token, x.device());
 
-    return sg_final_output.narrow(0, 0, n_tokens);
+    return final_out.narrow(0, 0, n_tokens);
 }
 
 
