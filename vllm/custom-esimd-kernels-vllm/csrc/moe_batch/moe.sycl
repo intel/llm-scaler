@@ -462,17 +462,19 @@ void moe_up_routed_e4m3_gelu_tanh_kernel(
                 for (int k = 16 * tid; k < hidden_size; k += 16 * GS) {
                     simd<fp16, 16> a_tile = block_load<fp16, 16>(x_row + k);
 
+                    // vllm layout [E, 2*inter, hidden]: width=hidden, height=2*inter
                     xesimd::config_2d_mem_access<uint8_t, 16, 16, 1> pgW(
-                        base, (uint32_t)two_inter - 1u, (uint32_t)hidden_size - 1u,
-                        (uint32_t)two_inter - 1u, (uint32_t)ng, (uint32_t)k);
+                        base, (uint32_t)hidden_size - 1u, (uint32_t)two_inter - 1u,
+                        (uint32_t)hidden_size - 1u, (uint32_t)k, (uint32_t)ng);
                     auto rg = xesimd::lsc_load_2d<uint8_t, 16, 16, 1, false, false,
                         xesimd::cache_hint::cached, xesimd::cache_hint::cached>(pgW);
                     simd<fp16, 256> bg = fp8e4m3_block_to_vnni(rg);
                     g_acc = dpas<8, 1, float, float, fp16, fp16>(g_acc, bg, a_tile);
 
+                    // vllm layout: up portion at row offset nu
                     xesimd::config_2d_mem_access<uint8_t, 16, 16, 1> puW(
-                        base, (uint32_t)two_inter - 1u, (uint32_t)hidden_size - 1u,
-                        (uint32_t)two_inter - 1u, (uint32_t)nu, (uint32_t)k);
+                        base, (uint32_t)hidden_size - 1u, (uint32_t)two_inter - 1u,
+                        (uint32_t)hidden_size - 1u, (uint32_t)k, (uint32_t)nu);
                     auto ru = xesimd::lsc_load_2d<uint8_t, 16, 16, 1, false, false,
                         xesimd::cache_hint::cached, xesimd::cache_hint::cached>(puW);
                     simd<fp16, 256> bu = fp8e4m3_block_to_vnni(ru);
@@ -826,6 +828,63 @@ void moe_down_routed_e4m3_kernel(
 
     submit_kernel(cgf, device, "moe down routed e4m3");
 }
+
+// ========== gemma4: down kernel for vllm layout [E, hidden, inter] ==========
+void moe_down_routed_e4m3_vllm_layout_kernel(
+    const fp16* intermediates,
+    const uint8_t* down_weight, const float* down_scale,
+    const fp16* routing_weights, const int* selected_experts,
+    fp16* output,
+    const int n_tokens, const int hidden_size, const int intermediate_size,
+    const int top_k, const int rows_per_token,
+    const torch::Device& device) {
+
+    const int n_tiles = hidden_size / 16;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeDownRoutedE4M3VllmLayout>(
+            sycl::range<2>(n_tokens * top_k, n_tiles),
+            [=](sycl::item<2> item) SYCL_ESIMD_KERNEL {
+                const int route_idx = (int)item.get_id(0);
+                const int n_tile    = (int)item.get_id(1);
+                const int token     = route_idx / top_k;
+                const int k_idx     = route_idx % top_k;
+
+                const int eid = selected_experts[route_idx];
+                const int routed_row = token * rows_per_token + k_idx;
+                // vllm layout: [E, hidden, inter] → base + eid * hidden * inter
+                const uint8_t* base = down_weight + (size_t)eid * hidden_size * intermediate_size;
+                const fp16* hi = intermediates + (size_t)routed_row * intermediate_size;
+                const int nj = n_tile * 16;
+                simd<float, 16> acc(0.f);
+
+                for (int k = 0; k < intermediate_size; k += 16) {
+                    simd<fp16, 16> a_tile = block_load<fp16, 16>(hi + k);
+
+                    // vllm layout [E, hidden, inter]: width=inter, height=hidden
+                    // Read weight[eid][nj:nj+16][k:k+16] → coords(x=k, y=nj)
+                    xesimd::config_2d_mem_access<uint8_t, 16, 16, 1> payW(
+                        base, (uint32_t)intermediate_size - 1u, (uint32_t)hidden_size - 1u,
+                        (uint32_t)intermediate_size - 1u, (uint32_t)k, (uint32_t)nj);
+                    auto raw = xesimd::lsc_load_2d<uint8_t, 16, 16, 1, false, false,
+                        xesimd::cache_hint::cached, xesimd::cache_hint::cached>(payW);
+                    simd<fp16, 256> b_tile = fp8e4m3_block_to_vnni(raw);
+                    acc = dpas<8, 1, float, float, fp16, fp16>(acc, b_tile, a_tile);
+                }
+
+                float w = (float)routing_weights[route_idx];
+                float ds = down_scale[eid];
+                acc *= w * ds;
+
+                block_store<fp16, 16>(
+                    output + (size_t)routed_row * hidden_size + nj,
+                    convert<fp16>(acc));
+            });
+    };
+
+    submit_kernel(cgf, device, "moe down routed e4m3 vllm layout");
+}
+
 
 void moe_down_routed_e5m2_kernel(
     const fp16* intermediates,
@@ -1464,7 +1523,8 @@ torch::Tensor moe_forward_full_gelu_tanh(
     int64_t top_k, int64_t n_routed_experts) {
     TORCH_CHECK(x.scalar_type() == torch::kHalf);
     int n_tokens = x.size(0), hidden_size = x.size(1);
-    int intermediate_size = gate_up_weight.size(2) / 2;
+    // vllm layout: gate_up [E, 2*inter, hidden], down [E, hidden, inter]
+    int intermediate_size = gate_up_weight.size(1) / 2;
     int rows_per_token = top_k;
 
     ensure_gemma4_moe_buffers(n_tokens, top_k, hidden_size, intermediate_size, x.device());
@@ -1486,8 +1546,8 @@ torch::Tensor moe_forward_full_gelu_tanh(
         n_tokens, hidden_size, intermediate_size,
         top_k, rows_per_token, x.device());
 
-    // Down routed
-    moe_down_routed_e4m3_kernel(
+    // Down routed (vllm layout: [E, hidden, inter])
+    moe_down_routed_e4m3_vllm_layout_kernel(
         (const fp16*)sg_intermediates.data_ptr(),
         (const uint8_t*)down_weight.data_ptr(), down_scale.data_ptr<float>(),
         (const fp16*)sg_topk_weight.data_ptr(), sg_topk_idx.data_ptr<int>(),
@@ -1586,9 +1646,8 @@ TORCH_LIBRARY_FRAGMENT(moe_ops, m) {
     m.def("moe_accumulate(Tensor partials, int top_k, int num_shared_experts) -> Tensor");
     m.def("moe_topk(Tensor logits, int top_k, bool norm) -> (Tensor, Tensor)");
     m.def("moe_forward_fused(Tensor x, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, Tensor routing_weights, Tensor selected_experts, int top_k, int num_shared_experts) -> Tensor");
-        m.def("moe_forward_full_gelu_tanh(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, int top_k, int n_routed_experts) -> Tensor");
-    m.impl("moe_forward_full_gelu_tanh", &moe_forward_full_gelu_tanh);
-m.def("moe_forward_full(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
+    m.def("moe_forward_full_gelu_tanh(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, int top_k, int n_routed_experts) -> Tensor");
+    m.def("moe_forward_full(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full_v2(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
 }
 
@@ -1598,6 +1657,7 @@ TORCH_LIBRARY_IMPL(moe_ops, XPU, m) {
     m.impl("moe_down_forward", &moe_down_forward);
     m.impl("moe_accumulate", &moe_accumulate);
     m.impl("moe_topk", &moe_topk);
+    m.impl("moe_forward_full_gelu_tanh", &moe_forward_full_gelu_tanh);
     m.impl("moe_forward_fused", &moe_forward_fused);
     m.impl("moe_forward_full", &moe_forward_full);
     m.impl("moe_forward_full_v2", &moe_forward_full_v2);
