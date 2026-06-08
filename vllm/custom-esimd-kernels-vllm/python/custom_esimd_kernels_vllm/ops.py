@@ -1443,3 +1443,29 @@ def moe_forward_full_gelu_tanh(
     return _moe_batch.moe_forward_full_gelu_tanh(
         x, logits, gate_up_weight, gate_up_scale,
         down_weight, down_scale, top_k, n_routed_experts)
+
+
+def moe_forward_full_gelu_tanh_routed(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    top_k: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """gelu_tanh MoE with caller-supplied routing.
+
+    Use when the model needs routing logic the kernel's built-in
+    softmax/topk does not cover (e.g. gemma4 folds per_expert_scale into
+    the routing weights). topk_weights must be fp16 [T, top_k];
+    topk_indices int32 [T, top_k]. Weight layout is the unmodified vllm
+    FusedMoE format: w13 [E, 2*inter, hidden], w2 [E, hidden, inter].
+    """
+    return _moe_batch.moe_forward_full_gelu_tanh_routed(
+        x, topk_weights, topk_indices,
+        gate_up_weight, gate_up_scale,
+        down_weight, down_scale,
+        top_k, n_routed_experts)
