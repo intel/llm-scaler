@@ -1427,3 +1427,19 @@ def moe_forward_cutlass_nmajor_int4_full(
         x, logits, w13, w13_scales, w2, w2_scales,
         shared_gu_w, shared_d_w, shared_gate_w,
         top_k, num_shared_experts, n_routed_experts)
+
+
+def moe_forward_full_gelu_tanh(
+    x: torch.Tensor,
+    logits: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    top_k: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """Full MoE forward with gelu_tanh activation (gemma4, no shared expert)."""
+    return moe_ops.moe_forward_full_gelu_tanh(
+        x, logits, gate_up_weight, gate_up_scale,
+        down_weight, down_scale, top_k, n_routed_experts)
