@@ -185,6 +185,11 @@ at::Tensor esimd_moe_scatter_fused(
     int64_t K, int64_t topk, int64_t T, int64_t num_experts);
 
 // SiLU(gate) * up activation
+// GELU_tanh(gate) * up activation (gemma4)
+at::Tensor esimd_moe_gelu_tanh_mul(
+    at::Tensor input, at::Tensor output,
+    int64_t N_gate_up, int64_t N_half, int64_t total_rows);
+
 at::Tensor esimd_moe_silu_mul(
     at::Tensor input, at::Tensor output,
     int64_t N_gate_up, int64_t N_half, int64_t total_rows);

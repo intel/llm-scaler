@@ -98,6 +98,19 @@ at::Tensor esimd_moe_silu_mul(
     return output;
 }
 
+at::Tensor esimd_moe_gelu_tanh_mul(
+    at::Tensor input,
+    at::Tensor output,
+    int64_t N_gate_up, int64_t N_half, int64_t total_rows)
+{
+    auto& q = get_device_queue(input);
+    moe_gelu_tanh_mul_host(
+        reinterpret_cast<const fp16*>(input.data_ptr()),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        (int)N_gate_up, (int)N_half, (int)total_rows, q);
+    return output;
+}
+
 at::Tensor esimd_moe_gather(
     at::Tensor moe_output,
     at::Tensor topk_ids,

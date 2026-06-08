@@ -46,7 +46,25 @@ ext_modules = [
         },
         extra_link_args=['-Wl,-rpath,$ORIGIN/../../torch/lib'],
         py_limited_api=False,
-    )
+    ),
+    SyclExtension(
+        name='custom_esimd_kernels_vllm.custom_esimd_kernels_moe',
+        sources=[
+            'csrc/xpu/esimd_kernel_moe.sycl',
+            'csrc/xpu/torch_extension_moe.cc',
+        ],
+        include_dirs=[
+            root / 'include',
+            root / 'csrc',
+        ],
+        extra_compile_args={
+            'cxx': ['-O3', '-std=c++17'],
+            'sycl': ['-ffast-math', '-fsycl-device-code-split=per_kernel',
+                     f'-I{torch_include}'],
+        },
+        extra_link_args=['-Wl,-rpath,$ORIGIN/../../torch/lib'],
+        py_limited_api=False,
+    ),
 ]
 
 setup(

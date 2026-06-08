@@ -539,6 +539,17 @@ def esimd_moe_silu_mul(
     return _ops.esimd_moe_silu_mul(input, output, N_gate_up, N_half, total_rows)
 
 
+def esimd_moe_gelu_tanh_mul(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    N_gate_up: int,
+    N_half: int,
+    total_rows: int,
+) -> torch.Tensor:
+    """GELU_tanh(gate) * up activation (gemma4 MoE)."""
+    return _ops.esimd_moe_gelu_tanh_mul(input, output, N_gate_up, N_half, total_rows)
+
+
 def esimd_moe_gather(
     moe_output: torch.Tensor,
     topk_ids: torch.Tensor,

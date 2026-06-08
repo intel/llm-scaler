@@ -41,6 +41,7 @@ from custom_esimd_kernels_vllm.ops import (
     esimd_moe_topk,
     esimd_moe_scatter_fused,
     esimd_moe_silu_mul,
+    esimd_moe_gelu_tanh_mul,
     esimd_moe_gather,
     esimd_moe_gemm_fp8,
     esimd_moe_gemm_fp8_pert,
