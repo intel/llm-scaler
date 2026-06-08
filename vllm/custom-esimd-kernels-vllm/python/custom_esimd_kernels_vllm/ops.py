@@ -1440,6 +1440,6 @@ def moe_forward_full_gelu_tanh(
     n_routed_experts: int,
 ) -> torch.Tensor:
     """Full MoE forward with gelu_tanh activation (gemma4, no shared expert)."""
-    return moe_ops.moe_forward_full_gelu_tanh(
+    return _moe_batch.moe_forward_full_gelu_tanh(
         x, logits, gate_up_weight, gate_up_scale,
         down_weight, down_scale, top_k, n_routed_experts)

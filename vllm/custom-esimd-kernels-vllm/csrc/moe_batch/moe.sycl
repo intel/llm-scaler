@@ -73,6 +73,29 @@ simd<fp16, 256> fp8e4m3_block_to_vnni(simd<uint8_t, 256> raw) {
     return vnni.template bit_cast_view<fp16>();
 }
 
+// ── FP8 [16,16] block → DPAS b_tile (VNNI-packed fp16) — NK layout ──────────
+// Input:  raw uint8[256] = row-major [N=16, K=16] FP8 (vllm FusedMoE layout:
+//         w13 [E, 2*inter, hidden], w2 [E, hidden, inter])
+// Output: same VNNI uint32 layout as fp8e4m3_block_to_vnni:
+//         u32[kp*16+n] = {fp16[2*kp,n], fp16[2*kp+1,n]}
+// Derived from custom-esimd-kernels-vllm/csrc/xpu/esimd_kernels/fp8_GEMM_pert.h:373.
+SYCL_ESIMD_FUNCTION
+simd<fp16, 256> fp8e4m3_block_to_vnni_nk(simd<uint8_t, 256> raw) {
+    simd<fp16, 256> w = fp8e4m3_to_half<256>(raw);
+    simd<uint16_t, 256> w_u16 = w.bit_cast_view<uint16_t>().read();
+    simd<uint16_t, 256> b_vnni_u16;
+    // raw is row-major [N=16, K=16]: element (n, k) at offset n*16 + k.
+    // stride-16 select with base=2*kp picks element k=2*kp from each of 16 N-rows.
+    #pragma unroll
+    for (int kp = 0; kp < 8; kp++) {
+        simd<uint16_t, 16> lo = w_u16.select<16, 16>(2 * kp);
+        simd<uint16_t, 16> hi = w_u16.select<16, 16>(2 * kp + 1);
+        b_vnni_u16.template select<16, 2>(kp * 32) = lo;
+        b_vnni_u16.template select<16, 2>(kp * 32 + 1) = hi;
+    }
+    return b_vnni_u16.template bit_cast_view<fp16>().read();
+}
+
 SYCL_ESIMD_FUNCTION
 simd<fp16, 256> fp8e5m2_block_to_vnni(simd<uint8_t, 256> raw) {
     simd<fp16, 256> w = fp8e5m2_to_half<256>(raw);
@@ -468,7 +491,7 @@ void moe_up_routed_e4m3_gelu_tanh_kernel(
                         (uint32_t)hidden_size - 1u, (uint32_t)k, (uint32_t)ng);
                     auto rg = xesimd::lsc_load_2d<uint8_t, 16, 16, 1, false, false,
                         xesimd::cache_hint::cached, xesimd::cache_hint::cached>(pgW);
-                    simd<fp16, 256> bg = fp8e4m3_block_to_vnni(rg);
+                    simd<fp16, 256> bg = fp8e4m3_block_to_vnni_nk(rg);
                     g_acc = dpas<8, 1, float, float, fp16, fp16>(g_acc, bg, a_tile);
 
                     // vllm layout: up portion at row offset nu
@@ -477,7 +500,7 @@ void moe_up_routed_e4m3_gelu_tanh_kernel(
                         (uint32_t)hidden_size - 1u, (uint32_t)k, (uint32_t)nu);
                     auto ru = xesimd::lsc_load_2d<uint8_t, 16, 16, 1, false, false,
                         xesimd::cache_hint::cached, xesimd::cache_hint::cached>(puW);
-                    simd<fp16, 256> bu = fp8e4m3_block_to_vnni(ru);
+                    simd<fp16, 256> bu = fp8e4m3_block_to_vnni_nk(ru);
                     u_acc = dpas<8, 1, float, float, fp16, fp16>(u_acc, bu, a_tile);
                 }
 
@@ -868,7 +891,7 @@ void moe_down_routed_e4m3_vllm_layout_kernel(
                         (uint32_t)intermediate_size - 1u, (uint32_t)k, (uint32_t)nj);
                     auto raw = xesimd::lsc_load_2d<uint8_t, 16, 16, 1, false, false,
                         xesimd::cache_hint::cached, xesimd::cache_hint::cached>(payW);
-                    simd<fp16, 256> b_tile = fp8e4m3_block_to_vnni(raw);
+                    simd<fp16, 256> b_tile = fp8e4m3_block_to_vnni_nk(raw);
                     acc = dpas<8, 1, float, float, fp16, fp16>(acc, b_tile, a_tile);
                 }
 
