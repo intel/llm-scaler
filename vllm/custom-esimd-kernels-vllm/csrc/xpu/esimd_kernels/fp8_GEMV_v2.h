@@ -107,7 +107,7 @@ inline void select_vl_ks(uint32_t N, uint32_t K, int& vl, int& ks) {
 
     int kpt = K / ks;
     while (vl > kpt || kpt % vl != 0) {
-        if (vl > 128) {
+        if (vl > 32) {
             vl /= 2;
         } else if (ks > 1) {
             ks /= 2;
@@ -370,7 +370,7 @@ inline void GEMV_fp8_pert_host(
     else if (vl == 128 && ks == 2) { LAUNCH_PERT(128, 2) }
     else if (vl == 128 && ks == 4) { LAUNCH_PERT(128, 4) }
     else if (vl == 128 && ks == 8) { LAUNCH_PERT(128, 8) }
-    else { LAUNCH_PERT(128, 1) }
+    else if (vl == 64 && ks == 1) { LAUNCH_PERT(64, 1) }    else if (vl == 64 && ks == 2) { LAUNCH_PERT(64, 2) }    else if (vl == 64 && ks == 4) { LAUNCH_PERT(64, 4) }    else if (vl == 32 && ks == 1) { LAUNCH_PERT(32, 1) }    else if (vl == 32 && ks == 2) { LAUNCH_PERT(32, 2) }    else { LAUNCH_PERT(32, 1) }
 
     #undef LAUNCH_PERT
 }

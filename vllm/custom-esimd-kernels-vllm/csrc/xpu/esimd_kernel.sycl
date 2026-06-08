@@ -227,7 +227,7 @@ at::Tensor esimd_resadd_norm_gemv_fp8_pert(
 
     auto& dpcpp_queue = get_device_queue(hidden_states);
 
-    resadd_norm_gemv_fp8_pert_host(
+    resadd_norm_gemv_fp8_pert_v2_host(
         reinterpret_cast<fp16*>(hidden_states.data_ptr()),
         reinterpret_cast<fp16*>(residual.data_ptr()),
         reinterpret_cast<const fp16*>(norm_weight.data_ptr()),
@@ -393,7 +393,7 @@ at::Tensor esimd_fused_add_rms_norm(
     int K = (int)hidden_states.size(-1);
     auto& dpcpp_queue = get_device_queue(hidden_states);
 
-    fused_add_rms_norm_host(
+    fused_add_rms_norm_v2_host(
         reinterpret_cast<fp16*>(hidden_states.data_ptr()),
         reinterpret_cast<fp16*>(residual.data_ptr()),
         reinterpret_cast<const fp16*>(weight.data_ptr()),

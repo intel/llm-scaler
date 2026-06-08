@@ -69,3 +69,93 @@ inline void fused_add_rms_norm_host(
             FusedAddRmsNorm_kernel{hidden_ptr, residual_ptr, weight_ptr, K, eps});
     });
 }
+
+// ============================================================================
+// V2: Templated VL with tail handling for non-aligned K (e.g. K=2816)
+// ============================================================================
+template<int VL>
+struct FusedAddRmsNorm_v2_kernel {
+    fp16*       hidden_ptr;
+    fp16*       residual_ptr;
+    const fp16* weight_ptr;
+    int K;
+    float eps;
+
+
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        int k_aligned = (K / VL) * VL;
+
+        // Pass 1: residual += hidden, accumulate sum_sq
+        float sum_sq = 0.0f;
+        for (int k = 0; k < k_aligned; k += VL) {
+            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + k);
+            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + k);
+            simd<float, VL> added = h + r;
+            block_store<fp16, VL>(residual_ptr + k, simd<fp16, VL>(added));
+            simd<float, VL> sq = added * added;
+            sum_sq += reduce<float>(sq, std::plus<>());
+        }
+        // Tail
+        if (k_aligned < K) {
+            int k_tail = K - VL;
+            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + k_tail);
+            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + k_tail);
+            simd<float, VL> added = h + r;
+            block_store<fp16, VL>(residual_ptr + k_tail, simd<fp16, VL>(added));
+            // Only accumulate the tail portion (avoid double-counting overlap)
+            int overlap = k_aligned - k_tail;
+            simd<float, VL> sq = added * added;
+            for (int z = 0; z < overlap; z++) sq[z] = 0.0f;
+            sum_sq += reduce<float>(sq, std::plus<>());
+        }
+
+        float inv_rms = sycl::ext::intel::esimd::rsqrt(
+            simd<float, 8>(sum_sq / (float)K + eps))[0];
+
+        // Pass 2: normalize and write output
+        for (int k = 0; k < k_aligned; k += VL) {
+            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + k);
+            simd<float, VL> w = block_load<fp16, VL>(weight_ptr + k);
+            simd<float, VL> normed = r * inv_rms * w;
+            block_store<fp16, VL>(hidden_ptr + k, simd<fp16, VL>(normed));
+        }
+        if (k_aligned < K) {
+            int k_tail = K - VL;
+            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + k_tail);
+            simd<float, VL> w = block_load<fp16, VL>(weight_ptr + k_tail);
+            simd<float, VL> normed = r * inv_rms * w;
+            // Only write tail portion to avoid corrupting overlap region
+            // (overlap region was already correctly written in main loop)
+            // Since we read from residual (already correct) and write to
+            // hidden (output), and the main loop already wrote [0..k_aligned),
+            // writing the full VL from k_tail overwrites [k_tail..k_tail+VL)
+            // = [K-VL..K). The overlap [k_tail..k_aligned) gets the same
+            // value (same residual, same weight, same inv_rms), so it's safe.
+            block_store<fp16, VL>(hidden_ptr + k_tail, simd<fp16, VL>(normed));
+        }
+    }
+};
+
+// V2 host dispatcher: picks VL based on K alignment
+inline void fused_add_rms_norm_v2_host(
+    fp16* hidden_ptr, fp16* residual_ptr, const fp16* weight_ptr,
+    int K, float eps, sycl::queue& q)
+{
+    // Use original kernel for K%512==0 (no overhead)
+    if (K % 512 == 0) {
+        fused_add_rms_norm_host(hidden_ptr, residual_ptr, weight_ptr, K, eps, q);
+        return;
+    }
+
+    // Pick largest VL that gives at least 1 full chunk (VL <= K)
+    // VL=256 for K=2816: 2816/256=11 full + 0 tail (2816%256=0!)
+    #define LAUNCH_V2(V)         q.submit([&](sycl::handler& cgh) {             cgh.parallel_for(sycl::nd_range<1>(1, 1),                 FusedAddRmsNorm_v2_kernel<V>{hidden_ptr, residual_ptr, weight_ptr, K, eps});         });
+
+    if      (K % 256 == 0) { LAUNCH_V2(256) }
+    else if (K % 128 == 0) { LAUNCH_V2(128) }
+    else if (K % 64 == 0)  { LAUNCH_V2(64)  }
+    else                   { LAUNCH_V2(64)  }  // tail handles remainder
+
+    #undef LAUNCH_V2
+}

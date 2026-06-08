@@ -173,3 +173,106 @@ inline void resadd_norm_gemv_fp8_pert_host(
                 N, K, eps, fp8_mode});
     });
 }
+
+// ============================================================================
+// V2: Templated VL for non-512-aligned K (e.g. gemma4 K=2816, VL=256)
+// ============================================================================
+template<int VL, int MAX_CHUNKS>
+struct ResAddNormGEMV_fp8_pert_v2_kernel {
+    fp16*          hidden_ptr;
+    fp16*          residual_ptr;
+    const fp16*    norm_w_ptr;
+    const uint8_t* gemv_weight;
+    const float*   gemv_scale;
+    fp16*          output;
+    fp16*          normed_out;
+    int N, K;
+    float eps;
+    int fp8_mode;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        int n = item.get_group(0);
+        if (n >= N) return;
+
+        int n_chunks = K / VL;
+        simd<float, VL> res_chunks[MAX_CHUNKS];
+
+        float sum_sq = 0.0f;
+
+        for (int c = 0; c < n_chunks; c++) {
+            int offset = c * VL;
+            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + offset);
+            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + offset);
+            simd<float, VL> added = h + r;
+            res_chunks[c] = added;
+
+            if (n == 0) {
+                block_store<fp16, VL>(residual_ptr + offset, simd<fp16, VL>(added));
+            }
+
+            simd<float, VL> sq = added * added;
+            sum_sq += reduce<float>(sq, std::plus<>());
+        }
+
+        float inv_rms = sycl::ext::intel::esimd::rsqrt(
+            simd<float, 8>(sum_sq / (float)K + eps))[0];
+
+        simd<float, VL> acc = 0.0f;
+
+        for (int c = 0; c < n_chunks; c++) {
+            int offset = c * VL;
+            simd<float, VL> nw = block_load<fp16, VL>(norm_w_ptr + offset);
+            simd<float, VL> normed = res_chunks[c] * inv_rms * nw;
+
+            if (n == 0) {
+                block_store<fp16, VL>(normed_out + offset, simd<fp16, VL>(normed));
+            }
+
+            simd<uint8_t, VL> w_raw = block_load<uint8_t, VL>(
+                gemv_weight + (size_t)n * K + offset);
+            simd<float, VL> wf = fp8_dequant_rng<VL>(w_raw, fp8_mode);
+
+            acc += normed * wf;
+        }
+
+        float dot = reduce<float>(acc, std::plus<>()) * (*gemv_scale);
+        output[n] = fp16(dot);
+    }
+};
+
+inline void resadd_norm_gemv_fp8_pert_v2_host(
+    fp16* hidden_ptr, fp16* residual_ptr, const fp16* norm_w_ptr,
+    const uint8_t* gemv_weight, const float* gemv_scale,
+    fp16* output, fp16* normed_out,
+    int N, int K, float eps, int fp8_mode, sycl::queue& q)
+{
+    // Route to original kernel if K%512==0 (no overhead)
+    if (K % 512 == 0) {
+        resadd_norm_gemv_fp8_pert_host(
+            hidden_ptr, residual_ptr, norm_w_ptr,
+            gemv_weight, gemv_scale, output, normed_out,
+            N, K, eps, fp8_mode, q);
+        return;
+    }
+
+    #define LAUNCH_RNGV2(V, MC)         q.submit([&](sycl::handler& cgh) {             cgh.parallel_for(sycl::nd_range<1>(N, 1),                 ResAddNormGEMV_fp8_pert_v2_kernel<V, MC>{                     hidden_ptr, residual_ptr, norm_w_ptr,                     gemv_weight, gemv_scale, output, normed_out,                     N, K, eps, fp8_mode});         });
+
+    if (K % 256 == 0) {
+        int mc = K / 256;
+        if      (mc <= 8)  { LAUNCH_RNGV2(256, 8)  }
+        else if (mc <= 16) { LAUNCH_RNGV2(256, 16) }
+        else               { LAUNCH_RNGV2(256, 32) }
+    } else if (K % 128 == 0) {
+        int mc = K / 128;
+        if      (mc <= 16) { LAUNCH_RNGV2(128, 16) }
+        else               { LAUNCH_RNGV2(128, 32) }
+    } else {
+        // Fallback: can't fuse, caller should not reach here
+        resadd_norm_gemv_fp8_pert_host(
+            hidden_ptr, residual_ptr, norm_w_ptr,
+            gemv_weight, gemv_scale, output, normed_out,
+            N, K, eps, fp8_mode, q);
+    }
+
+    #undef LAUNCH_RNGV2
+}
