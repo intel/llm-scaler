@@ -191,6 +191,35 @@ def esimd_qkv_split_norm_rope(
         q_heads, kv_heads, attn_output_gate, rotary_dim, cos_sin_cache)
 
 
+def esimd_qkv_split_norm_rope_v(
+    qkv_state: torch.Tensor,
+    q_out: torch.Tensor,
+    gate_out: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    norm_wq: torch.Tensor,
+    norm_wk: torch.Tensor,
+    norm_wv: torch.Tensor,
+    positions: torch.Tensor,
+    q_heads: int,
+    kv_heads: int,
+    attn_output_gate: bool,
+    rotary_dim: int = 256,
+    cos_sin_cache: torch.Tensor = None,
+) -> torch.Tensor:
+    """Like esimd_qkv_split_norm_rope, but also RMSNorms V heads (no RoPE).
+
+    All norm weights still follow the Qwen w+1.0 convention; gemma4 callers
+    must pass (gemma_weight - 1.0) so the kernel's `+1.0` reproduces the
+    desired RMSNorm scale. For gemma4 V-Norm (has_weight=False), pass a
+    zeros([head_dim]) tensor so the kernel multiplies by ones.
+    """
+    return _ops.esimd_qkv_split_norm_rope_v(
+        qkv_state, q_out, gate_out, k_out, v_out,
+        norm_wq, norm_wk, norm_wv, positions,
+        q_heads, kv_heads, attn_output_gate, rotary_dim, cos_sin_cache)
+
+
 # ---- Fused Conv1d + GDN (doubleGRF, LGRF module) ----
 
 def esimd_gdn_conv_fused(

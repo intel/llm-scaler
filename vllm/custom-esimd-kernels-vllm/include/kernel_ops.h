@@ -60,6 +60,16 @@ at::Tensor esimd_qkv_split_norm_rope(
     int64_t q_heads, int64_t kv_heads, bool attn_output_gate,
     int64_t rotary_dim, at::Tensor cos_sin_cache);
 
+// Variant with V-Norm (gemma4): also RMSNorms V heads.
+at::Tensor esimd_qkv_split_norm_rope_v(
+    at::Tensor qkv_state,
+    at::Tensor q_out, at::Tensor gate_out,
+    at::Tensor k_out, at::Tensor v_out,
+    at::Tensor norm_wq, at::Tensor norm_wk, at::Tensor norm_wv,
+    at::Tensor positions,
+    int64_t q_heads, int64_t kv_heads, bool attn_output_gate,
+    int64_t rotary_dim, at::Tensor cos_sin_cache);
+
 // Fused Conv1d + GDN for Qwen3-Next-80B-A3B decode — reads from projections directly
 // qkvz:               [N, qkvz_dim] fp16 — projected_states_qkvz, read-only
 // conv_state:         [num_cache, 3, 2048] fp16, strided dim0

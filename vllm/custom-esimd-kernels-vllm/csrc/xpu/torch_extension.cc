@@ -59,6 +59,14 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
         "int rotary_dim, Tensor cos_sin_cache) -> Tensor");
   m.impl("esimd_qkv_split_norm_rope", torch::kXPU, &esimd_qkv_split_norm_rope);
 
+  // Variant with V-Norm (gemma4): same as above but also RMSNorms V heads.
+  m.def("esimd_qkv_split_norm_rope_v(Tensor qkv_state, "
+        "Tensor q_out, Tensor gate_out, Tensor k_out, Tensor v_out, "
+        "Tensor norm_wq, Tensor norm_wk, Tensor norm_wv, Tensor positions, "
+        "int q_heads, int kv_heads, bool attn_output_gate, "
+        "int rotary_dim, Tensor cos_sin_cache) -> Tensor");
+  m.impl("esimd_qkv_split_norm_rope_v", torch::kXPU, &esimd_qkv_split_norm_rope_v);
+
   // Fused ResidualAdd + RMSNorm + FP8 GEMV (post_attn_norm + router)
   m.def("esimd_resadd_norm_gemv_fp8_pert(Tensor hidden_states, Tensor residual, "
         "Tensor norm_weight, Tensor gemv_weight, Tensor gemv_scale, "

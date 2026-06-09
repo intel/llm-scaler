@@ -202,7 +202,46 @@ at::Tensor esimd_qkv_split_norm_rope(
     auto& dpcpp_queue = get_device_queue(qkv_state);
     qkv_split_norm_rope_host(
         p_qkv, p_q, p_gate, p_k, p_v,
-        p_nwq, p_nwk, p_pos, p_cs,
+        p_nwq, p_nwk, /*normWv=*/nullptr, p_pos, p_cs,
+        ntoks, hiddenDim,
+        (uint32_t)q_heads, (uint32_t)kv_heads,
+        attn_output_gate, (uint32_t)rotary_dim, dpcpp_queue);
+    return q_out;
+}
+
+// Variant with V-Norm (gemma4): same kernel + RMSNorm path on V heads.
+at::Tensor esimd_qkv_split_norm_rope_v(
+    at::Tensor qkv_state,
+    at::Tensor q_out,
+    at::Tensor gate_out,
+    at::Tensor k_out,
+    at::Tensor v_out,
+    at::Tensor norm_wq,
+    at::Tensor norm_wk,
+    at::Tensor norm_wv,
+    at::Tensor positions,
+    int64_t q_heads, int64_t kv_heads, bool attn_output_gate,
+    int64_t rotary_dim,
+    at::Tensor cos_sin_cache) {
+
+    EXTRACT_PTR(p_qkv, qkv_state);
+    EXTRACT_PTR(p_q, q_out);
+    EXTRACT_PTR(p_gate, gate_out);
+    EXTRACT_PTR(p_k, k_out);
+    EXTRACT_PTR(p_v, v_out);
+    EXTRACT_PTR(p_nwq, norm_wq);
+    EXTRACT_PTR(p_nwk, norm_wk);
+    EXTRACT_PTR(p_nwv, norm_wv);
+    auto p_pos = reinterpret_cast<uint32_t*>(positions.data_ptr());
+    auto p_cs = reinterpret_cast<sycl::half*>(cos_sin_cache.data_ptr());
+
+    uint32_t ntoks = qkv_state.size(0);
+    uint32_t hiddenDim = qkv_state.size(1);
+
+    auto& dpcpp_queue = get_device_queue(qkv_state);
+    qkv_split_norm_rope_host(
+        p_qkv, p_q, p_gate, p_k, p_v,
+        p_nwq, p_nwk, p_nwv, p_pos, p_cs,
         ntoks, hiddenDim,
         (uint32_t)q_heads, (uint32_t)kv_heads,
         attn_output_gate, (uint32_t)rotary_dim, dpcpp_queue);

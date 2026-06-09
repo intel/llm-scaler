@@ -28,6 +28,7 @@ ESIMD_INLINE void qkv_split_norm_rope_kernel(
     uint8_t* vState,
     uint8_t* normWq,
     uint8_t* normWk,
+    uint8_t* normWv,        // optional: if non-null, V is RMSNormed (gemma4)
     uint32_t* ropePos,
     fp16* ropeCosSinCache,  // [max_pos, rotaryDim] fp16 — first half cos, second half sin
     uint32_t ntoks,
@@ -215,8 +216,23 @@ ESIMD_INLINE void qkv_split_norm_rope_kernel(
         block_store<fp16, 256>((fp16*)kState + outputOffset, activation);
     }
     else if (whereAmI == QKV_LOCATION_V) {
-        // V: copy only
         outputOffset = kvHead * headDim * tokIdx + outHead * headDim;
+        if (normWv != nullptr) {
+            // RMSNorm only (no RoPE) — gemma4 V-Norm
+            simd<fp16, 256> fp16RmsW;
+            simd<float, 256> fp32RmsW;
+            simd<float, 256> outputTemp = activation;
+            simd<float, 256> outputSq = outputTemp * outputTemp;
+
+            fp16RmsW = block_load<fp16, 256>((fp16*)normWv);
+            float acc = sycl::ext::intel::esimd::detail::sum<float, float, 256>(outputSq) / (float)headDim;
+            float scale = __ESIMD_NS::rsqrt(acc + eps);
+            fp32RmsW = fp16RmsW + 1.0f;
+            outputTemp = outputTemp * fp32RmsW;
+            outputTemp.select<256, 1>(0) = outputTemp.select<256, 1>(0) * scale;
+            activation = outputTemp;
+        }
+        // else: copy only (qwen3_next path)
         block_store<fp16, 256>((fp16*)vState + outputOffset, activation);
     }
 }
@@ -230,6 +246,7 @@ inline void qkv_split_norm_rope_host(
     uint8_t* vState,
     uint8_t* normWq,
     uint8_t* normWk,
+    uint8_t* normWv,        // optional: nullptr to skip V-Norm (qwen3_next)
     uint32_t* ropePos,
     fp16* ropeCosSinCache,
     uint32_t ntoks,
@@ -254,7 +271,7 @@ inline void qkv_split_norm_rope_host(
             [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
                 qkv_split_norm_rope_kernel(
                     qkvState, qState, gateState, kState, vState,
-                    normWq, normWk, ropePos, ropeCosSinCache,
+                    normWq, normWk, normWv, ropePos, ropeCosSinCache,
                     ntoks, hiddenDim, headDim, qHead, kvHead, rotaryDim, ndi);
             });
     });
