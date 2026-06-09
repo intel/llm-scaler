@@ -137,6 +137,86 @@ struct FusedAddRmsNorm_v2_kernel {
     }
 };
 
+// ============================================================================
+// V3: Scaled variant — fuses (hs + r) * scalar, then RMSNorm * weight.
+//     residual ← (hs + r) * scalar  (in-place)
+//     hidden   ← rmsnorm(residual) * weight
+// Used by gemma4 cross-layer fuse: layer N's `final_add + scalar_mul` and
+// layer N+1's `input_norm` collapse into one kernel call.
+//
+// Note: rmsnorm(s*x) = sign(s) * rmsnorm(x), so the math is equivalent to
+// computing the scaled residual first, then norming. We still scale the
+// stored residual so subsequent reads (e.g. router on `residual`) see the
+// correctly scaled value.
+// ============================================================================
+template<int VL>
+struct FusedScaledAddRmsNorm_kernel {
+    fp16*       hidden_ptr;
+    fp16*       residual_ptr;
+    const fp16* weight_ptr;
+    int K;
+    float eps;
+    float scalar;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        int k_aligned = (K / VL) * VL;
+
+        // Pass 1: scaled add + sum_sq
+        float sum_sq = 0.0f;
+        for (int k = 0; k < k_aligned; k += VL) {
+            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + k);
+            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + k);
+            simd<float, VL> added = (h + r) * scalar;
+            block_store<fp16, VL>(residual_ptr + k, simd<fp16, VL>(added));
+            simd<float, VL> sq = added * added;
+            sum_sq += reduce<float>(sq, std::plus<>());
+        }
+        if (k_aligned < K) {
+            int k_tail = K - VL;
+            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + k_tail);
+            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + k_tail);
+            simd<float, VL> added = (h + r) * scalar;
+            block_store<fp16, VL>(residual_ptr + k_tail, simd<fp16, VL>(added));
+            int overlap = k_aligned - k_tail;
+            simd<float, VL> sq = added * added;
+            for (int z = 0; z < overlap; z++) sq[z] = 0.0f;
+            sum_sq += reduce<float>(sq, std::plus<>());
+        }
+
+        float inv_rms = sycl::ext::intel::esimd::rsqrt(
+            simd<float, 8>(sum_sq / (float)K + eps))[0];
+
+        // Pass 2: normalize and write output
+        for (int k = 0; k < k_aligned; k += VL) {
+            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + k);
+            simd<float, VL> w = block_load<fp16, VL>(weight_ptr + k);
+            simd<float, VL> normed = r * inv_rms * w;
+            block_store<fp16, VL>(hidden_ptr + k, simd<fp16, VL>(normed));
+        }
+        if (k_aligned < K) {
+            int k_tail = K - VL;
+            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + k_tail);
+            simd<float, VL> w = block_load<fp16, VL>(weight_ptr + k_tail);
+            simd<float, VL> normed = r * inv_rms * w;
+            block_store<fp16, VL>(hidden_ptr + k_tail, simd<fp16, VL>(normed));
+        }
+    }
+};
+
+inline void fused_scaled_add_rms_norm_host(
+    fp16* hidden_ptr, fp16* residual_ptr, const fp16* weight_ptr,
+    int K, float eps, float scalar, sycl::queue& q)
+{
+    #define LAUNCH_V3(V)         q.submit([&](sycl::handler& cgh) {             cgh.parallel_for(sycl::nd_range<1>(1, 1),                 FusedScaledAddRmsNorm_kernel<V>{hidden_ptr, residual_ptr, weight_ptr, K, eps, scalar});         });
+
+    if      (K % 512 == 0) { LAUNCH_V3(512) }
+    else if (K % 256 == 0) { LAUNCH_V3(256) }
+    else if (K % 128 == 0) { LAUNCH_V3(128) }
+    else                   { LAUNCH_V3(64)  }
+
+    #undef LAUNCH_V3
+}
+
 // V2 host dispatcher: picks VL based on K alignment
 inline void fused_add_rms_norm_v2_host(
     fp16* hidden_ptr, fp16* residual_ptr, const fp16* weight_ptr,

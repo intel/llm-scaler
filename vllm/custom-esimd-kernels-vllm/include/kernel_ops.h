@@ -165,6 +165,11 @@ at::Tensor esimd_fused_add_rms_norm(
     at::Tensor hidden_states, at::Tensor residual,
     at::Tensor weight, double eps);
 
+// Scaled variant: residual <- (hs+r)*scalar; hidden <- norm(residual)*weight
+at::Tensor esimd_fused_scaled_add_rms_norm(
+    at::Tensor hidden_states, at::Tensor residual,
+    at::Tensor weight, double eps, double scalar);
+
 at::Tensor esimd_rms_norm_gated(
     at::Tensor x, at::Tensor z, at::Tensor weight,
     at::Tensor output, double eps);

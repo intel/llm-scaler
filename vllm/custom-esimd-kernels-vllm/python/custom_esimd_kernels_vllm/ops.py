@@ -281,6 +281,27 @@ def esimd_fused_add_rms_norm(
     return _ops.esimd_fused_add_rms_norm(hidden_states, residual, weight, eps)
 
 
+def esimd_fused_scaled_add_rms_norm(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    scalar: float,
+) -> torch.Tensor:
+    """Scaled fused add + RMSNorm.
+
+        residual = (hidden_states + residual) * scalar  (in-place)
+        hidden_states = rmsnorm(residual) * weight       (output)
+
+    Used by gemma4 cross-layer fuse: layer N's `final_add + scalar_mul`
+    plus layer N+1's `input_norm` collapse into one kernel call.
+    `weight` must be pre-adjusted if the model uses a non-vanilla RMSNorm
+    convention (caller's responsibility, same as esimd_fused_add_rms_norm).
+    """
+    return _ops.esimd_fused_scaled_add_rms_norm(
+        hidden_states, residual, weight, eps, scalar)
+
+
 def esimd_fused_add_rms_norm_batched(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
