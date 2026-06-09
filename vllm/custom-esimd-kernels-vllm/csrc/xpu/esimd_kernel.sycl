@@ -438,6 +438,22 @@ at::Tensor esimd_rms_norm_gated(
     return output;
 }
 
+at::Tensor esimd_rms_norm(
+    at::Tensor input,    // [1, K] fp16
+    at::Tensor output,   // [1, K] fp16 — written
+    at::Tensor weight,   // [K] fp16
+    double eps)
+{
+    int K = (int)input.size(-1);
+    auto& dpcpp_queue = get_device_queue(input);
+    rms_norm_host(
+        reinterpret_cast<const fp16*>(input.data_ptr()),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        reinterpret_cast<const fp16*>(weight.data_ptr()),
+        K, (float)eps, dpcpp_queue);
+    return output;
+}
+
 at::Tensor esimd_fused_add_rms_norm(
     at::Tensor hidden_states,  // [1, K] — input/output (normalized result)
     at::Tensor residual,       // [1, K] — updated in-place

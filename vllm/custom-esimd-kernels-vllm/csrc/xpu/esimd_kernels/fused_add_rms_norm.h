@@ -239,3 +239,69 @@ inline void fused_add_rms_norm_v2_host(
 
     #undef LAUNCH_V2
 }
+
+// ============================================================================
+// V4: Plain RMSNorm (no residual add) — for the standalone RMSNorm spots
+// in gemma4 (post_attn_norm, post_ff_norm_1, pre_ff_norm_2, post_ff_norm_2).
+// Same VL templating as v2; reads input, writes output, no in-place residual.
+// ============================================================================
+template<int VL>
+struct RmsNorm_kernel {
+    const fp16* input_ptr;
+    fp16*       output_ptr;
+    const fp16* weight_ptr;
+    int K;
+    float eps;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        int k_aligned = (K / VL) * VL;
+
+        // Pass 1: sum_sq
+        float sum_sq = 0.0f;
+        for (int k = 0; k < k_aligned; k += VL) {
+            simd<float, VL> x = block_load<fp16, VL>(input_ptr + k);
+            simd<float, VL> sq = x * x;
+            sum_sq += reduce<float>(sq, std::plus<>());
+        }
+        if (k_aligned < K) {
+            int k_tail = K - VL;
+            simd<float, VL> x = block_load<fp16, VL>(input_ptr + k_tail);
+            int overlap = k_aligned - k_tail;
+            simd<float, VL> sq = x * x;
+            for (int z = 0; z < overlap; z++) sq[z] = 0.0f;
+            sum_sq += reduce<float>(sq, std::plus<>());
+        }
+
+        float inv_rms = sycl::ext::intel::esimd::rsqrt(
+            simd<float, 8>(sum_sq / (float)K + eps))[0];
+
+        // Pass 2: normalize and write output
+        for (int k = 0; k < k_aligned; k += VL) {
+            simd<float, VL> x = block_load<fp16, VL>(input_ptr + k);
+            simd<float, VL> w = block_load<fp16, VL>(weight_ptr + k);
+            simd<float, VL> normed = x * inv_rms * w;
+            block_store<fp16, VL>(output_ptr + k, simd<fp16, VL>(normed));
+        }
+        if (k_aligned < K) {
+            int k_tail = K - VL;
+            simd<float, VL> x = block_load<fp16, VL>(input_ptr + k_tail);
+            simd<float, VL> w = block_load<fp16, VL>(weight_ptr + k_tail);
+            simd<float, VL> normed = x * inv_rms * w;
+            block_store<fp16, VL>(output_ptr + k_tail, simd<fp16, VL>(normed));
+        }
+    }
+};
+
+inline void rms_norm_host(
+    const fp16* input_ptr, fp16* output_ptr, const fp16* weight_ptr,
+    int K, float eps, sycl::queue& q)
+{
+    #define LAUNCH_V4(V)         q.submit([&](sycl::handler& cgh) {             cgh.parallel_for(sycl::nd_range<1>(1, 1),                 RmsNorm_kernel<V>{input_ptr, output_ptr, weight_ptr, K, eps});         });
+
+    if      (K % 512 == 0) { LAUNCH_V4(512) }
+    else if (K % 256 == 0) { LAUNCH_V4(256) }
+    else if (K % 128 == 0) { LAUNCH_V4(128) }
+    else                   { LAUNCH_V4(64)  }
+
+    #undef LAUNCH_V4
+}

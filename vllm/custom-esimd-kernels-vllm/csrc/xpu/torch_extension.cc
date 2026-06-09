@@ -103,6 +103,12 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
         "int HV, int V, float eps) -> Tensor");
   m.impl("esimd_norm_gemv_int4_pert", torch::kXPU, &esimd_norm_gemv_int4_pert);
 
+  // Standalone RMSNorm (no add): for the spots where input differs from
+  // the accumulating residual stream (post_attn_norm, post_ff_norm_1, etc.).
+  m.def("esimd_rms_norm(Tensor input, Tensor output, "
+        "Tensor weight, float eps) -> Tensor");
+  m.impl("esimd_rms_norm", torch::kXPU, &esimd_rms_norm);
+
   m.def("esimd_fused_add_rms_norm(Tensor hidden_states, Tensor residual, "
         "Tensor weight, float eps) -> Tensor");
   m.impl("esimd_fused_add_rms_norm", torch::kXPU, &esimd_fused_add_rms_norm);

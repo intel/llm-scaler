@@ -296,6 +296,29 @@ def esimd_fused_add_rms_norm(
     return _ops.esimd_fused_add_rms_norm(hidden_states, residual, weight, eps)
 
 
+def esimd_rms_norm(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Standalone RMSNorm (no residual add).
+
+    output = rmsnorm(input) * weight
+
+    For decode (M==1) one-token RMSNorm spots that don't share their input
+    with the accumulating residual stream (e.g. gemma4 post_attn_norm,
+    post_feedforward_layernorm_1, pre_feedforward_layernorm_2,
+    post_feedforward_layernorm_2).
+
+    Caller's responsibility: pass the right weight, including any per-model
+    convention adjustment (e.g. (w-1) if calling from a Qwen-style stack
+    where the kernel adds 1.0 — this kernel does NOT add 1.0; the multiply
+    is done verbatim).
+    """
+    return _ops.esimd_rms_norm(input, output, weight, eps)
+
+
 def esimd_fused_scaled_add_rms_norm(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,

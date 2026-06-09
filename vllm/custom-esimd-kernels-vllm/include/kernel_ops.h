@@ -164,6 +164,11 @@ at::Tensor esimd_norm_gemv_int4_pert(
     at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output,
     int64_t HV, int64_t V, double eps);
 
+// Standalone RMSNorm (no add): output[k] = input[k] * inv_rms(input) * weight[k]
+at::Tensor esimd_rms_norm(
+    at::Tensor input, at::Tensor output,
+    at::Tensor weight, double eps);
+
 // Fused Add + RMSNorm (Gemma-style)
 at::Tensor esimd_fused_add_rms_norm(
     at::Tensor hidden_states, at::Tensor residual,
