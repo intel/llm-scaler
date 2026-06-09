@@ -19,10 +19,27 @@ index b9729cd..20fff80 100644
        conv_states_ptr[width_id * conv_elems + i] =
            conv_states_tmp_ptr[width_id * conv_elems + i];
 diff --git a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp b/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
-index 10d7a1b..66b104c 100644
+index 10d7a1b..e032c2e 100644
 --- a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
 +++ b/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
-@@ -150,10 +150,34 @@ CUTE_DEVICE void chunk_prepare_kernel(
+@@ -121,6 +121,16 @@ CUTE_DEVICE void chunk_prepare_kernel(
+   int chunk_id = total_sg_id % chunk_range;
+   const int v_head_id = total_sg_id / chunk_range;
+ 
++  // Fix (OOB write): total_sg_range = sm_count * (threads/sg) is NOT a multiple
++  // of num_v_heads, so chunk_range = total_sg_range/num_v_heads truncates and
++  // the top range of total_sg_id yields v_head_id >= num_v_heads. Those excess
++  // work-items would index a[... + v_head_id*total_virtual_seqlen] past the end
++  // of the buffer (and A_log[v_head_id] out of range), corrupting adjacent GPU
++  // memory (e.g. in_proj_qkvz.weight). They have no legitimate work -> bail.
++  if (v_head_id >= num_v_heads) {
++    return;
++  }
++
+   const float A_log_exp_h = -sycl::exp(A_log[v_head_id]);
+   const float dt_bias_h = static_cast<float>(dt_bias[v_head_id]);
+ 
+@@ -150,10 +160,34 @@ CUTE_DEVICE void chunk_prepare_kernel(
              a[(chunk_start_offset + sg_local_id * local_num + c) +
                v_head_id * total_virtual_seqlen];
        }
@@ -59,7 +76,7 @@ index 10d7a1b..66b104c 100644
          g_local[c] = a_h;
          g_local_sum += a_h;
        }
-@@ -309,6 +333,10 @@ CUTE_DEVICE void chunk_compute_A_kernel(
+@@ -309,6 +343,10 @@ CUTE_DEVICE void chunk_compute_A_kernel(
  
          reorder(tSrA_c, tCrA_c);
          copy(copy_A_c, tCrA_c, tCgA_c);
@@ -70,7 +87,7 @@ index 10d7a1b..66b104c 100644
        }
        chunk_id += global_chunk_range;
      }
-@@ -928,6 +956,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -928,6 +966,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
      StateT*
          ssm_state,  // [cache_batch_size, num_v_heads, head_v_dim, head_k_dim]
      const int ssm_state_stride_0,
@@ -78,7 +95,7 @@ index 10d7a1b..66b104c 100644
      const int* query_start_loc,
      const int* cache_indices,
      const bool* has_initial_state,
-@@ -997,6 +1026,23 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -997,6 +1036,23 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
          static_cast<int64_t>(cache_indices[batch_id]) * ssm_state_stride_0 +
          v_head_id * head_v_dim * head_k_dim;
  
@@ -102,7 +119,7 @@ index 10d7a1b..66b104c 100644
      for (int chunk_id = 0; chunk_id < current_chunks; ++chunk_id) {
        const bool has_prev_state = (chunk_id != 0) || initial_state;
        const int out_chunk_offset = seq_start_offset + chunk_id * chunk_size;
-@@ -1049,6 +1095,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1049,6 +1105,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
            make_gmem_ptr(S_ptr),
            make_layout(S_tensor_shape, make_stride(head_k_dim, _1{})));
  
@@ -114,7 +131,7 @@ index 10d7a1b..66b104c 100644
        Tensor cU = make_identity_tensor(U_tensor.shape());
  
        auto copy_U_c = get_block_2d_copy_C<void>(mma, U_tensor);
-@@ -1084,7 +1135,8 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1084,7 +1145,8 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
            reorder(tCrU_c, tCrU_d);
            copy(copy_U_d, tCrU_d, tCgU_d);
          }
@@ -124,7 +141,7 @@ index 10d7a1b..66b104c 100644
        }
  
        auto q_ptr =
-@@ -1190,29 +1242,30 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1190,29 +1252,30 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
                K_tensor_T_shape, make_stride(_1{}, head_k_dim * num_k_heads)));
  
        Tensor cS = make_identity_tensor(S_tensor.shape());
@@ -165,7 +182,7 @@ index 10d7a1b..66b104c 100644
                tSrS_d(i) *= g_last_value_exp;
              }
            } else {
-@@ -1221,7 +1274,17 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1221,7 +1284,17 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
  
            gemm_TTS_k_multi(
                U_tensor_T, K_tensor_T, tSrS_d, dv, dk, mma, g_multi_slm_ptr);
@@ -184,7 +201,7 @@ index 10d7a1b..66b104c 100644
            copy(copy_S_d, tCrS_d, tCgS_d);
          }
        }
-@@ -1279,6 +1342,7 @@ void kernel_launcher(
+@@ -1279,6 +1352,7 @@ void kernel_launcher(
      const T* dt_bias,
      StateT* ssm_state,
      const int ssm_state_stride_0,
@@ -192,7 +209,7 @@ index 10d7a1b..66b104c 100644
      const int* query_start_loc,
      const int* cache_indices,
      const bool* has_initial_state,
-@@ -1507,6 +1571,7 @@ void kernel_launcher(
+@@ -1507,6 +1581,7 @@ void kernel_launcher(
                a,
                ssm_state,
                ssm_state_stride_0,
@@ -200,7 +217,7 @@ index 10d7a1b..66b104c 100644
                query_start_loc,
                cache_indices,
                has_initial_state,
-@@ -1583,6 +1648,17 @@ void chunk_gated_delta_rule_impl_xe2(
+@@ -1583,6 +1658,17 @@ void chunk_gated_delta_rule_impl_xe2(
        {num_v_heads, total_seqlen + padding_size, head_v_dim},
        torch::dtype(dtype).device(device).requires_grad(false));
  
@@ -218,7 +235,7 @@ index 10d7a1b..66b104c 100644
  #define KERNEL_LAUNCHER(scalar_t, state_scalar_t)                  \
    kernel_launcher<scalar_t, state_scalar_t>(                       \
        queue,                                                       \
-@@ -1599,6 +1675,7 @@ void chunk_gated_delta_rule_impl_xe2(
+@@ -1599,6 +1685,7 @@ void chunk_gated_delta_rule_impl_xe2(
        reinterpret_cast<scalar_t*>(dt_bias.data_ptr()),             \
        reinterpret_cast<state_scalar_t*>(ssm_state.data_ptr()),     \
        ssm_state_stride_0,                                          \
@@ -227,10 +244,10 @@ index 10d7a1b..66b104c 100644
        reinterpret_cast<int*>(cache_indices.data_ptr()),            \
        has_initial_state.has_value()                                \
 diff --git a/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp b/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp
-index 0f78d83..726bd4e 100644
+index ac2d7d6..fb51306 100644
 --- a/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp
 +++ b/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp
-@@ -349,6 +349,19 @@ CUTE_DEVICE void xe_gemm_4bits(
+@@ -339,6 +339,19 @@ CUTE_DEVICE void xe_gemm_4bits(
    int group_num = get<1>(A.shape()) / group_size;
    int x_idx = sg_local_id / channel_num;
  
@@ -250,7 +267,7 @@ index 0f78d83..726bd4e 100644
    using scaleStoreType = conditional_t<is_same_v<TA, half_t>, half_t, float>;
    scaleStoreType scales[thr_N * channel_num];
  
-@@ -364,7 +377,7 @@ CUTE_DEVICE void xe_gemm_4bits(
+@@ -354,7 +367,7 @@ CUTE_DEVICE void xe_gemm_4bits(
      prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
      prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
  
@@ -259,7 +276,7 @@ index 0f78d83..726bd4e 100644
        auto next_scales_tensor = make_tensor(
            make_gmem_ptr(
                reinterpret_cast<const ElementS*>(
-@@ -416,7 +429,8 @@ CUTE_DEVICE void xe_gemm_4bits(
+@@ -406,7 +419,8 @@ CUTE_DEVICE void xe_gemm_4bits(
          }
        }
  
