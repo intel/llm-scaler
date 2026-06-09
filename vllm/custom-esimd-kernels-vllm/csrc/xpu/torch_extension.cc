@@ -24,6 +24,10 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
   m.impl("esimd_gemv_fp8_pern_fused3", torch::kXPU, &esimd_gemv_fp8_pern_fused3);
 
   // Per-tensor scale variants (N/K inferred from weight shape)
+  // FP16 GEMV (no scale): for fp16 GateLinear-style decode router projection
+  m.def("esimd_gemv_fp16(Tensor input, Tensor weight, Tensor output) -> Tensor");
+  m.impl("esimd_gemv_fp16", torch::kXPU, &esimd_gemv_fp16);
+
   m.def("esimd_gemv_fp8_pert(Tensor input, Tensor weight, Tensor weight_scale, "
         "Tensor output) -> Tensor");
   m.impl("esimd_gemv_fp8_pert", torch::kXPU, &esimd_gemv_fp8_pert);

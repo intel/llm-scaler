@@ -7,6 +7,7 @@
 #include <sycl/sycl.hpp>
 
 #include "esimd_kernels/fp8_GEMV_v2.h"
+#include "esimd_kernels/fp16_GEMV.h"
 #include "esimd_kernels/qkv_split_norm_rope.h"
 #include "esimd_kernels/norm_gemv_fused.h"
 #include "esimd_kernels/fused_add_rms_norm.h"
@@ -87,6 +88,20 @@ at::Tensor esimd_gemv_fp8_pert(
     EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
     auto& dpcpp_queue = get_device_queue(input);
     GEMV_fp8_pert_host(p_in, p_w, p_sc, p_out, N, K, get_fp8_mode(weight), dpcpp_queue);
+    return output;
+}
+
+at::Tensor esimd_gemv_fp16(
+    at::Tensor input,    // [1, K] fp16
+    at::Tensor weight,   // [N, K] fp16
+    at::Tensor output) { // [1, N] fp16
+    int64_t N = weight.size(0);
+    int64_t K = weight.size(1);
+    auto p_in  = reinterpret_cast<const fp16*>(input.data_ptr());
+    auto p_w   = reinterpret_cast<const fp16*>(weight.data_ptr());
+    auto p_out = reinterpret_cast<fp16*>(output.data_ptr());
+    auto& dpcpp_queue = get_device_queue(input);
+    GEMV_fp16_host(p_in, p_w, p_out, (uint32_t)N, (uint32_t)K, dpcpp_queue);
     return output;
 }
 

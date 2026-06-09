@@ -32,6 +32,10 @@ at::Tensor esimd_gemv_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output);
 
+// FP16 weight GEMV (no scale): for fp16 GateLinear-style projections at decode.
+at::Tensor esimd_gemv_fp16(
+    at::Tensor input, at::Tensor weight, at::Tensor output);
+
 at::Tensor esimd_gemv_fp8_pert_fused2(
     at::Tensor input,
     at::Tensor w0, at::Tensor s0, at::Tensor o0,

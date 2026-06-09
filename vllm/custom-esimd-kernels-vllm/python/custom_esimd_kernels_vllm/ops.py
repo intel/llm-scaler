@@ -63,6 +63,21 @@ def esimd_gemv_fp8_pert(
     return _ops.esimd_gemv_fp8_pert(input, weight, weight_scale, output)
 
 
+def esimd_gemv_fp16(
+    input: torch.Tensor, weight: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """FP16 weight GEMV (no quantization). Decode (M=1) path.
+
+    input:  [1, K] fp16
+    weight: [N, K] fp16, contiguous (row-major). N inferred from weight.size(0),
+            K from weight.size(1).
+    output: [1, N] fp16.
+
+    Used by gemma4's decode router projection (GateLinear is fp16 fp16-fp16).
+    """
+    return _ops.esimd_gemv_fp16(input, weight, output)
+
+
 def esimd_gemv_fp8_pert_fused2(
     input: torch.Tensor,
     w0: torch.Tensor, s0: torch.Tensor, o0: torch.Tensor,

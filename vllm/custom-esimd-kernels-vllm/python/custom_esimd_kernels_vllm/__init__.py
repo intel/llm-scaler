@@ -21,6 +21,7 @@ from custom_esimd_kernels_vllm.ops import (
     esimd_gemv_fp8_pern_fused2,
     esimd_gemv_fp8_pern_fused3,
     esimd_gemv_fp8_pert,
+    esimd_gemv_fp16,
     esimd_gemv_fp8_pert_fused2,
     esimd_gemv_fp8_pert_fused3,
     # INT4 GEMV ops
