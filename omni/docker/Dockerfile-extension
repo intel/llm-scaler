@@ -18,6 +18,7 @@ COPY ./patches/extention_comfyui_wanvideowrapper.patch /tmp/
 COPY ./patches/extention_comfyui_florence2.patch /tmp/
 COPY ./patches/extension_comfyui_segment_anything_2.patch /tmp/
 COPY ./patches/extension_comfyui_reactor.patch /tmp/
+COPY ./patches/extension_comfyui_rmbg.patch /tmp/
 
 # Add custom node
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -64,12 +65,23 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/ComfyUI/custom_nodes && \
     rm -rf extension_comfyui_reactor && \
-    git clone --depth 1 https://github.com/Gourieff/ComfyUI-ReActor.git extension_comfyui_reactor && \
-    cd extension_comfyui_reactor && \
+    git clone --depth 1 https://github.com/Gourieff/ComfyUI-ReActor.git comfyui-reactor && \
+    cd comfyui-reactor && \
     git fetch --depth 1 origin 6ad6b35a4df250d14cb2abf0808c9ffedf59f747 && \
     git checkout 6ad6b35a4df250d14cb2abf0808c9ffedf59f747 && \
     git apply /tmp/extension_comfyui_reactor.patch && \
     python install.py && \
     rm -f /tmp/extension_comfyui_reactor.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf ComfyUI-RMBG && \
+    git clone --depth 1 https://github.com/1038lab/ComfyUI-RMBG.git && \
+    cd ComfyUI-RMBG && \
+    git fetch --depth 1 origin d7402513f23f58db7d56754b02a4f51a148b4941 && \
+    git checkout d7402513f23f58db7d56754b02a4f51a148b4941 && \
+    git apply /tmp/extension_comfyui_rmbg.patch && \
+    pip install -r requirements.txt && \
+    rm -f /tmp/extension_comfyui_rmbg.patch
 
 WORKDIR /llm/entrypoints
