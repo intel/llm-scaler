@@ -187,6 +187,18 @@ at::Tensor esimd_fused_add_rms_norm_batched(
     at::Tensor hidden_states, at::Tensor residual,
     at::Tensor weight, double eps);
 
+
+void esimd_norm_gemv_norm_fp16(
+    at::Tensor residual, at::Tensor scale_with_root,
+    at::Tensor proj_w, at::Tensor pre_ff_w,
+    at::Tensor router_logits, at::Tensor moe_input,
+    double eps);
+
+void esimd_scaled_resadd_norm_gemv_fp8_pert(
+    at::Tensor hidden_states, at::Tensor residual,
+    at::Tensor norm_weight, at::Tensor qkv_weight,
+    at::Tensor qkv_scale, at::Tensor qkv_out,
+    double eps, double scalar);
 // ======================== MoE Auxiliary Ops ========================
 
 // Fused softmax + top-8 + normalize
@@ -267,3 +279,17 @@ at::Tensor esimd_moe_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor scale,
     at::Tensor output, at::Tensor expert_idx,
     int64_t N, int64_t K, int64_t num_experts, int64_t max_tokens_per_expert);
+
+void esimd_norm_add_norm(
+    at::Tensor h2_raw, at::Tensor h1,
+    at::Tensor w1, at::Tensor w2, at::Tensor out,
+    double eps1, double eps2);
+
+void esimd_accum_norm_add_norm(
+    at::Tensor routed_output, at::Tensor h1,
+    at::Tensor w1, at::Tensor w2, at::Tensor out,
+    int64_t top_k, double eps1, double eps2);
+
+at::Tensor esimd_gemv_fp8_pert_bmg(
+    at::Tensor input, at::Tensor weight,
+    at::Tensor weight_scale, at::Tensor output);

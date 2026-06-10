@@ -1557,3 +1557,125 @@ def moe_forward_full_gelu_tanh_routed(
         gate_up_weight, gate_up_scale,
         down_weight, down_scale,
         top_k, n_routed_experts)
+
+
+def esimd_norm_gemv_norm_fp16(
+    residual: torch.Tensor,
+    scale_with_root: torch.Tensor,
+    proj_w: torch.Tensor,
+    pre_ff_w: torch.Tensor,
+    router_logits: torch.Tensor,
+    moe_input: torch.Tensor,
+    eps: float,
+) -> None:
+    """Fused (rms_norm | * scale_with_root | fp16 GEMV) + (rms_norm | * pre_ff_w).
+
+    Designed for gemma4 MoE branch where router(residual) and
+    pre_feedforward_layernorm_2(residual) both compute rms(residual) and then
+    apply different post-norm scales -- this kernel shares the rms computation
+    and emits both outputs in one launch.
+
+    Layout:
+        residual:        [1, K] fp16
+        scale_with_root: [K] fp16   (Gemma4 router scale * root_size, pre-folded)
+        proj_w:          [N, K] fp16  (router projection)
+        pre_ff_w:        [K] fp16   (pre_feedforward_layernorm_2 weight)
+        router_logits:   [1, N] fp16
+        moe_input:       [1, K] fp16
+
+    Replaces 3 launches (esimd_rms_norm + esimd_gemv_fp16 + esimd_rms_norm).
+    """
+    return _ops.esimd_norm_gemv_norm_fp16(
+        residual, scale_with_root, proj_w, pre_ff_w,
+        router_logits, moe_input, eps)
+
+
+def esimd_scaled_resadd_norm_gemv_fp8_pert(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    qkv_weight: torch.Tensor,
+    qkv_scale: torch.Tensor,
+    qkv_out: torch.Tensor,
+    eps: float,
+    scalar: float,
+) -> None:
+    """Fused (h+r)*scalar + RMSNorm + FP8 GEMV (qkv_proj decode entry).
+
+    Replaces 2 launches (esimd_fused_scaled_add_rms_norm + the FP8 GEMV inside
+    vllm linear) with one. Updates residual in-place to (h+r)*scalar.
+    """
+    return _ops.esimd_scaled_resadd_norm_gemv_fp8_pert(
+        hidden_states, residual, norm_weight, qkv_weight, qkv_scale, qkv_out,
+        eps, scalar)
+
+
+def esimd_norm_add_norm(
+    h2_raw: torch.Tensor,
+    h1: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    out: torch.Tensor,
+    eps1: float,
+    eps2: float,
+) -> None:
+    """Fused (rms_norm(h2_raw) × w1) + add to h1 + (rms_norm(h1_new) × w2).
+
+    Layout:
+        h2_raw: [1, K] fp16 (read)
+        h1:     [1, K] fp16 (in-place: ← h2_normed_w1 + h1)
+        w1, w2: [K] fp16
+        out:    [1, K] fp16 (= rms_norm(h1) × w2)
+
+    Replaces 2 launches (esimd_rms_norm + esimd_fused_add_rms_norm).
+    """
+    return _ops.esimd_norm_add_norm(h2_raw, h1, w1, w2, out, eps1, eps2)
+
+
+def esimd_accum_norm_add_norm(
+    routed_output: torch.Tensor,
+    h1: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    out: torch.Tensor,
+    top_k: int,
+    eps1: float,
+    eps2: float,
+) -> None:
+    """Fused MoE-output (top_k sum) + RMSNorm × w1 + Add to h1 + RMSNorm × w2.
+
+    Replaces 3 kernels (moe_accumulate + esimd_rms_norm + esimd_fused_add_rms_norm)
+    or 2 kernels (moe_accumulate + esimd_norm_add_norm) with 1.
+    """
+    return _ops.esimd_accum_norm_add_norm(
+        routed_output, h1, w1, w2, out, top_k, eps1, eps2)
+
+
+def moe_forward_full_gelu_tanh_routed_no_accum(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    top_k: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """Same as moe_forward_full_gelu_tanh_routed but without the final
+    moe_accumulate kernel — returns [T*top_k, hidden] partial outputs so
+    the caller can fuse the accumulate into a downstream kernel
+    (e.g. esimd_accum_norm_add_norm)."""
+    return _moe_batch.moe_forward_full_gelu_tanh_routed_no_accum(
+        x, topk_weights, topk_indices,
+        gate_up_weight, gate_up_scale,
+        down_weight, down_scale,
+        top_k, n_routed_experts)
+
+
+def esimd_gemv_fp8_pert_bmg(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """BMG-tuned FP8 per-tensor GEMV with K_SPLIT and tail handling."""
+    return _ops.esimd_gemv_fp8_pert_bmg(input, weight, weight_scale, output)

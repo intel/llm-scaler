@@ -125,6 +125,28 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
   m.def("esimd_fused_add_rms_norm_batched(Tensor hidden_states, Tensor residual, "
         "Tensor weight, float eps) -> Tensor");
   m.impl("esimd_fused_add_rms_norm_batched", torch::kXPU, &esimd_fused_add_rms_norm_batched);
+
+  m.def("esimd_norm_gemv_norm_fp16(Tensor residual, Tensor scale_with_root, "
+        "Tensor proj_w, Tensor pre_ff_w, Tensor router_logits, Tensor moe_input, "
+        "float eps) -> ()");
+  m.impl("esimd_norm_gemv_norm_fp16", torch::kXPU, &esimd_norm_gemv_norm_fp16);
+
+  m.def("esimd_scaled_resadd_norm_gemv_fp8_pert(Tensor hidden_states, Tensor residual, "
+        "Tensor norm_weight, Tensor qkv_weight, Tensor qkv_scale, Tensor qkv_out, "
+        "float eps, float scalar) -> ()");
+  m.impl("esimd_scaled_resadd_norm_gemv_fp8_pert", torch::kXPU, &esimd_scaled_resadd_norm_gemv_fp8_pert);
+
+  m.def("esimd_norm_add_norm(Tensor h2_raw, Tensor h1, Tensor w1, Tensor w2, "
+        "Tensor out, float eps1, float eps2) -> ()");
+  m.impl("esimd_norm_add_norm", torch::kXPU, &esimd_norm_add_norm);
+
+  m.def("esimd_accum_norm_add_norm(Tensor routed_output, Tensor h1, "
+        "Tensor w1, Tensor w2, Tensor out, int top_k, "
+        "float eps1, float eps2) -> ()");
+  m.impl("esimd_accum_norm_add_norm", torch::kXPU, &esimd_accum_norm_add_norm);
+
+  m.def("esimd_gemv_fp8_pert_bmg(Tensor input, Tensor weight, Tensor weight_scale, Tensor output) -> Tensor");
+  m.impl("esimd_gemv_fp8_pert_bmg", torch::kXPU, &esimd_gemv_fp8_pert_bmg);
 }
 
 PyMODINIT_FUNC PyInit_custom_esimd_kernels() {
