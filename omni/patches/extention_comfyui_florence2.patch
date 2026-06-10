@@ -1,0 +1,21 @@
+diff --git a/model/davit.py b/model/davit.py
+index 9d8c9f1..060c621 100644
+--- a/model/davit.py
++++ b/model/davit.py
+@@ -82,7 +82,7 @@ class ConvEmbed(nn.Module):
+             x = x.view(B, H, W, C).permute(0, 3, 1, 2)
+         x = self.proj(x)
+         _, _, H, W = x.shape
+-        x = x.flatten(2).transpose(1, 2)
++        x = x.flatten(2).transpose(1, 2).contiguous()
+         if self.norm and not self.pre_norm:
+             x = self.norm(x)
+         return x, (H, W)
+@@ -219,6 +219,7 @@ class DaViT(nn.Module):
+     def forward_features_unpool(self, x):
+         """[B, 3, H, W] -> [B, N, C]"""
+         input_size = (x.size(2), x.size(3))
++        x = x.contiguous()
+         for conv, block in zip(self.convs, self.blocks):
+             x, input_size = conv(x, input_size)
+             x, input_size = block(x, input_size)

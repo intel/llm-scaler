@@ -17,6 +17,10 @@ ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python${PYTHON_VERSION}/dist-
 COPY ./patches/extention_comfyui_wanvideowrapper.patch /tmp/
 COPY ./patches/comfyui-layerstyle_advance-add-intel-xpu-support-for-joy-caption-beta1.patch /tmp/
 COPY ./patches/art-venture-resize-mask-to-match-image-spatial-size.patch /tmp
+COPY ./patches/extention_comfyui_florence2.patch /tmp/
+COPY ./patches/extension_comfyui_segment_anything_2.patch /tmp/
+COPY ./patches/extension_comfyui_reactor.patch /tmp/
+COPY ./patches/extension_comfyui_rmbg.patch /tmp/
 
 # Add custom node
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -58,5 +62,57 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git apply /tmp/art-venture-resize-mask-to-match-image-spatial-size.patch && \
     pip install -r requirements.txt && \
     rm -rf /tmp/art-venture-resize-mask-to-match-image-spatial-size.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf comfyui-florence2 && \
+    git clone --depth 1 https://github.com/kijai/ComfyUI-Florence2.git comfyui-florence2 && \
+    cd comfyui-florence2 && \
+    git fetch --depth 1 origin 9ece3de914214c5f581d725167bc9d0eeb0d1120 && \
+    git checkout 9ece3de914214c5f581d725167bc9d0eeb0d1120 && \
+    git apply /tmp/extention_comfyui_florence2.patch && \
+    pip install -r requirements.txt && \
+    rm -f /tmp/extention_comfyui_florence2.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf comfyui_layerstyle && \
+    git clone --depth 1 https://github.com/chflame163/ComfyUI_LayerStyle.git comfyui_layerstyle && \
+    cd comfyui_layerstyle && \
+    git fetch --depth 1 origin d94bef1ee5ed3656f5ff1bb2830a4ffd94f40935 && \
+    git checkout d94bef1ee5ed3656f5ff1bb2830a4ffd94f40935 && \
+    pip install -r requirements.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf comfyui-segment-anything-2 && \
+    git clone --depth 1 https://github.com/kijai/ComfyUI-segment-anything-2.git comfyui-segment-anything-2 && \
+    cd comfyui-segment-anything-2 && \
+    git fetch --depth 1 origin 0c35fff5f382803e2310103357b5e985f5437f32 && \
+    git checkout 0c35fff5f382803e2310103357b5e985f5437f32 && \
+    git apply /tmp/extension_comfyui_segment_anything_2.patch && \
+    rm -f /tmp/extension_comfyui_segment_anything_2.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf extension_comfyui_reactor && \
+    git clone --depth 1 https://github.com/Gourieff/ComfyUI-ReActor.git comfyui-reactor && \
+    cd comfyui-reactor && \
+    git fetch --depth 1 origin 6ad6b35a4df250d14cb2abf0808c9ffedf59f747 && \
+    git checkout 6ad6b35a4df250d14cb2abf0808c9ffedf59f747 && \
+    git apply /tmp/extension_comfyui_reactor.patch && \
+    python install.py && \
+    rm -f /tmp/extension_comfyui_reactor.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf ComfyUI-RMBG && \
+    git clone --depth 1 https://github.com/1038lab/ComfyUI-RMBG.git && \
+    cd ComfyUI-RMBG && \
+    git fetch --depth 1 origin d7402513f23f58db7d56754b02a4f51a148b4941 && \
+    git checkout d7402513f23f58db7d56754b02a4f51a148b4941 && \
+    git apply /tmp/extension_comfyui_rmbg.patch && \
+    pip install -r requirements.txt && \
+    rm -f /tmp/extension_comfyui_rmbg.patch
 
 WORKDIR /llm/entrypoints

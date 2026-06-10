@@ -1,0 +1,509 @@
+diff --git a/install.py b/install.py
+index 14cd972..28966a7 100644
+--- a/install.py
++++ b/install.py
+@@ -66,19 +66,32 @@ with open(req_file) as file:
+         ort = "onnxruntime-gpu"
+         import torch
+         cuda_version = None
+-        if torch.cuda.is_available():
++        xpu_available = False
++        if hasattr(torch, "xpu"):
++            try:
++                xpu_available = torch.xpu.is_available()
++            except Exception:
++                xpu_available = False
++
++        if xpu_available:
++            ort = "onnxruntime-openvino"
++            print("XPU detected, using onnxruntime-openvino")
++        elif torch.cuda.is_available():
+             cuda_version = torch.version.cuda
+             print(f"CUDA {cuda_version}")
+         elif torch.backends.mps.is_available() or hasattr(torch,'dml') or hasattr(torch,'privateuseone'):
+             ort = "onnxruntime"
+-        if cuda_version is not None and float(cuda_version)>=12 and torch.torch_version.__version__ <= "2.2.0": # CU12.x and torch<=2.2.0
++
++        if ort == "onnxruntime-gpu" and cuda_version is not None and float(cuda_version)>=12 and torch.torch_version.__version__ <= "2.2.0": # CU12.x and torch<=2.2.0
+             print(f"Torch: {torch.torch_version.__version__}")
+             if not is_installed(ort,"1.17.0",False):
+                 run_pip(ort,"--extra-index-url", "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/")
+-        elif cuda_version is not None and float(cuda_version)>=12 and torch.torch_version.__version__ >= "2.4.0" : # CU12.x and latest torch
++        elif ort == "onnxruntime-gpu" and cuda_version is not None and float(cuda_version)>=12 and torch.torch_version.__version__ >= "2.4.0" : # CU12.x and latest torch
+             print(f"Torch: {torch.torch_version.__version__}")
+             if not is_installed(ort,"1.20.1",False): # latest ort-gpu
+                 run_pip(ort,"-U")
++        elif ort == "onnxruntime-openvino" and not is_installed(ort, "1.18.0", False):
++            run_pip(ort, "-U")
+         elif not is_installed(ort,"1.16.1",False):
+             run_pip(ort, "-U")
+     except Exception as e:
+diff --git a/nodes.py b/nodes.py
+index 0904da2..4175773 100644
+--- a/nodes.py
++++ b/nodes.py
+@@ -53,6 +53,7 @@ from reactor_utils import (
+     normalize_cropped_face,
+     add_folder_path_and_extensions,
+     rgba2rgb_tensor,
++    clear_torch_cache,
+     progress_bar,
+     progress_bar_reset
+ )
+@@ -364,7 +365,7 @@ class reactor:
+                                     restored_face = tensor2img(output, rgb2bgr=True, min_max=(-1, 1))
+ 
+                             del output
+-                            torch.cuda.empty_cache()
++                            clear_torch_cache(device)
+ 
+                         except Exception as error:
+ 
+@@ -1139,7 +1140,7 @@ class RestoreFaceAdvanced:
+                                 restored_face = tensor2img(output, rgb2bgr=True, min_max=(-1, 1))
+ 
+                         del output
+-                        torch.cuda.empty_cache()
++                        clear_torch_cache(device)
+ 
+                     except Exception as error:
+ 
+@@ -1490,10 +1491,7 @@ class MaskHelper:
+ 
+                 pbar.update(1)
+ 
+-        try:
+-            torch.cuda.empty_cache()
+-        except:
+-            pass
++        clear_torch_cache(device)
+ 
+         progress_bar_reset(pbar)
+         
+diff --git a/r_facelib/detection/__init__.py b/r_facelib/detection/__init__.py
+index 47c76ab..c454645 100644
+--- a/r_facelib/detection/__init__.py
++++ b/r_facelib/detection/__init__.py
+@@ -12,7 +12,30 @@ from .retinaface.retinaface import RetinaFace
+ from .yolov5face.face_detector import YoloDetector
+ 
+ 
+-def init_detection_model(model_name, half=False, device='cuda'):
++def _default_device():
++    if hasattr(torch, 'xpu'):
++        try:
++            if torch.xpu.is_available():
++                return 'xpu'
++        except Exception:
++            pass
++
++    if torch.cuda.is_available():
++        return 'cuda'
++
++    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
++        return 'mps'
++
++    if hasattr(torch, 'privateuseone'):
++        return 'privateuseone:0'
++
++    return 'cpu'
++
++
++def init_detection_model(model_name, half=False, device=None):
++    if device is None:
++        device = _default_device()
++
+     if 'retinaface' in model_name:
+         model = init_retinaface_model(model_name, half, device)
+     elif 'YOLOv5' in model_name:
+@@ -23,7 +46,10 @@ def init_detection_model(model_name, half=False, device='cuda'):
+     return model
+ 
+ 
+-def init_retinaface_model(model_name, half=False, device='cuda'):
++def init_retinaface_model(model_name, half=False, device=None):
++    if device is None:
++        device = _default_device()
++
+     if model_name == 'retinaface_resnet50':
+         model = RetinaFace(network_name='resnet50', half=half)
+         model_url = 'https://github.com/xinntao/facexlib/releases/download/v0.1.0/detection_Resnet50_Final.pth'
+@@ -47,7 +73,10 @@ def init_retinaface_model(model_name, half=False, device='cuda'):
+     return model
+ 
+ 
+-def init_yolov5face_model(model_name, device='cuda'):
++def init_yolov5face_model(model_name, device=None):
++    if device is None:
++        device = _default_device()
++
+     current_dir = str(pathlib.Path(__file__).parent.resolve())
+     if model_name == 'YOLOv5l':
+         model = YoloDetector(config_name=current_dir+'/yolov5face/models/yolov5l.yaml', device=device)
+diff --git a/r_facelib/detection/retinaface/retinaface.py b/r_facelib/detection/retinaface/retinaface.py
+index 5b9b9b0..c678c1a 100644
+--- a/r_facelib/detection/retinaface/retinaface.py
++++ b/r_facelib/detection/retinaface/retinaface.py
+@@ -13,23 +13,31 @@ from r_facelib.detection.retinaface.retinaface_net import FPN, SSH, MobileNetV1,
+ from r_facelib.detection.retinaface.retinaface_utils import (PriorBox, batched_decode, batched_decode_landm, decode, decode_landm,
+                                                  py_cpu_nms)
+ 
+-#device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+-if torch.cuda.is_available():
+-    device = torch.device('cuda')
+-elif torch.backends.mps.is_available():
+-    device = torch.device('mps')
+-# elif hasattr(torch,'dml'):
+-#     device = torch.device('dml')
+-elif hasattr(torch,'dml') or hasattr(torch,'privateuseone'): # AMD
+-    if shared.cmd_opts is not None: # A1111
+-        if shared.cmd_opts.device_id is not None:
+-            device = torch.device(f'privateuseone:{shared.cmd_opts.device_id}')
+-        else:
+-            device = torch.device('privateuseone:0')
+-    else:
+-        device = torch.device('privateuseone:0')
+-else:
+-    device = torch.device('cpu')
++def _select_device():
++    if hasattr(torch, 'xpu'):
++        try:
++            if torch.xpu.is_available():
++                return torch.device('xpu')
++        except Exception:
++            pass
++
++    if torch.cuda.is_available():
++        return torch.device('cuda')
++
++    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
++        return torch.device('mps')
++
++    if hasattr(torch, 'dml') or hasattr(torch, 'privateuseone'):  # AMD
++        if shared.cmd_opts is not None:  # A1111
++            if shared.cmd_opts.device_id is not None:
++                return torch.device(f'privateuseone:{shared.cmd_opts.device_id}')
++            return torch.device('privateuseone:0')
++        return torch.device('privateuseone:0')
++
++    return torch.device('cpu')
++
++
++device = _select_device()
+ 
+ 
+ def generate_config(network_name):
+diff --git a/r_facelib/parsing/__init__.py b/r_facelib/parsing/__init__.py
+index db827ff..848eff8 100644
+--- a/r_facelib/parsing/__init__.py
++++ b/r_facelib/parsing/__init__.py
+@@ -5,7 +5,30 @@ from .bisenet import BiSeNet
+ from .parsenet import ParseNet
+ 
+ 
+-def init_parsing_model(model_name='bisenet', half=False, device='cuda'):
++def _default_device():
++    if hasattr(torch, 'xpu'):
++        try:
++            if torch.xpu.is_available():
++                return 'xpu'
++        except Exception:
++            pass
++
++    if torch.cuda.is_available():
++        return 'cuda'
++
++    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
++        return 'mps'
++
++    if hasattr(torch, 'privateuseone'):
++        return 'privateuseone:0'
++
++    return 'cpu'
++
++
++def init_parsing_model(model_name='bisenet', half=False, device=None):
++    if device is None:
++        device = _default_device()
++
+     if model_name == 'bisenet':
+         model = BiSeNet(num_class=19)
+         model_url = 'https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/parsing_bisenet.pth'
+diff --git a/r_facelib/utils/face_restoration_helper.py b/r_facelib/utils/face_restoration_helper.py
+index 5935125..92f4e7f 100644
+--- a/r_facelib/utils/face_restoration_helper.py
++++ b/r_facelib/utils/face_restoration_helper.py
+@@ -97,7 +97,26 @@ class FaceRestoreHelper(object):
+         self.pad_input_imgs = []
+ 
+         if device is None:
+-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
++            if hasattr(torch, 'xpu'):
++                try:
++                    if torch.xpu.is_available():
++                        self.device = torch.device('xpu')
++                    elif torch.cuda.is_available():
++                        self.device = torch.device('cuda')
++                    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
++                        self.device = torch.device('mps')
++                    elif hasattr(torch, 'privateuseone'):
++                        self.device = torch.device('privateuseone:0')
++                    else:
++                        self.device = torch.device('cpu')
++                except Exception:
++                    self.device = torch.device('cpu')
++            elif torch.cuda.is_available():
++                self.device = torch.device('cuda')
++            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
++                self.device = torch.device('mps')
++            else:
++                self.device = torch.device('cpu')
+         else:
+             self.device = device
+ 
+diff --git a/reactor_utils.py b/reactor_utils.py
+index cdd3eb8..4082b70 100644
+--- a/reactor_utils.py
++++ b/reactor_utils.py
+@@ -212,10 +212,98 @@ def get_ort_session():
+     global ORT_SESSION
+     return ORT_SESSION
+ 
+-def set_ort_session(model_path, providers) -> Any:
++def _torch_cuda_available() -> bool:
++    try:
++        return torch.cuda.is_available()
++    except Exception:
++        return False
++
++
++def _torch_xpu_available() -> bool:
++    try:
++        return hasattr(torch, "xpu") and torch.xpu.is_available()
++    except Exception:
++        return False
++
++
++def _torch_mps_available() -> bool:
++    try:
++        return hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
++    except Exception:
++        return False
++
++
++def _torch_rocm_like_available() -> bool:
++    return hasattr(torch, "dml") or hasattr(torch, "privateuseone")
++
++
++def resolve_onnx_providers(providers=None):
++    try:
++        available_providers = onnxruntime.get_available_providers()
++    except Exception:
++        available_providers = ["CPUExecutionProvider"]
++
++    if providers:
++        resolved = [provider for provider in providers if provider in available_providers]
++        if "CPUExecutionProvider" in available_providers and "CPUExecutionProvider" not in resolved:
++            resolved.append("CPUExecutionProvider")
++        if resolved:
++            return resolved
++
++    preferred = []
++    if _torch_cuda_available():
++        preferred.append("CUDAExecutionProvider")
++    if _torch_xpu_available():
++        preferred.append("OpenVINOExecutionProvider")
++    if _torch_mps_available():
++        preferred.append("CoreMLExecutionProvider")
++    if _torch_rocm_like_available():
++        preferred.append("ROCMExecutionProvider")
++    preferred.append("CPUExecutionProvider")
++
++    resolved = [provider for provider in preferred if provider in available_providers]
++    if not resolved:
++        return ["CPUExecutionProvider"]
++    return resolved
++
++
++def _safe_empty_cache(device_type: str) -> None:
++    if device_type == "cuda" and _torch_cuda_available():
++        torch.cuda.empty_cache()
++    elif device_type == "xpu" and _torch_xpu_available() and hasattr(torch.xpu, "empty_cache"):
++        torch.xpu.empty_cache()
++    elif device_type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
++        torch.mps.empty_cache()
++
++
++def clear_torch_cache(device=None) -> None:
++    try:
++        if device is not None:
++            if isinstance(device, torch.device):
++                device_type = device.type
++            else:
++                device_type = torch.device(device).type
++            _safe_empty_cache(device_type)
++            return
++    except Exception:
++        pass
++
++    # Fallback: clear caches on all known backends, if available.
++    for device_type in ("cuda", "xpu", "mps"):
++        try:
++            _safe_empty_cache(device_type)
++        except Exception:
++            continue
++
++
++def set_ort_session(model_path, providers=None) -> Any:
+     global ORT_SESSION
+     onnxruntime.set_default_logger_severity(3)
+-    ORT_SESSION = onnxruntime.InferenceSession(model_path, providers=providers)
++    resolved_providers = resolve_onnx_providers(providers)
++    try:
++        ORT_SESSION = onnxruntime.InferenceSession(model_path, providers=resolved_providers)
++    except Exception:
++        ORT_SESSION = onnxruntime.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+     return ORT_SESSION
+ 
+ def clear_ort_session() -> None:
+diff --git a/requirements.txt b/requirements.txt
+index d01894a..fc3817f 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -4,3 +4,4 @@ opencv-python>=4.7.0.72
+ numpy
+ segment_anything
+ ultralytics
++onnxruntime-openvino
+diff --git a/scripts/r_faceboost/restorer.py b/scripts/r_faceboost/restorer.py
+index 0f62977..496754a 100644
+--- a/scripts/r_faceboost/restorer.py
++++ b/scripts/r_faceboost/restorer.py
+@@ -4,11 +4,6 @@ import numpy as np
+ import torch
+ from torchvision.transforms.functional import normalize
+ 
+-try:
+-    import torch.cuda as cuda
+-except:
+-    cuda = None
+-
+ import comfy.utils
+ import folder_paths
+ import comfy.model_management as model_management
+@@ -20,18 +15,14 @@ from reactor_utils import (
+     tensor2img,
+     img2tensor,
+     set_ort_session,
++    resolve_onnx_providers,
++    clear_torch_cache,
+     prepare_cropped_face,
+     normalize_cropped_face
+ )
+ 
+ 
+-if cuda is not None:
+-    if cuda.is_available():
+-        providers = ["CUDAExecutionProvider"]
+-    else:
+-        providers = ["CPUExecutionProvider"]
+-else:
+-    providers = ["CPUExecutionProvider"]
++providers = resolve_onnx_providers()
+ 
+ 
+ def get_restored_face(cropped_face,
+@@ -116,7 +107,7 @@ def get_restored_face(cropped_face,
+                 restored_face = tensor2img(output, rgb2bgr=True, min_max=(-1, 1))
+ 
+         del output
+-        torch.cuda.empty_cache()
++        clear_torch_cache(device)
+ 
+     except Exception as error:
+ 
+diff --git a/scripts/r_masking/core.py b/scripts/r_masking/core.py
+index 197e7fc..cdacff8 100644
+--- a/scripts/r_masking/core.py
++++ b/scripts/r_masking/core.py
+@@ -598,7 +598,7 @@ def make_sam_mask_segmented(sam_model, segs, image, detection_hint, dilation,
+         mask = combine_masks2(total_masks)
+ 
+     finally:
+-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++        device = model_management.get_torch_device()
+         sam_model.to(device)
+         # if sam_model.is_auto_mode:
+         #     sam_model.cpu()
+diff --git a/scripts/reactor_sfw.py b/scripts/reactor_sfw.py
+index 3027642..bd92fe1 100644
+--- a/scripts/reactor_sfw.py
++++ b/scripts/reactor_sfw.py
+@@ -34,6 +34,15 @@ SCORE = 0.979
+ 
+ logging.getLogger("transformers").setLevel(logging.ERROR)
+ 
++
++def _hf_pipeline_device(device) -> str:
++    device_str = str(device).lower()
++    if "cpu" in device_str:
++        return "cpu"
++    if "privateuseone" in device_str:
++        return "cpu"
++    return str(device)
++
+ def nsfw_image(img_data, model_path: str):
+     if not MODEL_EXISTS:
+         logger.status("Ensuring NSFW detection model exists...")
+@@ -41,13 +50,18 @@ def nsfw_image(img_data, model_path: str):
+             return True
+     device = model_management.get_torch_device()
+     with Image.open(io.BytesIO(img_data)) as img:
+-        if "cpu" in str(device):
++        pipeline_device = _hf_pipeline_device(device)
++        if pipeline_device == "cpu":
+             predict = pipeline("image-classification", model=model_path)
+         else:
+-            device_id = 0
+-            if "cuda" in str(device):
+-                device_id = int(str(device).split(":")[1])
+-            predict = pipeline("image-classification", model=model_path, device=device_id)
++            try:
++                predict = pipeline("image-classification", model=model_path, device=pipeline_device)
++            except Exception:
++                if pipeline_device.startswith("cuda"):
++                    device_id = int(pipeline_device.split(":")[1]) if ":" in pipeline_device else 0
++                    predict = pipeline("image-classification", model=model_path, device=device_id)
++                else:
++                    predict = pipeline("image-classification", model=model_path)
+         result = predict(img)
+         if result[0]["label"] == "nsfw" and result[0]["score"] > SCORE:
+             logger.status(f'NSFW content detected with score={result[0]["score"]}, skipping...')
+diff --git a/scripts/reactor_swapper.py b/scripts/reactor_swapper.py
+index d3f0c7b..5e8076d 100644
+--- a/scripts/reactor_swapper.py
++++ b/scripts/reactor_swapper.py
+@@ -20,6 +20,7 @@ from scripts.reactor_logger import logger
+ from reactor_utils import (
+     move_path,
+     get_image_md5hash,
++    resolve_onnx_providers,
+     progress_bar,
+     progress_bar_reset
+ )
+@@ -32,14 +33,7 @@ np.warnings.filterwarnings('ignore')
+ 
+ # PROVIDERS
+ try:
+-    if torch.cuda.is_available():
+-        providers = ["CUDAExecutionProvider"]
+-    elif torch.backends.mps.is_available():
+-        providers = ["CoreMLExecutionProvider"]
+-    elif hasattr(torch,'dml') or hasattr(torch,'privateuseone'):
+-        providers = ["ROCMExecutionProvider"]
+-    else:
+-        providers = ["CPUExecutionProvider"]
++    providers = resolve_onnx_providers()
+ except Exception as e:
+     logger.debug(f"ExecutionProviderError: {e}.\nEP is set to CPU.")
+     providers = ["CPUExecutionProvider"]

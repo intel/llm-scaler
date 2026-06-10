@@ -1,0 +1,94 @@
+diff --git a/nodes.py b/nodes.py
+index c5ac406..a2b6bac 100644
+--- a/nodes.py
++++ b/nodes.py
+@@ -16,6 +16,18 @@ import folder_paths
+ 
+ script_directory = os.path.dirname(os.path.abspath(__file__))
+ 
++
++def _is_xpu_available():
++    return hasattr(torch, "xpu") and torch.xpu.is_available()
++
++
++def _get_autocast_context(device, dtype):
++    if mm.is_device_mps(device):
++        return nullcontext()
++    if device.type == "xpu":
++        return torch.autocast(device_type="xpu", dtype=dtype)
++    return torch.autocast(mm.get_autocast_device(device), dtype=dtype)
++
+ class DownloadAndLoadSAM2Model:
+     @classmethod
+     def INPUT_TYPES(s):
+@@ -33,7 +45,7 @@ class DownloadAndLoadSAM2Model:
+             "segmentor": (
+                     ['single_image','video', 'automaskgenerator'],
+                     ),
+-            "device": (['cuda', 'cpu', 'mps'], ),
++                "device": (['cuda', 'cpu', 'mps', 'xpu'], ),
+             "precision": ([ 'fp16','bf16','fp32'],
+                     {
+                     "default": 'fp16'
+@@ -51,13 +63,20 @@ class DownloadAndLoadSAM2Model:
+         if precision != 'fp32' and device == 'cpu':
+             raise ValueError("fp16 and bf16 are not supported on cpu")
+ 
++        if device == "cuda" and not torch.cuda.is_available():
++            raise ValueError("CUDA device selected but CUDA is not available")
++        if device == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
++            raise ValueError("MPS device selected but MPS is not available")
++        if device == "xpu" and not _is_xpu_available():
++            raise ValueError("XPU device selected but Intel XPU is not available")
++
+         if device == "cuda":
+             if torch.cuda.get_device_properties(0).major >= 8:
+                 # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+                 torch.backends.cuda.matmul.allow_tf32 = True
+                 torch.backends.cudnn.allow_tf32 = True
+         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
+-        device = {"cuda": torch.device("cuda"), "cpu": torch.device("cpu"), "mps": torch.device("mps")}[device]
++        device = {"cuda": torch.device("cuda"), "cpu": torch.device("cpu"), "mps": torch.device("mps"), "xpu": torch.device("xpu")}[device]
+ 
+         download_path = os.path.join(folder_paths.models_dir, "sam2")
+         if precision != 'fp32' and "2.1" in model:
+@@ -305,8 +324,7 @@ class Sam2Segmentation:
+         except:
+             model.model.to(device)
+         
+-        autocast_condition = not mm.is_device_mps(device)
+-        with torch.autocast(mm.get_autocast_device(device), dtype=dtype) if autocast_condition else nullcontext():
++        with _get_autocast_context(device, dtype):
+             if segmentor == 'single_image':
+                 image_np = (image.contiguous() * 255).byte().numpy()
+                 comfy_pbar = ProgressBar(len(image_np))
+@@ -503,8 +521,7 @@ class Sam2VideoSegmentationAddPoints:
+         
+         model.to(device)
+         
+-        autocast_condition = not mm.is_device_mps(device)
+-        with torch.autocast(mm.get_autocast_device(model.device), dtype=dtype) if autocast_condition else nullcontext(): 
++        with _get_autocast_context(device, dtype):
+             if prev_inference_state is None:
+                 print("Initializing inference state")
+                 if hasattr(self, 'inference_state'):
+@@ -563,8 +580,7 @@ class Sam2VideoSegmentation:
+ 
+         model.to(device)
+         
+-        autocast_condition = not mm.is_device_mps(device)
+-        with torch.autocast(mm.get_autocast_device(device), dtype=dtype) if autocast_condition else nullcontext(): 
++        with _get_autocast_context(device, dtype):
+             
+             #if hasattr(self, 'inference_state'):
+             #    model.reset_state(self.inference_state)
+@@ -665,8 +681,7 @@ class Sam2AutoSegmentation:
+         mask_list=[]
+         
+         pbar = ProgressBar(B)
+-        autocast_condition = not mm.is_device_mps(device)
+-        with torch.autocast(mm.get_autocast_device(device), dtype=dtype) if autocast_condition else nullcontext():
++        with _get_autocast_context(device, dtype):
+             for img_np in image_np:
+                 result_dict = model.generate(img_np)
+                 mask_list = [item['segmentation'] for item in result_dict]
