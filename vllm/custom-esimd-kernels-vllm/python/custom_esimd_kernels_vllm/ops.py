@@ -63,6 +63,21 @@ def esimd_gemv_fp8_pert(
     return _ops.esimd_gemv_fp8_pert(input, weight, weight_scale, output)
 
 
+def esimd_gemv_fp16(
+    input: torch.Tensor, weight: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """FP16 weight GEMV (no quantization). Decode (M=1) path.
+
+    input:  [1, K] fp16
+    weight: [N, K] fp16, contiguous (row-major). N inferred from weight.size(0),
+            K from weight.size(1).
+    output: [1, N] fp16.
+
+    Used by gemma4's decode router projection (GateLinear is fp16 fp16-fp16).
+    """
+    return _ops.esimd_gemv_fp16(input, weight, output)
+
+
 def esimd_gemv_fp8_pert_fused2(
     input: torch.Tensor,
     w0: torch.Tensor, s0: torch.Tensor, o0: torch.Tensor,
@@ -191,6 +206,35 @@ def esimd_qkv_split_norm_rope(
         q_heads, kv_heads, attn_output_gate, rotary_dim, cos_sin_cache)
 
 
+def esimd_qkv_split_norm_rope_v(
+    qkv_state: torch.Tensor,
+    q_out: torch.Tensor,
+    gate_out: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    norm_wq: torch.Tensor,
+    norm_wk: torch.Tensor,
+    norm_wv: torch.Tensor,
+    positions: torch.Tensor,
+    q_heads: int,
+    kv_heads: int,
+    attn_output_gate: bool,
+    rotary_dim: int = 256,
+    cos_sin_cache: torch.Tensor = None,
+) -> torch.Tensor:
+    """Like esimd_qkv_split_norm_rope, but also RMSNorms V heads (no RoPE).
+
+    All norm weights still follow the Qwen w+1.0 convention; gemma4 callers
+    must pass (gemma_weight - 1.0) so the kernel's `+1.0` reproduces the
+    desired RMSNorm scale. For gemma4 V-Norm (has_weight=False), pass a
+    zeros([head_dim]) tensor so the kernel multiplies by ones.
+    """
+    return _ops.esimd_qkv_split_norm_rope_v(
+        qkv_state, q_out, gate_out, k_out, v_out,
+        norm_wq, norm_wk, norm_wv, positions,
+        q_heads, kv_heads, attn_output_gate, rotary_dim, cos_sin_cache)
+
+
 # ---- Fused Conv1d + GDN (doubleGRF, LGRF module) ----
 
 def esimd_gdn_conv_fused(
@@ -250,6 +294,50 @@ def esimd_fused_add_rms_norm(
     weight must be pre-adjusted (w+1.0).
     """
     return _ops.esimd_fused_add_rms_norm(hidden_states, residual, weight, eps)
+
+
+def esimd_rms_norm(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Standalone RMSNorm (no residual add).
+
+    output = rmsnorm(input) * weight
+
+    For decode (M==1) one-token RMSNorm spots that don't share their input
+    with the accumulating residual stream (e.g. gemma4 post_attn_norm,
+    post_feedforward_layernorm_1, pre_feedforward_layernorm_2,
+    post_feedforward_layernorm_2).
+
+    Caller's responsibility: pass the right weight, including any per-model
+    convention adjustment (e.g. (w-1) if calling from a Qwen-style stack
+    where the kernel adds 1.0 — this kernel does NOT add 1.0; the multiply
+    is done verbatim).
+    """
+    return _ops.esimd_rms_norm(input, output, weight, eps)
+
+
+def esimd_fused_scaled_add_rms_norm(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    scalar: float,
+) -> torch.Tensor:
+    """Scaled fused add + RMSNorm.
+
+        residual = (hidden_states + residual) * scalar  (in-place)
+        hidden_states = rmsnorm(residual) * weight       (output)
+
+    Used by gemma4 cross-layer fuse: layer N's `final_add + scalar_mul`
+    plus layer N+1's `input_norm` collapse into one kernel call.
+    `weight` must be pre-adjusted if the model uses a non-vanilla RMSNorm
+    convention (caller's responsibility, same as esimd_fused_add_rms_norm).
+    """
+    return _ops.esimd_fused_scaled_add_rms_norm(
+        hidden_states, residual, weight, eps, scalar)
 
 
 def esimd_fused_add_rms_norm_batched(
@@ -537,6 +625,17 @@ def esimd_moe_silu_mul(
     output: [total_rows, N_half] fp16
     """
     return _ops.esimd_moe_silu_mul(input, output, N_gate_up, N_half, total_rows)
+
+
+def esimd_moe_gelu_tanh_mul(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    N_gate_up: int,
+    N_half: int,
+    total_rows: int,
+) -> torch.Tensor:
+    """GELU_tanh(gate) * up activation (gemma4 MoE)."""
+    return _ops.esimd_moe_gelu_tanh_mul(input, output, N_gate_up, N_half, total_rows)
 
 
 def esimd_moe_gather(
@@ -1416,3 +1515,167 @@ def moe_forward_cutlass_nmajor_int4_full(
         x, logits, w13, w13_scales, w2, w2_scales,
         shared_gu_w, shared_d_w, shared_gate_w,
         top_k, num_shared_experts, n_routed_experts)
+
+
+def moe_forward_full_gelu_tanh(
+    x: torch.Tensor,
+    logits: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    top_k: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """Full MoE forward with gelu_tanh activation (gemma4, no shared expert)."""
+    return _moe_batch.moe_forward_full_gelu_tanh(
+        x, logits, gate_up_weight, gate_up_scale,
+        down_weight, down_scale, top_k, n_routed_experts)
+
+
+def moe_forward_full_gelu_tanh_routed(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    top_k: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """gelu_tanh MoE with caller-supplied routing.
+
+    Use when the model needs routing logic the kernel's built-in
+    softmax/topk does not cover (e.g. gemma4 folds per_expert_scale into
+    the routing weights). topk_weights must be fp16 [T, top_k];
+    topk_indices int32 [T, top_k]. Weight layout is the unmodified vllm
+    FusedMoE format: w13 [E, 2*inter, hidden], w2 [E, hidden, inter].
+    """
+    return _moe_batch.moe_forward_full_gelu_tanh_routed(
+        x, topk_weights, topk_indices,
+        gate_up_weight, gate_up_scale,
+        down_weight, down_scale,
+        top_k, n_routed_experts)
+
+
+def esimd_norm_gemv_norm_fp16(
+    residual: torch.Tensor,
+    scale_with_root: torch.Tensor,
+    proj_w: torch.Tensor,
+    pre_ff_w: torch.Tensor,
+    router_logits: torch.Tensor,
+    moe_input: torch.Tensor,
+    eps: float,
+) -> None:
+    """Fused (rms_norm | * scale_with_root | fp16 GEMV) + (rms_norm | * pre_ff_w).
+
+    Designed for gemma4 MoE branch where router(residual) and
+    pre_feedforward_layernorm_2(residual) both compute rms(residual) and then
+    apply different post-norm scales -- this kernel shares the rms computation
+    and emits both outputs in one launch.
+
+    Layout:
+        residual:        [1, K] fp16
+        scale_with_root: [K] fp16   (Gemma4 router scale * root_size, pre-folded)
+        proj_w:          [N, K] fp16  (router projection)
+        pre_ff_w:        [K] fp16   (pre_feedforward_layernorm_2 weight)
+        router_logits:   [1, N] fp16
+        moe_input:       [1, K] fp16
+
+    Replaces 3 launches (esimd_rms_norm + esimd_gemv_fp16 + esimd_rms_norm).
+    """
+    return _ops.esimd_norm_gemv_norm_fp16(
+        residual, scale_with_root, proj_w, pre_ff_w,
+        router_logits, moe_input, eps)
+
+
+def esimd_scaled_resadd_norm_gemv_fp8_pert(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    qkv_weight: torch.Tensor,
+    qkv_scale: torch.Tensor,
+    qkv_out: torch.Tensor,
+    eps: float,
+    scalar: float,
+) -> None:
+    """Fused (h+r)*scalar + RMSNorm + FP8 GEMV (qkv_proj decode entry).
+
+    Replaces 2 launches (esimd_fused_scaled_add_rms_norm + the FP8 GEMV inside
+    vllm linear) with one. Updates residual in-place to (h+r)*scalar.
+    """
+    return _ops.esimd_scaled_resadd_norm_gemv_fp8_pert(
+        hidden_states, residual, norm_weight, qkv_weight, qkv_scale, qkv_out,
+        eps, scalar)
+
+
+def esimd_norm_add_norm(
+    h2_raw: torch.Tensor,
+    h1: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    out: torch.Tensor,
+    eps1: float,
+    eps2: float,
+) -> None:
+    """Fused (rms_norm(h2_raw) × w1) + add to h1 + (rms_norm(h1_new) × w2).
+
+    Layout:
+        h2_raw: [1, K] fp16 (read)
+        h1:     [1, K] fp16 (in-place: ← h2_normed_w1 + h1)
+        w1, w2: [K] fp16
+        out:    [1, K] fp16 (= rms_norm(h1) × w2)
+
+    Replaces 2 launches (esimd_rms_norm + esimd_fused_add_rms_norm).
+    """
+    return _ops.esimd_norm_add_norm(h2_raw, h1, w1, w2, out, eps1, eps2)
+
+
+def esimd_accum_norm_add_norm(
+    routed_output: torch.Tensor,
+    h1: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    out: torch.Tensor,
+    top_k: int,
+    eps1: float,
+    eps2: float,
+) -> None:
+    """Fused MoE-output (top_k sum) + RMSNorm × w1 + Add to h1 + RMSNorm × w2.
+
+    Replaces 3 kernels (moe_accumulate + esimd_rms_norm + esimd_fused_add_rms_norm)
+    or 2 kernels (moe_accumulate + esimd_norm_add_norm) with 1.
+    """
+    return _ops.esimd_accum_norm_add_norm(
+        routed_output, h1, w1, w2, out, top_k, eps1, eps2)
+
+
+def moe_forward_full_gelu_tanh_routed_no_accum(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    top_k: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """Same as moe_forward_full_gelu_tanh_routed but without the final
+    moe_accumulate kernel — returns [T*top_k, hidden] partial outputs so
+    the caller can fuse the accumulate into a downstream kernel
+    (e.g. esimd_accum_norm_add_norm)."""
+    return _moe_batch.moe_forward_full_gelu_tanh_routed_no_accum(
+        x, topk_weights, topk_indices,
+        gate_up_weight, gate_up_scale,
+        down_weight, down_scale,
+        top_k, n_routed_experts)
+
+
+def esimd_gemv_fp8_pert_bmg(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """BMG-tuned FP8 per-tensor GEMV with K_SPLIT and tail handling."""
+    return _ops.esimd_gemv_fp8_pert_bmg(input, weight, weight_scale, output)

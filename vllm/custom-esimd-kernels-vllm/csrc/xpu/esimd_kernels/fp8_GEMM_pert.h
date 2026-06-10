@@ -88,16 +88,7 @@ inline void select_vl_ks(uint32_t N, uint32_t K, int& vl, int& ks) {
     }
 
     int kpt = K / ks;
-    while (vl > kpt || kpt % vl != 0) {
-        if (vl > 128) {
-            vl /= 2;
-        } else if (ks > 1) {
-            ks /= 2;
-            kpt = K / ks;
-        } else {
-            break;
-        }
-    }
+    while (vl > kpt || kpt % vl != 0) {        if (vl > 32) {            vl /= 2;        } else if (ks > 1) {            ks /= 2;            kpt = K / ks;        } else {            break;        }    }
 }
 
 // ============================================================================
@@ -179,17 +170,38 @@ struct GEMM_fp8_pert_ws_kernel {
         #pragma unroll
         for (int i = 0; i < TILE_M; i++) acc[i] = 0.0f;
 
-        for (int k = 0; k < K; k += VL) {
-            // Load weight row once
+        // Main loop: process full VL chunks
+        int k_aligned = (K / VL) * VL;
+        for (int k = 0; k < k_aligned; k += VL) {
             simd<uint8_t, VL> raw = block_load<uint8_t, VL>(weight + (size_t)n * K + k);
             simd<float, VL> wf = fp8_dequant<VL>(raw, fp8_mode);
 
-            // Multiply with each active input row
             #pragma unroll
             for (int i = 0; i < TILE_M; i++) {
                 if (m_start + i < M) {
                     simd<fp16, VL> iv = block_load<fp16, VL>(
                         input + (size_t)(m_start + i) * K + k);
+                    acc[i] += simd<float, VL>(iv) * wf;
+                }
+            }
+        }
+        // Tail: overlap-read last VL elements (re-processes some, but
+        // accumulator zeroed for overlap portion via mask subtraction)
+        if (k_aligned < K) {
+            int k_tail = K - VL;  // read last VL elements (overlaps with end of main loop)
+            simd<uint8_t, VL> raw = block_load<uint8_t, VL>(weight + (size_t)n * K + k_tail);
+            simd<float, VL> wf = fp8_dequant<VL>(raw, fp8_mode);
+            // Mask: only accumulate the tail portion [k_aligned..K)
+            // Elements [0..k_aligned-k_tail) were already accumulated in main loop
+            int overlap = k_aligned - k_tail;
+            // Zero out the overlapping prefix so we dont double-count
+            for (int z = 0; z < overlap; z++) wf[z] = 0.0f;
+
+            #pragma unroll
+            for (int i = 0; i < TILE_M; i++) {
+                if (m_start + i < M) {
+                    simd<fp16, VL> iv = block_load<fp16, VL>(
+                        input + (size_t)(m_start + i) * K + k_tail);
                     acc[i] += simd<float, VL>(iv) * wf;
                 }
             }
@@ -3811,7 +3823,11 @@ inline void batched_gemv_fp8_pert_host(
     else if (vl == 128 && ks == 2) { LAUNCH_BATCHED(128, 2) }
     else if (vl == 128 && ks == 4) { LAUNCH_BATCHED(128, 4) }
     else if (vl == 128 && ks == 8) { LAUNCH_BATCHED(128, 8) }
-    else                           { LAUNCH_BATCHED(128, 1) }
+    else if (vl == 64 && ks == 1) { LAUNCH_BATCHED(64, 1) }
+    else if (vl == 64 && ks == 2) { LAUNCH_BATCHED(64, 2) }
+    else if (vl == 32 && ks == 1) { LAUNCH_BATCHED(32, 1) }
+    else if (vl == 32 && ks == 2) { LAUNCH_BATCHED(32, 2) }
+    else                           { LAUNCH_BATCHED(32, 1) }
 
     #undef LAUNCH_BATCHED
 }
@@ -3885,12 +3901,12 @@ inline void GEMM_fp8_pert_host(
     if (M <= 3) {
         batched_gemv_fp8_pert_host(p_in, p_w, p_sc, p_out, M, N, K, fp8_mode, q);
     } else if (M <= 8) {
-        ws_gemm_fp8_pert_host<128, 8>(p_in, p_w, p_sc, p_out, M, N, K, fp8_mode, q);
+        // VL=64 with tail handling in WS kernel (supports any K>=64)
+        if      (K % 128 == 0) ws_gemm_fp8_pert_host<128, 8>(p_in, p_w, p_sc, p_out, M, N, K, fp8_mode, q);
+        else                   ws_gemm_fp8_pert_host<64,  8>(p_in, p_w, p_sc, p_out, M, N, K, fp8_mode, q);
     } else {
-        // WS-16/128 wins across all M>8 values in crossover analysis.
-        // DPAS available via dpas_gemm_fp8_pert_host<16>() but FP8 dequant+VNNI
-        // packing overhead makes it slower than WS for these shape sizes.
-        ws_gemm_fp8_pert_host<128, 16>(p_in, p_w, p_sc, p_out, M, N, K, fp8_mode, q);
+        if      (K % 128 == 0) ws_gemm_fp8_pert_host<128, 16>(p_in, p_w, p_sc, p_out, M, N, K, fp8_mode, q);
+        else                   ws_gemm_fp8_pert_host<64,  16>(p_in, p_w, p_sc, p_out, M, N, K, fp8_mode, q);
     }
 }
 

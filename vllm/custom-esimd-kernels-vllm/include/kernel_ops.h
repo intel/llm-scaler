@@ -32,6 +32,10 @@ at::Tensor esimd_gemv_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output);
 
+// FP16 weight GEMV (no scale): for fp16 GateLinear-style projections at decode.
+at::Tensor esimd_gemv_fp16(
+    at::Tensor input, at::Tensor weight, at::Tensor output);
+
 at::Tensor esimd_gemv_fp8_pert_fused2(
     at::Tensor input,
     at::Tensor w0, at::Tensor s0, at::Tensor o0,
@@ -56,6 +60,16 @@ at::Tensor esimd_qkv_split_norm_rope(
     at::Tensor q_out, at::Tensor gate_out,
     at::Tensor k_out, at::Tensor v_out,
     at::Tensor norm_wq, at::Tensor norm_wk,
+    at::Tensor positions,
+    int64_t q_heads, int64_t kv_heads, bool attn_output_gate,
+    int64_t rotary_dim, at::Tensor cos_sin_cache);
+
+// Variant with V-Norm (gemma4): also RMSNorms V heads.
+at::Tensor esimd_qkv_split_norm_rope_v(
+    at::Tensor qkv_state,
+    at::Tensor q_out, at::Tensor gate_out,
+    at::Tensor k_out, at::Tensor v_out,
+    at::Tensor norm_wq, at::Tensor norm_wk, at::Tensor norm_wv,
     at::Tensor positions,
     int64_t q_heads, int64_t kv_heads, bool attn_output_gate,
     int64_t rotary_dim, at::Tensor cos_sin_cache);
@@ -150,10 +164,20 @@ at::Tensor esimd_norm_gemv_int4_pert(
     at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output,
     int64_t HV, int64_t V, double eps);
 
+// Standalone RMSNorm (no add): output[k] = input[k] * inv_rms(input) * weight[k]
+at::Tensor esimd_rms_norm(
+    at::Tensor input, at::Tensor output,
+    at::Tensor weight, double eps);
+
 // Fused Add + RMSNorm (Gemma-style)
 at::Tensor esimd_fused_add_rms_norm(
     at::Tensor hidden_states, at::Tensor residual,
     at::Tensor weight, double eps);
+
+// Scaled variant: residual <- (hs+r)*scalar; hidden <- norm(residual)*weight
+at::Tensor esimd_fused_scaled_add_rms_norm(
+    at::Tensor hidden_states, at::Tensor residual,
+    at::Tensor weight, double eps, double scalar);
 
 at::Tensor esimd_rms_norm_gated(
     at::Tensor x, at::Tensor z, at::Tensor weight,
@@ -163,6 +187,18 @@ at::Tensor esimd_fused_add_rms_norm_batched(
     at::Tensor hidden_states, at::Tensor residual,
     at::Tensor weight, double eps);
 
+
+void esimd_norm_gemv_norm_fp16(
+    at::Tensor residual, at::Tensor scale_with_root,
+    at::Tensor proj_w, at::Tensor pre_ff_w,
+    at::Tensor router_logits, at::Tensor moe_input,
+    double eps);
+
+void esimd_scaled_resadd_norm_gemv_fp8_pert(
+    at::Tensor hidden_states, at::Tensor residual,
+    at::Tensor norm_weight, at::Tensor qkv_weight,
+    at::Tensor qkv_scale, at::Tensor qkv_out,
+    double eps, double scalar);
 // ======================== MoE Auxiliary Ops ========================
 
 // Fused softmax + top-8 + normalize
@@ -185,6 +221,11 @@ at::Tensor esimd_moe_scatter_fused(
     int64_t K, int64_t topk, int64_t T, int64_t num_experts);
 
 // SiLU(gate) * up activation
+// GELU_tanh(gate) * up activation (gemma4)
+at::Tensor esimd_moe_gelu_tanh_mul(
+    at::Tensor input, at::Tensor output,
+    int64_t N_gate_up, int64_t N_half, int64_t total_rows);
+
 at::Tensor esimd_moe_silu_mul(
     at::Tensor input, at::Tensor output,
     int64_t N_gate_up, int64_t N_half, int64_t total_rows);
@@ -238,3 +279,17 @@ at::Tensor esimd_moe_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor scale,
     at::Tensor output, at::Tensor expert_idx,
     int64_t N, int64_t K, int64_t num_experts, int64_t max_tokens_per_expert);
+
+void esimd_norm_add_norm(
+    at::Tensor h2_raw, at::Tensor h1,
+    at::Tensor w1, at::Tensor w2, at::Tensor out,
+    double eps1, double eps2);
+
+void esimd_accum_norm_add_norm(
+    at::Tensor routed_output, at::Tensor h1,
+    at::Tensor w1, at::Tensor w2, at::Tensor out,
+    int64_t top_k, double eps1, double eps2);
+
+at::Tensor esimd_gemv_fp8_pert_bmg(
+    at::Tensor input, at::Tensor weight,
+    at::Tensor weight_scale, at::Tensor output);

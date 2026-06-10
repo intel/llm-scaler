@@ -674,3 +674,59 @@ inline void moe_gather_host(
                               final_hidden, K, topk});
     });
 }
+
+// ======================== GELU_Tanh_and_Mul Kernel ========================
+// Input: [rows, N_gate_up] fp16, first N_half is gate, second N_half is up.
+// Output: [rows, N_half] fp16 = GELU_tanh(gate) * up
+// GELU_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+
+struct MoE_GeluTanh_Mul_Kernel {
+    const fp16* input;
+    fp16* output;
+    int N_gate_up;
+    int N_half;
+    int total_rows;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        int row = item.get_group(0);
+        if (row >= total_rows) return;
+
+        const fp16* row_in = input + (size_t)row * N_gate_up;
+        fp16* row_out = output + (size_t)row * N_half;
+
+        constexpr float sqrt_2_over_pi = 0.7978845608f;  // sqrt(2/pi)
+        constexpr float coeff = 0.044715f;
+
+        for (int off = 0; off < N_half; off += 64) {
+            simd<fp16, 64> gate_h = block_load<fp16, 64>(row_in + off);
+            simd<fp16, 64> up_h   = block_load<fp16, 64>(row_in + N_half + off);
+
+            simd<float, 64> x  = convert<float, fp16, 64>(gate_h);
+            simd<float, 64> up = convert<float, fp16, 64>(up_h);
+
+            // GELU_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+            simd<float, 64> x3 = x * x * x;
+            simd<float, 64> inner = sqrt_2_over_pi * (x + coeff * x3);
+            // tanh(z) = (exp(2z) - 1) / (exp(2z) + 1)
+            simd<float, 64> exp2z = esimd_math::exp<float, 64>(2.0f * inner);
+            simd<float, 64> tanh_val = (exp2z - 1.0f) / (exp2z + 1.0f);
+            simd<float, 64> gelu = 0.5f * x * (1.0f + tanh_val);
+            simd<float, 64> result = gelu * up;
+
+            simd<fp16, 64> out = convert<fp16, float, 64>(result);
+            block_store<fp16, 64>(row_out + off, out);
+        }
+    }
+};
+
+inline void moe_gelu_tanh_mul_host(
+    const fp16* input, fp16* output,
+    int N_gate_up, int N_half, int total_rows,
+    sycl::queue& q)
+{
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>({(size_t)total_rows}, {1}),
+            MoE_GeluTanh_Mul_Kernel{input, output, N_gate_up, N_half, total_rows});
+    });
+}

@@ -1,4 +1,6 @@
 #pragma once
+#include <cstdlib>
+#include <string>
 #include "utils.h"
 
 // FP8 GEMV with FP32 accumulation, element-wise acc + deferred scale.
@@ -107,7 +109,7 @@ inline void select_vl_ks(uint32_t N, uint32_t K, int& vl, int& ks) {
 
     int kpt = K / ks;
     while (vl > kpt || kpt % vl != 0) {
-        if (vl > 128) {
+        if (vl > 32) {
             vl /= 2;
         } else if (ks > 1) {
             ks /= 2;
@@ -334,6 +336,12 @@ struct GEMV_fp8_pert_kernel {
     }
 };
 
+// Forward decl: BMG-tuned kernel with K_SPLIT and VL+tail. Defined in
+// fp8_GEMV_bmg.h (included in esimd_kernel.sycl alongside this header).
+inline void GEMV_fp8_pert_bmg_host(
+    const fp16* p_in, const uint8_t* p_w, const float* p_sc, fp16* p_out,
+    uint32_t N, uint32_t K, int fp8_mode, sycl::queue& q);
+
 inline void GEMV_fp8_pert_host(
     uint8_t* input_data,
     uint8_t* weight_data,
@@ -348,6 +356,25 @@ inline void GEMV_fp8_pert_host(
     auto* p_w   = reinterpret_cast<const uint8_t*>(weight_data);
     auto* p_sc  = reinterpret_cast<const float*>(scale_data);
     auto* p_out = reinterpret_cast<fp16*>(output_data);
+
+    // Redirect K-unfriendly shapes (where v2's select_vl_ks falls back to
+    // small VL=32) to the BMG kernel which uses VL_BIG=256 + masked tail.
+    // Empirically: K=1056 (gemma4 mlp.down_proj) goes 9.91us → 5.56us (1.78x).
+    // For other shapes (K%256==0 / K%512==0) v2 already picks vl≥128 and the
+    // bmg kernel matches or trails, so we keep v2 as the default.
+    static const bool _disable_bmg = std::getenv("DISABLE_BMG_GEMV") &&
+                                     std::string(std::getenv("DISABLE_BMG_GEMV")) == "1";
+    if (!_disable_bmg) {
+        if (K % 64 != 0 || (K < 512 && K % 256 != 0)) {
+            GEMV_fp8_pert_bmg_host(p_in, p_w, p_sc, p_out, N, K, fp8_mode, q);
+            return;
+        }
+        // K in {1024, 1056, 1152, ...} — bmg is faster when vl=32 fallback
+        if (K >= 1024 && K < 2048 && (K % 256 != 0)) {
+            GEMV_fp8_pert_bmg_host(p_in, p_w, p_sc, p_out, N, K, fp8_mode, q);
+            return;
+        }
+    }
 
     int vl, ks;
     select_vl_ks(N, K, vl, ks);
@@ -370,7 +397,7 @@ inline void GEMV_fp8_pert_host(
     else if (vl == 128 && ks == 2) { LAUNCH_PERT(128, 2) }
     else if (vl == 128 && ks == 4) { LAUNCH_PERT(128, 4) }
     else if (vl == 128 && ks == 8) { LAUNCH_PERT(128, 8) }
-    else { LAUNCH_PERT(128, 1) }
+    else if (vl == 64 && ks == 1) { LAUNCH_PERT(64, 1) }    else if (vl == 64 && ks == 2) { LAUNCH_PERT(64, 2) }    else if (vl == 64 && ks == 4) { LAUNCH_PERT(64, 4) }    else if (vl == 32 && ks == 1) { LAUNCH_PERT(32, 1) }    else if (vl == 32 && ks == 2) { LAUNCH_PERT(32, 2) }    else { LAUNCH_PERT(32, 1) }
 
     #undef LAUNCH_PERT
 }

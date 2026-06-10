@@ -73,6 +73,29 @@ simd<fp16, 256> fp8e4m3_block_to_vnni(simd<uint8_t, 256> raw) {
     return vnni.template bit_cast_view<fp16>();
 }
 
+// ── FP8 [16,16] block → DPAS b_tile (VNNI-packed fp16) — NK layout ──────────
+// Input:  raw uint8[256] = row-major [N=16, K=16] FP8 (vllm FusedMoE layout:
+//         w13 [E, 2*inter, hidden], w2 [E, hidden, inter])
+// Output: same VNNI uint32 layout as fp8e4m3_block_to_vnni:
+//         u32[kp*16+n] = {fp16[2*kp,n], fp16[2*kp+1,n]}
+// Derived from custom-esimd-kernels-vllm/csrc/xpu/esimd_kernels/fp8_GEMM_pert.h:373.
+SYCL_ESIMD_FUNCTION
+simd<fp16, 256> fp8e4m3_block_to_vnni_nk(simd<uint8_t, 256> raw) {
+    simd<fp16, 256> w = fp8e4m3_to_half<256>(raw);
+    simd<uint16_t, 256> w_u16 = w.bit_cast_view<uint16_t>().read();
+    simd<uint16_t, 256> b_vnni_u16;
+    // raw is row-major [N=16, K=16]: element (n, k) at offset n*16 + k.
+    // stride-16 select with base=2*kp picks element k=2*kp from each of 16 N-rows.
+    #pragma unroll
+    for (int kp = 0; kp < 8; kp++) {
+        simd<uint16_t, 16> lo = w_u16.select<16, 16>(2 * kp);
+        simd<uint16_t, 16> hi = w_u16.select<16, 16>(2 * kp + 1);
+        b_vnni_u16.template select<16, 2>(kp * 32) = lo;
+        b_vnni_u16.template select<16, 2>(kp * 32 + 1) = hi;
+    }
+    return b_vnni_u16.template bit_cast_view<fp16>().read();
+}
+
 SYCL_ESIMD_FUNCTION
 simd<fp16, 256> fp8e5m2_block_to_vnni(simd<uint8_t, 256> raw) {
     simd<fp16, 256> w = fp8e5m2_to_half<256>(raw);
@@ -424,6 +447,102 @@ void moe_up_routed_e4m3_kernel(
     submit_kernel(cgf, device, "moe up routed e4m3");
 }
 
+// ========== gemma4: gelu_tanh activation variant ==========
+void moe_up_routed_e4m3_gelu_tanh_kernel(
+    const fp16* x,
+    const uint8_t* gate_up_weight, const float* gate_up_scale,
+    const int* selected_experts,
+    fp16* intermediates,
+    const int n_tokens, const int hidden_size, const int intermediate_size,
+    const int top_k, const int rows_per_token,
+    const torch::Device& device) {
+
+    constexpr int GS = 16;
+    const int two_inter = 2 * intermediate_size;
+    const int n_tiles = intermediate_size / 16;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeUpRoutedE4M3GeluTanh>(
+            sycl::nd_range<2>(
+                sycl::range<2>(n_tokens * top_k, n_tiles * GS),
+                sycl::range<2>(1, GS)),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                slm_init<GS * 32 * sizeof(float)>();
+
+                const int route_idx = (int)item.get_global_id(0);
+                const int token     = route_idx / top_k;
+                const int k_idx     = route_idx % top_k;
+                const int n_tile    = (int)item.get_group(1);
+                const int tid       = (int)item.get_local_id(1);
+
+                const fp16* x_row = x + (size_t)token * hidden_size;
+                const int eid = selected_experts[route_idx];
+                const uint8_t* base = gate_up_weight + (size_t)eid * hidden_size * two_inter;
+                const int ng = n_tile * 16;
+                const int nu = intermediate_size + ng;
+                simd<float, 16> g_acc(0.f), u_acc(0.f);
+
+                for (int k = 16 * tid; k < hidden_size; k += 16 * GS) {
+                    simd<fp16, 16> a_tile = block_load<fp16, 16>(x_row + k);
+
+                    // vllm layout [E, 2*inter, hidden]: width=hidden, height=2*inter
+                    xesimd::config_2d_mem_access<uint8_t, 16, 16, 1> pgW(
+                        base, (uint32_t)hidden_size - 1u, (uint32_t)two_inter - 1u,
+                        (uint32_t)hidden_size - 1u, (uint32_t)k, (uint32_t)ng);
+                    auto rg = xesimd::lsc_load_2d<uint8_t, 16, 16, 1, false, false,
+                        xesimd::cache_hint::cached, xesimd::cache_hint::cached>(pgW);
+                    simd<fp16, 256> bg = fp8e4m3_block_to_vnni_nk(rg);
+                    g_acc = dpas<8, 1, float, float, fp16, fp16>(g_acc, bg, a_tile);
+
+                    // vllm layout: up portion at row offset nu
+                    xesimd::config_2d_mem_access<uint8_t, 16, 16, 1> puW(
+                        base, (uint32_t)hidden_size - 1u, (uint32_t)two_inter - 1u,
+                        (uint32_t)hidden_size - 1u, (uint32_t)k, (uint32_t)nu);
+                    auto ru = xesimd::lsc_load_2d<uint8_t, 16, 16, 1, false, false,
+                        xesimd::cache_hint::cached, xesimd::cache_hint::cached>(puW);
+                    simd<fp16, 256> bu = fp8e4m3_block_to_vnni_nk(ru);
+                    u_acc = dpas<8, 1, float, float, fp16, fp16>(u_acc, bu, a_tile);
+                }
+
+                uint32_t slm_off = (uint32_t)(tid * 32) * 4u;
+                slm_block_store<float, 16>(slm_off, g_acc);
+                slm_block_store<float, 16>(slm_off + 64u, u_acc);
+
+                barrier();
+
+                if (tid == 0) {
+                    simd<float, 16> gs(0.f), us(0.f);
+                    #pragma unroll
+                    for (int i = 0; i < GS; i++) {
+                        gs += slm_block_load<float, 16>((uint32_t)(i * 128));
+                        us += slm_block_load<float, 16>((uint32_t)(i * 128 + 64));
+                    }
+
+                    float scale = gate_up_scale[eid];
+                    gs *= scale;
+                    us *= scale;
+
+                    // GELU_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+                    constexpr float sqrt_2_over_pi = 0.7978845608f;
+                    constexpr float coeff = 0.044715f;
+                    simd<float, 16> gs3 = gs * gs * gs;
+                    simd<float, 16> inner = sqrt_2_over_pi * (gs + coeff * gs3);
+                    simd<float, 16> exp2z = esimd_math::exp<float, 16>(2.0f * inner);
+                    simd<float, 16> tanh_v = (exp2z - 1.0f) / (exp2z + 1.0f);
+                    simd<float, 16> gelu = 0.5f * gs * (1.0f + tanh_v);
+                    simd<float, 16> result = gelu * us;
+
+                    const int routed_row = token * rows_per_token + k_idx;
+                    block_store<fp16, 16>(
+                        intermediates + (size_t)routed_row * intermediate_size + ng,
+                        convert<fp16>(result));
+                }
+            });
+    };
+
+    submit_kernel(cgf, device, "moe up routed e4m3 gelu_tanh");
+}
+
 void moe_up_routed_e5m2_kernel(
     const fp16* x,
     const uint8_t* gate_up_weight, const float* gate_up_scale,
@@ -732,6 +851,63 @@ void moe_down_routed_e4m3_kernel(
 
     submit_kernel(cgf, device, "moe down routed e4m3");
 }
+
+// ========== gemma4: down kernel for vllm layout [E, hidden, inter] ==========
+void moe_down_routed_e4m3_vllm_layout_kernel(
+    const fp16* intermediates,
+    const uint8_t* down_weight, const float* down_scale,
+    const fp16* routing_weights, const int* selected_experts,
+    fp16* output,
+    const int n_tokens, const int hidden_size, const int intermediate_size,
+    const int top_k, const int rows_per_token,
+    const torch::Device& device) {
+
+    const int n_tiles = hidden_size / 16;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeDownRoutedE4M3VllmLayout>(
+            sycl::range<2>(n_tokens * top_k, n_tiles),
+            [=](sycl::item<2> item) SYCL_ESIMD_KERNEL {
+                const int route_idx = (int)item.get_id(0);
+                const int n_tile    = (int)item.get_id(1);
+                const int token     = route_idx / top_k;
+                const int k_idx     = route_idx % top_k;
+
+                const int eid = selected_experts[route_idx];
+                const int routed_row = token * rows_per_token + k_idx;
+                // vllm layout: [E, hidden, inter] → base + eid * hidden * inter
+                const uint8_t* base = down_weight + (size_t)eid * hidden_size * intermediate_size;
+                const fp16* hi = intermediates + (size_t)routed_row * intermediate_size;
+                const int nj = n_tile * 16;
+                simd<float, 16> acc(0.f);
+
+                for (int k = 0; k < intermediate_size; k += 16) {
+                    simd<fp16, 16> a_tile = block_load<fp16, 16>(hi + k);
+
+                    // vllm layout [E, hidden, inter]: width=inter, height=hidden
+                    // Read weight[eid][nj:nj+16][k:k+16] → coords(x=k, y=nj)
+                    xesimd::config_2d_mem_access<uint8_t, 16, 16, 1> payW(
+                        base, (uint32_t)intermediate_size - 1u, (uint32_t)hidden_size - 1u,
+                        (uint32_t)intermediate_size - 1u, (uint32_t)k, (uint32_t)nj);
+                    auto raw = xesimd::lsc_load_2d<uint8_t, 16, 16, 1, false, false,
+                        xesimd::cache_hint::cached, xesimd::cache_hint::cached>(payW);
+                    simd<fp16, 256> b_tile = fp8e4m3_block_to_vnni_nk(raw);
+                    acc = dpas<8, 1, float, float, fp16, fp16>(acc, b_tile, a_tile);
+                }
+
+                float w = (float)routing_weights[route_idx];
+                float ds = down_scale[eid];
+                acc *= w * ds;
+
+                block_store<fp16, 16>(
+                    output + (size_t)routed_row * hidden_size + nj,
+                    convert<fp16>(acc));
+            });
+    };
+
+    submit_kernel(cgf, device, "moe down routed e4m3 vllm layout");
+}
+
 
 void moe_down_routed_e5m2_kernel(
     const fp16* intermediates,
@@ -1343,6 +1519,192 @@ static void ensure_moe_buffers_v2(int n_tokens, int top_k, int num_shared_expert
     }
 }
 
+// ========== gemma4: moe_forward_full_gelu_tanh (no shared expert) ==========
+// Scratch buffers (topk + intermediates + routed_output) are reused every
+// call — a single pair is fine because the next call overwrites them only
+// after the previous call's accumulate has consumed them.
+//
+// The final output is different: callers (e.g. vllm Gemma4MoE.forward)
+// hold the returned tensor across the rest of the layer's compute (residual
+// add, allreduce, next layer's input), so we cannot overwrite it on the
+// next call. Use a small ring of output buffers and rotate per call so each
+// returned tensor stays valid until at least SG_FINAL_RING-1 further calls
+// have happened — enough that the consuming work has finished by then.
+static thread_local torch::Tensor sg_topk_idx, sg_topk_weight;
+static thread_local torch::Tensor sg_intermediates, sg_routed_output;
+static thread_local int sg_cached_ntokens = -1;
+
+static constexpr int SG_FINAL_RING = 4;
+static thread_local torch::Tensor sg_final_outputs[SG_FINAL_RING];
+static thread_local int sg_final_ring_idx = 0;
+
+static void ensure_gemma4_moe_buffers(int n_tokens, int top_k,
+    int hidden_size, int intermediate_size, const torch::Device& dev) {
+    int rows_per_token = top_k;
+    if (sg_cached_ntokens >= n_tokens) return;
+    sg_topk_idx = torch::empty({n_tokens, top_k}, torch::device(dev).dtype(torch::kInt32));
+    sg_topk_weight = torch::empty({n_tokens, top_k}, torch::device(dev).dtype(torch::kHalf));
+    sg_intermediates = torch::empty({n_tokens * rows_per_token, intermediate_size},
+        torch::device(dev).dtype(torch::kHalf));
+    sg_routed_output = torch::empty({n_tokens * rows_per_token, hidden_size},
+        torch::device(dev).dtype(torch::kHalf));
+    for (int i = 0; i < SG_FINAL_RING; i++) {
+        sg_final_outputs[i] = torch::empty({n_tokens, hidden_size},
+            torch::device(dev).dtype(torch::kHalf));
+    }
+    sg_cached_ntokens = n_tokens;
+}
+
+static torch::Tensor& sg_take_final_output() {
+    auto& t = sg_final_outputs[sg_final_ring_idx];
+    sg_final_ring_idx = (sg_final_ring_idx + 1) % SG_FINAL_RING;
+    return t;
+}
+
+torch::Tensor moe_forward_full_gelu_tanh(
+    torch::Tensor x, torch::Tensor logits,
+    torch::Tensor gate_up_weight, torch::Tensor gate_up_scale,
+    torch::Tensor down_weight, torch::Tensor down_scale,
+    int64_t top_k, int64_t n_routed_experts) {
+    TORCH_CHECK(x.scalar_type() == torch::kHalf);
+    int n_tokens = x.size(0), hidden_size = x.size(1);
+    // vllm layout: gate_up [E, 2*inter, hidden], down [E, hidden, inter]
+    int intermediate_size = gate_up_weight.size(1) / 2;
+    int rows_per_token = top_k;
+
+    ensure_gemma4_moe_buffers(n_tokens, top_k, hidden_size, intermediate_size, x.device());
+
+    // TopK
+    dispatch_moe_topk_forward<class MoeTopKGemma4>(
+        (const fp16*)logits.data_ptr(),
+        sg_topk_idx.data_ptr<int>(),
+        (fp16*)sg_topk_weight.data_ptr(),
+        n_tokens, (int)n_routed_experts, (int)top_k, /*norm=*/true,
+        logits.device());
+
+    // Up + gelu_tanh activation
+    moe_up_routed_e4m3_gelu_tanh_kernel(
+        (const fp16*)x.data_ptr(),
+        (const uint8_t*)gate_up_weight.data_ptr(), gate_up_scale.data_ptr<float>(),
+        sg_topk_idx.data_ptr<int>(),
+        (fp16*)sg_intermediates.data_ptr(),
+        n_tokens, hidden_size, intermediate_size,
+        top_k, rows_per_token, x.device());
+
+    // Down routed (vllm layout: [E, hidden, inter])
+    moe_down_routed_e4m3_vllm_layout_kernel(
+        (const fp16*)sg_intermediates.data_ptr(),
+        (const uint8_t*)down_weight.data_ptr(), down_scale.data_ptr<float>(),
+        (const fp16*)sg_topk_weight.data_ptr(), sg_topk_idx.data_ptr<int>(),
+        (fp16*)sg_routed_output.data_ptr(),
+        n_tokens, hidden_size, intermediate_size,
+        top_k, rows_per_token, x.device());
+
+    // Accumulate (sum over top_k experts per token)
+    auto& final_out = sg_take_final_output();
+    moe_accumulate_kernel(
+        (const fp16*)sg_routed_output.data_ptr(),
+        (fp16*)final_out.data_ptr(),
+        n_tokens, hidden_size, rows_per_token, x.device());
+
+    return final_out.narrow(0, 0, n_tokens);
+}
+
+
+// ========== gemma4: variant with externally supplied routing ==========
+// Skip the built-in softmax/topk. Caller passes per-token topk indices and
+// weights that already encode model-specific routing logic (e.g. gemma4's
+// per_expert_scale fold-in). topk_weights must be fp16 [n_tokens, top_k];
+// topk_indices int32 [n_tokens, top_k]. Same vllm weight layout as
+// moe_forward_full_gelu_tanh.
+torch::Tensor moe_forward_full_gelu_tanh_routed(
+    torch::Tensor x,
+    torch::Tensor topk_weights, torch::Tensor topk_indices,
+    torch::Tensor gate_up_weight, torch::Tensor gate_up_scale,
+    torch::Tensor down_weight, torch::Tensor down_scale,
+    int64_t top_k, int64_t n_routed_experts) {
+    (void)n_routed_experts;
+    TORCH_CHECK(x.scalar_type() == torch::kHalf);
+    TORCH_CHECK(topk_weights.scalar_type() == torch::kHalf,
+                "topk_weights must be fp16 [T, top_k]");
+    TORCH_CHECK(topk_indices.scalar_type() == torch::kInt32,
+                "topk_indices must be int32 [T, top_k]");
+    int n_tokens = x.size(0), hidden_size = x.size(1);
+    int intermediate_size = gate_up_weight.size(1) / 2;
+    int rows_per_token = top_k;
+
+    ensure_gemma4_moe_buffers(n_tokens, top_k, hidden_size, intermediate_size, x.device());
+
+    const int* idx_ptr = topk_indices.data_ptr<int>();
+    const fp16* w_ptr  = (const fp16*)topk_weights.data_ptr();
+
+    moe_up_routed_e4m3_gelu_tanh_kernel(
+        (const fp16*)x.data_ptr(),
+        (const uint8_t*)gate_up_weight.data_ptr(), gate_up_scale.data_ptr<float>(),
+        idx_ptr,
+        (fp16*)sg_intermediates.data_ptr(),
+        n_tokens, hidden_size, intermediate_size,
+        top_k, rows_per_token, x.device());
+
+    moe_down_routed_e4m3_vllm_layout_kernel(
+        (const fp16*)sg_intermediates.data_ptr(),
+        (const uint8_t*)down_weight.data_ptr(), down_scale.data_ptr<float>(),
+        w_ptr, idx_ptr,
+        (fp16*)sg_routed_output.data_ptr(),
+        n_tokens, hidden_size, intermediate_size,
+        top_k, rows_per_token, x.device());
+
+    auto& final_out = sg_take_final_output();
+    moe_accumulate_kernel(
+        (const fp16*)sg_routed_output.data_ptr(),
+        (fp16*)final_out.data_ptr(),
+        n_tokens, hidden_size, rows_per_token, x.device());
+
+    return final_out.narrow(0, 0, n_tokens);
+}
+
+
+
+torch::Tensor moe_forward_full_gelu_tanh_routed_no_accum(
+    torch::Tensor x,
+    torch::Tensor topk_weights, torch::Tensor topk_indices,
+    torch::Tensor gate_up_weight, torch::Tensor gate_up_scale,
+    torch::Tensor down_weight, torch::Tensor down_scale,
+    int64_t top_k, int64_t n_routed_experts) {
+    (void)n_routed_experts;
+    TORCH_CHECK(x.scalar_type() == torch::kHalf);
+    TORCH_CHECK(topk_weights.scalar_type() == torch::kHalf,
+                "topk_weights must be fp16 [T, top_k]");
+    TORCH_CHECK(topk_indices.scalar_type() == torch::kInt32,
+                "topk_indices must be int32 [T, top_k]");
+    int n_tokens = x.size(0), hidden_size = x.size(1);
+    int intermediate_size = gate_up_weight.size(1) / 2;
+    int rows_per_token = top_k;
+
+    ensure_gemma4_moe_buffers(n_tokens, top_k, hidden_size, intermediate_size, x.device());
+
+    const int* idx_ptr = topk_indices.data_ptr<int>();
+    const fp16* w_ptr  = (const fp16*)topk_weights.data_ptr();
+
+    moe_up_routed_e4m3_gelu_tanh_kernel(
+        (const fp16*)x.data_ptr(),
+        (const uint8_t*)gate_up_weight.data_ptr(), gate_up_scale.data_ptr<float>(),
+        idx_ptr,
+        (fp16*)sg_intermediates.data_ptr(),
+        n_tokens, hidden_size, intermediate_size,
+        top_k, rows_per_token, x.device());
+
+    moe_down_routed_e4m3_vllm_layout_kernel(
+        (const fp16*)sg_intermediates.data_ptr(),
+        (const uint8_t*)down_weight.data_ptr(), down_scale.data_ptr<float>(),
+        w_ptr, idx_ptr,
+        (fp16*)sg_routed_output.data_ptr(),
+        n_tokens, hidden_size, intermediate_size,
+        top_k, rows_per_token, x.device());
+
+    // Skip moe_accumulate; return [T*top_k, hidden] for downstream fusion.
+    return sg_routed_output.narrow(0, 0, n_tokens * top_k);
+}
 torch::Tensor moe_forward_full_v2(
     torch::Tensor x, torch::Tensor logits,
     torch::Tensor gate_up_weight, torch::Tensor gate_up_scale,
@@ -1424,6 +1786,9 @@ TORCH_LIBRARY_FRAGMENT(moe_ops, m) {
     m.def("moe_accumulate(Tensor partials, int top_k, int num_shared_experts) -> Tensor");
     m.def("moe_topk(Tensor logits, int top_k, bool norm) -> (Tensor, Tensor)");
     m.def("moe_forward_fused(Tensor x, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, Tensor routing_weights, Tensor selected_experts, int top_k, int num_shared_experts) -> Tensor");
+    m.def("moe_forward_full_gelu_tanh(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, int top_k, int n_routed_experts) -> Tensor");
+    m.def("moe_forward_full_gelu_tanh_routed_no_accum(Tensor x, Tensor topk_weights, Tensor topk_indices, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, int top_k, int n_routed_experts) -> Tensor");
+    m.def("moe_forward_full_gelu_tanh_routed(Tensor x, Tensor topk_weights, Tensor topk_indices, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full_v2(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
 }
@@ -1434,6 +1799,9 @@ TORCH_LIBRARY_IMPL(moe_ops, XPU, m) {
     m.impl("moe_down_forward", &moe_down_forward);
     m.impl("moe_accumulate", &moe_accumulate);
     m.impl("moe_topk", &moe_topk);
+    m.impl("moe_forward_full_gelu_tanh", &moe_forward_full_gelu_tanh);
+    m.impl("moe_forward_full_gelu_tanh_routed", &moe_forward_full_gelu_tanh_routed);
+    m.impl("moe_forward_full_gelu_tanh_routed_no_accum", &moe_forward_full_gelu_tanh_routed_no_accum);
     m.impl("moe_forward_fused", &moe_forward_fused);
     m.impl("moe_forward_full", &moe_forward_full);
     m.impl("moe_forward_full_v2", &moe_forward_full_v2);

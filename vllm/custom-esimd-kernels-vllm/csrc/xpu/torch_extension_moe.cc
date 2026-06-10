@@ -27,8 +27,11 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
         "int K, int topk, int T, int num_experts) -> Tensor");
   m.impl("esimd_moe_scatter_fused", torch::kXPU, &esimd_moe_scatter_fused);
 
+  m.def("esimd_moe_gelu_tanh_mul(Tensor input, Tensor output, "
+       "int N_gate_up, int N_half, int total_rows) -> Tensor");
   m.def("esimd_moe_silu_mul(Tensor input, Tensor output, "
         "int N_gate_up, int N_half, int total_rows) -> Tensor");
+  m.impl("esimd_moe_gelu_tanh_mul", torch::kXPU, &esimd_moe_gelu_tanh_mul);
   m.impl("esimd_moe_silu_mul", torch::kXPU, &esimd_moe_silu_mul);
 
   m.def("esimd_moe_gather(Tensor moe_output, Tensor topk_ids, "
