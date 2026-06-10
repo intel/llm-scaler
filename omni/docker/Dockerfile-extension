@@ -15,6 +15,8 @@ ARG PYTHON_VERSION
 ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python${PYTHON_VERSION}/dist-packages/torch/lib:${LD_LIBRARY_PATH}"
 
 COPY ./patches/extention_comfyui_wanvideowrapper.patch /tmp/
+COPY ./patches/comfyui-layerstyle_advance-add-intel-xpu-support-for-joy-caption-beta1.patch /tmp/
+COPY ./patches/art-venture-resize-mask-to-match-image-spatial-size.patch /tmp
 COPY ./patches/extention_comfyui_florence2.patch /tmp/
 COPY ./patches/extension_comfyui_segment_anything_2.patch /tmp/
 COPY ./patches/extension_comfyui_reactor.patch /tmp/
@@ -30,7 +32,36 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git checkout e091c4a77425d6a4a7f90ab30c513d24f8cb91cf && \
     git apply /tmp/extention_comfyui_wanvideowrapper.patch && \
     pip install -r requirements.txt && \
-    rm -f /tmp/extention_comfyui_wanvideowrapper.patch
+    rm -f /tmp/extention_comfyui_wanvideowrapper.patch && \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf ComfyUI_LayerStyle_Advance && \
+    git clone --depth 1 https://github.com/chflame163/ComfyUI_LayerStyle_Advance.git && \
+    cd ComfyUI_LayerStyle_Advance && \
+    git fetch --depth 1 orgin 7b678b401a38307a4a7e99ef6630bd48f9cecedb && \
+    git checkout 7b678b401a38307a4a7e99ef6630bd48f9cecedb && \
+    git apply /tmp/comfyui-layerstyle_advance-add-intel-xpu-support-for-joy-caption-beta1.patch && \
+    pip install segment_anything wget blend_modes && \
+    pip install -r requirements.txt && \
+    rm -rf /tmp/comfyui-layerstyle_advance-add-intel-xpu-support-for-joy-caption-beta1.patch && \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf comfyui-mixlab-nodes && \
+    git clone https://github.com/MixLabPro/comfyui-mixlab-nodes.git && \
+    cd comfyui-mixlab-nodes && \
+    git fetch --depth 1 origin 32b22c39cbe13b46df29ef1b6ab088c2eb4389d2 && \
+    git checkout 32b22c39cbe13b46df29ef1b6ab088c2eb4389d2 && \
+    pip install -r requirements.txt && \
+    pip install --ignore-installed cryptography && \
+    pip install pyOpenSSL && \
+    pip install setuptools==70.2.0 && \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf comfyui-art-venture && \
+    git clone --depth 1 https://github.com/sipherxyz/comfyui-art-venture && \
+    cd comfyui-art-venture && \
+    git fetch --depth 1 origin 210dc072b1f103f91be18a33bdeb13ab315aaae5 && \
+    git checkout 210dc072b1f103f91be18a33bdeb13ab315aaae5 && \
+    git apply /tmp/art-venture-resize-mask-to-match-image-spatial-size.patch && \
+    pip install -r requirements.txt && \
+    rm -rf /tmp/art-venture-resize-mask-to-match-image-spatial-size.patch
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/ComfyUI/custom_nodes && \
