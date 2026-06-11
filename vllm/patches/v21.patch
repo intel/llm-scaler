@@ -1,0 +1,2166 @@
+From ee38750a7565ee7158ddc78ff5abd12e9c0d3733 Mon Sep 17 00:00:00 2001
+From: David Zheng <153074367+dzhengAP@users.noreply.github.com>
+Date: Wed, 6 May 2026 08:17:15 -0700
+Subject: [PATCH 01/13] [Bugfix] Fix spawn_new_process_for_each_test silently
+ swallowing test failures (#41423)
+
+Signed-off-by: dqzhengAP <dqzheng1996@gmail.com>
+---
+ tests/utils.py                                |  85 ++--
+ tests/utils_/test_spawn_decorator.py          |  33 ++
+ tests/v1/cudagraph/test_cudagraph_dispatch.py | 365 +++++++++---------
+ .../logits_processors/test_custom_online.py   |  68 ++--
+ 4 files changed, 306 insertions(+), 245 deletions(-)
+ create mode 100644 tests/utils_/test_spawn_decorator.py
+
+diff --git a/tests/utils.py b/tests/utils.py
+index 41202aa19..e8fd3f1e8 100644
+--- a/tests/utils.py
++++ b/tests/utils.py
+@@ -19,7 +19,7 @@ import threading
+ import time
+ import warnings
+ from collections.abc import Callable, Iterable, Sequence
+-from contextlib import ExitStack, contextmanager, suppress
++from contextlib import ExitStack, contextmanager
+ from multiprocessing import Process
+ from pathlib import Path
+ from typing import Any, Literal
+@@ -1512,52 +1512,65 @@ def fork_new_process_for_each_test(func: Callable[_P, None]) -> Callable[_P, Non
+ 
+ 
+ def spawn_new_process_for_each_test(f: Callable[_P, None]) -> Callable[_P, None]:
+-    """Decorator to spawn a new process for each test function."""
++    """Decorator to spawn a new process for each test function.
++
++    Uses subprocess with cloudpickle to serialize the test function and
++    propagates exceptions back to the parent, so test failures are never
++    silently swallowed (fixes https://github.com/vllm-project/vllm/issues/41415).
++    """
+ 
+     @functools.wraps(f)
+     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> None:
+-        # Check if we're already in a subprocess
+-        if os.environ.get("RUNNING_IN_SUBPROCESS") == "1":
+-            # If we are, just run the function directly
+-            return f(*args, **kwargs)
+-
+-        import torch.multiprocessing as mp
+-
+-        with suppress(RuntimeError):
+-            mp.set_start_method("spawn")
+-
+-        # Get the module
+-        module_name = f.__module__
+-
+-        # Create a process with environment variable set
+-        env = os.environ.copy()
+-        env["RUNNING_IN_SUBPROCESS"] = "1"
+-
+-        with tempfile.TemporaryDirectory() as tempdir:
+-            output_filepath = os.path.join(tempdir, "new_process.tmp")
++        with tempfile.NamedTemporaryFile(delete=False, suffix=".tb", mode="wb") as tmp:
++            tb_file = tmp.name
+ 
+-            # `cloudpickle` allows pickling complex functions directly
+-            input_bytes = cloudpickle.dumps((f, output_filepath))
++        try:
++            # Serialize the function + args with cloudpickle so closures work
++            payload = cloudpickle.dumps((f, args, kwargs, tb_file))
++
++            child_script = (
++                "import sys, cloudpickle, traceback\n"
++                "try:\n"
++                "    from _pytest.outcomes import Skipped\n"
++                "except ImportError:\n"
++                "    class Skipped(BaseException): pass\n"
++                "f, args, kwargs, tb_file = "
++                "cloudpickle.loads(sys.stdin.buffer.read())\n"
++                "try:\n"
++                "    f(*args, **kwargs)\n"
++                "except Skipped:\n"
++                "    sys.exit(0)\n"
++                "except BaseException:\n"
++                "    open(tb_file, 'w').write(traceback.format_exc())\n"
++                "    sys.exit(1)\n"
++            )
+ 
+             repo_root = str(VLLM_PATH.resolve())
+-
+-            env = dict(env or os.environ)
++            env = os.environ.copy()
+             env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+ 
+-            cmd = [sys.executable, "-m", f"{module_name}"]
+-
+-            returned = subprocess.run(
+-                cmd, input=input_bytes, capture_output=True, env=env
++            result = subprocess.run(
++                [sys.executable, "-c", child_script],
++                input=payload,
++                capture_output=True,
++                env=env,
+             )
+ 
+-            # check if the subprocess is successful
+-            try:
+-                returned.check_returncode()
+-            except Exception as e:
+-                # wrap raised exception to provide more information
++            if result.returncode != 0:
++                # Read traceback written by child, fall back to stderr
++                tb = ""
++                if os.path.exists(tb_file) and os.path.getsize(tb_file) > 0:
++                    with open(tb_file) as fp:
++                        tb = fp.read()
++                else:
++                    tb = result.stderr.decode()
+                 raise RuntimeError(
+-                    f"Error raised in subprocess:\n{returned.stderr.decode()}"
+-                ) from e
++                    f"Test subprocess '{f.__name__}' failed "
++                    f"(exit code {result.returncode}):\n{tb}"
++                )
++        finally:
++            with contextlib.suppress(OSError):
++                os.remove(tb_file)
+ 
+     return wrapper
+ 
+diff --git a/tests/utils_/test_spawn_decorator.py b/tests/utils_/test_spawn_decorator.py
+new file mode 100644
+index 000000000..1740ea30d
+--- /dev/null
++++ b/tests/utils_/test_spawn_decorator.py
+@@ -0,0 +1,33 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tests for spawn_new_process_for_each_test decorator."""
++
++import pytest
++
++from tests.utils import spawn_new_process_for_each_test
++
++
++@spawn_new_process_for_each_test
++def test_spawn_decorator_passing():
++    """Passing function should complete normally."""
++    assert 1 + 1 == 2
++
++
++@pytest.mark.xfail(raises=RuntimeError, strict=True)
++@spawn_new_process_for_each_test
++def test_spawn_decorator_failure_is_caught():
++    """Failing function should raise RuntimeError, never silently pass."""
++    raise ValueError("intentional failure")
++
++
++@spawn_new_process_for_each_test
++def test_spawn_decorator_skip():
++    """pytest.skip inside subprocess should propagate correctly."""
++    pytest.skip("intentional skip")
++
++
++@spawn_new_process_for_each_test
++@pytest.mark.parametrize("x,y,expected", [(1, 2, 3), (0, 0, 0)])
++def test_spawn_decorator_parametrized(x, y, expected):
++    """Args and kwargs must be forwarded correctly to subprocess."""
++    assert x + y == expected
+diff --git a/tests/v1/cudagraph/test_cudagraph_dispatch.py b/tests/v1/cudagraph/test_cudagraph_dispatch.py
+index 66e6d7dd4..97b5fd46a 100644
+--- a/tests/v1/cudagraph/test_cudagraph_dispatch.py
++++ b/tests/v1/cudagraph/test_cudagraph_dispatch.py
+@@ -371,193 +371,200 @@ class TestCUDAGraphWrapper:
+         assert not wrapper.concrete_cudagraph_entries
+ 
+ 
+-@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
+-class TestCudagraphIntegration:
+-    def setup_method(self):
+-        # only FULL mode for non-uniform batches
+-        self.comp_config = CompilationConfig(
+-            mode=CompilationMode.VLLM_COMPILE,
+-            cudagraph_mode="FULL",
+-            cudagraph_capture_sizes=[10, 20],
+-        )
+-        self.vllm_config = _create_vllm_config(self.comp_config)
+-        self.dispatcher = CudagraphDispatcher(self.vllm_config)
+-        self.dispatcher.initialize_cudagraph_keys(
+-            self.comp_config.cudagraph_mode, uniform_decode_query_len=1
+-        )
+-
+-    def _run_and_monitor_call(
+-        self, wrapper, input_tensor, runtime_mode, batch_descriptor
++def _run_and_monitor_call(
++    wrapper, input_tensor, runtime_mode, batch_descriptor, vllm_config
++):
++    """Helper to run a single call and monitor the action."""
++
++    with (
++        patch("torch.cuda.graph", wraps=torch.cuda.graph) as mock_graph_context,
++        patch.object(wrapper, "runnable", wraps=wrapper.runnable) as mock_runnable,
+     ):
+-        """Helper to run a single call and monitor the action."""
+-
+-        with (
+-            patch("torch.cuda.graph", wraps=torch.cuda.graph) as mock_graph_context,
+-            patch.object(wrapper, "runnable", wraps=wrapper.runnable) as mock_runnable,
+-        ):
+-            entry = wrapper.concrete_cudagraph_entries.get(batch_descriptor, None)
+-
+-            context = set_forward_context(
+-                attn_metadata=None,
+-                vllm_config=self.vllm_config,
+-                cudagraph_runtime_mode=runtime_mode,
+-                batch_descriptor=batch_descriptor,
+-            )
+-            mock_replay = MagicMock()
+-            if entry and entry.cudagraph:
+-                with (
+-                    context,
+-                    patch.object(
+-                        entry.cudagraph, "replay", new_callable=MagicMock
+-                    ) as mock_replay,
+-                ):
+-                    wrapper(input_tensor)
+-            else:
+-                with context:
+-                    wrapper(input_tensor)
+-
+-            if mock_graph_context.called:
+-                # note that this is globally mocked, so it will be detected
+-                # even whether called by the inner or outer wrapper
+-                return "capture_global"
+-            if mock_replay.called:
+-                # only for outer wrapper
+-                return "replay"
+-            if mock_runnable.call_count > 0:
+-                # only for outer wrapper
+-                return "bypass"
+-            return "unknown"
+-
+-    @create_new_process_for_each_test("spawn")
+-    def test_capture_replay_bypass_logic(self):
+-        model = SimpleMLP().to(DEVICE_TYPE)
+-        full_wrapper = CUDAGraphWrapper(model, self.vllm_config, CUDAGraphMode.FULL)
+-        max_bs = 16
+-        persistent_input_buffer = torch.zeros(max_bs, 10, device=DEVICE_TYPE)
+-        input_1 = persistent_input_buffer[:1]
+-        input_2 = persistent_input_buffer[:2]
+-        input_3 = persistent_input_buffer[:3]
+-
+-        desc_1 = BatchDescriptor(num_tokens=1)
+-        desc_2 = BatchDescriptor(num_tokens=2)
+-        desc_3_unseen = BatchDescriptor(num_tokens=3)
++        entry = wrapper.concrete_cudagraph_entries.get(batch_descriptor, None)
+ 
+-        # 0. global warmup
+-        with set_forward_context(
++        context = set_forward_context(
+             attn_metadata=None,
+-            vllm_config=self.vllm_config,
+-            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+-            batch_descriptor=None,
+-        ):
+-            full_wrapper(input_1)
++            vllm_config=vllm_config,
++            cudagraph_runtime_mode=runtime_mode,
++            batch_descriptor=batch_descriptor,
++        )
++        mock_replay = MagicMock()
++        if entry and entry.cudagraph:
++            with (
++                context,
++                patch.object(
++                    entry.cudagraph, "replay", new_callable=MagicMock
++                ) as mock_replay,
++            ):
++                wrapper(input_tensor)
++        else:
++            with context:
++                wrapper(input_tensor)
++
++        if mock_graph_context.called:
++            # note that this is globally mocked, so it will be detected
++            # even whether called by the inner or outer wrapper
++            return "capture_global"
++        if mock_replay.called:
++            # only for outer wrapper
++            return "replay"
++        if mock_runnable.call_count > 0:
++            # only for outer wrapper
++            return "bypass"
++        return "unknown"
++
++
++@create_new_process_for_each_test("spawn")
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
++def test_capture_replay_bypass_logic():
++    comp_config = CompilationConfig(
++        mode=CompilationMode.VLLM_COMPILE,
++        cudagraph_mode="FULL",
++        cudagraph_capture_sizes=[1, 2],
++    )
++    vllm_config = _create_vllm_config(comp_config)
++    dispatcher = CudagraphDispatcher(vllm_config)
++    dispatcher.initialize_cudagraph_keys(
++        comp_config.cudagraph_mode, uniform_decode_query_len=1
++    )
++    model = SimpleMLP().to(DEVICE_TYPE)
++    full_wrapper = CUDAGraphWrapper(model, vllm_config, CUDAGraphMode.FULL)
++    max_bs = 16
++    persistent_input_buffer = torch.zeros(max_bs, 10, device=DEVICE_TYPE)
++    input_1 = persistent_input_buffer[:1]
++    input_2 = persistent_input_buffer[:2]
++    input_3 = persistent_input_buffer[:3]
++
++    desc_1 = BatchDescriptor(num_tokens=1)
++    desc_2 = BatchDescriptor(num_tokens=2)
++    desc_3_unseen = BatchDescriptor(num_tokens=3)
++
++    # 0. global warmup
++    with set_forward_context(
++        attn_metadata=None,
++        vllm_config=vllm_config,
++        cudagraph_runtime_mode=CUDAGraphMode.NONE,
++        batch_descriptor=None,
++    ):
++        full_wrapper(input_1)
+ 
+-        rt_mode, key = self.dispatcher.dispatch(num_tokens=desc_1.num_tokens)
+-        # 1. Capture first shape
+-        action = self._run_and_monitor_call(full_wrapper, input_1, rt_mode, key)
+-        assert action == "capture_global"
++    rt_mode, key = dispatcher.dispatch(num_tokens=desc_1.num_tokens)
++    # 1. Capture first shape
++    action = _run_and_monitor_call(full_wrapper, input_1, rt_mode, key, vllm_config)
++    assert action == "capture_global"
+ 
+-        # 2. Replay first shape
+-        action = self._run_and_monitor_call(full_wrapper, input_1, rt_mode, key)
+-        assert action == "replay"
++    # 2. Replay first shape
++    action = _run_and_monitor_call(full_wrapper, input_1, rt_mode, key, vllm_config)
++    assert action == "replay"
+ 
+-        rt_mode, key = self.dispatcher.dispatch(num_tokens=desc_2.num_tokens)
+-        # 3. Capture second shape
+-        action = self._run_and_monitor_call(full_wrapper, input_2, rt_mode, key)
+-        assert action == "capture_global"
++    rt_mode, key = dispatcher.dispatch(num_tokens=desc_2.num_tokens)
++    # 3. Capture second shape
++    action = _run_and_monitor_call(full_wrapper, input_2, rt_mode, key, vllm_config)
++    assert action == "capture_global"
+ 
+-        # 4. Replay second shape
+-        action = self._run_and_monitor_call(
+-            full_wrapper, input_2, CUDAGraphMode.FULL, desc_2
++    # 4. Replay second shape
++    action = _run_and_monitor_call(
++        full_wrapper, input_2, CUDAGraphMode.FULL, key, vllm_config
++    )
++    assert action == "replay"
++
++    # 5. Bypass if no key match
++    rt_mode, key = dispatcher.dispatch(num_tokens=desc_3_unseen.num_tokens)
++    assert rt_mode == CUDAGraphMode.NONE
++    action = _run_and_monitor_call(full_wrapper, input_3, rt_mode, key, vllm_config)
++    assert action == "bypass"
++
++    # capture unseen shape is not allowed after disable
++    set_cudagraph_capturing_enabled(False)
++    with pytest.raises(RuntimeError):
++        _run_and_monitor_call(
++            full_wrapper, input_3, CUDAGraphMode.FULL, desc_3_unseen, vllm_config
+         )
+-        assert action == "replay"
++    set_cudagraph_capturing_enabled(True)
+ 
+-        # 5. Bypass if no key match
+-        rt_mode, key = self.dispatcher.dispatch(num_tokens=desc_3_unseen.num_tokens)
+-        assert rt_mode == CUDAGraphMode.NONE
+-        action = self._run_and_monitor_call(full_wrapper, input_3, rt_mode, key)
+-        assert action == "bypass"
+-
+-        # capture unseen shape is not allowed after disable
+-        set_cudagraph_capturing_enabled(False)
+-        with pytest.raises(RuntimeError):
+-            self._run_and_monitor_call(
+-                full_wrapper, input_3, CUDAGraphMode.FULL, desc_3_unseen
+-            )
+-        set_cudagraph_capturing_enabled(True)
+-
+-    @create_new_process_for_each_test("spawn")
+-    def test_nested_wrappers(self):
+-        """Tests a scenario with a PIECEWISE wrapper inside a FULL one."""
+-        model = SimpleMLP().to(DEVICE_TYPE)
+-        full_wrapper = CUDAGraphWrapper(model, self.vllm_config, CUDAGraphMode.FULL)
+-        input_1 = torch.randn(1, 10, device=DEVICE_TYPE)
+-
+-        # Setup: Inner model is wrapped with PIECEWISE, outer with FULL
+-        inner_model = SimpleMLP().to(DEVICE_TYPE)
+-        piecewise_wrapper = CUDAGraphWrapper(
+-            inner_model, self.vllm_config, CUDAGraphMode.PIECEWISE
+-        )
+-        inner_model.forward = MagicMock(wraps=inner_model.forward)
+-        outer_model = SimpleMLP().to(DEVICE_TYPE)
+-        # When outer model is called, it calls the piecewise_wrapper
+-        outer_model.forward = MagicMock(
+-            wraps=outer_model.forward, side_effect=piecewise_wrapper
+-        )
+-        full_wrapper = CUDAGraphWrapper(
+-            outer_model, self.vllm_config, CUDAGraphMode.FULL
+-        )
+ 
+-        desc_1 = BatchDescriptor(num_tokens=1)
++@create_new_process_for_each_test("spawn")
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
++def test_nested_wrappers():
++    """Tests a scenario with a PIECEWISE wrapper inside a FULL one."""
++    comp_config = CompilationConfig(
++        mode=CompilationMode.VLLM_COMPILE,
++        cudagraph_mode="FULL",
++        cudagraph_capture_sizes=[1],
++    )
++    vllm_config = _create_vllm_config(comp_config)
++    dispatcher = CudagraphDispatcher(vllm_config)
++    dispatcher.initialize_cudagraph_keys(
++        comp_config.cudagraph_mode, uniform_decode_query_len=1
++    )
++    model = SimpleMLP().to(DEVICE_TYPE)
++    full_wrapper = CUDAGraphWrapper(model, vllm_config, CUDAGraphMode.FULL)
++    input_1 = torch.randn(1, 10, device=DEVICE_TYPE)
++
++    # Setup: Inner model is wrapped with PIECEWISE, outer with FULL
++    inner_model = SimpleMLP().to(DEVICE_TYPE)
++    piecewise_wrapper = CUDAGraphWrapper(
++        inner_model, vllm_config, CUDAGraphMode.PIECEWISE
++    )
++    inner_model.forward = MagicMock(wraps=inner_model.forward)
++    outer_model = SimpleMLP().to(DEVICE_TYPE)
++    # When outer model is called, it calls the piecewise_wrapper
++    outer_model.forward = MagicMock(
++        wraps=outer_model.forward, side_effect=piecewise_wrapper
++    )
++    full_wrapper = CUDAGraphWrapper(outer_model, vllm_config, CUDAGraphMode.FULL)
+ 
+-        # 0. global warmup
+-        with set_forward_context(
+-            attn_metadata=None,
+-            vllm_config=self.vllm_config,
+-            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+-            batch_descriptor=None,
+-        ):
+-            full_wrapper(input_1)
+-
+-        # --- Test runtime mode FULL---
+-        # Run with FULL mode context. Expect outer wrapper to capture.
+-        # The inner mock should be called once inside the graph capture.
+-        outer_model.forward.reset_mock()
+-        inner_model.forward.reset_mock()
+-        action = self._run_and_monitor_call(
+-            full_wrapper, input_1, CUDAGraphMode.FULL, desc_1
+-        )
+-        assert action == "capture_global"
+-        assert outer_model.forward.call_count == 1
+-        assert inner_model.forward.call_count == 1
+-
+-        # Run again. Expect outer wrapper to replay.
+-        # The outer model should NOT be called because the whole graph
+-        # is replayed.
+-        action = self._run_and_monitor_call(
+-            full_wrapper, input_1, CUDAGraphMode.FULL, desc_1
+-        )
+-        assert action == "replay"
+-        assert outer_model.forward.call_count == 1  # No new call
+-        assert inner_model.forward.call_count == 1
+-
+-        # --- Test runtime mode PIECEWISE ---
+-        outer_model.forward.reset_mock()
+-        inner_model.forward.reset_mock()
+-        # Run with PIECEWISE mode context.
+-        # Expect outer wrapper to bypass and call inner wrapper.
+-        # Inner wrapper should capture.
+-        action = self._run_and_monitor_call(
+-            full_wrapper, input_1, CUDAGraphMode.PIECEWISE, desc_1
+-        )
+-        assert action == "capture_global"
+-        assert outer_model.forward.call_count == 1
+-        assert inner_model.forward.call_count == 1
+-
+-        # Run again with PIECEWISE.
+-        # Outer bypasses, inner replays.
+-        action = self._run_and_monitor_call(
+-            full_wrapper, input_1, CUDAGraphMode.PIECEWISE, desc_1
+-        )
+-        assert action == "bypass"
+-        assert outer_model.forward.call_count == 2
+-        assert inner_model.forward.call_count == 1
++    desc_1 = BatchDescriptor(num_tokens=1)
++
++    # 0. global warmup
++    with set_forward_context(
++        attn_metadata=None,
++        vllm_config=vllm_config,
++        cudagraph_runtime_mode=CUDAGraphMode.NONE,
++        batch_descriptor=None,
++    ):
++        full_wrapper(input_1)
++
++    # --- Test runtime mode FULL---
++    # Run with FULL mode context. Expect outer wrapper to capture.
++    # The inner mock should be called once inside the graph capture.
++    outer_model.forward.reset_mock()
++    inner_model.forward.reset_mock()
++    action = _run_and_monitor_call(
++        full_wrapper, input_1, CUDAGraphMode.FULL, desc_1, vllm_config
++    )
++    assert action == "capture_global"
++    assert outer_model.forward.call_count == 1
++    assert inner_model.forward.call_count == 1
++
++    # Run again. Expect outer wrapper to replay.
++    # The outer model should NOT be called because the whole graph
++    # is replayed.
++    action = _run_and_monitor_call(
++        full_wrapper, input_1, CUDAGraphMode.FULL, desc_1, vllm_config
++    )
++    assert action == "replay"
++    assert outer_model.forward.call_count == 1  # No new call
++    assert inner_model.forward.call_count == 1
++
++    # --- Test runtime mode PIECEWISE ---
++    outer_model.forward.reset_mock()
++    inner_model.forward.reset_mock()
++    # Run with PIECEWISE mode context.
++    # Expect outer wrapper to bypass and call inner wrapper.
++    # Inner wrapper should capture.
++    action = _run_and_monitor_call(
++        full_wrapper, input_1, CUDAGraphMode.PIECEWISE, desc_1, vllm_config
++    )
++    assert action == "capture_global"
++    assert outer_model.forward.call_count == 1
++    assert inner_model.forward.call_count == 1
++
++    # Run again with PIECEWISE.
++    # Outer bypasses, inner replays.
++    action = _run_and_monitor_call(
++        full_wrapper, input_1, CUDAGraphMode.PIECEWISE, desc_1, vllm_config
++    )
++    assert action == "bypass"
++    assert outer_model.forward.call_count == 2
++    assert inner_model.forward.call_count == 1
+diff --git a/tests/v1/logits_processors/test_custom_online.py b/tests/v1/logits_processors/test_custom_online.py
+index 3dc6b8979..93825c65b 100644
+--- a/tests/v1/logits_processors/test_custom_online.py
++++ b/tests/v1/logits_processors/test_custom_online.py
+@@ -120,12 +120,11 @@ api_keyword_args = {
+ 
+ 
+ @create_new_process_for_each_test()
+-@pytest.mark.asyncio
+ @pytest.mark.parametrize(
+     "model_name",
+     [MODEL_NAME],
+ )
+-async def test_custom_logitsprocs(client: openai.AsyncOpenAI, model_name: str):
++def test_custom_logitsprocs(server, model_name: str):
+     """Test custom logitsprocs when starting OpenAI server from CLI
+ 
+     Launch vLLM OpenAI-compatible server, configured to load a custom logitproc
+@@ -139,36 +138,45 @@ async def test_custom_logitsprocs(client: openai.AsyncOpenAI, model_name: str):
+     token
+     """
+ 
+-    use_dummy_logitproc = True
+-    for prompt in prompts:
+-        # Build request arguments
+-        request_keyword_args: dict[str, Any] = {
+-            **api_keyword_args,
+-        }
+-        if use_dummy_logitproc:
+-            # 50% of requests pass target_token custom arg
+-            target_token = random.choice([128, 67])
+-            # For requests which activate the dummy logitproc, choose one of
+-            # two `target_token` values which are known not to be EOS tokens
+-            request_keyword_args["extra_body"] = {
+-                "vllm_xargs": {DUMMY_LOGITPROC_ARG: target_token}
+-            }
+-        batch = await client.completions.create(
+-            model=model_name,
+-            prompt=prompt,
+-            **request_keyword_args,
+-        )
++    import asyncio
+ 
+-        if use_dummy_logitproc:
+-            # Only for requests which activate dummy logitproc - validate that
+-            # output token is repeated
+-            choices: openai.types.CompletionChoice = batch.choices
+-            toks = choices[0].logprobs.tokens
+-            if not all([x == toks[0] for x in toks]):
+-                raise AssertionError(f"Generated {toks} should all be {toks[0]}")
++    async def _async_main(srv, mn):
++        async with srv.get_async_client() as client:
++            await _run(client)
+ 
+-        # Alternate whether to activate dummy logitproc for each request
+-        use_dummy_logitproc = not use_dummy_logitproc
++    async def _run(client):
++        use_dummy_logitproc = True
++        for prompt in prompts:
++            # Build request arguments
++            request_keyword_args: dict[str, Any] = {
++                **api_keyword_args,
++            }
++            if use_dummy_logitproc:
++                # 50% of requests pass target_token custom arg
++                target_token = random.choice([128, 67])
++                # For requests which activate the dummy logitproc, choose one of
++                # two `target_token` values which are known not to be EOS tokens
++                request_keyword_args["extra_body"] = {
++                    "vllm_xargs": {DUMMY_LOGITPROC_ARG: target_token}
++                }
++            batch = await client.completions.create(
++                model=model_name,
++                prompt=prompt,
++                **request_keyword_args,
++            )
++
++            if use_dummy_logitproc:
++                # Only for requests which activate dummy logitproc - validate that
++                # output token is repeated
++                choices: openai.types.CompletionChoice = batch.choices
++                toks = choices[0].logprobs.tokens
++                if not all([x == toks[0] for x in toks]):
++                    raise AssertionError(f"Generated {toks} should all be {toks[0]}")
++
++            # Alternate whether to activate dummy logitproc for each request
++            use_dummy_logitproc = not use_dummy_logitproc
++
++    asyncio.run(_async_main(server, model_name))
+ 
+ 
+ @pytest.mark.asyncio
+-- 
+2.39.5 (Apple Git-154)
+
+
+From d5b31c954d511ecdb486e84c71d52d2a5c28ade4 Mon Sep 17 00:00:00 2001
+From: Viktor Pus <viktorpus@tenstorrent.com>
+Date: Wed, 6 May 2026 18:10:17 +0200
+Subject: [PATCH 02/13] [Bugfix] Account for truncate_prompt_tokens when
+ computing max_tokens (#41800)
+
+Signed-off-by: Viktor Pus <viktorpus@tenstorrent.com>
+---
+ .../chat_completion/test_serving_chat.py      | 51 +++++++++++++++++++
+ .../openai/chat_completion/serving.py         |  1 +
+ vllm/entrypoints/openai/completion/serving.py |  1 +
+ vllm/entrypoints/openai/responses/serving.py  |  6 +++
+ vllm/entrypoints/serve/render/serving.py      |  2 +
+ vllm/entrypoints/utils.py                     |  7 +++
+ 6 files changed, 68 insertions(+)
+
+diff --git a/tests/entrypoints/openai/chat_completion/test_serving_chat.py b/tests/entrypoints/openai/chat_completion/test_serving_chat.py
+index df4d5ad47..c44e07a4c 100644
+--- a/tests/entrypoints/openai/chat_completion/test_serving_chat.py
++++ b/tests/entrypoints/openai/chat_completion/test_serving_chat.py
+@@ -807,6 +807,57 @@ async def test_serving_chat_should_set_correct_max_tokens():
+     assert mock_engine.generate.call_args.args[1].max_tokens == 5
+ 
+ 
++@pytest.mark.asyncio
++async def test_serving_chat_truncate_prompt_tokens_max_token_accounting():
++    """When truncate_prompt_tokens is set, max_tokens must be calculated using
++    the truncated prompt length, not the original prompt length.
++
++    Regression: without the fix, get_max_tokens received the untruncated prompt
++    length, causing the output budget to be underestimated.
++    """
++    mock_engine = MagicMock(spec=AsyncLLM)
++    mock_engine.errored = False
++    mock_engine.model_config = MockModelConfig()
++    mock_engine.input_processor = MagicMock()
++    mock_engine.renderer = _build_renderer(mock_engine.model_config)
++
++    serving_chat = _build_serving_chat(mock_engine)
++
++    # "what is 1+1?" tokenizes to 7 tokens with the test chat template
++    # (max_model_len=100 -> max_tokens = 93 without truncation, confirmed by
++    # test_serving_chat_should_set_correct_max_tokens above).
++    messages = [{"role": "user", "content": "what is 1+1?"}]
++
++    # Baseline: no truncation -> max_tokens = 100 - 7 = 93.
++    req = ChatCompletionRequest(model=MODEL_NAME, messages=messages)
++    with suppress(Exception):
++        await serving_chat.create_chat_completion(req)
++    assert mock_engine.generate.call_args.args[1].max_tokens == 93
++
++    # With truncate_prompt_tokens=5 (less than 7): the effective prompt length
++    # is 5, so max_tokens should be 100 - 5 = 95, not 93.
++    req = ChatCompletionRequest(
++        model=MODEL_NAME,
++        messages=messages,
++        truncate_prompt_tokens=5,
++    )
++    with suppress(Exception):
++        await serving_chat.create_chat_completion(req)
++    assert mock_engine.generate.call_args.args[1].max_tokens == 95
++
++    # With truncate_prompt_tokens=-1 (meaning use full max_model_len as the
++    # truncation limit, i.e., no practical truncation vs the window): effective
++    # length = min(7, 100) = 7 -> max_tokens = 93 again.
++    req = ChatCompletionRequest(
++        model=MODEL_NAME,
++        messages=messages,
++        truncate_prompt_tokens=-1,
++    )
++    with suppress(Exception):
++        await serving_chat.create_chat_completion(req)
++    assert mock_engine.generate.call_args.args[1].max_tokens == 93
++
++
+ @pytest.mark.asyncio
+ async def test_serving_chat_mistral_token_ids_prompt_is_validated():
+     """Regression test: when the Mistral tokenizer path returns token IDs
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index d149d9fd7..f42cc8afe 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -289,6 +289,7 @@ class OpenAIServingChat(OpenAIServing):
+                 self._extract_prompt_len(engine_input),
+                 self.default_sampling_params,
+                 self.override_max_tokens,
++                truncate_prompt_tokens=request.truncate_prompt_tokens,
+             )
+ 
+             sampling_params: SamplingParams | BeamSearchParams
+diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
+index 454b170a5..816c62163 100644
+--- a/vllm/entrypoints/openai/completion/serving.py
++++ b/vllm/entrypoints/openai/completion/serving.py
+@@ -151,6 +151,7 @@ class OpenAIServingCompletion(OpenAIServing):
+                 self._extract_prompt_len(engine_input),
+                 self.default_sampling_params,
+                 self.override_max_tokens,
++                truncate_prompt_tokens=request.truncate_prompt_tokens,
+             )
+ 
+             sampling_params: SamplingParams | BeamSearchParams
+diff --git a/vllm/entrypoints/openai/responses/serving.py b/vllm/entrypoints/openai/responses/serving.py
+index a6a9355ae..9c4dc4858 100644
+--- a/vllm/entrypoints/openai/responses/serving.py
++++ b/vllm/entrypoints/openai/responses/serving.py
+@@ -416,6 +416,9 @@ class OpenAIServingResponses(OpenAIServing):
+                 self._extract_prompt_len(engine_input),
+                 self.default_sampling_params,
+                 self.override_max_tokens,
++                truncate_prompt_tokens=(
++                    -1 if request.truncation != "disabled" else None
++                ),
+             )
+ 
+             sampling_params = request.to_sampling_params(
+@@ -700,6 +703,9 @@ class OpenAIServingResponses(OpenAIServing):
+                     self._extract_prompt_len(engine_input),
+                     self.default_sampling_params,  # type: ignore
+                     self.override_max_tokens,  # type: ignore
++                    truncate_prompt_tokens=(
++                        -1 if context.request.truncation != "disabled" else None
++                    ),
+                 )
+ 
+             # OPTIMIZATION
+diff --git a/vllm/entrypoints/serve/render/serving.py b/vllm/entrypoints/serve/render/serving.py
+index 967899229..782b2eaea 100644
+--- a/vllm/entrypoints/serve/render/serving.py
++++ b/vllm/entrypoints/serve/render/serving.py
+@@ -164,6 +164,7 @@ class OpenAIServingRender:
+             input_length,
+             self.default_sampling_params,
+             self.override_max_tokens,
++            truncate_prompt_tokens=request.truncate_prompt_tokens,
+         )
+         params = request.to_sampling_params(max_tokens, self.default_sampling_params)
+ 
+@@ -298,6 +299,7 @@ class OpenAIServingRender:
+                 input_length,
+                 self.default_sampling_params,
+                 self.override_max_tokens,
++                truncate_prompt_tokens=request.truncate_prompt_tokens,
+             )
+             params = request.to_sampling_params(
+                 max_tokens, self.default_sampling_params
+diff --git a/vllm/entrypoints/utils.py b/vllm/entrypoints/utils.py
+index e3682280e..cd1010457 100644
+--- a/vllm/entrypoints/utils.py
++++ b/vllm/entrypoints/utils.py
+@@ -177,7 +177,14 @@ def get_max_tokens(
+     input_length: int,
+     default_sampling_params: dict,
+     override_max_tokens: int | None = None,
++    truncate_prompt_tokens: int | None = None,
+ ) -> int:
++    if truncate_prompt_tokens is not None:
++        limit = truncate_prompt_tokens
++        input_length = min(
++            input_length,
++            max_model_len if limit == -1 else limit,
++        )
+     if max_model_len < input_length:
+         raise ValueError(
+             f"Input length ({input_length}) exceeds model's maximum "
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 22a3cbe1520bc8a3b19ace0abe497c514b3129ea Mon Sep 17 00:00:00 2001
+From: Divakar Verma <137818590+divakar-amd@users.noreply.github.com>
+Date: Wed, 6 May 2026 12:11:36 -0400
+Subject: [PATCH 03/13] [ROCm] aiter_unified_attn fp8 q scale refactor (#38296)
+
+Signed-off-by: Divakar Verma <divakar.verma@amd.com>
+---
+ .../backends/rocm_aiter_unified_attn.py       | 24 +++----------------
+ 1 file changed, 3 insertions(+), 21 deletions(-)
+
+diff --git a/vllm/v1/attention/backends/rocm_aiter_unified_attn.py b/vllm/v1/attention/backends/rocm_aiter_unified_attn.py
+index 55ed5c5b3..f56b58c43 100644
+--- a/vllm/v1/attention/backends/rocm_aiter_unified_attn.py
++++ b/vllm/v1/attention/backends/rocm_aiter_unified_attn.py
+@@ -200,19 +200,9 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
+         key_cache, value_cache = kv_cache.unbind(0)
+ 
+         softmax_scale = self.scale
+-        fp8_post_attn_v_rescale = False
+         if is_quantized_kv_cache(self.kv_cache_dtype):
+             key_cache = key_cache.view(self.fp8_dtype)
+             value_cache = value_cache.view(self.fp8_dtype)
+-            # When Q is FP8, triton kernel skips K/V dequant (for fp8xfp8 matmul).
+-            # Compensate by absorbing q_scale and k_scale into softmax_scale, and
+-            # v_scale into output_scale (or post-multiplying if no fusion).
+-            if query.dtype == self.fp8_dtype:
+-                softmax_scale = self.scale * layer._q_scale_float * layer._k_scale_float
+-                if output_scale is not None:
+-                    output_scale = output_scale / layer._v_scale_float
+-                else:
+-                    fp8_post_attn_v_rescale = True
+ 
+         cu_seqlens_q = attn_metadata.query_start_loc
+         seqused_k = attn_metadata.seq_lens
+@@ -220,11 +210,6 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
+         max_seqlen_k = attn_metadata.max_seq_len
+         block_table = attn_metadata.block_table
+ 
+-        descale_shape = (
+-            cu_seqlens_q.shape[0] - 1,
+-            key.shape[1] if key is not None else self.num_kv_heads,
+-        )
+-
+         self.unified_attention(
+             q=query[:num_actual_tokens],
+             k=key_cache,
+@@ -240,16 +225,13 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
+             window_size=self.sliding_window,
+             block_table=block_table,
+             softcap=self.logits_soft_cap,
+-            q_descale=None,  # q_scale absorbed into softmax_scale
+-            k_descale=layer._k_scale.expand(descale_shape),
+-            v_descale=layer._v_scale.expand(descale_shape),
++            q_descale=layer._q_scale if query.dtype == self.fp8_dtype else None,
++            k_descale=layer._k_scale,
++            v_descale=layer._v_scale,
+             sinks=self.sinks,
+             output_scale=output_scale,
+         )
+ 
+-        if fp8_post_attn_v_rescale:
+-            output[:num_actual_tokens].mul_(layer._v_scale_float)
+-
+         return output
+ 
+     def do_kv_cache_update(
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 27702f6d0879312c011e0180ffd48cbc034380d2 Mon Sep 17 00:00:00 2001
+From: Jing Wang <jingwang96@qq.com>
+Date: Thu, 7 May 2026 02:07:32 +0800
+Subject: [PATCH 04/13] [Bugfix] Fix token loss in PP mode which causes
+ degraded accuracy (#41133)
+
+Signed-off-by: Jing Wang <jingwang96@qq.com>
+Co-authored-by: Copilot <175728472+Copilot@users.noreply.github.com>
+Co-authored-by: Wentao Ye <44945378+yewentao256@users.noreply.github.com>
+Co-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>
+---
+ tests/v1/worker/test_gpu_model_runner.py | 157 +++++++++++++++++++++++
+ vllm/v1/worker/gpu_input_batch.py        |   1 +
+ vllm/v1/worker/gpu_model_runner.py       |  28 +++-
+ 3 files changed, 179 insertions(+), 7 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_model_runner.py b/tests/v1/worker/test_gpu_model_runner.py
+index ceea6cacf..4942390cd 100644
+--- a/tests/v1/worker/test_gpu_model_runner.py
++++ b/tests/v1/worker/test_gpu_model_runner.py
+@@ -163,6 +163,34 @@ def _schedule_new_request(*req_ids: str) -> SchedulerOutput:
+     )
+ 
+ 
++def _schedule_cached_requests(
++    req_ids: list[str],
++    num_scheduled_tokens: dict[str, int],
++    new_token_ids: list[list[int]],
++    num_computed_tokens: list[int],
++    num_output_tokens: list[int],
++) -> SchedulerOutput:
++    return SchedulerOutput(
++        scheduled_new_reqs=[],
++        scheduled_cached_reqs=CachedRequestData(
++            req_ids=req_ids,
++            resumed_req_ids=set(),
++            new_token_ids=new_token_ids,
++            all_token_ids={},
++            new_block_ids=[None] * len(req_ids),
++            num_computed_tokens=num_computed_tokens,
++            num_output_tokens=num_output_tokens,
++        ),
++        num_scheduled_tokens=num_scheduled_tokens,
++        total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
++        scheduled_spec_decode_tokens={},
++        scheduled_encoder_inputs={},
++        num_common_prefix_blocks=[],
++        finished_req_ids=set(),
++        free_encoder_mm_hashes=[],
++    )
++
++
+ def _is_req_scheduled(model_runner, req_id: str) -> bool:
+     return req_id in model_runner.input_batch.req_id_to_index
+ 
+@@ -510,6 +538,135 @@ def test_update_states_request_unscheduled(model_runner, dist_init):
+     assert not _is_req_scheduled(model_runner, req_ids[1])
+ 
+ 
++def test_update_states_pp_non_async_multi_request_keeps_token_buffers_consistent(
++    model_runner, model_runner_2, dist_init, monkeypatch
++):
++    req_ids = ["req_0", "req_1"]
++    non_last_runner = model_runner
++    last_runner = model_runner_2
++    non_last_runner.use_async_scheduling = False
++    last_runner.use_async_scheduling = False
++
++    # Both ranks start from the same request set.
++    monkeypatch.setattr(
++        "vllm.v1.worker.gpu_model_runner.get_pp_group",
++        lambda: SimpleNamespace(is_last_rank=False, world_size=2),
++    )
++    non_last_runner._update_states(_schedule_new_request(*req_ids))
++    last_runner._update_states(_schedule_new_request(*req_ids))
++
++    sampled_by_last_rank = {req_ids[0]: 101, req_ids[1]: 201}
++    # Emulate last-rank bookkeeping result from previous step:
++    # sampled tokens already cached in CPU token buffers.
++    for req_id, token_id in sampled_by_last_rank.items():
++        req_index = last_runner.input_batch.req_id_to_index[req_id]
++        start_idx = int(last_runner.input_batch.num_tokens_no_spec[req_index])
++        end_idx = start_idx + 1
++        last_runner.input_batch.token_ids_cpu[req_index, start_idx:end_idx] = [token_id]
++        last_runner.input_batch.is_token_ids[req_index, start_idx:end_idx] = True
++        last_runner.input_batch.num_tokens_no_spec[req_index] = end_idx
++        last_runner.requests[req_id].output_token_ids.append(token_id)
++
++    scheduler_output = _schedule_cached_requests(
++        req_ids=req_ids,
++        num_scheduled_tokens={req_ids[0]: 1, req_ids[1]: 1},
++        new_token_ids=[[101], [201]],
++        num_computed_tokens=[3, 3],  # prompt tokens only
++        num_output_tokens=[1, 1],
++    )
++    # non-last rank appends new_token_ids in _update_states.
++    monkeypatch.setattr(
++        "vllm.v1.worker.gpu_model_runner.get_pp_group",
++        lambda: SimpleNamespace(is_last_rank=False, world_size=2),
++    )
++    non_last_runner._update_states(scheduler_output)
++    # last rank should keep its already-bookkept CPU buffers unchanged.
++    monkeypatch.setattr(
++        "vllm.v1.worker.gpu_model_runner.get_pp_group",
++        lambda: SimpleNamespace(is_last_rank=True, world_size=2),
++    )
++    last_runner._update_states(scheduler_output)
++
++    # Verify consistency between PP ranks after _update_states.
++    for req_id in req_ids:
++        non_last_idx = non_last_runner.input_batch.req_id_to_index[req_id]
++        last_idx = last_runner.input_batch.req_id_to_index[req_id]
++        non_last_len = int(non_last_runner.input_batch.num_tokens_no_spec[non_last_idx])
++        last_len = int(last_runner.input_batch.num_tokens_no_spec[last_idx])
++        assert non_last_len == last_len
++        assert (
++            non_last_runner.input_batch.token_ids_cpu[
++                non_last_idx, :non_last_len
++            ].tolist()
++            == last_runner.input_batch.token_ids_cpu[last_idx, :last_len].tolist()
++        )
++
++
++def test_update_states_pp_async_multi_request_keeps_rank_state_consistent(
++    model_runner, model_runner_2, dist_init, monkeypatch
++):
++    req_ids = ["req_0", "req_1"]
++    non_last_runner = model_runner
++    last_runner = model_runner_2
++    non_last_runner.use_async_scheduling = True
++    last_runner.use_async_scheduling = True
++
++    # Both ranks start from the same request set.
++    monkeypatch.setattr(
++        "vllm.v1.worker.gpu_model_runner.get_pp_group",
++        lambda: SimpleNamespace(is_last_rank=False, world_size=2),
++    )
++    non_last_runner._update_states(_schedule_new_request(*req_ids))
++    last_runner._update_states(_schedule_new_request(*req_ids))
++
++    # Simulate async previous-step sampled tokens known on both ranks.
++    # non-last rank may receive them via PP communication; last rank has
++    # them from local sampling/bookkeeping.
++    sampled_by_last_rank = {req_ids[0]: 111, req_ids[1]: 222}
++    for runner in (non_last_runner, last_runner):
++        for req_id, token_id in sampled_by_last_rank.items():
++            req_index = runner.input_batch.req_id_to_index[req_id]
++            start_idx = int(runner.input_batch.num_tokens_no_spec[req_index])
++            end_idx = start_idx + 1
++            runner.input_batch.token_ids_cpu[req_index, start_idx:end_idx] = [token_id]
++            runner.input_batch.is_token_ids[req_index, start_idx:end_idx] = True
++            runner.input_batch.num_tokens_no_spec[req_index] = end_idx
++            runner.requests[req_id].output_token_ids.append(token_id)
++
++    scheduler_output = _schedule_cached_requests(
++        req_ids=req_ids,
++        num_scheduled_tokens={req_ids[0]: 1, req_ids[1]: 1},
++        new_token_ids=[],
++        num_computed_tokens=[4, 4],
++        num_output_tokens=[1, 1],
++    )
++    # non-last rank: async PP branch (new_token_ids empty).
++    monkeypatch.setattr(
++        "vllm.v1.worker.gpu_model_runner.get_pp_group",
++        lambda: SimpleNamespace(is_last_rank=False, world_size=2),
++    )
++    non_last_runner._update_states(scheduler_output)
++    # last rank: keep already-bookkept state aligned with scheduler view.
++    monkeypatch.setattr(
++        "vllm.v1.worker.gpu_model_runner.get_pp_group",
++        lambda: SimpleNamespace(is_last_rank=True, world_size=2),
++    )
++    last_runner._update_states(scheduler_output)
++
++    for req_id in req_ids:
++        non_last_idx = non_last_runner.input_batch.req_id_to_index[req_id]
++        last_idx = last_runner.input_batch.req_id_to_index[req_id]
++        non_last_len = int(non_last_runner.input_batch.num_tokens_no_spec[non_last_idx])
++        last_len = int(last_runner.input_batch.num_tokens_no_spec[last_idx])
++        assert non_last_len == last_len
++        assert (
++            non_last_runner.input_batch.token_ids_cpu[
++                non_last_idx, :non_last_len
++            ].tolist()
++            == last_runner.input_batch.token_ids_cpu[last_idx, :last_len].tolist()
++        )
++
++
+ def test_kv_cache_stride_order(monkeypatch, model_runner):
+     # This test checks if GPUModelRunner initializes correctly when an attention
+     # backend enforces a non-default KV cache stride order.
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index 44e0efaaa..e9de08342 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -504,6 +504,7 @@ class InputBatch:
+         start_index = self.num_tokens_no_spec[req_index]
+         end_token_index = start_index + num_spec_tokens
+         self.token_ids_cpu[req_index, start_index:end_token_index] = spec_token_ids
++        self.is_token_ids[req_index, start_index:end_token_index] = True
+         cur_spec_token_ids.extend(spec_token_ids)
+ 
+     def remove_request(self, req_id: str) -> int | None:
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index eef55957a..f712f2c49 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -1347,13 +1347,27 @@ class GPUModelRunner(
+             # For the last rank, we don't need to update the token_ids_cpu
+             # because the sampled tokens are already cached.
+             if not is_last_rank:
+-                # Add new_token_ids to token_ids_cpu.
+-                start_token_index = num_computed_tokens
+-                end_token_index = num_computed_tokens + len(new_token_ids)
+-                self.input_batch.token_ids_cpu[
+-                    req_index, start_token_index:end_token_index
+-                ] = new_token_ids
+-                self.input_batch.num_tokens_no_spec[req_index] = end_token_index
++                start_token_index = self.input_batch.num_tokens_no_spec[req_index]
++                # For chunked prefill, num_computed_tokens may less
++                # than num_tokens_no_spec.
++                # Async scheduled PP: no new_token_ids, advance num_tokens_no_spec
++                # according to num_computed_tokens.
++                end_token_index = max(
++                    start_token_index,
++                    num_computed_tokens + len(new_token_ids),
++                )
++                if end_token_index > start_token_index:
++                    if new_token_ids:
++                        # Add new_token_ids to token_ids_cpu.
++                        num_new_tokens = end_token_index - start_token_index
++                        tokens_to_append = new_token_ids[-num_new_tokens:]
++                        self.input_batch.token_ids_cpu[
++                            req_index, start_token_index:end_token_index
++                        ] = tokens_to_append
++                    self.input_batch.is_token_ids[
++                        req_index, start_token_index:end_token_index
++                    ] = True
++                    self.input_batch.num_tokens_no_spec[req_index] = end_token_index
+ 
+             # Add spec_token_ids to token_ids_cpu.
+             self.input_batch.update_req_spec_token_ids(req_state, scheduled_spec_tokens)
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 38e16678ba7ec8417ce87f7010a03d203ee64b2b Mon Sep 17 00:00:00 2001
+From: Benjamin Chislett <bchislett@nvidia.com>
+Date: Wed, 6 May 2026 14:17:02 -0400
+Subject: [PATCH 05/13] [Bugfix] Align block table for TRTLLM MLA edge-case
+ (#39324)
+
+Signed-off-by: Benjamin Chislett <bchislett@nvidia.com>
+---
+ vllm/v1/worker/block_table.py     | 7 +++++++
+ vllm/v1/worker/gpu/block_table.py | 5 +++++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/vllm/v1/worker/block_table.py b/vllm/v1/worker/block_table.py
+index f46e8a8ed..87a2aac9d 100644
+--- a/vllm/v1/worker/block_table.py
++++ b/vllm/v1/worker/block_table.py
+@@ -257,6 +257,13 @@ class MultiGroupBlockTable:
+                 f"must match block_sizes length ({len(block_sizes)})"
+             )
+ 
++        # Align to a multiple of (128 / block_size) as required
++        # by some attention backends such as TRTLLM (#39324)
++        max_num_blocks = [
++            cdiv(n, 128 // bs) * (128 // bs) if bs <= 128 else n
++            for n, bs in zip(max_num_blocks, block_sizes)
++        ]
++
+         self.block_tables = [
+             BlockTable(
+                 block_size,
+diff --git a/vllm/v1/worker/gpu/block_table.py b/vllm/v1/worker/gpu/block_table.py
+index d2a2a6aed..3061278b0 100644
+--- a/vllm/v1/worker/gpu/block_table.py
++++ b/vllm/v1/worker/gpu/block_table.py
+@@ -41,6 +41,11 @@ class BlockTables:
+             # As a result, one block on the current rank covers `block_size * cp_size`
+             # tokens in the full, global (unsharded) sequence.
+             max_num_blocks = cdiv(self.max_model_len, block_size * self.cp_size)
++            # Align to a multiple of (128 / block_size) as required
++            # by some attention backends such as TRTLLM (#39324)
++            if block_size <= 128:
++                alignment = 128 // block_size
++                max_num_blocks = cdiv(max_num_blocks, alignment) * alignment
+             block_table = StagedWriteTensor(
+                 (self.max_num_reqs, max_num_blocks),
+                 dtype=torch.int32,
+-- 
+2.39.5 (Apple Git-154)
+
+
+From ca3e62d3363d3f8f5470b351ebfc48fa1826e687 Mon Sep 17 00:00:00 2001
+From: Johnny Yang <24908445+jcyang43@users.noreply.github.com>
+Date: Wed, 6 May 2026 11:41:37 -0700
+Subject: [PATCH 06/13] Upgrade tpu-inference to v0.19.0 (#41844)
+
+Signed-off-by: Johnny Yang <johnnyyang@google.com>
+---
+ requirements/tpu.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/requirements/tpu.txt b/requirements/tpu.txt
+index cee9fa657..f1074e4a6 100644
+--- a/requirements/tpu.txt
++++ b/requirements/tpu.txt
+@@ -11,4 +11,4 @@ ray[default]
+ ray[data]
+ setuptools==78.1.0
+ nixl==0.3.0
+-tpu-inference==0.18.0
++tpu-inference==0.19.0
+-- 
+2.39.5 (Apple Git-154)
+
+
+From f3f8efa73a49ec87d6a22fe268d0abde503497d7 Mon Sep 17 00:00:00 2001
+From: Flora Feng <4florafeng@gmail.com>
+Date: Wed, 6 May 2026 16:25:34 -0400
+Subject: [PATCH 07/13] [CI] Enable gemma4 parser test on CI (#41857)
+
+Signed-off-by: sfeng33 <4florafeng@gmail.com>
+---
+ .buildkite/test-amd.yaml        | 3 ++-
+ .buildkite/test_areas/misc.yaml | 2 +-
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/.buildkite/test-amd.yaml b/.buildkite/test-amd.yaml
+index 5b3eb4f79..ae0c01592 100644
+--- a/.buildkite/test-amd.yaml
++++ b/.buildkite/test-amd.yaml
+@@ -931,6 +931,7 @@ steps:
+   - tests/renderers
+   - tests/standalone_tests/lazy_imports.py
+   - tests/tokenizers_
++  - tests/reasoning
+   - tests/tool_parsers
+   - tests/transformers_utils
+   - tests/config
+@@ -943,7 +944,7 @@ steps:
+   - pytest -v -s -m 'cpu_test' multimodal
+   - pytest -v -s renderers
+   - pytest -v -s tokenizers_
+-  - pytest -v -s reasoning --ignore=reasoning/test_seedoss_reasoning_parser.py --ignore=reasoning/test_glm4_moe_reasoning_parser.py --ignore=reasoning/test_gemma4_reasoning_parser.py
++  - pytest -v -s reasoning --ignore=reasoning/test_seedoss_reasoning_parser.py --ignore=reasoning/test_glm4_moe_reasoning_parser.py
+   - pytest -v -s tool_parsers
+   - pytest -v -s transformers_utils
+   - pytest -v -s config
+diff --git a/.buildkite/test_areas/misc.yaml b/.buildkite/test_areas/misc.yaml
+index 0e6e70959..c34d4c10b 100644
+--- a/.buildkite/test_areas/misc.yaml
++++ b/.buildkite/test_areas/misc.yaml
+@@ -190,7 +190,7 @@ steps:
+   - pytest -v -s -m 'cpu_test' multimodal
+   - pytest -v -s renderers
+   - pytest -v -s tokenizers_
+-  - pytest -v -s reasoning --ignore=reasoning/test_seedoss_reasoning_parser.py --ignore=reasoning/test_glm4_moe_reasoning_parser.py --ignore=reasoning/test_gemma4_reasoning_parser.py
++  - pytest -v -s reasoning --ignore=reasoning/test_seedoss_reasoning_parser.py --ignore=reasoning/test_glm4_moe_reasoning_parser.py
+   - pytest -v -s tool_parsers
+   - pytest -v -s transformers_utils
+   - pytest -v -s config
+-- 
+2.39.5 (Apple Git-154)
+
+
+From deb737e323b3c2bf7986b2225ba76e32b4b097f2 Mon Sep 17 00:00:00 2001
+From: JackyLiu <lzwgre@126.com>
+Date: Wed, 6 May 2026 17:17:56 -0400
+Subject: [PATCH 08/13] =?UTF-8?q?[Doc]=20Add=20ModernBertForSequenceClassi?=
+ =?UTF-8?q?fication=20to=20scoring.md=20cross-en=E2=80=A6=20(#41832)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: JLiu4Coding <lzwgre@126.com>
+---
+ docs/models/pooling_models/scoring.md | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/docs/models/pooling_models/scoring.md b/docs/models/pooling_models/scoring.md
+index a4424642c..baaf15f14 100644
+--- a/docs/models/pooling_models/scoring.md
++++ b/docs/models/pooling_models/scoring.md
+@@ -41,6 +41,7 @@ The score models is designed to compute similarity scores between two input prom
+ | `GemmaForSequenceClassification` | Gemma-based | `BAAI/bge-reranker-v2-gemma`(see note), etc. | [bge-reranker-v2-gemma.jinja](../../../examples/pooling/score/template/bge-reranker-v2-gemma.jinja) | ✅︎ | ✅︎ |
+ | `GteNewForSequenceClassification` | mGTE-TRM (see note) | `Alibaba-NLP/gte-multilingual-reranker-base`, etc. | N/A | | |
+ | `LlamaBidirectionalForSequenceClassification`<sup>C</sup> | Llama-based with bidirectional attention | `nvidia/llama-nemotron-rerank-1b-v2`, etc. | [nemotron-rerank.jinja](../../../examples/pooling/score/template/nemotron-rerank.jinja) | ✅︎ | ✅︎ |
++| `ModernBertForSequenceClassification` | ModernBERT-based | `Alibaba-NLP/gte-reranker-modernbert-base`, etc. | N/A | | |
+ | `Qwen2ForSequenceClassification`<sup>C</sup> | Qwen2-based | `mixedbread-ai/mxbai-rerank-base-v2`(see note), etc. | [mxbai_rerank_v2.jinja](../../../examples/pooling/score/template/mxbai_rerank_v2.jinja) | ✅︎ | ✅︎ |
+ | `Qwen3ForSequenceClassification`<sup>C</sup> | Qwen3-based | `tomaarsen/Qwen3-Reranker-0.6B-seq-cls`, `Qwen/Qwen3-Reranker-0.6B`(see note), etc. | [qwen3_reranker.jinja](../../../examples/pooling/score/template/qwen3_reranker.jinja) | ✅︎ | ✅︎ |
+ | `RobertaForSequenceClassification` | RoBERTa-based | `cross-encoder/quora-roberta-base`, etc. | N/A | | |
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 50acdc5b5cc00f10408d8f98b21fc97efc615173 Mon Sep 17 00:00:00 2001
+From: xy3 <120182408@qq.com>
+Date: Thu, 7 May 2026 05:22:01 +0800
+Subject: [PATCH 09/13] Fix Qwen3 streaming content routing (#40820)
+
+Signed-off-by: xy3 <120182408@qq.com>
+Signed-off-by: sfeng33 <4florafeng@gmail.com>
+Co-authored-by: sfeng33 <4florafeng@gmail.com>
+---
+ .../test_thinking_token_budget.py             |  44 +++++
+ tests/parser/__init__.py                      |   2 +
+ tests/parser/test_streaming.py                | 165 ++++++++++++++++++
+ vllm/parser/abstract_parser.py                |  16 +-
+ 4 files changed, 220 insertions(+), 7 deletions(-)
+ create mode 100644 tests/parser/__init__.py
+ create mode 100644 tests/parser/test_streaming.py
+
+diff --git a/tests/entrypoints/openai/chat_completion/test_thinking_token_budget.py b/tests/entrypoints/openai/chat_completion/test_thinking_token_budget.py
+index d7a601114..ae2b597e1 100644
+--- a/tests/entrypoints/openai/chat_completion/test_thinking_token_budget.py
++++ b/tests/entrypoints/openai/chat_completion/test_thinking_token_budget.py
+@@ -287,3 +287,47 @@ async def test_thinking_token_budget_qwen35_fp8_mtp_concurrent_mixed_budget_and_
+                 f"index {i}: reasoning decode token ids ({n_reason}) != "
+                 f"thinking_token_budget ({expected_budget})"
+             )
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("client", ["default", "auto_config"], indirect=True)
++async def test_streaming_with_thinking_disabled_stays_in_content(
++    client: openai.AsyncOpenAI,
++):
++    request_kwargs = {
++        "model": MODEL_NAME,
++        "messages": [
++            {
++                "role": "user",
++                "content": "Which is larger, 4 or 12?"
++                " Output exactly one token: 4 or 12.",
++            }
++        ],
++        "max_tokens": 16,
++        "temperature": 0.0,
++        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
++    }
++
++    response = await client.chat.completions.create(**request_kwargs)
++    message = response.choices[0].message
++    assert message.content is not None and message.content.strip() != ""
++    assert getattr(message, "reasoning", None) in (None, "")
++
++    stream = await client.chat.completions.create(
++        **request_kwargs,
++        stream=True,
++    )
++
++    content_chunks = []
++    reasoning_chunks = []
++    async for chunk in stream:
++        if not chunk.choices:
++            continue
++        delta = chunk.choices[0].delta
++        if getattr(delta, "content", None):
++            content_chunks.append(delta.content)
++        if getattr(delta, "reasoning", None):
++            reasoning_chunks.append(delta.reasoning)
++
++    assert "".join(content_chunks).strip() != ""
++    assert reasoning_chunks == []
+diff --git a/tests/parser/__init__.py b/tests/parser/__init__.py
+new file mode 100644
+index 000000000..208f01a7c
+--- /dev/null
++++ b/tests/parser/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/tests/parser/test_streaming.py b/tests/parser/test_streaming.py
+new file mode 100644
+index 000000000..d9194d48e
+--- /dev/null
++++ b/tests/parser/test_streaming.py
+@@ -0,0 +1,165 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import json
++
++import pytest
++
++from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
++from vllm.entrypoints.openai.engine.protocol import DeltaMessage
++from vllm.parser.abstract_parser import _WrappedParser
++from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
++from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
++
++
++class ThinkReasoningParser(BaseThinkingReasoningParser):
++    @property
++    def start_token(self) -> str:
++        return "<think>"
++
++    @property
++    def end_token(self) -> str:
++        return "</think>"
++
++
++MODEL_OUTPUT = (
++    "<think>let me think about this</think>"
++    '<tool_call>\n{"name": "get_weather", '
++    '"arguments": {"city": "Dallas"}}\n</tool_call>'
++)
++
++
++@pytest.fixture(scope="module")
++def tokenizer():
++    from vllm.tokenizers import get_tokenizer
++
++    return get_tokenizer("Qwen/Qwen3-32B")
++
++
++@pytest.fixture
++def request_obj():
++    return ChatCompletionRequest(
++        model="test-model",
++        messages=[{"role": "user", "content": "hi"}],
++    )
++
++
++def make_parser(tokenizer, reasoning=False, tool=False):
++    _WrappedParser.reasoning_parser_cls = ThinkReasoningParser if reasoning else None
++    _WrappedParser.tool_parser_cls = Hermes2ProToolParser if tool else None
++    return _WrappedParser(tokenizer)
++
++
++def stream_text(parser, tokenizer, text, request, prompt_token_ids=None):
++    token_ids = tokenizer.encode(text, add_special_tokens=False)
++    results: list[DeltaMessage | None] = []
++    for tid in token_ids:
++        delta_text = tokenizer.decode([tid])
++        result = parser.parse_delta(
++            delta_text, [tid], request, prompt_token_ids=prompt_token_ids
++        )
++        prompt_token_ids = None
++        results.append(result)
++    return results
++
++
++def collect_fields(results):
++    all_reasoning = "".join(r.reasoning for r in results if r and r.reasoning)
++    all_content = "".join(r.content for r in results if r and r.content)
++    all_tool_calls = [tc for r in results if r and r.tool_calls for tc in r.tool_calls]
++    return all_reasoning, all_content, all_tool_calls
++
++
++def test_parse_delta_neither_parser(tokenizer, request_obj):
++    parser = make_parser(tokenizer, reasoning=False, tool=False)
++    results = stream_text(
++        parser, tokenizer, MODEL_OUTPUT, request_obj, prompt_token_ids=[]
++    )
++    reasoning, content, tool_calls = collect_fields(results)
++
++    assert reasoning == ""
++    assert len(tool_calls) == 0
++    assert "<think>" in content
++    assert "let me think about this" in content
++    assert "<tool_call>" in content
++    assert "get_weather" in content
++
++
++def test_parse_delta_tool_parser_only(tokenizer, request_obj):
++    parser = make_parser(tokenizer, reasoning=False, tool=True)
++    results = stream_text(
++        parser, tokenizer, MODEL_OUTPUT, request_obj, prompt_token_ids=[]
++    )
++    reasoning, content, tool_calls = collect_fields(results)
++
++    assert reasoning == ""
++    assert "<think>" in content
++    assert "let me think about this" in content
++    assert "</think>" in content
++
++    assert len(tool_calls) > 0
++    assert tool_calls[0].function.name == "get_weather"
++    tool_args = "".join(
++        tc.function.arguments for tc in tool_calls if tc.function.arguments
++    )
++    assert json.loads(tool_args) == {"city": "Dallas"}
++
++
++def test_parse_delta_reasoning_parser_only(tokenizer, request_obj):
++    parser = make_parser(tokenizer, reasoning=True, tool=False)
++    results = stream_text(
++        parser, tokenizer, MODEL_OUTPUT, request_obj, prompt_token_ids=[]
++    )
++    reasoning, content, tool_calls = collect_fields(results)
++
++    assert "let me think about this" in reasoning
++    assert len(tool_calls) == 0
++    assert "<tool_call>" in content
++    assert "get_weather" in content
++    assert "</tool_call>" in content
++
++
++def test_parse_delta_both_parsers(tokenizer, request_obj):
++    parser = make_parser(tokenizer, reasoning=True, tool=True)
++    results = stream_text(
++        parser, tokenizer, MODEL_OUTPUT, request_obj, prompt_token_ids=[]
++    )
++    reasoning, content, tool_calls = collect_fields(results)
++
++    assert "let me think about this" in reasoning
++    assert content == ""
++
++    assert len(tool_calls) > 0
++    assert tool_calls[0].function.name == "get_weather"
++    tool_args = "".join(
++        tc.function.arguments for tc in tool_calls if tc.function.arguments
++    )
++    assert json.loads(tool_args) == {"city": "Dallas"}
++
++
++def test_parse_delta_reasoning_only_thinking_disabled(tokenizer, request_obj):
++    """Regression test for vllm-project/vllm#40466.
++
++    When enable_thinking=False, the chat template places <think>\\n\\n</think>
++    in the prompt. The model then generates pure content (no think tokens).
++    All streaming output must go to delta.content, not delta.reasoning.
++    """
++    parser = make_parser(tokenizer, reasoning=True, tool=False)
++
++    end_token_id = parser._reasoning_parser.end_token_id
++    prompt_token_ids = [1, 2, end_token_id, 3]
++
++    content_text = "Hello! How can I assist you today?"
++    results = stream_text(
++        parser,
++        tokenizer,
++        content_text,
++        request_obj,
++        prompt_token_ids=prompt_token_ids,
++    )
++    reasoning, content, tool_calls = collect_fields(results)
++
++    assert reasoning == "", f"Expected no reasoning, got: {reasoning!r}"
++    assert "Hello" in content
++    assert "assist" in content
++    assert len(tool_calls) == 0
+diff --git a/vllm/parser/abstract_parser.py b/vllm/parser/abstract_parser.py
+index 03b9f211d..1b861dcad 100644
+--- a/vllm/parser/abstract_parser.py
++++ b/vllm/parser/abstract_parser.py
+@@ -636,15 +636,11 @@ class DelegatingParser(Parser):
+     def _in_reasoning_phase(self, state: StreamState) -> bool:
+         if self._reasoning_parser is None:
+             return False
+-        if self._tool_parser is None:
+-            return True
+         return not state.reasoning_ended
+ 
+     def _in_tool_call_phase(self, state: StreamState) -> bool:
+         if self._tool_parser is None:
+             return False
+-        if self._reasoning_parser is None:
+-            return True
+         return state.reasoning_ended
+ 
+     def parse_delta(
+@@ -658,7 +654,9 @@ class DelegatingParser(Parser):
+ 
+         if not state.prompt_reasoning_checked and prompt_token_ids is not None:
+             state.prompt_reasoning_checked = True
+-            if self.is_reasoning_end(prompt_token_ids):
++            if self._reasoning_parser is None or self.is_reasoning_end(
++                prompt_token_ids
++            ):
+                 state.reasoning_ended = True
+ 
+         current_text = state.previous_text + delta_text
+@@ -709,8 +707,12 @@ class DelegatingParser(Parser):
+                 )
+             )
+ 
+-        # No parsers: pass through as content
+-        if self._reasoning_parser is None and self._tool_parser is None:
++        # No phase active: pass through as content
++        if (
++            delta_message is None
++            and not self._in_reasoning_phase(state)
++            and not self._in_tool_call_phase(state)
++        ):
+             delta_message = DeltaMessage(content=delta_text)
+ 
+         state.previous_text = current_text
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 95582868efd4db0b120e3640bbc61dcfce20d59f Mon Sep 17 00:00:00 2001
+From: Chauncey <chaunceyjiang@gmail.com>
+Date: Thu, 7 May 2026 05:48:01 +0800
+Subject: [PATCH 10/13] [Bugfix] DeepSeekV32/v4: respect string='true|false'
+ attribute andunwrap arguments/input wrapper (#41801)
+
+Signed-off-by: chaunceyjiang <chaunceyjiang@gmail.com>
+Co-authored-by: QwertyJack <7554089+QwertyJack@users.noreply.github.com>
+---
+ .../test_deepseekv32_tool_parser.py           | 157 +++++++++++++++++-
+ .../test_deepseekv4_tool_parser.py            |  33 ++++
+ vllm/tool_parsers/deepseekv32_tool_parser.py  |  44 ++++-
+ 3 files changed, 224 insertions(+), 10 deletions(-)
+
+diff --git a/tests/tool_parsers/test_deepseekv32_tool_parser.py b/tests/tool_parsers/test_deepseekv32_tool_parser.py
+index c547795e7..693cf5cad 100644
+--- a/tests/tool_parsers/test_deepseekv32_tool_parser.py
++++ b/tests/tool_parsers/test_deepseekv32_tool_parser.py
+@@ -203,7 +203,14 @@ class TestExtractToolCalls:
+             ),
+         )
+         parser = make_parser(tools=[tool])
+-        model_output = build_tool_call("toggle", {"enabled": "true", "count": "42"})
++        model_output = (
++            f"{FC_START}\n"
++            f'{INV_START}toggle">\n'
++            f'{PARAM_START}enabled" string="false">true{PARAM_END}\n'
++            f'{PARAM_START}count" string="false">42{PARAM_END}\n'
++            f"{INV_END}\n"
++            f"{FC_END}"
++        )
+         result = parser.extract_tool_calls(model_output, None)
+         assert result.tools_called
+         assert len(result.tool_calls) == 1
+@@ -212,6 +219,118 @@ class TestExtractToolCalls:
+         assert isinstance(args["enabled"], bool)
+         assert isinstance(args["count"], int)
+ 
++    def test_string_attr_true_preserves_literal_despite_schema(self):
++        """string="true" must keep the value as a string even
++        if the schema says integer."""
++        tool = ChatCompletionToolsParam(
++            function=FunctionDefinition(
++                name="score",
++                parameters={
++                    "type": "object",
++                    "properties": {
++                        "value": {"type": "integer"},
++                    },
++                },
++            ),
++        )
++        parser = make_parser(tools=[tool])
++        model_output = (
++            f"{FC_START}\n"
++            f'{INV_START}score">\n'
++            f'{PARAM_START}value" string="true">42{PARAM_END}\n'
++            f"{INV_END}\n"
++            f"{FC_END}"
++        )
++        result = parser.extract_tool_calls(model_output, None)
++        assert result.tools_called
++        args = json.loads(result.tool_calls[0].function.arguments)
++        assert args == {"value": "42"}
++        assert isinstance(args["value"], str)
++
++    def test_string_attr_false_allows_schema_conversion(self):
++        """string="false" allows the parser to convert via the tool schema."""
++        tool = ChatCompletionToolsParam(
++            function=FunctionDefinition(
++                name="score",
++                parameters={
++                    "type": "object",
++                    "properties": {
++                        "value": {"type": "integer"},
++                    },
++                },
++            ),
++        )
++        parser = make_parser(tools=[tool])
++        model_output = (
++            f"{FC_START}\n"
++            f'{INV_START}score">\n'
++            f'{PARAM_START}value" string="false">42{PARAM_END}\n'
++            f"{INV_END}\n"
++            f"{FC_END}"
++        )
++        result = parser.extract_tool_calls(model_output, None)
++        assert result.tools_called
++        args = json.loads(result.tool_calls[0].function.arguments)
++        assert args == {"value": 42}
++        assert isinstance(args["value"], int)
++
++    def test_arguments_wrapper_repaired(self):
++        """A single 'arguments' wrapper parameter must be unwrapped when it
++        is not part of the tool schema and the inner object matches schema fields."""
++        tool = ChatCompletionToolsParam(
++            function=FunctionDefinition(
++                name="get_weather",
++                parameters={
++                    "type": "object",
++                    "properties": {
++                        "location": {"type": "string"},
++                    },
++                },
++            ),
++        )
++        parser = make_parser(tools=[tool])
++        model_output = (
++            f"{FC_START}\n"
++            f'{INV_START}get_weather">\n'
++            f'{PARAM_START}arguments" string="false">'
++            f'{{"location":"Beijing"}}'
++            f"{PARAM_END}\n"
++            f"{INV_END}\n"
++            f"{FC_END}"
++        )
++        result = parser.extract_tool_calls(model_output, None)
++        assert result.tools_called
++        args = json.loads(result.tool_calls[0].function.arguments)
++        assert args == {"location": "Beijing"}
++
++    def test_input_wrapper_repaired(self):
++        """A single 'input' wrapper parameter must be unwrapped similarly."""
++        tool = ChatCompletionToolsParam(
++            function=FunctionDefinition(
++                name="get_weather",
++                parameters={
++                    "type": "object",
++                    "properties": {
++                        "location": {"type": "string"},
++                    },
++                },
++            ),
++        )
++        parser = make_parser(tools=[tool])
++        model_output = (
++            f"{FC_START}\n"
++            f'{INV_START}get_weather">\n'
++            f'{PARAM_START}input" string="true">'
++            f'{{"location":"Beijing"}}'
++            f"{PARAM_END}\n"
++            f"{INV_END}\n"
++            f"{FC_END}"
++        )
++        result = parser.extract_tool_calls(model_output, None)
++        assert result.tools_called
++        args = json.loads(result.tool_calls[0].function.arguments)
++        assert args == {"location": "Beijing"}
++
+ 
+ # ---------------------------------------------------------------------------
+ # Tests: extract_tool_calls_streaming
+@@ -319,11 +438,45 @@ class TestExtractToolCallsStreaming:
+             ),
+         )
+         parser = make_parser(tools=[tool])
+-        full_text = build_tool_call("add", {"x": "3", "y": "4"})
++        full_text = (
++            f"{FC_START}\n"
++            f'{INV_START}add">\n'
++            f'{PARAM_START}x" string="false">3{PARAM_END}\n'
++            f'{PARAM_START}y" string="false">4{PARAM_END}\n'
++            f"{INV_END}\n"
++            f"{FC_END}"
++        )
+         deltas = self._stream(parser, full_text)
+         args_str = self._reconstruct_args(deltas)
+         assert json.loads(args_str) == {"x": 3, "y": 4}
+ 
++    def test_string_attr_true_preserves_literal_in_streaming(self):
++        """Streaming: string='true' must keep the value literal despite schema."""
++        tool = ChatCompletionToolsParam(
++            function=FunctionDefinition(
++                name="score",
++                parameters={
++                    "type": "object",
++                    "properties": {
++                        "value": {"type": "integer"},
++                    },
++                },
++            ),
++        )
++        parser = make_parser(tools=[tool])
++        full_text = (
++            f"{FC_START}\n"
++            f'{INV_START}score">\n'
++            f'{PARAM_START}value" string="true">42{PARAM_END}\n'
++            f"{INV_END}\n"
++            f"{FC_END}"
++        )
++        deltas = self._stream(parser, full_text)
++        args_str = self._reconstruct_args(deltas)
++        args = json.loads(args_str)
++        assert args == {"value": "42"}
++        assert isinstance(args["value"], str)
++
+     def test_multiple_tools_streaming(self, parser):
+         full_text = (
+             f"{FC_START}\n"
+diff --git a/tests/tool_parsers/test_deepseekv4_tool_parser.py b/tests/tool_parsers/test_deepseekv4_tool_parser.py
+index cc77a1f77..afcd05739 100644
+--- a/tests/tool_parsers/test_deepseekv4_tool_parser.py
++++ b/tests/tool_parsers/test_deepseekv4_tool_parser.py
+@@ -203,3 +203,36 @@ def test_get_vllm_registry_structural_tag_returns_structural_tag(
+         )
+         tag = parser.get_structural_tag(req)
+         assert isinstance(tag, StructuralTag)
++
++
++def test_extract_tool_calls_arguments_wrapper():
++    mock_tokenizer = MagicMock()
++    mock_tokenizer.get_vocab.return_value = {}
++
++    tool = ChatCompletionToolsParam(
++        type="function",
++        function={
++            "name": "get_weather",
++            "parameters": {
++                "type": "object",
++                "properties": {"location": {"type": "string"}},
++            },
++        },
++    )
++
++    parser = DeepSeekV4ToolParser(mock_tokenizer, tools=[tool])
++    request = MagicMock()
++    request.tools = [tool]
++
++    model_output = (
++        f"{TC_START}"
++        f'{INV_START}get_weather">'
++        f'{PARAM_START}arguments" string="false">{{"location":"Beijing"}}{PARAM_END}'
++        f"{INV_END}"
++        f"{TC_END}"
++    )
++
++    result = parser.extract_tool_calls(model_output, request)
++    assert result.tools_called
++    args = json.loads(result.tool_calls[0].function.arguments)
++    assert args == {"location": "Beijing"}
+diff --git a/vllm/tool_parsers/deepseekv32_tool_parser.py b/vllm/tool_parsers/deepseekv32_tool_parser.py
+index 02182e229..f01f7f929 100644
+--- a/vllm/tool_parsers/deepseekv32_tool_parser.py
++++ b/vllm/tool_parsers/deepseekv32_tool_parser.py
+@@ -69,7 +69,7 @@ class DeepSeekV32ToolParser(ToolParser):
+             r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>', re.DOTALL
+         )
+         self.parameter_complete_regex = re.compile(
+-            r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(?:true|false)"\s*>(.*?)</｜DSML｜parameter>',
++            r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>(.*?)</｜DSML｜parameter>',
+             re.DOTALL,
+         )
+ 
+@@ -101,10 +101,12 @@ class DeepSeekV32ToolParser(ToolParser):
+         """Generate a unique tool call ID."""
+         return f"call_{uuid.uuid4().hex[:24]}"
+ 
+-    def _parse_invoke_params(self, invoke_str: str) -> dict:
+-        param_dict = dict()
+-        for param_name, param_val in self.parameter_complete_regex.findall(invoke_str):
+-            param_dict[param_name] = param_val
++    def _parse_invoke_params(self, invoke_str: str) -> dict[str, tuple[str, str]]:
++        param_dict: dict[str, tuple[str, str]] = {}
++        for param_name, string_attr, param_val in self.parameter_complete_regex.findall(
++            invoke_str
++        ):
++            param_dict[param_name] = (param_val, string_attr)
+         return param_dict
+ 
+     def _convert_param_value_checked(self, value: str, param_type: str) -> Any:
+@@ -142,10 +144,32 @@ class DeepSeekV32ToolParser(ToolParser):
+         # return value as fallback
+         return value
+ 
++    @staticmethod
++    def _repair_param_dict(
++        param_dict: dict[str, Any],
++        param_config: dict[str, dict],
++    ) -> dict[str, Any]:
++        """Unwrap single 'arguments' / 'input' wrappers when the wrapper
++        is not part of the requested tool schema and the wrapped object
++        matches the schema fields."""
++        allowed = set(param_config.keys())
++        for wrapper in ("arguments", "input"):
++            if set(param_dict.keys()) != {wrapper} or wrapper in allowed:
++                continue
++            inner = param_dict[wrapper]
++            if isinstance(inner, str):
++                try:
++                    inner = json.loads(inner)
++                except json.JSONDecodeError:
++                    return param_dict
++            if isinstance(inner, dict) and set(inner.keys()).issubset(allowed):
++                return inner
++        return param_dict
++
+     def _convert_params_with_schema(
+         self,
+         function_name: str,
+-        param_dict: dict[str, str],
++        param_dict: dict[str, tuple[str, str]],
+     ) -> dict[str, Any]:
+         """Convert raw string param values using the tool schema types."""
+         param_config: dict = {}
+@@ -162,12 +186,16 @@ class DeepSeekV32ToolParser(ToolParser):
+                     break
+ 
+         converted: dict[str, Any] = {}
+-        for name, value in param_dict.items():
++        for name, (value, string_attr) in param_dict.items():
++            if string_attr == "true":
++                converted[name] = value
++                continue
++
+             param_type = "string"
+             if name in param_config and isinstance(param_config[name], dict):
+                 param_type = param_config[name].get("type", "string")
+             converted[name] = self._convert_param_value(value, param_type)
+-        return converted
++        return self._repair_param_dict(converted, param_config)
+ 
+     def extract_tool_calls(
+         self,
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 80d5e7d103ee181f66389d0e2580841e2a2f1db5 Mon Sep 17 00:00:00 2001
+From: Yongye Zhu <zyy1102000@gmail.com>
+Date: Wed, 6 May 2026 19:17:48 -0400
+Subject: [PATCH 11/13] [Bugfix] Fix condition to clear persistent topk so that
+ it can be captured regardless (#41665)
+
+Signed-off-by: Yongye Zhu <zyy1102000@gmail.com>
+---
+ csrc/topk.cu | 25 +++++++++++++++++--------
+ 1 file changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/csrc/topk.cu b/csrc/topk.cu
+index 68352629e..c5bffb328 100644
+--- a/csrc/topk.cu
++++ b/csrc/topk.cu
+@@ -153,14 +153,23 @@ void launch_persistent_topk(const torch::Tensor& logits,
+     TORCH_CHECK(workspace.size(0) >= static_cast<int64_t>(state_bytes),
+                 "workspace too small, need ", state_bytes, " bytes");
+ 
+-    // Zero the per-group RadixRowState region before launch — only when the
+-    // radix path will actually run (max_seq_len > RADIX_THRESHOLD). The
+-    // RadixRowState fields (arrival_counter, histograms) are only touched by
+-    // radix_topk; the decode/medium paths inside the persistent kernel
+-    // operate purely in shared memory and never read these globals, so a
+-    // stale workspace is harmless for them.
++    // Zero the per-group RadixRowState region before launch.
+     //
+-    // Why we need the memset (when needs_cooperative is true):
++    // Issued UNCONDITIONALLY so the memset is captured as its own node in
++    // the cudagraph (a separate cudaMemsetAsync node, sequenced before the
++    // persistent_topk_kernel launch on the same stream). The previous
++    // host-side guard `if (needs_cooperative)` was evaluated at capture time;
++    // when capture-time max_seq_len <= RADIX_THRESHOLD (always true under
++    // FULL_DECODE_ONLY with max_model_len < 32 K) the memset would NOT be
++    // captured, leaving the workspace state to accumulate across replays.
++    // That's a latent correctness bug if the runtime data ever takes the
++    // radix path, and removes one variable while debugging hangs in the
++    // decode/medium paths.
++    //
++    // Cost is sub-microsecond: state_bytes = num_groups * sizeof(RadixRowState)
++    // is ~3 KB per group, ~100 KB for the largest grids on this hardware.
++    //
++    // Why the memset is required (regardless of which path the kernel takes):
+     //   1. arrival_counter accumulates within a launch and is never reset,
+     //      so a prior call leaves it at a large positive value. Without this
+     //      reset, the very first wait_ge in the next call sees counter >>
+@@ -169,7 +178,7 @@ void launch_persistent_topk(const torch::Tensor& logits,
+     //      __syncthreads(), so it had no happens-before edge to CTA-1+'s
+     //      first red_release. cudaMemsetAsync is stream-ordered: the zero
+     //      is globally visible before any CTA runs.
+-    if (needs_cooperative) {
++    {
+       cudaError_t mz_err = cudaMemsetAsync(workspace.data_ptr<uint8_t>(), 0,
+                                            state_bytes, stream);
+       TORCH_CHECK(mz_err == cudaSuccess,
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 7a576e2c724e135236c0dc005dce114c7e4d911e Mon Sep 17 00:00:00 2001
+From: Micah Williamson <micah.williamson@amd.com>
+Date: Wed, 6 May 2026 18:37:11 -0500
+Subject: [PATCH 12/13] [ROCm][CI] Remove `TORCH_NCCL_BLOCKING_WAIT=1` After
+ Bugfix In ROCm 7.2 (#41840)
+
+Signed-off-by: Micah Williamson <micah.williamson@amd.com>
+---
+ .buildkite/test-amd.yaml | 16 ----------------
+ 1 file changed, 16 deletions(-)
+
+diff --git a/.buildkite/test-amd.yaml b/.buildkite/test-amd.yaml
+index ae0c01592..b3c77dcac 100644
+--- a/.buildkite/test-amd.yaml
++++ b/.buildkite/test-amd.yaml
+@@ -230,7 +230,6 @@ steps:
+   - tests/entrypoints/llm/test_collective_rpc.py
+   - vllm/platforms/rocm.py
+   commands:
+-  - export TORCH_NCCL_BLOCKING_WAIT=1
+   - pytest -v -s entrypoints/llm/test_collective_rpc.py
+   - pytest -v -s ./compile/fullgraph/test_basic_correctness.py
+   - pytest -v -s ./compile/test_wrapper.py
+@@ -272,7 +271,6 @@ steps:
+   - tests/v1/worker/test_worker_memory_snapshot.py
+   - vllm/platforms/rocm.py
+   commands:
+-  - export TORCH_NCCL_BLOCKING_WAIT=1
+   - VLLM_TEST_SAME_HOST=1 torchrun --nproc-per-node=4 distributed/test_same_node.py | grep 'Same node test passed'
+   - VLLM_TEST_SAME_HOST=1 VLLM_TEST_WITH_DEFAULT_DEVICE_SET=1 torchrun --nproc-per-node=4 distributed/test_same_node.py | grep 'Same node test passed'
+   - CUDA_VISIBLE_DEVICES=0,1 pytest -v -s v1/shutdown
+@@ -590,7 +588,6 @@ steps:
+   - vllm/platforms/rocm.py
+   commands:
+   - pip freeze | grep -E 'torch'
+-  - export TORCH_NCCL_BLOCKING_WAIT=1
+   - pytest -v -s models/language -m 'core_model and slow_test' --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB
+ 
+ - label: Multi-Modal Models (Extended Generation 2) # TBD
+@@ -865,7 +862,6 @@ steps:
+   - tests/entrypoints/openai/test_multi_api_servers.py
+   - vllm/platforms/rocm.py
+   commands:
+-  - export TORCH_NCCL_BLOCKING_WAIT=1
+   - TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_async_llm_dp.py
+   - TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_eagle_dp.py
+   - TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_external_lb_dp.py
+@@ -1175,7 +1171,6 @@ steps:
+   - vllm/_aiter_ops.py
+   - vllm/platforms/rocm.py
+   commands:
+-  - export TORCH_NCCL_BLOCKING_WAIT=1
+   - pytest -v -s tests/distributed/test_context_parallel.py
+   - VLLM_LOGGING_LEVEL=DEBUG python3 examples/features/data_parallel/data_parallel_offline.py --model=Qwen/Qwen1.5-MoE-A2.7B -tp=1 -dp=2 --max-model-len=2048 --all2all-backend=allgather_reducescatter --disable-nccl-for-dp-synchronization
+ 
+@@ -1189,7 +1184,6 @@ steps:
+   source_file_dependencies:
+   - vllm/
+   commands:
+-  - export TORCH_NCCL_BLOCKING_WAIT=1
+   - pytest -v -s distributed/test_custom_all_reduce.py
+   - torchrun --nproc_per_node=2 distributed/test_ca_buffer_sharing.py
+   - TARGET_TEST_SUITE=A100 pytest basic_correctness/ -v -s -m 'distributed(num_gpus=2)'
+@@ -1209,7 +1203,6 @@ steps:
+   - tests/examples/features/data_parallel/data_parallel_offline.py
+   - vllm/platforms/rocm.py
+   commands:
+-  - export TORCH_NCCL_BLOCKING_WAIT=1
+   - torchrun --nproc-per-node=4 distributed/test_torchrun_example.py
+   - PP_SIZE=2 torchrun --nproc-per-node=4 distributed/test_torchrun_example.py
+   - TP_SIZE=4 torchrun --nproc-per-node=4 distributed/test_torchrun_example_moe.py
+@@ -1255,7 +1248,6 @@ steps:
+   - vllm/platforms/rocm.py
+   commands:
+   - export VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1
+-  - export TORCH_NCCL_BLOCKING_WAIT=1
+   - pytest -v -s distributed/test_ray_v2_executor.py
+   - pytest -v -s distributed/test_ray_v2_executor_e2e.py
+   - pytest -v -s distributed/test_pipeline_parallel.py -k "ray"
+@@ -1277,7 +1269,6 @@ steps:
+   - vllm/v1/worker/gpu_worker.py
+   - vllm/platforms/rocm.py
+   commands:
+-  - export TORCH_NCCL_BLOCKING_WAIT=1
+   - torchrun --nproc-per-node=8 ../examples/features/torchrun/torchrun_dp_example_offline.py --tp-size=2 --pp-size=1 --dp-size=4 --enable-ep
+ 
+ #--------------------------------------------------------  mi300 · entrypoints  --------------------------------------------------------#
+@@ -2284,7 +2275,6 @@ steps:
+   - tests/entrypoints/openai/test_multi_api_servers.py
+   - vllm/platforms/rocm.py
+   commands:
+-  - export TORCH_NCCL_BLOCKING_WAIT=1
+   - TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_async_llm_dp.py
+   - TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_eagle_dp.py
+   - TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_external_lb_dp.py
+@@ -2304,7 +2294,6 @@ steps:
+   - vllm/_aiter_ops.py
+   - vllm/platforms/rocm.py
+   commands:
+-  - export TORCH_NCCL_BLOCKING_WAIT=1
+   - VLLM_ALLOW_INSECURE_SERIALIZATION=1 python3 examples/rl/rlhf_async_new_apis.py
+   - VLLM_LOGGING_LEVEL=DEBUG python3 examples/features/data_parallel/data_parallel_offline.py --model=Qwen/Qwen1.5-MoE-A2.7B -tp=1 -dp=2 --max-model-len=2048 --all2all-backend=deepep_high_throughput
+   - pytest -v -s tests/v1/distributed/test_dbo.py
+@@ -2367,7 +2356,6 @@ steps:
+   - tests/distributed/test_utils
+   - vllm/platforms/rocm.py
+   commands:
+-  - export TORCH_NCCL_BLOCKING_WAIT=1
+   - TP_SIZE=2 DP_SIZE=2 pytest -v -s v1/distributed/test_async_llm_dp.py
+   - TP_SIZE=2 DP_SIZE=2 pytest -v -s v1/distributed/test_eagle_dp.py
+   - TP_SIZE=2 DP_SIZE=2 pytest -v -s v1/distributed/test_external_lb_dp.py
+@@ -2497,7 +2485,6 @@ steps:
+   - tests/entrypoints/llm/test_collective_rpc.py
+   - vllm/platforms/rocm.py
+   commands:
+-  - export TORCH_NCCL_BLOCKING_WAIT=1
+   - pytest -v -s entrypoints/llm/test_collective_rpc.py
+   - pytest -v -s ./compile/fullgraph/test_basic_correctness.py
+   - pytest -v -s ./compile/test_wrapper.py
+@@ -2522,7 +2509,6 @@ steps:
+   - tests/v1/worker/test_worker_memory_snapshot.py
+   - vllm/platforms/rocm.py
+   commands:
+-  - export TORCH_NCCL_BLOCKING_WAIT=1
+   - VLLM_TEST_SAME_HOST=1 torchrun --nproc-per-node=4 distributed/test_same_node.py | grep 'Same node test passed'
+   - VLLM_TEST_SAME_HOST=1 VLLM_TEST_WITH_DEFAULT_DEVICE_SET=1 torchrun --nproc-per-node=4 distributed/test_same_node.py | grep 'Same node test passed'
+   - CUDA_VISIBLE_DEVICES=0,1 pytest -v -s v1/shutdown
+@@ -2543,7 +2529,6 @@ steps:
+   - tests/distributed/test_multiproc_executor.py
+   - vllm/platforms/rocm.py
+   commands:
+-  - export TORCH_NCCL_BLOCKING_WAIT=1
+   - pytest -v -s compile/fullgraph/test_basic_correctness.py
+   - pytest -v -s distributed/test_pynccl.py
+   - pytest -v -s distributed/test_events.py
+@@ -2723,7 +2708,6 @@ steps:
+   - vllm/_aiter_ops.py
+   - vllm/platforms/rocm.py
+   commands:
+-  - export TORCH_NCCL_BLOCKING_WAIT=1
+   - pytest -v -s tests/distributed/test_context_parallel.py
+   - pytest -v -s tests/v1/distributed/test_dbo.py
+ 
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 5a0a8fc1ea7542394ff315138bd5677b7b53bca1 Mon Sep 17 00:00:00 2001
+From: Russell Bryant <rbryant@redhat.com>
+Date: Wed, 6 May 2026 19:54:29 -0400
+Subject: [PATCH 13/13] [Docs] add cache directory security guidance (#38920)
+
+Signed-off-by: Russell Bryant <rbryant@redhat.com>
+---
+ docs/usage/security.md | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/docs/usage/security.md b/docs/usage/security.md
+index 300cabbfc..e548899ab 100644
+--- a/docs/usage/security.md
++++ b/docs/usage/security.md
+@@ -309,6 +309,30 @@ vLLM supports dynamically loading and unloading LoRA adapters at runtime via the
+ 
+ **Warning:** Dynamic LoRA loading is not a secure operation and should not be enabled in deployments exposed to untrusted clients. If you must enable dynamic LoRA loading, restrict access to the `/v1/load_lora_adapter` and `/v1/unload_lora_adapter` endpoints to trusted administrators only, using a reverse proxy or network-level access controls. Do not expose these endpoints to end users. For details on configuring LoRA adapters, see the [LoRA Adapters documentation](../features/lora.md).
+ 
++## Cache Directory Security
++
++vLLM assumes that its cache directories are **private and trusted**. Cache contents are loaded without cryptographic integrity verification, including formats that support arbitrary code execution. If an untrusted user or process can write to vLLM's cache directories, they may be able to crash vLLM or cause it to execute arbitrary code.
++
++**Do not share vLLM cache directories with untrusted users or mount them from untrusted storage.** Treat the cache directory with the same care as the vLLM installation itself.
++
++### Cache Directory Configuration
++
++Most cache paths default to subdirectories under a single root. Changing `VLLM_CACHE_ROOT` changes the default location for all features that inherit from it. When `torch.compile` caching is enabled (the default), vLLM also redirects `TRITON_CACHE_DIR` into this tree. If compile caching is disabled, Triton falls back to its own default location (`~/.triton/cache`).
++
++| Environment Variable | Default | Description |
++| --- | --- | --- |
++| `VLLM_CACHE_ROOT` | `~/.cache/vllm` | Base cache directory. Respects `XDG_CACHE_HOME` if set. All paths below inherit from this unless explicitly overridden. |
++| *(torch.compile)* | `$VLLM_CACHE_ROOT/torch_compile_cache/` | Compilation cache for AOT-compiled models, Inductor graphs, and Triton kernels. Controlled by `VLLM_DISABLE_COMPILE_CACHE` (set to `1` to disable). |
++| `VLLM_ASSETS_CACHE` | `$VLLM_CACHE_ROOT/assets/` | Downloaded assets (e.g., tokenizer files). |
++| `VLLM_XLA_CACHE_PATH` | `$VLLM_CACHE_ROOT/xla_cache/` | XLA/TPU compilation cache. |
++| `VLLM_MEDIA_CACHE` | *(disabled)* | Optional cache for downloaded media (images, video, audio). Not enabled unless explicitly set. |
++
++### Recommendations
++
++- **Restrict file permissions** on `VLLM_CACHE_ROOT` (and any other cache directories used by dependencies, such as `~/.triton` if compile caching is disabled) so that only the vLLM process owner can read and write to them.
++- **Do not copy cache contents from untrusted sources.** If you distribute cache artifacts between environments, ensure they originate from a trusted build pipeline.
++- **Container deployments:** If mounting cache directories into containers, ensure the volume source is trusted.
++
+ ## Reporting Security Vulnerabilities
+ 
+ If you believe you have found a security vulnerability in vLLM, please report it following the project's security policy. For more information on how to report security issues and the project's security policy, please see the [vLLM Security Policy](https://github.com/vllm-project/vllm/blob/main/SECURITY.md).
+-- 
+2.39.5 (Apple Git-154)
+
