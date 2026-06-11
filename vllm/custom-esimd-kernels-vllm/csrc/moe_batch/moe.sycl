@@ -112,6 +112,8 @@ simd<fp16, 256> fp8e5m2_block_to_vnni(simd<uint8_t, 256> raw) {
 }
 
 // ── Kernel 1: Router GEMV ────────────────────────────────────────────────────
+#include "moe_fp8_grouped.h"
+
 // Hybrid dispatch:
 //   n_tokens <= 4: Option A — 1 WI per expert, weight-reuse across tokens
 //                  (4 hardcoded accumulators, fits in GRF without spill)
@@ -1938,6 +1940,8 @@ TORCH_LIBRARY_FRAGMENT(moe_ops, m) {
     m.def("moe_forward_full_gelu_tanh_routed(Tensor x, Tensor topk_weights, Tensor topk_indices, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full_gelu_tanh_routed_decode(Tensor x, Tensor topk_weights, Tensor topk_indices, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full_gelu_tanh_decode(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor per_expert_scale, int top_k, int n_routed_experts) -> Tensor");
+    m.def("moe_up_fp8_grouped(Tensor x, Tensor gate_up_weight, Tensor gate_up_scale, Tensor expert_offsets, Tensor expert_tokens, int top_k, int n_routed_experts) -> Tensor");
+    m.def("moe_down_fp8_grouped(Tensor intermediate, Tensor down_weight, Tensor down_scale, Tensor routing_weights, Tensor expert_offsets, Tensor expert_tokens, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full_v2(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
 }
@@ -1952,6 +1956,8 @@ TORCH_LIBRARY_IMPL(moe_ops, XPU, m) {
     m.impl("moe_forward_full_gelu_tanh_routed", &moe_forward_full_gelu_tanh_routed);
     m.impl("moe_forward_full_gelu_tanh_routed_decode", &moe_forward_full_gelu_tanh_routed_decode);
     m.impl("moe_forward_full_gelu_tanh_decode", &moe_forward_full_gelu_tanh_decode);
+    m.impl("moe_up_fp8_grouped", &moe_up_fp8_grouped);
+    m.impl("moe_down_fp8_grouped", &moe_down_fp8_grouped);
     m.impl("moe_forward_full_gelu_tanh_routed_no_accum", &moe_forward_full_gelu_tanh_routed_no_accum);
     m.impl("moe_forward_fused", &moe_forward_fused);
     m.impl("moe_forward_full", &moe_forward_full);
