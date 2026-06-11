@@ -135,3 +135,21 @@ struct MoeDownDecode {
         output[(size_t)route*hidden + h] = fp16(s * w * ds);
     }
 };
+
+
+// ── per_expert_scale fold: topk_weight[r] *= scale[idx[r]] (top_k items) ─────
+// gemma folds a learnable per-expert scale into the routing weights. One
+// work-item per route. Tiny (top_k=8) — pure launch, but stays on-device.
+struct MoeFoldExpertScale {
+    fp16*        topk_weight;   // [top_k] in/out
+    const int*   topk_idx;      // [top_k]
+    const float* per_expert_scale;  // [n_experts]
+    int top_k;
+    void operator()(sycl::id<1> it) const SYCL_ESIMD_KERNEL {
+        using namespace sycl::ext::intel::esimd;
+        const int r = (int)it[0];
+        if (r >= top_k) return;
+        float s = per_expert_scale[topk_idx[r]];
+        topk_weight[r] = fp16((float)topk_weight[r] * s);
+    }
+};
