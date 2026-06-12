@@ -1,0 +1,31 @@
+--- /home/nobara-user/llm-scaler-vllm/vllm/vllm/model_executor/layers/fused_moe/layer.py	2026-04-14 19:39:54.209280695 +0900
++++ /home/nobara-user/llm-scaler-vllm/venv/lib64/python3.12/site-packages/vllm/model_executor/layers/fused_moe/layer.py	2026-04-16 22:03:30.198785772 +0900
+@@ -1732,10 +1732,11 @@
+             return states
+ 
+         if self.shared_experts is None:
+-            if current_platform.is_tpu() or current_platform.is_cpu():
+-                # TODO: Once the OOM issue for the TPU backend is resolved, we
+-                # will switch to using the moe_forward custom op.
+-                # Note: CPU doesn't require wrapped forward_impl.
++            if current_platform.is_tpu() or current_platform.is_cpu() \
++                    or current_platform.is_xpu():
++                # XPU: bypass torch.ops.vllm.moe_forward custom op —
++                # the mutates_args + needs_fixed_stride_order tags cause
++                # DEVICE_LOST on Xe2 iGPU INT4 MoE GEMM
+                 fused_output = self.forward_impl(hidden_states, router_logits)
+                 assert not isinstance(fused_output, tuple)
+             else:
+@@ -1744,10 +1745,8 @@
+                 )
+             return reduce_output(fused_output)[..., :og_hidden_states]
+         else:
+-            if current_platform.is_tpu() or current_platform.is_cpu():
+-                # TODO: Once the OOM issue for the TPU backend is resolved, we
+-                # will switch to using the moe_forward custom op.
+-                # Note: CPU doesn't require wrapped forward_impl.
++            if current_platform.is_tpu() or current_platform.is_cpu() \
++                    or current_platform.is_xpu():
+                 shared_output, fused_output = self.forward_impl(
+                     hidden_states, router_logits
+                 )

@@ -1,0 +1,22 @@
+--- /home/nobara-user/llm-scaler-vllm/vllm/vllm/v1/attention/backends/mla/common.py	2026-04-13 22:15:22.954075409 +0900
++++ /home/nobara-user/llm-scaler-vllm/venv/lib64/python3.12/site-packages/vllm/v1/attention/backends/mla/common.py	2026-04-15 14:13:11.403343750 +0900
+@@ -260,6 +260,8 @@
+     # For rocm use upstream flash attention
+     if current_platform.is_rocm():
+         from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
++    elif current_platform.is_xpu():
++        from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func  # type: ignore[no-redef]
+     is_vllm_fa = False
+ 
+ try:
+@@ -1381,6 +1383,10 @@
+ 
+         if is_vllm_fa:
+             kwargs["return_softmax_lse"] = return_softmax_lse
++        elif current_platform.is_xpu():
++            # XPU/IPEX flash_attn doesn't support return_attn_probs or
++            # return_softmax_lse — skip the parameter entirely
++            pass
+         else:
+             # ROCm leverages the upstream flash_attn, which takes a parameter
+             # called "return_attn_probs" instead of return_softmax_lse
