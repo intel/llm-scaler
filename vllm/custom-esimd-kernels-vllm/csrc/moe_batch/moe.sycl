@@ -24,21 +24,18 @@ static inline sycl::event submit_kernel(
 template<int N>
 SYCL_ESIMD_FUNCTION
 simd<fp16, N> fp8e4m3_to_half(simd<uint8_t, N> raw) {
-    simd<uint32_t, N> val = convert<uint32_t>(raw);
-    simd<uint32_t, N> s = val >> 7;
-    simd<uint32_t, N> e = (val >> 3) & 0xF;
-    simd<uint32_t, N> m = val & 0x7;
-
-    simd<uint32_t, N> fp32_bits = (s << 31) | ((e + 120) << 23) | (m << 20);
-
-    simd<float, N> sub_val = convert<float>(m) * (1.0f / 512.0f);
-    simd<uint32_t, N> sub_bits = sub_val.template bit_cast_view<uint32_t>();
-    sub_bits = sub_bits | (s << 31);
-
-    fp32_bits.merge(sub_bits, e == 0);
-    fp32_bits.merge(s << 31, (e == 0) & (m == 0));
-
-    return fp32_bits.template bit_cast_view<float>();
+    // Direct e4m3 -> fp16 bit map (stays in uint16, no fp32 round-trip or
+    // per-element subnormal float math). e4m3 (4exp/3mant, bias 7) -> fp16
+    // (5exp/10mant, bias 15): shift exp|mant left 7, add bias delta (8<<10 =
+    // 0x2000). Subnormals (exp==0, ~0.02% of gemma4 weights, all < 0.014)
+    // flush to +-0 -- matches the production fp8_GEMM_pert dequant. ~2x fewer
+    // SIMD ops than the prior fp32-path decode (was 32% of up-GEMM time).
+    simd<uint16_t, N> u16 = convert<uint16_t>(raw);
+    simd<uint16_t, N> sign = (u16 & 0x80) << 8;            // sign -> bit 15
+    simd<uint16_t, N> upart = u16 & 0x7F;                  // exp|mant
+    simd<uint16_t, N> fp16_bits = sign | ((upart << 7) + 0x2000);
+    fp16_bits.merge(sign, (u16 & 0x78) == 0);              // exp==0 -> flush
+    return fp16_bits.template bit_cast_view<fp16>().read();
 }
 
 // ── FP8 E5M2 → half conversion ───────────────────────────────────────────────
