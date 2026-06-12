@@ -125,9 +125,8 @@ def apply():
     def _patched_median(input, dim=None, keepdim=False, *, out=None):
         if out is not None or not _should_handle(input, dim):
             if dim is None:
-                return _orig_median(input)
-            return _orig_median(input, dim, keepdim, out=out) if out is not None \
-                else _orig_median(input, dim, keepdim)
+                return _orig_median(input, out=out) if out is not None else _orig_median(input)
+            return _orig_median(input, dim, keepdim, out=out) if out is not None else _orig_median(input, dim, keepdim)
         # preserve NaN propagation: torch.median returns NaN if any NaN in slice
         if input.is_floating_point() and torch.isnan(input).any():
             return _orig_median(input, dim, keepdim)
