@@ -115,17 +115,35 @@ void moe_up_fp8_grouped_gelu_tanh_kernel(
                         simd<fp16, 256> bu = fp8g_load_wtile(
                             wbase, (uint32_t)hidden_size,
                             (uint32_t)(2 * intermediate_size), (uint32_t)k, (uint32_t)nu);
+                        // Fold the per-tensor scale (~5e-4) into the weight tile
+                        // BEFORE the fp16 DPAS accumulate. Raw e4m3 weights reach
+                        // +-288; a raw fp16 accumulate over K=hidden can exceed
+                        // fp16 max (65504) -> inf for large activations (observed
+                        // in-model: scaled inter up to ~119 => raw ~238000).
+                        // Scaling pre-DPAS keeps partial sums bounded. Identical
+                        // math: (w*s)@x = (w@x)*s.
+                        bg = bg * fp16(scale);
+                        bu = bu * fp16(scale);
                         g_acc = dpas<8, 8, fp16, fp16, fp16, fp16>(g_acc, bg, a_tile);
                         u_acc = dpas<8, 8, fp16, fp16, fp16, fp16>(u_acc, bu, a_tile);
                     }
 
-                    // gelu_tanh(gate*scale) * (up*scale) in float for stability.
-                    simd<float, 128> gf = simd<float, 128>(g_acc) * scale;
-                    simd<float, 128> uf = simd<float, 128>(u_acc) * scale;
+                    // Scale already folded into the weights pre-accumulation.
+                    simd<float, 128> gf = simd<float, 128>(g_acc);
+                    simd<float, 128> uf = simd<float, 128>(u_acc);
                     constexpr float c0 = 0.7978845608f;  // sqrt(2/pi)
                     constexpr float c1 = 0.044715f;
                     simd<float, 128> g3 = gf * gf * gf;
                     simd<float, 128> inner = c0 * (gf + c1 * g3);
+                    // tanh saturates at +-1 for |inner|>~10; clamp before exp so
+                    // large gate activations (gf up to ~160 with full-range fp8
+                    // weights) don't overflow exp(2*inner) -> inf -> inf/inf=NaN.
+                    // Without this, big-magnitude channels (e.g. col205) become
+                    // NaN or drop to ~0, losing real large outputs.
+                    namespace _ei = sycl::ext::intel::esimd;
+                    inner = _ei::min<float,128>(
+                        _ei::max<float,128>(inner, simd<float,128>(-30.0f)),
+                        simd<float,128>(30.0f));
                     simd<float, 128> e2 = esimd_math::exp<float, 128>(2.0f * inner);
                     simd<float, 128> tanh_v = (e2 - 1.0f) / (e2 + 1.0f);
                     simd<float, 128> res = (0.5f * gf * (1.0f + tanh_v)) * uf;
@@ -209,10 +227,19 @@ void moe_down_fp8_grouped_kernel(
                         simd<fp16, 256> bd = fp8g_load_wtile(
                             wbase, (uint32_t)intermediate_size,
                             (uint32_t)hidden_size, (uint32_t)k, (uint32_t)ng);
+                        // Fold the per-tensor down_scale (~1e-3) into the weight
+                        // tile BEFORE the fp16 DPAS accumulate. Raw e4m3 down
+                        // weights reach +-288 and intermediate values reach ~160
+                        // (big-gate channels), so a raw fp16 accumulate over
+                        // K=inter overflows fp16 max -> inf (observed at row16).
+                        // Scaling pre-DPAS keeps partial sums bounded. Identical
+                        // math: (w*s)@m = (w@m)*s.
+                        bd = bd * fp16(scale);
                         acc = dpas<8, 8, fp16, fp16, fp16, fp16>(acc, bd, a_tile);
                     }
 
-                    simd<float, 128> accf = simd<float, 128>(acc) * scale;
+                    // Scale already folded into the weights pre-accumulation.
+                    simd<float, 128> accf = simd<float, 128>(acc);
                     #pragma unroll
                     for (int m = 0; m < TILE_M; m++) {
                         if (m < m_cnt) {
