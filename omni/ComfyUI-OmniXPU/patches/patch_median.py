@@ -13,6 +13,10 @@ log = logging.getLogger("ComfyUI-OmniXPU")
 # median path (no dim argument) is healthy, so we only intervene on the
 # dim-reduction path and leave everything else to the original implementation.
 #
+# Scope: the underlying XPU slowdown has only been verified on Intel Arc
+# B60/B70 with torch 2.10. Re-validate on other hardware / torch versions
+# before relying on this workaround there.
+#
 # Strategy (all paths produce bit-exact VALUES vs torch.median):
 #   - small N  -> odd-even (Batcher) min/max compare-exchange network
 #                 (lowest overhead for small reduction lengths)

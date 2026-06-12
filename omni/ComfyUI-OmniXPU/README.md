@@ -40,6 +40,8 @@ OMNIXPU_MEDIAN_FIX=0        # Disable median workaround only
 `OMNIXPU_MEDIAN_STRICT_INDICES=1` makes the median workaround reproduce
 `torch.median`'s exact tie-break indices (values are always bit-exact).
 
+> **Note:** the XPU median slowdown this works around has only been verified on Intel Arc B60/B70 with torch 2.10. It should be re-checked on other hardware or torch versions before relying on it there.
+
 ## Diagnostics
 
 Add the **OmniXPU Status** node to any workflow to see:
