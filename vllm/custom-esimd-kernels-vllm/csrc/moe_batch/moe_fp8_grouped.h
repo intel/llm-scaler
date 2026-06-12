@@ -128,7 +128,14 @@ void moe_up_fp8_grouped_gelu_tanh_kernel(
                 const float scale = gate_up_scale[eid];
 
                 {
-                    // Source token row (in x) and dest row (in intermediate) per m.
+                    // M256 OPT: each work-item processes MG blocks of 8 rows
+                    // (TILE_M = MG*8). The expensive fp8 weight load + VNNI
+                    // shuffle (fp8g_load_wtile) is done ONCE per K-step and
+                    // reused across all MG DPAS<8,8> calls, amortizing the
+                    // load/shuffle (the up-GEMM bottleneck: ~5 TFLOPS => DPAS
+                    // underfed by per-tile fp8 reload). avg 16 routes/expert at
+                    // M=256 => MG=2 covers a whole expert in one tile.
+                    constexpr int MG = TILE_M / 8;
                     size_t x_off[TILE_M];
                     int dst_row[TILE_M];
                     #pragma unroll
@@ -139,43 +146,42 @@ void moe_up_fp8_grouped_gelu_tanh_kernel(
                         x_off[m] = (size_t)(pair / top_k) * hidden_size;
                     }
 
-                    // fp16 DPAS accumulators (XeLPG only supports fp16-acc
-                    // dpas<8,8>; float-acc dpas2 is rejected at AOT for mtl-h).
-                    // Matches the working int4 grouped GEMM convention.
-                    simd<fp16, 128> g_acc(fp16(0));  // 8 rows × 16 N (gate)
-                    simd<fp16, 128> u_acc(fp16(0));  // 8 rows × 16 N (up)
+                    simd<fp16, 128> g_acc[MG];
+                    simd<fp16, 128> u_acc[MG];
+                    #pragma unroll
+                    for (int g = 0; g < MG; g++) { g_acc[g] = fp16(0); u_acc[g] = fp16(0); }
 
-                    // Loop K in 16-wide sub-tiles; load weight + input per step.
                     for (int k = 0; k < hidden_size; k += 16) {
-                        simd<fp16, 128> a_tile(fp16(0));
-                        #pragma unroll
-                        for (int m = 0; m < TILE_M; m++) {
-                            if (m < m_cnt)
-                                a_tile.template select<16, 1>(m * 16) =
-                                    block_load<fp16, 16>(x + x_off[m] + k);
-                        }
                         simd<fp16, 256> bg = fp8g_load_wtile(
                             wbase, (uint32_t)hidden_size,
                             (uint32_t)(2 * intermediate_size), (uint32_t)k, (uint32_t)ng);
                         simd<fp16, 256> bu = fp8g_load_wtile(
                             wbase, (uint32_t)hidden_size,
                             (uint32_t)(2 * intermediate_size), (uint32_t)k, (uint32_t)nu);
-                        // Fold the per-tensor scale (~5e-4) into the weight tile
-                        // BEFORE the fp16 DPAS accumulate. Raw e4m3 weights reach
-                        // +-288; a raw fp16 accumulate over K=hidden can exceed
-                        // fp16 max (65504) -> inf for large activations (observed
-                        // in-model: scaled inter up to ~119 => raw ~238000).
-                        // Scaling pre-DPAS keeps partial sums bounded. Identical
-                        // math: (w*s)@x = (w@x)*s.
+                        // Fold per-tensor scale pre-DPAS (fp16-accum overflow
+                        // safety; identical math (w*s)@x = (w@x)*s).
                         bg = bg * fp16(scale);
                         bu = bu * fp16(scale);
-                        g_acc = dpas<8, 8, fp16, fp16, fp16, fp16>(g_acc, bg, a_tile);
-                        u_acc = dpas<8, 8, fp16, fp16, fp16, fp16>(u_acc, bu, a_tile);
+                        #pragma unroll
+                        for (int g = 0; g < MG; g++) {
+                            simd<fp16, 128> a_tile(fp16(0));
+                            #pragma unroll
+                            for (int mm = 0; mm < 8; mm++) {
+                                int m = g * 8 + mm;
+                                if (m < m_cnt)
+                                    a_tile.template select<16, 1>(mm * 16) =
+                                        block_load<fp16, 16>(x + x_off[m] + k);
+                            }
+                            g_acc[g] = dpas<8, 8, fp16, fp16, fp16, fp16>(g_acc[g], bg, a_tile);
+                            u_acc[g] = dpas<8, 8, fp16, fp16, fp16, fp16>(u_acc[g], bu, a_tile);
+                        }
                     }
 
+                    #pragma unroll
+                    for (int g = 0; g < MG; g++) {
                     // Scale already folded into the weights pre-accumulation.
-                    simd<float, 128> gf = simd<float, 128>(g_acc);
-                    simd<float, 128> uf = simd<float, 128>(u_acc);
+                    simd<float, 128> gf = simd<float, 128>(g_acc[g]);
+                    simd<float, 128> uf = simd<float, 128>(u_acc[g]);
                     constexpr float c0 = 0.7978845608f;  // sqrt(2/pi)
                     constexpr float c1 = 0.044715f;
                     simd<float, 128> g3 = gf * gf * gf;
@@ -194,15 +200,17 @@ void moe_up_fp8_grouped_gelu_tanh_kernel(
                     simd<float, 128> res = (0.5f * gf * (1.0f + tanh_v)) * uf;
 
                     #pragma unroll
-                    for (int m = 0; m < TILE_M; m++) {
+                    for (int mm = 0; mm < 8; mm++) {
+                        int m = g * 8 + mm;
                         if (m < m_cnt) {
-                            simd<float, 16> rf = res.template select<16, 1>(m * 16);
+                            simd<float, 16> rf = res.template select<16, 1>(mm * 16);
                             simd<fp16, 16> row = convert<fp16>(rf);
                             block_store<fp16, 16>(
                                 intermediate + (size_t)dst_row[m] * intermediate_size + ng,
                                 row);
                         }
                     }
+                    }  // end MG group loop
                 }
             });
     };
@@ -259,42 +267,50 @@ void moe_down_fp8_grouped_kernel(
                         rw[m] = (s < t1) ? routing_weights[pair] : fp16(0);
                     }
 
-                    simd<fp16, 128> acc(fp16(0));  // 8 rows × 16 N (hidden)
+                    // M256 OPT: reuse the fp8 down-weight load+VNNI across MG
+                    // DPAS<8,8> groups (same amortization as the up kernel).
+                    constexpr int MGD = TILE_M / 8;
+                    simd<fp16, 128> acc[MGD];
+                    #pragma unroll
+                    for (int g = 0; g < MGD; g++) acc[g] = fp16(0);
 
                     for (int k = 0; k < intermediate_size; k += 16) {
-                        simd<fp16, 128> a_tile(fp16(0));
-                        #pragma unroll
-                        for (int m = 0; m < TILE_M; m++) {
-                            if (m < m_cnt)
-                                a_tile.template select<16, 1>(m * 16) =
-                                    block_load<fp16, 16>(intermediate + in_off[m] + k);
-                        }
                         simd<fp16, 256> bd = fp8g_load_wtile(
                             wbase, (uint32_t)intermediate_size,
                             (uint32_t)hidden_size, (uint32_t)k, (uint32_t)ng);
-                        // Fold the per-tensor down_scale (~1e-3) into the weight
-                        // tile BEFORE the fp16 DPAS accumulate. Raw e4m3 down
-                        // weights reach +-288 and intermediate values reach ~160
-                        // (big-gate channels), so a raw fp16 accumulate over
-                        // K=inter overflows fp16 max -> inf (observed at row16).
-                        // Scaling pre-DPAS keeps partial sums bounded. Identical
-                        // math: (w*s)@m = (w@m)*s.
+                        // Fold per-tensor down_scale pre-DPAS (fp16-accum overflow
+                        // safety; identical math (w*s)@m = (w@m)*s).
                         bd = bd * fp16(scale);
-                        acc = dpas<8, 8, fp16, fp16, fp16, fp16>(acc, bd, a_tile);
+                        #pragma unroll
+                        for (int g = 0; g < MGD; g++) {
+                            simd<fp16, 128> a_tile(fp16(0));
+                            #pragma unroll
+                            for (int mm = 0; mm < 8; mm++) {
+                                int m = g * 8 + mm;
+                                if (m < m_cnt)
+                                    a_tile.template select<16, 1>(mm * 16) =
+                                        block_load<fp16, 16>(intermediate + in_off[m] + k);
+                            }
+                            acc[g] = dpas<8, 8, fp16, fp16, fp16, fp16>(acc[g], bd, a_tile);
+                        }
                     }
 
-                    // Scale already folded into the weights pre-accumulation.
-                    simd<float, 128> accf = simd<float, 128>(acc);
                     #pragma unroll
-                    for (int m = 0; m < TILE_M; m++) {
+                    for (int g = 0; g < MGD; g++) {
+                    // Scale already folded into the weights pre-accumulation.
+                    simd<float, 128> accf = simd<float, 128>(acc[g]);
+                    #pragma unroll
+                    for (int mm = 0; mm < 8; mm++) {
+                        int m = g * 8 + mm;
                         if (m < m_cnt) {
-                            simd<float, 16> r = accf.template select<16, 1>(m * 16);
+                            simd<float, 16> r = accf.template select<16, 1>(mm * 16);
                             r = r * (float)rw[m];
                             simd<fp16, 16> orow = convert<fp16>(r);
                             block_store<fp16, 16>(
                                 output + (size_t)dst_row[m] * hidden_size + ng, orow);
                         }
                     }
+                    }  // end MGD group loop
                 }
             });
     };
@@ -323,7 +339,7 @@ inline torch::Tensor moe_up_fp8_grouped(
         torch::device(x.device()).dtype(torch::kHalf));
     // Flatten work into fixed TILE_M tiles to remove per-expert skew. Upper
     // bound on tiles: sum_e ceil(c_e / TILE_M) <= total_routes/TILE_M + E.
-    constexpr int TILE_M = 8;
+    constexpr int TILE_M = 16;  // M256 OPT: MG=2 (16 rows/tile, weight reuse)
     int max_tiles = total_routes / TILE_M + (int)n_routed_experts;
     auto opts_int = torch::device(x.device()).dtype(torch::kInt32);
     auto tile_expert = torch::empty({max_tiles}, opts_int);
@@ -363,7 +379,7 @@ inline torch::Tensor moe_down_fp8_grouped(
     int hidden_size = down_weight.size(1);
     auto output = torch::empty({total_routes, hidden_size},
         torch::device(intermediate.device()).dtype(torch::kHalf));
-    moe_down_fp8_grouped_kernel<>(
+    moe_down_fp8_grouped_kernel<16>(
         (const fp16*)intermediate.data_ptr(),
         (const uint8_t*)down_weight.data_ptr(),
         down_scale.data_ptr<float>(),
