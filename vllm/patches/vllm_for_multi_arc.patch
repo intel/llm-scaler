@@ -11851,7 +11851,7 @@ index 000000000..b01b55f70
 +                if "mlp.experts" in name:
 +                    continue
 +
-+                name_mapped = name.replace(weight_name, param_name
++                name_mapped = name.replace(weight_name, param_name)
 +                # Skip loading extra bias for GPTQ models.
 +                if name_mapped.endswith(".bias") and name_mapped not in params_dict:
 +                    continue
