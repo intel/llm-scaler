@@ -91,13 +91,16 @@ def _fast_dim_median(input, dim, keepdim, strict_indices):
         k = (n - 1) // 2 + 1
         v, i = torch.kthvalue(moved, k, dim=0)
     else:
+        mid = (n - 1) // 2
         if n <= SMALL_N_MAX:
             v = _minmax_lower_median(moved)
+            # a valid median index: first position along dim holding the value
+            i = (moved == v.unsqueeze(0)).to(torch.uint8).argmax(dim=0)
         else:
-            s, _ = torch.sort(moved, dim=0)
-            v = s[(n - 1) // 2]
-        # a valid median index: first position along dim holding the value
-        i = (moved == v.unsqueeze(0)).to(torch.uint8).argmax(dim=0)
+            # sort already yields a valid median position; reuse its indices
+            s, sort_i = torch.sort(moved, dim=0)
+            v = s[mid]
+            i = sort_i[mid]
     if keepdim:
         v = v.unsqueeze(dim)
         i = i.unsqueeze(dim)
@@ -105,13 +108,20 @@ def _fast_dim_median(input, dim, keepdim, strict_indices):
 
 
 def _should_handle(input, dim):
-    return (
-        dim is not None
-        and isinstance(input, torch.Tensor)
-        and input.device.type == "xpu"
-        and input.dtype in _FAST_DTYPES
-        and input.dim() > 0
-    )
+    if (
+        dim is None
+        or not isinstance(input, torch.Tensor)
+        or input.device.type != "xpu"
+        or input.dtype not in _FAST_DTYPES
+        or input.dim() == 0
+    ):
+        return False
+    # reject invalid/empty reduction dims so user errors fall through to the
+    # original implementation (which raises the proper error) without a warning
+    try:
+        return input.size(dim) > 0
+    except IndexError:
+        return False
 
 
 def apply():
@@ -140,8 +150,8 @@ def apply():
     def _patched_nanmedian(input, dim=None, keepdim=False, *, out=None):
         if out is not None or not _should_handle(input, dim):
             if dim is None:
-                return _orig_nanmedian(input)
-            return _orig_nanmedian(input, dim, keepdim)
+                return _orig_nanmedian(input, out=out) if out is not None else _orig_nanmedian(input)
+            return _orig_nanmedian(input, dim, keepdim, out=out) if out is not None else _orig_nanmedian(input, dim, keepdim)
         # nanmedian ignores NaNs; if NaNs present, semantics differ -> fallback
         if input.is_floating_point() and torch.isnan(input).any():
             return _orig_nanmedian(input, dim, keepdim)
