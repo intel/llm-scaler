@@ -1,2166 +1,1552 @@
-From ee38750a7565ee7158ddc78ff5abd12e9c0d3733 Mon Sep 17 00:00:00 2001
-From: David Zheng <153074367+dzhengAP@users.noreply.github.com>
-Date: Wed, 6 May 2026 08:17:15 -0700
-Subject: [PATCH 01/13] [Bugfix] Fix spawn_new_process_for_each_test silently
- swallowing test failures (#41423)
+From 0fb28c60dfa381efc9b133173627faceb4d0ee07 Mon Sep 17 00:00:00 2001
+From: Kunshang Ji <kunshang.ji@intel.com>
+Date: Thu, 22 Jan 2026 02:52:33 -0800
+Subject: [PATCH 01/17] [INT4]remove ipex quant, support gptq, awq dense model
 
-Signed-off-by: dqzhengAP <dqzheng1996@gmail.com>
+Signed-off-by: Kunshang Ji <kunshang.ji@intel.com>
+
+add xpuwNa16 support (#112)
+
+Signed-off-by: Zhu, Zufang <zufang.zhu@intel.com>
+
+Signed-off-by: Kunshang Ji <kunshang.ji@intel.com>
+
+revert
+
+Signed-off-by: Kunshang Ji <kunshang.ji@intel.com>
+
+Revert "add xpuwNa16 support (#112)"
+
+This reverts commit e9cdfa3724ab9265090911421b9bdb8b22fa10fa.
+
+Signed-off-by: Kunshang Ji <kunshang.ji@intel.com>
 ---
- tests/utils.py                                |  85 ++--
- tests/utils_/test_spawn_decorator.py          |  33 ++
- tests/v1/cudagraph/test_cudagraph_dispatch.py | 365 +++++++++---------
- .../logits_processors/test_custom_online.py   |  68 ++--
- 4 files changed, 306 insertions(+), 245 deletions(-)
- create mode 100644 tests/utils_/test_spawn_decorator.py
+ .../model_executor/layers/quantization/awq.py | 32 +++++++++++++++++++
+ .../layers/quantization/gptq.py               | 30 +++++++++++++++++
+ 2 files changed, 62 insertions(+)
 
-diff --git a/tests/utils.py b/tests/utils.py
-index 41202aa19..e8fd3f1e8 100644
---- a/tests/utils.py
-+++ b/tests/utils.py
-@@ -19,7 +19,7 @@ import threading
- import time
- import warnings
- from collections.abc import Callable, Iterable, Sequence
--from contextlib import ExitStack, contextmanager, suppress
-+from contextlib import ExitStack, contextmanager
- from multiprocessing import Process
- from pathlib import Path
- from typing import Any, Literal
-@@ -1512,52 +1512,65 @@ def fork_new_process_for_each_test(func: Callable[_P, None]) -> Callable[_P, Non
- 
- 
- def spawn_new_process_for_each_test(f: Callable[_P, None]) -> Callable[_P, None]:
--    """Decorator to spawn a new process for each test function."""
-+    """Decorator to spawn a new process for each test function.
-+
-+    Uses subprocess with cloudpickle to serialize the test function and
-+    propagates exceptions back to the parent, so test failures are never
-+    silently swallowed (fixes https://github.com/vllm-project/vllm/issues/41415).
-+    """
- 
-     @functools.wraps(f)
-     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> None:
--        # Check if we're already in a subprocess
--        if os.environ.get("RUNNING_IN_SUBPROCESS") == "1":
--            # If we are, just run the function directly
--            return f(*args, **kwargs)
--
--        import torch.multiprocessing as mp
--
--        with suppress(RuntimeError):
--            mp.set_start_method("spawn")
--
--        # Get the module
--        module_name = f.__module__
--
--        # Create a process with environment variable set
--        env = os.environ.copy()
--        env["RUNNING_IN_SUBPROCESS"] = "1"
--
--        with tempfile.TemporaryDirectory() as tempdir:
--            output_filepath = os.path.join(tempdir, "new_process.tmp")
-+        with tempfile.NamedTemporaryFile(delete=False, suffix=".tb", mode="wb") as tmp:
-+            tb_file = tmp.name
- 
--            # `cloudpickle` allows pickling complex functions directly
--            input_bytes = cloudpickle.dumps((f, output_filepath))
-+        try:
-+            # Serialize the function + args with cloudpickle so closures work
-+            payload = cloudpickle.dumps((f, args, kwargs, tb_file))
-+
-+            child_script = (
-+                "import sys, cloudpickle, traceback\n"
-+                "try:\n"
-+                "    from _pytest.outcomes import Skipped\n"
-+                "except ImportError:\n"
-+                "    class Skipped(BaseException): pass\n"
-+                "f, args, kwargs, tb_file = "
-+                "cloudpickle.loads(sys.stdin.buffer.read())\n"
-+                "try:\n"
-+                "    f(*args, **kwargs)\n"
-+                "except Skipped:\n"
-+                "    sys.exit(0)\n"
-+                "except BaseException:\n"
-+                "    open(tb_file, 'w').write(traceback.format_exc())\n"
-+                "    sys.exit(1)\n"
-+            )
- 
-             repo_root = str(VLLM_PATH.resolve())
--
--            env = dict(env or os.environ)
-+            env = os.environ.copy()
-             env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
- 
--            cmd = [sys.executable, "-m", f"{module_name}"]
--
--            returned = subprocess.run(
--                cmd, input=input_bytes, capture_output=True, env=env
-+            result = subprocess.run(
-+                [sys.executable, "-c", child_script],
-+                input=payload,
-+                capture_output=True,
-+                env=env,
-             )
- 
--            # check if the subprocess is successful
--            try:
--                returned.check_returncode()
--            except Exception as e:
--                # wrap raised exception to provide more information
-+            if result.returncode != 0:
-+                # Read traceback written by child, fall back to stderr
-+                tb = ""
-+                if os.path.exists(tb_file) and os.path.getsize(tb_file) > 0:
-+                    with open(tb_file) as fp:
-+                        tb = fp.read()
-+                else:
-+                    tb = result.stderr.decode()
-                 raise RuntimeError(
--                    f"Error raised in subprocess:\n{returned.stderr.decode()}"
--                ) from e
-+                    f"Test subprocess '{f.__name__}' failed "
-+                    f"(exit code {result.returncode}):\n{tb}"
-+                )
-+        finally:
-+            with contextlib.suppress(OSError):
-+                os.remove(tb_file)
- 
-     return wrapper
- 
-diff --git a/tests/utils_/test_spawn_decorator.py b/tests/utils_/test_spawn_decorator.py
-new file mode 100644
-index 000000000..1740ea30d
---- /dev/null
-+++ b/tests/utils_/test_spawn_decorator.py
-@@ -0,0 +1,33 @@
-+# SPDX-License-Identifier: Apache-2.0
-+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-+"""Tests for spawn_new_process_for_each_test decorator."""
-+
-+import pytest
-+
-+from tests.utils import spawn_new_process_for_each_test
-+
-+
-+@spawn_new_process_for_each_test
-+def test_spawn_decorator_passing():
-+    """Passing function should complete normally."""
-+    assert 1 + 1 == 2
-+
-+
-+@pytest.mark.xfail(raises=RuntimeError, strict=True)
-+@spawn_new_process_for_each_test
-+def test_spawn_decorator_failure_is_caught():
-+    """Failing function should raise RuntimeError, never silently pass."""
-+    raise ValueError("intentional failure")
-+
-+
-+@spawn_new_process_for_each_test
-+def test_spawn_decorator_skip():
-+    """pytest.skip inside subprocess should propagate correctly."""
-+    pytest.skip("intentional skip")
-+
-+
-+@spawn_new_process_for_each_test
-+@pytest.mark.parametrize("x,y,expected", [(1, 2, 3), (0, 0, 0)])
-+def test_spawn_decorator_parametrized(x, y, expected):
-+    """Args and kwargs must be forwarded correctly to subprocess."""
-+    assert x + y == expected
-diff --git a/tests/v1/cudagraph/test_cudagraph_dispatch.py b/tests/v1/cudagraph/test_cudagraph_dispatch.py
-index 66e6d7dd4..97b5fd46a 100644
---- a/tests/v1/cudagraph/test_cudagraph_dispatch.py
-+++ b/tests/v1/cudagraph/test_cudagraph_dispatch.py
-@@ -371,193 +371,200 @@ class TestCUDAGraphWrapper:
-         assert not wrapper.concrete_cudagraph_entries
- 
- 
--@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
--class TestCudagraphIntegration:
--    def setup_method(self):
--        # only FULL mode for non-uniform batches
--        self.comp_config = CompilationConfig(
--            mode=CompilationMode.VLLM_COMPILE,
--            cudagraph_mode="FULL",
--            cudagraph_capture_sizes=[10, 20],
--        )
--        self.vllm_config = _create_vllm_config(self.comp_config)
--        self.dispatcher = CudagraphDispatcher(self.vllm_config)
--        self.dispatcher.initialize_cudagraph_keys(
--            self.comp_config.cudagraph_mode, uniform_decode_query_len=1
--        )
--
--    def _run_and_monitor_call(
--        self, wrapper, input_tensor, runtime_mode, batch_descriptor
-+def _run_and_monitor_call(
-+    wrapper, input_tensor, runtime_mode, batch_descriptor, vllm_config
-+):
-+    """Helper to run a single call and monitor the action."""
-+
-+    with (
-+        patch("torch.cuda.graph", wraps=torch.cuda.graph) as mock_graph_context,
-+        patch.object(wrapper, "runnable", wraps=wrapper.runnable) as mock_runnable,
-     ):
--        """Helper to run a single call and monitor the action."""
--
--        with (
--            patch("torch.cuda.graph", wraps=torch.cuda.graph) as mock_graph_context,
--            patch.object(wrapper, "runnable", wraps=wrapper.runnable) as mock_runnable,
--        ):
--            entry = wrapper.concrete_cudagraph_entries.get(batch_descriptor, None)
--
--            context = set_forward_context(
--                attn_metadata=None,
--                vllm_config=self.vllm_config,
--                cudagraph_runtime_mode=runtime_mode,
--                batch_descriptor=batch_descriptor,
--            )
--            mock_replay = MagicMock()
--            if entry and entry.cudagraph:
--                with (
--                    context,
--                    patch.object(
--                        entry.cudagraph, "replay", new_callable=MagicMock
--                    ) as mock_replay,
--                ):
--                    wrapper(input_tensor)
--            else:
--                with context:
--                    wrapper(input_tensor)
--
--            if mock_graph_context.called:
--                # note that this is globally mocked, so it will be detected
--                # even whether called by the inner or outer wrapper
--                return "capture_global"
--            if mock_replay.called:
--                # only for outer wrapper
--                return "replay"
--            if mock_runnable.call_count > 0:
--                # only for outer wrapper
--                return "bypass"
--            return "unknown"
--
--    @create_new_process_for_each_test("spawn")
--    def test_capture_replay_bypass_logic(self):
--        model = SimpleMLP().to(DEVICE_TYPE)
--        full_wrapper = CUDAGraphWrapper(model, self.vllm_config, CUDAGraphMode.FULL)
--        max_bs = 16
--        persistent_input_buffer = torch.zeros(max_bs, 10, device=DEVICE_TYPE)
--        input_1 = persistent_input_buffer[:1]
--        input_2 = persistent_input_buffer[:2]
--        input_3 = persistent_input_buffer[:3]
--
--        desc_1 = BatchDescriptor(num_tokens=1)
--        desc_2 = BatchDescriptor(num_tokens=2)
--        desc_3_unseen = BatchDescriptor(num_tokens=3)
-+        entry = wrapper.concrete_cudagraph_entries.get(batch_descriptor, None)
- 
--        # 0. global warmup
--        with set_forward_context(
-+        context = set_forward_context(
-             attn_metadata=None,
--            vllm_config=self.vllm_config,
--            cudagraph_runtime_mode=CUDAGraphMode.NONE,
--            batch_descriptor=None,
--        ):
--            full_wrapper(input_1)
-+            vllm_config=vllm_config,
-+            cudagraph_runtime_mode=runtime_mode,
-+            batch_descriptor=batch_descriptor,
-+        )
-+        mock_replay = MagicMock()
-+        if entry and entry.cudagraph:
-+            with (
-+                context,
-+                patch.object(
-+                    entry.cudagraph, "replay", new_callable=MagicMock
-+                ) as mock_replay,
-+            ):
-+                wrapper(input_tensor)
-+        else:
-+            with context:
-+                wrapper(input_tensor)
-+
-+        if mock_graph_context.called:
-+            # note that this is globally mocked, so it will be detected
-+            # even whether called by the inner or outer wrapper
-+            return "capture_global"
-+        if mock_replay.called:
-+            # only for outer wrapper
-+            return "replay"
-+        if mock_runnable.call_count > 0:
-+            # only for outer wrapper
-+            return "bypass"
-+        return "unknown"
-+
-+
-+@create_new_process_for_each_test("spawn")
-+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
-+def test_capture_replay_bypass_logic():
-+    comp_config = CompilationConfig(
-+        mode=CompilationMode.VLLM_COMPILE,
-+        cudagraph_mode="FULL",
-+        cudagraph_capture_sizes=[1, 2],
-+    )
-+    vllm_config = _create_vllm_config(comp_config)
-+    dispatcher = CudagraphDispatcher(vllm_config)
-+    dispatcher.initialize_cudagraph_keys(
-+        comp_config.cudagraph_mode, uniform_decode_query_len=1
-+    )
-+    model = SimpleMLP().to(DEVICE_TYPE)
-+    full_wrapper = CUDAGraphWrapper(model, vllm_config, CUDAGraphMode.FULL)
-+    max_bs = 16
-+    persistent_input_buffer = torch.zeros(max_bs, 10, device=DEVICE_TYPE)
-+    input_1 = persistent_input_buffer[:1]
-+    input_2 = persistent_input_buffer[:2]
-+    input_3 = persistent_input_buffer[:3]
-+
-+    desc_1 = BatchDescriptor(num_tokens=1)
-+    desc_2 = BatchDescriptor(num_tokens=2)
-+    desc_3_unseen = BatchDescriptor(num_tokens=3)
-+
-+    # 0. global warmup
-+    with set_forward_context(
-+        attn_metadata=None,
-+        vllm_config=vllm_config,
-+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
-+        batch_descriptor=None,
-+    ):
-+        full_wrapper(input_1)
- 
--        rt_mode, key = self.dispatcher.dispatch(num_tokens=desc_1.num_tokens)
--        # 1. Capture first shape
--        action = self._run_and_monitor_call(full_wrapper, input_1, rt_mode, key)
--        assert action == "capture_global"
-+    rt_mode, key = dispatcher.dispatch(num_tokens=desc_1.num_tokens)
-+    # 1. Capture first shape
-+    action = _run_and_monitor_call(full_wrapper, input_1, rt_mode, key, vllm_config)
-+    assert action == "capture_global"
- 
--        # 2. Replay first shape
--        action = self._run_and_monitor_call(full_wrapper, input_1, rt_mode, key)
--        assert action == "replay"
-+    # 2. Replay first shape
-+    action = _run_and_monitor_call(full_wrapper, input_1, rt_mode, key, vllm_config)
-+    assert action == "replay"
- 
--        rt_mode, key = self.dispatcher.dispatch(num_tokens=desc_2.num_tokens)
--        # 3. Capture second shape
--        action = self._run_and_monitor_call(full_wrapper, input_2, rt_mode, key)
--        assert action == "capture_global"
-+    rt_mode, key = dispatcher.dispatch(num_tokens=desc_2.num_tokens)
-+    # 3. Capture second shape
-+    action = _run_and_monitor_call(full_wrapper, input_2, rt_mode, key, vllm_config)
-+    assert action == "capture_global"
- 
--        # 4. Replay second shape
--        action = self._run_and_monitor_call(
--            full_wrapper, input_2, CUDAGraphMode.FULL, desc_2
-+    # 4. Replay second shape
-+    action = _run_and_monitor_call(
-+        full_wrapper, input_2, CUDAGraphMode.FULL, key, vllm_config
-+    )
-+    assert action == "replay"
-+
-+    # 5. Bypass if no key match
-+    rt_mode, key = dispatcher.dispatch(num_tokens=desc_3_unseen.num_tokens)
-+    assert rt_mode == CUDAGraphMode.NONE
-+    action = _run_and_monitor_call(full_wrapper, input_3, rt_mode, key, vllm_config)
-+    assert action == "bypass"
-+
-+    # capture unseen shape is not allowed after disable
-+    set_cudagraph_capturing_enabled(False)
-+    with pytest.raises(RuntimeError):
-+        _run_and_monitor_call(
-+            full_wrapper, input_3, CUDAGraphMode.FULL, desc_3_unseen, vllm_config
-         )
--        assert action == "replay"
-+    set_cudagraph_capturing_enabled(True)
- 
--        # 5. Bypass if no key match
--        rt_mode, key = self.dispatcher.dispatch(num_tokens=desc_3_unseen.num_tokens)
--        assert rt_mode == CUDAGraphMode.NONE
--        action = self._run_and_monitor_call(full_wrapper, input_3, rt_mode, key)
--        assert action == "bypass"
--
--        # capture unseen shape is not allowed after disable
--        set_cudagraph_capturing_enabled(False)
--        with pytest.raises(RuntimeError):
--            self._run_and_monitor_call(
--                full_wrapper, input_3, CUDAGraphMode.FULL, desc_3_unseen
--            )
--        set_cudagraph_capturing_enabled(True)
--
--    @create_new_process_for_each_test("spawn")
--    def test_nested_wrappers(self):
--        """Tests a scenario with a PIECEWISE wrapper inside a FULL one."""
--        model = SimpleMLP().to(DEVICE_TYPE)
--        full_wrapper = CUDAGraphWrapper(model, self.vllm_config, CUDAGraphMode.FULL)
--        input_1 = torch.randn(1, 10, device=DEVICE_TYPE)
--
--        # Setup: Inner model is wrapped with PIECEWISE, outer with FULL
--        inner_model = SimpleMLP().to(DEVICE_TYPE)
--        piecewise_wrapper = CUDAGraphWrapper(
--            inner_model, self.vllm_config, CUDAGraphMode.PIECEWISE
--        )
--        inner_model.forward = MagicMock(wraps=inner_model.forward)
--        outer_model = SimpleMLP().to(DEVICE_TYPE)
--        # When outer model is called, it calls the piecewise_wrapper
--        outer_model.forward = MagicMock(
--            wraps=outer_model.forward, side_effect=piecewise_wrapper
--        )
--        full_wrapper = CUDAGraphWrapper(
--            outer_model, self.vllm_config, CUDAGraphMode.FULL
--        )
- 
--        desc_1 = BatchDescriptor(num_tokens=1)
-+@create_new_process_for_each_test("spawn")
-+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
-+def test_nested_wrappers():
-+    """Tests a scenario with a PIECEWISE wrapper inside a FULL one."""
-+    comp_config = CompilationConfig(
-+        mode=CompilationMode.VLLM_COMPILE,
-+        cudagraph_mode="FULL",
-+        cudagraph_capture_sizes=[1],
-+    )
-+    vllm_config = _create_vllm_config(comp_config)
-+    dispatcher = CudagraphDispatcher(vllm_config)
-+    dispatcher.initialize_cudagraph_keys(
-+        comp_config.cudagraph_mode, uniform_decode_query_len=1
-+    )
-+    model = SimpleMLP().to(DEVICE_TYPE)
-+    full_wrapper = CUDAGraphWrapper(model, vllm_config, CUDAGraphMode.FULL)
-+    input_1 = torch.randn(1, 10, device=DEVICE_TYPE)
-+
-+    # Setup: Inner model is wrapped with PIECEWISE, outer with FULL
-+    inner_model = SimpleMLP().to(DEVICE_TYPE)
-+    piecewise_wrapper = CUDAGraphWrapper(
-+        inner_model, vllm_config, CUDAGraphMode.PIECEWISE
-+    )
-+    inner_model.forward = MagicMock(wraps=inner_model.forward)
-+    outer_model = SimpleMLP().to(DEVICE_TYPE)
-+    # When outer model is called, it calls the piecewise_wrapper
-+    outer_model.forward = MagicMock(
-+        wraps=outer_model.forward, side_effect=piecewise_wrapper
-+    )
-+    full_wrapper = CUDAGraphWrapper(outer_model, vllm_config, CUDAGraphMode.FULL)
- 
--        # 0. global warmup
--        with set_forward_context(
--            attn_metadata=None,
--            vllm_config=self.vllm_config,
--            cudagraph_runtime_mode=CUDAGraphMode.NONE,
--            batch_descriptor=None,
--        ):
--            full_wrapper(input_1)
--
--        # --- Test runtime mode FULL---
--        # Run with FULL mode context. Expect outer wrapper to capture.
--        # The inner mock should be called once inside the graph capture.
--        outer_model.forward.reset_mock()
--        inner_model.forward.reset_mock()
--        action = self._run_and_monitor_call(
--            full_wrapper, input_1, CUDAGraphMode.FULL, desc_1
--        )
--        assert action == "capture_global"
--        assert outer_model.forward.call_count == 1
--        assert inner_model.forward.call_count == 1
--
--        # Run again. Expect outer wrapper to replay.
--        # The outer model should NOT be called because the whole graph
--        # is replayed.
--        action = self._run_and_monitor_call(
--            full_wrapper, input_1, CUDAGraphMode.FULL, desc_1
--        )
--        assert action == "replay"
--        assert outer_model.forward.call_count == 1  # No new call
--        assert inner_model.forward.call_count == 1
--
--        # --- Test runtime mode PIECEWISE ---
--        outer_model.forward.reset_mock()
--        inner_model.forward.reset_mock()
--        # Run with PIECEWISE mode context.
--        # Expect outer wrapper to bypass and call inner wrapper.
--        # Inner wrapper should capture.
--        action = self._run_and_monitor_call(
--            full_wrapper, input_1, CUDAGraphMode.PIECEWISE, desc_1
--        )
--        assert action == "capture_global"
--        assert outer_model.forward.call_count == 1
--        assert inner_model.forward.call_count == 1
--
--        # Run again with PIECEWISE.
--        # Outer bypasses, inner replays.
--        action = self._run_and_monitor_call(
--            full_wrapper, input_1, CUDAGraphMode.PIECEWISE, desc_1
--        )
--        assert action == "bypass"
--        assert outer_model.forward.call_count == 2
--        assert inner_model.forward.call_count == 1
-+    desc_1 = BatchDescriptor(num_tokens=1)
-+
-+    # 0. global warmup
-+    with set_forward_context(
-+        attn_metadata=None,
-+        vllm_config=vllm_config,
-+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
-+        batch_descriptor=None,
-+    ):
-+        full_wrapper(input_1)
-+
-+    # --- Test runtime mode FULL---
-+    # Run with FULL mode context. Expect outer wrapper to capture.
-+    # The inner mock should be called once inside the graph capture.
-+    outer_model.forward.reset_mock()
-+    inner_model.forward.reset_mock()
-+    action = _run_and_monitor_call(
-+        full_wrapper, input_1, CUDAGraphMode.FULL, desc_1, vllm_config
-+    )
-+    assert action == "capture_global"
-+    assert outer_model.forward.call_count == 1
-+    assert inner_model.forward.call_count == 1
-+
-+    # Run again. Expect outer wrapper to replay.
-+    # The outer model should NOT be called because the whole graph
-+    # is replayed.
-+    action = _run_and_monitor_call(
-+        full_wrapper, input_1, CUDAGraphMode.FULL, desc_1, vllm_config
-+    )
-+    assert action == "replay"
-+    assert outer_model.forward.call_count == 1  # No new call
-+    assert inner_model.forward.call_count == 1
-+
-+    # --- Test runtime mode PIECEWISE ---
-+    outer_model.forward.reset_mock()
-+    inner_model.forward.reset_mock()
-+    # Run with PIECEWISE mode context.
-+    # Expect outer wrapper to bypass and call inner wrapper.
-+    # Inner wrapper should capture.
-+    action = _run_and_monitor_call(
-+        full_wrapper, input_1, CUDAGraphMode.PIECEWISE, desc_1, vllm_config
-+    )
-+    assert action == "capture_global"
-+    assert outer_model.forward.call_count == 1
-+    assert inner_model.forward.call_count == 1
-+
-+    # Run again with PIECEWISE.
-+    # Outer bypasses, inner replays.
-+    action = _run_and_monitor_call(
-+        full_wrapper, input_1, CUDAGraphMode.PIECEWISE, desc_1, vllm_config
-+    )
-+    assert action == "bypass"
-+    assert outer_model.forward.call_count == 2
-+    assert inner_model.forward.call_count == 1
-diff --git a/tests/v1/logits_processors/test_custom_online.py b/tests/v1/logits_processors/test_custom_online.py
-index 3dc6b8979..93825c65b 100644
---- a/tests/v1/logits_processors/test_custom_online.py
-+++ b/tests/v1/logits_processors/test_custom_online.py
-@@ -120,12 +120,11 @@ api_keyword_args = {
- 
- 
- @create_new_process_for_each_test()
--@pytest.mark.asyncio
- @pytest.mark.parametrize(
-     "model_name",
-     [MODEL_NAME],
+diff --git a/vllm/model_executor/layers/quantization/awq.py b/vllm/model_executor/layers/quantization/awq.py
+index 37cffcb3d..c9c48d1f9 100644
+--- a/vllm/model_executor/layers/quantization/awq.py
++++ b/vllm/model_executor/layers/quantization/awq.py
+@@ -22,6 +22,7 @@ from vllm.model_executor.layers.quantization.base_config import (
  )
--async def test_custom_logitsprocs(client: openai.AsyncOpenAI, model_name: str):
-+def test_custom_logitsprocs(server, model_name: str):
-     """Test custom logitsprocs when starting OpenAI server from CLI
+ from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+ from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
++from vllm.platforms import current_platform
+ from vllm.transformers_utils.config import get_safetensors_params_metadata
  
-     Launch vLLM OpenAI-compatible server, configured to load a custom logitproc
-@@ -139,36 +138,45 @@ async def test_custom_logitsprocs(client: openai.AsyncOpenAI, model_name: str):
-     token
-     """
- 
--    use_dummy_logitproc = True
--    for prompt in prompts:
--        # Build request arguments
--        request_keyword_args: dict[str, Any] = {
--            **api_keyword_args,
--        }
--        if use_dummy_logitproc:
--            # 50% of requests pass target_token custom arg
--            target_token = random.choice([128, 67])
--            # For requests which activate the dummy logitproc, choose one of
--            # two `target_token` values which are known not to be EOS tokens
--            request_keyword_args["extra_body"] = {
--                "vllm_xargs": {DUMMY_LOGITPROC_ARG: target_token}
--            }
--        batch = await client.completions.create(
--            model=model_name,
--            prompt=prompt,
--            **request_keyword_args,
--        )
-+    import asyncio
- 
--        if use_dummy_logitproc:
--            # Only for requests which activate dummy logitproc - validate that
--            # output token is repeated
--            choices: openai.types.CompletionChoice = batch.choices
--            toks = choices[0].logprobs.tokens
--            if not all([x == toks[0] for x in toks]):
--                raise AssertionError(f"Generated {toks} should all be {toks[0]}")
-+    async def _async_main(srv, mn):
-+        async with srv.get_async_client() as client:
-+            await _run(client)
- 
--        # Alternate whether to activate dummy logitproc for each request
--        use_dummy_logitproc = not use_dummy_logitproc
-+    async def _run(client):
-+        use_dummy_logitproc = True
-+        for prompt in prompts:
-+            # Build request arguments
-+            request_keyword_args: dict[str, Any] = {
-+                **api_keyword_args,
-+            }
-+            if use_dummy_logitproc:
-+                # 50% of requests pass target_token custom arg
-+                target_token = random.choice([128, 67])
-+                # For requests which activate the dummy logitproc, choose one of
-+                # two `target_token` values which are known not to be EOS tokens
-+                request_keyword_args["extra_body"] = {
-+                    "vllm_xargs": {DUMMY_LOGITPROC_ARG: target_token}
-+                }
-+            batch = await client.completions.create(
-+                model=model_name,
-+                prompt=prompt,
-+                **request_keyword_args,
+ if TYPE_CHECKING:
+@@ -258,6 +259,23 @@ class AWQLinearMethod(LinearMethodBase):
+         layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
+         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
+         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
++        if current_platform.is_xpu():
++            from vllm_xpu_kernels.quantization._quantize_convert import (
++                AWQUtils,
++                transpose_onednn_woq_format,
 +            )
 +
-+            if use_dummy_logitproc:
-+                # Only for requests which activate dummy logitproc - validate that
-+                # output token is repeated
-+                choices: openai.types.CompletionChoice = batch.choices
-+                toks = choices[0].logprobs.tokens
-+                if not all([x == toks[0] for x in toks]):
-+                    raise AssertionError(f"Generated {toks} should all be {toks[0]}")
-+
-+            # Alternate whether to activate dummy logitproc for each request
-+            use_dummy_logitproc = not use_dummy_logitproc
-+
-+    asyncio.run(_async_main(server, model_name))
++            layer.xpu_output_size = (
++                layer.qweight.size(1) * self.quant_config.pack_factor
++            )
++            qweight_new, qzeros_new = AWQUtils.repack(layer.qweight, layer.qzeros)
++            if qweight_new.shape != layer.qweight.data.shape:
++                layer.qweight.data = layer.qweight.data.view_as(qweight_new)
++            if qzeros_new.shape != layer.qzeros.data.shape:
++                layer.qzeros.data = layer.qzeros.data.view_as(qzeros_new)
++            layer.qweight.data.copy_(qweight_new)
++            layer.qzeros.data.copy_(qzeros_new)
++            transpose_onednn_woq_format(layer, "awq", False)
  
+     def apply(
+         self,
+@@ -265,6 +283,20 @@ class AWQLinearMethod(LinearMethodBase):
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if current_platform.is_xpu():
++            reshaped_x = x.reshape(-1, x.shape[-1])
++            out = torch.ops._xpu_C.int4_gemm_w4a16(
++                reshaped_x,
++                layer.qweight,
++                bias,
++                layer.scales,
++                layer.qzeros,
++                self.quant_config.group_size,
++                None,
++            )
++            out_shape = x.shape[:-1] + (layer.xpu_output_size,)
++            return out.reshape(out_shape)
++
+         qweight = layer.qweight
+         scales = layer.scales
+         qzeros = layer.qzeros
+diff --git a/vllm/model_executor/layers/quantization/gptq.py b/vllm/model_executor/layers/quantization/gptq.py
+index 458741478..380dfe0f9 100644
+--- a/vllm/model_executor/layers/quantization/gptq.py
++++ b/vllm/model_executor/layers/quantization/gptq.py
+@@ -29,6 +29,7 @@ from vllm.model_executor.parameter import (
+     PackedvLLMParameter,
+     RowvLLMParameter,
+ )
++from vllm.platforms import current_platform
+ from vllm.transformers_utils.config import get_safetensors_params_metadata
+ from vllm.utils.collection_utils import is_list_of
  
- @pytest.mark.asyncio
+@@ -361,6 +362,23 @@ class GPTQLinearMethod(LinearMethodBase):
+         layer.g_idx = Parameter(layer.g_idx.data, requires_grad=False)
+         layer.scales = Parameter(layer.scales.data, requires_grad=False)
+ 
++        if current_platform.is_xpu():
++            from vllm_xpu_kernels.quantization._quantize_convert import (
++                GPTQUtils,
++                transpose_onednn_woq_format,
++            )
++
++            if self.quant_config.desc_act and layer.g_idx is not None:
++                gptq_utils = GPTQUtils(bits=4, blocksize=self.quant_config.group_size)
++                qweight_new, g_idx_new = gptq_utils.shuffle(layer.qweight, layer.g_idx)
++                layer.qweight.data.copy_(qweight_new)
++                layer.g_idx.data.copy_(g_idx_new)
++                qweight_new = None
++                g_idx_new = None
++                del qweight_new, g_idx_new
++            transpose_onednn_woq_format(layer, "gptq", True)
++            return
++
+         # exllama needs to shuffle the weight after the weight is loaded
+         # here we do the shuffle on first forward pass
+         if layer.exllama_state == ExllamaState.UNINITIALIZED:
+@@ -379,6 +397,18 @@ class GPTQLinearMethod(LinearMethodBase):
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if current_platform.is_xpu():
++            reshaped_x = x.reshape(-1, x.shape[-1])
++            out = torch.ops._xpu_C.int4_gemm_w4a16(
++                reshaped_x,
++                layer.qweight,
++                bias,
++                layer.scales,
++                layer.qzeros,
++                layer.quant_config.group_size,
++                None,
++            )
++            return out
+         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
+         reshaped_x = x.reshape(-1, x.shape[-1])
+ 
 -- 
 2.39.5 (Apple Git-154)
 
 
-From d5b31c954d511ecdb486e84c71d52d2a5c28ade4 Mon Sep 17 00:00:00 2001
-From: Viktor Pus <viktorpus@tenstorrent.com>
-Date: Wed, 6 May 2026 18:10:17 +0200
-Subject: [PATCH 02/13] [Bugfix] Account for truncate_prompt_tokens when
- computing max_tokens (#41800)
+From 39c935f70ac91d71618e255307a26d170e1d2ab9 Mon Sep 17 00:00:00 2001
+From: Yan Ma <yan.ma@intel.com>
+Date: Fri, 10 Apr 2026 02:34:22 +0000
+Subject: [PATCH 02/17] add workaround for mem_get_info on BMG
 
-Signed-off-by: Viktor Pus <viktorpus@tenstorrent.com>
+Signed-off-by: Yan Ma <yan.ma@intel.com>
 ---
- .../chat_completion/test_serving_chat.py      | 51 +++++++++++++++++++
- .../openai/chat_completion/serving.py         |  1 +
- vllm/entrypoints/openai/completion/serving.py |  1 +
- vllm/entrypoints/openai/responses/serving.py  |  6 +++
- vllm/entrypoints/serve/render/serving.py      |  2 +
- vllm/entrypoints/utils.py                     |  7 +++
- 6 files changed, 68 insertions(+)
+ vllm/platforms/xpu.py | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
 
-diff --git a/tests/entrypoints/openai/chat_completion/test_serving_chat.py b/tests/entrypoints/openai/chat_completion/test_serving_chat.py
-index df4d5ad47..c44e07a4c 100644
---- a/tests/entrypoints/openai/chat_completion/test_serving_chat.py
-+++ b/tests/entrypoints/openai/chat_completion/test_serving_chat.py
-@@ -807,6 +807,57 @@ async def test_serving_chat_should_set_correct_max_tokens():
-     assert mock_engine.generate.call_args.args[1].max_tokens == 5
+diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
+index bd9006f3f..5c2b685f2 100644
+--- a/vllm/platforms/xpu.py
++++ b/vllm/platforms/xpu.py
+@@ -169,6 +169,17 @@ class XPUPlatform(Platform):
+     def get_static_graph_wrapper_cls(cls) -> str:
+         return "vllm.compilation.cuda_graph.CUDAGraphWrapper"
  
- 
-+@pytest.mark.asyncio
-+async def test_serving_chat_truncate_prompt_tokens_max_token_accounting():
-+    """When truncate_prompt_tokens is set, max_tokens must be calculated using
-+    the truncated prompt length, not the original prompt length.
++    @classmethod
++    def mem_get_info(cls, device) -> tuple[int, int]:
++        if cls.is_data_center_gpu():
++            # For data center GPU, use torch.xpu.mem_get_info
++            return torch.xpu.mem_get_info(device)
++        # FIXME:kunshang, For client GPU, estimate free memory
++        reserved_mem = torch.xpu.memory_reserved(device)
++        total_mem = torch.xpu.get_device_properties(device).total_memory
++        estimated_free_mem = total_mem - reserved_mem
++        return estimated_free_mem, total_mem
 +
-+    Regression: without the fix, get_max_tokens received the untruncated prompt
-+    length, causing the output budget to be underestimated.
-+    """
-+    mock_engine = MagicMock(spec=AsyncLLM)
-+    mock_engine.errored = False
-+    mock_engine.model_config = MockModelConfig()
-+    mock_engine.input_processor = MagicMock()
-+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
-+
-+    serving_chat = _build_serving_chat(mock_engine)
-+
-+    # "what is 1+1?" tokenizes to 7 tokens with the test chat template
-+    # (max_model_len=100 -> max_tokens = 93 without truncation, confirmed by
-+    # test_serving_chat_should_set_correct_max_tokens above).
-+    messages = [{"role": "user", "content": "what is 1+1?"}]
-+
-+    # Baseline: no truncation -> max_tokens = 100 - 7 = 93.
-+    req = ChatCompletionRequest(model=MODEL_NAME, messages=messages)
-+    with suppress(Exception):
-+        await serving_chat.create_chat_completion(req)
-+    assert mock_engine.generate.call_args.args[1].max_tokens == 93
-+
-+    # With truncate_prompt_tokens=5 (less than 7): the effective prompt length
-+    # is 5, so max_tokens should be 100 - 5 = 95, not 93.
-+    req = ChatCompletionRequest(
-+        model=MODEL_NAME,
-+        messages=messages,
-+        truncate_prompt_tokens=5,
-+    )
-+    with suppress(Exception):
-+        await serving_chat.create_chat_completion(req)
-+    assert mock_engine.generate.call_args.args[1].max_tokens == 95
-+
-+    # With truncate_prompt_tokens=-1 (meaning use full max_model_len as the
-+    # truncation limit, i.e., no practical truncation vs the window): effective
-+    # length = min(7, 100) = 7 -> max_tokens = 93 again.
-+    req = ChatCompletionRequest(
-+        model=MODEL_NAME,
-+        messages=messages,
-+        truncate_prompt_tokens=-1,
-+    )
-+    with suppress(Exception):
-+        await serving_chat.create_chat_completion(req)
-+    assert mock_engine.generate.call_args.args[1].max_tokens == 93
-+
-+
- @pytest.mark.asyncio
- async def test_serving_chat_mistral_token_ids_prompt_is_validated():
-     """Regression test: when the Mistral tokenizer path returns token IDs
-diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
-index d149d9fd7..f42cc8afe 100644
---- a/vllm/entrypoints/openai/chat_completion/serving.py
-+++ b/vllm/entrypoints/openai/chat_completion/serving.py
-@@ -289,6 +289,7 @@ class OpenAIServingChat(OpenAIServing):
-                 self._extract_prompt_len(engine_input),
-                 self.default_sampling_params,
-                 self.override_max_tokens,
-+                truncate_prompt_tokens=request.truncate_prompt_tokens,
-             )
- 
-             sampling_params: SamplingParams | BeamSearchParams
-diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
-index 454b170a5..816c62163 100644
---- a/vllm/entrypoints/openai/completion/serving.py
-+++ b/vllm/entrypoints/openai/completion/serving.py
-@@ -151,6 +151,7 @@ class OpenAIServingCompletion(OpenAIServing):
-                 self._extract_prompt_len(engine_input),
-                 self.default_sampling_params,
-                 self.override_max_tokens,
-+                truncate_prompt_tokens=request.truncate_prompt_tokens,
-             )
- 
-             sampling_params: SamplingParams | BeamSearchParams
-diff --git a/vllm/entrypoints/openai/responses/serving.py b/vllm/entrypoints/openai/responses/serving.py
-index a6a9355ae..9c4dc4858 100644
---- a/vllm/entrypoints/openai/responses/serving.py
-+++ b/vllm/entrypoints/openai/responses/serving.py
-@@ -416,6 +416,9 @@ class OpenAIServingResponses(OpenAIServing):
-                 self._extract_prompt_len(engine_input),
-                 self.default_sampling_params,
-                 self.override_max_tokens,
-+                truncate_prompt_tokens=(
-+                    -1 if request.truncation != "disabled" else None
-+                ),
-             )
- 
-             sampling_params = request.to_sampling_params(
-@@ -700,6 +703,9 @@ class OpenAIServingResponses(OpenAIServing):
-                     self._extract_prompt_len(engine_input),
-                     self.default_sampling_params,  # type: ignore
-                     self.override_max_tokens,  # type: ignore
-+                    truncate_prompt_tokens=(
-+                        -1 if context.request.truncation != "disabled" else None
-+                    ),
-                 )
- 
-             # OPTIMIZATION
-diff --git a/vllm/entrypoints/serve/render/serving.py b/vllm/entrypoints/serve/render/serving.py
-index 967899229..782b2eaea 100644
---- a/vllm/entrypoints/serve/render/serving.py
-+++ b/vllm/entrypoints/serve/render/serving.py
-@@ -164,6 +164,7 @@ class OpenAIServingRender:
-             input_length,
-             self.default_sampling_params,
-             self.override_max_tokens,
-+            truncate_prompt_tokens=request.truncate_prompt_tokens,
-         )
-         params = request.to_sampling_params(max_tokens, self.default_sampling_params)
- 
-@@ -298,6 +299,7 @@ class OpenAIServingRender:
-                 input_length,
-                 self.default_sampling_params,
-                 self.override_max_tokens,
-+                truncate_prompt_tokens=request.truncate_prompt_tokens,
-             )
-             params = request.to_sampling_params(
-                 max_tokens, self.default_sampling_params
-diff --git a/vllm/entrypoints/utils.py b/vllm/entrypoints/utils.py
-index e3682280e..cd1010457 100644
---- a/vllm/entrypoints/utils.py
-+++ b/vllm/entrypoints/utils.py
-@@ -177,7 +177,14 @@ def get_max_tokens(
-     input_length: int,
-     default_sampling_params: dict,
-     override_max_tokens: int | None = None,
-+    truncate_prompt_tokens: int | None = None,
- ) -> int:
-+    if truncate_prompt_tokens is not None:
-+        limit = truncate_prompt_tokens
-+        input_length = min(
-+            input_length,
-+            max_model_len if limit == -1 else limit,
-+        )
-     if max_model_len < input_length:
-         raise ValueError(
-             f"Input length ({input_length}) exceeds model's maximum "
+     @classmethod
+     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+         parallel_config = vllm_config.parallel_config
 -- 
 2.39.5 (Apple Git-154)
 
 
-From 22a3cbe1520bc8a3b19ace0abe497c514b3129ea Mon Sep 17 00:00:00 2001
-From: Divakar Verma <137818590+divakar-amd@users.noreply.github.com>
-Date: Wed, 6 May 2026 12:11:36 -0400
-Subject: [PATCH 03/13] [ROCm] aiter_unified_attn fp8 q scale refactor (#38296)
+From bcfcf45df3984c1f2c5a1fec670cc192a4aea829 Mon Sep 17 00:00:00 2001
+From: Yan Ma <yan.ma@intel.com>
+Date: Tue, 21 Apr 2026 05:54:54 +0000
+Subject: [PATCH 03/17] update minicpm tokenizer attrs for transformers
+ compatibility
 
-Signed-off-by: Divakar Verma <divakar.verma@amd.com>
+Signed-off-by: Yan Ma <yan.ma@intel.com>
 ---
- .../backends/rocm_aiter_unified_attn.py       | 24 +++----------------
- 1 file changed, 3 insertions(+), 21 deletions(-)
+ tests/lora/test_minicpmv_tp.py         | 10 -------
+ vllm/model_executor/models/minicpmv.py | 37 ++++++++++++++++++++++++++
+ 2 files changed, 37 insertions(+), 10 deletions(-)
 
-diff --git a/vllm/v1/attention/backends/rocm_aiter_unified_attn.py b/vllm/v1/attention/backends/rocm_aiter_unified_attn.py
-index 55ed5c5b3..f56b58c43 100644
---- a/vllm/v1/attention/backends/rocm_aiter_unified_attn.py
-+++ b/vllm/v1/attention/backends/rocm_aiter_unified_attn.py
-@@ -200,19 +200,9 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
-         key_cache, value_cache = kv_cache.unbind(0)
+diff --git a/tests/lora/test_minicpmv_tp.py b/tests/lora/test_minicpmv_tp.py
+index 3d6484a71..4c7f4112e 100644
+--- a/tests/lora/test_minicpmv_tp.py
++++ b/tests/lora/test_minicpmv_tp.py
+@@ -1,10 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  
-         softmax_scale = self.scale
--        fp8_post_attn_v_rescale = False
-         if is_quantized_kv_cache(self.kv_cache_dtype):
-             key_cache = key_cache.view(self.fp8_dtype)
-             value_cache = value_cache.view(self.fp8_dtype)
--            # When Q is FP8, triton kernel skips K/V dequant (for fp8xfp8 matmul).
--            # Compensate by absorbing q_scale and k_scale into softmax_scale, and
--            # v_scale into output_scale (or post-multiplying if no fusion).
--            if query.dtype == self.fp8_dtype:
--                softmax_scale = self.scale * layer._q_scale_float * layer._k_scale_float
--                if output_scale is not None:
--                    output_scale = output_scale / layer._v_scale_float
--                else:
--                    fp8_post_attn_v_rescale = True
+-from importlib.metadata import version
  
-         cu_seqlens_q = attn_metadata.query_start_loc
-         seqused_k = attn_metadata.seq_lens
-@@ -220,11 +210,6 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
-         max_seqlen_k = attn_metadata.max_seq_len
-         block_table = attn_metadata.block_table
+ import pytest
+-from packaging.version import Version
  
--        descale_shape = (
--            cu_seqlens_q.shape[0] - 1,
--            key.shape[1] if key is not None else self.num_kv_heads,
--        )
+ import vllm
+ from vllm.assets.image import ImageAsset
+@@ -13,14 +11,6 @@ from vllm.platforms import current_platform
+ 
+ from ..utils import multi_gpu_test
+ 
+-pytestmark = pytest.mark.skipif(
+-    Version("5.0") <= Version(version("transformers")),
+-    reason=(
+-        "MiniCPMV custom processor uses tokenizer.im_start_id which is not "
+-        "available on TokenizersBackend in transformers v5.0+"
+-    ),
+-)
 -
-         self.unified_attention(
-             q=query[:num_actual_tokens],
-             k=key_cache,
-@@ -240,16 +225,13 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
-             window_size=self.sliding_window,
-             block_table=block_table,
-             softcap=self.logits_soft_cap,
--            q_descale=None,  # q_scale absorbed into softmax_scale
--            k_descale=layer._k_scale.expand(descale_shape),
--            v_descale=layer._v_scale.expand(descale_shape),
-+            q_descale=layer._q_scale if query.dtype == self.fp8_dtype else None,
-+            k_descale=layer._k_scale,
-+            v_descale=layer._v_scale,
-             sinks=self.sinks,
-             output_scale=output_scale,
-         )
+ MODEL_PATH = "openbmb/MiniCPM-Llama3-V-2_5"
  
--        if fp8_post_attn_v_rescale:
--            output[:num_actual_tokens].mul_(layer._v_scale_float)
--
-         return output
+ PROMPT_TEMPLATE = (
+diff --git a/vllm/model_executor/models/minicpmv.py b/vllm/model_executor/models/minicpmv.py
+index cda07ea29..f58f98dac 100644
+--- a/vllm/model_executor/models/minicpmv.py
++++ b/vllm/model_executor/models/minicpmv.py
+@@ -98,6 +98,39 @@ from .utils import AutoWeightsLoader, flatten_bn, maybe_prefix
+ # For profile run
+ _MAX_FRAMES_PER_VIDEO = 16
  
-     def do_kv_cache_update(
--- 
-2.39.5 (Apple Git-154)
-
-
-From 27702f6d0879312c011e0180ffd48cbc034380d2 Mon Sep 17 00:00:00 2001
-From: Jing Wang <jingwang96@qq.com>
-Date: Thu, 7 May 2026 02:07:32 +0800
-Subject: [PATCH 04/13] [Bugfix] Fix token loss in PP mode which causes
- degraded accuracy (#41133)
-
-Signed-off-by: Jing Wang <jingwang96@qq.com>
-Co-authored-by: Copilot <175728472+Copilot@users.noreply.github.com>
-Co-authored-by: Wentao Ye <44945378+yewentao256@users.noreply.github.com>
-Co-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>
----
- tests/v1/worker/test_gpu_model_runner.py | 157 +++++++++++++++++++++++
- vllm/v1/worker/gpu_input_batch.py        |   1 +
- vllm/v1/worker/gpu_model_runner.py       |  28 +++-
- 3 files changed, 179 insertions(+), 7 deletions(-)
-
-diff --git a/tests/v1/worker/test_gpu_model_runner.py b/tests/v1/worker/test_gpu_model_runner.py
-index ceea6cacf..4942390cd 100644
---- a/tests/v1/worker/test_gpu_model_runner.py
-+++ b/tests/v1/worker/test_gpu_model_runner.py
-@@ -163,6 +163,34 @@ def _schedule_new_request(*req_ids: str) -> SchedulerOutput:
-     )
- 
- 
-+def _schedule_cached_requests(
-+    req_ids: list[str],
-+    num_scheduled_tokens: dict[str, int],
-+    new_token_ids: list[list[int]],
-+    num_computed_tokens: list[int],
-+    num_output_tokens: list[int],
-+) -> SchedulerOutput:
-+    return SchedulerOutput(
-+        scheduled_new_reqs=[],
-+        scheduled_cached_reqs=CachedRequestData(
-+            req_ids=req_ids,
-+            resumed_req_ids=set(),
-+            new_token_ids=new_token_ids,
-+            all_token_ids={},
-+            new_block_ids=[None] * len(req_ids),
-+            num_computed_tokens=num_computed_tokens,
-+            num_output_tokens=num_output_tokens,
-+        ),
-+        num_scheduled_tokens=num_scheduled_tokens,
-+        total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
-+        scheduled_spec_decode_tokens={},
-+        scheduled_encoder_inputs={},
-+        num_common_prefix_blocks=[],
-+        finished_req_ids=set(),
-+        free_encoder_mm_hashes=[],
-+    )
-+
-+
- def _is_req_scheduled(model_runner, req_id: str) -> bool:
-     return req_id in model_runner.input_batch.req_id_to_index
- 
-@@ -510,6 +538,135 @@ def test_update_states_request_unscheduled(model_runner, dist_init):
-     assert not _is_req_scheduled(model_runner, req_ids[1])
- 
- 
-+def test_update_states_pp_non_async_multi_request_keeps_token_buffers_consistent(
-+    model_runner, model_runner_2, dist_init, monkeypatch
-+):
-+    req_ids = ["req_0", "req_1"]
-+    non_last_runner = model_runner
-+    last_runner = model_runner_2
-+    non_last_runner.use_async_scheduling = False
-+    last_runner.use_async_scheduling = False
-+
-+    # Both ranks start from the same request set.
-+    monkeypatch.setattr(
-+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
-+        lambda: SimpleNamespace(is_last_rank=False, world_size=2),
-+    )
-+    non_last_runner._update_states(_schedule_new_request(*req_ids))
-+    last_runner._update_states(_schedule_new_request(*req_ids))
-+
-+    sampled_by_last_rank = {req_ids[0]: 101, req_ids[1]: 201}
-+    # Emulate last-rank bookkeeping result from previous step:
-+    # sampled tokens already cached in CPU token buffers.
-+    for req_id, token_id in sampled_by_last_rank.items():
-+        req_index = last_runner.input_batch.req_id_to_index[req_id]
-+        start_idx = int(last_runner.input_batch.num_tokens_no_spec[req_index])
-+        end_idx = start_idx + 1
-+        last_runner.input_batch.token_ids_cpu[req_index, start_idx:end_idx] = [token_id]
-+        last_runner.input_batch.is_token_ids[req_index, start_idx:end_idx] = True
-+        last_runner.input_batch.num_tokens_no_spec[req_index] = end_idx
-+        last_runner.requests[req_id].output_token_ids.append(token_id)
-+
-+    scheduler_output = _schedule_cached_requests(
-+        req_ids=req_ids,
-+        num_scheduled_tokens={req_ids[0]: 1, req_ids[1]: 1},
-+        new_token_ids=[[101], [201]],
-+        num_computed_tokens=[3, 3],  # prompt tokens only
-+        num_output_tokens=[1, 1],
-+    )
-+    # non-last rank appends new_token_ids in _update_states.
-+    monkeypatch.setattr(
-+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
-+        lambda: SimpleNamespace(is_last_rank=False, world_size=2),
-+    )
-+    non_last_runner._update_states(scheduler_output)
-+    # last rank should keep its already-bookkept CPU buffers unchanged.
-+    monkeypatch.setattr(
-+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
-+        lambda: SimpleNamespace(is_last_rank=True, world_size=2),
-+    )
-+    last_runner._update_states(scheduler_output)
-+
-+    # Verify consistency between PP ranks after _update_states.
-+    for req_id in req_ids:
-+        non_last_idx = non_last_runner.input_batch.req_id_to_index[req_id]
-+        last_idx = last_runner.input_batch.req_id_to_index[req_id]
-+        non_last_len = int(non_last_runner.input_batch.num_tokens_no_spec[non_last_idx])
-+        last_len = int(last_runner.input_batch.num_tokens_no_spec[last_idx])
-+        assert non_last_len == last_len
-+        assert (
-+            non_last_runner.input_batch.token_ids_cpu[
-+                non_last_idx, :non_last_len
-+            ].tolist()
-+            == last_runner.input_batch.token_ids_cpu[last_idx, :last_len].tolist()
-+        )
-+
-+
-+def test_update_states_pp_async_multi_request_keeps_rank_state_consistent(
-+    model_runner, model_runner_2, dist_init, monkeypatch
-+):
-+    req_ids = ["req_0", "req_1"]
-+    non_last_runner = model_runner
-+    last_runner = model_runner_2
-+    non_last_runner.use_async_scheduling = True
-+    last_runner.use_async_scheduling = True
-+
-+    # Both ranks start from the same request set.
-+    monkeypatch.setattr(
-+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
-+        lambda: SimpleNamespace(is_last_rank=False, world_size=2),
-+    )
-+    non_last_runner._update_states(_schedule_new_request(*req_ids))
-+    last_runner._update_states(_schedule_new_request(*req_ids))
-+
-+    # Simulate async previous-step sampled tokens known on both ranks.
-+    # non-last rank may receive them via PP communication; last rank has
-+    # them from local sampling/bookkeeping.
-+    sampled_by_last_rank = {req_ids[0]: 111, req_ids[1]: 222}
-+    for runner in (non_last_runner, last_runner):
-+        for req_id, token_id in sampled_by_last_rank.items():
-+            req_index = runner.input_batch.req_id_to_index[req_id]
-+            start_idx = int(runner.input_batch.num_tokens_no_spec[req_index])
-+            end_idx = start_idx + 1
-+            runner.input_batch.token_ids_cpu[req_index, start_idx:end_idx] = [token_id]
-+            runner.input_batch.is_token_ids[req_index, start_idx:end_idx] = True
-+            runner.input_batch.num_tokens_no_spec[req_index] = end_idx
-+            runner.requests[req_id].output_token_ids.append(token_id)
-+
-+    scheduler_output = _schedule_cached_requests(
-+        req_ids=req_ids,
-+        num_scheduled_tokens={req_ids[0]: 1, req_ids[1]: 1},
-+        new_token_ids=[],
-+        num_computed_tokens=[4, 4],
-+        num_output_tokens=[1, 1],
-+    )
-+    # non-last rank: async PP branch (new_token_ids empty).
-+    monkeypatch.setattr(
-+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
-+        lambda: SimpleNamespace(is_last_rank=False, world_size=2),
-+    )
-+    non_last_runner._update_states(scheduler_output)
-+    # last rank: keep already-bookkept state aligned with scheduler view.
-+    monkeypatch.setattr(
-+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
-+        lambda: SimpleNamespace(is_last_rank=True, world_size=2),
-+    )
-+    last_runner._update_states(scheduler_output)
-+
-+    for req_id in req_ids:
-+        non_last_idx = non_last_runner.input_batch.req_id_to_index[req_id]
-+        last_idx = last_runner.input_batch.req_id_to_index[req_id]
-+        non_last_len = int(non_last_runner.input_batch.num_tokens_no_spec[non_last_idx])
-+        last_len = int(last_runner.input_batch.num_tokens_no_spec[last_idx])
-+        assert non_last_len == last_len
-+        assert (
-+            non_last_runner.input_batch.token_ids_cpu[
-+                non_last_idx, :non_last_len
-+            ].tolist()
-+            == last_runner.input_batch.token_ids_cpu[last_idx, :last_len].tolist()
-+        )
-+
-+
- def test_kv_cache_stride_order(monkeypatch, model_runner):
-     # This test checks if GPUModelRunner initializes correctly when an attention
-     # backend enforces a non-default KV cache stride order.
-diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
-index 44e0efaaa..e9de08342 100644
---- a/vllm/v1/worker/gpu_input_batch.py
-+++ b/vllm/v1/worker/gpu_input_batch.py
-@@ -504,6 +504,7 @@ class InputBatch:
-         start_index = self.num_tokens_no_spec[req_index]
-         end_token_index = start_index + num_spec_tokens
-         self.token_ids_cpu[req_index, start_index:end_token_index] = spec_token_ids
-+        self.is_token_ids[req_index, start_index:end_token_index] = True
-         cur_spec_token_ids.extend(spec_token_ids)
- 
-     def remove_request(self, req_id: str) -> int | None:
-diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index eef55957a..f712f2c49 100644
---- a/vllm/v1/worker/gpu_model_runner.py
-+++ b/vllm/v1/worker/gpu_model_runner.py
-@@ -1347,13 +1347,27 @@ class GPUModelRunner(
-             # For the last rank, we don't need to update the token_ids_cpu
-             # because the sampled tokens are already cached.
-             if not is_last_rank:
--                # Add new_token_ids to token_ids_cpu.
--                start_token_index = num_computed_tokens
--                end_token_index = num_computed_tokens + len(new_token_ids)
--                self.input_batch.token_ids_cpu[
--                    req_index, start_token_index:end_token_index
--                ] = new_token_ids
--                self.input_batch.num_tokens_no_spec[req_index] = end_token_index
-+                start_token_index = self.input_batch.num_tokens_no_spec[req_index]
-+                # For chunked prefill, num_computed_tokens may less
-+                # than num_tokens_no_spec.
-+                # Async scheduled PP: no new_token_ids, advance num_tokens_no_spec
-+                # according to num_computed_tokens.
-+                end_token_index = max(
-+                    start_token_index,
-+                    num_computed_tokens + len(new_token_ids),
-+                )
-+                if end_token_index > start_token_index:
-+                    if new_token_ids:
-+                        # Add new_token_ids to token_ids_cpu.
-+                        num_new_tokens = end_token_index - start_token_index
-+                        tokens_to_append = new_token_ids[-num_new_tokens:]
-+                        self.input_batch.token_ids_cpu[
-+                            req_index, start_token_index:end_token_index
-+                        ] = tokens_to_append
-+                    self.input_batch.is_token_ids[
-+                        req_index, start_token_index:end_token_index
-+                    ] = True
-+                    self.input_batch.num_tokens_no_spec[req_index] = end_token_index
- 
-             # Add spec_token_ids to token_ids_cpu.
-             self.input_batch.update_req_spec_token_ids(req_state, scheduled_spec_tokens)
--- 
-2.39.5 (Apple Git-154)
-
-
-From 38e16678ba7ec8417ce87f7010a03d203ee64b2b Mon Sep 17 00:00:00 2001
-From: Benjamin Chislett <bchislett@nvidia.com>
-Date: Wed, 6 May 2026 14:17:02 -0400
-Subject: [PATCH 05/13] [Bugfix] Align block table for TRTLLM MLA edge-case
- (#39324)
-
-Signed-off-by: Benjamin Chislett <bchislett@nvidia.com>
----
- vllm/v1/worker/block_table.py     | 7 +++++++
- vllm/v1/worker/gpu/block_table.py | 5 +++++
- 2 files changed, 12 insertions(+)
-
-diff --git a/vllm/v1/worker/block_table.py b/vllm/v1/worker/block_table.py
-index f46e8a8ed..87a2aac9d 100644
---- a/vllm/v1/worker/block_table.py
-+++ b/vllm/v1/worker/block_table.py
-@@ -257,6 +257,13 @@ class MultiGroupBlockTable:
-                 f"must match block_sizes length ({len(block_sizes)})"
-             )
- 
-+        # Align to a multiple of (128 / block_size) as required
-+        # by some attention backends such as TRTLLM (#39324)
-+        max_num_blocks = [
-+            cdiv(n, 128 // bs) * (128 // bs) if bs <= 128 else n
-+            for n, bs in zip(max_num_blocks, block_sizes)
-+        ]
-+
-         self.block_tables = [
-             BlockTable(
-                 block_size,
-diff --git a/vllm/v1/worker/gpu/block_table.py b/vllm/v1/worker/gpu/block_table.py
-index d2a2a6aed..3061278b0 100644
---- a/vllm/v1/worker/gpu/block_table.py
-+++ b/vllm/v1/worker/gpu/block_table.py
-@@ -41,6 +41,11 @@ class BlockTables:
-             # As a result, one block on the current rank covers `block_size * cp_size`
-             # tokens in the full, global (unsharded) sequence.
-             max_num_blocks = cdiv(self.max_model_len, block_size * self.cp_size)
-+            # Align to a multiple of (128 / block_size) as required
-+            # by some attention backends such as TRTLLM (#39324)
-+            if block_size <= 128:
-+                alignment = 128 // block_size
-+                max_num_blocks = cdiv(max_num_blocks, alignment) * alignment
-             block_table = StagedWriteTensor(
-                 (self.max_num_reqs, max_num_blocks),
-                 dtype=torch.int32,
--- 
-2.39.5 (Apple Git-154)
-
-
-From ca3e62d3363d3f8f5470b351ebfc48fa1826e687 Mon Sep 17 00:00:00 2001
-From: Johnny Yang <24908445+jcyang43@users.noreply.github.com>
-Date: Wed, 6 May 2026 11:41:37 -0700
-Subject: [PATCH 06/13] Upgrade tpu-inference to v0.19.0 (#41844)
-
-Signed-off-by: Johnny Yang <johnnyyang@google.com>
----
- requirements/tpu.txt | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/requirements/tpu.txt b/requirements/tpu.txt
-index cee9fa657..f1074e4a6 100644
---- a/requirements/tpu.txt
-+++ b/requirements/tpu.txt
-@@ -11,4 +11,4 @@ ray[default]
- ray[data]
- setuptools==78.1.0
- nixl==0.3.0
--tpu-inference==0.18.0
-+tpu-inference==0.19.0
--- 
-2.39.5 (Apple Git-154)
-
-
-From f3f8efa73a49ec87d6a22fe268d0abde503497d7 Mon Sep 17 00:00:00 2001
-From: Flora Feng <4florafeng@gmail.com>
-Date: Wed, 6 May 2026 16:25:34 -0400
-Subject: [PATCH 07/13] [CI] Enable gemma4 parser test on CI (#41857)
-
-Signed-off-by: sfeng33 <4florafeng@gmail.com>
----
- .buildkite/test-amd.yaml        | 3 ++-
- .buildkite/test_areas/misc.yaml | 2 +-
- 2 files changed, 3 insertions(+), 2 deletions(-)
-
-diff --git a/.buildkite/test-amd.yaml b/.buildkite/test-amd.yaml
-index 5b3eb4f79..ae0c01592 100644
---- a/.buildkite/test-amd.yaml
-+++ b/.buildkite/test-amd.yaml
-@@ -931,6 +931,7 @@ steps:
-   - tests/renderers
-   - tests/standalone_tests/lazy_imports.py
-   - tests/tokenizers_
-+  - tests/reasoning
-   - tests/tool_parsers
-   - tests/transformers_utils
-   - tests/config
-@@ -943,7 +944,7 @@ steps:
-   - pytest -v -s -m 'cpu_test' multimodal
-   - pytest -v -s renderers
-   - pytest -v -s tokenizers_
--  - pytest -v -s reasoning --ignore=reasoning/test_seedoss_reasoning_parser.py --ignore=reasoning/test_glm4_moe_reasoning_parser.py --ignore=reasoning/test_gemma4_reasoning_parser.py
-+  - pytest -v -s reasoning --ignore=reasoning/test_seedoss_reasoning_parser.py --ignore=reasoning/test_glm4_moe_reasoning_parser.py
-   - pytest -v -s tool_parsers
-   - pytest -v -s transformers_utils
-   - pytest -v -s config
-diff --git a/.buildkite/test_areas/misc.yaml b/.buildkite/test_areas/misc.yaml
-index 0e6e70959..c34d4c10b 100644
---- a/.buildkite/test_areas/misc.yaml
-+++ b/.buildkite/test_areas/misc.yaml
-@@ -190,7 +190,7 @@ steps:
-   - pytest -v -s -m 'cpu_test' multimodal
-   - pytest -v -s renderers
-   - pytest -v -s tokenizers_
--  - pytest -v -s reasoning --ignore=reasoning/test_seedoss_reasoning_parser.py --ignore=reasoning/test_glm4_moe_reasoning_parser.py --ignore=reasoning/test_gemma4_reasoning_parser.py
-+  - pytest -v -s reasoning --ignore=reasoning/test_seedoss_reasoning_parser.py --ignore=reasoning/test_glm4_moe_reasoning_parser.py
-   - pytest -v -s tool_parsers
-   - pytest -v -s transformers_utils
-   - pytest -v -s config
--- 
-2.39.5 (Apple Git-154)
-
-
-From deb737e323b3c2bf7986b2225ba76e32b4b097f2 Mon Sep 17 00:00:00 2001
-From: JackyLiu <lzwgre@126.com>
-Date: Wed, 6 May 2026 17:17:56 -0400
-Subject: [PATCH 08/13] =?UTF-8?q?[Doc]=20Add=20ModernBertForSequenceClassi?=
- =?UTF-8?q?fication=20to=20scoring.md=20cross-en=E2=80=A6=20(#41832)?=
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-Signed-off-by: JLiu4Coding <lzwgre@126.com>
----
- docs/models/pooling_models/scoring.md | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/docs/models/pooling_models/scoring.md b/docs/models/pooling_models/scoring.md
-index a4424642c..baaf15f14 100644
---- a/docs/models/pooling_models/scoring.md
-+++ b/docs/models/pooling_models/scoring.md
-@@ -41,6 +41,7 @@ The score models is designed to compute similarity scores between two input prom
- | `GemmaForSequenceClassification` | Gemma-based | `BAAI/bge-reranker-v2-gemma`(see note), etc. | [bge-reranker-v2-gemma.jinja](../../../examples/pooling/score/template/bge-reranker-v2-gemma.jinja) | ✅︎ | ✅︎ |
- | `GteNewForSequenceClassification` | mGTE-TRM (see note) | `Alibaba-NLP/gte-multilingual-reranker-base`, etc. | N/A | | |
- | `LlamaBidirectionalForSequenceClassification`<sup>C</sup> | Llama-based with bidirectional attention | `nvidia/llama-nemotron-rerank-1b-v2`, etc. | [nemotron-rerank.jinja](../../../examples/pooling/score/template/nemotron-rerank.jinja) | ✅︎ | ✅︎ |
-+| `ModernBertForSequenceClassification` | ModernBERT-based | `Alibaba-NLP/gte-reranker-modernbert-base`, etc. | N/A | | |
- | `Qwen2ForSequenceClassification`<sup>C</sup> | Qwen2-based | `mixedbread-ai/mxbai-rerank-base-v2`(see note), etc. | [mxbai_rerank_v2.jinja](../../../examples/pooling/score/template/mxbai_rerank_v2.jinja) | ✅︎ | ✅︎ |
- | `Qwen3ForSequenceClassification`<sup>C</sup> | Qwen3-based | `tomaarsen/Qwen3-Reranker-0.6B-seq-cls`, `Qwen/Qwen3-Reranker-0.6B`(see note), etc. | [qwen3_reranker.jinja](../../../examples/pooling/score/template/qwen3_reranker.jinja) | ✅︎ | ✅︎ |
- | `RobertaForSequenceClassification` | RoBERTa-based | `cross-encoder/quora-roberta-base`, etc. | N/A | | |
--- 
-2.39.5 (Apple Git-154)
-
-
-From 50acdc5b5cc00f10408d8f98b21fc97efc615173 Mon Sep 17 00:00:00 2001
-From: xy3 <120182408@qq.com>
-Date: Thu, 7 May 2026 05:22:01 +0800
-Subject: [PATCH 09/13] Fix Qwen3 streaming content routing (#40820)
-
-Signed-off-by: xy3 <120182408@qq.com>
-Signed-off-by: sfeng33 <4florafeng@gmail.com>
-Co-authored-by: sfeng33 <4florafeng@gmail.com>
----
- .../test_thinking_token_budget.py             |  44 +++++
- tests/parser/__init__.py                      |   2 +
- tests/parser/test_streaming.py                | 165 ++++++++++++++++++
- vllm/parser/abstract_parser.py                |  16 +-
- 4 files changed, 220 insertions(+), 7 deletions(-)
- create mode 100644 tests/parser/__init__.py
- create mode 100644 tests/parser/test_streaming.py
-
-diff --git a/tests/entrypoints/openai/chat_completion/test_thinking_token_budget.py b/tests/entrypoints/openai/chat_completion/test_thinking_token_budget.py
-index d7a601114..ae2b597e1 100644
---- a/tests/entrypoints/openai/chat_completion/test_thinking_token_budget.py
-+++ b/tests/entrypoints/openai/chat_completion/test_thinking_token_budget.py
-@@ -287,3 +287,47 @@ async def test_thinking_token_budget_qwen35_fp8_mtp_concurrent_mixed_budget_and_
-                 f"index {i}: reasoning decode token ids ({n_reason}) != "
-                 f"thinking_token_budget ({expected_budget})"
-             )
-+
-+
-+@pytest.mark.asyncio
-+@pytest.mark.parametrize("client", ["default", "auto_config"], indirect=True)
-+async def test_streaming_with_thinking_disabled_stays_in_content(
-+    client: openai.AsyncOpenAI,
-+):
-+    request_kwargs = {
-+        "model": MODEL_NAME,
-+        "messages": [
-+            {
-+                "role": "user",
-+                "content": "Which is larger, 4 or 12?"
-+                " Output exactly one token: 4 or 12.",
-+            }
-+        ],
-+        "max_tokens": 16,
-+        "temperature": 0.0,
-+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
-+    }
-+
-+    response = await client.chat.completions.create(**request_kwargs)
-+    message = response.choices[0].message
-+    assert message.content is not None and message.content.strip() != ""
-+    assert getattr(message, "reasoning", None) in (None, "")
-+
-+    stream = await client.chat.completions.create(
-+        **request_kwargs,
-+        stream=True,
-+    )
-+
-+    content_chunks = []
-+    reasoning_chunks = []
-+    async for chunk in stream:
-+        if not chunk.choices:
-+            continue
-+        delta = chunk.choices[0].delta
-+        if getattr(delta, "content", None):
-+            content_chunks.append(delta.content)
-+        if getattr(delta, "reasoning", None):
-+            reasoning_chunks.append(delta.reasoning)
-+
-+    assert "".join(content_chunks).strip() != ""
-+    assert reasoning_chunks == []
-diff --git a/tests/parser/__init__.py b/tests/parser/__init__.py
-new file mode 100644
-index 000000000..208f01a7c
---- /dev/null
-+++ b/tests/parser/__init__.py
-@@ -0,0 +1,2 @@
-+# SPDX-License-Identifier: Apache-2.0
-+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-diff --git a/tests/parser/test_streaming.py b/tests/parser/test_streaming.py
-new file mode 100644
-index 000000000..d9194d48e
---- /dev/null
-+++ b/tests/parser/test_streaming.py
-@@ -0,0 +1,165 @@
-+# SPDX-License-Identifier: Apache-2.0
-+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-+
-+import json
-+
-+import pytest
-+
-+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
-+from vllm.entrypoints.openai.engine.protocol import DeltaMessage
-+from vllm.parser.abstract_parser import _WrappedParser
-+from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
-+from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
-+
-+
-+class ThinkReasoningParser(BaseThinkingReasoningParser):
-+    @property
-+    def start_token(self) -> str:
-+        return "<think>"
-+
-+    @property
-+    def end_token(self) -> str:
-+        return "</think>"
-+
-+
-+MODEL_OUTPUT = (
-+    "<think>let me think about this</think>"
-+    '<tool_call>\n{"name": "get_weather", '
-+    '"arguments": {"city": "Dallas"}}\n</tool_call>'
++_MINICPM_TOKENIZER_ID_ATTRS = (
++    ("im_start_id", "im_start_token", "<image>"),
++    ("im_end_id", "im_end_token", "</image>"),
++    ("slice_start_id", "slice_start_token", "<slice>"),
++    ("slice_end_id", "slice_end_token", "</slice>"),
 +)
 +
 +
-+@pytest.fixture(scope="module")
-+def tokenizer():
-+    from vllm.tokenizers import get_tokenizer
++def _ensure_minicpm_tokenizer_compat(
++    tokenizer: object,
++    image_processor: object,
++) -> None:
++    convert_tokens_to_ids = getattr(tokenizer, "convert_tokens_to_ids", None)
++    if not callable(convert_tokens_to_ids):
++        return
 +
-+    return get_tokenizer("Qwen/Qwen3-32B")
++    unk_token = getattr(tokenizer, "unk_token", None)
++    unk_token_id = getattr(tokenizer, "unk_token_id", None)
 +
++    for attr_name, proc_attr_name, default_token in _MINICPM_TOKENIZER_ID_ATTRS:
++        if hasattr(tokenizer, attr_name):
++            continue
 +
-+@pytest.fixture
-+def request_obj():
-+    return ChatCompletionRequest(
-+        model="test-model",
-+        messages=[{"role": "user", "content": "hi"}],
-+    )
++        token = getattr(image_processor, proc_attr_name, default_token)
++        token_id = convert_tokens_to_ids(token)
 +
++        if not isinstance(token_id, int):
++            continue
++        if token != unk_token and token_id == unk_token_id:
++            continue
 +
-+def make_parser(tokenizer, reasoning=False, tool=False):
-+    _WrappedParser.reasoning_parser_cls = ThinkReasoningParser if reasoning else None
-+    _WrappedParser.tool_parser_cls = Hermes2ProToolParser if tool else None
-+    return _WrappedParser(tokenizer)
++        setattr(tokenizer, attr_name, token_id)
 +
+ 
+ class MiniCPMVImagePixelInputs(TensorSchema):
+     """
+@@ -551,6 +584,10 @@ class MiniCPMVProcessingInfo(BaseProcessingInfo):
+             if isinstance(val, np.ndarray):
+                 setattr(image_processor, attr, val.tolist())
+ 
++        tokenizer = getattr(hf_processor, "tokenizer", None)
++        if tokenizer is not None:
++            _ensure_minicpm_tokenizer_compat(tokenizer, image_processor)
 +
-+def stream_text(parser, tokenizer, text, request, prompt_token_ids=None):
-+    token_ids = tokenizer.encode(text, add_special_tokens=False)
-+    results: list[DeltaMessage | None] = []
-+    for tid in token_ids:
-+        delta_text = tokenizer.decode([tid])
-+        result = parser.parse_delta(
-+            delta_text, [tid], request, prompt_token_ids=prompt_token_ids
+         return hf_processor
+ 
+     def get_image_processor(self, **kwargs: object):
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 615db8b4c437401fc968737f34b717a37d8c81b2 Mon Sep 17 00:00:00 2001
+From: Yan Ma <yan.ma@intel.com>
+Date: Fri, 15 May 2026 04:59:32 +0000
+Subject: [PATCH 04/17] cherry-pick kv cache offloading - 36423
+
+Signed-off-by: Yan Ma <yan.ma@intel.com>
+---
+ vllm/_custom_ops.py                           |  9 ++++--
+ vllm/v1/kv_offload/cpu/gpu_worker.py          | 31 +++++++++++++------
+ .../kv_offload/cpu/shared_offload_region.py   | 16 ++++++----
+ vllm/v1/kv_offload/cpu/spec.py                |  2 +-
+ 4 files changed, 38 insertions(+), 20 deletions(-)
+
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index 553513de6..2a4edb703 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -2821,9 +2821,12 @@ def swap_blocks_batch(
+         writing to the source. Defaults to False (STREAM ordering), which
+         is always safe.
+     """
+-    torch.ops._C_cache_ops.swap_blocks_batch(
+-        src_ptrs, dst_ptrs, sizes, is_src_access_order_any
+-    )
++    if current_platform.is_xpu():
++        torch.ops._C_cache_ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes)
++    else:
++        torch.ops._C_cache_ops.swap_blocks_batch(
++            src_ptrs, dst_ptrs, sizes, is_src_access_order_any
 +        )
-+        prompt_token_ids = None
-+        results.append(result)
-+    return results
-+
-+
-+def collect_fields(results):
-+    all_reasoning = "".join(r.reasoning for r in results if r and r.reasoning)
-+    all_content = "".join(r.content for r in results if r and r.content)
-+    all_tool_calls = [tc for r in results if r and r.tool_calls for tc in r.tool_calls]
-+    return all_reasoning, all_content, all_tool_calls
-+
-+
-+def test_parse_delta_neither_parser(tokenizer, request_obj):
-+    parser = make_parser(tokenizer, reasoning=False, tool=False)
-+    results = stream_text(
-+        parser, tokenizer, MODEL_OUTPUT, request_obj, prompt_token_ids=[]
-+    )
-+    reasoning, content, tool_calls = collect_fields(results)
-+
-+    assert reasoning == ""
-+    assert len(tool_calls) == 0
-+    assert "<think>" in content
-+    assert "let me think about this" in content
-+    assert "<tool_call>" in content
-+    assert "get_weather" in content
-+
-+
-+def test_parse_delta_tool_parser_only(tokenizer, request_obj):
-+    parser = make_parser(tokenizer, reasoning=False, tool=True)
-+    results = stream_text(
-+        parser, tokenizer, MODEL_OUTPUT, request_obj, prompt_token_ids=[]
-+    )
-+    reasoning, content, tool_calls = collect_fields(results)
-+
-+    assert reasoning == ""
-+    assert "<think>" in content
-+    assert "let me think about this" in content
-+    assert "</think>" in content
-+
-+    assert len(tool_calls) > 0
-+    assert tool_calls[0].function.name == "get_weather"
-+    tool_args = "".join(
-+        tc.function.arguments for tc in tool_calls if tc.function.arguments
-+    )
-+    assert json.loads(tool_args) == {"city": "Dallas"}
-+
-+
-+def test_parse_delta_reasoning_parser_only(tokenizer, request_obj):
-+    parser = make_parser(tokenizer, reasoning=True, tool=False)
-+    results = stream_text(
-+        parser, tokenizer, MODEL_OUTPUT, request_obj, prompt_token_ids=[]
-+    )
-+    reasoning, content, tool_calls = collect_fields(results)
-+
-+    assert "let me think about this" in reasoning
-+    assert len(tool_calls) == 0
-+    assert "<tool_call>" in content
-+    assert "get_weather" in content
-+    assert "</tool_call>" in content
-+
-+
-+def test_parse_delta_both_parsers(tokenizer, request_obj):
-+    parser = make_parser(tokenizer, reasoning=True, tool=True)
-+    results = stream_text(
-+        parser, tokenizer, MODEL_OUTPUT, request_obj, prompt_token_ids=[]
-+    )
-+    reasoning, content, tool_calls = collect_fields(results)
-+
-+    assert "let me think about this" in reasoning
-+    assert content == ""
-+
-+    assert len(tool_calls) > 0
-+    assert tool_calls[0].function.name == "get_weather"
-+    tool_args = "".join(
-+        tc.function.arguments for tc in tool_calls if tc.function.arguments
-+    )
-+    assert json.loads(tool_args) == {"city": "Dallas"}
-+
-+
-+def test_parse_delta_reasoning_only_thinking_disabled(tokenizer, request_obj):
-+    """Regression test for vllm-project/vllm#40466.
-+
-+    When enable_thinking=False, the chat template places <think>\\n\\n</think>
-+    in the prompt. The model then generates pure content (no think tokens).
-+    All streaming output must go to delta.content, not delta.reasoning.
-+    """
-+    parser = make_parser(tokenizer, reasoning=True, tool=False)
-+
-+    end_token_id = parser._reasoning_parser.end_token_id
-+    prompt_token_ids = [1, 2, end_token_id, 3]
-+
-+    content_text = "Hello! How can I assist you today?"
-+    results = stream_text(
-+        parser,
-+        tokenizer,
-+        content_text,
-+        request_obj,
-+        prompt_token_ids=prompt_token_ids,
-+    )
-+    reasoning, content, tool_calls = collect_fields(results)
-+
-+    assert reasoning == "", f"Expected no reasoning, got: {reasoning!r}"
-+    assert "Hello" in content
-+    assert "assist" in content
-+    assert len(tool_calls) == 0
-diff --git a/vllm/parser/abstract_parser.py b/vllm/parser/abstract_parser.py
-index 03b9f211d..1b861dcad 100644
---- a/vllm/parser/abstract_parser.py
-+++ b/vllm/parser/abstract_parser.py
-@@ -636,15 +636,11 @@ class DelegatingParser(Parser):
-     def _in_reasoning_phase(self, state: StreamState) -> bool:
-         if self._reasoning_parser is None:
-             return False
--        if self._tool_parser is None:
--            return True
-         return not state.reasoning_ended
  
-     def _in_tool_call_phase(self, state: StreamState) -> bool:
-         if self._tool_parser is None:
-             return False
--        if self._reasoning_parser is None:
--            return True
-         return state.reasoning_ended
  
-     def parse_delta(
-@@ -658,7 +654,9 @@ class DelegatingParser(Parser):
+ def convert_fp8(
+diff --git a/vllm/v1/kv_offload/cpu/gpu_worker.py b/vllm/v1/kv_offload/cpu/gpu_worker.py
+index 2da3f1038..1572137fc 100644
+--- a/vllm/v1/kv_offload/cpu/gpu_worker.py
++++ b/vllm/v1/kv_offload/cpu/gpu_worker.py
+@@ -9,6 +9,7 @@ import torch
  
-         if not state.prompt_reasoning_checked and prompt_token_ids is not None:
-             state.prompt_reasoning_checked = True
--            if self.is_reasoning_end(prompt_token_ids):
-+            if self._reasoning_parser is None or self.is_reasoning_end(
-+                prompt_token_ids
-+            ):
-                 state.reasoning_ended = True
+ from vllm import _custom_ops as ops
+ from vllm.logger import init_logger
++from vllm.platforms import current_platform
+ from vllm.utils.math_utils import cdiv
+ from vllm.utils.platform_utils import is_pin_memory_available
+ from vllm.v1.kv_offload.base import (
+@@ -70,16 +71,16 @@ def compute_sub_block_ptrs(
  
-         current_text = state.previous_text + delta_text
-@@ -709,8 +707,12 @@ class DelegatingParser(Parser):
+     if block_size_factor == 1:
+         # Fast path: 1:1 mapping, no sub-block expansion needed.
+-        output[:] = base_ptr + block_ids[:num_sub_blocks] * row_stride
++        output[:] = base_ptr + block_ids.astype(np.uint64)[:num_sub_blocks] * row_stride
+         return
+ 
+     # Vectorized expansion for block_size_factor > 1.
+     assert tensor.shape[1] % block_size_factor == 0
+     sub_block_size = tensor.shape[1] // block_size_factor
+-    sub_offsets = np.arange(block_size_factor, dtype=np.int64) * sub_block_size
++    sub_offsets = np.arange(block_size_factor, dtype=np.uint64) * sub_block_size
+     # (num_blocks, 1) + (1, block_size_factor) -> (num_blocks, block_size_factor)
+     all_ptrs = (
+-        base_ptr + block_ids.astype(np.int64)[:, np.newaxis] * row_stride
++        base_ptr + block_ids.astype(np.uint64)[:, np.newaxis] * row_stride
+     ) + sub_offsets[np.newaxis, :]
+     # Flatten and apply skip_count / truncation
+     flat = all_ptrs.ravel()
+@@ -88,6 +89,14 @@ def compute_sub_block_ptrs(
+ 
+ def pin_mmap_region(region: SharedOffloadRegion) -> None:
+     """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
++    if not current_platform.is_cuda_alike():
++        logger.info(
++            "Skipping mmap host registration on %s; cudaHostRegister is only "
++            "available on CUDA/ROCm.",
++            current_platform.device_name,
++        )
++        return
++
+     rank = region.rank
+ 
+     base_ptr = region._base.data_ptr()
+@@ -144,7 +153,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
+         for gpu_tensor, cpu_tensor in zip(gpu_tensors, cpu_tensors):
+             assert gpu_tensor.dtype == torch.int8
+             assert gpu_tensor.ndim == 2
+-            assert gpu_tensor.is_cuda
++            assert gpu_tensor.is_cuda or gpu_tensor.is_xpu
+             assert cpu_tensor.dtype == torch.int8
+             assert cpu_tensor.ndim == 2
+             assert cpu_tensor.device.type == "cpu"
+@@ -224,9 +233,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
+         ):
+             num_copy_ops += group_size * len(group_data_refs)
+ 
+-        all_src = np.empty(num_copy_ops, dtype=np.int64)
+-        all_dst = np.empty(num_copy_ops, dtype=np.int64)
+-        all_sizes = np.empty(num_copy_ops, dtype=np.int64)
++        all_src = np.empty(num_copy_ops, dtype=np.uint64)
++        all_dst = np.empty(num_copy_ops, dtype=np.uint64)
++        all_sizes = np.empty(num_copy_ops, dtype=np.uint64)
+ 
+         src_offset = 0
+         dst_offset = 0
+@@ -293,7 +302,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
+         batch_dst = torch.from_numpy(all_dst)
+         batch_sizes = torch.from_numpy(all_sizes)
+ 
+-        stream = self._stream_pool.pop() if self._stream_pool else torch.cuda.Stream()
++        stream = (
++            self._stream_pool.pop() if self._stream_pool else current_platform.Stream()
++        )
+         start_event = (
+             self._event_pool.pop()
+             if self._event_pool
+@@ -307,7 +318,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
+ 
+         if self.gpu_to_cpu:
+             # wait for model computation to finish before offloading
+-            stream.wait_stream(torch.cuda.current_stream())
++            stream.wait_stream(current_platform.current_stream())
+         if self._transfers:
+             last_transfer: Transfer = self._transfers[-1]
+             last_event = last_transfer.end_event
+@@ -320,7 +331,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
+         # writing; we must keep STREAM ordering so source reads are gated
+         # by the transfer stream's wait_stream(compute) barrier.
+         is_src_access_order_any = not self.gpu_to_cpu
+-        with torch.cuda.stream(stream):
++        with current_platform.stream(stream):
+             start_event.record(stream)
+             if num_copy_ops > 0:
+                 ops.swap_blocks_batch(
+diff --git a/vllm/v1/kv_offload/cpu/shared_offload_region.py b/vllm/v1/kv_offload/cpu/shared_offload_region.py
+index b2e21d06c..6dd7f1224 100644
+--- a/vllm/v1/kv_offload/cpu/shared_offload_region.py
++++ b/vllm/v1/kv_offload/cpu/shared_offload_region.py
+@@ -7,6 +7,7 @@ import time
+ import torch
+ 
+ from vllm.logger import init_logger
++from vllm.platforms import current_platform
+ 
+ logger = init_logger(__name__)
+ 
+@@ -155,12 +156,15 @@ class SharedOffloadRegion:
+ 
+     def cleanup(self) -> None:
+         if self.is_pinned and self._base is not None:
+-            base_ptr = self._base.data_ptr()
+-            result = torch.cuda.cudart().cudaHostUnregister(base_ptr)
+-            if result.value != 0:
+-                logger.warning(
+-                    "cudaHostUnregister failed for rank=%d (code=%d)", self.rank, result
+-                )
++            if current_platform.is_cuda_alike():
++                base_ptr = self._base.data_ptr()
++                result = torch.cuda.cudart().cudaHostUnregister(base_ptr)
++                if result.value != 0:
++                    logger.warning(
++                        "cudaHostUnregister failed for rank=%d (code=%d)",
++                        self.rank,
++                        result,
++                    )
+             self.is_pinned = False
+         # Release views before _base: each view holds a _base reference and a
+         # direct StorageImpl reference.  Freeing views first lets both refcounts
+diff --git a/vllm/v1/kv_offload/cpu/spec.py b/vllm/v1/kv_offload/cpu/spec.py
+index 54046d98f..1c147b07a 100644
+--- a/vllm/v1/kv_offload/cpu/spec.py
++++ b/vllm/v1/kv_offload/cpu/spec.py
+@@ -86,7 +86,7 @@ class CPUOffloadingSpec(OffloadingSpec):
+         self, kv_caches: CanonicalKVCaches
+     ) -> Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec], OffloadingHandler]]:
+         if not self._handlers:
+-            if not current_platform.is_cuda_alike():
++            if not (current_platform.is_cuda_alike() or current_platform.is_xpu()):
+                 raise Exception(
+                     "CPU Offloading is currently only supported on CUDA-alike GPUs"
                  )
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 49c9d2d52299e7ffeb2d02c3f07e3f122d2b30e6 Mon Sep 17 00:00:00 2001
+From: Qiming Zhang <qiming1.zhang@intel.com>
+Date: Tue, 5 May 2026 22:24:32 -0700
+Subject: [PATCH 05/17] Add XPU path to FusedMoEKernelModularImpl (#180)
+
+Signed-off-by: mayuyuace <qiming1.zhang@intel.com>
+---
+ .../layers/fused_moe/modular_kernel.py        | 20 +++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/vllm/model_executor/layers/fused_moe/modular_kernel.py b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+index 135a677ff..941d22f3d 100644
+--- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
++++ b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+@@ -1398,6 +1398,26 @@ class FusedMoEKernelModularImpl:
+         if global_num_experts == -1:
+             global_num_experts = local_num_experts
+ 
++        if current_platform.is_xpu():
++            self.fused_experts.apply(
++                output=output,
++                hidden_states=hidden_states,
++                w1=w1,
++                w2=w2,
++                topk_weights=topk_weights,
++                topk_ids=topk_ids,
++                activation=activation,
++                global_num_experts=global_num_experts,
++                expert_map=expert_map,
++                a1q_scale=None,
++                a2_scale=self.fused_experts.a2_scale,
++                workspace13=None,
++                workspace2=None,
++                expert_tokens_meta=None,
++                apply_router_weight_on_input=apply_router_weight_on_input,
++            )
++            return output
++
+         a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
+             hidden_states,
+             topk_weights,
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 431fc099a5a43d98a6eb3ba0dbab00c91d035bfb Mon Sep 17 00:00:00 2001
+From: Qiming Zhang <qiming1.zhang@intel.com>
+Date: Wed, 6 May 2026 02:14:48 -0700
+Subject: [PATCH 06/17] Reduce host overhead of moe path (#181)
+
+* Add XPU path to FusedMoEKernelModularImpl
+
+Signed-off-by: mayuyuace <qiming1.zhang@intel.com>
+
+* reduce host overhead by new moe api and pure_fused_moe of runner
+
+Signed-off-by: mayuyuace <qiming1.zhang@intel.com>
+
+---------
+
+Signed-off-by: mayuyuace <qiming1.zhang@intel.com>
+---
+ .../layers/fused_moe/experts/xpu_moe.py       | 38 ++++++++++---------
+ .../layers/fused_moe/runner/moe_runner.py     | 26 +++++++++++++
+ 2 files changed, 47 insertions(+), 17 deletions(-)
+
+diff --git a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+index d6bd2b140..7ba577856 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+@@ -21,7 +21,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+ from vllm.platforms import current_platform
+ 
+ if current_platform.is_xpu():
+-    from vllm_xpu_kernels.fused_moe_interface import xpu_fused_moe
++    from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
+ 
+ 
+ def prepare_fp8_moe_layer_for_xpu(
+@@ -47,6 +47,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
+         )
+         self.is_fp8 = False
+         self.is_mxfp4 = False
++        self.fused_moe_impl = None
+ 
+     @property
+     def expects_unquantized_inputs(self) -> bool:
+@@ -129,25 +130,28 @@ class XPUExperts(mk.FusedMoEExpertsModular):
+         expert_tokens_meta: mk.ExpertTokensMetadata | None,
+         apply_router_weight_on_input: bool,
+     ):
+-        topk = topk_ids.size(-1)
+-        xpu_fused_moe(
++        if self.fused_moe_impl is None:
++            topk = topk_ids.size(-1)
++            self.fused_moe_impl = XpuFusedMoe(
++                w13=w1,
++                w13_scales=self.w1_scale,
++                w13_bias=self.w1_bias,
++                w2=w2,
++                w2_scales=self.w2_scale,
++                w2_bias=self.w2_bias,
++                n_experts_per_token=topk,
++                activation=activation.value,
++                num_experts=self.moe_config.num_local_experts,
++                ep_rank=self.moe_config.ep_rank,
++                ep_size=self.moe_config.ep_size,
++                is_fp8=self.is_fp8,
++                is_mxfp4=self.is_mxfp4,
++            )
++        self.fused_moe_impl.apply(
++            output=output,
+             hidden_states=hidden_states,
+-            w13=w1,
+-            w13_scales=self.w1_scale,
+-            w13_bias=self.w1_bias,
+-            w2=w2,
+-            w2_scales=self.w2_scale,
+-            w2_bias=self.w2_bias,
+             topk_weights=topk_weights,
+             topk_ids=topk_ids,
+-            n_experts_per_token=topk,
+-            activation=activation.value,
+-            num_experts=self.moe_config.num_local_experts,
+-            ep_rank=self.moe_config.ep_rank,
+-            ep_size=self.moe_config.ep_size,
+-            output=output,
+-            is_fp8=self.is_fp8,
+-            is_mxfp4=self.is_mxfp4,
+         )
+ 
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index 37b15ed40..ad4526570 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -265,6 +265,15 @@ class MoERunner(MoERunnerInterface):
+ 
+         self._forward_entry = self._select_forward()
+ 
++        self.skip_pad_hidden_states = False
++        self.pure_fused_moe = False
++        if self.routed_input_transform is None \
++            and self._shared_experts is None \
++            and self.routed_scaling_factor == 1.0 \
++            and self.routed_output_transform is None \
++            and not isinstance(self.router, ZeroExpertRouter):
++            self.pure_fused_moe = True
++
+     def _select_forward(self) -> Callable:
+         if current_platform.is_tpu() or current_platform.is_cpu():
+             # TODO: Once the OOM issue for the TPU backend is resolved, we
+@@ -621,6 +630,23 @@ class MoERunner(MoERunnerInterface):
+         1. pytorch cannot handle union types in custom op signatures so
+            _moe_forward and _moe_forward_shared must be split.
+         """
++        if self.pure_fused_moe:
++            og_hidden_dim = hidden_states.shape[-1]
++            if not self.skip_pad_hidden_states:
++                hidden_states, og_hidden_dim_pad = self._maybe_pad_hidden_states(
++                    None,
++                    hidden_states,
++                )
++                if og_hidden_dim_pad == og_hidden_dim:
++                    self.skip_pad_hidden_states = True
++                og_hidden_dim = og_hidden_dim_pad
++            result = self._forward_entry(
++                hidden_states,
++                router_logits,
++                None,
++                self._encode_layer_name(),
++            )
++            return self._maybe_reduce_final_output(result, og_hidden_dim)
+ 
+         # Apply transform for routed experts (e.g., latent projection
+         # for latent MoE)
+-- 
+2.39.5 (Apple Git-154)
+
+
+From afaeaad4db9721e10632e07703b65989745c9d77 Mon Sep 17 00:00:00 2001
+From: Yan Ma <yan.ma@intel.com>
+Date: Thu, 7 May 2026 01:52:38 +0000
+Subject: [PATCH 07/17] update dependency - 40367
+
+Signed-off-by: Yan Ma <yan.ma@intel.com>
+---
+ docker/Dockerfile.xpu | 14 +++++++-------
+ requirements/xpu.txt  |  2 +-
+ 2 files changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/docker/Dockerfile.xpu b/docker/Dockerfile.xpu
+index e348562a4..c8e01dc38 100644
+--- a/docker/Dockerfile.xpu
++++ b/docker/Dockerfile.xpu
+@@ -41,13 +41,13 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
+ # Install UMD
+ RUN mkdir neo && \
+     cd neo && \
+-    wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.24.8/intel-igc-core-2_2.24.8+20344_amd64.deb && \
+-    wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.24.8/intel-igc-opencl-2_2.24.8+20344_amd64.deb && \
+-    wget https://github.com/intel/compute-runtime/releases/download/25.48.36300.8/intel-ocloc_25.48.36300.8-0_amd64.deb && \
+-    wget https://github.com/intel/compute-runtime/releases/download/25.48.36300.8/intel-opencl-icd_25.48.36300.8-0_amd64.deb && \
+-    wget https://github.com/intel/compute-runtime/releases/download/25.48.36300.8/libigdgmm12_22.8.2_amd64.deb && \
+-    wget https://github.com/intel/compute-runtime/releases/download/25.48.36300.8/libze-intel-gpu1_25.48.36300.8-0_amd64.deb && \
+-    wget https://github.com/oneapi-src/level-zero/releases/download/v1.26.0/level-zero_1.26.0+u24.04_amd64.deb && \
++    wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.32.7/intel-igc-core-2_2.32.7+21184_amd64.deb && \
++    wget https://github.com/intel/intel-graphics-compiler/releases/download/v2.32.7/intel-igc-opencl-2_2.32.7+21184_amd64.deb && \
++    wget https://github.com/intel/compute-runtime/releases/download/26.14.37833.4/intel-ocloc_26.14.37833.4-0_amd64.deb && \
++    wget https://github.com/intel/compute-runtime/releases/download/26.14.37833.4/intel-opencl-icd_26.14.37833.4-0_amd64.deb && \
++    wget https://github.com/intel/compute-runtime/releases/download/26.14.37833.4/libigdgmm12_22.9.0_amd64.deb && \
++    wget https://github.com/intel/compute-runtime/releases/download/26.14.37833.4/libze-intel-gpu1_26.14.37833.4-0_amd64.deb && \
++    wget https://github.com/oneapi-src/level-zero/releases/download/v1.28.2/level-zero_1.28.2+u24.04_amd64.deb && \
+     dpkg -i *.deb && \
+     cd .. && \
+     rm -rf neo
+diff --git a/requirements/xpu.txt b/requirements/xpu.txt
+index 9b147bf69..4ff2f6b65 100644
+--- a/requirements/xpu.txt
++++ b/requirements/xpu.txt
+@@ -15,4 +15,4 @@ torch==2.11.0+xpu
+ torchaudio
+ torchvision
+ 
+-vllm_xpu_kernels @ https://github.com/vllm-project/vllm-xpu-kernels/releases/download/v0.1.7/vllm_xpu_kernels-0.1.7-cp38-abi3-manylinux_2_28_x86_64.whl
++#vllm_xpu_kernels @ https://github.com/vllm-project/vllm-xpu-kernels/releases/download/v0.1.7/vllm_xpu_kernels-0.1.7-cp38-abi3-manylinux_2_28_x86_64.whl
+-- 
+2.39.5 (Apple Git-154)
+
+
+From af5a32d0318c29d85256bfc8069b43f02f61b13b Mon Sep 17 00:00:00 2001
+From: Yan Ma <yan.ma@intel.com>
+Date: Thu, 7 May 2026 04:19:27 +0000
+Subject: [PATCH 08/17] upgrade transformers
+
+Signed-off-by: Yan Ma <yan.ma@intel.com>
+---
+ requirements/test/xpu.txt | 3 ++-
+ requirements/xpu.txt      | 1 +
+ 2 files changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/requirements/test/xpu.txt b/requirements/test/xpu.txt
+index 80b0c1481..bd4db4218 100644
+--- a/requirements/test/xpu.txt
++++ b/requirements/test/xpu.txt
+@@ -667,9 +667,10 @@ tqdm==4.67.3
+     #   pqdm
+     #   sentence-transformers
+     #   transformers
+-transformers==5.5.3
++transformers==5.8.0
+     # via
+     #   -c requirements/common.txt
++    #   -c requirements/xpu.txt
+     #   sentence-transformers
+ triton-xpu==3.7.0
+     # via torch
+diff --git a/requirements/xpu.txt b/requirements/xpu.txt
+index 4ff2f6b65..5131abc87 100644
+--- a/requirements/xpu.txt
++++ b/requirements/xpu.txt
+@@ -10,6 +10,7 @@ wheel
+ jinja2>=3.1.6
+ datasets # for benchmark scripts
+ numba == 0.65.0 # Required for N-gram speculative decoding
++transformers == 5.8.0
+ --extra-index-url=https://download.pytorch.org/whl/xpu
+ torch==2.11.0+xpu
+ torchaudio
+-- 
+2.39.5 (Apple Git-154)
+
+
+From d2a9f5ce088668b8b4a62cbdc6a9ef75255be71e Mon Sep 17 00:00:00 2001
+From: Yan Ma <yan.ma@intel.com>
+Date: Fri, 8 May 2026 01:21:52 +0000
+Subject: [PATCH 09/17] fix parameter mismatch
+
+Signed-off-by: Yan Ma <yan.ma@intel.com>
+---
+ .../layers/fused_moe/runner/moe_runner.py           | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index ad4526570..fa3bea600 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -267,11 +267,13 @@ class MoERunner(MoERunnerInterface):
+ 
+         self.skip_pad_hidden_states = False
+         self.pure_fused_moe = False
+-        if self.routed_input_transform is None \
+-            and self._shared_experts is None \
+-            and self.routed_scaling_factor == 1.0 \
+-            and self.routed_output_transform is None \
+-            and not isinstance(self.router, ZeroExpertRouter):
++        if (
++            self.routed_input_transform is None
++            and self._shared_experts is None
++            and self.routed_scaling_factor == 1.0
++            and self.routed_output_transform is None
++            and not isinstance(self.router, ZeroExpertRouter)
++        ):
+             self.pure_fused_moe = True
+ 
+     def _select_forward(self) -> Callable:
+@@ -644,6 +646,7 @@ class MoERunner(MoERunnerInterface):
+                 hidden_states,
+                 router_logits,
+                 None,
++                input_ids,
+                 self._encode_layer_name(),
+             )
+             return self._maybe_reduce_final_output(result, og_hidden_dim)
+-- 
+2.39.5 (Apple Git-154)
+
+
+From e7f325e263f27fcf78ca746e68f79edd3eb09740 Mon Sep 17 00:00:00 2001
+From: baodi <di.bao@intel.com>
+Date: Wed, 13 May 2026 16:02:20 +0800
+Subject: [PATCH 10/17] [XPU][MLA] Fold XPU MLA into FlashAttnMLA backend
+ (#187)
+
+* [XPU][MLA] Add FlashAttnXPUMLA backend wired to vllm-xpu-kernels paged_decode
+
+New v1 attention backend that routes MLA decode on Intel XPU (Arc /
+Battlemage) through vllm_xpu_kernels.flash_mla_decode while reusing the
+parent MLACommonImpl FA varlen path for prefill via
+xpu_ops.flash_attn_varlen_func.
+
+Files:
+* vllm/v1/attention/backends/mla/flashattn_xpu_mla.py (new)
+  - FlashAttnXPUMLABackend / Metadata / Impl.
+  - forward_mqa() slices the decode portion of the batch
+    (query_start_loc[: num_decodes + 1]) and pins max_seqlen_q=1, since
+    MLA's MQA path only sees decode tokens; using batch-level
+    max_query_len here would incorrectly trip on mixed prefill+decode
+    batches.
+  - SLM-aware constraints (head_size_qk=576, num_heads<=8/rank,
+    block_size<=64) raise NotImplementedError at construction with a
+    clear hint to bump TP if violated.
+  - Module-import-time monkey-patch over XpuCommunicator.{all_reduce,
+    all_gather, all_gatherv, reduce_scatter, reduce_scatterv, broadcast,
+    gather} routes XPU collectives through the cpu_group (gloo) as a
+    workaround for oneCCL's >512 work-group SYCL kernels failing on
+    Arc B580. Idempotent + applied lazily so non-XPU envs are unaffected.
+  - faulthandler.enable(all_threads=True) at import + per-signal
+    register so future C++ terminates dump a Python stack instead of
+    aborting silently.
+
+* vllm/platforms/xpu.py
+  - get_attn_backend_cls(): when use_mla and selected_backend ==
+    FLASH_ATTN_XPU_MLA, return the new backend; otherwise fall back to
+    the existing TRITON_MLA path.
+
+* vllm/v1/attention/backends/registry.py
+  - Register FLASH_ATTN_XPU_MLA -> FlashAttnXPUMLABackend.
+
+Verified end-to-end with DeepSeek-V2-Lite TP=4 on 4x Intel Arc B580.
+
+Signed-off-by: baodii <di.bao@intel.com>
+
+* fix block table to avoid triton version disable
+
+Signed-off-by: baodii <di.bao@intel.com>
+
+* [XPU][MLA] Fold XPU MLA into FlashAttnMLA backend
+
+Route XPU MLA through FLASH_ATTN_MLA and call the vllm-xpu-kernels varlen attention entry point for paged decode. Remove the separate FLASH_ATTN_XPU_MLA backend and keep the XPU output allocation compatible with MLA QK/V head-size differences.
+
+Signed-off-by: baodii <di.bao@intel.com>
+
+* restore block_table.py
+
+Signed-off-by: baodii <di.bao@intel.com>
+
+* fix useless code
+
+Signed-off-by: baodii <di.bao@intel.com>
+
+* Revert docs/design/attention_backends.md to main
+
+* use super func in flashattn_mla
+
+Signed-off-by: baodii <di.bao@intel.com>
+
+---------
+
+Signed-off-by: baodii <di.bao@intel.com>
+---
+ vllm/_xpu_ops.py                              |  6 +-
+ vllm/platforms/xpu.py                         | 13 +++-
+ vllm/v1/attention/backends/fa_utils.py        |  2 +
+ .../attention/backends/mla/flashattn_mla.py   | 69 +++++++++++++++++--
+ 4 files changed, 81 insertions(+), 9 deletions(-)
+
+diff --git a/vllm/_xpu_ops.py b/vllm/_xpu_ops.py
+index 6a2e5e841..bf22fc452 100644
+--- a/vllm/_xpu_ops.py
++++ b/vllm/_xpu_ops.py
+@@ -379,7 +379,11 @@ class xpu_ops:
+             "when block_table is disabled, cu_seqlens_k is needed"
+         )
+         if out is None:
+-            out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
++            out = torch.empty(
++                q.shape[:-1] + (v.shape[-1],),
++                dtype=q.dtype,
++                device=q.device,
++            )
+         real_window_size: tuple[int, int]
+         if window_size is None:
+             real_window_size = (-1, -1)
+diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
+index 5c2b685f2..4145dedc8 100644
+--- a/vllm/platforms/xpu.py
++++ b/vllm/platforms/xpu.py
+@@ -72,8 +72,17 @@ class XPUPlatform(Platform):
+             logger.info_once("Using XPU MLA Sparse backend.")
+             return AttentionBackendEnum.XPU_MLA_SPARSE.get_path()
+         if attn_selector_config.use_mla:
+-            logger.info_once("Using Triton MLA backend on V1 engine.")
+-            return AttentionBackendEnum.TRITON_MLA.get_path()
++            if selected_backend in (None, AttentionBackendEnum.FLASH_ATTN_MLA):
++                logger.info_once("Using Flash Attention MLA backend on XPU.")
++                return AttentionBackendEnum.FLASH_ATTN_MLA.get_path()
++            if selected_backend == AttentionBackendEnum.TRITON_MLA:
++                logger.info_once("Using Triton MLA backend on V1 engine.")
++                return AttentionBackendEnum.TRITON_MLA.get_path()
++            if selected_backend:
++                raise ValueError(
++                    f"Invalid attention backend for {cls.device_name}, "
++                    f"with use_mla: {attn_selector_config.use_mla}"
++                )
+         if selected_backend == AttentionBackendEnum.TRITON_ATTN:
+             logger.info_once("Using Triton backend.")
+             return AttentionBackendEnum.TRITON_ATTN.get_path()
+diff --git a/vllm/v1/attention/backends/fa_utils.py b/vllm/v1/attention/backends/fa_utils.py
+index 1e74e4c48..89791eb42 100644
+--- a/vllm/v1/attention/backends/fa_utils.py
++++ b/vllm/v1/attention/backends/fa_utils.py
+@@ -213,6 +213,8 @@ def flash_attn_supports_sinks() -> bool:
+ def flash_attn_supports_mla():
+     from vllm.platforms import current_platform
+ 
++    if current_platform.is_xpu():
++        return True
+     if current_platform.is_cuda():
+         try:
+             from vllm.vllm_flash_attn.flash_attn_interface import (
+diff --git a/vllm/v1/attention/backends/mla/flashattn_mla.py b/vllm/v1/attention/backends/mla/flashattn_mla.py
+index bd947296e..697376069 100644
+--- a/vllm/v1/attention/backends/mla/flashattn_mla.py
++++ b/vllm/v1/attention/backends/mla/flashattn_mla.py
+@@ -18,6 +18,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
+     MLACommonMetadataBuilder,
+     QueryLenSupport,
+ )
++from vllm.platforms import current_platform
+ from vllm.platforms.interface import DeviceCapability
+ from vllm.utils.math_utils import round_up
+ from vllm.utils.torch_utils import is_quantized_kv_cache
+@@ -29,13 +30,11 @@ from vllm.v1.attention.backend import (
+ )
+ from vllm.v1.attention.backends.fa_utils import (
+     flash_attn_supports_mla,
+-    get_flash_attn_version,
+-)
+-from vllm.v1.kv_cache_interface import AttentionSpec
+-from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
+     flash_attn_varlen_func,
++    get_flash_attn_version,
+     get_scheduler_metadata,
+ )
++from vllm.v1.kv_cache_interface import AttentionSpec
+ 
+ logger = init_logger(__name__)
+ 
+@@ -50,6 +49,9 @@ class FlashAttnMLABackend(MLACommonBackend):
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
++        if current_platform.is_xpu():
++            # Xe h576 paged decode only fits in SLM with block_size=64.
++            return [MultipleOf(64)]
+         return [MultipleOf(16)]
+ 
+     @staticmethod
+@@ -70,8 +72,23 @@ class FlashAttnMLABackend(MLACommonBackend):
+ 
+     @classmethod
+     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
++        if current_platform.is_xpu():
++            return True
+         return capability.major == 9
+ 
++    @classmethod
++    def supports_block_size(cls, block_size: int | None) -> bool:
++        if current_platform.is_xpu():
++            return block_size is None or block_size == 64
++        return super().supports_block_size(block_size)
++
++    @classmethod
++    def get_supported_head_sizes(cls) -> list[int]:
++        if current_platform.is_xpu():
++            # MLA combined QK head dim = kv_lora_rank (512) + rope dim (64).
++            return [576]
++        return super().get_supported_head_sizes()
++
+     @classmethod
+     def supports_combination(
+         cls,
+@@ -106,7 +123,8 @@ class FlashAttnMLAMetadata(MLACommonMetadata[FlashAttnMLADecodeMetadata]):
+ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]):
+     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.VARLEN
+-    reorder_batch_threshold: int = 512  # process small prefills with decode pathway
++    # XPU paged decode currently supports single-token decode only.
++    reorder_batch_threshold: int = 1 if current_platform.is_xpu() else 512
+ 
+     def __init__(
+         self,
+@@ -253,7 +271,7 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
+ 
+ 
+ class FlashAttnMLAImpl(MLACommonImpl[FlashAttnMLAMetadata]):
+-    can_return_lse_for_decode: bool = True
++    can_return_lse_for_decode: bool = not current_platform.is_xpu()
+ 
+     def __init__(
+         self,
+@@ -306,6 +324,13 @@ class FlashAttnMLAImpl(MLACommonImpl[FlashAttnMLAMetadata]):
+                 "FlashAttnMLA V1 with FP8 KV cache not yet supported"
              )
  
--        # No parsers: pass through as content
--        if self._reasoning_parser is None and self._tool_parser is None:
-+        # No phase active: pass through as content
-+        if (
-+            delta_message is None
-+            and not self._in_reasoning_phase(state)
-+            and not self._in_tool_call_phase(state)
-+        ):
-             delta_message = DeltaMessage(content=delta_text)
- 
-         state.previous_text = current_text
--- 
-2.39.5 (Apple Git-154)
-
-
-From 95582868efd4db0b120e3640bbc61dcfce20d59f Mon Sep 17 00:00:00 2001
-From: Chauncey <chaunceyjiang@gmail.com>
-Date: Thu, 7 May 2026 05:48:01 +0800
-Subject: [PATCH 10/13] [Bugfix] DeepSeekV32/v4: respect string='true|false'
- attribute andunwrap arguments/input wrapper (#41801)
-
-Signed-off-by: chaunceyjiang <chaunceyjiang@gmail.com>
-Co-authored-by: QwertyJack <7554089+QwertyJack@users.noreply.github.com>
----
- .../test_deepseekv32_tool_parser.py           | 157 +++++++++++++++++-
- .../test_deepseekv4_tool_parser.py            |  33 ++++
- vllm/tool_parsers/deepseekv32_tool_parser.py  |  44 ++++-
- 3 files changed, 224 insertions(+), 10 deletions(-)
-
-diff --git a/tests/tool_parsers/test_deepseekv32_tool_parser.py b/tests/tool_parsers/test_deepseekv32_tool_parser.py
-index c547795e7..693cf5cad 100644
---- a/tests/tool_parsers/test_deepseekv32_tool_parser.py
-+++ b/tests/tool_parsers/test_deepseekv32_tool_parser.py
-@@ -203,7 +203,14 @@ class TestExtractToolCalls:
-             ),
-         )
-         parser = make_parser(tools=[tool])
--        model_output = build_tool_call("toggle", {"enabled": "true", "count": "42"})
-+        model_output = (
-+            f"{FC_START}\n"
-+            f'{INV_START}toggle">\n'
-+            f'{PARAM_START}enabled" string="false">true{PARAM_END}\n'
-+            f'{PARAM_START}count" string="false">42{PARAM_END}\n'
-+            f"{INV_END}\n"
-+            f"{FC_END}"
-+        )
-         result = parser.extract_tool_calls(model_output, None)
-         assert result.tools_called
-         assert len(result.tool_calls) == 1
-@@ -212,6 +219,118 @@ class TestExtractToolCalls:
-         assert isinstance(args["enabled"], bool)
-         assert isinstance(args["count"], int)
- 
-+    def test_string_attr_true_preserves_literal_despite_schema(self):
-+        """string="true" must keep the value as a string even
-+        if the schema says integer."""
-+        tool = ChatCompletionToolsParam(
-+            function=FunctionDefinition(
-+                name="score",
-+                parameters={
-+                    "type": "object",
-+                    "properties": {
-+                        "value": {"type": "integer"},
-+                    },
-+                },
-+            ),
-+        )
-+        parser = make_parser(tools=[tool])
-+        model_output = (
-+            f"{FC_START}\n"
-+            f'{INV_START}score">\n'
-+            f'{PARAM_START}value" string="true">42{PARAM_END}\n'
-+            f"{INV_END}\n"
-+            f"{FC_END}"
-+        )
-+        result = parser.extract_tool_calls(model_output, None)
-+        assert result.tools_called
-+        args = json.loads(result.tool_calls[0].function.arguments)
-+        assert args == {"value": "42"}
-+        assert isinstance(args["value"], str)
++        if current_platform.is_xpu() and self.num_heads > 8:
++            raise NotImplementedError(
++                f"FlashAttnMLA on XPU supports at most 8 query heads per "
++                f"rank at head_size=576 (got num_heads={self.num_heads}); "
++                f"increase tensor parallel size."
++            )
 +
-+    def test_string_attr_false_allows_schema_conversion(self):
-+        """string="false" allows the parser to convert via the tool schema."""
-+        tool = ChatCompletionToolsParam(
-+            function=FunctionDefinition(
-+                name="score",
-+                parameters={
-+                    "type": "object",
-+                    "properties": {
-+                        "value": {"type": "integer"},
-+                    },
-+                },
-+            ),
-+        )
-+        parser = make_parser(tools=[tool])
-+        model_output = (
-+            f"{FC_START}\n"
-+            f'{INV_START}score">\n'
-+            f'{PARAM_START}value" string="false">42{PARAM_END}\n'
-+            f"{INV_END}\n"
-+            f"{FC_END}"
-+        )
-+        result = parser.extract_tool_calls(model_output, None)
-+        assert result.tools_called
-+        args = json.loads(result.tool_calls[0].function.arguments)
-+        assert args == {"value": 42}
-+        assert isinstance(args["value"], int)
-+
-+    def test_arguments_wrapper_repaired(self):
-+        """A single 'arguments' wrapper parameter must be unwrapped when it
-+        is not part of the tool schema and the inner object matches schema fields."""
-+        tool = ChatCompletionToolsParam(
-+            function=FunctionDefinition(
-+                name="get_weather",
-+                parameters={
-+                    "type": "object",
-+                    "properties": {
-+                        "location": {"type": "string"},
-+                    },
-+                },
-+            ),
-+        )
-+        parser = make_parser(tools=[tool])
-+        model_output = (
-+            f"{FC_START}\n"
-+            f'{INV_START}get_weather">\n'
-+            f'{PARAM_START}arguments" string="false">'
-+            f'{{"location":"Beijing"}}'
-+            f"{PARAM_END}\n"
-+            f"{INV_END}\n"
-+            f"{FC_END}"
-+        )
-+        result = parser.extract_tool_calls(model_output, None)
-+        assert result.tools_called
-+        args = json.loads(result.tool_calls[0].function.arguments)
-+        assert args == {"location": "Beijing"}
-+
-+    def test_input_wrapper_repaired(self):
-+        """A single 'input' wrapper parameter must be unwrapped similarly."""
-+        tool = ChatCompletionToolsParam(
-+            function=FunctionDefinition(
-+                name="get_weather",
-+                parameters={
-+                    "type": "object",
-+                    "properties": {
-+                        "location": {"type": "string"},
-+                    },
-+                },
-+            ),
-+        )
-+        parser = make_parser(tools=[tool])
-+        model_output = (
-+            f"{FC_START}\n"
-+            f'{INV_START}get_weather">\n'
-+            f'{PARAM_START}input" string="true">'
-+            f'{{"location":"Beijing"}}'
-+            f"{PARAM_END}\n"
-+            f"{INV_END}\n"
-+            f"{FC_END}"
-+        )
-+        result = parser.extract_tool_calls(model_output, None)
-+        assert result.tools_called
-+        args = json.loads(result.tool_calls[0].function.arguments)
-+        assert args == {"location": "Beijing"}
-+
- 
- # ---------------------------------------------------------------------------
- # Tests: extract_tool_calls_streaming
-@@ -319,11 +438,45 @@ class TestExtractToolCallsStreaming:
-             ),
-         )
-         parser = make_parser(tools=[tool])
--        full_text = build_tool_call("add", {"x": "3", "y": "4"})
-+        full_text = (
-+            f"{FC_START}\n"
-+            f'{INV_START}add">\n'
-+            f'{PARAM_START}x" string="false">3{PARAM_END}\n'
-+            f'{PARAM_START}y" string="false">4{PARAM_END}\n'
-+            f"{INV_END}\n"
-+            f"{FC_END}"
-+        )
-         deltas = self._stream(parser, full_text)
-         args_str = self._reconstruct_args(deltas)
-         assert json.loads(args_str) == {"x": 3, "y": 4}
- 
-+    def test_string_attr_true_preserves_literal_in_streaming(self):
-+        """Streaming: string='true' must keep the value literal despite schema."""
-+        tool = ChatCompletionToolsParam(
-+            function=FunctionDefinition(
-+                name="score",
-+                parameters={
-+                    "type": "object",
-+                    "properties": {
-+                        "value": {"type": "integer"},
-+                    },
-+                },
-+            ),
-+        )
-+        parser = make_parser(tools=[tool])
-+        full_text = (
-+            f"{FC_START}\n"
-+            f'{INV_START}score">\n'
-+            f'{PARAM_START}value" string="true">42{PARAM_END}\n'
-+            f"{INV_END}\n"
-+            f"{FC_END}"
-+        )
-+        deltas = self._stream(parser, full_text)
-+        args_str = self._reconstruct_args(deltas)
-+        args = json.loads(args_str)
-+        assert args == {"value": "42"}
-+        assert isinstance(args["value"], str)
-+
-     def test_multiple_tools_streaming(self, parser):
-         full_text = (
-             f"{FC_START}\n"
-diff --git a/tests/tool_parsers/test_deepseekv4_tool_parser.py b/tests/tool_parsers/test_deepseekv4_tool_parser.py
-index cc77a1f77..afcd05739 100644
---- a/tests/tool_parsers/test_deepseekv4_tool_parser.py
-+++ b/tests/tool_parsers/test_deepseekv4_tool_parser.py
-@@ -203,3 +203,36 @@ def test_get_vllm_registry_structural_tag_returns_structural_tag(
-         )
-         tag = parser.get_structural_tag(req)
-         assert isinstance(tag, StructuralTag)
-+
-+
-+def test_extract_tool_calls_arguments_wrapper():
-+    mock_tokenizer = MagicMock()
-+    mock_tokenizer.get_vocab.return_value = {}
-+
-+    tool = ChatCompletionToolsParam(
-+        type="function",
-+        function={
-+            "name": "get_weather",
-+            "parameters": {
-+                "type": "object",
-+                "properties": {"location": {"type": "string"}},
-+            },
-+        },
-+    )
-+
-+    parser = DeepSeekV4ToolParser(mock_tokenizer, tools=[tool])
-+    request = MagicMock()
-+    request.tools = [tool]
-+
-+    model_output = (
-+        f"{TC_START}"
-+        f'{INV_START}get_weather">'
-+        f'{PARAM_START}arguments" string="false">{{"location":"Beijing"}}{PARAM_END}'
-+        f"{INV_END}"
-+        f"{TC_END}"
-+    )
-+
-+    result = parser.extract_tool_calls(model_output, request)
-+    assert result.tools_called
-+    args = json.loads(result.tool_calls[0].function.arguments)
-+    assert args == {"location": "Beijing"}
-diff --git a/vllm/tool_parsers/deepseekv32_tool_parser.py b/vllm/tool_parsers/deepseekv32_tool_parser.py
-index 02182e229..f01f7f929 100644
---- a/vllm/tool_parsers/deepseekv32_tool_parser.py
-+++ b/vllm/tool_parsers/deepseekv32_tool_parser.py
-@@ -69,7 +69,7 @@ class DeepSeekV32ToolParser(ToolParser):
-             r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>', re.DOTALL
-         )
-         self.parameter_complete_regex = re.compile(
--            r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(?:true|false)"\s*>(.*?)</｜DSML｜parameter>',
-+            r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="(true|false)"\s*>(.*?)</｜DSML｜parameter>',
-             re.DOTALL,
-         )
- 
-@@ -101,10 +101,12 @@ class DeepSeekV32ToolParser(ToolParser):
-         """Generate a unique tool call ID."""
-         return f"call_{uuid.uuid4().hex[:24]}"
- 
--    def _parse_invoke_params(self, invoke_str: str) -> dict:
--        param_dict = dict()
--        for param_name, param_val in self.parameter_complete_regex.findall(invoke_str):
--            param_dict[param_name] = param_val
-+    def _parse_invoke_params(self, invoke_str: str) -> dict[str, tuple[str, str]]:
-+        param_dict: dict[str, tuple[str, str]] = {}
-+        for param_name, string_attr, param_val in self.parameter_complete_regex.findall(
-+            invoke_str
-+        ):
-+            param_dict[param_name] = (param_val, string_attr)
-         return param_dict
- 
-     def _convert_param_value_checked(self, value: str, param_type: str) -> Any:
-@@ -142,10 +144,32 @@ class DeepSeekV32ToolParser(ToolParser):
-         # return value as fallback
-         return value
- 
-+    @staticmethod
-+    def _repair_param_dict(
-+        param_dict: dict[str, Any],
-+        param_config: dict[str, dict],
-+    ) -> dict[str, Any]:
-+        """Unwrap single 'arguments' / 'input' wrappers when the wrapper
-+        is not part of the requested tool schema and the wrapped object
-+        matches the schema fields."""
-+        allowed = set(param_config.keys())
-+        for wrapper in ("arguments", "input"):
-+            if set(param_dict.keys()) != {wrapper} or wrapper in allowed:
-+                continue
-+            inner = param_dict[wrapper]
-+            if isinstance(inner, str):
-+                try:
-+                    inner = json.loads(inner)
-+                except json.JSONDecodeError:
-+                    return param_dict
-+            if isinstance(inner, dict) and set(inner.keys()).issubset(allowed):
-+                return inner
-+        return param_dict
-+
-     def _convert_params_with_schema(
+     def forward_mqa(
          self,
-         function_name: str,
--        param_dict: dict[str, str],
-+        param_dict: dict[str, tuple[str, str]],
-     ) -> dict[str, Any]:
-         """Convert raw string param values using the tool schema types."""
-         param_config: dict = {}
-@@ -162,12 +186,16 @@ class DeepSeekV32ToolParser(ToolParser):
-                     break
+         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+@@ -326,6 +351,38 @@ class FlashAttnMLAImpl(MLACommonImpl[FlashAttnMLAMetadata]):
+         if is_quantized_kv_cache(self.kv_cache_dtype):
+             raise NotImplementedError("FP8 FlashAttention MLA not yet supported")
  
-         converted: dict[str, Any] = {}
--        for name, value in param_dict.items():
-+        for name, (value, string_attr) in param_dict.items():
-+            if string_attr == "true":
-+                converted[name] = value
-+                continue
++        if current_platform.is_xpu():
++            num_decodes = attn_metadata.num_decodes
++            decode_cu_seqlens_q = attn_metadata.query_start_loc[: num_decodes + 1]
 +
-             param_type = "string"
-             if name in param_config and isinstance(param_config[name], dict):
-                 param_type = param_config[name].get("type", "string")
-             converted[name] = self._convert_param_value(value, param_type)
--        return converted
-+        return self._repair_param_dict(converted, param_config)
- 
-     def extract_tool_calls(
-         self,
--- 
-2.39.5 (Apple Git-154)
-
-
-From 80d5e7d103ee181f66389d0e2580841e2a2f1db5 Mon Sep 17 00:00:00 2001
-From: Yongye Zhu <zyy1102000@gmail.com>
-Date: Wed, 6 May 2026 19:17:48 -0400
-Subject: [PATCH 11/13] [Bugfix] Fix condition to clear persistent topk so that
- it can be captured regardless (#41665)
-
-Signed-off-by: Yongye Zhu <zyy1102000@gmail.com>
----
- csrc/topk.cu | 25 +++++++++++++++++--------
- 1 file changed, 17 insertions(+), 8 deletions(-)
-
-diff --git a/csrc/topk.cu b/csrc/topk.cu
-index 68352629e..c5bffb328 100644
---- a/csrc/topk.cu
-+++ b/csrc/topk.cu
-@@ -153,14 +153,23 @@ void launch_persistent_topk(const torch::Tensor& logits,
-     TORCH_CHECK(workspace.size(0) >= static_cast<int64_t>(state_bytes),
-                 "workspace too small, need ", state_bytes, " bytes");
- 
--    // Zero the per-group RadixRowState region before launch — only when the
--    // radix path will actually run (max_seq_len > RADIX_THRESHOLD). The
--    // RadixRowState fields (arrival_counter, histograms) are only touched by
--    // radix_topk; the decode/medium paths inside the persistent kernel
--    // operate purely in shared memory and never read these globals, so a
--    // stale workspace is harmless for them.
-+    // Zero the per-group RadixRowState region before launch.
-     //
--    // Why we need the memset (when needs_cooperative is true):
-+    // Issued UNCONDITIONALLY so the memset is captured as its own node in
-+    // the cudagraph (a separate cudaMemsetAsync node, sequenced before the
-+    // persistent_topk_kernel launch on the same stream). The previous
-+    // host-side guard `if (needs_cooperative)` was evaluated at capture time;
-+    // when capture-time max_seq_len <= RADIX_THRESHOLD (always true under
-+    // FULL_DECODE_ONLY with max_model_len < 32 K) the memset would NOT be
-+    // captured, leaving the workspace state to accumulate across replays.
-+    // That's a latent correctness bug if the runtime data ever takes the
-+    // radix path, and removes one variable while debugging hangs in the
-+    // decode/medium paths.
-+    //
-+    // Cost is sub-microsecond: state_bytes = num_groups * sizeof(RadixRowState)
-+    // is ~3 KB per group, ~100 KB for the largest grids on this hardware.
-+    //
-+    // Why the memset is required (regardless of which path the kernel takes):
-     //   1. arrival_counter accumulates within a launch and is never reset,
-     //      so a prior call leaves it at a large positive value. Without this
-     //      reset, the very first wait_ge in the next call sees counter >>
-@@ -169,7 +178,7 @@ void launch_persistent_topk(const torch::Tensor& logits,
-     //      __syncthreads(), so it had no happens-before edge to CTA-1+'s
-     //      first red_release. cudaMemsetAsync is stream-ordered: the zero
-     //      is globally visible before any CTA runs.
--    if (needs_cooperative) {
-+    {
-       cudaError_t mz_err = cudaMemsetAsync(workspace.data_ptr<uint8_t>(), 0,
-                                            state_bytes, stream);
-       TORCH_CHECK(mz_err == cudaSuccess,
--- 
-2.39.5 (Apple Git-154)
-
-
-From 7a576e2c724e135236c0dc005dce114c7e4d911e Mon Sep 17 00:00:00 2001
-From: Micah Williamson <micah.williamson@amd.com>
-Date: Wed, 6 May 2026 18:37:11 -0500
-Subject: [PATCH 12/13] [ROCm][CI] Remove `TORCH_NCCL_BLOCKING_WAIT=1` After
- Bugfix In ROCm 7.2 (#41840)
-
-Signed-off-by: Micah Williamson <micah.williamson@amd.com>
----
- .buildkite/test-amd.yaml | 16 ----------------
- 1 file changed, 16 deletions(-)
-
-diff --git a/.buildkite/test-amd.yaml b/.buildkite/test-amd.yaml
-index ae0c01592..b3c77dcac 100644
---- a/.buildkite/test-amd.yaml
-+++ b/.buildkite/test-amd.yaml
-@@ -230,7 +230,6 @@ steps:
-   - tests/entrypoints/llm/test_collective_rpc.py
-   - vllm/platforms/rocm.py
-   commands:
--  - export TORCH_NCCL_BLOCKING_WAIT=1
-   - pytest -v -s entrypoints/llm/test_collective_rpc.py
-   - pytest -v -s ./compile/fullgraph/test_basic_correctness.py
-   - pytest -v -s ./compile/test_wrapper.py
-@@ -272,7 +271,6 @@ steps:
-   - tests/v1/worker/test_worker_memory_snapshot.py
-   - vllm/platforms/rocm.py
-   commands:
--  - export TORCH_NCCL_BLOCKING_WAIT=1
-   - VLLM_TEST_SAME_HOST=1 torchrun --nproc-per-node=4 distributed/test_same_node.py | grep 'Same node test passed'
-   - VLLM_TEST_SAME_HOST=1 VLLM_TEST_WITH_DEFAULT_DEVICE_SET=1 torchrun --nproc-per-node=4 distributed/test_same_node.py | grep 'Same node test passed'
-   - CUDA_VISIBLE_DEVICES=0,1 pytest -v -s v1/shutdown
-@@ -590,7 +588,6 @@ steps:
-   - vllm/platforms/rocm.py
-   commands:
-   - pip freeze | grep -E 'torch'
--  - export TORCH_NCCL_BLOCKING_WAIT=1
-   - pytest -v -s models/language -m 'core_model and slow_test' --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB
- 
- - label: Multi-Modal Models (Extended Generation 2) # TBD
-@@ -865,7 +862,6 @@ steps:
-   - tests/entrypoints/openai/test_multi_api_servers.py
-   - vllm/platforms/rocm.py
-   commands:
--  - export TORCH_NCCL_BLOCKING_WAIT=1
-   - TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_async_llm_dp.py
-   - TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_eagle_dp.py
-   - TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_external_lb_dp.py
-@@ -1175,7 +1171,6 @@ steps:
-   - vllm/_aiter_ops.py
-   - vllm/platforms/rocm.py
-   commands:
--  - export TORCH_NCCL_BLOCKING_WAIT=1
-   - pytest -v -s tests/distributed/test_context_parallel.py
-   - VLLM_LOGGING_LEVEL=DEBUG python3 examples/features/data_parallel/data_parallel_offline.py --model=Qwen/Qwen1.5-MoE-A2.7B -tp=1 -dp=2 --max-model-len=2048 --all2all-backend=allgather_reducescatter --disable-nccl-for-dp-synchronization
- 
-@@ -1189,7 +1184,6 @@ steps:
-   source_file_dependencies:
-   - vllm/
-   commands:
--  - export TORCH_NCCL_BLOCKING_WAIT=1
-   - pytest -v -s distributed/test_custom_all_reduce.py
-   - torchrun --nproc_per_node=2 distributed/test_ca_buffer_sharing.py
-   - TARGET_TEST_SUITE=A100 pytest basic_correctness/ -v -s -m 'distributed(num_gpus=2)'
-@@ -1209,7 +1203,6 @@ steps:
-   - tests/examples/features/data_parallel/data_parallel_offline.py
-   - vllm/platforms/rocm.py
-   commands:
--  - export TORCH_NCCL_BLOCKING_WAIT=1
-   - torchrun --nproc-per-node=4 distributed/test_torchrun_example.py
-   - PP_SIZE=2 torchrun --nproc-per-node=4 distributed/test_torchrun_example.py
-   - TP_SIZE=4 torchrun --nproc-per-node=4 distributed/test_torchrun_example_moe.py
-@@ -1255,7 +1248,6 @@ steps:
-   - vllm/platforms/rocm.py
-   commands:
-   - export VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1
--  - export TORCH_NCCL_BLOCKING_WAIT=1
-   - pytest -v -s distributed/test_ray_v2_executor.py
-   - pytest -v -s distributed/test_ray_v2_executor_e2e.py
-   - pytest -v -s distributed/test_pipeline_parallel.py -k "ray"
-@@ -1277,7 +1269,6 @@ steps:
-   - vllm/v1/worker/gpu_worker.py
-   - vllm/platforms/rocm.py
-   commands:
--  - export TORCH_NCCL_BLOCKING_WAIT=1
-   - torchrun --nproc-per-node=8 ../examples/features/torchrun/torchrun_dp_example_offline.py --tp-size=2 --pp-size=1 --dp-size=4 --enable-ep
- 
- #--------------------------------------------------------  mi300 · entrypoints  --------------------------------------------------------#
-@@ -2284,7 +2275,6 @@ steps:
-   - tests/entrypoints/openai/test_multi_api_servers.py
-   - vllm/platforms/rocm.py
-   commands:
--  - export TORCH_NCCL_BLOCKING_WAIT=1
-   - TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_async_llm_dp.py
-   - TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_eagle_dp.py
-   - TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_external_lb_dp.py
-@@ -2304,7 +2294,6 @@ steps:
-   - vllm/_aiter_ops.py
-   - vllm/platforms/rocm.py
-   commands:
--  - export TORCH_NCCL_BLOCKING_WAIT=1
-   - VLLM_ALLOW_INSECURE_SERIALIZATION=1 python3 examples/rl/rlhf_async_new_apis.py
-   - VLLM_LOGGING_LEVEL=DEBUG python3 examples/features/data_parallel/data_parallel_offline.py --model=Qwen/Qwen1.5-MoE-A2.7B -tp=1 -dp=2 --max-model-len=2048 --all2all-backend=deepep_high_throughput
-   - pytest -v -s tests/v1/distributed/test_dbo.py
-@@ -2367,7 +2356,6 @@ steps:
-   - tests/distributed/test_utils
-   - vllm/platforms/rocm.py
-   commands:
--  - export TORCH_NCCL_BLOCKING_WAIT=1
-   - TP_SIZE=2 DP_SIZE=2 pytest -v -s v1/distributed/test_async_llm_dp.py
-   - TP_SIZE=2 DP_SIZE=2 pytest -v -s v1/distributed/test_eagle_dp.py
-   - TP_SIZE=2 DP_SIZE=2 pytest -v -s v1/distributed/test_external_lb_dp.py
-@@ -2497,7 +2485,6 @@ steps:
-   - tests/entrypoints/llm/test_collective_rpc.py
-   - vllm/platforms/rocm.py
-   commands:
--  - export TORCH_NCCL_BLOCKING_WAIT=1
-   - pytest -v -s entrypoints/llm/test_collective_rpc.py
-   - pytest -v -s ./compile/fullgraph/test_basic_correctness.py
-   - pytest -v -s ./compile/test_wrapper.py
-@@ -2522,7 +2509,6 @@ steps:
-   - tests/v1/worker/test_worker_memory_snapshot.py
-   - vllm/platforms/rocm.py
-   commands:
--  - export TORCH_NCCL_BLOCKING_WAIT=1
-   - VLLM_TEST_SAME_HOST=1 torchrun --nproc-per-node=4 distributed/test_same_node.py | grep 'Same node test passed'
-   - VLLM_TEST_SAME_HOST=1 VLLM_TEST_WITH_DEFAULT_DEVICE_SET=1 torchrun --nproc-per-node=4 distributed/test_same_node.py | grep 'Same node test passed'
-   - CUDA_VISIBLE_DEVICES=0,1 pytest -v -s v1/shutdown
-@@ -2543,7 +2529,6 @@ steps:
-   - tests/distributed/test_multiproc_executor.py
-   - vllm/platforms/rocm.py
-   commands:
--  - export TORCH_NCCL_BLOCKING_WAIT=1
-   - pytest -v -s compile/fullgraph/test_basic_correctness.py
-   - pytest -v -s distributed/test_pynccl.py
-   - pytest -v -s distributed/test_events.py
-@@ -2723,7 +2708,6 @@ steps:
-   - vllm/_aiter_ops.py
-   - vllm/platforms/rocm.py
-   commands:
--  - export TORCH_NCCL_BLOCKING_WAIT=1
-   - pytest -v -s tests/distributed/test_context_parallel.py
-   - pytest -v -s tests/v1/distributed/test_dbo.py
++            cache = kv_c_and_k_pe_cache
++            if cache.dim() == 3:
++                cache = cache.unsqueeze(-2)  # add num_heads_kv=1 dim
++            assert cache.dim() == 4 and cache.size(-2) == 1, (
++                "kv_c_and_k_pe_cache must be [num_blocks, block_size, "
++                "(num_heads_kv=1)?, kv_lora_rank+qk_rope_head_dim]"
++            )
++
++            q = torch.cat([q_nope, q_pe], dim=-1)
++            if not q.is_contiguous():
++                q = q.contiguous()
++
++            out = flash_attn_varlen_func(
++                q,
++                cache,
++                cache.narrow(-1, 0, self.kv_lora_rank),
++                max_seqlen_q=1,
++                cu_seqlens_q=decode_cu_seqlens_q,
++                max_seqlen_k=attn_metadata.decode.max_seq_len,
++                seqused_k=attn_metadata.decode.seq_lens,
++                block_table=attn_metadata.decode.block_table,
++                softmax_scale=self.scale,
++                causal=False,
++                fa_version=2,
++                return_softmax_lse=False,
++            )
++            return out, None
++
+         kv_c_cache = kv_c_and_k_pe_cache[..., : self.kv_lora_rank]
+         k_pe_cache = kv_c_and_k_pe_cache[..., self.kv_lora_rank :]
  
 -- 
 2.39.5 (Apple Git-154)
 
 
-From 5a0a8fc1ea7542394ff315138bd5677b7b53bca1 Mon Sep 17 00:00:00 2001
-From: Russell Bryant <rbryant@redhat.com>
-Date: Wed, 6 May 2026 19:54:29 -0400
-Subject: [PATCH 13/13] [Docs] add cache directory security guidance (#38920)
+From 2394a63c2b8978cc109f91899efd529f63ca29a2 Mon Sep 17 00:00:00 2001
+From: Yan Ma <yan.ma@intel.com>
+Date: Mon, 18 May 2026 01:39:34 +0000
+Subject: [PATCH 11/17] fix parameter mismatch - 1
 
-Signed-off-by: Russell Bryant <rbryant@redhat.com>
+Signed-off-by: Yan Ma <yan.ma@intel.com>
 ---
- docs/usage/security.md | 24 ++++++++++++++++++++++++
- 1 file changed, 24 insertions(+)
+ vllm/model_executor/layers/fused_moe/runner/moe_runner.py | 1 +
+ 1 file changed, 1 insertion(+)
 
-diff --git a/docs/usage/security.md b/docs/usage/security.md
-index 300cabbfc..e548899ab 100644
---- a/docs/usage/security.md
-+++ b/docs/usage/security.md
-@@ -309,6 +309,30 @@ vLLM supports dynamically loading and unloading LoRA adapters at runtime via the
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index fa3bea600..ad283db37 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -648,6 +648,7 @@ class MoERunner(MoERunnerInterface):
+                 None,
+                 input_ids,
+                 self._encode_layer_name(),
++                self._trtllm_mxfp4_unpadded_dim(),
+             )
+             return self._maybe_reduce_final_output(result, og_hidden_dim)
  
- **Warning:** Dynamic LoRA loading is not a secure operation and should not be enabled in deployments exposed to untrusted clients. If you must enable dynamic LoRA loading, restrict access to the `/v1/load_lora_adapter` and `/v1/unload_lora_adapter` endpoints to trusted administrators only, using a reverse proxy or network-level access controls. Do not expose these endpoints to end users. For details on configuring LoRA adapters, see the [LoRA Adapters documentation](../features/lora.md).
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 2b61eb4ddb4bb5e96348f5f99482904585d10c58 Mon Sep 17 00:00:00 2001
+From: Yan Ma <yan.ma@intel.com>
+Date: Tue, 19 May 2026 11:49:12 +0000
+Subject: [PATCH 12/17] cherry-pick sampler fix - 41771
+
+Signed-off-by: Yan Ma <yan.ma@intel.com>
+---
+ vllm/v1/sample/ops/topk_topp_sampler.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/vllm/v1/sample/ops/topk_topp_sampler.py b/vllm/v1/sample/ops/topk_topp_sampler.py
+index 363b113f0..c538fd58c 100644
+--- a/vllm/v1/sample/ops/topk_topp_sampler.py
++++ b/vllm/v1/sample/ops/topk_topp_sampler.py
+@@ -289,6 +289,11 @@ class TopKTopPSampler(nn.Module):
+         torch.ops.vllm.xpu_topk_topp_sampler(
+             random_sampled, logits_to_return, logits, k, p, self.logprobs_mode, seeds
+         )
++        # The custom XPU sampler kernel consumes RNG values internally, so advance
++        # the default generator's offset to keep future draws deterministic.
++        offset = (offset + logits.numel() + 3) // 4 * 4
++        state.view(torch.int64)[1] = offset
++        generator.set_state(state)
+         return random_sampled, logits_to_return
  
-+## Cache Directory Security
+ 
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 68f10dc4950dc745350c4389865763cac2fe4c3e Mon Sep 17 00:00:00 2001
+From: Yan Ma <yan.ma@intel.com>
+Date: Thu, 21 May 2026 01:39:57 +0000
+Subject: [PATCH 13/17] Revert "[XPU] Implement out-of-place all-reduce
+ functionality (#41808)"
+
+This reverts commit 2a84da3b17a9d0b6b10f7c0347fe9529307596ec.
+---
+ vllm/distributed/device_communicators/xpu_communicator.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/vllm/distributed/device_communicators/xpu_communicator.py b/vllm/distributed/device_communicators/xpu_communicator.py
+index 209005c5b..29c731fbc 100644
+--- a/vllm/distributed/device_communicators/xpu_communicator.py
++++ b/vllm/distributed/device_communicators/xpu_communicator.py
+@@ -42,7 +42,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
+                 logger.info("Using AgRs manager on XPU device.")
+ 
+     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+-        output = input_.clone()
++        output = input_.clone() if torch.compiler.is_compiling() else input_
+         dist.all_reduce(output, group=self.device_group)
+         return output
+ 
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 2b6f437aaf8401629f548c3af23221c1b1dcf9d1 Mon Sep 17 00:00:00 2001
+From: YiSheng5 <yi.sheng@intel.com>
+Date: Wed, 27 May 2026 10:03:39 +0800
+Subject: [PATCH 14/17] fix the accuracy issues when using DP (#190)
+
+---
+ .../layers/fused_moe/modular_kernel.py        | 43 +++++++++++--------
+ 1 file changed, 26 insertions(+), 17 deletions(-)
+
+diff --git a/vllm/model_executor/layers/fused_moe/modular_kernel.py b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+index 941d22f3d..65b4e137a 100644
+--- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
++++ b/vllm/model_executor/layers/fused_moe/modular_kernel.py
+@@ -1399,24 +1399,33 @@ class FusedMoEKernelModularImpl:
+             global_num_experts = local_num_experts
+ 
+         if current_platform.is_xpu():
+-            self.fused_experts.apply(
+-                output=output,
+-                hidden_states=hidden_states,
+-                w1=w1,
+-                w2=w2,
+-                topk_weights=topk_weights,
+-                topk_ids=topk_ids,
+-                activation=activation,
+-                global_num_experts=global_num_experts,
+-                expert_map=expert_map,
+-                a1q_scale=None,
+-                a2_scale=self.fused_experts.a2_scale,
+-                workspace13=None,
+-                workspace2=None,
+-                expert_tokens_meta=None,
+-                apply_router_weight_on_input=apply_router_weight_on_input,
++            dp_size = (
++                self.moe_parallel_config.dp_size
++                if self.moe_parallel_config is not None
++                else 1
+             )
+-            return output
++            # Only DP <=1 can go this path, cause
++            # prepare/finalize handles the AllGather/ReduceScatter needed
++            # to gather/dispatch tokens across DP ranks.
++            if dp_size <= 1:
++                self.fused_experts.apply(
++                    output=output,
++                    hidden_states=hidden_states,
++                    w1=w1,
++                    w2=w2,
++                    topk_weights=topk_weights,
++                    topk_ids=topk_ids,
++                    activation=activation,
++                    global_num_experts=global_num_experts,
++                    expert_map=expert_map,
++                    a1q_scale=None,
++                    a2_scale=self.fused_experts.a2_scale,
++                    workspace13=None,
++                    workspace2=None,
++                    expert_tokens_meta=None,
++                    apply_router_weight_on_input=apply_router_weight_on_input,
++                )
++                return output
+ 
+         a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
+             hidden_states,
+-- 
+2.39.5 (Apple Git-154)
+
+
+From cd629e665bf686d4bfce1ef10e24f3279609124f Mon Sep 17 00:00:00 2001
+From: wenjun liu <wenjun.liu@intel.com>
+Date: Wed, 27 May 2026 10:32:04 +0800
+Subject: [PATCH 15/17] update kernel to 0.1.8.2 (#192)
+
+---
+ requirements/xpu.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/requirements/xpu.txt b/requirements/xpu.txt
+index 5131abc87..a5d0cd088 100644
+--- a/requirements/xpu.txt
++++ b/requirements/xpu.txt
+@@ -16,4 +16,4 @@ torch==2.11.0+xpu
+ torchaudio
+ torchvision
+ 
+-#vllm_xpu_kernels @ https://github.com/vllm-project/vllm-xpu-kernels/releases/download/v0.1.7/vllm_xpu_kernels-0.1.7-cp38-abi3-manylinux_2_28_x86_64.whl
++vllm_xpu_kernels @ https://github.com/vllm-project/vllm-xpu-kernels/releases/download/v0.1.8.2/vllm_xpu_kernels-0.1.8.2-cp38-abi3-manylinux_2_28_x86_64.whl
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 9b668217f8328510560f59ad786e580dd8fc4cd5 Mon Sep 17 00:00:00 2001
+From: YiSheng5 <yi.sheng@intel.com>
+Date: Fri, 29 May 2026 10:00:08 +0800
+Subject: [PATCH 16/17] disable async_scheduling when PP is enabled (#194)
+
+---
+ vllm/platforms/xpu.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
+index 4145dedc8..df76fa167 100644
+--- a/vllm/platforms/xpu.py
++++ b/vllm/platforms/xpu.py
+@@ -255,6 +255,12 @@ class XPUPlatform(Platform):
+ 
+         # check and update parallel config
+         parallel_config = vllm_config.parallel_config
 +
-+vLLM assumes that its cache directories are **private and trusted**. Cache contents are loaded without cryptographic integrity verification, including formats that support arbitrary code execution. If an untrusted user or process can write to vLLM's cache directories, they may be able to crash vLLM or cause it to execute arbitrary code.
++        # Disable async scheduling when pipeline parallelism is enabled on XPU
++        if parallel_config.pipeline_parallel_size > 1:
++            scheduler_config = vllm_config.scheduler_config
++            scheduler_config.async_scheduling = False
 +
-+**Do not share vLLM cache directories with untrusted users or mount them from untrusted storage.** Treat the cache directory with the same care as the vLLM installation itself.
+         # Only override worker_cls if it's still the default "auto"
+         # This allows custom workers (like vllm-omni workers) to be used on XPU
+         if parallel_config.worker_cls == "auto":
+-- 
+2.39.5 (Apple Git-154)
+
+
+From 848eda6c0d8c172357edc61c0ec7b8d6139d701d Mon Sep 17 00:00:00 2001
+From: Yan Ma <yan.ma@intel.com>
+Date: Sat, 30 May 2026 10:26:51 +0800
+Subject: [PATCH 17/17] Add release note (#193)
+
+* Add release note
+
+Signed-off-by: Yan Ma <yan.ma@intel.com>
+
+* update
+
+Signed-off-by: Yan Ma <yan.ma@intel.com>
+
+* update
+
+Signed-off-by: Yan Ma <yan.ma@intel.com>
+
+* Update 0.21.0-xpu.md
+
+---------
+
+Signed-off-by: Yan Ma <yan.ma@intel.com>
+Co-authored-by: Roger Feng <roger.feng@intel.com>
+---
+ 0.21.0-xpu.md | 259 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 259 insertions(+)
+ create mode 100755 0.21.0-xpu.md
+
+diff --git a/0.21.0-xpu.md b/0.21.0-xpu.md
+new file mode 100755
+index 000000000..c020c5dbe
+--- /dev/null
++++ b/0.21.0-xpu.md
+@@ -0,0 +1,259 @@
++# Contents of the vLLM Container
 +
-+### Cache Directory Configuration
++This container image is optimized for use with Intel® GPUs. It includes the complete source for this vLLM release in `/workspace/vllm`, and vLLM is prebuilt and installed in the default system Python environment (`/usr/local/lib/python3.12/dist-packages/vllm`). It has been validated on [Intel® Arc™ Pro B-Series Graphics](https://www.intel.com/content/www/us/en/products/docs/discrete-gpus/arc/workstations/b-series/overview.html). The following bill of materials was used during validation:
 +
-+Most cache paths default to subdirectories under a single root. Changing `VLLM_CACHE_ROOT` changes the default location for all features that inherit from it. When `torch.compile` caching is enabled (the default), vLLM also redirects `TRITON_CACHE_DIR` into this tree. If compile caching is disabled, Triton falls back to its own default location (`~/.triton/cache`).
++| Ingredients | Version |
++| --- | --- |
++| vLLM | 0.21.0 |
++| vllm-xpu-kernels | 0.1.8.2 |
++| Host OS | Ubuntu 25.04 |
++| Python | 3.12 |
++| PyTorch | 2.11 |
++| Transformers | 5.8.0 |
++| KMD Driver | 6.14.0-1011-intel with IOMMU OFF |
++| UMD | 26.14.37833.4 |
++| oneAPI | 2025.3.3 |
++| oneCCL | 2021.15.9.14 |
 +
-+| Environment Variable | Default | Description |
++For more information about vLLM, visit [vLLM Docs](https://docs.vllm.ai/en/latest/).
++
++## 1. What's New in This Release?
++
++* Most workloads achieve obvious performance improvement compared with [v0.14.1](https://github.com/intel/ai-containers/blob/main/vllm/0.14.1-xpu.md) release, especially in 1k/512 input/output seq length scenarios with up to 1.74X boost. Note that in this release, the first round performance doesn't reflect peak values because of JIT compilation overhead. It is recommended to perform warm-up runs before and set `--temperature=0` to collect stable and reproducible performance data.
++* MLA (Multi-head Latent Attention) is functionally supported and validated with the `deepseek-ai/DeepSeek-V2-Lite` model.
++* GDN (GatedDeltaNet) attention XPU kernel is introduced for Qwen3-Next models, delivering more than 1.1x end-to-end performance improvement compared with the Triton implementation.
++
++## 2. What's Supported?
++
++This release supports core vLLM serving capabilities on Intel® GPUs, including online FP8 quantization, multimodal models, pooling models, and multi-GPU scaling strategies. In addition to dense model serving, it also includes expert parallelism and validated support for MoE models.
++
++| Feature | Description | Note |
 +| --- | --- | --- |
-+| `VLLM_CACHE_ROOT` | `~/.cache/vllm` | Base cache directory. Respects `XDG_CACHE_HOME` if set. All paths below inherit from this unless explicitly overridden. |
-+| *(torch.compile)* | `$VLLM_CACHE_ROOT/torch_compile_cache/` | Compilation cache for AOT-compiled models, Inductor graphs, and Triton kernels. Controlled by `VLLM_DISABLE_COMPILE_CACHE` (set to `1` to disable). |
-+| `VLLM_ASSETS_CACHE` | `$VLLM_CACHE_ROOT/assets/` | Downloaded assets (e.g., tokenizer files). |
-+| `VLLM_XLA_CACHE_PATH` | `$VLLM_CACHE_ROOT/xla_cache/` | XLA/TPU compilation cache. |
-+| `VLLM_MEDIA_CACHE` | *(disabled)* | Optional cache for downloaded media (images, video, audio). Not enabled unless explicitly set. |
++| FP8 Online Quantization | vLLM supports weight-only online dynamic quantization with FP8, enabling up to a 2x reduction in model memory requirements and up to a 1.6x throughput improvement with minimal accuracy impact. BF16 and FP16 models can be quantized dynamically to FP8 without calibration data. | See the [example](https://docs.vllm.ai/en/stable/features/quantization/fp8/?h=online+dynamic#online-dynamic-quantization). |
++| Multi-Modality Support | Intel® GPUs support many of the popular multimodal models listed upstream [here](https://docs.vllm.ai/en/stable/models/supported_models/#list-of-multimodal-language-models), including the Qwen VL series, InternVL series, whisper-large-v3, DeepSeek-OCR, and PaddleOCR-VL. | For example, `Qwen/Qwen2.5-VL-32B-Instruct` can run on four Intel® Arc™ Pro B60 Graphics cards for multimodal workloads. |
++| Pooling Models Support | vLLM supports pooling models such as embedding, classification, and reward models, and these model types are supported on Intel® GPUs. | For detailed usage, refer to the [guide](https://docs.vllm.ai/en/latest/models/pooling_models.html). |
++| Pipeline Parallelism | Pipeline parallelism distributes model layers across multiple GPUs, with each GPU processing a different stage of the model in sequence. | On Intel® GPUs, this is supported on a single node with `mp` as the backend. |
++| Data Parallelism | vLLM supports [Data Parallelism](https://docs.vllm.ai/en/latest/serving/data_parallel_deployment.html), where model weights are replicated across separate instances or GPUs to process independent request batches. | Supports both dense and MoE models. |
++| Expert Parallelism | Experimental support for [Expert Parallelism](https://docs.vllm.ai/en/stable/serving/expert_parallel_deployment), which allows experts in Mixture-of-Experts (MoE) models to be deployed across separate GPUs. | In this release, `TP+DP+EP` is supported. |
++| Speculative Decoding | [Speculative Decoding](https://docs.vllm.ai/en/stable/features/speculative_decoding/) with vLLM helps reduce inter-token latency under medium-to-low QPS (query per second), memory-bound workloads. | XPU supports methods `n-gram`, `EAGLE`, `EAGLE3`, `medusa`, and `suffix`. |
++| FP8 KV cache | Quantized KV cache can reduce memory footprint by allowing approximately double the amount of space for KV cache allocation. This enables either processing longer context lengths for individual requests, or handling more concurrent request batches. | XPU supports FP8 KV cache with per-tensor quantization. |
 +
-+### Recommendations
++In addition, features such as async scheduling, cpu kv cache offloading, [automatic prefix caching](https://docs.vllm.ai/en/latest/design/prefix_caching), [reasoning outputs](https://docs.vllm.ai/en/latest/features/reasoning_outputs.html), [structured outputs](https://docs.vllm.ai/en/latest/features/structured_outputs.html) and [tool calling](https://docs.vllm.ai/en/latest/features/tool_calling.html) are also supported.
 +
-+- **Restrict file permissions** on `VLLM_CACHE_ROOT` (and any other cache directories used by dependencies, such as `~/.triton` if compile caching is disabled) so that only the vLLM process owner can read and write to them.
-+- **Do not copy cache contents from untrusted sources.** If you distribute cache artifacts between environments, ensure they originate from a trusted build pipeline.
-+- **Container deployments:** If mounting cache directories into containers, ensure the volume source is trusted.
++## 3. Supported Models
 +
- ## Reporting Security Vulnerabilities
- 
- If you believe you have found a security vulnerability in vLLM, please report it following the project's security policy. For more information on how to report security issues and the project's security policy, please see the [vLLM Security Policy](https://github.com/vllm-project/vllm/blob/main/SECURITY.md).
++The following tables list the models validated by Intel. Support for vLLM on Intel® GPUs extends to a broader set of models beyond this list.
++
++### Text Generation Models
++
++These models primarily use the `LLM.generate` API. Chat and instruct variants also support the `LLM.chat` API.
++
++| Model (company/model name)                | BF16/FP16 | Dynamic Online FP8 | MXFP4 |
++|-------------------------------------------| --- | --- | -- |
++| openai/gpt-oss-20b                        | | |✅︎|
++| openai/gpt-oss-120b                       | | |✅︎|
++| deepseek-ai/DeepSeek-R1-Distill-Llama-8B  |✅︎|✅︎| |
++| deepseek-ai/DeepSeek-R1-Distill-Qwen-14B  |✅︎|✅︎| |
++| deepseek-ai/DeepSeek-R1-Distill-Qwen-32B  |✅︎|✅︎| |
++| deepseek-ai/DeepSeek-R1-Distill-Llama-70B |✅︎|✅︎| |
++| deepseek-ai/DeepSeek-Coder-33B-base       |✅︎|✅︎| |
++| Qwen/Qwen2.5-72B-Instruct                 |✅︎|✅︎| |
++| Qwen/Qwen3-14B                            |✅︎|✅︎| |
++| Qwen/Qwen3-32B                            |✅︎|✅︎| |
++| Qwen/Qwen3-30B-A3B                        |✅︎|✅︎| |
++| Qwen/Qwen3-coder-30B-A3B-Instruct         |✅︎|✅︎| |
++| Qwen/Qwen3-NEXT-80B-A3B-Instruct          |✅︎|✅︎| |
++| Qwen/Qwen3-NEXT-80B-A3B-Thinking          |✅︎|✅︎| |
++| Qwen/QwQ-32B                              |✅︎|✅︎| |
++| openbmb/MiniCPM-V-4                       |✅︎|✅︎| |
++| deepseek-ai/DeepSeek-V2-Lite              |✅︎|✅︎| |
++| meta-llama/Llama-3.1-8B-Instruct          |✅︎|✅︎| |
++| THUDM/GLM-4-9B-chat                       |✅︎|✅︎| |
++| THUDM/GLM-4v-9B-chat                      |✅︎|✅︎| |
++| THUDM/CodeGeex4-All-9B                    |✅︎|✅︎| |
++| chuhac/TeleChat2-35B                      |✅︎|✅︎| |
++| 01-ai/Yi1.5-34B-Chat                      |✅︎|✅︎| |
++| deepseek-ai/DeepSeek-Coder-33B-base       |✅︎|✅︎| |
++| meta-llama/Llama-2-13b-chat-hf            |✅︎|✅︎| |
++| Qwen/Qwen1.5-14B-Chat                     |✅︎|✅︎| |
++| Qwen/Qwen1.5-32B-Chat                     |✅︎|✅︎| |
++
++Per-tensor and per-channel `compressed_tensors` quantized models such as `RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic` are also supported.
++
++### Multimodal Models
++
++Supported modalities vary by model and include text, image, video, and audio:
++
++| Model (company/model name)                | BF16/FP16 | Dynamic Online FP8 | Text | Image | Video | Audio |
++|-------------------------------------------| --- | --- | -- | -- | -- | -- |
++| openai/whisper-large-v3                   |✅︎| | | | |✅︎|
++| deepseek-ai/DeepSeek-OCR                  |✅︎|✅︎|✅︎|✅︎| | |
++| PaddlePaddle/PaddleOCR-VL                 |✅︎|✅︎|✅︎|✅︎| | |
++| Qwen/Qwen2-VL-7B-Instruct                 |✅︎|✅︎|✅︎|✅︎|✅︎| |
++| Qwen/Qwen2.5-VL-72B-Instruct              |✅︎|✅︎|✅︎|✅︎|✅︎| |
++| Qwen/Qwen2.5-VL-32B-Instruct              |✅︎|✅︎|✅︎|✅︎|✅︎| |
++| OpenGVLab/InternVL3_5-8B                  |✅︎|✅︎|✅︎|✅︎|✅︎| |
++| OpenGVLab/InternVL3_5-14B                 |✅︎|✅︎|✅︎|✅︎|✅︎| |
++| OpenGVLab/InternVL3_5-38B                 |✅︎|✅︎|✅︎|✅︎|✅︎| |
++| OpenGVLab/InternVL3_5-30B-A3B             |✅︎|✅︎|✅︎|✅︎|✅︎| |
++| openbmb/MiniCPM-V-4                       |✅︎|✅︎|✅︎|✅︎|✅︎| |
++
++### Pooling Models
++
++These models primarily support the `LLM.embed` API. The following table lists the models validated on XPU.
++
++| Model Type      | Model (company/model name)                | BF16 | Dynamic Online FP8 |
++|-----------------|-------------------------------------------| --- | --- |
++| Embedding Model | Qwen/Qwen3-Embedding-8B                   |✅︎|✅︎|
++| Reranker Model  | Qwen/Qwen3-Reranker-8B                    |✅︎|✅︎|
++
++## 4. Limitations
++
++The following items are currently known issues and limitations:
++
++* `vllm serve` uses aggressive GPU memory allocation by default. If you encounter an out-of-memory (OOM) condition, reduce the GPU memory utilization setting when starting the server. For example: `vllm serve  --gpu-memory-utilization 0.8`.
++* `torch.compile` is currently not supported.
++* For BF16 models with 8K input and 2K output sequence lengths, TPOT performance shows an approximately 10% regression compared to the 0.14.1 release. This issue is expected to be resolved with PyTorch 2.12.
++* A TPOT performance regression has been observed for the Qwen/Qwen3-30B-A3B model with 8K input and 2K output sequence lengths. The regression is caused by additional host overhead introduced by the vLLM `FusedMoE` refactor in upstream.
++
++## 5. How to Get Started
++
++### 5.1. Prerequisites
++
++| OS | Hardware |
++| ---------- | ---------- |
++| Ubuntu 25.04 | Intel® Arc™ B-Series |
++
++### 5.2. Prepare a Serving Environment
++
++1. Pull the released Docker image:
++
++   ```bash
++   docker pull <docker-image-name>:<tag>
++   ```
++
++2. Start the container:
++
++   ```bash
++   docker run -t -d --shm-size 10g --net=host --ipc=host --privileged \
++     -v /dev/dri/by-path:/dev/dri/by-path --name=vllm-test \
++     --device /dev/dri:/dev/dri --entrypoint=/bin/bash <docker-image-name>:<tag>
++   ```
++
++3. Open two terminals and run `docker exec -it vllm-test bash` in both. Use one terminal for the server and the other for the client.
++
++From this point on, all commands are expected to be run inside the Docker container unless noted otherwise.
++
++In both environments, you may want to set the `HUGGING_FACE_HUB_TOKEN` environment variable so the required files can be downloaded from Hugging Face.
++
++```bash
++export HUGGING_FACE_HUB_TOKEN=xxxxxx
++```
++
++### 5.3. Launch Workloads
++
++#### 5.3.1. Launch the Server in the Server Environment
++
++Command:
++
++```bash
++VLLM_WORKER_MULTIPROC_METHOD=spawn vllm serve deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
++  --dtype=float16 \
++  --enforce-eager \
++  --port 8000 \
++  --block-size 64 \
++  --gpu-memory-util 0.9 \
++  --no-enable-prefix-caching \
++  --trust-remote-code \
++  --max-num-batched-tokens=8192 \
++  --max-model-len 4096 \
++  -tp=4 \
++  --quantization fp8
++```
++
++Expected output:
++
++```bash
++INFO 03-20 03:20:29 api_server.py:937] Starting vLLM API server on http://0.0.0.0:8000
++INFO 03-20 03:20:29 launcher.py:23] Available routes are:
++INFO 03-20 03:20:29 launcher.py:31] Route: /openapi.json, Methods: HEAD, GET
++INFO 03-20 03:20:29 launcher.py:31] Route: /docs, Methods: HEAD, GET
++INFO 03-20 03:20:29 launcher.py:31] Route: /docs/oauth2-redirect, Methods: HEAD, GET
++INFO 03-20 03:20:29 launcher.py:31] Route: /redoc, Methods: HEAD, GET
++INFO 03-20 03:20:29 launcher.py:31] Route: /health, Methods: GET
++INFO 03-20 03:20:29 launcher.py:31] Route: /ping, Methods: POST, GET
++INFO 03-20 03:20:29 launcher.py:31] Route: /tokenize, Methods: POST
++INFO 03-20 03:20:29 launcher.py:31] Route: /detokenize, Methods: POST
++INFO 03-20 03:20:29 launcher.py:31] Route: /v1/models, Methods: GET
++INFO 03-20 03:20:29 launcher.py:31] Route: /version, Methods: GET
++INFO 03-20 03:20:29 launcher.py:31] Route: /v1/chat/completions, Methods: POST
++INFO 03-20 03:20:29 launcher.py:31] Route: /v1/completions, Methods: POST
++INFO 03-20 03:20:29 launcher.py:31] Route: /v1/embeddings, Methods: POST
++INFO 03-20 03:20:29 launcher.py:31] Route: /pooling, Methods: POST
++INFO 03-20 03:20:29 launcher.py:31] Route: /score, Methods: POST
++INFO 03-20 03:20:29 launcher.py:31] Route: /v1/score, Methods: POST
++INFO 03-20 03:20:29 launcher.py:31] Route: /v1/audio/transcriptions, Methods: POST
++INFO 03-20 03:20:29 launcher.py:31] Route: /rerank, Methods: POST
++INFO 03-20 03:20:29 launcher.py:31] Route: /v1/rerank, Methods: POST
++INFO 03-20 03:20:29 launcher.py:31] Route: /v2/rerank, Methods: POST
++INFO 03-20 03:20:29 launcher.py:31] Route: /invocations, Methods: POST
++INFO:     Started server process [1636943]
++INFO:     Waiting for application startup.
++INFO:     Application startup complete.
++```
++
++Startup may take some time. When `INFO:     Application startup complete.` appears, the server is ready.
++
++#### 5.3.2. Send Benchmark Requests from the Client Environment
++
++Use the following command to send benchmark requests:
++
++```bash
++vllm bench serve \
++  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
++  --dataset-name random \
++  --random-input-len=1024 \
++  --random-output-len=1024 \
++  --ignore-eos \
++  --num-prompt 16 \
++  --max-concurrency 16 \
++  --temperature=0 \
++  --request-rate inf \
++  --backend vllm \
++  --port=8000 \
++  --host 0.0.0.0 \
++  --ready-check-timeout-sec 1
++```
++
++This command uses the `deepseek-ai/DeepSeek-R1-Distill-Qwen-32B` model. Both the input and output lengths are set to `1024` tokens, and the server processes up to `16` requests concurrently.
++
++Expected output:
++
++```bash
++Maximum request concurrency: 16
++============ Serving Benchmark Result ============
++Successful requests:                     1
++Benchmark duration (s):                  xxx
++Total input tokens:                      1024
++Total generated tokens:                  1024
++Request throughput (req/s):              xxx
++Output token throughput (tok/s):         xxx
++Total Token throughput (tok/s):          xxx
++---------------Time to First Token----------------
++Mean TTFT (ms):                          xxx
++Median TTFT (ms):                        xxx
++P99 TTFT (ms):                           xxx
++-----Time per Output Token (excl. 1st token)------
++Mean TPOT (ms):                          xxx
++Median TPOT (ms):                        xxx
++P99 TPOT (ms):                           xxx
++---------------Inter-token Latency----------------
++Mean ITL (ms):                           xxx
++Median ITL (ms):                         xxx
++P99 ITL (ms):                            xxx
++==================================================
++```
++
++## 6. Need Assistance?
++
++If you encounter any issues or have questions, please submit an issue at [vLLM GitHub Issues](https://github.com/vllm-project/vllm/issues). Include the text `[Intel GPU]` in the issue title so it is routed appropriately.
 -- 
 2.39.5 (Apple Git-154)
 
