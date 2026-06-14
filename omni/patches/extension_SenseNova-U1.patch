@@ -1,0 +1,289 @@
+diff --git a/SenseNova/examples/utils.py b/SenseNova/examples/utils.py
+index 52caa5f..842ae85 100644
+--- a/SenseNova/examples/utils.py
++++ b/SenseNova/examples/utils.py
+@@ -13,10 +13,47 @@ _M = TypeVar("_M", bound=torch.nn.Module)
+ T = TypeVar("T")
+ 
+ 
++def _get_device_module(target_device):
++    if isinstance(target_device, torch.device):
++        device = target_device
++    else:
++        device = torch.device(target_device)
++    return getattr(torch, device.type, None), device
++
++
++def _synchronize_device(target_device=None) -> None:
++    if target_device is None:
++        if torch.cuda.is_available():
++            torch.cuda.synchronize()
++            return
++        if hasattr(torch, "xpu") and torch.xpu.is_available():
++            try:
++                torch.xpu.synchronize()
++            except TypeError:
++                torch.xpu.synchronize(0)
++            return
++        return
++
++    device_module, device = _get_device_module(target_device)
++    if device_module is None or not hasattr(device_module, "synchronize"):
++        return
++    try:
++        device_module.synchronize(device=device)
++    except TypeError:
++        device_module.synchronize()
++
++
++def _empty_device_caches() -> None:
++    if torch.cuda.is_available():
++        torch.cuda.empty_cache()
++    if hasattr(torch, "xpu") and torch.xpu.is_available():
++        torch.xpu.empty_cache()
++
++
+ def cleanup_memory() -> None:
+     gc.collect()
+-    torch.cuda.empty_cache()
+-    torch.cuda.synchronize()
++    _empty_device_caches()
++    _synchronize_device()
+ 
+ 
+ @contextmanager
+@@ -27,7 +64,7 @@ def _expert_streaming_ctx(model,target_device,prefetch_count):
+         yield wrapper
+     finally:
+         wrapper.teardown()
+-        torch.cuda.synchronize(device=target_device)
++        _synchronize_device(target_device)
+         try:
+             if hasattr(torch._C, "_host_emptyCache"):
+                 torch._C._host_emptyCache()
+@@ -59,7 +96,7 @@ def _streaming_model(
+         # returned to the OS.  Without this, sequential streaming models
+         # (e.g. text encoder then transformer) exhaust host memory because the
+         # CachingHostAllocator keeps freed blocks cached indefinitely.
+-        torch.cuda.synchronize(device=target_device)
++        _synchronize_device(target_device)
+         try:
+             if hasattr(torch._C, "_host_emptyCache"):
+                 torch._C._host_emptyCache()
+@@ -89,7 +126,7 @@ def _streaming_model_(
+         # returned to the OS.  Without this, sequential streaming models
+         # (e.g. text encoder then transformer) exhaust host memory because the
+         # CachingHostAllocator keeps freed blocks cached indefinitely.
+-        torch.cuda.synchronize(device=target_device)
++        _synchronize_device(target_device)
+         try:
+             if hasattr(torch._C, "_host_emptyCache"):
+                 torch._C._host_emptyCache()
+diff --git a/SenseNova/src/sensenova_u1/models/neo_unify/configuration_neo_chat.py b/SenseNova/src/sensenova_u1/models/neo_unify/configuration_neo_chat.py
+index bb59f0e..c3e1f42 100644
+--- a/SenseNova/src/sensenova_u1/models/neo_unify/configuration_neo_chat.py
++++ b/SenseNova/src/sensenova_u1/models/neo_unify/configuration_neo_chat.py
+@@ -21,6 +21,9 @@ class NEOLLMConfig(Qwen3Config):
+         super().__init__(**kwargs)
+         self.rope_theta_hw = rope_theta_hw
+         self.max_position_embeddings_hw = max_position_embeddings_hw
++        # transformers>=5 may omit rope_theta on some qwen3-derived configs.
++        if getattr(self, "rope_theta", None) is None:
++            self.rope_theta = kwargs.get("rope_theta", rope_theta_hw)
+ 
+ 
+ class NEOMoELLMConfig(Qwen3MoeConfig):
+@@ -55,6 +58,9 @@ class NEOMoELLMConfig(Qwen3MoeConfig):
+         super().__init__(**kwargs)
+         self.rope_theta_hw = rope_theta_hw
+         self.max_position_embeddings_hw = max_position_embeddings_hw
++        # transformers>=5 may omit rope_theta on some qwen3-derived configs.
++        if getattr(self, "rope_theta", None) is None:
++            self.rope_theta = kwargs.get("rope_theta", rope_theta_hw)
+ 
+         # Generation-path MoE knobs default to the understanding-path values
+         # so legacy single-MoE configs (where both branches share the same
+diff --git a/SenseNova/src/sensenova_u1/models/neo_unify/modeling_neo_chat.py b/SenseNova/src/sensenova_u1/models/neo_unify/modeling_neo_chat.py
+index 23a1393..42be9d0 100644
+--- a/SenseNova/src/sensenova_u1/models/neo_unify/modeling_neo_chat.py
++++ b/SenseNova/src/sensenova_u1/models/neo_unify/modeling_neo_chat.py
+@@ -28,6 +28,19 @@ def version_cmp(v1, v2, op='eq'):
+     op_func = getattr(operator, op)
+     return op_func(version.parse(v1), version.parse(v2))
+ 
++
++def _clear_device_cache(device: torch.device) -> None:
++    device_module = getattr(torch, device.type, None)
++    if device_module is None:
++        return
++    if hasattr(device_module, "empty_cache"):
++        device_module.empty_cache()
++    if hasattr(device_module, "synchronize"):
++        try:
++            device_module.synchronize(device=device)
++        except TypeError:
++            device_module.synchronize()
++
+ def prepare_flash_kv_cache(
+     past_key_values,
+     current_len: int,
+@@ -92,7 +105,6 @@ def clear_flash_kv_cache(past_key_values):
+         if hasattr(layer, "flash_v_cache"):
+             delattr(layer, "flash_v_cache")
+ 
+-@torch.cuda.amp.autocast(dtype=torch.float32)
+ def optimized_scale(positive_flat, negative_flat):
+ 
+     # Calculate dot production
+@@ -1248,8 +1260,7 @@ class NEOChatModel(PreTrainedModel):
+                 del indexes_image_text_uncondition, indexes_image_img_uncondition, indexes_image_condition
+                 del past_key_values_cond_cfg, past_key_values_tu_cfg, past_key_values_iu_cfg
+                 del attention_mask_condition, attention_mask_text_uncondition, attention_mask_img_uncondition
+-                torch.cuda.empty_cache()
+-                torch.cuda.synchronize()
++                _clear_device_cache(device)
+                 
+                 img_count += 1
+                 print(f'All images is {max_images},Generated {img_count} images, {img_count / (time.time() - start_time):.2f} images per second')
+@@ -1319,8 +1330,7 @@ class NEOChatModel(PreTrainedModel):
+                 del outputs_cond, outputs_tu
+ 
+         del past_key_values_cond, past_key_values_tu, past_key_values_iu
+-        torch.cuda.empty_cache()
+-        torch.cuda.synchronize()
++        _clear_device_cache(device)
+         return generated_text, generated_images
+ 
+     @torch.no_grad()
+diff --git a/SenseNova/src/sensenova_u1/models/neo_unify/modeling_qwen3.py b/SenseNova/src/sensenova_u1/models/neo_unify/modeling_qwen3.py
+index 9f6af8e..5708cac 100644
+--- a/SenseNova/src/sensenova_u1/models/neo_unify/modeling_qwen3.py
++++ b/SenseNova/src/sensenova_u1/models/neo_unify/modeling_qwen3.py
+@@ -296,7 +296,9 @@ def _compute_default_rope_parameters(config, device=None, **_kwargs):
+     5.x dropped the ``"default"`` key from that table. Having a local copy keeps
+     ``Qwen3RotaryEmbedding`` working on both.
+     """
+-    base = config.rope_theta
++    base = getattr(config, "rope_theta", None)
++    if base is None:
++        base = getattr(config, "rope_theta_hw", 10000.0)
+     partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+     dim = int(head_dim * partial_rotary_factor)
+@@ -346,6 +348,17 @@ class Qwen3RotaryEmbedding(nn.Module):
+         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+         self.register_buffer("inv_freq", inv_freq, persistent=False)
+         self.original_inv_freq = self.inv_freq
++    
++    @staticmethod
++    def compute_default_rope_parameters(
++        config: Qwen3Config | None = None,
++        device: Optional["torch.device"] = None,
++        seq_len: int | None = None,
++    ) -> tuple["torch.Tensor", float]:
++        del seq_len
++        if config is None:
++            raise ValueError("`config` must be provided for RoPE initialization.")
++        return _compute_default_rope_parameters(config=config, device=device)
+ 
+     @torch.no_grad()
+     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
+diff --git a/SenseNova_node.py b/SenseNova_node.py
+index 76613fe..a6c0c91 100644
+--- a/SenseNova_node.py
++++ b/SenseNova_node.py
+@@ -14,10 +14,22 @@ from .SenseNova.examples.interleave.inference import infer_sensenova_interleave,
+ from .SenseNova.examples.vqa.inference import infer_sensenova_vqa
+ 
+ 
+-device = torch.device(
+-    "cuda:0") if torch.cuda.is_available() else torch.device(
+-    "mps") if torch.backends.mps.is_available() else torch.device(
+-    "cpu")
++def _detect_device() -> torch.device:
++    if torch.cuda.is_available():
++        return torch.device("cuda:0")
++    if hasattr(torch, "xpu") and torch.xpu.is_available():
++        return torch.device("xpu:0")
++    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
++        return torch.device("mps")
++    return torch.device("cpu")
++
++
++def _supports_streaming(target_device: torch.device) -> bool:
++    # Layer streaming wrappers currently rely on torch.cuda streams/events.
++    return target_device.type == "cuda"
++
++
++device = _detect_device()
+ 
+ MAX_SEED = np.iinfo(np.int32).max
+ node_cr_path = os.path.dirname(os.path.abspath(__file__))
+@@ -100,29 +112,32 @@ class SenseNova_SM_Sampler(io.ComfyNode):
+         cfg_interval=[0.0,1.0]
+         width,height=SUPPORTED_RESOLUTIONS_interleave[target_pixels] if img_mode=="interleave" else SUPPORTED_RESOLUTIONS[target_pixels]
+         images=tensor2pillist(image) if image is not None else None
+-        
+-        if prefetch_count==0:
++        streaming_prefetch_count = None if prefetch_count == 0 else prefetch_count
++        if streaming_prefetch_count is not None and not _supports_streaming(device):
++            print(f"[SenseNova] prefetch streaming only supports CUDA; disabling on {device.type}.")
++            streaming_prefetch_count = None
++
++        if streaming_prefetch_count is None:
+             model.model.to(device)
+-            prefetch_count=None
+         
+         if images is not None:
+             print(f"infer_mode is : {img_mode}")
+             if "edit"==img_mode:
+-                image,text=infer_sensenova_edit(model,prompt,cfg,cfg_norm,steps,batch_size,timestep_shift,img_cfg,cfg_interval,width,height,images,target_pixels,seed,prefetch_count,think_mode)
++                image,text=infer_sensenova_edit(model,prompt,cfg,cfg_norm,steps,batch_size,timestep_shift,img_cfg,cfg_interval,width,height,images,target_pixels,seed,streaming_prefetch_count,think_mode)
+             elif "vqa"==img_mode:
+                 image=torch.zeros((1,height, width,3))
+-                text=infer_sensenova_vqa(model,prompt,images[0],max_new_tokens,do_sample,temperature,top_p,top_k,repetition_penalty,prefetch_count)
++                text=infer_sensenova_vqa(model,prompt,images[0],max_new_tokens,do_sample,temperature,top_p,top_k,repetition_penalty,streaming_prefetch_count)
+             else:
+-                text,image=infer_sensenova_interleave(model,prompt,cfg,steps,timestep_shift,img_cfg,images,cfg_interval,width,height,think_mode,seed,prefetch_count,interleave_max)
++                text,image=infer_sensenova_interleave(model,prompt,cfg,steps,timestep_shift,img_cfg,images,cfg_interval,width,height,think_mode,seed,streaming_prefetch_count,interleave_max)
+         else:
+             if "interleave"==img_mode:
+                 print(f"infer_mode is : interleave without image")
+-                text,image=infer_sensenova_interleave(model,prompt,cfg,steps,timestep_shift,img_cfg,images,cfg_interval,width,height,think_mode,seed,prefetch_count,interleave_max)
++                text,image=infer_sensenova_interleave(model,prompt,cfg,steps,timestep_shift,img_cfg,images,cfg_interval,width,height,think_mode,seed,streaming_prefetch_count,interleave_max)
+             else:
+                 print(f"infer_mode is : t2i")
+-                text,image=infer_sensenova_t2i(model,prompt,cfg,cfg_norm,steps,batch_size,timestep_shift,cfg_interval,width,height,seed,prefetch_count,think_mode,enhance,)
++                text,image=infer_sensenova_t2i(model,prompt,cfg,cfg_norm,steps,batch_size,timestep_shift,cfg_interval,width,height,seed,streaming_prefetch_count,think_mode,enhance,)
+ 
+-        if  prefetch_count is None:
++        if streaming_prefetch_count is None:
+             model.model.to(torch.device("cpu"))
+ 
+         return io.NodeOutput(image,text)
+diff --git a/pyproject.toml b/pyproject.toml
+index 1aa4c4f..24e81e2 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -3,7 +3,7 @@ name = "sensenova_u1"
+ description = "SenseNova-U1: Unifying Multimodal Understanding and Generation with NEO-Unify Architecture"
+ version = "1.0.0"
+ license = {file = "LICENSE"}
+-dependencies = ["torch", "diffusers", "torchvision", "transformers # < 4.58.0", "accelerate", "tqdm", "gguf", "tokenizers"]
++dependencies = ["torch", "diffusers", "torchvision", "transformers>=4.57.1,<6.0.0", "accelerate", "tqdm", "gguf", "tokenizers"]
+ 
+ [project.urls]
+ Repository = "https://github.com/smthemex/ComfyUI_SenseNova_U1"
+diff --git a/requirements.txt b/requirements.txt
+index 09cd431..4e5d0e2 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,7 +1,7 @@
+ torch
+ diffusers
+ torchvision
+-transformers >=4.57.1, < 4.58.0
++transformers >=4.57.1, < 6.0.0
+ accelerate
+ tqdm
+ gguf
