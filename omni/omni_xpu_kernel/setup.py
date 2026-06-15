@@ -222,7 +222,7 @@ class ICPXBuildExt(build_ext):
         
         if IS_WINDOWS:
             # Windows compile command using icx
-            python_lib_dir = sysconfig.get_config_var("LIBDIR") or str(Path(sys.executable).parent / "libs")
+            python_lib_dir = sysconfig.get_config_var("LIBDIR") or str(Path(sys.base_prefix) / "libs")
             python_version = f"{sys.version_info.major}{sys.version_info.minor}"
             
             cmd = [
@@ -256,14 +256,16 @@ class ICPXBuildExt(build_ext):
                     "/DWIN32_LEAN_AND_MEAN",
                     f"/DOMNI_XPU_HAS_ONEDNN={1 if has_onednn else 0}",
                     f"/I{python_include}",
+                ]
+                if has_onednn:
+                    cmd.append(f"/I{onednn_include}")
+                cmd += [
                     f"/I{torch_include}",
                     f"/I{torch_include}\\torch\\csrc\\api\\include",
                     f"/I{src_dir}",
                     "/LD",  # Create DLL
                     f"/Fe:{output_path}",  # Output file
                 ]
-                if has_onednn:
-                    cmd.append(f"/I{onednn_include}")
                 cmd += [str(s) for s in sources] + [
                     f"/link",
                     f"/LIBPATH:{torch_lib}",

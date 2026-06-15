@@ -80,3 +80,6 @@ def test_run_benchmarks_reports_cold_and_steady_state(monkeypatch):
     assert "cold=" in rendered
     assert "steady=" in rendered
     assert "std=" in rendered
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

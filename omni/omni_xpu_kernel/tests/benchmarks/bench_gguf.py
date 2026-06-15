@@ -53,7 +53,7 @@ def torch_dequantize_q4_0(data: torch.Tensor, dtype: torch.dtype) -> torch.Tenso
     high = (packed >> 4) - 8    # [n_blocks, 16]
     
     # Interleave low and high values: [low0, high0, low1, high1, ...]
-    output = torch.stack([low, high], dim=2).view(n_blocks, 32)  # [n_blocks, 32]
+    output = torch.cat([low, high], dim=1)
     
     # Apply scale and convert to target dtype
     output = (output.to(scales.dtype) * scales).to(dtype)

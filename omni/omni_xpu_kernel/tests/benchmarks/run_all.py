@@ -68,39 +68,45 @@ def main():
         run_norm()
         print()
 
-    if run_all or "svdq" in selected:
-        run_svdq = _load_benchmark_module("bench_svdq.py").run_benchmarks
-        print("=" * 60, " SVDQuant Dequant ", "=" * 60)
-        run_svdq()
-        print()
+    # if run_all or "svdq" in selected:
+    #     run_svdq = _load_benchmark_module("bench_svdq.py").run_benchmarks
+    #     print("=" * 60, " SVDQuant Dequant ", "=" * 60)
+    #     run_svdq()
+    #     print()
 
-    if run_all or "rmsnorm" in selected:
-        run_rmsnorm = _load_benchmark_module("bench_rmsnorm.py").main
-        print("=" * 60, " RMSNorm ESIMD ", "=" * 60)
-        run_rmsnorm()
-        print()
+    # if run_all or "rmsnorm" in selected:
+    #     run_rmsnorm = _load_benchmark_module("bench_rmsnorm.py").main
+    #     print("=" * 60, " RMSNorm ESIMD ", "=" * 60)
+    #     run_rmsnorm()
+    #     print()
 
-    if run_all or "rotary" in selected:
-        run_rotary = _load_benchmark_module("bench_rotary.py").main
-        print("=" * 60, " Rotary Embedding ESIMD ", "=" * 60)
-        run_rotary()
-        print()
+    # if run_all or "rotary" in selected:
+    #     run_rotary = _load_benchmark_module("bench_rotary.py").main
+    #     print("=" * 60, " Rotary Embedding ESIMD ", "=" * 60)
+    #     run_rotary()
+    #     print()
 
-    if run_all or "onednn" in selected:
-        run_onednn = _load_benchmark_module("bench_onednn_int4.py").main
-        print("=" * 60, " oneDNN INT4 GEMM ", "=" * 60)
-        run_onednn()
-        print()
+    # if run_all or "onednn" in selected:
+    #     run_onednn = _load_benchmark_module("bench_onednn_int4.py").main
+    #     print("=" * 60, " oneDNN INT4 GEMM ", "=" * 60)
+    #     run_onednn()
+    #     print()
 
-    if run_all or "postproc" in selected:
-        run_postproc = _load_benchmark_module("bench_fused_postproc.py").main
-        print("=" * 60, " Fused Convert+Add ", "=" * 60)
-        run_postproc()
-        print()
+    # if run_all or "postproc" in selected:
+    #     run_postproc = _load_benchmark_module("bench_fused_postproc.py").main
+    #     print("=" * 60, " Fused Convert+Add ", "=" * 60)
+    #     run_postproc()
+    #     print()
 
     if run_all or "sdp" in selected:
         run_sdp = _load_benchmark_module("bench_sdp.py").run_benchmarks
         print("=" * 60, " SDP ", "=" * 60)
+        run_sdp()
+        print()
+
+    if run_all or "fp8" in selected:
+        run_sdp = _load_benchmark_module("bench_sdp.py").run_benchmarks
+        print("=" * 60, " FP8 ", "=" * 60)
         run_sdp()
         print()
 

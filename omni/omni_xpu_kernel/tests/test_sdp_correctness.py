@@ -434,3 +434,7 @@ class TestStandaloneSDPKernel:
 
         rtol, atol = (5e-2, 5e-2) if dtype == torch.bfloat16 else (1e-2, 1e-2)
         torch.testing.assert_close(out_kernel, out_ref, rtol=rtol, atol=atol)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

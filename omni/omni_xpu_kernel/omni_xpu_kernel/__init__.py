@@ -18,6 +18,8 @@ Usage::
 import os
 import sys
 from pathlib import Path
+from functools import lru_cache
+
 
 __version__ = "0.1.0"
 __author__ = "Intel"
@@ -41,7 +43,7 @@ def _add_windows_dll_directory(path: Path) -> None:
     _dll_dir_handles.append(handle)
     _dll_dir_paths.add(resolved)
 
-
+@lru_cache(maxsize=None) # init only once time
 def _configure_windows_dll_search_paths() -> None:
     """Ensure the active Python environment's runtime DLLs are discoverable."""
     if sys.platform != "win32":
@@ -61,6 +63,10 @@ def _configure_windows_dll_search_paths() -> None:
         locale_dirs.extend(sorted(oneapi_root.glob("*\\bin\\1033"), reverse=True))
     for locale_dir in locale_dirs:
         _add_windows_dll_directory(locale_dir)
+
+    dnnl_root_path = Path(os.environ.get("DNNLROOT"))
+    if dnnl_root_path:
+        _add_windows_dll_directory(dnnl_root_path / "bin")
 
     try:
         import torch
@@ -82,7 +88,6 @@ def _load_extension():
         return _native_module
     
     try:
-        _configure_windows_dll_search_paths()
         from omni_xpu_kernel import _C
         _native_module = _C
         return _native_module
@@ -102,6 +107,8 @@ def is_available():
     except ImportError:
         return False
 
+if sys.platform == "win32":
+    _configure_windows_dll_search_paths()
 
 # Submodule imports
 from . import gguf

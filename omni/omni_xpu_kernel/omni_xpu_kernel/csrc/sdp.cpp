@@ -127,6 +127,9 @@ KernelLibrary& get_kernel_library() {
 
         library.fp16 = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_fp16"));
         library.bf16io = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_bf16io"));
+        library.fp16_fast   = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_fp16_fast"));
+        library.fp16_hd64   = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_fp16_hd64"));
+        library.bf16io_hd64 = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_bf16io_hd64"));
 #else
         Dl_info current_module_info;
         if (dladdr(reinterpret_cast<void*>(&get_kernel_library), &current_module_info) == 0 || current_module_info.dli_fname == nullptr) {

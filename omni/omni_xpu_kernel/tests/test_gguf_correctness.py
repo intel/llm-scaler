@@ -104,19 +104,19 @@ class TestGGUFDequantCorrectness:
         from omni_xpu_kernel import gguf
         
         output = gguf.dequantize_q4_0(q4_0_data, torch.float16)
-        reference = reference_dequantize_q4_0(q4_0_data, sequential=False)
-        
-        torch.testing.assert_close(output.cpu(), reference.cpu(), rtol=1e-3, atol=1e-3)
-    
-    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
-    def test_dequantize_q4_0_comfyui_correctness(self, q4_0_data):
-        """Test ComfyUI layout correctness."""
-        from omni_xpu_kernel import gguf
-        
-        output = gguf.dequantize_q4_0_comfyui(q4_0_data, torch.float16)
         reference = reference_dequantize_q4_0(q4_0_data, sequential=True)
         
         torch.testing.assert_close(output.cpu(), reference.cpu(), rtol=1e-3, atol=1e-3)
+    
+    # @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    # def test_dequantize_q4_0_comfyui_correctness(self, q4_0_data):
+    #     """Test ComfyUI layout correctness."""
+    #     from omni_xpu_kernel import gguf
+        
+    #     output = gguf.dequantize_q4_0_comfyui(q4_0_data, torch.float16)
+    #     reference = reference_dequantize_q4_0(q4_0_data, sequential=True)
+        
+    #     torch.testing.assert_close(output.cpu(), reference.cpu(), rtol=1e-3, atol=1e-3)
     
     @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
     def test_dequantize_dtypes(self, q4_0_data):

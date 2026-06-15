@@ -25,3 +25,4 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+/omni/omni_xpu_kernel/build_windows
