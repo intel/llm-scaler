@@ -101,9 +101,10 @@ def run_fp8_benchmarks():
                 dtype_str = str(dtype).split('.')[-1]
                 bias_str = "Yes" if has_bias else "No"
                 print(f"{m:>6} {n:>6} {k:>6} {bias_str:>6} {dtype_str:>10} │ "
-                      f"{result['kernel_time_ms']:>12.4f} {result['pytorch_time_ms']:>12.4f} "
-                      f"{result['kernel_tflops']:>12.4f} {result['pytorch_tflops']:>12.4f} "
-                      f"{result['speedup']:>9.2f}x")
+                    f"{result['kernel_time_ms']:>12.4f} {result['pytorch_time_ms']:>12.4f} "
+                    f"{result['kernel_tflops']:>12.4f} {result['pytorch_tflops']:>12.4f} "
+                    f"{result['speedup']:>9.2f}x")
+            
 
     print("\nKnown bad-shape focus:")
     for (m, n, k) in [
@@ -114,15 +115,21 @@ def run_fp8_benchmarks():
         (4608, 36864, 4096),
         (4608, 4096, 16384),
     ]:
+        print(f"\nTesting bad-shape {m}x{n}x{k}")
+        
         for dtype in [torch.float16, torch.bfloat16]:
             for has_bias in [False, True]:
-                result = benchmark_fp8_linear(m, n, k, dtype, has_bias=has_bias, warmup=3, iters=10)
-                dtype_str = str(dtype).split('.')[-1]
-                bias_str = "Yes" if has_bias else "No"
-                print(f"{m:>6} {n:>6} {k:>6} {bias_str:>6} {dtype_str:>10} │ "
-                      f"{result['kernel_time_ms']:>12.4f} {result['pytorch_time_ms']:>12.4f} "
-                      f"{result['kernel_tflops']:>12.4f} {result['pytorch_tflops']:>12.4f} "
-                      f"{result['speedup']:>9.2f}x")
+                try:
+                    result = benchmark_fp8_linear(m, n, k, dtype, has_bias=has_bias, warmup=3, iters=10)
+                    dtype_str = str(dtype).split('.')[-1]
+                    bias_str = "Yes" if has_bias else "No"
+                    print(f"{m:>6} {n:>6} {k:>6} {bias_str:>6} {dtype_str:>10} │ "
+                        f"{result['kernel_time_ms']:>12.4f} {result['pytorch_time_ms']:>12.4f} "
+                        f"{result['kernel_tflops']:>12.4f} {result['pytorch_tflops']:>12.4f} "
+                        f"{result['speedup']:>9.2f}x")
+                except Exception as e:
+                    print(f"FAILED testing bad-shape at {m}x{n}x{k}: {e}")
+                    continue
 
 
 def main():

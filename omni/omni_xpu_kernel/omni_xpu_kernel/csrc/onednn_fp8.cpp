@@ -222,6 +222,26 @@ std::optional<int64_t> select_chunk_n_for_shape(
         }
     }
 
+    // Code by ChatGPT
+    // Generic large-N chunking
+    if (input_type == ST::Half) {
+        // Large FP16 shapes can hit oneDNN register allocation failures
+        if (m >= 4096 && n >= 32768) {
+            return int64_t{1024};
+        }
+
+        if (n > 4096 && k >= 2048) {
+            return int64_t{4096};
+        }
+    }
+
+    if (input_type == ST::BFloat16) {
+        if (n > 4096 && k >= 2048) {
+            return int64_t{4096};
+        }
+    }
+    // End code by ChatGPT
+
     return std::nullopt;
 }
 

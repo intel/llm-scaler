@@ -105,9 +105,9 @@ def main():
         print()
 
     if run_all or "fp8" in selected:
-        run_sdp = _load_benchmark_module("bench_sdp.py").run_benchmarks
+        run_fp8 = _load_benchmark_module("bench_fp8.py").run_benchmarks
         print("=" * 60, " FP8 ", "=" * 60)
-        run_sdp()
+        run_fp8()
         print()
 
 
