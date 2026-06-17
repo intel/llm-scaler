@@ -1,3 +1,22 @@
+diff --git a/indextts/BigVGAN/bigvgan.py b/indextts/BigVGAN/bigvgan.py
+index 58e4ba1..41d3895 100644
+--- a/indextts/BigVGAN/bigvgan.py
++++ b/indextts/BigVGAN/bigvgan.py
+@@ -460,10 +460,10 @@ class BigVGAN(
+         revision: str,
+         cache_dir: str,
+         force_download: bool,
+-        proxies: Optional[Dict],
+-        resume_download: bool,
+-        local_files_only: bool,
+-        token: Union[str, bool, None],
++        proxies: Optional[Dict] = None,
++        resume_download: Optional[bool] = None,
++        local_files_only: bool = False,
++        token: Union[str, bool, None] = None,
+         map_location: str = "cpu",  # Additional argument
+         strict: bool = False,  # Additional argument
+         use_cuda_kernel: bool = False,
 diff --git a/indextts/cli.py b/indextts/cli.py
 index e0e2f51..7f2b2e9 100644
 --- a/indextts/cli.py
@@ -11,6 +30,465 @@ index e0e2f51..7f2b2e9 100644
          elif torch.mps.is_available():
              args.device = "mps"
          else:
+diff --git a/indextts/gpt/model.py b/indextts/gpt/model.py
+index 5f3b25c..e2783d5 100644
+--- a/indextts/gpt/model.py
++++ b/indextts/gpt/model.py
+@@ -10,8 +10,29 @@ from indextts.gpt.transformers_gpt2 import GPT2PreTrainedModel, GPT2Model
+ 
+ # from transformers import GPT2Config, GPT2PreTrainedModel, LogitsProcessorList
+ from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+-from transformers.utils.model_parallel_utils import (assert_device_map,
+-                                                     get_device_map)
++try:
++    from transformers.utils.model_parallel_utils import (assert_device_map, get_device_map)
++except ImportError:
++    def get_device_map(n_layers, devices):
++        devices = list(devices)
++        if len(devices) == 0:
++            return {0: list(range(n_layers))}
++
++        n_devices = len(devices)
++        return {device: list(range(i, n_layers, n_devices)) for i, device in enumerate(devices)}
++
++    def assert_device_map(device_map, n_layers):
++        if device_map is None:
++            return
++
++        assigned_layers = set()
++        for layers in device_map.values():
++            assigned_layers.update(layers)
++
++        expected_layers = set(range(n_layers))
++        missing_layers = expected_layers - assigned_layers
++        if missing_layers:
++            raise ValueError(f"device_map is missing layer ids: {sorted(missing_layers)}")
+ 
+ from indextts.gpt.conformer_encoder import ConformerEncoder
+ from indextts.gpt.perceiver import PerceiverResampler
+diff --git a/indextts/gpt/model_v2.py b/indextts/gpt/model_v2.py
+index 3f39bec..ee329fa 100644
+--- a/indextts/gpt/model_v2.py
++++ b/indextts/gpt/model_v2.py
+@@ -10,8 +10,29 @@ from indextts.gpt.transformers_gpt2 import GPT2PreTrainedModel, GPT2Model
+ 
+ # from transformers import GPT2Config, GPT2PreTrainedModel, LogitsProcessorList
+ from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+-from transformers.utils.model_parallel_utils import (assert_device_map,
+-                                                     get_device_map)
++try:
++    from transformers.utils.model_parallel_utils import (assert_device_map, get_device_map)
++except ImportError:
++    def get_device_map(n_layers, devices):
++        devices = list(devices)
++        if len(devices) == 0:
++            return {0: list(range(n_layers))}
++
++        n_devices = len(devices)
++        return {device: list(range(i, n_layers, n_devices)) for i, device in enumerate(devices)}
++
++    def assert_device_map(device_map, n_layers):
++        if device_map is None:
++            return
++
++        assigned_layers = set()
++        for layers in device_map.values():
++            assigned_layers.update(layers)
++
++        expected_layers = set(range(n_layers))
++        missing_layers = expected_layers - assigned_layers
++        if missing_layers:
++            raise ValueError(f"device_map is missing layer ids: {sorted(missing_layers)}")
+ 
+ from indextts.gpt.conformer_encoder import ConformerEncoder
+ from indextts.gpt.perceiver import PerceiverResampler
+diff --git a/indextts/gpt/transformers_beam_search.py b/indextts/gpt/transformers_beam_search.py
+index d82e081..f047038 100644
+--- a/indextts/gpt/transformers_beam_search.py
++++ b/indextts/gpt/transformers_beam_search.py
+@@ -21,7 +21,29 @@ import numpy as np
+ import torch
+ 
+ from transformers.utils import add_start_docstrings
+-from transformers.generation.beam_constraints import Constraint, ConstraintListState
++try:
++    from transformers.generation.beam_constraints import Constraint, ConstraintListState
++except ImportError:
++    class Constraint:
++        def copy(self, *args, **kwargs):
++            return self
++
++    class ConstraintListState:
++        def __init__(self, constraints):
++            self.constraints = constraints
++            self.completed = False
++
++        def reset(self, sequence):
++            self.completed = True
++
++        def advance(self):
++            return []
++
++        def copy(self, stateful=False):
++            return ConstraintListState(self.constraints)
++
++        def add(self, token):
++            return None
+ 
+ 
+ PROCESS_INPUTS_DOCSTRING = r"""
+diff --git a/indextts/gpt/transformers_generation_utils.py b/indextts/gpt/transformers_generation_utils.py
+index 61a57c2..93193bc 100644
+--- a/indextts/gpt/transformers_generation_utils.py
++++ b/indextts/gpt/transformers_generation_utils.py
+@@ -29,15 +29,23 @@ from transformers.cache_utils import (
+     Cache,
+     DynamicCache,
+     EncoderDecoderCache,
+-    OffloadedCache,
+     StaticCache,
+ )
++
++try:
++    from transformers.cache_utils import OffloadedCache
++except ImportError:
++    OffloadedCache = None  # transformers>=5 may not expose OffloadedCache
++
+ from transformers.configuration_utils import PretrainedConfig
+ from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+ from transformers.integrations.fsdp import is_fsdp_managed_module
+ from transformers.modeling_outputs import CausalLMOutputWithPast, Seq2SeqLMOutput
+ from transformers.pytorch_utils import isin_mps_friendly
+-from transformers.tokenization_utils import ExtensionsTrie
++try:
++    from transformers.tokenization_utils import ExtensionsTrie
++except ImportError:
++    from transformers.tokenization_python import ExtensionsTrie
+ from transformers.utils import (
+     ModelOutput,
+     is_accelerate_available,
+@@ -47,8 +55,27 @@ from transformers.utils import (
+     is_torchdynamo_compiling,
+     logging,
+ )
+-from transformers.generation.beam_constraints import DisjunctiveConstraint, PhrasalConstraint
+-from transformers.generation.beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
++try:
++    from transformers.generation.beam_constraints import DisjunctiveConstraint, PhrasalConstraint
++except ImportError:
++    class _CompatConstraint:
++        def __init__(self, *args, **kwargs):
++            self.args = args
++            self.kwargs = kwargs
++
++        def copy(self, *args, **kwargs):
++            return self
++
++    class DisjunctiveConstraint(_CompatConstraint):
++        pass
++
++    class PhrasalConstraint(_CompatConstraint):
++        pass
++
++try:
++    from transformers.generation.beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
++except ImportError:
++    from .transformers_beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
+ from transformers.generation.candidate_generator import (
+     AssistedCandidateGenerator,
+     AssistedCandidateGeneratorDifferentTokenizers,
+@@ -94,7 +121,6 @@ from transformers.generation.logits_process import (
+     ExponentialDecayLengthPenalty,
+     ForcedBOSTokenLogitsProcessor,
+     ForcedEOSTokenLogitsProcessor,
+-    HammingDiversityLogitsProcessor,
+     InfNanRemoveLogitsProcessor,
+     LogitNormalization,
+     LogitsProcessorList,
+@@ -114,6 +140,17 @@ from transformers.generation.logits_process import (
+     TypicalLogitsWarper,
+     UnbatchedClassifierFreeGuidanceLogitsProcessor,
+ )
++
++try:
++    from transformers.generation.logits_process import HammingDiversityLogitsProcessor
++except ImportError:
++    class HammingDiversityLogitsProcessor:
++        def __init__(self, *args, **kwargs):
++            pass
++
++        def __call__(self, input_ids, scores, *args, **kwargs):
++            return scores
++
+ from transformers.generation.stopping_criteria import (
+     ConfidenceCriteria,
+     EosTokenCriteria,
+@@ -1507,7 +1544,7 @@ class GenerationMixin:
+                 not is_torchdynamo_compiling()
+                 and self.generation_config._from_model_config  # 1)
+                 and self.generation_config._original_object_hash == hash(self.generation_config)  # 2)
+-                and len(self.config._get_non_default_generation_parameters()) > 0  # 3)
++                and len(getattr(self.config, "_get_non_default_generation_parameters", lambda: {})()) > 0  # 3)
+             ):
+                 new_generation_config = GenerationConfig.from_model_config(self.config)
+                 if new_generation_config != self.generation_config:  # 4)
+@@ -1781,7 +1818,13 @@ class GenerationMixin:
+ 
+                 model_kwargs[cache_name] = cache_class(cache_config)
+             elif generation_config.cache_implementation == "offloaded":
+-                model_kwargs[cache_name] = OffloadedCache()
++                if OffloadedCache is not None:
++                    model_kwargs[cache_name] = OffloadedCache()
++                else:
++                    try:
++                        model_kwargs[cache_name] = DynamicCache(offloading=True)
++                    except TypeError:
++                        model_kwargs[cache_name] = DynamicCache()
+ 
+         # Use DynamicCache() instance by default. This will avoid back and forth from legacy format that
+         # keeps copying the cache thus using much more memory
+@@ -2372,16 +2415,19 @@ class GenerationMixin:
+                 **model_kwargs,
+             )
+ 
++        # transformers>=5 compatibility: `return_legacy_cache` may be absent.
++        return_legacy_cache = getattr(generation_config, "return_legacy_cache", None)
++
+         # Convert to legacy cache format if requested
+         if (
+-            generation_config.return_legacy_cache is not False  # Should check for `True` after v4.47
++            return_legacy_cache is not False  # Should check for `True` after v4.47
+             and not is_torchdynamo_compiling()
+             and hasattr(result, "past_key_values")
+             and hasattr(result.past_key_values, "to_legacy_cache")
+             and result.past_key_values.to_legacy_cache is not None
+         ):
+             # handle BC (convert by default if he user hasn't passed a cache AND the cache is of the default type)
+-            should_convert_cache = generation_config.return_legacy_cache
++            should_convert_cache = return_legacy_cache
+             is_user_defined_cache = user_defined_cache is not None
+             is_default_cache_type = (
+                 type(result.past_key_values) == DynamicCache  # noqa E721
+diff --git a/indextts/gpt/transformers_gpt2.py b/indextts/gpt/transformers_gpt2.py
+index e4f4198..f252c19 100644
+--- a/indextts/gpt/transformers_gpt2.py
++++ b/indextts/gpt/transformers_gpt2.py
+@@ -31,7 +31,11 @@ from transformers.activations import ACT2FN
+ import transformers
+ 
+ from indextts.gpt.transformers_generation_utils import GenerationMixin
+-from indextts.gpt.transformers_modeling_utils import PreTrainedModel
++from indextts.gpt.transformers_modeling_utils import (
++    PreTrainedModel,
++    find_pruneable_heads_and_indices,
++    prune_conv1d_layer,
++)
+ 
+ from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa, _prepare_4d_causal_attention_mask_for_sdpa
+ from transformers.modeling_outputs import (
+@@ -42,7 +46,7 @@ from transformers.modeling_outputs import (
+     TokenClassifierOutput,
+ )
+ 
+-from transformers.pytorch_utils import Conv1D, find_pruneable_heads_and_indices, prune_conv1d_layer
++from transformers.pytorch_utils import Conv1D
+ from transformers.utils import (
+     ModelOutput,
+     add_code_sample_docstrings,
+@@ -117,7 +121,29 @@ from transformers.utils import (
+     logging,
+     replace_return_docstrings
+ )
+-from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
++try:
++    from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
++except ImportError:
++    def get_device_map(n_layers, devices):
++        devices = list(devices)
++        if len(devices) == 0:
++            return {0: list(range(n_layers))}
++
++        n_devices = len(devices)
++        return {device: list(range(i, n_layers, n_devices)) for i, device in enumerate(devices)}
++
++    def assert_device_map(device_map, n_layers):
++        if device_map is None:
++            return
++
++        assigned_layers = set()
++        for layers in device_map.values():
++            assigned_layers.update(layers)
++
++        expected_layers = set(range(n_layers))
++        missing_layers = expected_layers - assigned_layers
++        if missing_layers:
++            raise ValueError(f"device_map is missing layer ids: {sorted(missing_layers)}")
+ from transformers.models.gpt2.configuration_gpt2 import GPT2Config
+ 
+ 
+diff --git a/indextts/gpt/transformers_modeling_utils.py b/indextts/gpt/transformers_modeling_utils.py
+index 39c28d0..6883ccd 100644
+--- a/indextts/gpt/transformers_modeling_utils.py
++++ b/indextts/gpt/transformers_modeling_utils.py
+@@ -53,13 +53,54 @@ from transformers.loss.loss_utils import LOSS_MAPPING
+ from transformers.pytorch_utils import (  # noqa: F401
+     Conv1D,
+     apply_chunking_to_forward,
+-    find_pruneable_heads_and_indices,
+     id_tensor_storage,
+     is_torch_greater_or_equal_than_1_13,
+-    prune_conv1d_layer,
+-    prune_layer,
+     prune_linear_layer,
+ )
++
++try:
++    from transformers.pytorch_utils import find_pruneable_heads_and_indices
++except ImportError:
++    def find_pruneable_heads_and_indices(heads, n_heads, head_size, already_pruned_heads):
++        mask = torch.ones(n_heads, head_size)
++        heads = set(heads) - already_pruned_heads
++        for head in heads:
++            head = head - sum(1 if h < head else 0 for h in already_pruned_heads)
++            mask[head] = 0
++        mask = mask.view(-1).contiguous().eq(1)
++        index = torch.arange(len(mask))[mask].long()
++        return heads, index
++
++try:
++    from transformers.pytorch_utils import prune_conv1d_layer
++except ImportError:
++    def prune_conv1d_layer(layer, index, dim=1):
++        index = index.to(layer.weight.device)
++        W = layer.weight.index_select(dim, index).detach().clone()
++        if dim == 0:
++            b = layer.bias.index_select(0, index).detach().clone()
++        else:
++            b = layer.bias.detach().clone()
++        new_size = list(layer.weight.size())
++        new_size[dim] = len(index)
++        new_layer = Conv1D(new_size[1], new_size[0]).to(layer.weight.device)
++        new_layer.weight.requires_grad = False
++        new_layer.weight.copy_(W.contiguous())
++        new_layer.weight.requires_grad = True
++        new_layer.bias.requires_grad = False
++        new_layer.bias.copy_(b.contiguous())
++        new_layer.bias.requires_grad = True
++        return new_layer
++
++try:
++    from transformers.pytorch_utils import prune_layer
++except ImportError:
++    def prune_layer(layer, index, dim=None):
++        if isinstance(layer, nn.Linear):
++            return prune_linear_layer(layer, index, dim=0 if dim is None else dim)
++        if isinstance(layer, Conv1D):
++            return prune_conv1d_layer(layer, index, dim=1 if dim is None else dim)
++        raise ValueError(f"Cannot prune layer of type {type(layer)}")
+ from transformers.quantizers import AutoHfQuantizer, HfQuantizer
+ from transformers.quantizers.quantizers_utils import get_module_from_name
+ from transformers.safetensors_conversion import auto_conversion
+@@ -69,11 +110,8 @@ from transformers.utils import (
+     ADAPTER_WEIGHTS_NAME,
+     CONFIG_NAME,
+     DUMMY_INPUTS,
+-    FLAX_WEIGHTS_NAME,
+     SAFE_WEIGHTS_INDEX_NAME,
+     SAFE_WEIGHTS_NAME,
+-    TF2_WEIGHTS_NAME,
+-    TF_WEIGHTS_NAME,
+     WEIGHTS_INDEX_NAME,
+     WEIGHTS_NAME,
+     ContextManagers,
+@@ -81,23 +119,55 @@ from transformers.utils import (
+     PushToHubMixin,
+     cached_file,
+     copy_func,
+-    download_url,
+     extract_commit_hash,
+     has_file,
+     is_accelerate_available,
+     is_bitsandbytes_available,
+     is_flash_attn_2_available,
+-    is_offline_mode,
+     is_optimum_available,
+     is_peft_available,
+-    is_remote_url,
+-    is_safetensors_available,
+-    is_torch_sdpa_available,
+     is_torch_xla_available,
+     logging,
+     replace_return_docstrings,
+     strtobool,
+ )
++
++# transformers>=5 compatibility fallbacks for removed utils exports
++FLAX_WEIGHTS_NAME = "flax_model.msgpack"
++TF2_WEIGHTS_NAME = "tf_model.h5"
++TF_WEIGHTS_NAME = "model.ckpt"
++
++try:
++    from transformers.utils.hub import is_offline_mode as _hub_is_offline_mode
++except ImportError:
++    _hub_is_offline_mode = None
++
++def is_offline_mode():
++    if _hub_is_offline_mode is None:
++        return False
++    return _hub_is_offline_mode()
++
++def is_remote_url(url_or_filename):
++    from urllib.parse import urlparse
++    scheme = urlparse(str(url_or_filename)).scheme
++    return scheme in ("http", "https")
++
++def download_url(url):
++    import tempfile
++    import urllib.request
++
++    fd, path = tempfile.mkstemp()
++    os.close(fd)
++    urllib.request.urlretrieve(url, path)
++    return path
++
++def is_safetensors_available():
++    import importlib.util
++    return importlib.util.find_spec("safetensors") is not None
++
++def is_torch_sdpa_available():
++    return hasattr(torch.nn.functional, "scaled_dot_product_attention")
++
+ from transformers.utils.hub import convert_file_size_to_int, create_and_tag_model_card, get_checkpoint_shard_files
+ from transformers.utils.import_utils import (
+     ENV_VARS_TRUE_VALUES,
+@@ -2816,7 +2886,7 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
+         if is_main_process:
+             if not _hf_peft_config_loaded:
+                 # If the model config has set attributes that should be in the generation config, move them there.
+-                misplaced_generation_parameters = model_to_save.config._get_non_default_generation_parameters()
++                misplaced_generation_parameters = getattr(model_to_save.config, "_get_non_default_generation_parameters", lambda: {})()
+                 if self.can_generate() and len(misplaced_generation_parameters) > 0:
+                     warnings.warn(
+                         "Moving the following attributes in the config to the generation config: "
+diff --git a/indextts/s2mel/modules/bigvgan/bigvgan.py b/indextts/s2mel/modules/bigvgan/bigvgan.py
+index 65f0cc4..bb5e974 100644
+--- a/indextts/s2mel/modules/bigvgan/bigvgan.py
++++ b/indextts/s2mel/modules/bigvgan/bigvgan.py
+@@ -418,10 +418,10 @@ class BigVGAN(
+             revision: str,
+             cache_dir: str,
+             force_download: bool,
+-            proxies: Optional[Dict],
+-            resume_download: bool,
+-            local_files_only: bool,
+-            token: Union[str, bool, None],
++            proxies: Optional[Dict] = None,
++            resume_download: Optional[bool] = None,
++            local_files_only: bool = False,
++            token: Union[str, bool, None] = None,
+             map_location: str = "cpu",  # Additional argument
+             strict: bool = False,  # Additional argument
+             use_cuda_kernel: bool = False,
 diff --git a/indexttsnode.py b/indexttsnode.py
 index f6f5b5f..e75ed13 100644
 --- a/indexttsnode.py
