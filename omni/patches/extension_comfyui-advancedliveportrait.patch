@@ -1,0 +1,223 @@
+diff --git a/LivePortrait/config/inference_config.py b/LivePortrait/config/inference_config.py
+index 7b6de66..b777fc2 100644
+--- a/LivePortrait/config/inference_config.py
++++ b/LivePortrait/config/inference_config.py
+@@ -1,14 +1,16 @@
+-
+ import os
+ from typing import Literal, Tuple
+ import folder_paths
+ 
+ current_file_path = os.path.abspath(__file__)
+ current_directory = os.path.dirname(current_file_path)
++
++
+ class InferenceConfig:
+     def __init__(self):
+         self.flag_use_half_precision: bool = True  # whether to use half precision
+         self.input_shape: Tuple[int, int] = (256, 256)  # input shape
+ 
+         self.mask_crop = None
+-        self.device_id: int = 0
+\ No newline at end of file
++        self.device_id: int = 0
++        self.device: str | None = None
+diff --git a/LivePortrait/live_portrait_wrapper.py b/LivePortrait/live_portrait_wrapper.py
+index eb1448e..63f6de9 100644
+--- a/LivePortrait/live_portrait_wrapper.py
++++ b/LivePortrait/live_portrait_wrapper.py
+@@ -11,6 +11,14 @@ from .config.inference_config import InferenceConfig
+ from .utils.rprint import rlog as log
+ 
+ 
++def _default_device_string(device_id: int) -> str:
++    if torch.cuda.is_available():
++        return f"cuda:{device_id}"
++    if hasattr(torch, "xpu") and torch.xpu.is_available():
++        return f"xpu:{device_id}"
++    return "cpu"
++
++
+ class LivePortraitWrapper(object):
+ 
+     def __init__(self, cfg: InferenceConfig, appearance_feature_extractor, motion_extractor,
+@@ -24,6 +32,11 @@ class LivePortraitWrapper(object):
+ 
+         self.cfg = cfg
+         self.device_id = cfg.device_id
++        cfg_device = getattr(cfg, "device", None) or _default_device_string(self.device_id)
++        self.device = torch.device(cfg_device)
++        self.autocast_device_type = self.device.type if self.device.type in ("cuda", "xpu", "cpu") else "cpu"
++        self.autocast_enabled = self.cfg.flag_use_half_precision and self.device.type in ("cuda", "xpu")
++        self.autocast_dtype = torch.float16 if self.device.type == "cuda" else torch.bfloat16
+         self.timer = Timer()
+ 
+     def prepare_source(self, img: np.ndarray) -> torch.Tensor:
+@@ -44,7 +57,7 @@ class LivePortraitWrapper(object):
+             raise ValueError(f'img ndim should be 3 or 4: {x.ndim}')
+         x = np.clip(x, 0, 1)  # clip to 0~1
+         x = torch.from_numpy(x).permute(0, 3, 1, 2)  # 1xHxWx3 -> 1x3xHxW
+-        x = x.cuda(self.device_id)
++        x = x.to(self.device)
+         return x
+ 
+     def prepare_driving_videos(self, imgs) -> torch.Tensor:
+@@ -61,7 +74,7 @@ class LivePortraitWrapper(object):
+         y = _imgs.astype(np.float32) / 255.
+         y = np.clip(y, 0, 1)  # clip to 0~1
+         y = torch.from_numpy(y).permute(0, 4, 3, 1, 2)  # TxHxWx3x1 -> Tx1x3xHxW
+-        y = y.cuda(self.device_id)
++        y = y.to(self.device)
+ 
+         return y
+ 
+@@ -70,7 +83,7 @@ class LivePortraitWrapper(object):
+         x: Bx3xHxW, normalized to 0~1
+         """
+         with torch.no_grad():
+-            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.cfg.flag_use_half_precision):
++            with torch.autocast(device_type=self.autocast_device_type, dtype=self.autocast_dtype, enabled=self.autocast_enabled):
+                 feature_3d = self.appearance_feature_extractor(x)
+ 
+         return feature_3d.float()
+@@ -82,7 +95,7 @@ class LivePortraitWrapper(object):
+         return: A dict contains keys: 'pitch', 'yaw', 'roll', 't', 'exp', 'scale', 'kp'
+         """
+         with torch.no_grad():
+-            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.cfg.flag_use_half_precision):
++            with torch.autocast(device_type=self.autocast_device_type, dtype=self.autocast_dtype, enabled=self.autocast_enabled):
+                 kp_info = self.motion_extractor(x)
+ 
+             if self.cfg.flag_use_half_precision:
+@@ -175,7 +188,7 @@ class LivePortraitWrapper(object):
+         """
+         # The line 18 in Algorithm 1: D(W(f_s; x_s, x′_d,i)）
+         with torch.no_grad():
+-            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=self.cfg.flag_use_half_precision):
++            with torch.autocast(device_type=self.autocast_device_type, dtype=self.autocast_dtype, enabled=self.autocast_enabled):
+                 # get decoder input
+                 ret_dct = self.warping_module(feature_3d, kp_source=kp_source, kp_driving=kp_driving)
+                 # decode
+diff --git a/LivePortrait/utils/helper.py b/LivePortrait/utils/helper.py
+index 277f63d..c96f4d7 100644
+--- a/LivePortrait/utils/helper.py
++++ b/LivePortrait/utils/helper.py
+@@ -66,8 +66,15 @@ def squeeze_tensor_to_numpy(tensor):
+ 
+ 
+ def dct2cuda(dct: dict, device_id: int):
++    if torch.cuda.is_available():
++        device = torch.device(f"cuda:{device_id}")
++    elif hasattr(torch, "xpu") and torch.xpu.is_available():
++        device = torch.device(f"xpu:{device_id}")
++    else:
++        device = torch.device("cpu")
++
+     for key in dct:
+-        dct[key] = torch.tensor(dct[key]).cuda(device_id)
++        dct[key] = torch.tensor(dct[key]).to(device)
+     return dct
+ 
+ 
+diff --git a/nodes.py b/nodes.py
+index 8e92a36..f3f8504 100644
+--- a/nodes.py
++++ b/nodes.py
+@@ -33,6 +33,14 @@ from .LivePortrait.modules.stitching_retargeting_network import StitchingRetarge
+ from collections import OrderedDict
+ 
+ 
++def get_torch_device():
++    if torch.cuda.is_available():
++        return torch.device("cuda:0")
++    if hasattr(torch, "xpu") and torch.xpu.is_available():
++        return torch.device("xpu:0")
++    return torch.device("cpu")
++
++
+ def tensor2pil(image):
+     return Image.fromarray(np.clip(255. * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+ def pil2tensor(image):
+@@ -89,6 +97,7 @@ class LP_Engine:
+     pipeline = None
+     detect_model = None
+     mask_img = None
++    runtime_device = get_torch_device()
+ 
+     def download_model(_, file_path, model_url):
+         print('AdvancedLivePortrait: Downloading model...')
+@@ -144,13 +153,13 @@ class LP_Engine:
+                 "https://huggingface.co/Kijai/LivePortrait_safetensors/resolve/main/" + model_type + ".safetensors")
+         model_params = model_config['model_params'][f'{model_type}_params']
+         if model_type == 'appearance_feature_extractor':
+-            model = AppearanceFeatureExtractor(**model_params).cuda(device)
++            model = AppearanceFeatureExtractor(**model_params).to(device)
+         elif model_type == 'motion_extractor':
+-            model = MotionExtractor(**model_params).cuda(device)
++            model = MotionExtractor(**model_params).to(device)
+         elif model_type == 'warping_module':
+-            model = WarpingNetwork(**model_params).cuda(device)
++            model = WarpingNetwork(**model_params).to(device)
+         elif model_type == 'spade_generator':
+-            model = SPADEDecoder(**model_params).cuda(device)
++            model = SPADEDecoder(**model_params).to(device)
+         elif model_type == 'stitching_retargeting_module':
+             # Special handling for stitching and retargeting module
+             config = model_config['model_params']['stitching_retargeting_module_params']
+@@ -167,12 +176,12 @@ class LP_Engine:
+ 
+             # retargetor_lip = StitchingRetargetingNetwork(**config.get('lip'))
+             # retargetor_lip.load_state_dict(self.remove_ddp_dumplicate_key(checkpoint['retarget_mouth']))
+-            # retargetor_lip = retargetor_lip.cuda(device)
++            # retargetor_lip = retargetor_lip.to(device)
+             # retargetor_lip.eval()
+             #
+             # retargetor_eye = StitchingRetargetingNetwork(**config.get('eye'))
+             # retargetor_eye.load_state_dict(self.remove_ddp_dumplicate_key(checkpoint['retarget_eye']))
+-            # retargetor_eye = retargetor_eye.cuda(device)
++            # retargetor_eye = retargetor_eye.to(device)
+             # retargetor_eye.eval()
+ 
+             return {
+@@ -203,14 +212,16 @@ class LP_Engine:
+         model_config_path = os.path.join(current_directory, 'LivePortrait', 'config', 'models.yaml')
+         model_config = yaml.safe_load(open(model_config_path, 'r'))
+ 
+-        device_id = 0
+-        appearance_feature_extractor = self.load_model(model_config, device_id, 'appearance_feature_extractor')
+-        motion_extractor = self.load_model(model_config, device_id, 'motion_extractor')
+-        warping_module = self.load_model(model_config, device_id, 'warping_module')
+-        spade_generator = self.load_model(model_config, device_id, 'spade_generator')
+-        stitching_retargeting_module = self.load_model(model_config, device_id, 'stitching_retargeting_module')
++        self.runtime_device = get_torch_device()
++        appearance_feature_extractor = self.load_model(model_config, self.runtime_device, 'appearance_feature_extractor')
++        motion_extractor = self.load_model(model_config, self.runtime_device, 'motion_extractor')
++        warping_module = self.load_model(model_config, self.runtime_device, 'warping_module')
++        spade_generator = self.load_model(model_config, self.runtime_device, 'spade_generator')
++        stitching_retargeting_module = self.load_model(model_config, self.runtime_device, 'stitching_retargeting_module')
+ 
+-        self.pipeline = LivePortraitWrapper(InferenceConfig(), appearance_feature_extractor, motion_extractor, warping_module, spade_generator, stitching_retargeting_module)
++        cfg = InferenceConfig()
++        cfg.device = str(self.runtime_device)
++        self.pipeline = LivePortraitWrapper(cfg, appearance_feature_extractor, motion_extractor, warping_module, spade_generator, stitching_retargeting_module)
+ 
+     def get_detect_model(self):
+         if self.detect_model == None:
+@@ -335,7 +346,7 @@ class LP_Engine:
+             raise ValueError(f'img ndim should be 3 or 4: {x.ndim}')
+         x = np.clip(x, 0, 1)  # clip to 0~1
+         x = torch.from_numpy(x).permute(0, 3, 1, 2)  # 1xHxWx3 -> 1x3xHxW
+-        x = x.cuda()
++        x = x.to(self.runtime_device)
+         return x
+ 
+     def GetMaskImg(self):
+@@ -476,7 +487,7 @@ class ExpressionSet:
+             self.s = erst[2]
+             self.t = erst[3]
+         else:
+-            self.e = torch.from_numpy(np.zeros((1, 21, 3))).float().to(device='cuda')
++            self.e = torch.from_numpy(np.zeros((1, 21, 3))).float().to(device=get_torch_device())
+             self.r = torch.Tensor([0, 0, 0])
+             self.s = 0
+             self.t = 0

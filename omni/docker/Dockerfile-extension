@@ -22,6 +22,7 @@ COPY ./patches/extension_comfyui_segment_anything_2.patch /tmp/
 COPY ./patches/extension_comfyui_reactor.patch /tmp/
 COPY ./patches/extension_comfyui_rmbg.patch /tmp/
 COPY ./patches/extension_SenseNova-U1.patch /tmp
+COPY ./patches/extension_comfyui-advancedliveportrait.patch /tmp
 
 # Add custom node
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -126,6 +127,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git apply /tmp/extension_SenseNova-U1.patch && \
     pip install -r requirements.txt && \
     rm -f /tmp/extension_SenseNova-U1.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf comfyui-advancedliveportrait && \
+    git clone --depth 1 https://github.com/PowerHouseMan/ComfyUI-AdvancedLivePortrait.git comfyui-advancedliveportrait && \
+    cd comfyui-advancedliveportrait && \
+    git fetch --depth 1 origin 64bc23a0aec326df9c0ab0435b35ae6252635805 && \
+    git checkout 64bc23a0aec326df9c0ab0435b35ae6252635805 && \
+    git apply /tmp/extension_comfyui-advancedliveportrait.patch && \
+    pip install -r requirements.txt && \
+    rm -f /tmp/extension_comfyui-advancedliveportrait.patch
 
 RUN rm -f /usr/lib/python3*/EXTERNALLY-MANAGED
 
