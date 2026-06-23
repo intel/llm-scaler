@@ -56,20 +56,44 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
   m.impl("esimd_gemv_int4_fused2", torch::kXPU, &esimd_gemv_int4_fused2);
 
   // Fused QKV Split + RMSNorm + RoPE
+  // q_out/gate_out/k_out/v_out are written in place (mutated). Declared with
+  // (a!)..(d!) + void return so torch.compile's auto-functionalize (v1) can
+  // trace it -- a `-> Tensor(a!)` alias return is rejected by v1, hence the
+  // lambda-wrapped void impl that discards the kernel's (aliased) return.
   m.def("esimd_qkv_split_norm_rope(Tensor qkv_state, "
-        "Tensor q_out, Tensor gate_out, Tensor k_out, Tensor v_out, "
+        "Tensor(a!) q_out, Tensor(b!) gate_out, Tensor(c!) k_out, Tensor(d!) v_out, "
         "Tensor norm_wq, Tensor norm_wk, Tensor positions, "
         "int q_heads, int kv_heads, bool attn_output_gate, "
-        "int rotary_dim, Tensor cos_sin_cache) -> Tensor");
-  m.impl("esimd_qkv_split_norm_rope", torch::kXPU, &esimd_qkv_split_norm_rope);
+        "int rotary_dim, Tensor cos_sin_cache) -> ()");
+  m.impl("esimd_qkv_split_norm_rope", torch::kXPU,
+         [](at::Tensor qkv_state, at::Tensor q_out, at::Tensor gate_out,
+            at::Tensor k_out, at::Tensor v_out, at::Tensor norm_wq,
+            at::Tensor norm_wk, at::Tensor positions, int64_t q_heads,
+            int64_t kv_heads, bool attn_output_gate, int64_t rotary_dim,
+            at::Tensor cos_sin_cache) -> void {
+           esimd_qkv_split_norm_rope(qkv_state, q_out, gate_out, k_out, v_out,
+                                     norm_wq, norm_wk, positions, q_heads,
+                                     kv_heads, attn_output_gate, rotary_dim,
+                                     cos_sin_cache);
+         });
 
   // Variant with V-Norm (gemma4): same as above but also RMSNorms V heads.
   m.def("esimd_qkv_split_norm_rope_v(Tensor qkv_state, "
-        "Tensor q_out, Tensor gate_out, Tensor k_out, Tensor v_out, "
+        "Tensor(a!) q_out, Tensor(b!) gate_out, Tensor(c!) k_out, Tensor(d!) v_out, "
         "Tensor norm_wq, Tensor norm_wk, Tensor norm_wv, Tensor positions, "
         "int q_heads, int kv_heads, bool attn_output_gate, "
-        "int rotary_dim, Tensor cos_sin_cache) -> Tensor");
-  m.impl("esimd_qkv_split_norm_rope_v", torch::kXPU, &esimd_qkv_split_norm_rope_v);
+        "int rotary_dim, Tensor cos_sin_cache) -> ()");
+  m.impl("esimd_qkv_split_norm_rope_v", torch::kXPU,
+         [](at::Tensor qkv_state, at::Tensor q_out, at::Tensor gate_out,
+            at::Tensor k_out, at::Tensor v_out, at::Tensor norm_wq,
+            at::Tensor norm_wk, at::Tensor norm_wv, at::Tensor positions,
+            int64_t q_heads, int64_t kv_heads, bool attn_output_gate,
+            int64_t rotary_dim, at::Tensor cos_sin_cache) -> void {
+           esimd_qkv_split_norm_rope_v(qkv_state, q_out, gate_out, k_out, v_out,
+                                       norm_wq, norm_wk, norm_wv, positions,
+                                       q_heads, kv_heads, attn_output_gate,
+                                       rotary_dim, cos_sin_cache);
+         });
 
   // Fused ResidualAdd + RMSNorm + FP8 GEMV (post_attn_norm + router)
   m.def("esimd_resadd_norm_gemv_fp8_pert(Tensor hidden_states, Tensor residual, "

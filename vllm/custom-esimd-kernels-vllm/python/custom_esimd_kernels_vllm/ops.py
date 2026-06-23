@@ -1559,6 +1559,53 @@ def moe_forward_full_gelu_tanh_routed(
         top_k, n_routed_experts)
 
 
+def moe_forward_full_gelu_tanh_routed_decode(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    top_k: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """Decode-only (M==1) variant of moe_forward_full_gelu_tanh_routed.
+
+    Uses 1D block_load expert GEMV instead of the 16-wide 2D DPAS load,
+    restoring full HBM bandwidth (~528 vs ~315 GB/s) for the single-token
+    decode case. Requires x.size(0) == 1. Bit-identical to the DPAS path.
+    """
+    return _moe_batch.moe_forward_full_gelu_tanh_routed_decode(
+        x, topk_weights, topk_indices,
+        gate_up_weight, gate_up_scale,
+        down_weight, down_scale,
+        top_k, n_routed_experts)
+
+
+def moe_forward_full_gelu_tanh_decode(
+    x: torch.Tensor,
+    logits: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    per_expert_scale: torch.Tensor,
+    top_k: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """Fully-fused gemma4 MoE decode (M==1): router logits in, output out.
+
+    Internal topk (fp32 production kernel) + per_expert_scale fold + 1D-load
+    gelu_tanh up/down GEMV + accumulate, all in one op. Removes the Python-side
+    moe_topk call, torch scale-fold, and separate expert dispatch.
+    """
+    return _moe_batch.moe_forward_full_gelu_tanh_decode(
+        x, logits, gate_up_weight, gate_up_scale,
+        down_weight, down_scale, per_expert_scale,
+        top_k, n_routed_experts)
+
+
 def esimd_norm_gemv_norm_fp16(
     residual: torch.Tensor,
     scale_with_root: torch.Tensor,

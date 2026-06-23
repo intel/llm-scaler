@@ -4,6 +4,7 @@
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
 
 #include "moe_topk.h"
+#include "moe_decode_gemv.h"
 #include "../xpu/esimd_kernels/moe_ops.h"
 
 using fp16 = sycl::half;
@@ -23,21 +24,18 @@ static inline sycl::event submit_kernel(
 template<int N>
 SYCL_ESIMD_FUNCTION
 simd<fp16, N> fp8e4m3_to_half(simd<uint8_t, N> raw) {
-    simd<uint32_t, N> val = convert<uint32_t>(raw);
-    simd<uint32_t, N> s = val >> 7;
-    simd<uint32_t, N> e = (val >> 3) & 0xF;
-    simd<uint32_t, N> m = val & 0x7;
-
-    simd<uint32_t, N> fp32_bits = (s << 31) | ((e + 120) << 23) | (m << 20);
-
-    simd<float, N> sub_val = convert<float>(m) * (1.0f / 512.0f);
-    simd<uint32_t, N> sub_bits = sub_val.template bit_cast_view<uint32_t>();
-    sub_bits = sub_bits | (s << 31);
-
-    fp32_bits.merge(sub_bits, e == 0);
-    fp32_bits.merge(s << 31, (e == 0) & (m == 0));
-
-    return fp32_bits.template bit_cast_view<float>();
+    // Direct e4m3 -> fp16 bit map (stays in uint16, no fp32 round-trip or
+    // per-element subnormal float math). e4m3 (4exp/3mant, bias 7) -> fp16
+    // (5exp/10mant, bias 15): shift exp|mant left 7, add bias delta (8<<10 =
+    // 0x2000). Subnormals (exp==0, ~0.02% of gemma4 weights, all < 0.014)
+    // flush to +-0 -- matches the production fp8_GEMM_pert dequant. ~2x fewer
+    // SIMD ops than the prior fp32-path decode (was 32% of up-GEMM time).
+    simd<uint16_t, N> u16 = convert<uint16_t>(raw);
+    simd<uint16_t, N> sign = (u16 & 0x80) << 8;            // sign -> bit 15
+    simd<uint16_t, N> upart = u16 & 0x7F;                  // exp|mant
+    simd<uint16_t, N> fp16_bits = sign | ((upart << 7) + 0x2000);
+    fp16_bits.merge(sign, (u16 & 0x78) == 0);              // exp==0 -> flush
+    return fp16_bits.template bit_cast_view<fp16>().read();
 }
 
 // ── FP8 E5M2 → half conversion ───────────────────────────────────────────────
@@ -111,6 +109,8 @@ simd<fp16, 256> fp8e5m2_block_to_vnni(simd<uint8_t, 256> raw) {
 }
 
 // ── Kernel 1: Router GEMV ────────────────────────────────────────────────────
+#include "moe_fp8_grouped.h"
+
 // Hybrid dispatch:
 //   n_tokens <= 4: Option A — 1 WI per expert, weight-reuse across tokens
 //                  (4 hardcoded accumulators, fits in GRF without spill)
@@ -1611,6 +1611,152 @@ torch::Tensor moe_forward_full_gelu_tanh(
 }
 
 
+
+// ========== gemma4 decode-only (M==1) expert GEMV (load-width fix) ==========
+// Uses 1D block_load<uint8_t,VL> along K instead of the DPAS 16-wide 2D load.
+// Same vllm weight layout. M==1 only — caller must guarantee n_tokens==1.
+torch::Tensor moe_forward_full_gelu_tanh_routed_decode(
+    torch::Tensor x,
+    torch::Tensor topk_weights, torch::Tensor topk_indices,
+    torch::Tensor gate_up_weight, torch::Tensor gate_up_scale,
+    torch::Tensor down_weight, torch::Tensor down_scale,
+    int64_t top_k, int64_t n_routed_experts) {
+    (void)n_routed_experts;
+    TORCH_CHECK(x.scalar_type() == torch::kHalf);
+    TORCH_CHECK(x.size(0) == 1, "decode kernel requires n_tokens==1");
+    TORCH_CHECK(topk_indices.scalar_type() == torch::kInt32);
+    TORCH_CHECK(topk_weights.scalar_type() == torch::kHalf);
+    int hidden_size = x.size(1);
+    int intermediate_size = gate_up_weight.size(1) / 2;
+    int rows_per_token = top_k;
+    ensure_gemma4_moe_buffers(1, top_k, hidden_size, intermediate_size, x.device());
+
+    const int* idx_ptr = topk_indices.data_ptr<int>();
+    const fp16* w_ptr  = (const fp16*)topk_weights.data_ptr();
+    sycl::queue& q = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+
+    // ---- Up + gelu_tanh: K = hidden_size ----
+    // gemma: hidden=2816 → VL=256 divides cleanly (tail 0).
+    {
+        const int VL = 256;
+        const int n_routes = top_k;
+        auto k = MoeUpDecodeGeluTanh<VL, 0>{
+            (const fp16*)x.data_ptr(),
+            (const uint8_t*)gate_up_weight.data_ptr(),
+            gate_up_scale.data_ptr<float>(),
+            idx_ptr,
+            (fp16*)sg_intermediates.data_ptr(),
+            hidden_size, intermediate_size, (int)top_k, /*fp8_mode=*/0};
+        q.submit([&](sycl::handler& h){
+            h.parallel_for(sycl::nd_range<2>(
+                sycl::range<2>(n_routes, intermediate_size),
+                sycl::range<2>(1, 1)), k);
+        });
+    }
+    // ---- Down: K = intermediate_size ----
+    // gemma per-card inter=1056 = 256*4 + 32 → VL=256 big chunks + 32 tail.
+    {
+        const int VL = 256;
+        const int VL_TAIL = 32;
+        const int n_routes = top_k;
+        auto k = MoeDownDecode<VL, VL_TAIL>{
+            (const fp16*)sg_intermediates.data_ptr(),
+            (const uint8_t*)down_weight.data_ptr(),
+            down_scale.data_ptr<float>(),
+            w_ptr, idx_ptr,
+            (fp16*)sg_routed_output.data_ptr(),
+            hidden_size, intermediate_size, (int)top_k, /*fp8_mode=*/0};
+        q.submit([&](sycl::handler& h){
+            h.parallel_for(sycl::nd_range<2>(
+                sycl::range<2>(n_routes, hidden_size),
+                sycl::range<2>(1, 1)), k);
+        });
+    }
+    // ---- Accumulate over top_k ----
+    auto& final_out = sg_take_final_output();
+    moe_accumulate_kernel(
+        (const fp16*)sg_routed_output.data_ptr(),
+        (fp16*)final_out.data_ptr(),
+        1, hidden_size, rows_per_token, x.device());
+    return final_out.narrow(0, 0, 1);
+}
+
+// ========== gemma4 fully-fused decode (logits in, topk+scale+expert) =========
+// Takes router logits directly: internal topk (fp32 production kernel, gsm8k-
+// aligned) -> fold per_expert_scale into topk weights (on-device) -> 1D-load
+// gelu_tanh up + down GEMV -> accumulate. Removes the Python-side moe_topk call
+// + torch scale-fold + separate routed_decode dispatch. M==1 only.
+torch::Tensor moe_forward_full_gelu_tanh_decode(
+    torch::Tensor x, torch::Tensor logits,
+    torch::Tensor gate_up_weight, torch::Tensor gate_up_scale,
+    torch::Tensor down_weight, torch::Tensor down_scale,
+    torch::Tensor per_expert_scale,
+    int64_t top_k, int64_t n_routed_experts) {
+    TORCH_CHECK(x.scalar_type() == torch::kHalf);
+    TORCH_CHECK(x.size(0) == 1, "decode kernel requires n_tokens==1");
+    int hidden_size = x.size(1);
+    int intermediate_size = gate_up_weight.size(1) / 2;
+    int rows_per_token = top_k;
+    ensure_gemma4_moe_buffers(1, top_k, hidden_size, intermediate_size, x.device());
+    sycl::queue& q = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+
+    // ---- TopK (fp32-internal production kernel, norm=true) ----
+    dispatch_moe_topk_forward<class MoeTopKGemma4Decode>(
+        (const fp16*)logits.data_ptr(),
+        sg_topk_idx.data_ptr<int>(),
+        (fp16*)sg_topk_weight.data_ptr(),
+        1, (int)n_routed_experts, (int)top_k, /*norm=*/true,
+        logits.device());
+
+    // ---- Fold per_expert_scale into topk weights (on-device) ----
+    q.submit([&](sycl::handler& h){
+        h.parallel_for(sycl::range<1>(top_k), MoeFoldExpertScale{
+            (fp16*)sg_topk_weight.data_ptr(),
+            sg_topk_idx.data_ptr<int>(),
+            per_expert_scale.data_ptr<float>(),
+            (int)top_k});
+    });
+
+    const int* idx_ptr = sg_topk_idx.data_ptr<int>();
+    const fp16* w_ptr  = (const fp16*)sg_topk_weight.data_ptr();
+
+    // ---- Up + gelu_tanh (1D-load GEMV) ----
+    {
+        const int VL = 256;
+        auto k = MoeUpDecodeGeluTanh<VL, 0>{
+            (const fp16*)x.data_ptr(),
+            (const uint8_t*)gate_up_weight.data_ptr(), gate_up_scale.data_ptr<float>(),
+            idx_ptr, (fp16*)sg_intermediates.data_ptr(),
+            hidden_size, intermediate_size, (int)top_k, /*fp8_mode=*/0};
+        q.submit([&](sycl::handler& h){
+            h.parallel_for(sycl::nd_range<2>(
+                sycl::range<2>(top_k, intermediate_size),
+                sycl::range<2>(1, 1)), k);
+        });
+    }
+    // ---- Down (1D-load GEMV, VL=256 + tail 32) ----
+    {
+        const int VL = 256; const int VL_TAIL = 32;
+        auto k = MoeDownDecode<VL, VL_TAIL>{
+            (const fp16*)sg_intermediates.data_ptr(),
+            (const uint8_t*)down_weight.data_ptr(), down_scale.data_ptr<float>(),
+            w_ptr, idx_ptr, (fp16*)sg_routed_output.data_ptr(),
+            hidden_size, intermediate_size, (int)top_k, /*fp8_mode=*/0};
+        q.submit([&](sycl::handler& h){
+            h.parallel_for(sycl::nd_range<2>(
+                sycl::range<2>(top_k, hidden_size),
+                sycl::range<2>(1, 1)), k);
+        });
+    }
+    // ---- Accumulate over top_k ----
+    auto& final_out = sg_take_final_output();
+    moe_accumulate_kernel(
+        (const fp16*)sg_routed_output.data_ptr(),
+        (fp16*)final_out.data_ptr(),
+        1, hidden_size, rows_per_token, x.device());
+    return final_out.narrow(0, 0, 1);
+}
+
 // ========== gemma4: variant with externally supplied routing ==========
 // Skip the built-in softmax/topk. Caller passes per-token topk indices and
 // weights that already encode model-specific routing logic (e.g. gemma4's
@@ -1789,6 +1935,10 @@ TORCH_LIBRARY_FRAGMENT(moe_ops, m) {
     m.def("moe_forward_full_gelu_tanh(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full_gelu_tanh_routed_no_accum(Tensor x, Tensor topk_weights, Tensor topk_indices, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full_gelu_tanh_routed(Tensor x, Tensor topk_weights, Tensor topk_indices, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, int top_k, int n_routed_experts) -> Tensor");
+    m.def("moe_forward_full_gelu_tanh_routed_decode(Tensor x, Tensor topk_weights, Tensor topk_indices, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, int top_k, int n_routed_experts) -> Tensor");
+    m.def("moe_forward_full_gelu_tanh_decode(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor per_expert_scale, int top_k, int n_routed_experts) -> Tensor");
+    m.def("moe_up_fp8_grouped(Tensor x, Tensor gate_up_weight, Tensor gate_up_scale, Tensor expert_offsets, Tensor expert_tokens, int top_k, int n_routed_experts) -> Tensor");
+    m.def("moe_down_fp8_grouped(Tensor intermediate, Tensor down_weight, Tensor down_scale, Tensor routing_weights, Tensor expert_offsets, Tensor expert_tokens, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full_v2(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
 }
@@ -1801,6 +1951,10 @@ TORCH_LIBRARY_IMPL(moe_ops, XPU, m) {
     m.impl("moe_topk", &moe_topk);
     m.impl("moe_forward_full_gelu_tanh", &moe_forward_full_gelu_tanh);
     m.impl("moe_forward_full_gelu_tanh_routed", &moe_forward_full_gelu_tanh_routed);
+    m.impl("moe_forward_full_gelu_tanh_routed_decode", &moe_forward_full_gelu_tanh_routed_decode);
+    m.impl("moe_forward_full_gelu_tanh_decode", &moe_forward_full_gelu_tanh_decode);
+    m.impl("moe_up_fp8_grouped", &moe_up_fp8_grouped);
+    m.impl("moe_down_fp8_grouped", &moe_down_fp8_grouped);
     m.impl("moe_forward_full_gelu_tanh_routed_no_accum", &moe_forward_full_gelu_tanh_routed_no_accum);
     m.impl("moe_forward_fused", &moe_forward_fused);
     m.impl("moe_forward_full", &moe_forward_full);
