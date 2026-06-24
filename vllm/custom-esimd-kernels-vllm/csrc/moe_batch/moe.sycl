@@ -527,7 +527,14 @@ void moe_up_routed_e4m3_gelu_tanh_kernel(
                     constexpr float coeff = 0.044715f;
                     simd<float, 16> gs3 = gs * gs * gs;
                     simd<float, 16> inner = sqrt_2_over_pi * (gs + coeff * gs3);
-                    simd<float, 16> exp2z = esimd_math::exp<float, 16>(2.0f * inner);
+                    // Saturate 2z into [-30, 30] before exp(): for gate absmax
+                    // >~11 the arg overflows fp32 exp() to +inf and inf/inf=NaN
+                    // (see #484, which fixed the same bug in the decode/dense
+                    // gelu kernel). tanh is +/-1 well within fp16 by |2z|=30.
+                    simd<float, 16> two_z = 2.0f * inner;
+                    two_z.merge(simd<float, 16>(30.0f), two_z > 30.0f);
+                    two_z.merge(simd<float, 16>(-30.0f), two_z < -30.0f);
+                    simd<float, 16> exp2z = esimd_math::exp<float, 16>(two_z);
                     simd<float, 16> tanh_v = (exp2z - 1.0f) / (exp2z + 1.0f);
                     simd<float, 16> gelu = 0.5f * gs * (1.0f + tanh_v);
                     simd<float, 16> result = gelu * us;
@@ -1609,8 +1616,6 @@ torch::Tensor moe_forward_full_gelu_tanh(
 
     return final_out.narrow(0, 0, n_tokens);
 }
-
-
 
 // ========== gemma4 decode-only (M==1) expert GEMV (load-width fix) ==========
 // Uses 1D block_load<uint8_t,VL> along K instead of the DPAS 16-wide 2D load.

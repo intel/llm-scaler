@@ -1463,6 +1463,10 @@ class MoeRouteFillInt4;
 template <typename IndexT>
 class MoeTinyMUpCutlassInt4;
 template <typename IndexT>
+class MoeTinyMUpCutlassInt4GeluTanh;
+template <typename IndexT>
+class MoeTinyMDownCutlassInt4G32;
+template <typename IndexT>
 class MoeTinyMDownCutlassInt4;
 template <typename IndexT>
 class MoeTinyMDownCutlassInt4WithSharedFP16;
@@ -1767,6 +1771,93 @@ void moe_tiny_m_up_cutlass_int4_kernel(
             });
     };
     submit_kernel(cgf, device, "moe tiny m up cutlass int4");
+}
+
+// ── gemma int4: tiny-m up kernel with gelu_tanh (gemma uses gelu_pytorch_tanh) ──
+template <typename IndexT>
+void moe_tiny_m_up_cutlass_int4_gelu_tanh_kernel(
+    const fp16* x,
+    const uint8_t* w13,
+    const fp16* w13_scales,
+    const IndexT* topk_idx,
+    fp16* intermediates,
+    const int n_tokens, const int top_k, const int hidden_size, const int intermediate_size,
+    const torch::Device& device) {
+
+    const int two_inter = 2 * intermediate_size;
+    const int k_bytes = hidden_size / 2;
+    const int k_groups = hidden_size / 32;  // gemma QK4_GROUP_SIZE=32
+    constexpr int WG_SIZE = 64;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> gate_acc(sycl::range<1>(WG_SIZE), cgh);
+        sycl::local_accessor<float, 1> up_acc(sycl::range<1>(WG_SIZE), cgh);
+        const int groups_per_token = top_k * intermediate_size;
+        const int groups = n_tokens * groups_per_token;
+        cgh.parallel_for<class MoeTinyMUpCutlassInt4GeluTanh<IndexT>>(
+            sycl::nd_range<1>(sycl::range<1>(groups * WG_SIZE),
+                              sycl::range<1>(WG_SIZE)),
+            [=](sycl::nd_item<1> item) {
+                const int group_id = (int)item.get_group(0);
+                const int lid = (int)item.get_local_id(0);
+                const int token = group_id / groups_per_token;
+                const int token_group = group_id - token * groups_per_token;
+                const int route = token_group / intermediate_size;
+                const int col = token_group - route * intermediate_size;
+                const int expert = (int)topk_idx[(size_t)token * top_k + route];
+                const fp16* x_row = x + (size_t)token * hidden_size;
+
+                const uint8_t* gate_row = w13 + ((size_t)expert * two_inter + col) * k_bytes;
+                const uint8_t* up_row = w13 + ((size_t)expert * two_inter + intermediate_size + col) * k_bytes;
+                const fp16* gate_s = w13_scales + ((size_t)expert * two_inter + col) * k_groups;
+                const fp16* up_s = w13_scales + ((size_t)expert * two_inter + intermediate_size + col) * k_groups;
+
+                float gate_sum = 0.0f;
+                float up_sum = 0.0f;
+                for (int kb = lid; kb < k_bytes; kb += WG_SIZE) {
+                    int k0 = kb << 1;
+                    int group = kb >> 4;  // group=32 -> 16 bytes/group
+                    uint8_t gate_packed = gate_row[kb];
+                    uint8_t up_packed = up_row[kb];
+                    int gate0 = decode_s4_nibble(gate_packed & 0x0F);
+                    int gate1 = decode_s4_nibble((gate_packed >> 4) & 0x0F);
+                    int up0 = decode_s4_nibble(up_packed & 0x0F);
+                    int up1 = decode_s4_nibble((up_packed >> 4) & 0x0F);
+                    float x0 = (float)x_row[k0];
+                    float x1 = (float)x_row[k0 + 1];
+                    gate_sum += x0 * ((float)gate0 * (float)gate_s[group]);
+                    gate_sum += x1 * ((float)gate1 * (float)gate_s[group]);
+                    up_sum += x0 * ((float)up0 * (float)up_s[group]);
+                    up_sum += x1 * ((float)up1 * (float)up_s[group]);
+                }
+                gate_acc[lid] = gate_sum;
+                up_acc[lid] = up_sum;
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int stride = WG_SIZE / 2; stride > 0; stride >>= 1) {
+                    if (lid < stride) {
+                        gate_acc[lid] += gate_acc[lid + stride];
+                        up_acc[lid] += up_acc[lid + stride];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+                if (lid == 0) {
+                    float g = gate_acc[0];
+                    float u = up_acc[0];
+                    // gelu_tanh: 0.5*g*(1+tanh(sqrt(2/pi)*(g+0.044715*g^3)))
+                    // saturate 2z into [-30,30] before exp (overflow guard, see #484)
+                    constexpr float c0 = 0.7978845608f, c1 = 0.044715f;
+                    float two_z = 2.0f * (c0 * (g + c1 * g * g * g));
+                    if (two_z > 30.0f) two_z = 30.0f;
+                    if (two_z < -30.0f) two_z = -30.0f;
+                    float e2 = sycl::exp(two_z);
+                    float tanh_v = (e2 - 1.0f) / (e2 + 1.0f);
+                    float gelu = 0.5f * g * (1.0f + tanh_v);
+                    intermediates[((size_t)token * top_k + route) * intermediate_size + col] = fp16(gelu * u);
+                }
+            });
+    };
+    submit_kernel(cgf, device, "moe tiny m up cutlass int4 gelu_tanh");
 }
 
 template <typename IndexT>
@@ -3628,6 +3719,130 @@ torch::Tensor moe_forward_cutlass_nmajor_int4_full(
     return output;
 }
 
+
+// ── gemma int4: group=32 down kernel (QK4_GROUP_SIZE=32, applies routing weight + accumulate) ──
+template <typename IndexT>
+void moe_tiny_m_down_cutlass_int4_g32_kernel(
+    const fp16* intermediates,
+    const uint8_t* w2,
+    const fp16* w2_scales,
+    const fp16* topk_weight,
+    const IndexT* topk_idx,
+    fp16* output,
+    const int n_tokens, const int top_k, const int hidden_size, const int intermediate_size,
+    const torch::Device& device) {
+
+    const int k_bytes = intermediate_size / 2;
+    const int k_groups = intermediate_size / 32;  // gemma QK4_GROUP_SIZE=32
+    constexpr int WG_SIZE = 64;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> local_acc(sycl::range<1>(WG_SIZE), cgh);
+        cgh.parallel_for<class MoeTinyMDownCutlassInt4G32<IndexT>>(
+            sycl::nd_range<1>(sycl::range<1>(n_tokens * hidden_size * WG_SIZE),
+                              sycl::range<1>(WG_SIZE)),
+            [=](sycl::nd_item<1> item) {
+                const int group_id = (int)item.get_group(0);
+                const int token = group_id / hidden_size;
+                const int h = group_id - token * hidden_size;
+                const int lid = (int)item.get_local_id(0);
+                float sum = 0.0f;
+                for (int route = 0; route < top_k; ++route) {
+                    int expert = (int)topk_idx[(size_t)token * top_k + route];
+                    const uint8_t* w_row = w2 + ((size_t)expert * hidden_size + h) * k_bytes;
+                    const fp16* s_row = w2_scales + ((size_t)expert * hidden_size + h) * k_groups;
+                    const fp16* in_row = intermediates + ((size_t)token * top_k + route) * intermediate_size;
+                    float route_weight = (float)topk_weight[(size_t)token * top_k + route];
+                    for (int k = lid; k < intermediate_size; k += WG_SIZE) {
+                        uint8_t packed = w_row[k >> 1];
+                        uint8_t nibble = (k & 1) ? ((packed >> 4) & 0x0F) : (packed & 0x0F);
+                        int v = decode_s4_nibble(nibble);
+                        float scale = (float)s_row[k >> 5];  // group=32
+                        sum += route_weight * (float)in_row[k] * ((float)v * scale);
+                    }
+                }
+                local_acc[lid] = sum;
+                item.barrier(sycl::access::fence_space::local_space);
+                for (int stride = WG_SIZE / 2; stride > 0; stride >>= 1) {
+                    if (lid < stride) local_acc[lid] += local_acc[lid + stride];
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+                if (lid == 0)
+                    output[(size_t)token * hidden_size + h] = fp16(local_acc[0]);
+            });
+    };
+    submit_kernel(cgf, device, "moe tiny m down cutlass int4 g32");
+}
+
+// ── gemma int4 decode: 内部 topk(fp32-internal) + per_expert_scale fold +
+// gelu_tanh up + down(+routing weight & accumulate). M==1 (decode). ──
+// w13_qweight_s4 [E, 2*inter, hidden/2] uint8, w13_scales [E, 2*inter, hidden/128] fp16
+// w2_qweight_s4  [E, hidden, inter/2] uint8,   w2_scales  [E, hidden, inter/128] fp16
+// per_expert_scale [E] float32. logits [n_tokens, E] fp16.
+torch::Tensor moe_forward_gelu_tanh_int4_decode(
+    torch::Tensor x, torch::Tensor logits,
+    torch::Tensor w13_qweight_s4, torch::Tensor w13_scales,
+    torch::Tensor w2_qweight_s4, torch::Tensor w2_scales,
+    torch::Tensor per_expert_scale,
+    int64_t top_k, int64_t n_routed_experts) {
+    TORCH_CHECK(x.scalar_type() == torch::kHalf && x.is_contiguous());
+    TORCH_CHECK(logits.scalar_type() == torch::kHalf);
+    TORCH_CHECK(w13_qweight_s4.scalar_type() == torch::kByte);
+    TORCH_CHECK(w2_qweight_s4.scalar_type() == torch::kByte);
+    int n_tokens = x.size(0);
+    int two_inter = w13_qweight_s4.size(1);
+    int intermediate_size = two_inter / 2;
+    int hidden_size = x.size(1);
+    sycl::queue& q = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+
+    // internal topk (fp32-internal softmax+top8+norm) — same v2 kernel as fp8 path
+    auto topk_idx = torch::empty({n_tokens, top_k},
+        torch::device(x.device()).dtype(torch::kInt));
+    auto topk_weight = torch::empty({n_tokens, top_k},
+        torch::device(x.device()).dtype(torch::kHalf));
+    TORCH_CHECK(n_routed_experts == 128 && top_k == 8,
+        "gemma int4 decode topk specialized for E=128 top_k=8");
+    moe_topk_v2_host<128, 8>(
+        (const fp16*)logits.data_ptr(),
+        (fp16*)topk_weight.data_ptr(),
+        topk_idx.data_ptr<int32_t>(),
+        n_tokens, q);
+
+    // fold per_expert_scale into topk weights (on-device)
+    {
+        const int n_routes = n_tokens * (int)top_k;
+        fp16* tw = (fp16*)topk_weight.data_ptr();
+        const int* ti = topk_idx.data_ptr<int>();
+        const float* pes = per_expert_scale.data_ptr<float>();
+        q.submit([&](sycl::handler& h){
+            h.parallel_for(sycl::range<1>(n_routes), [=](sycl::id<1> it){
+                const int r = (int)it[0];
+                tw[r] = fp16((float)tw[r] * pes[ti[r]]);
+            });
+        });
+    }
+
+    // gelu_tanh up -> intermediates [n_tokens*top_k, inter]
+    auto intermediates = torch::empty({n_tokens * (int)top_k, intermediate_size},
+        torch::device(x.device()).dtype(torch::kHalf));
+    moe_tiny_m_up_cutlass_int4_gelu_tanh_kernel<int32_t>(
+        (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
+        (const fp16*)w13_scales.data_ptr(), topk_idx.data_ptr<int>(),
+        (fp16*)intermediates.data_ptr(), n_tokens, (int)top_k, hidden_size,
+        intermediate_size, x.device());
+
+    // down (group=32, applies routing weight + accumulate over top_k) -> [n_tokens, hidden]
+    int hidden_out = w2_qweight_s4.size(1);
+    auto output = torch::empty({n_tokens, hidden_out},
+        torch::device(x.device()).dtype(torch::kHalf));
+    moe_tiny_m_down_cutlass_int4_g32_kernel<int32_t>(
+        (const fp16*)intermediates.data_ptr(), (const uint8_t*)w2_qweight_s4.data_ptr(),
+        (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
+        topk_idx.data_ptr<int32_t>(), (fp16*)output.data_ptr(),
+        n_tokens, (int)top_k, hidden_out, intermediate_size, x.device());
+    return output;
+}
+
 TORCH_LIBRARY_FRAGMENT(moe_int4_ops, m) {
     m.def("moe_router_forward_int4(Tensor x, Tensor weight, Tensor scale, bool use_ggml_layout) -> Tensor");
     m.def("moe_router_topk_int4(Tensor x, Tensor weight, Tensor scale, bool use_ggml_layout, int top_k, int n_routed_experts, bool norm) -> (Tensor, Tensor)");
@@ -3638,6 +3853,7 @@ TORCH_LIBRARY_FRAGMENT(moe_int4_ops, m) {
         m.def("moe_forward_tiny_cutlass_nmajor_int4(Tensor x, Tensor w13_qweight_s4, Tensor w13_scales, "
             "Tensor w2_qweight_s4, Tensor w2_scales, Tensor topk_weight, Tensor topk_idx) -> Tensor");
         m.def("moe_tiny_cutlass_nmajor_int4_up(Tensor x, Tensor w13_qweight_s4, Tensor w13_scales, Tensor topk_idx) -> Tensor");
+        m.def("moe_forward_gelu_tanh_int4_decode(Tensor x, Tensor logits, Tensor w13_qweight_s4, Tensor w13_scales, Tensor w2_qweight_s4, Tensor w2_scales, Tensor per_expert_scale, int top_k, int n_routed_experts) -> Tensor");
         m.def("moe_tiny_cutlass_nmajor_int4_down(Tensor intermediates, Tensor w2_qweight_s4, Tensor w2_scales, "
                     "Tensor topk_weight, Tensor topk_idx) -> Tensor");
             m.def("moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared(Tensor x, Tensor w13_qweight_s4, Tensor w13_scales, "
@@ -3680,6 +3896,7 @@ TORCH_LIBRARY_IMPL(moe_int4_ops, XPU, m) {
     m.impl("moe_route_gather_int4", &moe_route_gather_int4);
     m.impl("moe_forward_tiny_cutlass_nmajor_int4", &moe_forward_tiny_cutlass_nmajor_int4);
     m.impl("moe_tiny_cutlass_nmajor_int4_up", &moe_tiny_cutlass_nmajor_int4_up);
+    m.impl("moe_forward_gelu_tanh_int4_decode", &moe_forward_gelu_tanh_int4_decode);
     m.impl("moe_tiny_cutlass_nmajor_int4_down", &moe_tiny_cutlass_nmajor_int4_down);
     m.impl("moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared", &moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared);
     m.impl("moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits", &moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits);
@@ -3700,6 +3917,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_route_gather_int4", &moe_route_gather_int4);
     m.def("moe_forward_tiny_cutlass_nmajor_int4", &moe_forward_tiny_cutlass_nmajor_int4);
     m.def("moe_tiny_cutlass_nmajor_int4_up", &moe_tiny_cutlass_nmajor_int4_up);
+    m.def("moe_forward_gelu_tanh_int4_decode", &moe_forward_gelu_tanh_int4_decode);
     m.def("moe_tiny_cutlass_nmajor_int4_down", &moe_tiny_cutlass_nmajor_int4_down);
     m.def("moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared", &moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared);
     m.def("moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits", &moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits);
