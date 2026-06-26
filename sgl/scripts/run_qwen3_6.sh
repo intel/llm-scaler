@@ -38,6 +38,10 @@ export SGLANG_XPU_ENABLE_GRAPH=1
 # Setup.py at /workspace/custom-esimd-kernels {-, -sglang}/setup.py
 # installs both via package_dir; nothing extra to set normally.
 
+# --disable-radix-cache: the MambaRadixCache prefix-cache path can deadlock
+# the TP schedulers on this hybrid GDN model (cache_prefix / zero-token
+# prefill insert spins the cross-rank sync). Disabling it keeps the server
+# stable for multi-request workloads; per-request decode perf is unaffected.
 exec python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
     --tp "${TP_SIZE}" \
@@ -45,5 +49,6 @@ exec python3 -m sglang.launch_server \
     --quantization fp8 \
     --attention-backend triton \
     --trust-remote-code \
+    --disable-radix-cache \
     --host "${HOST}" \
     --port "${PORT}"
