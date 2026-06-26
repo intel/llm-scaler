@@ -8,7 +8,9 @@ Battlemage (BMG) GPUs with the optimized ESIMD kernel fast-paths.
 ```
 sgl/
 ├── Dockerfile                       # builds the full image
-├── scripts/run_qwen3_6.sh           # launches the TP=4 fp8 server
+├── scripts/
+│   ├── build_image.sh               # wrapper around `docker build`
+│   └── run_qwen3_6.sh               # launches the TP=4 fp8 server
 ├── custom-esimd-kernels/            # ESIMD kernels: decode attn, fp8 GEMM, fp8 MoE
 └── custom-esimd-kernels-sglang/     # ESIMD kernels: fused QKV, GDN conv fused_seq
 ```
@@ -20,11 +22,11 @@ vendor them.
 ## Build
 
 ```bash
-docker build -t llm-scaler-sgl:bmg \
-    --build-arg http_proxy=${http_proxy:-} \
-    --build-arg https_proxy=${https_proxy:-} \
-    llm-scaler/sgl
+llm-scaler/sgl/scripts/build_image.sh
 ```
+
+The script forwards `http_proxy` / `https_proxy` from the environment and
+defaults the image tag to `llm-scaler-sgl:bmg` (override with `IMAGE_TAG=...`).
 
 Time: ~25 min on a workstation (cold), dominated by the ESIMD AOT compile
 and the sgl-kernel-xpu cmake build.
