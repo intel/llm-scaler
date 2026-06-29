@@ -32,13 +32,17 @@
  *     cu_seqlens : [n_seqs + 1]             int32
  */
 
+// StateT = persisted SSM state dtype (float | sycl::half). The recurrence
+// math always runs in fp32; only the load/store of the persistent state
+// buffer is in StateT (matches mamba_ssm_dtype: fp32 or fp16).
+template <typename StateT>
 ESIMD_INLINE void chunkGatedDeltaRuleExtendFp16(
   uint8_t* qState,
   uint8_t* kState,
   uint8_t* vState,
   uint8_t* gState,        // fp32 log-space decay
   uint8_t* betaState,     // fp32 post-sigmoid
-  uint8_t* stateBuf,      // FP32 in/out: initial_state on entry, last_state on exit
+  uint8_t* stateBuf,      // StateT in/out: initial_state on entry, last_state on exit
   uint8_t* oState,
   uint32_t* cuSeqlens,
   uint32_t headQk,        // H_k: headV must be a multiple of this (GQA on GDN)
@@ -69,8 +73,8 @@ ESIMD_INLINE void chunkGatedDeltaRuleExtendFp16(
   const uint32_t qkTokStride = headQk * headDim;  // per-token stride on q/k (fp16 elements)
   const uint32_t vTokStride  = headV  * headDim;
   const uint32_t gTokStride  = headV;             // per-token stride on g (fp32 elements) / beta (fp16 elements)
-  const uint32_t stateHeadElems = headDim * headDim;                      // per head, in fp16 elements
-  const uint32_t stateSeqElems  = headV * stateHeadElems;                 // per seq, in fp16 elements
+  const uint32_t stateHeadElems = headDim * headDim;                      // per head, in StateT elements
+  const uint32_t stateSeqElems  = headV * stateHeadElems;                 // per seq, in StateT elements
 
   // GQA on GDN: multiple v-heads share one k-head (repeat = H_v / H_k).
   // H_k == H_v is the common case (repeat = 1, "dense GDN").
@@ -81,23 +85,25 @@ ESIMD_INLINE void chunkGatedDeltaRuleExtendFp16(
   fp16* vPtr     = (fp16*)vState;
   float* gPtr    = (float*)gState;
   float* betaPtr = (float*)betaState;
-  float* sPtr    = (float*)stateBuf;
+  StateT* sPtr   = (StateT*)stateBuf;
   fp16* oPtr     = (fp16*)oState;
 
   // Base pointer to this thread's 8-row slab of the (seq, head) state:
-  // state[seq, head][hh*8 : hh*8 + 8, :] contiguous = headDim * 8 fp32 elements.
-  float* sMyRows = sPtr
+  // state[seq, head][hh*8 : hh*8 + 8, :] contiguous = headDim * 8 StateT elements.
+  // Element counts are dtype-independent; only the element size differs.
+  StateT* sMyRows = sPtr
                  + seqIdx * stateSeqElems
                  + headIdx * stateHeadElems
                  + (hh * 8) * headDim;
 
-  // Load our 8 state rows (fp32, 128 elems × 8 rows = 1024 floats = 4 KB).
-  // block_load fp32 max per call is 128 elements; loop 8 times.
+  // Load our 8 state rows (128 elems × 8 rows). State always held in fp32
+  // registers; StateT=half upconverts to float on assign, StateT=float no-op.
+  // block_load max per call is 128 elements; loop 8 times.
   simd<float, 128 * 8> fp32InS_persistent;
   #pragma unroll
   for (int r = 0; r < 8; r++) {
-    fp32InS_persistent.select<128, 1>(r * 128) =
-        block_load<float, 128>(sMyRows + r * headDim);
+    simd<StateT, 128> raw = block_load<StateT, 128>(sMyRows + r * headDim);
+    fp32InS_persistent.select<128, 1>(r * 128) = raw;
   }
 
   // ---- Per-token loop --------------------------------------------------
@@ -203,10 +209,11 @@ ESIMD_INLINE void chunkGatedDeltaRuleExtendFp16(
     // state stays in fp32 registers (fp32InS_persistent) across iterations.
   }
 
-  // ---- Phase 3: write final state back to stateBuf as last_state (fp32) --
+  // ---- Phase 3: write final state back to stateBuf as last_state (StateT) --
+  // fp32 registers downconvert to StateT on store (no-op when StateT=float).
   #pragma unroll
   for (int r = 0; r < 8; r++) {
-    block_store<float, 128>(sMyRows + r * headDim,
-                            fp32InS_persistent.select<128, 1>(r * 128));
+    simd<StateT, 128> ov = fp32InS_persistent.select<128, 1>(r * 128);
+    block_store<StateT, 128>(sMyRows + r * headDim, ov);
   }
 }

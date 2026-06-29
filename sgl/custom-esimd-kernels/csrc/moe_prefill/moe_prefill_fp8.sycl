@@ -1,0 +1,678 @@
+// ============================================================================
+// FP8 (e4m3 / e5m2) M-tiled DPAS MoE prefill kernels for Intel BMG.
+//
+// Adapted from the proven int4 reference
+//   ref/.../csrc/moe_prefill/moe_prefill_int4.sycl
+// with these changes (int4 -> FP8):
+//
+//   * Weight dtype: uint32 packed int4  ->  uint8 FP8 (e4m3 or e5m2).
+//   * sglang FusedMoE layout (N-major / NK):
+//       w13 = [E, 2*I, H]   (rows = 2I output, cols = H input)
+//       w2  = [E, H,   I]   (rows = H  output, cols = I input)
+//     so the K dim is the *contiguous* (last) dim of each weight matrix.
+//   * Per-expert *scalar* scale (float* indexed [eid]) instead of per-group
+//     per-column fp16 scale.  Applied to the accumulator AFTER the K-loop,
+//     mirroring moe.sycl's GEMV path (`gs *= scale`).
+//   * No marlin unshuffle, no -8 zero-point, no scale reload in the K-loop.
+//
+// DPAS operand shaping (the load-bearing detail):
+//   The int4 ref calls
+//       dpas<8,8,fp16,fp16,fp16,fp16>(acc, bv, a_tile)
+//   where  bv     = 256 fp16 = gathered INPUT activation, VNNI [K=16,16-tok]
+//                   (DPAS operand B, execSize=16 tokens)
+//          a_tile = 128 fp16 = dequantized WEIGHT, plain [N=8 rows, K=16]
+//                   (DPAS operand A, RepeatCount=8)
+//          acc    = 128 fp16 = result [N=8 weight-rows, 16 tokens]
+//                   indexed acc[weight_row*16 + tok].
+//   So the WEIGHT is DPAS operand A in *plain row-major* [N=8, K=16]=128 — it
+//   is NOT VNNI-packed.  The FP8 helpers fp8e4m3_block_to_vnni_nk(...) produce
+//   a 256-elem VNNI block, which is the layout for an operand *B* weight (as in
+//   moe.sycl's GEMV at line ~425, dpas<8,1>(acc, b_vnni, a_act)) — the opposite
+//   operand role.  Feeding that here would give DPAS the wrong operand-A
+//   layout.  Therefore — to reuse the int4 ref's DPAS call verbatim and keep
+//   the input as the 256-elem VNNI operand B — we build the weight a_tile as
+//   plain [N=8,K=16]=128 directly from the FP8 bytes via the scalar-vector
+//   fp8e4m3_to_half<128> / fp8e5m2_to_half<128> conversions (16 N-rows-of-8 K
+//   loaded with block_load<uint8_t,16> per row).  See the report for the
+//   256-vs-128 deviation rationale.
+// ============================================================================
+
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <cstring>
+#include <algorithm>
+#include <vector>
+#include <cassert>
+
+using fp16 = sycl::half;
+using bf16 = sycl::ext::oneapi::bfloat16;
+using namespace sycl::ext::intel::esimd;
+namespace xesimd = sycl::ext::intel::experimental::esimd;
+namespace xmx_ns = sycl::ext::intel::esimd::xmx;
+
+#include "../xpu/esimd_kernels/moe_ops.h"
+
+// ── FP8 → half scalar-vector dequant (identical math to the helpers in ──────
+//    csrc/moe_batch/moe.sycl; kept local so this TU is self-contained) ───────
+template<int N>
+SYCL_ESIMD_FUNCTION
+simd<fp16, N> mp_fp8e4m3_to_half(simd<uint8_t, N> raw) {
+    simd<uint32_t, N> val = convert<uint32_t>(raw);
+    simd<uint32_t, N> s = val >> 7;
+    simd<uint32_t, N> e = (val >> 3) & 0xF;
+    simd<uint32_t, N> m = val & 0x7;
+
+    simd<uint32_t, N> fp32_bits = (s << 31) | ((e + 120) << 23) | (m << 20);
+
+    simd<float, N> sub_val = convert<float>(m) * (1.0f / 512.0f);
+    simd<uint32_t, N> sub_bits = sub_val.template bit_cast_view<uint32_t>();
+    sub_bits = sub_bits | (s << 31);
+
+    fp32_bits.merge(sub_bits, e == 0);
+    fp32_bits.merge(s << 31, (e == 0) & (m == 0));
+
+    simd<float, N> f = fp32_bits.template bit_cast_view<float>();
+    return convert<fp16>(f);
+}
+
+template<int N>
+SYCL_ESIMD_FUNCTION
+simd<fp16, N> mp_fp8e5m2_to_half(simd<uint8_t, N> raw) {
+    simd<uint16_t, N> u16 = convert<uint16_t>(raw);
+    simd<uint16_t, N> fp8_sign = (u16 >> 7) & 1;
+    simd<uint16_t, N> fp8_exp  = (u16 >> 2) & 0x1F;
+    simd<uint16_t, N> fp8_mant = u16 & 0x3;
+    simd<uint16_t, N> fp16_bits =
+        (fp8_sign << 15) | (fp8_exp << 10) | (fp8_mant << 8);
+    fp16_bits.merge(fp8_sign << 15, fp8_exp == 0);
+    return fp16_bits.template bit_cast_view<fp16>();
+}
+
+// FP8 mode tag: 0 = e4m3, 1 = e5m2. Compile-time so the dequant inlines.
+template<int FP8_MODE, int N>
+SYCL_ESIMD_FUNCTION inline simd<fp16, N> mp_fp8_to_half(simd<uint8_t, N> raw) {
+    if constexpr (FP8_MODE == 0) return mp_fp8e4m3_to_half<N>(raw);
+    else                         return mp_fp8e5m2_to_half<N>(raw);
+}
+
+// ======================== gather/routing kernel (copied verbatim) ===========
+template<int GS = 1024>
+sycl::event moe_prefill_gather_forward_kernel_fp8(
+    sycl::queue& q,
+    const int* selected_experts, int* expert_offsets, int* expert_tokens,
+    int* pair_to_perm, int* rows_for_experts,
+    int num_experts, int total_seqlen)
+{
+    return q.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> slm_counters(sycl::range<1>(num_experts), cgh);
+        sycl::local_accessor<int, 1> slm_offsets(sycl::range<1>(num_experts), cgh);
+
+        cgh.parallel_for<class K0_fp8>(
+            sycl::nd_range<1>(GS, GS),
+            [=](sycl::nd_item<1> item) {
+            const int lid = (int)item.get_local_id(0);
+
+            for (int i = lid; i < num_experts; i += GS) {
+                slm_counters[i] = 0;
+                slm_offsets[i] = 0;
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+
+            for (int i = lid; i < total_seqlen; i += GS) {
+                int eid = selected_experts[i];
+                sycl::atomic_ref<int, sycl::memory_order::relaxed,
+                    sycl::memory_scope::work_group,
+                    sycl::access::address_space::local_space> ref(slm_counters[eid]);
+                ref.fetch_add(1);
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+
+            if (lid == 0) {
+                int sum = 0;
+                for (int i = 0; i < num_experts; i++) {
+                    slm_offsets[i] = sum;
+                    sum += slm_counters[i];
+                }
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+
+            for (int i = lid; i < num_experts; i += GS) {
+                expert_offsets[i] = slm_offsets[i];
+                rows_for_experts[i] = slm_counters[i];
+            }
+
+            for (int i = lid; i < total_seqlen; i += GS) {
+                int eid = selected_experts[i];
+                sycl::atomic_ref<int, sycl::memory_order::relaxed,
+                    sycl::memory_scope::work_group,
+                    sycl::access::address_space::local_space> ref(slm_offsets[eid]);
+                int pos = ref.fetch_add(1);
+                expert_tokens[pos] = i;
+                pair_to_perm[i]    = pos;
+            }
+        });
+    });
+}
+
+// ======================== up kernel: Gate+Up+SiLU (FP8) =====================
+// Weight layout (sglang FusedMoE w13): [E, 2*I, H] uint8 FP8, N-major/NK.
+//   gate rows at [0, I), up rows at [I, 2*I).  K = hidden_size (last dim).
+// One WI per (expert, N-tile of size N).  Per-expert scalar scale.
+template<typename IT, int FP8_MODE, int MAX_M = 32, int N = 16>
+sycl::event moe_prefill_up_forward_kernel_fp8(
+    sycl::queue& q,
+    const IT* input, const uint8_t* gate_up_weight, const float* gate_up_scale,
+    IT* intermediate, const int* expert_offsets, const int* expert_tokens,
+    int num_experts, int total_seqlen, int hidden_size, int intermediate_size, int top_k)
+{
+    static_assert(MAX_M % 16 == 0, "MAX_M must be multiple of 16");
+    static_assert(N % 8 == 0,      "N must be multiple of 8 (DPAS N-tile)");
+    constexpr int MS     = MAX_M / 16;
+    constexpr int NS     = N / 8;          // DPAS N-tiles per WI (operand-A rows of 8)
+    constexpr int ACC_SZ = MS * NS * 128;
+
+    return q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::range<2>(num_experts, intermediate_size / N),
+            [=](sycl::id<2> id) SYCL_ESIMD_KERNEL {
+
+            const int two_inter = 2 * intermediate_size;
+            const int eid  = (int)id[0];
+            const int tid  = (int)id[1];
+            const int n_start = tid * N;                      // gate N-start; up = + intermediate_size
+            const int t0 = expert_offsets[eid];
+            const int t1 = (eid + 1 < num_experts) ? expert_offsets[eid + 1] : total_seqlen;
+            if (t0 == t1) return;
+
+            // w13 = [E, 2*I, H]: base for this expert, K = hidden_size = last dim
+            const uint8_t* w_base = gate_up_weight + (size_t)eid * two_inter * hidden_size;
+            // gate_up_scale is [E, 2]: per-expert separate scale for gate (w1)
+            // and up (w3). Applying a single mean to both is too lossy when the
+            // gate/up magnitudes differ (gsm8k garbage).
+            const float    scale_gate = gate_up_scale[(size_t)eid * 2 + 0];
+            const float    scale_up   = gate_up_scale[(size_t)eid * 2 + 1];
+
+            for (int m_base = t0; m_base < t1; m_base += MAX_M) {
+                simd<uint32_t, MAX_M> sorted_idxs =
+                    min(simd<uint32_t, MAX_M>(0u, 1u) + (uint32_t)m_base,
+                        simd<uint32_t, MAX_M>((uint32_t)(t1 - 1)));
+                simd<uint32_t, MAX_M> pair_idxs =
+                    convert<uint32_t>(gather<int, MAX_M>(expert_tokens, sorted_idxs * 4u));
+                simd<uint32_t, MAX_M> in_off =
+                    (pair_idxs / (uint32_t)top_k) * (uint32_t)(hidden_size * sizeof(IT));
+
+                simd<fp16, ACC_SZ> g_acc(fp16(0));
+                simd<fp16, ACC_SZ> u_acc(fp16(0));
+
+                // K-loop: 16 K-elements (one DPAS K-tile) per iteration.
+                for (int k = 0; k < hidden_size; k += 16) {
+                    // b_tile: gather input rows, VNNI [MS, K=16, 16-tok] = 256 fp16/MS.
+                    const uint32_t k_off = (uint32_t)k * (uint32_t)sizeof(IT);
+                    simd<fp16, MS * 256> b_tile;
+                    #pragma unroll
+                    for (int ms = 0; ms < MS; ms++) {
+                        simd<IT, 256> btmp;
+                        btmp.template bit_cast_view<uint32_t>() =
+                            xesimd::lsc_gather<uint32_t, 8,
+                                xesimd::lsc_data_size::u32,
+                                xesimd::cache_hint::cached, xesimd::cache_hint::cached,
+                                16, uint32_t>(
+                                reinterpret_cast<const uint32_t*>(input),
+                                in_off.template select<16, 1>(ms * 16).read() + k_off);
+                        b_tile.template select<256, 1>(ms * 256) = convert<fp16>(btmp);
+                    }
+
+                    // Build + DPAS one column block (N output rows) for gate or up.
+                    //   col_base : N-row offset into the 2*I weight rows.
+                    auto fp8_dpas = [&](int col_base, simd<fp16, ACC_SZ>& acc)
+                                        SYCL_ESIMD_FUNCTION {
+                        #pragma unroll
+                        for (int ns = 0; ns < NS; ns++) {
+                            // Load FP8 weight [8 N-rows × 16 K] = 128 bytes, row-major.
+                            //   w13[eid][col_base + ns*8 + r][k .. k+15]
+                            simd<uint8_t, 128> wraw;
+                            #pragma unroll
+                            for (int r = 0; r < 8; r++) {
+                                const size_t row = (size_t)(col_base + ns * 8 + r);
+                                wraw.template select<16, 1>(r * 16) =
+                                    block_load<uint8_t, 16>(
+                                        w_base + row * (size_t)hidden_size + k);
+                            }
+                            // Dequant → plain [N=8, K=16] = 128 a_tile (DPAS operand A).
+                            simd<fp16, 128> a_tile = mp_fp8_to_half<FP8_MODE, 128>(wraw);
+
+                            #pragma unroll
+                            for (int ms = 0; ms < MS; ms++) {
+                                const int idx = ms * NS * 128 + ns * 128;
+                                simd<fp16, 128> a  = acc.template select<128, 1>(idx);
+                                simd<fp16, 256> bv = b_tile.template select<256, 1>(ms * 256);
+                                a = xmx_ns::dpas<8, 8, fp16, fp16, fp16, fp16>(a, bv, a_tile);
+                                acc.template select<128, 1>(idx) = a;
+                            }
+                        }
+                    };
+
+                    fp8_dpas(n_start,                     g_acc);
+                    fp8_dpas(n_start + intermediate_size, u_acc);
+                } // k
+
+                // Separate per-expert scale for gate and up, then SiLU(gate)*up.
+                g_acc *= fp16(scale_gate);
+                u_acc *= fp16(scale_up);
+                simd<fp16, ACC_SZ> sv =
+                    (g_acc / (fp16(1) + sycl::ext::intel::esimd::exp(-g_acc))) * u_acc;
+
+                // Scatter intermediate (indexed by pair_idx). acc layout per ms:
+                //   [ns][N=8 weight-rows][16 tok]; output N row = ns*8 + rr.
+                simd<uint32_t, MAX_M> out_off =
+                    pair_idxs * (uint32_t)(intermediate_size * sizeof(IT));
+
+                #pragma unroll
+                for (int ms = 0; ms < MS; ms++) {
+                    simd<uint32_t, 16> ms_off =
+                        out_off.template select<16, 1>(ms * 16).read();
+
+                    #pragma unroll
+                    for (int ns = 0; ns < NS; ns++) {
+                        #pragma unroll
+                        for (int rr = 0; rr < 8; rr++) {
+                            const int n_local = ns * 8 + rr;          // 0..N-1
+                            uint32_t ch = (uint32_t)(n_start + n_local) * (uint32_t)sizeof(IT);
+                            const int idx = ms * NS * 128 + ns * 128 + rr * 16;
+                            simd<IT, 16> val = sv.template select<16, 1>(idx);
+                            scatter<IT, 16>(intermediate, ms_off + ch, val);
+                        }
+                    }
+                }
+            } // m_base
+        });
+    });
+}
+
+// ======================== down kernel: Down projection (FP8) ================
+// Weight layout (sglang FusedMoE w2): [E, H, I] uint8 FP8, N-major/NK.
+//   K = intermediate_size (last dim).  N output dim = hidden_size.
+template<typename IT, int FP8_MODE, int MAX_M = 32, int N = 32>
+sycl::event moe_prefill_down_forward_kernel_fp8(
+    sycl::queue& q,
+    const IT* intermediate, const uint8_t* down_weight, const float* down_scale,
+    IT* expert_output, const int* expert_offsets, const int* expert_tokens,
+    int num_experts, int total_seqlen, int intermediate_size, int hidden_size)
+{
+    static_assert(MAX_M % 16 == 0, "MAX_M must be multiple of 16");
+    static_assert(N % 8 == 0,       "N must be multiple of 8");
+    constexpr int MS     = MAX_M / 16;
+    constexpr int NS     = N / 8;
+    constexpr int ACC_SZ = MS * NS * 128;
+
+    return q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::range<2>(num_experts, hidden_size / N),
+            [=](sycl::id<2> id) SYCL_ESIMD_KERNEL {
+
+            const int eid   = (int)id[0];
+            const int tid   = (int)id[1];
+            const int n_start = tid * N;
+            const int t0 = expert_offsets[eid];
+            const int t1 = (eid + 1 < num_experts) ? expert_offsets[eid + 1] : total_seqlen;
+            if (t0 == t1) return;
+
+            // w2 = [E, H, I]: K = intermediate_size = last dim
+            const uint8_t* w_base = down_weight + (size_t)eid * hidden_size * intermediate_size;
+            const float    scale  = down_scale[eid];
+
+            for (int m_base = t0; m_base < t1; m_base += MAX_M) {
+                simd<uint32_t, MAX_M> sorted_idxs =
+                    min(simd<uint32_t, MAX_M>(0u, 1u) + (uint32_t)m_base,
+                        simd<uint32_t, MAX_M>((uint32_t)(t1 - 1)));
+                simd<uint32_t, MAX_M> pair_idxs =
+                    convert<uint32_t>(gather<int, MAX_M>(expert_tokens, sorted_idxs * 4u));
+                simd<uint32_t, MAX_M> in_off =
+                    pair_idxs * (uint32_t)(intermediate_size * sizeof(IT));
+
+                simd<fp16, ACC_SZ> acc(fp16(0));
+
+                for (int k = 0; k < intermediate_size; k += 16) {
+                    const uint32_t k_off = (uint32_t)k * (uint32_t)sizeof(IT);
+                    simd<fp16, MS * 256> b_tile;
+                    #pragma unroll
+                    for (int ms = 0; ms < MS; ms++) {
+                        simd<IT, 256> btmp;
+                        btmp.template bit_cast_view<uint32_t>() =
+                            xesimd::lsc_gather<uint32_t, 8,
+                                xesimd::lsc_data_size::u32,
+                                xesimd::cache_hint::cached, xesimd::cache_hint::cached,
+                                16, uint32_t>(
+                                reinterpret_cast<const uint32_t*>(intermediate),
+                                in_off.template select<16, 1>(ms * 16).read() + k_off);
+                        b_tile.template select<256, 1>(ms * 256) = convert<fp16>(btmp);
+                    }
+
+                    #pragma unroll
+                    for (int ns = 0; ns < NS; ns++) {
+                        simd<uint8_t, 128> wraw;
+                        #pragma unroll
+                        for (int r = 0; r < 8; r++) {
+                            const size_t row = (size_t)(n_start + ns * 8 + r);
+                            wraw.template select<16, 1>(r * 16) =
+                                block_load<uint8_t, 16>(
+                                    w_base + row * (size_t)intermediate_size + k);
+                        }
+                        simd<fp16, 128> a_tile = mp_fp8_to_half<FP8_MODE, 128>(wraw);
+
+                        #pragma unroll
+                        for (int ms = 0; ms < MS; ms++) {
+                            const int idx = ms * NS * 128 + ns * 128;
+                            simd<fp16, 256> bv = b_tile.template select<256, 1>(ms * 256);
+                            simd<fp16, 128> a  = acc.template select<128, 1>(idx);
+                            a = xmx_ns::dpas<8, 8, fp16, fp16, fp16, fp16>(a, bv, a_tile);
+                            acc.template select<128, 1>(idx) = a;
+                        }
+                    } // ns
+                } // k
+
+                acc *= fp16(scale);
+
+                simd<uint32_t, MAX_M> out_off =
+                    pair_idxs * (uint32_t)(hidden_size * sizeof(IT));
+
+                #pragma unroll
+                for (int ms = 0; ms < MS; ms++) {
+                    simd<uint32_t, 16> ms_off =
+                        out_off.template select<16, 1>(ms * 16).read();
+
+                    #pragma unroll
+                    for (int ns = 0; ns < NS; ns++) {
+                        #pragma unroll
+                        for (int rr = 0; rr < 8; rr++) {
+                            const int n_local = ns * 8 + rr;
+                            uint32_t ch = (uint32_t)(n_start + n_local) * (uint32_t)sizeof(IT);
+                            const int idx = ms * NS * 128 + ns * 128 + rr * 16;
+                            simd<IT, 16> rv = acc.template select<16, 1>(idx);
+                            scatter<IT, 16>(expert_output, ms_off + ch, rv);
+                        }
+                    }
+                }
+            } // m_base
+        });
+    });
+}
+
+// ======================== accumulate kernel (copied verbatim) ===============
+template<typename IT>
+sycl::event moe_prefill_accumulate_forward_kernel_fp8(
+    sycl::queue& q,
+    const IT* output, const IT* routing_weights, IT* routing_output,
+    int num_tokens, int hidden_size, int top_k)
+{
+    return q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::range<1>(num_tokens),
+            [=](sycl::id<1> id) SYCL_ESIMD_KERNEL {
+                const int tok = (int)id[0];
+                for (int hoff = 0; hoff < hidden_size; hoff += 64) {
+                    simd<float, 64> acc(0.f);
+                    for (int s = 0; s < top_k; s++) {
+                        float w = (float)routing_weights[tok * top_k + s];
+                        int pi = tok * top_k + s;
+                        acc += w * convert<float>(
+                            block_load<IT, 64>(output + (size_t)pi * hidden_size + hoff));
+                    }
+                    block_store<IT, 64>(routing_output + (size_t)tok * hidden_size + hoff, convert<IT>(acc));
+                }
+            });
+    });
+}
+
+// ======================== Torch wrappers ====================================
+
+static inline int fp8_mode_of(const torch::Tensor& w, const char* who) {
+    switch (w.scalar_type()) {
+        case at::kFloat8_e4m3fn: return 0;
+        case at::kFloat8_e5m2:   return 1;
+        default:
+            TORCH_CHECK(false, who, ": weight dtype must be float8_e4m3fn or float8_e5m2");
+            return -1;
+    }
+}
+
+std::vector<torch::Tensor> moe_prefill_gather_forward_fp8(
+    torch::Tensor selected_experts,
+    int64_t num_experts) {
+
+    TORCH_CHECK(selected_experts.dim() == 2);
+    TORCH_CHECK(selected_experts.scalar_type() == torch::kInt32);
+
+    int total_seqlen = selected_experts.numel();
+
+    auto opts_int = torch::device(selected_experts.device()).dtype(torch::kInt32);
+    torch::Tensor expert_offsets    = torch::empty({num_experts},  opts_int);
+    torch::Tensor expert_tokens     = torch::empty({total_seqlen}, opts_int);
+    torch::Tensor pair_to_perm      = torch::empty({total_seqlen}, opts_int);
+    torch::Tensor rows_for_experts  = torch::empty({num_experts},  opts_int);
+
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(selected_experts.device().index()).queue();
+
+    moe_prefill_gather_forward_kernel_fp8(
+        queue,
+        selected_experts.data_ptr<int>(),
+        expert_offsets.data_ptr<int>(),
+        expert_tokens.data_ptr<int>(),
+        pair_to_perm.data_ptr<int>(),
+        rows_for_experts.data_ptr<int>(),
+        num_experts, total_seqlen);
+
+    return {expert_offsets, expert_tokens, pair_to_perm, rows_for_experts};
+}
+
+// w13 = [E, 2*I, H] FP8 ; gate_up_scale = float[E, 2] (gate, up per expert)
+torch::Tensor moe_prefill_up_forward_fp8(
+    torch::Tensor x,
+    torch::Tensor gate_up_weight,
+    torch::Tensor gate_up_scale,
+    torch::Tensor expert_offsets,
+    torch::Tensor expert_tokens,
+    int64_t top_k) {
+
+    TORCH_CHECK(x.dim() == 2);
+    TORCH_CHECK(gate_up_weight.dim() == 3, "gate_up_weight must be [E, 2*I, H]");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "x must be fp16");
+    TORCH_CHECK(gate_up_scale.scalar_type() == torch::kFloat32, "gate_up_scale must be float32");
+    TORCH_CHECK(expert_offsets.scalar_type() == torch::kInt32);
+    TORCH_CHECK(expert_tokens.scalar_type() == torch::kInt32);
+
+    int fp8_mode    = fp8_mode_of(gate_up_weight, "moe_prefill_up_forward_fp8");
+    int num_experts = gate_up_weight.size(0);
+    int two_inter   = gate_up_weight.size(1);
+    int hidden_size = gate_up_weight.size(2);
+    int intermediate_size = two_inter / 2;
+    int total_seqlen = expert_tokens.numel();
+
+    TORCH_CHECK(x.size(1) == hidden_size, "x hidden dim must equal w13 last dim");
+    TORCH_CHECK(intermediate_size % 16 == 0, "intermediate_size must be multiple of 16 (N-tile)");
+    TORCH_CHECK(hidden_size % 16 == 0, "hidden_size (K) must be multiple of 16");
+    TORCH_CHECK(gate_up_scale.numel() >= 2 * num_experts, "gate_up_scale must have >= 2*E entries ([E,2] gate/up)");
+
+    torch::Tensor intermediate = torch::empty(
+        {total_seqlen, intermediate_size},
+        torch::device(x.device()).dtype(x.scalar_type()));
+
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+
+    const fp16* x_ptr    = (const fp16*)x.data_ptr();
+    const uint8_t* w_ptr = (const uint8_t*)gate_up_weight.data_ptr();
+    const float* s_ptr   = gate_up_scale.data_ptr<float>();
+    fp16* o_ptr          = (fp16*)intermediate.data_ptr();
+
+    if (fp8_mode == 0)
+        moe_prefill_up_forward_kernel_fp8<fp16, 0>(
+            queue, x_ptr, w_ptr, s_ptr, o_ptr,
+            expert_offsets.data_ptr<int>(), expert_tokens.data_ptr<int>(),
+            num_experts, total_seqlen, hidden_size, intermediate_size, top_k);
+    else
+        moe_prefill_up_forward_kernel_fp8<fp16, 1>(
+            queue, x_ptr, w_ptr, s_ptr, o_ptr,
+            expert_offsets.data_ptr<int>(), expert_tokens.data_ptr<int>(),
+            num_experts, total_seqlen, hidden_size, intermediate_size, top_k);
+
+    return intermediate;
+}
+
+// w2 = [E, H, I] FP8 ; down_scale = float[E] (per-expert scalar)
+torch::Tensor moe_prefill_down_forward_fp8(
+    torch::Tensor intermediate,
+    torch::Tensor down_weight,
+    torch::Tensor down_scale,
+    torch::Tensor expert_offsets,
+    torch::Tensor expert_tokens) {
+
+    TORCH_CHECK(intermediate.dim() == 2);
+    TORCH_CHECK(down_weight.dim() == 3, "down_weight must be [E, H, I]");
+    TORCH_CHECK(intermediate.scalar_type() == torch::kHalf, "intermediate must be fp16");
+    TORCH_CHECK(down_scale.scalar_type() == torch::kFloat32, "down_scale must be float32");
+    TORCH_CHECK(expert_offsets.scalar_type() == torch::kInt32);
+    TORCH_CHECK(expert_tokens.scalar_type() == torch::kInt32);
+
+    int fp8_mode    = fp8_mode_of(down_weight, "moe_prefill_down_forward_fp8");
+    int num_experts = down_weight.size(0);
+    int hidden_size = down_weight.size(1);
+    int intermediate_size = down_weight.size(2);
+    int total_seqlen = expert_tokens.numel();
+
+    TORCH_CHECK(intermediate.size(1) == intermediate_size,
+                "intermediate dim must equal w2 last dim");
+    TORCH_CHECK(hidden_size % 32 == 0, "hidden_size must be multiple of 32 (N-tile)");
+    TORCH_CHECK(intermediate_size % 16 == 0, "intermediate_size (K) must be multiple of 16");
+    TORCH_CHECK(down_scale.numel() >= num_experts, "down_scale must have >= E entries");
+
+    torch::Tensor expert_output = torch::empty(
+        {total_seqlen, hidden_size},
+        torch::device(intermediate.device()).dtype(intermediate.scalar_type()));
+
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(intermediate.device().index()).queue();
+
+    const fp16* i_ptr    = (const fp16*)intermediate.data_ptr();
+    const uint8_t* w_ptr = (const uint8_t*)down_weight.data_ptr();
+    const float* s_ptr   = down_scale.data_ptr<float>();
+    fp16* o_ptr          = (fp16*)expert_output.data_ptr();
+
+    if (fp8_mode == 0)
+        moe_prefill_down_forward_kernel_fp8<fp16, 0>(
+            queue, i_ptr, w_ptr, s_ptr, o_ptr,
+            expert_offsets.data_ptr<int>(), expert_tokens.data_ptr<int>(),
+            num_experts, total_seqlen, intermediate_size, hidden_size);
+    else
+        moe_prefill_down_forward_kernel_fp8<fp16, 1>(
+            queue, i_ptr, w_ptr, s_ptr, o_ptr,
+            expert_offsets.data_ptr<int>(), expert_tokens.data_ptr<int>(),
+            num_experts, total_seqlen, intermediate_size, hidden_size);
+
+    return expert_output;
+}
+
+torch::Tensor moe_prefill_accumulate_forward_fp8(
+    torch::Tensor output,
+    torch::Tensor routing_weights) {
+
+    TORCH_CHECK(output.dim() == 2);
+    TORCH_CHECK(routing_weights.dim() == 2);
+    TORCH_CHECK(output.scalar_type() == torch::kHalf);
+    TORCH_CHECK(routing_weights.scalar_type() == torch::kHalf);
+
+    int num_tokens = routing_weights.size(0);
+    int top_k = routing_weights.size(1);
+    int hidden_size = output.size(1);
+
+    torch::Tensor routing_output = torch::empty(
+        {num_tokens, hidden_size},
+        torch::device(output.device()).dtype(output.scalar_type()));
+
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(output.device().index()).queue();
+
+    moe_prefill_accumulate_forward_kernel_fp8<fp16>(
+        queue,
+        (const fp16*)output.data_ptr(),
+        (const fp16*)routing_weights.data_ptr(),
+        (fp16*)routing_output.data_ptr(),
+        num_tokens, hidden_size, top_k);
+
+    return routing_output;
+}
+
+// ======================== Unified fused driver ==============================
+// topk handled by caller (sglang). Takes topk_weights/topk_ids directly and
+// does gather -> up -> down -> accumulate.
+torch::Tensor moe_prefill_full_fp8(
+    torch::Tensor hidden_states,   // [M, H] fp16
+    torch::Tensor topk_weights,    // [M, top_k] fp16
+    torch::Tensor topk_ids,        // [M, top_k] int32
+    torch::Tensor w13,             // [E, 2*I, H] FP8 (e4m3/e5m2)
+    torch::Tensor w13_scale,       // [E, 2] float32 (gate, up per expert)
+    torch::Tensor w2,              // [E, H, I] FP8
+    torch::Tensor w2_scale,        // [E] float32
+    int64_t top_k, int64_t num_experts)
+{
+    TORCH_CHECK(hidden_states.scalar_type() == torch::kHalf, "hidden_states must be fp16");
+    TORCH_CHECK(topk_weights.scalar_type() == torch::kHalf, "topk_weights must be fp16");
+    TORCH_CHECK(topk_ids.scalar_type() == torch::kInt32, "topk_ids must be int32");
+    TORCH_CHECK(topk_ids.dim() == 2 && topk_ids.size(1) == top_k,
+                "topk_ids must be [M, top_k]");
+
+    // 1. Gather: expert_offsets + expert_tokens from topk_ids.
+    auto gather_result = moe_prefill_gather_forward_fp8(topk_ids, num_experts);
+    auto expert_offsets = gather_result[0];
+    auto expert_tokens  = gather_result[1];
+
+    // 2. Up GEMM: gate_up projection + SiLU.
+    auto intermediate = moe_prefill_up_forward_fp8(
+        hidden_states, w13, w13_scale, expert_offsets, expert_tokens, top_k);
+
+    // 3. Down GEMM.
+    auto expert_output = moe_prefill_down_forward_fp8(
+        intermediate, w2, w2_scale, expert_offsets, expert_tokens);
+
+    // 4. Accumulate: weighted gather over top_k.
+    auto final_output = moe_prefill_accumulate_forward_fp8(expert_output, topk_weights);
+
+    return final_output;
+}
+
+// ======================== Registration ======================================
+
+TORCH_LIBRARY_FRAGMENT(moe_fp8_prefill_ops, m) {
+    m.def("moe_prefill_full_fp8(Tensor hidden_states, Tensor topk_weights, "
+          "Tensor topk_ids, Tensor w13, Tensor w13_scale, "
+          "Tensor w2, Tensor w2_scale, int top_k, int num_experts) -> Tensor");
+    m.def("moe_prefill_gather_forward_fp8(Tensor selected_experts, "
+          "int num_experts) -> Tensor[]");
+    m.def("moe_prefill_up_forward_fp8(Tensor x, Tensor gate_up_weight, "
+          "Tensor gate_up_scale, Tensor expert_offsets, "
+          "Tensor expert_tokens, int top_k) -> Tensor");
+    m.def("moe_prefill_down_forward_fp8(Tensor intermediate, "
+          "Tensor down_weight, Tensor down_scale, "
+          "Tensor expert_offsets, Tensor expert_tokens) -> Tensor");
+    m.def("moe_prefill_accumulate_forward_fp8(Tensor output, "
+          "Tensor routing_weights) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(moe_fp8_prefill_ops, XPU, m) {
+    m.impl("moe_prefill_full_fp8", &moe_prefill_full_fp8);
+    m.impl("moe_prefill_gather_forward_fp8", &moe_prefill_gather_forward_fp8);
+    m.impl("moe_prefill_up_forward_fp8", &moe_prefill_up_forward_fp8);
+    m.impl("moe_prefill_down_forward_fp8", &moe_prefill_down_forward_fp8);
+    m.impl("moe_prefill_accumulate_forward_fp8", &moe_prefill_accumulate_forward_fp8);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("moe_prefill_full_fp8", &moe_prefill_full_fp8);
+    m.def("moe_prefill_gather_forward_fp8", &moe_prefill_gather_forward_fp8);
+    m.def("moe_prefill_up_forward_fp8", &moe_prefill_up_forward_fp8);
+    m.def("moe_prefill_down_forward_fp8", &moe_prefill_down_forward_fp8);
+    m.def("moe_prefill_accumulate_forward_fp8", &moe_prefill_accumulate_forward_fp8);
+}

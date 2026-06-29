@@ -5,13 +5,16 @@
  * state/o. g stays fp32 (log-space decay).
  */
 
+// StateT = persisted SSM state dtype (float | sycl::half). Recurrence math
+// always runs in fp32; only the persistent state load/store uses StateT.
+template <typename StateT>
 ESIMD_INLINE void chunkGatedDeltaRuleExtendBf16(
   uint8_t* qState,
   uint8_t* kState,
   uint8_t* vState,
   uint8_t* gState,        // fp32
   uint8_t* betaState,     // fp32
-  uint8_t* stateBuf,      // bf16 in/out
+  uint8_t* stateBuf,      // StateT in/out
   uint8_t* oState,        // bf16 out
   uint32_t* cuSeqlens,
   uint32_t headQk,        // H_k: headV must be a multiple of this (GQA on GDN)
@@ -48,20 +51,22 @@ ESIMD_INLINE void chunkGatedDeltaRuleExtendBf16(
   bf16* vPtr     = (bf16*)vState;
   float* gPtr    = (float*)gState;
   float* betaPtr = (float*)betaState;
-  float* sPtr    = (float*)stateBuf;  // fp32 state
+  StateT* sPtr   = (StateT*)stateBuf;  // StateT state (fp32 or fp16)
   bf16* oPtr     = (bf16*)oState;
 
-  float* sMyRows = sPtr
+  // Element counts are dtype-independent; only the element size differs.
+  StateT* sMyRows = sPtr
                  + seqIdx * stateSeqElems
                  + headIdx * stateHeadElems
                  + (hh * 8) * headDim;
 
-  // Load fp32 state (8 × 128 floats = 4 KB).
+  // Load state (8 × 128 elems). State held in fp32 regs; StateT=half
+  // upconverts to float on assign, StateT=float is a no-op.
   simd<float, 128 * 8> fp32InS_persistent;
   #pragma unroll
   for (int r = 0; r < 8; r++) {
-    fp32InS_persistent.select<128, 1>(r * 128) =
-        block_load<float, 128>(sMyRows + r * headDim);
+    simd<StateT, 128> raw = block_load<StateT, 128>(sMyRows + r * headDim);
+    fp32InS_persistent.select<128, 1>(r * 128) = raw;
   }
 
   namespace xens = sycl::ext::intel::experimental::esimd;
@@ -150,10 +155,10 @@ ESIMD_INLINE void chunkGatedDeltaRuleExtendBf16(
     block_store<bf16, 8>(oPtr + t * vTokStride + headIdx * headDim + hh * 8, o_bf16);
   }
 
-  // Write fp32 state back as last_state.
+  // Write state back as last_state (fp32 regs downconvert to StateT on store).
   #pragma unroll
   for (int r = 0; r < 8; r++) {
-    block_store<float, 128>(sMyRows + r * headDim,
-                            fp32InS_persistent.select<128, 1>(r * 128));
+    simd<StateT, 128> ov = fp32InS_persistent.select<128, 1>(r * 128);
+    block_store<StateT, 128>(sMyRows + r * headDim, ov);
   }
 }

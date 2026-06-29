@@ -6,6 +6,7 @@ Build with:
 Modules built:
     custom_esimd_kernels_gemm        -- FP8 GEMM (M>=2) + INT4 GEMM (DPAS)
     custom_esimd_kernels_moe_batch   -- FP8 MoE (silu, e4m3 routed)
+    custom_esimd_kernels_moe_prefill -- FP8 M-tiled DPAS MoE prefill (e4m3/e5m2)
     custom_esimd_kernels_attn        -- sglang flat-NHD decode SDPA (split-K)
 """
 import sys
@@ -52,6 +53,30 @@ ext_modules = [
         ],
         include_dirs=[
             str(root / "csrc/moe_batch"),
+            str(root / "csrc/xpu"),
+            str(root / "csrc/xpu/esimd_kernels"),
+            str(root / "csrc"),
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++20"],
+            "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
+                     f"-I{torch_include}"],
+        },
+        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+        py_limited_api=False,
+    ),
+    # FP8 M-tiled DPAS MoE prefill (e4m3 + e5m2): gather routing + up(gate+SiLU)
+    # + down + accumulate, plus the fused moe_prefill_full_fp8 driver. Adapted
+    # from the int4 reference; sglang FusedMoE w13=[E,2I,H]/w2=[E,H,I] layout,
+    # per-expert scalar scale.
+    SyclExtension(
+        name="custom_esimd_kernels.custom_esimd_kernels_moe_prefill",
+        sources=[
+            "csrc/moe_prefill/moe_prefill_fp8.sycl",
+        ],
+        include_dirs=[
+            str(root / "csrc/moe_prefill"),
             str(root / "csrc/xpu"),
             str(root / "csrc/xpu/esimd_kernels"),
             str(root / "csrc"),

@@ -520,8 +520,9 @@ std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
               "g must be fp32 (log-space decay)");
   TORCH_CHECK(beta.scalar_type() == torch::kFloat32,
               "beta must be fp32 (post-sigmoid); matches fused_gdn_gating output");
-  TORCH_CHECK(initial_state.scalar_type() == torch::kFloat32,
-              "initial_state must be fp32 (matches mamba_ssm_dtype=float32)");
+  TORCH_CHECK(initial_state.scalar_type() == torch::kFloat32 ||
+              initial_state.scalar_type() == torch::kHalf,
+              "initial_state must be fp32 or fp16 (matches mamba_ssm_dtype)");
   TORCH_CHECK(cu_seqlens.scalar_type() == torch::kInt32);
 
   // q: [1?, T_total, H_k, K] — the caller passes an extra leading batch dim
@@ -568,27 +569,53 @@ std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
   uint8_t* oPtr = (uint8_t*)out.data_ptr();
   uint32_t* cuPtr = (uint32_t*)cu_seqlens.data_ptr();
 
+  // State dtype (mamba_ssm_dtype): fp32 or fp16. Recurrence math always fp32;
+  // only the persisted state load/store uses this dtype.
+  const bool stateIsHalf = (initial_state.scalar_type() == torch::kHalf);
+
   switch (q.scalar_type()) {
     case torch::kHalf:
-      kernel = [=](sycl::handler& cgh) {
-        cgh.parallel_for<class chunkGdnExtendFp16>(
-          range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
-            chunkGatedDeltaRuleExtendFp16(
-              qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, cuPtr,
-              headQk, headV, headDim, qScale, ndi);
-          });
-      };
+      if (stateIsHalf) {
+        kernel = [=](sycl::handler& cgh) {
+          cgh.parallel_for<class chunkGdnExtendFp16Sf16>(
+            range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+              chunkGatedDeltaRuleExtendFp16<sycl::half>(
+                qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, cuPtr,
+                headQk, headV, headDim, qScale, ndi);
+            });
+        };
+      } else {
+        kernel = [=](sycl::handler& cgh) {
+          cgh.parallel_for<class chunkGdnExtendFp16Sf32>(
+            range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+              chunkGatedDeltaRuleExtendFp16<float>(
+                qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, cuPtr,
+                headQk, headV, headDim, qScale, ndi);
+            });
+        };
+      }
       submit_kernel(kernel, q.device(), "chunk_gated_delta_rule_extend fp16");
       break;
     case torch::kBFloat16:
-      kernel = [=](sycl::handler& cgh) {
-        cgh.parallel_for<class chunkGdnExtendBf16>(
-          range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
-            chunkGatedDeltaRuleExtendBf16(
-              qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, cuPtr,
-              headQk, headV, headDim, qScale, ndi);
-          });
-      };
+      if (stateIsHalf) {
+        kernel = [=](sycl::handler& cgh) {
+          cgh.parallel_for<class chunkGdnExtendBf16Sf16>(
+            range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+              chunkGatedDeltaRuleExtendBf16<sycl::half>(
+                qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, cuPtr,
+                headQk, headV, headDim, qScale, ndi);
+            });
+        };
+      } else {
+        kernel = [=](sycl::handler& cgh) {
+          cgh.parallel_for<class chunkGdnExtendBf16Sf32>(
+            range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+              chunkGatedDeltaRuleExtendBf16<float>(
+                qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, cuPtr,
+                headQk, headV, headDim, qScale, ndi);
+            });
+        };
+      }
       submit_kernel(kernel, q.device(), "chunk_gated_delta_rule_extend bf16");
       break;
     default:
