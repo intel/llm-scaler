@@ -41,7 +41,16 @@ def get_icpx_path():
         # Try common oneAPI installation paths on Windows
         program_files = os.environ.get("ProgramFiles", "C:\\Program Files")
         program_files_x86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
+        preferred_version = os.environ.get("OMNI_XPU_ONEAPI_VERSION")
         candidates = [
+            *(
+                [
+                    os.path.join(program_files_x86, "Intel", "oneAPI", "compiler", preferred_version, "bin", "icx.exe"),
+                    os.path.join(program_files, "Intel", "oneAPI", "compiler", preferred_version, "bin", "icx.exe"),
+                ]
+                if preferred_version
+                else []
+            ),
             os.path.join(program_files, "Intel", "oneAPI", "compiler", "latest", "bin", "icx.exe"),
             os.path.join(program_files, "Intel", "oneAPI", "compiler", "2025.1", "bin", "icx.exe"),
             os.path.join(program_files, "Intel", "oneAPI", "compiler", "2024.2", "bin", "icx.exe"),
@@ -61,6 +70,47 @@ def get_icpx_path():
             return path
     
     return None
+
+
+def get_windows_oneapi_tool_dirs():
+    """Find auxiliary oneAPI tool directories needed for Windows AOT builds."""
+    if not IS_WINDOWS:
+        return []
+
+    program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"))
+    oneapi_root = program_files_x86 / "Intel" / "oneAPI"
+    if not oneapi_root.exists():
+        return []
+
+    preferred_version = os.environ.get("OMNI_XPU_ONEAPI_VERSION")
+    candidates = []
+    patterns = []
+    if preferred_version:
+        patterns.extend([
+            f"compiler\\{preferred_version}\\bin\\compiler",
+            f"ocloc\\{preferred_version}\\bin",
+        ])
+    patterns.extend([
+        "compiler\\*\\bin\\compiler",
+        "ocloc\\*\\bin",
+    ])
+
+    for pattern in patterns:
+        matches = sorted(oneapi_root.glob(pattern), reverse=True)
+        for match in matches:
+            if match.is_dir():
+                candidates.append(str(match))
+                break
+
+    return candidates
+
+
+def should_enable_onednn():
+    """Decide whether oneDNN-backed kernels should be built."""
+    env_value = os.environ.get("OMNI_XPU_ENABLE_ONEDNN")
+    if env_value is not None:
+        return env_value.strip().lower() in {"1", "true", "yes", "on"}
+    return not IS_WINDOWS
 
 
 class ICPXBuildExt(build_ext):
@@ -117,29 +167,58 @@ class ICPXBuildExt(build_ext):
         onednn_include = os.environ.get("ONEDNN_INCLUDE", "")
         onednn_lib = os.environ.get("ONEDNN_LIB", "")
         
-        if not onednn_include or not onednn_lib:
+        want_onednn = should_enable_onednn()
+
+        if want_onednn and (not onednn_include or not onednn_lib):
             # Auto-detect from common oneAPI paths
-            onednn_candidates = [
-                "/opt/intel/oneapi/dnnl/2025.1",
-                "/opt/intel/oneapi/dnnl/latest",
-                "/opt/intel/oneapi/2025.1",
-            ]
+            if IS_WINDOWS:
+                program_files_x86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
+                onednn_candidates = [
+                    os.path.join(program_files_x86, "Intel", "oneAPI", "dnnl", "latest"),
+                    os.path.join(program_files_x86, "Intel", "oneAPI", "dnnl", "2026.0"),
+                    os.path.join(program_files_x86, "Intel", "oneAPI", "dnnl", "2025.1"),
+                    os.path.join(program_files_x86, "Intel", "oneAPI", "2026.0"),
+                ]
+            else:
+                onednn_candidates = [
+                    "/opt/intel/oneapi/dnnl/2025.1",
+                    "/opt/intel/oneapi/dnnl/latest",
+                    "/opt/intel/oneapi/2025.1",
+                ]
             for candidate in onednn_candidates:
                 inc = os.path.join(candidate, "include")
                 lib = os.path.join(candidate, "lib")
-                if os.path.exists(os.path.join(inc, "oneapi", "dnnl", "dnnl.hpp")):
+                if (
+                    os.path.exists(os.path.join(inc, "oneapi", "dnnl", "dnnl.hpp"))
+                    or os.path.exists(os.path.join(inc, "dnnl.hpp"))
+                ):
                     if not onednn_include:
                         onednn_include = inc
                     if not onednn_lib:
                         onednn_lib = lib
                     break
         
-        has_onednn = bool(onednn_include and os.path.isdir(onednn_include))
+        has_onednn = bool(
+            want_onednn
+            and
+            onednn_include
+            and onednn_lib
+            and os.path.isdir(onednn_include)
+            and os.path.isdir(onednn_lib)
+        )
         if has_onednn:
             print(f"oneDNN include: {onednn_include}")
             print(f"oneDNN lib: {onednn_lib}")
-        else:
+        elif want_onednn:
             print("WARNING: oneDNN not found. onednn_int4_gemm will not be available.")
+        else:
+            print("oneDNN disabled for this build.")
+
+        if not has_onednn:
+            sources = [
+                source for source in sources
+                if source.name not in {"onednn_int4_gemm.cpp", "onednn_fp8.cpp"}
+            ]
         
         if IS_WINDOWS:
             # Windows compile command using icx
@@ -165,11 +244,17 @@ class ICPXBuildExt(build_ext):
                     cmd.append(f"/I{onednn_include}")
                 cmd += [str(s) for s in sources]
             else:
+                device_target = os.environ.get("OMNI_XPU_DEVICE", "bmg")
                 cmd += [
+                    "-fsycl-targets=spir64_gen",
+                    "-Xs", f"-device {device_target}",
                     "-fsycl-esimd-force-stateless-mem",
                     "/O2", "/DNDEBUG",
                     "/EHsc",  # Enable C++ exception handling
                     "/std:c++17",
+                    "/DNOMINMAX",
+                    "/DWIN32_LEAN_AND_MEAN",
+                    f"/DOMNI_XPU_HAS_ONEDNN={1 if has_onednn else 0}",
                     f"/I{python_include}",
                     f"/I{torch_include}",
                     f"/I{torch_include}\\torch\\csrc\\api\\include",
@@ -215,6 +300,7 @@ class ICPXBuildExt(build_ext):
                     "-O3", "-DNDEBUG",
                     "-fPIC", "-shared",
                     "-std=c++17",
+                    f"-DOMNI_XPU_HAS_ONEDNN={1 if has_onednn else 0}",
                     f"-I{python_include}",
                     f"-I{torch_include}",
                     f"-I{torch_include}/torch/csrc/api/include",
@@ -237,7 +323,14 @@ class ICPXBuildExt(build_ext):
         print(f"Compile command: {' '.join(cmd)}")
         
         # Run compiler
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        env = os.environ.copy()
+        if IS_WINDOWS:
+            extra_tool_dirs = get_windows_oneapi_tool_dirs()
+            if extra_tool_dirs:
+                print(f"Adding oneAPI tool dirs to PATH: {extra_tool_dirs}")
+                env["PATH"] = os.pathsep.join(extra_tool_dirs + [env.get("PATH", "")])
+
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
         
         if result.returncode != 0:
             print("STDOUT:", result.stdout)
@@ -258,7 +351,7 @@ class ICPXExtension(Extension):
 # Read version
 def get_version():
     version_file = Path(__file__).parent / "omni_xpu_kernel" / "__init__.py"
-    with open(version_file) as f:
+    with open(version_file, encoding="utf-8") as f:
         for line in f:
             if line.startswith("__version__"):
                 return line.split("=")[1].strip().strip('"\'')

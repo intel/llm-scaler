@@ -33,9 +33,11 @@ namespace svdq {
     torch::Tensor dequantize_svdq_w4(const torch::Tensor& packed, const torch::Tensor& scales, torch::ScalarType out_dtype);
     torch::Tensor unpack_svdq_int4(const torch::Tensor& packed, bool is_signed);
     std::tuple<torch::Tensor, torch::Tensor> quantize_svdq_act_int4(const torch::Tensor& input, int64_t group_size);
+#if OMNI_XPU_HAS_ONEDNN
     torch::Tensor onednn_int4_gemm(const torch::Tensor& act, const torch::Tensor& packed, const torch::Tensor& wscales);
     torch::Tensor onednn_int4_gemm_preconverted(const torch::Tensor& act, const torch::Tensor& packed_u4, const torch::Tensor& scales_f16);
     void onednn_int4_gemm_add_to_output(const torch::Tensor& act, const torch::Tensor& packed_u4, const torch::Tensor& scales_f16, torch::Tensor& dst);
+#endif
     void fused_convert_add(torch::Tensor& out, const torch::Tensor& result, const torch::Tensor& residual);
     torch::Tensor fused_smooth_convert(const torch::Tensor& x, const torch::Tensor& smooth_factor);
     torch::Tensor fused_smooth_mul_convert(const torch::Tensor& x, const torch::Tensor& rcp_smooth);
@@ -46,11 +48,13 @@ namespace rotary {
 namespace sdp {
     torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v);
 }
+#if OMNI_XPU_HAS_ONEDNN
 namespace linear {
     torch::Tensor onednn_w8a16_fp8(torch::Tensor input, torch::Tensor weight, torch::Tensor scale_w, std::optional<torch::Tensor> bias);
     void fp8_cache_clear();
     std::tuple<int64_t, int64_t, int64_t> fp8_cache_stats();
 }
+#endif
 }
 
 PYBIND11_MODULE(_C, m) {
@@ -127,6 +131,7 @@ PYBIND11_MODULE(_C, m) {
         "Output: (packed [M, K/2] uint8, scales [num_groups, M])",
         py::arg("input"), py::arg("group_size") = 64);
 
+#if OMNI_XPU_HAS_ONEDNN
     svdq.def("onednn_int4_gemm", &omni_xpu::svdq::onednn_int4_gemm,
         "Fused INT4 dequant + GEMM using oneDNN u4 matmul primitive\n"
         "Converts signed INT4 to u4 and bf16 scales to f16 per call\n"
@@ -147,6 +152,7 @@ PYBIND11_MODULE(_C, m) {
         "Input: act [M, K] f16, packed_u4 [N, K/2] uint8, scales_f16 [G, N] f16, dst [M, N] bf16\n"
         "Output: dst modified in-place (dst += GEMM result)",
         py::arg("act"), py::arg("packed_u4"), py::arg("scales_f16"), py::arg("dst"));
+#endif
 
     svdq.def("fused_convert_add", &omni_xpu::svdq::fused_convert_add,
         "Fused f16->bf16 conversion + bf16 addition in single ESIMD kernel\n"
@@ -181,6 +187,7 @@ PYBIND11_MODULE(_C, m) {
 
     // FP8 Linear (oneDNN W8A16)
     auto linear = m.def_submodule("linear", "FP8 linear kernels");
+#if OMNI_XPU_HAS_ONEDNN
     linear.def("onednn_w8a16_fp8", &omni_xpu::linear::onednn_w8a16_fp8,
         "FP8 GEMM: W8A16 matmul with E4M3/E5M2 weights via oneDNN.\n"
         "Input: x [M, K] fp16/bf16, weight [N, K] float8, scales [N] f32\n"
@@ -190,6 +197,7 @@ PYBIND11_MODULE(_C, m) {
         "Clear FP8 primitive cache");
     linear.def("fp8_cache_stats", &omni_xpu::linear::fp8_cache_stats,
         "Return FP8 cache stats as (hits, misses, size)");
+#endif
 
     // Scaled Dot-Product Attention (ESIMD Flash Attention)
     auto sdp = m.def_submodule("sdp", "Scaled dot-product attention kernels");

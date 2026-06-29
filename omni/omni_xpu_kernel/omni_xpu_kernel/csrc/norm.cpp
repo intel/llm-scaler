@@ -314,12 +314,17 @@ using rms_fn_t = void(*)(const void*, const void*, void*, float, const int, cons
 
 template<typename IT, int BS>
 rms_fn_t<IT, BS> select_rms_kernel(int nb) {
+#ifdef _WIN32
+    (void)nb;
+    return rms_norm_kernel<IT, 1, BS>;
+#else
     if (nb <= 1)  return rms_norm_kernel<IT, 1,  BS>;
     if (nb <= 2)  return rms_norm_kernel<IT, 2,  BS>;
     if (nb <= 4)  return rms_norm_kernel<IT, 4,  BS>;
     if (nb <= 8)  return rms_norm_kernel<IT, 8,  BS>;
     if (nb <= 16) return rms_norm_kernel<IT, 16, BS>;
     return rms_norm_kernel<IT, 32, BS>;
+#endif
 }
 
 // LayerNorm dispatch
@@ -328,12 +333,17 @@ using ln_fn_t = void(*)(const void*, const uint64_t, const uint64_t, void*, floa
 
 template<typename IT, int BS>
 ln_fn_t<IT, BS> select_ln_kernel(int nb) {
+#ifdef _WIN32
+    (void)nb;
+    return layer_norm_kernel<IT, 1, BS>;
+#else
     if (nb <= 1)  return layer_norm_kernel<IT, 1,  BS>;
     if (nb <= 2)  return layer_norm_kernel<IT, 2,  BS>;
     if (nb <= 4)  return layer_norm_kernel<IT, 4,  BS>;
     if (nb <= 8)  return layer_norm_kernel<IT, 8,  BS>;
     if (nb <= 16) return layer_norm_kernel<IT, 16, BS>;
     return layer_norm_kernel<IT, 32, BS>;
+#endif
 }
 
 // Fused add rms norm dispatch
@@ -342,12 +352,17 @@ using fused_fn_t = void(*)(const void*, void*, void*, float, const int, const in
 
 template<typename IT, int BS>
 fused_fn_t<IT, BS> select_fused_kernel(int nb) {
+#ifdef _WIN32
+    (void)nb;
+    return fused_add_rms_norm_kernel<IT, 1, BS>;
+#else
     if (nb <= 1)  return fused_add_rms_norm_kernel<IT, 1,  BS>;
     if (nb <= 2)  return fused_add_rms_norm_kernel<IT, 2,  BS>;
     if (nb <= 4)  return fused_add_rms_norm_kernel<IT, 4,  BS>;
     if (nb <= 8)  return fused_add_rms_norm_kernel<IT, 8,  BS>;
     if (nb <= 16) return fused_add_rms_norm_kernel<IT, 16, BS>;
     return fused_add_rms_norm_kernel<IT, 32, BS>;
+#endif
 }
 
 // ============================================================================
