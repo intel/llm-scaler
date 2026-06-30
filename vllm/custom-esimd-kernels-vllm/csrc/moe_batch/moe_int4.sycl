@@ -1373,34 +1373,73 @@ void moe_down_finalize_int4_kernel(
 // moe_forward_full_int4 — Full pipeline: TopK → Up → Down → Finalize
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Pre-allocated scratch/output buffers reused across all MoE layers.
+//
+// ⚠️ XPU-graph correctness: these buffers' addresses are baked into captured
+// graphs at capture time and are NOT re-resolved on replay (the host-side
+// ensure_* call does not run during replay). The previous behavior reallocated
+// whenever `n_tokens` changed (`!= n_tokens`), which moved the addresses — so a
+// later batch-size change (a different decode size, or a small prefill chunk
+// <= 64 that also routes through this ESIMD path) freed the storage the
+// captured decode graphs still point at, producing garbage / "!!!!" output.
+//
+// Fix: allocate ONCE at the kernel's hard cap (S_INT4_MAX_NTOKENS == 64, see
+// the `x.size(0) <= 64` TORCH_CHECK in the callers) and grow-only beyond it.
+// Because every real n_tokens is <= 64, the buffers are allocated on the first
+// call and never moved again, so the captured-graph pointers stay valid for the
+// process lifetime. Each call uses only the first `n_tokens` rows (via
+// .narrow / explicit n_tokens row counts); the unused tail is harmless.
+// Cost is a one-time ~few-MB-per-rank bump, independent of layer count.
+static constexpr int S_INT4_MAX_NTOKENS = 64;
+
 static thread_local torch::Tensor s_int4_topk_idx, s_int4_topk_weight;
-static thread_local torch::Tensor s_int4_routed_output, s_int4_final_output;
+static thread_local torch::Tensor s_int4_routed_output;
 static thread_local torch::Tensor s_int4_intermediates;
 static thread_local torch::Tensor s_int4_gate_values;  // BSZ>1 precomputed gate sigmoid
-static thread_local int s_int4_cached_ntokens = -1;
+static thread_local int s_int4_cached_cap = -1;
+
+// The returned final output is held by the caller across the rest of the layer
+// (TP all-reduce, residual add, next layer's input), so it must not be
+// overwritten by the next MoE call. Rotate a small ring so each returned tensor
+// stays valid for several subsequent calls — same approach as the FP8 gemma4
+// path (sg_final_outputs in moe.sycl).
+static constexpr int S_INT4_FINAL_RING = 4;
+static thread_local torch::Tensor s_int4_final_outputs[S_INT4_FINAL_RING];
+static thread_local int s_int4_final_ring_idx = 0;
 
 static void ensure_int4_moe_buffers(int n_tokens, int top_k, int num_shared_experts,
                                      int hidden_size, int intermediate_size,
                                      const torch::Device& dev) {
     int rows_per_token = top_k + num_shared_experts;
-    if (s_int4_cached_ntokens != n_tokens) {
-        s_int4_topk_idx = torch::empty({n_tokens, top_k},
-            torch::device(dev).dtype(torch::kInt32));
-        s_int4_topk_weight = torch::empty({n_tokens, top_k},
+    // Allocate at (at least) the kernel's max batch so smaller batches never
+    // trigger a realloc that would move the addresses out from under a captured
+    // XPU graph. Grow-only guard in case the cap is ever exceeded.
+    int cap = n_tokens > S_INT4_MAX_NTOKENS ? n_tokens : S_INT4_MAX_NTOKENS;
+    if (s_int4_cached_cap >= cap && s_int4_topk_idx.defined()) return;
+    s_int4_topk_idx = torch::empty({cap, top_k},
+        torch::device(dev).dtype(torch::kInt32));
+    s_int4_topk_weight = torch::empty({cap, top_k},
+        torch::device(dev).dtype(torch::kHalf));
+    s_int4_routed_output = torch::empty(
+        {cap * rows_per_token, hidden_size},
+        torch::device(dev).dtype(torch::kHalf));
+    s_int4_intermediates = torch::empty(
+        {cap * rows_per_token, intermediate_size},
+        torch::device(dev).dtype(torch::kHalf));
+    s_int4_gate_values = torch::empty(
+        {cap * num_shared_experts},
+        torch::device(dev).dtype(torch::kFloat));
+    for (int i = 0; i < S_INT4_FINAL_RING; i++) {
+        s_int4_final_outputs[i] = torch::empty({cap, hidden_size},
             torch::device(dev).dtype(torch::kHalf));
-        s_int4_routed_output = torch::empty(
-            {n_tokens * rows_per_token, hidden_size},
-            torch::device(dev).dtype(torch::kHalf));
-        s_int4_final_output = torch::empty({n_tokens, hidden_size},
-            torch::device(dev).dtype(torch::kHalf));
-        s_int4_intermediates = torch::empty(
-            {n_tokens * rows_per_token, intermediate_size},
-            torch::device(dev).dtype(torch::kHalf));
-        s_int4_gate_values = torch::empty(
-            {n_tokens * num_shared_experts},
-            torch::device(dev).dtype(torch::kFloat));
-        s_int4_cached_ntokens = n_tokens;
     }
+    s_int4_cached_cap = cap;
+}
+
+static torch::Tensor& s_int4_take_final_output() {
+    auto& t = s_int4_final_outputs[s_int4_final_ring_idx];
+    s_int4_final_ring_idx = (s_int4_final_ring_idx + 1) % S_INT4_FINAL_RING;
+    return t;
 }
 
 std::tuple<torch::Tensor, torch::Tensor> moe_topk_int4(
@@ -2696,7 +2735,9 @@ torch::Tensor moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared(
     fp16* routed_intermediates_ptr = (fp16*)s_int4_intermediates.data_ptr();
     fp16* shared_intermediates_ptr = routed_intermediates_ptr + (size_t)n_tokens * top_k * intermediate_size;
     float* shared_gate_values_ptr = (float*)s_int4_gate_values.data_ptr();
-    auto final_output = s_int4_final_output;
+    // Rotate the final-output ring so the returned tensor is not overwritten by
+    // a later MoE layer before the caller has consumed it (see ring comment).
+    auto& final_output = s_int4_take_final_output();
 
     // Cast topk_idx to int32 if needed (internal topk always produces int32;
     // external callers may pass int64 which we cast here to avoid double template instantiation)
@@ -2746,7 +2787,8 @@ torch::Tensor moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared(
                 shared_inter_size, (int)num_shared_experts, x.device());
         }
     }
-    return final_output;
+    // Buffer is sized to the capacity (>= n_tokens); hand back only this call's rows.
+    return final_output.narrow(0, 0, n_tokens);
 }
 
 torch::Tensor moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits(
@@ -2811,9 +2853,13 @@ torch::Tensor moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits(
             queue);
     }
 
+    // The topk buffers are now sized to the capacity (>= n_tokens); narrow to
+    // this call's rows so the callee's `topk.size(0) == x.size(0)` checks hold.
+    // A dim-0 prefix narrow of a contiguous tensor stays contiguous.
     return moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared(
         x, w13_qweight_s4, w13_scales, w2_qweight_s4, w2_scales,
-        s_int4_topk_weight, s_int4_topk_idx, shared_gate_up_weight,
+        s_int4_topk_weight.narrow(0, 0, n_tokens),
+        s_int4_topk_idx.narrow(0, 0, n_tokens), shared_gate_up_weight,
         shared_down_weight, shared_expert_gate_weight, num_shared_experts);
 }
 
@@ -2931,6 +2977,8 @@ torch::Tensor moe_forward_full_int4(
 
     ensure_int4_moe_buffers(n_tokens, top_k, num_shared_experts, hidden_size,
                             intermediate_size, x.device());
+    // Rotate the final-output ring (caller holds the result across the layer).
+    auto& final_output = s_int4_take_final_output();
 
     sycl::queue& queue = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
 
@@ -3078,7 +3126,7 @@ torch::Tensor moe_forward_full_int4(
         // Accumulate all rows (routed + shared) per token
         moe_accumulate_int4_kernel(
             (const fp16*)s_int4_routed_output.data_ptr(),
-            (fp16*)s_int4_final_output.data_ptr(),
+            (fp16*)final_output.data_ptr(),
             n_tokens, hidden_size, rows_per_token, x.device());
     } else {
         // BSZ=1: fused down_finalize (gate sigmoid dedup via SLM)
@@ -3094,7 +3142,7 @@ torch::Tensor moe_forward_full_int4(
                 (const uint32_t*)shared_dw_reshaped.data_ptr(),
                 (const fp16*)shared_down_scale.data_ptr(),
                 (const fp16*)shared_expert_gate_weight.data_ptr(),
-                (fp16*)s_int4_final_output.data_ptr(),
+                (fp16*)final_output.data_ptr(),
                 n_tokens, hidden_size, shared_intermediate_size,
                 intermediate_size, K_packed_down, K_groups_down,
                 top_k, num_shared_experts, rows_per_token, x.device());
@@ -3105,14 +3153,15 @@ torch::Tensor moe_forward_full_int4(
                 (const fp16*)s_int4_routed_output.data_ptr(),
                 (const fp16*)shared_down_weight.data_ptr(),
                 (const fp16*)shared_expert_gate_weight.data_ptr(),
-                (fp16*)s_int4_final_output.data_ptr(),
+                (fp16*)final_output.data_ptr(),
                 n_tokens, hidden_size, shared_intermediate_size,
                 intermediate_size,
                 top_k, num_shared_experts, rows_per_token, x.device());
         }
     }
 
-    return s_int4_final_output;
+    // Buffer is sized to the capacity (>= n_tokens); hand back only this call's rows.
+    return final_output.narrow(0, 0, n_tokens);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
