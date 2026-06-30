@@ -140,6 +140,15 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
     const int conv_idx = conv_state_indices_ptr[seq_idx];
     const int ssm_idx = ssm_state_indices_ptr[seq_idx];
 
+    // XPU-graph batch>1 replay pads the batch with dummy reqs whose cache
+    // index is the sentinel -1 (see hybrid_linear_attn_backend._replay_metadata).
+    // The conv1d phase below indexes conv_state_ptr + conv_idx*stride with no
+    // bound check, so conv_idx=-1 reads conv_state_ptr[-stride] → GPU index OOB
+    // assertion → SIGABRT. Padding slots have no real work and their output is
+    // discarded, so skip the whole work-group. (The ssm phase already guards
+    // ssm_idx>=0 and the shift kernel guards conv_idx<0; this covers conv1d.)
+    if (conv_idx < 0) return;
+
     // ---- Sequential layout base offsets ----
     const int dim = 2 * H * gdn_K + HV * gdn_V;  // conv_state row width
     const int q_base = 0;
