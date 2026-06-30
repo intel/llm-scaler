@@ -1,5 +1,5 @@
 diff --git a/csrc/flash_attn/flash_api.cpp b/csrc/flash_attn/flash_api.cpp
-index 8d12b68..9cc057b 100644
+index 8d12b68..7c0e824 100644
 --- a/csrc/flash_attn/flash_api.cpp
 +++ b/csrc/flash_attn/flash_api.cpp
 @@ -118,7 +118,11 @@ std::vector<at::Tensor> mha_varlen_fwd(
@@ -25,17 +25,140 @@ index 8d12b68..9cc057b 100644
    } else if (max_seqlen_q > 1) {
      if (!out_.has_value()) {
        out = torch::empty_like(q);
-@@ -262,7 +267,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
+@@ -238,6 +243,18 @@ std::vector<at::Tensor> mha_varlen_fwd(
+                             cu_seqlens_q.slice(0, 0, batch_size);
+     at::Tensor is_prefill_mask = seq_lens_q.gt(1);
+     std::optional<const at::Tensor> is_prefill_opt = is_prefill_mask;
++    // Whether the mixed batch actually contains any decode sequence
++    // (seq_len_q == 1). When every sequence is prefill (seq_len_q > 1), the
++    // paged_decode kernel below would launch but skip all batches via its
++    // is_prefill mask -- yet it still requests per-WG SLM proportional to
++    // q_packed (= num_heads_q / num_heads_kv) * head_size_vo. For head_dim=512
++    // with a large GQA group (e.g. gemma-4 full-attn single-card: 16 q-heads /
++    // 1 kv-head), that SLM exceeds the Intel Xe per-WG limit and the launch
++    // fails with UR_RESULT_ERROR_OUT_OF_RESOURCES even though the kernel has no
++    // work to do. Skip the decode launch entirely when there are no decode
++    // sequences (it is a no-op in that case anyway).
++    bool has_decode = (seq_lens_q.numel() > 0) &&
++                      (seq_lens_q.eq(1).any().item<bool>());
+ 
+     cutlass_chunk_prefill_interface(
+         queue,
+@@ -262,58 +279,61 @@ std::vector<at::Tensor> mha_varlen_fwd(
          is_local,
          is_sink,
          softmax_lse_opt,
 -        is_prefill_opt);
+-
+-    // Paged decode: processes only decode batches (skips prefill)
+-    int eff_window_left =
+-        window_size_left == -1 ? max_seqlen_k : window_size_left;
+-    int eff_window_right =
+-        window_size_right == -1 ? max_seqlen_k : window_size_right;
+-    int effective_seqlen_k =
+-        is_local ? std::min(max_seqlen_k, eff_window_left + 1) : max_seqlen_k;
+-
+-    int num_tokens = batch_size;
+-    int num_heads_q = q.size(1);
+-    int head_dim = q.size(2);
+-    int num_heads_kv = k.size(2);
+-    int kv_block_size = k.size(1);
+-
+-    int num_kv_splits = 1;
+-    at::Tensor tmp_out = out;
+-    at::Tensor decode_max_logits = at::empty(
+-        {num_tokens, num_heads_q, num_kv_splits},
+-        q.options().dtype(at::kFloat).device(q.device()));
+-    at::Tensor decode_exp_sums = at::empty(
+-        {num_tokens, num_heads_q, num_kv_splits},
+-        q.options().dtype(at::kFloat).device(q.device()));
+-
+-    cutlass_paged_decode_interface(
+-        queue,
+-        q,
+-        k,
+-        v,
+-        out,
+-        tmp_out,
+-        decode_exp_sums,
+-        decode_max_logits,
+-        block_table,
+-        cu_seqlens_q,
+-        seqlens_k,
+-        max_seqlen_q,
+-        max_seqlen_k,
+-        k_scale,
+-        v_scale,
+-        softmax_scale,
+-        softmax_sink_,
+-        eff_window_left,
+-        eff_window_right,
+-        is_varlen,
+-        is_paged,
+-        false,  // is_causal: always false for decode;
+-        is_local,
+-        is_sink,
+-        num_kv_splits,
+-        is_prefill_opt);
 +        is_prefill_opt,
 +        per_seq_causal_);
- 
-     // Paged decode: processes only decode batches (skips prefill)
-     int eff_window_left =
-@@ -439,7 +445,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
++
++    if (has_decode) {
++        // Paged decode: processes only decode batches (skips prefill)
++      int eff_window_left =
++          window_size_left == -1 ? max_seqlen_k : window_size_left;
++      int eff_window_right =
++          window_size_right == -1 ? max_seqlen_k : window_size_right;
++      int effective_seqlen_k =
++          is_local ? std::min(max_seqlen_k, eff_window_left + 1) : max_seqlen_k;
++
++      int num_tokens = batch_size;
++      int num_heads_q = q.size(1);
++      int head_dim = q.size(2);
++      int num_heads_kv = k.size(2);
++      int kv_block_size = k.size(1);
++
++      int num_kv_splits = 1;
++      at::Tensor tmp_out = out;
++      at::Tensor decode_max_logits = at::empty(
++          {num_tokens, num_heads_q, num_kv_splits},
++          q.options().dtype(at::kFloat).device(q.device()));
++      at::Tensor decode_exp_sums = at::empty(
++          {num_tokens, num_heads_q, num_kv_splits},
++          q.options().dtype(at::kFloat).device(q.device()));
++
++      cutlass_paged_decode_interface(
++          queue,
++          q,
++          k,
++          v,
++          out,
++          tmp_out,
++          decode_exp_sums,
++          decode_max_logits,
++          block_table,
++          cu_seqlens_q,
++          seqlens_k,
++          max_seqlen_q,
++          max_seqlen_k,
++          k_scale,
++          v_scale,
++          softmax_scale,
++          softmax_sink_,
++          eff_window_left,
++          eff_window_right,
++          is_varlen,
++          is_paged,
++          false,  // is_causal: always false for decode;
++          is_local,
++          is_sink,
++          num_kv_splits,
++          is_prefill_opt);
++    }
+   } else {
+     // Normalize -1 (unbounded) to max_seqlen_k for kernel masking logic
+     // In decode phase the window_size_right doesn't have effect
+@@ -439,7 +459,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
        "float softmax_scale, Tensor? softmax_sink, bool zero_tensors, "
        "bool is_causal, int window_size_left, int window_size_right, float "
        "softcap, bool return_softmax, "
@@ -84,10 +207,10 @@ index 65d2f24..c2acd2d 100644
  void cutlass_paged_decode_interface(
      sycl::queue& queue,
 diff --git a/csrc/xpu/attn/xe_2/chunk_prefill.hpp b/csrc/xpu/attn/xe_2/chunk_prefill.hpp
-index 44f9dd0..f5f38bb 100644
+index 44f9dd0..574df8e 100644
 --- a/csrc/xpu/attn/xe_2/chunk_prefill.hpp
 +++ b/csrc/xpu/attn/xe_2/chunk_prefill.hpp
-@@ -74,6 +74,11 @@ struct chunk_prefill_args_t {
+@@ -74,8 +74,24 @@ struct chunk_prefill_args_t {
    int o_stride_batch = 0;
    // per-batch mask: true = prefill, false = decode; nullptr = process all
    void* is_prefill = nullptr;
@@ -98,8 +221,21 @@ index 44f9dd0..f5f38bb 100644
 +  void* per_seq_causal = nullptr;
  };
  
++// XPU-graph-safe kernel entry: receives the SLM block as an explicit char* (a
++// sycl::local_accessor allocated by the launch layer when a compat::local_mem_size
++// is supplied), instead of cutlass::device_kernel which fetches
++// work_group_scratch_memory (un-capturable by SYCL command graph). A dedicated
++// free function keeps the launch<auto F> non-type template parameter unambiguous.
++template <typename Op>
++void chunk_prefill_graph_safe_kernel(typename Op::Params params, char* smem) {
++  Op op;
++  op(params, smem);
++}
++
  template <class FMHAKernel, bool isVarLen>
-@@ -174,7 +179,8 @@ struct KernelLauncher {
+ struct KernelLauncher {
+   using StrideQ = typename FMHAKernel::StrideQ;
+@@ -174,7 +190,8 @@ struct KernelLauncher {
           reinterpret_cast<ElementQ*>(args.sm_sink),
           args.softmax_lse,
           args.lse_stride,
@@ -109,6 +245,30 @@ index 44f9dd0..f5f38bb 100644
          {args.sm_scale,
           args.k_scale,
           args.v_scale,
+@@ -218,16 +235,16 @@ struct KernelLauncher {
+     const auto sycl_block = compat::dim3(block.x, block.y, block.z);
+     const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
+ 
+-    // Launch parameters depend on whether SYCL compiler supports work-group
+-    // scratch memory extension
+-    compat::experimental::launch_properties launch_props{
+-        syclex::work_group_scratch_size(smem_size),
+-    };
++    // XPU-graph: static local_accessor (compat::local_mem_size) instead of
++    // work_group_scratch_size so the prefill/chunk-prefill kernel is
++    // SYCL-command-graph-capturable. SLM size == FMHAKernel::SharedStorageSize
++    // (compile-time constant). Mirrors paged_decode.hpp; kernel body unchanged.
+     compat::experimental::kernel_properties kernel_props{
+         syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
+     compat::experimental::launch_policy policy{
+-        sycl_grid, sycl_block, launch_props, kernel_props};
+-    compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
++        sycl_grid, sycl_block, kernel_props,
++        compat::experimental::local_mem_size(smem_size)};
++    compat::experimental::launch<chunk_prefill_graph_safe_kernel<FMHAKernel>>(
+         policy, queue, params);
+   }
+ };
 diff --git a/csrc/xpu/attn/xe_2/chunk_prefill_utils.hpp b/csrc/xpu/attn/xe_2/chunk_prefill_utils.hpp
 index 0561534..aae4154 100644
 --- a/csrc/xpu/attn/xe_2/chunk_prefill_utils.hpp
@@ -121,29 +281,38 @@ index 0561534..aae4154 100644
 +    std::optional<const at::Tensor>& is_prefill,
 +    std::optional<const at::Tensor>& per_seq_causal);
 diff --git a/csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp b/csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp
-index f4f7344..e6ec3bd 100644
+index f4f7344..f8ff2ae 100644
 --- a/csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp
 +++ b/csrc/xpu/attn/xe_2/collective/chunk_prefill_mainloop.hpp
-@@ -269,7 +269,8 @@ struct FMHAFwdMainloop<
+@@ -269,7 +269,15 @@ struct FMHAFwdMainloop<
        int blk_k1_causal,
        int thr_id,
        int seq_len,
 -      int full_tile_offset) {
 +      int full_tile_offset,
-+      bool seq_is_causal = true) {  // per-seq: false => bidirectional
++      bool seq_is_causal = true,  // per-seq: false => bidirectional
++      // True ONLY for a genuine per-sequence bidirectional sequence
++      // (DiffusionGemma: compiled CausalMask=true but per_seq_causal[idx_b]
++      // ==false). For a normal causal sliding-window layer the kernel is
++      // compiled with CausalMask=false, so seq_is_causal is false too, but the
++      // window must stay one-sided (local_right) -- this flag keeps the two
++      // cases apart.
++      bool is_per_seq_bidir = false) {
      using namespace sycl::ext::oneapi::this_work_item;
  
      // Short dimension names:
-@@ -469,12 +470,18 @@ struct FMHAFwdMainloop<
+@@ -469,12 +477,20 @@ struct FMHAFwdMainloop<
          Tensor gP = local_tile(
              cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
          auto cS_thread = thr_mma_qk.partition_C(gP);
-+        // For a bidirectional sequence (per-seq causal == false) inside a
-+        // causal-windowed kernel, the right window is one-sided (local_right
-+        // is 0 for causal sliding layers), which would wrongly re-impose
-+        // causal masking. Make the window SYMMETRIC for bidirectional seqs by
-+        // mirroring local_left on the right.
-+        int eff_right = seq_is_causal ? params.local_right : params.local_left;
++        // Symmetrize the window (mirror local_left on the right) ONLY for a
++        // genuine per-sequence bidirectional sequence (DiffusionGemma). A
++        // normal causal sliding-window layer is compiled CausalMask=false, so
++        // seq_is_causal is false as well, but its window is one-sided
++        // (local_right==0) and must NOT be symmetrized -- doing so would drop
++        // causal masking entirely and attend to future tokens.
++        int eff_right =
++            is_per_seq_bidir ? params.local_left : params.local_right;
          CUTLASS_PRAGMA_UNROLL
          for (int i = 0; i < tSrS.size(); ++i) {
            int row_idx = get<0>(cS_thread(i));
@@ -154,6 +323,68 @@ index f4f7344..e6ec3bd 100644
            if (left_mask || right_mask) {
              tSrS(i) = ElementS(-INFINITY);
            }
+diff --git a/csrc/xpu/attn/xe_2/fmha_utils.hpp b/csrc/xpu/attn/xe_2/fmha_utils.hpp
+index 27ad8bc..96ac672 100644
+--- a/csrc/xpu/attn/xe_2/fmha_utils.hpp
++++ b/csrc/xpu/attn/xe_2/fmha_utils.hpp
+@@ -154,6 +154,22 @@ struct chunk_policy_head512_b16 {
+   using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
+ };
+ 
++// Cap the per-work-group V (output head_dim) tile at 256 elements. The decode
++// epilogue's cross-SG reduction SLM buffer is sized q_packed * V_tile *
++// SGPerWG * sizeof(float); at head_dim=512 with a large GQA group
++// (q_packed=16) the full-512 V tile needs ~128 KiB, exceeding the Intel Xe
++// per-work-group SLM cap and failing the launch with
++// UR_RESULT_ERROR_OUT_OF_RESOURCES. Capping the V tile at 256 makes the decode
++// tile scheduler emit grid.x = ceil_div(head_size_vo, 256) work-groups (2 for
++// head_dim=512), each owning an independent 256-wide output slice (the V
++// dimension is the output feature axis -> embarrassingly parallel, no cross-WG
++// reduction; softmax over K is recomputed per slice). This mirrors how the
++// chunk_prefill head512 policy splits V via grid.x=2. For head_dim<=256 the cap
++// is a no-op, so smaller head sizes are unchanged.
++template <typename head_dim>
++using decode_v_tile_t =
++    cute::conditional_t<(head_dim::value > 256), _256, head_dim>;
++
+ // define decode policy
+ template <typename q_packed, typename head_dim, typename kv_tile>
+ struct decode_policy_qpacked_head {
+@@ -169,7 +185,7 @@ template <typename q_packed, typename head_dim>
+ struct decode_policy_qpacked_head<q_packed, head_dim, _16> {
+   using ShapeQK = Shape<q_packed, _16, _64>;
+   using ShapePV = Shape<q_packed, _32, _16>;
+-  using ShapeOut = Shape<q_packed, head_dim>;
++  using ShapeOut = Shape<q_packed, decode_v_tile_t<head_dim>>;
+   using SubgroupLayoutQK = Layout<Shape<_1, _1, _1>>;
+ };
+ 
+@@ -178,7 +194,7 @@ template <typename q_packed, typename head_dim>
+ struct decode_policy_qpacked_head<q_packed, head_dim, _32> {
+   using ShapeQK = Shape<q_packed, _32, _64>;
+   using ShapePV = Shape<q_packed, _32, _32>;
+-  using ShapeOut = Shape<q_packed, head_dim>;
++  using ShapeOut = Shape<q_packed, decode_v_tile_t<head_dim>>;
+   using SubgroupLayoutQK = Layout<Shape<_1, _2, _1>>;
+ };
+ 
+@@ -190,7 +206,7 @@ template <typename q_packed, typename head_dim>
+ struct decode_policy_qpacked_head<q_packed, head_dim, _64> {
+   using ShapeQK = Shape<q_packed, _64, _64>;
+   using ShapePV = Shape<q_packed, _32, _64>;
+-  using ShapeOut = Shape<q_packed, head_dim>;
++  using ShapeOut = Shape<q_packed, decode_v_tile_t<head_dim>>;
+   using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
+ };
+ 
+@@ -206,6 +222,6 @@ template <typename q_packed, typename head_dim>
+ struct decode_policy_qpacked_head<q_packed, head_dim, _128> {
+   using ShapeQK = Shape<q_packed, _128, _64>;
+   using ShapePV = Shape<q_packed, _32, _128>;
+-  using ShapeOut = Shape<q_packed, head_dim>;
++  using ShapeOut = Shape<q_packed, decode_v_tile_t<head_dim>>;
+   using SubgroupLayoutQK = Layout<Shape<_1, _8, _1>>;
+ };
 diff --git a/csrc/xpu/attn/xe_2/fmha_xe2.cpp b/csrc/xpu/attn/xe_2/fmha_xe2.cpp
 index 4286270..32995e4 100644
 --- a/csrc/xpu/attn/xe_2/fmha_xe2.cpp
@@ -210,7 +441,7 @@ index a666921..f91c3b1 100644
 +    std::optional<const at::Tensor>& is_prefill,
 +    std::optional<const at::Tensor>& per_seq_causal);
 diff --git a/csrc/xpu/attn/xe_2/kernel/chunk_prefill_kernel.hpp b/csrc/xpu/attn/xe_2/kernel/chunk_prefill_kernel.hpp
-index 90bd62b..4ac3f36 100644
+index 90bd62b..9f6b2dd 100644
 --- a/csrc/xpu/attn/xe_2/kernel/chunk_prefill_kernel.hpp
 +++ b/csrc/xpu/attn/xe_2/kernel/chunk_prefill_kernel.hpp
 @@ -153,6 +153,9 @@ class XeFMHAFwdKernel {
@@ -223,7 +454,7 @@ index 90bd62b..4ac3f36 100644
    };
    using KernelParams = KernelArguments;
  
-@@ -271,9 +274,17 @@ class XeFMHAFwdKernel {
+@@ -271,9 +274,23 @@ class XeFMHAFwdKernel {
        int seq_coord =
            cute::min(seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
  
@@ -234,6 +465,12 @@ index 90bd62b..4ac3f36 100644
 +      const bool seq_is_causal =
 +          CausalMask &&
 +          (p.per_seq_causal == nullptr || p.per_seq_causal[idx_b]);
++      // Genuine per-sequence bidirectional sequence: only when a per_seq_causal
++      // mask is actually supplied (DiffusionGemma) AND this sequence is marked
++      // bidirectional. Normal causal sliding-window layers have
++      // per_seq_causal==nullptr and must NOT be treated as bidirectional.
++      const bool is_per_seq_bidir =
++          (p.per_seq_causal != nullptr) && !p.per_seq_causal[idx_b];
 +
        // calc sg level seq_len_kv
        const int seq_len =
@@ -242,7 +479,7 @@ index 90bd62b..4ac3f36 100644
                ? LocalMask
                      ? cute::min(
                            seq_len_kv,
-@@ -290,9 +301,12 @@ class XeFMHAFwdKernel {
+@@ -290,9 +307,12 @@ class XeFMHAFwdKernel {
                      get<1>(TileShapeQK{})
                : 0;
        const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
@@ -257,16 +494,87 @@ index 90bd62b..4ac3f36 100644
  
        int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
        if constexpr (is_var_len) {
-@@ -355,7 +369,8 @@ class XeFMHAFwdKernel {
+@@ -355,7 +375,9 @@ class XeFMHAFwdKernel {
            k_blocks_causal,
            thr_id,
            seq_len,
 -          full_tile_offset);
 +          full_tile_offset,
-+          seq_is_causal);
++          seq_is_causal,
++          is_per_seq_bidir);
  
        // return softmax_lse
        if constexpr (SoftmaxLSE) {
+diff --git a/csrc/xpu/attn/xe_2/paged_decode.hpp b/csrc/xpu/attn/xe_2/paged_decode.hpp
+index 61ad263..d34bbd5 100644
+--- a/csrc/xpu/attn/xe_2/paged_decode.hpp
++++ b/csrc/xpu/attn/xe_2/paged_decode.hpp
+@@ -138,6 +138,18 @@ struct paged_decode_args_t {
+   int64_t q_stride_batch = 0;
+ };
+ 
++// XPU-graph-safe kernel entry: receives the SLM block as an explicit char* (a
++// sycl::local_accessor allocated by the launch layer when a compat::local_mem_size
++// is supplied), instead of cutlass::device_kernel which fetches
++// work_group_scratch_memory (un-capturable by SYCL command graph). A dedicated
++// free function (not an overload of cutlass::device_kernel) keeps the
++// `launch<auto F>` non-type template-parameter unambiguous.
++template <typename Op>
++void paged_decode_graph_safe_kernel(typename Op::Params params, char* smem) {
++  Op op;
++  op(params, smem);
++}
++
+ template <class FMHAKernel, class ReductionSplitKernel, bool isVarLen>
+ struct DecodeKernelLauncher {
+   using StrideQ = typename FMHAKernel::StrideQ;
+@@ -399,16 +411,18 @@ struct DecodeKernelLauncher {
+     const auto sycl_block = compat::dim3(block.x, block.y, block.z);
+     const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
+ 
+-    // Launch parameters depend on whether SYCL compiler supports work-group
+-    // scratch memory extension
+-    compat::experimental::launch_properties launch_props{
+-        syclex::work_group_scratch_size(smem_size),
+-    };
++    // XPU-graph: use a static local_accessor (compat::local_mem_size) instead
++    // of work_group_scratch_size. The scratch-memory extension cannot be
++    // captured by a SYCL command graph; local_accessor (SLM) can. The launch
++    // layer allocates a sycl::local_accessor of smem_size bytes and calls the
++    // device_kernel(params, local_ptr<char>) overload. smem_size ==
++    // FMHAKernel::SharedStorageSize is a compile-time constant.
+     compat::experimental::kernel_properties kernel_props{
+         syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
+     compat::experimental::launch_policy policy{
+-        sycl_grid, sycl_block, launch_props, kernel_props};
+-    compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
++        sycl_grid, sycl_block, kernel_props,
++        compat::experimental::local_mem_size(smem_size)};
++    compat::experimental::launch<paged_decode_graph_safe_kernel<FMHAKernel>>(
+         policy, queue, params);
+ 
+     // event.wait();
+@@ -420,17 +434,14 @@ struct DecodeKernelLauncher {
+       const auto reduce_sycl_block = compat::dim3(block.x, block.y, block.z);
+       const auto reduce_sycl_grid =
+           compat::dim3(reduce_grid.x, reduce_grid.y, reduce_grid.z);
+-      compat::experimental::launch_properties launch_props_reduce{
+-          syclex::work_group_scratch_size(reduce_smem_size),
+-      };
+       compat::experimental::launch_policy reduce_policy{
+           reduce_sycl_grid,
+           reduce_sycl_block,
+-          launch_props_reduce,
+-          kernel_props};
++          kernel_props,
++          compat::experimental::local_mem_size(reduce_smem_size)};
+ 
+       compat::experimental::launch<
+-          cutlass::device_kernel<ReductionSplitKernel>>(
++          paged_decode_graph_safe_kernel<ReductionSplitKernel>>(
+           reduce_policy, queue, reduce_params);
+       // reduce_event.wait();
+     }
 diff --git a/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp b/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp
 index b9729cd..20fff80 100644
 --- a/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp
