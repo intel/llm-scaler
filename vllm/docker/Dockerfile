@@ -139,7 +139,8 @@ SHELL ["bash", "-c"]
 WORKDIR /llm
 
 ENV PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
 
 # --- thin runtime OS deps (media/audio + numactl); NO build-essential / UCX / NIXL ---
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -180,11 +181,20 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # which clobbers the base image's `triton-xpu` libtriton.so and drops the `intel`
 # backend (breaks `import triton.backends`).  Restore the XPU triton, as the legacy
 # build did.  --no-deps keeps it from dragging anything else.
-# Do NOT `strip` the result: `strip --strip-debug` also removes the `intel` binding.
+#
+# Then shrink triton IN THIS SAME LAYER (a later RUN can't reclaim space from here):
+#   * strip --strip-debug libtriton.so: 1.16GB -> ~228MB.  Safe on the *correctly
+#     installed* triton-xpu (validated: intel backend imports + JIT compiles on XPU).
+#     The earlier failure was stripping the CUDA-clobbered .so, not the strip itself.
+#   * dedup the two identical libMLIRDialectPlugin.so copies (500MB each) to a symlink.
 RUN --mount=type=cache,target=/root/.cache/uv \
     pip uninstall -y triton triton-xpu || true && \
     pip install --no-deps triton-xpu==3.7.0 \
-        --extra-index-url https://download.pytorch.org/whl/xpu
+        --extra-index-url https://download.pytorch.org/whl/xpu && \
+    TRITON=/opt/venv/lib/python3.12/site-packages/triton && \
+    strip --strip-debug ${TRITON}/_C/libtriton.so && \
+    rm -f ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git && \
+    ln -s libMLIRDialectPlugin.so ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git
 
 # --- sanity: native modules import & link, triton backends load, int4 quant lib loads ---
 RUN python3 -c "import torch, vllm, custom_esimd_kernels_vllm, vllm_xpu_kernels; print('torch', torch.__version__, 'vllm', vllm.__version__)" && \
