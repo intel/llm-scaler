@@ -207,8 +207,11 @@ sycl::event moe_prefill_up_forward_kernel_fp8(
                 simd<uint32_t, MAX_M> in_off =
                     (pair_idxs / (uint32_t)top_k) * (uint32_t)(hidden_size * sizeof(IT));
 
-                simd<fp16, ACC_SZ> g_acc(fp16(0));
-                simd<fp16, ACC_SZ> u_acc(fp16(0));
+                // fp32 DPAS accumulators: deep layers run near the fp16 ceiling,
+                // and an fp16 partial-sum overflows to inf -> NaN cascade. Match
+                // the dense GEMM / int4 kernels which all accumulate in float.
+                simd<float, ACC_SZ> g_acc(0.0f);
+                simd<float, ACC_SZ> u_acc(0.0f);
 
                 // K-loop: 16 K-elements (one DPAS K-tile) per iteration.
                 for (int k = 0; k < hidden_size; k += 16) {
@@ -230,7 +233,7 @@ sycl::event moe_prefill_up_forward_kernel_fp8(
 
                     // Build + DPAS one column block (N output rows) for gate or up.
                     //   col_base : N-row offset into the 2*I weight rows.
-                    auto fp8_dpas = [&](int col_base, simd<fp16, ACC_SZ>& acc)
+                    auto fp8_dpas = [&](int col_base, simd<float, ACC_SZ>& acc)
                                         SYCL_ESIMD_FUNCTION {
                         #pragma unroll
                         for (int ns = 0; ns < NS; ns++) {
@@ -250,9 +253,9 @@ sycl::event moe_prefill_up_forward_kernel_fp8(
                             #pragma unroll
                             for (int ms = 0; ms < MS; ms++) {
                                 const int idx = ms * NS * 128 + ns * 128;
-                                simd<fp16, 128> a  = acc.template select<128, 1>(idx);
+                                simd<float, 128> a  = acc.template select<128, 1>(idx);
                                 simd<fp16, 256> bv = b_tile.template select<256, 1>(ms * 256);
-                                a = xmx_ns::dpas<8, 8, fp16, fp16, fp16, fp16>(a, bv, a_tile);
+                                a = xmx_ns::dpas<8, 8, float, float, fp16, fp16>(a, bv, a_tile);
                                 acc.template select<128, 1>(idx) = a;
                             }
                         }
@@ -263,10 +266,11 @@ sycl::event moe_prefill_up_forward_kernel_fp8(
                 } // k
 
                 // Separate per-expert scale for gate and up, then SiLU(gate)*up.
-                g_acc *= fp16(scale_gate);
-                u_acc *= fp16(scale_up);
-                simd<fp16, ACC_SZ> sv =
-                    (g_acc / (fp16(1) + sycl::ext::intel::esimd::exp(-g_acc))) * u_acc;
+                // Done in fp32 (accumulators are float); cast to fp16 at scatter.
+                g_acc *= scale_gate;
+                u_acc *= scale_up;
+                simd<fp16, ACC_SZ> sv = convert<fp16>(
+                    (g_acc / (1.0f + sycl::ext::intel::esimd::exp(-g_acc))) * u_acc);
 
                 // Scatter intermediate (indexed by pair_idx). acc layout per ms:
                 //   [ns][N=8 weight-rows][16 tok]; output N row = ns*8 + rr.
@@ -336,7 +340,7 @@ sycl::event moe_prefill_down_forward_kernel_fp8(
                 simd<uint32_t, MAX_M> in_off =
                     pair_idxs * (uint32_t)(intermediate_size * sizeof(IT));
 
-                simd<fp16, ACC_SZ> acc(fp16(0));
+                simd<float, ACC_SZ> acc(0.0f);
 
                 for (int k = 0; k < intermediate_size; k += 16) {
                     const uint32_t k_off = (uint32_t)k * (uint32_t)sizeof(IT);
@@ -370,14 +374,14 @@ sycl::event moe_prefill_down_forward_kernel_fp8(
                         for (int ms = 0; ms < MS; ms++) {
                             const int idx = ms * NS * 128 + ns * 128;
                             simd<fp16, 256> bv = b_tile.template select<256, 1>(ms * 256);
-                            simd<fp16, 128> a  = acc.template select<128, 1>(idx);
-                            a = xmx_ns::dpas<8, 8, fp16, fp16, fp16, fp16>(a, bv, a_tile);
+                            simd<float, 128> a  = acc.template select<128, 1>(idx);
+                            a = xmx_ns::dpas<8, 8, float, float, fp16, fp16>(a, bv, a_tile);
                             acc.template select<128, 1>(idx) = a;
                         }
                     } // ns
                 } // k
 
-                acc *= fp16(scale);
+                acc *= scale;
 
                 simd<uint32_t, MAX_M> out_off =
                     pair_idxs * (uint32_t)(hidden_size * sizeof(IT));
@@ -394,7 +398,8 @@ sycl::event moe_prefill_down_forward_kernel_fp8(
                             const int n_local = ns * 8 + rr;
                             uint32_t ch = (uint32_t)(n_start + n_local) * (uint32_t)sizeof(IT);
                             const int idx = ms * NS * 128 + ns * 128 + rr * 16;
-                            simd<IT, 16> rv = acc.template select<16, 1>(idx);
+                            simd<IT, 16> rv = convert<IT>(
+                                acc.template select<16, 1>(idx).read());
                             scatter<IT, 16>(expert_output, ms_off + ch, rv);
                         }
                     }
