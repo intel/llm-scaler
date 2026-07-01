@@ -88,7 +88,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install -r requirements/xpu.txt && \
     uv pip install grpcio-tools protobuf nanobind && \
     export CMAKE_PREFIX_PATH="$(python3 -c 'import site; print(site.getsitepackages()[0])'):${CMAKE_PREFIX_PATH:-}" && \
-    pip wheel --no-build-isolation --no-deps . -w ${WHEELS}
+    pip wheel --no-build-isolation --no-deps . -w ${WHEELS} && \
+    rm -rf build
 
 # ---------------------------------------------------------------------------
 # 1b. custom ESIMD kernels  ->  wheel  (TORCH_XPU_ARCH_LIST=bmg-g21)
@@ -98,7 +99,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     source /opt/intel/oneapi/setvars.sh --force && \
     cd /src/custom-esimd-kernels-vllm && \
     TORCH_XPU_ARCH_LIST=bmg-g21 MAX_JOBS=1 python3 setup.py bdist_wheel && \
-    cp dist/*.whl ${WHEELS}/
+    cp dist/*.whl ${WHEELS}/ && \
+    rm -rf build dist
 
 # ---------------------------------------------------------------------------
 # 1c. vllm-xpu-kernels (patch + pinned commit)  ->  wheel
@@ -116,7 +118,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     sed -i 's|^transformers|# transformers|' requirements.txt && \
     uv pip install -r requirements.txt && \
     export CMAKE_PREFIX_PATH="$(python3 -c 'import site; print(site.getsitepackages()[0])'):${CMAKE_PREFIX_PATH:-}" && \
-    pip wheel --no-build-isolation --no-deps . -w ${WHEELS}
+    pip wheel --no-build-isolation --no-deps . -w ${WHEELS} && \
+    rm -rf build .deps
 
 # Wheel inventory (visible in the build log for sanity).
 RUN ls -la ${WHEELS}/
