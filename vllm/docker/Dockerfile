@@ -88,7 +88,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install -r requirements/xpu.txt && \
     uv pip install grpcio-tools protobuf nanobind && \
     export CMAKE_PREFIX_PATH="$(python3 -c 'import site; print(site.getsitepackages()[0])'):${CMAKE_PREFIX_PATH:-}" && \
-    pip wheel --no-build-isolation --no-deps . -w ${WHEELS}
+    pip wheel --no-build-isolation --no-deps . -w ${WHEELS} && \
+    rm -rf .git
 
 # ---------------------------------------------------------------------------
 # 1b. custom ESIMD kernels  ->  wheel  (TORCH_XPU_ARCH_LIST=bmg-g21)
@@ -116,7 +117,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     sed -i 's|^transformers|# transformers|' requirements.txt && \
     uv pip install -r requirements.txt && \
     export CMAKE_PREFIX_PATH="$(python3 -c 'import site; print(site.getsitepackages()[0])'):${CMAKE_PREFIX_PATH:-}" && \
-    pip wheel --no-build-isolation --no-deps . -w ${WHEELS}
+    pip wheel --no-build-isolation --no-deps . -w ${WHEELS} && \
+    rm -rf .git
 
 # Wheel inventory (visible in the build log for sanity).
 RUN ls -la ${WHEELS}/
@@ -142,7 +144,15 @@ ENV http_proxy=${http_proxy} \
     VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
     VLLM_WORKER_MULTIPROC_METHOD=spawn
 
-WORKDIR /llm-scaler/vllm/
+WORKDIR /llm-scaler/vllm
+
+# --- patched source trees (post-patch vLLM, vllm-xpu-kernels, and the ESIMD
+#     kernels) kept in the shipped image for reference / editable-install dev
+#     workflows.  These are plain COPY (not bind-mounted): unlike the wheels
+#     below, they're meant to persist in the final image. ---
+COPY --from=builder /src/vllm ./vllm
+COPY --from=builder /src/vllm-xpu-kernels ./vllm-xpu-kernels
+COPY --from=builder /src/custom-esimd-kernels-vllm ./custom-esimd-kernels-vllm
 
 # --- thin runtime OS deps, vLLM + kernel wheels, lean-core serving deps, and the
 #     triton-xpu fix/shrink all in ONE layer: cleanup must happen in the same RUN
