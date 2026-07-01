@@ -66,7 +66,40 @@
 // across threads.
 // ============================================================================
 
+// Default / legacy group size (GGML q4_0 with 128-element blocks).
 static constexpr int INT4_GROUP_SIZE = 128;
+
+// ----------------------------------------------------------------------------
+// Per-lane scale construction for arbitrary GROUP_SIZE <= VL.
+//
+// VL=128 is kept fixed for bandwidth, but the scale group can be smaller
+// (e.g. 32 for vLLM 0.21 sym_int4 / ggml q4_0 with 32-element blocks).
+// One K-loop iteration of VL=128 elements then spans VL/GROUP_SIZE groups.
+//
+// The kernel deinterleaves K into even (K=0,2,4,...) and odd (K=1,3,5,...)
+// halves, each VL/2 lanes.  Even lane i  -> K position 2*i,  so it belongs to
+// group (2*i) / GROUP_SIZE.  Odd lane i -> K position 2*i+1, group (2*i+1)/GS.
+// Because GROUP_SIZE is even and lanes are contiguous, both even and odd
+// halves partition into segments of (GROUP_SIZE/2) lanes per group:
+//   lanes [g*(GS/2) : (g+1)*(GS/2))  use group scale g.
+//
+// build_lane_scale fills a simd<float, VL/2> by broadcasting each of the
+// (VL/GROUP_SIZE) group scales onto its (GROUP_SIZE/2)-lane segment.
+// When GROUP_SIZE == VL this degenerates to a single scalar broadcast.
+// ----------------------------------------------------------------------------
+template<int VL, int GROUP_SIZE>
+SYCL_ESIMD_FUNCTION inline simd<float, VL/2> build_lane_scale(
+    const fp16* s_row, int group_idx) {
+    constexpr int N_GROUPS_PER_ITER = VL / GROUP_SIZE;   // e.g. 128/32 = 4
+    constexpr int LANES_PER_GROUP   = GROUP_SIZE / 2;    // e.g. 32/2  = 16
+    simd<float, VL/2> sv;
+    #pragma unroll
+    for (int g = 0; g < N_GROUPS_PER_ITER; ++g) {
+        float gs = static_cast<float>(s_row[group_idx + g]);
+        sv.template select<LANES_PER_GROUP, 1>(g * LANES_PER_GROUP) = gs;
+    }
+    return sv;
+}
 
 
 // ============================================================================
@@ -130,10 +163,14 @@ inline void select_vl_ks_int4(uint32_t N, uint32_t K, int& vl, int& ks) {
     if      (N <= 128 && K >= 2048) { ks = 8; }
     else if (N <= 512 && K >= 2048) { ks = 4; }
 
-    // Enforce: kp = K / ks must be a multiple of 128 (GROUP_SIZE).
-    // If not, halve ks until it is.
+    // Enforce: kp = K / ks must be a multiple of VL (=128) so the K-loop
+    // (step VL) never over-reads and never splits the VL-block across threads.
+    // This is stricter than (and therefore satisfies) the scale-group
+    // alignment for both GROUP_SIZE=128 and GROUP_SIZE=32 (128 % 32 == 0).
+    // If not aligned, halve ks until it is.
+    constexpr int KP_ALIGN = 128;
     int kp = K / ks;
-    while (kp % INT4_GROUP_SIZE != 0 && ks > 1) {
+    while (kp % KP_ALIGN != 0 && ks > 1) {
         ks /= 2;
         kp = K / ks;
     }
@@ -162,7 +199,7 @@ inline void select_vl_ks_int4(uint32_t N, uint32_t K, int& vl, int& ks) {
 //   5. After loop: horizontal reduce acc_even + acc_odd → scalar output.
 // ============================================================================
 
-template<int VL, int K_SPLIT>
+template<int VL, int K_SPLIT, int GROUP_SIZE = INT4_GROUP_SIZE>
 struct GEMV_int4_kernel {
     const fp16*    input;     // [1, K] fp16 — input activation vector
     const uint8_t* weight;    // [N, K/2] uint8 — packed INT4 weights
@@ -194,8 +231,8 @@ struct GEMV_int4_kernel {
         const uint8_t* w_row = weight + (size_t)n * (K / 2);    // packed weight
         const fp16*    s_row = scale  + (size_t)n * n_groups;    // group scales
 
-        // Track which group we're in (advances by VL/GROUP_SIZE per iteration).
-        int group_idx = ks / INT4_GROUP_SIZE;
+        // Track which group we are in (advances by VL/GROUP_SIZE per iteration).
+        int group_idx = ks / GROUP_SIZE;
 
         for (int k = ks; k < ks + kp; k += VL) {
             // --- Load input: VL fp16 values (VL*2 = 256 bytes) ---
@@ -217,16 +254,17 @@ struct GEMV_int4_kernel {
             simd<float, VL/2> wf_even, wf_odd;
             int4_dequant<VL>(raw, wf_even, wf_odd);
 
-            // --- Load per-group scale ---
-            // With VL=128 and GROUP_SIZE=128, exactly 1 group per iteration.
-            // Scale is fp16, convert to float for FMA precision.
-            float gs = static_cast<float>(s_row[group_idx]);
-            group_idx += VL / INT4_GROUP_SIZE;   // +1 when VL=GROUP_SIZE
+            // --- Load per-group scale(s) ---
+            // VL elements span VL/GROUP_SIZE groups (1 when GROUP_SIZE==VL).
+            // Build per-lane scale vectors for the even/odd halves; both halves
+            // share the same segment layout (see build_lane_scale comment).
+            simd<float, VL/2> sv =
+                build_lane_scale<VL, GROUP_SIZE>(s_row, group_idx);
+            group_idx += VL / GROUP_SIZE;
 
             // --- FMA: accumulate input * weight * scale ---
-            // Apply scale to weight first (scalar broadcast), then multiply by input.
-            wf_even *= gs;
-            wf_odd  *= gs;
+            wf_even *= sv;
+            wf_odd  *= sv;
             acc_even += in_even * wf_even;
             acc_odd  += in_odd  * wf_odd;
         }
@@ -271,14 +309,15 @@ inline void GEMV_int4_host(
     uint8_t* output_data,
     uint32_t N,
     uint32_t K,
-    sycl::queue& q) {
+    sycl::queue& q,
+    int group_size = INT4_GROUP_SIZE) {
 
     auto* p_in  = reinterpret_cast<const fp16*>(input_data);
     auto* p_w   = reinterpret_cast<const uint8_t*>(weight_data);
     auto* p_sc  = reinterpret_cast<const fp16*>(scale_data);
     auto* p_out = reinterpret_cast<fp16*>(output_data);
 
-    int n_groups = K / INT4_GROUP_SIZE;
+    int n_groups = K / group_size;
 
     int vl, ks;
     select_vl_ks_int4(N, K, vl, ks);
@@ -286,20 +325,25 @@ inline void GEMV_int4_host(
     int global = N * ks;   // total threads = N workgroups × K_SPLIT threads/WG
     int local  = ks;       // threads per workgroup
 
-    // Phase 1: VL is always 128.  Only K_SPLIT varies.
-    #define LAUNCH_INT4(S) \
+    // VL is always 128.  K_SPLIT (S) varies; GROUP_SIZE (G) is 128 or 32.
+    #define LAUNCH_INT4(S, G) \
         q.submit([&](sycl::handler& h) { \
             h.parallel_for(sycl::nd_range<1>(global, local), \
-                GEMV_int4_kernel<128, S>{ \
+                GEMV_int4_kernel<128, S, G>{ \
                     p_in, p_w, p_sc, p_out, (int)N, (int)K, n_groups}); \
         });
 
-    if      (ks == 1) { LAUNCH_INT4(1) }
-    else if (ks == 2) { LAUNCH_INT4(2) }
-    else if (ks == 4) { LAUNCH_INT4(4) }
-    else if (ks == 8) { LAUNCH_INT4(8) }
-    else              { LAUNCH_INT4(1) }
+    #define DISPATCH_KS(G) \
+        if      (ks == 1) { LAUNCH_INT4(1, G) } \
+        else if (ks == 2) { LAUNCH_INT4(2, G) } \
+        else if (ks == 4) { LAUNCH_INT4(4, G) } \
+        else if (ks == 8) { LAUNCH_INT4(8, G) } \
+        else              { LAUNCH_INT4(1, G) }
 
+    if (group_size == 32) { DISPATCH_KS(32) }
+    else                  { DISPATCH_KS(128) }
+
+    #undef DISPATCH_KS
     #undef LAUNCH_INT4
 }
 
@@ -318,7 +362,7 @@ inline void GEMV_int4_host(
 // it belongs to via cumulative N sums (same pattern as fp8_GEMV_v2.h).
 // ============================================================================
 
-template<int VL, int K_SPLIT, int GEMV_COUNT>
+template<int VL, int K_SPLIT, int GEMV_COUNT, int GROUP_SIZE = INT4_GROUP_SIZE>
 struct GEMV_int4_fused_kernel {
     const fp16*    input;                     // [1, K] fp16 — shared input
     const uint8_t* weights[GEMV_COUNT];       // packed INT4 weight per matrix
@@ -361,7 +405,7 @@ struct GEMV_int4_fused_kernel {
         simd<float, VL/2> acc_even = 0.0f;
         simd<float, VL/2> acc_odd  = 0.0f;
 
-        int group_idx = ks / INT4_GROUP_SIZE;
+        int group_idx = ks / GROUP_SIZE;
 
         for (int k = ks; k < ks + kp; k += VL) {
             // Load + deinterleave input.
@@ -376,12 +420,13 @@ struct GEMV_int4_fused_kernel {
             simd<float, VL/2> wf_even, wf_odd;
             int4_dequant<VL>(raw, wf_even, wf_odd);
 
-            // Per-group scale + FMA.
-            float gs = static_cast<float>(s_row[group_idx]);
-            group_idx += VL / INT4_GROUP_SIZE;
+            // Per-group scale(s) + FMA (VL spans VL/GROUP_SIZE groups).
+            simd<float, VL/2> sv =
+                build_lane_scale<VL, GROUP_SIZE>(s_row, group_idx);
+            group_idx += VL / GROUP_SIZE;
 
-            wf_even *= gs;
-            wf_odd  *= gs;
+            wf_even *= sv;
+            wf_odd  *= sv;
             acc_even += in_even * wf_even;
             acc_odd  += in_odd  * wf_odd;
         }
@@ -419,14 +464,15 @@ inline void GEMV_int4_fused_host(
     uint8_t* output_ptrs[GEMV_COUNT],
     uint32_t Ns[GEMV_COUNT],
     uint32_t K,
-    sycl::queue& q) {
+    sycl::queue& q,
+    int group_size = INT4_GROUP_SIZE) {
 
     auto* p_in = reinterpret_cast<const fp16*>(input_data);
 
     uint32_t total_N = 0;
     for (int i = 0; i < GEMV_COUNT; i++) total_N += Ns[i];
 
-    int n_groups = K / INT4_GROUP_SIZE;
+    int n_groups = K / group_size;
 
     int vl, ks;
     select_vl_ks_int4(total_N, K, vl, ks);
@@ -434,9 +480,9 @@ inline void GEMV_int4_fused_host(
     int global = total_N * ks;
     int local  = ks;
 
-    #define LAUNCH_INT4_FUSED(S) \
+    #define LAUNCH_INT4_FUSED(S, G) \
         q.submit([&](sycl::handler& h) { \
-            GEMV_int4_fused_kernel<128, S, GEMV_COUNT> kern; \
+            GEMV_int4_fused_kernel<128, S, GEMV_COUNT, G> kern; \
             kern.input = p_in; \
             kern.K = (int)K; \
             kern.n_groups = n_groups; \
@@ -452,11 +498,16 @@ inline void GEMV_int4_fused_host(
             h.parallel_for(sycl::nd_range<1>(global, local), kern); \
         });
 
-    if      (ks == 1) { LAUNCH_INT4_FUSED(1) }
-    else if (ks == 2) { LAUNCH_INT4_FUSED(2) }
-    else if (ks == 4) { LAUNCH_INT4_FUSED(4) }
-    else if (ks == 8) { LAUNCH_INT4_FUSED(8) }
-    else              { LAUNCH_INT4_FUSED(1) }
+    #define DISPATCH_KS_FUSED(G) \
+        if      (ks == 1) { LAUNCH_INT4_FUSED(1, G) } \
+        else if (ks == 2) { LAUNCH_INT4_FUSED(2, G) } \
+        else if (ks == 4) { LAUNCH_INT4_FUSED(4, G) } \
+        else if (ks == 8) { LAUNCH_INT4_FUSED(8, G) } \
+        else              { LAUNCH_INT4_FUSED(1, G) }
 
+    if (group_size == 32) { DISPATCH_KS_FUSED(32) }
+    else                  { DISPATCH_KS_FUSED(128) }
+
+    #undef DISPATCH_KS_FUSED
     #undef LAUNCH_INT4_FUSED
 }

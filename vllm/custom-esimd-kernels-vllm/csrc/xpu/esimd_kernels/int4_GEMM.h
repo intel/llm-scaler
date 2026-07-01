@@ -11,7 +11,10 @@ namespace xesimd = sycl::ext::intel::experimental::esimd;
 using fp16 = sycl::half;
 
 // ============================================================================
-// INT4 GEMM via DPAS (XMX matrix engine), per-group scale (group_size = 128).
+// INT4 GEMM via DPAS (XMX matrix engine), per-group scale.
+// Supports GROUP_SIZE = 128 (legacy GGML) and 32 (vLLM 0.21 sym_int4 / q4_0).
+// GROUP_SIZE is a template param (default 128); host dispatches on the scale
+// last dim, so the op signature is unchanged and group128 callers are intact.
 //
 // Mirrors the FP8 DPAS V9 kernel (fp8_GEMM_pert.h:FP8_GEMM_DPAS_V9) and
 // adapts three things that are INT4-specific:
@@ -42,8 +45,10 @@ using fp16 = sycl::half;
 //
 // Requirements:
 //   N % 16 == 0
-//   K % (K_THREADS * 128) == 0  (each K-thread owns whole scale groups)
-//   input fp16, weight uint8 [N, K/2], weight_scale fp16 [N, K/128],
+//   K % (K_THREADS * K_LOAD) == 0  (each K-thread owns whole 128-wide loads;
+//       K_LOAD=128 is a multiple of both 128 and 32, so this also keeps each
+//       thread owning whole scale groups for either GROUP_SIZE)
+//   input fp16, weight uint8 [N, K/2], weight_scale fp16 [N, K/GROUP_SIZE],
 //   output fp16 [M, N] pre-allocated.
 // ============================================================================
 
@@ -78,11 +83,11 @@ int4_pair_to_vnni_scaled(simd<uint32_t, 16> byte_u32,
     return interleaved.template bit_cast_view<uint32_t>();
 }
 
-template<int K_THREADS, int M_TILES>
+template<int K_THREADS, int M_TILES, int GROUP_SIZE = INT4_GEMM_GROUP_SIZE>
 struct GEMM_int4_pgrp_kernel {
     const fp16*    input;      // [M, K]
     const uint8_t* weight;     // [N, K/2] packed int4
-    const fp16*    scale;      // [N, K/GROUP_SIZE]
+    const fp16*    scale;      // [N, K/GROUP_SIZE]  (per-group scales)
     fp16*          output;     // [M, N]
     int M, N, K;
     int n_groups;              // K / GROUP_SIZE
@@ -90,7 +95,12 @@ struct GEMM_int4_pgrp_kernel {
     void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
         constexpr int N_TILE = 16;
         constexpr int M_TILE = 8;
-        constexpr int K_LOAD = INT4_GEMM_GROUP_SIZE;  // 128
+        // K_LOAD stays 128 for DPAS efficiency regardless of GROUP_SIZE.
+        constexpr int K_LOAD = 128;
+        // How many scale groups a single K_LOAD (=128 K) spans: 1 for
+        // GROUP_SIZE=128, 4 for GROUP_SIZE=32.  K_SUB(=16) divides GROUP_SIZE
+        // for both, so every K_SUB falls entirely inside one scale group.
+        constexpr int SUBS_PER_GROUP = GROUP_SIZE / 16;  // 8 (g128) or 2 (g32)
         constexpr int K_SUB  = 16;
         constexpr int SUBS_PER_KLOAD = K_LOAD / K_SUB;  // 8
         constexpr int SLM_PER_THREAD = M_TILES * 128 * 4;
@@ -131,17 +141,26 @@ struct GEMM_int4_pgrp_kernel {
         const fp16* s_base = scale + (size_t)n_start * n_groups;
 
         for (int k_base = k_start; k_base < k_end; k_base += K_LOAD) {
-            int group_idx = k_base / INT4_GEMM_GROUP_SIZE;
-            simd<fp16, N_TILE> scales_f16;
-            #pragma unroll
-            for (int n = 0; n < N_TILE; n++) {
-                scales_f16[n] = s_base[n * n_groups + group_idx];
-            }
-            simd<fp16, N_TILE> scale_m8_f16 = scales_f16 * fp16(-8.0f);
+            // Base group index of this K_LOAD.  For GROUP_SIZE=128 this is the
+            // single group; for 32 it is the first of SUBS_PER_KLOAD/SUBS_PER_GROUP
+            // (=4) groups covered by the 128-wide load.
+            int base_group = k_base / GROUP_SIZE;
 
             #pragma unroll
             for (int sub = 0; sub < SUBS_PER_KLOAD; sub++) {
                 int k_sub = k_base + sub * K_SUB;
+
+                // Which scale group this K_SUB belongs to.  Each K_SUB (=16)
+                // lies entirely in one group (K_SUB divides GROUP_SIZE).  For
+                // GROUP_SIZE=128, SUBS_PER_GROUP=8 so all subs share base_group;
+                // for 32, SUBS_PER_GROUP=2 so the group advances every 2 subs.
+                int group_idx = base_group + sub / SUBS_PER_GROUP;
+                simd<fp16, N_TILE> scales_f16;
+                #pragma unroll
+                for (int n = 0; n < N_TILE; n++) {
+                    scales_f16[n] = s_base[n * n_groups + group_idx];
+                }
+                simd<fp16, N_TILE> scale_m8_f16 = scales_f16 * fp16(-8.0f);
 
                 // set_x is a uint32-element offset; one uint32 covers 8 int4
                 // K-elements, so stepping by k_sub K means set_x(k_sub / 8).
@@ -269,17 +288,17 @@ struct GEMM_int4_pgrp_kernel {
     }
 };
 
-template<int K_THREADS, int M_TILES>
+template<int K_THREADS, int M_TILES, int GROUP_SIZE = INT4_GEMM_GROUP_SIZE>
 inline void gemm_int4_pgrp_host_impl(
     const fp16* input, const uint8_t* weight, const fp16* scale,
     fp16* output, uint32_t M, uint32_t N, uint32_t K,
     sycl::queue& q) {
-    int n_groups = (int)K / INT4_GEMM_GROUP_SIZE;
+    int n_groups = (int)K / GROUP_SIZE;
     int num_wg = ((int)N + 15) / 16;
     q.submit([&](sycl::handler& h) {
         h.parallel_for(
             sycl::nd_range<1>({(size_t)(num_wg * K_THREADS)}, {(size_t)K_THREADS}),
-            GEMM_int4_pgrp_kernel<K_THREADS, M_TILES>{
+            GEMM_int4_pgrp_kernel<K_THREADS, M_TILES, GROUP_SIZE>{
                 input, weight, scale, output,
                 (int)M, (int)N, (int)K, n_groups});
     });
@@ -291,30 +310,36 @@ inline void gemm_int4_pgrp_host_impl(
 inline void GEMM_int4_pgrp_host(
     const fp16* input, const uint8_t* weight, const fp16* scale,
     fp16* output, uint32_t M, uint32_t N, uint32_t K,
-    sycl::queue& q) {
+    sycl::queue& q, int group_size = INT4_GEMM_GROUP_SIZE) {
     int m_tiles = ((int)M + 7) / 8;
     int n_wgs = ((int)N + 15) / 16;
     int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs, 1)));
-    while (k_threads > 1 && ((int)K % (k_threads * INT4_GEMM_GROUP_SIZE) != 0)) k_threads--;
+    // Each K-thread must own whole 128-wide K_LOADs (K_LOAD=128 is a multiple
+    // of both group sizes), so the per-thread K span must be a multiple of 128.
+    // This is independent of group_size.
+    while (k_threads > 1 && ((int)K % (k_threads * 128) != 0)) k_threads--;
     if (k_threads == 3) k_threads = 2;
 
-    #define DISPATCH(KT, MT) gemm_int4_pgrp_host_impl<KT, MT>( \
+    #define DISPATCH(KT, MT, G) gemm_int4_pgrp_host_impl<KT, MT, G>( \
         input, weight, scale, output, M, N, K, q)
-    if (k_threads >= 4) {
-        if      (m_tiles <= 1) DISPATCH(4, 1);
-        else if (m_tiles <= 2) DISPATCH(4, 2);
-        else if (m_tiles <= 4) DISPATCH(4, 4);
-        else                   DISPATCH(4, 8);
-    } else if (k_threads >= 2) {
-        if      (m_tiles <= 1) DISPATCH(2, 1);
-        else if (m_tiles <= 2) DISPATCH(2, 2);
-        else if (m_tiles <= 4) DISPATCH(2, 4);
-        else                   DISPATCH(2, 8);
-    } else {
-        if      (m_tiles <= 1) DISPATCH(1, 1);
-        else if (m_tiles <= 2) DISPATCH(1, 2);
-        else if (m_tiles <= 4) DISPATCH(1, 4);
-        else                   DISPATCH(1, 8);
-    }
+    #define DISPATCH_MT(KT, G) \
+        do { \
+            if      (m_tiles <= 1) DISPATCH(KT, 1, G); \
+            else if (m_tiles <= 2) DISPATCH(KT, 2, G); \
+            else if (m_tiles <= 4) DISPATCH(KT, 4, G); \
+            else                   DISPATCH(KT, 8, G); \
+        } while (0)
+    #define DISPATCH_KT(G) \
+        do { \
+            if      (k_threads >= 4) DISPATCH_MT(4, G); \
+            else if (k_threads >= 2) DISPATCH_MT(2, G); \
+            else                     DISPATCH_MT(1, G); \
+        } while (0)
+
+    if (group_size == 32) { DISPATCH_KT(32); }
+    else                  { DISPATCH_KT(128); }
+
+    #undef DISPATCH_KT
+    #undef DISPATCH_MT
     #undef DISPATCH
 }
