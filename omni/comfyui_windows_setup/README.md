@@ -17,10 +17,11 @@ This guide provides step-by-step instructions for setting up a portable ComfyUI 
 
 ## Overview
 
-This setup script creates a fully portable ComfyUI installation optimized for Intel XPU (Arc GPUs). The installation includes:
+This setup script creates a portable ComfyUI directory layout optimized for Intel XPU (Arc GPUs). The installation includes:
 
 - **Python 3.12 Embedded** - Self-contained Python environment
 - **PyTorch with XPU Support** - Intel GPU acceleration
+- **omni_xpu_kernel** - Local wheel installed from the llm-scaler build output
 - **ComfyUI** - AI image generation workflow interface
 - **Essential Custom Nodes** - Pre-installed plugins for extended functionality
 
@@ -30,6 +31,46 @@ This setup script creates a fully portable ComfyUI installation optimized for In
 - **Intel XPU Optimized** - Hardware-accelerated on Intel GPUs
 - **Pre-configured** - Ready to use out of the box
 - **Custom Nodes Included** - Popular extensions pre-installed
+
+## Script Scope And Validated Follow-Up
+
+`setup_portable_env.bat` does not build `omni_xpu_kernel`. It only consumes a prebuilt local wheel and installs it into the embedded Python environment.
+
+In the validated Windows flow, the work was split into two parts:
+
+1. Pre-build `omni_xpu_kernel` separately from `llm-scaler\omni\omni_xpu_kernel` and place the wheel under `<WHEEL_DIR>`.
+2. Run `setup_portable_env.bat` from `llm-scaler\omni\comfyui_windows_setup`.
+3. Let the setup script install Python, PyTorch XPU, the prebuilt local wheel, ComfyUI, the patch, custom nodes, and launcher scripts.
+4. After the script completes, run manual verification from the embedded Python environment.
+5. After the script completes, optionally configure `extra_model_paths.yaml` and run an end-to-end workflow test.
+
+The shared model directory and the Z-Image-Turbo workflow test were post-install validation steps. They were not created by the setup script itself.
+
+In the examples below, these placeholders are used:
+
+```text
+<WORKSPACE>         workspace root directory
+<PORTABLE_DIR>      <WORKSPACE>\llm-scaler\omni\comfyui_windows_setup
+<WHEEL_DIR>         <WORKSPACE>\llm_scaler_dist
+<SHARED_MODELS_DIR> shared model directory used across ComfyUI installs
+```
+
+### Validated Windows Layout
+
+The current validated workspace uses the following paths:
+
+```text
+<PORTABLE_DIR>\ComfyUI
+<PORTABLE_DIR>\python_embeded
+<WHEEL_DIR>\omni_xpu_kernel-0.1.0-cp312-cp312-win_amd64.whl
+<SHARED_MODELS_DIR>
+```
+
+The portable Python executable is:
+
+```text
+<PORTABLE_DIR>\python_embeded\python.exe
+```
 
 ---
 
@@ -67,18 +108,18 @@ Clone the LLM Scaler repository to your desired location:
 git clone https://github.com/intel/llm-scaler.git
 cd llm-scaler\omni\comfyui_windows_setup
 ```
-
 The required files are located in:
 ```
 llm-scaler\omni\
 ├── comfyui_windows_setup\
 │   └── setup_portable_env.bat
 └── patches\
-    ├── comfyui_for_multi_arc.patch
-    └── comfyui_gguf_xpu.patch
+   └── comfyui_for_multi_arc.patch
 ```
 
 ### Step 2: Run Setup Script
+
+Before running the setup script, make sure the `omni_xpu_kernel` wheel has already been built. The setup script installs that wheel, but it does not build it.
 
 1. **Right-click** on `setup_portable_env.bat`
 2. Select **"Run as administrator"** (recommended)
@@ -87,10 +128,26 @@ llm-scaler\omni\
 The script will automatically:
 - Download and configure Python 3.12 Embedded
 - Install PyTorch with Intel XPU support
+- Install the local `omni_xpu_kernel` wheel built from `llm-scaler\omni\omni_xpu_kernel`
 - Clone ComfyUI from official repository
 - Apply Intel XPU optimization patches
 - Install essential custom nodes
 - Create launcher scripts
+
+The setup script expects the local kernel wheel at:
+
+```text
+<WHEEL_DIR>\omni_xpu_kernel-0.1.0-cp312-cp312-win_amd64.whl
+```
+
+To use a different wheel, set `OMNI_XPU_KERNEL_WHEEL` before running the script:
+
+```cmd
+set "OMNI_XPU_KERNEL_WHEEL=D:\path\to\omni_xpu_kernel-0.1.0-cp312-cp312-win_amd64.whl"
+setup_portable_env.bat
+```
+
+If your network cannot reach `python.org`, place the embedded Python package under the local fallback source directory used by the script and rerun setup. The validated installation used a local embedded Python fallback instead of downloading Python from the public site.
 
 ### Step 3: Verify Installation
 
@@ -103,6 +160,34 @@ python_embeded\python.exe -c "import torch; print(f'XPU available: {torch.xpu.is
 Expected output:
 ```
 XPU available: True
+```
+
+Verify the local XPU kernels wheel is installed and loadable:
+
+```cmd
+python_embeded\python.exe -c "import omni_xpu_kernel as ok; print(ok.__version__); print(ok.is_available())"
+```
+
+Expected output:
+```text
+0.1.0
+True
+```
+
+You can also verify that ComfyUI itself imports from the embedded environment:
+
+```cmd
+cd ComfyUI
+..\python_embeded\python.exe -c "import main; print('ComfyUI main import: OK')"
+```
+
+The validated environment also showed:
+
+```text
+torch 2.9.0+xpu
+torch.xpu.is_available() == True
+omni_xpu_kernel 0.1.0
+omni_xpu_kernel.is_available() == True
 ```
 
 ---
@@ -121,10 +206,10 @@ run_comfyui.bat
 
 ### Disable Smart Memory Mode
 
-For GPUs with Out of Memory (OOM), use the disable smart memory launcher:
+For GPUs with Out of Memory (OOM), use the low VRAM launcher created by the script:
 
 ```cmd
-run_comfyui_disable_smart_memory.bat
+run_comfyui_lowvram.bat
 ```
 
 ### CPU Mode
@@ -151,6 +236,23 @@ Once ComfyUI starts, open your web browser and navigate to:
 http://127.0.0.1:8188
 ```
 
+If port `8188` is already in use, start ComfyUI on another port:
+
+```cmd
+run_comfyui.bat --listen 127.0.0.1 --port 8190
+```
+
+The validated manual launch command is:
+
+```cmd
+set "PYTHONNOUSERSITE=1"
+set "PYTHONPATH="
+set "PYTHONHOME="
+set "PATH=%CD%\python_embeded;%CD%\python_embeded\Scripts;%CD%\python_embeded\Library\bin;%PATH%"
+cd ComfyUI
+..\python_embeded\python.exe main.py --listen 127.0.0.1 --port 8190
+```
+
 ---
 
 ## Installed Custom Nodes
@@ -163,7 +265,7 @@ The setup script automatically installs the following custom nodes:
 | **VideoHelperSuite** | Video processing and generation tools | [Kosinkadink/ComfyUI-VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite) |
 | **Easy-Use** | Simplified workflow nodes | [yolain/ComfyUI-Easy-Use](https://github.com/yolain/ComfyUI-Easy-Use) |
 | **ControlNet Aux** | ControlNet preprocessors | [Fannovel16/comfyui_controlnet_aux](https://github.com/Fannovel16/comfyui_controlnet_aux) |
-| **ComfyUI-GGUF** | GGUF model format support | [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) |
+| **ComfyUI-GGUF-XPU** | XPU-oriented GGUF model format support | [analytics-zoo/ComfyUI-GGUF-XPU](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU) |
 | **KJNodes** | Utility nodes collection | [kijai/ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) |
 | **ComfyUI-CacheDiT** | DiT model inference acceleration via caching | [Jasonzzt/ComfyUI-CacheDiT](https://github.com/Jasonzzt/ComfyUI-CacheDiT) |
 
@@ -215,7 +317,7 @@ comfyui_windows_setup/
 │   │   ├── comfyui-videohelpersuite/
 │   │   ├── comfyui-easy-use/
 │   │   ├── comfyui_controlnet_aux/
-│   │   ├── ComfyUI-GGUF/
+│   │   ├── ComfyUI-GGUF-XPU/
 │   │   ├── ComfyUI-KJNodes/
 │   │   └── ComfyUI-CacheDiT/
 │   ├── models/               # Model files (download separately)
@@ -229,6 +331,121 @@ comfyui_windows_setup/
 ├── run_comfyui_lowvram.bat   # Low VRAM launcher
 └── run_comfyui_cpu.bat       # CPU-only launcher
 ```
+
+---
+
+## Portable ZIP Reuse
+
+This directory can be packaged as a portable ZIP, but the current validated layout is not fully self-contained for arbitrary Windows machines.
+
+What is already portable:
+
+- `python_embeded/` is self-contained.
+- `ComfyUI/` and the generated launcher scripts use relative paths.
+- `run_comfyui.bat`, `run_comfyui_lowvram.bat`, and `run_comfyui_cpu.bat` can run from the extracted directory without reinstalling Python.
+
+What is not fully self-contained today:
+
+- The current `ComfyUI\extra_model_paths.yaml` points to `<SHARED_MODELS_DIR>`, which is a machine-specific absolute path in the validated setup.
+- The validated Z-Image-Turbo test used models stored outside this directory.
+- `omni_xpu_kernel` on Windows still probes Intel oneAPI runtime directories such as `C:\Program Files (x86)\Intel\oneAPI\dnnl\latest\bin` and `C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin` when importing the native extension.
+
+Practical recommendation:
+
+1. If you want a ZIP for direct unzip testing on another machine, copy the required models into `ComfyUI\models\...` inside this directory and remove or rewrite `ComfyUI\extra_model_paths.yaml`.
+2. Use a target machine that already has the required Intel GPU driver. If the packaged environment does not include every DLL needed by `omni_xpu_kernel`, the target machine may also need a compatible Intel oneAPI runtime.
+3. Treat the ZIP as portable between similarly prepared Intel XPU Windows machines, not as a fully dependency-free package for any clean Windows host.
+
+For the current workspace, the directory is portable enough for internal testing after fixing the model path assumptions, but it should not yet be described as a completely standalone redistributable package.
+
+---
+
+## Shared Model Directory
+
+The setup script does not create shared model paths automatically. For multiple ComfyUI checkouts, you can optionally use a shared model directory instead of copying large model files into each installation. The validated shared directory is:
+
+```text
+<SHARED_MODELS_DIR>
+```
+
+Recommended subdirectories:
+
+```text
+checkpoints
+clip
+clip_vision
+configs
+controlnet
+diffusion_models
+embeddings
+loras
+text_encoders
+upscale_models
+vae
+vae_approx
+```
+
+Create `ComfyUI\extra_model_paths.yaml` with:
+
+```yaml
+shared_models:
+   base_path: <SHARED_MODELS_DIR>
+   checkpoints: checkpoints
+   clip: clip
+   clip_vision: clip_vision
+   configs: configs
+   controlnet: controlnet
+   diffusion_models: diffusion_models
+   embeddings: embeddings
+   loras: loras
+   text_encoders: text_encoders
+   upscale_models: upscale_models
+   vae: vae
+   vae_approx: vae_approx
+```
+
+The Z-Image-Turbo validation used these model files:
+
+```text
+<SHARED_MODELS_DIR>\text_encoders\qwen_3_4b.safetensors
+<SHARED_MODELS_DIR>\vae\ae.safetensors
+<SHARED_MODELS_DIR>\diffusion_models\z_image_turbo_bf16.safetensors
+```
+
+---
+
+## Z-Image-Turbo E2E Validation
+
+This was a manual post-install validation step after the script had completed successfully. The local installation was validated with the official Z-Image-Turbo node chain expanded into a ComfyUI API prompt:
+
+```text
+UNETLoader -> ModelSamplingAuraFlow -> KSampler -> VAEDecode -> SaveImage
+CLIPLoader -> CLIPTextEncode -> ConditioningZeroOut
+EmptySD3LatentImage -> KSampler
+```
+
+Validated settings:
+
+```text
+unet_name: z_image_turbo_bf16.safetensors
+clip_name: qwen_3_4b.safetensors
+clip type: lumina2
+vae_name: ae.safetensors
+shift: 3.0
+sampler: res_multistep
+scheduler: simple
+cfg: 1.0
+steps: 4
+size: 512x512
+```
+
+The test output was generated at:
+
+```text
+ComfyUI\output\z_image_turbo_e2e_00001_.png
+```
+
+The generated PNG was verified as a valid `512x512` image. The first run loaded about 11.7 GB of model weights and completed in about 57 seconds on the validated Intel XPU system.
 
 ---
 
@@ -282,6 +499,34 @@ comfyui_windows_setup/
 - Check firewall settings
 - Try running with VPN disabled (or enabled, depending on your network)
 
+#### 6. ComfyUI-Manager GitHub Timeout During Startup
+
+**Symptom**: Startup logs show `Cannot connect to host raw.githubusercontent.com` or `Cannot connect to comfyregistry`.
+
+**Solution**:
+- This is usually not fatal for local inference.
+- ComfyUI-Manager can fall back to local mode.
+- Configure proxy variables if you need Manager online features.
+
+#### 7. `comfy-aimdo` DLL Warning
+
+**Symptom**: Startup logs show `comfy-aimdo failed to load`.
+
+**Solution**:
+- This package is NVIDIA-only in the current environment.
+- The warning can be ignored for Intel XPU validation.
+
+#### 8. Port Already in Use
+
+**Symptom**: Startup fails with `WinError 10048` for `127.0.0.1:8188`.
+
+**Solution**:
+- Use another port, for example `--port 8190`.
+- Check the current listener with:
+   ```powershell
+   Get-NetTCPConnection -LocalPort 8188 -ErrorAction SilentlyContinue
+   ```
+
 ### Getting Help
 
 If you encounter issues not covered above:
@@ -301,7 +546,7 @@ If you encounter issues not covered above:
 
 ### Q: Can I move the installation to another location?
 
-**A**: Yes! The installation is fully portable. Simply move the entire folder to a new location. The relative paths will continue to work.
+**A**: Mostly yes for the directory layout itself: the embedded Python environment, ComfyUI checkout, and launcher scripts use relative paths, so the folder can be moved. In the current validated setup, you still need to account for external model paths and, on some systems, additional runtime DLL dependencies as described in [Portable ZIP Reuse](#portable-zip-reuse).
 
 ### Q: How do I update ComfyUI?
 
@@ -318,11 +563,13 @@ git stash pop
 
 ### Q: Where should I put my model files?
 
-**A**: Place model files in the appropriate subfolders under `ComfyUI/models/`:
+**A**: For a single installation, place model files in the appropriate subfolders under `ComfyUI/models/`:
 - Checkpoints (SDXL, SD1.5, etc.) → `models/checkpoints/`
 - LoRA models → `models/loras/`
 - VAE files → `models/vae/`
 - ControlNet models → `models/controlnet/`
+
+For multiple local ComfyUI installations, prefer the shared directory described in [Shared Model Directory](#shared-model-directory).
 
 ### Q: Can I use this with NVIDIA GPU?
 
@@ -344,7 +591,8 @@ git stash pop
 |-----------|---------|
 | Python | 3.12.10 |
 | PyTorch | 2.9.0+xpu |
-| ComfyUI | Commit 532e285 |
+| omni_xpu_kernel | 0.1.0 local wheel |
+| ComfyUI | Commit 64b8457 |
 | Setup Script | v1.0 |
 
 ---

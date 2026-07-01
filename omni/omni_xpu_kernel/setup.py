@@ -149,6 +149,8 @@ class ICPXBuildExt(build_ext):
             cmd = [
                 icpx,
                 "-fsycl",
+                "/DNOMINMAX",
+                "/DWIN32_LEAN_AND_MEAN",
             ]
             
             if is_lgrf:
