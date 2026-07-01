@@ -144,24 +144,25 @@ ENV http_proxy=${http_proxy} \
 
 WORKDIR /llm-scaler/vllm/
 
-# --- compiled wheels from the builder stage ---
-COPY --from=builder /wheels /llm-scaler/vllm/
-
 # --- thin runtime OS deps, vLLM + kernel wheels, lean-core serving deps, and the
 #     triton-xpu fix/shrink all in ONE layer: cleanup must happen in the same RUN
-#     that creates the bloat, otherwise a later layer can't reclaim the space. ---
+#     that creates the bloat, otherwise a later layer can't reclaim the space.
+#     Wheels are bind-mounted (not COPY'd) from the builder stage: a COPY would
+#     bake them into their own image layer that a later `rm` could never reclaim
+#     (union FS layers are immutable); the bind mount makes them visible only for
+#     this RUN's lifetime, so nothing from /wheels ever lands in the final image. ---
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,from=builder,source=/wheels,target=/wheels \
     apt-get update -y && \
     apt-get install -y --no-install-recommends --fix-missing \
         ffmpeg libsndfile1 libsm6 libxext6 libgl1 numactl curl && \
     rm -rf /var/lib/apt/lists/* && \
-    pip install ./vllm-*.whl --extra-index-url https://download.pytorch.org/whl/xpu && \
+    pip install /wheels/vllm-*.whl --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-deps --force-reinstall \
-        ./custom_esimd_kernels_vllm-*.whl \
-        ./vllm_xpu_kernels-*.whl && \
-    rm -f ./*.whl && \
+        /wheels/custom_esimd_kernels_vllm-*.whl \
+        /wheels/vllm_xpu_kernels-*.whl && \
     pip install transformers==5.8.0 accelerate hf_transfer 'modelscope!=1.15.0' && \
     pip install librosa soundfile decord ijson && \
     pip install bigdl-core==2.4.0b2 && \
