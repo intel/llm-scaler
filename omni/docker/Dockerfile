@@ -53,12 +53,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         --index-url https://download.pytorch.org/whl/xpu && \
     pip install pytest
 
-# omni_xpu_kernel
+# omni_xpu_kernel is installed AFTER sgl-kernel-xpu (below): its cute FMHA
+# extension needs the cutlass-sycl headers that sgl-kernel-xpu fetches into
+# build/_deps/repo-cutlass-sycl-src.
 COPY ./omni_xpu_kernel /tmp/omni_xpu_kernel
-RUN --mount=type=cache,target=/root/.cache/pip \
-    cd /tmp/omni_xpu_kernel && \
-    pip install . --no-build-isolation && \
-    rm -rf /tmp/omni_xpu_kernel
 
 # xDiT / long-context-attention
 COPY ./patches/yunchang_for_multi_arc.patch /tmp/
@@ -253,6 +251,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cp -r /llm/sglang/python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion \
         /llm/ComfyUI/custom_nodes/ && \
     rm -f /tmp/sglang_diffusion_for_multi_arc.patch
+
+# omni_xpu_kernel (installed here so its cute FMHA ext can use sgl-kernel-xpu's
+# cutlass-sycl headers). CUTLASS_SYCL_ROOT points at the fetched tree; the cute
+# ext is AOT-compiled for OMNI_XPU_DEVICE (bmg = Arc B-series).
+RUN --mount=type=cache,target=/root/.cache/pip \
+    export CUTLASS_SYCL_ROOT=/llm/sgl-kernel-xpu/build/_deps/repo-cutlass-sycl-src && \
+    export OMNI_XPU_DEVICE=bmg && \
+    cd /tmp/omni_xpu_kernel && \
+    pip install . --no-build-isolation && \
+    rm -rf /tmp/omni_xpu_kernel
 
 # Application files
 COPY ./workflows/* /llm/ComfyUI/user/default/workflows/

@@ -101,11 +101,15 @@ class ICPXBuildExt(build_ext):
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
         is_lgrf = ext.name.endswith("lgrf_sdp")
-        
+        is_cute = ext.name.endswith("cute_fmha_torch")
+
         # Source directory
         if is_lgrf:
             src_dir = Path(ext.sourcedir) / "omni_xpu_kernel" / "lgrf_uni"
             sources = [src_dir / "sdp_kernels.cpp"]
+        elif is_cute:
+            src_dir = Path(ext.sourcedir) / "omni_xpu_kernel" / "cute"
+            sources = [src_dir / "cute_fmha_torch.cpp"]
         else:
             src_dir = Path(ext.sourcedir) / "omni_xpu_kernel" / "csrc"
             sources = list(src_dir.glob("*.cpp"))
@@ -209,6 +213,45 @@ class ICPXBuildExt(build_ext):
                 if has_onednn:
                     cmd.append(f"-I{onednn_include}")
                 cmd += ["-o", str(output_path)] + [str(s) for s in sources]
+            elif is_cute:
+                # CUTLASS-SYCL fused FMHA. Needs a cutlass-sycl / sycl-tla source
+                # tree (headers only) via CUTLASS_SYCL_ROOT, AOT to the target GPU,
+                # and the Xe SPIR-V extensions. fp32 accumulation (no fp16 overflow).
+                cutlass = os.environ.get("CUTLASS_SYCL_ROOT", "")
+                if not cutlass or not os.path.isdir(cutlass):
+                    raise RuntimeError(
+                        "cute_fmha_torch needs CUTLASS_SYCL_ROOT set to a cutlass-sycl "
+                        "(sycl-tla) source tree containing include/, tools/util/include/, "
+                        "examples/common/, applications/. Got: " + repr(cutlass))
+                device_target = os.environ.get("OMNI_XPU_DEVICE", "bmg")
+                cmd += [
+                    "-std=c++17", "-O3", "-DNDEBUG", "-fPIC", "-shared",
+                    "-fsycl-targets=spir64_gen",
+                    "-Xsycl-target-backend", f"-device {device_target}",
+                    "-Xspirv-translator",
+                    "-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,"
+                    "+SPV_INTEL_subgroup_matrix_multiply_accumulate",
+                    "-fno-sycl-instrument-device-code",
+                    "-DCUTLASS_ENABLE_SYCL", "-DSYCL_INTEL_TARGET",
+                    "-D_GLIBCXX_USE_CXX11_ABI=1", "-DHEAD_DIM=128",
+                    f"-I{cutlass}/include",
+                    f"-I{cutlass}/tools/util/include",
+                    f"-I{cutlass}/examples/common",
+                    f"-I{cutlass}/applications",
+                    f"-I{python_include}",
+                    f"-I{torch_include}",
+                    f"-I{torch_include}/torch/csrc/api/include",
+                    "-Wno-unknown-pragmas", "-Wno-unused-variable",
+                    "-Wno-unused-but-set-variable", "-Wno-unused-local-typedef",
+                    "-Wno-uninitialized", "-Wno-reorder-ctor",
+                    "-Wno-logical-op-parentheses", "-Wno-unused-function",
+                    "-Wno-deprecated-copy",
+                    f"-L{torch_lib}",
+                    "-ltorch", "-ltorch_python", "-ltorch_cpu", "-ltorch_xpu",
+                    "-lc10", "-lc10_xpu",
+                    "-Wl,-rpath," + str(torch_lib),
+                    "-o", str(output_path),
+                ] + [str(s) for s in sources]
             else:
                 cmd += [
                     "-fsycl-esimd-force-stateless-mem",
@@ -285,7 +328,8 @@ setup(
     packages=find_packages(exclude=["tests", "scripts"]),
     ext_modules=[
         ICPXExtension("omni_xpu_kernel._C", sourcedir="."),
-        ICPXExtension("omni_xpu_kernel.lgrf_uni.lgrf_sdp", sourcedir=".")
+        ICPXExtension("omni_xpu_kernel.lgrf_uni.lgrf_sdp", sourcedir="."),
+        ICPXExtension("omni_xpu_kernel.cute.cute_fmha_torch", sourcedir="."),
     ],
     cmdclass={"build_ext": ICPXBuildExt},
     python_requires=">=3.9",

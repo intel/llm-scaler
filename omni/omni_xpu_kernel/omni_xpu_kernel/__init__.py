@@ -59,6 +59,13 @@ from . import rotary
 from . import sdp
 from . import linear
 
+# cute FMHA (CUTLASS-SYCL) is an optional backend — its AOT .so may be absent on
+# non-XPU / header-less installs, so import defensively.
+try:
+    from . import cute
+except Exception:  # pragma: no cover
+    cute = None
+
 __all__ = [
     "gguf",
     "norm",
@@ -66,6 +73,7 @@ __all__ = [
     "rotary",
     "sdp",
     "linear",
+    "cute",
     "is_available",
     "__version__",
 ]
