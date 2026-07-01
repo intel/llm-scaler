@@ -90,6 +90,10 @@ class ICPXBuildExt(build_ext):
         torch_dir = Path(torch.__file__).parent
         torch_include = torch_dir / "include"
         torch_lib = torch_dir / "lib"
+
+        # Match PyTorch's libstdc++ ABI so the extension links/loads against this
+        # wheel (a hard-coded flag breaks if the wheel used the other ABI).
+        torch_cxx11_abi = int(bool(torch.compiled_with_cxx11_abi()))
         
         # Get Python include
         import sysconfig
@@ -145,6 +149,11 @@ class ICPXBuildExt(build_ext):
         else:
             print("WARNING: oneDNN not found. onednn_int4_gemm will not be available.")
         
+        if is_cute and IS_WINDOWS:
+            # cute FMHA has no Windows build path (and is filtered out of
+            # ext_modules on Windows); guard here in case it is reached directly.
+            raise RuntimeError("cute_fmha_torch is Linux-only; not supported on Windows.")
+
         if IS_WINDOWS:
             # Windows compile command using icx
             python_lib_dir = sysconfig.get_config_var("LIBDIR") or str(Path(sys.executable).parent / "libs")
@@ -233,7 +242,7 @@ class ICPXBuildExt(build_ext):
                     "+SPV_INTEL_subgroup_matrix_multiply_accumulate",
                     "-fno-sycl-instrument-device-code",
                     "-DCUTLASS_ENABLE_SYCL", "-DSYCL_INTEL_TARGET",
-                    "-D_GLIBCXX_USE_CXX11_ABI=1", "-DHEAD_DIM=128",
+                    f"-D_GLIBCXX_USE_CXX11_ABI={torch_cxx11_abi}", "-DHEAD_DIM=128",
                     f"-I{cutlass}/include",
                     f"-I{cutlass}/tools/util/include",
                     f"-I{cutlass}/examples/common",
@@ -316,6 +325,16 @@ def get_long_description():
     return ""
 
 
+# Extension list. The cute (CUTLASS-SYCL) FMHA is Linux-only — it needs the
+# cutlass-sycl headers + Xe SPIR-V extensions and has no Windows build path, so
+# it is only added on non-Windows platforms.
+_ext_modules = [
+    ICPXExtension("omni_xpu_kernel._C", sourcedir="."),
+    ICPXExtension("omni_xpu_kernel.lgrf_uni.lgrf_sdp", sourcedir="."),
+]
+if not IS_WINDOWS:
+    _ext_modules.append(ICPXExtension("omni_xpu_kernel.cute.cute_fmha_torch", sourcedir="."))
+
 setup(
     name="omni_xpu_kernel",
     version=get_version(),
@@ -326,11 +345,7 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/intel/omni_xpu_kernel",
     packages=find_packages(exclude=["tests", "scripts"]),
-    ext_modules=[
-        ICPXExtension("omni_xpu_kernel._C", sourcedir="."),
-        ICPXExtension("omni_xpu_kernel.lgrf_uni.lgrf_sdp", sourcedir="."),
-        ICPXExtension("omni_xpu_kernel.cute.cute_fmha_torch", sourcedir="."),
-    ],
+    ext_modules=_ext_modules,
     cmdclass={"build_ext": ICPXBuildExt},
     python_requires=">=3.9",
     install_requires=[

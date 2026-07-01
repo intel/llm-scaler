@@ -213,7 +213,15 @@ void run_d128(const void* q_ptr, const void* k_ptr, const void* v_ptr, void* o_p
 // ---- public op --------------------------------------------------------------
 at::Tensor sdp(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
   TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "cute_fmha: expect [B,L,H,D]");
-  TORCH_CHECK(q.device().is_xpu(), "cute_fmha: q must be XPU");
+  // All three operands must be on XPU and share q's dtype — the kernel takes raw
+  // data_ptr()s and reinterprets them as q's element type, so a CPU tensor or a
+  // dtype mismatch would feed invalid pointers / misread data.
+  TORCH_CHECK(q.device().is_xpu() && k.device().is_xpu() && v.device().is_xpu(),
+              "cute_fmha: q, k, v must all be XPU tensors (got ",
+              q.device(), ", ", k.device(), ", ", v.device(), ")");
+  TORCH_CHECK(k.scalar_type() == q.scalar_type() && v.scalar_type() == q.scalar_type(),
+              "cute_fmha: q, k, v must share dtype (got ",
+              q.scalar_type(), ", ", k.scalar_type(), ", ", v.scalar_type(), ")");
   // Public layout is [B, L, H, D] (drop-in for omni_xpu_kernel.sdp). The kernel
   // reads this contiguous layout directly via custom strides (run_d128), so no
   // permute/copy is needed — output is also [B, L, H, D].
