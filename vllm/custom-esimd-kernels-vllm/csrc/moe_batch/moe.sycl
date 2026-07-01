@@ -1,4 +1,6 @@
 #include <torch/extension.h>
+#include <cstdlib>
+#include <algorithm>
 #include <c10/xpu/XPUStream.h>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
@@ -1450,6 +1452,19 @@ torch::Tensor moe_forward_fused(
 // Buffers are lazily initialized on first call and reused across layers.
 
 // Static buffer cache (thread-local for safety, though typically single-threaded)
+// XPU-graph safety: by default the static MoE buffers only grow and are never
+// reallocated, so the output-tensor address frozen into a captured graph stays
+// valid forever. (Otherwise a large batch triggers a realloc -> the old address
+// is freed -> a later small-batch graph replay reads freed/garbage memory ->
+// !!!! .) Set MOE_STICKY_BUF=0 to fall back to the original "reallocate exactly
+// to n_tokens" behavior (for emergencies / A-B comparison).
+static bool moe_sticky_disabled() {
+    // MOE_STICKY_BUF=0 -> original (reallocate-to-n_tokens) behavior; else sticky.
+    static bool v = []{ const char* e = std::getenv("MOE_STICKY_BUF");
+                        return e && e[0] == 48; }();  // 48 = ascii 0
+    return v;
+}
+
 static thread_local torch::Tensor s_topk_idx, s_topk_weight;
 static thread_local torch::Tensor s_routed_output, s_final_output;
 static thread_local torch::Tensor s_intermediates;
@@ -1459,18 +1474,21 @@ static void ensure_moe_buffers(int n_tokens, int top_k, int num_shared_experts,
                                 int hidden_size, int intermediate_size,
                                 const torch::Device& dev) {
     int rows_per_token = top_k + num_shared_experts;
-    if (s_cached_ntokens != n_tokens) {
-        s_topk_idx = torch::empty({n_tokens, top_k},
+    bool _sticky = !moe_sticky_disabled();
+    int an = _sticky ? std::max(s_cached_ntokens, n_tokens) : n_tokens;
+    bool _need = _sticky ? (s_cached_ntokens < n_tokens) : (s_cached_ntokens != n_tokens);
+    if (_need) {
+        s_topk_idx = torch::empty({an, top_k},
             torch::device(dev).dtype(torch::kInt32));
-        s_topk_weight = torch::empty({n_tokens, top_k},
+        s_topk_weight = torch::empty({an, top_k},
             torch::device(dev).dtype(torch::kHalf));
-        s_routed_output = torch::empty({n_tokens * rows_per_token, hidden_size},
+        s_routed_output = torch::empty({an * rows_per_token, hidden_size},
             torch::device(dev).dtype(torch::kHalf));
-        s_final_output = torch::empty({n_tokens, hidden_size},
+        s_final_output = torch::empty({an, hidden_size},
             torch::device(dev).dtype(torch::kHalf));
-        s_intermediates = torch::empty({n_tokens * rows_per_token, intermediate_size},
+        s_intermediates = torch::empty({an * rows_per_token, intermediate_size},
             torch::device(dev).dtype(torch::kHalf));
-        s_cached_ntokens = n_tokens;
+        s_cached_ntokens = an;
     }
 }
 
@@ -1558,7 +1576,7 @@ torch::Tensor moe_forward_full(
             n_tokens, hidden_size, intermediate_size, top_k, num_shared_experts, rows_per_token, x.device());
     }
 
-    return s_final_output;
+    return !moe_sticky_disabled() ? s_final_output.narrow(0, 0, n_tokens) : s_final_output;
 }
 
 // V2: For BSZ>1 — uses standalone down path (gate_precompute + down_routed +
@@ -1577,20 +1595,23 @@ static void ensure_moe_buffers_v2(int n_tokens, int top_k, int num_shared_expert
                                    int hidden_size, int intermediate_size,
                                    const torch::Device& dev) {
     int rows_per_token = top_k + num_shared_experts;
-    if (s2_cached_ntokens != n_tokens) {
-        s2_topk_idx = torch::empty({n_tokens, top_k},
+    bool _sticky = !moe_sticky_disabled();
+    int an = _sticky ? std::max(s2_cached_ntokens, n_tokens) : n_tokens;
+    bool _need = _sticky ? (s2_cached_ntokens < n_tokens) : (s2_cached_ntokens != n_tokens);
+    if (_need) {
+        s2_topk_idx = torch::empty({an, top_k},
             torch::device(dev).dtype(torch::kInt32));
-        s2_topk_weight = torch::empty({n_tokens, top_k},
+        s2_topk_weight = torch::empty({an, top_k},
             torch::device(dev).dtype(torch::kHalf));
-        s2_routed_output = torch::empty({n_tokens * rows_per_token, hidden_size},
+        s2_routed_output = torch::empty({an * rows_per_token, hidden_size},
             torch::device(dev).dtype(torch::kHalf));
-        s2_final_output = torch::empty({n_tokens, hidden_size},
+        s2_final_output = torch::empty({an, hidden_size},
             torch::device(dev).dtype(torch::kHalf));
-        s2_intermediates = torch::empty({n_tokens * rows_per_token, intermediate_size},
+        s2_intermediates = torch::empty({an * rows_per_token, intermediate_size},
             torch::device(dev).dtype(torch::kHalf));
-        s2_gate_values = torch::empty({n_tokens * num_shared_experts},
+        s2_gate_values = torch::empty({an * num_shared_experts},
             torch::device(dev).dtype(torch::kFloat32));
-        s2_cached_ntokens = n_tokens;
+        s2_cached_ntokens = an;
     }
 }
 
@@ -2026,7 +2047,7 @@ torch::Tensor moe_forward_full_v2(
         (fp16*)s2_final_output.data_ptr(),
         n_tokens, hidden_size, rows_per_token, x.device());
 
-    return s2_final_output;
+    return !moe_sticky_disabled() ? s2_final_output.narrow(0, 0, n_tokens) : s2_final_output;
 }
 
 TORCH_LIBRARY_FRAGMENT(moe_ops, m) {
