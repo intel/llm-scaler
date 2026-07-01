@@ -100,7 +100,7 @@ at::Tensor esimd_gdn_conv_fused_seq(
     auto* p_alog    = reinterpret_cast<const fp16*>(A_log.data_ptr());
     auto* p_dtbias  = reinterpret_cast<const fp16*>(dt_bias.data_ptr());
     auto* p_ba      = reinterpret_cast<const fp16*>(ba.data_ptr());
-    auto* p_sstate  = reinterpret_cast<fp16*>(ssm_state.data_ptr());
+    auto* p_sstate  = reinterpret_cast<float*>(ssm_state.data_ptr());
     auto* p_ssidx   = ssm_state_indices.data_ptr<int>();
     auto* p_out     = reinterpret_cast<fp16*>(output.data_ptr());
     auto* p_zout    = reinterpret_cast<fp16*>(z_out.data_ptr());

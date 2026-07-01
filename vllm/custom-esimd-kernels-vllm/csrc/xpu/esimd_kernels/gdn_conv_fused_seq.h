@@ -56,18 +56,18 @@ ESIMD_INLINE float esimd_sqrtf_seq(float x) {
     return v[0];
 }
 
-/* ---- LSC load/store helpers ---- */
-ESIMD_INLINE simd<float, 64> lsc_load_state_64_seq(const fp16* ptr) {
-    return xmem::lsc_block_load<fp16, 64,
+/* ---- LSC load/store helpers for SSM state (fp32) ---- */
+ESIMD_INLINE simd<float, 64> lsc_load_state_64_seq(const float* ptr) {
+    return xmem::lsc_block_load<float, 64,
         xmem::lsc_data_size::default_size,
         xmem::cache_hint::streaming, xmem::cache_hint::cached>(ptr);
 }
 
-ESIMD_INLINE void lsc_store_state_64_seq(fp16* ptr, simd<float, 64> val) {
-    xmem::lsc_block_store<fp16, 64,
+ESIMD_INLINE void lsc_store_state_64_seq(float* ptr, simd<float, 64> val) {
+    xmem::lsc_block_store<float, 64,
         xmem::lsc_data_size::default_size,
         xmem::cache_hint::streaming, xmem::cache_hint::write_back>(
-        ptr, simd<fp16, 64>(val));
+        ptr, val);
 }
 
 /* ---- Dot product 128 (split lo/hi 64) ---- */
@@ -115,7 +115,7 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
     const fp16* __restrict__ dt_bias_ptr,
     const fp16* __restrict__ ba_ptr,
     int64_t ba_stride0,
-    fp16* __restrict__ ssm_state_ptr,
+    float* __restrict__ ssm_state_ptr,
     const int* __restrict__ ssm_state_indices_ptr,
     fp16* __restrict__ output_ptr,
     fp16* __restrict__ z_out_ptr,
@@ -296,7 +296,7 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
         float exp_g = esimd_expf_seq(g);
         float beta = 1.0f / (1.0f + esimd_expf_seq(-b_val));
 
-        fp16* sstate_base = ssm_state_ptr +
+        float* sstate_base = ssm_state_ptr +
             (int64_t)ssm_idx * ssm_stride0 + (int64_t)hv * gdn_V * gdn_K;
 
         // Manual unroll to avoid ESIMD compiler codegen issues with
@@ -304,10 +304,10 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
         simd<float, VPT> o_acc;
 
         if constexpr (VPT == 4) {
-            fp16* sr0 = sstate_base + (int64_t)(vi0 + 0) * gdn_K;
-            fp16* sr1 = sstate_base + (int64_t)(vi0 + 1) * gdn_K;
-            fp16* sr2 = sstate_base + (int64_t)(vi0 + 2) * gdn_K;
-            fp16* sr3 = sstate_base + (int64_t)(vi0 + 3) * gdn_K;
+            float* sr0 = sstate_base + (int64_t)(vi0 + 0) * gdn_K;
+            float* sr1 = sstate_base + (int64_t)(vi0 + 1) * gdn_K;
+            float* sr2 = sstate_base + (int64_t)(vi0 + 2) * gdn_K;
+            float* sr3 = sstate_base + (int64_t)(vi0 + 3) * gdn_K;
 
             simd<float, 64> h0_lo = lsc_load_state_64_seq(sr0);
             simd<float, 64> h0_hi = lsc_load_state_64_seq(sr0 + 64);
@@ -353,8 +353,8 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
             lsc_store_state_64_seq(sr3 + 64, h3_hi);
         } else {
             // VPT == 2 (WG=64)
-            fp16* sr0 = sstate_base + (int64_t)(vi0 + 0) * gdn_K;
-            fp16* sr1 = sstate_base + (int64_t)(vi0 + 1) * gdn_K;
+            float* sr0 = sstate_base + (int64_t)(vi0 + 0) * gdn_K;
+            float* sr1 = sstate_base + (int64_t)(vi0 + 1) * gdn_K;
 
             simd<float, 64> h0_lo = lsc_load_state_64_seq(sr0);
             simd<float, 64> h0_hi = lsc_load_state_64_seq(sr0 + 64);
@@ -482,7 +482,7 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel_large_h(
     const fp16* __restrict__ dt_bias_ptr,
     const fp16* __restrict__ ba_ptr,
     int64_t ba_stride0,
-    fp16* __restrict__ ssm_state_ptr,
+    float* __restrict__ ssm_state_ptr,
     const int* __restrict__ ssm_state_indices_ptr,
     fp16* __restrict__ output_ptr,
     fp16* __restrict__ z_out_ptr,
@@ -584,12 +584,12 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel_large_h(
         float exp_g = esimd_expf_seq(g);
         float beta = 1.0f / (1.0f + esimd_expf_seq(-b_val));
 
-        fp16* sstate_base = ssm_state_ptr +
+        float* sstate_base = ssm_state_ptr +
             (int64_t)ssm_idx * ssm_stride0 + (int64_t)hv * gdn_V * gdn_K;
 
         // VPT=2
-        fp16* sr0 = sstate_base + (int64_t)(vi0 + 0) * gdn_K;
-        fp16* sr1 = sstate_base + (int64_t)(vi0 + 1) * gdn_K;
+        float* sr0 = sstate_base + (int64_t)(vi0 + 0) * gdn_K;
+        float* sr1 = sstate_base + (int64_t)(vi0 + 1) * gdn_K;
 
         simd<float, 64> h0_lo = lsc_load_state_64_seq(sr0);
         simd<float, 64> h0_hi = lsc_load_state_64_seq(sr0 + 64);
@@ -778,7 +778,7 @@ inline void gdn_conv_fused_seq_dispatch(
     const fp16* conv_bias_ptr, const int* conv_state_indices_ptr,
     const fp16* A_log_ptr, const fp16* dt_bias_ptr,
     const fp16* ba_ptr, int64_t ba_stride0,
-    fp16* ssm_state_ptr, const int* ssm_state_indices_ptr,
+    float* ssm_state_ptr, const int* ssm_state_indices_ptr,
     fp16* output_ptr, fp16* z_out_ptr,
     int N, int H, int HV, int K, int V, float scale,
     int64_t conv_stride0, int64_t ssm_stride0,
@@ -835,7 +835,7 @@ inline void gdn_conv_fused_seq_host(
     const fp16* dt_bias_ptr,
     const fp16* ba_ptr,
     int64_t ba_stride0,
-    fp16* ssm_state_ptr,
+    float* ssm_state_ptr,
     const int* ssm_state_indices_ptr,
     fp16* output_ptr,
     fp16* z_out_ptr,
