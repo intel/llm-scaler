@@ -88,8 +88,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install -r requirements/xpu.txt && \
     uv pip install grpcio-tools protobuf nanobind && \
     export CMAKE_PREFIX_PATH="$(python3 -c 'import site; print(site.getsitepackages()[0])'):${CMAKE_PREFIX_PATH:-}" && \
-    pip wheel --no-build-isolation --no-deps . -w ${WHEELS} && \
-    rm -rf .git
+    pip wheel --no-build-isolation --no-deps . -w ${WHEELS}
 
 # ---------------------------------------------------------------------------
 # 1b. custom ESIMD kernels  ->  wheel  (TORCH_XPU_ARCH_LIST=bmg-g21)
@@ -117,8 +116,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     sed -i 's|^transformers|# transformers|' requirements.txt && \
     uv pip install -r requirements.txt && \
     export CMAKE_PREFIX_PATH="$(python3 -c 'import site; print(site.getsitepackages()[0])'):${CMAKE_PREFIX_PATH:-}" && \
-    pip wheel --no-build-isolation --no-deps . -w ${WHEELS} && \
-    rm -rf .git
+    pip wheel --no-build-isolation --no-deps . -w ${WHEELS}
 
 # Wheel inventory (visible in the build log for sanity).
 RUN ls -la ${WHEELS}/
