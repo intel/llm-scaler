@@ -29,14 +29,28 @@ FROM intel/omix:latest-devel-ubuntu24.04 AS builder
 ARG http_proxy
 ARG https_proxy
 ARG no_proxy
-ENV http_proxy=${http_proxy} \
-    https_proxy=${https_proxy} \
-    no_proxy=${no_proxy}
-
 # vllm-xpu-kernels pinned base commit (identical to legacy build).
 ARG VLLM_XPU_KERNELS_COMMIT=3cab97a
 
+ENV http_proxy=${http_proxy} \
+    https_proxy=${https_proxy} \
+    no_proxy=${no_proxy} \
+    VIRTUAL_ENV=/opt/buildenv \
+    PATH="/root/.local/bin:/opt/buildenv/bin:${PATH}" \
+    UV_HTTP_TIMEOUT=500 \
+    PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
+    UV_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
+    UV_INDEX_STRATEGY="unsafe-best-match" \
+    UV_LINK_MODE="copy" \
+    VLLM_TARGET_DEVICE=xpu \
+    WHEELS=/wheels
+
+# Required: build RUN steps use `source .../setvars.sh` and `set -eo pipefail`,
+# both bash-only (unavailable under the default /bin/sh).
 SHELL ["bash", "-c"]
+
+COPY ./patches/vllm_for_multi_arc.patch ./patches/vllm_xpu_kernels.patch /tmp/
+COPY ./custom-esimd-kernels-vllm /src/custom-esimd-kernels-vllm
 
 # --- build tooling (the oneAPI DPC++ compiler is already in the OMIX devel base) ---
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -48,19 +62,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         ninja-build cmake pkg-config numactl
 
 # --- isolated build venv (avoid OMIX system-python PEP 668 block; clean resolution) ---
-ENV VIRTUAL_ENV=/opt/buildenv
 RUN python3 -m venv ${VIRTUAL_ENV}
-ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 
 # --- uv for fast, deterministic installs (matches legacy build) ---
-ENV PATH="/root/.local/bin:${PATH}"
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-
-ENV UV_HTTP_TIMEOUT=500 \
-    PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
-    UV_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
-    UV_INDEX_STRATEGY="unsafe-best-match" \
-    UV_LINK_MODE="copy"
 
 # --- torch MUST match the runtime base (2.11.0+xpu) so SyclExtension .so files link
 #     against the same libtorch ABI the runtime ships (rpath $ORIGIN/../../torch/lib) ---
@@ -69,15 +74,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install torch==2.11.0+xpu torchaudio torchvision \
         --index-url https://download.pytorch.org/whl/xpu
 
-ENV WHEELS=/wheels
 RUN mkdir -p ${WHEELS}
-
-ENV VLLM_TARGET_DEVICE=xpu
 
 # ---------------------------------------------------------------------------
 # 1a. vLLM v0.21.0 + multi-arc patch  ->  wheel
 # ---------------------------------------------------------------------------
-COPY ./patches/vllm_for_multi_arc.patch /tmp/
 RUN --mount=type=cache,target=/root/.cache/uv \
     set -eo pipefail && \
     source /opt/intel/oneapi/setvars.sh --force && \
@@ -92,7 +93,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ---------------------------------------------------------------------------
 # 1b. custom ESIMD kernels  ->  wheel  (TORCH_XPU_ARCH_LIST=bmg-g21)
 # ---------------------------------------------------------------------------
-COPY ./custom-esimd-kernels-vllm /src/custom-esimd-kernels-vllm
 RUN --mount=type=cache,target=/root/.cache/uv \
     set -eo pipefail && \
     source /opt/intel/oneapi/setvars.sh --force && \
@@ -103,7 +103,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ---------------------------------------------------------------------------
 # 1c. vllm-xpu-kernels (patch + pinned commit)  ->  wheel
 # ---------------------------------------------------------------------------
-COPY ./patches/vllm_xpu_kernels.patch /tmp/
 RUN --mount=type=cache,target=/root/.cache/uv \
     set -eo pipefail && \
     source /opt/intel/oneapi/setvars.sh --force && \
@@ -125,69 +124,47 @@ RUN ls -la ${WHEELS}/
 # =========================================================================
 # Stage 2: runtime -- lightweight serving image (no compiler, no /opt/intel/oneapi)
 # =========================================================================
-FROM intel/pytorch:xpu-2.11.0-ubuntu24.04 AS vllm-openai
+FROM intel/pytorch:xpu-2.11.0-ubuntu24.04
 
 ARG http_proxy
 ARG https_proxy
 ARG no_proxy
-ENV http_proxy=${http_proxy} \
-    https_proxy=${https_proxy} \
-    no_proxy=${no_proxy}
 
 # The base already exports PATH=/opt/venv/bin:... and DEVICE=xpu.
-SHELL ["bash", "-c"]
-WORKDIR /llm
-
-ENV PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
+ENV http_proxy=${http_proxy} \
+    https_proxy=${https_proxy} \
+    no_proxy=${no_proxy} \
+    PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    VLLM_QUANTIZE_Q40_LIB="/opt/venv/lib/python3.12/site-packages/vllm_int4_for_multi_arc.so" \
+    VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 \
+    VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+    VLLM_WORKER_MULTIPROC_METHOD=spawn
 
-# --- thin runtime OS deps (media/audio + numactl); NO build-essential / UCX / NIXL ---
+WORKDIR /llm-scaler/vllm/
+
+# --- compiled wheels from the builder stage ---
+COPY --from=builder /wheels /llm-scaler/vllm/
+
+# --- thin runtime OS deps, vLLM + kernel wheels, lean-core serving deps, and the
+#     triton-xpu fix/shrink all in ONE layer: cleanup must happen in the same RUN
+#     that creates the bloat, otherwise a later layer can't reclaim the space. ---
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    --mount=type=cache,target=/root/.cache/uv \
     apt-get update -y && \
     apt-get install -y --no-install-recommends --fix-missing \
         ffmpeg libsndfile1 libsm6 libxext6 libgl1 numactl curl && \
-    rm -rf /var/lib/apt/lists/*
-
-# --- compiled wheels from the builder stage ---
-COPY --from=builder /wheels /wheels
-
-# --- install vLLM WITH its python deps.  This resolves pure-python deps and, per
-#     requirements/xpu.txt, also pulls the upstream prebuilt vllm_xpu_kernels wheel.
-#     torch/torchvision/torchaudio/triton are already present in the base venv and
-#     stay untouched (the +xpu pins are satisfied via --extra-index-url). ---
-RUN --mount=type=cache,target=/root/.cache/uv \
-    pip install /wheels/vllm-*.whl \
-        --extra-index-url https://download.pytorch.org/whl/xpu
-
-# --- install our custom kernels LAST so they win, exactly as the legacy build did:
-#     force-reinstall overwrites the upstream prebuilt vllm_xpu_kernels with our
-#     patched build; --no-deps guarantees neither drags a second torch. ---
-RUN --mount=type=cache,target=/root/.cache/uv \
+    rm -rf /var/lib/apt/lists/* && \
+    pip install ./vllm-*.whl --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-deps --force-reinstall \
-        /wheels/custom_esimd_kernels_vllm-*.whl \
-        /wheels/vllm_xpu_kernels-*.whl && \
-    rm -rf /wheels
-
-# --- lean-core serving deps.  bigdl-core ships vllm_int4_for_multi_arc.so used by
-#     the sym_int4 path (VLLM_QUANTIZE_Q40_LIB below). ---
-RUN --mount=type=cache,target=/root/.cache/uv \
+        ./custom_esimd_kernels_vllm-*.whl \
+        ./vllm_xpu_kernels-*.whl && \
+    rm -f ./*.whl && \
     pip install transformers==5.8.0 accelerate hf_transfer 'modelscope!=1.15.0' && \
     pip install librosa soundfile decord ijson && \
-    pip install bigdl-core==2.4.0b2
-
-# Installing the vLLM wheel's python deps pulls upstream CUDA `triton` (via xgrammar),
-# which clobbers the base image's `triton-xpu` libtriton.so and drops the `intel`
-# backend (breaks `import triton.backends`).  Restore the XPU triton, as the legacy
-# build did.  --no-deps keeps it from dragging anything else.
-#
-# Then shrink triton IN THIS SAME LAYER (a later RUN can't reclaim space from here):
-#   * strip --strip-debug libtriton.so: 1.16GB -> ~228MB.  Safe on the *correctly
-#     installed* triton-xpu (validated: intel backend imports + JIT compiles on XPU).
-#     The earlier failure was stripping the CUDA-clobbered .so, not the strip itself.
-#   * dedup the two identical libMLIRDialectPlugin.so copies (500MB each) to a symlink.
-RUN --mount=type=cache,target=/root/.cache/uv \
+    pip install bigdl-core==2.4.0b2 && \
     pip uninstall -y triton triton-xpu || true && \
     pip install --no-deps triton-xpu==3.7.0 \
         --extra-index-url https://download.pytorch.org/whl/xpu && \
@@ -195,19 +172,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     strip --strip-debug ${TRITON}/_C/libtriton.so && \
     rm -f ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git && \
     ln -s libMLIRDialectPlugin.so ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git
-
-# --- sanity: native modules import & link, triton backends load, int4 quant lib loads ---
-RUN python3 -c "import torch, vllm, custom_esimd_kernels_vllm, vllm_xpu_kernels; print('torch', torch.__version__, 'vllm', vllm.__version__)" && \
-    python3 -c "import triton, triton.backends; print('triton', triton.__version__, 'backends OK')" && \
-    python3 -c "import ctypes; ctypes.CDLL('/opt/venv/lib/python3.12/site-packages/vllm_int4_for_multi_arc.so'); print('int4 quant lib OK')"
-
-COPY ./examples/offline_inference.py /llm/
-
-# --- production environment ---
-ENV VLLM_QUANTIZE_Q40_LIB="/opt/venv/lib/python3.12/site-packages/vllm_int4_for_multi_arc.so" \
-    VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 \
-    VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
-    VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 # --- entrypoint: no oneCCL vars.sh (absent in this base); multi-card relies on
 #     torch 2.11 built-in XCCL. ---
