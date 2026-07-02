@@ -1,5 +1,5 @@
 diff --git a/custom_linear.py b/custom_linear.py
-index 9fe4762..0977968 100644
+index 9fe4762..5121746 100644
 --- a/custom_linear.py
 +++ b/custom_linear.py
 @@ -13,7 +13,7 @@ def apply_lora(weight: torch.Tensor, lora_diff_0: torch.Tensor, lora_diff_1: tor
@@ -20,6 +20,36 @@ index 9fe4762..0977968 100644
  
  @apply_single_lora.register_fake
  def _(weight, lora_diff, lora_strength):
+@@ -221,6 +221,10 @@ class CustomLinear(nn.Linear):
+ 
+         for idx, lora_diff_names in enumerate(self.lora_diffs):
+             lora_strength = self._get_lora_strength(idx)
++            if isinstance(lora_strength, torch.Tensor):
++                lora_strength = lora_strength.to(device=weight.device, dtype=weight.dtype)
++            else:
++                lora_strength = torch.tensor(lora_strength, device=weight.device, dtype=weight.dtype)
+ 
+             if isinstance(lora_diff_names, tuple):
+                 lora_diff_0 = getattr(self, lora_diff_names[0])
+@@ -239,7 +243,8 @@ class CustomLinear(nn.Linear):
+     def _prepare_weight(self, input):
+         """Prepare weight tensor - handles both regular and GGUF weights"""
+         if self.is_gguf:
+-            weight = dequantize_gguf_tensor(self.weight).to(self.compute_dtype)
++            target_dtype = self.compute_dtype if self.compute_dtype is not None else input.dtype
++            weight = dequantize_gguf_tensor(self.weight).to(device=input.device, dtype=target_dtype)
+         else:
+             weight = self.weight.to(input)
+         return weight
+@@ -248,7 +253,7 @@ class CustomLinear(nn.Linear):
+         weight = self._prepare_weight(input)
+ 
+         if self.bias is not None:
+-            bias = self.bias.to(input if not self.is_gguf else self.compute_dtype)
++            bias = self.bias.to(device=input.device, dtype=weight.dtype)
+         else:
+             bias = None
+ 
 diff --git a/wanvideo/modules/model.py b/wanvideo/modules/model.py
 index ce101d8..15ba0b9 100644
 --- a/wanvideo/modules/model.py
