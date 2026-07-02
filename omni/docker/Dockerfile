@@ -148,8 +148,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/ComfyUI/custom_nodes && \
     git clone --depth 1 https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git && \
     cd ComfyUI-nunchaku-XPU && \
-    git fetch --depth 1 origin 1b78483a6af31297d5291f61965502079aed3407 && \
-    git checkout 1b78483a6af31297d5291f61965502079aed3407 && \
+    git fetch --depth 1 origin 55b6497e5c5e4337d2de12943fd97a499bd9c2e5 && \
+    git checkout 55b6497e5c5e4337d2de12943fd97a499bd9c2e5 && \
     pip install -r requirements.txt && \
     pip install --no-deps kernels==0.14.0
 
