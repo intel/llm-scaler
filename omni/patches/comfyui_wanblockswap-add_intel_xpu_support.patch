@@ -1,0 +1,24 @@
+From aade73f11098ca3a7d700660c747bc9e394c22e0 Mon Sep 17 00:00:00 2001
+From: Haoming Zhang <haomingzh@126.com>
+Date: Tue, 30 Jun 2026 14:04:53 +0800
+Subject: [PATCH] add_intel_xpu_support
+
+---
+ nodes.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/nodes.py b/nodes.py
+index 098e542..931c4b7 100644
+--- a/nodes.py
++++ b/nodes.py
+@@ -27,7 +27,7 @@ class WanVideoBlockSwap:
+         
+         def swap_blocks(model: ModelPatcher, device_to, lowvram_model_memory, force_patch_weights, full_load):
+             base_model = model.model
+-            main_device=torch.device('cuda')
++            main_device=torch.device('xpu')
+             if isinstance(base_model, WAN21):
+                 unet = base_model.diffusion_model
+             for b, block in tqdm(enumerate(unet.blocks), total=len(unet.blocks), desc="Initializing block swap"):
+2.43.0
+
