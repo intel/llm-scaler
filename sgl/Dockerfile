@@ -1,98 +1,90 @@
-# Dockerfile for SGLang on Intel BMG (Battlemage)
-# Targets Qwen3.6-35B-A3B online fp8 inference.
-#
-# Build:
-#   docker build -t llm-scaler-sgl:bmg \
-#     --build-arg http_proxy=$http_proxy \
-#     --build-arg https_proxy=$https_proxy \
-#     llm-scaler/sgl
-#
-# Run (TP=4 example):
-#   docker run --rm -it --device=/dev/dri --shm-size=16g \
-#     -v /path/to/Qwen3.6-35B-A3B:/models/Qwen3.6-35B-A3B:ro \
-#     -p 30000:30000 \
-#     llm-scaler-sgl:bmg \
-#     /workspace/scripts/run_qwen3_6.sh
-
-FROM amr-registry.caas.intel.com/intelanalytics/llm-scaler-platform:26.24.9.1
+# ======== Build Stage ========
+FROM intel/omix:latest-devel-ubuntu24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
-
 ARG http_proxy
 ARG https_proxy
 ARG no_proxy=localhost,127.0.0.1,::1
-ENV http_proxy=${http_proxy}
-ENV https_proxy=${https_proxy}
-ENV no_proxy=${no_proxy}
-
-# AOT-compile ESIMD kernels for BMG only (skip multi-arch fat binaries
-# that would pull in dpas v128 paths unsupported on XeLPG).
 ARG DPCPP_SYCL_TARGET=bmg
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV http_proxy=${http_proxy} https_proxy=${https_proxy} no_proxy=${no_proxy}
 ENV TORCH_XPU_ARCH_LIST=${DPCPP_SYCL_TARGET}
+ENV OMNI_XPU_DEVICE=${DPCPP_SYCL_TARGET}
+ENV MAX_JOBS=1
 
-ARG SGLANG_REPO=https://github.com/analytics-zoo/sglang.git
-ARG SGLANG_BRANCH=dev-bmg
-ARG SGL_KERNEL_REPO=https://github.com/analytics-zoo/sgl-kernel-xpu.git
-ARG SGL_KERNEL_BRANCH=dev-bmg
+WORKDIR /llm-scaler/sgl
+COPY . .
 
-# ----- system + python -----
-RUN apt-get update && \
-    apt-get install -y python3-pip python3-dev git && \
-    rm -rf /var/lib/apt/lists/* && \
-    python3 -m pip config set global.break-system-packages true
+# --- System packages + pip base setup ---
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3-pip python3-dev git \
+ && python3 -m pip config set global.break-system-packages true \
+ && pip3 install ninja \
+ && pip3 install torch==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu \
+ && rm -rf /root/.cache /root/.cmake /tmp/* /var/tmp/* /var/lib/apt/lists/*
 
-RUN pip3 install torch==2.12.0+xpu torchvision==0.27.0+xpu torchaudio==2.11.0+xpu \
-      triton-xpu==3.7.1 \
-      --index-url https://download.pytorch.org/whl/xpu
+# --- Build sgl-kernel-xpu wheel ---
+RUN git clone --depth 1 -b dev-bmg https://github.com/analytics-zoo/sgl-kernel-xpu.git /root/sk \
+ && pip3 wheel -v /root/sk --config-settings=cmake.define.DPCPP_SYCL_TARGET=${DPCPP_SYCL_TARGET} --wheel-dir /root/wheels --no-deps \
+ && rm -rf /root/sk \
+ && rm -rf /root/.cache /root/.cmake /tmp/* /var/tmp/* /var/lib/apt/lists/*
 
-# ----- sgl-kernel-xpu -----
-# dev-bmg already carries the BMG fixes (mha_fwd init, gdn_attention,
-# rms_norm_gated bf16/fp16, fp8 per-tensor quant graph-capture fix, ...).
-RUN git clone -b ${SGL_KERNEL_BRANCH} ${SGL_KERNEL_REPO} /root/sgl-kernel-xpu && \
-    cd /root/sgl-kernel-xpu && \
-    pip3 install -v . \
-        --config-settings=cmake.define.DPCPP_SYCL_TARGET=${DPCPP_SYCL_TARGET} && \
-    rm -rf /root/sgl-kernel-xpu
+# --- Build sglang wheel ---
+RUN git clone --depth 1 -b dev-bmg https://github.com/analytics-zoo/sglang.git /root/sglang \
+ && cd /root/sglang/python \
+ && cp pyproject_xpu.toml pyproject.toml \
+ && sed -i '/sgl-kernel/d;/torch==/d;/torchaudio==/d;/torchvision==/d;/torchao==/d' pyproject.toml \
+ && pip3 wheel -v . --wheel-dir /root/wheels --no-deps \
+ && rm -rf /root/sglang \
+ && rm -rf /root/.cache /root/.cmake /tmp/* /var/tmp/* /var/lib/apt/lists/*
 
-# ----- sglang (dev-bmg) -----
-# Carries ESIMD fast-paths (decode attn, MoE fp8, fp8 GEMM, QKV split-norm-rope,
-# GDN conv fused_seq, RMSNormGated SYCL), fp8 e5m2 weight dtype, XPU Graph
-# scaffold + Qwen3.5/3.6 capture wiring.
-RUN git clone -b ${SGLANG_BRANCH} ${SGLANG_REPO} /root/sglang && \
-    cd /root/sglang/python && \
-    cp pyproject_xpu.toml pyproject.toml && \
-    sed -i '/sgl-kernel/d' pyproject.toml && \
-    sed -i '/torch==/d' pyproject.toml && \
-    sed -i '/torchaudio==/d' pyproject.toml && \
-    sed -i '/torchvision==/d' pyproject.toml && \
-    sed -i '/torchao==/d' pyproject.toml && \
-    pip3 install . --extra-index-url https://download.pytorch.org/whl/xpu && \
-    pip3 install --no-deps xgrammar==0.1.33 || true && \
-    rm -rf /root/sglang
+# --- Build custom ESIMD kernels ---
+RUN . /opt/intel/oneapi/setvars.sh --force \
+ && cd /llm-scaler/sgl/custom-esimd-kernels \
+ && CXX=icpx pip3 wheel -v . --wheel-dir /root/wheels --no-deps --no-build-isolation \
+ && cd /llm-scaler/sgl/custom-esimd-kernels-sglang \
+ && CXX=icpx pip3 wheel -v . --wheel-dir /root/wheels --no-deps --no-build-isolation \
+ && rm -rf /root/.cache /root/.cmake /tmp/* /var/tmp/* /var/lib/apt/lists/*
 
-# ----- ESIMD kernel packages -----
-# Two flavours, both required:
-#   * custom-esimd-kernels        — sglang decode attn, fp8 GEMM, fp8 MoE silu
-#   * custom-esimd-kernels-sglang — Qwen3.5/3.6 fused QKV, GDN conv fused_seq,
-#                                   RMSNormGated ESIMD variant
-COPY custom-esimd-kernels        /workspace/custom-esimd-kernels
-COPY custom-esimd-kernels-sglang /workspace/custom-esimd-kernels-sglang
+# ======== Runtime Stage ========
+FROM intel/pytorch:xpu-2.11.0-ubuntu24.04
 
-# Build is single-threaded on purpose: the three SyclExtension targets share
-# one build.ninja under build/temp.../ and parallel writes corrupt it.
-RUN cd /workspace/custom-esimd-kernels && \
-    CXX=icpx python3 setup.py build_ext --inplace -j 1 && \
-    pip3 install -e . --no-build-isolation
+ENV DEBIAN_FRONTEND=noninteractive
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy=localhost,127.0.0.1,::1,intel.com,.intel.com
+ARG DPCPP_SYCL_TARGET=bmg
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV http_proxy=${http_proxy} https_proxy=${https_proxy} no_proxy=${no_proxy}
+ENV TORCH_XPU_ARCH_LIST=${DPCPP_SYCL_TARGET}
+ENV OMNI_XPU_DEVICE=${DPCPP_SYCL_TARGET}
 
-RUN cd /workspace/custom-esimd-kernels-sglang && \
-    CXX=icpx python3 setup.py build_ext --inplace -j 1 && \
-    pip3 install -e . --no-build-isolation
+WORKDIR /llm-scaler/sgl
+COPY . .
 
-# ----- runtime helpers -----
-RUN pip3 install pytest expecttest ray huggingface_hub
+# Single RUN: install UMD driver (BMG) + all pre-built wheels via bind-mounted /root/wheels
+# (no COPY layer for wheels -> ~400 MB saved), then strip + prune caches/bytecode.
+RUN --mount=type=bind,from=builder,source=/root/wheels,target=/tmp/wheels \
+    export no_proxy=localhost,127.0.0.1,::1 \
+ # --- Intel BMG user-mode driver (pytorch base does not bundle it) ---
+ && apt-get update \
+ && apt-get install -y --no-install-recommends software-properties-common python3-pip \
+ && add-apt-repository -y ppa:kobuk-team/intel-graphics \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+        libze-intel-gpu1 libze1 intel-metrics-discovery intel-opencl-icd clinfo intel-gsc \
+        libze-dev \
+ # --- Python deps: pre-built wheels + explicit runtime deps sglang needs ---
+ && python3 -m pip config set global.break-system-packages true \
+ && pip3 install /tmp/wheels/*.whl --extra-index-url https://download.pytorch.org/whl/xpu \
+ && pip3 install --no-deps xgrammar==0.1.33 || true \
+ && chmod +x /llm-scaler/sgl/scripts/*.sh \
+ # --- Size cleanup: drop caches + bytecode ---
+ && find /opt/venv /usr/local/lib/python3* -name "*.pyc" -delete 2>/dev/null || true \
+ && find /opt/venv /usr/local/lib/python3* -name "__pycache__" -type d \
+        -exec rm -rf {} + 2>/dev/null || true \
+ && find /tmp -mindepth 1 -maxdepth 1 ! -name wheels -exec rm -rf {} + \
+ && rm -rf /root/.cache /root/.cmake /var/tmp/* /var/lib/apt/lists/*
 
-COPY scripts /workspace/scripts
-RUN chmod +x /workspace/scripts/*.sh
-
-WORKDIR /workspace
 CMD ["bash"]
+

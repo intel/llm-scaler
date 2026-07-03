@@ -18,7 +18,9 @@ echo "Building ${IMAGE_TAG} from ${SGL_DIR}"
 echo "  http_proxy=${http_proxy:-<unset>}"
 echo "  https_proxy=${https_proxy:-<unset>}"
 
-exec docker build -t "${IMAGE_TAG}" \
+export DOCKER_BUILDKIT=1
+
+exec docker buildx build --load -t "${IMAGE_TAG}" \
     --build-arg "http_proxy=${http_proxy:-}" \
     --build-arg "https_proxy=${https_proxy:-}" \
     "${SGL_DIR}"
