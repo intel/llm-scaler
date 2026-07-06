@@ -1963,7 +1963,7 @@ index a5d4e4db7..a9f1eaa09 100644
  
  class LayerNorm(nn.Module):
 diff --git a/vllm/model_executor/layers/mamba/gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn_linear_attn.py
-index 4493ee783..35bedcd7d 100644
+index 4493ee783..fb0e235c7 100644
 --- a/vllm/model_executor/layers/mamba/gdn_linear_attn.py
 +++ b/vllm/model_executor/layers/mamba/gdn_linear_attn.py
 @@ -37,6 +37,15 @@ from vllm.model_executor.layers.linear import (
@@ -2218,7 +2218,7 @@ index 4493ee783..35bedcd7d 100644
      def forward_xpu(
          self,
          hidden_states: torch.Tensor,
-@@ -797,30 +1028,235 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
+@@ -797,30 +1028,247 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
          # ============================================================
          # Part 1: Input Projection
          # ============================================================
@@ -2260,7 +2260,19 @@ index 4493ee783..35bedcd7d 100644
 +            )
 +            projected_states_qkvz = self._int4_qkvz_buf
 +            projected_states_ba = self._int4_ba_buf
-+        elif num_tokens <= 64 and self._gdn_proj_int4_esimd_ok:
++        elif (
++            num_tokens <= 64
++            and self._gdn_proj_int4_esimd_ok
++            # esimd_gemm_int4_pgrp requires N % 16 == 0 (DPAS N tile). GDN
++            # in_proj_ba has N = 2 * num_v_heads/tp (e.g. 24 for Qwen3.6-27B
++            # TP=4), not a multiple of 16, so it TORCH_CHECK-fails here --
++            # notably in XPU-graph capture dummy_run (num_tokens=2..8). Fall
++            # through to the upstream GEMM below when either projection N is
++            # not tile-aligned. The M==1 decode path above uses the GEMV
++            # kernel, which has no such constraint.
++            and self.in_proj_qkvz.weight_esimd.shape[0] % 16 == 0
++            and self.in_proj_ba.weight_esimd.shape[0] % 16 == 0
++        ):
 +            from vllm.model_executor.layers.esimd_utils import esimd_gemm_int4_pgrp
 +            dev = hidden_states.device
 +            N_qkvz = self.in_proj_qkvz.weight_esimd.shape[0]
@@ -2468,7 +2480,7 @@ index 4493ee783..35bedcd7d 100644
          z_shape_og = z.shape
          # Reshape input data into 2D tensor
          core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-@@ -830,6 +1266,152 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
+@@ -830,6 +1278,152 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
          core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
          output[:num_tokens], _ = self.out_proj(core_attn_out)
  
@@ -10000,7 +10012,7 @@ index 1e74e4c48..89791eb42 100644
          try:
              from vllm.vllm_flash_attn.flash_attn_interface import (
 diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
-index 4b8b86d86..0026d2195 100755
+index 4b8b86d86..79adb0b4c 100755
 --- a/vllm/v1/attention/backends/flash_attn.py
 +++ b/vllm/v1/attention/backends/flash_attn.py
 @@ -3,6 +3,8 @@
@@ -10244,7 +10256,7 @@ index 4b8b86d86..0026d2195 100755
      ) -> torch.Tensor:
          """Forward pass with FlashAttention.
  
-@@ -806,6 +1012,159 @@ class FlashAttentionImpl(AttentionImpl):
+@@ -806,6 +1012,166 @@ class FlashAttentionImpl(AttentionImpl):
                      if self.sliding_window is not None
                      else None
                  )
@@ -10267,6 +10279,13 @@ index 4b8b86d86..0026d2195 100755
 +                    and attn_metadata.max_query_len == 1
 +                    and self.head_size == 256
 +                    and _gqa_check >= 2
++                    # esimd page_attn_decode has NO sliding-window arg; it
++                    # attends the FULL cached KV. Sliding-window layers (e.g.
++                    # gemma4 sliding, window=1024, hd=256, GQA=2) MUST NOT take
++                    # this path or decode attends beyond the window once
++                    # seqlen>window -> progressive garbage on long context.
++                    # Route them to flash_attn_varlen_func (passes window_size).
++                    and sliding_window_size is None
 +                ):
 +                    try:
 +                        eagle_ops = importlib.import_module(
