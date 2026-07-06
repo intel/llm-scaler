@@ -24,7 +24,7 @@
 # =========================================================================
 # Stage 1: builder -- compile every native wheel with the oneAPI toolchain
 # =========================================================================
-FROM intel/omix:latest-devel-ubuntu24.04 AS builder
+FROM intel/omix:0.2.0-devel-ubuntu24.04 AS builder
 
 ARG http_proxy
 ARG https_proxy
