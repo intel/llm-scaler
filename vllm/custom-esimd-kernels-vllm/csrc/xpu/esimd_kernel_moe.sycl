@@ -171,12 +171,29 @@ at::Tensor esimd_moe_gemm_fp8_blockscale(
     TORCH_CHECK(K % block_k == 0,
                 "esimd_moe_gemm_fp8_blockscale: K must be a multiple of block_k(128)");
     auto& q = get_device_queue(input);
+
+    // Active-experts-only grid: only min(num_experts, total_tokens) experts can
+    // be non-empty this call. Compact their ids so the main grid launches
+    // n_active*N work-groups instead of num_experts*N (~99% empty at decode).
+    const int64_t total_tokens = input.size(0);
+    const int n_active =
+        (int)std::min<int64_t>(num_experts, total_tokens);
+    auto active_experts = at::full(
+        {std::max(n_active, 1)}, (int64_t)num_experts,
+        input.options().dtype(at::kInt));
+    if (n_active > 0) {
+        fp8_moe_blockscale::build_active_experts(
+            reinterpret_cast<const uint32_t*>(expert_idx.data_ptr()),
+            active_experts.data_ptr<int32_t>(), (int)num_experts, q);
+    }
+
     fp8_moe_blockscale::moe_gemm_fp8_blockscale_host(
         reinterpret_cast<const fp16*>(input.data_ptr()),
         reinterpret_cast<const uint8_t*>(weight.data_ptr()),
         weight_scale.data_ptr<float>(),
         reinterpret_cast<fp16*>(output.data_ptr()),
         reinterpret_cast<const uint32_t*>(expert_idx.data_ptr()),
+        active_experts.data_ptr<int32_t>(), n_active,
         (int)N, (int)K, (int)num_experts, (int)block_n, (int)block_k, q);
     return output;
 }
