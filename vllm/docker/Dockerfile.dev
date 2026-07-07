@@ -10,7 +10,7 @@
 #              26.14.37833.4, libze_loader 1.28.2, libigc2 2.32.7, libigdgmm 22.10.0.
 #              Verified byte-identical -> this image can BOTH compile and run on GPU.
 #
-# Relationship to prod (docker/Dockerfile, released as v0.21.0-omix-pr508):
+# Relationship to prod (docker/Dockerfile):
 #   prod is a 2-stage build that ships a stripped, cleaned runtime WITHOUT a compiler.
 #   Great for size, painful to debug.  This dev image keeps EVERYTHING:
 #     * the oneAPI compiler + GPU runtime (base already has both)
