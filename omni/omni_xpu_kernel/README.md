@@ -134,7 +134,7 @@ output = rotary.rotary_emb(x, cos_cache, sin_cache, seq_len, heads)
 - Intel oneAPI DPC++/C++ Compiler (icpx)
 - PyTorch >= 2.0 with XPU support
 - Intel GPU: Arc B-series (BMG), Data Center GPU Max (PVC), or compatible
-- oneDNN (for INT4/FP8 GEMM; auto-detected from oneAPI)
+- oneDNN (for INT4/FP8 GEMM; auto-detected from oneAPI when enabled)
 
 ## Installation
 
@@ -150,6 +150,30 @@ OMNI_XPU_DEVICE=pvc pip install -e . --no-build-isolation   # Data Center GPU Ma
 ```
 
 On Windows, see [WHL_BUILD_INSTALL.md](WHL_BUILD_INSTALL.md).
+
+### Windows status
+
+Windows wheel build and runtime validation currently use this known-good stack:
+
+| Component | Version |
+| --- | --- |
+| Python | 3.12 |
+| PyTorch | `2.10.0+xpu` |
+| torchvision | `0.25.0+xpu` |
+| torchaudio | `2.10.0+xpu` |
+| oneAPI compiler | `2025.3` |
+| Intel XPU runtime | `2025.3.x` |
+| MSVC toolchain | VS 2022 Build Tools |
+
+The critical Windows requirement is **compiler/runtime alignment**. Building with a newer oneAPI compiler and loading into an older PyTorch XPU runtime can fail at import time or surface misleading runtime errors.
+
+Current Windows guidance:
+
+- set `OMNI_XPU_ONEAPI_VERSION=2025.3`
+- use `OMNI_XPU_DEVICE=bmg` unless you are targeting another validated device
+- keep `OMNI_XPU_ENABLE_ONEDNN=0` unless you are explicitly validating oneDNN-backed kernels on Windows
+
+The package now also configures Windows DLL search paths for the active Python runtime, `torch\lib`, and the oneAPI compiler locale directory. See [WHL_BUILD_INSTALL.md](WHL_BUILD_INSTALL.md) for the full build, install, and troubleshooting guide.
 
 ## Debug Logging
 
@@ -211,8 +235,8 @@ To switch config at compile time: `-DSDP_CONFIG_PVC`
 ### Build System
 
 The package builds multiple extension modules:
-- `_C.so` — Main extension (norm, gguf, svdq, rotary, sdp loader, fp8)
-- `lgrf_sdp.so` — SDP ESIMD sidecar (AOT, doubleGRF)
+- `_C.so` / `_C.pyd` — Main extension (norm, gguf, svdq, rotary, sdp loader, fp8)
+- `lgrf_sdp.so` / `lgrf_sdp*.pyd` — SDP ESIMD sidecar (AOT, doubleGRF)
 
 ## License
 

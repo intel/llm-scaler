@@ -17,12 +17,63 @@ Usage::
 
 import os
 import sys
+from pathlib import Path
 
 __version__ = "0.1.0"
 __author__ = "Intel"
 
 # Lazy loading of native extension
 _native_module = None
+_dll_dir_handles = []
+_dll_dir_paths = set()
+
+
+def _add_windows_dll_directory(path: Path) -> None:
+    """Register a DLL search path and keep the handle alive for process lifetime."""
+    if not path.is_dir():
+        return
+
+    resolved = path.resolve()
+    if resolved in _dll_dir_paths:
+        return
+
+    handle = os.add_dll_directory(str(resolved))
+    _dll_dir_handles.append(handle)
+    _dll_dir_paths.add(resolved)
+
+
+def _configure_windows_dll_search_paths() -> None:
+    """Ensure the active Python environment's runtime DLLs are discoverable."""
+    if sys.platform != "win32":
+        return
+
+    python_root = Path(sys.executable).resolve().parent
+    _add_windows_dll_directory(python_root / "Library" / "bin")
+    _add_windows_dll_directory(python_root / "DLLs")
+
+    program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"))
+    oneapi_root = program_files_x86 / "Intel" / "oneAPI" / "compiler"
+    preferred_version = os.environ.get("OMNI_XPU_ONEAPI_VERSION")
+    locale_dirs = []
+    if preferred_version:
+        locale_dirs.append(oneapi_root / preferred_version / "bin" / "1033")
+    if oneapi_root.is_dir():
+        locale_dirs.extend(sorted(oneapi_root.glob("*\\bin\\1033"), reverse=True))
+    for locale_dir in locale_dirs:
+        _add_windows_dll_directory(locale_dir)
+
+    try:
+        import torch
+
+        torch_root = Path(torch.__file__).resolve().parent
+        _add_windows_dll_directory(torch_root / "lib")
+    except Exception:
+        pass
+
+    extra_dirs = os.environ.get("OMNI_XPU_DLL_DIRS", "")
+    for raw_path in extra_dirs.split(os.pathsep):
+        if raw_path:
+            _add_windows_dll_directory(Path(raw_path))
 
 def _load_extension():
     """Load the native C++ extension module."""
@@ -31,6 +82,7 @@ def _load_extension():
         return _native_module
     
     try:
+        _configure_windows_dll_search_paths()
         from omni_xpu_kernel import _C
         _native_module = _C
         return _native_module
