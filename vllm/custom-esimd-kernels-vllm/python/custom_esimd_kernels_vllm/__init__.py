@@ -56,6 +56,7 @@ from custom_esimd_kernels_vllm.ops import (
     esimd_moe_gemm_fp8,
     esimd_moe_gemm_fp8_pert,
     esimd_gemm_fp8_pert,
+    esimd_gemm_fp8_blockscale,
     # Eagle ops
     eagle_gdn,
     eagle_page_attn_decode,

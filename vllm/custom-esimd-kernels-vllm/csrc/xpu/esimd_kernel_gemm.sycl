@@ -13,6 +13,7 @@
 
 #include "esimd_kernels/fp8_GEMM_pert.h"
 #include "esimd_kernels/int4_GEMM.h"
+#include "esimd_kernels/fp8_GEMM_blockscale.h"
 
 #define EXTRACT_PTR(var, tensor) auto var = reinterpret_cast<uint8_t*>(tensor.data_ptr())
 
@@ -84,5 +85,53 @@ at::Tensor esimd_gemm_int4_pgrp(
         reinterpret_cast<const fp16*>(p_sc),
         reinterpret_cast<fp16*>(p_out),
         (uint32_t)M, (uint32_t)N, (uint32_t)K, dpcpp_queue);
+    return output;
+}
+
+// ---- FP8 block-scaled GEMM (DeepSeek 128x128 weight block scale, w8a16) ----
+// input: [M, K] fp16, weight: [N, K] fp8_e4m3 (uint8 bits),
+// weight_scale: [ceil(N/block_n), ceil(K/block_k)] fp32 (== weight_scale_inv),
+// output: [M, N] fp16 pre-allocated. Activation stays fp16 (no act quant).
+at::Tensor esimd_gemm_fp8_blockscale(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output, int64_t block_n, int64_t block_k) {
+    int64_t M = input.size(0);
+    int64_t N = weight.size(0);
+    int64_t K = weight.size(1);
+
+    TORCH_CHECK(input.scalar_type() == at::ScalarType::Half,
+                "esimd_gemm_fp8_blockscale: input must be fp16");
+    TORCH_CHECK(weight.scalar_type() == at::ScalarType::Float8_e4m3fn ||
+                    weight.scalar_type() == at::ScalarType::Byte,
+                "esimd_gemm_fp8_blockscale: weight must be fp8_e4m3 (or uint8 bits)");
+    TORCH_CHECK(weight_scale.scalar_type() == at::ScalarType::Float,
+                "esimd_gemm_fp8_blockscale: weight_scale must be float32");
+    TORCH_CHECK(output.scalar_type() == at::ScalarType::Half,
+                "esimd_gemm_fp8_blockscale: output must be fp16");
+    TORCH_CHECK(block_n == 128 && block_k == 128,
+                "esimd_gemm_fp8_blockscale: only 128x128 weight blocks supported, got ",
+                block_n, "x", block_k);
+    TORCH_CHECK(K % block_k == 0,
+                "esimd_gemm_fp8_blockscale: K must be a multiple of block_k(128), got K=", K);
+    const int64_t Nb = (N + block_n - 1) / block_n;
+    const int64_t Kb = (K + block_k - 1) / block_k;
+    TORCH_CHECK(weight_scale.size(0) == Nb && weight_scale.size(1) == Kb,
+                "esimd_gemm_fp8_blockscale: weight_scale shape mismatch; expected [",
+                Nb, ", ", Kb, "], got [", weight_scale.size(0), ", ",
+                weight_scale.size(1), "]");
+    TORCH_CHECK(output.size(0) == M && output.size(1) == N,
+                "esimd_gemm_fp8_blockscale: output shape mismatch; expected [", M,
+                ", ", N, "]");
+
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_w, weight);
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    fp8_blockscale::gemm_fp8_blockscale_host(
+        reinterpret_cast<const fp16*>(p_in),
+        reinterpret_cast<const uint8_t*>(p_w),
+        reinterpret_cast<const float*>(p_sc),
+        reinterpret_cast<fp16*>(p_out),
+        (uint32_t)M, (uint32_t)N, (uint32_t)K,
+        (uint32_t)block_n, (uint32_t)block_k, dpcpp_queue);
     return output;
 }
