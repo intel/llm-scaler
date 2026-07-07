@@ -698,6 +698,29 @@ def esimd_gemm_fp8_pert(
     return _ops.esimd_gemm_fp8_pert(input, weight, weight_scale, output)
 
 
+def esimd_gemm_fp8_blockscale(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor, block_n: int = 128, block_k: int = 128,
+) -> torch.Tensor:
+    """FP8 block-scaled GEMM (DeepSeek-style), w8a16 (fp16 activation).
+
+    Computes: output[M, N] = input[M, K] @ dequant(weight[N, K])^T
+    where the fp8_e4m3 weight is dequantized with a 2D 128x128 block scale
+    (weight_scale[nb, kb] scales the 128x128 weight block). The activation is
+    NOT quantized — it is consumed in fp16 directly.
+
+    input:        [M, K]                         fp16
+    weight:       [N, K]                         fp8_e4m3 (or uint8 bits)
+    weight_scale: [ceil(N/128), ceil(K/128)]     float32  (== weight_scale_inv)
+    output:       [M, N]                         fp16 — pre-allocated
+
+    M, N, K inferred from tensor shapes. K must be a multiple of block_k (128).
+    Only block_n == block_k == 128 is currently supported.
+    """
+    return _ops.esimd_gemm_fp8_blockscale(
+        input, weight, weight_scale, output, block_n, block_k)
+
+
 def esimd_moe_gemm_fp8_pert(
     input: torch.Tensor,
     weight: torch.Tensor,

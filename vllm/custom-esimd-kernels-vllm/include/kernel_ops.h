@@ -248,6 +248,14 @@ at::Tensor esimd_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output);
 
+// FP8 block-scaled GEMM (DeepSeek-style 128x128 weight block scale, w8a16):
+// input [M, K] fp16, weight [N, K] fp8_e4m3, weight_scale [ceil(N/128), ceil(K/128)]
+// fp32 (== weight_scale_inv), output [M, N] fp16. Activation stays fp16 (no
+// activation quantization). M, N, K auto-detected from tensor shapes.
+at::Tensor esimd_gemm_fp8_blockscale(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output, int64_t block_n, int64_t block_k);
+
 // ======================== INT4 GEMV ========================
 // Symmetric INT4 weight GEMV with per-group scale (group_size=128).
 // Optimized for decode (M=1). FP32 accumulation → fp16 output.
