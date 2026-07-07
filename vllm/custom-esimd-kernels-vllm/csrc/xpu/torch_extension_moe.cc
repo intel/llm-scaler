@@ -48,6 +48,12 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
         "Tensor output, Tensor expert_idx, "
         "int N, int K, int num_experts, int max_tokens_per_expert) -> Tensor");
   m.impl("esimd_moe_gemm_fp8_pert", torch::kXPU, &esimd_moe_gemm_fp8_pert);
+
+  m.def("esimd_moe_gemm_fp8_blockscale(Tensor input, Tensor weight, "
+        "Tensor weight_scale, Tensor output, Tensor expert_idx, "
+        "int N, int K, int num_experts, int block_n, int block_k) -> Tensor");
+  m.impl("esimd_moe_gemm_fp8_blockscale", torch::kXPU,
+         &esimd_moe_gemm_fp8_blockscale);
 }
 
 PyMODINIT_FUNC PyInit_custom_esimd_kernels_moe() {

@@ -242,6 +242,15 @@ at::Tensor esimd_moe_gemm_fp8(
     at::Tensor output, at::Tensor expert_idx,
     int64_t N, int64_t K, int64_t num_experts, int64_t max_tokens_per_expert);
 
+// MoE grouped block-scaled FP8 GEMM (DeepSeek 128x128 weight block, w8a16):
+// input [total_tokens, K] fp16, weight [E, N, K] fp8_e4m3, weight_scale
+// [E, ceil(N/128), ceil(K/128)] fp32 (== weight_scale_inv), output
+// [total_tokens, N] fp16, expert_idx [E+1] uint32 token start offsets.
+at::Tensor esimd_moe_gemm_fp8_blockscale(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output, at::Tensor expert_idx,
+    int64_t N, int64_t K, int64_t num_experts, int64_t block_n, int64_t block_k);
+
 // FP8 GEMM per-tensor scale: input [M, K] fp16, weight [N, K] fp8, output [M, N] fp16
 // Auto-dispatches: M<=3 → batched GEMV, M>=2 E4M3 → DPAS V9, else → WS
 at::Tensor esimd_gemm_fp8_pert(

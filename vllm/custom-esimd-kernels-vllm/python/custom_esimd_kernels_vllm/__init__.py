@@ -54,6 +54,7 @@ from custom_esimd_kernels_vllm.ops import (
     moe_forward_full_gelu_tanh,
     esimd_moe_gather,
     esimd_moe_gemm_fp8,
+    esimd_moe_gemm_fp8_blockscale,
     esimd_moe_gemm_fp8_pert,
     esimd_gemm_fp8_pert,
     esimd_gemm_fp8_blockscale,
