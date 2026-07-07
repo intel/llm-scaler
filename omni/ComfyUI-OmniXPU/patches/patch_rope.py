@@ -95,4 +95,32 @@ def apply():
                     pass
         log.info("[OmniXPU] rope: rebound %d by-value imports of apply_rope1", rebound)
 
+    # ── Krea2-only: dual-tensor apply_rope ───────────────────────────────────
+    # comfy.ldm.krea2.model.Attention calls the TOP-LEVEL
+    # comfy.ldm.flux.math.apply_rope(q, k, freqs), whose inference branch
+    # forwards to comfy_kitchen.ck.apply_rope. The single-tensor apply_rope1
+    # patch above never gets hit for Krea2. To accelerate Krea2 -- and ONLY
+    # Krea2 -- we rebind the apply_rope name that comfy.ldm.krea2.model imported
+    # by value at module top-level. We deliberately do NOT touch
+    # flux_math.apply_rope, so every other model (flux, lumina, hidream, sam3,
+    # triposplat, lens, pixeldit) keeps its original rope path unchanged.
+    try:
+        import comfy.ldm.krea2.model as _krea2_model
+    except ImportError:
+        _krea2_model = None
+    if _krea2_model is not None and getattr(_krea2_model, "apply_rope", None) is not None:
+        _orig_krea2_apply_rope = _krea2_model.apply_rope
+
+        def _krea2_apply_rope(xq, xk, freqs_cis):
+            # Engage the omni ESIMD rotary kernel only when eligible (kernel
+            # loaded, XPU tensors, head_dim in {64,128}, 4D q/k, freqs ndim == 6);
+            # otherwise fall back to the original apply_rope.
+            if (_can_use(xq) and _can_use(xk) and xq.ndim == 4 and xk.ndim == 4
+                    and freqs_cis.ndim == 6):
+                return _omni_apply_rope1(xq, freqs_cis), _omni_apply_rope1(xk, freqs_cis)
+            return _orig_krea2_apply_rope(xq, xk, freqs_cis)
+
+        _krea2_model.apply_rope = _krea2_apply_rope
+        log.info("[OmniXPU] rope: patched Krea2 apply_rope (Krea2-only)")
+
     return True, None

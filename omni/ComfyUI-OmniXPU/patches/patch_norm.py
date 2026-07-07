@@ -174,4 +174,36 @@ def apply():
     except (ImportError, AttributeError):
         pass  # comfy.rmsnorm may not exist in all versions
 
+    # --- Krea2 local RMSNorm ---
+    # comfy.ldm.krea2.model defines its OWN RMSNorm(nn.Module) that calls
+    # torch F.rms_norm directly, using the (1 + scale) weight convention and
+    # fp32 accumulation. It uses neither comfy.ops.RMSNorm nor
+    # comfy.rmsnorm.rms_norm, so the patches above never reach it. Hijack its
+    # forward to use the omni ESIMD kernel (which also supports fp32), while
+    # preserving the exact numerics: weight = scale.float() + 1.0, fp32 compute,
+    # cast back to the input dtype.
+    try:
+        import comfy.ldm.krea2.model as _krea2_model
+
+        _KreaRMS = _krea2_model.RMSNorm
+
+        def _krea2_rms_forward(self, x):
+            dtype = x.dtype
+            weight = comfy.model_management.cast_to(
+                self.scale, dtype=torch.float32, device=x.device) + 1.0
+            h = x.shape[-1]
+            if (_omni_norm is not None and x.is_xpu and x.ndim >= 2
+                    and h <= 8192 and h % 32 == 0):
+                _log_first("Krea2RMSNorm", x.shape)
+                orig = x.shape
+                x_2d = x.float().reshape(-1, h).contiguous()
+                return _omni_norm.rms_norm(weight, x_2d, self.eps).reshape(orig).to(dtype)
+            return torch.nn.functional.rms_norm(
+                x.float(), (h,), weight=weight, eps=self.eps).to(dtype)
+
+        _KreaRMS.forward = _krea2_rms_forward
+        log.info("[OmniXPU] norm: patched Krea2 local RMSNorm.forward")
+    except (ImportError, AttributeError):
+        pass  # krea2 model not present in this ComfyUI version
+
     return True, None
