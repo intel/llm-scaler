@@ -23,6 +23,8 @@ COPY ./patches/extension_comfyui_reactor.patch /tmp/
 COPY ./patches/extension_comfyui_rmbg.patch /tmp/
 COPY ./patches/extension_SenseNova-U1.patch /tmp
 COPY ./patches/extension_comfyui-advancedliveportrait.patch /tmp
+COPY ./patches/extension_comfyui_unload_model.patch /tmp
+COPY ./patches/extension_comfyui_mmaudio.patch /tmp
 
 # Add custom node
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -138,6 +140,26 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git apply /tmp/extension_comfyui-advancedliveportrait.patch && \
     pip install -r requirements.txt && \
     rm -f /tmp/extension_comfyui-advancedliveportrait.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf ComfyUI-Unload-Model && \
+    git clone --depth 1 https://github.com/SeanScripts/ComfyUI-Unload-Model.git && \
+    cd ComfyUI-Unload-Model && \
+    git fetch --depth 1 origin ac5ffb4ed05546545ce7cf38e7b69b5152714eed && \
+    git checkout ac5ffb4ed05546545ce7cf38e7b69b5152714eed && \
+    git apply /tmp/extension_comfyui_unload_model.patch && \
+    rm -f /tmp/extension_comfyui_unload_model.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf ComfyUI-MMAudio && \
+    git clone --depth 1 https://github.com/kijai/ComfyUI-MMAudio.git && \
+    cd ComfyUI-MMAudio  && \
+    git fetch --depth 1 origin 8eaeb72edc3aaf2059b57f2d96a1f6f689f19ae2 && \
+    git checkout 8eaeb72edc3aaf2059b57f2d96a1f6f689f19ae2 && \
+    git apply /tmp/extension_comfyui_mmaudio.patch && \
+    rm -f /tmp/extension_comfyui_mmaudio.patch
 
 RUN rm -f /usr/lib/python3*/EXTERNALLY-MANAGED
 
