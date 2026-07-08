@@ -61,8 +61,16 @@ xpu-smi discovery 2>&1 | tee -a "$LOG"
 xpu-smi dump -m 0,1,2,3,4,5,18,19,20 -n 1 2>&1 | tee -a "$LOG"
 
 # === P2P Bandwidth Test ===
-count=$(lspci | grep -E "e211|e210" | wc -l)
-echo "Detected GPU count: $count"
+# Detect discrete GPUs (B60: e211/e210) and iGPUs (Arc 140V: 64a0)
+dgpu_count=$(lspci | grep -E "e211|e210" | wc -l)
+igpu_count=$(lspci -nn | grep -i 'vga\|3d\|display' | grep -c '8086:64a0' || true)
+count=$dgpu_count
+echo "Detected discrete GPU count: $dgpu_count"
+echo "Detected integrated GPU count: $igpu_count"
+if [ "$igpu_count" -gt 0 ] && [ "$dgpu_count" -eq 0 ]; then
+    echo "Lunar Lake Xe2 iGPU detected. Skipping P2P tests (single iGPU)."
+    echo "For full Lunar Lake evaluation, use: lunar_lake_evaluation.sh"
+fi
 if [ "$count" -ge 2 ]; then
     step "Running ze_peer default test"
     ./tools/level-zero-tests/ze_peer -s 0 -d 1 2>&1 | tee -a "$LOG"

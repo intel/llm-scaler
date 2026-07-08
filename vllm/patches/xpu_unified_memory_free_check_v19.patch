@@ -1,0 +1,18 @@
+--- vllm/utils/mem_utils.py	(v0.19.0 upstream)
++++ vllm/utils/mem_utils.py	(patched)
+@@ -120,6 +120,15 @@
+             # that explains how you can compute the proper value yourself.
+             # https://docs.nvidia.com/cuda/cuda-for-tegra-appnote/#estimating-total-allocatable-device-memory-on-an-integrated-gpu-device
+             self.free_memory = psutil.virtual_memory().available
++        elif current_platform.is_xpu():
++            # Intel iGPU (Lunar Lake / Arrow Lake) uses unified LPDDR5x memory
++            # shared with the CPU. torch.xpu.mem_get_info()'s "free" counts
++            # Linux page cache as used, severely underreporting reclaimable
++            # memory during startup when vLLM reads the model's safetensors.
++            # Use psutil.virtual_memory().available — same rationale as the
++            # Orin/Thor/Spark branch above.
++            self.free_memory = min(psutil.virtual_memory().available,
++                                   self.total_memory)
+ 
+         self.cuda_memory = self.total_memory - self.free_memory
+ 

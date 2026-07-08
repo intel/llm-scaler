@@ -1,0 +1,22 @@
+--- /home/nobara-user/llm-scaler-vllm/vllm/vllm/attention/layer.py	2026-04-14 19:39:54.208412709 +0900
++++ /home/nobara-user/llm-scaler-vllm/venv/lib64/python3.12/site-packages/vllm/attention/layer.py	2026-04-16 22:09:58.602989491 +0900
+@@ -283,7 +283,8 @@
+         # torch.compile works by registering the attention as one giant
+         # opaque custom op. For other platforms, we directly call them
+         # and let torch.compile handle them.
+-        self.use_direct_call = not current_platform.opaque_attention_op()
++        self.use_direct_call = not current_platform.opaque_attention_op() \
++            or current_platform.is_xpu()
+ 
+         self.use_output = self.attn_backend.accept_output_buffer
+         compilation_config = vllm_config.compilation_config
+@@ -573,7 +574,8 @@
+             **extra_impl_args,
+         )
+ 
+-        self.use_direct_call = not current_platform.opaque_attention_op()
++        self.use_direct_call = not current_platform.opaque_attention_op() \
++            or current_platform.is_xpu()
+ 
+         compilation_config = get_current_vllm_config().compilation_config
+         if prefix in compilation_config.static_forward_context:
