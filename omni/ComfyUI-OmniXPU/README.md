@@ -15,7 +15,7 @@ Requires `omni_xpu_kernel` installed. Without it the node loads silently with no
 | Patch | Target |
 |-------|--------|
 | ESIMD Flash Attention | `optimized_attention` |
-| ESIMD RoPE | `_apply_rope1` / `apply_rope1` |
+| ESIMD RoPE | `_apply_rope1` / `apply_rope1` / `apply_rope` (flux.math dual-tensor) |
 | ESIMD LayerNorm/RMSNorm | `LayerNorm.forward` / `RMSNorm.forward` / `rms_norm()` |
 | FP8 GEMM | `fp8_linear` / `mixed_precision_ops` |
 | FP8 Negative Zero Fix | `manual_stochastic_round_to_float8` |
@@ -31,6 +31,7 @@ OMNIXPU_ENABLE=0            # Master switch — disable everything
 OMNIXPU_ATTENTION=0         # Disable ESIMD Flash Attention only
 OMNIXPU_ROPE=0              # Disable ESIMD RoPE only
 OMNIXPU_NORM=0              # Disable ESIMD LayerNorm/RMSNorm only
+OMNIXPU_KREA2_RMSNORM=0     # Disable the Krea2-specific local RMSNorm hook only
 OMNIXPU_FP8_GEMM=0          # Disable FP8 GEMM only
 OMNIXPU_FP8_NEG_ZERO_FIX=0  # Disable FP8 negative zero fix only
 OMNIXPU_INTERPOLATE_FIX=0   # Disable interpolate workaround only
