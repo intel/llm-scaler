@@ -25,6 +25,7 @@ COPY ./patches/extension_SenseNova-U1.patch /tmp
 COPY ./patches/extension_comfyui-advancedliveportrait.patch /tmp
 COPY ./patches/extension_comfyui_unload_model.patch /tmp
 COPY ./patches/extension_comfyui_mmaudio.patch /tmp
+COPY ./patches/extension_comfyui_slk_joy_caption_two.patch /tmp
 
 # Add custom node
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -160,6 +161,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git checkout 8eaeb72edc3aaf2059b57f2d96a1f6f689f19ae2 && \
     git apply /tmp/extension_comfyui_mmaudio.patch && \
     rm -f /tmp/extension_comfyui_mmaudio.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf ComfyUI_SLK_joy_caption_two && \
+    git clone --depth 1 https://github.com/EvilBT/ComfyUI_SLK_joy_caption_two.git && \
+    cd ComfyUI_SLK_joy_caption_two && \
+    git fetch --depth 1 origin 667751cab945bd8e9fb0be4d557d47e36821350a && \
+    git checkout 667751cab945bd8e9fb0be4d557d47e36821350a && \
+    git apply /tmp/extension_comfyui_slk_joy_caption_two.patch && \
+    rm -f /tmp/extension_comfyui_slk_joy_caption_two.patch
 
 RUN rm -f /usr/lib/python3*/EXTERNALLY-MANAGED
 

@@ -1,0 +1,374 @@
+--- a/joy_caption_two_node.py
++++ b/joy_caption_two_node.py
+@@ -27,6 +27,56 @@
+ 
+ BASE_MODEL_PATH = Path(folder_paths.models_dir, "Joy_caption_two")
+ 
++def _autocast_device_type():
++    if torch.cuda.is_available():
++        return "cuda"
++    xpu_backend = getattr(torch, "xpu", None)
++    if xpu_backend is not None and xpu_backend.is_available():
++        return "xpu"
++    return "cpu"
++
++
++def _autocast_enabled():
++    return _autocast_device_type() != "cpu"
++
++
++def _empty_cache():
++    if torch.cuda.is_available():
++        torch.cuda.empty_cache()
++        return
++    xpu_backend = getattr(torch, "xpu", None)
++    if xpu_backend is not None and xpu_backend.is_available():
++        xpu_backend.empty_cache()
++
++
++def _safe_clear_llm(joy_two_pipeline, low_vram):
++    if joy_two_pipeline is not None and getattr(joy_two_pipeline, "llm", None) is not None:
++        joy_two_pipeline.llm.clear_gpu(low_vram)
++
++
++def _disable_incompatible_torchao_for_peft():
++    try:
++        import importlib_metadata
++        import packaging.version
++        import peft.import_utils as peft_import_utils
++        import peft.tuners.lora.torchao as peft_torchao
++
++        try:
++            torchao_version = packaging.version.parse(importlib_metadata.version("torchao"))
++        except Exception:
++            return
++
++        if torchao_version < packaging.version.parse("0.16.0"):
++            def _always_false():
++                return False
++
++            peft_import_utils.is_torchao_available = _always_false
++            peft_torchao.is_torchao_available = _always_false
++            print(f"Disabled PEFT torchao path due to incompatible torchao version: {torchao_version}")
++    except Exception as e:
++        print(f"Torchao compatibility probe skipped: {e}")
++
++
+ def tensor2pil(t_image: torch.Tensor)  -> Image:
+     return Image.fromarray(np.clip(255.0 * t_image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+ 
+@@ -58,13 +108,11 @@
+         clip_model.eval()
+         clip_model.requires_grad_(False)
+         self.model = clip_model
+-
+-        self.patcher = ModelPatcher(self.model, load_device=self.load_device, offload_device=self.offload_device)
+-
+     def encode_image(self, pixel_values):
+-        #print(f"{id(self)}之前 in JoyClipVisionModel: {next(self.model.parameters()).device}")  # 打印模型参数的设备
+-        load_models_gpu([self.patcher], force_full_load=True, force_patch_weights=True)
+-        #print(f"之后 in JoyClipVisionModel: {next(self.model.parameters()).device}")  # 打印模型参数的设备
++        # Avoid ModelPatcher for SigLIP vision model: it may try to set a read-only `device` property.
++        model_device = next(self.model.parameters()).device
++        if model_device != self.load_device:
++            self.model = self.model.to(self.load_device)
+         vision_outputs = self.model(pixel_values=pixel_values, output_hidden_states=True)
+         return vision_outputs
+ 
+@@ -139,8 +187,21 @@
+         self.patcher = ModelPatcher(self.image_adapter, load_device=self.load_device,
+                                     offload_device=self.offload_device)
+ 
+-    def embedded_image(self, hidden_states):
++    def embedded_image(self, vision_outputs):
+         load_models_gpu([self.patcher], force_full_load=True, force_patch_weights=True)
++        hidden_states = getattr(vision_outputs, "hidden_states", None)
++        if hidden_states is None:
++            last_hidden_state = getattr(vision_outputs, "last_hidden_state", None)
++            if last_hidden_state is not None:
++                # Keep at least two items so ImageAdapter can safely index [-2].
++                hidden_states = (last_hidden_state, last_hidden_state)
++
++        if hidden_states is None:
++            hidden_states = vision_outputs
++
++        if isinstance(hidden_states, (tuple, list)) and len(hidden_states) == 1:
++            hidden_states = (hidden_states[0], hidden_states[0])
++
+         embedded_images = self.image_adapter(hidden_states)
+         embedded_images.to(self.load_device)
+         return embedded_images
+@@ -161,40 +222,62 @@
+         self.tokenizer = tokenizer
+         self.text_model = None
+ 
++    def _load_text_model_once(self, text_model_path, llm_path):
++        try:
++            text_model = AutoModelForCausalLM.from_pretrained(
++                text_model_path,
++                local_files_only=True,
++                trust_remote_code=True,
++                torch_dtype=self.type,
++            )
++        except Exception as e:
++            err_msg = str(e)
++            if "`weight` is not an nn.Module" in err_msg or "torchao" in err_msg:
++                print(f"Primary adapter load failed ({e}); falling back to base+PEFT path")
++                _disable_incompatible_torchao_for_peft()
++                from peft import PeftModel
++
++                base_model = AutoModelForCausalLM.from_pretrained(
++                    llm_path,
++                    local_files_only=True,
++                    trust_remote_code=True,
++                    torch_dtype=self.type,
++                )
++                text_model = PeftModel.from_pretrained(
++                    base_model,
++                    text_model_path,
++                    local_files_only=True,
++                    is_trainable=False,
++                )
++            else:
++                raise
++
++        text_model = text_model.to(self.load_device)
++        text_model.eval()
++        return text_model
++
+     def load_llm_model(self):
+         if self.text_model is None or self.current_model_id != self.model_id:
+             print(f"Loading LLM: {self.model_id}")
+             LLM_PATH = download_hg_model(self.model_id, "LLM")
+             text_model_path = os.path.join(BASE_MODEL_PATH, "text_model")
+             modify_json_value(os.path.join(text_model_path, "adapter_config.json"), "base_model_name_or_path",
+-                              LLM_PATH)
+-            max_retries = 5  # 设置最大重试次数
++                               LLM_PATH)
++            _disable_incompatible_torchao_for_peft()
++            max_retries = 5  # retry loading when free memory is too low
+             retries = 0
+             while True:
+                 free_vram = get_free_memory()/1024/1024
+-                # print(f"现在的显存{retries}:{free_vram}")
+                 if free_vram > 6400:
+-                    text_model = AutoModelForCausalLM.from_pretrained(text_model_path,
+-                                                              device_map=self.load_device,
+-                                                              local_files_only=True,
+-                                                              trust_remote_code=True, torch_dtype=self.type)
+-                    text_model.eval()
+-                    self.text_model = text_model
++                    self.text_model = self._load_text_model_once(text_model_path, LLM_PATH)
++                    break
++                clear_cache()
++                retries += 1
++                if retries > max_retries:
++                    self.text_model = self._load_text_model_once(text_model_path, LLM_PATH)
+                     break
+-                else:
+-                    clear_cache()
+-                    retries += 1
+-                    if retries > max_retries:
+-                        text_model = AutoModelForCausalLM.from_pretrained(text_model_path,
+-                                                                          device_map=self.load_device,
+-                                                                          local_files_only=True,
+-                                                                          trust_remote_code=True,
+-                                                                          torch_dtype=self.type)
+-                        text_model.eval()
+-                        self.text_model = text_model
+-                        break
+-                    time.sleep(1 + retries / 2)
+-            # print(f"现在呢:{get_free_memory()/1024/1024}")
++                time.sleep(1 + retries / 2)
++
+             self.current_model_id = self.model_id
+         return self.text_model
+ 
+@@ -202,7 +285,7 @@
+         del self.text_model
+         self.text_model = None
+         self.current_model_id = None
+-        torch.cuda.empty_cache()
++        _empty_cache()
+         import gc
+         gc.collect()
+         if low_vram:
+@@ -294,7 +377,7 @@
+     FUNCTION = "generate"
+ 
+     def generate(self, joy_two_pipeline: JoyTwoPipeline, image, caption_type, caption_length, low_vram):
+-        torch.cuda.empty_cache()
++        _empty_cache()
+ 
+         if joy_two_pipeline.clip_model is None:
+             joy_two_pipeline.parent.loadModels()
+@@ -337,9 +420,9 @@
+ 
+         # Embed image
+         # This results in Batch x Image Tokens x Features
+-        with torch.amp.autocast_mode.autocast('cuda', enabled=True):
++        with torch.amp.autocast_mode.autocast(_autocast_device_type(), enabled=_autocast_enabled()):
+             vision_outputs = joy_two_pipeline.clip_model.encode_image(pixel_values)
+-            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs.hidden_states)
++            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs)
+ 
+         if low_vram:
+             pixel_values.to(joy_two_pipeline.offload_device)
+@@ -382,7 +465,7 @@
+ 
+         text_model = joy_two_pipeline.llm.load_llm_model()
+         # Embed the tokens
+-        convo_embeds = text_model.model.embed_tokens(convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
++        convo_embeds = text_model.get_input_embeddings()( convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
+ 
+         # Construct the input
+         input_embeds = torch.cat([
+@@ -416,7 +499,7 @@
+ 
+         caption = tokenizer.batch_decode(generate_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)[0]
+ 
+-        joy_two_pipeline.llm.clear_gpu(low_vram)
++        _safe_clear_llm(joy_two_pipeline, low_vram)
+ 
+         return (caption.strip(), )
+ 
+@@ -449,7 +532,7 @@
+     FUNCTION = "generate"
+ 
+     def generate(self, joy_two_pipeline: JoyTwoPipeline, image, extra_options, caption_type, caption_length, name, custom_prompt, low_vram, top_p, temperature):
+-        torch.cuda.empty_cache()
++        _empty_cache()
+ 
+         if joy_two_pipeline.clip_model == None:
+             joy_two_pipeline.parent.loadModels()
+@@ -500,9 +583,9 @@
+ 
+         # Embed image
+         # This results in Batch x Image Tokens x Features
+-        with torch.amp.autocast_mode.autocast('cuda', enabled=True):
++        with torch.amp.autocast_mode.autocast(_autocast_device_type(), enabled=_autocast_enabled()):
+             vision_outputs = joy_two_pipeline.clip_model.encode_image(pixel_values)
+-            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs.hidden_states)
++            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs)
+ 
+         if low_vram:
+             pixel_values.to(joy_two_pipeline.offload_device)
+@@ -545,7 +628,7 @@
+ 
+         text_model = joy_two_pipeline.llm.load_llm_model()
+         # Embed the tokens
+-        convo_embeds = text_model.model.embed_tokens(convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
++        convo_embeds = text_model.get_input_embeddings()( convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
+         # Construct the input
+         input_embeds = torch.cat([
+             convo_embeds[:, :preamble_len],  # Part before the prompt
+@@ -579,7 +662,7 @@
+ 
+         caption = tokenizer.batch_decode(generate_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)[0]
+ 
+-        joy_two_pipeline.llm.clear_gpu(low_vram)
++        _safe_clear_llm(joy_two_pipeline, low_vram)
+ 
+         return (caption.strip(), )
+ 
+@@ -608,16 +691,16 @@
+     FUNCTION = "generate"
+ 
+     def generate_caption(self, joy_two_pipeline: JoyTwoPipeline, image, prompt, low_vram=True):
+-        torch.cuda.empty_cache()
++        _empty_cache()
+         pixel_values = TVF.pil_to_tensor(image).unsqueeze(0) / 255.0
+         pixel_values = TVF.normalize(pixel_values, [0.5], [0.5])
+         pixel_values = pixel_values.to(joy_two_pipeline.load_device)
+ 
+         # Embed image
+         # This results in Batch x Image Tokens x Features
+-        with torch.amp.autocast_mode.autocast('cuda', enabled=True):
++        with torch.amp.autocast_mode.autocast(_autocast_device_type(), enabled=_autocast_enabled()):
+             vision_outputs = joy_two_pipeline.clip_model.encode_image(pixel_values)
+-            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs.hidden_states)
++            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs)
+ 
+         if low_vram:
+             pixel_values.to(joy_two_pipeline.offload_device)
+@@ -659,7 +742,7 @@
+ 
+         text_model = joy_two_pipeline.llm.load_llm_model()
+         # Embed the tokens
+-        convo_embeds = text_model.model.embed_tokens(convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
++        convo_embeds = text_model.get_input_embeddings()( convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
+         # Construct the input
+         input_embeds = torch.cat([
+             convo_embeds[:, :preamble_len],  # Part before the prompt
+@@ -695,7 +778,7 @@
+         return caption.strip()
+ 
+     def generate(self, joy_two_pipeline: JoyTwoPipeline, input_dir, output_dir, caption_type, caption_length, low_vram):
+-        torch.cuda.empty_cache()
++        _empty_cache()
+ 
+         if joy_two_pipeline.clip_model == None:
+             joy_two_pipeline.parent.loadModels()
+@@ -767,7 +850,7 @@
+         # NOTE: I found the default processor for so400M to have worse results than just using PIL directly
+         # image = clip_processor(images=input_image, return_tensors='pt').pixel_values
+ 
+-        joy_two_pipeline.llm.clear_gpu(low_vram)
++        _safe_clear_llm(joy_two_pipeline, low_vram)
+ 
+         return (f"result: finished count: {finished_image_count}, error count: {error_image_count}", )
+ 
+@@ -806,16 +889,16 @@
+     FUNCTION = "generate"
+ 
+     def generate_caption(self, joy_two_pipeline: JoyTwoPipeline, image, prompt, top_p=0.9, temperature=0.6, low_vram=True):
+-        torch.cuda.empty_cache()
++        _empty_cache()
+         pixel_values = TVF.pil_to_tensor(image).unsqueeze(0) / 255.0
+         pixel_values = TVF.normalize(pixel_values, [0.5], [0.5])
+         pixel_values = pixel_values.to(joy_two_pipeline.load_device)
+ 
+         # Embed image
+         # This results in Batch x Image Tokens x Features
+-        with torch.amp.autocast_mode.autocast('cuda', enabled=True):
++        with torch.amp.autocast_mode.autocast(_autocast_device_type(), enabled=_autocast_enabled()):
+             vision_outputs = joy_two_pipeline.clip_model.encode_image(pixel_values)
+-            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs.hidden_states)
++            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs)
+ 
+         if low_vram:
+             pixel_values.to(joy_two_pipeline.offload_device)
+@@ -857,7 +940,7 @@
+ 
+         text_model = joy_two_pipeline.llm.load_llm_model()
+         # Embed the tokens
+-        convo_embeds = text_model.model.embed_tokens(convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
++        convo_embeds = text_model.get_input_embeddings()( convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
+         # Construct the input
+         input_embeds = torch.cat([
+             convo_embeds[:, :preamble_len],  # Part before the prompt
+@@ -896,7 +979,7 @@
+     def generate(self, joy_two_pipeline: JoyTwoPipeline, input_dir, output_dir, rename, prefix_name, start_index,
+                  extra_options, caption_type, caption_length, name, custom_prompt, low_vram, top_p, temperature,
+                  prefix_caption, suffix_caption):
+-        torch.cuda.empty_cache()
++        _empty_cache()
+ 
+         if joy_two_pipeline.clip_model == None:
+             joy_two_pipeline.parent.loadModels()
+@@ -986,7 +1069,7 @@
+         # NOTE: I found the default processor for so400M to have worse results than just using PIL directly
+         # image = clip_processor(images=input_image, return_tensors='pt').pixel_values
+ 
+-        joy_two_pipeline.llm.clear_gpu(low_vram)
++        _safe_clear_llm(joy_two_pipeline, low_vram)
+ 
+         return (f"result: finished count: {finished_image_count}, error count: {error_image_count}", )
+ 
+@@ -1016,4 +1099,4 @@
+         for selected, option in zip(options_selected, options):
+             if selected:
+                 values.append(option)
+-        return (values, )
+\ No newline at end of file
++        return (values, )
