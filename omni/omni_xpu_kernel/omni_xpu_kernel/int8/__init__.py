@@ -135,9 +135,15 @@ def dequantize_int8_simple_dtype(
     Returns:
         Dequantized tensor in specified dtype.
     """
+    _dtype_map = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}
     native = _get_native()
     if native is not None and hasattr(native, 'dequantize_int8_simple_dtype'):
-        dtype_code = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}[out_dtype]
+        dtype_code = _dtype_map.get(out_dtype)
+        if dtype_code is None:
+            raise ValueError(
+                f"Unsupported out_dtype {out_dtype}. "
+                f"Supported dtypes: torch.float32, torch.float16, torch.bfloat16"
+            )
         return native.dequantize_int8_simple_dtype(q, scale, dtype_code)
     return _ref_dequantize_int8_simple_dtype(q, scale, out_dtype)
 
