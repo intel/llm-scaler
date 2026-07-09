@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Russell Bryant <rbryant@redhat.com>
+Date: Tue, 8 Jul 2026 00:00:00 +0000
+Subject: [PATCH] [Frontend] Simplify AuthenticationMiddleware path extraction
+
+Use scope["path"] directly instead of reconstructing a full URL via
+URL(scope=scope).path. The scope path is already available and avoids
+an unnecessary round-trip through URL parsing.
+
+Fixes GHSA-94f4-hr76-p5j6
+
+Signed-off-by: Russell Bryant <rbryant@redhat.com>
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ vllm/entrypoints/openai/server_utils.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/entrypoints/openai/server_utils.py b/vllm/entrypoints/openai/server_utils.py
+index b60119af5591..269c33549e84 100644
+--- a/vllm/entrypoints/openai/server_utils.py
++++ b/vllm/entrypoints/openai/server_utils.py
+@@ -15,7 +15,7 @@
+ from fastapi.exceptions import RequestValidationError
+ from fastapi.responses import JSONResponse
+ from starlette.concurrency import iterate_in_threadpool
+-from starlette.datastructures import URL, Headers, MutableHeaders
++from starlette.datastructures import Headers, MutableHeaders
+ from starlette.types import ASGIApp, Message, Receive, Scope, Send
+ 
+ from vllm import envs
+@@ -82,3 +82,3 @@
+         root_path = scope.get("root_path", "")
+-        url_path = URL(scope=scope).path.removeprefix(root_path)
++        url_path = scope["path"].removeprefix(root_path)
+         headers = Headers(scope=scope)
+-- 
+2.45.2
+
