@@ -3,13 +3,14 @@
  * MoE kernels use ~42 GRFs — well within 256 limit.
  */
 
+#include <sycl/sycl.hpp>
+
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/python.h>
 
 #include <cstdint>
-#include <sycl/sycl.hpp>
 
 #include "esimd_kernels/moe_ops.h"
 #include "esimd_kernels/fp8_moe_gemm.h"

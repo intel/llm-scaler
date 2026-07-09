@@ -14,6 +14,7 @@
 // Shared expert weights: FP16 (NOT quantized, no scale).
 // ═══════════════════════════════════════════════════════════════════════════════
 
+#include <sycl/sycl.hpp>
 #include <torch/extension.h>
 #include <c10/xpu/XPUStream.h>
 #include <sycl/ext/intel/esimd.hpp>

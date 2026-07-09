@@ -2,13 +2,14 @@
  * Compiled with -doubleGRF flags for 512 register access.
  */
 
+#include <sycl/sycl.hpp>
+
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/python.h>
 
 #include <cstdint>
-#include <sycl/sycl.hpp>
 
 #include "esimd_kernels/gdn_conv_fused.h"
 #include "esimd_kernels/gdn_conv_fused_seq.h"
