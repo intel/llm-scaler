@@ -3,7 +3,7 @@
 #
 # Multi-stage OMIX build of llm-scaler-vllm (Intel XPU).
 #
-#   builder : intel/omix:latest-devel-ubuntu24.04   -- oneAPI 2025.3 DPC++ compiler
+#   builder : intel/omix:0.1.0-devel-ubuntu24.04    -- oneAPI 2025.3 DPC++ compiler
 #                                                       + oneCCL/oneDNN/oneMKL.  Compiles
 #                                                       all native wheels.  NOT shipped.
 #   runtime : intel/pytorch:xpu-2.11.0-ubuntu24.04  -- torch 2.11.0+xpu + GPU UMD driver
@@ -24,7 +24,7 @@
 # =========================================================================
 # Stage 1: builder -- compile every native wheel with the oneAPI toolchain
 # =========================================================================
-FROM intel/omix:0.2.0-devel-ubuntu24.04 AS builder
+FROM intel/omix:0.1.0-devel-ubuntu24.04 AS builder
 
 ARG http_proxy
 ARG https_proxy
