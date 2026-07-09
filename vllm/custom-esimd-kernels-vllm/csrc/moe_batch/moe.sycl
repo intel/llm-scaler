@@ -1,3 +1,4 @@
+#include <sycl/sycl.hpp>
 #include <torch/extension.h>
 #include <cstdlib>
 #include <algorithm>

@@ -3,13 +3,14 @@
  * Separate from esimd_kernel.sycl to avoid ODR conflicts with fp8_GEMV_v2.h
  * (both define fp8_dequant, select_vl_ks with identical implementations).
  */
+#include <sycl/sycl.hpp>
+
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/python.h>
 
 #include <cstdint>
-#include <sycl/sycl.hpp>
 
 #include "esimd_kernels/fp8_GEMM_pert.h"
 #include "esimd_kernels/int4_GEMM.h"

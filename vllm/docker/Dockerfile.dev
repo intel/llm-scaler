@@ -3,7 +3,7 @@
 #
 # DEV / DEBUG build of llm-scaler-vllm (Intel XPU).  Single stage.
 #
-#   base : intel/omix:latest-devel-ubuntu24.04
+#   base : intel/omix:0.2.0-devel-ubuntu24.04
 #            - oneAPI 2025.3 DPC++ compiler (icpx), oneCCL 2021.17, oneDNN/oneMKL
 #            - AND the SAME Intel GPU runtime stack as the prod runtime base
 #              (intel/pytorch:xpu-2.11.0): intel-opencl-icd/ocloc/libze-intel-gpu1
@@ -32,7 +32,7 @@
 # and ./examples resolve):
 #     docker build -f docker/Dockerfile.dev -t <name>:v0.21.0-omix-pr508-dev .
 
-FROM intel/omix:latest-devel-ubuntu24.04
+FROM intel/omix:0.2.0-devel-ubuntu24.04
 
 ARG http_proxy
 ARG https_proxy
