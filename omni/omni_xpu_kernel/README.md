@@ -118,6 +118,28 @@ output = svdq.onednn_int4_gemm_preconverted(act_f16, packed_u4, scales_f16)
 svdq.fused_convert_add(out_bf16, result_f16, residual_bf16)
 ```
 
+### int8 — INT8 Quantization and Linear
+
+INT8 dynamic quantization and linear layer for ComfyUI INT8-ConvRot models.
+Uses oneDNN s8×s8→s32 GEMM with ESIMD fused quantization and scale-back.
+
+```python
+from omni_xpu_kernel import int8
+
+# Quantize weight offline
+w_int8, w_scale = int8.quantize_int8_tensorwise(weight)
+
+# INT8 linear (dynamic activation quantization + oneDNN GEMM + rescale)
+output = int8.int8_linear(x_bf16, w_int8, w_scale, bias=bias, out_dtype=torch.bfloat16)
+
+# With ConvRot (Hadamard rotation for improved accuracy)
+output = int8.int8_linear(x, w_int8, w_scale, convrot=True, convrot_groupsize=256)
+
+# Cache management
+int8.int8_cache_clear()
+stats = int8.int8_cache_stats()  # {"hits": ..., "misses": ..., "size": ...}
+```
+
 ### rotary — Rotary Position Embedding
 
 Fused bf16->f32 + rotary rotation + f32->bf16 in a single ESIMD kernel.
@@ -211,7 +233,7 @@ To switch config at compile time: `-DSDP_CONFIG_PVC`
 ### Build System
 
 The package builds multiple extension modules:
-- `_C.so` — Main extension (norm, gguf, svdq, rotary, sdp loader, fp8)
+- `_C.so` — Main extension (norm, gguf, svdq, rotary, sdp loader, fp8, int8)
 - `lgrf_sdp.so` — SDP ESIMD sidecar (AOT, doubleGRF)
 
 ## License
