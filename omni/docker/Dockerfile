@@ -85,8 +85,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm && \
     git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git && \
     cd ComfyUI && \
-    git fetch --depth 1 origin 64b8457f55cd7fb54ca7a956d9c73b505e903e0c && \
-    git checkout 64b8457f55cd7fb54ca7a956d9c73b505e903e0c && \
+    git fetch --depth 1 origin bb131be9e83d2f773c90f1d6f1e4b248a498c8c5 && \
+    git checkout bb131be9e83d2f773c90f1d6f1e4b248a498c8c5 && \
     pip install -r requirements.txt
 
 # ComfyUI-OmniXPU: Intel XPU acceleration via custom node (replaces core patch)
