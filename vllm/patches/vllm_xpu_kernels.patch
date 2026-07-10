@@ -1,5 +1,5 @@
 diff --git a/csrc/flash_attn/flash_api.cpp b/csrc/flash_attn/flash_api.cpp
-index 8d12b68..7c0e824 100644
+index 8d12b68..82bada4 100644
 --- a/csrc/flash_attn/flash_api.cpp
 +++ b/csrc/flash_attn/flash_api.cpp
 @@ -118,7 +118,11 @@ std::vector<at::Tensor> mha_varlen_fwd(
@@ -25,7 +25,7 @@ index 8d12b68..7c0e824 100644
    } else if (max_seqlen_q > 1) {
      if (!out_.has_value()) {
        out = torch::empty_like(q);
-@@ -238,6 +243,18 @@ std::vector<at::Tensor> mha_varlen_fwd(
+@@ -238,6 +243,33 @@ std::vector<at::Tensor> mha_varlen_fwd(
                              cu_seqlens_q.slice(0, 0, batch_size);
      at::Tensor is_prefill_mask = seq_lens_q.gt(1);
      std::optional<const at::Tensor> is_prefill_opt = is_prefill_mask;
@@ -39,12 +39,27 @@ index 8d12b68..7c0e824 100644
 +    // fails with UR_RESULT_ERROR_OUT_OF_RESOURCES even though the kernel has no
 +    // work to do. Skip the decode launch entirely when there are no decode
 +    // sequences (it is a no-op in that case anyway).
-+    bool has_decode = (seq_lens_q.numel() > 0) &&
-+                      (seq_lens_q.eq(1).any().item<bool>());
++    // The .item<bool>() probe forces a device->host read, which makes SYCL
++    // wait on the queue ("wait method cannot be used for an event associated
++    // with a command graph") and aborts during SYCL-command-graph capture.
++    // Skip the probe only while the queue is recording a graph AND on the
++    // DiffusionGemma fused per-seq-causal path (per_seq_causal_ set): that path
++    // captures uniform multi-token (canvas) batches with no seq_len_q==1 decode
++    // sequence, so has_decode is false for the captured shape. In eager
++    // execution (queue not recording) the full probe still runs, preserving
++    // correctness for mixed batches that contain a seq_len_q==1 sequence; all
++    // other paths are unaffected.
++    bool capturing = queue.ext_oneapi_get_state() ==
++                     sycl::ext::oneapi::experimental::queue_state::recording;
++    bool has_decode = false;
++    if (!(capturing && per_seq_causal_.has_value())) {
++      has_decode = (seq_lens_q.numel() > 0) &&
++                   (seq_lens_q.eq(1).any().item<bool>());
++    }
  
      cutlass_chunk_prefill_interface(
          queue,
-@@ -262,58 +279,61 @@ std::vector<at::Tensor> mha_varlen_fwd(
+@@ -262,58 +294,61 @@ std::vector<at::Tensor> mha_varlen_fwd(
          is_local,
          is_sink,
          softmax_lse_opt,
@@ -158,7 +173,7 @@ index 8d12b68..7c0e824 100644
    } else {
      // Normalize -1 (unbounded) to max_seqlen_k for kernel masking logic
      // In decode phase the window_size_right doesn't have effect
-@@ -439,7 +459,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+@@ -439,7 +474,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
        "float softmax_scale, Tensor? softmax_sink, bool zero_tensors, "
        "bool is_causal, int window_size_left, int window_size_right, float "
        "softcap, bool return_softmax, "
@@ -575,11 +590,2060 @@ index 61ad263..d34bbd5 100644
            reduce_policy, queue, reduce_params);
        // reduce_event.wait();
      }
+diff --git a/csrc/xpu/gdn_attn/causal_conv1d.hpp b/csrc/xpu/gdn_attn/causal_conv1d.hpp
+old mode 100755
+new mode 100644
+index f61a125..b7ba51f
+--- a/csrc/xpu/gdn_attn/causal_conv1d.hpp
++++ b/csrc/xpu/gdn_attn/causal_conv1d.hpp
+@@ -30,11 +30,14 @@ struct causal_conv1d_kernel {
+       const int conv_states_stride_0,
+       T* conv_states_tmp,
+       int* query_start_loc,
++      int* token_indx,
+       int* cache_indices,
+       bool* has_initial_state,
++      int* num_accepted_tokens,
+       const ActMode& act_mode,
+       const int& pad_slot_id,
+       const int& batch_size,
++      const int& num_virtual_tokens,
+       const int& num_actual_tokens,
+       const int& num_k_heads,
+       const int& head_k_dim,
+@@ -56,12 +59,15 @@ struct causal_conv1d_kernel {
+         conv_states_stride_0(conv_states_stride_0),
+         conv_states_tmp(conv_states_tmp),
+         query_start_loc(query_start_loc),
++        token_indx(token_indx),
+         cache_indices(cache_indices),
+         has_initial_state(has_initial_state),
++        num_accepted_tokens(num_accepted_tokens),
+         act_mode(act_mode),
+         pad_slot_id(pad_slot_id),
+         batch_size(batch_size),
+         num_actual_tokens(num_actual_tokens),
++        num_virtual_tokens(num_virtual_tokens),
+         num_k_heads(num_k_heads),
+         head_k_dim(head_k_dim),
+         num_v_heads(num_v_heads),
+@@ -70,11 +76,11 @@ struct causal_conv1d_kernel {
+         conv_elems(conv_elems) {}
+ 
+   static inline sycl::nd_range<2>
+-  get_nd_range(const int total_seqlen, const int qkvz_elems) {
++  get_nd_range(const int num_virtual_tokens, const int qkvz_elems) {
+     const int groups_per_token =
+         (qkvz_elems + elems_per_group - 1) / elems_per_group;
+     sycl::range<2> local(1, group_size);
+-    sycl::range<2> global(total_seqlen, groups_per_token);
++    sycl::range<2> global(num_virtual_tokens, groups_per_token);
+     return sycl::nd_range<2>(global * local, local);
+   }
+ 
+@@ -95,6 +101,12 @@ struct causal_conv1d_kernel {
+       return;
+     }
+ 
++    // When q/k/v/b/a (LOCAL outputs) are a subset of mixed_qkvz/mixed_ba
++    // (GLOBAL inputs), token_indx maps local token positions back to global
++    // positions. When nullptr, local == global.
++    const int global_token_id =
++        (token_indx != nullptr) ? token_indx[token_id] : token_id;
++
+     const int q_dim = head_k_dim;
+     const int k_dim = head_k_dim;
+     const int v_dim = head_v_dim * num_v_heads / num_k_heads;
+@@ -104,29 +116,34 @@ struct causal_conv1d_kernel {
+     int k_heads_id = qkvz_elems_id / qkvz_dim;
+     int qkvz_dim_id = qkvz_elems_id % qkvz_dim;
+ 
+-    // reorder b,a
++    // reorder b,a (mixed_ba is GLOBAL → indexed by global_token_id;
++    //              b_out/a_out are LOCAL → indexed by token_id)
+     if constexpr (ReorderInput) {
+       if (qkvz_elems_id < num_v_heads) {
+-        int step = token_id * num_v_heads;
++        int step_local = token_id * num_v_heads;
++        int step_global = global_token_id * num_v_heads;
+ #pragma unroll
+         for (int e = 0; e < elems_per_item; ++e) {
+-          b_out[step + qkvz_elems_id + e] =
+-              mixed_ba[step * 2 + qkvz_elems_id + e];
+-          a_out[step + qkvz_elems_id + e] =
+-              mixed_ba[step * 2 + num_v_heads + qkvz_dim_id + e];
++          b_out[step_local + qkvz_elems_id + e] =
++              mixed_ba[step_global * 2 + qkvz_elems_id + e];
++          a_out[step_local + qkvz_elems_id + e] =
++              mixed_ba[step_global * 2 + num_v_heads + qkvz_dim_id + e];
+         }
+       }
+     } else {
+       if (qkvz_dim_id < (num_v_heads / num_k_heads)) {
+-        int step =
++        int step_local =
+             token_id * num_v_heads + k_heads_id * num_v_heads / num_k_heads;
++        int step_global = global_token_id * num_v_heads +
++                          k_heads_id * num_v_heads / num_k_heads;
+         const int ba_elems_per_item =
+             sycl::min(elems_per_item, num_v_heads / num_k_heads);
+ #pragma unroll
+         for (int e = 0; e < ba_elems_per_item; ++e) {
+-          b_out[step + qkvz_dim_id + e] = mixed_ba[step * 2 + qkvz_dim_id + e];
+-          a_out[step + qkvz_dim_id + e] =
+-              mixed_ba[step * 2 + num_v_heads / num_k_heads + qkvz_dim_id + e];
++          b_out[step_local + qkvz_dim_id + e] =
++              mixed_ba[step_global * 2 + qkvz_dim_id + e];
++          a_out[step_local + qkvz_dim_id + e] = mixed_ba
++              [step_global * 2 + num_v_heads / num_k_heads + qkvz_dim_id + e];
+         }
+       }
+     }
+@@ -184,14 +201,14 @@ struct causal_conv1d_kernel {
+       }
+     }
+ 
+-    // reorder z
++    // reorder z (z_out is GLOBAL → use global_token_id; mixed_qkvz is GLOBAL)
+     if (is_z) {
+       int z_elems_id =
+           k_heads_id * z_dim + qkvz_dim_id - (q_dim + k_dim + v_dim);
+ #pragma unroll
+       for (int e = 0; e < elems_per_item; ++e) {
+-        z_out[token_id * num_k_heads * z_dim + z_elems_id + e] =
+-            mixed_qkvz[token_id * qkvz_elems + mixed_qkvz_id + e];
++        z_out[global_token_id * num_k_heads * z_dim + z_elems_id + e] =
++            mixed_qkvz[global_token_id * qkvz_elems + mixed_qkvz_id + e];
+       }
+       return;
+     }
+@@ -252,11 +269,13 @@ struct causal_conv1d_kernel {
+ 
+ #pragma unroll
+     for (int i = 0; i < input_load_len; ++i) {
++      const int load_local = token_id - input_load_len + 1 + i;
++      const int load_global =
++          (token_indx != nullptr) ? token_indx[load_local] : load_local;
+ #pragma unroll
+       for (int e = 0; e < elems_per_item; ++e) {
+-        local_input[Width * e + states_load_len + i] = mixed_qkvz
+-            [(token_id - input_load_len + 1 + i) * qkvz_elems + mixed_qkvz_id +
+-             e];
++        local_input[Width * e + states_load_len + i] =
++            mixed_qkvz[load_global * qkvz_elems + mixed_qkvz_id + e];
+       }
+     }
+ 
+@@ -360,11 +379,14 @@ struct causal_conv1d_kernel {
+   const int conv_states_stride_0;
+   T* conv_states_tmp;
+   const int32_t* query_start_loc;
++  const int* token_indx;
+   const int* cache_indices;
+   const bool* has_initial_state;
++  const int* num_accepted_tokens;
+   const ActMode act_mode;
+   const int pad_slot_id;
+   const int batch_size;
++  const int num_virtual_tokens;
+   const int num_actual_tokens;
+   const int num_k_heads;
+   const int head_k_dim;
+@@ -390,6 +412,7 @@ struct update_states_kernel {
+       const int width,
+       const int conv_elems,
+       const int32_t* query_start_loc,
++      const int* token_indx,
+       const int batch_size)
+       : conv_states(conv_states),
+         conv_states_stride_0(conv_states_stride_0),
+@@ -398,6 +421,7 @@ struct update_states_kernel {
+         width(width),
+         conv_elems(conv_elems),
+         query_start_loc(query_start_loc),
++        token_indx(token_indx),
+         batch_size(batch_size) {}
+ 
+   static inline sycl::nd_range<3>
+@@ -444,9 +468,391 @@ struct update_states_kernel {
+   const int width;
+   const int conv_elems;
+   const int32_t* query_start_loc;
++  const int* token_indx;
+   const int batch_size;
+ };
+ 
++// -----------------------------------------------------------------------------
++// Spec-decoding kernel for causal_conv1d.
++//
++// Each spec sequence contributes exactly num_spec_tokens (== num_spec + 1)
++// contiguous tokens in the LOCAL q/k/v/b/a buffers, ordered by
++// spec_query_start_loc; their corresponding GLOBAL positions in
++// mixed_qkvz / mixed_ba / z_out are given by token_indx.
++//
++// Grid: (num_spec_decodes, groups_per_token). Each thread owns a feature
++// chunk of `elems_per_item` lanes and walks all num_spec_tokens tokens of
++// one sequence in a sliding window:
++//   - q/k/v lanes: load Width-1 prior values from
++//     conv_states[cache_indices[batch, num_accepted_tokens[batch] - 1]],
++//     then for every t_local in [0, num_spec_tokens) shift the window left
++//     by one, load the new input from mixed_qkvz[token_indx[...]], apply the
++//     conv (+bias +activation) and store to local q/k/v outputs.
++//   - z lanes: pure reorder, no conv.
++//   - b/a lanes: pure reorder.
++// After processing all tokens we write the trailing Width-1 input values to
++// ONLY the last cache slot: conv_states[cache_indices[batch, num_spec]],
++// matching the Triton fused_recurrent path which keeps a single rollback
++// reference for the next forward.
++// -----------------------------------------------------------------------------
++template <typename T, int Width, bool ReorderInput>
++struct causal_conv1d_spec_kernel {
++ public:
++  static constexpr int sub_group_size = 32;
++  static constexpr int group_size = 256;
++  static constexpr int elems_per_item = 4;
++  static constexpr int elems_per_group = group_size * elems_per_item;
++
++  causal_conv1d_spec_kernel(
++      T* q_out,
++      T* k_out,
++      T* v_out,
++      T* z_out,
++      T* b_out,
++      T* a_out,
++      const T* mixed_qkvz,
++      const T* mixed_ba,
++      const T* conv_weights,
++      const T* conv_bias,
++      T* conv_states,
++      const int conv_states_stride_0,
++      const int* token_indx,
++      const int* cache_indices,
++      const int cache_indices_stride_0,
++      const int* num_accepted_tokens,
++      const ActMode& act_mode,
++      const int& pad_slot_id,
++      const int& num_spec_decodes,
++      const int& num_spec_tokens,
++      const int& num_k_heads,
++      const int& head_k_dim,
++      const int& num_v_heads,
++      const int& head_v_dim,
++      const int& qkvz_elems,
++      const int& conv_elems)
++      : q_out(q_out),
++        k_out(k_out),
++        v_out(v_out),
++        z_out(z_out),
++        b_out(b_out),
++        a_out(a_out),
++        mixed_qkvz(mixed_qkvz),
++        mixed_ba(mixed_ba),
++        conv_weights(conv_weights),
++        conv_bias(conv_bias),
++        conv_states(conv_states),
++        conv_states_stride_0(conv_states_stride_0),
++        token_indx(token_indx),
++        cache_indices(cache_indices),
++        cache_indices_stride_0(cache_indices_stride_0),
++        num_accepted_tokens(num_accepted_tokens),
++        act_mode(act_mode),
++        pad_slot_id(pad_slot_id),
++        num_spec_decodes(num_spec_decodes),
++        num_spec_tokens(num_spec_tokens),
++        num_k_heads(num_k_heads),
++        head_k_dim(head_k_dim),
++        num_v_heads(num_v_heads),
++        head_v_dim(head_v_dim),
++        qkvz_elems(qkvz_elems),
++        conv_elems(conv_elems) {}
++
++  static inline sycl::nd_range<2>
++  get_nd_range(const int num_spec_decodes, const int qkvz_elems) {
++    const int groups_per_token =
++        (qkvz_elems + elems_per_group - 1) / elems_per_group;
++    sycl::range<2> local(1, group_size);
++    sycl::range<2> global(num_spec_decodes, groups_per_token);
++    return sycl::nd_range<2>(global * local, local);
++  }
++
++  static inline void act_swish(float& x, float beta = 1.0f) {
++    x = x / (1.0f + sycl::exp(-x * beta));
++  }
++  static inline void act_silu(float& x) { act_swish(x, 1.0f); }
++
++  [[sycl::reqd_sub_group_size(sub_group_size)]] void
++  operator()(sycl::nd_item<2> item) const {
++    const int batch_id = item.get_group(0);
++    const int local_group_id = item.get_group(1);
++    const int local_id = item.get_local_linear_id();
++    const int qkvz_elems_id =
++        local_group_id * elems_per_group + local_id * elems_per_item;
++
++    if (qkvz_elems_id >= qkvz_elems) {
++      return;
++    }
++
++    const int q_dim = head_k_dim;
++    const int k_dim = head_k_dim;
++    const int v_dim = head_v_dim * num_v_heads / num_k_heads;
++    const int z_dim = head_v_dim * num_v_heads / num_k_heads;
++    const int qkvz_dim = q_dim + k_dim + v_dim + z_dim;
++
++    int k_heads_id = qkvz_elems_id / qkvz_dim;
++    int qkvz_dim_id = qkvz_elems_id % qkvz_dim;
++
++    // Determine role (q/k/v/z) and the mixed_qkvz offset for this feature.
++    bool is_q = false, is_k = false, is_v = false, is_z = false;
++    int mixed_qkvz_id = qkvz_elems_id;
++    int reordered_elems_id = 0;
++    if (qkvz_dim_id < q_dim) {
++      is_q = true;
++      if constexpr (ReorderInput) {
++        mixed_qkvz_id = k_heads_id * k_dim + qkvz_dim_id;
++      }
++      reordered_elems_id = k_heads_id * q_dim + qkvz_dim_id;
++    } else if (qkvz_dim_id < q_dim + k_dim) {
++      is_k = true;
++      if constexpr (ReorderInput) {
++        mixed_qkvz_id =
++            num_k_heads * head_k_dim + k_heads_id * k_dim + qkvz_dim_id - q_dim;
++      }
++      reordered_elems_id =
++          num_k_heads * q_dim + k_heads_id * k_dim + qkvz_dim_id - q_dim;
++    } else if (qkvz_dim_id < q_dim + k_dim + v_dim) {
++      is_v = true;
++      if constexpr (ReorderInput) {
++        mixed_qkvz_id = 2 * num_k_heads * head_k_dim + k_heads_id * v_dim +
++                        qkvz_dim_id - (q_dim + k_dim);
++      }
++      reordered_elems_id = num_k_heads * (q_dim + k_dim) + k_heads_id * v_dim +
++                           qkvz_dim_id - (q_dim + k_dim);
++    } else {
++      is_z = true;
++      if constexpr (ReorderInput) {
++        mixed_qkvz_id = 2 * num_k_heads * head_k_dim +
++                        num_v_heads * head_v_dim + k_heads_id * z_dim +
++                        qkvz_dim_id - (q_dim + k_dim + v_dim);
++      }
++    }
++
++    // -- b / a reorder (mixed_ba GLOBAL → b_out/a_out LOCAL) ----------------
++    for (int t_local = 0; t_local < num_spec_tokens; ++t_local) {
++      const int token_id_local = batch_id * num_spec_tokens + t_local;
++      const int global_t = token_indx[token_id_local];
++      if constexpr (ReorderInput) {
++        if (qkvz_elems_id < num_v_heads) {
++          int step_local = token_id_local * num_v_heads;
++          int step_global = global_t * num_v_heads;
++#pragma unroll
++          for (int e = 0; e < elems_per_item; ++e) {
++            b_out[step_local + qkvz_elems_id + e] =
++                mixed_ba[step_global * 2 + qkvz_elems_id + e];
++            a_out[step_local + qkvz_elems_id + e] =
++                mixed_ba[step_global * 2 + num_v_heads + qkvz_dim_id + e];
++          }
++        }
++      } else {
++        if (qkvz_dim_id < (num_v_heads / num_k_heads)) {
++          int step_local = token_id_local * num_v_heads +
++                           k_heads_id * num_v_heads / num_k_heads;
++          int step_global =
++              global_t * num_v_heads + k_heads_id * num_v_heads / num_k_heads;
++          const int ba_elems_per_item =
++              sycl::min(elems_per_item, num_v_heads / num_k_heads);
++#pragma unroll
++          for (int e = 0; e < ba_elems_per_item; ++e) {
++            b_out[step_local + qkvz_dim_id + e] =
++                mixed_ba[step_global * 2 + qkvz_dim_id + e];
++            a_out[step_local + qkvz_dim_id + e] = mixed_ba
++                [step_global * 2 + num_v_heads / num_k_heads + qkvz_dim_id + e];
++          }
++        }
++      }
++    }
++
++    // -- z reorder: simple copy through token_indx, no convolution. ---------
++    if (is_z) {
++      int z_elems_id =
++          k_heads_id * z_dim + qkvz_dim_id - (q_dim + k_dim + v_dim);
++      for (int t_local = 0; t_local < num_spec_tokens; ++t_local) {
++        const int token_id_local = batch_id * num_spec_tokens + t_local;
++        const int global_t = token_indx[token_id_local];
++#pragma unroll
++        for (int e = 0; e < elems_per_item; ++e) {
++          z_out[global_t * num_k_heads * z_dim + z_elems_id + e] =
++              mixed_qkvz[global_t * qkvz_elems + mixed_qkvz_id + e];
++        }
++      }
++      return;
++    }
++
++    if (!(is_q || is_k || is_v)) {
++      return;
++    }
++
++    // -- conv1d on q/k/v lanes ----------------------------------------------
++    // Pick the initial conv-state slot using num_accepted_tokens. The slot
++    // at column num_accepted_tokens[batch_id] - 1 was written by the previous
++    // step's last accepted token; we fall back to col 0 defensively when
++    // num_accepted_tokens == 0.
++    int init_col = num_accepted_tokens[batch_id] - 1;
++    if (init_col < 0) init_col = 0;
++    const int init_state_id =
++        cache_indices[batch_id * cache_indices_stride_0 + init_col];
++
++    // Load weights
++    T local_weights[Width * elems_per_item];
++#pragma unroll
++    for (int i = 0; i < Width; ++i) {
++#pragma unroll
++      for (int e = 0; e < elems_per_item; ++e) {
++        local_weights[Width * e + i] =
++            conv_weights[(reordered_elems_id + e) * Width + i];
++      }
++    }
++
++    // Sliding window of size Width. Positions [0, Width-1) start with the
++    // prior conv_state; position Width-1 is filled per-iter with the new
++    // input. When the cache slot is the pad slot the prior is zeroed.
++    T local_input[Width * elems_per_item];
++#pragma unroll
++    for (int i = 0; i < Width * elems_per_item; ++i) {
++      local_input[i] = static_cast<T>(0);
++    }
++    if (Width > 1 && init_state_id != pad_slot_id) {
++      const T* init_state_ptr =
++          conv_states + init_state_id * conv_states_stride_0;
++#pragma unroll
++      for (int i = 0; i < Width - 1; ++i) {
++#pragma unroll
++        for (int e = 0; e < elems_per_item; ++e) {
++          local_input[Width * e + i] =
++              init_state_ptr[i * conv_elems + reordered_elems_id + e];
++        }
++      }
++    }
++
++    for (int t_local = 0; t_local < num_spec_tokens; ++t_local) {
++      const int token_id_local = batch_id * num_spec_tokens + t_local;
++      const int global_t = token_indx[token_id_local];
++
++      // Shift window left by 1 (for t_local == 0 the trailing slot is fresh).
++      if (t_local > 0) {
++#pragma unroll
++        for (int i = 0; i < Width - 1; ++i) {
++#pragma unroll
++          for (int e = 0; e < elems_per_item; ++e) {
++            local_input[Width * e + i] = local_input[Width * e + i + 1];
++          }
++        }
++      }
++      // Load new input at the trailing slot.
++#pragma unroll
++      for (int e = 0; e < elems_per_item; ++e) {
++        local_input[Width * e + Width - 1] =
++            mixed_qkvz[global_t * qkvz_elems + mixed_qkvz_id + e];
++      }
++
++      float res[elems_per_item];
++#pragma unroll
++      for (int e = 0; e < elems_per_item; ++e) {
++        res[e] = 0.0f;
++      }
++#pragma unroll
++      for (int i = 0; i < Width; ++i) {
++#pragma unroll
++        for (int e = 0; e < elems_per_item; ++e) {
++          res[e] += static_cast<float>(local_input[Width * e + i]) *
++                    static_cast<float>(local_weights[Width * e + i]);
++        }
++      }
++      if (conv_bias != nullptr) {
++#pragma unroll
++        for (int e = 0; e < elems_per_item; ++e) {
++          res[e] += conv_bias[reordered_elems_id + e];
++        }
++      }
++      if (act_mode == ActMode::silu) {
++#pragma unroll
++        for (int e = 0; e < elems_per_item; ++e) {
++          act_silu(res[e]);
++        }
++      } else if (act_mode == ActMode::swish) {
++#pragma unroll
++        for (int e = 0; e < elems_per_item; ++e) {
++          act_swish(res[e]);
++        }
++      }
++
++      // Write to LOCAL q/k/v at token_id_local.
++      if (is_q) {
++#pragma unroll
++        for (int e = 0; e < elems_per_item; ++e) {
++          q_out
++              [token_id_local * num_k_heads * q_dim + k_heads_id * q_dim +
++               qkvz_dim_id + e] = res[e];
++        }
++      } else if (is_k) {
++#pragma unroll
++        for (int e = 0; e < elems_per_item; ++e) {
++          k_out
++              [token_id_local * num_k_heads * k_dim + k_heads_id * k_dim +
++               qkvz_dim_id - q_dim + e] = res[e];
++        }
++      } else {  // is_v
++#pragma unroll
++        for (int e = 0; e < elems_per_item; ++e) {
++          v_out
++              [token_id_local * num_k_heads * v_dim + k_heads_id * v_dim +
++               qkvz_dim_id - (q_dim + k_dim) + e] = res[e];
++        }
++      }
++
++      // Checkpoint the rolling conv state at every step into the cache slot
++      // that the next decoding round will read when `num_accepted_tokens ==
++      // t_local + 1`. Writing each column (not only the last one) keeps the
++      // scheduler's per-acceptance rollback consistent: column `t_local`
++      // holds the conv state right after consuming spec token `t_local`.
++      if (Width > 1) {
++        const int save_state_id =
++            cache_indices[batch_id * cache_indices_stride_0 + t_local];
++        if (save_state_id != pad_slot_id) {
++          T* save_state_ptr =
++              conv_states + save_state_id * conv_states_stride_0;
++#pragma unroll
++          for (int i = 0; i < Width - 1; ++i) {
++#pragma unroll
++            for (int e = 0; e < elems_per_item; ++e) {
++              save_state_ptr[i * conv_elems + reordered_elems_id + e] =
++                  local_input[Width * e + i + 1];
++            }
++          }
++        }
++      }
++    }
++  }
++
++ private:
++  T* q_out;
++  T* k_out;
++  T* v_out;
++  T* z_out;
++  T* b_out;
++  T* a_out;
++  const T* mixed_qkvz;
++  const T* mixed_ba;
++  const T* conv_weights;
++  const T* conv_bias;
++  T* conv_states;
++  const int conv_states_stride_0;
++  const int* token_indx;
++  const int* cache_indices;
++  const int cache_indices_stride_0;
++  const int* num_accepted_tokens;
++  const ActMode act_mode;
++  const int pad_slot_id;
++  const int num_spec_decodes;
++  const int num_spec_tokens;
++  const int num_k_heads;
++  const int head_k_dim;
++  const int num_v_heads;
++  const int head_v_dim;
++  const int qkvz_elems;
++  const int conv_elems;
++};
++
+ template <typename T, int Width, bool ReorderInput>
+ void kernel_launcher(
+     sycl::queue& queue,
+@@ -464,11 +870,15 @@ void kernel_launcher(
+     const int conv_states_stride_0,
+     T* conv_states_tmp,
+     int* query_start_loc,
++    int* token_indx,
+     int* cache_indices,
++    const int cache_indices_stride_0,
+     bool* has_initial_state,
++    int* num_accepted_tokens,
+     const ActMode& act_mode,
+     const int& pad_slot_id,
+     const int& batch_size,
++    const int& num_virtual_tokens,
+     const int& num_actual_tokens,
+     const int& num_k_heads,
+     const int& head_k_dim,
+@@ -477,9 +887,51 @@ void kernel_launcher(
+     const int& qkvz_elems,
+     const int& conv_elems,
+     const int& num_prefills,
+-    const int& num_decodes) {
++    const int& num_decodes,
++    const int& num_spec_decodes,
++    const int& num_spec_tokens) {
++  // Spec path: state writeback happens inside the spec kernel, so we do not
++  // run the auxiliary update_states_kernel for prefills here.
++  if (num_accepted_tokens != nullptr) {
++    using KERNEL_SPEC = causal_conv1d_spec_kernel<T, Width, ReorderInput>;
++    auto range_spec = KERNEL_SPEC::get_nd_range(num_spec_decodes, qkvz_elems);
++    assert(head_k_dim % KERNEL_SPEC::elems_per_item == 0);
++    assert(num_v_heads % KERNEL_SPEC::elems_per_item == 0);
++    queue.submit([&](sycl::handler& cgh) {
++      KERNEL_SPEC task(
++          q_out,
++          k_out,
++          v_out,
++          z_out,
++          b_out,
++          a_out,
++          mixed_qkvz,
++          mixed_ba,
++          conv_weights,
++          conv_bias,
++          conv_states,
++          conv_states_stride_0,
++          token_indx,
++          cache_indices,
++          cache_indices_stride_0,
++          num_accepted_tokens,
++          act_mode,
++          pad_slot_id,
++          num_spec_decodes,
++          num_spec_tokens,
++          num_k_heads,
++          head_k_dim,
++          num_v_heads,
++          head_v_dim,
++          qkvz_elems,
++          conv_elems);
++      cgh.parallel_for(range_spec, task);
++    });
++    return;
++  }
++
+   using KERNEL_MAIN = causal_conv1d_kernel<T, Width, ReorderInput>;
+-  auto range_main = KERNEL_MAIN::get_nd_range(num_actual_tokens, qkvz_elems);
++  auto range_main = KERNEL_MAIN::get_nd_range(num_virtual_tokens, qkvz_elems);
+   assert(head_k_dim % KERNEL_MAIN::elems_per_item == 0);
+   assert(num_v_heads % KERNEL_MAIN::elems_per_item == 0);
+   queue.submit([&](sycl::handler& cgh) {
+@@ -498,11 +950,14 @@ void kernel_launcher(
+         conv_states_stride_0,
+         conv_states_tmp,
+         query_start_loc,
++        token_indx,
+         cache_indices,
+         has_initial_state,
++        num_accepted_tokens,
+         act_mode,
+         pad_slot_id,
+         batch_size,
++        num_virtual_tokens,
+         num_actual_tokens,
+         num_k_heads,
+         head_k_dim,
+@@ -525,6 +980,7 @@ void kernel_launcher(
+           Width,
+           conv_elems,
+           query_start_loc,
++          token_indx,
+           batch_size);
+       cgh.parallel_for(range_update, task);
+     });
+@@ -533,16 +989,16 @@ void kernel_launcher(
+ 
+ void causal_conv1d(
+     sycl::queue& queue,
+-    torch::Tensor& q_out,  // [total_seqlen, num_k_heads, head_k_dim]
+-    torch::Tensor& k_out,  // [total_seqlen, num_k_heads, head_k_dim]
+-    torch::Tensor& v_out,  // [total_seqlen, num_v_heads, head_v_dim]
+-    torch::Tensor& z_out,  // [total_seqlen, num_v_heads, head_v_dim]
+-    torch::Tensor& b_out,  // [total_seqlen, num_v_heads]
+-    torch::Tensor& a_out,  // [total_seqlen, num_v_heads]
++    torch::Tensor& q_out,  // [num_virtual_tokens, num_k_heads, head_k_dim]
++    torch::Tensor& k_out,  // [num_virtual_tokens, num_k_heads, head_k_dim]
++    torch::Tensor& v_out,  // [num_virtual_tokens, num_v_heads, head_v_dim]
++    torch::Tensor& z_out,  // [num_actual_tokens, num_v_heads, head_v_dim]
++    torch::Tensor& b_out,  // [num_virtual_tokens, num_v_heads]
++    torch::Tensor& a_out,  // [num_virtual_tokens, num_v_heads]
+     const torch::Tensor&
+-        mixed_qkvz,  // [total_seqlen, num_k_heads * (2 * head_k_dim + 2 *
++        mixed_qkvz,  // [num_actual_tokens, num_k_heads * (2 * head_k_dim + 2 *
+                      // head_v_dim * num_v_heads / num_k_heads)]
+-    const torch::Tensor& mixed_ba,  // [total_seqlen, num_k_heads * (2 *
++    const torch::Tensor& mixed_ba,  // [num_actual_tokens, num_k_heads * (2 *
+                                     // num_v_heads / num_k_heads)]
+     const torch::Tensor&
+         conv_weights,  // [num_k_heads * (2 * head_k_dim + head_v_dim *
+@@ -553,21 +1009,26 @@ void causal_conv1d(
+     torch::Tensor&
+         conv_states,  // [cache_batch_size, width - 1, num_k_heads * (2 *
+                       // head_k_dim + head_v_dim * num_v_heads / num_k_heads)]
+-    const torch::Tensor& query_start_loc,  // [batch_size + 1]
+-    const torch::Tensor& cache_indices,    // [batch_size]
++    const std::optional<torch::Tensor>& query_start_loc,  // [batch_size + 1]
++    const std::optional<torch::Tensor>&
++        token_indx,  // [num_virtual_tokens] or None
++    const std::optional<torch::Tensor>& cache_indices,  // [batch_size]
+     const std::optional<torch::Tensor>&
+-        has_initial_state,    // [batch_size] or None
++        has_initial_state,  // [batch_size] or None
++    const std::optional<torch::Tensor>&
++        num_accepted_tokens,  // [batch_size] or None
+     const ActMode& act_mode,  // silu or swish
+     const int& pad_slot_id,   // -1
+     const int num_prefills,
+     const int num_decodes,
++    const int num_spec_decodes,
+     const bool reorder_input) {
+-  if (num_prefills == 0 && num_decodes == 0) {
+-    return;
+-  }
++  TORCH_CHECK(query_start_loc.has_value() && cache_indices.has_value());
+ 
+-  const int batch_size = query_start_loc.size(0) - 1;
+-  const int num_actual_tokens = q_out.size(0);
++  const bool is_spec = num_accepted_tokens.has_value();
++  const int batch_size = query_start_loc->size(0) - 1;
++  const int num_virtual_tokens = q_out.size(0);
++  const int num_actual_tokens = mixed_qkvz.size(0);
+   const int num_k_heads = q_out.size(1);
+   const int head_k_dim = q_out.size(2);
+   const int num_v_heads = v_out.size(1);
+@@ -577,47 +1038,66 @@ void causal_conv1d(
+   const int width = conv_weights.size(1);
+   const int conv_states_stride_0 = conv_states.stride(0);
+ 
++  int num_spec_tokens = 0;
++  int cache_indices_stride_0 = 0;
++  if (is_spec) {
++    TORCH_CHECK(cache_indices->dim() == 2);
++    TORCH_CHECK(cache_indices->size(0) == num_spec_decodes);
++    num_spec_tokens = cache_indices->size(1);
++    cache_indices_stride_0 = cache_indices->stride(0);
++    TORCH_CHECK(num_accepted_tokens->size(0) == num_spec_decodes);
++  }
++
+   auto dtype = conv_states.dtype();
+   auto device = conv_states.device();
+   torch::Tensor conv_states_tmp = torch::empty(
+-      {batch_size, width - 1, conv_elems},
++      {std::max(batch_size, 1), width - 1, conv_elems},
+       torch::dtype(dtype).device(device).requires_grad(false));
+ 
+-#define KERNEL_LAUNCHER(scalar_t, width, reorder_input)            \
+-  kernel_launcher<scalar_t, width, reorder_input>(                 \
+-      queue,                                                       \
+-      reinterpret_cast<scalar_t*>(q_out.data_ptr()),               \
+-      reinterpret_cast<scalar_t*>(k_out.data_ptr()),               \
+-      reinterpret_cast<scalar_t*>(v_out.data_ptr()),               \
+-      reinterpret_cast<scalar_t*>(z_out.data_ptr()),               \
+-      reinterpret_cast<scalar_t*>(b_out.data_ptr()),               \
+-      reinterpret_cast<scalar_t*>(a_out.data_ptr()),               \
+-      reinterpret_cast<scalar_t*>(mixed_qkvz.data_ptr()),          \
+-      reinterpret_cast<scalar_t*>(mixed_ba.data_ptr()),            \
+-      reinterpret_cast<scalar_t*>(conv_weights.data_ptr()),        \
+-      conv_bias.has_value()                                        \
+-          ? reinterpret_cast<scalar_t*>(conv_bias->data_ptr())     \
+-          : nullptr,                                               \
+-      reinterpret_cast<scalar_t*>(conv_states.data_ptr()),         \
+-      conv_states_stride_0,                                        \
+-      reinterpret_cast<scalar_t*>(conv_states_tmp.data_ptr()),     \
+-      reinterpret_cast<int*>(query_start_loc.data_ptr()),          \
+-      reinterpret_cast<int*>(cache_indices.data_ptr()),            \
+-      has_initial_state.has_value()                                \
+-          ? reinterpret_cast<bool*>(has_initial_state->data_ptr()) \
+-          : nullptr,                                               \
+-      act_mode,                                                    \
+-      pad_slot_id,                                                 \
+-      batch_size,                                                  \
+-      num_actual_tokens,                                           \
+-      num_k_heads,                                                 \
+-      head_k_dim,                                                  \
+-      num_v_heads,                                                 \
+-      head_v_dim,                                                  \
+-      qkvz_elems,                                                  \
+-      conv_elems,                                                  \
+-      num_prefills,                                                \
+-      num_decodes);
++#define KERNEL_LAUNCHER(scalar_t, width, reorder_input)                       \
++  kernel_launcher<scalar_t, width, reorder_input>(                            \
++      queue,                                                                  \
++      reinterpret_cast<scalar_t*>(q_out.data_ptr()),                          \
++      reinterpret_cast<scalar_t*>(k_out.data_ptr()),                          \
++      reinterpret_cast<scalar_t*>(v_out.data_ptr()),                          \
++      reinterpret_cast<scalar_t*>(z_out.data_ptr()),                          \
++      reinterpret_cast<scalar_t*>(b_out.data_ptr()),                          \
++      reinterpret_cast<scalar_t*>(a_out.data_ptr()),                          \
++      reinterpret_cast<scalar_t*>(mixed_qkvz.data_ptr()),                     \
++      reinterpret_cast<scalar_t*>(mixed_ba.data_ptr()),                       \
++      reinterpret_cast<scalar_t*>(conv_weights.data_ptr()),                   \
++      conv_bias.has_value()                                                   \
++          ? reinterpret_cast<scalar_t*>(conv_bias->data_ptr())                \
++          : nullptr,                                                          \
++      reinterpret_cast<scalar_t*>(conv_states.data_ptr()),                    \
++      conv_states_stride_0,                                                   \
++      reinterpret_cast<scalar_t*>(conv_states_tmp.data_ptr()),                \
++      reinterpret_cast<int*>(query_start_loc->data_ptr()),                    \
++      token_indx.has_value() ? reinterpret_cast<int*>(token_indx->data_ptr()) \
++                             : nullptr,                                       \
++      reinterpret_cast<int*>(cache_indices->data_ptr()),                      \
++      cache_indices_stride_0,                                                 \
++      has_initial_state.has_value()                                           \
++          ? reinterpret_cast<bool*>(has_initial_state->data_ptr())            \
++          : nullptr,                                                          \
++      num_accepted_tokens.has_value()                                         \
++          ? reinterpret_cast<int*>(num_accepted_tokens->data_ptr())           \
++          : nullptr,                                                          \
++      act_mode,                                                               \
++      pad_slot_id,                                                            \
++      batch_size,                                                             \
++      num_virtual_tokens,                                                     \
++      num_actual_tokens,                                                      \
++      num_k_heads,                                                            \
++      head_k_dim,                                                             \
++      num_v_heads,                                                            \
++      head_v_dim,                                                             \
++      qkvz_elems,                                                             \
++      conv_elems,                                                             \
++      num_prefills,                                                           \
++      num_decodes,                                                            \
++      num_spec_decodes,                                                       \
++      num_spec_tokens);
+ 
+ #define WIDTH_DISPATCH(scalar_t, width, reorder_input) \
+   switch (width) {                                     \
+diff --git a/csrc/xpu/gdn_attn/gated_delta_rule.hpp b/csrc/xpu/gdn_attn/gated_delta_rule.hpp
+index 19ba665..445ff26 100644
+--- a/csrc/xpu/gdn_attn/gated_delta_rule.hpp
++++ b/csrc/xpu/gdn_attn/gated_delta_rule.hpp
+@@ -26,8 +26,10 @@ struct gated_delta_rule_kernel {
+       StateT* ssm_state,
+       const int ssm_state_stride_0,
+       const int* query_start_loc,
++      const int* token_indx,
+       const int* cache_indices,
+       const bool* has_initial_state,
++      const int* num_accepted_tokens,
+       const int batch_size,
+       const int total_seqlen,
+       const int num_k_heads,
+@@ -45,8 +47,10 @@ struct gated_delta_rule_kernel {
+         ssm_state(ssm_state),
+         ssm_state_stride_0(ssm_state_stride_0),
+         query_start_loc(query_start_loc),
++        token_indx(token_indx),
+         cache_indices(cache_indices),
+         has_initial_state(has_initial_state),
++        num_accepted_tokens(num_accepted_tokens),
+         batch_size(batch_size),
+         total_seqlen(total_seqlen),
+         num_k_heads(num_k_heads),
+@@ -218,13 +222,15 @@ struct gated_delta_rule_kernel {
+         res[i] = sycl::reduce_over_group(sg, res[i], sycl::plus<>());
+       }
+ 
+-      // store O(t)
++      // store O(t) -- core_attn_out is the GLOBAL active buffer; remap
++      // local token id `t` through token_indx if it was provided.
+       if (sg_local_id == 0) {
++        const int global_t = (token_indx != nullptr) ? token_indx[t] : t;
+ #pragma unroll
+         for (int i = 0; i < v_dim_per_sg; ++i) {
+           core_attn_out
+-              [t * num_v_heads * head_v_dim + num_v_heads_id * head_v_dim +
+-               head_v_dim_id + i] = res[i];
++              [global_t * num_v_heads * head_v_dim +
++               num_v_heads_id * head_v_dim + head_v_dim_id + i] = res[i];
+         }
+       }
+     }
+@@ -255,8 +261,10 @@ struct gated_delta_rule_kernel {
+   StateT* ssm_state;
+   const int ssm_state_stride_0;
+   const int* query_start_loc;
++  const int* token_indx;
+   const int* cache_indices;
+   const bool* has_initial_state;
++  const int* num_accepted_tokens;
+   const int batch_size;
+   const int total_seqlen;
+   const int num_k_heads;
+@@ -265,6 +273,282 @@ struct gated_delta_rule_kernel {
+   const int head_v_dim;
+ };
+ 
++// -----------------------------------------------------------------------------
++// Spec-decoding kernel: every spec sequence contributes exactly
++// `num_spec_tokens` (== num_speculative_tokens + 1) tokens, laid out
++// contiguously inside q/k/v/b/a (which are LOCAL buffers of size
++// `num_spec_decodes * num_spec_tokens`).
++//
++// - The initial SSM state for sequence n is read from cache slot
++//   `cache_indices[n, num_accepted_tokens[n] - 1]` (the last accepted token of
++//   the previous step). When num_accepted_tokens[n] is 0 we fall back to col 0
++//   (matches the rejection-sampler invariant that the bonus token is always
++//   accepted, so this branch is defensive only).
++// - After processing every local token t, the new SSM state is written into
++//   `cache_indices[n, t]`, mirroring the Triton kernel's per-step writeback
++//   used to support multiple rollback positions on the next iteration.
++// - `core_attn_out` is the GLOBAL active buffer; we route writes through
++//   `token_indx`, which maps a local token index back to its global position.
++// -----------------------------------------------------------------------------
++template <typename T, typename StateT, int k_bucket_size>
++struct gated_delta_rule_spec_kernel {
++ public:
++  static constexpr int group_size = 256;
++  static constexpr int sg_per_group = group_size / sub_group_size;
++  static constexpr int v_dim_per_sg = 4;
++  static constexpr int v_dim_per_group = v_dim_per_sg * sg_per_group;
++  static constexpr float eps = 0.000001;
++
++  gated_delta_rule_spec_kernel(
++      T* core_attn_out,
++      const T* q,
++      const T* k,
++      const T* v,
++      const T* b,
++      const T* a,
++      const float* A_log,
++      const T* dt_bias,
++      StateT* ssm_state,
++      const int ssm_state_stride_0,
++      const int* token_indx,
++      const int* cache_indices,
++      const int cache_indices_stride_0,
++      const int* num_accepted_tokens,
++      const int num_spec_decodes,
++      const int num_spec_tokens,
++      const int num_k_heads,
++      const int head_k_dim,
++      const int num_v_heads,
++      const int head_v_dim)
++      : core_attn_out(core_attn_out),
++        q(q),
++        k(k),
++        v(v),
++        b(b),
++        a(a),
++        A_log(A_log),
++        dt_bias(dt_bias),
++        ssm_state(ssm_state),
++        ssm_state_stride_0(ssm_state_stride_0),
++        token_indx(token_indx),
++        cache_indices(cache_indices),
++        cache_indices_stride_0(cache_indices_stride_0),
++        num_accepted_tokens(num_accepted_tokens),
++        num_spec_decodes(num_spec_decodes),
++        num_spec_tokens(num_spec_tokens),
++        num_k_heads(num_k_heads),
++        head_k_dim(head_k_dim),
++        num_v_heads(num_v_heads),
++        head_v_dim(head_v_dim) {}
++
++  static inline sycl::nd_range<3> get_nd_range(
++      const int num_spec_decodes, const int num_v_heads, const int head_v_dim) {
++    int num_v_bucket = (head_v_dim + v_dim_per_group - 1) / v_dim_per_group;
++    sycl::range<3> local(1, 1, group_size);
++    sycl::range<3> global(num_spec_decodes, num_v_heads, num_v_bucket);
++    return sycl::nd_range<3>(global * local, local);
++  }
++
++  static inline float act_sigmoid(float& x) {
++    return 1.0f / (1.0f + sycl::exp(-x));
++  }
++
++  static inline float
++  act_softplus(float& x, float beta = 1.0f, float threshold = 20.0f) {
++    if (beta * x < threshold) {
++      return sycl::log(1.0f + sycl::exp(beta * x)) / beta;
++    } else
++      return x;
++  }
++
++  [[sycl::reqd_sub_group_size(sub_group_size)]] void
++  operator()(sycl::nd_item<3> item) const {
++    int batch_id = item.get_group(0);
++    int num_v_heads_id = item.get_group(1);
++    int v_bucket_id = item.get_group(2);
++
++    auto sg = item.get_sub_group();
++    int sg_id = sg.get_group_id();
++    int sg_local_id = sg.get_local_id();
++
++    int kv_ratio = num_v_heads / num_k_heads;
++    int head_v_dim_id = v_bucket_id * v_dim_per_group + sg_id * v_dim_per_sg;
++    if (head_v_dim_id >= head_v_dim) {
++      return;
++    }
++
++    const float scale = 1.0f / sycl::sqrt(float(head_k_dim));
++    float A_log_local = A_log[num_v_heads_id];
++    float dt_bias_local = dt_bias[num_v_heads_id];
++    A_log_local = -sycl::exp(A_log_local);
++
++    float state_local[v_dim_per_sg * k_bucket_size];
++    float q_local[k_bucket_size];
++    float k_local[k_bucket_size];
++    float v_local[v_dim_per_sg];
++
++    // -- Load initial state ---------------------------------------------------
++    // init_col = num_accepted_tokens[batch_id] - 1 (clamped to >= 0).
++    int init_col = num_accepted_tokens[batch_id] - 1;
++    if (init_col < 0) init_col = 0;
++    const int init_state_idx =
++        cache_indices[batch_id * cache_indices_stride_0 + init_col];
++    const StateT* init_state_ptr =
++        ssm_state + static_cast<int64_t>(init_state_idx) * ssm_state_stride_0;
++#pragma unroll
++    for (int j = 0; j < v_dim_per_sg; ++j) {
++#pragma unroll
++      for (int i = 0; i < k_bucket_size; ++i) {
++        state_local[j * k_bucket_size + i] =
++            static_cast<float>(init_state_ptr
++                                   [num_v_heads_id * head_k_dim * head_v_dim +
++                                    (k_bucket_size * sg_local_id + i) +
++                                    (head_v_dim_id + j) * head_k_dim]);
++      }
++    }
++
++    // -- Iterate over the num_spec_tokens tokens of this sequence -------------
++    for (int t_local = 0; t_local < num_spec_tokens; ++t_local) {
++      // Local token index inside q/k/v/b/a (which were sized
++      // num_spec_decodes * num_spec_tokens and ordered by
++      // spec_query_start_loc).
++      const int t = batch_id * num_spec_tokens + t_local;
++
++      float b_local = b[t * num_v_heads + num_v_heads_id];
++      float beta = act_sigmoid(b_local);
++      float a_local = a[t * num_v_heads + num_v_heads_id] + dt_bias_local;
++      float g = sycl::exp(A_log_local * act_softplus(a_local));
++
++      float q_sum = 0.0f;
++      float k_sum = 0.0f;
++#pragma unroll
++      for (int i = 0; i < k_bucket_size; ++i) {
++        q_local[i] =
++            q[t * num_k_heads * head_k_dim +
++              (num_v_heads_id / kv_ratio) * head_k_dim +
++              (k_bucket_size * sg_local_id + i)];
++        k_local[i] =
++            k[t * num_k_heads * head_k_dim +
++              (num_v_heads_id / kv_ratio) * head_k_dim +
++              (k_bucket_size * sg_local_id + i)];
++        q_sum += q_local[i] * q_local[i];
++        k_sum += k_local[i] * k_local[i];
++      }
++      q_sum = sycl::reduce_over_group(sg, q_sum, sycl::plus<>());
++      k_sum = sycl::reduce_over_group(sg, k_sum, sycl::plus<>());
++      q_sum += eps;
++      k_sum += eps;
++#pragma unroll
++      for (int i = 0; i < k_bucket_size; ++i) {
++        q_local[i] /= sycl::sqrt(q_sum);
++        q_local[i] *= scale;
++        k_local[i] /= sycl::sqrt(k_sum);
++      }
++
++      float kv_mem[v_dim_per_sg];
++#pragma unroll
++      for (int i = 0; i < v_dim_per_sg; ++i) {
++        kv_mem[i] = 0.0f;
++      }
++#pragma unroll
++      for (int j = 0; j < v_dim_per_sg; ++j) {
++#pragma unroll
++        for (int i = 0; i < k_bucket_size; ++i) {
++          state_local[j * k_bucket_size + i] *= g;
++          kv_mem[j] += state_local[j * k_bucket_size + i] * k_local[i];
++        }
++      }
++#pragma unroll
++      for (int i = 0; i < v_dim_per_sg; ++i) {
++        kv_mem[i] = sycl::reduce_over_group(sg, kv_mem[i], sycl::plus<>());
++      }
++
++#pragma unroll
++      for (int i = 0; i < v_dim_per_sg; ++i) {
++        v_local[i] =
++            v[t * num_v_heads * head_v_dim + num_v_heads_id * head_v_dim +
++              head_v_dim_id + i];
++      }
++      float delta[v_dim_per_sg];
++#pragma unroll
++      for (int i = 0; i < v_dim_per_sg; ++i) {
++        delta[i] = (v_local[i] - kv_mem[i]) * beta;
++      }
++
++      float res[v_dim_per_sg];
++#pragma unroll
++      for (int i = 0; i < v_dim_per_sg; ++i) {
++        res[i] = 0.0f;
++      }
++#pragma unroll
++      for (int j = 0; j < v_dim_per_sg; ++j) {
++#pragma unroll
++        for (int i = 0; i < k_bucket_size; ++i) {
++          state_local[j * k_bucket_size + i] += k_local[i] * delta[j];
++          res[j] += state_local[j * k_bucket_size + i] * q_local[i];
++        }
++      }
++#pragma unroll
++      for (int i = 0; i < v_dim_per_sg; ++i) {
++        res[i] = sycl::reduce_over_group(sg, res[i], sycl::plus<>());
++      }
++
++      // Write O(t) to GLOBAL core_attn_out via token_indx remap.
++      if (sg_local_id == 0) {
++        const int global_t = (token_indx != nullptr) ? token_indx[t] : t;
++#pragma unroll
++        for (int i = 0; i < v_dim_per_sg; ++i) {
++          core_attn_out
++              [global_t * num_v_heads * head_v_dim +
++               num_v_heads_id * head_v_dim + head_v_dim_id + i] = res[i];
++        }
++      }
++
++      // Write the new SSM state back to this token's dedicated cache slot,
++      // so that the next forward can pick the right rollback column based on
++      // num_accepted_tokens.
++      const int final_state_idx =
++          cache_indices[batch_id * cache_indices_stride_0 + t_local];
++      StateT* final_state_ptr =
++          ssm_state +
++          static_cast<int64_t>(final_state_idx) * ssm_state_stride_0;
++#pragma unroll
++      for (int j = 0; j < v_dim_per_sg; ++j) {
++#pragma unroll
++        for (int i = 0; i < k_bucket_size; ++i) {
++          final_state_ptr
++              [num_v_heads_id * head_k_dim * head_v_dim +
++               (k_bucket_size * sg_local_id + i) +
++               (head_v_dim_id + j) * head_k_dim] =
++                  static_cast<StateT>(state_local[j * k_bucket_size + i]);
++        }
++      }
++    }
++  }
++
++ private:
++  T* core_attn_out;
++  const T* q;
++  const T* k;
++  const T* v;
++  const T* b;
++  const T* a;
++  const float* A_log;
++  const T* dt_bias;
++  StateT* ssm_state;
++  const int ssm_state_stride_0;
++  const int* token_indx;
++  const int* cache_indices;
++  const int cache_indices_stride_0;
++  const int* num_accepted_tokens;
++  const int num_spec_decodes;
++  const int num_spec_tokens;
++  const int num_k_heads;
++  const int head_k_dim;
++  const int num_v_heads;
++  const int head_v_dim;
++};
++
+ template <typename T, typename StateT, int k_bucket_size>
+ void kernel_launcher(
+     sycl::queue& queue,
+@@ -279,8 +563,10 @@ void kernel_launcher(
+     StateT* ssm_state,
+     const int ssm_state_stride_0,
+     const int* query_start_loc,
++    const int* token_indx,
+     const int* cache_indices,
+     const bool* has_initial_state,
++    const int* num_accepted_tokens,
+     const int batch_size,
+     const int total_seqlen,
+     const int num_k_heads,
+@@ -303,8 +589,10 @@ void kernel_launcher(
+         ssm_state,
+         ssm_state_stride_0,
+         query_start_loc,
++        token_indx,
+         cache_indices,
+         has_initial_state,
++        num_accepted_tokens,
+         batch_size,
+         total_seqlen,
+         num_k_heads,
+@@ -315,6 +603,58 @@ void kernel_launcher(
+   });
+ }
+ 
++template <typename T, typename StateT, int k_bucket_size>
++void kernel_launcher_spec(
++    sycl::queue& queue,
++    T* core_attn_out,
++    const T* q,
++    const T* k,
++    const T* v,
++    const T* b,
++    const T* a,
++    const float* A_log,
++    const T* dt_bias,
++    StateT* ssm_state,
++    const int ssm_state_stride_0,
++    const int* token_indx,
++    const int* cache_indices,
++    const int cache_indices_stride_0,
++    const int* num_accepted_tokens,
++    const int num_spec_decodes,
++    const int num_spec_tokens,
++    const int num_k_heads,
++    const int head_k_dim,
++    const int num_v_heads,
++    const int head_v_dim) {
++  using KERNEL = gated_delta_rule_spec_kernel<T, StateT, k_bucket_size>;
++  auto range = KERNEL::get_nd_range(num_spec_decodes, num_v_heads, head_v_dim);
++  assert(head_v_dim % KERNEL::v_dim_per_group == 0);
++  queue.submit([&](sycl::handler& cgh) {
++    KERNEL task(
++        core_attn_out,
++        q,
++        k,
++        v,
++        b,
++        a,
++        A_log,
++        dt_bias,
++        ssm_state,
++        ssm_state_stride_0,
++        token_indx,
++        cache_indices,
++        cache_indices_stride_0,
++        num_accepted_tokens,
++        num_spec_decodes,
++        num_spec_tokens,
++        num_k_heads,
++        head_k_dim,
++        num_v_heads,
++        head_v_dim);
++    cgh.parallel_for(range, task);
++  });
++}
++
+ void gated_delta_rule(
+     sycl::queue& queue,
+     torch::Tensor& core_attn_out,  // [total_seqlen, num_v_heads, head_v_dim]
+@@ -327,17 +667,26 @@ void gated_delta_rule(
+     const torch::Tensor& dt_bias,  // [num_v_heads]
+     torch::Tensor&
+         ssm_state,  // [cache_batch_size, num_v_heads, head_v_dim, head_k_dim]
+-    const torch::Tensor& query_start_loc,  // [batch_size + 1]
+-    const torch::Tensor& cache_indices,    // [batch_size]
++    const std::optional<torch::Tensor>& query_start_loc,  // [batch_size + 1]
++    const std::optional<torch::Tensor>&
++        token_indx,  // [num_virtual_tokens] or None
++    const std::optional<torch::Tensor>& cache_indices,  // [batch_size]
+     const std::optional<torch::Tensor>&
+         has_initial_state,  // [batch_size] or None
++    const std::optional<torch::Tensor>&
++        num_accepted_tokens,  // [batch_size] or None
+     const int num_prefills,
+-    const int num_decodes) {
+-  if (num_prefills == 0 && num_decodes == 0) {
+-    return;
+-  }
++    const int num_decodes,
++    const int num_spec_decodes) {
++  TORCH_CHECK(query_start_loc.has_value() && cache_indices.has_value());
++
++  // Spec path is selected when num_accepted_tokens is provided. In that case
++  // cache_indices is the 2D spec_state_indices_tensor of shape
++  // [num_spec_decodes, num_speculative_tokens + 1]; otherwise it is the 1D
++  // non_spec_state_indices_tensor.
++  const bool is_spec = num_accepted_tokens.has_value();
+ 
+-  int batch_size = query_start_loc.size(0) - 1;
++  int batch_size = query_start_loc->size(0) - 1;
+   if (num_prefills == 0 && num_decodes > 0) {
+     batch_size = num_decodes;
+   }
+@@ -348,6 +697,16 @@ void gated_delta_rule(
+   const int head_v_dim = v.size(2);
+   const int ssm_state_stride_0 = ssm_state.stride(0);
+ 
++  int num_spec_tokens = 0;
++  int cache_indices_stride_0 = 0;
++  if (is_spec) {
++    TORCH_CHECK(cache_indices->dim() == 2);
++    TORCH_CHECK(cache_indices->size(0) == num_spec_decodes);
++    num_spec_tokens = cache_indices->size(1);
++    cache_indices_stride_0 = cache_indices->stride(0);
++    TORCH_CHECK(num_accepted_tokens->size(0) == num_spec_decodes);
++  }
++
+   TORCH_CHECK(num_v_heads % num_k_heads == 0);
+   TORCH_CHECK(
+       A_log.scalar_type() == at::kFloat,
+@@ -364,30 +723,61 @@ void gated_delta_rule(
+   TORCH_CHECK(head_k_dim % sub_group_size == 0);
+   const int k_bucket_size = head_k_dim / sub_group_size;
+ 
+-#define KERNEL_LAUNCHER(scalar_t, state_scalar_t, k_bucket_size)   \
+-  kernel_launcher<scalar_t, state_scalar_t, k_bucket_size>(        \
+-      queue,                                                       \
+-      reinterpret_cast<scalar_t*>(core_attn_out.data_ptr()),       \
+-      reinterpret_cast<scalar_t*>(q.data_ptr()),                   \
+-      reinterpret_cast<scalar_t*>(k.data_ptr()),                   \
+-      reinterpret_cast<scalar_t*>(v.data_ptr()),                   \
+-      reinterpret_cast<scalar_t*>(b.data_ptr()),                   \
+-      reinterpret_cast<scalar_t*>(a.data_ptr()),                   \
+-      reinterpret_cast<float*>(A_log.data_ptr()),                  \
+-      reinterpret_cast<scalar_t*>(dt_bias.data_ptr()),             \
+-      reinterpret_cast<state_scalar_t*>(ssm_state.data_ptr()),     \
+-      ssm_state_stride_0,                                          \
+-      reinterpret_cast<int*>(query_start_loc.data_ptr()),          \
+-      reinterpret_cast<int*>(cache_indices.data_ptr()),            \
+-      has_initial_state.has_value()                                \
+-          ? reinterpret_cast<bool*>(has_initial_state->data_ptr()) \
+-          : nullptr,                                               \
+-      batch_size,                                                  \
+-      total_seqlen,                                                \
+-      num_k_heads,                                                 \
+-      head_k_dim,                                                  \
+-      num_v_heads,                                                 \
+-      head_v_dim);
++#define KERNEL_LAUNCHER(scalar_t, state_scalar_t, k_bucket_size)     \
++  if (is_spec) {                                                     \
++    kernel_launcher_spec<scalar_t, state_scalar_t, k_bucket_size>(   \
++        queue,                                                       \
++        reinterpret_cast<scalar_t*>(core_attn_out.data_ptr()),       \
++        reinterpret_cast<scalar_t*>(q.data_ptr()),                   \
++        reinterpret_cast<scalar_t*>(k.data_ptr()),                   \
++        reinterpret_cast<scalar_t*>(v.data_ptr()),                   \
++        reinterpret_cast<scalar_t*>(b.data_ptr()),                   \
++        reinterpret_cast<scalar_t*>(a.data_ptr()),                   \
++        reinterpret_cast<float*>(A_log.data_ptr()),                  \
++        reinterpret_cast<scalar_t*>(dt_bias.data_ptr()),             \
++        reinterpret_cast<state_scalar_t*>(ssm_state.data_ptr()),     \
++        ssm_state_stride_0,                                          \
++        token_indx.has_value()                                       \
++            ? reinterpret_cast<int*>(token_indx->data_ptr())         \
++            : nullptr,                                               \
++        reinterpret_cast<int*>(cache_indices->data_ptr()),           \
++        cache_indices_stride_0,                                      \
++        reinterpret_cast<int*>(num_accepted_tokens->data_ptr()),     \
++        num_spec_decodes,                                            \
++        num_spec_tokens,                                             \
++        num_k_heads,                                                 \
++        head_k_dim,                                                  \
++        num_v_heads,                                                 \
++        head_v_dim);                                                 \
++  } else {                                                           \
++    kernel_launcher<scalar_t, state_scalar_t, k_bucket_size>(        \
++        queue,                                                       \
++        reinterpret_cast<scalar_t*>(core_attn_out.data_ptr()),       \
++        reinterpret_cast<scalar_t*>(q.data_ptr()),                   \
++        reinterpret_cast<scalar_t*>(k.data_ptr()),                   \
++        reinterpret_cast<scalar_t*>(v.data_ptr()),                   \
++        reinterpret_cast<scalar_t*>(b.data_ptr()),                   \
++        reinterpret_cast<scalar_t*>(a.data_ptr()),                   \
++        reinterpret_cast<float*>(A_log.data_ptr()),                  \
++        reinterpret_cast<scalar_t*>(dt_bias.data_ptr()),             \
++        reinterpret_cast<state_scalar_t*>(ssm_state.data_ptr()),     \
++        ssm_state_stride_0,                                          \
++        reinterpret_cast<int*>(query_start_loc->data_ptr()),         \
++        token_indx.has_value()                                       \
++            ? reinterpret_cast<int*>(token_indx->data_ptr())         \
++            : nullptr,                                               \
++        reinterpret_cast<int*>(cache_indices->data_ptr()),           \
++        has_initial_state.has_value()                                \
++            ? reinterpret_cast<bool*>(has_initial_state->data_ptr()) \
++            : nullptr,                                               \
++        /*num_accepted_tokens=*/nullptr,                             \
++        batch_size,                                                  \
++        total_seqlen,                                                \
++        num_k_heads,                                                 \
++        head_k_dim,                                                  \
++        num_v_heads,                                                 \
++        head_v_dim);                                                 \
++  }
+ 
+ #define BUCKET_DISPATCH(scalar_t, state_scalar_t, k_bucket_size) \
+   switch (k_bucket_size) {                                       \
+diff --git a/csrc/xpu/gdn_attn/gdn_attn_interface.cpp b/csrc/xpu/gdn_attn/gdn_attn_interface.cpp
+index 94984d0..22b56de 100644
+--- a/csrc/xpu/gdn_attn/gdn_attn_interface.cpp
++++ b/csrc/xpu/gdn_attn/gdn_attn_interface.cpp
+@@ -12,16 +12,16 @@
+ #endif
+ 
+ void gdn_attention(
+-    torch::Tensor&
+-        core_attn_out,  // [total_seqlen, num_v_heads / tp_size, head_v_dim]
+-    torch::Tensor& z,   // [total_seqlen, num_v_heads / tp_size, head_v_dim]
++    torch::Tensor& core_attn_out,  // [num_actual_tokens, num_v_heads / tp_size,
++                                   // head_v_dim]
++    torch::Tensor& z,  // [num_actual_tokens, num_v_heads / tp_size, head_v_dim]
+     const torch::Tensor&
+-        projected_states_qkvz,  // [total_seqlen, num_k_heads / tp_size * (2 *
+-                                // head_k_dim + 2 * head_v_dim * num_v_heads /
+-                                // num_k_heads)]
++        projected_states_qkvz,  // [num_actual_tokens, num_k_heads / tp_size *
++                                // (2 * head_k_dim + 2 * head_v_dim *
++                                // num_v_heads / num_k_heads)]
+     const torch::Tensor&
+-        projected_states_ba,  // [total_seqlen, num_k_heads / tp_size * (2 *
+-                              // num_v_heads / num_k_heads)]
++        projected_states_ba,  // [num_actual_tokens, num_k_heads / tp_size * (2
++                              // * num_v_heads / num_k_heads)]
+     const int64_t num_k_heads,
+     const int64_t num_v_heads,
+     const int64_t head_k_dim,
+@@ -42,10 +42,23 @@ void gdn_attention(
+     const torch::Tensor& dt_bias,  // [num_v_heads / tp_size]
+     const int64_t num_prefills,
+     const int64_t num_decodes,
++    const int64_t num_spec_decodes,
++    const std::optional<torch::Tensor>&
++        has_initial_state,  // [num_prefills] or None
++    const std::optional<torch::Tensor>&
++        non_spec_query_start_loc,  // [num_prefills + num_decodes + 1]
++    const std::optional<torch::Tensor>&
++        non_spec_token_indx,  // [non_spec_token]
++    const std::optional<torch::Tensor>&
++        non_spec_state_indices_tensor,  // [num_prefills + num_decodes]
++    const std::optional<torch::Tensor>&
++        spec_query_start_loc,  // [num_spec_decodes + 1]
++    const std::optional<torch::Tensor>& spec_token_indx,  // [spec_token]
+     const std::optional<torch::Tensor>&
+-        has_initial_state,                               // [batch_size] or None
+-    const torch::Tensor& non_spec_query_start_loc,       // [batch_size + 1]
+-    const torch::Tensor& non_spec_state_indices_tensor,  // [batch_size]
++        spec_state_indices_tensor,  // [num_spec_decodes, num_speculative_tokens
++                                    // + 1]
++    const std::optional<torch::Tensor>&
++        num_accepted_tokens,  // [num_spec_decodes]
+     const int64_t num_actual_tokens,
+     const int64_t tp_size,
+     const bool reorder_input) {
+@@ -67,34 +80,193 @@ void gdn_attention(
+   TORCH_CHECK(conv_weights.is_contiguous(), "conv_weights must be contiguous");
+   TORCH_CHECK(A_log.is_contiguous(), "A_log must be contiguous");
+   TORCH_CHECK(dt_bias.is_contiguous(), "dt_bias must be contiguous");
+-  TORCH_CHECK(
+-      non_spec_query_start_loc.is_contiguous(),
+-      "non_spec_query_start_loc must be contiguous");
+-  TORCH_CHECK(
+-      non_spec_state_indices_tensor.is_contiguous(),
+-      "non_spec_state_indices_tensor must be contiguous");
+ 
+-  // check core_attn_out shape
+-  TORCH_CHECK(core_attn_out.size(0) == num_actual_tokens);
++  int non_spec_token = 0;
++  if (num_prefills + num_decodes > 0) {
++    if (has_initial_state.has_value()) {
++      TORCH_CHECK(
++          has_initial_state->is_contiguous(),
++          "has_initial_state must be contiguous");
++      TORCH_CHECK(
++          has_initial_state->dtype() == torch::kBool,
++          "has_initial_state must be of bool dtype");
++      TORCH_CHECK(
++          has_initial_state->dim() == 1,
++          "has_initial_state must be 1D of shape [num_prefills + num_decodes]");
++      TORCH_CHECK(
++          num_prefills + num_decodes > 0 &&
++              has_initial_state->size(0) == num_prefills + num_decodes,
++          "has_initial_state must have size [num_prefills + num_decodes]");
++    }
++
++    TORCH_CHECK(
++        non_spec_query_start_loc->is_contiguous(),
++        "non_spec_query_start_loc must be contiguous");
++    TORCH_CHECK(
++        non_spec_query_start_loc->dtype() == torch::kInt32,
++        "non_spec_query_start_loc must be of int32 dtype");
++    TORCH_CHECK(
++        non_spec_query_start_loc->dim() == 1,
++        "non_spec_query_start_loc must be 1D of shape [num_prefills + "
++        "num_decodes + 1]");
++    TORCH_CHECK(
++        non_spec_query_start_loc->size(0) == num_prefills + num_decodes + 1,
++        "non_spec_query_start_loc must have size [num_prefills + num_decodes + "
++        "1]");
++
++    if (non_spec_token_indx.has_value()) {
++      TORCH_CHECK(
++          non_spec_token_indx->is_contiguous(),
++          "non_spec_token_indx must be contiguous");
++      TORCH_CHECK(
++          non_spec_token_indx->dtype() == torch::kInt32,
++          "non_spec_token_indx must be of int32 dtype");
++      TORCH_CHECK(
++          non_spec_token_indx->dim() == 1,
++          "non_spec_token_indx must be 1D of shape [non_spec_token]");
++      non_spec_token = non_spec_token_indx->size(0);
++    } else {
++      non_spec_token = num_actual_tokens;
++    }
++
++    TORCH_CHECK(
++        non_spec_state_indices_tensor->is_contiguous(),
++        "non_spec_state_indices_tensor must be contiguous");
++    TORCH_CHECK(
++        non_spec_state_indices_tensor->dtype() == torch::kInt32,
++        "non_spec_state_indices_tensor must be of int32 dtype");
++    TORCH_CHECK(
++        non_spec_state_indices_tensor->dim() == 1,
++        "non_spec_state_indices_tensor must be 1D of shape [num_prefills + "
++        "num_decodes]");
++    TORCH_CHECK(
++        num_prefills + num_decodes > 0 && non_spec_state_indices_tensor->size(
++                                              0) == num_prefills + num_decodes,
++        "non_spec_state_indices_tensor must have size [num_prefills + "
++        "num_decodes, non_spec_token]");
++  }
++
++  int spec_token = 0;
++  int num_speculative_tokens = 0;
++  if (num_spec_decodes > 0) {
++    TORCH_CHECK(
++        spec_query_start_loc->is_contiguous(),
++        "spec_query_start_loc must be contiguous");
++    TORCH_CHECK(
++        spec_query_start_loc->dtype() == torch::kInt32,
++        "spec_query_start_loc must be of int32 dtype");
++    TORCH_CHECK(
++        spec_query_start_loc->dim() == 1,
++        "spec_query_start_loc must be 1D of shape [num_spec_decodes + 1]");
++    TORCH_CHECK(
++        spec_query_start_loc->size(0) == num_spec_decodes + 1,
++        "spec_query_start_loc must have size [num_spec_decodes + 1]");
++
++    TORCH_CHECK(
++        spec_token_indx->is_contiguous(), "spec_token_indx must be contiguous");
++    TORCH_CHECK(
++        spec_token_indx->dtype() == torch::kInt32,
++        "spec_token_indx must be of int32 dtype");
++    TORCH_CHECK(
++        spec_token_indx->dim() == 1,
++        "spec_token_indx must be 1D of shape [spec_token]");
++    spec_token = spec_token_indx->size(0);
++
++    TORCH_CHECK(
++        spec_state_indices_tensor->is_contiguous(),
++        "spec_state_indices_tensor must be contiguous");
++    TORCH_CHECK(
++        spec_state_indices_tensor->dtype() == torch::kInt32,
++        "spec_state_indices_tensor must be of int32 dtype");
++    TORCH_CHECK(
++        spec_state_indices_tensor->dim() == 2,
++        "spec_state_indices_tensor must be 2D of shape [num_spec_decodes, "
++        "num_speculative_tokens + 1]");
++    TORCH_CHECK(
++        num_spec_decodes > 0 &&
++            spec_state_indices_tensor->size(0) == num_spec_decodes,
++        "spec_state_indices_tensor must have size [num_spec_decodes, "
++        "num_speculative_tokens + 1]");
++    num_speculative_tokens = spec_state_indices_tensor->size(1) - 1;
++
++    TORCH_CHECK(
++        num_accepted_tokens->is_contiguous(),
++        "num_accepted_tokens must be contiguous");
++    TORCH_CHECK(
++        num_accepted_tokens->dtype() == torch::kInt32,
++        "num_accepted_tokens must be of int32 dtype");
++    TORCH_CHECK(
++        num_accepted_tokens->dim() == 1,
++        "num_accepted_tokens must be 1D of shape [num_spec_decodes]");
++    TORCH_CHECK(
++        num_accepted_tokens->size(0) == num_spec_decodes,
++        "num_accepted_tokens size must be num_spec_decodes");
++  }
++
++  // NOTE: spec_token need NOT equal num_spec_decodes*(num_speculative_tokens+1).
++  // The scheduler produces ragged spec batches: when a request accepts 0 draft
++  // tokens (num_accepted_tokens==0 -> num_decode_draft_tokens==-1) or the batch
++  // is otherwise short, gdn_attn.py deliberately truncates spec_token_indx via
++  // min(num_spec_decodes*(n+1), query_start_loc[-1]). The CUDA reference kernel
++  // (gdn_linear_attn.py forward_cuda) has no such rectangular assumption -- it
++  // index_selects by the actual spec_token_indx length. The sub-kernels here
++  // (causal_conv1d / gated_delta_rule) likewise walk per-request ranges via
++  // spec_query_start_loc, so a short spec region is handled correctly. Only the
++  // conservation check below is required.
++  TORCH_CHECK(non_spec_token + spec_token == num_actual_tokens);
++
++  // check core_attn_out / z / projected_states_{qkvz,ba} shapes.
++  // Callers running under torch.compile + cudagraph capture pad the leading
++  // dim to the captured graph size while num_actual_tokens stays at the real
++  // (unpadded) count, so accept size(0) >= num_actual_tokens and narrow to the
++  // active prefix below.
++  TORCH_CHECK(
++      core_attn_out.size(0) >= num_actual_tokens,
++      "core_attn_out.size(0) (",
++      core_attn_out.size(0),
++      ") must be >= num_actual_tokens (",
++      num_actual_tokens,
++      ")");
+   TORCH_CHECK(core_attn_out.size(1) == num_v_heads / tp_size);
+   TORCH_CHECK(core_attn_out.size(2) == head_v_dim);
+ 
+-  // check z shape
+   TORCH_CHECK(z.size(0) == core_attn_out.size(0));
+   TORCH_CHECK(z.size(1) == core_attn_out.size(1));
+   TORCH_CHECK(z.size(2) == core_attn_out.size(2));
+ 
+-  // check projected_states_qkvz shape
+-  TORCH_CHECK(projected_states_qkvz.size(0) == num_actual_tokens);
++  TORCH_CHECK(
++      projected_states_qkvz.size(0) >= num_actual_tokens,
++      "projected_states_qkvz.size(0) (",
++      projected_states_qkvz.size(0),
++      ") must be >= num_actual_tokens (",
++      num_actual_tokens,
++      ")");
+   TORCH_CHECK(
+       projected_states_qkvz.size(1) ==
+       num_k_heads / tp_size *
+           (2 * head_k_dim + 2 * head_v_dim * num_v_heads / num_k_heads));
+ 
+-  // check projected_states_ba shape
+-  TORCH_CHECK(projected_states_ba.size(0) == num_actual_tokens);
++  TORCH_CHECK(
++      projected_states_ba.size(0) >= num_actual_tokens,
++      "projected_states_ba.size(0) (",
++      projected_states_ba.size(0),
++      ") must be >= num_actual_tokens (",
++      num_actual_tokens,
++      ")");
+   TORCH_CHECK(projected_states_ba.size(1) == 2 * num_v_heads / tp_size);
+ 
++  // Narrowing dim 0 of a contiguous tensor yields a contiguous view that
++  // shares storage with the original, so writes through core_attn_out_active
++  // land in the caller's buffer at offsets [0, num_actual_tokens); padded
++  // trailing slots are left untouched (matches the CUDA path in
++  // gdn_linear_attn.py).
++  auto core_attn_out_active = core_attn_out.narrow(0, 0, num_actual_tokens);
++  auto z_active = z.narrow(0, 0, num_actual_tokens);
++  auto projected_states_qkvz_active =
++      projected_states_qkvz.narrow(0, 0, num_actual_tokens);
++  auto projected_states_ba_active =
++      projected_states_ba.narrow(0, 0, num_actual_tokens);
++
+   auto& queue = vllm::xpu::vllmGetQueue();
+   auto dtype = projected_states_qkvz.dtype();
+   auto device = projected_states_qkvz.device();
+@@ -109,47 +281,115 @@ void gdn_attention(
+   }
+   const int pad_slot_id = -1;
+ 
++  std::optional<torch::Tensor> empty_tensor{std::nullopt};
++
++  if (spec_token > 0) {
++    torch::Tensor q = torch::empty(
++        {spec_token, num_k_heads / tp_size, head_k_dim},
++        torch::dtype(dtype).device(device).requires_grad(false));
++    torch::Tensor k = torch::empty(
++        {spec_token, num_k_heads / tp_size, head_k_dim},
++        torch::dtype(dtype).device(device).requires_grad(false));
++    torch::Tensor v = torch::empty(
++        {spec_token, num_v_heads / tp_size, head_v_dim},
++        torch::dtype(dtype).device(device).requires_grad(false));
++    torch::Tensor b = torch::empty(
++        {spec_token, num_v_heads / tp_size},
++        torch::dtype(dtype).device(device).requires_grad(false));
++    torch::Tensor a = torch::empty(
++        {spec_token, num_v_heads / tp_size},
++        torch::dtype(dtype).device(device).requires_grad(false));
++
++    gdn::causal_conv1d(
++        queue,
++        q,
++        k,
++        v,
++        z_active,
++        b,
++        a,
++        projected_states_qkvz_active,
++        projected_states_ba_active,
++        conv_weights,
++        conv_bias,
++        conv_state,
++        spec_query_start_loc,
++        spec_token_indx,
++        spec_state_indices_tensor,
++        empty_tensor,
++        num_accepted_tokens,
++        act_mode,
++        pad_slot_id,
++        num_prefills,
++        num_decodes,
++        num_spec_decodes,
++        reorder_input);
++    gdn::gated_delta_rule(
++        queue,
++        core_attn_out_active,
++        q,
++        k,
++        v,
++        b,
++        a,
++        A_log,
++        dt_bias,
++        ssm_state,
++        spec_query_start_loc,
++        spec_token_indx,
++        spec_state_indices_tensor,
++        empty_tensor,
++        num_accepted_tokens,
++        num_prefills,
++        num_decodes,
++        num_spec_decodes);
++  }
++
++  if (non_spec_token > 0) {
+ #define NATIVE_LAUNCHER                                           \
+   do {                                                            \
+     torch::Tensor q = torch::empty(                               \
+-        {num_actual_tokens, num_k_heads / tp_size, head_k_dim},   \
++        {non_spec_token, num_k_heads / tp_size, head_k_dim},      \
+         torch::dtype(dtype).device(device).requires_grad(false)); \
+     torch::Tensor k = torch::empty(                               \
+-        {num_actual_tokens, num_k_heads / tp_size, head_k_dim},   \
++        {non_spec_token, num_k_heads / tp_size, head_k_dim},      \
+         torch::dtype(dtype).device(device).requires_grad(false)); \
+     torch::Tensor v = torch::empty(                               \
+-        {num_actual_tokens, num_v_heads / tp_size, head_v_dim},   \
++        {non_spec_token, num_v_heads / tp_size, head_v_dim},      \
+         torch::dtype(dtype).device(device).requires_grad(false)); \
+     torch::Tensor b = torch::empty(                               \
+-        {num_actual_tokens, num_v_heads / tp_size},               \
++        {non_spec_token, num_v_heads / tp_size},                  \
+         torch::dtype(dtype).device(device).requires_grad(false)); \
+     torch::Tensor a = torch::empty(                               \
+-        {num_actual_tokens, num_v_heads / tp_size},               \
++        {non_spec_token, num_v_heads / tp_size},                  \
+         torch::dtype(dtype).device(device).requires_grad(false)); \
+     gdn::causal_conv1d(                                           \
+         queue,                                                    \
+         q,                                                        \
+         k,                                                        \
+         v,                                                        \
+-        z,                                                        \
++        z_active,                                                 \
+         b,                                                        \
+         a,                                                        \
+-        projected_states_qkvz,                                    \
+-        projected_states_ba,                                      \
++        projected_states_qkvz_active,                             \
++        projected_states_ba_active,                               \
+         conv_weights,                                             \
+         conv_bias,                                                \
+         conv_state,                                               \
+         non_spec_query_start_loc,                                 \
++        non_spec_token_indx,                                      \
+         non_spec_state_indices_tensor,                            \
+         has_initial_state,                                        \
++        empty_tensor,                                             \
+         act_mode,                                                 \
+         pad_slot_id,                                              \
+         num_prefills,                                             \
+         num_decodes,                                              \
++        num_spec_decodes,                                         \
+         reorder_input);                                           \
+     gdn::gated_delta_rule(                                        \
+         queue,                                                    \
+-        core_attn_out,                                            \
++        core_attn_out_active,                                     \
+         q,                                                        \
+         k,                                                        \
+         v,                                                        \
+@@ -159,76 +399,93 @@ void gdn_attention(
+         dt_bias,                                                  \
+         ssm_state,                                                \
+         non_spec_query_start_loc,                                 \
++        non_spec_token_indx,                                      \
+         non_spec_state_indices_tensor,                            \
+         has_initial_state,                                        \
++        empty_tensor,                                             \
+         num_prefills,                                             \
+-        num_decodes);                                             \
++        num_decodes,                                              \
++        num_spec_decodes);                                        \
+   } while (0)
+ 
+ #ifdef VLLM_XPU_ENABLE_XE2
+-  if (num_prefills > 0) {
+-    int batch_size = non_spec_query_start_loc.size(0) - 1;
+-    int padding_size = batch_size * (gdn::chunk_size_xe2 - 1);
++    // XE2 chunk path handles all non-spec tokens whenever there are prefills,
++    // even when spec_decodes are also present. The XE2 kernels accept an
++    // optional token_indx so they can read mixed_qkvz/mixed_ba and write z /
++    // core_attn_out directly at the interleaved global slots indicated by
++    // non_spec_token_indx, avoiding host-side gather/scatter.
++    if (num_prefills > 0) {
++      int batch_size = non_spec_query_start_loc->size(0) - 1;
++      int padding_size = batch_size * (gdn::chunk_size_xe2 - 1);
+ 
+-    torch::Tensor q = torch::zeros(
+-        {num_actual_tokens + padding_size, num_k_heads / tp_size, head_k_dim},
+-        torch::dtype(dtype).device(device).requires_grad(false));
+-    torch::Tensor k = torch::zeros(
+-        {num_actual_tokens + padding_size, num_k_heads / tp_size, head_k_dim},
+-        torch::dtype(dtype).device(device).requires_grad(false));
+-    torch::Tensor v = torch::zeros(
+-        {num_actual_tokens + padding_size, num_v_heads / tp_size, head_v_dim},
+-        torch::dtype(dtype).device(device).requires_grad(false));
+-    torch::Tensor b = torch::zeros(
+-        {num_v_heads / tp_size, num_actual_tokens + padding_size},
+-        torch::dtype(torch::kFloat32).device(device).requires_grad(false));
+-    torch::Tensor a = torch::zeros(
+-        {num_v_heads / tp_size, num_actual_tokens + padding_size},
+-        torch::dtype(torch::kFloat32).device(device).requires_grad(false));
+-
+-    gdn::chunk_causal_conv1d_xe2(
+-        queue,
+-        q,
+-        k,
+-        v,
+-        z,
+-        b,
+-        a,
+-        projected_states_qkvz,
+-        projected_states_ba,
+-        conv_weights,
+-        conv_bias,
+-        conv_state,
+-        non_spec_query_start_loc,
+-        non_spec_state_indices_tensor,
+-        has_initial_state,
+-        act_mode,
+-        pad_slot_id,
+-        num_prefills,
+-        num_decodes,
+-        reorder_input);
++      const int* token_indx_ptr =
++          non_spec_token_indx.has_value()
++              ? reinterpret_cast<const int*>(non_spec_token_indx->data_ptr())
++              : nullptr;
+ 
+-    chunk_gated_delta_rule_xe2(
+-        queue,
+-        core_attn_out,
+-        q,
+-        k,
+-        v,
+-        b,
+-        a,
+-        A_log,
+-        dt_bias,
+-        ssm_state,
+-        non_spec_query_start_loc,
+-        non_spec_state_indices_tensor,
+-        has_initial_state,
+-        num_prefills,
+-        num_decodes);
+-  } else {
+-    NATIVE_LAUNCHER;
+-  }
++      torch::Tensor q = torch::zeros(
++          {non_spec_token + padding_size, num_k_heads / tp_size, head_k_dim},
++          torch::dtype(dtype).device(device).requires_grad(false));
++      torch::Tensor k = torch::zeros(
++          {non_spec_token + padding_size, num_k_heads / tp_size, head_k_dim},
++          torch::dtype(dtype).device(device).requires_grad(false));
++      torch::Tensor v = torch::zeros(
++          {non_spec_token + padding_size, num_v_heads / tp_size, head_v_dim},
++          torch::dtype(dtype).device(device).requires_grad(false));
++      torch::Tensor b = torch::zeros(
++          {num_v_heads / tp_size, non_spec_token + padding_size},
++          torch::dtype(torch::kFloat32).device(device).requires_grad(false));
++      torch::Tensor a = torch::zeros(
++          {num_v_heads / tp_size, non_spec_token + padding_size},
++          torch::dtype(torch::kFloat32).device(device).requires_grad(false));
++
++      gdn::chunk_causal_conv1d_xe2(
++          queue,
++          q,
++          k,
++          v,
++          z_active,
++          b,
++          a,
++          projected_states_qkvz_active,
++          projected_states_ba_active,
++          conv_weights,
++          conv_bias,
++          conv_state,
++          *non_spec_query_start_loc,
++          *non_spec_state_indices_tensor,
++          has_initial_state,
++          act_mode,
++          pad_slot_id,
++          num_prefills,
++          num_decodes,
++          reorder_input,
++          token_indx_ptr,
++          non_spec_token);
++
++      chunk_gated_delta_rule_xe2(
++          queue,
++          core_attn_out_active,
++          q,
++          k,
++          v,
++          b,
++          a,
++          A_log,
++          dt_bias,
++          ssm_state,
++          *non_spec_query_start_loc,
++          *non_spec_state_indices_tensor,
++          has_initial_state,
++          num_prefills,
++          num_decodes,
++          token_indx_ptr);
++    } else {
++      NATIVE_LAUNCHER;
++    }
+ #else
+-  NATIVE_LAUNCHER;
++    NATIVE_LAUNCHER;
+ #endif
+ #undef NATIVE_LAUNCHER
++  }
+ }
+\ No newline at end of file
 diff --git a/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp b/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp
-index b9729cd..20fff80 100644
+index b9729cd..ef79217 100644
 --- a/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp
 +++ b/csrc/xpu/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp
-@@ -536,8 +536,14 @@ struct chunk_update_states_kernel {
+@@ -35,6 +35,7 @@ struct chunk_causal_conv1d_kernel {
+       int* query_start_loc,
+       int* cache_indices,
+       bool* has_initial_state,
++      const int* token_indx,
+       const ActMode& act_mode,
+       const int& pad_slot_id,
+       const int& batch_size,
+@@ -62,6 +63,7 @@ struct chunk_causal_conv1d_kernel {
+         query_start_loc(query_start_loc),
+         cache_indices(cache_indices),
+         has_initial_state(has_initial_state),
++        token_indx(token_indx),
+         act_mode(act_mode),
+         pad_slot_id(pad_slot_id),
+         batch_size(batch_size),
+@@ -74,6 +76,8 @@ struct chunk_causal_conv1d_kernel {
+         qkvz_elems(qkvz_elems),
+         conv_elems(conv_elems) {}
+ 
++  inline int lookup(int t) const { return token_indx ? token_indx[t] : t; }
++
+   static inline sycl::nd_range<2> get_nd_range(
+       const int total_seqlen,
+       const int num_k_heads,
+@@ -219,11 +223,11 @@ struct chunk_causal_conv1d_kernel {
+ 
+ #pragma unroll
+     for (int i = 0; i < input_load_len; ++i) {
++      const int src_token = lookup(token_id - input_load_len + 1 + i);
+ #pragma unroll
+       for (int e = 0; e < elems_per_item; ++e) {
+-        local_input[Width * e + states_load_len + i] = mixed_qkvz
+-            [(token_id - input_load_len + 1 + i) * qkvz_elems +
+-             qkvz_elems_offset + e];
++        local_input[Width * e + states_load_len + i] =
++            mixed_qkvz[src_token * qkvz_elems + qkvz_elems_offset + e];
+       }
+     }
+ 
+@@ -329,6 +333,7 @@ struct chunk_causal_conv1d_kernel {
+   const int32_t* query_start_loc;
+   const int* cache_indices;
+   const bool* has_initial_state;
++  const int* token_indx;
+   const ActMode act_mode;
+   const int pad_slot_id;
+   const int batch_size;
+@@ -360,6 +365,7 @@ struct chunk_reorder_zba_kernel {
+       const T* mixed_qkvz,
+       const T* mixed_ba,
+       const int32_t* query_start_loc,
++      const int* token_indx,
+       const int batch_size,
+       const int& num_virtual_tokens,
+       const int& num_k_heads,
+@@ -372,6 +378,7 @@ struct chunk_reorder_zba_kernel {
+         mixed_qkvz(mixed_qkvz),
+         mixed_ba(mixed_ba),
+         query_start_loc(query_start_loc),
++        token_indx(token_indx),
+         batch_size(batch_size),
+         num_virtual_tokens(num_virtual_tokens),
+         num_k_heads(num_k_heads),
+@@ -379,6 +386,8 @@ struct chunk_reorder_zba_kernel {
+         num_v_heads(num_v_heads),
+         head_v_dim(head_v_dim) {}
+ 
++  inline int lookup(int t) const { return token_indx ? token_indx[t] : t; }
++
+   static inline sycl::nd_range<2>
+   get_nd_range(const int total_seqlen, const int num_k_heads, const int z_dim) {
+     assert(z_dim % load_size == 0);
+@@ -418,7 +427,7 @@ struct chunk_reorder_zba_kernel {
+       }
+ 
+       if constexpr (ReorderInput) {
+-        int step = token_id * num_v_heads * 2;
++        int step = lookup(token_id) * num_v_heads * 2;
+ #pragma unroll
+         for (int e = 0; e < kv_ratio; ++e) {
+           float b_value = mixed_ba[step + k_head_id * kv_ratio + e];
+@@ -433,9 +442,9 @@ struct chunk_reorder_zba_kernel {
+                   a_value;
+         }
+       } else {
+-        int step =
+-            (token_id * num_v_heads + k_head_id * num_v_heads / num_k_heads) *
+-            2;
++        int step = (lookup(token_id) * num_v_heads +
++                    k_head_id * num_v_heads / num_k_heads) *
++                   2;
+ #pragma unroll
+         for (int e = 0; e < kv_ratio; ++e) {
+           float b_value = mixed_ba[step + e];
+@@ -452,17 +461,18 @@ struct chunk_reorder_zba_kernel {
+     }
+ 
+     // reorder z
++    const int z_src_token = lookup(token_id);
+ #pragma unroll
+     for (int e = 0; e < load_size; ++e) {
+       int z_dim_id = dim_offset * load_size + e;
+-      int mixed_z_id = token_id * num_k_heads * qkvz_dim +
++      int mixed_z_id = z_src_token * num_k_heads * qkvz_dim +
+                        k_head_id * qkvz_dim + qkv_dim + z_dim_id;
+       if constexpr (ReorderInput) {
+-        mixed_z_id = token_id * num_k_heads * qkvz_dim +
++        mixed_z_id = z_src_token * num_k_heads * qkvz_dim +
+                      2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim +
+                      k_head_id * z_dim + z_dim_id;
+       }
+-      z_out[token_id * num_k_heads * z_dim + k_head_id * z_dim + z_dim_id] =
++      z_out[z_src_token * num_k_heads * z_dim + k_head_id * z_dim + z_dim_id] =
+           mixed_qkvz[mixed_z_id];
+     }
+   }
+@@ -474,6 +484,7 @@ struct chunk_reorder_zba_kernel {
+   const T* mixed_qkvz;
+   const T* mixed_ba;
+   const int32_t* query_start_loc;
++  const int* token_indx;
+   const int batch_size;
+   const int num_virtual_tokens;
+   const int num_k_heads;
+@@ -536,8 +547,14 @@ struct chunk_update_states_kernel {
      T* conv_states_ptr = conv_states + states_id * conv_states_stride_0;
      const T* conv_states_tmp_ptr =
          conv_states_tmp + batch_id * (width - 1) * conv_elems;
@@ -595,8 +2659,60 @@ index b9729cd..20fff80 100644
           i += group_size) {
        conv_states_ptr[width_id * conv_elems + i] =
            conv_states_tmp_ptr[width_id * conv_elems + i];
+@@ -574,6 +591,7 @@ void kernel_launcher(
+     int* query_start_loc,
+     int* cache_indices,
+     bool* has_initial_state,
++    const int* token_indx,
+     const ActMode& act_mode,
+     const int& pad_slot_id,
+     const int& batch_size,
+@@ -608,6 +626,7 @@ void kernel_launcher(
+         query_start_loc,
+         cache_indices,
+         has_initial_state,
++        token_indx,
+         act_mode,
+         pad_slot_id,
+         batch_size,
+@@ -638,6 +657,7 @@ void kernel_launcher(
+         mixed_qkvz,
+         mixed_ba,
+         query_start_loc,
++        token_indx,
+         batch_size,
+         num_virtual_tokens,
+         num_k_heads,
+@@ -696,13 +716,17 @@ void chunk_causal_conv1d_xe2(
+     const int& pad_slot_id,   // -1
+     const int num_prefills,
+     const int num_decodes,
+-    const bool reorder_input) {
++    const bool reorder_input,
++    const int* token_indx = nullptr,
++    int num_actual_tokens_override = -1) {
+   if (num_prefills == 0 && num_decodes == 0) {
+     return;
+   }
+ 
+   const int batch_size = query_start_loc.size(0) - 1;
+-  const int num_actual_tokens = mixed_qkvz.size(0);
++  const int num_actual_tokens = num_actual_tokens_override >= 0
++                                    ? num_actual_tokens_override
++                                    : static_cast<int>(mixed_qkvz.size(0));
+   const int num_virtual_tokens = q_out.size(0);
+   const int num_k_heads = q_out.size(1);
+   const int head_k_dim = q_out.size(2);
+@@ -742,6 +766,7 @@ void chunk_causal_conv1d_xe2(
+       has_initial_state.has_value()                                \
+           ? reinterpret_cast<bool*>(has_initial_state->data_ptr()) \
+           : nullptr,                                               \
++      token_indx,                                                  \
+       act_mode,                                                    \
+       pad_slot_id,                                                 \
+       batch_size,                                                  \
 diff --git a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp b/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
-index 10d7a1b..e032c2e 100644
+index 10d7a1b..d4b3eb7 100644
 --- a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
 +++ b/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
 @@ -121,6 +121,16 @@ CUTE_DEVICE void chunk_prepare_kernel(
@@ -664,7 +2780,7 @@ index 10d7a1b..e032c2e 100644
        }
        chunk_id += global_chunk_range;
      }
-@@ -928,6 +966,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -928,9 +966,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
      StateT*
          ssm_state,  // [cache_batch_size, num_v_heads, head_v_dim, head_k_dim]
      const int ssm_state_stride_0,
@@ -672,7 +2788,11 @@ index 10d7a1b..e032c2e 100644
      const int* query_start_loc,
      const int* cache_indices,
      const bool* has_initial_state,
-@@ -997,6 +1036,23 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
++    const int* token_indx,
+     const int batch_size,
+     const int total_virtual_seqlen,
+     const int num_k_heads,
+@@ -997,6 +1037,23 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
          static_cast<int64_t>(cache_indices[batch_id]) * ssm_state_stride_0 +
          v_head_id * head_v_dim * head_k_dim;
  
@@ -696,7 +2816,7 @@ index 10d7a1b..e032c2e 100644
      for (int chunk_id = 0; chunk_id < current_chunks; ++chunk_id) {
        const bool has_prev_state = (chunk_id != 0) || initial_state;
        const int out_chunk_offset = seq_start_offset + chunk_id * chunk_size;
-@@ -1049,6 +1105,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1049,6 +1106,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
            make_gmem_ptr(S_ptr),
            make_layout(S_tensor_shape, make_stride(head_k_dim, _1{})));
  
@@ -708,7 +2828,7 @@ index 10d7a1b..e032c2e 100644
        Tensor cU = make_identity_tensor(U_tensor.shape());
  
        auto copy_U_c = get_block_2d_copy_C<void>(mma, U_tensor);
-@@ -1084,7 +1145,8 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1084,7 +1146,8 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
            reorder(tCrU_c, tCrU_d);
            copy(copy_U_d, tCrU_d, tCgU_d);
          }
@@ -718,7 +2838,21 @@ index 10d7a1b..e032c2e 100644
        }
  
        auto q_ptr =
-@@ -1190,29 +1252,30 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1145,8 +1208,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+       auto U_tensor_T = make_tensor(
+           make_gmem_ptr(U_ptr),
+           make_layout(U_tensor_T_shape, make_stride(_1{}, head_v_dim)));
+-      auto O_ptr = core_attn_out + out_chunk_offset * num_v_heads * head_v_dim +
+-                   v_head_id * head_v_dim;
++      auto O_ptr =
++          core_attn_out +
++          (token_indx ? token_indx[out_chunk_offset] : out_chunk_offset) *
++              num_v_heads * head_v_dim +
++          v_head_id * head_v_dim;
+       auto O_tensor_shape = make_shape(current_chunk_size, head_v_dim);
+       auto O_tensor = make_tensor(
+           make_gmem_ptr(O_ptr),
+@@ -1190,29 +1256,30 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
                K_tensor_T_shape, make_stride(_1{}, head_k_dim * num_k_heads)));
  
        Tensor cS = make_identity_tensor(S_tensor.shape());
@@ -759,7 +2893,7 @@ index 10d7a1b..e032c2e 100644
                tSrS_d(i) *= g_last_value_exp;
              }
            } else {
-@@ -1221,7 +1284,17 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1221,7 +1288,17 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
  
            gemm_TTS_k_multi(
                U_tensor_T, K_tensor_T, tSrS_d, dv, dk, mma, g_multi_slm_ptr);
@@ -778,7 +2912,7 @@ index 10d7a1b..e032c2e 100644
            copy(copy_S_d, tCrS_d, tCgS_d);
          }
        }
-@@ -1279,6 +1352,7 @@ void kernel_launcher(
+@@ -1279,9 +1356,11 @@ void kernel_launcher(
      const T* dt_bias,
      StateT* ssm_state,
      const int ssm_state_stride_0,
@@ -786,7 +2920,11 @@ index 10d7a1b..e032c2e 100644
      const int* query_start_loc,
      const int* cache_indices,
      const bool* has_initial_state,
-@@ -1507,6 +1581,7 @@ void kernel_launcher(
++    const int* token_indx,
+     const int batch_size,
+     const int total_virtual_seqlen,
+     const int num_k_heads,
+@@ -1507,9 +1586,11 @@ void kernel_launcher(
                a,
                ssm_state,
                ssm_state_stride_0,
@@ -794,7 +2932,21 @@ index 10d7a1b..e032c2e 100644
                query_start_loc,
                cache_indices,
                has_initial_state,
-@@ -1583,6 +1658,17 @@ void chunk_gated_delta_rule_impl_xe2(
++              token_indx,
+               batch_size,
+               total_virtual_seqlen,
+               num_k_heads,
+@@ -1537,7 +1618,8 @@ void chunk_gated_delta_rule_impl_xe2(
+     const std::optional<torch::Tensor>&
+         has_initial_state,  // [batch_size] or None
+     const int num_prefills,
+-    const int num_decodes) {
++    const int num_decodes,
++    const int* token_indx) {
+   if (num_prefills == 0 && num_decodes == 0) {
+     return;
+   }
+@@ -1583,6 +1665,17 @@ void chunk_gated_delta_rule_impl_xe2(
        {num_v_heads, total_seqlen + padding_size, head_v_dim},
        torch::dtype(dtype).device(device).requires_grad(false));
  
@@ -812,7 +2964,7 @@ index 10d7a1b..e032c2e 100644
  #define KERNEL_LAUNCHER(scalar_t, state_scalar_t)                  \
    kernel_launcher<scalar_t, state_scalar_t>(                       \
        queue,                                                       \
-@@ -1599,6 +1685,7 @@ void chunk_gated_delta_rule_impl_xe2(
+@@ -1599,11 +1692,13 @@ void chunk_gated_delta_rule_impl_xe2(
        reinterpret_cast<scalar_t*>(dt_bias.data_ptr()),             \
        reinterpret_cast<state_scalar_t*>(ssm_state.data_ptr()),     \
        ssm_state_stride_0,                                          \
@@ -820,6 +2972,48 @@ index 10d7a1b..e032c2e 100644
        reinterpret_cast<int*>(query_start_loc.data_ptr()),          \
        reinterpret_cast<int*>(cache_indices.data_ptr()),            \
        has_initial_state.has_value()                                \
+           ? reinterpret_cast<bool*>(has_initial_state->data_ptr()) \
+           : nullptr,                                               \
++      token_indx,                                                  \
+       batch_size,                                                  \
+       total_virtual_seqlen,                                        \
+       num_k_heads,                                                 \
+diff --git a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_xe2.cpp b/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_xe2.cpp
+index 424964b..beec710 100755
+--- a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_xe2.cpp
++++ b/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_xe2.cpp
+@@ -21,7 +21,8 @@ void chunk_gated_delta_rule_xe2(
+     const std::optional<torch::Tensor>&
+         has_initial_state,  // [batch_size] or None
+     const int num_prefills,
+-    const int num_decodes) {
++    const int num_decodes,
++    const int* token_indx) {
+   gdn::chunk_gated_delta_rule_impl_xe2(
+       queue,
+       core_attn_out,
+@@ -37,5 +38,6 @@ void chunk_gated_delta_rule_xe2(
+       cache_indices,
+       has_initial_state,
+       num_prefills,
+-      num_decodes);
++      num_decodes,
++      token_indx);
+ }
+\ No newline at end of file
+diff --git a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_xe2.h b/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_xe2.h
+index 6ec4561..32436dd 100644
+--- a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_xe2.h
++++ b/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_xe2.h
+@@ -17,4 +17,5 @@ void chunk_gated_delta_rule_xe2(
+     const std::optional<torch::Tensor>&
+         has_initial_state,  // [batch_size] or None
+     const int num_prefills,
+-    const int num_decodes);
+\ No newline at end of file
++    const int num_decodes,
++    const int* token_indx = nullptr);
+\ No newline at end of file
 diff --git a/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp b/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp
 index ac2d7d6..fb51306 100644
 --- a/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp
@@ -863,6 +3057,567 @@ index ac2d7d6..fb51306 100644
          auto next_scales_tensor = make_tensor(
              make_gmem_ptr(
                  reinterpret_cast<const ElementS*>(
+diff --git a/csrc/xpu/ops.h b/csrc/xpu/ops.h
+index 1f8c046..39edf06 100644
+--- a/csrc/xpu/ops.h
++++ b/csrc/xpu/ops.h
+@@ -95,9 +95,15 @@ void gdn_attention(
+     const torch::Tensor& dt_bias,
+     const int64_t num_prefills,
+     const int64_t num_decodes,
++    const int64_t num_spec_decodes,
+     const std::optional<torch::Tensor>& has_initial_state,
+-    const torch::Tensor& non_spec_query_start_loc,
+-    const torch::Tensor& non_spec_state_indices_tensor,
++    const std::optional<torch::Tensor>& non_spec_query_start_loc,
++    const std::optional<torch::Tensor>& non_spec_token_indx,
++    const std::optional<torch::Tensor>& non_spec_state_indices_tensor,
++    const std::optional<torch::Tensor>& spec_query_start_loc,
++    const std::optional<torch::Tensor>& spec_token_indx,
++    const std::optional<torch::Tensor>& spec_state_indices_tensor,
++    const std::optional<torch::Tensor>& num_accepted_tokens,
+     const int64_t num_actual_tokens,
+     const int64_t tp_size,
+     const bool reorder_input);
+diff --git a/csrc/xpu/torch_bindings.cpp b/csrc/xpu/torch_bindings.cpp
+index 7089a0b..157def8 100644
+--- a/csrc/xpu/torch_bindings.cpp
++++ b/csrc/xpu/torch_bindings.cpp
+@@ -83,9 +83,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
+       "int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim,"
+       "Tensor! conv_state, Tensor! ssm_state, Tensor conv_weights, Tensor? "
+       "conv_bias, str activation, Tensor A_log, Tensor dt_bias,"
+-      "int num_prefills, int num_decodes, Tensor? has_initial_state, Tensor "
+-      "non_spec_query_start_loc,"
+-      "Tensor non_spec_state_indices_tensor, int num_actual_tokens, int "
++      "int num_prefills, int num_decodes, int num_spec_decodes, Tensor? "
++      "has_initial_state, Tensor? "
++      "non_spec_query_start_loc,  Tensor? non_spec_token_indx,"
++      "Tensor? non_spec_state_indices_tensor, Tensor? spec_query_start_loc, "
++      "Tensor? spec_token_indx, Tensor? spec_state_indices_tensor, Tensor? "
++      "num_accepted_tokens, int num_actual_tokens, int "
+       "tp_size, bool reorder_input) -> ()");
+   xpu_ops.impl("gdn_attention", torch::kXPU, &gdn_attention);
+ #endif
+diff --git a/tests/gdn_attn/test_gdn_attn.py b/tests/gdn_attn/test_gdn_attn.py
+index 3fe54c0..1822793 100755
+--- a/tests/gdn_attn/test_gdn_attn.py
++++ b/tests/gdn_attn/test_gdn_attn.py
+@@ -190,57 +190,69 @@ def ref_gdn_attention(
+                               head_v_dim)
+ 
+         if has_initial_state[batch]:
+-            ssm_state_batch = ssm_state[non_spec_state_indices_tensor[
+-                batch]]  # [num_v_heads // tp_size, head_v_dim, head_k_dim]
++            ssm_state_batch = ssm_state[
++                non_spec_state_indices_tensor[batch]].to(
++                    torch.float32
++                )  # [num_v_heads // tp_size, head_v_dim, head_k_dim]
+         else:
+-            ssm_state_batch = torch.zeros_like(ssm_state[0])
++            ssm_state_batch = torch.zeros_like(ssm_state[0],
++                                               dtype=torch.float32)
++
++        # ------------------------------------------------------------------
++        # Hoist all per-token elementwise work out of the recurrence loop.
++        # Only the SSM state update itself is sequential.
++        # ------------------------------------------------------------------
++        rep = num_v_heads // num_k_heads
++        b_batch = b[batch_start_id:batch_end_id].to(
++            torch.float32)  # [T, NV]
++        a_batch = a[batch_start_id:batch_end_id].to(torch.float32)
++        beta_batch = torch.sigmoid(b_batch)  # [T, NV]
++        g_batch = torch.exp(A_log_exp *
++                            softplus(a_batch + dt_bias))  # [T, NV]
++
++        q_all = q_out.to(torch.float32)  # [T, NK, Hk]
++        k_all = k_out.to(torch.float32)
++        v_all = v_out.to(torch.float32)  # [T, NV, Hv]
++
++        # l2norm along head dim, then scale q.
++        q_all = q_all * torch.rsqrt(q_all.pow(2).sum(-1, keepdim=True) + eps)
++        k_all = k_all * torch.rsqrt(k_all.pow(2).sum(-1, keepdim=True) + eps)
++        q_all = q_all * scale
++
++        # GQA: replicate K/Q heads NK -> NV.
++        if rep > 1:
++            q_all = q_all.repeat_interleave(rep, dim=1)  # [T, NV, Hk]
++            k_all = k_all.repeat_interleave(rep, dim=1)
++
++        out_buf = torch.empty(batch_num_tokens,
++                              num_v_heads // tp_size,
++                              head_v_dim,
++                              dtype=torch.float32,
++                              device=core_attn_out.device)
+ 
+         # O(t) = S(t) * q(t)
+         # S(t) = g(t)*S(t - 1) + (v(t) - g(t)*S(t - 1)*k(t))*beta(t)*k(t)
+         for token_id in range(batch_num_tokens):
+-            b_t = b[batch_start_id + token_id].to(
+-                torch.float32)  # [num_v_heads // tp_size]
+-            beta_t = torch.sigmoid(b_t)  # [num_v_heads // tp_size]
+-            a_t = a[batch_start_id + token_id].to(
+-                torch.float32)  # [num_v_heads // tp_size]
+-            g_t = torch.exp(
+-                A_log_exp *
+-                softplus(a_t + dt_bias))  # [num_v_heads // tp_size]
+-
+-            q_t = q_out[token_id].to(
+-                torch.float32)  # [num_k_heads // tp_size, head_k_dim]
+-            k_t = k_out[token_id].to(
+-                torch.float32)  # [num_k_heads // tp_size, head_k_dim]
+-            v_t = v_out[token_id].to(
+-                torch.float32)  # [num_v_heads // tp_size, head_v_dim]
+-
+-            # l2norm
+-            q_t = q_t / torch.sqrt(torch.sum(q_t * q_t, dim=-1) +
+-                                   eps).unsqueeze(-1)
+-            k_t = k_t / torch.sqrt(torch.sum(k_t * k_t, dim=-1) +
+-                                   eps).unsqueeze(-1)
+-            q_t *= scale
+-
+-            q_t = torch.repeat_interleave(
+-                q_t, repeats=num_v_heads // num_k_heads,
+-                dim=0)  # [num_v_heads // tp_size, head_k_dim]
+-            k_t = torch.repeat_interleave(
+-                k_t, repeats=num_v_heads // num_k_heads,
+-                dim=0)  # [num_v_heads // tp_size, head_k_dim]
++            g_t = g_batch[token_id]  # [NV]
++            beta_t = beta_batch[token_id]  # [NV]
++            q_t = q_all[token_id]  # [NV, Hk]
++            k_t = k_all[token_id]  # [NV, Hk]
++            v_t = v_all[token_id]  # [NV, Hv]
+ 
+             ssm_state_batch *= g_t.unsqueeze(-1).unsqueeze(-1)
+ 
+-            kv_mem_t = (ssm_state_batch * k_t.unsqueeze(1)).sum(
+-                dim=-1)  # [num_v_heads // tp_size, head_v_dim]
+-            delta_t = (v_t - kv_mem_t) * beta_t.unsqueeze(
+-                -1)  # [num_v_heads // tp_size, head_v_dim]
++            # kv_mem_t[v, h] = sum_k S[v, h, k] * k_t[v, k]
++            kv_mem_t = torch.einsum("vhk,vk->vh", ssm_state_batch, k_t)
++            delta_t = (v_t - kv_mem_t) * beta_t.unsqueeze(-1)  # [NV, Hv]
+ 
+-            ssm_state_batch += k_t.unsqueeze(1) * delta_t.unsqueeze(2)
++            # outer product update: S[v, h, k] += delta[v, h] * k_t[v, k]
++            ssm_state_batch.add_(
++                torch.einsum("vh,vk->vhk", delta_t, k_t))
+ 
+-            core_attn_out[batch_start_id +
+-                          token_id] = (ssm_state_batch *
+-                                       q_t.unsqueeze(1)).sum(dim=-1).to(dtype)
++            out_buf[token_id] = torch.einsum("vhk,vk->vh", ssm_state_batch,
++                                             q_t)
+ 
++        core_attn_out[batch_start_id:batch_end_id] = out_buf.to(dtype)
+         ssm_state[non_spec_state_indices_tensor[batch]] = ssm_state_batch.to(
+             ssm_state.dtype)
+ 
+@@ -377,9 +389,15 @@ def test_gdn_attention(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
+         dt_bias=dt_bias,
+         num_prefills=num_prefills,
+         num_decodes=num_decodes,
++        num_spec_decodes=0,
+         has_initial_state=has_initial_state,
+         non_spec_query_start_loc=non_spec_query_start_loc,
++        non_spec_token_indx=None,
+         non_spec_state_indices_tensor=non_spec_state_indices_tensor,
++        spec_query_start_loc=None,
++        spec_token_indx=None,
++        spec_state_indices_tensor=None,
++        num_accepted_tokens=None,
+         num_actual_tokens=num_actual_tokens,
+         tp_size=tp_size,
+         reorder_input=reorder_input)
+@@ -440,3 +458,388 @@ def test_gdn_attention(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
+                                        ref_ssm_state[state_id],
+                                        atol=atol,
+                                        rtol=rtol)
++
++
++NUM_SPEC_DECODES = [1, 4]
++NUM_SPEC_TOKENS = [2, 3]  # num_speculative_tokens + 1
++
++
++def _extract_qkv_b_a_z(projected_states_qkvz, projected_states_ba,
++                       num_actual_tokens, num_k_heads, num_v_heads,
++                       head_k_dim, head_v_dim, tp_size, reorder_input):
++    """Replicate the qkv/ba split done in `ref_gdn_attention` and return
++    the post-reorder qkv (for conv1d), b, a, z tensors plus split sizes."""
++    if reorder_input:
++        key_dim = head_k_dim * num_k_heads
++        value_dim = head_v_dim * num_v_heads
++        q_size = key_dim // tp_size
++        k_size = q_size
++        v_size = value_dim // tp_size
++        z_size = v_size
++        q_tmp, k_tmp, v_tmp, z_tmp = projected_states_qkvz.split(
++            [q_size, k_size, v_size, z_size], dim=-1)
++        q_tmp = q_tmp.reshape(q_tmp.size(0), -1, head_k_dim)
++        k_tmp = k_tmp.reshape(k_tmp.size(0), -1, head_k_dim)
++        v_tmp = v_tmp.reshape(v_tmp.size(0), -1,
++                              num_v_heads // num_k_heads * head_v_dim)
++        z_tmp = z_tmp.reshape(z_tmp.size(0), -1,
++                              num_v_heads // num_k_heads * head_v_dim)
++        projected_states_qkvz = torch.cat(
++            [q_tmp, k_tmp, v_tmp, z_tmp],
++            dim=-1).reshape(q_tmp.size(0), -1).contiguous()
++
++        b, a = projected_states_ba.chunk(2, dim=-1)
++        b = b.reshape(b.size(0), -1, num_v_heads // num_k_heads)
++        a = a.reshape(a.size(0), -1, num_v_heads // num_k_heads)
++        projected_states_ba = torch.cat(
++            [b, a], dim=-1).reshape(b.size(0), -1).contiguous()
++
++    projected_states_ba = projected_states_ba.reshape(
++        num_actual_tokens, num_k_heads // tp_size,
++        (2 * num_v_heads // num_k_heads))
++    b, a = torch.split(
++        projected_states_ba,
++        [num_v_heads // num_k_heads, num_v_heads // num_k_heads],
++        dim=-1)
++    b = b.reshape(num_actual_tokens, num_v_heads // tp_size)
++    a = a.reshape(num_actual_tokens, num_v_heads // tp_size)
++
++    split_qkvz = [
++        head_k_dim,
++        head_k_dim,
++        num_v_heads // num_k_heads * head_v_dim,
++        num_v_heads // num_k_heads * head_v_dim,
++    ]
++    projected_states_qkvz = projected_states_qkvz.reshape(
++        num_actual_tokens, num_k_heads // tp_size,
++        (2 * head_k_dim + 2 * num_v_heads // num_k_heads * head_v_dim))
++    q_split, k_split, v_split, z_split = torch.split(
++        projected_states_qkvz, split_qkvz, dim=-1)
++    q_split = q_split.reshape(num_actual_tokens,
++                              num_k_heads // tp_size * head_k_dim)
++    k_split = k_split.reshape(num_actual_tokens,
++                              num_k_heads // tp_size * head_k_dim)
++    v_split = v_split.reshape(
++        num_actual_tokens,
++        num_k_heads // tp_size * num_v_heads // num_k_heads * head_v_dim)
++    qkv = torch.cat((q_split, k_split, v_split), dim=-1).reshape(
++        num_actual_tokens,
++        num_k_heads // tp_size *
++        (2 * head_k_dim + num_v_heads // num_k_heads * head_v_dim))
++    z_global = z_split.reshape(num_actual_tokens, num_v_heads // tp_size,
++                               head_v_dim)
++    return qkv, b, a, z_global
++
++
++def ref_gdn_attention_spec(
++    core_attn_out,
++    z,
++    projected_states_qkvz,
++    projected_states_ba,
++    num_k_heads,
++    num_v_heads,
++    head_k_dim,
++    head_v_dim,
++    conv_state,
++    ssm_state,
++    conv_weights,
++    conv_bias,
++    activation,
++    A_log,
++    dt_bias,
++    num_spec_decodes,
++    spec_query_start_loc,
++    spec_token_indx,
++    spec_state_indices_tensor,
++    num_accepted_tokens,
++    num_actual_tokens,
++    tp_size,
++    reorder_input,
++):
++    """Spec-decode reference. Mirrors the non-spec ref but routes gather/
++    scatter through spec_token_indx and writes per-step ssm-state + final
++    conv-state into spec_state_indices_tensor."""
++    eps = 0.000001
++    scale = 1.0 / math.sqrt(head_k_dim)
++    dtype = projected_states_qkvz.dtype
++    width = conv_weights.shape[-1]
++    rep = num_v_heads // num_k_heads
++    K = spec_state_indices_tensor.shape[1]
++    qkv_elems_size = num_k_heads // tp_size * (
++        2 * head_k_dim + num_v_heads // num_k_heads * head_v_dim)
++
++    qkv, b, a, z_global = _extract_qkv_b_a_z(
++        projected_states_qkvz, projected_states_ba, num_actual_tokens,
++        num_k_heads, num_v_heads, head_k_dim, head_v_dim, tp_size,
++        reorder_input)
++
++    # Scatter z into output at the spec token positions.
++    spec_indx_long = spec_token_indx.to(torch.long)
++    z[spec_indx_long] = z_global[spec_indx_long]
++
++    A_log_exp = -torch.exp(A_log)
++    softplus = torch.nn.Softplus(beta=1.0, threshold=20.0)
++    conv_bias_f = (conv_bias.to(torch.float)
++                   if conv_bias is not None else None)
++
++    split_qkv = [
++        num_k_heads // tp_size * head_k_dim,
++        num_k_heads // tp_size * head_k_dim,
++        num_k_heads // tp_size * num_v_heads // num_k_heads * head_v_dim,
++    ]
++
++    for n in range(num_spec_decodes):
++        start = int(spec_query_start_loc[n].item())
++        end = int(spec_query_start_loc[n + 1].item())
++        assert end - start == K, (end - start, K)
++        globals_ = spec_token_indx[start:end].to(torch.long)
++
++        naccepted = int(num_accepted_tokens[n].item())
++        init_col = max(naccepted - 1, 0)
++        init_slot = int(spec_state_indices_tensor[n, init_col].item())
++        final_conv_slot = int(spec_state_indices_tensor[n, K - 1].item())
++
++        # ---- conv1d on the K gathered tokens (with Width-1 history) ----
++        conv_state_batch = conv_state[init_slot].clone()
++        qkv_batch = qkv[globals_]  # [K, qkv_elems]
++        qkv_conv_input = torch.cat([conv_state_batch, qkv_batch], dim=0)
++        # Final conv state goes ONLY to the last cache slot.
++        conv_state[final_conv_slot] = qkv_conv_input[-(width - 1):]
++
++        qkv_conv_in = qkv_conv_input.transpose(0, 1).unsqueeze(0).to(
++            torch.float32)
++        qkv_conv_out = F.conv1d(qkv_conv_in,
++                                conv_weights.unsqueeze(1).to(torch.float32),
++                                conv_bias_f,
++                                padding=0,
++                                groups=qkv_elems_size)
++        qkv_conv_out = (qkv_conv_out if activation is None else
++                        F.silu(qkv_conv_out)).to(dtype=dtype)
++        qkv_conv_out = qkv_conv_out.transpose(-2, -1).reshape(
++            K, qkv_elems_size)
++
++        q_out, k_out, v_out = torch.split(qkv_conv_out, split_qkv, dim=-1)
++        q_out = q_out.reshape(K, num_k_heads // tp_size, head_k_dim)
++        k_out = k_out.reshape(K, num_k_heads // tp_size, head_k_dim)
++        v_out = v_out.reshape(K, num_v_heads // tp_size, head_v_dim)
++
++        # ---- SSM recurrence (same as non-spec, just per-step writeback) ----
++        ssm_state_batch = ssm_state[init_slot].to(torch.float32).clone()
++
++        b_batch = b[globals_].to(torch.float32)
++        a_batch = a[globals_].to(torch.float32)
++        beta_batch = torch.sigmoid(b_batch)
++        g_batch = torch.exp(A_log_exp * softplus(a_batch + dt_bias))
++
++        q_all = q_out.to(torch.float32)
++        k_all = k_out.to(torch.float32)
++        v_all = v_out.to(torch.float32)
++        q_all = q_all * torch.rsqrt(q_all.pow(2).sum(-1, keepdim=True) + eps)
++        k_all = k_all * torch.rsqrt(k_all.pow(2).sum(-1, keepdim=True) + eps)
++        q_all = q_all * scale
++        if rep > 1:
++            q_all = q_all.repeat_interleave(rep, dim=1)
++            k_all = k_all.repeat_interleave(rep, dim=1)
++
++        for t in range(K):
++            g_t = g_batch[t]
++            beta_t = beta_batch[t]
++            q_t = q_all[t]
++            k_t = k_all[t]
++            v_t = v_all[t]
++
++            ssm_state_batch *= g_t.unsqueeze(-1).unsqueeze(-1)
++            kv_mem_t = torch.einsum("vhk,vk->vh", ssm_state_batch, k_t)
++            delta_t = (v_t - kv_mem_t) * beta_t.unsqueeze(-1)
++            ssm_state_batch.add_(torch.einsum("vh,vk->vhk", delta_t, k_t))
++
++            out_t = torch.einsum("vhk,vk->vh", ssm_state_batch, q_t).to(dtype)
++            core_attn_out[globals_[t]] = out_t
++            # Per-step ssm-state writeback to cache_indices[n, t].
++            ssm_state[int(spec_state_indices_tensor[n, t].item())] = (
++                ssm_state_batch.to(ssm_state.dtype))
++
++
++@pytest.mark.parametrize("num_spec_decodes", NUM_SPEC_DECODES)
++@pytest.mark.parametrize("num_spec_tokens", NUM_SPEC_TOKENS)
++@pytest.mark.parametrize("num_k_heads", [16])
++@pytest.mark.parametrize("head_k_dim", [128])
++@pytest.mark.parametrize("num_v_heads", [32])
++@pytest.mark.parametrize("head_v_dim", [128])
++@pytest.mark.parametrize("width", [4])
++@pytest.mark.parametrize("tp_size", [1])
++@pytest.mark.parametrize("has_bias", [True, False])
++@pytest.mark.parametrize("activation", ["silu"])
++@pytest.mark.parametrize("reorder_input", [True, False])
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
++                         ids=format_tc)
++@pytest.mark.parametrize("ssm_state_is_fp32", [False, True])
++@torch.inference_mode()
++def test_gdn_attention_mtp(num_spec_decodes, num_spec_tokens, num_k_heads,
++                           head_k_dim, num_v_heads, head_v_dim, width,
++                           tp_size, has_bias, activation, reorder_input,
++                           dtype, ssm_state_is_fp32):
++    """Pure spec-decode batch: num_prefills == num_decodes == 0,
++    num_spec_decodes sequences each contributing num_spec_tokens tokens.
++    Token positions are shuffled in the global buffer via spec_token_indx
++    so the kernel's gather/scatter is exercised."""
++    if (os.getenv("SKIP_ACC_ERROR_KERNEL") is not None
++            and os.getenv("SKIP_ACC_ERROR_KERNEL") == "1"):
++        pytest.skip("skip gdn attention kernels testing on PVC.")
++
++    device = "xpu"
++    random.seed(123)
++    torch.manual_seed(123)
++    ssm_state_dtype = torch.float32 if ssm_state_is_fp32 else dtype
++
++    assert head_k_dim == head_v_dim
++    K = num_spec_tokens
++    num_actual_tokens = num_spec_decodes * K
++    cache_batch_size = 200
++
++    mixed_qkvz_size = num_k_heads // tp_size * (
++        2 * head_k_dim + 2 * head_v_dim * num_v_heads // num_k_heads)
++    mixed_ba_size = num_k_heads // tp_size * (2 * num_v_heads // num_k_heads)
++    mixed_qkv_size = num_k_heads // tp_size * (
++        2 * head_k_dim + head_v_dim * num_v_heads // num_k_heads)
++
++    projected_states_qkvz = torch.randn(num_actual_tokens,
++                                        mixed_qkvz_size,
++                                        dtype=dtype,
++                                        device=device)
++    projected_states_ba = torch.randn(num_actual_tokens,
++                                      mixed_ba_size,
++                                      dtype=dtype,
++                                      device=device)
++    conv_state = torch.randn(cache_batch_size,
++                             width - 1,
++                             mixed_qkv_size,
++                             dtype=dtype,
++                             device=device)
++    ref_conv_state = conv_state.clone()
++    ssm_state = torch.randn(cache_batch_size,
++                            num_v_heads // tp_size,
++                            head_v_dim,
++                            head_k_dim,
++                            dtype=ssm_state_dtype,
++                            device=device)
++    ref_ssm_state = ssm_state.clone()
++    conv_weights = torch.randn(mixed_qkv_size,
++                               width,
++                               dtype=dtype,
++                               device=device)
++    conv_bias = (torch.randn(mixed_qkv_size, dtype=dtype, device=device)
++                 if has_bias else None)
++    A_log = torch.randn(num_v_heads // tp_size,
++                        dtype=torch.float32,
++                        device=device)
++    dt_bias = torch.randn(num_v_heads // tp_size, dtype=dtype, device=device)
++
++    # Each spec seq owns K consecutive cache slots (cols 0..K-1).
++    state_slots = random.sample(range(cache_batch_size), num_spec_decodes * K)
++    spec_state_indices_tensor = torch.tensor(state_slots,
++                                             dtype=torch.int32,
++                                             device=device).reshape(
++                                                 num_spec_decodes, K)
++    # Mix of acceptance counts including the 0 edge case.
++    num_accepted_tokens = torch.tensor(
++        [random.randint(0, K) for _ in range(num_spec_decodes)],
++        dtype=torch.int32,
++        device=device)
++
++    # Shuffle global token positions across the K-tokens-per-seq layout.
++    perm = torch.randperm(num_actual_tokens, device=device).to(torch.int32)
++    spec_token_indx = perm.contiguous()
++    spec_query_start_loc = (torch.arange(
++        num_spec_decodes + 1, dtype=torch.int32, device=device) * K)
++
++    core_attn_out = torch.zeros(num_actual_tokens,
++                                num_v_heads // tp_size,
++                                head_v_dim,
++                                dtype=dtype,
++                                device=device)
++    z = torch.zeros_like(core_attn_out)
++
++    torch.ops._xpu_C.gdn_attention(
++        core_attn_out,
++        z,
++        projected_states_qkvz,
++        projected_states_ba,
++        num_k_heads,
++        num_v_heads,
++        head_k_dim,
++        head_v_dim,
++        conv_state=conv_state,
++        ssm_state=ssm_state,
++        conv_weights=conv_weights,
++        conv_bias=conv_bias,
++        activation=activation,
++        A_log=A_log,
++        dt_bias=dt_bias,
++        num_prefills=0,
++        num_decodes=0,
++        num_spec_decodes=num_spec_decodes,
++        has_initial_state=None,
++        non_spec_query_start_loc=None,
++        non_spec_token_indx=None,
++        non_spec_state_indices_tensor=None,
++        spec_query_start_loc=spec_query_start_loc,
++        spec_token_indx=spec_token_indx,
++        spec_state_indices_tensor=spec_state_indices_tensor,
++        num_accepted_tokens=num_accepted_tokens,
++        num_actual_tokens=num_actual_tokens,
++        tp_size=tp_size,
++        reorder_input=reorder_input)
++
++    ref_core_attn_out = torch.zeros_like(core_attn_out)
++    ref_z = torch.zeros_like(core_attn_out)
++    ref_gdn_attention_spec(
++        ref_core_attn_out,
++        ref_z,
++        projected_states_qkvz,
++        projected_states_ba,
++        num_k_heads,
++        num_v_heads,
++        head_k_dim,
++        head_v_dim,
++        conv_state=ref_conv_state,
++        ssm_state=ref_ssm_state,
++        conv_weights=conv_weights,
++        conv_bias=conv_bias,
++        activation=activation,
++        A_log=A_log,
++        dt_bias=dt_bias,
++        num_spec_decodes=num_spec_decodes,
++        spec_query_start_loc=spec_query_start_loc,
++        spec_token_indx=spec_token_indx,
++        spec_state_indices_tensor=spec_state_indices_tensor,
++        num_accepted_tokens=num_accepted_tokens,
++        num_actual_tokens=num_actual_tokens,
++        tp_size=tp_size,
++        reorder_input=reorder_input,
++    )
++
++    atol = 5e-2
++    rtol = 5e-2
++
++    torch.testing.assert_close(z, ref_z, atol=atol, rtol=rtol)
++    torch.testing.assert_close(core_attn_out,
++                               ref_core_attn_out,
++                               atol=atol,
++                               rtol=rtol,
++                               equal_nan=True)
++
++    # Final conv-state slot per seq (col K-1) must match the reference.
++    for n in range(num_spec_decodes):
++        final_slot = int(spec_state_indices_tensor[n, K - 1].item())
++        torch.testing.assert_close(conv_state[final_slot],
++                                   ref_conv_state[final_slot],
++                                   atol=atol,
++                                   rtol=rtol)
++        # All K ssm-state slots are written per-step.
++        for t in range(K):
++            slot = int(spec_state_indices_tensor[n, t].item())
++            torch.testing.assert_close(ssm_state[slot],
++                                       ref_ssm_state[slot],
++                                       atol=atol,
++                                       rtol=rtol)
 diff --git a/vllm_xpu_kernels/flash_attn_interface.py b/vllm_xpu_kernels/flash_attn_interface.py
 index 70df0b2..c43f92d 100644
 --- a/vllm_xpu_kernels/flash_attn_interface.py
