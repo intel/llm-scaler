@@ -161,10 +161,14 @@ at::Tensor esimd_gemv_int4(
     at::Tensor output) {
     int64_t N = weight.size(0);
     int64_t K = weight.size(1) * 2;  // packed: K/2 bytes → K elements
+    // Infer group size from scale shape [N, K/group_size]: 128 (legacy GGML)
+    // or 32 (vLLM 0.21 sym_int4 / q4_0 32-element blocks).
+    int64_t n_groups = weight_scale.size(weight_scale.dim() - 1);
+    int group_size = (n_groups > 0) ? (int)(K / n_groups) : 128;
     EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_w, weight);
     EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
     auto& dpcpp_queue = get_device_queue(input);
-    GEMV_int4_host(p_in, p_w, p_sc, p_out, N, K, dpcpp_queue);
+    GEMV_int4_host(p_in, p_w, p_sc, p_out, N, K, dpcpp_queue, group_size);
     return output;
 }
 
@@ -176,6 +180,8 @@ at::Tensor esimd_gemv_int4_fused2(
     at::Tensor w1, at::Tensor s1, at::Tensor o1) {
     int64_t K = w0.size(1) * 2;  // packed: K/2 bytes → K elements
     int64_t N0 = w0.size(0), N1 = w1.size(0);
+    int64_t ng0 = s0.size(s0.dim() - 1);
+    int group_size = (ng0 > 0) ? (int)(K / ng0) : 128;
     EXTRACT_PTR(p_in, input);
     EXTRACT_PTR(pw0, w0); EXTRACT_PTR(ps0, s0); EXTRACT_PTR(po0, o0);
     EXTRACT_PTR(pw1, w1); EXTRACT_PTR(ps1, s1); EXTRACT_PTR(po1, o1);
@@ -184,7 +190,7 @@ at::Tensor esimd_gemv_int4_fused2(
     uint8_t* sp[2] = {ps0, ps1};
     uint8_t* op[2] = {po0, po1};
     uint32_t ns[2] = {(uint32_t)N0, (uint32_t)N1};
-    GEMV_int4_fused_host<2>(p_in, wp, sp, op, ns, (uint32_t)K, dpcpp_queue);
+    GEMV_int4_fused_host<2>(p_in, wp, sp, op, ns, (uint32_t)K, dpcpp_queue, group_size);
     return o0;
 }
 

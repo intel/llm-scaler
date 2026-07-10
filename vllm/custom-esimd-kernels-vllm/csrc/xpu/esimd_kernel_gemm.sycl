@@ -48,7 +48,8 @@ at::Tensor esimd_gemm_fp8_pert(
 
 // ---- INT4 GEMM per-group scale: DPAS kernel for M>=2 ----
 // input: [M, K] fp16, weight: [N, K/2] uint8 packed int4,
-// weight_scale: [N, K/128] fp16 per-group, output: [M, N] fp16 pre-allocated.
+// weight_scale: [N, K/group] fp16 per-group (group=128 GGML or 32 q4_0),
+// output: [M, N] fp16 pre-allocated.
 // Complementary to esimd_gemv_int4 (M=1); for M>=2 use this.
 at::Tensor esimd_gemm_int4_pgrp(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
@@ -67,12 +68,20 @@ at::Tensor esimd_gemm_int4_pgrp(
                 "esimd_gemm_int4_pgrp: output must be fp16");
     TORCH_CHECK(N % 16 == 0,
                 "esimd_gemm_int4_pgrp: N must be a multiple of 16 (DPAS N tile), got N=", N);
-    TORCH_CHECK(K % INT4_GEMM_GROUP_SIZE == 0,
-                "esimd_gemm_int4_pgrp: K must be a multiple of 128 (group_size), got K=", K);
-    TORCH_CHECK(weight_scale.size(0) == N && weight_scale.size(1) == K / INT4_GEMM_GROUP_SIZE,
+    TORCH_CHECK(K % 128 == 0,
+                "esimd_gemm_int4_pgrp: K must be a multiple of 128 (DPAS K_LOAD), got K=", K);
+    // Infer group size from scale shape [N, K/group_size]: 128 (legacy GGML)
+    // or 32 (vLLM 0.21 sym_int4 / q4_0 32-element blocks).
+    int64_t n_groups = weight_scale.size(weight_scale.dim() - 1);
+    int group_size = (n_groups > 0) ? (int)(K / n_groups) : INT4_GEMM_GROUP_SIZE;
+    TORCH_CHECK(group_size == 128 || group_size == 32,
+                "esimd_gemm_int4_pgrp: unsupported group_size=", group_size,
+                " (expected 128 or 32); scale shape [", weight_scale.size(0),
+                ", ", weight_scale.size(weight_scale.dim()-1), "], K=", K);
+    TORCH_CHECK(weight_scale.size(0) == N && (int64_t)group_size * n_groups == K,
                 "esimd_gemm_int4_pgrp: weight_scale shape mismatch; expected [", N,
-                ", ", K / INT4_GEMM_GROUP_SIZE, "], got [", weight_scale.size(0),
-                ", ", weight_scale.size(1), "]");
+                ", ", K / group_size, "], got [", weight_scale.size(0),
+                ", ", weight_scale.size(weight_scale.dim()-1), "]");
     TORCH_CHECK(output.size(0) == M && output.size(1) == N,
                 "esimd_gemm_int4_pgrp: output shape mismatch; expected [", M, ", ", N, "]");
 
@@ -84,6 +93,6 @@ at::Tensor esimd_gemm_int4_pgrp(
         reinterpret_cast<const uint8_t*>(p_w),
         reinterpret_cast<const fp16*>(p_sc),
         reinterpret_cast<fp16*>(p_out),
-        (uint32_t)M, (uint32_t)N, (uint32_t)K, dpcpp_queue);
+        (uint32_t)M, (uint32_t)N, (uint32_t)K, dpcpp_queue, group_size);
     return output;
 }
