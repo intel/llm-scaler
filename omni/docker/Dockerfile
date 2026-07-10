@@ -255,11 +255,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # omni_xpu_kernel (installed here so its cute FMHA ext can use sgl-kernel-xpu's
 # cutlass-sycl headers). CUTLASS_SYCL_ROOT points at the fetched tree; the cute
 # ext is AOT-compiled for OMNI_XPU_DEVICE (bmg = Arc B-series).
-# IGC_ThreadCount limits Intel Graphics Compiler threads to prevent OOM during AOT.
 RUN --mount=type=cache,target=/root/.cache/pip \
     export CUTLASS_SYCL_ROOT=/llm/sgl-kernel-xpu/build/_deps/repo-cutlass-sycl-src && \
     export OMNI_XPU_DEVICE=bmg && \
-    export IGC_ThreadCount=4 && \
     cd /tmp/omni_xpu_kernel && \
     pip install . --no-build-isolation && \
     rm -rf /tmp/omni_xpu_kernel
