@@ -800,20 +800,88 @@ index 553513de6..2a4edb703 100644
  
  def convert_fp8(
 diff --git a/vllm/_xpu_ops.py b/vllm/_xpu_ops.py
-index 6a2e5e841..f1966da5f 100644
+index 6a2e5e841..53fdf8417 100644
 --- a/vllm/_xpu_ops.py
 +++ b/vllm/_xpu_ops.py
-@@ -365,6 +365,9 @@ class xpu_ops:
+@@ -114,13 +114,42 @@ def _gdn_attention_core_xpu_impl(
+     attn_metadata = attn_metadata_raw[self.prefix]
+     assert isinstance(attn_metadata, GDNAttentionMetadata)
+ 
+-    # TODO: xpu does not support speculative decoding yet
+-    assert attn_metadata.spec_sequence_masks is None  # type: ignore[attr-defined]
+-
+     conv_weights = self.conv1d.weight.view(
+         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+     )
+ 
++    # num_spec_decodes must be the true decode-request count, NOT
++    # spec_state_indices_tensor.size(0): under full-cudagraph capture that
++    # tensor is padded along dim0 to num_actual_tokens, so size(0) overstates
++    # the count (e.g. 6 instead of 2) and breaks the kernel's
++    # `spec_token == num_spec_decodes * (num_spec_tokens+1)` check. Use the
++    # scalar carried in the metadata, matching the CUDA path
++    # (gdn_linear_attn.py uses attn_metadata.num_spec_decodes).
++    num_spec_decodes = 0
++    if attn_metadata.spec_sequence_masks is not None:  # type: ignore[attr-defined]
++        num_spec_decodes = attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
++
++    def _contig(t):
++        # XPU gdn_attention kernel requires these index/loc tensors to be
++        # contiguous int32. The spec/non_spec split produces non-contiguous
++        # views (fancy indexing) and int64 outputs (torch.argsort), so coerce
++        # both here -- this kernel call site is the single source of truth.
++        if t is None:
++            return None
++        if t.dtype != torch.int32:
++            t = t.to(torch.int32)
++        return t.contiguous()
++
++    def _narrow0(t, n):
++        # Trim a batch-dim-padded tensor back to its true length n. Under
++        # full-cudagraph capture spec tensors are padded along dim0 to
++        # num_actual_tokens; the kernel asserts exact shapes tied to
++        # num_spec_decodes, so narrow to the real prefix (a view; padding
++        # lives in the tail, so the prefix address is stable for replay).
++        if t is None:
++            return None
++        return t.narrow(0, 0, n)
++
+     torch.ops._xpu_C.gdn_attention(
+         core_attn_out,
+         z,
+@@ -139,9 +168,15 @@ def _gdn_attention_core_xpu_impl(
+         dt_bias=self.dt_bias,
+         num_prefills=attn_metadata.num_prefills,  # type: ignore[attr-defined]
+         num_decodes=attn_metadata.num_decodes,  # type: ignore[attr-defined]
++        num_spec_decodes=num_spec_decodes,
+         has_initial_state=attn_metadata.has_initial_state,  # type: ignore[attr-defined]
+-        non_spec_query_start_loc=attn_metadata.non_spec_query_start_loc,  # type: ignore[attr-defined]
+-        non_spec_state_indices_tensor=attn_metadata.non_spec_state_indices_tensor,  # type: ignore[attr-defined]
++        non_spec_query_start_loc=_contig(attn_metadata.non_spec_query_start_loc),  # type: ignore[attr-defined]
++        non_spec_token_indx=_contig(getattr(attn_metadata, 'non_spec_token_indx', None)),  # type: ignore[attr-defined]
++        non_spec_state_indices_tensor=_contig(attn_metadata.non_spec_state_indices_tensor),  # type: ignore[attr-defined]
++        spec_query_start_loc=_contig(_narrow0(getattr(attn_metadata, 'spec_query_start_loc', None), num_spec_decodes + 1) if num_spec_decodes > 0 else None),  # type: ignore[attr-defined]
++        spec_token_indx=_contig(getattr(attn_metadata, 'spec_token_indx', None) if num_spec_decodes > 0 else None),  # type: ignore[attr-defined]
++        spec_state_indices_tensor=_contig(_narrow0(getattr(attn_metadata, 'spec_state_indices_tensor', None), num_spec_decodes) if num_spec_decodes > 0 else None),  # type: ignore[attr-defined]
++        num_accepted_tokens=_contig(_narrow0(getattr(attn_metadata, 'num_accepted_tokens', None), num_spec_decodes) if num_spec_decodes > 0 else None),  # type: ignore[attr-defined]
+         num_actual_tokens=attn_metadata.num_actual_tokens,  # type: ignore[attr-defined]
+         tp_size=self.tp_size,
+         reorder_input=not self.gqa_interleaved_layout,
+@@ -365,6 +400,13 @@ class xpu_ops:
          return_softmax_lse: bool | None = False,
          s_aux: torch.Tensor | None = None,
          return_attn_probs: bool | None = False,
 +        # Per-sequence causal mask [num_seqs] bool (DiffusionGemma mixed
 +        # causal/bidirectional in one launch). None => scalar `causal`.
 +        per_seq_causal: torch.Tensor | None = None,
++        # XPU: False routes paged multi-query (MTP verify) to branch1
++        # (chunk_prefill, XPU-graph-safe) instead of branch2 whose
++        # host-side .item() breaks command-graph capture.
++        is_mix_batch: bool = True,
      ):
          assert cu_seqlens_k is not None or seqused_k is not None, (
              "cu_seqlens_k or seqused_k must be provided"
-@@ -379,7 +382,11 @@ class xpu_ops:
+@@ -379,7 +421,11 @@ class xpu_ops:
              "when block_table is disabled, cu_seqlens_k is needed"
          )
          if out is None:
@@ -826,14 +894,33 @@ index 6a2e5e841..f1966da5f 100644
          real_window_size: tuple[int, int]
          if window_size is None:
              real_window_size = (-1, -1)
-@@ -408,6 +415,7 @@ class xpu_ops:
+@@ -408,6 +454,8 @@ class xpu_ops:
              q_descale=q_descale,
              k_descale=k_descale,
              v_descale=v_descale,
 +            per_seq_causal=per_seq_causal,
++            is_mix_batch=is_mix_batch,
          )
  
      @staticmethod
+diff --git a/vllm/compilation/cuda_graph.py b/vllm/compilation/cuda_graph.py
+index b63d86199..6800d99aa 100644
+--- a/vllm/compilation/cuda_graph.py
++++ b/vllm/compilation/cuda_graph.py
+@@ -358,4 +358,13 @@ class CUDAGraphWrapper:
+         # from pre-capture prefetches are satisfied.
+         get_offloader().sync_prev_onload()
+         entry.cudagraph.replay()
++        if current_platform.is_xpu():
++            try:
++                from vllm.distributed.device_communicators.xpu_communicator import (
++                    mark_xpu_graph_replay_seen,
++                )
++
++                mark_xpu_graph_replay_seen()
++            except Exception:
++                logger.exception("Failed to mark XPU graph replay")
+         return entry.output
 diff --git a/vllm/config/__init__.py b/vllm/config/__init__.py
 index b189c45c8..82ab1842f 100644
 --- a/vllm/config/__init__.py
@@ -952,18 +1039,195 @@ index 53f91e1b6..e50a11b0a 100644
                      self.scheduler_config.max_num_seqs * decode_query_len * 2, 512
                  )
 diff --git a/vllm/distributed/device_communicators/xpu_communicator.py b/vllm/distributed/device_communicators/xpu_communicator.py
-index 209005c5b..29c731fbc 100644
+index 209005c5b..cc601ac3e 100644
 --- a/vllm/distributed/device_communicators/xpu_communicator.py
 +++ b/vllm/distributed/device_communicators/xpu_communicator.py
-@@ -42,7 +42,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
+@@ -2,15 +2,98 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ 
++import os
++
+ import torch
+ import torch.distributed as dist
+ from torch.distributed import ProcessGroup
+ 
++from vllm.forward_context import get_forward_context, is_forward_context_available
+ from vllm.logger import init_logger
+ 
+ from .base_device_communicator import DeviceCommunicatorBase
+ 
+ logger = init_logger(__name__)
++_xpu_graph_replay_seen = False
++_xpu_allreduce_retry_seq = 0
++_XPU_ALLREDUCE_RETRY_SHAPES = "25,5120;25,2048"
++
++
++def _env_enabled(name: str, default: bool) -> bool:
++    value = os.environ.get(name)
++    if value is None:
++        return default
++    return value.strip().lower() not in ("0", "false", "no", "off")
++
++
++def mark_xpu_graph_replay_seen() -> None:
++    global _xpu_graph_replay_seen
++    _xpu_graph_replay_seen = True
++
++
++def _xpu_retry_shape_allowed(tensor: torch.Tensor) -> bool:
++    shape_spec = os.environ.get(
++        "VLLM_XPU_ALLREDUCE_RETRY_SHAPE",
++        _XPU_ALLREDUCE_RETRY_SHAPES,
++    )
++    if not shape_spec:
++        return False
++    shape = ",".join(str(dim) for dim in tensor.shape)
++    return shape in {item.strip() for item in shape_spec.split(";")}
++
++
++def _xpu_retry_context_allowed() -> tuple[bool, object | None, object | None]:
++    if not is_forward_context_available():
++        return False, None, None
++
++    forward_context = get_forward_context()
++    batch_descriptor = forward_context.batch_descriptor
++    runtime_mode = forward_context.cudagraph_runtime_mode
++    allowed = (
++        batch_descriptor is not None
++        and getattr(batch_descriptor, "num_tokens", 0) > 1
++        and str(runtime_mode) == "NONE"
++    )
++    return allowed, batch_descriptor, runtime_mode
++
++
++def _xpu_tensor_has_nan(tensor: torch.Tensor) -> bool:
++    try:
++        return bool(torch.isnan(tensor).any().item())
++    except Exception:
++        logger.exception("Failed to inspect XPU all_reduce tensor for NaN")
++        return False
++
++
++def _xpu_global_any_nan(
++    local_nan: bool,
++    tensor: torch.Tensor,
++    group: ProcessGroup,
++) -> bool:
++    flag = torch.empty((), device=tensor.device, dtype=torch.int32)
++    flag.fill_(1 if local_nan else 0)
++    dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
++    return bool(flag.item())
++
++
++def _xpu_allgather_allreduce(
++    output: torch.Tensor,
++    device_group: ProcessGroup,
++    world_size: int,
++    buffer_cache: dict[
++        tuple[torch.device, torch.dtype, tuple[int, ...]], list[torch.Tensor]
++    ],
++) -> None:
++    key = (output.device, output.dtype, tuple(output.shape))
++    gathered = buffer_cache.get(key)
++    if gathered is None:
++        gathered = [torch.empty_like(output) for _ in range(world_size)]
++        buffer_cache[key] = gathered
++
++    dist.all_gather(gathered, output, group=device_group)
++    output.copy_(gathered[0])
++    for tensor in gathered[1:]:
++        output.add_(tensor)
+ 
+ 
+ class XpuCommunicator(DeviceCommunicatorBase):
+@@ -40,10 +123,85 @@ class XpuCommunicator(DeviceCommunicatorBase):
+ 
+                 self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
                  logger.info("Using AgRs manager on XPU device.")
++        self._xpu_allgather_fallback_buffers: dict[
++            tuple[torch.device, torch.dtype, tuple[int, ...]], list[torch.Tensor]
++        ] = {}
  
      def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
 -        output = input_.clone()
++        global _xpu_allreduce_retry_seq
 +        output = input_.clone() if torch.compiler.is_compiling() else input_
++        retry_armed = False
++        batch_descriptor = None
++        runtime_mode = None
++        if (
++            _env_enabled("VLLM_XPU_ALLREDUCE_RETRY_ON_NAN", True)
++            and _xpu_graph_replay_seen
++            and not torch.compiler.is_compiling()
++            and output.is_floating_point()
++            and output.numel() > 0
++            and not torch.xpu.is_current_stream_capturing()
++        ):
++            context_allowed, batch_descriptor, runtime_mode = (
++                _xpu_retry_context_allowed()
++            )
++            retry_armed = context_allowed or _xpu_retry_shape_allowed(output)
++        retry_input = output.clone() if retry_armed else None
++
          dist.all_reduce(output, group=self.device_group)
++        post_nan = _xpu_tensor_has_nan(output) if retry_armed else False
++        global_post_nan = (
++            _xpu_global_any_nan(post_nan, output, self.device_group)
++            if retry_armed
++            else False
++        )
++        retry_count = 0
++        fallback_used = False
++
++        if global_post_nan and retry_input is not None:
++            max_retries = int(os.environ.get("VLLM_XPU_ALLREDUCE_RETRY_MAX", "3"))
++            while global_post_nan and retry_count < max_retries:
++                retry_count += 1
++                output.copy_(retry_input)
++                if _env_enabled("VLLM_XPU_ALLREDUCE_RETRY_SYNC", True):
++                    torch.xpu.synchronize()
++                dist.all_reduce(output, group=self.device_group)
++                post_nan = _xpu_tensor_has_nan(output)
++                global_post_nan = _xpu_global_any_nan(
++                    post_nan, output, self.device_group)
++
++            if (
++                global_post_nan
++                and _env_enabled(
++                    "VLLM_XPU_ALLREDUCE_FALLBACK_AFTER_RETRY", True)
++            ):
++                output.copy_(retry_input)
++                if _env_enabled("VLLM_XPU_ALLREDUCE_RETRY_SYNC", True):
++                    torch.xpu.synchronize()
++                _xpu_allgather_allreduce(
++                    output,
++                    self.device_group,
++                    self.world_size,
++                    self._xpu_allgather_fallback_buffers,
++                )
++                fallback_used = True
++                post_nan = _xpu_tensor_has_nan(output)
++                global_post_nan = _xpu_global_any_nan(
++                    post_nan, output, self.device_group)
++
++            _xpu_allreduce_retry_seq += 1
++            logger.error(
++                "XPU_ALLREDUCE_RETRY seq=%d retries=%d fallback_used=%s "
++                "local_final_post_nan=%s global_final_post_nan=%s "
++                "batch_descriptor=%s runtime_mode=%s shape=%s",
++                _xpu_allreduce_retry_seq,
++                retry_count,
++                fallback_used,
++                post_nan,
++                global_post_nan,
++                batch_descriptor,
++                runtime_mode,
++                tuple(output.shape),
++            )
          return output
  
+     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
 diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
 index 58c49c09d..0c21e39f7 100644
 --- a/vllm/distributed/parallel_state.py
@@ -7100,7 +7364,7 @@ index dc761e69b..4c100ed9d 100644
  @support_torch_compile(
      dynamic_arg_dims={
 diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
-index f4c716789..d9d41f2da 100644
+index f4c716789..526773199 100644
 --- a/vllm/model_executor/models/qwen3_next.py
 +++ b/vllm/model_executor/models/qwen3_next.py
 @@ -21,6 +21,7 @@ from vllm.distributed import (
@@ -7139,7 +7403,7 @@ index f4c716789..d9d41f2da 100644
              prefix=f"{prefix}.gate",
          )
  
-@@ -172,12 +185,162 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+@@ -172,12 +185,164 @@ class Qwen3NextSparseMoeBlock(nn.Module):
              else None,
          )
  
@@ -7160,6 +7424,7 @@ index f4c716789..d9d41f2da 100644
 +        self._moe_esimd_ok = (
 +            ESIMD_AVAILABLE
 +            and not disable_esimd_moe()
++            and not parallel_config.enable_expert_parallel
 +            and quant_is_fp8(quant_config)
 +            and self.shared_expert is not None
 +            and self.n_routed_experts % 16 == 0
@@ -7173,6 +7438,7 @@ index f4c716789..d9d41f2da 100644
 +        self._moe_int4_esimd_ok = (
 +            ESIMD_AVAILABLE
 +            and not disable_esimd_int4()
++            and not parallel_config.enable_expert_parallel
 +            and quant_is_sym_int4(quant_config)
 +            and self.shared_expert is not None
 +            and self.n_routed_experts % 16 == 0
@@ -7302,7 +7568,7 @@ index f4c716789..d9d41f2da 100644
          if self.is_sequence_parallel:
              hidden_states = sequence_parallel_chunk(hidden_states)
  
-@@ -201,6 +364,112 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+@@ -201,6 +366,112 @@ class Qwen3NextSparseMoeBlock(nn.Module):
  
          return final_hidden_states.view(orig_shape)
  
@@ -7415,7 +7681,7 @@ index f4c716789..d9d41f2da 100644
  
  class Qwen3NextAttention(nn.Module):
      def __init__(
-@@ -281,13 +550,93 @@ class Qwen3NextAttention(nn.Module):
+@@ -281,13 +552,93 @@ class Qwen3NextAttention(nn.Module):
          self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
          self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
  
@@ -7510,7 +7776,7 @@ index f4c716789..d9d41f2da 100644
  
          if self.attn_output_gate:
              q_gate, k, v = qkv.split(
-@@ -316,6 +665,118 @@ class Qwen3NextAttention(nn.Module):
+@@ -316,6 +667,118 @@ class Qwen3NextAttention(nn.Module):
              gate = torch.sigmoid(gate)
              attn_output = attn_output * gate
  
@@ -7629,7 +7895,7 @@ index f4c716789..d9d41f2da 100644
          output[:], _ = self.o_proj(attn_output)
  
  
-@@ -398,6 +859,239 @@ class Qwen3NextDecoderLayer(nn.Module):
+@@ -398,6 +861,239 @@ class Qwen3NextDecoderLayer(nn.Module):
                  ),
              )
  
@@ -7869,7 +8135,7 @@ index f4c716789..d9d41f2da 100644
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -405,27 +1099,100 @@ class Qwen3NextDecoderLayer(nn.Module):
+@@ -405,27 +1101,100 @@ class Qwen3NextDecoderLayer(nn.Module):
          positions: torch.Tensor = None,
          **kwargs: object,
      ):
@@ -7989,7 +8255,7 @@ index f4c716789..d9d41f2da 100644
  
          if self.layer_scale:
              if len(hidden_states.shape) == 2:
-@@ -438,8 +1205,71 @@ class Qwen3NextDecoderLayer(nn.Module):
+@@ -438,8 +1207,71 @@ class Qwen3NextDecoderLayer(nn.Module):
                  )
  
          # Fully Connected
@@ -10012,7 +10278,7 @@ index 1e74e4c48..89791eb42 100644
          try:
              from vllm.vllm_flash_attn.flash_attn_interface import (
 diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
-index 4b8b86d86..79adb0b4c 100755
+index 4b8b86d86..a07a4bd77 100755
 --- a/vllm/v1/attention/backends/flash_attn.py
 +++ b/vllm/v1/attention/backends/flash_attn.py
 @@ -3,6 +3,8 @@
@@ -10423,6 +10689,16 @@ index 4b8b86d86..79adb0b4c 100755
                  flash_attn_varlen_func(
                      q=query[:num_actual_tokens],
                      k=key_cache,
+@@ -828,6 +1194,9 @@ class FlashAttentionImpl(AttentionImpl):
+                     v_descale=v_descale,
+                     num_splits=attn_metadata.max_num_splits,
+                     s_aux=self.sinks,
++                    # XPU MTP+graph: route paged multi-query to branch1
++                    # (chunk_prefill) so capture avoids branch2's .item().
++                    is_mix_batch=False,
+                 )
+                 return output
+ 
 diff --git a/vllm/v1/attention/backends/mla/flashattn_mla.py b/vllm/v1/attention/backends/mla/flashattn_mla.py
 index bd947296e..697376069 100644
 --- a/vllm/v1/attention/backends/mla/flashattn_mla.py
