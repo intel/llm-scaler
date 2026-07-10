@@ -1,12 +1,13 @@
 /* esimd_kernel_topk_v2.sycl — Standalone TopK V2 kernel (no DPAS dependency) */
 
+#include <sycl/sycl.hpp>
+
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/python.h>
 
 #include <cstdint>
-#include <sycl/sycl.hpp>
 
 // Include only moe_ops.h (TopK kernels, no DPAS)
 #include "esimd_kernels/moe_ops.h"
