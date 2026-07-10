@@ -51,6 +51,24 @@ namespace linear {
     void fp8_cache_clear();
     std::tuple<int64_t, int64_t, int64_t> fp8_cache_stats();
 }
+namespace int8_ops {
+    torch::Tensor mm_int8(torch::Tensor a, torch::Tensor b);
+    torch::Tensor int8_linear(torch::Tensor x, torch::Tensor weight, torch::Tensor weight_scale,
+                              std::optional<torch::Tensor> bias, int64_t out_dtype_code,
+                              bool convrot, int64_t convrot_groupsize);
+    std::tuple<torch::Tensor, torch::Tensor> quantize_int8_tensorwise(
+        torch::Tensor x, std::optional<torch::Tensor> scale, int64_t stochastic_rounding);
+    std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise(
+        torch::Tensor x, int64_t stochastic_rounding);
+    std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(torch::Tensor x);
+    torch::Tensor fused_scaleback(torch::Tensor gemm_result, torch::Tensor x_scale,
+                                  torch::Tensor w_scale, std::optional<torch::Tensor> bias,
+                                  int64_t out_dtype_code);
+    torch::Tensor dequantize_int8_simple(torch::Tensor q, torch::Tensor scale);
+    torch::Tensor dequantize_int8_simple_dtype(torch::Tensor q, torch::Tensor scale, int64_t output_dtype_code);
+    void int8_cache_clear();
+    std::tuple<int64_t, int64_t, int64_t> int8_cache_stats();
+}
 }
 
 PYBIND11_MODULE(_C, m) {
@@ -201,4 +219,59 @@ PYBIND11_MODULE(_C, m) {
         "Returns: (output, has_nonfinite) where has_nonfinite is True if kernel\n"
         "detected inf/nan (e.g. degenerate softmax), signaling SDPA fallback needed.",
         py::arg("q"), py::arg("k"), py::arg("v"));
+
+    // INT8 Quantization and Linear (oneDNN s8 matmul)
+    auto int8 = m.def_submodule("int8", "INT8 quantization and linear kernels");
+    int8.def("mm_int8", &omni_xpu::int8_ops::mm_int8,
+        "INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N] (s8×s8→s32)\n"
+        "Uses oneDNN DPAS-accelerated s8 matmul primitive.\n"
+        "Input: a [M, K] int8, b [K, N] int8\n"
+        "Output: [M, N] int32",
+        py::arg("a"), py::arg("b"));
+    int8.def("int8_linear", &omni_xpu::int8_ops::int8_linear,
+        "INT8 linear layer with dynamic activation quantization.\n"
+        "Fuses: rowwise quant → s8 GEMM → rescale → bias.\n"
+        "Input: x [M, K] fp16/bf16, weight [N, K] int8, weight_scale [N] or scalar f32\n"
+        "Output: [M, N] in out_dtype",
+        py::arg("x"), py::arg("weight"), py::arg("weight_scale"),
+        py::arg("bias") = py::none(), py::arg("out_dtype_code") = 2,
+        py::arg("convrot") = false, py::arg("convrot_groupsize") = 256);
+    int8.def("quantize_int8_tensorwise", &omni_xpu::int8_ops::quantize_int8_tensorwise,
+        "Quantize tensor to INT8 with single tensorwise scale.\n"
+        "Input: x (any shape), optional scale, stochastic_rounding seed\n"
+        "Output: (int8 tensor, float32 scale)",
+        py::arg("x"), py::arg("scale") = py::none(), py::arg("stochastic_rounding") = 0);
+    int8.def("quantize_int8_rowwise", &omni_xpu::int8_ops::quantize_int8_rowwise,
+        "Quantize tensor to INT8 with per-row scales.\n"
+        "Input: x [..., K]\n"
+        "Output: (int8 tensor, float32 scales [..., 1])",
+        py::arg("x"), py::arg("stochastic_rounding") = 0);
+    int8.def("quantize_int8_rowwise_fused", &omni_xpu::int8_ops::quantize_int8_rowwise_fused,
+        "ESIMD fused per-row INT8 quantization (single kernel pass).\n"
+        "Fuses absmax + scale + divide + round + clamp + cast.\n"
+        "Input: x [..., K] bf16/f16\n"
+        "Output: (int8 tensor, float32 scales [..., 1])",
+        py::arg("x"));
+    int8.def("fused_scaleback", &omni_xpu::int8_ops::fused_scaleback,
+        "ESIMD fused scale-back: int32 GEMM result → output dtype in single pass.\n"
+        "Fuses: int32→f32 cast + scale multiply + dtype conversion + bias add.\n"
+        "Input: gemm_result [M,N] int32, x_scale [M], w_scale [N] or scalar, bias [N]\n"
+        "Output: [M,N] in specified dtype",
+        py::arg("gemm_result"), py::arg("x_scale"), py::arg("w_scale"),
+        py::arg("bias") = py::none(), py::arg("out_dtype_code") = 2);
+    int8.def("dequantize_int8_simple", &omni_xpu::int8_ops::dequantize_int8_simple,
+        "Dequantize INT8 tensor: result = q.float() * scale\n"
+        "Input: q (int8), scale (broadcastable)\n"
+        "Output: float32 tensor",
+        py::arg("q"), py::arg("scale"));
+    int8.def("dequantize_int8_simple_dtype", &omni_xpu::int8_ops::dequantize_int8_simple_dtype,
+        "Dequantize INT8 tensor with output dtype conversion.\n"
+        "dtype codes: 0=f32, 1=f16, 2=bf16\n"
+        "Input: q (int8), scale, output_dtype_code\n"
+        "Output: tensor in specified dtype",
+        py::arg("q"), py::arg("scale"), py::arg("output_dtype_code"));
+    int8.def("int8_cache_clear", &omni_xpu::int8_ops::int8_cache_clear,
+        "Clear INT8 oneDNN primitive cache");
+    int8.def("int8_cache_stats", &omni_xpu::int8_ops::int8_cache_stats,
+        "Return INT8 cache stats as (hits, misses, size)");
 }

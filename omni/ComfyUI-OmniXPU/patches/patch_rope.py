@@ -95,4 +95,52 @@ def apply():
                     pass
         log.info("[OmniXPU] rope: rebound %d by-value imports of apply_rope1", rebound)
 
+    # ── General dual-tensor apply_rope ───────────────────────────────────────
+    # comfy.ldm.flux.math.apply_rope(q, k, freqs) is the dual-tensor entry used
+    # by flux (its own attention()), lumina, hidream, sam3, krea2, triposplat,
+    # lens and pixeldit. Its inference branch forwards to comfy_kitchen
+    # ck.apply_rope, which has no XPU backend (falls back to eager torch), so
+    # none of these models reach the omni ESIMD rotary kernel via the
+    # single-tensor apply_rope1 patch above. Patch apply_rope the same way:
+    # route eligible tensors through the ESIMD kernel, fall back otherwise.
+    # Numerically equivalent to the reference (verified: fp32 ~1e-7,
+    # bf16 ~3e-3 rounding) — see krea2/verify_rope_equivalence.py.
+    #
+    # NOTE: this targets the flux.math.apply_rope symbol only. The
+    # identically-named comfy.text_encoders.llama.apply_rope (used by the
+    # llama/qwen35/sa3/gpt_oss text encoders and comfy.ldm.ideogram4) is a
+    # different function with a different freq layout; the identity check in
+    # the rebind walk below leaves it untouched.
+    if hasattr(flux_math, "apply_rope"):
+        _orig_apply_rope = flux_math.apply_rope
+
+        def _patched_apply_rope(xq, xk, freqs_cis):
+            if (_can_use(xq) and _can_use(xk) and xq.ndim == 4 and xk.ndim == 4
+                    and freqs_cis.ndim == 6):
+                return _omni_apply_rope1(xq, freqs_cis), _omni_apply_rope1(xk, freqs_cis)
+            return _orig_apply_rope(xq, xk, freqs_cis)
+
+        flux_math.apply_rope = _patched_apply_rope
+
+        # Rebind by-value imports of apply_rope in already-loaded modules
+        # (lumina, hidream, sam3, krea2, triposplat, lens, pixeldit all do
+        # `from comfy.ldm.flux.math import apply_rope`). The identity check
+        # against the original flux.math.apply_rope excludes the llama-family
+        # function of the same name.
+        rebound_ar = 0
+        for mod_name, mod in list(sys.modules.items()):
+            if mod is None or mod is flux_math:
+                continue
+            try:
+                cur = getattr(mod, "apply_rope", None)
+            except Exception:
+                continue
+            if cur is _orig_apply_rope:
+                try:
+                    setattr(mod, "apply_rope", _patched_apply_rope)
+                    rebound_ar += 1
+                except Exception:
+                    pass
+        log.info("[OmniXPU] rope: patched apply_rope + rebound %d by-value imports", rebound_ar)
+
     return True, None

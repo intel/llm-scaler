@@ -53,12 +53,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         --index-url https://download.pytorch.org/whl/xpu && \
     pip install pytest
 
-# omni_xpu_kernel
+# omni_xpu_kernel is installed AFTER sgl-kernel-xpu (below): its cute FMHA
+# extension needs the cutlass-sycl headers that sgl-kernel-xpu fetches into
+# build/_deps/repo-cutlass-sycl-src.
 COPY ./omni_xpu_kernel /tmp/omni_xpu_kernel
-RUN --mount=type=cache,target=/root/.cache/pip \
-    cd /tmp/omni_xpu_kernel && \
-    pip install . --no-build-isolation && \
-    rm -rf /tmp/omni_xpu_kernel
 
 # xDiT / long-context-attention
 COPY ./patches/yunchang_for_multi_arc.patch /tmp/
@@ -87,8 +85,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm && \
     git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git && \
     cd ComfyUI && \
-    git fetch --depth 1 origin 64b8457f55cd7fb54ca7a956d9c73b505e903e0c && \
-    git checkout 64b8457f55cd7fb54ca7a956d9c73b505e903e0c && \
+    git fetch --depth 1 origin bb131be9e83d2f773c90f1d6f1e4b248a498c8c5 && \
+    git checkout bb131be9e83d2f773c90f1d6f1e4b248a498c8c5 && \
     pip install -r requirements.txt
 
 # ComfyUI-OmniXPU: Intel XPU acceleration via custom node (replaces core patch)
@@ -148,8 +146,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/ComfyUI/custom_nodes && \
     git clone --depth 1 https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git && \
     cd ComfyUI-nunchaku-XPU && \
-    git fetch --depth 1 origin 1b78483a6af31297d5291f61965502079aed3407 && \
-    git checkout 1b78483a6af31297d5291f61965502079aed3407 && \
+    git fetch --depth 1 origin 55b6497e5c5e4337d2de12943fd97a499bd9c2e5 && \
+    git checkout 55b6497e5c5e4337d2de12943fd97a499bd9c2e5 && \
     pip install -r requirements.txt && \
     pip install --no-deps kernels==0.14.0
 
@@ -254,6 +252,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         /llm/ComfyUI/custom_nodes/ && \
     rm -f /tmp/sglang_diffusion_for_multi_arc.patch
 
+# omni_xpu_kernel (installed here so its cute FMHA ext can use sgl-kernel-xpu's
+# cutlass-sycl headers). CUTLASS_SYCL_ROOT points at the fetched tree; the cute
+# ext is AOT-compiled for OMNI_XPU_DEVICE (bmg = Arc B-series).
+RUN --mount=type=cache,target=/root/.cache/pip \
+    export CUTLASS_SYCL_ROOT=/llm/sgl-kernel-xpu/build/_deps/repo-cutlass-sycl-src && \
+    export OMNI_XPU_DEVICE=bmg && \
+    cd /tmp/omni_xpu_kernel && \
+    pip install . --no-build-isolation && \
+    rm -rf /tmp/omni_xpu_kernel
+
 # Application files
 COPY ./workflows/* /llm/ComfyUI/user/default/workflows/
 COPY ./example_inputs/* /llm/ComfyUI/input/
@@ -303,6 +311,5 @@ ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python${PYTHON_VERSION}/dist-
 ENV CCL_SYCL_ALLTOALL_ARC_LL=1
 ENV CCL_SYCL_CCL_BARRIER=1
 ENV OMNIXPU_INTERPOLATE_FIX=0
-ENV OMNIXPU_ATTENTION=0
 
 WORKDIR /llm/entrypoints

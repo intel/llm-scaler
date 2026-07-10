@@ -21,6 +21,8 @@ COPY ./patches/extention_comfyui_florence2.patch /tmp/
 COPY ./patches/extension_comfyui_segment_anything_2.patch /tmp/
 COPY ./patches/extension_comfyui_reactor.patch /tmp/
 COPY ./patches/extension_comfyui_rmbg.patch /tmp/
+COPY ./patches/extension_SenseNova-U1.patch /tmp
+COPY ./patches/extension_comfyui-advancedliveportrait.patch /tmp
 
 # Add custom node
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -37,7 +39,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     rm -rf ComfyUI_LayerStyle_Advance && \
     git clone --depth 1 https://github.com/chflame163/ComfyUI_LayerStyle_Advance.git && \
     cd ComfyUI_LayerStyle_Advance && \
-    git fetch --depth 1 orgin 7b678b401a38307a4a7e99ef6630bd48f9cecedb && \
+    git fetch --depth 1 origin 7b678b401a38307a4a7e99ef6630bd48f9cecedb && \
     git checkout 7b678b401a38307a4a7e99ef6630bd48f9cecedb && \
     git apply /tmp/comfyui-layerstyle_advance-add-intel-xpu-support-for-joy-caption-beta1.patch && \
     pip install segment_anything wget blend_modes && \
@@ -114,5 +116,29 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git apply /tmp/extension_comfyui_rmbg.patch && \
     pip install -r requirements.txt && \
     rm -f /tmp/extension_comfyui_rmbg.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf ComfyUI_SenseNova_U1 && \
+    git clone --depth 1 https://github.com/smthemex/ComfyUI_SenseNova_U1.git && \
+    cd ComfyUI_SenseNova_U1 && \
+    git fetch --depth 1 origin 6ad02b24859dfc29e5b187e239c657d75d3d1583 && \
+    git checkout 6ad02b24859dfc29e5b187e239c657d75d3d1583 && \
+    git apply /tmp/extension_SenseNova-U1.patch && \
+    pip install -r requirements.txt && \
+    rm -f /tmp/extension_SenseNova-U1.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf comfyui-advancedliveportrait && \
+    git clone --depth 1 https://github.com/PowerHouseMan/ComfyUI-AdvancedLivePortrait.git comfyui-advancedliveportrait && \
+    cd comfyui-advancedliveportrait && \
+    git fetch --depth 1 origin 64bc23a0aec326df9c0ab0435b35ae6252635805 && \
+    git checkout 64bc23a0aec326df9c0ab0435b35ae6252635805 && \
+    git apply /tmp/extension_comfyui-advancedliveportrait.patch && \
+    pip install -r requirements.txt && \
+    rm -f /tmp/extension_comfyui-advancedliveportrait.patch
+
+RUN rm -f /usr/lib/python3*/EXTERNALLY-MANAGED
 
 WORKDIR /llm/entrypoints

@@ -1118,8 +1118,8 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | Qwen/Qwen3-235B-A22B                       |      |         ✅         |                      |       |                           |
 | Qwen/Qwen3-Coder-30B-A3B-Instruct          |  ✅  |         ✅         |          ✅          |       |                           |
 | Qwen/Qwen3-Coder-Next                      |  ✅  |         ✅         |                    |       |                           |
-| Qwen/Qwen3.5-27B                           |  ✅  |         ✅         |          ✅          |       |                           |
-| Qwen/Qwen3.5-35B-A3B                       |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3.5/3.6-27B                       |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3.5/3.6-35B-A3B                   |  ✅  |         ✅         |          ✅          |       |                           |
 | Qwen/Qwen3.5-122B-A10B                     |      |         ✅         |          ✅          |       |                           |
 | Qwen/QwQ-32B                               |  ✅  |         ✅         |          ✅          |       |                           |
 | mistralai/Ministral-8B-Instruct-2410       |  ✅  |         ✅         |          ✅          |       |                           |
@@ -1205,6 +1205,58 @@ curl http://localhost:8001/v1/chat/completions -H 'Content-Type: application/jso
 "max_tokens": 128
 }'
 ```
+
+### 3.2 Reference commands for running the supported Qwen3.5/3.6 models
+
+`intel/llm-scaler-vllm:0.14.0-b8.3.1` release is recommended for running Qwen3.5/3.6-27B, Qwen3.5/3.6-35B-A3B and Qwen3.5-122B-A10B models. You may start by using the reference commands and parameters as follows: 
+
+1. Starting the container on host: 
+```bash
+sudo docker run -td --privileged --net=host --device=/dev/dri --name=test -v $your_model_path:/llm/models/  --shm-size="32g" --entrypoint /bin/bash intel/llm-scaler-vllm:0.14.0-b8.3
+```
+Use ```-e http_proxy=$your_proxy -e https_proxy=$your_proxy -e no_proxy=localhost,127.0.0.1``` if needed.  
+
+
+2. Starting the vllm server
+
+Fo instance starting the Qwen3.6-35B-A3B model: 
+```bash
+sudo docker exec -it test bash 
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 # or ```export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=0```
+export ZE_AFFINITY_MASK=0,1 # assuming use the first two Arc GPUs
+
+vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-tokens 8192 --max-model-len 40000 --block-size 64 --dtype float16 --model /llm/models/Qwen3.6-35B-A3B/ --served-model-name Qwen3.6-35B-A3B --tensor-parallel-size 2 --quantization fp8 --enforce-eager --trust-remote-code --disable-log-requests 
+```
+
+For Int4, please use 
+```export VLLM_QUANTIZE_Q40_LIB="/usr/local/lib/python3.12/dist-packages/vllm_int4_for_multi_arc.so"```, and ```--quantization sym_int4``` when starting the vllm server.
+
+Prefix Caching and Tool Calling features are supported with additional parameters: 
+```
+--enable-prefix-caching 
+--enable-auto-tool-choice 
+--tool-call-parser qwen3_coder 
+```
+
+3. Sending bench requests to the vllm server 
+
+For instance sending one 32K random input: 
+```bash
+vllm bench serve --model /llm/models/Qwen3.6-35B-A3B/ --served-model-name Qwen3.6-35B-A3B --port 8000 --backend vllm --request-rate inf --ignore-eos --trust-remote-code --dataset-name random --num-prompt 1 --random-output-len 2048 --random-input-len 32768 
+```
+
+Please note the performance will vary according to the combinations of these parameters: 
+```
+--max-model-len
+--tensor-parallel-size
+--quantization
+--num-prompt
+--random-input-len
+--random-output-len
+```
+
 
 ## 4. Troubleshooting
 

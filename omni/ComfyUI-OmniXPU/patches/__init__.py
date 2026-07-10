@@ -36,18 +36,22 @@ def apply_all_patches(cfg):
         return mod.apply
 
     apply_interpolate = _load_patch("patch_interpolate")
+    apply_median = _load_patch("patch_median")
     apply_fp8_fix = _load_patch("patch_fp8_fix")
     apply_norm = _load_patch("patch_norm")
     apply_rope = _load_patch("patch_rope")
     apply_fp8_gemm = _load_patch("patch_fp8_gemm")
     apply_attention = _load_patch("patch_attention")
+    apply_int8 = _load_patch("patch_int8")
 
     _apply_one("interpolate_fix", cfg.interpolate_fix, apply_interpolate)
+    _apply_one("median_fix", cfg.median_fix, apply_median)
     _apply_one("fp8_neg_zero_fix", cfg.fp8_neg_zero_fix, apply_fp8_fix)
     _apply_one("norm", cfg.norm, apply_norm)
     _apply_one("rope", cfg.rope, apply_rope)
     _apply_one("fp8_gemm", cfg.fp8_gemm, apply_fp8_gemm)
     _apply_one("attention", cfg.attention, apply_attention)
+    _apply_one("int8", cfg.int8, apply_int8)
 
 
 def _apply_one(name, enabled, apply_fn):

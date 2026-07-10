@@ -9,10 +9,11 @@ Optimised SYCL/ESIMD kernels for Intel GPUs:
 * **rotary** — Fused rotary position embedding
 * **sdp** — Standalone scaled dot-product attention
 * **linear** — FP8 GEMM (oneDNN W8A16, E4M3/E5M2)
+* **int8** — INT8 quantization, GEMM, and linear (oneDNN s8 matmul + ESIMD fusion)
 
 Usage::
 
-    from omni_xpu_kernel import svdq, norm, rotary, gguf, sdp, linear
+    from omni_xpu_kernel import svdq, norm, rotary, gguf, sdp, linear, int8
 """
 
 import os
@@ -58,6 +59,14 @@ from . import svdq
 from . import rotary
 from . import sdp
 from . import linear
+from . import int8
+
+# cute FMHA (CUTLASS-SYCL) is an optional backend — its AOT .so may be absent on
+# non-XPU / header-less installs, so import defensively.
+try:
+    from . import cute
+except Exception:  # pragma: no cover
+    cute = None
 
 __all__ = [
     "gguf",
@@ -66,6 +75,8 @@ __all__ = [
     "rotary",
     "sdp",
     "linear",
+    "int8",
+    "cute",
     "is_available",
     "__version__",
 ]
