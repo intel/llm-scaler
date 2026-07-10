@@ -50,6 +50,8 @@ _try_import_ext("custom_esimd_kernels_gemm")   # XeLPG: skipped (DPAS-dep)
 _try_import_ext("eagle_ops")                   # Qwen3.5 decode uses this
 _try_import_ext("moe_ops")                     # XeLPG: skipped (DPAS-dep)
 _try_import_ext("moe_int4_ops")                # XeLPG: skipped (DPAS-dep)
+_try_import_ext("moe_fp8_prefill_ops")         # v2-merged: FP8 MoE prefill
+_try_import_ext("custom_esimd_kernels_attn")   # v2-merged: decode SDPA (pybind)
 
 if _MISSING_EXTS:
     _log.info(
@@ -104,6 +106,11 @@ _EXPORTS = [
     "esimd_moe_gemm_fp8",
     "esimd_moe_gemm_fp8_pert",
     "esimd_gemm_fp8_pert",
+    "esimd_gemm_int4_pgrp",
+    # v2-merged: FP8 MoE prefill + decode SDPA
+    "moe_prefill_full_fp8",
+    "sglang_decode_attn",
+    "sglang_decode_attn_temp_size",
     # Eagle ops
     "eagle_gdn",
     "eagle_page_attn_decode",

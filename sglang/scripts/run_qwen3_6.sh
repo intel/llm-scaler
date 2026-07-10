@@ -45,9 +45,9 @@ export SGLANG_MAMBA_SSM_DTYPE=float16
 # replay on sequences > 16384 tokens (kernel MAX_SPLITS cap).
 export SGLANG_XPU_ENABLE_GRAPH=1
 
-# --- python path for vendored ESIMD packages ---
-# Setup.py at /workspace/custom-esimd-kernels {-, -sglang}/setup.py
-# installs both via package_dir; nothing extra to set normally.
+# --- python path for vendored ESIMD package ---
+# Setup.py at /workspace/custom-esimd-kernels/setup.py installs the single
+# merged custom_esimd_kernels_sglang package; nothing extra to set normally.
 
 # --disable-radix-cache: the MambaRadixCache prefix-cache path can deadlock
 # the TP schedulers on this hybrid GDN model (cache_prefix / zero-token

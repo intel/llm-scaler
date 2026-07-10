@@ -5,6 +5,9 @@ import torch
 import torch.nn.functional as F
 
 _ops = torch.ops.custom_esimd_kernels_sglang
+# FP8/INT4 GEMM (M>=2) ops live in the v2-derived gemm extension, which keeps
+# its original torch namespace `custom_esimd_kernels`.
+_ops_gemm = torch.ops.custom_esimd_kernels
 
 
 def esimd_gemv_fp8_pern(
@@ -774,7 +777,18 @@ def esimd_gemm_fp8_pert(
       M=1-3  → batched GEMV (BW-bound, K-split SLM reduction)
       M>=2   → DPAS V9 (E4M3, K%64==0) or DPAS V7 (E5M2) or WS fallback
     """
-    return _ops.esimd_gemm_fp8_pert(input, weight, weight_scale, output)
+    return _ops_gemm.esimd_gemm_fp8_pert(input, weight, weight_scale, output)
+
+
+def esimd_gemm_int4_pgrp(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """INT4 GEMM with per-group scale (group_size=128). M >= 2.
+
+    From the v2-derived gemm extension (torch.ops.custom_esimd_kernels).
+    """
+    return _ops_gemm.esimd_gemm_int4_pgrp(input, weight, weight_scale, output)
 
 
 def esimd_moe_gemm_fp8_pert(
@@ -1633,3 +1647,60 @@ def moe_forward_cutlass_nmajor_int4_full(
         x, logits, w13, w13_scales, w2, w2_scales,
         shared_gu_w, shared_d_w, shared_gate_w,
         top_k, num_shared_experts, n_routed_experts)
+
+
+# ============================================================================
+# v2-derived ops (merged from the former custom-esimd-kernels package)
+# ============================================================================
+
+# FP8 M-tiled DPAS MoE prefill (torch.ops.moe_fp8_prefill_ops).
+_moe_fp8_prefill = torch.ops.moe_fp8_prefill_ops
+
+
+def moe_prefill_full_fp8(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: torch.Tensor, w13_scale: torch.Tensor,
+    w2: torch.Tensor, w2_scale: torch.Tensor,
+    top_k: int, num_experts: int,
+) -> torch.Tensor:
+    """Fused FP8 MoE prefill driver (gather + up(gate·SiLU) + down + accumulate).
+
+    sglang FusedMoE layout: w13=[E,2I,H], w2=[E,H,I], per-expert scalar scale.
+    """
+    return _moe_fp8_prefill.moe_prefill_full_fp8(
+        hidden_states, topk_weights, topk_ids,
+        w13, w13_scale, w2, w2_scale, top_k, num_experts)
+
+
+# Decode SDPA for sglang's flat NHD KV-cache layout. Exposed as a pybind11
+# method on the compiled extension module (not a torch.ops op).
+def _load_attn_mod():
+    from custom_esimd_kernels_sglang import custom_esimd_kernels_attn as _m
+    return _m
+
+
+def sglang_decode_attn(
+    q, k_buffer, v_buffer, kv_indptr, kv_indices, out, sm_scale,
+    temp_p=None, max_seq_len=-1,
+):
+    """ESIMD decode SDPA on sglang flat-NHD KV layout (head_dim=256, GQA).
+
+    q/out fp16; k/v fp16 or bf16; kv_indptr/indices int32. ``temp_p`` is an
+    optional pre-allocated fp32 scratch for XPUGraph capture/replay stability;
+    ``max_seq_len`` (<=0 = legacy device->host scan) lets n_splits be computed
+    host-side.
+    """
+    return _load_attn_mod().sglang_decode_attn(
+        q, k_buffer, v_buffer, kv_indptr, kv_indices, out, float(sm_scale),
+        temp_p, int(max_seq_len),
+    )
+
+
+def sglang_decode_attn_temp_size(batches: int, num_q_heads: int, max_seq_len: int) -> int:
+    """fp32 element count needed for the ``temp_p`` scratch of sglang_decode_attn."""
+    SPLIT_TILE = 64
+    n_splits = max((max_seq_len + SPLIT_TILE - 1) // SPLIT_TILE, 1)
+    per_partial = batches * num_q_heads * n_splits
+    return per_partial * (1 + 1 + 256)
