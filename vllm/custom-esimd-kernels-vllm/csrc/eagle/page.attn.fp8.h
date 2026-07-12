@@ -366,20 +366,17 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1Fp8(
         1,
         uint32_t>(pPollP, atomicOffset);
 
-      if (0 == arrivalId) {
-        atomic_update<
-          __ESIMD_NS::atomic_op::fcmpxchg,
-          float,
-          1,
-          uint32_t>(pGlobalMax, atomicOffset, ppMax, zeros);
-      }
-      else {
-        atomic_update<
-          __ESIMD_NS::atomic_op::fmax,
-          float,
-          1,
-          uint32_t>(pGlobalMax, atomicOffset, ppMax);
-      }
+      // Order-invariant global-max reduction: every arrival does an atomic fmax, so
+      // pGlobalMax must be seeded to FP32_MIN (done in page_attn_decode) rather than 0.
+      // See page.attn.h (fp16 path) for the full rationale; the arrival counter is now
+      // unused but kept so the pPollP layout matches the fp16 kernels.
+      (void)arrivalId;
+      (void)zeros;
+      atomic_update<
+        __ESIMD_NS::atomic_op::fmax,
+        float,
+        1,
+        uint32_t>(pGlobalMax, atomicOffset, ppMax);
 
       outputOffset += pStride;
       outputMaxOffset += maxStride;
@@ -908,20 +905,17 @@ ESIMD_INLINE void sdpaDecodeGqa2Phase1Fp8(
         1,
         uint32_t>(pPollP, atomicOffset);
 
-      if (0 == arrivalId) {
-        atomic_update<
-          __ESIMD_NS::atomic_op::fcmpxchg,
-          float,
-          1,
-          uint32_t>(pGlobalMax, atomicOffset, ppMax, zeros);
-      }
-      else {
-        atomic_update<
-          __ESIMD_NS::atomic_op::fmax,
-          float,
-          1,
-          uint32_t>(pGlobalMax, atomicOffset, ppMax);
-      }
+      // Order-invariant global-max reduction: every arrival does an atomic fmax, so
+      // pGlobalMax must be seeded to FP32_MIN (done in page_attn_decode) rather than 0.
+      // See page.attn.h (fp16 path) for the full rationale; the arrival counter is now
+      // unused but kept so the pPollP layout matches the fp16 kernels.
+      (void)arrivalId;
+      (void)zeros;
+      atomic_update<
+        __ESIMD_NS::atomic_op::fmax,
+        float,
+        1,
+        uint32_t>(pGlobalMax, atomicOffset, ppMax);
     }
   }
 }
