@@ -150,6 +150,32 @@ class TestQuantizeInt8Rowwise:
         assert q.shape == (2, 16, 128)
         assert scale.shape == (2, 16, 1)
 
+    @pytest.mark.skipif(not has_xpu(), reason="Fused quant kernel requires XPU")
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("k", [7, 8, 255, 256, 512, 513, 1024, 3840])
+    def test_fused_hot_path_aligned_and_unaligned(self, dtype, k, seed):
+        """Native fused quant handles vectorized and scalar-fallback rows."""
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(native, "quantize_int8_rowwise_fused"):
+            pytest.skip("Native fused quant kernel is unavailable")
+
+        x = torch.randn(7, k, device="xpu", dtype=dtype)
+        q, scale = native.quantize_int8_rowwise_fused(x)
+        expected_scale = (
+            x.float().abs().amax(dim=-1, keepdim=True) / 127.0
+        ).clamp(min=1e-30)
+        expected_q = (
+            torch.round(x.float() / expected_scale)
+            .clamp(-128, 127)
+            .to(torch.int8)
+        )
+
+        torch.testing.assert_close(scale, expected_scale, rtol=1e-6, atol=1e-8)
+        max_quant_diff = (q.to(torch.int16) - expected_q.to(torch.int16)).abs().max()
+        assert max_quant_diff.item() <= 1
+
 
 # =============================================================================
 # Dequantization Tests
