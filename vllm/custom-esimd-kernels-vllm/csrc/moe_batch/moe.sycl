@@ -1495,31 +1495,35 @@ static void ensure_moe_buffers(int n_tokens, int top_k, int num_shared_experts,
     }
 }
 
-// FP8-block BSZ=1 path. The checkpoint layout is the native vLLM layout:
+// FP8-block small-batch path. The checkpoint layout is the native vLLM layout:
 //   routed gate_up [E, 2I, H], scale [E, ceil(2I/128), ceil(H/128)]
 //   routed down    [E, H, I],  scale [E, ceil(H/128), ceil(I/128)]
 // Shared-expert weights omit the leading expert dimension. Activations remain
 // FP16; FP8 values are converted to FP16/FP32 and multiplied by the 128x128
 // block scale before accumulation. This path does not use FP8 matrix multiply.
-void moe_up_fp8_block_bsz1_kernel(
+void moe_up_fp8_block_batched_kernel(
     const fp16* x,
     const uint8_t* gate_up_weight, const float* gate_up_scale,
     const uint8_t* shared_gate_up_weight, const float* shared_gate_up_scale,
     const int* selected_experts, fp16* intermediates,
-    const int hidden_size, const int intermediate_size, const int top_k,
+    const int num_tokens, const int hidden_size,
+    const int intermediate_size, const int top_k,
     const torch::Device& device) {
     const int two_inter = 2 * intermediate_size;
     const int scale_nb = (two_inter + 127) / 128;
     const int scale_kb = (hidden_size + 127) / 128;
 
     auto cgf = [&](sycl::handler& cgh) {
-        cgh.parallel_for<class MoeUpFP8BlockBSZ1>(
-            sycl::range<2>(top_k + 1, intermediate_size),
-            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
-                const int route = (int)idx[0];
-                const int row = (int)idx[1];
+        cgh.parallel_for<class MoeUpFP8BlockBatched>(
+            sycl::range<3>(num_tokens, top_k + 1, intermediate_size),
+            [=](sycl::id<3> idx) SYCL_ESIMD_KERNEL {
+                const int token = (int)idx[0];
+                const int route = (int)idx[1];
+                const int row = (int)idx[2];
                 const bool shared = route == top_k;
-                const int eid = shared ? 0 : selected_experts[route];
+                const int eid = shared ? 0
+                    : selected_experts[token * top_k + route];
+                const fp16* token_x = x + (size_t)token * hidden_size;
                 const uint8_t* weight = shared ? shared_gate_up_weight
                     : gate_up_weight + (size_t)eid * two_inter * hidden_size;
                 const float* scales = shared ? shared_gate_up_scale
@@ -1534,7 +1538,7 @@ void moe_up_fp8_block_bsz1_kernel(
                 simd<float, 64> gate_acc(0.f), up_acc(0.f);
                 for (int k = 0; k < hidden_size; k += 64) {
                     simd<float, 64> xv =
-                        block_load<fp16, 64>(x + k);
+                        block_load<fp16, 64>(token_x + k);
                     simd<float, 64> gw = fp8e4m3_to_half<64>(
                         block_load<uint8_t, 64>(gate_w + k));
                     simd<float, 64> uw = fp8e4m3_to_half<64>(
@@ -1548,35 +1552,43 @@ void moe_up_fp8_block_bsz1_kernel(
                 float up = sycl::ext::intel::esimd::detail::sum<
                     float, float, 64>(up_acc);
                 float silu = gate / (1.f + sycl::exp(-gate));
-                intermediates[(size_t)route * intermediate_size + row] =
+                const size_t intermediate_offset =
+                    ((size_t)token * (top_k + 1) + route)
+                    * intermediate_size + row;
+                intermediates[intermediate_offset] =
                     fp16(silu * up);
             });
     };
-    submit_kernel(cgf, device, "moe up fp8 block bsz1");
+    submit_kernel(cgf, device, "moe up fp8 block batched");
 }
 
-void moe_down_finalize_fp8_block_bsz1_kernel(
+void moe_down_finalize_fp8_block_batched_kernel(
     const fp16* x, const fp16* intermediates,
     const uint8_t* down_weight, const float* down_scale,
     const uint8_t* shared_down_weight, const float* shared_down_scale,
     const fp16* shared_expert_gate_weight,
     const fp16* routing_weights, const int* selected_experts,
-    fp16* final_output, const int hidden_size, const int intermediate_size,
-    const int top_k, const torch::Device& device) {
+    fp16* final_output, const int num_tokens, const int hidden_size,
+    const int intermediate_size, const int top_k,
+    const torch::Device& device) {
     const int scale_nb = (hidden_size + 127) / 128;
     const int scale_kb = (intermediate_size + 127) / 128;
 
     auto cgf = [&](sycl::handler& cgh) {
-        cgh.parallel_for<class MoeDownFinalizeFP8BlockBSZ1>(
-            sycl::range<1>(hidden_size),
-            [=](sycl::id<1> idx) SYCL_ESIMD_KERNEL {
-                const int out = (int)idx[0];
+        cgh.parallel_for<class MoeDownFinalizeFP8BlockBatched>(
+            sycl::range<2>(num_tokens, hidden_size),
+            [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
+                const int token = (int)idx[0];
+                const int out = (int)idx[1];
+                const fp16* token_x = x + (size_t)token * hidden_size;
                 float result = 0.f;
 
                 for (int route = 0; route < top_k; route++) {
-                    const int eid = selected_experts[route];
-                    const fp16* input =
-                        intermediates + (size_t)route * intermediate_size;
+                    const int route_offset = token * top_k + route;
+                    const int eid = selected_experts[route_offset];
+                    const fp16* input = intermediates
+                        + ((size_t)token * (top_k + 1) + route)
+                        * intermediate_size;
                     const uint8_t* weight = down_weight
                         + ((size_t)eid * hidden_size + out) * intermediate_size;
                     const float* scales = down_scale
@@ -1590,12 +1602,13 @@ void moe_down_finalize_fp8_block_bsz1_kernel(
                         acc += iv * (wv * scales[k / 128]);
                     }
                     result += sycl::ext::intel::esimd::detail::sum<
-                        float, float, 64>(acc) * (float)routing_weights[route];
+                        float, float, 64>(acc)
+                        * (float)routing_weights[route_offset];
                 }
 
                 simd<float, 64> gate_acc(0.f);
                 for (int k = 0; k < hidden_size; k += 64) {
-                    simd<float, 64> xv = block_load<fp16, 64>(x + k);
+                    simd<float, 64> xv = block_load<fp16, 64>(token_x + k);
                     simd<float, 64> gw = block_load<fp16, 64>(
                         shared_expert_gate_weight + k);
                     gate_acc += xv * gw;
@@ -1605,7 +1618,9 @@ void moe_down_finalize_fp8_block_bsz1_kernel(
                 gate = 1.f / (1.f + sycl::exp(-gate));
 
                 const fp16* shared_input =
-                    intermediates + (size_t)top_k * intermediate_size;
+                    intermediates
+                    + ((size_t)token * (top_k + 1) + top_k)
+                    * intermediate_size;
                 const uint8_t* shared_weight =
                     shared_down_weight + (size_t)out * intermediate_size;
                 const float* shared_scales = shared_down_scale
@@ -1620,10 +1635,10 @@ void moe_down_finalize_fp8_block_bsz1_kernel(
                 }
                 result += gate * sycl::ext::intel::esimd::detail::sum<
                     float, float, 64>(shared_acc);
-                final_output[out] = fp16(result);
+                final_output[(size_t)token * hidden_size + out] = fp16(result);
             });
     };
-    submit_kernel(cgf, device, "moe down finalize fp8 block bsz1");
+    submit_kernel(cgf, device, "moe down finalize fp8 block batched");
 }
 
 static thread_local torch::Tensor s_block_topk_idx, s_block_topk_weight;
@@ -1632,28 +1647,32 @@ static thread_local std::array<torch::Tensor, 2> s_block_final_outputs;
 static thread_local int s_block_cached_topk = -1;
 static thread_local int s_block_cached_hidden = -1;
 static thread_local int s_block_cached_intermediate = -1;
+static thread_local int s_block_cached_tokens = -1;
 static thread_local int s_block_output_index = 0;
 
-static void ensure_moe_block_buffers(int top_k, int hidden_size,
+static void ensure_moe_block_buffers(int num_tokens, int top_k, int hidden_size,
                                      int intermediate_size,
                                      const torch::Device& dev) {
-    if (s_block_cached_topk != top_k ||
+    if (s_block_cached_tokens != num_tokens ||
+        s_block_cached_topk != top_k ||
         s_block_cached_hidden != hidden_size ||
         s_block_cached_intermediate != intermediate_size) {
         s_block_topk_idx = torch::empty(
-            {1, top_k}, torch::device(dev).dtype(torch::kInt32));
+            {num_tokens, top_k}, torch::device(dev).dtype(torch::kInt32));
         s_block_topk_weight = torch::empty(
-            {1, top_k}, torch::device(dev).dtype(torch::kHalf));
+            {num_tokens, top_k}, torch::device(dev).dtype(torch::kHalf));
         s_block_intermediates = torch::empty(
-            {top_k + 1, intermediate_size},
+            {num_tokens, top_k + 1, intermediate_size},
             torch::device(dev).dtype(torch::kHalf));
         for (auto& output : s_block_final_outputs) {
             output = torch::empty(
-                {1, hidden_size}, torch::device(dev).dtype(torch::kHalf));
+                {num_tokens, hidden_size},
+                torch::device(dev).dtype(torch::kHalf));
         }
         s_block_cached_topk = top_k;
         s_block_cached_hidden = hidden_size;
         s_block_cached_intermediate = intermediate_size;
+        s_block_cached_tokens = num_tokens;
         s_block_output_index = 0;
     }
 }
@@ -1667,10 +1686,11 @@ torch::Tensor moe_forward_full_fp8_block(
     torch::Tensor shared_expert_gate_weight,
     int64_t top_k, int64_t num_shared_experts,
     int64_t n_routed_experts) {
-    TORCH_CHECK(x.dim() == 2 && x.size(0) == 1,
-                "moe_forward_full_fp8_block currently supports batch size 1");
+    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 4,
+                "moe_forward_full_fp8_block supports 1 to 4 tokens");
     TORCH_CHECK(x.is_contiguous() && x.scalar_type() == torch::kHalf);
-    TORCH_CHECK(logits.dim() == 2 && logits.size(0) == 1 &&
+    const int num_tokens = x.size(0);
+    TORCH_CHECK(logits.dim() == 2 && logits.size(0) == num_tokens &&
                 logits.size(1) == n_routed_experts);
     TORCH_CHECK(logits.scalar_type() == torch::kHalf);
     TORCH_CHECK(num_shared_experts == 1,
@@ -1700,26 +1720,28 @@ torch::Tensor moe_forward_full_fp8_block(
                 torch::IntArrayRef({hidden_size, intermediate_size}));
     TORCH_CHECK(hidden_size % 128 == 0 && intermediate_size % 128 == 0);
 
-    ensure_moe_block_buffers(top_k, hidden_size, intermediate_size, x.device());
+    ensure_moe_block_buffers(
+        num_tokens, top_k, hidden_size, intermediate_size, x.device());
     // Alternate outputs so the next decoder layer can safely pass the
     // preceding layer's returned buffer back as x.
     torch::Tensor final_output = s_block_final_outputs[s_block_output_index];
     s_block_output_index ^= 1;
-    dispatch_moe_topk_forward<class MoeTopKFP8BlockBSZ1>(
+    dispatch_moe_topk_forward<class MoeTopKFP8BlockBatched>(
         (const fp16*)logits.data_ptr(), s_block_topk_idx.data_ptr<int>(),
-        (fp16*)s_block_topk_weight.data_ptr(), 1, (int)n_routed_experts,
+        (fp16*)s_block_topk_weight.data_ptr(), num_tokens,
+        (int)n_routed_experts,
         (int)top_k, /*norm=*/true, logits.device());
 
-    moe_up_fp8_block_bsz1_kernel(
+    moe_up_fp8_block_batched_kernel(
         (const fp16*)x.data_ptr(),
         (const uint8_t*)gate_up_weight.data_ptr(), gate_up_scale.data_ptr<float>(),
         (const uint8_t*)shared_gate_up_weight.data_ptr(),
         shared_gate_up_scale.data_ptr<float>(),
         s_block_topk_idx.data_ptr<int>(),
-        (fp16*)s_block_intermediates.data_ptr(), hidden_size,
+        (fp16*)s_block_intermediates.data_ptr(), num_tokens, hidden_size,
         intermediate_size, top_k, x.device());
 
-    moe_down_finalize_fp8_block_bsz1_kernel(
+    moe_down_finalize_fp8_block_batched_kernel(
         (const fp16*)x.data_ptr(),
         (const fp16*)s_block_intermediates.data_ptr(),
         (const uint8_t*)down_weight.data_ptr(), down_scale.data_ptr<float>(),
@@ -1728,7 +1750,7 @@ torch::Tensor moe_forward_full_fp8_block(
         (const fp16*)shared_expert_gate_weight.data_ptr(),
         (const fp16*)s_block_topk_weight.data_ptr(),
         s_block_topk_idx.data_ptr<int>(),
-        (fp16*)final_output.data_ptr(), hidden_size,
+        (fp16*)final_output.data_ptr(), num_tokens, hidden_size,
         intermediate_size, top_k, x.device());
     return final_output;
 }

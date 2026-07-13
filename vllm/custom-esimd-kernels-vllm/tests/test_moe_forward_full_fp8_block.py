@@ -66,11 +66,12 @@ def reference(
     out = torch.zeros_like(x32)
     dw13 = dequant(w13, s13)
     dw2 = dequant(w2, s2)
-    for route in range(top_k):
-        eid = int(top_ids[0, route])
-        gate, up = (x32 @ dw13[eid].t()).chunk(2, dim=-1)
-        inter = torch.nn.functional.silu(gate) * up
-        out += top_weights[0, route] * (inter @ dw2[eid].t())
+    for token in range(x.shape[0]):
+        for route in range(top_k):
+            eid = int(top_ids[token, route])
+            gate, up = (x32[token] @ dw13[eid].t()).chunk(2, dim=-1)
+            inter = torch.nn.functional.silu(gate) * up
+            out[token] += top_weights[token, route] * (inter @ dw2[eid].t())
     shared_gate_v = torch.sigmoid(x32 @ shared_gate.float().t())
     gate, up = (x32 @ dequant(shared_w13, shared_s13).t()).chunk(2, dim=-1)
     shared_inter = torch.nn.functional.silu(gate) * up
@@ -81,10 +82,11 @@ def reference(
 def main():
     device = "xpu"
     experts, hidden, intermediate, top_k = 16, 256, 128, 4
-    for seed in range(5):
+    cases = [(1, seed) for seed in range(3)] + [(4, seed) for seed in range(3)]
+    for batch_size, seed in cases:
         torch.manual_seed(seed)
-        x = (torch.randn(1, hidden, device=device) * 0.2).half()
-        logits = (torch.randn(1, experts, device=device) * 0.4).half()
+        x = (torch.randn(batch_size, hidden, device=device) * 0.2).half()
+        logits = (torch.randn(batch_size, experts, device=device) * 0.4).half()
         w13, s13 = quantize_block(
             torch.randn(experts, 2 * intermediate, hidden, device=device) * 0.15
         )
@@ -135,11 +137,14 @@ def main():
         cosine = torch.nn.functional.cosine_similarity(
             actual.flatten(), expected.flatten(), dim=0
         )
-        print(f"seed={seed} mean_rel={mean_rel.item():.6e} cos={cosine.item():.8f}")
+        print(
+            f"batch={batch_size} seed={seed} mean_rel={mean_rel.item():.6e} "
+            f"cos={cosine.item():.8f}"
+        )
         assert mean_rel < 3e-3
         assert cosine > 0.9999
 
-        if seed == 0:
+        if batch_size == 4 and seed == 0:
             chained_expected = reference(
                 actual_half,
                 logits,
