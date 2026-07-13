@@ -20,9 +20,9 @@
 #     /workspace/scripts/run_qwen3_6.sh
 
 # ======== Build Stage ========
-# Pinned to 0.2.0 instead of latest (same digest as latest at time of writing,
+# Pinned to 0.1.0 instead of latest (same digest as latest at time of writing,
 # but avoids the tag silently drifting under us on rebuilds).
-FROM intel/omix:0.2.0-devel-ubuntu24.04 AS builder
+FROM intel/omix:0.1.0-devel-ubuntu24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 ARG http_proxy
