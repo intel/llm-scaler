@@ -108,7 +108,7 @@ def esimd_gemv_fp8_pert_fused3(
 def esimd_gemv_int4(
     input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     output: torch.Tensor,
-) -> torch.Tensor:
+) -> None:
     """Symmetric INT4 weight GEMV with per-group scale, FP32 accumulation.
 
     Computes: output[1, N] = input[1, K] @ dequant(weight)^T
@@ -130,7 +130,7 @@ def esimd_gemv_int4_fused2(
     input: torch.Tensor,
     w0: torch.Tensor, s0: torch.Tensor, o0: torch.Tensor,
     w1: torch.Tensor, s1: torch.Tensor, o1: torch.Tensor,
-) -> torch.Tensor:
+) -> None:
     """Fused 2-matrix INT4 GEMV: two GEMVs sharing the same input, single kernel.
 
     Saves one kernel launch overhead (~20-50 us) compared to two separate calls.
@@ -140,7 +140,7 @@ def esimd_gemv_int4_fused2(
     w0:    [N0, K/2]    uint8, s0: [N0, K/128] fp16, o0: [1, N0] fp16
     w1:    [N1, K/2]    uint8, s1: [N1, K/128] fp16, o1: [1, N1] fp16
 
-    Returns o0. Both o0 and o1 are written.
+    Both o0 and o1 are written in place.
     """
     return _ops.esimd_gemv_int4_fused2(input, w0, s0, o0, w1, s1, o1)
 
@@ -410,7 +410,7 @@ def esimd_resadd_norm_gemv_int4_pert(
     output: torch.Tensor,
     normed_out: torch.Tensor,
     eps: float,
-) -> torch.Tensor:
+) -> None:
     """Fused ResidualAdd + RMSNorm + INT4 GEMV.
 
     Combines post_attention_layernorm + MoE router GEMV (INT4 quantized):
@@ -488,7 +488,7 @@ def esimd_norm_gemv_int4_pert(
     HV: int,
     V: int,
     eps: float,
-) -> torch.Tensor:
+) -> None:
     """Fused RMSNormGated + INT4 GEMV for GDN out_proj decode path.
 
     Combines norm(x, z) + out_proj(normed) into a single kernel.
