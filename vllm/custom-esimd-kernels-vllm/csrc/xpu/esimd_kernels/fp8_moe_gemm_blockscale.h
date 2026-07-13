@@ -40,6 +40,8 @@
 #include "fp8_GEMM_blockscale.h"  // fp8_blockscale::fp8e4m3_to_fp16
 #include <algorithm>
 #include <cstdint>
+#include <sycl/ext/intel/esimd/xmx/dpas.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
 
 namespace fp8_moe_blockscale {
 
@@ -71,6 +73,41 @@ inline void build_active_experts(const uint32_t* expert_idx,
     cgh.parallel_for(sycl::range<1>(1),
                      build_active_experts_kernel{expert_idx, active_experts,
                                                  num_experts});
+  });
+}
+
+// Build one descriptor for every contiguous tile of up to 64 expert-grouped
+// rows.  The descriptor count is bounded on the host by ceil(total_rows/64)+E,
+// so the large-M kernel needs no device-to-host synchronization to discover the
+// maximum number of tokens routed to one expert.
+struct build_expert_m_tiles_kernel {
+  const uint32_t* expert_idx;
+  int32_t* tile_experts;
+  int32_t* tile_rows;
+  int num_experts;
+
+  void operator()(sycl::id<1>) const {
+    int tile = 0;
+    for (int e = 0; e < num_experts; e++) {
+      const int start = (int)expert_idx[e];
+      const int end = (int)expert_idx[e + 1];
+      for (int row = start; row < end; row += 64) {
+        tile_experts[tile] = e;
+        tile_rows[tile] = row;
+        tile++;
+      }
+    }
+  }
+};
+
+inline void build_expert_m_tiles(const uint32_t* expert_idx,
+                                 int32_t* tile_experts,
+                                 int32_t* tile_rows, int num_experts,
+                                 sycl::queue& q) {
+  q.submit([&](handler& cgh) {
+    cgh.parallel_for(sycl::range<1>(1),
+                     build_expert_m_tiles_kernel{expert_idx, tile_experts,
+                                                 tile_rows, num_experts});
   });
 }
 
@@ -133,6 +170,156 @@ struct moe_gemv_block_kernel {
     }
   }
 };
+
+// Large-M grouped W8A16 GEMM.  Each work-group owns one 64-row expert tile and
+// one group of 16-column N tiles.  FP8 E4M3 weights are converted to FP16,
+// multiplied by their 128x128 scale, then consumed by FP16 DPAS.  This keeps
+// the platform restriction (no FP8 matrix multiply) while replacing the
+// scalar output-channel reductions used by the decode-tuned GEMV.
+struct moe_gemm_block_prefill_kernel {
+  const fp16* input;
+  const uint8_t* weight;
+  const float* wscale;
+  fp16* output;
+  const uint32_t* expert_idx;
+  const int32_t* tile_experts;
+  const int32_t* tile_rows;
+  int total_tokens;
+  int tile_capacity;
+  int N, K, Nb, Kb, num_experts;
+  int n_wg_count, n_per_wg;
+
+  void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+    namespace mem = sycl::ext::intel::experimental::esimd;
+    const int wg = item.get_group(0);
+    const int tile_id = wg / n_wg_count;
+    const int n_wg_id = wg - tile_id * n_wg_count;
+    if (tile_id >= tile_capacity) return;
+    const int e = tile_experts[tile_id];
+    if (e < 0 || e >= num_experts) return;
+
+    const int row_start = tile_rows[tile_id];
+    const int row_end = (int)expert_idx[e + 1];
+    const int valid_rows = row_end - row_start < 64 ? row_end - row_start : 64;
+    if (valid_rows <= 0) return;
+
+    const int n_tiles = (N + 15) / 16;
+    const int n_tile_start = n_wg_id * n_per_wg;
+    const int n_tile_end = n_tile_start + n_per_wg < n_tiles
+                               ? n_tile_start + n_per_wg
+                               : n_tiles;
+
+    const uint32_t surfW_A = (uint32_t)K * 2u - 1u;
+    const uint32_t surfH_A = (uint32_t)total_tokens - 1u;
+    mem::config_2d_mem_access<fp16, 16, 8, 1> payA(
+        input, surfW_A, surfH_A, surfW_A, 0u, (uint32_t)row_start);
+
+    const uint32_t surfW_B = (uint32_t)K - 1u;
+    const uint32_t surfH_B = (uint32_t)(num_experts * N) - 1u;
+    mem::config_2d_mem_access<uint32_t, 4, 16, 1> payB_t(
+        reinterpret_cast<const uint32_t*>(weight), surfW_B, surfH_B, surfW_B,
+        0u, 0u);
+
+    for (int nc = n_tile_start; nc < n_tile_end; nc++) {
+      const int n_start = nc * 16;
+      if (n_start >= N) break;
+      const int n_valid = N - n_start < 16 ? N - n_start : 16;
+      payB_t.set_y((uint32_t)(e * N + n_start));
+      simd<float, 128> acc[8];
+#pragma unroll
+      for (int mt = 0; mt < 8; mt++) acc[mt] = 0.0f;
+
+      for (int k_base = 0; k_base < K; k_base += 64) {
+#pragma unroll
+        for (int sub = 0; sub < 4; sub++) {
+          const int k_sub = k_base + sub * 16;
+          payB_t.set_x((uint32_t)(k_sub / 4));
+          simd<uint32_t, 64> w_t =
+              mem::lsc_load_2d<uint32_t, 4, 16, 1, true, false,
+                               mem::cache_hint::cached,
+                               mem::cache_hint::cached>(payB_t);
+
+          // Transposed 16x16 FP8 tile -> DPAS VNNI2 FP16 layout.
+          simd<uint8_t, 256> raw_vnni;
+#pragma unroll
+          for (int col = 0; col < 4; col++) {
+            simd<uint32_t, 16> g = w_t.template select<16, 1>(col * 16);
+            simd<uint8_t, 16> b0 = convert<uint8_t>(g & 0xFF);
+            simd<uint8_t, 16> b1 = convert<uint8_t>((g >> 8) & 0xFF);
+            simd<uint8_t, 16> b2 = convert<uint8_t>((g >> 16) & 0xFF);
+            simd<uint8_t, 16> b3 = convert<uint8_t>((g >> 24) & 0xFF);
+            raw_vnni.template select<16, 2>(col * 64) = b0;
+            raw_vnni.template select<16, 2>(col * 64 + 1) = b1;
+            raw_vnni.template select<16, 2>(col * 64 + 32) = b2;
+            raw_vnni.template select<16, 2>(col * 64 + 33) = b3;
+          }
+          simd<fp16, 256> b_tile = fp8e4m3_to_fp16<256>(raw_vnni);
+          const float scale =
+              wscale[((size_t)e * Nb + n_start / 128) * Kb + k_sub / 128];
+          b_tile *= fp16(scale);
+
+          payA.set_x((uint32_t)k_sub);
+#pragma unroll
+          for (int mt = 0; mt < 8; mt++) {
+            payA.set_y((uint32_t)(row_start + mt * 8));
+            simd<fp16, 128> a =
+                mem::lsc_load_2d<fp16, 16, 8, 1, false, false,
+                                 mem::cache_hint::cached,
+                                 mem::cache_hint::cached>(payA);
+            acc[mt] = sycl::ext::intel::esimd::xmx::dpas<
+                8, 8, float, float, fp16, fp16>(acc[mt], b_tile, a);
+          }
+        }
+      }
+
+#pragma unroll
+      for (int mt = 0; mt < 8; mt++) {
+#pragma unroll
+        for (int mi = 0; mi < 8; mi++) {
+          const int row_id = mt * 8 + mi;
+          if (row_id < valid_rows) {
+            simd<float, 16> row = acc[mt].template select<16, 1>(mi * 16);
+            simd<fp16, 16> out = convert<fp16>(row);
+            const size_t off = (size_t)(row_start + row_id) * N + n_start;
+            if (n_valid == 16) {
+              block_store<fp16, 16>(output + off, out);
+            } else {
+              for (int ni = 0; ni < n_valid; ni++) output[off + ni] = out[ni];
+            }
+          }
+        }
+      }
+    }
+  }
+};
+
+inline void moe_gemm_fp8_blockscale_prefill_host(
+    const fp16* input, const uint8_t* weight, const float* weight_scale,
+    fp16* output, const uint32_t* expert_idx, const int32_t* tile_experts,
+    const int32_t* tile_rows, int total_tokens, int tile_capacity, int N, int K,
+    int num_experts, int block_n, int block_k, sycl::queue& q) {
+  const int Nb = (N + block_n - 1) / block_n;
+  const int Kb = K / block_k;
+  const int n_tiles = (N + 15) / 16;
+  const int wg_cap = (K <= 512) ? 51200 : 38400;
+  int n_per_wg = 1;
+  int total_wgs = tile_capacity * n_tiles;
+  while (total_wgs > wg_cap && n_per_wg < n_tiles) {
+    n_per_wg++;
+    while (n_per_wg < n_tiles && n_tiles % n_per_wg != 0) n_per_wg++;
+    total_wgs = tile_capacity * ((n_tiles + n_per_wg - 1) / n_per_wg);
+  }
+  const int n_wg_count = (n_tiles + n_per_wg - 1) / n_per_wg;
+  const int groups = tile_capacity * n_wg_count;
+  q.submit([&](handler& cgh) {
+    cgh.parallel_for(
+        sycl::nd_range<1>((size_t)groups, 1),
+        moe_gemm_block_prefill_kernel{
+            input, weight, weight_scale, output, expert_idx, tile_experts,
+            tile_rows, total_tokens, tile_capacity, N, K, Nb, Kb, num_experts,
+            n_wg_count, n_per_wg});
+  });
+}
 
 template <int VL, int MAX_M>
 inline void launch_moe_gemv_block(const fp16* input, const uint8_t* weight,
