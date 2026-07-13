@@ -10502,7 +10502,7 @@ new file mode 100644
 index 000000000..713b38426
 --- /dev/null
 +++ b/vllm/model_executor/models/minicpmv4_6.py
-@@ -0,0 +1,1351 @@
+@@ -0,0 +1,1358 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Inference-only MiniCPM-V 4.6 model (MiniCPMV4_6ForConditionalGeneration)."""
@@ -11051,22 +11051,29 @@ index 000000000..713b38426
 +        downsample_mode = self._get_downsample_mode(downsample_mode)
 +        token_divisor = 4 if downsample_mode == "4x" else 16
 +
++        # vLLM ImageSize is (width, height); transformers get_sliced_grid/
++        # find_best_resize/get_refine_size expect (height, width).
++        if hasattr(image_size, "height"):
++            hf_image_size = (image_size.height, image_size.width)
++        else:
++            hf_image_size = (image_size[1], image_size[0])
++
 +        # transformers v5.7+ requires `scale_resolution` arg
 +        try:
 +            grids = image_processor.get_sliced_grid(
-+                image_size,
++                hf_image_size,
 +                max_slice_nums,
 +                scale_res,
 +            )
 +        except TypeError:
 +            grids = image_processor.get_sliced_grid(
-+                image_size,
++                hf_image_size,
 +                max_slice_nums,
 +            )
 +
 +        if grids is None:
 +            best_size = image_processor.find_best_resize(
-+                image_size,
++                hf_image_size,
 +                scale_res,
 +                patch_size,
 +                allow_upscale=True,
@@ -11077,7 +11084,7 @@ index 000000000..713b38426
 +            return [0, 0], source_tokens, 0
 +
 +        best_resize = image_processor.find_best_resize(
-+            image_size,
++            hf_image_size,
 +            scale_res,
 +            patch_size,
 +        )
@@ -11085,7 +11092,7 @@ index 000000000..713b38426
 +            best_resize[0] * best_resize[1] // (patch_size * patch_size * token_divisor)
 +        )
 +        refine_size = image_processor.get_refine_size(
-+            image_size,
++            hf_image_size,
 +            grids,
 +            scale_res,
 +            patch_size,
