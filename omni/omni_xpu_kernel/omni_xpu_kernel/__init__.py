@@ -85,8 +85,11 @@ __all__ = [
 
 
 def native_capabilities() -> dict[str, tuple[str, ...]]:
-    """Return native symbols by submodule for backend feature negotiation."""
-    native = _load_extension()
+    """Return loaded native symbols, or an empty mapping when unavailable."""
+    try:
+        native = _load_extension()
+    except ImportError:
+        return {}
     modules = ("fp8", "gguf", "norm", "svdq", "rotary", "sdp", "linear", "int8")
     return {
         name: tuple(sorted(item for item in dir(getattr(native, name)) if not item.startswith("_")))

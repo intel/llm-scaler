@@ -173,7 +173,7 @@ output = int8.int8_linear(x_bf16, w_int8, w_scale, bias=bias, out_dtype=torch.bf
 # With ConvRot (Hadamard rotation for improved accuracy)
 output = int8.int8_linear(x, w_int8, w_scale, convrot=True, convrot_groupsize=256)
 
-# Native memory-bounded ConvRot weight preparation
+# Native ConvRot weight preparation using a cached Hadamard matrix multiplication
 w_int8, w_scale = int8.quantize_int8_convrot_weight(weight, group_size=256)
 
 # Cache management

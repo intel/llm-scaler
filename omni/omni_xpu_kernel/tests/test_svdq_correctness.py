@@ -63,7 +63,7 @@ def ref_quantize_act_int4(x, group_size=64):
     group_max = x_grouped.abs().amax(dim=-1)
     scales = (group_max / 7.0).clamp(min=1e-10)
     rscale = 7.0 / group_max.clamp(min=1e-10)
-    x_q = torch.round(x_grouped * rscale.unsqueeze(-1)).clamp(-8, 7).to(torch.int8).view(M, K)
+    x_q = torch.round(x_grouped * rscale.unsqueeze(-1)).clamp(-7, 7).to(torch.int8).view(M, K)
     packed = ref_pack_int4(x_q)
     return packed, scales.T.contiguous()  # scales: [G, M]
 
@@ -171,6 +171,19 @@ class TestQuantizeActInt4:
             unp_ref = ref_unpack_int4(packed_ref)
             max_q_diff = (unp_esimd - unp_ref).abs().max().item()
             assert max_q_diff <= 1, f"Quantized values differ by more than 1: max_diff={max_q_diff}"
+
+    def test_signed_quantizer_uses_symmetric_range(self, xpu_device):
+        x = torch.zeros(1, 64, dtype=torch.float32, device=xpu_device)
+        x[0, 0] = -8.0
+        x[0, 1] = 8.0
+
+        from omni_xpu_kernel import svdq
+
+        packed, _scales = svdq.quantize_act_int4(x, group_size=64)
+        unpacked = svdq.unpack_int4(packed, signed=True)
+        assert unpacked[0, 0].item() == -7
+        assert unpacked[0, 1].item() == 7
+        assert unpacked.min().item() >= -7
 
 
 class TestRoundtrip:

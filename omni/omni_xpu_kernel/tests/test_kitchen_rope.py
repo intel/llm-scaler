@@ -59,6 +59,21 @@ def test_kitchen_rope_pair_allows_different_query_key_shapes():
     torch.testing.assert_close(k_out, _adjacent_reference(k, freqs), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("freqs_dtype", [torch.float16, torch.bfloat16])
+def test_kitchen_rope_adjacent_fallback_preserves_addcmul_rounding(freqs_dtype):
+    if not torch.xpu.is_available():
+        pytest.skip("XPU is unavailable")
+    base = torch.randn(2, 17, 3, 64, device="xpu", dtype=torch.bfloat16)
+    x = base.transpose(1, 2)
+    freqs = torch.randn(2, 1, 17, 32, 2, 2, device="xpu", dtype=freqs_dtype)
+
+    assert not x.is_contiguous()
+    assert not rotary._get_native().kitchen_rope_fast_supported(x, freqs)
+    actual = rotary.apply_kitchen_rope1(x, freqs)
+    expected = _adjacent_reference(x, freqs)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "layout,shape",
     [

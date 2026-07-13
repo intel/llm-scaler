@@ -262,7 +262,7 @@ void unpack_svdq_int4_kernel(
 // ============================================================================
 // Kernel 3: quantize_svdq_act_int4
 // ============================================================================
-// Quantize bf16/f32 activation to INT4 with per-group absmax scaling.
+// Quantize fp16/bf16/f32 activation with per-group absmax scaling.
 // Used in the activation quantization path.
 //
 // input shape:  [M, K] bf16/f32
@@ -270,8 +270,8 @@ void unpack_svdq_int4_kernel(
 // scales shape: [num_groups, M] where num_groups = K/64
 //
 // Per-group quantization:
-//   scale[g, m] = max(|input[m, g*64:(g+1)*64]|) / 7.0
-//   q[m, k] = round(input[m, k] / scale[g, m]), clamped to [-8, 7]
+//   signed:   scale = absmax / 7,  q clamped symmetrically to [-7, 7]
+//   unsigned: scale = absmax / 15, q clamped to [0, 15]
 //   packed[m, k/2] = (q[even] & 0xF) | (q[odd] << 4)
 // ============================================================================
 
@@ -352,7 +352,7 @@ void quantize_svdq_act_int4_kernel(
                 // Store scale: scales[grp * M + row]
                 scales[grp * M + row] = scale;
 
-                // Quantize: round(val * rscale), clamp to [-8, 7]
+                // Quantize and clamp to signed [-7, 7] or unsigned [0, 15].
                 simd<float, 32> scaled_0 = vals_0 * rscale;
                 simd<float, 32> scaled_1 = vals_1 * rscale;
                 simd<float, 32> q_0 = sycl::ext::intel::esimd::rnde<float, 32>(scaled_0);

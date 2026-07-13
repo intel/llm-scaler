@@ -58,8 +58,8 @@ torch::Tensor apply_kitchen_rope1(
                     "freqs_cis dimension 2 is shorter than the input");
         freqs = freqs.slice(2, 0, paired.size(2));
     }
-    auto output = freqs.select(-1, 0) * paired.select(-1, 0) +
-                  freqs.select(-1, 1) * paired.select(-1, 1);
+    auto output = freqs.select(-1, 0) * paired.select(-1, 0);
+    output.addcmul_(freqs.select(-1, 1), paired.select(-1, 1));
     return output.reshape(x.sizes()).to(x.scalar_type());
 }
 

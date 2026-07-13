@@ -307,7 +307,7 @@ PYBIND11_MODULE(_C, m) {
         "Output: (int8 tensor, float32 scales [..., 1])",
         py::arg("x"));
     int8.def("rotate_convrot", &omni_xpu::int8_ops::rotate_convrot,
-        "Memory-bounded radix-4 regular Hadamard rotation on the last dimension",
+        "Regular Hadamard rotation using a cached matrix multiplication on the last dimension",
         py::arg("input"), py::arg("group_size") = 256);
     int8.def("quantize_int8_convrot_weight", &omni_xpu::int8_ops::quantize_int8_convrot_weight,
         "Native ConvRot weight rotation followed by row-wise INT8 quantization",

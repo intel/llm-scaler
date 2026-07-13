@@ -198,7 +198,7 @@ def int8_linear(
         out_dtype = x.dtype
     native = _get_native()
     if native is not None and hasattr(native, "int8_linear"):
-        # Rotate through the native memory-bounded radix-4 implementation.
+        # Rotate through the native cached Hadamard-matrix implementation.
         if convrot:
             if x.shape[-1] % convrot_groupsize != 0:
                 raise ValueError(
