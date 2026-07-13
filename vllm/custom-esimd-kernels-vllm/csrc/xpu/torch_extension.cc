@@ -46,14 +46,22 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
   // INT4 GEMV with per-group scale (group_size=128)
   // Weight [N, K/2] uint8 packed, scale [N, K/128] fp16. N/K auto-detected.
   m.def("esimd_gemv_int4(Tensor input, Tensor weight, Tensor weight_scale, "
-        "Tensor output) -> Tensor");
-  m.impl("esimd_gemv_int4", torch::kXPU, &esimd_gemv_int4);
+        "Tensor(a!) output) -> ()");
+  m.impl("esimd_gemv_int4", torch::kXPU,
+         [](at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+            at::Tensor output) -> void {
+           esimd_gemv_int4(input, weight, weight_scale, output);
+         });
 
   // Fused 2-matrix INT4 GEMV (GDN in_proj_qkvz + in_proj_ba)
   m.def("esimd_gemv_int4_fused2(Tensor input, "
-        "Tensor w0, Tensor s0, Tensor o0, "
-        "Tensor w1, Tensor s1, Tensor o1) -> Tensor");
-  m.impl("esimd_gemv_int4_fused2", torch::kXPU, &esimd_gemv_int4_fused2);
+        "Tensor w0, Tensor s0, Tensor(a!) o0, "
+        "Tensor w1, Tensor s1, Tensor(b!) o1) -> ()");
+  m.impl("esimd_gemv_int4_fused2", torch::kXPU,
+         [](at::Tensor input, at::Tensor w0, at::Tensor s0, at::Tensor o0,
+            at::Tensor w1, at::Tensor s1, at::Tensor o1) -> void {
+           esimd_gemv_int4_fused2(input, w0, s0, o0, w1, s1, o1);
+         });
 
   // Fused QKV Split + RMSNorm + RoPE
   // q_out/gate_out/k_out/v_out are written in place (mutated). Declared with
@@ -116,16 +124,30 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
   m.impl("esimd_norm_gemv_fp8_pert", torch::kXPU, &esimd_norm_gemv_fp8_pert);
 
   // Fused ResidualAdd + RMSNorm + INT4 GEMV (post_attn_norm + router)
-  m.def("esimd_resadd_norm_gemv_int4_pert(Tensor hidden_states, Tensor residual, "
+  m.def("esimd_resadd_norm_gemv_int4_pert(Tensor hidden_states, Tensor(a!) residual, "
         "Tensor norm_weight, Tensor gemv_weight, Tensor gemv_scale, "
-        "Tensor output, Tensor normed_out, float eps) -> Tensor");
-  m.impl("esimd_resadd_norm_gemv_int4_pert", torch::kXPU, &esimd_resadd_norm_gemv_int4_pert);
+        "Tensor(b!) output, Tensor(c!) normed_out, float eps) -> ()");
+  m.impl("esimd_resadd_norm_gemv_int4_pert", torch::kXPU,
+         [](at::Tensor hidden_states, at::Tensor residual,
+            at::Tensor norm_weight, at::Tensor gemv_weight,
+            at::Tensor gemv_scale, at::Tensor output, at::Tensor normed_out,
+            double eps) -> void {
+           esimd_resadd_norm_gemv_int4_pert(hidden_states, residual, norm_weight,
+                                            gemv_weight, gemv_scale, output,
+                                            normed_out, eps);
+         });
 
   // Fused RMSNormGated + INT4 GEMV (out_proj for GDN layers)
   m.def("esimd_norm_gemv_int4_pert(Tensor x, Tensor z, Tensor norm_weight, "
-        "Tensor gemv_weight, Tensor gemv_scale, Tensor output, "
-        "int HV, int V, float eps) -> Tensor");
-  m.impl("esimd_norm_gemv_int4_pert", torch::kXPU, &esimd_norm_gemv_int4_pert);
+        "Tensor gemv_weight, Tensor gemv_scale, Tensor(a!) output, "
+        "int HV, int V, float eps) -> ()");
+  m.impl("esimd_norm_gemv_int4_pert", torch::kXPU,
+         [](at::Tensor x, at::Tensor z, at::Tensor norm_weight,
+            at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output,
+            int64_t HV, int64_t V, double eps) -> void {
+           esimd_norm_gemv_int4_pert(x, z, norm_weight, gemv_weight,
+                                     gemv_scale, output, HV, V, eps);
+         });
 
   // Standalone RMSNorm (no add): for the spots where input differs from
   // the accumulating residual stream (post_attn_norm, post_ff_norm_1, etc.).
