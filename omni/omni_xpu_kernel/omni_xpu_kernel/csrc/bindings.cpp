@@ -247,7 +247,7 @@ PYBIND11_MODULE(_C, m) {
         "Output: (int8 tensor, float32 scales [..., 1])",
         py::arg("x"), py::arg("stochastic_rounding") = 0);
     int8.def("quantize_int8_rowwise_fused", &omni_xpu::int8_ops::quantize_int8_rowwise_fused,
-        "ESIMD fused per-row INT8 quantization (single kernel pass).\n"
+        "Plain-SYCL fused per-row INT8 quantization (single kernel launch).\n"
         "Fuses absmax + scale + divide + round + clamp + cast.\n"
         "Input: x [..., K] bf16/f16\n"
         "Output: (int8 tensor, float32 scales [..., 1])",

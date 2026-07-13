@@ -430,8 +430,8 @@ torch::Tensor int8_linear(
         // For now, the Python dispatch layer handles rotation before calling native.
     }
 
-    // Step 2: Dynamic per-row quantization of activation
-    // Use ESIMD fused kernel: single pass absmax + scale + quantize
+    // Step 2: Dynamic per-row quantization of activation.
+    // One plain-SYCL launch performs two coalesced passes for absmax + quantize.
     auto [x_int8, x_scale] = quantize_int8_rowwise_fused(x);
     x_int8 = x_int8.contiguous();
     // Per-token activation scale as a flat [M] f32 vector for the fused epilogue.

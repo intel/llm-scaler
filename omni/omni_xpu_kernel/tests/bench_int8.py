@@ -56,6 +56,7 @@ def get_sync_fn(device):
 
 COMFYUI_SHAPES = [
     # (M, N, K) — typical ComfyUI diffusion model shapes
+    (4128, 10240, 3840),   # z_image_turbo projection
     (1, 4096, 4096),       # Single token generation
     (4, 4096, 4096),       # Small batch
     (32, 4096, 4096),      # Medium batch
@@ -125,12 +126,24 @@ def bench_quantize(device, shapes, iters=50):
     from omni_xpu_kernel import int8
 
     sync_fn = get_sync_fn(device)
+    native = int8._get_native()
+    fused_rowwise = (
+        native.quantize_int8_rowwise_fused
+        if native is not None and hasattr(native, "quantize_int8_rowwise_fused")
+        else None
+    )
 
     print(f"\n{'='*80}")
     print(f"INT8 Quantization Benchmark — device={device}")
     print(f"{'='*80}")
-    print(f"{'M':>6} {'K':>6} | {'tensorwise':>12} | {'rowwise':>12}")
-    print(f"{'-'*6} {'-'*6} | {'-'*12} | {'-'*12}")
+    print(
+        f"{'M':>6} {'K':>6} | {'tensorwise':>12} | {'rowwise':>12} | "
+        f"{'fused hot path':>16} | {'useful BW':>10}"
+    )
+    print(
+        f"{'-'*6} {'-'*6} | {'-'*12} | {'-'*12} | "
+        f"{'-'*16} | {'-'*10}"
+    )
 
     for m, _, k in shapes:
         x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
@@ -144,7 +157,21 @@ def bench_quantize(device, shapes, iters=50):
         ms_tw = warmup_and_bench(quant_tw, iters=iters, sync_fn=sync_fn)
         ms_rw = warmup_and_bench(quant_rw, iters=iters, sync_fn=sync_fn)
 
-        print(f"{m:>6} {k:>6} | {ms_tw:>9.3f} ms | {ms_rw:>9.3f} ms")
+        if fused_rowwise is not None:
+            ms_fused = warmup_and_bench(
+                lambda: fused_rowwise(x), iters=iters, sync_fn=sync_fn
+            )
+            useful_bw = (m * k * 3) / (ms_fused * 1e6)
+            fused_text = f"{ms_fused:>13.3f} ms"
+            bw_text = f"{useful_bw:>7.1f} GB/s"
+        else:
+            fused_text = f"{'N/A':>16}"
+            bw_text = f"{'N/A':>10}"
+
+        print(
+            f"{m:>6} {k:>6} | {ms_tw:>9.3f} ms | {ms_rw:>9.3f} ms | "
+            f"{fused_text} | {bw_text}"
+        )
 
 
 def bench_mm_int8(device, shapes, iters=20):
