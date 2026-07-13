@@ -216,26 +216,27 @@ std::shared_ptr<Int8ScaledState> get_or_create_int8_scaled_primitive(
     // dst: [M, N] in output dtype
     state->dst_md = dnnl::memory::desc({m, n}, dst_dt, dnnl::memory::format_tag::ab);
     // src_scale: [M] f32 — per-row activation scale
-    state->src_scale_md = dnnl::memory::desc({m, 1}, DT::f32, dnnl::memory::format_tag::ab);
+    state->src_scale_md = dnnl::memory::desc({m}, DT::f32, dnnl::memory::format_tag::a);
     // wei_scale: [N] or [1] f32 — per-channel or scalar weight scale
     if (w_scale_is_scalar) {
-        state->wei_scale_md = dnnl::memory::desc({1, 1}, DT::f32, dnnl::memory::format_tag::ab);
+        state->wei_scale_md = dnnl::memory::desc({1}, DT::f32, dnnl::memory::format_tag::a);
     } else {
-        state->wei_scale_md = dnnl::memory::desc({1, n}, DT::f32, dnnl::memory::format_tag::ab);
+        state->wei_scale_md = dnnl::memory::desc({n}, DT::f32, dnnl::memory::format_tag::a);
     }
-    // bias: [1, N] in output dtype
+    // bias: [1, N] f32
     if (has_bias) {
-        state->bias_md = dnnl::memory::desc({1, n}, dst_dt, dnnl::memory::format_tag::ab);
+        state->bias_md = dnnl::memory::desc({1, n}, DT::f32, dnnl::memory::format_tag::ab);
     }
 
     dnnl::primitive_attr attr;
-    // Per-row src scales: mask = (1 << 0) means scale varies along dim 0 (rows)
-    attr.set_scales(DNNL_ARG_SRC, (1 << 0), {1, 1}, DT::f32);
+    // Per-token src scale via the grouped-scale API: mask over {M,K}, group {1,K}
+    // == one scale per row. The (1<<0),{1,1} form is rejected on XPU s8 matmul.
+    attr.set_scales(DNNL_ARG_SRC, (1 << 0) | (1 << 1), {1, k}, DT::f32);
     // Weight scales: mask = (1 << 1) for per-col, mask = 0 for scalar
     if (w_scale_is_scalar) {
         attr.set_scales(DNNL_ARG_WEIGHTS, 0, {}, DT::f32);
     } else {
-        attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 1), {1, 1}, DT::f32);
+        attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 1), {}, DT::f32);
     }
     attr.set_fpmath_mode(dnnl::fpmath_mode::any, true);
 
@@ -433,16 +434,26 @@ torch::Tensor int8_linear(
     // Use ESIMD fused kernel: single pass absmax + scale + quantize
     auto [x_int8, x_scale] = quantize_int8_rowwise_fused(x);
     x_int8 = x_int8.contiguous();
+    // Per-token activation scale as a flat [M] f32 vector for the fused epilogue.
+    x_scale = x_scale.to(torch::kFloat32).reshape(-1).contiguous();
 
-    // Step 3: INT8 GEMM with per-channel weight scale fused via oneDNN
-    // oneDNN computes: dst = (src_s8 × wei_s8) * wei_scale[n] → f32/bf16
-    // Then we apply x_scale[m] separately (much cheaper: just elementwise mul)
+    // Step 3: Fully-fused INT8 GEMM via oneDNN.
+    //   dst[m,n] = x_scale[m] * wei_scale[n] * (src_s8 × wei_s8) + bias[n]
+    // Both the per-token activation scale and the per-channel weight scale (and
+    // bias) are folded into the matmul epilogue, so there is no separate
+    // scaleback (`output.mul_(x_scale)`) or bias-add kernel — one HBM pass only.
     bool w_scale_is_scalar = (weight_scale.numel() == 1);
+    bool has_bias = bias.has_value();
+    torch::Tensor bias_f32;
+    if (has_bias) {
+        TORCH_CHECK(bias->size(0) == n, "bias size must match N=", n);
+        bias_f32 = bias->to(x.device()).to(torch::kFloat32).reshape({1, -1}).contiguous();
+    }
 
     sycl::queue& queue = omni_xpu::utils::get_queue(x.device());
 
-    // Try scaled primitive with per-channel weight scale only (no src scale)
-    Int8ScaledCacheKey skey{x.device().index(), static_cast<int>(out_dtype_code), m, k, n, false, w_scale_is_scalar};
+    // Fused scaled primitive: per-token src scale + per-channel weight scale (+bias).
+    Int8ScaledCacheKey skey{x.device().index(), static_cast<int>(out_dtype_code), m, k, n, has_bias, w_scale_is_scalar};
     std::shared_ptr<Int8ScaledState> sstate;
     {
         auto& cache = int8_scaled_cache();
@@ -466,29 +477,47 @@ torch::Tensor int8_linear(
 
             sstate = std::make_shared<Int8ScaledState>();
             sstate->engine = engine;
-            sstate->has_bias = false;
+            sstate->has_bias = has_bias;
             sstate->w_scale_is_scalar = w_scale_is_scalar;
 
             sstate->src_md = dnnl::memory::desc({m, k}, DT::s8, dnnl::memory::format_tag::ab);
             sstate->wei_md = dnnl::memory::desc({k, n}, DT::s8, dnnl::memory::format_tag::ba);
             sstate->dst_md = dnnl::memory::desc({m, n}, dst_dt, dnnl::memory::format_tag::ab);
 
+            // Per-token src scale: one f32 per row (M values).
+            sstate->src_scale_md = dnnl::memory::desc({m}, DT::f32, dnnl::memory::format_tag::a);
             if (w_scale_is_scalar) {
                 sstate->wei_scale_md = dnnl::memory::desc({1}, DT::f32, dnnl::memory::format_tag::a);
             } else {
                 sstate->wei_scale_md = dnnl::memory::desc({n}, DT::f32, dnnl::memory::format_tag::a);
             }
+            if (has_bias) {
+                sstate->bias_md = dnnl::memory::desc({1, n}, DT::f32, dnnl::memory::format_tag::ab);
+            }
 
             dnnl::primitive_attr attr;
-            // Per-channel weight scale: mask = 2 (varies along N dimension of dst)
-            attr.set_scales_mask(DNNL_ARG_WEIGHTS, w_scale_is_scalar ? 0 : 2);
+            // Per-token src scale via the grouped-scale API: mask over {M,K} with
+            // group {1, K} == one scale per row. oneDNN >= 3.9 supports this on
+            // XPU s8 matmul (jit:gemm). NOTE: the mask=(1<<0), group {1,1} form
+            // throws "unsupported scales configuration" — do not use it.
+            attr.set_scales(DNNL_ARG_SRC, (1 << 0) | (1 << 1), {1, k}, DT::f32);
+            // Per-channel weight scale (mask over N), or scalar (mask 0).
+            attr.set_scales(DNNL_ARG_WEIGHTS, w_scale_is_scalar ? 0 : (1 << 1), {}, DT::f32);
             attr.set_fpmath_mode(dnnl::fpmath_mode::any, true);
 
-            dnnl::matmul::primitive_desc pd(engine, sstate->src_md, sstate->wei_md, sstate->dst_md, attr);
+            dnnl::matmul::primitive_desc pd = has_bias
+                ? dnnl::matmul::primitive_desc(engine, sstate->src_md, sstate->wei_md, sstate->bias_md, sstate->dst_md, attr)
+                : dnnl::matmul::primitive_desc(engine, sstate->src_md, sstate->wei_md, sstate->dst_md, attr);
             sstate->primitive = dnnl::matmul(pd);
 
             const std::string impl = pd.impl_info_str();
-            OMNI_DEBUG("int8", "scaled(w-only) cache MISS: impl=%s (M=%ld K=%ld N=%ld)", impl.c_str(), m, k, n);
+            OMNI_DEBUG("int8", "scaled(fused) cache MISS: impl=%s (M=%ld K=%ld N=%ld bias=%d)",
+                       impl.c_str(), m, k, n, (int)has_bias);
+            if (impl.find("ref") != std::string::npos) {
+                std::fprintf(stderr,
+                    "[omni_xpu::int8] WARNING: fused oneDNN ref impl for M=%ld K=%ld N=%ld: %s\n",
+                    m, k, n, impl.c_str());
+            }
 
             cache.emplace(skey, sstate);
             ++counters.misses;
@@ -511,19 +540,16 @@ torch::Tensor int8_linear(
         {DNNL_ARG_SRC, dnnl::memory(sstate->src_md, sstate->engine, x_int8.data_ptr())},
         {DNNL_ARG_WEIGHTS, dnnl::memory(sstate->wei_md, sstate->engine, weight.data_ptr())},
         {DNNL_ARG_DST, dnnl::memory(sstate->dst_md, sstate->engine, output.data_ptr())},
+        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, dnnl::memory(sstate->src_scale_md, sstate->engine, x_scale.data_ptr())},
         {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, dnnl::memory(sstate->wei_scale_md, sstate->engine, weight_scale.data_ptr())},
     };
+    if (has_bias) {
+        args.emplace(DNNL_ARG_BIAS, dnnl::memory(sstate->bias_md, sstate->engine, bias_f32.data_ptr()));
+    }
     sstate->primitive.execute(stream, args);
 
-    // Step 4: Apply per-row x_scale (cheap elementwise multiply)
-    // output[m,n] *= x_scale[m]  (broadcasts over N dimension)
-    output.mul_(x_scale.to(out_dtype));
-
-    // Step 5: Bias
-    if (bias.has_value()) {
-        TORCH_CHECK(bias->size(0) == n, "bias size must match N=", n);
-        output.add_(bias->to(x.device()).to(out_dtype).reshape({1, -1}));
-    }
+    // Per-token src scale, per-channel weight scale, and bias are all fused into
+    // the matmul epilogue above — no separate scaleback / bias kernels.
 
     // Reshape back to original batch dimensions
     std::vector<int64_t> out_sizes(orig_sizes.begin(), orig_sizes.end() - 1);
