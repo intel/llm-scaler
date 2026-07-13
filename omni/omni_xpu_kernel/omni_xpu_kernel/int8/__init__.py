@@ -46,8 +46,9 @@ def _get_native():
     """Get the native INT8 module (returns None if unavailable)."""
     try:
         from .. import _load_extension
+
         mod = _load_extension()
-        return getattr(mod, 'int8', None)
+        return getattr(mod, "int8", None)
     except (ImportError, AttributeError):
         return None
 
@@ -75,7 +76,7 @@ def quantize_int8_tensorwise(
             - scale: Scalar float32 tensor
     """
     native = _get_native()
-    if native is not None and hasattr(native, 'quantize_int8_tensorwise'):
+    if native is not None and hasattr(native, "quantize_int8_tensorwise"):
         return native.quantize_int8_tensorwise(x, scale, stochastic_rounding)
     return _ref_quantize_int8_tensorwise(x, scale, stochastic_rounding)
 
@@ -96,7 +97,7 @@ def quantize_int8_rowwise(
             - scales: Float32 tensor [..., 1] with per-row scales
     """
     native = _get_native()
-    if native is not None and hasattr(native, 'quantize_int8_rowwise'):
+    if native is not None and hasattr(native, "quantize_int8_rowwise"):
         return native.quantize_int8_rowwise(x, stochastic_rounding)
     return _ref_quantize_int8_rowwise(x, stochastic_rounding)
 
@@ -115,7 +116,7 @@ def dequantize_int8_simple(
         Dequantized float32 tensor.
     """
     native = _get_native()
-    if native is not None and hasattr(native, 'dequantize_int8_simple'):
+    if native is not None and hasattr(native, "dequantize_int8_simple"):
         return native.dequantize_int8_simple(q, scale)
     return _ref_dequantize_int8_simple(q, scale)
 
@@ -136,10 +137,12 @@ def dequantize_int8_simple_dtype(
         Dequantized tensor in specified dtype.
     """
     native = _get_native()
-    if native is not None and hasattr(native, 'dequantize_int8_simple_dtype'):
+    if native is not None and hasattr(native, "dequantize_int8_simple_dtype"):
         _dtype_to_code = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}
         if out_dtype not in _dtype_to_code:
-            raise ValueError(f"Unsupported out_dtype: {out_dtype}. Supported: float32, float16, bfloat16")
+            raise ValueError(
+                f"Unsupported out_dtype: {out_dtype}. Supported: float32, float16, bfloat16"
+            )
         return native.dequantize_int8_simple_dtype(q, scale, _dtype_to_code[out_dtype])
     return _ref_dequantize_int8_simple_dtype(q, scale, out_dtype)
 
@@ -160,7 +163,7 @@ def mm_int8(
         INT32 tensor [M, N] with accumulated dot products.
     """
     native = _get_native()
-    if native is not None and hasattr(native, 'mm_int8'):
+    if native is not None and hasattr(native, "mm_int8"):
         return native.mm_int8(a, b)
     return _ref_mm_int8(a, b)
 
@@ -194,23 +197,30 @@ def int8_linear(
     if out_dtype is None:
         out_dtype = x.dtype
     native = _get_native()
-    if native is not None and hasattr(native, 'int8_linear'):
-        # Handle ConvRot rotation in Python before native GEMM
-        # (native ESIMD rotation kernel will replace this later)
+    if native is not None and hasattr(native, "int8_linear"):
+        # Rotate through the native memory-bounded radix-4 implementation.
         if convrot:
-            from ._reference import _build_hadamard, _rotate_activation
             if x.shape[-1] % convrot_groupsize != 0:
                 raise ValueError(
                     f"ConvRot group size {convrot_groupsize} does not divide "
                     f"input features {x.shape[-1]}"
                 )
-            h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
-            x = _rotate_activation(x, h, convrot_groupsize)
-        dtype_code = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}.get(out_dtype, 2)
-        return native.int8_linear(x, weight, weight_scale, bias, dtype_code,
-                                  False, convrot_groupsize)
-    return _ref_int8_linear(x, weight, weight_scale, bias, out_dtype,
-                            convrot, convrot_groupsize)
+            if hasattr(native, "rotate_convrot"):
+                x = native.rotate_convrot(x, convrot_groupsize)
+            else:
+                from ._reference import _build_hadamard, _rotate_activation
+
+                h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+                x = _rotate_activation(x, h, convrot_groupsize)
+        dtype_code = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}.get(
+            out_dtype, 2
+        )
+        return native.int8_linear(
+            x, weight, weight_scale, bias, dtype_code, False, convrot_groupsize
+        )
+    return _ref_int8_linear(
+        x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize
+    )
 
 
 def quantize_int8_convrot_weight(
@@ -228,9 +238,15 @@ def quantize_int8_convrot_weight(
     Returns:
         Tuple of (rotated_quantized_weight_int8, per_row_scales).
     """
+    if weight.shape[-1] % group_size != 0:
+        raise ValueError(
+            f"input features {weight.shape[-1]} not divisible by group_size {group_size}"
+        )
     native = _get_native()
-    if native is not None and hasattr(native, 'quantize_int8_convrot_weight'):
-        return native.quantize_int8_convrot_weight(weight, group_size, stochastic_rounding)
+    if native is not None and hasattr(native, "quantize_int8_convrot_weight"):
+        return native.quantize_int8_convrot_weight(
+            weight, group_size, stochastic_rounding
+        )
     return _ref_quantize_int8_convrot_weight(weight, group_size, stochastic_rounding)
 
 
@@ -250,7 +266,7 @@ def dequantize_int8_convrot_weight(
         Dequantized weight tensor in float32.
     """
     native = _get_native()
-    if native is not None and hasattr(native, 'dequantize_int8_convrot_weight'):
+    if native is not None and hasattr(native, "dequantize_int8_convrot_weight"):
         return native.dequantize_int8_convrot_weight(q, scale, group_size)
     return _ref_dequantize_int8_convrot_weight(q, scale, group_size)
 
@@ -258,14 +274,14 @@ def dequantize_int8_convrot_weight(
 def int8_cache_clear() -> None:
     """Clear cached oneDNN INT8 primitive state."""
     native = _get_native()
-    if native is not None and hasattr(native, 'int8_cache_clear'):
+    if native is not None and hasattr(native, "int8_cache_clear"):
         native.int8_cache_clear()
 
 
 def int8_cache_stats() -> dict:
     """Return INT8 primitive cache counters and size."""
     native = _get_native()
-    if native is not None and hasattr(native, 'int8_cache_stats'):
+    if native is not None and hasattr(native, "int8_cache_stats"):
         hits, misses, size = native.int8_cache_stats()
         return {"hits": hits, "misses": misses, "size": size}
     return {"hits": 0, "misses": 0, "size": 0}

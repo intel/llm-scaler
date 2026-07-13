@@ -225,11 +225,16 @@ at::Tensor sdp(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
   // Public layout is [B, L, H, D] (drop-in for omni_xpu_kernel.sdp). The kernel
   // reads this contiguous layout directly via custom strides (run_d128), so no
   // permute/copy is needed — output is also [B, L, H, D].
-  // q is [B, Lq, H, D]; k,v are [B, Lkv, H, D]. Cross-attention allows Lq != Lkv.
+  // q,k,v are [B, L, H, D]. The current scheduler is validated only for
+  // self-attention; reject cross-attention instead of returning silently
+  // inaccurate results. ComfyUI routes cross-attention to the ESIMD backend.
   const int B = q.size(0), Lq = q.size(1), H = q.size(2), D = q.size(3);
   const int Lkv = k.size(1);
   TORCH_CHECK(B == 1, "cute_fmha: only B==1 supported (got ", B, ")");
   TORCH_CHECK(D == 128, "cute_fmha: only head_dim==128 supported (got ", D, ")");
+  TORCH_CHECK(Lq == Lkv,
+              "cute_fmha: only self-attention with equal q/kv lengths is supported (got ",
+              Lq, " and ", Lkv, ")");
   TORCH_CHECK(k.size(0) == B && v.size(0) == B, "cute_fmha: batch mismatch");
   TORCH_CHECK(k.size(2) == H && v.size(2) == H, "cute_fmha: q,k,v must share num_heads (got ",
               H, ",", k.size(2), ",", v.size(2), ")");

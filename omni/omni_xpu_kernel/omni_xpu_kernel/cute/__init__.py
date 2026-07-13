@@ -3,12 +3,13 @@
 Drop-in for :func:`omni_xpu_kernel.sdp.sdp` — same signature and layout::
 
     from omni_xpu_kernel import cute
-    out = cute.sdp(q, k, v)   # q,k,v,out are [B, L, H, D] (B==1, D==128), fp16/bf16
+    out = cute.sdp(q, k, v)   # self-attn [B, L, H, D] (B==1, D==128), fp16/bf16
 
 Unlike the ESIMD ``sdp`` kernel (fp16 accumulator + adaptive V-scaling), the cute
 FMHA accumulates QK and P*V in fp32, so it does not overflow on large-magnitude
 activations (e.g. Qwen-Image). It is AOT-compiled into ``cute_fmha_torch.so`` and
-exposes ``torch.ops.cute_fmha.sdp``.
+exposes ``torch.ops.cute_fmha.sdp``. The current Kernel accepts self-attention
+only; callers must route differing query/key sequence lengths elsewhere.
 """
 
 import glob

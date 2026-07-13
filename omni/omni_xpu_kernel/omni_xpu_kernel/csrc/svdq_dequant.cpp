@@ -58,7 +58,7 @@ constexpr int HALF_GROUP = SVDQ_GROUP_SIZE / 2;  // 32 packed bytes per group
 //   output[n, g*64 .. (g+1)*64 - 1] = unpack(packed) * scale
 // ============================================================================
 
-template<typename OT>
+template<typename OT, bool Signed = true>
 void dequantize_svdq_w4_kernel(
     const uint8_t* __restrict__ packed,
     const OT* __restrict__ scales,
@@ -113,8 +113,8 @@ void dequantize_svdq_w4_kernel(
                     for (int i = 0; i < 16; ++i) {
                         int16_t lv = static_cast<int16_t>(low_u[i]);
                         int16_t hv = static_cast<int16_t>(high_u[i]);
-                        low_s[i] = (lv >= 8) ? (lv - 16) : lv;
-                        high_s[i] = (hv >= 8) ? (hv - 16) : hv;
+                        low_s[i] = Signed && lv >= 8 ? (lv - 16) : lv;
+                        high_s[i] = Signed && hv >= 8 ? (hv - 16) : hv;
                     }
 
                     // Interleave: even positions get low nibbles, odd get high
@@ -167,7 +167,7 @@ void dequantize_svdq_w4_kernel(
 // Signed: range [-8, 7]
 // ============================================================================
 
-template<int COLS_PER_WI = 64>
+template<bool Signed = true, int COLS_PER_WI = 64>
 void unpack_svdq_int4_kernel(
     const uint8_t* __restrict__ packed,
     int8_t* __restrict__ output,
@@ -231,8 +231,8 @@ void unpack_svdq_int4_kernel(
                     for (int i = 0; i < 16; ++i) {
                         int8_t lv = static_cast<int8_t>(low_u[i]);
                         int8_t hv = static_cast<int8_t>(high_u[i]);
-                        low_s[i] = (lv >= 8) ? (lv - 16) : lv;
-                        high_s[i] = (hv >= 8) ? (hv - 16) : hv;
+                        low_s[i] = Signed && lv >= 8 ? (lv - 16) : lv;
+                        high_s[i] = Signed && hv >= 8 ? (hv - 16) : hv;
                     }
 
                     // Interleave: [low[0], high[0], low[1], high[1], ...]
@@ -275,7 +275,7 @@ void unpack_svdq_int4_kernel(
 //   packed[m, k/2] = (q[even] & 0xF) | (q[odd] << 4)
 // ============================================================================
 
-template<typename IT>
+template<typename IT, bool Unsigned = false>
 void quantize_svdq_act_int4_kernel(
     const IT* __restrict__ input,
     uint8_t* __restrict__ output,
@@ -343,9 +343,11 @@ void quantize_svdq_act_int4_kernel(
                 }
 
                 // Compute scale
-                float scale = group_max / 7.0f;
+                constexpr float qmax = Unsigned ? 15.0f : 7.0f;
+                constexpr float qmin = Unsigned ? 0.0f : -7.0f;
+                float scale = group_max / qmax;
                 if (scale < 1e-10f) scale = 1e-10f;
-                float rscale = 7.0f / (group_max < 1e-10f ? 1e-10f : group_max);
+                float rscale = qmax / (group_max < 1e-10f ? 1e-10f : group_max);
 
                 // Store scale: scales[grp * M + row]
                 scales[grp * M + row] = scale;
@@ -355,8 +357,8 @@ void quantize_svdq_act_int4_kernel(
                 simd<float, 32> scaled_1 = vals_1 * rscale;
                 simd<float, 32> q_0 = sycl::ext::intel::esimd::rnde<float, 32>(scaled_0);
                 simd<float, 32> q_1 = sycl::ext::intel::esimd::rnde<float, 32>(scaled_1);
-                simd<float, 32> clamp_lo(-8.0f);
-                simd<float, 32> clamp_hi(7.0f);
+                simd<float, 32> clamp_lo(qmin);
+                simd<float, 32> clamp_hi(qmax);
                 q_0 = sycl::ext::intel::esimd::max<float, 32>(
                     sycl::ext::intel::esimd::min<float, 32>(q_0, clamp_hi), clamp_lo);
                 q_1 = sycl::ext::intel::esimd::max<float, 32>(
@@ -447,6 +449,34 @@ torch::Tensor dequantize_svdq_w4(
     return output;
 }
 
+torch::Tensor dequantize_svdq_u4(
+    const torch::Tensor& packed,
+    const torch::Tensor& scales,
+    torch::ScalarType out_dtype
+) {
+    TORCH_CHECK(packed.is_contiguous(), "packed tensor must be contiguous");
+    TORCH_CHECK(scales.is_contiguous(), "scales tensor must be contiguous");
+    TORCH_CHECK(packed.scalar_type() == torch::kByte, "packed must be uint8");
+    TORCH_CHECK(packed.dim() == 2 && scales.dim() == 2, "packed and scales must be 2D");
+    const int64_t M = packed.size(0);
+    const int64_t K = packed.size(1) * 2;
+    const int64_t groups = scales.size(0);
+    TORCH_CHECK(scales.size(1) == M && groups == K / SVDQ_GROUP_SIZE,
+                "unsigned activation scale shape mismatch");
+    auto output = torch::empty({M, K}, torch::TensorOptions().dtype(out_dtype).device(packed.device()));
+    auto scales_cast = scales.to(out_dtype).contiguous();
+    if (out_dtype == torch::kFloat32) {
+        dequantize_svdq_w4_kernel<float, false>(packed.data_ptr<uint8_t>(), scales_cast.data_ptr<float>(), output.data_ptr<float>(), M, K, groups, packed.device());
+    } else if (out_dtype == torch::kBFloat16) {
+        dequantize_svdq_w4_kernel<bf16, false>(packed.data_ptr<uint8_t>(), reinterpret_cast<const bf16*>(scales_cast.data_ptr()), reinterpret_cast<bf16*>(output.data_ptr()), M, K, groups, packed.device());
+    } else if (out_dtype == torch::kFloat16) {
+        dequantize_svdq_w4_kernel<fp16, false>(packed.data_ptr<uint8_t>(), reinterpret_cast<const fp16*>(scales_cast.data_ptr()), reinterpret_cast<fp16*>(output.data_ptr()), M, K, groups, packed.device());
+    } else {
+        TORCH_CHECK(false, "Unsupported output dtype: ", out_dtype);
+    }
+    return output;
+}
+
 
 torch::Tensor unpack_svdq_int4(
     const torch::Tensor& packed,     // [M, K/2] uint8
@@ -456,19 +486,17 @@ torch::Tensor unpack_svdq_int4(
     TORCH_CHECK(packed.scalar_type() == torch::kByte, "packed must be uint8");
     TORCH_CHECK(packed.dim() == 2, "packed must be 2D [M, K/2]");
 
-    // For now, only signed mode is used by nunchaku
-    TORCH_CHECK(is_signed, "Only signed INT4 is currently supported");
-
     const int64_t M = packed.size(0);
     const int64_t K_half = packed.size(1);
 
     auto output = torch::empty({M, K_half * 2},
         torch::TensorOptions().dtype(torch::kInt8).device(packed.device()));
 
-    unpack_svdq_int4_kernel(
-        packed.data_ptr<uint8_t>(),
-        output.data_ptr<int8_t>(),
-        M, K_half, packed.device());
+    if (is_signed) {
+        unpack_svdq_int4_kernel<true>(packed.data_ptr<uint8_t>(), output.data_ptr<int8_t>(), M, K_half, packed.device());
+    } else {
+        unpack_svdq_int4_kernel<false>(packed.data_ptr<uint8_t>(), output.data_ptr<int8_t>(), M, K_half, packed.device());
+    }
 
     return output;
 }
@@ -521,6 +549,31 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_svdq_act_int4(
     // Return scales in input dtype for consistency
     auto scales_out = scales_f32.to(input_dtype);
     return std::make_tuple(packed, scales_out);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> quantize_svdq_act_uint4(
+    const torch::Tensor& input,
+    int64_t group_size
+) {
+    TORCH_CHECK(input.is_contiguous(), "input tensor must be contiguous");
+    TORCH_CHECK(input.dim() == 2, "input must be 2D [M, K]");
+    TORCH_CHECK(group_size == SVDQ_GROUP_SIZE, "Only group_size=64 is supported");
+    const int64_t M = input.size(0);
+    const int64_t K = input.size(1);
+    TORCH_CHECK(K % SVDQ_GROUP_SIZE == 0, "K must be divisible by 64");
+    const int64_t groups = K / SVDQ_GROUP_SIZE;
+    auto packed = torch::empty({M, K / 2}, torch::TensorOptions().dtype(torch::kByte).device(input.device()));
+    auto scales_f32 = torch::empty({groups, M}, torch::TensorOptions().dtype(torch::kFloat32).device(input.device()));
+    if (input.scalar_type() == torch::kFloat32) {
+        quantize_svdq_act_int4_kernel<float, true>(input.data_ptr<float>(), packed.data_ptr<uint8_t>(), scales_f32.data_ptr<float>(), M, K, groups, input.device());
+    } else if (input.scalar_type() == torch::kBFloat16) {
+        quantize_svdq_act_int4_kernel<bf16, true>(reinterpret_cast<const bf16*>(input.data_ptr()), packed.data_ptr<uint8_t>(), scales_f32.data_ptr<float>(), M, K, groups, input.device());
+    } else if (input.scalar_type() == torch::kFloat16) {
+        quantize_svdq_act_int4_kernel<fp16, true>(reinterpret_cast<const fp16*>(input.data_ptr()), packed.data_ptr<uint8_t>(), scales_f32.data_ptr<float>(), M, K, groups, input.device());
+    } else {
+        TORCH_CHECK(false, "Unsupported input dtype: ", input.scalar_type());
+    }
+    return {packed, scales_f32.to(input.scalar_type())};
 }
 
 
