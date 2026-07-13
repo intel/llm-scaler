@@ -325,28 +325,31 @@ def get_long_description():
     return ""
 
 
-# Extension list. The cute (CUTLASS-SYCL) FMHA is Linux-only. Generic omni
-# development builds may omit it, but downstream release builders can set
-# OMNI_XPU_REQUIRE_CUTE=1 to turn missing or incomplete headers into a hard
-# error instead of silently producing a wheel without its default attention
-# backend.
+# Extension list. The cute (CUTLASS-SYCL) FMHA is Linux-only and required by
+# default so a normal build cannot silently omit the default attention backend.
+# Set OMNI_XPU_REQUIRE_CUTE=0 explicitly for a core-only build (including
+# Windows, where the CUTE extension is not supported).
 _ext_modules = [
     ICPXExtension("omni_xpu_kernel._C", sourcedir="."),
     ICPXExtension("omni_xpu_kernel.lgrf_uni.lgrf_sdp", sourcedir="."),
 ]
 _cutlass_sycl_root = os.environ.get("CUTLASS_SYCL_ROOT", "")
-_cutlass_sycl_required = os.environ.get("OMNI_XPU_REQUIRE_CUTE", "0") == "1"
+_cutlass_sycl_required = os.environ.get("OMNI_XPU_REQUIRE_CUTE", "1") != "0"
 _cutlass_sycl_dirs = ("include", "tools/util/include", "examples/common", "applications")
 _cutlass_sycl_available = bool(_cutlass_sycl_root) and all(
     os.path.isdir(os.path.join(_cutlass_sycl_root, path)) for path in _cutlass_sycl_dirs
 )
 if _cutlass_sycl_required and IS_WINDOWS:
-    raise RuntimeError("OMNI_XPU_REQUIRE_CUTE=1 is unsupported on Windows")
+    raise RuntimeError(
+        "CUTE is required by default but unsupported on Windows; "
+        "set OMNI_XPU_REQUIRE_CUTE=0 for an explicit core-only build"
+    )
 if _cutlass_sycl_required and not _cutlass_sycl_available:
     raise RuntimeError(
-        "OMNI_XPU_REQUIRE_CUTE=1 requires CUTLASS_SYCL_ROOT containing: "
+        "CUTE is required by default; set CUTLASS_SYCL_ROOT containing: "
         + ", ".join(_cutlass_sycl_dirs)
         + f"; got {_cutlass_sycl_root!r}"
+        + ". Set OMNI_XPU_REQUIRE_CUTE=0 only for an explicit core-only build."
     )
 if not IS_WINDOWS and _cutlass_sycl_available:
     _ext_modules.append(ICPXExtension("omni_xpu_kernel.cute.cute_fmha_torch", sourcedir="."))

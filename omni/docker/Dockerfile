@@ -257,6 +257,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # ext is AOT-compiled for OMNI_XPU_DEVICE (bmg = Arc B-series).
 RUN --mount=type=cache,target=/root/.cache/pip \
     export CUTLASS_SYCL_ROOT=/llm/sgl-kernel-xpu/build/_deps/repo-cutlass-sycl-src && \
+    export OMNI_XPU_REQUIRE_CUTE=1 && \
     export OMNI_XPU_DEVICE=bmg && \
     cd /tmp/omni_xpu_kernel && \
     pip install . --no-build-isolation && \

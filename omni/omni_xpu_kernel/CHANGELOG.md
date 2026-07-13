@@ -1,5 +1,17 @@
 # Changelog
 
+## dev/kitchen_xpu (2026-07-13)
+
+### Build System
+
+- CUTE FMHA is required by default on Linux. A normal build now requires a
+  complete `CUTLASS_SYCL_ROOT` and fails if `cute_fmha_torch` cannot be
+  included.
+- `OMNI_XPU_REQUIRE_CUTE=0` is the explicit core-only opt-out and is required
+  for Windows, where the CUTE extension is not supported.
+- The Omni Docker image keeps an explicit `OMNI_XPU_REQUIRE_CUTE=1` release
+  guard so an incomplete CUTE build fails during image construction.
+
 ## dev/sdp-optimization (2026-03-27)
 
 ### Performance

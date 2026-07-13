@@ -62,8 +62,8 @@ from . import linear
 from . import int8
 from . import fp8
 
-# cute FMHA (CUTLASS-SYCL) is an optional backend — its AOT .so may be absent on
-# non-XPU / header-less installs, so import defensively.
+# cute FMHA (CUTLASS-SYCL) is required by default at build time. Import remains
+# defensive for explicit core-only/Windows builds and older installed wheels.
 try:
     from . import cute
 except Exception:  # pragma: no cover

@@ -33,9 +33,11 @@ output = sdp.sdp(q, k, v)
 **AOT compilation for target GPU:**
 ```bash
 # Default target: bmg (Arc B580)
+CUTLASS_SYCL_ROOT=/path/to/sycl-tla \
 OMNI_XPU_DEVICE=bmg pip install -e . --no-build-isolation
 
 # For other GPUs:
+CUTLASS_SYCL_ROOT=/path/to/sycl-tla \
 OMNI_XPU_DEVICE=pvc pip install -e . --no-build-isolation   # Data Center GPU Max
 ```
 
@@ -53,9 +55,9 @@ if cute.is_available():
     output = cute.sdp(q, k, v)
 ```
 
-The CUTE extension is Linux-only and is built when `CUTLASS_SYCL_ROOT` points
-to a complete Intel `sycl-tla`/CUTLASS-SYCL source tree. See Installation for
-the release-build guard that prevents silently omitting this extension.
+The CUTE extension is Linux-only and required by default. `CUTLASS_SYCL_ROOT`
+must point to a complete Intel `sycl-tla`/CUTLASS-SYCL source tree; otherwise
+the build fails instead of silently omitting the default attention backend.
 
 ### linear — FP8 GEMM (oneDNN W8A16)
 
@@ -200,24 +202,21 @@ output = rotary.apply_kitchen_rope_split_half1(x, freqs_cis)
 - PyTorch >= 2.0 with XPU support
 - Intel GPU: Arc B-series (BMG), Data Center GPU Max (PVC), or compatible
 - oneDNN (for INT4/FP8 GEMM; auto-detected from oneAPI)
-- Intel `sycl-tla`/CUTLASS-SYCL headers (for the optional Linux CUTE FMHA)
+- Intel `sycl-tla`/CUTLASS-SYCL headers (for the default Linux CUTE FMHA)
 
 ## Installation
 
 ```bash
 source /opt/intel/oneapi/setvars.sh
 
-# Core build for Arc B580 (bmg). CUTE is omitted when its headers are absent.
+# Default Linux build: CUTE is mandatory. The build fails if the source tree
+# is missing or invalid.
+CUTLASS_SYCL_ROOT=/path/to/sycl-tla \
+OMNI_XPU_DEVICE=bmg \
 pip install -e . --no-build-isolation
 
-# Specify GPU target:
-OMNI_XPU_DEVICE=bmg pip install -e . --no-build-isolation   # Arc B580/B770
-OMNI_XPU_DEVICE=pvc pip install -e . --no-build-isolation   # Data Center GPU Max
-
-# Linux build requiring CUTE FMHA. Fails instead of producing an incomplete
-# artifact if the source tree is missing or invalid.
-CUTLASS_SYCL_ROOT=/path/to/sycl-tla \
-OMNI_XPU_REQUIRE_CUTE=1 \
+# Explicit core-only opt-out (also required for Windows builds):
+OMNI_XPU_REQUIRE_CUTE=0 \
 OMNI_XPU_DEVICE=bmg \
 pip install -e . --no-build-isolation
 ```
@@ -274,10 +273,10 @@ The SDP Flash Attention kernel uses ESIMD with doubleGRF and is compiled as a
 separate sidecar shared library (`lgrf_sdp.so`). AOT compilation targets a
 specific GPU via `-device <target>` (default: bmg).
 
-On Linux, a valid `CUTLASS_SYCL_ROOT` additionally builds the CUTLASS-SYCL
-attention sidecar (`cute_fmha_torch.so`). Set `OMNI_XPU_REQUIRE_CUTE=1` for
-release builds that must contain it. The remaining native operations are built
-into the main `_C` extension.
+On Linux, the default build requires a valid `CUTLASS_SYCL_ROOT` and produces
+the CUTLASS-SYCL attention sidecar (`cute_fmha_torch.so`). Set
+`OMNI_XPU_REQUIRE_CUTE=0` only for an explicit core-only build. The remaining
+native operations are built into the main `_C` extension.
 
 Configuration is via `sdp_config.h`:
 - `ConfigBMG` — Arc B580 (default)

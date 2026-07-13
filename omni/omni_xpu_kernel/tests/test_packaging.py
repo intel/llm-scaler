@@ -7,6 +7,7 @@ import tempfile
 import zipfile
 from importlib.util import find_spec
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -15,6 +16,59 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_DIR = Path("omni_xpu_kernel") / "lgrf_uni"
 EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX")
 ARTIFACT_NAME = f"lgrf_sdp{EXT_SUFFIX if isinstance(EXT_SUFFIX, str) and EXT_SUFFIX else '.so'}"
+
+
+def setup_metadata_env(*, require_cute: Optional[str]) -> dict[str, str]:
+    env = {**os.environ, "PIP_NO_INPUT": "1"}
+    env.pop("CUTLASS_SYCL_ROOT", None)
+    if require_cute is None:
+        env.pop("OMNI_XPU_REQUIRE_CUTE", None)
+    else:
+        env["OMNI_XPU_REQUIRE_CUTE"] = require_cute
+    return env
+
+
+def run_setup_name(*, require_cute: Optional[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "setup.py", "--name"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        env=setup_metadata_env(require_cute=require_cute),
+    )
+
+
+def test_cute_is_required_by_default():
+    result = run_setup_name(require_cute=None)
+
+    assert result.returncode != 0
+    output = result.stdout + result.stderr
+    assert "CUTE is required by default" in output
+
+
+def test_core_only_build_requires_explicit_cute_opt_out():
+    result = run_setup_name(require_cute="0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "omni_xpu_kernel" in result.stdout
+
+
+def test_default_build_accepts_complete_cutlass_tree(tmp_path):
+    for required_dir in ("include", "tools/util/include", "examples/common", "applications"):
+        (tmp_path / required_dir).mkdir(parents=True)
+    env = setup_metadata_env(require_cute=None)
+    env["CUTLASS_SYCL_ROOT"] = str(tmp_path)
+
+    result = subprocess.run(
+        [sys.executable, "setup.py", "--name"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "omni_xpu_kernel" in result.stdout
 
 
 def has_packaging_prerequisites() -> bool:
@@ -71,7 +125,7 @@ def test_lgrf_sdp_wheel_contains_sidecar_artifact():
             cwd=source_copy,
             capture_output=True,
             text=True,
-            env={**os.environ, "PIP_NO_INPUT": "1"},
+            env=setup_metadata_env(require_cute="0"),
         )
 
         assert result.returncode == 0, (
