@@ -59,20 +59,20 @@ Key points:
 - Produce wheel to %OUTPUT_DIR%
 
 Output:
-- %OUTPUT_DIR%\omni_xpu_kernel-0.1.0-cp312-cp312-win_amd64.whl
+- %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0-cp312-cp312-win_amd64.whl
 
 ## 3. Install the newly built wheel (embedded Python)
 Use --no-deps to avoid pulling dependencies again:
 
  - Wheel path:
-  - %OUTPUT_DIR%\omni_xpu_kernel-0.1.0-cp312-cp312-win_amd64.whl
+  - %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0-cp312-cp312-win_amd64.whl
  - Install command:
   - pip install --force-reinstall --no-deps <wheel>
 
 Command example (with variables):
 
 ```
-"%EMBED_PYTHON_DIR%\python.exe" -m pip install --force-reinstall --no-deps "%OUTPUT_DIR%\omni_xpu_kernel-0.1.0-cp312-cp312-win_amd64.whl"
+"%EMBED_PYTHON_DIR%\python.exe" -m pip install --force-reinstall --no-deps "%OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0-cp312-cp312-win_amd64.whl"
 ```
 
 ## 4. Verify (optional)

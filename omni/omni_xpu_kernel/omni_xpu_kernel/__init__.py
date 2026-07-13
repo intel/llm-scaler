@@ -19,7 +19,8 @@ Usage::
 import os
 import sys
 
-__version__ = "0.1.0"
+from ._version import __version__
+
 __author__ = "Intel"
 
 # Lazy loading of native extension

@@ -303,18 +303,28 @@ class ICPXExtension(Extension):
     """Extension that will be built with icpx."""
     
     def __init__(self, name, sourcedir=""):
-        super().__init__(name, sources=[])
-        self.sourcedir = os.fspath(Path(sourcedir).resolve())
+        # setuptools requires Extension.sources to be relative to setup.py so
+        # they can be recorded in an sdist/wheel manifest.  The custom build
+        # command keeps an absolute root separately for invoking icpx.
+        source_root = Path(sourcedir)
+        if name.endswith("lgrf_sdp"):
+            sources = [source_root / "omni_xpu_kernel" / "lgrf_uni" / "sdp_kernels.cpp"]
+        elif name.endswith("cute_fmha_torch"):
+            sources = [source_root / "omni_xpu_kernel" / "cute" / "cute_fmha_torch.cpp"]
+        else:
+            sources = sorted((source_root / "omni_xpu_kernel" / "csrc").glob("*.cpp"))
+        super().__init__(name, sources=[source.as_posix() for source in sources])
+        self.sourcedir = os.fspath(source_root.resolve())
 
 
 # Read version
 def get_version():
-    version_file = Path(__file__).parent / "omni_xpu_kernel" / "__init__.py"
+    version_file = Path(__file__).parent / "omni_xpu_kernel" / "_version.py"
     with open(version_file) as f:
         for line in f:
             if line.startswith("__version__"):
                 return line.split("=")[1].strip().strip('"\'')
-    return "0.1.0"
+    raise RuntimeError(f"Unable to read __version__ from {version_file}")
 
 
 # Read README
