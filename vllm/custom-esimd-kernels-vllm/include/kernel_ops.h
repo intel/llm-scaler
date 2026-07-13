@@ -194,6 +194,11 @@ void esimd_norm_gemv_norm_fp16(
     at::Tensor router_logits, at::Tensor moe_input,
     double eps);
 
+at::Tensor esimd_norm_gemv_fp8_blockscale(
+    at::Tensor x, at::Tensor z, at::Tensor norm_weight,
+    at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output,
+    int64_t HV, int64_t V, double eps);
+
 void esimd_scaled_resadd_norm_gemv_fp8_pert(
     at::Tensor hidden_states, at::Tensor residual,
     at::Tensor norm_weight, at::Tensor qkv_weight,
@@ -264,6 +269,16 @@ at::Tensor esimd_gemm_fp8_pert(
 at::Tensor esimd_gemm_fp8_blockscale(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output, int64_t block_n, int64_t block_k);
+
+at::Tensor esimd_gemv_fp8_blockscale_fused2(
+    at::Tensor input,
+    at::Tensor w0, at::Tensor s0, at::Tensor o0,
+    at::Tensor w1, at::Tensor s1, at::Tensor o1,
+    int64_t block_n, int64_t block_k);
+
+at::Tensor esimd_gemv_fp8_blockscale_fp16_fused2(
+    at::Tensor input, at::Tensor w0, at::Tensor s0, at::Tensor o0,
+    at::Tensor w1, at::Tensor o1, int64_t block_n, int64_t block_k);
 
 // ======================== INT4 GEMV ========================
 // Symmetric INT4 weight GEMV with per-group scale (group_size=128).
