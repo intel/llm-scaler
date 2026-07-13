@@ -1001,6 +1001,36 @@ def moe_forward_full(
         top_k, num_shared_experts, n_routed_experts)
 
 
+def moe_forward_full_fp8_block(
+    x: torch.Tensor,
+    logits: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    shared_gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_down_scale: torch.Tensor,
+    shared_expert_gate_weight: torch.Tensor,
+    top_k: int,
+    num_shared_experts: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """Batch-1 full MoE decode for 128x128 offline FP8 block weights.
+
+    Activations stay fp16. Routed scales have layout ``[E, N/128, K/128]``;
+    shared-expert scales omit the leading expert dimension.
+    """
+    return _moe_batch.moe_forward_full_fp8_block(
+        x, logits, gate_up_weight, gate_up_scale,
+        shared_gate_up_weight, shared_gate_up_scale,
+        down_weight, down_scale,
+        shared_down_weight, shared_down_scale,
+        shared_expert_gate_weight,
+        top_k, num_shared_experts, n_routed_experts)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MoE INT4 Batch ops
 # ═══════════════════════════════════════════════════════════════════════════════
