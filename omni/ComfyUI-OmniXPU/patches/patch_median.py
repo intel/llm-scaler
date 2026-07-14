@@ -2,6 +2,8 @@ import logging
 
 import torch
 
+from .debug import trace_patch
+
 log = logging.getLogger("ComfyUI-OmniXPU")
 
 # Patch torch.median / torch.nanmedian on XPU.
@@ -132,6 +134,7 @@ def apply():
     _orig_nanmedian = torch.nanmedian
     strict = os.environ.get("OMNIXPU_MEDIAN_STRICT_INDICES", "0") != "0"
 
+    @trace_patch("median", ("input", "dim", "keepdim"))
     def _patched_median(input, dim=None, keepdim=False, *, out=None):
         if out is not None or not _should_handle(input, dim):
             if dim is None:
@@ -147,6 +150,7 @@ def apply():
             log.warning("[OmniXPU] median fast path failed (%s); fallback", e)
             return _orig_median(input, dim, keepdim)
 
+    @trace_patch("nanmedian", ("input", "dim", "keepdim"))
     def _patched_nanmedian(input, dim=None, keepdim=False, *, out=None):
         if out is not None or not _should_handle(input, dim):
             if dim is None:

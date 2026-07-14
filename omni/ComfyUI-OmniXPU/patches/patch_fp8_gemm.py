@@ -9,6 +9,8 @@ import logging
 import torch
 import comfy.model_management
 
+from .debug import trace_patch
+
 log = logging.getLogger("ComfyUI-OmniXPU")
 
 _omni_fp8_linear = None
@@ -36,6 +38,7 @@ def apply():
     if hasattr(comfy_ops, "fp8_linear"):
         _orig_fp8_linear = comfy_ops.fp8_linear
 
+        @trace_patch("fp8_gemm.fp8_linear", ("self", "input"))
         def _patched_fp8_linear(self, input):
             dtype = self.weight.dtype
             if dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
@@ -87,6 +90,10 @@ def apply():
 
             # -- Intercept 1: _forward(input, weight, bias) --
             # Called from forward_comfy_cast_weights after cast_bias_weight.
+            @trace_patch(
+                "fp8_gemm.mixed_precision_ops.Linear._forward",
+                ("self", "input", "weight", "bias"),
+            )
             def _mp_inner_forward(self, input, weight, bias):
                 if (_omni_fp8_linear is not None and input.is_xpu and input.ndim == 2 and
                         hasattr(weight, 'dtype') and weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)):
@@ -105,6 +112,10 @@ def apply():
 
             # -- Intercept 2: forward() --
             # Intercepts before comfy_kitchen QuantizedTensor dispatch.
+            @trace_patch(
+                "fp8_gemm.mixed_precision_ops.Linear.forward",
+                ("self", "input"),
+            )
             def _mp_forward(self, input, *fwd_args, **fwd_kwargs):
                 if (_omni_fp8_linear is not None and input.is_xpu and
                         getattr(self, 'quant_format', None) in ('float8_e4m3fn', 'float8_e5m2') and

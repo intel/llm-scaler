@@ -14,6 +14,8 @@ import os
 import torch
 import comfy.model_management
 
+from .debug import trace_patch
+
 log = logging.getLogger("ComfyUI-OmniXPU")
 
 _omni_norm = None
@@ -58,6 +60,7 @@ def apply():
     _orig_ln_cast = LN.forward_comfy_cast_weights
     _orig_ln_fwd = LN.forward
 
+    @trace_patch("norm.LayerNorm.forward_comfy_cast_weights", ("self", "input"))
     def _ln_cast(self, input):
         if self.weight is not None:
             weight, bias, offload_stream = comfy_ops.cast_bias_weight(self, input, offloadable=True)
@@ -76,6 +79,7 @@ def apply():
         comfy_ops.uncast_bias_weight(self, weight, bias, offload_stream)
         return x
 
+    @trace_patch("norm.LayerNorm.forward", ("self", "input"))
     def _ln_fwd(self, *args, **kwargs):
         # run_every_op() is called by the original forward; skip here to avoid
         # double-counting. Only use omni fast path when NOT in cast-weights mode.
@@ -98,6 +102,7 @@ def apply():
     _orig_rn_cast = RN.forward_comfy_cast_weights
     _orig_rn_fwd = RN.forward
 
+    @trace_patch("norm.RMSNorm.forward_comfy_cast_weights", ("self", "input"))
     def _rn_cast(self, input):
         if self.weight is not None:
             weight, bias, offload_stream = comfy_ops.cast_bias_weight(self, input, offloadable=True)
@@ -116,6 +121,7 @@ def apply():
         comfy_ops.uncast_bias_weight(self, weight, bias, offload_stream)
         return x
 
+    @trace_patch("norm.RMSNorm.forward", ("self", "input"))
     def _rn_fwd(self, *args, **kwargs):
         if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
             return _rn_cast(self, *args, **kwargs)
@@ -137,6 +143,7 @@ def apply():
         import comfy.rmsnorm as comfy_rmsnorm
         _orig_rms_fn = comfy_rmsnorm.rms_norm
 
+        @trace_patch("norm.rms_norm", ("x", "weight", "eps"))
         def _patched_rms_norm(x, weight=None, eps=1e-6):
             if _can_use_omni(x):
                 _log_first("rms_norm_fn", x.shape)
@@ -197,6 +204,7 @@ def apply():
 
             _KreaRMS = _krea2_model.RMSNorm
 
+            @trace_patch("norm.Krea2RMSNorm.forward", ("self", "x"))
             def _krea2_rms_forward(self, x):
                 dtype = x.dtype
                 weight = comfy.model_management.cast_to(

@@ -1,5 +1,7 @@
 import logging
 
+from .debug import debug_enabled
+
 log = logging.getLogger("ComfyUI-OmniXPU")
 
 # Patch registry: ordered list of (name, status, reason)
@@ -22,6 +24,9 @@ def get_status():
 
 def apply_all_patches(cfg):
     import importlib, os, sys
+
+    if debug_enabled():
+        log.info("[OmniXPU] debug tracing enabled (OMNIXPU_DEBUG=1)")
 
     _patches_dir = os.path.dirname(os.path.abspath(__file__))
     _pkg_name = os.path.basename(os.path.dirname(_patches_dir))
