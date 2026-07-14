@@ -14,9 +14,9 @@ TP_SIZE="${TP_SIZE:-2}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.9}"
 
 # --- device selection ---
-# Pin to the last two BMG cards (physical 2,3). After masking, sglang sees
+# Pin to the last two BMG cards (physical 0,1). After masking, sglang sees
 # them as XPU 0,1 so TP=2 maps onto exactly these two devices.
-export ZE_AFFINITY_MASK="${ZE_AFFINITY_MASK:-2,3}"
+export ZE_AFFINITY_MASK="${ZE_AFFINITY_MASK:-0,1}"
 
 # --- triton-xpu fp16 mismatch workaround ---
 # Mamba state pool defaults to bf16; force fp16 so it matches the activation
@@ -26,31 +26,30 @@ export SGLANG_MAMBA_CONV_DTYPE=float16
 export SGLANG_MAMBA_SSM_DTYPE=float16
 
 # --- ESIMD fast-path gates ---
-# NOTE: GDN/FA gates MUST use the legacy SGL_XPU_* names; the newer
-# SGLANG_XPU_* aliases fail silently.
+# All ESIMD/XPU fast-path gates use the SGL_XPU_* prefix.
 # decode attn split-K (sglang_decode_attn): mandatory for online perf
-export SGLANG_ENABLE_XPU_ESIMD_DECODE=1
+export SGL_XPU_ESIMD_DECODE=1
 # MoE silu routed kernel (replaces triton fused_moe on XPU)
-export SGLANG_ENABLE_ESIMD_MOE=1
+export SGL_XPU_ESIMD_MOE=1
 # MoE prefill ESIMD (M-tiled DPAS fp8 MoE prefill)
-export SGLANG_ENABLE_ESIMD_MOE_PREFILL=1
+export SGL_XPU_ESIMD_MOE_PREFILL=1
 # Full-attention fused QKV split + RMSNorm + RoPE (Qwen3.5/3.6)
 export SGL_XPU_FA_ESIMD_QKV=1
 # GDN conv fused_seq for the linear-attention decode path
 export SGL_XPU_GDN_ESIMD=1
 # GDN chunk_gated_delta_rule prefill (extend) — ESIMD M-tiled kernel.
 # This is the prefill TTFT lever: triton GDN recurrence is the prefill
-# bottleneck (~6.7x TTFT speedup, 13s->2s at 2k tokens). The kernel was
-# extended to accept fp16 ssm-state to match this fp16 model's mamba pool.
+# bottleneck. The kernel was extended to accept fp16 ssm-state to match
+# this fp16 model's mamba pool.
 export SGL_XPU_GDN_EXTEND_ESIMD=1
 # Prefill SDPA via DPAS/XMX (AOT-compiled, doubleGRF)
 export SGL_XPU_PREFILL_DPAS=1
 
 # --- XPU Graph (CUDA-graph-equivalent) ---
-# Captures the decode forward graph for ~3x TPOT speedup at BS=1.
+# Captures the decode forward graph for a TPOT speedup at BS=1.
 # Safe to leave on with the kernels in this image; falls back to eager
 # replay on sequences > 16384 tokens (kernel MAX_SPLITS cap).
-export SGLANG_XPU_ENABLE_GRAPH=1
+export SGL_XPU_ENABLE_GRAPH=1
 
 # --load-format layered_fp8: build on CPU, load the full bf16 checkpoint into
 # host RAM, then move + quantize each module onto the device one at a time.

@@ -113,7 +113,7 @@ inline void q6_k_gemv_host(
 // dequantizes Q6_K -> a 2.5x-bigger fp16 table + generic GEMM (reads 1017MB at
 // N=248320). This reads the 413MB Q6_K ONCE: per K-tile, load+unpack+dequant
 // weight_f a single time, then multiply against ALL M activation rows (M
-// accumulators). ~2.5x less weight BW than the fp16-table GEMM. input [M,K] row-
+// accumulators). Much less weight BW than the fp16-table GEMM. input [M,K] row-
 // major, output [M,N] row-major.
 template <int M>
 struct Q6_K_gemv_M_kernel {

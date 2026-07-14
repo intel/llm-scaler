@@ -8,9 +8,8 @@
  * esimd_kernel.sycl at single-GRF (better thread occupancy for
  * GEMV/norm/etc.) while letting prefill_dpas use 2x the register file.
  *
- * Result on PTL Xe3 (Qwen3.5 HD=256, n_q=16, n_kv=2):
- *   kv=4k:  6069us -> 1818us  (-70%, 11.3 -> 37.8 TFLOPS / 84% XMX)
- *   kv=64k: 112ms -> 41.5ms   (-63%, 9.8 -> 26.5 TFLOPS / 59% XMX)
+ * Result on PTL Xe3 (Qwen3.5 HD=256, n_q=16, n_kv=2): substantially lower
+ * prefill latency and higher XMX throughput at both short and long KV.
  */
 
 #include <ATen/ATen.h>

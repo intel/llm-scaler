@@ -1,23 +1,4 @@
 # Dockerfile for SGLang on Intel BMG (Battlemage)
-# Targets Qwen3.6-35B-A3B online fp8 inference.
-#
-# Multistage build: the `builder` stage compiles/wheels sgl-kernel-xpu, sglang
-# and the custom ESIMD kernels; the runtime stage only installs the prebuilt
-# wheels on top of intel/pytorch, so no toolchain/source ends up in the final
-# image.
-#
-# Build:
-#   docker build -t llm-scaler-sgl:bmg \
-#     --build-arg http_proxy=$http_proxy \
-#     --build-arg https_proxy=$https_proxy \
-#     llm-scaler/sglang
-#
-# Run (TP=4 example):
-#   docker run --rm -it --device=/dev/dri --shm-size=16g \
-#     -v /path/to/Qwen3.6-35B-A3B:/models/Qwen3.6-35B-A3B:ro \
-#     -p 30000:30000 \
-#     llm-scaler-sgl:bmg \
-#     /workspace/scripts/run_qwen3_6.sh
 
 # ======== Build Stage ========
 # Pinned to 0.1.0 instead of latest (same digest as latest at time of writing,

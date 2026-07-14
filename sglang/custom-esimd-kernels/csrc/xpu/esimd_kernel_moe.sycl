@@ -1,5 +1,5 @@
 /* esimd_kernel_moe.sycl — MoE ESIMD kernels compiled WITHOUT doubleGRF.
- * Standard GRF (256 regs) → 8 threads/XVE → 2× occupancy vs doubleGRF.
+ * Standard GRF (256 regs) → 8 threads/XVE → higher occupancy vs doubleGRF.
  * MoE kernels use ~42 GRFs — well within 256 limit.
  */
 

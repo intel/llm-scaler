@@ -435,7 +435,7 @@ void page_attn_decode(
   // actual kvSeqLen bounds (Phase2 gates `< kvSeqLen`, Phase3 masks to
   // effectiveReduceCount) so their worst-case tail is never read. The old
   // temp_p.zero_() zeroed the ENTIRE ~max_context_len-sized buffer (~21MB @ ctx 64k,
-  // 300us/call, the #108 trace's 82ms Fill<float>); this zeroes ~512 bytes instead.
+  // costly Fill<float>); this zeroes ~512 bytes instead.
   // pGlobalMax and pPollP are contiguous (offsets above), so one narrow zero covers both.
   if (preallocated) {
     size_t zoff = szP + szGroupMax;                  // start of pGlobalMax

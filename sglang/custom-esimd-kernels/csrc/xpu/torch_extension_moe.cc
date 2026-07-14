@@ -9,7 +9,7 @@
 #include "kernel_ops.h"
 
 TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_sglang, m) {
-  // MoE ops — compiled without doubleGRF for 2× occupancy
+  // MoE ops — compiled without doubleGRF for higher occupancy
   m.def("esimd_moe_topk(Tensor router_logits, Tensor top_values, "
         "Tensor top_indices, int T) -> Tensor");
   m.impl("esimd_moe_topk", torch::kXPU, &esimd_moe_topk);

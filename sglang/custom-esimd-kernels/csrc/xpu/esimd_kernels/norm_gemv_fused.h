@@ -23,7 +23,7 @@
  * cache after the first WG reads them (total 2*HV*V*2 + V*2 ≈ 4.25KB).
  *
  * Saves: 1 kernel launch + Python overhead of norm (torch.empty, reshape,
- * Triton dispatch) per GDN layer. 48 layers × ~50us = ~2.4ms.
+ * Triton dispatch) per GDN layer, across all 48 layers.
  */
 
 #pragma once

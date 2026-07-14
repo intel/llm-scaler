@@ -115,7 +115,7 @@ inline sycl::event moe_down_q6k_ggemv_t(
                         // q32 = qb0|qb1<<8|qb2<<16|qb3<<24, element e's 2-bit field is at bit
                         // 8*(e/4)+2*(e%4) == 2*e. So h2 = (q32 >> 2e) & 3. v6 = nibble+h2*16,
                         // w = scale*(v6-32). VECTORIZED per row (mirrors up; replaces the
-                        // scalar `for e` lane R/W that capped down at ~28 GB/s, notes §10ax).
+                        // scalar `for e` lane R/W that capped down throughput, notes §10ax).
                         const simd<uint32_t, 16> sh6 = simd<uint32_t, 16>(0, 1) * (uint32_t)2;  // 0,2,..30
                         #pragma unroll
                         for (int r = 0; r < 8; r++) {

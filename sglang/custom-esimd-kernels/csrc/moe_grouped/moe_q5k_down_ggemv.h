@@ -122,7 +122,7 @@ inline sycl::event moe_down_q5k_ggemv_t(
                         // element e in [0,16): bit = (qh16 >> e) & 1, value += bit*16, where
                         // qh16 = b0 | (b1<<8). VECTORIZED per row (mirrors up's select<16,1>
                         // dequant; replaces the old scalar `for e` lane-indexed R/W that
-                        // starved the loads -> down at 30 GB/s vs up 73 GB/s, notes §10ax).
+                        // starved the loads (down slower than up), notes §10ax).
                         const simd<uint32_t, 16> sh5(0, 1);   // 0,1,...,15
                         #pragma unroll
                         for (int r = 0; r < 8; r++) {
@@ -181,7 +181,7 @@ inline sycl::event moe_down_q5k_ggemv_smallm(
     fp16* expert_output, const MoeQ4KChunkInfo* chunks, int num_chunks,
     int intermediate_size, int hidden_size) {
     // small-M occupancy: finer N-tile (32->16) multiplies WIs (notes §10..),
-    // ~1.2x at verify M=4. MOE_N_TILE env A/B; default 16.
+    // improves small-M throughput. MOE_N_TILE env A/B; default 16.
     static const int NT = [](){ const char* e=std::getenv("MOE_N_TILE"); return e?atoi(e):16; }();
     auto f = (NT==8)  ? moe_down_q5k_ggemv_t<1,8>
            : (NT==32) ? moe_down_q5k_ggemv_t<1,32>

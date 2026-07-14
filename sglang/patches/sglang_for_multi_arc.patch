@@ -568,7 +568,7 @@ index ae5365e8d6..8c7f30ef5a 100644
 +# NHD KV layout `[n_slots, Hkv, D]` directly via kv_indptr/kv_indices, no
 +# paged-cache reshape required. 2-phase split-K kernel; supports radix cache.
 +_ENABLE_XPU_ESIMD_DECODE = get_bool_env_var(
-+    "SGLANG_ENABLE_XPU_ESIMD_DECODE", "false"
++    "SGL_XPU_ESIMD_DECODE", "false"
 +)
 +_XPU_ESIMD_DECODE_FN = None
 +if _ENABLE_XPU_ESIMD_DECODE:
@@ -1279,11 +1279,11 @@ index 96e431d4e3..76a515822e 100644
          running_state: dict,
          hooks: Optional[Any] = None,
      ) -> TritonRunnerOutput:
-+        # XPU fast path: gated by SGLANG_ENABLE_ESIMD_MOE=1. The fused-func
++        # XPU fast path: gated by SGL_XPU_ESIMD_MOE=1. The fused-func
 +        # path (`fused_experts_none_to_triton`) is the one that actually fires
 +        # under the default runner config; this branch is here for the future
 +        # case where a runner_input gets routed straight into the runner_core.
-+        if os.environ.get("SGLANG_ENABLE_ESIMD_MOE", "0") == "1":
++        if os.environ.get("SGL_XPU_ESIMD_MOE", "0") == "1":
 +            out = _try_esimd_moe_silu_routed(runner_input, quant_info, self.config)
 +            if out is not None:
 +                return TritonRunnerOutput(hidden_states=out)
@@ -1474,7 +1474,7 @@ index 96e431d4e3..76a515822e 100644
 +        return None
 +    # NOTE: this routed-only path does NOT yet handle Qwen3.6 shared-expert
 +    # fusion (shared_expert_intermediate_size == moe_intermediate_size), so the
-+    # full MoE output is incomplete -> SGLANG_ENABLE_ESIMD_MOE_PREFILL must stay
++    # full MoE output is incomplete -> SGL_XPU_ESIMD_MOE_PREFILL must stay
 +    # off until the shared expert contribution is added. Kept wired + scale-fixed
 +    # for when that lands.
 +
@@ -1511,7 +1511,7 @@ index 96e431d4e3..76a515822e 100644
 +    # a single linear layer, so a single scalar per expert is too lossy.
 +    # TODO: migrate the per-block FP8 MoE GEMM kernel from llm-scaler/vllm
 +    # (or feed 2D scale through a future kernel variant) before re-enabling.
-+    if os.environ.get("SGLANG_ENABLE_ESIMD_MOE", "0") == "1":
++    if os.environ.get("SGL_XPU_ESIMD_MOE", "0") == "1":
 +        esimd_out = _maybe_esimd_moe_silu_fused(
 +            dispatch_output, quant_info, runner_config
 +        )
@@ -1520,7 +1520,7 @@ index 96e431d4e3..76a515822e 100644
 +
 +    # Large-T (prefill) M-tiled DPAS FP8 MoE kernel. Separate env gate so it can
 +    # be enabled independently of the decode kernel.
-+    if os.environ.get("SGLANG_ENABLE_ESIMD_MOE_PREFILL", "0") == "1":
++    if os.environ.get("SGL_XPU_ESIMD_MOE_PREFILL", "0") == "1":
 +        esimd_out = _maybe_esimd_moe_silu_prefill(
 +            dispatch_output, quant_info, runner_config
 +        )
@@ -3695,7 +3695,7 @@ index 3b30eb0e1f..ea5d755e4d 100644
 +            # in progress. torch.cuda.CUDAGraph / torch.cuda.graph are
 +            # aliased onto torch.xpu equivalents in cuda_graph_runner at
 +            # import time (see _xpu_patch_cuda_graph_apis).
-+            if os.environ.get("SGLANG_XPU_ENABLE_GRAPH") == "1":
++            if os.environ.get("SGL_XPU_ENABLE_GRAPH") == "1":
 +                self.init_device_graphs()
 +            else:
 +                self.graph_runner = None

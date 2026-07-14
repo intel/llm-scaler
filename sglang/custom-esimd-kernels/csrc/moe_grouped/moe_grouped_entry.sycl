@@ -9,7 +9,7 @@
 //   moe_down_q5k_ggemv : down-proj Q5_K GGEMV      [E,H,IM]        -> [tot,H]
 //   moe_down_q6k_ggemv : down-proj Q6_K GGEMV      [E,H,IM]        -> [tot,H]
 // smallm=true selects the 16-row tile + finer N-col tiling (occupancy fix for
-// small M, e.g. MTP verify M<=16; ~1.35x over the 64-row tile at M=4).
+// small M, e.g. MTP verify M<=16; improves small-M occupancy over the 64-row tile).
 #include <torch/extension.h>
 #include <c10/xpu/XPUStream.h>
 #include "moe_q4k_ggemv.h"

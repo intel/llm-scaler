@@ -6,7 +6,7 @@
  * where rmsnorm(x) = x / rms(x), silu(z) = z * sigmoid(z).
  *
  * Grid: rows WGs, 1 thread each. V=128 fits in registers.
- * Expected: ~5us vs ~87us for PyTorch dispatch chain.
+ * Expected: much lower latency than the PyTorch dispatch chain.
  */
 
 #pragma once

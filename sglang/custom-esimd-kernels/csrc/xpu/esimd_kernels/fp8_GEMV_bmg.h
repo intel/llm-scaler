@@ -1,7 +1,7 @@
 /* fp8_GEMV_bmg.h — BMG-optimized FP8 GEMV with K_SPLIT and K-tail handling.
  *
  * Designed for shapes that fp8_GEMV_v2 picks suboptimal (vl, ks) on:
- *   K=1056 → V2 picks vl=32, ks=1 (loop 33×) → ~9.9us @ 300 GB/s.
+ *   K=1056 → V2 picks vl=32, ks=1 (loop 33×), leaving bandwidth on the table.
  *   This kernel allows kp = K/ks not divisible by VL via masked tail.
  *
  *   N=2816, K=1056: ks=4 → kp=264; we pick VL=256 + 1 tail of 8 (256+8 -> wait, 264 = 256+8 = 256+8, but VL=256 reads OOB)

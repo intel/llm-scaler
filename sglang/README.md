@@ -19,9 +19,6 @@ sglang/
                                      #   fused QKV, GDN conv fused_seq, RMSNormGated
 ```
 
-The patched **sglang** and **sgl-kernel-xpu** sources are pulled from the
-`dev-bmg` branches of analytics-zoo on build, so this directory does not
-vendor them.
 
 ## Build
 
@@ -48,32 +45,22 @@ docker run --rm -it \
     /workspace/scripts/run_qwen3_6.sh
 ```
 
-## Performance
-
-BS=1, 1k-in / 256-out, fp16 + fp8 weights:
-
-| Config                          | TPOT (ms) |
-|---------------------------------|-----------|
-| Baseline (no XPU Graph)         | ~45       |
-| **With XPU Graph (this image)** | **~15**   |
-
 ## Fast-paths enabled
 
 Each is gated by an env var (set by `run_qwen3_6.sh`):
 
 | Env var                            | Path                                   |
 |------------------------------------|----------------------------------------|
-| `SGLANG_ENABLE_XPU_ESIMD_DECODE`   | Decode SDPA (split-K, flat NHD KV)     |
-| `SGLANG_ENABLE_ESIMD_MOE`          | FP8 MoE silu routed kernel             |
-| `SGLANG_ENABLE_ESIMD_MOE_PREFILL`  | FP8 MoE prefill (M-tiled DPAS)         |
+| `SGL_XPU_ESIMD_DECODE`             | Decode SDPA (split-K, flat NHD KV)     |
+| `SGL_XPU_ESIMD_MOE`                | FP8 MoE silu routed kernel             |
+| `SGL_XPU_ESIMD_MOE_PREFILL`        | FP8 MoE prefill (M-tiled DPAS)         |
 | `SGL_XPU_FA_ESIMD_QKV`             | Full-attention fused QKV+RMSNorm+RoPE  |
 | `SGL_XPU_GDN_ESIMD`                | GDN conv fused_seq decode              |
 | `SGL_XPU_GDN_EXTEND_ESIMD`         | GDN chunk_gated_delta_rule prefill     |
 | `SGL_XPU_PREFILL_DPAS`             | Prefill SDPA via DPAS/XMX              |
-| `SGLANG_XPU_ENABLE_GRAPH`          | XPU device-graph capture/replay        |
+| `SGL_XPU_ENABLE_GRAPH`             | XPU device-graph capture/replay        |
 
-> **Note:** the GDN/FA gates must use the legacy `SGL_XPU_*` names — the newer
-> `SGLANG_XPU_*` aliases fail silently.
+> **Note:** all ESIMD/XPU fast-path gates use the `SGL_XPU_*` prefix.
 
 In addition `SGLANG_MAMBA_{CONV,SSM}_DTYPE=float16` is required when running
 the model with `--dtype float16` so the mamba state pool matches activation

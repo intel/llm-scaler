@@ -312,7 +312,7 @@ inline void GEMV_int4_host(
 // computes two GEMVs with the same hidden_states input:
 //   qkvz = input @ in_proj_qkvz.weight^T    (N0, e.g. 3072)
 //   ba   = input @ in_proj_ba.weight^T       (N1, e.g. 16)
-// Fusing them saves one kernel launch overhead (~20-50 us on BMG).
+// Fusing them saves one kernel launch overhead.
 //
 // Grid layout: (N0 + N1 + ...) workgroups, each WG determines which matrix
 // it belongs to via cumulative N sums (same pattern as fp8_GEMV_v2.h).

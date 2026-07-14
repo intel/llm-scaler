@@ -13,7 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SGLANG_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DOCKERFILE="${SGLANG_DIR}/docker/Dockerfile"
 
-IMAGE_TAG="${IMAGE_TAG:-amr-registry.caas.intel.com/intelanalytics/llm-scaler-sglang:0.5.13-b1}"
+IMAGE_TAG="${IMAGE_TAG:-intel/llm-scaler-sglang:0.21.0-b1}"
 SGLANG_CACHEBUST="${SGLANG_CACHEBUST:-$(date +%s)}"
 
 echo "Building ${IMAGE_TAG} from ${SGLANG_DIR}"

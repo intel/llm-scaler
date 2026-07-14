@@ -5,7 +5,7 @@
  *   hidden[i] = rmsnorm(residual[i]) * weight
  *
  * Grid: rows WGs, 1 thread each. K=2048 → 4 iterations with VL=512.
- * Replaces PyTorch dispatch chain (~87us) with single kernel (~5us).
+ * Replaces the PyTorch dispatch chain with a single, much faster kernel.
  */
 
 #pragma once

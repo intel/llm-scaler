@@ -33,12 +33,12 @@ struct MoeQ4KChunkInfo { int eid; int t0; int nt; };
 // expert-sort permutation tok_sorted). When non-null, the kernel reads the
 // activation directly from `expert_states` at row tok_ids[t0+m] — folding the
 // per-expert input gather INTO the load (no `es = xf.index_select(tok_sorted)`
-// round-trip; saves the IndexKernel, ~10% of prefill, notes §10be). When null,
+// round-trip; saves the IndexKernel, notes §10be). When null,
 // reads contiguous rows t0..t0+nt (legacy: caller pre-gathered).
 // MS_ = row-tiles of 16 tokens each (MAX_M = MS_*16). MS_=4 -> 64-token tile
 // (prefill, large M). MS_=1 -> 16-token tile: for SMALL M (e.g. MTP verify M=4)
-// the 64-row DPAS wastes ~60/64 rows; a 16-row tile does ~4x less matmul +
-// smaller acc + 1x the b_tile gather. Templated so both variants share one body.
+// the 64-row DPAS wastes ~60/64 rows; a 16-row tile does much less matmul +
+// smaller acc + the same b_tile gather. Templated so both variants share one body.
 template <int MS_, int N_ = 32>
 inline sycl::event moe_up_q4k_ggemv_t(
     sycl::queue& q,
@@ -294,11 +294,11 @@ inline sycl::event moe_up_q4k_ggemv_tN(
     });
 }
 
-// Small-M (MTP verify, M<=16): 16-token row-tile (MS=1). ~4x less wasted DPAS.
+// Small-M (MTP verify, M<=16): 16-token row-tile (MS=1). Much less wasted DPAS.
 // NOTE: a register-GEMV smallm (no 16-row DPAS pad) was tried (per-col and
-// 8-col-tile) — both REGRESSED to 0.54x / 0.29x vs this DPAS MS=1 (GRF can't
+// 8-col-tile) — both regressed vs this DPAS MS=1 (GRF can't
 // hold N-col x M accumulators; scalar weight loads don't coalesce like the DPAS
-// lsc_load_2d). The DPAS MS=1 (~3x weight-BW floor) is the best small-M path
+// lsc_load_2d). The DPAS MS=1 (near the weight-BW floor) is the best small-M path
 // here; beating it needs a different scheme (e.g. 4-expert x 4-token packing).
 inline sycl::event moe_up_q4k_ggemv_smallm(
     sycl::queue& q, const fp16* expert_states,
@@ -307,8 +307,8 @@ inline sycl::event moe_up_q4k_ggemv_smallm(
     fp16* gate_buf, const MoeQ4KChunkInfo* chunks, int num_chunks,
     int hidden_size, int intermediate_size, const int* tok_ids = nullptr) {
     // occupancy probe (notes §10..): at M=4 the N=32 tile launches only
-    // num_chunks*(fused_im/32) WIs -> 42GB/s (2.65x floor) while M=16 hits
-    // 66GB/s. Cause is OCCUPANCY starvation, not DPAS compute (MS1==MS4 wall).
+    // num_chunks*(fused_im/32) WIs, causing occupancy starvation vs M=16,
+    // not DPAS compute (MS1==MS4 wall).
     // Finer N-tiling multiplies WI count at fixed M (same bytes, no reduction).
     // MOE_N_TILE env selects 8/16/32 for A/B; default 16 (best probe headroom).
     static const int NT = [](){ const char* e=std::getenv("MOE_N_TILE"); return e?atoi(e):16; }();

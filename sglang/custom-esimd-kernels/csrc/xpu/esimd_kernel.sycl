@@ -195,7 +195,7 @@ at::Tensor esimd_gemv_q8_0(
 // M-tiled q8_0 dense GEMV (small M, MTP verify). input [M,K], output [M,N].
 // Reads the int8 q8_0 weights ONCE per row-tile across the M rows (vs the M>1
 // oneDNN jit:gemm path that CACHE-MISSes / JIT-recompiles per (M,K,N) shape —
-// the #87 trace hog). M = input.size(0). weight [N,K] int8, scale [N,K/32].
+// a major hog). M = input.size(0). weight [N,K] int8, scale [N,K/32].
 at::Tensor esimd_gemv_q8_0_m(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output) {

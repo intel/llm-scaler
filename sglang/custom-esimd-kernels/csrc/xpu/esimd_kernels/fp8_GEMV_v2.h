@@ -2,7 +2,7 @@
 #include "utils.h"
 
 // FP8 GEMV with FP32 accumulation, element-wise acc + deferred scale.
-// Optimized for decode (M=1) on BMG. Achieves ~97% BW utilization on large shapes.
+// Optimized for decode (M=1) on BMG. Near-peak BW utilization on large shapes.
 //
 // Supports both E4M3 and E5M2 via fp8_mode (0=E4M3, 1=E5M2).
 // Input: [1, K] fp16, Weight: [N, K] fp8, Output: [1, N] fp16

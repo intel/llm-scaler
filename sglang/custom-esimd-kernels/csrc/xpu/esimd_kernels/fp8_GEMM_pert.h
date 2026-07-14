@@ -1047,9 +1047,9 @@ inline void dpas_v4_gemm_fp8_pert_host(
 // Regime H: DPAS V5 — Wide weight load (K_LOAD=64, cache-line aligned)
 //
 // Key insight: lsc_load_2d<uint8_t, 16, 16> fetches 16 cache lines (1024 bytes)
-// for only 256 bytes of data → 25% cache utilization.
+// for only 256 bytes of data → poor cache-line utilization.
 // lsc_load_2d<uint8_t, 64, 16> fetches the same 16 cache lines but uses all
-// 1024 bytes → 100% utilization. This requires processing 4 DPAS K-subs per load.
+// 1024 bytes → full cache-line utilization. This requires processing 4 DPAS K-subs per load.
 //
 // Requires K % 64 == 0.
 // ============================================================================
@@ -1155,7 +1155,7 @@ struct FP8_GEMM_DPAS_V5 {
 
 // ============================================================================
 // FP8 GEMM DPAS V7: K-split multi-thread WG
-// V5 has 160 threads for N=2560 = 1 thread/XVE (12.5% occupancy).
+// V5 has 160 threads for N=2560 = 1 thread/XVE (low occupancy).
 // V6 (M-parallel) was worse because L1 weight reuse < register reuse.
 // V7 splits K across threads: each thread loads DIFFERENT weight/input data,
 // then reduces partial sums via SLM. More threads = better latency hiding.
@@ -1412,7 +1412,7 @@ inline void dpas_v7_auto_dispatch(
 // Key insight: oneDNN's JIT fuses the byte→fp16 dequant with VNNI interleave
 // via register regioning (shl with stride-4 source, stride-2 dest). ESIMD can't
 // emit these instructions, causing 64 narrow mov(4|M0) per sub-tile for VNNI pack
-// (55% of the loop body).
+// (a large fraction of the loop body).
 //
 // V9 solution: Use lsc_load_2d<uint32_t, 4, 16, 1, TRANSPOSE=true> so each uint32
 // contains 4 adjacent FP8 bytes for one N-row. Extract byte pairs into uint32
@@ -3396,7 +3396,7 @@ inline void dpas_v13_auto_dispatch(
 
 // ============================================================================
 // V10: V9 + N_TILES — process multiple N-columns per thread to reduce input loads
-// VTune showed V9 has 45% more Send instructions than oneDNN at M=32.
+// V9 issues more Send instructions than oneDNN at M=32.
 // Root cause: V9 processes only 16 N-cols/WG → 160 WGs each redundantly loading input.
 // V10: N_TILES=2 → 32 N-cols/WG → 80 WGs → halves redundant input loads.
 // ============================================================================
@@ -4041,7 +4041,7 @@ inline void GEMM_fp8_pert_dispatch(
     } else if (N <= 16 && M >= 2) {
         // Tiny-N M-parallel: one WG per input row, K_SPLIT threads per WG.
         // Grid={M×K_SPLIT}. Weight (N*K bytes) in L3. Avoids N-parallel
-        // underutilization that causes 2x cliff at M=9 in V7/WS kernels.
+        // underutilization that causes a throughput cliff at M=9 in V7/WS kernels.
         // K_SPLIT chosen so K/K_SPLIT is divisible by VL=128.
         if (K >= 2048 && K % (8 * 128) == 0) {
             mpar_gemm_fp8_pert_host<128, 8, 16>(

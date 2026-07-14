@@ -1572,7 +1572,7 @@ torch::Tensor moe_forward_fused(
 }
 
 // Full MoE forward: topk + up + down_routed + down_finalize in one C++ call.
-// Pre-allocated buffers to eliminate torch::empty overhead (~2.6us each × 5 = 13us/call).
+// Pre-allocated buffers to eliminate torch::empty overhead.
 // Buffers are lazily initialized on first call and reused across layers.
 
 // Static buffer cache (thread-local for safety, though typically single-threaded)
@@ -1663,7 +1663,7 @@ torch::Tensor moe_forward_full(
 // V2: For BSZ>1 — uses standalone down path (gate_precompute + down_routed +
 // down_shared + accumulate) instead of down_finalize. down_finalize fuses
 // shared-expert GEMV per work-item with no weight reuse, which is optimal for
-// BSZ=1 but adds ~8us/token overhead at BSZ>1. The standalone path uses
+// BSZ=1 but adds per-token overhead at BSZ>1. The standalone path uses
 // properly parallelized GEMM-style kernels with weight reuse.
 //
 // Separate static buffers to avoid interfering with BSZ=1 moe_forward_full.
