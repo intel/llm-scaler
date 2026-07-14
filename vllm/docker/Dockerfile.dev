@@ -40,10 +40,7 @@ ARG no_proxy
 # vllm-xpu-kernels pinned base commit (identical to prod build).
 ARG VLLM_XPU_KERNELS_COMMIT=3cab97a
 
-ENV http_proxy=${http_proxy} \
-    https_proxy=${https_proxy} \
-    no_proxy=${no_proxy} \
-    VIRTUAL_ENV=/opt/venv \
+ENV VIRTUAL_ENV=/opt/venv \
     PATH="/root/.local/bin:/opt/venv/bin:${PATH}" \
     UV_HTTP_TIMEOUT=500 \
     PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \

@@ -32,10 +32,7 @@ ARG no_proxy
 # vllm-xpu-kernels pinned base commit (identical to legacy build).
 ARG VLLM_XPU_KERNELS_COMMIT=3cab97a
 
-ENV http_proxy=${http_proxy} \
-    https_proxy=${https_proxy} \
-    no_proxy=${no_proxy} \
-    VIRTUAL_ENV=/opt/buildenv \
+ENV VIRTUAL_ENV=/opt/buildenv \
     PATH="/root/.local/bin:/opt/buildenv/bin:${PATH}" \
     UV_HTTP_TIMEOUT=500 \
     PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
@@ -134,10 +131,7 @@ ARG https_proxy
 ARG no_proxy
 
 # The base already exports PATH=/opt/venv/bin:... and DEVICE=xpu.
-ENV http_proxy=${http_proxy} \
-    https_proxy=${https_proxy} \
-    no_proxy=${no_proxy} \
-    PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
+ENV PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     VLLM_QUANTIZE_Q40_LIB="/opt/venv/lib/python3.12/site-packages/vllm_int4_for_multi_arc.so" \
