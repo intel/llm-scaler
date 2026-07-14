@@ -6,6 +6,7 @@ from typing import Tuple
 
 def _get_native():
     from .. import _load_extension
+
     return _load_extension().svdq
 
 
@@ -26,6 +27,14 @@ def dequantize_w4(
         [N, K] dequantized tensor in out_dtype
     """
     return _get_native().dequantize_svdq_w4(packed, scales, out_dtype)
+
+
+def dequantize_u4(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    return _get_native().dequantize_svdq_u4(packed, scales, out_dtype)
 
 
 def unpack_int4(
@@ -60,6 +69,13 @@ def quantize_act_int4(
         (packed [M, K/2] uint8, scales [num_groups, M])
     """
     return _get_native().quantize_svdq_act_int4(input, group_size)
+
+
+def quantize_act_uint4(
+    input: torch.Tensor,
+    group_size: int = 64,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _get_native().quantize_svdq_act_uint4(input, group_size)
 
 
 def onednn_int4_gemm(
@@ -209,8 +225,10 @@ def prepare_onednn_weights(
 
 __all__ = [
     "dequantize_w4",
+    "dequantize_u4",
     "unpack_int4",
     "quantize_act_int4",
+    "quantize_act_uint4",
     "onednn_int4_gemm",
     "onednn_int4_gemm_preconverted",
     "onednn_int4_gemm_add_to_output",

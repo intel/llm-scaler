@@ -303,18 +303,28 @@ class ICPXExtension(Extension):
     """Extension that will be built with icpx."""
     
     def __init__(self, name, sourcedir=""):
-        super().__init__(name, sources=[])
-        self.sourcedir = os.fspath(Path(sourcedir).resolve())
+        # setuptools requires Extension.sources to be relative to setup.py so
+        # they can be recorded in an sdist/wheel manifest.  The custom build
+        # command keeps an absolute root separately for invoking icpx.
+        source_root = Path(sourcedir)
+        if name.endswith("lgrf_sdp"):
+            sources = [source_root / "omni_xpu_kernel" / "lgrf_uni" / "sdp_kernels.cpp"]
+        elif name.endswith("cute_fmha_torch"):
+            sources = [source_root / "omni_xpu_kernel" / "cute" / "cute_fmha_torch.cpp"]
+        else:
+            sources = sorted((source_root / "omni_xpu_kernel" / "csrc").glob("*.cpp"))
+        super().__init__(name, sources=[source.as_posix() for source in sources])
+        self.sourcedir = os.fspath(source_root.resolve())
 
 
 # Read version
 def get_version():
-    version_file = Path(__file__).parent / "omni_xpu_kernel" / "__init__.py"
+    version_file = Path(__file__).parent / "omni_xpu_kernel" / "_version.py"
     with open(version_file) as f:
         for line in f:
             if line.startswith("__version__"):
                 return line.split("=")[1].strip().strip('"\'')
-    return "0.1.0"
+    raise RuntimeError(f"Unable to read __version__ from {version_file}")
 
 
 # Read README
@@ -325,14 +335,33 @@ def get_long_description():
     return ""
 
 
-# Extension list. The cute (CUTLASS-SYCL) FMHA is Linux-only — it needs the
-# cutlass-sycl headers + Xe SPIR-V extensions and has no Windows build path, so
-# it is only added on non-Windows platforms.
+# Extension list. The cute (CUTLASS-SYCL) FMHA is Linux-only and required by
+# default so a normal build cannot silently omit the default attention backend.
+# Set OMNI_XPU_REQUIRE_CUTE=0 explicitly for a core-only build (including
+# Windows, where the CUTE extension is not supported).
 _ext_modules = [
     ICPXExtension("omni_xpu_kernel._C", sourcedir="."),
     ICPXExtension("omni_xpu_kernel.lgrf_uni.lgrf_sdp", sourcedir="."),
 ]
-if not IS_WINDOWS:
+_cutlass_sycl_root = os.environ.get("CUTLASS_SYCL_ROOT", "")
+_cutlass_sycl_required = os.environ.get("OMNI_XPU_REQUIRE_CUTE", "1") != "0"
+_cutlass_sycl_dirs = ("include", "tools/util/include", "examples/common", "applications")
+_cutlass_sycl_available = bool(_cutlass_sycl_root) and all(
+    os.path.isdir(os.path.join(_cutlass_sycl_root, path)) for path in _cutlass_sycl_dirs
+)
+if _cutlass_sycl_required and IS_WINDOWS:
+    raise RuntimeError(
+        "CUTE is required by default but unsupported on Windows; "
+        "set OMNI_XPU_REQUIRE_CUTE=0 for an explicit core-only build"
+    )
+if _cutlass_sycl_required and not _cutlass_sycl_available:
+    raise RuntimeError(
+        "CUTE is required by default; set CUTLASS_SYCL_ROOT containing: "
+        + ", ".join(_cutlass_sycl_dirs)
+        + f"; got {_cutlass_sycl_root!r}"
+        + ". Set OMNI_XPU_REQUIRE_CUTE=0 only for an explicit core-only build."
+    )
+if not IS_WINDOWS and _cutlass_sycl_available:
     _ext_modules.append(ICPXExtension("omni_xpu_kernel.cute.cute_fmha_torch", sourcedir="."))
 
 setup(

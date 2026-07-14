@@ -38,6 +38,7 @@ set "WORKSPACE=C:\workspace"
 set "LLM_SCALER_DIR=%WORKSPACE%\llm-scaler"
 set "EMBED_PYTHON_DIR=%WORKSPACE%\omni\comfyui_windows_setup\python_embeded"
 set "OUTPUT_DIR=%WORKSPACE%\llm_scaler_dist"
+set "OMNI_XPU_REQUIRE_CUTE=0"
 set "PATH=%CONDA_PREFIX%\Library\bin;%CONDA_PREFIX%\Lib\site-packages\torch\lib;%PATH%"
 cd /d %LLM_SCALER_DIR%\omni\omni_xpu_kernel
 python -m pip wheel . -w %OUTPUT_DIR% --no-build-isolation --no-deps > %WORKSPACE%\build_log.txt 2>&1
@@ -53,24 +54,25 @@ How to run the .cmd file (common options):
 Key points:
 - Initialize oneAPI: setvars.bat
 - Activate conda: omni_env
+- Explicitly select a core-only build because CUTE FMHA is Linux-only
 - Set torch DLL search path
 - Produce wheel to %OUTPUT_DIR%
 
 Output:
-- %OUTPUT_DIR%\omni_xpu_kernel-0.1.0-cp312-cp312-win_amd64.whl
+- %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0-cp312-cp312-win_amd64.whl
 
 ## 3. Install the newly built wheel (embedded Python)
 Use --no-deps to avoid pulling dependencies again:
 
  - Wheel path:
-  - %OUTPUT_DIR%\omni_xpu_kernel-0.1.0-cp312-cp312-win_amd64.whl
+  - %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0-cp312-cp312-win_amd64.whl
  - Install command:
   - pip install --force-reinstall --no-deps <wheel>
 
 Command example (with variables):
 
 ```
-"%EMBED_PYTHON_DIR%\python.exe" -m pip install --force-reinstall --no-deps "%OUTPUT_DIR%\omni_xpu_kernel-0.1.0-cp312-cp312-win_amd64.whl"
+"%EMBED_PYTHON_DIR%\python.exe" -m pip install --force-reinstall --no-deps "%OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0-cp312-cp312-win_amd64.whl"
 ```
 
 ## 4. Verify (optional)

@@ -8,6 +8,7 @@ ARG TORCH_VERSION=2.10.0
 ARG TORCHVISION_VERSION=0.25.0
 ARG TORCHAUDIO_VERSION=2.10.0
 ARG ONEAPI_VERSION=2025.2.0-517
+ARG IMAGE_TAG
 
 # ======== Builder Stage ========
 FROM ${BASE_IMAGE} AS builder
@@ -19,6 +20,9 @@ ARG TORCH_VERSION
 ARG TORCHVISION_VERSION
 ARG TORCHAUDIO_VERSION
 ARG ONEAPI_VERSION
+ARG IMAGE_TAG
+
+RUN test -n "${IMAGE_TAG}"
 
 ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python${PYTHON_VERSION}/dist-packages/torch/lib:${LD_LIBRARY_PATH}"
 
@@ -91,7 +95,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # ComfyUI-OmniXPU: Intel XPU acceleration via custom node (replaces core patch)
 COPY ./ComfyUI-OmniXPU /llm/ComfyUI/custom_nodes/ComfyUI-OmniXPU
-ARG IMAGE_TAG="0.1.0-dev"
 RUN cd /llm/ComfyUI/custom_nodes/ComfyUI-OmniXPU && \
     git init && git add -A && \
     git -c user.name="llm-scaler" -c user.email="noreply@intel.com" \
@@ -257,8 +260,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # ext is AOT-compiled for OMNI_XPU_DEVICE (bmg = Arc B-series).
 RUN --mount=type=cache,target=/root/.cache/pip \
     export CUTLASS_SYCL_ROOT=/llm/sgl-kernel-xpu/build/_deps/repo-cutlass-sycl-src && \
+    export OMNI_XPU_REQUIRE_CUTE=1 && \
     export OMNI_XPU_DEVICE=bmg && \
     cd /tmp/omni_xpu_kernel && \
+    grep -Fqx "__version__ = \"${IMAGE_TAG}\"" omni_xpu_kernel/_version.py && \
     pip install . --no-build-isolation && \
     rm -rf /tmp/omni_xpu_kernel
 
@@ -275,6 +280,9 @@ ARG https_proxy
 ARG http_proxy
 ARG PYTHON_VERSION=3.12
 ARG ONEAPI_VERSION=2025.2.0-517
+ARG IMAGE_TAG
+
+LABEL org.opencontainers.image.version="${IMAGE_TAG}"
 
 # System packages
 RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
@@ -311,5 +319,6 @@ ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python${PYTHON_VERSION}/dist-
 ENV CCL_SYCL_ALLTOALL_ARC_LL=1
 ENV CCL_SYCL_CCL_BARRIER=1
 ENV OMNIXPU_INTERPOLATE_FIX=0
+ENV OMNI_IMAGE_VERSION="${IMAGE_TAG}"
 
 WORKDIR /llm/entrypoints

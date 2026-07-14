@@ -19,7 +19,8 @@ Usage::
 import os
 import sys
 
-__version__ = "0.1.0"
+from ._version import __version__
+
 __author__ = "Intel"
 
 # Lazy loading of native extension
@@ -60,9 +61,10 @@ from . import rotary
 from . import sdp
 from . import linear
 from . import int8
+from . import fp8
 
-# cute FMHA (CUTLASS-SYCL) is an optional backend — its AOT .so may be absent on
-# non-XPU / header-less installs, so import defensively.
+# cute FMHA (CUTLASS-SYCL) is required by default at build time. Import remains
+# defensive for explicit core-only/Windows builds and older installed wheels.
 try:
     from . import cute
 except Exception:  # pragma: no cover
@@ -76,7 +78,25 @@ __all__ = [
     "sdp",
     "linear",
     "int8",
+    "fp8",
     "cute",
     "is_available",
     "__version__",
 ]
+
+
+def native_capabilities() -> dict[str, tuple[str, ...]]:
+    """Return loaded native symbols, or an empty mapping when unavailable."""
+    try:
+        native = _load_extension()
+    except ImportError:
+        return {}
+    modules = ("fp8", "gguf", "norm", "svdq", "rotary", "sdp", "linear", "int8")
+    return {
+        name: tuple(sorted(item for item in dir(getattr(native, name)) if not item.startswith("_")))
+        for name in modules
+        if hasattr(native, name)
+    }
+
+
+__all__.append("native_capabilities")
