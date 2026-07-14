@@ -293,3 +293,18 @@ at::Tensor esimd_moe_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor scale,
     at::Tensor output, at::Tensor expert_idx,
     int64_t N, int64_t K, int64_t num_experts, int64_t max_tokens_per_expert);
+
+// ============================================================================
+// FP8/INT4 GEMM (v2, from custom-esimd-kernels-vllm) — used by the gemm ext.
+// Merged from include_gemm/kernel_ops.h so all extensions share one header.
+// ============================================================================
+
+// BMG-specific FP8 GEMV variant
+at::Tensor esimd_gemv_fp8_pert_bmg(
+    at::Tensor input, at::Tensor weight,
+    at::Tensor weight_scale, at::Tensor output);
+
+// INT4 GEMM (M >= 2) — per-group scale (group_size=128)
+at::Tensor esimd_gemm_int4_pgrp(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output);

@@ -283,8 +283,8 @@ ext_modules.append(
 #   moe_ops                        -> torch.ops.moe_ops                (FP8 MoE batch, silu routed)
 #   moe_fp8_prefill_ops            -> torch.ops.moe_fp8_prefill_ops    (FP8 M-tiled DPAS MoE prefill)
 #   custom_esimd_kernels_attn      -> torch.ops.sgl_esimd_attn + pybind (decode SDPA, flat NHD)
-# NOTE: kernel_ops.h for the gemm ext is the v2 variant kept under include_gemm/
-# (the sglang variant in include/ lacks esimd_gemm_int4_pgrp / *_bmg decls).
+# NOTE: the gemm ext's v2 decls (esimd_gemm_int4_pgrp / *_bmg) have been merged
+# into the shared include/kernel_ops.h, so all extensions now use one header.
 # ============================================================================
 
 ### FP8 GEMM (M>=2) + INT4 GEMM (DPAS) — from v2
@@ -296,7 +296,7 @@ ext_modules.append(
             "csrc/xpu/torch_extension_gemm.cc",
         ],
         include_dirs=[
-            root / "include_gemm",   # v2 kernel_ops.h (esimd_gemm_int4_pgrp, *_bmg)
+            root / "include",   # shared header (now incl. esimd_gemm_int4_pgrp, *_bmg)
             root / "csrc",
             root / "csrc" / "xpu",
         ],

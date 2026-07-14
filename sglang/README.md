@@ -7,10 +7,13 @@ Battlemage (BMG) GPUs with the optimized ESIMD kernel fast-paths.
 
 ```
 sglang/
-├── Dockerfile                       # builds the full image
+├── docker/
+│   └── Dockerfile                   # builds the full image
 ├── scripts/
-│   ├── build_image.sh               # wrapper around `docker build`
-│   └── run_qwen3_6.sh               # launches the TP=4 fp8 server
+│   ├── build_image.sh               # wrapper around `docker buildx build`
+│   ├── run_qwen3_6.sh               # launches the TP=2 fp8 server
+│   └── run_gsm8k.py                 # standalone GSM8K accuracy harness
+├── patches/                         # sglang / sgl-kernel-xpu source patches
 └── custom-esimd-kernels/            # merged ESIMD kernel package:
                                      #   decode attn, fp8 GEMM, fp8 MoE (silu + prefill),
                                      #   fused QKV, GDN conv fused_seq, RMSNormGated
@@ -26,8 +29,9 @@ vendor them.
 llm-scaler/sglang/scripts/build_image.sh
 ```
 
-The script forwards `http_proxy` / `https_proxy` from the environment and
-defaults the image tag to `llm-scaler-sgl:bmg` (override with `IMAGE_TAG=...`).
+The script resolves `docker/Dockerfile` relative to itself, forwards
+`http_proxy` / `https_proxy` from the environment, and bumps
+`SGLANG_CACHEBUST` each run. Override the tag with `IMAGE_TAG=...`.
 
 Time: ~25 min on a workstation (cold), dominated by the ESIMD AOT compile
 and the sgl-kernel-xpu cmake build.
@@ -57,14 +61,50 @@ BS=1, 1k-in / 256-out, fp16 + fp8 weights:
 
 Each is gated by an env var (set by `run_qwen3_6.sh`):
 
-| Env var                          | Path                                   |
-|----------------------------------|----------------------------------------|
-| `SGLANG_ENABLE_XPU_ESIMD_DECODE` | Decode SDPA (split-K, flat NHD KV)     |
-| `SGLANG_ENABLE_ESIMD_MOE`        | FP8 MoE silu routed kernel             |
-| `SGL_XPU_FA_ESIMD_QKV`           | Full-attention fused QKV+RMSNorm+RoPE  |
-| `SGL_XPU_GDN_ESIMD`              | GDN conv fused_seq decode              |
-| `SGLANG_XPU_ENABLE_GRAPH`        | XPU device-graph capture/replay        |
+| Env var                            | Path                                   |
+|------------------------------------|----------------------------------------|
+| `SGLANG_ENABLE_XPU_ESIMD_DECODE`   | Decode SDPA (split-K, flat NHD KV)     |
+| `SGLANG_ENABLE_ESIMD_MOE`          | FP8 MoE silu routed kernel             |
+| `SGLANG_ENABLE_ESIMD_MOE_PREFILL`  | FP8 MoE prefill (M-tiled DPAS)         |
+| `SGL_XPU_FA_ESIMD_QKV`             | Full-attention fused QKV+RMSNorm+RoPE  |
+| `SGL_XPU_GDN_ESIMD`                | GDN conv fused_seq decode              |
+| `SGL_XPU_GDN_EXTEND_ESIMD`         | GDN chunk_gated_delta_rule prefill     |
+| `SGL_XPU_PREFILL_DPAS`             | Prefill SDPA via DPAS/XMX              |
+| `SGLANG_XPU_ENABLE_GRAPH`          | XPU device-graph capture/replay        |
+
+> **Note:** the GDN/FA gates must use the legacy `SGL_XPU_*` names — the newer
+> `SGLANG_XPU_*` aliases fail silently.
 
 In addition `SGLANG_MAMBA_{CONV,SSM}_DTYPE=float16` is required when running
 the model with `--dtype float16` so the mamba state pool matches activation
 dtype (the triton causal_conv1d_update kernel rejects mismatches).
+
+## Accuracy check (GSM8K)
+
+`scripts/run_gsm8k.py` is a standalone harness (stdlib only) that hits the
+running server's OpenAI-compatible endpoint with full sampling-parameter
+control, then reports accuracy and classifies failures
+(correct / wrong_answer / empty_output / runaway_len / error).
+
+```bash
+# non-thinking chat, greedy, 200 questions (cleanest kernel-debug signal)
+python3 scripts/run_gsm8k.py \
+    --base-url http://localhost:30000 \
+    --num-questions 200 \
+    --no-thinking \
+    --temperature 0
+
+# thinking mode with the Qwen3-recommended sampling params
+python3 scripts/run_gsm8k.py \
+    --base-url http://localhost:30000 \
+    --num-questions 200 \
+    --thinking \
+    --temperature 0.6 --top-p 0.95 --top-k 20 --repetition-penalty 1.05
+```
+
+Key flags: `--thinking/--no-thinking` (explicitly sets `enable_thinking`),
+`--chat-stop/--no-chat-stop` (adds `Question:` stops to prevent fake-question
+continuation), `--api chat|completion`, plus the full sampling set
+(`--temperature --top-p --top-k --min-p --repetition-penalty
+--frequency-penalty --presence-penalty --max-tokens`). Outputs
+`<prefix>_examples.jsonl` and `<prefix>_summary.txt`.

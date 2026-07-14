@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Launch SGLang server for Qwen3.6-35B-A3B online fp8 on Intel BMG, TP=2.
 #
-# All ESIMD fast-paths enabled + XPU Graph capture.
-# Required env knobs are documented inline.
+# Golden fp8 + full-ESIMD + XPU-graph config (matches the sgl-fp8-perf setup).
+# All ESIMD fast-paths + prefill fast-paths enabled. Required env knobs are
+# documented inline.
 
 set -euo pipefail
 
@@ -17,11 +18,22 @@ MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.9}"
 # them as XPU 0,1 so TP=2 maps onto exactly these two devices.
 export ZE_AFFINITY_MASK="${ZE_AFFINITY_MASK:-2,3}"
 
+# --- triton-xpu fp16 mismatch workaround ---
+# Mamba state pool defaults to bf16; force fp16 so it matches the activation
+# dtype when running --dtype float16 (otherwise causal_conv1d_update kernel
+# fails with "Mismatched type for col0 (bf16 vs fp16)").
+export SGLANG_MAMBA_CONV_DTYPE=float16
+export SGLANG_MAMBA_SSM_DTYPE=float16
+
 # --- ESIMD fast-path gates ---
+# NOTE: GDN/FA gates MUST use the legacy SGL_XPU_* names; the newer
+# SGLANG_XPU_* aliases fail silently.
 # decode attn split-K (sglang_decode_attn): mandatory for online perf
 export SGLANG_ENABLE_XPU_ESIMD_DECODE=1
 # MoE silu routed kernel (replaces triton fused_moe on XPU)
 export SGLANG_ENABLE_ESIMD_MOE=1
+# MoE prefill ESIMD (M-tiled DPAS fp8 MoE prefill)
+export SGLANG_ENABLE_ESIMD_MOE_PREFILL=1
 # Full-attention fused QKV split + RMSNorm + RoPE (Qwen3.5/3.6)
 export SGL_XPU_FA_ESIMD_QKV=1
 # GDN conv fused_seq for the linear-attention decode path
@@ -31,13 +43,8 @@ export SGL_XPU_GDN_ESIMD=1
 # bottleneck (~6.7x TTFT speedup, 13s->2s at 2k tokens). The kernel was
 # extended to accept fp16 ssm-state to match this fp16 model's mamba pool.
 export SGL_XPU_GDN_EXTEND_ESIMD=1
-
-# --- triton-xpu fp16 mismatch workaround ---
-# Mamba state pool defaults to bf16; force fp16 so it matches the activation
-# dtype when running --dtype float16 (otherwise causal_conv1d_update kernel
-# fails with "Mismatched type for col0 (bf16 vs fp16)").
-export SGLANG_MAMBA_CONV_DTYPE=float16
-export SGLANG_MAMBA_SSM_DTYPE=float16
+# Prefill SDPA via DPAS/XMX (AOT-compiled, doubleGRF)
+export SGL_XPU_PREFILL_DPAS=1
 
 # --- XPU Graph (CUDA-graph-equivalent) ---
 # Captures the decode forward graph for ~3x TPOT speedup at BS=1.
@@ -45,27 +52,27 @@ export SGLANG_MAMBA_SSM_DTYPE=float16
 # replay on sequences > 16384 tokens (kernel MAX_SPLITS cap).
 export SGLANG_XPU_ENABLE_GRAPH=1
 
-# --- python path for vendored ESIMD package ---
-# Setup.py at /workspace/custom-esimd-kernels/setup.py installs the single
-# merged custom_esimd_kernels_sglang package; nothing extra to set normally.
-
-# --disable-radix-cache: the MambaRadixCache prefix-cache path can deadlock
-# the TP schedulers on this hybrid GDN model (cache_prefix / zero-token
-# prefill insert spins the cross-rank sync). Disabling it keeps the server
-# stable for multi-request workloads; per-request decode perf is unaffected.
 # --load-format layered_fp8: build on CPU, load the full bf16 checkpoint into
 # host RAM, then move + quantize each module onto the device one at a time.
 # Peak device memory is fp8 weights + one module's bf16, so a TP=2 split
 # (only two cards) fits where the default loader would OOM on the full bf16.
+# --mamba-scheduler-strategy extra_buffer + --page-size 64: hybrid GDN
+# scheduler tuning that keeps the radix prefix-cache stable on this model
+# (so radix cache is left ENABLED for prefill reuse).
 exec python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
     --tp "${TP_SIZE}" \
     --dtype float16 \
     --quantization fp8 \
     --load-format layered_fp8 \
-    --attention-backend triton \
+    --attention-backend intel_xpu \
     --trust-remote-code \
-    --disable-radix-cache \
     --mem-fraction-static "${MEM_FRACTION_STATIC}" \
+    --max-mamba-cache-size 64 \
+    --page-size 64 \
+    --mamba-scheduler-strategy extra_buffer \
+    --reasoning-parser qwen3 \
+    --enable-cache-report \
+    --enable-metrics \
     --host "${HOST}" \
     --port "${PORT}"
