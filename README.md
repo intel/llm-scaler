@@ -102,6 +102,10 @@ Please follow the instructions in the [Getting Started](vllm/README.md/#1-gettin
 | ByteDance-Seed/UI-TARS-7B-DPO              |  ✅  |         ✅         |          ✅          |       |                           |
 | google/gemma-3-12b-it                      |      |         ✅         |                      |       |  use bfloat16  |
 | google/gemma-3-27b-it                      |      |         ✅         |                      |       |  use bfloat16  |
+| google/gemma-4-12B-it                      |      |         ✅         |          ✅         |       |see [Reference Commands](vllm/README.md/#33-reference-commands-for-running-gemma-4-models-and-diffusiongemma)                            |
+| google/gemma-4-31B-it                      |      |         ✅         |          ✅         |       |                            |
+| google/gemma-4-26B-A4B-it                  |      |         ✅         |          ✅         |       |                            |
+| google/diffusiongemma-26B-A4B-it           |      |         ✅         |          ✅         |       |see [Reference Commands](vllm/README.md/#33-reference-commands-for-running-gemma-4-models-and-diffusiongemma)                            |
 | THUDM/GLM-4v-9B                            |  ✅  |         ✅         |          ✅         |       |  with --hf-overrides and chat_template  |
 | zai-org/GLM-4.1V-9B-Base                   |  ✅  |         ✅         |          ✅          |       |                           |
 | zai-org/GLM-4.1V-9B-Thinking               |  ✅  |         ✅         |          ✅          |       |                           |

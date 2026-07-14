@@ -1155,6 +1155,10 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | ByteDance-Seed/UI-TARS-7B-DPO              |  ✅  |         ✅         |          ✅          |       |                           |
 | google/gemma-3-12b-it                      |      |         ✅         |                      |       |  use bfloat16  |
 | google/gemma-3-27b-it                      |      |         ✅         |                      |       |  use bfloat16  |
+| google/gemma-4-12B-it                      |      |         ✅         |          ✅         |       | see [Reference Commands](#33-reference-commands-for-running-gemma-4-models-and-diffusiongemma)     |
+| google/gemma-4-31B-it                      |      |         ✅         |          ✅         |       |                            |
+| google/gemma-4-26B-A4B-it                  |      |         ✅         |          ✅         |       |                            |
+| google/diffusiongemma-26B-A4B-it           |      |         ✅         |          ✅         |       | see [Reference Commands](#33-reference-commands-for-running-gemma-4-models-and-diffusiongemma)                            |
 | THUDM/GLM-4v-9B                            |  ✅  |         ✅         |          ✅         |       |  with --hf-overrides and chat_template  |
 | zai-org/GLM-4.1V-9B-Base                   |  ✅  |         ✅         |          ✅          |       |                           |
 | zai-org/GLM-4.1V-9B-Thinking               |  ✅  |         ✅         |          ✅          |       |                           |
@@ -1257,6 +1261,35 @@ Please note the performance will vary according to the combinations of these par
 --random-output-len
 ```
 
+### 3.3 Reference commands for running gemma-4 models and diffusiongemma
+
+The gemma-4 models (12B-it, 31B-it and 26B-A4B-it) and diffusiongemma-26B-A4B-it online fp8 and sym_int4 quantization is supported since `intel/llm-scaler-vllm:0.21.0-b1` release. 
+
+Reference commands for running gemma-4-12B-it model with fp8 quantization: 
+
+```bash
+export ZE_AFFINITY_MASK=0 
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 
+export VLLM_WORKER_MULTIPROC_METHOD=spawn 
+export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 
+
+vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-tokens 8192 --max-model-len 90000 --block-size 64 --dtype float16 --mamba-ssm-cache-dtype float16 --model /llm/models/gemma-4-12B-it/ --served-model-name gemma-4-12B-it --tensor-parallel-size 1 --quantization fp8 --trust-remote-code 
+```
+
+Reference commands for running diffusiongemma-26B-A4B-it model with fp8 quantization: 
+
+```bash 
+export ZE_AFFINITY_MASK=0,1
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
+export VLLM_INT4_GROUP_SIZE=32 
+export VLLM_USE_V2_MODEL_RUNNER=1 
+export VLLM_USE_V1=1 
+export DGEMMA_FUSED_CAUSAL=1 
+
+vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.8 --max-num-batched-tokens 8192 --max-model-len 90000 --block-size 64 --dtype float16 --mamba-ssm-cache-dtype float16 --model /llm/models/diffusiongemma-26B-A4B-it/ --served-model-name diffusiongemma-26B-A4B-it --tensor-parallel-size 2 --quantization fp8 --max-num-seqs 4 --attention-backend FLASH_ATTN --diffusion-config '{"canvas_length":256,"max_denoising_steps":16}' --hf-overrides '{"diffusion_sampler":"entropy_bound","diffusion_entropy_bound":0.1,"diffusion_confidence_threshold":0.0}' --trust-remote-code 
+```
 
 ## 4. Troubleshooting
 
