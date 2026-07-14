@@ -16,6 +16,7 @@ ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 ENV http_proxy=${http_proxy} https_proxy=${https_proxy} no_proxy=${no_proxy}
 ENV TORCH_XPU_ARCH_LIST=${DPCPP_SYCL_TARGET}
 ENV OMNI_XPU_DEVICE=${DPCPP_SYCL_TARGET}
+ENV UV_BREAK_SYSTEM_PACKAGES=1
 ENV MAX_JOBS=1
 
 # Pinned to upstream (sgl-project) releases/commits instead of the
@@ -33,12 +34,13 @@ ARG SGL_KERNEL_UPSTREAM_COMMIT=ea5c70f0909bcd55ceaf1803302651fc0593b64d
 WORKDIR /llm-scaler/sglang
 COPY . .
 
-# --- System packages + pip base setup ---
+# --- System packages + pip/uv base setup ---
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3-pip python3-dev git ninja-build \
  && python3 -m pip config set global.break-system-packages true \
- && pip3 install ninja \
- && pip3 install torch==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu \
+ && pip3 install uv \
+ && uv pip install --system ninja \
+ && uv pip install --system torch==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu \
  && rm -rf /root/.cache /root/.cmake /tmp/* /var/tmp/* /var/lib/apt/lists/*
 
 # --- Build sgl-kernel-xpu wheel ---
@@ -115,10 +117,15 @@ RUN --mount=type=bind,from=builder,source=/root/wheels,target=/tmp/wheels \
         libze-dev \
  # --- Python deps: pre-built wheels + explicit runtime deps sglang needs ---
  && python3 -m pip config set global.break-system-packages true \
- && pip3 install /tmp/wheels/*.whl --extra-index-url https://download.pytorch.org/whl/xpu \
- && pip3 install --no-deps xgrammar==0.1.33 || true \
+ && pip3 install uv \
+ && uv pip install --python /opt/venv/bin/python \
+        /tmp/wheels/*.whl \
+        --extra-index-url https://download.pytorch.org/whl/xpu \
+ && uv pip install --python /opt/venv/bin/python \
+        --no-deps xgrammar==0.1.33 || true \
  # --- runtime helpers (eval scripts: gsm8k, etc.) ---
- && pip3 install pytest expecttest ray huggingface_hub \
+ && uv pip install --python /opt/venv/bin/python \
+        pytest expecttest ray huggingface_hub \
  && chmod +x /llm-scaler/sglang/scripts/*.sh \
  # --- Size cleanup: drop caches + bytecode ---
  && find /opt/venv /usr/local/lib/python3* -name "*.pyc" -delete 2>/dev/null || true \
@@ -127,5 +134,5 @@ RUN --mount=type=bind,from=builder,source=/root/wheels,target=/tmp/wheels \
  && find /tmp -mindepth 1 -maxdepth 1 ! -name wheels -exec rm -rf {} + \
  && rm -rf /root/.cache /root/.cmake /var/tmp/* /var/lib/apt/lists/*
 
-WORKDIR /workspace
-CMD ["bash"]
+WORKDIR /llm-scaler/sglang
+ENTRYPOINT ["bash", "-c", "exec sglang serve \"$@\"", "--"]
