@@ -202,7 +202,9 @@ std::optional<int64_t> select_chunk_n_for_shape(
     if (m == 4608 && k == 4096) {
         if (n == 16384) {
             if (input_type == ST::Half) {
-                return int64_t{512};
+                // oneDNN 3.9 cannot create the f16 primitive for N=512 on
+                // BMG (register bundle exhaustion); N=256 is stable.
+                return int64_t{256};
             }
             return int64_t{4096};
         }

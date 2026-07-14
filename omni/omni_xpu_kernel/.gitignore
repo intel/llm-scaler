@@ -14,6 +14,9 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+wheelhouse/
+.uv-wheel-matrix/
+*.whl
 downloads/
 eggs/
 .eggs/

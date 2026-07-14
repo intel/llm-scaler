@@ -14,7 +14,7 @@ Requires `omni_xpu_kernel` installed. Without it the node loads silently with no
 
 | Patch | Target |
 |-------|--------|
-| ESIMD Flash Attention | `optimized_attention` |
+| Auto-routed cute/ESIMD Attention | `optimized_attention` |
 | ESIMD RoPE | `_apply_rope1` / `apply_rope1` / `apply_rope` (flux.math dual-tensor) |
 | ESIMD LayerNorm/RMSNorm | `LayerNorm.forward` / `RMSNorm.forward` / `rms_norm()` |
 | FP8 GEMM | `fp8_linear` / `mixed_precision_ops` |
@@ -29,7 +29,7 @@ All patches enabled by default. Disable with `=0`:
 
 ```bash
 OMNIXPU_ENABLE=0            # Master switch — disable everything
-OMNIXPU_ATTENTION=0         # Disable ESIMD Flash Attention only
+OMNIXPU_ATTENTION=0         # Disable the XPU attention patch only
 OMNIXPU_ROPE=0              # Disable ESIMD RoPE only
 OMNIXPU_NORM=0              # Disable ESIMD LayerNorm/RMSNorm only
 OMNIXPU_KREA2_RMSNORM=0     # Disable the Krea2-specific local RMSNorm hook only
@@ -39,6 +39,22 @@ OMNIXPU_FP8_NEG_ZERO_FIX=0  # Disable FP8 negative zero fix only
 OMNIXPU_INTERPOLATE_FIX=0   # Disable interpolate workaround only
 OMNIXPU_MEDIAN_FIX=0        # Disable median workaround only
 ```
+
+Attention routing is selected independently:
+
+```bash
+OMNI_ATTN_BACKEND=auto   # default: cute d128 self-attn, then ESIMD, then PyTorch
+OMNI_ATTN_BACKEND=cute   # force cute where supported; otherwise PyTorch
+OMNI_ATTN_BACKEND=esimd  # force ESIMD where supported; otherwise PyTorch
+OMNI_ATTN_BACKEND=torch  # keep the original PyTorch attention path
+```
+
+With `auto`, CUTE handles its validated B=1, unmasked, standard-scale d128
+self-attention domain. Supported d64 and cross-attention calls use ESIMD.
+Masked attention, other batch sizes or head dimensions, GQA, custom scaling,
+and any unsupported shape fall back to the original PyTorch implementation.
+Explicit `cute` and `esimd` select only that fused backend and still use the
+safe PyTorch fallback outside its supported domain.
 
 `OMNIXPU_MEDIAN_STRICT_INDICES=1` makes the median workaround reproduce
 `torch.median`'s exact tie-break indices (values are always bit-exact).
@@ -52,7 +68,7 @@ Add the **OmniXPU Status** node to any workflow to see:
 ```
 === ComfyUI-OmniXPU Status ===
   GPU: Intel(R) Arc(TM) B580 Graphics (11605 MB)
-  omni_xpu_kernel: 0.1.0
+  omni_xpu_kernel: 0.1.0-b8-dev
     available: sdp, norm, rotary, linear_fp8
 
   [+] interpolate_fix: applied
@@ -69,13 +85,14 @@ Add the **OmniXPU Status** node to any workflow to see:
 When loaded successfully, ComfyUI logs:
 
 ```
-[OmniXPU] omni_xpu_kernel 0.1.0 — available: sdp, norm, rotary, linear_fp8
+[OmniXPU] omni_xpu_kernel 0.1.0-b8-dev — available: sdp, norm, rotary, linear_fp8
 [OmniXPU] interpolate_fix: applied
 [OmniXPU] median_fix: applied
 [OmniXPU] fp8_neg_zero_fix: applied
 [OmniXPU] norm: applied
 [OmniXPU] rope: applied
 [OmniXPU] fp8_gemm: applied
+[OmniXPU] attention[cute]: rebound 45 by-value imports across sys.modules
 [OmniXPU] attention: applied
 [OmniXPU] INT8: registered XPU impl for comfy_kitchen::int8_linear
 [OmniXPU] int8: applied
@@ -96,5 +113,5 @@ No ComfyUI core files are modified. Works with unmodified upstream ComfyUI.
 
 - ComfyUI >= 0.18.x (>= 0.27.0 for INT8 ConvRot model support)
 - PyTorch >= 2.7 with XPU support
-- `omni_xpu_kernel` >= 0.1.0
+- `omni_xpu_kernel` >= 0.1.0b8.dev0 (Omni image `0.1.0-b8-dev`)
 - `comfy_kitchen` >= 0.2.8 (for INT8 custom ops)
