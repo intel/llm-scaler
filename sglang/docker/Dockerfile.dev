@@ -1,0 +1,177 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Single-stage DEV build of SGLang on Intel BMG (Battlemage).
+#
+# This follows the production Dockerfile's build and installation flow:
+#   1. Build sgl-kernel-xpu as a wheel.
+#   2. Build SGLang as a wheel.
+#   3. Build custom ESIMD kernels as a wheel.
+#   4. Install all pre-built wheels together.
+#
+# The main differences from production are:
+#   * one stage based on the OMIX development image
+#   * oneAPI compiler and development environment remain available
+#   * cloned sources, build outputs, wheels, caches, and debug symbols remain
+#   * uv is used for Python package installation
+#
+# Build context root MUST be the `sglang/` directory.
+
+FROM intel/omix:0.1.0-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy=localhost,127.0.0.1,::1
+# AOT-compile ESIMD kernels for BMG only (skip multi-arch fat binaries
+# that would pull in dpas v128 paths unsupported on XeLPG).
+ARG DPCPP_SYCL_TARGET=bmg
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV http_proxy=${http_proxy} https_proxy=${https_proxy} no_proxy=${no_proxy}
+ENV TORCH_XPU_ARCH_LIST=${DPCPP_SYCL_TARGET}
+ENV OMNI_XPU_DEVICE=${DPCPP_SYCL_TARGET}
+ENV UV_BREAK_SYSTEM_PACKAGES=1
+ENV MAX_JOBS=1
+
+# Pinned to upstream (sgl-project) releases/commits instead of the
+# analytics-zoo dev-bmg forks. All BMG-specific changes are carried as
+# patches under ./patches/ (see "Build sgl-kernel-xpu wheel" and "Build
+# sglang wheel" below) and applied with `git apply` after checkout, so the
+# exact upstream base is pinned and reproducible.
+ARG SGLANG_UPSTREAM_REPO=https://github.com/sgl-project/sglang.git
+ARG SGLANG_UPSTREAM_TAG=v0.5.13
+ARG SGL_KERNEL_UPSTREAM_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
+# sgl-kernel-xpu has no release tags; pin to the exact upstream/main commit
+# the analytics-zoo/dev-bmg fork was branched from.
+ARG SGL_KERNEL_UPSTREAM_COMMIT=ea5c70f0909bcd55ceaf1803302651fc0593b64d
+
+SHELL ["bash", "-c"]
+
+WORKDIR /llm-scaler/sglang
+COPY . .
+
+# ---------------------------------------------------------------------------
+# System build/runtime packages and uv.
+#
+# The OMIX development image already contains the oneAPI compiler and Intel GPU
+# runtime, so the production runtime stage's external graphics PPA installation
+# is not needed here.
+# ---------------------------------------------------------------------------
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends --fix-missing \
+        git curl ca-certificates \
+        python3-dev python3-venv python3-pip \
+        ninja-build cmake pkg-config numactl \
+        ffmpeg libsndfile1 libsm6 libxext6 libgl1 \
+        gdb vim less htop procps
+    curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    mkdir -p ${WHEELS}
+
+# Install the same Torch version used by the production runtime.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system \
+        torch==2.11.0+xpu \
+        --index-url https://download.pytorch.org/whl/xpu && \
+    uv pip install --system ninja
+
+# ---------------------------------------------------------------------------
+# Build sgl-kernel-xpu wheel.
+#
+# Keep the patched source tree and all build outputs in this dev image.
+# ---------------------------------------------------------------------------
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eo pipefail && \
+    source /opt/intel/oneapi/setvars.sh --force && \
+    git clone ${SGL_KERNEL_UPSTREAM_REPO} /llm-scaler/sglang/sgl-kernel-xpu && \
+    cd /llm-scaler/sglang/sgl-kernel-xpu && \
+    git checkout ${SGL_KERNEL_UPSTREAM_COMMIT} && \
+    git apply --whitespace=nowarn \
+        /llm-scaler/sglang/patches/sgl_kernel_xpu.patch && \
+    python3 -m pip wheel -v . \
+        --config-settings=cmake.define.DPCPP_SYCL_TARGET=${DPCPP_SYCL_TARGET} \
+        --wheel-dir ${WHEELS} \
+        --no-deps \
+        --break-system-packages
+
+# ---------------------------------------------------------------------------
+# Build SGLang wheel.
+#
+# This intentionally remains a wheel build, matching the production
+# Dockerfile. It is not converted to an editable installation.
+# ---------------------------------------------------------------------------
+ARG SGLANG_CACHEBUST=0
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eo pipefail && \
+    source /opt/intel/oneapi/setvars.sh --force && \
+    echo "Refreshing sglang ${SGLANG_UPSTREAM_TAG} + BMG patch (cache bust ${SGLANG_CACHEBUST})" && \
+    git clone --depth 1 \
+        -b ${SGLANG_UPSTREAM_TAG} \
+        ${SGLANG_UPSTREAM_REPO} \
+        /llm-scaler/sglang/sglang && \
+    cd /llm-scaler/sglang/sglang && \
+    git apply --whitespace=nowarn \
+        /llm-scaler/sglang/patches/sglang_for_multi_arc.patch && \
+    cd /llm-scaler/sglang/sglang/python && \
+    cp pyproject_xpu.toml pyproject.toml && \
+    sed -i \
+        '/sgl-kernel/d;/torch==/d;/torchaudio==/d;/torchvision==/d;/torchao==/d' \
+        pyproject.toml && \
+    python3 -m pip wheel -v . \
+        --wheel-dir ${WHEELS} \
+        --no-deps \
+        --break-system-packages
+
+# ---------------------------------------------------------------------------
+# Build custom ESIMD kernels wheel.
+#
+# The source tree is already present from COPY. Build outputs are intentionally
+# retained for development and debugging.
+# ---------------------------------------------------------------------------
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eo pipefail && \
+    source /opt/intel/oneapi/setvars.sh --force && \
+    cd /llm-scaler/sglang/custom-esimd-kernels && \
+    CXX=icpx python3 -m pip wheel -v . \
+        --wheel-dir ${WHEELS} \
+        --no-deps \
+        --no-build-isolation \
+        --break-system-packages
+
+# ---------------------------------------------------------------------------
+# Install all pre-built wheels together, matching the production Dockerfile.
+#
+# uv replaces pip for package installation. The wheel build commands above
+# continue to use `pip wheel`; they build artifacts but do not install them.
+# ---------------------------------------------------------------------------
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eo pipefail && \
+    uv pip install --system \
+        ${WHEELS}/*.whl \
+        --extra-index-url https://download.pytorch.org/whl/xpu && \
+    uv pip install --system --no-deps xgrammar==0.1.33 || true
+
+# Runtime and evaluation helpers from the production image.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eo pipefail && \
+    uv pip install --system \
+        pytest \
+        expecttest \
+        ray \
+        huggingface_hub && \
+    chmod +x /llm-scaler/sglang/scripts/*.sh
+
+# Keep wheels, source trees, build directories, caches, bytecode, and debug
+# symbols. Print an inventory for build-log validation.
+RUN echo "Built wheels:" && \
+    ls -la ${WHEELS} && \
+    echo "Installed components:" && \
+    uv pip list --system | \
+        grep -iE "^(sglang|sgl-kernel|custom-esimd|torch|triton|transformers|xgrammar)" \
+        || true
+
+# Interactive development shell. The OMIX base configures the oneAPI
+# environment for login-shell workflows.
+CMD ["/bin/bash", "-l"]
