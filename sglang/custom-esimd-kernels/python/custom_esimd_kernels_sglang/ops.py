@@ -351,6 +351,7 @@ def esimd_qkv_split_norm_rope(
     attn_output_gate: bool,
     rotary_dim: int = 256,
     cos_sin_cache: torch.Tensor = None,
+    normalize_v: bool = False,
 ) -> torch.Tensor:
     """Fused QKV Split + RMSNorm(weight+1.0, eps=1e-6) + RoPE.
 
@@ -364,12 +365,14 @@ def esimd_qkv_split_norm_rope(
     rotary_dim:    number of dimensions to apply RoPE.
     cos_sin_cache: [max_pos, rotary_dim] fp16 — from rotary_emb.cos_sin_cache.
                    Layout: [cos(rotary_dim/2), sin(rotary_dim/2)] per row.
+    normalize_v:   apply Gemma4's weight-free RMSNorm to V.
     headDim=256 only.
     """
     return _ops.esimd_qkv_split_norm_rope(
         qkv_state, q_out, gate_out, k_out, v_out,
         norm_wq, norm_wk, positions,
-        q_heads, kv_heads, attn_output_gate, rotary_dim, cos_sin_cache)
+        q_heads, kv_heads, attn_output_gate, rotary_dim, cos_sin_cache,
+        normalize_v)
 
 
 # ---- Fused Conv1d + GDN (doubleGRF, LGRF module) ----
@@ -1704,3 +1707,70 @@ def sglang_decode_attn_temp_size(batches: int, num_q_heads: int, max_seq_len: in
     n_splits = max((max_seq_len + SPLIT_TILE - 1) // SPLIT_TILE, 1)
     per_partial = batches * num_q_heads * n_splits
     return per_partial * (1 + 1 + 256)
+
+
+def esimd_gemv_fp16(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    return _ops.esimd_gemv_fp16(input, weight, output)
+
+
+def esimd_norm_add_norm(
+    h2_raw: torch.Tensor,
+    h1: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    out: torch.Tensor,
+    eps1: float,
+    eps2: float,
+) -> None:
+    _ops.esimd_norm_add_norm(h2_raw, h1, w1, w2, out, eps1, eps2)
+
+
+def esimd_kv_scatter(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+) -> None:
+    _ops.esimd_kv_scatter(k, v, k_cache, v_cache, indices)
+
+
+def esimd_rmsnorm_residual_scalar(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    residual: torch.Tensor,
+    output: torch.Tensor,
+    eps: float,
+    scalar: float,
+) -> torch.Tensor:
+    return _ops.esimd_rmsnorm_residual_scalar(
+        x, weight, residual, output, eps, scalar
+    )
+
+
+def splitk_decode_attention(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor,
+    scratch: torch.Tensor,
+    max_seq_len: int,
+    num_splits: int,
+) -> None:
+    _eagle_ops.splitk_decode_attention(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        out,
+        scratch,
+        max_seq_len,
+        num_splits,
+    )

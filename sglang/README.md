@@ -1,7 +1,7 @@
 # SGLang on Intel BMG
 
-End-to-end recipe for running Qwen3.6-35B-A3B online fp8 inference on Intel
-Battlemage (BMG) GPUs with the optimized ESIMD kernel fast-paths.
+End-to-end recipe for running Qwen3.6-35B-A3B and Gemma4-31B online FP8
+inference on Intel Battlemage (BMG) GPUs with optimized ESIMD kernels.
 
 ## What's in here
 
@@ -12,11 +12,12 @@ sglang/
 ├── scripts/
 │   ├── build_image.sh               # wrapper around `docker buildx build`
 │   ├── run_qwen3_6.sh               # launches the TP=2 fp8 server
+│   ├── run_gemma4_31b.sh             # launches Gemma4 TP=2 in eager mode
 │   └── run_gsm8k.py                 # standalone GSM8K accuracy harness
 ├── patches/                         # sglang / sgl-kernel-xpu source patches
 └── custom-esimd-kernels/            # merged ESIMD kernel package:
                                      #   decode attn, fp8 GEMM, fp8 MoE (silu + prefill),
-                                     #   fused QKV, GDN conv fused_seq, RMSNormGated
+                                     #   fused QKV, GDN, Gemma4 dense decode kernels
 ```
 
 
@@ -42,8 +43,25 @@ docker run --rm -it \
     -v /home/intel/LLM/models/Qwen3.6-35B-A3B:/models/Qwen3.6-35B-A3B:ro \
     -p 30000:30000 \
     llm-scaler-sgl:bmg \
-    /workspace/scripts/run_qwen3_6.sh
+    /llm-scaler/sglang/scripts/run_qwen3_6.sh
 ```
+
+Gemma4-31B uses TP=2 and eager execution because XPU graph capture is not
+supported for this model with TP collectives:
+
+```bash
+docker run --rm -it \
+    --device=/dev/dri \
+    --shm-size=16g \
+    -v /home/intel/LLM/models/gemma-4-31B-it:/models/gemma-4-31B-it:ro \
+    -p 30000:30000 \
+    llm-scaler-sgl:bmg \
+    /llm-scaler/sglang/scripts/run_gemma4_31b.sh
+```
+
+Set `SPECULATIVE_DRAFT_MODEL_PATH` to enable the validated NEXTN configuration
+with top-k 1. The Gemma4 recipe intentionally does not depend on locally built
+development extensions.
 
 ## Fast-paths enabled
 
@@ -51,16 +69,14 @@ Each is gated by an env var (set by `run_qwen3_6.sh`):
 
 | Env var                            | Path                                   |
 |------------------------------------|----------------------------------------|
-| `SGL_XPU_ESIMD_DECODE`             | Decode SDPA (split-K, flat NHD KV)     |
-| `SGL_XPU_ESIMD_MOE`                | FP8 MoE silu routed kernel             |
-| `SGL_XPU_ESIMD_MOE_PREFILL`        | FP8 MoE prefill (M-tiled DPAS)         |
+| `SGLANG_ENABLE_XPU_ESIMD_DECODE`   | Decode SDPA (split-K, flat NHD KV)     |
+| `SGLANG_ENABLE_ESIMD_MOE`          | FP8 MoE silu routed kernel             |
+| `SGLANG_ENABLE_ESIMD_MOE_PREFILL`  | FP8 MoE prefill (M-tiled DPAS)         |
 | `SGL_XPU_FA_ESIMD_QKV`             | Full-attention fused QKV+RMSNorm+RoPE  |
 | `SGL_XPU_GDN_ESIMD`                | GDN conv fused_seq decode              |
 | `SGL_XPU_GDN_EXTEND_ESIMD`         | GDN chunk_gated_delta_rule prefill     |
 | `SGL_XPU_PREFILL_DPAS`             | Prefill SDPA via DPAS/XMX              |
-| `SGL_XPU_ENABLE_GRAPH`             | XPU device-graph capture/replay        |
-
-> **Note:** all ESIMD/XPU fast-path gates use the `SGL_XPU_*` prefix.
+| `SGLANG_XPU_ENABLE_GRAPH`          | XPU device-graph capture/replay        |
 
 In addition `SGLANG_MAMBA_{CONV,SSM}_DTYPE=float16` is required when running
 the model with `--dtype float16` so the mamba state pool matches activation

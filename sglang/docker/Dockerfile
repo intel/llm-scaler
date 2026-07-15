@@ -80,6 +80,7 @@ RUN echo "Refreshing sglang ${SGLANG_UPSTREAM_TAG} + BMG patch (cache bust ${SGL
 # be two separate flavours (custom-esimd-kernels + custom-esimd-kernels-sglang):
 #   * decode SDPA, FP8 GEMM, FP8 MoE silu, FP8 MoE prefill, prefill DPAS (was v2)
 #   * Qwen3.5/3.6 fused QKV, GDN conv fused_seq, RMSNormGated (was -sglang)
+#   * Gemma4 GQA2/split-K attention, FP16 GEMV, fused norms, and KV scatter
 RUN . /opt/intel/oneapi/setvars.sh --force \
  && cd /llm-scaler/sglang/custom-esimd-kernels \
  && CXX=icpx pip3 wheel -v . --wheel-dir /root/wheels --no-deps --no-build-isolation \
