@@ -107,7 +107,6 @@ _EXPORTS = [
     "esimd_moe_gemm_fp8_pert",
     "esimd_gemm_fp8_pert",
     "esimd_gemm_int4_pgrp",
-    # Gemma4 dense decode ops
     "esimd_gemv_fp16",
     "esimd_norm_add_norm",
     "esimd_kv_scatter",
