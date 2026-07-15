@@ -116,7 +116,7 @@ TORCH_LIBRARY(custom_esimd_kernels_sglang, m) {
         "Tensor q_out, Tensor gate_out, Tensor k_out, Tensor v_out, "
         "Tensor norm_wq, Tensor norm_wk, Tensor positions, "
         "int q_heads, int kv_heads, bool attn_output_gate, "
-        "int rotary_dim, Tensor cos_sin_cache) -> Tensor");
+        "int rotary_dim, Tensor cos_sin_cache, bool normalize_v) -> Tensor");
   m.impl("esimd_qkv_split_norm_rope", torch::kXPU, &esimd_qkv_split_norm_rope);
 
   // Fused ResidualAdd + RMSNorm + FP8 GEMV (post_attn_norm + router)
@@ -162,6 +162,21 @@ TORCH_LIBRARY(custom_esimd_kernels_sglang, m) {
   m.def("esimd_fused_add_rms_norm_batched(Tensor hidden_states, Tensor residual, "
         "Tensor weight, float eps) -> Tensor");
   m.impl("esimd_fused_add_rms_norm_batched", torch::kXPU, &esimd_fused_add_rms_norm_batched);
+
+  m.def("esimd_gemv_fp16(Tensor input, Tensor weight, Tensor output) -> Tensor");
+  m.impl("esimd_gemv_fp16", torch::kXPU, &esimd_gemv_fp16);
+
+  m.def("esimd_norm_add_norm(Tensor h2_raw, Tensor h1, Tensor w1, Tensor w2, "
+        "Tensor out, float eps1, float eps2) -> ()");
+  m.impl("esimd_norm_add_norm", torch::kXPU, &esimd_norm_add_norm);
+
+  m.def("esimd_kv_scatter(Tensor k, Tensor v, Tensor(a!) k_cache, "
+        "Tensor(b!) v_cache, Tensor indices) -> ()");
+  m.impl("esimd_kv_scatter", torch::kXPU, &esimd_kv_scatter);
+
+  m.def("esimd_rmsnorm_residual_scalar(Tensor x, Tensor weight, Tensor residual, "
+        "Tensor output, float eps, float scalar) -> Tensor");
+  m.impl("esimd_rmsnorm_residual_scalar", torch::kXPU, &esimd_rmsnorm_residual_scalar);
 }
 
 PyMODINIT_FUNC PyInit_custom_esimd_kernels() {

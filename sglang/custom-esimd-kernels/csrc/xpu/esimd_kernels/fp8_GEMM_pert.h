@@ -3,6 +3,7 @@
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
 #include <sycl/ext/intel/esimd/xmx/dpas.hpp>
+#include <cstdlib>
 
 using namespace sycl::ext::intel::esimd;
 using namespace sycl::ext::intel::esimd::xmx;
@@ -73,7 +74,15 @@ SYCL_ESIMD_FUNCTION inline simd<fp16, VL> fp8_dequant_fp16(
 
 // ---- VL/K_SPLIT auto-selection (reused from GEMV) ----
 inline void select_vl_ks(uint32_t N, uint32_t K, int& vl, int& ks) {
-    vl = 512; ks = 1;
+    static const int default_vl = []() {
+        const char* value = std::getenv("SGLANG_GEMV_VL_CAP");
+        return value ? std::atoi(value) : 256;
+    }();
+    static const int ks_mode = []() {
+        const char* value = std::getenv("SGLANG_GEMV_KS_MODE");
+        return value ? std::atoi(value) : 0;
+    }();
+    vl = default_vl; ks = 1;
 
     if (K < 512) {
         vl = 128; ks = 1;
@@ -85,6 +94,11 @@ inline void select_vl_ks(uint32_t N, uint32_t K, int& vl, int& ks) {
         vl = 128; ks = 8;
     } else if (N <= 512 && K >= 2048) {
         vl = 128; ks = 4;
+    }
+
+    if (ks_mode == 1 && N > 512 && K == 5376) {
+        vl = 128;
+        ks = 2;
     }
 
     int kpt = K / ks;
