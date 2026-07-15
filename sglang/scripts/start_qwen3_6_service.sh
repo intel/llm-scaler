@@ -33,16 +33,16 @@ export SGLANG_ENABLE_ESIMD_MOE=1
 # MoE prefill ESIMD (M-tiled DPAS fp8 MoE prefill)
 export SGLANG_ENABLE_ESIMD_MOE_PREFILL=1
 # Full-attention fused QKV split + RMSNorm + RoPE (Qwen3.5/3.6)
-export SGL_XPU_FA_ESIMD_QKV=1
+export SGLANG_XPU_FA_ESIMD_QKV=1
 # GDN conv fused_seq for the linear-attention decode path
-export SGL_XPU_GDN_ESIMD=1
+export SGLANG_XPU_GDN_ESIMD=1
 # GDN chunk_gated_delta_rule prefill (extend) — ESIMD M-tiled kernel.
 # This is the prefill TTFT lever: triton GDN recurrence is the prefill
 # bottleneck. The kernel was extended to accept fp16 ssm-state to match
 # this fp16 model's mamba pool.
-export SGL_XPU_GDN_EXTEND_ESIMD=1
+export SGLANG_XPU_GDN_EXTEND_ESIMD=1
 # Prefill SDPA via DPAS/XMX (AOT-compiled, doubleGRF)
-export SGL_XPU_PREFILL_DPAS=1
+export SGLANG_XPU_PREFILL_DPAS=1
 
 # --- XPU Graph (CUDA-graph-equivalent) ---
 # Captures the decode forward graph for a TPOT speedup at BS=1.
