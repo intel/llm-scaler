@@ -9,7 +9,7 @@
 //   Q heads: RMSNorm(weight+1.0, eps=1e-6) → RoPE(theta=10M)
 //   K heads: RMSNorm(weight+1.0, eps=1e-6) → RoPE(theta=10M)
 //   G heads (gating): copy only
-//   V heads: copy only
+//   V heads: RMSNorm (with_scale=False, eps=1e-6)
 //
 // Work decomposition: 2D dispatch (totalHeads, nTokens), one WG per (head, token)
 //   With gating:    totalHeads = 2*qHead + 2*kvHead  (Q,G interleaved)
@@ -36,6 +36,7 @@ ESIMD_INLINE void qkv_split_norm_rope_kernel(
     uint32_t qHead,
     uint32_t kvHead,
     uint32_t rotaryDim,
+    bool normalizeV,
     sycl::nd_item<2>& ndi) {
 
     constexpr float eps = 1e-6f;
@@ -215,8 +216,15 @@ ESIMD_INLINE void qkv_split_norm_rope_kernel(
         block_store<fp16, 256>((fp16*)kState + outputOffset, activation);
     }
     else if (whereAmI == QKV_LOCATION_V) {
-        // V: copy only
         outputOffset = kvHead * headDim * tokIdx + outHead * headDim;
+        if (normalizeV) {
+            simd<float, 256> vTemp = activation;
+            simd<float, 256> vOutputSq = vTemp * vTemp;
+            float vacc =
+                sycl::ext::intel::esimd::detail::sum<float, float, 256>(vOutputSq) /
+                static_cast<float>(headDim);
+            activation = vTemp * __ESIMD_NS::rsqrt(vacc + eps);
+        }
         block_store<fp16, 256>((fp16*)vState + outputOffset, activation);
     }
 }
@@ -238,6 +246,7 @@ inline void qkv_split_norm_rope_host(
     uint32_t kvHead,
     bool attnOutputGate,
     uint32_t rotaryDim,
+    bool normalizeV,
     sycl::queue& q) {
 
     constexpr uint32_t headDim = 256;
@@ -255,7 +264,8 @@ inline void qkv_split_norm_rope_host(
                 qkv_split_norm_rope_kernel(
                     qkvState, qState, gateState, kState, vState,
                     normWq, normWk, ropePos, ropeCosSinCache,
-                    ntoks, hiddenDim, headDim, qHead, kvHead, rotaryDim, ndi);
+                    ntoks, hiddenDim, headDim, qHead, kvHead, rotaryDim,
+                    normalizeV, ndi);
             });
     });
 }

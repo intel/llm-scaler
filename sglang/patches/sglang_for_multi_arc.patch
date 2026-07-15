@@ -206,156 +206,59 @@ index 44ee91a1a2..38de4d83ab 100644
      FLASH_RL = "flash_rl"  # For RL training with quantized models
      JAX = "jax"
      REMOTE = "remote"
-diff --git a/python/sglang/srt/layers/attention/fla/chunk_torch_xpu.py b/python/sglang/srt/layers/attention/fla/chunk_torch_xpu.py
-new file mode 100644
-index 0000000000..378fea0ccb
---- /dev/null
-+++ b/python/sglang/srt/layers/attention/fla/chunk_torch_xpu.py
-@@ -0,0 +1,144 @@
-+"""Pure-PyTorch fallback for chunk_gated_delta_rule on Intel XPU.
-+
-+Triton-XPU 3.7.0 cannot compile the block-pointer-heavy GDN kernels in
-+chunk_delta_h.py / chunk_fwd.py / chunk_o.py (TritonIntelStrideVersioning and
-+downstream TTGIR passes fail). This module provides an eager reference
-+implementation that is semantically equivalent to chunk_gated_delta_rule, at the
-+cost of performance — one loop iteration per token, no fusion. The goal is
-+correctness so Qwen3.5 (and other GDN-based hybrid models) can at least run
-+end-to-end on XPU while the Triton backend catches up.
-+"""
-+
-+from typing import Optional, Tuple
-+
-+import torch
+diff --git a/python/sglang/srt/distributed/device_communicators/xpu_communicator.py b/python/sglang/srt/distributed/device_communicators/xpu_communicator.py
+index 78931ac7c4..ed639a3b60 100644
+--- a/python/sglang/srt/distributed/device_communicators/xpu_communicator.py
++++ b/python/sglang/srt/distributed/device_communicators/xpu_communicator.py
+@@ -9,6 +9,14 @@ from torch.distributed import ProcessGroup
+ from sglang.srt.utils import is_xpu
+ 
+ 
++def _xpu_all_reduce_inplace(x: torch.Tensor, group) -> torch.Tensor:
++    """In-place all-reduce returning the same buffer. Used as the eager break
++    function under XPU breakable-graph capture (the returned buffer's stable
++    storage is what the next captured segment reads)."""
++    dist.all_reduce(x, group=group)
++    return x
 +
 +
-+def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-+    # Match the behavior of fla/l2norm.py (normalize last dim, float32 reduction).
-+    orig_dtype = x.dtype
-+    x32 = x.to(torch.float32)
-+    denom = x32.pow(2).sum(dim=-1, keepdim=True).clamp_min(eps).sqrt()
-+    return (x32 / denom).to(orig_dtype)
+ class XpuCommunicator:
+ 
+     def __init__(self, group: ProcessGroup):
+@@ -20,6 +28,17 @@ class XpuCommunicator:
+         self.world_size = dist.get_world_size(self.group)
+ 
+     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
++        # oneCCL collectives cannot be captured into an XPUGraph (they replay
++        # stale on the 2nd+ replay -> garbled TP>1 decode). When an XPU breakable
++        # graph is capturing, run the collective EAGER as a break point between
++        # captured compute segments; otherwise call it directly.
++        from sglang.srt.model_executor.breakable_cuda_graph.xpu_breakable_graph import (
++            is_xpu_breakable_capturing,
++            run_eager_between_segments,
++        )
 +
++        if is_xpu_breakable_capturing():
++            return run_eager_between_segments(_xpu_all_reduce_inplace, x, self.group)
+         dist.all_reduce(x, group=self.group)
+         return x
+ 
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 435c30a5cf..5abb15f221 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -656,6 +656,11 @@ class Envs:
+     # Breakable CUDA Graph
+     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
+ 
++    # XPU breakable graph: capture the decode forward as XPUGraph segments split
++    # at each TP all-reduce, running the (non-capturable) oneCCL collective eager
++    # between segments. Fixes the TP>1 XPU-graph decode garble.
++    SGLANG_XPU_BREAKABLE_GRAPH = EnvBool(False)
 +
-+def chunk_gated_delta_rule_torch(
-+    q: torch.Tensor,
-+    k: torch.Tensor,
-+    v: torch.Tensor,
-+    g: torch.Tensor,
-+    beta: torch.Tensor,
-+    scale: Optional[float] = None,
-+    initial_state: Optional[torch.Tensor] = None,
-+    initial_state_indices: Optional[torch.Tensor] = None,
-+    cu_seqlens: Optional[torch.LongTensor] = None,
-+    head_first: bool = False,
-+    use_qk_l2norm_in_kernel: bool = False,
-+) -> Tuple[torch.Tensor, None, Optional[torch.Tensor]]:
-+    """Drop-in for sglang.srt.layers.attention.fla.chunk.chunk_gated_delta_rule.
-+
-+    Shapes (head_first=False, the only mode sglang uses today):
-+      q, k : [1, T_total, H_k, K]   (T_total = sum of sequence lengths when cu_seqlens given)
-+      v    : [1, T_total, H,   V]
-+      g    : [1, T_total, H]        — log-space decay
-+      beta : [1, T_total, H]
-+      initial_state         : [N_slots, H, V, K]  — full state pool
-+      initial_state_indices : [N_seqs]            — per-sequence slot index
-+      cu_seqlens            : [N_seqs + 1]
-+    Returns:
-+      (o, None, last_recurrent_state)  where
-+        o                    : [1, T_total, H, V]
-+        last_recurrent_state : [N_seqs, H, V, K]   — callers are responsible for
-+                               scattering this back into initial_state at
-+                               initial_state_indices.
-+    """
-+    assert not head_first, "head_first=True is not supported in the XPU fallback."
-+    assert q.shape[0] == 1, "XPU fallback expects batch=1 with cu_seqlens."
-+    assert (
-+        cu_seqlens is not None
-+    ), "XPU fallback currently requires cu_seqlens (sglang always provides it)."
-+
-+    if use_qk_l2norm_in_kernel:
-+        q = _l2norm(q)
-+        k = _l2norm(k)
-+
-+    T_total, H_k, K = q.shape[1], q.shape[2], q.shape[3]
-+    _, _, H, V = v.shape
-+    assert H % H_k == 0, f"H ({H}) must be a multiple of H_k ({H_k}) for GQA."
-+    repeat = H // H_k
-+
-+    if scale is None:
-+        scale = K ** -0.5
-+
-+    # Work in float32 on the accumulator, cast output back to input dtype.
-+    out_dtype = q.dtype
-+
-+    # Drop the leading batch dim for convenience.
-+    q = q[0]      # [T_total, H_k, K]
-+    k = k[0]      # [T_total, H_k, K]
-+    v = v[0]      # [T_total, H,   V]
-+    g = g[0]      # [T_total, H]
-+    beta = beta[0]  # [T_total, H]
-+
-+    o = torch.empty((T_total, H, V), dtype=out_dtype, device=q.device)
-+
-+    n_seqs = cu_seqlens.numel() - 1
-+    last_state = torch.empty(
-+        (n_seqs, H, V, K), dtype=torch.float32, device=q.device
-+    )
-+
-+    cu = cu_seqlens.tolist()
-+    idx_list = (
-+        initial_state_indices.tolist() if initial_state_indices is not None else None
-+    )
-+
-+    for s in range(n_seqs):
-+        t0, t1 = cu[s], cu[s + 1]
-+
-+        if initial_state is not None:
-+            # Two shapes are possible depending on the caller:
-+            #   idx_list given   -> initial_state is the full state pool
-+            #                       [N_slots, H, V, K], pick slot idx_list[s].
-+            #   idx_list is None -> caller already sliced with cache_indices
-+            #                       so initial_state is [N_seqs, H, V, K].
-+            slot = idx_list[s] if idx_list is not None else s
-+            state = initial_state[slot].to(torch.float32).clone()  # [H, V, K]
-+        else:
-+            state = torch.zeros((H, V, K), dtype=torch.float32, device=q.device)
-+
-+        for t in range(t0, t1):
-+            q_t = q[t].to(torch.float32)                     # [H_k, K]
-+            k_t = k[t].to(torch.float32)                     # [H_k, K]
-+            v_t = v[t].to(torch.float32)                     # [H, V]
-+            g_t = g[t].to(torch.float32)                     # [H]
-+            b_t = beta[t].to(torch.float32)                  # [H]
-+
-+            # Expand GQA: replicate q/k heads to full V head count.
-+            q_full = q_t.repeat_interleave(repeat, dim=0)    # [H, K]
-+            k_full = k_t.repeat_interleave(repeat, dim=0)    # [H, K]
-+
-+            # state *= exp(g_t)  (per-head decay in log space).
-+            decay = torch.exp(g_t).view(H, 1, 1)
-+            state = state * decay
-+
-+            # Delta-rule update:
-+            #   v_pred_h = state_h @ k_h         -> [H, V]
-+            #   v_err_h  = v_h - v_pred_h        -> [H, V]
-+            #   state_h += beta_h * outer(v_err_h, k_h)
-+            v_pred = torch.einsum("hvk,hk->hv", state, k_full)
-+            v_err = v_t - v_pred
-+            update = torch.einsum("hv,hk->hvk", v_err, k_full)
-+            state = state + b_t.view(H, 1, 1) * update
-+
-+            # Output: o_h = scale * state_h @ q_h   -> [H, V]
-+            o_t = scale * torch.einsum("hvk,hk->hv", state, q_full)
-+            o[t] = o_t.to(out_dtype)
-+
-+        last_state[s] = state
-+
-+    o = o.unsqueeze(0)  # [1, T_total, H, V]
-+    # Return contract: (o, last_recurrent_state, h_aux). The caller in
-+    # gdn_backend.forward_extend scatters last_recurrent_state back into
-+    # ssm_states[cache_indices] on non-CUDA backends; returning it as the
-+    # middle element (not as h_aux) is required for that scatter to run.
-+    return o, last_state, None
+     # Release & Resume Memory
+     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
+ 
 diff --git a/python/sglang/srt/layers/attention/fla/layernorm_gated.py b/python/sglang/srt/layers/attention/fla/layernorm_gated.py
 index 5a8fda41b4..99c56f9ff8 100644
 --- a/python/sglang/srt/layers/attention/fla/layernorm_gated.py
@@ -568,7 +471,7 @@ index ae5365e8d6..8c7f30ef5a 100644
 +# NHD KV layout `[n_slots, Hkv, D]` directly via kv_indptr/kv_indices, no
 +# paged-cache reshape required. 2-phase split-K kernel; supports radix cache.
 +_ENABLE_XPU_ESIMD_DECODE = get_bool_env_var(
-+    "SGL_XPU_ESIMD_DECODE", "false"
++    "SGLANG_ENABLE_XPU_ESIMD_DECODE", "false"
 +)
 +_XPU_ESIMD_DECODE_FN = None
 +if _ENABLE_XPU_ESIMD_DECODE:
@@ -667,17 +570,40 @@ index ae5365e8d6..8c7f30ef5a 100644
              q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
              self.token_to_kv_pool.get_key_buffer(layer.layer_id),
 diff --git a/python/sglang/srt/layers/attention/xpu_backend.py b/python/sglang/srt/layers/attention/xpu_backend.py
-index ea02e001f1..5c1ef49582 100644
+index ea02e001f1..9c93802638 100644
 --- a/python/sglang/srt/layers/attention/xpu_backend.py
 +++ b/python/sglang/srt/layers/attention/xpu_backend.py
-@@ -1,5 +1,6 @@
+@@ -1,9 +1,29 @@
  from __future__ import annotations
  
 +import os
  from typing import TYPE_CHECKING, Optional
  
  import torch
-@@ -20,9 +21,73 @@ if TYPE_CHECKING:
+ 
++# Split-K decode: number of KV splits for the hd512 (gemma4 global) ESIMD kernel.
++# The kernel now derives its per-split chunk from the REAL seqlen (seqLens[b]) —
++# see splitk_decode.h — so a single high G is optimal across ALL context lengths
++# (idle splits early-return; each active split scans ceil(seqlen/G) tokens). G=64
++# = 16 q-heads * 64 = 1024 work-items ≈ BMG's ~960 HW-thread ceiling; measured
++# near-flat TPOT to 64k (44ms@32k, 50ms@64k) vs G=4/16 which grow with ctx.
++# Overridable via env for A/B.
++_SPLITK_G = int(os.environ.get("SGLANG_SPLITK_G", "64"))
++
++# Debug gate: force the ESIMD decode fast paths (page_attn_decode + split-K) OFF
++# so decode routes through flash_attn_with_kvcache (the fp16->bf16-casting wrapper).
++# Used to localize the fp16+graph decode garble.
++_DISABLE_ESIMD_DECODE = os.environ.get("SGLANG_DISABLE_ESIMD_DECODE", "0") == "1"
++
++# Debug gate: force the hd256 page_attn_decode path OFF so sliding layers also use
++# split-K (which accepts head_dim 256). Both are no-SLM/graph-capturable. Isolates
++# whether the graph garble is in page_attn_decode vs split-K.
++_DISABLE_PAGE_ATTN = os.environ.get("SGLANG_DISABLE_PAGE_ATTN", "0") == "1"
++
+ from sglang.srt.configs.model_config import AttentionArch
+ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+ from sglang.srt.layers.attention.flashattention_backend import (
+@@ -20,9 +40,81 @@ if TYPE_CHECKING:
      from sglang.srt.layers.radix_attention import RadixAttention
      from sglang.srt.model_executor.model_runner import ModelRunner
  
@@ -696,6 +622,14 @@ index ea02e001f1..5c1ef49582 100644
 +    _sglang_decode_attn_fn = None
  from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
  
++_esimd_page_attn_decode = None
++_splitk_decode_attention = None
++try:
++    from custom_esimd_kernels_sglang import eagle_page_attn_decode as _esimd_page_attn_decode
++    from custom_esimd_kernels_sglang import splitk_decode_attention as _splitk_decode_attention
++except ImportError:
++    pass
++
 +# PTL-proven fp16 prefill SDPA DPAS kernel (custom_esimd_kernels_sglang, HD=256).
 +# Replaces the cutlass-sycl flash fp16 prefill (which NaNs on Xe / produces
 +# garbage prefill logits) for head_dim==256 fp16. Lazily resolved; gated by
@@ -751,7 +685,7 @@ index ea02e001f1..5c1ef49582 100644
  
  class XPUAttentionBackend(AttentionBackend):
      """XPU FlashAttention backend, currently based on FlashAttentionBackend, will be refactored later.
-@@ -30,7 +95,8 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -30,7 +122,8 @@ class XPUAttentionBackend(AttentionBackend):
      TODO:
      - Prefill and Decode disaggregation, currently only chunked prefill is supported
      - Speculative Decoding support
@@ -761,7 +695,7 @@ index ea02e001f1..5c1ef49582 100644
      - MLA Prefill support
      """
  
-@@ -71,6 +137,15 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -71,6 +164,15 @@ class XPUAttentionBackend(AttentionBackend):
          self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
          self.page_size = model_runner.page_size
          self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
@@ -777,7 +711,7 @@ index ea02e001f1..5c1ef49582 100644
          self.skip_prefill = skip_prefill
          self.is_hybrid_swa = model_runner.is_hybrid_swa
          self.use_sliding_window_kv_pool = (
-@@ -103,6 +178,150 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -103,6 +205,244 @@ class XPUAttentionBackend(AttentionBackend):
          self.has_swa = (
              self.sliding_window_size is not None and self.sliding_window_size > -1
          )
@@ -925,10 +859,104 @@ index ea02e001f1..5c1ef49582 100644
 +        self.forward_metadata = self._graph_state["captured"].get(
 +            forward_batch.batch_size, self.forward_metadata
 +        )
++
++    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
++        """Pre-allocate stable device buffers for XPU graph capture + replay."""
++        max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
++        device = self.device
++
++        self._graph_state = {
++            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=device),
++            "cu_seqlens_q": torch.arange(0, max_bs + 1, dtype=torch.int32, device=device),
++            "page_table": torch.zeros(max_bs, max_num_pages, dtype=torch.int32, device=device),
++            "strided_indices": torch.arange(0, self.max_context_len, self.page_size, device=device),
++        }
++        if self.use_sliding_window_kv_pool:
++            self._graph_state["swa_page_table"] = torch.zeros(
++                max_bs, max_num_pages, dtype=torch.int32, device=device,
++            )
++            # SWA-pool KV write location (one slot per request per decode step).
++            # Must be address-stable for graph capture/replay (the captured
++            # set_kv_buffer writes to its capture-time address).
++            self._graph_state["swa_out_cache_loc"] = torch.zeros(
++                max_bs, dtype=torch.int64, device=device,
++            )
++
++    def init_forward_metadata_out_graph(self, forward_batch: ForwardBatch, in_capture: bool = False):
++        """Prepare forward_metadata for graph capture or replay (runs outside graph.capture())."""
++        if not forward_batch.forward_mode.is_decode_or_idle():
++            return
++        if not hasattr(self, "_graph_state") or not self._graph_state:
++            return
++
++        bs = forward_batch.batch_size
++        state = self._graph_state
++        seq_lens = forward_batch.seq_lens[:bs]
++
++        metadata = FlashAttentionMetadata()
++        metadata.cache_seqlens_int32 = state["cache_seqlens"][:bs]
++        metadata.cu_seqlens_q = state["cu_seqlens_q"][:bs + 1]
++        metadata.page_table = state["page_table"][:bs, :]
++        metadata.max_seq_len_q = 1
++
++        # Populate cache_seqlens from real seq_lens
++        metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
++        max_len = int(seq_lens.max().item()) if seq_lens.numel() else 1
++        metadata.max_seq_len_k = max_len
++
++        # Populate page_table. NOTE on ordering (must match eager
++        # init_forward_metadata): the SWA translation
++        # (translate_loc_from_full_to_swa) maps full-pool KV *slot* indices ->
++        # SWA-pool slot indices, so it MUST be applied to the RAW req_to_token
++        # slot values BEFORE dividing by page_size. The earlier version divided
++        # first and then translated page-granularity indices through a slot-index
++        # map -> wrong SWA page table -> the 50 sliding layers read the wrong KV
++        # -> decode garbled from the first step. Build raw slots first, translate,
++        # then stride + //page_size for both full and SWA tables.
++        max_seq_pages = (max_len + self.page_size - 1) // self.page_size
++        if max_seq_pages > 0:
++            req_pool_indices = forward_batch.req_pool_indices[:bs]
++            # Raw token-granularity KV slots for [0, max_len).
++            raw_slots = self.req_to_token[req_pool_indices, :max_len]
++
++            # Full-pool page table: stride by page_size then divide.
++            strided_indices = state["strided_indices"][:max_seq_pages]
++            pt = (
++                self.req_to_token[req_pool_indices[:, None], strided_indices[None, :]]
++                // self.page_size
++            )
++            metadata.page_table[:bs, :max_seq_pages].copy_(pt)
++
++            # SWA page table: translate RAW slots first, then stride + divide.
++            if self.use_sliding_window_kv_pool:
++                swa_slots = self.token_to_kv_pool.translate_loc_from_full_to_swa(
++                    raw_slots
++                ).to(torch.int32)
++                swa_pt = swa_slots[:, ::self.page_size] // self.page_size
++                swa_buf = state["swa_page_table"][:bs, :]
++                # Write into the persistent (address-stable) graph buffer so the
++                # captured sliding layers read it at a fixed address across replays.
++                swa_buf[:, :swa_pt.shape[1]].copy_(swa_pt)
++                metadata.swa_page_table = swa_buf
++
++        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
++            swa_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
++                forward_batch.out_cache_loc
++            )
++            n = swa_loc.shape[0]
++            loc_buf = state["swa_out_cache_loc"][:n]
++            loc_buf.copy_(swa_loc)
++            metadata.swa_out_cache_loc = loc_buf
++
++        self.forward_metadata = metadata
++
++    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
++        """No-op: metadata already set by init_forward_metadata_out_graph."""
++        pass
  
      def init_forward_metadata(self, forward_batch: ForwardBatch):
          """Initialize forward metadata hence all layers in the forward pass can reuse it."""
-@@ -590,24 +809,52 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -590,24 +930,52 @@ class XPUAttentionBackend(AttentionBackend):
                  cu_seqlens_k = metadata.encoder_cu_seqlens_k
                  window_size = (-1, -1)
  
@@ -998,7 +1026,7 @@ index ea02e001f1..5c1ef49582 100644
  
              if use_cascade_attn:
                  o, softmax_lse, *rest = result
-@@ -865,10 +1112,31 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -865,10 +1233,31 @@ class XPUAttentionBackend(AttentionBackend):
                  -1, self.page_size, layer.tp_v_head_num, layer.head_dim
              )
  
@@ -1031,7 +1059,7 @@ index ea02e001f1..5c1ef49582 100644
                      k_cache=key_cache,
                      v_cache=value_cache,
                      page_table=metadata.encoder_page_table,
-@@ -887,7 +1155,7 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -887,7 +1276,7 @@ class XPUAttentionBackend(AttentionBackend):
              elif use_local_attn:
                  # Use chunked (local) attention batching for self-attention
                  o = flash_attn_with_kvcache(
@@ -1040,14 +1068,10 @@ index ea02e001f1..5c1ef49582 100644
                      k_cache=key_cache,
                      v_cache=value_cache,
                      page_table=local_attn_metadata.local_block_table,
-@@ -903,32 +1171,54 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -903,6 +1292,53 @@ class XPUAttentionBackend(AttentionBackend):
                      v_descale=v_descale,
                      **kwargs,
                  )
--            else:
--                is_swa_layer = (
--                    layer.sliding_window_size is not None
--                    and layer.sliding_window_size > -1
 +            elif (
 +                self._graph_state.get("temp_p") is not None
 +                and not use_cascade_attn
@@ -1080,26 +1104,7 @@ index ea02e001f1..5c1ef49582 100644
 +                    float(layer.scaling),
 +                    self._graph_state["sglang_temp_p"],
 +                    self._sglang_decode_graph_max_seq,
-                 )
--
--                page_table = metadata.page_table
--                # For SWA layers on hybrid models, use the translated
--                # SWA-pool page table so KV reads hit the correct pool.
--                if is_swa_layer and self.use_sliding_window_kv_pool:
--                    if metadata.swa_page_table is not None:
--                        page_table = metadata.swa_page_table
--                    else:
--                        page_table = (
--                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
--                                metadata.page_table
--                            ).to(torch.int32)
--                        )
--
--                cache_seqlens = metadata.cache_seqlens_int32
--                cu_seqlens_k = metadata.cu_seqlens_k
--                max_seqlen_q = metadata.max_seq_len_q
--                q_reshaped = q.contiguous().view(
--                    -1, layer.tp_q_head_num, layer.head_dim
++                )
 +                o = o_fp16.view(-1, layer.tp_q_head_num, layer.head_dim)
 +            elif self._graph_state.get("temp_p") is not None and not use_cascade_attn:
 +                o = torch.empty_like(q_reshaped)
@@ -1113,12 +1118,308 @@ index ea02e001f1..5c1ef49582 100644
 +                    max_seqlen_q,
 +                    metadata.max_seq_len_k,
 +                    self._graph_state["temp_p"],
++                )
+             else:
+                 is_swa_layer = (
+                     layer.sliding_window_size is not None
+@@ -929,25 +1365,192 @@ class XPUAttentionBackend(AttentionBackend):
+                     -1, layer.tp_q_head_num, layer.head_dim
                  )
--
-+            else:
-                 # Default: single-token self-attention
-                 result = flash_attn_with_kvcache(
-                     q=q_reshaped,
+ 
+-                # Default: single-token self-attention
+-                result = flash_attn_with_kvcache(
+-                    q=q_reshaped,
+-                    k_cache=key_cache,
+-                    v_cache=value_cache,
+-                    page_table=page_table,
+-                    cache_seqlens=cache_seqlens,
+-                    cu_seqlens_q=metadata.cu_seqlens_q,
+-                    cu_seqlens_k_new=None,
+-                    max_seqlen_q=max_seqlen_q,
+-                    softmax_scale=layer.scaling,
+-                    causal=False if use_cascade_attn else causal,
+-                    window_size=window_size,
+-                    softcap=layer.logit_cap,
+-                    k_descale=k_descale,
+-                    v_descale=v_descale,
+-                    return_softmax_lse=use_cascade_attn,
+-                    **kwargs,
++                # ESIMD page_attn_decode fast path: no SLM, graph-capturable.
++                # Fires for head_dim==256 layers, which for gemma4 are the SWA
++                # (sliding-window) layers (global layers have head_dim=512 and
++                # take the split-K path below). SWA windowing is handled inside
++                # the kernel via the `window` param (see the SWA branch below):
++                # positions outside the last `window` tokens are masked to -inf,
++                # matching FA3's window_size semantics.
++                _use_esimd_pa = (
++                    not _DISABLE_ESIMD_DECODE
++                    and not _DISABLE_PAGE_ATTN
++                    and _esimd_page_attn_decode is not None
++                    and layer.head_dim == 256
++                    and max_seqlen_q == 1
++                    and not use_cascade_attn
++                    and layer.logit_cap == 0.0
++                    and q_reshaped.dtype == torch.float16
+                 )
++                if _use_esimd_pa:
++                    bs = forward_batch.batch_size
++                    # Persistent per-layer buffers: under XPU graph, capture bakes
++                    # tensor addresses, so fresh torch.empty()/elementwise temporaries
++                    # get unstable addresses across replay and corrupt decode. Reuse
++                    # stable buffers + in-place ops so capture and replay match.
++                    out_pa = self._decode_buf(
++                        ("pa_out", layer.layer_id), (bs, layer.tp_q_head_num, layer.head_dim),
++                        torch.float16, q_reshaped.device,
++                    )
++                    pa_seqlens = cache_seqlens
++                    page_table_pa = page_table
++                    max_seq = page_table.shape[1] * self.page_size
++                    # Sliding-window (SWA) layers: the ESIMD kernel reads the full
++                    # [0, seq_len) page table. Once seq_len > window, positions
++                    # older than the window have been evicted from the SWA pool
++                    # and their full->swa mapping points to slot 0 (another
++                    # token's KV = garbage), which garbled decode output. The old
++                    # clamp hack kept the FIRST window+1 columns (the OLDEST /
++                    # evicted positions) so it read garbage too.
++                    #
++                    # Fix WITHOUT any kernel change: page-align the page table to
++                    # the LAST `window` tokens and pass the reduced seq_len, so
++                    # the kernel only ever reads resident, in-window KV. The SWA
++                    # pool evicts per page (page_size), so the window-boundary
++                    # page is resident whenever it holds any in-window token;
++                    # floor-aligning the start therefore reads only valid slots
++                    # (it may attend up to page_size-1 extra, still-resident,
++                    # slightly-older tokens — a benign superset of FA3's
++                    # window_size=(sliding_window_size,0)). This also shrinks the
++                    # decode grid for long sequences.
++                    #
++                    # The windowed table depends only on cache_seqlens + the SWA
++                    # page table, which are identical across all ~50 SWA layers
++                    # in a step. Compute it ONCE per step and cache on the
++                    # (per-step-fresh) metadata object; recomputing per layer
++                    # added ~7ms TPOT (50x redundant host work).
++                    #
++                    # bs==1 (the shippable --max-running-requests 1 config) takes
++                    # a host-side fast path: the window is a CONTIGUOUS page span
++                    # [start_page : start_page+n_win_pages], so we slice the page
++                    # table (a zero-copy view) instead of building an index tensor
++                    # and gathering. start_page is derived from
++                    # metadata.max_seq_len_k, which is already a host int (no new
++                    # device->host sync). Microbench: 74us (gather) -> 8us (slice).
++                    # bs>1 keeps the gather path (per-batch start pages differ).
++                    if (
++                        is_swa_layer
++                        and layer.sliding_window_size is not None
++                        and layer.sliding_window_size > -1
++                        and metadata.max_seq_len_k > (layer.sliding_window_size + 1)
++                    ):
++                        cached = getattr(metadata, "_swa_win_cache", None)
++                        if cached is None:
++                            window_tokens = layer.sliding_window_size + 1
++                            ps = self.page_size
++                            n_win_pages = (window_tokens - 1) // ps + 2
++                            n_cols = page_table.shape[1]
++                            if bs == 1:
++                                start_pg = max(
++                                    metadata.max_seq_len_k - window_tokens, 0
++                                ) // ps
++                                end_pg = min(start_pg + n_win_pages, n_cols)
++                                pt_pa = page_table[:, start_pg:end_pg]
++                                sl = cache_seqlens - (start_pg * ps)
++                            else:
++                                start_page = (
++                                    torch.clamp(cache_seqlens - window_tokens, min=0)
++                                    // ps
++                                )
++                                col = start_page.to(torch.int64).unsqueeze(
++                                    1
++                                ) + torch.arange(
++                                    n_win_pages,
++                                    device=page_table.device,
++                                    dtype=torch.int64,
++                                )
++                                col = col.clamp_(max=n_cols - 1)
++                                pt_pa = torch.gather(page_table, 1, col)
++                                sl = (cache_seqlens - start_page * ps).to(torch.int32)
++                            cached = (pt_pa, sl, pt_pa.shape[1] * self.page_size)
++                            metadata._swa_win_cache = cached
++                        page_table_pa, pa_seqlens, max_seq = cached
++                    # ESIMD kernel hardcodes matMulQuantCoeff=0.0625 (1/sqrt(256)).
++                    # Compensate for the model's actual scaling factor.
++                    if layer.scaling != 0.0625:
++                        q_scaled = self._decode_buf(
++                            ("pa_q", layer.layer_id), q_reshaped.shape,
++                            q_reshaped.dtype, q_reshaped.device,
++                        )
++                        torch.mul(q_reshaped, layer.scaling / 0.0625, out=q_scaled)
++                    else:
++                        q_scaled = q_reshaped
++                    _esimd_page_attn_decode(
++                        q_scaled,
++                        key_cache,
++                        value_cache,
++                        page_table_pa,
++                        pa_seqlens,
++                        out_pa,
++                        max_seqlen_q,
++                        max_seq,
++                        None,
++                    )
++                    result = out_pa
++                else:
++                    # Split-K ESIMD decode (no SLM, graph-capturable) for hd512.
++                    # Falls back to flash_attn for non-decode or unsupported configs.
++                    if (
++                        not _DISABLE_ESIMD_DECODE
++                        and _splitk_decode_attention is not None
++                        and max_seqlen_q == 1
++                        and not use_cascade_attn
++                        and layer.logit_cap == 0.0
++                        and q_reshaped.dtype == torch.float16
++                        and layer.head_dim in (256, 512)
++                    ):
++                        bs = forward_batch.batch_size
++                        G = _SPLITK_G  # num KV splits (env SGLANG_SPLITK_G, default 64)
++                        nTG = bs * layer.tp_q_head_num * G
++                        hd = layer.head_dim
++                        # Persistent PER-LAYER scratch + output: under XPU graph the
++                        # 10 global layers are all captured; a single shared scratch
++                        # (or fresh torch.empty per call) gives unstable/aliased
++                        # addresses across replay and corrupts decode. One stable
++                        # buffer per layer_id keyed by size.
++                        out_sk = self._decode_buf(
++                            ("sk_out", layer.layer_id), (bs, layer.tp_q_head_num, hd),
++                            torch.float16, q_reshaped.device,
++                        )
++                        scratch = self._decode_buf(
++                            ("sk_scratch", layer.layer_id), (nTG * (hd + 2),),
++                            torch.float32, q_reshaped.device,
++                        )
++                        max_seq = page_table.shape[1] * self.page_size
++                        # Split-K kernel has built-in 1/sqrt(HD) scaling
++                        if layer.scaling != hd ** -0.5:
++                            q_scaled = self._decode_buf(
++                                ("sk_q", layer.layer_id), q_reshaped.shape,
++                                q_reshaped.dtype, q_reshaped.device,
++                            )
++                            torch.mul(q_reshaped, layer.scaling / (hd ** -0.5), out=q_scaled)
++                        else:
++                            q_scaled = q_reshaped
++                        _splitk_decode_attention(
++                            q_scaled, key_cache, value_cache,
++                            page_table, cache_seqlens,
++                            out_sk, scratch, max_seq, G,
++                        )
++                        result = out_sk
++                    else:
++                        result = flash_attn_with_kvcache(
++                            q=q_reshaped,
++                            k_cache=key_cache,
++                            v_cache=value_cache,
++                            page_table=page_table,
++                            cache_seqlens=cache_seqlens,
++                            cu_seqlens_q=metadata.cu_seqlens_q,
++                            cu_seqlens_k_new=None,
++                            max_seqlen_q=max_seqlen_q,
++                            softmax_scale=layer.scaling,
++                            causal=False if use_cascade_attn else causal,
++                            window_size=window_size,
++                            softcap=layer.logit_cap,
++                            k_descale=k_descale,
++                            v_descale=v_descale,
++                            return_softmax_lse=use_cascade_attn,
++                            **kwargs,
++                        )
+                 if use_cascade_attn:
+                     o, softmax_lse, *rest = result
+                     o_expand, softmax_lse_expand, *rest_expand = (
+@@ -1006,6 +1609,27 @@ class XPUAttentionBackend(AttentionBackend):
+         out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+         return out
+ 
++    def _decode_buf(self, key, shape, dtype, device):
++        """Return a persistent, address-stable buffer for the given (key, shape).
++
++        XPU graph capture bakes tensor data pointers; allocating fresh tensors
++        (torch.empty) or elementwise temporaries inside the captured decode
++        forward yields addresses that differ at replay -> silent corruption.
++        Caching one buffer per key (e.g. per layer_id + role) keeps the address
++        stable across capture and replay. Reallocates only if a larger shape is
++        ever requested.
++        """
++        if not hasattr(self, "_decode_bufs"):
++            self._decode_bufs = {}
++        buf = self._decode_bufs.get(key)
++        numel = 1
++        for s in shape:
++            numel *= s
++        if buf is None or buf.numel() < numel or buf.dtype != dtype:
++            buf = torch.zeros(numel, dtype=dtype, device=device)
++            self._decode_bufs[key] = buf
++        return buf[:numel].view(*shape)
++
+     def get_cuda_graph_seq_len_fill_value(self):
+         """Get the fill value for sequence length in CUDA graph."""
+         return 1
+diff --git a/python/sglang/srt/layers/linear.py b/python/sglang/srt/layers/linear.py
+index fc197860da..9b01ec583f 100644
+--- a/python/sglang/srt/layers/linear.py
++++ b/python/sglang/srt/layers/linear.py
+@@ -6,6 +6,7 @@ from __future__ import annotations
+ 
+ import itertools
+ import logging
++import os
+ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+ 
+ import torch
+@@ -1541,7 +1542,9 @@ class RowParallelLinear(LinearBase):
+             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+ 
+         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
+-            if self.use_dp_attention_reduce:
++            if os.environ.get("SGLANG_SKIP_ALLREDUCE") == "1" and input_.shape[0] == 1:
++                output = output_parallel
++            elif self.use_dp_attention_reduce:
+                 output = get_attention_tp_group().all_reduce(output_parallel)
+             else:
+                 quantize_communications = (
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index 15a3d6aac9..4fe805001c 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -21,6 +21,12 @@ from typing import Any, Dict, List, Optional, Tuple, Union
+ import torch
+ from torch import nn
+ 
++_esimd_gemv_fp16 = None
++try:
++    from custom_esimd_kernels_sglang import esimd_gemv_fp16 as _esimd_gemv_fp16
++except ImportError:
++    pass
++
+ from sglang.srt.distributed import (
+     get_tensor_model_parallel_world_size,
+     tensor_model_parallel_all_gather,
+@@ -901,6 +907,18 @@ class LogitsProcessor(nn.Module):
+                 logits = torch.matmul(
+                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
+                 )
++            elif (
++                _esimd_gemv_fp16 is not None
++                and hidden_states.is_xpu
++                and hidden_states.shape[0] == 1
++                # oneDNN picks a slow kernel variant ({32,2,8}) at N=131072 in steady-state decode
++            ):
++                if not hasattr(lm_head, "_esimd_fp16_weight"):
++                    lm_head._esimd_fp16_weight = lm_head.weight.to(torch.float16).contiguous()
++                w = lm_head._esimd_fp16_weight
++                inp = hidden_states.to(torch.float16).contiguous()
++                out = torch.empty(1, w.shape[0], dtype=torch.float16, device=hidden_states.device)
++                logits = _esimd_gemv_fp16(inp, w, out)
+             else:
+                 logits = torch.matmul(
+                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
 diff --git a/python/sglang/srt/layers/moe/moe_runner/triton.py b/python/sglang/srt/layers/moe/moe_runner/triton.py
 index 96e431d4e3..76a515822e 100644
 --- a/python/sglang/srt/layers/moe/moe_runner/triton.py
@@ -1279,11 +1580,11 @@ index 96e431d4e3..76a515822e 100644
          running_state: dict,
          hooks: Optional[Any] = None,
      ) -> TritonRunnerOutput:
-+        # XPU fast path: gated by SGL_XPU_ESIMD_MOE=1. The fused-func
++        # XPU fast path: gated by SGLANG_ENABLE_ESIMD_MOE=1. The fused-func
 +        # path (`fused_experts_none_to_triton`) is the one that actually fires
 +        # under the default runner config; this branch is here for the future
 +        # case where a runner_input gets routed straight into the runner_core.
-+        if os.environ.get("SGL_XPU_ESIMD_MOE", "0") == "1":
++        if os.environ.get("SGLANG_ENABLE_ESIMD_MOE", "0") == "1":
 +            out = _try_esimd_moe_silu_routed(runner_input, quant_info, self.config)
 +            if out is not None:
 +                return TritonRunnerOutput(hidden_states=out)
@@ -1474,7 +1775,7 @@ index 96e431d4e3..76a515822e 100644
 +        return None
 +    # NOTE: this routed-only path does NOT yet handle Qwen3.6 shared-expert
 +    # fusion (shared_expert_intermediate_size == moe_intermediate_size), so the
-+    # full MoE output is incomplete -> SGL_XPU_ESIMD_MOE_PREFILL must stay
++    # full MoE output is incomplete -> SGLANG_ENABLE_ESIMD_MOE_PREFILL must stay
 +    # off until the shared expert contribution is added. Kept wired + scale-fixed
 +    # for when that lands.
 +
@@ -1511,7 +1812,7 @@ index 96e431d4e3..76a515822e 100644
 +    # a single linear layer, so a single scalar per expert is too lossy.
 +    # TODO: migrate the per-block FP8 MoE GEMM kernel from llm-scaler/vllm
 +    # (or feed 2D scale through a future kernel variant) before re-enabling.
-+    if os.environ.get("SGL_XPU_ESIMD_MOE", "0") == "1":
++    if os.environ.get("SGLANG_ENABLE_ESIMD_MOE", "0") == "1":
 +        esimd_out = _maybe_esimd_moe_silu_fused(
 +            dispatch_output, quant_info, runner_config
 +        )
@@ -1520,7 +1821,7 @@ index 96e431d4e3..76a515822e 100644
 +
 +    # Large-T (prefill) M-tiled DPAS FP8 MoE kernel. Separate env gate so it can
 +    # be enabled independently of the decode kernel.
-+    if os.environ.get("SGL_XPU_ESIMD_MOE_PREFILL", "0") == "1":
++    if os.environ.get("SGLANG_ENABLE_ESIMD_MOE_PREFILL", "0") == "1":
 +        esimd_out = _maybe_esimd_moe_silu_prefill(
 +            dispatch_output, quant_info, runner_config
 +        )
@@ -1796,7 +2097,7 @@ index 30a035a23c..b10f39fbd0 100644
  fp8_min = -fp8_max
  
 diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
-index 6c6827c7d2..35b948c625 100755
+index 6c6827c7d2..ee6ab255b3 100755
 --- a/python/sglang/srt/layers/quantization/fp8_utils.py
 +++ b/python/sglang/srt/layers/quantization/fp8_utils.py
 @@ -46,6 +46,7 @@ from sglang.srt.utils import (
@@ -1807,11 +2108,27 @@ index 6c6827c7d2..35b948c625 100755
      offloader,
  )
  from sglang.srt.utils.custom_op import register_custom_op
-@@ -59,6 +60,19 @@ _is_sm100_supported = is_sm100_supported()
+@@ -59,6 +60,35 @@ _is_sm100_supported = is_sm100_supported()
  _is_sm120_supported = is_sm120_supported()
  _is_gfx95_supported = is_gfx95_supported()
  _is_musa = is_musa()
 +_is_xpu = is_xpu()
++
++# XPU: for per-tensor-weight FP8 linears, quantise the (prefill) activation per-tensor
++# instead of per-token, so the subsequent torch._scaled_mm uses its FUSED dequant epilogue
++# (the per_tensor_weights & per_tensor_activations branch in apply_fp8_linear) rather than
++# the unfused fp32 dequant `output * x_scale * weight_scale.t()` — the latter cost ~17% of
++# prefill per unitrace. fp8 e4m3 is floating-point so per-tensor vs per-token granularity is
++# numerically near-equivalent (kernel-validated: cos delta <5e-5). Decode (M<=64) is untouched
++# because it early-returns via the ESIMD fast path above. Set env=0 to revert to per-token.
++_XPU_FP8_PERTENSOR_PREFILL = _is_xpu and get_bool_env_var(
++    "SGLANG_XPU_FP8_PERTENSOR_PREFILL", "true"
++)
++if _is_xpu:
++    logger.info(
++        "[opt#1] XPU FP8 per-tensor prefill dequant fusion = %s",
++        "ON" if _XPU_FP8_PERTENSOR_PREFILL else "OFF",
++    )
 +
 +# Lazy-loaded handle to the merged custom_esimd_kernels_sglang
 +# esimd_gemm_fp8_pert kernel wrapper.
@@ -1827,7 +2144,7 @@ index 6c6827c7d2..35b948c625 100755
  
  _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
  _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
-@@ -188,6 +202,7 @@ class Fp8GemmRunnerBackend(Enum):
+@@ -188,6 +218,7 @@ class Fp8GemmRunnerBackend(Enum):
      DEEP_GEMM = "deep_gemm"
      TRITON = "triton"
      AITER = "aiter"
@@ -1835,7 +2152,7 @@ index 6c6827c7d2..35b948c625 100755
  
      def is_auto(self) -> bool:
          return self == Fp8GemmRunnerBackend.AUTO
-@@ -213,6 +228,9 @@ class Fp8GemmRunnerBackend(Enum):
+@@ -213,6 +244,9 @@ class Fp8GemmRunnerBackend(Enum):
      def is_aiter(self) -> bool:
          return self == Fp8GemmRunnerBackend.AITER
  
@@ -1845,7 +2162,7 @@ index 6c6827c7d2..35b948c625 100755
  
  FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
  
-@@ -439,6 +457,17 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
+@@ -439,6 +473,17 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
      elif backend.is_triton():
          return triton_w8a8_block_fp8_linear
  
@@ -1863,7 +2180,7 @@ index 6c6827c7d2..35b948c625 100755
      else:
          raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
  
-@@ -832,6 +861,54 @@ def triton_w8a8_block_fp8_linear(
+@@ -832,6 +877,54 @@ def triton_w8a8_block_fp8_linear(
      input_2d = input.view(-1, input.shape[-1])
      output_shape = [*input.shape[:-1], weight.shape[0]]
  
@@ -1918,7 +2235,7 @@ index 6c6827c7d2..35b948c625 100755
      q_input, x_scale = per_token_group_quant_fp8(
          input_2d, block_size[1], column_major_scales=False
      )
-@@ -843,6 +920,50 @@ def triton_w8a8_block_fp8_linear(
+@@ -843,6 +936,50 @@ def triton_w8a8_block_fp8_linear(
      return output.to(dtype=input_2d.dtype).view(*output_shape)
  
  
@@ -1969,7 +2286,7 @@ index 6c6827c7d2..35b948c625 100755
  @lru_cache(maxsize=1)
  def _get_triton_mxfp8_downcast():
      try:
-@@ -1491,6 +1612,46 @@ def apply_fp8_linear(
+@@ -1491,6 +1628,46 @@ def apply_fp8_linear(
      input_2d = input.view(-1, input.shape[-1])
      output_shape = [*input.shape[:-1], weight.shape[1]]
  
@@ -2016,6 +2333,22 @@ index 6c6827c7d2..35b948c625 100755
      if compressed_tensor_quant:
          # Maybe apply padding to output, see comment in __init__
          num_token_padding = output_padding
+@@ -1544,6 +1721,15 @@ def apply_fp8_linear(
+                         input_scale,
+                         use_per_token_if_dynamic=use_per_token_if_dynamic,
+                     )
++                elif _XPU_FP8_PERTENSOR_PREFILL and weight_scale.numel() == 1:
++                    # XPU prefill (decode M<=64 already returned via the ESIMD fast path):
++                    # per-tensor activation quant -> hit the fused torch._scaled_mm epilogue
++                    # below, dropping the unfused fp32 dequant (~17% of prefill).
++                    qinput, x_scale = scaled_fp8_quant(
++                        input_2d,
++                        input_scale,
++                        use_per_token_if_dynamic=False,
++                    )
+                 else:
+                     qinput, x_scale = per_token_group_quant_fp8(
+                         input_2d, group_size=input_2d.shape[1]
 diff --git a/python/sglang/srt/layers/quantization/gguf.py b/python/sglang/srt/layers/quantization/gguf.py
 index 5c1e7a63e6..c08f80f045 100644
 --- a/python/sglang/srt/layers/quantization/gguf.py
@@ -3587,10 +3920,65 @@ index a282339587..3b7c99c7b0 100644
          self,
          *,
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index 8efe9aae94..287e06cd58 100644
+index 8efe9aae94..8a33403ef3 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
-@@ -328,7 +328,7 @@ class MambaPool:
+@@ -62,6 +62,7 @@ from sglang.srt.utils import (
+     is_cuda,
+     is_hip,
+     is_npu,
++    is_xpu,
+     next_power_of_2,
+ )
+ from sglang.srt.utils.async_probe import maybe_detect_oob
+@@ -86,6 +87,17 @@ _is_fp8_fnuz = is_fp8_fnuz()
+ # the SHUFFLE 5D pool layout has no consumer kernels, so the env var is
+ # silently ignored and the legacy NHD layout is used.
+ _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
++_is_xpu = is_xpu()
++
++# Optional fused KV-cache scatter (single ESIMD launch replaces the 2 advanced-
++# index scatters in the XPU naive fallback). Import is best-effort; absence just
++# keeps the naive path.
++_esimd_kv_scatter = None
++if _is_xpu:
++    try:
++        from custom_esimd_kernels_sglang import esimd_kv_scatter as _esimd_kv_scatter
++    except ImportError:
++        pass
+ 
+ 
+ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
+@@ -129,6 +141,28 @@ def _set_kv_buffer_impl(
+             row_dim,
+         )
+ 
++    # XPU: fuse the two advanced-index scatters into one ESIMD launch. Pure
++    # copy (no scale/cast on this path since cache dtype == model dtype), so the
++    # write is bit-identical to k_cache[indices]=k; v_cache[indices]=v. Falls
++    # back to the naive path if the kernel is unavailable or the shape is unfit.
++    if (
++        _is_xpu
++        and same_kv_dim
++        and _esimd_kv_scatter is not None
++        and store_dtype.itemsize == 2
++        and row_dim % 32 == 0
++        and k.numel() > 0
++    ):
++        idx = indices if indices.dtype == torch.int64 else indices.to(torch.int64)
++        _esimd_kv_scatter(
++            k.reshape(-1, row_dim),
++            v.reshape(-1, row_dim),
++            k_cache.view(-1, row_dim),
++            v_cache.view(-1, row_dim),
++            idx,
++        )
++        return
++
+     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+ 
+     if get_is_capture_mode() and alt_stream is not None:
+@@ -328,7 +362,7 @@ class MambaPool:
                          temporal_state_shape[2],
                      ),
                      dtype=ssm_dtype,
@@ -3599,7 +3987,7 @@ index 8efe9aae94..287e06cd58 100644
                  )
                  # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
                  # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
-@@ -342,7 +342,7 @@ class MambaPool:
+@@ -342,7 +376,7 @@ class MambaPool:
                              conv_shape[1],
                          ),
                          dtype=conv_dtype,
@@ -3608,8 +3996,29 @@ index 8efe9aae94..287e06cd58 100644
                      )
                      for conv_shape in conv_state_shape
                  ]
+diff --git a/python/sglang/srt/model_executor/breakable_cuda_graph/breakable_cuda_graph.py b/python/sglang/srt/model_executor/breakable_cuda_graph/breakable_cuda_graph.py
+index 7341301ef4..464151c42e 100644
+--- a/python/sglang/srt/model_executor/breakable_cuda_graph/breakable_cuda_graph.py
++++ b/python/sglang/srt/model_executor/breakable_cuda_graph/breakable_cuda_graph.py
+@@ -315,9 +315,13 @@ class BreakableCUDAGraphCapture:
+ 
+     def _begin_new_segment(self) -> None:
+         graph = torch.cuda.CUDAGraph()
+-        graph.capture_begin(
+-            pool=self._pool, capture_error_mode=self._capture_error_mode
+-        )
++        try:
++            graph.capture_begin(
++                pool=self._pool, capture_error_mode=self._capture_error_mode
++            )
++        except TypeError:
++            # XPUGraph doesn't support capture_error_mode
++            graph.capture_begin(pool=self._pool)
+         self.cuda_graph._segments.append(graph)
+ 
+     def _end_current_segment(self) -> None:
 diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
-index ebbfc2b288..68891945df 100644
+index ebbfc2b288..56497dcc76 100644
 --- a/python/sglang/srt/model_executor/cuda_graph_runner.py
 +++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
 @@ -75,6 +75,7 @@ from sglang.srt.utils import (
@@ -3620,7 +4029,7 @@ index ebbfc2b288..68891945df 100644
      log_info_on_rank0,
      require_attn_tp_gather,
      require_gathered_buffer,
-@@ -84,6 +85,45 @@ from sglang.srt.utils import (
+@@ -84,6 +85,48 @@ from sglang.srt.utils import (
  from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
  from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
  
@@ -3657,6 +4066,9 @@ index ebbfc2b288..68891945df 100644
 +            return self._ctx.__exit__(exc_type, exc, tb)
 +
 +    torch.cuda.graph = _XpuGraphCtx  # type: ignore[assignment]
++    torch.cuda.stream = torch.xpu.stream  # type: ignore[assignment]
++    torch.cuda.current_stream = torch.xpu.current_stream  # type: ignore[assignment]
++    torch.cuda.synchronize = torch.xpu.synchronize  # type: ignore[assignment]
 +    torch.cuda._sglang_xpu_patched = True
 +
 +
@@ -3666,7 +4078,31 @@ index ebbfc2b288..68891945df 100644
  try:
      from kt_kernel import KTMoEWrapper
  
-@@ -818,7 +858,11 @@ class CudaGraphRunner:
+@@ -100,6 +143,12 @@ if not _is_hip:
+         eager_on_graph,
+     )
+ 
++# XPU breakable graph (no cuda-python dep); safe to import on any platform.
++from sglang.srt.model_executor.breakable_cuda_graph.xpu_breakable_graph import (
++    XpuBreakableGraph,
++    XpuBreakableGraphCapture,
++)
++
+ logger = logging.getLogger(__name__)
+ 
+ if TYPE_CHECKING:
+@@ -808,7 +857,9 @@ class CudaGraphRunner:
+             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+         )
+ 
+-        if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
++        if is_xpu() and envs.SGLANG_XPU_BREAKABLE_GRAPH.get():
++            graph_ctx = XpuBreakableGraphCapture
++        elif envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
+             if memory_saver_adapter.enabled:
+                 raise NotImplementedError(
+                     "Breakable CUDA graph is not compatible with memory saver mode"
+@@ -818,7 +869,11 @@ class CudaGraphRunner:
              graph_ctx = (
                  partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
                  if memory_saver_adapter.enabled
@@ -3679,6 +4115,25 @@ index ebbfc2b288..68891945df 100644
              )
  
          if self.model_runner.server_args.debug_cuda_graph:
+@@ -827,10 +882,17 @@ class CudaGraphRunner:
+             captured_fn = run_once_fn
+ 
+         with graph_ctx(cuda_graph=graph, pool=pool, stream=stream):
+-            out = captured_fn()
++            try:
++                out = captured_fn()
++            except RuntimeError as e:
++                import traceback
++                traceback.print_exc()
++                raise
+         return out
+ 
+     def _create_device_graph(self):
++        if is_xpu() and envs.SGLANG_XPU_BREAKABLE_GRAPH.get():
++            return XpuBreakableGraph()
+         if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
+             if _is_hip:
+                 raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
 index 3b30eb0e1f..ea5d755e4d 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
@@ -3695,7 +4150,7 @@ index 3b30eb0e1f..ea5d755e4d 100644
 +            # in progress. torch.cuda.CUDAGraph / torch.cuda.graph are
 +            # aliased onto torch.xpu equivalents in cuda_graph_runner at
 +            # import time (see _xpu_patch_cuda_graph_apis).
-+            if os.environ.get("SGL_XPU_ENABLE_GRAPH") == "1":
++            if os.environ.get("SGLANG_XPU_ENABLE_GRAPH") == "1":
 +                self.init_device_graphs()
 +            else:
 +                self.graph_runner = None
@@ -3704,7 +4159,7 @@ index 3b30eb0e1f..ea5d755e4d 100644
              self.init_attention_backend()
              if current_platform.support_cuda_graph():
 diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
-index 32ff5bac25..6b7d1eff63 100644
+index 32ff5bac25..e8ee7b4ae0 100644
 --- a/python/sglang/srt/model_loader/loader.py
 +++ b/python/sglang/srt/model_loader/loader.py
 @@ -115,6 +115,7 @@ from sglang.srt.utils import (
@@ -3746,7 +4201,7 @@ index 32ff5bac25..6b7d1eff63 100644
  @contextmanager
  def device_loading_context(module: torch.nn.Module, target_device: torch.device):
      if target_device.type == "cpu":
-@@ -858,6 +877,107 @@ class LayeredModelLoader(DefaultModelLoader):
+@@ -858,6 +877,117 @@ class LayeredModelLoader(DefaultModelLoader):
          return model.eval()
  
  
@@ -3824,8 +4279,18 @@ index 32ff5bac25..6b7d1eff63 100644
 +        # norm/embedding tensors all stay resident. The transient bf16 device
 +        # copy of a quantized weight is dropped when process_weights replaces
 +        # layer.weight, then reclaimed by the periodic empty_cache.
++        skip_vision = os.environ.get("SGLANG_SKIP_VISION_GPU", "0") == "1"
++        # Build set of modules to skip (vision_tower subtree)
++        _skip_modules = set()
++        if skip_vision:
++            for name, mod in model.named_modules():
++                if "vision_tower" in name or "embed_vision" in name:
++                    _skip_modules.add(id(mod))
++
 +        processed = 0
 +        for module in model.modules():
++            if id(module) in _skip_modules:
++                continue
 +            # Move this module's own params/buffers onto the device (recurse=False
 +            # so child modules are handled in their own iteration step).
 +            _move_module_tensors_to_device(module, target_device)
@@ -3854,7 +4319,7 @@ index 32ff5bac25..6b7d1eff63 100644
  class QuantizedRLModelLoader(DefaultModelLoader):
      """
      Model loader for RL training with FP8 quantization (profile-free, native SGLang).
-@@ -2094,11 +2214,25 @@ class GGUFModelLoader(BaseModelLoader):
+@@ -2094,11 +2224,25 @@ class GGUFModelLoader(BaseModelLoader):
              model_type = "command-r"
          elif model_type == "qwen3_moe":
              model_type = "qwen3moe"
@@ -3880,7 +4345,7 @@ index 32ff5bac25..6b7d1eff63 100644
          if arch is None:
              raise RuntimeError(f"Unknown gguf model_type: {model_type}")
          num_layers = config.num_hidden_layers
-@@ -2114,6 +2248,206 @@ class GGUFModelLoader(BaseModelLoader):
+@@ -2114,6 +2258,206 @@ class GGUFModelLoader(BaseModelLoader):
              gguf_to_hf_name_map[f"{gguf_name}.{suffix}"] = hf_name
          return gguf_to_hf_name_map
  
@@ -4087,7 +4552,7 @@ index 32ff5bac25..6b7d1eff63 100644
      def _get_weights_iterator(
          self, model_name_or_path: str, gguf_to_hf_name_map: Dict[str, str]
      ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-@@ -3114,6 +3448,9 @@ def get_model_loader(
+@@ -3114,6 +3458,9 @@ def get_model_loader(
      if load_config.load_format == LoadFormat.LAYERED:
          return LayeredModelLoader(load_config)
  
@@ -4097,6 +4562,279 @@ index 32ff5bac25..6b7d1eff63 100644
      # Check for FLASH_RL format early
      # FP8 approach: BF16/FP16 model with native FP8 quantization
      if load_config.load_format == LoadFormat.FLASH_RL:
+diff --git a/python/sglang/srt/models/gemma4_causal.py b/python/sglang/srt/models/gemma4_causal.py
+index 9c2f9c25db..4468eea59f 100644
+--- a/python/sglang/srt/models/gemma4_causal.py
++++ b/python/sglang/srt/models/gemma4_causal.py
+@@ -13,6 +13,7 @@
+ # ==============================================================================
+ 
+ import logging
++import os
+ import re
+ from typing import Iterable, List, Optional, Set, Tuple, Union
+ 
+@@ -65,6 +66,21 @@ from sglang.srt.utils import add_prefix, make_layers
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Lazy-loaded ESIMD kernels (fp16 decode fast paths).
++_esimd_qkv_split_norm_rope = None
++_esimd_fused_add_rms_norm = None
++_esimd_rmsnorm_residual_scalar = None
++_esimd_norm_add_norm = None
++try:
++    from custom_esimd_kernels_sglang import (
++        esimd_qkv_split_norm_rope as _esimd_qkv_split_norm_rope,
++        esimd_fused_add_rms_norm as _esimd_fused_add_rms_norm,
++        esimd_rmsnorm_residual_scalar as _esimd_rmsnorm_residual_scalar,
++        esimd_norm_add_norm as _esimd_norm_add_norm,
++    )
++except ImportError:
++    pass
++
+ 
+ # Aligned with HF's implementation, using sliding window inclusive with the last token
+ # SGLang assumes exclusive
+@@ -404,6 +420,20 @@ class Gemma4Attention(nn.Module):
+             prefix=add_prefix("attn", prefix),
+         )
+ 
++    def _init_esimd_qkv_cache(self):
++        """Lazily build precomputed buffers for the ESIMD QKV+norm+rope kernel."""
++        if hasattr(self, "_esimd_qkv_cache"):
++            return self._esimd_qkv_cache
++        dev = self.q_norm.weight.device
++        dtype = torch.float16
++        cache = {
++            "wq": (self.q_norm.weight.data.to(dtype) - 1.0).contiguous(),
++            "wk": (self.k_norm.weight.data.to(dtype) - 1.0).contiguous(),
++            "gate": torch.empty((1, self.q_size), dtype=dtype, device=dev),
++        }
++        self._esimd_qkv_cache = cache
++        return cache
++
+     def forward(
+         self,
+         positions: torch.Tensor,
+@@ -412,6 +442,66 @@ class Gemma4Attention(nn.Module):
+         **kwargs,
+     ):
+         qkv, _ = self.qkv_proj(hidden_states)
++
++        # ESIMD fast path: fused QKV split + Q/K RMSNorm + RoPE in one kernel.
++        # Eligible when: head_dim==256, fp16, non-kv-shared, decode (M small).
++        is_kv_shared = (
++            self.is_kv_shared_layer and self.kv_shared_layer_index is not None
++        )
++        _use_esimd_qkv = (
++            _esimd_qkv_split_norm_rope is not None
++            and self.head_dim == 256
++            and qkv.dtype == torch.float16
++            and not is_kv_shared
++            and qkv.is_contiguous()
++            and os.environ.get("SGLANG_DISABLE_ESIMD_QKV", "0") != "1"
++        )
++        if _use_esimd_qkv:
++            cache = self._init_esimd_qkv_cache()
++            n_tok = qkv.shape[0]
++            dev = qkv.device
++            q = torch.empty(n_tok, self.q_size, dtype=torch.float16, device=dev)
++            k = torch.empty(n_tok, self.kv_size, dtype=torch.float16, device=dev)
++            v = torch.empty(n_tok, self.kv_size, dtype=torch.float16, device=dev)
++            self.rotary_emb._match_cos_sin_cache_dtype(qkv)
++            cs_cache = self.rotary_emb.cos_sin_cache
++            rotary_dim = cs_cache.shape[-1]  # already = head_dim for sliding
++            # positions.to(int32) is identical across all decoder layers in a
++            # step; cache it on forward_batch (shared per step, fresh each step)
++            # to drop ~1 redundant cast kernel per layer.
++            pos_i32 = getattr(forward_batch, "_gemma4_positions_i32", None)
++            if (
++                pos_i32 is None
++                or getattr(forward_batch, "_gemma4_positions_src", None) is not positions
++            ):
++                pos_i32 = positions.to(torch.int32)
++                forward_batch._gemma4_positions_i32 = pos_i32
++                forward_batch._gemma4_positions_src = positions
++            _esimd_qkv_split_norm_rope(
++                qkv, q, cache["gate"], k, v,
++                cache["wq"], cache["wk"],
++                pos_i32,
++                self.num_heads, self.num_kv_heads,
++                False,  # attn_output_gate
++                rotary_dim,
++                cs_cache,
++                normalize_v=True,
++            )
++            # V norm is now fused into the ESIMD kernel (V branch does RMSNorm,
++            # with_scale=False → pure norm, no weight multiply). No separate call.
++            v_3d = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
++            # Reshape for attention: q [n_tok, num_heads, head_dim], k/v [n_tok, kv_heads, head_dim]
++            q = q.unflatten(-1, (self.num_heads, self.head_dim))
++            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
++            v = v_3d
++            attn_output = self.attn(
++                q, k, v, forward_batch=forward_batch, save_kv_cache=True,
++            )
++            if attn_output.dim() == 3:
++                attn_output = attn_output.flatten(-2, -1)
++            output, _ = self.o_proj(attn_output)
++            return output
++
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+ 
+         # Fused Q/K/V RMSNorm: replaces three separate norm kernels with one.
+@@ -424,9 +514,11 @@ class Gemma4Attention(nn.Module):
+         )
+         can_fuse_qkv_norm = (
+             (q.is_cuda or q.is_xpu)
++            and self.head_dim == 256
+             and self.q_norm.scale_shift == 0.0
+             and self.k_norm.scale_shift == 0.0
+             and not self.v_norm.with_scale
++            and os.environ.get("SGLANG_GEMMA4_DISABLE_FUSED_QKV_NORM", "0") != "1"
+         )
+         if can_fuse_qkv_norm:
+             if is_kv_shared:
+@@ -665,9 +757,10 @@ class Gemma4DecoderLayer(nn.Module):
+             hidden_states=hidden_states,
+             forward_batch=forward_batch,
+         )
+-        hidden_states = self.post_attention_layernorm(hidden_states)
+ 
+         if self.enable_moe_block:
++            # MoE path keeps the standalone post-attention norm.
++            hidden_states = self.post_attention_layernorm(hidden_states)
+             # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
+             # Also need raw (unfused) residual for router and pre_ff_norm_2
+             hidden_states, residual = self.pre_feedforward_layernorm(
+@@ -714,10 +807,53 @@ class Gemma4DecoderLayer(nn.Module):
+             # Combine branches
+             hidden_states = hidden_states_1 + hidden_states_2
+         else:
+-            # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
+-            hidden_states, residual = self.pre_feedforward_layernorm(
+-                hidden_states, residual
+-            )
++            # Dense path. Fuse the standalone post_attention_layernorm, the
++            # residual add, and pre_feedforward_layernorm into ONE kernel:
++            #   residual = post_attn_norm(attn_out) + residual
++            #   hidden   = pre_ff_norm(residual)
++            # (RMSNorm here uses raw weight, so pass weights as-is; `out` may
++            #  safely alias `attn_out` since the kernel reads it before writing.)
++            if (
++                _esimd_norm_add_norm is not None
++                and hidden_states.shape[0] == 1
++                and hidden_states.dtype == torch.float16
++                and hidden_states.is_contiguous()
++                and residual.is_contiguous()
++            ):
++                if not hasattr(self, "_nan_w1"):
++                    self._nan_w1 = (
++                        self.post_attention_layernorm.weight.data.to(torch.float16).contiguous()
++                    )
++                    self._nan_w2 = (
++                        self.pre_feedforward_layernorm.weight.data.to(torch.float16).contiguous()
++                    )
++                _esimd_norm_add_norm(
++                    hidden_states,
++                    residual,
++                    self._nan_w1,
++                    self._nan_w2,
++                    hidden_states,
++                    self.post_attention_layernorm.variance_epsilon,
++                    self.pre_feedforward_layernorm.variance_epsilon,
++                )
++            else:
++                hidden_states = self.post_attention_layernorm(hidden_states)
++                # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
++                if (
++                    _esimd_fused_add_rms_norm is not None
++                    and hidden_states.shape[0] == 1
++                    and hidden_states.dtype == torch.float16
++                    and hidden_states.is_contiguous()
++                    and residual.is_contiguous()
++                ):
++                    norm = self.pre_feedforward_layernorm
++                    if not hasattr(norm, "_esimd_w"):
++                        norm._esimd_w = norm.weight.data.to(torch.float16).contiguous()
++                    _esimd_fused_add_rms_norm(hidden_states, residual, norm._esimd_w, norm.variance_epsilon)
++                else:
++                    hidden_states, residual = self.pre_feedforward_layernorm(
++                        hidden_states, residual
++                    )
+             hidden_states = self.mlp(hidden_states)
+ 
+         if (
+@@ -726,15 +862,32 @@ class Gemma4DecoderLayer(nn.Module):
+             and (hidden_states.is_cuda or hidden_states.is_xpu)
+             and hidden_states.dim() == 2
+         ):
+-            # Fused: (post_ff_norm(h) + residual) * layer_scalar in one kernel
+             norm = self.post_feedforward_layernorm
+-            hidden_states = gemma_rmsnorm_residual_scalar(
+-                hidden_states,
+-                norm.weight.data,
+-                residual,
+-                self.layer_scalar,
+-                norm.variance_epsilon,
+-            )
++            if (
++                _esimd_rmsnorm_residual_scalar is not None
++                and hidden_states.shape[0] == 1
++                and hidden_states.dtype == torch.float16
++                and hidden_states.is_contiguous()
++                and residual.is_contiguous()
++            ):
++                if not hasattr(norm, "_esimd_w"):
++                    norm._esimd_w = (norm.weight.data.to(torch.float16) - 1.0).contiguous()
++                if not hasattr(self, "_rrs_scalar"):
++                    self._rrs_scalar = float(self.layer_scalar.item())
++                if not hasattr(self, "_rrs_buf"):
++                    self._rrs_buf = torch.empty_like(hidden_states)
++                hidden_states = _esimd_rmsnorm_residual_scalar(
++                    hidden_states, norm._esimd_w, residual, self._rrs_buf,
++                    norm.variance_epsilon, self._rrs_scalar,
++                )
++            else:
++                hidden_states = gemma_rmsnorm_residual_scalar(
++                    hidden_states,
++                    norm.weight.data,
++                    residual,
++                    self.layer_scalar,
++                    norm.variance_epsilon,
++                )
+         else:
+             hidden_states = self.post_feedforward_layernorm(hidden_states)
+             hidden_states = hidden_states + residual
+diff --git a/python/sglang/srt/models/gemma4_mm.py b/python/sglang/srt/models/gemma4_mm.py
+index 3629782ca3..3d7068ab44 100644
+--- a/python/sglang/srt/models/gemma4_mm.py
++++ b/python/sglang/srt/models/gemma4_mm.py
+@@ -606,12 +606,17 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
+         # so non-first ranks must skip this and pull per_layer_inputs from the
+         # PP proxy (forwarded by Gemma4TextModel).
+         if is_first_rank and input_ids is not None:
+-            ple_ids = input_ids.clone()
+-            pad_id = self.config.text_config.pad_token_id
+-            ple_ids[input_ids == self.config.image_token_id] = pad_id
+-            ple_ids[input_ids == self.config.video_token_id] = pad_id
+-            ple_ids[input_ids == self.config.audio_token_id] = pad_id
+-            per_layer_inputs = self.get_per_layer_inputs(ple_ids)
++            if forward_batch.forward_mode.is_decode_or_idle():
++                # Decode: no image/video/audio tokens possible; skip boolean
++                # indexing (not capturable in XPU graph).
++                per_layer_inputs = self.get_per_layer_inputs(input_ids)
++            else:
++                ple_ids = input_ids.clone()
++                pad_id = self.config.text_config.pad_token_id
++                ple_ids[input_ids == self.config.image_token_id] = pad_id
++                ple_ids[input_ids == self.config.video_token_id] = pad_id
++                ple_ids[input_ids == self.config.audio_token_id] = pad_id
++                per_layer_inputs = self.get_per_layer_inputs(ple_ids)
+ 
+         # Prepare bidirectional attention masks for image tokens during prefill.
+         # mm_inputs is preserved on every PP rank up to the first-rank embed
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
 index 65f78e6917..bf045b8549 100644
 --- a/python/sglang/srt/models/qwen3_5.py
@@ -4936,6 +5674,144 @@ index 6c77ff64f9..78d88e51c6 100644
              if self.speculative_num_draft_tokens is not None:
                  assert not self.enable_mamba_extra_buffer_lazy(), (
                      "extra_buffer_lazy is not yet supported with speculative decoding. "
+diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
+index 3bb3cec3ae..49e3644c03 100644
+--- a/python/sglang/srt/speculative/eagle_utils.py
++++ b/python/sglang/srt/speculative/eagle_utils.py
+@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, List, Optional
+ 
+ import torch
+ 
+-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
++from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu
+ from sglang.srt.utils.async_probe import maybe_detect_oob
+ 
+ if TYPE_CHECKING:
+@@ -17,12 +17,31 @@ _is_cuda = is_cuda()
+ _is_hip = is_hip()
+ _is_npu = is_npu()
+ _is_musa = is_musa()
++_is_xpu = is_xpu()
+ 
+ if _is_cuda or _is_hip or _is_musa:
+     from sgl_kernel import (
+         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
+     )
+ 
++# XPU uses the SYCL implementation shipped by custom_esimd_kernels_sglang
++# (ptl branch). Its signature matches the CUDA op exactly (8 tensors + 4 ints
++# including tree_mask_mode), unlike the sgl-kernel-xpu stub which is missing
++# tree_mask_mode. Import lazily so the module is optional at import time.
++_xpu_build_tree_kernel_efficient = None
++_xpu_verify_tree_greedy = None
++if _is_xpu:
++    try:
++        from custom_esimd_kernels_sglang.eagle_ops import (
++            build_tree_kernel_efficient as _xpu_build_tree_kernel_efficient,
++        )
++        from custom_esimd_kernels_sglang.eagle_ops import (
++            verify_tree_greedy as _xpu_verify_tree_greedy,
++        )
++    except ImportError:
++        _xpu_build_tree_kernel_efficient = None
++        _xpu_verify_tree_greedy = None
++
+ 
+ def per_step_draft_out_cache_loc(
+     out_cache_loc: torch.Tensor,
+@@ -189,6 +208,29 @@ def build_tree_kernel_efficient(
+             num_verify_tokens,
+             tree_mask_mode,
+         )
++    elif _is_xpu:
++        # SYCL impl from custom_esimd_kernels_sglang (ptl branch). Same 12-arg
++        # signature as the CUDA op (tree_mask_mode included).
++        if _xpu_build_tree_kernel_efficient is None:
++            raise RuntimeError(
++                "XPU speculative decoding requires custom_esimd_kernels_sglang "
++                "with the eagle_ops extension (provides build_tree_kernel_efficient); "
++                "the module could not be imported."
++            )
++        _xpu_build_tree_kernel_efficient(
++            parent_list,
++            top_scores_index,
++            seq_lens,
++            tree_mask,
++            positions,
++            retrieve_index,
++            retrieve_next_token,
++            retrieve_next_sibling,
++            topk,
++            spec_steps,
++            num_verify_tokens,
++            tree_mask_mode,
++        )
+     else:
+         sgl_build_tree_kernel_efficient(
+             parent_list,
+@@ -254,6 +296,25 @@ def verify_tree_greedy_func(
+             retrive_next_sibling=retrieve_next_sibling,
+             target_predict=target_predict,
+         )
++    elif _is_xpu:
++        # SYCL impl from custom_esimd_kernels_sglang (ptl branch); positional
++        # signature matches the CUDA op.
++        if _xpu_verify_tree_greedy is None:
++            raise RuntimeError(
++                "XPU speculative decoding requires custom_esimd_kernels_sglang "
++                "with the eagle_ops extension (provides verify_tree_greedy); "
++                "the module could not be imported."
++            )
++        _xpu_verify_tree_greedy(
++            predicts,
++            accept_index,
++            accept_token_num,
++            candidates,
++            retrieve_index,
++            retrieve_next_token,
++            retrieve_next_sibling,
++            target_predict,
++        )
+     return predicts, accept_index, accept_token_num
+ 
+ 
+diff --git a/python/sglang/srt/speculative/spec_utils.py b/python/sglang/srt/speculative/spec_utils.py
+index 48d07334af..c00eb1e982 100644
+--- a/python/sglang/srt/speculative/spec_utils.py
++++ b/python/sglang/srt/speculative/spec_utils.py
+@@ -39,12 +39,13 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
+ from sglang.srt.speculative.triton_ops.cache_locs import (
+     get_target_cache_loc as get_target_cache_loc,
+ )
+-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
++from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu
+ 
+ _is_cuda = is_cuda()
+ _is_hip = is_hip()
+ _is_npu = is_npu()
+ _is_musa = is_musa()
++_is_xpu = is_xpu()
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+@@ -158,7 +159,7 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
+     return not server_args.enable_multi_layer_eagle
+ 
+ 
+-@torch.compile(dynamic=True, disable=_is_npu)
++@torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
+ def create_num_accept_tokens_filter(
+     num_correct_drafts: torch.Tensor,
+     unfinished_index_device: torch.Tensor,
+@@ -192,7 +193,7 @@ def _select_top_k_tokens_first(
+     return input_ids, hidden_states, topk_p, tree_info
+ 
+ 
+-@torch.compile(dynamic=True, disable=_is_npu)
++@torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
+ def _select_top_k_tokens_later(
+     i: int,
+     topk_p: torch.Tensor,
 diff --git a/python/sglang/srt/utils/hf_transformers/config.py b/python/sglang/srt/utils/hf_transformers/config.py
 index f66ea9a672..8e5f7beda7 100644
 --- a/python/sglang/srt/utils/hf_transformers/config.py
