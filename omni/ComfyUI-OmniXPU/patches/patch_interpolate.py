@@ -4,6 +4,8 @@ import logging
 import torch
 import torch.nn.functional as F
 
+from .debug import trace_patch
+
 log = logging.getLogger("ComfyUI-OmniXPU")
 
 _original_interpolate = None
@@ -14,6 +16,7 @@ def apply():
     _original_interpolate = F.interpolate
 
     @functools.wraps(_original_interpolate)
+    @trace_patch("interpolate", ("input",))
     def _xpu_interpolate(input_tensor, *args, **kwargs):
         if input_tensor.device.type == "xpu":
             dev = input_tensor.device

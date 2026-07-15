@@ -40,6 +40,25 @@ OMNIXPU_INTERPOLATE_FIX=0   # Disable interpolate workaround only
 OMNIXPU_MEDIAN_FIX=0        # Disable median workaround only
 ```
 
+Set `OMNIXPU_DEBUG=1` before starting ComfyUI to log calls intercepted by the
+enabled patches. Only calls containing at least one XPU tensor are logged, and
+the output includes tensor shapes, dtypes, and devices without printing values
+or synchronizing the device:
+
+```bash
+OMNIXPU_DEBUG=1 python main.py
+```
+
+Example:
+
+```text
+[OmniXPU DEBUG] patch=attention tensors=q(shape=(1, 4352, 3072), dtype=torch.bfloat16, device=xpu:0), k(shape=(1, 4352, 3072), dtype=torch.bfloat16, device=xpu:0), v(shape=(1, 4352, 3072), dtype=torch.bfloat16, device=xpu:0)
+```
+
+The flag is evaluated when patch wrappers are installed during ComfyUI startup.
+Changing it after startup does not affect existing wrappers and requires a
+process restart. When it is unset, no tracing wrappers are installed.
+
 Attention routing is selected independently:
 
 ```bash

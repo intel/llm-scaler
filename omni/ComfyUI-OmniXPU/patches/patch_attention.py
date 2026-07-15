@@ -3,6 +3,8 @@ import os
 
 import torch
 
+from .debug import trace_patch
+
 log = logging.getLogger("ComfyUI-OmniXPU")
 
 _fallback_esimd_sdp = None
@@ -119,6 +121,10 @@ def apply():
     _pytorch_fallback = attn_mod.attention_pytorch
     wrap_attn = attn_mod.wrap_attn
 
+    @trace_patch(
+        "attention",
+        ("q", "k", "v", "heads", "mask", "attn_precision", "skip_reshape"),
+    )
     @wrap_attn
     def attention_esimd(
         q,

@@ -2,6 +2,8 @@ import logging
 
 import torch
 
+from .debug import trace_patch
+
 log = logging.getLogger("ComfyUI-OmniXPU")
 
 _original_fn = None
@@ -19,6 +21,7 @@ def apply():
 
     _original_fn = comfy_float.manual_stochastic_round_to_float8
 
+    @trace_patch("fp8_neg_zero_fix", ("x", "dtype", "generator"))
     def _patched(x, dtype, generator=None):
         result = _original_fn(x, dtype, generator=generator)
         # Fix: on XPU, -0.0 → float8 produces NaN
