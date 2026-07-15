@@ -55,7 +55,8 @@ Example:
 [OmniXPU DEBUG] patch=attention tensors=q(shape=(1, 4352, 3072), dtype=torch.bfloat16, device=xpu:0), k(shape=(1, 4352, 3072), dtype=torch.bfloat16, device=xpu:0), v(shape=(1, 4352, 3072), dtype=torch.bfloat16, device=xpu:0)
 ```
 
-The flag is read when each patch module is imported, so changing it requires a
+The flag is evaluated when patch wrappers are installed during ComfyUI startup.
+Changing it after startup does not affect existing wrappers and requires a
 process restart. When it is unset, no tracing wrappers are installed.
 
 Attention routing is selected independently:

@@ -72,7 +72,7 @@ def trace_patch(
     *,
     xpu_only: bool = True,
 ) -> Callable[[_F], _F]:
-    """Wrap a patch call when tracing was enabled before module import."""
+    """Wrap a patch call if tracing is enabled when the decorator is applied."""
 
     def decorator(func: _F) -> _F:
         if not debug_enabled() or getattr(func, _WRAPPED_ATTR, None) == patch_name:

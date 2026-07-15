@@ -26,7 +26,7 @@ def apply_all_patches(cfg):
     import importlib, os, sys
 
     if debug_enabled():
-        log.info("[OmniXPU] debug tracing enabled (OMNIXPU_DEBUG=1)")
+        log.info("[OmniXPU] debug tracing enabled")
 
     _patches_dir = os.path.dirname(os.path.abspath(__file__))
     _pkg_name = os.path.basename(os.path.dirname(_patches_dir))

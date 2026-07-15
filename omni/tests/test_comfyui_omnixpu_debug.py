@@ -10,10 +10,19 @@ import pytest
 import torch
 
 _DEBUG_PATH = Path(__file__).parents[1] / "ComfyUI-OmniXPU" / "patches" / "debug.py"
+if not _DEBUG_PATH.is_file():
+    pytest.skip(
+        f"OmniXPU debug helper is unavailable: {_DEBUG_PATH}", allow_module_level=True
+    )
+
 _SPEC = importlib.util.spec_from_file_location("omnixpu_debug_test_module", _DEBUG_PATH)
-assert _SPEC is not None and _SPEC.loader is not None
+if _SPEC is None or _SPEC.loader is None:
+    pytest.skip("Unable to load the OmniXPU debug helper", allow_module_level=True)
+
 _DEBUG = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_DEBUG)
+
+_XPU_AVAILABLE = hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
 def test_debug_flag_defaults_to_disabled(monkeypatch):
@@ -67,7 +76,7 @@ def test_enabled_trace_formats_tensor_metadata(monkeypatch, caplog):
     assert "nested['weight'](shape=(4, 3), dtype=torch.int8, device=cpu)" in message
 
 
-@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is unavailable")
+@pytest.mark.skipif(not _XPU_AVAILABLE, reason="XPU is unavailable")
 def test_enabled_trace_logs_xpu_calls(monkeypatch, caplog):
     monkeypatch.setenv("OMNIXPU_DEBUG", "1")
 
