@@ -394,7 +394,7 @@ index ade156e98c..a430c66952 100644
                      ssm_states.dtype, copy=False
                  )
 diff --git a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
-index 0daf8f4e25..952ea1bc90 100644
+index 0daf8f4e25..cab43381b4 100644
 --- a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
 +++ b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
 @@ -34,6 +34,17 @@ elif is_xpu():
@@ -434,7 +434,7 @@ index 0daf8f4e25..952ea1bc90 100644
 +        import os as _os
 +        if (
 +            is_xpu()
-+            and _os.environ.get("SGLANG_XPU_GDN_EXTEND_ESIMD") == "1"
++            and _os.environ.get("SGL_XPU_GDN_EXTEND_ESIMD") == "1"
 +            and q.size(-1) == 128
 +            and v.size(-1) == 128
 +            and v.size(-2) % q.size(-2) == 0  # H_v % H_k == 0 (GQA on GDN)
@@ -460,7 +460,7 @@ index 0daf8f4e25..952ea1bc90 100644
              q=q,
              k=k,
 diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py
-index ae5365e8d6..8c7f30ef5a 100644
+index ae5365e8d6..0f54d2a8ce 100644
 --- a/python/sglang/srt/layers/attention/triton_backend.py
 +++ b/python/sglang/srt/layers/attention/triton_backend.py
 @@ -36,6 +36,21 @@ _is_gfx942 = is_gfx942_supported()
@@ -471,7 +471,7 @@ index ae5365e8d6..8c7f30ef5a 100644
 +# NHD KV layout `[n_slots, Hkv, D]` directly via kv_indptr/kv_indices, no
 +# paged-cache reshape required. 2-phase split-K kernel; supports radix cache.
 +_ENABLE_XPU_ESIMD_DECODE = get_bool_env_var(
-+    "SGLANG_ENABLE_XPU_ESIMD_DECODE", "false"
++    "SGL_XPU_ESIMD_DECODE", "false"
 +)
 +_XPU_ESIMD_DECODE_FN = None
 +if _ENABLE_XPU_ESIMD_DECODE:
@@ -570,7 +570,7 @@ index ae5365e8d6..8c7f30ef5a 100644
              q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
              self.token_to_kv_pool.get_key_buffer(layer.layer_id),
 diff --git a/python/sglang/srt/layers/attention/xpu_backend.py b/python/sglang/srt/layers/attention/xpu_backend.py
-index ea02e001f1..a5495ee9e9 100644
+index ea02e001f1..9c93802638 100644
 --- a/python/sglang/srt/layers/attention/xpu_backend.py
 +++ b/python/sglang/srt/layers/attention/xpu_backend.py
 @@ -1,9 +1,29 @@
@@ -614,7 +614,7 @@ index ea02e001f1..a5495ee9e9 100644
 +# same op the triton backend's XPU ESIMD fast path uses. On this stack the paged
 +# eagle_page_attn_decode kernel is numerically wrong for GQA ratio=8 / single KV
 +# head, so the XPU graph decode path routes here instead. Gated by
-+# SGLANG_XPU_DECODE_SGLANG_ATTN (default on); falls back to eagle when unavailable.
++# SGL_XPU_DECODE_SGLANG_ATTN (default on); falls back to eagle when unavailable.
 +_sglang_decode_attn_fn = None
 +try:
 +    from custom_esimd_kernels_sglang import sglang_decode_attn as _sglang_decode_attn_fn
@@ -633,7 +633,7 @@ index ea02e001f1..a5495ee9e9 100644
 +# PTL-proven fp16 prefill SDPA DPAS kernel (custom_esimd_kernels_sglang, HD=256).
 +# Replaces the cutlass-sycl flash fp16 prefill (which NaNs on Xe / produces
 +# garbage prefill logits) for head_dim==256 fp16. Lazily resolved; gated by
-+# SGLANG_XPU_PREFILL_DPAS=1. Op namespace is custom_esimd_kernels_vllm (unchanged
++# SGL_XPU_PREFILL_DPAS=1. Op namespace is custom_esimd_kernels_vllm (unchanged
 +# from the ported kernel). Falls through to flash_attn_with_kvcache when the op
 +# is unavailable / ineligible.
 +_prefill_dpas_op = None
@@ -980,12 +980,12 @@ index ea02e001f1..a5495ee9e9 100644
 +            # 腿C (#69): for fp16 HD=256 prefill, prefer the PTL-proven DPAS SDPA
 +            # kernel over the cutlass-sycl flash fp16 path (which NaNs / produces
 +            # garbage prefill logits on this Xe stack). Gated by
-+            # SGLANG_XPU_PREFILL_DPAS=1; falls through to flash_attn_with_kvcache when
++            # SGL_XPU_PREFILL_DPAS=1; falls through to flash_attn_with_kvcache when
 +            # off / ineligible / op missing.
 +            _dpas = (
 +                _get_prefill_dpas_op()
 +                if (
-+                    os.environ.get("SGLANG_XPU_PREFILL_DPAS") == "1"
++                    os.environ.get("SGL_XPU_PREFILL_DPAS") == "1"
 +                    and q.dtype == torch.float16
 +                    and layer.head_dim == 256
 +                    and not layer.is_cross_attention
@@ -1079,7 +1079,7 @@ index ea02e001f1..a5495ee9e9 100644
 +                and getattr(metadata, "kv_indices", None) is not None
 +                and layer.head_dim == 256
 +                and layer.tp_q_head_num % layer.tp_k_head_num == 0
-+                and os.environ.get("SGLANG_XPU_DECODE_SGLANG_ATTN", "1") == "1"
++                and os.environ.get("SGL_XPU_DECODE_SGLANG_ATTN", "1") == "1"
 +            ):
 +                # Proven-correct flat-NHD token-granular decode kernel. The paged
 +                # eagle_page_attn_decode is numerically wrong for GQA ratio=8 /
@@ -1421,7 +1421,7 @@ index 15a3d6aac9..4fe805001c 100644
                  logits = torch.matmul(
                      hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
 diff --git a/python/sglang/srt/layers/moe/moe_runner/triton.py b/python/sglang/srt/layers/moe/moe_runner/triton.py
-index 96e431d4e3..76a515822e 100644
+index 96e431d4e3..f2ba507fc2 100644
 --- a/python/sglang/srt/layers/moe/moe_runner/triton.py
 +++ b/python/sglang/srt/layers/moe/moe_runner/triton.py
 @@ -1,5 +1,6 @@
@@ -1580,11 +1580,11 @@ index 96e431d4e3..76a515822e 100644
          running_state: dict,
          hooks: Optional[Any] = None,
      ) -> TritonRunnerOutput:
-+        # XPU fast path: gated by SGLANG_ENABLE_ESIMD_MOE=1. The fused-func
++        # XPU fast path: gated by SGL_XPU_ESIMD_MOE=1. The fused-func
 +        # path (`fused_experts_none_to_triton`) is the one that actually fires
 +        # under the default runner config; this branch is here for the future
 +        # case where a runner_input gets routed straight into the runner_core.
-+        if os.environ.get("SGLANG_ENABLE_ESIMD_MOE", "0") == "1":
++        if os.environ.get("SGL_XPU_ESIMD_MOE", "0") == "1":
 +            out = _try_esimd_moe_silu_routed(runner_input, quant_info, self.config)
 +            if out is not None:
 +                return TritonRunnerOutput(hidden_states=out)
@@ -1775,7 +1775,7 @@ index 96e431d4e3..76a515822e 100644
 +        return None
 +    # NOTE: this routed-only path does NOT yet handle Qwen3.6 shared-expert
 +    # fusion (shared_expert_intermediate_size == moe_intermediate_size), so the
-+    # full MoE output is incomplete -> SGLANG_ENABLE_ESIMD_MOE_PREFILL must stay
++    # full MoE output is incomplete -> SGL_XPU_ESIMD_MOE_PREFILL must stay
 +    # off until the shared expert contribution is added. Kept wired + scale-fixed
 +    # for when that lands.
 +
@@ -1812,7 +1812,7 @@ index 96e431d4e3..76a515822e 100644
 +    # a single linear layer, so a single scalar per expert is too lossy.
 +    # TODO: migrate the per-block FP8 MoE GEMM kernel from llm-scaler/vllm
 +    # (or feed 2D scale through a future kernel variant) before re-enabling.
-+    if os.environ.get("SGLANG_ENABLE_ESIMD_MOE", "0") == "1":
++    if os.environ.get("SGL_XPU_ESIMD_MOE", "0") == "1":
 +        esimd_out = _maybe_esimd_moe_silu_fused(
 +            dispatch_output, quant_info, runner_config
 +        )
@@ -1821,7 +1821,7 @@ index 96e431d4e3..76a515822e 100644
 +
 +    # Large-T (prefill) M-tiled DPAS FP8 MoE kernel. Separate env gate so it can
 +    # be enabled independently of the decode kernel.
-+    if os.environ.get("SGLANG_ENABLE_ESIMD_MOE_PREFILL", "0") == "1":
++    if os.environ.get("SGL_XPU_ESIMD_MOE_PREFILL", "0") == "1":
 +        esimd_out = _maybe_esimd_moe_silu_prefill(
 +            dispatch_output, quant_info, runner_config
 +        )
@@ -4135,7 +4135,7 @@ index ebbfc2b288..56497dcc76 100644
              if _is_hip:
                  raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 3b30eb0e1f..ea5d755e4d 100644
+index 3b30eb0e1f..141eb11a4d 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -849,6 +849,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
@@ -4150,7 +4150,7 @@ index 3b30eb0e1f..ea5d755e4d 100644
 +            # in progress. torch.cuda.CUDAGraph / torch.cuda.graph are
 +            # aliased onto torch.xpu equivalents in cuda_graph_runner at
 +            # import time (see _xpu_patch_cuda_graph_apis).
-+            if os.environ.get("SGLANG_XPU_ENABLE_GRAPH") == "1":
++            if os.environ.get("SGL_XPU_ENABLE_GRAPH") == "1":
 +                self.init_device_graphs()
 +            else:
 +                self.graph_runner = None
@@ -4836,7 +4836,7 @@ index 3629782ca3..3d7068ab44 100644
          # Prepare bidirectional attention masks for image tokens during prefill.
          # mm_inputs is preserved on every PP rank up to the first-rank embed
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
-index 65f78e6917..0718c24691 100644
+index 65f78e6917..bf045b8549 100644
 --- a/python/sglang/srt/models/qwen3_5.py
 +++ b/python/sglang/srt/models/qwen3_5.py
 @@ -15,6 +15,7 @@
@@ -5301,7 +5301,7 @@ index 65f78e6917..0718c24691 100644
 +        # recurrence in one launch. Sequential [q|k|v|z] layout — no gather.
 +        # Decode-only; prefill stays on the Triton/PyTorch path.
 +        _ENABLE_XPU_GDN_ESIMD = os.environ.get(
-+            "SGLANG_XPU_GDN_ESIMD", "0"
++            "SGL_XPU_GDN_ESIMD", "0"
 +        ) == "1"
 +        if (
 +            _ENABLE_XPU_GDN_ESIMD
@@ -5330,7 +5330,7 @@ index 65f78e6917..0718c24691 100644
 +        # implicit cast loses dynamic range during RoPE and gsm8k drops from
 +        # 0.80 to 0.40 (verified). Restrict to fp16 inputs only.
 +        if (
-+            os.environ.get("SGLANG_XPU_FA_ESIMD_QKV") == "1"
++            os.environ.get("SGL_XPU_FA_ESIMD_QKV") == "1"
 +            and self.head_dim == 256
 +            and hidden_states.dim() == 2
 +            and hidden_states.dtype == torch.float16
