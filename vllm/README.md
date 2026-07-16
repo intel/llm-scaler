@@ -1295,7 +1295,7 @@ vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.8 --max-num-batched-to
 
 vLLM supports serving multiple LoRA adapters with runtime load/unload capabilities. This enables fine-tuned model variants to be served from a single base model instance.
 
-**Supported models:** Currently verified with Qwen3.5/3.6-27B and Qwen3.5/3.6-35B-A3B models.
+**Supported models:** Currently verified with Qwen3.6-27B and Qwen3.6-35B-A3B models.
 
 #### Starting the server with LoRA adapters
 
