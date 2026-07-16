@@ -9,7 +9,7 @@ import logging
 import torch
 import comfy.model_management
 
-from .debug import trace_patch
+from .debug import log_debug_event
 
 log = logging.getLogger("ComfyUI-OmniXPU")
 
@@ -22,6 +22,17 @@ def _log_first(msg):
     if not _logged_first_use:
         _logged_first_use = True
         log.info("[OmniXPU] fp8_gemm first use: %s", msg)
+
+
+def _dispatch_details(module):
+    weight = getattr(module, "weight", None)
+    layout = getattr(module, "layout_type", None)
+    if layout is None:
+        layout = getattr(weight, "_layout_cls", None)
+    return {
+        "quant_format": getattr(module, "quant_format", None),
+        "layout": layout,
+    }
 
 
 def apply():
@@ -38,8 +49,14 @@ def apply():
     if hasattr(comfy_ops, "fp8_linear"):
         _orig_fp8_linear = comfy_ops.fp8_linear
 
-        @trace_patch("fp8_gemm.fp8_linear", ("self", "input"))
         def _patched_fp8_linear(self, input):
+            log_debug_event(
+                "dispatch",
+                "fp8_linear",
+                {"input": input},
+                details=_dispatch_details(self),
+                verbose_only=True,
+            )
             dtype = self.weight.dtype
             if dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
                 return None
@@ -64,6 +81,12 @@ def apply():
                 scale_weight = self.scale_weight if hasattr(self, 'scale_weight') and self.scale_weight is not None else torch.ones((), device=input.device, dtype=torch.float32)
                 try:
                     o = _omni_fp8_linear(input, w, scale_weight, bias)
+                    log_debug_event(
+                        "kernel",
+                        "fp8_linear",
+                        {"input": input, "weight": w, "weight_scale": scale_weight, "bias": bias},
+                        details={"backend": "omni_xpu", "format": dtype},
+                    )
                     comfy_ops.uncast_bias_weight(self, w, bias, offload_stream)
                     if tensor_3d:
                         o = o.reshape((input_shape[0], input_shape[1], w.shape[0]))
@@ -90,10 +113,6 @@ def apply():
 
             # -- Intercept 1: _forward(input, weight, bias) --
             # Called from forward_comfy_cast_weights after cast_bias_weight.
-            @trace_patch(
-                "fp8_gemm.mixed_precision_ops.Linear._forward",
-                ("self", "input", "weight", "bias"),
-            )
             def _mp_inner_forward(self, input, weight, bias):
                 if (_omni_fp8_linear is not None and input.is_xpu and input.ndim == 2 and
                         hasattr(weight, 'dtype') and weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)):
@@ -105,18 +124,28 @@ def apply():
                             scale_w = getattr(p, 'scale', None) if p else None
                         if scale_w is None:
                             scale_w = torch.ones((), device=input.device, dtype=torch.float32)
-                        return _omni_fp8_linear(input, weight, scale_w, bias)
+                        output = _omni_fp8_linear(input, weight, scale_w, bias)
+                        log_debug_event(
+                            "kernel",
+                            "fp8_linear",
+                            {"input": input, "weight": weight, "weight_scale": scale_w, "bias": bias},
+                            details={"backend": "omni_xpu", "format": weight.dtype},
+                        )
+                        return output
                     except Exception as e:
                         _log_first(f"_forward failed, falling back: {e}")
                 return _orig_inner_fwd(self, input, weight, bias)
 
             # -- Intercept 2: forward() --
             # Intercepts before comfy_kitchen QuantizedTensor dispatch.
-            @trace_patch(
-                "fp8_gemm.mixed_precision_ops.Linear.forward",
-                ("self", "input"),
-            )
             def _mp_forward(self, input, *fwd_args, **fwd_kwargs):
+                log_debug_event(
+                    "dispatch",
+                    "mixed_precision.Linear",
+                    {"input": input},
+                    details=_dispatch_details(self),
+                    verbose_only=True,
+                )
                 if (_omni_fp8_linear is not None and input.is_xpu and
                         getattr(self, 'quant_format', None) in ('float8_e4m3fn', 'float8_e5m2') and
                         len(self.weight_function) == 0 and len(self.bias_function) == 0):
@@ -143,6 +172,12 @@ def apply():
                                        f"dtype={w_fp8.dtype} format={self.quant_format}")
 
                             o = _omni_fp8_linear(input_2d, w_fp8, scale_w, bias)
+                            log_debug_event(
+                                "kernel",
+                                "fp8_linear",
+                                {"input": input_2d, "weight": w_fp8, "weight_scale": scale_w, "bias": bias},
+                                details={"backend": "omni_xpu", "format": self.quant_format},
+                            )
                             if input.ndim == 3:
                                 o = o.reshape(input_shape[0], input_shape[1], -1)
                             return o

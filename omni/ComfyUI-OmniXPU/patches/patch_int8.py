@@ -20,8 +20,9 @@ def apply():
 
     @torch.library.impl("comfy_kitchen::int8_linear", "XPU")
     @trace_patch(
-        "int8.int8_linear",
+        "int8_linear",
         ("x", "weight", "weight_scale", "bias", "output_dtype_code"),
+        details={"backend": "omni_xpu"},
     )
     def _xpu_impl(x, weight, weight_scale, bias, output_dtype_code, convrot=False, convrot_groupsize=256):
         out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]

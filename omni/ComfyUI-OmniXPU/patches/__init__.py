@@ -1,6 +1,6 @@
 import logging
 
-from .debug import debug_enabled
+from .debug import debug_enabled, verbose_debug_enabled
 
 log = logging.getLogger("ComfyUI-OmniXPU")
 
@@ -23,10 +23,14 @@ def get_status():
 
 
 def apply_all_patches(cfg):
-    import importlib, os, sys
+    import importlib
+    import os
+    import sys
 
-    if debug_enabled():
-        log.info("[OmniXPU] debug tracing enabled")
+    if verbose_debug_enabled():
+        log.info("[OmniXPU] verbose debug tracing enabled (dispatch + kernel)")
+    elif debug_enabled():
+        log.info("[OmniXPU] debug tracing enabled (kernel only)")
 
     _patches_dir = os.path.dirname(os.path.abspath(__file__))
     _pkg_name = os.path.basename(os.path.dirname(_patches_dir))
