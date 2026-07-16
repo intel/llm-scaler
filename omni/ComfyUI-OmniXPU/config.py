@@ -14,6 +14,7 @@ class Config:
         self.interpolate_fix = master and os.environ.get("OMNIXPU_INTERPOLATE_FIX", "1") != "0"
         self.median_fix = master and os.environ.get("OMNIXPU_MEDIAN_FIX", "1") != "0"
         self.int8 = master and os.environ.get("OMNIXPU_INT8", "1") != "0"
+        self.int8_ffn = self.int8 and os.environ.get("OMNIXPU_INT8_FFN", "1") != "0"
 
 
 config = Config()

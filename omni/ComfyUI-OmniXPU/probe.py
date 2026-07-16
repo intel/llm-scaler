@@ -9,11 +9,12 @@ sdp = None
 norm = None
 rotary = None
 linear_fp8 = None
+int8 = None
 
 
 def probe():
     """Probe omni_xpu_kernel and populate available submodules."""
-    global version, sdp, norm, rotary, linear_fp8
+    global version, sdp, norm, rotary, linear_fp8, int8
 
     try:
         import omni_xpu_kernel as pkg
@@ -52,6 +53,13 @@ def probe():
     except (ImportError, AttributeError):
         modules["linear_fp8"] = False
 
+    try:
+        from omni_xpu_kernel import int8 as _int8
+        int8 = _int8
+        modules["int8"] = True
+    except ImportError:
+        modules["int8"] = False
+
     available = [k for k, v in modules.items() if v]
     missing = [k for k, v in modules.items() if not v]
 
@@ -68,4 +76,5 @@ def summary():
         "norm": norm is not None,
         "rotary": rotary is not None,
         "linear_fp8": linear_fp8 is not None,
+        "int8": int8 is not None,
     }

@@ -52,6 +52,7 @@ def apply_all_patches(cfg):
     apply_fp8_gemm = _load_patch("patch_fp8_gemm")
     apply_attention = _load_patch("patch_attention")
     apply_int8 = _load_patch("patch_int8")
+    apply_int8_ffn = _load_patch("patch_int8_ffn")
 
     _apply_one("interpolate_fix", cfg.interpolate_fix, apply_interpolate)
     _apply_one("median_fix", cfg.median_fix, apply_median)
@@ -61,6 +62,7 @@ def apply_all_patches(cfg):
     _apply_one("fp8_gemm", cfg.fp8_gemm, apply_fp8_gemm)
     _apply_one("attention", cfg.attention, apply_attention)
     _apply_one("int8", cfg.int8, apply_int8)
+    _apply_one("int8_ffn", cfg.int8_ffn, apply_int8_ffn)
 
 
 def _apply_one(name, enabled, apply_fn):
