@@ -33,6 +33,7 @@ def test_non_default_stream_orders_sycl_and_onednn_kernels():
     torch.manual_seed(123)
     x_cpu = torch.randn(16, 128, dtype=torch.bfloat16)
     weight_cpu = torch.randn(64, 128, dtype=torch.bfloat16)
+    down_weight_cpu = torch.randn(128, 64, dtype=torch.bfloat16)
     rope_x_cpu = torch.randn(2, 3, 31, 64, dtype=torch.bfloat16)
     freqs_cpu = torch.randn(2, 1, 31, 32, 2, 2, dtype=torch.float32)
 
@@ -43,6 +44,64 @@ def test_non_default_stream_orders_sycl_and_onednn_kernels():
         qweight, weight_scale = int8.quantize_int8_tensorwise(weight)
         linear_out = int8.int8_linear(
             x, qweight, weight_scale, out_dtype=torch.bfloat16
+        )
+        qactivation, activation_scale = int8.quantize_int8_rowwise(x)
+        prequantized_out = int8.int8_linear_prequantized(
+            qactivation,
+            activation_scale,
+            qweight,
+            weight_scale,
+            out_dtype=torch.bfloat16,
+        )
+        shared1, shared2 = int8.int8_linear_shared_input(
+            x,
+            qweight,
+            weight_scale,
+            qweight,
+            weight_scale,
+            out_dtype=torch.bfloat16,
+        )
+        gated_q, gated_scale = int8.fused_silu_mul_quantize_rowwise(
+            shared1, shared2
+        )
+        down_weight = down_weight_cpu.to("xpu")
+        qdown_weight, down_weight_scale = int8.quantize_int8_tensorwise(
+            down_weight
+        )
+        mlp_out = int8.int8_linear_prequantized(
+            gated_q,
+            gated_scale,
+            qdown_weight,
+            down_weight_scale,
+            out_dtype=torch.bfloat16,
+        )
+        convrot_weight, convrot_weight_scale = (
+            int8.quantize_int8_convrot_weight(weight, group_size=64)
+        )
+        convrot_shared1, convrot_shared2 = int8.int8_linear_shared_input(
+            x,
+            convrot_weight,
+            convrot_weight_scale,
+            convrot_weight,
+            convrot_weight_scale,
+            out_dtype=torch.bfloat16,
+            convrot=True,
+            convrot_groupsize=64,
+        )
+        convrot_gated = int8.fused_silu_mul(
+            convrot_shared1, convrot_shared2
+        )
+        convrot_gated = int8.rotate_convrot(convrot_gated, group_size=64)
+        convrot_q, convrot_scale = int8.quantize_int8_rowwise(convrot_gated)
+        convrot_down_weight, convrot_down_weight_scale = (
+            int8.quantize_int8_convrot_weight(down_weight, group_size=64)
+        )
+        convrot_mlp_out = int8.int8_linear_prequantized(
+            convrot_q,
+            convrot_scale,
+            convrot_down_weight,
+            convrot_down_weight_scale,
+            out_dtype=torch.bfloat16,
         )
 
         rope_x = rope_x_cpu.to("xpu")
@@ -56,8 +115,68 @@ def test_non_default_stream_orders_sycl_and_onednn_kernels():
     expected_linear = int8.int8_linear(
         x, qweight, weight_scale, out_dtype=torch.bfloat16
     )
+    expected_prequantized = int8.int8_linear_prequantized(
+        qactivation,
+        activation_scale,
+        qweight,
+        weight_scale,
+        out_dtype=torch.bfloat16,
+    )
+    expected_shared1, expected_shared2 = int8.int8_linear_shared_input(
+        x,
+        qweight,
+        weight_scale,
+        qweight,
+        weight_scale,
+        out_dtype=torch.bfloat16,
+    )
+    expected_gated_q, expected_gated_scale = (
+        int8.fused_silu_mul_quantize_rowwise(expected_shared1, expected_shared2)
+    )
+    expected_mlp = int8.int8_linear_prequantized(
+        expected_gated_q,
+        expected_gated_scale,
+        qdown_weight,
+        down_weight_scale,
+        out_dtype=torch.bfloat16,
+    )
+    expected_convrot_shared1, expected_convrot_shared2 = (
+        int8.int8_linear_shared_input(
+            x,
+            convrot_weight,
+            convrot_weight_scale,
+            convrot_weight,
+            convrot_weight_scale,
+            out_dtype=torch.bfloat16,
+            convrot=True,
+            convrot_groupsize=64,
+        )
+    )
+    expected_convrot_gated = int8.fused_silu_mul(
+        expected_convrot_shared1, expected_convrot_shared2
+    )
+    expected_convrot_gated = int8.rotate_convrot(
+        expected_convrot_gated, group_size=64
+    )
+    expected_convrot_q, expected_convrot_scale = int8.quantize_int8_rowwise(
+        expected_convrot_gated
+    )
+    expected_convrot_mlp = int8.int8_linear_prequantized(
+        expected_convrot_q,
+        expected_convrot_scale,
+        convrot_down_weight,
+        convrot_down_weight_scale,
+        out_dtype=torch.bfloat16,
+    )
     expected_rope = _adjacent_reference(rope_x, freqs)
     torch.testing.assert_close(linear_out, expected_linear, rtol=0, atol=0)
+    torch.testing.assert_close(
+        prequantized_out, expected_prequantized, rtol=0, atol=0
+    )
+    torch.testing.assert_close(mlp_out, expected_mlp, rtol=0, atol=0)
+    torch.testing.assert_close(
+        convrot_mlp_out, expected_convrot_mlp, rtol=0, atol=0
+    )
     torch.testing.assert_close(rope_out, expected_rope, rtol=0, atol=0)
 
 

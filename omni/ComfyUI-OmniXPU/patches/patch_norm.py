@@ -14,7 +14,7 @@ import os
 import torch
 import comfy.model_management
 
-from .debug import trace_patch
+from .debug import log_debug_event, trace_patch
 
 log = logging.getLogger("ComfyUI-OmniXPU")
 
@@ -40,6 +40,26 @@ def _log_first(op, shape):
         log.info("[OmniXPU] norm first use: %s shape=%s", op, shape)
 
 
+def _run_layer_norm(x, weight, bias, eps):
+    log_debug_event(
+        "kernel",
+        "layer_norm",
+        {"input": x, "weight": weight, "bias": bias},
+        details={"backend": "esimd"},
+    )
+    return _omni_norm.layer_norm(x, weight, bias, eps)
+
+
+def _run_rms_norm(weight, x, eps):
+    log_debug_event(
+        "kernel",
+        "rms_norm",
+        {"input": x, "weight": weight},
+        details={"backend": "esimd"},
+    )
+    return _omni_norm.rms_norm(weight, x, eps)
+
+
 def apply():
     global _omni_norm
     import sys
@@ -60,7 +80,12 @@ def apply():
     _orig_ln_cast = LN.forward_comfy_cast_weights
     _orig_ln_fwd = LN.forward
 
-    @trace_patch("norm.LayerNorm.forward_comfy_cast_weights", ("self", "input"))
+    @trace_patch(
+        "norm.LayerNorm.forward_comfy_cast_weights",
+        ("self", "input"),
+        stage="dispatch",
+        verbose_only=True,
+    )
     def _ln_cast(self, input):
         if self.weight is not None:
             weight, bias, offload_stream = comfy_ops.cast_bias_weight(self, input, offloadable=True)
@@ -73,13 +98,18 @@ def apply():
             _log_first("LayerNorm", input.shape)
             orig = input.shape
             x_2d = input.reshape(-1, orig[-1])
-            x = _omni_norm.layer_norm(x_2d, weight, bias, self.eps).reshape(orig)
+            x = _run_layer_norm(x_2d, weight, bias, self.eps).reshape(orig)
         else:
             x = torch.nn.functional.layer_norm(input, self.normalized_shape, weight, bias, self.eps)
         comfy_ops.uncast_bias_weight(self, weight, bias, offload_stream)
         return x
 
-    @trace_patch("norm.LayerNorm.forward", ("self", "input"))
+    @trace_patch(
+        "norm.LayerNorm.forward",
+        ("self", "input"),
+        stage="dispatch",
+        verbose_only=True,
+    )
     def _ln_fwd(self, *args, **kwargs):
         # run_every_op() is called by the original forward; skip here to avoid
         # double-counting. Only use omni fast path when NOT in cast-weights mode.
@@ -91,7 +121,7 @@ def apply():
             _log_first("LayerNorm", input.shape)
             orig = input.shape
             x_2d = input.reshape(-1, orig[-1])
-            return _omni_norm.layer_norm(x_2d, self.weight, self.bias, self.eps).reshape(orig)
+            return _run_layer_norm(x_2d, self.weight, self.bias, self.eps).reshape(orig)
         return _orig_ln_fwd(self, *args, **kwargs)
 
     LN.forward_comfy_cast_weights = _ln_cast
@@ -102,7 +132,12 @@ def apply():
     _orig_rn_cast = RN.forward_comfy_cast_weights
     _orig_rn_fwd = RN.forward
 
-    @trace_patch("norm.RMSNorm.forward_comfy_cast_weights", ("self", "input"))
+    @trace_patch(
+        "norm.RMSNorm.forward_comfy_cast_weights",
+        ("self", "input"),
+        stage="dispatch",
+        verbose_only=True,
+    )
     def _rn_cast(self, input):
         if self.weight is not None:
             weight, bias, offload_stream = comfy_ops.cast_bias_weight(self, input, offloadable=True)
@@ -115,13 +150,18 @@ def apply():
             orig = input.shape
             x_2d = input.reshape(-1, orig[-1])
             eps = self.eps if self.eps is not None else 1e-6
-            x = _omni_norm.rms_norm(weight, x_2d, eps).reshape(orig)
+            x = _run_rms_norm(weight, x_2d, eps).reshape(orig)
         else:
             x = torch.nn.functional.rms_norm(input, self.normalized_shape, weight, self.eps)
         comfy_ops.uncast_bias_weight(self, weight, bias, offload_stream)
         return x
 
-    @trace_patch("norm.RMSNorm.forward", ("self", "input"))
+    @trace_patch(
+        "norm.RMSNorm.forward",
+        ("self", "input"),
+        stage="dispatch",
+        verbose_only=True,
+    )
     def _rn_fwd(self, *args, **kwargs):
         if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
             return _rn_cast(self, *args, **kwargs)
@@ -132,7 +172,7 @@ def apply():
             orig = input.shape
             x_2d = input.reshape(-1, orig[-1])
             eps = self.eps if self.eps is not None else 1e-6
-            return _omni_norm.rms_norm(self.weight, x_2d, eps).reshape(orig)
+            return _run_rms_norm(self.weight, x_2d, eps).reshape(orig)
         return _orig_rn_fwd(self, *args, **kwargs)
 
     RN.forward_comfy_cast_weights = _rn_cast
@@ -143,7 +183,12 @@ def apply():
         import comfy.rmsnorm as comfy_rmsnorm
         _orig_rms_fn = comfy_rmsnorm.rms_norm
 
-        @trace_patch("norm.rms_norm", ("x", "weight", "eps"))
+        @trace_patch(
+            "norm.rms_norm",
+            ("x", "weight", "eps"),
+            stage="dispatch",
+            verbose_only=True,
+        )
         def _patched_rms_norm(x, weight=None, eps=1e-6):
             if _can_use_omni(x):
                 _log_first("rms_norm_fn", x.shape)
@@ -153,7 +198,7 @@ def apply():
                     w = comfy.model_management.cast_to(weight, dtype=x.dtype, device=x.device)
                 else:
                     w = torch.ones(orig[-1], dtype=x.dtype, device=x.device)
-                return _omni_norm.rms_norm(w, x_2d, eps).reshape(orig)
+                return _run_rms_norm(w, x_2d, eps).reshape(orig)
             return _orig_rms_fn(x, weight=weight, eps=eps)
 
         comfy_rmsnorm.rms_norm = _patched_rms_norm
@@ -204,7 +249,12 @@ def apply():
 
             _KreaRMS = _krea2_model.RMSNorm
 
-            @trace_patch("norm.Krea2RMSNorm.forward", ("self", "x"))
+            @trace_patch(
+                "norm.Krea2RMSNorm.forward",
+                ("self", "x"),
+                stage="dispatch",
+                verbose_only=True,
+            )
             def _krea2_rms_forward(self, x):
                 dtype = x.dtype
                 weight = comfy.model_management.cast_to(
@@ -215,7 +265,7 @@ def apply():
                     _log_first("Krea2RMSNorm", x.shape)
                     orig = x.shape
                     x_2d = x.float().reshape(-1, h).contiguous()
-                    return _omni_norm.rms_norm(weight, x_2d, self.eps).reshape(orig).to(dtype)
+                    return _run_rms_norm(weight, x_2d, self.eps).reshape(orig).to(dtype)
                 return torch.nn.functional.rms_norm(
                     x.float(), (h,), weight=weight, eps=self.eps).to(dtype)
 

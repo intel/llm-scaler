@@ -3,7 +3,7 @@ import os
 
 import torch
 
-from .debug import trace_patch
+from .debug import log_debug_event
 
 log = logging.getLogger("ComfyUI-OmniXPU")
 
@@ -121,10 +121,6 @@ def apply():
     _pytorch_fallback = attn_mod.attention_pytorch
     wrap_attn = attn_mod.wrap_attn
 
-    @trace_patch(
-        "attention",
-        ("q", "k", "v", "heads", "mask", "attn_precision", "skip_reshape"),
-    )
     @wrap_attn
     def attention_esimd(
         q,
@@ -138,6 +134,14 @@ def apply():
         **kwargs,
     ):
         global _esimd_call_count, _esimd_fallback_count
+
+        log_debug_event(
+            "dispatch",
+            "attention",
+            {"q": q, "k": k, "v": v, "mask": mask},
+            details={"policy": _backend},
+            verbose_only=True,
+        )
 
         if skip_reshape:
             b, _, _, dim_head = q.shape
@@ -222,6 +226,12 @@ def apply():
             k_blhd = k.view(b, -1, heads, dim_head).contiguous()
             v_blhd = v.view(b, -1, heads, dim_head).contiguous()
 
+        log_debug_event(
+            "kernel",
+            "attention",
+            {"q": q_blhd, "k": k_blhd, "v": v_blhd},
+            details={"backend": selected_backend},
+        )
         out = selected_sdp.sdp(q_blhd, k_blhd, v_blhd)
 
         # FP16 NaN safety

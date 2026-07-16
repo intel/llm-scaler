@@ -27,17 +27,28 @@ _XPU_AVAILABLE = hasattr(torch, "xpu") and torch.xpu.is_available()
 
 def test_debug_flag_defaults_to_disabled(monkeypatch):
     monkeypatch.delenv("OMNIXPU_DEBUG", raising=False)
+    monkeypatch.delenv("OMNIXPU_DEBUG_VERBOSE", raising=False)
     assert not _DEBUG.debug_enabled()
+    assert not _DEBUG.verbose_debug_enabled()
 
 
 def test_debug_flag_accepts_common_true_values(monkeypatch):
+    monkeypatch.delenv("OMNIXPU_DEBUG_VERBOSE", raising=False)
     for value in ("1", "true", "TRUE", "yes", "on"):
         monkeypatch.setenv("OMNIXPU_DEBUG", value)
         assert _DEBUG.debug_enabled()
 
 
+def test_verbose_flag_enables_kernel_and_dispatch_tracing(monkeypatch):
+    monkeypatch.delenv("OMNIXPU_DEBUG", raising=False)
+    monkeypatch.setenv("OMNIXPU_DEBUG_VERBOSE", "1")
+    assert _DEBUG.debug_enabled()
+    assert _DEBUG.verbose_debug_enabled()
+
+
 def test_disabled_trace_does_not_wrap(monkeypatch):
     monkeypatch.setenv("OMNIXPU_DEBUG", "0")
+    monkeypatch.setenv("OMNIXPU_DEBUG_VERBOSE", "0")
 
     def operation(x):
         return x
@@ -45,8 +56,22 @@ def test_disabled_trace_does_not_wrap(monkeypatch):
     assert _DEBUG.trace_patch("operation", ("x",))(operation) is operation
 
 
+def test_kernel_debug_does_not_install_verbose_dispatch_wrapper(monkeypatch):
+    monkeypatch.setenv("OMNIXPU_DEBUG", "1")
+    monkeypatch.setenv("OMNIXPU_DEBUG_VERBOSE", "0")
+
+    def operation(x):
+        return x
+
+    decorated = _DEBUG.trace_patch(
+        "operation", ("x",), stage="dispatch", verbose_only=True
+    )(operation)
+    assert decorated is operation
+
+
 def test_enabled_trace_ignores_cpu_calls_by_default(monkeypatch, caplog):
     monkeypatch.setenv("OMNIXPU_DEBUG", "1")
+    monkeypatch.setenv("OMNIXPU_DEBUG_VERBOSE", "0")
 
     @_DEBUG.trace_patch("sample", ("x",))
     def operation(x):
@@ -59,8 +84,14 @@ def test_enabled_trace_ignores_cpu_calls_by_default(monkeypatch, caplog):
 
 def test_enabled_trace_formats_tensor_metadata(monkeypatch, caplog):
     monkeypatch.setenv("OMNIXPU_DEBUG", "1")
+    monkeypatch.setenv("OMNIXPU_DEBUG_VERBOSE", "0")
 
-    @_DEBUG.trace_patch("sample", ("x", "nested"), xpu_only=False)
+    @_DEBUG.trace_patch(
+        "sample",
+        ("x", "nested"),
+        xpu_only=False,
+        details={"backend": "omni_xpu"},
+    )
     def operation(x, nested):
         return x
 
@@ -71,14 +102,43 @@ def test_enabled_trace_formats_tensor_metadata(monkeypatch, caplog):
 
     assert len(caplog.records) == 1
     message = caplog.records[0].getMessage()
-    assert "[OmniXPU DEBUG] patch=sample" in message
+    assert "[OmniXPU DEBUG] stage=kernel op=sample backend=omni_xpu" in message
     assert "x(shape=(2, 3), dtype=torch.bfloat16, device=cpu)" in message
     assert "nested['weight'](shape=(4, 3), dtype=torch.int8, device=cpu)" in message
+
+
+def test_verbose_trace_logs_dispatch_metadata(monkeypatch, caplog):
+    monkeypatch.setenv("OMNIXPU_DEBUG", "0")
+    monkeypatch.setenv("OMNIXPU_DEBUG_VERBOSE", "1")
+
+    @_DEBUG.trace_patch(
+        "mixed_precision.Linear",
+        ("input",),
+        xpu_only=False,
+        stage="dispatch",
+        details={
+            "quant_format": "int8_tensorwise",
+            "layout": "TensorWiseINT8Layout",
+        },
+        verbose_only=True,
+    )
+    def operation(input):
+        return input
+
+    x = torch.zeros((2, 3), dtype=torch.bfloat16)
+    with caplog.at_level(logging.INFO, logger="ComfyUI-OmniXPU"):
+        assert operation(x) is x
+
+    message = caplog.records[0].getMessage()
+    assert "stage=dispatch op=mixed_precision.Linear" in message
+    assert "quant_format=int8_tensorwise" in message
+    assert "layout=TensorWiseINT8Layout" in message
 
 
 @pytest.mark.skipif(not _XPU_AVAILABLE, reason="XPU is unavailable")
 def test_enabled_trace_logs_xpu_calls(monkeypatch, caplog):
     monkeypatch.setenv("OMNIXPU_DEBUG", "1")
+    monkeypatch.setenv("OMNIXPU_DEBUG_VERBOSE", "0")
 
     @_DEBUG.trace_patch("xpu_sample", ("x",))
     def operation(x):
@@ -89,6 +149,6 @@ def test_enabled_trace_logs_xpu_calls(monkeypatch, caplog):
         assert operation(x) is x
 
     message = caplog.records[0].getMessage()
-    assert "patch=xpu_sample" in message
+    assert "stage=kernel op=xpu_sample" in message
     assert "shape=(2, 3)" in message
     assert "device=xpu:0" in message

@@ -19,6 +19,7 @@ Requires `omni_xpu_kernel` installed. Without it the node loads silently with no
 | ESIMD LayerNorm/RMSNorm | `LayerNorm.forward` / `RMSNorm.forward` / `rms_norm()` |
 | FP8 GEMM | `fp8_linear` / `mixed_precision_ops` |
 | INT8 Linear | `comfy_kitchen::int8_linear` (oneDNN s8 GEMM) |
+| Fused INT8 SwiGLU FFN | Eligible Lumina/Z-Image `FeedForward` blocks |
 | FP8 Negative Zero Fix | `manual_stochastic_round_to_float8` |
 | Interpolate Fix | `F.interpolate` |
 | Median Fix | `torch.median` / `torch.nanmedian` (XPU dim-reduction) |
@@ -34,16 +35,17 @@ OMNIXPU_ROPE=0              # Disable ESIMD RoPE only
 OMNIXPU_NORM=0              # Disable ESIMD LayerNorm/RMSNorm only
 OMNIXPU_KREA2_RMSNORM=0     # Disable the Krea2-specific local RMSNorm hook only
 OMNIXPU_FP8_GEMM=0          # Disable FP8 GEMM only
-OMNIXPU_INT8=0              # Disable INT8 Linear only
+OMNIXPU_INT8=0              # Disable all INT8 routes
+OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN only
 OMNIXPU_FP8_NEG_ZERO_FIX=0  # Disable FP8 negative zero fix only
 OMNIXPU_INTERPOLATE_FIX=0   # Disable interpolate workaround only
 OMNIXPU_MEDIAN_FIX=0        # Disable median workaround only
 ```
 
-Set `OMNIXPU_DEBUG=1` before starting ComfyUI to log calls intercepted by the
-enabled patches. Only calls containing at least one XPU tensor are logged, and
-the output includes tensor shapes, dtypes, and devices without printing values
-or synchronizing the device:
+Set `OMNIXPU_DEBUG=1` before starting ComfyUI to log the XPU kernels that are
+actually selected. Wrapper calls that fall back to another implementation are
+not reported as Omni XPU kernel executions. Tensor shapes, dtypes, and devices
+are included without printing values or synchronizing the device:
 
 ```bash
 OMNIXPU_DEBUG=1 python main.py
@@ -52,12 +54,41 @@ OMNIXPU_DEBUG=1 python main.py
 Example:
 
 ```text
-[OmniXPU DEBUG] patch=attention tensors=q(shape=(1, 4352, 3072), dtype=torch.bfloat16, device=xpu:0), k(shape=(1, 4352, 3072), dtype=torch.bfloat16, device=xpu:0), v(shape=(1, 4352, 3072), dtype=torch.bfloat16, device=xpu:0)
+[OmniXPU DEBUG] stage=kernel op=int8_linear backend=omni_xpu tensors=x(shape=(1, 4160, 3840), dtype=torch.bfloat16, device=xpu:0), weight(shape=(10240, 3840), dtype=torch.int8, device=xpu:0), weight_scale(shape=(10240, 1), dtype=torch.float32, device=xpu:0)
+[OmniXPU DEBUG] stage=kernel op=int8_swiglu_mlp backend=omni_xpu route=shared_up+fused_swiglu+convrot+quant+prequant_down up_convrot=True down_convrot=True tensors=input(shape=(1, 4160, 3840), dtype=torch.bfloat16, device=xpu:0), ...
 ```
 
-The flag is evaluated when patch wrappers are installed during ComfyUI startup.
-Changing it after startup does not affect existing wrappers and requires a
-process restart. When it is unset, no tracing wrappers are installed.
+For dispatch and fallback analysis, use the verbose flag instead. It is a
+superset of normal debug logging, so setting both flags is unnecessary:
+
+```bash
+OMNIXPU_DEBUG_VERBOSE=1 python main.py
+```
+
+Verbose output adds the high-level dispatch stage, including the quantization
+format and layout where available:
+
+```text
+[OmniXPU DEBUG] stage=dispatch op=mixed_precision.Linear quant_format=int8_tensorwise layout=TensorWiseINT8Layout tensors=input(shape=(1, 4160, 3840), dtype=torch.bfloat16, device=xpu:0)
+[OmniXPU DEBUG] stage=kernel op=int8_linear backend=omni_xpu tensors=x(shape=(1, 4160, 3840), dtype=torch.bfloat16, device=xpu:0), weight(shape=(10240, 3840), dtype=torch.int8, device=xpu:0), weight_scale(shape=(10240, 1), dtype=torch.float32, device=xpu:0)
+```
+
+Set either flag before ComfyUI startup. Changing tracing flags in a running
+process is unsupported; restart ComfyUI after changing them.
+
+The fused INT8 FFN route shares activation quantization and optional ConvRot
+between Lumina `w1` and `w3`. For an unrotated `w2`, it fuses
+`SiLU(w1(x)) * w3(x)` directly into rowwise INT8 storage. For a ConvRot `w2`,
+including Z-Image INT8 ConvRot, it writes one fused floating SwiGLU result,
+reuses the existing XMX ConvRot, quantizes it, and feeds the result to the
+prequantized projection. This avoids the separate floating SiLU temporary
+without replacing the faster XMX rotation with a slower custom transform.
+
+The route is selected only for resident `TensorWiseINT8Layout` XPU weights
+with matching dtypes and supported ConvRot settings. LoRA or other weight
+functions, offloaded weights, bias, training, transposed weights,
+full-precision overrides, and unsupported shapes retain the original ComfyUI
+forward path. Use `OMNIXPU_DEBUG_VERBOSE=1` to see the fallback reason.
 
 Attention routing is selected independently:
 
@@ -115,6 +146,8 @@ When loaded successfully, ComfyUI logs:
 [OmniXPU] attention: applied
 [OmniXPU] INT8: registered XPU impl for comfy_kitchen::int8_linear
 [OmniXPU] int8: applied
+[OmniXPU] INT8 FFN: routed eligible Lumina FeedForward through fused kernels
+[OmniXPU] int8_ffn: applied
 ```
 
 ## How it works

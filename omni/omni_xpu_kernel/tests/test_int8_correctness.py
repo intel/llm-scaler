@@ -150,6 +150,28 @@ class TestQuantizeInt8Rowwise:
         assert q.shape == (2, 16, 128)
         assert scale.shape == (2, 16, 1)
 
+    @pytest.mark.skipif(not has_xpu(), reason="Native quant dispatch requires XPU")
+    @pytest.mark.parametrize(
+        ("shape", "dtype", "scale_shape"),
+        [
+            ((128,), torch.bfloat16, (1,)),
+            ((4, 128), torch.float32, (4, 1)),
+        ],
+    )
+    def test_generic_native_fallback_inputs(
+        self, shape, dtype, scale_shape, seed
+    ):
+        """Public dispatch retains generic-native shape and dtype support."""
+        from omni_xpu_kernel import int8
+
+        x = torch.randn(shape, device="xpu", dtype=dtype)
+        q, scale = int8.quantize_int8_rowwise(x)
+
+        assert q.shape == x.shape
+        assert q.dtype == torch.int8
+        assert scale.shape == scale_shape
+        assert scale.dtype == torch.float32
+
     @pytest.mark.skipif(not has_xpu(), reason="Fused quant kernel requires XPU")
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     @pytest.mark.parametrize("k", [7, 8, 255, 256, 512, 513, 1024, 3840])
@@ -425,6 +447,363 @@ class TestInt8Linear:
 
         with pytest.raises((ValueError, RuntimeError)):
             int8.int8_linear(x, w, w_scale)
+
+
+class TestInt8LinearPrequantized:
+    """Tests for the explicit rowwise-quantized activation path."""
+
+    def test_reference_matches_manual_scaled_int_mm(self, seed):
+        """Reference path applies row and channel scales before output cast."""
+        from omni_xpu_kernel.int8 import _reference
+
+        x_int8 = torch.randint(-127, 128, (6, 16), dtype=torch.int8)
+        x_scale = torch.rand(6, 1, dtype=torch.float32) * 0.05 + 1e-4
+        weight = torch.randint(-127, 128, (8, 16), dtype=torch.int8)
+        weight_scale = torch.rand(8, dtype=torch.float32) * 0.05 + 1e-4
+        bias = torch.randn(8, dtype=torch.float32)
+
+        out = _reference.int8_linear_prequantized(
+            x_int8,
+            x_scale,
+            weight,
+            weight_scale,
+            bias=bias,
+            out_dtype=torch.float32,
+        )
+        accum = x_int8.to(torch.int32) @ weight.to(torch.int32).T
+        expected = (
+            accum.float()
+            * x_scale.reshape(-1, 1)
+            * weight_scale.reshape(1, -1)
+            + bias.reshape(1, -1)
+        )
+
+        # Floating-point multiplication order may differ between the combined
+        # scale expression and the reference implementation.
+        torch.testing.assert_close(out, expected, rtol=2e-6, atol=5e-6)
+
+    def test_reference_preserves_leading_dimensions(self, seed):
+        """One scale per flattened row supports arbitrary leading dimensions."""
+        from omni_xpu_kernel.int8 import _reference
+
+        x_int8 = torch.randint(-127, 128, (2, 3, 16), dtype=torch.int8)
+        x_scale = torch.rand(2, 3, 1, dtype=torch.float32) + 1e-4
+        weight = torch.randint(-127, 128, (8, 16), dtype=torch.int8)
+        weight_scale = torch.tensor(0.01, dtype=torch.float32)
+
+        out = _reference.int8_linear_prequantized(
+            x_int8, x_scale, weight, weight_scale, out_dtype=torch.bfloat16
+        )
+
+        assert out.shape == (2, 3, 8)
+        assert out.dtype == torch.bfloat16
+
+    def test_reference_rejects_wrong_activation_scale_count(self, seed):
+        """Activation scale count must equal the flattened row count."""
+        from omni_xpu_kernel.int8 import _reference
+
+        x_int8 = torch.randint(-127, 128, (2, 3, 16), dtype=torch.int8)
+        weight = torch.randint(-127, 128, (8, 16), dtype=torch.int8)
+
+        with pytest.raises(ValueError, match="one value per flattened activation row"):
+            _reference.int8_linear_prequantized(
+                x_int8,
+                torch.ones(2),
+                weight,
+                torch.ones(8),
+            )
+
+    def test_public_reference_fallback(self, monkeypatch, seed):
+        """Python dispatch exposes the API when the native symbol is absent."""
+        from omni_xpu_kernel import int8
+
+        monkeypatch.setattr(int8, "_get_native", lambda: None)
+        x_int8 = torch.randint(-127, 128, (4, 16), dtype=torch.int8)
+        x_scale = torch.rand(4, 1, dtype=torch.float32) + 1e-4
+        weight = torch.randint(-127, 128, (8, 16), dtype=torch.int8)
+
+        out = int8.int8_linear_prequantized(
+            x_int8,
+            x_scale,
+            weight,
+            torch.tensor(0.01),
+            out_dtype=torch.float16,
+        )
+
+        assert out.shape == (4, 8)
+        assert out.dtype == torch.float16
+
+    def test_native_matches_reference_for_fixed_quantized_input(self, device, seed):
+        """Native and reference consume exactly the same quantized boundary."""
+        if device.type != "xpu":
+            pytest.skip("native prequantized Linear requires XPU")
+
+        from omni_xpu_kernel import int8
+        from omni_xpu_kernel.int8 import _reference
+
+        native = int8._get_native()
+        if native is None or not hasattr(native, "int8_linear_prequantized"):
+            pytest.skip("native extension does not expose int8_linear_prequantized")
+
+        x_int8 = torch.randint(-127, 128, (2, 7, 128), device=device, dtype=torch.int8)
+        x_scale = torch.rand(2, 7, 1, device=device, dtype=torch.float32) * 0.02 + 1e-4
+        weight = torch.randint(-127, 128, (64, 128), device=device, dtype=torch.int8)
+        weight_scale = torch.rand(64, device=device, dtype=torch.float32) * 0.02 + 1e-4
+        bias = torch.randn(64, device=device, dtype=torch.float32)
+
+        out = int8.int8_linear_prequantized(
+            x_int8,
+            x_scale,
+            weight,
+            weight_scale,
+            bias=bias,
+            out_dtype=torch.bfloat16,
+        )
+        ref = _reference.int8_linear_prequantized(
+            x_int8,
+            x_scale,
+            weight,
+            weight_scale,
+            bias=bias,
+            out_dtype=torch.bfloat16,
+        )
+
+        torch.testing.assert_close(out.float(), ref.float(), rtol=0.02, atol=0.2)
+
+    def test_dynamic_and_prequantized_share_primitive_cache(self, device, seed):
+        """Both entry points use the same scaled oneDNN primitive key."""
+        if device.type != "xpu":
+            pytest.skip("oneDNN primitive cache requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(native, "int8_linear_prequantized"):
+            pytest.skip("native extension does not expose int8_linear_prequantized")
+
+        x = torch.randn(16, 128, device=device, dtype=torch.bfloat16)
+        weight = torch.randint(-127, 128, (64, 128), device=device, dtype=torch.int8)
+        weight_scale = torch.ones(64, device=device, dtype=torch.float32)
+        x_int8, x_scale = int8.quantize_int8_rowwise(x)
+
+        int8.int8_cache_clear()
+        int8.int8_linear_prequantized(
+            x_int8, x_scale, weight, weight_scale, out_dtype=torch.bfloat16
+        )
+        prequant_stats = int8.int8_cache_stats()
+        int8.int8_linear(x, weight, weight_scale, out_dtype=torch.bfloat16)
+        dynamic_stats = int8.int8_cache_stats()
+
+        assert dynamic_stats["hits"] > prequant_stats["hits"]
+        assert dynamic_stats["size"] == prequant_stats["size"]
+
+
+class TestInt8LinearSharedInput:
+    """Tests for two projections sharing one activation quantization."""
+
+    def test_reference_matches_two_single_calls(self, seed):
+        from omni_xpu_kernel.int8 import _reference
+
+        x = torch.randn(2, 3, 32, dtype=torch.bfloat16)
+        w1 = torch.randn(24, 32, dtype=torch.bfloat16)
+        w2 = torch.randn(24, 32, dtype=torch.bfloat16)
+        w1_q, w1_scale = _reference.quantize_int8_rowwise(w1)
+        w2_q, w2_scale = _reference.quantize_int8_rowwise(w2)
+
+        pair = _reference.int8_linear_shared_input(
+            x, w1_q, w1_scale, w2_q, w2_scale
+        )
+        expected1 = _reference.int8_linear(x, w1_q, w1_scale)
+        expected2 = _reference.int8_linear(x, w2_q, w2_scale)
+
+        assert torch.equal(pair[0], expected1)
+        assert torch.equal(pair[1], expected2)
+
+    def test_native_matches_two_dynamic_calls(self, device, seed):
+        if device.type != "xpu":
+            pytest.skip("native shared-input Linear requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(native, "int8_linear_shared_input"):
+            pytest.skip("native extension does not expose int8_linear_shared_input")
+
+        x = torch.randn(2, 7, 128, device=device, dtype=torch.bfloat16)
+        w1 = torch.randint(-127, 128, (64, 128), device=device, dtype=torch.int8)
+        w2 = torch.randint(-127, 128, (64, 128), device=device, dtype=torch.int8)
+        s1 = torch.rand(64, 1, device=device, dtype=torch.float32) * 0.02 + 1e-4
+        s2 = torch.rand(64, 1, device=device, dtype=torch.float32) * 0.02 + 1e-4
+        b1 = torch.randn(64, device=device, dtype=torch.bfloat16)
+        b2 = torch.randn(64, device=device, dtype=torch.bfloat16)
+
+        output1, output2 = int8.int8_linear_shared_input(
+            x, w1, s1, w2, s2, bias1=b1, bias2=b2
+        )
+        expected1 = int8.int8_linear(x, w1, s1, bias=b1)
+        expected2 = int8.int8_linear(x, w2, s2, bias=b2)
+
+        assert output1.shape == (2, 7, 64)
+        assert output2.shape == (2, 7, 64)
+        assert torch.equal(output1, expected1)
+        assert torch.equal(output2, expected2)
+
+    def test_same_shapes_share_one_primitive(self, device, seed):
+        if device.type != "xpu":
+            pytest.skip("oneDNN primitive cache requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(native, "int8_linear_shared_input"):
+            pytest.skip("native extension does not expose int8_linear_shared_input")
+
+        x = torch.randn(16, 128, device=device, dtype=torch.bfloat16)
+        w1 = torch.randint(-127, 128, (64, 128), device=device, dtype=torch.int8)
+        w2 = torch.randint(-127, 128, (64, 128), device=device, dtype=torch.int8)
+        scale = torch.ones(64, device=device, dtype=torch.float32)
+
+        int8.int8_cache_clear()
+        int8.int8_linear_shared_input(x, w1, scale, w2, scale)
+        stats = int8.int8_cache_stats()
+
+        assert stats["misses"] == 1
+        assert stats["hits"] >= 1
+        assert stats["size"] == 1
+
+
+class TestFusedSiluMulQuantize:
+    """Tests for the no-floating-intermediate SwiGLU quantizer."""
+
+    def test_reference_shape_dtype(self, seed):
+        from omni_xpu_kernel.int8 import _reference
+
+        x1 = torch.randn(2, 3, 32, dtype=torch.bfloat16)
+        x2 = torch.randn_like(x1)
+        q, scale = _reference.fused_silu_mul_quantize_rowwise(x1, x2)
+
+        assert q.shape == x1.shape
+        assert q.dtype == torch.int8
+        assert scale.shape == (2, 3, 1)
+        assert scale.dtype == torch.float32
+        floating = _reference.fused_silu_mul(x1, x2)
+        torch.testing.assert_close(
+            floating, torch.nn.functional.silu(x1) * x2, rtol=0, atol=0
+        )
+
+    def test_fused_floating_public_reference_fallback(self, monkeypatch, seed):
+        from omni_xpu_kernel import int8
+
+        monkeypatch.setattr(int8, "_get_native", lambda: None)
+        x1 = torch.randn(2, 3, 32, dtype=torch.bfloat16)
+        x2 = torch.randn_like(x1)
+        output = int8.fused_silu_mul(x1, x2)
+        torch.testing.assert_close(
+            output, torch.nn.functional.silu(x1) * x2, rtol=0, atol=0
+        )
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("k", [7, 256, 1024])
+    def test_fused_floating_output_matches_materialized(
+        self, device, seed, dtype, k
+    ):
+        from omni_xpu_kernel import int8
+
+        x1 = torch.randn(7, k, device=device, dtype=dtype)
+        x2 = torch.randn_like(x1)
+        expected = torch.nn.functional.silu(x1) * x2
+        if dtype == torch.float16:
+            expected = torch.nan_to_num(
+                expected, nan=0.0, posinf=65504.0, neginf=-65504.0
+            )
+        output = int8.fused_silu_mul(x1, x2)
+
+        assert output.shape == x1.shape
+        assert output.dtype == dtype
+        torch.testing.assert_close(output, expected, rtol=0.01, atol=0.01)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("k", [7, 256, 1024])
+    def test_native_matches_materialized_boundary(self, device, seed, dtype, k):
+        if device.type != "xpu":
+            pytest.skip("native fused SwiGLU quantization requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "fused_silu_mul_quantize_rowwise"
+        ):
+            pytest.skip("native extension lacks fused SwiGLU quantization")
+
+        x1 = torch.randn(7, k, device=device, dtype=dtype)
+        x2 = torch.randn_like(x1)
+        materialized = torch.nn.functional.silu(x1) * x2
+        if dtype == torch.float16:
+            materialized = torch.nan_to_num(
+                materialized, nan=0.0, posinf=65504.0, neginf=-65504.0
+            )
+        expected_q, expected_scale = native.quantize_int8_rowwise_fused(
+            materialized
+        )
+        q, scale = int8.fused_silu_mul_quantize_rowwise(x1, x2)
+
+        torch.testing.assert_close(scale, expected_scale, rtol=0.01, atol=1e-7)
+        max_quant_diff = (q.to(torch.int16) - expected_q.to(torch.int16)).abs().max()
+        assert max_quant_diff.item() <= 1
+
+    def test_down_projection_close_to_materialized_path(self, device, seed):
+        if device.type != "xpu":
+            pytest.skip("native fused SwiGLU quantization requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "fused_silu_mul_quantize_rowwise"
+        ):
+            pytest.skip("native extension lacks fused SwiGLU quantization")
+
+        x1 = torch.randn(32, 256, device=device, dtype=torch.bfloat16)
+        x2 = torch.randn_like(x1)
+        weight = torch.randn(128, 256, device=device, dtype=torch.bfloat16)
+        weight_q, weight_scale = int8.quantize_int8_rowwise(weight)
+
+        materialized = torch.nn.functional.silu(x1) * x2
+        expected = int8.int8_linear(
+            materialized, weight_q, weight_scale, out_dtype=torch.bfloat16
+        )
+        q, scale = int8.fused_silu_mul_quantize_rowwise(x1, x2)
+        output = int8.int8_linear_prequantized(
+            q, scale, weight_q, weight_scale, out_dtype=torch.bfloat16
+        )
+
+        error = (output.float() - expected.float()).abs()
+        assert error.mean().item() < 0.05
+        assert error.max().item() < 0.5
+
+    def test_fp16_nonfinite_values_follow_lumina_clamp(self, device):
+        if device.type != "xpu":
+            pytest.skip("native fused SwiGLU quantization requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "fused_silu_mul_quantize_rowwise"
+        ):
+            pytest.skip("native extension lacks fused SwiGLU quantization")
+
+        x1 = torch.tensor(
+            [[float("nan"), float("inf"), -float("inf"), 1.0] * 8],
+            device=device,
+            dtype=torch.float16,
+        )
+        x2 = torch.ones_like(x1)
+        q, scale = int8.fused_silu_mul_quantize_rowwise(x1, x2)
+
+        assert torch.isfinite(scale).all()
+        assert q.dtype == torch.int8
 
 
 # =============================================================================
