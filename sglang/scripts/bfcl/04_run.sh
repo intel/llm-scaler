@@ -4,8 +4,8 @@
 # server across runs lets radix state accumulate cross-run and contaminates the
 # comparison), runs the eval, scores.
 #
-# Runs INSIDE the container. threads=1 ALWAYS (only bsz=1 is optimized on XPU;
-# threads>1 gives meaningless numbers). No `| tail` anywhere (the generate child
+# Runs INSIDE the container. Try to keep threads=1 (only bsz=1 is 100% valid on XPU;
+# threads>1 will cause Batch Variant bugs, the result may be unstable). No `| tail` anywhere (the generate child
 # tail blocks on a dead pipe and hangs forever — R5).
 #
 # Usage (inside container):
@@ -20,6 +20,7 @@ RANGE="${2:-}"                       # "", "6" (single), or "0-29" (range)
 VENV="${VENV:-/opt/venv}"
 WORKDIR="${WORKDIR:-/workspace/bfcl_kit/workspace_xpu}"
 PORT="${PORT:-9010}"
+BFCL_NUM_THREADS="${BFCL_NUM_THREADS:-1}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3.6-35B-A3B-FC}"
 START="${START:-$(cd "$(dirname "$0")" && pwd)/01_start_server.sh}"
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -77,7 +78,7 @@ fi
 cd "$WORKDIR"
 echo "[run] generate: cat=$CAT range='${RANGE:-full}' ids='${IDS:-}' $(date)"
 bfcl generate --model "$MODEL_ID" --test-category "$CAT" --skip-server-setup \
-  --num-threads 1 --temperature 0.0 --local-model-path "$TOK_DIR" $RUNIDS_ARG </dev/null >>"$GEN" 2>&1
+  --num-threads "$BFCL_NUM_THREADS" --temperature 0.0 --local-model-path "$TOK_DIR" $RUNIDS_ARG </dev/null >>"$GEN" 2>&1
 echo "[run] GENDONE $(date)"
 EVAL_PARTIAL=""; [ -n "$RUNIDS_ARG" ] && EVAL_PARTIAL="--partial-eval"
 bfcl evaluate --model "$MODEL_ID" --test-category "$CAT" $EVAL_PARTIAL </dev/null >>"$GEN" 2>&1

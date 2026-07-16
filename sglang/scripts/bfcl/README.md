@@ -27,7 +27,6 @@ git clone https://github.com/zhangYiIntel/gorilla.git vendor
 ```bash
 cd vendor
 git checkout 6ee7b7718d9c7498b26e043635db6381a6583593
-cd ..
 ```
 
 # Step 4. Configure Environment Variables
@@ -49,7 +48,7 @@ export ZE_MASK="0"               # Which XPU tile to use
 Run the installation script to install the vendored BFCL package into your virtual environment. This script performs an offline-first editable install from the vendor directory.
 
 ```bash
-bash 02_install_bfcl.sh
+bash 02_install_bfcl_fork.sh
 ```
 
 Note: This script installs the package from $KIT_ROOT/vendor/berkeley-function-call-leaderboard and verifies that bfcl_eval resolves correctly without being shadowed by a stale site-packages version.
@@ -67,18 +66,17 @@ Note: If TOK_DIR is not set or the tokenizer.json is missing, this script will a
 To launch a fresh server (cold radix) and run the BFCL multi-turn evaluation:
 
 ```bash
-SKIP_START=1 MODEL_ID="Qwen/Qwen3.6-35B-A3B-FC" NUM_THREADS=1 bash ./scripts/04_run.sh multi_turn_base
+SKIP_START=1 MODEL_ID="Qwen/Qwen3.6-35B-A3B-FC" BFCL_NUM_THREADS=1 bash 04_run.sh multi_turn_base
 ```
 
-
-复制代码
 Usage options for 04_run.sh:
 
 ```bash
-bash 04_run.sh — Run the full multi_turn_base (200) category.
+bash 04_run.sh multi_turn_base — Run the full multi_turn_base (200) category.
 bash 04_run.sh multi_turn_base 6 — Run a single entry base_6 (smoke test).
 bash 04_run.sh multi_turn_base 0-29 — Run a subset base_0..29.
 IDS="6,10,42" bash 04_run.sh — Run an explicit list of IDs.
+BFCL_NUM_THREADS=16 bash 04_run.sh — Run on 16 BFCL workers.
 ```
 
-Note: The script enforces threads=1 as only batch-size 1 is optimized on XPU. It will automatically start the reference server, generate responses, evaluate them, and then safely terminate the server to leave the GPU clean.
+Note: It is suggested that threads=1 as only batch-size 1 is guaranteed to be valid on XPU: Batch Invariant hasn't been achieved on vllm for XPU yet. 
