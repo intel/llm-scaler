@@ -16,6 +16,10 @@
 #include "esimd_kernels/fused_add_rms_norm_batched.h"
 #include "esimd_kernels/norm_gemv_int4.h"
 #include "esimd_kernels/resadd_norm_gemv_int4.h"
+#include "esimd_kernels/fp16_GEMV.h"
+#include "esimd_kernels/kv_scatter.h"
+#include "esimd_kernels/norm_add_norm.h"
+#include "esimd_kernels/rmsnorm_residual_scalar.h"
 
 #define EXTRACT_PTR(var, tensor) auto var = reinterpret_cast<uint8_t*>(tensor.data_ptr())
 
@@ -430,7 +434,8 @@ at::Tensor esimd_qkv_split_norm_rope(
     at::Tensor positions,
     int64_t q_heads, int64_t kv_heads, bool attn_output_gate,
     int64_t rotary_dim,
-    at::Tensor cos_sin_cache) {
+    at::Tensor cos_sin_cache,
+    bool normalize_v) {
 
     EXTRACT_PTR(p_qkv, qkv_state);
     EXTRACT_PTR(p_q, q_out);
@@ -452,7 +457,7 @@ at::Tensor esimd_qkv_split_norm_rope(
         p_nwq, p_nwk, p_pos, p_cs,
         ntoks, hiddenDim,
         (uint32_t)q_heads, (uint32_t)kv_heads,
-        attn_output_gate, (uint32_t)rotary_dim, dpcpp_queue);
+        attn_output_gate, (uint32_t)rotary_dim, normalize_v, dpcpp_queue);
     return q_out;
 }
 
@@ -666,4 +671,74 @@ at::Tensor esimd_fused_add_rms_norm_batched(
         rows, K, (float)eps, dpcpp_queue);
 
     return hidden_states;
+}
+
+at::Tensor esimd_gemv_fp16(
+    at::Tensor input,
+    at::Tensor weight,
+    at::Tensor output) {
+    int64_t n = weight.size(0);
+    int64_t k = weight.size(1);
+    auto& queue = get_device_queue(input);
+    GEMV_fp16_host(
+        reinterpret_cast<const fp16*>(input.data_ptr()),
+        reinterpret_cast<const fp16*>(weight.data_ptr()),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        static_cast<uint32_t>(n), static_cast<uint32_t>(k), queue);
+    return output;
+}
+
+void esimd_norm_add_norm(
+    at::Tensor h2_raw,
+    at::Tensor h1,
+    at::Tensor w1,
+    at::Tensor w2,
+    at::Tensor out,
+    double eps1,
+    double eps2) {
+    int k = static_cast<int>(h2_raw.size(-1));
+    auto& queue = get_device_queue(h2_raw);
+    norm_add_norm_host(
+        reinterpret_cast<const fp16*>(h2_raw.data_ptr()),
+        reinterpret_cast<fp16*>(h1.data_ptr()),
+        reinterpret_cast<const fp16*>(w1.data_ptr()),
+        reinterpret_cast<const fp16*>(w2.data_ptr()),
+        reinterpret_cast<fp16*>(out.data_ptr()),
+        k, static_cast<float>(eps1), static_cast<float>(eps2), queue);
+}
+
+void esimd_kv_scatter(
+    at::Tensor k,
+    at::Tensor v,
+    at::Tensor k_cache,
+    at::Tensor v_cache,
+    at::Tensor indices) {
+    int tokens = static_cast<int>(k.size(0));
+    int row_dim = static_cast<int>(k.size(-1));
+    auto& queue = get_device_queue(k);
+    kv_scatter_host(
+        reinterpret_cast<const fp16*>(k.data_ptr()),
+        reinterpret_cast<const fp16*>(v.data_ptr()),
+        reinterpret_cast<fp16*>(k_cache.data_ptr()),
+        reinterpret_cast<fp16*>(v_cache.data_ptr()),
+        reinterpret_cast<const int64_t*>(indices.data_ptr()),
+        tokens, row_dim, queue);
+}
+
+at::Tensor esimd_rmsnorm_residual_scalar(
+    at::Tensor x,
+    at::Tensor weight,
+    at::Tensor residual,
+    at::Tensor output,
+    double eps,
+    double scalar) {
+    int k = static_cast<int>(x.size(-1));
+    auto& queue = get_device_queue(x);
+    rmsnorm_residual_scalar_host(
+        reinterpret_cast<const fp16*>(x.data_ptr()),
+        reinterpret_cast<const fp16*>(weight.data_ptr()),
+        reinterpret_cast<const fp16*>(residual.data_ptr()),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        k, static_cast<float>(eps), static_cast<float>(scalar), queue);
+    return output;
 }

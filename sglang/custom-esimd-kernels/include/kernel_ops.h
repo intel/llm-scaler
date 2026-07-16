@@ -58,7 +58,7 @@ at::Tensor esimd_qkv_split_norm_rope(
     at::Tensor norm_wq, at::Tensor norm_wk,
     at::Tensor positions,
     int64_t q_heads, int64_t kv_heads, bool attn_output_gate,
-    int64_t rotary_dim, at::Tensor cos_sin_cache);
+    int64_t rotary_dim, at::Tensor cos_sin_cache, bool normalize_v);
 
 // Fused Conv1d + GDN for Qwen3-Next-80B-A3B decode — reads from projections directly
 // qkvz:               [N, qkvz_dim] fp16 — projected_states_qkvz, read-only
@@ -293,6 +293,18 @@ at::Tensor esimd_moe_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor scale,
     at::Tensor output, at::Tensor expert_idx,
     int64_t N, int64_t K, int64_t num_experts, int64_t max_tokens_per_expert);
+
+at::Tensor esimd_gemv_fp16(
+    at::Tensor input, at::Tensor weight, at::Tensor output);
+void esimd_norm_add_norm(
+    at::Tensor h2_raw, at::Tensor h1, at::Tensor w1, at::Tensor w2,
+    at::Tensor out, double eps1, double eps2);
+void esimd_kv_scatter(
+    at::Tensor k, at::Tensor v, at::Tensor k_cache, at::Tensor v_cache,
+    at::Tensor indices);
+at::Tensor esimd_rmsnorm_residual_scalar(
+    at::Tensor x, at::Tensor weight, at::Tensor residual, at::Tensor output,
+    double eps, double scalar);
 
 // ============================================================================
 // FP8/INT4 GEMM (v2, from custom-esimd-kernels-vllm) — used by the gemm ext.

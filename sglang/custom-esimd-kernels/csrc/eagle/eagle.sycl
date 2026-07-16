@@ -42,6 +42,8 @@ static inline uint32_t getHighestBit(uint32_t in) {
 #include "extend.kernels.fp16.h"
 #include "extend.kernels.bf16.h"
 #include "page.attn.h"
+#include "page.attn.gqa2.h"
+#include "splitk_decode.h"
 
 // ── Kernel 1: MTP causal conv1d update kernel ───────────────────────────────
 void conv1d_forward_kernel(
@@ -175,6 +177,12 @@ template <typename T>
 class paPhase2ForwardT;
 template <typename T>
 class paPhase3ForwardT;
+template <typename T>
+class paPhase1Gqa2ForwardT;
+template <typename T>
+class paPhase2Gqa2ForwardT;
+template <typename T>
+class paPhase3Gqa2ForwardT;
 
 template <typename T>
 void page_attention_forward_kernel(
@@ -206,6 +214,67 @@ void page_attention_forward_kernel(
   uint32_t groupH, groupV, groupD;
   uint32_t flag = maxKvSeqLen > 1024 ? 0 : 1;
   uint32_t gqaGroups = gqaRatio / 4;
+
+  if (gqaRatio == 2) {
+    uint32_t gqaGroups2 = gqaRatio / 2;
+    groupH = headV * gqaGroups2;
+    groupV = (maxKvSeqLen + 63) / 64;
+    groupD = batches;
+    sycl::range<3> globalPaPhase1(groupH * 2, groupV, groupD);
+    sycl::range<3> localPaPhase1(2, 1, 1);
+    sycl::nd_range<3> rangePaPhase1(globalPaPhase1, localPaPhase1);
+
+    groupH = headDim / 16 * (maxKvSeqLen + 1023) / 1024;
+    groupV = headV * gqaGroups2;
+    groupD = batches;
+    sycl::range<3> globalPaPhase2(groupH * 2, groupV, groupD);
+    sycl::range<3> localPaPhase2(2, 1, 1);
+    sycl::nd_range<3> rangePaPhase2(globalPaPhase2, localPaPhase2);
+
+    groupH = headDim / 16;
+    groupV = headQk;
+    groupD = batches;
+    sycl::range<3> globalPaPhase3(groupH, groupV, groupD);
+    sycl::range<3> localPaPhase3(1, 1, 1);
+    sycl::nd_range<3> rangePaPhase3(globalPaPhase3, localPaPhase3);
+
+    auto kernelPhase1 = [&](sycl::handler& cgh) {
+      cgh.parallel_for<paPhase1Gqa2ForwardT<T>>(
+        rangePaPhase1, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL {
+          sdpaDecodeGqa2Phase1<T>(
+            qState, kCache, reinterpret_cast<uint8_t*>(pState), pGroupMax,
+            pGlobalMax, pPollP, pageTable, kvSeqLens, batches, kvCacheStride1,
+            pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV,
+            gqaRatio, idx);
+        });
+    };
+    auto kernelPhase2 = [&](sycl::handler& cgh) {
+      cgh.parallel_for<paPhase2Gqa2ForwardT<T>>(
+        rangePaPhase2, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL {
+          sdpaDecodeGqa2Phase2<T>(
+            reinterpret_cast<uint8_t*>(pState), pGroupMax, vCache, pGlobalMax,
+            pTempOut, pGlobalSoftmaxSum, out, pageTable, kvSeqLens, batches,
+            kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride,
+            maxStride, headV, maxKvSeqLen, flag, gqaRatio, idx);
+        });
+    };
+    auto kernelPhase3 = [&](sycl::handler& cgh) {
+      cgh.parallel_for<paPhase3Gqa2ForwardT<T>>(
+        rangePaPhase3, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL {
+          sdpaDecodeGqa2Phase3<T>(
+            pTempOut, pGlobalSoftmaxSum, out, kvSeqLens, batches, headV,
+            maxKvSeqLen, gqaRatio, idx);
+        });
+    };
+
+    submit_kernel(kernelPhase1, device, "page_attn_gqa2_ph1 forward");
+    submit_kernel(kernelPhase2, device, "page_attn_gqa2_ph2 forward");
+    if (flag == 0) {
+      submit_kernel(kernelPhase3, device, "page_attn_gqa2_ph3 forward");
+    }
+    return;
+  }
+
   // Phase1: each work group of 4 threads handles 4 q-heads sharing one kv-head
   // Total groups in dim0 = headV * gqaGroups (one group per 4-q-head chunk)
   groupH = headV * gqaGroups;
@@ -381,7 +450,9 @@ void page_attn_decode(
   TORCH_CHECK(headV > 0, "num_kv_heads must be positive");
   uint32_t gqaRatio = headQk / headV;
   TORCH_CHECK(gqaRatio * headV == headQk, "num_q_heads must be a multiple of num_kv_heads");
-  TORCH_CHECK(gqaRatio >= 4 && gqaRatio % 4 == 0, "gqaRatio must be a multiple of 4, got ", gqaRatio);
+  TORCH_CHECK(
+      gqaRatio == 2 || (gqaRatio >= 4 && gqaRatio % 4 == 0),
+      "gqaRatio must be 2 or a multiple of 4, got ", gqaRatio);
   uint32_t maxSeqLen = max_seq_len;
   uint32_t hiddenDimP = ((maxSeqLen + 63) / 64) * 64;
   uint32_t hiddenDimPMax = ((maxSeqLen + 63) / 64);
@@ -1831,6 +1902,62 @@ void mamba_state_scatter(
 #undef MSS_LAUNCH
 }
 
+void splitk_decode_attention(
+    at::Tensor query,
+    at::Tensor key_cache,
+    at::Tensor value_cache,
+    at::Tensor block_table,
+    at::Tensor seq_lens,
+    at::Tensor out,
+    at::Tensor scratch,
+    int64_t max_seq_len,
+    int64_t num_splits) {
+  using fp16 = sycl::half;
+  uint32_t batches = query.size(0);
+  uint32_t num_q_heads = query.size(1);
+  uint32_t head_dim = query.size(2);
+  uint32_t num_kv_heads = key_cache.size(2);
+  uint32_t page_size = key_cache.size(1);
+  uint32_t page_size_log2 = getHighestBit(page_size);
+  uint32_t page_table_stride = block_table.size(1);
+  uint32_t splits = static_cast<uint32_t>(num_splits);
+
+  size_t token_groups = static_cast<size_t>(batches) * num_q_heads * splits;
+  float* partial_acc = scratch.data_ptr<float>();
+  float* partial_max = partial_acc + token_groups * head_dim;
+  float* partial_sum = partial_max + token_groups;
+  sycl::queue& queue =
+      c10::xpu::getCurrentXPUStream(query.device().index()).queue();
+
+  if (head_dim == 512) {
+    skattn::launch<fp16, 512>(
+        queue, reinterpret_cast<const fp16*>(query.data_ptr()),
+        reinterpret_cast<const fp16*>(key_cache.data_ptr()),
+        reinterpret_cast<const fp16*>(value_cache.data_ptr()),
+        reinterpret_cast<const uint32_t*>(block_table.data_ptr()),
+        reinterpret_cast<const uint32_t*>(seq_lens.data_ptr()),
+        reinterpret_cast<fp16*>(out.data_ptr()), partial_acc, partial_max,
+        partial_sum, batches, num_q_heads, num_kv_heads,
+        static_cast<uint32_t>(max_seq_len), page_size, page_size_log2,
+        page_table_stride, splits);
+  } else {
+    TORCH_CHECK(
+        head_dim == 256,
+        "splitk_decode_attention supports head_dim 256 or 512, got ",
+        head_dim);
+    skattn::launch<fp16, 256>(
+        queue, reinterpret_cast<const fp16*>(query.data_ptr()),
+        reinterpret_cast<const fp16*>(key_cache.data_ptr()),
+        reinterpret_cast<const fp16*>(value_cache.data_ptr()),
+        reinterpret_cast<const uint32_t*>(block_table.data_ptr()),
+        reinterpret_cast<const uint32_t*>(seq_lens.data_ptr()),
+        reinterpret_cast<fp16*>(out.data_ptr()), partial_acc, partial_max,
+        partial_sum, batches, num_q_heads, num_kv_heads,
+        static_cast<uint32_t>(max_seq_len), page_size, page_size_log2,
+        page_table_stride, splits);
+  }
+}
+
 TORCH_LIBRARY_FRAGMENT(eagle_ops, m) {
     m.def("assign_draft_cache_locs_p1(Tensor req_pool_indices, Tensor! req_to_token, Tensor seq_lens, Tensor out_cache_loc, int topk, int num_steps) -> ()");
     m.def("create_extend_after_decode_spec_info_xpu(Tensor verified_id, Tensor seq_lens, Tensor accept_lens, Tensor! positions, Tensor! new_verified_id) -> ()");
@@ -1844,6 +1971,7 @@ TORCH_LIBRARY_FRAGMENT(eagle_ops, m) {
     m.def("verify_tree_greedy(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, Tensor target_predict) -> ()");
     m.def("gdn_eagle(Tensor! qkvz, Tensor! z_out, Tensor conv_w, Tensor? conv_b, Tensor! conv_state, Tensor accepted_tokens, Tensor ba, Tensor a_log, Tensor dt_bias, Tensor! state_in, Tensor ssm_state_idx, Tensor norm_w, int max_query_len) -> Tensor");
     m.def("page_attn_decode(Tensor query, Tensor key_cache, Tensor value_cache, Tensor block_table, Tensor seq_lens, Tensor! out, int max_query_len, int max_seq_len, Tensor(a!)? temp_p=None) -> ()");
+    m.def("splitk_decode_attention(Tensor query, Tensor key_cache, Tensor value_cache, Tensor block_table, Tensor seq_lens, Tensor! out, Tensor! scratch, int max_seq_len, int num_splits) -> ()");
     m.def("chunk_gated_delta_rule_extend(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor! initial_state, Tensor cu_seqlens, float scale) -> (Tensor, Tensor)");
     m.def("mamba_state_scatter(Tensor! dst, Tensor src, Tensor dst_indices, Tensor step_indices) -> ()");
     // Contract: q/k/v/initial_state are fp16 or bf16 (all same); g and beta are fp32
@@ -1858,6 +1986,7 @@ TORCH_LIBRARY_IMPL(eagle_ops, XPU, m) {
     m.impl("filter_finished_cache_loc_xpu", &filter_finished_cache_loc_xpu);
     m.impl("gdn_eagle", &gdn_eagle);
     m.impl("page_attn_decode", &page_attn_decode);
+    m.impl("splitk_decode_attention", &splitk_decode_attention);
     m.impl("chunk_gated_delta_rule_extend", &chunk_gated_delta_rule_extend);
     m.impl("build_tree_kernel_efficient", &build_tree_kernel_efficient);
     m.impl("verify_tree_greedy", &verify_tree_greedy);
@@ -1875,6 +2004,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("filter_finished_cache_loc_xpu", &filter_finished_cache_loc_xpu, "filter_finished_cache_loc_xpu");
     m.def("gdn_eagle", &gdn_eagle, "gdn_eagle");
     m.def("page_attn_decode", &page_attn_decode, "page_attn_decode");
+    m.def("splitk_decode_attention", &splitk_decode_attention, "splitk_decode_attention");
     m.def("chunk_gated_delta_rule_extend", &chunk_gated_delta_rule_extend, "chunk_gated_delta_rule_extend");
     m.def("build_tree_kernel_efficient", &build_tree_kernel_efficient, "build_tree_kernel_efficient");
     m.def("verify_tree_greedy", &verify_tree_greedy, "verify_tree_greedy");
