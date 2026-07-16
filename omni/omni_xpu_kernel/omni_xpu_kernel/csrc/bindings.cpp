@@ -69,11 +69,23 @@ namespace int8_ops {
     torch::Tensor int8_linear(torch::Tensor x, torch::Tensor weight, torch::Tensor weight_scale,
                               std::optional<torch::Tensor> bias, int64_t out_dtype_code,
                               bool convrot, int64_t convrot_groupsize);
+    torch::Tensor int8_linear_prequantized(
+        torch::Tensor x_int8, torch::Tensor x_scale, torch::Tensor weight,
+        torch::Tensor weight_scale, std::optional<torch::Tensor> bias,
+        int64_t out_dtype_code);
+    std::tuple<torch::Tensor, torch::Tensor> int8_linear_shared_input(
+        torch::Tensor x, torch::Tensor weight1, torch::Tensor weight_scale1,
+        torch::Tensor weight2, torch::Tensor weight_scale2,
+        std::optional<torch::Tensor> bias1, std::optional<torch::Tensor> bias2,
+        int64_t out_dtype_code);
     std::tuple<torch::Tensor, torch::Tensor> quantize_int8_tensorwise(
         torch::Tensor x, std::optional<torch::Tensor> scale, int64_t stochastic_rounding);
     std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise(
         torch::Tensor x, int64_t stochastic_rounding);
     std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(torch::Tensor x);
+    torch::Tensor fused_silu_mul(torch::Tensor x1, torch::Tensor x2);
+    std::tuple<torch::Tensor, torch::Tensor> fused_silu_mul_quantize_rowwise(
+        torch::Tensor x1, torch::Tensor x2);
     torch::Tensor rotate_convrot(torch::Tensor input, int64_t group_size);
     std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_weight(
         torch::Tensor weight, int64_t group_size, int64_t stochastic_rounding);
@@ -290,6 +302,22 @@ PYBIND11_MODULE(_C, m) {
         py::arg("x"), py::arg("weight"), py::arg("weight_scale"),
         py::arg("bias") = py::none(), py::arg("out_dtype_code") = 2,
         py::arg("convrot") = false, py::arg("convrot_groupsize") = 256);
+    int8.def("int8_linear_prequantized", &omni_xpu::int8_ops::int8_linear_prequantized,
+        "INT8 linear layer for prequantized rowwise activations.\n"
+        "Input: x_int8 [..., K], x_scale one value per flattened row, "
+        "weight [N, K] int8, weight_scale [N] or scalar f32\n"
+        "Output: [..., N] in out_dtype; activation quantization is not performed",
+        py::arg("x_int8"), py::arg("x_scale"), py::arg("weight"),
+        py::arg("weight_scale"), py::arg("bias") = py::none(),
+        py::arg("out_dtype_code") = 2);
+    int8.def("int8_linear_shared_input", &omni_xpu::int8_ops::int8_linear_shared_input,
+        "Two INT8 linear projections sharing one dynamic rowwise activation quantization.\n"
+        "Input: x [..., K] fp16/bf16 and two INT8 [N, K] weights\n"
+        "Output: two floating tensors with the original leading dimensions",
+        py::arg("x"), py::arg("weight1"), py::arg("weight_scale1"),
+        py::arg("weight2"), py::arg("weight_scale2"),
+        py::arg("bias1") = py::none(), py::arg("bias2") = py::none(),
+        py::arg("out_dtype_code") = 2);
     int8.def("quantize_int8_tensorwise", &omni_xpu::int8_ops::quantize_int8_tensorwise,
         "Quantize tensor to INT8 with single tensorwise scale.\n"
         "Input: x (any shape), optional scale, stochastic_rounding seed\n"
@@ -306,6 +334,17 @@ PYBIND11_MODULE(_C, m) {
         "Input: x [..., K] bf16/f16\n"
         "Output: (int8 tensor, float32 scales [..., 1])",
         py::arg("x"));
+    int8.def("fused_silu_mul", &omni_xpu::int8_ops::fused_silu_mul,
+        "Fused SiLU(x1) * x2 with one floating output and no SiLU temporary.\n"
+        "Input: x1/x2 identical bf16/f16 tensors\n"
+        "Output: floating tensor with the input shape and dtype",
+        py::arg("x1"), py::arg("x2"));
+    int8.def("fused_silu_mul_quantize_rowwise", &omni_xpu::int8_ops::fused_silu_mul_quantize_rowwise,
+        "Fused SiLU(x1) * x2 followed by deterministic rowwise INT8 quantization.\n"
+        "Does not materialize the floating SwiGLU intermediate.\n"
+        "Input: x1/x2 [..., K] bf16/f16 with identical shape and dtype\n"
+        "Output: (int8 tensor, float32 scales [..., 1])",
+        py::arg("x1"), py::arg("x2"));
     int8.def("rotate_convrot", &omni_xpu::int8_ops::rotate_convrot,
         "Regular Hadamard rotation using a cached matrix multiplication on the last dimension",
         py::arg("input"), py::arg("group_size") = 256);

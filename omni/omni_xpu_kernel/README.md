@@ -175,6 +175,44 @@ w_int8, w_scale = int8.quantize_int8_tensorwise(weight)
 # INT8 linear (dynamic activation quantization + oneDNN GEMM + rescale)
 output = int8.int8_linear(x_bf16, w_int8, w_scale, bias=bias, out_dtype=torch.bfloat16)
 
+# Quantize once and reuse the activation across one or more Linear calls
+x_int8, x_scale = int8.quantize_int8_rowwise(x_bf16)
+output = int8.int8_linear_prequantized(
+    x_int8, x_scale, w_int8, w_scale,
+    bias=bias, out_dtype=torch.bfloat16,
+)
+
+# SwiGLU MLP: share the input quantization, then avoid the BF16 gate tensor
+gate, up = int8.int8_linear_shared_input(
+    x_bf16,
+    w1_int8, w1_scale,
+    w3_int8, w3_scale,
+    out_dtype=torch.bfloat16,
+)
+gated_int8, gated_scale = int8.fused_silu_mul_quantize_rowwise(gate, up)
+output = int8.int8_linear_prequantized(
+    gated_int8, gated_scale, w2_int8, w2_scale,
+    out_dtype=torch.bfloat16,
+)
+
+# ConvRot SwiGLU: remove the SiLU temporary, then reuse the XMX rotation
+gate, up = int8.int8_linear_shared_input(
+    x_bf16,
+    w1_convrot_int8, w1_scale,
+    w3_convrot_int8, w3_scale,
+    out_dtype=torch.bfloat16,
+    convrot=True, convrot_groupsize=256,
+)
+gated = int8.fused_silu_mul(gate, up)
+del gate, up
+rotated = int8.rotate_convrot(gated, group_size=256)
+del gated
+gated_int8, gated_scale = int8.quantize_int8_rowwise(rotated)
+output = int8.int8_linear_prequantized(
+    gated_int8, gated_scale, w2_convrot_int8, w2_scale,
+    out_dtype=torch.bfloat16,
+)
+
 # With ConvRot (Hadamard rotation for improved accuracy)
 output = int8.int8_linear(x, w_int8, w_scale, convrot=True, convrot_groupsize=256)
 
