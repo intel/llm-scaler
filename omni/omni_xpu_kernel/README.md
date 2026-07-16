@@ -35,16 +35,9 @@ output = sdp.sdp(q, k, v)
 # are scaled to prevent fp16 overflow, with zero overhead on normal models.
 ```
 
-**AOT compilation for target GPU:**
-```bash
-# Default target: bmg (Arc B580)
-CUTLASS_SYCL_ROOT=/path/to/sycl-tla \
-OMNI_XPU_DEVICE=bmg pip install -e . --no-build-isolation
-
-# For other GPUs:
-CUTLASS_SYCL_ROOT=/path/to/sycl-tla \
-OMNI_XPU_DEVICE=pvc pip install -e . --no-build-isolation   # Data Center GPU Max
-```
+The LGRF and CUTE sidecars contain architecture-specific AOT images. Select the
+target with `OMNI_XPU_DEVICE`; see [Building from Source](#building-from-source)
+for the platform matrix and complete build procedure.
 
 ### cute — CUTLASS-SYCL Flash Attention
 
@@ -242,29 +235,283 @@ output = rotary.apply_kitchen_rope_split_half1(x, freqs_cis)
 ## Requirements
 
 - Intel oneAPI DPC++/C++ Compiler (icpx)
-- PyTorch >= 2.0 with XPU support
-- Intel GPU: Arc B-series (BMG), Data Center GPU Max (PVC), or compatible
+- PyTorch with XPU support; the current validated container uses `2.11.0+xpu`
+- Intel GPU: Arc B-series (BMG) or Panther Lake H (PTL-H)
 - oneDNN (for INT4/FP8 GEMM; auto-detected from oneAPI)
 - Intel `sycl-tla`/CUTLASS-SYCL headers (for the default Linux CUTE FMHA)
 
-## Installation
+## Building from Source
+
+### Select the GPU target
+
+`OMNI_XPU_DEVICE` controls the AOT ISA embedded in `lgrf_sdp.so` and
+`cute_fmha_torch.so`. A wheel built for one target must not be installed on a
+different GPU architecture.
+
+| Platform | SYCL architecture check | `OMNI_XPU_DEVICE` | Status |
+|---|---|---|---|
+| Arc B-series / Battlemage | `intel_gpu_bmg_*` | `bmg` | Default and performance-tuned target |
+| Panther Lake H / Arc B390 | `intel_gpu_ptl_h` | `ptl-h` | Build and correctness validated |
+
+Identify the device before compiling instead of inferring the target from the
+product name:
 
 ```bash
-source /opt/intel/oneapi/setvars.sh
+source /opt/intel/oneapi/setvars.sh --force
+sycl-ls --verbose | grep -E 'Name|Architecture|Version|DeviceID'
+```
 
-# Default Linux build: CUTE is mandatory. The build fails if the source tree
-# is missing or invalid.
+For example, the validated PTL-H system reports:
+
+```text
+Name         : Intel(R) Arc(TM) B390 GPU
+Version      : 30.0.4
+DeviceID     : 45184
+Architecture : intel_gpu_ptl_h
+```
+
+`ptl-h` and `ptl-u` are different AOT targets. The compiler accepting a target
+only proves toolchain support; it does not prove that the generated image
+matches the local GPU.
+
+### Prepare CUTE / sycl-tla
+
+The Linux build requires CUTE by default (`OMNI_XPU_REQUIRE_CUTE=1`).
+`CUTLASS_SYCL_ROOT` must point to a complete Intel `sycl-tla` source tree with
+the following directories:
+
+```text
+include/
+tools/util/include/
+examples/common/
+applications/
+```
+
+The currently validated revision is:
+
+```bash
+git clone https://github.com/intel/sycl-tla.git /path/to/sycl-tla
+git -C /path/to/sycl-tla checkout 2fc09973bfdf15755090fcb0e3b6ad236408a992
+```
+
+Do not update this pin without rebuilding and retesting CUTE FMHA; the templates
+depend on a specific set of CUTE and Xe SYCL APIs.
+
+### Reproducible Linux development container
+
+The following example mounts the source tree, a writable output workspace, and
+the read-only sycl-tla checkout. Set `SOURCE_DIR`, `WORKSPACE_DIR`, and
+`SYCL_TLA_DIR` to host paths before running it.
+
+```bash
+export SOURCE_DIR=/path/to/llm-scaler/omni/omni_xpu_kernel
+export WORKSPACE_DIR=/path/to/workspace
+export SYCL_TLA_DIR=/path/to/sycl-tla
+
+docker run -d \
+  --name omni-xpu-kernel-devel \
+  --device /dev/dri:/dev/dri \
+  -v "$SOURCE_DIR:/src/omni_xpu_kernel" \
+  -v "$WORKSPACE_DIR:/workspace" \
+  -v "$SYCL_TLA_DIR:/opt/sycl-tla:ro" \
+  intel/omix:0.1.0-devel-ubuntu24.04 \
+  sleep infinity
+```
+
+Install the Python build environment and PyTorch 2.11 XPU:
+
+```bash
+docker exec omni-xpu-kernel-devel bash -lc '
+  set -e
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    python3-pip python3-venv python3-dev
+  python3 -m venv /opt/venv
+  /opt/venv/bin/python -m pip install -U pip
+  /opt/venv/bin/python -m pip install \
+    torch==2.11.0+xpu torchaudio torchvision \
+    --index-url https://download.pytorch.org/whl/xpu
+  /opt/venv/bin/python -m pip install wheel pytest numpy
+'
+```
+
+The current resolver selects torchvision `0.26.0+xpu`, torchaudio
+`2.11.0+xpu`, and `triton-xpu==3.7.0`. A `docker exec` shell does not reliably
+inherit the oneAPI environment established for container PID 1, so source
+`setvars.sh` explicitly in every build and test command.
+
+### Build and install
+
+Set `TARGET` to a value from the platform table. This example writes a wheel
+instead of installing an editable tree so the exact artifact can be archived
+and installed into another matching environment.
+
+```bash
+export TARGET=ptl-h  # use bmg on Arc B-series
+
+docker exec -e TARGET="$TARGET" omni-xpu-kernel-devel bash -lc '
+  set -e
+  source /opt/intel/oneapi/setvars.sh --force >/dev/null
+  source /opt/venv/bin/activate
+  cd /src/omni_xpu_kernel
+  mkdir -p /workspace/dist
+  CUTLASS_SYCL_ROOT=/opt/sycl-tla \
+  OMNI_XPU_REQUIRE_CUTE=1 \
+  OMNI_XPU_DEVICE="$TARGET" \
+  python -m pip wheel . --no-build-isolation --no-deps \
+    -w /workspace/dist
+'
+
+docker exec omni-xpu-kernel-devel bash -lc '
+  set -e
+  source /opt/venv/bin/activate
+  python -m pip install --force-reinstall --no-deps \
+    /workspace/dist/omni_xpu_kernel-*.whl
+'
+```
+
+`--no-build-isolation` is required because the compiler needs the headers and
+libraries from the installed XPU PyTorch wheel. A normal `_C` build currently
+compiles 17 C++ translation units in one serial `icpx` invocation. The build
+backend captures compiler output, so several minutes without terminal output
+can be normal while a `clang` child process is consuming CPU.
+
+For a direct editable build outside the container, use the same environment:
+
+```bash
+source /opt/intel/oneapi/setvars.sh --force
+
 CUTLASS_SYCL_ROOT=/path/to/sycl-tla \
 OMNI_XPU_DEVICE=bmg \
 pip install -e . --no-build-isolation
 
-# Explicit core-only opt-out (also required for Windows builds):
+CUTLASS_SYCL_ROOT=/path/to/sycl-tla \
+OMNI_XPU_DEVICE=ptl-h \
+pip install -e . --no-build-isolation
+
+# Explicit Linux core-only opt-out:
 OMNI_XPU_REQUIRE_CUTE=0 \
 OMNI_XPU_DEVICE=bmg \
 pip install -e . --no-build-isolation
 ```
 
-On Windows, see [WHL_BUILD_INSTALL.md](WHL_BUILD_INSTALL.md).
+On Windows, CUTE is not built and the core-only path is used; see
+[WHL_BUILD_INSTALL.md](WHL_BUILD_INSTALL.md).
+
+### Verify the installed wheel
+
+The Linux wheel should contain three native artifacts:
+
+```bash
+python -m zipfile -l /workspace/dist/omni_xpu_kernel-*.whl \
+  | grep -E '(_C|lgrf_sdp|cute_fmha_torch).*\.so'
+```
+
+```text
+omni_xpu_kernel/_C.cpython-312-x86_64-linux-gnu.so
+omni_xpu_kernel/lgrf_uni/lgrf_sdp.cpython-312-x86_64-linux-gnu.so
+omni_xpu_kernel/cute/cute_fmha_torch.cpython-312-x86_64-linux-gnu.so
+```
+
+Run the import check outside the source directory so an unbuilt source package
+cannot shadow the installed wheel:
+
+```bash
+cd /tmp
+python -c '
+import torch, omni_xpu_kernel as ok
+from omni_xpu_kernel import cute
+print(torch.__version__, torch.xpu.get_device_name(0))
+print(ok.__version__, ok.is_available(), cute.is_available())
+'
+```
+
+### oneDNN header/library consistency
+
+PyTorch XPU wheels include oneDNN headers, while the OMIX image links the
+oneAPI oneDNN shared library. Mixing a newer Torch header with an older system
+library can produce an import failure such as:
+
+```text
+undefined symbol: dnnl_primitive_attr_set_zero_points_v2
+```
+
+The build keeps the explicitly selected oneAPI oneDNN include directory before
+`torch/include` and removes only duplicate oneDNN entries injected through
+`CPATH`, `C_INCLUDE_PATH`, or `CPLUS_INCLUDE_PATH`. Check the result with:
+
+```bash
+nm -D /path/to/_C.so | grep dnnl_primitive_attr_set_zero_points
+ldd /path/to/_C.so | grep dnnl
+```
+
+The validated OMIX build references
+`dnnl_primitive_attr_set_zero_points` and loads the oneAPI `libdnnl.so.3`.
+
+### Platform-specific notes
+
+#### Battlemage
+
+- `bmg` remains the default AOT target.
+- LGRF `ConfigBMG` is the currently performance-tuned attention configuration.
+- The PTL-specific oneDNN workaround described below is guarded by runtime
+  architecture and does not change the BMG path.
+
+#### Panther Lake H
+
+- Use `ptl-h` only after `sycl-ls --verbose` reports `intel_gpu_ptl_h`.
+- LGRF and CUTE compile to PTL-H AOT images, but their tile/WG policy currently
+  reuses the BMG/Xe2 configuration; successful compilation is not a claim of
+  PTL-specific performance tuning.
+- oneDNN 3.9 cannot create the FP16 `M=4096, K=4096, N=4096` JIT GEMM primitive
+  used as a chunk of the `N=12288` FP8 workflow shape. The implementation uses
+  an `N=2048` chunk only on `intel_gpu_ptl_h`; BF16 and non-PTL paths retain the
+  existing chunk selection.
+
+The PTL-H configuration validated on 2026-07-16 was:
+
+| Component | Version / result |
+|---|---|
+| Source baseline | `origin/main@1380ca7` plus PTL build fixes |
+| GPU | Arc B390, `intel_gpu_ptl_h`, IP 30.0.4 |
+| Container | `intel/omix:0.1.0-devel-ubuntu24.04` |
+| Compiler | oneAPI DPC++/C++ 2025.3.3 |
+| PyTorch | `2.11.0+xpu` |
+| sycl-tla | `2fc09973bfdf15755090fcb0e3b6ad236408a992` |
+| Tests | `469 passed, 2 skipped`, no failures |
+
+The validated wheel is
+`omni_xpu_kernel-0.1.0b8.dev0-cp312-cp312-linux_x86_64.whl`, SHA256
+`e2873ac7969f1070576a1e9a980a6732c4e308c50ef023116f47111ad4fd8554`.
+
+Compiler metadata contains two LGRF images and three CUTE images. LGRF D128 and
+D64 kernels reserve 256 GRF with 32 KiB and 16 KiB SLM respectively; the CUTE
+FP16/BF16 main kernels reserve 256 GRF. No image reports compiler-visible
+scratch, spill, or `per_thread_memory_buffers`. Inspect another build with:
+
+```bash
+TOOL=/opt/intel/oneapi/compiler/2025.3/bin/compiler/clang-offload-extract
+$TOOL --stem=/tmp/lgrf /path/to/lgrf_sdp.so
+$TOOL --stem=/tmp/cute /path/to/cute_fmha_torch.so
+
+for image in /tmp/lgrf.* /tmp/cute.*; do
+  readelf -p .ze_info "$image" \
+    | grep -E 'name:|grf_count:|slm_size:|scratch|spill|per_thread_memory_buffers'
+done
+```
+
+`grf_count=256` denotes the doubleGRF reservation and is not itself evidence of
+spill. The PTL oneDNN failure happens during JIT register-bundle allocation,
+before execution, and is handled by chunking rather than accepting spill.
+
+#### Support boundary
+
+- The documented build targets are BMG and PTL-H only. PVC has never been
+  validated by this project and is not a planned support target.
+- `sdp_config.h` contains legacy PVC/LNL and B770 configuration placeholders;
+  their presence is not a build-support claim.
+- Never distribute a BMG or PTL-H wheel as a generic cross-platform binary;
+  rebuild the AOT sidecars for the matching target.
 
 ## Debug Logging
 
@@ -321,18 +568,17 @@ the CUTLASS-SYCL attention sidecar (`cute_fmha_torch.so`). Set
 `OMNI_XPU_REQUIRE_CUTE=0` only for an explicit core-only build. The remaining
 native operations are built into the main `_C` extension.
 
-Configuration is via `sdp_config.h`:
-- `ConfigBMG` — Arc B580 (default)
-- `ConfigPVC` — Data Center GPU Max
-- `ConfigLNL` — Lunar Lake
-
-To switch config at compile time: `-DSDP_CONFIG_PVC`
+`sdp_config.h` contains the active `ConfigBMG` configuration plus legacy
+PVC/LNL configuration placeholders. Only the BMG path is performance-tuned;
+the PTL-H build currently reuses its tile/WG policy. The legacy definitions do
+not imply that those platforms are supported.
 
 ### Build System
 
 The package builds multiple extension modules:
 - `_C.so` — Main extension (norm, gguf, svdq, rotary, sdp loader, fp8, int8)
 - `lgrf_sdp.so` — SDP ESIMD sidecar (AOT, doubleGRF)
+- `cute_fmha_torch.so` — CUTLASS-SYCL FMHA sidecar (Linux, AOT, required by default)
 
 ## License
 

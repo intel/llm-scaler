@@ -63,6 +63,29 @@ def get_icpx_path():
     return None
 
 
+def get_compile_env(onednn_include=""):
+    """Keep the explicitly selected oneDNN include directory authoritative."""
+    env = os.environ.copy()
+    if not onednn_include:
+        return env
+
+    selected = os.path.normcase(os.path.realpath(onednn_include))
+    for name in ("CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH"):
+        value = env.get(name)
+        if not value:
+            continue
+        paths = value.split(os.pathsep)
+        paths = [
+            path for path in paths
+            if not path or os.path.normcase(os.path.realpath(path)) != selected
+        ]
+        if paths:
+            env[name] = os.pathsep.join(paths)
+        else:
+            env.pop(name, None)
+    return env
+
+
 class ICPXBuildExt(build_ext):
     """Build extension using Intel icpx compiler directly."""
     
@@ -183,6 +206,13 @@ class ICPXBuildExt(build_ext):
                     "/O2", "/DNDEBUG",
                     "/EHsc",  # Enable C++ exception handling
                     "/std:c++17",
+                ]
+                # PyTorch XPU wheels also bundle oneDNN headers. Keep the
+                # headers selected with the external oneDNN library first so
+                # declarations and exported symbols use the same ABI.
+                if has_onednn:
+                    cmd.append(f"/I{onednn_include}")
+                cmd += [
                     f"/I{python_include}",
                     f"/I{torch_include}",
                     f"/I{torch_include}\\torch\\csrc\\api\\include",
@@ -190,8 +220,6 @@ class ICPXBuildExt(build_ext):
                     "/LD",  # Create DLL
                     f"/Fe:{output_path}",  # Output file
                 ]
-                if has_onednn:
-                    cmd.append(f"/I{onednn_include}")
                 cmd += [str(s) for s in sources] + [
                     f"/link",
                     f"/LIBPATH:{torch_lib}",
@@ -210,7 +238,7 @@ class ICPXBuildExt(build_ext):
             
             if is_lgrf:
                 # Device target: set OMNI_XPU_DEVICE env var to override
-                # Common values: bmg (Arc B-series), pvc (Data Center GPU Max), ptl-h (Panther Lake)
+                # Validated values: bmg (Arc B-series), ptl-h (Panther Lake H)
                 device_target = os.environ.get("OMNI_XPU_DEVICE", "bmg")
                 cmd += [
                     "-fsycl-targets=spir64_gen",
@@ -267,13 +295,17 @@ class ICPXBuildExt(build_ext):
                     "-O3", "-DNDEBUG",
                     "-fPIC", "-shared",
                     "-std=c++17",
+                ]
+                # torch/include contains another oneDNN header tree. Put the
+                # explicitly selected installation first so it matches -ldnnl.
+                if has_onednn:
+                    cmd.append(f"-I{onednn_include}")
+                cmd += [
                     f"-I{python_include}",
                     f"-I{torch_include}",
                     f"-I{torch_include}/torch/csrc/api/include",
                     f"-I{src_dir}",
                 ]
-                if has_onednn:
-                    cmd.append(f"-I{onednn_include}")
                 cmd += [
                     f"-L{torch_lib}",
                     "-ltorch", "-ltorch_python", "-ltorch_cpu", "-ltorch_xpu", "-lc10", "-lc10_xpu",
@@ -289,7 +321,16 @@ class ICPXBuildExt(build_ext):
         print(f"Compile command: {' '.join(cmd)}")
         
         # Run compiler
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # oneAPI setvars also injects oneDNN through the compiler include-path
+        # environment. Clang can de-duplicate that path against the earlier -I
+        # and retain the environment copy after torch/include. Remove only the
+        # duplicate entry; all other oneAPI paths remain unchanged.
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=get_compile_env(onednn_include if has_onednn else ""),
+        )
         
         if result.returncode != 0:
             print("STDOUT:", result.stdout)

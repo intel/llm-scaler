@@ -194,11 +194,23 @@ std::optional<int64_t> select_chunk_n_for_shape(
     int64_t m,
     int64_t k,
     int64_t n,
-    torch::ScalarType input_type
+    torch::ScalarType input_type,
+    const torch::Device& device
 ) {
     // Known good chunk sizes for specific shapes (empirically tuned)
     if (m == 4096 && k == 4096) {
         if (n == 12288) {
+            namespace syclex = sycl::ext::oneapi::experimental;
+            const auto architecture = utils::get_queue(device)
+                .get_device()
+                .get_info<syclex::info::device::architecture>();
+            if (input_type == ST::Half &&
+                architecture == syclex::architecture::intel_gpu_ptl_h) {
+                // oneDNN 3.9 exhausts the requested register bundle for the
+                // f16 M=4096/K=4096/N=4096 primitive on PTL-H. N=2048 is the
+                // largest tested chunk that creates and executes reliably.
+                return int64_t{2048};
+            }
             return int64_t{4096};
         }
 
@@ -494,7 +506,13 @@ torch::Tensor onednn_w8a16_fp8(
 
     // Check N-chunking first: some large-N shapes are split into smaller chunks
     // that individually satisfy the per-primitive shape constraints.
-    auto selected_chunk_n = select_chunk_n_for_shape(m, k, n, x_materialized.scalar_type());
+    auto selected_chunk_n = select_chunk_n_for_shape(
+        m,
+        k,
+        n,
+        x_materialized.scalar_type(),
+        x_materialized.device()
+    );
 
     // Shape guard: only enable FP8 for shapes where it's faster than bf16 GEMM.
     // Empirically on BMG/B60, FP8 is beneficial when N <= 4096, M <= 8192, K >= 2048.
