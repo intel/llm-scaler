@@ -16,6 +16,7 @@ export SGLANG_USE_SGL_XPU=1
 export SGLANG_SKIP_VISION_GPU=1
 export SGLANG_FP8_IGNORED_LAYERS=vision_tower,embed_vision
 export SGLANG_SPLITK_G="${SGLANG_SPLITK_G:-64}"
+export SGL_XPU_FP8_W8A16_PREFILL="${SGL_XPU_FP8_W8A16_PREFILL:-1}"
 
 speculative_args=()
 if [[ -n "${SPECULATIVE_DRAFT_MODEL_PATH}" ]]; then
