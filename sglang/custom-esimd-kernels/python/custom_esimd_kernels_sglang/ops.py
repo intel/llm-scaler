@@ -1752,6 +1752,15 @@ def esimd_rmsnorm_residual_scalar(
     )
 
 
+def onednn_fp8_gemm_w8a16(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return _ops.onednn_fp8_gemm_w8a16(input, weight, weight_scale, bias)
+
+
 def splitk_decode_attention(
     query: torch.Tensor,
     key_cache: torch.Tensor,

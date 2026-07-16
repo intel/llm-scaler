@@ -1,5 +1,5 @@
 diff --git a/python/pyproject.toml b/python/pyproject.toml
-index a8e086c361..bec0935373 100755
+index a8e086c3612bac67c907ccb88f4ff529e06eefc8..bec0935373211eb2a63c9be415b8c64dc046ef2d 100755
 --- a/python/pyproject.toml
 +++ b/python/pyproject.toml
 @@ -1,5 +1,5 @@
@@ -195,7 +195,7 @@ index a8e086c361..bec0935373 100755
 -[tool.kernels.dependencies]
 -"kernels-community/sgl-flash-attn3" = 1
 diff --git a/python/sglang/srt/configs/load_config.py b/python/sglang/srt/configs/load_config.py
-index 44ee91a1a2..38de4d83ab 100644
+index 44ee91a1a2106212ecbb2ef26a367893eaf1f41b..38de4d83abb81bf8033d10fa6192a121b89dc27f 100644
 --- a/python/sglang/srt/configs/load_config.py
 +++ b/python/sglang/srt/configs/load_config.py
 @@ -25,6 +25,7 @@ class LoadFormat(str, enum.Enum):
@@ -207,7 +207,7 @@ index 44ee91a1a2..38de4d83ab 100644
      JAX = "jax"
      REMOTE = "remote"
 diff --git a/python/sglang/srt/distributed/device_communicators/xpu_communicator.py b/python/sglang/srt/distributed/device_communicators/xpu_communicator.py
-index 78931ac7c4..ed639a3b60 100644
+index 78931ac7c4fb5efae9035e089a0d9589153e759a..ed639a3b60939b0e9bd00909b1adf03ed1991338 100644
 --- a/python/sglang/srt/distributed/device_communicators/xpu_communicator.py
 +++ b/python/sglang/srt/distributed/device_communicators/xpu_communicator.py
 @@ -9,6 +9,14 @@ from torch.distributed import ProcessGroup
@@ -244,7 +244,7 @@ index 78931ac7c4..ed639a3b60 100644
          return x
  
 diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index 435c30a5cf..5abb15f221 100644
+index 435c30a5cfd99f457b580bd3d3894424a89d3df8..5abb15f221ee34af22fc31b46fb48d76eaa79888 100644
 --- a/python/sglang/srt/environ.py
 +++ b/python/sglang/srt/environ.py
 @@ -656,6 +656,11 @@ class Envs:
@@ -261,7 +261,7 @@ index 435c30a5cf..5abb15f221 100644
  
 diff --git a/python/sglang/srt/layers/attention/fla/chunk_torch_xpu.py b/python/sglang/srt/layers/attention/fla/chunk_torch_xpu.py
 new file mode 100644
-index 0000000000..378fea0ccb
+index 0000000000000000000000000000000000000000..378fea0ccb467a365283804cf14ebafb1d75ef70
 --- /dev/null
 +++ b/python/sglang/srt/layers/attention/fla/chunk_torch_xpu.py
 @@ -0,0 +1,144 @@
@@ -410,7 +410,7 @@ index 0000000000..378fea0ccb
 +    # middle element (not as h_aux) is required for that scatter to run.
 +    return o, last_state, None
 diff --git a/python/sglang/srt/layers/attention/fla/layernorm_gated.py b/python/sglang/srt/layers/attention/fla/layernorm_gated.py
-index 5a8fda41b4..99c56f9ff8 100644
+index 5a8fda41b4f1620ddb428484f7229d5d99556dad..99c56f9ff86ab66af82b89f81d0eed8bde39af19 100644
 --- a/python/sglang/srt/layers/attention/fla/layernorm_gated.py
 +++ b/python/sglang/srt/layers/attention/fla/layernorm_gated.py
 @@ -22,11 +22,27 @@ from sglang.srt.utils import (
@@ -500,7 +500,7 @@ index 5a8fda41b4..99c56f9ff8 100644
 +            activation=self.activation,
 +        )
 diff --git a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
-index d0a8ff7a90..7c0d37076e 100644
+index d0a8ff7a90bbea0a4d22232c6640f2678cc470a7..7c0d37076ec3f7f96a760780fbf90d032589d078 100644
 --- a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
 +++ b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
 @@ -533,7 +533,14 @@ class MambaAttnBackendBase(AttentionBackend):
@@ -520,7 +520,7 @@ index d0a8ff7a90..7c0d37076e 100644
          if forward_mode.is_decode_or_idle():
              if num_padding == 0:
 diff --git a/python/sglang/srt/layers/attention/linear/gdn_backend.py b/python/sglang/srt/layers/attention/linear/gdn_backend.py
-index ade156e98c..a430c66952 100644
+index ade156e98cdbd5e95746a7387450ef55aa17e3c3..a430c6695228b2824c67d0a3a984c503433e0e62 100644
 --- a/python/sglang/srt/layers/attention/linear/gdn_backend.py
 +++ b/python/sglang/srt/layers/attention/linear/gdn_backend.py
 @@ -18,7 +18,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -544,7 +544,7 @@ index ade156e98c..a430c66952 100644
                      ssm_states.dtype, copy=False
                  )
 diff --git a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
-index 0daf8f4e25..cab43381b4 100644
+index 0daf8f4e25714bccc4debc93a75c02304335dbab..cab43381b4a41c47f07d6c0519e44f9ba5626c4b 100644
 --- a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
 +++ b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
 @@ -34,6 +34,17 @@ elif is_xpu():
@@ -610,7 +610,7 @@ index 0daf8f4e25..cab43381b4 100644
              q=q,
              k=k,
 diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py
-index ae5365e8d6..0f54d2a8ce 100644
+index ae5365e8d6f760ff5837216f5e235495e7f44683..0f54d2a8ceb03e37f529a72df7833ca23cabc014 100644
 --- a/python/sglang/srt/layers/attention/triton_backend.py
 +++ b/python/sglang/srt/layers/attention/triton_backend.py
 @@ -36,6 +36,21 @@ _is_gfx942 = is_gfx942_supported()
@@ -720,7 +720,7 @@ index ae5365e8d6..0f54d2a8ce 100644
              q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
              self.token_to_kv_pool.get_key_buffer(layer.layer_id),
 diff --git a/python/sglang/srt/layers/attention/xpu_backend.py b/python/sglang/srt/layers/attention/xpu_backend.py
-index ea02e001f1..9c93802638 100644
+index ea02e001f13ef31d784ffc9623198a174694f594..9c93802638741615b8b8af334cb1980871eaac54 100644
 --- a/python/sglang/srt/layers/attention/xpu_backend.py
 +++ b/python/sglang/srt/layers/attention/xpu_backend.py
 @@ -1,9 +1,29 @@
@@ -1512,7 +1512,7 @@ index ea02e001f1..9c93802638 100644
          """Get the fill value for sequence length in CUDA graph."""
          return 1
 diff --git a/python/sglang/srt/layers/linear.py b/python/sglang/srt/layers/linear.py
-index fc197860da..9b01ec583f 100644
+index fc197860da3097e1416f2aa7c7b88c0e8eb2ccc2..9b01ec583f29b37ae03287802e6c8f0b67bb0ef9 100644
 --- a/python/sglang/srt/layers/linear.py
 +++ b/python/sglang/srt/layers/linear.py
 @@ -6,6 +6,7 @@ from __future__ import annotations
@@ -1535,7 +1535,7 @@ index fc197860da..9b01ec583f 100644
              else:
                  quantize_communications = (
 diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
-index 15a3d6aac9..4fe805001c 100644
+index 15a3d6aac9b15878b314a411e3535359fa2987a5..4fe805001c389e7c57a9f120306b03c30ed4fd67 100644
 --- a/python/sglang/srt/layers/logits_processor.py
 +++ b/python/sglang/srt/layers/logits_processor.py
 @@ -21,6 +21,12 @@ from typing import Any, Dict, List, Optional, Tuple, Union
@@ -1571,7 +1571,7 @@ index 15a3d6aac9..4fe805001c 100644
                  logits = torch.matmul(
                      hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
 diff --git a/python/sglang/srt/layers/moe/moe_runner/triton.py b/python/sglang/srt/layers/moe/moe_runner/triton.py
-index 96e431d4e3..f2ba507fc2 100644
+index 96e431d4e38597be063d4366aa44067e139ac9eb..f2ba507fc2c39cefc026311b36114d30da873c76 100644
 --- a/python/sglang/srt/layers/moe/moe_runner/triton.py
 +++ b/python/sglang/srt/layers/moe/moe_runner/triton.py
 @@ -1,5 +1,6 @@
@@ -1982,7 +1982,7 @@ index 96e431d4e3..f2ba507fc2 100644
          hidden_states=dispatch_output.hidden_states,
          w1=quant_info.w13_weight,
 diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
-index b4e05df013..f88e4f1cfe 100644
+index b4e05df0132f56f4e8e2cd2cc638cc5afa2ead37..f88e4f1cfee99fc4109fe789b5587dcfda3b235e 100644
 --- a/python/sglang/srt/layers/quantization/fp8.py
 +++ b/python/sglang/srt/layers/quantization/fp8.py
 @@ -116,6 +116,145 @@ _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
@@ -2187,7 +2187,7 @@ index b4e05df013..f88e4f1cfe 100644
                  x,
                  layer.w13_weight,
 diff --git a/python/sglang/srt/layers/quantization/fp8_kernel.py b/python/sglang/srt/layers/quantization/fp8_kernel.py
-index 30a035a23c..b10f39fbd0 100644
+index 30a035a23c0126ffc1f0e57dd9325f29dbba0c10..b10f39fbd0ab3bab407d3eaec24a13eea3f022b5 100644
 --- a/python/sglang/srt/layers/quantization/fp8_kernel.py
 +++ b/python/sglang/srt/layers/quantization/fp8_kernel.py
 @@ -40,6 +40,7 @@ from sglang.srt.utils import (
@@ -2247,7 +2247,7 @@ index 30a035a23c..b10f39fbd0 100644
  fp8_min = -fp8_max
  
 diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
-index 6c6827c7d2..ee6ab255b3 100755
+index 6c6827c7d20bf351bbbc2c7ee2b838899540c281..0a4f5b91c6fc4d6aa7a4a7788174118bc7598ddf 100755
 --- a/python/sglang/srt/layers/quantization/fp8_utils.py
 +++ b/python/sglang/srt/layers/quantization/fp8_utils.py
 @@ -46,6 +46,7 @@ from sglang.srt.utils import (
@@ -2258,7 +2258,7 @@ index 6c6827c7d2..ee6ab255b3 100755
      offloader,
  )
  from sglang.srt.utils.custom_op import register_custom_op
-@@ -59,6 +60,35 @@ _is_sm100_supported = is_sm100_supported()
+@@ -59,6 +60,61 @@ _is_sm100_supported = is_sm100_supported()
  _is_sm120_supported = is_sm120_supported()
  _is_gfx95_supported = is_gfx95_supported()
  _is_musa = is_musa()
@@ -2272,13 +2272,39 @@ index 6c6827c7d2..ee6ab255b3 100755
 +# numerically near-equivalent (kernel-validated: cos delta <5e-5). Decode (M<=64) is untouched
 +# because it early-returns via the ESIMD fast path above. Set env=0 to revert to per-token.
 +_XPU_FP8_PERTENSOR_PREFILL = _is_xpu and get_bool_env_var(
-+    "SGLANG_XPU_FP8_PERTENSOR_PREFILL", "true"
++    "SGL_XPU_FP8_PERTENSOR_PREFILL", "true"
 +)
 +if _is_xpu:
 +    logger.info(
 +        "[opt#1] XPU FP8 per-tensor prefill dequant fusion = %s",
 +        "ON" if _XPU_FP8_PERTENSOR_PREFILL else "OFF",
 +    )
++
++# XPU prefill uses the oneDNN W8A16 op ported from llm-scaler Omni into the
++# unified custom kernel wheel. It preserves fp16 activations and the checkpoint's
++# scalar FP8 weight scale; decode remains on the ESIMD path below.
++_XPU_FP8_W8A16_PREFILL = _is_xpu and get_bool_env_var(
++    "SGL_XPU_FP8_W8A16_PREFILL", "true"
++)
++_fp8_gemm_w8a16 = None
++if _XPU_FP8_W8A16_PREFILL:
++    try:
++        from custom_esimd_kernels_sglang import (
++            HAS_ONEDNN_W8A16,
++            onednn_fp8_gemm_w8a16,
++        )
++
++        if HAS_ONEDNN_W8A16:
++            _fp8_gemm_w8a16 = onednn_fp8_gemm_w8a16
++            logger.info("[opt#2] XPU FP8 W8A16 prefill = ON")
++        else:
++            logger.warning(
++                "[opt#2] W8A16 extension unavailable; falling back to opt#1"
++            )
++    except (ImportError, OSError, AttributeError) as err:
++        logger.warning(
++            "[opt#2] W8A16 load failed; falling back to opt#1: %s", err
++        )
 +
 +# Lazy-loaded handle to the merged custom_esimd_kernels_sglang
 +# esimd_gemm_fp8_pert kernel wrapper.
@@ -2294,7 +2320,7 @@ index 6c6827c7d2..ee6ab255b3 100755
  
  _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
  _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
-@@ -188,6 +218,7 @@ class Fp8GemmRunnerBackend(Enum):
+@@ -188,6 +244,7 @@ class Fp8GemmRunnerBackend(Enum):
      DEEP_GEMM = "deep_gemm"
      TRITON = "triton"
      AITER = "aiter"
@@ -2302,7 +2328,7 @@ index 6c6827c7d2..ee6ab255b3 100755
  
      def is_auto(self) -> bool:
          return self == Fp8GemmRunnerBackend.AUTO
-@@ -213,6 +244,9 @@ class Fp8GemmRunnerBackend(Enum):
+@@ -213,6 +270,9 @@ class Fp8GemmRunnerBackend(Enum):
      def is_aiter(self) -> bool:
          return self == Fp8GemmRunnerBackend.AITER
  
@@ -2312,7 +2338,7 @@ index 6c6827c7d2..ee6ab255b3 100755
  
  FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
  
-@@ -439,6 +473,17 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
+@@ -439,6 +499,17 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
      elif backend.is_triton():
          return triton_w8a8_block_fp8_linear
  
@@ -2330,7 +2356,7 @@ index 6c6827c7d2..ee6ab255b3 100755
      else:
          raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
  
-@@ -832,6 +877,54 @@ def triton_w8a8_block_fp8_linear(
+@@ -832,6 +903,54 @@ def triton_w8a8_block_fp8_linear(
      input_2d = input.view(-1, input.shape[-1])
      output_shape = [*input.shape[:-1], weight.shape[0]]
  
@@ -2385,7 +2411,7 @@ index 6c6827c7d2..ee6ab255b3 100755
      q_input, x_scale = per_token_group_quant_fp8(
          input_2d, block_size[1], column_major_scales=False
      )
-@@ -843,6 +936,50 @@ def triton_w8a8_block_fp8_linear(
+@@ -843,6 +962,50 @@ def triton_w8a8_block_fp8_linear(
      return output.to(dtype=input_2d.dtype).view(*output_shape)
  
  
@@ -2436,7 +2462,7 @@ index 6c6827c7d2..ee6ab255b3 100755
  @lru_cache(maxsize=1)
  def _get_triton_mxfp8_downcast():
      try:
-@@ -1491,6 +1628,46 @@ def apply_fp8_linear(
+@@ -1491,6 +1654,61 @@ def apply_fp8_linear(
      input_2d = input.view(-1, input.shape[-1])
      output_shape = [*input.shape[:-1], weight.shape[1]]
  
@@ -2480,10 +2506,25 @@ index 6c6827c7d2..ee6ab255b3 100755
 +        _esimd_gemm_fp8_pert(input_fp16, weight_nk, scale_1d, output)
 +        return output.to(input.dtype).view(*output_shape)
 +
++    if (
++        _is_xpu
++        and _fp8_gemm_w8a16 is not None
++        and not compressed_tensor_quant
++        and weight_scale.numel() == 1
++        and input_2d.shape[0] > 64
++    ):
++        input_fp16 = (
++            input_2d
++            if input_2d.dtype == torch.float16
++            else input_2d.to(torch.float16)
++        )
++        output = _fp8_gemm_w8a16(input_fp16, weight, weight_scale, bias)
++        return output.to(input.dtype).view(*output_shape)
++
      if compressed_tensor_quant:
          # Maybe apply padding to output, see comment in __init__
          num_token_padding = output_padding
-@@ -1544,6 +1721,15 @@ def apply_fp8_linear(
+@@ -1544,6 +1762,15 @@ def apply_fp8_linear(
                          input_scale,
                          use_per_token_if_dynamic=use_per_token_if_dynamic,
                      )
@@ -2500,7 +2541,7 @@ index 6c6827c7d2..ee6ab255b3 100755
                      qinput, x_scale = per_token_group_quant_fp8(
                          input_2d, group_size=input_2d.shape[1]
 diff --git a/python/sglang/srt/layers/quantization/gguf.py b/python/sglang/srt/layers/quantization/gguf.py
-index 5c1e7a63e6..c08f80f045 100644
+index 5c1e7a63e6d90693033108dedd016df02ef5a19b..c08f80f04573d359e7659f02723f37b9fad67678 100644
 --- a/python/sglang/srt/layers/quantization/gguf.py
 +++ b/python/sglang/srt/layers/quantization/gguf.py
 @@ -1,9 +1,9 @@
@@ -3973,7 +4014,7 @@ index 5c1e7a63e6..c08f80f045 100644
      """Embedding method for GGUF.
  
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 8e32640fc6..120fc5e29a 100644
+index 8e32640fc6a9085425a0dd2e45b38c09a5bc643d..120fc5e29a42c7102a5e99227f708a634cc022ca 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -2542,6 +2542,15 @@ class Scheduler(
@@ -3993,7 +4034,7 @@ index 8e32640fc6..120fc5e29a 100644
  
      def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index a282339587..3b7c99c7b0 100644
+index a282339587133c315eec0e47770a8c7bbf8bab0b..3b7c99c7b01ceb48864f612c95c7866c7aebff82 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 @@ -1,6 +1,7 @@
@@ -4070,7 +4111,7 @@ index a282339587..3b7c99c7b0 100644
          self,
          *,
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index 8efe9aae94..8a33403ef3 100644
+index 8efe9aae94e05a94e56e8507396d0ad3964dbe3a..8a33403ef3fe5852789b4b3c72654633c0a18ae4 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
 @@ -62,6 +62,7 @@ from sglang.srt.utils import (
@@ -4147,7 +4188,7 @@ index 8efe9aae94..8a33403ef3 100644
                      for conv_shape in conv_state_shape
                  ]
 diff --git a/python/sglang/srt/model_executor/breakable_cuda_graph/breakable_cuda_graph.py b/python/sglang/srt/model_executor/breakable_cuda_graph/breakable_cuda_graph.py
-index 7341301ef4..464151c42e 100644
+index 7341301ef4b2503cb93bcf72228a65a617a7c535..464151c42ea66f4fd1c32612032cc6516c73e8c8 100644
 --- a/python/sglang/srt/model_executor/breakable_cuda_graph/breakable_cuda_graph.py
 +++ b/python/sglang/srt/model_executor/breakable_cuda_graph/breakable_cuda_graph.py
 @@ -315,9 +315,13 @@ class BreakableCUDAGraphCapture:
@@ -4169,7 +4210,7 @@ index 7341301ef4..464151c42e 100644
      def _end_current_segment(self) -> None:
 diff --git a/python/sglang/srt/model_executor/breakable_cuda_graph/xpu_breakable_graph.py b/python/sglang/srt/model_executor/breakable_cuda_graph/xpu_breakable_graph.py
 new file mode 100644
-index 0000000000..7bbbd2d5b5
+index 0000000000000000000000000000000000000000..7bbbd2d5b5c28fb3a826c1cf4cca072edcbd5441
 --- /dev/null
 +++ b/python/sglang/srt/model_executor/breakable_cuda_graph/xpu_breakable_graph.py
 @@ -0,0 +1,271 @@
@@ -4445,7 +4486,7 @@ index 0000000000..7bbbd2d5b5
 +    """
 +    return fn(*args, **kwargs)
 diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
-index ebbfc2b288..56497dcc76 100644
+index ebbfc2b288d8a82978e13bb83ac156980cc00ae6..56497dcc763b5cd8e42c857000f19a7dd705b701 100644
 --- a/python/sglang/srt/model_executor/cuda_graph_runner.py
 +++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
 @@ -75,6 +75,7 @@ from sglang.srt.utils import (
@@ -4562,7 +4603,7 @@ index ebbfc2b288..56497dcc76 100644
              if _is_hip:
                  raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 3b30eb0e1f..141eb11a4d 100644
+index 3b30eb0e1f74721eaacd2d066b6de30c78ceec64..141eb11a4d832a9c9888d5a95d52441ea9fde775 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -849,6 +849,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
@@ -4586,7 +4627,7 @@ index 3b30eb0e1f..141eb11a4d 100644
              self.init_attention_backend()
              if current_platform.support_cuda_graph():
 diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
-index 32ff5bac25..e8ee7b4ae0 100644
+index 32ff5bac255940253408e70a361e2bb843505986..e8ee7b4ae04bfd97ffa41cc92433df2f6cebab62 100644
 --- a/python/sglang/srt/model_loader/loader.py
 +++ b/python/sglang/srt/model_loader/loader.py
 @@ -115,6 +115,7 @@ from sglang.srt.utils import (
@@ -4990,7 +5031,7 @@ index 32ff5bac25..e8ee7b4ae0 100644
      # FP8 approach: BF16/FP16 model with native FP8 quantization
      if load_config.load_format == LoadFormat.FLASH_RL:
 diff --git a/python/sglang/srt/models/gemma4_causal.py b/python/sglang/srt/models/gemma4_causal.py
-index 9c2f9c25db..4468eea59f 100644
+index 9c2f9c25dbf7c2d8cbd9b10bd8f34fa51f457b40..4468eea59f0db79f5b3cab9d09b5613726a3e399 100644
 --- a/python/sglang/srt/models/gemma4_causal.py
 +++ b/python/sglang/srt/models/gemma4_causal.py
 @@ -13,6 +13,7 @@
@@ -5235,7 +5276,7 @@ index 9c2f9c25db..4468eea59f 100644
              hidden_states = self.post_feedforward_layernorm(hidden_states)
              hidden_states = hidden_states + residual
 diff --git a/python/sglang/srt/models/gemma4_mm.py b/python/sglang/srt/models/gemma4_mm.py
-index 3629782ca3..3d7068ab44 100644
+index 3629782ca3ba6bf6c84ca16a40cf99dac72a6700..3d7068ab445cbca34cba2e6cd00513acc45cf2c1 100644
 --- a/python/sglang/srt/models/gemma4_mm.py
 +++ b/python/sglang/srt/models/gemma4_mm.py
 @@ -606,12 +606,17 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
@@ -5263,7 +5304,7 @@ index 3629782ca3..3d7068ab44 100644
          # Prepare bidirectional attention masks for image tokens during prefill.
          # mm_inputs is preserved on every PP rank up to the first-rank embed
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
-index 65f78e6917..bf045b8549 100644
+index 65f78e6917e8c6f9e0c418f9afc00375347a361d..bf045b85499e575fabf4f2604e072795c78dfd5d 100644
 --- a/python/sglang/srt/models/qwen3_5.py
 +++ b/python/sglang/srt/models/qwen3_5.py
 @@ -15,6 +15,7 @@
@@ -6071,7 +6112,7 @@ index 65f78e6917..bf045b8549 100644
                              param, "weight_loader", default_weight_loader
                          )
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index 6c77ff64f9..78d88e51c6 100644
+index 6c77ff64f92cd08d9f00eb96f8f1514a39d4dd2c..78d88e51c6e93e3a4998e77f255a9467081dd299 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
 @@ -119,6 +119,7 @@ LOAD_FORMAT_CHOICES = [
@@ -6102,7 +6143,7 @@ index 6c77ff64f9..78d88e51c6 100644
                  assert not self.enable_mamba_extra_buffer_lazy(), (
                      "extra_buffer_lazy is not yet supported with speculative decoding. "
 diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
-index 3bb3cec3ae..49e3644c03 100644
+index 3bb3cec3ae3364a7f5e97dc1751ad3d1ad5b9fb0..49e3644c03789b4e9a36afe01a549a0720328831 100644
 --- a/python/sglang/srt/speculative/eagle_utils.py
 +++ b/python/sglang/srt/speculative/eagle_utils.py
 @@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, List, Optional
@@ -6203,7 +6244,7 @@ index 3bb3cec3ae..49e3644c03 100644
  
  
 diff --git a/python/sglang/srt/speculative/spec_utils.py b/python/sglang/srt/speculative/spec_utils.py
-index 48d07334af..c00eb1e982 100644
+index 48d07334af78dfc7ddcf74288ce327fd18357ec4..c00eb1e982d03521f9d6d4d912b1542a8054ad4d 100644
 --- a/python/sglang/srt/speculative/spec_utils.py
 +++ b/python/sglang/srt/speculative/spec_utils.py
 @@ -39,12 +39,13 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
@@ -6240,7 +6281,7 @@ index 48d07334af..c00eb1e982 100644
      i: int,
      topk_p: torch.Tensor,
 diff --git a/python/sglang/srt/utils/hf_transformers/config.py b/python/sglang/srt/utils/hf_transformers/config.py
-index f66ea9a672..8e5f7beda7 100644
+index f66ea9a672e55dfd7b44f40feece4592dfc4c960..8e5f7beda725af2662f2e24ae8a6064c76437b29 100644
 --- a/python/sglang/srt/utils/hf_transformers/config.py
 +++ b/python/sglang/srt/utils/hf_transformers/config.py
 @@ -13,6 +13,7 @@

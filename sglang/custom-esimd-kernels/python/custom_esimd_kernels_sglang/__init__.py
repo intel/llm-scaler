@@ -48,6 +48,7 @@ _try_import_ext("custom_esimd_kernels_lgrf")   # always expected (Qwen3.5 path)
 _try_import_ext("custom_esimd_kernels_moe")    # XeLPG: skipped (DPAS-dep)
 _try_import_ext("custom_esimd_kernels_gemm")   # XeLPG: skipped (DPAS-dep)
 _try_import_ext("eagle_ops")                   # Qwen3.5 decode uses this
+HAS_ONEDNN_W8A16 = _try_import_ext("onednn_w8a16")
 _try_import_ext("moe_ops")                     # XeLPG: skipped (DPAS-dep)
 _try_import_ext("moe_int4_ops")                # XeLPG: skipped (DPAS-dep)
 _try_import_ext("moe_fp8_prefill_ops")         # v2-merged: FP8 MoE prefill
@@ -112,6 +113,7 @@ _EXPORTS = [
     "esimd_kv_scatter",
     "esimd_rmsnorm_residual_scalar",
     "splitk_decode_attention",
+    "onednn_fp8_gemm_w8a16",
     # v2-merged: FP8 MoE prefill + decode SDPA
     "moe_prefill_full_fp8",
     "sglang_decode_attn",
