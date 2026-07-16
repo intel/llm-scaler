@@ -48,7 +48,7 @@ def probe():
 
     try:
         from omni_xpu_kernel import linear as _linear
-        linear_fp8 = _linear.onednn_w8a16_fp8
+        linear_fp8 = getattr(_linear, "try_onednn_w8a16_fp8", _linear.onednn_w8a16_fp8)
         modules["linear_fp8"] = True
     except (ImportError, AttributeError):
         modules["linear_fp8"] = False

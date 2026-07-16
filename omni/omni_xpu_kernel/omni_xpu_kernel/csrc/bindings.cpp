@@ -58,6 +58,7 @@ namespace linear {
     torch::Tensor onednn_w8a16_fp8(torch::Tensor input, torch::Tensor weight, torch::Tensor scale_w, std::optional<torch::Tensor> bias);
     void fp8_cache_clear();
     std::tuple<int64_t, int64_t, int64_t> fp8_cache_stats();
+    std::tuple<int64_t, int64_t, int64_t> fp8_failure_cache_stats();
 }
 namespace fp8 {
     torch::Tensor quantize_per_tensor(const torch::Tensor& input, const torch::Tensor& scale, torch::ScalarType out_dtype);
@@ -263,6 +264,8 @@ PYBIND11_MODULE(_C, m) {
         "Clear FP8 primitive cache");
     linear.def("fp8_cache_stats", &omni_xpu::linear::fp8_cache_stats,
         "Return FP8 cache stats as (hits, misses, size)");
+    linear.def("fp8_failure_cache_stats", &omni_xpu::linear::fp8_failure_cache_stats,
+        "Return failed FP8 primitive cache stats as (failures, negative_hits, size)");
 
     auto fp8 = m.def_submodule("fp8", "FP8 quantization kernels");
     fp8.def("quantize_per_tensor", &omni_xpu::fp8::quantize_per_tensor,
