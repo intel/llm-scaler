@@ -98,6 +98,7 @@ def test_extension_metadata_tracks_native_sources(monkeypatch):
     import setuptools
 
     captured = {}
+    monkeypatch.chdir(PROJECT_ROOT)
     monkeypatch.delenv("CUTLASS_SYCL_ROOT", raising=False)
     monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
     monkeypatch.setattr(setuptools, "setup", lambda **kwargs: captured.update(kwargs))
@@ -115,6 +116,33 @@ def test_extension_metadata_tracks_native_sources(monkeypatch):
     assert "kitchen_rope.cpp" in main_sources
     assert "svdq_dequant.cpp" in main_sources
     assert extensions["omni_xpu_kernel.lgrf_uni.lgrf_sdp"].sources
+    assert "torch==2.11.0" in captured["install_requires"]
+    assert any(
+        requirement.startswith("onednn==2025.3.0;")
+        for requirement in captured["install_requires"]
+    )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="ELF $ORIGIN is Linux-only")
+def test_linux_runtime_search_paths_are_prefix_relative(monkeypatch):
+    import setuptools
+
+    monkeypatch.chdir(PROJECT_ROOT)
+    monkeypatch.delenv("CUTLASS_SYCL_ROOT", raising=False)
+    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
+    monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
+    namespace = run_path(str(PROJECT_ROOT / "setup.py"), run_name="__rpath_test__")
+
+    runtime_lib = Path(sys.prefix) / "lib"
+    core_rpath = namespace["get_origin_rpath"]("omni_xpu_kernel._C", runtime_lib)
+    sidecar_rpath = namespace["get_origin_rpath"](
+        "omni_xpu_kernel.lgrf_uni.lgrf_sdp", runtime_lib
+    )
+
+    assert core_rpath.startswith("$ORIGIN/")
+    assert sidecar_rpath.startswith("$ORIGIN/")
+    assert sys.prefix not in core_rpath
+    assert sys.prefix not in sidecar_rpath
 
 
 def test_default_build_accepts_complete_cutlass_tree(tmp_path):
@@ -206,3 +234,20 @@ def test_lgrf_sdp_wheel_contains_sidecar_artifact():
                 f"expected packaged wheel to contain {expected_member}, "
                 "not just a source-tree sidecar artifact"
             )
+            if sys.platform == "linux" and shutil.which("readelf") is not None:
+                native_members = [
+                    member for member in wheel_zip.namelist()
+                    if member.endswith(".so")
+                ]
+                extract_root = temp_root / "extracted"
+                for member in native_members:
+                    wheel_zip.extract(member, extract_root)
+                    dynamic = subprocess.run(
+                        ["readelf", "-d", str(extract_root / member)],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    ).stdout
+                    assert "$ORIGIN" in dynamic
+                    assert str(sys.prefix) not in dynamic
+                    assert "/opt/intel" not in dynamic

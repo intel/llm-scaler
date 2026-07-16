@@ -237,7 +237,7 @@ output = rotary.apply_kitchen_rope_split_half1(x, freqs_cis)
 - Intel oneAPI DPC++/C++ Compiler (icpx)
 - PyTorch with XPU support; the current validated container uses `2.11.0+xpu`
 - Intel GPU: Arc B-series (BMG) or Panther Lake H (PTL-H)
-- oneDNN (for INT4/FP8 GEMM; auto-detected from oneAPI)
+- oneDNN 2025.3 pip runtime and development headers (for INT4/FP8/INT8 GEMM)
 - Intel `sycl-tla`/CUTLASS-SYCL headers (for the default Linux CUTE FMHA)
 
 ## Building from Source
@@ -331,6 +331,8 @@ docker exec omni-xpu-kernel-devel bash -lc '
   /opt/venv/bin/python -m pip install \
     torch==2.11.0+xpu torchaudio torchvision \
     --index-url https://download.pytorch.org/whl/xpu
+  /opt/venv/bin/python -m pip install \
+    onednn==2025.3.0 onednn-devel==2025.3.0
   /opt/venv/bin/python -m pip install wheel pytest numpy
 '
 ```
@@ -428,25 +430,41 @@ print(ok.__version__, ok.is_available(), cute.is_available())
 
 ### oneDNN header/library consistency
 
-PyTorch XPU wheels include oneDNN headers, while the OMIX image links the
-oneAPI oneDNN shared library. Mixing a newer Torch header with an older system
-library can produce an import failure such as:
+PyTorch XPU wheels include oneDNN headers for their internal build but do not
+ship an exported `libdnnl.so.3`. The extension directly calls oneDNN, so Linux
+builds use the matched official pip packages by default:
+
+```bash
+pip install onednn==2025.3.0 onednn-devel==2025.3.0
+```
+
+Both packages contain oneDNN 3.9.1. Mixing the newer headers bundled under
+`torch/include` with an older external library can produce an import failure
+such as:
 
 ```text
 undefined symbol: dnnl_primitive_attr_set_zero_points_v2
 ```
 
-The build keeps the explicitly selected oneAPI oneDNN include directory before
-`torch/include` and removes only duplicate oneDNN entries injected through
-`CPATH`, `C_INCLUDE_PATH`, or `CPLUS_INCLUDE_PATH`. Check the result with:
+The build validates the header and runtime versions, passes the selected
+`libdnnl` file directly to the linker, and keeps that include directory before
+`torch/include`. It also removes only duplicate oneDNN entries injected through
+`CPATH`, `C_INCLUDE_PATH`, or `CPLUS_INCLUDE_PATH`.
+
+The three native extensions use `$ORIGIN`-relative ELF search paths to the
+active Python prefix instead of embedding the build venv or `/opt/intel` path.
+Check the result with:
 
 ```bash
 nm -D /path/to/_C.so | grep dnnl_primitive_attr_set_zero_points
 ldd /path/to/_C.so | grep dnnl
+readelf -d /path/to/_C.so | grep -E 'RPATH|RUNPATH'
 ```
 
-The validated OMIX build references
-`dnnl_primitive_attr_set_zero_points` and loads the oneAPI `libdnnl.so.3`.
+The validated build references `dnnl_primitive_attr_set_zero_points` and loads
+`libdnnl.so.3` from the Python prefix. A non-pip development installation can
+still be selected explicitly by setting both `ONEDNN_INCLUDE` and
+`ONEDNN_LIB`; this is not the relocatable wheel path.
 
 ### Platform-specific notes
 
@@ -477,12 +495,13 @@ The PTL-H configuration validated on 2026-07-16 was:
 | Container | `intel/omix:0.1.0-devel-ubuntu24.04` |
 | Compiler | oneAPI DPC++/C++ 2025.3.3 |
 | PyTorch | `2.11.0+xpu` |
+| oneDNN | pip `onednn==2025.3.0` / oneDNN 3.9.1 |
 | sycl-tla | `2fc09973bfdf15755090fcb0e3b6ad236408a992` |
 | Tests | `469 passed, 2 skipped`, no failures |
 
 The validated wheel is
 `omni_xpu_kernel-0.1.0b8.dev0-cp312-cp312-linux_x86_64.whl`, SHA256
-`e2873ac7969f1070576a1e9a980a6732c4e308c50ef023116f47111ad4fd8554`.
+`71eb2c49e2a798ffdf00b389de756896076965b9347af9b4517084533c62f09b`.
 
 Compiler metadata contains two LGRF images and three CUTE images. LGRF D128 and
 D64 kernels reserve 256 GRF with 32 KiB and 16 KiB SLM respectively; the CUTE
