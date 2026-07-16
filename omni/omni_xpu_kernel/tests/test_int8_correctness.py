@@ -150,6 +150,28 @@ class TestQuantizeInt8Rowwise:
         assert q.shape == (2, 16, 128)
         assert scale.shape == (2, 16, 1)
 
+    @pytest.mark.skipif(not has_xpu(), reason="Native quant dispatch requires XPU")
+    @pytest.mark.parametrize(
+        ("shape", "dtype", "scale_shape"),
+        [
+            ((128,), torch.bfloat16, (1,)),
+            ((4, 128), torch.float32, (4, 1)),
+        ],
+    )
+    def test_generic_native_fallback_inputs(
+        self, shape, dtype, scale_shape, seed
+    ):
+        """Public dispatch retains generic-native shape and dtype support."""
+        from omni_xpu_kernel import int8
+
+        x = torch.randn(shape, device="xpu", dtype=dtype)
+        q, scale = int8.quantize_int8_rowwise(x)
+
+        assert q.shape == x.shape
+        assert q.dtype == torch.int8
+        assert scale.shape == scale_shape
+        assert scale.dtype == torch.float32
+
     @pytest.mark.skipif(not has_xpu(), reason="Fused quant kernel requires XPU")
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     @pytest.mark.parametrize("k", [7, 8, 255, 256, 512, 513, 1024, 3840])

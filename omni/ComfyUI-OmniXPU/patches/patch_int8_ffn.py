@@ -215,6 +215,7 @@ def apply():
             gated_q, gated_scale = _omni_int8.fused_silu_mul_quantize_rowwise(
                 up1, up3
             )
+            del up1, up3
             route = "shared_up+fused_swiglu_quant+prequant_down"
         output = _omni_int8.int8_linear_prequantized(
             gated_q,

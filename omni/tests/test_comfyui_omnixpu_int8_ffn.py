@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import types
+import weakref
 from pathlib import Path
 
 import torch
@@ -71,10 +72,14 @@ def _load_patch(monkeypatch, candidate):
 class _Candidate:
     def __init__(self):
         self.calls = []
+        self.up_refs = ()
+        self.up_inputs_released_at_down = False
 
     def int8_linear_shared_input(self, x, *args, **kwargs):
         self.calls.append(("shared", kwargs))
-        return x + 2, x + 3
+        up1, up3 = x + 2, x + 3
+        self.up_refs = (weakref.ref(up1), weakref.ref(up3))
+        return up1, up3
 
     def fused_silu_mul_quantize_rowwise(self, x1, x2):
         self.calls.append(("fused", {}))
@@ -94,6 +99,7 @@ class _Candidate:
 
     def int8_linear_prequantized(self, q, scale, *args, **kwargs):
         self.calls.append(("down", kwargs))
+        self.up_inputs_released_at_down = all(ref() is None for ref in self.up_refs)
         return q.to(torch.float32) + 4
 
 
@@ -158,6 +164,7 @@ def test_eligible_route_chains_all_three_kernel_apis(monkeypatch):
     assert [name for name, _ in candidate.calls] == ["shared", "fused", "down"]
     assert candidate.calls[0][1]["out_dtype"] == torch.bfloat16
     assert candidate.calls[2][1]["out_dtype"] == torch.bfloat16
+    assert candidate.up_inputs_released_at_down
     torch.testing.assert_close(output, torch.full_like(output, 6.0))
 
 
@@ -196,6 +203,7 @@ def test_convrot_route_uses_staged_fused_producer(monkeypatch):
         "down",
     ]
     assert candidate.calls[2][1]["group_size"] == 4
+    assert candidate.up_inputs_released_at_down
     torch.testing.assert_close(output, torch.full_like(output, 9.0))
 
 

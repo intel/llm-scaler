@@ -110,10 +110,14 @@ def quantize_int8_rowwise(
     """
     native = _get_native()
     if native is not None:
-        # The ESIMD hot path is deterministic. Keep the generic native path for
-        # callers that explicitly request stochastic rounding.
-        if stochastic_rounding <= 0 and hasattr(
-            native, "quantize_int8_rowwise_fused"
+        # The fused hot path is deterministic and specialized for matrix-like
+        # FP16/BF16 activations. Preserve the generic native API for 1D inputs,
+        # other floating dtypes, and explicit stochastic rounding.
+        if (
+            stochastic_rounding <= 0
+            and x.ndim >= 2
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and hasattr(native, "quantize_int8_rowwise_fused")
         ):
             return native.quantize_int8_rowwise_fused(x)
         if hasattr(native, "quantize_int8_rowwise"):
