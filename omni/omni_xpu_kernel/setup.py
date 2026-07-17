@@ -63,6 +63,30 @@ def get_icpx_path():
     return None
 
 
+def compiler_env_with_explicit_onednn(onednn_include):
+    """Remove duplicate oneDNN include paths injected by setvars.sh."""
+    env = os.environ.copy()
+    explicit_path = os.path.realpath(onednn_include)
+
+    for name in ("CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH"):
+        value = env.get(name)
+        if not value:
+            continue
+
+        entries = value.split(os.pathsep)
+        entries = [
+            entry for entry in entries
+            if not entry or os.path.realpath(entry) != explicit_path
+        ]
+
+        if entries:
+            env[name] = os.pathsep.join(entries)
+        else:
+            env.pop(name, None)
+
+    return env
+
+
 class ICPXBuildExt(build_ext):
     """Build extension using Intel icpx compiler directly."""
     
@@ -268,13 +292,13 @@ class ICPXBuildExt(build_ext):
                     "-fPIC", "-shared",
                     "-std=c++17",
                     f"-I{python_include}",
-                    f"-I{torch_include}",
-                    f"-I{torch_include}/torch/csrc/api/include",
-                    f"-I{src_dir}",
                 ]
                 if has_onednn:
                     cmd.append(f"-I{onednn_include}")
                 cmd += [
+                    f"-I{torch_include}",
+                    f"-I{torch_include}/torch/csrc/api/include",
+                    f"-I{src_dir}",
                     f"-L{torch_lib}",
                     "-ltorch", "-ltorch_python", "-ltorch_cpu", "-ltorch_xpu", "-lc10", "-lc10_xpu",
                 ]
@@ -288,8 +312,17 @@ class ICPXBuildExt(build_ext):
         
         print(f"Compile command: {' '.join(cmd)}")
         
-        # Run compiler
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # Run compiler with the explicit oneDNN include taking precedence.
+        compiler_env = os.environ.copy()
+        if has_onednn and not is_cute:
+            compiler_env = compiler_env_with_explicit_onednn(onednn_include)
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=compiler_env,
+        )
         
         if result.returncode != 0:
             print("STDOUT:", result.stdout)
