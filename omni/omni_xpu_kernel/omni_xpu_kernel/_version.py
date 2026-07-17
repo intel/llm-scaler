@@ -5,4 +5,4 @@
 # they were compiled against.
 __image_version__ = "0.1.0-b8-dev"
 __torch_version__ = "2.11.0"
-__version__ = "0.1.0-b8-dev+torch211"
+__version__ = "0.1.0b8.dev0+torch211"

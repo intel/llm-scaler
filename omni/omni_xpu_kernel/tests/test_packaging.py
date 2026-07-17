@@ -20,11 +20,12 @@ PACKAGE_DIR = Path("omni_xpu_kernel") / "lgrf_uni"
 EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX")
 ARTIFACT_NAME = f"lgrf_sdp{EXT_SUFFIX if isinstance(EXT_SUFFIX, str) and EXT_SUFFIX else '.so'}"
 VERSION_FILE = PROJECT_ROOT / "omni_xpu_kernel" / "_version.py"
+PYPROJECT_FILE = PROJECT_ROOT / "pyproject.toml"
 IMAGE_VERSION = "0.1.0-b8-dev"
 TORCH_VERSION = "2.11.0"
 TORCH_VERSION_TAG = "torch211"
-SOURCE_VERSION = f"{IMAGE_VERSION}+{TORCH_VERSION_TAG}"
 PACKAGE_VERSION = f"0.1.0b8.dev0+{TORCH_VERSION_TAG}"
+SOURCE_VERSION = PACKAGE_VERSION
 
 
 def setup_metadata_env(*, require_cute: Optional[str]) -> dict[str, str]:
@@ -56,7 +57,7 @@ def test_kernel_version_is_exposed_by_package_metadata():
     assert version_module["__version__"] == SOURCE_VERSION
     assert "+" not in IMAGE_VERSION
     assert TORCH_VERSION_TAG == "torch" + "".join(TORCH_VERSION.split(".")[:2])
-    assert SOURCE_VERSION == f"{IMAGE_VERSION}+{TORCH_VERSION_TAG}"
+    assert str(Version(SOURCE_VERSION)) == SOURCE_VERSION
     assert omni_xpu_kernel.__torch_version__ == TORCH_VERSION
     assert omni_xpu_kernel.__version__ == SOURCE_VERSION
 
@@ -86,6 +87,15 @@ def test_distribution_metadata_uses_normalized_torch_version(tmp_path):
     pkg_info = next(tmp_path.glob("*.egg-info/PKG-INFO"))
     metadata = Parser().parsestr(pkg_info.read_text(encoding="utf-8"))
     assert metadata["Version"] == PACKAGE_VERSION
+    assert f"torch=={TORCH_VERSION}" in metadata.get_all("Requires-Dist")
+
+
+def test_build_system_does_not_force_a_torch_environment():
+    pyproject = PYPROJECT_FILE.read_text(encoding="utf-8")
+    build_system = pyproject.split("[build-system]", 1)[1].split("\n[", 1)[0]
+    assert "torch==" not in build_system
+    assert "onednn" not in build_system
+    assert 'dynamic = ["version", "dependencies"]' in pyproject
 
 
 def test_cute_is_required_by_default():

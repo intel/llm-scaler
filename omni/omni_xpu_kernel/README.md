@@ -7,7 +7,10 @@ in `omni_xpu_kernel/_version.py`. The current image version is
 `0.1.0-b8-dev`, while wheels built against Torch 2.11 use the PEP 440 local
 version `0.1.0b8.dev0+torch211`. The Torch tag makes version-specific native
 artifacts distinguishable; rebuild with the corresponding tag for each Torch
-minor.
+minor. Torch and oneDNN are intentionally not pinned in
+`[build-system].requires`: install the selected build dependencies first and
+use `--no-build-isolation`; release metadata is generated from
+`__torch_version__` in `_version.py`.
 
 ## Modules
 
@@ -503,7 +506,7 @@ The PTL-H configuration validated on 2026-07-16 was:
 
 The validated wheel is
 `omni_xpu_kernel-0.1.0b8.dev0+torch211-cp312-cp312-linux_x86_64.whl`, SHA256
-`c49919bc27b6363225b126798a0525ba018bf9ed54c8037baebe6ea71dff9c91`.
+`91579b7b34329148176f5b8f589424a8d8098e60990bdb0a841e93ce5aaa15fd`.
 
 Compiler metadata contains two LGRF images and three CUTE images. LGRF D128 and
 D64 kernels reserve 256 GRF with 32 KiB and 16 KiB SLM respectively; the CUTE
@@ -524,15 +527,6 @@ done
 `grf_count=256` denotes the doubleGRF reservation and is not itself evidence of
 spill. The PTL oneDNN failure happens during JIT register-bundle allocation,
 before execution, and is handled by chunking rather than accepting spill.
-
-#### Support boundary
-
-- The documented build targets are BMG and PTL-H only. PVC has never been
-  validated by this project and is not a planned support target.
-- `sdp_config.h` contains legacy PVC/LNL and B770 configuration placeholders;
-  their presence is not a build-support claim.
-- Never distribute a BMG or PTL-H wheel as a generic cross-platform binary;
-  rebuild the AOT sidecars for the matching target.
 
 ## Debug Logging
 

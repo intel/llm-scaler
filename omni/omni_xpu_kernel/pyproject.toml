@@ -2,15 +2,12 @@
 requires = [
     "setuptools>=45",
     "wheel",
-    "torch==2.11.0",
-    "onednn==2025.3.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
-    "onednn-devel==2025.3.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "omni_xpu_kernel"
-dynamic = ["version"]
+dynamic = ["version", "dependencies"]
 description = "High-performance Intel XPU kernels for PyTorch"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -30,11 +27,6 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Operating System :: Microsoft :: Windows",
 ]
-dependencies = [
-    "torch==2.11.0",
-    "onednn==2025.3.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
-]
-
 [project.optional-dependencies]
 dev = [
     "pytest",

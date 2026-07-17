@@ -118,7 +118,7 @@ Add the **OmniXPU Status** node to any workflow to see:
 ```
 === ComfyUI-OmniXPU Status ===
   GPU: Intel(R) Arc(TM) B580 Graphics (11605 MB)
-  omni_xpu_kernel: 0.1.0-b8-dev+torch211
+  omni_xpu_kernel: 0.1.0b8.dev0+torch211
     available: sdp, norm, rotary, linear_fp8
 
   [+] interpolate_fix: applied
@@ -135,7 +135,7 @@ Add the **OmniXPU Status** node to any workflow to see:
 When loaded successfully, ComfyUI logs:
 
 ```
-[OmniXPU] omni_xpu_kernel 0.1.0-b8-dev+torch211 — available: sdp, norm, rotary, linear_fp8
+[OmniXPU] omni_xpu_kernel 0.1.0b8.dev0+torch211 — available: sdp, norm, rotary, linear_fp8
 [OmniXPU] interpolate_fix: applied
 [OmniXPU] median_fix: applied
 [OmniXPU] fp8_neg_zero_fix: applied
