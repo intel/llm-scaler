@@ -263,7 +263,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     export OMNI_XPU_REQUIRE_CUTE=1 && \
     export OMNI_XPU_DEVICE=bmg && \
     cd /tmp/omni_xpu_kernel && \
-    grep -Fqx "__version__ = \"${IMAGE_TAG}\"" omni_xpu_kernel/_version.py && \
+    grep -Fqx "__image_version__ = \"${IMAGE_TAG}\"" omni_xpu_kernel/_version.py && \
     pip install . --no-build-isolation && \
     rm -rf /tmp/omni_xpu_kernel
 

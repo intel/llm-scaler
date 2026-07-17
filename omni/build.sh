@@ -6,7 +6,7 @@ export HTTP_PROXY HTTPS_PROXY
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION_FILE="${SCRIPT_DIR}/omni_xpu_kernel/omni_xpu_kernel/_version.py"
-TAG="$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' "${VERSION_FILE}")"
+TAG="$(sed -n 's/^__image_version__ = "\([^"]*\)"$/\1/p' "${VERSION_FILE}")"
 if [ -z "${TAG}" ]; then
     echo "Unable to read Omni version from ${VERSION_FILE}" >&2
     exit 1

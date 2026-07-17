@@ -28,8 +28,21 @@ from setuptools import setup, Extension, find_packages
 from setuptools.command.build_ext import build_ext
 
 IS_WINDOWS = platform.system() == "Windows"
-VALIDATED_TORCH_VERSION = "2.11.0"
 VALIDATED_ONEDNN_VERSION = (3, 9, 1)
+
+
+def read_version_field(name):
+    """Read a literal version field without importing the package."""
+    version_file = Path(__file__).parent / "omni_xpu_kernel" / "_version.py"
+    prefix = f"{name} = "
+    with open(version_file, encoding="utf-8") as handle:
+        for line in handle:
+            if line.startswith(prefix):
+                return line.split("=", 1)[1].strip().strip('"\'')
+    raise RuntimeError(f"Unable to read {name} from {version_file}")
+
+
+VALIDATED_TORCH_VERSION = read_version_field("__torch_version__")
 
 
 def get_icpx_path():
@@ -513,12 +526,7 @@ class ICPXExtension(Extension):
 
 # Read version
 def get_version():
-    version_file = Path(__file__).parent / "omni_xpu_kernel" / "_version.py"
-    with open(version_file) as f:
-        for line in f:
-            if line.startswith("__version__"):
-                return line.split("=")[1].strip().strip('"\'')
-    raise RuntimeError(f"Unable to read __version__ from {version_file}")
+    return read_version_field("__version__")
 
 
 # Read README
@@ -572,7 +580,7 @@ setup(
     cmdclass={"build_ext": ICPXBuildExt},
     python_requires=">=3.9",
     install_requires=[
-        "torch==2.11.0",
+        f"torch=={VALIDATED_TORCH_VERSION}",
         "onednn==2025.3.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
     ],
     extras_require={

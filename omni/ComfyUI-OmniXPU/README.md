@@ -118,7 +118,7 @@ Add the **OmniXPU Status** node to any workflow to see:
 ```
 === ComfyUI-OmniXPU Status ===
   GPU: Intel(R) Arc(TM) B580 Graphics (11605 MB)
-  omni_xpu_kernel: 0.1.0-b8-dev
+  omni_xpu_kernel: 0.1.0-b8-dev+torch211
     available: sdp, norm, rotary, linear_fp8
 
   [+] interpolate_fix: applied
@@ -135,7 +135,7 @@ Add the **OmniXPU Status** node to any workflow to see:
 When loaded successfully, ComfyUI logs:
 
 ```
-[OmniXPU] omni_xpu_kernel 0.1.0-b8-dev — available: sdp, norm, rotary, linear_fp8
+[OmniXPU] omni_xpu_kernel 0.1.0-b8-dev+torch211 — available: sdp, norm, rotary, linear_fp8
 [OmniXPU] interpolate_fix: applied
 [OmniXPU] median_fix: applied
 [OmniXPU] fp8_neg_zero_fix: applied
@@ -165,5 +165,6 @@ No ComfyUI core files are modified. Works with unmodified upstream ComfyUI.
 
 - ComfyUI >= 0.18.x (>= 0.27.0 for INT8 ConvRot model support)
 - PyTorch >= 2.7 with XPU support
-- `omni_xpu_kernel` >= 0.1.0b8.dev0 (Omni image `0.1.0-b8-dev`)
+- An `omni_xpu_kernel` wheel matching the installed Torch minor; the current
+  Omni image uses `0.1.0b8.dev0+torch211` with Torch 2.11
 - `comfy_kitchen` >= 0.2.8 (for INT8 custom ops)

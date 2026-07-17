@@ -2,10 +2,12 @@
 
 High-performance Intel XPU kernels for PyTorch.
 
-The Kernel version and the `intel/llm-scaler-omni` image version share the
-single source in `omni_xpu_kernel/_version.py`. The current development version
-is `0.1.0-b8-dev`; Python packaging normalizes it to `0.1.0b8.dev0` in wheel
-metadata and filenames.
+Kernel wheel and `intel/llm-scaler-omni` image versions share the single source
+in `omni_xpu_kernel/_version.py`. The current image version is
+`0.1.0-b8-dev`, while wheels built against Torch 2.11 use the PEP 440 local
+version `0.1.0b8.dev0+torch211`. The Torch tag makes version-specific native
+artifacts distinguishable; rebuild with the corresponding tag for each Torch
+minor.
 
 ## Modules
 
@@ -500,8 +502,8 @@ The PTL-H configuration validated on 2026-07-16 was:
 | Tests | `469 passed, 2 skipped`, no failures |
 
 The validated wheel is
-`omni_xpu_kernel-0.1.0b8.dev0-cp312-cp312-linux_x86_64.whl`, SHA256
-`71eb2c49e2a798ffdf00b389de756896076965b9347af9b4517084533c62f09b`.
+`omni_xpu_kernel-0.1.0b8.dev0+torch211-cp312-cp312-linux_x86_64.whl`, SHA256
+`c49919bc27b6363225b126798a0525ba018bf9ed54c8037baebe6ea71dff9c91`.
 
 Compiler metadata contains two LGRF images and three CUTE images. LGRF D128 and
 D64 kernels reserve 256 GRF with 32 KiB and 16 KiB SLM respectively; the CUTE

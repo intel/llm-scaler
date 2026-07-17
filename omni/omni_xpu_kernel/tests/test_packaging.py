@@ -20,8 +20,11 @@ PACKAGE_DIR = Path("omni_xpu_kernel") / "lgrf_uni"
 EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX")
 ARTIFACT_NAME = f"lgrf_sdp{EXT_SUFFIX if isinstance(EXT_SUFFIX, str) and EXT_SUFFIX else '.so'}"
 VERSION_FILE = PROJECT_ROOT / "omni_xpu_kernel" / "_version.py"
-SOURCE_VERSION = "0.1.0-b8-dev"
-PACKAGE_VERSION = "0.1.0b8.dev0"
+IMAGE_VERSION = "0.1.0-b8-dev"
+TORCH_VERSION = "2.11.0"
+TORCH_VERSION_TAG = "torch211"
+SOURCE_VERSION = f"{IMAGE_VERSION}+{TORCH_VERSION_TAG}"
+PACKAGE_VERSION = f"0.1.0b8.dev0+{TORCH_VERSION_TAG}"
 
 
 def setup_metadata_env(*, require_cute: Optional[str]) -> dict[str, str]:
@@ -48,7 +51,13 @@ def test_kernel_version_is_exposed_by_package_metadata():
     import omni_xpu_kernel
 
     version_module = run_path(str(VERSION_FILE))
+    assert version_module["__image_version__"] == IMAGE_VERSION
+    assert version_module["__torch_version__"] == TORCH_VERSION
     assert version_module["__version__"] == SOURCE_VERSION
+    assert "+" not in IMAGE_VERSION
+    assert TORCH_VERSION_TAG == "torch" + "".join(TORCH_VERSION.split(".")[:2])
+    assert SOURCE_VERSION == f"{IMAGE_VERSION}+{TORCH_VERSION_TAG}"
+    assert omni_xpu_kernel.__torch_version__ == TORCH_VERSION
     assert omni_xpu_kernel.__version__ == SOURCE_VERSION
 
     result = subprocess.run(
@@ -64,7 +73,7 @@ def test_kernel_version_is_exposed_by_package_metadata():
     assert str(Version(result.stdout.strip())) == PACKAGE_VERSION
 
 
-def test_distribution_metadata_uses_normalized_b8_version(tmp_path):
+def test_distribution_metadata_uses_normalized_torch_version(tmp_path):
     result = subprocess.run(
         [sys.executable, "setup.py", "egg_info", "--egg-base", str(tmp_path)],
         cwd=PROJECT_ROOT,
@@ -116,7 +125,7 @@ def test_extension_metadata_tracks_native_sources(monkeypatch):
     assert "kitchen_rope.cpp" in main_sources
     assert "svdq_dequant.cpp" in main_sources
     assert extensions["omni_xpu_kernel.lgrf_uni.lgrf_sdp"].sources
-    assert "torch==2.11.0" in captured["install_requires"]
+    assert f"torch=={TORCH_VERSION}" in captured["install_requires"]
     assert any(
         requirement.startswith("onednn==2025.3.0;")
         for requirement in captured["install_requires"]

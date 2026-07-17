@@ -1,5 +1,15 @@
 # Changelog
 
+## dev/torch-version-tag (2026-07-17)
+
+### Build System
+
+- Wheel versions now carry the Torch minor used for compilation as a PEP 440
+  local version, for example `0.1.0b8.dev0+torch211`.
+- The Docker image retains the shared `0.1.0-b8-dev` base version because `+`
+  is not valid in a Docker tag. Both values remain defined in
+  `omni_xpu_kernel/_version.py`.
+
 ## dev/kitchen_xpu (2026-07-13)
 
 ### Build System
