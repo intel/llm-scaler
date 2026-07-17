@@ -6,6 +6,7 @@ This document summarizes how to build the updated omni_xpu_kernel from llm-scale
 - Intel oneAPI Base Toolkit installed
 - VS2022 C++ components installed
 - conda environment: omni_env
+- PyTorch XPU 2.10.x, 2.11.x, or 2.12.x installed in the build environment
 - ComfyUI embedded Python located at: %EMBED_PYTHON_DIR%
 - Variables (adjust as needed):
   - %WORKSPACE%: workspace root
@@ -59,20 +60,26 @@ Key points:
 - Produce wheel to %OUTPUT_DIR%
 
 Output:
-- %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+torch211-cp312-cp312-win_amd64.whl
+- Torch 2.10.x: %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+torch210-cp312-cp312-win_amd64.whl
+- Torch 2.11.x: %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+torch211-cp312-cp312-win_amd64.whl
+- Torch 2.12.x: %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+torch212-cp312-cp312-win_amd64.whl
+
+The build detects the installed Torch version automatically. Build one wheel
+per Torch environment and install it only into an embedded environment with
+the same Torch public version.
 
 ## 3. Install the newly built wheel (embedded Python)
 Use --no-deps to avoid pulling dependencies again:
 
- - Wheel path:
-  - %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+torch211-cp312-cp312-win_amd64.whl
+ - Wheel path: select the matching `+torch210`, `+torch211`, or `+torch212` artifact
  - Install command:
   - pip install --force-reinstall --no-deps <wheel>
 
 Command example (with variables):
 
 ```
-"%EMBED_PYTHON_DIR%\python.exe" -m pip install --force-reinstall --no-deps "%OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+torch211-cp312-cp312-win_amd64.whl"
+set "TORCH_TAG=torch211"
+"%EMBED_PYTHON_DIR%\python.exe" -m pip install --force-reinstall --no-deps "%OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+%TORCH_TAG%-cp312-cp312-win_amd64.whl"
 ```
 
 ## 4. Verify (optional)
@@ -110,16 +117,13 @@ Add missing link libraries in llm-scaler code:
 ### 2) Restore embedded PyTorch to XPU build
 Reinstall the XPU build of PyTorch in embedded Python (to avoid fallback to standard builds):
 
- - Reference script:
-  - [setup_portable_env.bat](../../../omni/comfyui_windows_setup/setup_portable_env.bat)
- - Key versions:
-  - torch==2.9.0+xpu
-  - torchvision==0.24.0+xpu
-  - torchaudio==2.9.0+xpu
-  - --index-url https://download.pytorch.org/whl/xpu
+Choose Torch 2.10.x, 2.11.x, or 2.12.x and use the same exact public version
+in both the build and embedded environments. Torch 2.9 is not supported by
+this kernel release.
 
 Command example (with variables):
 
 ```
-"%EMBED_PYTHON_DIR%\python.exe" -m pip install torch==2.9.0+xpu torchvision==0.24.0+xpu torchaudio==2.9.0+xpu --index-url https://download.pytorch.org/whl/xpu
+set "TORCH_VERSION=2.11.0"
+"%EMBED_PYTHON_DIR%\python.exe" -m pip install "torch==%TORCH_VERSION%+xpu" torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu
 ```

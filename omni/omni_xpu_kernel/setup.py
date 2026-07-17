@@ -23,6 +23,7 @@ import subprocess
 import shutil
 import platform
 import sysconfig
+from runpy import run_path
 from pathlib import Path
 from setuptools import setup, Extension, find_packages
 from setuptools.command.build_ext import build_ext
@@ -31,18 +32,9 @@ IS_WINDOWS = platform.system() == "Windows"
 VALIDATED_ONEDNN_VERSION = (3, 9, 1)
 
 
-def read_version_field(name):
-    """Read a literal version field without importing the package."""
-    version_file = Path(__file__).parent / "omni_xpu_kernel" / "_version.py"
-    prefix = f"{name} = "
-    with open(version_file, encoding="utf-8") as handle:
-        for line in handle:
-            if line.startswith(prefix):
-                return line.split("=", 1)[1].strip().strip('"\'')
-    raise RuntimeError(f"Unable to read {name} from {version_file}")
-
-
-VALIDATED_TORCH_VERSION = read_version_field("__torch_version__")
+VERSION_NAMESPACE = run_path(str(Path(__file__).parent / "omni_xpu_kernel" / "_version.py"))
+BUILD_TORCH_VERSION = VERSION_NAMESPACE["get_installed_torch_version"]()
+PACKAGE_VERSION = VERSION_NAMESPACE["get_package_version"](BUILD_TORCH_VERSION)
 
 
 def get_icpx_path():
@@ -244,9 +236,9 @@ def get_onednn_paths():
 
 def validate_torch_build(torch, torch_lib):
     public_version = torch.__version__.split("+", 1)[0]
-    if public_version != VALIDATED_TORCH_VERSION:
+    if public_version != BUILD_TORCH_VERSION:
         raise RuntimeError(
-            f"omni_xpu_kernel must be built against torch {VALIDATED_TORCH_VERSION} XPU; "
+            f"omni_xpu_kernel metadata selected torch {BUILD_TORCH_VERSION}, "
             f"found {torch.__version__}"
         )
 
@@ -303,7 +295,6 @@ class ICPXBuildExt(build_ext):
         
         # Get Python include
         python_include = sysconfig.get_path("include")
-        ext_suffix = sysconfig.get_config_var("EXT_SUFFIX")
         
         # Output paths
         output_path = Path(self.get_ext_fullpath(ext.name))
@@ -385,7 +376,7 @@ class ICPXBuildExt(build_ext):
                     f"/Fe:{output_path}",  # Output file
                 ]
                 cmd += [str(s) for s in sources] + [
-                    f"/link",
+                    "/link",
                     f"/LIBPATH:{torch_lib}",
                     f"/LIBPATH:{python_lib_dir}",
                     "torch.lib", "torch_python.lib", "torch_cpu.lib", "torch_xpu.lib", "c10.lib", "c10_xpu.lib",
@@ -526,7 +517,7 @@ class ICPXExtension(Extension):
 
 # Read version
 def get_version():
-    return read_version_field("__version__")
+    return PACKAGE_VERSION
 
 
 # Read README
@@ -580,7 +571,7 @@ setup(
     cmdclass={"build_ext": ICPXBuildExt},
     python_requires=">=3.9",
     install_requires=[
-        f"torch=={VALIDATED_TORCH_VERSION}",
+        f"torch=={BUILD_TORCH_VERSION}",
         "onednn==2025.3.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
     ],
     extras_require={

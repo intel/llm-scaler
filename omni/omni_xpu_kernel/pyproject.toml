@@ -33,8 +33,5 @@ dev = [
     "numpy",
 ]
 
-[tool.setuptools.dynamic]
-version = {attr = "omni_xpu_kernel._version.__version__"}
-
 [tool.setuptools.packages.find]
 exclude = ["tests*", "scripts*"]

@@ -22,9 +22,12 @@ ARTIFACT_NAME = f"lgrf_sdp{EXT_SUFFIX if isinstance(EXT_SUFFIX, str) and EXT_SUF
 VERSION_FILE = PROJECT_ROOT / "omni_xpu_kernel" / "_version.py"
 PYPROJECT_FILE = PROJECT_ROOT / "pyproject.toml"
 IMAGE_VERSION = "0.1.0-b8-dev"
-TORCH_VERSION = "2.11.0"
-TORCH_VERSION_TAG = "torch211"
-PACKAGE_VERSION = f"0.1.0b8.dev0+{TORCH_VERSION_TAG}"
+BASE_VERSION = "0.1.0b8.dev0"
+SUPPORTED_TORCH_MINORS = ("2.10", "2.11", "2.12")
+VERSION_NAMESPACE = run_path(str(VERSION_FILE))
+TORCH_VERSION = VERSION_NAMESPACE["get_installed_torch_version"]()
+TORCH_VERSION_TAG = VERSION_NAMESPACE["get_torch_tag"](TORCH_VERSION)
+PACKAGE_VERSION = f"{BASE_VERSION}+{TORCH_VERSION_TAG}"
 SOURCE_VERSION = PACKAGE_VERSION
 
 
@@ -53,6 +56,8 @@ def test_kernel_version_is_exposed_by_package_metadata():
 
     version_module = run_path(str(VERSION_FILE))
     assert version_module["__image_version__"] == IMAGE_VERSION
+    assert version_module["__base_version__"] == BASE_VERSION
+    assert version_module["__supported_torch_minors__"] == SUPPORTED_TORCH_MINORS
     assert version_module["__torch_version__"] == TORCH_VERSION
     assert version_module["__version__"] == SOURCE_VERSION
     assert "+" not in IMAGE_VERSION
@@ -72,6 +77,32 @@ def test_kernel_version_is_exposed_by_package_metadata():
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip() == SOURCE_VERSION
     assert str(Version(result.stdout.strip())) == PACKAGE_VERSION
+
+
+@pytest.mark.parametrize(
+    ("torch_version", "public_version", "torch_minor", "torch_tag"),
+    [
+        ("2.10.0+xpu", "2.10.0", "2.10", "torch210"),
+        ("2.11.0+xpu", "2.11.0", "2.11", "torch211"),
+        ("2.12.0+xpu", "2.12.0", "2.12", "torch212"),
+        ("2.12.1+xpu", "2.12.1", "2.12", "torch212"),
+    ],
+)
+def test_supported_torch_minors_select_distinct_wheel_tags(
+    torch_version, public_version, torch_minor, torch_tag
+):
+    assert VERSION_NAMESPACE["get_public_torch_version"](torch_version) == public_version
+    assert VERSION_NAMESPACE["get_torch_minor"](torch_version) == torch_minor
+    assert VERSION_NAMESPACE["get_torch_tag"](torch_version) == torch_tag
+    assert VERSION_NAMESPACE["get_package_version"](torch_version) == (
+        f"{BASE_VERSION}+{torch_tag}"
+    )
+
+
+@pytest.mark.parametrize("torch_version", ["2.9.1+xpu", "2.13.0+xpu", "invalid"])
+def test_unsupported_torch_versions_are_rejected(torch_version):
+    with pytest.raises(RuntimeError, match="Torch minor|Unsupported Torch version"):
+        VERSION_NAMESPACE["get_torch_minor"](torch_version)
 
 
 def test_distribution_metadata_uses_normalized_torch_version(tmp_path):
@@ -96,6 +127,7 @@ def test_build_system_does_not_force_a_torch_environment():
     assert "torch==" not in build_system
     assert "onednn" not in build_system
     assert 'dynamic = ["version", "dependencies"]' in pyproject
+    assert "omni_xpu_kernel._version.__version__" not in pyproject
 
 
 def test_cute_is_required_by_default():

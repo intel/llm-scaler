@@ -4,13 +4,15 @@ High-performance Intel XPU kernels for PyTorch.
 
 Kernel wheel and `intel/llm-scaler-omni` image versions share the single source
 in `omni_xpu_kernel/_version.py`. The current image version is
-`0.1.0-b8-dev`, while wheels built against Torch 2.11 use the PEP 440 local
-version `0.1.0b8.dev0+torch211`. The Torch tag makes version-specific native
-artifacts distinguishable; rebuild with the corresponding tag for each Torch
-minor. Torch and oneDNN are intentionally not pinned in
+`0.1.0-b8-dev`. Source builds support Torch XPU 2.10, 2.11, and 2.12 and
+automatically produce `+torch210`, `+torch211`, and `+torch212` PEP 440 local
+versions respectively. The Torch tag makes version-specific native artifacts
+distinguishable; build a separate wheel in each selected Torch environment.
+Torch and oneDNN are intentionally not pinned in
 `[build-system].requires`: install the selected build dependencies first and
-use `--no-build-isolation`; release metadata is generated from
-`__torch_version__` in `_version.py`.
+use `--no-build-isolation`. `setup.py` detects the installed Torch public
+version, rejects unsupported minors, generates the wheel tag, and pins that
+exact public version in the wheel runtime metadata.
 
 ## Modules
 
@@ -240,7 +242,7 @@ output = rotary.apply_kitchen_rope_split_half1(x, freqs_cis)
 ## Requirements
 
 - Intel oneAPI DPC++/C++ Compiler (icpx)
-- PyTorch with XPU support; the current validated container uses `2.11.0+xpu`
+- PyTorch XPU `2.10.x`, `2.11.x`, or `2.12.x`
 - Intel GPU: Arc B-series (BMG) or Panther Lake H (PTL-H)
 - oneDNN 2025.3 pip runtime and development headers (for INT4/FP8/INT8 GEMM)
 - Intel `sycl-tla`/CUTLASS-SYCL headers (for the default Linux CUTE FMHA)
@@ -323,10 +325,13 @@ docker run -d \
   sleep infinity
 ```
 
-Install the Python build environment and PyTorch 2.11 XPU:
+Install the Python build environment and one supported PyTorch XPU version.
+This example selects 2.11; use a separate environment for every wheel variant:
 
 ```bash
-docker exec omni-xpu-kernel-devel bash -lc '
+export TORCH_VERSION=2.11.0  # supported minors: 2.10, 2.11, 2.12
+
+docker exec -e TORCH_VERSION="$TORCH_VERSION" omni-xpu-kernel-devel bash -lc '
   set -e
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -334,7 +339,7 @@ docker exec omni-xpu-kernel-devel bash -lc '
   python3 -m venv /opt/venv
   /opt/venv/bin/python -m pip install -U pip
   /opt/venv/bin/python -m pip install \
-    torch==2.11.0+xpu torchaudio torchvision \
+    "torch==${TORCH_VERSION}+xpu" torchaudio torchvision \
     --index-url https://download.pytorch.org/whl/xpu
   /opt/venv/bin/python -m pip install \
     onednn==2025.3.0 onednn-devel==2025.3.0
@@ -342,16 +347,26 @@ docker exec omni-xpu-kernel-devel bash -lc '
 '
 ```
 
-The current resolver selects torchvision `0.26.0+xpu`, torchaudio
-`2.11.0+xpu`, and `triton-xpu==3.7.0`. A `docker exec` shell does not reliably
-inherit the oneAPI environment established for container PID 1, so source
-`setvars.sh` explicitly in every build and test command.
+The companion torchvision, torchaudio, and Triton versions are selected by the
+chosen Torch index. A `docker exec` shell does not reliably inherit the oneAPI
+environment established for container PID 1, so source `setvars.sh` explicitly
+in every build and test command.
 
 ### Build and install
 
 Set `TARGET` to a value from the platform table. This example writes a wheel
 instead of installing an editable tree so the exact artifact can be archived
 and installed into another matching environment.
+
+| Active build environment | Generated local version |
+|---|---|
+| Torch `2.10.x+xpu` | `0.1.0b8.dev0+torch210` |
+| Torch `2.11.x+xpu` | `0.1.0b8.dev0+torch211` |
+| Torch `2.12.x+xpu` | `0.1.0b8.dev0+torch212` |
+
+The wheel metadata pins the exact public version used to build it. Do not move
+a native wheel between Torch minors; rebuild the same source in the target
+environment instead.
 
 ```bash
 export TARGET=ptl-h  # use bmg on Arc B-series
