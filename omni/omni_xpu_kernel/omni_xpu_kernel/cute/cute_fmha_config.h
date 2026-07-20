@@ -30,8 +30,8 @@ struct Config {
 // Tuned against the original BMG/B60 workload.
 using ConfigBMG = Config<BMGTag, 256, 32, 32, 32, 128, 16, 2, 256>;
 
-// PTL-H correctness and compiler resources are validated with this policy.
-// Keep a separate type so future PTL-H tuning cannot silently alter BMG.
+// Internal PTL-H representative-workload validation retained this policy.
+// Keep a separate type so later PTL-H tuning cannot silently alter BMG.
 using ConfigPTLH = Config<PTLHTag, 256, 32, 32, 32, 128, 16, 2, 256>;
 
 #if defined(OMNI_XPU_ARCH_BMG) && defined(OMNI_XPU_ARCH_PTL_H)

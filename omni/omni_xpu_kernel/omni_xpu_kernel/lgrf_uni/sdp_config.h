@@ -1,8 +1,9 @@
 // ============================================================================
 // SDP Kernel Configuration — compile-time hardware-specific parameters
 // ============================================================================
-// Template parameterization enables zero-overhead hardware adaptation.
-// Add new configs for different GPUs without modifying kernel code.
+// Architecture tags keep AOT policy selection explicit. The current ESIMD
+// implementation has a fixed WG/tile mapping; only head dimension is a safe
+// independent template parameter until those hard-coded mappings are refactored.
 // ============================================================================
 #pragma once
 
@@ -13,50 +14,18 @@ namespace sdp_config {
 struct BMGTag {};
 struct PTLHTag {};
 
-// Primary tuning parameters are template arguments so all resource and launch
-// constants are recalculated when a platform changes WG or tile sizes.
-template <
-    typename ArchTag,
-    int HeadDim,
-    int WgSize,
-    int QPerThread,
-    int KvTile,
-    int PrefetchKBlocks,
-    int VLoadThreads>
+template <typename ArchTag, int HeadDim>
 struct SdpConfig {
-    // Thread organization
-    static constexpr int WG_SIZE      = WgSize;
-    static constexpr int Q_PER_THREAD = QPerThread;
+    static_assert(HeadDim == 64 || HeadDim == 128, "LGRF SDP supports head_dim 64 or 128");
+
+    // These are implementation constraints, not independent policy knobs:
+    // kernels map local_id with &0xf, advance Q by 16 rows per work-item, and
+    // use fixed 64-row K/V load and DPAS loops.
+    static constexpr int WG_SIZE      = 16;
+    static constexpr int Q_PER_THREAD = 16;
     static constexpr int Q_GROUP      = WG_SIZE * Q_PER_THREAD;
-
-    // Tiling
     static constexpr int HEAD_DIM     = HeadDim;
-    static constexpr int KV_TILE      = KvTile;
-
-    // SLM (Shared Local Memory)
-    // V pingpong buffer: 2 * KV_TILE * HEAD_DIM * sizeof(fp16)
-    static constexpr int SLM_V_BYTES  = 2 * KV_TILE * HEAD_DIM * 2;  // 32768 bytes (32KB)
-    static constexpr int SLM_TOTAL    = SLM_V_BYTES;
-
-    // DPAS configuration
-    static constexpr int DPAS_M       = 8;    // DPAS tile M
-    static constexpr int DPAS_N       = 8;    // DPAS tile N
-
-    // Prefetch
-    static constexpr int PREFETCH_K_BLOCKS = PrefetchKBlocks;
-
-    // Derived constants
-    static constexpr int V_LOAD_THREADS = VLoadThreads;
-    static constexpr int V_ROWS_PER_THREAD = KV_TILE / V_LOAD_THREADS;
-
-    // QK iteration structure
-    static constexpr int QK_K_BLOCKS  = HEAD_DIM / 16;  // K blocks in QK (8 for HEAD_DIM=128)
-    static constexpr int QK_N_TILES   = KV_TILE / 8;    // N tiles per K block (8 for KV_TILE=64)
-
-    // S×V iteration structure
-    static constexpr int SV_BLOCKS    = 4;    // S×V blocks (2 halves × 2 V row groups)
-    static constexpr int SV_NN        = 2;    // V row sub-blocks per block
-    static constexpr int SV_DPAS_PER_NN = HEAD_DIM / 16;
+    static constexpr int KV_TILE      = 64;
 };
 
 // ============================================================================
@@ -66,16 +35,15 @@ struct SdpConfig {
 
 // Intel Arc B580 (Battlemage / BMG / Xe2-HPG)
 // 160 XVEs, 20 Xe Cores, doubleGRF, 12GB GDDR6
-using ConfigBMG = SdpConfig<BMGTag, 128, 16, 16, 64, 2, 4>;
+using ConfigBMG = SdpConfig<BMGTag, 128>;
 
-// Intel Panther Lake H / Arc B390. Correctness and resource use are validated
-// with these values. This named policy intentionally starts equal to BMG until
-// representative ComfyUI workloads establish a better PTL-H-specific choice.
-using ConfigPTLH = SdpConfig<PTLHTag, 128, 16, 16, 64, 2, 4>;
+// Intel Panther Lake H / Arc B390. The fixed implementation mapping was
+// performance- and spill-validated with representative ComfyUI workloads.
+using ConfigPTLH = SdpConfig<PTLHTag, 128>;
 
 // HEAD_DIM=64 variants — for SD3.5, z-Image, LTX-Video
-using ConfigBMG_HD64 = SdpConfig<BMGTag, 64, 16, 16, 64, 2, 4>;
-using ConfigPTLH_HD64 = SdpConfig<PTLHTag, 64, 16, 16, 64, 2, 4>;
+using ConfigBMG_HD64 = SdpConfig<BMGTag, 64>;
+using ConfigPTLH_HD64 = SdpConfig<PTLHTag, 64>;
 
 // ============================================================================
 // Active configuration — setup.py defines exactly one architecture macro from

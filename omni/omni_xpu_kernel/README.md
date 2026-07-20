@@ -506,10 +506,9 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
 #### Panther Lake H
 
 - Use `ptl-h` only after `sycl-ls --verbose` reports `intel_gpu_ptl_h`.
-- LGRF and CUTE select explicit `ConfigPTLH` policies. Their initial values
-  intentionally match the correctness-validated BMG/Xe2 policy; this separation
-  prevents future PTL-H tuning from silently changing BMG, but is not yet a
-  claim of PTL-specific performance tuning.
+- LGRF and CUTE select explicit `ConfigPTLH` policies. Internal PTL-H
+  representative-workload validation retained the current values; the separate
+  types prevent later PTL-H tuning from silently changing BMG.
 - oneDNN 3.9 cannot create the FP16 `M=4096, K=4096, N=4096` JIT GEMM primitive
   used as a chunk of the `N=12288` FP8 workflow shape. The implementation uses
   an `N=2048` chunk only on `intel_gpu_ptl_h`; BF16 and non-PTL paths retain the

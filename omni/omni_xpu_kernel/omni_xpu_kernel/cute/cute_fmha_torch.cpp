@@ -41,7 +41,7 @@ namespace {
 
 // ---- launch glue: submit cutlass device kernel onto torch's XPU queue --------
 // (mirror of sgl-kernel-xpu src/sycl/comm/common.h::launch)
-template <typename Kernel>
+template <typename Kernel, int GrfSize>
 class CuteFmhaKernelTag {};
 
 template <typename Kernel, int GrfSize = 256>
@@ -71,7 +71,8 @@ static void launch_on_torch_queue(typename Kernel::Params params) {
         compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<Kernel>>(cgh, policy, params);
     syclex::detail::LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>
         ConfigAccess(config);
-    cgh.parallel_for<CuteFmhaKernelTag<Kernel>>(ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
+    cgh.parallel_for<CuteFmhaKernelTag<Kernel, GrfSize>>(
+        ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
   };
   auto stream = at::xpu::getCurrentXPUStream();
   auto q = stream.queue();
