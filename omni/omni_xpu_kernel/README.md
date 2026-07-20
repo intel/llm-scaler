@@ -13,6 +13,9 @@ Torch and oneDNN are intentionally not pinned in
 use `--no-build-isolation`. `setup.py` detects the installed Torch public
 version, rejects unsupported minors, generates the wheel tag, and pins that
 exact public version in the wheel runtime metadata.
+After installation, `__version__` and `__torch_version__` are read from that
+wheel's own dist-info rather than recomputed from the active Torch environment,
+so replacing Torch cannot change the native artifact's reported build identity.
 
 ## Modules
 

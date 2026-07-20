@@ -10,6 +10,9 @@
 - Each wheel pins the exact public Torch version in its runtime metadata while
   keeping the filename ABI tag at minor granularity. Unsupported minors are
   rejected before native compilation.
+- Installed packages read their immutable version and compiled Torch version
+  from wheel dist-info. Changing the active Torch environment no longer changes
+  the native wheel identity reported by `__version__`.
 - The Docker image retains the shared `0.1.0-b8-dev` base version because `+`
   is not valid in a Docker tag. Both values remain defined in
   `omni_xpu_kernel/_version.py`.

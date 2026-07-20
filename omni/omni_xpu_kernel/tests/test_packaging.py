@@ -99,6 +99,46 @@ def test_supported_torch_minors_select_distinct_wheel_tags(
     )
 
 
+def test_installed_wheel_identity_comes_from_its_own_metadata(monkeypatch, tmp_path):
+    class FakeDistribution:
+        version = f"{BASE_VERSION}+torch210"
+        requires = ["torch==2.10.0", "onednn==2025.3.0"]
+        files = [Path("omni_xpu_kernel-0.1.0.dist-info") / "RECORD"]
+
+        @staticmethod
+        def locate_file(path):
+            return tmp_path / path
+
+    get_build_info = VERSION_NAMESPACE["get_packaged_build_info"]
+    monkeypatch.setitem(get_build_info.__globals__, "distribution", lambda name: FakeDistribution())
+    packaged_version_file = tmp_path / "omni_xpu_kernel" / "_version.py"
+
+    assert get_build_info(packaged_version_file) == (
+        f"{BASE_VERSION}+torch210",
+        "2.10.0",
+    )
+    # An unrelated installed wheel must not override a source checkout build.
+    assert get_build_info(VERSION_FILE) is None
+
+
+def test_inconsistent_installed_wheel_metadata_is_rejected(monkeypatch, tmp_path):
+    class FakeDistribution:
+        version = f"{BASE_VERSION}+torch212"
+        requires = ["torch==2.10.0"]
+        files = [Path("omni_xpu_kernel-0.1.0.dist-info") / "RECORD"]
+
+        @staticmethod
+        def locate_file(path):
+            return tmp_path / path
+
+    get_build_info = VERSION_NAMESPACE["get_packaged_build_info"]
+    monkeypatch.setitem(get_build_info.__globals__, "distribution", lambda name: FakeDistribution())
+    packaged_version_file = tmp_path / "omni_xpu_kernel" / "_version.py"
+
+    with pytest.raises(RuntimeError, match="metadata is inconsistent"):
+        get_build_info(packaged_version_file)
+
+
 @pytest.mark.parametrize("torch_version", ["2.9.1+xpu", "2.13.0+xpu", "invalid"])
 def test_unsupported_torch_versions_are_rejected(torch_version):
     with pytest.raises(RuntimeError, match="Torch minor|Unsupported Torch version"):

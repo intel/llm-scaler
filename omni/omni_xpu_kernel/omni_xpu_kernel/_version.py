@@ -1,6 +1,12 @@
 """Version helpers shared by source builds and the installed package."""
 
-from importlib.metadata import PackageNotFoundError, version as distribution_version
+import re
+from importlib.metadata import (
+    PackageNotFoundError,
+    distribution,
+    version as distribution_version,
+)
+from pathlib import Path
 
 # Docker tags cannot contain the PEP 440 ``+`` local-version separator, so the
 # image keeps the shared base version while Python artifacts add the Torch ABI
@@ -53,7 +59,57 @@ def get_installed_torch_version():
     return get_public_torch_version(torch_version)
 
 
-# Runtime values match the active Torch environment. Wheel metadata pins that
-# exact public version, while the local version tag records its native ABI minor.
-__torch_version__ = get_installed_torch_version()
-__version__ = get_package_version(__torch_version__)
+def get_required_torch_version(requirements):
+    """Return the exact Torch version pinned by wheel metadata."""
+    for requirement in requirements or ():
+        match = re.match(r"^\s*torch\s*==(?!=)\s*([^;,\s]+)", requirement, re.IGNORECASE)
+        if match:
+            return get_public_torch_version(match.group(1))
+    raise RuntimeError("omni_xpu_kernel wheel metadata has no exact torch requirement")
+
+
+def get_packaged_build_info(version_file=None):
+    """Read build identity from this installed wheel, not the active Torch.
+
+    A source checkout may coexist with an older installed wheel. Compare the
+    distribution-owned ``_version.py`` path before trusting its dist-info so a
+    source build still selects the Torch version from its build environment.
+    """
+    current_file = Path(version_file or __file__).resolve()
+    try:
+        package_distribution = distribution("omni-xpu-kernel")
+    except PackageNotFoundError:
+        return None
+
+    distribution_files = package_distribution.files or ()
+    if not any(str(path).endswith(".dist-info/RECORD") for path in distribution_files):
+        # Source-tree egg-info is metadata for a prospective build, not an
+        # immutable installed wheel identity.
+        return None
+
+    packaged_file = Path(
+        package_distribution.locate_file(Path("omni_xpu_kernel") / "_version.py")
+    ).resolve()
+    if packaged_file != current_file:
+        return None
+
+    package_version = str(package_distribution.version)
+    torch_version = get_required_torch_version(package_distribution.requires)
+    expected_version = get_package_version(torch_version)
+    if package_version != expected_version:
+        raise RuntimeError(
+            "omni_xpu_kernel wheel metadata is inconsistent: "
+            f"version is {package_version}, torch requirement selects {expected_version}"
+        )
+    return package_version, torch_version
+
+
+# A source tree derives the prospective wheel identity from its active build
+# environment. An installed wheel instead reports its immutable dist-info so a
+# later Torch replacement cannot make one native artifact impersonate another.
+_packaged_build_info = get_packaged_build_info()
+if _packaged_build_info is None:
+    __torch_version__ = get_installed_torch_version()
+    __version__ = get_package_version(__torch_version__)
+else:
+    __version__, __torch_version__ = _packaged_build_info
