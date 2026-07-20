@@ -858,6 +858,24 @@ class TestConvRot:
         assert scale.shape == (64, 1)
         assert scale.dtype == torch.float32
 
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("group_size", [64, 256])
+    def test_convrot_fused_quantize_matches_composed(
+        self, device, seed, dtype, group_size
+    ):
+        """PTL fused transform+quantize preserves the composed API exactly."""
+        from omni_xpu_kernel import int8
+
+        weight = torch.randn(129, 512, device=device, dtype=dtype)
+        rotated = int8.rotate_convrot(weight, group_size)
+        expected_q, expected_scale = int8.quantize_int8_rowwise(rotated)
+        actual_q, actual_scale = int8.quantize_int8_convrot_weight(
+            weight, group_size=group_size
+        )
+
+        assert torch.equal(actual_q, expected_q)
+        assert torch.equal(actual_scale, expected_scale)
+
     def test_convrot_divisibility_error(self, device, seed):
         """Error when channels not divisible by group_size."""
         from omni_xpu_kernel import int8

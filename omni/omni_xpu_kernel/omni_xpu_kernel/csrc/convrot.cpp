@@ -16,6 +16,9 @@ torch::Tensor dequantize_int8_convrot_fused(
     torch::Tensor input,
     torch::Tensor scale,
     int64_t group_size);
+std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_fused(
+    torch::Tensor input,
+    int64_t group_size);
 
 namespace {
 
@@ -94,6 +97,15 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_weight(
     int64_t group_size,
     int64_t stochastic_rounding) {
     TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
+#if defined(OMNI_XPU_ARCH_PTL_H)
+    if (stochastic_rounding <= 0 && weight.numel() > 0 &&
+        (weight.scalar_type() == torch::kBFloat16 ||
+         weight.scalar_type() == torch::kHalf) &&
+        (group_size == 64 || group_size == 256) &&
+        weight.size(1) % group_size == 0) {
+        return quantize_int8_convrot_fused(weight, group_size);
+    }
+#endif
     auto rotated = rotate_convrot(weight, group_size);
     if (stochastic_rounding <= 0 &&
         (rotated.scalar_type() == torch::kBFloat16 ||

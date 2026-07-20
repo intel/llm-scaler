@@ -513,6 +513,14 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
   used as a chunk of the `N=12288` FP8 workflow shape. The implementation uses
   an `N=2048` chunk only on `intel_gpu_ptl_h`; BF16 and non-PTL paths retain the
   existing chunk selection.
+- Same-shape Kitchen RoPE pairs share index calculation and frequency loads on
+  PTL-H. Different Q/K shapes and BMG retain the established dispatch.
+- Deterministic BF16/FP16 ConvRot weight quantization with group size 64 or 256
+  uses a fused radix-4 transform and rowwise quantization path on PTL-H.
+  Stochastic and unsupported shapes retain the composed implementation.
+- BF16 per-tensor FP8 quantization and stochastic FP8 rounding encode the final
+  FP8 bytes directly on PTL-H. Other input types and BMG retain the validated
+  PyTorch cast path.
 
 The PTL-H configuration validated on 2026-07-20 was:
 

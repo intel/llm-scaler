@@ -14,6 +14,27 @@ namespace rotary {
 
 namespace {
 
+#ifndef OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE
+#if defined(OMNI_XPU_ARCH_PTL_H)
+#define OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE 1
+#elif defined(OMNI_XPU_ARCH_BMG)
+// Keep the existing BMG path until this launch geometry is measured there.
+#define OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE 0
+#else
+#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
+#endif
+#endif
+
+#ifndef OMNI_KITCHEN_ROPE_PAIR_WG_SIZE
+#if defined(OMNI_XPU_ARCH_PTL_H)
+#define OMNI_KITCHEN_ROPE_PAIR_WG_SIZE 128
+#elif defined(OMNI_XPU_ARCH_BMG)
+#define OMNI_KITCHEN_ROPE_PAIR_WG_SIZE 256
+#else
+#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
+#endif
+#endif
+
 bool broadcastable_dim(int64_t source, int64_t target, bool allow_longer) {
     return source == 1 || source == target || (allow_longer && source >= target);
 }
@@ -128,6 +149,107 @@ void launch_rope(
     utils::submit_kernel(cgf, xq.device(), Pair ? "kitchen_rope_pair_sycl" : "kitchen_rope_sycl");
 }
 
+// Same-shape Q/K pairs can share the expensive logical-index calculation and
+// each 2x2 frequency matrix.  Keeping one pair per work-item avoids the
+// register-pressure collapse seen when several pairs are unrolled together.
+template <typename InputT, typename FreqT, bool SplitHalf>
+void launch_rope_pair_same_shape(
+    const torch::Tensor& xq,
+    const torch::Tensor& xk,
+    const torch::Tensor& freqs,
+    torch::Tensor& out_q,
+    torch::Tensor& out_k) {
+    const auto* q_ptr = reinterpret_cast<const InputT*>(xq.data_ptr());
+    const auto* k_ptr = reinterpret_cast<const InputT*>(xk.data_ptr());
+    const auto* f_ptr = reinterpret_cast<const FreqT*>(freqs.data_ptr());
+    auto* oq_ptr = reinterpret_cast<InputT*>(out_q.data_ptr());
+    auto* ok_ptr = reinterpret_cast<InputT*>(out_k.data_ptr());
+
+    const int64_t x1 = xq.size(1), x2 = xq.size(2), xd = xq.size(3);
+    const int64_t pairs = xd / 2;
+    const int64_t total = xq.numel() / 2;
+    const int64_t f0 = freqs.size(0), f1 = freqs.size(1), f2 = freqs.size(2);
+    const int64_t fpairs = freqs.size(3);
+    constexpr int64_t WG = OMNI_KITCHEN_ROPE_PAIR_WG_SIZE;
+    const int64_t padded = (total + WG - 1) / WG * WG;
+
+    auto cgf = [&](sycl::handler& handler) {
+        handler.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(padded), sycl::range<1>(WG)),
+            [=](sycl::nd_item<1> item) {
+                int64_t logical = item.get_global_id(0);
+                if (logical >= total) return;
+                const int64_t pair = logical % pairs;
+                logical /= pairs;
+                const int64_t i2 = logical % x2;
+                logical /= x2;
+                const int64_t i1 = logical % x1;
+                const int64_t i0 = logical / x1;
+                const int64_t base = ((i0 * x1 + i1) * x2 + i2) * xd;
+                const int64_t xoff0 = base + (SplitHalf ? pair : pair * 2);
+                const int64_t xoff1 =
+                    base + (SplitHalf ? pairs + pair : pair * 2 + 1);
+
+                const int64_t fi0 = f0 == 1 ? 0 : i0;
+                const int64_t fi1 = f1 == 1 ? 0 : i1;
+                const int64_t fi2 = f2 == 1 ? 0 : i2;
+                const int64_t fpair = fpairs == 1 ? 0 : pair;
+                const int64_t fbase =
+                    (((fi0 * f1 + fi1) * f2 + fi2) * fpairs + fpair) * 4;
+
+                const FreqT f00 = f_ptr[fbase];
+                const FreqT f01 = f_ptr[fbase + 1];
+                const FreqT f10 = f_ptr[fbase + 2];
+                const FreqT f11 = f_ptr[fbase + 3];
+                const FreqT q0 = static_cast<FreqT>(q_ptr[xoff0]);
+                const FreqT q1 = static_cast<FreqT>(q_ptr[xoff1]);
+                const FreqT k0 = static_cast<FreqT>(k_ptr[xoff0]);
+                const FreqT k1 = static_cast<FreqT>(k_ptr[xoff1]);
+
+                if constexpr (SplitHalf) {
+                    const FreqT q00 = force_dtype_round<FreqT>(f00 * q0);
+                    const FreqT q01 = force_dtype_round<FreqT>(f01 * q1);
+                    const FreqT q10 = force_dtype_round<FreqT>(f10 * q0);
+                    const FreqT q11 = force_dtype_round<FreqT>(f11 * q1);
+                    const FreqT k00 = force_dtype_round<FreqT>(f00 * k0);
+                    const FreqT k01 = force_dtype_round<FreqT>(f01 * k1);
+                    const FreqT k10 = force_dtype_round<FreqT>(f10 * k0);
+                    const FreqT k11 = force_dtype_round<FreqT>(f11 * k1);
+                    oq_ptr[xoff0] = static_cast<InputT>(q00 + q01);
+                    oq_ptr[xoff1] = static_cast<InputT>(q10 + q11);
+                    ok_ptr[xoff0] = static_cast<InputT>(k00 + k01);
+                    ok_ptr[xoff1] = static_cast<InputT>(k10 + k11);
+                } else {
+                    const FreqT q00 = force_dtype_round<FreqT>(f00 * q0);
+                    const FreqT q10 = force_dtype_round<FreqT>(f10 * q0);
+                    const FreqT k00 = force_dtype_round<FreqT>(f00 * k0);
+                    const FreqT k10 = force_dtype_round<FreqT>(f10 * k0);
+                    const float qy0 = sycl::fma(
+                        static_cast<float>(f01), static_cast<float>(q1),
+                        static_cast<float>(q00));
+                    const float qy1 = sycl::fma(
+                        static_cast<float>(f11), static_cast<float>(q1),
+                        static_cast<float>(q10));
+                    const float ky0 = sycl::fma(
+                        static_cast<float>(f01), static_cast<float>(k1),
+                        static_cast<float>(k00));
+                    const float ky1 = sycl::fma(
+                        static_cast<float>(f11), static_cast<float>(k1),
+                        static_cast<float>(k10));
+                    oq_ptr[xoff0] = static_cast<InputT>(
+                        force_dtype_round<FreqT>(static_cast<FreqT>(qy0)));
+                    oq_ptr[xoff1] = static_cast<InputT>(
+                        force_dtype_round<FreqT>(static_cast<FreqT>(qy1)));
+                    ok_ptr[xoff0] = static_cast<InputT>(
+                        force_dtype_round<FreqT>(static_cast<FreqT>(ky0)));
+                    ok_ptr[xoff1] = static_cast<InputT>(
+                        force_dtype_round<FreqT>(static_cast<FreqT>(ky1)));
+                }
+            });
+    };
+    utils::submit_kernel(cgf, xq.device(), "kitchen_rope_pair_same_shape_sycl");
+}
+
 template <typename InputT, bool SplitHalf, bool Pair>
 void dispatch_freq(
     const torch::Tensor& xq,
@@ -150,6 +272,31 @@ void dispatch_freq(
     }
 }
 
+template <typename InputT, bool SplitHalf>
+void dispatch_freq_pair_same_shape(
+    const torch::Tensor& xq,
+    const torch::Tensor& xk,
+    const torch::Tensor& freqs,
+    torch::Tensor& out_q,
+    torch::Tensor& out_k) {
+    switch (freqs.scalar_type()) {
+        case torch::kFloat32:
+            launch_rope_pair_same_shape<InputT, float, SplitHalf>(
+                xq, xk, freqs, out_q, out_k);
+            break;
+        case torch::kFloat16:
+            launch_rope_pair_same_shape<InputT, fp16, SplitHalf>(
+                xq, xk, freqs, out_q, out_k);
+            break;
+        case torch::kBFloat16:
+            launch_rope_pair_same_shape<InputT, bf16, SplitHalf>(
+                xq, xk, freqs, out_q, out_k);
+            break;
+        default:
+            TORCH_CHECK(false, "unsupported freqs dtype");
+    }
+}
+
 template <bool SplitHalf, bool Pair>
 void dispatch_input(
     const torch::Tensor& xq,
@@ -166,6 +313,31 @@ void dispatch_input(
             break;
         case torch::kBFloat16:
             dispatch_freq<bf16, SplitHalf, Pair>(xq, xk, freqs, out_q, out_k);
+            break;
+        default:
+            TORCH_CHECK(false, "unsupported input dtype");
+    }
+}
+
+template <bool SplitHalf>
+void dispatch_input_pair_same_shape(
+    const torch::Tensor& xq,
+    const torch::Tensor& xk,
+    const torch::Tensor& freqs,
+    torch::Tensor& out_q,
+    torch::Tensor& out_k) {
+    switch (xq.scalar_type()) {
+        case torch::kFloat32:
+            dispatch_freq_pair_same_shape<float, SplitHalf>(
+                xq, xk, freqs, out_q, out_k);
+            break;
+        case torch::kFloat16:
+            dispatch_freq_pair_same_shape<fp16, SplitHalf>(
+                xq, xk, freqs, out_q, out_k);
+            break;
+        case torch::kBFloat16:
+            dispatch_freq_pair_same_shape<bf16, SplitHalf>(
+                xq, xk, freqs, out_q, out_k);
             break;
         default:
             TORCH_CHECK(false, "unsupported input dtype");
@@ -203,6 +375,18 @@ std::tuple<torch::Tensor, torch::Tensor> apply_kitchen_rope_fast(
     TORCH_CHECK(xq.scalar_type() == xk.scalar_type(), "query and key dtypes must match");
     auto out_q = torch::empty_like(xq);
     auto out_k = torch::empty_like(xk);
+#if OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE
+    if (xq.sizes() == xk.sizes()) {
+        if (split_half) {
+            dispatch_input_pair_same_shape<true>(
+                xq, xk, freqs, out_q, out_k);
+        } else {
+            dispatch_input_pair_same_shape<false>(
+                xq, xk, freqs, out_q, out_k);
+        }
+        return {out_q, out_k};
+    }
+#endif
     if (split_half) {
         dispatch_input<true, true>(xq, xk, freqs, out_q, out_k);
     } else {

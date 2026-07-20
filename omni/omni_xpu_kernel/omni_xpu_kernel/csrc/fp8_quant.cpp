@@ -38,6 +38,124 @@ void check_xpu(const torch::Tensor& tensor, const char* name) {
     TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
+#if defined(OMNI_XPU_ARCH_PTL_H)
+int round_shift_right_rne(int value, int shift) {
+    if (shift <= 0) return value << (-shift);
+    if (shift >= 10) return 0;
+    const int truncated = value >> shift;
+    const int remainder = value & ((1 << shift) - 1);
+    const int halfway = 1 << (shift - 1);
+    return truncated +
+        (remainder > halfway || (remainder == halfway && (truncated & 1)));
+}
+
+template<int ExponentBits, int MantissaBits, int ExponentBias>
+uint8_t encode_bf16_rne(bf16 value) {
+    const uint16_t bits = sycl::bit_cast<uint16_t>(value);
+    const uint8_t sign = static_cast<uint8_t>((bits >> 8) & 0x80);
+    const uint16_t magnitude = bits & uint16_t(0x7fff);
+    if (magnitude == 0) return sign;
+
+    const int exponent = (magnitude >> 7) & 0xff;
+    const int input_mantissa = magnitude & 0x7f;
+    if (exponent == 0xff) {
+        // The BF16 preparation path canonicalizes every NaN to 0xffff.
+        return sign | uint8_t(0x7f);
+    }
+    if (exponent == 0) {
+        // Every BF16 subnormal is below the smallest E5M2 subnormal.
+        return sign;
+    }
+
+    const int unbiased_exponent = exponent - 127;
+    int target_exponent = unbiased_exponent + ExponentBias;
+    if (target_exponent <= 0) {
+        const int significand = 128 + input_mantissa;
+        const int shift = 8 - unbiased_exponent - ExponentBias - MantissaBits;
+        const int target_mantissa = round_shift_right_rne(significand, shift);
+        return sign | static_cast<uint8_t>(target_mantissa);
+    }
+
+    int rounded_significand = round_shift_right_rne(
+        128 + input_mantissa, 7 - MantissaBits);
+    if (rounded_significand == (1 << (MantissaBits + 1))) {
+        ++target_exponent;
+        rounded_significand >>= 1;
+    }
+    const int target_mantissa = rounded_significand - (1 << MantissaBits);
+    return sign | static_cast<uint8_t>(
+        (target_exponent << MantissaBits) | target_mantissa);
+}
+
+template<int ExponentBits, int MantissaBits, int ExponentBias>
+torch::Tensor quantize_bf16_direct(
+    const torch::Tensor& input,
+    const torch::Tensor& scale,
+    torch::ScalarType out_dtype,
+    float limit) {
+    auto scale_typed = scale.to(torch::kBFloat16).contiguous();
+    auto output = torch::empty(input.sizes(), input.options().dtype(out_dtype));
+    const int64_t numel = input.numel();
+    if (numel == 0) return output;
+
+    const auto* input_ptr = reinterpret_cast<const bf16*>(input.data_ptr());
+    const auto* scale_ptr = reinterpret_cast<const bf16*>(scale_typed.data_ptr());
+    auto* output_ptr = reinterpret_cast<uint8_t*>(output.data_ptr());
+    constexpr int Vec = OMNI_FP8_QUANT_VEC;
+    constexpr int WorkGroupSize = 256;
+    const int64_t work_items = (numel + Vec - 1) / Vec;
+    const int64_t padded =
+        (work_items + WorkGroupSize - 1) / WorkGroupSize * WorkGroupSize;
+
+    auto cgf = [&](sycl::handler& handle) {
+        handle.parallel_for(
+            sycl::nd_range<1>(
+                sycl::range<1>(padded), sycl::range<1>(WorkGroupSize)),
+            [=](sycl::nd_item<1> item) {
+                const int64_t first =
+                    static_cast<int64_t>(item.get_global_linear_id()) * Vec;
+                const bf16 scale_value = scale_ptr[0];
+                if (first + Vec <= numel) {
+                    using InputVec = sycl::vec<bf16, Vec>;
+                    using OutputVec = sycl::vec<uint8_t, Vec>;
+                    const InputVec values =
+                        *reinterpret_cast<const InputVec*>(input_ptr + first);
+                    OutputVec encoded;
+#pragma unroll
+                    for (int lane = 0; lane < Vec; ++lane) {
+                        const bf16 scaled = static_cast<bf16>(
+                            static_cast<float>(values[lane]) /
+                            static_cast<float>(scale_value));
+                        const float scaled_f = static_cast<float>(scaled);
+                        const bf16 prepared = sycl::isnan(scaled_f)
+                            ? sycl::bit_cast<bf16>(uint16_t(0xffff))
+                            : static_cast<bf16>(sycl::fmax(
+                                  -limit, sycl::fmin(limit, scaled_f)));
+                        encoded[lane] = encode_bf16_rne<
+                            ExponentBits, MantissaBits, ExponentBias>(prepared);
+                    }
+                    *reinterpret_cast<OutputVec*>(output_ptr + first) = encoded;
+                } else {
+                    for (int64_t index = first; index < numel; ++index) {
+                        const bf16 scaled = static_cast<bf16>(
+                            static_cast<float>(input_ptr[index]) /
+                            static_cast<float>(scale_value));
+                        const float scaled_f = static_cast<float>(scaled);
+                        const bf16 prepared = sycl::isnan(scaled_f)
+                            ? sycl::bit_cast<bf16>(uint16_t(0xffff))
+                            : static_cast<bf16>(sycl::fmax(
+                                  -limit, sycl::fmin(limit, scaled_f)));
+                        output_ptr[index] = encode_bf16_rne<
+                            ExponentBits, MantissaBits, ExponentBias>(prepared);
+                    }
+                }
+            });
+    };
+    utils::submit_kernel(cgf, input.device(), "fp8_quant_bf16_direct");
+    return output;
+}
+#endif
+
 template<typename InputT>
 void prepare_quantized_values(
     const InputT* __restrict__ input,
@@ -116,6 +234,16 @@ torch::Tensor quantize_per_tensor_fused(
     const torch::Tensor& scale,
     torch::ScalarType out_dtype,
     float limit) {
+#if defined(OMNI_XPU_ARCH_PTL_H)
+    if constexpr (std::is_same_v<InputT, bf16>) {
+        if (out_dtype == torch::kFloat8_e4m3fn) {
+            return quantize_bf16_direct<4, 3, 7>(
+                input, scale, out_dtype, limit);
+        }
+        return quantize_bf16_direct<5, 2, 15>(
+            input, scale, out_dtype, limit);
+    }
+#endif
     auto scale_typed = scale.to(input.scalar_type()).contiguous();
     auto prepared = torch::empty_like(input);
     if (input.numel() != 0) {
@@ -128,6 +256,56 @@ torch::Tensor quantize_per_tensor_fused(
     return prepared.to(out_dtype);
 }
 
+#if defined(OMNI_XPU_ARCH_PTL_H)
+template<int ExponentBits, int MantissaBits, int ExponentBias>
+uint8_t encode_exact_fp16(fp16 value) {
+    const uint16_t bits = sycl::bit_cast<uint16_t>(value);
+    const uint8_t sign = static_cast<uint8_t>((bits >> 8) & 0x80);
+    const uint16_t magnitude = bits & uint16_t(0x7fff);
+    if (magnitude == 0) return 0;
+    if (magnitude >= uint16_t(0x7c00)) {
+        if (magnitude > uint16_t(0x7c00)) return sign | uint8_t(0x7f);
+        if constexpr (ExponentBits == 4) {
+            return sign | uint8_t(0x7e);
+        } else {
+            return sign | uint8_t(0x7c);
+        }
+    }
+
+    const int half_exponent = (magnitude >> 10) & 0x1f;
+    const int half_mantissa = magnitude & 0x03ff;
+    if (half_exponent == 0) {
+        constexpr int Shift = ExponentBias + MantissaBits - 25;
+        static_assert(Shift < 0);
+        const int mantissa = half_mantissa >> (-Shift);
+        return sign | static_cast<uint8_t>(mantissa);
+    }
+
+    const int target_exponent = half_exponent - 15 + ExponentBias;
+    if (target_exponent <= 0) {
+        const int significand = 1024 + half_mantissa;
+        const int shift = half_exponent + ExponentBias + MantissaBits - 26;
+        const int mantissa = shift >= 0
+            ? significand << shift
+            : significand >> (-shift);
+        return sign | static_cast<uint8_t>(mantissa);
+    }
+    const int mantissa = half_mantissa >> (10 - MantissaBits);
+    return sign | static_cast<uint8_t>(
+        (target_exponent << MantissaBits) | mantissa);
+}
+
+template<int ExponentBits, int MantissaBits, int ExponentBias>
+uint8_t stochastic_output(fp16 value) {
+    return encode_exact_fp16<ExponentBits, MantissaBits, ExponentBias>(value);
+}
+#else
+template<int ExponentBits, int MantissaBits, int ExponentBias>
+fp16 stochastic_output(fp16 value) {
+    return value;
+}
+#endif
+
 template<int ExponentBits, int MantissaBits, int ExponentBias>
 torch::Tensor stochastic_rounding_fused(
     const torch::Tensor& input,
@@ -137,15 +315,35 @@ torch::Tensor stochastic_rounding_fused(
     // Preserve the original implementation's FP16 arithmetic contract.  The
     // old path expressed every operation as an individual ATen kernel; doing
     // the same arithmetic in one SYCL kernel avoids materializing all of those
-    // intermediate tensors while leaving the final FP8 conversion to PyTorch.
+    // intermediate tensors.
     auto x = input.to(torch::kHalf);
+#if defined(OMNI_XPU_ARCH_PTL_H)
+    // The stochastic result is already exactly representable in the selected
+    // FP8 format. Encode it directly on PTL-H to avoid a temporary FP16 tensor
+    // and the separate PyTorch cast kernel. Keep the established two-stage
+    // path on BMG until this code path has been validated there.
+    auto output = torch::empty(input.sizes(), input.options().dtype(out_dtype));
+    using OutputT = uint8_t;
+#else
     auto rounded = torch::empty_like(x);
+    using OutputT = fp16;
+#endif
     const int64_t numel = x.numel();
-    if (numel == 0) return rounded.to(out_dtype);
+    if (numel == 0) {
+#if defined(OMNI_XPU_ARCH_PTL_H)
+        return output;
+#else
+        return rounded.to(out_dtype);
+#endif
+    }
 
     const auto* x_ptr = reinterpret_cast<const fp16*>(x.data_ptr<at::Half>());
     const auto* rng_ptr = rng.data_ptr<uint8_t>();
-    auto* out_ptr = reinterpret_cast<fp16*>(rounded.data_ptr<at::Half>());
+#if defined(OMNI_XPU_ARCH_PTL_H)
+    auto* out_ptr = reinterpret_cast<OutputT*>(output.data_ptr());
+#else
+    auto* out_ptr = reinterpret_cast<OutputT*>(rounded.data_ptr<at::Half>());
+#endif
     const fp16 mantissa_levels = static_cast<fp16>(1 << MantissaBits);
     const float denorm_divisor =
         static_cast<float>(std::exp2(-ExponentBias + 1 - MantissaBits));
@@ -169,13 +367,16 @@ torch::Tensor stochastic_rounding_fused(
                 const uint16_t abs_bits = value_bits & uint16_t(0x7fff);
                 if (abs_bits == 0) {
                     // torch.sign maps both +0 and -0 to +0 in the old path.
-                    out_ptr[index] = fp16(0);
+                    out_ptr[index] = stochastic_output<
+                        ExponentBits, MantissaBits, ExponentBias>(fp16(0));
                     continue;
                 }
                 if (abs_bits > uint16_t(0x7c00)) {
                     // torch.sign returns +0 for FP16 NaNs on XPU, and the old
                     // composite expression consequently produces +qNaN.
-                    out_ptr[index] = sycl::bit_cast<fp16>(uint16_t(0x7e00));
+                    out_ptr[index] = stochastic_output<
+                        ExponentBits, MantissaBits, ExponentBias>(
+                            sycl::bit_cast<fp16>(uint16_t(0x7e00)));
                     continue;
                 }
 
@@ -227,7 +428,9 @@ torch::Tensor stochastic_rounding_fused(
                     if (exponent_i == 31) {
                         // exp2(16) and the following arithmetic produce the
                         // same canonical -qNaN in the composite FP16 path.
-                        out_ptr[index] = sycl::bit_cast<fp16>(uint16_t(0xfe00));
+                        out_ptr[index] = stochastic_output<
+                            ExponentBits, MantissaBits, ExponentBias>(
+                                sycl::bit_cast<fp16>(uint16_t(0xfe00)));
                         continue;
                     }
                 }
@@ -266,12 +469,17 @@ torch::Tensor stochastic_rounding_fused(
                     : static_cast<fp16>(denorm_base * mantissa);
                 fp16 result = static_cast<fp16>(sign * magnitude);
                 result = sycl::clamp(result, -limit_h, limit_h);
-                out_ptr[index] = result;
+                out_ptr[index] = stochastic_output<
+                    ExponentBits, MantissaBits, ExponentBias>(result);
             }
         });
     };
     utils::submit_kernel(cgf, input.device(), "fp8_stochastic_rounding_fused");
+#if defined(OMNI_XPU_ARCH_PTL_H)
+    return output;
+#else
     return rounded.to(out_dtype);
+#endif
 }
 
 }  // namespace

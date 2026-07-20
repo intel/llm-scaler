@@ -90,6 +90,21 @@ def test_quantize_fused_path_matches_torch(
 
 
 @pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_quantize_covers_all_bf16_encodings(fp8_dtype):
+    bits = torch.arange(65536, dtype=torch.int32).to(torch.uint16)
+    all_bf16 = bits.view(torch.bfloat16).to("xpu")
+    for scale_value in (1.0, 0.125, 0.1, 1.3, -0.375):
+        scale = torch.tensor(scale_value, device="xpu", dtype=torch.float32)
+        actual = fp8.quantize_per_tensor(all_bf16, scale, fp8_dtype)
+        expected = torch.clamp(
+            all_bf16 / scale.to(torch.bfloat16),
+            -torch.finfo(fp8_dtype).max,
+            torch.finfo(fp8_dtype).max,
+        ).to(fp8_dtype)
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("out_dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_dequantize_covers_all_fp8_encodings(fp8_dtype, out_dtype):
     # Repeat past the vector width and leave a tail so both paths are covered.
@@ -150,3 +165,16 @@ def test_stochastic_rounding_matches_composite_reference(input_dtype, fp8_dtype)
     actual = fp8.stochastic_rounding(x, rng, fp8_dtype)
     expected = _stochastic_rounding_reference(x, rng, fp8_dtype)
     assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_stochastic_rounding_covers_all_fp16_encodings(fp8_dtype):
+    bits = torch.arange(65536, dtype=torch.int32).to(torch.uint16)
+    all_half = bits.view(torch.float16).to("xpu")
+    for rng_value in (0, 1, 31, 63, 127, 128, 192, 254, 255):
+        rng = torch.full(
+            all_half.shape, rng_value, device="xpu", dtype=torch.uint8
+        )
+        actual = fp8.stochastic_rounding(all_half, rng, fp8_dtype)
+        expected = _stochastic_rounding_reference(all_half, rng, fp8_dtype)
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
