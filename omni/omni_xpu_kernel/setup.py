@@ -368,6 +368,7 @@ class ICPXBuildExt(build_ext):
                 cmd += [
                     "-fsycl-esimd-force-stateless-mem",
                     "/O2", "/DNDEBUG",
+                    f"/D{XPU_ARCH_MACRO}=1",
                     "/EHsc",  # Enable C++ exception handling
                     "/std:c++17",
                 ]
@@ -456,6 +457,7 @@ class ICPXBuildExt(build_ext):
                 cmd += [
                     "-fsycl-esimd-force-stateless-mem",
                     "-O3", "-DNDEBUG",
+                    f"-D{XPU_ARCH_MACRO}=1",
                     "-fPIC", "-shared",
                     "-std=c++17",
                 ]

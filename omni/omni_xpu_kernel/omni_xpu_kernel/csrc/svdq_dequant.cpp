@@ -58,7 +58,20 @@ constexpr int HALF_GROUP = SVDQ_GROUP_SIZE / 2;  // 32 packed bytes per group
 //   output[n, g*64 .. (g+1)*64 - 1] = unpack(packed) * scale
 // ============================================================================
 
-template<typename OT, bool Signed = true>
+#ifndef OMNI_SVDQ_DEQUANT_GROUPS_PER_WI
+#if defined(OMNI_XPU_ARCH_PTL_H)
+#define OMNI_SVDQ_DEQUANT_GROUPS_PER_WI 60
+#elif defined(OMNI_XPU_ARCH_BMG)
+#define OMNI_SVDQ_DEQUANT_GROUPS_PER_WI 1
+#else
+#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
+#endif
+#endif
+
+template<
+    typename OT,
+    bool Signed = true,
+    int GroupsPerWorkItem = OMNI_SVDQ_DEQUANT_GROUPS_PER_WI>
 void dequantize_svdq_w4_kernel(
     const uint8_t* __restrict__ packed,
     const OT* __restrict__ scales,
@@ -68,8 +81,9 @@ void dequantize_svdq_w4_kernel(
     const int64_t num_groups,  // K / 64
     const at::Device& device
 ) {
-    // Total work items: N * num_groups (one per row-group pair)
-    const int64_t total_items = N * num_groups;
+    const int64_t group_chunks =
+        (num_groups + GroupsPerWorkItem - 1) / GroupsPerWorkItem;
+    const int64_t total_items = N * group_chunks;
     constexpr int WG_SIZE = 64;
     const int64_t padded_size = (total_items + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
 
@@ -80,71 +94,71 @@ void dequantize_svdq_w4_kernel(
                 const int64_t gid = item.get_global_id(0);
                 if (gid >= total_items) return;
 
-                const int64_t row = gid / num_groups;
-                const int64_t grp = gid % num_groups;
+                const int64_t row = gid / group_chunks;
+                const int64_t first_grp =
+                    (gid % group_chunks) * GroupsPerWorkItem;
 
-                // Read scale for this (group, row): scales[grp * N + row]
-                // Use scalar_load for single element
-                const OT scale_val = scales[grp * N + row];
+                for (int local_grp = 0; local_grp < GroupsPerWorkItem;
+                     ++local_grp) {
+                    const int64_t grp = first_grp + local_grp;
+                    if (grp >= num_groups) break;
 
-                // Read 32 packed bytes for this group
-                const uint8_t* src = packed + row * (K / 2) + grp * HALF_GROUP;
-                OT* dst = output + row * K + grp * SVDQ_GROUP_SIZE;
+                    // Read scale for this (group, row): scales[grp * N + row]
+                    const OT scale_val = scales[grp * N + row];
 
-                // Process in 2 chunks of 16 bytes (32 elements each)
-                // to stay within ESIMD vector width limits
-                #pragma unroll
-                for (int chunk = 0; chunk < 2; ++chunk) {
-                    simd<uint32_t, 16> offsets;
-                    #pragma unroll
-                    for (int i = 0; i < 16; ++i) offsets[i] = i;
+                    // Read 32 packed bytes for this group
+                    const uint8_t* src =
+                        packed + row * (K / 2) + grp * HALF_GROUP;
+                    OT* dst = output + row * K + grp * SVDQ_GROUP_SIZE;
 
-                    simd<uint8_t, 16> bytes = gather<uint8_t, 16>(
-                        src + chunk * 16, offsets);
+                    // Process in 2 chunks of 16 bytes (32 elements each)
+                    // to stay within ESIMD vector width limits
+#pragma unroll
+                    for (int chunk = 0; chunk < 2; ++chunk) {
+                        simd<uint8_t, 16> bytes =
+                            block_load<uint8_t, 16>(src + chunk * 16);
 
-                    // Unpack: low nibble = even index, high nibble = odd index
-                    simd<uint8_t, 16> low_u = bytes & (uint8_t)0x0F;
-                    simd<uint8_t, 16> high_u = (bytes >> 4) & (uint8_t)0x0F;
+                        // Unpack: low nibble = even index, high nibble = odd index
+                        simd<uint8_t, 16> low_u = bytes & (uint8_t)0x0F;
+                        simd<uint8_t, 16> high_u = (bytes >> 4) & (uint8_t)0x0F;
 
-                    // Signed conversion: values 8-15 map to -8..-1
-                    simd<int16_t, 16> low_s;
-                    simd<int16_t, 16> high_s;
-                    #pragma unroll
-                    for (int i = 0; i < 16; ++i) {
-                        int16_t lv = static_cast<int16_t>(low_u[i]);
-                        int16_t hv = static_cast<int16_t>(high_u[i]);
-                        low_s[i] = Signed && lv >= 8 ? (lv - 16) : lv;
-                        high_s[i] = Signed && hv >= 8 ? (hv - 16) : hv;
-                    }
+                        // Signed conversion: values 8-15 map to -8..-1
+                        simd<int16_t, 16> low_s;
+                        simd<int16_t, 16> high_s;
+#pragma unroll
+                        for (int i = 0; i < 16; ++i) {
+                            int16_t lv = static_cast<int16_t>(low_u[i]);
+                            int16_t hv = static_cast<int16_t>(high_u[i]);
+                            low_s[i] = Signed && lv >= 8 ? (lv - 16) : lv;
+                            high_s[i] = Signed && hv >= 8 ? (hv - 16) : hv;
+                        }
 
-                    // Interleave: even positions get low nibbles, odd get high
-                    // Output order: [low[0], high[0], low[1], high[1], ...]
-                    // This matches nunchaku's unpack_int4 which stacks [low, high]
-                    // along last dim then reshapes.
-                    // Actually nunchaku stacks as [..., 2] then flattens:
-                    //   torch.stack([low, high], dim=-1).reshape(..., K)
-                    // So output is: low[0], high[0], low[1], high[1], ...
-                    simd<float, 32> interleaved;
-                    #pragma unroll
-                    for (int i = 0; i < 16; ++i) {
-                        interleaved[i * 2] = static_cast<float>(low_s[i]);
-                        interleaved[i * 2 + 1] = static_cast<float>(high_s[i]);
-                    }
+                        // Interleave low and high nibbles to match nunchaku's
+                        // stack([low, high], dim=-1).reshape(..., K) layout.
+                        simd<float, 32> interleaved;
+#pragma unroll
+                        for (int i = 0; i < 16; ++i) {
+                            interleaved[i * 2] = static_cast<float>(low_s[i]);
+                            interleaved[i * 2 + 1] = static_cast<float>(high_s[i]);
+                        }
 
-                    // Apply scale
-                    float scale_f = static_cast<float>(scale_val);
-                    interleaved = interleaved * scale_f;
+                        // Apply scale
+                        float scale_f = static_cast<float>(scale_val);
+                        interleaved = interleaved * scale_f;
 
-                    // Store 32 output elements
-                    OT* out_ptr = dst + chunk * 32;
-                    if constexpr (std::is_same_v<OT, float>) {
-                        block_store<float, 32>(out_ptr, interleaved);
-                    } else if constexpr (std::is_same_v<OT, bf16>) {
-                        simd<bf16, 32> result_bf = interleaved;
-                        block_store<bf16, 32>(reinterpret_cast<bf16*>(out_ptr), result_bf);
-                    } else if constexpr (std::is_same_v<OT, fp16>) {
-                        simd<fp16, 32> result_fp = interleaved;
-                        block_store<fp16, 32>(reinterpret_cast<fp16*>(out_ptr), result_fp);
+                        // Store 32 output elements
+                        OT* out_ptr = dst + chunk * 32;
+                        if constexpr (std::is_same_v<OT, float>) {
+                            block_store<float, 32>(out_ptr, interleaved);
+                        } else if constexpr (std::is_same_v<OT, bf16>) {
+                            simd<bf16, 32> result_bf = interleaved;
+                            block_store<bf16, 32>(
+                                reinterpret_cast<bf16*>(out_ptr), result_bf);
+                        } else if constexpr (std::is_same_v<OT, fp16>) {
+                            simd<fp16, 32> result_fp = interleaved;
+                            block_store<fp16, 32>(
+                                reinterpret_cast<fp16*>(out_ptr), result_fp);
+                        }
                     }
                 }
             }
@@ -167,7 +181,38 @@ void dequantize_svdq_w4_kernel(
 // Signed: range [-8, 7]
 // ============================================================================
 
-template<bool Signed = true, int COLS_PER_WI = 64>
+#ifndef OMNI_SVDQ_UNPACK_COLS_PER_WI
+#if defined(OMNI_XPU_ARCH_PTL_H)
+#define OMNI_SVDQ_UNPACK_COLS_PER_WI 3840
+#elif defined(OMNI_XPU_ARCH_BMG)
+// Keep the established launch geometry until it is retuned on BMG.
+#define OMNI_SVDQ_UNPACK_COLS_PER_WI 64
+#else
+#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
+#endif
+#endif
+
+#ifndef OMNI_SVDQ_UNPACK_BYTES_PER_ITERATION
+#if defined(OMNI_XPU_ARCH_PTL_H)
+#define OMNI_SVDQ_UNPACK_BYTES_PER_ITERATION 64
+#elif defined(OMNI_XPU_ARCH_BMG)
+#define OMNI_SVDQ_UNPACK_BYTES_PER_ITERATION 16
+#else
+#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
+#endif
+#endif
+
+#ifndef OMNI_SVDQ_UNPACK_WG_SIZE
+#if defined(OMNI_XPU_ARCH_PTL_H)
+#define OMNI_SVDQ_UNPACK_WG_SIZE 32
+#elif defined(OMNI_XPU_ARCH_BMG)
+#define OMNI_SVDQ_UNPACK_WG_SIZE 64
+#else
+#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
+#endif
+#endif
+
+template<bool Signed = true, int COLS_PER_WI = OMNI_SVDQ_UNPACK_COLS_PER_WI>
 void unpack_svdq_int4_kernel(
     const uint8_t* __restrict__ packed,
     int8_t* __restrict__ output,
@@ -176,12 +221,13 @@ void unpack_svdq_int4_kernel(
     const at::Device& device
 ) {
     const int64_t K = K_half * 2;
-    // Each work item processes COLS_PER_WI/2 = 32 packed bytes → 64 output values
-    const int64_t cols_per_wi_half = COLS_PER_WI / 2;  // 32
+    // Amortize row/chunk indexing over a platform-tuned contiguous tile.
+    const int64_t cols_per_wi_half = COLS_PER_WI / 2;
     const int64_t num_col_chunks = (K_half + cols_per_wi_half - 1) / cols_per_wi_half;
     const int64_t total_items = M * num_col_chunks;
+    const bool aligned_rows = (K_half % 16) == 0;
 
-    constexpr int WG_SIZE = 64;
+    constexpr int WG_SIZE = OMNI_SVDQ_UNPACK_WG_SIZE;
     const int64_t padded_size = (total_items + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
 
     auto cgf = [&](sycl::handler& handle) {
@@ -201,53 +247,48 @@ void unpack_svdq_int4_kernel(
                 const uint8_t* src = packed + row * K_half + col_start;
                 int8_t* dst = output + row * K + col_start * 2;
 
-                // Process in chunks of 16 bytes (for ESIMD vector width)
-                for (int64_t b = 0; b < n_bytes; b += 16) {
-                    const int64_t chunk_size = std::min((int64_t)16, n_bytes - b);
+                constexpr int BytesPerIteration =
+                    OMNI_SVDQ_UNPACK_BYTES_PER_ITERATION;
+                for (int64_t b = 0; b < n_bytes; b += BytesPerIteration) {
+                    const int64_t chunk_size = std::min(
+                        static_cast<int64_t>(BytesPerIteration), n_bytes - b);
 
-                    simd<uint32_t, 16> offsets;
-                    #pragma unroll
-                    for (int i = 0; i < 16; ++i) offsets[i] = i;
-
-                    simd<uint8_t, 16> bytes;
-                    if (chunk_size == 16) {
-                        bytes = gather<uint8_t, 16>(src + b, offsets);
+                    simd<uint8_t, BytesPerIteration> bytes;
+                    if (chunk_size == BytesPerIteration && aligned_rows) {
+                        bytes = block_load<uint8_t, BytesPerIteration>(src + b);
                     } else {
-                        // Scalar fallback for tail: avoid OOB read from gather
-                        #pragma unroll
-                        for (int i = 0; i < 16; ++i) {
+                        // Scalar fallback for an unaligned row or final tail.
+#pragma unroll
+                        for (int i = 0; i < BytesPerIteration; ++i) {
                             bytes[i] = (i < static_cast<int>(chunk_size))
                                            ? *(src + b + i) : uint8_t(0);
                         }
                     }
 
-                    // Unpack nibbles
-                    simd<uint8_t, 16> low_u = bytes & (uint8_t)0x0F;
-                    simd<uint8_t, 16> high_u = (bytes >> 4) & (uint8_t)0x0F;
+                    simd<uint8_t, BytesPerIteration> low_u =
+                        bytes & uint8_t(0x0F);
+                    simd<uint8_t, BytesPerIteration> high_u =
+                        (bytes >> 4) & uint8_t(0x0F);
 
-                    // Convert to signed int8: if val >= 8, val -= 16
-                    simd<int8_t, 16> low_s, high_s;
-                    #pragma unroll
-                    for (int i = 0; i < 16; ++i) {
-                        int8_t lv = static_cast<int8_t>(low_u[i]);
-                        int8_t hv = static_cast<int8_t>(high_u[i]);
-                        low_s[i] = Signed && lv >= 8 ? (lv - 16) : lv;
-                        high_s[i] = Signed && hv >= 8 ? (hv - 16) : hv;
+                    simd<int16_t, BytesPerIteration> low_wide = low_u;
+                    simd<int16_t, BytesPerIteration> high_wide = high_u;
+                    if constexpr (Signed) {
+                        low_wide.merge(low_wide - 16, low_wide >= 8);
+                        high_wide.merge(high_wide - 16, high_wide >= 8);
                     }
+                    simd<int8_t, BytesPerIteration> low_s = low_wide;
+                    simd<int8_t, BytesPerIteration> high_s = high_wide;
 
-                    // Interleave: [low[0], high[0], low[1], high[1], ...]
-                    simd<int8_t, 32> interleaved;
-                    #pragma unroll
-                    for (int i = 0; i < 16; ++i) {
-                        interleaved[i * 2] = low_s[i];
-                        interleaved[i * 2 + 1] = high_s[i];
-                    }
+                    simd<int8_t, BytesPerIteration * 2> interleaved;
+                    interleaved.template select<BytesPerIteration, 2>(0) = low_s;
+                    interleaved.template select<BytesPerIteration, 2>(1) = high_s;
 
-                    // Store (handle partial chunks at boundaries)
-                    if (chunk_size == 16) {
-                        block_store<int8_t, 32>(dst + b * 2, interleaved);
+                    if (chunk_size == BytesPerIteration && aligned_rows) {
+                        block_store<int8_t, BytesPerIteration * 2>(
+                            dst + b * 2, interleaved);
                     } else {
-                        for (int i = 0; i < static_cast<int>(chunk_size) * 2; ++i) {
+                        for (int i = 0;
+                             i < static_cast<int>(chunk_size) * 2; ++i) {
                             dst[b * 2 + i] = interleaved[i];
                         }
                     }
@@ -275,18 +316,32 @@ void unpack_svdq_int4_kernel(
 //   packed[m, k/2] = (q[even] & 0xF) | (q[odd] << 4)
 // ============================================================================
 
-template<typename IT, bool Unsigned = false>
+#ifndef OMNI_SVDQ_QUANT_GROUPS_PER_WI
+#if defined(OMNI_XPU_ARCH_PTL_H)
+#define OMNI_SVDQ_QUANT_GROUPS_PER_WI 60
+#elif defined(OMNI_XPU_ARCH_BMG)
+#define OMNI_SVDQ_QUANT_GROUPS_PER_WI 1
+#else
+#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
+#endif
+#endif
+
+template<
+    typename IT,
+    bool Unsigned = false,
+    int GroupsPerWorkItem = OMNI_SVDQ_QUANT_GROUPS_PER_WI>
 void quantize_svdq_act_int4_kernel(
     const IT* __restrict__ input,
     uint8_t* __restrict__ output,
-    float* __restrict__ scales,   // output scales as f32 (will be cast by caller)
+    IT* __restrict__ scales,
     const int64_t M,
     const int64_t K,
     const int64_t num_groups,
     const at::Device& device
 ) {
-    // Each work item handles one (row, group) pair
-    const int64_t total_items = M * num_groups;
+    const int64_t group_chunks =
+        (num_groups + GroupsPerWorkItem - 1) / GroupsPerWorkItem;
+    const int64_t total_items = M * group_chunks;
     constexpr int WG_SIZE = 64;
     const int64_t padded_size = (total_items + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
 
@@ -297,97 +352,102 @@ void quantize_svdq_act_int4_kernel(
                 const int64_t gid = item.get_global_id(0);
                 if (gid >= total_items) return;
 
-                const int64_t row = gid / num_groups;
-                const int64_t grp = gid % num_groups;
+                const int64_t row = gid / group_chunks;
+                const int64_t first_grp =
+                    (gid % group_chunks) * GroupsPerWorkItem;
 
-                const IT* src = input + row * K + grp * SVDQ_GROUP_SIZE;
-                uint8_t* dst = output + row * (K / 2) + grp * HALF_GROUP;
+                for (int local_grp = 0; local_grp < GroupsPerWorkItem;
+                     ++local_grp) {
+                    const int64_t grp = first_grp + local_grp;
+                    if (grp >= num_groups) break;
 
-                // Load 64 input values and find absmax
-                // Process in 2 chunks of 32
-                simd<float, 32> vals_0, vals_1;
-                simd<uint32_t, 32> offsets32;
-                #pragma unroll
-                for (int i = 0; i < 32; ++i) offsets32[i] = i;
+                    const IT* src =
+                        input + row * K + grp * SVDQ_GROUP_SIZE;
+                    uint8_t* dst =
+                        output + row * (K / 2) + grp * HALF_GROUP;
 
-                if constexpr (std::is_same_v<IT, float>) {
-                    vals_0 = block_load<float, 32>(src);
-                    vals_1 = block_load<float, 32>(src + 32);
-                } else if constexpr (std::is_same_v<IT, bf16>) {
-                    simd<bf16, 32> bvals_0 = block_load<bf16, 32>(
-                        reinterpret_cast<const bf16*>(src));
-                    simd<bf16, 32> bvals_1 = block_load<bf16, 32>(
-                        reinterpret_cast<const bf16*>(src + 32));
-                    vals_0 = bvals_0;
-                    vals_1 = bvals_1;
-                } else {
-                    simd<fp16, 32> hvals_0 = block_load<fp16, 32>(
-                        reinterpret_cast<const fp16*>(src));
-                    simd<fp16, 32> hvals_1 = block_load<fp16, 32>(
-                        reinterpret_cast<const fp16*>(src + 32));
-                    vals_0 = hvals_0;
-                    vals_1 = hvals_1;
+                    // Load 64 input values in two chunks and find absmax.
+                    simd<float, 32> vals_0, vals_1;
+                    if constexpr (std::is_same_v<IT, float>) {
+                        vals_0 = block_load<float, 32>(src);
+                        vals_1 = block_load<float, 32>(src + 32);
+                    } else if constexpr (std::is_same_v<IT, bf16>) {
+                        simd<bf16, 32> bvals_0 = block_load<bf16, 32>(
+                            reinterpret_cast<const bf16*>(src));
+                        simd<bf16, 32> bvals_1 = block_load<bf16, 32>(
+                            reinterpret_cast<const bf16*>(src + 32));
+                        vals_0 = bvals_0;
+                        vals_1 = bvals_1;
+                    } else {
+                        simd<fp16, 32> hvals_0 = block_load<fp16, 32>(
+                            reinterpret_cast<const fp16*>(src));
+                        simd<fp16, 32> hvals_1 = block_load<fp16, 32>(
+                            reinterpret_cast<const fp16*>(src + 32));
+                        vals_0 = hvals_0;
+                        vals_1 = hvals_1;
+                    }
+
+                    simd<float, 32> abs_0 =
+                        sycl::ext::intel::esimd::abs<float, 32>(vals_0);
+                    simd<float, 32> abs_1 =
+                        sycl::ext::intel::esimd::abs<float, 32>(vals_1);
+                    simd<float, 32> abs_max =
+                        sycl::ext::intel::esimd::max<float, 32>(abs_0, abs_1);
+                    // Use the ESIMD reduction tree instead of a 32-step
+                    // scalar dependency chain.
+                    float group_max = hmax<float>(abs_max);
+
+                    constexpr float qmax = Unsigned ? 15.0f : 7.0f;
+                    constexpr float qmin = Unsigned ? 0.0f : -7.0f;
+                    float scale = group_max / qmax;
+                    if (scale < 1e-10f) scale = 1e-10f;
+                    float rscale =
+                        qmax /
+                        (group_max < 1e-10f ? 1e-10f : group_max);
+                    scales[grp * M + row] = static_cast<IT>(scale);
+
+                    simd<float, 32> q_0 =
+                        sycl::ext::intel::esimd::rnde<float, 32>(
+                            vals_0 * rscale);
+                    simd<float, 32> q_1 =
+                        sycl::ext::intel::esimd::rnde<float, 32>(
+                            vals_1 * rscale);
+                    simd<float, 32> clamp_lo(qmin);
+                    simd<float, 32> clamp_hi(qmax);
+                    q_0 = sycl::ext::intel::esimd::max<float, 32>(
+                        sycl::ext::intel::esimd::min<float, 32>(
+                            q_0, clamp_hi),
+                        clamp_lo);
+                    q_1 = sycl::ext::intel::esimd::max<float, 32>(
+                        sycl::ext::intel::esimd::min<float, 32>(
+                            q_1, clamp_hi),
+                        clamp_lo);
+
+                    // Pack even elements into low nibbles and odd elements
+                    // into high nibbles.
+                    simd<uint8_t, 16> packed_0, packed_1;
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        int8_t even_0 = static_cast<int8_t>(q_0[i * 2]);
+                        int8_t odd_0 = static_cast<int8_t>(q_0[i * 2 + 1]);
+                        packed_0[i] =
+                            static_cast<uint8_t>(even_0 & 0x0F) |
+                            static_cast<uint8_t>((odd_0 & 0x0F) << 4);
+
+                        int8_t even_1 = static_cast<int8_t>(q_1[i * 2]);
+                        int8_t odd_1 = static_cast<int8_t>(q_1[i * 2 + 1]);
+                        packed_1[i] =
+                            static_cast<uint8_t>(even_1 & 0x0F) |
+                            static_cast<uint8_t>((odd_1 & 0x0F) << 4);
+                    }
+
+                    simd<uint32_t, 16> store_offsets;
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) store_offsets[i] = i;
+                    scatter<uint8_t, 16>(dst, store_offsets, packed_0);
+                    scatter<uint8_t, 16>(
+                        dst + 16, store_offsets, packed_1);
                 }
-
-                // Compute absmax
-                simd<float, 32> abs_0 = sycl::ext::intel::esimd::abs<float, 32>(vals_0);
-                simd<float, 32> abs_1 = sycl::ext::intel::esimd::abs<float, 32>(vals_1);
-                simd<float, 32> abs_max = sycl::ext::intel::esimd::max<float, 32>(abs_0, abs_1);
-
-                // Reduce to single max
-                float group_max = 0.0f;
-                #pragma unroll
-                for (int i = 0; i < 32; ++i) {
-                    float v = abs_max[i];
-                    if (v > group_max) group_max = v;
-                }
-
-                // Compute scale
-                constexpr float qmax = Unsigned ? 15.0f : 7.0f;
-                constexpr float qmin = Unsigned ? 0.0f : -7.0f;
-                float scale = group_max / qmax;
-                if (scale < 1e-10f) scale = 1e-10f;
-                float rscale = qmax / (group_max < 1e-10f ? 1e-10f : group_max);
-
-                // Store scale: scales[grp * M + row]
-                scales[grp * M + row] = scale;
-
-                // Quantize and clamp to signed [-7, 7] or unsigned [0, 15].
-                simd<float, 32> scaled_0 = vals_0 * rscale;
-                simd<float, 32> scaled_1 = vals_1 * rscale;
-                simd<float, 32> q_0 = sycl::ext::intel::esimd::rnde<float, 32>(scaled_0);
-                simd<float, 32> q_1 = sycl::ext::intel::esimd::rnde<float, 32>(scaled_1);
-                simd<float, 32> clamp_lo(qmin);
-                simd<float, 32> clamp_hi(qmax);
-                q_0 = sycl::ext::intel::esimd::max<float, 32>(
-                    sycl::ext::intel::esimd::min<float, 32>(q_0, clamp_hi), clamp_lo);
-                q_1 = sycl::ext::intel::esimd::max<float, 32>(
-                    sycl::ext::intel::esimd::min<float, 32>(q_1, clamp_hi), clamp_lo);
-
-                // Convert to int8 and pack
-                // Pack: even elements go to low nibble, odd to high nibble
-                // vals_0 covers elements [0..31] = 16 packed bytes
-                // vals_1 covers elements [32..63] = 16 packed bytes
-                simd<uint8_t, 16> packed_0, packed_1;
-                #pragma unroll
-                for (int i = 0; i < 16; ++i) {
-                    int8_t even_0 = static_cast<int8_t>(q_0[i * 2]);
-                    int8_t odd_0 = static_cast<int8_t>(q_0[i * 2 + 1]);
-                    packed_0[i] = static_cast<uint8_t>(even_0 & 0x0F) |
-                                  static_cast<uint8_t>((odd_0 & 0x0F) << 4);
-
-                    int8_t even_1 = static_cast<int8_t>(q_1[i * 2]);
-                    int8_t odd_1 = static_cast<int8_t>(q_1[i * 2 + 1]);
-                    packed_1[i] = static_cast<uint8_t>(even_1 & 0x0F) |
-                                  static_cast<uint8_t>((odd_1 & 0x0F) << 4);
-                }
-
-                // Store 32 packed bytes
-                simd<uint32_t, 16> store_offsets;
-                #pragma unroll
-                for (int i = 0; i < 16; ++i) store_offsets[i] = i;
-                scatter<uint8_t, 16>(dst, store_offsets, packed_0);
-                scatter<uint8_t, 16>(dst + 16, store_offsets, packed_1);
             }
         );
     };
@@ -520,34 +580,31 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_svdq_act_int4(
 
     auto packed = torch::empty({M, K / 2},
         torch::TensorOptions().dtype(torch::kByte).device(input.device()));
-    auto scales_f32 = torch::empty({num_groups, M},
-        torch::TensorOptions().dtype(torch::kFloat32).device(input.device()));
+    auto scales_out = torch::empty({num_groups, M}, input.options());
 
     auto input_dtype = input.scalar_type();
     if (input_dtype == torch::kFloat32) {
         quantize_svdq_act_int4_kernel<float>(
             input.data_ptr<float>(),
             packed.data_ptr<uint8_t>(),
-            scales_f32.data_ptr<float>(),
+            scales_out.data_ptr<float>(),
             M, K, num_groups, input.device());
     } else if (input_dtype == torch::kBFloat16) {
         quantize_svdq_act_int4_kernel<bf16>(
             reinterpret_cast<const bf16*>(input.data_ptr()),
             packed.data_ptr<uint8_t>(),
-            scales_f32.data_ptr<float>(),
+            reinterpret_cast<bf16*>(scales_out.data_ptr()),
             M, K, num_groups, input.device());
     } else if (input_dtype == torch::kFloat16) {
         quantize_svdq_act_int4_kernel<fp16>(
             reinterpret_cast<const fp16*>(input.data_ptr()),
             packed.data_ptr<uint8_t>(),
-            scales_f32.data_ptr<float>(),
+            reinterpret_cast<fp16*>(scales_out.data_ptr()),
             M, K, num_groups, input.device());
     } else {
         TORCH_CHECK(false, "Unsupported input dtype: ", input_dtype);
     }
 
-    // Return scales in input dtype for consistency
-    auto scales_out = scales_f32.to(input_dtype);
     return std::make_tuple(packed, scales_out);
 }
 
@@ -563,17 +620,17 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_svdq_act_uint4(
     TORCH_CHECK(K % SVDQ_GROUP_SIZE == 0, "K must be divisible by 64");
     const int64_t groups = K / SVDQ_GROUP_SIZE;
     auto packed = torch::empty({M, K / 2}, torch::TensorOptions().dtype(torch::kByte).device(input.device()));
-    auto scales_f32 = torch::empty({groups, M}, torch::TensorOptions().dtype(torch::kFloat32).device(input.device()));
+    auto scales_out = torch::empty({groups, M}, input.options());
     if (input.scalar_type() == torch::kFloat32) {
-        quantize_svdq_act_int4_kernel<float, true>(input.data_ptr<float>(), packed.data_ptr<uint8_t>(), scales_f32.data_ptr<float>(), M, K, groups, input.device());
+        quantize_svdq_act_int4_kernel<float, true>(input.data_ptr<float>(), packed.data_ptr<uint8_t>(), scales_out.data_ptr<float>(), M, K, groups, input.device());
     } else if (input.scalar_type() == torch::kBFloat16) {
-        quantize_svdq_act_int4_kernel<bf16, true>(reinterpret_cast<const bf16*>(input.data_ptr()), packed.data_ptr<uint8_t>(), scales_f32.data_ptr<float>(), M, K, groups, input.device());
+        quantize_svdq_act_int4_kernel<bf16, true>(reinterpret_cast<const bf16*>(input.data_ptr()), packed.data_ptr<uint8_t>(), reinterpret_cast<bf16*>(scales_out.data_ptr()), M, K, groups, input.device());
     } else if (input.scalar_type() == torch::kFloat16) {
-        quantize_svdq_act_int4_kernel<fp16, true>(reinterpret_cast<const fp16*>(input.data_ptr()), packed.data_ptr<uint8_t>(), scales_f32.data_ptr<float>(), M, K, groups, input.device());
+        quantize_svdq_act_int4_kernel<fp16, true>(reinterpret_cast<const fp16*>(input.data_ptr()), packed.data_ptr<uint8_t>(), reinterpret_cast<fp16*>(scales_out.data_ptr()), M, K, groups, input.device());
     } else {
         TORCH_CHECK(false, "Unsupported input dtype: ", input.scalar_type());
     }
-    return {packed, scales_f32.to(input.scalar_type())};
+    return {packed, scales_out};
 }
 
 

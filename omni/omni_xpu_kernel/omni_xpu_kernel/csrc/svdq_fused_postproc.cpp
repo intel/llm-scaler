@@ -42,9 +42,8 @@ namespace svdq {
 //         smooth_factor [K] bf16 — per-channel smooth factor (broadcast over M)
 // Output: [M, K] f16
 //
-// Each work-item processes a contiguous chunk of elements.
-// We use a flat 1D decomposition over total elements, with each work-item
-// processing 32 elements (one ESIMD vector width for bf16).
+// Each work-item processes a platform-tuned contiguous chunk of elements.
+// We use a flat 1D decomposition over total elements.
 // smooth_factor is indexed by column: smooth[elem_idx % K].
 // ============================================================================
 
@@ -56,8 +55,16 @@ static void fused_smooth_convert_kernel(
     int64_t K,
     const at::Device& device
 ) {
-    // Each work-item processes 32 elements (bf16 = 2 bytes, 32 elements = 64 bytes)
-    constexpr int ELEM_PER_WI = 32;
+#ifndef OMNI_SVDQ_SMOOTH_DIV_ELEMENTS_PER_WI
+#if defined(OMNI_XPU_ARCH_PTL_H)
+#define OMNI_SVDQ_SMOOTH_DIV_ELEMENTS_PER_WI 256
+#elif defined(OMNI_XPU_ARCH_BMG)
+#define OMNI_SVDQ_SMOOTH_DIV_ELEMENTS_PER_WI 32
+#else
+#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
+#endif
+#endif
+    constexpr int ELEM_PER_WI = OMNI_SVDQ_SMOOTH_DIV_ELEMENTS_PER_WI;
     const int64_t total_elements = M * K;
     const int64_t total_wi = (total_elements + ELEM_PER_WI - 1) / ELEM_PER_WI;
     constexpr int WG_SIZE = 64;

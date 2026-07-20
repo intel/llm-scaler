@@ -32,6 +32,14 @@
 namespace omni_xpu {
 namespace int8_ops {
 
+torch::Tensor dequantize_int8_fused(
+    torch::Tensor input,
+    torch::Tensor scale,
+    torch::ScalarType out_dtype);
+std::tuple<torch::Tensor, torch::Tensor> quantize_int8_tensorwise_fused(
+    torch::Tensor input,
+    std::optional<torch::Tensor> scale_opt);
+
 // Forward declaration — defined in int8_quantize_esimd.cpp
 std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(torch::Tensor x);
 // Forward declaration — defined in int8_scaleback_esimd.cpp
@@ -601,6 +609,13 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_tensorwise(
 ) {
     TORCH_CHECK(x.device().is_xpu(), "x must be on XPU device");
 
+    if (stochastic_rounding <= 0 &&
+        (x.scalar_type() == torch::kBFloat16 ||
+         x.scalar_type() == torch::kHalf ||
+         x.scalar_type() == torch::kFloat)) {
+        return quantize_int8_tensorwise_fused(x, scale_opt);
+    }
+
     // Compute scale from absmax if not provided
     torch::Tensor scale;
     if (scale_opt.has_value()) {
@@ -632,6 +647,13 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise(
 ) {
     TORCH_CHECK(x.device().is_xpu(), "x must be on XPU device");
 
+    if (stochastic_rounding <= 0 && x.dim() >= 1 &&
+        (x.scalar_type() == torch::kBFloat16 ||
+         x.scalar_type() == torch::kHalf ||
+         x.scalar_type() == torch::kFloat)) {
+        return quantize_int8_rowwise_fused(x);
+    }
+
     auto abs_max = x.abs().amax(-1, true); // [..., 1]
     auto scale = (abs_max.to(torch::kFloat32) / 127.0f).clamp_min(1e-30f);
 
@@ -654,8 +676,7 @@ torch::Tensor dequantize_int8_simple(
     torch::Tensor q,
     torch::Tensor scale
 ) {
-    TORCH_CHECK(q.scalar_type() == torch::kInt8, "q must be int8");
-    return q.to(torch::kFloat32) * scale.to(torch::kFloat32);
+    return dequantize_int8_fused(q, scale, torch::kFloat);
 }
 
 torch::Tensor dequantize_int8_simple_dtype(
@@ -670,7 +691,7 @@ torch::Tensor dequantize_int8_simple_dtype(
         case 2: out_dtype = torch::kBFloat16; break;
         default: out_dtype = torch::kFloat; break;
     }
-    return dequantize_int8_simple(q, scale).to(out_dtype);
+    return dequantize_int8_fused(q, scale, out_dtype);
 }
 
 }  // namespace int8_ops

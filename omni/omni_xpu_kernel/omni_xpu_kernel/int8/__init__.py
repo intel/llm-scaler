@@ -110,13 +110,12 @@ def quantize_int8_rowwise(
     """
     native = _get_native()
     if native is not None:
-        # The fused hot path is deterministic and specialized for matrix-like
-        # FP16/BF16 activations. Preserve the generic native API for 1D inputs,
-        # other floating dtypes, and explicit stochastic rounding.
+        # The fused hot path covers deterministic FP32/FP16/BF16 rowwise input.
+        # Preserve the generic native API for explicit stochastic rounding.
         if (
             stochastic_rounding <= 0
-            and x.ndim >= 2
-            and x.dtype in (torch.float16, torch.bfloat16)
+            and x.ndim >= 1
+            and x.dtype in (torch.float32, torch.float16, torch.bfloat16)
             and hasattr(native, "quantize_int8_rowwise_fused")
         ):
             return native.quantize_int8_rowwise_fused(x)

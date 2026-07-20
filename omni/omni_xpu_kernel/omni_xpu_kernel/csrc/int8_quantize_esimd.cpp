@@ -368,10 +368,12 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(
     torch::Tensor x
 ) {
     TORCH_CHECK(x.device().is_xpu(), "x must be on XPU device");
-    TORCH_CHECK(x.dim() >= 2, "x must be at least 2D");
+    TORCH_CHECK(x.dim() >= 1, "x must be at least 1D");
     TORCH_CHECK(
-        x.scalar_type() == torch::kBFloat16 || x.scalar_type() == torch::kHalf,
-        "x must be bf16 or f16, got ", x.scalar_type()
+        x.scalar_type() == torch::kBFloat16 ||
+            x.scalar_type() == torch::kHalf ||
+            x.scalar_type() == torch::kFloat,
+        "x must be bf16, f16, or f32, got ", x.scalar_type()
     );
 
     x = x.contiguous();
@@ -389,9 +391,16 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(
             scales.data_ptr<float>(),
             M, K, x.device()
         );
-    } else {
+    } else if (x.scalar_type() == torch::kHalf) {
         quantize_int8_rowwise_kernel<fp16>(
             reinterpret_cast<const fp16*>(x.data_ptr()),
+            reinterpret_cast<int8_t*>(output.data_ptr()),
+            scales.data_ptr<float>(),
+            M, K, x.device()
+        );
+    } else {
+        quantize_int8_rowwise_kernel<float>(
+            x.data_ptr<float>(),
             reinterpret_cast<int8_t*>(output.data_ptr()),
             scales.data_ptr<float>(),
             M, K, x.device()
