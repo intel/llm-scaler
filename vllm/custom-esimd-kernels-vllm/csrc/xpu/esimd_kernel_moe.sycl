@@ -21,6 +21,30 @@ static inline sycl::queue& get_device_queue(const at::Tensor& tensor) {
     return c10::xpu::getCurrentXPUStream(tensor.device().index()).queue();
 }
 
+struct MoePrefillTileBuffers {
+    at::Tensor experts;
+    at::Tensor rows;
+    int64_t capacity = 0;
+    int device_index = -1;
+};
+
+static thread_local MoePrefillTileBuffers s_moe_prefill_tiles;
+
+static MoePrefillTileBuffers& ensure_moe_prefill_tile_buffers(
+        int64_t capacity, const at::Tensor& input) {
+    const int device_index = input.device().index();
+    if (s_moe_prefill_tiles.capacity < capacity ||
+        s_moe_prefill_tiles.device_index != device_index) {
+        s_moe_prefill_tiles.experts = at::empty(
+            {capacity}, input.options().dtype(at::kInt));
+        s_moe_prefill_tiles.rows = at::empty(
+            {capacity}, input.options().dtype(at::kInt));
+        s_moe_prefill_tiles.capacity = capacity;
+        s_moe_prefill_tiles.device_index = device_index;
+    }
+    return s_moe_prefill_tiles;
+}
+
 // ======================== MoE Auxiliary Ops ========================
 
 at::Tensor esimd_moe_topk(
@@ -179,15 +203,14 @@ at::Tensor esimd_moe_gemm_fp8_blockscale(
         // device; the capacity bound avoids a max(rows_per_expert) host sync.
         const int64_t tile_capacity =
             (total_tokens + 63) / 64 + num_experts;
-        auto tile_experts = at::full(
-            {tile_capacity}, (int64_t)num_experts,
-            input.options().dtype(at::kInt));
-        auto tile_rows = at::empty(
-            {tile_capacity}, input.options().dtype(at::kInt));
+        auto& tile_buffers =
+            ensure_moe_prefill_tile_buffers(tile_capacity, input);
+        auto& tile_experts = tile_buffers.experts;
+        auto& tile_rows = tile_buffers.rows;
         fp8_moe_blockscale::build_expert_m_tiles(
             reinterpret_cast<const uint32_t*>(expert_idx.data_ptr()),
             tile_experts.data_ptr<int32_t>(), tile_rows.data_ptr<int32_t>(),
-            (int)num_experts, q);
+            (int)num_experts, (int)tile_capacity, q);
         fp8_moe_blockscale::moe_gemm_fp8_blockscale_prefill_host(
             reinterpret_cast<const fp16*>(input.data_ptr()),
             reinterpret_cast<const uint8_t*>(weight.data_ptr()),

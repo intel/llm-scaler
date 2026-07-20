@@ -85,6 +85,7 @@ struct build_expert_m_tiles_kernel {
   int32_t* tile_experts;
   int32_t* tile_rows;
   int num_experts;
+  int tile_capacity;
 
   void operator()(sycl::id<1>) const {
     int tile = 0;
@@ -97,17 +98,24 @@ struct build_expert_m_tiles_kernel {
         tile++;
       }
     }
+    // Fill unused descriptors here so the caller does not need a separate
+    // tensor-fill submission. The prefill kernel checks this sentinel before
+    // reading tile_rows.
+    for (; tile < tile_capacity; tile++) {
+      tile_experts[tile] = num_experts;
+    }
   }
 };
 
 inline void build_expert_m_tiles(const uint32_t* expert_idx,
                                  int32_t* tile_experts,
                                  int32_t* tile_rows, int num_experts,
-                                 sycl::queue& q) {
+                                 int tile_capacity, sycl::queue& q) {
   q.submit([&](handler& cgh) {
     cgh.parallel_for(sycl::range<1>(1),
                      build_expert_m_tiles_kernel{expert_idx, tile_experts,
-                                                 tile_rows, num_experts});
+                                                 tile_rows, num_experts,
+                                                 tile_capacity});
   });
 }
 
