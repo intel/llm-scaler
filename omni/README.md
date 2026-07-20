@@ -23,8 +23,16 @@ docker pull intel/llm-scaler-omni:0.1.0-b7
 Or build docker image:
 
 ```bash
-bash build.sh
+# Arc B-series / Battlemage
+OMNI_XPU_DEVICE=bmg bash build.sh
+
+# Panther Lake H / Arc B390
+OMNI_XPU_DEVICE=ptl-h bash build.sh
 ```
+
+Local images are tagged with their AOT target, for example
+`intel/llm-scaler-omni:0.1.0-b8-dev-bmg` or
+`intel/llm-scaler-omni:0.1.0-b8-dev-ptl-h`.
 
 Run docker image:
 

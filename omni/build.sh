@@ -12,11 +12,21 @@ if [ -z "${TAG}" ]; then
     exit 1
 fi
 
+XPU_TARGET="${OMNI_XPU_DEVICE:-bmg}"
+case "${XPU_TARGET}" in
+    bmg|ptl-h) ;;
+    *)
+        echo "Unsupported OMNI_XPU_DEVICE '${XPU_TARGET}'; use bmg or ptl-h" >&2
+        exit 1
+        ;;
+esac
+
 cd "${SCRIPT_DIR}"
 set -x
 
 DOCKER_BUILDKIT=1 docker build -f ./docker/Dockerfile . \
-    -t "intel/llm-scaler-omni:${TAG}" \
+    -t "intel/llm-scaler-omni:${TAG}-${XPU_TARGET}" \
     --build-arg "IMAGE_TAG=${TAG}" \
+    --build-arg "OMNI_XPU_DEVICE=${XPU_TARGET}" \
     --build-arg "https_proxy=${HTTPS_PROXY}" \
     --build-arg "http_proxy=${HTTP_PROXY}"

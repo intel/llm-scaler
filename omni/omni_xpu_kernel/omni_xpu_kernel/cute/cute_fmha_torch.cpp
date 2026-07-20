@@ -5,8 +5,8 @@
  * omni_xpu_kernel.sdp:  q,k,v,o are [B, L, H, D] (B==1), fp16 or bf16, XPU.
  *
  * The kernel body is the CUTLASS-SYCL flash-attention-v2 forward used by
- * 06_xe_fmha_fwd.cpp (d=128, 256-row Q-tile, doubleGRF, PipelineStages=2 —
- * the exact config benchmarked at ~75 TF on B60). Only the launch is changed:
+ * 06_xe_fmha_fwd.cpp (d=128, platform-selected tile/GRF/pipeline policy).
+ * The initial PTL-H policy uses the correctness-validated BMG values; only the launch is changed:
  * instead of cutlass' global compat queue we submit onto torch's current XPU
  * queue (at::xpu::getCurrentXPUStream().queue()), with torch tensor data_ptr()s
  * as the operands, so the SYCL context matches torch's allocations.
@@ -33,6 +33,7 @@
 #include "flash_attention_v2/collective/xe_fmha_fwd_epilogue.hpp"
 #include "flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp"
 #include "flash_attention_v2/kernel/xe_tile_scheduler.hpp"
+#include "cute_fmha_config.h"
 
 using namespace cute;
 
@@ -82,27 +83,30 @@ static void launch_on_torch_queue(typename Kernel::Params params) {
 // switches to a 64-wide KV tile (fewer K-loop iters at large seq — omni uses 64).
 template <typename Element>
 struct D128Kernel {
+  using PlatformConfig = cute_fmha_config::ActiveConfig;
 #if defined(CUTE_FMHA_KV64)
   // KV tile = get<1>(ShapeQK) = 64. Per get_tiled_mma_pv, the PV tile must be
   // <TileQ, TileV, KVtile> — so ShapePV's K-dim (3rd) MUST equal 64, not 32.
   // TileV=32 -> VTiles = 128/32 = 4. (My earlier <256,32,32> broke the QK->PV
   // K-dim match and tripped the gemm.hpp static_assert.)
-  using ShapeQK          = Shape<_256, _64, _32>;
-  using ShapePV          = Shape<_256, _32, _64>;
-  using ShapeOutput      = Shape<_256, _128>;
-  using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
+  static constexpr int KvTile = 64;
 #else
-  // Tile shapes: HEAD_DIM==128 PREFILL branch of 06_xe_fmha_fwd.cpp
-  using ShapeQK          = Shape<_256, _32, _32>;
-  using ShapePV          = Shape<_256, _32, _32>;
-  using ShapeOutput      = Shape<_256, _128>;
-  using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
+  static constexpr int KvTile = PlatformConfig::KV_TILE;
 #endif
+  using ShapeQK = Shape<
+      Int<PlatformConfig::Q_TILE>, Int<KvTile>, Int<PlatformConfig::MMA_K>>;
+  using ShapePV = Shape<
+      Int<PlatformConfig::Q_TILE>, Int<PlatformConfig::V_TILE>, Int<KvTile>>;
+  using ShapeOutput = Shape<
+      Int<PlatformConfig::Q_TILE>, Int<PlatformConfig::HEAD_DIM>>;
+  using SubgroupLayoutQK = Layout<
+      Shape<Int<PlatformConfig::SUBGROUP_LAYOUT_Q>, _1, _1>>;
 #ifdef CUTE_FMHA_STAGES
   static constexpr int PipelineStages = CUTE_FMHA_STAGES;
 #else
-  static constexpr int PipelineStages = 2;
+  static constexpr int PipelineStages = PlatformConfig::PIPELINE_STAGES;
 #endif
+  static constexpr int GrfSize = PlatformConfig::GRF_SIZE;
 
   using ElementQ = Element;
   using ElementK = Element;
@@ -207,7 +211,7 @@ void run_d128(const void* q_ptr, const void* k_ptr, const void* v_ptr, void* o_p
   TORCH_CHECK(K::can_implement(arguments), "cute_fmha: can_implement failed (bad problem shape)");
   K::initialize_workspace(arguments, workspace.data_ptr());
   auto kernel_params = K::to_underlying_arguments(arguments, workspace.data_ptr());
-  launch_on_torch_queue<K, 256>(kernel_params);
+  launch_on_torch_queue<K, KT::GrfSize>(kernel_params);
 }
 
 // ---- public op --------------------------------------------------------------

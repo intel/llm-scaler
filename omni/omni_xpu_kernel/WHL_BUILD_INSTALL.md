@@ -22,6 +22,7 @@ set "WORKSPACE=C:\workspace"
 set "LLM_SCALER_DIR=%WORKSPACE%\llm-scaler"
 set "EMBED_PYTHON_DIR=%WORKSPACE%\omni\comfyui_windows_setup\python_embeded"
 set "OUTPUT_DIR=%WORKSPACE%\llm_scaler_dist"
+set "OMNI_XPU_DEVICE=bmg"
 ```
 
 ## 2. Build (in conda environment)
@@ -56,22 +57,26 @@ Key points:
 - Initialize oneAPI: setvars.bat
 - Activate conda: omni_env
 - Explicitly select a core-only build because CUTE FMHA is Linux-only
+- Set `OMNI_XPU_DEVICE` to `bmg` or `ptl-h` for the destination GPU
 - Set torch DLL search path
 - Produce wheel to %OUTPUT_DIR%
 
 Output:
-- Torch 2.10.x: %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+torch210-cp312-cp312-win_amd64.whl
-- Torch 2.11.x: %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+torch211-cp312-cp312-win_amd64.whl
-- Torch 2.12.x: %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+torch212-cp312-cp312-win_amd64.whl
+- Torch 2.10.x/BMG: %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+torch210.bmg-cp312-cp312-win_amd64.whl
+- Torch 2.11.x/BMG: %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+torch211.bmg-cp312-cp312-win_amd64.whl
+- Torch 2.12.x/BMG: %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+torch212.bmg-cp312-cp312-win_amd64.whl
+
+PTL-H builds use the corresponding `.ptlh` local-version component. Build one
+artifact for every Torch/GPU target pair rather than renaming a BMG wheel.
 
 The build detects the installed Torch version automatically. Build one wheel
-per Torch environment and install it only into an embedded environment with
-the same Torch public version.
+per Torch environment and GPU target, and install it only into an embedded
+environment with the same Torch public version and GPU architecture.
 
 ## 3. Install the newly built wheel (embedded Python)
 Use --no-deps to avoid pulling dependencies again:
 
- - Wheel path: select the matching `+torch210`, `+torch211`, or `+torch212` artifact
+ - Wheel path: select the matching Torch and `.bmg`/`.ptlh` artifact
  - Install command:
   - pip install --force-reinstall --no-deps <wheel>
 
@@ -79,7 +84,8 @@ Command example (with variables):
 
 ```
 set "TORCH_TAG=torch211"
-"%EMBED_PYTHON_DIR%\python.exe" -m pip install --force-reinstall --no-deps "%OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+%TORCH_TAG%-cp312-cp312-win_amd64.whl"
+set "XPU_TAG=bmg"
+"%EMBED_PYTHON_DIR%\python.exe" -m pip install --force-reinstall --no-deps "%OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+%TORCH_TAG%.%XPU_TAG%-cp312-cp312-win_amd64.whl"
 ```
 
 ## 4. Verify (optional)
@@ -89,7 +95,7 @@ set "TORCH_TAG=torch211"
 Command example (with variables):
 
 ```
-"%EMBED_PYTHON_DIR%\python.exe" -c "import omni_xpu_kernel as ok, importlib.metadata as im; print('omni_xpu_kernel:', ok); print('version:', im.version('omni-xpu-kernel'))"
+"%EMBED_PYTHON_DIR%\python.exe" -c "import omni_xpu_kernel as ok, importlib.metadata as im; print('version:', im.version('omni-xpu-kernel')); print('target:', ok.__xpu_target__)"
 ```
 
 ---

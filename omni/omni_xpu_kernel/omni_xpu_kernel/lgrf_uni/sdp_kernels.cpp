@@ -1,10 +1,10 @@
 // SDP ESIMD Flash Attention DLL — parameterized for hardware adaptation
-// Compiled with: icpx -fsycl -fsycl-targets=spir64_gen -Xs "-device bmg -options -doubleGRF"
+// Compiled AOT with -device bmg or -device ptl-h and the matching
+// OMNI_XPU_ARCH_* policy macro selected by setup.py.
 // Exports: sdp_fp16 (FP16 optimized), sdp_bf16io (BF16 I/O hybrid)
 // Tensor shape: [B, L, H, D] with D=HEAD_DIM, B=1, contiguous
 //
 // Hardware config is selected at compile time via sdp_config.h.
-// To target a different GPU, define SDP_CONFIG_PVC / SDP_CONFIG_LNL before including.
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
@@ -39,11 +39,11 @@ using Cfg = sdp_config::ActiveConfig;
 #include "single_kernels/flash.attn.b.mha.fp16.opt.h"
 }
 namespace hd64 {
-using Cfg = sdp_config::ConfigBMG_HD64;
+using Cfg = sdp_config::ActiveConfigHD64;
 #include "single_kernels/flash.attn.b.mha.fp16.opt.h"
 }
 namespace hd64_bf16 {
-using Cfg = sdp_config::ConfigBMG_HD64;
+using Cfg = sdp_config::ActiveConfigHD64;
 #include "single_kernels/flash.attn.b.mha.bf16io.opt.h"
 }
 
@@ -154,7 +154,7 @@ extern "C" ESIMD_KERNEL_API void sdp_fp16_hd64(
     int headQ, int headKv,
     void* sycl_queue_ptr)
 {
-    using C64 = sdp_config::ConfigBMG_HD64;
+    using C64 = sdp_config::ActiveConfigHD64;
     sycl::queue& q = *reinterpret_cast<sycl::queue*>(sycl_queue_ptr);
     int groupH = headQ;
     int groupV = (q_len + C64::Q_GROUP - 1) / C64::Q_GROUP;
@@ -183,7 +183,7 @@ extern "C" ESIMD_KERNEL_API void sdp_bf16io_hd64(
     int headQ, int headKv,
     void* sycl_queue_ptr)
 {
-    using C64 = sdp_config::ConfigBMG_HD64;
+    using C64 = sdp_config::ActiveConfigHD64;
     sycl::queue& q = *reinterpret_cast<sycl::queue*>(sycl_queue_ptr);
     int groupH = headQ;
     int groupV = (q_len + C64::Q_GROUP - 1) / C64::Q_GROUP;

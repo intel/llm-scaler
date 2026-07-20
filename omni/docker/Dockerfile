@@ -7,8 +7,9 @@ ARG PYTHON_VERSION=3.12
 ARG TORCH_VERSION=2.10.0
 ARG TORCHVISION_VERSION=0.25.0
 ARG TORCHAUDIO_VERSION=2.10.0
-ARG ONEAPI_VERSION=2025.2.0-517
+ARG ONEAPI_VERSION=2025.3.3-30
 ARG IMAGE_TAG
+ARG OMNI_XPU_DEVICE=bmg
 
 # ======== Builder Stage ========
 FROM ${BASE_IMAGE} AS builder
@@ -21,8 +22,10 @@ ARG TORCHVISION_VERSION
 ARG TORCHAUDIO_VERSION
 ARG ONEAPI_VERSION
 ARG IMAGE_TAG
+ARG OMNI_XPU_DEVICE
 
-RUN test -n "${IMAGE_TAG}"
+RUN test -n "${IMAGE_TAG}" && \
+    { test "${OMNI_XPU_DEVICE}" = bmg || test "${OMNI_XPU_DEVICE}" = ptl-h; }
 
 ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/python${PYTHON_VERSION}/dist-packages/torch/lib:${LD_LIBRARY_PATH}"
 
@@ -44,7 +47,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
         libxi6 libxxf86vm1 libxcursor1 libxrandr2 libxinerama1 \
         libxkbcommon0 && \
     apt remove python3-blinker -y && \
-    apt-get install -y intel-oneapi-dpcpp-ct=${ONEAPI_VERSION} && \
+    apt-get install -y intel-oneapi-dpcpp-cpp-2025.3=${ONEAPI_VERSION} && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     rm -f /usr/lib/python3*/EXTERNALLY-MANAGED
 
@@ -55,7 +58,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         torchvision==${TORCHVISION_VERSION} \
         torchaudio==${TORCHAUDIO_VERSION} \
         --index-url https://download.pytorch.org/whl/xpu && \
-    pip install pytest
+    pip install pytest \
+        onednn==2025.3.0 \
+        onednn-devel==2025.3.0
 
 # omni_xpu_kernel is installed AFTER sgl-kernel-xpu (below): its cute FMHA
 # extension needs the cutlass-sycl headers that sgl-kernel-xpu fetches into
@@ -257,14 +262,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # omni_xpu_kernel (installed here so its cute FMHA ext can use sgl-kernel-xpu's
 # cutlass-sycl headers). CUTLASS_SYCL_ROOT points at the fetched tree; the cute
-# ext is AOT-compiled for OMNI_XPU_DEVICE (bmg = Arc B-series).
+# ext is AOT-compiled for the validated OMNI_XPU_DEVICE build argument.
 RUN --mount=type=cache,target=/root/.cache/pip \
     export CUTLASS_SYCL_ROOT=/llm/sgl-kernel-xpu/build/_deps/repo-cutlass-sycl-src && \
     export OMNI_XPU_REQUIRE_CUTE=1 && \
-    export OMNI_XPU_DEVICE=bmg && \
+    export OMNI_XPU_DEVICE="${OMNI_XPU_DEVICE}" && \
     cd /tmp/omni_xpu_kernel && \
     grep -Fqx "__image_version__ = \"${IMAGE_TAG}\"" omni_xpu_kernel/_version.py && \
     pip install . --no-build-isolation && \
+    pip uninstall -y onednn-devel && \
     rm -rf /tmp/omni_xpu_kernel
 
 # Application files
@@ -279,10 +285,12 @@ FROM ${BASE_IMAGE} AS runtime
 ARG https_proxy
 ARG http_proxy
 ARG PYTHON_VERSION=3.12
-ARG ONEAPI_VERSION=2025.2.0-517
+ARG ONEAPI_VERSION=2025.3.3-30
 ARG IMAGE_TAG
+ARG OMNI_XPU_DEVICE
 
-LABEL org.opencontainers.image.version="${IMAGE_TAG}"
+LABEL org.opencontainers.image.version="${IMAGE_TAG}" \
+      com.intel.omni.xpu-target="${OMNI_XPU_DEVICE}"
 
 # System packages
 RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
@@ -302,7 +310,7 @@ RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRO
         libxi6 libxxf86vm1 libxcursor1 libxrandr2 libxinerama1 \
         libxkbcommon0 && \
     apt remove python3-blinker -y && \
-    apt-get install -y intel-oneapi-dpcpp-ct=${ONEAPI_VERSION} && \
+    apt-get install -y intel-oneapi-dpcpp-cpp-2025.3=${ONEAPI_VERSION} && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     rm -f /usr/lib/python3*/EXTERNALLY-MANAGED
 

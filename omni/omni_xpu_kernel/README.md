@@ -5,17 +5,18 @@ High-performance Intel XPU kernels for PyTorch.
 Kernel wheel and `intel/llm-scaler-omni` image versions share the single source
 in `omni_xpu_kernel/_version.py`. The current image version is
 `0.1.0-b8-dev`. Source builds support Torch XPU 2.10, 2.11, and 2.12 and
-automatically produce `+torch210`, `+torch211`, and `+torch212` PEP 440 local
-versions respectively. The Torch tag makes version-specific native artifacts
-distinguishable; build a separate wheel in each selected Torch environment.
+produce GPU-specific local versions such as `+torch211.bmg` and
+`+torch211.ptlh`. The Torch and GPU tags make both native ABI dimensions
+explicit; build a separate wheel for every selected Torch/GPU pair.
 Torch and oneDNN are intentionally not pinned in
 `[build-system].requires`: install the selected build dependencies first and
 use `--no-build-isolation`. `setup.py` detects the installed Torch public
 version, rejects unsupported minors, generates the wheel tag, and pins that
 exact public version in the wheel runtime metadata.
-After installation, `__version__` and `__torch_version__` are read from that
-wheel's own dist-info rather than recomputed from the active Torch environment,
-so replacing Torch cannot change the native artifact's reported build identity.
+After installation, `__version__`, `__torch_version__`, and `__xpu_target__`
+are read from that wheel's own dist-info rather than recomputed from the active
+environment, so replacing Torch or changing `OMNI_XPU_DEVICE` cannot change the
+native artifact's reported build identity.
 
 ## Modules
 
@@ -257,6 +258,8 @@ output = rotary.apply_kitchen_rope_split_half1(x, freqs_cis)
 `OMNI_XPU_DEVICE` controls the AOT ISA embedded in `lgrf_sdp.so` and
 `cute_fmha_torch.so`. A wheel built for one target must not be installed on a
 different GPU architecture.
+The same validated target also selects kernel-local LGRF SDP and CUTE FMHA
+compile-time policies. Unknown values are rejected before compilation.
 
 | Platform | SYCL architecture check | `OMNI_XPU_DEVICE` | Status |
 |---|---|---|---|
@@ -361,15 +364,15 @@ Set `TARGET` to a value from the platform table. This example writes a wheel
 instead of installing an editable tree so the exact artifact can be archived
 and installed into another matching environment.
 
-| Active build environment | Generated local version |
-|---|---|
-| Torch `2.10.x+xpu` | `0.1.0b8.dev0+torch210` |
-| Torch `2.11.x+xpu` | `0.1.0b8.dev0+torch211` |
-| Torch `2.12.x+xpu` | `0.1.0b8.dev0+torch212` |
+| Active build environment | BMG version | PTL-H version |
+|---|---|---|
+| Torch `2.10.x+xpu` | `0.1.0b8.dev0+torch210.bmg` | `0.1.0b8.dev0+torch210.ptlh` |
+| Torch `2.11.x+xpu` | `0.1.0b8.dev0+torch211.bmg` | `0.1.0b8.dev0+torch211.ptlh` |
+| Torch `2.12.x+xpu` | `0.1.0b8.dev0+torch212.bmg` | `0.1.0b8.dev0+torch212.ptlh` |
 
-The wheel metadata pins the exact public version used to build it. Do not move
-a native wheel between Torch minors; rebuild the same source in the target
-environment instead.
+The wheel metadata pins the exact public Torch version and the local version
+records the AOT GPU target. Do not move a native wheel between Torch minors or
+GPU targets; rebuild the same source for the destination environment.
 
 ```bash
 export TARGET=ptl-h  # use bmg on Arc B-series
@@ -379,19 +382,20 @@ docker exec -e TARGET="$TARGET" omni-xpu-kernel-devel bash -lc '
   source /opt/intel/oneapi/setvars.sh --force >/dev/null
   source /opt/venv/bin/activate
   cd /src/omni_xpu_kernel
-  mkdir -p /workspace/dist
+  rm -rf "/workspace/dist/$TARGET"
+  mkdir -p "/workspace/dist/$TARGET"
   CUTLASS_SYCL_ROOT=/opt/sycl-tla \
   OMNI_XPU_REQUIRE_CUTE=1 \
   OMNI_XPU_DEVICE="$TARGET" \
   python -m pip wheel . --no-build-isolation --no-deps \
-    -w /workspace/dist
+    -w "/workspace/dist/$TARGET"
 '
 
-docker exec omni-xpu-kernel-devel bash -lc '
+docker exec -e TARGET="$TARGET" omni-xpu-kernel-devel bash -lc '
   set -e
   source /opt/venv/bin/activate
   python -m pip install --force-reinstall --no-deps \
-    /workspace/dist/omni_xpu_kernel-*.whl
+    "/workspace/dist/$TARGET"/omni_xpu_kernel-*.whl
 '
 ```
 
@@ -447,7 +451,7 @@ python -c '
 import torch, omni_xpu_kernel as ok
 from omni_xpu_kernel import cute
 print(torch.__version__, torch.xpu.get_device_name(0))
-print(ok.__version__, ok.is_available(), cute.is_available())
+print(ok.__version__, ok.__xpu_target__, ok.is_available(), cute.is_available())
 '
 ```
 
@@ -494,37 +498,39 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
 #### Battlemage
 
 - `bmg` remains the default AOT target.
-- LGRF `ConfigBMG` is the currently performance-tuned attention configuration.
+- LGRF `ConfigBMG` and CUTE `ConfigBMG` are the currently performance-tuned
+  attention policies.
 - The PTL-specific oneDNN workaround described below is guarded by runtime
   architecture and does not change the BMG path.
 
 #### Panther Lake H
 
 - Use `ptl-h` only after `sycl-ls --verbose` reports `intel_gpu_ptl_h`.
-- LGRF and CUTE compile to PTL-H AOT images, but their tile/WG policy currently
-  reuses the BMG/Xe2 configuration; successful compilation is not a claim of
-  PTL-specific performance tuning.
+- LGRF and CUTE select explicit `ConfigPTLH` policies. Their initial values
+  intentionally match the correctness-validated BMG/Xe2 policy; this separation
+  prevents future PTL-H tuning from silently changing BMG, but is not yet a
+  claim of PTL-specific performance tuning.
 - oneDNN 3.9 cannot create the FP16 `M=4096, K=4096, N=4096` JIT GEMM primitive
   used as a chunk of the `N=12288` FP8 workflow shape. The implementation uses
   an `N=2048` chunk only on `intel_gpu_ptl_h`; BF16 and non-PTL paths retain the
   existing chunk selection.
 
-The PTL-H configuration validated on 2026-07-16 was:
+The PTL-H configuration validated on 2026-07-20 was:
 
 | Component | Version / result |
 |---|---|
-| Source baseline | `origin/main@1380ca7` plus PTL build fixes |
+| Source baseline | `dev/torch-version-tag` with GPU-target policies |
 | GPU | Arc B390, `intel_gpu_ptl_h`, IP 30.0.4 |
 | Container | `intel/omix:0.1.0-devel-ubuntu24.04` |
 | Compiler | oneAPI DPC++/C++ 2025.3.3 |
-| PyTorch | `2.11.0+xpu` |
+| PyTorch | `2.10.0+xpu`, `2.11.0+xpu`, and `2.12.0+xpu` |
 | oneDNN | pip `onednn==2025.3.0` / oneDNN 3.9.1 |
 | sycl-tla | `2fc09973bfdf15755090fcb0e3b6ad236408a992` |
-| Tests | `469 passed, 2 skipped`, no failures |
+| Tests | Each Torch version: `487 passed, 2 skipped, 1 deselected` |
 
 The validated wheel is
-`omni_xpu_kernel-0.1.0b8.dev0+torch211-cp312-cp312-linux_x86_64.whl`, SHA256
-`91579b7b34329148176f5b8f589424a8d8098e60990bdb0a841e93ce5aaa15fd`.
+`omni_xpu_kernel-0.1.0b8.dev0+torch211.ptlh-cp312-cp312-linux_x86_64.whl`,
+SHA256 `2095b7969ca36b63733df8b9c79ec038626a59d065a39c21942cd22e0a63874b`.
 
 Compiler metadata contains two LGRF images and three CUTE images. LGRF D128 and
 D64 kernels reserve 256 GRF with 32 KiB and 16 KiB SLM respectively; the CUTE
@@ -601,10 +607,11 @@ the CUTLASS-SYCL attention sidecar (`cute_fmha_torch.so`). Set
 `OMNI_XPU_REQUIRE_CUTE=0` only for an explicit core-only build. The remaining
 native operations are built into the main `_C` extension.
 
-`sdp_config.h` contains the active `ConfigBMG` configuration plus legacy
-PVC/LNL configuration placeholders. Only the BMG path is performance-tuned;
-the PTL-H build currently reuses its tile/WG policy. The legacy definitions do
-not imply that those platforms are supported.
+`sdp_config.h` contains separate `ConfigBMG` and `ConfigPTLH` policies for both
+head dimensions. CUTE uses the same kernel-local pattern in
+`cute_fmha_config.h`. `setup.py` derives exactly one `OMNI_XPU_ARCH_*` macro
+from `OMNI_XPU_DEVICE`, so the policy, AOT ISA, and wheel target tag stay
+consistent.
 
 ### Build System
 

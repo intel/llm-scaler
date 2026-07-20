@@ -5,17 +5,22 @@
 ### Build System
 
 - Source builds now accept Torch XPU 2.10, 2.11, and 2.12. Wheel versions carry
-  the detected compilation minor as a PEP 440 local version: `+torch210`,
-  `+torch211`, or `+torch212`.
+  both native dimensions as a PEP 440 local version, for example
+  `+torch211.bmg` or `+torch211.ptlh`.
 - Each wheel pins the exact public Torch version in its runtime metadata while
   keeping the filename ABI tag at minor granularity. Unsupported minors are
   rejected before native compilation.
-- Installed packages read their immutable version and compiled Torch version
-  from wheel dist-info. Changing the active Torch environment no longer changes
-  the native wheel identity reported by `__version__`.
-- The Docker image retains the shared `0.1.0-b8-dev` base version because `+`
-  is not valid in a Docker tag. Both values remain defined in
-  `omni_xpu_kernel/_version.py`.
+- Installed packages read their immutable version, compiled Torch version, and
+  GPU target from wheel dist-info. Changing the active environment no longer
+  changes the native wheel identity reported by `__version__`.
+- `OMNI_XPU_DEVICE` now accepts only `bmg` and `ptl-h` and selects the AOT ISA,
+  wheel target tag, and matching LGRF/CUTE compile-time policy together. LGRF
+  HD64 no longer hard-codes the BMG policy. PTL-H policies begin with the
+  correctness-validated shared values and can be tuned independently later.
+- Docker images retain the shared `0.1.0-b8-dev` base version and append
+  `-bmg` or `-ptl-h`; `+` is not valid in a Docker tag. The Docker build now
+  uses the validated oneAPI 2025.3.3 compiler, installs `onednn-devel` only for
+  native compilation, and removes it before the runtime stage.
 - Version-specific Torch and oneDNN packages are no longer forced through the
   isolated `[build-system].requires`. Builds use the documented preinstalled
   environment with `--no-build-isolation`, while wheel runtime requirements

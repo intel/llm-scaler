@@ -1,5 +1,6 @@
 """Version helpers shared by source builds and the installed package."""
 
+import os
 import re
 from importlib.metadata import (
     PackageNotFoundError,
@@ -14,6 +15,7 @@ from pathlib import Path
 __image_version__ = "0.1.0-b8-dev"
 __base_version__ = "0.1.0b8.dev0"
 __supported_torch_minors__ = ("2.10", "2.11", "2.12")
+__supported_xpu_targets__ = ("bmg", "ptl-h")
 
 
 def get_public_torch_version(torch_version):
@@ -42,9 +44,46 @@ def get_torch_tag(torch_version):
     return "torch" + get_torch_minor(torch_version).replace(".", "")
 
 
-def get_package_version(torch_version):
-    """Return the native wheel version for the selected Torch ABI."""
-    return f"{__base_version__}+{get_torch_tag(torch_version)}"
+def normalize_xpu_target(xpu_target):
+    """Return the canonical build target used by the Intel GPU compiler."""
+    target = str(xpu_target).strip().lower()
+    if target not in __supported_xpu_targets__:
+        supported = ", ".join(__supported_xpu_targets__)
+        raise RuntimeError(
+            f"Unsupported OMNI_XPU_DEVICE {xpu_target!r}; supported targets: {supported}"
+        )
+    return target
+
+
+def get_build_xpu_target():
+    """Read and validate the AOT target selected for a source build."""
+    return normalize_xpu_target(os.environ.get("OMNI_XPU_DEVICE", "bmg"))
+
+
+def get_xpu_target_tag(xpu_target):
+    """Return a PEP 440 local-version component for an AOT target."""
+    return normalize_xpu_target(xpu_target).replace("-", "")
+
+
+def get_xpu_target_from_package_version(package_version):
+    """Recover the AOT target from a Torch- and GPU-tagged wheel version."""
+    match = re.search(r"\+torch\d+\.(bmg|ptlh)$", str(package_version), re.IGNORECASE)
+    if not match:
+        raise RuntimeError(
+            "omni_xpu_kernel wheel version has no supported GPU target tag: "
+            f"{package_version}"
+        )
+    target_tag = match.group(1).lower()
+    return "ptl-h" if target_tag == "ptlh" else target_tag
+
+
+def get_package_version(torch_version, xpu_target=None):
+    """Return the native wheel version for the selected Torch ABI and GPU."""
+    target = get_build_xpu_target() if xpu_target is None else normalize_xpu_target(xpu_target)
+    return (
+        f"{__base_version__}+{get_torch_tag(torch_version)}."
+        f"{get_xpu_target_tag(target)}"
+    )
 
 
 def get_installed_torch_version():
@@ -95,13 +134,14 @@ def get_packaged_build_info(version_file=None):
 
     package_version = str(package_distribution.version)
     torch_version = get_required_torch_version(package_distribution.requires)
-    expected_version = get_package_version(torch_version)
+    xpu_target = get_xpu_target_from_package_version(package_version)
+    expected_version = get_package_version(torch_version, xpu_target)
     if package_version != expected_version:
         raise RuntimeError(
             "omni_xpu_kernel wheel metadata is inconsistent: "
             f"version is {package_version}, torch requirement selects {expected_version}"
         )
-    return package_version, torch_version
+    return package_version, torch_version, xpu_target
 
 
 # A source tree derives the prospective wheel identity from its active build
@@ -110,6 +150,7 @@ def get_packaged_build_info(version_file=None):
 _packaged_build_info = get_packaged_build_info()
 if _packaged_build_info is None:
     __torch_version__ = get_installed_torch_version()
-    __version__ = get_package_version(__torch_version__)
+    __xpu_target__ = get_build_xpu_target()
+    __version__ = get_package_version(__torch_version__, __xpu_target__)
 else:
-    __version__, __torch_version__ = _packaged_build_info
+    __version__, __torch_version__, __xpu_target__ = _packaged_build_info

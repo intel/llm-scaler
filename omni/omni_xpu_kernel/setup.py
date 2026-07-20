@@ -34,7 +34,15 @@ VALIDATED_ONEDNN_VERSION = (3, 9, 1)
 
 VERSION_NAMESPACE = run_path(str(Path(__file__).parent / "omni_xpu_kernel" / "_version.py"))
 BUILD_TORCH_VERSION = VERSION_NAMESPACE["get_installed_torch_version"]()
-PACKAGE_VERSION = VERSION_NAMESPACE["get_package_version"](BUILD_TORCH_VERSION)
+BUILD_XPU_TARGET = VERSION_NAMESPACE["get_build_xpu_target"]()
+PACKAGE_VERSION = VERSION_NAMESPACE["get_package_version"](
+    BUILD_TORCH_VERSION, BUILD_XPU_TARGET
+)
+XPU_ARCH_MACROS = {
+    "bmg": "OMNI_XPU_ARCH_BMG",
+    "ptl-h": "OMNI_XPU_ARCH_PTL_H",
+}
+XPU_ARCH_MACRO = XPU_ARCH_MACROS[BUILD_XPU_TARGET]
 
 
 def get_icpx_path():
@@ -281,6 +289,7 @@ class ICPXBuildExt(build_ext):
         
         print(f"Using Intel compiler: {icpx}")
         print(f"Building for platform: {'Windows' if IS_WINDOWS else 'Linux'}")
+        print(f"Intel GPU AOT target: {BUILD_XPU_TARGET} ({XPU_ARCH_MACRO})")
         
         # Get paths from torch
         import torch
@@ -343,12 +352,12 @@ class ICPXBuildExt(build_ext):
             ]
             
             if is_lgrf:
-                device_target = os.environ.get("OMNI_XPU_DEVICE", "bmg")
                 cmd += [
                     "-fsycl-targets=spir64_gen",
-                    "-Xs", f"-device {device_target} -options -doubleGRF",
+                    "-Xs", f"-device {BUILD_XPU_TARGET} -options -doubleGRF",
                     "/O2", "/DNDEBUG",
                     "-DBUILD_ESIMD_KERNEL_LIB",
+                    f"/D{XPU_ARCH_MACRO}=1",
                     "/LD",  # Create DLL
                     f"/Fe:{output_path}",  # Output file
                 ]
@@ -392,14 +401,12 @@ class ICPXBuildExt(build_ext):
             ]
             
             if is_lgrf:
-                # Device target: set OMNI_XPU_DEVICE env var to override
-                # Validated values: bmg (Arc B-series), ptl-h (Panther Lake H)
-                device_target = os.environ.get("OMNI_XPU_DEVICE", "bmg")
                 cmd += [
                     "-fsycl-targets=spir64_gen",
-                    "-Xs", f"-device {device_target} -options -doubleGRF",
+                    "-Xs", f"-device {BUILD_XPU_TARGET} -options -doubleGRF",
                     "-O3", "-DNDEBUG",
                     "-DBUILD_ESIMD_KERNEL_LIB",
+                    f"-D{XPU_ARCH_MACRO}=1",
                     "-fPIC", "-shared",
                 ]
                 cmd += linux_rpath_flags(ext.name, runtime_lib)
@@ -416,17 +423,17 @@ class ICPXBuildExt(build_ext):
                         "cute_fmha_torch needs CUTLASS_SYCL_ROOT set to a cutlass-sycl "
                         "(sycl-tla) source tree containing include/, tools/util/include/, "
                         "examples/common/, applications/. Got: " + repr(cutlass))
-                device_target = os.environ.get("OMNI_XPU_DEVICE", "bmg")
                 cmd += [
                     "-std=c++17", "-O3", "-DNDEBUG", "-fPIC", "-shared",
                     "-fsycl-targets=spir64_gen",
-                    "-Xsycl-target-backend", f"-device {device_target}",
+                    "-Xsycl-target-backend", f"-device {BUILD_XPU_TARGET}",
                     "-Xspirv-translator",
                     "-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,"
                     "+SPV_INTEL_subgroup_matrix_multiply_accumulate",
                     "-fno-sycl-instrument-device-code",
                     "-DCUTLASS_ENABLE_SYCL", "-DSYCL_INTEL_TARGET",
-                    f"-D_GLIBCXX_USE_CXX11_ABI={torch_cxx11_abi}", "-DHEAD_DIM=128",
+                    f"-D{XPU_ARCH_MACRO}=1",
+                    f"-D_GLIBCXX_USE_CXX11_ABI={torch_cxx11_abi}",
                     f"-I{cutlass}/include",
                     f"-I{cutlass}/tools/util/include",
                     f"-I{cutlass}/examples/common",
@@ -505,13 +512,24 @@ class ICPXExtension(Extension):
         # they can be recorded in an sdist/wheel manifest.  The custom build
         # command keeps an absolute root separately for invoking icpx.
         source_root = Path(sourcedir)
+        depends = []
         if name.endswith("lgrf_sdp"):
-            sources = [source_root / "omni_xpu_kernel" / "lgrf_uni" / "sdp_kernels.cpp"]
+            kernel_root = source_root / "omni_xpu_kernel" / "lgrf_uni"
+            sources = [kernel_root / "sdp_kernels.cpp"]
+            depends = sorted(kernel_root.rglob("*.h"))
         elif name.endswith("cute_fmha_torch"):
-            sources = [source_root / "omni_xpu_kernel" / "cute" / "cute_fmha_torch.cpp"]
+            kernel_root = source_root / "omni_xpu_kernel" / "cute"
+            sources = [kernel_root / "cute_fmha_torch.cpp"]
+            depends = [kernel_root / "cute_fmha_config.h"]
         else:
-            sources = sorted((source_root / "omni_xpu_kernel" / "csrc").glob("*.cpp"))
-        super().__init__(name, sources=[source.as_posix() for source in sources])
+            kernel_root = source_root / "omni_xpu_kernel" / "csrc"
+            sources = sorted(kernel_root.glob("*.cpp"))
+            depends = sorted(kernel_root.glob("*.h"))
+        super().__init__(
+            name,
+            sources=[source.as_posix() for source in sources],
+            depends=[dependency.as_posix() for dependency in depends],
+        )
         self.sourcedir = os.fspath(source_root.resolve())
 
 

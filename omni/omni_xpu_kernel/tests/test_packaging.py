@@ -24,10 +24,13 @@ PYPROJECT_FILE = PROJECT_ROOT / "pyproject.toml"
 IMAGE_VERSION = "0.1.0-b8-dev"
 BASE_VERSION = "0.1.0b8.dev0"
 SUPPORTED_TORCH_MINORS = ("2.10", "2.11", "2.12")
+SUPPORTED_XPU_TARGETS = ("bmg", "ptl-h")
 VERSION_NAMESPACE = run_path(str(VERSION_FILE))
 TORCH_VERSION = VERSION_NAMESPACE["get_installed_torch_version"]()
 TORCH_VERSION_TAG = VERSION_NAMESPACE["get_torch_tag"](TORCH_VERSION)
-PACKAGE_VERSION = f"{BASE_VERSION}+{TORCH_VERSION_TAG}"
+XPU_TARGET = VERSION_NAMESPACE["get_build_xpu_target"]()
+XPU_TARGET_TAG = VERSION_NAMESPACE["get_xpu_target_tag"](XPU_TARGET)
+PACKAGE_VERSION = f"{BASE_VERSION}+{TORCH_VERSION_TAG}.{XPU_TARGET_TAG}"
 SOURCE_VERSION = PACKAGE_VERSION
 
 
@@ -58,12 +61,15 @@ def test_kernel_version_is_exposed_by_package_metadata():
     assert version_module["__image_version__"] == IMAGE_VERSION
     assert version_module["__base_version__"] == BASE_VERSION
     assert version_module["__supported_torch_minors__"] == SUPPORTED_TORCH_MINORS
+    assert version_module["__supported_xpu_targets__"] == SUPPORTED_XPU_TARGETS
     assert version_module["__torch_version__"] == TORCH_VERSION
+    assert version_module["__xpu_target__"] == XPU_TARGET
     assert version_module["__version__"] == SOURCE_VERSION
     assert "+" not in IMAGE_VERSION
     assert TORCH_VERSION_TAG == "torch" + "".join(TORCH_VERSION.split(".")[:2])
     assert str(Version(SOURCE_VERSION)) == SOURCE_VERSION
     assert omni_xpu_kernel.__torch_version__ == TORCH_VERSION
+    assert omni_xpu_kernel.__xpu_target__ == XPU_TARGET
     assert omni_xpu_kernel.__version__ == SOURCE_VERSION
 
     result = subprocess.run(
@@ -94,14 +100,33 @@ def test_supported_torch_minors_select_distinct_wheel_tags(
     assert VERSION_NAMESPACE["get_public_torch_version"](torch_version) == public_version
     assert VERSION_NAMESPACE["get_torch_minor"](torch_version) == torch_minor
     assert VERSION_NAMESPACE["get_torch_tag"](torch_version) == torch_tag
-    assert VERSION_NAMESPACE["get_package_version"](torch_version) == (
-        f"{BASE_VERSION}+{torch_tag}"
+    assert VERSION_NAMESPACE["get_package_version"](torch_version, XPU_TARGET) == (
+        f"{BASE_VERSION}+{torch_tag}.{XPU_TARGET_TAG}"
     )
+
+
+@pytest.mark.parametrize(
+    ("target", "target_tag"),
+    [("bmg", "bmg"), ("ptl-h", "ptlh")],
+)
+def test_gpu_targets_select_distinct_wheel_tags(target, target_tag):
+    package_version = VERSION_NAMESPACE["get_package_version"]("2.11.0+xpu", target)
+
+    assert package_version == f"{BASE_VERSION}+torch211.{target_tag}"
+    assert VERSION_NAMESPACE["get_xpu_target_from_package_version"](
+        package_version
+    ) == target
+
+
+@pytest.mark.parametrize("target", ["ptl", "ptl-u", "pvc", "invalid"])
+def test_unsupported_gpu_targets_are_rejected(target):
+    with pytest.raises(RuntimeError, match="Unsupported OMNI_XPU_DEVICE"):
+        VERSION_NAMESPACE["normalize_xpu_target"](target)
 
 
 def test_installed_wheel_identity_comes_from_its_own_metadata(monkeypatch, tmp_path):
     class FakeDistribution:
-        version = f"{BASE_VERSION}+torch210"
+        version = f"{BASE_VERSION}+torch210.ptlh"
         requires = ["torch==2.10.0", "onednn==2025.3.0"]
         files = [Path("omni_xpu_kernel-0.1.0.dist-info") / "RECORD"]
 
@@ -114,8 +139,9 @@ def test_installed_wheel_identity_comes_from_its_own_metadata(monkeypatch, tmp_p
     packaged_version_file = tmp_path / "omni_xpu_kernel" / "_version.py"
 
     assert get_build_info(packaged_version_file) == (
-        f"{BASE_VERSION}+torch210",
+        f"{BASE_VERSION}+torch210.ptlh",
         "2.10.0",
+        "ptl-h",
     )
     # An unrelated installed wheel must not override a source checkout build.
     assert get_build_info(VERSION_FILE) is None
@@ -123,7 +149,7 @@ def test_installed_wheel_identity_comes_from_its_own_metadata(monkeypatch, tmp_p
 
 def test_inconsistent_installed_wheel_metadata_is_rejected(monkeypatch, tmp_path):
     class FakeDistribution:
-        version = f"{BASE_VERSION}+torch212"
+        version = f"{BASE_VERSION}+torch212.ptlh"
         requires = ["torch==2.10.0"]
         files = [Path("omni_xpu_kernel-0.1.0.dist-info") / "RECORD"]
 
@@ -161,6 +187,38 @@ def test_distribution_metadata_uses_normalized_torch_version(tmp_path):
     assert f"torch=={TORCH_VERSION}" in metadata.get_all("Requires-Dist")
 
 
+def test_setup_metadata_rejects_unknown_gpu_target():
+    env = setup_metadata_env(require_cute="0")
+    env["OMNI_XPU_DEVICE"] = "pvc"
+
+    result = subprocess.run(
+        [sys.executable, "setup.py", "--version"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "Unsupported OMNI_XPU_DEVICE" in result.stdout + result.stderr
+
+
+def test_setup_metadata_tags_ptl_h_target():
+    env = setup_metadata_env(require_cute="0")
+    env["OMNI_XPU_DEVICE"] = "ptl-h"
+
+    result = subprocess.run(
+        [sys.executable, "setup.py", "--version"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == f"{BASE_VERSION}+{TORCH_VERSION_TAG}.ptlh"
+
+
 def test_build_system_does_not_force_a_torch_environment():
     pyproject = PYPROJECT_FILE.read_text(encoding="utf-8")
     build_system = pyproject.split("[build-system]", 1)[1].split("\n[", 1)[0]
@@ -185,16 +243,20 @@ def test_core_only_build_requires_explicit_cute_opt_out():
     assert "omni_xpu_kernel" in result.stdout
 
 
-def test_extension_metadata_tracks_native_sources(monkeypatch):
+def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
     import setuptools
 
     captured = {}
+    for required_dir in ("include", "tools/util/include", "examples/common", "applications"):
+        (tmp_path / required_dir).mkdir(parents=True)
     monkeypatch.chdir(PROJECT_ROOT)
-    monkeypatch.delenv("CUTLASS_SYCL_ROOT", raising=False)
-    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
+    monkeypatch.setenv("CUTLASS_SYCL_ROOT", str(tmp_path))
+    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "1")
     monkeypatch.setattr(setuptools, "setup", lambda **kwargs: captured.update(kwargs))
 
-    run_path(str(PROJECT_ROOT / "setup.py"), run_name="__setup_metadata_test__")
+    setup_namespace = run_path(
+        str(PROJECT_ROOT / "setup.py"), run_name="__setup_metadata_test__"
+    )
 
     extensions = {extension.name: extension for extension in captured["ext_modules"]}
     main_sources = {Path(source).name for source in extensions["omni_xpu_kernel._C"].sources}
@@ -206,8 +268,23 @@ def test_extension_metadata_tracks_native_sources(monkeypatch):
     assert "bindings.cpp" in main_sources
     assert "kitchen_rope.cpp" in main_sources
     assert "svdq_dequant.cpp" in main_sources
+    assert setup_namespace["BUILD_XPU_TARGET"] == XPU_TARGET
+    assert setup_namespace["XPU_ARCH_MACRO"] == (
+        "OMNI_XPU_ARCH_PTL_H" if XPU_TARGET == "ptl-h" else "OMNI_XPU_ARCH_BMG"
+    )
+    cute_dependencies = {
+        Path(dependency).name
+        for dependency in extensions["omni_xpu_kernel.cute.cute_fmha_torch"].depends
+    }
+    assert "cute_fmha_config.h" in cute_dependencies
+    assert all(
+        not Path(dependency).is_absolute()
+        for extension in extensions.values()
+        for dependency in extension.depends
+    )
     assert extensions["omni_xpu_kernel.lgrf_uni.lgrf_sdp"].sources
     assert f"torch=={TORCH_VERSION}" in captured["install_requires"]
+    assert captured["version"] == PACKAGE_VERSION
     assert any(
         requirement.startswith("onednn==2025.3.0;")
         for requirement in captured["install_requires"]

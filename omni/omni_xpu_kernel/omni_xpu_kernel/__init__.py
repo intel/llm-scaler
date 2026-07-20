@@ -19,7 +19,7 @@ Usage::
 import os
 import sys
 
-from ._version import __torch_version__, __version__
+from ._version import __torch_version__, __version__, __xpu_target__
 
 __author__ = "Intel"
 
@@ -82,6 +82,7 @@ __all__ = [
     "cute",
     "is_available",
     "__torch_version__",
+    "__xpu_target__",
     "__version__",
 ]
 
