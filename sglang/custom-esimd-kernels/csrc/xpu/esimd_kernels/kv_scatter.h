@@ -7,7 +7,7 @@
  * cuts 2 scatter launches/layer -> 1 (120 -> 60 for gemma4's 60 layers).
  *
  * Layout (both K and V share the same [T]-indexed slot map):
- *   k_ptr / v_ptr:     [T, row_dim] fp16, contiguous (per-token source rows)
+ *   k_ptr / v_ptr:     [T, row_dim] fp16, with independent source row strides
  *   k_cache / v_cache: [S, row_dim] fp16 (destination pool, S = #slots)
  *   idx_ptr:           [T] int64 (out_cache_loc: destination slot per token)
  *   row_dim = kv_heads * head_dim  (gemma4: 16*256=4096 SWA, 4*512=2048 full)
@@ -29,14 +29,16 @@ struct KVScatter_kernel {
     const int64_t* idx_ptr;    // [T]
     int T;
     int row_dim;
+    int64_t k_stride;
+    int64_t v_stride;
 
     void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
         int t = item.get_group(0);
         if (t >= T) return;
 
         int64_t dst = idx_ptr[t];
-        const fp16* ks = k_ptr + (int64_t)t * row_dim;
-        const fp16* vs = v_ptr + (int64_t)t * row_dim;
+        const fp16* ks = k_ptr + (int64_t)t * k_stride;
+        const fp16* vs = v_ptr + (int64_t)t * v_stride;
         fp16*       kd = k_cache + dst * (int64_t)row_dim;
         fp16*       vd = v_cache + dst * (int64_t)row_dim;
 
@@ -57,6 +59,8 @@ inline void kv_scatter_host(
     const int64_t* idx_ptr,
     int T,
     int row_dim,
+    int64_t k_stride,
+    int64_t v_stride,
     sycl::queue& q)
 {
     if (T <= 0) return;
@@ -66,7 +70,8 @@ inline void kv_scatter_host(
             cgh.parallel_for(                                               \
                 sycl::nd_range<1>({(size_t)T}, {1}),                        \
                 KVScatter_kernel<V>{                                        \
-                    k_ptr, v_ptr, k_cache, v_cache, idx_ptr, T, row_dim});  \
+                    k_ptr, v_ptr, k_cache, v_cache, idx_ptr, T, row_dim,     \
+                    k_stride, v_stride});                                   \
         });
 
     if      (row_dim % 512 == 0) { LAUNCH_KVS(512) }
