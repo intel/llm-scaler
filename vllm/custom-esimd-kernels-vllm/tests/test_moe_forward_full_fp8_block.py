@@ -82,7 +82,13 @@ def reference(
 def main():
     device = "xpu"
     experts, hidden, intermediate, top_k = 16, 256, 128, 4
-    cases = [(1, seed) for seed in range(3)] + [(4, seed) for seed in range(3)]
+    # Alternate all supported token counts so the per-shape persistent buffer
+    # cache is exercised instead of only testing long same-shape runs.
+    cases = [
+        (batch_size, seed)
+        for seed in range(3)
+        for batch_size in (1, 4, 2, 3)
+    ]
     for batch_size, seed in cases:
         torch.manual_seed(seed)
         x = (torch.randn(batch_size, hidden, device=device) * 0.2).half()

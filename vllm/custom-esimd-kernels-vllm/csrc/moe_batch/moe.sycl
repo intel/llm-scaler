@@ -1641,40 +1641,48 @@ void moe_down_finalize_fp8_block_batched_kernel(
     submit_kernel(cgf, device, "moe down finalize fp8 block batched");
 }
 
-static thread_local torch::Tensor s_block_topk_idx, s_block_topk_weight;
-static thread_local torch::Tensor s_block_intermediates;
-static thread_local std::array<torch::Tensor, 2> s_block_final_outputs;
-static thread_local int s_block_cached_topk = -1;
-static thread_local int s_block_cached_hidden = -1;
-static thread_local int s_block_cached_intermediate = -1;
-static thread_local int s_block_cached_tokens = -1;
-static thread_local int s_block_output_index = 0;
+struct MoeBlockBuffers {
+    torch::Tensor topk_idx, topk_weight, intermediates;
+    std::array<torch::Tensor, 2> final_outputs;
+    int cached_topk = -1;
+    int cached_hidden = -1;
+    int cached_intermediate = -1;
+    int cached_device = -1;
+    int output_index = 0;
+};
 
-static void ensure_moe_block_buffers(int num_tokens, int top_k, int hidden_size,
-                                     int intermediate_size,
-                                     const torch::Device& dev) {
-    if (s_block_cached_tokens != num_tokens ||
-        s_block_cached_topk != top_k ||
-        s_block_cached_hidden != hidden_size ||
-        s_block_cached_intermediate != intermediate_size) {
-        s_block_topk_idx = torch::empty(
+// Capture and serving commonly alternate among 1..4 decode tokens. Keep one
+// persistent slot per token count so switching shapes does not reallocate all
+// intermediate tensors. The memory cost is tiny for these decode-only buffers.
+static thread_local std::array<MoeBlockBuffers, 4> s_block_buffers;
+
+static MoeBlockBuffers& ensure_moe_block_buffers(
+        int num_tokens, int top_k, int hidden_size, int intermediate_size,
+        const torch::Device& dev) {
+    auto& buffers = s_block_buffers[num_tokens - 1];
+    if (buffers.cached_topk != top_k ||
+        buffers.cached_hidden != hidden_size ||
+        buffers.cached_intermediate != intermediate_size ||
+        buffers.cached_device != dev.index()) {
+        buffers.topk_idx = torch::empty(
             {num_tokens, top_k}, torch::device(dev).dtype(torch::kInt32));
-        s_block_topk_weight = torch::empty(
+        buffers.topk_weight = torch::empty(
             {num_tokens, top_k}, torch::device(dev).dtype(torch::kHalf));
-        s_block_intermediates = torch::empty(
+        buffers.intermediates = torch::empty(
             {num_tokens, top_k + 1, intermediate_size},
             torch::device(dev).dtype(torch::kHalf));
-        for (auto& output : s_block_final_outputs) {
+        for (auto& output : buffers.final_outputs) {
             output = torch::empty(
                 {num_tokens, hidden_size},
                 torch::device(dev).dtype(torch::kHalf));
         }
-        s_block_cached_topk = top_k;
-        s_block_cached_hidden = hidden_size;
-        s_block_cached_intermediate = intermediate_size;
-        s_block_cached_tokens = num_tokens;
-        s_block_output_index = 0;
+        buffers.cached_topk = top_k;
+        buffers.cached_hidden = hidden_size;
+        buffers.cached_intermediate = intermediate_size;
+        buffers.cached_device = dev.index();
+        buffers.output_index = 0;
     }
+    return buffers;
 }
 
 torch::Tensor moe_forward_full_fp8_block(
@@ -1720,15 +1728,16 @@ torch::Tensor moe_forward_full_fp8_block(
                 torch::IntArrayRef({hidden_size, intermediate_size}));
     TORCH_CHECK(hidden_size % 128 == 0 && intermediate_size % 128 == 0);
 
-    ensure_moe_block_buffers(
+    auto& buffers = ensure_moe_block_buffers(
         num_tokens, top_k, hidden_size, intermediate_size, x.device());
     // Alternate outputs so the next decoder layer can safely pass the
     // preceding layer's returned buffer back as x.
-    torch::Tensor final_output = s_block_final_outputs[s_block_output_index];
-    s_block_output_index ^= 1;
+    torch::Tensor final_output =
+        buffers.final_outputs[buffers.output_index];
+    buffers.output_index ^= 1;
     dispatch_moe_topk_forward<class MoeTopKFP8BlockBatched>(
-        (const fp16*)logits.data_ptr(), s_block_topk_idx.data_ptr<int>(),
-        (fp16*)s_block_topk_weight.data_ptr(), num_tokens,
+        (const fp16*)logits.data_ptr(), buffers.topk_idx.data_ptr<int>(),
+        (fp16*)buffers.topk_weight.data_ptr(), num_tokens,
         (int)n_routed_experts,
         (int)top_k, /*norm=*/true, logits.device());
 
@@ -1737,19 +1746,19 @@ torch::Tensor moe_forward_full_fp8_block(
         (const uint8_t*)gate_up_weight.data_ptr(), gate_up_scale.data_ptr<float>(),
         (const uint8_t*)shared_gate_up_weight.data_ptr(),
         shared_gate_up_scale.data_ptr<float>(),
-        s_block_topk_idx.data_ptr<int>(),
-        (fp16*)s_block_intermediates.data_ptr(), num_tokens, hidden_size,
+        buffers.topk_idx.data_ptr<int>(),
+        (fp16*)buffers.intermediates.data_ptr(), num_tokens, hidden_size,
         intermediate_size, top_k, x.device());
 
     moe_down_finalize_fp8_block_batched_kernel(
         (const fp16*)x.data_ptr(),
-        (const fp16*)s_block_intermediates.data_ptr(),
+        (const fp16*)buffers.intermediates.data_ptr(),
         (const uint8_t*)down_weight.data_ptr(), down_scale.data_ptr<float>(),
         (const uint8_t*)shared_down_weight.data_ptr(),
         shared_down_scale.data_ptr<float>(),
         (const fp16*)shared_expert_gate_weight.data_ptr(),
-        (const fp16*)s_block_topk_weight.data_ptr(),
-        s_block_topk_idx.data_ptr<int>(),
+        (const fp16*)buffers.topk_weight.data_ptr(),
+        buffers.topk_idx.data_ptr<int>(),
         (fp16*)final_output.data_ptr(), num_tokens, hidden_size,
         intermediate_size, top_k, x.device());
     return final_output;
