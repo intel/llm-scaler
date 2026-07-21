@@ -93,14 +93,16 @@ forward path. Use `OMNIXPU_DEBUG_VERBOSE=1` to see the fallback reason.
 Attention routing is selected independently:
 
 ```bash
-OMNI_ATTN_BACKEND=auto   # default: cute d128 self-attn, then ESIMD, then PyTorch
+OMNI_ATTN_BACKEND=auto   # default: platform-specific cute/Torch/ESIMD routing
 OMNI_ATTN_BACKEND=cute   # force cute where supported; otherwise PyTorch
 OMNI_ATTN_BACKEND=esimd  # force ESIMD where supported; otherwise PyTorch
 OMNI_ATTN_BACKEND=torch  # keep the original PyTorch attention path
 ```
 
-With `auto`, CUTE handles its validated B=1, unmasked, standard-scale d128
-self-attention domain. Supported d64 and cross-attention calls use ESIMD.
+With `auto`, the validated Torch 2.11/PTL-H BF16 d128 self-attention path uses
+PyTorch SDPA; the packaged CUTE kernel remains the d128 self-attention route for
+other platform, Torch-version, and dtype combinations. Supported d64 and
+cross-attention calls use ESIMD.
 Masked attention, other batch sizes or head dimensions, GQA, custom scaling,
 and any unsupported shape fall back to the original PyTorch implementation.
 Explicit `cute` and `esimd` select only that fused backend and still use the

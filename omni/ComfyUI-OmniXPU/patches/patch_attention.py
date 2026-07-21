@@ -15,8 +15,10 @@ _esimd_fallback_reasons = {}
 # ── Attention backend selection ──────────────────────────────────────────────
 # OMNI_ATTN_BACKEND selects which attention routing policy the patched ComfyUI
 # path uses:
-#   auto   (default) — cute for its validated d128 self-attention domain, ESIMD
-#                      for supported d64/cross-attention, then PyTorch fallback.
+#   auto   (default) — platform policy: Torch 2.11/PTL-H BF16 d128 self-attention
+#                      uses PyTorch SDPA; other validated d128 self-attention
+#                      uses cute, supported d64/cross-attention uses ESIMD,
+#                      then PyTorch fallback.
 #   cute             — CUTLASS-SYCL FMHA (omni_xpu_kernel.cute). fp32 accumulation,
 #                      so it does NOT overflow on large activations (Qwen-Image etc.)
 #                      where the ESIMD fp16-accumulator kernel can. Unsupported
@@ -29,6 +31,8 @@ _esimd_fallback_reasons = {}
 _backend = os.environ.get("OMNI_ATTN_BACKEND", "auto").lower()
 _backend_name = _backend  # for logging
 _backend_sdp = None  # callable(q_blhd, k_blhd, v_blhd) -> out_blhd
+_xpu_target = ""
+_torch_version = ""
 
 
 def _default_cute_so():
@@ -81,9 +85,18 @@ def get_stats():
 
 def apply():
     global _fallback_esimd_sdp, _backend_sdp, _backend_name
+    global _xpu_target, _torch_version
     import sys
 
     probe = sys.modules.get("ComfyUI-OmniXPU.probe")
+    try:
+        import omni_xpu_kernel as kernel_package
+
+        _xpu_target = getattr(kernel_package, "__xpu_target__", "")
+        _torch_version = getattr(kernel_package, "__torch_version__", "")
+    except ImportError:
+        _xpu_target = ""
+        _torch_version = ""
 
     # Resolve the requested backend.
     if _backend not in {"auto", "cute", "esimd", "torch"}:
@@ -185,6 +198,22 @@ def apply():
                 selected_backend = "esimd"
             else:
                 reasons.append(f"cute_unsupported=dim{dim_head},q{q_len},kv{kv_len}")
+
+        # PTL-H Torch 2.11 SDPA is consistently faster than the packaged CUTE
+        # kernel for BF16 D128 self-attention, including the input/output layout
+        # transforms. Keep this under auto policy: explicit cute remains a
+        # useful reproducible backend, and BMG requires its own measurement.
+        if (
+            not reasons
+            and _backend == "auto"
+            and _backend_name == "cute"
+            and _xpu_target == "ptl-h"
+            and _torch_version.startswith("2.11.")
+            and q.dtype == torch.bfloat16
+            and dim_head == 128
+            and q_len == kv_len
+        ):
+            reasons.append("ptl_bf16_prefers_torch")
 
         if reasons:
             _esimd_fallback_count += 1
