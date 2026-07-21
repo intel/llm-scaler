@@ -159,6 +159,135 @@ void quantize_int8_rowwise_kernel(
     utils::submit_kernel(cgf, device, "quantize_int8_rowwise_sg2pass");
 }
 
+#if defined(OMNI_XPU_ARCH_PTL_H)
+// Z-Image's ConvRot down projection quantizes BF16 [M, 10240] activations.
+// At M >= 1024 the input no longer remains cache-resident between the generic
+// kernel's two global-memory passes. One PTL work-group therefore owns one row,
+// stages it in SLM, and cooperatively performs reduction and quantization.
+// Keep this configuration tied to the measured kernel/shape; other shapes and
+// BMG retain the generic rowwise path above.
+struct RowwiseQuantizeLargePTLConfig {
+    static constexpr int Columns = 10240;
+    static constexpr int MinimumRows = 1024;
+    static constexpr int SubgroupSize = 32;
+    static constexpr int SubgroupsPerRow = 24;
+    static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
+    static constexpr int VectorWidth = 16;
+};
+
+template <typename InputT, int VectorWidth, int SubgroupsPerRow>
+class QuantizeInt8RowwiseLargePTLKernel;
+
+template <typename InputT>
+void quantize_int8_rowwise_large_ptl_kernel(
+    const InputT* __restrict__ input,
+    int8_t* __restrict__ output,
+    float* __restrict__ scales,
+    int64_t rows,
+    const at::Device& device) {
+    using Config = RowwiseQuantizeLargePTLConfig;
+    using InputVector = sycl::vec<InputT, Config::VectorWidth>;
+    using OutputVector = sycl::vec<int8_t, Config::VectorWidth>;
+    static_assert(Config::WorkgroupSize <= 1024);
+
+    const sycl::range<1> local(Config::WorkgroupSize);
+    const sycl::range<1> global(
+        static_cast<size_t>(rows) * Config::WorkgroupSize);
+    auto cgf = [&](sycl::handler& handle) {
+        sycl::local_accessor<InputT, 1> row_cache(
+            sycl::range<1>(Config::Columns), handle);
+        sycl::local_accessor<float, 1> subgroup_maxima(
+            sycl::range<1>(Config::SubgroupsPerRow), handle);
+        handle.parallel_for<QuantizeInt8RowwiseLargePTLKernel<
+            InputT, Config::VectorWidth, Config::SubgroupsPerRow>>(
+            sycl::nd_range<1>(global, local),
+            [=](sycl::nd_item<1> item)
+                [[sycl::reqd_sub_group_size(Config::SubgroupSize)]] {
+                auto subgroup = item.get_sub_group();
+                const int lane =
+                    static_cast<int>(subgroup.get_local_linear_id());
+                const int subgroup_index =
+                    static_cast<int>(subgroup.get_group_linear_id());
+                const int workgroup_lane =
+                    subgroup_index * Config::SubgroupSize + lane;
+                const int first = workgroup_lane * Config::VectorWidth;
+                const int64_t row = static_cast<int64_t>(item.get_group(0));
+                const InputT* __restrict__ row_input =
+                    input + row * Config::Columns;
+                int8_t* __restrict__ row_output =
+                    output + row * Config::Columns;
+                InputT* local_ptr = row_cache
+                    .template get_multi_ptr<sycl::access::decorated::no>()
+                    .get();
+
+                float local_max = 0.0f;
+                if (first < Config::Columns) {
+                    const InputVector values =
+                        *reinterpret_cast<const InputVector*>(
+                            row_input + first);
+#pragma unroll
+                    for (int element = 0; element < Config::VectorWidth;
+                         ++element) {
+                        local_ptr[first + element] = values[element];
+                        local_max = sycl::fmax(
+                            local_max,
+                            sycl::fabs(static_cast<float>(values[element])));
+                    }
+                }
+
+                const float subgroup_max = sycl::reduce_over_group(
+                    subgroup, local_max, sycl::maximum<float>());
+                if (lane == 0) {
+                    subgroup_maxima[subgroup_index] = subgroup_max;
+                }
+                sycl::group_barrier(item.get_group());
+
+                if (subgroup_index == 0) {
+                    const float row_max = sycl::reduce_over_group(
+                        subgroup,
+                        lane < Config::SubgroupsPerRow
+                            ? subgroup_maxima[lane]
+                            : 0.0f,
+                        sycl::maximum<float>());
+                    if (lane == 0) {
+                        float scale = row_max / 127.0f;
+                        if (scale < 1e-30f) scale = 1e-30f;
+                        subgroup_maxima[0] = scale;
+                        scales[row] = scale;
+                    }
+                }
+                sycl::group_barrier(item.get_group());
+
+                if (first < Config::Columns) {
+                    InputVector values;
+#pragma unroll
+                    for (int element = 0; element < Config::VectorWidth;
+                         ++element) {
+                        values[element] = local_ptr[first + element];
+                    }
+                    const float inverse_scale = 1.0f / subgroup_maxima[0];
+                    OutputVector quantized;
+#pragma unroll
+                    for (int element = 0; element < Config::VectorWidth;
+                         ++element) {
+                        float rounded = sycl::rint(
+                            static_cast<float>(values[element]) *
+                            inverse_scale);
+                        rounded = sycl::fmax(
+                            -128.0f, sycl::fmin(127.0f, rounded));
+                        quantized[element] = static_cast<int8_t>(
+                            static_cast<int32_t>(rounded));
+                    }
+                    *reinterpret_cast<OutputVector*>(row_output + first) =
+                        quantized;
+                }
+            });
+    };
+    utils::submit_kernel(
+        cgf, device, "quantize_int8_rowwise_large_ptl");
+}
+#endif
+
 template <typename InputT>
 inline float silu_mul_rounded(InputT x1, InputT x2) {
     const float a = static_cast<float>(x1);
@@ -398,12 +527,24 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(
     torch::Tensor scales = torch::empty({M}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
 
     if (x.scalar_type() == torch::kBFloat16) {
+#if defined(OMNI_XPU_ARCH_PTL_H)
+        if (M >= RowwiseQuantizeLargePTLConfig::MinimumRows &&
+            K == RowwiseQuantizeLargePTLConfig::Columns) {
+            quantize_int8_rowwise_large_ptl_kernel<bf16>(
+                reinterpret_cast<const bf16*>(x.data_ptr()),
+                reinterpret_cast<int8_t*>(output.data_ptr()),
+                scales.data_ptr<float>(), M, x.device());
+        } else {
+#endif
         quantize_int8_rowwise_kernel<bf16>(
             reinterpret_cast<const bf16*>(x.data_ptr()),
             reinterpret_cast<int8_t*>(output.data_ptr()),
             scales.data_ptr<float>(),
             M, K, x.device()
         );
+#if defined(OMNI_XPU_ARCH_PTL_H)
+        }
+#endif
     } else if (x.scalar_type() == torch::kHalf) {
         quantize_int8_rowwise_kernel<fp16>(
             reinterpret_cast<const fp16*>(x.data_ptr()),
