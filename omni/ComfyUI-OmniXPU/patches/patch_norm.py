@@ -20,6 +20,7 @@ log = logging.getLogger("ComfyUI-OmniXPU")
 
 _omni_norm = None
 _logged_first_use = False
+_allow_noncontiguous_rms = False
 
 
 def _can_use_omni(x):
@@ -31,6 +32,36 @@ def _can_use_omni(x):
         return False
     h = x.shape[-1]
     return h <= 8192 and h % 32 == 0
+
+
+def _rms_input_2d(x):
+    """Return an eligible 2D RMSNorm input, materializing PTL split views."""
+    if _omni_norm is None or not x.is_xpu or x.ndim < 2:
+        return None
+    h = x.shape[-1]
+    if h > 8192 or h % 32 != 0:
+        return None
+    if not x.is_contiguous():
+        # Lumina/Z-Image Q and K are views into a combined QKV projection. The
+        # last dimension is dense, but every token has a gap after the selected
+        # projection. Torch decomposes RMSNorm on this layout into several
+        # large elementwise/reduction kernels. On PTL it is faster to make one
+        # dense copy and then use the ESIMD RMSNorm kernel. Keep other targets
+        # on their validated route until they receive their own workflow A/B.
+        if (
+            not _allow_noncontiguous_rms
+            or x.ndim != 4
+            or x.shape[0] != 1
+            or x.shape[2] != 30
+            or h != 128
+            or x.stride(-1) != 1
+            or x.stride(2) != h
+            or x.stride(1) != 3 * x.shape[2] * h
+            or x.stride(0) != x.shape[1] * x.stride(1)
+        ):
+            return None
+        x = x.contiguous()
+    return x.reshape(-1, h)
 
 
 def _log_first(op, shape):
@@ -61,12 +92,21 @@ def _run_rms_norm(weight, x, eps):
 
 
 def apply():
-    global _omni_norm
+    global _allow_noncontiguous_rms, _omni_norm
     import sys
     probe = sys.modules.get("ComfyUI-OmniXPU.probe")
     if probe.norm is None:
         return False, "omni_xpu_kernel norm not available"
     _omni_norm = probe.norm
+    try:
+        import omni_xpu_kernel as _omni_package
+
+        _allow_noncontiguous_rms = (
+            getattr(_omni_package, "__xpu_target__", "") == "ptl-h"
+            and os.environ.get("OMNIXPU_NONCONTIG_RMSNORM", "1") != "0"
+        )
+    except ImportError:
+        _allow_noncontiguous_rms = False
 
     import comfy.ops as comfy_ops
 
@@ -145,12 +185,12 @@ def apply():
             weight = None
             bias = None
             offload_stream = None
-        if _can_use_omni(input) and weight is not None and weight.shape[0] == input.shape[-1]:
+        input_2d = _rms_input_2d(input)
+        if input_2d is not None and weight is not None and weight.shape[0] == input.shape[-1]:
             _log_first("RMSNorm", input.shape)
             orig = input.shape
-            x_2d = input.reshape(-1, orig[-1])
             eps = self.eps if self.eps is not None else 1e-6
-            x = _run_rms_norm(weight, x_2d, eps).reshape(orig)
+            x = _run_rms_norm(weight, input_2d, eps).reshape(orig)
         else:
             x = torch.nn.functional.rms_norm(input, self.normalized_shape, weight, self.eps)
         comfy_ops.uncast_bias_weight(self, weight, bias, offload_stream)
@@ -166,13 +206,13 @@ def apply():
         if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
             return _rn_cast(self, *args, **kwargs)
         input = args[0] if args else kwargs.get("input")
-        if (input is not None and _can_use_omni(input)
-                and self.weight is not None and self.weight.shape[0] == input.shape[-1]):
+        input_2d = _rms_input_2d(input) if input is not None else None
+        if (input_2d is not None and self.weight is not None
+                and self.weight.shape[0] == input.shape[-1]):
             _log_first("RMSNorm", input.shape)
             orig = input.shape
-            x_2d = input.reshape(-1, orig[-1])
             eps = self.eps if self.eps is not None else 1e-6
-            return _run_rms_norm(self.weight, x_2d, eps).reshape(orig)
+            return _run_rms_norm(self.weight, input_2d, eps).reshape(orig)
         return _orig_rn_fwd(self, *args, **kwargs)
 
     RN.forward_comfy_cast_weights = _rn_cast
@@ -190,10 +230,10 @@ def apply():
             verbose_only=True,
         )
         def _patched_rms_norm(x, weight=None, eps=1e-6):
-            if _can_use_omni(x):
+            x_2d = _rms_input_2d(x)
+            if x_2d is not None:
                 _log_first("rms_norm_fn", x.shape)
                 orig = x.shape
-                x_2d = x.reshape(-1, orig[-1])
                 if weight is not None:
                     w = comfy.model_management.cast_to(weight, dtype=x.dtype, device=x.device)
                 else:

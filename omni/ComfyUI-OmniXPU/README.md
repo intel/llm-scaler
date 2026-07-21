@@ -33,6 +33,7 @@ OMNIXPU_ENABLE=0            # Master switch — disable everything
 OMNIXPU_ATTENTION=0         # Disable the XPU attention patch only
 OMNIXPU_ROPE=0              # Disable ESIMD RoPE only
 OMNIXPU_NORM=0              # Disable ESIMD LayerNorm/RMSNorm only
+OMNIXPU_NONCONTIG_RMSNORM=0 # Disable the PTL-H split-QKV RMSNorm route
 OMNIXPU_KREA2_RMSNORM=0     # Disable the Krea2-specific local RMSNorm hook only
 OMNIXPU_FP8_GEMM=0          # Disable FP8 GEMM only
 OMNIXPU_INT8=0              # Disable all INT8 routes
@@ -41,6 +42,10 @@ OMNIXPU_FP8_NEG_ZERO_FIX=0  # Disable FP8 negative zero fix only
 OMNIXPU_INTERPOLATE_FIX=0   # Disable interpolate workaround only
 OMNIXPU_MEDIAN_FIX=0        # Disable median workaround only
 ```
+
+On PTL-H, eligible Lumina/Z-Image split-QKV views are materialized once and
+then use the ESIMD RMSNorm kernel. Setting `OMNIXPU_NONCONTIG_RMSNORM=0`
+leaves these views on the original Torch path.
 
 Set `OMNIXPU_DEBUG=1` before starting ComfyUI to log the XPU kernels that are
 actually selected. Wrapper calls that fall back to another implementation are
