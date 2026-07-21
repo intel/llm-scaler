@@ -261,8 +261,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     rm -f /tmp/sglang_diffusion_for_multi_arc.patch
 
 # omni_xpu_kernel (installed here so its cute FMHA ext can use sgl-kernel-xpu's
-# cutlass-sycl headers). CUTLASS_SYCL_ROOT points at the fetched tree; the cute
-# ext is AOT-compiled for the validated OMNI_XPU_DEVICE build argument.
+# cutlass-sycl headers). CUTLASS_SYCL_ROOT points at the fetched tree. The
+# attention sidecars are AOT-compiled for OMNI_XPU_DEVICE; PTL-H also requires
+# the main core to expose the same target from its compiled AOT image.
 RUN --mount=type=cache,target=/root/.cache/pip \
     export CUTLASS_SYCL_ROOT=/llm/sgl-kernel-xpu/build/_deps/repo-cutlass-sycl-src && \
     export OMNI_XPU_REQUIRE_CUTE=1 && \
@@ -270,6 +271,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd /tmp/omni_xpu_kernel && \
     grep -Fqx "__image_version__ = \"${IMAGE_TAG}\"" omni_xpu_kernel/_version.py && \
     pip install . --no-build-isolation && \
+    python -c 'import os, omni_xpu_kernel as ok; target = os.environ["OMNI_XPU_DEVICE"]; core = ok.core_aot_target(); assert target != "ptl-h" or core == target, (target, core)' && \
     pip uninstall -y onednn-devel && \
     rm -rf /tmp/omni_xpu_kernel
 

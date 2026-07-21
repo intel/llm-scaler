@@ -104,6 +104,17 @@ namespace int8_ops {
 
 PYBIND11_MODULE(_C, m) {
     m.doc() = "omni_xpu_kernel - High-performance Intel XPU ESIMD kernels for ComfyUI";
+
+    // This marker is deliberately compiled into the native artifact. Python
+    // dispatchers use it to distinguish a target-AOT core from older JIT core
+    // builds; package metadata alone cannot detect a stale _C shared library.
+#if defined(OMNI_XPU_CORE_AOT) && defined(OMNI_XPU_ARCH_PTL_H)
+    m.attr("__core_aot_target__") = "ptl-h";
+#elif defined(OMNI_XPU_CORE_AOT) && defined(OMNI_XPU_ARCH_BMG)
+    m.attr("__core_aot_target__") = "bmg";
+#else
+    m.attr("__core_aot_target__") = "";
+#endif
     
     // GGUF Dequantization
     auto gguf = m.def_submodule("gguf", "GGUF dequantization kernels");

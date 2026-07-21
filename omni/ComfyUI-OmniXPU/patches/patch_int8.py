@@ -9,6 +9,7 @@ from .debug import log_debug_event
 log = logging.getLogger("ComfyUI-OmniXPU")
 
 _native_target = ""
+_native_core_aot_target = ""
 _native_calls = 0
 _fallback_calls = 0
 _fallback_reasons: dict[str, int] = {}
@@ -54,13 +55,13 @@ def _log_first_shape(
 
 
 def _native_guard_reason() -> str:
-    # The current PTL-H AOT build's dynamic rowwise quantizer terminates the
-    # process even for a minimal [1, 256] BF16 input.  int8_linear always calls
-    # that kernel, so no M/K/N subset is safe to admit.  Keep the oneDNN
-    # prequantized APIs available to callers that provide their own known-good
-    # activation quantization, while this dispatcher uses Comfy Kitchen eager.
-    if _native_target == "ptl-h":
-        return "ptl_h_dynamic_rowwise_quantize"
+    # Older PTL-H wheels leave the mixed ESIMD/plain-SYCL core as a JIT image;
+    # submitting its rowwise quantizer terminates the process even for a
+    # minimal [1, 256] BF16 input.  Fixed wheels expose an explicit core-AOT
+    # target marker.  Keep old artifacts safe without disabling native INT8 on
+    # an AOT wheel built for this device.
+    if _native_target == "ptl-h" and _native_core_aot_target != _native_target:
+        return "ptl_h_core_not_aot"
     return ""
 
 
@@ -79,7 +80,7 @@ def get_stats() -> dict[str, Any]:
 
 
 def apply():
-    global _native_target
+    global _native_core_aot_target, _native_target
 
     try:
         import omni_xpu_kernel as _omni_package
@@ -99,6 +100,10 @@ def apply():
         return False, "comfy_kitchen::int8_linear not registered"
 
     _native_target = getattr(_omni_package, "__xpu_target__", "")
+    get_core_aot_target = getattr(_omni_package, "core_aot_target", None)
+    _native_core_aot_target = (
+        get_core_aot_target() if callable(get_core_aot_target) else ""
+    )
 
     @torch.library.impl("comfy_kitchen::int8_linear", "XPU")
     def _xpu_impl(

@@ -16,7 +16,10 @@ exact public version in the wheel runtime metadata.
 After installation, `__version__`, `__torch_version__`, and `__xpu_target__`
 are read from that wheel's own dist-info rather than recomputed from the active
 environment, so replacing Torch or changing `OMNI_XPU_DEVICE` cannot change the
-native artifact's reported build identity.
+native artifact's reported build identity. `core_aot_target()` independently
+reads an optional target marker compiled into `_C`; consumers that require a
+core AOT image can therefore reject an old or stale binary even when its
+Python metadata is newer.
 
 ## Modules
 
@@ -46,9 +49,11 @@ output = sdp.sdp(q, k, v)
 # are scaled to prevent fp16 overflow, with zero overhead on normal models.
 ```
 
-The LGRF and CUTE sidecars contain architecture-specific AOT images. Select the
-target with `OMNI_XPU_DEVICE`; see [Building from Source](#building-from-source)
-for the platform matrix and complete build procedure.
+The LGRF/CUTE sidecars contain architecture-specific AOT images. PTL-H builds
+also AOT-compile the main `_C` extension because that platform cannot safely
+execute its plain-SYCL rowwise INT8 JIT image. Select the target with
+`OMNI_XPU_DEVICE`; see [Building from Source](#building-from-source) for the
+platform matrix and complete build procedure.
 
 ### cute — CUTLASS-SYCL Flash Attention
 
@@ -256,8 +261,8 @@ output = rotary.apply_kitchen_rope_split_half1(x, freqs_cis)
 ### Select the GPU target
 
 `OMNI_XPU_DEVICE` controls the AOT ISA embedded in `lgrf_sdp.so` and
-`cute_fmha_torch.so`. A wheel built for one target must not be installed on a
-different GPU architecture.
+`cute_fmha_torch.so`; PTL-H additionally embeds a target-AOT `_C.so`. A wheel
+built for one target must not be installed on a different GPU architecture.
 The same validated target also selects kernel-local LGRF SDP and CUTE FMHA
 compile-time policies. Unknown values are rejected before compilation.
 
@@ -451,9 +456,15 @@ python -c '
 import torch, omni_xpu_kernel as ok
 from omni_xpu_kernel import cute
 print(torch.__version__, torch.xpu.get_device_name(0))
-print(ok.__version__, ok.__xpu_target__, ok.is_available(), cute.is_available())
+print(ok.__version__, ok.__xpu_target__, ok.core_aot_target())
+print(ok.is_available(), cute.is_available())
 '
 ```
+
+On PTL-H, `core_aot_target()` must equal `__xpu_target__`. An empty or
+different value is invalid for native dynamic INT8: it means the loaded `_C`
+is an older, non-AOT, or stale binary. BMG retains its established JIT core and
+does not currently require this marker.
 
 ### oneDNN header/library consistency
 
@@ -506,6 +517,11 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
 #### Panther Lake H
 
 - Use `ptl-h` only after `sycl-ls --verbose` reports `intel_gpu_ptl_h`.
+- The main `_C` extension must also be AOT-compiled for `ptl-h`. A JIT-only
+  core can terminate the process when the plain-SYCL rowwise INT8 quantizer is
+  submitted, even though the ESIMD sidecars are correctly AOT-compiled. Current
+  wheels expose the target from the `_C` binary through `core_aot_target()`;
+  the ComfyUI integration guards native dynamic INT8 on older PTL-H wheels.
 - LGRF and CUTE select explicit `ConfigPTLH` policies. Internal PTL-H
   representative-workload validation retained the current values; the separate
   types prevent later PTL-H tuning from silently changing BMG.
@@ -615,7 +631,8 @@ specific GPU via `-device <target>` (default: bmg).
 On Linux, the default build requires a valid `CUTLASS_SYCL_ROOT` and produces
 the CUTLASS-SYCL attention sidecar (`cute_fmha_torch.so`). Set
 `OMNI_XPU_REQUIRE_CUTE=0` only for an explicit core-only build. The remaining
-native operations are built into the main `_C` extension.
+native operations are built into the main `_C` extension; that core is AOT on
+PTL-H and retains the established JIT build on BMG.
 
 `sdp_config.h` contains separate `ConfigBMG` and `ConfigPTLH` policies for both
 head dimensions. CUTE uses the same kernel-local pattern in
@@ -626,7 +643,7 @@ consistent.
 ### Build System
 
 The package builds multiple extension modules:
-- `_C.so` — Main extension (norm, gguf, svdq, rotary, sdp loader, fp8, int8)
+- `_C.so` — Main extension (PTL-H AOT; BMG JIT; norm, gguf, svdq, rotary, sdp loader, fp8, int8)
 - `lgrf_sdp.so` — SDP ESIMD sidecar (AOT, doubleGRF)
 - `cute_fmha_torch.so` — CUTLASS-SYCL FMHA sidecar (Linux, AOT, required by default)
 

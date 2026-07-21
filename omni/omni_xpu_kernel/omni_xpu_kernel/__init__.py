@@ -53,6 +53,20 @@ def is_available():
         return False
 
 
+def core_aot_target() -> str:
+    """Return the GPU target embedded in the loaded core AOT image.
+
+    Older artifacts and builds without core AOT return an empty string.  The
+    value comes from ``_C`` rather than Python package metadata so a stale
+    binary cannot accidentally advertise a capability it does not contain.
+    """
+    try:
+        native = _load_extension()
+    except ImportError:
+        return ""
+    return str(getattr(native, "__core_aot_target__", ""))
+
+
 # Submodule imports
 from . import gguf
 from . import norm
@@ -80,6 +94,7 @@ __all__ = [
     "int8",
     "fp8",
     "cute",
+    "core_aot_target",
     "is_available",
     "__torch_version__",
     "__xpu_target__",

@@ -152,7 +152,12 @@ def apply():
     # same native dynamic rowwise quantizer guarded by patch_int8 on PTL-H.
     # Skipping this wrapper lets the original Lumina path reach that safe eager
     # fallback instead of entering an uncatchable native process fault.
-    if getattr(_omni_package, "__xpu_target__", "") == "ptl-h":
+    target = getattr(_omni_package, "__xpu_target__", "")
+    get_core_aot_target = getattr(_omni_package, "core_aot_target", None)
+    core_aot_target = (
+        get_core_aot_target() if callable(get_core_aot_target) else ""
+    )
+    if target == "ptl-h" and core_aot_target != target:
         return False, "PTL-H native dynamic rowwise INT8 quantization is guarded"
 
     required = (

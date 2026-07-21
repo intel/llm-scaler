@@ -22,10 +22,10 @@
 #include <tuple>
 #include <unordered_map>
 
-#include <torch/extension.h>
-#include <ATen/xpu/XPUGeneratorImpl.h>
 #include <oneapi/dnnl/dnnl.hpp>
 #include <oneapi/dnnl/dnnl_sycl.hpp>
+#include <torch/extension.h>
+#include <ATen/xpu/XPUGeneratorImpl.h>
 
 #include "utils.h"
 

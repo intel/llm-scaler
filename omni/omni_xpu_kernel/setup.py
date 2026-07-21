@@ -454,8 +454,18 @@ class ICPXBuildExt(build_ext):
                 ] + [str(s) for s in sources]
                 cmd += linux_rpath_flags(ext.name, torch_lib, runtime_lib)
             else:
+                cmd += ["-fsycl-esimd-force-stateless-mem"]
+                # PTL-H cannot safely execute the JIT image produced for the
+                # core's plain-SYCL subgroup rowwise INT8 quantizer. Keep the
+                # established BMG core build unchanged until BMG separately
+                # validates an AOT core.
+                if BUILD_XPU_TARGET == "ptl-h":
+                    cmd += [
+                        "-fsycl-targets=spir64_gen",
+                        "-Xsycl-target-backend", f"-device {BUILD_XPU_TARGET}",
+                        "-DOMNI_XPU_CORE_AOT=1",
+                    ]
                 cmd += [
-                    "-fsycl-esimd-force-stateless-mem",
                     "-O3", "-DNDEBUG",
                     f"-D{XPU_ARCH_MACRO}=1",
                     "-fPIC", "-shared",
