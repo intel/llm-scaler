@@ -105,18 +105,20 @@ fallback call counts; guarded legacy wheels use reason `ptl_h_core_not_aot`.
 Attention routing is selected independently:
 
 ```bash
-OMNI_ATTN_BACKEND=auto   # default: cute d128 self-attn, then ESIMD, then PyTorch
+OMNI_ATTN_BACKEND=auto   # default: validated platform routes, then CUTE/ESIMD/PyTorch
 OMNI_ATTN_BACKEND=cute   # force cute where supported; otherwise PyTorch
 OMNI_ATTN_BACKEND=esimd  # force ESIMD where supported; otherwise PyTorch
 OMNI_ATTN_BACKEND=torch  # keep the original PyTorch attention path
 ```
 
-With `auto`, CUTE handles its validated B=1, unmasked, standard-scale d128
-self-attention domain. Supported d64 and cross-attention calls use ESIMD.
-Masked attention, other batch sizes or head dimensions, GQA, custom scaling,
-and any unsupported shape fall back to the original PyTorch implementation.
-Explicit `cute` and `esimd` select only that fused backend and still use the
-safe PyTorch fallback outside its supported domain.
+With `auto`, validated PTL-H/Torch 2.11 Z-Image BF16 d128 self-attention shapes
+use the original PyTorch SDPA path. CUTE handles the remaining validated B=1,
+unmasked, standard-scale d128 self-attention domain; supported d64 and
+cross-attention calls use ESIMD. Masked attention, other batch sizes or head
+dimensions, GQA, custom scaling, and any unsupported shape fall back to the
+original PyTorch implementation. Explicit `cute` and `esimd` select only that
+fused backend and still use the safe PyTorch fallback outside its supported
+domain.
 
 `OMNIXPU_MEDIAN_STRICT_INDICES=1` makes the median workaround reproduce
 `torch.median`'s exact tie-break indices (values are always bit-exact).

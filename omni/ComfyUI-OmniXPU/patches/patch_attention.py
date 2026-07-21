@@ -15,8 +15,9 @@ _esimd_fallback_reasons = {}
 # ── Attention backend selection ──────────────────────────────────────────────
 # OMNI_ATTN_BACKEND selects which attention routing policy the patched ComfyUI
 # path uses:
-#   auto   (default) — cute for its validated d128 self-attention domain, ESIMD
-#                      for supported d64/cross-attention, then PyTorch fallback.
+#   auto   (default) — use platform/workflow-tuned routes where validated, then
+#                      cute for d128 self-attention, ESIMD for supported
+#                      d64/cross-attention, and finally PyTorch fallback.
 #   cute             — CUTLASS-SYCL FMHA (omni_xpu_kernel.cute). fp32 accumulation,
 #                      so it does NOT overflow on large activations (Qwen-Image etc.)
 #                      where the ESIMD fp16-accumulator kernel can. Unsupported
@@ -29,6 +30,49 @@ _esimd_fallback_reasons = {}
 _backend = os.environ.get("OMNI_ATTN_BACKEND", "auto").lower()
 _backend_name = _backend  # for logging
 _backend_sdp = None  # callable(q_blhd, k_blhd, v_blhd) -> out_blhd
+_torch_sdpa_count = 0
+
+
+def _torch_major_minor():
+    try:
+        components = torch.__version__.split("+", 1)[0].split(".")
+        return int(components[0]), int(components[1])
+    except (AttributeError, IndexError, ValueError):
+        return None
+
+
+def _omni_xpu_target():
+    try:
+        import omni_xpu_kernel as pkg
+
+        return getattr(pkg, "__xpu_target__", None)
+    except ImportError:
+        return None
+
+
+def _use_ptl_torch_sdpa(
+    q,
+    heads,
+    dim_head,
+    q_len,
+    kv_len,
+    skip_reshape,
+    skip_output_reshape,
+):
+    """Select only workflow shapes validated on PTL-H with Torch 2.11."""
+    return (
+        _backend == "auto"
+        and _backend_name == "cute"
+        and _omni_xpu_target() == "ptl-h"
+        and _torch_major_minor() == (2, 11)
+        and q.dtype == torch.bfloat16
+        and heads == 30
+        and dim_head == 128
+        and q_len == kv_len
+        and q_len in (64, 1024, 1088)
+        and skip_reshape
+        and not skip_output_reshape
+    )
 
 
 def _default_cute_so():
@@ -74,6 +118,7 @@ def get_stats():
         "policy": _backend,
         "backend": _backend_name,
         "esimd": _esimd_call_count,
+        "torch_sdpa": _torch_sdpa_count,
         "fallback": _esimd_fallback_count,
         "reasons": dict(_esimd_fallback_reasons),
     }
@@ -133,7 +178,7 @@ def apply():
         skip_output_reshape=False,
         **kwargs,
     ):
-        global _esimd_call_count, _esimd_fallback_count
+        global _esimd_call_count, _esimd_fallback_count, _torch_sdpa_count
 
         log_debug_event(
             "dispatch",
@@ -172,6 +217,46 @@ def apply():
             q_len, kv_len = q.shape[2], k.shape[2]
         else:
             q_len, kv_len = q.shape[1], k.shape[1]
+
+        # Torch 2.11 SDPA is faster end-to-end for the measured PTL-H Z-Image
+        # D128 self-attention shapes. Keep this route narrower than the generic
+        # d128 CUTE domain: explicit `cute`, other platforms/versions, dtypes,
+        # head counts, and sequence lengths retain the existing policy.
+        if not reasons and _use_ptl_torch_sdpa(
+            q,
+            heads,
+            dim_head,
+            q_len,
+            kv_len,
+            skip_reshape,
+            skip_output_reshape,
+        ):
+            _torch_sdpa_count += 1
+            if _torch_sdpa_count <= 3:
+                log.info(
+                    "[OmniXPU] attention TORCH #%d: heads=%d seq=%d dtype=%s",
+                    _torch_sdpa_count,
+                    heads,
+                    q_len,
+                    q.dtype,
+                )
+            log_debug_event(
+                "kernel",
+                "attention",
+                {"q": q, "k": k, "v": v},
+                details={"backend": "torch", "route": "ptl_torch211_zimage"},
+            )
+            return _pytorch_fallback(
+                q,
+                k,
+                v,
+                heads,
+                mask=mask,
+                attn_precision=attn_precision,
+                skip_reshape=skip_reshape,
+                skip_output_reshape=skip_output_reshape,
+                **kwargs,
+            )
 
         # cute is currently accepted only for d128 self-attention. Auto keeps
         # d64 and cross-attention on ESIMD; explicit cute never silently changes
