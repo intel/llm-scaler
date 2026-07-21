@@ -33,6 +33,7 @@ from custom_esimd_kernels_vllm.ops import (
     esimd_gemm_int4_pgrp,
     esimd_qkv_split_norm_rope,
     esimd_qkv_split_norm_rope_v,
+    esimd_qkv_split_norm_rope_onyx,
     esimd_gdn_conv_fused,
     esimd_fused_add_rms_norm,
     esimd_norm_gemv_norm_fp16,
