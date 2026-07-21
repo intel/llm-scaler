@@ -143,9 +143,17 @@ def apply():
     global _omni_int8
 
     try:
+        import omni_xpu_kernel as _omni_package
         from omni_xpu_kernel import int8 as _candidate
     except ImportError:
         return False, "omni_xpu_kernel.int8 not available"
+
+    # The fused route starts with int8_linear_shared_input, which invokes the
+    # same native dynamic rowwise quantizer guarded by patch_int8 on PTL-H.
+    # Skipping this wrapper lets the original Lumina path reach that safe eager
+    # fallback instead of entering an uncatchable native process fault.
+    if getattr(_omni_package, "__xpu_target__", "") == "ptl-h":
+        return False, "PTL-H native dynamic rowwise INT8 quantization is guarded"
 
     required = (
         "int8_linear_shared_input",

@@ -70,6 +70,24 @@ class OmniXPUStatus:
             except Exception:
                 pass
 
+        # INT8 dispatcher stats
+        int8 = sys.modules.get(f"{_PKG}.patches.patch_int8")
+        if int8 and hasattr(int8, "get_stats"):
+            try:
+                stats = int8.get_stats()
+                if stats["native"] or stats["fallback"]:
+                    lines.append("")
+                    lines.append(
+                        "  INT8 linear calls: "
+                        f"native={stats['native']} fallback={stats['fallback']}"
+                    )
+                    for reason, count in sorted(
+                        stats["reasons"].items(), key=lambda item: -item[1]
+                    ):
+                        lines.append(f"    {reason}: {count}")
+            except Exception:
+                pass
+
         # Fused INT8 FFN routing stats
         int8_ffn = sys.modules.get(f"{_PKG}.patches.patch_int8_ffn")
         if int8_ffn and hasattr(int8_ffn, "get_stats"):

@@ -90,6 +90,13 @@ functions, offloaded weights, bias, training, transposed weights,
 full-precision overrides, and unsupported shapes retain the original ComfyUI
 forward path. Use `OMNIXPU_DEBUG_VERBOSE=1` to see the fallback reason.
 
+The current PTL-H wheel guards the native dynamic rowwise INT8 quantizer. On
+that target, `comfy_kitchen::int8_linear` uses the Comfy Kitchen eager backend
+and the fused Lumina INT8 FFN route is skipped. Prequantized oneDNN INT8 APIs
+remain available because they do not enter the guarded quantizer. BMG keeps
+the native dispatcher and fused FFN routes. The status node reports native and
+fallback call counts and the reason `ptl_h_dynamic_rowwise_quantize`.
+
 Attention routing is selected independently:
 
 ```bash
