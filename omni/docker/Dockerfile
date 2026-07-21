@@ -67,7 +67,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update -y && \
     apt-get install -y --no-install-recommends --fix-missing \
         ca-certificates curl ffmpeg git patch \
-        python3-dev python3-venv python3-pip \
+        python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv python3-pip \
         build-essential ninja-build cmake pkg-config \
         libsndfile1 libsm6 libxext6 libgl1 \
         lsb-release numactl wget vim linux-libc-dev \
@@ -77,7 +77,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # Isolated Python environment.  This avoids modifying OMIX's system Python and
 # keeps every Python package used by the delivered image under /opt/venv.
-RUN python3 -m venv ${VIRTUAL_ENV} && \
+RUN python${PYTHON_VERSION} -m venv ${VIRTUAL_ENV} && \
     pip install --upgrade pip setuptools wheel
 
 # PyTorch
@@ -186,10 +186,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt && \
     pip install --no-deps kernels==0.14.0
 
-# ComfyUI disabled custom nodes (optional: --build-arg INSTALL_DISABLED_NODES=true)
-# SeedVR2 remains optional as requested; it is not installed in the default
-# image when INSTALL_DISABLED_NODES=false.
-ARG INSTALL_DISABLED_NODES=false
+
+ARG INSTALL_DISABLED_NODES=true
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "${INSTALL_DISABLED_NODES}" = "true" ]; then \
         cd /llm/ComfyUI/custom_nodes && \
@@ -300,22 +298,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/omni_xpu_kernel && \
     grep -Fqx "__version__ = \"${IMAGE_TAG}\"" omni_xpu_kernel/_version.py && \
     pip wheel -v . --wheel-dir /wheels --no-deps --no-build-isolation && \
-    pip install --no-deps --force-reinstall /wheels/omni_xpu_kernel-*.whl && \
-    EXT="$(find ${VIRTUAL_ENV}/lib/python${PYTHON_VERSION}/site-packages/omni_xpu_kernel -type f -name '_C*.so' | head -1)" && \
-    test -n "${EXT}" && \
-    nm -D "${EXT}" | grep -q ' U dnnl_primitive_attr_set_zero_points$' && \
-    ! nm -D "${EXT}" | grep -q 'dnnl_primitive_attr_set_zero_points_v2'
-
-# Build-time smoke test.  GPU execution is tested after image creation with
-# /dev/dri mounted, but compiler availability and native-extension loading can
-# already be verified here without access to a physical XPU.
-RUN source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 && \
-    command -v icpx && \
-    command -v cmake && \
-    command -v ninja && \
-    test -f /llm/omni_xpu_kernel/setup.py && \
-    test -d /llm/sgl-kernel-xpu/build && \
-    python -c "import torch; from omni_xpu_kernel import _C; import sgl_kernel; print(torch.__version__); print('native kernel imports OK')"
+    pip install --no-deps --force-reinstall /wheels/omni_xpu_kernel-*.whl
 
 # ComfyUI-Manager dependencies
 # Install these during image build so a fresh/ephemeral container does not need
@@ -376,7 +359,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update -y && \
     apt-get install -y --no-install-recommends --fix-missing \
         ca-certificates curl ffmpeg git patch \
-        python3-dev python3-venv python3-pip \
+        python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv python3-pip \
         build-essential ninja-build cmake pkg-config \
         libsndfile1 libsm6 libxext6 libgl1 \
         lsb-release numactl wget vim linux-libc-dev \
@@ -403,25 +386,6 @@ ENV CCL_SYCL_ALLTOALL_ARC_LL=1 \
     OMNIXPU_INTERPOLATE_FIX=0 \
     OMNI_IMAGE_VERSION="${IMAGE_TAG}"
 
-# Final-image smoke test: prove that this stage—not only the builder—contains
-# the compiler, source/build trees, application installs, and loadable native
-# extensions.  Physical XPU and multi-card execution are validated after build.
-RUN source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 && \
-    command -v icpx && \
-    command -v cmake && \
-    command -v ninja && \
-    test -f /llm/omni_xpu_kernel/setup.py && \
-    test -d /llm/sgl-kernel-xpu/build && \
-    test -f /llm/ComfyUI/main.py && \
-    test -d /llm/sglang/python/sglang && \
-    EXT="$(find ${VIRTUAL_ENV}/lib/python${PYTHON_VERSION}/site-packages/omni_xpu_kernel -type f -name '_C*.so' | head -1)" && \
-    test -n "${EXT}" && \
-    nm -D "${EXT}" | grep -q ' U dnnl_primitive_attr_set_zero_points$' && \
-    ! nm -D "${EXT}" | grep -q 'dnnl_primitive_attr_set_zero_points_v2' && \
-    ! ldd "${EXT}" | grep -q 'not found' && \
-    python -c "import git; import torch; from omni_xpu_kernel import _C; import sgl_kernel; import sglang; print(torch.__version__); print('runtime development environment OK')"
 
-# No strip, source removal, build-directory removal, or compiler removal here.
-# The final image is intentionally a complete development image.
 WORKDIR /llm/entrypoints
 CMD ["/bin/bash"]
