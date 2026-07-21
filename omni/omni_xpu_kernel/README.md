@@ -531,6 +531,10 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
   existing chunk selection.
 - Same-shape Kitchen RoPE pairs share index calculation and frequency loads on
   PTL-H. Different Q/K shapes and BMG retain the established dispatch.
+- Bulk contiguous BF16 RMSNorm with hidden size 128 uses a PTL-H-specific
+  one-work-item-per-row profile that keeps the input in registers while
+  preserving the generic BS=32 reduction order. Small row counts, other hidden
+  sizes and dtypes, and BMG retain the generic work-group profile.
 - Deterministic BF16/FP16 ConvRot weight quantization with group size 64 or 256
   uses a fused radix-4 transform and rowwise quantization path on PTL-H.
   Stochastic and unsupported shapes retain the composed implementation.

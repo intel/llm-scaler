@@ -54,6 +54,25 @@ class TestRMSNormCorrectness:
         
         torch.testing.assert_close(output_esimd, output_ref, rtol=rtol, atol=atol)
 
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    @pytest.mark.parametrize("rows", [1024, 1920])
+    def test_rms_norm_h128_bf16_correctness(self, rows):
+        """Cover the PTL-H bulk-row H128 specialization and generic fallback."""
+        from omni_xpu_kernel import norm
+
+        torch.manual_seed(rows)
+        eps = 1e-5
+        input = torch.randn(rows, 128, device="xpu", dtype=torch.bfloat16)
+        weight = torch.randn(128, device="xpu", dtype=torch.bfloat16)
+
+        output_esimd = norm.rms_norm(weight, input, eps=eps)
+        output_ref = torch.nn.functional.rms_norm(
+            input.float(), (128,), weight.float(), eps=eps
+        ).to(torch.bfloat16)
+
+        assert torch.isfinite(output_esimd).all()
+        torch.testing.assert_close(output_esimd, output_ref, rtol=1e-2, atol=1e-2)
+
 
 class TestLayerNormCorrectness:
     """Correctness tests for LayerNorm kernel."""
