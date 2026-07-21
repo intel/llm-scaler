@@ -306,7 +306,12 @@ fp16 stochastic_output(fp16 value) {
 }
 #endif
 
-template<int ExponentBits, int MantissaBits, int ExponentBias>
+template<
+    typename InputT,
+    bool FuseInputConversion,
+    int ExponentBits,
+    int MantissaBits,
+    int ExponentBias>
 torch::Tensor stochastic_rounding_fused(
     const torch::Tensor& input,
     const torch::Tensor& rng,
@@ -316,7 +321,14 @@ torch::Tensor stochastic_rounding_fused(
     // old path expressed every operation as an individual ATen kernel; doing
     // the same arithmetic in one SYCL kernel avoids materializing all of those
     // intermediate tensors.
-    auto x = input.to(torch::kHalf);
+    torch::Tensor converted;
+    const InputT* input_ptr;
+    if constexpr (FuseInputConversion) {
+        input_ptr = reinterpret_cast<const InputT*>(input.data_ptr());
+    } else {
+        converted = input.to(torch::kHalf);
+        input_ptr = reinterpret_cast<const InputT*>(converted.data_ptr());
+    }
 #if defined(OMNI_XPU_ARCH_PTL_H)
     // The stochastic result is already exactly representable in the selected
     // FP8 format. Encode it directly on PTL-H to avoid a temporary FP16 tensor
@@ -325,10 +337,10 @@ torch::Tensor stochastic_rounding_fused(
     auto output = torch::empty(input.sizes(), input.options().dtype(out_dtype));
     using OutputT = uint8_t;
 #else
-    auto rounded = torch::empty_like(x);
+    auto rounded = torch::empty_like(converted);
     using OutputT = fp16;
 #endif
-    const int64_t numel = x.numel();
+    const int64_t numel = input.numel();
     if (numel == 0) {
 #if defined(OMNI_XPU_ARCH_PTL_H)
         return output;
@@ -337,7 +349,6 @@ torch::Tensor stochastic_rounding_fused(
 #endif
     }
 
-    const auto* x_ptr = reinterpret_cast<const fp16*>(x.data_ptr<at::Half>());
     const auto* rng_ptr = rng.data_ptr<uint8_t>();
 #if defined(OMNI_XPU_ARCH_PTL_H)
     auto* out_ptr = reinterpret_cast<OutputT*>(output.data_ptr());
@@ -362,7 +373,9 @@ torch::Tensor stochastic_rounding_fused(
                 const int64_t index = first + lane;
                 if (index >= numel) break;
 
-                const fp16 value = x_ptr[index];
+                // With FuseInputConversion, match input.to(float16) inside
+                // this kernel instead of materializing an FP16 tensor.
+                const fp16 value = static_cast<fp16>(input_ptr[index]);
                 const uint16_t value_bits = sycl::bit_cast<uint16_t>(value);
                 const uint16_t abs_bits = value_bits & uint16_t(0x7fff);
                 if (abs_bits == 0) {
@@ -531,15 +544,34 @@ torch::Tensor stochastic_rounding(
     TORCH_CHECK(rng.scalar_type() == torch::kUInt8, "rng must be uint8");
     TORCH_CHECK(rng.sizes() == input.sizes(), "rng shape must match input");
 
-    if (out_dtype == torch::kFloat8_e4m3fn) {
-        return stochastic_rounding_fused<4, 3, 7>(
-            input, rng, out_dtype, fp8_max(out_dtype));
-    } else if (out_dtype == torch::kFloat8_e5m2) {
-        return stochastic_rounding_fused<5, 2, 15>(
-            input, rng, out_dtype, fp8_max(out_dtype));
-    } else {
-        TORCH_CHECK(false, "output dtype must be float8_e4m3fn or float8_e5m2");
+    const double limit = fp8_max(out_dtype);
+#define DISPATCH_STOCHASTIC(InputT)                                      \
+    if (out_dtype == torch::kFloat8_e4m3fn) {                            \
+        return stochastic_rounding_fused<InputT, true, 4, 3, 7>(         \
+            input, rng, out_dtype, limit);                               \
+    }                                                                    \
+    return stochastic_rounding_fused<InputT, true, 5, 2, 15>(            \
+        input, rng, out_dtype, limit)
+#if defined(OMNI_XPU_ARCH_PTL_H)
+    if (input.scalar_type() == torch::kFloat) {
+        DISPATCH_STOCHASTIC(float);
     }
+    if (input.scalar_type() == torch::kBFloat16) {
+        DISPATCH_STOCHASTIC(bf16);
+    }
+    if (input.scalar_type() == torch::kHalf) {
+        DISPATCH_STOCHASTIC(fp16);
+    }
+#endif
+    // BMG and uncommon PTL-H input dtypes retain the established
+    // materialized-FP16 input path.
+    if (out_dtype == torch::kFloat8_e4m3fn) {
+        return stochastic_rounding_fused<fp16, false, 4, 3, 7>(
+            input, rng, out_dtype, limit);
+    }
+    return stochastic_rounding_fused<fp16, false, 5, 2, 15>(
+        input, rng, out_dtype, limit);
+#undef DISPATCH_STOCHASTIC
 }
 
 }  // namespace fp8

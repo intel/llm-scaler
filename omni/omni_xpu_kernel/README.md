@@ -519,8 +519,9 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
   uses a fused radix-4 transform and rowwise quantization path on PTL-H.
   Stochastic and unsupported shapes retain the composed implementation.
 - BF16 per-tensor FP8 quantization and stochastic FP8 rounding encode the final
-  FP8 bytes directly on PTL-H. Other input types and BMG retain the validated
-  PyTorch cast path.
+  FP8 bytes directly on PTL-H; stochastic rounding also folds supported input
+  conversion into that kernel. Other quantization input types and BMG retain
+  the validated PyTorch cast path.
 
 The PTL-H configuration validated on 2026-07-20 was:
 
