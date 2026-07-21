@@ -24,6 +24,19 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 namespace omni_xpu {
 namespace int8_ops {
 
+#ifndef OMNI_SILU_MUL_ELEMENTS_PER_WI
+#if defined(OMNI_XPU_ARCH_PTL_H)
+// PTL-H's math pipeline benefits from exposing each exp as an independent
+// work-item instead of serializing several transcendental operations.
+#define OMNI_SILU_MUL_ELEMENTS_PER_WI 1
+#elif defined(OMNI_XPU_ARCH_BMG)
+// Preserve the measured BMG launch geometry until it is tuned independently.
+#define OMNI_SILU_MUL_ELEMENTS_PER_WI 8
+#else
+#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
+#endif
+#endif
+
 // ============================================================================
 // Kernel: Fused per-row INT8 quantization
 // ============================================================================
@@ -185,7 +198,7 @@ void fused_silu_mul_kernel(
     const at::Device& device
 ) {
     constexpr int WG = 256;
-    constexpr int VEC = 8;
+    constexpr int VEC = OMNI_SILU_MUL_ELEMENTS_PER_WI;
     const int64_t work_items = (numel + VEC - 1) / VEC;
     const int64_t global_items = ((work_items + WG - 1) / WG) * WG;
 
