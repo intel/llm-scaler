@@ -168,6 +168,85 @@ void dequantize_svdq_w4_kernel(
     utils::submit_kernel(cgf, device, "dequantize_svdq_w4");
 }
 
+#if defined(OMNI_XPU_ARCH_PTL_H)
+// The PTL signed path benefits from expressing sign extension and low/high
+// interleave as ESIMD vector regions. Keep this as a distinct kernel type:
+// its register footprint limits the work-group to 32, while the original
+// unsigned path above remains faster at WG64.
+template<
+    typename OT,
+    int GroupsPerWorkItem = OMNI_SVDQ_DEQUANT_GROUPS_PER_WI>
+void dequantize_svdq_w4_signed_ptl_kernel(
+    const uint8_t* __restrict__ packed,
+    const OT* __restrict__ scales,
+    OT* __restrict__ output,
+    const int64_t N,
+    const int64_t K,
+    const int64_t num_groups,
+    const at::Device& device) {
+    const int64_t group_chunks =
+        (num_groups + GroupsPerWorkItem - 1) / GroupsPerWorkItem;
+    const int64_t total_items = N * group_chunks;
+    constexpr int WG_SIZE = 32;
+    const int64_t padded_size =
+        (total_items + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
+
+    auto cgf = [&](sycl::handler& handle) {
+        handle.parallel_for(
+            sycl::nd_range<1>(
+                sycl::range<1>(padded_size), sycl::range<1>(WG_SIZE)),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                const int64_t gid = item.get_global_id(0);
+                if (gid >= total_items) return;
+
+                const int64_t row = gid / group_chunks;
+                const int64_t first_grp =
+                    (gid % group_chunks) * GroupsPerWorkItem;
+                for (int local_grp = 0; local_grp < GroupsPerWorkItem;
+                     ++local_grp) {
+                    const int64_t grp = first_grp + local_grp;
+                    if (grp >= num_groups) break;
+                    const float scale_f =
+                        static_cast<float>(scales[grp * N + row]);
+                    const uint8_t* src =
+                        packed + row * (K / 2) + grp * HALF_GROUP;
+                    OT* dst = output + row * K + grp * SVDQ_GROUP_SIZE;
+
+#pragma unroll
+                    for (int chunk = 0; chunk < 2; ++chunk) {
+                        simd<uint8_t, 16> bytes =
+                            block_load<uint8_t, 16>(src + chunk * 16);
+                        simd<int16_t, 16> low_s = bytes & uint8_t(0x0F);
+                        simd<int16_t, 16> high_s =
+                            (bytes >> 4) & uint8_t(0x0F);
+                        low_s.merge(low_s - 16, low_s >= 8);
+                        high_s.merge(high_s - 16, high_s >= 8);
+
+                        simd<float, 32> interleaved;
+                        interleaved.template select<16, 2>(0) = low_s;
+                        interleaved.template select<16, 2>(1) = high_s;
+                        interleaved *= scale_f;
+
+                        OT* out_ptr = dst + chunk * 32;
+                        if constexpr (std::is_same_v<OT, float>) {
+                            block_store<float, 32>(out_ptr, interleaved);
+                        } else if constexpr (std::is_same_v<OT, bf16>) {
+                            simd<bf16, 32> result = interleaved;
+                            block_store<bf16, 32>(
+                                reinterpret_cast<bf16*>(out_ptr), result);
+                        } else if constexpr (std::is_same_v<OT, fp16>) {
+                            simd<fp16, 32> result = interleaved;
+                            block_store<fp16, 32>(
+                                reinterpret_cast<fp16*>(out_ptr), result);
+                        }
+                    }
+                }
+            });
+    };
+    utils::submit_kernel(cgf, device, "dequantize_svdq_w4_signed_ptl");
+}
+#endif
+
 // ============================================================================
 // Kernel 2: unpack_svdq_int4
 // ============================================================================
@@ -491,15 +570,27 @@ torch::Tensor dequantize_svdq_w4(
     const uint8_t* packed_ptr = packed.data_ptr<uint8_t>();
 
     if (out_dtype == torch::kFloat32) {
+#if defined(OMNI_XPU_ARCH_PTL_H)
+        dequantize_svdq_w4_signed_ptl_kernel<float>(
+#else
         dequantize_svdq_w4_kernel<float>(
+#endif
             packed_ptr, scales_cast.data_ptr<float>(),
             output.data_ptr<float>(), N, K, num_groups, packed.device());
     } else if (out_dtype == torch::kBFloat16) {
+#if defined(OMNI_XPU_ARCH_PTL_H)
+        dequantize_svdq_w4_signed_ptl_kernel<bf16>(
+#else
         dequantize_svdq_w4_kernel<bf16>(
+#endif
             packed_ptr, reinterpret_cast<const bf16*>(scales_cast.data_ptr()),
             reinterpret_cast<bf16*>(output.data_ptr()), N, K, num_groups, packed.device());
     } else if (out_dtype == torch::kFloat16) {
+#if defined(OMNI_XPU_ARCH_PTL_H)
+        dequantize_svdq_w4_signed_ptl_kernel<fp16>(
+#else
         dequantize_svdq_w4_kernel<fp16>(
+#endif
             packed_ptr, reinterpret_cast<const fp16*>(scales_cast.data_ptr()),
             reinterpret_cast<fp16*>(output.data_ptr()), N, K, num_groups, packed.device());
     } else {
