@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 from torch import Tensor
@@ -9,12 +10,48 @@ log = logging.getLogger("ComfyUI-OmniXPU")
 
 _omni_rotary = None
 _logged_first = False
+_logged_zimage_pair = 0
+_allow_ptl_zimage_pair = False
 
 
 def _can_use(x):
     if _omni_rotary is None or not x.is_xpu:
         return False
     return x.shape[-1] in (64, 128)
+
+
+def _torch_major_minor():
+    try:
+        components = torch.__version__.split("+", 1)[0].split(".")
+        return int(components[0]), int(components[1])
+    except (AttributeError, IndexError, ValueError):
+        return None
+
+
+def _use_ptl_zimage_pair(xq: Tensor, xk: Tensor, freqs_cis: Tensor):
+    """Select the exact Z-Image pair route validated on PTL-H/Torch 2.11."""
+    return (
+        _allow_ptl_zimage_pair
+        and hasattr(_omni_rotary, "apply_kitchen_rope")
+        and xq.is_xpu
+        and xk.is_xpu
+        and freqs_cis.is_xpu
+        and xq.device == xk.device == freqs_cis.device
+        and xq.dtype == xk.dtype == torch.bfloat16
+        and freqs_cis.dtype == torch.float32
+        and xq.ndim == 4
+        and xk.ndim == 4
+        and freqs_cis.ndim == 6
+        and xq.is_contiguous()
+        and xk.is_contiguous()
+        and freqs_cis.is_contiguous()
+        and xq.shape == xk.shape
+        and xq.shape[0] == 1
+        and xq.shape[1] in (64, 1024, 1088)
+        and xq.shape[2:] == (30, 128)
+        and freqs_cis.shape == (1, xq.shape[1], 1, 64, 2, 2)
+        and _torch_major_minor() == (2, 11)
+    )
 
 
 def _omni_apply_rope1(x: Tensor, freqs_cis: Tensor):
@@ -49,12 +86,21 @@ def _omni_apply_rope1(x: Tensor, freqs_cis: Tensor):
 
 
 def apply():
-    global _omni_rotary
+    global _allow_ptl_zimage_pair, _omni_rotary
     import sys
     probe = sys.modules.get("ComfyUI-OmniXPU.probe")
     if probe.rotary is None:
         return False, "omni_xpu_kernel rotary not available"
     _omni_rotary = probe.rotary
+    try:
+        import omni_xpu_kernel as _omni_package
+
+        _allow_ptl_zimage_pair = (
+            getattr(_omni_package, "__xpu_target__", "") == "ptl-h"
+            and os.environ.get("OMNIXPU_ZIMAGE_ROPE_PAIR", "1") != "0"
+        )
+    except ImportError:
+        _allow_ptl_zimage_pair = False
 
     import comfy.ldm.flux.math as flux_math
 
@@ -141,6 +187,25 @@ def apply():
             verbose_only=True,
         )
         def _patched_apply_rope(xq, xk, freqs_cis):
+            global _logged_zimage_pair
+            if _use_ptl_zimage_pair(xq, xk, freqs_cis):
+                _logged_zimage_pair += 1
+                if _logged_zimage_pair <= 3:
+                    log.info(
+                        "[OmniXPU] rope Kitchen pair #%d: seq=%d heads=%d "
+                        "dtype=%s",
+                        _logged_zimage_pair,
+                        xq.shape[1],
+                        xq.shape[2],
+                        xq.dtype,
+                    )
+                log_debug_event(
+                    "kernel",
+                    "rotary_emb",
+                    {"q": xq, "k": xk, "freqs": freqs_cis},
+                    details={"backend": "kitchen_pair", "route": "ptl_zimage"},
+                )
+                return _omni_rotary.apply_kitchen_rope(xq, xk, freqs_cis)
             if (_can_use(xq) and _can_use(xk) and xq.ndim == 4 and xk.ndim == 4
                     and freqs_cis.ndim == 6):
                 return _omni_apply_rope1(xq, freqs_cis), _omni_apply_rope1(xk, freqs_cis)

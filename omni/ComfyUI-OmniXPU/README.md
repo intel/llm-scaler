@@ -15,7 +15,7 @@ Requires `omni_xpu_kernel` installed. Without it the node loads silently with no
 | Patch | Target |
 |-------|--------|
 | Auto-routed cute/ESIMD Attention | `optimized_attention` |
-| ESIMD RoPE | `_apply_rope1` / `apply_rope1` / `apply_rope` (flux.math dual-tensor) |
+| ESIMD / Kitchen pair RoPE | `_apply_rope1` / `apply_rope1` / `apply_rope` (flux.math dual-tensor) |
 | ESIMD LayerNorm/RMSNorm | `LayerNorm.forward` / `RMSNorm.forward` / `rms_norm()` |
 | FP8 GEMM | `fp8_linear` / `mixed_precision_ops` |
 | INT8 Linear | `comfy_kitchen::int8_linear` (oneDNN s8 GEMM) |
@@ -31,7 +31,8 @@ All patches enabled by default. Disable with `=0`:
 ```bash
 OMNIXPU_ENABLE=0            # Master switch — disable everything
 OMNIXPU_ATTENTION=0         # Disable the XPU attention patch only
-OMNIXPU_ROPE=0              # Disable ESIMD RoPE only
+OMNIXPU_ROPE=0              # Disable all Omni XPU RoPE routes
+OMNIXPU_ZIMAGE_ROPE_PAIR=0  # Disable the PTL-H Z-Image Q/K pair route
 OMNIXPU_NORM=0              # Disable ESIMD LayerNorm/RMSNorm only
 OMNIXPU_NONCONTIG_RMSNORM=0 # Disable the PTL-H split-QKV RMSNorm route
 OMNIXPU_KREA2_RMSNORM=0     # Disable the Krea2-specific local RMSNorm hook only
@@ -46,6 +47,14 @@ OMNIXPU_MEDIAN_FIX=0        # Disable median workaround only
 On PTL-H, eligible Lumina/Z-Image split-QKV views are materialized once and
 then use the ESIMD RMSNorm kernel. Setting `OMNIXPU_NONCONTIG_RMSNORM=0`
 leaves these views on the original Torch path.
+
+PTL-H/Torch 2.11 Z-Image BF16 Q/K pairs with the validated 30-head, D128
+layouts use the native Kitchen pair-RoPE kernel. It preserves the adjacent-pair
+`addcmul` rounding semantics while avoiding separate FP32 cast, multiply,
+addcmul, and cast-back launches for Q and K. Other platforms, Torch minor
+versions, dtypes, layouts, head counts, and sequence lengths retain the prior
+route. Set `OMNIXPU_ZIMAGE_ROPE_PAIR=0` before startup to disable only this
+route.
 
 Set `OMNIXPU_DEBUG=1` before starting ComfyUI to log the XPU kernels that are
 actually selected. Wrapper calls that fall back to another implementation are
