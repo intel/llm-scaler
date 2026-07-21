@@ -15,6 +15,7 @@
 #include "esimd_kernels/norm_add_norm.h"
 #include "esimd_kernels/accum_norm_add_norm.h"
 #include "esimd_kernels/qkv_split_norm_rope.h"
+#include "esimd_kernels/qkv_split_norm_rope_onyx.h"
 #include "esimd_kernels/norm_gemv_fused.h"
 #include "esimd_kernels/fused_add_rms_norm.h"
 #include "esimd_kernels/resadd_norm_gemv_fused.h"
@@ -266,6 +267,38 @@ at::Tensor esimd_qkv_split_norm_rope_v(
         ntoks, hiddenDim,
         (uint32_t)q_heads, (uint32_t)kv_heads,
         attn_output_gate, (uint32_t)rotary_dim, dpcpp_queue);
+    return q_out;
+}
+
+// Onyx-specific fused Q/K split + parameterless RMSNorm + q_scale + interleaved-pair RoPE.
+// Fixed head_dim=128, is_neox_style=False, no output_gate head, no V-Norm.
+at::Tensor esimd_qkv_split_norm_rope_onyx(
+    at::Tensor qkv_state,
+    at::Tensor q_out,
+    at::Tensor k_out,
+    at::Tensor v_out,
+    at::Tensor positions,
+    int64_t q_heads,
+    int64_t kv_heads,
+    double q_scale,
+    at::Tensor cos_sin_cache) {
+
+    EXTRACT_PTR(p_qkv, qkv_state);
+    EXTRACT_PTR(p_q, q_out);
+    EXTRACT_PTR(p_k, k_out);
+    EXTRACT_PTR(p_v, v_out);
+    auto p_pos = reinterpret_cast<uint32_t*>(positions.data_ptr());
+    auto p_cs = reinterpret_cast<sycl::half*>(cos_sin_cache.data_ptr());
+
+    uint32_t ntoks = qkv_state.size(0);
+    uint32_t hiddenDim = qkv_state.size(1);
+
+    auto& dpcpp_queue = get_device_queue(qkv_state);
+    qkv_split_norm_rope_onyx_host(
+        p_qkv, p_q, p_k, p_v, p_pos, p_cs,
+        ntoks, hiddenDim,
+        (uint32_t)q_heads, (uint32_t)kv_heads,
+        (float)q_scale, dpcpp_queue);
     return q_out;
 }
 
