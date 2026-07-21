@@ -522,6 +522,8 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
   FP8 bytes directly on PTL-H; stochastic rounding also folds supported input
   conversion into that kernel. Other quantization input types and BMG retain
   the validated PyTorch cast path.
+- Batched GGUF dequantization dispatches each input allocation directly on
+  PTL-H to avoid packed-input concatenation. BMG retains grouped concatenation.
 
 The PTL-H configuration validated on 2026-07-20 was:
 

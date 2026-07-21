@@ -127,6 +127,32 @@ class TestGGUFDequantCorrectness:
             output = gguf.dequantize_q4_0(q4_0_data, dtype)
             assert output.dtype == dtype
 
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_dequantize_batch_matches_individual_dispatch(self, dtype):
+        from omni_xpu_kernel import gguf
+
+        formats = ["q4_0", "q4_0", "q8_0", "q4_k", "q6_k"]
+        block_sizes = [18, 18, 34, 144, 210]
+        inputs = [
+            torch.randint(
+                0, 256, (block_size * 37,), device="xpu", dtype=torch.uint8
+            )
+            for block_size in block_sizes
+        ]
+        expected = [
+            getattr(gguf, f"dequantize_{format_name}")(tensor, dtype)
+            for tensor, format_name in zip(inputs, formats)
+        ]
+        actual = gguf.dequantize_batch(inputs, formats, dtype)
+
+        assert len(actual) == len(expected)
+        for batch_output, individual_output in zip(actual, expected):
+            assert torch.equal(
+                batch_output.view(torch.uint8),
+                individual_output.view(torch.uint8),
+            )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

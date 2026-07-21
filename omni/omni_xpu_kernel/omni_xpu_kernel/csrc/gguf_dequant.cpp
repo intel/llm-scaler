@@ -467,6 +467,32 @@ std::vector<torch::Tensor> dequantize_batch(
         "inputs and formats must have the same length");
     TORCH_CHECK(!inputs.empty(), "inputs must not be empty");
 
+#if defined(OMNI_XPU_ARCH_PTL_H)
+    // PTL-H launch overhead is lower than the GPU-side concat cost, including
+    // for small tensors. Dispatch each original allocation directly so batch
+    // dequantization does not add a full read+write of the packed inputs.
+    std::vector<torch::Tensor> direct_outputs(inputs.size());
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        TORCH_CHECK(inputs[i].is_contiguous(),
+            "Input tensor ", i, " must be contiguous");
+        TORCH_CHECK(inputs[i].scalar_type() == torch::kByte,
+            "Input ", i, " must be uint8");
+        const auto& fmt = formats[i];
+        if (fmt == "q4_0") {
+            direct_outputs[i] = dequantize_q4_0(inputs[i], dtype);
+        } else if (fmt == "q8_0") {
+            direct_outputs[i] = dequantize_q8_0(inputs[i], dtype);
+        } else if (fmt == "q4_k") {
+            direct_outputs[i] = dequantize_q4_k(inputs[i], dtype);
+        } else if (fmt == "q6_k") {
+            direct_outputs[i] = dequantize_q6_k(inputs[i], dtype);
+        } else {
+            TORCH_CHECK(false, "Unsupported format: ", fmt);
+        }
+    }
+    return direct_outputs;
+#endif
+
     struct FormatGroup {
         std::vector<size_t> indices;
         std::vector<torch::Tensor> tensors;

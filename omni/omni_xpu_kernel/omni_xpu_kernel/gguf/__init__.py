@@ -97,11 +97,11 @@ def dequantize_batch(
     inputs: list, formats: list, dtype: torch.dtype = torch.float16
 ) -> list:
     """
-    Batch dequantize multiple tensors with fewer kernel launches.
+    Batch dequantize multiple tensors with platform-selected dispatch.
 
-    Groups tensors by format, concatenates data, launches one kernel per
-    format type, then splits outputs back. For N tensors of the same format,
-    this reduces N kernel submissions to 1.
+    BMG groups tensors by format and uses one concatenated launch per format.
+    PTL-H launches directly from each original allocation because avoiding the
+    packed-input concatenation is faster on that platform.
 
     Args:
         inputs: List of uint8 tensors (quantized data on XPU)
