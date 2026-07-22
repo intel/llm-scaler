@@ -53,6 +53,7 @@ def apply_all_patches(cfg):
     apply_attention = _load_patch("patch_attention")
     apply_int8 = _load_patch("patch_int8")
     apply_int8_ffn = _load_patch("patch_int8_ffn")
+    apply_zimage_rms_gate = _load_patch("patch_zimage_rms_gate")
 
     _apply_one("interpolate_fix", cfg.interpolate_fix, apply_interpolate)
     _apply_one("median_fix", cfg.median_fix, apply_median)
@@ -63,6 +64,9 @@ def apply_all_patches(cfg):
     _apply_one("attention", cfg.attention, apply_attention)
     _apply_one("int8", cfg.int8, apply_int8)
     _apply_one("int8_ffn", cfg.int8_ffn, apply_int8_ffn)
+    _apply_one(
+        "zimage_rms_gate", cfg.zimage_rms_gate, apply_zimage_rms_gate
+    )
 
 
 def _apply_one(name, enabled, apply_fn):

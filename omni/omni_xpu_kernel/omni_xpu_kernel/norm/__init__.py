@@ -50,6 +50,30 @@ def rms_norm(
     return _get_native().rms_norm(weight, input, eps)
 
 
+def rms_norm_gate_residual(
+    weight: torch.Tensor,
+    input: torch.Tensor,
+    gate: torch.Tensor,
+    residual: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Fuse the validated PTL-H Z-Image RMSNorm/gate/residual chain.
+
+    Equivalent to ``residual + gate * rms_norm(weight, input, eps)`` with
+    BF16 materialization after RMSNorm and after the gate multiply. The native
+    route accepts contiguous BF16 ``input``/``residual`` tensors shaped
+    ``[M, 3840]`` for M=64, 1024, or 1088, plus 1D weight/gate tensors.
+    """
+    native = _get_native()
+    if not hasattr(native, "rms_norm_gate_residual"):
+        raise RuntimeError(
+            "rms_norm_gate_residual is only available in a PTL-H native build"
+        )
+    return native.rms_norm_gate_residual(
+        weight, input, gate, residual, eps
+    )
+
+
 def layer_norm(
     input: torch.Tensor,
     weight: Optional[torch.Tensor] = None,
@@ -146,6 +170,7 @@ def fused_adaln(
 
 __all__ = [
     "rms_norm",
+    "rms_norm_gate_residual",
     "layer_norm",
     "fused_add_rms_norm",
     "fused_rms_norm_linear",

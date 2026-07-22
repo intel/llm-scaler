@@ -73,6 +73,41 @@ class TestRMSNormCorrectness:
         assert torch.isfinite(output_esimd).all()
         torch.testing.assert_close(output_esimd, output_ref, rtol=1e-2, atol=1e-2)
 
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    @pytest.mark.parametrize("rows", [64, 1024, 1088])
+    def test_rms_norm_gate_residual_h3840_bf16(self, rows):
+        """Validate the PTL-H Z-Image fused modulation boundary."""
+        from omni_xpu_kernel import norm
+
+        native = norm._get_native()
+        if not hasattr(native, "rms_norm_gate_residual"):
+            pytest.skip("PTL-H fused RMS/gate kernel is not in this build")
+
+        torch.manual_seed(3840 + rows)
+        value = torch.randn(
+            rows, 3840, device="xpu", dtype=torch.bfloat16
+        )
+        weight = torch.randn(3840, device="xpu", dtype=torch.bfloat16)
+        gate = torch.randn(3840, device="xpu", dtype=torch.bfloat16).tanh()
+        residual = torch.randn(
+            rows, 3840, device="xpu", dtype=torch.bfloat16
+        )
+
+        normalized = norm.rms_norm(weight, value, eps=1e-5)
+        expected = residual + gate.reshape(1, 3840) * normalized
+        actual = norm.rms_norm_gate_residual(
+            weight, value, gate, residual, eps=1e-5
+        )
+
+        difference = (actual.float() - expected.float()).abs()
+        mismatches = int((actual != expected).sum().item())
+        assert torch.isfinite(actual).all()
+        # A separately compiled fused reduction can move a very small number
+        # of BF16 values by one representable step. Bound both incidence and
+        # magnitude rather than hiding it behind a broad relative tolerance.
+        assert mismatches <= max(4, actual.numel() // 200_000)
+        assert float(difference.max().item()) <= 0.0625
+
 
 class TestLayerNormCorrectness:
     """Correctness tests for LayerNorm kernel."""

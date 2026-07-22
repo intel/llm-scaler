@@ -140,6 +140,11 @@ output = norm.rms_norm(weight, input, eps=1e-6)
 output = norm.layer_norm(input, weight=weight, bias=None, eps=1e-5)
 norm.fused_add_rms_norm(input, residual, weight, eps=1e-6)  # in-place
 
+# PTL-H Z-Image BF16 [M, 3840], M in {64, 1024, 1088}
+output = norm.rms_norm_gate_residual(
+    weight, input, gate, residual, eps=1e-6
+)
+
 # Fused RMSNorm + Linear projection (chains in C++, keeps data in L3 cache)
 output = norm.fused_rms_norm_linear(input, norm_weight, proj_weight, eps=1e-6)
 
@@ -485,9 +490,11 @@ undefined symbol: dnnl_primitive_attr_set_zero_points_v2
 ```
 
 The build validates the header and runtime versions, passes the selected
-`libdnnl` file directly to the linker, and keeps that include directory before
-`torch/include`. It also removes only duplicate oneDNN entries injected through
-`CPATH`, `C_INCLUDE_PATH`, or `CPLUS_INCLUDE_PATH`.
+`libdnnl` file directly to the linker, and uses quoted oneDNN includes plus
+`-iquote` to keep that header tree authoritative before `torch/include`.
+This also handles Debian system Python, where `sys.prefix` is `/usr` but pip's
+installation scheme uses `/usr/local`. Duplicate oneDNN entries injected through
+`CPATH`, `C_INCLUDE_PATH`, or `CPLUS_INCLUDE_PATH` are removed selectively.
 
 The three native extensions use `$ORIGIN`-relative ELF search paths to the
 active Python prefix instead of embedding the build venv or `/opt/intel` path.
@@ -535,6 +542,10 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
   one-work-item-per-row profile that keeps the input in registers while
   preserving the generic BS=32 reduction order. Small row counts, other hidden
   sizes and dtypes, and BMG retain the generic work-group profile.
+- The validated Z-Image BF16 H3840 second-normalization boundary on PTL-H can
+  fuse RMSNorm, gate multiplication, and residual addition while preserving the
+  BF16 materialization between operations. Other shapes, dtypes, and platforms
+  do not expose this native entry point.
 - Deterministic BF16/FP16 ConvRot weight quantization with group size 64 or 256
   uses a fused radix-4 transform and rowwise quantization path on PTL-H.
   Stochastic and unsupported shapes retain the composed implementation.

@@ -25,6 +25,11 @@ namespace gguf {
 }
 namespace norm {
     torch::Tensor rms_norm(torch::Tensor weight, torch::Tensor input, double eps);
+#if defined(OMNI_XPU_ARCH_PTL_H)
+    torch::Tensor rms_norm_gate_residual(
+        torch::Tensor weight, torch::Tensor input, torch::Tensor gate,
+        torch::Tensor residual, double eps);
+#endif
     torch::Tensor layer_norm(torch::Tensor input, std::optional<torch::Tensor> weight, std::optional<torch::Tensor> bias, double eps);
     void fused_add_rms_norm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
     torch::Tensor fused_rms_norm_linear(torch::Tensor input, torch::Tensor norm_weight, torch::Tensor proj_weight, double eps);
@@ -149,6 +154,15 @@ PYBIND11_MODULE(_C, m) {
     norm.def("rms_norm", &omni_xpu::norm::rms_norm,
         "RMSNorm using ESIMD optimization",
         py::arg("weight"), py::arg("input"), py::arg("eps") = 1e-6);
+
+#if defined(OMNI_XPU_ARCH_PTL_H)
+    norm.def(
+        "rms_norm_gate_residual",
+        &omni_xpu::norm::rms_norm_gate_residual,
+        "PTL-H fused Z-Image RMSNorm, BF16 gate multiply, and residual add",
+        py::arg("weight"), py::arg("input"), py::arg("gate"),
+        py::arg("residual"), py::arg("eps") = 1e-6);
+#endif
     
     norm.def("layer_norm", &omni_xpu::norm::layer_norm,
         "LayerNorm using ESIMD optimization",

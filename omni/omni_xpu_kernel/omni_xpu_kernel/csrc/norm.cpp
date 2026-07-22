@@ -37,6 +37,23 @@ struct RmsNormH128PTLConfig {
 
 class RmsNormH128PTLKernel;
 
+// Z-Image applies a second RMSNorm immediately before a BF16 gate multiply
+// and BF16 residual add. At its H3840 workflow shapes, keeping all three
+// operations in one kernel removes two materialized intermediates while
+// preserving the two reduced-precision boundaries explicitly.
+struct RmsNormGateResidualH3840PTLConfig {
+    static constexpr int HiddenSize = 3840;
+    static constexpr int BlockSize = 64;
+    static constexpr int GroupSize = 32;
+    static constexpr int Blocks = HiddenSize / BlockSize;
+    static constexpr int InputBytes = HiddenSize * sizeof(bf16);
+    static constexpr int PartialBytes =
+        ((GroupSize * static_cast<int>(sizeof(float)) + 15) / 16) * 16;
+    static constexpr int SlmBytes = InputBytes + PartialBytes;
+};
+
+class RmsNormGateResidualH3840PTLKernel;
+
 void rms_norm_h128_ptl_kernel(
     const void* weight_ptr,
     const void* input_ptr,
@@ -105,6 +122,102 @@ void rms_norm_h128_ptl_kernel(
             });
     };
     utils::submit_kernel(cgf, device, "rms_norm_h128_ptl");
+}
+
+void rms_norm_gate_residual_h3840_ptl_kernel(
+    const bf16* weight,
+    const bf16* input,
+    const bf16* gate,
+    const bf16* residual,
+    bf16* output,
+    float eps,
+    int64_t rows,
+    const at::Device& device
+) {
+    using Config = RmsNormGateResidualH3840PTLConfig;
+    constexpr int SubBlocks = Config::Blocks / Config::GroupSize;
+    constexpr int RemainderBlocks = Config::Blocks % Config::GroupSize;
+
+    auto cgf = [&](sycl::handler& handle) {
+        handle.parallel_for<RmsNormGateResidualH3840PTLKernel>(
+            sycl::nd_range<2>(
+                sycl::range<2>(rows, Config::GroupSize),
+                sycl::range<2>(1, Config::GroupSize)),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                slm_init<Config::SlmBytes>();
+                const int64_t row = item.get_global_id(0);
+                const int tid = item.get_local_id(1);
+                const bf16* input_row =
+                    input + row * Config::HiddenSize;
+                const bf16* residual_row =
+                    residual + row * Config::HiddenSize;
+                bf16* output_row = output + row * Config::HiddenSize;
+                const int start_block =
+                    SubBlocks * tid +
+                    (tid < RemainderBlocks ? tid : RemainderBlocks);
+                const int end_block =
+                    start_block + SubBlocks + (tid < RemainderBlocks);
+
+                simd<float, Config::BlockSize> accumulator = 0;
+                for (int block = start_block; block < end_block; ++block) {
+                    simd<bf16, Config::BlockSize> values =
+                        block_load<bf16, Config::BlockSize>(
+                            input_row + block * Config::BlockSize);
+                    slm_block_store<bf16, Config::BlockSize>(
+                        block * Config::BlockSize * sizeof(bf16), values);
+                    simd<float, Config::BlockSize> values_f32 = values;
+                    accumulator += values_f32 * values_f32;
+                }
+                const float partial =
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::BlockSize>(accumulator) /
+                    static_cast<float>(Config::HiddenSize);
+                slm_block_store<float, 1>(
+                    Config::InputBytes + tid * sizeof(float), partial);
+                barrier();
+
+                simd<float, Config::GroupSize> partials =
+                    slm_block_load<float, Config::GroupSize>(
+                        Config::InputBytes);
+                const float mean =
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::GroupSize>(partials);
+                const float rms_scale = rsqrt(mean + eps);
+
+                for (int block = start_block; block < end_block; ++block) {
+                    const int column = block * Config::BlockSize;
+                    simd<float, Config::BlockSize> values =
+                        slm_block_load<bf16, Config::BlockSize>(
+                            column * sizeof(bf16));
+                    simd<float, Config::BlockSize> weights =
+                        block_load<bf16, Config::BlockSize>(weight + column);
+                    simd<float, Config::BlockSize> gate_values =
+                        block_load<bf16, Config::BlockSize>(gate + column);
+                    simd<float, Config::BlockSize> residual_values =
+                        block_load<bf16, Config::BlockSize>(
+                            residual_row + column);
+
+                    // Match the existing three-op BF16 chain: RMSNorm first
+                    // stores BF16, gate * normalized stores BF16 again, then
+                    // the residual add rounds to BF16.
+                    simd<bf16, Config::BlockSize> normalized_bf16 =
+                        simd<bf16, Config::BlockSize>(
+                            values * rms_scale * weights);
+                    simd<float, Config::BlockSize> normalized =
+                        normalized_bf16;
+                    simd<bf16, Config::BlockSize> product_bf16 =
+                        simd<bf16, Config::BlockSize>(
+                            normalized * gate_values);
+                    simd<float, Config::BlockSize> product = product_bf16;
+                    block_store<bf16, Config::BlockSize>(
+                        output_row + column,
+                        simd<bf16, Config::BlockSize>(
+                            residual_values + product));
+                }
+            });
+    };
+    utils::submit_kernel(
+        cgf, device, "rms_norm_gate_residual_h3840_ptl");
 }
 #endif
 
@@ -442,6 +555,58 @@ fused_fn_t<IT, BS> select_fused_kernel(int nb) {
 // ============================================================================
 // Public C++ API
 // ============================================================================
+
+#if defined(OMNI_XPU_ARCH_PTL_H)
+torch::Tensor rms_norm_gate_residual(
+    torch::Tensor weight,
+    torch::Tensor input,
+    torch::Tensor gate,
+    torch::Tensor residual,
+    double eps
+) {
+    using Config = RmsNormGateResidualH3840PTLConfig;
+    TORCH_CHECK(
+        input.is_xpu() && weight.is_xpu() && gate.is_xpu() && residual.is_xpu(),
+        "weight, input, gate, and residual must be XPU tensors");
+    TORCH_CHECK(
+        input.device() == weight.device() && input.device() == gate.device() &&
+            input.device() == residual.device(),
+        "weight, input, gate, and residual must be on the same device");
+    TORCH_CHECK(
+        input.dim() == 2 && input.size(1) == Config::HiddenSize,
+        "input must have shape [M, 3840]");
+    TORCH_CHECK(
+        input.size(0) == 64 || input.size(0) == 1024 || input.size(0) == 1088,
+        "M must be one of the validated Z-Image lengths: 64, 1024, or 1088");
+    TORCH_CHECK(
+        weight.dim() == 1 && weight.size(0) == Config::HiddenSize &&
+            gate.dim() == 1 && gate.size(0) == Config::HiddenSize,
+        "weight and gate must have shape [3840]");
+    TORCH_CHECK(
+        residual.sizes() == input.sizes(),
+        "residual must have the same shape as input");
+    TORCH_CHECK(
+        input.scalar_type() == ST::BFloat16 &&
+            weight.scalar_type() == ST::BFloat16 &&
+            gate.scalar_type() == ST::BFloat16 &&
+            residual.scalar_type() == ST::BFloat16,
+        "weight, input, gate, and residual must be BF16 tensors");
+    TORCH_CHECK(
+        input.is_contiguous() && weight.is_contiguous() &&
+            gate.is_contiguous() && residual.is_contiguous(),
+        "weight, input, gate, and residual must be contiguous");
+
+    auto output = torch::empty_like(input);
+    rms_norm_gate_residual_h3840_ptl_kernel(
+        reinterpret_cast<const bf16*>(weight.data_ptr()),
+        reinterpret_cast<const bf16*>(input.data_ptr()),
+        reinterpret_cast<const bf16*>(gate.data_ptr()),
+        reinterpret_cast<const bf16*>(residual.data_ptr()),
+        reinterpret_cast<bf16*>(output.data_ptr()),
+        static_cast<float>(eps), input.size(0), input.device());
+    return output;
+}
+#endif
 
 torch::Tensor rms_norm(
     torch::Tensor weight,
