@@ -199,15 +199,16 @@ class TestQuantizeInt8Rowwise:
         assert max_quant_diff.item() <= 1
 
     @pytest.mark.skipif(not has_xpu(), reason="Large quant kernel requires XPU")
-    def test_lumina_down_projection_shape(self, seed):
-        """The PTL-specialized [1024,10240] route matches rowwise QDQ."""
+    @pytest.mark.parametrize("shape", [(1024, 10240), (4192, 6144)])
+    def test_ptl_workflow_shapes(self, shape, seed):
+        """PTL-specialized workflow shapes match rowwise QDQ."""
         from omni_xpu_kernel import int8
 
         native = int8._get_native()
         if native is None or not hasattr(native, "quantize_int8_rowwise_fused"):
             pytest.skip("Native fused quant kernel is unavailable")
 
-        x = torch.randn(1024, 10240, device="xpu", dtype=torch.bfloat16)
+        x = torch.randn(*shape, device="xpu", dtype=torch.bfloat16)
         q, scale = native.quantize_int8_rowwise_fused(x)
         expected_scale = (
             x.float().abs().amax(dim=-1, keepdim=True) / 127.0

@@ -160,12 +160,11 @@ void quantize_int8_rowwise_kernel(
 }
 
 #if defined(OMNI_XPU_ARCH_PTL_H)
-// Z-Image's ConvRot down projection quantizes BF16 [M, 10240] activations.
-// At M >= 1024 the input no longer remains cache-resident between the generic
-// kernel's two global-memory passes. One PTL work-group therefore owns one row,
-// stages it in SLM, and cooperatively performs reduction and quantization.
-// Keep this configuration tied to the measured kernel/shape; other shapes and
-// BMG retain the generic rowwise path above.
+// Large PTL BF16 ConvRot activations no longer remain cache-resident between
+// the generic kernel's two global-memory passes. One work-group therefore owns
+// one row, stages it in SLM, and cooperatively performs reduction and
+// quantization. Keep every launch geometry tied to its measured workflow shape;
+// other shapes, dtypes, and BMG retain the generic rowwise path above.
 struct RowwiseQuantizeLargePTLConfig {
     static constexpr int Columns = 10240;
     static constexpr int MinimumRows = 1024;
@@ -175,17 +174,32 @@ struct RowwiseQuantizeLargePTLConfig {
     static constexpr int VectorWidth = 16;
 };
 
-template <typename InputT, int VectorWidth, int SubgroupsPerRow>
+// Krea2 Turbo INT8 at 1024x1024 produces BF16 [4192, 6144] activations. Eight
+// subgroups loop over three 2048-column stripes while retaining the complete
+// 12 KiB row in SLM, eliminating the second global read.
+struct RowwiseQuantizeKrea2PTLConfig {
+    static constexpr int Columns = 6144;
+    static constexpr int Rows = 4192;
+    static constexpr int SubgroupSize = 32;
+    static constexpr int SubgroupsPerRow = 8;
+    static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
+    static constexpr int VectorWidth = 8;
+};
+
+template <
+    typename InputT,
+    int Columns,
+    int VectorWidth,
+    int SubgroupsPerRow>
 class QuantizeInt8RowwiseLargePTLKernel;
 
-template <typename InputT>
+template <typename InputT, typename Config>
 void quantize_int8_rowwise_large_ptl_kernel(
     const InputT* __restrict__ input,
     int8_t* __restrict__ output,
     float* __restrict__ scales,
     int64_t rows,
     const at::Device& device) {
-    using Config = RowwiseQuantizeLargePTLConfig;
     using InputVector = sycl::vec<InputT, Config::VectorWidth>;
     using OutputVector = sycl::vec<int8_t, Config::VectorWidth>;
     static_assert(Config::WorkgroupSize <= 1024);
@@ -199,7 +213,10 @@ void quantize_int8_rowwise_large_ptl_kernel(
         sycl::local_accessor<float, 1> subgroup_maxima(
             sycl::range<1>(Config::SubgroupsPerRow), handle);
         handle.parallel_for<QuantizeInt8RowwiseLargePTLKernel<
-            InputT, Config::VectorWidth, Config::SubgroupsPerRow>>(
+            InputT,
+            Config::Columns,
+            Config::VectorWidth,
+            Config::SubgroupsPerRow>>(
             sycl::nd_range<1>(global, local),
             [=](sycl::nd_item<1> item)
                 [[sycl::reqd_sub_group_size(Config::SubgroupSize)]] {
@@ -210,7 +227,6 @@ void quantize_int8_rowwise_large_ptl_kernel(
                     static_cast<int>(subgroup.get_group_linear_id());
                 const int workgroup_lane =
                     subgroup_index * Config::SubgroupSize + lane;
-                const int first = workgroup_lane * Config::VectorWidth;
                 const int64_t row = static_cast<int64_t>(item.get_group(0));
                 const InputT* __restrict__ row_input =
                     input + row * Config::Columns;
@@ -221,7 +237,11 @@ void quantize_int8_rowwise_large_ptl_kernel(
                     .get();
 
                 float local_max = 0.0f;
-                if (first < Config::Columns) {
+                constexpr int VectorStride =
+                    Config::WorkgroupSize * Config::VectorWidth;
+                for (int first = workgroup_lane * Config::VectorWidth;
+                     first < Config::Columns;
+                     first += VectorStride) {
                     const InputVector values =
                         *reinterpret_cast<const InputVector*>(
                             row_input + first);
@@ -258,7 +278,9 @@ void quantize_int8_rowwise_large_ptl_kernel(
                 }
                 sycl::group_barrier(item.get_group());
 
-                if (first < Config::Columns) {
+                for (int first = workgroup_lane * Config::VectorWidth;
+                     first < Config::Columns;
+                     first += VectorStride) {
                     InputVector values;
 #pragma unroll
                     for (int element = 0; element < Config::VectorWidth;
@@ -530,7 +552,15 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(
 #if defined(OMNI_XPU_ARCH_PTL_H)
         if (M >= RowwiseQuantizeLargePTLConfig::MinimumRows &&
             K == RowwiseQuantizeLargePTLConfig::Columns) {
-            quantize_int8_rowwise_large_ptl_kernel<bf16>(
+            quantize_int8_rowwise_large_ptl_kernel<
+                bf16, RowwiseQuantizeLargePTLConfig>(
+                reinterpret_cast<const bf16*>(x.data_ptr()),
+                reinterpret_cast<int8_t*>(output.data_ptr()),
+                scales.data_ptr<float>(), M, x.device());
+        } else if (M == RowwiseQuantizeKrea2PTLConfig::Rows &&
+                   K == RowwiseQuantizeKrea2PTLConfig::Columns) {
+            quantize_int8_rowwise_large_ptl_kernel<
+                bf16, RowwiseQuantizeKrea2PTLConfig>(
                 reinterpret_cast<const bf16*>(x.data_ptr()),
                 reinterpret_cast<int8_t*>(output.data_ptr()),
                 scales.data_ptr<float>(), M, x.device());
