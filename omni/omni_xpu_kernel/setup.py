@@ -109,9 +109,14 @@ def get_origin_rpath(extension_name, target_dir):
     platlib = Path(sysconfig.get_path("platlib")).resolve()
     extension_dir = platlib.joinpath(*extension_name.split(".")[:-1])
     target_dir = Path(target_dir).resolve()
-    try:
-        target_dir.relative_to(Path(sys.prefix).resolve())
-    except ValueError:
+    install_roots = {
+        Path(sys.prefix).resolve(),
+        Path(sysconfig.get_path("data")).resolve(),
+    }
+    if not any(
+        target_dir == root or root in target_dir.parents
+        for root in install_roots
+    ):
         # Explicit system-library overrides remain visibly non-relocatable.
         return target_dir.as_posix()
     relative = os.path.relpath(target_dir, extension_dir)
@@ -124,7 +129,15 @@ def get_runtime_library_dir():
     """Directory populated by Intel runtime wheels pulled in by torch XPU."""
     if IS_WINDOWS:
         return Path(sys.prefix) / "Library" / "bin"
-    return Path(sys.prefix) / "lib"
+    # Debian's system Python uses sys.prefix=/usr while pip's installation
+    # scheme places both platlib and wheel data under /usr/local. Use the
+    # scheme data prefix so a system-Python build remains prefix-relative.
+    return Path(sysconfig.get_path("data")) / "lib"
+
+
+def get_torch_runtime_library_dir():
+    """Expected torch/lib location after installing both wheels together."""
+    return Path(sysconfig.get_path("platlib")) / "torch" / "lib"
 
 
 def get_onednn_header_version(include_dir):
@@ -192,7 +205,7 @@ def get_onednn_paths():
         pip_lib = Path(sys.prefix) / "Library" / "lib"
     else:
         # onednn-devel and onednn install into the active Python prefix.
-        pip_include = Path(sys.prefix) / "include"
+        pip_include = Path(sysconfig.get_path("data")) / "include"
         pip_lib = get_runtime_library_dir()
     candidates.append((pip_include, pip_lib, "pip"))
 
@@ -331,6 +344,7 @@ class ICPXBuildExt(build_ext):
         # newer bundled headers and an unrelated system libdnnl.
         onednn_include, onednn_lib, onednn_library, onednn_source = get_onednn_paths()
         runtime_lib = get_runtime_library_dir().resolve()
+        torch_runtime_lib = get_torch_runtime_library_dir().resolve()
         has_onednn = True
         print(f"oneDNN source: {onednn_source}")
         print(f"oneDNN include: {onednn_include}")
@@ -452,7 +466,9 @@ class ICPXBuildExt(build_ext):
                     "-lc10", "-lc10_xpu",
                     "-o", str(output_path),
                 ] + [str(s) for s in sources]
-                cmd += linux_rpath_flags(ext.name, torch_lib, runtime_lib)
+                cmd += linux_rpath_flags(
+                    ext.name, torch_runtime_lib, runtime_lib
+                )
             else:
                 cmd += ["-fsycl-esimd-force-stateless-mem"]
                 # PTL-H cannot safely execute the JIT image produced for the
@@ -474,7 +490,15 @@ class ICPXBuildExt(build_ext):
                 # torch/include contains another oneDNN header tree. Put the
                 # explicitly selected installation first so it matches -ldnnl.
                 if has_onednn:
-                    cmd.append(f"-I{onednn_include}")
+                    # The compiler treats /usr/local/include as a built-in
+                    # system path and may de-duplicate a normal -I entry after
+                    # torch/include. The oneDNN translation units use quoted
+                    # includes so -iquote keeps the validated pip header tree
+                    # authoritative even with Debian's system Python scheme.
+                    cmd += [
+                        f"-iquote{onednn_include}",
+                        f"-I{onednn_include}",
+                    ]
                 cmd += [
                     f"-I{python_include}",
                     f"-I{torch_include}",
@@ -492,7 +516,9 @@ class ICPXBuildExt(build_ext):
                 cmd += [
                     "-o", str(output_path),
                 ] + [str(s) for s in sources]
-                cmd += linux_rpath_flags(ext.name, torch_lib, runtime_lib, onednn_lib)
+                cmd += linux_rpath_flags(
+                    ext.name, torch_runtime_lib, runtime_lib, onednn_lib
+                )
         
         print(f"Compile command: {' '.join(cmd)}")
         

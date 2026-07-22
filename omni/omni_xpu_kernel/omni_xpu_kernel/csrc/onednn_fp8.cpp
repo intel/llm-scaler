@@ -8,8 +8,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include <oneapi/dnnl/dnnl.hpp>
-#include <oneapi/dnnl/dnnl_sycl.hpp>
+#include "oneapi/dnnl/dnnl.hpp"
+#include "oneapi/dnnl/dnnl_sycl.hpp"
 #include <torch/extension.h>
 
 #include "utils.h"

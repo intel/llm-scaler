@@ -301,16 +301,26 @@ def test_linux_runtime_search_paths_are_prefix_relative(monkeypatch):
     monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
     namespace = run_path(str(PROJECT_ROOT / "setup.py"), run_name="__rpath_test__")
 
-    runtime_lib = Path(sys.prefix) / "lib"
+    runtime_lib = namespace["get_runtime_library_dir"]()
+    torch_runtime_lib = namespace["get_torch_runtime_library_dir"]()
     core_rpath = namespace["get_origin_rpath"]("omni_xpu_kernel._C", runtime_lib)
+    torch_rpath = namespace["get_origin_rpath"](
+        "omni_xpu_kernel._C", torch_runtime_lib
+    )
     sidecar_rpath = namespace["get_origin_rpath"](
         "omni_xpu_kernel.lgrf_uni.lgrf_sdp", runtime_lib
     )
 
     assert core_rpath.startswith("$ORIGIN/")
+    assert torch_rpath == "$ORIGIN/../torch/lib"
     assert sidecar_rpath.startswith("$ORIGIN/")
     assert sys.prefix not in core_rpath
     assert sys.prefix not in sidecar_rpath
+
+    external = Path("/opt/intel/oneapi/dnnl/latest/lib")
+    assert namespace["get_origin_rpath"](
+        "omni_xpu_kernel._C", external
+    ) == external.resolve().as_posix()
 
 
 def test_default_build_accepts_complete_cutlass_tree(tmp_path):
@@ -403,6 +413,11 @@ def test_lgrf_sdp_wheel_contains_sidecar_artifact():
                 "not just a source-tree sidecar artifact"
             )
             if sys.platform == "linux" and shutil.which("readelf") is not None:
+                import torch
+
+                build_torch_lib = str(
+                    Path(torch.__file__).resolve().parent / "lib"
+                )
                 native_members = [
                     member for member in wheel_zip.namelist()
                     if member.endswith(".so")
@@ -418,4 +433,5 @@ def test_lgrf_sdp_wheel_contains_sidecar_artifact():
                     ).stdout
                     assert "$ORIGIN" in dynamic
                     assert str(sys.prefix) not in dynamic
+                    assert build_torch_lib not in dynamic
                     assert "/opt/intel" not in dynamic
