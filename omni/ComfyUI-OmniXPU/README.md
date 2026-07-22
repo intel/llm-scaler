@@ -17,7 +17,6 @@ Requires `omni_xpu_kernel` installed. Without it the node loads silently with no
 | Auto-routed cute/ESIMD Attention | `optimized_attention` |
 | ESIMD / Kitchen pair RoPE | `_apply_rope1` / `apply_rope1` / `apply_rope` (flux.math dual-tensor) |
 | ESIMD LayerNorm/RMSNorm | `LayerNorm.forward` / `RMSNorm.forward` / `rms_norm()` |
-| Fused Z-Image RMSNorm/gate/residual | Eligible PTL-H `JointTransformerBlock` boundaries |
 | FP8 GEMM | `fp8_linear` / `mixed_precision_ops` |
 | INT8 Linear | `comfy_kitchen::int8_linear` (oneDNN s8 GEMM) |
 | Fused INT8 SwiGLU FFN | Eligible Lumina/Z-Image `FeedForward` blocks |
@@ -36,7 +35,6 @@ OMNIXPU_ROPE=0              # Disable all Omni XPU RoPE routes
 OMNIXPU_ZIMAGE_ROPE_PAIR=0  # Disable the PTL-H Z-Image Q/K pair route
 OMNIXPU_NORM=0              # Disable ESIMD LayerNorm/RMSNorm only
 OMNIXPU_NONCONTIG_RMSNORM=0 # Disable the PTL-H split-QKV RMSNorm route
-OMNIXPU_ZIMAGE_RMS_GATE=0   # Disable the PTL-H Z-Image fused RMS/gate route
 OMNIXPU_KREA2_RMSNORM=0     # Disable the Krea2-specific local RMSNorm hook only
 OMNIXPU_FP8_GEMM=0          # Disable FP8 GEMM only
 OMNIXPU_INT8=0              # Disable all INT8 routes
@@ -49,14 +47,6 @@ OMNIXPU_MEDIAN_FIX=0        # Disable median workaround only
 On PTL-H, eligible Lumina/Z-Image split-QKV views are materialized once and
 then use the ESIMD RMSNorm kernel. Setting `OMNIXPU_NONCONTIG_RMSNORM=0`
 leaves these views on the original Torch path.
-
-PTL-H/Torch 2.11 Z-Image BF16 transformer blocks use a native fused route for
-the validated second-RMSNorm, gate-multiply, and residual-add boundaries at
-sequence lengths 64, 1024, and 1088. The route preserves the intermediate BF16
-rounding points and the normal ComfyUI weight-casting lifecycle. Unsupported
-platforms, Torch versions, shapes, dtypes, layouts, and modulation variants
-retain the original block forward. Set `OMNIXPU_ZIMAGE_RMS_GATE=0` before
-startup to disable only this route.
 
 PTL-H/Torch 2.11 Z-Image BF16 Q/K pairs with the validated 30-head, D128
 layouts use the native Kitchen pair-RoPE kernel. It preserves the adjacent-pair

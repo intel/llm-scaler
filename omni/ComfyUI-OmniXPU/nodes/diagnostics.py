@@ -106,25 +106,4 @@ class OmniXPUStatus:
             except Exception:
                 pass
 
-        # Fused Z-Image RMSNorm/gate/residual routing stats
-        zimage_rms_gate = sys.modules.get(
-            f"{_PKG}.patches.patch_zimage_rms_gate"
-        )
-        if zimage_rms_gate and hasattr(zimage_rms_gate, "get_stats"):
-            try:
-                stats = zimage_rms_gate.get_stats()
-                if stats["routed"] or stats["fallback"]:
-                    lines.append("")
-                    lines.append(
-                        "  Z-Image RMS/gate calls: "
-                        f"fused={stats['routed']} fallback={stats['fallback']}"
-                    )
-                    for reason, count in sorted(
-                        stats["reasons"].items(),
-                        key=lambda item: -item[1],
-                    ):
-                        lines.append(f"    {reason}: {count}")
-            except Exception:
-                pass
-
         return ("\n".join(lines),)
