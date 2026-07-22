@@ -540,8 +540,8 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
   PTL-H. Different Q/K shapes and BMG retain the established dispatch.
 - BF16 rowwise INT8 quantization uses separate PTL-H SLM profiles for the
   validated Z-Image large-K path and the Krea2 Turbo 1024x1024
-  `[4192, 6144]` activation. Other shapes, dtypes, and BMG retain the generic
-  two-pass profile.
+  `[4192, 6144]` projection and `[4192, 16384]` FFN-down activations. Other
+  shapes, dtypes, and BMG retain the generic two-pass profile.
 - Bulk contiguous RMSNorm with hidden size 128 uses PTL-H-specific BF16 and
   FP32 one-work-item-per-row profiles that keep the input in registers. The
   BF16 route covers Z-Image attention projections, while the FP32 route covers

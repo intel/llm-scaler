@@ -199,7 +199,9 @@ class TestQuantizeInt8Rowwise:
         assert max_quant_diff.item() <= 1
 
     @pytest.mark.skipif(not has_xpu(), reason="Large quant kernel requires XPU")
-    @pytest.mark.parametrize("shape", [(1024, 10240), (4192, 6144)])
+    @pytest.mark.parametrize(
+        "shape", [(1024, 10240), (4192, 6144), (4192, 16384)]
+    )
     def test_ptl_workflow_shapes(self, shape, seed):
         """PTL-specialized workflow shapes match rowwise QDQ."""
         from omni_xpu_kernel import int8

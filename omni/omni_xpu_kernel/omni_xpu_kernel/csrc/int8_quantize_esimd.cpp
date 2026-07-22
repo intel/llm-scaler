@@ -186,6 +186,19 @@ struct RowwiseQuantizeKrea2PTLConfig {
     static constexpr int VectorWidth = 8;
 };
 
+// The Krea2 FFN down projection quantizes a much wider BF16 activation before
+// its K=16384 -> N=6144 INT8 matmul. Sixteen subgroups stage the complete
+// 32 KiB row in SLM and preserve the generic max/scale/rounding result while
+// eliminating its second global-memory read.
+struct RowwiseQuantizeKrea2FFNDownPTLConfig {
+    static constexpr int Columns = 16384;
+    static constexpr int Rows = 4192;
+    static constexpr int SubgroupSize = 32;
+    static constexpr int SubgroupsPerRow = 16;
+    static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
+    static constexpr int VectorWidth = 8;
+};
+
 template <
     typename InputT,
     int Columns,
@@ -561,6 +574,13 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(
                    K == RowwiseQuantizeKrea2PTLConfig::Columns) {
             quantize_int8_rowwise_large_ptl_kernel<
                 bf16, RowwiseQuantizeKrea2PTLConfig>(
+                reinterpret_cast<const bf16*>(x.data_ptr()),
+                reinterpret_cast<int8_t*>(output.data_ptr()),
+                scales.data_ptr<float>(), M, x.device());
+        } else if (M == RowwiseQuantizeKrea2FFNDownPTLConfig::Rows &&
+                   K == RowwiseQuantizeKrea2FFNDownPTLConfig::Columns) {
+            quantize_int8_rowwise_large_ptl_kernel<
+                bf16, RowwiseQuantizeKrea2FFNDownPTLConfig>(
                 reinterpret_cast<const bf16*>(x.data_ptr()),
                 reinterpret_cast<int8_t*>(output.data_ptr()),
                 scales.data_ptr<float>(), M, x.device());
