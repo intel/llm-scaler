@@ -45,3 +45,31 @@ def test_norm_h120_capability_is_false_for_legacy_binary(monkeypatch):
 
     monkeypatch.setattr(norm, "_get_native", lambda: SimpleNamespace())
     assert norm.supports_h120_fp16() is False
+
+
+def test_rotary_fast_capability_comes_from_loaded_binary(monkeypatch):
+    from omni_xpu_kernel import rotary
+
+    native = SimpleNamespace(kitchen_rope_fast_supported=lambda _x, _freqs: True)
+    monkeypatch.setattr(rotary, "_get_native", lambda: native)
+
+    assert rotary.supports_kitchen_rope_fast() is True
+    assert rotary.kitchen_rope_fast_supported(object(), object()) is True
+
+
+def test_rotary_fast_capability_is_safe_for_legacy_or_rejected_inputs(monkeypatch):
+    from omni_xpu_kernel import rotary
+
+    monkeypatch.setattr(rotary, "_get_native", lambda: SimpleNamespace())
+    assert rotary.supports_kitchen_rope_fast() is False
+    assert rotary.kitchen_rope_fast_supported(object(), object()) is False
+
+    def rejected(_x, _freqs):
+        raise RuntimeError("unsupported tensor contract")
+
+    monkeypatch.setattr(
+        rotary,
+        "_get_native",
+        lambda: SimpleNamespace(kitchen_rope_fast_supported=rejected),
+    )
+    assert rotary.kitchen_rope_fast_supported(object(), object()) is False

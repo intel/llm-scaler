@@ -86,7 +86,7 @@ def test_kitchen_rope_adjacent_fallback_preserves_addcmul_rounding(freqs_dtype):
     freqs = torch.randn(2, 1, 17, 32, 2, 2, device="xpu", dtype=freqs_dtype)
 
     assert not x.is_contiguous()
-    assert not rotary._get_native().kitchen_rope_fast_supported(x, freqs)
+    assert not rotary.kitchen_rope_fast_supported(x, freqs)
     actual = rotary.apply_kitchen_rope1(x, freqs)
     expected = _adjacent_reference(x, freqs)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -113,7 +113,7 @@ def test_kitchen_rope_real_workload_shapes(layout, shape, split_half):
     else:
         b, n, _h, d = shape
         freqs = torch.randn(1, n, 1, d // 2, 2, 2, device="xpu", dtype=torch.float32)
-    assert rotary._get_native().kitchen_rope_fast_supported(x, freqs)
+    assert rotary.kitchen_rope_fast_supported(x, freqs)
     if split_half:
         actual = rotary.apply_kitchen_rope_split_half1(x, freqs)
         expected = _split_reference(x, freqs)

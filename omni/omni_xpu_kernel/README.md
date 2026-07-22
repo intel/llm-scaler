@@ -258,6 +258,10 @@ output = rotary.rotary_emb(x, cos_cache, sin_cache, seq_len, heads)
 # Comfy Kitchen adjacent-pair and split-half semantics
 output = rotary.apply_kitchen_rope1(x, freqs_cis)
 output = rotary.apply_kitchen_rope_split_half1(x, freqs_cis)
+
+# Safe capability query for callers that select the single-launch path
+if rotary.kitchen_rope_fast_supported(x, freqs_cis):
+    output = rotary.apply_kitchen_rope1(x, freqs_cis)
 ```
 
 ## Requirements

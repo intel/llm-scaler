@@ -33,6 +33,7 @@ OMNIXPU_ENABLE=0            # Master switch — disable everything
 OMNIXPU_ATTENTION=0         # Disable the XPU attention patch only
 OMNIXPU_ROPE=0              # Disable all Omni XPU RoPE routes
 OMNIXPU_ZIMAGE_ROPE_PAIR=0  # Disable the PTL-H Z-Image Q/K pair route
+OMNIXPU_BOOGU_D120_ROPE=0   # Disable the PTL-H Boogu D120 single-tensor route
 OMNIXPU_NORM=0              # Disable ESIMD LayerNorm/RMSNorm only
 OMNIXPU_NONCONTIG_RMSNORM=0 # Disable the PTL-H split-QKV RMSNorm route
 OMNIXPU_H120_RMSNORM=0      # Disable PTL-H native H120 RMSNorm
@@ -63,6 +64,14 @@ addcmul, and cast-back launches for Q and K. Other platforms, Torch minor
 versions, dtypes, layouts, head counts, and sequence lengths retain the prior
 route. Set `OMNIXPU_ZIMAGE_ROPE_PAIR=0` before startup to disable only this
 route.
+
+PTL-H/Torch 2.11 Boogu Image Turbo FP16 D120 tensors from the validated 1K
+workflow use the native single-launch Kitchen RoPE path. The route is limited
+to contiguous `[1, 4096|4205, 7|28, 120]` inputs with matching FP32 frequency
+tensors. It requires both a feature marker and a per-tensor capability check
+from the loaded binary; stale binaries and all other shapes retain the original
+implementation. Set `OMNIXPU_BOOGU_D120_ROPE=0` before startup to disable only
+this route.
 
 Set `OMNIXPU_DEBUG=1` before starting ComfyUI to log the XPU kernels that are
 actually selected. Wrapper calls that fall back to another implementation are

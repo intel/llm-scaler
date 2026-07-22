@@ -36,6 +36,26 @@ def apply_kitchen_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tenso
     return _get_native().apply_kitchen_rope1(x, freqs_cis)
 
 
+def supports_kitchen_rope_fast() -> bool:
+    """Whether the loaded core exports the single-launch Kitchen RoPE path."""
+    try:
+        return hasattr(_get_native(), "kitchen_rope_fast_supported")
+    except (AttributeError, ImportError, RuntimeError):
+        return False
+
+
+def kitchen_rope_fast_supported(
+    x: torch.Tensor, freqs_cis: torch.Tensor
+) -> bool:
+    """Whether ``x`` and ``freqs_cis`` satisfy the native fast-path contract."""
+    if not supports_kitchen_rope_fast():
+        return False
+    try:
+        return bool(_get_native().kitchen_rope_fast_supported(x, freqs_cis))
+    except (RuntimeError, TypeError):
+        return False
+
+
 def apply_kitchen_rope(
     xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -59,5 +79,7 @@ __all__ = [
     "apply_kitchen_rope1",
     "apply_kitchen_rope_split_half",
     "apply_kitchen_rope_split_half1",
+    "kitchen_rope_fast_supported",
     "rotary_emb",
+    "supports_kitchen_rope_fast",
 ]

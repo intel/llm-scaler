@@ -11,7 +11,9 @@ log = logging.getLogger("ComfyUI-OmniXPU")
 _omni_rotary = None
 _logged_first = False
 _logged_zimage_pair = 0
+_logged_boogu_d120 = 0
 _allow_ptl_zimage_pair = False
+_allow_ptl_boogu_d120 = False
 
 
 def _can_use(x):
@@ -54,6 +56,51 @@ def _use_ptl_zimage_pair(xq: Tensor, xk: Tensor, freqs_cis: Tensor):
     )
 
 
+def _use_ptl_boogu_d120(x: Tensor, freqs_cis: Tensor):
+    """Select exact Boogu D120 shapes validated with native Kitchen RoPE."""
+    return (
+        _allow_ptl_boogu_d120
+        and hasattr(_omni_rotary, "apply_kitchen_rope1")
+        and hasattr(_omni_rotary, "kitchen_rope_fast_supported")
+        and x.is_xpu
+        and freqs_cis.is_xpu
+        and x.device == freqs_cis.device
+        and x.dtype == torch.float16
+        and freqs_cis.dtype == torch.float32
+        and x.ndim == 4
+        and freqs_cis.ndim == 6
+        and x.is_contiguous()
+        and freqs_cis.is_contiguous()
+        and x.shape[0] == 1
+        and x.shape[1] in (4096, 4205)
+        and x.shape[2] in (7, 28)
+        and x.shape[3] == 120
+        and freqs_cis.shape == (1, x.shape[1], 1, 60, 2, 2)
+        and _torch_major_minor() == (2, 11)
+        and _omni_rotary.kitchen_rope_fast_supported(x, freqs_cis)
+    )
+
+
+def _omni_apply_boogu_d120(x: Tensor, freqs_cis: Tensor):
+    global _logged_boogu_d120
+    _logged_boogu_d120 += 1
+    if _logged_boogu_d120 <= 3:
+        log.info(
+            "[OmniXPU] rope Boogu D120 #%d: seq=%d heads=%d dtype=%s",
+            _logged_boogu_d120,
+            x.shape[1],
+            x.shape[2],
+            x.dtype,
+        )
+    log_debug_event(
+        "kernel",
+        "rotary_emb",
+        {"x": x, "freqs": freqs_cis},
+        details={"backend": "kitchen", "route": "ptl_boogu_d120"},
+    )
+    return _omni_rotary.apply_kitchen_rope1(x, freqs_cis)
+
+
 def _omni_apply_rope1(x: Tensor, freqs_cis: Tensor):
     global _logged_first
     B, H, S, D = x.shape
@@ -86,7 +133,7 @@ def _omni_apply_rope1(x: Tensor, freqs_cis: Tensor):
 
 
 def apply():
-    global _allow_ptl_zimage_pair, _omni_rotary
+    global _allow_ptl_boogu_d120, _allow_ptl_zimage_pair, _omni_rotary
     import sys
     probe = sys.modules.get("ComfyUI-OmniXPU.probe")
     if probe.rotary is None:
@@ -99,8 +146,16 @@ def apply():
             getattr(_omni_package, "__xpu_target__", "") == "ptl-h"
             and os.environ.get("OMNIXPU_ZIMAGE_ROPE_PAIR", "1") != "0"
         )
+        fast_marker = getattr(_omni_rotary, "supports_kitchen_rope_fast", None)
+        _allow_ptl_boogu_d120 = (
+            getattr(_omni_package, "__xpu_target__", "") == "ptl-h"
+            and callable(fast_marker)
+            and fast_marker()
+            and os.environ.get("OMNIXPU_BOOGU_D120_ROPE", "1") != "0"
+        )
     except ImportError:
         _allow_ptl_zimage_pair = False
+        _allow_ptl_boogu_d120 = False
 
     import comfy.ldm.flux.math as flux_math
 
@@ -114,6 +169,8 @@ def apply():
         verbose_only=True,
     )
     def _patched_apply_rope1(x: Tensor, freqs_cis: Tensor):
+        if _use_ptl_boogu_d120(x, freqs_cis):
+            return _omni_apply_boogu_d120(x, freqs_cis)
         if _can_use(x) and x.ndim == 4 and freqs_cis.ndim == 6:
             return _omni_apply_rope1(x, freqs_cis)
         return _orig_apply_rope1(x, freqs_cis)
@@ -132,6 +189,8 @@ def apply():
             verbose_only=True,
         )
         def _patched_compiled(x, freqs_cis):
+            if _use_ptl_boogu_d120(x, freqs_cis):
+                return _omni_apply_boogu_d120(x, freqs_cis)
             if _can_use(x) and x.ndim == 4 and freqs_cis.ndim == 6:
                 return _omni_apply_rope1(x, freqs_cis)
             return _orig_compiled(x, freqs_cis)
