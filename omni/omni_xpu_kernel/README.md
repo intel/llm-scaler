@@ -542,10 +542,12 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
   validated Z-Image large-K path and the Krea2 Turbo 1024x1024
   `[4192, 6144]` activation. Other shapes, dtypes, and BMG retain the generic
   two-pass profile.
-- Bulk contiguous BF16 RMSNorm with hidden size 128 uses a PTL-H-specific
-  one-work-item-per-row profile that keeps the input in registers while
-  preserving the generic BS=32 reduction order. Small row counts, other hidden
-  sizes and dtypes, and BMG retain the generic work-group profile.
+- Bulk contiguous RMSNorm with hidden size 128 uses PTL-H-specific BF16 and
+  FP32 one-work-item-per-row profiles that keep the input in registers. The
+  BF16 route covers Z-Image attention projections, while the FP32 route covers
+  Krea2 attention normalization without changing its accumulation dtype. Small
+  row counts, FP16, other hidden sizes, and BMG retain the generic work-group
+  profile.
 - The validated Z-Image BF16 H3840 second-normalization boundary on PTL-H can
   fuse RMSNorm, gate multiplication, and residual addition while preserving the
   BF16 materialization between operations. Other shapes, dtypes, and platforms

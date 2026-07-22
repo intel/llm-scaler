@@ -20,12 +20,13 @@ namespace omni_xpu {
 namespace norm {
 
 #if defined(OMNI_XPU_ARCH_PTL_H)
-// Z-Image's attention projections normalize contiguous BF16 [L * 30, 128]
-// Q/K tensors. The generic H128 kernel assigns four work-items to every row,
-// reserves its maximum 8K-element SLM cache, and crosses a work-group barrier.
-// For sufficiently many short rows, one PTL-H work-item per row is faster: it
-// retains the 128 inputs in GRF and only uses four SLM floats to preserve the
-// generic kernel's BS=32 reduction order exactly.
+// Z-Image and Krea2 attention projections normalize large batches of
+// contiguous H128 Q/K rows. The generic H128 kernel assigns four work-items
+// to every row, reserves its maximum 8K-element SLM cache, and crosses a
+// work-group barrier. For sufficiently many short rows, one PTL-H work-item
+// per row is faster: it retains the 128 inputs in GRF and only uses four SLM
+// floats. Z-Image reaches this route as BF16; Krea2 uses FP32 to preserve its
+// model-defined accumulation semantics.
 struct RmsNormH128PTLConfig {
     static constexpr int HiddenSize = 128;
     static constexpr int BlockSize = 32;
@@ -36,6 +37,7 @@ struct RmsNormH128PTLConfig {
 };
 
 class RmsNormH128PTLKernel;
+class RmsNormH128FP32PTLKernel;
 
 // Z-Image applies a second RMSNorm immediately before a BF16 gate multiply
 // and BF16 residual add. At its H3840 workflow shapes, keeping all three
@@ -122,6 +124,74 @@ void rms_norm_h128_ptl_kernel(
             });
     };
     utils::submit_kernel(cgf, device, "rms_norm_h128_ptl");
+}
+
+void rms_norm_h128_fp32_ptl_kernel(
+    const void* weight_ptr,
+    const void* input_ptr,
+    void* output_ptr,
+    float eps,
+    const int input_size,
+    const at::Device& device
+) {
+    using Config = RmsNormH128PTLConfig;
+    const float* weight = static_cast<const float*>(weight_ptr);
+    const float* input = static_cast<const float*>(input_ptr);
+    float* output = static_cast<float*>(output_ptr);
+
+    auto cgf = [&](sycl::handler& handle) {
+        handle.parallel_for<RmsNormH128FP32PTLKernel>(
+            sycl::nd_range<2>(
+                sycl::range<2>(input_size, 1),
+                sycl::range<2>(1, 1)),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                slm_init<Config::PartialBytes>();
+                const int row = item.get_global_id(0);
+                const float* input_row =
+                    input + static_cast<size_t>(row) * Config::HiddenSize;
+                float* output_row =
+                    output + static_cast<size_t>(row) * Config::HiddenSize;
+                simd<float, Config::HiddenSize> cached;
+
+#pragma unroll
+                for (int block = 0; block < Config::Blocks; ++block) {
+                    simd<float, Config::BlockSize> values =
+                        block_load<float, Config::BlockSize>(
+                            input_row + block * Config::BlockSize);
+                    cached.template select<Config::BlockSize, 1>(
+                        block * Config::BlockSize) = values;
+                    simd<float, Config::BlockSize> squares = 0;
+                    squares += values * values;
+                    const float partial =
+                        sycl::ext::intel::esimd::detail::sum<
+                            float, float, Config::BlockSize>(squares) /
+                        static_cast<float>(Config::HiddenSize);
+                    slm_block_store<float, 1>(
+                        block * sizeof(float), partial);
+                }
+
+                simd<float, Config::Blocks> partials =
+                    slm_block_load<float, Config::Blocks>(0);
+                const float mean =
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::Blocks>(partials);
+                const float scale = rsqrt(mean + eps);
+
+#pragma unroll
+                for (int block = 0; block < Config::Blocks; ++block) {
+                    simd<float, Config::BlockSize> values =
+                        cached.template select<Config::BlockSize, 1>(
+                            block * Config::BlockSize);
+                    simd<float, Config::BlockSize> weights =
+                        block_load<float, Config::BlockSize>(
+                            weight + block * Config::BlockSize);
+                    block_store<float, Config::BlockSize>(
+                        output_row + block * Config::BlockSize,
+                        values * scale * weights);
+                }
+            });
+    };
+    utils::submit_kernel(cgf, device, "rms_norm_h128_fp32_ptl");
 }
 
 void rms_norm_gate_residual_h3840_ptl_kernel(
@@ -627,13 +697,20 @@ torch::Tensor rms_norm(
         torch::device(input.device()).dtype(input.dtype()));
 
 #if defined(OMNI_XPU_ARCH_PTL_H)
-    if (input.scalar_type() == ST::BFloat16 &&
-        hidden_size == RmsNormH128PTLConfig::HiddenSize &&
+    if (hidden_size == RmsNormH128PTLConfig::HiddenSize &&
         input_size >= RmsNormH128PTLConfig::MinimumRows) {
-        rms_norm_h128_ptl_kernel(
-            weight.data_ptr(), input.data_ptr(), output.data_ptr(),
-            static_cast<float>(eps), input_size, input.device());
-        return output;
+        if (input.scalar_type() == ST::BFloat16) {
+            rms_norm_h128_ptl_kernel(
+                weight.data_ptr(), input.data_ptr(), output.data_ptr(),
+                static_cast<float>(eps), input_size, input.device());
+            return output;
+        }
+        if (input.scalar_type() == ST::Float) {
+            rms_norm_h128_fp32_ptl_kernel(
+                weight.data_ptr(), input.data_ptr(), output.data_ptr(),
+                static_cast<float>(eps), input_size, input.device());
+            return output;
+        }
     }
 #endif
 

@@ -74,6 +74,27 @@ class TestRMSNormCorrectness:
         torch.testing.assert_close(output_esimd, output_ref, rtol=1e-2, atol=1e-2)
 
     @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    @pytest.mark.parametrize("rows", [1024, 50304])
+    def test_rms_norm_h128_fp32_correctness(self, rows):
+        """Cover the PTL-H FP32 H128 route used by Krea2 Q/K normalization."""
+        from omni_xpu_kernel import norm
+
+        torch.manual_seed(128 + rows)
+        eps = 1e-5
+        input = torch.randn(rows, 128, device="xpu", dtype=torch.float32)
+        weight = torch.randn(128, device="xpu", dtype=torch.float32)
+
+        output_esimd = norm.rms_norm(weight, input, eps=eps)
+        output_ref = torch.nn.functional.rms_norm(
+            input, (128,), weight, eps=eps
+        )
+
+        assert torch.isfinite(output_esimd).all()
+        torch.testing.assert_close(
+            output_esimd, output_ref, rtol=1e-5, atol=2e-6
+        )
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
     @pytest.mark.parametrize("rows", [64, 1024, 1088])
     def test_rms_norm_gate_residual_h3840_bf16(self, rows):
         """Validate the PTL-H Z-Image fused modulation boundary."""
