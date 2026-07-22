@@ -1,0 +1,90 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4b1bf68..7b4ea1b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -25,7 +25,11 @@ find_package(Torch REQUIRED)
+ set(SGL_OPS_XPU_ROOT ${PROJECT_SOURCE_DIR})
+ list(APPEND CMAKE_MODULE_PATH ${SGL_OPS_XPU_ROOT}/cmake/Modules)
+
+-set(DPCPP_SYCL_TARGET "bmg" CACHE STRING "dpcpp target device" FORCE)
++if(DEFINED ENV{SGL_DPCPP_TARGET})
++  set(DPCPP_SYCL_TARGET "$ENV{SGL_DPCPP_TARGET}" CACHE STRING "dpcpp target device" FORCE)
++else()
++  set(DPCPP_SYCL_TARGET "bmg" CACHE STRING "dpcpp target device" FORCE)
++endif()
+
+ include(${SGL_OPS_XPU_ROOT}/cmake/SYCL.cmake)
+ include(${SGL_OPS_XPU_ROOT}/cmake/BuildFlags.cmake)
+diff --git a/cmake/BuildFlags.cmake b/cmake/BuildFlags.cmake
+index 1ffc9b3..0254b4c 100644
+--- a/cmake/BuildFlags.cmake
++++ b/cmake/BuildFlags.cmake
+@@ -133,11 +133,17 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+
+   list(REMOVE_DUPLICATES AOT_TARGETS)
+   string(JOIN "," AOT_TARGETS_STR ${AOT_TARGETS})
+-  set(SYCL_TARGETS_OPTION -fsycl-targets=spir64_gen)
++  if(DPCPP_SYCL_TARGET STREQUAL "spir64")
++    set(SYCL_TARGETS_OPTION -fsycl-targets=spir64)
++    set(SYCL_OFFLINE_COMPILER_AOT_OPTIONS "")
++    message(STATUS "SYCL JIT build (spir64) - no AOT device")
++  else()
++    set(SYCL_TARGETS_OPTION -fsycl-targets=spir64_gen)
++    set(SYCL_OFFLINE_COMPILER_AOT_OPTIONS "-device ${AOT_TARGETS}")
++    message(STATUS "Compile Intel GPU AOT Targets for ${AOT_TARGETS}")
++  endif()
+   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} ${SYCL_TARGETS_OPTION})
+   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} ${SYCL_TARGETS_OPTION})
+-  set(SYCL_OFFLINE_COMPILER_AOT_OPTIONS "-device ${AOT_TARGETS}")
+-  message(STATUS "Compile Intel GPU AOT Targets for ${AOT_TARGETS}")
+   # SYCL compiler in basekit after 2025.2 needs more spirv arguments.
+   if(SYCL_COMPILER_VERSION GREATER_EQUAL 20250806)
+     set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} -Xspirv-translator;-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+@@ -147,7 +153,11 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+
+   set(SYCL_COMPILE_FLAGS ${SYCL_COMPILE_FLAGS} ${SYCL_KERNEL_OPTIONS})
+
+-  set(SYCL_OFFLINE_COMPILER_FLAGS "${SYCL_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
++  if(DPCPP_SYCL_TARGET STREQUAL "spir64")
++    set(SYCL_OFFLINE_COMPILER_FLAGS "")
++  else()
++    set(SYCL_OFFLINE_COMPILER_FLAGS "${SYCL_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
++  endif()
+ else()
+   message("Not compiling with XPU. Currently only support GCC compiler on Linux as CXX compiler.")
+   return()
+diff --git a/cmake/Modules/FindSYCL.cmake b/cmake/Modules/FindSYCL.cmake
+index 3700b25..5936198 100644
+--- a/cmake/Modules/FindSYCL.cmake
++++ b/cmake/Modules/FindSYCL.cmake
+@@ -415,9 +415,10 @@ macro(SYCL_LINK_DEVICE_OBJECTS output_file sycl_target sycl_offline_compiler_fla
+       OUTPUT ${output_file}
+       DEPENDS ${object_files}
+       COMMAND ${SYCL_EXECUTABLE}
++      -fsycl
+       ${SYCL_device_link_flags}
+       -fsycl-link ${object_files}
+-      -Xs ${sycl_offline_compiler_flags}
++      ${_sycl_xs_flags}
+       -o ${output_file}
+       COMMENT "Building SYCL device link file ${output_file_relative_path}"
+       )
+diff --git a/src/BuildOnLinux.cmake b/src/BuildOnLinux.cmake
+index 8b1d951..3ea8960 100644
+--- a/src/BuildOnLinux.cmake
++++ b/src/BuildOnLinux.cmake
+@@ -50,8 +50,12 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
+ endforeach()
+
+ # xe20 kernels
+-set(XE20_OFFLINE_COMPILER_AOT_OPTIONS "-device bmg")
+-set(XE20_OFFLINE_COMPILER_FLAGS "${XE20_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
++if(DPCPP_SYCL_TARGET STREQUAL "spir64")
++  set(XE20_OFFLINE_COMPILER_FLAGS "")
++else()
++  set(XE20_OFFLINE_COMPILER_AOT_OPTIONS "-device bmg")
++  set(XE20_OFFLINE_COMPILER_FLAGS "${XE20_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
++endif()
+ foreach(sycl_src ${ATen_XPU_SYCL_XE20})
+   get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
+   set(sycl_lib sgl-ops-sycl-${name})

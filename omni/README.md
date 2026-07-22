@@ -24,15 +24,43 @@ Or build docker image:
 
 ```bash
 # Arc B-series / Battlemage
-OMNI_XPU_DEVICE=bmg bash build.sh
+XPU_TARGET=bmg bash build.sh
 
 # Panther Lake H / Arc B390
-OMNI_XPU_DEVICE=ptl-h bash build.sh
+XPU_TARGET=ptl-h bash build.sh
 ```
 
-Local images are tagged with their AOT target, for example
+`XPU_TARGET` is the single device selector for sgl-kernel-xpu, the Omni core,
+LGRF, and CUTE native builds. Valid values are `bmg` and `ptl-h`; the existing
+`OMNI_XPU_DEVICE` environment variable remains a compatible alias. The build
+fails before compilation for any other value. Omni's native extensions use
+the selected AOT target directly. The pinned sgl-kernel-xpu/CUTLASS-SYCL
+revision supports BMG AOT only, so the Docker build maps `bmg` to BMG AOT and
+`ptl-h` to the validated `spir64` JIT build instead of silently emitting a BMG
+binary. Its resolved mode is recorded in
+`/llm/sgl-kernel-xpu/.llm-scaler-build-target` inside the image.
+
+Local images are tagged with their device target, for example
 `intel/llm-scaler-omni:0.1.0-b8-dev-bmg` or
 `intel/llm-scaler-omni:0.1.0-b8-dev-ptl-h`.
+The builder and final image both use
+`intel/omix:0.1.0-devel-ubuntu24.04`; the final image retains `/opt/venv`,
+the complete `/llm` source/build trees, `/wheels`, and the oneAPI compiler so
+native kernels can be rebuilt in place. Set `MAX_JOBS`, `OMNI_BASE_IMAGE`, or
+`INSTALL_DISABLED_NODES=false` when a local build needs to override those
+defaults.
+
+After a PTL-H build, the installed kernel must report matching package and
+compiled-core targets:
+
+```bash
+docker run --rm \
+    intel/llm-scaler-omni:0.1.0-b8-dev-ptl-h \
+    python -c 'import omni_xpu_kernel as ok; print(ok.__version__, ok.__xpu_target__, ok.core_aot_target())'
+```
+
+Both target fields must be `ptl-h`; do not rename or reuse a BMG image for
+PTL-H.
 
 Run docker image:
 
