@@ -60,13 +60,20 @@ platform matrix and complete build procedure.
 CUTLASS-SYCL fused Flash Attention with fp32 accumulation, AOT-compiled for
 the target GPU. The currently validated domain is B=1, unmasked self-attention
 with standard `1/sqrt(head_dim)` scaling, head dimension 128, equal Q/K/V head
-counts, and fp16 or bf16 inputs in `[B, L, H, D]` layout.
+counts, and fp16 or bf16 inputs in `[B, L, H, D]` layout. PTL-H builds also
+provide a D120 self-attention entry point for dense packed-BHLD or BLHD-backed
+BHLD inputs. This separate API preserves the existing D128 layout contract and
+is not registered by BMG builds.
 
 ```python
 from omni_xpu_kernel import cute
 
 if cute.is_available():
     output = cute.sdp(q, k, v)
+
+if cute.supports_d120_bhld():
+    # q, k, v: [1, H, L, 120], dense packed-BHLD or BLHD-backed BHLD
+    output_bhld = cute.sdp_bhld_d120(q, k, v)
 ```
 
 The CUTE extension is Linux-only and required by default. `CUTLASS_SYCL_ROOT`
@@ -532,6 +539,10 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
 - LGRF and CUTE select explicit `ConfigPTLH` policies. Internal PTL-H
   representative-workload validation retained the current values; the separate
   types prevent later PTL-H tuning from silently changing BMG.
+- PTL-H CUTE exposes a dense-BHLD D120 self-attention capability using the
+  existing 128-wide physical tile with runtime tail handling and a one-stage
+  pipeline. BMG does not register this entry point; unsupported shapes and
+  layouts remain caller-controlled fallbacks.
 - oneDNN 3.9 cannot create the FP16 `M=4096, K=4096, N=4096` JIT GEMM primitive
   used as a chunk of the `N=12288` FP8 workflow shape. The implementation uses
   an `N=2048` chunk only on `intel_gpu_ptl_h`; BF16 and non-PTL paths retain the

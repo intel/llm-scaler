@@ -33,11 +33,19 @@ class _FakeTensor:
         dim_head=128,
         dtype=torch.bfloat16,
         pre_shaped=True,
+        stride=None,
     ):
         if pre_shaped:
             self.shape = (1, heads, seq, dim_head)
+            self._stride = stride or (
+                heads * seq * dim_head,
+                dim_head,
+                heads * dim_head,
+                1,
+            )
         else:
             self.shape = (1, seq, heads * dim_head)
+            self._stride = stride or (seq * heads * dim_head, heads * dim_head, 1)
         self.dtype = dtype
         self.device = types.SimpleNamespace(type="xpu")
 
@@ -53,6 +61,12 @@ class _FakeTensor:
     def permute(self, *dims):
         return self
 
+    def transpose(self, *dims):
+        return self
+
+    def stride(self):
+        return self._stride
+
     def __ne__(self, other):
         return types.SimpleNamespace(any=lambda: False)
 
@@ -63,6 +77,7 @@ def _load_patch(
     target="ptl-h",
     torch_version="2.11.0+xpu",
     backend="auto",
+    d120_capable=True,
 ):
     monkeypatch.setenv("OMNI_ATTN_BACKEND", backend)
     monkeypatch.setattr(torch, "__version__", torch_version)
@@ -111,6 +126,15 @@ def _load_patch(
             calls.append("cute")
             return q
 
+        @staticmethod
+        def supports_d120_bhld():
+            return d120_capable
+
+        @staticmethod
+        def sdp_bhld_d120(q, k, v):
+            calls.append("cute_d120")
+            return q
+
     omni = types.ModuleType("omni_xpu_kernel")
     omni.__xpu_target__ = target
     omni.__path__ = []
@@ -149,6 +173,18 @@ def test_ptl_auto_torch211_zimage_shape_uses_torch(monkeypatch, seq):
     assert patch.get_stats()["fallback"] == 0
 
 
+def test_ptl_auto_torch211_krea2_shape_uses_torch(monkeypatch):
+    patch, attention, calls = _load_patch(monkeypatch)
+    tensor = _FakeTensor(seq=4192, heads=48)
+    result = attention.optimized_attention(
+        tensor, tensor, tensor, heads=48, skip_reshape=True
+    )
+    assert result == "torch-output"
+    assert calls == ["torch"]
+    assert patch.get_stats()["torch_sdpa"] == 1
+    assert patch.get_stats()["fallback"] == 0
+
+
 def test_explicit_cute_does_not_apply_auto_route(monkeypatch):
     _, attention, calls = _load_patch(monkeypatch, backend="cute")
     tensor = _FakeTensor()
@@ -167,6 +203,7 @@ def test_explicit_cute_does_not_apply_auto_route(monkeypatch):
         ("ptl-h", "2.12.0+xpu", _FakeTensor(), 30),
         ("ptl-h", "2.11.0+xpu", _FakeTensor(heads=24), 24),
         ("ptl-h", "2.11.0+xpu", _FakeTensor(seq=4096), 30),
+        ("ptl-h", "2.11.0+xpu", _FakeTensor(seq=4191, heads=48), 48),
         (
             "ptl-h",
             "2.11.0+xpu",
@@ -204,3 +241,91 @@ def test_unvalidated_layouts_keep_cute(monkeypatch, tensor, kwargs):
     assert isinstance(result, _FakeTensor)
     assert calls == ["cute"]
     assert patch.get_stats()["torch_sdpa"] == 0
+
+
+@pytest.mark.parametrize("seq", [4096, 4205])
+def test_ptl_auto_boogu_d120_uses_strided_cute(monkeypatch, seq):
+    patch, attention, calls = _load_patch(monkeypatch)
+    tensor = _FakeTensor(
+        seq=seq,
+        heads=28,
+        dim_head=120,
+        dtype=torch.float16,
+    )
+    result = attention.optimized_attention(
+        tensor, tensor, tensor, heads=28, skip_reshape=True
+    )
+    assert isinstance(result, _FakeTensor)
+    assert calls == ["cute_d120"]
+    assert patch.get_stats()["esimd"] == 1
+    assert patch.get_stats()["fallback"] == 0
+
+
+@pytest.mark.parametrize(
+    ("target", "torch_version", "backend", "d120_capable", "seq"),
+    [
+        ("bmg", "2.11.0+xpu", "auto", True, 4096),
+        ("ptl-h", "2.10.0+xpu", "auto", True, 4096),
+        ("ptl-h", "2.12.0+xpu", "auto", True, 4096),
+        ("ptl-h", "2.11.0+xpu", "cute", True, 4096),
+        ("ptl-h", "2.11.0+xpu", "auto", False, 4096),
+        ("ptl-h", "2.11.0+xpu", "auto", True, 109),
+    ],
+)
+def test_unvalidated_boogu_d120_keeps_torch_fallback(
+    monkeypatch, target, torch_version, backend, d120_capable, seq
+):
+    patch, attention, calls = _load_patch(
+        monkeypatch,
+        target=target,
+        torch_version=torch_version,
+        backend=backend,
+        d120_capable=d120_capable,
+    )
+    tensor = _FakeTensor(
+        seq=seq,
+        heads=28,
+        dim_head=120,
+        dtype=torch.float16,
+    )
+    result = attention.optimized_attention(
+        tensor, tensor, tensor, heads=28, skip_reshape=True
+    )
+    assert result == "torch-output"
+    assert calls == ["torch"]
+    assert patch.get_stats()["fallback"] == 1
+
+
+def test_boogu_d120_rejects_unvalidated_tensor_contract(monkeypatch):
+    _, attention, calls = _load_patch(monkeypatch)
+    tensor = _FakeTensor(
+        seq=4096,
+        heads=28,
+        dim_head=120,
+        dtype=torch.float16,
+        stride=(13762560, 491520, 1, 4096),
+    )
+    result = attention.optimized_attention(
+        tensor, tensor, tensor, heads=28, skip_reshape=True
+    )
+    assert result == "torch-output"
+    assert calls == ["torch"]
+
+    calls.clear()
+    q = _FakeTensor(
+        seq=4096,
+        heads=28,
+        dim_head=120,
+        dtype=torch.float16,
+    )
+    k = _FakeTensor(
+        seq=4096,
+        heads=28,
+        dim_head=120,
+        dtype=torch.bfloat16,
+    )
+    result = attention.optimized_attention(
+        q, k, q, heads=28, skip_reshape=True
+    )
+    assert result == "torch-output"
+    assert calls == ["torch"]

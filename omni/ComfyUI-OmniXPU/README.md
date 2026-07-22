@@ -14,7 +14,7 @@ Requires `omni_xpu_kernel` installed. Without it the node loads silently with no
 
 | Patch | Target |
 |-------|--------|
-| Auto-routed cute/ESIMD Attention | `optimized_attention` |
+| Auto-routed CUTE/ESIMD/PyTorch Attention | `optimized_attention` |
 | ESIMD / Kitchen pair RoPE | `_apply_rope1` / `apply_rope1` / `apply_rope` (flux.math dual-tensor) |
 | ESIMD LayerNorm/RMSNorm | `LayerNorm.forward` / `RMSNorm.forward` / `rms_norm()` |
 | FP8 GEMM | `fp8_linear` / `mixed_precision_ops` |
@@ -128,14 +128,17 @@ OMNI_ATTN_BACKEND=esimd  # force ESIMD where supported; otherwise PyTorch
 OMNI_ATTN_BACKEND=torch  # keep the original PyTorch attention path
 ```
 
-With `auto`, validated PTL-H/Torch 2.11 Z-Image BF16 d128 self-attention shapes
-use the original PyTorch SDPA path. CUTE handles the remaining validated B=1,
-unmasked, standard-scale d128 self-attention domain; supported d64 and
-cross-attention calls use ESIMD. Masked attention, other batch sizes or head
-dimensions, GQA, custom scaling, and any unsupported shape fall back to the
-original PyTorch implementation. Explicit `cute` and `esimd` select only that
-fused backend and still use the safe PyTorch fallback outside its supported
-domain.
+With `auto`, validated PTL-H/Torch 2.11 Z-Image and Krea2 Turbo BF16 D128
+self-attention shapes use the original PyTorch SDPA path. The Boogu Image Turbo
+FP16 H28/D120 image and joint-stream shapes use the PTL-H native dense-BHLD
+CUTE capability when the loaded wheel exports it. CUTE handles the remaining
+validated B=1, unmasked, standard-scale D128 self-attention domain; supported
+D64 and cross-attention calls use ESIMD. Masked attention, other batch sizes or
+head dimensions, GQA, custom scaling, and any unsupported shape fall back to
+the original PyTorch implementation. Explicit `cute` and `esimd` select only
+that fused backend and still use the safe PyTorch fallback outside its
+supported domain. These are custom-node capability routes; they do not replace
+a model pipeline or model `forward`.
 
 `OMNIXPU_MEDIAN_STRICT_INDICES=1` makes the median workaround reproduce
 `torch.median`'s exact tie-break indices (values are always bit-exact).

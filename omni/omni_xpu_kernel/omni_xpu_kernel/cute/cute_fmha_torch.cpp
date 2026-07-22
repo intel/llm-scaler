@@ -1,8 +1,10 @@
 /***************************************************************************************************
  * Torch-callable wrapper around the cute_attn_analysis fused FMHA (example-06 kernel).
  *
- * Exposes  cute_fmha::sdp(q, k, v) -> o   with the SAME signature/layout as
- * omni_xpu_kernel.sdp:  q,k,v,o are [B, L, H, D] (B==1), fp16 or bf16, XPU.
+ * Exposes cute_fmha::sdp(q, k, v) -> o with the SAME signature/layout as
+ * omni_xpu_kernel.sdp: q,k,v,o are [B, L, H, D] (B==1, D==128), fp16 or bf16,
+ * XPU. PTL-H builds additionally expose a dense-BHLD D120 entry point used by
+ * the validated ComfyUI workflow route.
  *
  * The kernel body is the CUTLASS-SYCL flash-attention-v2 forward used by
  * 06_xe_fmha_fwd.cpp (d=128, platform-selected tile/GRF/pipeline policy).
@@ -17,6 +19,10 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 #include <torch/library.h>
+
+#include <cmath>
+#include <cstdint>
+#include <limits>
 
 #include <cute/tensor.hpp>
 #include <sycl/sycl.hpp>
@@ -79,11 +85,18 @@ static void launch_on_torch_queue(typename Kernel::Params params) {
   q.submit(cgf);
 }
 
-// ---- kernel type assembly (d=128, matches 06_xe_fmha_fwd.cpp PREFILL path) ---
+static int checked_int(int64_t value, const char* label) {
+  TORCH_CHECK(
+      value >= 0 && value <= std::numeric_limits<int>::max(), label,
+      " exceeds the CUTE int32 index range: ", value);
+  return static_cast<int>(value);
+}
+
+// ---- kernel type assembly (128-wide tile, example-06 PREFILL path) ----------
 // KV tile = get<1>(ShapeQK). Default 32 (stock example-06). -DCUTE_FMHA_KV64
 // switches to a 64-wide KV tile (fewer K-loop iters at large seq — omni uses 64).
-template <typename Element>
-struct D128Kernel {
+template <typename Element, int PipelineStagesOverride = 0>
+struct D128TileKernel {
   using PlatformConfig = cute_fmha_config::ActiveConfig;
 #if defined(CUTE_FMHA_KV64)
   // KV tile = get<1>(ShapeQK) = 64. Per get_tiled_mma_pv, the PV tile must be
@@ -105,7 +118,9 @@ struct D128Kernel {
 #ifdef CUTE_FMHA_STAGES
   static constexpr int PipelineStages = CUTE_FMHA_STAGES;
 #else
-  static constexpr int PipelineStages = PlatformConfig::PIPELINE_STAGES;
+  static constexpr int PipelineStages =
+      PipelineStagesOverride > 0 ? PipelineStagesOverride
+                                 : PlatformConfig::PIPELINE_STAGES;
 #endif
   static constexpr int GrfSize = PlatformConfig::GRF_SIZE;
 
@@ -161,15 +176,24 @@ struct D128Kernel {
       cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>;
 };
 
-template <typename Element>
-void run_d128(const void* q_ptr, const void* k_ptr, const void* v_ptr, void* o_ptr,
-              int B, int H, int Lq, int Lkv, int D, float scale) {
-  using KT   = D128Kernel<Element>;
+template <typename Element, int PipelineStagesOverride = 0>
+void run_d128_tile(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr, void* o_ptr,
+    int B, int H, int Lq, int Lkv, int D, float scale,
+    int64_t q_stride_seq = -1, int64_t q_stride_head = -1,
+    int64_t q_stride_batch = -1, int64_t k_stride_seq = -1,
+    int64_t k_stride_head = -1, int64_t k_stride_batch = -1,
+    int64_t v_stride_seq = -1, int64_t v_stride_head = -1,
+    int64_t v_stride_batch = -1, int64_t o_stride_seq = -1,
+    int64_t o_stride_head = -1, int64_t o_stride_batch = -1) {
+  using KT   = D128TileKernel<Element, PipelineStagesOverride>;
   using K    = typename KT::Kernel;
   using PS   = typename KT::ProblemShapeType;
 
   cutlass::KernelHardwareInfo hw_info;
-  hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+  hw_info.sm_count =
+      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
+          hw_info.device_id);
 
   PS shape;
   shape.batch = B;
@@ -181,15 +205,47 @@ void run_d128(const void* q_ptr, const void* k_ptr, const void* v_ptr, void* o_p
   shape.head_size_qk = D;
   shape.head_size_vo = D;
 
-  // Strides for CONTIGUOUS [B, L, H, D] inputs (no permute needed): logical cute
-  // modes are Q/K/O=(seq,dim,head,batch), V=(dim,seq,head,batch). Element (b,l,h,d)
-  // lives at b*(L*H*D)+l*(H*D)+h*D+d. Q/O use Lq; K/V use Lkv.
-  const int HD = H * D;
-  const int LqHD = Lq * H * D, LkvHD = Lkv * H * D;
-  typename KT::StrideQ stride_Q = cute::make_stride(HD, _1{}, D, LqHD);  // (seq,dim,head,batch)
-  typename KT::StrideK stride_K = cute::make_stride(HD, _1{}, D, LkvHD);
-  typename KT::StrideV stride_V = cute::make_stride(_1{}, HD, D, LkvHD); // (dim,seq,head,batch)
-  typename KT::StrideO stride_O = cute::make_stride(HD, _1{}, D, LqHD);
+  // Logical cute modes are Q/K/O=(seq,dim,head,batch) and
+  // V=(dim,seq,head,batch). Default strides consume contiguous BLHD. The D120
+  // entry point supplies the actual dense BHLD/BLHD-backed strides so it can
+  // match ComfyUI's mixed input layouts without materializing copies.
+  const int HD = checked_int(static_cast<int64_t>(H) * D, "H*D");
+  const int LqHD = checked_int(static_cast<int64_t>(Lq) * H * D, "Lq*H*D");
+  const int LkvHD = checked_int(static_cast<int64_t>(Lkv) * H * D, "Lkv*H*D");
+  if (q_stride_seq < 0) {
+    q_stride_seq = HD;
+    q_stride_head = D;
+    q_stride_batch = LqHD;
+    k_stride_seq = HD;
+    k_stride_head = D;
+    k_stride_batch = LkvHD;
+    v_stride_seq = HD;
+    v_stride_head = D;
+    v_stride_batch = LkvHD;
+    o_stride_seq = HD;
+    o_stride_head = D;
+    o_stride_batch = LqHD;
+  }
+  typename KT::StrideQ stride_Q =
+      cute::make_stride(
+          checked_int(q_stride_seq, "Q sequence stride"), _1{},
+          checked_int(q_stride_head, "Q head stride"),
+          checked_int(q_stride_batch, "Q batch stride"));
+  typename KT::StrideK stride_K =
+      cute::make_stride(
+          checked_int(k_stride_seq, "K sequence stride"), _1{},
+          checked_int(k_stride_head, "K head stride"),
+          checked_int(k_stride_batch, "K batch stride"));
+  typename KT::StrideV stride_V =
+      cute::make_stride(
+          _1{}, checked_int(v_stride_seq, "V sequence stride"),
+          checked_int(v_stride_head, "V head stride"),
+          checked_int(v_stride_batch, "V batch stride"));
+  typename KT::StrideO stride_O =
+      cute::make_stride(
+          checked_int(o_stride_seq, "output sequence stride"), _1{},
+          checked_int(o_stride_head, "output head stride"),
+          checked_int(o_stride_batch, "output batch stride"));
 
   typename K::Arguments arguments{
       {
@@ -209,7 +265,8 @@ void run_d128(const void* q_ptr, const void* k_ptr, const void* v_ptr, void* o_p
   auto opts = at::TensorOptions().dtype(at::kByte).device(at::kXPU);
   at::Tensor workspace = at::empty({(long)workspace_size}, opts);
 
-  TORCH_CHECK(K::can_implement(arguments), "cute_fmha: can_implement failed (bad problem shape)");
+  TORCH_CHECK(K::can_implement(arguments),
+              "cute_fmha: can_implement failed (bad problem shape)");
   K::initialize_workspace(arguments, workspace.data_ptr());
   auto kernel_params = K::to_underlying_arguments(arguments, workspace.data_ptr());
   launch_on_torch_queue<K, KT::GrfSize>(kernel_params);
@@ -228,37 +285,106 @@ at::Tensor sdp(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
               "cute_fmha: q, k, v must share dtype (got ",
               q.scalar_type(), ", ", k.scalar_type(), ", ", v.scalar_type(), ")");
   // Public layout is [B, L, H, D] (drop-in for omni_xpu_kernel.sdp). The kernel
-  // reads this contiguous layout directly via custom strides (run_d128), so no
+  // reads this contiguous layout directly via custom strides (run_d128_tile), so no
   // permute/copy is needed — output is also [B, L, H, D].
   // q,k,v are [B, L, H, D]. The current scheduler is validated only for
   // self-attention; reject cross-attention instead of returning silently
   // inaccurate results. ComfyUI routes cross-attention to the ESIMD backend.
-  const int B = q.size(0), Lq = q.size(1), H = q.size(2), D = q.size(3);
-  const int Lkv = k.size(1);
+  const int B = checked_int(q.size(0), "batch");
+  const int Lq = checked_int(q.size(1), "query length");
+  const int H = checked_int(q.size(2), "head count");
+  const int D = checked_int(q.size(3), "head dimension");
+  const int Lkv = checked_int(k.size(1), "key/value length");
   TORCH_CHECK(B == 1, "cute_fmha: only B==1 supported (got ", B, ")");
   TORCH_CHECK(D == 128, "cute_fmha: only head_dim==128 supported (got ", D, ")");
   TORCH_CHECK(Lq == Lkv,
               "cute_fmha: only self-attention with equal q/kv lengths is supported (got ",
               Lq, " and ", Lkv, ")");
   TORCH_CHECK(k.size(0) == B && v.size(0) == B, "cute_fmha: batch mismatch");
-  TORCH_CHECK(k.size(2) == H && v.size(2) == H, "cute_fmha: q,k,v must share num_heads (got ",
-              H, ",", k.size(2), ",", v.size(2), ")");
-  TORCH_CHECK(k.size(3) == D && v.size(3) == D, "cute_fmha: q,k,v must share head_dim");
-  TORCH_CHECK(v.size(1) == Lkv, "cute_fmha: k,v seq_len must match (got ", Lkv, ",", v.size(1), ")");
+  TORCH_CHECK(k.size(2) == H && v.size(2) == H,
+              "cute_fmha: q,k,v must share num_heads (got ", H, ",",
+              k.size(2), ",", v.size(2), ")");
+  TORCH_CHECK(k.size(3) == D && v.size(3) == D,
+              "cute_fmha: q,k,v must share head_dim");
+  TORCH_CHECK(v.size(1) == Lkv,
+              "cute_fmha: k,v seq_len must match (got ", Lkv, ",",
+              v.size(1), ")");
 
   auto qc = q.contiguous(), kc = k.contiguous(), vc = v.contiguous();
-  at::Tensor o = at::empty_like(qc);                // [B,Lq,H,D]
+  at::Tensor o = at::empty_like(qc);
   const float scale = 1.0f / std::sqrt((float)D);
 
   if (q.scalar_type() == at::kHalf) {
-    run_d128<cutlass::half_t>(qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), o.data_ptr(), B, H, Lq, Lkv, D, scale);
+    run_d128_tile<cutlass::half_t>(
+        qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), o.data_ptr(), B, H, Lq,
+        Lkv, D, scale);
   } else if (q.scalar_type() == at::kBFloat16) {
-    run_d128<cutlass::bfloat16_t>(qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), o.data_ptr(), B, H, Lq, Lkv, D, scale);
+    run_d128_tile<cutlass::bfloat16_t>(
+        qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), o.data_ptr(), B, H, Lq,
+        Lkv, D, scale);
   } else {
     TORCH_CHECK(false, "cute_fmha: only fp16/bf16 supported");
   }
   return o;
 }
+
+#if defined(OMNI_XPU_ARCH_PTL_H)
+bool is_supported_bhld_layout(
+    const at::Tensor& tensor, int64_t H, int64_t L, int64_t D) {
+  if (tensor.stride(3) != 1 || tensor.stride(0) != H * L * D) {
+    return false;
+  }
+  const bool packed_bhld =
+      tensor.stride(1) == L * D && tensor.stride(2) == D;
+  const bool blhd_backed =
+      tensor.stride(1) == D && tensor.stride(2) == H * D;
+  return packed_bhld || blhd_backed;
+}
+
+at::Tensor sdp_bhld_d120(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+  TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+              "cute_fmha: expect BHLD tensors");
+  TORCH_CHECK(q.device().is_xpu() && k.device().is_xpu() && v.device().is_xpu(),
+              "cute_fmha: q, k, v must all be XPU tensors");
+  TORCH_CHECK(k.scalar_type() == q.scalar_type() && v.scalar_type() == q.scalar_type(),
+              "cute_fmha: q, k, v must share dtype");
+
+  const int B = checked_int(q.size(0), "batch");
+  const int H = checked_int(q.size(1), "head count");
+  const int L = checked_int(q.size(2), "sequence length");
+  const int D = checked_int(q.size(3), "head dimension");
+  TORCH_CHECK(B == 1, "cute_fmha: D120 BHLD requires B==1");
+  TORCH_CHECK(D == 120, "cute_fmha: D120 BHLD requires head_dim==120");
+  TORCH_CHECK(k.sizes() == q.sizes() && v.sizes() == q.sizes(),
+              "cute_fmha: D120 BHLD requires matching self-attention Q/K/V");
+  TORCH_CHECK(is_supported_bhld_layout(q, H, L, D) &&
+                  is_supported_bhld_layout(k, H, L, D) &&
+                  is_supported_bhld_layout(v, H, L, D),
+              "cute_fmha: D120 BHLD requires dense packed-BHLD or BLHD-backed tensors");
+
+  // BLHD storage exposed as BHLD matches Torch SDPA's output strides. The
+  // following ComfyUI transpose+reshape is therefore a metadata-only view.
+  at::Tensor o = at::empty({B, L, H, D}, q.options()).permute({0, 2, 1, 3});
+  const float scale = 1.0f / std::sqrt((float)D);
+  if (q.scalar_type() == at::kHalf) {
+    run_d128_tile<cutlass::half_t, 1>(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(), B, H, L, L, D,
+        scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+        k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+        o.stride(2), o.stride(1), o.stride(0));
+  } else if (q.scalar_type() == at::kBFloat16) {
+    run_d128_tile<cutlass::bfloat16_t, 1>(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(), B, H, L, L, D,
+        scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+        k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+        o.stride(2), o.stride(1), o.stride(0));
+  } else {
+    TORCH_CHECK(false, "cute_fmha: D120 BHLD supports fp16/bf16 only");
+  }
+  return o;
+}
+#endif
 
 }  // namespace
 
@@ -268,8 +394,21 @@ at::Tensor sdp(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
 #ifndef CUTE_FMHA_NS
 #define CUTE_FMHA_NS cute_fmha
 #endif
+#if defined(OMNI_XPU_ARCH_PTL_H)
+#define CUTE_FMHA_D120_DEF(m) m.def("sdp_bhld_d120(Tensor q, Tensor k, Tensor v) -> Tensor");
+#define CUTE_FMHA_D120_IMPL(m) m.impl("sdp_bhld_d120", &sdp_bhld_d120);
+#else
+#define CUTE_FMHA_D120_DEF(m)
+#define CUTE_FMHA_D120_IMPL(m)
+#endif
 #define CUTE_FMHA_LIB_(NS) \
-  TORCH_LIBRARY(NS, m) { m.def("sdp(Tensor q, Tensor k, Tensor v) -> Tensor"); } \
-  TORCH_LIBRARY_IMPL(NS, XPU, m) { m.impl("sdp", &sdp); }
+  TORCH_LIBRARY(NS, m) { \
+    m.def("sdp(Tensor q, Tensor k, Tensor v) -> Tensor"); \
+    CUTE_FMHA_D120_DEF(m) \
+  } \
+  TORCH_LIBRARY_IMPL(NS, XPU, m) { \
+    m.impl("sdp", &sdp); \
+    CUTE_FMHA_D120_IMPL(m) \
+  }
 #define CUTE_FMHA_LIB(NS) CUTE_FMHA_LIB_(NS)
 CUTE_FMHA_LIB(CUTE_FMHA_NS)

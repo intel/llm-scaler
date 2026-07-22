@@ -60,18 +60,73 @@ def _use_ptl_torch_sdpa(
     skip_output_reshape,
 ):
     """Select only workflow shapes validated on PTL-H with Torch 2.11."""
+    is_zimage = heads == 30 and q_len in (64, 1024, 1088)
+    is_krea2 = heads == 48 and q_len == 4192
     return (
         _backend == "auto"
         and _backend_name == "cute"
         and _omni_xpu_target() == "ptl-h"
         and _torch_major_minor() == (2, 11)
         and q.dtype == torch.bfloat16
-        and heads == 30
         and dim_head == 128
         and q_len == kv_len
-        and q_len in (64, 1024, 1088)
+        and (is_zimage or is_krea2)
         and skip_reshape
         and not skip_output_reshape
+    )
+
+
+def _is_dense_d120_bhld(tensor, heads, seq, dim_head):
+    try:
+        shape = tuple(tensor.shape)
+        strides = tensor.stride()
+    except (AttributeError, TypeError):
+        return False
+    if shape != (1, heads, seq, dim_head):
+        return False
+    if len(strides) != 4 or strides[3] != 1:
+        return False
+    if strides[0] != heads * seq * dim_head:
+        return False
+    packed_bhld = strides[1] == seq * dim_head and strides[2] == dim_head
+    blhd_backed = strides[1] == dim_head and strides[2] == heads * dim_head
+    return packed_bhld or blhd_backed
+
+
+def _use_ptl_cute_d120(
+    q,
+    k,
+    v,
+    heads,
+    dim_head,
+    q_len,
+    kv_len,
+    skip_reshape,
+    skip_output_reshape,
+):
+    capability = getattr(_backend_sdp, "supports_d120_bhld", None)
+    return (
+        _backend == "auto"
+        and _backend_name == "cute"
+        and _omni_xpu_target() == "ptl-h"
+        and _torch_major_minor() == (2, 11)
+        and callable(capability)
+        and capability()
+        and q.dtype == torch.float16
+        and k.dtype == q.dtype
+        and v.dtype == q.dtype
+        and q.device.type == "xpu"
+        and k.device.type == "xpu"
+        and v.device.type == "xpu"
+        and heads == 28
+        and dim_head == 120
+        and q_len == kv_len
+        and q_len in (4096, 4205)
+        and skip_reshape
+        and not skip_output_reshape
+        and _is_dense_d120_bhld(q, heads, q_len, dim_head)
+        and _is_dense_d120_bhld(k, heads, kv_len, dim_head)
+        and _is_dense_d120_bhld(v, heads, kv_len, dim_head)
     )
 
 
@@ -194,13 +249,30 @@ def apply():
             b, _, dim_head = q.shape
             dim_head //= heads
 
+        if skip_reshape:
+            q_len, kv_len = q.shape[2], k.shape[2]
+        else:
+            q_len, kv_len = q.shape[1], k.shape[1]
+
+        use_ptl_cute_d120 = _use_ptl_cute_d120(
+            q,
+            k,
+            v,
+            heads,
+            dim_head,
+            q_len,
+            kv_len,
+            skip_reshape,
+            skip_output_reshape,
+        )
+
         # Constraint check
         reasons = []
         if b != 1:
             reasons.append(f"batch={b}")
         if mask is not None:
             reasons.append(f"mask={mask.shape}")
-        if dim_head not in (64, 128):
+        if dim_head not in (64, 128) and not use_ptl_cute_d120:
             reasons.append(f"dim_head={dim_head}")
         if q.device.type != "xpu":
             reasons.append(f"device={q.device.type}")
@@ -213,15 +285,10 @@ def apply():
 
         selected_sdp = _backend_sdp
         selected_backend = _backend_name
-        if skip_reshape:
-            q_len, kv_len = q.shape[2], k.shape[2]
-        else:
-            q_len, kv_len = q.shape[1], k.shape[1]
-
-        # Torch 2.11 SDPA is faster end-to-end for the measured PTL-H Z-Image
-        # D128 self-attention shapes. Keep this route narrower than the generic
-        # d128 CUTE domain: explicit `cute`, other platforms/versions, dtypes,
-        # head counts, and sequence lengths retain the existing policy.
+        # Torch 2.11 SDPA is faster end-to-end for the measured PTL-H D128
+        # workflow shapes. Keep this route narrower than the generic d128 CUTE
+        # domain: explicit `cute`, other platforms/versions, dtypes, head
+        # counts, and sequence lengths retain the existing policy.
         if not reasons and _use_ptl_torch_sdpa(
             q,
             heads,
@@ -244,7 +311,7 @@ def apply():
                 "kernel",
                 "attention",
                 {"q": q, "k": k, "v": v},
-                details={"backend": "torch", "route": "ptl_torch211_zimage"},
+                details={"backend": "torch", "route": "ptl_torch211_workflow"},
             )
             return _pytorch_fallback(
                 q,
@@ -257,6 +324,30 @@ def apply():
                 skip_output_reshape=skip_output_reshape,
                 **kwargs,
             )
+
+        # Boogu's PTL-H D120 route consumes the exact BHLD input strides and
+        # returns a BLHD-backed BHLD view.  The final transpose+reshape is a
+        # metadata-only view, avoiding all layout copies.  This remains an
+        # auto-only, Torch-2.11, workflow-shape route; unsupported wheels and
+        # layouts retain the unmodified Torch fallback.
+        if not reasons and use_ptl_cute_d120:
+            _esimd_call_count += 1
+            if _esimd_call_count <= 3:
+                log.info(
+                    "[OmniXPU] attention CUTE_D120 #%d: heads=%d seq=%d dtype=%s",
+                    _esimd_call_count,
+                    heads,
+                    q_len,
+                    q.dtype,
+                )
+            log_debug_event(
+                "kernel",
+                "attention",
+                {"q": q, "k": k, "v": v},
+                details={"backend": "cute", "route": "ptl_cute_d120_bhld"},
+            )
+            out = _backend_sdp.sdp_bhld_d120(q, k, v)
+            return out.transpose(1, 2).reshape(b, -1, heads * dim_head)
 
         # cute is currently accepted only for d128 self-attention. Auto keeps
         # d64 and cross-attention on ESIMD; explicit cute never silently changes

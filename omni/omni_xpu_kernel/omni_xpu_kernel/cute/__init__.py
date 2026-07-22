@@ -5,10 +5,15 @@ Drop-in for :func:`omni_xpu_kernel.sdp.sdp` — same signature and layout::
     from omni_xpu_kernel import cute
     out = cute.sdp(q, k, v)   # self-attn [B, L, H, D] (B==1, D==128), fp16/bf16
 
+PTL-H wheels also expose a workflow-tuned D120 entry point that consumes dense
+packed-BHLD or BLHD-backed BHLD layouts without intermediate copies::
+
+    out = cute.sdp_bhld_d120(q, k, v)  # [B, H, L, 120]
+
 Unlike the ESIMD ``sdp`` kernel (fp16 accumulator + adaptive V-scaling), the cute
 FMHA accumulates QK and P*V in fp32, so it does not overflow on large-magnitude
 activations (e.g. Qwen-Image). It is AOT-compiled into ``cute_fmha_torch.so`` and
-exposes ``torch.ops.cute_fmha.sdp``. The current Kernel accepts self-attention
+exposes ``torch.ops.cute_fmha.sdp``. The current kernel accepts self-attention
 only; callers must route differing query/key sequence lengths elsewhere.
 """
 
@@ -66,4 +71,23 @@ def sdp(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return torch.ops.cute_fmha.sdp(q, k, v)
 
 
-__all__ = ["sdp", "is_available"]
+def supports_d120_bhld() -> bool:
+    """Whether this target sidecar exports the PTL-H D120 BHLD kernel."""
+    try:
+        _ensure_loaded()
+        return hasattr(torch.ops.cute_fmha, "sdp_bhld_d120")
+    except Exception:
+        return False
+
+
+def sdp_bhld_d120(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """PTL-H fused self-attention for dense ``[B,H,L,120]`` inputs."""
+    _ensure_loaded()
+    if not hasattr(torch.ops.cute_fmha, "sdp_bhld_d120"):
+        raise RuntimeError("CUTE D120 BHLD kernel is unavailable in this sidecar")
+    return torch.ops.cute_fmha.sdp_bhld_d120(q, k, v)
+
+
+__all__ = ["sdp", "sdp_bhld_d120", "supports_d120_bhld", "is_available"]
