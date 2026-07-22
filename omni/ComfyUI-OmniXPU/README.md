@@ -35,6 +35,7 @@ OMNIXPU_ROPE=0              # Disable all Omni XPU RoPE routes
 OMNIXPU_ZIMAGE_ROPE_PAIR=0  # Disable the PTL-H Z-Image Q/K pair route
 OMNIXPU_NORM=0              # Disable ESIMD LayerNorm/RMSNorm only
 OMNIXPU_NONCONTIG_RMSNORM=0 # Disable the PTL-H split-QKV RMSNorm route
+OMNIXPU_H120_RMSNORM=0      # Disable PTL-H native H120 RMSNorm
 OMNIXPU_KREA2_RMSNORM=0     # Disable the Krea2-specific local RMSNorm hook only
 OMNIXPU_FP8_GEMM=0          # Disable FP8 GEMM only
 OMNIXPU_INT8=0              # Disable all INT8 routes
@@ -47,6 +48,13 @@ OMNIXPU_MEDIAN_FIX=0        # Disable median workaround only
 On PTL-H, eligible Lumina/Z-Image split-QKV views are materialized once and
 then use the ESIMD RMSNorm kernel. Setting `OMNIXPU_NONCONTIG_RMSNORM=0`
 leaves these views on the original Torch path.
+
+On a PTL-H-targeted wheel, contiguous FP16 H120 RMSNorm uses the native core
+kernel instead of the multi-kernel PyTorch decomposition. This is a general
+norm capability route; it does not replace a model `forward`. Set
+`OMNIXPU_H120_RMSNORM=0` to retain the PyTorch path. The patch also requires an
+H120 feature marker from the loaded native binary, so an older or stale PTL-H
+`_C` artifact stays on the safe PyTorch fallback.
 
 PTL-H/Torch 2.11 Z-Image BF16 Q/K pairs with the validated 30-head, D128
 layouts use the native Kitchen pair-RoPE kernel. It preserves the adjacent-pair

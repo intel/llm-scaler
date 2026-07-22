@@ -36,6 +36,19 @@ struct RmsNormH128PTLConfig {
         ((Blocks * static_cast<int>(sizeof(float)) + 15) / 16) * 16;
 };
 
+// Boogu Image uses FP16 Q/K heads with D=120. This hidden size cannot enter
+// the generic power-of-two block dispatch. One ESIMD work-item per row keeps
+// the complete head in GRF, performs a 7x16 + 8 reduction, and removes the
+// multi-kernel PyTorch RMSNorm decomposition.
+struct RmsNormH120FP16PTLConfig {
+    static constexpr int HiddenSize = 120;
+    static constexpr int WideBlockSize = 16;
+    static constexpr int WideBlocks = 7;
+    static constexpr int TailBlockSize = 8;
+    static constexpr int TailOffset = WideBlockSize * WideBlocks;
+};
+
+class RmsNormH120FP16PTLKernel;
 class RmsNormH128PTLKernel;
 class RmsNormH128FP32PTLKernel;
 
@@ -55,6 +68,84 @@ struct RmsNormGateResidualH3840PTLConfig {
 };
 
 class RmsNormGateResidualH3840PTLKernel;
+
+void rms_norm_h120_fp16_ptl_kernel(
+    const void* weight_ptr,
+    const void* input_ptr,
+    void* output_ptr,
+    float eps,
+    const int input_size,
+    const at::Device& device
+) {
+    using Config = RmsNormH120FP16PTLConfig;
+    const fp16* weight = static_cast<const fp16*>(weight_ptr);
+    const fp16* input = static_cast<const fp16*>(input_ptr);
+    fp16* output = static_cast<fp16*>(output_ptr);
+
+    auto cgf = [&](sycl::handler& handle) {
+        handle.parallel_for<RmsNormH120FP16PTLKernel>(
+            sycl::range<1>(input_size),
+            [=](sycl::item<1> item) SYCL_ESIMD_KERNEL {
+                const int row = item.get_id(0);
+                const fp16* input_row =
+                    input + static_cast<size_t>(row) * Config::HiddenSize;
+                fp16* output_row =
+                    output + static_cast<size_t>(row) * Config::HiddenSize;
+                simd<fp16, Config::HiddenSize> cached;
+                simd<float, Config::WideBlockSize> accumulator = 0;
+
+#pragma unroll
+                for (int block = 0; block < Config::WideBlocks; ++block) {
+                    simd<fp16, Config::WideBlockSize> values =
+                        block_load<fp16, Config::WideBlockSize>(
+                            input_row + block * Config::WideBlockSize);
+                    cached.template select<Config::WideBlockSize, 1>(
+                        block * Config::WideBlockSize) = values;
+                    simd<float, Config::WideBlockSize> values_f32 = values;
+                    accumulator += values_f32 * values_f32;
+                }
+                simd<fp16, Config::TailBlockSize> tail =
+                    block_load<fp16, Config::TailBlockSize>(
+                        input_row + Config::TailOffset);
+                cached.template select<Config::TailBlockSize, 1>(
+                    Config::TailOffset) = tail;
+                simd<float, Config::TailBlockSize> tail_f32 = tail;
+                const float sum_squares =
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::WideBlockSize>(accumulator) +
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::TailBlockSize>(
+                        tail_f32 * tail_f32);
+                const float scale = rsqrt(
+                    sum_squares / Config::HiddenSize + eps);
+
+#pragma unroll
+                for (int block = 0; block < Config::WideBlocks; ++block) {
+                    simd<float, Config::WideBlockSize> values =
+                        cached.template select<Config::WideBlockSize, 1>(
+                            block * Config::WideBlockSize);
+                    simd<float, Config::WideBlockSize> weights =
+                        block_load<fp16, Config::WideBlockSize>(
+                            weight + block * Config::WideBlockSize);
+                    block_store<fp16, Config::WideBlockSize>(
+                        output_row + block * Config::WideBlockSize,
+                        simd<fp16, Config::WideBlockSize>(
+                            values * scale * weights));
+                }
+                simd<float, Config::TailBlockSize> tail_values =
+                    cached.template select<Config::TailBlockSize, 1>(
+                        Config::TailOffset);
+                simd<float, Config::TailBlockSize> tail_weights =
+                    block_load<fp16, Config::TailBlockSize>(
+                        weight + Config::TailOffset);
+                block_store<fp16, Config::TailBlockSize>(
+                    output_row + Config::TailOffset,
+                    simd<fp16, Config::TailBlockSize>(
+                        tail_values * scale * tail_weights));
+            });
+    };
+    utils::submit_kernel(cgf, device, "rms_norm_h120_fp16_ptl");
+}
 
 void rms_norm_h128_ptl_kernel(
     const void* weight_ptr,
@@ -697,6 +788,13 @@ torch::Tensor rms_norm(
         torch::device(input.device()).dtype(input.dtype()));
 
 #if defined(OMNI_XPU_ARCH_PTL_H)
+    if (hidden_size == RmsNormH120FP16PTLConfig::HiddenSize &&
+        input.scalar_type() == ST::Half) {
+        rms_norm_h120_fp16_ptl_kernel(
+            weight.data_ptr(), input.data_ptr(), output.data_ptr(),
+            static_cast<float>(eps), input_size, input.device());
+        return output;
+    }
     if (hidden_size == RmsNormH128PTLConfig::HiddenSize &&
         input_size >= RmsNormH128PTLConfig::MinimumRows) {
         if (input.scalar_type() == ST::BFloat16) {

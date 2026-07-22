@@ -29,3 +29,19 @@ def test_core_aot_target_is_empty_for_legacy_or_unavailable_binary(monkeypatch):
 
     monkeypatch.setattr(omni_xpu_kernel, "_load_extension", unavailable)
     assert omni_xpu_kernel.core_aot_target() == ""
+
+
+def test_norm_h120_capability_comes_from_loaded_binary(monkeypatch):
+    from omni_xpu_kernel import norm
+
+    monkeypatch.setattr(
+        norm, "_get_native", lambda: SimpleNamespace(__h120_fp16__=True)
+    )
+    assert norm.supports_h120_fp16() is True
+
+
+def test_norm_h120_capability_is_false_for_legacy_binary(monkeypatch):
+    from omni_xpu_kernel import norm
+
+    monkeypatch.setattr(norm, "_get_native", lambda: SimpleNamespace())
+    assert norm.supports_h120_fp16() is False

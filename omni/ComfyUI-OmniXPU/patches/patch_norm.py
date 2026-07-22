@@ -21,6 +21,7 @@ log = logging.getLogger("ComfyUI-OmniXPU")
 _omni_norm = None
 _logged_first_use = False
 _allow_noncontiguous_rms = False
+_allow_h120_rms = False
 
 
 def _can_use_omni(x):
@@ -39,7 +40,7 @@ def _rms_input_2d(x):
     if _omni_norm is None or not x.is_xpu or x.ndim < 2:
         return None
     h = x.shape[-1]
-    if h > 8192 or h % 32 != 0:
+    if h > 8192 or (h % 32 != 0 and not (_allow_h120_rms and h == 120)):
         return None
     if not x.is_contiguous():
         # Lumina/Z-Image Q and K are views into a combined QKV projection. The
@@ -92,7 +93,7 @@ def _run_rms_norm(weight, x, eps):
 
 
 def apply():
-    global _allow_noncontiguous_rms, _omni_norm
+    global _allow_h120_rms, _allow_noncontiguous_rms, _omni_norm
     import sys
     probe = sys.modules.get("ComfyUI-OmniXPU.probe")
     if probe.norm is None:
@@ -101,12 +102,26 @@ def apply():
     try:
         import omni_xpu_kernel as _omni_package
 
+        target = getattr(_omni_package, "__xpu_target__", "")
         _allow_noncontiguous_rms = (
-            getattr(_omni_package, "__xpu_target__", "") == "ptl-h"
+            target == "ptl-h"
             and os.environ.get("OMNIXPU_NONCONTIG_RMSNORM", "1") != "0"
+        )
+        supports_h120 = getattr(_omni_norm, "supports_h120_fp16", None)
+        _allow_h120_rms = (
+            target == "ptl-h"
+            and callable(supports_h120)
+            and supports_h120()
+            and os.environ.get("OMNIXPU_H120_RMSNORM", "1") != "0"
+        )
+        log.info(
+            "[OmniXPU] norm: H120 FP16 native route %s (target=%s)",
+            "enabled" if _allow_h120_rms else "disabled",
+            target or "unknown",
         )
     except ImportError:
         _allow_noncontiguous_rms = False
+        _allow_h120_rms = False
 
     import comfy.ops as comfy_ops
 

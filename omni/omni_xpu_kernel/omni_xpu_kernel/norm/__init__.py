@@ -25,6 +25,11 @@ def _get_native():
     return _load_extension().norm
 
 
+def supports_h120_fp16() -> bool:
+    """Return whether the loaded native binary contains the H120 FP16 route."""
+    return bool(getattr(_get_native(), "__h120_fp16__", False))
+
+
 def rms_norm(
     weight: torch.Tensor, input: torch.Tensor, eps: float = 1e-6
 ) -> torch.Tensor:
@@ -44,7 +49,8 @@ def rms_norm(
 
     Note:
         - Input must be 2D tensor [batch_size, hidden_size]
-        - hidden_size must be <= 8192 and divisible by 32
+        - hidden_size must be <= 8192 and divisible by 32, except that a
+          PTL-H binary may additionally advertise native FP16 H120 support
         - Supports fp32, fp16, bf16
     """
     return _get_native().rms_norm(weight, input, eps)

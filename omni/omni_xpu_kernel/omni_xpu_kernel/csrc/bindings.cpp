@@ -150,6 +150,12 @@ PYBIND11_MODULE(_C, m) {
 
     // Normalization
     auto norm = m.def_submodule("norm", "Normalization kernels");
+
+#if defined(OMNI_XPU_ARCH_PTL_H)
+    norm.attr("__h120_fp16__") = true;
+#else
+    norm.attr("__h120_fp16__") = false;
+#endif
     
     norm.def("rms_norm", &omni_xpu::norm::rms_norm,
         "RMSNorm using ESIMD optimization",

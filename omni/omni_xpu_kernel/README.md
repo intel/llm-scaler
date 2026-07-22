@@ -552,6 +552,10 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
   Krea2 attention normalization without changing its accumulation dtype. Small
   row counts, FP16, other hidden sizes, and BMG retain the generic work-group
   profile.
+- Contiguous FP16 RMSNorm with hidden size 120 uses a PTL-H one-work-item-per-
+  row profile for head-dimension normalization. The route is exposed as a
+  native norm capability with an explicit binary feature marker; BMG, stale
+  binaries, and other hidden sizes retain their established dispatch.
 - The validated Z-Image BF16 H3840 second-normalization boundary on PTL-H can
   fuse RMSNorm, gate multiplication, and residual addition while preserving the
   BF16 materialization between operations. Other shapes, dtypes, and platforms
