@@ -200,9 +200,18 @@ class TestQuantizeInt8Rowwise:
 
     @pytest.mark.skipif(not has_xpu(), reason="Large quant kernel requires XPU")
     @pytest.mark.parametrize(
-        "shape", [(1024, 10240), (4192, 6144), (4192, 16384)]
+        ("shape", "dtype"),
+        [
+            ((1024, 10240), torch.bfloat16),
+            ((4192, 6144), torch.bfloat16),
+            ((4192, 16384), torch.bfloat16),
+            ((4096, 3360), torch.float16),
+            ((4205, 3360), torch.float16),
+            ((4096, 13568), torch.float16),
+            ((4205, 13568), torch.float16),
+        ],
     )
-    def test_ptl_workflow_shapes(self, shape, seed):
+    def test_ptl_workflow_shapes(self, shape, dtype, seed):
         """PTL-specialized workflow shapes match rowwise QDQ."""
         from omni_xpu_kernel import int8
 
@@ -210,7 +219,7 @@ class TestQuantizeInt8Rowwise:
         if native is None or not hasattr(native, "quantize_int8_rowwise_fused"):
             pytest.skip("Native fused quant kernel is unavailable")
 
-        x = torch.randn(*shape, device="xpu", dtype=torch.bfloat16)
+        x = torch.randn(*shape, device="xpu", dtype=dtype)
         q, scale = native.quantize_int8_rowwise_fused(x)
         expected_scale = (
             x.float().abs().amax(dim=-1, keepdim=True) / 127.0

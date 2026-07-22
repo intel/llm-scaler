@@ -199,6 +199,33 @@ struct RowwiseQuantizeKrea2FFNDownPTLConfig {
     static constexpr int VectorWidth = 8;
 };
 
+// Boogu Image Turbo at 1024x1024 uses FP16 activations with either the image
+// stream (4096 rows) or the joined image/instruction stream (4205 rows).  Its
+// hidden projections quantize K=3360, while FFN down projections quantize
+// K=13568.  Both shapes benefit from retaining one complete row in SLM; twenty
+// SG32 subgroups with VEC16 were selected by a core-matched, process-isolated
+// sweep.  Keep the row guard exact so unrelated FP16 models retain the generic
+// path.
+struct RowwiseQuantizeBooguHiddenPTLConfig {
+    static constexpr int Columns = 3360;
+    static constexpr int ImageRows = 4096;
+    static constexpr int JointRows = 4205;
+    static constexpr int SubgroupSize = 32;
+    static constexpr int SubgroupsPerRow = 20;
+    static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
+    static constexpr int VectorWidth = 16;
+};
+
+struct RowwiseQuantizeBooguFFNDownPTLConfig {
+    static constexpr int Columns = 13568;
+    static constexpr int ImageRows = 4096;
+    static constexpr int JointRows = 4205;
+    static constexpr int SubgroupSize = 32;
+    static constexpr int SubgroupsPerRow = 20;
+    static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
+    static constexpr int VectorWidth = 16;
+};
+
 template <
     typename InputT,
     int Columns,
@@ -596,12 +623,34 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(
         }
 #endif
     } else if (x.scalar_type() == torch::kHalf) {
+#if defined(OMNI_XPU_ARCH_PTL_H)
+        if ((M == RowwiseQuantizeBooguHiddenPTLConfig::ImageRows ||
+             M == RowwiseQuantizeBooguHiddenPTLConfig::JointRows) &&
+            K == RowwiseQuantizeBooguHiddenPTLConfig::Columns) {
+            quantize_int8_rowwise_large_ptl_kernel<
+                fp16, RowwiseQuantizeBooguHiddenPTLConfig>(
+                reinterpret_cast<const fp16*>(x.data_ptr()),
+                reinterpret_cast<int8_t*>(output.data_ptr()),
+                scales.data_ptr<float>(), M, x.device());
+        } else if ((M == RowwiseQuantizeBooguFFNDownPTLConfig::ImageRows ||
+                    M == RowwiseQuantizeBooguFFNDownPTLConfig::JointRows) &&
+                   K == RowwiseQuantizeBooguFFNDownPTLConfig::Columns) {
+            quantize_int8_rowwise_large_ptl_kernel<
+                fp16, RowwiseQuantizeBooguFFNDownPTLConfig>(
+                reinterpret_cast<const fp16*>(x.data_ptr()),
+                reinterpret_cast<int8_t*>(output.data_ptr()),
+                scales.data_ptr<float>(), M, x.device());
+        } else {
+#endif
         quantize_int8_rowwise_kernel<fp16>(
             reinterpret_cast<const fp16*>(x.data_ptr()),
             reinterpret_cast<int8_t*>(output.data_ptr()),
             scales.data_ptr<float>(),
             M, K, x.device()
         );
+#if defined(OMNI_XPU_ARCH_PTL_H)
+        }
+#endif
     } else {
         quantize_int8_rowwise_kernel<float>(
             x.data_ptr<float>(),
