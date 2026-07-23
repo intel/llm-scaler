@@ -102,16 +102,16 @@ inline void moe_up_q4k_host(
 // ── Down stage: PACKED (zero extra memory, mirrors q5_k/q6_k_GEMV.h) ─────────
 // grid (n_routed, hidden). Each WI: dot(inter, dequant(down[eid,h_col,:])) *
 // topk_w -> per-route partial [n_routed, hidden] (host sums over top_k).
-// intermediate (=K of the down weight) must be a multiple of VL=512 (the
-// pre-shuffle tile) — true for the 35B (inter=512).
-static constexpr int MOE_DOWN_VL = 512;
+// Both down kernels read PLAIN qh and loop per 32-elem superblock at fixed simd
+// width 32, so intermediate (=K) may be any multiple of 32 (TP1 512 / TP2 256 /
+// TP4 128).
 
-// Q5_K down: ql [E,N,K/2] nibble + qh [E,N,K/8] pre-shuffled 1-bit +
-// scale,min [E,N,K/32] fp16. v5 = nibble|(qh<<4); w = scale*v5 - min.
+// Q5_K down: ql [E,N,K/2] nibble + qh [E,N,K/8] PLAIN 1-bit (byte j bit b = elem
+// 8j+b) + scale,min [E,N,K/32] fp16. v5 = nibble|(qh<<4); w = v5*scale - min.
 struct Moe_down_q5k_kernel {
     const fp16*    inter;      // [n_routed, K]
     const uint8_t* ql;         // [E, N, K/2]
-    const uint8_t* qh;         // [E, N, K/8] pre-shuffled
+    const uint8_t* qh;         // [E, N, K/8] PLAIN (byte j bit b = elem 8j+b)
     const fp16*    sc;         // [E, N, K/32]
     const fp16*    mn;         // [E, N, K/32]
     const int*     sel_experts;
@@ -130,45 +130,39 @@ struct Moe_down_q5k_kernel {
         const fp16*    scr = sc + ((size_t)eid * N + n) * Kg;
         const fp16*    mnr = mn + ((size_t)eid * N + n) * Kg;
 
-        simd<float, MOE_DOWN_VL> acc = 0.0f;  // reused per tile, sum at end
+        simd<float, 32> acc;                  // per-superblock scratch
+        const simd<uint32_t, 32> lane(0u, 1u);   // 0..31 = bit index within word
         float dot = 0.0f;
-        constexpr int VL = MOE_DOWN_VL, VL2 = VL / 2, VL8 = VL / 8, VLG = VL / 32;
-        for (int t = 0; t < K / VL; t++) {
-            const int kb = t * VL;
-            simd<fp16, VL> iv = block_load<fp16, VL>(i_row + kb);
-            simd<uint8_t, VL2> qd = block_load<uint8_t, VL2>(qlr + kb / 2);
-            simd<float, VL> wf;
-            #pragma unroll
-            for (int c = 0; c < VL2 / 64; c++) {
-                auto p = qd.template select<64, 1>(c * 64);
-                wf.template select<64, 2>(c * 128) = p & 0x0F;
-                wf.template select<64, 2>(c * 128 + 1) = (p >> 4) & 0x0F;
-            }
-            simd<uint8_t, VL8> qhd = block_load<uint8_t, VL8>(qhr + kb / 8);
-            #pragma unroll
-            for (int b = 0; b < 8; b++) {
-                simd<float, VL8> ef = (qhd >> b) & 1;
-                wf.template select<VL8, 1>(b * VL8) += ef * 16.0f;
-            }
-            #pragma unroll
-            for (int sb = 0; sb < VLG; sb++) {
-                float s = (float)scr[t * VLG + sb], m = (float)mnr[t * VLG + sb];
-                wf.template select<32, 1>(sb * 32) =
-                    wf.template select<32, 1>(sb * 32) * s - m;
-            }
-            acc = simd<float, VL>(iv) * wf;
-            dot += esimd_detail2::sum<float, float, VL>(acc);
+        for (int blk = 0; blk < Kg; blk++) {
+            const int e0 = blk * 32;
+            simd<fp16, 32>    iv = block_load<fp16, 32>(i_row + e0);
+            simd<uint8_t, 16> qd = block_load<uint8_t, 16>(qlr + e0 / 2);
+            simd<uint32_t, 1> qhw =
+                block_load<uint32_t, 1>(
+                    reinterpret_cast<const uint32_t*>(qhr + e0 / 8));
+            const uint32_t qh32 = qhw[0];
+            simd<float, 32> wf;
+            wf.template select<16, 2>(0) = qd & 0x0F;         // low  nibble -> 2j
+            wf.template select<16, 2>(1) = (qd >> 4) & 0x0F;  // high nibble -> 2j+1
+            // 5th bit: element e high = bit e of the little-endian 4-byte qh word.
+            simd<uint32_t, 32> hb = (simd<uint32_t, 32>(qh32) >> lane) & 1u;
+            wf += simd<float, 32>(hb) * 16.0f;
+            const float s = (float)scr[blk], m = (float)mnr[blk];
+            wf = wf * s - m;
+            acc = simd<float, 32>(iv) * wf;
+            dot += esimd_detail2::sum<float, float, 32>(acc);
         }
         out[(size_t)route * N + n] = fp16(dot * (float)topk_w[route]);
     }
 };
 
-// Q6_K down: ql [E,N,K/2] nibble + qh [E,N,K/4] pre-shuffled 2-bit +
-// scale [E,N,K/16] fp16. v6 = nibble|(qh<<4); w = scale*(v6-32). symmetric.
+// Q6_K down: ql [E,N,K/2] nibble + qh [E,N,K/4] PLAIN 2-bit (byte j field p =
+// elem 4j+p) + scale [E,N,K/16] fp16. v6 = nibble|(qh<<4); w = scale*(v6-32).
+// Per-32-elem block (= 2 scale sub-blocks of 16); fixed simd width 32, any K%32==0.
 struct Moe_down_q6k_kernel {
     const fp16*    inter;
     const uint8_t* ql;         // [E, N, K/2]
-    const uint8_t* qh;         // [E, N, K/4] pre-shuffled 2-bit
+    const uint8_t* qh;         // [E, N, K/4] PLAIN 2-bit (byte j field p = elem 4j+p)
     const fp16*    sc;         // [E, N, K/16]
     const int*     sel_experts;
     const fp16*    topk_w;
@@ -185,33 +179,30 @@ struct Moe_down_q6k_kernel {
         const uint8_t* qhr = qh + ((size_t)eid * N + n) * Kq;
         const fp16*    scr = sc + ((size_t)eid * N + n) * Kg;
 
+        // Each iter = 32 elems = 2 Q6_K scale sub-blocks of 16.
+        const simd<uint32_t, 16> lane2(0u, 2u);  // 0,2,..,30 = 2-bit field offsets
         float dot = 0.0f;
-        constexpr int VL = MOE_DOWN_VL, VL2 = VL / 2, VLQ = VL / 4, VLG = VL / 16;
-        for (int t = 0; t < K / VL; t++) {
-            const int kb = t * VL;
-            simd<fp16, VL> iv = block_load<fp16, VL>(i_row + kb);
-            simd<uint8_t, VL2> qd = block_load<uint8_t, VL2>(qlr + kb / 2);
-            simd<float, VL> wf;
-            #pragma unroll
-            for (int c = 0; c < VL2 / 64; c++) {
-                auto p = qd.template select<64, 1>(c * 64);
-                wf.template select<64, 2>(c * 128) = p & 0x0F;
-                wf.template select<64, 2>(c * 128 + 1) = (p >> 4) & 0x0F;
-            }
-            simd<uint8_t, VLQ> qhd = block_load<uint8_t, VLQ>(qhr + kb / 4);
-            #pragma unroll
-            for (int p = 0; p < 4; p++) {
-                simd<float, VLQ> ef = (qhd >> (2 * p)) & 3;
-                wf.template select<VLQ, 1>(p * VLQ) += ef * 16.0f;
-            }
-            #pragma unroll
-            for (int sb = 0; sb < VLG; sb++) {
-                float s = (float)scr[t * VLG + sb];
-                wf.template select<16, 1>(sb * 16) =
-                    (wf.template select<16, 1>(sb * 16) - 32.0f) * s;
-            }
-            simd<float, VL> prod = simd<float, VL>(iv) * wf;
-            dot += esimd_detail2::sum<float, float, VL>(prod);
+        for (int blk = 0; blk < K / 32; blk++) {
+            const int e0 = blk * 32;
+            simd<fp16, 32>    iv = block_load<fp16, 32>(i_row + e0);
+            simd<uint8_t, 16> qd = block_load<uint8_t, 16>(qlr + e0 / 2);
+            simd<uint32_t, 2> qhw =
+                block_load<uint32_t, 2>(
+                    reinterpret_cast<const uint32_t*>(qhr + e0 / 4));
+            const uint32_t w0 = qhw[0], w1 = qhw[1];
+            simd<float, 32> wf;
+            wf.template select<16, 2>(0) = qd & 0x0F;         // low  nibble -> 2j
+            wf.template select<16, 2>(1) = (qd >> 4) & 0x0F;  // high nibble -> 2j+1
+            // 2-bit high: elem e (0..15) high = bits [2e,2e+1] of w0; 16..31 of w1.
+            simd<uint32_t, 16> h0 = (simd<uint32_t, 16>(w0) >> lane2) & 3u;
+            simd<uint32_t, 16> h1 = (simd<uint32_t, 16>(w1) >> lane2) & 3u;
+            wf.template select<16, 1>(0)  += simd<float, 16>(h0) * 16.0f;
+            wf.template select<16, 1>(16) += simd<float, 16>(h1) * 16.0f;
+            const float s0 = (float)scr[blk * 2], s1 = (float)scr[blk * 2 + 1];
+            wf.template select<16, 1>(0)  = (wf.template select<16, 1>(0)  - 32.0f) * s0;
+            wf.template select<16, 1>(16) = (wf.template select<16, 1>(16) - 32.0f) * s1;
+            simd<float, 32> prod = simd<float, 32>(iv) * wf;
+            dot += esimd_detail2::sum<float, float, 32>(prod);
         }
         out[(size_t)route * N + n] = fp16(dot * (float)topk_w[route]);
     }
