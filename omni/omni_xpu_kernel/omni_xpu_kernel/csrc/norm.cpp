@@ -784,6 +784,19 @@ torch::Tensor rms_norm(
     int64_t input_size = input.size(0);
     int64_t hidden_size = input.size(1);
 
+#if defined(OMNI_XPU_ARCH_PTL_H)
+    const bool supported_hidden_size =
+        hidden_size % 32 == 0 ||
+        (hidden_size == RmsNormH120FP16PTLConfig::HiddenSize &&
+         input.scalar_type() == ST::Half);
+#else
+    const bool supported_hidden_size = hidden_size % 32 == 0;
+#endif
+    TORCH_CHECK(
+        hidden_size > 0 && hidden_size <= 8192 && supported_hidden_size,
+        "hidden_size must be nonzero, <=8192, and divisible by 32"
+        " (PTL-H additionally supports FP16 hidden_size=120)");
+
     auto output = torch::empty({input_size, hidden_size},
         torch::device(input.device()).dtype(input.dtype()));
 

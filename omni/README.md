@@ -59,6 +59,11 @@ Local images include both flavor and device in the tag, for example:
 - `intel/llm-scaler-omni:0.1.0-b9-dev-comfyui-ptl-h`
 - `intel/llm-scaler-omni:0.1.0-b9-dev-full-ptl-h`
 
+For the focused image, `build.sh` also records the full `llm-scaler` Git
+revision and whether the `omni/` worktree was dirty. These values are exposed
+as OCI labels and `OMNI_LLM_SCALER_SOURCE_*` environment variables; release
+acceptance rejects an unknown revision or dirty source by default.
+
 The builder and final image both use
 `intel/omix:0.1.0-devel-ubuntu24.04`; the final image retains `/opt/venv`,
 the `/llm` source/build trees, `/wheels`, and the oneAPI compiler so native
@@ -104,13 +109,13 @@ iteration. The intermediate `kernel-wheel` and `kitchen-wheel` targets exist
 for diagnostics, but release acceptance must use the default
 `runtime-comfyui` target.
 
-Dockerfiles construct the image; they do not contain source revision/version
-assertions or device-dependent acceptance checks. In particular, Docker build
-runs without `/dev/dri`, so Kitchen may correctly report its XPU backend as
-unavailable there. Revision policy belongs in the release/CI orchestration,
-while package identity, native AOT target, dependency consistency, real XPU
-availability, and Kitchen capabilities are checked in the final container by
-`tools/validate_comfyui_image.py`.
+Dockerfiles construct the image without a GPU device, so Kitchen may correctly
+report its XPU backend as unavailable during the build. `build.sh` records
+source provenance, while package identity, clean-source policy, native AOT
+target, dependency consistency, real XPU availability, and Kitchen
+capabilities are checked in the final container by
+`tools/validate_comfyui_image.py`. `--allow-dirty-source` is only for explicit
+development diagnostics and must not be used for release acceptance.
 
 After a PTL-H build, run the acceptance check with the real device exposed:
 

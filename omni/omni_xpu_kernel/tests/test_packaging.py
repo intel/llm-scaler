@@ -291,6 +291,60 @@ def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
     )
 
 
+@pytest.mark.parametrize("target", SUPPORTED_XPU_TARGETS)
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux core AOT command")
+def test_linux_core_compile_command_is_aot_for_every_supported_target(
+    monkeypatch, tmp_path, target
+):
+    import setuptools
+
+    monkeypatch.chdir(PROJECT_ROOT)
+    monkeypatch.delenv("CUTLASS_SYCL_ROOT", raising=False)
+    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
+    monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
+    namespace = run_path(
+        str(PROJECT_ROOT / "setup.py"), run_name="__core_aot_command_test__"
+    )
+
+    build_extension = namespace["ICPXBuildExt"].build_extension
+    build_globals = build_extension.__globals__
+    target_macro = (
+        "OMNI_XPU_ARCH_PTL_H" if target == "ptl-h" else "OMNI_XPU_ARCH_BMG"
+    )
+    monkeypatch.setitem(build_globals, "BUILD_XPU_TARGET", target)
+    monkeypatch.setitem(build_globals, "XPU_ARCH_MACRO", target_macro)
+    monkeypatch.setitem(build_globals, "get_icpx_path", lambda: "/fake/icpx")
+
+    commands = []
+
+    def capture_compile(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", capture_compile)
+
+    command = namespace["ICPXBuildExt"](setuptools.Distribution())
+    monkeypatch.setattr(
+        command,
+        "get_ext_fullpath",
+        lambda name: str(tmp_path / f"{name.rsplit('.', 1)[-1]}.so"),
+    )
+    extension = namespace["ICPXExtension"](
+        "omni_xpu_kernel._C", sourcedir=str(PROJECT_ROOT)
+    )
+    command.build_extension(extension)
+
+    assert len(commands) == 1
+    compile_command = commands[0]
+    assert compile_command[:2] == ["/fake/icpx", "-fsycl"]
+    assert "-fsycl-esimd-force-stateless-mem" in compile_command
+    assert compile_command.count("-fsycl-targets=spir64_gen") == 1
+    backend_index = compile_command.index("-Xsycl-target-backend")
+    assert compile_command[backend_index + 1] == f"-device {target}"
+    assert "-DOMNI_XPU_CORE_AOT=1" in compile_command
+    assert f"-D{target_macro}=1" in compile_command
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="ELF $ORIGIN is Linux-only")
 def test_linux_runtime_search_paths_are_prefix_relative(monkeypatch):
     import setuptools

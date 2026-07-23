@@ -17,9 +17,9 @@ After installation, `__version__`, `__torch_version__`, and `__xpu_target__`
 are read from that wheel's own dist-info rather than recomputed from the active
 environment, so replacing Torch or changing `OMNI_XPU_DEVICE` cannot change the
 native artifact's reported build identity. `core_aot_target()` independently
-reads an optional target marker compiled into `_C`; consumers that require a
-core AOT image can therefore reject an old or stale binary even when its
-Python metadata is newer.
+reads the target marker compiled into the Linux `_C` AOT image, so consumers
+can reject an old, JIT-only, or stale binary even when its Python metadata is
+newer.
 
 ## Modules
 
@@ -49,11 +49,13 @@ output = sdp.sdp(q, k, v)
 # are scaled to prevent fp16 overflow, with zero overhead on normal models.
 ```
 
-The LGRF/CUTE sidecars contain architecture-specific AOT images. PTL-H builds
-also AOT-compile the main `_C` extension because that platform cannot safely
-execute its plain-SYCL rowwise INT8 JIT image. Select the target with
-`OMNI_XPU_DEVICE`; see [Building from Source](#building-from-source) for the
-platform matrix and complete build procedure.
+The LGRF/CUTE sidecars and the main Linux `_C` extension contain
+architecture-specific AOT images. PTL-H originally required the core AOT path
+because that platform cannot safely execute its plain-SYCL rowwise INT8 JIT
+image; BMG uses the same explicit target contract so package, core, and
+sidecar identities cannot diverge. Select the target with `OMNI_XPU_DEVICE`;
+see [Building from Source](#building-from-source) for the platform matrix and
+complete build procedure.
 
 ### cute — CUTLASS-SYCL Flash Attention
 
@@ -276,11 +278,11 @@ if rotary.kitchen_rope_fast_supported(x, freqs_cis):
 
 ### Select the GPU target
 
-`OMNI_XPU_DEVICE` controls the AOT ISA embedded in `lgrf_sdp.so` and
-`cute_fmha_torch.so`; PTL-H additionally embeds a target-AOT `_C.so`. A wheel
-built for one target must not be installed on a different GPU architecture.
-The same validated target also selects kernel-local LGRF SDP and CUTE FMHA
-compile-time policies. Unknown values are rejected before compilation.
+`OMNI_XPU_DEVICE` controls the AOT ISA embedded in the Linux `_C.so`,
+`lgrf_sdp.so`, and `cute_fmha_torch.so`. A wheel built for one target must not
+be installed on a different GPU architecture. The same validated target also
+selects kernel-local LGRF SDP and CUTE FMHA compile-time policies. Unknown
+values are rejected before compilation.
 
 | Platform | SYCL architecture check | `OMNI_XPU_DEVICE` | Status |
 |---|---|---|---|
@@ -477,10 +479,9 @@ print(ok.is_available(), cute.is_available())
 '
 ```
 
-On PTL-H, `core_aot_target()` must equal `__xpu_target__`. An empty or
-different value is invalid for native dynamic INT8: it means the loaded `_C`
-is an older, non-AOT, or stale binary. BMG retains its established JIT core and
-does not currently require this marker.
+On Linux, `core_aot_target()` must equal `__xpu_target__` for both BMG and
+PTL-H. An empty or different value means the loaded `_C` is older, JIT-only,
+or stale and must fail image acceptance.
 
 ### oneDNN header/library consistency
 
@@ -527,6 +528,8 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
 #### Battlemage
 
 - `bmg` remains the default AOT target.
+- The main `_C` extension, LGRF, and CUTE all embed BMG-targeted AOT images;
+  `core_aot_target()` must report `bmg`.
 - LGRF `ConfigBMG` and CUTE `ConfigBMG` are the currently performance-tuned
   attention policies.
 - The PTL-specific oneDNN workaround described below is guarded by runtime
@@ -675,8 +678,8 @@ specific GPU via `-device <target>` (default: bmg).
 On Linux, the default build requires a valid `CUTLASS_SYCL_ROOT` and produces
 the CUTLASS-SYCL attention sidecar (`cute_fmha_torch.so`). Set
 `OMNI_XPU_REQUIRE_CUTE=0` only for an explicit core-only build. The remaining
-native operations are built into the main `_C` extension; that core is AOT on
-PTL-H and retains the established JIT build on BMG.
+native operations are built into the main `_C` extension; that core is
+AOT-compiled for the selected BMG or PTL-H target.
 
 `sdp_config.h` contains separate `ConfigBMG` and `ConfigPTLH` policies for both
 head dimensions. CUTE uses the same kernel-local pattern in
@@ -687,7 +690,7 @@ consistent.
 ### Build System
 
 The package builds multiple extension modules:
-- `_C.so` — Main extension (PTL-H AOT; BMG JIT; norm, gguf, svdq, rotary, sdp loader, fp8, int8)
+- `_C.so` — Main extension (BMG/PTL-H AOT; norm, gguf, svdq, rotary, sdp loader, fp8, int8)
 - `lgrf_sdp.so` — SDP ESIMD sidecar (AOT, doubleGRF)
 - `cute_fmha_torch.so` — CUTLASS-SYCL FMHA sidecar (Linux, AOT, required by default)
 

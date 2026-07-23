@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import os
+import re
 import subprocess
 import sys
 
@@ -37,6 +38,11 @@ def main() -> None:
         action="store_true",
         help="check package identity and imports without requiring a GPU",
     )
+    parser.add_argument(
+        "--allow-dirty-source",
+        action="store_true",
+        help="allow a development image built from a dirty llm-scaler worktree",
+    )
     args = parser.parse_args()
 
     import torch
@@ -47,10 +53,19 @@ def main() -> None:
     expected_image = os.environ["OMNI_IMAGE_VERSION"]
     expected_target = os.environ["OMNI_IMAGE_XPU_TARGET"]
     expected_kitchen = os.environ["OMNI_COMFY_KITCHEN_VERSION"]
+    source_revision = os.environ["OMNI_LLM_SCALER_SOURCE_REVISION"]
+    source_dirty = os.environ["OMNI_LLM_SCALER_SOURCE_DIRTY"]
 
     require_equal("image version", kernel_version.__image_version__, expected_image)
     require_equal("kernel package target", omni_xpu_kernel.__xpu_target__, expected_target)
     require_equal("kernel AOT target", omni_xpu_kernel.core_aot_target(), expected_target)
+    if re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
+        raise RuntimeError(
+            "llm-scaler source revision must be a full 40-character Git commit, "
+            f"got {source_revision!r}"
+        )
+    if not args.allow_dirty_source:
+        require_equal("llm-scaler source dirty", source_dirty, "false")
     require_equal(
         "Kitchen module version",
         comfy_kitchen.__version__,
@@ -97,6 +112,7 @@ def main() -> None:
     print(
         "ComfyUI image acceptance passed: "
         f"image={expected_image}, target={expected_target}, "
+        f"source={source_revision[:12]}, dirty={source_dirty}, "
         f"torch={torch.__version__}, kitchen={expected_kitchen}, "
         f"xpu={device_name!r}, kitchen_capabilities={len(capabilities)}"
     )

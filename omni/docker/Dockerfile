@@ -23,6 +23,8 @@ ARG SYCL_TLA_COMMIT=2fc09973bfdf15755090fcb0e3b6ad236408a992
 ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
 ARG COMFY_KITCHEN_COMMIT=223eea0c931bcf7a1bd0e83631e21b2a58961b28
 ARG COMFY_KITCHEN_VERSION=0.2.18
+ARG LLM_SCALER_SOURCE_REVISION=unknown
+ARG LLM_SCALER_SOURCE_DIRTY=unknown
 
 # ======== Stable OS/toolchain base ========
 # Keep device, image-version, Kitchen, and local-source arguments out of this
@@ -306,13 +308,17 @@ ARG IMAGE_TAG
 ARG SYCL_TLA_COMMIT
 ARG COMFY_KITCHEN_COMMIT
 ARG COMFY_KITCHEN_VERSION
+ARG LLM_SCALER_SOURCE_REVISION
+ARG LLM_SCALER_SOURCE_DIRTY
 
 RUN cp /opt/intel/oneapi/compiler/latest/lib/libsycl-native-*.spv \
     /usr/local/lib/
 
 LABEL org.opencontainers.image.version="${IMAGE_TAG}" \
+      org.opencontainers.image.revision="${LLM_SCALER_SOURCE_REVISION}" \
       com.intel.omni.image-flavor="comfyui" \
       com.intel.omni.xpu-target="${XPU_TARGET}" \
+      com.intel.omni.llm-scaler.source-dirty="${LLM_SCALER_SOURCE_DIRTY}" \
       com.intel.omni.sycl-tla.revision="${SYCL_TLA_COMMIT}" \
       com.intel.omni.comfy-kitchen.version="${COMFY_KITCHEN_VERSION}" \
       com.intel.omni.comfy-kitchen.revision="${COMFY_KITCHEN_COMMIT}"
@@ -321,6 +327,8 @@ ENV OMNIXPU_INTERPOLATE_FIX=0 \
     OMNI_IMAGE_VERSION="${IMAGE_TAG}" \
     OMNI_IMAGE_FLAVOR="comfyui" \
     OMNI_IMAGE_XPU_TARGET="${XPU_TARGET}" \
+    OMNI_LLM_SCALER_SOURCE_REVISION="${LLM_SCALER_SOURCE_REVISION}" \
+    OMNI_LLM_SCALER_SOURCE_DIRTY="${LLM_SCALER_SOURCE_DIRTY}" \
     OMNI_COMFY_KITCHEN_VERSION="${COMFY_KITCHEN_VERSION}"
 
 WORKDIR /llm/entrypoints

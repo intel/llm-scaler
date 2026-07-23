@@ -45,6 +45,21 @@ XPU_ARCH_MACROS = {
 XPU_ARCH_MACRO = XPU_ARCH_MACROS[BUILD_XPU_TARGET]
 
 
+def get_core_aot_compile_args(xpu_target):
+    """Return the target-specific flags shared by every Linux core build."""
+    if xpu_target not in XPU_ARCH_MACROS:
+        supported = ", ".join(XPU_ARCH_MACROS)
+        raise RuntimeError(
+            f"Unsupported core AOT target {xpu_target!r}; supported targets: {supported}"
+        )
+    return [
+        "-fsycl-targets=spir64_gen",
+        "-Xsycl-target-backend",
+        f"-device {xpu_target}",
+        "-DOMNI_XPU_CORE_AOT=1",
+    ]
+
+
 def get_icpx_path():
     """Find Intel icpx compiler."""
     # On Windows, the compiler is icx.exe (for C++) or icpx is a symlink
@@ -471,16 +486,10 @@ class ICPXBuildExt(build_ext):
                 )
             else:
                 cmd += ["-fsycl-esimd-force-stateless-mem"]
-                # PTL-H cannot safely execute the JIT image produced for the
-                # core's plain-SYCL subgroup rowwise INT8 quantizer. Keep the
-                # established BMG core build unchanged until BMG separately
-                # validates an AOT core.
-                if BUILD_XPU_TARGET == "ptl-h":
-                    cmd += [
-                        "-fsycl-targets=spir64_gen",
-                        "-Xsycl-target-backend", f"-device {BUILD_XPU_TARGET}",
-                        "-DOMNI_XPU_CORE_AOT=1",
-                    ]
+                # The image validator requires the package target and compiled
+                # core target to agree. Build both supported devices AOT so a
+                # BMG image cannot silently retain the legacy JIT core.
+                cmd += get_core_aot_compile_args(BUILD_XPU_TARGET)
                 cmd += [
                     "-O3", "-DNDEBUG",
                     f"-D{XPU_ARCH_MACRO}=1",

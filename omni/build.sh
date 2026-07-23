@@ -8,12 +8,26 @@ NO_PROXY="${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,::1,intel.com,.intel.com}}
 export HTTP_PROXY HTTPS_PROXY NO_PROXY
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPOSITORY_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || true)"
 VERSION_FILE="${SCRIPT_DIR}/omni_xpu_kernel/omni_xpu_kernel/_version.py"
 TAG="$(sed -n 's/^__image_version__ = "\([^"]*\)"$/\1/p' "${VERSION_FILE}")"
 if [ -z "${TAG}" ]; then
     echo "Unable to read Omni version from ${VERSION_FILE}" >&2
     exit 1
 fi
+
+DETECTED_SOURCE_REVISION=unknown
+DETECTED_SOURCE_DIRTY=unknown
+if [ -n "${REPOSITORY_ROOT}" ]; then
+    DETECTED_SOURCE_REVISION="$(git -C "${REPOSITORY_ROOT}" rev-parse HEAD)"
+    if [ -n "$(git -C "${REPOSITORY_ROOT}" status --porcelain --untracked-files=normal -- omni)" ]; then
+        DETECTED_SOURCE_DIRTY=true
+    else
+        DETECTED_SOURCE_DIRTY=false
+    fi
+fi
+SOURCE_REVISION="${OMNI_SOURCE_REVISION:-${DETECTED_SOURCE_REVISION}}"
+SOURCE_DIRTY="${OMNI_SOURCE_DIRTY:-${DETECTED_SOURCE_DIRTY}}"
 
 # XPU_TARGET is the canonical Docker build parameter. Keep OMNI_XPU_DEVICE as
 # a backwards-compatible user-facing alias used by existing kernel scripts.
@@ -85,6 +99,8 @@ if [ "${IMAGE_FLAVOR}" = "comfyui" ]; then
     DOCKER_ARGS+=(
         --build-arg "SYCL_TLA_REPOSITORY=${SYCL_TLA_REPOSITORY}"
         --build-arg "SYCL_TLA_COMMIT=${SYCL_TLA_COMMIT}"
+        --build-arg "LLM_SCALER_SOURCE_REVISION=${SOURCE_REVISION}"
+        --build-arg "LLM_SCALER_SOURCE_DIRTY=${SOURCE_DIRTY}"
     )
 else
     DOCKER_ARGS+=(

@@ -11,6 +11,15 @@
 - Split the focused Docker build into stable OS/Python/ComfyUI layers and
   independent Kitchen/kernel wheel branches so native iteration reuses the
   unrelated wheel and third-party dependency cache.
+- AOT-compile the main Linux `_C` extension for both BMG and PTL-H. The package
+  target, compiled-core marker, and image target must now agree on both
+  supported devices.
+
+### Correctness
+
+- Reject unsupported RMSNorm hidden sizes instead of returning a partially
+  written tensor. FP16 H120 remains a capability-gated PTL-H-only route; BMG
+  accepts the documented hidden sizes divisible by 32.
 
 ## dev/torch-version-tag (2026-07-17)
 
