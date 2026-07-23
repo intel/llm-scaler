@@ -1,5 +1,5 @@
 diff --git a/python/pyproject.toml b/python/pyproject.toml
-index a8e086c361..bec0935373 100755
+index a8e086c36..bec093537 100755
 --- a/python/pyproject.toml
 +++ b/python/pyproject.toml
 @@ -1,5 +1,5 @@
@@ -195,7 +195,7 @@ index a8e086c361..bec0935373 100755
 -[tool.kernels.dependencies]
 -"kernels-community/sgl-flash-attn3" = 1
 diff --git a/python/sglang/srt/configs/load_config.py b/python/sglang/srt/configs/load_config.py
-index 44ee91a1a2..38de4d83ab 100644
+index 44ee91a1a..38de4d83a 100644
 --- a/python/sglang/srt/configs/load_config.py
 +++ b/python/sglang/srt/configs/load_config.py
 @@ -25,6 +25,7 @@ class LoadFormat(str, enum.Enum):
@@ -208,7 +208,7 @@ index 44ee91a1a2..38de4d83ab 100644
      REMOTE = "remote"
 diff --git a/python/sglang/srt/layers/attention/fla/chunk_torch_xpu.py b/python/sglang/srt/layers/attention/fla/chunk_torch_xpu.py
 new file mode 100644
-index 0000000000..378fea0ccb
+index 000000000..378fea0cc
 --- /dev/null
 +++ b/python/sglang/srt/layers/attention/fla/chunk_torch_xpu.py
 @@ -0,0 +1,144 @@
@@ -357,7 +357,7 @@ index 0000000000..378fea0ccb
 +    # middle element (not as h_aux) is required for that scatter to run.
 +    return o, last_state, None
 diff --git a/python/sglang/srt/layers/attention/fla/layernorm_gated.py b/python/sglang/srt/layers/attention/fla/layernorm_gated.py
-index 5a8fda41b4..99c56f9ff8 100644
+index 5a8fda41b..99c56f9ff 100644
 --- a/python/sglang/srt/layers/attention/fla/layernorm_gated.py
 +++ b/python/sglang/srt/layers/attention/fla/layernorm_gated.py
 @@ -22,11 +22,27 @@ from sglang.srt.utils import (
@@ -447,7 +447,7 @@ index 5a8fda41b4..99c56f9ff8 100644
 +            activation=self.activation,
 +        )
 diff --git a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
-index d0a8ff7a90..7c0d37076e 100644
+index d0a8ff7a9..7c0d37076 100644
 --- a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
 +++ b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
 @@ -533,7 +533,14 @@ class MambaAttnBackendBase(AttentionBackend):
@@ -467,7 +467,7 @@ index d0a8ff7a90..7c0d37076e 100644
          if forward_mode.is_decode_or_idle():
              if num_padding == 0:
 diff --git a/python/sglang/srt/layers/attention/linear/gdn_backend.py b/python/sglang/srt/layers/attention/linear/gdn_backend.py
-index ade156e98c..a430c66952 100644
+index ade156e98..a430c6695 100644
 --- a/python/sglang/srt/layers/attention/linear/gdn_backend.py
 +++ b/python/sglang/srt/layers/attention/linear/gdn_backend.py
 @@ -18,7 +18,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -491,7 +491,7 @@ index ade156e98c..a430c66952 100644
                      ssm_states.dtype, copy=False
                  )
 diff --git a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
-index 0daf8f4e25..cab43381b4 100644
+index 0daf8f4e2..cab43381b 100644
 --- a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
 +++ b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
 @@ -34,6 +34,17 @@ elif is_xpu():
@@ -557,7 +557,7 @@ index 0daf8f4e25..cab43381b4 100644
              q=q,
              k=k,
 diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py
-index ae5365e8d6..0f54d2a8ce 100644
+index ae5365e8d..0f54d2a8c 100644
 --- a/python/sglang/srt/layers/attention/triton_backend.py
 +++ b/python/sglang/srt/layers/attention/triton_backend.py
 @@ -36,6 +36,21 @@ _is_gfx942 = is_gfx942_supported()
@@ -667,7 +667,7 @@ index ae5365e8d6..0f54d2a8ce 100644
              q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
              self.token_to_kv_pool.get_key_buffer(layer.layer_id),
 diff --git a/python/sglang/srt/layers/attention/xpu_backend.py b/python/sglang/srt/layers/attention/xpu_backend.py
-index ea02e001f1..5c1ef49582 100644
+index ea02e001f..5c1ef4958 100644
 --- a/python/sglang/srt/layers/attention/xpu_backend.py
 +++ b/python/sglang/srt/layers/attention/xpu_backend.py
 @@ -1,5 +1,6 @@
@@ -1119,8 +1119,37 @@ index ea02e001f1..5c1ef49582 100644
                  # Default: single-token self-attention
                  result = flash_attn_with_kvcache(
                      q=q_reshaped,
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+index 59ca3f9cc..e104249d2 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -733,12 +733,23 @@ class FusedMoE(torch.nn.Module):
+         if is_gguf_weight:
+             output_dim = getattr(param, "output_dim", None)
+             if self.moe_tp_size > 1:
+-                if shard_id in ["w1", "w3", "w2"] and output_dim == 0:
++                if shard_id in ["w1", "w3"] and output_dim == 0:
++                    # w1/w3 (gate/up): column-parallel, split output dim = dim0.
+                     shard_size = loaded_weight.size(0) // self.moe_tp_size
+                     start_idx = tp_rank * shard_size
+                     loaded_weight = loaded_weight.narrow(
+                         0, start_idx, shard_size
+                     ).clone()
++                elif shard_id == "w2":
++                    # w2 (down): row-parallel, split input (intermediate) dim.
++                    # For the GGUF quantized per-expert tensor
++                    # [hidden, intermediate_bytes] that is the LAST dim, not dim0.
++                    last = loaded_weight.dim() - 1
++                    shard_size = loaded_weight.size(last) // self.moe_tp_size
++                    start_idx = tp_rank * shard_size
++                    loaded_weight = loaded_weight.narrow(
++                        last, start_idx, shard_size
++                    ).clone()
+ 
+             # Store in data_container with expert/shard info
+             if not hasattr(param, "expert_data_map"):
 diff --git a/python/sglang/srt/layers/moe/moe_runner/triton.py b/python/sglang/srt/layers/moe/moe_runner/triton.py
-index 96e431d4e3..f2ba507fc2 100644
+index 96e431d4e..f2ba507fc 100644
 --- a/python/sglang/srt/layers/moe/moe_runner/triton.py
 +++ b/python/sglang/srt/layers/moe/moe_runner/triton.py
 @@ -1,5 +1,6 @@
@@ -1531,7 +1560,7 @@ index 96e431d4e3..f2ba507fc2 100644
          hidden_states=dispatch_output.hidden_states,
          w1=quant_info.w13_weight,
 diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
-index b4e05df013..f88e4f1cfe 100644
+index b4e05df01..f88e4f1cf 100644
 --- a/python/sglang/srt/layers/quantization/fp8.py
 +++ b/python/sglang/srt/layers/quantization/fp8.py
 @@ -116,6 +116,145 @@ _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
@@ -1736,7 +1765,7 @@ index b4e05df013..f88e4f1cfe 100644
                  x,
                  layer.w13_weight,
 diff --git a/python/sglang/srt/layers/quantization/fp8_kernel.py b/python/sglang/srt/layers/quantization/fp8_kernel.py
-index 30a035a23c..b10f39fbd0 100644
+index 30a035a23..b10f39fbd 100644
 --- a/python/sglang/srt/layers/quantization/fp8_kernel.py
 +++ b/python/sglang/srt/layers/quantization/fp8_kernel.py
 @@ -40,6 +40,7 @@ from sglang.srt.utils import (
@@ -1796,7 +1825,7 @@ index 30a035a23c..b10f39fbd0 100644
  fp8_min = -fp8_max
  
 diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
-index 6c6827c7d2..35b948c625 100755
+index 6c6827c7d..35b948c62 100755
 --- a/python/sglang/srt/layers/quantization/fp8_utils.py
 +++ b/python/sglang/srt/layers/quantization/fp8_utils.py
 @@ -46,6 +46,7 @@ from sglang.srt.utils import (
@@ -2017,7 +2046,7 @@ index 6c6827c7d2..35b948c625 100755
          # Maybe apply padding to output, see comment in __init__
          num_token_padding = output_padding
 diff --git a/python/sglang/srt/layers/quantization/gguf.py b/python/sglang/srt/layers/quantization/gguf.py
-index 5c1e7a63e6..c568568ef8 100644
+index 5c1e7a63e..69ccc3646 100644
 --- a/python/sglang/srt/layers/quantization/gguf.py
 +++ b/python/sglang/srt/layers/quantization/gguf.py
 @@ -1,9 +1,9 @@
@@ -2131,7 +2160,7 @@ index 5c1e7a63e6..c568568ef8 100644
              return GGUFMoEMethod(self)
          return None
  
-@@ -456,6 +534,1320 @@ class GGUFLinearMethod(LinearMethodBase):
+@@ -456,6 +534,1318 @@ class GGUFLinearMethod(LinearMethodBase):
          return out
  
  
@@ -2748,20 +2777,19 @@ index 5c1e7a63e6..c568568ef8 100644
 +        u5, scale, minv = _xpu_q5_k_elem(qweight)
 +        K = u5.shape[1]
 +        ql = _pack_nibble_interleaved(u5)
-+        qh = _preshuffle_qh1((u5 >> 4) & 1, K)
 +        hbit = ((u5 >> 4) & 1).to(torch.uint8).view(N, K // 8, 8)
 +        weights = (1 << torch.arange(8, dtype=torch.int32, device=u5.device))
 +        qh_plain = (hbit.to(torch.int32) * weights).sum(dim=2).to(torch.uint8)
-+        return ql, qh, scale.contiguous(), minv.contiguous(), qh_plain.contiguous()
-+    ql_out, qh_out, qhp_out, sc_out, mn_out = [], [], [], [], []
++        return ql, scale.contiguous(), minv.contiguous(), qh_plain.contiguous()
++    ql_out, qhp_out, sc_out, mn_out = [], [], [], []
 +    for lo in range(0, N, chunk_rows):
 +        hi = min(lo + chunk_rows, N)
 +        r = _xpu_repack_q5_k_down_combined(qweight[lo:hi], chunk_rows)
-+        ql_out.append(r[0]); qh_out.append(r[1]); sc_out.append(r[2])
-+        mn_out.append(r[3]); qhp_out.append(r[4])
++        ql_out.append(r[0]); sc_out.append(r[1])
++        mn_out.append(r[2]); qhp_out.append(r[3])
 +        if qweight.device.type == "xpu":
 +            torch.xpu.empty_cache()
-+    return (torch.cat(ql_out, 0), torch.cat(qh_out, 0), torch.cat(sc_out, 0),
++    return (torch.cat(ql_out, 0), torch.cat(sc_out, 0),
 +            torch.cat(mn_out, 0), torch.cat(qhp_out, 0))
 +
 +
@@ -2773,19 +2801,18 @@ index 5c1e7a63e6..c568568ef8 100644
 +        u6, scale = _xpu_q6_k_elem(qweight)
 +        K = u6.shape[1]
 +        ql = _pack_nibble_interleaved(u6)
-+        qh = _preshuffle_qh2((u6 >> 4) & 3, K)
 +        h2 = ((u6 >> 4) & 3).to(torch.int32).view(N, K // 4, 4)
 +        shifts = (2 * torch.arange(4, dtype=torch.int32, device=u6.device))
 +        qh_plain = (h2 << shifts).sum(dim=2).to(torch.uint8)
-+        return ql, qh, scale.contiguous(), qh_plain.contiguous()
-+    ql_out, qh_out, qhp_out, sc_out = [], [], [], []
++        return ql, scale.contiguous(), qh_plain.contiguous()
++    ql_out, qhp_out, sc_out = [], [], []
 +    for lo in range(0, N, chunk_rows):
 +        hi = min(lo + chunk_rows, N)
 +        r = _xpu_repack_q6_k_down_combined(qweight[lo:hi], chunk_rows)
-+        ql_out.append(r[0]); qh_out.append(r[1]); sc_out.append(r[2]); qhp_out.append(r[3])
++        ql_out.append(r[0]); sc_out.append(r[1]); qhp_out.append(r[2])
 +        if qweight.device.type == "xpu":
 +            torch.xpu.empty_cache()
-+    return torch.cat(ql_out, 0), torch.cat(qh_out, 0), torch.cat(sc_out, 0), torch.cat(qhp_out, 0)
++    return torch.cat(ql_out, 0), torch.cat(sc_out, 0), torch.cat(qhp_out, 0)
 +
 +
 +def _xpu_moe_grouped_prefill(xf, topk_ids, topk_weights, E, hidden, inter,
@@ -3452,7 +3479,7 @@ index 5c1e7a63e6..c568568ef8 100644
  class GGUFMoEMethod(FusedMoEMethodBase):
      """MoE method for GGUF.
  
-@@ -565,6 +1957,262 @@ class GGUFMoEMethod(FusedMoEMethodBase):
+@@ -565,6 +1955,253 @@ class GGUFMoEMethod(FusedMoEMethodBase):
          return StandardCombineInput(hidden_states=output)
  
  
@@ -3621,33 +3648,24 @@ index 5c1e7a63e6..c568568ef8 100644
 +        down_b = w2.reshape(E * Nd, Kbd).contiguous()
 +        del w2
 +        self._grouped_ok = _moe_grouped is not None
-+        # MEMORY (TP=1 OOM fix, cont'd): the decode-packed rep (ql/qh/scale/[minv])
-+        # and the grouped-prefill PLAIN-qh rep used to be built by two separate
-+        # calls (_xpu_repack_q5_k/_q6_k then _xpu_repack_q5_k_plain/_q6_k_plain),
-+        # each re-deriving the element-order u5/u6 int32 [N,K] tensor from
-+        # scratch (N=E*Nd rows -> several GB for a full down-proj layer). The
-+        # *_down_combined helpers derive u5/u6 ONCE and chunk over rows (see
-+        # SGLANG_GGUF_XPU_MOE_REPACK_CHUNK_ROWS) so peak memory no longer scales
-+        # with E*Nd at all.
++        # Down proj: decode + grouped-prefill kernels both read PLAIN qh, so
++        # down_qh_plain is the only high-bit rep we keep (no 512-tile pre-shuffle).
++        # The *_down_combined helpers derive u5/u6 ONCE and chunk over rows (see
++        # SGLANG_GGUF_XPU_MOE_REPACK_CHUNK_ROWS) so peak memory does not scale
++        # with E*Nd.
 +        if self._down_is_q6:
-+            if self._grouped_ok:
-+                ql, qh, sc, qh_plain = _xpu_repack_q6_k_down_combined(down_b)
-+                self.down_qh_plain = qh_plain.reshape(E, Nd, -1).contiguous()
-+                del qh_plain
-+            else:
-+                ql, qh, sc = _xpu_repack_q6_k(down_b)
-+            self.down_ql = ql.reshape(E, Nd, -1).contiguous(); self.down_qh = qh.reshape(E, Nd, -1).contiguous(); self.down_sc = sc.reshape(E, Nd, -1).contiguous()
++            ql, sc, qh_plain = _xpu_repack_q6_k_down_combined(down_b)
++            self.down_qh_plain = qh_plain.reshape(E, Nd, -1).contiguous()
++            del qh_plain
++            self.down_ql = ql.reshape(E, Nd, -1).contiguous(); self.down_sc = sc.reshape(E, Nd, -1).contiguous()
 +            self.down_mn = torch.zeros(1, dtype=torch.float16, device=dev)
-+            del ql, qh, sc
++            del ql, sc
 +        else:
-+            if self._grouped_ok:
-+                ql, qh, sc, mn, qh_plain = _xpu_repack_q5_k_down_combined(down_b)
-+                self.down_qh_plain = qh_plain.reshape(E, Nd, -1).contiguous()
-+                del qh_plain
-+            else:
-+                ql, qh, sc, mn = _xpu_repack_q5_k(down_b)
-+            self.down_ql = ql.reshape(E, Nd, -1).contiguous(); self.down_qh = qh.reshape(E, Nd, -1).contiguous(); self.down_sc = sc.reshape(E, Nd, -1).contiguous(); self.down_mn = mn.reshape(E, Nd, -1).contiguous()
-+            del ql, qh, sc, mn
++            ql, sc, mn, qh_plain = _xpu_repack_q5_k_down_combined(down_b)
++            self.down_qh_plain = qh_plain.reshape(E, Nd, -1).contiguous()
++            del qh_plain
++            self.down_ql = ql.reshape(E, Nd, -1).contiguous(); self.down_sc = sc.reshape(E, Nd, -1).contiguous(); self.down_mn = mn.reshape(E, Nd, -1).contiguous()
++            del ql, sc, mn
 +        del down_b
 +        # dims: w13 gate rows = intermediate; hidden from gate K (=ql cols*2).
 +        self.intermediate = half
@@ -3702,10 +3720,10 @@ index 5c1e7a63e6..c568568ef8 100644
 +                         M, hidden, inter, top_k)
 +        out_partial = torch.empty(n_routed, hidden, dtype=torch.float16, device=x2.device)
 +        if self._down_is_q6:
-+            esimd_moe_down_q6k(inter_buf, self.down_ql, self.down_qh, self.down_sc,
++            esimd_moe_down_q6k(inter_buf, self.down_ql, self.down_qh_plain, self.down_sc,
 +                               sel, tw, out_partial, M, hidden, inter, top_k)
 +        else:
-+            esimd_moe_down_q5k(inter_buf, self.down_ql, self.down_qh, self.down_sc,
++            esimd_moe_down_q5k(inter_buf, self.down_ql, self.down_qh_plain, self.down_sc,
 +                               self.down_mn, sel, tw, out_partial, M, hidden, inter, top_k)
 +        # sum the top_k per-route partials back to per-token output (one op).
 +        out = out_partial.view(M, top_k, hidden).sum(dim=1).to(out.dtype)
@@ -3716,7 +3734,7 @@ index 5c1e7a63e6..c568568ef8 100644
      """Embedding method for GGUF.
  
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 8e32640fc6..120fc5e29a 100644
+index 8e32640fc..120fc5e29 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -2542,6 +2542,15 @@ class Scheduler(
@@ -3736,7 +3754,7 @@ index 8e32640fc6..120fc5e29a 100644
  
      def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index a282339587..3b7c99c7b0 100644
+index a28233958..3b7c99c7b 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 @@ -1,6 +1,7 @@
@@ -3813,7 +3831,7 @@ index a282339587..3b7c99c7b0 100644
          self,
          *,
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index 8efe9aae94..287e06cd58 100644
+index 8efe9aae9..287e06cd5 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
 @@ -328,7 +328,7 @@ class MambaPool:
@@ -3835,7 +3853,7 @@ index 8efe9aae94..287e06cd58 100644
                      for conv_shape in conv_state_shape
                  ]
 diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
-index ebbfc2b288..68891945df 100644
+index ebbfc2b28..68891945d 100644
 --- a/python/sglang/srt/model_executor/cuda_graph_runner.py
 +++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
 @@ -75,6 +75,7 @@ from sglang.srt.utils import (
@@ -3906,7 +3924,7 @@ index ebbfc2b288..68891945df 100644
  
          if self.model_runner.server_args.debug_cuda_graph:
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 3b30eb0e1f..141eb11a4d 100644
+index 3b30eb0e1..141eb11a4 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -849,6 +849,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
@@ -3930,7 +3948,7 @@ index 3b30eb0e1f..141eb11a4d 100644
              self.init_attention_backend()
              if current_platform.support_cuda_graph():
 diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
-index 32ff5bac25..6b7d1eff63 100644
+index 32ff5bac2..6b7d1eff6 100644
 --- a/python/sglang/srt/model_loader/loader.py
 +++ b/python/sglang/srt/model_loader/loader.py
 @@ -115,6 +115,7 @@ from sglang.srt.utils import (
@@ -4324,7 +4342,7 @@ index 32ff5bac25..6b7d1eff63 100644
      # FP8 approach: BF16/FP16 model with native FP8 quantization
      if load_config.load_format == LoadFormat.FLASH_RL:
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
-index 65f78e6917..bf045b8549 100644
+index 65f78e691..bf045b854 100644
 --- a/python/sglang/srt/models/qwen3_5.py
 +++ b/python/sglang/srt/models/qwen3_5.py
 @@ -15,6 +15,7 @@
@@ -5132,7 +5150,7 @@ index 65f78e6917..bf045b8549 100644
                              param, "weight_loader", default_weight_loader
                          )
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index 6c77ff64f9..78d88e51c6 100644
+index 6c77ff64f..78d88e51c 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
 @@ -119,6 +119,7 @@ LOAD_FORMAT_CHOICES = [
@@ -5163,7 +5181,7 @@ index 6c77ff64f9..78d88e51c6 100644
                  assert not self.enable_mamba_extra_buffer_lazy(), (
                      "extra_buffer_lazy is not yet supported with speculative decoding. "
 diff --git a/python/sglang/srt/utils/hf_transformers/config.py b/python/sglang/srt/utils/hf_transformers/config.py
-index f66ea9a672..8e5f7beda7 100644
+index f66ea9a67..8e5f7beda 100644
 --- a/python/sglang/srt/utils/hf_transformers/config.py
 +++ b/python/sglang/srt/utils/hf_transformers/config.py
 @@ -13,6 +13,7 @@
