@@ -48,7 +48,12 @@ The builder and final image both use
 the complete `/llm` source/build trees, `/wheels`, and the oneAPI compiler so
 native kernels can be rebuilt in place. Set `MAX_JOBS`, `OMNI_BASE_IMAGE`, or
 `INSTALL_DISABLED_NODES=false` when a local build needs to override those
-defaults.
+defaults. The PTL-H Kitchen integration is pinned to
+`xiangyuT/comfy-kitchen-xpu@223eea0c931bcf7a1bd0e83631e21b2a58961b28`
+(`comfy-kitchen==0.2.18`) and is installed after third-party requirements so
+ComfyUI's older transitive pin cannot replace it. Its repository, commit, and
+version can be overridden together with `COMFY_KITCHEN_REPOSITORY`,
+`COMFY_KITCHEN_COMMIT`, and `COMFY_KITCHEN_VERSION` for a deliberate upgrade.
 
 After a PTL-H build, the installed kernel must report matching package and
 compiled-core targets:
@@ -56,11 +61,11 @@ compiled-core targets:
 ```bash
 docker run --rm \
     intel/llm-scaler-omni:0.1.0-b8-dev-ptl-h \
-    python -c 'import omni_xpu_kernel as ok; print(ok.__version__, ok.__xpu_target__, ok.core_aot_target())'
+    python -c 'import comfy_kitchen as ck, omni_xpu_kernel as ok; print(ck.__version__, ok.__version__, ok.__xpu_target__, ok.core_aot_target())'
 ```
 
-Both target fields must be `ptl-h`; do not rename or reuse a BMG image for
-PTL-H.
+Kitchen must report `0.2.18`, and both target fields must be `ptl-h`; do not
+rename or reuse a BMG image for PTL-H.
 
 Run docker image:
 

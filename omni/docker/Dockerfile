@@ -100,6 +100,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 RUN mkdir -p /llm /wheels
 
+# TODO(cache): move target-independent third-party dependency installation
+# ahead of local source COPY instructions, especially omni_xpu_kernel and
+# ComfyUI-OmniXPU. At present, a Kernel-only source change invalidates the
+# unrelated long-context, ComfyUI, and custom-node layers. Keep native target
+# arguments scoped to the first layer that actually consumes them as part of
+# that rework.
 # omni_xpu_kernel is installed AFTER sgl-kernel-xpu (below): its cute FMHA
 # extension needs the cutlass-sycl headers that sgl-kernel-xpu fetches into
 # build/_deps/repo-cutlass-sycl-src.
@@ -331,6 +337,33 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r /llm/ComfyUI/custom_nodes/comfyui-manager/requirements.txt && \
     python -c "import git; print('ComfyUI-Manager dependencies OK')"
 
+# The pinned ComfyUI core currently requests comfy-kitchen 0.2.16. Install the
+# accepted PTL-H Kitchen source after every third-party requirements step so it
+# cannot be replaced by that older transitive pin. Keep both its source and
+# wheel in the development image for audit and in-container reproduction.
+ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
+ARG COMFY_KITCHEN_COMMIT=223eea0c931bcf7a1bd0e83631e21b2a58961b28
+ARG COMFY_KITCHEN_VERSION=0.2.18
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -eo pipefail && \
+    cd /llm && \
+    git clone --filter=blob:none --no-checkout \
+        "${COMFY_KITCHEN_REPOSITORY}" comfy-kitchen-xpu && \
+    cd comfy-kitchen-xpu && \
+    git fetch --depth 1 origin "${COMFY_KITCHEN_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${COMFY_KITCHEN_COMMIT}" && \
+    test "$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')" = "${COMFY_KITCHEN_VERSION}" && \
+    rm -f /wheels/comfy_kitchen-*.whl && \
+    python setup.py bdist_wheel --no-cuda --dist-dir /wheels && \
+    KITCHEN_WHEEL="$(find /wheels -maxdepth 1 -type f \
+        -name "comfy_kitchen-${COMFY_KITCHEN_VERSION}-*.whl" -print -quit)" && \
+    test -n "${KITCHEN_WHEEL}" && \
+    pip install --no-deps --force-reinstall "${KITCHEN_WHEEL}" && \
+    cd / && \
+    EXPECTED_COMFY_KITCHEN_VERSION="${COMFY_KITCHEN_VERSION}" \
+        python -c 'import importlib.metadata as m, os, comfy_kitchen as k; expected = os.environ["EXPECTED_COMFY_KITCHEN_VERSION"]; assert k.__version__ == expected, (k.__version__, expected); assert m.version("comfy-kitchen") == expected'
+
 # Application files
 COPY ./workflows/* /llm/ComfyUI/user/default/workflows/
 COPY ./example_inputs/* /llm/ComfyUI/input/
@@ -402,14 +435,19 @@ COPY --from=builder /wheels /wheels
 # The files already ship with this OMIX base; no files are removed.
 RUN cp /opt/intel/oneapi/compiler/latest/lib/libsycl-native-*.spv /usr/local/lib/
 
+ARG COMFY_KITCHEN_COMMIT
+ARG COMFY_KITCHEN_VERSION
 LABEL org.opencontainers.image.version="${IMAGE_TAG}" \
-      com.intel.omni.xpu-target="${XPU_TARGET}"
+      com.intel.omni.xpu-target="${XPU_TARGET}" \
+      com.intel.omni.comfy-kitchen.version="${COMFY_KITCHEN_VERSION}" \
+      com.intel.omni.comfy-kitchen.revision="${COMFY_KITCHEN_COMMIT}"
 
 ENV CCL_SYCL_ALLTOALL_ARC_LL=1 \
     CCL_SYCL_CCL_BARRIER=1 \
     OMNIXPU_INTERPOLATE_FIX=0 \
     OMNI_IMAGE_VERSION="${IMAGE_TAG}" \
-    OMNI_IMAGE_XPU_TARGET="${XPU_TARGET}"
+    OMNI_IMAGE_XPU_TARGET="${XPU_TARGET}" \
+    OMNI_COMFY_KITCHEN_VERSION="${COMFY_KITCHEN_VERSION}"
 
 
 WORKDIR /llm/entrypoints

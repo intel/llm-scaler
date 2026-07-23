@@ -28,6 +28,9 @@ BASE_IMAGE="${OMNI_BASE_IMAGE:-intel/omix:0.1.0-devel-ubuntu24.04}"
 BUILD_MAX_JOBS="${MAX_JOBS:-8}"
 INSTALL_OPTIONAL_NODES="${INSTALL_DISABLED_NODES:-true}"
 IMAGE_REPOSITORY="${OMNI_IMAGE_REPOSITORY:-intel/llm-scaler-omni}"
+KITCHEN_REPOSITORY="${COMFY_KITCHEN_REPOSITORY:-https://github.com/xiangyuT/comfy-kitchen-xpu.git}"
+KITCHEN_COMMIT="${COMFY_KITCHEN_COMMIT:-223eea0c931bcf7a1bd0e83631e21b2a58961b28}"
+KITCHEN_VERSION="${COMFY_KITCHEN_VERSION:-0.2.18}"
 
 cd "${SCRIPT_DIR}"
 set -x
@@ -39,6 +42,9 @@ DOCKER_BUILDKIT=1 docker build -f ./docker/Dockerfile . \
     --build-arg "XPU_TARGET=${DEVICE_TARGET}" \
     --build-arg "MAX_JOBS=${BUILD_MAX_JOBS}" \
     --build-arg "INSTALL_DISABLED_NODES=${INSTALL_OPTIONAL_NODES}" \
+    --build-arg "COMFY_KITCHEN_REPOSITORY=${KITCHEN_REPOSITORY}" \
+    --build-arg "COMFY_KITCHEN_COMMIT=${KITCHEN_COMMIT}" \
+    --build-arg "COMFY_KITCHEN_VERSION=${KITCHEN_VERSION}" \
     --build-arg "https_proxy=${HTTPS_PROXY}" \
     --build-arg "http_proxy=${HTTP_PROXY}" \
     --build-arg "no_proxy=${NO_PROXY}"
