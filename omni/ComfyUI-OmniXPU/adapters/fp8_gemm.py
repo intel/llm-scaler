@@ -9,7 +9,7 @@ import logging
 import torch
 import comfy.model_management
 
-from .debug import log_debug_event
+from ..patches.debug import log_debug_event
 
 log = logging.getLogger("ComfyUI-OmniXPU")
 

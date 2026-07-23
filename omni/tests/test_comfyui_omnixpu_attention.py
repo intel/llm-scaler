@@ -13,6 +13,7 @@ import torch
 
 _PLUGIN = Path(__file__).parents[1] / "ComfyUI-OmniXPU"
 _PATCHES = _PLUGIN / "patches"
+_ADAPTERS = _PLUGIN / "adapters"
 
 
 def _load_module(name: str, path: Path):
@@ -86,8 +87,11 @@ def _load_patch(
     package.__path__ = [str(_PLUGIN)]
     patches = types.ModuleType(f"{package_name}.patches")
     patches.__path__ = [str(_PATCHES)]
+    adapters = types.ModuleType(f"{package_name}.adapters")
+    adapters.__path__ = [str(_ADAPTERS)]
     monkeypatch.setitem(sys.modules, package_name, package)
     monkeypatch.setitem(sys.modules, patches.__name__, patches)
+    monkeypatch.setitem(sys.modules, adapters.__name__, adapters)
     _load_module(f"{patches.__name__}.debug", _PATCHES / "debug.py")
 
     calls = []
@@ -153,8 +157,8 @@ def _load_patch(
         monkeypatch.setitem(sys.modules, name, module)
 
     patch = _load_module(
-        f"{patches.__name__}.patch_attention",
-        _PATCHES / "patch_attention.py",
+        f"{adapters.__name__}.attention",
+        _ADAPTERS / "attention.py",
     )
     assert patch.apply() == (True, None)
     return patch, attention, calls

@@ -43,22 +43,45 @@ class OmniXPUStatus:
             except Exception:
                 pass
 
+        # Kitchen is the authority for generic operator registration and
+        # fallback. Report it separately from custom-node adapters.
+        try:
+            import comfy_kitchen as ck
+
+            kitchen_xpu = ck.list_backends().get("xpu", {})
+            available = kitchen_xpu.get("available", False)
+            disabled = kitchen_xpu.get("disabled", False)
+            state = "available" if available and not disabled else "unavailable"
+            if disabled:
+                state = "disabled"
+            capabilities = kitchen_xpu.get("capabilities", [])
+            lines.append(
+                f"  comfy_kitchen XPU: {state} "
+                f"({len(capabilities)} capabilities)"
+            )
+            reason = kitchen_xpu.get("unavailable_reason")
+            if reason:
+                lines.append(f"    reason: {reason}")
+        except Exception as exc:
+            lines.append(f"  comfy_kitchen XPU: unavailable ({exc})")
+
         # Patch status
         lines.append("")
         patches = sys.modules.get(f"{_PKG}.patches")
         if patches:
             for entry in patches.get_status():
                 name = entry["name"]
+                kind = entry.get("kind", "component")
                 status = entry["status"]
                 reason = entry.get("reason", "")
                 mark = {"applied": "+", "skipped": "-", "failed": "!!"}.get(status, "?")
-                line = f"  [{mark}] {name}: {status}"
+                line = f"  [{mark}] {name} [{kind}]: {status}"
                 if reason:
                     line += f" ({reason})"
                 lines.append(line)
 
         # Attention stats
-        attn = sys.modules.get(f"{_PKG}.patches.patch_attention")
+        attn = sys.modules.get(f"{_PKG}.adapters.attention")
         if attn and hasattr(attn, "get_stats"):
             try:
                 stats = attn.get_stats()
@@ -70,26 +93,8 @@ class OmniXPUStatus:
             except Exception:
                 pass
 
-        # INT8 dispatcher stats
-        int8 = sys.modules.get(f"{_PKG}.patches.patch_int8")
-        if int8 and hasattr(int8, "get_stats"):
-            try:
-                stats = int8.get_stats()
-                if stats["native"] or stats["fallback"]:
-                    lines.append("")
-                    lines.append(
-                        "  INT8 linear calls: "
-                        f"native={stats['native']} fallback={stats['fallback']}"
-                    )
-                    for reason, count in sorted(
-                        stats["reasons"].items(), key=lambda item: -item[1]
-                    ):
-                        lines.append(f"    {reason}: {count}")
-            except Exception:
-                pass
-
         # Fused INT8 FFN routing stats
-        int8_ffn = sys.modules.get(f"{_PKG}.patches.patch_int8_ffn")
+        int8_ffn = sys.modules.get(f"{_PKG}.adapters.int8_ffn")
         if int8_ffn and hasattr(int8_ffn, "get_stats"):
             try:
                 stats = int8_ffn.get_stats()

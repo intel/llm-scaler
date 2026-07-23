@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0-b9-dev (2026-07-23)
+
+### Build System
+
+- Bumped the shared Omni image and kernel wheel development version to
+  `0.1.0-b9-dev` / `0.1.0b9.dev0`.
+- Removed residual oneCCL environment tuning from the single-device,
+  ComfyUI-focused image.
+- Split the focused Docker build into stable OS/Python/ComfyUI layers and
+  independent Kitchen/kernel wheel branches so native iteration reuses the
+  unrelated wheel and third-party dependency cache.
+
 ## dev/torch-version-tag (2026-07-17)
 
 ### Build System

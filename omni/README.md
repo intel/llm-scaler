@@ -4,23 +4,31 @@
 
 ## Table of Contents
 
-1. [Getting Started with Omni Docker Image](#getting-started-with-omni-docker-image)
+1. [Getting Started with the ComfyUI Image](#getting-started-with-the-comfyui-image)
 2. [ComfyUI](#comfyui)
-3. [SGLang Diffusion](#sglang-diffusion-experimental)
-4. [XInference](#xinference)
+3. [SGLang Diffusion (full image only)](#sglang-diffusion-experimental)
+4. [XInference (full image only)](#xinference)
 5. [Stand-alone Examples](#stand-alone-examples)
 6. [ComfyUI for Windows (experimental)](#comfyui-for-windows-experimental)
 
 ---
 
-## Getting Started with Omni Docker Image
+## Getting Started with the ComfyUI Image
 
-Pull docker image from dockerhub:
+The default Dockerfile is single-device ComfyUI-focused. It excludes
+Xinference, SGLang/SGLDiffusion, and the disabled audio/3D node bundle.
+Raylight and its xDiT-based multi-XPU ComfyUI integration have been removed
+from both image flavors.
+The former all-in-one development image remains available as the optional
+`full` flavor.
+
+Pull a published image from Docker Hub:
+
 ```bash
 docker pull intel/llm-scaler-omni:0.1.0-b7
 ```
 
-Or build docker image:
+Build the default ComfyUI flavor:
 
 ```bash
 # Arc B-series / Battlemage
@@ -30,58 +38,108 @@ XPU_TARGET=bmg bash build.sh
 XPU_TARGET=ptl-h bash build.sh
 ```
 
-`XPU_TARGET` is the single device selector for sgl-kernel-xpu, the Omni core,
-LGRF, and CUTE native builds. Valid values are `bmg` and `ptl-h`; the existing
-`OMNI_XPU_DEVICE` environment variable remains a compatible alias. The build
-fails before compilation for any other value. Omni's native extensions use
-the selected AOT target directly. The pinned sgl-kernel-xpu/CUTLASS-SYCL
-revision supports BMG AOT only, so the Docker build maps `bmg` to BMG AOT and
-`ptl-h` to the validated `spir64` JIT build instead of silently emitting a BMG
-binary. Its resolved mode is recorded in
-`/llm/sgl-kernel-xpu/.llm-scaler-build-target` inside the image.
+Build the optional full flavor only when Xinference or SGLang is required:
 
-Local images are tagged with their device target, for example
-`intel/llm-scaler-omni:0.1.0-b8-dev-bmg` or
-`intel/llm-scaler-omni:0.1.0-b8-dev-ptl-h`.
+```bash
+OMNI_IMAGE_FLAVOR=full XPU_TARGET=ptl-h bash build.sh
+```
+
+`XPU_TARGET` is the single device selector for the Omni core, LGRF, and CUTE
+native builds. Valid values are `bmg` and `ptl-h`; `OMNI_XPU_DEVICE` remains a
+compatible alias. The build rejects other targets before compilation.
+
+The focused image fetches the pinned SYCL-TLA/CUTLASS headers directly instead
+of obtaining them as a side effect of an SGL kernel build. Omni native
+extensions are AOT-compiled for the selected device and the build verifies
+that the package and compiled-core target markers match.
+
+Local images include both flavor and device in the tag, for example:
+
+- `intel/llm-scaler-omni:0.1.0-b9-dev-comfyui-bmg`
+- `intel/llm-scaler-omni:0.1.0-b9-dev-comfyui-ptl-h`
+- `intel/llm-scaler-omni:0.1.0-b9-dev-full-ptl-h`
+
 The builder and final image both use
 `intel/omix:0.1.0-devel-ubuntu24.04`; the final image retains `/opt/venv`,
-the complete `/llm` source/build trees, `/wheels`, and the oneAPI compiler so
-native kernels can be rebuilt in place. Set `MAX_JOBS`, `OMNI_BASE_IMAGE`, or
-`INSTALL_DISABLED_NODES=false` when a local build needs to override those
-defaults. The PTL-H Kitchen integration is pinned to
+the `/llm` source/build trees, `/wheels`, and the oneAPI compiler so native
+kernels can be rebuilt in place. Set `MAX_JOBS` or `OMNI_BASE_IMAGE` to
+override those defaults. `INSTALL_DISABLED_NODES` applies only to the full
+flavor.
+
+The Kitchen XPU integration is pinned to
 `xiangyuT/comfy-kitchen-xpu@223eea0c931bcf7a1bd0e83631e21b2a58961b28`
 (`comfy-kitchen==0.2.18`) and is installed after third-party requirements so
 ComfyUI's older transitive pin cannot replace it. Its repository, commit, and
 version can be overridden together with `COMFY_KITCHEN_REPOSITORY`,
 `COMFY_KITCHEN_COMMIT`, and `COMFY_KITCHEN_VERSION` for a deliberate upgrade.
 
-After a PTL-H build, the installed kernel must report matching package and
-compiled-core targets:
+### Docker Build Cache Layout
+
+The focused Dockerfile keeps frequently edited native projects on independent
+BuildKit branches:
+
+- `os-base` and `python-base`: stable OS, Torch XPU, and oneDNN dependencies;
+- `comfyui-deps`: pinned ComfyUI and third-party custom-node dependencies;
+- `sycl-tla`: pinned native headers;
+- `kernel-wheel`: local `omni_xpu_kernel` source and its device-specific wheel;
+- `kitchen-wheel`: the pinned `comfy-kitchen-xpu` source and wheel;
+- `builder-comfyui`: installs the two wheels and adds the local Omni custom node;
+- `runtime-comfyui`: adds final metadata directly on top of `builder-comfyui`.
+
+Kernel edits rebuild `kernel-wheel` without rebuilding Kitchen or ComfyUI
+dependencies. Kitchen commit/version changes rebuild `kitchen-wheel` without
+recompiling the Omni kernel. Changing only `ComfyUI-OmniXPU` reuses both wheel
+branches. The `--no-cuda` Kitchen wheel is pure Python and is reused across
+BMG/PTL-H; switching the device target rebuilds only the AOT kernel and final
+assembly while reusing the OS, Torch, ComfyUI, and Kitchen layers.
+
+The runtime deliberately inherits the completed development builder. Recopying
+the complete `/opt/venv`, `/llm`, and `/wheels` trees from that builder into a
+fresh base produces large replacement layers after every native edit, even
+when dependency caches work correctly. Direct inheritance keeps incremental
+image export proportional to the changed wheel/source layers.
+
+`build.sh` enables BuildKit by default; do not use `--no-cache` during normal
+iteration. The intermediate `kernel-wheel` and `kitchen-wheel` targets exist
+for diagnostics, but release acceptance must use the default
+`runtime-comfyui` target.
+
+Dockerfiles construct the image; they do not contain source revision/version
+assertions or device-dependent acceptance checks. In particular, Docker build
+runs without `/dev/dri`, so Kitchen may correctly report its XPU backend as
+unavailable there. Revision policy belongs in the release/CI orchestration,
+while package identity, native AOT target, dependency consistency, real XPU
+availability, and Kitchen capabilities are checked in the final container by
+`tools/validate_comfyui_image.py`.
+
+After a PTL-H build, run the acceptance check with the real device exposed:
 
 ```bash
 docker run --rm \
-    intel/llm-scaler-omni:0.1.0-b8-dev-ptl-h \
-    python -c 'import comfy_kitchen as ck, omni_xpu_kernel as ok; print(ck.__version__, ok.__version__, ok.__xpu_target__, ok.core_aot_target())'
+    --device=/dev/dri \
+    intel/llm-scaler-omni:0.1.0-b9-dev-comfyui-ptl-h \
+    python /llm/tools/validate_comfyui_image.py
 ```
 
-Kitchen must report `0.2.18`, and both target fields must be `ptl-h`; do not
-rename or reuse a BMG image for PTL-H.
+For device-less metadata-only CI, pass `--allow-no-xpu`; this is not a
+substitute for the device-backed release acceptance above. Do not rename or
+reuse a BMG image for PTL-H.
 
-Run docker image:
+Run the image with the model and development workspaces mounted:
 
 ```bash
-export DOCKER_IMAGE=intel/llm-scaler-omni:0.1.0-b7
+export DOCKER_IMAGE=intel/llm-scaler-omni:0.1.0-b9-dev-comfyui-ptl-h
 export CONTAINER_NAME=comfyui
-export MODEL_DIR=<your_model_dir>
-export COMFYUI_MODEL_DIR=<your_comfyui_model_dir>
+export COMFYUI_MODEL_DIR=/home/sas/xiangyu/comfyui_models
+export WORKSPACE_DIR=/home/sas/xiangyu/codex_workspace
 sudo docker run -itd \
         --privileged \
         --net=host \
         --device=/dev/dri \
         -e no_proxy=localhost,127.0.0.1 \
         --name=$CONTAINER_NAME \
-        -v $MODEL_DIR:/llm/models/ \
         -v $COMFYUI_MODEL_DIR:/llm/ComfyUI/models \
+        -v $WORKSPACE_DIR:/workspace \
         --shm-size="64g" \
         --entrypoint=/bin/bash \
         $DOCKER_IMAGE
@@ -118,26 +176,30 @@ Modify the `Preview method` to show the preview image during sampling iterations
 
 ### Supported Models
 
-The following models are supported in ComfyUI workflows. For detailed model files and directory structure, see the [ComfyUI Guide](./docs/ComfyUI_Guide.md#model-directory-structure).
+Use ComfyUI's built-in **Template Browser** for upstream official workflows
+instead of repository snapshots. For model files and directory structure, see
+the [ComfyUI Guide](./docs/ComfyUI_Guide.md#model-directory-structure).
 
-| Model Category | Model Name | Type | Workflow Files |
-|---------------|------------|------|----------------|
-| **Image Generation** | Qwen-Image, Qwen-Image-Edit, Qwen-Image-Edit-2511 | Text-to-Image, Image Editing | `image_qwen_image.json`, `image_qwen_image_2512.json`, `image_qwen_image_distill.json`, `image_qwen_image_edit.json`, `image_qwen_image_edit_2509.json`, `image_qwen_image_edit_2511.json`, `image_qwen_image_layered.json` |
-| **Image Generation** | Stable Diffusion 3.5 | Text-to-Image, ControlNet | `image_sd3.5_simple_example.json`, `image_sd3.5_midium.json`, `image_sd3.5_large_canny_controlnet_example.json` |
-| **Image Generation** | Z-Image-Turbo | Text-to-Image |  `image_z_image_turbo.json` |
-| **Image Generation** | Flux.1, Flux.1 Kontext dev | Text-to-Image, Multi-Image Reference, ControlNet | `image_flux_kontext_dev_basic.json`, `image_flux_controlnet_example.json` |
-| **Image Generation** | FireRed-Image-Edit-1.1 | Image Editing | `image_firered_image_edit_1.1.json` |
-| **Video Generation** | Wan2.2 TI2V 5B, Wan2.2 T2V 14B, Wan2.2 I2V 14B | Text-to-Video, Image-to-Video | `video_wan2_2_5B_ti2v.json`, `video_wan2_2_14B_t2v.json`, `video_wan2_2_14B_t2v_rapid_aio_multi_xpu.json`, `video_wan2.2_14B_i2v_rapid_aio_multi_xpu.json` |
-| **Video Generation** | Wan2.2 Animate 14B | Video Animation | `video_wan2_2_animate_basic.json` |
-| **Video Generation** | HunyuanVideo 1.5 8.3B | Text-to-Video, Image-to-Video | `video_hunyuan_video_1.5_t2v.json`, `video_hunyuan_video_1.5_i2v.json`, `video_hunyuan_video_1.5_i2v_multi_xpu.json` |
-| **Video Generation** | LTX-2 T2V 19B, LTX-2 I2V 19B, | Text-to-Video, Image-to-Video | `video_ltx2_19B_t2v.json`, `video_ltx2_19B_i2v.json`, `video_ltx_2_19B_t2v_distilled.json`, `video_ltx_2_19B_i2v_distilled.json` |
+| Model Category | Model Name | Type | Workflow source |
+|---------------|------------|------|-----------------|
+| **Image Generation** | Qwen-Image family | Text-to-Image, Image Editing | ComfyUI Template Browser |
+| **Image Generation** | Stable Diffusion 3.5 | Text-to-Image, ControlNet | ComfyUI Template Browser |
+| **Image Generation** | Z-Image-Turbo | Text-to-Image | ComfyUI Template Browser |
+| **Image Generation** | Flux.1 / Kontext | Text-to-Image, Editing, ControlNet | ComfyUI Template Browser |
+| **Image Generation** | FireRed-Image-Edit-1.1 | Image Editing | Model card |
+| **Video Generation** | Wan2.2 family | Text/Image-to-Video | ComfyUI Template Browser |
+| **Video Generation** | HunyuanVideo 1.5 8.3B | Text-to-Video, Image-to-Video | ComfyUI Template Browser |
+| **Video Generation** | LTX-2 19B | Text-to-Video, Image-to-Video | ComfyUI Template Browser |
 | **3D Generation** | Hunyuan3D 2.1 | Text/Image-to-3D | `3d_hunyuan3d.json` |
 | **Audio Generation** | VoxCPM1.5, IndexTTS 2 | Text-to-Speech, Voice Cloning | `audio_VoxCPM_example.json`, `audio_indextts2.json` |
 | **Video Upscaling** | SeedVR2, FlashVSR-v1.1 | Video Restoration and Upscaling | `video_upscale_SeedVR2.json`, `video_upscale_FlashVSR.json` |
 
 ### Enabling Optional Nodes
 
-Some nodes are disabled by default to save resources. To use **SeedVR2**, **FlashVSR** **Hunyuan3D**, **VoxCPM**, **IndexTTS**, or **HY-Motion1**, you can enable them using **ComfyUI Manager**:
+The default ComfyUI-focused image does not install the optional SeedVR2,
+FlashVSR, Hunyuan3D, VoxCPM, IndexTTS, or HY-Motion1 bundle. Build the `full`
+flavor first if those nodes are required. In that image they are disabled by
+default and can be enabled with ComfyUI Manager:
 
 1. Click the **Manager** button in the ComfyUI menu.
 2. In the Manager window, use the **Filter** dropdown to select **Disabled**.
@@ -188,7 +250,11 @@ Insert the acceleration node(s) **between** the model loader and the sampler.
 On the left side of the web UI, you can find the workflows logo to load and manage workflows.
 ![workflow image](./assets/confyui_workflow.png)
 
-All workflow files are available in the `workflows/` directory. Below are detailed descriptions of supported workflows organized by category.
+The focused image does not preload repository workflow or input snapshots.
+Open maintained workflows from ComfyUI's Template Browser. The repository's
+remaining workflows are legacy examples for the optional `full` flavor only.
+The sections below link to upstream templates and tutorials; a listed upstream
+template is not necessarily copied into this repository.
 
 #### Image Generation Workflows
 
@@ -229,10 +295,7 @@ These workflows enable image editing based on text prompts, allowing you to modi
 
 ComfyUI tutorial: https://comfyanonymous.github.io/ComfyUI_examples/sd3/
 
-**Available Workflows:**
-- **image_sd3.5_simple_example.json**: Simple text-to-image workflow
-- **image_sd3.5_midium.json**: Medium model variant
-- **image_sd3.5_large_canny_controlnet_example.json**: Large model with Canny edge ControlNet for precise control
+Use the maintained workflows from ComfyUI's Template Browser.
 
 Stable Diffusion 3.5 provides high-quality text-to-image generation with optional ControlNet support for guided generation.
 
@@ -247,15 +310,14 @@ Comfyui tutorial: https://docs.comfy.org/tutorials/image/z-image/z-image-turbo
 
 ComfyUI tutorial: https://docs.comfy.org/tutorials/flux/flux-1-kontext-dev
 
-**Available Workflows:**
-- **image_flux_kontext_dev_basic.json**: Basic workflow with multi-image reference support
+Use the official workflow from ComfyUI's Template Browser.
 
 ##### FireRed-Image-Edit-1.1
 
 HuggingFace: https://huggingface.co/FireRedTeam/FireRed-Image-Edit-1.1-ComfyUI
 
-**Available Workflows:**
-- **image_firered_image_edit_1.1.json**: Multi-image reference image editing workflow with optional Lightning LoRA acceleration
+Use the workflow distributed from the model card rather than a repository
+snapshot.
 
 #### Video Generation Workflows
 
@@ -268,51 +330,17 @@ ComfyUI tutorial: https://docs.comfy.org/tutorials/video/wan/wan2_2
 **Available Workflows:**
 - **video_wan2_2_5B_ti2v.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_wan2_2_5B_ti2v.json)): Text+Image-to-Video with 5B model
 - **video_wan2_2_14B_t2v.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_wan2_2_14B_t2v.json)): Text-to-Video with 14B model
-- **video_wan2_2_14B_i2v.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_wan2_2_14B_i2v.json)): Image-to-Video with 14B model
-- **video_wan2_2_14B_t2v_rapid_aio_multi_xpu.json**: 14B Text-to-Video with multi-XPU support (using raylight)
-- **video_wan2.2_14B_i2v_rapid_aio_multi_xpu.json**: 14B Image-to-Video with multi-XPU support
-
-**Multi-XPU Support with Raylight:**
-
-For workflows using [WAN2.2-14B-Rapid-AllInOne](https://huggingface.co/Phr00t/WAN2.2-14B-Rapid-AllInOne) with [raylight](https://github.com/komikndr/raylight) for faster inference with multi-XPU support:
-
-![wan_raylight](./assets/wan_raylight.png)
-
-**Steps to Complete Multi-XPU Workflows:**
-
-1. **Model Loading**
-   - Ensure the `Load Diffusion Model (Ray)` node loads the diffusion model part from WAN2.2-14B-Rapid-AllInOne
-   - Ensure the `Load VAE` node loads the VAE part from WAN2.2-14B-Rapid-AllInOne
-   - Ensure the `Load CLIP` node loads `umt5_xxl_fp8_e4m3fn_scaled.safetensors`
-
-2. **Ray Configuration**
-   - Set the `GPU` and `ulysses_degree` in `Ray Init Actor` node to the number of GPUs you want to use
-
-3. **Run the Workflow**
-   - Click the `Run` button or use the shortcut `Ctrl(cmd) + Enter` to run the workflow
-
-> **Note:** Model weights can be obtained from [ModelScope](https://modelscope.cn/models/Phr00t/WAN2.2-14B-Rapid-AllInOne/files). You may need to extract the unet and VAE parts separately using `tools/extract.py`.
 
 ##### Wan2.2 Animate 14B
 
-**Available Workflows:**
-- **video_wan2_2_animate_basic.json**: Video animation workflow with control video support
-
-This is a separate model from the standard Wan2.2 T2V/I2V models, designed specifically for video animation with control video inputs.
+Use the official workflow from ComfyUI's Template Browser. This is a separate
+model from the standard Wan2.2 T2V/I2V models.
 
 ##### HunyuanVideo 1.5 8.3B
 
 ComfyUI tutorial: https://docs.comfy.org/tutorials/video/hunyuan/hunyuan-video-1-5
 
-**Available Workflows:**
-
-- **video_hunyuan_video_1.5_t2v.json**: Basic workflow for Text-to-Video generation
-
-- **video_hunyuan_video_1.5_i2v.json**: Basic workflow for Image-to-Video generation
-
-- **video_hunyuan_video_1.5_i2v_multi_xpu.json**: 8.3B Image-to-Video multi-XPU support with [raylight](https://github.com/komikndr/raylight)
-
-The default parameter configurations of these workflows are optimized for 480p FP8 Image-to-Video.
+Use the maintained T2V and I2V workflows from ComfyUI's Template Browser.
 
 ##### LTX-2
 
@@ -323,13 +351,6 @@ ComfyUI tutorial: https://blog.comfy.org/p/ltx-2-open-source-audio-video-ai
 - **video_ltx2_19B_t2v.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_ltx2_t2v.json)): Text to Video with motion, dialogue, SFX, and music
 
 - **video_ltx2_19B_i2v.json** ([official](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_ltx2_i2v.json)): Image to Video with motion, dialogue, SFX, and music
-
-- **video_ltx_2_19B_t2v_distilled.json**: Distilled Text-to-Video workflow
-
-- **video_ltx_2_19B_i2v_distilled.json**: Distilled Image-to-Video workflow
-
-> **Note:** Model weights of distilled workflow can be obtained from [Kijai/LTXV2_comfy](https://huggingface.co/Kijai/LTXV2_comfy).
-
 
 #### 3D Generation Workflows
 
@@ -446,6 +467,9 @@ This workflow synthesizes new speech using a single reference audio file for voi
 
 ## SGLang Diffusion (experimental)
 
+> This section requires an image built with `OMNI_IMAGE_FLAVOR=full`. The
+> default ComfyUI-focused image does not install SGLang/SGLDiffusion.
+
 > **📖 Detailed Documentation**: See [SGLang Diffusion Guide](./docs/SGLang_Diffusion_Guide.md) for complete server configuration, API reference, and multi-GPU setup. For ComfyUI integration, see [SGLang Diffusion ComfyUI Guide](./docs/SGLang_Diffusion_ComfyUI_Guide.md).
 
 SGLang Diffusion provides OpenAI-compatible API for image/video generation models.
@@ -513,6 +537,9 @@ with open("output.png", "wb") as f:
 ```
 
 ## XInference
+
+> This section requires an image built with `OMNI_IMAGE_FLAVOR=full`. The
+> default ComfyUI-focused image does not install Xinference.
 
 ```bash
 xinference-local --host 0.0.0.0 --port 9997

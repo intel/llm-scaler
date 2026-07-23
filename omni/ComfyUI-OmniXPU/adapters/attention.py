@@ -3,7 +3,7 @@ import os
 
 import torch
 
-from .debug import log_debug_event
+from ..patches.debug import log_debug_event
 
 log = logging.getLogger("ComfyUI-OmniXPU")
 

@@ -4,7 +4,7 @@ High-performance Intel XPU kernels for PyTorch.
 
 Kernel wheel and `intel/llm-scaler-omni` image versions share the single source
 in `omni_xpu_kernel/_version.py`. The current image version is
-`0.1.0-b8-dev`. Source builds support Torch XPU 2.10, 2.11, and 2.12 and
+`0.1.0-b9-dev`. Source builds support Torch XPU 2.10, 2.11, and 2.12 and
 produce GPU-specific local versions such as `+torch211.bmg` and
 `+torch211.ptlh`. The Torch and GPU tags make both native ABI dimensions
 explicit; build a separate wheel for every selected Torch/GPU pair.
@@ -387,9 +387,9 @@ and installed into another matching environment.
 
 | Active build environment | BMG version | PTL-H version |
 |---|---|---|
-| Torch `2.10.x+xpu` | `0.1.0b8.dev0+torch210.bmg` | `0.1.0b8.dev0+torch210.ptlh` |
-| Torch `2.11.x+xpu` | `0.1.0b8.dev0+torch211.bmg` | `0.1.0b8.dev0+torch211.ptlh` |
-| Torch `2.12.x+xpu` | `0.1.0b8.dev0+torch212.bmg` | `0.1.0b8.dev0+torch212.ptlh` |
+| Torch `2.10.x+xpu` | `0.1.0b9.dev0+torch210.bmg` | `0.1.0b9.dev0+torch210.ptlh` |
+| Torch `2.11.x+xpu` | `0.1.0b9.dev0+torch211.bmg` | `0.1.0b9.dev0+torch211.ptlh` |
+| Torch `2.12.x+xpu` | `0.1.0b9.dev0+torch212.bmg` | `0.1.0b9.dev0+torch212.ptlh` |
 
 The wheel metadata pins the exact public Torch version and the local version
 records the AOT GPU target. Do not move a native wheel between Torch minors or
@@ -585,22 +585,22 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
 - Batched GGUF dequantization dispatches each input allocation directly on
   PTL-H to avoid packed-input concatenation. BMG retains grouped concatenation.
 
-The PTL-H configuration validated on 2026-07-20 was:
+The current PTL-H image configuration validated on 2026-07-23 was:
 
 | Component | Version / result |
 |---|---|
-| Source baseline | `dev/torch-version-tag` with GPU-target policies |
+| Source baseline | `dev/comfyui-focused-image` |
 | GPU | Arc B390, `intel_gpu_ptl_h`, IP 30.0.4 |
 | Container | `intel/omix:0.1.0-devel-ubuntu24.04` |
 | Compiler | oneAPI DPC++/C++ 2025.3.3 |
-| PyTorch | `2.10.0+xpu`, `2.11.0+xpu`, and `2.12.0+xpu` |
+| PyTorch | `2.11.0+xpu` |
 | oneDNN | pip `onednn==2025.3.0` / oneDNN 3.9.1 |
 | sycl-tla | `2fc09973bfdf15755090fcb0e3b6ad236408a992` |
-| Tests | Each Torch version: `487 passed, 2 skipped, 1 deselected` |
+| Tests | `570 passed, 2 skipped` |
 
 The validated wheel is
-`omni_xpu_kernel-0.1.0b8.dev0+torch211.ptlh-cp312-cp312-linux_x86_64.whl`,
-SHA256 `2095b7969ca36b63733df8b9c79ec038626a59d065a39c21942cd22e0a63874b`.
+`omni_xpu_kernel-0.1.0b9.dev0+torch211.ptlh-cp312-cp312-linux_x86_64.whl`,
+SHA256 `675947ad95959d01009318049d3511dd57a2d1ebefeaafcc90be8c0a29030510`.
 
 Compiler metadata contains two LGRF images and three CUTE images. LGRF D128 and
 D64 kernels reserve 256 GRF with 32 KiB and 16 KiB SLM respectively; the CUTE

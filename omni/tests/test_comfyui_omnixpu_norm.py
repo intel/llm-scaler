@@ -10,6 +10,7 @@ from pathlib import Path
 
 _PLUGIN = Path(__file__).parents[1] / "ComfyUI-OmniXPU"
 _PATCHES = _PLUGIN / "patches"
+_ADAPTERS = _PLUGIN / "adapters"
 
 
 def _load_module(name: str, path: Path):
@@ -27,8 +28,11 @@ def _load_patch(monkeypatch):
     package.__path__ = [str(_PLUGIN)]
     patches = types.ModuleType(f"{package_name}.patches")
     patches.__path__ = [str(_PATCHES)]
+    adapters = types.ModuleType(f"{package_name}.adapters")
+    adapters.__path__ = [str(_ADAPTERS)]
     monkeypatch.setitem(sys.modules, package_name, package)
     monkeypatch.setitem(sys.modules, patches.__name__, patches)
+    monkeypatch.setitem(sys.modules, adapters.__name__, adapters)
     _load_module(f"{patches.__name__}.debug", _PATCHES / "debug.py")
 
     comfy = types.ModuleType("comfy")
@@ -40,7 +44,7 @@ def _load_patch(monkeypatch):
         sys.modules, "comfy.model_management", model_management
     )
     return _load_module(
-        f"{patches.__name__}.patch_norm", _PATCHES / "patch_norm.py"
+        f"{adapters.__name__}.norm", _ADAPTERS / "norm.py"
     )
 
 

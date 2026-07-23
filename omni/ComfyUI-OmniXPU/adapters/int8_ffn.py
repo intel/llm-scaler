@@ -8,7 +8,7 @@ from typing import Any
 
 import torch
 
-from .debug import log_debug_event
+from ..patches.debug import log_debug_event
 
 log = logging.getLogger("ComfyUI-OmniXPU")
 
@@ -149,7 +149,7 @@ def apply():
         return False, "omni_xpu_kernel.int8 not available"
 
     # The fused route starts with int8_linear_shared_input, which invokes the
-    # same native dynamic rowwise quantizer guarded by patch_int8 on PTL-H.
+    # same native dynamic rowwise quantizer exposed by the Kitchen XPU backend.
     # Skipping this wrapper lets the original Lumina path reach that safe eager
     # fallback instead of entering an uncatchable native process fault.
     target = getattr(_omni_package, "__xpu_target__", "")

@@ -1,79 +1,141 @@
 import logging
+from dataclasses import dataclass
+from pathlib import Path
 
 from .debug import debug_enabled, verbose_debug_enabled
 
 log = logging.getLogger("ComfyUI-OmniXPU")
 
-# Patch registry: ordered list of (name, status, reason)
+# Runtime component status for the diagnostics node.
 _registry = []
 
 
-def _record(name, status, reason=""):
-    _registry.append({"name": name, "status": status, "reason": reason})
+@dataclass(frozen=True)
+class Component:
+    name: str
+    flag: str
+    kind: str
+    owner: str
+    module: str
+
+
+# Generic XPU operators are intentionally absent: comfy_kitchen owns their
+# registration, capability checks, dispatch, and eager fallback.
+COMPONENTS = (
+    Component(
+        "attention_adapter",
+        "attention",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/attention.py",
+    ),
+    Component(
+        "norm_adapter",
+        "norm",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/norm.py",
+    ),
+    Component(
+        "fp8_model_adapter",
+        "fp8_gemm",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/fp8_gemm.py",
+    ),
+    Component(
+        "int8_ffn_adapter",
+        "int8_ffn",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/int8_ffn.py",
+    ),
+    Component(
+        "legacy_interpolate_fix",
+        "interpolate_fix",
+        "legacy_fix",
+        "upstream_pending",
+        "fixes/legacy_interpolate.py",
+    ),
+    Component(
+        "legacy_median_fix",
+        "median_fix",
+        "legacy_fix",
+        "upstream_pending",
+        "fixes/legacy_median.py",
+    ),
+)
+
+
+def _record(component, status, reason=""):
+    _registry.append(
+        {
+            "name": component.name,
+            "kind": component.kind,
+            "owner": component.owner,
+            "module": component.module,
+            "status": status,
+            "reason": reason,
+        }
+    )
     if status == "applied":
-        log.info("[OmniXPU] %s: applied", name)
+        log.info("[OmniXPU] %s: applied", component.name)
     elif status == "skipped":
-        log.info("[OmniXPU] %s: skipped (%s)", name, reason)
+        log.info("[OmniXPU] %s: skipped (%s)", component.name, reason)
     elif status == "failed":
-        log.warning("[OmniXPU] %s: FAILED (%s)", name, reason)
+        log.warning("[OmniXPU] %s: FAILED (%s)", component.name, reason)
 
 
 def get_status():
     return list(_registry)
 
 
+def get_components():
+    return [
+        {
+            "name": component.name,
+            "flag": component.flag,
+            "kind": component.kind,
+            "owner": component.owner,
+            "module": component.module,
+        }
+        for component in COMPONENTS
+    ]
+
+
 def apply_all_patches(cfg):
     import importlib
-    import os
     import sys
 
+    _registry.clear()
     if verbose_debug_enabled():
         log.info("[OmniXPU] verbose debug tracing enabled (dispatch + kernel)")
     elif debug_enabled():
         log.info("[OmniXPU] debug tracing enabled (kernel only)")
 
-    _patches_dir = os.path.dirname(os.path.abspath(__file__))
-    _pkg_name = os.path.basename(os.path.dirname(_patches_dir))
+    plugin_dir = Path(__file__).resolve().parent.parent
+    pkg_name = __name__.rsplit(".", 1)[0]
 
-    def _load_patch(name):
-        fpath = os.path.join(_patches_dir, name + ".py")
-        mod_name = f"{_pkg_name}.patches.{name}"
+    def _load_component(component):
+        relative = Path(component.module)
+        fpath = plugin_dir / relative
+        mod_name = f"{pkg_name}.{'.'.join(relative.with_suffix('').parts)}"
         spec = importlib.util.spec_from_file_location(mod_name, fpath)
         mod = importlib.util.module_from_spec(spec)
         sys.modules[mod_name] = mod
         spec.loader.exec_module(mod)
         return mod.apply
 
-    apply_interpolate = _load_patch("patch_interpolate")
-    apply_median = _load_patch("patch_median")
-    apply_fp8_fix = _load_patch("patch_fp8_fix")
-    apply_norm = _load_patch("patch_norm")
-    apply_rope = _load_patch("patch_rope")
-    apply_fp8_gemm = _load_patch("patch_fp8_gemm")
-    apply_attention = _load_patch("patch_attention")
-    apply_int8 = _load_patch("patch_int8")
-    apply_int8_ffn = _load_patch("patch_int8_ffn")
-
-    _apply_one("interpolate_fix", cfg.interpolate_fix, apply_interpolate)
-    _apply_one("median_fix", cfg.median_fix, apply_median)
-    _apply_one("fp8_neg_zero_fix", cfg.fp8_neg_zero_fix, apply_fp8_fix)
-    _apply_one("norm", cfg.norm, apply_norm)
-    _apply_one("rope", cfg.rope, apply_rope)
-    _apply_one("fp8_gemm", cfg.fp8_gemm, apply_fp8_gemm)
-    _apply_one("attention", cfg.attention, apply_attention)
-    _apply_one("int8", cfg.int8, apply_int8)
-    _apply_one("int8_ffn", cfg.int8_ffn, apply_int8_ffn)
-
-
-def _apply_one(name, enabled, apply_fn):
-    if not enabled:
-        _record(name, "skipped", "disabled by env")
-        return
-    try:
-        ok, reason = apply_fn()
-        if ok:
-            _record(name, "applied")
-        else:
-            _record(name, "skipped", reason)
-    except Exception as e:
-        _record(name, "failed", str(e))
+    for component in COMPONENTS:
+        if not getattr(cfg, component.flag):
+            _record(component, "skipped", "disabled by env")
+            continue
+        try:
+            apply_fn = _load_component(component)
+            ok, reason = apply_fn()
+            if ok:
+                _record(component, "applied")
+            else:
+                _record(component, "skipped", reason or "")
+        except Exception as exc:
+            _record(component, "failed", str(exc))

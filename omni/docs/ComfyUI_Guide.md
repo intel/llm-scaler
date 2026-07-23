@@ -277,11 +277,8 @@ The text prompt is intended to describe the overall content of the input image�
 
 #### Workflow Files
 
-| Workflow | Description |
-|----------|-------------|
-| `image_sd3.5_simple_example.json` | Simple text-to-image workflow |
-| `image_sd3.5_midium.json` | Medium model workflow |
-| `image_sd3.5_large_canny_controlnet_example.json` | Large model + Canny ControlNet |
+Use ComfyUI's Template Browser for the maintained text-to-image and ControlNet
+workflows.
 
 ---
 
@@ -345,12 +342,10 @@ The text prompt is intended to describe the overall content of the input image�
         └── ae.safetensors
 ```
 
-#### Workflow Files
+#### Workflows
 
-| Workflow | Description |
-|----------|-------------|
-| `image_flux_kontext_dev_basic.json` | Multi-image reference basic workflow |
-| `image_flux_controlnet_example.json` | Flux ControlNet workflow |
+Use the maintained Kontext and ControlNet workflows in ComfyUI's Template
+Browser.
 
 ---
 
@@ -384,11 +379,10 @@ The text prompt is intended to describe the overall content of the input image�
 
 > CLIP is shared with Qwen-Image models. VAE and DiT are specific to FireRed-Image-Edit.
 
-#### Workflow Files
+#### Workflow
 
-| Workflow | Description |
-|----------|-------------|
-| `image_firered_image_edit_1.1.json` | Multi-image reference editing workflow with optional Lightning LoRA |
+Use the workflow published with the FireRed model card. The repository no
+longer carries a snapshot.
 
 #### Usage Tips
 
@@ -421,11 +415,6 @@ The text prompt is intended to describe the overall content of the input image�
 | UNet (Low Noise) | `wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors` | `diffusion_models/` | [HuggingFace](https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors) |
 | VAE | `wan_2.1_vae.safetensors` | `vae/` | [HuggingFace](https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors) |
 
-##### Image to Video (14B)
-| Type | Filename | Directory | Download Link |
-|------|----------|-----------|---------------|
-| UNet | `wan2.2_i2v_14B_fp8_scaled.safetensors` | `diffusion_models/` | [HuggingFace](https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_14B_fp8_scaled.safetensors) |
-
 #### Model Storage Location
 
 **For 5B Text+Image to Video (`video_wan2_2_5B_ti2v.json`):**
@@ -455,45 +444,15 @@ The text prompt is intended to describe the overall content of the input image�
         └── wan_2.1_vae.safetensors
 ```
 
-**For 14B Image to Video (`video_wan2.2_14B_i2v_rapid_aio_multi_xpu.json`):**
-
-```text
-📂 ComfyUI/
-└── 📂 models/
-    ├── 📂 text_encoders/
-    │   └── umt5_xxl_fp8_e4m3fn_scaled.safetensors
-    ├── 📂 diffusion_models/
-    │   └── wan2.2_i2v_14B_fp8_scaled.safetensors
-    └── 📂 vae/
-        └── wan2.2_vae.safetensors
-```
-
 #### Workflow Files
 
 | Workflow | Description |
 |----------|-------------|
 | `video_wan2_2_5B_ti2v.json` | 5B text+image to video |
 | `video_wan2_2_14B_t2v.json` | 14B text to video |
-| `video_wan2_2_14B_t2v_rapid_aio_multi_xpu.json` | 14B text to video + multi-XPU support (Raylight) |
-| `video_wan2.2_14B_i2v_rapid_aio_multi_xpu.json` | 14B image to video + multi-XPU support |
-| `video_wan2_2_animate_basic.json` | 14B video animation |
 
-#### Multi-XPU Configuration (Raylight)
-
-Use [WAN2.2-14B-Rapid-AllInOne](https://huggingface.co/Phr00t/WAN2.2-14B-Rapid-AllInOne) with [Raylight](https://github.com/komikndr/raylight) for multi-GPU acceleration:
-
-1. **Model Loading**
-   - `Load Diffusion Model (Ray)` node loads the diffusion model from WAN2.2-14B-Rapid-AllInOne
-   - `Load VAE` node loads the VAE
-   - `Load CLIP` node loads `umt5_xxl_fp8_e4m3fn_scaled.safetensors`
-
-2. **Ray Configuration**
-   - Set `GPU` and `ulysses_degree` in the `Ray Init Actor` node to the number of GPUs you want to use
-
-3. **Execute Workflow**
-   - Click the `Run` button or use shortcut `Ctrl + Enter`
-
-> **Tip**: Model weights can be obtained from [ModelScope](https://modelscope.cn/models/Phr00t/WAN2.2-14B-Rapid-AllInOne/files). You may need to use `tools/extract.py` to extract UNet and VAE parts.
+These workflows, including Wan Animate, are maintained in ComfyUI's Template
+Browser and are not copied into this repository.
 
 ---
 
@@ -530,56 +489,7 @@ Use [WAN2.2-14B-Rapid-AllInOne](https://huggingface.co/Phr00t/WAN2.2-14B-Rapid-A
 
 #### Workflow Files
 
-| Workflow | Description |
-|----------|-------------|
-| `video_hunyuan_video_1.5_t2v.json` | Text to video |
-| `video_hunyuan_video_1.5_i2v.json` | Image to video |
-| `video_hunyuan_video_1.5_i2v_multi_xpu.json` | Image to video + multi-XPU support (Raylight) |
-
-> **Note**: Default parameter configurations are optimized for 480p FP8 image-to-video.
-
-#### Multi-XPU Configuration (Raylight)
-
-For `video_hunyuan_video_1.5_i2v_multi_xpu.json`, use [Raylight](https://github.com/komikndr/raylight) for multi-GPU acceleration:
-
-##### Additional Model Files for Multi-XPU
-
-| Type | Filename | Directory | Download Link |
-|------|----------|-----------|---------------|
-| UNet (480p I2V Distilled) | `hunyuanvideo1.5_480p_i2v_cfg_distilled_fp8_scaled.safetensors` | `diffusion_models/` | [HuggingFace](https://huggingface.co/Comfy-Org/HunyuanVideo_1.5_repackaged/resolve/main/split_files/diffusion_models/hunyuanvideo1.5_480p_i2v_cfg_distilled_fp8_scaled.safetensors) |
-| CLIP Vision | `sigclip_vision_patch14_384.safetensors` | `clip_vision/` | [HuggingFace](https://huggingface.co/Comfy-Org/sigclip_vision_384/resolve/main/sigclip_vision_patch14_384.safetensors) |
-
-##### Model Storage Location (Multi-XPU)
-
-```text
-📂 ComfyUI/
-└── 📂 models/
-    ├── 📂 text_encoders/
-    │   ├── qwen_2.5_vl_7b_fp8_scaled.safetensors
-    │   └── byt5_small_glyphxl_fp16.safetensors
-    ├── 📂 diffusion_models/
-    │   └── hunyuanvideo1.5_480p_i2v_cfg_distilled_fp8_scaled.safetensors
-    ├── 📂 clip_vision/
-    │   └── sigclip_vision_patch14_384.safetensors
-    └── 📂 vae/
-        └── hunyuanvideo15_vae_fp16.safetensors
-```
-
-##### Ray Configuration
-
-1. **Ray Initializer**
-   - Configure `GPU` count and parallelism settings (`ulysses_degree`, `ring_degree`) in the `RayInitializer` node
-   - Set to the number of GPUs you want to use (e.g., 2 or 4)
-
-2. **Model Loading**
-   - `RayUNETLoader` node loads the diffusion model with Ray distributed support
-   - `DualCLIPLoader` loads text encoders (Qwen + ByT5)
-   - `VAELoader` loads the VAE
-   - `CLIPVisionLoader` loads the CLIP Vision model for image conditioning
-
-3. **Sampling**
-   - `XFuserSamplerCustom` performs distributed sampling across multiple GPUs
-   - `RayModelSamplingSD3` configures the model sampling parameters
+Use ComfyUI's Template Browser for the maintained T2V and I2V workflows.
 
 ---
 
@@ -617,8 +527,9 @@ For `video_hunyuan_video_1.5_i2v_multi_xpu.json`, use [Raylight](https://github.
 |----------|-------------|
 | `video_ltx2_19B_t2v.json` | Text to video with audio/motion |
 | `video_ltx2_19B_i2v.json` | Image to video with audio/motion |
-| `video_ltx_2_19B_t2v_distilled.json` | Distilled workflow for text to video with audio/motion |
-| `video_ltx_2_19B_i2v_distilled.json` | Distilled workflow for image to video with audio/motion |
+
+These workflows are maintained in ComfyUI's Template Browser and are not
+copied into this repository.
 
 ---
 
@@ -822,14 +733,14 @@ ComfyUI has built-in model download functionality. It will automatically prompt 
 ### 3. Generation is slow?
 
 - Use FP8 quantized models
-- Enable multi-XPU support (for supported workflows)
 - Reduce output resolution or frame count
 
 ### 4. Out of memory?
 
-- Use `--lowvram` or `--novram` startup parameters
 - Reduce batch size
 - Use quantized models
+- Switch to a smaller model or lower resolution before enabling aggressive
+  host offload
 
 ### 5. How to add custom nodes?
 

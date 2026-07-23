@@ -62,9 +62,9 @@ Key points:
 - Produce wheel to %OUTPUT_DIR%
 
 Output:
-- Torch 2.10.x/BMG: %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+torch210.bmg-cp312-cp312-win_amd64.whl
-- Torch 2.11.x/BMG: %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+torch211.bmg-cp312-cp312-win_amd64.whl
-- Torch 2.12.x/BMG: %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+torch212.bmg-cp312-cp312-win_amd64.whl
+- Torch 2.10.x/BMG: %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b9.dev0+torch210.bmg-cp312-cp312-win_amd64.whl
+- Torch 2.11.x/BMG: %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b9.dev0+torch211.bmg-cp312-cp312-win_amd64.whl
+- Torch 2.12.x/BMG: %OUTPUT_DIR%\omni_xpu_kernel-0.1.0b9.dev0+torch212.bmg-cp312-cp312-win_amd64.whl
 
 PTL-H builds use the corresponding `.ptlh` local-version component. Build one
 artifact for every Torch/GPU target pair rather than renaming a BMG wheel.
@@ -85,7 +85,7 @@ Command example (with variables):
 ```
 set "TORCH_TAG=torch211"
 set "XPU_TAG=bmg"
-"%EMBED_PYTHON_DIR%\python.exe" -m pip install --force-reinstall --no-deps "%OUTPUT_DIR%\omni_xpu_kernel-0.1.0b8.dev0+%TORCH_TAG%.%XPU_TAG%-cp312-cp312-win_amd64.whl"
+"%EMBED_PYTHON_DIR%\python.exe" -m pip install --force-reinstall --no-deps "%OUTPUT_DIR%\omni_xpu_kernel-0.1.0b9.dev0+%TORCH_TAG%.%XPU_TAG%-cp312-cp312-win_amd64.whl"
 ```
 
 ## 4. Verify (optional)

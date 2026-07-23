@@ -12,6 +12,7 @@ import torch
 
 _PLUGIN = Path(__file__).parents[1] / "ComfyUI-OmniXPU"
 _PATCHES = _PLUGIN / "patches"
+_ADAPTERS = _PLUGIN / "adapters"
 
 
 def _load_module(name: str, path: Path):
@@ -28,12 +29,15 @@ def _load_patch(monkeypatch, candidate):
     package.__path__ = [str(_PLUGIN)]
     patches = types.ModuleType("omnixpu_ffn_test.patches")
     patches.__path__ = [str(_PATCHES)]
+    adapters = types.ModuleType("omnixpu_ffn_test.adapters")
+    adapters.__path__ = [str(_ADAPTERS)]
     monkeypatch.setitem(sys.modules, package.__name__, package)
     monkeypatch.setitem(sys.modules, patches.__name__, patches)
+    monkeypatch.setitem(sys.modules, adapters.__name__, adapters)
     _load_module("omnixpu_ffn_test.patches.debug", _PATCHES / "debug.py")
     patch = _load_module(
-        "omnixpu_ffn_test.patches.patch_int8_ffn",
-        _PATCHES / "patch_int8_ffn.py",
+        "omnixpu_ffn_test.adapters.int8_ffn",
+        _ADAPTERS / "int8_ffn.py",
     )
 
     class FeedForward:
@@ -103,19 +107,19 @@ class _Candidate:
         return q.to(torch.float32) + 4
 
 
-def test_ffn_environment_switch_is_nested_under_int8(monkeypatch):
+def test_ffn_environment_switch_is_independent_of_kitchen_int8(monkeypatch):
     config_path = _PLUGIN / "config.py"
     monkeypatch.setenv("OMNIXPU_ENABLE", "1")
-    monkeypatch.setenv("OMNIXPU_INT8", "1")
     monkeypatch.setenv("OMNIXPU_INT8_FFN", "0")
     config = _load_module("omnixpu_ffn_config_disabled", config_path)
-    assert config.config.int8
     assert not config.config.int8_ffn
 
-    monkeypatch.setenv("OMNIXPU_INT8", "0")
     monkeypatch.setenv("OMNIXPU_INT8_FFN", "1")
-    config = _load_module("omnixpu_ffn_config_parent_disabled", config_path)
-    assert not config.config.int8
+    config = _load_module("omnixpu_ffn_config_enabled", config_path)
+    assert config.config.int8_ffn
+
+    monkeypatch.setenv("OMNIXPU_ENABLE", "0")
+    config = _load_module("omnixpu_ffn_config_master_disabled", config_path)
     assert not config.config.int8_ffn
 
 

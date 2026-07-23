@@ -2,12 +2,11 @@
 # Copyright (C) 2025 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-# Full Omni two-stage development image built with the repository's original two-stage
-# builder/runtime structure.
+# ComfyUI-focused Omni development image.
 #
-# The runtime stage deliberately uses the OMIX devel base as well.  Therefore
-# the single delivered image keeps the complete oneAPI compiler and GPU runtime
-# while the builder/runtime boundary still isolates the build procedure.
+# The default image intentionally excludes Xinference, SGLang/SGLDiffusion,
+# and the disabled media/3D node bundle. Raylight's xDiT-based multi-XPU
+# ComfyUI integration is not part of either flavor; this image targets one XPU.
 
 ARG BASE_IMAGE=intel/omix:0.1.0-devel-ubuntu24.04
 ARG PYTHON_VERSION=3.12
@@ -15,58 +14,27 @@ ARG TORCH_VERSION=2.11.0+xpu
 ARG TORCHVISION_VERSION=0.26.0+xpu
 ARG TORCHAUDIO_VERSION=2.11.0+xpu
 ARG ONEDNN_VERSION=2025.3.0
-ARG SGL_KERNEL_COMMIT=9aef6481524906d11956bf4b4ab8e243c5128b4e
-# One canonical architecture selector drives every native component. Supported
-# values are bmg (Arc B-series) and ptl-h (Panther Lake H / Arc B390).
 ARG XPU_TARGET=bmg
 ARG MAX_JOBS=8
 ARG IMAGE_TAG
 
-# ======== Builder Stage ========
-# OMIX devel already provides oneAPI 2025.3 (compiler + runtime libraries), so
-# unlike llm-scaler-platform we must not reinstall a separately pinned DPC++
-# compiler from Intel's apt repository.
-FROM ${BASE_IMAGE} AS builder
+ARG SYCL_TLA_REPOSITORY=https://github.com/intel/sycl-tla.git
+ARG SYCL_TLA_COMMIT=2fc09973bfdf15755090fcb0e3b6ad236408a992
+ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
+ARG COMFY_KITCHEN_COMMIT=223eea0c931bcf7a1bd0e83631e21b2a58961b28
+ARG COMFY_KITCHEN_VERSION=0.2.18
 
-ARG https_proxy
-ARG http_proxy
-ARG no_proxy=localhost,127.0.0.1,::1,intel.com,.intel.com
+# ======== Stable OS/toolchain base ========
+# Keep device, image-version, Kitchen, and local-source arguments out of this
+# stage. Changes to those inputs must not invalidate apt or Python setup.
+FROM ${BASE_IMAGE} AS os-base
+
 ARG PYTHON_VERSION
-ARG TORCH_VERSION
-ARG TORCHVISION_VERSION
-ARG TORCHAUDIO_VERSION
-ARG ONEDNN_VERSION
-ARG SGL_KERNEL_COMMIT
-ARG XPU_TARGET
-ARG MAX_JOBS
-ARG IMAGE_TAG
 
-RUN test -n "${IMAGE_TAG}" && \
-    { test "${XPU_TARGET}" = bmg || test "${XPU_TARGET}" = ptl-h; }
-
-ENV DEBIAN_FRONTEND=noninteractive \
-    VIRTUAL_ENV=/opt/venv \
-    PATH="/opt/venv/bin:/opt/intel/oneapi/compiler/latest/bin:${PATH}" \
-    PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    http_proxy=${http_proxy} \
-    https_proxy=${https_proxy} \
-    no_proxy=${no_proxy} \
-    TORCH_XPU_ARCH_LIST=${XPU_TARGET} \
-    OMNI_XPU_DEVICE=${XPU_TARGET} \
-    MAX_JOBS=${MAX_JOBS} \
-    CMAKE_BUILD_PARALLEL_LEVEL=${MAX_JOBS}
-
-# Make both Python entrypoints and native extensions work without requiring the
-# user to source setvars.sh first.  Source builds below still source setvars.sh
-# so they receive the complete oneAPI compiler environment.
-ENV LD_LIBRARY_PATH="/opt/venv/lib:/opt/venv/lib/python${PYTHON_VERSION}/site-packages/torch/lib:/opt/intel/oneapi/compiler/latest/lib:/opt/intel/oneapi/dnnl/latest/lib:/opt/intel/oneapi/mkl/latest/lib:/opt/intel/oneapi/tbb/latest/lib:/opt/intel/oneapi/mpi/latest/lib"
+ENV DEBIAN_FRONTEND=noninteractive
 
 SHELL ["bash", "-c"]
 
-# System packages
-# The compiler is deliberately not installed here: it is supplied and
-# maintained as part of the OMIX devel base image.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     apt-get update -y && \
@@ -80,13 +48,27 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libxi6 libxxf86vm1 libxcursor1 libxrandr2 libxinerama1 \
         libxkbcommon0
 
-# Isolated Python environment.  This avoids modifying OMIX's system Python and
-# keeps every Python package used by the delivered image under /opt/venv.
+# ======== Stable Python/Torch base ========
+# This stage is shared by the ComfyUI dependency, Kitchen, and kernel branches.
+# It changes only when the base Python/Torch/oneDNN environment changes.
+FROM os-base AS python-base
+
+ARG PYTHON_VERSION
+ARG TORCH_VERSION
+ARG TORCHVISION_VERSION
+ARG TORCHAUDIO_VERSION
+ARG ONEDNN_VERSION
+
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:/opt/intel/oneapi/compiler/latest/bin:${PATH}" \
+    PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+ENV LD_LIBRARY_PATH="/opt/venv/lib:/opt/venv/lib/python${PYTHON_VERSION}/site-packages/torch/lib:/opt/intel/oneapi/compiler/latest/lib:/opt/intel/oneapi/dnnl/latest/lib:/opt/intel/oneapi/mkl/latest/lib:/opt/intel/oneapi/tbb/latest/lib:/opt/intel/oneapi/mpi/latest/lib"
+
 RUN python${PYTHON_VERSION} -m venv ${VIRTUAL_ENV} && \
     pip install --upgrade pip setuptools wheel
 
-# PyTorch
-# Torch 2.11 must match the native extensions built in this image.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
         torch==${TORCH_VERSION} \
@@ -98,357 +80,248 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         onednn==${ONEDNN_VERSION} \
         onednn-devel==${ONEDNN_VERSION}
 
-RUN mkdir -p /llm /wheels
+RUN mkdir -p /llm /wheels /llm/patches
 
-# TODO(cache): move target-independent third-party dependency installation
-# ahead of local source COPY instructions, especially omni_xpu_kernel and
-# ComfyUI-OmniXPU. At present, a Kernel-only source change invalidates the
-# unrelated long-context, ComfyUI, and custom-node layers. Keep native target
-# arguments scoped to the first layer that actually consumes them as part of
-# that rework.
-# omni_xpu_kernel is installed AFTER sgl-kernel-xpu (below): its cute FMHA
-# extension needs the cutlass-sycl headers that sgl-kernel-xpu fetches into
-# build/_deps/repo-cutlass-sycl-src.
-# Keep the complete local source under /llm so it can be transferred to and
-# rebuilt inside the runtime image.
-COPY ./omni_xpu_kernel /llm/omni_xpu_kernel
+# ======== Pinned native headers ========
+# Header acquisition is independent of both local native projects. A kernel
+# source change reuses this stage; a Kitchen change never reaches it.
+FROM python-base AS sycl-tla
 
-# Keep project patches for the final image as part of the source-development
-# environment and use them directly from this stable path.
-COPY ./patches /llm/patches
+ARG SYCL_TLA_REPOSITORY
+ARG SYCL_TLA_COMMIT
 
-# xDiT / long-context-attention
+# Fetch native headers directly. This replaces the old hidden dependency on the
+# copy of sycl-tla populated as a side effect of building sgl-kernel-xpu.
+RUN cd /llm && \
+    git clone --filter=blob:none --no-checkout \
+        "${SYCL_TLA_REPOSITORY}" sycl-tla && \
+    git -C sycl-tla fetch --depth 1 origin "${SYCL_TLA_COMMIT}" && \
+    git -C sycl-tla checkout --detach FETCH_HEAD
+
+# ======== Stable ComfyUI dependency tree ========
+FROM python-base AS comfyui-deps
+
+# ComfyUI core and its Python dependencies are target-independent and stay
+# ahead of local source COPY instructions for Docker cache reuse.
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm && \
-    git clone --depth 1 https://github.com/feifeibear/long-context-attention.git && \
-    cd long-context-attention && \
-    git fetch --depth 1 origin fc5d55e61b78b3102fd824bea1791cf406cc2a4b && \
-    git checkout fc5d55e61b78b3102fd824bea1791cf406cc2a4b && \
-    git apply /llm/patches/yunchang_for_multi_arc.patch && \
-    pip install -e . && \
-    cd /llm && \
-    git clone --depth 1 https://github.com/xdit-project/xDiT.git && \
-    cd xDiT && \
-    git fetch --depth 1 origin fb8fb0e437a8745b9629020759de31d1626a4a7b && \
-    git checkout fb8fb0e437a8745b9629020759de31d1626a4a7b && \
-    git apply /llm/patches/xdit_for_multi_arc.patch && \
-    pip install -e .
+    git clone --filter=blob:none --no-checkout \
+        https://github.com/comfyanonymous/ComfyUI.git && \
+    git -C ComfyUI fetch --depth 1 origin \
+        bb131be9e83d2f773c90f1d6f1e4b248a498c8c5 && \
+    git -C ComfyUI checkout --detach FETCH_HEAD && \
+    pip install -r /llm/ComfyUI/requirements.txt
 
-# ComfyUI core (upstream, no patches)
+# Pin every default custom node to the exact revision accepted in the previous
+# full image. These stable remote-source layers stay ahead of all frequently
+# edited local native sources.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    git clone --filter=blob:none --no-checkout \
+        https://github.com/ltdrdata/ComfyUI-Manager.git comfyui-manager && \
+    git -C comfyui-manager fetch --depth 1 origin \
+        7955e638db7d4a4b8bf7a614e724a2013b83dfd7 && \
+    git -C comfyui-manager checkout --detach FETCH_HEAD && \
+    pip install -r comfyui-manager/requirements.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    git clone --filter=blob:none --no-checkout \
+        https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git \
+        comfyui-videohelpersuite && \
+    git -C comfyui-videohelpersuite fetch --depth 1 origin \
+        4ee72c065db22c9d96c2427954dc69e7b908444b && \
+    git -C comfyui-videohelpersuite checkout --detach FETCH_HEAD && \
+    pip install -r comfyui-videohelpersuite/requirements.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    git clone --filter=blob:none --no-checkout \
+        https://github.com/yolain/ComfyUI-Easy-Use.git comfyui-easy-use && \
+    git -C comfyui-easy-use fetch --depth 1 origin \
+        54d080bf6a4f52da287e984f305243c10db097f5 && \
+    git -C comfyui-easy-use checkout --detach FETCH_HEAD && \
+    pip install -r comfyui-easy-use/requirements.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    git clone --filter=blob:none --no-checkout \
+        https://github.com/kijai/ComfyUI-KJNodes.git && \
+    git -C ComfyUI-KJNodes fetch --depth 1 origin \
+        a41e0d85b822ddc4bbd1256417aa2d58d39e94ce && \
+    git -C ComfyUI-KJNodes checkout --detach FETCH_HEAD && \
+    pip install -r ComfyUI-KJNodes/requirements.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    git clone --filter=blob:none --no-checkout \
+        https://github.com/Jasonzzt/ComfyUI-CacheDiT.git && \
+    git -C ComfyUI-CacheDiT fetch --depth 1 origin \
+        ab1a1448a2476a33493c9a9b04e1685971b9e73a && \
+    git -C ComfyUI-CacheDiT checkout --detach FETCH_HEAD && \
+    pip install -r ComfyUI-CacheDiT/requirements.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    git clone --filter=blob:none --no-checkout \
+        https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git && \
+    git -C ComfyUI-GGUF-XPU fetch --depth 1 origin \
+        4b8a633e8434036820a2bb9d18cb77ae691e788c && \
+    git -C ComfyUI-GGUF-XPU checkout --detach FETCH_HEAD && \
+    pip install -r ComfyUI-GGUF-XPU/requirements.txt
+
+# Nunchaku is retained because it is a ComfyUI quantized-model backend. Its
+# Python runtime is independent of the removed SGLang service.
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm && \
-    git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git && \
-    cd ComfyUI && \
-    git fetch --depth 1 origin bb131be9e83d2f773c90f1d6f1e4b248a498c8c5 && \
-    git checkout bb131be9e83d2f773c90f1d6f1e4b248a498c8c5 && \
-    pip install -r requirements.txt
+    git clone --filter=blob:none --no-checkout \
+        https://github.com/xiangyuT/nunchaku-torch.git && \
+    git -C nunchaku-torch fetch --depth 1 origin \
+        e09fae78f138fc0f5e86ad630be14433bd9713af && \
+    git -C nunchaku-torch checkout --detach FETCH_HEAD && \
+    pip install -e nunchaku-torch --no-deps && \
+    cd /llm/ComfyUI/custom_nodes && \
+    git clone --filter=blob:none --no-checkout \
+        https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git && \
+    git -C ComfyUI-nunchaku-XPU fetch --depth 1 origin \
+        55b6497e5c5e4337d2de12943fd97a499bd9c2e5 && \
+    git -C ComfyUI-nunchaku-XPU checkout --detach FETCH_HEAD && \
+    pip install -r ComfyUI-nunchaku-XPU/requirements.txt
 
-# ComfyUI-OmniXPU: Intel XPU acceleration via custom node (replaces core patch)
+# Keep the only patched third-party node last. Editing this local patch no
+# longer invalidates any of the unpatched third-party node layers above.
+COPY ./patches/comfyui_controlnet_aux_depth_anything_v2_xpu.patch /llm/patches/
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    git clone --filter=blob:none --no-checkout \
+        https://github.com/Fannovel16/comfyui_controlnet_aux.git && \
+    git -C comfyui_controlnet_aux fetch --depth 1 origin \
+        e8b689a513c3e6b63edc44066560ca5919c0576e && \
+    git -C comfyui_controlnet_aux checkout --detach FETCH_HEAD && \
+    git -C comfyui_controlnet_aux apply \
+        /llm/patches/comfyui_controlnet_aux_depth_anything_v2_xpu.patch && \
+    pip install -r comfyui_controlnet_aux/requirements.txt
+
+# ======== Kitchen wheel branch ========
+# Kitchen and Omni kernel deliberately branch from separate cached parents.
+# Updating either source/commit builds only that wheel, then reruns the cheap
+# final installation/verification layer.
+FROM python-base AS kitchen-wheel
+
+ARG COMFY_KITCHEN_REPOSITORY
+ARG COMFY_KITCHEN_COMMIT
+
+RUN cd /llm && \
+    git clone --filter=blob:none --no-checkout \
+        "${COMFY_KITCHEN_REPOSITORY}" comfy-kitchen-xpu && \
+    git -C comfy-kitchen-xpu fetch --depth 1 origin \
+        "${COMFY_KITCHEN_COMMIT}" && \
+    git -C comfy-kitchen-xpu checkout --detach FETCH_HEAD
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/comfy-kitchen-xpu && \
+    python setup.py bdist_wheel --no-cuda --dist-dir /wheels
+
+# ======== Omni kernel wheel branch ========
+FROM sycl-tla AS kernel-wheel
+
+ARG IMAGE_TAG
+ARG XPU_TARGET
+ARG MAX_JOBS
+
+ENV TORCH_XPU_ARCH_LIST=${XPU_TARGET} \
+    OMNI_XPU_DEVICE=${XPU_TARGET} \
+    MAX_JOBS=${MAX_JOBS} \
+    CMAKE_BUILD_PARALLEL_LEVEL=${MAX_JOBS} \
+    CUTLASS_SYCL_ROOT=/llm/sycl-tla \
+    OMNI_XPU_REQUIRE_CUTE=1
+
+# COPY --link keeps the source snapshot independent of changes to earlier base
+# layers; only this native branch consumes the frequently edited kernel tree.
+COPY --link ./omni_xpu_kernel /llm/omni_xpu_kernel
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -eo pipefail && \
+    source /opt/intel/oneapi/setvars.sh --force && \
+    cd /llm/omni_xpu_kernel && \
+    pip wheel -v . --wheel-dir /wheels --no-deps --no-build-isolation && \
+    pip install --no-deps --force-reinstall \
+        /wheels/omni_xpu_kernel-*.whl
+
+# ======== Final ComfyUI development assembly ========
+FROM comfyui-deps AS builder-comfyui
+
+ARG IMAGE_TAG
+ARG XPU_TARGET
+ARG MAX_JOBS
+ARG COMFY_KITCHEN_VERSION
+
+ENV TORCH_XPU_ARCH_LIST=${XPU_TARGET} \
+    OMNI_XPU_DEVICE=${XPU_TARGET} \
+    MAX_JOBS=${MAX_JOBS} \
+    CMAKE_BUILD_PARALLEL_LEVEL=${MAX_JOBS} \
+    CUTLASS_SYCL_ROOT=/llm/sycl-tla \
+    OMNI_XPU_REQUIRE_CUTE=1
+
+COPY --from=sycl-tla /llm/sycl-tla /llm/sycl-tla
+COPY --from=kitchen-wheel /llm/comfy-kitchen-xpu /llm/comfy-kitchen-xpu
+COPY --from=kernel-wheel /llm/omni_xpu_kernel /llm/omni_xpu_kernel
+COPY --from=kitchen-wheel /wheels/ /wheels/
+COPY --from=kernel-wheel /wheels/ /wheels/
+
+# All third-party requirements are already installed. Force the two locally
+# iterated native packages into the final environment without dependency
+# resolution so neither can silently replace the accepted Torch/Kitchen stack.
+# Artifact and device acceptance belongs in tools/validate_comfyui_image.py,
+# where the check can run with the real /dev/dri device rather than Docker's
+# device-less build sandbox.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps --force-reinstall \
+        /wheels/omni_xpu_kernel-*.whl \
+        /wheels/comfy_kitchen-${COMFY_KITCHEN_VERSION}-*.whl
+
+# The local custom node is intentionally a thin ComfyUI integration layer. It
+# is copied after Kitchen/kernel installation so adapter-only edits stay cheap.
 COPY ./ComfyUI-OmniXPU /llm/ComfyUI/custom_nodes/ComfyUI-OmniXPU
 RUN cd /llm/ComfyUI/custom_nodes/ComfyUI-OmniXPU && \
     git init && git add -A && \
     git -c user.name="llm-scaler" -c user.email="noreply@intel.com" \
         commit --allow-empty -m "ComfyUI-OmniXPU ${IMAGE_TAG}"
 
-# ComfyUI custom nodes (active)
-RUN --mount=type=cache,target=/root/.cache/pip \
-    cd /llm/ComfyUI/custom_nodes && \
-    git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Manager.git comfyui-manager && \
-    git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git comfyui-videohelpersuite && \
-    pip install -r comfyui-videohelpersuite/requirements.txt && \
-    git clone --depth 1 https://github.com/komikndr/raylight.git && \
-    cd raylight && \
-    git fetch --depth 1 origin c91ef47afb02e522bf08ff199ea2182642de0368 && \
-    git checkout c91ef47afb02e522bf08ff199ea2182642de0368 && \
-    git apply /llm/patches/raylight_for_multi_arc.patch && \
-    pip install ray==2.49.2 -r requirements.txt && \
-    cd /llm/ComfyUI/custom_nodes && \
-    git clone --depth 1 https://github.com/yolain/ComfyUI-Easy-Use.git comfyui-easy-use && \
-    pip install -r comfyui-easy-use/requirements.txt && \
-    git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux.git && \
-    cd comfyui_controlnet_aux && \
-    git fetch --depth 1 origin e8b689a513c3e6b63edc44066560ca5919c0576e && \
-    git checkout e8b689a513c3e6b63edc44066560ca5919c0576e && \
-    git apply /llm/patches/comfyui_controlnet_aux_depth_anything_v2_xpu.patch && \
-    cd .. && \
-    pip install -r comfyui_controlnet_aux/requirements.txt && \
-    git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git && \
-    cd ComfyUI-KJNodes && \
-    git fetch --depth 1 origin a41e0d85b822ddc4bbd1256417aa2d58d39e94ce && \
-    git checkout a41e0d85b822ddc4bbd1256417aa2d58d39e94ce && \
-    pip install -r requirements.txt && \
-    cd /llm/ComfyUI/custom_nodes && \
-    git clone --depth 1 https://github.com/Jasonzzt/ComfyUI-CacheDiT.git && \
-    pip install -r ComfyUI-CacheDiT/requirements.txt && \
-    git clone --depth 1 https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git && \
-    cd ComfyUI-GGUF-XPU && \
-    pip install -r requirements.txt
+# Retain project sources needed for in-container development. The focused image
+# intentionally relies on ComfyUI's Template Browser instead of bundled
+# workflow/input snapshots.
+COPY ./patches /llm/patches
+COPY ./tools /llm/tools
+COPY ./entrypoints/start_comfyui.sh /llm/entrypoints/start_comfyui.sh
 
-# nunchaku-torch runtime + ComfyUI-nunchaku-XPU custom node (SVDQuant W4A4/W4A16 diffusion inference)
-RUN --mount=type=cache,target=/root/.cache/pip \
-    cd /llm && \
-    git clone --depth 1 https://github.com/xiangyuT/nunchaku-torch.git && \
-    cd nunchaku-torch && \
-    git fetch --depth 1 origin e09fae78f138fc0f5e86ad630be14433bd9713af && \
-    git checkout e09fae78f138fc0f5e86ad630be14433bd9713af && \
-    pip install -e . --no-deps && \
-    cd /llm/ComfyUI/custom_nodes && \
-    git clone --depth 1 https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git && \
-    cd ComfyUI-nunchaku-XPU && \
-    git fetch --depth 1 origin 55b6497e5c5e4337d2de12943fd97a499bd9c2e5 && \
-    git checkout 55b6497e5c5e4337d2de12943fd97a499bd9c2e5 && \
-    pip install -r requirements.txt && \
-    pip install --no-deps kernels==0.14.0
+# ======== ComfyUI Runtime ========
+# The runtime is intentionally the completed development builder rather than a
+# fresh os-base plus copies of /opt/venv and /llm. Both stages use the same
+# OMIX devel base, so copying the complete environment only creates very large
+# replacement layers after each kernel/Kitchen edit and slows image export.
+FROM builder-comfyui AS runtime-comfyui
 
-
-ARG INSTALL_DISABLED_NODES=true
-RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "${INSTALL_DISABLED_NODES}" = "true" ]; then \
-        cd /llm/ComfyUI/custom_nodes && \
-        git clone --depth 1 https://github.com/wildminder/ComfyUI-VoxCPM.git comfyui-voxcpm.disabled && \
-        cd comfyui-voxcpm.disabled && \
-        git fetch --depth 1 origin 7875a8a36a531b7efef8cac96dc74001d3cb5895 && \
-        git checkout 7875a8a36a531b7efef8cac96dc74001d3cb5895 && \
-        git apply /llm/patches/comfyui_voxcpm_for_xpu.patch && \
-        pip install -r requirements.txt && \
-        cd /llm/ComfyUI/custom_nodes && \
-        git clone --depth 1 https://github.com/billwuhao/ComfyUI_IndexTTS.git ComfyUI_IndexTTS.disabled && \
-        cd ComfyUI_IndexTTS.disabled && \
-        git apply /llm/patches/comfyui_indextts.patch && \
-        pip install -r requirements.txt torchcodec==0.9.0 && \
-        cd /llm/ComfyUI/custom_nodes && \
-        git clone --depth 1 https://github.com/visualbruno/ComfyUI-Hunyuan3d-2-1.git ComfyUI-Hunyuan3d-2-1.disabled && \
-        cd ComfyUI-Hunyuan3d-2-1.disabled && \
-        git fetch --depth 1 origin 9d7ef32509101495a7840b3ae8e718c8d1183305 && \
-        git checkout 9d7ef32509101495a7840b3ae8e718c8d1183305 && \
-        git apply /llm/patches/comfyui_hunyuan3d_for_xpu.patch && \
-        pip install rembg realesrgan -r requirements.txt && \
-        cd hy3dpaint/custom_rasterizer && python setup.py install && \
-        cd ../DifferentiableRenderer && python setup.py install && \
-        cd /llm/ComfyUI/custom_nodes && \
-        git clone --depth 1 https://github.com/jtydhr88/ComfyUI-HY-Motion1.git ComfyUI-HY-Motion1.disabled && \
-        cd ComfyUI-HY-Motion1.disabled && \
-        git fetch --depth 1 origin 47b1d0d96eeac6d4b99509ede91490eaba93440a && \
-        git checkout 47b1d0d96eeac6d4b99509ede91490eaba93440a && \
-        git apply /llm/patches/comfyui_hy_motion1.patch && \
-        pip install -r requirements.txt && \
-        cd /llm/ComfyUI/custom_nodes && \
-        git clone --depth 1 https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git ComfyUI-SeedVR2_VideoUpscaler.disabled && \
-        cd ComfyUI-SeedVR2_VideoUpscaler.disabled && \
-        git fetch --depth 1 origin 4490bd1f482e026674543386bb2a4d176da245b9 && \
-        git checkout 4490bd1f482e026674543386bb2a4d176da245b9 && \
-        git apply /llm/patches/comfyui_seedvr2_xpu.patch && \
-        pip install -r requirements.txt && \
-        cd /llm/ComfyUI/custom_nodes && \
-        git clone --depth 1 https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast.git ComfyUI-FlashVSR_Ultra_Fast.disabled && \
-        cd ComfyUI-FlashVSR_Ultra_Fast.disabled && \
-        git fetch --depth 1 origin 4820b3f02347bddcbbb9a5a85ab7638fe976366e && \
-        git checkout 4820b3f02347bddcbbb9a5a85ab7638fe976366e && \
-        git apply /llm/patches/comfyui_flashvsr_ultra_fast_xpu.patch; \
-    fi
-
-# Xinference
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "xinference[transformers]==1.15.0" \
-        kokoro Jinja2==3.1.6 jieba ordered-set pypinyin cn2an pypinyin-dict && \
-    XINFERENCE_DEVICE_UTILS="$(python -c 'import pathlib, xinference; print(pathlib.Path(xinference.__file__).parent / "device_utils.py")')" && \
-    patch "${XINFERENCE_DEVICE_UTILS}" < /llm/patches/xinference_device_utils.patch
-
-# SGLang Diffusion + sgl-kernel-xpu
-# Keep the checked-out sources and native build directory in /llm so the
-# kernel can be rebuilt and debugged inside a running container.
-# The pinned upstream sgl-kernel-xpu revision force-pins BMG internally. Apply
-# the repository patch so the canonical XPU_TARGET selects BMG AOT or, for
-# PTL-H, the previously validated spir64 JIT strategy (sycl-tla at this pin
-# does not accept PTL as an offline AOT device).
-COPY ./docker/sgl_kernel_xpu_device_target.patch /llm/patches/
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-    set -eo pipefail && \
-    source /opt/intel/oneapi/setvars.sh --force && \
-    mkdir -p /wheels && \
-    cd /llm && \
-    git clone --depth 1 https://github.com/sgl-project/sglang.git && \
-    cd sglang && \
-    git fetch --depth 1 origin 1ae3218d036c554e6c109f18233d1f75bf775c1d && \
-    git checkout 1ae3218d036c554e6c109f18233d1f75bf775c1d && \
-    git apply /llm/patches/sglang_diffusion_for_multi_arc.patch && \
-    cp python/pyproject_xpu.toml python/pyproject.toml && \
-    sed -i '/sgl-kernel/d' python/pyproject.toml && \
-    sed -i 's/"transformers==[0-9.]*"/"transformers"/' python/pyproject.toml && \
-    sed -E -i 's/(torch[a-z]*)([=<>!~]+[0-9.+a-z]+)/\1/g' python/pyproject.toml && \
-    pip install -e "python[diffusion]" && \
-    pip install \
-        'transformers==5.0.0' \
-        'huggingface_hub==1.3.5' \
-        'diffusers==0.38.0' \
-        'peft==0.19.1' && \
-    pip install \
-        torch==${TORCH_VERSION} \
-        torchvision==${TORCHVISION_VERSION} \
-        torchaudio==${TORCHAUDIO_VERSION} \
-        --index-url https://download.pytorch.org/whl/xpu && \
-    pip install triton==3.5.0 && \
-    pip install pytorch-triton-xpu==3.5.0 \
-        --index-url https://download.pytorch.org/whl/xpu --force-reinstall && \
-    cd /llm && \
-    git clone --depth 1 https://github.com/sgl-project/sgl-kernel-xpu.git && \
-    cd sgl-kernel-xpu && \
-    git fetch --depth 1 origin ${SGL_KERNEL_COMMIT} && \
-    git checkout ${SGL_KERNEL_COMMIT} && \
-    git apply /llm/patches/sgl_kernel_xpu_device_target.patch && \
-    if [ "${XPU_TARGET}" = "ptl-h" ]; then \
-        SGL_KERNEL_TARGET=spir64; \
-    else \
-        SGL_KERNEL_TARGET=bmg; \
-    fi && \
-    printf '%s\n' "${SGL_KERNEL_TARGET}" > .llm-scaler-build-target && \
-    SGL_DPCPP_TARGET="${SGL_KERNEL_TARGET}" pip wheel -v . \
-        --wheel-dir /wheels --no-deps && \
-    pip install --no-deps /wheels/sgl_kernel-*.whl && \
-    cp -r /llm/sglang/python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion \
-        /llm/ComfyUI/custom_nodes/
-
-# omni_xpu_kernel (installed here so its cute FMHA ext can use sgl-kernel-xpu's
-# cutlass-sycl headers). CUTLASS_SYCL_ROOT points at the fetched tree; the cute
-# ext is AOT-compiled for the canonical XPU_TARGET through OMNI_XPU_DEVICE.
-# The setup.py source also contains the Torch-2.11/oneDNN include-order fix; the
-# resulting extension must reference dnnl_primitive_attr_set_zero_points
-# (without the _v2 suffix).
-ENV CUTLASS_SYCL_ROOT=/llm/sgl-kernel-xpu/build/_deps/repo-cutlass-sycl-src \
-    OMNI_XPU_REQUIRE_CUTE=1
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-    set -eo pipefail && \
-    source /opt/intel/oneapi/setvars.sh --force && \
-    cd /llm/omni_xpu_kernel && \
-    grep -Fqx "__image_version__ = \"${IMAGE_TAG}\"" omni_xpu_kernel/_version.py && \
-    pip wheel -v . --wheel-dir /wheels --no-deps --no-build-isolation && \
-    pip install --no-deps --force-reinstall /wheels/omni_xpu_kernel-*.whl && \
-    cd / && \
-    python -c 'import os, omni_xpu_kernel as ok; target = os.environ["OMNI_XPU_DEVICE"]; assert ok.__xpu_target__ == target, (ok.__xpu_target__, target); core = ok.core_aot_target(); assert target != "ptl-h" or core == target, (target, core)'
-
-# ComfyUI-Manager dependencies
-# Install these during image build so a fresh/ephemeral container does not need
-# PyPI access or spend about one minute installing GitPython at startup.  This
-# deliberately comes after native kernel builds to preserve their expensive
-# Docker cache when Manager requirements change.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r /llm/ComfyUI/custom_nodes/comfyui-manager/requirements.txt && \
-    python -c "import git; print('ComfyUI-Manager dependencies OK')"
-
-# The pinned ComfyUI core currently requests comfy-kitchen 0.2.16. Install the
-# accepted PTL-H Kitchen source after every third-party requirements step so it
-# cannot be replaced by that older transitive pin. Keep both its source and
-# wheel in the development image for audit and in-container reproduction.
-ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
-ARG COMFY_KITCHEN_COMMIT=223eea0c931bcf7a1bd0e83631e21b2a58961b28
-ARG COMFY_KITCHEN_VERSION=0.2.18
-RUN --mount=type=cache,target=/root/.cache/pip \
-    set -eo pipefail && \
-    cd /llm && \
-    git clone --filter=blob:none --no-checkout \
-        "${COMFY_KITCHEN_REPOSITORY}" comfy-kitchen-xpu && \
-    cd comfy-kitchen-xpu && \
-    git fetch --depth 1 origin "${COMFY_KITCHEN_COMMIT}" && \
-    git checkout --detach FETCH_HEAD && \
-    test "$(git rev-parse HEAD)" = "${COMFY_KITCHEN_COMMIT}" && \
-    test "$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')" = "${COMFY_KITCHEN_VERSION}" && \
-    rm -f /wheels/comfy_kitchen-*.whl && \
-    python setup.py bdist_wheel --no-cuda --dist-dir /wheels && \
-    KITCHEN_WHEEL="$(find /wheels -maxdepth 1 -type f \
-        -name "comfy_kitchen-${COMFY_KITCHEN_VERSION}-*.whl" -print -quit)" && \
-    test -n "${KITCHEN_WHEEL}" && \
-    pip install --no-deps --force-reinstall "${KITCHEN_WHEEL}" && \
-    cd / && \
-    EXPECTED_COMFY_KITCHEN_VERSION="${COMFY_KITCHEN_VERSION}" \
-        python -c 'import importlib.metadata as m, os, comfy_kitchen as k; expected = os.environ["EXPECTED_COMFY_KITCHEN_VERSION"]; assert k.__version__ == expected, (k.__version__, expected); assert m.version("comfy-kitchen") == expected'
-
-# Application files
-COPY ./workflows/* /llm/ComfyUI/user/default/workflows/
-COPY ./example_inputs/* /llm/ComfyUI/input/
-COPY ./tools/* /llm/tools/
-COPY ./entrypoints/* /llm/entrypoints/
-
-# Wheel inventory is useful in CI logs and remains available in the runtime.
-RUN ls -lh /wheels
-
-# ======== Runtime Stage ========
-# This is intentionally OMIX devel rather than a compiler-free PyTorch runtime.
-# It supplies a maintained, coherent oneAPI compiler + GPU runtime environment
-# without manually selecting and copying individual native libraries.
-FROM ${BASE_IMAGE} AS runtime
-
-ARG https_proxy
-ARG http_proxy
-ARG no_proxy=localhost,127.0.0.1,::1,intel.com,.intel.com
-ARG PYTHON_VERSION
 ARG XPU_TARGET
-ARG MAX_JOBS
 ARG IMAGE_TAG
-
-RUN test -n "${IMAGE_TAG}" && \
-    { test "${XPU_TARGET}" = bmg || test "${XPU_TARGET}" = ptl-h; }
-
-ENV DEBIAN_FRONTEND=noninteractive \
-    VIRTUAL_ENV=/opt/venv \
-    PATH="/opt/venv/bin:/opt/intel/oneapi/compiler/latest/bin:${PATH}" \
-    PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    TORCH_XPU_ARCH_LIST=${XPU_TARGET} \
-    OMNI_XPU_DEVICE=${XPU_TARGET} \
-    MAX_JOBS=${MAX_JOBS} \
-    CMAKE_BUILD_PARALLEL_LEVEL=${MAX_JOBS} \
-    CUTLASS_SYCL_ROOT=/llm/sgl-kernel-xpu/build/_deps/repo-cutlass-sycl-src \
-    OMNI_XPU_REQUIRE_CUTE=1
-
-ENV LD_LIBRARY_PATH="/opt/venv/lib:/opt/venv/lib/python${PYTHON_VERSION}/site-packages/torch/lib:/opt/intel/oneapi/compiler/latest/lib:/opt/intel/oneapi/dnnl/latest/lib:/opt/intel/oneapi/mkl/latest/lib:/opt/intel/oneapi/tbb/latest/lib:/opt/intel/oneapi/mpi/latest/lib"
-
-SHELL ["bash", "-c"]
-
-# System packages
-# Runtime applications and in-container source builds need the same OS-level
-# headers and build tools. oneAPI itself is already supplied by OMIX devel and
-# is intentionally not reinstalled from a separate apt repository.
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-    apt-get update -y && \
-    apt-get install -y --no-install-recommends --fix-missing \
-        ca-certificates curl ffmpeg git patch \
-        python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv python3-pip \
-        build-essential ninja-build cmake pkg-config \
-        libsndfile1 libsm6 libxext6 libgl1 \
-        lsb-release numactl wget vim linux-libc-dev \
-        libopengl0 libglx0 libxrender1 libxfixes3 libx11-dev \
-        libxi6 libxxf86vm1 libxcursor1 libxrandr2 libxinerama1 \
-        libxkbcommon0
-
-# Copy built artifacts from builder
-# Copy complete environments/trees, not a hand-maintained list of shared
-# libraries.  Editable installs continue to resolve because their /llm paths
-# are identical in builder and runtime.
-COPY --from=builder /opt/venv /opt/venv
-COPY --from=builder /llm /llm
-COPY --from=builder /wheels /wheels
-
-# Fix for multi-XPU support: copy SYCL native binary files to a common library path
-# The files already ship with this OMIX base; no files are removed.
-RUN cp /opt/intel/oneapi/compiler/latest/lib/libsycl-native-*.spv /usr/local/lib/
-
+ARG SYCL_TLA_COMMIT
 ARG COMFY_KITCHEN_COMMIT
 ARG COMFY_KITCHEN_VERSION
+
+RUN cp /opt/intel/oneapi/compiler/latest/lib/libsycl-native-*.spv \
+    /usr/local/lib/
+
 LABEL org.opencontainers.image.version="${IMAGE_TAG}" \
+      com.intel.omni.image-flavor="comfyui" \
       com.intel.omni.xpu-target="${XPU_TARGET}" \
+      com.intel.omni.sycl-tla.revision="${SYCL_TLA_COMMIT}" \
       com.intel.omni.comfy-kitchen.version="${COMFY_KITCHEN_VERSION}" \
       com.intel.omni.comfy-kitchen.revision="${COMFY_KITCHEN_COMMIT}"
 
-ENV CCL_SYCL_ALLTOALL_ARC_LL=1 \
-    CCL_SYCL_CCL_BARRIER=1 \
-    OMNIXPU_INTERPOLATE_FIX=0 \
+ENV OMNIXPU_INTERPOLATE_FIX=0 \
     OMNI_IMAGE_VERSION="${IMAGE_TAG}" \
+    OMNI_IMAGE_FLAVOR="comfyui" \
     OMNI_IMAGE_XPU_TARGET="${XPU_TARGET}" \
     OMNI_COMFY_KITCHEN_VERSION="${COMFY_KITCHEN_VERSION}"
-
 
 WORKDIR /llm/entrypoints
 CMD ["/bin/bash"]
