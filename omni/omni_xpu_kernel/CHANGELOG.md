@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Start the focused ComfyUI image with a configurable 4 GiB VRAM reserve so
+  the official LTX 2.3 workflow can re-run its XPU text encoder after
+  diffusion without exhausting activation memory.
+
 ## 0.1.0-b9-dev (2026-07-23)
 
 ### Build System

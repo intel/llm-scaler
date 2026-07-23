@@ -159,16 +159,25 @@ docker exec -it comfyui bash
 ### Starting ComfyUI
 
 ```bash
-cd /llm/ComfyUI
-
 export http_proxy=<your_proxy>
 export https_proxy=<your_proxy>
 export no_proxy=localhost,127.0.0.1
 
-python3 main.py --listen 0.0.0.0
+/llm/entrypoints/start_comfyui.sh
 ```
 
-Then you can access the webUI at `http://<your_local_ip>:8188/`. 
+The focused-image entrypoint reserves 4 GiB of XPU memory for peak
+activations. This is required on a 32 GiB BMG device when an official LTX 2.3
+workflow changes its prompt after diffusion weights are resident: ComfyUI must
+offload enough diffusion weights before re-running the 12B text encoder on
+XPU. To choose a different reserve explicitly:
+
+```bash
+OMNI_COMFYUI_RESERVE_VRAM_GB=6 /llm/entrypoints/start_comfyui.sh
+```
+
+Additional ComfyUI arguments can be appended to the entrypoint command. Then
+access the web UI at `http://<your_local_ip>:8188/`.
 
 ### (Optional) Preview settings for ComfyUI
 
