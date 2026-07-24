@@ -20,8 +20,8 @@ PACKAGE_DIR = Path("omni_xpu_kernel") / "lgrf_uni"
 EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX")
 ARTIFACT_NAME = f"lgrf_sdp{EXT_SUFFIX if isinstance(EXT_SUFFIX, str) and EXT_SUFFIX else '.so'}"
 VERSION_FILE = PROJECT_ROOT / "omni_xpu_kernel" / "_version.py"
-SOURCE_VERSION = "0.1.0-b8-dev"
-PACKAGE_VERSION = "0.1.0b8.dev0"
+SOURCE_VERSION = "0.1.0-b8"
+PACKAGE_VERSION = "0.1.0b8"
 
 
 def setup_metadata_env(*, require_cute: Optional[str]) -> dict[str, str]:

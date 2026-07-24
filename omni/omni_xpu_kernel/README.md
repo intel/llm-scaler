@@ -3,8 +3,8 @@
 High-performance Intel XPU kernels for PyTorch.
 
 The Kernel version and the `intel/llm-scaler-omni` image version share the
-single source in `omni_xpu_kernel/_version.py`. The current development version
-is `0.1.0-b8-dev`; Python packaging normalizes it to `0.1.0b8.dev0` in wheel
+single source in `omni_xpu_kernel/_version.py`. The current release version
+is `0.1.0-b8`; Python packaging normalizes it to `0.1.0b8` in wheel
 metadata and filenames.
 
 ## Modules

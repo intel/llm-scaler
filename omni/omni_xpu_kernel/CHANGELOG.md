@@ -1,12 +1,12 @@
 # Changelog
 
-## dev/kitchen_xpu (2026-07-13)
+## 0.1.0-b8 (2026-07-24)
 
 ### Build System
 
-- Kernel and Omni image development versions now share
-  `omni_xpu_kernel/_version.py`, initially set to `0.1.0-b8-dev`. Wheel
-  metadata uses the normalized PEP 440 version `0.1.0b8.dev0`.
+- Kernel and Omni image versions now share
+  `omni_xpu_kernel/_version.py`, set to `0.1.0-b8`. Wheel metadata uses the
+  normalized PEP 440 version `0.1.0b8`.
 - CUTE FMHA is required by default on Linux. A normal build now requires a
   complete `CUTLASS_SYCL_ROOT` and fails if `cute_fmha_torch` cannot be
   included.
