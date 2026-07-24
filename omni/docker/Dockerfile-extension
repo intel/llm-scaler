@@ -2,8 +2,8 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-# Base image built from the b8 Dockerfile:
-ARG BASE_IMAGE=intel/llm-scaler-omni:0.1.0-b8
+# Base image built from the original b7 Dockerfile:
+ARG BASE_IMAGE=intel/llm-scaler-omni:0.1.0-b7
 ARG PYTHON_VERSION=3.12
 
 FROM ${BASE_IMAGE}
