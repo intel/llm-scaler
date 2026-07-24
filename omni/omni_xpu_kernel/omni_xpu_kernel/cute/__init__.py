@@ -5,8 +5,9 @@ Drop-in for :func:`omni_xpu_kernel.sdp.sdp` — same signature and layout::
     from omni_xpu_kernel import cute
     out = cute.sdp(q, k, v)   # self-attn [B, L, H, D] (B==1, D==128), fp16/bf16
 
-PTL-H wheels also expose a workflow-tuned D120 entry point that consumes dense
-packed-BHLD or BLHD-backed BHLD layouts without intermediate copies::
+PTL-H and BMG wheels also expose a workflow-tuned D120 entry point that
+consumes dense packed-BHLD or BLHD-backed BHLD layouts without intermediate
+copies::
 
     out = cute.sdp_bhld_d120(q, k, v)  # [B, H, L, 120]
 
@@ -72,7 +73,7 @@ def sdp(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
 
 
 def supports_d120_bhld() -> bool:
-    """Whether this target sidecar exports the PTL-H D120 BHLD kernel."""
+    """Whether this target sidecar exports the workflow-tuned D120 kernel."""
     try:
         _ensure_loaded()
         return hasattr(torch.ops.cute_fmha, "sdp_bhld_d120")
@@ -83,7 +84,7 @@ def supports_d120_bhld() -> bool:
 def sdp_bhld_d120(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> torch.Tensor:
-    """PTL-H fused self-attention for dense ``[B,H,L,120]`` inputs."""
+    """Fused self-attention for validated dense ``[B,H,L,120]`` inputs."""
     _ensure_loaded()
     if not hasattr(torch.ops.cute_fmha, "sdp_bhld_d120"):
         raise RuntimeError("CUTE D120 BHLD kernel is unavailable in this sidecar")

@@ -93,7 +93,7 @@ def _is_dense_d120_bhld(tensor, heads, seq, dim_head):
     return packed_bhld or blhd_backed
 
 
-def _use_ptl_cute_d120(
+def _use_workflow_cute_d120(
     q,
     k,
     v,
@@ -108,7 +108,7 @@ def _use_ptl_cute_d120(
     return (
         _backend == "auto"
         and _backend_name == "cute"
-        and _omni_xpu_target() == "ptl-h"
+        and _omni_xpu_target() in ("ptl-h", "bmg")
         and _torch_major_minor() == (2, 11)
         and callable(capability)
         and capability()
@@ -254,7 +254,7 @@ def apply():
         else:
             q_len, kv_len = q.shape[1], k.shape[1]
 
-        use_ptl_cute_d120 = _use_ptl_cute_d120(
+        use_workflow_cute_d120 = _use_workflow_cute_d120(
             q,
             k,
             v,
@@ -272,7 +272,7 @@ def apply():
             reasons.append(f"batch={b}")
         if mask is not None:
             reasons.append(f"mask={mask.shape}")
-        if dim_head not in (64, 128) and not use_ptl_cute_d120:
+        if dim_head not in (64, 128) and not use_workflow_cute_d120:
             reasons.append(f"dim_head={dim_head}")
         if q.device.type != "xpu":
             reasons.append(f"device={q.device.type}")
@@ -325,12 +325,12 @@ def apply():
                 **kwargs,
             )
 
-        # Boogu's PTL-H D120 route consumes the exact BHLD input strides and
+        # Boogu's PTL-H/BMG D120 route consumes the exact BHLD input strides and
         # returns a BLHD-backed BHLD view.  The final transpose+reshape is a
         # metadata-only view, avoiding all layout copies.  This remains an
         # auto-only, Torch-2.11, workflow-shape route; unsupported wheels and
         # layouts retain the unmodified Torch fallback.
-        if not reasons and use_ptl_cute_d120:
+        if not reasons and use_workflow_cute_d120:
             _esimd_call_count += 1
             if _esimd_call_count <= 3:
                 log.info(
@@ -344,7 +344,7 @@ def apply():
                 "kernel",
                 "attention",
                 {"q": q, "k": k, "v": v},
-                details={"backend": "cute", "route": "ptl_cute_d120_bhld"},
+                details={"backend": "cute", "route": "boogu_cute_d120_bhld"},
             )
             out = _backend_sdp.sdp_bhld_d120(q, k, v)
             return out.transpose(1, 2).reshape(b, -1, heads * dim_head)

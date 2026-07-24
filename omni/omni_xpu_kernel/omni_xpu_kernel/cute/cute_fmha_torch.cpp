@@ -3,8 +3,8 @@
  *
  * Exposes cute_fmha::sdp(q, k, v) -> o with the SAME signature/layout as
  * omni_xpu_kernel.sdp: q,k,v,o are [B, L, H, D] (B==1, D==128), fp16 or bf16,
- * XPU. PTL-H builds additionally expose a dense-BHLD D120 entry point used by
- * the validated ComfyUI workflow route.
+ * XPU. PTL-H and BMG builds additionally expose a dense-BHLD D120 entry point
+ * used by the validated ComfyUI workflow route.
  *
  * The kernel body is the CUTLASS-SYCL flash-attention-v2 forward used by
  * 06_xe_fmha_fwd.cpp (d=128, platform-selected tile/GRF/pipeline policy).
@@ -328,7 +328,7 @@ at::Tensor sdp(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
   return o;
 }
 
-#if defined(OMNI_XPU_ARCH_PTL_H)
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
 bool is_supported_bhld_layout(
     const at::Tensor& tensor, int64_t H, int64_t L, int64_t D) {
   if (tensor.stride(3) != 1 || tensor.stride(0) != H * L * D) {
@@ -394,7 +394,7 @@ at::Tensor sdp_bhld_d120(
 #ifndef CUTE_FMHA_NS
 #define CUTE_FMHA_NS cute_fmha
 #endif
-#if defined(OMNI_XPU_ARCH_PTL_H)
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
 #define CUTE_FMHA_D120_DEF(m) m.def("sdp_bhld_d120(Tensor q, Tensor k, Tensor v) -> Tensor");
 #define CUTE_FMHA_D120_IMPL(m) m.impl("sdp_bhld_d120", &sdp_bhld_d120);
 #else

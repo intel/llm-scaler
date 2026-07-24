@@ -230,7 +230,7 @@ output = sdp.sdp(q, k, v)
 if cute is not None and cute.is_available():
     output = cute.sdp(q, k, v)
 
-# PTL-H wheels expose a separate dense-BHLD D120 capability.
+# PTL-H and BMG wheels expose a separate dense-BHLD D120 capability.
 if cute is not None and cute.supports_d120_bhld():
     output = cute.sdp_bhld_d120(q_bhld, k_bhld, v_bhld)
 ```

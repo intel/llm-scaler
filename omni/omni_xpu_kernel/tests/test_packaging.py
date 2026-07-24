@@ -296,6 +296,58 @@ def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
     )
 
 
+def test_bmg_cute_overlay_patches_private_header_copy(monkeypatch, tmp_path):
+    import setuptools
+
+    cutlass_root = tmp_path / "sycl-tla"
+    for required_dir in (
+        "include",
+        "tools/util/include",
+        "examples/common",
+        "applications",
+    ):
+        (cutlass_root / required_dir).mkdir(parents=True)
+    monkeypatch.chdir(PROJECT_ROOT)
+    monkeypatch.setenv("CUTLASS_SYCL_ROOT", str(cutlass_root))
+    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "1")
+    monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
+    namespace = run_path(
+        str(PROJECT_ROOT / "setup.py"), run_name="__cute_bmg_overlay_test__"
+    )
+
+    collective = (
+        cutlass_root
+        / "applications"
+        / "flash_attention_v2"
+        / "collective"
+    )
+    collective.mkdir(parents=True)
+    original = namespace["BMG_CUTE_REMAINDER_MASK_ORIGINAL"]
+    replacement = namespace["BMG_CUTE_REMAINDER_MASK_REPLACEMENT"]
+    source_header = collective / "xe_fmha_fwd_mainloop.hpp"
+    source_header.write_text(f"prefix\n{original}suffix\n", encoding="utf-8")
+    (collective / "fmha_fusion.hpp").write_text(
+        "fusion sentinel\n", encoding="utf-8"
+    )
+
+    overlay = namespace["prepare_bmg_cute_include_overlay"](
+        cutlass_root, tmp_path / "build"
+    )
+    overlay_collective = (
+        overlay / "flash_attention_v2" / "collective"
+    )
+    patched = (
+        overlay_collective / "xe_fmha_fwd_mainloop.hpp"
+    ).read_text(encoding="utf-8")
+
+    assert replacement in patched
+    assert original not in patched
+    assert original in source_header.read_text(encoding="utf-8")
+    assert (
+        overlay_collective / "fmha_fusion.hpp"
+    ).read_text(encoding="utf-8") == "fusion sentinel\n"
+
+
 @pytest.mark.parametrize("target", SUPPORTED_XPU_TARGETS)
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux core AOT command")
 def test_linux_core_compile_command_is_aot_for_every_supported_target(

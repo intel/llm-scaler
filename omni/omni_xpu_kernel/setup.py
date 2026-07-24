@@ -44,6 +44,35 @@ XPU_ARCH_MACROS = {
 }
 XPU_ARCH_MACRO = XPU_ARCH_MACROS[BUILD_XPU_TARGET]
 
+BMG_CUTE_REMAINDER_MASK_ORIGINAL = """\
+          FragSRow k_rem_mask;
+          int k_val = get<0>(tKgK_cur(0,0,0,k_idx,0)) + kblocks_cache * get<1>(TileShapeQK{});
+          int k = k_val + get_sub_group().get_local_id()[0];
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {
+            k_rem_mask(i) = (k < seq_len) ? ElementS(sycl::nan(0u)) : ElementS(-INFINITY);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); i++) {
+            tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(k_rem_mask, tSrS, i));
+          }
+"""
+
+BMG_CUTE_REMAINDER_MASK_REPLACEMENT = """\
+          Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
+          Tensor gP = local_tile(
+              cPgP, take<0,2>(TileShapeQK{}),
+              make_coord(get<0>(blk_qv), K));
+          auto cS_thread = thr_mma_qk.partition_C(gP);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); ++i) {
+            int col_idx = get<1>(cS_thread(i));
+            if (col_idx >= seq_len) {
+              tSrS(i) = ElementS(-INFINITY);
+            }
+          }
+"""
+
 
 def get_core_aot_compile_args(xpu_target):
     """Return the target-specific flags shared by every core AOT build."""
@@ -58,6 +87,48 @@ def get_core_aot_compile_args(xpu_target):
         f"-device {xpu_target}",
         "-DOMNI_XPU_CORE_AOT=1",
     ]
+
+
+def prepare_bmg_cute_include_overlay(cutlass_root, build_temp):
+    """Create a private BMG mainloop overlay without modifying sycl-tla.
+
+    The pinned sycl-tla remainder mask broadcasts a row fragment using a
+    mapping that is incorrect for the BMG KV32/SG16 configuration.  Generate a
+    build-local copy that derives each score element's key coordinate from the
+    MMA partition.  PTL-H continues to compile the pinned upstream header.
+    """
+    applications = Path(cutlass_root) / "applications"
+    relative_dir = Path("flash_attention_v2") / "collective"
+    source_dir = applications / relative_dir
+    mainloop_source = source_dir / "xe_fmha_fwd_mainloop.hpp"
+    fusion_source = source_dir / "fmha_fusion.hpp"
+    if not mainloop_source.is_file() or not fusion_source.is_file():
+        raise RuntimeError(
+            "BMG CUTE overlay needs the pinned sycl-tla collective headers: "
+            f"{mainloop_source} and {fusion_source}"
+        )
+
+    text = mainloop_source.read_text(encoding="utf-8")
+    matches = text.count(BMG_CUTE_REMAINDER_MASK_ORIGINAL)
+    if matches != 1:
+        raise RuntimeError(
+            "Pinned sycl-tla BMG remainder-mask source no longer matches the "
+            f"validated overlay contract (matches={matches})"
+        )
+
+    overlay_root = Path(build_temp) / "cute_bmg_include_overlay"
+    overlay_dir = overlay_root / relative_dir
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+    (overlay_dir / mainloop_source.name).write_text(
+        text.replace(
+            BMG_CUTE_REMAINDER_MASK_ORIGINAL,
+            BMG_CUTE_REMAINDER_MASK_REPLACEMENT,
+            1,
+        ),
+        encoding="utf-8",
+    )
+    shutil.copyfile(fusion_source, overlay_dir / fusion_source.name)
+    return overlay_root
 
 
 def get_icpx_path():
@@ -481,6 +552,12 @@ class ICPXBuildExt(build_ext):
                         "cute_fmha_torch needs CUTLASS_SYCL_ROOT set to a cutlass-sycl "
                         "(sycl-tla) source tree containing include/, tools/util/include/, "
                         "examples/common/, applications/. Got: " + repr(cutlass))
+                cute_overlay_flags = []
+                if BUILD_XPU_TARGET == "bmg":
+                    overlay = prepare_bmg_cute_include_overlay(
+                        cutlass, self.build_temp
+                    )
+                    cute_overlay_flags.append(f"-I{overlay}")
                 cmd += [
                     "-std=c++17", "-O3", "-DNDEBUG", "-fPIC", "-shared",
                     "-fsycl-targets=spir64_gen",
@@ -492,6 +569,7 @@ class ICPXBuildExt(build_ext):
                     "-DCUTLASS_ENABLE_SYCL", "-DSYCL_INTEL_TARGET",
                     f"-D{XPU_ARCH_MACRO}=1",
                     f"-D_GLIBCXX_USE_CXX11_ABI={torch_cxx11_abi}",
+                    *cute_overlay_flags,
                     f"-I{cutlass}/include",
                     f"-I{cutlass}/tools/util/include",
                     f"-I{cutlass}/examples/common",

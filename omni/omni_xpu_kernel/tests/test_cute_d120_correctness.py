@@ -1,4 +1,4 @@
-"""Correctness and layout contracts for the PTL-H CUTE D120 entry point."""
+"""Correctness and layout contracts for the PTL-H/BMG CUTE D120 entry point."""
 
 import pytest
 import torch
@@ -23,7 +23,15 @@ def has_d120():
         return False
 
 
-@pytest.mark.skipif(not has_d120(), reason="PTL-H CUTE D120 sidecar unavailable")
+def has_bmg_d120():
+    if not has_d120():
+        return False
+    import omni_xpu_kernel
+
+    return omni_xpu_kernel.__xpu_target__ == "bmg"
+
+
+@pytest.mark.skipif(not has_d120(), reason="CUTE D120 sidecar unavailable")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_cute_d120_matches_torch_for_workflow_layouts(dtype):
     from omni_xpu_kernel import cute
@@ -46,7 +54,30 @@ def test_cute_d120_matches_torch_for_workflow_layouts(dtype):
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
 
 
-@pytest.mark.skipif(not has_d120(), reason="PTL-H CUTE D120 sidecar unavailable")
+@pytest.mark.skipif(
+    not has_bmg_d120(), reason="BMG CUTE D120 sidecar unavailable"
+)
+def test_cute_d120_bmg_matches_workflow_remainder_length():
+    from omni_xpu_kernel import cute
+
+    batch, heads, sequence, dim = 1, 28, 4205, 120
+    q = torch.randn(
+        batch, sequence, heads, dim, device="xpu", dtype=torch.float16
+    ).permute(0, 2, 1, 3)
+    k = torch.randn(
+        batch, heads, sequence, dim, device="xpu", dtype=torch.float16
+    )
+    v = torch.randn_like(k)
+
+    actual = cute.sdp_bhld_d120(q, k, v)
+    expected = F.scaled_dot_product_attention(q, k, v)
+
+    assert actual.stride() == q.stride()
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not has_d120(), reason="CUTE D120 sidecar unavailable")
 def test_cute_d120_rejects_wrong_head_dim():
     from omni_xpu_kernel import cute
 
@@ -55,7 +86,7 @@ def test_cute_d120_rejects_wrong_head_dim():
         cute.sdp_bhld_d120(q, q, q)
 
 
-@pytest.mark.skipif(not has_d120(), reason="PTL-H CUTE D120 sidecar unavailable")
+@pytest.mark.skipif(not has_d120(), reason="CUTE D120 sidecar unavailable")
 def test_cute_d120_rejects_unsupported_stride():
     from omni_xpu_kernel import cute
 

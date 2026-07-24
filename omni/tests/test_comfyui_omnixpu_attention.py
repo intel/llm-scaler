@@ -247,9 +247,12 @@ def test_unvalidated_layouts_keep_cute(monkeypatch, tensor, kwargs):
     assert patch.get_stats()["torch_sdpa"] == 0
 
 
+@pytest.mark.parametrize("target", ["ptl-h", "bmg"])
 @pytest.mark.parametrize("seq", [4096, 4205])
-def test_ptl_auto_boogu_d120_uses_strided_cute(monkeypatch, seq):
-    patch, attention, calls = _load_patch(monkeypatch)
+def test_validated_auto_boogu_d120_uses_strided_cute(
+    monkeypatch, target, seq
+):
+    patch, attention, calls = _load_patch(monkeypatch, target=target)
     tensor = _FakeTensor(
         seq=seq,
         heads=28,
@@ -268,7 +271,6 @@ def test_ptl_auto_boogu_d120_uses_strided_cute(monkeypatch, seq):
 @pytest.mark.parametrize(
     ("target", "torch_version", "backend", "d120_capable", "seq"),
     [
-        ("bmg", "2.11.0+xpu", "auto", True, 4096),
         ("ptl-h", "2.10.0+xpu", "auto", True, 4096),
         ("ptl-h", "2.12.0+xpu", "auto", True, 4096),
         ("ptl-h", "2.11.0+xpu", "cute", True, 4096),
