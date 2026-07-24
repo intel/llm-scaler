@@ -1019,9 +1019,13 @@ def moe_forward_full_fp8_block(
 ) -> torch.Tensor:
     """Small-batch MoE decode for 128x128 offline FP8 block weights.
 
-    Activations stay fp16. Routed scales have layout ``[E, N/128, K/128]``;
-    shared-expert scales omit the leading expert dimension. Supports 1 to 4
-    tokens.
+    Supports 1 to 4 tokens and exactly one shared expert. Activations and the
+    caller-owned output are contiguous fp16 tensors. Weights are contiguous
+    ``float8_e4m3fn`` tensors with contiguous fp32 128x128 block scales;
+    hidden and intermediate dimensions must both be divisible by 128. All
+    tensors must be on the same XPU device. Routed scales have layout
+    ``[E, N/128, K/128]``; shared-expert scales omit the leading expert
+    dimension.
     """
     output = torch.empty_like(x)
     return _moe_batch.moe_forward_full_fp8_block(

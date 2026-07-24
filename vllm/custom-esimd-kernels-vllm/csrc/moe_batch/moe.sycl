@@ -1497,8 +1497,8 @@ static void ensure_moe_buffers(int n_tokens, int top_k, int num_shared_experts,
 }
 
 // FP8-block small-batch path. The checkpoint layout is the native vLLM layout:
-//   routed gate_up [E, 2I, H], scale [E, ceil(2I/128), ceil(H/128)]
-//   routed down    [E, H, I],  scale [E, ceil(H/128), ceil(I/128)]
+//   routed gate_up [E, 2I, H], scale [E, 2I/128, H/128]
+//   routed down    [E, H, I],  scale [E, H/128, I/128]
 // Shared-expert weights omit the leading expert dimension. Activations remain
 // FP16; FP8 values are converted to FP16/FP32 and multiplied by the 128x128
 // block scale before accumulation. This path does not use FP8 matrix multiply.
@@ -1653,6 +1653,10 @@ struct MoeBlockBuffers {
 // Capture and serving commonly alternate among 1..4 decode tokens. Keep one
 // persistent slot per token count so switching shapes does not reallocate all
 // intermediate tensors. The memory cost is tiny for these decode-only buffers.
+// This cache follows vLLM's single model-compute-stream-per-TP-worker contract;
+// concurrent use from multiple compute streams is unsupported. If that
+// execution model changes, use per-stream caches rather than synchronizing the
+// decode hot path on every stream change.
 static thread_local std::array<MoeBlockBuffers, 4> s_block_buffers;
 
 static MoeBlockBuffers& ensure_moe_block_buffers(
