@@ -6,7 +6,7 @@
 #
 # The default image intentionally excludes Xinference, SGLang/SGLDiffusion,
 # and the disabled media/3D node bundle. Raylight's xDiT-based multi-XPU
-# ComfyUI integration is not part of either flavor; this image targets one XPU.
+# ComfyUI integration is not part of this image; this image targets one XPU.
 
 ARG BASE_IMAGE=intel/omix:0.1.0-devel-ubuntu24.04
 ARG PYTHON_VERSION=3.12
@@ -114,9 +114,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git -C ComfyUI checkout --detach FETCH_HEAD && \
     pip install -r /llm/ComfyUI/requirements.txt
 
-# Pin every default custom node to the exact revision accepted in the previous
-# full image. These stable remote-source layers stay ahead of all frequently
-# edited local native sources.
+# Pin every default custom node to an exact accepted revision. These stable
+# remote-source layers stay ahead of all frequently edited local native sources.
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/ComfyUI/custom_nodes && \
     git clone --filter=blob:none --no-checkout \

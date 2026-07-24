@@ -1,11 +1,8 @@
-"""Patch comfy.ops LayerNorm / RMSNorm and comfy.rmsnorm.rms_norm to use
-omni_xpu_kernel accelerated norms on XPU.
+"""Route eligible ComfyUI LayerNorm and RMSNorm operations to Omni XPU kernels.
 
-Mirrors the omni_b7 branch (analytics-zoo/ComfyUI @ 4aa7b1c):
-- forward_comfy_cast_weights: cast weights via cast_bias_weight(..., offloadable=True),
-  use omni kernel when eligible, then uncast. Preserves offload_stream lifecycle.
-- forward: only takes the omni fast path when NOT in comfy-cast-weights mode and
-  when weight_function / bias_function hooks are empty.
+The adapter preserves ComfyUI's cast and offload lifecycle. Comfy-cast weights
+continue through ``cast_bias_weight(..., offloadable=True)`` before dispatch;
+the direct fast path is used only when weight and bias hooks are absent.
 """
 
 import logging
