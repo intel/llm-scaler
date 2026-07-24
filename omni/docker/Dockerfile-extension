@@ -23,6 +23,9 @@ COPY ./patches/extension_comfyui_reactor.patch /tmp/
 COPY ./patches/extension_comfyui_rmbg.patch /tmp/
 COPY ./patches/extension_SenseNova-U1.patch /tmp
 COPY ./patches/extension_comfyui-advancedliveportrait.patch /tmp
+COPY ./patches/extension_comfyui_unload_model.patch /tmp
+COPY ./patches/extension_comfyui_mmaudio.patch /tmp
+COPY ./patches/extension_comfyui_slk_joy_caption_two.patch /tmp
 COPY ./patches/comfyui-pulid-flux-ll-add_intel_xpu_support_and_bug_fix.patch /tmp
 COPY ./patches/comfyui_wanblockswap-add_intel_xpu_support.patch /tmp
 
@@ -143,6 +146,36 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/ComfyUI/custom_nodes && \
+    rm -rf ComfyUI-Unload-Model && \
+    git clone --depth 1 https://github.com/SeanScripts/ComfyUI-Unload-Model.git && \
+    cd ComfyUI-Unload-Model && \
+    git fetch --depth 1 origin ac5ffb4ed05546545ce7cf38e7b69b5152714eed && \
+    git checkout ac5ffb4ed05546545ce7cf38e7b69b5152714eed && \
+    git apply /tmp/extension_comfyui_unload_model.patch && \
+    rm -f /tmp/extension_comfyui_unload_model.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf ComfyUI-MMAudio && \
+    git clone --depth 1 https://github.com/kijai/ComfyUI-MMAudio.git && \
+    cd ComfyUI-MMAudio  && \
+    git fetch --depth 1 origin 8eaeb72edc3aaf2059b57f2d96a1f6f689f19ae2 && \
+    git checkout 8eaeb72edc3aaf2059b57f2d96a1f6f689f19ae2 && \
+    git apply /tmp/extension_comfyui_mmaudio.patch && \
+    rm -f /tmp/extension_comfyui_mmaudio.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf ComfyUI_SLK_joy_caption_two && \
+    git clone --depth 1 https://github.com/EvilBT/ComfyUI_SLK_joy_caption_two.git && \
+    cd ComfyUI_SLK_joy_caption_two && \
+    git fetch --depth 1 origin 667751cab945bd8e9fb0be4d557d47e36821350a && \
+    git checkout 667751cab945bd8e9fb0be4d557d47e36821350a && \
+    git apply /tmp/extension_comfyui_slk_joy_caption_two.patch && \
+    rm -f /tmp/extension_comfyui_slk_joy_caption_two.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
     rm -rf ComfyUI_PuLID_Flux_ll && \
     git clone --depth 1 https://github.com/lldacing/ComfyUI_PuLID_Flux_ll && \
     cd ComfyUI_PuLID_Flux_ll && \
@@ -162,6 +195,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git checkout 5fa2ec0fa55879fe43a33e762fff91fc2c553a67 && \
     git apply /tmp/comfyui_wanblockswap-add_intel_xpu_support.patch && \
     rm -f /tmp/comfyui_wanblockswap-add_intel_xpu_support.patch
+
 
 RUN rm -f /usr/lib/python3*/EXTERNALLY-MANAGED
 

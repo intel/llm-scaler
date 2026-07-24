@@ -76,7 +76,7 @@ def layer_norm(
         - hidden_size must be <= 8192 and divisible by 32
         - Supports fp32, fp16, bf16
     """
-    return _get_native().layer_norm(input, weight, bias, eps)
+    return _get_native().layer_norm(input.contiguous(), weight, bias, eps)
 
 
 def fused_add_rms_norm(

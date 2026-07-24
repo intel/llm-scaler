@@ -1,5 +1,5 @@
 diff --git a/custom_linear.py b/custom_linear.py
-index 9fe4762..0977968 100644
+index 9fe4762..0a85e3e 100644
 --- a/custom_linear.py
 +++ b/custom_linear.py
 @@ -13,7 +13,7 @@ def apply_lora(weight: torch.Tensor, lora_diff_0: torch.Tensor, lora_diff_1: tor
@@ -20,8 +20,134 @@ index 9fe4762..0977968 100644
  
  @apply_single_lora.register_fake
  def _(weight, lora_diff, lora_strength):
+@@ -31,6 +31,11 @@ def _(weight, lora_diff, lora_strength):
+ 
+ @torch.library.custom_op("wanvideo::linear_forward", mutates_args=())
+ def linear_forward(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
++    # Fallback alignment for mixed offload paths (cpu/xpu).
++    if weight.device != input.device:
++        weight = weight.to(device=input.device)
++    if bias is not None and (bias.device != input.device or bias.dtype != weight.dtype):
++        bias = bias.to(device=input.device, dtype=weight.dtype)
+     return torch.nn.functional.linear(input, weight, bias)
+ 
+ @linear_forward.register_fake
+@@ -221,6 +226,10 @@ class CustomLinear(nn.Linear):
+ 
+         for idx, lora_diff_names in enumerate(self.lora_diffs):
+             lora_strength = self._get_lora_strength(idx)
++            if isinstance(lora_strength, torch.Tensor):
++                lora_strength = lora_strength.to(device=weight.device, dtype=weight.dtype)
++            else:
++                lora_strength = torch.tensor(lora_strength, device=weight.device, dtype=weight.dtype)
+ 
+             if isinstance(lora_diff_names, tuple):
+                 lora_diff_0 = getattr(self, lora_diff_names[0])
+@@ -239,7 +248,8 @@ class CustomLinear(nn.Linear):
+     def _prepare_weight(self, input):
+         """Prepare weight tensor - handles both regular and GGUF weights"""
+         if self.is_gguf:
+-            weight = dequantize_gguf_tensor(self.weight).to(self.compute_dtype)
++            target_dtype = self.compute_dtype if self.compute_dtype is not None else input.dtype
++            weight = dequantize_gguf_tensor(self.weight).to(device=input.device, dtype=target_dtype)
+         else:
+             weight = self.weight.to(input)
+         return weight
+@@ -248,7 +258,7 @@ class CustomLinear(nn.Linear):
+         weight = self._prepare_weight(input)
+ 
+         if self.bias is not None:
+-            bias = self.bias.to(input if not self.is_gguf else self.compute_dtype)
++            bias = self.bias.to(device=input.device, dtype=weight.dtype)
+         else:
+             bias = None
+ 
+diff --git a/nodes.py b/nodes.py
+index 25d33cb..0b0faf6 100644
+--- a/nodes.py
++++ b/nodes.py
+@@ -198,7 +198,7 @@ class WanVideoTextEncodeCached:
+             "negative_prompt": ("STRING", {"default": "", "multiline": True} ),
+             "quantization": (['disabled', 'fp8_e4m3fn'], {"default": 'disabled', "tooltip": "optional quantization method"}),
+             "use_disk_cache": ("BOOLEAN", {"default": True, "tooltip": "Cache the text embeddings to disk for faster re-use, under the custom_nodes/ComfyUI-WanVideoWrapper/text_embed_cache directory"}),
+-            "device": (["gpu", "cpu"], {"default": "gpu", "tooltip": "Device to run the text encoding on."}),
++            "device": (["gpu", "xpu", "cpu"], {"default": "gpu", "tooltip": "Device to run the text encoding on."}),
+             },
+             "optional": {
+                 "extender_args": ("WANVIDEOPROMPTEXTENDER_ARGS", {"tooltip": "Use this node to extend the prompt with additional text."}),
+@@ -237,7 +237,7 @@ of the original Wan templates or a custom system prompt.
+                 log.info("Using WanVideoPromptExtender to process prompts")
+                 qwen, = QwenLoader().load(
+                     extender_args["model"], 
+-                    load_device="main_device" if device == "gpu" else "cpu", 
++                    load_device="main_device" if device in ("gpu", "xpu") else "cpu",
+                     precision=precision)
+                 positive_prompt, = WanVideoPromptExtender().generate(
+                     qwen=qwen,
+@@ -294,7 +294,7 @@ class WanVideoTextEncode:
+                 "force_offload": ("BOOLEAN", {"default": True}),
+                 "model_to_offload": ("WANVIDEOMODEL", {"tooltip": "Model to move to offload_device before encoding"}),
+                 "use_disk_cache": ("BOOLEAN", {"default": False, "tooltip": "Cache the text embeddings to disk for faster re-use, under the custom_nodes/ComfyUI-WanVideoWrapper/text_embed_cache directory"}),
+-                "device": (["gpu", "cpu"], {"default": "gpu", "tooltip": "Device to run the text encoding on."}),
++                "device": (["gpu", "xpu", "cpu"], {"default": "gpu", "tooltip": "Device to run the text encoding on."}),
+             }
+         }
+ 
+@@ -323,7 +323,7 @@ class WanVideoTextEncode:
+         if t5 is None:
+             raise ValueError("No cached text embeds found for prompts, please provide a T5 encoder.")
+ 
+-        if model_to_offload is not None and device == "gpu":
++        if model_to_offload is not None and device in ("gpu", "xpu"):
+             try:
+                 log.info(f"Moving video model to {offload_device}")
+                 model_to_offload.model.to(offload_device)
+@@ -358,6 +358,12 @@ class WanVideoTextEncode:
+ 
+         if device == "gpu":
+             device_to = mm.get_torch_device()
++        elif device == "xpu":
++            if hasattr(torch, "xpu") and torch.xpu.is_available():
++                device_to = torch.device("xpu")
++            else:
++                log.warning("XPU selected for text encoding but not available, falling back to CPU.")
++                device_to = torch.device("cpu")
+         else:
+             device_to = torch.device("cpu")
+ 
+@@ -464,7 +470,7 @@ class WanVideoTextEncodeSingle:
+                 "force_offload": ("BOOLEAN", {"default": True}),
+                 "model_to_offload": ("WANVIDEOMODEL", {"tooltip": "Model to move to offload_device before encoding"}),
+                 "use_disk_cache": ("BOOLEAN", {"default": False, "tooltip": "Cache the text embeddings to disk for faster re-use, under the custom_nodes/ComfyUI-WanVideoWrapper/text_embed_cache directory"}),
+-                "device": (["gpu", "cpu"], {"default": "gpu", "tooltip": "Device to run the text encoding on."}),
++                "device": (["gpu", "xpu", "cpu"], {"default": "gpu", "tooltip": "Device to run the text encoding on."}),
+             }
+         }
+ 
+@@ -498,7 +504,7 @@ class WanVideoTextEncodeSingle:
+ 
+         if encoded is None:
+             try:
+-                if model_to_offload is not None and device == "gpu":
++                if model_to_offload is not None and device in ("gpu", "xpu"):
+                     log.info(f"Moving video model to {offload_device}")
+                     model_to_offload.model.to(offload_device)
+                     mm.soft_empty_cache()
+@@ -510,6 +516,12 @@ class WanVideoTextEncodeSingle:
+ 
+             if device == "gpu":
+                 device_to = mm.get_torch_device()
++            elif device == "xpu":
++                if hasattr(torch, "xpu") and torch.xpu.is_available():
++                    device_to = torch.device("xpu")
++                else:
++                    log.warning("XPU selected for text encoding but not available, falling back to CPU.")
++                    device_to = torch.device("cpu")
+             else:
+                 device_to = torch.device("cpu")
+ 
 diff --git a/wanvideo/modules/model.py b/wanvideo/modules/model.py
-index ce101d8..15ba0b9 100644
+index ce101d8..c67b12f 100644
 --- a/wanvideo/modules/model.py
 +++ b/wanvideo/modules/model.py
 @@ -302,7 +302,7 @@ class WanRMSNorm(nn.Module):
@@ -33,7 +159,7 @@ index ce101d8..15ba0b9 100644
  
      def _norm(self, x):
          return x * (torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)).to(x.dtype)
-@@ -320,7 +320,7 @@ class WanRMSNorm(nn.Module):
+@@ -320,33 +320,39 @@ class WanRMSNorm(nn.Module):
              chunk = x[:, start_idx:end_idx, :]
              
              norm_factor = torch.rsqrt(chunk.pow(2).mean(dim=-1, keepdim=True) + self.eps)
@@ -42,27 +168,60 @@ index ce101d8..15ba0b9 100644
  
              start_idx = end_idx
              
-@@ -328,6 +328,8 @@ class WanRMSNorm(nn.Module):
+         return output
      
  class WanFusedRMSNorm(nn.RMSNorm):
++    def _forward_with_local_weight(self, x):
++        weight = self.weight
++        if weight is not None and weight.device != x.device:
++            weight = weight.to(device=x.device)
++        return F.rms_norm(x, self.normalized_shape, weight, self.eps)
++
      def forward(self, x, num_chunks=1):
-+        if self.weight is not None and self.weight.device != x.device:
-+            self.weight.data = self.weight.data.to(x.device)
          use_chunked = num_chunks > 1
          if use_chunked:
              return self.forward_chunked(x, num_chunks)
-@@ -359,6 +361,10 @@ class WanLayerNorm(nn.LayerNorm):
+         else:
+-            return super().forward(x)
++            return self._forward_with_local_weight(x)
+ 
+     def forward_chunked(self, x, num_chunks=4):
+         output = torch.empty_like(x)
+-        
++
+         chunk_sizes = [x.shape[1] // num_chunks + (1 if i < x.shape[1] % num_chunks else 0) 
+                     for i in range(num_chunks)]
+-        
++
+         start_idx = 0
+         for size in chunk_sizes:
+             end_idx = start_idx + size
+             chunk = x[:, start_idx:end_idx, :]
+-            output[:, start_idx:end_idx, :] = super().forward(chunk)
++            output[:, start_idx:end_idx, :] = self._forward_with_local_weight(chunk)
+             start_idx = end_idx
+-            
++
+         return output
+ 
+ class WanLayerNorm(nn.LayerNorm):
+@@ -359,7 +365,14 @@ class WanLayerNorm(nn.LayerNorm):
          Args:
              x(Tensor): Shape [B, L, C]
          """
-+        if self.weight is not None and self.weight.device != x.device:
-+            self.weight.data = self.weight.data.to(x.device)
-+        if self.bias is not None and self.bias.device != x.device:
-+            self.bias.data = self.bias.data.to(x.device)
-         return super().forward(x)
+-        return super().forward(x)
++        weight = self.weight
++        bias = self.bias
++        if weight is not None and weight.device != x.device:
++            weight = weight.to(device=x.device)
++        if bias is not None and bias.device != x.device:
++            target_dtype = weight.dtype if weight is not None else bias.dtype
++            bias = bias.to(device=x.device, dtype=target_dtype)
++        return F.layer_norm(x, self.normalized_shape, weight, bias, self.eps)
  
  #region selfattn
-@@ -968,9 +974,9 @@ class WanAttentionBlock(nn.Module):
+ class WanSelfAttention(nn.Module):
+@@ -968,9 +981,9 @@ class WanAttentionBlock(nn.Module):
              if e.shape[-1] == 512:
                  e = self.modulation(e)
                  return e.unsqueeze(2).chunk(6, dim=-1)
@@ -74,7 +233,7 @@ index ce101d8..15ba0b9 100644
              return [ei.squeeze(1) for ei in e_mod.unbind(dim=1)]
  
  
-@@ -1552,9 +1558,9 @@ class Head(nn.Module):
+@@ -1552,9 +1565,9 @@ class Head(nn.Module):
  
      def get_mod(self, e):
          if e.dim() == 2:
@@ -86,7 +245,7 @@ index ce101d8..15ba0b9 100644
              return [ei.squeeze(1) for ei in e]
  
      def forward(self, x, e, e_tr=None, tr_start=0, tr_num=0, **kwargs):
-@@ -3294,8 +3300,8 @@ class WanModel(torch.nn.Module):
+@@ -3294,8 +3307,8 @@ class WanModel(torch.nn.Module):
                      compute_end = time.perf_counter()
                      compute_time = compute_end - compute_start
                      to_cpu_transfer_start = time.perf_counter()
@@ -97,3 +256,19 @@ index ce101d8..15ba0b9 100644
                  if self.block_swap_debug:
                      to_cpu_transfer_end = time.perf_counter()
                      to_cpu_transfer_time = to_cpu_transfer_end - to_cpu_transfer_start
+diff --git a/wanvideo/modules/wananimate/face_blocks.py b/wanvideo/modules/wananimate/face_blocks.py
+index e5399af..452ccab 100644
+--- a/wanvideo/modules/wananimate/face_blocks.py
++++ b/wanvideo/modules/wananimate/face_blocks.py
+@@ -78,7 +78,10 @@ class RMSNorm(nn.Module):
+     def forward(self, x):
+         output = self._norm(x.float()).type_as(x)
+         if hasattr(self, "weight"):
+-            output = output * self.weight
++            weight = self.weight
++            if weight.device != output.device or weight.dtype != output.dtype:
++                weight = weight.to(device=output.device, dtype=output.dtype)
++            output = output * weight
+         return output
+ 
+ 
