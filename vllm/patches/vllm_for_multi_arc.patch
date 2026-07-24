@@ -2765,7 +2765,7 @@ index 4493ee783..fb0e235c7 100644
 +
 +        ok = False
 +        if ESIMD_AVAILABLE and not disable_esimd_gdn_outproj():
-+            w = self.out_proj.weight
++            w = getattr(self.out_proj, "weight", None)
 +            ws = getattr(self.out_proj, "weight_scale", None)
 +            ok = (
 +                w is not None
@@ -2798,7 +2798,7 @@ index 4493ee783..fb0e235c7 100644
 +
 +        ok = False
 +        if ESIMD_AVAILABLE and not disable_esimd_gdn_outproj():
-+            w = self.out_proj.weight
++            w = getattr(self.out_proj, "weight", None)
 +            ws = getattr(self.out_proj, "weight_scale", None)
 +            ok = (
 +                w is not None
