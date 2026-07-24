@@ -1,4 +1,4 @@
-"""Benchmark standalone SDP kernel against torch SDPA."""
+"""Benchmark standalone SDP kernel against Torch SDPA."""
 
 import statistics
 import time

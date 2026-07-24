@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Benchmark ESIMD SDP vs PyTorch SDPA for LTX-2 video shapes (H=32, HD=64)."""
+"""Benchmark ESIMD SDP vs PyTorch SDPA for LTX-2 video shapes (H=32, HD=64).
+
+Usage:
+    python benchmarks/bench_ltx2.py
+"""
 import time
 import torch
 import torch.nn.functional as F

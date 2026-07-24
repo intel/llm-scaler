@@ -1,5 +1,5 @@
 """
-Performance benchmarks for FP8 GEMM kernels
+Performance benchmarks for FP8 GEMM kernels.
 
 Compares oneDNN FP8 kernels against PyTorch native (dequant + F.linear) implementations.
 

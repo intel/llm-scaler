@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Benchmark ESIMD SDP kernel vs PyTorch SDPA for head_dim=64 (FP16 + BF16)."""
+"""Benchmark ESIMD SDP kernel vs PyTorch SDPA for head_dim=64 (FP16 + BF16).
+
+Usage:
+    python benchmarks/bench_sdp_hd64_bf16.py
+"""
 import time
 import torch
 import torch.nn.functional as F

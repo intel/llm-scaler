@@ -631,7 +631,16 @@ setup(
     long_description=get_long_description(),
     long_description_content_type="text/markdown",
     url="https://github.com/intel/omni_xpu_kernel",
-    packages=find_packages(exclude=["tests", "scripts"]),
+    packages=find_packages(
+        exclude=[
+            "tests",
+            "tests.*",
+            "scripts",
+            "scripts.*",
+            "benchmarks",
+            "benchmarks.*",
+        ]
+    ),
     ext_modules=_ext_modules,
     cmdclass={"build_ext": ICPXBuildExt},
     python_requires=">=3.9",

@@ -1,5 +1,5 @@
 """
-Performance benchmarks for normalization kernels
+Performance benchmarks for normalization kernels.
 
 Compares ESIMD kernels against PyTorch native implementations.
 

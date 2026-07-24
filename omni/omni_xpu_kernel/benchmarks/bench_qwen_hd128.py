@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Benchmark ESIMD SDP vs PyTorch SDPA for Qwen Image HD=128 shapes."""
+"""Benchmark ESIMD SDP vs PyTorch SDPA for Qwen Image HD=128 shapes.
+
+Usage:
+    python benchmarks/bench_qwen_hd128.py
+"""
 import time
 import torch
 import torch.nn.functional as F

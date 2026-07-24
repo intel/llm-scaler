@@ -10,9 +10,9 @@ Compares:
 Tests at ComfyUI-relevant shapes.
 
 Usage:
-    python tests/bench_int8.py
-    python tests/bench_int8.py --device xpu
-    python tests/bench_int8.py --shapes comfyui
+    python benchmarks/bench_int8.py
+    python benchmarks/bench_int8.py --device xpu
+    python benchmarks/bench_int8.py --shapes comfyui
 """
 
 import argparse

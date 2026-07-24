@@ -1,5 +1,5 @@
 """
-Performance benchmarks for GGUF dequantization kernels
+Performance benchmarks for GGUF dequantization kernels.
 
 Compares ESIMD kernel against PyTorch native implementation.
 

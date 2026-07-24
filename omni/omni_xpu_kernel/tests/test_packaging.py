@@ -225,6 +225,7 @@ def test_build_system_does_not_force_a_torch_environment():
     assert "torch==" not in build_system
     assert "onednn" not in build_system
     assert 'dynamic = ["version", "dependencies"]' in pyproject
+    assert 'exclude = ["tests*", "scripts*", "benchmarks*"]' in pyproject
     assert "omni_xpu_kernel._version.__version__" not in pyproject
 
 
@@ -271,6 +272,10 @@ def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
     assert setup_namespace["BUILD_XPU_TARGET"] == XPU_TARGET
     assert setup_namespace["XPU_ARCH_MACRO"] == (
         "OMNI_XPU_ARCH_PTL_H" if XPU_TARGET == "ptl-h" else "OMNI_XPU_ARCH_BMG"
+    )
+    assert all(
+        not package.startswith(("tests", "scripts", "benchmarks"))
+        for package in captured["packages"]
     )
     cute_dependencies = {
         Path(dependency).name

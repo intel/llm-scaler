@@ -7,7 +7,9 @@ import pytest
 
 
 def _load_bench_sdp_module():
-    module_path = Path(__file__).resolve().parent / "benchmarks" / "bench_sdp.py"
+    module_path = (
+        Path(__file__).resolve().parents[1] / "benchmarks" / "bench_sdp.py"
+    )
     spec = importlib.util.spec_from_file_location("bench_sdp", module_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load benchmark module from {module_path}")

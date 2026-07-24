@@ -34,4 +34,4 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-exclude = ["tests*", "scripts*"]
+exclude = ["tests*", "scripts*", "benchmarks*"]
