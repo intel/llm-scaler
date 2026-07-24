@@ -232,7 +232,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # the repository patch so the canonical XPU_TARGET selects BMG AOT or, for
 # PTL-H, the previously validated spir64 JIT strategy (sycl-tla at this pin
 # does not accept PTL as an offline AOT device).
-COPY ./docker/sgl_kernel_xpu_device_target.patch /llm/patches/
+COPY ./patches/sgl_kernel_xpu_device_target.patch /llm/patches/
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     set -eo pipefail && \

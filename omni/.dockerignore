@@ -29,7 +29,6 @@ tests/
 workflows/
 docker/Dockerfile.full
 docker/Dockerfile-extension
-docker/sgl_kernel_xpu_device_target.patch
 
 # Common local runtime state.
 **/.env
