@@ -15,3 +15,29 @@ omni_xpu_kernel/build/
 # Local-only
 local_build.sh
 .git/
+
+# Files outside the focused ComfyUI image build. Keep these sources in the
+# repository without sending them in the focused Docker build context.
+README.md
+Releases.md
+docs/
+assets/
+benchmarks/
+comfyui_windows_setup/
+example_inputs/
+standalone_examples/
+tests/
+workflows/
+docker/Dockerfile.full
+docker/Dockerfile-extension
+docker/sgl_kernel_xpu_device_target.patch
+entrypoints/start_sgl_diffusion.sh
+
+# Common local runtime state.
+**/.env
+**/.vscode/
+**/logs/
+**/models/
+**/node_modules/
+**/outputs/
+**/tmp/
