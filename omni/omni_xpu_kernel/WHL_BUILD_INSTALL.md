@@ -10,7 +10,8 @@ This document summarizes how to build the updated omni_xpu_kernel from llm-scale
 - ComfyUI embedded Python located at: %EMBED_PYTHON_DIR%
 - Variables (adjust as needed):
   - %WORKSPACE%: workspace root
-  - %EMBED_PYTHON_DIR%: embedded Python directory (example: %WORKSPACE%\omni\comfyui_windows_setup\python_embeded)
+  - %EMBED_PYTHON_DIR%: existing ComfyUI portable embedded Python directory
+    (example: C:\path\to\ComfyUI_windows_portable\python_embeded)
   - %LLM_SCALER_DIR%: llm-scaler repo directory (example: %WORKSPACE%\llm-scaler)
   - %OUTPUT_DIR%: build output directory (example: %WORKSPACE%\llm_scaler_dist)
 
@@ -20,7 +21,7 @@ You can put these variables at the top of your command prompt or script for cons
 ```
 set "WORKSPACE=C:\workspace"
 set "LLM_SCALER_DIR=%WORKSPACE%\llm-scaler"
-set "EMBED_PYTHON_DIR=%WORKSPACE%\omni\comfyui_windows_setup\python_embeded"
+set "EMBED_PYTHON_DIR=C:\path\to\ComfyUI_windows_portable\python_embeded"
 set "OUTPUT_DIR=%WORKSPACE%\llm_scaler_dist"
 set "OMNI_XPU_DEVICE=bmg"
 ```

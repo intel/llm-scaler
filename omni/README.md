@@ -113,5 +113,4 @@ Use ComfyUI's Template Browser for maintained upstream workflows.
 - [ComfyUI usage](docs/COMFYUI.md)
 - [Omni XPU kernel](omni_xpu_kernel/README.md)
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md)
-- [Windows portable setup](comfyui_windows_setup/README.md)
 - [Standalone examples](standalone_examples/)
