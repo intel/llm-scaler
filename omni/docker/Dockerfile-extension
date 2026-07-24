@@ -24,6 +24,7 @@ COPY ./patches/extension_comfyui_rmbg.patch /tmp/
 COPY ./patches/extension_SenseNova-U1.patch /tmp
 COPY ./patches/extension_comfyui-advancedliveportrait.patch /tmp
 COPY ./patches/comfyui-pulid-flux-ll-add_intel_xpu_support_and_bug_fix.patch /tmp
+COPY ./patches/comfyui_wanblockswap-add_intel_xpu_support.patch /tmp
 
 # Add custom node
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -151,6 +152,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt && \
     pip install facenet-pytorch --no-deps && \
     rm -f /tmp/0001-add_intel_xpu_support_and_bug_fix.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf ComfyUI-wanBlockswap && \
+    git clone --depth 1 https://github.com/orssorbit/ComfyUI-wanBlockswap && \
+    cd ComfyUI-wanBlockswap && \
+    git fetch --depth 1 origin 5fa2ec0fa55879fe43a33e762fff91fc2c553a67 && \
+    git checkout 5fa2ec0fa55879fe43a33e762fff91fc2c553a67 && \
+    git apply /tmp/comfyui_wanblockswap-add_intel_xpu_support.patch && \
+    rm -f /tmp/comfyui_wanblockswap-add_intel_xpu_support.patch
 
 RUN rm -f /usr/lib/python3*/EXTERNALLY-MANAGED
 

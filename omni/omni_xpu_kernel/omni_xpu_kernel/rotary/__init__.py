@@ -3,6 +3,7 @@ import torch
 
 def _get_native():
     from .. import _load_extension
+
     return _load_extension().rotary
 
 
@@ -31,4 +32,32 @@ def rotary_emb(
     return _get_native().rotary_emb(x, cos_cache, sin_cache, seq_len, heads)
 
 
-__all__ = ["rotary_emb"]
+def apply_kitchen_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    return _get_native().apply_kitchen_rope1(x, freqs_cis)
+
+
+def apply_kitchen_rope(
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _get_native().apply_kitchen_rope(xq, xk, freqs_cis)
+
+
+def apply_kitchen_rope_split_half1(
+    x: torch.Tensor, freqs_cis: torch.Tensor
+) -> torch.Tensor:
+    return _get_native().apply_kitchen_rope_split_half1(x, freqs_cis)
+
+
+def apply_kitchen_rope_split_half(
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _get_native().apply_kitchen_rope_split_half(xq, xk, freqs_cis)
+
+
+__all__ = [
+    "apply_kitchen_rope",
+    "apply_kitchen_rope1",
+    "apply_kitchen_rope_split_half",
+    "apply_kitchen_rope_split_half1",
+    "rotary_emb",
+]

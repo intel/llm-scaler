@@ -1,5 +1,7 @@
 import logging
 
+from .debug import debug_enabled, verbose_debug_enabled
+
 log = logging.getLogger("ComfyUI-OmniXPU")
 
 # Patch registry: ordered list of (name, status, reason)
@@ -21,7 +23,14 @@ def get_status():
 
 
 def apply_all_patches(cfg):
-    import importlib, os, sys
+    import importlib
+    import os
+    import sys
+
+    if verbose_debug_enabled():
+        log.info("[OmniXPU] verbose debug tracing enabled (dispatch + kernel)")
+    elif debug_enabled():
+        log.info("[OmniXPU] debug tracing enabled (kernel only)")
 
     _patches_dir = os.path.dirname(os.path.abspath(__file__))
     _pkg_name = os.path.basename(os.path.dirname(_patches_dir))
@@ -42,6 +51,8 @@ def apply_all_patches(cfg):
     apply_rope = _load_patch("patch_rope")
     apply_fp8_gemm = _load_patch("patch_fp8_gemm")
     apply_attention = _load_patch("patch_attention")
+    apply_int8 = _load_patch("patch_int8")
+    apply_int8_ffn = _load_patch("patch_int8_ffn")
 
     _apply_one("interpolate_fix", cfg.interpolate_fix, apply_interpolate)
     _apply_one("median_fix", cfg.median_fix, apply_median)
@@ -50,6 +61,8 @@ def apply_all_patches(cfg):
     _apply_one("rope", cfg.rope, apply_rope)
     _apply_one("fp8_gemm", cfg.fp8_gemm, apply_fp8_gemm)
     _apply_one("attention", cfg.attention, apply_attention)
+    _apply_one("int8", cfg.int8, apply_int8)
+    _apply_one("int8_ffn", cfg.int8_ffn, apply_int8_ffn)
 
 
 def _apply_one(name, enabled, apply_fn):

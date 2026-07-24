@@ -1,0 +1,127 @@
+// moe_grouped_entry.sycl — ATen entry for the grouped Q4_K/Q5_K/Q6_K MoE GGEMV
+// (doubleGRF DPAS), used by the GGUF XPU MoE prefill + MTP-verify path
+// (sglang gguf.py: import custom_esimd_kernels_sglang.moe_grouped_gguf_xpu).
+//
+// Ported from the cc_workspace POC (tools/moe_q4k_prefill_poc) into the
+// git-tracked eagle_ops package. AOT-compiled -device ptl-u -options -doubleGRF
+// (see setup.py). The three kernels:
+//   moe_up_q4k_ggemv   : fused gate+up Q4_K GGEMV  [E,IM,H] gate/up -> [tot,2*IM]
+//   moe_down_q5k_ggemv : down-proj Q5_K GGEMV      [E,H,IM]        -> [tot,H]
+//   moe_down_q6k_ggemv : down-proj Q6_K GGEMV      [E,H,IM]        -> [tot,H]
+// smallm=true selects the 16-row tile + finer N-col tiling (occupancy fix for
+// small M, e.g. MTP verify M<=16; improves small-M occupancy over the 64-row tile).
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+#include "moe_q4k_ggemv.h"
+#include "moe_q5k_down_ggemv.h"
+#include "moe_q6k_down_ggemv.h"
+
+//   expert_states [total, H] fp16  (or read via tok_ids gather when provided)
+//   gate/up_ql [E, IM, H/2] u8 (interleaved nibbles); gate/up_sc,mn [E, IM, H/32] fp16
+//   chunks [num_chunks, 3] int32 {eid, t0, nt}
+//   gate_buf [total, 2*IM] fp16 (out: cols 0:IM gate, IM:2IM up)
+at::Tensor moe_up_q4k_ggemv_entry(
+    at::Tensor expert_states,
+    at::Tensor gate_ql, at::Tensor gate_sc, at::Tensor gate_mn,
+    at::Tensor up_ql, at::Tensor up_sc, at::Tensor up_mn,
+    at::Tensor gate_buf, at::Tensor chunks,
+    int64_t hidden_size, int64_t intermediate_size,
+    at::Tensor tok_ids,   // [total] int32 sorted-route token ids; empty => null (legacy)
+    bool smallm = false)  // M<=16 (e.g. MTP verify): 16-row tile + N=16 occupancy tile
+{
+    TORCH_CHECK(chunks.dim() == 2 && chunks.size(1) == 3, "chunks [num_chunks,3]");
+    const int num_chunks = chunks.size(0);
+    if (num_chunks <= 0) return gate_buf;
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(expert_states.device().index()).queue();
+    const auto* chunks_ptr = reinterpret_cast<const MoeQ4KChunkInfo*>(chunks.data_ptr<int>());
+    const int* tok_ids_ptr = (tok_ids.defined() && tok_ids.numel() > 0)
+                             ? tok_ids.data_ptr<int>() : nullptr;
+    auto fn = smallm ? moe_up_q4k_ggemv_smallm : moe_up_q4k_ggemv;
+    fn(
+        queue,
+        reinterpret_cast<const fp16*>(expert_states.data_ptr()),
+        gate_ql.data_ptr<uint8_t>(),
+        reinterpret_cast<const fp16*>(gate_sc.data_ptr()),
+        reinterpret_cast<const fp16*>(gate_mn.data_ptr()),
+        up_ql.data_ptr<uint8_t>(),
+        reinterpret_cast<const fp16*>(up_sc.data_ptr()),
+        reinterpret_cast<const fp16*>(up_mn.data_ptr()),
+        reinterpret_cast<fp16*>(gate_buf.data_ptr()),
+        chunks_ptr, num_chunks, (int)hidden_size, (int)intermediate_size,
+        tok_ids_ptr);
+    // NOTE (#102): NO queue.wait() — it (a) breaks XPU-graph capture ("wait cannot
+    // be called for a queue which is recording to a command graph") and (b) needlessly
+    // host-blocks in eager (the kernel writes gate_buf on the current XPU stream; the
+    // downstream silu/GGEMV run on the SAME stream, so ordering already holds). torch
+    // syncs at the framework boundary.
+    return gate_buf;
+}
+
+at::Tensor moe_down_q5k_ggemv_entry(
+    at::Tensor intermediate, at::Tensor w_ql, at::Tensor w_qh,
+    at::Tensor w_scale, at::Tensor w_min,
+    at::Tensor expert_output, at::Tensor chunks,
+    int64_t intermediate_size, int64_t hidden_size, bool smallm = false)
+{
+    TORCH_CHECK(chunks.dim() == 2 && chunks.size(1) == 3, "chunks [num_chunks,3]");
+    const int num_chunks = chunks.size(0);
+    if (num_chunks <= 0) return expert_output;
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(intermediate.device().index()).queue();
+    const auto* chunks_ptr = reinterpret_cast<const MoeQ4KChunkInfo*>(chunks.data_ptr<int>());
+    auto fn = smallm ? moe_down_q5k_ggemv_smallm : moe_down_q5k_ggemv;
+    fn(
+        queue,
+        reinterpret_cast<const fp16*>(intermediate.data_ptr()),
+        w_ql.data_ptr<uint8_t>(), w_qh.data_ptr<uint8_t>(),
+        reinterpret_cast<const fp16*>(w_scale.data_ptr()),
+        reinterpret_cast<const fp16*>(w_min.data_ptr()),
+        reinterpret_cast<fp16*>(expert_output.data_ptr()),
+        chunks_ptr, num_chunks, (int)intermediate_size, (int)hidden_size);
+    // NOTE (#102): NO queue.wait() — breaks graph capture + needless host-block. Same
+    // stream as caller => ordering holds. (q5k down GGEMV.)
+    return expert_output;
+}
+
+at::Tensor moe_down_q6k_ggemv_entry(
+    at::Tensor intermediate, at::Tensor w_ql, at::Tensor w_qh, at::Tensor w_scale,
+    at::Tensor expert_output, at::Tensor chunks,
+    int64_t intermediate_size, int64_t hidden_size, bool smallm = false)
+{
+    TORCH_CHECK(chunks.dim() == 2 && chunks.size(1) == 3, "chunks [num_chunks,3]");
+    const int num_chunks = chunks.size(0);
+    if (num_chunks <= 0) return expert_output;
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(intermediate.device().index()).queue();
+    const auto* chunks_ptr = reinterpret_cast<const MoeQ4KChunkInfo*>(chunks.data_ptr<int>());
+    auto fn = smallm ? moe_down_q6k_ggemv_smallm : moe_down_q6k_ggemv;
+    fn(
+        queue,
+        reinterpret_cast<const fp16*>(intermediate.data_ptr()),
+        w_ql.data_ptr<uint8_t>(), w_qh.data_ptr<uint8_t>(),
+        reinterpret_cast<const fp16*>(w_scale.data_ptr()),
+        reinterpret_cast<fp16*>(expert_output.data_ptr()),
+        chunks_ptr, num_chunks, (int)intermediate_size, (int)hidden_size);
+    // NOTE (#102): NO queue.wait() — breaks graph capture + needless host-block. Same
+    // stream as caller => ordering holds. (q6k down GGEMV.)
+    return expert_output;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("moe_up_q4k_ggemv", &moe_up_q4k_ggemv_entry, "grouped Q4_K up GGEMV",
+          py::arg("expert_states"), py::arg("gate_ql"), py::arg("gate_sc"), py::arg("gate_mn"),
+          py::arg("up_ql"), py::arg("up_sc"), py::arg("up_mn"),
+          py::arg("gate_buf"), py::arg("chunks"),
+          py::arg("hidden_size"), py::arg("intermediate_size"),
+          // default must be a DEFINED tensor — an undefined at::Tensor() can't be
+          // used as a pybind default (makes the whole overload uncallable when the
+          // arg is omitted). Empty int32 tensor => tok_ids_ptr=nullptr (legacy path).
+          py::arg("tok_ids") = at::empty({0}, at::TensorOptions().dtype(at::kInt)),
+          py::arg("smallm") = false);
+    m.def("moe_down_q5k_ggemv", &moe_down_q5k_ggemv_entry, "grouped Q5_K down GGEMV",
+          py::arg("intermediate"), py::arg("w_ql"), py::arg("w_qh"), py::arg("w_scale"),
+          py::arg("w_min"), py::arg("expert_output"), py::arg("chunks"),
+          py::arg("intermediate_size"), py::arg("hidden_size"), py::arg("smallm") = false);
+    m.def("moe_down_q6k_ggemv", &moe_down_q6k_ggemv_entry, "grouped Q6_K down GGEMV",
+          py::arg("intermediate"), py::arg("w_ql"), py::arg("w_qh"), py::arg("w_scale"),
+          py::arg("expert_output"), py::arg("chunks"),
+          py::arg("intermediate_size"), py::arg("hidden_size"), py::arg("smallm") = false);
+}
