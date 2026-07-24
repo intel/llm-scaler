@@ -23,6 +23,7 @@ COPY ./patches/extension_comfyui_reactor.patch /tmp/
 COPY ./patches/extension_comfyui_rmbg.patch /tmp/
 COPY ./patches/extension_SenseNova-U1.patch /tmp
 COPY ./patches/extension_comfyui-advancedliveportrait.patch /tmp
+COPY ./patches/comfyui-pulid-flux-ll-add_intel_xpu_support_and_bug_fix.patch /tmp
 COPY ./patches/comfyui_wanblockswap-add_intel_xpu_support.patch /tmp
 
 # Add custom node
@@ -139,6 +140,18 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git apply /tmp/extension_comfyui-advancedliveportrait.patch && \
     pip install -r requirements.txt && \
     rm -f /tmp/extension_comfyui-advancedliveportrait.patch
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /llm/ComfyUI/custom_nodes && \
+    rm -rf ComfyUI_PuLID_Flux_ll && \
+    git clone --depth 1 https://github.com/lldacing/ComfyUI_PuLID_Flux_ll && \
+    cd ComfyUI_PuLID_Flux_ll && \
+    git fetch --depth 1 origin 7c7362b806c2c0f4bde8742ada9e7cb05b44d249 && \
+    git checkout 7c7362b806c2c0f4bde8742ada9e7cb05b44d249 && \
+    git apply /tmp/0001-add_intel_xpu_support_and_bug_fix.patch && \
+    pip install -r requirements.txt && \
+    pip install facenet-pytorch --no-deps && \
+    rm -f /tmp/0001-add_intel_xpu_support_and_bug_fix.patch
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/ComfyUI/custom_nodes && \
