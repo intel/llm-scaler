@@ -37,8 +37,10 @@ The package and `intel/llm-scaler-omni` image versions share the source in
 derives its native identity from the active Torch installation and
 `OMNI_XPU_DEVICE`.
 
-Supported Torch XPU minors are 2.10, 2.11, and 2.12. The generated wheel uses a
-PEP 440 local version such as:
+The packaging layer recognizes Torch XPU minors 2.10, 2.11, and 2.12. Each
+Torch/GPU pair still requires its own build and runtime validation; recognizing
+a version is not a validation claim. The generated wheel uses a PEP 440 local
+version such as:
 
 ```text
 omni_xpu_kernel-0.1.0b9.dev0+torch211.bmg
@@ -92,8 +94,9 @@ be installed on PTL-H.
 
 - Python 3.9 or newer development environment
 - Intel oneAPI DPC++/C++ Compiler (`icpx`)
-- PyTorch XPU 2.10.x, 2.11.x, or 2.12.x
-- `onednn==2025.3.0` and `onednn-devel==2025.3.0`
+- A packaging-supported PyTorch XPU minor: 2.10.x, 2.11.x, or 2.12.x
+- `onednn==2025.3.0` and `onednn-devel==2025.3.0` for the package's direct
+  oneDNN calls on Linux
 - Intel [`sycl-tla`](https://github.com/intel/sycl-tla) headers for the
   default Linux CUTE build
 
@@ -157,10 +160,13 @@ For Windows build and installation details, see
 
 ### oneDNN consistency
 
-The native extensions call oneDNN directly. Using headers from one oneDNN
-release with a library from another can produce missing-symbol errors during
-import. The default Linux path uses the matched pip runtime and development
-packages shown above.
+The native extensions call oneDNN directly. The `2025.3.0` pin belongs to
+`omni_xpu_kernel`; it is not inherited from the selected Torch wheel. Using
+headers from one oneDNN release with a library from another can produce
+missing-symbol errors during import. The default Linux path therefore uses the
+matched pip runtime and development packages shown above for every recognized
+Torch minor. A new Torch minor is accepted only after rebuilding and testing
+that complete combination.
 
 For a non-pip development installation, set both variables to the same oneDNN
 installation:
@@ -345,15 +351,18 @@ Run source tests from this directory in a matching XPU build environment:
 python -m pytest tests
 ```
 
-Run the bundled benchmark groups explicitly:
+Benchmarks live outside `tests/` so pytest cannot collect performance
+workloads. Run the available groups explicitly:
 
 ```bash
-python -m tests.benchmarks.run_all --sdp
-python -m tests.benchmarks.run_all --norm
-python -m tests.benchmarks.run_all --gguf
-python -m tests.benchmarks.run_all --onednn
-python -m tests.benchmarks.run_all --rotary
+python -m benchmarks.run_all --fp8
+python -m benchmarks.run_all --gguf
+python -m benchmarks.run_all --norm
+python -m benchmarks.run_all --sdp
 ```
+
+See [`benchmarks/README.md`](benchmarks/README.md) for workload-specific
+programs and measurement boundaries.
 
 Benchmark results are device-, driver-, Torch-, shape-, and power-state
 specific. Do not treat a number from one target as validation for another.
