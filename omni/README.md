@@ -72,8 +72,9 @@ override those defaults. `INSTALL_DISABLED_NODES` applies only to the full
 flavor.
 
 The Kitchen XPU integration is pinned to
-`xiangyuT/comfy-kitchen-xpu@f4fd5d8c36af2e22577f5a7091ae372c6bfa8dc2`
-(`comfy-kitchen==0.2.18`) and is installed after third-party requirements so
+`xiangyuT/comfy-kitchen-xpu@9b4776cc7507c47f16a53a5b8a991c1ba2bc354a`
+(`comfy-kitchen==0.2.18+xpu.1`, based on upstream `0.2.18`) and is installed
+after third-party requirements so
 ComfyUI's older transitive pin cannot replace it. Its repository, commit, and
 version can be overridden together with `COMFY_KITCHEN_REPOSITORY`,
 `COMFY_KITCHEN_COMMIT`, and `COMFY_KITCHEN_VERSION` for a deliberate upgrade.
