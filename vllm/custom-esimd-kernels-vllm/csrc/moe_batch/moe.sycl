@@ -2,6 +2,7 @@
 #include <torch/extension.h>
 #include <cstdlib>
 #include <algorithm>
+#include <utility>
 #include <c10/xpu/XPUStream.h>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
@@ -1643,12 +1644,10 @@ void moe_down_finalize_fp8_block_batched_kernel(
 
 struct MoeBlockBuffers {
     torch::Tensor topk_idx, topk_weight, intermediates;
-    std::array<torch::Tensor, 2> final_outputs;
     int cached_topk = -1;
     int cached_hidden = -1;
     int cached_intermediate = -1;
     int cached_device = -1;
-    int output_index = 0;
 };
 
 // Capture and serving commonly alternate among 1..4 decode tokens. Keep one
@@ -1671,22 +1670,16 @@ static MoeBlockBuffers& ensure_moe_block_buffers(
         buffers.intermediates = torch::empty(
             {num_tokens, top_k + 1, intermediate_size},
             torch::device(dev).dtype(torch::kHalf));
-        for (auto& output : buffers.final_outputs) {
-            output = torch::empty(
-                {num_tokens, hidden_size},
-                torch::device(dev).dtype(torch::kHalf));
-        }
         buffers.cached_topk = top_k;
         buffers.cached_hidden = hidden_size;
         buffers.cached_intermediate = intermediate_size;
         buffers.cached_device = dev.index();
-        buffers.output_index = 0;
     }
     return buffers;
 }
 
 torch::Tensor moe_forward_full_fp8_block(
-    torch::Tensor x, torch::Tensor logits,
+    torch::Tensor x, torch::Tensor logits, torch::Tensor output,
     torch::Tensor gate_up_weight, torch::Tensor gate_up_scale,
     torch::Tensor shared_gate_up_weight, torch::Tensor shared_gate_up_scale,
     torch::Tensor down_weight, torch::Tensor down_scale,
@@ -1700,9 +1693,17 @@ torch::Tensor moe_forward_full_fp8_block(
     const int num_tokens = x.size(0);
     TORCH_CHECK(logits.dim() == 2 && logits.size(0) == num_tokens &&
                 logits.size(1) == n_routed_experts);
+    TORCH_CHECK(output.sizes() == x.sizes() &&
+                output.scalar_type() == torch::kHalf);
+    TORCH_CHECK(output.data_ptr() != x.data_ptr(),
+                "moe_forward_full_fp8_block output must not alias x");
     TORCH_CHECK(logits.scalar_type() == torch::kHalf);
     TORCH_CHECK(num_shared_experts == 1,
                 "moe_forward_full_fp8_block requires one shared expert");
+    TORCH_CHECK(n_routed_experts > 0 && top_k > 0 &&
+                top_k <= n_routed_experts,
+                "moe_forward_full_fp8_block requires 0 < top_k <= "
+                "n_routed_experts");
     TORCH_CHECK(gate_up_weight.scalar_type() == at::kFloat8_e4m3fn &&
                 down_weight.scalar_type() == at::kFloat8_e4m3fn &&
                 shared_gate_up_weight.scalar_type() == at::kFloat8_e4m3fn &&
@@ -1719,6 +1720,7 @@ torch::Tensor moe_forward_full_fp8_block(
                 gate_up_weight.size(2) == hidden_size);
     const int intermediate_size = gate_up_weight.size(1) / 2;
     TORCH_CHECK(gate_up_weight.size(1) == 2 * intermediate_size);
+    TORCH_CHECK(hidden_size % 128 == 0 && intermediate_size % 128 == 0);
     TORCH_CHECK(down_weight.sizes() ==
                 torch::IntArrayRef({n_routed_experts, hidden_size,
                                     intermediate_size}));
@@ -1726,15 +1728,48 @@ torch::Tensor moe_forward_full_fp8_block(
                 torch::IntArrayRef({2 * intermediate_size, hidden_size}));
     TORCH_CHECK(shared_down_weight.sizes() ==
                 torch::IntArrayRef({hidden_size, intermediate_size}));
-    TORCH_CHECK(hidden_size % 128 == 0 && intermediate_size % 128 == 0);
+    TORCH_CHECK(
+        gate_up_scale.sizes() ==
+        torch::IntArrayRef({n_routed_experts, 2 * intermediate_size / 128,
+                            hidden_size / 128}));
+    TORCH_CHECK(
+        down_scale.sizes() ==
+        torch::IntArrayRef({n_routed_experts, hidden_size / 128,
+                            intermediate_size / 128}));
+    TORCH_CHECK(
+        shared_gate_up_scale.sizes() ==
+        torch::IntArrayRef({2 * intermediate_size / 128,
+                            hidden_size / 128}));
+    TORCH_CHECK(
+        shared_down_scale.sizes() ==
+        torch::IntArrayRef({hidden_size / 128, intermediate_size / 128}));
+    TORCH_CHECK(
+        shared_expert_gate_weight.sizes() ==
+        torch::IntArrayRef({1, hidden_size}) &&
+        shared_expert_gate_weight.scalar_type() == torch::kHalf);
+
+    const auto device = x.device();
+    const std::pair<const char*, const torch::Tensor*> tensors[] = {
+        {"logits", &logits},
+        {"output", &output},
+        {"gate_up_weight", &gate_up_weight},
+        {"gate_up_scale", &gate_up_scale},
+        {"shared_gate_up_weight", &shared_gate_up_weight},
+        {"shared_gate_up_scale", &shared_gate_up_scale},
+        {"down_weight", &down_weight},
+        {"down_scale", &down_scale},
+        {"shared_down_weight", &shared_down_weight},
+        {"shared_down_scale", &shared_down_scale},
+        {"shared_expert_gate_weight", &shared_expert_gate_weight},
+    };
+    for (const auto& [name, tensor] : tensors) {
+        TORCH_CHECK(tensor->device() == device, name,
+                    " must be on the same device as x");
+        TORCH_CHECK(tensor->is_contiguous(), name, " must be contiguous");
+    }
 
     auto& buffers = ensure_moe_block_buffers(
         num_tokens, top_k, hidden_size, intermediate_size, x.device());
-    // Alternate outputs so the next decoder layer can safely pass the
-    // preceding layer's returned buffer back as x.
-    torch::Tensor final_output =
-        buffers.final_outputs[buffers.output_index];
-    buffers.output_index ^= 1;
     dispatch_moe_topk_forward<class MoeTopKFP8BlockBatched>(
         (const fp16*)logits.data_ptr(), buffers.topk_idx.data_ptr<int>(),
         (fp16*)buffers.topk_weight.data_ptr(), num_tokens,
@@ -1759,9 +1794,9 @@ torch::Tensor moe_forward_full_fp8_block(
         (const fp16*)shared_expert_gate_weight.data_ptr(),
         (const fp16*)buffers.topk_weight.data_ptr(),
         buffers.topk_idx.data_ptr<int>(),
-        (fp16*)final_output.data_ptr(), num_tokens, hidden_size,
+        (fp16*)output.data_ptr(), num_tokens, hidden_size,
         intermediate_size, top_k, x.device());
-    return final_output;
+    return output;
 }
 
 torch::Tensor moe_forward_full(
@@ -2337,7 +2372,7 @@ TORCH_LIBRARY_FRAGMENT(moe_ops, m) {
     m.def("moe_up_fp8_grouped(Tensor x, Tensor gate_up_weight, Tensor gate_up_scale, Tensor expert_offsets, Tensor expert_tokens, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_down_fp8_grouped(Tensor intermediate, Tensor down_weight, Tensor down_scale, Tensor routing_weights, Tensor expert_offsets, Tensor expert_tokens, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
-    m.def("moe_forward_full_fp8_block(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
+    m.def("moe_forward_full_fp8_block(Tensor x, Tensor logits, Tensor(a!) output, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor(a!)");
     m.def("moe_forward_full_v2(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
 }
 

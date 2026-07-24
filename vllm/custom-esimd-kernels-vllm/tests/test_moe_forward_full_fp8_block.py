@@ -1,8 +1,9 @@
-"""Correctness test for the batch-1 FP8-block fused MoE decode op."""
+"""Correctness tests for the small-batch FP8-block fused MoE decode op."""
 
+import pytest
 import torch
 
-import custom_esimd_kernels_vllm as esimd
+import custom_esimd_kernels_vllm  # noqa: F401
 
 
 FP8_MAX = 448.0
@@ -79,36 +80,77 @@ def reference(
     return out
 
 
-def main():
+@pytest.mark.parametrize("batch_size", [1, 4, 2, 3])
+@pytest.mark.parametrize("seed", range(3))
+def test_moe_forward_full_fp8_block(batch_size: int, seed: int):
     device = "xpu"
     experts, hidden, intermediate, top_k = 16, 256, 128, 4
-    # Alternate all supported token counts so the per-shape persistent buffer
-    # cache is exercised instead of only testing long same-shape runs.
-    cases = [
-        (batch_size, seed)
-        for seed in range(3)
-        for batch_size in (1, 4, 2, 3)
-    ]
-    for batch_size, seed in cases:
-        torch.manual_seed(seed)
-        x = (torch.randn(batch_size, hidden, device=device) * 0.2).half()
-        logits = (torch.randn(batch_size, experts, device=device) * 0.4).half()
-        w13, s13 = quantize_block(
-            torch.randn(experts, 2 * intermediate, hidden, device=device) * 0.15
-        )
-        w2, s2 = quantize_block(
-            torch.randn(experts, hidden, intermediate, device=device) * 0.15
-        )
-        shared_w13, shared_s13 = quantize_block(
-            torch.randn(2 * intermediate, hidden, device=device) * 0.15
-        )
-        shared_w2, shared_s2 = quantize_block(
-            torch.randn(hidden, intermediate, device=device) * 0.15
-        )
-        shared_gate = (torch.randn(1, hidden, device=device) * 0.1).half()
+    torch.manual_seed(seed)
+    x = (torch.randn(batch_size, hidden, device=device) * 0.2).half()
+    logits = (torch.randn(batch_size, experts, device=device) * 0.4).half()
+    w13, s13 = quantize_block(
+        torch.randn(experts, 2 * intermediate, hidden, device=device) * 0.15
+    )
+    w2, s2 = quantize_block(
+        torch.randn(experts, hidden, intermediate, device=device) * 0.15
+    )
+    shared_w13, shared_s13 = quantize_block(
+        torch.randn(2 * intermediate, hidden, device=device) * 0.15
+    )
+    shared_w2, shared_s2 = quantize_block(
+        torch.randn(hidden, intermediate, device=device) * 0.15
+    )
+    shared_gate = (torch.randn(1, hidden, device=device) * 0.1).half()
 
-        expected = reference(
-            x,
+    expected = reference(
+        x,
+        logits,
+        w13,
+        s13,
+        shared_w13,
+        shared_s13,
+        w2,
+        s2,
+        shared_w2,
+        shared_s2,
+        shared_gate,
+        top_k,
+    )
+    output = torch.empty_like(x)
+    actual_half = torch.ops.moe_ops.moe_forward_full_fp8_block(
+        x,
+        logits,
+        output,
+        w13,
+        s13,
+        shared_w13,
+        shared_s13,
+        w2,
+        s2,
+        shared_w2,
+        shared_s2,
+        shared_gate,
+        top_k,
+        1,
+        experts,
+    )
+    assert actual_half.data_ptr() == output.data_ptr()
+    actual = actual_half.float()
+    torch.xpu.synchronize()
+    mean_rel = (actual - expected).abs().mean() / expected.abs().mean()
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.flatten(), expected.flatten(), dim=0
+    )
+    print(
+        f"batch={batch_size} seed={seed} mean_rel={mean_rel.item():.6e} "
+        f"cos={cosine.item():.8f}"
+    )
+    assert mean_rel < 3e-3
+    assert cosine > 0.9999
+
+    if batch_size == 4 and seed == 0:
+        chained_expected = reference(
+            actual_half,
             logits,
             w13,
             s13,
@@ -121,9 +163,11 @@ def main():
             shared_gate,
             top_k,
         )
-        actual_half = esimd.moe_forward_full_fp8_block(
-            x,
+        chained_output = torch.empty_like(x)
+        chained_actual = torch.ops.moe_ops.moe_forward_full_fp8_block(
+            actual_half,
             logits,
+            chained_output,
             w13,
             s13,
             shared_w13,
@@ -136,66 +180,17 @@ def main():
             top_k,
             1,
             experts,
-        )
-        actual = actual_half.float()
+        ).float()
         torch.xpu.synchronize()
-        mean_rel = (actual - expected).abs().mean() / expected.abs().mean()
-        cosine = torch.nn.functional.cosine_similarity(
-            actual.flatten(), expected.flatten(), dim=0
+        chained_mean_rel = (
+            chained_actual - chained_expected
+        ).abs().mean() / chained_expected.abs().mean()
+        chained_cosine = torch.nn.functional.cosine_similarity(
+            chained_actual.flatten(), chained_expected.flatten(), dim=0
         )
         print(
-            f"batch={batch_size} seed={seed} mean_rel={mean_rel.item():.6e} "
-            f"cos={cosine.item():.8f}"
+            f"chained mean_rel={chained_mean_rel.item():.6e} "
+            f"cos={chained_cosine.item():.8f}"
         )
-        assert mean_rel < 3e-3
-        assert cosine > 0.9999
-
-        if batch_size == 4 and seed == 0:
-            chained_expected = reference(
-                actual_half,
-                logits,
-                w13,
-                s13,
-                shared_w13,
-                shared_s13,
-                w2,
-                s2,
-                shared_w2,
-                shared_s2,
-                shared_gate,
-                top_k,
-            )
-            chained_actual = esimd.moe_forward_full_fp8_block(
-                actual_half,
-                logits,
-                w13,
-                s13,
-                shared_w13,
-                shared_s13,
-                w2,
-                s2,
-                shared_w2,
-                shared_s2,
-                shared_gate,
-                top_k,
-                1,
-                experts,
-            ).float()
-            torch.xpu.synchronize()
-            chained_mean_rel = (
-                chained_actual - chained_expected
-            ).abs().mean() / chained_expected.abs().mean()
-            chained_cosine = torch.nn.functional.cosine_similarity(
-                chained_actual.flatten(), chained_expected.flatten(), dim=0
-            )
-            print(
-                f"chained mean_rel={chained_mean_rel.item():.6e} "
-                f"cos={chained_cosine.item():.8f}"
-            )
-            assert chained_mean_rel < 3e-3
-            assert chained_cosine > 0.9999
-    print("ALL_PASS")
-
-
-if __name__ == "__main__":
-    main()
+        assert chained_mean_rel < 3e-3
+        assert chained_cosine > 0.9999
