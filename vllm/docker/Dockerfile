@@ -129,11 +129,14 @@ FROM intel/pytorch:xpu-2.11.0-ubuntu24.04
 ARG http_proxy
 ARG https_proxy
 ARG no_proxy
+ARG ONECCL_INSTALLER="intel-oneccl-2021.15.9.14_offline.sh"
+ARG ONECCL_INSTALLER_SHA256="f7ab81b6ed1b10dd35fadec366a78046d8af214888dfd625047ce8953d5aa4ef"
 
 # The base already exports PATH=/opt/venv/bin:... and DEVICE=xpu.
 ENV PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
+    LD_PRELOAD="/opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1" \
     VLLM_QUANTIZE_Q40_LIB="/opt/venv/lib/python3.12/site-packages/vllm_int4_for_multi_arc.so" \
     VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 \
     VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
@@ -164,6 +167,16 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get install -y --no-install-recommends --fix-missing \
         ffmpeg libsndfile1 libsm6 libxext6 libgl1 numactl curl && \
     rm -rf /var/lib/apt/lists/* && \
+    curl -fL --retry 3 -o "${ONECCL_INSTALLER}" "https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.9/${ONECCL_INSTALLER}" && \
+    printf "%s  %s\n" "${ONECCL_INSTALLER_SHA256}" "${ONECCL_INSTALLER}" > /tmp/oneccl.sha256 && \
+    sha256sum -c /tmp/oneccl.sha256 && \
+    rm -f /tmp/oneccl.sha256 && \
+    bash "${ONECCL_INSTALLER}" -a --silent --eula accept && \
+    rm "${ONECCL_INSTALLER}" && \
+    echo "source /opt/intel/oneapi/setvars.sh --force" >> /root/.bashrc && \
+    echo "source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --force" >> /root/.bashrc && \
+    rm -f /opt/intel/oneapi/ccl/latest && \
+    ln -s /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/latest && \
     pip install /wheels/vllm-*.whl --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-deps --force-reinstall \
         /wheels/custom_esimd_kernels_vllm-*.whl \
@@ -179,6 +192,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     rm -f ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git && \
     ln -s libMLIRDialectPlugin.so ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git
 
-# --- entrypoint: no oneCCL vars.sh (absent in this base); multi-card relies on
-#     torch 2.11 built-in XCCL. ---
+# --- entrypoint: oneCCL 2021.15 is preloaded via LD_PRELOAD to avoid torch's
+#     /opt/venv/lib libccl.so.1 taking precedence due to libtorch_xpu.so RPATH. ---
 ENTRYPOINT ["bash", "-c", "exec vllm serve \"$@\"", "--"]

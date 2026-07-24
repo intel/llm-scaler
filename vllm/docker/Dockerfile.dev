@@ -39,6 +39,8 @@ ARG https_proxy
 ARG no_proxy
 # vllm-xpu-kernels pinned base commit (identical to prod build).
 ARG VLLM_XPU_KERNELS_COMMIT=3cab97a
+ARG ONECCL_INSTALLER="intel-oneccl-2021.15.9.14_offline.sh"
+ARG ONECCL_INSTALLER_SHA256="f7ab81b6ed1b10dd35fadec366a78046d8af214888dfd625047ce8953d5aa4ef"
 
 ENV VIRTUAL_ENV=/opt/venv \
     PATH="/root/.local/bin:/opt/venv/bin:${PATH}" \
@@ -50,6 +52,7 @@ ENV VIRTUAL_ENV=/opt/venv \
     VLLM_TARGET_DEVICE=xpu \
     WHEELS=/wheels \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    LD_PRELOAD="/opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1" \
     VLLM_QUANTIZE_Q40_LIB="/opt/venv/lib/python3.12/site-packages/vllm_int4_for_multi_arc.so" \
     VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 \
     VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
@@ -90,6 +93,21 @@ COPY ./patches/vllm_for_multi_arc.patch ./patches/vllm_xpu_kernels.patch /tmp/
 COPY ./custom-esimd-kernels-vllm /llm-scaler/vllm/custom-esimd-kernels-vllm
 
 WORKDIR /llm-scaler/vllm
+
+# This Intel(R) oneAPI Collective Communications Library (oneCCL) contains several
+# enhancements for Intel(R) Arc(TM) Pro graphics.
+# For details, please refer to:
+# https://github.com/uxlfoundation/oneCCL/releases/tag/2021.15.9
+RUN curl -fL --retry 3 -o "${ONECCL_INSTALLER}" "https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.9/${ONECCL_INSTALLER}" && \
+    printf "%s  %s\n" "${ONECCL_INSTALLER_SHA256}" "${ONECCL_INSTALLER}" > /tmp/oneccl.sha256 && \
+    sha256sum -c /tmp/oneccl.sha256 && \
+    rm -f /tmp/oneccl.sha256 && \
+    bash "${ONECCL_INSTALLER}" -a --silent --eula accept && \
+    rm "${ONECCL_INSTALLER}" && \
+    echo "source /opt/intel/oneapi/setvars.sh --force" >> /root/.bashrc && \
+    echo "source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --force" >> /root/.bashrc && \
+    rm -f /opt/intel/oneapi/ccl/latest && \
+    ln -s /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/latest
 
 # ---------------------------------------------------------------------------
 # vLLM v0.21.0 + multi-arc patch  ->  EDITABLE install (source kept at
