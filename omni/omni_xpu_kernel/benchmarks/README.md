@@ -15,7 +15,7 @@ python -m benchmarks.run_all --norm
 python -m benchmarks.run_all --sdp
 ```
 
-The remaining programs cover larger or workload-specific shapes and are run
+The remaining programs cover larger or model-motivated shapes and are run
 individually:
 
 ```bash
@@ -24,6 +24,10 @@ python benchmarks/bench_ltx2.py
 python benchmarks/bench_qwen_hd128.py
 python benchmarks/bench_sdp_hd64_bf16.py
 ```
+
+`bench_ltx2.py` is a synthetic attention sequence-length sweep using
+LTX-2-family head dimensions. It is not an end-to-end LTX 2.3 workflow
+benchmark and must not be reported as workflow latency.
 
 Run benchmarks only with a wheel built for the local Torch minor and XPU
 target. Results are sensitive to warm-up, driver, power state, competing

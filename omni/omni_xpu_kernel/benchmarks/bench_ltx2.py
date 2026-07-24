@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Benchmark ESIMD SDP vs PyTorch SDPA for LTX-2 video shapes (H=32, HD=64).
+"""Diagnostic ESIMD SDP sweep for LTX-2-family attention dimensions.
+
+This is a synthetic kernel microbenchmark, not an end-to-end LTX 2.3 workflow
+benchmark. The sequence lengths below are not extracted from a template trace.
 
 Usage:
     python benchmarks/bench_ltx2.py
@@ -11,9 +14,11 @@ from omni_xpu_kernel import sdp
 
 device = torch.device("xpu:0")
 
-# LTX-2: H=32, HD=64
-# First pass (640x360, 121 frames): seq ~3600-54000 depending on compression
-# Second pass (1280x720, after spatial 2x upscale): seq up to ~360000
+# LTX-2-family attention dimensions: H=32, HD=64. The official LTX 2.3
+# template uses 126 graph input frames at 640x360; 121 is the final output frame
+# count after template preprocessing. Neither value directly determines the
+# attention sequence length, so use the configurations only as a synthetic
+# logarithmic sweep.
 configs = [
     # name,                B, H,    S,    D, dtype
     ("bf16 S=1024",        1, 32, 1024,   64, torch.bfloat16),
