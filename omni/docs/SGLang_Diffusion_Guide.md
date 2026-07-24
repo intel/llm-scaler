@@ -90,12 +90,6 @@ sglang serve --model-path /llm/models/Z-Image-Turbo/ \
     --num-gpus 1 --port 30010
 ```
 
-Or use the provided entrypoint script:
-
-```bash
-bash /llm/entrypoints/start_sgl_diffusion.sh
-```
-
 ### API Endpoints
 
 | Endpoint | Method | Description |

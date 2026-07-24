@@ -143,11 +143,8 @@ This is a generic template for text-to-image generation using any SGLang Diffusi
 
 **Steps:**
 
-1. **Start the SGLang Diffusion server:**
-
-   ```bash
-   bash /llm/entrypoints/start_sgl_diffusion.sh
-   ```
+1. **Start the SGLang Diffusion server** using the command in the
+   [SGLang Diffusion guide](SGLang_Diffusion_Guide.md#starting-the-server).
 
 2. **Load the workflow** in ComfyUI: Open `image_sglang_diffusion.json` from the workflows panel.
 
@@ -182,11 +179,8 @@ An enhanced workflow specifically for Z-Image-Turbo with both positive and negat
 
 **Steps:**
 
-1. **Start the server** (same as above, or use the entrypoint script):
-
-   ```bash
-   bash /llm/entrypoints/start_sgl_diffusion.sh
-   ```
+1. **Start the server** using the command in the
+   [SGLang Diffusion guide](SGLang_Diffusion_Guide.md#starting-the-server).
 
 2. **Load the workflow**: Open `image_z_image_sgld.json`.
 
@@ -242,11 +236,8 @@ All workflow files are available in the `workflows/` directory of ComfyUI.
    docker exec -it $CONTAINER_NAME bash
    ```
 
-2. **Start the SGLang Diffusion server** (in terminal 1):
-
-   ```bash
-   bash /llm/entrypoints/start_sgl_diffusion.sh
-   ```
+2. **Start the SGLang Diffusion server** in terminal 1 using the command in the
+   [SGLang Diffusion guide](SGLang_Diffusion_Guide.md#starting-the-server).
 
    Wait until you see the server is ready (listening on port 30010).
 

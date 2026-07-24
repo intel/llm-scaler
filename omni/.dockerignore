@@ -23,7 +23,6 @@ Releases.md
 docs/
 assets/
 benchmarks/
-comfyui_windows_setup/
 example_inputs/
 standalone_examples/
 tests/
@@ -31,7 +30,6 @@ workflows/
 docker/Dockerfile.full
 docker/Dockerfile-extension
 docker/sgl_kernel_xpu_device_target.patch
-entrypoints/start_sgl_diffusion.sh
 
 # Common local runtime state.
 **/.env
