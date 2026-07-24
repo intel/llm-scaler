@@ -200,20 +200,22 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1(
         1,
         uint32_t>(pPollP, atomicOffset);
 
-      if (0 == arrivalId) {
-        atomic_update<
-          __ESIMD_NS::atomic_op::fcmpxchg,
-          float,
-          1,
-          uint32_t>(pGlobalMax, atomicOffset, ppMax, zeros);
-      }
-      else {
-        atomic_update<
-          __ESIMD_NS::atomic_op::fmax,
-          float,
-          1,
-          uint32_t>(pGlobalMax, atomicOffset, ppMax);
-      }
+      // Order-invariant global-max reduction: every arrival does an atomic fmax, so
+      // pGlobalMax must be seeded to FP32_MIN (done in page_attn_decode) rather than 0.
+      // The prior fcmpxchg-if-first / fmax-else scheme assumed a 0 seed and had two
+      // problems: (1) with a single 64-tile (maxSeqLen<=64) the first arrival's
+      // fcmpxchg is the only writer, so any seed != 0 leaves pGlobalMax unchanged;
+      // (2) even with a 0 seed it is not order-invariant -- a later arrival's
+      // fmax(0, neg)=0 can mask a negative max before arrival-0's fcmpxchg overwrites
+      // it, losing the true max when the whole head's max is negative. fmax-from-
+      // FP32_MIN removes both (the arrival counter is now unused).
+      (void)arrivalId;
+      (void)zeros;
+      atomic_update<
+        __ESIMD_NS::atomic_op::fmax,
+        float,
+        1,
+        uint32_t>(pGlobalMax, atomicOffset, ppMax);
 
       outputOffset += pStride;
       outputMaxOffset += maxStride;
@@ -766,20 +768,22 @@ ESIMD_INLINE void sdpaDecodeGqa2Phase1(
         1,
         uint32_t>(pPollP, atomicOffset);
 
-      if (0 == arrivalId) {
-        atomic_update<
-          __ESIMD_NS::atomic_op::fcmpxchg,
-          float,
-          1,
-          uint32_t>(pGlobalMax, atomicOffset, ppMax, zeros);
-      }
-      else {
-        atomic_update<
-          __ESIMD_NS::atomic_op::fmax,
-          float,
-          1,
-          uint32_t>(pGlobalMax, atomicOffset, ppMax);
-      }
+      // Order-invariant global-max reduction: every arrival does an atomic fmax, so
+      // pGlobalMax must be seeded to FP32_MIN (done in page_attn_decode) rather than 0.
+      // The prior fcmpxchg-if-first / fmax-else scheme assumed a 0 seed and had two
+      // problems: (1) with a single 64-tile (maxSeqLen<=64) the first arrival's
+      // fcmpxchg is the only writer, so any seed != 0 leaves pGlobalMax unchanged;
+      // (2) even with a 0 seed it is not order-invariant -- a later arrival's
+      // fmax(0, neg)=0 can mask a negative max before arrival-0's fcmpxchg overwrites
+      // it, losing the true max when the whole head's max is negative. fmax-from-
+      // FP32_MIN removes both (the arrival counter is now unused).
+      (void)arrivalId;
+      (void)zeros;
+      atomic_update<
+        __ESIMD_NS::atomic_op::fmax,
+        float,
+        1,
+        uint32_t>(pGlobalMax, atomicOffset, ppMax);
     }
   }
 }
