@@ -5,7 +5,9 @@ LLM Scaler is an GenAI solution for text generation, image generation, video gen
 ---
 
 ## Latest Update
-- 🔥[2026.06] We released `intel/llm-scaler-vllm:0.14.0-b8.3.2` to fix Qwen3.5/3.6-27B accuracy issues. 
+- 🔥[2026.07] We released `intel/llm-scaler-omni:0.1.0-b8` to support ComfyUI 0.27.0,more workflows and models.
+- 🔥[2026.07] We released `intel/llm-scaler-vllm:0.21.0-b1` to support gemma-4 (12B, 31B and 26B-A4B) and diffusiongemma (26B-A4B) models, and experimentally support XPU graph. 
+- [2026.06] We released `intel/llm-scaler-vllm:0.14.0-b8.3.2` to fix Qwen3.5/3.6-27B accuracy issues. 
 - [2026.06] We released `intel/llm-scaler-vllm:0.14.0-b8.3.1` to enable FP8 KV Cache and fix bugs for Qwen3/Qwen3.5 models. 
 - [2026.05] We released `intel/llm-scaler-vllm:0.14.0-b8.3` to improve performance for Qwen3.5/3.6 series and Qwen3-Coder-Next, and enabled model streaming load to reduce peak memory. 
 - [2026.05] We released `intel/llm-scaler-vllm:1.4` (or, `intel/llm-scaler-vllm:0.14.0-b8.2.1`) with new platform image and support Intel® Arc™ Pro B70 GPU. 
@@ -101,6 +103,10 @@ Please follow the instructions in the [Getting Started](vllm/README.md/#1-gettin
 | ByteDance-Seed/UI-TARS-7B-DPO              |  ✅  |         ✅         |          ✅          |       |                           |
 | google/gemma-3-12b-it                      |      |         ✅         |                      |       |  use bfloat16  |
 | google/gemma-3-27b-it                      |      |         ✅         |                      |       |  use bfloat16  |
+| google/gemma-4-12B-it                      |      |         ✅         |          ✅         |       |see [Reference Commands](vllm/README.md/#33-reference-commands-for-running-gemma-4-models-and-diffusiongemma)                            |
+| google/gemma-4-31B-it                      |      |         ✅         |          ✅         |       |                            |
+| google/gemma-4-26B-A4B-it                  |      |         ✅         |          ✅         |       |                            |
+| google/diffusiongemma-26B-A4B-it           |      |         ✅         |          ✅         |       |see [Reference Commands](vllm/README.md/#33-reference-commands-for-running-gemma-4-models-and-diffusiongemma)                            |
 | THUDM/GLM-4v-9B                            |  ✅  |         ✅         |          ✅         |       |  with --hf-overrides and chat_template  |
 | zai-org/GLM-4.1V-9B-Base                   |  ✅  |         ✅         |          ✅          |       |                           |
 | zai-org/GLM-4.1V-9B-Thinking               |  ✅  |         ✅         |          ✅          |       |                           |

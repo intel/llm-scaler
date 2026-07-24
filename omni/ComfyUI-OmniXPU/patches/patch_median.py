@@ -2,6 +2,8 @@ import logging
 
 import torch
 
+from .debug import log_debug_event, trace_patch
+
 log = logging.getLogger("ComfyUI-OmniXPU")
 
 # Patch torch.median / torch.nanmedian on XPU.
@@ -132,6 +134,12 @@ def apply():
     _orig_nanmedian = torch.nanmedian
     strict = os.environ.get("OMNIXPU_MEDIAN_STRICT_INDICES", "0") != "0"
 
+    @trace_patch(
+        "median",
+        ("input", "dim", "keepdim"),
+        stage="dispatch",
+        verbose_only=True,
+    )
     def _patched_median(input, dim=None, keepdim=False, *, out=None):
         if out is not None or not _should_handle(input, dim):
             if dim is None:
@@ -141,12 +149,24 @@ def apply():
         if input.is_floating_point() and torch.isnan(input).any():
             return _orig_median(input, dim, keepdim)
         try:
+            log_debug_event(
+                "kernel",
+                "median_fix",
+                {"input": input},
+                details={"backend": "xpu_workaround"},
+            )
             v, i = _fast_dim_median(input, dim, keepdim, strict)
             return torch.return_types.median((v, i))
         except Exception as e:  # never break the graph
             log.warning("[OmniXPU] median fast path failed (%s); fallback", e)
             return _orig_median(input, dim, keepdim)
 
+    @trace_patch(
+        "nanmedian",
+        ("input", "dim", "keepdim"),
+        stage="dispatch",
+        verbose_only=True,
+    )
     def _patched_nanmedian(input, dim=None, keepdim=False, *, out=None):
         if out is not None or not _should_handle(input, dim):
             if dim is None:
@@ -156,6 +176,12 @@ def apply():
         if input.is_floating_point() and torch.isnan(input).any():
             return _orig_nanmedian(input, dim, keepdim)
         try:
+            log_debug_event(
+                "kernel",
+                "nanmedian_fix",
+                {"input": input},
+                details={"backend": "xpu_workaround"},
+            )
             v, i = _fast_dim_median(input, dim, keepdim, strict)
             return torch.return_types.nanmedian((v, i))
         except Exception as e:

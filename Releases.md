@@ -3,9 +3,10 @@
 ## llm-scaler-vllm
 
 ### Latest Release
-* [`intel/llm-scaler-vllm:0.14.0-b8.3.2`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.14.0-b8.3.2/images/sha256-4454b316ba834d8d45c20c1b4b64c71285f31efff17b8c61d672376e7d25f802) [06/2026] 
+* [`intel/llm-scaler-vllm:0.21.0-b1`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.21.0-b1/images/sha256-5d87be271e4db54539f1dbb29c071e9122f4e57b74594dbb26a55d27a569d780) [07/2026] 
     
 ### Previous Releases
+* [`intel/llm-scaler-vllm:0.14.0-b8.3.2`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.14.0-b8.3.2/images/sha256-4454b316ba834d8d45c20c1b4b64c71285f31efff17b8c61d672376e7d25f802) [06/2026] 
 * [`intel/llm-scaler-vllm:0.14.0-b8.3.1`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.14.0-b8.3.1/images/sha256-4304f64f2a9a38994cf1e824d8fa0c61769c87c8b7ecfd2965d9a01b46c8bc8a) [06/2026] 
 * [`intel/llm-scaler-vllm:0.14.0-b8.3`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.14.0-b8.3/images/sha256-eba91ab40dfdd6912f47164d0553bd7bbf65598b334686873b94694afe1e98a6) [05/2026]   
 * [`intel/llm-scaler-vllm:1.4`](https://hub.docker.com/layers/intel/llm-scaler-vllm/1.4/images/sha256-e96ac887e90b06d45dc3e6766a1eff6c32e2e5ba9146336569c309dfc0e828b0) [05/2026] 
@@ -31,9 +32,10 @@
 ## llm-scaler-omni
 
 ### Latest Release 
-* [`intel/llm-scaler-omni:0.1.0-b7`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b7/images/sha256-0cda2f6c8666027aa64aaa6ce0bd8d6081a043ce046b65e2a28a5b5db2d85f61) [05/2026]
+* [`intel/llm-scaler-omni:0.1.0-b8`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b8/images/sha256-7e28f7e3aaa9448ce70151a1e6a89de13f0b3b844c0d76d4b40f1dece9b2da81) [07/2026]
 
 ### Previous Releases
+* [`intel/llm-scaler-omni:0.1.0-b7`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b7/images/sha256-0cda2f6c8666027aa64aaa6ce0bd8d6081a043ce046b65e2a28a5b5db2d85f61) [05/2026]
 * [`intel/llm-scaler-omni:0.1.0-b6`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b6/images/sha256-fcf14ab440bc8a9b0903ffdb2f9ec6b678ba6d0c5b8217a6e749bacb8ea5fc87) [03/2026]
 * [`intel/llm-scaler-omni:0.1.0-b5`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b5/images/sha256-3e3347fa47d93b0f7b22c07d45fd19dec46aa08e93e00d45c8181765f5e02433) [01/2026]
 * [`intel/llm-scaler-omni:0.1.0-b4`](https://hub.docker.com/layers/intel/llm-scaler-omni/0.1.0-b4/images/sha256-0ebf4061275252042ae12578fb0d355be90cbec853d6fe45bfb625f0df9187e8) [12/2025]

@@ -63,6 +63,30 @@ def get_icpx_path():
     return None
 
 
+def compiler_env_with_explicit_onednn(onednn_include):
+    """Remove duplicate oneDNN include paths injected by setvars.sh."""
+    env = os.environ.copy()
+    explicit_path = os.path.realpath(onednn_include)
+
+    for name in ("CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH"):
+        value = env.get(name)
+        if not value:
+            continue
+
+        entries = value.split(os.pathsep)
+        entries = [
+            entry for entry in entries
+            if not entry or os.path.realpath(entry) != explicit_path
+        ]
+
+        if entries:
+            env[name] = os.pathsep.join(entries)
+        else:
+            env.pop(name, None)
+
+    return env
+
+
 class ICPXBuildExt(build_ext):
     """Build extension using Intel icpx compiler directly."""
     
@@ -90,6 +114,10 @@ class ICPXBuildExt(build_ext):
         torch_dir = Path(torch.__file__).parent
         torch_include = torch_dir / "include"
         torch_lib = torch_dir / "lib"
+
+        # Match PyTorch's libstdc++ ABI so the extension links/loads against this
+        # wheel (a hard-coded flag breaks if the wheel used the other ABI).
+        torch_cxx11_abi = int(bool(torch.compiled_with_cxx11_abi()))
         
         # Get Python include
         import sysconfig
@@ -101,11 +129,15 @@ class ICPXBuildExt(build_ext):
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
         is_lgrf = ext.name.endswith("lgrf_sdp")
-        
+        is_cute = ext.name.endswith("cute_fmha_torch")
+
         # Source directory
         if is_lgrf:
             src_dir = Path(ext.sourcedir) / "omni_xpu_kernel" / "lgrf_uni"
             sources = [src_dir / "sdp_kernels.cpp"]
+        elif is_cute:
+            src_dir = Path(ext.sourcedir) / "omni_xpu_kernel" / "cute"
+            sources = [src_dir / "cute_fmha_torch.cpp"]
         else:
             src_dir = Path(ext.sourcedir) / "omni_xpu_kernel" / "csrc"
             sources = list(src_dir.glob("*.cpp"))
@@ -141,6 +173,11 @@ class ICPXBuildExt(build_ext):
         else:
             print("WARNING: oneDNN not found. onednn_int4_gemm will not be available.")
         
+        if is_cute and IS_WINDOWS:
+            # cute FMHA has no Windows build path (and is filtered out of
+            # ext_modules on Windows); guard here in case it is reached directly.
+            raise RuntimeError("cute_fmha_torch is Linux-only; not supported on Windows.")
+
         if IS_WINDOWS:
             # Windows compile command using icx
             python_lib_dir = sysconfig.get_config_var("LIBDIR") or str(Path(sys.executable).parent / "libs")
@@ -209,6 +246,45 @@ class ICPXBuildExt(build_ext):
                 if has_onednn:
                     cmd.append(f"-I{onednn_include}")
                 cmd += ["-o", str(output_path)] + [str(s) for s in sources]
+            elif is_cute:
+                # CUTLASS-SYCL fused FMHA. Needs a cutlass-sycl / sycl-tla source
+                # tree (headers only) via CUTLASS_SYCL_ROOT, AOT to the target GPU,
+                # and the Xe SPIR-V extensions. fp32 accumulation (no fp16 overflow).
+                cutlass = os.environ.get("CUTLASS_SYCL_ROOT", "")
+                if not cutlass or not os.path.isdir(cutlass):
+                    raise RuntimeError(
+                        "cute_fmha_torch needs CUTLASS_SYCL_ROOT set to a cutlass-sycl "
+                        "(sycl-tla) source tree containing include/, tools/util/include/, "
+                        "examples/common/, applications/. Got: " + repr(cutlass))
+                device_target = os.environ.get("OMNI_XPU_DEVICE", "bmg")
+                cmd += [
+                    "-std=c++17", "-O3", "-DNDEBUG", "-fPIC", "-shared",
+                    "-fsycl-targets=spir64_gen",
+                    "-Xsycl-target-backend", f"-device {device_target}",
+                    "-Xspirv-translator",
+                    "-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,"
+                    "+SPV_INTEL_subgroup_matrix_multiply_accumulate",
+                    "-fno-sycl-instrument-device-code",
+                    "-DCUTLASS_ENABLE_SYCL", "-DSYCL_INTEL_TARGET",
+                    f"-D_GLIBCXX_USE_CXX11_ABI={torch_cxx11_abi}", "-DHEAD_DIM=128",
+                    f"-I{cutlass}/include",
+                    f"-I{cutlass}/tools/util/include",
+                    f"-I{cutlass}/examples/common",
+                    f"-I{cutlass}/applications",
+                    f"-I{python_include}",
+                    f"-I{torch_include}",
+                    f"-I{torch_include}/torch/csrc/api/include",
+                    "-Wno-unknown-pragmas", "-Wno-unused-variable",
+                    "-Wno-unused-but-set-variable", "-Wno-unused-local-typedef",
+                    "-Wno-uninitialized", "-Wno-reorder-ctor",
+                    "-Wno-logical-op-parentheses", "-Wno-unused-function",
+                    "-Wno-deprecated-copy",
+                    f"-L{torch_lib}",
+                    "-ltorch", "-ltorch_python", "-ltorch_cpu", "-ltorch_xpu",
+                    "-lc10", "-lc10_xpu",
+                    "-Wl,-rpath," + str(torch_lib),
+                    "-o", str(output_path),
+                ] + [str(s) for s in sources]
             else:
                 cmd += [
                     "-fsycl-esimd-force-stateless-mem",
@@ -216,13 +292,13 @@ class ICPXBuildExt(build_ext):
                     "-fPIC", "-shared",
                     "-std=c++17",
                     f"-I{python_include}",
-                    f"-I{torch_include}",
-                    f"-I{torch_include}/torch/csrc/api/include",
-                    f"-I{src_dir}",
                 ]
                 if has_onednn:
                     cmd.append(f"-I{onednn_include}")
                 cmd += [
+                    f"-I{torch_include}",
+                    f"-I{torch_include}/torch/csrc/api/include",
+                    f"-I{src_dir}",
                     f"-L{torch_lib}",
                     "-ltorch", "-ltorch_python", "-ltorch_cpu", "-ltorch_xpu", "-lc10", "-lc10_xpu",
                 ]
@@ -236,8 +312,17 @@ class ICPXBuildExt(build_ext):
         
         print(f"Compile command: {' '.join(cmd)}")
         
-        # Run compiler
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # Run compiler with the explicit oneDNN include taking precedence.
+        compiler_env = os.environ.copy()
+        if has_onednn and not is_cute:
+            compiler_env = compiler_env_with_explicit_onednn(onednn_include)
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=compiler_env,
+        )
         
         if result.returncode != 0:
             print("STDOUT:", result.stdout)
@@ -251,18 +336,28 @@ class ICPXExtension(Extension):
     """Extension that will be built with icpx."""
     
     def __init__(self, name, sourcedir=""):
-        super().__init__(name, sources=[])
-        self.sourcedir = os.fspath(Path(sourcedir).resolve())
+        # setuptools requires Extension.sources to be relative to setup.py so
+        # they can be recorded in an sdist/wheel manifest.  The custom build
+        # command keeps an absolute root separately for invoking icpx.
+        source_root = Path(sourcedir)
+        if name.endswith("lgrf_sdp"):
+            sources = [source_root / "omni_xpu_kernel" / "lgrf_uni" / "sdp_kernels.cpp"]
+        elif name.endswith("cute_fmha_torch"):
+            sources = [source_root / "omni_xpu_kernel" / "cute" / "cute_fmha_torch.cpp"]
+        else:
+            sources = sorted((source_root / "omni_xpu_kernel" / "csrc").glob("*.cpp"))
+        super().__init__(name, sources=[source.as_posix() for source in sources])
+        self.sourcedir = os.fspath(source_root.resolve())
 
 
 # Read version
 def get_version():
-    version_file = Path(__file__).parent / "omni_xpu_kernel" / "__init__.py"
+    version_file = Path(__file__).parent / "omni_xpu_kernel" / "_version.py"
     with open(version_file) as f:
         for line in f:
             if line.startswith("__version__"):
                 return line.split("=")[1].strip().strip('"\'')
-    return "0.1.0"
+    raise RuntimeError(f"Unable to read __version__ from {version_file}")
 
 
 # Read README
@@ -272,6 +367,35 @@ def get_long_description():
         return readme.read_text(encoding="utf-8")
     return ""
 
+
+# Extension list. The cute (CUTLASS-SYCL) FMHA is Linux-only and required by
+# default so a normal build cannot silently omit the default attention backend.
+# Set OMNI_XPU_REQUIRE_CUTE=0 explicitly for a core-only build (including
+# Windows, where the CUTE extension is not supported).
+_ext_modules = [
+    ICPXExtension("omni_xpu_kernel._C", sourcedir="."),
+    ICPXExtension("omni_xpu_kernel.lgrf_uni.lgrf_sdp", sourcedir="."),
+]
+_cutlass_sycl_root = os.environ.get("CUTLASS_SYCL_ROOT", "")
+_cutlass_sycl_required = os.environ.get("OMNI_XPU_REQUIRE_CUTE", "1") != "0"
+_cutlass_sycl_dirs = ("include", "tools/util/include", "examples/common", "applications")
+_cutlass_sycl_available = bool(_cutlass_sycl_root) and all(
+    os.path.isdir(os.path.join(_cutlass_sycl_root, path)) for path in _cutlass_sycl_dirs
+)
+if _cutlass_sycl_required and IS_WINDOWS:
+    raise RuntimeError(
+        "CUTE is required by default but unsupported on Windows; "
+        "set OMNI_XPU_REQUIRE_CUTE=0 for an explicit core-only build"
+    )
+if _cutlass_sycl_required and not _cutlass_sycl_available:
+    raise RuntimeError(
+        "CUTE is required by default; set CUTLASS_SYCL_ROOT containing: "
+        + ", ".join(_cutlass_sycl_dirs)
+        + f"; got {_cutlass_sycl_root!r}"
+        + ". Set OMNI_XPU_REQUIRE_CUTE=0 only for an explicit core-only build."
+    )
+if not IS_WINDOWS and _cutlass_sycl_available:
+    _ext_modules.append(ICPXExtension("omni_xpu_kernel.cute.cute_fmha_torch", sourcedir="."))
 
 setup(
     name="omni_xpu_kernel",
@@ -283,10 +407,7 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/intel/omni_xpu_kernel",
     packages=find_packages(exclude=["tests", "scripts"]),
-    ext_modules=[
-        ICPXExtension("omni_xpu_kernel._C", sourcedir="."),
-        ICPXExtension("omni_xpu_kernel.lgrf_uni.lgrf_sdp", sourcedir=".")
-    ],
+    ext_modules=_ext_modules,
     cmdclass={"build_ext": ICPXBuildExt},
     python_requires=">=3.9",
     install_requires=[

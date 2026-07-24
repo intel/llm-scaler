@@ -707,8 +707,17 @@ struct MoE_GeluTanh_Mul_Kernel {
             // GELU_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
             simd<float, 64> x3 = x * x * x;
             simd<float, 64> inner = sqrt_2_over_pi * (x + coeff * x3);
-            // tanh(z) = (exp(2z) - 1) / (exp(2z) + 1)
-            simd<float, 64> exp2z = esimd_math::exp<float, 64>(2.0f * inner);
+            // tanh(z) = (exp(2z) - 1) / (exp(2z) + 1) overflows fp32 exp() for a
+            // gate value x>~11 (DiffusionGemma's unsharded TP=1 dense MLP has
+            // gate absmax ~40): exp(2z) -> inf -> inf/inf = NaN. tanh saturates
+            // to +/-1 by |z|>~15, so first SATURATE 2z into a safe range via an
+            // explicit mask-merge (robust to -ffast-math: no reliance on
+            // finite-math or on min/max intrinsics that the optimizer may treat
+            // as dead once it assumes finiteness), then take exp().
+            simd<float, 64> two_z = 2.0f * inner;
+            two_z.merge(simd<float, 64>(30.0f), two_z > 30.0f);
+            two_z.merge(simd<float, 64>(-30.0f), two_z < -30.0f);
+            simd<float, 64> exp2z = esimd_math::exp<float, 64>(two_z);
             simd<float, 64> tanh_val = (exp2z - 1.0f) / (exp2z + 1.0f);
             simd<float, 64> gelu = 0.5f * x * (1.0f + tanh_val);
             simd<float, 64> result = gelu * up;

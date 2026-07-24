@@ -13,9 +13,9 @@
 //   float_val = (nibble_unsigned - 8) * scale
 // ═══════════════════════════════════════════════════════════════════════════════
 
+#include <sycl/sycl.hpp>
 #include <torch/extension.h>
 #include <c10/xpu/XPUStream.h>
-#include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 
 #include <cstdint>

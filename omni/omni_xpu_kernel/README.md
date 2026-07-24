@@ -1,6 +1,11 @@
 # omni_xpu_kernel
 
-High-performance Intel XPU ESIMD kernels for PyTorch.
+High-performance Intel XPU kernels for PyTorch.
+
+The Kernel version and the `intel/llm-scaler-omni` image version share the
+single source in `omni_xpu_kernel/_version.py`. The current development version
+is `0.1.0-b8-dev`; Python packaging normalizes it to `0.1.0b8.dev0` in wheel
+metadata and filenames.
 
 ## Modules
 
@@ -33,11 +38,31 @@ output = sdp.sdp(q, k, v)
 **AOT compilation for target GPU:**
 ```bash
 # Default target: bmg (Arc B580)
+CUTLASS_SYCL_ROOT=/path/to/sycl-tla \
 OMNI_XPU_DEVICE=bmg pip install -e . --no-build-isolation
 
 # For other GPUs:
+CUTLASS_SYCL_ROOT=/path/to/sycl-tla \
 OMNI_XPU_DEVICE=pvc pip install -e . --no-build-isolation   # Data Center GPU Max
 ```
+
+### cute — CUTLASS-SYCL Flash Attention
+
+CUTLASS-SYCL fused Flash Attention with fp32 accumulation, AOT-compiled for
+the target GPU. The currently validated domain is B=1, unmasked self-attention
+with standard `1/sqrt(head_dim)` scaling, head dimension 128, equal Q/K/V head
+counts, and fp16 or bf16 inputs in `[B, L, H, D]` layout.
+
+```python
+from omni_xpu_kernel import cute
+
+if cute.is_available():
+    output = cute.sdp(q, k, v)
+```
+
+The CUTE extension is Linux-only and required by default. `CUTLASS_SYCL_ROOT`
+must point to a complete Intel `sycl-tla`/CUTLASS-SYCL source tree; otherwise
+the build fails instead of silently omitting the default attention backend.
 
 ### linear — FP8 GEMM (oneDNN W8A16)
 
@@ -54,6 +79,19 @@ output = linear.onednn_w8a16_fp8(x_fp16, weight_fp8, scales_f32, bias=bias)
 # Cache management
 linear.fp8_cache_clear()
 hits, misses, size = linear.fp8_cache_stats()
+```
+
+### fp8 — FP8 Quantization
+
+Per-tensor quantization, dequantization, and seed-data-driven stochastic
+rounding with Comfy Kitchen-compatible FP8 semantics.
+
+```python
+from omni_xpu_kernel import fp8
+
+quantized = fp8.quantize_per_tensor(x, scale, torch.float8_e4m3fn)
+restored = fp8.dequantize_per_tensor(quantized, scale, torch.bfloat16)
+rounded = fp8.stochastic_rounding(x, rng, torch.float8_e4m3fn)
 ```
 
 ### gguf — GGUF Dequantization
@@ -95,6 +133,9 @@ norm.fused_add_rms_norm(input, residual, weight, eps=1e-6)  # in-place
 
 # Fused RMSNorm + Linear projection (chains in C++, keeps data in L3 cache)
 output = norm.fused_rms_norm_linear(input, norm_weight, proj_weight, eps=1e-6)
+
+# LayerNorm followed by AdaLN scale/shift modulation
+output = norm.fused_adaln(input, scale, shift, row_repeat=1, eps=1e-6)
 ```
 
 ### svdq — SVDQuant W4A4
@@ -109,6 +150,8 @@ from omni_xpu_kernel import svdq
 dequantized = svdq.dequantize_w4(packed, scales, out_dtype=torch.bfloat16)
 unpacked = svdq.unpack_int4(packed, signed=True)
 packed_act, act_scales = svdq.quantize_act_int4(activation, group_size=64)
+packed_u4, u4_scales = svdq.quantize_act_uint4(nonnegative_activation, group_size=64)
+restored_u4 = svdq.dequantize_u4(packed_u4, u4_scales)
 
 # oneDNN INT4 GEMM (pre-convert weights once, then use preconverted variant)
 packed_u4, scales_f16 = svdq.prepare_onednn_weights(packed, wscales)
@@ -116,6 +159,69 @@ output = svdq.onednn_int4_gemm_preconverted(act_f16, packed_u4, scales_f16)
 
 # Fused f16->bf16 convert + add
 svdq.fused_convert_add(out_bf16, result_f16, residual_bf16)
+```
+
+### int8 — INT8 Quantization and Linear
+
+INT8 dynamic quantization and linear layer for ComfyUI INT8-ConvRot models.
+Uses oneDNN s8×s8→s32 GEMM with ESIMD fused quantization and scale-back.
+
+```python
+from omni_xpu_kernel import int8
+
+# Quantize weight offline
+w_int8, w_scale = int8.quantize_int8_tensorwise(weight)
+
+# INT8 linear (dynamic activation quantization + oneDNN GEMM + rescale)
+output = int8.int8_linear(x_bf16, w_int8, w_scale, bias=bias, out_dtype=torch.bfloat16)
+
+# Quantize once and reuse the activation across one or more Linear calls
+x_int8, x_scale = int8.quantize_int8_rowwise(x_bf16)
+output = int8.int8_linear_prequantized(
+    x_int8, x_scale, w_int8, w_scale,
+    bias=bias, out_dtype=torch.bfloat16,
+)
+
+# SwiGLU MLP: share the input quantization, then avoid the BF16 gate tensor
+gate, up = int8.int8_linear_shared_input(
+    x_bf16,
+    w1_int8, w1_scale,
+    w3_int8, w3_scale,
+    out_dtype=torch.bfloat16,
+)
+gated_int8, gated_scale = int8.fused_silu_mul_quantize_rowwise(gate, up)
+output = int8.int8_linear_prequantized(
+    gated_int8, gated_scale, w2_int8, w2_scale,
+    out_dtype=torch.bfloat16,
+)
+
+# ConvRot SwiGLU: remove the SiLU temporary, then reuse the XMX rotation
+gate, up = int8.int8_linear_shared_input(
+    x_bf16,
+    w1_convrot_int8, w1_scale,
+    w3_convrot_int8, w3_scale,
+    out_dtype=torch.bfloat16,
+    convrot=True, convrot_groupsize=256,
+)
+gated = int8.fused_silu_mul(gate, up)
+del gate, up
+rotated = int8.rotate_convrot(gated, group_size=256)
+del gated
+gated_int8, gated_scale = int8.quantize_int8_rowwise(rotated)
+output = int8.int8_linear_prequantized(
+    gated_int8, gated_scale, w2_convrot_int8, w2_scale,
+    out_dtype=torch.bfloat16,
+)
+
+# With ConvRot (Hadamard rotation for improved accuracy)
+output = int8.int8_linear(x, w_int8, w_scale, convrot=True, convrot_groupsize=256)
+
+# Native ConvRot weight preparation using a cached Hadamard matrix multiplication
+w_int8, w_scale = int8.quantize_int8_convrot_weight(weight, group_size=256)
+
+# Cache management
+int8.int8_cache_clear()
+stats = int8.int8_cache_stats()  # {"hits": ..., "misses": ..., "size": ...}
 ```
 
 ### rotary — Rotary Position Embedding
@@ -127,6 +233,10 @@ Supports head_dim 64 and 128.
 from omni_xpu_kernel import rotary
 
 output = rotary.rotary_emb(x, cos_cache, sin_cache, seq_len, heads)
+
+# Comfy Kitchen adjacent-pair and split-half semantics
+output = rotary.apply_kitchen_rope1(x, freqs_cis)
+output = rotary.apply_kitchen_rope_split_half1(x, freqs_cis)
 ```
 
 ## Requirements
@@ -135,18 +245,23 @@ output = rotary.rotary_emb(x, cos_cache, sin_cache, seq_len, heads)
 - PyTorch >= 2.0 with XPU support
 - Intel GPU: Arc B-series (BMG), Data Center GPU Max (PVC), or compatible
 - oneDNN (for INT4/FP8 GEMM; auto-detected from oneAPI)
+- Intel `sycl-tla`/CUTLASS-SYCL headers (for the default Linux CUTE FMHA)
 
 ## Installation
 
 ```bash
 source /opt/intel/oneapi/setvars.sh
 
-# Default: builds for Arc B580 (bmg)
+# Default Linux build: CUTE is mandatory. The build fails if the source tree
+# is missing or invalid.
+CUTLASS_SYCL_ROOT=/path/to/sycl-tla \
+OMNI_XPU_DEVICE=bmg \
 pip install -e . --no-build-isolation
 
-# Specify GPU target:
-OMNI_XPU_DEVICE=bmg pip install -e . --no-build-isolation   # Arc B580/B770
-OMNI_XPU_DEVICE=pvc pip install -e . --no-build-isolation   # Data Center GPU Max
+# Explicit core-only opt-out (also required for Windows builds):
+OMNI_XPU_REQUIRE_CUTE=0 \
+OMNI_XPU_DEVICE=bmg \
+pip install -e . --no-build-isolation
 ```
 
 On Windows, see [WHL_BUILD_INSTALL.md](WHL_BUILD_INSTALL.md).
@@ -195,11 +310,16 @@ python -m tests.benchmarks.run_all --rotary
 
 ## Architecture
 
-### SDP Kernel Compilation
+### Attention Kernel Compilation
 
 The SDP Flash Attention kernel uses ESIMD with doubleGRF and is compiled as a
 separate sidecar shared library (`lgrf_sdp.so`). AOT compilation targets a
 specific GPU via `-device <target>` (default: bmg).
+
+On Linux, the default build requires a valid `CUTLASS_SYCL_ROOT` and produces
+the CUTLASS-SYCL attention sidecar (`cute_fmha_torch.so`). Set
+`OMNI_XPU_REQUIRE_CUTE=0` only for an explicit core-only build. The remaining
+native operations are built into the main `_C` extension.
 
 Configuration is via `sdp_config.h`:
 - `ConfigBMG` — Arc B580 (default)
@@ -211,7 +331,7 @@ To switch config at compile time: `-DSDP_CONFIG_PVC`
 ### Build System
 
 The package builds multiple extension modules:
-- `_C.so` — Main extension (norm, gguf, svdq, rotary, sdp loader, fp8)
+- `_C.so` — Main extension (norm, gguf, svdq, rotary, sdp loader, fp8, int8)
 - `lgrf_sdp.so` — SDP ESIMD sidecar (AOT, doubleGRF)
 
 ## License

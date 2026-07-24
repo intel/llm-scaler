@@ -20,6 +20,13 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
   m.def("esimd_gemm_int4_pgrp(Tensor input, Tensor weight, Tensor weight_scale, "
         "Tensor output) -> Tensor");
   m.impl("esimd_gemm_int4_pgrp", torch::kXPU, &esimd_gemm_int4_pgrp);
+
+  // FP8 block-scaled GEMM: DeepSeek 128x128 weight block scale + fp16 activation.
+  // input [M, K] fp16, weight [N, K] fp8_e4m3, weight_scale [ceil(N/128), ceil(K/128)]
+  // fp32, output [M, N] fp16 pre-allocated.
+  m.def("esimd_gemm_fp8_blockscale(Tensor input, Tensor weight, Tensor weight_scale, "
+        "Tensor output, int block_n, int block_k) -> Tensor");
+  m.impl("esimd_gemm_fp8_blockscale", torch::kXPU, &esimd_gemm_fp8_blockscale);
 }
 
 PyMODINIT_FUNC PyInit_custom_esimd_kernels_gemm() {

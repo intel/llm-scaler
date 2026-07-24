@@ -1,0 +1,17 @@
+# Keep the docker build context free of local build artifacts so the image's
+# own `pip install` compiles everything cleanly against the image toolchain/ABI.
+# (A .so built inside a dev container can have a mismatched torch/oneAPI ABI.)
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Compiled extensions / build trees (rebuilt inside the image)
+**/*.so
+**/*.egg-info/
+**/build/
+**/dist/
+omni_xpu_kernel/build/
+
+# Local-only
+local_build.sh
+.git/
