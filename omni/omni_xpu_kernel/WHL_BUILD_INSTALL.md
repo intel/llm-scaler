@@ -25,33 +25,26 @@ set "OUTPUT_DIR=%WORKSPACE%\llm_scaler_dist"
 set "OMNI_XPU_DEVICE=bmg"
 ```
 
-## 2. Build (in conda environment)
-Build script location:
-- [scripts/build_llm_scaler_conda.cmd](scripts/build_llm_scaler_conda.cmd)
+## 2. Build in the configured conda environment
 
-Script contents (full example, with variables):
+Initialize Visual Studio and oneAPI using the paths from the local
+installation, then activate the conda environment that contains the selected
+PyTorch XPU version. The repository does not provide a machine-specific conda
+wrapper because the Visual Studio edition, oneAPI location, environment name,
+workspace, and output path are host configuration.
+
+Example commands:
 
 ```
 @echo off
-set "VS2022INSTALLDIR=C:\Program Files\Microsoft Visual Studio\18\Community"
-call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+call "<path-to-visual-studio>\Common7\Tools\VsDevCmd.bat"
+call "<path-to-oneapi>\setvars.bat"
 call C:\ProgramData\miniforge3\Scripts\activate.bat omni_env
-set "WORKSPACE=C:\workspace"
-set "LLM_SCALER_DIR=%WORKSPACE%\llm-scaler"
-set "EMBED_PYTHON_DIR=%WORKSPACE%\omni\comfyui_windows_setup\python_embeded"
-set "OUTPUT_DIR=%WORKSPACE%\llm_scaler_dist"
 set "OMNI_XPU_REQUIRE_CUTE=0"
 set "PATH=%CONDA_PREFIX%\Library\bin;%CONDA_PREFIX%\Lib\site-packages\torch\lib;%PATH%"
 cd /d %LLM_SCALER_DIR%\omni\omni_xpu_kernel
-python -m pip wheel . -w %OUTPUT_DIR% --no-build-isolation --no-deps > %WORKSPACE%\build_log.txt 2>&1
+python -m pip wheel . --wheel-dir %OUTPUT_DIR% --no-build-isolation --no-deps
 ```
-
-How to run the .cmd file (common options):
-- Double-click it in File Explorer.
-- From Command Prompt:
-  - `cmd /c scripts\build_llm_scaler_conda.cmd`
-- From PowerShell:
-  - `cmd /c "scripts\build_llm_scaler_conda.cmd"`
 
 Key points:
 - Initialize oneAPI: setvars.bat
