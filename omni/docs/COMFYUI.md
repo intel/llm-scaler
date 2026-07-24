@@ -43,8 +43,7 @@ exact file names and directory:
 
 The focused image deliberately does not copy `omni/workflows` or
 `omni/example_inputs`. This prevents stale workflow snapshots from replacing
-maintained upstream templates. The optional full image still contains the
-repository workflows needed by its additional node bundle.
+maintained upstream templates.
 
 ## Included custom nodes
 

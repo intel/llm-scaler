@@ -5,10 +5,6 @@ default image is a single-XPU ComfyUI environment with target-specific
 `omni_xpu_kernel` binaries, the XPU-enabled Comfy Kitchen backend, and a thin
 ComfyUI integration layer.
 
-The optional `full` image also contains Xinference and SGLang Diffusion. It is
-not the default build and is maintained separately from the focused ComfyUI
-runtime.
-
 ## Getting Started with the Omni Docker Image
 
 Build from the `omni` directory:
@@ -110,25 +106,6 @@ The focused image contains:
 The focused image does not include Xinference, SGLang Diffusion, the disabled
 audio/3D node bundle, repository workflow snapshots, or example input files.
 Use ComfyUI's Template Browser for maintained upstream workflows.
-
-## Optional full image
-
-Build the full image only when Xinference, SGLang Diffusion, or the optional
-workflow bundle is needed:
-
-```bash
-OMNI_IMAGE_FLAVOR=full XPU_TARGET=bmg bash build.sh
-```
-
-The resulting tag is:
-
-```text
-intel/llm-scaler-omni:<version>-full-<target>
-```
-
-The full image retains a broader dependency set and repository workflows. See
-the [SGLang Diffusion guide](docs/SGLang_Diffusion_Guide.md) and
-[SGLang Diffusion ComfyUI guide](docs/SGLang_Diffusion_ComfyUI_Guide.md).
 
 ## Build and component documentation
 

@@ -118,7 +118,7 @@ XPU_TARGET=bmg bash build.sh
 XPU_TARGET=ptl-h bash build.sh
 ```
 
-See the [Omni image documentation](../README.md) for image flavors, tags,
+See the [Omni image documentation](../README.md) for image tags,
 runtime setup, and acceptance checks.
 
 ### Build a standalone Linux wheel

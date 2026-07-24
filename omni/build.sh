@@ -43,39 +43,21 @@ esac
 BASE_IMAGE="${OMNI_BASE_IMAGE:-intel/omix:0.1.0-devel-ubuntu24.04}"
 BUILD_MAX_JOBS="${MAX_JOBS:-8}"
 IMAGE_REPOSITORY="${OMNI_IMAGE_REPOSITORY:-intel/llm-scaler-omni}"
-IMAGE_FLAVOR="${OMNI_IMAGE_FLAVOR:-comfyui}"
 KITCHEN_REPOSITORY="${COMFY_KITCHEN_REPOSITORY:-https://github.com/xiangyuT/comfy-kitchen-xpu.git}"
 KITCHEN_COMMIT="${COMFY_KITCHEN_COMMIT:-acdf65deace1b0ca3b436f45e560ed44f0c0d08f}"
 KITCHEN_VERSION="${COMFY_KITCHEN_VERSION:-0.2.18}"
 SYCL_TLA_REPOSITORY="${OMNI_SYCL_TLA_REPOSITORY:-https://github.com/intel/sycl-tla.git}"
 SYCL_TLA_COMMIT="${OMNI_SYCL_TLA_COMMIT:-2fc09973bfdf15755090fcb0e3b6ad236408a992}"
 
-case "${IMAGE_FLAVOR}" in
-    comfyui)
-        DOCKERFILE="${OMNI_DOCKERFILE:-./docker/Dockerfile}"
-        DOCKER_TARGET="${OMNI_DOCKER_TARGET:-runtime-comfyui}"
-        ;;
-    full)
-        DOCKERFILE="${OMNI_DOCKERFILE:-./docker/Dockerfile.full}"
-        DOCKER_TARGET="${OMNI_DOCKER_TARGET:-runtime}"
-        ;;
-    *)
-        echo "Unsupported image flavor '${IMAGE_FLAVOR}'; use comfyui or full" >&2
-        exit 1
-        ;;
-esac
-
-case "${DOCKERFILE}" in
-    /*) DOCKERFILE_PATH="${DOCKERFILE}" ;;
-    *) DOCKERFILE_PATH="${SCRIPT_DIR}/${DOCKERFILE#./}" ;;
-esac
+DOCKERFILE_PATH="${SCRIPT_DIR}/docker/Dockerfile"
+DOCKER_TARGET=runtime-comfyui
 
 if [ ! -f "${DOCKERFILE_PATH}" ]; then
     echo "Dockerfile not found: ${DOCKERFILE_PATH}" >&2
     exit 1
 fi
 
-IMAGE_NAME="${IMAGE_REPOSITORY}:${TAG}-${IMAGE_FLAVOR}-${DEVICE_TARGET}"
+IMAGE_NAME="${IMAGE_REPOSITORY}:${TAG}-comfyui-${DEVICE_TARGET}"
 
 cd "${SCRIPT_DIR}"
 
@@ -95,18 +77,12 @@ DOCKER_ARGS=(
     --build-arg "no_proxy=${NO_PROXY}"
 )
 
-if [ "${IMAGE_FLAVOR}" = "comfyui" ]; then
-    DOCKER_ARGS+=(
-        --build-arg "SYCL_TLA_REPOSITORY=${SYCL_TLA_REPOSITORY}"
-        --build-arg "SYCL_TLA_COMMIT=${SYCL_TLA_COMMIT}"
-        --build-arg "LLM_SCALER_SOURCE_REVISION=${SOURCE_REVISION}"
-        --build-arg "LLM_SCALER_SOURCE_DIRTY=${SOURCE_DIRTY}"
-    )
-else
-    DOCKER_ARGS+=(
-        --build-arg "INSTALL_DISABLED_NODES=${INSTALL_DISABLED_NODES:-true}"
-    )
-fi
+DOCKER_ARGS+=(
+    --build-arg "SYCL_TLA_REPOSITORY=${SYCL_TLA_REPOSITORY}"
+    --build-arg "SYCL_TLA_COMMIT=${SYCL_TLA_COMMIT}"
+    --build-arg "LLM_SCALER_SOURCE_REVISION=${SOURCE_REVISION}"
+    --build-arg "LLM_SCALER_SOURCE_DIRTY=${SOURCE_DIRTY}"
+)
 
 set -x
 DOCKER_BUILDKIT=1 docker build "${DOCKER_ARGS[@]}" .

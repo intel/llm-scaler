@@ -17,7 +17,6 @@ The supported environment overrides are:
 | Variable | Purpose | Default |
 |---|---|---|
 | `XPU_TARGET` | Native GPU build target | `bmg` |
-| `OMNI_IMAGE_FLAVOR` | `comfyui` or `full` | `comfyui` |
 | `OMNI_IMAGE_REPOSITORY` | Local image repository | `intel/llm-scaler-omni` |
 | `OMNI_BASE_IMAGE` | OMIX development base | `intel/omix:0.1.0-devel-ubuntu24.04` |
 | `MAX_JOBS` | Native build parallelism | `8` |
