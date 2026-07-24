@@ -69,6 +69,7 @@ from custom_esimd_kernels_vllm.ops import (
     moe_accumulate,
     moe_forward_fused,
     moe_forward_full,
+    moe_forward_full_fp8_block,
     # MoE INT4 Batch ops
     moe_router_forward_int4,
     moe_router_topk_int4,

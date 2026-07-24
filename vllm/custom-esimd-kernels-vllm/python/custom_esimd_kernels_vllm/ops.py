@@ -1001,6 +1001,42 @@ def moe_forward_full(
         top_k, num_shared_experts, n_routed_experts)
 
 
+def moe_forward_full_fp8_block(
+    x: torch.Tensor,
+    logits: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    shared_gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_down_scale: torch.Tensor,
+    shared_expert_gate_weight: torch.Tensor,
+    top_k: int,
+    num_shared_experts: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """Small-batch MoE decode for 128x128 offline FP8 block weights.
+
+    Supports 1 to 4 tokens and exactly one shared expert. Activations and the
+    caller-owned output are contiguous fp16 tensors. Weights are contiguous
+    ``float8_e4m3fn`` tensors with contiguous fp32 128x128 block scales;
+    hidden and intermediate dimensions must both be divisible by 128. All
+    tensors must be on the same XPU device. Routed scales have layout
+    ``[E, N/128, K/128]``; shared-expert scales omit the leading expert
+    dimension.
+    """
+    output = torch.empty_like(x)
+    return _moe_batch.moe_forward_full_fp8_block(
+        x, logits, output, gate_up_weight, gate_up_scale,
+        shared_gate_up_weight, shared_gate_up_scale,
+        down_weight, down_scale,
+        shared_down_weight, shared_down_scale,
+        shared_expert_gate_weight,
+        top_k, num_shared_experts, n_routed_experts)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MoE INT4 Batch ops
 # ═══════════════════════════════════════════════════════════════════════════════
