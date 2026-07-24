@@ -3,6 +3,8 @@ import logging
 import torch
 from torch import Tensor
 
+from .debug import log_debug_event, trace_patch
+
 log = logging.getLogger("ComfyUI-OmniXPU")
 
 _omni_rotary = None
@@ -36,6 +38,12 @@ def _omni_apply_rope1(x: Tensor, freqs_cis: Tensor):
     cos_cache = freqs_cis[0, 0, :S, :, 0, 0].to(dtype=torch.float32).contiguous()
     sin_cache = freqs_cis[0, 0, :S, :, 1, 0].to(dtype=torch.float32).contiguous()
     x_flat = x.permute(0, 2, 1, 3).contiguous().reshape(B * S * H, D)
+    log_debug_event(
+        "kernel",
+        "rotary_emb",
+        {"x": x_flat, "cos": cos_cache, "sin": sin_cache},
+        details={"backend": "esimd"},
+    )
     out = _omni_rotary.rotary_emb(x_flat, cos_cache, sin_cache, S, H)
     return out.reshape(B, S, H, D).permute(0, 2, 1, 3).contiguous()
 
@@ -53,6 +61,12 @@ def apply():
     # Save originals
     _orig_apply_rope1 = flux_math._apply_rope1
 
+    @trace_patch(
+        "rope._apply_rope1",
+        ("x", "freqs_cis"),
+        stage="dispatch",
+        verbose_only=True,
+    )
     def _patched_apply_rope1(x: Tensor, freqs_cis: Tensor):
         if _can_use(x) and x.ndim == 4 and freqs_cis.ndim == 6:
             return _omni_apply_rope1(x, freqs_cis)
@@ -65,6 +79,12 @@ def apply():
     if hasattr(flux_math, "apply_rope1"):
         _orig_compiled = flux_math.apply_rope1
 
+        @trace_patch(
+            "rope.apply_rope1",
+            ("x", "freqs_cis"),
+            stage="dispatch",
+            verbose_only=True,
+        )
         def _patched_compiled(x, freqs_cis):
             if _can_use(x) and x.ndim == 4 and freqs_cis.ndim == 6:
                 return _omni_apply_rope1(x, freqs_cis)
@@ -114,6 +134,12 @@ def apply():
     if hasattr(flux_math, "apply_rope"):
         _orig_apply_rope = flux_math.apply_rope
 
+        @trace_patch(
+            "rope.apply_rope",
+            ("xq", "xk", "freqs_cis"),
+            stage="dispatch",
+            verbose_only=True,
+        )
         def _patched_apply_rope(xq, xk, freqs_cis):
             if (_can_use(xq) and _can_use(xk) and xq.ndim == 4 and xk.ndim == 4
                     and freqs_cis.ndim == 6):

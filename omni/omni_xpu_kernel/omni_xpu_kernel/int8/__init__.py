@@ -7,6 +7,7 @@ Provides high-performance INT8 inference kernels matching comfy-kitchen's INT8 A
 - dequantize_int8_simple: INT8 dequantization with scale
 - dequantize_int8_simple_dtype: INT8 dequantization with output dtype
 - int8_linear: Dynamic INT8 linear layer (quant activation + INT8 GEMM + rescale)
+- int8_linear_prequantized: Scaled INT8 linear for a prequantized activation
 - mm_int8: Raw INT8 matrix multiplication (s8×s8→s32)
 - quantize_int8_convrot_weight: Offline ConvRot weight rotation + quantization
 - dequantize_int8_convrot_weight: ConvRot dequantization with inverse rotation
@@ -23,6 +24,13 @@ Example:
     # INT8 linear inference
     output = int8.int8_linear(x, w_int8, w_scale, bias=bias, out_dtype=torch.bfloat16)
 
+    # Reuse one activation quantization across one or more linear calls
+    x_int8, x_scale = int8.quantize_int8_rowwise(x)
+    output = int8.int8_linear_prequantized(
+        x_int8, x_scale, w_int8, w_scale, bias=bias,
+        out_dtype=torch.bfloat16,
+    )
+
     # With ConvRot
     output = int8.int8_linear(x, w_int8, w_scale, convrot=True, convrot_groupsize=256)
 """
@@ -33,10 +41,14 @@ from typing import Optional, Tuple
 from ._reference import (
     quantize_int8_tensorwise as _ref_quantize_int8_tensorwise,
     quantize_int8_rowwise as _ref_quantize_int8_rowwise,
+    fused_silu_mul_quantize_rowwise as _ref_fused_silu_mul_quantize_rowwise,
+    fused_silu_mul as _ref_fused_silu_mul,
     dequantize_int8_simple as _ref_dequantize_int8_simple,
     dequantize_int8_simple_dtype as _ref_dequantize_int8_simple_dtype,
     mm_int8 as _ref_mm_int8,
     int8_linear as _ref_int8_linear,
+    int8_linear_prequantized as _ref_int8_linear_prequantized,
+    int8_linear_shared_input as _ref_int8_linear_shared_input,
     quantize_int8_convrot_weight as _ref_quantize_int8_convrot_weight,
     dequantize_int8_convrot_weight as _ref_dequantize_int8_convrot_weight,
 )
@@ -97,9 +109,52 @@ def quantize_int8_rowwise(
             - scales: Float32 tensor [..., 1] with per-row scales
     """
     native = _get_native()
-    if native is not None and hasattr(native, "quantize_int8_rowwise"):
-        return native.quantize_int8_rowwise(x, stochastic_rounding)
+    if native is not None:
+        # The fused hot path is deterministic and specialized for matrix-like
+        # FP16/BF16 activations. Preserve the generic native API for 1D inputs,
+        # other floating dtypes, and explicit stochastic rounding.
+        if (
+            stochastic_rounding <= 0
+            and x.ndim >= 2
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and hasattr(native, "quantize_int8_rowwise_fused")
+        ):
+            return native.quantize_int8_rowwise_fused(x)
+        if hasattr(native, "quantize_int8_rowwise"):
+            return native.quantize_int8_rowwise(x, stochastic_rounding)
     return _ref_quantize_int8_rowwise(x, stochastic_rounding)
+
+
+def fused_silu_mul_quantize_rowwise(
+    x1: torch.Tensor,
+    x2: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fuse ``SiLU(x1) * x2`` with deterministic rowwise INT8 quantization.
+
+    The floating SwiGLU result is not materialized by the native path. The
+    returned quantized tensor and row scales can be passed directly to
+    :func:`int8_linear_prequantized`.
+    """
+    native = _get_native()
+    if native is not None and hasattr(native, "fused_silu_mul_quantize_rowwise"):
+        return native.fused_silu_mul_quantize_rowwise(x1, x2)
+    return _ref_fused_silu_mul_quantize_rowwise(x1, x2)
+
+
+def fused_silu_mul(
+    x1: torch.Tensor,
+    x2: torch.Tensor,
+) -> torch.Tensor:
+    """Fuse ``SiLU(x1) * x2`` while retaining one floating output tensor.
+
+    This boundary is useful before a required floating transform such as
+    ConvRot: it removes the separate SiLU allocation while preserving the
+    existing optimized transform implementation.
+    """
+    native = _get_native()
+    if native is not None and hasattr(native, "fused_silu_mul"):
+        return native.fused_silu_mul(x1, x2)
+    return _ref_fused_silu_mul(x1, x2)
 
 
 def dequantize_int8_simple(
@@ -223,6 +278,153 @@ def int8_linear(
     )
 
 
+def int8_linear_prequantized(
+    x_int8: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """INT8 linear layer for an already rowwise-quantized activation.
+
+    This API does not quantize the activation. It is intended for sharing one
+    activation quantization across multiple Linear calls and for consuming the
+    output of a fused producer such as SwiGLU-plus-quantize.
+
+    Args:
+        x_int8: Rowwise-quantized activation tensor [..., K] in INT8.
+        x_scale: One activation scale per flattened input row.
+        weight: INT8 weight tensor [N, K].
+        weight_scale: Weight scale (scalar or per-channel [N] or [N,1]).
+        bias: Optional bias tensor [N].
+        out_dtype: Output dtype (float32, float16, or bfloat16).
+
+    Returns:
+        Result tensor [..., N] in out_dtype.
+    """
+    dtype_code = {
+        torch.float32: 0,
+        torch.float16: 1,
+        torch.bfloat16: 2,
+    }.get(out_dtype)
+    if dtype_code is None:
+        raise ValueError(
+            f"Unsupported out_dtype: {out_dtype}. Supported: "
+            "float32, float16, bfloat16"
+        )
+
+    native = _get_native()
+    if native is not None and hasattr(native, "int8_linear_prequantized"):
+        return native.int8_linear_prequantized(
+            x_int8,
+            x_scale,
+            weight,
+            weight_scale,
+            bias,
+            dtype_code,
+        )
+    return _ref_int8_linear_prequantized(
+        x_int8,
+        x_scale,
+        weight,
+        weight_scale,
+        bias=bias,
+        out_dtype=out_dtype,
+    )
+
+
+def int8_linear_shared_input(
+    x: torch.Tensor,
+    weight1: torch.Tensor,
+    weight_scale1: torch.Tensor,
+    weight2: torch.Tensor,
+    weight_scale2: torch.Tensor,
+    bias1: Optional[torch.Tensor] = None,
+    bias2: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run two INT8 linear projections with one activation quantization.
+
+    ConvRot, when requested, is also applied once and therefore must be shared
+    by both weights.
+    """
+    if out_dtype is None:
+        out_dtype = x.dtype
+    dtype_code = {
+        torch.float32: 0,
+        torch.float16: 1,
+        torch.bfloat16: 2,
+    }.get(out_dtype)
+    if dtype_code is None:
+        raise ValueError(
+            f"Unsupported out_dtype: {out_dtype}. Supported: "
+            "float32, float16, bfloat16"
+        )
+
+    native = _get_native()
+    if native is not None and hasattr(native, "int8_linear_shared_input"):
+        if convrot:
+            if x.shape[-1] % convrot_groupsize != 0:
+                raise ValueError(
+                    f"ConvRot group size {convrot_groupsize} does not divide "
+                    f"input features {x.shape[-1]}"
+                )
+            if hasattr(native, "rotate_convrot"):
+                x = native.rotate_convrot(x, convrot_groupsize)
+            else:
+                from ._reference import _build_hadamard, _rotate_activation
+
+                h = _build_hadamard(
+                    convrot_groupsize, device=x.device, dtype=x.dtype
+                )
+                x = _rotate_activation(x, h, convrot_groupsize)
+        return native.int8_linear_shared_input(
+            x,
+            weight1,
+            weight_scale1,
+            weight2,
+            weight_scale2,
+            bias1,
+            bias2,
+            dtype_code,
+        )
+
+    return _ref_int8_linear_shared_input(
+        x,
+        weight1,
+        weight_scale1,
+        weight2,
+        weight_scale2,
+        bias1=bias1,
+        bias2=bias2,
+        out_dtype=out_dtype,
+        convrot=convrot,
+        convrot_groupsize=convrot_groupsize,
+    )
+
+
+def rotate_convrot(
+    x: torch.Tensor,
+    group_size: int = 256,
+) -> torch.Tensor:
+    """Apply the online groupwise Hadamard activation rotation."""
+    if x.shape[-1] % group_size != 0:
+        raise ValueError(
+            f"features {x.shape[-1]} not divisible by group_size {group_size}"
+        )
+    native = _get_native()
+    if native is not None and hasattr(native, "rotate_convrot"):
+        return native.rotate_convrot(x, group_size)
+
+    from ._reference import _build_hadamard, _rotate_activation
+
+    h = _build_hadamard(group_size, device=x.device, dtype=x.dtype)
+    return _rotate_activation(x, h, group_size)
+
+
 def quantize_int8_convrot_weight(
     weight: torch.Tensor,
     group_size: int = 256,
@@ -290,10 +492,15 @@ def int8_cache_stats() -> dict:
 __all__ = [
     "quantize_int8_tensorwise",
     "quantize_int8_rowwise",
+    "fused_silu_mul_quantize_rowwise",
+    "fused_silu_mul",
     "dequantize_int8_simple",
     "dequantize_int8_simple_dtype",
     "mm_int8",
     "int8_linear",
+    "int8_linear_prequantized",
+    "int8_linear_shared_input",
+    "rotate_convrot",
     "quantize_int8_convrot_weight",
     "dequantize_int8_convrot_weight",
     "int8_cache_clear",

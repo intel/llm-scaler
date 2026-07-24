@@ -222,6 +222,53 @@ def quantize_int8_rowwise(
     return q, scale
 
 
+def fused_silu_mul_quantize_rowwise(
+    x1: torch.Tensor,
+    x2: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reference SwiGLU followed by deterministic rowwise INT8 quantization."""
+    if x1.shape != x2.shape:
+        raise ValueError(
+            f"x1 and x2 must have identical shapes, got {x1.shape} and {x2.shape}"
+        )
+    if x1.dtype != x2.dtype:
+        raise ValueError(
+            f"x1 and x2 must have identical dtypes, got {x1.dtype} and {x2.dtype}"
+        )
+    if x1.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"x1 and x2 must be float16 or bfloat16, got {x1.dtype}")
+
+    gated = torch.nn.functional.silu(x1) * x2
+    if gated.dtype == torch.float16:
+        gated = torch.nan_to_num(
+            gated, nan=0.0, posinf=65504.0, neginf=-65504.0
+        )
+    return quantize_int8_rowwise(gated)
+
+
+def fused_silu_mul(
+    x1: torch.Tensor,
+    x2: torch.Tensor,
+) -> torch.Tensor:
+    """Reference fused SwiGLU floating boundary."""
+    if x1.shape != x2.shape:
+        raise ValueError(
+            f"x1 and x2 must have identical shapes, got {x1.shape} and {x2.shape}"
+        )
+    if x1.dtype != x2.dtype:
+        raise ValueError(
+            f"x1 and x2 must have identical dtypes, got {x1.dtype} and {x2.dtype}"
+        )
+    if x1.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"x1 and x2 must be float16 or bfloat16, got {x1.dtype}")
+    output = torch.nn.functional.silu(x1) * x2
+    if output.dtype == torch.float16:
+        output = torch.nan_to_num(
+            output, nan=0.0, posinf=65504.0, neginf=-65504.0
+        )
+    return output
+
+
 # =============================================================================
 # Dequantization
 # =============================================================================
@@ -381,8 +428,150 @@ def dequantize_int8_convrot_weight(
 
 
 # =============================================================================
-# INT8 Linear (Full Inference Path)
+# INT8 Linear
 # =============================================================================
+
+
+def int8_linear_prequantized(
+    x_int8: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """INT8 linear layer for an already rowwise-quantized activation.
+
+    Args:
+        x_int8: Rowwise-quantized activation [..., K] in INT8.
+        x_scale: One activation scale per flattened input row.
+        weight: INT8 weight [N, K].
+        weight_scale: Scalar or per-channel [N] or [N,1] weight scale.
+        bias: Optional bias [N].
+        out_dtype: Output dtype (float32, float16, or bfloat16).
+
+    Returns:
+        Result tensor [..., N].
+    """
+    if x_int8.ndim < 1:
+        raise ValueError("x_int8 must have at least one dimension")
+    if weight.ndim != 2:
+        raise ValueError(f"weight must be 2D [N, K], got {weight.ndim}D")
+    if x_int8.dtype != torch.int8:
+        raise ValueError(f"x_int8 must be int8, got {x_int8.dtype}")
+    if weight.dtype != torch.int8:
+        raise ValueError(f"weight must be int8, got {weight.dtype}")
+    if x_int8.shape[-1] != weight.shape[-1]:
+        raise ValueError(
+            "Input and weight inner dimensions must match, "
+            f"got {x_int8.shape[-1]} and {weight.shape[-1]}"
+        )
+    if x_int8.shape[-1] == 0:
+        raise ValueError("x_int8.shape[-1] must be greater than zero")
+    if weight.shape[0] == 0:
+        raise ValueError("weight.shape[0] must be greater than zero")
+    if out_dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"Unsupported out_dtype: {out_dtype}. Supported: "
+            "float32, float16, bfloat16"
+        )
+
+    orig_shape = x_int8.shape
+    x_2d = x_int8.reshape(-1, x_int8.shape[-1]).contiguous()
+    m = x_2d.shape[0]
+    n = weight.shape[0]
+
+    x_scale = x_scale.to(device=x_int8.device, dtype=torch.float32).reshape(-1)
+    if x_scale.numel() != m:
+        raise ValueError(
+            f"x_scale must contain one value per flattened activation row (M={m}), "
+            f"got {x_scale.numel()}"
+        )
+
+    weight = weight.to(device=x_int8.device).contiguous()
+    weight_scale = weight_scale.to(
+        device=x_int8.device, dtype=torch.float32
+    ).reshape(-1)
+    if weight_scale.numel() not in (1, n):
+        raise ValueError(
+            "INT8 weight scale must be scalar or per-output-channel, "
+            f"got {tuple(weight_scale.shape)} for weight shape {tuple(weight.shape)}"
+        )
+    if bias is not None and bias.numel() != n:
+        raise ValueError(
+            f"bias must contain one value per output channel (N={n}), "
+            f"got {bias.numel()}"
+        )
+
+    # INT8 GEMM — x_int8 [M, K] @ weight^T [K, N]
+    result = mm_int8(x_2d, weight.T.contiguous())
+
+    # Rescale in bounded chunks to avoid a large float32 intermediate.
+    chunk_size = max(1, min(m, 256 * 1024 * 1024 // max(1, n * 4)))
+    weight_scale_row = weight_scale.reshape(1, -1)
+    bias_f32 = None
+    if bias is not None:
+        bias_f32 = bias.to(device=x_int8.device, dtype=torch.float32).reshape(1, -1)
+    scaled_parts = []
+    for i in range(0, m, chunk_size):
+        end_i = min(i + chunk_size, m)
+        chunk = result[i:end_i].float()
+        chunk_scales = x_scale[i:end_i].reshape(-1, 1) * weight_scale_row
+        chunk_scaled = chunk * chunk_scales
+        if bias_f32 is not None:
+            chunk_scaled = chunk_scaled + bias_f32
+        scaled_parts.append(chunk_scaled.to(out_dtype))
+
+    if scaled_parts:
+        result = torch.cat(scaled_parts, dim=0)
+    else:
+        result = torch.empty((0, n), device=x_int8.device, dtype=out_dtype)
+
+    return result.reshape(*orig_shape[:-1], n)
+
+
+def int8_linear_shared_input(
+    x: torch.Tensor,
+    weight1: torch.Tensor,
+    weight_scale1: torch.Tensor,
+    weight2: torch.Tensor,
+    weight_scale2: torch.Tensor,
+    bias1: Optional[torch.Tensor] = None,
+    bias2: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Two INT8 linear projections sharing one rowwise activation quantization."""
+    if out_dtype is None:
+        out_dtype = x.dtype
+    if convrot:
+        if x.shape[-1] % convrot_groupsize != 0:
+            raise ValueError(
+                f"ConvRot group size {convrot_groupsize} does not divide "
+                f"input features {x.shape[-1]}"
+            )
+        h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        x = _rotate_activation(x, h, convrot_groupsize)
+
+    x_int8, x_scale = quantize_int8_rowwise(x)
+    output1 = int8_linear_prequantized(
+        x_int8,
+        x_scale,
+        weight1,
+        weight_scale1,
+        bias=bias1,
+        out_dtype=out_dtype,
+    )
+    output2 = int8_linear_prequantized(
+        x_int8,
+        x_scale,
+        weight2,
+        weight_scale2,
+        bias=bias2,
+        out_dtype=out_dtype,
+    )
+    return output1, output2
 
 
 def int8_linear(
@@ -424,14 +613,6 @@ def int8_linear(
             f"got {x.shape[-1]} and {weight.shape[-1]}"
         )
 
-    weight = weight.to(device=x.device).contiguous()
-    weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1)
-    if weight_scale.numel() not in (1, weight.shape[0]):
-        raise ValueError(
-            f"INT8 weight scale must be scalar or per-output-channel, "
-            f"got {tuple(weight_scale.shape)} for weight shape {tuple(weight.shape)}"
-        )
-
     # Step 1: Optional ConvRot rotation
     if convrot:
         if x.shape[-1] % convrot_groupsize != 0:
@@ -448,32 +629,12 @@ def int8_linear(
     # Step 2: Quantize activation per-row
     x_8, x_scale = quantize_int8_rowwise(x_2d)
 
-    # Step 3: INT8 GEMM — x_8 [M, K] @ weight^T [K, N]
-    result = mm_int8(x_8, weight.T.contiguous())
-
-    # Step 4: Rescale with chunked approach to avoid OOM on large models
-    m, n = result.shape
-    chunk_size = max(1, min(m, 256 * 1024 * 1024 // (n * 4)))
-
-    weight_scale_row = weight_scale.reshape(1, -1)
-    scaled_parts = []
-    for i in range(0, m, chunk_size):
-        end_i = min(i + chunk_size, m)
-        chunk = result[i:end_i].float()
-
-        # Combined scale: x_scale[i:end_i] * weight_scale
-        chunk_scales = (
-            x_scale[i:end_i].to(device=chunk.device, dtype=torch.float32)
-            * weight_scale_row
-        )
-        chunk_scaled = chunk * chunk_scales
-        chunk_scaled = chunk_scaled.to(out_dtype)
-        scaled_parts.append(chunk_scaled)
-
-    result = torch.cat(scaled_parts, dim=0)
-
-    # Step 5: Optional bias
-    if bias is not None:
-        result = result + bias.to(device=result.device, dtype=result.dtype).reshape(1, -1)
-
-    return result.reshape(*orig_shape[:-1], weight.shape[0])
+    # Steps 3-5: scaled INT8 GEMM and optional bias.
+    return int8_linear_prequantized(
+        x_8,
+        x_scale,
+        weight,
+        weight_scale,
+        bias=bias,
+        out_dtype=out_dtype,
+    ).reshape(*orig_shape[:-1], weight.shape[0])

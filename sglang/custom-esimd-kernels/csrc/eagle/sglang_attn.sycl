@@ -1,0 +1,233 @@
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// sglang_attn.sycl
+// =================
+// 2-phase split-K decode attention for sglang's flat-NHD KV layout.
+// Registers `sglang_decode_attn` as a torch op.
+
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+
+#include "sglang_decode_attn.h"
+
+namespace esimd = sycl::ext::intel::esimd;
+using fp16 = sycl::half;
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+// Distinct kernel-name classes per (Phase, KvT) — required by SYCL 2020.
+// Declared at namespace scope (not inside a template body) so each tag has a
+// single, unambiguous mangled name; otherwise icpx emits "redefinition of
+// 'KernelInfo<...>'" on the second template instantiation.
+class SglangDecodeAttnP1Fp16;
+class SglangDecodeAttnP1Bf16;
+class SglangDecodeAttnP2;
+
+template <typename KvT> struct Phase1Tag;
+template <> struct Phase1Tag<fp16> { using name = SglangDecodeAttnP1Fp16; };
+template <> struct Phase1Tag<bf16> { using name = SglangDecodeAttnP1Bf16; };
+
+namespace {
+
+// Phase 2 launcher (dtype-independent): merge n_splits partials.
+inline void launch_sglang_decode_attn_phase2(
+    const float* m_part,
+    const float* l_part,
+    const float* o_part,
+    fp16* out_ptr,
+    uint32_t batches,
+    uint32_t Hq,
+    uint32_t n_splits,
+    sycl::queue& queue) {
+    sycl::range<2> p2_global(batches, Hq);
+    sycl::range<2> p2_local(1, 1);
+    sycl::nd_range<2> p2_range(p2_global, p2_local);
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<SglangDecodeAttnP2>(
+            p2_range,
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                uint32_t batch = item.get_global_id(0);
+                uint32_t q_head = item.get_global_id(1);
+                sgl_esimd::sglang_decode_attn_phase2_impl(
+                    m_part, l_part, o_part, out_ptr,
+                    batch, q_head, Hq, n_splits);
+            });
+    });
+}
+
+template <typename KvT>
+void launch_sglang_decode_attn(
+    const fp16* q_ptr,
+    const KvT*  k_buf,
+    const KvT*  v_buf,
+    const uint32_t* kv_indptr,
+    const uint32_t* kv_indices,
+    fp16* out_ptr,
+    float* m_part,
+    float* l_part,
+    float* o_part,
+    uint32_t batches,
+    uint32_t Hq,
+    uint32_t Hkv,
+    uint32_t gqa_ratio,
+    uint32_t n_splits,
+    float    sm_scale,
+    sycl::queue& queue) {
+
+    // Phase 1: (batches, Hq, n_splits) work-items, one slot of partial stats each.
+    sycl::range<3> p1_global(batches, Hq, n_splits);
+    sycl::range<3> p1_local(1, 1, 1);
+    sycl::nd_range<3> p1_range(p1_global, p1_local);
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<typename Phase1Tag<KvT>::name>(
+            p1_range,
+            [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
+                uint32_t batch = item.get_global_id(0);
+                uint32_t q_head = item.get_global_id(1);
+                uint32_t split = item.get_global_id(2);
+                sgl_esimd::sglang_decode_attn_phase1_impl<KvT>(
+                    q_ptr, k_buf, v_buf, kv_indptr, kv_indices,
+                    m_part, l_part, o_part,
+                    batch, q_head, split,
+                    Hq, Hkv, gqa_ratio, n_splits, sm_scale);
+            });
+    });
+
+    // Phase 2 (dtype-independent) — launched via standalone function so the
+    // kernel-name class only appears once in the TU.
+    launch_sglang_decode_attn_phase2(
+        m_part, l_part, o_part, out_ptr,
+        batches, Hq, n_splits, queue);
+}
+
+}  // namespace
+
+// Public entry point.
+//
+// `temp_p` (optional): pre-allocated float32 scratch buffer holding the
+//   phase-1 partial accumulators. Sized to fit the caller's worst-case
+//   (batches, Hq, n_splits_max). When provided we slice into it instead of
+//   allocating fresh — required so XPUGraph capture sees a stable data_ptr
+//   across replays. When None, falls back to per-call allocation (legacy).
+//
+// `max_seq_len` (optional, >0): caller-provided upper bound on KV length
+//   so n_splits can be computed host-side without copying kv_indptr off
+//   device. When <=0, we fall back to the legacy `.cpu()` scan — that path
+//   breaks XPUGraph capture but is fine for eager runs.
+void sglang_decode_attn(
+    torch::Tensor q,
+    torch::Tensor k_buffer,
+    torch::Tensor v_buffer,
+    torch::Tensor kv_indptr,
+    torch::Tensor kv_indices,
+    torch::Tensor& out,
+    double sm_scale_d,
+    c10::optional<torch::Tensor> temp_p = c10::nullopt,
+    int64_t max_seq_len = -1) {
+
+    TORCH_CHECK(q.dim() == 3 && out.dim() == 3,
+                "q/out must be [B, Hq, head_dim]");
+    TORCH_CHECK(k_buffer.dim() == 3 && v_buffer.dim() == 3,
+                "k_buffer/v_buffer must be [n_slots, Hkv, head_dim]");
+    TORCH_CHECK(q.size(2) == 256 && k_buffer.size(2) == 256 && v_buffer.size(2) == 256,
+                "head_dim must be 256");
+    TORCH_CHECK(q.scalar_type() == torch::kHalf, "q must be fp16");
+    TORCH_CHECK(out.scalar_type() == torch::kHalf, "out must be fp16");
+    TORCH_CHECK(kv_indptr.scalar_type() == torch::kInt32);
+    TORCH_CHECK(kv_indices.scalar_type() == torch::kInt32);
+
+    const uint32_t batches = q.size(0);
+    const uint32_t Hq      = q.size(1);
+    const uint32_t Hkv     = k_buffer.size(1);
+    TORCH_CHECK(Hq % Hkv == 0, "Hq must be divisible by Hkv");
+    const uint32_t gqa_ratio = Hq / Hkv;
+
+    // Compute n_splits. Prefer the caller-provided max_seq_len so we never
+    // hit a device->host sync (which would break XPUGraph capture).
+    constexpr uint32_t SPLIT_TILE = 64;
+    uint32_t max_len;
+    if (max_seq_len > 0) {
+        max_len = (uint32_t)max_seq_len;
+    } else {
+        auto indptr_cpu = kv_indptr.cpu();
+        int32_t* ip = indptr_cpu.data_ptr<int32_t>();
+        max_len = 0;
+        for (uint32_t b = 0; b < batches; ++b) {
+            uint32_t L = (uint32_t)(ip[b + 1] - ip[b]);
+            if (L > max_len) max_len = L;
+        }
+    }
+    uint32_t n_splits = (max_len + SPLIT_TILE - 1) / SPLIT_TILE;
+    if (n_splits == 0) n_splits = 1;
+    TORCH_CHECK(n_splits <= 256, "n_splits exceeds MAX_SPLITS (=256)");
+
+    // Phase-1 scratch. Reuse caller-provided buffer when available.
+    auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(q.device());
+    torch::Tensor m_part, l_part, o_part;
+    if (temp_p.has_value() && temp_p->defined()) {
+        const torch::Tensor& tp = *temp_p;
+        TORCH_CHECK(tp.scalar_type() == torch::kFloat32 && tp.is_contiguous(),
+                    "temp_p must be contiguous float32");
+        const int64_t need_m = (int64_t)batches * Hq * n_splits;
+        const int64_t need_l = need_m;
+        const int64_t need_o = need_m * 256;
+        const int64_t need_total = need_m + need_l + need_o;
+        TORCH_CHECK(tp.numel() >= need_total,
+                    "temp_p too small: need ", need_total, " elems, got ", tp.numel());
+        float* base = tp.data_ptr<float>();
+        m_part = torch::from_blob(base,                       {batches, Hq, n_splits},      opts_f32);
+        l_part = torch::from_blob(base + need_m,              {batches, Hq, n_splits},      opts_f32);
+        o_part = torch::from_blob(base + need_m + need_l,     {batches, Hq, n_splits, 256}, opts_f32);
+    } else {
+        m_part = torch::empty({batches, Hq, n_splits}, opts_f32);
+        l_part = torch::empty({batches, Hq, n_splits}, opts_f32);
+        o_part = torch::empty({batches, Hq, n_splits, 256}, opts_f32);
+    }
+
+    sycl::queue& queue =
+        c10::xpu::getCurrentXPUStream(q.device().index()).queue();
+
+    const fp16*     q_ptr      = (const fp16*)q.data_ptr();
+    const uint32_t* indptr_ptr = (const uint32_t*)kv_indptr.data_ptr();
+    const uint32_t* idx_ptr    = (const uint32_t*)kv_indices.data_ptr();
+    fp16*           out_ptr    = (fp16*)out.data_ptr();
+    float*          m_p        = m_part.data_ptr<float>();
+    float*          l_p        = l_part.data_ptr<float>();
+    float*          o_p        = o_part.data_ptr<float>();
+
+    if (k_buffer.scalar_type() == torch::kHalf) {
+        launch_sglang_decode_attn<fp16>(
+            q_ptr, (const fp16*)k_buffer.data_ptr(), (const fp16*)v_buffer.data_ptr(),
+            indptr_ptr, idx_ptr, out_ptr,
+            m_p, l_p, o_p,
+            batches, Hq, Hkv, gqa_ratio, n_splits,
+            (float)sm_scale_d, queue);
+    } else if (k_buffer.scalar_type() == torch::kBFloat16) {
+        launch_sglang_decode_attn<bf16>(
+            q_ptr, (const bf16*)k_buffer.data_ptr(), (const bf16*)v_buffer.data_ptr(),
+            indptr_ptr, idx_ptr, out_ptr,
+            m_p, l_p, o_p,
+            batches, Hq, Hkv, gqa_ratio, n_splits,
+            (float)sm_scale_d, queue);
+    } else {
+        TORCH_CHECK(false, "k_buffer dtype must be fp16 or bf16, got ",
+                    k_buffer.scalar_type());
+    }
+}
+
+TORCH_LIBRARY_FRAGMENT(sgl_esimd_attn, m) {
+    m.def("sglang_decode_attn(Tensor q, Tensor k_buffer, Tensor v_buffer, "
+          "Tensor kv_indptr, Tensor kv_indices, Tensor! out, "
+          "float sm_scale, Tensor(a!)? temp_p=None, "
+          "int max_seq_len=-1) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(sgl_esimd_attn, XPU, m) {
+    m.impl("sglang_decode_attn", &sglang_decode_attn);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("sglang_decode_attn", &sglang_decode_attn, "sglang flat-NHD decode attn");
+}

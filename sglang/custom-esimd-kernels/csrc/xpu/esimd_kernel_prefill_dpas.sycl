@@ -1,0 +1,115 @@
+/* esimd_kernel_prefill_dpas.sycl — SYCL compilation unit for the
+ * sdp_paged_prefill_dpas kernel ONLY. Compiled with -doubleGRF (256
+ * registers/thread) so the kernel's heavy register state (A_tile=4096B,
+ * ST_tile/ST_next=2*2048B, etc.) doesn't spill at default small-GRF
+ * (128 reg/thread = 4096B/thread).
+ *
+ * Splitting this kernel into its own unit keeps the rest of
+ * esimd_kernel.sycl at single-GRF (better thread occupancy for
+ * GEMV/norm/etc.) while letting prefill_dpas use 2x the register file.
+ *
+ * Result on PTL Xe3 (Qwen3.5 HD=256, n_q=16, n_kv=2): substantially lower
+ * prefill latency and higher XMX throughput at both short and long KV.
+ */
+
+#include <ATen/ATen.h>
+#include <ATen/Parallel.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/python.h>
+
+#include <cstdint>
+#include <sycl/sycl.hpp>
+
+#include "esimd_kernels/prefill_dpas.h"
+
+// File-local helper (mirrored from esimd_kernel.sycl).
+static inline sycl::queue& get_device_queue(const at::Tensor& tensor) {
+    return c10::xpu::getCurrentXPUStream(tensor.device().index()).queue();
+}
+
+// SDPA Prefill DPAS — FA-2 style block-attention prefill kernel
+// (q_len > 1). Uses the windows-tree DPAS kernel ported in task #135.
+//
+// Same input/output tensor layout as esimd_sdpa_decode_varlen, plus
+// `seq_lens` (i32 [batch]) — equivalent to seqused_k but mandatory here.
+at::Tensor esimd_sdpa_prefill_dpas(
+    at::Tensor q,                       // [total_q, n_heads, HD=256]
+    at::Tensor key_cache,               // [num_blocks, block_size, n_kv_heads, HD]
+    at::Tensor value_cache,             // [num_blocks, block_size, n_kv_heads, HD]
+    at::Tensor cu_seqlens_q,            // [batch + 1]  int32
+    at::Tensor seq_lens,                // [batch] int32 (full KV length per req)
+    bool is_causal,
+    std::optional<double> scale,
+    at::Tensor block_table)             // [batch, max_blocks_per_seq] int32
+{
+    const int total_q    = q.size(0);
+    const int n_heads    = q.size(1);
+    const int hd         = q.size(2);
+    const int block_size = key_cache.size(1);
+    const int n_kv_heads = key_cache.size(2);
+    const int batch      = cu_seqlens_q.size(0) - 1;
+    const int max_nblks  = block_table.size(1);
+
+    TORCH_CHECK(hd == 256,
+        "esimd_sdpa_prefill_dpas: head_dim must be 256, got ", hd);
+    TORCH_CHECK(q.scalar_type() == key_cache.scalar_type());
+    TORCH_CHECK(q.scalar_type() == value_cache.scalar_type());
+    TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt);
+    TORCH_CHECK(seq_lens.scalar_type() == at::kInt);
+    TORCH_CHECK(block_table.scalar_type() == at::kInt);
+
+    float sc = scale.has_value()
+        ? (float)scale.value()
+        : (1.0f / std::sqrt((float)hd));
+
+    auto out = at::empty_like(q);
+    auto& dpcpp_queue = get_device_queue(q);
+
+    // KV strides (in elements; same for K and V tensors — same layout)
+    int64_t kv_stride_block = key_cache.stride(0);
+    int64_t kv_stride_pos   = key_cache.stride(1);
+    int64_t kv_stride_head  = key_cache.stride(2);
+
+    auto* q_us  = reinterpret_cast<const unsigned short*>(q.data_ptr());
+    auto* kc_us = reinterpret_cast<const unsigned short*>(key_cache.data_ptr());
+    auto* vc_us = reinterpret_cast<const unsigned short*>(value_cache.data_ptr());
+    auto* o_us  = reinterpret_cast<unsigned short*>(out.data_ptr());
+    auto* bt_i  = reinterpret_cast<const int*>(block_table.data_ptr());
+    auto* sl_i  = reinterpret_cast<const int*>(seq_lens.data_ptr());
+    auto* qsl_i = reinterpret_cast<const int*>(cu_seqlens_q.data_ptr());
+
+    bool is_bf16 = (q.scalar_type() == at::ScalarType::BFloat16);
+
+    if (is_bf16) {
+        if (is_causal)
+            sdp_paged_prefill_dpas_host<true, true>(
+                q_us, kc_us, vc_us, o_us, bt_i, sl_i, qsl_i,
+                n_heads, n_kv_heads, hd, block_size, max_nblks,
+                kv_stride_block, kv_stride_pos, kv_stride_head,
+                sc, total_q, batch, dpcpp_queue);
+        else
+            sdp_paged_prefill_dpas_host<true, false>(
+                q_us, kc_us, vc_us, o_us, bt_i, sl_i, qsl_i,
+                n_heads, n_kv_heads, hd, block_size, max_nblks,
+                kv_stride_block, kv_stride_pos, kv_stride_head,
+                sc, total_q, batch, dpcpp_queue);
+    } else if (q.scalar_type() == at::kHalf) {
+        if (is_causal)
+            sdp_paged_prefill_dpas_host<false, true>(
+                q_us, kc_us, vc_us, o_us, bt_i, sl_i, qsl_i,
+                n_heads, n_kv_heads, hd, block_size, max_nblks,
+                kv_stride_block, kv_stride_pos, kv_stride_head,
+                sc, total_q, batch, dpcpp_queue);
+        else
+            sdp_paged_prefill_dpas_host<false, false>(
+                q_us, kc_us, vc_us, o_us, bt_i, sl_i, qsl_i,
+                n_heads, n_kv_heads, hd, block_size, max_nblks,
+                kv_stride_block, kv_stride_pos, kv_stride_head,
+                sc, total_q, batch, dpcpp_queue);
+    } else {
+        TORCH_CHECK(false,
+            "esimd_sdpa_prefill_dpas: unsupported dtype (expected fp16 or bf16)");
+    }
+
+    return out;
+}

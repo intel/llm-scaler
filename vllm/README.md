@@ -25,9 +25,9 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    2.9 [Multi-node Distributed Deployment (PP/TP)](#29-multi-node-distributed-deployment-pptp)  
    2.10 [BPE-Qwen Tokenizer](#210-bpe-qwen-tokenizer)  
    2.11 [Load Balancer Solution](#211-load-balancer-solution)
-4. [Supported Models](#3-supported-models)  
-5. [Troubleshooting](#4-troubleshooting)
-6. [Performance tuning](#5-performance-tuning)
+3. [Supported Models](#3-supported-models)
+4. [Troubleshooting](#4-troubleshooting)
+5. [Performance tuning](#5-performance-tuning)
 
 ---
 
@@ -1118,8 +1118,8 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | Qwen/Qwen3-235B-A22B                       |      |         ✅         |                      |       |                           |
 | Qwen/Qwen3-Coder-30B-A3B-Instruct          |  ✅  |         ✅         |          ✅          |       |                           |
 | Qwen/Qwen3-Coder-Next                      |  ✅  |         ✅         |                    |       |                           |
-| Qwen/Qwen3.5/3.6-27B                       |  ✅  |         ✅         |          ✅          |       |                           |
-| Qwen/Qwen3.5/3.6-35B-A3B                   |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3.6-27B                           |  ✅  |         ✅         |          ✅          |       | LoRA supported, see [LoRA Serving](#34-lora-adapter-serving) |
+| Qwen/Qwen3.6-35B-A3B                       |  ✅  |         ✅         |          ✅          |       | LoRA supported, see [LoRA Serving](#34-lora-adapter-serving) |
 | Qwen/Qwen3.5-122B-A10B                     |      |         ✅         |          ✅          |       |                           |
 | Qwen/QwQ-32B                               |  ✅  |         ✅         |          ✅          |       |                           |
 | mistralai/Ministral-8B-Instruct-2410       |  ✅  |         ✅         |          ✅          |       |                           |
@@ -1289,6 +1289,76 @@ export VLLM_USE_V1=1
 export DGEMMA_FUSED_CAUSAL=1 
 
 vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.8 --max-num-batched-tokens 8192 --max-model-len 90000 --block-size 64 --dtype float16 --mamba-ssm-cache-dtype float16 --model /llm/models/diffusiongemma-26B-A4B-it/ --served-model-name diffusiongemma-26B-A4B-it --tensor-parallel-size 2 --quantization fp8 --max-num-seqs 4 --attention-backend FLASH_ATTN --diffusion-config '{"canvas_length":256,"max_denoising_steps":16}' --hf-overrides '{"diffusion_sampler":"entropy_bound","diffusion_entropy_bound":0.1,"diffusion_confidence_threshold":0.0}' --trust-remote-code 
+```
+
+### 3.4 LoRA Adapter Serving
+
+vLLM supports serving multiple LoRA adapters with runtime load/unload capabilities. This enables fine-tuned model variants to be served from a single base model instance.
+
+**Supported models:** Currently verified with Qwen3.6-27B and Qwen3.6-35B-A3B models.
+
+#### Starting the server with LoRA adapters
+
+Example for Qwen3.6-27B with two LoRA adapters:
+
+```bash
+export ZE_AFFINITY_MASK=0,1
+export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
+
+vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-tokens 8192 --max-model-len 20000 --block-size 64 --dtype float16 --model /llm/models/Qwen3.6-27B/ --served-model-name Qwen3.6-27B --tensor-parallel-size 2 --quantization fp8 --enforce-eager --trust-remote-code --disable-log-requests --enable-lora --lora-modules adapter1=/llm/models/adapter/adapter1 adapter2=/llm/models/adapter/adapter2 --max-loras 2 --max-lora-rank 128
+```
+
+Example for Qwen3.6-35B-A3B with a single LoRA adapter:
+
+```bash
+export ZE_AFFINITY_MASK=0,1
+export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
+
+vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-tokens 8192 --max-model-len 40000 --block-size 64 --dtype float16 --model /llm/models/Qwen3.6-35B-A3B/ --served-model-name Qwen3.6-35B-A3B --tensor-parallel-size 2 --quantization fp8 --enforce-eager --trust-remote-code --disable-log-requests --enable-lora --lora-modules adapter1=/llm/models/adapter/adapter1 --max-loras 1 --max-lora-rank 128
+```
+
+Key LoRA parameters:
+- `--enable-lora`: Enable LoRA serving
+- `--lora-modules <name>=<path> ...`: Register LoRA adapters at startup (format: `name=path`)
+- `--max-loras`: Maximum number of LoRA adapters to serve concurrently
+- `--max-lora-rank`: Maximum LoRA rank supported (set to the highest rank among your adapters)
+- `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True`: Enable runtime adapter load/unload
+
+#### Sending requests to LoRA adapters
+
+Use the adapter name as the model name in your API requests:
+
+```bash
+curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "adapter1",
+  "messages": [{"role": "user", "content": "Hello, how are you?"}],
+  "max_tokens": 100
+}'
+```
+
+To use the base model without any adapter, use the `--served-model-name` value (e.g., `Qwen3.6-27B`).
+
+#### Runtime adapter management
+
+Unload an adapter:
+```bash
+curl -X POST http://localhost:8000/v1/unload_lora_adapter -H "Content-Type: application/json" -d '{"lora_name":"adapter1"}'
+```
+
+Load a new adapter:
+```bash
+curl -X POST http://localhost:8000/v1/load_lora_adapter -H "Content-Type: application/json" -d '{"lora_name":"adapter1","lora_path":"/llm/models/adapter/adapter1"}'
+```
+
+List currently registered models:
+```bash
+curl http://localhost:8000/v1/models
 ```
 
 ## 4. Troubleshooting

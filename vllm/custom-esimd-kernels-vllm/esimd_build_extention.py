@@ -297,12 +297,34 @@ def _get_sycl_arch_list():
     arch_list = [x for x in arch_list if not x.startswith('dg2-')]
     return ','.join(arch_list)
 
-_SYCL_DLINK_FLAGS = [
-    *_COMMON_SYCL_FLAGS,
-    '-fsycl-link',
-    '--offload-compress',
-    f'-Xs "-device {_get_sycl_arch_list()}"',
-]
+
+def _get_sycl_dlink_flags(compile_flags):
+    """Build device-link flags using the effective SYCL compile target.
+
+    Extension-specific flags are appended after ``_COMMON_SYCL_FLAGS`` and can
+    therefore override ``-fsycl-targets``.  Device linking must use the same
+    target as compilation; otherwise icpx may try to link a target that is not
+    present in the input object.
+    """
+    target_prefix = '-fsycl-targets='
+    target_flag = next(
+        (flag for flag in reversed(compile_flags)
+         if flag.startswith(target_prefix)),
+        None,
+    )
+
+    dlink_flags = [
+        flag for flag in _COMMON_SYCL_FLAGS
+        if not flag.startswith(target_prefix)
+    ]
+    if target_flag is not None:
+        dlink_flags.append(target_flag)
+    dlink_flags.extend([
+        '-fsycl-link',
+        '--offload-compress',
+        f'-Xs "-device {_get_sycl_arch_list()}"',
+    ])
+    return dlink_flags
 
 # JIT_EXTENSION_VERSIONER = ExtensionVersioner()
 
@@ -807,9 +829,10 @@ class BuildExtension(build_ext):
                 # Note the order: shlex.quote sycl_flags first, _wrap_sycl_host_flags
                 # second. Reason is that sycl host flags are quoted, space containing
                 # strings passed to SYCL compiler.
+                sycl_dlink_post_cflags = _get_sycl_dlink_flags(
+                    sycl_cflags + sycl_post_cflags)
                 sycl_cflags = [shlex.quote(f) for f in sycl_cflags]
                 # sycl_cflags += _wrap_sycl_host_flags(host_cflags)
-                sycl_dlink_post_cflags = list(_SYCL_DLINK_FLAGS)
                 # Propagate -doubleGRF from extension compile flags to dlink
                 if any('doubleGRF' in f for f in sycl_post_cflags):
                     sycl_dlink_post_cflags = [
@@ -2647,7 +2670,7 @@ def _write_ninja_file_to_build_library(path,
         host_cflags = [item.replace('\\"', '\\\\"') for item in host_cflags]
         host_cflags = ' '.join(host_cflags)
         # sycl_cflags += _wrap_sycl_host_flags(host_cflags)
-        sycl_dlink_post_cflags = _SYCL_DLINK_FLAGS
+        sycl_dlink_post_cflags = _get_sycl_dlink_flags(sycl_cflags)
     else:
         sycl_cflags = None
         sycl_dlink_post_cflags = None

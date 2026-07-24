@@ -14,6 +14,7 @@
 
 #include "esimd_kernels/moe_ops.h"
 #include "esimd_kernels/fp8_moe_gemm.h"
+#include "esimd_kernels/fp8_moe_gemm_blockscale.h"
 
 // Get queue for the specific device (multi-card safe)
 static inline sycl::queue& get_device_queue(const at::Tensor& tensor) {
@@ -145,6 +146,56 @@ at::Tensor esimd_moe_gemm_fp8(
         reinterpret_cast<fp16*>(output.data_ptr()),
         reinterpret_cast<const uint32_t*>(expert_idx.data_ptr()),
         (int)N, (int)K, (int)num_experts, (int)max_tokens_per_expert, q);
+    return output;
+}
+
+// MoE grouped block-scaled FP8 GEMM (DeepSeek 128x128 weight block, w8a16).
+// input [total_tokens, K] fp16, weight [E, N, K] fp8_e4m3 (uint8 bits),
+// weight_scale [E, ceil(N/128), ceil(K/128)] fp32 (== weight_scale_inv),
+// output [total_tokens, N] fp16, expert_idx [E+1] uint32 token start offsets.
+at::Tensor esimd_moe_gemm_fp8_blockscale(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output, at::Tensor expert_idx,
+    int64_t N, int64_t K, int64_t num_experts, int64_t block_n, int64_t block_k)
+{
+    TORCH_CHECK(input.scalar_type() == at::ScalarType::Half,
+                "esimd_moe_gemm_fp8_blockscale: input must be fp16");
+    TORCH_CHECK(weight.scalar_type() == at::ScalarType::Float8_e4m3fn ||
+                    weight.scalar_type() == at::ScalarType::Byte,
+                "esimd_moe_gemm_fp8_blockscale: weight must be fp8_e4m3 (or uint8 bits)");
+    TORCH_CHECK(weight_scale.scalar_type() == at::ScalarType::Float,
+                "esimd_moe_gemm_fp8_blockscale: weight_scale must be float32");
+    TORCH_CHECK(output.scalar_type() == at::ScalarType::Half,
+                "esimd_moe_gemm_fp8_blockscale: output must be fp16");
+    TORCH_CHECK(block_n == 128 && block_k == 128,
+                "esimd_moe_gemm_fp8_blockscale: only 128x128 weight blocks supported");
+    TORCH_CHECK(K % block_k == 0,
+                "esimd_moe_gemm_fp8_blockscale: K must be a multiple of block_k(128)");
+    auto& q = get_device_queue(input);
+
+    // Active-experts-only grid: only min(num_experts, total_tokens) experts can
+    // be non-empty this call. Compact their ids so the main grid launches
+    // n_active*N work-groups instead of num_experts*N (~99% empty at decode).
+    const int64_t total_tokens = input.size(0);
+    const int n_active =
+        (int)std::min<int64_t>(num_experts, total_tokens);
+    auto active_experts = at::full(
+        {std::max(n_active, 1)}, (int64_t)num_experts,
+        input.options().dtype(at::kInt));
+    if (n_active > 0) {
+        fp8_moe_blockscale::build_active_experts(
+            reinterpret_cast<const uint32_t*>(expert_idx.data_ptr()),
+            active_experts.data_ptr<int32_t>(), (int)num_experts, q);
+    }
+
+    fp8_moe_blockscale::moe_gemm_fp8_blockscale_host(
+        reinterpret_cast<const fp16*>(input.data_ptr()),
+        reinterpret_cast<const uint8_t*>(weight.data_ptr()),
+        weight_scale.data_ptr<float>(),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        reinterpret_cast<const uint32_t*>(expert_idx.data_ptr()),
+        active_experts.data_ptr<int32_t>(), n_active,
+        (int)N, (int)K, (int)num_experts, (int)block_n, (int)block_k, q);
     return output;
 }
 
