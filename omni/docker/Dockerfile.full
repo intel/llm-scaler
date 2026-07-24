@@ -309,8 +309,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # cannot be replaced by that older transitive pin. Keep both its source and
 # wheel in the development image for audit and in-container reproduction.
 ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
-ARG COMFY_KITCHEN_COMMIT=9b4776cc7507c47f16a53a5b8a991c1ba2bc354a
-ARG COMFY_KITCHEN_VERSION=0.2.18+xpu.1
+ARG COMFY_KITCHEN_COMMIT=acdf65deace1b0ca3b436f45e560ed44f0c0d08f
+ARG COMFY_KITCHEN_VERSION=0.2.18
 RUN --mount=type=cache,target=/root/.cache/pip \
     set -eo pipefail && \
     cd /llm && \
