@@ -21,7 +21,7 @@ ARG IMAGE_TAG
 ARG SYCL_TLA_REPOSITORY=https://github.com/intel/sycl-tla.git
 ARG SYCL_TLA_COMMIT=2fc09973bfdf15755090fcb0e3b6ad236408a992
 ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
-ARG COMFY_KITCHEN_COMMIT=223eea0c931bcf7a1bd0e83631e21b2a58961b28
+ARG COMFY_KITCHEN_COMMIT=f4fd5d8c36af2e22577f5a7091ae372c6bfa8dc2
 ARG COMFY_KITCHEN_VERSION=0.2.18
 ARG LLM_SCALER_SOURCE_REVISION=unknown
 ARG LLM_SCALER_SOURCE_DIRTY=unknown
@@ -222,7 +222,7 @@ RUN cd /llm && \
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/comfy-kitchen-xpu && \
-    python setup.py bdist_wheel --no-cuda --dist-dir /wheels
+    pip wheel . --wheel-dir /wheels --no-deps --no-build-isolation
 
 # ======== Omni kernel wheel branch ========
 FROM sycl-tla AS kernel-wheel

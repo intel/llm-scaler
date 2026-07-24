@@ -72,7 +72,7 @@ override those defaults. `INSTALL_DISABLED_NODES` applies only to the full
 flavor.
 
 The Kitchen XPU integration is pinned to
-`xiangyuT/comfy-kitchen-xpu@223eea0c931bcf7a1bd0e83631e21b2a58961b28`
+`xiangyuT/comfy-kitchen-xpu@f4fd5d8c36af2e22577f5a7091ae372c6bfa8dc2`
 (`comfy-kitchen==0.2.18`) and is installed after third-party requirements so
 ComfyUI's older transitive pin cannot replace it. Its repository, commit, and
 version can be overridden together with `COMFY_KITCHEN_REPOSITORY`,
@@ -94,9 +94,10 @@ BuildKit branches:
 Kernel edits rebuild `kernel-wheel` without rebuilding Kitchen or ComfyUI
 dependencies. Kitchen commit/version changes rebuild `kitchen-wheel` without
 recompiling the Omni kernel. Changing only `ComfyUI-OmniXPU` reuses both wheel
-branches. The `--no-cuda` Kitchen wheel is pure Python and is reused across
-BMG/PTL-H; switching the device target rebuilds only the AOT kernel and final
-assembly while reusing the OS, Torch, ComfyUI, and Kitchen layers.
+branches. The Kitchen wheel is pure Python, packages XPU/Triton/eager only, and
+is reused across BMG/PTL-H; switching the device target rebuilds only the AOT
+kernel and final assembly while reusing the OS, Torch, ComfyUI, and Kitchen
+layers.
 
 The runtime deliberately inherits the completed development builder. Recopying
 the complete `/opt/venv`, `/llm`, and `/wheels` trees from that builder into a

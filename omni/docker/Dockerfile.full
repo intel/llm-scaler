@@ -309,7 +309,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # cannot be replaced by that older transitive pin. Keep both its source and
 # wheel in the development image for audit and in-container reproduction.
 ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
-ARG COMFY_KITCHEN_COMMIT=223eea0c931bcf7a1bd0e83631e21b2a58961b28
+ARG COMFY_KITCHEN_COMMIT=f4fd5d8c36af2e22577f5a7091ae372c6bfa8dc2
 ARG COMFY_KITCHEN_VERSION=0.2.18
 RUN --mount=type=cache,target=/root/.cache/pip \
     set -eo pipefail && \
@@ -320,7 +320,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git fetch --depth 1 origin "${COMFY_KITCHEN_COMMIT}" && \
     git checkout --detach FETCH_HEAD && \
     rm -f /wheels/comfy_kitchen-*.whl && \
-    python setup.py bdist_wheel --no-cuda --dist-dir /wheels && \
+    pip wheel . --wheel-dir /wheels --no-deps --no-build-isolation && \
     pip install --no-deps --force-reinstall \
         /wheels/comfy_kitchen-${COMFY_KITCHEN_VERSION}-*.whl
 
