@@ -1,4 +1,4 @@
-# GLM-TTS with Intel XPU Support
+# OmniLottie with Intel XPU Support
 
 This project demonstrates how to run [OmniLottie](https://github.com/OpenVGLab/OmniLottie) on Intel GPUs (XPU) using Docker.
 
@@ -25,7 +25,6 @@ export CONTAINER_NAME=omnilottie
 export DOCKER_IMAGE=llm-scaler-omni:omnilottie
 
 docker run -itd \
-    --privileged \
     --net=host \
     --device /dev/dri \
     -e no_proxy=localhost,127.0.0.1 \

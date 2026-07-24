@@ -11,9 +11,8 @@ Run docker image:
 ```bash
 export DOCKER_IMAGE=llm-scaler-omni:qwen-image
 export CONTAINER_NAME=qwen-image
-export MODEL_DIR=<your_model_dir>
-sudo docker run -itd \
-        --privileged \
+export MODEL_DIR=/path/to/models
+docker run -itd \
         --net=host \
         --device=/dev/dri \
         -e no_proxy=localhost,127.0.0.1 \

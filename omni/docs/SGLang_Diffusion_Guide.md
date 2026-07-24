@@ -1,5 +1,9 @@
 # SGLang Diffusion Guide
 
+> This guide applies only to the optional image built with
+> `OMNI_IMAGE_FLAVOR=full`. The default ComfyUI-focused image does not install
+> SGLang Diffusion.
+
 SGLang Diffusion provides an OpenAI-compatible API for image and video generation models, optimized for Intel XPU. It supports CLI generation, HTTP server mode, and integration with ComfyUI through custom nodes.
 
 ---
@@ -76,8 +80,8 @@ Start an HTTP server that exposes OpenAI-compatible endpoints for image/video ge
 
 ```bash
 # Configure proxy if needed
-export http_proxy=<your_http_proxy>
-export https_proxy=<your_https_proxy>
+export http_proxy=http://proxy.example.com:port
+export https_proxy=http://proxy.example.com:port
 export no_proxy=localhost,127.0.0.1
 
 # Start server with Z-Image-Turbo

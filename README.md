@@ -137,51 +137,12 @@ Please follow the instructions in the [Getting Started](vllm/README.md/#1-gettin
 
 ## LLM Scaler Omni (experimental)
 
-`llm-scaler-omni` supports running image/voice/video generation etc., featuring `Omni Studio` mode (using ComfyUI) and `Omni Serving` mode (via SGLang Diffusion or Xinference).  
+The default Omni build is a target-specific, single-XPU ComfyUI image. An
+optional full image retains Xinference, SGLang Diffusion, and the broader
+workflow bundle.
 
-
-Please follow the instructions in the [Getting Started](omni/README.md/#getting-started-with-omni-docker-image) to use `llm-scaler-omni`. 
-
-
-### Omni Demos
-
-| Qwen-Image | Multi B60 Wan2.2-T2V-14B |
-|------------|--------------------------|
-| ![Qwen Image Demo](./omni/assets/demo_qwen_image.gif) | ![Wan2.2 T2V Demo](./omni/assets/demo_wan2.2_14b_i2v_multi_xpu.gif) |
-
-
-### Omni Studio (ComfyUI WebUI interaction)
-
-`Omni Stuido` supports Image Generation/Edit, Video Generation, Audio Generation, 3D Generation etc.  
-
-
-| Model Category | Model | Type | 
-|----------------------|------------|---------------|
-| **Image Generation** | Qwen-Image, Qwen-Image-Edit | Text-to-Image, Image Editing | 
-| **Image Generation** | Stable Diffusion 3.5 | Text-to-Image, ControlNet | 
-| **Image Generation** | Z-Image-Turbo | Text-to-Image | 
-| **Image Generation** | Flux.1, Flux.1 Kontext dev | Text-to-Image, Multi-Image Reference, ControlNet | 
-| **Image Generation** | FireRed-Image-Edit-1.1 | Image Editing | 
-| **Video Generation** | Wan2.2 TI2V 5B, Wan2.2 T2V 14B, Wan2.2 I2V 14B | Text-to-Video, Image-to-Video | 
-| **Video Generation** | Wan2.2 Animate 14B | Video Animation | 
-| **Video Generation** | HunyuanVideo 1.5 8.3B | Text-to-Video, Image-to-Video | 
-| **Video Generation** | LTX-2 | Text-to-Video, Image-to-Video | 
-| **3D Generation** | Hunyuan3D 2.1 | Text/Image-to-3D | 
-| **Audio Generation** | VoxCPM1.5, IndexTTS 2 | Text-to-Speech, Voice Cloning | 
-| **Video Upscaling** | SeedVR2 | Video Restoration and Upscaling | 
-
-
-Please check [ComfyUI Support](omni/README.md/#comfyui) for more details.
-
-### Omni Serving (OpenAI-API compatible serving)
-
-`Omni Serving` supports Image Generation, Audio Generation etc.
-
-- Image Generation (`/v1/images/generations`): Stable Diffusion 3.5, Flux.1-dev
-- Text to Speech (`/v1/audio/speech`): Kokoro 82M
-- Speech to Text (`/v1/audio/transcriptions`): whisper-large-v3
-
-Please check [Xinference Support](omni/README.md/#xinference) for more details. 
+See [LLM Scaler Omni](omni/README.md) for build, runtime, workflow, and image
+acceptance instructions.
 
 ---
 ## Releases

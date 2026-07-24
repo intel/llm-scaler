@@ -32,8 +32,7 @@ export HOST_FUNASR_MODEL=/path/to/Fun-ASR-Nano-2512
 export DOCKER_IMAGE=llm-scaler-omni:fun-audio-llm
 export CONTAINER_NAME=fun-audio-llm
 
-sudo docker run -itd \
-    --privileged \
+docker run -itd \
     --net=host \
     --device=/dev/dri \
     -e no_proxy=localhost,127.0.0.1 \

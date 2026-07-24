@@ -1,5 +1,9 @@
 # SGLang Diffusion ComfyUI Guide
 
+> This guide applies only to the optional image built with
+> `OMNI_IMAGE_FLAVOR=full`. The default ComfyUI-focused image does not install
+> SGLang Diffusion or its ComfyUI nodes.
+
 This guide explains how to use SGLang Diffusion custom nodes within ComfyUI for image and video generation. The plugin provides a high-performance backend for diffusion models, leveraging SGLang's optimized kernels and multi-GPU parallelization.
 
 ---
@@ -24,8 +28,9 @@ The `ComfyUI_SGLDiffusion` plugin connects to an external SGLang Diffusion HTTP 
 
 ## Prerequisites
 
-1. **SGLang Diffusion** is installed inside the Docker container (pre-installed in `intel/llm-scaler-omni` image).
-2. **ComfyUI_SGLDiffusion** custom nodes are available in `ComfyUI/custom_nodes/ComfyUI_SGLDiffusion/` (pre-installed in the Docker image).
+1. Build the optional full image with `OMNI_IMAGE_FLAVOR=full`.
+2. **SGLang Diffusion** and **ComfyUI_SGLDiffusion** are installed in that
+   image.
 3. The SGLang Diffusion server must be running before executing the workflow.
 
 ---
@@ -215,15 +220,18 @@ All workflow files are available in the `workflows/` directory of ComfyUI.
 
 ### Example 1: Text-to-Image with Z-Image-Turbo (Server Mode)
 
-1. **Start the Docker container:**
+1. **Build and start the full-image container:**
 
    ```bash
-   export DOCKER_IMAGE=intel/llm-scaler-omni:0.1.0-b7
+   cd omni
+   OMNI_IMAGE_FLAVOR=full XPU_TARGET=bmg bash build.sh
+
+   export DOCKER_IMAGE=intel/llm-scaler-omni:0.1.0-b9-dev-full-bmg
    export CONTAINER_NAME=comfyui
-   export MODEL_DIR=<your_model_dir>
-   export COMFYUI_MODEL_DIR=<your_comfyui_model_dir>
-   sudo docker run -itd \
-           --privileged --net=host --device=/dev/dri \
+   export MODEL_DIR=/path/to/sglang_models
+   export COMFYUI_MODEL_DIR=/path/to/comfyui_models
+   docker run -itd \
+           --net=host --device=/dev/dri \
            -e no_proxy=localhost,127.0.0.1 \
            --name=$CONTAINER_NAME \
            -v $MODEL_DIR:/llm/models/ \
@@ -249,7 +257,7 @@ All workflow files are available in the `workflows/` directory of ComfyUI.
    python3 main.py --listen 0.0.0.0
    ```
 
-4. **Open ComfyUI** in your browser at `http://<your_ip>:8188/`.
+4. **Open ComfyUI** in your browser at `http://HOST_IP:8188/`.
 
 5. **Load the workflow**: Go to the workflows panel and load `image_z_image_sgld.json`.
 

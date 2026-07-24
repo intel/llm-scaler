@@ -37,8 +37,8 @@ Example commands:
 
 ```
 @echo off
-call "<path-to-visual-studio>\Common7\Tools\VsDevCmd.bat"
-call "<path-to-oneapi>\setvars.bat"
+call "C:\path\to\VisualStudio\Common7\Tools\VsDevCmd.bat"
+call "C:\path\to\oneAPI\setvars.bat"
 call C:\ProgramData\miniforge3\Scripts\activate.bat omni_env
 set "OMNI_XPU_REQUIRE_CUTE=0"
 set "PATH=%CONDA_PREFIX%\Library\bin;%CONDA_PREFIX%\Lib\site-packages\torch\lib;%PATH%"

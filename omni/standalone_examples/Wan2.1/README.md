@@ -11,9 +11,8 @@ Run docker image:
 ```bash
 export DOCKER_IMAGE=llm-scaler-omni:latest-wan2.1
 export CONTAINER_NAME=wan-2.1
-export MODEL_DIR=<your_model_dir>
-sudo docker run -itd \
-        --privileged \
+export MODEL_DIR=/path/to/models
+docker run -itd \
         --net=host \
         --device=/dev/dri \
         -e no_proxy=localhost,127.0.0.1 \

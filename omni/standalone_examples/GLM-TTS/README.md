@@ -29,7 +29,6 @@ export CONTAINER_NAME=glm-tts
 export DOCKER_IMAGE=llm-scaler-omni:glm-tts
 
 docker run -itd \
-    --privileged \
     --net=host \
     --device /dev/dri \
     -e no_proxy=localhost,127.0.0.1 \

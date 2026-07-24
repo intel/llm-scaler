@@ -10,8 +10,8 @@ This project enables [HY-WorldPlay](https://github.com/Tencent-Hunyuan/HY-WorldP
 ### Build Docker Image
 
 ```bash
-export HTTP_PROXY=<your_http_proxy>
-export HTTPS_PROXY=<your_https_proxy>
+export HTTP_PROXY=http://proxy.example.com:port
+export HTTPS_PROXY=http://proxy.example.com:port
 
 bash build.sh
 ```
@@ -21,13 +21,12 @@ bash build.sh
 ```bash
 export DOCKER_IMAGE=llm-scaler-omni:hy-worldplay
 export CONTAINER_NAME=hy-worldplay
-sudo docker run -itd \
-        --privileged \
+docker run -itd \
         --net=host \
         --device=/dev/dri \
         -e no_proxy=localhost,127.0.0.1 \
-        -e http_proxy=<your_http_proxy> \
-        -e https_proxy=<your_https_proxy> \
+        -e http_proxy="$HTTP_PROXY" \
+        -e https_proxy="$HTTPS_PROXY" \
         --name=$CONTAINER_NAME \
         --shm-size="64g" \
         --entrypoint=/bin/bash \
