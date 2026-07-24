@@ -65,6 +65,31 @@ def _get_native():
         return None
 
 
+def _can_quantize_int8_convrot_g16_bmg(
+    x: torch.Tensor,
+    native,
+    convrot: bool,
+    convrot_groupsize: int,
+) -> bool:
+    """Return whether the captured BMG Boogu ConvRot route is exact."""
+    if (
+        native is None
+        or not hasattr(native, "quantize_int8_convrot_g16_bmg")
+        or not hasattr(native, "int8_linear_prequantized")
+        or not convrot
+        or convrot_groupsize != 16
+        or x.device.type != "xpu"
+        or x.dtype != torch.float16
+        or x.ndim < 1
+        or x.shape[-1] != 3360
+        or not x.is_contiguous()
+        or x.requires_grad
+    ):
+        return False
+    rows = x.numel() // x.shape[-1]
+    return rows in (109, 110, 4096, 4205, 4206)
+
+
 # =============================================================================
 # Public API — dispatch to native or fallback to reference
 # =============================================================================
@@ -252,6 +277,23 @@ def int8_linear(
         out_dtype = x.dtype
     native = _get_native()
     if native is not None and hasattr(native, "int8_linear"):
+        dtype_code = {
+            torch.float32: 0,
+            torch.float16: 1,
+            torch.bfloat16: 2,
+        }.get(out_dtype, 2)
+        if _can_quantize_int8_convrot_g16_bmg(
+            x, native, convrot, convrot_groupsize
+        ):
+            x_int8, x_scale = native.quantize_int8_convrot_g16_bmg(x)
+            return native.int8_linear_prequantized(
+                x_int8,
+                x_scale,
+                weight,
+                weight_scale,
+                bias,
+                dtype_code,
+            )
         # Rotate through the native cached Hadamard-matrix implementation.
         if convrot:
             if x.shape[-1] % convrot_groupsize != 0:
@@ -266,9 +308,6 @@ def int8_linear(
 
                 h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
                 x = _rotate_activation(x, h, convrot_groupsize)
-        dtype_code = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}.get(
-            out_dtype, 2
-        )
         return native.int8_linear(
             x, weight, weight_scale, bias, dtype_code, False, convrot_groupsize
         )

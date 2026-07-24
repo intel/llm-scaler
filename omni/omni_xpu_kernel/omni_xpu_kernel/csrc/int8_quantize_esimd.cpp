@@ -14,12 +14,20 @@
 
 #include <torch/extension.h>
 #include <sycl/sycl.hpp>
+#if defined(OMNI_XPU_ARCH_BMG)
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/esimd/xmx/dpas.hpp>
+#endif
 #include <type_traits>
 
 #include "utils.h"
 
 using fp16 = sycl::half;
 using bf16 = sycl::ext::oneapi::bfloat16;
+#if defined(OMNI_XPU_ARCH_BMG)
+namespace esimd = sycl::ext::intel::esimd;
+namespace xmx = sycl::ext::intel::esimd::xmx;
+#endif
 
 namespace omni_xpu {
 namespace int8_ops {
@@ -829,6 +837,232 @@ std::tuple<torch::Tensor, torch::Tensor> fused_silu_mul_quantize_rowwise(
     scale_shape.back() = 1;
     return {output.reshape(x1.sizes()), scales.reshape(scale_shape)};
 }
+
+#if defined(OMNI_XPU_ARCH_BMG)
+namespace {
+
+class QuantizeInt8ConvRotG16BMGKernel;
+
+inline bool convrot_h16_negative(int inner, int output) {
+    const bool high_negative = inner / 4 + output / 4 == 3;
+    const bool low_negative = inner % 4 + output % 4 == 3;
+    return high_negative != low_negative;
+}
+
+}  // namespace
+
+std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_g16_bmg(
+    torch::Tensor input
+) {
+    TORCH_CHECK(input.device().is_xpu(), "input must be on XPU");
+    TORCH_CHECK(input.dim() >= 1, "input must have at least one dimension");
+    TORCH_CHECK(input.scalar_type() == torch::kHalf, "input must be FP16");
+    TORCH_CHECK(input.size(-1) == 3360, "input must have K=3360");
+
+    input = input.contiguous();
+    const int64_t columns = input.size(-1);
+    const int64_t rows = input.numel() / columns;
+    TORCH_CHECK(
+        rows == 109 || rows == 110 || rows == 4096 ||
+            rows == 4205 || rows == 4206,
+        "BMG G16 ConvRot quantization requires Boogu rows "
+        "109, 110, 4096, 4205, or 4206");
+
+    auto output = torch::empty_like(
+        input, input.options().dtype(torch::kInt8));
+    auto scales = torch::empty(
+        {rows}, input.options().dtype(torch::kFloat32));
+    const auto* source =
+        reinterpret_cast<const fp16*>(input.data_ptr());
+    auto* destination = output.data_ptr<int8_t>();
+    auto* scale_output = scales.data_ptr<float>();
+
+    constexpr int GroupSize = 16;
+    constexpr int GroupsPerDPAS = 8;
+    // 210 G16 groups require 27 work-items. Avoiding five idle work-items
+    // measured faster than a power-of-two work-group on the traced BMG shapes.
+    constexpr int WorkitemsPerRow = 27;
+    constexpr int MaximaSlots = 32;
+    constexpr int CachedGroups = WorkitemsPerRow * GroupsPerDPAS;
+    constexpr int RotatedBytes =
+        CachedGroups * GroupSize * sizeof(fp16);
+    constexpr int MaximaOffset = RotatedBytes;
+    constexpr int ScaleOffset =
+        MaximaOffset + MaximaSlots * sizeof(float);
+    constexpr int SLMBytes = ScaleOffset + 16;
+    const int64_t groups_per_row = columns / GroupSize;
+    const sycl::range<1> local(WorkitemsPerRow);
+    const sycl::range<1> global(
+        static_cast<size_t>(rows) * WorkitemsPerRow);
+
+    auto command_group = [&](sycl::handler& handler) {
+        handler.parallel_for<QuantizeInt8ConvRotG16BMGKernel>(
+            sycl::nd_range<1>(global, local),
+            [=](sycl::nd_item<1> item) [[intel::sycl_explicit_simd]] {
+                esimd::slm_init<SLMBytes>();
+                const int workitem =
+                    static_cast<int>(item.get_local_linear_id());
+                const int64_t row =
+                    static_cast<int64_t>(item.get_group(0));
+                const int64_t first_group =
+                    static_cast<int64_t>(workitem) * GroupsPerDPAS;
+                const int64_t remaining_groups =
+                    groups_per_row - first_group;
+                const int valid_groups = remaining_groups <= 0
+                    ? 0
+                    : (
+                          remaining_groups < GroupsPerDPAS
+                              ? static_cast<int>(remaining_groups)
+                              : GroupsPerDPAS);
+
+                esimd::simd<fp16, 256> matrix_b;
+#pragma unroll
+                for (int inner_pair = 0; inner_pair < 8; ++inner_pair) {
+#pragma unroll
+                    for (int column = 0; column < 16; ++column) {
+#pragma unroll
+                        for (int pair_element = 0; pair_element < 2;
+                             ++pair_element) {
+                            const int inner =
+                                inner_pair * 2 + pair_element;
+                            const int packed =
+                                inner_pair * 32 + column * 2 + pair_element;
+                            matrix_b[packed] = static_cast<fp16>(
+                                convrot_h16_negative(inner, column)
+                                    ? -0.25f
+                                    : 0.25f);
+                        }
+                    }
+                }
+
+                esimd::simd<fp16, GroupsPerDPAS * GroupSize> matrix_a =
+                    0.0f;
+                const fp16* row_input = source + row * columns;
+                if (valid_groups == GroupsPerDPAS) {
+                    matrix_a.copy_from(
+                        row_input + first_group * GroupSize);
+                } else {
+#pragma unroll
+                    for (int group = 0; group < GroupsPerDPAS; ++group) {
+                        if (group < valid_groups) {
+#pragma unroll
+                            for (int inner = 0; inner < GroupSize; ++inner) {
+                                matrix_a[group * GroupSize + inner] =
+                                    row_input[
+                                        (first_group + group) * GroupSize +
+                                        inner];
+                            }
+                        }
+                    }
+                }
+
+                const auto accumulated =
+                    xmx::dpas<8, GroupsPerDPAS, float>(
+                        matrix_b, matrix_a);
+                // Match the public rotate_convrot materialization boundary:
+                // oneDNN writes FP16 before rowwise quantization consumes it.
+                const esimd::simd<
+                    fp16,
+                    GroupsPerDPAS * GroupSize> rounded = accumulated;
+                const uint32_t cache_offset =
+                    static_cast<uint32_t>(
+                        workitem *
+                        GroupsPerDPAS *
+                        GroupSize *
+                        sizeof(fp16));
+                esimd::slm_block_store<fp16, GroupsPerDPAS * GroupSize>(
+                    cache_offset, rounded);
+                const esimd::simd<
+                    float,
+                    GroupsPerDPAS * GroupSize> rounded_fp32 = rounded;
+                const float local_max = esimd::hmax<float>(
+                    esimd::abs(rounded_fp32));
+                esimd::slm_block_store<float, 1>(
+                    MaximaOffset + workitem * sizeof(float),
+                    esimd::simd<float, 1>(local_max),
+                    esimd::overaligned<4>);
+                esimd::barrier();
+
+                if (workitem == 0) {
+                    const auto maxima =
+                        esimd::slm_block_load<float, MaximaSlots>(
+                            MaximaOffset);
+                    auto valid_maxima = maxima;
+#pragma unroll
+                    for (int slot = WorkitemsPerRow;
+                         slot < MaximaSlots;
+                         ++slot) {
+                        valid_maxima[slot] = 0.0f;
+                    }
+                    const float row_max =
+                        esimd::hmax<float>(valid_maxima);
+                    float scale = row_max / 127.0f;
+                    if (scale < 1e-30f) scale = 1e-30f;
+                    scale_output[row] = scale;
+                    esimd::slm_block_store<float, 1>(
+                        ScaleOffset,
+                        esimd::simd<float, 1>(1.0f / scale));
+                }
+                esimd::barrier();
+
+                const float inverse_scale =
+                    esimd::slm_block_load<float, 1>(ScaleOffset)[0];
+                const auto cached =
+                    esimd::slm_block_load<
+                        fp16,
+                        GroupsPerDPAS * GroupSize>(cache_offset);
+                const esimd::simd<
+                    float,
+                    GroupsPerDPAS * GroupSize> cached_fp32 = cached;
+                auto quantized_fp32 =
+                    esimd::rnde<float>(cached_fp32 * inverse_scale);
+#pragma unroll
+                for (int element = 0;
+                     element < GroupsPerDPAS * GroupSize;
+                     ++element) {
+                    quantized_fp32[element] =
+                        quantized_fp32[element] < -128.0f
+                            ? -128.0f
+                            : quantized_fp32[element];
+                    quantized_fp32[element] =
+                        quantized_fp32[element] > 127.0f
+                            ? 127.0f
+                            : quantized_fp32[element];
+                }
+                esimd::simd<
+                    int8_t,
+                    GroupsPerDPAS * GroupSize> quantized =
+                    quantized_fp32;
+                int8_t* row_output = destination + row * columns;
+                if (valid_groups == GroupsPerDPAS) {
+                    quantized.copy_to(
+                        row_output + first_group * GroupSize);
+                } else {
+#pragma unroll
+                    for (int group = 0; group < GroupsPerDPAS; ++group) {
+                        if (group < valid_groups) {
+                            const esimd::simd<int8_t, GroupSize>
+                                group_quantized = quantized
+                                    .template select<GroupSize, 1>(
+                                        group * GroupSize);
+                            group_quantized.copy_to(
+                                row_output +
+                                (first_group + group) * GroupSize);
+                        }
+                    }
+                }
+            });
+    };
+    utils::submit_kernel(
+        command_group,
+        input.device(),
+        "quantize_int8_convrot_g16_bmg_dpas");
+
+    auto scale_shape = input.sizes().vec();
+    scale_shape.back() = 1;
+    return {output, scales.reshape(scale_shape)};
+}
+#endif
 
 }  // namespace int8_ops
 }  // namespace omni_xpu

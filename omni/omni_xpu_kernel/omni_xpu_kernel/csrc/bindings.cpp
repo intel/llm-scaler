@@ -94,6 +94,10 @@ namespace int8_ops {
     std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise(
         torch::Tensor x, int64_t stochastic_rounding);
     std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(torch::Tensor x);
+#if defined(OMNI_XPU_ARCH_BMG)
+    std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_g16_bmg(
+        torch::Tensor input);
+#endif
     torch::Tensor fused_silu_mul(torch::Tensor x1, torch::Tensor x2);
     std::tuple<torch::Tensor, torch::Tensor> fused_silu_mul_quantize_rowwise(
         torch::Tensor x1, torch::Tensor x2);
@@ -385,6 +389,14 @@ PYBIND11_MODULE(_C, m) {
         "Input: x [..., K] bf16/f16\n"
         "Output: (int8 tensor, float32 scales [..., 1])",
         py::arg("x"));
+#if defined(OMNI_XPU_ARCH_BMG)
+    int8.def(
+        "quantize_int8_convrot_g16_bmg",
+        &omni_xpu::int8_ops::quantize_int8_convrot_g16_bmg,
+        "BMG DPAS-fused G16 ConvRot plus rowwise INT8 quantization for "
+        "validated Boogu FP16 K=3360 activation shapes.",
+        py::arg("input"));
+#endif
     int8.def("fused_silu_mul", &omni_xpu::int8_ops::fused_silu_mul,
         "Fused SiLU(x1) * x2 with one floating output and no SiLU temporary.\n"
         "Input: x1/x2 identical bf16/f16 tensors\n"

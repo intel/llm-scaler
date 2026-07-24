@@ -854,6 +854,102 @@ class TestFusedSiluMulQuantize:
 class TestConvRot:
     """Tests for ConvRot (Hadamard rotation) operations."""
 
+    @pytest.mark.parametrize("rows", [109, 110, 4096, 4205, 4206])
+    def test_bmg_g16_fused_quantize_matches_materialized_path(
+        self, device, seed, rows
+    ):
+        """The BMG DPAS route preserves the public FP16 materialization."""
+        if device.type != "xpu":
+            pytest.skip("BMG fused ConvRot quantization requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "quantize_int8_convrot_g16_bmg"
+        ):
+            pytest.skip("native extension is not a BMG build with the fused route")
+
+        x = torch.randn(rows, 3360, device=device, dtype=torch.float16)
+        rotated = native.rotate_convrot(x, 16)
+        expected_q, expected_scale = native.quantize_int8_rowwise_fused(
+            rotated
+        )
+        actual_q, actual_scale = native.quantize_int8_convrot_g16_bmg(x)
+
+        assert torch.equal(actual_q, expected_q)
+        assert torch.equal(actual_scale, expected_scale)
+
+    def test_bmg_g16_public_linear_dispatches_to_fused_route(
+        self, device, seed, monkeypatch
+    ):
+        """The public linear API consumes the fused quantized activation."""
+        if device.type != "xpu":
+            pytest.skip("BMG fused ConvRot quantization requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "quantize_int8_convrot_g16_bmg"
+        ):
+            pytest.skip("native extension is not a BMG build with the fused route")
+
+        calls = {"fused": 0, "rotate": 0, "prequantized": 0}
+
+        class NativeProxy:
+            def __getattr__(self, name):
+                return getattr(native, name)
+
+            def quantize_int8_convrot_g16_bmg(self, x):
+                calls["fused"] += 1
+                return native.quantize_int8_convrot_g16_bmg(x)
+
+            def rotate_convrot(self, x, group_size):
+                calls["rotate"] += 1
+                return native.rotate_convrot(x, group_size)
+
+            def int8_linear_prequantized(
+                self,
+                x_int8,
+                x_scale,
+                weight,
+                weight_scale,
+                bias,
+                dtype_code,
+            ):
+                calls["prequantized"] += 1
+                return native.int8_linear_prequantized(
+                    x_int8,
+                    x_scale,
+                    weight,
+                    weight_scale,
+                    bias,
+                    dtype_code,
+                )
+
+        x = torch.randn(109, 3360, device=device, dtype=torch.float16)
+        weight = torch.randint(
+            -128, 128, (16, 3360), device=device, dtype=torch.int8
+        )
+        weight_scale = torch.rand(16, device=device, dtype=torch.float32)
+        bias = torch.randn(16, device=device, dtype=torch.float16)
+
+        monkeypatch.setattr(int8, "_get_native", lambda: NativeProxy())
+        output = int8.int8_linear(
+            x,
+            weight,
+            weight_scale,
+            bias=bias,
+            out_dtype=torch.float16,
+            convrot=True,
+            convrot_groupsize=16,
+        )
+
+        assert output.shape == (109, 16)
+        assert output.dtype == torch.float16
+        assert calls == {"fused": 1, "rotate": 0, "prequantized": 1}
+
     def test_hadamard_properties(self, device, seed):
         """Hadamard matrix is orthogonal and symmetric."""
         from omni_xpu_kernel.int8._reference import _build_hadamard
