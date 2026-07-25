@@ -1,4 +1,4 @@
-"""Portable control-flow tests for the fused Lumina INT8 FFN route."""
+"""Portable control-flow tests for fused Lumina and OmniGen2 INT8 FFN routes."""
 
 from __future__ import annotations
 
@@ -54,10 +54,22 @@ def _load_patch(monkeypatch, candidate):
     comfy_lumina.__path__ = []
     comfy_model = types.ModuleType("comfy.ldm.lumina.model")
     comfy_model.FeedForward = FeedForward
+    comfy_omnigen = types.ModuleType("comfy.ldm.omnigen")
+    comfy_omnigen.__path__ = []
+    comfy_omnigen_model = types.ModuleType("comfy.ldm.omnigen.omnigen2")
+
+    class LuminaFeedForward:
+        def forward(self, x):
+            self.original_calls += 1
+            return x + 2
+
+    comfy_omnigen_model.LuminaFeedForward = LuminaFeedForward
     comfy.ops = comfy_ops
     comfy.ldm = comfy_ldm
     comfy_ldm.lumina = comfy_lumina
     comfy_lumina.model = comfy_model
+    comfy_ldm.omnigen = comfy_omnigen
+    comfy_omnigen.omnigen2 = comfy_omnigen_model
 
     omni = types.ModuleType("omni_xpu_kernel")
     omni.int8 = candidate
@@ -67,6 +79,8 @@ def _load_patch(monkeypatch, candidate):
         ("comfy.ldm", comfy_ldm),
         ("comfy.ldm.lumina", comfy_lumina),
         ("comfy.ldm.lumina.model", comfy_model),
+        ("comfy.ldm.omnigen", comfy_omnigen),
+        ("comfy.ldm.omnigen.omnigen2", comfy_omnigen_model),
         ("omni_xpu_kernel", omni),
     ):
         monkeypatch.setitem(sys.modules, name, module)
@@ -157,7 +171,9 @@ def test_eligible_route_chains_all_three_kernel_apis(monkeypatch):
         convrot_groupsize=256,
     )
     monkeypatch.setattr(
-        patch, "_route_inputs", lambda module, input: ((weight, weight, weight), "")
+        patch,
+        "_route_inputs",
+        lambda module, input: ((weight, weight, weight), ""),
     )
 
     module = FeedForward()
@@ -169,6 +185,35 @@ def test_eligible_route_chains_all_three_kernel_apis(monkeypatch):
     assert candidate.calls[0][1]["out_dtype"] == torch.bfloat16
     assert candidate.calls[2][1]["out_dtype"] == torch.bfloat16
     assert candidate.up_inputs_released_at_down
+    torch.testing.assert_close(output, torch.full_like(output, 6.0))
+
+
+def test_eligible_omnigen2_route_uses_same_kernel_chain(monkeypatch):
+    candidate = _Candidate()
+    patch, _, comfy_ops = _load_patch(monkeypatch, candidate)
+    comfy_ops.run_every_op = lambda: None
+    assert patch.apply() == (True, "")
+
+    x = torch.zeros((2, 4), dtype=torch.bfloat16)
+    weight = patch._Weight(
+        qdata=torch.zeros((4, 4), dtype=torch.int8),
+        scale=torch.ones((4, 1)),
+        convrot=False,
+        convrot_groupsize=256,
+    )
+    monkeypatch.setattr(
+        patch, "_route_inputs", lambda module, input: ((weight, weight, weight), "")
+    )
+
+    feed_forward = sys.modules[
+        "comfy.ldm.omnigen.omnigen2"
+    ].LuminaFeedForward
+    module = feed_forward()
+    module.original_calls = 0
+    output = module.forward(x)
+
+    assert module.original_calls == 0
+    assert [name for name, _ in candidate.calls] == ["shared", "fused", "down"]
     torch.testing.assert_close(output, torch.full_like(output, 6.0))
 
 

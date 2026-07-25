@@ -1,4 +1,4 @@
-"""Route supported Lumina/Z-Image INT8 FFNs through fused Omni XPU kernels."""
+"""Route supported Lumina and OmniGen2 INT8 FFNs through fused XPU kernels."""
 
 from __future__ import annotations
 
@@ -88,14 +88,19 @@ def _route_inputs(
     if x.requires_grad:
         return None, "requires_grad"
 
+    projection_names = (
+        ("w1", "w3", "w2")
+        if all(hasattr(module, name) for name in ("w1", "w3", "w2"))
+        else ("linear_1", "linear_3", "linear_2")
+    )
     weights = []
-    for name in ("w1", "w3", "w2"):
+    for role, name in zip(("w1", "w3", "w2"), projection_names):
         linear = getattr(module, name, None)
         if linear is None:
-            return None, f"missing_{name}"
+            return None, f"missing_{role}"
         extracted, reason = _module_weight(linear, x)
         if extracted is None:
-            return None, f"{name}_{reason}"
+            return None, f"{role}_{reason}"
         weights.append(extracted)
 
     w1, w3, w2 = weights
@@ -174,93 +179,129 @@ def apply():
 
     try:
         import comfy.ops as comfy_ops
-        import comfy.ldm.lumina.model as lumina_model
     except ImportError as exc:
-        return False, f"Lumina FeedForward unavailable ({exc})"
+        return False, f"ComfyUI operations unavailable ({exc})"
 
-    feed_forward = getattr(lumina_model, "FeedForward", None)
-    if feed_forward is None or not hasattr(feed_forward, "forward"):
-        return False, "Lumina FeedForward.forward not found"
-    if hasattr(feed_forward.forward, _PATCH_MARKER):
-        return True, ""
+    targets = []
+    try:
+        import comfy.ldm.lumina.model as lumina_model
+
+        targets.append(
+            (
+                "lumina.FeedForward",
+                getattr(lumina_model, "FeedForward", None),
+            )
+        )
+    except ImportError:
+        pass
+    try:
+        import comfy.ldm.omnigen.omnigen2 as omnigen2_model
+
+        targets.append(
+            (
+                "omnigen2.LuminaFeedForward",
+                getattr(omnigen2_model, "LuminaFeedForward", None),
+            )
+        )
+    except ImportError:
+        pass
+
+    targets = [
+        (name, target)
+        for name, target in targets
+        if target is not None and hasattr(target, "forward")
+    ]
+    if not targets:
+        return False, "Lumina and OmniGen2 feed-forward modules unavailable"
 
     _omni_int8 = _candidate
-    original_forward = feed_forward.forward
 
-    def _forward(self, x):
-        global _routed_calls
+    def make_forward(original_forward, target_name):
+        def _forward(self, x):
+            global _routed_calls
 
-        weights, reason = _route_inputs(self, x)
-        if weights is None:
-            _record_fallback(reason)
+            weights, reason = _route_inputs(self, x)
+            if weights is None:
+                _record_fallback(reason)
+                log_debug_event(
+                    "dispatch",
+                    target_name,
+                    {"input": x},
+                    details={"route": "comfy", "reason": reason},
+                    verbose_only=True,
+                )
+                return original_forward(self, x)
+
+            w1, w3, w2 = weights
+            comfy_ops.run_every_op()
+            up1, up3 = _omni_int8.int8_linear_shared_input(
+                x,
+                w1.qdata,
+                w1.scale,
+                w3.qdata,
+                w3.scale,
+                out_dtype=x.dtype,
+                convrot=w1.convrot,
+                convrot_groupsize=w1.convrot_groupsize,
+            )
+            if w2.convrot:
+                gated = _omni_int8.fused_silu_mul(up1, up3)
+                del up1, up3
+                rotated = _omni_int8.rotate_convrot(
+                    gated, w2.convrot_groupsize
+                )
+                del gated
+                gated_q, gated_scale = _omni_int8.quantize_int8_rowwise(
+                    rotated
+                )
+                del rotated
+                route = "shared_up+fused_swiglu+convrot+quant+prequant_down"
+            else:
+                gated_q, gated_scale = (
+                    _omni_int8.fused_silu_mul_quantize_rowwise(up1, up3)
+                )
+                del up1, up3
+                route = "shared_up+fused_swiglu_quant+prequant_down"
+            output = _omni_int8.int8_linear_prequantized(
+                gated_q,
+                gated_scale,
+                w2.qdata,
+                w2.scale,
+                out_dtype=x.dtype,
+            )
+            _routed_calls += 1
             log_debug_event(
-                "dispatch",
-                "lumina.FeedForward",
-                {"input": x},
-                details={"route": "comfy", "reason": reason},
-                verbose_only=True,
+                "kernel",
+                "int8_swiglu_mlp",
+                {
+                    "input": x,
+                    "up_weight": w1.qdata,
+                    "gate_weight": w3.qdata,
+                    "down_weight": w2.qdata,
+                    "output": output,
+                },
+                details={
+                    "backend": "omni_xpu",
+                    "module": target_name,
+                    "route": route,
+                    "up_convrot": w1.convrot,
+                    "down_convrot": w2.convrot,
+                },
             )
-            return original_forward(self, x)
+            return output
 
-        w1, w3, w2 = weights
-        comfy_ops.run_every_op()
-        up1, up3 = _omni_int8.int8_linear_shared_input(
-            x,
-            w1.qdata,
-            w1.scale,
-            w3.qdata,
-            w3.scale,
-            out_dtype=x.dtype,
-            convrot=w1.convrot,
-            convrot_groupsize=w1.convrot_groupsize,
-        )
-        if w2.convrot:
-            gated = _omni_int8.fused_silu_mul(up1, up3)
-            del up1, up3
-            rotated = _omni_int8.rotate_convrot(
-                gated, w2.convrot_groupsize
-            )
-            del gated
-            gated_q, gated_scale = _omni_int8.quantize_int8_rowwise(rotated)
-            del rotated
-            route = "shared_up+fused_swiglu+convrot+quant+prequant_down"
-        else:
-            gated_q, gated_scale = _omni_int8.fused_silu_mul_quantize_rowwise(
-                up1, up3
-            )
-            del up1, up3
-            route = "shared_up+fused_swiglu_quant+prequant_down"
-        output = _omni_int8.int8_linear_prequantized(
-            gated_q,
-            gated_scale,
-            w2.qdata,
-            w2.scale,
-            out_dtype=x.dtype,
-        )
-        _routed_calls += 1
-        log_debug_event(
-            "kernel",
-            "int8_swiglu_mlp",
-            {
-                "input": x,
-                "up_weight": w1.qdata,
-                "gate_weight": w3.qdata,
-                "down_weight": w2.qdata,
-                "output": output,
-            },
-            details={
-                "backend": "omni_xpu",
-                "route": route,
-                "up_convrot": w1.convrot,
-                "down_convrot": w2.convrot,
-            },
-        )
-        return output
+        setattr(_forward, _PATCH_MARKER, original_forward)
+        return _forward
 
-    setattr(_forward, _PATCH_MARKER, original_forward)
-    feed_forward.forward = _forward
+    patched_names = []
+    for target_name, target in targets:
+        if not hasattr(target.forward, _PATCH_MARKER):
+            target.forward = make_forward(target.forward, target_name)
+        patched_names.append(target_name)
+
     log.info(
-        "[OmniXPU] INT8 FFN: routed eligible Lumina FeedForward through fused kernels"
+        "[OmniXPU] INT8 FFN: routed eligible %s through fused kernels",
+        ", ".join(patched_names),
     )
     return True, ""
 
