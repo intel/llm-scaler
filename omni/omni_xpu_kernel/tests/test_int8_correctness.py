@@ -11,6 +11,8 @@ Test structure mirrors comfy-kitchen's test_int8.py + test_qdq.py:
 - Cache reuse verification (when native available)
 """
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 
@@ -999,6 +1001,189 @@ class TestConvRot:
         assert output.shape == (109, 16)
         assert output.dtype == torch.float16
         assert calls == {"fused": 1, "rotate": 0, "prequantized": 1}
+
+    @pytest.mark.parametrize("inference_mode", [False, True])
+    def test_bmg_g16_public_linear_reuses_exact_qkv_activation(
+        self, device, seed, monkeypatch, inference_mode
+    ):
+        """One Q quantization is reused only by the following K and V calls."""
+        if device.type != "xpu":
+            pytest.skip("BMG QKV activation cache requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "quantize_int8_convrot_g16_bmg"
+        ):
+            pytest.skip("native extension is not a BMG build with the fused route")
+
+        calls = {"quantize": 0, "prequantized": 0}
+
+        class NativeProxy:
+            def int8_linear(self, *args):
+                raise AssertionError("generic linear route must not run")
+
+            def quantize_int8_convrot_g16_bmg(self, x):
+                calls["quantize"] += 1
+                rows = x.numel() // x.shape[-1]
+                return (
+                    torch.empty_like(x, dtype=torch.int8),
+                    torch.ones(rows, 1, device=x.device, dtype=torch.float32),
+                )
+
+            def int8_linear_prequantized(
+                self,
+                x_int8,
+                x_scale,
+                weight,
+                weight_scale,
+                bias,
+                dtype_code,
+            ):
+                calls["prequantized"] += 1
+                assert bias is None
+                assert dtype_code == 1
+                return torch.empty(
+                    (*x_int8.shape[:-1], weight.shape[0]),
+                    device=x_int8.device,
+                    dtype=torch.float16,
+                )
+
+        context = torch.inference_mode() if inference_mode else nullcontext()
+        with context:
+            x = torch.randn(109, 3360, device=device, dtype=torch.float16)
+            q_weight = torch.empty(
+                3360, 3360, device=device, dtype=torch.int8
+            )
+            kv_weight = torch.empty(
+                840, 3360, device=device, dtype=torch.int8
+            )
+            q_scale = torch.ones(3360, device=device, dtype=torch.float32)
+            kv_scale = torch.ones(840, device=device, dtype=torch.float32)
+
+            int8._clear_bmg_qkv_activation_cache()
+            monkeypatch.setattr(int8, "_get_native", lambda: NativeProxy())
+            q = int8.int8_linear(
+                x,
+                q_weight,
+                q_scale,
+                out_dtype=torch.float16,
+                convrot=True,
+                convrot_groupsize=16,
+            )
+            k = int8.int8_linear(
+                x,
+                kv_weight,
+                kv_scale,
+                out_dtype=torch.float16,
+                convrot=True,
+                convrot_groupsize=16,
+            )
+            v = int8.int8_linear(
+                x,
+                kv_weight,
+                kv_scale,
+                out_dtype=torch.float16,
+                convrot=True,
+                convrot_groupsize=16,
+            )
+            extra = int8.int8_linear(
+                x,
+                kv_weight,
+                kv_scale,
+                out_dtype=torch.float16,
+                convrot=True,
+                convrot_groupsize=16,
+            )
+
+        assert torch.is_inference(x) is inference_mode
+        assert q.shape == (109, 3360)
+        assert k.shape == v.shape == extra.shape == (109, 840)
+        assert calls == {"quantize": 2, "prequantized": 4}
+        int8._clear_bmg_qkv_activation_cache()
+
+    def test_bmg_g16_qkv_cache_observes_tensor_mutation(
+        self, device, seed, monkeypatch
+    ):
+        """A normal tensor version change invalidates a pending Q cache."""
+        if device.type != "xpu":
+            pytest.skip("BMG QKV activation cache requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "quantize_int8_convrot_g16_bmg"
+        ):
+            pytest.skip("native extension is not a BMG build with the fused route")
+
+        quantize_calls = 0
+
+        class NativeProxy:
+            def int8_linear(self, *args):
+                raise AssertionError("generic linear route must not run")
+
+            def quantize_int8_convrot_g16_bmg(self, x):
+                nonlocal quantize_calls
+                quantize_calls += 1
+                rows = x.numel() // x.shape[-1]
+                return (
+                    torch.empty_like(x, dtype=torch.int8),
+                    torch.ones(rows, 1, device=x.device, dtype=torch.float32),
+                )
+
+            def int8_linear_prequantized(
+                self,
+                x_int8,
+                x_scale,
+                weight,
+                weight_scale,
+                bias,
+                dtype_code,
+            ):
+                return torch.empty(
+                    (*x_int8.shape[:-1], weight.shape[0]),
+                    device=x_int8.device,
+                    dtype=torch.float16,
+                )
+
+        x = torch.randn(109, 3360, device=device, dtype=torch.float16)
+        q_weight = torch.empty(3360, 3360, device=device, dtype=torch.int8)
+        kv_weight = torch.empty(840, 3360, device=device, dtype=torch.int8)
+        q_scale = torch.ones(3360, device=device, dtype=torch.float32)
+        kv_scale = torch.ones(840, device=device, dtype=torch.float32)
+
+        int8._clear_bmg_qkv_activation_cache()
+        monkeypatch.setattr(int8, "_get_native", lambda: NativeProxy())
+        int8.int8_linear(
+            x,
+            q_weight,
+            q_scale,
+            out_dtype=torch.float16,
+            convrot=True,
+            convrot_groupsize=16,
+        )
+        x.add_(1)
+        int8.int8_linear(
+            x,
+            kv_weight,
+            kv_scale,
+            out_dtype=torch.float16,
+            convrot=True,
+            convrot_groupsize=16,
+        )
+        int8.int8_linear(
+            x,
+            kv_weight,
+            kv_scale,
+            out_dtype=torch.float16,
+            convrot=True,
+            convrot_groupsize=16,
+        )
+
+        assert quantize_calls == 3
+        int8._clear_bmg_qkv_activation_cache()
 
     def test_bmg_g16_public_shared_dispatches_to_pair(
         self, device, seed, monkeypatch

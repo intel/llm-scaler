@@ -35,8 +35,10 @@ Example:
     output = int8.int8_linear(x, w_int8, w_scale, convrot=True, convrot_groupsize=256)
 """
 
-import torch
+import threading
 from typing import Optional, Tuple
+
+import torch
 
 from ._reference import (
     quantize_int8_tensorwise as _ref_quantize_int8_tensorwise,
@@ -130,6 +132,109 @@ def _can_pair_int8_convrot_g16_bmg(
         ):
             return False
     return True
+
+
+_BMG_QKV_OUTPUT_FEATURES = (840, 3360)
+_bmg_qkv_activation_cache = threading.local()
+
+
+def _clear_bmg_qkv_activation_cache() -> None:
+    """Drop the current thread's exact Boogu QKV activation cache."""
+    _bmg_qkv_activation_cache.key = None
+    _bmg_qkv_activation_cache.input = None
+    _bmg_qkv_activation_cache.quantized = None
+    _bmg_qkv_activation_cache.scale = None
+    _bmg_qkv_activation_cache.remaining_hits = 0
+
+
+def _can_cache_int8_convrot_g16_bmg(
+    x: torch.Tensor,
+    native,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    convrot: bool,
+    convrot_groupsize: int,
+) -> bool:
+    """Return whether the exact Boogu image Q/K/V cache contract applies."""
+    if (
+        not _can_quantize_int8_convrot_g16_bmg(
+            x, native, convrot, convrot_groupsize
+        )
+        or out_dtype != torch.float16
+        or bias is not None
+        or not isinstance(weight, torch.Tensor)
+        or weight.device != x.device
+        or weight.dtype != torch.int8
+        or weight.ndim != 2
+        or weight.shape[1] != 3360
+        or weight.shape[0] not in _BMG_QKV_OUTPUT_FEATURES
+        or not weight.is_contiguous()
+        or not isinstance(weight_scale, torch.Tensor)
+        or weight_scale.device != x.device
+        or weight_scale.numel() != weight.shape[0]
+    ):
+        return False
+    return True
+
+
+def _bmg_qkv_input_key(x: torch.Tensor) -> tuple:
+    """Identify one activation on one XPU stream without synchronizing."""
+    stream = torch.xpu.current_stream(x.device)
+    is_inference = torch.is_inference(x)
+    version = None if is_inference else x._version
+    return (
+        x.device.index,
+        stream.stream_id,
+        x.data_ptr(),
+        x.storage_offset(),
+        tuple(x.shape),
+        tuple(x.stride()),
+        x.dtype,
+        is_inference,
+        version,
+    )
+
+
+def _quantize_int8_convrot_g16_bmg_qkv(
+    x: torch.Tensor,
+    native,
+    output_features: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reuse the Q activation quantization for the following K and V calls.
+
+    The exact Boogu attention sequence is one 3360-wide Q projection followed
+    immediately by two 840-wide K/V projections from the same activation.
+    Keeping the input alive prevents allocator pointer reuse; normal tensors
+    also carry their mutation version in the key. Inference tensors do not
+    expose a version counter, so their cache is deliberately limited to the
+    two consecutive K/V hits and is cleared by every non-matching linear call.
+    """
+    key = _bmg_qkv_input_key(x)
+    if (
+        output_features == 840
+        and getattr(_bmg_qkv_activation_cache, "key", None) == key
+        and getattr(_bmg_qkv_activation_cache, "remaining_hits", 0) > 0
+        and getattr(_bmg_qkv_activation_cache, "quantized", None) is not None
+        and getattr(_bmg_qkv_activation_cache, "scale", None) is not None
+    ):
+        x_int8 = _bmg_qkv_activation_cache.quantized
+        x_scale = _bmg_qkv_activation_cache.scale
+        _bmg_qkv_activation_cache.remaining_hits -= 1
+        if _bmg_qkv_activation_cache.remaining_hits == 0:
+            _clear_bmg_qkv_activation_cache()
+        return x_int8, x_scale
+
+    _clear_bmg_qkv_activation_cache()
+    x_int8, x_scale = native.quantize_int8_convrot_g16_bmg(x)
+    if output_features == 3360:
+        _bmg_qkv_activation_cache.key = key
+        _bmg_qkv_activation_cache.input = x
+        _bmg_qkv_activation_cache.quantized = x_int8
+        _bmg_qkv_activation_cache.scale = x_scale
+        _bmg_qkv_activation_cache.remaining_hits = 2
+    return x_int8, x_scale
 
 
 # =============================================================================
@@ -324,6 +429,28 @@ def int8_linear(
             torch.float16: 1,
             torch.bfloat16: 2,
         }.get(out_dtype, 2)
+        if _can_cache_int8_convrot_g16_bmg(
+            x,
+            native,
+            weight,
+            weight_scale,
+            bias,
+            out_dtype,
+            convrot,
+            convrot_groupsize,
+        ):
+            x_int8, x_scale = _quantize_int8_convrot_g16_bmg_qkv(
+                x, native, weight.shape[0]
+            )
+            return native.int8_linear_prequantized(
+                x_int8,
+                x_scale,
+                weight,
+                weight_scale,
+                bias,
+                dtype_code,
+            )
+        _clear_bmg_qkv_activation_cache()
         if _can_quantize_int8_convrot_g16_bmg(
             x, native, convrot, convrot_groupsize
         ):
@@ -353,6 +480,7 @@ def int8_linear(
         return native.int8_linear(
             x, weight, weight_scale, bias, dtype_code, False, convrot_groupsize
         )
+    _clear_bmg_qkv_activation_cache()
     return _ref_int8_linear(
         x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize
     )
@@ -394,6 +522,7 @@ def int8_linear_prequantized(
             "float32, float16, bfloat16"
         )
 
+    _clear_bmg_qkv_activation_cache()
     native = _get_native()
     if native is not None and hasattr(native, "int8_linear_prequantized"):
         return native.int8_linear_prequantized(
@@ -431,6 +560,7 @@ def int8_linear_shared_input(
     ConvRot, when requested, is also applied once and therefore must be shared
     by both weights.
     """
+    _clear_bmg_qkv_activation_cache()
     if out_dtype is None:
         out_dtype = x.dtype
     dtype_code = {
