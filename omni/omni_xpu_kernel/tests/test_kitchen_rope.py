@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import omni_xpu_kernel
 from omni_xpu_kernel import rotary
 
 
@@ -121,3 +122,44 @@ def test_kitchen_rope_real_workload_shapes(layout, shape, split_half):
         actual = rotary.apply_kitchen_rope1(x, freqs)
         expected = _adjacent_reference(x, freqs)
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+
+
+@pytest.mark.parametrize(
+    "sequence_length,heads",
+    [(109, 7), (109, 28), (4096, 7), (4205, 28)],
+)
+@pytest.mark.parametrize("split_half", [False, True])
+def test_kitchen_rope_bmg_d120_single_exact(
+    sequence_length, heads, split_half
+):
+    if not torch.xpu.is_available():
+        pytest.skip("XPU is unavailable")
+    if omni_xpu_kernel.core_aot_target() != "bmg":
+        pytest.skip("BMG-specific D120 route")
+
+    x = torch.randn(
+        1,
+        sequence_length,
+        heads,
+        120,
+        device="xpu",
+        dtype=torch.float16,
+    )
+    freqs = torch.randn(
+        1,
+        sequence_length,
+        1,
+        60,
+        2,
+        2,
+        device="xpu",
+        dtype=torch.float32,
+    )
+    assert rotary.kitchen_rope_fast_supported(x, freqs)
+    if split_half:
+        actual = rotary.apply_kitchen_rope_split_half1(x, freqs)
+        expected = _split_reference(x, freqs)
+    else:
+        actual = rotary.apply_kitchen_rope1(x, freqs)
+        expected = _adjacent_reference(x, freqs)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

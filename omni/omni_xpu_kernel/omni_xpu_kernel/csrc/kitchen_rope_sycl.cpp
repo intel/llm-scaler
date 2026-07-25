@@ -2,6 +2,7 @@
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 
 #include "utils.h"
@@ -52,6 +53,110 @@ bool supported_shape(const torch::Tensor& x, const torch::Tensor& freqs) {
            broadcastable_dim(freqs.size(2), x.size(2), true) &&
            broadcastable_dim(freqs.size(3), pairs, false);
 }
+
+#if defined(OMNI_XPU_ARCH_BMG)
+bool d120_bmg_single_supported(
+    const torch::Tensor& x,
+    const torch::Tensor& freqs) {
+    if (!x.device().is_xpu() || !freqs.device().is_xpu() ||
+        x.device() != freqs.device()) {
+        return false;
+    }
+    if (x.scalar_type() != torch::kFloat16 ||
+        freqs.scalar_type() != torch::kFloat32) {
+        return false;
+    }
+    if (!x.is_contiguous() || !freqs.is_contiguous()) return false;
+    if (x.dim() != 4 || freqs.dim() != 6) return false;
+    if (x.size(0) != 1 || x.size(3) != 120) return false;
+    if (x.size(2) != 7 && x.size(2) != 28) return false;
+    if (x.numel() > std::numeric_limits<uint32_t>::max() ||
+        freqs.numel() > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    return freqs.size(0) == 1 &&
+           freqs.size(1) == x.size(1) &&
+           freqs.size(2) == 1 &&
+           freqs.size(3) == 60 &&
+           freqs.size(4) == 2 &&
+           freqs.size(5) == 2;
+}
+
+inline fp16 apply_d120_component(
+    float f0,
+    float f1,
+    fp16 x0,
+    fp16 x1) {
+    const float product = f0 * static_cast<float>(x0);
+    return static_cast<fp16>(
+        sycl::fma(f1, static_cast<float>(x1), product));
+}
+
+// Boogu's single-input D120 route reuses each token/pair frequency matrix
+// across all heads. One work-group per token removes the generic kernel's
+// repeated 64-bit index decomposition and redundant frequency loads.
+template <uint32_t Heads>
+void launch_rope_d120_bmg(
+    const torch::Tensor& x,
+    const torch::Tensor& freqs,
+    torch::Tensor& output) {
+    constexpr uint32_t HeadDim = 120;
+    constexpr uint32_t Pairs = HeadDim / 2;
+    constexpr uint32_t FreqValuesPerToken = Pairs * 4;
+    constexpr uint32_t WG = 64;
+
+    const auto* x_ptr = reinterpret_cast<const fp16*>(x.data_ptr());
+    const auto* f_ptr = freqs.data_ptr<float>();
+    auto* out_ptr = reinterpret_cast<fp16*>(output.data_ptr());
+    const uint32_t tokens = static_cast<uint32_t>(x.size(1));
+
+    auto cgf = [&](sycl::handler& handler) {
+        handler.parallel_for(
+            sycl::nd_range<1>(
+                sycl::range<1>(static_cast<size_t>(tokens) * WG),
+                sycl::range<1>(WG)),
+            [=](sycl::nd_item<1> item) {
+                const uint32_t token =
+                    static_cast<uint32_t>(item.get_group(0));
+                const uint32_t pair =
+                    static_cast<uint32_t>(item.get_local_id(0));
+                if (pair >= Pairs) return;
+
+                const uint32_t token_x_base = token * Heads * HeadDim;
+                const uint32_t f_offset =
+                    token * FreqValuesPerToken + pair * 4;
+                const float f00 = f_ptr[f_offset];
+                const float f01 = f_ptr[f_offset + 1];
+                const float f10 = f_ptr[f_offset + 2];
+                const float f11 = f_ptr[f_offset + 3];
+
+#pragma unroll
+                for (uint32_t head = 0; head < Heads; ++head) {
+                    const uint32_t x_offset =
+                        token_x_base + head * HeadDim + pair * 2;
+                    const fp16 x0 = x_ptr[x_offset];
+                    const fp16 x1 = x_ptr[x_offset + 1];
+                    out_ptr[x_offset] =
+                        apply_d120_component(f00, f01, x0, x1);
+                    out_ptr[x_offset + 1] =
+                        apply_d120_component(f10, f11, x0, x1);
+                }
+            });
+    };
+    utils::submit_kernel(cgf, x.device(), "kitchen_rope_d120_bmg");
+}
+
+void dispatch_rope_d120_bmg(
+    const torch::Tensor& x,
+    const torch::Tensor& freqs,
+    torch::Tensor& output) {
+    if (x.size(2) == 7) {
+        launch_rope_d120_bmg<7>(x, freqs, output);
+    } else {
+        launch_rope_d120_bmg<28>(x, freqs, output);
+    }
+}
+#endif
 
 template <typename T>
 T force_dtype_round(T value) {
@@ -356,6 +461,14 @@ torch::Tensor apply_kitchen_rope1_fast(
     TORCH_CHECK(supported_shape(x, freqs), "unsupported fast RoPE shape");
     auto output = torch::empty_like(x);
     auto unused = torch::Tensor();
+#if defined(OMNI_XPU_ARCH_BMG)
+    if (!split_half && d120_bmg_single_supported(x, freqs)) {
+        if (output.numel() != 0) {
+            dispatch_rope_d120_bmg(x, freqs, output);
+        }
+        return output;
+    }
+#endif
     if (split_half) {
         dispatch_input<true, false>(x, unused, freqs, output, unused);
     } else {
