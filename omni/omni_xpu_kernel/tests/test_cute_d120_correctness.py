@@ -57,10 +57,11 @@ def test_cute_d120_matches_torch_for_workflow_layouts(dtype):
 @pytest.mark.skipif(
     not has_bmg_d120(), reason="BMG CUTE D120 sidecar unavailable"
 )
-def test_cute_d120_bmg_matches_workflow_remainder_length():
+@pytest.mark.parametrize("sequence", [4096, 4205])
+def test_cute_d120_bmg_matches_workflow_lengths(sequence):
     from omni_xpu_kernel import cute
 
-    batch, heads, sequence, dim = 1, 28, 4205, 120
+    batch, heads, dim = 1, 28, 120
     q = torch.randn(
         batch, sequence, heads, dim, device="xpu", dtype=torch.float16
     ).permute(0, 2, 1, 3)

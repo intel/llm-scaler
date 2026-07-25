@@ -95,9 +95,19 @@ static int checked_int(int64_t value, const char* label) {
 // ---- kernel type assembly (128-wide tile, example-06 PREFILL path) ----------
 // KV tile = get<1>(ShapeQK). Default 32 (stock example-06). -DCUTE_FMHA_KV64
 // switches to a 64-wide KV tile (fewer K-loop iters at large seq — omni uses 64).
-template <typename Element, int PipelineStagesOverride = 0>
+template <
+    typename Element,
+    int PipelineStagesOverride = 0,
+    int QTileOverride = 0,
+    int SubgroupLayoutQOverride = 0>
 struct D128TileKernel {
   using PlatformConfig = cute_fmha_config::ActiveConfig;
+  static constexpr int QTile =
+      QTileOverride > 0 ? QTileOverride : PlatformConfig::Q_TILE;
+  static constexpr int SubgroupLayoutQ =
+      SubgroupLayoutQOverride > 0
+          ? SubgroupLayoutQOverride
+          : PlatformConfig::SUBGROUP_LAYOUT_Q;
 #if defined(CUTE_FMHA_KV64)
   // KV tile = get<1>(ShapeQK) = 64. Per get_tiled_mma_pv, the PV tile must be
   // <TileQ, TileV, KVtile> — so ShapePV's K-dim (3rd) MUST equal 64, not 32.
@@ -108,13 +118,13 @@ struct D128TileKernel {
   static constexpr int KvTile = PlatformConfig::KV_TILE;
 #endif
   using ShapeQK = Shape<
-      Int<PlatformConfig::Q_TILE>, Int<KvTile>, Int<PlatformConfig::MMA_K>>;
+      Int<QTile>, Int<KvTile>, Int<PlatformConfig::MMA_K>>;
   using ShapePV = Shape<
-      Int<PlatformConfig::Q_TILE>, Int<PlatformConfig::V_TILE>, Int<KvTile>>;
+      Int<QTile>, Int<PlatformConfig::V_TILE>, Int<KvTile>>;
   using ShapeOutput = Shape<
-      Int<PlatformConfig::Q_TILE>, Int<PlatformConfig::HEAD_DIM>>;
+      Int<QTile>, Int<PlatformConfig::HEAD_DIM>>;
   using SubgroupLayoutQK = Layout<
-      Shape<Int<PlatformConfig::SUBGROUP_LAYOUT_Q>, _1, _1>>;
+      Shape<Int<SubgroupLayoutQ>, _1, _1>>;
 #ifdef CUTE_FMHA_STAGES
   static constexpr int PipelineStages = CUTE_FMHA_STAGES;
 #else
@@ -176,7 +186,11 @@ struct D128TileKernel {
       cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>;
 };
 
-template <typename Element, int PipelineStagesOverride = 0>
+template <
+    typename Element,
+    int PipelineStagesOverride = 0,
+    int QTileOverride = 0,
+    int SubgroupLayoutQOverride = 0>
 void run_d128_tile(
     const void* q_ptr, const void* k_ptr, const void* v_ptr, void* o_ptr,
     int B, int H, int Lq, int Lkv, int D, float scale,
@@ -186,7 +200,11 @@ void run_d128_tile(
     int64_t v_stride_seq = -1, int64_t v_stride_head = -1,
     int64_t v_stride_batch = -1, int64_t o_stride_seq = -1,
     int64_t o_stride_head = -1, int64_t o_stride_batch = -1) {
-  using KT   = D128TileKernel<Element, PipelineStagesOverride>;
+  using KT = D128TileKernel<
+      Element,
+      PipelineStagesOverride,
+      QTileOverride,
+      SubgroupLayoutQOverride>;
   using K    = typename KT::Kernel;
   using PS   = typename KT::ProblemShapeType;
 
@@ -368,6 +386,20 @@ at::Tensor sdp_bhld_d120(
   at::Tensor o = at::empty({B, L, H, D}, q.options()).permute({0, 2, 1, 3});
   const float scale = 1.0f / std::sqrt((float)D);
   if (q.scalar_type() == at::kHalf) {
+#if defined(OMNI_XPU_ARCH_BMG)
+    // L4096 has no Q-tile remainder.  Doubling both the Q tile and subgroup
+    // count preserves the proven 16-row per-subgroup fragment while halving
+    // work-group scheduling and reusing each K/V traversal across twice as
+    // many queries.  L4205 retains Q256/SG16 because its Q512 tail regresses.
+    if (L == 4096) {
+      run_d128_tile<cutlass::half_t, 1, 512, 32>(
+          q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(), B, H, L, L,
+          D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+          k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+          o.stride(2), o.stride(1), o.stride(0));
+      return o;
+    }
+#endif
     run_d128_tile<cutlass::half_t, 1>(
         q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(), B, H, L, L, D,
         scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
