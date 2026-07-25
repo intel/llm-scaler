@@ -84,6 +84,13 @@ namespace int8_ops {
         torch::Tensor x_int8, torch::Tensor x_scale, torch::Tensor weight,
         torch::Tensor weight_scale, std::optional<torch::Tensor> bias,
         int64_t out_dtype_code);
+#if defined(OMNI_XPU_ARCH_BMG)
+    std::tuple<torch::Tensor, torch::Tensor> int8_linear_pair_prequantized(
+        torch::Tensor x_int8, torch::Tensor x_scale,
+        torch::Tensor weight1, torch::Tensor weight_scale1,
+        torch::Tensor weight2, torch::Tensor weight_scale2,
+        int64_t out_dtype_code);
+#endif
     std::tuple<torch::Tensor, torch::Tensor> int8_linear_shared_input(
         torch::Tensor x, torch::Tensor weight1, torch::Tensor weight_scale1,
         torch::Tensor weight2, torch::Tensor weight_scale2,
@@ -365,6 +372,20 @@ PYBIND11_MODULE(_C, m) {
         py::arg("x_int8"), py::arg("x_scale"), py::arg("weight"),
         py::arg("weight_scale"), py::arg("bias") = py::none(),
         py::arg("out_dtype_code") = 2);
+#if defined(OMNI_XPU_ARCH_BMG)
+    int8.def(
+        "int8_linear_pair_prequantized",
+        &omni_xpu::int8_ops::int8_linear_pair_prequantized,
+        "BMG paired INT8 linears sharing one prequantized activation and "
+        "one oneDNN setup path.\n"
+        "Input: x_int8 [...,K], row scale, and two same-shaped [N,K] "
+        "weights with per-channel scales.\n"
+        "Output: two [...,N] floating tensors.",
+        py::arg("x_int8"), py::arg("x_scale"),
+        py::arg("weight1"), py::arg("weight_scale1"),
+        py::arg("weight2"), py::arg("weight_scale2"),
+        py::arg("out_dtype_code") = 1);
+#endif
     int8.def("int8_linear_shared_input", &omni_xpu::int8_ops::int8_linear_shared_input,
         "Two INT8 linear projections sharing one dynamic rowwise activation quantization.\n"
         "Input: x [..., K] fp16/bf16 and two INT8 [N, K] weights\n"

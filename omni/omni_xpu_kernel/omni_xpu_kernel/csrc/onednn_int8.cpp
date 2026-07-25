@@ -15,6 +15,7 @@
 // Primitive caching: keyed by {device, M, K, N} to amortize creation cost.
 // ============================================================================
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -142,6 +143,17 @@ struct Int8ScaledState {
     bool w_scale_is_scalar;
 };
 
+struct Int8PairState {
+    dnnl::engine engine;
+    dnnl::memory::desc src_md;
+    dnnl::memory::desc wei_md;
+    dnnl::memory::desc dst_md;
+    dnnl::memory::desc src_scale_md;
+    dnnl::memory::desc wei_scale_md;
+    dnnl::memory::desc scratchpad_md;
+    dnnl::matmul primitive;
+};
+
 struct Int8ScaledCacheKey {
     int device_index;
     int out_dtype;  // 0=f32, 1=f16, 2=bf16
@@ -177,8 +189,42 @@ struct Int8ScaledCacheKeyHash {
     }
 };
 
+struct Int8PairCacheKey {
+    int device_index;
+    int out_dtype;
+    int64_t m;
+    int64_t k;
+    int64_t n;
+
+    bool operator==(const Int8PairCacheKey& other) const {
+        return device_index == other.device_index
+            && out_dtype == other.out_dtype
+            && m == other.m && k == other.k && n == other.n;
+    }
+};
+
+struct Int8PairCacheKeyHash {
+    size_t operator()(const Int8PairCacheKey& key) const {
+        size_t seed = 0;
+        auto combine = [&](size_t value) {
+            seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+        };
+        combine(std::hash<int>{}(key.device_index));
+        combine(std::hash<int>{}(key.out_dtype));
+        combine(std::hash<int64_t>{}(key.m));
+        combine(std::hash<int64_t>{}(key.k));
+        combine(std::hash<int64_t>{}(key.n));
+        return seed;
+    }
+};
+
 std::unordered_map<Int8ScaledCacheKey, std::shared_ptr<Int8ScaledState>, Int8ScaledCacheKeyHash>& int8_scaled_cache() {
     static std::unordered_map<Int8ScaledCacheKey, std::shared_ptr<Int8ScaledState>, Int8ScaledCacheKeyHash> cache;
+    return cache;
+}
+
+std::unordered_map<Int8PairCacheKey, std::shared_ptr<Int8PairState>, Int8PairCacheKeyHash>& int8_pair_cache() {
+    static std::unordered_map<Int8PairCacheKey, std::shared_ptr<Int8PairState>, Int8PairCacheKeyHash> cache;
     return cache;
 }
 
@@ -266,6 +312,68 @@ std::shared_ptr<Int8ScaledState> get_or_create_int8_scaled_primitive(
     return state;
 }
 
+std::shared_ptr<Int8PairState> get_or_create_int8_pair_primitive(
+    int64_t m,
+    int64_t k,
+    int64_t n,
+    int out_dtype_code,
+    const torch::Device& device,
+    const sycl::queue& queue
+) {
+    Int8PairCacheKey key{device.index(), out_dtype_code, m, k, n};
+
+    auto& cache = int8_pair_cache();
+    auto& counters = int8_cache_counters();
+    std::lock_guard<std::mutex> lock(int8_cache_mutex());
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        ++counters.hits;
+        return it->second;
+    }
+
+    DT dst_dt;
+    switch (out_dtype_code) {
+        case 1: dst_dt = DT::f16; break;
+        case 2: dst_dt = DT::bf16; break;
+        default:
+            TORCH_CHECK(
+                false,
+                "paired INT8 linear supports float16 or bfloat16 output");
+    }
+
+    auto state = std::make_shared<Int8PairState>();
+    state->engine = dnnl::sycl_interop::make_engine(
+        queue.get_device(), queue.get_context());
+    state->src_md = dnnl::memory::desc(
+        {m, k}, DT::s8, dnnl::memory::format_tag::ab);
+    state->wei_md = dnnl::memory::desc(
+        {k, n}, DT::s8, dnnl::memory::format_tag::ba);
+    state->dst_md = dnnl::memory::desc(
+        {m, n}, dst_dt, dnnl::memory::format_tag::ab);
+    state->src_scale_md = dnnl::memory::desc(
+        {m}, DT::f32, dnnl::memory::format_tag::a);
+    state->wei_scale_md = dnnl::memory::desc(
+        {n}, DT::f32, dnnl::memory::format_tag::a);
+
+    dnnl::primitive_attr attr;
+    attr.set_scales(
+        DNNL_ARG_SRC, (1 << 0) | (1 << 1), {1, k}, DT::f32);
+    attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 1), {}, DT::f32);
+    attr.set_fpmath_mode(dnnl::fpmath_mode::any, true);
+    attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+    dnnl::matmul::primitive_desc pd(
+        state->engine,
+        state->src_md,
+        state->wei_md,
+        state->dst_md,
+        attr);
+    state->scratchpad_md = pd.scratchpad_desc();
+    state->primitive = dnnl::matmul(pd);
+    cache.emplace(key, state);
+    ++counters.misses;
+    return state;
+}
+
 std::shared_ptr<Int8PrimitiveState> get_or_create_int8_primitive(
     int64_t m,
     int64_t k,
@@ -337,6 +445,7 @@ void int8_cache_clear() {
     std::lock_guard<std::mutex> lock(int8_cache_mutex());
     int8_primitive_cache().clear();
     int8_scaled_cache().clear();
+    int8_pair_cache().clear();
     int8_cache_counters() = {};
 }
 
@@ -346,7 +455,10 @@ std::tuple<int64_t, int64_t, int64_t> int8_cache_stats() {
     return {
         counters.hits,
         counters.misses,
-        static_cast<int64_t>(int8_primitive_cache().size() + int8_scaled_cache().size()),
+        static_cast<int64_t>(
+            int8_primitive_cache().size()
+            + int8_scaled_cache().size()
+            + int8_pair_cache().size()),
     };
 }
 
@@ -500,6 +612,134 @@ torch::Tensor int8_linear_prequantized(
 
     return output.reshape(out_sizes);
 }
+
+#if defined(OMNI_XPU_ARCH_BMG)
+std::tuple<torch::Tensor, torch::Tensor> int8_linear_pair_prequantized(
+    torch::Tensor x_int8,
+    torch::Tensor x_scale,
+    torch::Tensor weight1,
+    torch::Tensor weight_scale1,
+    torch::Tensor weight2,
+    torch::Tensor weight_scale2,
+    int64_t out_dtype_code
+) {
+    TORCH_CHECK(x_int8.dim() >= 1,
+        "x_int8 must have at least one dimension");
+    TORCH_CHECK(x_int8.device().is_xpu(),
+        "x_int8 must be on XPU device");
+    TORCH_CHECK(x_int8.scalar_type() == torch::kInt8,
+        "x_int8 must be int8");
+    TORCH_CHECK(weight1.dim() == 2 && weight2.dim() == 2,
+        "weights must be 2D [N,K]");
+    TORCH_CHECK(weight1.sizes() == weight2.sizes(),
+        "paired weights must have the same shape");
+    TORCH_CHECK(weight1.device() == x_int8.device()
+            && weight2.device() == x_int8.device(),
+        "paired weights must be on the input XPU device");
+    TORCH_CHECK(weight1.scalar_type() == torch::kInt8
+            && weight2.scalar_type() == torch::kInt8,
+        "paired weights must be int8");
+    TORCH_CHECK(out_dtype_code == 1 || out_dtype_code == 2,
+        "paired output must be float16 or bfloat16");
+
+    const int64_t k = x_int8.size(-1);
+    const int64_t n = weight1.size(0);
+    TORCH_CHECK(k > 0 && n > 0, "paired dimensions must be positive");
+    TORCH_CHECK(weight1.size(1) == k,
+        "paired weight K must match x_int8 K");
+    const auto input_sizes = x_int8.sizes().vec();
+    x_int8 = x_int8.reshape({-1, k}).contiguous();
+    const int64_t m = x_int8.size(0);
+    weight1 = weight1.contiguous();
+    weight2 = weight2.contiguous();
+    x_scale = x_scale.to(x_int8.device())
+                  .to(torch::kFloat32)
+                  .reshape(-1)
+                  .contiguous();
+    weight_scale1 = weight_scale1.to(x_int8.device())
+                        .to(torch::kFloat32)
+                        .reshape(-1)
+                        .contiguous();
+    weight_scale2 = weight_scale2.to(x_int8.device())
+                        .to(torch::kFloat32)
+                        .reshape(-1)
+                        .contiguous();
+    TORCH_CHECK(x_scale.numel() == m,
+        "x_scale must contain one value per flattened activation row");
+    TORCH_CHECK(weight_scale1.numel() == n
+            && weight_scale2.numel() == n,
+        "paired weight scales must contain one value per output channel");
+
+    const torch::ScalarType out_dtype = out_dtype_code == 1
+        ? torch::kHalf
+        : torch::kBFloat16;
+    std::vector<int64_t> output_sizes(
+        input_sizes.begin(), input_sizes.end() - 1);
+    output_sizes.push_back(n);
+    if (m == 0) {
+        auto options = torch::TensorOptions()
+            .dtype(out_dtype)
+            .device(x_int8.device());
+        return {
+            torch::empty(output_sizes, options),
+            torch::empty(output_sizes, options),
+        };
+    }
+
+    sycl::queue& queue = omni_xpu::utils::get_queue(x_int8.device());
+    auto state = get_or_create_int8_pair_primitive(
+        m, k, n, static_cast<int>(out_dtype_code), x_int8.device(), queue);
+    auto output1 = torch::empty(
+        {m, n},
+        torch::TensorOptions().dtype(out_dtype).device(x_int8.device()));
+    auto output2 = torch::empty_like(output1);
+    const int64_t scratchpad_bytes = std::max<int64_t>(
+        1, static_cast<int64_t>(state->scratchpad_md.get_size()));
+    auto scratchpad = torch::empty(
+        {scratchpad_bytes},
+        torch::TensorOptions().dtype(torch::kUInt8).device(x_int8.device()));
+    dnnl::stream stream = dnnl::sycl_interop::make_stream(
+        state->engine, queue);
+
+    auto execute = [&](torch::Tensor& weight,
+                       torch::Tensor& weight_scale,
+                       torch::Tensor& output) {
+        std::unordered_map<int, dnnl::memory> args = {
+            {DNNL_ARG_SRC,
+             dnnl::memory(
+                 state->src_md, state->engine, x_int8.data_ptr())},
+            {DNNL_ARG_WEIGHTS,
+             dnnl::memory(
+                 state->wei_md, state->engine, weight.data_ptr())},
+            {DNNL_ARG_DST,
+             dnnl::memory(
+                 state->dst_md, state->engine, output.data_ptr())},
+            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC,
+             dnnl::memory(
+                 state->src_scale_md,
+                 state->engine,
+                 x_scale.data_ptr())},
+            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS,
+             dnnl::memory(
+                 state->wei_scale_md,
+                 state->engine,
+                 weight_scale.data_ptr())},
+            {DNNL_ARG_SCRATCHPAD,
+             dnnl::memory(
+                 state->scratchpad_md,
+                 state->engine,
+                 scratchpad.data_ptr())},
+        };
+        state->primitive.execute(stream, args);
+    };
+    execute(weight1, weight_scale1, output1);
+    execute(weight2, weight_scale2, output2);
+    return {
+        output1.reshape(output_sizes),
+        output2.reshape(output_sizes),
+    };
+}
+#endif
 
 std::tuple<torch::Tensor, torch::Tensor> int8_linear_shared_input(
     torch::Tensor x,

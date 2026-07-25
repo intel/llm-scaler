@@ -90,6 +90,48 @@ def _can_quantize_int8_convrot_g16_bmg(
     return rows in (109, 110, 4096, 4205, 4206)
 
 
+def _can_pair_int8_convrot_g16_bmg(
+    x: torch.Tensor,
+    native,
+    weight1: torch.Tensor,
+    weight_scale1: torch.Tensor,
+    weight2: torch.Tensor,
+    weight_scale2: torch.Tensor,
+    bias1: Optional[torch.Tensor],
+    bias2: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    convrot: bool,
+    convrot_groupsize: int,
+) -> bool:
+    """Return whether the exact Boogu shared-up pair route applies."""
+    if (
+        not _can_quantize_int8_convrot_g16_bmg(
+            x, native, convrot, convrot_groupsize
+        )
+        or not hasattr(native, "int8_linear_pair_prequantized")
+        or out_dtype != torch.float16
+        or bias1 is not None
+        or bias2 is not None
+    ):
+        return False
+    for weight, scale in (
+        (weight1, weight_scale1),
+        (weight2, weight_scale2),
+    ):
+        if (
+            not isinstance(weight, torch.Tensor)
+            or weight.device != x.device
+            or weight.dtype != torch.int8
+            or weight.shape != (13568, 3360)
+            or not weight.is_contiguous()
+            or not isinstance(scale, torch.Tensor)
+            or scale.device != x.device
+            or scale.numel() != 13568
+        ):
+            return False
+    return True
+
+
 # =============================================================================
 # Public API — dispatch to native or fallback to reference
 # =============================================================================
@@ -404,6 +446,29 @@ def int8_linear_shared_input(
 
     native = _get_native()
     if native is not None and hasattr(native, "int8_linear_shared_input"):
+        if _can_pair_int8_convrot_g16_bmg(
+            x,
+            native,
+            weight1,
+            weight_scale1,
+            weight2,
+            weight_scale2,
+            bias1,
+            bias2,
+            out_dtype,
+            convrot,
+            convrot_groupsize,
+        ):
+            x_int8, x_scale = native.quantize_int8_convrot_g16_bmg(x)
+            return native.int8_linear_pair_prequantized(
+                x_int8,
+                x_scale,
+                weight1,
+                weight_scale1,
+                weight2,
+                weight_scale2,
+                dtype_code,
+            )
         if convrot:
             if x.shape[-1] % convrot_groupsize != 0:
                 raise ValueError(

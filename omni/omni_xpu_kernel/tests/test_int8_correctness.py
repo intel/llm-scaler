@@ -711,6 +711,56 @@ class TestInt8LinearSharedInput:
         assert stats["hits"] >= 1
         assert stats["size"] == 1
 
+    def test_bmg_prequantized_pair_matches_two_single_calls(
+        self, device, seed
+    ):
+        if device.type != "xpu":
+            pytest.skip("native paired Linear requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "int8_linear_pair_prequantized"
+        ):
+            pytest.skip("native extension is not a BMG build with paired Linear")
+
+        x_int8 = torch.randint(
+            -127, 128, (2, 7, 128), device=device, dtype=torch.int8
+        )
+        x_scale = torch.rand(14, device=device, dtype=torch.float32) * 0.02
+        weight1 = torch.randint(
+            -127, 128, (64, 128), device=device, dtype=torch.int8
+        )
+        weight2 = torch.randint(
+            -127, 128, (64, 128), device=device, dtype=torch.int8
+        )
+        scale1 = torch.rand(64, device=device, dtype=torch.float32) * 0.02
+        scale2 = torch.rand(64, device=device, dtype=torch.float32) * 0.02
+
+        actual1, actual2 = native.int8_linear_pair_prequantized(
+            x_int8,
+            x_scale,
+            weight1,
+            scale1,
+            weight2,
+            scale2,
+            1,
+        )
+        expected1 = native.int8_linear_prequantized(
+            x_int8, x_scale, weight1, scale1, None, 1
+        )
+        expected2 = native.int8_linear_prequantized(
+            x_int8, x_scale, weight2, scale2, None, 1
+        )
+
+        assert actual1.shape == (2, 7, 64)
+        assert actual2.shape == (2, 7, 64)
+        assert actual1.dtype == torch.float16
+        assert actual2.dtype == torch.float16
+        assert torch.equal(actual1, expected1)
+        assert torch.equal(actual2, expected2)
+
 
 class TestFusedSiluMulQuantize:
     """Tests for the no-floating-intermediate SwiGLU quantizer."""
@@ -949,6 +999,68 @@ class TestConvRot:
         assert output.shape == (109, 16)
         assert output.dtype == torch.float16
         assert calls == {"fused": 1, "rotate": 0, "prequantized": 1}
+
+    def test_bmg_g16_public_shared_dispatches_to_pair(
+        self, device, seed, monkeypatch
+    ):
+        if device.type != "xpu":
+            pytest.skip("BMG paired ConvRot route requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "int8_linear_pair_prequantized"
+        ):
+            pytest.skip("native extension is not a BMG build with paired Linear")
+
+        calls = {"fused": 0, "pair": 0, "rotate": 0, "shared": 0}
+
+        class NativeProxy:
+            def __getattr__(self, name):
+                return getattr(native, name)
+
+            def quantize_int8_convrot_g16_bmg(self, x):
+                calls["fused"] += 1
+                return native.quantize_int8_convrot_g16_bmg(x)
+
+            def int8_linear_pair_prequantized(self, *args):
+                calls["pair"] += 1
+                return native.int8_linear_pair_prequantized(*args)
+
+            def rotate_convrot(self, x, group_size):
+                calls["rotate"] += 1
+                return native.rotate_convrot(x, group_size)
+
+            def int8_linear_shared_input(self, *args):
+                calls["shared"] += 1
+                return native.int8_linear_shared_input(*args)
+
+        x = torch.randn(109, 3360, device=device, dtype=torch.float16)
+        weight1 = torch.zeros(
+            13568, 3360, device=device, dtype=torch.int8
+        )
+        weight2 = torch.zeros_like(weight1)
+        scale1 = torch.ones(13568, 1, device=device, dtype=torch.float32)
+        scale2 = torch.ones_like(scale1)
+
+        monkeypatch.setattr(int8, "_get_native", lambda: NativeProxy())
+        output1, output2 = int8.int8_linear_shared_input(
+            x,
+            weight1,
+            scale1,
+            weight2,
+            scale2,
+            out_dtype=torch.float16,
+            convrot=True,
+            convrot_groupsize=16,
+        )
+
+        assert output1.shape == (109, 13568)
+        assert output2.shape == (109, 13568)
+        assert output1.dtype == torch.float16
+        assert output2.dtype == torch.float16
+        assert calls == {"fused": 1, "pair": 1, "rotate": 0, "shared": 0}
 
     def test_hadamard_properties(self, device, seed):
         """Hadamard matrix is orthogonal and symmetric."""
