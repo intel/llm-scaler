@@ -38,8 +38,10 @@ namespace int8_ops {
 // work-item instead of serializing several transcendental operations.
 #define OMNI_SILU_MUL_ELEMENTS_PER_WI 1
 #elif defined(OMNI_XPU_ARCH_BMG)
-// Preserve the measured BMG launch geometry until it is tuned independently.
-#define OMNI_SILU_MUL_ELEMENTS_PER_WI 8
+// BMG workflow shapes are also math-pipeline limited: exposing each exp as an
+// independent work-item is faster than serializing eight transcendental
+// operations while preserving byte-exact FP16/BF16 output.
+#define OMNI_SILU_MUL_ELEMENTS_PER_WI 1
 #else
 #error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
 #endif
