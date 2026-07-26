@@ -16,7 +16,7 @@ namespace {
 #if defined(OMNI_XPU_ARCH_PTL_H)
 #define OMNI_FP8_DEQUANT_ELEMENTS_PER_WI 256
 #elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_FP8_DEQUANT_ELEMENTS_PER_WI 64
+#define OMNI_FP8_DEQUANT_ELEMENTS_PER_WI 256
 #else
 #error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
 #endif
@@ -64,8 +64,8 @@ void dequantize_kernel(
     int64_t numel,
     const at::Device& device) {
     constexpr int ElementsPerWorkItem = OMNI_FP8_DEQUANT_ELEMENTS_PER_WI;
-    // The 256-lane PTL-H decode uses double GRF and admits at most 32 work
-    // items in a work-group.
+    // The 256-lane PTL-H/BMG decode uses double GRF and admits at most 32
+    // work items in a work-group.
     constexpr int WorkGroupSize = 32;
     const int64_t work_items =
         (numel + ElementsPerWorkItem - 1) / ElementsPerWorkItem;
