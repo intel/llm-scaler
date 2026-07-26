@@ -205,6 +205,8 @@ class TestQuantizeInt8Rowwise:
         ("shape", "dtype"),
         [
             ((1024, 10240), torch.bfloat16),
+            ((4096, 3840), torch.bfloat16),
+            ((4128, 3840), torch.bfloat16),
             ((4096, 10240), torch.bfloat16),
             ((4128, 10240), torch.bfloat16),
             ((4192, 6144), torch.bfloat16),

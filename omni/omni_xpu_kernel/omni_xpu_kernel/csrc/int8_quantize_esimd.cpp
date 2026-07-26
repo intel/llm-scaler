@@ -238,13 +238,23 @@ struct RowwiseQuantizeBooguFFNDownPTLConfig {
 #endif
 
 #if defined(OMNI_XPU_ARCH_BMG)
-// BMG large-K BF16 routes use exact workflow shapes. Z-Image produces M=4096
-// and M=4128 K=10240 calls; Krea2 produces M=4192 at K=6144 and K=16384.
-// Process-isolated continuous benchmarks selected VEC8/SG20 for K=10240,
-// VEC8/SG12 for K=6144, and VEC8/SG32 for K=16384. K=6144 SG12 and SG20 were
-// effectively tied in the continuous benchmark; SG12 is the configuration
-// validated end to end. All selected configurations preserve byte-exact
-// Q/scale results.
+// BMG BF16 routes use exact workflow shapes. Z-Image produces M=4096 and
+// M=4128 at K=3840 and K=10240; Krea2 produces M=4192 at K=6144 and K=16384.
+// Process-isolated continuous benchmarks selected VEC8/SG16 for K=3840,
+// VEC8/SG20 for K=10240, VEC8/SG12 for K=6144, and VEC8/SG32 for K=16384.
+// K=6144 SG12 and SG20 were effectively tied in the continuous benchmark;
+// SG12 is the configuration validated end to end. All selected configurations
+// preserve byte-exact Q/scale results.
+struct RowwiseQuantizeZImageHiddenBMGConfig {
+    static constexpr int Columns = 3840;
+    static constexpr int ImageRows = 4096;
+    static constexpr int JointRows = 4128;
+    static constexpr int SubgroupSize = 32;
+    static constexpr int SubgroupsPerRow = 16;
+    static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
+    static constexpr int VectorWidth = 8;
+};
+
 struct RowwiseQuantizeZImageBMGConfig {
     static constexpr int Columns = 10240;
     static constexpr int ImageRows = 4096;
@@ -688,7 +698,16 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(
                 scales.data_ptr<float>(), M, x.device());
         } else {
 #elif defined(OMNI_XPU_ARCH_BMG)
-        if ((M == RowwiseQuantizeZImageBMGConfig::ImageRows ||
+        if ((M == RowwiseQuantizeZImageHiddenBMGConfig::ImageRows ||
+             M == RowwiseQuantizeZImageHiddenBMGConfig::JointRows) &&
+            K == RowwiseQuantizeZImageHiddenBMGConfig::Columns) {
+            quantize_int8_rowwise_large_ptl_kernel<
+                bf16, RowwiseQuantizeZImageHiddenBMGConfig>(
+                reinterpret_cast<const bf16*>(x.data_ptr()),
+                reinterpret_cast<int8_t*>(output.data_ptr()),
+                scales.data_ptr<float>(), M, x.device(),
+                "quantize_int8_rowwise_large_bmg");
+        } else if ((M == RowwiseQuantizeZImageBMGConfig::ImageRows ||
              M == RowwiseQuantizeZImageBMGConfig::JointRows) &&
             K == RowwiseQuantizeZImageBMGConfig::Columns) {
             quantize_int8_rowwise_large_ptl_kernel<
