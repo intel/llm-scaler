@@ -99,7 +99,8 @@ template <
     typename Element,
     int PipelineStagesOverride = 0,
     int QTileOverride = 0,
-    int SubgroupLayoutQOverride = 0>
+    int SubgroupLayoutQOverride = 0,
+    int MmaKOverride = 0>
 struct D128TileKernel {
   using PlatformConfig = cute_fmha_config::ActiveConfig;
   static constexpr int QTile =
@@ -108,6 +109,8 @@ struct D128TileKernel {
       SubgroupLayoutQOverride > 0
           ? SubgroupLayoutQOverride
           : PlatformConfig::SUBGROUP_LAYOUT_Q;
+  static constexpr int MmaK =
+      MmaKOverride > 0 ? MmaKOverride : PlatformConfig::MMA_K;
 #if defined(CUTE_FMHA_KV64)
   // KV tile = get<1>(ShapeQK) = 64. Per get_tiled_mma_pv, the PV tile must be
   // <TileQ, TileV, KVtile> — so ShapePV's K-dim (3rd) MUST equal 64, not 32.
@@ -118,7 +121,7 @@ struct D128TileKernel {
   static constexpr int KvTile = PlatformConfig::KV_TILE;
 #endif
   using ShapeQK = Shape<
-      Int<QTile>, Int<KvTile>, Int<PlatformConfig::MMA_K>>;
+      Int<QTile>, Int<KvTile>, Int<MmaK>>;
   using ShapePV = Shape<
       Int<QTile>, Int<PlatformConfig::V_TILE>, Int<KvTile>>;
   using ShapeOutput = Shape<
@@ -190,7 +193,8 @@ template <
     typename Element,
     int PipelineStagesOverride = 0,
     int QTileOverride = 0,
-    int SubgroupLayoutQOverride = 0>
+    int SubgroupLayoutQOverride = 0,
+    int MmaKOverride = 0>
 void run_d128_tile(
     const void* q_ptr, const void* k_ptr, const void* v_ptr, void* o_ptr,
     int B, int H, int Lq, int Lkv, int D, float scale,
@@ -204,7 +208,8 @@ void run_d128_tile(
       Element,
       PipelineStagesOverride,
       QTileOverride,
-      SubgroupLayoutQOverride>;
+      SubgroupLayoutQOverride,
+      MmaKOverride>;
   using K    = typename KT::Kernel;
   using PS   = typename KT::ProblemShapeType;
 
@@ -337,6 +342,19 @@ at::Tensor sdp(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
         qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), o.data_ptr(), B, H, Lq,
         Lkv, D, scale);
   } else if (q.scalar_type() == at::kBFloat16) {
+#if defined(OMNI_XPU_ARCH_BMG)
+    // Z-Image Turbo's canonical 1024x1024 workflow uses this exact self-
+    // attention contract.  On BMG, MMA-K16 reduces both forward and reverse
+    // publication micro time while Krea2 L4192/H48 remains fastest at the
+    // platform-default MMA-K32.  Keep the override exact instead of changing
+    // the platform-wide D128 policy.
+    if (Lq == 4128 && H == 30) {
+      run_d128_tile<cutlass::bfloat16_t, 0, 0, 0, 16>(
+          qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), o.data_ptr(), B, H, Lq,
+          Lkv, D, scale);
+      return o;
+    }
+#endif
     run_d128_tile<cutlass::bfloat16_t>(
         qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), o.data_ptr(), B, H, Lq,
         Lkv, D, scale);
