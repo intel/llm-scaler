@@ -985,30 +985,29 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_g16_bmg(
                     esimd::overaligned<4>);
                 esimd::barrier();
 
-                if (workitem == 0) {
-                    const auto maxima =
-                        esimd::slm_block_load<float, MaximaSlots>(
-                            MaximaOffset);
-                    auto valid_maxima = maxima;
+                // All 27 work-items read the same maxima vector and execute
+                // the same reduction order.  Replicating this small reduction
+                // avoids publishing inverse_scale through SLM and the second
+                // work-group barrier.  Only work-item 0 writes the public
+                // scale tensor.
+                const auto maxima =
+                    esimd::slm_block_load<float, MaximaSlots>(
+                        MaximaOffset);
+                auto valid_maxima = maxima;
 #pragma unroll
-                    for (int slot = WorkitemsPerRow;
-                         slot < MaximaSlots;
-                         ++slot) {
-                        valid_maxima[slot] = 0.0f;
-                    }
-                    const float row_max =
-                        esimd::hmax<float>(valid_maxima);
-                    float scale = row_max / 127.0f;
-                    if (scale < 1e-30f) scale = 1e-30f;
-                    scale_output[row] = scale;
-                    esimd::slm_block_store<float, 1>(
-                        ScaleOffset,
-                        esimd::simd<float, 1>(1.0f / scale));
+                for (int slot = WorkitemsPerRow;
+                     slot < MaximaSlots;
+                     ++slot) {
+                    valid_maxima[slot] = 0.0f;
                 }
-                esimd::barrier();
-
-                const float inverse_scale =
-                    esimd::slm_block_load<float, 1>(ScaleOffset)[0];
+                const float row_max =
+                    esimd::hmax<float>(valid_maxima);
+                float scale = row_max / 127.0f;
+                if (scale < 1e-30f) scale = 1e-30f;
+                if (workitem == 0) {
+                    scale_output[row] = scale;
+                }
+                const float inverse_scale = 1.0f / scale;
                 const auto cached =
                     esimd::slm_block_load<
                         fp16,
