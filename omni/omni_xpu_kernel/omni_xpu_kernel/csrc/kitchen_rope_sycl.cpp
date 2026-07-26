@@ -82,6 +82,25 @@ bool d120_bmg_single_supported(
            freqs.size(5) == 2;
 }
 
+bool krea2_bmg_pair_supported(
+    const torch::Tensor& xq,
+    const torch::Tensor& xk,
+    const torch::Tensor& freqs) {
+    return xq.device().is_xpu() && xk.device().is_xpu() &&
+           freqs.device().is_xpu() &&
+           xq.device() == xk.device() && xq.device() == freqs.device() &&
+           xq.scalar_type() == torch::kBFloat16 &&
+           xk.scalar_type() == torch::kBFloat16 &&
+           freqs.scalar_type() == torch::kFloat32 &&
+           xq.is_contiguous() && xk.is_contiguous() &&
+           freqs.is_contiguous() &&
+           xq.dim() == 4 && xk.dim() == 4 && freqs.dim() == 6 &&
+           xq.sizes() == torch::IntArrayRef({1, 48, 4192, 128}) &&
+           xk.sizes() == torch::IntArrayRef({1, 12, 4192, 128}) &&
+           freqs.sizes() ==
+               torch::IntArrayRef({1, 1, 4192, 64, 2, 2});
+}
+
 inline fp16 apply_d120_component(
     float f0,
     float f1,
@@ -165,6 +184,93 @@ T force_dtype_round(T value) {
     const Bits loaded = stored;
     return sycl::bit_cast<T>(loaded);
 }
+
+#if defined(OMNI_XPU_ARCH_BMG)
+inline void apply_krea2_bmg_pair(
+    const bf16* source,
+    bf16* destination,
+    uint32_t offset,
+    float f00,
+    float f01,
+    float f10,
+    float f11) {
+    const float x0 = static_cast<float>(source[offset]);
+    const float x1 = static_cast<float>(source[offset + 1]);
+    const float p00 = force_dtype_round<float>(f00 * x0);
+    const float p10 = force_dtype_round<float>(f10 * x0);
+    const float y0 = sycl::fma(f01, x1, p00);
+    const float y1 = sycl::fma(f11, x1, p10);
+    destination[offset] =
+        static_cast<bf16>(force_dtype_round<float>(y0));
+    destination[offset + 1] =
+        static_cast<bf16>(force_dtype_round<float>(y1));
+}
+
+// Krea2's Q/K use [1,H,S,D] with H48/H12 and broadcast one frequency
+// matrix over the heads. Align one WG64 with every token/head row to remove
+// the generic flat dispatch's repeated 64-bit index decomposition.
+void launch_rope_krea2_bmg(
+    const torch::Tensor& xq,
+    const torch::Tensor& xk,
+    const torch::Tensor& freqs,
+    torch::Tensor& out_q,
+    torch::Tensor& out_k) {
+    constexpr uint32_t Sequence = 4192;
+    constexpr uint32_t QueryHeads = 48;
+    constexpr uint32_t KeyHeads = 12;
+    constexpr uint32_t HeadDim = 128;
+    constexpr uint32_t Pairs = HeadDim / 2;
+    constexpr uint32_t WG = Pairs;
+
+    const auto* q_ptr = reinterpret_cast<const bf16*>(xq.data_ptr());
+    const auto* k_ptr = reinterpret_cast<const bf16*>(xk.data_ptr());
+    const auto* f_ptr = freqs.data_ptr<float>();
+    auto* oq_ptr = reinterpret_cast<bf16*>(out_q.data_ptr());
+    auto* ok_ptr = reinterpret_cast<bf16*>(out_k.data_ptr());
+
+    auto cgf = [&](sycl::handler& handler) {
+        handler.parallel_for(
+            sycl::nd_range<1>(
+                sycl::range<1>(
+                    static_cast<size_t>(Sequence) *
+                    (QueryHeads + KeyHeads) * WG),
+                sycl::range<1>(WG)),
+            [=](sycl::nd_item<1> item) {
+                const uint32_t group =
+                    static_cast<uint32_t>(item.get_group(0));
+                const uint32_t token =
+                    group / (QueryHeads + KeyHeads);
+                const uint32_t logical_head =
+                    group % (QueryHeads + KeyHeads);
+                const uint32_t pair =
+                    static_cast<uint32_t>(item.get_local_id(0));
+                const uint32_t fbase = (token * Pairs + pair) * 4;
+                const float f00 = f_ptr[fbase];
+                const float f01 = f_ptr[fbase + 1];
+                const float f10 = f_ptr[fbase + 2];
+                const float f11 = f_ptr[fbase + 3];
+
+                if (logical_head < QueryHeads) {
+                    const uint32_t offset =
+                        ((logical_head * Sequence + token) * HeadDim) +
+                        pair * 2;
+                    apply_krea2_bmg_pair(
+                        q_ptr, oq_ptr, offset, f00, f01, f10, f11);
+                } else {
+                    const uint32_t key_head =
+                        logical_head - QueryHeads;
+                    const uint32_t offset =
+                        ((key_head * Sequence + token) * HeadDim) +
+                        pair * 2;
+                    apply_krea2_bmg_pair(
+                        k_ptr, ok_ptr, offset, f00, f01, f10, f11);
+                }
+            });
+    };
+    utils::submit_kernel(
+        cgf, xq.device(), "kitchen_rope_krea2_bmg");
+}
+#endif
 
 template <typename InputT, typename FreqT, bool SplitHalf, bool Pair>
 void launch_rope(
@@ -487,6 +593,12 @@ std::tuple<torch::Tensor, torch::Tensor> apply_kitchen_rope_fast(
     TORCH_CHECK(xq.scalar_type() == xk.scalar_type(), "query and key dtypes must match");
     auto out_q = torch::empty_like(xq);
     auto out_k = torch::empty_like(xk);
+#if defined(OMNI_XPU_ARCH_BMG)
+    if (!split_half && krea2_bmg_pair_supported(xq, xk, freqs)) {
+        launch_rope_krea2_bmg(xq, xk, freqs, out_q, out_k);
+        return {out_q, out_k};
+    }
+#endif
 #if OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE
     if (xq.sizes() == xk.sizes()) {
         if (split_half) {

@@ -60,6 +60,30 @@ def test_kitchen_rope_pair_allows_different_query_key_shapes():
     torch.testing.assert_close(k_out, _adjacent_reference(k, freqs), rtol=0, atol=0)
 
 
+def test_kitchen_rope_bmg_krea2_pair_exact():
+    if not torch.xpu.is_available():
+        pytest.skip("XPU is unavailable")
+    if omni_xpu_kernel.core_aot_target() != "bmg":
+        pytest.skip("BMG-specific Krea2 pair route")
+
+    q = torch.randn(
+        1, 48, 4192, 128, device="xpu", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        1, 12, 4192, 128, device="xpu", dtype=torch.bfloat16
+    )
+    freqs = torch.randn(
+        1, 1, 4192, 64, 2, 2, device="xpu", dtype=torch.float32
+    )
+    q_out, k_out = rotary.apply_kitchen_rope(q, k, freqs)
+    torch.testing.assert_close(
+        q_out, _adjacent_reference(q, freqs), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        k_out, _adjacent_reference(k, freqs), rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("split_half", [False, True])
 def test_kitchen_rope_pair_same_shape(freqs_dtype, split_half):
