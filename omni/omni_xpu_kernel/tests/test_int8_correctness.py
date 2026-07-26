@@ -1185,6 +1185,177 @@ class TestConvRot:
         assert quantize_calls == 3
         int8._clear_bmg_qkv_activation_cache()
 
+    @pytest.mark.parametrize("inference_mode", [False, True])
+    def test_bmg_krea2_public_linear_reuses_exact_projection_activation(
+        self, device, seed, monkeypatch, inference_mode
+    ):
+        """Krea2 attention and MLP projections reuse only the same activation."""
+        if device.type != "xpu":
+            pytest.skip("BMG Krea2 activation cache requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        if not int8._is_bmg_package_and_core():
+            pytest.skip("test requires aligned BMG package and core targets")
+
+        calls = {"rotate": 0, "quantize": 0, "prequantized": 0}
+
+        class NativeProxy:
+            def int8_linear(self, *args):
+                raise AssertionError("generic linear route must not run")
+
+            def rotate_convrot(self, x, group_size):
+                calls["rotate"] += 1
+                assert group_size == 256
+                return x
+
+            def quantize_int8_rowwise_fused(self, x):
+                calls["quantize"] += 1
+                rows = x.numel() // x.shape[-1]
+                return (
+                    torch.empty_like(x, dtype=torch.int8),
+                    torch.ones(rows, 1, device=x.device, dtype=torch.float32),
+                )
+
+            def int8_linear_prequantized(
+                self,
+                x_int8,
+                x_scale,
+                weight,
+                weight_scale,
+                bias,
+                dtype_code,
+            ):
+                calls["prequantized"] += 1
+                assert bias is None
+                assert dtype_code == 2
+                return torch.empty(
+                    (*x_int8.shape[:-1], weight.shape[0]),
+                    device=x_int8.device,
+                    dtype=torch.bfloat16,
+                )
+
+        context = torch.inference_mode() if inference_mode else nullcontext()
+        with context:
+            x1 = torch.empty(
+                1, 4192, 6144, device=device, dtype=torch.bfloat16
+            )
+            x2 = torch.empty_like(x1)
+            weights = {
+                output_features: torch.empty(
+                    output_features,
+                    6144,
+                    device=device,
+                    dtype=torch.int8,
+                )
+                for output_features in (1536, 6144, 16384)
+            }
+            scales = {
+                output_features: torch.ones(
+                    output_features,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                for output_features in weights
+            }
+
+            int8._clear_bmg_krea2_activation_cache()
+            monkeypatch.setattr(int8, "_get_native", lambda: NativeProxy())
+            for output_features in (6144, 1536, 1536, 6144, 1536):
+                int8.int8_linear(
+                    x1,
+                    weights[output_features],
+                    scales[output_features],
+                    out_dtype=torch.bfloat16,
+                    convrot=True,
+                    convrot_groupsize=256,
+                )
+            for output_features in (16384, 16384):
+                int8.int8_linear(
+                    x2,
+                    weights[output_features],
+                    scales[output_features],
+                    out_dtype=torch.bfloat16,
+                    convrot=True,
+                    convrot_groupsize=256,
+                )
+
+        assert torch.is_inference(x1) is inference_mode
+        assert calls == {"rotate": 3, "quantize": 3, "prequantized": 7}
+        int8._clear_bmg_krea2_activation_cache()
+
+    def test_bmg_krea2_cache_observes_tensor_mutation(
+        self, device, seed, monkeypatch
+    ):
+        """A normal tensor version change invalidates a pending Krea2 entry."""
+        if device.type != "xpu":
+            pytest.skip("BMG Krea2 activation cache requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        if not int8._is_bmg_package_and_core():
+            pytest.skip("test requires aligned BMG package and core targets")
+
+        quantize_calls = 0
+
+        class NativeProxy:
+            def int8_linear(self, *args):
+                raise AssertionError("generic linear route must not run")
+
+            def rotate_convrot(self, x, group_size):
+                return x
+
+            def quantize_int8_rowwise_fused(self, x):
+                nonlocal quantize_calls
+                quantize_calls += 1
+                rows = x.numel() // x.shape[-1]
+                return (
+                    torch.empty_like(x, dtype=torch.int8),
+                    torch.ones(rows, 1, device=x.device, dtype=torch.float32),
+                )
+
+            def int8_linear_prequantized(
+                self,
+                x_int8,
+                x_scale,
+                weight,
+                weight_scale,
+                bias,
+                dtype_code,
+            ):
+                return torch.empty(
+                    (*x_int8.shape[:-1], weight.shape[0]),
+                    device=x_int8.device,
+                    dtype=torch.bfloat16,
+                )
+
+        x = torch.zeros(1, 4192, 6144, device=device, dtype=torch.bfloat16)
+        weight = torch.empty(6144, 6144, device=device, dtype=torch.int8)
+        scale = torch.ones(6144, device=device, dtype=torch.float32)
+
+        int8._clear_bmg_krea2_activation_cache()
+        monkeypatch.setattr(int8, "_get_native", lambda: NativeProxy())
+        int8.int8_linear(
+            x,
+            weight,
+            scale,
+            out_dtype=torch.bfloat16,
+            convrot=True,
+            convrot_groupsize=256,
+        )
+        x.add_(1)
+        int8.int8_linear(
+            x,
+            weight,
+            scale,
+            out_dtype=torch.bfloat16,
+            convrot=True,
+            convrot_groupsize=256,
+        )
+
+        assert quantize_calls == 2
+        int8._clear_bmg_krea2_activation_cache()
+
     def test_bmg_g16_public_shared_dispatches_to_pair(
         self, device, seed, monkeypatch
     ):
