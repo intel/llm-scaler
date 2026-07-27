@@ -15,6 +15,7 @@
 #include "esimd_kernels/fp8_GEMM_pert.h"
 #include "esimd_kernels/int4_GEMM.h"
 #include "esimd_kernels/fp8_GEMM_blockscale.h"
+#include "esimd_kernels/norm_gemv_fused.h"
 
 #define EXTRACT_PTR(var, tensor) auto var = reinterpret_cast<uint8_t*>(tensor.data_ptr())
 
@@ -134,5 +135,120 @@ at::Tensor esimd_gemm_fp8_blockscale(
         reinterpret_cast<fp16*>(p_out),
         (uint32_t)M, (uint32_t)N, (uint32_t)K,
         (uint32_t)block_n, (uint32_t)block_k, dpcpp_queue);
+    return output;
+}
+
+// ---- Fused dual FP8 block-scaled GEMV (decode M=1, shared input) ----
+at::Tensor esimd_gemv_fp8_blockscale_fused2(
+    at::Tensor input,
+    at::Tensor w0, at::Tensor s0, at::Tensor o0,
+    at::Tensor w1, at::Tensor s1, at::Tensor o1,
+    int64_t block_n, int64_t block_k) {
+    const int64_t K = w0.size(1);
+    const int64_t N0 = w0.size(0);
+    const int64_t N1 = w1.size(0);
+    TORCH_CHECK(input.scalar_type() == at::ScalarType::Half && input.size(0) == 1,
+                "esimd_gemv_fp8_blockscale_fused2: input must be fp16 [1,K]");
+    TORCH_CHECK(w0.scalar_type() == at::ScalarType::Float8_e4m3fn &&
+                    w1.scalar_type() == at::ScalarType::Float8_e4m3fn,
+                "esimd_gemv_fp8_blockscale_fused2: weights must be fp8_e4m3");
+    TORCH_CHECK(s0.scalar_type() == at::ScalarType::Float &&
+                    s1.scalar_type() == at::ScalarType::Float,
+                "esimd_gemv_fp8_blockscale_fused2: scales must be float32");
+    TORCH_CHECK(o0.scalar_type() == at::ScalarType::Half &&
+                    o1.scalar_type() == at::ScalarType::Half,
+                "esimd_gemv_fp8_blockscale_fused2: outputs must be fp16");
+    TORCH_CHECK(block_n == 128 && block_k == 128 && K % 128 == 0,
+                "esimd_gemv_fp8_blockscale_fused2: requires 128x128 blocks");
+    TORCH_CHECK(w1.size(1) == K && input.size(1) == K,
+                "esimd_gemv_fp8_blockscale_fused2: K mismatch");
+    const int64_t Kb = K / 128;
+    TORCH_CHECK(s0.size(0) == (N0 + 127) / 128 && s0.size(1) == Kb &&
+                    s1.size(0) == (N1 + 127) / 128 && s1.size(1) == Kb,
+                "esimd_gemv_fp8_blockscale_fused2: scale shape mismatch");
+    TORCH_CHECK(o0.numel() == N0 && o1.numel() == N1,
+                "esimd_gemv_fp8_blockscale_fused2: output shape mismatch");
+
+    EXTRACT_PTR(p_in, input);
+    EXTRACT_PTR(pw0, w0); EXTRACT_PTR(ps0, s0); EXTRACT_PTR(po0, o0);
+    EXTRACT_PTR(pw1, w1); EXTRACT_PTR(ps1, s1); EXTRACT_PTR(po1, o1);
+    auto& q = get_device_queue(input);
+    fp8_blockscale::gemv_fp8_blockscale_fused2_host(
+        reinterpret_cast<const fp16*>(p_in), pw0,
+        reinterpret_cast<const float*>(ps0), reinterpret_cast<fp16*>(po0),
+        (uint32_t)N0, pw1, reinterpret_cast<const float*>(ps1),
+        reinterpret_cast<fp16*>(po1), (uint32_t)N1, (uint32_t)K, q);
+    return o0;
+}
+
+at::Tensor esimd_gemv_fp8_blockscale_fp16_fused2(
+    at::Tensor input, at::Tensor w0, at::Tensor s0, at::Tensor o0,
+    at::Tensor w1, at::Tensor o1, int64_t block_n, int64_t block_k) {
+    const int64_t K = w0.size(1);
+    const int64_t N0 = w0.size(0);
+    const int64_t N1 = w1.size(0);
+    TORCH_CHECK(input.scalar_type() == at::ScalarType::Half && input.size(0) == 1,
+                "esimd_gemv_fp8_blockscale_fp16_fused2: input must be fp16 [1,K]");
+    TORCH_CHECK(w0.scalar_type() == at::ScalarType::Float8_e4m3fn &&
+                    w1.scalar_type() == at::ScalarType::Half,
+                "esimd_gemv_fp8_blockscale_fp16_fused2: weights must be e4m3/fp16");
+    TORCH_CHECK(s0.scalar_type() == at::ScalarType::Float,
+                "esimd_gemv_fp8_blockscale_fp16_fused2: scale must be float32");
+    TORCH_CHECK(o0.scalar_type() == at::ScalarType::Half &&
+                    o1.scalar_type() == at::ScalarType::Half,
+                "esimd_gemv_fp8_blockscale_fp16_fused2: outputs must be fp16");
+    TORCH_CHECK(block_n == 128 && block_k == 128 && K % 128 == 0,
+                "esimd_gemv_fp8_blockscale_fp16_fused2: requires 128x128 blocks");
+    TORCH_CHECK(w1.size(1) == K && input.size(1) == K,
+                "esimd_gemv_fp8_blockscale_fp16_fused2: K mismatch");
+    TORCH_CHECK(s0.size(0) == (N0 + 127) / 128 && s0.size(1) == K / 128,
+                "esimd_gemv_fp8_blockscale_fp16_fused2: scale shape mismatch");
+    TORCH_CHECK(o0.numel() == N0 && o1.numel() == N1,
+                "esimd_gemv_fp8_blockscale_fp16_fused2: output shape mismatch");
+    auto& q = get_device_queue(input);
+    fp8_blockscale::gemv_fp8_blockscale_fp16_fused2_host(
+        reinterpret_cast<const fp16*>(input.data_ptr()),
+        reinterpret_cast<const uint8_t*>(w0.data_ptr()), s0.data_ptr<float>(),
+        reinterpret_cast<fp16*>(o0.data_ptr()), (uint32_t)N0,
+        reinterpret_cast<const fp16*>(w1.data_ptr()),
+        reinterpret_cast<fp16*>(o1.data_ptr()), (uint32_t)N1, (uint32_t)K, q);
+    return o0;
+}
+
+at::Tensor esimd_norm_gemv_fp8_blockscale(
+    at::Tensor x, at::Tensor z, at::Tensor norm_weight,
+    at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output,
+    int64_t HV, int64_t V, double eps) {
+    const int64_t N = gemv_weight.size(0);
+    const int64_t K = gemv_weight.size(1);
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::Half &&
+                    z.scalar_type() == at::ScalarType::Half &&
+                    norm_weight.scalar_type() == at::ScalarType::Half,
+                "esimd_norm_gemv_fp8_blockscale: norm inputs must be fp16");
+    TORCH_CHECK(gemv_weight.scalar_type() == at::ScalarType::Float8_e4m3fn,
+                "esimd_norm_gemv_fp8_blockscale: weight must be fp8_e4m3");
+    TORCH_CHECK(gemv_scale.scalar_type() == at::ScalarType::Float,
+                "esimd_norm_gemv_fp8_blockscale: scale must be float32");
+    TORCH_CHECK(output.scalar_type() == at::ScalarType::Half,
+                "esimd_norm_gemv_fp8_blockscale: output must be fp16");
+    TORCH_CHECK(V == 128 && K == HV * V && K % 128 == 0,
+                "esimd_norm_gemv_fp8_blockscale: requires V=128 and K=HV*V");
+    TORCH_CHECK(x.numel() == K && z.numel() == K &&
+                    norm_weight.numel() == V,
+                "esimd_norm_gemv_fp8_blockscale: input shape mismatch");
+    TORCH_CHECK(gemv_scale.size(0) == (N + 127) / 128 &&
+                    gemv_scale.size(1) == K / 128,
+                "esimd_norm_gemv_fp8_blockscale: scale shape mismatch");
+    TORCH_CHECK(output.numel() == N,
+                "esimd_norm_gemv_fp8_blockscale: output shape mismatch");
+    auto& q = get_device_queue(x);
+    norm_gemv_fp8_blockscale_host(
+        reinterpret_cast<const fp16*>(x.data_ptr()),
+        reinterpret_cast<const fp16*>(z.data_ptr()),
+        reinterpret_cast<const fp16*>(norm_weight.data_ptr()),
+        reinterpret_cast<const uint8_t*>(gemv_weight.data_ptr()),
+        gemv_scale.data_ptr<float>(),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        (int)N, (int)HV, (int)V, (float)eps, q);
     return output;
 }

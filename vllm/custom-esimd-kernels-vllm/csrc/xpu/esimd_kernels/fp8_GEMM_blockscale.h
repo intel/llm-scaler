@@ -237,6 +237,218 @@ inline void gemm_fp8_blockscale_host(const fp16* input, const uint8_t* weight,
   }
 }
 
+// Decode-only dual GEMV for two block-scaled weights sharing the same input.
+// A single grid spans both output-channel ranges, eliminating the second host
+// submission while preserving each matrix's independent [Nb, Kb] scale table.
+template <int VL, int K_SPLIT, int BK>
+struct gemv_block_fused2_bmg_kernel {
+  const fp16* input;
+  const uint8_t* weight0;
+  const float* scale0;
+  fp16* output0;
+  const uint8_t* weight1;
+  const float* scale1;
+  fp16* output1;
+  int N0, N1, K, Kb;
+
+  void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+    if constexpr (K_SPLIT > 1) slm_init<K_SPLIT * sizeof(float)>();
+    const int gn = item.get_group(0);
+    const int lid = item.get_local_id(0);
+    if (gn >= N0 + N1) return;
+
+    const bool second = gn >= N0;
+    const int n = second ? gn - N0 : gn;
+    const uint8_t* weight = second ? weight1 : weight0;
+    const float* scale = second ? scale1 : scale0;
+    fp16* output = second ? output1 : output0;
+    const uint8_t* w_row = weight + (size_t)n * K;
+    const float* s_row = scale + (size_t)(n / 128) * Kb;
+    const int kp = K / K_SPLIT;
+    const int ks = lid * kp;
+    float acc = 0.0f;
+
+    for (int k = ks; k < ks + kp; k += VL) {
+      simd<uint8_t, VL> raw = block_load<uint8_t, VL>(w_row + k);
+      simd<float, VL> wf = fp8e4m3_to_fp16<VL>(raw);
+#pragma unroll
+      for (int sb = 0; sb < VL / BK; sb++) {
+        const float sc = s_row[(k / BK) + sb];
+        wf.template select<BK, 1>(sb * BK) *= sc;
+      }
+      simd<float, VL> iv = block_load<fp16, VL>(input + k);
+      acc += reduce<float>(iv * wf, std::plus<>());
+    }
+
+    if constexpr (K_SPLIT == 1) {
+      output[n] = fp16(acc);
+    } else {
+      simd<float, 1> partial = acc;
+      slm_block_store<float, 1>(lid * sizeof(float), partial);
+      barrier();
+      if (lid == 0) {
+        simd<float, K_SPLIT> parts =
+            slm_block_load<float, K_SPLIT>(0);
+        output[n] = fp16(reduce<float>(parts, std::plus<>()));
+      }
+    }
+  }
+};
+
+template <int VL, int K_SPLIT>
+inline void launch_gemv_block_fused2(
+    const fp16* input, const uint8_t* weight0, const float* scale0,
+    fp16* output0, int N0, const uint8_t* weight1, const float* scale1,
+    fp16* output1, int N1, int K, sycl::queue& q) {
+  constexpr int BK = 128;
+  gemv_block_fused2_bmg_kernel<VL, K_SPLIT, BK> kern{
+      input, weight0, scale0, output0, weight1, scale1, output1,
+      N0, N1, K, K / BK};
+  const int groups = N0 + N1;
+  q.submit([&](handler& cgh) {
+    cgh.parallel_for(
+        sycl::nd_range<1>((size_t)groups * K_SPLIT, K_SPLIT), kern);
+  });
+}
+
+inline void gemv_fp8_blockscale_fused2_host(
+    const fp16* input, const uint8_t* weight0, const float* scale0,
+    fp16* output0, uint32_t N0, const uint8_t* weight1, const float* scale1,
+    fp16* output1, uint32_t N1, uint32_t K, sycl::queue& q) {
+  const int VL = (K % 256 == 0) ? 256 : 128;
+  const int total_n = (int)(N0 + N1);
+  int target = 1;
+  if (total_n * 8 <= 640) target = 8;
+  else if (total_n * 4 <= 640) target = 4;
+  else if (total_n * 2 <= 640) target = 2;
+  int ks = 1;
+  for (int s = target; s >= 1; s >>= 1) {
+    if (K % s == 0 && (K / s) % VL == 0) { ks = s; break; }
+  }
+#define BS_FUSED2_DISPATCH(V, S)                                               \
+  launch_gemv_block_fused2<V, S>(input, weight0, scale0, output0, (int)N0,    \
+                                  weight1, scale1, output1, (int)N1, (int)K, q)
+  if (VL == 256) {
+    switch (ks) {
+      case 8: BS_FUSED2_DISPATCH(256, 8); break;
+      case 4: BS_FUSED2_DISPATCH(256, 4); break;
+      case 2: BS_FUSED2_DISPATCH(256, 2); break;
+      default: BS_FUSED2_DISPATCH(256, 1); break;
+    }
+  } else {
+    switch (ks) {
+      case 8: BS_FUSED2_DISPATCH(128, 8); break;
+      case 4: BS_FUSED2_DISPATCH(128, 4); break;
+      case 2: BS_FUSED2_DISPATCH(128, 2); break;
+      default: BS_FUSED2_DISPATCH(128, 1); break;
+    }
+  }
+#undef BS_FUSED2_DISPATCH
+}
+
+// Qwen GDN input projection: block-scaled qkvz plus the intentionally-FP16 ba
+// projection share one input and one launch.
+template <int VL, int K_SPLIT>
+struct gemv_block_fp16_fused2_bmg_kernel {
+  const fp16* input;
+  const uint8_t* weight0;
+  const float* scale0;
+  fp16* output0;
+  const fp16* weight1;
+  fp16* output1;
+  int N0, N1, K, Kb;
+
+  void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+    if constexpr (K_SPLIT > 1) slm_init<K_SPLIT * sizeof(float)>();
+    const int gn = item.get_group(0);
+    const int lid = item.get_local_id(0);
+    if (gn >= N0 + N1) return;
+    const bool fp16_matrix = gn >= N0;
+    const int n = fp16_matrix ? gn - N0 : gn;
+    const int kp = K / K_SPLIT;
+    const int ks = lid * kp;
+    float acc = 0.0f;
+
+    for (int k = ks; k < ks + kp; k += VL) {
+      simd<float, VL> wf;
+      if (fp16_matrix) {
+        wf = block_load<fp16, VL>(weight1 + (size_t)n * K + k);
+      } else {
+        simd<uint8_t, VL> raw =
+            block_load<uint8_t, VL>(weight0 + (size_t)n * K + k);
+        wf = fp8e4m3_to_fp16<VL>(raw);
+        const float* s_row = scale0 + (size_t)(n / 128) * Kb;
+#pragma unroll
+        for (int sb = 0; sb < VL / 128; sb++) {
+          wf.template select<128, 1>(sb * 128) *= s_row[(k / 128) + sb];
+        }
+      }
+      simd<float, VL> iv = block_load<fp16, VL>(input + k);
+      acc += reduce<float>(iv * wf, std::plus<>());
+    }
+    fp16* output = fp16_matrix ? output1 : output0;
+    if constexpr (K_SPLIT == 1) {
+      output[n] = fp16(acc);
+    } else {
+      simd<float, 1> partial = acc;
+      slm_block_store<float, 1>(lid * sizeof(float), partial);
+      barrier();
+      if (lid == 0) {
+        simd<float, K_SPLIT> parts = slm_block_load<float, K_SPLIT>(0);
+        output[n] = fp16(reduce<float>(parts, std::plus<>()));
+      }
+    }
+  }
+};
+
+template <int VL, int K_SPLIT>
+inline void launch_gemv_block_fp16_fused2(
+    const fp16* input, const uint8_t* weight0, const float* scale0,
+    fp16* output0, int N0, const fp16* weight1, fp16* output1, int N1,
+    int K, sycl::queue& q) {
+  gemv_block_fp16_fused2_bmg_kernel<VL, K_SPLIT> kern{
+      input, weight0, scale0, output0, weight1, output1,
+      N0, N1, K, K / 128};
+  q.submit([&](handler& cgh) {
+    cgh.parallel_for(
+        sycl::nd_range<1>((size_t)(N0 + N1) * K_SPLIT, K_SPLIT), kern);
+  });
+}
+
+inline void gemv_fp8_blockscale_fp16_fused2_host(
+    const fp16* input, const uint8_t* weight0, const float* scale0,
+    fp16* output0, uint32_t N0, const fp16* weight1, fp16* output1,
+    uint32_t N1, uint32_t K, sycl::queue& q) {
+  const int VL = (K % 256 == 0) ? 256 : 128;
+  const int total_n = (int)(N0 + N1);
+  int target = total_n * 8 <= 640 ? 8 : total_n * 4 <= 640 ? 4
+                                  : total_n * 2 <= 640 ? 2 : 1;
+  int ks = 1;
+  for (int s = target; s >= 1; s >>= 1) {
+    if (K % s == 0 && (K / s) % VL == 0) { ks = s; break; }
+  }
+#define BS_FP16_FUSED2_DISPATCH(V, S)                                          \
+  launch_gemv_block_fp16_fused2<V, S>(                                        \
+      input, weight0, scale0, output0, (int)N0, weight1, output1, (int)N1,    \
+      (int)K, q)
+  if (VL == 256) {
+    switch (ks) {
+      case 8: BS_FP16_FUSED2_DISPATCH(256, 8); break;
+      case 4: BS_FP16_FUSED2_DISPATCH(256, 4); break;
+      case 2: BS_FP16_FUSED2_DISPATCH(256, 2); break;
+      default: BS_FP16_FUSED2_DISPATCH(256, 1); break;
+    }
+  } else {
+    switch (ks) {
+      case 8: BS_FP16_FUSED2_DISPATCH(128, 8); break;
+      case 4: BS_FP16_FUSED2_DISPATCH(128, 4); break;
+      case 2: BS_FP16_FUSED2_DISPATCH(128, 2); break;
+      default: BS_FP16_FUSED2_DISPATCH(128, 1); break;
+    }
+  }
+#undef BS_FP16_FUSED2_DISPATCH
+}
+
 #undef BS_WE
 #undef BS_WM
 

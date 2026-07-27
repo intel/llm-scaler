@@ -23,6 +23,8 @@ from custom_esimd_kernels_vllm.ops import (
     esimd_gemv_fp8_pert,
     esimd_gemv_fp16,
     esimd_gemv_fp8_pert_fused2,
+    esimd_gemv_fp8_blockscale_fused2,
+    esimd_gemv_fp8_blockscale_fp16_fused2,
     esimd_gemv_fp8_pert_fused3,
     # INT4 GEMV ops
     esimd_gemv_int4,
@@ -45,6 +47,7 @@ from custom_esimd_kernels_vllm.ops import (
     esimd_resadd_norm_gemv_int4_pert,
     esimd_resadd_norm_gemv2_fp8_pert,
     esimd_norm_gemv_fp8_pert,
+    esimd_norm_gemv_fp8_blockscale,
     esimd_norm_gemv_int4_pert,
     esimd_gdn_conv_fused_seq,
     esimd_moe_topk,
