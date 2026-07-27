@@ -11,6 +11,9 @@ _cute_call_count = 0
 _esimd_call_count = 0
 _attention_fallback_count = 0
 _attention_fallback_reasons = {}
+_attention_route_counts = {}
+_attention_failed_contracts = set()
+_attention_experimental_warning_emitted = False
 
 # ── Attention backend selection ──────────────────────────────────────────────
 # OMNI_ATTN_BACKEND selects which attention routing policy the patched ComfyUI
@@ -32,6 +35,12 @@ _backend = os.environ.get("OMNI_ATTN_BACKEND", "auto").lower()
 _backend_name = _backend  # for logging
 _backend_sdp = None  # callable(q_blhd, k_blhd, v_blhd) -> out_blhd
 _torch_sdpa_count = 0
+
+
+def _record_attention_route(route):
+    count = _attention_route_counts.get(route, 0) + 1
+    _attention_route_counts[route] = count
+    return count
 
 
 def _torch_major_minor():
@@ -77,13 +86,13 @@ def _use_ptl_torch_sdpa(
     )
 
 
-def _is_dense_d120_bhld(tensor, heads, seq, dim_head):
+def _is_dense_bhld(tensor, batch, heads, seq, dim_head):
     try:
         shape = tuple(tensor.shape)
         strides = tensor.stride()
     except (AttributeError, TypeError):
         return False
-    if shape != (1, heads, seq, dim_head):
+    if shape != (batch, heads, seq, dim_head):
         return False
     if len(strides) != 4 or strides[3] != 1:
         return False
@@ -125,10 +134,92 @@ def _use_workflow_cute_d120(
         and q_len in (4096, 4205)
         and skip_reshape
         and not skip_output_reshape
-        and _is_dense_d120_bhld(q, heads, q_len, dim_head)
-        and _is_dense_d120_bhld(k, heads, kv_len, dim_head)
-        and _is_dense_d120_bhld(v, heads, kv_len, dim_head)
+        and _is_dense_bhld(q, 1, heads, q_len, dim_head)
+        and _is_dense_bhld(k, 1, heads, kv_len, dim_head)
+        and _is_dense_bhld(v, 1, heads, kv_len, dim_head)
     )
+
+
+def _is_dense_bld(tensor, batch, seq, width):
+    try:
+        shape = tuple(tensor.shape)
+        strides = tensor.stride()
+    except (AttributeError, TypeError):
+        return False
+    return (
+        shape == (batch, seq, width)
+        and len(strides) == 3
+        and strides == (seq * width, width, 1)
+    )
+
+
+def _prepare_bmg_d128_bhld_cute(
+    q,
+    k,
+    v,
+    b,
+    heads,
+    dim_head,
+    q_len,
+    kv_len,
+    skip_reshape,
+    skip_output_reshape,
+):
+    capability = getattr(_backend_sdp, "supports_d128_bhld", None)
+    self_attention = q_len == kv_len and q_len >= 768
+    cross_attention = kv_len == 1024 and q_len >= 1024
+    if not (
+        _backend_name == "cute"
+        and _omni_xpu_target() == "bmg"
+        and _torch_major_minor() == (2, 11)
+        and callable(capability)
+        and capability()
+        and q.dtype == torch.bfloat16
+        and k.dtype == q.dtype
+        and v.dtype == q.dtype
+        and q.device.type == "xpu"
+        and k.device == q.device
+        and v.device == q.device
+        and heads == 32
+        and dim_head == 128
+        and (self_attention or cross_attention)
+        and b == 2
+    ):
+        return None
+
+    if skip_reshape:
+        q_bhld, k_bhld, v_bhld = q, k, v
+    else:
+        width = heads * dim_head
+        if not (
+            _is_dense_bld(q, b, q_len, width)
+            and _is_dense_bld(k, b, kv_len, width)
+            and _is_dense_bld(v, b, kv_len, width)
+        ):
+            return None
+        q_bhld = q.view(b, q_len, heads, dim_head).transpose(1, 2)
+        k_bhld = k.view(b, kv_len, heads, dim_head).transpose(1, 2)
+        v_bhld = v.view(b, kv_len, heads, dim_head).transpose(1, 2)
+
+    if not (
+        _is_dense_bhld(q_bhld, b, heads, q_len, dim_head)
+        and _is_dense_bhld(k_bhld, b, heads, kv_len, dim_head)
+        and _is_dense_bhld(v_bhld, b, heads, kv_len, dim_head)
+    ):
+        return None
+
+    contract = (
+        str(q.dtype),
+        b,
+        heads,
+        q_len,
+        kv_len,
+        tuple(q_bhld.stride()),
+        tuple(k_bhld.stride()),
+        tuple(v_bhld.stride()),
+        skip_output_reshape,
+    )
+    return contract, q_bhld, k_bhld, v_bhld
 
 
 def _use_bmg_wan22_cute_cross(
@@ -208,6 +299,17 @@ def _load_cute_backend():
             def sdp_wan22_cross(q, k, v):
                 return torch.ops.cute_fmha.sdp_wan22_cross(q, k, v)
 
+            @staticmethod
+            def supports_d128_bhld():
+                return hasattr(
+                    torch.ops.cute_fmha,
+                    "sdp_bhld_d128",
+                )
+
+            @staticmethod
+            def sdp_bhld_d128(q, k, v):
+                return torch.ops.cute_fmha.sdp_bhld_d128(q, k, v)
+
         return _Wrap, None
     except Exception as e:
         return None, f"cute load failed: {e}"
@@ -222,6 +324,8 @@ def get_stats():
         "torch_sdpa": _torch_sdpa_count,
         "fallback": _attention_fallback_count,
         "reasons": dict(_attention_fallback_reasons),
+        "routes": dict(_attention_route_counts),
+        "quarantined_contracts": len(_attention_failed_contracts),
     }
 
 
@@ -278,6 +382,7 @@ def apply():
     ):
         global _cute_call_count, _esimd_call_count
         global _attention_fallback_count, _torch_sdpa_count
+        global _attention_experimental_warning_emitted
 
         log_debug_event(
             "dispatch",
@@ -309,6 +414,27 @@ def apply():
             skip_reshape,
             skip_output_reshape,
         )
+        bmg_d128_prepared = _prepare_bmg_d128_bhld_cute(
+            q,
+            k,
+            v,
+            b,
+            heads,
+            dim_head,
+            q_len,
+            kv_len,
+            skip_reshape,
+            skip_output_reshape,
+        )
+        bmg_d128_contract = (
+            bmg_d128_prepared[0]
+            if bmg_d128_prepared is not None
+            else None
+        )
+        use_bmg_d128_bhld_cute = (
+            bmg_d128_contract is not None
+            and bmg_d128_contract not in _attention_failed_contracts
+        )
         use_bmg_wan22_cute_cross = _use_bmg_wan22_cute_cross(
             q,
             k,
@@ -323,8 +449,13 @@ def apply():
 
         # Constraint check
         reasons = []
-        if b != 1:
+        if b != 1 and bmg_d128_prepared is None:
             reasons.append(f"batch={b}")
+        if (
+            bmg_d128_contract is not None
+            and bmg_d128_contract in _attention_failed_contracts
+        ):
+            reasons.append("cute_runtime_quarantined")
         if mask is not None:
             reasons.append(f"mask={mask.shape}")
         if dim_head not in (64, 128) and not use_workflow_cute_d120:
@@ -387,10 +518,13 @@ def apply():
         # layouts retain the unmodified Torch fallback.
         if not reasons and use_workflow_cute_d120:
             _cute_call_count += 1
-            if _cute_call_count <= 3:
+            route_call_count = _record_attention_route(
+                "boogu_cute_d120_bhld"
+            )
+            if route_call_count <= 3:
                 log.info(
                     "[OmniXPU] attention CUTE_D120 #%d: heads=%d seq=%d dtype=%s",
-                    _cute_call_count,
+                    route_call_count,
                     heads,
                     q_len,
                     q.dtype,
@@ -404,16 +538,104 @@ def apply():
             out = _backend_sdp.sdp_bhld_d120(q, k, v)
             return out.transpose(1, 2).reshape(b, -1, heads * dim_head)
 
+        # LTX reaches optimized_attention with dense BLD tensors, while
+        # attention_pytorch creates the BLHD-backed BHLD view only after this
+        # dispatch point. Prepare that metadata-only view here so the public
+        # D128 op can cover generation sizes beyond the traced default. There
+        # is deliberately no maximum sequence length: the lower crossover
+        # thresholds are measured, while the upper bound is capability-driven.
+        if not reasons and use_bmg_d128_bhld_cute:
+            _cute_call_count += 1
+            route = (
+                "bmg_b2_bf16_d128_self"
+                if q_len == kv_len
+                else "bmg_b2_bf16_d128_kv1024_cross"
+            )
+            route_call_count = _record_attention_route(route)
+            if not _attention_experimental_warning_emitted:
+                log.warning(
+                    "[OmniXPU] experimental capability-driven BMG D128 "
+                    "CUTE route enabled; set OMNI_ATTN_BACKEND=torch "
+                    "to disable it if this workflow shows an issue"
+                )
+                _attention_experimental_warning_emitted = True
+            if route_call_count <= 3:
+                log.info(
+                    "[OmniXPU] attention CUTE_BHLD_D128 #%d: "
+                    "heads=%d q=%d kv=%d dtype=%s",
+                    route_call_count,
+                    heads,
+                    q_len,
+                    kv_len,
+                    q.dtype,
+                )
+            log_debug_event(
+                "kernel",
+                "attention",
+                {
+                    "q": bmg_d128_prepared[1],
+                    "k": bmg_d128_prepared[2],
+                    "v": bmg_d128_prepared[3],
+                },
+                details={
+                    "backend": "cute",
+                    "route": route,
+                },
+            )
+            _, q_bhld, k_bhld, v_bhld = bmg_d128_prepared
+            try:
+                out = _backend_sdp.sdp_bhld_d128(
+                    q_bhld, k_bhld, v_bhld
+                )
+                if skip_output_reshape:
+                    return out
+                return out.transpose(1, 2).reshape(
+                    b, -1, heads * dim_head
+                )
+            except Exception as error:
+                _attention_failed_contracts.add(bmg_d128_contract)
+                _attention_fallback_count += 1
+                key = "cute_runtime_error"
+                _attention_fallback_reasons[key] = (
+                    _attention_fallback_reasons.get(key, 0) + 1
+                )
+                log.warning(
+                    "[OmniXPU] BMG D128 CUTE failed for "
+                    "B=%d H=%d Q=%d KV=%d; this contract is disabled "
+                    "for the process and the call is falling back to "
+                    "PyTorch. Set OMNI_ATTN_BACKEND=torch to disable "
+                    "the experimental route globally. Error: %s",
+                    b,
+                    heads,
+                    q_len,
+                    kv_len,
+                    error,
+                )
+                return _pytorch_fallback(
+                    q,
+                    k,
+                    v,
+                    heads,
+                    mask=mask,
+                    attn_precision=attn_precision,
+                    skip_reshape=skip_reshape,
+                    skip_output_reshape=skip_output_reshape,
+                    **kwargs,
+                )
+
         # The official Wan 2.2 14B T2V Turbo 720p workflow has an exact FP16
         # rectangular contract. Use the dedicated BMG CUTE entry point so the
         # cross-attention accumulates in FP32 instead of the ESIMD FP16 path.
         if not reasons and use_bmg_wan22_cute_cross:
             _cute_call_count += 1
-            if _cute_call_count <= 3:
+            route_call_count = _record_attention_route(
+                "wan22_t2v_turbo_720p_cross"
+            )
+            if route_call_count <= 3:
                 log.info(
                     "[OmniXPU] attention CUTE_WAN22 #%d: "
                     "heads=%d q=%d kv=%d dtype=%s",
-                    _cute_call_count,
+                    route_call_count,
                     heads,
                     q_len,
                     kv_len,

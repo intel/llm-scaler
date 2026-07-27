@@ -419,6 +419,71 @@ bool is_supported_bhld_layout(
   return packed_bhld || blhd_backed;
 }
 
+#if defined(OMNI_XPU_ARCH_BMG)
+at::Tensor sdp_bhld_d128(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+  TORCH_CHECK(
+      q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+      "cute_fmha: D128 attention expects BHLD tensors");
+  TORCH_CHECK(
+      q.device().is_xpu() && k.device() == q.device() && v.device() == q.device(),
+      "cute_fmha: D128 attention requires Q/K/V on the same XPU device");
+  TORCH_CHECK(
+      k.scalar_type() == q.scalar_type() && v.scalar_type() == q.scalar_type(),
+      "cute_fmha: D128 attention requires matching Q/K/V dtypes");
+
+  const int B = checked_int(q.size(0), "batch");
+  const int H = checked_int(q.size(1), "head count");
+  const int Lq = checked_int(q.size(2), "query length");
+  const int D = checked_int(q.size(3), "head dimension");
+  const int Lkv = checked_int(k.size(2), "key/value length");
+  TORCH_CHECK(
+      B > 0 && H > 0 && Lq > 0 && Lkv > 0,
+      "cute_fmha: D128 attention dimensions must be positive");
+  TORCH_CHECK(D == 128, "cute_fmha: D128 attention requires head_dim==128");
+  TORCH_CHECK(
+      k.sizes() == at::IntArrayRef({B, H, Lkv, D}) &&
+          v.sizes() == k.sizes(),
+      "cute_fmha: D128 attention requires matching B/H/D and K/V lengths (got ",
+      k.sizes(), " and ", v.sizes());
+  TORCH_CHECK(
+      is_supported_bhld_layout(q, H, Lq, D) &&
+          is_supported_bhld_layout(k, H, Lkv, D) &&
+          is_supported_bhld_layout(v, H, Lkv, D),
+      "cute_fmha: D128 attention requires dense packed-BHLD or "
+      "BLHD-backed tensors");
+
+  const bool q_is_packed_bhld =
+      q.stride(1) == static_cast<int64_t>(Lq) * D &&
+      q.stride(2) == D;
+  at::Tensor output =
+      q_is_packed_bhld
+          ? at::empty(q.sizes(), q.options())
+          : at::empty({B, Lq, H, D}, q.options()).permute({0, 2, 1, 3});
+  const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+  if (q.scalar_type() == at::kHalf) {
+    run_d128_tile<cutlass::half_t>(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(),
+        B, H, Lq, Lkv, D, scale,
+        q.stride(2), q.stride(1), q.stride(0),
+        k.stride(2), k.stride(1), k.stride(0),
+        v.stride(2), v.stride(1), v.stride(0),
+        output.stride(2), output.stride(1), output.stride(0));
+  } else if (q.scalar_type() == at::kBFloat16) {
+    run_d128_tile<cutlass::bfloat16_t>(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(),
+        B, H, Lq, Lkv, D, scale,
+        q.stride(2), q.stride(1), q.stride(0),
+        k.stride(2), k.stride(1), k.stride(0),
+        v.stride(2), v.stride(1), v.stride(0),
+        output.stride(2), output.stride(1), output.stride(0));
+  } else {
+    TORCH_CHECK(false, "cute_fmha: D128 attention supports fp16/bf16 only");
+  }
+  return output;
+}
+#endif
+
 at::Tensor sdp_bhld_d120(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
   TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
@@ -498,19 +563,27 @@ at::Tensor sdp_bhld_d120(
   m.def("sdp_wan22_cross(Tensor q, Tensor k, Tensor v) -> Tensor");
 #define CUTE_FMHA_WAN22_IMPL(m) \
   m.impl("sdp_wan22_cross", &sdp_wan22_cross);
+#define CUTE_FMHA_BHLD_D128_DEF(m) \
+  m.def("sdp_bhld_d128(Tensor q, Tensor k, Tensor v) -> Tensor");
+#define CUTE_FMHA_BHLD_D128_IMPL(m) \
+  m.impl("sdp_bhld_d128", &sdp_bhld_d128);
 #else
 #define CUTE_FMHA_WAN22_DEF(m)
 #define CUTE_FMHA_WAN22_IMPL(m)
+#define CUTE_FMHA_BHLD_D128_DEF(m)
+#define CUTE_FMHA_BHLD_D128_IMPL(m)
 #endif
 #define CUTE_FMHA_LIB_(NS) \
   TORCH_LIBRARY(NS, m) { \
     m.def("sdp(Tensor q, Tensor k, Tensor v) -> Tensor"); \
     CUTE_FMHA_WAN22_DEF(m) \
+    CUTE_FMHA_BHLD_D128_DEF(m) \
     CUTE_FMHA_D120_DEF(m) \
   } \
   TORCH_LIBRARY_IMPL(NS, XPU, m) { \
     m.impl("sdp", &sdp); \
     CUTE_FMHA_WAN22_IMPL(m) \
+    CUTE_FMHA_BHLD_D128_IMPL(m) \
     CUTE_FMHA_D120_IMPL(m) \
   }
 #define CUTE_FMHA_LIB(NS) CUTE_FMHA_LIB_(NS)
