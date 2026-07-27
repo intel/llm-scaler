@@ -194,6 +194,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     echo "source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --force" >> /root/.bashrc && \
     rm -f /opt/intel/oneapi/ccl/latest && \
     ln -s /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/latest && \
+    find /opt/intel/oneapi/ccl -mindepth 1 -maxdepth 1 -type d -not -name 2021.15 -exec rm -rf {} + && \
     rm -rf "/tmp/${ONECCL_INSTALLER%.sh}" /tmp/oneccl-runtime && \
     pip install /wheels/vllm-*.whl --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-deps --force-reinstall \
