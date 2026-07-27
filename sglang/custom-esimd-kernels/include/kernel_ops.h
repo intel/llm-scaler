@@ -124,6 +124,7 @@ at::Tensor esimd_resadd_norm_gemv2_fp8_pert(
     at::Tensor hidden_states, at::Tensor residual, at::Tensor norm_weight,
     at::Tensor w0, at::Tensor s0, at::Tensor o0,
     at::Tensor w1, at::Tensor s1, at::Tensor o1,
+    at::Tensor new_residual,
     double eps);
 
 // Fused RMSNormGated + FP8 GEMV for GDN out_proj decode path
