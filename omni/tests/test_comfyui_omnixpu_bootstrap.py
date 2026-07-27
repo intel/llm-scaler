@@ -52,6 +52,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     for name in (
         "OMNIXPU_ENABLE",
         "OMNIXPU_ATTENTION",
+        "OMNIXPU_ROTARY",
         "OMNIXPU_NORM",
         "OMNIXPU_FP8_GEMM",
         "OMNIXPU_INT8_FFN",
@@ -62,6 +63,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
 
     config = _load_module("omnixpu_bootstrap_config", _PLUGIN / "config.py").config
     assert config.attention
+    assert config.rotary
     assert config.norm
     assert config.fp8_gemm
     assert config.int8_ffn
@@ -76,6 +78,7 @@ def test_disabled_components_are_reported_without_importing_modules(monkeypatch)
     patches = _load_registry(monkeypatch)
     cfg = types.SimpleNamespace(
         attention=False,
+        rotary=False,
         norm=False,
         fp8_gemm=False,
         int8_ffn=False,

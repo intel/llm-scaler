@@ -74,12 +74,48 @@ def apply_kitchen_rope_split_half(
     return _get_native().apply_kitchen_rope_split_half(xq, xk, freqs_cis)
 
 
+def supports_ltx_split_rope_direct() -> bool:
+    """Whether the loaded core exports direct LTX cos/sin split-half RoPE."""
+    try:
+        return hasattr(_get_native(), "ltx_split_rope_direct_supported")
+    except (AttributeError, ImportError, RuntimeError):
+        return False
+
+
+def ltx_split_rope_direct_supported(
+    input: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> bool:
+    """Whether the tensors satisfy the native direct LTX RoPE contract."""
+    if not supports_ltx_split_rope_direct():
+        return False
+    try:
+        return bool(
+            _get_native().ltx_split_rope_direct_supported(input, cos, sin)
+        )
+    except (RuntimeError, TypeError):
+        return False
+
+
+def apply_ltx_split_rope_direct(
+    input: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """Apply split-half LTX RoPE without constructing a 2x2 matrix."""
+    return _get_native().apply_ltx_split_rope_direct(input, cos, sin)
+
+
 __all__ = [
+    "apply_ltx_split_rope_direct",
     "apply_kitchen_rope",
     "apply_kitchen_rope1",
     "apply_kitchen_rope_split_half",
     "apply_kitchen_rope_split_half1",
     "kitchen_rope_fast_supported",
+    "ltx_split_rope_direct_supported",
     "rotary_emb",
     "supports_kitchen_rope_fast",
+    "supports_ltx_split_rope_direct",
 ]
