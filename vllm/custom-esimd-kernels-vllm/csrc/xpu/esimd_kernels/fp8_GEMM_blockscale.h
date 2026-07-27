@@ -42,7 +42,9 @@ inline simd<fp16, N> fp8e4m3_to_fp16(simd<uint8_t, N> x) {
   constexpr uint16_t weo = 5;   // fp16 exponent bits
   constexpr uint16_t wmo = 10;  // fp16 mantissa bits
 
-  auto is_zero = (x == 0);
+  // E4M3 has both +0 (0x00) and -0 (0x80). Ignore the sign bit when
+  // identifying zero, then preserve it in the FP16 result below.
+  auto is_zero = ((x & 0x7F) == 0);
 
   simd<uint16_t, N> mantissa = x & ((1 << BS_WM) - 1);
   simd<uint16_t, N> exponent = (x & 0x7F) >> BS_WM;
@@ -75,7 +77,7 @@ inline simd<fp16, N> fp8e4m3_to_fp16(simd<uint8_t, N> x) {
 
   simd<uint16_t, N> sign = x >> 7;
   simd<uint16_t, N> retval = (sign << 15) | (exponent << 10) | mantissa;
-  retval.merge(0, is_zero);
+  retval.merge(sign << 15, is_zero);
 
   return retval.template bit_cast_view<fp16>();
 }

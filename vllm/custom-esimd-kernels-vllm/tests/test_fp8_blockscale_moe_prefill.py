@@ -1,4 +1,4 @@
-"""Correctness test for the large-M block-scaled MoE W8A16 GEMM."""
+"""Correctness tests for large-M block-scaled MoE W8A16 GEMM."""
 
 import time
 
@@ -10,6 +10,9 @@ import custom_esimd_kernels_vllm as esimd
 
 FP8_MAX = 448.0
 BLOCK = 128
+requires_xpu = pytest.mark.skipif(
+    not torch.xpu.is_available(), reason="XPU is required"
+)
 
 
 def quantize_block(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -46,6 +49,45 @@ def dequant(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     n, k = q.shape[-2:]
     expanded = scale.repeat_interleave(BLOCK, -2).repeat_interleave(BLOCK, -1)
     return q.float() * expanded[..., :n, :k]
+
+
+def check_all_e4m3_encodings() -> None:
+    """Exercise every raw E4M3 code through dense, decode, and prefill paths."""
+    raw = (
+        torch.arange(256, dtype=torch.uint8)
+        .view(1, 256, 1)
+        .expand(1, 256, 128)
+        .contiguous()
+    )
+    reference = raw[0, :, 0].view(torch.float8_e4m3fn).float() * 128
+    finite = torch.isfinite(reference)
+    weight = raw.to("xpu")
+    scale = torch.ones((1, 2, 1), dtype=torch.float32, device="xpu")
+
+    x = torch.ones((1, 128), dtype=torch.float16, device="xpu")
+    dense_out = torch.empty((1, 256), dtype=torch.float16, device="xpu")
+    esimd.esimd_gemm_fp8_blockscale(x, weight[0], scale[0], dense_out, 128, 128)
+
+    outputs = [("dense", dense_out)]
+    for total, label in ((1, "moe_decode"), (128, "moe_prefill")):
+        moe_x = torch.ones((total, 128), dtype=torch.float16, device="xpu")
+        moe_out = torch.empty((total, 256), dtype=torch.float16, device="xpu")
+        offsets = torch.tensor([0, total], dtype=torch.int32, device="xpu")
+        esimd.esimd_moe_gemm_fp8_blockscale(
+            moe_x, weight, scale, moe_out, offsets, 256, 128, 1, 128, 128
+        )
+        outputs.append((label, moe_out))
+
+    torch.xpu.synchronize()
+    for label, output in outputs:
+        actual = output[0].cpu().float()
+        mismatches = torch.nonzero(finite & (actual != reference)).flatten()
+        assert mismatches.numel() == 0, (
+            label,
+            [(int(i), actual[i].item(), reference[i].item()) for i in mismatches],
+        )
+        assert actual[0x80].item() == 0.0, (label, actual[0x80].item())
+    print("all 254 finite E4M3 encodings: dense/decode/prefill exact")
 
 
 def run_prefill_case(*, benchmark: bool) -> None:
@@ -102,7 +144,12 @@ def run_prefill_case(*, benchmark: bool) -> None:
     print("RESULT: ALL OK")
 
 
-@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required")
+@requires_xpu
+def test_all_e4m3_encodings() -> None:
+    check_all_e4m3_encodings()
+
+
+@requires_xpu
 def test_fp8_blockscale_moe_prefill() -> None:
     run_prefill_case(benchmark=False)
 
@@ -110,4 +157,5 @@ def test_fp8_blockscale_moe_prefill() -> None:
 if __name__ == "__main__":
     if not torch.xpu.is_available():
         raise SystemExit("XPU is required")
+    check_all_e4m3_encodings()
     run_prefill_case(benchmark=True)
