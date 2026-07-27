@@ -233,6 +233,9 @@ at::Tensor esimd_norm_gemv_fp8_blockscale(
                 "esimd_norm_gemv_fp8_blockscale: output must be fp16");
     TORCH_CHECK(V == 128 && K == HV * V && K % 128 == 0,
                 "esimd_norm_gemv_fp8_blockscale: requires V=128 and K=HV*V");
+    TORCH_CHECK(x.numel() == K && z.numel() == K &&
+                    norm_weight.numel() == V,
+                "esimd_norm_gemv_fp8_blockscale: input shape mismatch");
     TORCH_CHECK(gemv_scale.size(0) == (N + 127) / 128 &&
                     gemv_scale.size(1) == K / 128,
                 "esimd_norm_gemv_fp8_blockscale: scale shape mismatch");

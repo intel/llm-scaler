@@ -96,7 +96,10 @@ def esimd_gemv_fp8_blockscale_fused2(
     w1: torch.Tensor, s1: torch.Tensor, o1: torch.Tensor,
     block_n: int = 128, block_k: int = 128,
 ) -> torch.Tensor:
-    """Decode dual GEMV for two E4M3 weights with 128x128 block scales."""
+    """Decode dual GEMV for two E4M3 weights with 128x128 block scales.
+
+    Results are written to ``o0`` and ``o1`` in place. Returns ``o0``.
+    """
     return _ops.esimd_gemv_fp8_blockscale_fused2(
         input, w0, s0, o0, w1, s1, o1, block_n, block_k)
 
@@ -107,7 +110,10 @@ def esimd_gemv_fp8_blockscale_fp16_fused2(
     w1: torch.Tensor, o1: torch.Tensor,
     block_n: int = 128, block_k: int = 128,
 ) -> torch.Tensor:
-    """Decode dual GEMV for block-E4M3 qkvz plus an FP16 ba weight."""
+    """Decode dual GEMV for block-E4M3 qkvz plus an FP16 ba weight.
+
+    Results are written to ``o0`` and ``o1`` in place. Returns ``o0``.
+    """
     return _ops.esimd_gemv_fp8_blockscale_fp16_fused2(
         input, w0, s0, o0, w1, o1, block_n, block_k)
 
@@ -511,7 +517,11 @@ def esimd_norm_gemv_fp8_blockscale(
     V: int,
     eps: float,
 ) -> torch.Tensor:
-    """Fused RMSNormGated + E4M3 GEMV with 128x128 weight scales."""
+    """Fused RMSNormGated + E4M3 GEMV with 128x128 weight scales.
+
+    The result is written to ``output`` in place and the same tensor is
+    returned.
+    """
     return _ops.esimd_norm_gemv_fp8_blockscale(
         x, z, norm_weight, gemv_weight, gemv_scale, output, HV, V, eps)
 

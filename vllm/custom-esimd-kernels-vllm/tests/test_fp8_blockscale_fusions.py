@@ -1,11 +1,15 @@
 """Correctness and microbenchmark for block-scaled GDN decode fusions."""
 
 import statistics
+import sys
 import time
+from pathlib import Path
 
 import torch
 
 import custom_esimd_kernels_vllm as esimd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_fp8_blockscale_gemm import dequant_weight, quantize_weight_block
 
 
@@ -30,7 +34,7 @@ def timed_ms(fn, warmup: int = 20, iterations: int = 100) -> float:
     return statistics.median(samples)
 
 
-def main() -> None:
+def test_fp8_blockscale_fusions() -> None:
     torch.manual_seed(20260713)
     dev = "xpu"
 
@@ -103,4 +107,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    test_fp8_blockscale_fusions()
