@@ -1,14 +1,18 @@
 """Correctness test for the large-M block-scaled MoE W8A16 GEMM."""
 
 import time
+import sys
+from pathlib import Path
 
 import torch
 
 import custom_esimd_kernels_vllm as esimd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_moe_forward_full_fp8_block import dequant, quantize_block
 
 
-def main() -> None:
+def test_fp8_blockscale_moe_prefill() -> None:
     torch.manual_seed(20260713)
     device = "xpu"
     experts, n, k = 4, 256, 256
@@ -60,4 +64,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    test_fp8_blockscale_moe_prefill()
