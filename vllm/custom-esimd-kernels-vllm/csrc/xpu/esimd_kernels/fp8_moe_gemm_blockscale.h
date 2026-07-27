@@ -301,6 +301,10 @@ inline void moe_gemm_fp8_blockscale_prefill_host(
   const int Nb = (N + block_n - 1) / block_n;
   const int Kb = K / block_k;
   const int n_tiles = (N + 15) / 16;
+  // Empirical BMG grid-shaping caps. Small-K groups do less work and tolerate
+  // a larger grid; larger-K groups use a lower cap to bound scheduling cost.
+  // These values only coalesce adjacent N tiles into a work-group and never
+  // truncate the launched computation.
   const int wg_cap = (K <= 512) ? 51200 : 38400;
   int n_per_wg = 1;
   int total_wgs = tile_capacity * n_tiles;
