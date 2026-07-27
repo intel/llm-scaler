@@ -11,6 +11,7 @@
 #include <torch/python.h>
 
 #include <cstdint>
+#include <vector>
 
 #include "esimd_kernels/moe_ops.h"
 #include "esimd_kernels/fp8_moe_gemm.h"
@@ -24,25 +25,45 @@ static inline sycl::queue& get_device_queue(const at::Tensor& tensor) {
 struct MoePrefillTileBuffers {
     at::Tensor experts;
     at::Tensor rows;
-    int64_t capacity = 0;
-    int device_index = -1;
+    int64_t capacity;
+    int device_index;
+    sycl::queue queue;
+
+    MoePrefillTileBuffers(
+            int64_t requested_capacity,
+            const at::Tensor& input,
+            const sycl::queue& current_queue)
+        : experts(at::empty(
+              {requested_capacity}, input.options().dtype(at::kInt))),
+          rows(at::empty(
+              {requested_capacity}, input.options().dtype(at::kInt))),
+          capacity(requested_capacity),
+          device_index(input.device().index()),
+          queue(current_queue) {}
 };
 
-static thread_local MoePrefillTileBuffers s_moe_prefill_tiles;
+// Calls from different host threads already have independent caches. Keep one
+// entry per XPU stream within each thread so asynchronously executing streams
+// never overwrite each other's descriptor storage.
+static thread_local std::vector<MoePrefillTileBuffers> s_moe_prefill_tiles;
 
 static MoePrefillTileBuffers& ensure_moe_prefill_tile_buffers(
-        int64_t capacity, const at::Tensor& input) {
+        int64_t capacity, const at::Tensor& input, const sycl::queue& queue) {
     const int device_index = input.device().index();
-    if (s_moe_prefill_tiles.capacity < capacity ||
-        s_moe_prefill_tiles.device_index != device_index) {
-        s_moe_prefill_tiles.experts = at::empty(
-            {capacity}, input.options().dtype(at::kInt));
-        s_moe_prefill_tiles.rows = at::empty(
-            {capacity}, input.options().dtype(at::kInt));
-        s_moe_prefill_tiles.capacity = capacity;
-        s_moe_prefill_tiles.device_index = device_index;
+    for (auto& buffers : s_moe_prefill_tiles) {
+        if (buffers.device_index != device_index || buffers.queue != queue) {
+            continue;
+        }
+        if (buffers.capacity < capacity) {
+            buffers.experts = at::empty(
+                {capacity}, input.options().dtype(at::kInt));
+            buffers.rows = at::empty(
+                {capacity}, input.options().dtype(at::kInt));
+            buffers.capacity = capacity;
+        }
+        return buffers;
     }
-    return s_moe_prefill_tiles;
+    return s_moe_prefill_tiles.emplace_back(capacity, input, queue);
 }
 
 // ======================== MoE Auxiliary Ops ========================
@@ -204,7 +225,7 @@ at::Tensor esimd_moe_gemm_fp8_blockscale(
         const int64_t tile_capacity =
             (total_tokens + 63) / 64 + num_experts;
         auto& tile_buffers =
-            ensure_moe_prefill_tile_buffers(tile_capacity, input);
+            ensure_moe_prefill_tile_buffers(tile_capacity, input, q);
         auto& tile_experts = tile_buffers.experts;
         auto& tile_rows = tile_buffers.rows;
         fp8_moe_blockscale::build_expert_m_tiles(
