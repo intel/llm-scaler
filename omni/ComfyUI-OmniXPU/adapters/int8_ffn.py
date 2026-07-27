@@ -1,22 +1,30 @@
-"""Route supported Lumina and OmniGen2 INT8 FFNs through fused XPU kernels."""
+"""Route supported INT8 FFNs and exact Krea2 SwiGLU through fused XPU kernels."""
 
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from ..patches.debug import log_debug_event
 
 log = logging.getLogger("ComfyUI-OmniXPU")
 
 _PATCH_MARKER = "__omnixpu_int8_ffn_original__"
+_KREA_PATCH_MARKER = "__omnixpu_krea2_swiglu_original__"
+_KREA_INPUT_SHAPE = (1, 4192, 6144)
+_KREA_OUTPUT_SHAPE = (1, 4192, 16384)
 _omni_int8 = None
 _routed_calls = 0
 _fallback_calls = 0
 _fallback_reasons: dict[str, int] = {}
+_krea_routed_calls = 0
+_krea_fallback_calls = 0
+_krea_fallback_reasons: dict[str, int] = {}
 
 
 @dataclass(frozen=True)
@@ -144,6 +152,54 @@ def get_stats() -> dict[str, Any]:
     }
 
 
+def _record_krea_fallback(reason: str) -> None:
+    global _krea_fallback_calls
+    _krea_fallback_calls += 1
+    _krea_fallback_reasons[reason] = (
+        _krea_fallback_reasons.get(reason, 0) + 1
+    )
+
+
+def get_krea_stats() -> dict[str, Any]:
+    return {
+        "routed": _krea_routed_calls,
+        "fallback": _krea_fallback_calls,
+        "reasons": dict(_krea_fallback_reasons),
+    }
+
+
+def _can_route_krea_input(x: Any) -> tuple[bool, str]:
+    if not isinstance(x, torch.Tensor):
+        return False, "input_type"
+    if x.device.type != "xpu":
+        return False, "device"
+    if x.dtype != torch.bfloat16:
+        return False, "input_dtype"
+    if tuple(x.shape) != _KREA_INPUT_SHAPE:
+        return False, "input_shape"
+    if not x.is_contiguous():
+        return False, "input_layout"
+    if x.requires_grad:
+        return False, "requires_grad"
+    return True, ""
+
+
+def _krea_output_reason(gate: Any, up: Any) -> str:
+    if not isinstance(gate, torch.Tensor) or not isinstance(up, torch.Tensor):
+        return "output_type"
+    if gate.device.type != "xpu" or up.device != gate.device:
+        return "output_device"
+    if gate.dtype != torch.bfloat16 or up.dtype != gate.dtype:
+        return "output_dtype"
+    if tuple(gate.shape) != _KREA_OUTPUT_SHAPE or up.shape != gate.shape:
+        return "output_shape"
+    if not gate.is_contiguous() or not up.is_contiguous():
+        return "output_layout"
+    if gate.requires_grad or up.requires_grad:
+        return "output_requires_grad"
+    return ""
+
+
 def apply():
     global _omni_int8
 
@@ -206,13 +262,30 @@ def apply():
     except ImportError:
         pass
 
+    krea_target = None
+    krea_enabled = (
+        target == "bmg"
+        and os.environ.get("OMNIXPU_KREA2_SWIGLU", "1") != "0"
+    )
+    if krea_enabled:
+        try:
+            import comfy.ldm.krea2.model as krea2_model
+
+            candidate_target = getattr(krea2_model, "SwiGLU", None)
+            if candidate_target is not None and hasattr(
+                candidate_target, "forward"
+            ):
+                krea_target = candidate_target
+        except ImportError:
+            pass
+
     targets = [
         (name, target)
         for name, target in targets
         if target is not None and hasattr(target, "forward")
     ]
-    if not targets:
-        return False, "Lumina and OmniGen2 feed-forward modules unavailable"
+    if not targets and krea_target is None:
+        return False, "supported feed-forward modules unavailable"
 
     _omni_int8 = _candidate
 
@@ -299,6 +372,47 @@ def apply():
             target.forward = make_forward(target.forward, target_name)
         patched_names.append(target_name)
 
+    if krea_target is not None:
+        original_forward = krea_target.forward
+        if not hasattr(original_forward, _KREA_PATCH_MARKER):
+            def _krea_forward(self, x):
+                global _krea_routed_calls
+
+                eligible, reason = _can_route_krea_input(x)
+                if not eligible:
+                    _record_krea_fallback(reason)
+                    return original_forward(self, x)
+
+                gate = self.gate(x)
+                up = self.up(x)
+                reason = _krea_output_reason(gate, up)
+                if reason:
+                    _record_krea_fallback(reason)
+                    gated = F.silu(gate).mul_(up)
+                else:
+                    gated = _omni_int8.fused_silu_mul(gate, up)
+                    _krea_routed_calls += 1
+                    log_debug_event(
+                        "kernel",
+                        "krea2_swiglu",
+                        {
+                            "input": x,
+                            "gate": gate,
+                            "up": up,
+                            "output": gated,
+                        },
+                        details={
+                            "backend": "omni_xpu",
+                            "module": "krea2.SwiGLU",
+                            "route": "fused_silu_mul",
+                        },
+                    )
+                return self.down(gated)
+
+            setattr(_krea_forward, _KREA_PATCH_MARKER, original_forward)
+            krea_target.forward = _krea_forward
+        patched_names.append("krea2.SwiGLU")
+
     log.info(
         "[OmniXPU] INT8 FFN: routed eligible %s through fused kernels",
         ", ".join(patched_names),
@@ -306,4 +420,4 @@ def apply():
     return True, ""
 
 
-__all__ = ["apply", "get_stats"]
+__all__ = ["apply", "get_krea_stats", "get_stats"]
