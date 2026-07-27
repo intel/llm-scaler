@@ -70,10 +70,11 @@ enabled by default on PTL-H or another Torch version.
 
 ## Adapter behavior
 
-Attention uses explicit capability guards. `auto` selects only validated
-platform, Torch-version, dtype, layout, and shape combinations before falling
-back to the original PyTorch attention path. `cute` and `esimd` force a
-preferred native backend where supported but still fall back safely.
+Attention uses explicit capability guards. `auto` selects only validated CUTE
+routes for matching platform, Torch-version, dtype, layout, and shape
+combinations, and uses the original PyTorch attention path for every remaining
+contract. It never selects ESIMD. `cute` and `esimd` are explicit diagnostic
+policies; unsupported contracts still fall back safely.
 
 The norm adapter preserves ComfyUI cast/offload hooks and uses native kernels
 only for eligible tensors. PTL-H H120 and non-contiguous split-QKV routes also

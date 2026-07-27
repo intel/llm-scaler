@@ -13,6 +13,7 @@ across those native ABI boundaries.
 |---|---|
 | `sdp` | ESIMD scaled dot-product attention |
 | `cute` | CUTLASS-SYCL fused attention |
+| `cute.sdp_wan22_cross` | Exact BMG Wan 2.2 14B T2V Turbo cross-attention |
 | `linear` | oneDNN FP8 weight-only GEMM |
 | `fp8` | FP8 quantization, dequantization, and stochastic rounding |
 | `gguf` | Q4_0, Q8_0, Q4_K, and Q6_K dequantization |
@@ -233,11 +234,21 @@ if cute is not None and cute.is_available():
 # PTL-H and BMG wheels expose a separate dense-BHLD D120 capability.
 if cute is not None and cute.supports_d120_bhld():
     output = cute.sdp_bhld_d120(q_bhld, k_bhld, v_bhld)
+
+# BMG wheels expose the exact official Wan 2.2 14B T2V Turbo 720p
+# cross-attention contract separately from generic self-attention.
+if cute is not None and cute.supports_wan22_cross():
+    output = cute.sdp_wan22_cross(q_blhd, k_blhd, v_blhd)
 ```
 
 The CUTE D128 path accepts unmasked self-attention with `B=1`, equal Q/K/V
 head counts, standard `1/sqrt(head_dim)` scaling, and FP16 or BF16 inputs.
 Callers must retain their fallback for unsupported shapes and layouts.
+
+`sdp_wan22_cross` is not a generic rectangular-attention API. It accepts only
+dense FP16 BMG tensors with Q `[1, 75600, 40, 128]` and K/V
+`[1, 512, 40, 128]`. Callers must use PyTorch SDPA for every other cross
+contract.
 
 ### Quantized linear operations
 

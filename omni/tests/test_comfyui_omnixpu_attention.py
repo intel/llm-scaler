@@ -131,6 +131,15 @@ def _load_patch(
             return q
 
         @staticmethod
+        def supports_wan22_cross():
+            return True
+
+        @staticmethod
+        def sdp_wan22_cross(q, k, v):
+            calls.append("cute_wan22_cross")
+            return q
+
+        @staticmethod
         def supports_d120_bhld():
             return d120_capable
 
@@ -139,13 +148,19 @@ def _load_patch(
             calls.append("cute_d120")
             return q
 
+    class Esimd:
+        @staticmethod
+        def sdp(q, k, v):
+            calls.append("esimd")
+            return q
+
     omni = types.ModuleType("omni_xpu_kernel")
     omni.__xpu_target__ = target
     omni.__path__ = []
     omni.cute = Cute
 
     probe = types.ModuleType("ComfyUI-OmniXPU.probe")
-    probe.sdp = Cute
+    probe.sdp = Esimd
     for name, module in (
         ("comfy", comfy),
         ("comfy.ldm", ldm),
@@ -190,13 +205,112 @@ def test_ptl_auto_torch211_krea2_shape_uses_torch(monkeypatch):
 
 
 def test_explicit_cute_does_not_apply_auto_route(monkeypatch):
-    _, attention, calls = _load_patch(monkeypatch, backend="cute")
+    patch, attention, calls = _load_patch(monkeypatch, backend="cute")
     tensor = _FakeTensor()
     result = attention.optimized_attention(
         tensor, tensor, tensor, heads=30, skip_reshape=True
     )
     assert isinstance(result, _FakeTensor)
     assert calls == ["cute"]
+    assert patch.get_stats()["cute"] == 1
+    assert patch.get_stats()["esimd"] == 0
+
+
+def test_esimd_is_selected_only_when_explicitly_requested(monkeypatch):
+    patch, attention, calls = _load_patch(monkeypatch, backend="esimd")
+    tensor = _FakeTensor()
+    result = attention.optimized_attention(
+        tensor, tensor, tensor, heads=30, skip_reshape=True
+    )
+    assert isinstance(result, _FakeTensor)
+    assert calls == ["esimd"]
+    assert patch.get_stats()["cute"] == 0
+    assert patch.get_stats()["esimd"] == 1
+
+
+def test_bmg_wan22_t2v_turbo_720p_cross_uses_cute(monkeypatch):
+    patch, attention, calls = _load_patch(
+        monkeypatch,
+        target="bmg",
+    )
+    q = _FakeTensor(
+        seq=75600,
+        heads=40,
+        dtype=torch.float16,
+        pre_shaped=False,
+    )
+    kv = _FakeTensor(
+        seq=512,
+        heads=40,
+        dtype=torch.float16,
+        pre_shaped=False,
+    )
+    result = attention.optimized_attention(
+        q,
+        kv,
+        kv,
+        heads=40,
+    )
+    assert isinstance(result, _FakeTensor)
+    assert calls == ["cute_wan22_cross"]
+    assert patch.get_stats()["cute"] == 1
+    assert patch.get_stats()["esimd"] == 0
+    assert patch.get_stats()["fallback"] == 0
+
+
+def test_auto_unsupported_cross_uses_torch_not_esimd(monkeypatch):
+    patch, attention, calls = _load_patch(
+        monkeypatch,
+        target="bmg",
+    )
+    q = _FakeTensor(
+        seq=4096,
+        heads=40,
+        dtype=torch.float16,
+        pre_shaped=False,
+    )
+    kv = _FakeTensor(
+        seq=512,
+        heads=40,
+        dtype=torch.float16,
+        pre_shaped=False,
+    )
+    result = attention.optimized_attention(
+        q,
+        kv,
+        kv,
+        heads=40,
+    )
+    assert result == "torch-output"
+    assert calls == ["torch"]
+    assert patch.get_stats()["cute"] == 0
+    assert patch.get_stats()["esimd"] == 0
+    assert patch.get_stats()["fallback"] == 1
+
+
+def test_auto_d64_uses_torch_not_esimd(monkeypatch):
+    patch, attention, calls = _load_patch(
+        monkeypatch,
+        target="bmg",
+    )
+    tensor = _FakeTensor(
+        seq=4096,
+        heads=40,
+        dim_head=64,
+        dtype=torch.float16,
+        pre_shaped=False,
+    )
+    result = attention.optimized_attention(
+        tensor,
+        tensor,
+        tensor,
+        heads=40,
+    )
+    assert result == "torch-output"
+    assert calls == ["torch"]
+    assert patch.get_stats()["cute"] == 0
+    assert patch.get_stats()["esimd"] == 0
+    assert patch.get_stats()["fallback"] == 1
 
 
 @pytest.mark.parametrize(
@@ -227,6 +341,8 @@ def test_unvalidated_auto_shapes_keep_cute(
     )
     assert isinstance(result, _FakeTensor)
     assert calls == ["cute"]
+    assert patch.get_stats()["cute"] == 1
+    assert patch.get_stats()["esimd"] == 0
     assert patch.get_stats()["torch_sdpa"] == 0
 
 
@@ -244,6 +360,8 @@ def test_unvalidated_layouts_keep_cute(monkeypatch, tensor, kwargs):
     )
     assert isinstance(result, _FakeTensor)
     assert calls == ["cute"]
+    assert patch.get_stats()["cute"] == 1
+    assert patch.get_stats()["esimd"] == 0
     assert patch.get_stats()["torch_sdpa"] == 0
 
 
@@ -264,7 +382,8 @@ def test_validated_auto_boogu_d120_uses_strided_cute(
     )
     assert isinstance(result, _FakeTensor)
     assert calls == ["cute_d120"]
-    assert patch.get_stats()["esimd"] == 1
+    assert patch.get_stats()["cute"] == 1
+    assert patch.get_stats()["esimd"] == 0
     assert patch.get_stats()["fallback"] == 0
 
 

@@ -7,17 +7,18 @@ from ..patches.debug import log_debug_event
 
 log = logging.getLogger("ComfyUI-OmniXPU")
 
-_fallback_esimd_sdp = None
+_cute_call_count = 0
 _esimd_call_count = 0
-_esimd_fallback_count = 0
-_esimd_fallback_reasons = {}
+_attention_fallback_count = 0
+_attention_fallback_reasons = {}
 
 # ── Attention backend selection ──────────────────────────────────────────────
 # OMNI_ATTN_BACKEND selects which attention routing policy the patched ComfyUI
 # path uses:
 #   auto   (default) — use platform/workflow-tuned routes where validated, then
-#                      cute for d128 self-attention, ESIMD for supported
-#                      d64/cross-attention, and finally PyTorch fallback.
+#                      cute for d128 self-attention and exact safe cross routes,
+#                      and PyTorch for every remaining attention contract.
+#                      Auto never selects the ESIMD attention backend.
 #   cute             — CUTLASS-SYCL FMHA (omni_xpu_kernel.cute). fp32 accumulation,
 #                      so it does NOT overflow on large activations (Qwen-Image etc.)
 #                      where the ESIMD fp16-accumulator kernel can. Unsupported
@@ -130,6 +131,39 @@ def _use_workflow_cute_d120(
     )
 
 
+def _use_bmg_wan22_cute_cross(
+    q,
+    k,
+    v,
+    heads,
+    dim_head,
+    q_len,
+    kv_len,
+    skip_reshape,
+    skip_output_reshape,
+):
+    capability = getattr(_backend_sdp, "supports_wan22_cross", None)
+    return (
+        _backend_name == "cute"
+        and _omni_xpu_target() == "bmg"
+        and _torch_major_minor() == (2, 11)
+        and callable(capability)
+        and capability()
+        and q.dtype == torch.float16
+        and k.dtype == q.dtype
+        and v.dtype == q.dtype
+        and q.device.type == "xpu"
+        and k.device.type == "xpu"
+        and v.device.type == "xpu"
+        and heads == 40
+        and dim_head == 128
+        and q_len == 75600
+        and kv_len == 512
+        and not skip_reshape
+        and not skip_output_reshape
+    )
+
+
 def _default_cute_so():
     # Ship next to the omni_xpu_kernel package by default.
     try:
@@ -163,6 +197,17 @@ def _load_cute_backend():
             def sdp(q, k, v):
                 return fn(q, k, v)
 
+            @staticmethod
+            def supports_wan22_cross():
+                return hasattr(
+                    torch.ops.cute_fmha,
+                    "sdp_wan22_cross",
+                )
+
+            @staticmethod
+            def sdp_wan22_cross(q, k, v):
+                return torch.ops.cute_fmha.sdp_wan22_cross(q, k, v)
+
         return _Wrap, None
     except Exception as e:
         return None, f"cute load failed: {e}"
@@ -172,15 +217,16 @@ def get_stats():
     return {
         "policy": _backend,
         "backend": _backend_name,
+        "cute": _cute_call_count,
         "esimd": _esimd_call_count,
         "torch_sdpa": _torch_sdpa_count,
-        "fallback": _esimd_fallback_count,
-        "reasons": dict(_esimd_fallback_reasons),
+        "fallback": _attention_fallback_count,
+        "reasons": dict(_attention_fallback_reasons),
     }
 
 
 def apply():
-    global _fallback_esimd_sdp, _backend_sdp, _backend_name
+    global _backend_sdp, _backend_name
     import sys
 
     probe = sys.modules.get("ComfyUI-OmniXPU.probe")
@@ -196,13 +242,12 @@ def apply():
         if wrap is not None:
             _backend_sdp = wrap
             _backend_name = "cute"
-        elif _backend == "auto" and probe is not None and probe.sdp is not None:
-            # cute requested but unavailable — degrade to esimd rather than SDPA.
-            log.warning(
-                "[OmniXPU] cute backend unavailable (%s); falling back to esimd", err
+        elif _backend == "auto":
+            return (
+                False,
+                "cute backend unavailable "
+                f"({err}); auto keeps PyTorch SDPA",
             )
-            _backend_sdp = probe.sdp
-            _backend_name = "esimd"
         else:
             return False, err
     else:  # esimd
@@ -210,8 +255,6 @@ def apply():
             return False, "omni_xpu_kernel sdp not available"
         _backend_sdp = probe.sdp
         _backend_name = "esimd"
-
-    _fallback_esimd_sdp = probe.sdp if probe is not None else None
 
     import comfy.ldm.modules.attention as attn_mod
 
@@ -222,7 +265,7 @@ def apply():
     wrap_attn = attn_mod.wrap_attn
 
     @wrap_attn
-    def attention_esimd(
+    def attention_omni(
         q,
         k,
         v,
@@ -233,7 +276,8 @@ def apply():
         skip_output_reshape=False,
         **kwargs,
     ):
-        global _esimd_call_count, _esimd_fallback_count, _torch_sdpa_count
+        global _cute_call_count, _esimd_call_count
+        global _attention_fallback_count, _torch_sdpa_count
 
         log_debug_event(
             "dispatch",
@@ -255,6 +299,17 @@ def apply():
             q_len, kv_len = q.shape[1], k.shape[1]
 
         use_workflow_cute_d120 = _use_workflow_cute_d120(
+            q,
+            k,
+            v,
+            heads,
+            dim_head,
+            q_len,
+            kv_len,
+            skip_reshape,
+            skip_output_reshape,
+        )
+        use_bmg_wan22_cute_cross = _use_bmg_wan22_cute_cross(
             q,
             k,
             v,
@@ -331,11 +386,11 @@ def apply():
         # auto-only, Torch-2.11, workflow-shape route; unsupported wheels and
         # layouts retain the unmodified Torch fallback.
         if not reasons and use_workflow_cute_d120:
-            _esimd_call_count += 1
-            if _esimd_call_count <= 3:
+            _cute_call_count += 1
+            if _cute_call_count <= 3:
                 log.info(
                     "[OmniXPU] attention CUTE_D120 #%d: heads=%d seq=%d dtype=%s",
-                    _esimd_call_count,
+                    _cute_call_count,
                     heads,
                     q_len,
                     q.dtype,
@@ -349,24 +404,76 @@ def apply():
             out = _backend_sdp.sdp_bhld_d120(q, k, v)
             return out.transpose(1, 2).reshape(b, -1, heads * dim_head)
 
-        # cute is currently accepted only for d128 self-attention. Auto keeps
-        # d64 and cross-attention on ESIMD; explicit cute never silently changes
-        # to another fused backend and instead uses the safe PyTorch fallback.
-        cute_needs_esimd = _backend_name == "cute" and (
-            dim_head != 128 or q_len != kv_len
+        # The official Wan 2.2 14B T2V Turbo 720p workflow has an exact FP16
+        # rectangular contract. Use the dedicated BMG CUTE entry point so the
+        # cross-attention accumulates in FP32 instead of the ESIMD FP16 path.
+        if not reasons and use_bmg_wan22_cute_cross:
+            _cute_call_count += 1
+            if _cute_call_count <= 3:
+                log.info(
+                    "[OmniXPU] attention CUTE_WAN22 #%d: "
+                    "heads=%d q=%d kv=%d dtype=%s",
+                    _cute_call_count,
+                    heads,
+                    q_len,
+                    kv_len,
+                    q.dtype,
+                )
+            q_blhd = q.view(b, q_len, heads, dim_head).contiguous()
+            k_blhd = k.view(b, kv_len, heads, dim_head).contiguous()
+            v_blhd = v.view(b, kv_len, heads, dim_head).contiguous()
+            log_debug_event(
+                "kernel",
+                "attention",
+                {"q": q_blhd, "k": k_blhd, "v": v_blhd},
+                details={
+                    "backend": "cute",
+                    "route": "wan22_t2v_turbo_720p_cross",
+                },
+            )
+            out = _backend_sdp.sdp_wan22_cross(
+                q_blhd, k_blhd, v_blhd
+            )
+            if (out != out).any():
+                _attention_fallback_count += 1
+                _attention_fallback_reasons["output_non_finite"] = (
+                    _attention_fallback_reasons.get(
+                        "output_non_finite", 0
+                    )
+                    + 1
+                )
+                return _pytorch_fallback(
+                    q,
+                    k,
+                    v,
+                    heads,
+                    mask=mask,
+                    attn_precision=attn_precision,
+                    skip_reshape=skip_reshape,
+                    skip_output_reshape=skip_output_reshape,
+                    **kwargs,
+                )
+            return out.reshape(b, q_len, heads * dim_head)
+
+        # CUTE is accepted only for its validated contracts. Both auto and
+        # explicit cute use the safe PyTorch fallback for everything else;
+        # auto never silently changes to ESIMD.
+        cute_unsupported = _backend_name == "cute" and (
+            dim_head != 128
+            or (q_len != kv_len and not use_bmg_wan22_cute_cross)
         )
-        if not reasons and cute_needs_esimd:
-            if _backend == "auto" and _fallback_esimd_sdp is not None:
-                selected_sdp = _fallback_esimd_sdp
-                selected_backend = "esimd"
-            else:
-                reasons.append(f"cute_unsupported=dim{dim_head},q{q_len},kv{kv_len}")
+        if not reasons and cute_unsupported:
+            reasons.append(
+                f"cute_unsupported=dim{dim_head},q{q_len},kv{kv_len}"
+            )
 
         if reasons:
-            _esimd_fallback_count += 1
+            _attention_fallback_count += 1
             key = ",".join(reasons)
-            _esimd_fallback_reasons[key] = _esimd_fallback_reasons.get(key, 0) + 1
-            if _esimd_fallback_count <= 5:
+            _attention_fallback_reasons[key] = (
+                _attention_fallback_reasons.get(key, 0) + 1
+            )
+            if _attention_fallback_count <= 5:
                 seq = q.shape[1] if not skip_reshape else q.shape[2]
                 log.info("[OmniXPU] attention fallback: %s (seq=%d)", key, seq)
             return _pytorch_fallback(
@@ -381,13 +488,18 @@ def apply():
                 **kwargs,
             )
 
-        _esimd_call_count += 1
-        if _esimd_call_count <= 3:
+        if selected_backend == "cute":
+            _cute_call_count += 1
+            selected_call_count = _cute_call_count
+        else:
+            _esimd_call_count += 1
+            selected_call_count = _esimd_call_count
+        if selected_call_count <= 3:
             seq = q.shape[1] if not skip_reshape else q.shape[2]
             log.info(
                 "[OmniXPU] attention %s #%d: heads=%d seq=%d dtype=%s",
                 selected_backend.upper(),
-                _esimd_call_count,
+                selected_call_count,
                 heads,
                 seq,
                 q.dtype,
@@ -412,11 +524,11 @@ def apply():
 
         # FP16 NaN safety
         if q.dtype == torch.float16 and (out != out).any():
-            _esimd_fallback_count += 1
-            _esimd_fallback_reasons["output_non_finite"] = (
-                _esimd_fallback_reasons.get("output_non_finite", 0) + 1
+            _attention_fallback_count += 1
+            _attention_fallback_reasons["output_non_finite"] = (
+                _attention_fallback_reasons.get("output_non_finite", 0) + 1
             )
-            if _esimd_fallback_reasons["output_non_finite"] <= 3:
+            if _attention_fallback_reasons["output_non_finite"] <= 3:
                 log.warning(
                     "[OmniXPU] FP16 overflow in %s, falling back to SDPA",
                     selected_backend.upper(),
@@ -447,8 +559,8 @@ def apply():
     }
 
     # Patch module-level variables
-    attn_mod.optimized_attention = attention_esimd
-    attn_mod.optimized_attention_masked = attention_esimd
+    attn_mod.optimized_attention = attention_omni
+    attn_mod.optimized_attention_masked = attention_omni
 
     # ── Rebind by-value imports in already-loaded modules ────────────────────
     # Many comfy.ldm.* and custom_nodes do `from comfy.ldm.modules.attention
@@ -468,7 +580,7 @@ def apply():
                 continue
             if cur is not None and cur in _originals:
                 try:
-                    setattr(mod, name, attention_esimd)
+                    setattr(mod, name, attention_omni)
                     rebound += 1
                 except Exception:
                     pass
@@ -480,6 +592,6 @@ def apply():
 
     # Also register via the official API
     if hasattr(attn_mod, "register_attention_function"):
-        attn_mod.register_attention_function("esimd", attention_esimd)
+        attn_mod.register_attention_function("omnixpu", attention_omni)
 
     return True, None

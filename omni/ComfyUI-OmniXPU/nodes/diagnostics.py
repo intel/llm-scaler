@@ -85,9 +85,20 @@ class OmniXPUStatus:
         if attn and hasattr(attn, "get_stats"):
             try:
                 stats = attn.get_stats()
-                if stats["esimd"] or stats["fallback"]:
+                if (
+                    stats["cute"]
+                    or stats["esimd"]
+                    or stats["torch_sdpa"]
+                    or stats["fallback"]
+                ):
                     lines.append("")
-                    lines.append(f"  Attention calls: esimd={stats['esimd']} fallback={stats['fallback']}")
+                    lines.append(
+                        "  Attention calls: "
+                        f"cute={stats['cute']} "
+                        f"esimd={stats['esimd']} "
+                        f"torch={stats['torch_sdpa']} "
+                        f"fallback={stats['fallback']}"
+                    )
                     for r, c in sorted(stats["reasons"].items(), key=lambda x: -x[1]):
                         lines.append(f"    {r}: {c}")
             except Exception:

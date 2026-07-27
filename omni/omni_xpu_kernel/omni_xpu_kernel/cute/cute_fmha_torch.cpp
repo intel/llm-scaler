@@ -364,6 +364,48 @@ at::Tensor sdp(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
   return o;
 }
 
+#if defined(OMNI_XPU_ARCH_BMG)
+at::Tensor sdp_wan22_cross(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v) {
+  TORCH_CHECK(
+      q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+      "cute_fmha: Wan 2.2 cross attention expects [B,L,H,D]");
+  TORCH_CHECK(
+      q.device().is_xpu() && k.device().is_xpu() && v.device().is_xpu(),
+      "cute_fmha: Wan 2.2 cross attention requires XPU tensors");
+  TORCH_CHECK(
+      q.scalar_type() == at::kHalf &&
+          k.scalar_type() == at::kHalf &&
+          v.scalar_type() == at::kHalf,
+      "cute_fmha: Wan 2.2 cross attention requires FP16 Q/K/V");
+  TORCH_CHECK(
+      q.sizes() == at::IntArrayRef({1, 75600, 40, 128}),
+      "cute_fmha: unsupported Wan 2.2 query shape ", q.sizes());
+  TORCH_CHECK(
+      k.sizes() == at::IntArrayRef({1, 512, 40, 128}) &&
+          v.sizes() == k.sizes(),
+      "cute_fmha: unsupported Wan 2.2 key/value shapes ",
+      k.sizes(), " and ", v.sizes());
+
+  auto qc = q.contiguous();
+  auto kc = k.contiguous();
+  auto vc = v.contiguous();
+  auto output = at::empty_like(qc);
+  constexpr int B = 1;
+  constexpr int Lq = 75600;
+  constexpr int Lkv = 512;
+  constexpr int H = 40;
+  constexpr int D = 128;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+  run_d128_tile<cutlass::half_t, 0, 0, 0, 16>(
+      qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), output.data_ptr(),
+      B, H, Lq, Lkv, D, scale);
+  return output;
+}
+#endif
+
 #if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
 bool is_supported_bhld_layout(
     const at::Tensor& tensor, int64_t H, int64_t L, int64_t D) {
@@ -451,13 +493,24 @@ at::Tensor sdp_bhld_d120(
 #define CUTE_FMHA_D120_DEF(m)
 #define CUTE_FMHA_D120_IMPL(m)
 #endif
+#if defined(OMNI_XPU_ARCH_BMG)
+#define CUTE_FMHA_WAN22_DEF(m) \
+  m.def("sdp_wan22_cross(Tensor q, Tensor k, Tensor v) -> Tensor");
+#define CUTE_FMHA_WAN22_IMPL(m) \
+  m.impl("sdp_wan22_cross", &sdp_wan22_cross);
+#else
+#define CUTE_FMHA_WAN22_DEF(m)
+#define CUTE_FMHA_WAN22_IMPL(m)
+#endif
 #define CUTE_FMHA_LIB_(NS) \
   TORCH_LIBRARY(NS, m) { \
     m.def("sdp(Tensor q, Tensor k, Tensor v) -> Tensor"); \
+    CUTE_FMHA_WAN22_DEF(m) \
     CUTE_FMHA_D120_DEF(m) \
   } \
   TORCH_LIBRARY_IMPL(NS, XPU, m) { \
     m.impl("sdp", &sdp); \
+    CUTE_FMHA_WAN22_IMPL(m) \
     CUTE_FMHA_D120_IMPL(m) \
   }
 #define CUTE_FMHA_LIB(NS) CUTE_FMHA_LIB_(NS)

@@ -11,11 +11,15 @@ copies::
 
     out = cute.sdp_bhld_d120(q, k, v)  # [B, H, L, 120]
 
+BMG wheels additionally expose the exact Wan 2.2 14B T2V Turbo 720p
+cross-attention contract through ``sdp_wan22_cross``.
+
 Unlike the ESIMD ``sdp`` kernel (fp16 accumulator + adaptive V-scaling), the cute
 FMHA accumulates QK and P*V in fp32, so it does not overflow on large-magnitude
 activations (e.g. Qwen-Image). It is AOT-compiled into ``cute_fmha_torch.so`` and
-exposes ``torch.ops.cute_fmha.sdp``. The current kernel accepts self-attention
-only; callers must route differing query/key sequence lengths elsewhere.
+exposes ``torch.ops.cute_fmha.sdp``. The generic entry point accepts
+self-attention only; validated rectangular workflow contracts use dedicated
+entry points.
 """
 
 import glob
@@ -72,6 +76,28 @@ def sdp(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return torch.ops.cute_fmha.sdp(q, k, v)
 
 
+def supports_wan22_cross() -> bool:
+    """Whether this BMG sidecar exports the exact Wan 2.2 cross kernel."""
+    try:
+        _ensure_loaded()
+        return hasattr(torch.ops.cute_fmha, "sdp_wan22_cross")
+    except Exception:
+        return False
+
+
+def sdp_wan22_cross(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """Wan 2.2 14B T2V Turbo 720p FP16 cross-attention."""
+    _ensure_loaded()
+    if not hasattr(torch.ops.cute_fmha, "sdp_wan22_cross"):
+        raise RuntimeError(
+            "CUTE Wan 2.2 cross-attention kernel is unavailable "
+            "in this sidecar"
+        )
+    return torch.ops.cute_fmha.sdp_wan22_cross(q, k, v)
+
+
 def supports_d120_bhld() -> bool:
     """Whether this target sidecar exports the workflow-tuned D120 kernel."""
     try:
@@ -91,4 +117,11 @@ def sdp_bhld_d120(
     return torch.ops.cute_fmha.sdp_bhld_d120(q, k, v)
 
 
-__all__ = ["sdp", "sdp_bhld_d120", "supports_d120_bhld", "is_available"]
+__all__ = [
+    "sdp",
+    "sdp_wan22_cross",
+    "supports_wan22_cross",
+    "sdp_bhld_d120",
+    "supports_d120_bhld",
+    "is_available",
+]
