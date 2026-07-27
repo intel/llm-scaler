@@ -10,25 +10,25 @@
 
 TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
   m.def("esimd_gdn_conv_fused(Tensor qkvz, "
-        "Tensor conv_state, Tensor conv_weight, Tensor conv_bias, "
+        "Tensor(a!) conv_state, Tensor conv_weight, Tensor conv_bias, "
         "Tensor conv_state_indices, "
         "Tensor A_log, Tensor dt_bias, "
         "Tensor ba, "
-        "Tensor ssm_state, Tensor ssm_state_indices, "
-        "Tensor output, Tensor z_out, "
+        "Tensor(b!) ssm_state, Tensor ssm_state_indices, "
+        "Tensor(c!) output, Tensor(d!) z_out, "
         "int N, int H, int HV, int K, int V, "
-        "float scale) -> Tensor");
+        "float scale) -> Tensor(c!)");
   m.impl("esimd_gdn_conv_fused", torch::kXPU, &esimd_gdn_conv_fused);
 
   m.def("esimd_gdn_conv_fused_seq(Tensor qkvz, "
-        "Tensor conv_state, Tensor conv_weight, Tensor conv_bias, "
+        "Tensor(a!) conv_state, Tensor conv_weight, Tensor conv_bias, "
         "Tensor conv_state_indices, "
         "Tensor A_log, Tensor dt_bias, "
         "Tensor ba, "
-        "Tensor ssm_state, Tensor ssm_state_indices, "
-        "Tensor output, Tensor z_out, "
+        "Tensor(b!) ssm_state, Tensor ssm_state_indices, "
+        "Tensor(c!) output, Tensor(d!) z_out, "
         "int N, int H, int HV, int K, int V, "
-        "float scale) -> Tensor");
+        "float scale) -> Tensor(c!)");
   m.impl("esimd_gdn_conv_fused_seq", torch::kXPU, &esimd_gdn_conv_fused_seq);
 }
 
