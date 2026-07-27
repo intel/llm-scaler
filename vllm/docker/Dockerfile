@@ -136,7 +136,6 @@ ARG ONECCL_INSTALLER_SHA256="f7ab81b6ed1b10dd35fadec366a78046d8af214888dfd625047
 ENV PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
-    LD_PRELOAD="/opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1" \
     VLLM_QUANTIZE_Q40_LIB="/opt/venv/lib/python3.12/site-packages/vllm_int4_for_multi_arc.so" \
     VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 \
     VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
@@ -171,12 +170,31 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     printf "%s  %s\n" "${ONECCL_INSTALLER_SHA256}" "${ONECCL_INSTALLER}" > /tmp/oneccl.sha256 && \
     sha256sum -c /tmp/oneccl.sha256 && \
     rm -f /tmp/oneccl.sha256 && \
-    bash "${ONECCL_INSTALLER}" -a --silent --eula accept && \
+    bash "${ONECCL_INSTALLER}" -s -x -f /tmp && \
+    ONECCL_CUP="/tmp/${ONECCL_INSTALLER%.sh}/packages/intel.oneapi.lin.ccl.runtime,v=2021.15.9+13/cupPayload.cup" && \
+    ONECCL_DST="/tmp/oneccl-runtime" && \
+    python3 -m zipfile -e "${ONECCL_CUP}" "${ONECCL_DST}" && \
+    ONECCL_LIB="${ONECCL_DST}/_installdir/ccl/2021.15/lib" && \
+    rm -f "${ONECCL_LIB}/libccl.so" "${ONECCL_LIB}/libccl.so.1" "${ONECCL_LIB}/libccl_openmp.so" "${ONECCL_LIB}/libccl_openmp.so.0" && \
+    ln -sf libccl.so.1 "${ONECCL_LIB}/libccl.so" && \
+    ln -sf libccl.so.1.0 "${ONECCL_LIB}/libccl.so.1" && \
+    ln -sf libccl_openmp.so.0 "${ONECCL_LIB}/libccl_openmp.so" && \
+    ln -sf libccl_openmp.so.0.1 "${ONECCL_LIB}/libccl_openmp.so.0" && \
+    ONECCL_CPU_LIB="${ONECCL_DST}/_installdir/ccl/2021.15/lib/ccl/cpu/lib" && \
+    rm -f "${ONECCL_CPU_LIB}/libccl.so" "${ONECCL_CPU_LIB}/libccl.so.1" "${ONECCL_CPU_LIB}/libccl_openmp.so" "${ONECCL_CPU_LIB}/libccl_openmp.so.0" && \
+    ln -sf libccl.so.1 "${ONECCL_CPU_LIB}/libccl.so" && \
+    ln -sf libccl.so.1.0 "${ONECCL_CPU_LIB}/libccl.so.1" && \
+    ln -sf libccl_openmp.so.0 "${ONECCL_CPU_LIB}/libccl_openmp.so" && \
+    ln -sf libccl_openmp.so.0.1 "${ONECCL_CPU_LIB}/libccl_openmp.so.0" && \
+    mkdir -p /opt/intel/oneapi/ccl && \
+    rm -rf /opt/intel/oneapi/ccl/2021.15 && \
+    cp -a /tmp/oneccl-runtime/_installdir/ccl/2021.15 /opt/intel/oneapi/ccl/ && \
     rm "${ONECCL_INSTALLER}" && \
     echo "source /opt/intel/oneapi/setvars.sh --force" >> /root/.bashrc && \
     echo "source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --force" >> /root/.bashrc && \
     rm -f /opt/intel/oneapi/ccl/latest && \
     ln -s /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/latest && \
+    rm -rf "/tmp/${ONECCL_INSTALLER%.sh}" /tmp/oneccl-runtime && \
     pip install /wheels/vllm-*.whl --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-deps --force-reinstall \
         /wheels/custom_esimd_kernels_vllm-*.whl \
@@ -187,6 +205,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     pip uninstall -y triton triton-xpu || true && \
     pip install --no-deps triton-xpu==3.7.0 \
         --extra-index-url https://download.pytorch.org/whl/xpu && \
+    pip uninstall -y oneccl oneccl-devel || true && \
+    rm -f /opt/venv/lib/libccl.so /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so.1.0 \
+        /opt/venv/lib/libccl_openmp.so /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so.0.1 && \
+    ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1.0 /opt/venv/lib/libccl.so.1 && \
+    ln -sf /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so && \
+    ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl_openmp.so.0.1 /opt/venv/lib/libccl_openmp.so.0 && \
+    ln -sf /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so && \
     TRITON=/opt/venv/lib/python3.12/site-packages/triton && \
     strip --strip-debug ${TRITON}/_C/libtriton.so && \
     rm -f ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git && \
@@ -194,4 +219,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # --- entrypoint: oneCCL 2021.15 is preloaded via LD_PRELOAD to avoid torch's
 #     /opt/venv/lib libccl.so.1 taking precedence due to libtorch_xpu.so RPATH. ---
+ENV LD_PRELOAD="/opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1"
+
 ENTRYPOINT ["bash", "-c", "exec vllm serve \"$@\"", "--"]
