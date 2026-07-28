@@ -1,6 +1,7 @@
 #include <sycl/sycl.hpp>
 #include <torch/extension.h>
 #include <cstdlib>
+#include <cstdio>
 #include <algorithm>
 #include <utility>
 #include <c10/xpu/XPUStream.h>
@@ -1945,6 +1946,30 @@ static constexpr int SG_FINAL_RING = 4;
 static thread_local torch::Tensor sg_final_outputs[SG_FINAL_RING];
 static thread_local int sg_final_ring_idx = 0;
 
+static bool moe_kernel_debug_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("VLLM_XPU_MOE_KERNEL_DEBUG");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+static void moe_kernel_debug_check(
+    const char* stage, const torch::Tensor& tensor) {
+    if (!moe_kernel_debug_enabled()) return;
+    auto& queue = c10::xpu::getCurrentXPUStream(tensor.device().index()).queue();
+    queue.wait_and_throw();
+    const int64_t nan_count = torch::isnan(tensor).sum().item<int64_t>();
+    const int64_t inf_count = torch::isinf(tensor).sum().item<int64_t>();
+    const float max_abs = tensor.abs().max().item<float>();
+    std::fprintf(
+        stderr,
+        "XPU_MOE_KERNEL_DEBUG stage=%s ptr=%p shape=%ldx%ld nan=%ld inf=%ld max_abs=%g\n",
+        stage, tensor.data_ptr(), tensor.size(0), tensor.size(1),
+        nan_count, inf_count, max_abs);
+    std::fflush(stderr);
+}
+
 static void ensure_gemma4_moe_buffers(int n_tokens, int top_k,
     int hidden_size, int intermediate_size, const torch::Device& dev) {
     int rows_per_token = top_k;
@@ -2039,6 +2064,8 @@ torch::Tensor moe_forward_full_gelu_tanh_routed_decode(
     const int* idx_ptr = topk_indices.data_ptr<int>();
     const fp16* w_ptr  = (const fp16*)topk_weights.data_ptr();
     sycl::queue& q = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+    // moe_kernel_debug_check("routed_decode_input", x);
+    // moe_kernel_debug_check("routed_decode_topk_weights", topk_weights);
 
     // ---- Up + gelu_tanh: K = hidden_size ----
     // gemma: hidden=2816 → VL=256 divides cleanly (tail 0).
@@ -2058,6 +2085,7 @@ torch::Tensor moe_forward_full_gelu_tanh_routed_decode(
                 sycl::range<2>(1, 1)), k);
         });
     }
+    // moe_kernel_debug_check("routed_decode_up_gelu", sg_intermediates);
     // ---- Down: K = intermediate_size ----
     // gemma per-card inter=1056 = 256*4 + 32 → VL=256 big chunks + 32 tail.
     {
@@ -2077,12 +2105,14 @@ torch::Tensor moe_forward_full_gelu_tanh_routed_decode(
                 sycl::range<2>(1, 1)), k);
         });
     }
+    // moe_kernel_debug_check("routed_decode_down", sg_routed_output);
     // ---- Accumulate over top_k ----
     auto& final_out = sg_take_final_output();
     moe_accumulate_kernel(
         (const fp16*)sg_routed_output.data_ptr(),
         (fp16*)final_out.data_ptr(),
         1, hidden_size, rows_per_token, x.device());
+    // moe_kernel_debug_check("routed_decode_accumulate", final_out);
     return final_out.narrow(0, 0, 1);
 }
 
