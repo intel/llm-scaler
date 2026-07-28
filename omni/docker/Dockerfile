@@ -21,7 +21,7 @@ ARG IMAGE_TAG
 ARG SYCL_TLA_REPOSITORY=https://github.com/intel/sycl-tla.git
 ARG SYCL_TLA_COMMIT=2fc09973bfdf15755090fcb0e3b6ad236408a992
 ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
-ARG COMFY_KITCHEN_COMMIT=fead43b4a48a5478e7518e10c0fb065cfb2ba8ac
+ARG COMFY_KITCHEN_COMMIT=c7ae07e5317d4a073562e278a41d98f05a4fe109
 ARG COMFY_KITCHEN_VERSION=0.2.18
 ARG LLM_SCALER_SOURCE_REVISION=unknown
 ARG LLM_SCALER_SOURCE_DIRTY=unknown
@@ -167,7 +167,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git clone --filter=blob:none --no-checkout \
         https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git && \
     git -C ComfyUI-GGUF-XPU fetch --depth 1 origin \
-        4b8a633e8434036820a2bb9d18cb77ae691e788c && \
+        39671fe73117ba97de7011e7e06e32599dcda06d && \
     git -C ComfyUI-GGUF-XPU checkout --detach FETCH_HEAD && \
     pip install -r ComfyUI-GGUF-XPU/requirements.txt
 
@@ -178,14 +178,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git clone --filter=blob:none --no-checkout \
         https://github.com/xiangyuT/nunchaku-torch.git && \
     git -C nunchaku-torch fetch --depth 1 origin \
-        e09fae78f138fc0f5e86ad630be14433bd9713af && \
+        f1dffcd797d80dfa8f9f89ac9df0ad9364372478 && \
     git -C nunchaku-torch checkout --detach FETCH_HEAD && \
     pip install -e nunchaku-torch --no-deps && \
     cd /llm/ComfyUI/custom_nodes && \
     git clone --filter=blob:none --no-checkout \
         https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git && \
     git -C ComfyUI-nunchaku-XPU fetch --depth 1 origin \
-        55b6497e5c5e4337d2de12943fd97a499bd9c2e5 && \
+        0510cbc789227c24056c3593681b65604bacdcfd && \
     git -C ComfyUI-nunchaku-XPU checkout --detach FETCH_HEAD && \
     pip install -r ComfyUI-nunchaku-XPU/requirements.txt
 
