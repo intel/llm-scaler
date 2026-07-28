@@ -23,6 +23,8 @@ ARG SYCL_TLA_COMMIT=2fc09973bfdf15755090fcb0e3b6ad236408a992
 ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
 ARG COMFY_KITCHEN_COMMIT=c7ae07e5317d4a073562e278a41d98f05a4fe109
 ARG COMFY_KITCHEN_VERSION=0.2.18
+ARG COMFY_GGUF_REPOSITORY=https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git
+ARG COMFY_GGUF_COMMIT=39671fe73117ba97de7011e7e06e32599dcda06d
 ARG COMFY_NUNCHAKU_REPOSITORY=https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git
 ARG COMFY_NUNCHAKU_COMMIT=5cf4fa9886f45abff102d1dd91af5247b4950148
 ARG COMFY_NUNCHAKU_VERSION=1.2.1+xpu.3
@@ -165,12 +167,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git -C ComfyUI-CacheDiT checkout --detach FETCH_HEAD && \
     pip install -r ComfyUI-CacheDiT/requirements.txt
 
+ARG COMFY_GGUF_REPOSITORY
+ARG COMFY_GGUF_COMMIT
+
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/ComfyUI/custom_nodes && \
     git clone --filter=blob:none --no-checkout \
-        https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git && \
+        "${COMFY_GGUF_REPOSITORY}" ComfyUI-GGUF-XPU && \
     git -C ComfyUI-GGUF-XPU fetch --depth 1 origin \
-        39671fe73117ba97de7011e7e06e32599dcda06d && \
+        "${COMFY_GGUF_COMMIT}" && \
     git -C ComfyUI-GGUF-XPU checkout --detach FETCH_HEAD && \
     pip install -r ComfyUI-GGUF-XPU/requirements.txt
 
@@ -308,6 +313,7 @@ ARG IMAGE_TAG
 ARG SYCL_TLA_COMMIT
 ARG COMFY_KITCHEN_COMMIT
 ARG COMFY_KITCHEN_VERSION
+ARG COMFY_GGUF_COMMIT
 ARG COMFY_NUNCHAKU_COMMIT
 ARG COMFY_NUNCHAKU_VERSION
 ARG LLM_SCALER_SOURCE_REVISION
@@ -324,6 +330,7 @@ LABEL org.opencontainers.image.version="${IMAGE_TAG}" \
       com.intel.omni.sycl-tla.revision="${SYCL_TLA_COMMIT}" \
       com.intel.omni.comfy-kitchen.version="${COMFY_KITCHEN_VERSION}" \
       com.intel.omni.comfy-kitchen.revision="${COMFY_KITCHEN_COMMIT}" \
+      com.intel.omni.comfy-gguf.revision="${COMFY_GGUF_COMMIT}" \
       com.intel.omni.comfy-nunchaku.version="${COMFY_NUNCHAKU_VERSION}" \
       com.intel.omni.comfy-nunchaku.revision="${COMFY_NUNCHAKU_COMMIT}"
 
@@ -334,6 +341,8 @@ ENV OMNIXPU_INTERPOLATE_FIX=0 \
     OMNI_LLM_SCALER_SOURCE_REVISION="${LLM_SCALER_SOURCE_REVISION}" \
     OMNI_LLM_SCALER_SOURCE_DIRTY="${LLM_SCALER_SOURCE_DIRTY}" \
     OMNI_COMFY_KITCHEN_VERSION="${COMFY_KITCHEN_VERSION}" \
+    OMNI_COMFY_KITCHEN_REVISION="${COMFY_KITCHEN_COMMIT}" \
+    OMNI_COMFY_GGUF_REVISION="${COMFY_GGUF_COMMIT}" \
     OMNI_COMFY_NUNCHAKU_VERSION="${COMFY_NUNCHAKU_VERSION}" \
     OMNI_COMFY_NUNCHAKU_REVISION="${COMFY_NUNCHAKU_COMMIT}"
 
