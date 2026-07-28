@@ -70,10 +70,25 @@ enabled by default on PTL-H or another Torch version.
 
 ## Adapter behavior
 
-Attention uses explicit capability guards. `auto` selects only validated
-platform, Torch-version, dtype, layout, and shape combinations before falling
-back to the original PyTorch attention path. `cute` and `esimd` force a
-preferred native backend where supported but still fall back safely.
+Attention uses explicit capability guards. `auto` selects CUTE routes for
+matching platform, Torch-version, dtype, layout, and operator contracts, and
+uses the original PyTorch attention path for every remaining contract. It
+never selects ESIMD. `cute` and `esimd` are explicit diagnostic policies;
+unsupported contracts still fall back safely.
+
+On BMG with Torch 2.11, the experimental LTX-style BF16 D128 route accepts
+dense B2/H32 self-attention and B1/B2/H32 KV1024 cross-attention inputs as
+`[B,L,H*D]` tensors or dense BHLD views. The adapter makes the BHLD view
+without a layout copy. B2 self-attention uses CUTE from sequence length 768,
+and B1/B2 cross-attention uses it from query length 1024 when KV length is
+1024. There is no generation-size-derived upper limit: larger lengths are
+selected from the public kernel capability instead of an exact traced shape.
+
+The first use logs a warning with the global rollback setting. If the native
+operation raises for a contract, that call falls back to PyTorch and the
+contract is quarantined for the rest of the process. Set
+`OMNI_ATTN_BACKEND=torch` before ComfyUI startup to disable the experimental
+route globally.
 
 The norm adapter preserves ComfyUI cast/offload hooks and uses native kernels
 only for eligible tensors. PTL-H H120 and non-contiguous split-QKV routes also

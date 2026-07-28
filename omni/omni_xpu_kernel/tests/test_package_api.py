@@ -73,3 +73,41 @@ def test_rotary_fast_capability_is_safe_for_legacy_or_rejected_inputs(monkeypatc
         lambda: SimpleNamespace(kitchen_rope_fast_supported=rejected),
     )
     assert rotary.kitchen_rope_fast_supported(object(), object()) is False
+
+
+def test_ltx_rope_capability_comes_from_loaded_binary(monkeypatch):
+    from omni_xpu_kernel import rotary
+
+    native = SimpleNamespace(
+        ltx_split_rope_direct_supported=lambda _input, _cos, _sin: True
+    )
+    monkeypatch.setattr(rotary, "_get_native", lambda: native)
+
+    assert rotary.supports_ltx_split_rope_direct() is True
+    assert rotary.ltx_split_rope_direct_supported(
+        object(), object(), object()
+    ) is True
+
+
+def test_ltx_rope_capability_is_safe_for_legacy_or_rejected_inputs(
+    monkeypatch,
+):
+    from omni_xpu_kernel import rotary
+
+    monkeypatch.setattr(rotary, "_get_native", lambda: SimpleNamespace())
+    assert rotary.supports_ltx_split_rope_direct() is False
+    assert not rotary.ltx_split_rope_direct_supported(
+        object(), object(), object()
+    )
+
+    def rejected(_input, _cos, _sin):
+        raise RuntimeError("unsupported tensor contract")
+
+    monkeypatch.setattr(
+        rotary,
+        "_get_native",
+        lambda: SimpleNamespace(ltx_split_rope_direct_supported=rejected),
+    )
+    assert not rotary.ltx_split_rope_direct_supported(
+        object(), object(), object()
+    )

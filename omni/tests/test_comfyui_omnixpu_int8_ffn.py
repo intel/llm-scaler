@@ -64,15 +64,30 @@ def _load_patch(monkeypatch, candidate):
             return x + 2
 
     comfy_omnigen_model.LuminaFeedForward = LuminaFeedForward
+    comfy_krea2 = types.ModuleType("comfy.ldm.krea2")
+    comfy_krea2.__path__ = []
+    comfy_krea2_model = types.ModuleType("comfy.ldm.krea2.model")
+
+    class SwiGLU:
+        def forward(self, x):
+            self.original_calls += 1
+            return self.down(
+                torch.nn.functional.silu(self.gate(x)).mul_(self.up(x))
+            )
+
+    comfy_krea2_model.SwiGLU = SwiGLU
     comfy.ops = comfy_ops
     comfy.ldm = comfy_ldm
     comfy_ldm.lumina = comfy_lumina
     comfy_lumina.model = comfy_model
     comfy_ldm.omnigen = comfy_omnigen
     comfy_omnigen.omnigen2 = comfy_omnigen_model
+    comfy_ldm.krea2 = comfy_krea2
+    comfy_krea2.model = comfy_krea2_model
 
     omni = types.ModuleType("omni_xpu_kernel")
     omni.int8 = candidate
+    omni.__xpu_target__ = "bmg"
     for name, module in (
         ("comfy", comfy),
         ("comfy.ops", comfy_ops),
@@ -81,6 +96,8 @@ def _load_patch(monkeypatch, candidate):
         ("comfy.ldm.lumina.model", comfy_model),
         ("comfy.ldm.omnigen", comfy_omnigen),
         ("comfy.ldm.omnigen.omnigen2", comfy_omnigen_model),
+        ("comfy.ldm.krea2", comfy_krea2),
+        ("comfy.ldm.krea2.model", comfy_krea2_model),
         ("omni_xpu_kernel", omni),
     ):
         monkeypatch.setitem(sys.modules, name, module)
@@ -254,6 +271,63 @@ def test_convrot_route_uses_staged_fused_producer(monkeypatch):
     assert candidate.calls[2][1]["group_size"] == 4
     assert candidate.up_inputs_released_at_down
     torch.testing.assert_close(output, torch.full_like(output, 9.0))
+
+
+def test_exact_krea2_swiglu_uses_public_fused_kernel(monkeypatch):
+    candidate = _Candidate()
+    patch, _, comfy_ops = _load_patch(monkeypatch, candidate)
+    comfy_ops.run_every_op = lambda: None
+    assert patch.apply() == (True, "")
+
+    monkeypatch.setattr(
+        patch, "_can_route_krea_input", lambda input: (True, "")
+    )
+    monkeypatch.setattr(patch, "_krea_output_reason", lambda gate, up: "")
+
+    swiglu = sys.modules["comfy.ldm.krea2.model"].SwiGLU
+    module = swiglu()
+    module.original_calls = 0
+    module.gate = lambda x: x + 2
+    module.up = lambda x: x + 3
+    module.down = lambda x: x + 4
+    output = module.forward(torch.zeros((2, 4), dtype=torch.bfloat16))
+
+    assert module.original_calls == 0
+    assert [name for name, _ in candidate.calls] == ["fused_float"]
+    assert patch.get_krea_stats() == {
+        "routed": 1,
+        "fallback": 0,
+        "reasons": {},
+    }
+    torch.testing.assert_close(output, torch.full_like(output, 9.0))
+
+
+def test_ineligible_krea2_swiglu_uses_original_forward(monkeypatch):
+    candidate = _Candidate()
+    patch, _, comfy_ops = _load_patch(monkeypatch, candidate)
+    comfy_ops.run_every_op = lambda: None
+    assert patch.apply() == (True, "")
+
+    swiglu = sys.modules["comfy.ldm.krea2.model"].SwiGLU
+    module = swiglu()
+    module.original_calls = 0
+    module.gate = lambda x: x + 2
+    module.up = lambda x: x + 3
+    module.down = lambda x: x + 4
+    x = torch.zeros((2, 4), dtype=torch.bfloat16)
+    expected = module.down(
+        torch.nn.functional.silu(module.gate(x)).mul_(module.up(x))
+    )
+    output = module.forward(x)
+
+    assert module.original_calls == 1
+    assert candidate.calls == []
+    assert patch.get_krea_stats() == {
+        "routed": 0,
+        "fallback": 1,
+        "reasons": {"device": 1},
+    }
+    torch.testing.assert_close(output, expected)
 
 
 def test_weight_extraction_rejects_dynamic_weight_transform(monkeypatch):

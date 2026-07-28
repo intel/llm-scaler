@@ -60,6 +60,14 @@ namespace rotary {
     torch::Tensor apply_kitchen_rope_split_half1(const torch::Tensor& x, const torch::Tensor& freqs_cis);
     std::tuple<torch::Tensor, torch::Tensor> apply_kitchen_rope_split_half(const torch::Tensor& xq, const torch::Tensor& xk, const torch::Tensor& freqs_cis);
     bool kitchen_rope_fast_supported(const torch::Tensor& x, const torch::Tensor& freqs);
+    bool ltx_split_rope_direct_supported(
+        const torch::Tensor& input,
+        const torch::Tensor& cos,
+        const torch::Tensor& sin);
+    torch::Tensor apply_ltx_split_rope_direct(
+        const torch::Tensor& input,
+        const torch::Tensor& cos,
+        const torch::Tensor& sin);
 }
 namespace sdp {
     torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v);
@@ -311,6 +319,16 @@ PYBIND11_MODULE(_C, m) {
     rotary.def("kitchen_rope_fast_supported", &omni_xpu::rotary::kitchen_rope_fast_supported,
         "Return whether a tensor pair can use the single-launch Kitchen RoPE kernel",
         py::arg("x"), py::arg("freqs_cis"));
+    rotary.def(
+        "ltx_split_rope_direct_supported",
+        &omni_xpu::rotary::ltx_split_rope_direct_supported,
+        "Return whether LTX split-half RoPE can consume cos/sin directly",
+        py::arg("input"), py::arg("cos"), py::arg("sin"));
+    rotary.def(
+        "apply_ltx_split_rope_direct",
+        &omni_xpu::rotary::apply_ltx_split_rope_direct,
+        "Apply LTX split-half RoPE directly to contiguous [B,T,H*D] input",
+        py::arg("input"), py::arg("cos"), py::arg("sin"));
 
     // FP8 Linear (oneDNN W8A16)
     auto linear = m.def_submodule("linear", "FP8 linear kernels");

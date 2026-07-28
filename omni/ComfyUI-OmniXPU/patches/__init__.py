@@ -30,6 +30,13 @@ COMPONENTS = (
         "adapters/attention.py",
     ),
     Component(
+        "rotary_adapter",
+        "rotary",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/rotary.py",
+    ),
+    Component(
         "norm_adapter",
         "norm",
         "adapter",
