@@ -1754,8 +1754,8 @@ torch::Tensor moe_forward_full_gelu_tanh_routed_decode(
     const int* idx_ptr = topk_indices.data_ptr<int>();
     const fp16* w_ptr  = (const fp16*)topk_weights.data_ptr();
     sycl::queue& q = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
-    moe_kernel_debug_check("routed_decode_input", x);
-    moe_kernel_debug_check("routed_decode_topk_weights", topk_weights);
+    // moe_kernel_debug_check("routed_decode_input", x);
+    // moe_kernel_debug_check("routed_decode_topk_weights", topk_weights);
 
     // ---- Up + gelu_tanh: K = hidden_size ----
     // gemma: hidden=2816 → VL=256 divides cleanly (tail 0).
@@ -1775,7 +1775,7 @@ torch::Tensor moe_forward_full_gelu_tanh_routed_decode(
                 sycl::range<2>(1, 1)), k);
         });
     }
-    moe_kernel_debug_check("routed_decode_up_gelu", sg_intermediates);
+    // moe_kernel_debug_check("routed_decode_up_gelu", sg_intermediates);
     // ---- Down: K = intermediate_size ----
     // gemma per-card inter=1056 = 256*4 + 32 → VL=256 big chunks + 32 tail.
     {
@@ -1795,14 +1795,14 @@ torch::Tensor moe_forward_full_gelu_tanh_routed_decode(
                 sycl::range<2>(1, 1)), k);
         });
     }
-    moe_kernel_debug_check("routed_decode_down", sg_routed_output);
+    // moe_kernel_debug_check("routed_decode_down", sg_routed_output);
     // ---- Accumulate over top_k ----
     auto& final_out = sg_take_final_output();
     moe_accumulate_kernel(
         (const fp16*)sg_routed_output.data_ptr(),
         (fp16*)final_out.data_ptr(),
         1, hidden_size, rows_per_token, x.device());
-    moe_kernel_debug_check("routed_decode_accumulate", final_out);
+    // moe_kernel_debug_check("routed_decode_accumulate", final_out);
     return final_out.narrow(0, 0, 1);
 }
 
