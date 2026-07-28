@@ -1188,17 +1188,17 @@ class TestConvRot:
         int8._clear_bmg_qkv_activation_cache()
 
     @pytest.mark.parametrize("inference_mode", [False, True])
-    def test_bmg_krea2_public_linear_reuses_exact_projection_activation(
+    def test_krea2_public_linear_reuses_exact_projection_activation(
         self, device, seed, monkeypatch, inference_mode
     ):
         """Krea2 attention and MLP projections reuse only the same activation."""
         if device.type != "xpu":
-            pytest.skip("BMG Krea2 activation cache requires XPU")
+            pytest.skip("Krea2 activation cache requires XPU")
 
         from omni_xpu_kernel import int8
 
-        if not int8._is_bmg_package_and_core():
-            pytest.skip("test requires aligned BMG package and core targets")
+        if not int8._is_supported_krea2_cache_target():
+            pytest.skip("test requires an aligned supported package/core target")
 
         calls = {"rotate": 0, "quantize": 0, "prequantized": 0}
 
@@ -1261,7 +1261,7 @@ class TestConvRot:
                 for output_features in weights
             }
 
-            int8._clear_bmg_krea2_activation_cache()
+            int8._clear_krea2_activation_cache()
             monkeypatch.setattr(int8, "_get_native", lambda: NativeProxy())
             for output_features in (6144, 1536, 1536, 6144, 1536):
                 int8.int8_linear(
@@ -1284,19 +1284,19 @@ class TestConvRot:
 
         assert torch.is_inference(x1) is inference_mode
         assert calls == {"rotate": 3, "quantize": 3, "prequantized": 7}
-        int8._clear_bmg_krea2_activation_cache()
+        int8._clear_krea2_activation_cache()
 
-    def test_bmg_krea2_cache_observes_tensor_mutation(
+    def test_krea2_cache_observes_tensor_mutation(
         self, device, seed, monkeypatch
     ):
         """A normal tensor version change invalidates a pending Krea2 entry."""
         if device.type != "xpu":
-            pytest.skip("BMG Krea2 activation cache requires XPU")
+            pytest.skip("Krea2 activation cache requires XPU")
 
         from omni_xpu_kernel import int8
 
-        if not int8._is_bmg_package_and_core():
-            pytest.skip("test requires aligned BMG package and core targets")
+        if not int8._is_supported_krea2_cache_target():
+            pytest.skip("test requires an aligned supported package/core target")
 
         quantize_calls = 0
 
@@ -1335,7 +1335,7 @@ class TestConvRot:
         weight = torch.empty(6144, 6144, device=device, dtype=torch.int8)
         scale = torch.ones(6144, device=device, dtype=torch.float32)
 
-        int8._clear_bmg_krea2_activation_cache()
+        int8._clear_krea2_activation_cache()
         monkeypatch.setattr(int8, "_get_native", lambda: NativeProxy())
         int8.int8_linear(
             x,
@@ -1356,7 +1356,7 @@ class TestConvRot:
         )
 
         assert quantize_calls == 2
-        int8._clear_bmg_krea2_activation_cache()
+        int8._clear_krea2_activation_cache()
 
     def test_bmg_g16_public_shared_dispatches_to_pair(
         self, device, seed, monkeypatch
