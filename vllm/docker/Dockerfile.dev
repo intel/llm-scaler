@@ -213,9 +213,6 @@ RUN set -eo pipefail && \
 # Component inventory in the build log for sanity.
 RUN pip list 2>/dev/null | grep -iE "^(vllm|torch|triton|transformers|bigdl|accelerate)" || true
 
-# Ensure runtime resolves oneCCL 2021.15 before torch RPATH candidates.
-ENV LD_PRELOAD="/opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1"
-
 # --- dev default: interactive login shell (oneAPI env auto-sourced by the base).
 #     Override with `docker run ... vllm serve <model> ...` to serve. ---
 CMD ["/bin/bash", "-l"]
