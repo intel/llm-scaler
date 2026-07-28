@@ -2,13 +2,14 @@
 GGUF Quantization Kernels - Intel XPU ESIMD Optimized
 
 High-performance dequantization kernels for GGUF quantized models.
-Supports Q4_0, Q8_0, Q4_K, Q6_K formats (ComfyUI-GGUF compatible).
+Supports Q4_0, Q4_1, Q8_0, Q4_K, Q6_K formats (ComfyUI-GGUF compatible).
 
 Example:
     import torch
     from omni_xpu_kernel import gguf
 
     output = gguf.dequantize_q4_0(quantized_data, torch.float16)
+    output = gguf.dequantize_q4_1(quantized_data, torch.float16)
     output = gguf.dequantize_q8_0(quantized_data, torch.float16)
     output = gguf.dequantize_q4_k(quantized_data, torch.float16)
     output = gguf.dequantize_q6_k(quantized_data, torch.float16)
@@ -48,6 +49,17 @@ def dequantize_q4_0_comfyui(
 ) -> torch.Tensor:
     """Dequantize Q4_0 to ComfyUI's low-16 then high-16 layout."""
     return _get_native().dequantize_q4_0(input, dtype)
+
+
+def dequantize_q4_1(
+    input: torch.Tensor, dtype: torch.dtype = torch.float16
+) -> torch.Tensor:
+    """Dequantize Q4_1 to ComfyUI's low-16 then high-16 layout.
+
+    Q4_1 stores one FP16 scale, one FP16 minimum, and 16 packed bytes
+    per 32 output elements.
+    """
+    return _get_native().dequantize_q4_1(input, dtype)
 
 
 def dequantize_q8_0(
@@ -104,7 +116,7 @@ def dequantize_batch(
 
     Args:
         inputs: List of uint8 tensors (quantized data on XPU)
-        formats: List of format strings ('q4_0', 'q8_0', 'q4_k', 'q6_k')
+        formats: List of format strings ('q4_0', 'q4_1', 'q8_0', 'q4_k', 'q6_k')
         dtype: Output dtype (default: torch.float16)
 
     Returns:
@@ -129,6 +141,7 @@ def dequantize_batch(
 __all__ = [
     "dequantize_q4_0",
     "dequantize_q4_0_comfyui",
+    "dequantize_q4_1",
     "dequantize_q8_0",
     "dequantize_q4_k",
     "dequantize_q6_k",

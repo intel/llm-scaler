@@ -5,6 +5,7 @@
 // 
 // Supported formats (matching ComfyUI-GGUF layout):
 //   Q4_0: Block=32, Size=18 bytes (2 scale + 16 data)
+//   Q4_1: Block=32, Size=20 bytes (2 scale + 2 min + 16 data)
 //   Q8_0: Block=32, Size=34 bytes (2 scale + 32 data)
 //   Q4_K: Block=256, Size=144 bytes (2+2+12+128)
 //   Q6_K: Block=256, Size=210 bytes (128+64+16+2)
@@ -31,6 +32,10 @@ namespace gguf {
 // Q4_0: 18 bytes per block, 32 elements
 constexpr int Q4_0_BLOCK_SIZE = 18;
 constexpr int Q4_0_QK = 32;
+
+// Q4_1: 20 bytes per block, 32 elements
+constexpr int Q4_1_BLOCK_SIZE = 20;
+constexpr int Q4_1_QK = 32;
 
 // Q8_0: 34 bytes per block, 32 elements
 constexpr int Q8_0_BLOCK_SIZE = 34;
@@ -105,6 +110,69 @@ void dequantize_q4_0_kernel(
     };
     
     utils::submit_kernel(cgf, device, "dequantize_q4_0");
+}
+
+// ============================================================================
+// Q4_1 Kernel (ComfyUI Sequential Layout)
+// Output layout: [0-15]=low nibbles, [16-31]=high nibbles
+// ============================================================================
+template<typename OT, int SBS = 16>
+void dequantize_q4_1_kernel(
+    const uint8_t* __restrict__ src,
+    OT* __restrict__ dst,
+    const int64_t n_blocks,
+    const at::Device& device
+) {
+    constexpr int WG_SIZE = 64;
+    const int64_t n_work_items = (n_blocks + SBS - 1) / SBS;
+    const int64_t padded_size = (n_work_items + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
+
+    auto cgf = [&](sycl::handler& handle) {
+        handle.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(padded_size), sycl::range<1>(WG_SIZE)),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                const int64_t gid = item.get_global_id(0);
+                if (gid >= n_work_items) return;
+
+                const int64_t start_block = gid * SBS;
+                const int64_t end_block = std::min(start_block + SBS, n_blocks);
+
+                simd<uint32_t, 16> offsets;
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) offsets[i] = i;
+
+                for (int64_t blk = start_block; blk < end_block; ++blk) {
+                    const uint8_t* block_src = src + blk * Q4_1_BLOCK_SIZE;
+                    OT* block_dst = dst + blk * Q4_1_QK;
+
+                    const fp16 scale = *reinterpret_cast<const fp16*>(block_src);
+                    const fp16 minimum = *reinterpret_cast<const fp16*>(block_src + 2);
+                    simd<uint8_t, 16> packed = gather<uint8_t, 16>(block_src + 4, offsets);
+
+                    simd<uint8_t, Q4_1_QK> unpacked;
+                    unpacked.select<16, 1>(0) = packed & (uint8_t)0x0F;
+                    unpacked.select<16, 1>(16) = packed >> 4;
+
+                    simd<fp16, Q4_1_QK> values = unpacked;
+                    simd<fp16, Q4_1_QK> result = values * scale + minimum;
+
+                    if constexpr (std::is_same_v<OT, fp16>) {
+                        block_store<fp16, Q4_1_QK>(
+                            reinterpret_cast<fp16*>(block_dst), result);
+                    } else if constexpr (std::is_same_v<OT, bf16>) {
+                        simd<bf16, Q4_1_QK> bf_result = result;
+                        block_store<bf16, Q4_1_QK>(
+                            reinterpret_cast<bf16*>(block_dst), bf_result);
+                    } else {
+                        simd<float, Q4_1_QK> f_result = result;
+                        block_store<float, Q4_1_QK>(block_dst, f_result);
+                    }
+                }
+            }
+        );
+    };
+
+    utils::submit_kernel(cgf, device, "dequantize_q4_1");
 }
 
 // ============================================================================
@@ -381,6 +449,33 @@ torch::Tensor dequantize_q4_0(const torch::Tensor& input, torch::ScalarType dtyp
     return output;
 }
 
+torch::Tensor dequantize_q4_1(const torch::Tensor& input, torch::ScalarType dtype) {
+    TORCH_CHECK(input.is_contiguous(), "Input tensor must be contiguous");
+    TORCH_CHECK(input.scalar_type() == torch::kByte, "Input must be uint8");
+
+    const int64_t n_bytes = input.numel();
+    const int64_t n_blocks = n_bytes / Q4_1_BLOCK_SIZE;
+    TORCH_CHECK(n_bytes % Q4_1_BLOCK_SIZE == 0, "Input size must be multiple of 20 bytes");
+
+    auto output = torch::empty({n_blocks * Q4_1_QK},
+        torch::TensorOptions().dtype(dtype).device(input.device()));
+    const uint8_t* src = input.data_ptr<uint8_t>();
+
+    if (dtype == torch::kFloat32) {
+        dequantize_q4_1_kernel<float>(
+            src, output.data_ptr<float>(), n_blocks, input.device());
+    } else if (dtype == torch::kFloat16) {
+        dequantize_q4_1_kernel<fp16>(
+            src, reinterpret_cast<fp16*>(output.data_ptr()), n_blocks, input.device());
+    } else if (dtype == torch::kBFloat16) {
+        dequantize_q4_1_kernel<bf16>(
+            src, reinterpret_cast<bf16*>(output.data_ptr()), n_blocks, input.device());
+    } else {
+        TORCH_CHECK(false, "Unsupported dtype");
+    }
+    return output;
+}
+
 torch::Tensor dequantize_q8_0(const torch::Tensor& input, torch::ScalarType dtype) {
     TORCH_CHECK(input.is_contiguous(), "Input tensor must be contiguous");
     TORCH_CHECK(input.scalar_type() == torch::kByte, "Input must be uint8");
@@ -480,6 +575,8 @@ std::vector<torch::Tensor> dequantize_batch(
         const auto& fmt = formats[i];
         if (fmt == "q4_0") {
             direct_outputs[i] = dequantize_q4_0(inputs[i], dtype);
+        } else if (fmt == "q4_1") {
+            direct_outputs[i] = dequantize_q4_1(inputs[i], dtype);
         } else if (fmt == "q8_0") {
             direct_outputs[i] = dequantize_q8_0(inputs[i], dtype);
         } else if (fmt == "q4_k") {
@@ -511,6 +608,7 @@ std::vector<torch::Tensor> dequantize_batch(
 
         int bs, qk;
         if (fmt == "q4_0") { bs = Q4_0_BLOCK_SIZE; qk = Q4_0_QK; }
+        else if (fmt == "q4_1") { bs = Q4_1_BLOCK_SIZE; qk = Q4_1_QK; }
         else if (fmt == "q8_0") { bs = Q8_0_BLOCK_SIZE; qk = Q8_0_QK; }
         else if (fmt == "q4_k") { bs = Q4_K_BLOCK_SIZE; qk = Q4_K_QK; }
         else if (fmt == "q6_k") { bs = Q6_K_BLOCK_SIZE; qk = Q6_K_QK; }
@@ -534,6 +632,7 @@ std::vector<torch::Tensor> dequantize_batch(
         // Single kernel launch for all tensors of this format
         torch::Tensor concat_output;
         if (fmt == "q4_0") concat_output = dequantize_q4_0(concat_input, dtype);
+        else if (fmt == "q4_1") concat_output = dequantize_q4_1(concat_input, dtype);
         else if (fmt == "q8_0") concat_output = dequantize_q8_0(concat_input, dtype);
         else if (fmt == "q4_k") concat_output = dequantize_q4_k(concat_input, dtype);
         else if (fmt == "q6_k") concat_output = dequantize_q6_k(concat_input, dtype);

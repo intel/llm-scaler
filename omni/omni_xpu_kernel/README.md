@@ -17,7 +17,7 @@ across those native ABI boundaries.
 | `cute.sdp_wan22_cross` | Exact BMG Wan 2.2 14B T2V Turbo cross-attention |
 | `linear` | oneDNN FP8 weight-only GEMM |
 | `fp8` | FP8 quantization, dequantization, and stochastic rounding |
-| `gguf` | Q4_0, Q8_0, Q4_K, and Q6_K dequantization |
+| `gguf` | Q4_0, Q4_1, Q8_0, Q4_K, and Q6_K dequantization |
 | `norm` | RMSNorm, LayerNorm, and fused normalization operations |
 | `svdq` | SVDQuant W4A4 dequantization, INT4 GEMM, and post-processing |
 | `int8` | INT8 quantization, linear, SwiGLU, and ConvRot operations |
