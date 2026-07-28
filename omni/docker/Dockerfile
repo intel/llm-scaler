@@ -106,9 +106,6 @@ RUN cd /llm && \
 # ======== Stable ComfyUI dependency tree ========
 FROM python-base AS comfyui-deps
 
-ARG COMFY_NUNCHAKU_REPOSITORY
-ARG COMFY_NUNCHAKU_COMMIT
-
 # ComfyUI core and its Python dependencies are target-independent and stay
 # ahead of local source COPY instructions for Docker cache reuse.
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -180,6 +177,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # The XPU custom node includes its nunchaku_torch runtime. Keep the source in
 # custom_nodes for ComfyUI discovery and install the same checkout as one
 # distribution so the bundled runtime is importable without a second repo.
+ARG COMFY_NUNCHAKU_REPOSITORY
+ARG COMFY_NUNCHAKU_COMMIT
+
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/ComfyUI/custom_nodes && \
     git clone --filter=blob:none --no-checkout \
