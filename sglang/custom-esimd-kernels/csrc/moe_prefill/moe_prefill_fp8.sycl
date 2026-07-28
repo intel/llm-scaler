@@ -71,7 +71,7 @@ namespace xmx_ns = sycl::ext::intel::esimd::xmx;
 #define MP_DOWN_MAXM 32
 #endif
 #ifndef MP_DOWN_N
-#define MP_DOWN_N 32
+#define MP_DOWN_N 64
 #endif
 
 // ── Chunk-based load balancing ───────────────────────────────────────────────
@@ -423,13 +423,20 @@ sycl::event moe_prefill_down_forward_kernel_fp8(
                         b_tile.template select<256, 1>(ms * 256) = convert<fp16>(btmp);
                     }
 
-                    // One 2D block load: all N weight rows × 16 K, row-major, rows
-                    // strided by intermediate_size. Replaces N/8 * 8 tiny row loads.
-                    simd<uint8_t, N * 16> wraw_all =
-                        xesimd::lsc_load_2d<uint8_t, 16, N, 1, false, false,
-                            xesimd::cache_hint::cached, xesimd::cache_hint::cached>(
-                            w_base, (unsigned)(intermediate_size - 1), (unsigned)(hidden_size - 1),
-                            (unsigned)(intermediate_size - 1), k, n_start);
+                    // 2D block load(s): N weight rows × 16 K, row-major, rows
+                    // strided by intermediate_size. lsc_load_2d block height is
+                    // capped at 32 rows, so for N > 32 we issue N/32 loads.
+                    constexpr int WH  = (N <= 32) ? N : 32;
+                    constexpr int WNB = N / WH;
+                    simd<uint8_t, N * 16> wraw_all;
+                    #pragma unroll
+                    for (int wb = 0; wb < WNB; wb++) {
+                        wraw_all.template select<WH * 16, 1>(wb * WH * 16) =
+                            xesimd::lsc_load_2d<uint8_t, 16, WH, 1, false, false,
+                                xesimd::cache_hint::cached, xesimd::cache_hint::cached>(
+                                w_base, (unsigned)(intermediate_size - 1), (unsigned)(hidden_size - 1),
+                                (unsigned)(intermediate_size - 1), k, n_start + wb * WH);
+                    }
                     #pragma unroll
                     for (int ns = 0; ns < NS; ns++) {
                         simd<fp16, 128> a_tile = mp_fp8_to_half<FP8_MODE, 128>(

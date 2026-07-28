@@ -2074,7 +2074,7 @@ index 30a035a23..c82c83ed6 100644
              # Dynamic scaling
              if use_per_token_if_dynamic:
 diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
-index 6c6827c7d..f5350b0ee 100755
+index 6c6827c7d..3124ad633 100755
 --- a/python/sglang/srt/layers/quantization/fp8_utils.py
 +++ b/python/sglang/srt/layers/quantization/fp8_utils.py
 @@ -46,6 +46,7 @@ from sglang.srt.utils import (
@@ -2258,7 +2258,63 @@ index 6c6827c7d..f5350b0ee 100755
  @lru_cache(maxsize=1)
  def _get_triton_mxfp8_downcast():
      try:
-@@ -1482,15 +1607,54 @@ def apply_fp8_linear(
+@@ -1444,6 +1569,55 @@ def _apply_fallback_scaled_mm(
+     input_dtype,
+ ):
+     global TORCH_DEVICE_IDENTITY
++
++    # XPU fast path: fuse the (X*W) dequant scaling into torch._scaled_mm's
++    # RowWise epilogue instead of running an identity-scaled fp32 GEMM followed
++    # by two fp32 elementwise multiplies and an fp32->fp16 cast. XPU _scaled_mm
++    # RowWise requires scale_a=(M,1) and scale_b=(1,N), both contiguous float;
++    # per-tensor weight scales are broadcast up to (1,N). Bit-exact vs the
++    # unfused path (cos=1.0) and ~3x faster on 4k prefill. Falls back on any
++    # shape/dtype mismatch.
++    if _is_xpu:
++        try:
++            N = weight.shape[1]
++            sa = x_scale
++            if sa.dim() == 1:
++                sa = sa.reshape(-1, 1)
++            if (
++                sa.dim() == 2
++                and sa.shape[0] == qinput.shape[0]
++                and sa.shape[1] == 1
++                and sa.dtype == torch.float32
++                and sa.is_contiguous()
++            ):
++                # scale_b=(1,N) is constant per weight — build once and cache on
++                # the weight_scale tensor (mirrors the _esimd_1d caching below).
++                sb = getattr(weight_scale, "_rowwise_1N", None)
++                if sb is None or sb.shape[1] != N:
++                    sb = weight_scale.reshape(1, -1).to(torch.float32)
++                    if sb.shape[1] == 1:
++                        sb = sb.expand(1, N)
++                    sb = sb.contiguous()
++                    if sb.shape[1] == N:
++                        try:
++                            weight_scale._rowwise_1N = sb
++                        except Exception:
++                            pass
++                if sb.shape[1] == N:
++                    output = torch._scaled_mm(
++                        qinput,
++                        weight,
++                        scale_a=sa,
++                        scale_b=sb,
++                        out_dtype=input_dtype,
++                        bias=bias,
++                    )
++                    return _process_scaled_mm_output(
++                        output, input_2d_shape, output_shape
++                    )
++        except Exception:
++            pass  # fall through to the portable unfused path below
++
+     if TORCH_DEVICE_IDENTITY is None:
+         TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32, device=weight.device)
+ 
+@@ -1482,15 +1656,54 @@ def apply_fp8_linear(
      # We also don't pad when using torch.compile,
      # as it breaks with dynamic shapes.
      if pad_output is None:
@@ -2317,7 +2373,7 @@ index 6c6827c7d..f5350b0ee 100755
          # Maybe apply padding to output, see comment in __init__
          num_token_padding = output_padding
 diff --git a/python/sglang/srt/layers/quantization/gguf.py b/python/sglang/srt/layers/quantization/gguf.py
-index 5c1e7a63e..69ccc3646 100644
+index 5c1e7a63e..ee9d9be32 100644
 --- a/python/sglang/srt/layers/quantization/gguf.py
 +++ b/python/sglang/srt/layers/quantization/gguf.py
 @@ -1,9 +1,9 @@
@@ -2431,7 +2487,7 @@ index 5c1e7a63e..69ccc3646 100644
              return GGUFMoEMethod(self)
          return None
  
-@@ -456,6 +534,1318 @@ class GGUFLinearMethod(LinearMethodBase):
+@@ -456,6 +534,1362 @@ class GGUFLinearMethod(LinearMethodBase):
          return out
  
  
@@ -2735,8 +2791,10 @@ index 5c1e7a63e..69ccc3646 100644
 +            and M == 1
 +            and rep[0] in ("q6_k", "q5_k", "q4_k", "q8_0", "q4_0")
 +        ):
-+            xf = x2.to(torch.float16).contiguous()
-+            out = _xpu_rep_gemv(xf, rep).to(x.dtype)  # [1, vocab]
++            xf = _as_fp16c(x2)
++            out = _xpu_rep_gemv(xf, rep)  # [1, vocab] fp16
++            if out.dtype != x.dtype:
++                out = out.to(x.dtype)
 +            if bias is not None:
 +                out = out + bias
 +            return out.reshape(*x.shape[:-1], out.shape[-1])
@@ -2753,11 +2811,12 @@ index 5c1e7a63e..69ccc3646 100644
 +            and 2 <= M <= 16
 +            and esimd_gemv_q6_k_m is not None
 +        ):
-+            xf = x2.to(torch.float16).contiguous()
++            xf = _as_fp16c(x2)
 +            N = rep[1].shape[0]
 +            out = torch.empty(M, N, dtype=torch.float16, device=xf.device)
 +            esimd_gemv_q6_k_m(xf, rep[1], rep[2], rep[3], out)
-+            out = out.to(x.dtype)
++            if out.dtype != x.dtype:
++                out = out.to(x.dtype)
 +            if bias is not None:
 +                out = out + bias
 +            return out.reshape(*x.shape[:-1], out.shape[-1])
@@ -3414,6 +3473,31 @@ index 5c1e7a63e..69ccc3646 100644
 +    return st
 +
 +
++def _as_fp16c(x: torch.Tensor) -> torch.Tensor:
++    """Return x as a contiguous fp16 tensor WITHOUT emitting a no-op
++    ``aten::to`` / ``aten::contiguous`` dispatch when x is already fp16 and
++    contiguous (the common ``--dtype float16`` case).
++
++    At M=1 decode the GGUF path is host-dispatch bound; the per-projection
++    ``x.to(torch.float16).contiguous()`` fired ~110 no-op casts/step (plus the
++    matching output cast). ``is_contiguous()`` is a cheap C++ property check,
++    not a device op, so this guard is pure host-overhead reduction and is
++    bit-identical (returns the same storage) for fp16 inputs. bf16/fp32
++    networks still get a real cast + contiguous copy.
++    """
++    if x.dtype == torch.float16:
++        return x if x.is_contiguous() else x.contiguous()
++    return x.to(torch.float16).contiguous()
++
++
++# Per-weight cache for the fp16-resident dense shards (GDN b/a in_proj_ba):
++#   id(weight) -> transposed_contiguous_weight [K, N]
++# Reps are held by the layer for the model's lifetime so id(weight) is stable
++# and this dict is bounded by the number of fp16 shards (~60). See the fp16
++# branch of _xpu_shard_matmul.
++_fp16_wt_cache: dict = {}
++
++
 +def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
 +    """x [M,K] fp16 @ shard^T -> [M,N] fp16. rep from _xpu_prepare_shard."""
 +    kind = rep[0]
@@ -3421,7 +3505,7 @@ index 5c1e7a63e..69ccc3646 100644
 +        _, packed, scale = rep
 +        N = packed.shape[0]
 +        M = x.shape[0]
-+        xf = x.to(torch.float16).contiguous()
++        xf = _as_fp16c(x)
 +        if M == 1:
 +            # Decode: the ESIMD GEMV is bandwidth-optimal (~3x faster than a
 +            # dense fp16 matmul at M=1).
@@ -3441,7 +3525,7 @@ index 5c1e7a63e..69ccc3646 100644
 +        _, qs, scale = rep
 +        N = qs.shape[0]
 +        M = x.shape[0]
-+        xf = x.to(torch.float16).contiguous()
++        xf = _as_fp16c(x)
 +        if M == 1:
 +            # Decode: ESIMD q8_0 GEMV (int8 resident, bandwidth-optimal).
 +            out = torch.empty(M, N, dtype=torch.float16, device=x.device)
@@ -3473,7 +3557,7 @@ index 5c1e7a63e..69ccc3646 100644
 +        _, ql, scale, minv = rep
 +        N = ql.shape[0]
 +        M = x.shape[0]
-+        xf = x.to(torch.float16).contiguous()
++        xf = _as_fp16c(x)
 +        if M == 1:
 +            # Decode: ESIMD q4_K GEMV (4.5-bit resident, asymmetric scale+min).
 +            out = torch.empty(M, N, dtype=torch.float16, device=x.device)
@@ -3486,7 +3570,7 @@ index 5c1e7a63e..69ccc3646 100644
 +        _, ql, qh, scale, minv = rep
 +        N = ql.shape[0]
 +        M = x.shape[0]
-+        xf = x.to(torch.float16).contiguous()
++        xf = _as_fp16c(x)
 +        if M == 1:
 +            out = torch.empty(M, N, dtype=torch.float16, device=x.device)
 +            esimd_gemv_q5_k(xf, ql, qh, scale, minv, out)
@@ -3497,16 +3581,28 @@ index 5c1e7a63e..69ccc3646 100644
 +        _, ql, qh, scale = rep
 +        N = ql.shape[0]
 +        M = x.shape[0]
-+        xf = x.to(torch.float16).contiguous()
++        xf = _as_fp16c(x)
 +        if M == 1:
 +            out = torch.empty(M, N, dtype=torch.float16, device=x.device)
 +            esimd_gemv_q6_k(xf, ql, qh, scale, out)
 +            return out
 +        w = _xpu_dequant_q6_k(ql, qh, scale, torch.float16)  # [N, K]
 +        return xf @ w.t()
-+    # fp16-resident dense weight [N, K]
-+    _, w, _ = rep
-+    return x.to(w.dtype) @ w.t()
++    # fp16-resident dense weight [N, K]. Hit by the GDN b/a (beta/decay) shards
++    # of in_proj_ba (each [num_v_heads, hidden] fp16, unquantized in the GGUF),
++    # ~60 GEMVs/decode-step. The naive ``x.to(w.dtype) @ w.t()`` fired ~8 host
++    # dispatches each (no-op cast + t/transpose/as_strided weight-transpose VIEW
++    # rebuilt per call + matmul-wrapper + mm + output empty/resize_). Cache the
++    # contiguous transpose [K, N] once so each call is a single ``torch.mm`` on
++    # two contiguous operands. Bit-identical (same operands, same math). A fresh
++    # output is allocated per call (no persistent-buffer aliasing risk).
++    w = rep[1]
++    xf = x if x.dtype == w.dtype else x.to(w.dtype)
++    wt = _fp16_wt_cache.get(id(w))
++    if wt is None:
++        wt = w.t().contiguous()  # [K, N], computed once per weight
++        _fp16_wt_cache[id(w)] = wt
++    return torch.mm(xf, wt)
 +
 +
 +def _xpu_permute_gdn_out_cols(rep, perm):
@@ -3726,7 +3822,8 @@ index 5c1e7a63e..69ccc3646 100644
 +        x: torch.Tensor,
 +        bias: torch.Tensor | None = None,
 +    ) -> torch.Tensor:
-+        x2 = x.reshape(-1, x.shape[-1])
++        # At M=1 decode x is already 2D [1, K]; skip the no-op reshape dispatch.
++        x2 = x if x.dim() == 2 else x.reshape(-1, x.shape[-1])
 +        merged = getattr(layer, "_xpu_merged", None)
 +        if merged is not None:
 +            # D1: one big-N GEMV over the merged q8_0/q4_0 shards (§10bj). The
@@ -3741,16 +3838,19 @@ index 5c1e7a63e..69ccc3646 100644
 +        # The q4_0 ESIMD kernels are fp16-only (PTL has no bf16 ESIMD), so a
 +        # bf16 network would otherwise get an fp16 tensor back here. Cast the
 +        # result to the input activation dtype to keep the graph type-consistent.
-+        out = out.to(x.dtype)
++        # Skip the no-op cast on fp16 networks (elides one host dispatch/proj).
++        if out.dtype != x.dtype:
++            out = out.to(x.dtype)
 +        if bias is not None:
 +            out = out + bias
-+        return out.reshape(*x.shape[:-1], out.shape[-1])
++        # x2 aliased x when x was 2D, so out is already [M, N] — skip no-op reshape.
++        return out if x.dim() == 2 else out.reshape(*x.shape[:-1], out.shape[-1])
 +
 +
  class GGUFMoEMethod(FusedMoEMethodBase):
      """MoE method for GGUF.
  
-@@ -565,6 +1955,253 @@ class GGUFMoEMethod(FusedMoEMethodBase):
+@@ -565,6 +1999,260 @@ class GGUFMoEMethod(FusedMoEMethodBase):
          return StandardCombineInput(hidden_states=output)
  
  
@@ -3957,15 +4057,17 @@ index 5c1e7a63e..69ccc3646 100644
 +        x = dispatch_output.hidden_states
 +        topk_weights, topk_ids, _ = dispatch_output.topk_output
 +
-+        x2 = x.reshape(-1, x.shape[-1])
++        # At M=1 decode x is already 2D [1, K]; skip the no-op reshape dispatch.
++        x2 = x if x.dim() == 2 else x.reshape(-1, x.shape[-1])
 +        M = x2.shape[0]
-+        out = torch.zeros_like(x2)
 +        if M == 0:
-+            return StandardCombineInput(hidden_states=out.reshape_as(x))
++            z = torch.zeros_like(x2)
++            return StandardCombineInput(
++                hidden_states=z if x.dim() == 2 else z.reshape_as(x))
 +        top_k = topk_ids.shape[1]
 +        hidden, inter = self.hidden, self.intermediate
 +        n_routed = M * top_k
-+        xf = x2.to(torch.float16).contiguous()
++        xf = _as_fp16c(x2)
 +        sel = topk_ids.reshape(-1).to(torch.int32).contiguous()
 +        tw = topk_weights.reshape(-1).to(torch.float16).contiguous()
 +
@@ -3980,7 +4082,10 @@ index 5c1e7a63e..69ccc3646 100644
 +                self.up_ql, self.up_sc, self.up_mn,
 +                self.down_ql, self.down_qh_plain, self.down_sc, self.down_mn,
 +                down_is_q6=self._down_is_q6)
-+            return StandardCombineInput(hidden_states=out_g.to(out.dtype).reshape_as(x))
++            if out_g.dtype != x2.dtype:
++                out_g = out_g.to(x2.dtype)
++            return StandardCombineInput(
++                hidden_states=out_g if x.dim() == 2 else out_g.reshape_as(x))
 +
 +        # Fused: 1 up launch (gate/up Q4_K + silu*up) + 1 down launch (Q5_K/Q6_K
 +        # weighted) over ALL routed pairs, then sum the top_k partials. Replaces
@@ -3997,8 +4102,10 @@ index 5c1e7a63e..69ccc3646 100644
 +            esimd_moe_down_q5k(inter_buf, self.down_ql, self.down_qh_plain, self.down_sc,
 +                               self.down_mn, sel, tw, out_partial, M, hidden, inter, top_k)
 +        # sum the top_k per-route partials back to per-token output (one op).
-+        out = out_partial.view(M, top_k, hidden).sum(dim=1).to(out.dtype)
-+        return StandardCombineInput(hidden_states=out.reshape_as(x))
++        summed = out_partial.view(M, top_k, hidden).sum(dim=1)
++        out = summed if summed.dtype == x2.dtype else summed.to(x2.dtype)
++        return StandardCombineInput(
++            hidden_states=out if x.dim() == 2 else out.reshape_as(x))
 +
 +
  class GGUFEmbeddingMethod(GGUFLinearMethod):
@@ -5224,7 +5331,7 @@ index 37552404b..96364a3f1 100644
  class Qwen2MoeAttention(nn.Module):
      def __init__(
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
-index 65f78e691..8c4c9b7ef 100644
+index 65f78e691..65446f811 100644
 --- a/python/sglang/srt/models/qwen3_5.py
 +++ b/python/sglang/srt/models/qwen3_5.py
 @@ -15,8 +15,9 @@
@@ -5503,10 +5610,50 @@ index 65f78e691..8c4c9b7ef 100644
          if (
              _is_cpu
              or _is_npu
-@@ -472,6 +664,440 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -472,6 +664,491 @@ class Qwen3_5GatedDeltaNet(nn.Module):
              projected_states_ba, _ = self.in_proj_ba(hidden_states)
          return projected_states_qkvz, projected_states_ba
  
++    def _gdn_seq_to_interleaved(
++        self,
++        projected_states_qkvz: torch.Tensor,
++        projected_states_ba: torch.Tensor,
++    ):
++        """Reorder sglang's sequential qkvz/ba into the GQA-interleaved layout
++        the native ``sgl_kernel.gdn_attention`` kernel reads.
++
++        Input (sglang, per-tp columns):
++          qkvz = [q_all(nk*hk) | k_all(nk*hk) | v_all(nv*hv) | z_all(nv*hv)]
++          ba   = [b_all(nv)    | a_all(nv)]
++        Output (kernel, per-k-head interleaved blocks):
++          qkvz = [ q(hk) k(hk) v(ratio*hv) z(ratio*hv) ] x nk
++          ba   = [ b(ratio) a(ratio) ] x nk
++        where ratio = nv // nk and v-head v belongs to k-head v // ratio
++        (contiguous GQA grouping). Returns contiguous tensors.
++        """
++        T = projected_states_qkvz.shape[0]
++        nk = self.num_k_heads // self.attn_tp_size
++        nv = self.num_v_heads // self.attn_tp_size
++        ratio = nv // nk
++        hk = self.head_k_dim
++        hv = self.head_v_dim
++        key_dim = nk * hk
++        val_dim = nv * hv
++
++        qkvz = projected_states_qkvz
++        q = qkvz[:, 0:key_dim].reshape(T, nk, hk)
++        k = qkvz[:, key_dim : 2 * key_dim].reshape(T, nk, hk)
++        v = qkvz[:, 2 * key_dim : 2 * key_dim + val_dim].reshape(T, nk, ratio * hv)
++        z = qkvz[:, 2 * key_dim + val_dim :].reshape(T, nk, ratio * hv)
++        qkvz_il = torch.cat([q, k, v, z], dim=2).reshape(T, -1).contiguous()
++
++        ba = projected_states_ba
++        b = ba[:, 0:nv].reshape(T, nk, ratio)
++        a = ba[:, nv : 2 * nv].reshape(T, nk, ratio)
++        ba_il = torch.cat([b, a], dim=2).reshape(T, -1).contiguous()
++
++        return qkvz_il, ba_il
++
 +    def _forward_xpu_fast_path(
 +        self,
 +        projected_states_qkvz: torch.Tensor,
@@ -5587,9 +5734,20 @@ index 65f78e691..8c4c9b7ef 100644
 +
 +        num_actual_tokens = projected_states_qkvz.shape[0]
 +
-+        # Contiguity the kernel asserts on.
-+        projected_states_qkvz = projected_states_qkvz.contiguous()
-+        projected_states_ba = projected_states_ba.contiguous()
++        # Layout adapter: sglang produces projected_states_qkvz in SEQUENTIAL
++        # [q_all | k_all | v_all | z_all] order and projected_states_ba as
++        # [b_all | a_all] (see fix_query_key_value_ordering). The native
++        # gdn_attention kernel instead reads qkvz as GQA-INTERLEAVED per-k-head
++        # blocks [q(head_k), k(head_k), v(head_v*ratio), z(head_v*ratio)] and ba
++        # as per-k-head [b(ratio), a(ratio)] (see chunk_causal_conv1d_xe2.hpp:
++        # qkvz_elems_offset = k_head_id*qkvz_dim+off; chunk_reorder_zba step =
++        # (token*num_v + k_head*ratio)*2). Reorder here so the kernel sees the
++        # layout it expects. conv_weights/conv_state/ssm_state stay sequential
++        # (the kernel reads those via reordered_elems_offset), so they are
++        # untouched. All dims are per-tp (the projection is column-parallel).
++        projected_states_qkvz, projected_states_ba = self._gdn_seq_to_interleaved(
++            projected_states_qkvz, projected_states_ba
++        )
 +
 +        # Output buffers (kernel writes into these).
 +        nv_tp = self.num_v_heads // self.attn_tp_size
@@ -5944,7 +6102,7 @@ index 65f78e691..8c4c9b7ef 100644
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -486,6 +1112,58 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -486,6 +1163,58 @@ class Qwen3_5GatedDeltaNet(nn.Module):
          projected_states_qkvz, projected_states_ba = self._forward_input_proj(
              hidden_states
          )
@@ -5972,7 +6130,7 @@ index 65f78e691..8c4c9b7ef 100644
 +            _ENABLE_XPU_FAST_PATH
 +            and _is_xpu
 +            and not forward_batch.forward_mode.is_target_verify()
-+            and self.num_v_heads // self.num_k_heads == 1
++            and self.num_v_heads % self.num_k_heads == 0
 +        ):
 +            output = self._forward_xpu_fast_path(
 +                projected_states_qkvz,
@@ -6003,7 +6161,7 @@ index 65f78e691..8c4c9b7ef 100644
  
          if (
              self.num_v_heads // self.num_k_heads in [1, 2, 4]
-@@ -623,6 +1301,132 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
+@@ -623,6 +1352,132 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
              is_last_layer=(layer_id == config.num_hidden_layers - 1),
          )
  
@@ -6136,7 +6294,7 @@ index 65f78e691..8c4c9b7ef 100644
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -631,48 +1435,79 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
+@@ -631,48 +1486,79 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
      ):
          forward_batch = kwargs.get("forward_batch", None)
  
@@ -6234,7 +6392,7 @@ index 65f78e691..8c4c9b7ef 100644
          if should_allreduce_fusion:
              hidden_states._sglang_needs_allreduce_fusion = True
          else:
-@@ -909,8 +1744,133 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -909,8 +1795,133 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
          positions: torch.Tensor,
          hidden_states: torch.Tensor,
          forward_batch: ForwardBatch,
@@ -6369,7 +6527,7 @@ index 65f78e691..8c4c9b7ef 100644
          if (
              not _is_npu
              or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-@@ -936,6 +1896,120 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -936,6 +1947,120 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
          output, _ = self.o_proj(attn_output)
          return output
  
@@ -6490,7 +6648,7 @@ index 65f78e691..8c4c9b7ef 100644
      def forward(
          self,
          positions: torch.Tensor,
-@@ -945,46 +2019,86 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -945,46 +2070,86 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
          captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
          **kwargs,
      ):
@@ -6590,7 +6748,7 @@ index 65f78e691..8c4c9b7ef 100644
          if should_allreduce_fusion:
              hidden_states._sglang_needs_allreduce_fusion = True
          else:
-@@ -1091,6 +2205,12 @@ class Qwen3_5ForCausalLM(nn.Module):
+@@ -1091,6 +2256,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                  config.hidden_size,
                  org_num_embeddings=config.vocab_size,
                  enable_tp=not is_dp_attention_enabled(),
@@ -6603,7 +6761,7 @@ index 65f78e691..8c4c9b7ef 100644
              )
          else:
              self.embed_tokens = PPMissingLayer()
-@@ -1718,6 +2838,113 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1718,6 +2889,113 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
          torch.cuda.empty_cache()
          torch.cuda.synchronize()
  
@@ -6717,7 +6875,7 @@ index 65f78e691..8c4c9b7ef 100644
      def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
          stacked_params_mapping = [
              # (param_name, shard_name, shard_id)
-@@ -1733,6 +2960,27 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1733,6 +3011,27 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
              ("in_proj_ba.", "in_proj_a.", 1),
          ]
  
@@ -6745,7 +6903,7 @@ index 65f78e691..8c4c9b7ef 100644
          num_experts = self.config.num_experts
  
          # Params for weights, fp8 weight scales, fp8 activation scales
-@@ -1832,6 +3080,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1832,6 +3131,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                  continue
              if "mtp" in name:
                  continue
@@ -6760,7 +6918,7 @@ index 65f78e691..8c4c9b7ef 100644
              if "language_model" in name:
                  name = name.replace(r"model.language_model.", r"model.")
              if ".self_attn." in name:
-@@ -1886,6 +3142,24 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1886,6 +3193,24 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                  if "mlp.experts" in name:
                      continue
                  name = name.replace(weight_name, param_name)
@@ -6785,7 +6943,7 @@ index 65f78e691..8c4c9b7ef 100644
                  # Skip loading extra parameters for GPTQ/modelopt models.
                  if name.endswith(ignore_suffixes) and name not in params_dict:
                      continue
-@@ -2013,6 +3287,24 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -2013,6 +3338,24 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
  
                      if name in params_dict.keys():
                          param = params_dict[name]
