@@ -324,6 +324,7 @@ def test_bmg_wan22_t2v_turbo_720p_cross_uses_cute(monkeypatch):
 @pytest.mark.parametrize(
     ("q_len", "kv_len", "pre_shaped", "route"),
     [
+        (14080, 1024, False, "bmg_b1_bf16_d128_kv1024_cross"),
         (768, 768, False, "bmg_b2_bf16_d128_self"),
         (769, 769, False, "bmg_b2_bf16_d128_self"),
         (1024, 1024, False, "bmg_b2_bf16_d128_self"),
@@ -337,9 +338,10 @@ def test_bmg_wan22_t2v_turbo_720p_cross_uses_cute(monkeypatch):
         (14080, 1024, False, "bmg_b2_bf16_d128_kv1024_cross"),
     ],
 )
-def test_bmg_b2_attention_open_ended_domain_uses_general_bhld_cute(
+def test_bmg_attention_open_ended_domain_uses_general_bhld_cute(
     monkeypatch, q_len, kv_len, pre_shaped, route
 ):
+    batch = 1 if route.startswith("bmg_b1_") else 2
     patch, attention, calls = _load_patch(
         monkeypatch,
         target="bmg",
@@ -347,13 +349,13 @@ def test_bmg_b2_attention_open_ended_domain_uses_general_bhld_cute(
     q = _FakeTensor(
         seq=q_len,
         heads=32,
-        batch=2,
+        batch=batch,
         pre_shaped=pre_shaped,
     )
     kv = _FakeTensor(
         seq=kv_len,
         heads=32,
-        batch=2,
+        batch=batch,
         pre_shaped=pre_shaped,
     )
     result = attention.optimized_attention(
@@ -369,6 +371,24 @@ def test_bmg_b2_attention_open_ended_domain_uses_general_bhld_cute(
     assert patch.get_stats()["esimd"] == 0
     assert patch.get_stats()["fallback"] == 0
     assert patch.get_stats()["routes"] == {route: 1}
+
+
+def test_bmg_b1_self_keeps_legacy_cute_route(monkeypatch):
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    tensor = _FakeTensor(seq=14080, heads=32, batch=1)
+
+    result = attention.optimized_attention(
+        tensor,
+        tensor,
+        tensor,
+        heads=32,
+        skip_reshape=True,
+    )
+
+    assert isinstance(result, _FakeTensor)
+    assert calls == ["cute"]
+    assert patch.get_stats()["cute"] == 1
+    assert patch.get_stats()["routes"] == {}
 
 
 @pytest.mark.parametrize(

@@ -77,10 +77,11 @@ never selects ESIMD. `cute` and `esimd` are explicit diagnostic policies;
 unsupported contracts still fall back safely.
 
 On BMG with Torch 2.11, the experimental LTX-style BF16 D128 route accepts
-dense B2/H32 `[B,L,H*D]` inputs as well as dense BHLD views. The adapter makes
-the BHLD view without a layout copy. Self-attention uses CUTE from sequence
-length 768, and cross-attention uses it from query length 1024 when KV length
-is 1024. There is no generation-size-derived upper limit: larger lengths are
+dense B2/H32 self-attention and B1/B2/H32 KV1024 cross-attention inputs as
+`[B,L,H*D]` tensors or dense BHLD views. The adapter makes the BHLD view
+without a layout copy. B2 self-attention uses CUTE from sequence length 768,
+and B1/B2 cross-attention uses it from query length 1024 when KV length is
+1024. There is no generation-size-derived upper limit: larger lengths are
 selected from the public kernel capability instead of an exact traced shape.
 
 The first use logs a warning with the global rollback setting. If the native

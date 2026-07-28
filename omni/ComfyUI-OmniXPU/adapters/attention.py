@@ -168,6 +168,10 @@ def _prepare_bmg_d128_bhld_cute(
     capability = getattr(_backend_sdp, "supports_d128_bhld", None)
     self_attention = q_len == kv_len and q_len >= 768
     cross_attention = kv_len == 1024 and q_len >= 1024
+    supported_batch_kind = (
+        (b == 2 and (self_attention or cross_attention))
+        or (b == 1 and cross_attention)
+    )
     if not (
         _backend_name == "cute"
         and _omni_xpu_target() == "bmg"
@@ -182,8 +186,7 @@ def _prepare_bmg_d128_bhld_cute(
         and v.device == q.device
         and heads == 32
         and dim_head == 128
-        and (self_attention or cross_attention)
-        and b == 2
+        and supported_batch_kind
     ):
         return None
 
@@ -549,7 +552,7 @@ def apply():
             route = (
                 "bmg_b2_bf16_d128_self"
                 if q_len == kv_len
-                else "bmg_b2_bf16_d128_kv1024_cross"
+                else f"bmg_b{b}_bf16_d128_kv1024_cross"
             )
             route_call_count = _record_attention_route(route)
             if not _attention_experimental_warning_emitted:
