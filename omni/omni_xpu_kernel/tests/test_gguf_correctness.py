@@ -43,6 +43,21 @@ def q4_0_data(xpu_device):
     return torch.tensor(data, dtype=torch.uint8, device=xpu_device)
 
 
+@pytest.fixture
+def q4_1_data(xpu_device):
+    """Create sample Q4_1 data with finite FP16 scales and minima."""
+    generator = np.random.default_rng(20260728)
+    data = []
+    for _ in range(1000):
+        scale = np.array([generator.uniform(-2.0, 2.0)], dtype=np.float16)
+        minimum = np.array([generator.uniform(-4.0, 4.0)], dtype=np.float16)
+        packed = generator.integers(0, 256, 16, dtype=np.uint8)
+        data.extend(scale.view(np.uint8).tolist())
+        data.extend(minimum.view(np.uint8).tolist())
+        data.extend(packed.tolist())
+    return torch.tensor(data, dtype=torch.uint8, device=xpu_device)
+
+
 def reference_dequantize_q4_0(data: torch.Tensor, sequential: bool = False):
     """Reference implementation for Q4_0 dequantization."""
     data_cpu = data.cpu()
@@ -67,6 +82,25 @@ def reference_dequantize_q4_0(data: torch.Tensor, sequential: bool = False):
                 out_block[2 * j] = scale * low
                 out_block[2 * j + 1] = scale * high
     
+    return output.to(data.device)
+
+
+def reference_dequantize_q4_1(data: torch.Tensor):
+    """Independent Q4_1 reference in ComfyUI low-half/high-half order."""
+    data_cpu = data.cpu()
+    n_blocks = data_cpu.numel() // 20
+    output = torch.zeros(n_blocks * 32, dtype=torch.float16)
+
+    for i in range(n_blocks):
+        block = data_cpu[i * 20 : (i + 1) * 20]
+        scale = block[:2].view(torch.float16).item()
+        minimum = block[2:4].view(torch.float16).item()
+        packed = block[4:].numpy().astype(int)
+        out_block = output[i * 32 : (i + 1) * 32]
+        for j in range(16):
+            out_block[j] = scale * (packed[j] & 0x0F) + minimum
+            out_block[j + 16] = scale * (packed[j] >> 4) + minimum
+
     return output.to(data.device)
 
 
@@ -117,6 +151,17 @@ class TestGGUFDequantCorrectness:
         reference = reference_dequantize_q4_0(q4_0_data, sequential=True)
         
         torch.testing.assert_close(output.cpu(), reference.cpu(), rtol=1e-3, atol=1e-3)
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    def test_dequantize_q4_1_correctness(self, q4_1_data):
+        """Test Q4_1 shape, layout, and values against an independent reference."""
+        from omni_xpu_kernel import gguf
+
+        output = gguf.dequantize_q4_1(q4_1_data, torch.float16)
+        reference = reference_dequantize_q4_1(q4_1_data)
+
+        assert output.shape == (q4_1_data.numel() // 20 * 32,)
+        torch.testing.assert_close(output.cpu(), reference.cpu(), rtol=1e-3, atol=1e-3)
     
     @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
     def test_dequantize_dtypes(self, q4_0_data):
@@ -132,8 +177,8 @@ class TestGGUFDequantCorrectness:
     def test_dequantize_batch_matches_individual_dispatch(self, dtype):
         from omni_xpu_kernel import gguf
 
-        formats = ["q4_0", "q4_0", "q8_0", "q4_k", "q6_k"]
-        block_sizes = [18, 18, 34, 144, 210]
+        formats = ["q4_0", "q4_0", "q4_1", "q8_0", "q4_k", "q6_k"]
+        block_sizes = [18, 18, 20, 34, 144, 210]
         inputs = [
             torch.randint(
                 0, 256, (block_size * 37,), device="xpu", dtype=torch.uint8

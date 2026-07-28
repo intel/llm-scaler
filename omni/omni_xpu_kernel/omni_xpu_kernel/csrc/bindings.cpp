@@ -3,7 +3,7 @@
 // ============================================================================
 // High-performance Intel XPU ESIMD kernels for ComfyUI
 // 
-// GGUF Dequantization: Q4_0, Q8_0, Q4_K, Q6_K
+// GGUF Dequantization: Q4_0, Q4_1, Q8_0, Q4_K, Q6_K
 // Normalization: RMSNorm, LayerNorm
 // SVDQuant: W4A4 dequantization, quantization, and oneDNN GEMM for nunchaku
 // Rotary: Fused rotary position embedding
@@ -15,6 +15,7 @@
 namespace omni_xpu {
 namespace gguf {
     torch::Tensor dequantize_q4_0(const torch::Tensor& input, torch::ScalarType dtype);
+    torch::Tensor dequantize_q4_1(const torch::Tensor& input, torch::ScalarType dtype);
     torch::Tensor dequantize_q8_0(const torch::Tensor& input, torch::ScalarType dtype);
     torch::Tensor dequantize_q4_k(const torch::Tensor& input, torch::ScalarType dtype);
     torch::Tensor dequantize_q6_k(const torch::Tensor& input, torch::ScalarType dtype);
@@ -151,6 +152,10 @@ PYBIND11_MODULE(_C, m) {
     gguf.def("dequantize_q4_0", &omni_xpu::gguf::dequantize_q4_0,
         "Dequantize Q4_0 tensor (18 bytes/block -> 32 elements)",
         py::arg("input"), py::arg("dtype") = torch::kFloat16);
+
+    gguf.def("dequantize_q4_1", &omni_xpu::gguf::dequantize_q4_1,
+        "Dequantize Q4_1 tensor (20 bytes/block -> 32 elements)",
+        py::arg("input"), py::arg("dtype") = torch::kFloat16);
     
     gguf.def("dequantize_q8_0", &omni_xpu::gguf::dequantize_q8_0,
         "Dequantize Q8_0 tensor (34 bytes/block -> 32 elements)",
@@ -168,7 +173,7 @@ PYBIND11_MODULE(_C, m) {
         "Batch dequantize multiple tensors in fewer kernel launches.\n"
         "Groups tensors by format, concatenates, launches one kernel per format group,\n"
         "then splits outputs. Reduces N submissions to num_format_types submissions.\n"
-        "Input: inputs=[tensor1, tensor2, ...], formats=['q4_0', 'q8_0', ...], dtype\n"
+        "Input: inputs=[tensor1, tensor2, ...], formats=['q4_0', 'q4_1', ...], dtype\n"
         "Output: list of dequantized tensors in same order as inputs",
         py::arg("inputs"), py::arg("formats"), py::arg("dtype") = torch::kFloat16);
 

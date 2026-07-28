@@ -3,7 +3,7 @@ omni_xpu_kernel - High-performance Intel XPU ESIMD kernels for PyTorch.
 
 Optimised SYCL/ESIMD kernels for Intel GPUs:
 
-* **gguf** — GGUF dequantization (Q4_0, Q8_0, Q4_K, Q6_K)
+* **gguf** — GGUF dequantization (Q4_0, Q4_1, Q8_0, Q4_K, Q6_K)
 * **norm** — RMSNorm, LayerNorm, fused Add+RMSNorm
 * **svdq** — SVDQuant W4A4: ESIMD dequant, oneDNN INT4 GEMM, fused post-processing
 * **rotary** — Fused rotary position embedding
