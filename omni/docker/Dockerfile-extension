@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Base image built from the original b7 Dockerfile:
-ARG BASE_IMAGE=intel/llm-scaler-omni:0.1.0-b7
+ARG BASE_IMAGE=intel/llm-scaler-omni:0.1.0-b8
 ARG PYTHON_VERSION=3.12
 
 FROM ${BASE_IMAGE}
@@ -181,10 +181,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd ComfyUI_PuLID_Flux_ll && \
     git fetch --depth 1 origin 7c7362b806c2c0f4bde8742ada9e7cb05b44d249 && \
     git checkout 7c7362b806c2c0f4bde8742ada9e7cb05b44d249 && \
-    git apply /tmp/0001-add_intel_xpu_support_and_bug_fix.patch && \
+    git apply /tmp/comfyui-pulid-flux-ll-add_intel_xpu_support_and_bug_fix.patch && \
     pip install -r requirements.txt && \
     pip install facenet-pytorch --no-deps && \
-    rm -f /tmp/0001-add_intel_xpu_support_and_bug_fix.patch
+    rm -f /tmp/comfyui-pulid-flux-ll-add_intel_xpu_support_and_bug_fix.patch
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/ComfyUI/custom_nodes && \
