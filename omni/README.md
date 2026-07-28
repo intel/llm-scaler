@@ -100,6 +100,8 @@ The focused image contains:
 - `comfy-kitchen==0.2.18` from the XPU-enabled
   [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/c7ae07e5317d4a073562e278a41d98f05a4fe109),
   including the managed GGUF and Nunchaku W4A16 routes;
+- [`ComfyUI-nunchaku-XPU==1.2.1+xpu.3`](https://github.com/xiangyuT/ComfyUI-nunchaku-XPU/commit/5cf4fa9886f45abff102d1dd91af5247b4950148),
+  with its `nunchaku_torch` runtime bundled in the same pinned checkout;
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md);
 - pinned ComfyUI Manager, VideoHelperSuite, Easy-Use, KJNodes, CacheDiT,
   GGUF-XPU, Nunchaku-XPU, and ControlNet auxiliary nodes.

@@ -23,10 +23,14 @@ The supported environment overrides are:
 | `COMFY_KITCHEN_REPOSITORY` | Kitchen source repository | pinned in `build.sh` |
 | `COMFY_KITCHEN_COMMIT` | Kitchen source revision | pinned in `build.sh` |
 | `COMFY_KITCHEN_VERSION` | Expected Kitchen wheel version | pinned in `build.sh` |
+| `COMFY_NUNCHAKU_REPOSITORY` | Combined Nunchaku custom-node/runtime repository | pinned in `build.sh` |
+| `COMFY_NUNCHAKU_COMMIT` | Combined Nunchaku source revision | pinned in `build.sh` |
+| `COMFY_NUNCHAKU_VERSION` | Expected combined distribution version | pinned in `build.sh` |
 
-Kitchen repository, commit, and version must be updated together. The kernel
-source is copied from `omni/omni_xpu_kernel` in the current llm-scaler
-checkout.
+Kitchen repository, commit, and version must be updated together. The same
+rule applies to the combined Nunchaku repository, commit, and distribution
+version. The kernel source is copied from `omni/omni_xpu_kernel` in the
+current llm-scaler checkout.
 
 ## Focused-image build graph
 
@@ -54,6 +58,7 @@ whether `omni/` had uncommitted changes. The final image also records:
 - image version and flavor;
 - selected XPU target;
 - Kitchen version and commit;
+- combined Nunchaku custom-node/runtime version and commit;
 - SYCL-TLA commit.
 
 Build from a clean commit before release acceptance. A device-less Docker
