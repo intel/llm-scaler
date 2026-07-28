@@ -23,6 +23,9 @@ ARG SYCL_TLA_COMMIT=2fc09973bfdf15755090fcb0e3b6ad236408a992
 ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
 ARG COMFY_KITCHEN_COMMIT=c7ae07e5317d4a073562e278a41d98f05a4fe109
 ARG COMFY_KITCHEN_VERSION=0.2.18
+ARG COMFY_NUNCHAKU_REPOSITORY=https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git
+ARG COMFY_NUNCHAKU_COMMIT=5cf4fa9886f45abff102d1dd91af5247b4950148
+ARG COMFY_NUNCHAKU_VERSION=1.2.1+xpu.3
 ARG LLM_SCALER_SOURCE_REVISION=unknown
 ARG LLM_SCALER_SOURCE_DIRTY=unknown
 
@@ -103,6 +106,9 @@ RUN cd /llm && \
 # ======== Stable ComfyUI dependency tree ========
 FROM python-base AS comfyui-deps
 
+ARG COMFY_NUNCHAKU_REPOSITORY
+ARG COMFY_NUNCHAKU_COMMIT
+
 # ComfyUI core and its Python dependencies are target-independent and stay
 # ahead of local source COPY instructions for Docker cache reuse.
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -171,23 +177,18 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git -C ComfyUI-GGUF-XPU checkout --detach FETCH_HEAD && \
     pip install -r ComfyUI-GGUF-XPU/requirements.txt
 
-# Nunchaku is retained because it is a ComfyUI quantized-model backend. Its
-# Python runtime is independent of the removed SGLang service.
+# The XPU custom node includes its nunchaku_torch runtime. Keep the source in
+# custom_nodes for ComfyUI discovery and install the same checkout as one
+# distribution so the bundled runtime is importable without a second repo.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    cd /llm && \
-    git clone --filter=blob:none --no-checkout \
-        https://github.com/xiangyuT/nunchaku-torch.git && \
-    git -C nunchaku-torch fetch --depth 1 origin \
-        f1dffcd797d80dfa8f9f89ac9df0ad9364372478 && \
-    git -C nunchaku-torch checkout --detach FETCH_HEAD && \
-    pip install -e nunchaku-torch --no-deps && \
     cd /llm/ComfyUI/custom_nodes && \
     git clone --filter=blob:none --no-checkout \
-        https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git && \
+        "${COMFY_NUNCHAKU_REPOSITORY}" ComfyUI-nunchaku-XPU && \
     git -C ComfyUI-nunchaku-XPU fetch --depth 1 origin \
-        0510cbc789227c24056c3593681b65604bacdcfd && \
+        "${COMFY_NUNCHAKU_COMMIT}" && \
     git -C ComfyUI-nunchaku-XPU checkout --detach FETCH_HEAD && \
-    pip install -r ComfyUI-nunchaku-XPU/requirements.txt
+    pip install -r ComfyUI-nunchaku-XPU/requirements.txt && \
+    pip install --no-deps --no-build-isolation ./ComfyUI-nunchaku-XPU
 
 # Keep the only patched third-party node last. Editing this local patch no
 # longer invalidates any of the unpatched third-party node layers above.
@@ -307,6 +308,8 @@ ARG IMAGE_TAG
 ARG SYCL_TLA_COMMIT
 ARG COMFY_KITCHEN_COMMIT
 ARG COMFY_KITCHEN_VERSION
+ARG COMFY_NUNCHAKU_COMMIT
+ARG COMFY_NUNCHAKU_VERSION
 ARG LLM_SCALER_SOURCE_REVISION
 ARG LLM_SCALER_SOURCE_DIRTY
 
@@ -320,7 +323,9 @@ LABEL org.opencontainers.image.version="${IMAGE_TAG}" \
       com.intel.omni.llm-scaler.source-dirty="${LLM_SCALER_SOURCE_DIRTY}" \
       com.intel.omni.sycl-tla.revision="${SYCL_TLA_COMMIT}" \
       com.intel.omni.comfy-kitchen.version="${COMFY_KITCHEN_VERSION}" \
-      com.intel.omni.comfy-kitchen.revision="${COMFY_KITCHEN_COMMIT}"
+      com.intel.omni.comfy-kitchen.revision="${COMFY_KITCHEN_COMMIT}" \
+      com.intel.omni.comfy-nunchaku.version="${COMFY_NUNCHAKU_VERSION}" \
+      com.intel.omni.comfy-nunchaku.revision="${COMFY_NUNCHAKU_COMMIT}"
 
 ENV OMNIXPU_INTERPOLATE_FIX=0 \
     OMNI_IMAGE_VERSION="${IMAGE_TAG}" \
@@ -328,7 +333,9 @@ ENV OMNIXPU_INTERPOLATE_FIX=0 \
     OMNI_IMAGE_XPU_TARGET="${XPU_TARGET}" \
     OMNI_LLM_SCALER_SOURCE_REVISION="${LLM_SCALER_SOURCE_REVISION}" \
     OMNI_LLM_SCALER_SOURCE_DIRTY="${LLM_SCALER_SOURCE_DIRTY}" \
-    OMNI_COMFY_KITCHEN_VERSION="${COMFY_KITCHEN_VERSION}"
+    OMNI_COMFY_KITCHEN_VERSION="${COMFY_KITCHEN_VERSION}" \
+    OMNI_COMFY_NUNCHAKU_VERSION="${COMFY_NUNCHAKU_VERSION}" \
+    OMNI_COMFY_NUNCHAKU_REVISION="${COMFY_NUNCHAKU_COMMIT}"
 
 WORKDIR /llm/entrypoints
 CMD ["/bin/bash"]

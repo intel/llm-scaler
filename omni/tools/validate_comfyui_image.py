@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 
 REQUIRED_KITCHEN_CAPABILITIES = {
@@ -23,6 +24,7 @@ REQUIRED_KITCHEN_CAPABILITIES = {
     "mm_int8",
     "quantize_int8_rowwise",
     "quantize_int8_tensorwise",
+    "svdquant_w4a16_linear",
 }
 
 
@@ -47,12 +49,14 @@ def main() -> None:
 
     import torch
     import comfy_kitchen
+    import nunchaku_torch
     import omni_xpu_kernel
     from omni_xpu_kernel import _version as kernel_version
 
     expected_image = os.environ["OMNI_IMAGE_VERSION"]
     expected_target = os.environ["OMNI_IMAGE_XPU_TARGET"]
     expected_kitchen = os.environ["OMNI_COMFY_KITCHEN_VERSION"]
+    expected_nunchaku = os.environ["OMNI_COMFY_NUNCHAKU_VERSION"]
     source_revision = os.environ["OMNI_LLM_SCALER_SOURCE_REVISION"]
     source_dirty = os.environ["OMNI_LLM_SCALER_SOURCE_DIRTY"]
 
@@ -76,6 +80,27 @@ def main() -> None:
         importlib.metadata.version("comfy-kitchen"),
         expected_kitchen,
     )
+    require_equal(
+        "ComfyUI-nunchaku-XPU distribution version",
+        importlib.metadata.version("ComfyUI-nunchaku-XPU"),
+        expected_nunchaku,
+    )
+    try:
+        standalone_nunchaku = importlib.metadata.version("nunchaku-torch")
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    else:
+        raise RuntimeError(
+            "standalone nunchaku-torch distribution must be absent, got "
+            f"{standalone_nunchaku!r}"
+        )
+    if "/llm/nunchaku-torch/" in nunchaku_torch.__file__:
+        raise RuntimeError(
+            "nunchaku_torch must come from the combined custom-node "
+            f"distribution, got {nunchaku_torch.__file__!r}"
+        )
+    if Path("/llm/nunchaku-torch").exists():
+        raise RuntimeError("standalone /llm/nunchaku-torch checkout must be absent")
     require_equal(
         "kernel Torch ABI",
         omni_xpu_kernel.__torch_version__,
@@ -114,6 +139,7 @@ def main() -> None:
         f"image={expected_image}, target={expected_target}, "
         f"source={source_revision[:12]}, dirty={source_dirty}, "
         f"torch={torch.__version__}, kitchen={expected_kitchen}, "
+        f"nunchaku={expected_nunchaku}, "
         f"xpu={device_name!r}, kitchen_capabilities={len(capabilities)}"
     )
 
