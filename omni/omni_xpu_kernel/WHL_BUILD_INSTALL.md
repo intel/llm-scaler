@@ -316,9 +316,13 @@ Torch XPU 头文件、库和版本。`--no-deps` 避免打包过程改变环境�
 已验证 artifact：
 
 ```text
-size:   1,398,388 bytes
-SHA256: 1F52D6F2BE86C9592432B367569B7859003C8ECE9A052FB3019D7A234D8C41FB
+size:   1,563,303 bytes
+SHA256: 2F3E7363CB4E913031F125540BABDC1DA933E27928BEA408D1020E0A4CC4DC77
 ```
+
+该 artifact 使用与 Linux 相同的 RMSNorm、LayerNorm 和 fused Add+RMSNorm
+GS dispatch ladder；Windows SDP loader 同时解析 sidecar 导出的 D64、D128
+和 FP16 fast-path 符号。
 
 项目的 `scripts\build.bat` 可用于原地安装或开发安装，但需要发布或复制
 artifact 时，应使用上面的 `pip wheel` 命令。
@@ -476,14 +480,17 @@ print("native kernel smoke: PASS")
 - BMG GroupNorm；
 - LTX direct split RoPE；
 - INT8 shared/prequantized pair、rowwise 和 cache correctness；
-- standalone SDP：`head_dim=128` 的 FP16、BF16；
+- standalone SDP：`head_dim=64/128` 的 FP16、BF16；
 - oneDNN FP8 GEMM correctness 和 primitive cache；
-- 两张 Intel Arc Pro B70 的 XPU 张量、RMSNorm 和 D128 SDP correctness。
+- 两张 Intel Arc Pro B70 的 XPU 张量、RMSNorm 和 D64/D128 SDP
+  correctness；
+- 本轮变更定点测试：Norm/Adaln 143 passed、4 skipped；SDP 91 passed、
+  1 skipped；platform dispatch source test 2 passed。
 
 当前 BMG core-only Windows wheel 的 standalone SDP 实机验收范围是
-`head_dim=128`。源码测试套件还包含 `head_dim=64` 用例；该 wheel 对这些
-配置会明确返回 `kernel not available for this configuration`，不能把上面的
-smoke 结果解释为已经覆盖 `head_dim=64`。
+`head_dim=64/128` 的 FP16、BF16。Windows 与 Linux 使用相同 sidecar
+kernel source 和参数；平台分支只负责分别通过 `GetProcAddress` 和 `dlsym`
+解析相同的五个导出符号。
 
 ### 8.3 ComfyUI 启动 smoke
 

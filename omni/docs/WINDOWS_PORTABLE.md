@@ -205,8 +205,8 @@ Architecture: intel_gpu_bmg_g31
 
 ```text
 omni_xpu_kernel-0.1.0b9.dev0+torch212.bmg-cp313-cp313-win_amd64.whl
-size:   1,398,388 bytes
-SHA256: 1F52D6F2BE86C9592432B367569B7859003C8ECE9A052FB3019D7A234D8C41FB
+size:   1,563,303 bytes
+SHA256: 2F3E7363CB4E913031F125540BABDC1DA933E27928BEA408D1020E0A4CC4DC77
 ```
 
 在 PowerShell 中取得实际 artifact，并检查 hash：
@@ -690,8 +690,8 @@ print("native kernel smoke: PASS")
 [`WHL_BUILD_INSTALL.md`](../omni_xpu_kernel/WHL_BUILD_INSTALL.md#82-最小原生-kernel-correctness-smoke)。
 
 当前 BMG core-only Windows wheel 验证的 standalone SDP 配置是
-`head_dim=128`。源码测试套件中的 `head_dim=64` 用例会返回
-`kernel not available for this configuration`，不属于本次已验证范围。
+`head_dim=64/128` 的 FP16、BF16。Windows loader 已与 Linux loader
+对齐，会解析 sidecar 已导出的 D64、D128 和 FP16 fast-path 符号。
 
 ### 13.3 ComfyUI/custom node 启动
 
@@ -786,7 +786,7 @@ curl.exe --noproxy "*" `
 | 检查 | 结果 |
 |---|---|
 | `pip check` | `No broken requirements found.` |
-| Kernel wheel | 1,398,388 bytes；SHA256 `1F52D6F2...C41FB` |
+| Kernel wheel | 1,563,303 bytes；SHA256 `2F3E7363...DC77` |
 | Kitchen wheel | 113,212 bytes；SHA256 `5E6B5663...0D64` |
 | Kitchen XPU backend | available，未 disabled |
 | Kitchen Triton backend | Windows 默认 unavailable；保留显式环境变量 opt-in |
@@ -794,8 +794,9 @@ curl.exe --noproxy "*" `
 | Kitchen source suite | 445 passed，412 skipped |
 | Kernel Windows 支持面 | 501 passed，36 skipped |
 | Kernel packaging | 25 passed，4 skipped |
+| Platform parity 定点测试 | Norm/Adaln 143 passed、4 skipped；SDP 91 passed、1 skipped；source dispatch 2 passed |
 | Attention control flow | 53 passed |
-| 双 XPU | 两张 B70 tensor、RMSNorm、D128 ESIMD SDP correctness 通过 |
+| 双 XPU | 两张 B70 tensor、RMSNorm、D64/D128 ESIMD SDP correctness 通过 |
 | 新 capability | Q4_1、GroupNorm、LTX direct RoPE、INT8 shared/prequantized pair 可见 |
 | ComfyUI quick-test | 返回码 `0` |
 | Launcher quick-test | 从 Portable 外部调用，返回码 `0` |
@@ -910,8 +911,8 @@ print(ck.list_backends().get("xpu"))
 
 - Windows wheel 当前没有 CUTE FMHA；默认使用 PyTorch SDPA，ESIMD SDP
   只作为显式选项。
-- Windows BMG ESIMD sidecar 的实机 correctness 范围是 `head_dim=128`；
-  `head_dim=64` 返回 unsupported，并由默认 SDPA 策略规避。
+- Windows BMG ESIMD sidecar 已验证 `head_dim=64/128` 的 FP16、BF16；
+  尚未覆盖的 dtype、layout、mask 和 GQA contract 仍由默认 SDPA 策略规避。
 - 本文的 native artifact 只验证了 BMG；PTL-H 需要
   `OMNI_XPU_DEVICE=ptl-h` 独立构建和验收。
 - Torch 2.13 不在当前 Windows 验证范围内。
