@@ -218,8 +218,4 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     rm -f ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git && \
     ln -s libMLIRDialectPlugin.so ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git
 
-# --- entrypoint: oneCCL 2021.15 is preloaded via LD_PRELOAD to avoid torch's
-#     /opt/venv/lib libccl.so.1 taking precedence due to libtorch_xpu.so RPATH. ---
-ENV LD_PRELOAD="/opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1"
-
 ENTRYPOINT ["bash", "-c", "exec vllm serve \"$@\"", "--"]
