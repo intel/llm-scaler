@@ -237,32 +237,35 @@ def _quantize_int8_convrot_g16_bmg_qkv(
     return x_int8, x_scale
 
 
-_BMG_KREA2_INPUT_SHAPE = (1, 4192, 6144)
-_BMG_KREA2_OUTPUT_FEATURES = (1536, 6144, 16384)
-_BMG_KREA2_MAXIMUM_CACHE_HITS = 3
-_bmg_krea2_activation_cache = threading.local()
+_KREA2_INPUT_SHAPE = (1, 4192, 6144)
+_KREA2_OUTPUT_FEATURES = (1536, 6144, 16384)
+_KREA2_MAXIMUM_CACHE_HITS = 3
+_krea2_activation_cache = threading.local()
 
 
-def _clear_bmg_krea2_activation_cache() -> None:
-    """Drop the current thread's exact Krea2 projection cache."""
-    _bmg_krea2_activation_cache.key = None
-    _bmg_krea2_activation_cache.input = None
-    _bmg_krea2_activation_cache.quantized = None
-    _bmg_krea2_activation_cache.scale = None
-    _bmg_krea2_activation_cache.remaining_hits = 0
+def _clear_krea2_activation_cache() -> None:
+    """Drop the current thread's target-aligned Krea2 projection cache."""
+    _krea2_activation_cache.key = None
+    _krea2_activation_cache.input = None
+    _krea2_activation_cache.quantized = None
+    _krea2_activation_cache.scale = None
+    _krea2_activation_cache.remaining_hits = 0
 
 
-def _is_bmg_package_and_core() -> bool:
-    """Require aligned BMG package metadata and embedded core AOT."""
+def _is_supported_krea2_cache_target() -> bool:
+    """Require aligned package/core metadata for a validated XPU target."""
     try:
         from .. import __xpu_target__, core_aot_target
 
-        return __xpu_target__ == "bmg" and core_aot_target() == "bmg"
+        return (
+            __xpu_target__ in {"bmg", "ptl-h"}
+            and core_aot_target() == __xpu_target__
+        )
     except (ImportError, RuntimeError):
         return False
 
 
-def _can_cache_krea2_int8_convrot_bmg(
+def _can_cache_krea2_int8_convrot(
     x: torch.Tensor,
     native,
     weight: torch.Tensor,
@@ -274,7 +277,7 @@ def _can_cache_krea2_int8_convrot_bmg(
 ) -> bool:
     """Return whether the trace-proven Krea2 projection contract applies."""
     if (
-        not _is_bmg_package_and_core()
+        not _is_supported_krea2_cache_target()
         or native is None
         or not hasattr(native, "rotate_convrot")
         or not hasattr(native, "quantize_int8_rowwise_fused")
@@ -284,7 +287,7 @@ def _can_cache_krea2_int8_convrot_bmg(
         or not isinstance(x, torch.Tensor)
         or x.device.type != "xpu"
         or x.dtype != torch.bfloat16
-        or tuple(x.shape) != _BMG_KREA2_INPUT_SHAPE
+        or tuple(x.shape) != _KREA2_INPUT_SHAPE
         or not x.is_contiguous()
         or x.requires_grad
         or bias is not None
@@ -293,8 +296,8 @@ def _can_cache_krea2_int8_convrot_bmg(
         or weight.device != x.device
         or weight.dtype != torch.int8
         or weight.ndim != 2
-        or weight.shape[1] != _BMG_KREA2_INPUT_SHAPE[-1]
-        or weight.shape[0] not in _BMG_KREA2_OUTPUT_FEATURES
+        or weight.shape[1] != _KREA2_INPUT_SHAPE[-1]
+        or weight.shape[0] not in _KREA2_OUTPUT_FEATURES
         or not weight.is_contiguous()
         or not isinstance(weight_scale, torch.Tensor)
         or weight_scale.device != x.device
@@ -306,7 +309,7 @@ def _can_cache_krea2_int8_convrot_bmg(
     return True
 
 
-def _quantize_krea2_int8_convrot_bmg(
+def _quantize_krea2_int8_convrot(
     x: torch.Tensor,
     native,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -319,28 +322,26 @@ def _quantize_krea2_int8_convrot_bmg(
     """
     key = _bmg_qkv_input_key(x)
     if (
-        getattr(_bmg_krea2_activation_cache, "key", None) == key
-        and getattr(_bmg_krea2_activation_cache, "remaining_hits", 0) > 0
-        and getattr(_bmg_krea2_activation_cache, "quantized", None) is not None
-        and getattr(_bmg_krea2_activation_cache, "scale", None) is not None
+        getattr(_krea2_activation_cache, "key", None) == key
+        and getattr(_krea2_activation_cache, "remaining_hits", 0) > 0
+        and getattr(_krea2_activation_cache, "quantized", None) is not None
+        and getattr(_krea2_activation_cache, "scale", None) is not None
     ):
-        x_int8 = _bmg_krea2_activation_cache.quantized
-        x_scale = _bmg_krea2_activation_cache.scale
-        _bmg_krea2_activation_cache.remaining_hits -= 1
-        if _bmg_krea2_activation_cache.remaining_hits == 0:
-            _clear_bmg_krea2_activation_cache()
+        x_int8 = _krea2_activation_cache.quantized
+        x_scale = _krea2_activation_cache.scale
+        _krea2_activation_cache.remaining_hits -= 1
+        if _krea2_activation_cache.remaining_hits == 0:
+            _clear_krea2_activation_cache()
         return x_int8, x_scale
 
-    _clear_bmg_krea2_activation_cache()
+    _clear_krea2_activation_cache()
     rotated = native.rotate_convrot(x, 256)
     x_int8, x_scale = native.quantize_int8_rowwise_fused(rotated)
-    _bmg_krea2_activation_cache.key = key
-    _bmg_krea2_activation_cache.input = x
-    _bmg_krea2_activation_cache.quantized = x_int8
-    _bmg_krea2_activation_cache.scale = x_scale
-    _bmg_krea2_activation_cache.remaining_hits = (
-        _BMG_KREA2_MAXIMUM_CACHE_HITS
-    )
+    _krea2_activation_cache.key = key
+    _krea2_activation_cache.input = x
+    _krea2_activation_cache.quantized = x_int8
+    _krea2_activation_cache.scale = x_scale
+    _krea2_activation_cache.remaining_hits = _KREA2_MAXIMUM_CACHE_HITS
     return x_int8, x_scale
 
 
@@ -536,7 +537,7 @@ def int8_linear(
             torch.float16: 1,
             torch.bfloat16: 2,
         }.get(out_dtype, 2)
-        if _can_cache_krea2_int8_convrot_bmg(
+        if _can_cache_krea2_int8_convrot(
             x,
             native,
             weight,
@@ -547,7 +548,7 @@ def int8_linear(
             convrot_groupsize,
         ):
             _clear_bmg_qkv_activation_cache()
-            x_int8, x_scale = _quantize_krea2_int8_convrot_bmg(x, native)
+            x_int8, x_scale = _quantize_krea2_int8_convrot(x, native)
             return native.int8_linear_prequantized(
                 x_int8,
                 x_scale,
@@ -556,7 +557,7 @@ def int8_linear(
                 bias,
                 dtype_code,
             )
-        _clear_bmg_krea2_activation_cache()
+        _clear_krea2_activation_cache()
         if _can_cache_int8_convrot_g16_bmg(
             x,
             native,
@@ -608,7 +609,7 @@ def int8_linear(
         return native.int8_linear(
             x, weight, weight_scale, bias, dtype_code, False, convrot_groupsize
         )
-    _clear_bmg_krea2_activation_cache()
+    _clear_krea2_activation_cache()
     _clear_bmg_qkv_activation_cache()
     return _ref_int8_linear(
         x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize
@@ -651,7 +652,7 @@ def int8_linear_prequantized(
             "float32, float16, bfloat16"
         )
 
-    _clear_bmg_krea2_activation_cache()
+    _clear_krea2_activation_cache()
     _clear_bmg_qkv_activation_cache()
     native = _get_native()
     if native is not None and hasattr(native, "int8_linear_prequantized"):
@@ -690,7 +691,7 @@ def int8_linear_shared_input(
     ConvRot, when requested, is also applied once and therefore must be shared
     by both weights.
     """
-    _clear_bmg_krea2_activation_cache()
+    _clear_krea2_activation_cache()
     _clear_bmg_qkv_activation_cache()
     if out_dtype is None:
         out_dtype = x.dtype
@@ -839,7 +840,7 @@ def dequantize_int8_convrot_weight(
 
 def int8_cache_clear() -> None:
     """Clear cached oneDNN INT8 primitive state."""
-    _clear_bmg_krea2_activation_cache()
+    _clear_krea2_activation_cache()
     _clear_bmg_qkv_activation_cache()
     native = _get_native()
     if native is not None and hasattr(native, "int8_cache_clear"):

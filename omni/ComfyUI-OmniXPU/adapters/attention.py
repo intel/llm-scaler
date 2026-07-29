@@ -337,6 +337,7 @@ def apply():
     import sys
 
     probe = sys.modules.get("ComfyUI-OmniXPU.probe")
+    target = _omni_xpu_target()
 
     # Resolve the requested backend.
     if _backend not in {"auto", "cute", "esimd", "torch"}:
@@ -417,17 +418,23 @@ def apply():
             skip_reshape,
             skip_output_reshape,
         )
-        bmg_d128_prepared = _prepare_bmg_d128_bhld_cute(
-            q,
-            k,
-            v,
-            b,
-            heads,
-            dim_head,
-            q_len,
-            kv_len,
-            skip_reshape,
-            skip_output_reshape,
+        # Keep target-specific capability probing out of other platforms'
+        # hot attention dispatchers.
+        bmg_d128_prepared = (
+            _prepare_bmg_d128_bhld_cute(
+                q,
+                k,
+                v,
+                b,
+                heads,
+                dim_head,
+                q_len,
+                kv_len,
+                skip_reshape,
+                skip_output_reshape,
+            )
+            if target == "bmg"
+            else None
         )
         bmg_d128_contract = (
             bmg_d128_prepared[0]
@@ -438,16 +445,20 @@ def apply():
             bmg_d128_contract is not None
             and bmg_d128_contract not in _attention_failed_contracts
         )
-        use_bmg_wan22_cute_cross = _use_bmg_wan22_cute_cross(
-            q,
-            k,
-            v,
-            heads,
-            dim_head,
-            q_len,
-            kv_len,
-            skip_reshape,
-            skip_output_reshape,
+        use_bmg_wan22_cute_cross = (
+            _use_bmg_wan22_cute_cross(
+                q,
+                k,
+                v,
+                heads,
+                dim_head,
+                q_len,
+                kv_len,
+                skip_reshape,
+                skip_output_reshape,
+            )
+            if target == "bmg"
+            else False
         )
 
         # Constraint check

@@ -276,6 +276,37 @@ def test_explicit_cute_does_not_apply_auto_route(monkeypatch):
     assert patch.get_stats()["esimd"] == 0
 
 
+def test_ptl_dispatch_does_not_probe_bmg_capabilities(monkeypatch):
+    patch, attention, calls = _load_patch(monkeypatch, target="ptl-h")
+
+    def unexpected_bmg_probe(*args, **kwargs):
+        raise AssertionError("PTL dispatch reached a BMG-only capability probe")
+
+    monkeypatch.setattr(
+        patch,
+        "_prepare_bmg_d128_bhld_cute",
+        unexpected_bmg_probe,
+    )
+    monkeypatch.setattr(
+        patch,
+        "_use_bmg_wan22_cute_cross",
+        unexpected_bmg_probe,
+    )
+
+    tensor = _FakeTensor(seq=4096)
+    result = attention.optimized_attention(
+        tensor,
+        tensor,
+        tensor,
+        heads=30,
+        skip_reshape=True,
+    )
+
+    assert isinstance(result, _FakeTensor)
+    assert calls == ["cute"]
+    assert patch.get_stats()["cute"] == 1
+
+
 def test_esimd_is_selected_only_when_explicitly_requested(monkeypatch):
     patch, attention, calls = _load_patch(monkeypatch, backend="esimd")
     tensor = _FakeTensor()
