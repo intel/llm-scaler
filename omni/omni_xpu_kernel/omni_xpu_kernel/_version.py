@@ -121,7 +121,10 @@ def get_packaged_build_info(version_file=None):
         return None
 
     distribution_files = package_distribution.files or ()
-    if not any(str(path).endswith(".dist-info/RECORD") for path in distribution_files):
+    if not any(
+        Path(path).as_posix().endswith(".dist-info/RECORD")
+        for path in distribution_files
+    ):
         # Source-tree egg-info is metadata for a prospective build, not an
         # immutable installed wheel identity.
         return None

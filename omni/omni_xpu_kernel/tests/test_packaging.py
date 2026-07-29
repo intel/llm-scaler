@@ -252,7 +252,10 @@ def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
         (tmp_path / required_dir).mkdir(parents=True)
     monkeypatch.chdir(PROJECT_ROOT)
     monkeypatch.setenv("CUTLASS_SYCL_ROOT", str(tmp_path))
-    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "1")
+    monkeypatch.setenv(
+        "OMNI_XPU_REQUIRE_CUTE",
+        "0" if sys.platform == "win32" else "1",
+    )
     monkeypatch.setattr(setuptools, "setup", lambda **kwargs: captured.update(kwargs))
 
     setup_namespace = run_path(
@@ -277,11 +280,14 @@ def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
         not package.startswith(("tests", "scripts", "benchmarks"))
         for package in captured["packages"]
     )
-    cute_dependencies = {
-        Path(dependency).name
-        for dependency in extensions["omni_xpu_kernel.cute.cute_fmha_torch"].depends
-    }
-    assert "cute_fmha_config.h" in cute_dependencies
+    if sys.platform == "win32":
+        assert "omni_xpu_kernel.cute.cute_fmha_torch" not in extensions
+    else:
+        cute_dependencies = {
+            Path(dependency).name
+            for dependency in extensions["omni_xpu_kernel.cute.cute_fmha_torch"].depends
+        }
+        assert "cute_fmha_config.h" in cute_dependencies
     assert all(
         not Path(dependency).is_absolute()
         for extension in extensions.values()
@@ -309,7 +315,10 @@ def test_bmg_cute_overlay_patches_private_header_copy(monkeypatch, tmp_path):
         (cutlass_root / required_dir).mkdir(parents=True)
     monkeypatch.chdir(PROJECT_ROOT)
     monkeypatch.setenv("CUTLASS_SYCL_ROOT", str(cutlass_root))
-    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "1")
+    monkeypatch.setenv(
+        "OMNI_XPU_REQUIRE_CUTE",
+        "0" if sys.platform == "win32" else "1",
+    )
     monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
     namespace = run_path(
         str(PROJECT_ROOT / "setup.py"), run_name="__cute_bmg_overlay_test__"
@@ -448,8 +457,14 @@ def test_default_build_accepts_complete_cutlass_tree(tmp_path):
         env=env,
     )
 
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "omni_xpu_kernel" in result.stdout
+    if sys.platform == "win32":
+        assert result.returncode != 0
+        assert "CUTE is required by default but unsupported on Windows" in (
+            result.stdout + result.stderr
+        )
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "omni_xpu_kernel" in result.stdout
 
 
 def has_packaging_prerequisites() -> bool:
