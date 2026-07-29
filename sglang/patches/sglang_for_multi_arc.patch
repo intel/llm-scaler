@@ -1272,7 +1272,7 @@ index 59ca3f9cc..e104249d2 100644
              # Store in data_container with expert/shard info
              if not hasattr(param, "expert_data_map"):
 diff --git a/python/sglang/srt/layers/moe/moe_runner/triton.py b/python/sglang/srt/layers/moe/moe_runner/triton.py
-index 96e431d4e..20a044846 100644
+index 96e431d4e..cd890f194 100644
 --- a/python/sglang/srt/layers/moe/moe_runner/triton.py
 +++ b/python/sglang/srt/layers/moe/moe_runner/triton.py
 @@ -1,5 +1,6 @@
@@ -1282,7 +1282,7 @@ index 96e431d4e..20a044846 100644
  from dataclasses import dataclass
  from typing import TYPE_CHECKING, Any, List, Optional
  
-@@ -24,6 +25,174 @@ if TYPE_CHECKING:
+@@ -24,6 +25,152 @@ if TYPE_CHECKING:
      )
  
  
@@ -1319,25 +1319,7 @@ index 96e431d4e..20a044846 100644
 +    return op
 +
 +
-+def _e5m2_gate_up_transposed(w13: torch.Tensor) -> torch.Tensor:
-+    """Return gate_up in the layout the e5m2 fused kernel expects.
 +
-+    ``moe_forward_full_silu_routed_e5m2`` requires gate_up as
-+    ``[E, hidden, 2*inter]`` (K-major), whereas sglang's FusedMoE stores w13 as
-+    ``[E, 2*inter, hidden]`` (N-major). There is no e5m2 *nmajor* up kernel, so
-+    for the e5m2 variant we transpose once and cache the contiguous copy on the
-+    weight tensor (amortised across all decode calls). down_weight needs no
-+    transform (both layouts are ``[E, hidden, inter]``).
-+    """
-+    cached = getattr(w13, "_esimd_e5m2_t", None)
-+    if cached is not None:
-+        return cached
-+    t = w13.transpose(1, 2).contiguous()
-+    try:
-+        w13._esimd_e5m2_t = t
-+    except Exception:
-+        pass
-+    return t
 +
 +
 +def _try_esimd_moe_silu_routed(
@@ -1427,14 +1409,10 @@ index 96e431d4e..20a044846 100644
 +    s13 = _per_expert_pt_scale(quant_info.w13_scale)
 +    s2 = _per_expert_pt_scale(quant_info.w2_scale)
 +
-+    # We use the `_sglang` kernel variant which accepts w13 directly in
-+    # sglang's [E, 2*intermediate, hidden] layout — no transpose / copy
-+    # required, no extra memory cost, and the Triton fallback can still read
-+    # the same parameter unchanged.
++    # Both the e4m3 (`_sglang`) and e5m2 kernel variants now accept w13 directly
++    # in sglang's [E, 2*intermediate, hidden] N-major layout — no transpose /
++    # extra copy, and the Triton fallback reads the same parameter unchanged.
 +    w13_kernel = w13
-+    if fp8_variant == "e5m2":
-+        # e5m2 fused kernel expects transposed gate_up ([E, hidden, 2*inter]).
-+        w13_kernel = _e5m2_gate_up_transposed(w13)
 +
 +    topk_w = runner_input.topk_weights
 +    topk_i = runner_input.topk_ids
@@ -1457,7 +1435,7 @@ index 96e431d4e..20a044846 100644
  @dataclass
  class TritonRunnerInput(RunnerInput):
  
-@@ -81,6 +250,15 @@ class TritonRunnerCore(MoeRunnerCore):
+@@ -81,6 +228,15 @@ class TritonRunnerCore(MoeRunnerCore):
          running_state: dict,
          hooks: Optional[Any] = None,
      ) -> TritonRunnerOutput:
@@ -1473,7 +1451,7 @@ index 96e431d4e..20a044846 100644
          from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
              _fused_moe_kernel_sequence,
          )
-@@ -136,6 +314,210 @@ class TritonRunnerCore(MoeRunnerCore):
+@@ -136,6 +292,207 @@ class TritonRunnerCore(MoeRunnerCore):
          return MoeRunnerBackend.TRITON
  
  
@@ -1536,12 +1514,9 @@ index 96e431d4e..20a044846 100644
 +    s13 = _per_expert_pt_scale(quant_info.w13_scale)
 +    s2 = _per_expert_pt_scale(quant_info.w2_scale)
 +
-+    # Use the `_sglang` kernel variant: accepts w13 in [E, 2*inter, hidden]
-+    # directly, no transpose required.
++    # Both e4m3 and e5m2 kernel variants accept w13 in [E, 2*inter, hidden]
++    # (N-major) directly — no transpose / extra copy.
 +    w13_kernel = w13
-+    if fp8_variant == "e5m2":
-+        # e5m2 fused kernel expects transposed gate_up ([E, hidden, 2*inter]).
-+        w13_kernel = _e5m2_gate_up_transposed(w13)
 +
 +    if topk_weights.dtype != torch.float16:
 +        topk_weights = topk_weights.to(torch.float16)
@@ -1684,7 +1659,7 @@ index 96e431d4e..20a044846 100644
  @register_fused_func("none", "triton")
  def fused_experts_none_to_triton(
      dispatch_output: StandardDispatchOutput,
-@@ -145,6 +527,30 @@ def fused_experts_none_to_triton(
+@@ -145,6 +502,30 @@ def fused_experts_none_to_triton(
      from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
      from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
  
@@ -1743,7 +1718,7 @@ index b104e40d7..4da941e2e 100644
          raise ValueError(
              "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
 diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
-index b4e05df01..eb3aa12c5 100644
+index b4e05df01..c003da1f1 100644
 --- a/python/sglang/srt/layers/quantization/fp8.py
 +++ b/python/sglang/srt/layers/quantization/fp8.py
 @@ -116,6 +116,145 @@ _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
@@ -1924,31 +1899,23 @@ index b4e05df01..eb3aa12c5 100644
          if _is_hip and _use_hip_int4:
              self.process_weights_hip_int4(layer)
  
-@@ -1580,6 +1726,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -1580,6 +1726,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
              layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
              layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
  
-+            # e5m2 fused decode kernels need a transposed copy of the routed
-+            # gate_up weight, precomputed HERE (load time, before the KV cache
-+            # pool is sized) to avoid a decode-time OOM:
-+            #   moe_forward_full_silu_routed_e5m2 / moe_forward_full_v2 want
-+            #   gate_up as [E, hidden, 2*inter]  (transpose of [E, 2*inter, hidden])
-+            # The routed DOWN weight is consumed in its NATURAL sglang layout
-+            # ([E, hidden, inter]) by both kernels (v2 uses the vllm-layout down
-+            # kernel), so NO transposed down copy is cached — that extra full
-+            # weight replica per rank would OOM at load time.
-+            if fp8_dtype == torch.float8_e5m2:
-+                try:
-+                    layer.w13_weight._esimd_e5m2_t = (
-+                        layer.w13_weight.data.transpose(1, 2).contiguous()
-+                    )
-+                except Exception:
-+                    pass
++            # NOTE: e5m2 fused decode kernels used to require a transposed copy
++            # of the routed gate_up weight (w13._esimd_e5m2_t = [E, hidden,
++            # 2*inter]), which cost a full extra weight replica per rank
++            # (~10GB/tile at E=256). The e5m2 up kernels now read sglang's
++            # native N-major w13 [E, 2*inter, hidden] directly
++            # (moe_up_routed_e5m2_nmajor_kernel / moe_up_merged_e5m2_nmajor_kernel),
++            # so NO transposed copy is cached. The routed DOWN weight is likewise
++            # consumed in its natural layout ([E, hidden, inter]).
 +
              if _is_hip:
                  self.process_weights_hip_scale_padding(layer)
  
-@@ -1807,7 +1970,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -1807,7 +1962,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
          layer: torch.nn.Module,
          dispatch_output: DispatchOutput,
      ) -> CombineInput:
@@ -1956,7 +1923,7 @@ index b4e05df01..eb3aa12c5 100644
          from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
  
          x = dispatch_output.hidden_states
-@@ -1860,9 +2022,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -1860,9 +2014,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
  
              topk_weights, topk_ids, _ = dispatch_output.topk_output
              assert layer.w13_weight.dtype == layer.w2_weight.dtype
@@ -4720,7 +4687,7 @@ index 32ff5bac2..6b7d1eff6 100644
      # FP8 approach: BF16/FP16 model with native FP8 quantization
      if load_config.load_format == LoadFormat.FLASH_RL:
 diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
-index 37552404b..96364a3f1 100644
+index 37552404b..4498c7d22 100644
 --- a/python/sglang/srt/models/qwen2_moe.py
 +++ b/python/sglang/srt/models/qwen2_moe.py
 @@ -19,6 +19,7 @@
@@ -4739,7 +4706,7 @@ index 37552404b..96364a3f1 100644
      tensor_model_parallel_all_reduce,
  )
  from sglang.srt.distributed.parallel_state import (
-@@ -123,6 +125,464 @@ _is_hip = is_hip()
+@@ -123,6 +125,451 @@ _is_hip = is_hip()
  _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
  
  
@@ -4879,8 +4846,8 @@ index 37552404b..96364a3f1 100644
 +# activations stay fp16. Gated by SGL_XPU_ESIMD_MOE_FULL=1.
 +#
 +# Weight layouts the kernel expects (all validated numerically, cos≈1.0):
-+#   routed gate_up : [E, hidden, 2*inter]  -> w13_weight._esimd_e5m2_t  (load-time)
-+#   routed down    : [E, inter, hidden]    -> w2_weight._esimd_e5m2_t   (load-time)
++#   routed gate_up : [E, 2*inter, hidden]  (native sglang w13, no transpose)
++#   routed down    : [E, hidden, inter]    (native sglang w2, no transpose)
 +#   shared gate_up : [NS, 2*inter, hidden] (natural)  -> transpose of stored [hidden,2*inter]
 +#   shared down    : [NS, hidden, inter]   (natural)  -> transpose of stored [inter,hidden]
 +#   shared_gate    : [NS, hidden] fp16 (not quantised)
@@ -4987,11 +4954,8 @@ index 37552404b..96364a3f1 100644
 +    if w13.dtype != torch.float8_e5m2 or w2.dtype != torch.float8_e5m2:
 +        _moe_full_dbg("routed_not_e5m2", w13=str(w13.dtype), w2=str(w2.dtype))
 +        return None
-+    gate_up_routed = getattr(w13, "_esimd_e5m2_t", None)   # [E, hidden, 2*inter]
++    gate_up_routed = w13                                   # native [E, 2*inter, hidden]
 +    down_routed = w2                                        # natural [E, hidden, inter]
-+    if gate_up_routed is None:
-+        _moe_full_dbg("routed_cache_missing", gu=False)
-+        return None
 +    s13 = _pt_scale_1d(getattr(experts, "w13_weight_scale", None))
 +    s2 = _pt_scale_1d(getattr(experts, "w2_weight_scale", None))
 +    if s13 is None or s2 is None:
@@ -5014,15 +4978,6 @@ index 37552404b..96364a3f1 100644
 +        try:
 +            shared_gate_up = gw.t().contiguous().unsqueeze(0)  # [1, 2*inter, hidden]
 +            gw._esimd_moe_full_nat = shared_gate_up
-+        except Exception:
-+            return None
-+    # DPAS/transposed layout [1, hidden, 2*inter] for the merged up kernel (4b).
-+    # gw is already stored [hidden, 2*inter], so this is just an unsqueeze.
-+    shared_gate_up_dpas = getattr(gw, "_esimd_moe_full_dpas", None)
-+    if shared_gate_up_dpas is None:
-+        try:
-+            shared_gate_up_dpas = gw.unsqueeze(0).contiguous()  # [1, hidden, 2*inter]
-+            gw._esimd_moe_full_dpas = shared_gate_up_dpas
 +        except Exception:
 +            return None
 +    shared_down = getattr(dw, "_esimd_moe_full_nat", None)
@@ -5050,7 +5005,6 @@ index 37552404b..96364a3f1 100644
 +        "num_shared": int(shared_gate_up.shape[0]),
 +        "gate_up_routed": gate_up_routed, "s13": s13,
 +        "shared_gate_up": shared_gate_up, "ss13": ss13,
-+        "shared_gate_up_dpas": shared_gate_up_dpas,
 +        "down_routed": down_routed, "s2": s2,
 +        "shared_down": shared_down, "ss2": ss2,
 +        "sgw16": sgw16,
@@ -5184,7 +5138,7 @@ index 37552404b..96364a3f1 100644
 +            h_in, res, norm_weight_folded, float(eps),
 +            wq, sc,
 +            W["gate_up_routed"], W["s13"],
-+            W["shared_gate_up_dpas"], W["ss13"],
++            W["shared_gate_up"], W["ss13"],
 +            W["down_routed"], W["s2"],
 +            W["shared_down"], W["ss2"],
 +            W["sgw16"],
@@ -5204,7 +5158,7 @@ index 37552404b..96364a3f1 100644
  def can_fuse_shared_expert(
      config: PretrainedConfig,
      quant_config: Optional[QuantizationConfig],
-@@ -454,7 +914,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+@@ -454,7 +901,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
  
      def _forward_router_experts(self, hidden_states: torch.Tensor):
          # router_logits: (num_tokens, n_experts)
@@ -5215,7 +5169,7 @@ index 37552404b..96364a3f1 100644
          topk_output = self.topk(hidden_states, router_logits)
          if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
              topk_output
-@@ -522,8 +984,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+@@ -522,8 +971,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                  hidden_states
              )
          else:
@@ -5233,7 +5187,7 @@ index 37552404b..96364a3f1 100644
  
          if shared_output is not None:
              final_hidden_states += shared_output
-@@ -542,6 +1011,96 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+@@ -542,6 +998,96 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
  
          return final_hidden_states.view(num_tokens, hidden_dim)
  
