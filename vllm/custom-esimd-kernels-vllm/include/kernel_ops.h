@@ -114,6 +114,19 @@ at::Tensor esimd_gdn_conv_fused_seq(
     int64_t K, int64_t V,
     double scale);
 
+// Rollback-aware fused Conv1d + GDN for speculative sequential tokens.
+at::Tensor esimd_gdn_conv_fused_seq_spec(
+    at::Tensor qkvz,
+    at::Tensor conv_state, at::Tensor conv_weight, at::Tensor conv_bias,
+    at::Tensor spec_state_indices,
+    at::Tensor A_log, at::Tensor dt_bias,
+    at::Tensor ba, at::Tensor ssm_state,
+    at::Tensor output, at::Tensor z_out,
+    at::Tensor token_indx, at::Tensor num_accepted_tokens,
+    int64_t num_spec_decodes, int64_t num_spec_tokens,
+    int64_t H, int64_t HV, int64_t K, int64_t V,
+    double scale);
+
 // Fused ResidualAdd + RMSNorm + FP8 GEMV (post_attn_norm + router)
 at::Tensor esimd_resadd_norm_gemv_fp8_pert(
     at::Tensor hidden_states, at::Tensor residual, at::Tensor norm_weight,

@@ -588,6 +588,36 @@ def esimd_gdn_conv_fused_seq(
         N, H, HV, K, V, scale)
 
 
+def esimd_gdn_conv_fused_seq_spec(
+    qkvz: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor,
+    spec_state_indices: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    ba: torch.Tensor,
+    ssm_state: torch.Tensor,
+    output: torch.Tensor,
+    z_out: torch.Tensor,
+    token_indx: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    num_spec_decodes: int,
+    num_spec_tokens: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    scale: float,
+) -> torch.Tensor:
+    """Fused sequential GDN for speculative tokens with rollback states."""
+    return _ops.esimd_gdn_conv_fused_seq_spec(
+        qkvz, conv_state, conv_weight, conv_bias, spec_state_indices,
+        A_log, dt_bias, ba, ssm_state, output, z_out, token_indx,
+        num_accepted_tokens, num_spec_decodes, num_spec_tokens,
+        H, HV, K, V, scale)
+
+
 # ---- MoE Auxiliary Ops (doubleGRF, LGRF module) ----
 
 def esimd_moe_topk(

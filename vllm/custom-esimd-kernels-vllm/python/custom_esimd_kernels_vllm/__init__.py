@@ -50,6 +50,7 @@ from custom_esimd_kernels_vllm.ops import (
     esimd_norm_gemv_fp8_blockscale,
     esimd_norm_gemv_int4_pert,
     esimd_gdn_conv_fused_seq,
+    esimd_gdn_conv_fused_seq_spec,
     esimd_moe_topk,
     esimd_moe_scatter_fused,
     esimd_moe_silu_mul,

@@ -30,6 +30,18 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
         "int N, int H, int HV, int K, int V, "
         "float scale) -> Tensor(c!)");
   m.impl("esimd_gdn_conv_fused_seq", torch::kXPU, &esimd_gdn_conv_fused_seq);
+
+  m.def("esimd_gdn_conv_fused_seq_spec(Tensor qkvz, "
+        "Tensor conv_state, Tensor conv_weight, Tensor conv_bias, "
+        "Tensor spec_state_indices, "
+        "Tensor A_log, Tensor dt_bias, "
+        "Tensor ba, Tensor ssm_state, "
+        "Tensor output, Tensor z_out, "
+        "Tensor token_indx, Tensor num_accepted_tokens, "
+        "int num_spec_decodes, int num_spec_tokens, "
+        "int H, int HV, int K, int V, float scale) -> Tensor");
+  m.impl("esimd_gdn_conv_fused_seq_spec", torch::kXPU,
+         &esimd_gdn_conv_fused_seq_spec);
 }
 
 PyMODINIT_FUNC PyInit_custom_esimd_kernels_lgrf() {
