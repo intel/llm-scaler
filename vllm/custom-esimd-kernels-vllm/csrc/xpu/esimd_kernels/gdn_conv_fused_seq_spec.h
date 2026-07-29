@@ -508,8 +508,8 @@ inline void gdn_conv_fused_seq_spec_host(
     int64_t ssm_stride0,
     sycl::queue& q)
 {
-    TORCH_CHECK(H == 8 && HV == 24 && K == 128 && V == 128,
-        "gdn_conv_fused_seq_spec supports only H=8, HV=24, K=V=128; got H=",
+    TORCH_CHECK(H == 8 && (HV == 16 || HV == 24) && K == 128 && V == 128,
+        "gdn_conv_fused_seq_spec supports H=8, HV=16/24, K=V=128; got H=",
         H, " HV=", HV, " K=", K, " V=", V);
     TORCH_CHECK(num_spec_decodes > 0 && num_spec_tokens > 0,
         "speculative GDN dimensions must be positive");
