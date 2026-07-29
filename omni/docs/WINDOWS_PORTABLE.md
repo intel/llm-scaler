@@ -36,12 +36,13 @@ Windows 部署保留 Dockerfile 中的核心分层，但不复制 Linux-only 部
 | Application | 官方 ComfyUI Intel Portable | UI、模型加载、workflow 和设备管理 |
 
 Docker image 中的 CUTE FMHA、`sycl-tla`、Linux `.so`、`/dev/dri` 和
-`LD_LIBRARY_PATH` 不适用于 Windows。Windows attention 使用
-`omni_xpu_kernel` 中的 ESIMD SDP，并保留 PyTorch SDPA fallback。
+`LD_LIBRARY_PATH` 不适用于 Windows。Windows attention 默认保留 ComfyUI
+的 PyTorch SDPA，不安装 attention patch。`omni_xpu_kernel` 中的 ESIMD
+SDP 仍可通过 `OMNI_ATTN_BACKEND=esimd` 显式启用，但不会被自动选择。
 
 ## 2. 当前验证矩阵
 
-以下是 2026-07-24 已经用于 Windows 构建和基础运行测试的组合：
+以下是 2026-07-29 已经用于 Windows 构建和完整核心工作流测试的组合：
 
 | 组件 | 已验证版本/修订 |
 |---|---|
@@ -58,19 +59,24 @@ Docker image 中的 CUTE FMHA、`sycl-tla`、Linux `.so`、`/dev/dri` 和
 | torchaudio | 当前测试目录为 `2.11.0+xpu`；不是 Omni kernel 必需依赖 |
 | onednn Python runtime | `2025.3.0` |
 | omni-xpu-kernel | `0.1.0b9.dev0+torch212.bmg` |
-| comfy-kitchen XPU fork | `0.2.18`，[`fead43b4...`](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/fead43b4a48a5478e7518e10c0fb065cfb2ba8ac) |
+| comfy-kitchen XPU fork | `0.2.18`，[`c7ae07e5...`](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/c7ae07e5317d4a073562e278a41d98f05a4fe109) |
 | ComfyUI | `0.28.0`，测试 commit `700821e1...` |
-| llm-scaler | [`37237c69...`](https://github.com/xiangyuT/llm-scaler/commit/37237c69a451463f2b1b4e82f1d270b61e01731f)（`feature/omni-0.1.0b9-preview`） |
+| llm-scaler | [`0c6cd57c...`](https://github.com/xiangyuT/llm-scaler/commit/0c6cd57c6034929c3f7ee6efc48d7aa0b72b7bed)（`feature/omni-0.1.0b9-preview`） |
 
 `comfy-kitchen 0.2.18` 是 Dockerfile 当前固定的 XPU fork 版本。当前 ComfyUI
 调用的 Kitchen API 已经在该 fork 中完成导入检查，XPU backend 也能在
 Torch 2.12/B70 上注册。它应保留真实版本 `0.2.18`，不伪装为上游
 ComfyUI requirements 中的其他版本。
 
-`fead43b4...` 在 Windows 上默认不注册 Triton backend，因为当前 Portable
+`c7ae07e5...` 的祖先包含 Windows Triton 修复 `fead43b4...`。它在 Windows
+上默认不注册 Triton backend，因为当前 Portable
 路径没有验证 Triton JIT compiler/runtime。默认 dispatch 顺序因此是
 `xpu -> eager`。只有已自行验证 Windows Triton toolchain 的环境才应在导入
 Kitchen 前设置 `COMFY_KITCHEN_ENABLE_TRITON_WINDOWS=1`。
+
+本轮核心验收不安装 GGUF 或 Nunchaku custom node/model。Kitchen/kernel 中
+随 pin 提供的相关通用 capability 保留，第三方节点和端到端工作流放在下一
+阶段单独验证。
 
 ## 3. 外部依赖
 
@@ -90,7 +96,7 @@ Kitchen 前设置 `COMFY_KITCHEN_ENABLE_TRITON_WINDOWS=1`。
 - [PyTorch Intel GPU guide](https://docs.pytorch.org/docs/main/notes/get_start_xpu.html)
 - [PyTorch XPU wheel index](https://download.pytorch.org/whl/xpu)
 - [`comfy-kitchen-xpu`](https://github.com/xiangyuT/comfy-kitchen-xpu)
-- [`comfy-kitchen-xpu` pinned commit](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/fead43b4a48a5478e7518e10c0fb065cfb2ba8ac)
+- [`comfy-kitchen-xpu` pinned commit](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/c7ae07e5317d4a073562e278a41d98f05a4fe109)
 
 只运行已经构建好的 wheel 时不需要 Visual Studio 和 oneAPI compiler。
 它们仅用于构建 `omni_xpu_kernel`。
@@ -199,7 +205,8 @@ Architecture: intel_gpu_bmg_g31
 
 ```text
 omni_xpu_kernel-0.1.0b9.dev0+torch212.bmg-cp313-cp313-win_amd64.whl
-SHA256: 875407C932C1A4399F94E8A607C6154EE0BAB60BB7ACBB03798E1B53C2ED4A09
+size:   1,398,388 bytes
+SHA256: 1F52D6F2BE86C9592432B367569B7859003C8ECE9A052FB3019D7A234D8C41FB
 ```
 
 在 PowerShell 中取得实际 artifact，并检查 hash：
@@ -301,7 +308,7 @@ kernel wheel。
 & $embeddedPython -m pip install "onednn==2025.3.0"
 ```
 
-`omni_xpu_kernel` 本身不依赖 torchvision 或 torchaudio。2026-07-24
+`omni_xpu_kernel` 本身不依赖 torchvision 或 torchaudio。2026-07-29
 实际查询 XPU index 时，torchaudio 最新版仍是 `2.11.0+xpu`；当前 Portable
 在 Torch 2.12 下的导入和 `pip check` 已通过。如果需要音频节点，可以保留或
 单独安装该版本，同时禁止它解析和替换 Torch：
@@ -413,7 +420,7 @@ Kitchen XPU wheel 是 pure-Python wheel，但仍应在项目内构建环境生�
 不要把 Portable 当作源码构建目录。
 
 ```powershell
-$kitchenCommit = "fead43b4a48a5478e7518e10c0fb065cfb2ba8ac"
+$kitchenCommit = "c7ae07e5317d4a073562e278a41d98f05a4fe109"
 $sourceRoot = Join-Path $buildRoot "sources"
 $kitchenSource = Join-Path $sourceRoot "comfy-kitchen-xpu"
 $kitchenWheelhouse = Join-Path $buildRoot "wheelhouse\kitchen"
@@ -467,18 +474,17 @@ comfy_kitchen/backends/eager/
 
 不应包含 `comfy_kitchen/backends/cuda/`。安装到 Portable：
 
-旧 pin `acdf65de...` 的 Windows 构建曾得到：
+当前 pin `c7ae07e5...` 的本机 Windows 构建得到：
 
 ```text
 file:   comfy_kitchen-0.2.18-py3-none-any.whl
-size:   100,362 bytes
-SHA256: B1B995510A256EE1EBB3BB46781B254A494753A98A31BEC5F5CC6D6E72A37234
+size:   113,212 bytes
+SHA256: 5E6B5663C1757217D1D51FA098AAE10A119FEEF8513B83DABD0634A5BA1B0D64
 ```
 
-该 hash 只记录旧 pin 的 artifact，不能作为当前 `fead43b4...` wheel 的预期
-hash。更新后应重新记录本机生成的 artifact；fresh clone 的 ZIP timestamp
-也可能使 pure-Python wheel hash 不同。验收身份以 source commit、distribution
-version 和 wheel 内容为准。
+该 hash 记录本机 artifact；fresh clone 的 ZIP timestamp 可能使 pure-Python
+wheel hash 不同。跨机器验收身份仍应以 source commit、distribution version
+和 wheel 内容为准。
 
 ```powershell
 & $embeddedPython -m pip install `
@@ -534,6 +540,7 @@ revision：
 $customNodeSource = Join-Path $omniRoot "ComfyUI-OmniXPU"
 $customNodeRoot = Join-Path $comfyRoot "custom_nodes"
 $customNodeTarget = Join-Path $customNodeRoot "ComfyUI-OmniXPU"
+$backupRoot = Join-Path $portableRoot "backups"
 
 if (-not (Test-Path $customNodeSource)) {
     throw "ComfyUI-OmniXPU source not found: $customNodeSource"
@@ -541,19 +548,28 @@ if (-not (Test-Path $customNodeSource)) {
 
 if (Test-Path $customNodeTarget) {
     $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $backupTarget = "$customNodeTarget.backup-$timestamp"
+    New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
+    $backupTarget = Join-Path $backupRoot "ComfyUI-OmniXPU-$timestamp"
     Move-Item -LiteralPath $customNodeTarget -Destination $backupTarget
     Write-Host "Existing custom node moved to $backupTarget"
 }
 
-Copy-Item `
-    -LiteralPath $customNodeSource `
-    -Destination $customNodeTarget `
-    -Recurse
+robocopy.exe `
+    $customNodeSource `
+    $customNodeTarget `
+    /E `
+    /XD __pycache__ `
+    /XF *.pyc
+
+if ($LASTEXITCODE -ge 8) {
+    throw "Copying ComfyUI-OmniXPU failed: robocopy exit $LASTEXITCODE"
+}
 ```
 
 这里不创建目录 junction，也不做 editable install。Portable 应包含一份独立
-副本，移动整个目录后仍能工作。
+副本，移动整个目录后仍能工作。旧节点备份不能留在 `custom_nodes` 中：
+ComfyUI 会把任何子目录当作候选 custom node，再次导入旧 adapter。备份必须
+放到 Portable 根目录下的 `backups` 或另一个不会被节点扫描的位置。
 
 ## 12. Windows 启动脚本
 
@@ -572,7 +588,7 @@ set "PATH=%PYTHON_DIR%;%PYTHON_DIR%\Scripts;%PYTHON_DIR%\Library\bin;%PYTHON_DIR
 
 if not defined OMNIXPU_ENABLE set "OMNIXPU_ENABLE=1"
 if not defined OMNI_XPU_REQUIRE_CUTE set "OMNI_XPU_REQUIRE_CUTE=0"
-if not defined OMNI_ATTN_BACKEND set "OMNI_ATTN_BACKEND=esimd"
+if not defined OMNI_ATTN_BACKEND set "OMNI_ATTN_BACKEND=torch"
 if not defined OMNIXPU_INTERPOLATE_FIX set "OMNIXPU_INTERPOLATE_FIX=0"
 if not defined OMNI_COMFYUI_RESERVE_VRAM_GB set "OMNI_COMFYUI_RESERVE_VRAM_GB=4"
 
@@ -588,8 +604,12 @@ pause
 说明：
 
 - `Library\bin` 和 `torch\lib` 提供 Portable 内的 SYCL/oneDNN/Torch DLL；
-- Windows 不构建 CUTE，因此显式使用 `OMNI_ATTN_BACKEND=esimd`；
-- 不支持的 dtype/layout/shape 仍由 adapter 回退到原始 PyTorch route；
+- Windows 默认使用 `OMNI_ATTN_BACKEND=torch`，保留 ComfyUI 的 PyTorch
+  SDPA，不安装 attention patch；
+- ESIMD 保留为显式选项。需要单独诊断或对照时，在启动脚本之前设置
+  `OMNI_ATTN_BACKEND=esimd`；它不会被默认或自动启用；
+- 显式 ESIMD 不支持的 dtype/layout/shape 仍由 adapter 回退到原始
+  PyTorch route；
 - Docker 启动脚本默认保留 4 GiB VRAM，这里使用同一默认值；
 - `OMNIXPU_INTERPOLATE_FIX` 和其他 legacy global fix 默认保持关闭；
 - `%*` 允许在启动脚本后追加其他 ComfyUI 参数。
@@ -678,7 +698,7 @@ print("native kernel smoke: PASS")
 ```powershell
 $env:OMNIXPU_ENABLE = "1"
 $env:OMNI_XPU_REQUIRE_CUTE = "0"
-$env:OMNI_ATTN_BACKEND = "esimd"
+$env:OMNI_ATTN_BACKEND = "torch"
 $env:OMNIXPU_INTERPOLATE_FIX = "0"
 
 & $embeddedPython (Join-Path $comfyRoot "main.py") `
@@ -697,7 +717,11 @@ $env:OMNIXPU_INTERPOLATE_FIX = "0"
 - `comfy_kitchen` 的 `xpu` backend 为 available；
 - `ComfyUI-OmniXPU` 被加载；
 - kernel probe 报告预期模块；
-- attention policy/backend 为 Windows ESIMD；
+- 日志包含 `attention_adapter: skipped`，reason 为
+  `OMNI_ATTN_BACKEND=torch (using PyTorch SDPA, no patch)`；
+- `rotary_adapter`、`norm_adapter`、`fp8_model_adapter` 和
+  `int8_ffn_adapter` applied；
+- Custom Node 只被导入一次，备份目录不出现在 import times 中；
 - 不出现 custom node import failure 或 native DLL load failure。
 
 启动 UI 后可以添加 **OmniXPU Status** node，检查：
@@ -743,43 +767,48 @@ curl.exe --noproxy "*" `
 
 预期返回 `200`。验收后在第一个终端按 `Ctrl+C` 关闭测试服务。
 
-### 13.5 2026-07-24 实机部署记录
+### 13.5 2026-07-29 实机部署记录
 
 完成的变更：
 
-- 从 ComfyUI requirements 完全移除 `comfy-kitchen` 依赖行并加入 Intel XPU
-  管理说明；
-- 用 `comfy_kitchen-0.2.18-py3-none-any.whl` 替换上游
-  `comfy-kitchen 0.2.20`；
-- 保留已经安装的
-  `omni_xpu_kernel-0.1.0b9.dev0+torch212.bmg-cp313-cp313-win_amd64.whl`；
-- 将 `ComfyUI-OmniXPU` 的 17 个文件复制到 `custom_nodes`，逐文件 SHA256
-  与 source tree 一致；
-- 更新 `run_intel_gpu.bat`，补齐 Portable DLL path、ESIMD policy、4 GiB
-  reserve 和参数透传。
+- 从 `llm-scaler` `0c6cd57c...` 构建并安装 Torch 2.12/BMG Windows
+  kernel wheel；
+- 从 Kitchen `c7ae07e5...` 构建并安装 XPU fork wheel；
+- 保留 requirements 中“完全省略 `comfy-kitchen`、单独管理 XPU fork”的
+  说明；
+- 把旧 Custom Node 移到 Portable 的 `backups` 目录，再复制匹配 revision
+  的新节点；
+- 将 launcher 的默认 attention policy 从 ESIMD 改为 PyTorch SDPA；
+- GGUF/Nunchaku custom node 和模型不在本轮安装范围。
 
 实际验收结果：
 
 | 检查 | 结果 |
 |---|---|
 | `pip check` | `No broken requirements found.` |
-| Kitchen distribution | `0.2.18` |
+| Kernel wheel | 1,398,388 bytes；SHA256 `1F52D6F2...C41FB` |
+| Kitchen wheel | 113,212 bytes；SHA256 `5E6B5663...0D64` |
 | Kitchen XPU backend | available，未 disabled |
+| Kitchen Triton backend | Windows 默认 unavailable；保留显式环境变量 opt-in |
 | Native target | `bmg` |
-| Kitchen AdaLN | FP32/FP16/BF16 parity 通过 |
-| Kitchen FP8 QDQ | XPU/eager exact parity 通过 |
-| Kitchen INT8 | QDQ 和 INT8 linear parity bounds 通过 |
-| Native kernel | RMSNorm 和 ESIMD SDP `head_dim=128` correctness 通过 |
+| Kitchen source suite | 445 passed，412 skipped |
+| Kernel Windows 支持面 | 501 passed，36 skipped |
+| Kernel packaging | 25 passed，4 skipped |
+| Attention control flow | 53 passed |
+| 双 XPU | 两张 B70 tensor、RMSNorm、D128 ESIMD SDP correctness 通过 |
+| 新 capability | Q4_1、GroupNorm、LTX direct RoPE、INT8 shared/prequantized pair 可见 |
 | ComfyUI quick-test | 返回码 `0` |
 | Launcher quick-test | 从 Portable 外部调用，返回码 `0` |
-| HTTP service | `127.0.0.1:8199` 监听，HTTP `200` |
+| Custom Node | 只导入一次；旧节点备份不在扫描目录 |
 
 ComfyUI `0.28.0` 的实际 adapter 日志：
 
 ```text
 [OmniXPU] omni_xpu_kernel 0.1.0b9.dev0+torch212.bmg - available: sdp, norm, rotary, linear_fp8, int8
-[OmniXPU] attention[esimd]: rebound 46 by-value imports across sys.modules
-[OmniXPU] attention_adapter: applied
+[OmniXPU] attention_adapter: skipped (OMNI_ATTN_BACKEND=torch (using PyTorch SDPA, no patch))
+[OmniXPU] rotary_adapter: applied
+[OmniXPU] norm: H120 FP16 native route enabled (target=bmg)
+[OmniXPU] norm: BMG GroupNorm route enabled (target=bmg)
 [OmniXPU] norm_adapter: applied
 [OmniXPU] fp8_model_adapter: applied
 [OmniXPU] int8_ffn_adapter: applied
@@ -787,20 +816,32 @@ ComfyUI `0.28.0` 的实际 adapter 日志：
 [OmniXPU] legacy_median_fix: skipped (disabled by env)
 ```
 
-当前还会出现：
+相同 1024×1024、相同 workflow 和 seed 的更新前后端到端墙钟对照：
+
+| Workflow | 更新前冷态 | 更新后冷态 | 更新前热态 | 更新后热态 |
+|---|---:|---:|---:|---:|
+| Z-Image BF16 | 29.666 s | 18.648 s | 9.106 s | 6.039 s |
+| Z-Image INT8 ConvRot | 13.411 s | 8.732 s | 7.118 s | 5.042 s |
+| Krea2 FP8 | 47.871 s | 22.994 s | 16.236 s | 10.262 s |
+| Krea2 INT8 ConvRot | 21.920 s | 16.000 s | 13.379 s | 12.168 s |
+
+四个更新后工作流都完成并保存有效的 1024×1024 RGB 图。相同 seed 的图像
+允许因新融合路径产生数值差异；本次人工检查没有黑图、花图、NaN 或语义
+损坏。更新后 Z-Image INT8 热态仍比 BF16 快约 16.5%。
+
+当前还会出现以下非阻塞提示：
 
 ```text
 Could not autodetect AIMDO implementation, assuming Nvidia
+onednn_verbose,v1,primitive,error,gpu,jit::gemm,Insufficient registers in requested bundle
 ```
 
 这是 `comfy-aimdo 0.4.10` 只识别 CUDA/ROCm 导致的探测提示。ComfyUI 随后用
 `is_nvidia()` 守卫 DynamicVRAM 初始化，Intel XPU 路径不会启用 NVIDIA
 AIMDO。显式添加 `--disable-dynamic-vram` 会触发 ComfyUI 自己的弃用警告，
 因此当前 launcher 不添加该参数。`--reserve-vram 4` 仍由 ComfyUI 的常规
-XPU memory management 处理。
-
-以上证明包身份、直接算子、Custom Node 接入、launcher 和 HTTP 服务正常。
-尚未包含具体模型 workflow 的生成结果和性能验收。
+XPU memory management 处理。oneDNN JIT register 提示在更新前基线中同样
+出现；oneDNN 随后选择可用实现，四个工作流均成功，因此不属于本轮回归。
 
 ## 14. 更新与防覆盖
 
@@ -858,15 +899,19 @@ print(ck.list_backends().get("xpu"))
 官方 archive 或恢复完整目录快照。
 
 如果只回滚 custom node，使用第 11 节创建的
-`ComfyUI-OmniXPU.backup-<timestamp>`，不要删除模型、output 或其他
-custom node。
+`backups\ComfyUI-OmniXPU-<timestamp>`。先关闭 ComfyUI，把当前节点移出
+`custom_nodes`，再把备份复制回 `custom_nodes\ComfyUI-OmniXPU`。不要把
+备份本身留在 `custom_nodes`，也不要删除模型、output 或其他 custom node。
 
 如果只回滚 Python 包，必须成组恢复 Torch XPU、Kitchen 和 kernel；不要把
 旧 `omni_xpu_kernel` 留在不同 Torch minor 的环境中。
 
 ## 16. 已知限制
 
-- Windows wheel 当前没有 CUTE FMHA，只提供 ESIMD SDP/PyTorch fallback。
+- Windows wheel 当前没有 CUTE FMHA；默认使用 PyTorch SDPA，ESIMD SDP
+  只作为显式选项。
+- Windows BMG ESIMD sidecar 的实机 correctness 范围是 `head_dim=128`；
+  `head_dim=64` 返回 unsupported，并由默认 SDPA 策略规避。
 - 本文的 native artifact 只验证了 BMG；PTL-H 需要
   `OMNI_XPU_DEVICE=ptl-h` 独立构建和验收。
 - Torch 2.13 不在当前 Windows 验证范围内。
