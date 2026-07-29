@@ -1063,6 +1063,103 @@ void moe_up_routed_e5m2_kernel(
     submit_kernel(cgf, device, "moe up routed e5m2");
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// E5M2 up kernel for sglang FusedMoE w13 layout: [E, 2*intermediate, hidden]
+// (N-major). Mirror of moe_up_routed_e4m3_nmajor_kernel but for e5m2 weights.
+// Reads each 16×16 weight block as [N=16 rows × K=16 cols] via lsc_load_2d and
+// uses fp8e5m2_block_to_vnni_nk to permute into the VNNI b_tile DPAS expects.
+// This lets callers pass sglang's native w13 directly — NO transposed copy.
+// Numerically identical to moe_up_routed_e5m2_kernel fed w13.transpose(1,2).
+// ────────────────────────────────────────────────────────────────────────────
+void moe_up_routed_e5m2_nmajor_kernel(
+    const fp16* x,
+    const uint8_t* gate_up_weight, const float* gate_up_scale,
+    const int* selected_experts,
+    fp16* intermediates,
+    const int n_tokens, const int hidden_size, const int intermediate_size,
+    const int top_k, const int rows_per_token,
+    const torch::Device& device) {
+
+    constexpr int GS = 16;
+    const int two_inter = 2 * intermediate_size;
+    const int n_tiles = intermediate_size / 16;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeUpRoutedE5M2NMajor>(
+            sycl::nd_range<2>(
+                sycl::range<2>(n_tokens * top_k, n_tiles * GS),
+                sycl::range<2>(1, GS)),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                slm_init<GS * 32 * sizeof(float)>();
+
+                const int route_idx = (int)item.get_global_id(0);
+                const int token     = route_idx / top_k;
+                const int k_idx     = route_idx % top_k;
+                const int n_tile    = (int)item.get_group(1);
+                const int tid       = (int)item.get_local_id(1);
+
+                const fp16* x_row = x + (size_t)token * hidden_size;
+                const int eid = selected_experts[route_idx];
+                // weight layout: [E, 2*inter, hidden] → base + eid * two_inter * hidden
+                const uint8_t* base = gate_up_weight + (size_t)eid * two_inter * hidden_size;
+                const int ng = n_tile * 16;            // N row offset (gate half)
+                const int nu = intermediate_size + ng; // N row offset (up half)
+                simd<float, 16> g_acc(0.f), u_acc(0.f);
+
+                for (int k = 16 * tid; k < hidden_size; k += 16 * GS) {
+                    simd<fp16, 16> a_tile = block_load<fp16, 16>(x_row + k);
+
+                    // [N=16, K=16] block at row=ng, col=k
+                    // surface: width=hidden, height=two_inter, pitch=hidden
+                    xesimd::config_2d_mem_access<uint8_t, 16, 16, 1> pgW(
+                        base, (uint32_t)hidden_size - 1u, (uint32_t)two_inter - 1u,
+                        (uint32_t)hidden_size - 1u, (uint32_t)k, (uint32_t)ng);
+                    auto rg = xesimd::lsc_load_2d<uint8_t, 16, 16, 1, false, false,
+                        xesimd::cache_hint::cached, xesimd::cache_hint::cached>(pgW);
+                    simd<fp16, 256> bg = fp8e5m2_block_to_vnni_nk(rg);
+                    g_acc = dpas<8, 1, float, float, fp16, fp16>(g_acc, bg, a_tile);
+
+                    xesimd::config_2d_mem_access<uint8_t, 16, 16, 1> puW(
+                        base, (uint32_t)hidden_size - 1u, (uint32_t)two_inter - 1u,
+                        (uint32_t)hidden_size - 1u, (uint32_t)k, (uint32_t)nu);
+                    auto ru = xesimd::lsc_load_2d<uint8_t, 16, 16, 1, false, false,
+                        xesimd::cache_hint::cached, xesimd::cache_hint::cached>(puW);
+                    simd<fp16, 256> bu = fp8e5m2_block_to_vnni_nk(ru);
+                    u_acc = dpas<8, 1, float, float, fp16, fp16>(u_acc, bu, a_tile);
+                }
+
+                uint32_t slm_off = (uint32_t)(tid * 32) * 4u;
+                slm_block_store<float, 16>(slm_off, g_acc);
+                slm_block_store<float, 16>(slm_off + 64u, u_acc);
+
+                barrier();
+
+                if (tid == 0) {
+                    simd<float, 16> gs(0.f), us(0.f);
+                    #pragma unroll
+                    for (int i = 0; i < GS; i++) {
+                        gs += slm_block_load<float, 16>((uint32_t)(i * 128));
+                        us += slm_block_load<float, 16>((uint32_t)(i * 128 + 64));
+                    }
+
+                    float scale = gate_up_scale[eid];
+                    gs *= scale;
+                    us *= scale;
+
+                    simd<float, 16> silu = gs / (1.f + exp(-gs));
+                    simd<float, 16> result = silu * us;
+
+                    const int routed_row = token * rows_per_token + k_idx;
+                    block_store<fp16, 16>(
+                        intermediates + (size_t)routed_row * intermediate_size + ng,
+                        convert<fp16>(result));
+                }
+            });
+    };
+
+    submit_kernel(cgf, device, "moe up routed e5m2 nmajor (sglang layout)");
+}
+
 // -- Shared expert up kernels --
 void moe_up_shared_e4m3_kernel(
     const fp16* x,
@@ -1261,6 +1358,113 @@ void moe_up_merged_e5m2_kernel(
     };
 
     submit_kernel(cgf, device, "moe up merged e5m2");
+}
+
+// -- Merged up kernel, N-major variant (routed + shared in ONE dispatch) --
+// Both routed and shared gate_up weights are in sglang's native N-major layout
+// [E, 2*inter, hidden] / [NS, 2*inter, hidden]. Same fusion as
+// moe_up_merged_e5m2_kernel but reads weights via lsc_load_2d + nk permute so
+// callers pass w13 (and the shared N-major gate_up) directly — NO transposed
+// copy. Numerically identical to the K-major merged kernel fed transposed w13.
+void moe_up_merged_e5m2_nmajor_kernel(
+    const fp16* x,
+    const uint8_t* gate_up_weight, const float* gate_up_scale,
+    const uint8_t* shared_gate_up_weight, const float* shared_gate_up_scale,
+    const int* selected_experts,
+    fp16* intermediates,
+    const int n_tokens, const int hidden_size, const int intermediate_size,
+    const int top_k, const int num_shared_experts, const int rows_per_token,
+    const torch::Device& device) {
+
+    constexpr int GS = 16;
+    const int two_inter = 2 * intermediate_size;
+    const int n_tiles = intermediate_size / 16;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeUpMergedE5M2NMajor>(
+            sycl::nd_range<2>(
+                sycl::range<2>(n_tokens * rows_per_token, n_tiles * GS),
+                sycl::range<2>(1, GS)),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                slm_init<GS * 32 * sizeof(float)>();
+
+                const int route_idx = (int)item.get_global_id(0);
+                const int token     = route_idx / rows_per_token;
+                const int slot      = route_idx % rows_per_token;
+                const int n_tile    = (int)item.get_group(1);
+                const int tid       = (int)item.get_local_id(1);
+
+                const fp16* x_row = x + (size_t)token * hidden_size;
+
+                // Select routed vs shared weight base + scale. Both are N-major
+                // [*, 2*inter, hidden], so the per-expert stride is the same.
+                const uint8_t* base;
+                float scale;
+                if (slot < top_k) {
+                    const int eid = selected_experts[token * top_k + slot];
+                    base  = gate_up_weight + (size_t)eid * two_inter * hidden_size;
+                    scale = gate_up_scale[eid];
+                } else {
+                    const int sid = slot - top_k;
+                    base  = shared_gate_up_weight + (size_t)sid * two_inter * hidden_size;
+                    scale = shared_gate_up_scale[sid];
+                }
+
+                const int ng = n_tile * 16;
+                const int nu = intermediate_size + ng;
+                simd<float, 16> g_acc(0.f), u_acc(0.f);
+
+                for (int k = 16 * tid; k < hidden_size; k += 16 * GS) {
+                    simd<fp16, 16> a_tile = block_load<fp16, 16>(x_row + k);
+
+                    // [N=16, K=16] block at row=ng, col=k
+                    // surface: width=hidden, height=two_inter, pitch=hidden
+                    xesimd::config_2d_mem_access<uint8_t, 16, 16, 1> pgW(
+                        base, (uint32_t)hidden_size - 1u, (uint32_t)two_inter - 1u,
+                        (uint32_t)hidden_size - 1u, (uint32_t)k, (uint32_t)ng);
+                    auto rg = xesimd::lsc_load_2d<uint8_t, 16, 16, 1, false, false,
+                        xesimd::cache_hint::cached, xesimd::cache_hint::cached>(pgW);
+                    simd<fp16, 256> bg = fp8e5m2_block_to_vnni_nk(rg);
+                    g_acc = dpas<8, 1, float, float, fp16, fp16>(g_acc, bg, a_tile);
+
+                    xesimd::config_2d_mem_access<uint8_t, 16, 16, 1> puW(
+                        base, (uint32_t)hidden_size - 1u, (uint32_t)two_inter - 1u,
+                        (uint32_t)hidden_size - 1u, (uint32_t)k, (uint32_t)nu);
+                    auto ru = xesimd::lsc_load_2d<uint8_t, 16, 16, 1, false, false,
+                        xesimd::cache_hint::cached, xesimd::cache_hint::cached>(puW);
+                    simd<fp16, 256> bu = fp8e5m2_block_to_vnni_nk(ru);
+                    u_acc = dpas<8, 1, float, float, fp16, fp16>(u_acc, bu, a_tile);
+                }
+
+                uint32_t slm_off = (uint32_t)(tid * 32) * 4u;
+                slm_block_store<float, 16>(slm_off, g_acc);
+                slm_block_store<float, 16>(slm_off + 64u, u_acc);
+
+                barrier();
+
+                if (tid == 0) {
+                    simd<float, 16> gs(0.f), us(0.f);
+                    #pragma unroll
+                    for (int i = 0; i < GS; i++) {
+                        gs += slm_block_load<float, 16>((uint32_t)(i * 128));
+                        us += slm_block_load<float, 16>((uint32_t)(i * 128 + 64));
+                    }
+
+                    gs *= scale;
+                    us *= scale;
+
+                    simd<float, 16> silu = gs / (1.f + exp(-gs));
+                    simd<float, 16> result = silu * us;
+
+                    const int out_row = token * rows_per_token + slot;
+                    block_store<fp16, 16>(
+                        intermediates + (size_t)out_row * intermediate_size + ng,
+                        convert<fp16>(result));
+                }
+            });
+    };
+
+    submit_kernel(cgf, device, "moe up merged e5m2 nmajor");
 }
 
 torch::Tensor moe_up_forward(
@@ -2100,7 +2304,7 @@ torch::Tensor moe_forward_full(
     int64_t top_k, int64_t num_shared_experts, int64_t n_routed_experts) {
     TORCH_CHECK(x.scalar_type() == torch::kHalf);
     int n_tokens = x.size(0), hidden_size = x.size(1);
-    int intermediate_size = gate_up_weight.size(2) / 2;
+    int intermediate_size = gate_up_weight.size(1) / 2;
     int rows_per_token = top_k + num_shared_experts;
 
     // Ensure pre-allocated buffers exist
@@ -2119,7 +2323,7 @@ torch::Tensor moe_forward_full(
     // Up forward (inlined, using pre-allocated s_intermediates)
     const fp16* x_ptr = (const fp16*)x.data_ptr();
     fp16* inter_ptr = (fp16*)s_intermediates.data_ptr();
-    moe_up_routed_e5m2_kernel(
+    moe_up_routed_e5m2_nmajor_kernel(
         x_ptr,
         (const uint8_t*)gate_up_weight.data_ptr(), gate_up_scale.data_ptr<float>(),
         s_topk_idx.data_ptr<int>(),
@@ -2172,7 +2376,7 @@ torch::Tensor moe_forward_full_rtfused(
     int64_t top_k, int64_t num_shared_experts, int64_t n_routed_experts) {
     TORCH_CHECK(x.scalar_type() == torch::kHalf);
     int n_tokens = x.size(0), hidden_size = x.size(1);
-    int intermediate_size = gate_up_weight.size(2) / 2;
+    int intermediate_size = gate_up_weight.size(1) / 2;
     int rows_per_token = top_k + num_shared_experts;
 
     ensure_moe_buffers(n_tokens, top_k, num_shared_experts, hidden_size,
@@ -2203,7 +2407,7 @@ torch::Tensor moe_forward_full_rtfused(
 
     const fp16* x_ptr = (const fp16*)x.data_ptr();
     fp16* inter_ptr = (fp16*)s_intermediates.data_ptr();
-    moe_up_routed_e5m2_kernel(
+    moe_up_routed_e5m2_nmajor_kernel(
         x_ptr,
         (const uint8_t*)gate_up_weight.data_ptr(), gate_up_scale.data_ptr<float>(),
         s_topk_idx.data_ptr<int>(),
@@ -2252,7 +2456,7 @@ std::vector<torch::Tensor> moe_forward_full_rtfused_norm(
     TORCH_CHECK(hidden.scalar_type() == torch::kHalf);
     TORCH_CHECK(residual.scalar_type() == torch::kHalf);
     int n_tokens = hidden.size(0), hidden_size = hidden.size(1);
-    int intermediate_size = gate_up_weight.size(2) / 2;
+    int intermediate_size = gate_up_weight.size(1) / 2;
     int rows_per_token = top_k + num_shared_experts;
 
     ensure_moe_buffers(n_tokens, top_k, num_shared_experts, hidden_size,
@@ -2273,9 +2477,9 @@ std::vector<torch::Tensor> moe_forward_full_rtfused_norm(
 
     const fp16* x_ptr = (const fp16*)s_normed_x.data_ptr();
     fp16* inter_ptr = (fp16*)s_intermediates.data_ptr();
-    // Merged up: routed + shared experts in ONE dispatch (4b). shared_gate_up_weight
-    // is passed in DPAS/transposed layout [NS, hidden, 2*inter] (same as routed).
-    moe_up_merged_e5m2_kernel(
+    // Merged up: routed + shared experts in ONE dispatch (4b). Both routed and
+    // shared gate_up are in sglang N-major layout [*, 2*inter, hidden].
+    moe_up_merged_e5m2_nmajor_kernel(
         x_ptr,
         (const uint8_t*)gate_up_weight.data_ptr(), gate_up_scale.data_ptr<float>(),
         (const uint8_t*)shared_gate_up_weight.data_ptr(), shared_gate_up_scale.data_ptr<float>(),
@@ -2565,9 +2769,9 @@ torch::Tensor moe_forward_full_silu_routed_e5m2(
     TORCH_CHECK(down_weight.scalar_type() == at::kFloat8_e5m2,
                 "down_weight must be fp8_e5m2");
     int n_tokens = x.size(0), hidden_size = x.size(1);
-    TORCH_CHECK(gate_up_weight.size(1) == hidden_size,
-                "gate_up_weight must be [E, hidden, 2*intermediate]");
-    int intermediate_size = gate_up_weight.size(2) / 2;
+    TORCH_CHECK(gate_up_weight.size(2) == hidden_size,
+                "gate_up_weight must be [E, 2*intermediate, hidden]");
+    int intermediate_size = gate_up_weight.size(1) / 2;
     int rows_per_token = top_k;
 
     ensure_gemma4_moe_buffers(n_tokens, top_k, hidden_size, intermediate_size, x.device());
@@ -2576,7 +2780,7 @@ torch::Tensor moe_forward_full_silu_routed_e5m2(
     const fp16* w_ptr  = (const fp16*)topk_weights.data_ptr();
 
     // Up + silu_mul (e5m2 silu kernel — built-in silu, not gelu_tanh)
-    moe_up_routed_e5m2_kernel(
+    moe_up_routed_e5m2_nmajor_kernel(
         (const fp16*)x.data_ptr(),
         (const uint8_t*)gate_up_weight.data_ptr(), gate_up_scale.data_ptr<float>(),
         idx_ptr,
@@ -2745,7 +2949,7 @@ torch::Tensor moe_forward_full_v2(
     int64_t top_k, int64_t num_shared_experts, int64_t n_routed_experts) {
     TORCH_CHECK(x.scalar_type() == torch::kHalf);
     int n_tokens = x.size(0), hidden_size = x.size(1);
-    int intermediate_size = gate_up_weight.size(2) / 2;
+    int intermediate_size = gate_up_weight.size(1) / 2;
     int rows_per_token = top_k + num_shared_experts;
 
     ensure_moe_buffers_v2(n_tokens, top_k, num_shared_experts, hidden_size,
@@ -2763,7 +2967,7 @@ torch::Tensor moe_forward_full_v2(
     // Up: routed + shared
     const fp16* x_ptr = (const fp16*)x.data_ptr();
     fp16* inter_ptr = (fp16*)s2_intermediates.data_ptr();
-    moe_up_routed_e5m2_kernel(
+    moe_up_routed_e5m2_nmajor_kernel(
         x_ptr,
         (const uint8_t*)gate_up_weight.data_ptr(), gate_up_scale.data_ptr<float>(),
         s2_topk_idx.data_ptr<int>(),
