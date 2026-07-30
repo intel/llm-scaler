@@ -22,6 +22,7 @@ from custom_esimd_kernels_vllm.ops import (
     esimd_gemv_fp8_pern_fused3,
     esimd_gemv_fp8_pert,
     esimd_gemv_fp16,
+    esimd_gemv_fp16_gelu_mul,
     esimd_gemv_fp8_pert_fused2,
     esimd_gemv_fp8_blockscale_fused2,
     esimd_gemv_fp8_blockscale_fp16_fused2,
@@ -73,6 +74,7 @@ from custom_esimd_kernels_vllm.ops import (
     moe_accumulate,
     moe_forward_fused,
     moe_forward_full,
+    moe_forward_full_fp8_grouped,
     moe_forward_full_fp8_block,
     # MoE INT4 Batch ops
     moe_router_forward_int4,

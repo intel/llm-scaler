@@ -111,6 +111,29 @@ at::Tensor esimd_gemv_fp16(
     return output;
 }
 
+at::Tensor esimd_gemv_fp16_gelu_mul(
+    at::Tensor input,
+    at::Tensor weight,
+    at::Tensor output) {
+    TORCH_CHECK(input.scalar_type() == at::ScalarType::Half);
+    TORCH_CHECK(weight.scalar_type() == at::ScalarType::Half);
+    TORCH_CHECK(output.scalar_type() == at::ScalarType::Half);
+    TORCH_CHECK(input.dim() == 2 && input.size(0) == 1);
+    TORCH_CHECK(weight.dim() == 2 && weight.size(0) % 2 == 0);
+    TORCH_CHECK(output.dim() == 2 && output.size(0) == 1);
+    int64_t N = weight.size(0) / 2;
+    int64_t K = weight.size(1);
+    TORCH_CHECK(input.size(1) == K);
+    TORCH_CHECK(output.size(1) == N);
+    auto& dpcpp_queue = get_device_queue(input);
+    GEMV_fp16_gelu_mul_host(
+        reinterpret_cast<const fp16*>(input.data_ptr()),
+        reinterpret_cast<const fp16*>(weight.data_ptr()),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        (uint32_t)N, (uint32_t)K, dpcpp_queue);
+    return output;
+}
+
 at::Tensor esimd_gemv_fp8_pert_fused2(
     at::Tensor input,
     at::Tensor w0, at::Tensor s0, at::Tensor o0,

@@ -36,6 +36,11 @@ at::Tensor esimd_gemv_fp8_pert(
 at::Tensor esimd_gemv_fp16(
     at::Tensor input, at::Tensor weight, at::Tensor output);
 
+// Fused FP16 gate-up GEMV plus GELU-tanh and multiply for Gemma MTP.
+// weight is [2*N, K] with gate rows followed by up rows; output is [1, N].
+at::Tensor esimd_gemv_fp16_gelu_mul(
+    at::Tensor input, at::Tensor weight, at::Tensor output);
+
 at::Tensor esimd_gemv_fp8_pert_fused2(
     at::Tensor input,
     at::Tensor w0, at::Tensor s0, at::Tensor o0,
