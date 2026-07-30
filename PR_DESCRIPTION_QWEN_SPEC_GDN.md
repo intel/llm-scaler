@@ -191,4 +191,4 @@ kernel 假设 vLLM 已保证以下 metadata 有效：
 
 - `1c2920c` — `[XPU] Add Qwen speculative GDN ESIMD kernel`
 - `65b460e` — `[XPU] Support Qwen35 speculative GDN HV16`
-- 后续 cleanup commit — 删除 `VLLM_MOE_STAGE_PROFILE` 诊断代码，并将 Conv checkpoint 写回主 kernel
+- `bb315f2` — 删除 `VLLM_MOE_STAGE_PROFILE` 诊断代码，并将 Conv checkpoint 写回主 kernel
