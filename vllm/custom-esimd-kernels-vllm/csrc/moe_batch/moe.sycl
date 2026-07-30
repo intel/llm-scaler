@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <utility>
+#include <chrono>
 #include <c10/xpu/XPUStream.h>
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
@@ -2302,6 +2303,40 @@ torch::Tensor moe_forward_full_v2(
     ensure_moe_buffers_v2(n_tokens, top_k, num_shared_experts, hidden_size,
                           intermediate_size, x.device());
 
+    static thread_local int stage_profile_calls = 0;
+    const char* stage_profile_env = std::getenv("VLLM_MOE_STAGE_PROFILE");
+    const bool stage_profile =
+        n_tokens == 3
+        && stage_profile_env != nullptr
+        && stage_profile_env[0] == '1'
+        && stage_profile_calls < 4;
+    const int stage_profile_call = stage_profile
+        ? stage_profile_calls++
+        : -1;
+    sycl::queue* stage_profile_queue = nullptr;
+    std::chrono::steady_clock::time_point stage_profile_t0;
+    auto stage_profile_begin = [&]() {
+        if (!stage_profile) return;
+        stage_profile_queue =
+            &c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+        stage_profile_queue->wait_and_throw();
+        stage_profile_t0 = std::chrono::steady_clock::now();
+    };
+    auto stage_profile_end = [&](const char* stage) {
+        if (!stage_profile) return;
+        stage_profile_queue->wait_and_throw();
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(
+            now - stage_profile_t0).count();
+        std::fprintf(
+            stderr,
+            "[MOE_STAGE_PROFILE] call=%d tokens=%d stage=%s ms=%.3f\n",
+            stage_profile_call, n_tokens, stage, ms);
+        std::fflush(stderr);
+        stage_profile_t0 = now;
+    };
+    stage_profile_begin();
+
     // TopK — dispatch by (n_experts, top_k) to pick correct V2 template,
     // fallback to generic heap-based impl for unsupported shapes.
     dispatch_moe_topk_forward<class MoeTopKFP8V2>(
@@ -2310,6 +2345,7 @@ torch::Tensor moe_forward_full_v2(
         (fp16*)s2_topk_weight.data_ptr(),
         n_tokens, (int)n_routed_experts, (int)top_k, /*norm=*/true,
         logits.device());
+    stage_profile_end("topk");
 
     const bool is_e4m3 = (gate_up_weight.scalar_type() == at::kFloat8_e4m3fn);
 
@@ -2325,23 +2361,27 @@ torch::Tensor moe_forward_full_v2(
             inter_ptr,
             n_tokens, hidden_size, intermediate_size,
             top_k, rows_per_token, x.device());
+        stage_profile_end("routed_up");
         moe_up_shared_e4m3_kernel(
             x_ptr,
             (const uint8_t*)shared_gate_up_weight.data_ptr(), shared_gate_up_scale.data_ptr<float>(),
             inter_ptr,
             n_tokens, hidden_size, intermediate_size,
             top_k, num_shared_experts, rows_per_token, x.device());
+        stage_profile_end("shared_up");
         moe_down_gate_precompute_kernel(
             x_ptr,
             (const fp16*)shared_expert_gate_weight.data_ptr(),
             s2_gate_values.data_ptr<float>(),
             n_tokens, hidden_size, num_shared_experts, x.device());
+        stage_profile_end("shared_gate");
         moe_down_routed_e4m3_kernel(
             (const fp16*)s2_intermediates.data_ptr(),
             (const uint8_t*)down_weight.data_ptr(), down_scale.data_ptr<float>(),
             (const fp16*)s2_topk_weight.data_ptr(), s2_topk_idx.data_ptr<int>(),
             rout_ptr,
             n_tokens, hidden_size, intermediate_size, top_k, rows_per_token, x.device());
+        stage_profile_end("routed_down");
         moe_down_shared_e4m3_kernel(
             (const fp16*)s2_intermediates.data_ptr(),
             (const uint8_t*)shared_down_weight.data_ptr(), shared_down_scale.data_ptr<float>(),
@@ -2349,6 +2389,7 @@ torch::Tensor moe_forward_full_v2(
             rout_ptr,
             n_tokens, hidden_size, intermediate_size,
             top_k, num_shared_experts, rows_per_token, x.device());
+        stage_profile_end("shared_down");
     } else {
         moe_up_routed_e5m2_kernel(
             x_ptr,
@@ -2357,23 +2398,27 @@ torch::Tensor moe_forward_full_v2(
             inter_ptr,
             n_tokens, hidden_size, intermediate_size,
             top_k, rows_per_token, x.device());
+        stage_profile_end("routed_up");
         moe_up_shared_e5m2_kernel(
             x_ptr,
             (const uint8_t*)shared_gate_up_weight.data_ptr(), shared_gate_up_scale.data_ptr<float>(),
             inter_ptr,
             n_tokens, hidden_size, intermediate_size,
             top_k, num_shared_experts, rows_per_token, x.device());
+        stage_profile_end("shared_up");
         moe_down_gate_precompute_kernel(
             x_ptr,
             (const fp16*)shared_expert_gate_weight.data_ptr(),
             s2_gate_values.data_ptr<float>(),
             n_tokens, hidden_size, num_shared_experts, x.device());
+        stage_profile_end("shared_gate");
         moe_down_routed_e5m2_kernel(
             (const fp16*)s2_intermediates.data_ptr(),
             (const uint8_t*)down_weight.data_ptr(), down_scale.data_ptr<float>(),
             (const fp16*)s2_topk_weight.data_ptr(), s2_topk_idx.data_ptr<int>(),
             rout_ptr,
             n_tokens, hidden_size, intermediate_size, top_k, rows_per_token, x.device());
+        stage_profile_end("routed_down");
         moe_down_shared_e5m2_kernel(
             (const fp16*)s2_intermediates.data_ptr(),
             (const uint8_t*)shared_down_weight.data_ptr(), shared_down_scale.data_ptr<float>(),
@@ -2381,12 +2426,14 @@ torch::Tensor moe_forward_full_v2(
             rout_ptr,
             n_tokens, hidden_size, intermediate_size,
             top_k, num_shared_experts, rows_per_token, x.device());
+        stage_profile_end("shared_down");
     }
 
     moe_accumulate_kernel(
         (const fp16*)s2_routed_output.data_ptr(),
         (fp16*)s2_final_output.data_ptr(),
         n_tokens, hidden_size, rows_per_token, x.device());
+    stage_profile_end("accumulate");
 
     return !moe_sticky_disabled() ? s2_final_output.narrow(0, 0, n_tokens) : s2_final_output;
 }
