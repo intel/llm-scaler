@@ -11,8 +11,9 @@ ComfyUI Intel XPU Portable。流程覆盖：
    依赖，由部署流程单独管理 XPU fork；
 6. 构建并安装 XPU-enabled `comfy-kitchen`；
 7. 安装 `omni_xpu_kernel` 和 `ComfyUI-OmniXPU` custom node；
-8. 修改 Windows 启动脚本并完成分层验收；
-9. 在更新 ComfyUI/Portable 后重放 Intel XPU 补丁。
+8. 安装固定 revision 的 GGUF 与 combined Nunchaku XPU 节点；
+9. 修改 Windows 启动脚本并完成分层验收；
+10. 在更新 ComfyUI/Portable 后重放 Intel XPU 补丁。
 
 这里的 Portable 只是最终运行环境，不参与原生扩展编译。所有源码、Python
 工具链和构建缓存都留在 `llm-scaler` 项目目录中，不修改其他项目环境。
@@ -33,6 +34,7 @@ Windows 部署保留 Dockerfile 中的核心分层，但不复制 Linux-only 部
 | Native kernel | `omni_xpu_kernel` wheel | norm、FP8、INT8、SVDQ、rotary、ESIMD SDP 等 |
 | Generic dispatch | `comfy-kitchen` XPU fork | 通用算子 API、capability、dispatch 和 eager fallback |
 | ComfyUI adapter | `ComfyUI-OmniXPU` custom node | attention、norm、FP8 model bridge 和 fused INT8 FFN 接入 |
+| Quantized adapters | `ComfyUI-GGUF-XPU`、`ComfyUI-nunchaku-XPU` | GGUF tensor/loader 与 bundled Nunchaku runtime；经 Kitchen/Omni 调用 XPU kernel |
 | Application | 官方 ComfyUI Intel Portable | UI、模型加载、workflow 和设备管理 |
 
 Docker image 中的 CUTE FMHA、`sycl-tla`、Linux `.so`、`/dev/dri` 和
@@ -60,8 +62,10 @@ SDP 仍可通过 `OMNI_ATTN_BACKEND=esimd` 显式启用，但不会被自动选�
 | onednn Python runtime | `2025.3.0` |
 | omni-xpu-kernel | `0.1.0b9.dev0+torch212.bmg` |
 | comfy-kitchen XPU fork | `0.2.18`，[`c7ae07e5...`](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/c7ae07e5317d4a073562e278a41d98f05a4fe109) |
+| ComfyUI-GGUF-XPU | [`39671fe7...`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d)；`gguf 0.19.0` |
+| ComfyUI-nunchaku-XPU | `1.2.1+xpu.3`，[`5cf4fa98...`](https://github.com/xiangyuT/ComfyUI-nunchaku-XPU/commit/5cf4fa9886f45abff102d1dd91af5247b4950148) |
 | ComfyUI | `0.28.0`，测试 commit `700821e1...` |
-| llm-scaler | [`0c6cd57c...`](https://github.com/xiangyuT/llm-scaler/commit/0c6cd57c6034929c3f7ee6efc48d7aa0b72b7bed)（`feature/omni-0.1.0b9-preview`） |
+| llm-scaler | [`3f554f97...`](https://github.com/xiangyuT/llm-scaler/commit/3f554f97bd97e0e8be7d49396fe3722b33954677)（`feature/omni-0.1.0b9-preview`） |
 
 `comfy-kitchen 0.2.18` 是 Dockerfile 当前固定的 XPU fork 版本。当前 ComfyUI
 调用的 Kitchen API 已经在该 fork 中完成导入检查，XPU backend 也能在
@@ -74,9 +78,11 @@ ComfyUI requirements 中的其他版本。
 `xpu -> eager`。只有已自行验证 Windows Triton toolchain 的环境才应在导入
 Kitchen 前设置 `COMFY_KITCHEN_ENABLE_TRITON_WINDOWS=1`。
 
-本轮核心验收不安装 GGUF 或 Nunchaku custom node/model。Kitchen/kernel 中
-随 pin 提供的相关通用 capability 保留，第三方节点和端到端工作流放在下一
-阶段单独验证。
+GGUF 与 combined Nunchaku 节点已经在同一 Portable 中完成依赖安装、节点
+导入、双 B70 native route 和数值正确性验收。固定 revision 的两份目标权重
+也已完成 1024×1024、9-step Z-Image real-model E2E：GGUF 与 Nunchaku
+各通过 cached/forced-text 10 次正式样本，所有 route 均命中 XPU 且
+fallback 为零。
 
 ## 3. 外部依赖
 
@@ -97,6 +103,10 @@ Kitchen 前设置 `COMFY_KITCHEN_ENABLE_TRITON_WINDOWS=1`。
 - [PyTorch XPU wheel index](https://download.pytorch.org/whl/xpu)
 - [`comfy-kitchen-xpu`](https://github.com/xiangyuT/comfy-kitchen-xpu)
 - [`comfy-kitchen-xpu` pinned commit](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/c7ae07e5317d4a073562e278a41d98f05a4fe109)
+- [`ComfyUI-GGUF-XPU` pinned commit](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d)
+- [`ComfyUI-nunchaku-XPU` pinned commit](https://github.com/xiangyuT/ComfyUI-nunchaku-XPU/commit/5cf4fa9886f45abff102d1dd91af5247b4950148)
+- [Z-Image Turbo GGUF weights](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF)
+- [Nunchaku Z-Image Turbo weights](https://huggingface.co/nunchaku-ai/nunchaku-z-image-turbo)
 
 只运行已经构建好的 wheel 时不需要 Visual Studio 和 oneAPI compiler。
 它们仅用于构建 `omni_xpu_kernel`。
@@ -571,7 +581,320 @@ if ($LASTEXITCODE -ge 8) {
 ComfyUI 会把任何子目录当作候选 custom node，再次导入旧 adapter。备份必须
 放到 Portable 根目录下的 `backups` 或另一个不会被节点扫描的位置。
 
-## 12. Windows 启动脚本
+## 12. 安装 GGUF 与 Nunchaku XPU
+
+这一层使用 Dockerfile 当前固定的两个 source revision：
+
+| 组件 | Revision/version | 运行路径 |
+|---|---|---|
+| `ComfyUI-GGUF-XPU` | [`39671fe73117ba97de7011e7e06e32599dcda06d`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d) | `GGMLTensor -> comfy_kitchen.dequantize_gguf -> omni_xpu_kernel.gguf` |
+| `ComfyUI-nunchaku-XPU` | [`5cf4fa9886f45abff102d1dd91af5247b4950148`](https://github.com/xiangyuT/ComfyUI-nunchaku-XPU/commit/5cf4fa9886f45abff102d1dd91af5247b4950148) / `1.2.1+xpu.3` | bundled `nunchaku_torch -> Kitchen W4A16 -> omni_xpu_kernel.svdq` |
+
+Nunchaku 是 combined custom-node/runtime distribution。不要再安装独立的
+`nunchaku-torch` distribution 或保留单独 runtime checkout，否则导入来源
+会变得不确定。
+
+### 12.1 依赖解析边界
+
+不能直接对 Portable 执行无约束的：
+
+```text
+pip install -r ComfyUI-nunchaku-XPU/requirements.txt
+```
+
+在本次实测中，通用 PyPI resolver 曾通过
+`facexlib -> torchvision 0.28.0 -> torch 2.13.0` 把 Torch 2.12 XPU 替换成
+Torch 2.13 CPU。Portable 没有参与该次失败实验；实际安装使用
+[`constraints-windows-portable-quantized-torch212.txt`](../constraints-windows-portable-quantized-torch212.txt)
+锁住基础 XPU stack 和已验证的 add-on 解析结果。
+
+主要直接依赖如下；完整 transitive 版本见 constraints 文件：
+
+| 范围 | 已验证版本 | 获取位置 |
+|---|---|---|
+| XPU stack guard | `torch 2.12.0+xpu`、`torchvision 0.27.0+xpu`、`numpy 2.4.4` | [PyTorch XPU index](https://download.pytorch.org/whl/xpu) / [NumPy](https://pypi.org/project/numpy/) |
+| GGUF | `gguf 0.19.0`、`protobuf 7.35.1`、`sentencepiece 0.2.2` | [gguf](https://pypi.org/project/gguf/) / [protobuf](https://pypi.org/project/protobuf/) / [sentencepiece](https://pypi.org/project/sentencepiece/) |
+| Diffusers/Hub | `diffusers 0.39.0`、`transformers 5.13.1`、`huggingface-hub 1.23.0` | [diffusers](https://pypi.org/project/diffusers/) / [transformers](https://pypi.org/project/transformers/) / [huggingface-hub](https://pypi.org/project/huggingface-hub/) |
+| Nunchaku loading | `peft 0.20.0`、`accelerate 1.14.0`、`safetensors 0.8.0`、`tomli 2.4.1` | [peft](https://pypi.org/project/peft/) / [accelerate](https://pypi.org/project/accelerate/) / [safetensors](https://pypi.org/project/safetensors/) / [tomli](https://pypi.org/project/tomli/) |
+| Vision/ONNX | `insightface 1.0.1`、`opencv-python 5.0.0.93`、`facexlib 0.3.0`、`onnxruntime 1.28.0`、`timm 1.0.28` | [insightface](https://pypi.org/project/insightface/) / [opencv-python](https://pypi.org/project/opencv-python/) / [facexlib](https://pypi.org/project/facexlib/) / [onnxruntime](https://pypi.org/project/onnxruntime/) / [timm](https://pypi.org/project/timm/) |
+| Existing Portable utilities | `einops 0.8.2`、`packaging 26.2`、`pillow 12.2.0` | [einops](https://pypi.org/project/einops/) / [packaging](https://pypi.org/project/packaging/) / [Pillow](https://pypi.org/project/pillow/) |
+
+该 constraints 文件只代表 Python 3.13/Torch 2.12 的已验证 milestone，不是
+对未来 Portable 的永久覆盖。更新 Python、Torch、torchvision 或 Portable
+版本后必须重新解析和验收，不能机械沿用。
+
+### 12.2 固定源码、安装依赖和 wheel
+
+所有 checkout、wheel 和构建缓存仍放在项目目录内：
+
+```powershell
+$quantizedRoot = Join-Path $kernelRoot "build\windows-quantized-support"
+$quantizedSourceRoot = Join-Path $quantizedRoot "sources"
+$quantizedWheelRoot = Join-Path $quantizedRoot "wheelhouse"
+$quantizedConstraints = Join-Path $omniRoot `
+    "constraints-windows-portable-quantized-torch212.txt"
+
+$ggufRepository = "https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git"
+$ggufRevision = "39671fe73117ba97de7011e7e06e32599dcda06d"
+$ggufSource = Join-Path $quantizedSourceRoot "ComfyUI-GGUF-XPU"
+
+$nunchakuRepository = "https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git"
+$nunchakuRevision = "5cf4fa9886f45abff102d1dd91af5247b4950148"
+$nunchakuSource = Join-Path $quantizedSourceRoot "ComfyUI-nunchaku-XPU"
+
+New-Item -ItemType Directory -Force `
+    -Path $quantizedSourceRoot, $quantizedWheelRoot | Out-Null
+
+foreach ($checkout in @(
+    @($ggufRepository, $ggufRevision, $ggufSource),
+    @($nunchakuRepository, $nunchakuRevision, $nunchakuSource)
+)) {
+    if (Test-Path -LiteralPath $checkout[2]) {
+        throw "Refusing to replace existing checkout: $($checkout[2])"
+    }
+    git clone --filter=blob:none --no-checkout $checkout[0] $checkout[2]
+    git -C $checkout[2] fetch --depth 1 origin $checkout[1]
+    git -C $checkout[2] checkout --detach FETCH_HEAD
+    if ((git -C $checkout[2] rev-parse HEAD) -ne $checkout[1]) {
+        throw "Pinned checkout verification failed: $($checkout[2])"
+    }
+}
+```
+
+先用 constraints 安装两个节点的 requirements，再立即检查 Torch：
+
+```powershell
+& $embeddedPython -m pip install `
+    --requirement (Join-Path $ggufSource "requirements.txt") `
+    --requirement (Join-Path $nunchakuSource "requirements.txt") `
+    --constraint $quantizedConstraints `
+    --extra-index-url "https://download.pytorch.org/whl/xpu"
+
+& $embeddedPython -c @"
+import torch
+assert torch.__version__ == "2.12.0+xpu", torch.__version__
+assert torch.xpu.is_available()
+assert torch.xpu.device_count() >= 1
+print(torch.__version__, torch.xpu.device_count())
+"@
+& $embeddedPython -m pip check
+```
+
+在项目内的独立 Python 环境构建 combined Nunchaku wheel，再以
+`--no-deps` 安装到 Portable：
+
+```powershell
+& $buildPython -m pip wheel `
+    --no-deps `
+    --no-build-isolation `
+    --wheel-dir $quantizedWheelRoot `
+    $nunchakuSource
+
+$nunchakuWheel = Get-ChildItem $quantizedWheelRoot `
+    -Filter "comfyui_nunchaku_xpu-1.2.1+xpu.3-*.whl" |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+
+if (-not $nunchakuWheel) {
+    throw "Pinned Nunchaku wheel was not produced"
+}
+
+& $embeddedPython -m pip install `
+    --force-reinstall `
+    --no-deps `
+    $nunchakuWheel.FullName
+```
+
+本机验证 artifact 为
+`comfyui_nunchaku_xpu-1.2.1+xpu.3-py3-none-any.whl`，SHA256
+`30147A2893485E6A831CE78C00AE23EF06BD83AE8B277670E23E6C6C05BAC057`。
+pure-Python wheel 的 ZIP timestamp 可能导致 fresh build hash 不同，验收身份
+以 source revision、distribution version 和 wheel 内容为主。
+
+最后把两份固定源码复制到 `custom_nodes`。已有同名节点必须先移到
+`$backupRoot`，不能直接覆盖，也不能把备份留在节点扫描目录：
+
+```powershell
+foreach ($node in @(
+    @($ggufSource, "ComfyUI-GGUF-XPU"),
+    @($nunchakuSource, "ComfyUI-nunchaku-XPU")
+)) {
+    $target = Join-Path $customNodeRoot $node[1]
+    if (Test-Path -LiteralPath $target) {
+        $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+        New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
+        Move-Item -LiteralPath $target -Destination (
+            Join-Path $backupRoot "$($node[1])-$timestamp"
+        )
+    }
+
+    robocopy.exe $node[0] $target /E `
+        /XD __pycache__ build dist .pytest_cache `
+        /XF *.pyc
+    if ($LASTEXITCODE -ge 8) {
+        throw "Copying $($node[1]) failed: robocopy exit $LASTEXITCODE"
+    }
+}
+```
+
+### 12.3 安装态检查
+
+```powershell
+Set-Location $portableRoot
+
+& $embeddedPython -c @"
+from importlib import metadata
+import nunchaku_torch
+
+distribution = metadata.distribution("ComfyUI-nunchaku-XPU")
+assert metadata.version("ComfyUI-nunchaku-XPU") == "1.2.1+xpu.3"
+assert any(
+    str(path).replace("\\", "/").startswith("nunchaku_torch/")
+    for path in distribution.files or ()
+)
+try:
+    metadata.version("nunchaku-torch")
+except metadata.PackageNotFoundError:
+    pass
+else:
+    raise RuntimeError("standalone nunchaku-torch distribution must be absent")
+
+print("bundled runtime:", nunchaku_torch.__file__)
+"@
+
+foreach ($device in 0, 1) {
+    $env:ZE_AFFINITY_MASK = "$device"
+    $env:OMNI_ATTN_BACKEND = "torch"
+    & $embeddedPython (Join-Path $comfyRoot "main.py") `
+        --windows-standalone-build `
+        --disable-auto-launch `
+        --quick-test-for-ci `
+        --log-stdout `
+        --verbose INFO
+    if ($LASTEXITCODE -ne 0) {
+        throw "ComfyUI quick test failed for ZE_AFFINITY_MASK=$device"
+    }
+}
+Remove-Item Env:ZE_AFFINITY_MASK -ErrorAction SilentlyContinue
+```
+
+日志必须同时包含：
+
+- `UnetLoaderGGUF` 所在节点成功导入；
+- GGUF 的 Q4_0/Q4_1/Q8_0/Q4_K/Q6_K 配置为 Kitchen managed XPU；
+- `NunchakuZImageDiTLoader` 所在节点成功导入；
+- bundled `nunchaku_torch 1.3.0dev` 和
+  `ComfyUI-nunchaku-XPU 1.2.1+xpu.3`；
+- Kitchen XPU backend 和 SVDQuant W4A16 available；
+- `Using pytorch attention`；
+- Kitchen Triton 在 Windows 为 disabled/unavailable。
+
+手工固定安装可能显示 `nunchaku_versions.json not found` 并进入 minimal mode。
+该文件是节点更新器的版本目录，不是 bundled runtime；只要上述
+distribution/runtime/node 检查通过，这条提示本身不是导入失败。
+
+### 12.4 模型与 E2E gate
+
+两个 1024×1024、9-step Z-Image workflow 只改变 diffusion-model loader：
+
+| 路径 | 文件 | 已知验证身份 |
+|---|---|---|
+| `models/diffusion_models/gguf` | `z-image-turbo-Q4_0.gguf` | 4,585,244,736 bytes；SHA256 `302B9CF7E7DDBEFFB472FDE1A9E2EA436A5EDF1F7119C617A18E5222C8078921` |
+| `models/diffusion_models/nunchaku` | `svdq-int4_r128-z-image-turbo.safetensors` | 4,011,374,152 bytes；SHA256 `DBF5ABA0F7370D1FE88E52823D3D7B9CEB6FA006707F075BAF9CFDAF362EA745` |
+
+两条 workflow 还需要已有的
+`models/text_encoders/qwen_3_4b.safetensors` 和 `models/vae/ae.safetensors`。
+以下命令按已验证 revision 直接下载到 Portable 对应的相对目录。它不会更改
+Python 依赖；如模型已经存在且哈希匹配，可跳过下载：
+
+```powershell
+$comfyRoot = Join-Path $portableRoot "ComfyUI"
+$env:OMNI_COMFY_ROOT = $comfyRoot
+
+@'
+import os
+from pathlib import Path
+from huggingface_hub import hf_hub_download
+
+root = Path(os.environ["OMNI_COMFY_ROOT"])
+artifacts = (
+    (
+        "unsloth/Z-Image-Turbo-GGUF",
+        "6c80814333b7b6a70a2e5b469a7c6437ce65de0f",
+        "z-image-turbo-Q4_0.gguf",
+        root / "models" / "diffusion_models" / "gguf",
+    ),
+    (
+        "nunchaku-ai/nunchaku-z-image-turbo",
+        "ca6bac69c3b0b2bdd31ca5196bf87c5f2a9eaedf",
+        "svdq-int4_r128-z-image-turbo.safetensors",
+        root / "models" / "diffusion_models" / "nunchaku",
+    ),
+)
+
+for repo_id, revision, filename, target in artifacts:
+    target.mkdir(parents=True, exist_ok=True)
+    hf_hub_download(
+        repo_id=repo_id,
+        revision=revision,
+        filename=filename,
+        local_dir=target,
+    )
+'@ | & $embeddedPython -
+
+Remove-Item Env:OMNI_COMFY_ROOT
+
+Get-FileHash -Algorithm SHA256 `
+    (Join-Path $comfyRoot `
+        "models\diffusion_models\gguf\z-image-turbo-Q4_0.gguf")
+Get-FileHash -Algorithm SHA256 `
+    (Join-Path $comfyRoot `
+        "models\diffusion_models\nunchaku\svdq-int4_r128-z-image-turbo.safetensors")
+```
+
+固定来源分别是
+[`unsloth/Z-Image-Turbo-GGUF@6c808143...`](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF/tree/6c80814333b7b6a70a2e5b469a7c6437ce65de0f)
+和
+[`nunchaku-ai/nunchaku-z-image-turbo@ca6bac69...`](https://huggingface.co/nunchaku-ai/nunchaku-z-image-turbo/tree/ca6bac69c3b0b2bdd31ca5196bf87c5f2a9eaedf)。
+使用
+[`omni-xpu-kernel-tuning` 的固定量化对比 API graphs](https://github.com/xiangyuT/omni-xpu-kernel-tuning/tree/main/workflows/bmg-zimage-quantization-comparison)
+执行 fresh server、cold、resident warm、formal 和 forced-text gate。
+
+验收要求：
+
+- 每条 workflow 均生成有效的 1024×1024 RGB PNG；
+- cold/model load 不用于性能比较；
+- GGUF 或 Nunchaku 的实际 route count 大于零；
+- Kitchen fallback/quarantine 为零；
+- 无 OOM、Level Zero、NaN 或 ComfyUI execution error；
+- 只有完成多次 resident formal run 后才报告 Windows 性能。
+
+2026-07-30 当前 Windows 安装态结果：
+
+| 检查 | XPU 0 | XPU 1 |
+|---|---:|---:|
+| ComfyUI quick-test 与节点导入 | passed | passed |
+| GGUF source/kernel suite | 24 passed | 24 passed |
+| GGUF `GGMLTensor` object integration（5 格式 × 2 dtype） | 10 passed，XPU route 10，fallback 0 | 10 passed，XPU route 10，fallback 0 |
+| Combined Nunchaku runtime/W4A16/XPU suite | 15 passed | 15 passed |
+
+`pip check` 为 `No broken requirements found.`，两张设备均识别为 Intel Arc
+Pro B70。real-model 正式 E2E 固定 `ZE_AFFINITY_MASK=1`、默认 Torch SDPA，
+每个模型各运行 cached/forced 两个 fresh-server block；每个 block 排除
+1 次 cold 和 3 次 warm，保留同一组 seed `36201..36210`：
+
+| 模型 | Cached mean / median / CV | Forced mean / median / CV | 每个 formal 的 XPU route | Fallback |
+|---|---:|---:|---:|---:|
+| GGUF Q4 | 6521.5 / 6527.0 ms / 0.210% | 6636.0 / 6634.0 ms / 0.124% | 1620 | 0 |
+| Nunchaku INT4 r128 | 6601.3 / 6609.0 ms / 0.333% | 6708.3 / 6713.0 ms / 0.213% | 1224 | 0 |
+
+四个 block 共 `56/56` execution 成功、40 个 formal；`56/56` 输出均为
+有效且 SHA256 唯一的 1024×1024 RGB PNG，server fatal-pattern audit 为零。
+Linux/B70 对照使用 Torch 2.11，Windows 的 GGUF cached/forced 均值分别慢
+`6.14%/6.38%`，Nunchaku 分别慢 `4.63%/4.98%`；这同时包含 runtime 和
+OS 差异，不能写成纯 Windows 开销。
+
+## 13. Windows 启动脚本
 
 将 Portable 根目录中的 `run_intel_gpu.bat` 改为：
 
@@ -614,9 +937,9 @@ pause
 - `OMNIXPU_INTERPOLATE_FIX` 和其他 legacy global fix 默认保持关闭；
 - `%*` 允许在启动脚本后追加其他 ComfyUI 参数。
 
-## 13. 分层验收
+## 14. 分层验收
 
-### 13.1 版本、DLL 和设备
+### 14.1 版本、DLL 和设备
 
 ```powershell
 Set-Location $portableRoot
@@ -652,7 +975,7 @@ assert omni.is_available()
 "@
 ```
 
-### 13.2 Native kernel correctness
+### 14.2 Native kernel correctness
 
 ```powershell
 @'
@@ -693,7 +1016,7 @@ print("native kernel smoke: PASS")
 `head_dim=64/128` 的 FP16、BF16。Windows loader 已与 Linux loader
 对齐，会解析 sidecar 已导出的 D64、D128 和 FP16 fast-path 符号。
 
-### 13.3 ComfyUI/custom node 启动
+### 14.3 ComfyUI/custom node 启动
 
 ```powershell
 $env:OMNIXPU_ENABLE = "1"
@@ -734,7 +1057,7 @@ $env:OMNIXPU_INTERPOLATE_FIX = "0"
 `--quick-test-for-ci` 只验证启动、导入和设备发现。最终发布还必须用目标模型
 workflow 做一次结果正确性和显存行为验收。
 
-### 13.4 Launcher 和 HTTP 服务
+### 14.4 Launcher 和 HTTP 服务
 
 先从 Portable 目录之外验证 launcher 的路径解析和参数透传：
 
@@ -767,11 +1090,11 @@ curl.exe --noproxy "*" `
 
 预期返回 `200`。验收后在第一个终端按 `Ctrl+C` 关闭测试服务。
 
-### 13.5 2026-07-29 实机部署记录
+### 14.5 2026-07-29 实机部署记录
 
 完成的变更：
 
-- 从 `llm-scaler` `0c6cd57c...` 构建并安装 Torch 2.12/BMG Windows
+- 从 `llm-scaler` `3f554f97...` 构建并安装 Torch 2.12/BMG Windows
   kernel wheel；
 - 从 Kitchen `c7ae07e5...` 构建并安装 XPU fork wheel；
 - 保留 requirements 中“完全省略 `comfy-kitchen`、单独管理 XPU fork”的
@@ -779,7 +1102,9 @@ curl.exe --noproxy "*" `
 - 把旧 Custom Node 移到 Portable 的 `backups` 目录，再复制匹配 revision
   的新节点；
 - 将 launcher 的默认 attention policy 从 ESIMD 改为 PyTorch SDPA；
-- GGUF/Nunchaku custom node 和模型不在本轮安装范围。
+- 使用 Torch 2.12 constraints 安装 GGUF/Nunchaku requirements；
+- 安装 GGUF `39671fe7...` 和 combined Nunchaku
+  `5cf4fa98...` / `1.2.1+xpu.3`。
 
 实际验收结果：
 
@@ -800,7 +1125,10 @@ curl.exe --noproxy "*" `
 | 新 capability | Q4_1、GroupNorm、LTX direct RoPE、INT8 shared/prequantized pair 可见 |
 | ComfyUI quick-test | 返回码 `0` |
 | Launcher quick-test | 从 Portable 外部调用，返回码 `0` |
-| Custom Node | 只导入一次；旧节点备份不在扫描目录 |
+| Omni Custom Node | 只导入一次；旧节点备份不在扫描目录 |
+| GGUF Custom Node | 两张 B70 各 24 source + 10 object integration passed；XPU route，fallback 0 |
+| Combined Nunchaku | 两张 B70 各 15 runtime/W4A16/XPU passed |
+| Quantized model E2E | GGUF/Nunchaku 各 2 block；56/56 execution、40 formal、56/56 有效 PNG；XPU route 1620/1224，fallback 0 |
 
 ComfyUI `0.28.0` 的实际 adapter 日志：
 
@@ -844,7 +1172,7 @@ AIMDO。显式添加 `--disable-dynamic-vram` 会触发 ComfyUI 自己的弃用�
 XPU memory management 处理。oneDNN JIT register 提示在更新前基线中同样
 出现；oneDNN 随后选择可用实现，四个工作流均成功，因此不属于本轮回归。
 
-## 14. 更新与防覆盖
+## 15. 更新与防覆盖
 
 这是 Intel XPU Portable 最容易被忽略的维护边界。
 
@@ -879,7 +1207,9 @@ pip install --upgrade ... -r ../ComfyUI/requirements.txt
 7. 如果 Torch minor 已变化，恢复 Torch 2.12，或者构建对应的新 kernel
    wheel，不能继续加载旧 wheel；
 8. 重新复制匹配 revision 的 `ComfyUI-OmniXPU`；
-9. 重跑第 13 节全部验收。
+9. 按第 12 节使用与新 Portable 匹配的 constraints 重新安装量化节点，不能
+   在 Torch minor 变化后沿用 Torch 2.12 constraints；
+10. 重跑第 14 节全部验收和实际使用的量化 workflow。
 
 不要只看 `pip install` 是否成功。官方 Kitchen 和 XPU Kitchen 使用相同的
 distribution/import name，必须检查：
@@ -894,7 +1224,7 @@ print(ck.list_backends().get("xpu"))
 "@
 ```
 
-## 15. 回滚
+## 16. 回滚
 
 最可靠的回滚是关闭 ComfyUI，移走当前 Portable 目录，然后重新解压原始
 官方 archive 或恢复完整目录快照。
@@ -907,7 +1237,7 @@ print(ck.list_backends().get("xpu"))
 如果只回滚 Python 包，必须成组恢复 Torch XPU、Kitchen 和 kernel；不要把
 旧 `omni_xpu_kernel` 留在不同 Torch minor 的环境中。
 
-## 16. 已知限制
+## 17. 已知限制
 
 - Windows wheel 当前没有 CUTE FMHA；默认使用 PyTorch SDPA，ESIMD SDP
   只作为显式选项。
@@ -918,7 +1248,10 @@ print(ck.list_backends().get("xpu"))
 - Torch 2.13 不在当前 Windows 验证范围内。
 - `comfy-kitchen 0.2.18` XPU fork 与未来 ComfyUI API 的兼容性必须在每次
   上游更新后重新测试。
-- Dockerfile 中的可选第三方 custom node 集合不属于 Omni 核心依赖。先完成
-  kernel、Kitchen、ComfyUI adapter 三层验收，再按 workflow 需求逐个安装。
+- GGUF/Nunchaku 的安装、导入、双卡 native correctness 与单卡正式
+  real-model E2E 已通过；当前正式性能仅覆盖 B70、Torch 2.12、默认
+  Torch SDPA、1024×1024/9-step Z-Image workload。
+- Dockerfile 中除 GGUF/Nunchaku 外的其他可选第三方 custom node 不属于
+  Omni 核心依赖，应按 workflow 需求逐个安装和验收。
 - legacy interpolate/median global workaround 默认关闭，不应作为基础部署的一
   部分启用。
