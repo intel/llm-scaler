@@ -11,8 +11,8 @@
  * vllm-xpu speculative GDN kernels while avoiding the intermediate q/k/v/b/a
  * buffers and the separate conv and delta-rule launches.
  *
- * This first implementation is intentionally scoped to the Qwen3.6-27B
- * TP=2 geometry (H=8, HV=24, K=V=128, WG_SIZE=64). The host dispatcher
+ * This implementation is intentionally scoped to the Qwen3.5/3.6 TP=2
+ * geometries (H=8, HV=16/24, K=V=128, WG_SIZE=64). The host dispatcher
  * rejects unsupported geometries rather than silently selecting a slower or
  * incorrect layout.
  */
@@ -266,6 +266,57 @@ ESIMD_INLINE void gdn_conv_fused_seq_spec_kernel(
                 (1.0f + sycl::ext::intel::esimd::exp(-conv_result_hi));
         }
 
+        // Each value-head work-group owns its V slice. Only hv=0 writes the
+        // replicated Q/K slices, so every checkpoint slot has one writer.
+        if (save_state_idx >= 0) {
+            fp16* save_state =
+                conv_state_ptr + (int64_t)save_state_idx * conv_stride0;
+            if (hv == 0 && tid < 4 * H) {
+                block_store<fp16, 64>(
+                    save_state + 0 * dim + chunk_start,
+                    simd<fp16, 64>(s1));
+                block_store<fp16, 64>(
+                    save_state + 1 * dim + chunk_start,
+                    simd<fp16, 64>(s2));
+                block_store<fp16, 64>(
+                    save_state + 2 * dim + chunk_start,
+                    x_fp16);
+            }
+            if (!v_oob && tid >= 4 * H) {
+                const int v_tid = tid - 4 * H;
+                if (double_v && v_tid == hv) {
+                    block_store<fp16, 64>(
+                        save_state + 0 * dim + chunk_start,
+                        simd<fp16, 64>(s1));
+                    block_store<fp16, 64>(
+                        save_state + 1 * dim + chunk_start,
+                        simd<fp16, 64>(s2));
+                    block_store<fp16, 64>(
+                        save_state + 2 * dim + chunk_start,
+                        x_fp16);
+                    block_store<fp16, 64>(
+                        save_state + 0 * dim + chunk_start_hi,
+                        simd<fp16, 64>(s1_hi));
+                    block_store<fp16, 64>(
+                        save_state + 1 * dim + chunk_start_hi,
+                        simd<fp16, 64>(s2_hi));
+                    block_store<fp16, 64>(
+                        save_state + 2 * dim + chunk_start_hi,
+                        x_fp16_hi);
+                } else if (!double_v && v_tid / 2 == hv) {
+                    block_store<fp16, 64>(
+                        save_state + 0 * dim + chunk_start,
+                        simd<fp16, 64>(s1));
+                    block_store<fp16, 64>(
+                        save_state + 1 * dim + chunk_start,
+                        simd<fp16, 64>(s2));
+                    block_store<fp16, 64>(
+                        save_state + 2 * dim + chunk_start,
+                        x_fp16);
+                }
+            }
+        }
+
         const int q_tid_lo = 2 * i_h;
         if (tid == q_tid_lo) {
             slm_block_store<float, 64>(SLM_Q_LO_SEQ, conv_result);
@@ -340,147 +391,6 @@ ESIMD_INLINE void gdn_conv_fused_seq_spec_kernel(
     }
 }
 
-/*
- * Write speculative conv checkpoints with one work-group per sequence.
- *
- * The fused GDN kernel has one work-group per value head.  Q/K lanes are
- * therefore replicated across work-groups and must not write the same cache
- * slot concurrently.  This post-kernel gives each sequence a single writer
- * for every Q/K/V feature chunk.
- */
-template <int WG_SIZE>
-ESIMD_INLINE void gdn_conv_state_update_seq_spec_kernel(
-    const fp16* __restrict__ qkvz_ptr,
-    int64_t qkvz_stride0,
-    fp16* __restrict__ conv_state_ptr,
-    const int* __restrict__ spec_state_indices_ptr,
-    const int* __restrict__ token_indx_ptr,
-    const int* __restrict__ num_accepted_tokens_ptr,
-    int num_spec_decodes,
-    int num_spec_tokens,
-    int H,
-    int HV,
-    int gdn_K,
-    int gdn_V,
-    int64_t conv_stride0,
-    nd_item<3>& ndi)
-{
-    const int seq_idx = ndi.get_group(0);
-    const int tid = ndi.get_local_id(2);
-    if (seq_idx >= num_spec_decodes) {
-        return;
-    }
-
-    const int num_v_threads = WG_SIZE - 4 * H;
-    const bool double_v = HV > num_v_threads / 2;
-    const bool v_oob = tid >= 4 * H &&
-        (double_v ? (tid - 4 * H >= HV) : ((tid - 4 * H) / 2 >= HV));
-    if (v_oob) {
-        return;
-    }
-
-    const int dim = 2 * H * gdn_K + HV * gdn_V;
-    const int q_base = 0;
-    const int k_base = H * gdn_K;
-    const int v_base = 2 * H * gdn_K;
-
-    int qkvz_offset = 0;
-    int qkvz_offset_hi = 0;
-    int chunk_start = 0;
-    int chunk_start_hi = 0;
-    if (tid < 2 * H) {
-        const int q_head = tid / 2;
-        qkvz_offset = q_base + q_head * gdn_K + (tid & 1) * 64;
-        chunk_start = qkvz_offset;
-    } else if (tid < 4 * H) {
-        const int k_tid = tid - 2 * H;
-        const int k_head = k_tid / 2;
-        qkvz_offset = k_base + k_head * gdn_K + (k_tid & 1) * 64;
-        chunk_start = qkvz_offset;
-    } else if (double_v) {
-        const int v_hv = tid - 4 * H;
-        qkvz_offset = v_base + v_hv * gdn_V;
-        qkvz_offset_hi = qkvz_offset + 64;
-        chunk_start = qkvz_offset;
-        chunk_start_hi = chunk_start + 64;
-    } else {
-        const int v_tid = tid - 4 * H;
-        const int v_hv = v_tid / 2;
-        qkvz_offset = v_base + v_hv * gdn_V + (v_tid & 1) * 64;
-        chunk_start = qkvz_offset;
-    }
-
-    const int state_row = seq_idx * num_spec_tokens;
-    const int accepted_prev = num_accepted_tokens_ptr[seq_idx] - 1;
-    const int init_col = accepted_prev > 0 ? accepted_prev : 0;
-    const int init_state_idx = spec_state_indices_ptr[state_row + init_col];
-    fp16* init_state = nullptr;
-    if (init_state_idx >= 0) {
-        init_state =
-            conv_state_ptr + (int64_t)init_state_idx * conv_stride0;
-    }
-
-    simd<float, 64> s1(0.0f), s2(0.0f);
-    if (init_state != nullptr) {
-        s1 = block_load<fp16, 64>(
-            init_state + 1 * dim + chunk_start);
-        s2 = block_load<fp16, 64>(
-            init_state + 2 * dim + chunk_start);
-    }
-    simd<float, 64> s1_hi(0.0f), s2_hi(0.0f);
-    if (double_v && tid >= 4 * H && init_state != nullptr) {
-        s1_hi = block_load<fp16, 64>(
-            init_state + 1 * dim + chunk_start_hi);
-        s2_hi = block_load<fp16, 64>(
-            init_state + 2 * dim + chunk_start_hi);
-    }
-
-    for (int t = 0; t < num_spec_tokens; ++t) {
-        const int global_t = token_indx_ptr[state_row + t];
-        const fp16* qkvz_row =
-            qkvz_ptr + (int64_t)global_t * qkvz_stride0;
-        const int save_state_idx = spec_state_indices_ptr[state_row + t];
-        simd<fp16, 64> x_fp16 =
-            block_load<fp16, 64>(qkvz_row + qkvz_offset);
-        simd<fp16, 64> x_fp16_hi;
-        if (double_v && tid >= 4 * H) {
-            x_fp16_hi = block_load<fp16, 64>(
-                qkvz_row + qkvz_offset_hi);
-        }
-        if (save_state_idx >= 0) {
-            fp16* save_state =
-                conv_state_ptr + (int64_t)save_state_idx * conv_stride0;
-            block_store<fp16, 64>(
-                save_state + 0 * dim + chunk_start,
-                simd<fp16, 64>(s1));
-            block_store<fp16, 64>(
-                save_state + 1 * dim + chunk_start,
-                simd<fp16, 64>(s2));
-            block_store<fp16, 64>(
-                save_state + 2 * dim + chunk_start,
-                x_fp16);
-
-            if (double_v && tid >= 4 * H) {
-                block_store<fp16, 64>(
-                    save_state + 0 * dim + chunk_start_hi,
-                    simd<fp16, 64>(s1_hi));
-                block_store<fp16, 64>(
-                    save_state + 1 * dim + chunk_start_hi,
-                    simd<fp16, 64>(s2_hi));
-                block_store<fp16, 64>(
-                    save_state + 2 * dim + chunk_start_hi,
-                    x_fp16_hi);
-            }
-        }
-        s1 = s2;
-        s2 = x_fp16;
-        if (double_v && tid >= 4 * H) {
-            s1_hi = s2_hi;
-            s2_hi = x_fp16_hi;
-        }
-    }
-}
-
 inline void gdn_conv_fused_seq_spec_host(
     const fp16* qkvz_ptr,
     int64_t qkvz_stride0,
@@ -528,20 +438,5 @@ inline void gdn_conv_fused_seq_spec_host(
                 num_accepted_tokens_ptr, num_spec_decodes, num_spec_tokens,
                 H, HV, K, V, scale, conv_stride0, ssm_stride0, ndi);
         });
-    });
-
-    sycl::nd_range<3> state_range(
-        sycl::range<3>(num_spec_decodes, 1, WG_SIZE),
-        sycl::range<3>(1, 1, WG_SIZE));
-    q.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(
-            state_range,
-            [=](sycl::nd_item<3> ndi) SYCL_ESIMD_KERNEL {
-                gdn_conv_state_update_seq_spec_kernel<WG_SIZE>(
-                    qkvz_ptr, qkvz_stride0, conv_state_ptr,
-                    spec_state_indices_ptr, token_indx_ptr,
-                    num_accepted_tokens_ptr, num_spec_decodes,
-                    num_spec_tokens, H, HV, K, V, conv_stride0, ndi);
-            });
     });
 }
