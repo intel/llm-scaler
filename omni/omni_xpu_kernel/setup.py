@@ -673,7 +673,12 @@ class ICPXExtension(Extension):
         elif name.endswith("cute_fmha_torch"):
             kernel_root = source_root / "omni_xpu_kernel" / "cute"
             sources = [kernel_root / "cute_fmha_torch.cpp"]
-            depends = [kernel_root / "cute_fmha_config.h"]
+            csrc_root = source_root / "omni_xpu_kernel" / "csrc"
+            depends = [
+                kernel_root / "cute_fmha_config.h",
+                csrc_root / "bmg_kernel_policy.h",
+                csrc_root / "device_utils.h",
+            ]
         else:
             kernel_root = source_root / "omni_xpu_kernel" / "csrc"
             sources = sorted(kernel_root.glob("*.cpp"))

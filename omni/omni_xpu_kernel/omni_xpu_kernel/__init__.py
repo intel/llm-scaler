@@ -139,6 +139,7 @@ from . import sdp
 from . import linear
 from . import int8
 from . import fp8
+from . import device
 
 # cute FMHA (CUTLASS-SYCL) is required by default at build time. Import remains
 # defensive for explicit core-only/Windows builds and older installed wheels.
@@ -156,6 +157,7 @@ __all__ = [
     "linear",
     "int8",
     "fp8",
+    "device",
     "cute",
     "core_aot_target",
     "is_available",
@@ -171,7 +173,17 @@ def native_capabilities() -> dict[str, tuple[str, ...]]:
         native = _load_extension()
     except ImportError:
         return {}
-    modules = ("fp8", "gguf", "norm", "svdq", "rotary", "sdp", "linear", "int8")
+    modules = (
+        "device",
+        "fp8",
+        "gguf",
+        "norm",
+        "svdq",
+        "rotary",
+        "sdp",
+        "linear",
+        "int8",
+    )
     return {
         name: tuple(sorted(item for item in dir(getattr(native, name)) if not item.startswith("_")))
         for name in modules

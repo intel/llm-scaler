@@ -73,8 +73,19 @@ assert omni.core_aot_target() == omni.__xpu_target__
 
 ## Build targets
 
-`OMNI_XPU_DEVICE` selects both the AOT ISA and target-specific kernel policy.
-Unknown values are rejected before compilation.
+`OMNI_XPU_DEVICE` selects the AOT ISA and architecture-level policy. Unknown
+values are rejected before compilation. One BMG wheel contains both B60 and
+B70 kernel profiles and selects between them from the exact runtime PCI Device
+ID:
+
+| PCI Device ID | Runtime BMG profile |
+|---|---|
+| `0xE210`, `0xE211` | `b60` |
+| `0xE223` | `b70` |
+| other BMG ID | `generic-bmg` (the shipped B70-compatible defaults) |
+
+Use `omni_xpu_kernel.device.info(index)` to inspect the detected ID, selected
+profile, and concrete policy values.
 
 | GPU architecture | `sycl-ls --verbose` architecture | `OMNI_XPU_DEVICE` |
 |---|---|---|
@@ -204,6 +215,7 @@ print("package:", omni.__version__)
 print("built torch:", omni.__torch_version__)
 print("metadata target:", omni.__xpu_target__)
 print("core AOT target:", omni.core_aot_target())
+print("runtime kernel profile:", omni.device.info(0))
 print("available:", omni.is_available())
 
 assert omni.is_available()
@@ -399,8 +411,9 @@ The Linux build produces three extension components:
 - `cute_fmha_torch.so`: target-specific CUTLASS-SYCL attention sidecar.
 
 `setup.py` derives one architecture macro from `OMNI_XPU_DEVICE` so wheel
-metadata, core AOT ISA, sidecars, and compile-time kernel policy identify the
-same target.
+metadata, core AOT ISA, and sidecars identify the same target. BMG core and
+CUTE components query the exact runtime Device ID and share the B60/B70 policy
+table.
 
 ## License
 

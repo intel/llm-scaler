@@ -39,6 +39,10 @@
 #include "flash_attention_v2/collective/xe_fmha_fwd_epilogue.hpp"
 #include "flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp"
 #include "flash_attention_v2/kernel/xe_tile_scheduler.hpp"
+#if defined(OMNI_XPU_ARCH_BMG)
+#include "../csrc/bmg_kernel_policy.h"
+#include "../csrc/device_utils.h"
+#endif
 #include "cute_fmha_config.h"
 
 using namespace cute;
@@ -100,7 +104,8 @@ template <
     int PipelineStagesOverride = 0,
     int QTileOverride = 0,
     int SubgroupLayoutQOverride = 0,
-    int MmaKOverride = 0>
+    int MmaKOverride = 0,
+    int VTileOverride = 0>
 struct D128TileKernel {
   using PlatformConfig = cute_fmha_config::ActiveConfig;
   static constexpr int QTile =
@@ -111,6 +116,8 @@ struct D128TileKernel {
           : PlatformConfig::SUBGROUP_LAYOUT_Q;
   static constexpr int MmaK =
       MmaKOverride > 0 ? MmaKOverride : PlatformConfig::MMA_K;
+  static constexpr int VTile =
+      VTileOverride > 0 ? VTileOverride : PlatformConfig::V_TILE;
 #if defined(CUTE_FMHA_KV64)
   // KV tile = get<1>(ShapeQK) = 64. Per get_tiled_mma_pv, the PV tile must be
   // <TileQ, TileV, KVtile> — so ShapePV's K-dim (3rd) MUST equal 64, not 32.
@@ -123,7 +130,7 @@ struct D128TileKernel {
   using ShapeQK = Shape<
       Int<QTile>, Int<KvTile>, Int<MmaK>>;
   using ShapePV = Shape<
-      Int<QTile>, Int<PlatformConfig::V_TILE>, Int<KvTile>>;
+      Int<QTile>, Int<VTile>, Int<KvTile>>;
   using ShapeOutput = Shape<
       Int<QTile>, Int<PlatformConfig::HEAD_DIM>>;
   using SubgroupLayoutQK = Layout<
@@ -194,7 +201,8 @@ template <
     int PipelineStagesOverride = 0,
     int QTileOverride = 0,
     int SubgroupLayoutQOverride = 0,
-    int MmaKOverride = 0>
+    int MmaKOverride = 0,
+    int VTileOverride = 0>
 void run_d128_tile(
     const void* q_ptr, const void* k_ptr, const void* v_ptr, void* o_ptr,
     int B, int H, int Lq, int Lkv, int D, float scale,
@@ -209,7 +217,8 @@ void run_d128_tile(
       PipelineStagesOverride,
       QTileOverride,
       SubgroupLayoutQOverride,
-      MmaKOverride>;
+      MmaKOverride,
+      VTileOverride>;
   using K    = typename KT::Kernel;
   using PS   = typename KT::ProblemShapeType;
 
@@ -512,6 +521,26 @@ at::Tensor sdp_bhld_d120(
   const float scale = 1.0f / std::sqrt((float)D);
   if (q.scalar_type() == at::kHalf) {
 #if defined(OMNI_XPU_ARCH_BMG)
+    auto& queue =
+        c10::xpu::getCurrentXPUStream(q.device().index()).queue();
+    const bool use_b60 =
+        omni_xpu::device::use_b60_kernel_profile(queue);
+    // B60's L4205 workflow benefits from a 64-wide V tile. B70 and
+    // unrecognized BMG IDs keep the shipped V32 specialization.
+    if (use_b60 && L == 4205) {
+      run_d128_tile<
+          cutlass::half_t,
+          1,
+          0,
+          0,
+          0,
+          omni_xpu::device::B60KernelPolicy::d120_l4205_v_tile>(
+          q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(), B, H, L, L,
+          D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+          k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+          o.stride(2), o.stride(1), o.stride(0));
+      return o;
+    }
     // L4096 has no Q-tile remainder.  Doubling both the Q tile and subgroup
     // count preserves the proven 16-row per-subgroup fragment while halving
     // work-group scheduling and reusing each K/V traversal across twice as

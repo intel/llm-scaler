@@ -12,6 +12,10 @@
 #include <torch/extension.h>
 #include <pybind11/stl.h>
 
+#include "bmg_kernel_policy.h"
+#include "device_utils.h"
+#include "utils.h"
+
 namespace omni_xpu {
 namespace gguf {
     torch::Tensor dequantize_q4_0(const torch::Tensor& input, torch::ScalarType dtype);
@@ -132,6 +136,53 @@ namespace int8_ops {
 }
 }
 
+namespace {
+
+template<typename Policy>
+py::dict bmg_kernel_policy_dict() {
+    py::dict policy;
+    policy["adaln"] = py::make_tuple(
+        Policy::adaln_block_size,
+        Policy::adaln_work_group_size);
+    policy["int8_dequant_fp32"] = py::make_tuple(
+        Policy::int8_dequant_fp32_elements,
+        Policy::int8_dequant_fp32_work_group_size);
+    policy["int8_dequant_fp16"] = py::make_tuple(
+        Policy::int8_dequant_fp16_elements,
+        Policy::int8_dequant_fp16_work_group_size);
+    policy["int8_dequant_bf16"] = py::make_tuple(
+        Policy::int8_dequant_bf16_elements,
+        Policy::int8_dequant_bf16_work_group_size);
+    policy["int8_scaleback"] = py::make_tuple(
+        Policy::int8_scaleback_elements,
+        Policy::int8_scaleback_work_group_rows,
+        Policy::int8_scaleback_work_group_cols);
+    policy["convrot_g16"] = py::make_tuple(
+        Policy::convrot_g16_groups_per_dpas,
+        Policy::convrot_g16_work_items_per_row);
+    policy["fp8_stochastic_elements"] =
+        Policy::fp8_stochastic_elements;
+    policy["svdq_dequant"] = py::make_tuple(
+        Policy::svdq_dequant_groups,
+        Policy::svdq_dequant_work_group_size);
+    policy["svdq_quant"] = py::make_tuple(
+        Policy::svdq_quant_groups,
+        Policy::svdq_quant_work_group_size);
+    policy["svdq_smooth"] = py::make_tuple(
+        Policy::svdq_smooth_elements,
+        Policy::svdq_smooth_work_group_size);
+    policy["svdq_convert_add_elements"] =
+        Policy::svdq_convert_add_elements;
+    policy["kitchen_rope"] = py::make_tuple(
+        Policy::kitchen_rope_pairs_per_work_item,
+        Policy::kitchen_rope_work_group_size);
+    policy["d120_l4205_v_tile"] =
+        Policy::d120_l4205_v_tile;
+    return policy;
+}
+
+}  // namespace
+
 PYBIND11_MODULE(_C, m) {
     m.doc() = "omni_xpu_kernel - High-performance Intel XPU ESIMD kernels for ComfyUI";
 
@@ -145,6 +196,61 @@ PYBIND11_MODULE(_C, m) {
 #else
     m.attr("__core_aot_target__") = "";
 #endif
+
+    // Exact runtime device identity.  B60/B70 share one BMG AOT image; host
+    // dispatch selects the kernel profile from the input device's queue.
+    auto device = m.def_submodule(
+        "device", "Exact Intel BMG identity and kernel-profile selection");
+    device.def(
+        "classify_bmg_device_id",
+        [](uint32_t device_id) {
+            return std::string(omni_xpu::device::bmg_sku_name(
+                omni_xpu::device::classify_bmg_device_id(device_id)));
+        },
+        py::arg("device_id"));
+    device.def(
+        "bmg_sku",
+        [](int64_t index) {
+            auto& queue = omni_xpu::utils::get_queue(
+                torch::Device(torch::kXPU, index));
+            return std::string(omni_xpu::device::bmg_sku_name(
+                omni_xpu::device::get_bmg_sku(queue)));
+        },
+        py::arg("index") = 0);
+    device.def(
+        "info",
+        [](int64_t index) {
+            auto& queue = omni_xpu::utils::get_queue(
+                torch::Device(torch::kXPU, index));
+            const auto sycl_device = queue.get_device();
+            const uint32_t device_id =
+                omni_xpu::device::get_device_id(sycl_device);
+            const auto sku =
+                omni_xpu::device::classify_bmg_device_id(device_id);
+            py::dict result;
+            result["index"] = index;
+            result["name"] =
+                sycl_device.get_info<sycl::info::device::name>();
+            result["device_id"] = device_id;
+            result["bmg_sku"] = std::string(
+                omni_xpu::device::bmg_sku_name(sku));
+            if (sku == omni_xpu::device::BmgSku::b60) {
+                result["kernel_profile"] = "b60";
+                result["kernel_policy"] =
+                    bmg_kernel_policy_dict<
+                        omni_xpu::device::B60KernelPolicy>();
+            } else {
+                result["kernel_profile"] =
+                    sku == omni_xpu::device::BmgSku::b70
+                    ? "b70"
+                    : "generic-bmg";
+                result["kernel_policy"] =
+                    bmg_kernel_policy_dict<
+                        omni_xpu::device::B70KernelPolicy>();
+            }
+            return result;
+        },
+        py::arg("index") = 0);
     
     // GGUF Dequantization
     auto gguf = m.def_submodule("gguf", "GGUF dequantization kernels");

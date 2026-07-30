@@ -2,6 +2,8 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 
+#include "bmg_kernel_policy.h"
+#include "device_utils.h"
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -22,7 +24,7 @@ namespace {
 #endif
 #endif
 
-template<typename OutputT>
+template<typename OutputT, int ElementsPerWorkItem, int WorkGroupSize>
 void dequantize_esimd_kernel(
     const int8_t* __restrict__ input,
     const float* __restrict__ scales,
@@ -31,8 +33,6 @@ void dequantize_esimd_kernel(
     int64_t row_width,
     bool rowwise,
     const at::Device& device) {
-    constexpr int ElementsPerWorkItem = OMNI_INT8_DEQUANT_ELEMENTS_PER_WI;
-    constexpr int WorkGroupSize = 64;
     const int64_t work_items =
         (numel + ElementsPerWorkItem - 1) / ElementsPerWorkItem;
     const int64_t padded =
@@ -93,9 +93,26 @@ torch::Tensor dequantize_int8_fused(
     const int64_t rows = input.numel() / row_width;
     const bool rowwise = scale.dim() > 0 && scale.size(-1) == 1 &&
         scale.numel() == rows && scale.numel() != 1;
-    constexpr int ElementsPerWorkItem = OMNI_INT8_DEQUANT_ELEMENTS_PER_WI;
+#if defined(OMNI_XPU_ARCH_BMG)
+    auto& queue = utils::get_queue(input.device());
+    const bool use_b60 =
+        device::use_b60_kernel_profile(queue) &&
+        input.dim() == 2 && rows == 16384 && row_width == 4096;
+#else
+    const bool use_b60 = false;
+#endif
+    const int elements_per_work_item =
+        use_b60
+        ? (
+              out_dtype == torch::kFloat
+              ? device::B60KernelPolicy::int8_dequant_fp32_elements
+              : (
+                    out_dtype == torch::kBFloat16
+                    ? device::B60KernelPolicy::int8_dequant_bf16_elements
+                    : device::B60KernelPolicy::int8_dequant_fp16_elements))
+        : OMNI_INT8_DEQUANT_ELEMENTS_PER_WI;
     const bool supported = scale.numel() == 1 ||
-        (rowwise && row_width % ElementsPerWorkItem == 0);
+        (rowwise && row_width % elements_per_work_item == 0);
     if (!supported) {
         auto result = input.to(torch::kFloat32) *
             scale.to(input.device()).to(torch::kFloat32);
@@ -109,17 +126,57 @@ torch::Tensor dequantize_int8_fused(
     const auto* input_ptr = input.data_ptr<int8_t>();
     const auto* scale_ptr = scales.data_ptr<float>();
     if (out_dtype == torch::kFloat) {
-        dequantize_esimd_kernel(
-            input_ptr, scale_ptr, output.data_ptr<float>(), input.numel(),
-            row_width, rowwise, input.device());
+        if (use_b60) {
+            dequantize_esimd_kernel<
+                float,
+                device::B60KernelPolicy::int8_dequant_fp32_elements,
+                device::B60KernelPolicy::int8_dequant_fp32_work_group_size>(
+                    input_ptr, scale_ptr, output.data_ptr<float>(),
+                    input.numel(), row_width, rowwise, input.device());
+        } else {
+            dequantize_esimd_kernel<
+                float,
+                OMNI_INT8_DEQUANT_ELEMENTS_PER_WI,
+                64>(
+                    input_ptr, scale_ptr, output.data_ptr<float>(),
+                    input.numel(), row_width, rowwise, input.device());
+        }
     } else if (out_dtype == torch::kHalf) {
-        dequantize_esimd_kernel(
-            input_ptr, scale_ptr, reinterpret_cast<fp16*>(output.data_ptr()),
-            input.numel(), row_width, rowwise, input.device());
+        if (use_b60) {
+            dequantize_esimd_kernel<
+                fp16,
+                device::B60KernelPolicy::int8_dequant_fp16_elements,
+                device::B60KernelPolicy::int8_dequant_fp16_work_group_size>(
+                    input_ptr, scale_ptr,
+                    reinterpret_cast<fp16*>(output.data_ptr()),
+                    input.numel(), row_width, rowwise, input.device());
+        } else {
+            dequantize_esimd_kernel<
+                fp16,
+                OMNI_INT8_DEQUANT_ELEMENTS_PER_WI,
+                64>(
+                    input_ptr, scale_ptr,
+                    reinterpret_cast<fp16*>(output.data_ptr()),
+                    input.numel(), row_width, rowwise, input.device());
+        }
     } else {
-        dequantize_esimd_kernel(
-            input_ptr, scale_ptr, reinterpret_cast<bf16*>(output.data_ptr()),
-            input.numel(), row_width, rowwise, input.device());
+        if (use_b60) {
+            dequantize_esimd_kernel<
+                bf16,
+                device::B60KernelPolicy::int8_dequant_bf16_elements,
+                device::B60KernelPolicy::int8_dequant_bf16_work_group_size>(
+                    input_ptr, scale_ptr,
+                    reinterpret_cast<bf16*>(output.data_ptr()),
+                    input.numel(), row_width, rowwise, input.device());
+        } else {
+            dequantize_esimd_kernel<
+                bf16,
+                OMNI_INT8_DEQUANT_ELEMENTS_PER_WI,
+                64>(
+                    input_ptr, scale_ptr,
+                    reinterpret_cast<bf16*>(output.data_ptr()),
+                    input.numel(), row_width, rowwise, input.device());
+        }
     }
     return output;
 }

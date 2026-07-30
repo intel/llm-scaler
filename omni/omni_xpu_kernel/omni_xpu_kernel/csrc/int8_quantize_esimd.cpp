@@ -20,6 +20,10 @@
 #endif
 #include <type_traits>
 
+#if defined(OMNI_XPU_ARCH_BMG)
+#include "bmg_kernel_policy.h"
+#include "device_utils.h"
+#endif
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -862,6 +866,7 @@ std::tuple<torch::Tensor, torch::Tensor> fused_silu_mul_quantize_rowwise(
 #if defined(OMNI_XPU_ARCH_BMG)
 namespace {
 
+template<int GroupsPerDPAS, int WorkitemsPerRow>
 class QuantizeInt8ConvRotG16BMGKernel;
 
 inline bool convrot_h16_negative(int inner, int output) {
@@ -872,7 +877,9 @@ inline bool convrot_h16_negative(int inner, int output) {
 
 }  // namespace
 
-std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_g16_bmg(
+template<int GroupsPerDPAS, int WorkitemsPerRow>
+static std::tuple<torch::Tensor, torch::Tensor>
+quantize_int8_convrot_g16_bmg_policy(
     torch::Tensor input
 ) {
     TORCH_CHECK(input.device().is_xpu(), "input must be on XPU");
@@ -899,10 +906,6 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_g16_bmg(
     auto* scale_output = scales.data_ptr<float>();
 
     constexpr int GroupSize = 16;
-    constexpr int GroupsPerDPAS = 8;
-    // 210 G16 groups require 27 work-items. Avoiding five idle work-items
-    // measured faster than a power-of-two work-group on the traced BMG shapes.
-    constexpr int WorkitemsPerRow = 27;
     constexpr int MaximaSlots = 32;
     constexpr int CachedGroups = WorkitemsPerRow * GroupsPerDPAS;
     constexpr int RotatedBytes =
@@ -917,7 +920,10 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_g16_bmg(
         static_cast<size_t>(rows) * WorkitemsPerRow);
 
     auto command_group = [&](sycl::handler& handler) {
-        handler.parallel_for<QuantizeInt8ConvRotG16BMGKernel>(
+        handler.parallel_for<
+            QuantizeInt8ConvRotG16BMGKernel<
+                GroupsPerDPAS,
+                WorkitemsPerRow>>(
             sycl::nd_range<1>(global, local),
             [=](sycl::nd_item<1> item) [[intel::sycl_explicit_simd]] {
                 esimd::slm_init<SLMBytes>();
@@ -1004,11 +1010,10 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_g16_bmg(
                     esimd::overaligned<4>);
                 esimd::barrier();
 
-                // All 27 work-items read the same maxima vector and execute
-                // the same reduction order.  Replicating this small reduction
-                // avoids publishing inverse_scale through SLM and the second
-                // work-group barrier.  Only work-item 0 writes the public
-                // scale tensor.
+                // Every work-item reads the same maxima vector and executes
+                // the same reduction order. Replicating this small reduction
+                // avoids publishing inverse_scale through SLM and a second
+                // barrier. Only work-item 0 writes the public scale tensor.
                 const auto maxima =
                     esimd::slm_block_load<float, MaximaSlots>(
                         MaximaOffset);
@@ -1081,6 +1086,23 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_g16_bmg(
     auto scale_shape = input.sizes().vec();
     scale_shape.back() = 1;
     return {output, scales.reshape(scale_shape)};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_g16_bmg(
+    torch::Tensor input
+) {
+    TORCH_CHECK(input.device().is_xpu(), "input must be on XPU");
+    auto& queue = utils::get_queue(input.device());
+    if (device::use_b60_kernel_profile(queue)) {
+        return quantize_int8_convrot_g16_bmg_policy<
+            device::B60KernelPolicy::convrot_g16_groups_per_dpas,
+            device::B60KernelPolicy::convrot_g16_work_items_per_row>(
+                input);
+    }
+    return quantize_int8_convrot_g16_bmg_policy<
+        device::B70KernelPolicy::convrot_g16_groups_per_dpas,
+        device::B70KernelPolicy::convrot_g16_work_items_per_row>(
+            input);
 }
 #endif
 
