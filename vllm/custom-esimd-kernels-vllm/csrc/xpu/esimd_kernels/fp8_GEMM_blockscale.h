@@ -85,21 +85,27 @@ struct gemv_block_bmg_kernel {
     simd<float, MAX_M> acc = 0.0f;
 
     for (int k = ks; k < ks + kp; k += VL) {
-      // Load + dequant the weight slice once, fold in the per-128 block scale.
+      // Load + dequant the weight slice once. Apply each 128-wide block scale
+      // after its local dot product: this is algebraically identical to
+      // scaling every weight, but replaces 128 vector multiplies with one
+      // scalar multiply per block.
       simd<uint8_t, VL> raw = block_load<uint8_t, VL>(w_row + k);
       simd<float, VL> wf = fp8e4m3_to_fp16<VL>(raw);
-#pragma unroll
-      for (int sb = 0; sb < VL / BK; sb++) {
-        const float sc = s_row[(k / BK) + sb];
-        wf.template select<BK, 1>(sb * BK) = wf.template select<BK, 1>(sb * BK) * sc;
-      }
-      // Reuse the scaled weight across all M activation rows.
+      // Reuse the decoded weight across all M activation rows.
 #pragma unroll
       for (int m = 0; m < MAX_M; m++) {
         if (m < M) {
           simd<fp16, VL> iv = block_load<fp16, VL>(input + (size_t)m * K + k);
           simd<float, VL> ivf = iv;
-          acc[m] += reduce<float>(ivf * wf, std::plus<>());
+#pragma unroll
+          for (int sb = 0; sb < VL / BK; sb++) {
+            acc[m] +=
+                reduce<float>(
+                    ivf.template select<BK, 1>(sb * BK) *
+                        wf.template select<BK, 1>(sb * BK),
+                    std::plus<>()) *
+                s_row[(k / BK) + sb];
+          }
         }
       }
     }
@@ -239,13 +245,16 @@ struct gemv_block_fused2_bmg_kernel {
     for (int k = ks; k < ks + kp; k += VL) {
       simd<uint8_t, VL> raw = block_load<uint8_t, VL>(w_row + k);
       simd<float, VL> wf = fp8e4m3_to_fp16<VL>(raw);
+      simd<float, VL> iv = block_load<fp16, VL>(input + k);
 #pragma unroll
       for (int sb = 0; sb < VL / BK; sb++) {
-        const float sc = s_row[(k / BK) + sb];
-        wf.template select<BK, 1>(sb * BK) *= sc;
+        acc +=
+            reduce<float>(
+                iv.template select<BK, 1>(sb * BK) *
+                    wf.template select<BK, 1>(sb * BK),
+                std::plus<>()) *
+            s_row[(k / BK) + sb];
       }
-      simd<float, VL> iv = block_load<fp16, VL>(input + k);
-      acc += reduce<float>(iv * wf, std::plus<>());
     }
 
     if constexpr (K_SPLIT == 1) {
@@ -345,14 +354,22 @@ struct gemv_block_fp16_fused2_bmg_kernel {
         simd<uint8_t, VL> raw =
             block_load<uint8_t, VL>(weight0 + (size_t)n * K + k);
         wf = fp8e4m3_to_fp16<VL>(raw);
+      }
+      simd<float, VL> iv = block_load<fp16, VL>(input + k);
+      if (fp16_matrix) {
+        acc += reduce<float>(iv * wf, std::plus<>());
+      } else {
         const float* s_row = scale0 + (size_t)(n / 128) * Kb;
 #pragma unroll
         for (int sb = 0; sb < VL / 128; sb++) {
-          wf.template select<128, 1>(sb * 128) *= s_row[(k / 128) + sb];
+          acc +=
+              reduce<float>(
+                  iv.template select<128, 1>(sb * 128) *
+                      wf.template select<128, 1>(sb * 128),
+                  std::plus<>()) *
+              s_row[(k / 128) + sb];
         }
       }
-      simd<float, VL> iv = block_load<fp16, VL>(input + k);
-      acc += reduce<float>(iv * wf, std::plus<>());
     }
     fp16* output = fp16_matrix ? output1 : output0;
     if constexpr (K_SPLIT == 1) {
