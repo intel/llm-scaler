@@ -37,10 +37,14 @@ SYCL_ESIMD_FUNCTION inline simd<float, VL> fp8_dequant_norm(
     simd<uint16_t, VL> fp16_bits;
 
     if (fp8_mode == 0) {
-        simd<uint16_t, VL> fp8_exp  = (u16 >> 3) & 0xF;
-        simd<uint16_t, VL> fp8_mant = u16 & 0x7;
-        fp16_bits = (fp8_sign << 15) | ((fp8_exp + 8) << 10) | (fp8_mant << 7);
-        fp16_bits.merge(fp8_sign << 15, fp8_exp == 0);
+        u16 <<= 8;
+        simd<int16_t, VL> shifted =
+            u16.template bit_cast_view<int16_t>().read() >> 1;
+        fp16_bits =
+            shifted.template bit_cast_view<uint16_t>().read() & 0xBFFF;
+        simd<fp16, VL> wh =
+            fp16_bits.template bit_cast_view<fp16>().read();
+        return simd<float, VL>(wh * fp16(256.0f));
     } else {
         simd<uint16_t, VL> fp8_exp  = (u16 >> 2) & 0x1F;
         simd<uint16_t, VL> fp8_mant = u16 & 0x3;
