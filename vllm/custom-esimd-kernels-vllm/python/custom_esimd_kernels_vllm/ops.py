@@ -78,6 +78,16 @@ def esimd_gemv_fp16(
     return _ops.esimd_gemv_fp16(input, weight, output)
 
 
+def esimd_gemv_fp16_gelu_mul(
+    input: torch.Tensor, weight: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """Fused FP16 gate-up GEMV followed by GELU-tanh and elementwise multiply.
+
+    ``weight`` is ``[2 * N, K]`` with gate rows first and up rows second.
+    """
+    return _ops.esimd_gemv_fp16_gelu_mul(input, weight, output)
+
+
 def esimd_gemv_fp8_pert_fused2(
     input: torch.Tensor,
     w0: torch.Tensor, s0: torch.Tensor, o0: torch.Tensor,
@@ -586,6 +596,36 @@ def esimd_gdn_conv_fused_seq(
         A_log, dt_bias, ba,
         ssm_state, ssm_state_indices, output, z_out,
         N, H, HV, K, V, scale)
+
+
+def esimd_gdn_conv_fused_seq_spec(
+    qkvz: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor,
+    spec_state_indices: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    ba: torch.Tensor,
+    ssm_state: torch.Tensor,
+    output: torch.Tensor,
+    z_out: torch.Tensor,
+    token_indx: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    num_spec_decodes: int,
+    num_spec_tokens: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    scale: float,
+) -> torch.Tensor:
+    """Fused sequential GDN for speculative tokens with rollback states."""
+    return _ops.esimd_gdn_conv_fused_seq_spec(
+        qkvz, conv_state, conv_weight, conv_bias, spec_state_indices,
+        A_log, dt_bias, ba, ssm_state, output, z_out, token_indx,
+        num_accepted_tokens, num_spec_decodes, num_spec_tokens,
+        H, HV, K, V, scale)
 
 
 # ---- MoE Auxiliary Ops (doubleGRF, LGRF module) ----
@@ -1664,6 +1704,25 @@ def moe_forward_full_gelu_tanh(
     return _moe_batch.moe_forward_full_gelu_tanh(
         x, logits, gate_up_weight, gate_up_scale,
         down_weight, down_scale, top_k, n_routed_experts)
+
+
+def moe_forward_full_fp8_grouped(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    routing_weights: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    expert_tokens: torch.Tensor,
+    top_k: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """Full Gemma grouped FP8 forward with routing supplied externally."""
+    return _moe_batch.moe_forward_full_fp8_grouped(
+        x, gate_up_weight, gate_up_scale, down_weight, down_scale,
+        routing_weights, expert_offsets, expert_tokens, top_k,
+        n_routed_experts)
 
 
 def moe_forward_full_gelu_tanh_routed(
