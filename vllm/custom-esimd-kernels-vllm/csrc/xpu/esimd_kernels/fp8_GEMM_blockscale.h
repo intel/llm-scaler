@@ -34,52 +34,18 @@ namespace fp8_blockscale {
 #define BS_WE 4
 #define BS_WM 3
 
-// Vectorized fp8_e4m3 (fn) -> fp16 conversion (handles zero + subnormals; NaN
-// inputs are not expected in weights and are not special-cased). Mirrors the
-// bit manipulation in GEMV_a16_wfp8_block.
+// Branchless fp8_e4m3fn -> fp16 conversion used by the oneDNN JIT path.
+// Shifting the encoded byte into the fp16 subnormal range and multiplying by
+// 2^8 maps all finite E4M3 values exactly, including E4M3 subnormals.
 template <uint32_t N>
 inline simd<fp16, N> fp8e4m3_to_fp16(simd<uint8_t, N> x) {
-  constexpr uint16_t weo = 5;   // fp16 exponent bits
-  constexpr uint16_t wmo = 10;  // fp16 mantissa bits
-
-  // E4M3 has both +0 (0x00) and -0 (0x80). Ignore the sign bit when
-  // identifying zero, then preserve it in the FP16 result below.
-  auto is_zero = ((x & 0x7F) == 0);
-
-  simd<uint16_t, N> mantissa = x & ((1 << BS_WM) - 1);
-  simd<uint16_t, N> exponent = (x & 0x7F) >> BS_WM;
-
-  auto zero_exponent = (exponent == 0);
-  simd<uint16_t, N> mantissa_subnormal = mantissa;
-  simd<uint16_t, N> exponent_subnormal = exponent;
-  {
-    // Re-normalize subnormal fp8 mantissa: count leading zeros via the exponent
-    // of (float)mantissa, then shift into a normalized fp16 representation.
-    simd<uint16_t, N> vec = mantissa;
-    simd<float, N> vec_float = vec;
-    simd<uint32_t, N> vec_uint = vec_float.template bit_cast_view<uint32_t>();
-    simd<uint32_t, N> exponent_tmp = (vec_uint >> 23) & 0xFF;
-    simd<uint32_t, N> lz = 158 - exponent_tmp;  // 158 = 127 + 31
-    simd<uint16_t, N> renorm_shift = lz;
-
-    simd<uint16_t, N> sh = 1 + renorm_shift - (32 - BS_WM);
-    mantissa_subnormal <<= sh;
-    exponent_subnormal += 1 - sh;
-    mantissa_subnormal &= ((1 << BS_WM) - 1);
-  }
-
-  mantissa.merge(mantissa_subnormal, zero_exponent);
-  exponent.merge(exponent_subnormal, zero_exponent);
-
-  const uint16_t exp_low_cutoff = (1 << (weo - 1)) - (1 << (BS_WE - 1));
-  exponent += exp_low_cutoff;
-  mantissa <<= wmo - BS_WM;
-
-  simd<uint16_t, N> sign = x >> 7;
-  simd<uint16_t, N> retval = (sign << 15) | (exponent << 10) | mantissa;
-  retval.merge(sign << 15, is_zero);
-
-  return retval.template bit_cast_view<fp16>();
+  simd<uint16_t, N> u16 = convert<uint16_t>(x);
+  u16 <<= 8;
+  simd<int16_t, N> shifted =
+      u16.template bit_cast_view<int16_t>().read() >> 1;
+  u16 = shifted.template bit_cast_view<uint16_t>().read() & 0xBFFF;
+  simd<fp16, N> value = u16.template bit_cast_view<fp16>().read();
+  return value * fp16(256.0f);
 }
 
 // Block-scaled FP8 GEMV, BMG-tuned (modeled on GEMV_fp8_pert_bmg_kernel).
