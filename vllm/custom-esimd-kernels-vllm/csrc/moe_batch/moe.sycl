@@ -1670,14 +1670,14 @@ struct MoeBlockBuffers {
     int cached_device = -1;
 };
 
-// Capture and serving commonly alternate among 1..4 decode tokens. Keep one
-// persistent slot per token count so switching shapes does not reallocate all
+// Capture and serving commonly alternate among small decode token counts. Keep
+// one persistent slot per token count so switching shapes does not reallocate all
 // intermediate tensors. The memory cost is tiny for these decode-only buffers.
 // This cache follows vLLM's single model-compute-stream-per-TP-worker contract;
 // concurrent use from multiple compute streams is unsupported. If that
 // execution model changes, use per-stream caches rather than synchronizing the
 // decode hot path on every stream change.
-static thread_local std::array<MoeBlockBuffers, 8> s_block_buffers;
+static thread_local std::array<MoeBlockBuffers, 12> s_block_buffers;
 
 static MoeBlockBuffers& ensure_moe_block_buffers(
         int num_tokens, int top_k, int hidden_size, int intermediate_size,
@@ -1713,8 +1713,8 @@ torch::Tensor moe_forward_full_fp8_block(
     torch::Tensor shared_expert_gate_weight,
     int64_t top_k, int64_t num_shared_experts,
     int64_t n_routed_experts) {
-    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 8,
-                "moe_forward_full_fp8_block supports 1 to 8 tokens");
+    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 12,
+                "moe_forward_full_fp8_block supports 1 to 12 tokens");
     TORCH_CHECK(x.is_contiguous() && x.scalar_type() == torch::kHalf);
     const int num_tokens = x.size(0);
     TORCH_CHECK(logits.dim() == 2 && logits.size(0) == num_tokens &&

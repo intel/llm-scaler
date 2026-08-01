@@ -94,7 +94,7 @@ def main():
         for N in (1024, 5120, 6144):
             all_ok &= run_case(1, N, K, dev)      # decode
     # M>1 tiled path + remainder tile
-    for M in (2, 7, 8, 9, 33, 64):
+    for M in (2, 7, 8, 9, 10, 12, 33, 64):
         all_ok &= run_case(M, 5120, 5120, dev)
     # N not a multiple of PPG (scalar tail store path)
     all_ok &= run_case(1, 1000, 5120, dev)
