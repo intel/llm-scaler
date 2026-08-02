@@ -191,8 +191,9 @@ inline void dispatch_gemv_block_bmg(const fp16* input, const uint8_t* weight,
 #undef BS_DISPATCH
 }
 
-// Host launcher. block_n/block_k must be 128. Handles any M by tiling into
-// groups of TILE rows (weight is reloaded per tile but reused across the tile).
+// Host launcher. block_n/block_k must be 128. Keep decode batches through 12
+// rows in one launch so the weight is streamed once and reused across all rows.
+// Larger M is tiled in groups of eight to bound register pressure.
 inline void gemm_fp8_blockscale_host(const fp16* input, const uint8_t* weight,
                                      const float* weight_scale, fp16* output,
                                      uint32_t M, uint32_t N, uint32_t K,
@@ -201,6 +202,16 @@ inline void gemm_fp8_blockscale_host(const fp16* input, const uint8_t* weight,
   if (M == 1) {
     dispatch_gemv_block_bmg<1>(input, weight, weight_scale, output, 1, (int)N,
                                (int)K, q);
+    return;
+  }
+  if (M <= 8) {
+    dispatch_gemv_block_bmg<8>(input, weight, weight_scale, output, (int)M,
+                               (int)N, (int)K, q);
+    return;
+  }
+  if (M <= 12) {
+    dispatch_gemv_block_bmg<12>(input, weight, weight_scale, output, (int)M,
+                                (int)N, (int)K, q);
     return;
   }
   constexpr uint32_t TILE = 8;
