@@ -284,6 +284,7 @@ vllm serve \
     --disable-sliding-window \
     --gpu-memory-util=0.9 \
     --max-num-batched-tokens=8192 \
+    --disable-log-requests \
     --max-model-len=8192 \
     --block-size 64 \
     --quantization fp8 \
@@ -412,10 +413,9 @@ vllm serve \
     --disable-sliding-window \
     --gpu-memory-util=0.9 \
     --max-num-batched-tokens=8192 \
-    --disable-log-requests \
     --max-model-len=8192 \
     --block-size 64 \
-    -tp=1 \
+    -tp=2 \
     2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
 ```
 
