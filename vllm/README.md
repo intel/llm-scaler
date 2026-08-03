@@ -284,7 +284,6 @@ vllm serve \
     --disable-sliding-window \
     --gpu-memory-util=0.9 \
     --max-num-batched-tokens=8192 \
-    --disable-log-requests \
     --max-model-len=8192 \
     --block-size 64 \
     --quantization fp8 \
@@ -376,7 +375,6 @@ vllm serve \
     --gpu-memory-util=0.9 \
     --no-enable-prefix-caching \
     --max-num-batched-tokens=8192 \
-    --disable-log-requests \
     --max-model-len=8192 \
     --block-size 64 \
     --quantization sym_int4 \
@@ -442,7 +440,6 @@ vllm serve \
     --gpu-memory-util=0.9 \
     --no-enable-prefix-caching \
     --max-num-batched-tokens=2048 \
-    --disable-log-requests \
     --max-model-len=2048 \
     --block-size 64 \
     -tp=1
@@ -481,7 +478,6 @@ vllm serve \
     --gpu-memory-util=0.9 \
     --no-enable-prefix-caching \
     --max-num-batched-tokens=2048 \
-    --disable-log-requests \
     --max-model-len=2048 \
     --block-size 64 \
     -tp=1 \
@@ -534,7 +530,6 @@ vllm serve \
     --gpu-memory-util=0.9 \
     --no-enable-prefix-caching \
     --max-num-batched-tokens=5120 \
-    --disable-log-requests \
     --max-model-len=5120 \
     --block-size 64 \
     --quantization fp8 \
@@ -608,7 +603,6 @@ python3 -m vllm.entrypoints.openai.api_server \
     --gpu-memory-util=0.9 \
     --no-enable-prefix-caching \
     --max-num-batched-tokens=5120 \
-    --disable-log-requests \
     --max-model-len=5120 \
     --block-size 16 \
     --quantization fp8 \
@@ -654,7 +648,6 @@ vllm serve \
     --gpu-memory-util=0.9 \
     --no-enable-prefix-caching \
     --max-num-batched-tokens=5120 \
-    --disable-log-requests \
     --max-model-len=5120 \
     --block-size 64 \
     --quantization fp8 \
@@ -1003,7 +996,6 @@ vllm serve \
     --gpu-memory-util=0.9 \
     --no-enable-prefix-caching \
     --max-num-batched-tokens=8192 \
-    --disable-log-requests \
     --max-model-len=20000 \
     --block-size 64 \
     --served-model-name test \
@@ -1257,7 +1249,7 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 # or ```export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=0```
 export ZE_AFFINITY_MASK=0,1 # assuming use the first two Arc GPUs
 
-vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-tokens 8192 --max-model-len 40000 --block-size 64 --dtype float16 --model /llm/models/Qwen3.6-35B-A3B/ --served-model-name Qwen3.6-35B-A3B --tensor-parallel-size 2 --quantization fp8 --enforce-eager --trust-remote-code --disable-log-requests 
+vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-tokens 8192 --max-model-len 40000 --block-size 64 --dtype float16 --model /llm/models/Qwen3.6-35B-A3B/ --served-model-name Qwen3.6-35B-A3B --tensor-parallel-size 2 --quantization fp8 --enforce-eager --trust-remote-code
 ```
 
 For Int4, please use 
@@ -1334,7 +1326,7 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
 
-vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-tokens 8192 --max-model-len 20000 --block-size 64 --dtype float16 --model /llm/models/Qwen3.6-27B/ --served-model-name Qwen3.6-27B --tensor-parallel-size 2 --quantization fp8 --enforce-eager --trust-remote-code --disable-log-requests --enable-lora --lora-modules adapter1=/llm/models/adapter/adapter1 adapter2=/llm/models/adapter/adapter2 --max-loras 2 --max-lora-rank 128
+vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-tokens 8192 --max-model-len 20000 --block-size 64 --dtype float16 --model /llm/models/Qwen3.6-27B/ --served-model-name Qwen3.6-27B --tensor-parallel-size 2 --quantization fp8 --enforce-eager --trust-remote-code --enable-lora --lora-modules adapter1=/llm/models/adapter/adapter1 adapter2=/llm/models/adapter/adapter2 --max-loras 2 --max-lora-rank 128
 ```
 
 Example for Qwen3.6-35B-A3B with a single LoRA adapter:
@@ -1346,7 +1338,7 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
 
-vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-tokens 8192 --max-model-len 40000 --block-size 64 --dtype float16 --model /llm/models/Qwen3.6-35B-A3B/ --served-model-name Qwen3.6-35B-A3B --tensor-parallel-size 2 --quantization fp8 --enforce-eager --trust-remote-code --disable-log-requests --enable-lora --lora-modules adapter1=/llm/models/adapter/adapter1 --max-loras 1 --max-lora-rank 128
+vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-tokens 8192 --max-model-len 40000 --block-size 64 --dtype float16 --model /llm/models/Qwen3.6-35B-A3B/ --served-model-name Qwen3.6-35B-A3B --tensor-parallel-size 2 --quantization fp8 --enforce-eager --trust-remote-code --enable-lora --lora-modules adapter1=/llm/models/adapter/adapter1 --max-loras 1 --max-lora-rank 128
 ```
 
 Key LoRA parameters:
