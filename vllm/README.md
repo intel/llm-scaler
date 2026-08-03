@@ -396,7 +396,15 @@ To use fp8 online quantization, simply replace `--quantization sym_int4` with:
 --quantization fp8
 ```
 
-For those models that have been quantized before, such as AWQ-Int4/GPTQ-Int4/FP8 models, user do not need to specify the `--quantization` option.
+For pre-quantized models, such as AWQ-Int4, GPTQ-Int4, and Offline FP8 models, do not specify the `--quantization` option.
+
+To serve an Offline FP8 model, provide the model path directly. For example:
+
+```bash
+vllm serve --model /llm/models/Qwen3.6-27B-FP8 --trust-remote-code
+```
+
+Replace the model path with `/llm/models/Qwen3.6-35B-A3B-FP8` to serve that model.
 
 ---
 
