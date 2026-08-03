@@ -354,6 +354,7 @@ To enable online quantization using `llm-scaler-vllm`, specify the desired quant
 | **MXFP4** | `mxfp4` | Microscaling FP4 quantization | `gpt-oss-20b`, `gpt-oss-120b` only |
 | **Online FP8** | `fp8` | Dynamic FP8 quantization at runtime | All supported models |
 | **Online INT4** | `sym_int4` | Dynamic symmetric INT4 quantization at runtime | All supported models |
+| **Offline FP8** | Not required | Uses pre-quantized FP8 weights from the model | `Qwen3.6-27B-FP8`, `Qwen3.6-35B-A3B-FP8` |
 | **Pre-quantized AWQ** | Not required | Auto-detected from model config (`quantization_config.quant_method: awq`) | AWQ-quantized models |
 | **Pre-quantized GPTQ** | Not required | Auto-detected from model config (`quantization_config.quant_method: gptq`) | GPTQ-quantized models |
 
@@ -1120,6 +1121,8 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | Qwen/Qwen3-Coder-Next                      |  ✅  |         ✅         |                    |       |                           |
 | Qwen/Qwen3.6-27B                           |  ✅  |         ✅         |          ✅          |       | LoRA supported, see [LoRA Serving](#34-lora-adapter-serving). MTP supported, see [MTP Enable](#35-mtp-enable).|
 | Qwen/Qwen3.6-35B-A3B                       |  ✅  |         ✅         |          ✅          |       | LoRA supported, see [LoRA Serving](#34-lora-adapter-serving). MTP supported, see [MTP Enable](#35-mtp-enable).|
+| Qwen/Qwen3.6-27B-FP8                       |      |                    |                      |       | Pre-quantized offline FP8 model |
+| Qwen/Qwen3.6-35B-A3B-FP8                   |      |                    |                      |       | Pre-quantized offline FP8 model |
 | Qwen/Qwen3.5-122B-A10B                     |      |         ✅         |          ✅          |       |                           |
 | Qwen/QwQ-32B                               |  ✅  |         ✅         |          ✅          |       |                           |
 | mistralai/Ministral-8B-Instruct-2410       |  ✅  |         ✅         |          ✅          |       |                           |
