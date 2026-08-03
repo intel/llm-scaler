@@ -1118,8 +1118,8 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | Qwen/Qwen3-235B-A22B                       |      |         ✅         |                      |       |                           |
 | Qwen/Qwen3-Coder-30B-A3B-Instruct          |  ✅  |         ✅         |          ✅          |       |                           |
 | Qwen/Qwen3-Coder-Next                      |  ✅  |         ✅         |                    |       |                           |
-| Qwen/Qwen3.6-27B                           |  ✅  |         ✅         |          ✅          |       | LoRA supported, see [LoRA Serving](#34-lora-adapter-serving) |
-| Qwen/Qwen3.6-35B-A3B                       |  ✅  |         ✅         |          ✅          |       | LoRA supported, see [LoRA Serving](#34-lora-adapter-serving) |
+| Qwen/Qwen3.6-27B                           |  ✅  |         ✅         |          ✅          |       | LoRA supported, see [LoRA Serving](#34-lora-adapter-serving). MTP supported, see [MTP Enable](#35-mtp-enable).|
+| Qwen/Qwen3.6-35B-A3B                       |  ✅  |         ✅         |          ✅          |       | LoRA supported, see [LoRA Serving](#34-lora-adapter-serving). MTP supported, see [MTP Enable](#35-mtp-enable).|
 | Qwen/Qwen3.5-122B-A10B                     |      |         ✅         |          ✅          |       |                           |
 | Qwen/QwQ-32B                               |  ✅  |         ✅         |          ✅          |       |                           |
 | mistralai/Ministral-8B-Instruct-2410       |  ✅  |         ✅         |          ✅          |       |                           |
@@ -1156,8 +1156,8 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | google/gemma-3-12b-it                      |      |         ✅         |                      |       |  use bfloat16  |
 | google/gemma-3-27b-it                      |      |         ✅         |                      |       |  use bfloat16  |
 | google/gemma-4-12B-it                      |      |         ✅         |          ✅         |       | see [Reference Commands](#33-reference-commands-for-running-gemma-4-models-and-diffusiongemma)     |
-| google/gemma-4-31B-it                      |      |         ✅         |          ✅         |       |                            |
-| google/gemma-4-26B-A4B-it                  |      |         ✅         |          ✅         |       |                            |
+| google/gemma-4-31B-it                      |      |         ✅         |          ✅         |       |  MTP supported, see [MTP Enable](#35-mtp-enable).                          |
+| google/gemma-4-26B-A4B-it                  |      |         ✅         |          ✅         |       |      MTP supported, see [MTP Enable](#35-mtp-enable).                      |
 | google/diffusiongemma-26B-A4B-it           |      |         ✅         |          ✅         |       | see [Reference Commands](#33-reference-commands-for-running-gemma-4-models-and-diffusiongemma)                            |
 | THUDM/GLM-4v-9B                            |  ✅  |         ✅         |          ✅         |       |  with --hf-overrides and chat_template  |
 | zai-org/GLM-4.1V-9B-Base                   |  ✅  |         ✅         |          ✅          |       |                           |
@@ -1360,6 +1360,42 @@ List currently registered models:
 ```bash
 curl http://localhost:8000/v1/models
 ```
+
+
+### 3.5 MTP Enable
+
+MTP is a speculative decoding method where the target model includes native
+multi-token prediction capability. Unlike draft-model-based methods, you do not
+need to provide a separate draft model.
+
+MTP is useful when:
+
+- Your model natively supports MTP.
+- You want model-based speculative decoding with minimal extra configuration.
+
+**Supported models:** Currently verified with `Qwen3.6-27B` and `Qwen3.6-35B-A3B` and `gemma-4-26B-A4B-it` and `gemma-4-31B-it` models.
+
+#### Qwen Assistant Models
+
+Use `"method": "qwen3_5_mtp"` when serving Qwen MTP:
+
+```bash
+    --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":2}'
+```
+
+#### Gemma 4 Assistant Models
+
+Gemma 4 assistant checkpoints use vLLM's Gemma 4 MTP path. You need to download draft_model first.
+
+Use `"method": "gemma4_mtp"` when serving Gemma 4 with an assistant checkpoint:
+
+```bash
+    --speculative-config '{"method":"gemma4_mtp","model":"/path/to/gemma-4-31B-it-assistant","num_speculative_tokens":2}'
+```
+
+
+You can profile performance by tuning `num_speculative_tokens` from 2 to 5. Adjust this based on your workload.
+
 
 ## 4. Troubleshooting
 
