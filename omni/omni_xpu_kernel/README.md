@@ -14,6 +14,7 @@ across those native ABI boundaries.
 | `sdp` | ESIMD scaled dot-product attention |
 | `cute` | CUTLASS-SYCL fused attention |
 | `cute.sdp_bhld_d128` | BMG batched/rectangular D128 BHLD attention |
+| `cute.sdp_minimax_h3_vae_d64` | Structural BMG MiniMax H3 VideoVAE D64 tile attention |
 | `cute.sdp_wan22_cross` | Exact BMG Wan 2.2 14B T2V Turbo cross-attention |
 | `linear` | oneDNN FP8 weight-only GEMM |
 | `fp8` | FP8 quantization, dequantization, and stochastic rounding |
@@ -236,10 +237,14 @@ if cute is not None and cute.is_available():
 if cute is not None and cute.supports_d120_bhld():
     output = cute.sdp_bhld_d120(q_bhld, k_bhld, v_bhld)
 
-# BMG wheels expose batched self/cross attention for dense packed-BHLD or
-# BLHD-backed BHLD D128 tensors.
+# BMG wheels expose batched self/cross attention for dense packed-BHLD,
+# BLHD-backed BHLD, or the B1/H56 MiniMax H3 QKV-backed D128 layout.
 if cute is not None and cute.supports_d128_bhld():
     output = cute.sdp_bhld_d128(q_bhld, k_bhld, v_bhld)
+
+# BMG wheels expose the structural MiniMax H3 VideoVAE FP16 D64 tile family.
+if cute is not None and cute.supports_minimax_h3_vae_d64():
+    output = cute.sdp_minimax_h3_vae_d64(q_bhld, k_bhld, v_bhld)
 
 # BMG wheels expose the exact official Wan 2.2 14B T2V Turbo 720p
 # tuned cross-attention contract separately from the general BHLD API.
@@ -250,8 +255,9 @@ if cute is not None and cute.supports_wan22_cross():
 The legacy BLHD `cute.sdp` entry point accepts unmasked self-attention with
 `B=1`. The BMG `cute.sdp_bhld_d128` entry point accepts positive batch, head,
 query-length, and key/value-length dimensions; matching Q/K/V batch, head,
-dtype, and head dimension; dense packed-BHLD or BLHD-backed BHLD layouts; D128;
-standard `1/sqrt(head_dim)` scaling; and FP16 or BF16. Neither entry point
+dtype, and head dimension; dense packed-BHLD, BLHD-backed BHLD, or the B1/H56
+MiniMax H3 QKV-backed layout; D128; standard `1/sqrt(head_dim)` scaling; and
+FP16 or BF16. Neither entry point
 accepts masks, causal mode, GQA, or custom scaling. API capability does not
 imply that every shape is faster than PyTorch; callers must retain a
 performance-qualified fallback policy.
@@ -260,6 +266,12 @@ performance-qualified fallback policy.
 dense FP16 BMG tensors with Q `[1, 75600, 40, 128]` and K/V
 `[1, 512, 40, 128]`; other structurally supported BHLD contracts use
 `sdp_bhld_d128`.
+
+`sdp_minimax_h3_vae_d64` accepts the MiniMax H3 VideoVAE tile family: FP16
+Q/K/V `[1, 32, S, 64]`, where `S` varies with the decoder's temporal and
+spatial tile extent. Q/K use the runtime-derived `H*D` sequence stride and V
+retains the three-wide QKV projection stride. Other D64 layouts remain with
+the caller's fallback.
 
 ### Quantized linear operations
 

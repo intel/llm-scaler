@@ -100,7 +100,8 @@ template <
     int PipelineStagesOverride = 0,
     int QTileOverride = 0,
     int SubgroupLayoutQOverride = 0,
-    int MmaKOverride = 0>
+    int MmaKOverride = 0,
+    int HeadDimOverride = 0>
 struct D128TileKernel {
   using PlatformConfig = cute_fmha_config::ActiveConfig;
   static constexpr int QTile =
@@ -111,6 +112,8 @@ struct D128TileKernel {
           : PlatformConfig::SUBGROUP_LAYOUT_Q;
   static constexpr int MmaK =
       MmaKOverride > 0 ? MmaKOverride : PlatformConfig::MMA_K;
+  static constexpr int HeadDim =
+      HeadDimOverride > 0 ? HeadDimOverride : PlatformConfig::HEAD_DIM;
 #if defined(CUTE_FMHA_KV64)
   // KV tile = get<1>(ShapeQK) = 64. Per get_tiled_mma_pv, the PV tile must be
   // <TileQ, TileV, KVtile> — so ShapePV's K-dim (3rd) MUST equal 64, not 32.
@@ -125,7 +128,7 @@ struct D128TileKernel {
   using ShapePV = Shape<
       Int<QTile>, Int<PlatformConfig::V_TILE>, Int<KvTile>>;
   using ShapeOutput = Shape<
-      Int<QTile>, Int<PlatformConfig::HEAD_DIM>>;
+      Int<QTile>, Int<HeadDim>>;
   using SubgroupLayoutQK = Layout<
       Shape<Int<SubgroupLayoutQ>, _1, _1>>;
 #ifdef CUTE_FMHA_STAGES
@@ -194,7 +197,8 @@ template <
     int PipelineStagesOverride = 0,
     int QTileOverride = 0,
     int SubgroupLayoutQOverride = 0,
-    int MmaKOverride = 0>
+    int MmaKOverride = 0,
+    int HeadDimOverride = 0>
 void run_d128_tile(
     const void* q_ptr, const void* k_ptr, const void* v_ptr, void* o_ptr,
     int B, int H, int Lq, int Lkv, int D, float scale,
@@ -209,7 +213,8 @@ void run_d128_tile(
       PipelineStagesOverride,
       QTileOverride,
       SubgroupLayoutQOverride,
-      MmaKOverride>;
+      MmaKOverride,
+      HeadDimOverride>;
   using K    = typename KT::Kernel;
   using PS   = typename KT::ProblemShapeType;
 
@@ -408,15 +413,21 @@ at::Tensor sdp_wan22_cross(
 
 #if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
 bool is_supported_bhld_layout(
-    const at::Tensor& tensor, int64_t H, int64_t L, int64_t D) {
-  if (tensor.stride(3) != 1 || tensor.stride(0) != H * L * D) {
+    const at::Tensor& tensor, int64_t B, int64_t H, int64_t L, int64_t D) {
+  if (tensor.stride(3) != 1) {
     return false;
   }
+  const bool dense_batch_stride = tensor.stride(0) == H * L * D;
   const bool packed_bhld =
       tensor.stride(1) == L * D && tensor.stride(2) == D;
   const bool blhd_backed =
       tensor.stride(1) == D && tensor.stride(2) == H * D;
-  return packed_bhld || blhd_backed;
+  const bool minimax_h3_qkv_backed =
+      B == 1 && H == 56 && D == 128 && tensor.stride(0) > 0 &&
+      tensor.stride(1) == D &&
+      (tensor.stride(2) == H * D || tensor.stride(2) == 3 * H * D);
+  return (dense_batch_stride && (packed_bhld || blhd_backed)) ||
+      minimax_h3_qkv_backed;
 }
 
 #if defined(OMNI_XPU_ARCH_BMG)
@@ -447,11 +458,11 @@ at::Tensor sdp_bhld_d128(
       "cute_fmha: D128 attention requires matching B/H/D and K/V lengths (got ",
       k.sizes(), " and ", v.sizes());
   TORCH_CHECK(
-      is_supported_bhld_layout(q, H, Lq, D) &&
-          is_supported_bhld_layout(k, H, Lkv, D) &&
-          is_supported_bhld_layout(v, H, Lkv, D),
+      is_supported_bhld_layout(q, B, H, Lq, D) &&
+          is_supported_bhld_layout(k, B, H, Lkv, D) &&
+          is_supported_bhld_layout(v, B, H, Lkv, D),
       "cute_fmha: D128 attention requires dense packed-BHLD or "
-      "BLHD-backed tensors");
+      "BLHD-backed tensors, or the B1/H56 MiniMax H3 QKV layout");
 
   const bool q_is_packed_bhld =
       q.stride(1) == static_cast<int64_t>(Lq) * D &&
@@ -482,6 +493,50 @@ at::Tensor sdp_bhld_d128(
   }
   return output;
 }
+
+at::Tensor sdp_minimax_h3_vae_d64(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+  TORCH_CHECK(
+      q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+      "cute_fmha: MiniMax H3 VAE attention expects BHLD tensors");
+  TORCH_CHECK(
+      q.device().is_xpu() && k.device() == q.device() && v.device() == q.device(),
+      "cute_fmha: MiniMax H3 VAE attention requires one XPU device");
+  TORCH_CHECK(
+      q.scalar_type() == at::kHalf && k.scalar_type() == at::kHalf &&
+          v.scalar_type() == at::kHalf,
+      "cute_fmha: MiniMax H3 VAE attention requires FP16 Q/K/V");
+  constexpr int B = 1;
+  constexpr int H = 32;
+  constexpr int D = 64;
+  const int L = checked_int(q.size(2), "MiniMax H3 VAE sequence length");
+  TORCH_CHECK(
+      q.sizes() == at::IntArrayRef({B, H, L, D}) &&
+          k.sizes() == q.sizes() && v.sizes() == q.sizes() && L > 5,
+      "cute_fmha: unsupported MiniMax H3 VAE attention shapes");
+  const int64_t qk_batch_stride = static_cast<int64_t>(L) * H * D;
+  const int64_t v_batch_stride = 3 * qk_batch_stride;
+  const auto has_qk_layout = [qk_batch_stride](const at::Tensor& tensor) {
+    return tensor.stride(0) == qk_batch_stride && tensor.stride(1) == D &&
+        tensor.stride(2) == H * D && tensor.stride(3) == 1;
+  };
+  const bool has_v_layout =
+      v.stride(0) == v_batch_stride && v.stride(1) == 3 * D &&
+      v.stride(2) == 3 * H * D && v.stride(3) == 1;
+  TORCH_CHECK(
+      has_qk_layout(q) && has_qk_layout(k) && has_v_layout,
+      "cute_fmha: unsupported MiniMax H3 VAE Q/K/V layout");
+
+  at::Tensor output =
+      at::empty({B, L, H, D}, q.options()).permute({0, 2, 1, 3});
+  const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+  run_d128_tile<cutlass::half_t, 0, 0, 0, 0, 64>(
+      q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(), B, H, L, L,
+      D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+      k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+      output.stride(2), output.stride(1), output.stride(0));
+  return output;
+}
 #endif
 
 at::Tensor sdp_bhld_d120(
@@ -501,9 +556,9 @@ at::Tensor sdp_bhld_d120(
   TORCH_CHECK(D == 120, "cute_fmha: D120 BHLD requires head_dim==120");
   TORCH_CHECK(k.sizes() == q.sizes() && v.sizes() == q.sizes(),
               "cute_fmha: D120 BHLD requires matching self-attention Q/K/V");
-  TORCH_CHECK(is_supported_bhld_layout(q, H, L, D) &&
-                  is_supported_bhld_layout(k, H, L, D) &&
-                  is_supported_bhld_layout(v, H, L, D),
+  TORCH_CHECK(is_supported_bhld_layout(q, B, H, L, D) &&
+                  is_supported_bhld_layout(k, B, H, L, D) &&
+                  is_supported_bhld_layout(v, B, H, L, D),
               "cute_fmha: D120 BHLD requires dense packed-BHLD or BLHD-backed tensors");
 
   // BLHD storage exposed as BHLD matches Torch SDPA's output strides. The
@@ -567,23 +622,31 @@ at::Tensor sdp_bhld_d120(
   m.def("sdp_bhld_d128(Tensor q, Tensor k, Tensor v) -> Tensor");
 #define CUTE_FMHA_BHLD_D128_IMPL(m) \
   m.impl("sdp_bhld_d128", &sdp_bhld_d128);
+#define CUTE_FMHA_H3_VAE_D64_DEF(m) \
+  m.def("sdp_minimax_h3_vae_d64(Tensor q, Tensor k, Tensor v) -> Tensor");
+#define CUTE_FMHA_H3_VAE_D64_IMPL(m) \
+  m.impl("sdp_minimax_h3_vae_d64", &sdp_minimax_h3_vae_d64);
 #else
 #define CUTE_FMHA_WAN22_DEF(m)
 #define CUTE_FMHA_WAN22_IMPL(m)
 #define CUTE_FMHA_BHLD_D128_DEF(m)
 #define CUTE_FMHA_BHLD_D128_IMPL(m)
+#define CUTE_FMHA_H3_VAE_D64_DEF(m)
+#define CUTE_FMHA_H3_VAE_D64_IMPL(m)
 #endif
 #define CUTE_FMHA_LIB_(NS) \
   TORCH_LIBRARY(NS, m) { \
     m.def("sdp(Tensor q, Tensor k, Tensor v) -> Tensor"); \
     CUTE_FMHA_WAN22_DEF(m) \
     CUTE_FMHA_BHLD_D128_DEF(m) \
+    CUTE_FMHA_H3_VAE_D64_DEF(m) \
     CUTE_FMHA_D120_DEF(m) \
   } \
   TORCH_LIBRARY_IMPL(NS, XPU, m) { \
     m.impl("sdp", &sdp); \
     CUTE_FMHA_WAN22_IMPL(m) \
     CUTE_FMHA_BHLD_D128_IMPL(m) \
+    CUTE_FMHA_H3_VAE_D64_IMPL(m) \
     CUTE_FMHA_D120_IMPL(m) \
   }
 #define CUTE_FMHA_LIB(NS) CUTE_FMHA_LIB_(NS)

@@ -124,6 +124,8 @@ def _load_patch(
     d120_capable=True,
     d128_bhld_capable=True,
     d128_bhld_error=None,
+    h3_vae_d64_capable=True,
+    h3_vae_d64_error=None,
 ):
     monkeypatch.setenv("OMNI_ATTN_BACKEND", backend)
     monkeypatch.setattr(torch, "__version__", torch_version)
@@ -197,6 +199,17 @@ def _load_patch(
             assert q.shape[-1] == k.shape[-1] == v.shape[-1] == 128
             if d128_bhld_error is not None:
                 raise d128_bhld_error
+            return q
+
+        @staticmethod
+        def supports_minimax_h3_vae_d64():
+            return h3_vae_d64_capable
+
+        @staticmethod
+        def sdp_minimax_h3_vae_d64(q, k, v):
+            calls.append("cute_h3_vae_d64")
+            if h3_vae_d64_error is not None:
+                raise h3_vae_d64_error
             return q
 
         @staticmethod
@@ -423,6 +436,65 @@ def test_bmg_b1_self_keeps_legacy_cute_route(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("seq", "qk_stride", "v_stride"),
+    [
+        (31, (7168, 128, 21504, 1), (7168, 128, 21504, 1)),
+        (255, (7168, 128, 21504, 1), (7168, 128, 21504, 1)),
+        (388, (7168, 128, 7168, 1), (7168, 128, 21504, 1)),
+        (1025, (7168, 128, 21504, 1), (7168, 128, 21504, 1)),
+        (15787, (7168, 128, 21504, 1), (7168, 128, 21504, 1)),
+    ],
+)
+def test_bmg_minimax_h3_h56_uses_direct_qkv_bhld_cute(
+    monkeypatch, seq, qk_stride, v_stride
+):
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=seq, heads=56, stride=qk_stride)
+    k = _FakeTensor(seq=seq, heads=56, stride=qk_stride)
+    v = _FakeTensor(seq=seq, heads=56, stride=v_stride)
+
+    result = attention.optimized_attention(
+        q,
+        k,
+        v,
+        heads=56,
+        skip_reshape=True,
+    )
+
+    assert isinstance(result, _FakeTensor)
+    assert calls == ["cute_d128_bhld"]
+    assert patch.get_stats()["fallback"] == 0
+    assert patch.get_stats()["routes"] == {
+        "minimax_h3_h56_bf16_d128_qkv_bhld": 1
+    }
+
+
+@pytest.mark.parametrize(
+    ("seq", "stride"),
+    [
+        (30, (7168, 128, 21504, 1)),
+        (15787, (7168, 128, 7169, 1)),
+    ],
+)
+def test_bmg_minimax_h3_h56_rejects_unvalidated_contract(
+    monkeypatch, seq, stride
+):
+    _, attention, calls = _load_patch(monkeypatch, target="bmg")
+    tensor = _FakeTensor(seq=seq, heads=56, stride=stride)
+
+    result = attention.optimized_attention(
+        tensor,
+        tensor,
+        tensor,
+        heads=56,
+        skip_reshape=True,
+    )
+
+    assert isinstance(result, _FakeTensor)
+    assert calls == ["cute"]
+
+
+@pytest.mark.parametrize(
     ("target", "torch_version", "capable", "q_len", "kv_len"),
     [
         ("ptl-h", "2.11.0+xpu", True, 3520, 3520),
@@ -570,6 +642,154 @@ def test_auto_d64_uses_torch_not_esimd(monkeypatch):
     assert patch.get_stats()["cute"] == 0
     assert patch.get_stats()["esimd"] == 0
     assert patch.get_stats()["fallback"] == 1
+
+
+@pytest.mark.parametrize("seq", [6, 12, 261, 453, 901, 1797])
+def test_bmg_minimax_h3_video_vae_d64_uses_structural_cute(
+    monkeypatch, seq
+):
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(
+        seq=seq,
+        heads=32,
+        dim_head=64,
+        dtype=torch.float16,
+        stride=(seq * 2048, 64, 2048, 1),
+    )
+    k = _FakeTensor(
+        seq=seq,
+        heads=32,
+        dim_head=64,
+        dtype=torch.float16,
+        stride=(seq * 2048, 64, 2048, 1),
+    )
+    v = _FakeTensor(
+        seq=seq,
+        heads=32,
+        dim_head=64,
+        dtype=torch.float16,
+        stride=(seq * 6144, 192, 6144, 1),
+    )
+
+    result = attention.optimized_attention(
+        q, k, v, heads=32, skip_reshape=True
+    )
+
+    assert isinstance(result, _FakeTensor)
+    assert calls == ["cute_h3_vae_d64"]
+    assert patch.get_stats()["fallback"] == 0
+    assert patch.get_stats()["routes"] == {
+        "minimax_h3_video_vae_fp16_d64": 1
+    }
+
+
+def test_bmg_minimax_h3_video_vae_d64_rejects_wrong_v_stride(monkeypatch):
+    _, attention, calls = _load_patch(monkeypatch, target="bmg")
+    tensor = _FakeTensor(
+        seq=1797,
+        heads=32,
+        dim_head=64,
+        dtype=torch.float16,
+        stride=(3680256, 64, 2048, 1),
+    )
+
+    result = attention.optimized_attention(
+        tensor, tensor, tensor, heads=32, skip_reshape=True
+    )
+
+    assert result == "torch-output"
+    assert calls == ["torch"]
+
+
+def test_bmg_minimax_h3_video_vae_d64_rejects_non_tile_sequence(
+    monkeypatch,
+):
+    _, attention, calls = _load_patch(monkeypatch, target="bmg")
+    seq = 5
+    q = _FakeTensor(
+        seq=seq,
+        heads=32,
+        dim_head=64,
+        dtype=torch.float16,
+        stride=(seq * 2048, 64, 2048, 1),
+    )
+    v = _FakeTensor(
+        seq=seq,
+        heads=32,
+        dim_head=64,
+        dtype=torch.float16,
+        stride=(seq * 6144, 192, 6144, 1),
+    )
+
+    result = attention.optimized_attention(
+        q, q, v, heads=32, skip_reshape=True
+    )
+
+    assert result == "torch-output"
+    assert calls == ["torch"]
+
+
+def test_bmg_minimax_h3_video_vae_d64_quarantines_runtime_failure(
+    monkeypatch,
+):
+    patch, attention, calls = _load_patch(
+        monkeypatch,
+        target="bmg",
+        h3_vae_d64_error=RuntimeError("candidate failed"),
+    )
+    seq = 453
+    q = _FakeTensor(
+        seq=seq,
+        heads=32,
+        dim_head=64,
+        dtype=torch.float16,
+        stride=(seq * 2048, 64, 2048, 1),
+    )
+    v = _FakeTensor(
+        seq=seq,
+        heads=32,
+        dim_head=64,
+        dtype=torch.float16,
+        stride=(seq * 6144, 192, 6144, 1),
+    )
+
+    for _ in range(2):
+        result = attention.optimized_attention(
+            q, q, v, heads=32, skip_reshape=True
+        )
+        assert result == "torch-output"
+
+    assert calls == ["cute_h3_vae_d64", "torch", "torch"]
+    assert patch.get_stats()["fallback"] == 2
+
+
+def test_attention_contract_trace_records_exact_layout_once(
+    monkeypatch, caplog
+):
+    caplog.set_level("INFO", logger="ComfyUI-OmniXPU")
+    monkeypatch.setenv("OMNI_ATTN_TRACE_CONTRACTS", "1")
+    _, attention, calls = _load_patch(monkeypatch, target="bmg")
+    tensor = _FakeTensor(
+        seq=1797,
+        heads=32,
+        dim_head=64,
+        dtype=torch.float16,
+    )
+
+    for _ in range(2):
+        result = attention.optimized_attention(
+            tensor,
+            tensor,
+            tensor,
+            heads=32,
+            skip_reshape=True,
+        )
+        assert result == "torch-output"
+
+    assert calls == ["torch", "torch"]
+    assert caplog.text.count("[OmniXPU] attention contract:") == 1
+    assert "heads=32" in caplog.text
+    assert "q=(1, 32, 1797, 64)/(3680256, 64, 2048, 1)/blhd_backed" in caplog.text
 
 
 @pytest.mark.parametrize(

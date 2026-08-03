@@ -14,6 +14,10 @@ _attention_fallback_reasons = {}
 _attention_route_counts = {}
 _attention_failed_contracts = set()
 _attention_experimental_warning_emitted = False
+_attention_traced_contracts = set()
+
+_MINIMAX_H3_H56_CUTE_MIN_SEQUENCE = 31
+_MINIMAX_H3_VAE_D64_CUTE_MIN_SEQUENCE = 6
 
 # ── Attention backend selection ──────────────────────────────────────────────
 # OMNI_ATTN_BACKEND selects which attention routing policy the patched ComfyUI
@@ -41,6 +45,102 @@ def _record_attention_route(route):
     count = _attention_route_counts.get(route, 0) + 1
     _attention_route_counts[route] = count
     return count
+
+
+def _attention_tensor_contract(tensor):
+    return (
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        str(tensor.dtype),
+        str(tensor.device),
+    )
+
+
+def _attention_layout(tensor):
+    shape = tuple(tensor.shape)
+    stride = tuple(tensor.stride())
+    if len(shape) != 4 or len(stride) != 4 or stride[3] != 1:
+        return "other"
+    _, heads, seq, dim_head = shape
+    if stride[1] == seq * dim_head and stride[2] == dim_head:
+        return "packed_bhld"
+    if stride[1] == dim_head and stride[2] == heads * dim_head:
+        return "blhd_backed"
+    return "strided_bhld"
+
+
+def _attention_caller():
+    import inspect
+
+    frame = inspect.currentframe()
+    try:
+        frame = frame.f_back if frame is not None else None
+        while frame is not None:
+            module = frame.f_globals.get("__name__", "")
+            if (
+                module != __name__
+                and module != "comfy.ldm.modules.attention"
+                and (
+                    module.startswith("comfy.")
+                    or module.startswith("custom_nodes.")
+                )
+            ):
+                return f"{module}:{frame.f_code.co_name}:{frame.f_lineno}"
+            frame = frame.f_back
+    finally:
+        del frame
+    return "unknown"
+
+
+def _trace_attention_contract(
+    q,
+    k,
+    v,
+    heads,
+    mask,
+    skip_reshape,
+    skip_output_reshape,
+):
+    if os.environ.get("OMNI_ATTN_TRACE_CONTRACTS", "0") not in {
+        "1",
+        "true",
+        "yes",
+    }:
+        return
+    contract = (
+        _attention_tensor_contract(q),
+        _attention_tensor_contract(k),
+        _attention_tensor_contract(v),
+        int(heads),
+        mask is not None,
+        bool(skip_reshape),
+        bool(skip_output_reshape),
+    )
+    if contract in _attention_traced_contracts:
+        return
+    _attention_traced_contracts.add(contract)
+    log.info(
+        "[OmniXPU] attention contract: caller=%s heads=%d "
+        "q=%s/%s/%s k=%s/%s/%s v=%s/%s/%s "
+        "dtype=%s device=%s mask=%s skip_reshape=%s "
+        "skip_output_reshape=%s",
+        _attention_caller(),
+        heads,
+        tuple(q.shape),
+        tuple(q.stride()),
+        _attention_layout(q) if skip_reshape else "bld",
+        tuple(k.shape),
+        tuple(k.stride()),
+        _attention_layout(k) if skip_reshape else "bld",
+        tuple(v.shape),
+        tuple(v.stride()),
+        _attention_layout(v) if skip_reshape else "bld",
+        q.dtype,
+        q.device,
+        mask is not None,
+        skip_reshape,
+        skip_output_reshape,
+    )
 
 
 def _torch_major_minor():
@@ -101,6 +201,78 @@ def _is_dense_bhld(tensor, batch, heads, seq, dim_head):
     packed_bhld = strides[1] == seq * dim_head and strides[2] == dim_head
     blhd_backed = strides[1] == dim_head and strides[2] == heads * dim_head
     return packed_bhld or blhd_backed
+
+
+def _is_minimax_h3_h56_bhld(tensor, seq):
+    try:
+        shape = tuple(tensor.shape)
+        strides = tuple(tensor.stride())
+    except (AttributeError, TypeError):
+        return False
+    head_width = 56 * 128
+    return (
+        shape == (1, 56, seq, 128)
+        and len(strides) == 4
+        and strides[0] > 0
+        and strides[1] == 128
+        and strides[2] in (head_width, 3 * head_width)
+        and strides[3] == 1
+    )
+
+
+def _is_minimax_h3_vae_d64_bhld(tensor, seq, *, value):
+    try:
+        shape = tuple(tensor.shape)
+        strides = tuple(tensor.stride())
+    except (AttributeError, TypeError):
+        return False
+    sequence_stride = 32 * (3 * 64 if value else 64)
+    head_stride = 3 * 64 if value else 64
+    return (
+        shape == (1, 32, seq, 64)
+        and strides
+        == (seq * sequence_stride, head_stride, sequence_stride, 1)
+    )
+
+
+def _use_bmg_minimax_h3_vae_d64(
+    q,
+    k,
+    v,
+    b,
+    heads,
+    dim_head,
+    q_len,
+    kv_len,
+    skip_reshape,
+    skip_output_reshape,
+):
+    capability = getattr(
+        _backend_sdp, "supports_minimax_h3_vae_d64", None
+    )
+    return (
+        _backend_name == "cute"
+        and _omni_xpu_target() == "bmg"
+        and _torch_major_minor() == (2, 11)
+        and callable(capability)
+        and capability()
+        and q.dtype == torch.float16
+        and k.dtype == q.dtype
+        and v.dtype == q.dtype
+        and q.device.type == "xpu"
+        and k.device == q.device
+        and v.device == q.device
+        and b == 1
+        and heads == 32
+        and dim_head == 64
+        and q_len == kv_len
+        and q_len >= _MINIMAX_H3_VAE_D64_CUTE_MIN_SEQUENCE
+        and skip_reshape
+        and not skip_output_reshape
+        and _is_minimax_h3_vae_d64_bhld(q, q_len, value=False)
+        and _is_minimax_h3_vae_d64_bhld(k, q_len, value=False)
+        and _is_minimax_h3_vae_d64_bhld(v, q_len, value=True)
+    )
 
 
 def _use_workflow_cute_d120(
@@ -168,9 +340,19 @@ def _prepare_bmg_d128_bhld_cute(
     capability = getattr(_backend_sdp, "supports_d128_bhld", None)
     self_attention = q_len == kv_len and q_len >= 768
     cross_attention = kv_len == 1024 and q_len >= 1024
+    minimax_h3_attention = (
+        b == 1
+        and heads == 56
+        and dim_head == 128
+        and q_len == kv_len
+        and q_len >= _MINIMAX_H3_H56_CUTE_MIN_SEQUENCE
+        and skip_reshape
+        and not skip_output_reshape
+    )
     supported_batch_kind = (
         (b == 2 and (self_attention or cross_attention))
         or (b == 1 and cross_attention)
+        or minimax_h3_attention
     )
     if not (
         _backend_name == "cute"
@@ -184,7 +366,7 @@ def _prepare_bmg_d128_bhld_cute(
         and q.device.type == "xpu"
         and k.device == q.device
         and v.device == q.device
-        and heads == 32
+        and (heads == 32 or minimax_h3_attention)
         and dim_head == 128
         and supported_batch_kind
     ):
@@ -204,11 +386,16 @@ def _prepare_bmg_d128_bhld_cute(
         k_bhld = k.view(b, kv_len, heads, dim_head).transpose(1, 2)
         v_bhld = v.view(b, kv_len, heads, dim_head).transpose(1, 2)
 
-    if not (
+    dense_layouts = (
         _is_dense_bhld(q_bhld, b, heads, q_len, dim_head)
         and _is_dense_bhld(k_bhld, b, heads, kv_len, dim_head)
         and _is_dense_bhld(v_bhld, b, heads, kv_len, dim_head)
-    ):
+    )
+    minimax_h3_layouts = minimax_h3_attention and all(
+        _is_minimax_h3_h56_bhld(tensor, q_len)
+        for tensor in (q_bhld, k_bhld, v_bhld)
+    )
+    if not (dense_layouts or minimax_h3_layouts):
         return None
 
     contract = (
@@ -313,6 +500,17 @@ def _load_cute_backend():
             def sdp_bhld_d128(q, k, v):
                 return torch.ops.cute_fmha.sdp_bhld_d128(q, k, v)
 
+            @staticmethod
+            def supports_minimax_h3_vae_d64():
+                return hasattr(
+                    torch.ops.cute_fmha,
+                    "sdp_minimax_h3_vae_d64",
+                )
+
+            @staticmethod
+            def sdp_minimax_h3_vae_d64(q, k, v):
+                return torch.ops.cute_fmha.sdp_minimax_h3_vae_d64(q, k, v)
+
         return _Wrap, None
     except Exception as e:
         return None, f"cute load failed: {e}"
@@ -395,6 +593,15 @@ def apply():
             details={"policy": _backend},
             verbose_only=True,
         )
+        _trace_attention_contract(
+            q,
+            k,
+            v,
+            heads,
+            mask,
+            skip_reshape,
+            skip_output_reshape,
+        )
 
         if skip_reshape:
             b, _, _, dim_head = q.shape
@@ -459,6 +666,40 @@ def apply():
             )
             if target == "bmg"
             else False
+        )
+        use_bmg_minimax_h3_vae_d64 = (
+            _use_bmg_minimax_h3_vae_d64(
+                q,
+                k,
+                v,
+                b,
+                heads,
+                dim_head,
+                q_len,
+                kv_len,
+                skip_reshape,
+                skip_output_reshape,
+            )
+            if target == "bmg"
+            else False
+        )
+        bmg_minimax_h3_vae_d64_contract = (
+            (
+                "minimax_h3_vae_d64",
+                str(q.dtype),
+                b,
+                heads,
+                q_len,
+                tuple(q.stride()),
+                tuple(k.stride()),
+                tuple(v.stride()),
+            )
+            if use_bmg_minimax_h3_vae_d64
+            else None
+        )
+        use_bmg_minimax_h3_vae_d64 = (
+            use_bmg_minimax_h3_vae_d64
+            and bmg_minimax_h3_vae_d64_contract not in _attention_failed_contracts
         )
 
         # Constraint check
@@ -552,19 +793,18 @@ def apply():
             out = _backend_sdp.sdp_bhld_d120(q, k, v)
             return out.transpose(1, 2).reshape(b, -1, heads * dim_head)
 
-        # LTX reaches optimized_attention with dense BLD tensors, while
-        # attention_pytorch creates the BLHD-backed BHLD view only after this
-        # dispatch point. Prepare that metadata-only view here so the public
-        # D128 op can cover generation sizes beyond the traced default. There
-        # is deliberately no maximum sequence length: the lower crossover
-        # thresholds are measured, while the upper bound is capability-driven.
+        # LTX reaches optimized_attention with dense BLD tensors. MiniMax H3
+        # reaches it with B1/H56 BHLD views backed by one QKV buffer. Prepare
+        # the former as metadata-only views and pass the latter directly so
+        # the public D128 op avoids three 216 MiB layout copies per H3 block.
         if not reasons and use_bmg_d128_bhld_cute:
             _cute_call_count += 1
-            route = (
-                "bmg_b2_bf16_d128_self"
-                if q_len == kv_len
-                else f"bmg_b{b}_bf16_d128_kv1024_cross"
-            )
+            if heads == 56:
+                route = "minimax_h3_h56_bf16_d128_qkv_bhld"
+            elif q_len == kv_len:
+                route = "bmg_b2_bf16_d128_self"
+            else:
+                route = f"bmg_b{b}_bf16_d128_kv1024_cross"
             route_call_count = _record_attention_route(route)
             if not _attention_experimental_warning_emitted:
                 log.warning(
@@ -690,6 +930,63 @@ def apply():
                     **kwargs,
                 )
             return out.reshape(b, q_len, heads * dim_head)
+
+        # MiniMax H3's tiled VideoVAE preserves one structural FP16 D64
+        # contract while the tile token count changes with temporal/spatial
+        # extent. Derive all strides from the runtime sequence length and keep
+        # unrelated D64 layouts on Torch SDPA.
+        if not reasons and use_bmg_minimax_h3_vae_d64:
+            _cute_call_count += 1
+            route = "minimax_h3_video_vae_fp16_d64"
+            route_call_count = _record_attention_route(route)
+            if route_call_count <= 3:
+                log.info(
+                    "[OmniXPU] attention CUTE_H3_VAE_D64 #%d: "
+                    "heads=%d seq=%d dtype=%s",
+                    route_call_count,
+                    heads,
+                    q_len,
+                    q.dtype,
+                )
+            log_debug_event(
+                "kernel",
+                "attention",
+                {"q": q, "k": k, "v": v},
+                details={"backend": "cute", "route": route},
+            )
+            try:
+                out = _backend_sdp.sdp_minimax_h3_vae_d64(q, k, v)
+                return out.transpose(1, 2).reshape(
+                    b, q_len, heads * dim_head
+                )
+            except Exception as error:
+                _attention_failed_contracts.add(
+                    bmg_minimax_h3_vae_d64_contract
+                )
+                _attention_fallback_count += 1
+                key = "cute_h3_vae_d64_runtime_error"
+                _attention_fallback_reasons[key] = (
+                    _attention_fallback_reasons.get(key, 0) + 1
+                )
+                log.warning(
+                    "[OmniXPU] MiniMax H3 VideoVAE D64 CUTE failed for "
+                    "S=%d; this structural contract is disabled for the "
+                    "process and the call is falling back to PyTorch. "
+                    "Error: %s",
+                    q_len,
+                    error,
+                )
+                return _pytorch_fallback(
+                    q,
+                    k,
+                    v,
+                    heads,
+                    mask=mask,
+                    attn_precision=attn_precision,
+                    skip_reshape=skip_reshape,
+                    skip_output_reshape=skip_output_reshape,
+                    **kwargs,
+                )
 
         # CUTE is accepted only for its validated contracts. Both auto and
         # explicit cute use the safe PyTorch fallback for everything else;

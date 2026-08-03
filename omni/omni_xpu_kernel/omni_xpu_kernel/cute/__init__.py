@@ -13,7 +13,9 @@ copies::
 
 BMG wheels additionally expose the exact Wan 2.2 14B T2V Turbo 720p
 cross-attention contract through ``sdp_wan22_cross`` and a batched,
-rectangular D128 BHLD entry point through ``sdp_bhld_d128``.
+rectangular D128 BHLD entry point through ``sdp_bhld_d128``. The structural
+MiniMax H3 VideoVAE D64 tile family is exposed separately through
+``sdp_minimax_h3_vae_d64``.
 
 Unlike the ESIMD ``sdp`` kernel (fp16 accumulator + adaptive V-scaling), the cute
 FMHA accumulates QK and P*V in fp32, so it does not overflow on large-magnitude
@@ -111,7 +113,7 @@ def supports_d128_bhld() -> bool:
 def sdp_bhld_d128(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> torch.Tensor:
-    """Batched self/cross attention for dense ``[B,H,L,128]`` inputs."""
+    """Attention for supported dense or H3 QKV-backed ``[B,H,L,128]`` inputs."""
     _ensure_loaded()
     if not hasattr(torch.ops.cute_fmha, "sdp_bhld_d128"):
         raise RuntimeError(
@@ -119,6 +121,33 @@ def sdp_bhld_d128(
             "in this sidecar"
         )
     return torch.ops.cute_fmha.sdp_bhld_d128(q, k, v)
+
+
+def supports_minimax_h3_vae_d64() -> bool:
+    """Whether this BMG sidecar exports MiniMax H3 VideoVAE D64 tiles."""
+    try:
+        _ensure_loaded()
+        return hasattr(torch.ops.cute_fmha, "sdp_minimax_h3_vae_d64")
+    except Exception:
+        return False
+
+
+def sdp_minimax_h3_vae_d64(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """MiniMax H3 VideoVAE FP16 ``[1,32,S,64]`` tile attention.
+
+    ``S`` is derived by the decoder from the temporal/spatial tile extent;
+    Q/K use the ``H*D`` sequence stride and V remains a view into the
+    three-wide QKV projection.
+    """
+    _ensure_loaded()
+    if not hasattr(torch.ops.cute_fmha, "sdp_minimax_h3_vae_d64"):
+        raise RuntimeError(
+            "CUTE MiniMax H3 VideoVAE D64 kernel is unavailable "
+            "in this sidecar"
+        )
+    return torch.ops.cute_fmha.sdp_minimax_h3_vae_d64(q, k, v)
 
 
 def supports_d120_bhld() -> bool:
@@ -146,6 +175,8 @@ __all__ = [
     "supports_wan22_cross",
     "sdp_bhld_d128",
     "supports_d128_bhld",
+    "sdp_minimax_h3_vae_d64",
+    "supports_minimax_h3_vae_d64",
     "sdp_bhld_d120",
     "supports_d120_bhld",
     "is_available",

@@ -119,6 +119,71 @@ def test_cute_d128_bmg_matches_ltx23_b2_bhld_contracts(kv_len):
     assert float(difference.max().item()) <= 0.00390625
 
 
+@pytest.mark.parametrize("sequence", [31, 256, 388, 1025, 4097, 15787])
+@pytest.mark.skipif(
+    not has_bmg_cute(), reason="BMG CUTE D128 sidecar unavailable"
+)
+def test_cute_d128_bmg_matches_minimax_h3_h56_qkv_layout(sequence):
+    from omni_xpu_kernel import cute
+
+    if not cute.supports_d128_bhld():
+        pytest.skip("D128 BHLD attention capability is unavailable")
+
+    torch.xpu.manual_seed_all(20260803 + sequence)
+    qkv = torch.randn(
+        (sequence, 3 * 56 * 128),
+        device="xpu",
+        dtype=torch.bfloat16,
+    )
+    q, k, v = (
+        tensor.view(sequence, 56, 128).transpose(0, 1).unsqueeze(0)
+        for tensor in qkv.split(56 * 128, dim=-1)
+    )
+
+    assert q.stride() == k.stride() == v.stride()
+    assert q.stride() == (7168, 128, 21504, 1)
+    actual = cute.sdp_bhld_d128(q, k, v)
+    expected = F.scaled_dot_product_attention(q, k, v)
+
+    assert actual.shape == q.shape
+    assert actual.stride() == (sequence * 7168, 128, 7168, 1)
+    assert torch.isfinite(actual).all()
+    difference = (actual.float() - expected.float()).abs()
+    assert float(difference.max().item()) <= 0.0078125
+
+
+@pytest.mark.skipif(
+    not has_bmg_cute(), reason="BMG CUTE D128 sidecar unavailable"
+)
+def test_cute_d128_bmg_matches_minimax_h3_h56_s388_mixed_layout():
+    from omni_xpu_kernel import cute
+
+    if not cute.supports_d128_bhld():
+        pytest.skip("D128 BHLD attention capability is unavailable")
+
+    torch.xpu.manual_seed_all(20260803)
+    q = torch.randn(
+        (1, 388, 56, 128), device="xpu", dtype=torch.bfloat16
+    ).transpose(1, 2)
+    k = torch.randn_like(q)
+    qkv = torch.randn(
+        (388, 3 * 56 * 128), device="xpu", dtype=torch.bfloat16
+    )
+    v = qkv[:, 2 * 56 * 128 :].view(388, 56, 128)
+    v = v.transpose(0, 1).unsqueeze(0)
+
+    assert q.stride() == k.stride() == (2781184, 128, 7168, 1)
+    assert v.stride() == (7168, 128, 21504, 1)
+    actual = cute.sdp_bhld_d128(q, k, v)
+    expected = F.scaled_dot_product_attention(q, k, v)
+
+    assert actual.shape == q.shape
+    assert actual.stride() == q.stride()
+    assert torch.isfinite(actual).all()
+    difference = (actual.float() - expected.float()).abs()
+    assert float(difference.max().item()) <= 0.0078125
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["packed_bhld", "blhd_backed"])
 @pytest.mark.parametrize(
@@ -189,6 +254,31 @@ def test_cute_d128_bmg_bhld_rejects_unsupported_contracts():
     )[..., ::2]
     with pytest.raises(RuntimeError, match="dense packed-BHLD"):
         cute.sdp_bhld_d128(bad_layout, bad_layout, bad_layout)
+
+    unsupported_qkv = torch.randn(
+        (33, 3 * 55 * 128),
+        device="xpu",
+        dtype=torch.bfloat16,
+    )
+    unsupported_qkv = tuple(
+        tensor.view(33, 55, 128).transpose(0, 1).unsqueeze(0)
+        for tensor in unsupported_qkv.split(55 * 128, dim=-1)
+    )
+    with pytest.raises(RuntimeError, match="B1/H56 MiniMax H3"):
+        cute.sdp_bhld_d128(*unsupported_qkv)
+
+    wrong_batch_stride = torch.empty_strided(
+        (1, 4, 33, 128),
+        (4 * 33 * 128 + 128, 128, 4 * 128, 1),
+        device="xpu",
+        dtype=torch.bfloat16,
+    )
+    with pytest.raises(RuntimeError, match="dense packed-BHLD"):
+        cute.sdp_bhld_d128(
+            wrong_batch_stride,
+            wrong_batch_stride,
+            wrong_batch_stride,
+        )
 
     bad_dtype = torch.randn(
         (1, 4, 33, 128),
