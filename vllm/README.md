@@ -284,7 +284,6 @@ vllm serve \
     --disable-sliding-window \
     --gpu-memory-util=0.9 \
     --max-num-batched-tokens=8192 \
-    --disable-log-requests \
     --max-model-len=8192 \
     --block-size 64 \
     --quantization fp8 \
