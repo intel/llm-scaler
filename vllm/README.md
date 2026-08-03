@@ -401,7 +401,23 @@ For pre-quantized models, such as AWQ-Int4, GPTQ-Int4, and Offline FP8 models, d
 To serve an Offline FP8 model, provide the model path directly. For example:
 
 ```bash
-vllm serve --model /llm/models/Qwen3.6-27B-FP8 --trust-remote-code
+VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+vllm serve \
+    --model /llm/models/Qwen3.6-27B-FP8 \
+    --dtype=float16 \
+    --enforce-eager \
+    --port 8000 \
+    --host 0.0.0.0 \
+    --trust-remote-code \
+    --disable-sliding-window \
+    --gpu-memory-util=0.9 \
+    --max-num-batched-tokens=8192 \
+    --disable-log-requests \
+    --max-model-len=8192 \
+    --block-size 64 \
+    -tp=1 \
+    2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
 ```
 
 Replace the model path with `/llm/models/Qwen3.6-35B-A3B-FP8` to serve that model.
