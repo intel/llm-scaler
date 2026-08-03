@@ -1373,7 +1373,7 @@ MTP is useful when:
 - Your model natively supports MTP.
 - You want model-based speculative decoding with minimal extra configuration.
 
-**Supported models:** Currently verified with `Qwen3.6-27B` and `Qwen3.6-35B-A3B` and `gemma-4-26B-A4B-it` and `gemma-4-31b-it` models.
+**Supported models:** Currently verified with `Qwen3.6-27B` and `Qwen3.6-35B-A3B` and `gemma-4-26B-A4B-it` and `gemma-4-31B-it` models.
 
 #### Qwen Assistant Models
 
@@ -1385,15 +1385,14 @@ Use `"method": "qwen3_5_mtp"` when serving Qwen MTP:
 
 #### Gemma 4 Assistant Models
 
-Gemma 4 assistant checkpoints use vLLM's Gemma 4 MTP path. They are not generic
-draft models, even though they are passed through the `model` field in
-`--speculative-config`. You need to download draft_model first.
+Gemma 4 assistant checkpoints use vLLM's Gemma 4 MTP path. You need to download draft_model first.
 
 Use `"method": "gemma4_mtp"` when serving Gemma 4 with an assistant checkpoint:
 
 ```bash
-    --speculative-config '{"method":"gemma4_mtp","model":"/llm/models/test/google/gemma-4-31B-it-assistant","num_speculative_tokens":2}'
+    --speculative-config '{"method":"gemma4_mtp","model":"/path/to/gemma-4-31B-it-assistant","num_speculative_tokens":2}'
 ```
+
 
 You can profile performance by tuning `num_speculative_tokens` from 2 to 5. Adjust this based on your workload.
 
