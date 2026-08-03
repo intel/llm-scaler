@@ -1373,7 +1373,7 @@ MTP is useful when:
 - Your model natively supports MTP.
 - You want model-based speculative decoding with minimal extra configuration.
 
-**Supported models:** Currently verified with Qwen3.6-27B and Qwen3.6-35B-A3B and gemma-4-26B-A4B-it and gemma-4-31b-itmodels.
+**Supported models:** Currently verified with `Qwen3.6-27B` and `Qwen3.6-35B-A3B` and `gemma-4-26B-A4B-it` and `gemma-4-31b-it` models.
 
 #### Qwen Assistant Models
 
@@ -1395,7 +1395,7 @@ Use `"method": "gemma4_mtp"` when serving Gemma 4 with an assistant checkpoint:
     --speculative-config '{"method":"gemma4_mtp","model":"/llm/models/test/google/gemma-4-31B-it-assistant","num_speculative_tokens":2}'
 ```
 
-You can profile performance by `tuning num_speculative_tokens` from 2 to 5. Adjust this based on your workload.
+You can profile performance by tuning `num_speculative_tokens` from 2 to 5. Adjust this based on your workload.
 
 
 ## 4. Troubleshooting
