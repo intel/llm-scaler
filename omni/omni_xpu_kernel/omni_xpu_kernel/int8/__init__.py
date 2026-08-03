@@ -67,6 +67,47 @@ def _get_native():
         return None
 
 
+def _apply_input_act(
+    x: torch.Tensor, input_act: Optional[str]
+) -> torch.Tensor:
+    if input_act in (None, "none"):
+        return x
+    if input_act == "gelu_tanh":
+        return torch.nn.functional.gelu(x, approximate="tanh")
+    if input_act == "swiglu":
+        gate, up = x.chunk(2, dim=-1)
+        return torch.nn.functional.silu(gate).mul_(up)
+    raise ValueError(
+        f"unsupported input_act: {input_act!r} "
+        "(expected one of ['gelu_tanh', 'none', 'swiglu'])"
+    )
+
+
+def _can_fuse_gelu_tanh_quantize(
+    x: torch.Tensor,
+    native,
+) -> bool:
+    """Use only the BMG contracts where fused GELU beats materialization."""
+    if (
+        x.dtype not in (torch.float16, torch.bfloat16)
+        or x.ndim < 2
+        or x.shape[-1] <= 0
+        or x.shape[-1] > 16384
+        or not hasattr(native, "fused_gelu_tanh_quantize_rowwise")
+        or not hasattr(native, "int8_linear_prequantized")
+    ):
+        return False
+    try:
+        from .. import __xpu_target__, core_aot_target
+
+        if __xpu_target__ != "bmg" or core_aot_target() != "bmg":
+            return False
+    except (ImportError, RuntimeError):
+        return False
+    rows = x.numel() // x.shape[-1]
+    return rows < 128
+
+
 def _can_quantize_int8_convrot_g16_bmg(
     x: torch.Tensor,
     native,
@@ -420,6 +461,32 @@ def fused_silu_mul_quantize_rowwise(
     return _ref_fused_silu_mul_quantize_rowwise(x1, x2)
 
 
+def fused_swiglu_quantize_rowwise(
+    input: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fuse concatenated ``[gate | up]`` SwiGLU with rowwise INT8 quantization."""
+    if input.shape[-1] <= 0 or input.shape[-1] % 2:
+        raise ValueError("SwiGLU input last dimension must be positive and even")
+    native = _get_native()
+    if native is not None and hasattr(native, "fused_swiglu_quantize_rowwise"):
+        return native.fused_swiglu_quantize_rowwise(input)
+    gate, up = input.chunk(2, dim=-1)
+    return _ref_fused_silu_mul_quantize_rowwise(gate, up)
+
+
+def fused_gelu_tanh_quantize_rowwise(
+    input: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fuse tanh-approximate GELU with rowwise INT8 quantization."""
+    if input.shape[-1] <= 0:
+        raise ValueError("GELU input last dimension must be positive")
+    native = _get_native()
+    if native is not None and hasattr(native, "fused_gelu_tanh_quantize_rowwise"):
+        return native.fused_gelu_tanh_quantize_rowwise(input)
+    activated = torch.nn.functional.gelu(input, approximate="tanh")
+    return quantize_int8_rowwise(activated)
+
+
 def fused_silu_mul(
     x1: torch.Tensor,
     x2: torch.Tensor,
@@ -510,6 +577,7 @@ def int8_linear(
     out_dtype: Optional[torch.dtype] = None,
     convrot: bool = False,
     convrot_groupsize: int = 256,
+    input_act: Optional[str] = None,
 ) -> torch.Tensor:
     """INT8 linear layer with dynamic activation quantization.
 
@@ -524,12 +592,23 @@ def int8_linear(
         out_dtype: Output dtype (defaults to x.dtype).
         convrot: If True, apply online activation rotation before quantization.
         convrot_groupsize: Group size for Hadamard rotation (must be power of 4).
+        input_act: Optional ``gelu_tanh`` or ``swiglu`` activation applied before
+            activation quantization. SwiGLU consumes concatenated ``[gate | up]``
+            halves and therefore halves the input width.
 
     Returns:
         Result tensor [..., N] in out_dtype.
     """
     if out_dtype is None:
         out_dtype = x.dtype
+    width = 2 if input_act == "swiglu" else 1
+    if input_act not in (None, "none", "gelu_tanh", "swiglu"):
+        _apply_input_act(x, input_act)
+    if x.shape[-1] != weight.shape[-1] * width:
+        raise ValueError(
+            "Input and weight inner dimensions must match after input_act, "
+            f"got {x.shape[-1]} and {weight.shape[-1]} with input_act={input_act!r}"
+        )
     native = _get_native()
     if native is not None and hasattr(native, "int8_linear"):
         dtype_code = {
@@ -537,6 +616,41 @@ def int8_linear(
             torch.float16: 1,
             torch.bfloat16: 2,
         }.get(out_dtype, 2)
+        if (
+            input_act == "swiglu"
+            and not convrot
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and hasattr(native, "fused_swiglu_quantize_rowwise")
+            and hasattr(native, "int8_linear_prequantized")
+        ):
+            _clear_krea2_activation_cache()
+            _clear_bmg_qkv_activation_cache()
+            x_int8, x_scale = native.fused_swiglu_quantize_rowwise(x)
+            return native.int8_linear_prequantized(
+                x_int8,
+                x_scale,
+                weight,
+                weight_scale,
+                bias,
+                dtype_code,
+            )
+        if (
+            input_act == "gelu_tanh"
+            and not convrot
+            and _can_fuse_gelu_tanh_quantize(x, native)
+        ):
+            _clear_krea2_activation_cache()
+            _clear_bmg_qkv_activation_cache()
+            x_int8, x_scale = native.fused_gelu_tanh_quantize_rowwise(x)
+            return native.int8_linear_prequantized(
+                x_int8,
+                x_scale,
+                weight,
+                weight_scale,
+                bias,
+                dtype_code,
+            )
+        x = _apply_input_act(x, input_act)
         if _can_cache_krea2_int8_convrot(
             x,
             native,
@@ -611,6 +725,7 @@ def int8_linear(
         )
     _clear_krea2_activation_cache()
     _clear_bmg_qkv_activation_cache()
+    x = _apply_input_act(x, input_act)
     return _ref_int8_linear(
         x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize
     )
@@ -860,6 +975,8 @@ __all__ = [
     "quantize_int8_tensorwise",
     "quantize_int8_rowwise",
     "fused_silu_mul_quantize_rowwise",
+    "fused_swiglu_quantize_rowwise",
+    "fused_gelu_tanh_quantize_rowwise",
     "fused_silu_mul",
     "dequantize_int8_simple",
     "dequantize_int8_simple_dtype",

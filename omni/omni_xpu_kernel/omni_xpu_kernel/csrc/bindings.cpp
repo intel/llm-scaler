@@ -40,6 +40,7 @@ namespace norm {
     void fused_add_rms_norm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
     torch::Tensor fused_rms_norm_linear(torch::Tensor input, torch::Tensor norm_weight, torch::Tensor proj_weight, double eps);
     torch::Tensor fused_adaln(torch::Tensor input, torch::Tensor modulation_scale, torch::Tensor modulation_shift, int64_t row_repeat, double eps);
+    torch::Tensor fused_rms_adaln(torch::Tensor input, torch::Tensor modulation_scale, torch::Tensor modulation_shift, int64_t row_repeat, double eps);
 }
 namespace svdq {
     torch::Tensor dequantize_svdq_w4(const torch::Tensor& packed, const torch::Tensor& scales, torch::ScalarType out_dtype);
@@ -60,6 +61,13 @@ namespace rotary {
     std::tuple<torch::Tensor, torch::Tensor> apply_kitchen_rope(const torch::Tensor& xq, const torch::Tensor& xk, const torch::Tensor& freqs_cis);
     torch::Tensor apply_kitchen_rope_split_half1(const torch::Tensor& x, const torch::Tensor& freqs_cis);
     std::tuple<torch::Tensor, torch::Tensor> apply_kitchen_rope_split_half(const torch::Tensor& xq, const torch::Tensor& xk, const torch::Tensor& freqs_cis);
+    torch::Tensor rms_kitchen_rope1(
+        torch::Tensor x, torch::Tensor freqs_cis, torch::Tensor scale,
+        double epsilon, bool split_half, int64_t rot_dim, bool inplace);
+    std::tuple<torch::Tensor, torch::Tensor> rms_kitchen_rope(
+        torch::Tensor q, torch::Tensor k, torch::Tensor freqs_cis,
+        torch::Tensor q_scale, torch::Tensor k_scale, double epsilon,
+        bool split_half, int64_t rot_dim, bool inplace);
     bool kitchen_rope_fast_supported(const torch::Tensor& x, const torch::Tensor& freqs);
     bool ltx_split_rope_direct_supported(
         const torch::Tensor& input,
@@ -117,6 +125,10 @@ namespace int8_ops {
     torch::Tensor fused_silu_mul(torch::Tensor x1, torch::Tensor x2);
     std::tuple<torch::Tensor, torch::Tensor> fused_silu_mul_quantize_rowwise(
         torch::Tensor x1, torch::Tensor x2);
+    std::tuple<torch::Tensor, torch::Tensor> fused_swiglu_quantize_rowwise(
+        torch::Tensor input);
+    std::tuple<torch::Tensor, torch::Tensor> fused_gelu_tanh_quantize_rowwise(
+        torch::Tensor input);
     torch::Tensor rotate_convrot(torch::Tensor input, int64_t group_size);
     std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_weight(
         torch::Tensor weight, int64_t group_size, int64_t stochastic_rounding);
@@ -230,6 +242,10 @@ PYBIND11_MODULE(_C, m) {
         "Fused LayerNorm and Kitchen AdaLN modulation in one ESIMD kernel",
         py::arg("input"), py::arg("scale"), py::arg("shift"),
         py::arg("row_repeat") = 1, py::arg("eps") = 1e-6);
+    norm.def("fused_rms_adaln", &omni_xpu::norm::fused_rms_adaln,
+        "Fused RMSNorm and Kitchen AdaLN modulation in one ESIMD kernel",
+        py::arg("input"), py::arg("scale"), py::arg("shift"),
+        py::arg("row_repeat") = 1, py::arg("eps") = 1e-6);
 
     // SVDQuant W4A4 Dequantization/Quantization (nunchaku)
     auto svdq = m.def_submodule("svdq", "SVDQuant W4A4 dequantization and quantization kernels for nunchaku");
@@ -321,6 +337,21 @@ PYBIND11_MODULE(_C, m) {
     rotary.def("apply_kitchen_rope_split_half", &omni_xpu::rotary::apply_kitchen_rope_split_half,
         "Apply Kitchen split-half RoPE semantics to query and key tensors",
         py::arg("xq"), py::arg("xk"), py::arg("freqs_cis"));
+    rotary.def(
+        "rms_kitchen_rope1",
+        &omni_xpu::rotary::rms_kitchen_rope1,
+        "Fused RMSNorm and Kitchen arbitrary-matrix RoPE for one tensor",
+        py::arg("x"), py::arg("freqs_cis"), py::arg("scale"),
+        py::arg("epsilon") = 1e-6, py::arg("split_half") = false,
+        py::arg("rot_dim") = 0, py::arg("inplace") = false);
+    rotary.def(
+        "rms_kitchen_rope",
+        &omni_xpu::rotary::rms_kitchen_rope,
+        "Fused RMSNorm and Kitchen arbitrary-matrix RoPE for a query/key pair",
+        py::arg("q"), py::arg("k"), py::arg("freqs_cis"),
+        py::arg("q_scale"), py::arg("k_scale"),
+        py::arg("epsilon") = 1e-6, py::arg("split_half") = false,
+        py::arg("rot_dim") = 0, py::arg("inplace") = false);
     rotary.def("kitchen_rope_fast_supported", &omni_xpu::rotary::kitchen_rope_fast_supported,
         "Return whether a tensor pair can use the single-launch Kitchen RoPE kernel",
         py::arg("x"), py::arg("freqs_cis"));
@@ -452,6 +483,16 @@ PYBIND11_MODULE(_C, m) {
         "Input: x1/x2 [..., K] bf16/f16 with identical shape and dtype\n"
         "Output: (int8 tensor, float32 scales [..., 1])",
         py::arg("x1"), py::arg("x2"));
+    int8.def(
+        "fused_swiglu_quantize_rowwise",
+        &omni_xpu::int8_ops::fused_swiglu_quantize_rowwise,
+        "Fused SwiGLU on concatenated [gate | up] input followed by rowwise INT8 quantization",
+        py::arg("input"));
+    int8.def(
+        "fused_gelu_tanh_quantize_rowwise",
+        &omni_xpu::int8_ops::fused_gelu_tanh_quantize_rowwise,
+        "Fused tanh-approximate GELU followed by deterministic rowwise INT8 quantization",
+        py::arg("input"));
     int8.def("rotate_convrot", &omni_xpu::int8_ops::rotate_convrot,
         "Regular Hadamard rotation using a cached matrix multiplication on the last dimension",
         py::arg("input"), py::arg("group_size") = 256);

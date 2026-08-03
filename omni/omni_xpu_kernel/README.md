@@ -20,7 +20,7 @@ across those native ABI boundaries.
 | `gguf` | Q4_0, Q4_1, Q8_0, Q4_K, and Q6_K dequantization |
 | `norm` | RMSNorm, LayerNorm, and fused normalization operations |
 | `svdq` | SVDQuant W4A4 dequantization, INT4 GEMM, and post-processing |
-| `int8` | INT8 quantization, linear, SwiGLU, and ConvRot operations |
+| `int8` | INT8 quantization, linear, fused GELU/SwiGLU, and ConvRot operations |
 | `rotary` | Rotary embedding and Comfy Kitchen-compatible RoPE operations |
 
 The exact native symbols available in an installed artifact can be inspected
@@ -279,6 +279,27 @@ output = int8.int8_linear(
     out_dtype=activation.dtype,
 )
 
+# Fold a concatenated [gate | up] SwiGLU into rowwise quantization. The
+# activated width is half the input width and must match the INT8 weight.
+output = int8.int8_linear(
+    gate_up,
+    w_int8,
+    w_scale,
+    out_dtype=gate_up.dtype,
+    input_act="swiglu",
+)
+
+# GELU-tanh is fused directly into rowwise INT8 quantization for the validated
+# profitable BMG row range when ConvRot is disabled. Larger rows retain the
+# faster materialized XPU route.
+output = int8.int8_linear(
+    activation,
+    w_int8,
+    w_scale,
+    out_dtype=activation.dtype,
+    input_act="gelu_tanh",
+)
+
 x_int8, x_scale = int8.quantize_int8_rowwise(activation)
 output = int8.int8_linear_prequantized(
     x_int8,
@@ -319,6 +340,7 @@ from omni_xpu_kernel import norm, svdq
 output = norm.rms_norm(weight, x, eps=1e-6)
 output = norm.layer_norm(x, weight=weight, bias=bias, eps=1e-5)
 norm.fused_add_rms_norm(x, residual, weight, eps=1e-6)
+output = norm.fused_rms_adaln(x_2d, scale_2d, shift_2d, row_repeat, eps=1e-6)
 
 unpacked = svdq.unpack_int4(packed_weight, signed=True)
 dequantized = svdq.dequantize_w4(
@@ -339,6 +361,18 @@ from omni_xpu_kernel import rotary
 
 output = rotary.apply_kitchen_rope1(x, freqs_cis)
 output = rotary.apply_kitchen_rope_split_half1(x, freqs_cis)
+
+# The fused pair API supports strided packed-QKV views, in-place output, and a
+# partial split-half rotary prefix while RMSNorm still covers the full head.
+q, k = rotary.rms_kitchen_rope_split_half_(
+    q,
+    k,
+    freqs_cis,
+    q_scale,
+    k_scale,
+    epsilon=1e-5,
+    rot_dim=96,
+)
 
 if rotary.kitchen_rope_fast_supported(x, freqs_cis):
     output = rotary.apply_kitchen_rope1(x, freqs_cis)

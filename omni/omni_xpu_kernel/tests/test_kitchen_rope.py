@@ -26,6 +26,16 @@ def _split_reference(x, freqs):
     return output.movedim(-1, -2).reshape_as(x).type_as(x)
 
 
+def _partial_rms_split_reference(x, freqs, scale, epsilon, rot_dim):
+    x_float = x.float()
+    inverse_rms = torch.rsqrt(
+        x_float.square().mean(dim=-1, keepdim=True) + epsilon
+    )
+    normalized = (x_float * inverse_rms * scale.float()).to(x.dtype)
+    rotated = _split_reference(normalized[..., :rot_dim], freqs)
+    return torch.cat((rotated, normalized[..., rot_dim:]), dim=-1)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["BHND", "BNHD"])
@@ -187,3 +197,56 @@ def test_kitchen_rope_bmg_d120_single_exact(
         actual = rotary.apply_kitchen_rope1(x, freqs)
         expected = _adjacent_reference(x, freqs)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_h3_packed_qkv_partial_rms_rope_inplace():
+    if not torch.xpu.is_available():
+        pytest.skip("XPU is unavailable")
+
+    sequence, heads, head_dim, rot_dim = 37, 56, 128, 96
+    inner = heads * head_dim
+    packed = torch.randn(
+        sequence,
+        3 * inner,
+        device="xpu",
+        dtype=torch.bfloat16,
+    )
+    q = packed[:, :inner].view(1, sequence, heads, head_dim)
+    k = packed[:, inner : 2 * inner].view(1, sequence, heads, head_dim)
+    q_before = q.clone()
+    k_before = k.clone()
+    q_scale = torch.randn(head_dim, device="xpu", dtype=torch.float32)
+    k_scale = torch.randn(head_dim, device="xpu", dtype=torch.float32)
+    freqs = torch.randn(
+        1,
+        sequence,
+        1,
+        rot_dim // 2,
+        2,
+        2,
+        device="xpu",
+        dtype=torch.bfloat16,
+    )
+
+    assert not q.is_contiguous()
+    q_pointer, k_pointer = q.data_ptr(), k.data_ptr()
+    q_out, k_out = rotary.rms_kitchen_rope_split_half_(
+        q,
+        k,
+        freqs,
+        q_scale,
+        k_scale,
+        epsilon=1e-5,
+        rot_dim=rot_dim,
+    )
+    q_expected = _partial_rms_split_reference(
+        q_before, freqs, q_scale, 1e-5, rot_dim
+    )
+    k_expected = _partial_rms_split_reference(
+        k_before, freqs, k_scale, 1e-5, rot_dim
+    )
+
+    assert q_out.data_ptr() == q_pointer
+    assert k_out.data_ptr() == k_pointer
+    torch.testing.assert_close(q_out, q_expected, rtol=0.02, atol=0.02)
+    torch.testing.assert_close(k_out, k_expected, rtol=0.02, atol=0.02)

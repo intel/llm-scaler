@@ -582,6 +582,7 @@ def int8_linear(
     out_dtype: Optional[torch.dtype] = None,
     convrot: bool = False,
     convrot_groupsize: int = 256,
+    input_act: Optional[str] = None,
 ) -> torch.Tensor:
     """INT8 linear layer with dynamic activation quantization.
 
@@ -606,6 +607,17 @@ def int8_linear(
     """
     if out_dtype is None:
         out_dtype = x.dtype
+
+    if input_act == "gelu_tanh":
+        x = torch.nn.functional.gelu(x, approximate="tanh")
+    elif input_act == "swiglu":
+        gate, up = x.chunk(2, dim=-1)
+        x = torch.nn.functional.silu(gate).mul_(up)
+    elif input_act not in (None, "none"):
+        raise ValueError(
+            f"unsupported input_act: {input_act!r} "
+            "(expected one of ['gelu_tanh', 'none', 'swiglu'])"
+        )
 
     if x.shape[-1] != weight.shape[-1]:
         raise ValueError(

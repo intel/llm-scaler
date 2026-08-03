@@ -466,6 +466,22 @@ inline float silu_mul_rounded(InputT x1, InputT x2) {
 }
 
 template <typename InputT>
+inline float gelu_tanh_rounded(InputT input) {
+    const float x = static_cast<float>(input);
+    constexpr float kSqrtTwoOverPi = 0.7978845608028654f;
+    constexpr float kCubicCoefficient = 0.044715f;
+    const float inner = kSqrtTwoOverPi *
+        (x + kCubicCoefficient * x * x * x);
+    const float value = 0.5f * x * (1.0f + sycl::tanh(inner));
+
+    // Preserve the public input_act boundary: PyTorch GELU returns the input
+    // dtype before rowwise quantization. Recomputing that rounded value in the
+    // two passes removes the full floating activation tensor without changing
+    // the following quantizer's dtype contract.
+    return static_cast<float>(static_cast<InputT>(value));
+}
+
+template <typename InputT>
 void fused_silu_mul_kernel(
     const InputT* __restrict__ input1,
     const InputT* __restrict__ input2,
@@ -511,6 +527,8 @@ void fused_silu_mul_quantize_rowwise_kernel(
     float* __restrict__ scales,
     int64_t M,
     int64_t K,
+    int64_t input1_row_stride,
+    int64_t input2_row_stride,
     const at::Device& device
 ) {
     constexpr int SG = 32;
@@ -534,8 +552,10 @@ void fused_silu_mul_quantize_rowwise_kernel(
                     sg.get_group_linear_id();
                 if (row >= M) return;
 
-                const InputT* __restrict__ row1 = input1 + row * K;
-                const InputT* __restrict__ row2 = input2 + row * K;
+                const InputT* __restrict__ row1 =
+                    input1 + row * input1_row_stride;
+                const InputT* __restrict__ row2 =
+                    input2 + row * input2_row_stride;
                 int8_t* __restrict__ out_ptr = output + row * K;
 
                 float local_max = 0.0f;
@@ -608,6 +628,166 @@ void fused_silu_mul_quantize_rowwise_kernel(
     };
     utils::submit_kernel(
         cgf, device, "fused_silu_mul_quantize_rowwise_sg2pass");
+}
+
+// One subgroup owns one row and recomputes the rounded GELU-tanh value for the
+// absmax and quantization passes. This is the unary counterpart of the fused
+// SwiGLU quantizer above and avoids materializing a floating [M,K] activation.
+template <typename InputT>
+void fused_gelu_tanh_quantize_rowwise_kernel(
+    const InputT* __restrict__ input,
+    int8_t* __restrict__ output,
+    float* __restrict__ scales,
+    int64_t M,
+    int64_t K,
+    const at::Device& device
+) {
+    constexpr int SG = 32;
+    constexpr int ROWS_PER_WG = 8;
+    constexpr int WG = SG * ROWS_PER_WG;
+    constexpr int VEC = 8;
+    constexpr int MIN_VECTOR_K = SG * VEC * 2;
+
+    const int64_t n_wg = (M + ROWS_PER_WG - 1) / ROWS_PER_WG;
+    sycl::range<1> global_size(static_cast<size_t>(n_wg) * WG);
+    sycl::range<1> local_size(WG);
+
+    auto cgf = [&](sycl::handler& handle) {
+        handle.parallel_for(
+            sycl::nd_range<1>(global_size, local_size),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
+                auto sg = item.get_sub_group();
+                const int lane = static_cast<int>(sg.get_local_linear_id());
+                const int64_t row =
+                    static_cast<int64_t>(item.get_group(0)) * ROWS_PER_WG +
+                    sg.get_group_linear_id();
+                if (row >= M) return;
+
+                const InputT* __restrict__ row_ptr = input + row * K;
+                int8_t* __restrict__ out_ptr = output + row * K;
+                const bool use_vector = K >= MIN_VECTOR_K && K % VEC == 0;
+                float local_max = 0.0f;
+
+                if (use_vector) {
+                    using InputVec = sycl::vec<InputT, VEC>;
+                    const int64_t lane_start = static_cast<int64_t>(lane) * VEC;
+                    for (int64_t k = lane_start; k < K; k += SG * VEC) {
+                        const InputVec values =
+                            *reinterpret_cast<const InputVec*>(row_ptr + k);
+                        #pragma unroll
+                        for (int i = 0; i < VEC; ++i) {
+                            const float value = gelu_tanh_rounded(values[i]);
+                            local_max = sycl::fmax(
+                                local_max, sycl::fabs(value));
+                        }
+                    }
+                } else {
+                    for (int64_t k = lane; k < K; k += SG) {
+                        const float value = gelu_tanh_rounded(row_ptr[k]);
+                        local_max = sycl::fmax(
+                            local_max, sycl::fabs(value));
+                    }
+                }
+
+                const float row_max = sycl::reduce_over_group(
+                    sg, local_max, sycl::maximum<float>());
+                float scale = row_max / 127.0f;
+                if (scale < 1e-30f) scale = 1e-30f;
+                const float inv_scale = 1.0f / scale;
+                if (lane == 0) scales[row] = scale;
+
+                if (use_vector) {
+                    using InputVec = sycl::vec<InputT, VEC>;
+                    using OutputVec = sycl::vec<int8_t, VEC>;
+                    const int64_t lane_start = static_cast<int64_t>(lane) * VEC;
+                    for (int64_t k = lane_start; k < K; k += SG * VEC) {
+                        const InputVec values =
+                            *reinterpret_cast<const InputVec*>(row_ptr + k);
+                        OutputVec quantized;
+                        #pragma unroll
+                        for (int i = 0; i < VEC; ++i) {
+                            float rounded = sycl::rint(
+                                gelu_tanh_rounded(values[i]) * inv_scale);
+                            rounded = sycl::fmax(
+                                -128.0f, sycl::fmin(127.0f, rounded));
+                            quantized[i] = static_cast<int8_t>(
+                                static_cast<int32_t>(rounded));
+                        }
+                        *reinterpret_cast<OutputVec*>(out_ptr + k) = quantized;
+                    }
+                } else {
+                    for (int64_t k = lane; k < K; k += SG) {
+                        float rounded = sycl::rint(
+                            gelu_tanh_rounded(row_ptr[k]) * inv_scale);
+                        rounded = sycl::fmax(
+                            -128.0f, sycl::fmin(127.0f, rounded));
+                        out_ptr[k] = static_cast<int8_t>(
+                            static_cast<int32_t>(rounded));
+                    }
+                }
+            });
+    };
+    utils::submit_kernel(
+        cgf, device, "fused_gelu_tanh_quantize_rowwise_sg2pass");
+}
+
+// Cache one rounded GELU row in workgroup local memory so the transcendental
+// activation is evaluated only once. The public dispatcher limits this path to
+// 32 KiB rows, leaving enough local memory headroom on supported XPU targets.
+template <typename InputT>
+void fused_gelu_tanh_quantize_rowwise_cached_kernel(
+    const InputT* __restrict__ input,
+    int8_t* __restrict__ output,
+    float* __restrict__ scales,
+    int64_t M,
+    int64_t K,
+    int workgroup_size,
+    const at::Device& device
+) {
+    sycl::range<1> global_size(
+        static_cast<size_t>(M) * workgroup_size);
+    sycl::range<1> local_size(static_cast<size_t>(workgroup_size));
+
+    auto cgf = [&](sycl::handler& handle) {
+        sycl::local_accessor<InputT, 1> cached(
+            sycl::range<1>(static_cast<size_t>(K)), handle);
+        handle.parallel_for(
+            sycl::nd_range<1>(global_size, local_size),
+            [=](sycl::nd_item<1> item) {
+                const int64_t row = item.get_group(0);
+                const int lane = static_cast<int>(item.get_local_linear_id());
+                const int row_threads =
+                    static_cast<int>(item.get_local_range(0));
+                const InputT* __restrict__ row_ptr = input + row * K;
+                int8_t* __restrict__ out_ptr = output + row * K;
+
+                float local_max = 0.0f;
+                for (int64_t k = lane; k < K; k += row_threads) {
+                    const float value = gelu_tanh_rounded(row_ptr[k]);
+                    cached[k] = static_cast<InputT>(value);
+                    local_max = sycl::fmax(local_max, sycl::fabs(value));
+                }
+
+                const float row_max = sycl::reduce_over_group(
+                    item.get_group(), local_max, sycl::maximum<float>());
+                float scale = row_max / 127.0f;
+                if (scale < 1e-30f) scale = 1e-30f;
+                const float inv_scale = 1.0f / scale;
+                if (lane == 0) scales[row] = scale;
+
+                item.barrier(sycl::access::fence_space::local_space);
+                for (int64_t k = lane; k < K; k += row_threads) {
+                    float rounded = sycl::rint(
+                        static_cast<float>(cached[k]) * inv_scale);
+                    rounded = sycl::fmax(
+                        -128.0f, sycl::fmin(127.0f, rounded));
+                    out_ptr[k] = static_cast<int8_t>(
+                        static_cast<int32_t>(rounded));
+                }
+            });
+    };
+    utils::submit_kernel(
+        cgf, device, "fused_gelu_tanh_quantize_rowwise_cached");
 }
 
 // ============================================================================
@@ -845,18 +1025,149 @@ std::tuple<torch::Tensor, torch::Tensor> fused_silu_mul_quantize_rowwise(
             reinterpret_cast<const bf16*>(x1.data_ptr()),
             reinterpret_cast<const bf16*>(x2.data_ptr()),
             reinterpret_cast<int8_t*>(output.data_ptr()),
-            scales.data_ptr<float>(), M, K, x1.device());
+            scales.data_ptr<float>(), M, K, K, K, x1.device());
     } else {
         fused_silu_mul_quantize_rowwise_kernel<fp16>(
             reinterpret_cast<const fp16*>(x1.data_ptr()),
             reinterpret_cast<const fp16*>(x2.data_ptr()),
             reinterpret_cast<int8_t*>(output.data_ptr()),
-            scales.data_ptr<float>(), M, K, x1.device());
+            scales.data_ptr<float>(), M, K, K, K, x1.device());
     }
 
     auto scale_shape = x1.sizes().vec();
     scale_shape.back() = 1;
     return {output.reshape(x1.sizes()), scales.reshape(scale_shape)};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> fused_swiglu_quantize_rowwise(
+    torch::Tensor input
+) {
+    TORCH_CHECK(input.device().is_xpu(), "input must be on XPU device");
+    TORCH_CHECK(input.dim() >= 2, "input must be at least 2D");
+    TORCH_CHECK(
+        input.scalar_type() == torch::kBFloat16 ||
+        input.scalar_type() == torch::kHalf,
+        "input must be bf16 or f16, got ", input.scalar_type());
+    TORCH_CHECK(input.size(-1) > 0 && input.size(-1) % 2 == 0,
+                "input last dimension must be positive and even");
+
+    input = input.contiguous();
+    const int64_t K = input.size(-1) / 2;
+    const int64_t M = input.numel() / (2 * K);
+    auto output_shape = input.sizes().vec();
+    output_shape.back() = K;
+    auto scale_shape = output_shape;
+    scale_shape.back() = 1;
+    auto output = torch::empty(
+        output_shape, input.options().dtype(torch::kInt8));
+    auto scales = torch::empty(
+        {M}, input.options().dtype(torch::kFloat32));
+
+    if (input.scalar_type() == torch::kBFloat16) {
+        const auto* source = reinterpret_cast<const bf16*>(input.data_ptr());
+        fused_silu_mul_quantize_rowwise_kernel<bf16>(
+            source,
+            source + K,
+            output.data_ptr<int8_t>(),
+            scales.data_ptr<float>(),
+            M,
+            K,
+            2 * K,
+            2 * K,
+            input.device());
+    } else {
+        const auto* source = reinterpret_cast<const fp16*>(input.data_ptr());
+        fused_silu_mul_quantize_rowwise_kernel<fp16>(
+            source,
+            source + K,
+            output.data_ptr<int8_t>(),
+            scales.data_ptr<float>(),
+            M,
+            K,
+            2 * K,
+            2 * K,
+            input.device());
+    }
+    return {output, scales.reshape(scale_shape)};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> fused_gelu_tanh_quantize_rowwise(
+    torch::Tensor input
+) {
+    TORCH_CHECK(input.device().is_xpu(), "input must be on XPU device");
+    TORCH_CHECK(input.dim() >= 2, "input must be at least 2D");
+    TORCH_CHECK(
+        input.scalar_type() == torch::kBFloat16 ||
+        input.scalar_type() == torch::kHalf,
+        "input must be bf16 or f16, got ", input.scalar_type());
+    TORCH_CHECK(input.size(-1) > 0,
+                "input last dimension must be positive");
+
+    input = input.contiguous();
+    const int64_t K = input.size(-1);
+    const int64_t M = input.numel() / K;
+    auto output = torch::empty(
+        input.sizes(), input.options().dtype(torch::kInt8));
+    auto scale_shape = input.sizes().vec();
+    scale_shape.back() = 1;
+    auto scales = torch::empty(
+        {M}, input.options().dtype(torch::kFloat32));
+
+    constexpr int64_t kCachedElementsLimit = 16384;
+    const bool use_cached_kernel = K <= kCachedElementsLimit;
+    int cached_workgroup_size = 256;
+#if defined(OMNI_XPU_ARCH_BMG)
+    // BMG's transcendental pipeline benefits from exposing each GELU to more
+    // independent work-items (the same direction established for fused SiLU).
+    // Match the measured BMG crossover: WG512 is best for K=2048/4096 while
+    // the much wider K=16384 contract needs WG1024. Narrow rows retain WG256.
+    if (K >= 8192) {
+        cached_workgroup_size = 1024;
+    } else if (K >= 1024) {
+        cached_workgroup_size = 512;
+    }
+#endif
+
+    if (input.scalar_type() == torch::kBFloat16) {
+        if (use_cached_kernel) {
+            fused_gelu_tanh_quantize_rowwise_cached_kernel<bf16>(
+                reinterpret_cast<const bf16*>(input.data_ptr()),
+                output.data_ptr<int8_t>(),
+                scales.data_ptr<float>(),
+                M,
+                K,
+                cached_workgroup_size,
+                input.device());
+        } else {
+            fused_gelu_tanh_quantize_rowwise_kernel<bf16>(
+                reinterpret_cast<const bf16*>(input.data_ptr()),
+                output.data_ptr<int8_t>(),
+                scales.data_ptr<float>(),
+                M,
+                K,
+                input.device());
+        }
+    } else {
+        if (use_cached_kernel) {
+            fused_gelu_tanh_quantize_rowwise_cached_kernel<fp16>(
+                reinterpret_cast<const fp16*>(input.data_ptr()),
+                output.data_ptr<int8_t>(),
+                scales.data_ptr<float>(),
+                M,
+                K,
+                cached_workgroup_size,
+                input.device());
+        } else {
+            fused_gelu_tanh_quantize_rowwise_kernel<fp16>(
+                reinterpret_cast<const fp16*>(input.data_ptr()),
+                output.data_ptr<int8_t>(),
+                scales.data_ptr<float>(),
+                M,
+                K,
+                input.device());
+        }
+    }
+    return {output, scales.reshape(scale_shape)};
 }
 
 #if defined(OMNI_XPU_ARCH_BMG)

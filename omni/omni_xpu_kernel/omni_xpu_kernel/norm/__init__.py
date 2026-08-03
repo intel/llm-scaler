@@ -198,6 +198,17 @@ def fused_adaln(
     return _get_native().fused_adaln(input, scale, shift, row_repeat, eps)
 
 
+def fused_rms_adaln(
+    input: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    row_repeat: int = 1,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Fuse RMSNorm and AdaLN modulation into one ESIMD kernel."""
+    return _get_native().fused_rms_adaln(input, scale, shift, row_repeat, eps)
+
+
 __all__ = [
     "group_norm_bmg",
     "rms_norm",
@@ -206,5 +217,6 @@ __all__ = [
     "fused_add_rms_norm",
     "fused_rms_norm_linear",
     "fused_adaln",
+    "fused_rms_adaln",
     "supports_group_norm_bmg",
 ]

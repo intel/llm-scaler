@@ -1816,5 +1816,152 @@ class TestXPUNativeInt8:
         assert stats["size"] >= 2, "Cache should have separate entries"
 
 
+def test_h3_swiglu_input_act_uses_fused_quantized_boundary(device, seed):
+    if device.type != "xpu":
+        pytest.skip("native XPU extension required")
+
+    from omni_xpu_kernel import int8
+
+    rows, hidden, output = 37, 256, 96
+    x = torch.randn(rows, 2 * hidden, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(output, hidden, device=device, dtype=torch.bfloat16)
+    qweight, weight_scale = int8.quantize_int8_tensorwise(weight)
+
+    actual_q, actual_scale = int8.fused_swiglu_quantize_rowwise(x)
+    gate, up = x.chunk(2, dim=-1)
+    activated = torch.nn.functional.silu(gate).mul(up)
+    expected_q, expected_scale = int8.quantize_int8_rowwise(activated)
+    torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
+    torch.testing.assert_close(actual_scale, expected_scale, rtol=1e-5, atol=1e-7)
+
+    actual = int8.int8_linear(
+        x,
+        qweight,
+        weight_scale,
+        out_dtype=torch.bfloat16,
+        input_act="swiglu",
+    )
+    expected = int8.int8_linear(
+        activated,
+        qweight,
+        weight_scale,
+        out_dtype=torch.bfloat16,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+
+
+def test_h3_exact_ffn_width_swiglu_quantizer(device, seed):
+    if device.type != "xpu":
+        pytest.skip("native XPU extension required")
+
+    from omni_xpu_kernel import int8
+
+    rows, hidden = 3, 14336
+    x = torch.randn(rows, 2 * hidden, device=device, dtype=torch.bfloat16)
+    actual_q, actual_scale = int8.fused_swiglu_quantize_rowwise(x)
+    gate, up = x.chunk(2, dim=-1)
+    activated = torch.nn.functional.silu(gate).mul(up)
+    expected_q, expected_scale = int8.quantize_int8_rowwise(activated)
+
+    assert actual_q.shape == (rows, hidden)
+    assert actual_scale.shape == (rows, 1)
+    torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
+    torch.testing.assert_close(actual_scale, expected_scale, rtol=1e-5, atol=1e-7)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(37, 300), (2, 17, 256), (4, 4096)])
+def test_fused_gelu_tanh_quantizer_matches_materialized_boundary(
+    device, seed, dtype, shape
+):
+    if device.type != "xpu":
+        pytest.skip("native XPU extension required")
+
+    from omni_xpu_kernel import int8
+
+    x = torch.randn(shape, device=device, dtype=dtype)
+    actual_q, actual_scale = int8.fused_gelu_tanh_quantize_rowwise(x)
+    activated = torch.nn.functional.gelu(x, approximate="tanh")
+    expected_q, expected_scale = int8.quantize_int8_rowwise(activated)
+
+    assert actual_q.shape == x.shape
+    assert actual_scale.shape == (*x.shape[:-1], 1)
+    q_difference = (actual_q.int() - expected_q.int()).abs()
+    if dtype is torch.bfloat16:
+        assert q_difference.count_nonzero().item() == 0
+        torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)
+    else:
+        # oneAPI's native tanh and PyTorch's XPU GELU can round differently in
+        # FP16. The accepted boundary is at most one quantized LSB for fewer
+        # than one percent of elements, with matching row scales to 0.1%.
+        assert q_difference.max().item() <= 1
+        assert q_difference.count_nonzero().item() / q_difference.numel() < 0.01
+        torch.testing.assert_close(
+            actual_scale, expected_scale, rtol=1e-3, atol=1e-7
+        )
+
+
+def test_gelu_tanh_int8_linear_uses_native_fused_boundary(device, seed, monkeypatch):
+    if device.type != "xpu":
+        pytest.skip("native XPU extension required")
+
+    from omni_xpu_kernel import int8
+
+    batch, tokens, hidden, output = 2, 17, 256, 96
+    x = torch.randn(batch, tokens, hidden, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(output, hidden, device=device, dtype=torch.bfloat16)
+    qweight, weight_scale = int8.quantize_int8_tensorwise(weight)
+    x_int8, x_scale = int8.fused_gelu_tanh_quantize_rowwise(x)
+    expected = int8.int8_linear_prequantized(
+        x_int8,
+        x_scale,
+        qweight,
+        weight_scale,
+        out_dtype=torch.bfloat16,
+    )
+
+    def reject_materialized_activation(*_args, **_kwargs):
+        raise AssertionError("gelu_tanh materialized a floating activation")
+
+    monkeypatch.setattr(int8, "_apply_input_act", reject_materialized_activation)
+    actual = int8.int8_linear(
+        x,
+        qweight,
+        weight_scale,
+        out_dtype=torch.bfloat16,
+        input_act="gelu_tanh",
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_gelu_tanh_large_dispatch_keeps_materialized_route(device, seed, monkeypatch):
+    if device.type != "xpu":
+        pytest.skip("native XPU extension required")
+
+    from omni_xpu_kernel import int8
+
+    rows, hidden, output = 128, 256, 32
+    x = torch.randn(rows, hidden, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(output, hidden, device=device, dtype=torch.bfloat16)
+    qweight, weight_scale = int8.quantize_int8_tensorwise(weight)
+    original_apply = int8._apply_input_act
+    materialized = []
+
+    def record_materialized_activation(value, input_act):
+        materialized.append(input_act)
+        return original_apply(value, input_act)
+
+    monkeypatch.setattr(int8, "_apply_input_act", record_materialized_activation)
+    actual = int8.int8_linear(
+        x,
+        qweight,
+        weight_scale,
+        out_dtype=torch.bfloat16,
+        input_act="gelu_tanh",
+    )
+    assert materialized == ["gelu_tanh"]
+    assert actual.shape == (rows, output)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
