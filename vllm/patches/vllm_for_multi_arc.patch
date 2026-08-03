@@ -320,6 +320,70 @@ index 9b147bf69..a5d0cd088 100644
  
 -vllm_xpu_kernels @ https://github.com/vllm-project/vllm-xpu-kernels/releases/download/v0.1.7/vllm_xpu_kernels-0.1.7-cp38-abi3-manylinux_2_28_x86_64.whl
 +vllm_xpu_kernels @ https://github.com/vllm-project/vllm-xpu-kernels/releases/download/v0.1.8.2/vllm_xpu_kernels-0.1.8.2-cp38-abi3-manylinux_2_28_x86_64.whl
+diff --git a/tests/lora/test_fused_moe_lora_kernel.py b/tests/lora/test_fused_moe_lora_kernel.py
+index e50d7d5aa..8178ff370 100644
+--- a/tests/lora/test_fused_moe_lora_kernel.py
++++ b/tests/lora/test_fused_moe_lora_kernel.py
+@@ -141,6 +141,9 @@ def use_fused_moe_lora_kernel(
+     block_size,
+     fully_sharded=False,
+     offset=0,
++    a_row_mapping=None,
++    c_row_mapping=None,
++    mul_routed_weight=False,
+ ):
+     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+     max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
+@@ -181,7 +184,6 @@ def use_fused_moe_lora_kernel(
+         "SPLIT_K": 1,
+     }
+ 
+-    mul_routed_weight = False
+     expert_ids = expert_ids.view(max_loras, -1)
+     sorted_token_ids = sorted_token_ids.view(max_loras, -1)
+ 
+@@ -222,6 +224,8 @@ def use_fused_moe_lora_kernel(
+         mul_routed_weight,
+         fully_sharded=fully_sharded,
+         offset=offset,
++        a_row_mapping=a_row_mapping,
++        c_row_mapping=c_row_mapping,
+     )
+ 
+ 
+diff --git a/tests/lora/test_lora_checkpoints.py b/tests/lora/test_lora_checkpoints.py
+index 7c263e2a2..fab150a4e 100644
+--- a/tests/lora/test_lora_checkpoints.py
++++ b/tests/lora/test_lora_checkpoints.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import pytest
++import torch.nn as nn
++from transformers import Gemma4TextConfig
+ 
+ from vllm.lora.lora_model import LoRAModel
+ from vllm.lora.peft_helper import PEFTHelper
+@@ -151,3 +153,19 @@ def test_gemma4_moe_lora_weights_mapping():
+         "model.layers.9.moe.gate_up_proj",
+         False,
+     )
++
++
++def test_gemma4_moe_expert_mapping():
++    model = Gemma4ForCausalLM.__new__(Gemma4ForCausalLM)
++    nn.Module.__init__(model)
++    model.config = Gemma4TextConfig(num_experts=2)
++    model.num_redundant_experts = 0
++
++    assert model.get_expert_mapping() == [
++        ("experts.w13_", "experts.0.gate_proj.", 0, "w1"),
++        ("experts.w2_", "experts.0.down_proj.", 0, "w2"),
++        ("experts.w13_", "experts.0.up_proj.", 0, "w3"),
++        ("experts.w13_", "experts.1.gate_proj.", 1, "w1"),
++        ("experts.w2_", "experts.1.down_proj.", 1, "w2"),
++        ("experts.w13_", "experts.1.up_proj.", 1, "w3"),
++    ]
 diff --git a/tests/lora/test_minicpmv_tp.py b/tests/lora/test_minicpmv_tp.py
 index 3d6484a71..4c7f4112e 100644
 --- a/tests/lora/test_minicpmv_tp.py
@@ -350,6 +414,286 @@ index 3d6484a71..4c7f4112e 100644
  MODEL_PATH = "openbmb/MiniCPM-Llama3-V-2_5"
  
  PROMPT_TEMPLATE = (
+diff --git a/tests/model_executor/model_loader/test_device_loading_context.py b/tests/model_executor/model_loader/test_device_loading_context.py
+new file mode 100644
+index 000000000..33fb5cf5b
+--- /dev/null
++++ b/tests/model_executor/model_loader/test_device_loading_context.py
+@@ -0,0 +1,54 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import pytest
++import torch
++
++from vllm.model_executor.model_loader.utils import device_loading_context
++from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
++
++
++@pytest.mark.skipif(not torch.xpu.is_available(), reason="requires XPU")
++def test_replaced_parameter_can_remain_on_device() -> None:
++    module = torch.nn.Linear(16, 16, bias=False, device="cpu")
++
++    with device_loading_context(module, torch.device("xpu")):
++        weight = torch.nn.Parameter(
++            torch.ones_like(module.weight, device="xpu"), requires_grad=False
++        )
++        weight._vllm_keep_on_device = True
++        module.weight = weight
++
++    assert module.weight.device.type == "xpu"
++    assert module.weight._vllm_keep_on_device
++
++
++@pytest.mark.skipif(not torch.xpu.is_available(), reason="requires XPU")
++def test_unmarked_parameter_is_restored_to_original_device() -> None:
++    module = torch.nn.Linear(16, 16, bias=False, device="cpu")
++
++    with device_loading_context(module, torch.device("xpu")):
++        assert module.weight.device.type == "xpu"
++
++    assert module.weight.device.type == "cpu"
++
++
++@pytest.mark.skipif(not torch.xpu.is_available(), reason="requires XPU")
++def test_replaced_uva_parameter_can_remain_on_device() -> None:
++    module = torch.nn.Linear(16, 16, bias=False, device="cpu")
++    cpu_weight = module.weight.detach().pin_memory()
++    uva_weight = torch.nn.Parameter(
++        get_accelerator_view_from_cpu_tensor(cpu_weight), requires_grad=False
++    )
++    uva_weight._vllm_is_uva_offloaded = True
++    module.weight = uva_weight
++
++    with device_loading_context(module, torch.device("xpu")):
++        weight = torch.nn.Parameter(
++            torch.ones_like(module.weight, device="xpu"), requires_grad=False
++        )
++        weight._vllm_keep_on_device = True
++        module.weight = weight
++
++    assert module.weight.device.type == "xpu"
++    assert module.weight._vllm_keep_on_device
++    assert not getattr(module.weight, "_vllm_is_uva_offloaded", False)
+diff --git a/tests/models/test_qwen3_next_gate_dequant.py b/tests/models/test_qwen3_next_gate_dequant.py
+new file mode 100644
+index 000000000..88d6e201d
+--- /dev/null
++++ b/tests/models/test_qwen3_next_gate_dequant.py
+@@ -0,0 +1,159 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Unit tests for the fused-router FP8 gate dequantization helper.
++
++The fused post-attention RMSNorm + MoE router GEMV path needs the router gate
++as per-tensor FP8. When a checkpoint ships an already-quantized gate it must be
++dequantized first, because ``scaled_fp8_quant`` dispatches on the input dtype
++and has no FP8 case. These tests pin the block-scale expansion, in particular
++for dimensions that are not a multiple of the block size.
++"""
++
++import pytest
++import torch
++
++from vllm.model_executor.models.qwen3_next import _dequantize_fp8_gate_weight
++
++
++class _FakeGate:
++    def __init__(self, weight_scale_inv=None, weight_scale=None, weight_block_size=None):
++        if weight_scale_inv is not None:
++            self.weight_scale_inv = weight_scale_inv
++        if weight_scale is not None:
++            self.weight_scale = weight_scale
++        if weight_block_size is not None:
++            self.weight_block_size = weight_block_size
++
++
++def _fp8(t: torch.Tensor) -> torch.Tensor:
++    return t.to(torch.float8_e4m3fn)
++
++
++@pytest.mark.parametrize("n,k", [(256, 256), (129, 129), (128, 200), (1, 1)])
++def test_block_scale_expansion_matches_reference(n, k):
++    """Every element must be scaled by the block that actually owns it."""
++    bn = bk = 128
++    torch.manual_seed(0)
++    w = _fp8(torch.randn(n, k) * 4)
++    scale = torch.rand((n + bn - 1) // bn, (k + bk - 1) // bk) + 0.5
++    gate = _FakeGate(weight_scale_inv=scale, weight_block_size=[bn, bk])
++
++    out = _dequantize_fp8_gate_weight(gate, w)
++
++    wf = w.to(torch.float32)
++    ref = torch.empty(n, k, dtype=torch.float32)
++    for i in range(n):
++        for j in range(k):
++            ref[i, j] = wf[i, j] * scale[i // bn, j // bk]
++
++    assert out.dtype == torch.float16
++    assert out.shape == (n, k)
++    torch.testing.assert_close(out, ref.to(torch.float16), rtol=1e-3, atol=1e-3)
++
++
++def test_non_multiple_dim_is_not_split_evenly():
++    """Regression: a ratio-derived block size would give 65/65 for N=129."""
++    n, k, bn, bk = 129, 128, 128, 128
++    w = _fp8(torch.ones(n, k))
++    scale = torch.tensor([[2.0], [7.0]])
++    gate = _FakeGate(weight_scale_inv=scale, weight_block_size=[bn, bk])
++
++    out = _dequantize_fp8_gate_weight(gate, w).to(torch.float32)
++
++    # Rows 0..127 belong to block 0, only row 128 belongs to block 1.
++    assert torch.all(out[:128] == 2.0)
++    assert torch.all(out[128] == 7.0)
++
++
++def test_missing_block_size_fails_closed():
++    gate = _FakeGate(weight_scale_inv=torch.ones(1, 1))
++    with pytest.raises(RuntimeError, match="weight_block_size"):
++        _dequantize_fp8_gate_weight(gate, _fp8(torch.ones(4, 4)))
++
++
++def test_scale_shape_mismatch_fails_closed():
++    gate = _FakeGate(weight_scale_inv=torch.ones(3, 1), weight_block_size=[128, 128])
++    with pytest.raises(RuntimeError, match="does not match"):
++        _dequantize_fp8_gate_weight(gate, _fp8(torch.ones(129, 128)))
++
++
++def test_missing_any_scale_fails_closed():
++    with pytest.raises(RuntimeError, match="neither weight_scale"):
++        _dequantize_fp8_gate_weight(_FakeGate(), _fp8(torch.ones(4, 4)))
++
++
++def test_per_tensor_scale():
++    w = _fp8(torch.ones(8, 4))
++    gate = _FakeGate(weight_scale=torch.tensor([3.0]))
++    out = _dequantize_fp8_gate_weight(gate, w).to(torch.float32)
++    assert torch.all(out == 3.0)
++
++
++def test_per_channel_scale_broadcasts_over_rows():
++    n, k = 4, 3
++    w = _fp8(torch.ones(n, k))
++    scale = torch.tensor([1.0, 2.0, 3.0, 4.0])
++    gate = _FakeGate(weight_scale=scale)
++    out = _dequantize_fp8_gate_weight(gate, w).to(torch.float32)
++    torch.testing.assert_close(out, scale.reshape(-1, 1).expand(n, k).contiguous())
++
++
++# ---------------------------------------------------------------------------
++# LoRA guard wiring
++#
++# The fused post-attn RMSNorm + router GEMV path caches a snapshot of the
++# *base* gate weight, so an active LoRA adapter on mlp.gate would silently not
++# affect routing. _init_esimd_flags therefore takes a lora_enabled flag. Every
++# DecoderLayer that calls it must pass that flag: Qwen3_5DecoderLayer bypasses
++# Qwen3NextDecoderLayer.__init__ and calls the helper itself, and both models
++# declare SupportsLoRA. A forgotten argument is a silent accuracy bug, not a
++# crash, so pin the wiring statically.
++# ---------------------------------------------------------------------------
++
++import ast
++import inspect
++import textwrap
++
++
++def _init_esimd_flags_signature():
++    import vllm.model_executor.models.qwen3_next as qwen3_next
++
++    return inspect.signature(qwen3_next.Qwen3NextDecoderLayer._init_esimd_flags)
++
++
++def test_lora_enabled_has_no_default():
++    """A default would let a caller silently skip the LoRA guard."""
++    param = _init_esimd_flags_signature().parameters["lora_enabled"]
++    assert param.default is inspect.Parameter.empty, (
++        "lora_enabled must not have a default: callers that forget it would "
++        "silently re-enable the fused router GEMV under LoRA."
++    )
++
++
++@pytest.mark.parametrize(
++    "module_name",
++    ["vllm.model_executor.models.qwen3_next", "vllm.model_executor.models.qwen3_5"],
++)
++def test_every_caller_passes_lora_enabled(module_name):
++    import importlib
++
++    module = importlib.import_module(module_name)
++    tree = ast.parse(textwrap.dedent(inspect.getsource(module)))
++
++    calls = [
++        node
++        for node in ast.walk(tree)
++        if isinstance(node, ast.Call)
++        and isinstance(node.func, ast.Attribute)
++        and node.func.attr == "_init_esimd_flags"
++    ]
++    assert calls, f"no _init_esimd_flags call found in {module_name}"
++
++    for call in calls:
++        passes_lora = len(call.args) >= 2 or any(
++            kw.arg == "lora_enabled" for kw in call.keywords
++        )
++        assert passes_lora, (
++            f"{module_name}:{call.lineno} calls _init_esimd_flags without "
++            "lora_enabled; the fused router GEMV would bypass gate LoRA."
++        )
+diff --git a/tests/quantization/test_sym_int4.py b/tests/quantization/test_sym_int4.py
+new file mode 100644
+index 000000000..b3343b64f
+--- /dev/null
++++ b/tests/quantization/test_sym_int4.py
+@@ -0,0 +1,49 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import torch
++from torch import nn
++
++from vllm.model_executor.layers.quantization import sym_int4
++
++
++def test_disabled_esimd_int4_does_not_retain_source_layout(monkeypatch):
++    monkeypatch.setattr(sym_int4, "disable_esimd_int4", lambda: True)
++    layer = nn.Module()
++    qweight = torch.zeros((4, 8), dtype=torch.int32)
++    scale = torch.zeros((4, 2), dtype=torch.float16)
++
++    sym_int4._register_linear_int4_layouts(layer, qweight, scale)
++
++    assert not hasattr(layer, "weight_esimd")
++    assert not hasattr(layer, "scale_esimd")
++    assert layer.qweight.shape == (8, 4)
++    assert layer.scales.shape == (2, 4)
++    assert layer.qweight.untyped_storage().data_ptr() == (
++        qweight.untyped_storage().data_ptr()
++    )
++    assert layer.scales.untyped_storage().data_ptr() != (
++        scale.untyped_storage().data_ptr()
++    )
++
++
++def test_enabled_esimd_int4_retains_source_layout(monkeypatch):
++    monkeypatch.setattr(sym_int4, "disable_esimd_int4", lambda: False)
++    layer = nn.Module()
++    qweight = torch.zeros((4, 8), dtype=torch.int32)
++    scale = torch.zeros((4, 2), dtype=torch.float16)
++
++    sym_int4._register_linear_int4_layouts(layer, qweight, scale)
++
++    assert layer.weight_esimd.untyped_storage().data_ptr() == (
++        qweight.untyped_storage().data_ptr()
++    )
++    assert layer.scale_esimd.untyped_storage().data_ptr() == (
++        scale.untyped_storage().data_ptr()
++    )
++    assert layer.qweight.untyped_storage().data_ptr() == (
++        qweight.untyped_storage().data_ptr()
++    )
++    assert layer.scales.untyped_storage().data_ptr() != (
++        scale.untyped_storage().data_ptr()
++    )
 diff --git a/tests/test_bidir_sliding.py b/tests/test_bidir_sliding.py
 new file mode 100644
 index 000000000..461db8992
@@ -779,6 +1123,71 @@ index 000000000..caf1c3054
 +ok_sw = check("sliding(causal seq0 + bidir seq1, W=4)", [3, 0])
 +
 +print("ALL PASS" if (ok_full and ok_sw) else "SOME FAILED")
+diff --git a/tests/v1/cudagraph/test_cudagraph_dispatch.py b/tests/v1/cudagraph/test_cudagraph_dispatch.py
+index 97b5fd46a..e65ac72ae 100644
+--- a/tests/v1/cudagraph/test_cudagraph_dispatch.py
++++ b/tests/v1/cudagraph/test_cudagraph_dispatch.py
+@@ -76,6 +76,22 @@ def _create_vllm_config(
+ 
+ 
+ class TestCudagraphDispatcher:
++    def test_eager_preserves_uniform_decode_descriptor(self):
++        comp_config = CompilationConfig(
++            cudagraph_mode="NONE",
++            mode=CompilationMode.NONE,
++        )
++        dispatcher = CudagraphDispatcher(_create_vllm_config(comp_config))
++        dispatcher.initialize_cudagraph_keys(CUDAGraphMode.NONE)
++
++        runtime_mode, descriptor = dispatcher.dispatch(
++            num_tokens=1,
++            uniform_decode=True,
++        )
++
++        assert runtime_mode == CUDAGraphMode.NONE
++        assert descriptor == BatchDescriptor(num_tokens=1, uniform=True)
++
+     @pytest.mark.parametrize(
+         "cudagraph_mode_str,compilation_mode,lora_config",
+         [
+diff --git a/tests/xpu/test_fp8_block_moe_dtype_gate.py b/tests/xpu/test_fp8_block_moe_dtype_gate.py
+new file mode 100644
+index 000000000..92d283364
+--- /dev/null
++++ b/tests/xpu/test_fp8_block_moe_dtype_gate.py
+@@ -0,0 +1,32 @@
++import pytest
++import torch
++
++from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
++    _xpu_block_moe_forward,
++)
++from vllm.model_executor.models.qwen3_next import (
++    _require_fp16_block_moe_activations,
++)
++
++
++def test_modular_block_moe_bf16_has_actionable_error() -> None:
++    hidden_states = torch.empty((1, 128), dtype=torch.bfloat16)
++    with pytest.raises(RuntimeError, match="--dtype float16"):
++        _xpu_block_moe_forward(
++            experts=None,
++            output=None,
++            hidden_states=hidden_states,
++            w1=None,
++            w2=None,
++            w1_scale=None,
++            w2_scale=None,
++            topk_weights=None,
++            topk_ids=None,
++            activation=None,
++        )
++
++
++def test_qwen_block_moe_bf16_has_actionable_error() -> None:
++    hidden_states = torch.empty((1, 128), dtype=torch.bfloat16)
++    with pytest.raises(RuntimeError, match="--dtype float16"):
++        _require_fp16_block_moe_activations(hidden_states)
 diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
 index 553513de6..2a4edb703 100644
 --- a/vllm/_custom_ops.py
@@ -1039,10 +1448,10 @@ index 53f91e1b6..e50a11b0a 100644
                      self.scheduler_config.max_num_seqs * decode_query_len * 2, 512
                  )
 diff --git a/vllm/distributed/device_communicators/xpu_communicator.py b/vllm/distributed/device_communicators/xpu_communicator.py
-index 209005c5b..cc601ac3e 100644
+index 209005c5b..7c97e80c5 100644
 --- a/vllm/distributed/device_communicators/xpu_communicator.py
 +++ b/vllm/distributed/device_communicators/xpu_communicator.py
-@@ -2,15 +2,98 @@
+@@ -2,15 +2,105 @@
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  
  
@@ -1061,6 +1470,13 @@ index 209005c5b..cc601ac3e 100644
 +_xpu_graph_replay_seen = False
 +_xpu_allreduce_retry_seq = 0
 +_XPU_ALLREDUCE_RETRY_SHAPES = "25,5120;25,2048"
++# The XPU all-reduce collective only returns NaN on large (prefill-sized)
++# buffers. The repair guard arms on the reduce's token count (rows), which is
++# model-agnostic: it spares the num_tokens==1 decode reduce on any hidden size
++# while catching prefill/embedding reduces of >= this many tokens.
++_XPU_ALLREDUCE_GUARD_MIN_ROWS = int(
++    os.environ.get("VLLM_XPU_ALLREDUCE_GUARD_MIN_ROWS", "128")
++)
 +
 +
 +def _env_enabled(name: str, default: bool) -> bool:
@@ -1141,7 +1557,7 @@ index 209005c5b..cc601ac3e 100644
  
  
  class XpuCommunicator(DeviceCommunicatorBase):
-@@ -40,10 +123,85 @@ class XpuCommunicator(DeviceCommunicatorBase):
+@@ -40,10 +130,107 @@ class XpuCommunicator(DeviceCommunicatorBase):
  
                  self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
                  logger.info("Using AgRs manager on XPU device.")
@@ -1151,14 +1567,30 @@ index 209005c5b..cc601ac3e 100644
  
      def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
 -        output = input_.clone()
++        if os.environ.get("SKIP_ALL_REDUCE") == "1":
++            return input_
 +        global _xpu_allreduce_retry_seq
 +        output = input_.clone() if torch.compiler.is_compiling() else input_
 +        retry_armed = False
 +        batch_descriptor = None
 +        runtime_mode = None
++        # The XPU all-reduce collective can intermittently return NaN from finite
++        # input on large (prefill-sized) buffers; the NaN then corrupts the
++        # token's hidden state and cascades to garbage ("!!!!") decode output.
++        # VLLM_XPU_ALLREDUCE_RETRY_ON_NAN gates the detect/retry/allgather-repair
++        # guard. Previously arming *also* required `_xpu_graph_replay_seen`, which
++        # is only set in XPU-graph mode, so under --enforce-eager the guard never
++        # armed and these NaNs went unrepaired. That graph requirement is now
++        # dropped. To avoid taxing every all-reduce (clone + NaN scan + an extra
++        # scalar all-reduce) on the hot decode path, arming is still gated: a
++        # tensor is armed only when it covers enough tokens to be at risk (row
++        # gate), or the forward context marks it as a multi-token/prefill reduce,
++        # or its shape is in the explicit retry list. The row gate is what covers
++        # the pre-forward embedding all-reduce (batch_descriptor is None, so
++        # context gating alone misses it) while sparing the num_tokens==1 decode
++        # reduces on any hidden size.
 +        if (
 +            _env_enabled("VLLM_XPU_ALLREDUCE_RETRY_ON_NAN", True)
-+            and _xpu_graph_replay_seen
 +            and not torch.compiler.is_compiling()
 +            and output.is_floating_point()
 +            and output.numel() > 0
@@ -1167,7 +1599,13 @@ index 209005c5b..cc601ac3e 100644
 +            context_allowed, batch_descriptor, runtime_mode = (
 +                _xpu_retry_context_allowed()
 +            )
-+            retry_armed = context_allowed or _xpu_retry_shape_allowed(output)
++            big = (
++                output.dim() >= 1
++                and output.shape[0] >= _XPU_ALLREDUCE_GUARD_MIN_ROWS
++            )
++            retry_armed = (
++                big or context_allowed or _xpu_retry_shape_allowed(output)
++            )
 +        retry_input = output.clone() if retry_armed else None
 +
          dist.all_reduce(output, group=self.device_group)
@@ -1349,6 +1787,633 @@ index ded474dc0..7a29d18c0 100755
  }
  
  
+diff --git a/vllm/lora/layers/base_linear.py b/vllm/lora/layers/base_linear.py
+index 68783ae50..206b0695f 100644
+--- a/vllm/lora/layers/base_linear.py
++++ b/vllm/lora/layers/base_linear.py
+@@ -74,6 +74,23 @@ if envs.VLLM_LORA_ENABLE_DUAL_STREAM:
+ 
+ 
+ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
++    def __getattr__(self, name: str):
++        """Forward quantization-specific attributes to the wrapped layer.
++
++        Some quantized XPU fast paths access auxiliary tensors such as
++        ``weight_esimd`` and ``scale_esimd`` on the linear module itself.
++        LoRA replaces that module with this wrapper, so preserve the wrapped
++        layer's public interface instead of copying and re-registering its
++        parameters on the wrapper.
++        """
++        try:
++            return super().__getattr__(name)
++        except AttributeError:
++            if name == "base_layer":
++                raise
++            base_layer = super().__getattr__("base_layer")
++            return getattr(base_layer, name)
++
+     def __init__(self, base_layer: LinearBase):
+         super().__init__()
+ 
+diff --git a/vllm/lora/layers/column_parallel_linear.py b/vllm/lora/layers/column_parallel_linear.py
+index 01bbc9366..3291f6364 100644
+--- a/vllm/lora/layers/column_parallel_linear.py
++++ b/vllm/lora/layers/column_parallel_linear.py
+@@ -61,7 +61,13 @@ def _mcp_apply(x, bias, layer: "ColumnParallelLinearWithLoRA"):
+     if not current_platform.can_update_inplace():
+         buffers = shrunk_buffers
+ 
+-    buffers = tensor_model_parallel_all_gather(buffers)
++    # The rank-dim all-gather is only correct for fully-sharded LoRA, where
++    # lora_a is sliced along the rank dimension and each rank holds a partial
++    # shrink result. In the default (non-sharded) path lora_a is replicated, so
++    # every rank already holds the full-rank shrink result; gathering here would
++    # concatenate it to rank*tp_size and break the expand GEMM.
++    if layer.lora_config.fully_sharded_loras:
++        buffers = tensor_model_parallel_all_gather(buffers)
+ 
+     lora_output: torch.Tensor | None = layer.punica_wrapper.add_expand(
+         output,
+diff --git a/vllm/lora/layers/fused_moe.py b/vllm/lora/layers/fused_moe.py
+index 8cb32f079..386d72805 100644
+--- a/vllm/lora/layers/fused_moe.py
++++ b/vllm/lora/layers/fused_moe.py
+@@ -18,6 +18,7 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
+ from vllm.model_executor.layers.fused_moe.prepare_finalize import (
+     MoEPrepareAndFinalizeNoDPEPModular,
+ )
++from vllm.platforms import current_platform
+ 
+ from .utils import _get_lora_device
+ 
+@@ -33,6 +34,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+         self.tp_size = self.base_layer.tp_size
+         self.tp_rank = self.base_layer.tp_rank
+         self.device = _get_lora_device(base_layer)
++        # sym_int4 can intentionally allocate the pre-quantization MoE weights
++        # on CPU (VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1). Those tensors are only
++        # staging buffers: the quantized experts and all inference inputs live
++        # on XPU. Do not inherit the staging device for routed-expert LoRA
++        # buffers, otherwise Triton receives inaccessible CPU pointers.
++        if current_platform.is_xpu() and self.device.type == "cpu":
++            self.device = current_platform.current_device()
+         # For non-gated MoE (is_act_and_mul=False), only 1 slice is needed
+         # since there's only up_proj (w1), not gate_proj + up_proj (w1 + w3)
+         self._w13_slices = 2 if base_layer.moe_config.is_act_and_mul else 1
+@@ -86,21 +94,24 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+         max_loras: int,
+         lora_config: LoRAConfig,
+     ):
+-        self.w13_lora_a_stacked: tuple[torch.Tensor, ...] = tuple(
+-            torch.zeros(
+-                (
+-                    max_loras,
+-                    self.base_layer.local_num_experts,
+-                    lora_config.max_lora_rank
+-                    if not self.fully_sharded
+-                    else divide(lora_config.max_lora_rank, self.tp_size),
+-                    self.base_layer.hidden_size,
+-                ),
+-                dtype=lora_config.lora_dtype,
+-                device=self.device,
+-            )
+-            for _ in range(self._w13_slices)
++        # Keep the projection slices in one allocation. Besides improving
++        # locality, this gives device backends which cannot dereference a
++        # device-side pointer table (notably XPU) a base pointer plus a regular
++        # slice stride that the fused LoRA kernel can consume directly.
++        w13_lora_a = torch.zeros(
++            (
++                self._w13_slices,
++                max_loras,
++                self.base_layer.local_num_experts,
++                lora_config.max_lora_rank
++                if not self.fully_sharded
++                else divide(lora_config.max_lora_rank, self.tp_size),
++                self.base_layer.hidden_size,
++            ),
++            dtype=lora_config.lora_dtype,
++            device=self.device,
+         )
++        self.w13_lora_a_stacked = tuple(w13_lora_a.unbind(0))
+         self.w2_lora_a_stacked: tuple[torch.Tensor, ...] = (
+             torch.zeros(
+                 (
+@@ -115,19 +126,18 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+         )
+ 
+     def _create_lora_b_weights(self, max_loras: int, lora_config: LoRAConfig):
+-        self.w13_lora_b_stacked: tuple[torch.Tensor, ...] = tuple(
+-            torch.zeros(
+-                (
+-                    max_loras,
+-                    self.base_layer.local_num_experts,
+-                    self.base_layer.intermediate_size_per_partition,
+-                    lora_config.max_lora_rank,
+-                ),
+-                dtype=lora_config.lora_dtype,
+-                device=self.device,
+-            )
+-            for _ in range(self._w13_slices)
++        w13_lora_b = torch.zeros(
++            (
++                self._w13_slices,
++                max_loras,
++                self.base_layer.local_num_experts,
++                self.base_layer.intermediate_size_per_partition,
++                lora_config.max_lora_rank,
++            ),
++            dtype=lora_config.lora_dtype,
++            device=self.device,
+         )
++        self.w13_lora_b_stacked = tuple(w13_lora_b.unbind(0))
+         self.w2_lora_b_stacked: tuple[torch.Tensor, ...] = (
+             torch.zeros(
+                 (
+diff --git a/vllm/lora/layers/utils.py b/vllm/lora/layers/utils.py
+index 1b8083f5c..b6bdb0dd5 100644
+--- a/vllm/lora/layers/utils.py
++++ b/vllm/lora/layers/utils.py
+@@ -33,22 +33,22 @@ def _get_lora_device(base_layer: nn.Module) -> torch.device:
+     # code borrowed from https://github.com/fmmoret/vllm/blob/fm-support-lora-on-quantized-models/vllm/lora/layers.py#L34
+     """Returns the device for where to place the LoRA tensors."""
+     # unquantizedLinear
+-    if hasattr(base_layer, "weight"):
++    if getattr(base_layer, "weight", None) is not None:
+         return base_layer.weight.device
+     # Compressed Tensor
+-    elif hasattr(base_layer, "weight_packed"):
++    elif getattr(base_layer, "weight_packed", None) is not None:
+         return base_layer.weight_packed.device
+     # GPTQ/AWQ
+-    elif hasattr(base_layer, "qweight"):
++    elif getattr(base_layer, "qweight", None) is not None:
+         return base_layer.qweight.device
+     # MoE layer
+-    elif hasattr(base_layer, "w2_weight"):
++    elif getattr(base_layer, "w2_weight", None) is not None:
+         return base_layer.w2_weight.device
+     # MoE Compressed Tensor
+-    elif hasattr(base_layer, "w2_weight_packed"):
++    elif getattr(base_layer, "w2_weight_packed", None) is not None:
+         return base_layer.w2_weight_packed.device
+     # MoE GPTQ/AWQ/GGUF
+-    elif hasattr(base_layer, "w2_qweight"):
++    elif getattr(base_layer, "w2_qweight", None) is not None:
+         return base_layer.w2_qweight.device
+     else:
+         raise ValueError(f"Unsupported base layer: {base_layer}")
+diff --git a/vllm/lora/ops/triton_ops/fused_moe_lora_op.py b/vllm/lora/ops/triton_ops/fused_moe_lora_op.py
+index 42f53b200..518a73415 100644
+--- a/vllm/lora/ops/triton_ops/fused_moe_lora_op.py
++++ b/vllm/lora/ops/triton_ops/fused_moe_lora_op.py
+@@ -9,6 +9,7 @@ from vllm.distributed import (
+ )
+ from vllm.triton_utils import tl, triton
+ from vllm.triton_utils.allocation import set_triton_allocator
++from vllm.platforms import current_platform
+ from vllm.utils.torch_utils import direct_register_custom_op
+ 
+ from .utils import supports_pdl, supports_tma
+@@ -166,6 +167,8 @@ def _fused_moe_lora_kernel(
+     expert_ids_ptr,
+     num_tokens_post_padded_ptr,
+     token_lora_mapping_ptr,
++    a_row_mapping_ptr,
++    c_row_mapping_ptr,
+     # Matrix dimensions
+     N,
+     K,
+@@ -191,6 +194,7 @@ def _fused_moe_lora_kernel(
+     stride_tl,
+     stride_el,
+     slice_a_size,
++    slice_b_size,
+     slice_c_size,
+     # Meta-parameters
+     num_slice_a: tl.constexpr,
+@@ -211,6 +215,9 @@ def _fused_moe_lora_kernel(
+     USE_GDC: tl.constexpr,
+     launch_pdl: tl.constexpr,
+     IS_PRIMARY: tl.constexpr,
++    DIRECT_B_PTR: tl.constexpr,
++    MAP_A_ROWS: tl.constexpr,
++    MAP_C_ROWS: tl.constexpr,
+     USE_TMA: tl.constexpr,
+     # sort_c determines whether tokens are stored in C in the order determined
+     # by sorted_token_ids to enable later TMA loads from this tensor.
+@@ -291,9 +298,28 @@ def _fused_moe_lora_kernel(
+         naive_block_assignment,
+         BLOCK_SIZE_M,
+     )
++    mapped_a_token = offs_token
++    if MAP_A_ROWS:
++        mapped_a_token = tl.load(
++            a_row_mapping_ptr + offs_token,
++            mask=offs_token < num_valid_tokens,
++            other=0,
++        )
++    mapped_c_token = offs_token
++    if MAP_C_ROWS:
++        mapped_c_token = tl.load(
++            c_row_mapping_ptr + offs_token,
++            mask=offs_token < num_valid_tokens,
++            other=0,
++        )
+     # get a_ptr,b_ptr,c_ptr
+     cur_a_ptr = a_ptr + (slice_id % num_slice_a) * slice_a_size
+-    cur_b_ptr = tl.load(b_ptr + slice_id).to(tl.pointer_type(c_ptr.dtype.element_ty))
++    if DIRECT_B_PTR:
++        cur_b_ptr = b_ptr + slice_id * slice_b_size
++    else:
++        cur_b_ptr = tl.load(b_ptr + slice_id).to(
++            tl.pointer_type(c_ptr.dtype.element_ty)
++        )
+     cur_c_ptr = c_ptr + (slice_id % num_slice_c) * slice_c_size
+ 
+     offs_k = pid_sk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+@@ -312,7 +338,7 @@ def _fused_moe_lora_kernel(
+         # 'sorted_token_ids_ptr' then store them in c_ptr in this same sorted order
+         tl.static_assert(a_desc is None, "a_desc must be none")
+         a_ptrs = cur_a_ptr + (
+-            offs_token[:, None] // token_mapping_factor * stride_am
++            mapped_a_token[:, None] // token_mapping_factor * stride_am
+             + offs_k[None, :] * stride_ak
+         )
+ 
+@@ -396,7 +422,7 @@ def _fused_moe_lora_kernel(
+         lora_id,
+         pid_m,
+         offs,
+-        offs_token,
++        mapped_c_token,
+         offs_cn,
+         stride_cm,
+         stride_cn,
+@@ -452,6 +478,7 @@ def _fused_moe_lora_shrink(
+     mul_routed_weight: bool = False,
+     use_gdc: bool = False,
+     use_tma: bool = False,
++    a_row_mapping: torch.Tensor | None = None,
+ ) -> None:
+     w1_lora_a_stacked = lora_a_stacked[0]
+     shrink_config = {
+@@ -467,7 +494,8 @@ def _fused_moe_lora_shrink(
+         "USE_TMA": use_tma,
+     }
+ 
+-    b_ptr = _get_ptr(lora_a_stacked, device)
++    direct_b_ptr = current_platform.is_xpu()
++    b_ptr = lora_a_stacked[0] if direct_b_ptr else _get_ptr(lora_a_stacked, device)
+ 
+     grid_lora_dim, stride_tl, stride_el = _adjust_kernel_inputs(
+         num_active_loras, sorted_token_ids, expert_ids
+@@ -499,6 +527,8 @@ def _fused_moe_lora_shrink(
+         expert_ids,
+         num_tokens_post_padded,
+         token_lora_mapping,
++        a_row_mapping,
++        None,
+         N,
+         K,
+         EM,
+@@ -519,6 +549,7 @@ def _fused_moe_lora_shrink(
+         stride_tl,
+         stride_el,
+         slice_a_size=qcurr_hidden_states.numel(),
++        slice_b_size=lora_a_stacked[0].numel(),
+         slice_c_size=a_intermediate_cache1.numel() // num_slices,
+         num_slice_a=1,
+         num_slice_c=num_slices,
+@@ -529,6 +560,9 @@ def _fused_moe_lora_shrink(
+         USE_B_L2_CACHE=True,
+         sort_c=use_tma and sorted_token_ids is not None,
+         IS_PRIMARY=True,
++        DIRECT_B_PTR=direct_b_ptr,
++        MAP_A_ROWS=a_row_mapping is not None,
++        MAP_C_ROWS=False,
+         **shrink_config,
+     )
+ 
+@@ -571,8 +605,10 @@ def _fused_moe_lora_expand(
+     offset: int = 0,
+     use_gdc: bool = False,
+     use_tma: bool = False,
++    c_row_mapping: torch.Tensor | None = None,
+ ) -> None:
+-    b_ptr = _get_ptr(lora_b_stacked, device)
++    direct_b_ptr = current_platform.is_xpu()
++    b_ptr = lora_b_stacked[0] if direct_b_ptr else _get_ptr(lora_b_stacked, device)
+     K = max_lora_rank
+     N = w1_output_dim_size
+ 
+@@ -635,6 +671,8 @@ def _fused_moe_lora_expand(
+         expert_ids,
+         num_tokens_post_padded,
+         token_lora_mapping,
++        None,
++        c_row_mapping,
+         N,
+         K,
+         EM,
+@@ -655,6 +693,7 @@ def _fused_moe_lora_expand(
+         stride_tl,
+         stride_el,
+         slice_a_size=a_intermediate_cache1.numel() // num_slices,
++        slice_b_size=lora_b_stacked[0].numel(),
+         slice_c_size=slice_c_size,
+         num_slice_a=num_slices,
+         num_slice_c=num_slices,
+@@ -665,6 +704,9 @@ def _fused_moe_lora_expand(
+         USE_B_L2_CACHE=True,
+         sort_c=False,
+         IS_PRIMARY=False,
++        DIRECT_B_PTR=direct_b_ptr,
++        MAP_A_ROWS=False,
++        MAP_C_ROWS=c_row_mapping is not None,
+         **expand_config,
+     )
+ 
+@@ -706,6 +748,8 @@ def _fused_moe_lora(
+     mul_routed_weight: bool = False,
+     fully_sharded: bool = False,
+     offset: int = 0,
++    a_row_mapping: torch.Tensor | None = None,
++    c_row_mapping: torch.Tensor | None = None,
+ ) -> None:
+     assert len(lora_a_stacked) == len(lora_b_stacked) > 0
+     assert topk_weights.dim() == qcurr_hidden_states.dim() == 2
+@@ -728,6 +772,10 @@ def _fused_moe_lora(
+         )
+     assert output.shape[0] == topk_weights.shape[0]
+     assert top_k_num == topk_weights.shape[1]
++    if a_row_mapping is not None:
++        assert a_row_mapping.numel() == topk_weights.numel()
++    if c_row_mapping is not None:
++        assert c_row_mapping.numel() == topk_weights.numel()
+     device = qcurr_hidden_states.device
+     num_slices = len(lora_a_stacked)
+     w1_lora_b_stacked = lora_b_stacked[0]
+@@ -809,6 +857,7 @@ def _fused_moe_lora(
+         mul_routed_weight,
+         use_gdc=use_gdc,
+         use_tma=use_tma,
++        a_row_mapping=a_row_mapping,
+     )
+ 
+     if fully_sharded:
+@@ -859,6 +908,7 @@ def _fused_moe_lora(
+         offset,
+         use_gdc=use_gdc,
+         use_tma=use_tma,
++        c_row_mapping=c_row_mapping,
+     )
+ 
+ 
+@@ -894,6 +944,8 @@ def _fused_moe_lora_fake(
+     mul_routed_weight: bool = False,
+     fully_sharded: bool = False,
+     offset: int = 0,
++    a_row_mapping: torch.Tensor | None = None,
++    c_row_mapping: torch.Tensor | None = None,
+ ) -> None:
+     return
+ 
+@@ -929,6 +981,7 @@ def _fused_moe_lora_shrink_fake(
+     mul_routed_weight: bool = False,
+     use_gdc: bool = False,
+     use_tma: bool = False,
++    a_row_mapping: torch.Tensor | None = None,
+ ) -> None:
+     return
+ 
+@@ -967,6 +1020,7 @@ def _fused_moe_lora_expand_fake(
+     offset: int = 0,
+     use_gdc: bool = False,
+     use_tma: bool = False,
++    c_row_mapping: torch.Tensor | None = None,
+ ) -> None:
+     return
+ 
+diff --git a/vllm/lora/punica_wrapper/punica_base.py b/vllm/lora/punica_wrapper/punica_base.py
+index 0448a6d00..dbea779f3 100644
+--- a/vllm/lora/punica_wrapper/punica_base.py
++++ b/vllm/lora/punica_wrapper/punica_base.py
+@@ -486,6 +486,8 @@ class PunicaWrapperBase(PunicaWrapperABC):
+         fully_sharded: bool = False,
+         offset: int = 0,
+         token_lora_mapping: torch.Tensor | None = None,
++        a_row_mapping: torch.Tensor | None = None,
++        c_row_mapping: torch.Tensor | None = None,
+     ):
+         """
+         Performs a fused forward computation for LoRA of
+@@ -515,6 +517,7 @@ class PunicaWrapperBase(PunicaWrapperABC):
+         fully_sharded: bool,
+         use_tuned_config: bool,
+         token_lora_mapping: torch.Tensor | None = None,
++        c_row_mapping: torch.Tensor | None = None,
+     ) -> tuple[
+         torch.Tensor | None,
+         torch.Tensor | None,
+@@ -554,6 +557,7 @@ class PunicaWrapperBase(PunicaWrapperABC):
+         fully_sharded: bool,
+         tp_rank: int,
+         use_tuned_config: bool,
++        row_mapping: torch.Tensor | None = None,
+     ) -> None:
+         """Apply w2 LoRA to y (intermediate_cache3) in-place before moe_sum.
+ 
+diff --git a/vllm/lora/punica_wrapper/punica_gpu.py b/vllm/lora/punica_wrapper/punica_gpu.py
+index bf951e074..93a361e94 100644
+--- a/vllm/lora/punica_wrapper/punica_gpu.py
++++ b/vllm/lora/punica_wrapper/punica_gpu.py
+@@ -435,6 +435,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
+         fully_sharded: bool = False,
+         offset: int = 0,
+         token_lora_mapping: torch.Tensor | None = None,
++        a_row_mapping: torch.Tensor | None = None,
++        c_row_mapping: torch.Tensor | None = None,
+     ):
+         """
+         Performs a fused forward computation for LoRA of Mixture-of-Experts (MoE) layer.
+@@ -484,6 +486,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
+             mul_routed_weight,
+             fully_sharded,
+             offset,
++            a_row_mapping,
++            c_row_mapping,
+         )
+ 
+     def add_lora_w13(
+@@ -507,6 +511,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
+         fully_sharded: bool,
+         use_tuned_config: bool,
+         token_lora_mapping: torch.Tensor | None = None,
++        c_row_mapping: torch.Tensor | None = None,
+     ) -> tuple[
+         torch.Tensor | None,
+         torch.Tensor | None,
+@@ -586,6 +591,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
+             expert_map,
+             naive_block_assignment=naive_block_assignment,
+             token_lora_mapping=token_lora_mapping,
++            c_row_mapping=c_row_mapping,
+         )
+ 
+         _sorted = sorted_token_ids_lora
+@@ -640,6 +646,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
+         fully_sharded: bool,
+         tp_rank: int,
+         use_tuned_config: bool,
++        row_mapping: torch.Tensor | None = None,
+     ) -> None:
+         import functools
+ 
+@@ -722,4 +729,6 @@ class PunicaWrapperGPU(PunicaWrapperBase):
+             fully_sharded=fully_sharded,
+             offset=offset,
+             token_lora_mapping=token_lora_mapping,
++            a_row_mapping=row_mapping,
++            c_row_mapping=row_mapping,
+         )
+diff --git a/vllm/lora/punica_wrapper/punica_xpu.py b/vllm/lora/punica_wrapper/punica_xpu.py
+index 58316cb75..2cef6682e 100755
+--- a/vllm/lora/punica_wrapper/punica_xpu.py
++++ b/vllm/lora/punica_wrapper/punica_xpu.py
+@@ -78,6 +78,11 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+         **kwargs,
+     ):
+         self.is_prefill = mapping.is_prefill
++        # Keep the host-side fast-path flag in sync for both prefill and
++        # decode.  LoRA id 0 denotes the base model.  Unlike the generic
++        # prefill metadata path, XPU prepares its kernel metadata directly,
++        # so it must derive this flag from the original CPU-side mapping.
++        self.no_lora = not any(lora_id > 0 for lora_id in mapping.index_mapping)
+         self._update_base_metadata(mapping, lora_index_to_id, max_loras, vocab_size)
+ 
+         # Prepare kernel metadata tensors
+@@ -131,6 +136,8 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+             lora_a_stacked (tuple[torch.Tensor, ...]): lora_a's weights
+             scale (float): Scaling factor for the operation
+         """
++        if self.no_lora:
++            return
+ 
+         x = x.view(-1, x.shape[-1])
+         for slice_idx in range(len(lora_a_stacked)):
+@@ -162,6 +169,9 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+             output_slices (tuple[int, ...]): Every slice's size
+             add_inputs (bool): Defaults to True.
+         """
++        if self.no_lora:
++            return
++
+         y_org = y
+         y = y.view(-1, y.shape[-1])
+ 
+@@ -201,6 +211,9 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+             lora_b_stacked (torch.Tensor): lora_b's weights.
+             add_inputs (bool): Default to True.
+         """
++        if self.no_lora:
++            return
++
+         token_lora_indices = self._get_token_lora_indices(x)
+         bgmv_expand(x, lora_b_stacked, y, token_lora_indices, add_inputs)
+ 
+@@ -237,6 +250,8 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+             output_slices (tuple[int, ...]): Every slice's size.
+             buffer (Optional[torch.Tensor]): Defaults to None.
+         """
++        if self.no_lora:
++            return
+ 
+         assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)
+ 
+@@ -296,6 +311,9 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+             scale (float): Scaling factor.
+             buffer (Optional[torch.Tensor]): Default to None.
+         """
++        if self.no_lora:
++            return
++
+         y_org = y
+         y = y.view(-1, y.shape[-1])
+         x = x.view(-1, x.shape[-1])
+@@ -390,6 +408,8 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+         fully_sharded: bool = False,
+         offset: int = 0,
+         token_lora_mapping: torch.Tensor | None = None,
++        a_row_mapping: torch.Tensor | None = None,
++        c_row_mapping: torch.Tensor | None = None,
+     ):
+         """
+         Performs a fused forward computation for LoRA of Mixture-of-Experts (MoE) layer.
+@@ -439,6 +459,8 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+             mul_routed_weight,
+             fully_sharded,
+             offset,
++            a_row_mapping,
++            c_row_mapping,
+         )
+ 
+     def add_lora_w13(
+@@ -462,6 +484,7 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+         fully_sharded: bool,
+         use_tuned_config: bool,
+         token_lora_mapping: torch.Tensor | None = None,
++        c_row_mapping: torch.Tensor | None = None,
+     ) -> tuple[
+         torch.Tensor | None,
+         torch.Tensor | None,
+@@ -564,6 +587,7 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+             adapter_enabled,
+             fully_sharded=fully_sharded,
+             token_lora_mapping=token_lora_mapping,
++            c_row_mapping=c_row_mapping,
+         )
+ 
+         return (
+@@ -594,6 +618,7 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+         fully_sharded: bool,
+         tp_rank: int,
+         use_tuned_config: bool,
++        row_mapping: torch.Tensor | None = None,
+     ) -> None:
+         import functools
+ 
+@@ -676,4 +701,6 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+             fully_sharded=fully_sharded,
+             offset=offset,
+             token_lora_mapping=token_lora_mapping,
++            a_row_mapping=row_mapping,
++            c_row_mapping=row_mapping,
+         )
+diff --git a/vllm/model_executor/kernels/linear/__init__.py b/vllm/model_executor/kernels/linear/__init__.py
+index b9a96a035..7426546ad 100644
+--- a/vllm/model_executor/kernels/linear/__init__.py
++++ b/vllm/model_executor/kernels/linear/__init__.py
+@@ -143,6 +143,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.triton import (
+ from vllm.model_executor.kernels.linear.scaled_mm.xpu import (
+     XPUFP8ScaledMMLinearKernel,
+ )
++from vllm.model_executor.kernels.linear.scaled_mm.xpu_block import (
++    XPUFp8BlockScaledMMKernel,
++)
+ from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
+ from vllm.platforms import PlatformEnum, current_platform
+ 
+@@ -203,6 +206,9 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
+     PlatformEnum.CPU: [
+         CPUFp8BlockScaledMMKernel,
+     ],
++    PlatformEnum.XPU: [
++        XPUFp8BlockScaledMMKernel,
++    ],
+ }
+ 
+ _POSSIBLE_WFP8A16_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] = {
 diff --git a/vllm/model_executor/kernels/linear/scaled_mm/xpu.py b/vllm/model_executor/kernels/linear/scaled_mm/xpu.py
 index 6d75a420e..146cf77cc 100644
 --- a/vllm/model_executor/kernels/linear/scaled_mm/xpu.py
@@ -1455,6 +2520,175 @@ index 6d75a420e..146cf77cc 100644
  
      def apply_scaled_mm(
          self,
+diff --git a/vllm/model_executor/kernels/linear/scaled_mm/xpu_block.py b/vllm/model_executor/kernels/linear/scaled_mm/xpu_block.py
+new file mode 100644
+index 000000000..5d613fc60
+--- /dev/null
++++ b/vllm/model_executor/kernels/linear/scaled_mm/xpu_block.py
+@@ -0,0 +1,163 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import torch
++
++from vllm.model_executor.layers.esimd_utils import (
++    ESIMD_AVAILABLE,
++    esimd_gemm_fp8_blockscale,
++)
++from vllm.model_executor.layers.quantization.utils.quant_utils import (
++    GroupShape,
++)
++from vllm.platforms import current_platform
++
++from .BlockScaledMMLinearKernel import (
++    Fp8BlockScaledMMLinearKernel,
++    FP8ScaledMMLinearLayerConfig,
++)
++from ..base import MMLinearKernel
++
++# Above this M, the ESIMD block GEMV (a K-split, bandwidth-bound decode kernel)
++# stops being competitive: it tiles M into groups of 8 and never uses the XMX
++# matrix engine, so prefill-shaped work (chunked prefill up to
++# max_num_batched_tokens) collapses to <1 GB/s. For M >= this threshold we
++# instead dequantize the fp8 block weight to fp16 once and run the GEMM through
++# oneDNN XMX (torch.matmul), which is compute-bound like the per-tensor fp8
++# prefill path. Small-batch decode (M < threshold) keeps the fp8-in GEMV.
++_ESIMD_BLOCK_GEMV_MAX_M = 16
++
++
++
++class XPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
++    """FP8 block-scaled linear for Intel XPU (DeepSeek 128x128 weight blocks).
++
++    Backed by the ESIMD ``esimd_gemm_fp8_blockscale`` kernel, which is a
++    weight-only-quantized (w8a16) GEMM: the fp8_e4m3 weight is dequantized on
++    the fly with its 128x128 block scale (``weight_scale_inv``) while the
++    activation is consumed directly in fp16. Because the activation is not
++    quantized, ``apply_input_quant`` is False -- the base ``apply_weights``
++    passes the raw activation through as ``A`` and a dummy ``As``.
++
++    Weight layout: the block branch of ``Fp8LinearMethod`` leaves the weight as
++    ``[N, K]`` fp8 (row-major, no transpose) and the scale as
++    ``[ceil(N/128), ceil(K/128)]`` fp32, which is exactly what the kernel reads.
++
++    Decode fusion status: the RMSNorm+projection GEMV decode fusions in
++    qwen3_next.py originally required ``weight_scale.numel()==1`` (per-tensor),
++    so block weights (which carry ``weight_scale_inv``) fell back to a separate
++    launch per norm/projection. The GDN and attention input-norm paths
++    (``_fused_gdn_input_proj``, ``_fused_attn_input_proj``) now have block
++    branches, and the post-attention RMSNorm + MoE router GEMV is folded into
++    one launch for block as well (``_moe_norm_esimd_ok`` accepts
++    ``_moe_block_esimd_ok``); the router gate is per-tensor FP8 in both cases,
++    so the existing ``esimd_resadd_norm_gemv_fp8_pert`` kernel is reused.
++
++    Remaining known gaps:
++
++    - The fused post-attn norm + router kernel is M==1 only, so batch>1 decode
++      still runs the unfused norm + gate GEMV. Extending it needs a multi-row
++      variant of ``resadd_norm_gemv_fp8_pert_v2_host``.
++    - ``VLLM_XPU_ENABLE_XPU_GRAPH=1`` (PIECEWISE) has measured *worse* block
++      decode TPOT than eager in this configuration; it is not a substitute for
++      reducing launch count.
++    """
++
++    # Activation stays fp16 -- no per-token-group quantization step.
++    apply_input_quant = False
++
++    def __init__(self, config: FP8ScaledMMLinearLayerConfig) -> None:
++        # Skip the base Fp8BlockScaledMMLinearKernel.__init__, which builds a
++        # QuantFP8 CustomOp (needs a vLLM config context and dispatches a
++        # forward). This kernel keeps the activation in fp16
++        # (apply_input_quant=False), so quant_fp8 is never used -- only
++        # weight_group_shape and use_triton are needed downstream.
++        MMLinearKernel.__init__(self, config)
++        self.weight_group_shape = config.weight_quant_key.scale.group_shape
++        self.use_triton = False
++
++    @classmethod
++    def is_supported(
++        cls, compute_capability: int | None = None
++    ) -> tuple[bool, str | None]:
++        if not current_platform.is_xpu():
++            return False, "XPUFp8BlockScaledMM is only supported on XPU"
++        if not ESIMD_AVAILABLE or esimd_gemm_fp8_blockscale is None:
++            return (
++                False,
++                "custom_esimd_kernels_vllm (esimd_gemm_fp8_blockscale) unavailable",
++            )
++        return True, None
++
++    @classmethod
++    def can_implement(
++        cls, config: FP8ScaledMMLinearLayerConfig
++    ) -> tuple[bool, str | None]:
++        can_implement_base, reason = super().can_implement(config)
++        if not can_implement_base:
++            return can_implement_base, reason
++
++        act_group = config.activation_quant_key.scale.group_shape
++        if act_group != GroupShape(1, 128):
++            return (
++                False,
++                "Supports only dynamic per-token-group activation with "
++                f"group_shape=(1,128); got {act_group}.",
++            )
++
++        weight_group = config.weight_quant_key.scale.group_shape
++        if weight_group != GroupShape(128, 128):
++            return (
++                False,
++                f"Supports only 128x128 weight block scale; got {weight_group}.",
++            )
++
++        if config.weight_quant_key.dtype != torch.float8_e4m3fn:
++            return (
++                False,
++                "Supports only float8_e4m3fn weight dtype; got "
++                f"{config.weight_quant_key.dtype}.",
++            )
++        return True, None
++
++    def apply_block_scaled_mm(
++        self,
++        A: torch.Tensor,
++        B: torch.Tensor,
++        As: torch.Tensor,
++        Bs: torch.Tensor,
++    ) -> torch.Tensor:
++        # A: [M, K] activation (fp16/bf16, un-quantized -- apply_input_quant=False)
++        # B: [N, K] fp8_e4m3 weight   Bs: [ceil(N/128), ceil(K/128)] fp32 block scale
++        block_n, block_k = self.weight_group_shape
++        block_n = int(block_n)
++        block_k = int(block_k)
++
++        A16 = A.to(torch.float16).contiguous()
++        M = A16.shape[0]
++        N, K = B.shape
++
++        # Prefill / large-M path: dequantize the fp8 block weight to fp16 and run
++        # the GEMM on oneDNN XMX. The ESIMD GEMV below is BW-bound and only
++        # competitive for small decode batches.
++        if (
++            M >= _ESIMD_BLOCK_GEMV_MAX_M
++            and N % block_n == 0
++            and K % block_k == 0
++        ):
++            Nb = N // block_n
++            Kb = K // block_k
++            # Dequant in fp16: w[n,k] = wq[n,k] * Bs[n//bn, k//bk]. Scale is
++            # broadcast over each block_n x block_k tile.
++            w16 = B.to(torch.float16).view(Nb, block_n, Kb, block_k)
++            w16 = w16 * Bs.to(torch.float16).view(Nb, 1, Kb, 1)
++            w16 = w16.view(N, K)
++            return torch.matmul(A16, w16.t())
++
++        # Decode / small-M path: fp8-in bandwidth-optimal ESIMD block GEMV.
++        # The ESIMD kernel consumes fp16 activation + fp32 scale via bare
++        # data_ptr reads, so make the layouts explicit and contiguous.
++        Bs32 = Bs.to(torch.float32).contiguous()
++        out = torch.empty(M, N, dtype=torch.float16, device=A16.device)
++        esimd_gemm_fp8_blockscale(A16, B, Bs32, out, block_n, block_k)
++        return out
 diff --git a/vllm/model_executor/layers/activation.py b/vllm/model_executor/layers/activation.py
 index d5b67ef04..872d2b3ff 100644
 --- a/vllm/model_executor/layers/activation.py
@@ -1492,10 +2726,10 @@ index d5b67ef04..872d2b3ff 100644
      def extra_repr(self) -> str:
 diff --git a/vllm/model_executor/layers/esimd_fake_ops.py b/vllm/model_executor/layers/esimd_fake_ops.py
 new file mode 100644
-index 000000000..d2f68abb7
+index 000000000..eaf0e2c1d
 --- /dev/null
 +++ b/vllm/model_executor/layers/esimd_fake_ops.py
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,205 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Fake (meta) implementations for the external ``custom_esimd_kernels_vllm``
@@ -1626,6 +2860,27 @@ index 000000000..d2f68abb7
 +    _try_register(f"{NS}::esimd_gemm_fp8_pert",
 +                  lambda input, weight, weight_scale, output:
 +                  torch.empty_like(output))
++    # esimd_gemm_fp8_blockscale(input, weight, weight_scale, output,
++    #                           block_n, block_k) -> output
++    _try_register(f"{NS}::esimd_gemm_fp8_blockscale",
++                  lambda input, weight, weight_scale, output, block_n, block_k:
++                  torch.empty_like(output))
++    # Mutates and returns output. Returning the same FakeTensor preserves the
++    # alias declared by the external op schema.
++    _try_register(
++        f"{NS}::esimd_moe_gemm_fp8_blockscale",
++        lambda input, weight, weight_scale, output, expert_idx,
++        N, K, num_experts, block_n, block_k: output,
++    )
++    _try_register(f"{NS}::esimd_gemv_fp8_blockscale_fused2",
++                  lambda input, w0, s0, o0, w1, s1, o1, block_n, block_k:
++                  o0)
++    _try_register(f"{NS}::esimd_gemv_fp8_blockscale_fp16_fused2",
++                  lambda input, w0, s0, o0, w1, o1, block_n, block_k:
++                  o0)
++    _try_register(f"{NS}::esimd_norm_gemv_fp8_blockscale",
++                  lambda x, z, norm_weight, gemv_weight, gemv_scale, output,
++                  HV, V, eps: output)
 +
 +    # --- MoE auxiliary -------------------------------------------------------
 +    # esimd_moe_topk(router_logits, top_values, top_indices, T) -> top_values
@@ -1659,6 +2914,12 @@ index 000000000..d2f68abb7
 +                  lambda x, logits, gate_up_weight, gate_up_scale, down_weight,
 +                  down_scale, per_expert_scale, top_k, n_routed_experts:
 +                  torch.empty_like(x))
++    _try_register(
++        f"{MOE}::moe_forward_full_fp8_block",
++        lambda x, logits, output, gate_up_weight, gate_up_scale,
++        shared_gate_up_weight, shared_gate_up_scale, down_weight, down_scale,
++        shared_down_weight, shared_down_scale, shared_expert_gate_weight,
++        top_k, num_shared_experts, n_routed_experts: output)
 +    # moe_up_fp8_grouped -> [n_tokens*top_k, intermediate] (=gate_up_weight.size(1)//2)
 +    _try_register(
 +        f"{MOE}::moe_up_fp8_grouped",
@@ -1676,10 +2937,10 @@ index 000000000..d2f68abb7
 +                     "moe_ops ops (torch.compile / XPU graph support).")
 diff --git a/vllm/model_executor/layers/esimd_utils.py b/vllm/model_executor/layers/esimd_utils.py
 new file mode 100644
-index 000000000..046f8a36c
+index 000000000..7bf12cd34
 --- /dev/null
 +++ b/vllm/model_executor/layers/esimd_utils.py
-@@ -0,0 +1,269 @@
+@@ -0,0 +1,309 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Shared infrastructure for the XPU ESIMD decode fast paths (Feature 1a).
@@ -1715,6 +2976,14 @@ index 000000000..046f8a36c
 +except ImportError:
 +    _esimd = None
 +    ESIMD_AVAILABLE = False
++
++
++def has_esimd_moe_gemm_fp8_blockscale() -> bool:
++    """Whether the installed ESIMD wheel provides the block-FP8 MoE op."""
++    return ESIMD_AVAILABLE and hasattr(
++        _esimd, "esimd_moe_gemm_fp8_blockscale"
++    )
++
 +
 +# Register fake/meta impls so the ESIMD ops can be traced by torch.compile
 +# (XPU graph mode, i.e. running without --enforce-eager). No-op if the package
@@ -1823,6 +3092,20 @@ index 000000000..046f8a36c
 +    return quant_config is not None and quant_config.get_name() == "fp8"
 +
 +
++def quant_is_block_fp8(quant_config) -> bool:
++    """True for DeepSeek-style 128x128 block FP8 (weight_block_size set).
++
++    The per-tensor ESIMD fast paths (e.g. the fused MoE decode kernel
++    moe_forward_full) read a scalar per-expert weight_scale. Block weights
++    carry weight_scale_inv ([E, N/128, K/128]) instead and have no scalar
++    weight_scale, so those fast paths must be disabled for block quant --
++    block routes through the modular kernels (XPUExpertsFp8Block).
++    """
++    return quant_is_fp8(quant_config) and (
++        getattr(quant_config, "weight_block_size", None) is not None
++    )
++
++
 +def quant_is_sym_int4(quant_config) -> bool:
 +    return quant_config is not None and quant_config.get_name() == "sym_int4"
 +
@@ -1887,6 +3170,15 @@ index 000000000..046f8a36c
 +    # scale). Used to fuse GDN's in_proj_qkvz + in_proj_ba into one launch.
 +    # Both weights [N, K] contiguous, scalar fp32 scale, separate outputs.
 +    esimd_gemv_fp8_pert_fused2 = _esimd.esimd_gemv_fp8_pert_fused2
++    esimd_gemv_fp8_blockscale_fused2 = getattr(
++        _esimd, "esimd_gemv_fp8_blockscale_fused2", None
++    )
++    esimd_gemv_fp8_blockscale_fp16_fused2 = getattr(
++        _esimd, "esimd_gemv_fp8_blockscale_fp16_fused2", None
++    )
++    esimd_norm_gemv_fp8_blockscale = getattr(
++        _esimd, "esimd_norm_gemv_fp8_blockscale", None
++    )
 +    # Fused residual-add + RMSNorm(Gemma w+1) + 2-matrix per-tensor FP8 GEMV.
 +    # Folds the GDN layer's input_layernorm (residual-add + RMSNorm) into the
 +    # Part-1 dual input projection: residual += hidden (in-place), normed =
@@ -1925,6 +3217,11 @@ index 000000000..046f8a36c
 +    # Fused residual-add + RMSNorm + INT4 GEMV. Combines post_attn_layernorm
 +    # + router/dense-MLP GEMV. Weight is [N, K/8] int32, scale [N, K/128].
 +    esimd_resadd_norm_gemv_int4_pert = _esimd.esimd_resadd_norm_gemv_int4_pert
++    # FP8 block-scaled GEMM (DeepSeek 128x128 weight block scale, w8a16). Weight
++    # is fp8_e4m3 [N, K] with fp32 weight_scale_inv [ceil(N/128), ceil(K/128)];
++    # activation stays fp16 (no per-token-group quant). Used by the XPU block
++    # FP8 linear kernel (scaled_mm/xpu_block.py).
++    esimd_gemm_fp8_blockscale = _esimd.esimd_gemm_fp8_blockscale
 +else:
 +    esimd_gemv_fp8_pert = None
 +    esimd_gemm_fp8_pert = None
@@ -1941,6 +3238,9 @@ index 000000000..046f8a36c
 +    moe_forward_full = None
 +    moe_forward_full_v2 = None
 +    esimd_gemv_fp8_pert_fused2 = None
++    esimd_gemv_fp8_blockscale_fused2 = None
++    esimd_gemv_fp8_blockscale_fp16_fused2 = None
++    esimd_norm_gemv_fp8_blockscale = None
 +    esimd_resadd_norm_gemv2_fp8_pert = None
 +    esimd_resadd_norm_gemv_fp8_pert = None
 +    page_attn_decode = None
@@ -1949,6 +3249,7 @@ index 000000000..046f8a36c
 +    esimd_gemm_int4_pgrp = None
 +    esimd_norm_gemv_int4_pert = None
 +    esimd_resadd_norm_gemv_int4_pert = None
++    esimd_gemm_fp8_blockscale = None
 diff --git a/vllm/model_executor/layers/fused_moe/activation.py b/vllm/model_executor/layers/fused_moe/activation.py
 index b2e67e622..ff9bac521 100644
 --- a/vllm/model_executor/layers/fused_moe/activation.py
@@ -1978,32 +3279,194 @@ index b2e67e622..ff9bac521 100644
          torch.ops._C.swigluoai_and_mul(output, input)
      elif activation == MoEActivation.SWIGLUSTEP:
 diff --git a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
-index d6bd2b140..7ba577856 100644
+index d6bd2b140..feb47dd63 100644
 --- a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
 +++ b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
-@@ -21,7 +21,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+@@ -9,19 +9,25 @@ from vllm.model_executor.layers.fused_moe.config import (
+     FusedMoEParallelConfig,
+     FusedMoEQuantConfig,
+ )
++from vllm.model_executor.layers.fused_moe.lora_experts_mixin import LoRAExpertsMixin
+ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+     TopKWeightAndReduceNoOP,
+ )
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     QuantKey,
++    kFp8Dynamic128Sym,
+     kFp8DynamicTensorSym,
++    kFp8Static128BlockSym,
+     kFp8StaticTensorSym,
+     kMxfp4Static,
+ )
  from vllm.platforms import current_platform
  
  if current_platform.is_xpu():
 -    from vllm_xpu_kernels.fused_moe_interface import xpu_fused_moe
-+    from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
++    from vllm_xpu_kernels.fused_moe_interface import (
++        XpuFusedMoe,
++        fused_moe_activation,
++    )
  
  
  def prepare_fp8_moe_layer_for_xpu(
-@@ -47,6 +47,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
+@@ -31,6 +37,124 @@ def prepare_fp8_moe_layer_for_xpu(
+     return w13.transpose(-1, -2).contiguous(), w2.transpose(-1, -2).contiguous()
+ 
+ 
++def _xpu_block_moe_forward(
++    experts: "XPUExperts",
++    output: torch.Tensor,
++    hidden_states: torch.Tensor,
++    w1: torch.Tensor,
++    w2: torch.Tensor,
++    w1_scale: torch.Tensor,
++    w2_scale: torch.Tensor,
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    activation: MoEActivation,
++) -> None:
++    """CUTLASS routed-expert forward for 128x128 block FP8 (w8a16).
++
++    Reuses the persistent grouped-GEMM scheduler from the per-tensor path,
++    while selecting scales by the weight's 128x128 block. Weights stay in
++    [E, N, K] layout with scales [E, N/128, K/128].
++    """
++    if hidden_states.dtype != torch.float16:
++        raise RuntimeError(
++            "XPU FP8 block MoE currently requires FP16 activations, but "
++            f"received {hidden_states.dtype}. Relaunch vLLM with "
++            "`--dtype float16`; native BF16 block-MoE support is not "
++            "implemented yet."
++        )
++
++    num_experts = experts.moe_config.num_local_experts
++    ep_rank = experts.moe_config.ep_rank
++    ep_size = experts.moe_config.ep_size
++    device = hidden_states.device
++    dtype = hidden_states.dtype
++
++    num_rows, hidden = hidden_states.shape
++    topk = topk_ids.size(-1)
++    total = num_rows * topk
++
++    N1 = w1.shape[1]  # 2 * intermediate (gate_up width)
++    inter = N1 // 2
++    K2 = w2.shape[2]  # gemm2 contraction dim (== intermediate for gated act)
++
++    # Expert map for expert parallelism (mirrors XpuFusedMoe.__init__).
++    expert_map = None
++    if ep_size > 1:
++        expert_map = torch.empty(
++            num_experts * ep_size, dtype=torch.int32, device=device
++        )
++        torch.ops._moe_C.init_expert_map(expert_map, num_experts, ep_rank, ep_size)
++    total_experts_num = (
++        expert_map.shape[0] if expert_map is not None else num_experts * ep_size
++    )
++
++    # Scatter tokens into expert-contiguous order.
++    remapped = torch.empty((total, hidden), dtype=dtype, device=device)
++    rows_per_expert = torch.zeros(num_experts, dtype=torch.int32, device=device)
++    unpermuted_row_to_permuted_row = torch.empty(
++        (num_rows, topk), dtype=torch.int32, device=device
++    )
++    torch.ops._moe_C.remap_hidden_states(
++        hidden_states=hidden_states,
++        hidden_states_scales=None,
++        remapped_hidden_states=remapped,
++        remapped_hidden_states_scales=None,
++        expert_map=expert_map,
++        rows_per_expert=rows_per_expert,
++        unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
++        topk_ids=topk_ids,
++        total_experts_num=total_experts_num,
++        local_experts_num=num_experts,
++    )
++
++    # gemm1: gate_up = scattered_x @ dequant(w13)^T
++    gemm1_output = torch.empty((total, N1), dtype=dtype, device=device)
++    torch.ops._xpu_C.cutlass_grouped_gemm_interface(
++        ptr_A=remapped,
++        ptr_B=w1,
++        ptr_scales=w1_scale,
++        ptr_bias=None,
++        ptr_D=gemm1_output,
++        rows_per_expert=rows_per_expert,
++        N=N1,
++        K=hidden,
++        num_experts=num_experts,
++        is_B_int4=False,
++        is_B_mxfp4=False,
++        is_B_fp8_block=True,
++    )
++
++    # activation (silu/gelu/... and mul)
++    inter_size_scale = 2 if activation.value == "relu2_no_mul" else 1
++    act_output = torch.empty(
++        (total, inter * inter_size_scale), dtype=dtype, device=device
++    )
++    fused_moe_activation(act_output, gemm1_output, activation.value)
++
++    # gemm2: out = act @ dequant(w2)^T
++    gemm2_output = torch.empty((total, hidden), dtype=dtype, device=device)
++    torch.ops._xpu_C.cutlass_grouped_gemm_interface(
++        ptr_A=act_output,
++        ptr_B=w2,
++        ptr_scales=w2_scale,
++        ptr_bias=None,
++        ptr_D=gemm2_output,
++        rows_per_expert=rows_per_expert,
++        N=hidden,
++        K=K2,
++        num_experts=num_experts,
++        is_B_int4=False,
++        is_B_mxfp4=False,
++        is_B_fp8_block=True,
++    )
++
++    # weighted gather back to per-token output
++    torch.ops._moe_C.moe_gather(
++        output, gemm2_output, topk_weights,
++        unpermuted_row_to_permuted_row, num_experts,
++    )
++
++
+ class XPUExperts(mk.FusedMoEExpertsModular):
+     def __init__(
+         self,
+@@ -47,6 +171,8 @@ class XPUExperts(mk.FusedMoEExpertsModular):
          )
          self.is_fp8 = False
          self.is_mxfp4 = False
++        self.is_block_fp8 = False
 +        self.fused_moe_impl = None
  
      @property
      def expects_unquantized_inputs(self) -> bool:
-@@ -129,25 +130,28 @@ class XPUExperts(mk.FusedMoEExpertsModular):
+@@ -129,29 +255,52 @@ class XPUExperts(mk.FusedMoEExpertsModular):
          expert_tokens_meta: mk.ExpertTokensMetadata | None,
          apply_router_weight_on_input: bool,
      ):
 -        topk = topk_ids.size(-1)
 -        xpu_fused_moe(
++        if self.is_block_fp8:
++            # Route 128x128 block FP8 experts through the persistent CUTLASS
++            # grouped GEMM while preserving the checkpoint weight and scale
++            # layouts. Reuse the packaged scatter/activation/gather glue.
++            _xpu_block_moe_forward(
++                self,
++                output=output,
++                hidden_states=hidden_states,
++                w1=w1,
++                w2=w2,
++                w1_scale=self.w1_scale,
++                w2_scale=self.w2_scale,
++                topk_weights=topk_weights,
++                topk_ids=topk_ids,
++                activation=activation,
++            )
++            return
++
 +        if self.fused_moe_impl is None:
 +            topk = topk_ids.size(-1)
 +            self.fused_moe_impl = XpuFusedMoe(
@@ -2019,7 +3482,9 @@ index d6bd2b140..7ba577856 100644
 +                ep_rank=self.moe_config.ep_rank,
 +                ep_size=self.moe_config.ep_size,
 +                is_fp8=self.is_fp8,
++                is_int4=getattr(self, "is_int4", False),
 +                is_mxfp4=self.is_mxfp4,
++                is_block_fp8=self.is_block_fp8,
 +            )
 +        self.fused_moe_impl.apply(
 +            output=output,
@@ -2043,6 +3508,483 @@ index d6bd2b140..7ba577856 100644
          )
  
  
+-class XPUExpertsFp8(XPUExperts):
++class XPUExpertsFp8(LoRAExpertsMixin, XPUExperts):
+     def __init__(
+         self,
+         moe_config: FusedMoEConfig,
+@@ -167,6 +316,217 @@ class XPUExpertsFp8(XPUExperts):
+         )
+         self.is_fp8 = True
+ 
++    def apply(
++        self,
++        output: torch.Tensor,
++        hidden_states: torch.Tensor,
++        w1: torch.Tensor,
++        w2: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        activation: MoEActivation,
++        global_num_experts: int,
++        expert_map: torch.Tensor | None,
++        a1q_scale: torch.Tensor | None,
++        a2_scale: torch.Tensor | None,
++        workspace13: torch.Tensor,
++        workspace2: torch.Tensor,
++        expert_tokens_meta: mk.ExpertTokensMetadata | None,
++        apply_router_weight_on_input: bool,
++    ):
++        # Keep the existing monolithic XPU fast path when this experts object
++        # is used without a LoRA context.
++        ctx = self._lora_context
++        if ctx is None or ctx.punica_wrapper.no_lora:
++            return super().apply(
++                output,
++                hidden_states,
++                w1,
++                w2,
++                topk_weights,
++                topk_ids,
++                activation,
++                global_num_experts,
++                expert_map,
++                a1q_scale,
++                a2_scale,
++                workspace13,
++                workspace2,
++                expert_tokens_meta,
++                apply_router_weight_on_input,
++            )
++
++        del a1q_scale, a2_scale, workspace13, workspace2
++        del expert_tokens_meta, apply_router_weight_on_input
++
++        num_tokens, hidden_size = hidden_states.shape
++        top_k = topk_ids.shape[-1]
++        num_moe_inputs = num_tokens * top_k
++        num_experts = self.moe_config.num_local_experts
++        inter_size = w1.shape[-1] // 2
++
++        remapped_hidden_states = torch.empty(
++            (num_moe_inputs, hidden_size),
++            dtype=hidden_states.dtype,
++            device=hidden_states.device,
++        )
++        rows_per_expert = torch.zeros(
++            num_experts, dtype=torch.int32, device=hidden_states.device
++        )
++        route_to_permuted_row = torch.empty(
++            (num_tokens, top_k), dtype=torch.int32, device=hidden_states.device
++        )
++        total_num_experts = (
++            expert_map.shape[0] if expert_map is not None else global_num_experts
++        )
++        if total_num_experts == -1:
++            total_num_experts = num_experts
++
++        torch.ops._moe_C.remap_hidden_states(
++            hidden_states=hidden_states,
++            hidden_states_scales=None,
++            remapped_hidden_states=remapped_hidden_states,
++            remapped_hidden_states_scales=None,
++            expert_map=expert_map,
++            rows_per_expert=rows_per_expert,
++            unpermuted_row_to_permuted_row=route_to_permuted_row,
++            topk_ids=topk_ids,
++            total_experts_num=total_num_experts,
++            local_experts_num=num_experts,
++        )
++
++        gemm1_output = torch.empty(
++            (num_moe_inputs, 2 * inter_size),
++            dtype=hidden_states.dtype,
++            device=hidden_states.device,
++        )
++        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
++            ptr_A=remapped_hidden_states,
++            ptr_B=w1,
++            ptr_scales=self.w1_scale,
++            ptr_bias=self.w1_bias,
++            ptr_D=gemm1_output,
++            rows_per_expert=rows_per_expert,
++            N=2 * inter_size,
++            K=hidden_size,
++            num_experts=num_experts,
++            is_B_int4=False,
++            is_B_mxfp4=False,
++        )
++
++        routing = route_to_permuted_row.reshape(-1)
++        (
++            sorted_token_ids_lora,
++            expert_ids_lora,
++            num_tokens_post_padded_lora,
++            token_lora_mapping,
++        ) = self.apply_w13_lora(
++            ctx,
++            y=gemm1_output,
++            x=hidden_states,
++            topk_ids=topk_ids,
++            topk_weights=topk_weights,
++            expert_map=expert_map,
++            w1=w1,
++            w2=w2,
++            num_tokens=num_tokens,
++            top_k_num=top_k,
++            c_row_mapping=routing,
++        )
++
++        act_output = torch.empty(
++            (num_moe_inputs, inter_size),
++            dtype=hidden_states.dtype,
++            device=hidden_states.device,
++        )
++        fused_moe_activation(act_output, gemm1_output, activation.value)
++
++        gemm2_output = torch.empty(
++            (num_moe_inputs, hidden_size),
++            dtype=hidden_states.dtype,
++            device=hidden_states.device,
++        )
++        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
++            ptr_A=act_output,
++            ptr_B=w2,
++            ptr_scales=self.w2_scale,
++            ptr_bias=self.w2_bias,
++            ptr_D=gemm2_output,
++            rows_per_expert=rows_per_expert,
++            N=hidden_size,
++            K=inter_size,
++            num_experts=num_experts,
++            is_B_int4=False,
++            is_B_mxfp4=False,
++        )
++
++        self.apply_w2_lora(
++            ctx,
++            y=gemm2_output.view(num_tokens, top_k, hidden_size),
++            x=act_output,
++            topk_weights=topk_weights,
++            sorted_token_ids_lora=sorted_token_ids_lora,
++            expert_ids_lora=expert_ids_lora,
++            num_tokens_post_padded_lora=num_tokens_post_padded_lora,
++            token_lora_mapping=token_lora_mapping,
++            num_tokens=num_tokens,
++            w1=w1,
++            w2=w2,
++            top_k_num=top_k,
++            row_mapping=routing,
++        )
++
++        torch.ops._moe_C.moe_gather(
++            output,
++            gemm2_output,
++            topk_weights,
++            route_to_permuted_row,
++            num_experts,
++        )
++
++
++class XPUExpertsFp8Block(XPUExperts):
++    """Routed-expert path for DeepSeek-style 128x128 block FP8 (weight
++    128x128 static block scale + activation 1x128 dynamic per-token-group).
++
++    Mirrors the dense XPUFp8BlockScaledMMKernel (F1) at the MoE level. The
++    routed experts use the persistent Xe2 CUTLASS grouped block-scaled GEMM,
++    while reusing the packaged scatter, activation, and weighted-gather
++    operations.
++    """
++
++    def __init__(
++        self,
++        moe_config: FusedMoEConfig,
++        quant_config: FusedMoEQuantConfig,
++        max_num_tokens: int | None = None,
++        num_dispatchers: int | None = None,
++    ):
++        super().__init__(
++            moe_config,
++            quant_config,
++            max_num_tokens,
++            num_dispatchers,
++        )
++        # Preserve the FP8/block-FP8 weight preparation contract and select
++        # _xpu_block_moe_forward in XPUExperts.apply.
++        self.is_fp8 = True
++        self.is_block_fp8 = True
++
++    @staticmethod
++    def _supports_current_device() -> bool:
++        return current_platform.is_xpu()
++
++    @staticmethod
++    def _supports_quant_scheme(
++        weight_key: QuantKey | None,
++        activation_key: QuantKey | None,
++    ) -> bool:
++        SUPPORTED_W_A = [
++            (kFp8Static128BlockSym, kFp8Dynamic128Sym),
++        ]
++        return (weight_key, activation_key) in SUPPORTED_W_A
++
+ 
+ class XPUExpertsMXFp4(XPUExperts):
+     def __init__(
+@@ -193,3 +553,219 @@ class XPUExpertsMXFp4(XPUExperts):
+             (kMxfp4Static, None),
+         ]
+         return (weight_key, activation_key) in SUPPORTED_W_A
++
++
++class XPUExpertsInt4(LoRAExpertsMixin, XPUExperts):
++    """LoRA-aware XPU grouped-GEMM experts for W4A16 MoE.
++
++    Unlike :class:`XPUExperts`, this keeps the two grouped GEMMs visible so
++    routed-expert LoRA can be added before the activation and before the final
++    expert reduction.
++    """
++
++    def __init__(
++        self,
++        moe_config: FusedMoEConfig,
++        quant_config: FusedMoEQuantConfig,
++        max_num_tokens: int | None = None,
++        num_dispatchers: int | None = None,
++    ):
++        super().__init__(
++            moe_config, quant_config, max_num_tokens, num_dispatchers
++        )
++        self.is_int4 = True
++
++    def apply(
++        self,
++        output: torch.Tensor,
++        hidden_states: torch.Tensor,
++        w1: torch.Tensor,
++        w2: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        activation: MoEActivation,
++        global_num_experts: int,
++        expert_map: torch.Tensor | None,
++        a1q_scale: torch.Tensor | None,
++        a2_scale: torch.Tensor | None,
++        workspace13: torch.Tensor,
++        workspace2: torch.Tensor,
++        expert_tokens_meta: mk.ExpertTokensMetadata | None,
++        apply_router_weight_on_input: bool,
++    ):
++        if (
++            self._lora_context is None
++            or self._lora_context.punica_wrapper.no_lora
++        ):
++            return super().apply(
++                output,
++                hidden_states,
++                w1,
++                w2,
++                topk_weights,
++                topk_ids,
++                activation,
++                global_num_experts,
++                expert_map,
++                a1q_scale,
++                a2_scale,
++                workspace13,
++                workspace2,
++                expert_tokens_meta,
++                apply_router_weight_on_input,
++            )
++
++        # Routed LoRA bypasses XPUExperts.apply, but it still needs the exact
++        # one-time INT4 weight conversion performed by XpuFusedMoe.  Retain the
++        # initialized object so subsequent base-model requests use the original
++        # fast path and so the converted allocation is owned for the lifetime
++        # of this expert layer.
++        if self.fused_moe_impl is None:
++            self.fused_moe_impl = XpuFusedMoe(
++                w13=w1,
++                w13_scales=self.w1_scale,
++                w13_bias=self.w1_bias,
++                w2=w2,
++                w2_scales=self.w2_scale,
++                w2_bias=self.w2_bias,
++                n_experts_per_token=topk_ids.size(-1),
++                activation=activation.value,
++                num_experts=self.moe_config.num_local_experts,
++                ep_rank=self.moe_config.ep_rank,
++                ep_size=self.moe_config.ep_size,
++                is_int4=True,
++            )
++
++        del global_num_experts, a1q_scale, a2_scale, workspace13, workspace2
++        del expert_tokens_meta, apply_router_weight_on_input
++
++        num_tokens, hidden_size = hidden_states.shape
++        top_k = topk_ids.size(-1)
++        num_moe_inputs = num_tokens * top_k
++        num_experts = self.moe_config.num_local_experts
++        inter_size = w1.shape[-2] // 2
++
++        if not hasattr(w1, "xpu_fused_moe"):
++            raise RuntimeError(
++                "XPU INT4 MoE weights were not converted during weight loading"
++            )
++
++        remapped_hidden_states = torch.empty(
++            (num_moe_inputs, hidden_size),
++            dtype=hidden_states.dtype,
++            device=hidden_states.device,
++        )
++        rows_per_expert = torch.zeros(
++            num_experts, dtype=torch.int32, device=hidden_states.device
++        )
++        unpermuted_row_to_permuted_row = torch.empty(
++            (num_tokens, top_k), dtype=torch.int32, device=hidden_states.device
++        )
++        torch.ops._moe_C.remap_hidden_states(
++            hidden_states=hidden_states,
++            hidden_states_scales=None,
++            remapped_hidden_states=remapped_hidden_states,
++            remapped_hidden_states_scales=None,
++            expert_map=expert_map,
++            rows_per_expert=rows_per_expert,
++            unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
++            topk_ids=topk_ids,
++            total_experts_num=(
++                expert_map.shape[0] if expert_map is not None else num_experts
++            ),
++            local_experts_num=num_experts,
++        )
++        gemm1_output = torch.empty(
++            (num_moe_inputs, 2 * inter_size),
++            dtype=hidden_states.dtype,
++            device=hidden_states.device,
++        )
++        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
++            ptr_A=remapped_hidden_states,
++            ptr_B=w1,
++            ptr_scales=self.w1_scale,
++            ptr_bias=self.w1_bias,
++            ptr_D=gemm1_output,
++            rows_per_expert=rows_per_expert,
++            N=2 * inter_size,
++            K=hidden_size,
++            num_experts=num_experts,
++            is_B_int4=True,
++            is_B_mxfp4=False,
++        )
++        ctx = self._lora_context
++        assert ctx is not None
++        routing = unpermuted_row_to_permuted_row.reshape(-1)
++        (
++            sorted_token_ids_lora,
++            expert_ids_lora,
++            num_tokens_post_padded_lora,
++            token_lora_mapping,
++        ) = self.apply_w13_lora(
++            ctx,
++            y=gemm1_output,
++            x=hidden_states,
++            topk_ids=topk_ids,
++            topk_weights=topk_weights,
++            expert_map=expert_map,
++            w1=w1,
++            w2=w2,
++            num_tokens=num_tokens,
++            top_k_num=top_k,
++            c_row_mapping=routing,
++        )
++
++        act_output = torch.empty(
++            (num_moe_inputs, inter_size),
++            dtype=hidden_states.dtype,
++            device=hidden_states.device,
++        )
++        if activation == MoEActivation.SILU:
++            torch.ops._C.silu_and_mul(act_output, gemm1_output)
++        elif activation == MoEActivation.GELU:
++            torch.ops._C.gelu_and_mul(act_output, gemm1_output)
++        else:
++            raise ValueError(f"Unsupported INT4 XPU MoE activation: {activation}")
++
++        gemm2_output = torch.empty(
++            (num_moe_inputs, hidden_size),
++            dtype=hidden_states.dtype,
++            device=hidden_states.device,
++        )
++        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
++            ptr_A=act_output,
++            ptr_B=w2,
++            ptr_scales=self.w2_scale,
++            ptr_bias=self.w2_bias,
++            ptr_D=gemm2_output,
++            rows_per_expert=rows_per_expert,
++            N=hidden_size,
++            K=inter_size,
++            num_experts=num_experts,
++            is_B_int4=True,
++            is_B_mxfp4=False,
++        )
++
++        self.apply_w2_lora(
++            ctx,
++            y=gemm2_output.view(num_tokens, top_k, hidden_size),
++            x=act_output,
++            topk_weights=topk_weights,
++            sorted_token_ids_lora=sorted_token_ids_lora,
++            expert_ids_lora=expert_ids_lora,
++            num_tokens_post_padded_lora=num_tokens_post_padded_lora,
++            token_lora_mapping=token_lora_mapping,
++            num_tokens=num_tokens,
++            w1=w1,
++            w2=w2,
++            top_k_num=top_k,
++            row_mapping=routing,
++        )
++
++        torch.ops._moe_C.moe_gather(
++            output,
++            gemm2_output,
++            topk_weights,
++            unpermuted_row_to_permuted_row,
++            num_experts,
++        )
+diff --git a/vllm/model_executor/layers/fused_moe/lora_experts_mixin.py b/vllm/model_executor/layers/fused_moe/lora_experts_mixin.py
+index 10707b91b..2fc96fcf9 100644
+--- a/vllm/model_executor/layers/fused_moe/lora_experts_mixin.py
++++ b/vllm/model_executor/layers/fused_moe/lora_experts_mixin.py
+@@ -45,6 +45,7 @@ class LoRAExpertsMixin:
+         w2: torch.Tensor,
+         num_tokens: int,
+         top_k_num: int,
++        c_row_mapping: torch.Tensor | None = None,
+     ) -> tuple[
+         torch.Tensor | None,
+         torch.Tensor | None,
+@@ -71,6 +72,7 @@ class LoRAExpertsMixin:
+             lora_context.fully_sharded,
+             lora_context.use_tuned_config,
+             token_lora_mapping=lora_context.local_token_lora_mapping,
++            c_row_mapping=c_row_mapping,
+         )
+ 
+     def apply_w2_lora(
+@@ -88,6 +90,7 @@ class LoRAExpertsMixin:
+         w1: torch.Tensor,
+         w2: torch.Tensor,
+         top_k_num: int,
++        row_mapping: torch.Tensor | None = None,
+     ) -> None:
+         lora_context.punica_wrapper.add_lora_w2(
+             y,
+@@ -109,4 +112,5 @@ class LoRAExpertsMixin:
+             lora_context.fully_sharded,
+             lora_context.tp_rank,
+             lora_context.use_tuned_config,
++            row_mapping=row_mapping,
+         )
 diff --git a/vllm/model_executor/layers/fused_moe/modular_kernel.py b/vllm/model_executor/layers/fused_moe/modular_kernel.py
 index 135a677ff..437f47b3a 100644
 --- a/vllm/model_executor/layers/fused_moe/modular_kernel.py
@@ -2083,6 +4025,37 @@ index 135a677ff..437f47b3a 100644
          a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
              hidden_states,
              topk_weights,
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/fp8.py b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
+index 6dc24adfd..974cf72f4 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/fp8.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/fp8.py
+@@ -188,9 +188,10 @@ def backend_to_kernel_cls(
+     elif backend == Fp8MoeBackend.XPU:
+         from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
+             XPUExpertsFp8,
++            XPUExpertsFp8Block,
+         )
+ 
+-        return [XPUExpertsFp8]
++        return [XPUExpertsFp8, XPUExpertsFp8Block]
+ 
+     elif backend == Fp8MoeBackend.CPU:
+         from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
+@@ -484,7 +485,13 @@ def convert_to_fp8_moe_kernel_format(
+             prepare_fp8_moe_layer_for_xpu,
+         )
+ 
+-        w13, w2 = prepare_fp8_moe_layer_for_xpu(w13, w2)
++        block_quant = getattr(layer, "weight_block_size", None) is not None
++        if not block_quant:
++            # Per-tensor XPU path expects [E, K, N]. The block reference path
++            # (ref_fused_moe fp8block) consumes the original [E, N, K] weight
++            # together with [E, N/128, K/128] scales, so leave block weights
++            # (and their per-block scales) untransposed.
++            w13, w2 = prepare_fp8_moe_layer_for_xpu(w13, w2)
+     elif fp8_backend == Fp8MoeBackend.CPU:
+         from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
+             prepare_fp8_moe_layer_for_cpu,
 diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
 index 37b15ed40..ad283db37 100644
 --- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
@@ -2227,10 +4200,10 @@ index a5d4e4db7..a9f1eaa09 100644
  
  class LayerNorm(nn.Module):
 diff --git a/vllm/model_executor/layers/mamba/gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn_linear_attn.py
-index 4493ee783..fb0e235c7 100644
+index 4493ee783..681939ba5 100644
 --- a/vllm/model_executor/layers/mamba/gdn_linear_attn.py
 +++ b/vllm/model_executor/layers/mamba/gdn_linear_attn.py
-@@ -37,6 +37,15 @@ from vllm.model_executor.layers.linear import (
+@@ -37,6 +37,16 @@ from vllm.model_executor.layers.linear import (
      MergedColumnParallelLinear,
      RowParallelLinear,
  )
@@ -2240,13 +4213,14 @@ index 4493ee783..fb0e235c7 100644
 +    esimd_gdn_conv_fused,
 +    esimd_gdn_conv_fused_seq,
 +    esimd_gemv_fp8_pert_fused2,
++    esimd_norm_gemv_fp8_blockscale,
 +    esimd_norm_gemv_fp8_pert,
 +    esimd_rms_norm_gated,
 +)
  from vllm.model_executor.layers.mamba.abstract import MambaBase
  from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
  from vllm.model_executor.layers.mamba.mamba_utils import (
-@@ -406,6 +415,80 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
+@@ -406,6 +416,80 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
              raise ValueError(f"Duplicate layer name: {prefix}")
          compilation_config.static_forward_context[prefix] = self
  
@@ -2327,7 +4301,7 @@ index 4493ee783..fb0e235c7 100644
      def create_qkvz_proj(
          self,
          hidden_size: int,
-@@ -781,6 +864,154 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
+@@ -781,6 +865,174 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
          # ============================================================
          self._output_projection(core_attn_out, z, output, num_tokens)
  
@@ -2340,6 +4314,8 @@ index 4493ee783..fb0e235c7 100644
 +        process_weights_after_loading. The single-GEMV path already accelerates
 +        each projection (PR #100); this saves one launch and reads hidden once.
 +        """
++        if self._has_lora_projection("in_proj_qkvz", "in_proj_ba"):
++            return None
 +        if not self._gdn_proj_esimd_ok or num_tokens != 1:
 +            return None
 +        if self._gdn_proj_fused_ready is None:
@@ -2377,6 +4353,24 @@ index 4493ee783..fb0e235c7 100644
 +            ba,
 +        )
 +        return qkvz, ba
++
++    def _has_lora_projection(self, *names: str) -> bool:
++        """Return whether any projection is wrapped by a LoRA layer.
++
++        XPU ESIMD projection fast paths consume the quantized base weights
++        directly, so they must fall back to the module call when LoRA is
++        present in order to apply the adapter delta.
++        """
++        from vllm.lora.layers.base import BaseLayerWithLoRA
++
++        for name in names:
++            projection = getattr(self, name)
++            if (
++                isinstance(projection, BaseLayerWithLoRA)
++                and not projection.punica_wrapper.no_lora
++            ):
++                return True
++        return False
 +
 +    def _gdn_conv_decode(
 +        self,
@@ -2482,7 +4476,7 @@ index 4493ee783..fb0e235c7 100644
      def forward_xpu(
          self,
          hidden_states: torch.Tensor,
-@@ -797,30 +1028,247 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
+@@ -797,30 +1049,260 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
          # ============================================================
          # Part 1: Input Projection
          # ============================================================
@@ -2491,7 +4485,11 @@ index 4493ee783..fb0e235c7 100644
 +        proj = self._gdn_proj_fused(hidden_states, num_tokens)
 +        if proj is not None:
 +            projected_states_qkvz, projected_states_ba = proj
-+        elif num_tokens == 1 and self._gdn_proj_int4_esimd_ok:
++        elif (
++            num_tokens == 1
++            and self._gdn_proj_int4_esimd_ok
++            and not self._has_lora_projection("in_proj_qkvz", "in_proj_ba")
++        ):
 +            from vllm.model_executor.layers.esimd_utils import (
 +                esimd_gemv_int4_fused2,
 +            )
@@ -2527,6 +4525,7 @@ index 4493ee783..fb0e235c7 100644
 +        elif (
 +            num_tokens <= 64
 +            and self._gdn_proj_int4_esimd_ok
++            and not self._has_lora_projection("in_proj_qkvz", "in_proj_ba")
 +            # esimd_gemm_int4_pgrp requires N % 16 == 0 (DPAS N tile). GDN
 +            # in_proj_ba has N = 2 * num_v_heads/tp (e.g. 24 for Qwen3.6-27B
 +            # TP=4), not a multiple of 16, so it TORCH_CHECK-fails here --
@@ -2599,8 +4598,8 @@ index 4493ee783..fb0e235c7 100644
 +            projected_states_qkvz,
 +            output,
 +            num_tokens,
-+        )
-+
+         )
+ 
 +    def _gdn_core_and_output(
 +        self,
 +        projected_states_qkvz: torch.Tensor,
@@ -2641,7 +4640,7 @@ index 4493ee783..fb0e235c7 100644
 +        # with DISABLE_ESIMD_GDN_CONV) we fall through to the upstream op 1:1.
 +        handled = self._gdn_conv_esimd_ok and self._gdn_conv_decode(
 +            projected_states_qkvz, projected_states_ba, core_attn_out, z
-         )
++        )
 +        if not handled:
 +            if _use_buf:
 +                core_attn_out.zero_()
@@ -2652,7 +4651,7 @@ index 4493ee783..fb0e235c7 100644
 +                projected_states_ba,
 +                self.prefix,
 +            )
- 
++
          # ============================================================
          # Part 3: Output Projection
          # ============================================================
@@ -2666,7 +4665,11 @@ index 4493ee783..fb0e235c7 100644
 +            self._output_projection_esimd_decode(core_attn_out, z, output)
 +            return
 +
-+        if num_tokens == 1 and self._gdn_proj_int4_esimd_ok:
++        if (
++            num_tokens == 1
++            and self._gdn_proj_int4_esimd_ok
++            and not self._has_lora_projection("out_proj")
++        ):
 +            self._output_projection_int4_esimd_decode(core_attn_out, z, output)
 +            return
 +
@@ -2704,7 +4707,11 @@ index 4493ee783..fb0e235c7 100644
 +        # INT4 counterpart of the batched out_proj path: fused gated RMSNorm
 +        # followed by the per-group INT4 GEMM (esimd_gemm_int4_pgrp) on the
 +        # ESIMD-formatted out_proj weights.
-+        if num_tokens <= 64 and self._gdn_proj_int4_esimd_ok:
++        if (
++            num_tokens <= 64
++            and self._gdn_proj_int4_esimd_ok
++            and not self._has_lora_projection("out_proj")
++        ):
 +            from vllm.model_executor.layers.esimd_utils import (
 +                esimd_gemm_int4_pgrp,
 +            )
@@ -2744,7 +4751,7 @@ index 4493ee783..fb0e235c7 100644
          z_shape_og = z.shape
          # Reshape input data into 2D tensor
          core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-@@ -830,6 +1278,152 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
+@@ -830,6 +1312,177 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
          core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
          output[:num_tokens], _ = self.out_proj(core_attn_out)
  
@@ -2764,9 +4771,20 @@ index 4493ee783..fb0e235c7 100644
 +            return cached
 +
 +        ok = False
++        is_block = False
 +        if ESIMD_AVAILABLE and not disable_esimd_gdn_outproj():
 +            w = self.out_proj.weight
 +            ws = getattr(self.out_proj, "weight_scale", None)
++            ws_block = getattr(self.out_proj, "weight_scale_inv", None)
++            block_size = getattr(self.out_proj, "weight_block_size", None)
++            per_tensor_ready = ws is not None and ws.numel() == 1
++            block_ready = (
++                esimd_norm_gemv_fp8_blockscale is not None
++                and w is not None
++                and w.dtype == torch.float8_e4m3fn
++                and ws_block is not None
++                and tuple(block_size or ()) == (128, 128)
++            )
 +            ok = (
 +                w is not None
 +                and self.norm.activation in ("silu", "swish")
@@ -2774,9 +4792,10 @@ index 4493ee783..fb0e235c7 100644
 +                and self.norm.norm_before_gate
 +                and self.out_proj.bias is None
 +                and w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-+                and ws is not None
-+                and ws.numel() == 1
++                and (per_tensor_ready or block_ready)
 +            )
++            is_block = block_ready
++        self._gdn_outproj_is_block = is_block
 +        self._gdn_outproj_esimd_ok = ok
 +        return ok
 +
@@ -2837,17 +4856,30 @@ index 4493ee783..fb0e235c7 100644
 +                device=output.device,
 +            )
 +
-+        esimd_norm_gemv_fp8_pert(
-+            core_attn_out.view(hv, v),
-+            z.view(hv, v),
-+            self._norm_weight_fp16,
-+            self.out_proj.weight,
-+            self.out_proj.weight_scale,
-+            self._decode_outproj_buf,
-+            hv,
-+            v,
-+            self.norm.eps,
-+        )
++        if self._gdn_outproj_is_block:
++            esimd_norm_gemv_fp8_blockscale(
++                core_attn_out.view(hv, v),
++                z.view(hv, v),
++                self._norm_weight_fp16,
++                self.out_proj.weight,
++                self.out_proj.weight_scale_inv,
++                self._decode_outproj_buf,
++                hv,
++                v,
++                self.norm.eps,
++            )
++        else:
++            esimd_norm_gemv_fp8_pert(
++                core_attn_out.view(hv, v),
++                z.view(hv, v),
++                self._norm_weight_fp16,
++                self.out_proj.weight,
++                self.out_proj.weight_scale,
++                self._decode_outproj_buf,
++                hv,
++                v,
++                self.norm.eps,
++            )
 +
 +        # out_proj is RowParallelLinear: reduce the partial product across TP.
 +        if self.tp_size > 1 and self.out_proj.reduce_results:
@@ -3060,10 +5092,10 @@ index 458741478..380dfe0f9 100644
  
 diff --git a/vllm/model_executor/layers/quantization/sym_int4.py b/vllm/model_executor/layers/quantization/sym_int4.py
 new file mode 100644
-index 000000000..dbb80d5b8
+index 000000000..8a26409f2
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/sym_int4.py
-@@ -0,0 +1,923 @@
+@@ -0,0 +1,1006 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""SYM_INT4 weight-only quantization for XPU.
@@ -3098,10 +5130,7 @@ index 000000000..dbb80d5b8
 +
 +from vllm.envs import VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT, VLLM_QUANTIZE_Q40_LIB
 +from vllm.logger import init_logger
-+from vllm.model_executor.layers.quantization.fp8 import (
-+    CopyNumelCounter,
-+    _copy_missing_attrs,
-+)
++from vllm.model_executor.layers.esimd_utils import disable_esimd_int4
 +from vllm.model_executor.layers.fused_moe import (
 +    FusedMoE,
 +    FusedMoEConfig,
@@ -3118,6 +5147,10 @@ index 000000000..dbb80d5b8
 +from vllm.model_executor.layers.quantization.base_config import (
 +    QuantizationConfig,
 +    QuantizeMethodBase,
++)
++from vllm.model_executor.layers.quantization.fp8 import (
++    CopyNumelCounter,
++    _copy_missing_attrs,
 +)
 +from vllm.model_executor.parameter import ModelWeightParameter
 +from vllm.model_executor.utils import set_weight_attrs
@@ -3468,6 +5501,31 @@ index 000000000..dbb80d5b8
 +        return out.reshape(x.shape[:-1] + (layer.qweight.shape[-1],))
 +
 +
++def _register_linear_int4_layouts(
++    layer: Module,
++    qweight: torch.Tensor,
++    scale: torch.Tensor,
++) -> None:
++    """Register only the INT4 layouts enabled for linear execution."""
++    # ESIMD views ([N, K/2] uint8) registered so ESIMD integration can reuse
++    # the quantized weights without re-quantizing. When ESIMD INT4 is disabled,
++    # avoid registering these params so the original N-major scale buffer can be
++    # released after we materialize the oneDNN scale layout (different physical
++    # order), reducing XPU memory usage.
++    if not disable_esimd_int4():
++        layer.weight_esimd = Parameter(qweight.view(torch.uint8), requires_grad=False)
++        layer.scale_esimd = Parameter(scale, requires_grad=False)
++
++    # oneDNN / gptq.py uses a logical [K/8, N] tensor whose K-packed
++    # dimension is contiguous (stride 1). The transpose view already has the
++    # required strides and the same N-major physical byte order ESIMD uses, so
++    # keep it as an alias instead of allocating a duplicate weight tensor.
++    layer.qweight = Parameter(qweight.t(), requires_grad=False)
++    # Runtime scales are consumed by oneDNN in contiguous [K/group, N] order,
++    # which differs physically from ESIMD's contiguous [N, K/group] order.
++    layer.scales = Parameter(scale.t().contiguous(), requires_grad=False)
++
++
 +def _quantize_linear_int4_inplace(layer: Module) -> None:
 +    """Quantize a Linear layer's BF16/FP16 weight to INT4 for the oneDNN backend.
 +
@@ -3545,16 +5603,7 @@ index 000000000..dbb80d5b8
 +    scale_xpu = scale.to("xpu")
 +    del qweight, scale
 +
-+    # ESIMD views ([N, K/2] uint8) registered so later ESIMD integration
-+    # (Feature 2b) can reuse the quantized weights without re-quantizing.
-+    layer.weight_esimd = Parameter(
-+        qweight_xpu.view(torch.uint8), requires_grad=False
-+    )
-+    layer.scale_esimd = Parameter(scale_xpu, requires_grad=False)
-+
-+    # oneDNN / gptq.py layout: qweight [K/8, N], scales [K/group, N].
-+    layer.qweight = Parameter(qweight_xpu.t().contiguous(), requires_grad=False)
-+    layer.scales = Parameter(scale_xpu.t().contiguous(), requires_grad=False)
++    _register_linear_int4_layouts(layer, qweight_xpu, scale_xpu)
 +    # Symmetric qzeros placeholder; transpose_onednn_woq_format overwrites it
 +    # with the scalar 8 for the "gptq" symmetric case.
 +    layer.qzeros = Parameter(
@@ -3594,9 +5643,11 @@ index 000000000..dbb80d5b8
 +    tensor would get it dragged back to CPU — leaving weights on CPU while
 +    scales stay on XPU, and the cutlass int4 GEMM then crashes on the
 +    cross-device pointers. New names are not in that record, so they stay on XPU.
-+    (v0.14.0-b8.3 instead patched device_loading_context to skip the move-back
-+    when VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1; v0.21.0 dropped that guard, so we
-+    avoid the name collision here instead of touching the loader.)
++    The final modular-kernel weights must use the standard ``w13_weight`` /
++    ``w2_weight`` names.  They are marked ``_vllm_keep_on_device`` when those
++    names are restored below, so ``device_loading_context`` can distinguish
++    permanent quantized inference weights from the original CPU staging
++    parameters and avoid moving them back to CPU/UVA.
 +    """
 +    assert which in ("w13", "w2"), f"unknown side {which!r}"
 +    weight_name = f"{which}_weight"
@@ -3687,7 +5738,11 @@ index 000000000..dbb80d5b8
 +    # not later move our XPU quantized weight back to CPU (see docstring).
 +    setattr(layer, weight_name, None)
 +
-+    qweight_xpu = qweight.to("xpu")
++    # Keep the same conversion path and XPU allocation layout as the original
++    # XpuFusedMoe implementation.  It converts these packed two's-complement
++    # nibbles to the signed-magnitude representation expected by CUTLASS once,
++    # when the expert implementation is initialized.
++    qweight_xpu = qweight.to("xpu").view(torch.uint8)
 +    scales_xpu = scales.to("xpu")
 +    del qweight, scales
 +
@@ -3722,10 +5777,42 @@ index 000000000..dbb80d5b8
 +    def get_fused_moe_quant_config(
 +        self, layer: torch.nn.Module
 +    ) -> Optional[FusedMoEQuantConfig]:
-+        # sym_int4 drives the kernel directly via xpu_fused_moe; it does not use
-+        # the modular-kernel quant config. v0.21.0 makes this abstract, so
-+        # implement it as a no-op returning None.
-+        return None
++        from vllm.model_executor.layers.fused_moe.config import (
++            int4_w4a16_moe_quant_config,
++        )
++
++        return int4_w4a16_moe_quant_config(
++            w1_scale=layer.w13_qscales,
++            w2_scale=layer.w2_qscales,
++            w1_zp=None,
++            w2_zp=None,
++            block_shape=[1, QK4_GROUP_SIZE],
++        )
++
++    def _setup_modular_kernel(self, layer: FusedMoE) -> None:
++        from vllm.model_executor.layers.fused_moe.all2all_utils import (
++            maybe_make_prepare_finalize,
++        )
++        from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
++            XPUExpertsInt4,
++        )
++        from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
++
++        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
++        prepare_finalize = maybe_make_prepare_finalize(
++            moe=self.moe,
++            quant_config=self.moe_quant_config,
++            routing_tables=layer._maybe_init_expert_routing_tables(),
++            allow_new_interface=True,
++        )
++        assert prepare_finalize is not None
++        experts = XPUExpertsInt4(self.moe, self.moe_quant_config)
++        self.moe_kernel = FusedMoEKernel(
++            prepare_finalize,
++            experts,
++            shared_experts=layer.shared_experts,
++            inplace=not self.moe.disable_inplace,
++        )
 +
 +    def create_weights(
 +        self,
@@ -3887,6 +5974,20 @@ index 000000000..dbb80d5b8
 +                    and getattr(layer, "_w13_materialized", False)
 +                    and getattr(layer, "_w2_materialized", False)):
 +                self._fused_moe_impl = None
++                layer.w13_weight = torch.nn.Parameter(
++                    layer.w13_qweight, requires_grad=False
++                )
++                layer.w2_weight = torch.nn.Parameter(
++                    layer.w2_qweight, requires_grad=False
++                )
++                # These replace UVA staging parameters with the permanent
++                # inference weights.  Keep them on XPU when the surrounding
++                # device_loading_context restores the original parameters.
++                layer.w13_weight._vllm_keep_on_device = True
++                layer.w2_weight._vllm_keep_on_device = True
++                layer.w13_qweight = None
++                layer.w2_qweight = None
++                self._setup_modular_kernel(layer)
 +                layer._already_called_process_weights_after_loading = True
 +
 +            return res
@@ -3930,6 +6031,19 @@ index 000000000..dbb80d5b8
 +        # XpuFusedMoe is built lazily on first apply (it mutates the weights via
 +        # implement_zp and caches the impl on the method instance).
 +        self._fused_moe_impl = None
++        layer.w13_weight = torch.nn.Parameter(
++            layer.w13_qweight, requires_grad=False
++        )
++        layer.w2_weight = torch.nn.Parameter(
++            layer.w2_qweight, requires_grad=False
++        )
++        # These replace UVA staging parameters with the permanent inference
++        # weights.  Keep them on XPU when device_loading_context exits.
++        layer.w13_weight._vllm_keep_on_device = True
++        layer.w2_weight._vllm_keep_on_device = True
++        layer.w13_qweight = None
++        layer.w2_qweight = None
++        self._setup_modular_kernel(layer)
 +        layer._already_called_process_weights_after_loading = True
 +
 +    def apply(
@@ -3940,53 +6054,77 @@ index 000000000..dbb80d5b8
 +        topk_ids: torch.Tensor,
 +        shared_experts_input: Optional[torch.Tensor],
 +    ) -> torch.Tensor:
-+        from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
++        assert self.moe_kernel is not None, (
++            "sym_int4 MoE modular kernel was not initialized after weight loading"
++        )
++        experts = self.moe_kernel.fused_experts
++        # Keep base-model requests on the original XPU fused-MoE fast path.
++        # The modular prepare/finalize path is needed only while routed-expert
++        # LoRA is active; using it for ordinary requests adds appreciable
++        # per-layer decode overhead without changing the computation.
++        lora_context = getattr(experts, "_lora_context", None)
++        if lora_context is None or lora_context.punica_wrapper.no_lora:
++            from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
 +
-+        if getattr(self, "_fused_moe_impl", None) is None:
-+            # int4 weights must be a uint8 [E, N, K/2] view for implement_zp.
-+            # Weights/scales live under the q-prefixed names set by
-+            # _quantize_moe_int4_side_inplace (see its docstring for why the
-+            # original w13_weight/w2_weight names are not reused).
-+            #
-+            # XpuFusedMoe.__init__ runs implement_zp once and rebinds the
-+            # converted result onto the tensor it is handed via ``w13.data =
-+            # w13_tmp``. With a throwaway ``.view()`` that rebind lands on the
-+            # view while ``layer.w13_qweight`` keeps the original storage alive,
-+            # so both the original int4 weight (~0.4GB per MoE layer) and the
-+            # converted copy stay resident -- a ~0.4GB/layer leak that OOMs large
-+            # MoE models. Build the views once, then drop the layer's int32
-+            # Parameters so only the converted weights (held by the impl) remain.
-+            w13_u8 = layer.w13_qweight.view(torch.uint8)
-+            w2_u8 = layer.w2_qweight.view(torch.uint8)
-+            self._fused_moe_impl = XpuFusedMoe(
-+                w13=w13_u8,
-+                w13_scales=layer.w13_qscales,
-+                w13_bias=None,
-+                w2=w2_u8,
-+                w2_scales=layer.w2_qscales,
-+                w2_bias=None,
-+                n_experts_per_token=topk_ids.size(-1),
-+                activation=layer.activation.value,
-+                num_experts=layer.local_num_experts,
-+                ep_rank=self.moe.ep_rank,
-+                ep_size=self.moe.ep_size,
-+                is_int4=True,
++            if self._fused_moe_impl is None:
++                self._fused_moe_impl = XpuFusedMoe(
++                    w13=layer.w13_weight,
++                    w13_scales=layer.w13_qscales,
++                    w13_bias=None,
++                    w2=layer.w2_weight,
++                    w2_scales=layer.w2_qscales,
++                    w2_bias=None,
++                    n_experts_per_token=topk_ids.size(-1),
++                    activation=layer.activation.value,
++                    num_experts=layer.local_num_experts,
++                    ep_rank=self.moe.ep_rank,
++                    ep_size=self.moe.ep_size,
++                    is_int4=True,
++                )
++            output = torch.empty_like(x)
++            self._fused_moe_impl.apply(
++                output=output,
++                hidden_states=x,
++                topk_weights=topk_weights,
++                topk_ids=topk_ids,
 +            )
-+            # implement_zp replaced w13_u8/w2_u8's storage with the converted
-+            # tensors (now held by self._fused_moe_impl). Release the layer's
-+            # original int32 Parameters so the pre-conversion int4 storage is
-+            # freed instead of lingering for the model's lifetime.
-+            layer.w13_qweight = None
-+            layer.w2_qweight = None
++            return output
 +
-+        out = torch.empty_like(x)
-+        self._fused_moe_impl.apply(
-+            output=out,
++        return self.moe_kernel.apply(
 +            hidden_states=x,
++            w1=layer.w13_weight,
++            w2=layer.w2_weight,
 +            topk_weights=topk_weights,
 +            topk_ids=topk_ids,
++            activation=layer.activation,
++            global_num_experts=layer.global_num_experts,
++            apply_router_weight_on_input=layer.apply_router_weight_on_input,
++            expert_map=layer.expert_map,
++            shared_experts_input=shared_experts_input,
 +        )
-+        return out
+diff --git a/vllm/model_executor/model_loader/utils.py b/vllm/model_executor/model_loader/utils.py
+index 2a5f746d7..0b277e23f 100644
+--- a/vllm/model_executor/model_loader/utils.py
++++ b/vllm/model_executor/model_loader/utils.py
+@@ -156,7 +156,8 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
+         )
+         # Restore parameters to their original devices, ignoring new parameters
+         for name, p in module.named_parameters():
+-            if name in original_device_states:
++            keep_on_device = getattr(p, "_vllm_keep_on_device", False)
++            if name in original_device_states and not keep_on_device:
+                 original_device: torch.device = original_device_states[name]
+                 p.data = p.data.to(original_device)
+ 
+@@ -164,7 +165,7 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
+             # re-offload it to CPU using UVA
+             if name in uva_offloaded_parameters and not getattr(
+                 p, "_vllm_is_uva_offloaded", False
+-            ):
++            ) and not keep_on_device:
+                 cpu_data = p.data.to(device="cpu")
+                 if use_pin_memory:
+                     cpu_data = cpu_data.pin_memory()
 diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
 index 459c16f8e..c10e588c7 100644
 --- a/vllm/model_executor/models/config.py
@@ -5625,7 +7763,7 @@ index 000000000..f53c2f445
 +            logprobs_tensors=logprobs_tensors,
 +        )
 diff --git a/vllm/model_executor/models/gemma4.py b/vllm/model_executor/models/gemma4.py
-index 1b50db61c..1bb03ebc8 100644
+index 1b50db61c..ed1d4eefc 100644
 --- a/vllm/model_executor/models/gemma4.py
 +++ b/vllm/model_executor/models/gemma4.py
 @@ -18,6 +18,7 @@
@@ -5713,7 +7851,26 @@ index 1b50db61c..1bb03ebc8 100644
  from vllm.model_executor.layers.linear import (
      ColumnParallelLinear,
      MergedColumnParallelLinear,
-@@ -160,11 +231,16 @@ def gemma4_fused_routing_kernel_triton(
+@@ -85,6 +156,18 @@ from .utils import (
+ logger = init_logger(__name__)
+ 
+ 
++def _pad_int4_input(
++    inputs: torch.Tensor,
++    packed_weight: torch.Tensor,
++) -> torch.Tensor:
++    required_k = packed_weight.shape[-1] * 2
++    input_k = inputs.shape[-1]
++    if input_k >= required_k:
++        return inputs
++    padding = required_k - input_k
++    return torch.nn.functional.pad(inputs, (0, padding)).contiguous()
++
++
+ def _remap_gemma4_expert_weight_name(name: str) -> str:
+     return re.sub(r"(?<!\.moe)\.experts\.(\d+)\.", r".moe.experts.\1.", name)
+ 
+@@ -160,11 +243,16 @@ def gemma4_fused_routing_kernel_triton(
      topk: int,
      per_expert_scale: torch.Tensor,
      num_warps: int = 1,
@@ -5731,7 +7888,7 @@ index 1b50db61c..1bb03ebc8 100644
      ids = torch.empty(T, topk, dtype=torch.int32, device=gating_output.device)
      BLOCK_E = triton.next_power_of_2(E)
      _gemma4_routing_kernel[(T,)](
-@@ -241,7 +317,114 @@ class Gemma4MLP(nn.Module):
+@@ -241,7 +329,124 @@ class Gemma4MLP(nn.Module):
          )
          self.act_fn = get_act_and_mul_fn(hidden_activation)
  
@@ -5835,9 +7992,19 @@ index 1b50db61c..1bb03ebc8 100644
 +                    _op_gu = _op_dn = self._dense_op
 +                else:
 +                    _op_gu = _op_dn = _gemm
-+                _op_gu(x, self._gu_w, self._gu_s, gate_up)
++                _gu_input = x
++                if self._dense_quant == "sym_int4":
++                    _gu_input = _pad_int4_input(x, self._gu_w)
++                _op_gu(_gu_input, self._gu_w, self._gu_s, gate_up)
 +                act = self.act_fn(gate_up)
-+                _op_dn(act, self._dn_w, self._dn_s, down)
++                if self._dense_quant == "sym_int4":
++                    act = _pad_int4_input(act, self._dn_w)
++                _op_dn(
++                    act,
++                    self._dn_w,
++                    self._dn_s,
++                    down,
++                )
 +                if self._dense_tp > 1:
 +                    from vllm.distributed import (
 +                        tensor_model_parallel_all_reduce)
@@ -5846,7 +8013,7 @@ index 1b50db61c..1bb03ebc8 100644
          gate_up, _ = self.gate_up_proj(x)
          x = self.act_fn(gate_up)
          x, _ = self.down_proj(x)
-@@ -291,6 +474,33 @@ class Gemma4Router(nn.Module):
+@@ -291,6 +496,33 @@ class Gemma4Router(nn.Module):
  
      def forward(self, x: torch.Tensor) -> torch.Tensor:
          """Returns raw router logits [T, E]."""
@@ -5880,7 +8047,7 @@ index 1b50db61c..1bb03ebc8 100644
          x = self.norm(x)
          x = x * self.root_size.to(x.dtype)
          x = x * self.scale.to(x.dtype)
-@@ -334,9 +544,63 @@ class Gemma4MoE(nn.Module):
+@@ -334,9 +566,63 @@ class Gemma4MoE(nn.Module):
              topk: int,
              renormalize: bool,
          ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -5945,7 +8112,7 @@ index 1b50db61c..1bb03ebc8 100644
                  )
  
              return gemma4_routing_function_torch(gating_output, topk, per_expert_scale)
-@@ -358,7 +622,257 @@ class Gemma4MoE(nn.Module):
+@@ -358,7 +644,257 @@ class Gemma4MoE(nn.Module):
              activation="gelu_tanh",
          )
  
@@ -6203,7 +8370,7 @@ index 1b50db61c..1bb03ebc8 100644
          return self.experts(x, router_logits)
  
  
-@@ -499,6 +1013,96 @@ class Gemma4Attention(nn.Module):
+@@ -499,6 +1035,96 @@ class Gemma4Attention(nn.Module):
              prefix=f"{prefix}.attn",
          )
  
@@ -6300,7 +8467,7 @@ index 1b50db61c..1bb03ebc8 100644
      def forward(
          self,
          positions: torch.Tensor,
-@@ -508,30 +1112,105 @@ class Gemma4Attention(nn.Module):
+@@ -508,30 +1134,109 @@ class Gemma4Attention(nn.Module):
          # Unified QKV path (works for both k_eq_v and standard layers).
          # For k_eq_v, K weights are loaded into both K and V slots of
          # qkv_proj, so V == K automatically.
@@ -6337,7 +8504,10 @@ index 1b50db61c..1bb03ebc8 100644
 +                qkv = self._m_qkv[:_n]
 +                _qg = getattr(self, "_qkv_op_gemm", None)
 +                _op = self._qkv_op if (_n == 1 or _qg is None) else _qg
-+                _op(hidden_states, self._qkv_w, self._qkv_s, qkv)
++                _qkv_input = hidden_states
++                if self._qkv_quant == "sym_int4":
++                    _qkv_input = _pad_int4_input(hidden_states, self._qkv_w)
++                _op(_qkv_input, self._qkv_w, self._qkv_s, qkv)
 +            else:
 +                qkv, _ = self.qkv_proj(hidden_states)
 +        else:
@@ -6417,7 +8587,8 @@ index 1b50db61c..1bb03ebc8 100644
 +        ):
 +            from custom_esimd_kernels_vllm import esimd_gemv_int4
 +            output = self._m_oproj[:1]
-+            esimd_gemv_int4(attn_output, self._o_w, self._o_s, output)
++            _oproj_input = _pad_int4_input(attn_output, self._o_w)
++            esimd_gemv_int4(_oproj_input, self._o_w, self._o_s, output)
 +            if self._oproj_tp > 1:
 +                from vllm.distributed import (
 +                    tensor_model_parallel_all_reduce)
@@ -6427,7 +8598,7 @@ index 1b50db61c..1bb03ebc8 100644
  
          return output
  
-@@ -628,6 +1307,11 @@ class Gemma4DecoderLayer(nn.Module):
+@@ -628,6 +1333,11 @@ class Gemma4DecoderLayer(nn.Module):
          self.enable_moe_block = getattr(config, "enable_moe_block", False) or getattr(
              config, "use_second_mlp_block", False
          )
@@ -6439,7 +8610,7 @@ index 1b50db61c..1bb03ebc8 100644
          if self.enable_moe_block:
              self.router = Gemma4Router(
                  config,
-@@ -689,6 +1373,26 @@ class Gemma4DecoderLayer(nn.Module):
+@@ -689,6 +1399,26 @@ class Gemma4DecoderLayer(nn.Module):
  
          # Layer scalar (loaded from checkpoint) — applies to ALL text layers
          self.register_buffer("layer_scalar", torch.ones(1))
@@ -6466,7 +8637,7 @@ index 1b50db61c..1bb03ebc8 100644
  
      def forward(
          self,
-@@ -701,38 +1405,223 @@ class Gemma4DecoderLayer(nn.Module):
+@@ -701,38 +1431,223 @@ class Gemma4DecoderLayer(nn.Module):
          # Gemma4 residual pattern:
          # 1. input_norm(x) → attn → post_attn_norm → ADD residual
          # 2. pre_ff_norm → mlp → post_ff_norm → ADD residual
@@ -6710,7 +8881,7 @@ index 1b50db61c..1bb03ebc8 100644
          hidden_states = hidden_states + residual
  
          # Apply PLE (Per-Layer Embedding) if configured
-@@ -763,6 +1652,7 @@ def _run_decoder_layers(
+@@ -763,6 +1678,7 @@ def _run_decoder_layers(
  ) -> torch.Tensor:
      """Run a slice of decoder layers with PLE extraction."""
      residual = None
@@ -6718,7 +8889,7 @@ index 1b50db61c..1bb03ebc8 100644
      for idx, layer in enumerate(decoder_layers):
          layer_idx = idx + layer_idx_start
          layer_per_input = (
-@@ -773,8 +1663,17 @@ def _run_decoder_layers(
+@@ -773,8 +1689,17 @@ def _run_decoder_layers(
              hidden_states,
              residual,
              per_layer_input=layer_per_input,
@@ -6736,7 +8907,7 @@ index 1b50db61c..1bb03ebc8 100644
      return hidden_states
  
  
-@@ -1312,6 +2211,7 @@ class Gemma4Model(nn.Module, EagleModelMixin):
+@@ -1312,6 +2237,7 @@ class Gemma4Model(nn.Module, EagleModelMixin):
              if per_layer_inputs is not None:
                  per_layer_inputs = intermediate_tensors["per_layer_inputs"]
          residual = None
@@ -6744,7 +8915,7 @@ index 1b50db61c..1bb03ebc8 100644
          aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
          for layer_idx, layer in enumerate(
              islice(self.layers, self.start_layer, self.end_layer)
-@@ -1329,8 +2229,10 @@ class Gemma4Model(nn.Module, EagleModelMixin):
+@@ -1329,8 +2255,10 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                  hidden_states,
                  residual,
                  per_layer_input=layer_per_input,
@@ -6755,7 +8926,7 @@ index 1b50db61c..1bb03ebc8 100644
              self._maybe_add_hidden_state(
                  aux_hidden_states, layer_idx + 1, hidden_states, residual
              )
-@@ -1346,7 +2248,15 @@ class Gemma4Model(nn.Module, EagleModelMixin):
+@@ -1346,7 +2274,15 @@ class Gemma4Model(nn.Module, EagleModelMixin):
          if residual is None:
              hidden_states = self.norm(hidden_states)
          else:
@@ -6772,6 +8943,23 @@ index 1b50db61c..1bb03ebc8 100644
  
          if len(aux_hidden_states) > 0:
              return hidden_states, aux_hidden_states
+@@ -1612,6 +2548,16 @@ class Gemma4ForCausalLM(
+     ) -> torch.Tensor | None:
+         return self.logits_processor(self.lm_head, hidden_states)
+ 
++    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
++        return fused_moe_make_expert_params_mapping(
++            self,
++            ckpt_gate_proj_name="gate_proj",
++            ckpt_down_proj_name="down_proj",
++            ckpt_up_proj_name="up_proj",
++            num_experts=self.config.num_experts,
++            num_redundant_experts=self.num_redundant_experts,
++        )
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         # Checkpoint weight names use "language_model." prefix (from the
+         # Gemma4ForConditionalGeneration wrapper). Strip it to map to our
 diff --git a/vllm/model_executor/models/gemma4_unified.py b/vllm/model_executor/models/gemma4_unified.py
 new file mode 100644
 index 000000000..f85627bf5
@@ -7346,10 +9534,10 @@ index cda07ea29..f58f98dac 100644
  
      def get_image_processor(self, **kwargs: object):
 diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
-index dc761e69b..4c100ed9d 100644
+index dc761e69b..2d1e8c478 100644
 --- a/vllm/model_executor/models/qwen3_5.py
 +++ b/vllm/model_executor/models/qwen3_5.py
-@@ -192,6 +192,13 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
+@@ -192,6 +192,16 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                  ),
              )
  
@@ -7358,30 +9546,35 @@ index dc761e69b..4c100ed9d 100644
 +        # MLP selection, and Qwen3_5RMSNorm), so the inherited ESIMD decode
 +        # fast-path wiring (incl. the sym_int4 flags) would otherwise be missing
 +        # entirely. Set it up here via the shared single-source-of-truth helper.
-+        self._init_esimd_flags(quant_config)
++        self._init_esimd_flags(
++            quant_config,
++            vllm_config.lora_config is not None,
++        )
 +
  
  @support_torch_compile(
      dynamic_arg_dims={
 diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
-index f4c716789..526773199 100644
+index f4c716789..e2a62b1b2 100644
 --- a/vllm/model_executor/models/qwen3_next.py
 +++ b/vllm/model_executor/models/qwen3_next.py
-@@ -21,6 +21,7 @@ from vllm.distributed import (
+@@ -21,13 +21,28 @@ from vllm.distributed import (
      get_pp_group,
      get_tensor_model_parallel_world_size,
      tensor_model_parallel_all_gather,
 +    tensor_model_parallel_all_reduce,
  )
++from vllm.forward_context import get_forward_context
  from vllm.logger import init_logger
  from vllm.model_executor.layers.attention import Attention
-@@ -28,6 +29,18 @@ from vllm.model_executor.layers.fused_moe import (
+ from vllm.model_executor.layers.fused_moe import (
      FusedMoE,
      fused_moe_make_expert_params_mapping,
  )
 +from vllm.model_executor.layers.esimd_utils import (
 +    esimd_fused_add_rms_norm,
 +    esimd_fused_add_rms_norm_batched,
++    esimd_gemv_fp8_blockscale_fp16_fused2,
 +    esimd_gemv_fp8_pert,
 +    esimd_gemv_fp8_pert_fused2,
 +    esimd_gemv_int4,
@@ -7394,7 +9587,73 @@ index f4c716789..526773199 100644
  from vllm.model_executor.layers.layernorm import (
      GemmaRMSNorm as Qwen3NextRMSNorm,
  )
-@@ -124,7 +137,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+@@ -82,6 +97,65 @@ logger = init_logger(__name__)
+ KVCache = tuple[torch.Tensor, torch.Tensor]
+ 
+ 
++def _require_fp16_block_moe_activations(hidden_states: torch.Tensor) -> None:
++    if hidden_states.dtype != torch.float16:
++        raise RuntimeError(
++            "Qwen3 XPU FP8 block MoE currently requires FP16 "
++            f"activations, but received {hidden_states.dtype}. Relaunch "
++            "vLLM with `--dtype float16`; native BF16 block-MoE support "
++            "is not implemented yet."
++        )
++
++
++def _dequantize_fp8_gate_weight(
++    gate, weight: torch.Tensor
++) -> torch.Tensor:
++    """Reconstruct an fp16 router gate weight from an FP8 quantized gate.
++
++    Handles both a per-channel/per-tensor ``weight_scale`` and a DeepSeek-style
++    128x128 block ``weight_scale_inv`` ([N/128, K/128]). Returns fp16 [N, K].
++    """
++    w = weight.to(torch.float32)
++    block_scale = getattr(gate, "weight_scale_inv", None)
++    if block_scale is not None:
++        scale = block_scale.data.to(torch.float32)
++        n, k = w.shape
++        # The block size must come from the layer, not be inferred from the
++        # weight/scale shape ratio: with a non-multiple dimension (e.g. N=129
++        # -> 2 scale rows) a ratio-derived size gives 65/65 instead of the
++        # correct 128 + 1, silently mis-scaling every row.
++        block_size = getattr(gate, "weight_block_size", None)
++        if block_size is None or len(block_size) != 2:
++            raise RuntimeError(
++                "Block-quantized router gate has weight_scale_inv but no "
++                "usable weight_block_size; refusing to guess the block shape "
++                "for the fused router GEMV. Set DISABLE_ESIMD_MOE_NORM=1 to "
++                "fall back to the unfused router."
++            )
++        bn, bk = int(block_size[0]), int(block_size[1])
++        expected = ((n + bn - 1) // bn, (k + bk - 1) // bk)
++        if tuple(scale.shape) != expected:
++            raise RuntimeError(
++                f"Router gate weight_scale_inv shape {tuple(scale.shape)} does "
++                f"not match weight shape {(n, k)} with block size {(bn, bk)} "
++                f"(expected {expected})."
++            )
++        # Expand each block scale over its full bn x bk tile, then trim the
++        # tail padding when N/K are not multiples of the block size.
++        expanded = scale.repeat_interleave(bn, dim=0).repeat_interleave(bk, dim=1)
++        return (w * expanded[:n, :k]).to(torch.float16)
++    scale = getattr(gate, "weight_scale", None)
++    if scale is None:
++        raise RuntimeError(
++            "FP8 router gate has neither weight_scale nor weight_scale_inv; "
++            "cannot build the fused router GEMV weight."
++        )
++    scale = scale.data.to(torch.float32)
++    if scale.numel() > 1:
++        scale = scale.reshape(-1, 1)
++    return (w * scale).to(torch.float16)
++
++
+ class Qwen3NextSparseMoeBlock(nn.Module):
+     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+@@ -124,7 +198,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
              config.hidden_size,
              config.num_experts,
              bias=False,
@@ -7403,7 +9662,7 @@ index f4c716789..526773199 100644
              prefix=f"{prefix}.gate",
          )
  
-@@ -172,12 +185,164 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+@@ -172,12 +246,200 @@ class Qwen3NextSparseMoeBlock(nn.Module):
              else None,
          )
  
@@ -7418,6 +9677,7 @@ index f4c716789..526773199 100644
 +        from vllm.model_executor.layers.esimd_utils import (
 +            ESIMD_AVAILABLE,
 +            disable_esimd_moe,
++            quant_is_block_fp8,
 +            quant_is_fp8,
 +        )
 +
@@ -7426,9 +9686,20 @@ index f4c716789..526773199 100644
 +            and not disable_esimd_moe()
 +            and not parallel_config.enable_expert_parallel
 +            and quant_is_fp8(quant_config)
++            and not quant_is_block_fp8(quant_config)
 +            and self.shared_expert is not None
 +            and self.n_routed_experts % 16 == 0
 +        )
++        self._moe_block_esimd_ok = (
++            ESIMD_AVAILABLE
++            and not disable_esimd_moe()
++            and not parallel_config.enable_expert_parallel
++            and quant_is_block_fp8(quant_config)
++            and self.shared_expert is not None
++            and self.n_routed_experts % 16 == 0
++            and hasattr(torch.ops.moe_ops, "moe_forward_full_fp8_block")
++        )
++        self._moe_block_output_buffers: dict[int, torch.Tensor] = {}
 +
 +        from vllm.model_executor.layers.esimd_utils import (
 +            disable_esimd_int4,
@@ -7488,8 +9759,14 @@ index f4c716789..526773199 100644
 +            # Re-quantizing an already-FP8 gate.weight crashes: scaled_fp8_quant
 +            # dispatches on the input dtype and has no FP8 case
 +            # ("not implemented for Float8_e4m3fn").
-+            gw = self.gate.weight
-+            gs = getattr(self.gate, "weight_scale", None)
++            # When LoRA is enabled the gate is wrapped in a *WithLoRA layer;
++            # its .weight property proxies through to the base layer, but
++            # weight_scale is not proxied. Unwrap to the base layer so an
++            # already-FP8 quantized gate is detected instead of being re-
++            # quantized (which crashes on FP8 input).
++            gate = getattr(self.gate, "base_layer", self.gate)
++            gw = gate.weight
++            gs = getattr(gate, "weight_scale", None)
 +            if (
 +                gw.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
 +                and gs is not None
@@ -7498,8 +9775,17 @@ index f4c716789..526773199 100644
 +                self._gate_fp8_weight = gw.data
 +                self._gate_fp8_scale = gs.data
 +            else:
++                src = gw.data
++                if src.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
++                    # A block-quantized (or otherwise non-per-tensor) FP8 gate:
++                    # scaled_fp8_quant dispatches on the input dtype and has no
++                    # FP8 case, so dequantize to fp16 first. Block-FP8
++                    # checkpoints for this model leave mlp.gate unquantized, so
++                    # this is a defensive path for other checkpoints; it runs
++                    # once per layer at first decode.
++                    src = _dequantize_fp8_gate_weight(gate, src)
 +                qw, scale = ops.scaled_fp8_quant(
-+                    self.gate.weight.data.contiguous(), scale=None
++                    src.contiguous(), scale=None
 +                )
 +                self._gate_fp8_weight = qw
 +                self._gate_fp8_scale = scale
@@ -7544,6 +9830,15 @@ index f4c716789..526773199 100644
 +        self._precomputed_router_logits = None
 +
 +        if (
++            self._moe_block_esimd_ok
++            and num_tokens <= 4
++            and not self.is_sequence_parallel
++        ):
++            out = self._forward_esimd_moe_block(hidden_states, precomputed_logits)
++            if out is not None:
++                return out.view(orig_shape)
++
++        if (
 +            self._moe_esimd_ok
 +            and num_tokens <= 128
 +            and not self.is_sequence_parallel
@@ -7568,7 +9863,7 @@ index f4c716789..526773199 100644
          if self.is_sequence_parallel:
              hidden_states = sequence_parallel_chunk(hidden_states)
  
-@@ -201,6 +366,112 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+@@ -201,6 +463,179 @@ class Qwen3NextSparseMoeBlock(nn.Module):
  
          return final_hidden_states.view(orig_shape)
  
@@ -7592,6 +9887,12 @@ index f4c716789..526773199 100644
 +            torch.float8_e4m3fn,
 +            torch.float8_e5m2,
 +        ):
++            return None
++
++        # This fused kernel is per-tensor only (reads scalar per-expert
++        # w13_weight_scale). Block-quant experts carry w13_weight_scale_inv
++        # instead -> fall through to the modular XPUExpertsFp8Block path.
++        if getattr(experts, "w13_weight_scale", None) is None:
 +            return None
 +
 +        if precomputed_logits is not None:
@@ -7622,6 +9923,67 @@ index f4c716789..526773199 100644
 +            self.shared_expert_gate.weight,
 +            experts.top_k,
 +            1,  # num_shared_experts
++            self.n_routed_experts,
++        )
++        if self.tp_size > 1:
++            out = tensor_model_parallel_all_reduce(out)
++        return out
++
++    def _forward_esimd_moe_block(self, hidden_states, precomputed_logits=None):
++        """Small-batch fused MoE decode for offline 128x128 FP8 block weights."""
++        _require_fp16_block_moe_activations(hidden_states)
++
++        experts = self.experts
++        w13 = getattr(experts, "w13_weight", None)
++        s13 = getattr(experts, "w13_weight_scale_inv", None)
++        w2 = getattr(experts, "w2_weight", None)
++        s2 = getattr(experts, "w2_weight_scale_inv", None)
++        shared_w13 = getattr(self.shared_expert.gate_up_proj, "weight", None)
++        shared_s13 = getattr(
++            self.shared_expert.gate_up_proj, "weight_scale_inv", None
++        )
++        shared_w2 = getattr(self.shared_expert.down_proj, "weight", None)
++        shared_s2 = getattr(
++            self.shared_expert.down_proj, "weight_scale_inv", None
++        )
++        required = (w13, s13, w2, s2, shared_w13, shared_s13, shared_w2, shared_s2)
++        if any(t is None for t in required):
++            return None
++        if w13.dtype != torch.float8_e4m3fn:
++            return None
++
++        if precomputed_logits is not None:
++            router_logits = precomputed_logits
++        else:
++            router_logits, _ = self.gate(hidden_states)
++        logger.info_once(
++            "Using fused ESIMD FP8-block MoE decode path for up to 4 tokens."
++        )
++        num_tokens = hidden_states.shape[0]
++        output = self._moe_block_output_buffers.get(num_tokens)
++        if (
++            output is None
++            or output.shape != hidden_states.shape
++            or output.dtype != hidden_states.dtype
++            or output.device != hidden_states.device
++        ):
++            output = torch.empty_like(hidden_states)
++            self._moe_block_output_buffers[num_tokens] = output
++        out = torch.ops.moe_ops.moe_forward_full_fp8_block(
++            hidden_states,
++            router_logits,
++            output,
++            w13,
++            s13,
++            shared_w13,
++            shared_s13,
++            w2,
++            s2,
++            shared_w2,
++            shared_s2,
++            self.shared_expert_gate.weight,
++            experts.top_k,
++            1,
 +            self.n_routed_experts,
 +        )
 +        if self.tp_size > 1:
@@ -7681,7 +10043,7 @@ index f4c716789..526773199 100644
  
  class Qwen3NextAttention(nn.Module):
      def __init__(
-@@ -281,13 +552,93 @@ class Qwen3NextAttention(nn.Module):
+@@ -281,13 +716,111 @@ class Qwen3NextAttention(nn.Module):
          self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
          self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
  
@@ -7735,6 +10097,7 @@ index f4c716789..526773199 100644
          hidden_states: torch.Tensor,
      ):
 -        qkv, _ = self.qkv_proj(hidden_states)
++        esimd_positions = self._get_esimd_positions(positions)
 +        # ntoks <= 128 cap: the kernel dispatches a 2D (totalHeads, ntoks) grid
 +        # with a 1x1 work-group, which stalls the worker at prefill-scale token
 +        # counts (observed to hang at ntoks~800). This is a decode / small-batch
@@ -7742,10 +10105,12 @@ index f4c716789..526773199 100644
 +        if (
 +            self._qkv_esimd_ok
 +            and not self._use_esimd_int4_gemv
-+            and positions.ndim == 1
++            and esimd_positions is not None
 +            and hidden_states.shape[0] <= 128
 +        ):
-+            return self._forward_esimd_qkv(positions, output, hidden_states)
++            return self._forward_esimd_qkv(
++                esimd_positions, output, hidden_states
++            )
 +
 +        _ntoks = hidden_states.shape[0]
 +        if _ntoks == 1 and self._use_esimd_int4_gemv:
@@ -7763,8 +10128,11 @@ index f4c716789..526773199 100644
 +            qkv = self._decode_qkv_int4_buf
 +        elif _ntoks <= 64 and self._use_esimd_int4_gemv:
 +            from vllm.model_executor.layers.esimd_utils import esimd_gemm_int4_pgrp
++
 +            N = self.qkv_proj.weight_esimd.shape[0]
-+            qkv = torch.empty(_ntoks, N, dtype=torch.float16, device=hidden_states.device)
++            qkv = torch.empty(
++                _ntoks, N, dtype=torch.float16, device=hidden_states.device
++            )
 +            esimd_gemm_int4_pgrp(
 +                hidden_states,
 +                self.qkv_proj.weight_esimd,
@@ -7773,14 +10141,36 @@ index f4c716789..526773199 100644
 +            )
 +        else:
 +            qkv, _ = self.qkv_proj(hidden_states)
++
++        # The INT4 projection produces the same fp16 QKV layout consumed by
++        # the fused split + q/k norm + RoPE kernel. Keep the INT4 GEMV while
++        # avoiding the generic PyTorch post-processing path below.
++        if (
++            self._qkv_esimd_ok
++            and self._use_esimd_int4_gemv
++            and esimd_positions is not None
++            and _ntoks <= 64
++        ):
++            self._esimd_qkv_core(qkv, esimd_positions, output)
++            return
  
          if self.attn_output_gate:
              q_gate, k, v = qkv.split(
-@@ -316,6 +667,118 @@ class Qwen3NextAttention(nn.Module):
+@@ -316,7 +849,148 @@ class Qwen3NextAttention(nn.Module):
              gate = torch.sigmoid(gate)
              attn_output = attn_output * gate
  
-+        if _ntoks == 1 and self._use_esimd_int4_gemv:
+-        output[:], _ = self.o_proj(attn_output)
++        self._project_attention_output(attn_output, output)
++
++    def _project_attention_output(
++        self,
++        attn_output: torch.Tensor,
++        output: torch.Tensor,
++    ) -> None:
++        """Project attention output, preserving the INT4 decode fast path."""
++        ntoks = attn_output.shape[0]
++        if ntoks == 1 and self._use_esimd_int4_gemv:
 +            if self._decode_o_int4_buf is None:
 +                N = self.o_proj.weight_esimd.shape[0]
 +                self._decode_o_int4_buf = torch.empty(
@@ -7792,22 +10182,40 @@ index f4c716789..526773199 100644
 +                self.o_proj.scale_esimd,
 +                self._decode_o_int4_buf,
 +            )
-+            output[:1] = tensor_model_parallel_all_reduce(
-+                self._decode_o_int4_buf
-+            )
-+        elif _ntoks <= 64 and self._use_esimd_int4_gemv:
++            output[:1] = tensor_model_parallel_all_reduce(self._decode_o_int4_buf)
++        elif ntoks <= 64 and self._use_esimd_int4_gemv:
 +            from vllm.model_executor.layers.esimd_utils import esimd_gemm_int4_pgrp
++
 +            N = self.o_proj.weight_esimd.shape[0]
-+            o_buf = torch.empty(_ntoks, N, dtype=torch.float16, device=attn_output.device)
++            o_buf = torch.empty(
++                ntoks, N, dtype=torch.float16, device=attn_output.device
++            )
 +            esimd_gemm_int4_pgrp(
 +                attn_output,
 +                self.o_proj.weight_esimd,
 +                self.o_proj.scale_esimd,
 +                o_buf,
 +            )
-+            output[:_ntoks] = tensor_model_parallel_all_reduce(o_buf)
++            output[:ntoks] = tensor_model_parallel_all_reduce(o_buf)
 +        else:
 +            output[:], _ = self.o_proj(attn_output)
++
++    @staticmethod
++    def _get_esimd_positions(positions: torch.Tensor) -> torch.Tensor | None:
++        """Return plain-RoPE positions for the fused QKV decode path."""
++        if positions.ndim == 1:
++            return positions
++        if positions.ndim != 2:
++            return None
++
++        # M-RoPE models pass [3, num_tokens] positions even for text-only
++        # generation. During a uniform decode all three coordinates advance
++        # together, so the temporal row is equivalent to plain RoPE. Prefill
++        # and mixed batches must keep the full M-RoPE section remapping.
++        batch_descriptor = get_forward_context().batch_descriptor
++        if batch_descriptor is not None and batch_descriptor.uniform:
++            return positions[0]
++        return None
 +
 +    def _forward_esimd_qkv(
 +        self,
@@ -7818,7 +10226,7 @@ index f4c716789..526773199 100644
 +        """Text-only fast path: one ESIMD kernel does QKV split + q/k RMSNorm +
 +        NeoX partial RoPE (+ sigmoid gate), replacing split/chunk/reshape, two
 +        GemmaRMSNorm dispatches, the RoPE call and the gate sigmoid. Gated by
-+        _qkv_esimd_ok and positions.ndim == 1 in forward()."""
++        _qkv_esimd_ok and plain/uniform-decode positions in forward()."""
 +        qkv, _ = self.qkv_proj(hidden_states)
 +        self._esimd_qkv_core(qkv, positions, output)
 +
@@ -7866,7 +10274,9 @@ index f4c716789..526773199 100644
 +        q = self._qkv_q_buf[:ntoks]
 +        k = self._qkv_k_buf[:ntoks]
 +        v = self._qkv_v_buf[:ntoks]
-+        gate = self._qkv_gate_buf[:ntoks] if self.attn_output_gate else self._qkv_gate_buf
++        gate = (
++            self._qkv_gate_buf[:ntoks] if self.attn_output_gate else self._qkv_gate_buf
++        )
 +
 +        # cos_sin_cache is fp16 (model dtype) -- kernel reads it directly.
 +        cos_sin_cache = self.rotary_emb.cos_sin_cache
@@ -7892,16 +10302,17 @@ index f4c716789..526773199 100644
 +            # gate already has sigmoid applied inside the kernel.
 +            attn_output = attn_output * gate
 +
-         output[:], _ = self.o_proj(attn_output)
++        self._project_attention_output(attn_output, output)
  
  
-@@ -398,6 +861,239 @@ class Qwen3NextDecoderLayer(nn.Module):
+ class Qwen3NextDecoderLayer(nn.Module):
+@@ -398,6 +1072,307 @@ class Qwen3NextDecoderLayer(nn.Module):
                  ),
              )
  
-+        self._init_esimd_flags(quant_config)
++        self._init_esimd_flags(quant_config, vllm_config.lora_config is not None)
 +
-+    def _init_esimd_flags(self, quant_config) -> None:
++    def _init_esimd_flags(self, quant_config, lora_enabled: bool) -> None:
 +        """Decide the ESIMD decode fast-path eligibility flags + buffer slots.
 +
 +        Reads only attributes every DecoderLayer __init__ sets before calling
@@ -7935,14 +10346,36 @@ index f4c716789..526773199 100644
 +        _is_fp8 = quant_is_fp8(quant_config)
 +        _is_int4 = quant_is_sym_int4(quant_config)
 +
++        # Both the per-tensor and the 128x128 block FP8 MoE decode fast paths
++        # accept router logits precomputed by the fused resadd + RMSNorm +
++        # router GEMV kernel, so both may fold this layer's
++        # post_attention_layernorm and the block's gate GEMV into one launch.
++        # The fusion kernel itself is per-tensor FP8 and is independent of the
++        # expert weight layout: it only consumes the (separately quantized)
++        # router gate weight, which block-FP8 checkpoints leave unquantized.
++        # The fused router GEMV consumes a cached snapshot of the *base* gate
++        # weight, so an active LoRA adapter on mlp.gate would silently not
++        # affect routing (the unfused path calls self.gate(...) and does apply
++        # it). Disable the fusion whenever LoRA is enabled at all -- the LoRA
++        # wrapper is substituted after model init, so we cannot inspect
++        # self.mlp.gate here to see whether this particular adapter targets it.
 +        self._moe_norm_esimd_ok = (
 +            ESIMD_AVAILABLE
 +            and _is_fp8
 +            and not disable_esimd_moe_norm()
++            and not lora_enabled
 +            and isinstance(self.mlp, Qwen3NextSparseMoeBlock)
-+            and getattr(self.mlp, "_moe_esimd_ok", False)
++            and (
++                getattr(self.mlp, "_moe_esimd_ok", False)
++                or getattr(self.mlp, "_moe_block_esimd_ok", False)
++            )
 +            and not self.layer_scale
 +        )
++        if self._moe_norm_esimd_ok:
++            logger.info_once(
++                "Using fused ESIMD post-attn RMSNorm + MoE router GEMV "
++                "decode path."
++            )
 +
 +        self._moe_norm_int4_esimd_ok = (
 +            ESIMD_AVAILABLE
@@ -7977,6 +10410,7 @@ index f4c716789..526773199 100644
 +        self._input_norm_w_fp16 = None
 +        self._gdn_fused_qkvz_buf = None
 +        self._gdn_fused_ba_buf = None
++        self._gdn_input_norm_is_block = False
 +        self._gdn_input_norm_ready = None  # None=undecided; True/False once checked
 +
 +        # Eligibility for folding input_layernorm + the attention qkv_proj GEMV
@@ -7994,6 +10428,7 @@ index f4c716789..526773199 100644
 +        )
 +        self._attn_input_norm_w_fp16 = None
 +        self._attn_fused_qkv_buf = None
++        self._attn_input_norm_is_block = False
 +        self._attn_input_norm_ready = None  # None=undecided; True/False once checked
 +        # Preallocated [1, hidden] attention-output buffer for the M==1 fused
 +        # decode path, reused across steps instead of a per-step empty_like.
@@ -8024,17 +10459,30 @@ index f4c716789..526773199 100644
 +            wb = gdn.in_proj_ba.weight
 +            sq = getattr(gdn.in_proj_qkvz, "weight_scale", None)
 +            sb = getattr(gdn.in_proj_ba, "weight_scale", None)
-+            self._gdn_input_norm_ready = (
++            sq_block = getattr(gdn.in_proj_qkvz, "weight_scale_inv", None)
++            q_block_size = getattr(gdn.in_proj_qkvz, "weight_block_size", None)
++            per_tensor_ready = (
 +                wq.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
 +                and wb.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
 +                and sq is not None
 +                and sb is not None
 +                and sq.numel() == 1
 +                and sb.numel() == 1
++            )
++            block_ready = (
++                esimd_gemv_fp8_blockscale_fp16_fused2 is not None
++                and wq.dtype == torch.float8_e4m3fn
++                and wb.dtype == torch.float16
++                and sq_block is not None
++                and tuple(q_block_size or ()) == (128, 128)
++            )
++            self._gdn_input_norm_ready = (
++                (per_tensor_ready or block_ready)
 +                and gdn.in_proj_qkvz.bias is None
 +                and gdn.in_proj_ba.bias is None
 +            )
 +            if self._gdn_input_norm_ready:
++                self._gdn_input_norm_is_block = block_ready
 +                dev = hidden_states.device
 +                self._input_norm_w_fp16 = (
 +                    (self.input_layernorm.weight.data + 1.0)
@@ -8059,16 +10507,26 @@ index f4c716789..526773199 100644
 +            self._input_norm_w_fp16,
 +            self.input_layernorm.variance_epsilon,
 +        )
-+        # Dual per-tensor FP8 GEMV (in_proj_qkvz + in_proj_ba) off normed hidden.
-+        esimd_gemv_fp8_pert_fused2(
-+            hidden_states,
-+            gdn.in_proj_qkvz.weight,
-+            gdn.in_proj_qkvz.weight_scale,
-+            self._gdn_fused_qkvz_buf,
-+            gdn.in_proj_ba.weight,
-+            gdn.in_proj_ba.weight_scale,
-+            self._gdn_fused_ba_buf,
-+        )
++        if self._gdn_input_norm_is_block:
++            esimd_gemv_fp8_blockscale_fp16_fused2(
++                hidden_states,
++                gdn.in_proj_qkvz.weight,
++                gdn.in_proj_qkvz.weight_scale_inv,
++                self._gdn_fused_qkvz_buf,
++                gdn.in_proj_ba.weight,
++                self._gdn_fused_ba_buf,
++            )
++        else:
++            # Original per-tensor path remains independently dispatched.
++            esimd_gemv_fp8_pert_fused2(
++                hidden_states,
++                gdn.in_proj_qkvz.weight,
++                gdn.in_proj_qkvz.weight_scale,
++                self._gdn_fused_qkvz_buf,
++                gdn.in_proj_ba.weight,
++                gdn.in_proj_ba.weight_scale,
++                self._gdn_fused_ba_buf,
++            )
 +        return True
 +
 +    def _fused_attn_input_proj(
@@ -8087,20 +10545,33 @@ index f4c716789..526773199 100644
 +        kernel; only this large-output attn qkv path is split.
 +        Returns the [1, qkv_out] projection buffer, or None to fall through.
 +
-+        Readiness (qkv_proj FP8 per-tensor, no bias) is decided lazily on the
-+        first decode -- weight_scale only exists after weight loading.
++        Readiness is decided lazily on the first decode after weight loading.
++        The qkv projection must have no bias and use either per-tensor FP8
++        (scalar weight_scale) or 128x128 block-scaled FP8
++        (weight_scale_inv with weight_block_size=(128, 128)).
 +        """
 +        attn = self.self_attn
 +        if self._attn_input_norm_ready is None:
 +            w = attn.qkv_proj.weight
 +            ws = getattr(attn.qkv_proj, "weight_scale", None)
++            ws_block = getattr(attn.qkv_proj, "weight_scale_inv", None)
++            weight_block_size = getattr(attn.qkv_proj, "weight_block_size", None)
++            block_shape = (
++                tuple(weight_block_size) if weight_block_size is not None else ()
++            )
++            per_tensor_ready = ws is not None and ws.numel() == 1
++            block_ready = (
++                w.dtype == torch.float8_e4m3fn
++                and ws_block is not None
++                and block_shape == (128, 128)
++            )
 +            self._attn_input_norm_ready = (
 +                w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-+                and ws is not None
-+                and ws.numel() == 1
++                and (per_tensor_ready or block_ready)
 +                and attn.qkv_proj.bias is None
 +            )
 +            if self._attn_input_norm_ready:
++                self._attn_input_norm_is_block = block_ready
 +                dev = hidden_states.device
 +                self._attn_input_norm_w_fp16 = (
 +                    (self.input_layernorm.weight.data + 1.0)
@@ -8108,9 +10579,10 @@ index f4c716789..526773199 100644
 +                    .clone()
 +                    .contiguous()
 +                )
-+                self._attn_fused_qkv_buf = torch.empty(
-+                    1, w.shape[0], dtype=torch.float16, device=dev
-+                )
++                if not block_ready:
++                    self._attn_fused_qkv_buf = torch.empty(
++                        1, w.shape[0], dtype=torch.float16, device=dev
++                    )
 +        if not self._attn_input_norm_ready:
 +            return None
 +
@@ -8123,6 +10595,13 @@ index f4c716789..526773199 100644
 +            self._attn_input_norm_w_fp16,
 +            self.input_layernorm.variance_epsilon,
 +        )
++        if self._attn_input_norm_is_block:
++            # The block-scaled qkv projection remains a W8A16 GEMV, then feeds
++            # the same fused split + q/k norm + RoPE core as per-tensor FP8.
++            # This keeps the original 128x128 scales intact while removing the
++            # dozens of eager tensor kernels in Qwen3NextAttention.forward.
++            qkv, _ = attn.qkv_proj(hidden_states)
++            return qkv
 +        # Plain per-tensor FP8 qkv GEMV off the normed hidden.
 +        esimd_gemv_fp8_pert(
 +            hidden_states,
@@ -8135,7 +10614,7 @@ index f4c716789..526773199 100644
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -405,27 +1101,100 @@ class Qwen3NextDecoderLayer(nn.Module):
+@@ -405,27 +1380,100 @@ class Qwen3NextDecoderLayer(nn.Module):
          positions: torch.Tensor = None,
          **kwargs: object,
      ):
@@ -8255,7 +10734,7 @@ index f4c716789..526773199 100644
  
          if self.layer_scale:
              if len(hidden_states.shape) == 2:
-@@ -438,8 +1207,71 @@ class Qwen3NextDecoderLayer(nn.Module):
+@@ -438,8 +1486,71 @@ class Qwen3NextDecoderLayer(nn.Module):
                  )
  
          # Fully Connected
@@ -10278,7 +12757,7 @@ index 1e74e4c48..89791eb42 100644
          try:
              from vllm.vllm_flash_attn.flash_attn_interface import (
 diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
-index 4b8b86d86..a07a4bd77 100755
+index 4b8b86d86..bcb2ac462 100755
 --- a/vllm/v1/attention/backends/flash_attn.py
 +++ b/vllm/v1/attention/backends/flash_attn.py
 @@ -3,6 +3,8 @@
@@ -10551,7 +13030,7 @@ index 4b8b86d86..a07a4bd77 100755
 +                    # this path or decode attends beyond the window once
 +                    # seqlen>window -> progressive garbage on long context.
 +                    # Route them to flash_attn_varlen_func (passes window_size).
-+                    and sliding_window_size is None
++                    and self.sliding_window[0] == -1
 +                ):
 +                    try:
 +                        eagle_ops = importlib.import_module(
@@ -11261,6 +13740,38 @@ index 8aaeb3970..d74607735 100644
                  num_rejected = num_draft_tokens - num_accepted
                  # num_computed_tokens represents the number of tokens
                  # processed in the current step, considering scheduled
+diff --git a/vllm/v1/cudagraph_dispatcher.py b/vllm/v1/cudagraph_dispatcher.py
+index e27b5ee38..8cf4ade14 100644
+--- a/vllm/v1/cudagraph_dispatcher.py
++++ b/vllm/v1/cudagraph_dispatcher.py
+@@ -277,7 +277,12 @@ class CudagraphDispatcher:
+             or num_tokens > max_size
+             or allowed_modes <= {CUDAGraphMode.NONE}
+         ):
+-            return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
++            return CUDAGraphMode.NONE, BatchDescriptor(
++                num_tokens=num_tokens,
++                uniform=uniform_decode,
++                has_lora=has_lora,
++                num_active_loras=num_active_loras,
++            )
+ 
+         effective_num_active_loras = num_active_loras
+         if has_lora and num_active_loras > 0:
+@@ -320,7 +325,12 @@ class CudagraphDispatcher:
+             f"No matching cudagraph found and NONE is not in "
+             f"allowed_modes={allowed_modes}"
+         )
+-        return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
++        return CUDAGraphMode.NONE, BatchDescriptor(
++            num_tokens=num_tokens,
++            uniform=uniform_decode,
++            has_lora=has_lora,
++            num_active_loras=num_active_loras,
++        )
+ 
+     def get_capture_descs(self) -> list[tuple[CUDAGraphMode, list[BatchDescriptor]]]:
+         """
 diff --git a/vllm/v1/engine/__init__.py b/vllm/v1/engine/__init__.py
 index f6c80055b..df166841f 100644
 --- a/vllm/v1/engine/__init__.py
