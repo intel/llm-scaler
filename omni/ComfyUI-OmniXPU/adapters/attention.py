@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 
 import torch
 
@@ -22,7 +23,8 @@ _MINIMAX_H3_VAE_D64_CUTE_MIN_SEQUENCE = 6
 # ── Attention backend selection ──────────────────────────────────────────────
 # OMNI_ATTN_BACKEND selects which attention routing policy the patched ComfyUI
 # path uses:
-#   auto   (default) — use platform/workflow-tuned routes where validated, then
+#   auto   (default outside Windows) — use platform/workflow-tuned routes where
+#                      validated, then
 #                      cute for d128 self-attention and exact safe cross routes,
 #                      and PyTorch for every remaining attention contract.
 #                      Auto never selects the ESIMD attention backend.
@@ -35,7 +37,11 @@ _MINIMAX_H3_VAE_D64_CUTE_MIN_SEQUENCE = 6
 #   torch            — no cute/esimd; always fall back to PyTorch SDPA.
 # The cute backend prefers the packaged omni_xpu_kernel.cute module and falls back
 # to a raw .so (OMNI_CUTE_FMHA_SO overrides the path).
-_backend = os.environ.get("OMNI_ATTN_BACKEND", "auto").lower()
+#
+# Windows defaults to the upstream PyTorch SDPA path. ESIMD remains available
+# only through an explicit OMNI_ATTN_BACKEND=esimd opt-in.
+_default_backend = "torch" if sys.platform == "win32" else "auto"
+_backend = os.environ.get("OMNI_ATTN_BACKEND", _default_backend).lower()
 _backend_name = _backend  # for logging
 _backend_sdp = None  # callable(q_blhd, k_blhd, v_blhd) -> out_blhd
 _torch_sdpa_count = 0

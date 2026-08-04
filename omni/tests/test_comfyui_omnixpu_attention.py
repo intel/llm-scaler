@@ -121,13 +121,20 @@ def _load_patch(
     target="ptl-h",
     torch_version="2.11.0+xpu",
     backend="auto",
+    platform=None,
+    expected_apply=True,
     d120_capable=True,
     d128_bhld_capable=True,
     d128_bhld_error=None,
     h3_vae_d64_capable=True,
     h3_vae_d64_error=None,
 ):
-    monkeypatch.setenv("OMNI_ATTN_BACKEND", backend)
+    if backend is None:
+        monkeypatch.delenv("OMNI_ATTN_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("OMNI_ATTN_BACKEND", backend)
+    if platform is not None:
+        monkeypatch.setattr(sys, "platform", platform)
     monkeypatch.setattr(torch, "__version__", torch_version)
     package_name = "omnixpu_attention_test"
     package = types.ModuleType(package_name)
@@ -248,8 +255,52 @@ def _load_patch(
         f"{adapters.__name__}.attention",
         _ADAPTERS / "attention.py",
     )
-    assert patch.apply() == (True, None)
+    result = patch.apply()
+    if expected_apply:
+        assert result == (True, None)
+    else:
+        assert result[0] is False
     return patch, attention, calls
+
+
+def test_windows_defaults_to_unpatched_torch_sdpa(monkeypatch):
+    patch, attention, calls = _load_patch(
+        monkeypatch,
+        backend=None,
+        platform="win32",
+        expected_apply=False,
+    )
+    tensor = _FakeTensor()
+    assert attention.optimized_attention(
+        tensor,
+        tensor,
+        tensor,
+        heads=30,
+        skip_reshape=True,
+    ) is None
+    assert calls == []
+    assert patch.get_stats()["policy"] == "torch"
+    assert patch.get_stats()["backend"] == "torch"
+
+
+def test_non_windows_keeps_auto_as_default(monkeypatch):
+    patch, attention, calls = _load_patch(
+        monkeypatch,
+        backend=None,
+        platform="linux",
+    )
+    tensor = _FakeTensor(seq=4096)
+    result = attention.optimized_attention(
+        tensor,
+        tensor,
+        tensor,
+        heads=30,
+        skip_reshape=True,
+    )
+    assert isinstance(result, _FakeTensor)
+    assert calls == ["cute"]
+    assert patch.get_stats()["policy"] == "auto"
+    assert patch.get_stats()["esimd"] == 0
 
 
 @pytest.mark.parametrize("seq", [64, 1024, 1088])

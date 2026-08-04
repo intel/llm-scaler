@@ -5,6 +5,10 @@
 #include <limits>
 #include <type_traits>
 
+#if defined(OMNI_XPU_ARCH_BMG)
+#include "bmg_kernel_policy.h"
+#include "device_utils.h"
+#endif
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -186,6 +190,139 @@ T force_dtype_round(T value) {
 }
 
 #if defined(OMNI_XPU_ARCH_BMG)
+bool b60_exact_row_supported(
+    const torch::Tensor& input,
+    const torch::Tensor& freqs,
+    int64_t sequence) {
+    return input.device().is_xpu() && freqs.device().is_xpu() &&
+           input.device() == freqs.device() &&
+           input.scalar_type() == torch::kBFloat16 &&
+           freqs.scalar_type() == torch::kFloat32 &&
+           input.is_contiguous() && freqs.is_contiguous() &&
+           input.sizes() ==
+               torch::IntArrayRef({1, 24, sequence, 128}) &&
+           freqs.sizes() ==
+               torch::IntArrayRef({1, 1, sequence, 64, 2, 2});
+}
+
+inline void apply_b60_exact_row_pair(
+    const bf16* source,
+    bf16* destination,
+    uint32_t offset0,
+    uint32_t offset1,
+    const float* freq,
+    bool split_half) {
+    const float x0 = static_cast<float>(source[offset0]);
+    const float x1 = static_cast<float>(source[offset1]);
+    if (split_half) {
+        const float p00 =
+            force_dtype_round<float>(freq[0] * x0);
+        const float p01 =
+            force_dtype_round<float>(freq[1] * x1);
+        const float p10 =
+            force_dtype_round<float>(freq[2] * x0);
+        const float p11 =
+            force_dtype_round<float>(freq[3] * x1);
+        destination[offset0] = static_cast<bf16>(p00 + p01);
+        destination[offset1] = static_cast<bf16>(p10 + p11);
+    } else {
+        const float p00 =
+            force_dtype_round<float>(freq[0] * x0);
+        const float p10 =
+            force_dtype_round<float>(freq[2] * x0);
+        const float y0 = sycl::fma(freq[1], x1, p00);
+        const float y1 = sycl::fma(freq[3], x1, p10);
+        destination[offset0] =
+            static_cast<bf16>(force_dtype_round<float>(y0));
+        destination[offset1] =
+            static_cast<bf16>(force_dtype_round<float>(y1));
+    }
+}
+
+template<
+    uint32_t Sequence,
+    bool Pair,
+    uint32_t PairsPerWorkItem,
+    uint32_t WorkGroupSize>
+void launch_b60_exact_row(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& freqs,
+    torch::Tensor& out_query,
+    torch::Tensor& out_key,
+    bool split_half) {
+    constexpr uint32_t Heads = 24;
+    constexpr uint32_t HeadDim = 128;
+    constexpr uint32_t Pairs = HeadDim / 2;
+    constexpr uint32_t Rows = Heads * Sequence;
+    static_assert(PairsPerWorkItem > 0);
+    static_assert(Pairs % PairsPerWorkItem == 0);
+    static_assert(WorkGroupSize == Pairs / PairsPerWorkItem);
+
+    const auto* query_ptr =
+        reinterpret_cast<const bf16*>(query.data_ptr());
+    const auto* key_ptr = Pair
+        ? reinterpret_cast<const bf16*>(key.data_ptr())
+        : nullptr;
+    const auto* freq_ptr = freqs.data_ptr<float>();
+    auto* out_query_ptr =
+        reinterpret_cast<bf16*>(out_query.data_ptr());
+    auto* out_key_ptr = Pair
+        ? reinterpret_cast<bf16*>(out_key.data_ptr())
+        : nullptr;
+
+    auto cgf = [&](sycl::handler& handler) {
+        handler.parallel_for(
+            sycl::nd_range<1>(
+                sycl::range<1>(
+                    static_cast<size_t>(Rows) * WorkGroupSize),
+                sycl::range<1>(WorkGroupSize)),
+            [=](sycl::nd_item<1> item) {
+                const uint32_t row =
+                    static_cast<uint32_t>(item.get_group(0));
+                const uint32_t token = row % Sequence;
+                const uint32_t first_pair =
+                    static_cast<uint32_t>(item.get_local_id(0)) *
+                    PairsPerWorkItem;
+                const uint32_t base = row * HeadDim;
+
+#pragma unroll
+                for (uint32_t lane = 0;
+                     lane < PairsPerWorkItem;
+                     ++lane) {
+                    const uint32_t pair = first_pair + lane;
+                    const uint32_t offset0 =
+                        base + (split_half ? pair : pair * 2);
+                    const uint32_t offset1 =
+                        base + (
+                            split_half
+                            ? Pairs + pair
+                            : pair * 2 + 1);
+                    const uint32_t freq_offset =
+                        (token * Pairs + pair) * 4;
+                    apply_b60_exact_row_pair(
+                        query_ptr,
+                        out_query_ptr,
+                        offset0,
+                        offset1,
+                        freq_ptr + freq_offset,
+                        split_half);
+                    if constexpr (Pair) {
+                        apply_b60_exact_row_pair(
+                            key_ptr,
+                            out_key_ptr,
+                            offset0,
+                            offset1,
+                            freq_ptr + freq_offset,
+                            split_half);
+                    }
+                }
+            });
+    };
+    utils::submit_kernel(
+        cgf, query.device(), "kitchen_rope_b60_exact_row");
+}
+
 inline void apply_krea2_bmg_pair(
     const bf16* source,
     bf16* destination,
@@ -568,6 +705,22 @@ torch::Tensor apply_kitchen_rope1_fast(
     auto output = torch::empty_like(x);
     auto unused = torch::Tensor();
 #if defined(OMNI_XPU_ARCH_BMG)
+    auto& queue = utils::get_queue(x.device());
+    if (device::use_b60_kernel_profile(queue) &&
+        b60_exact_row_supported(x, freqs, 4352)) {
+        launch_b60_exact_row<
+            4352,
+            false,
+            device::B60KernelPolicy::kitchen_rope_pairs_per_work_item,
+            device::B60KernelPolicy::kitchen_rope_work_group_size>(
+                x,
+                unused,
+                freqs,
+                output,
+                unused,
+                split_half);
+        return output;
+    }
     if (!split_half && d120_bmg_single_supported(x, freqs)) {
         if (output.numel() != 0) {
             dispatch_rope_d120_bmg(x, freqs, output);
@@ -594,6 +747,23 @@ std::tuple<torch::Tensor, torch::Tensor> apply_kitchen_rope_fast(
     auto out_q = torch::empty_like(xq);
     auto out_k = torch::empty_like(xk);
 #if defined(OMNI_XPU_ARCH_BMG)
+    auto& queue = utils::get_queue(xq.device());
+    if (device::use_b60_kernel_profile(queue) &&
+        b60_exact_row_supported(xq, freqs, 4096) &&
+        b60_exact_row_supported(xk, freqs, 4096)) {
+        launch_b60_exact_row<
+            4096,
+            true,
+            device::B60KernelPolicy::kitchen_rope_pairs_per_work_item,
+            device::B60KernelPolicy::kitchen_rope_work_group_size>(
+                xq,
+                xk,
+                freqs,
+                out_q,
+                out_k,
+                split_half);
+        return {out_q, out_k};
+    }
     if (!split_half && krea2_bmg_pair_supported(xq, xk, freqs)) {
         launch_rope_krea2_bmg(xq, xk, freqs, out_q, out_k);
         return {out_q, out_k};

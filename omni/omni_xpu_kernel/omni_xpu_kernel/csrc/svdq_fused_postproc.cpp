@@ -24,6 +24,10 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 
+#if defined(OMNI_XPU_ARCH_BMG)
+#include "bmg_kernel_policy.h"
+#include "device_utils.h"
+#endif
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -47,6 +51,7 @@ namespace svdq {
 // smooth_factor is indexed by column: smooth[elem_idx % K].
 // ============================================================================
 
+template<int ELEM_PER_WI, int WG_SIZE>
 static void fused_smooth_convert_kernel(
     const bf16* __restrict__ x,
     const bf16* __restrict__ smooth,
@@ -55,19 +60,8 @@ static void fused_smooth_convert_kernel(
     int64_t K,
     const at::Device& device
 ) {
-#ifndef OMNI_SVDQ_SMOOTH_DIV_ELEMENTS_PER_WI
-#if defined(OMNI_XPU_ARCH_PTL_H)
-#define OMNI_SVDQ_SMOOTH_DIV_ELEMENTS_PER_WI 256
-#elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_SVDQ_SMOOTH_DIV_ELEMENTS_PER_WI 256
-#else
-#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
-#endif
-#endif
-    constexpr int ELEM_PER_WI = OMNI_SVDQ_SMOOTH_DIV_ELEMENTS_PER_WI;
     const int64_t total_elements = M * K;
     const int64_t total_wi = (total_elements + ELEM_PER_WI - 1) / ELEM_PER_WI;
-    constexpr int WG_SIZE = 64;
     const int64_t padded = (total_wi + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
 
     auto cgf = [&](sycl::handler& handle) {
@@ -129,6 +123,47 @@ static void fused_smooth_convert_kernel(
     };
 
     utils::submit_kernel(cgf, device, "fused_smooth_convert");
+}
+
+template<int ELEM_PER_WI, int WG_SIZE>
+static void fused_smooth_convert_2d_kernel(
+    const bf16* __restrict__ x,
+    const bf16* __restrict__ smooth,
+    fp16* __restrict__ output,
+    int64_t M,
+    int64_t K,
+    const at::Device& device
+) {
+    const int64_t tiles_per_row = K / ELEM_PER_WI;
+    const int64_t padded_tiles =
+        (tiles_per_row + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
+
+    auto cgf = [&](sycl::handler& handle) {
+        handle.parallel_for(
+            sycl::nd_range<2>(
+                sycl::range<2>(M, padded_tiles),
+                sycl::range<2>(1, WG_SIZE)),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                const int64_t row = item.get_global_id(0);
+                const int64_t tile = item.get_global_id(1);
+                if (tile >= tiles_per_row) return;
+                const int64_t col = tile * ELEM_PER_WI;
+                const int64_t offset = row * K + col;
+                const simd<bf16, ELEM_PER_WI> x_vec =
+                    block_load<bf16, ELEM_PER_WI>(x + offset);
+                simd<bf16, ELEM_PER_WI> smooth_vec;
+                smooth_vec.copy_from(smooth + col);
+                const simd<float, ELEM_PER_WI> x_f32 = x_vec;
+                const simd<float, ELEM_PER_WI> smooth_f32 = smooth_vec;
+                const simd<float, ELEM_PER_WI> result =
+                    x_f32 / smooth_f32;
+                const simd<fp16, ELEM_PER_WI> converted = result;
+                block_store<fp16, ELEM_PER_WI>(
+                    output + offset, converted);
+            });
+    };
+
+    utils::submit_kernel(cgf, device, "fused_smooth_convert_b60_2d");
 }
 
 // ============================================================================
@@ -301,6 +336,7 @@ static void fused_smooth_mul_convert_kernel(
 // Common case: M_out × N_out elements, result stride = Nr, output stride = No.
 // ============================================================================
 
+template<int ELEM_PER_WI>
 static void fused_convert_add_kernel_flat(
     const fp16* __restrict__ result,
     const bf16* __restrict__ residual,
@@ -309,7 +345,6 @@ static void fused_convert_add_kernel_flat(
     const at::Device& device
 ) {
     // Flat path: all three tensors are contiguous over total_elements
-    constexpr int ELEM_PER_WI = 32;
     const int64_t total_wi = (total_elements + ELEM_PER_WI - 1) / ELEM_PER_WI;
     constexpr int WG_SIZE = 64;
     const int64_t padded = (total_wi + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
@@ -355,6 +390,7 @@ static void fused_convert_add_kernel_flat(
 }
 
 // Strided path: result has different row stride than output/residual
+template<int ELEM_PER_WI>
 static void fused_convert_add_kernel_strided(
     const fp16* __restrict__ result,
     int64_t result_stride,      // number of f16 elements per row in result
@@ -367,7 +403,6 @@ static void fused_convert_add_kernel_strided(
     const at::Device& device
 ) {
     // Each work-item processes 32 contiguous elements within a row
-    constexpr int ELEM_PER_WI = 32;
     const int64_t cols_per_row = (N + ELEM_PER_WI - 1) / ELEM_PER_WI;
     const int64_t total_wi = M * cols_per_row;
     constexpr int WG_SIZE = 64;
@@ -415,6 +450,37 @@ static void fused_convert_add_kernel_strided(
     utils::submit_kernel(cgf, device, "fused_convert_add_strided");
 }
 
+template<int ELEM_PER_WI>
+static void launch_fused_convert_add(
+    torch::Tensor& out,
+    const torch::Tensor& result,
+    const torch::Tensor& residual,
+    int64_t M,
+    int64_t N,
+    int64_t result_stride,
+    int64_t residual_stride
+) {
+    if (result_stride == N && residual_stride == N) {
+        fused_convert_add_kernel_flat<ELEM_PER_WI>(
+            reinterpret_cast<const fp16*>(result.data_ptr()),
+            reinterpret_cast<const bf16*>(residual.data_ptr()),
+            reinterpret_cast<bf16*>(out.data_ptr()),
+            M * N,
+            out.device());
+    } else {
+        fused_convert_add_kernel_strided<ELEM_PER_WI>(
+            reinterpret_cast<const fp16*>(result.data_ptr()),
+            result_stride,
+            reinterpret_cast<const bf16*>(residual.data_ptr()),
+            residual_stride,
+            reinterpret_cast<bf16*>(out.data_ptr()),
+            N,
+            M,
+            N,
+            out.device());
+    }
+}
+
 
 // ============================================================================
 // Public API
@@ -443,12 +509,55 @@ torch::Tensor fused_smooth_convert(
     auto output = torch::empty({M, K},
         torch::TensorOptions().dtype(torch::kFloat16).device(x.device()));
 
-    fused_smooth_convert_kernel(
-        reinterpret_cast<const bf16*>(x.data_ptr()),
-        reinterpret_cast<const bf16*>(smooth_factor.data_ptr()),
-        reinterpret_cast<fp16*>(output.data_ptr()),
-        M, K, x.device()
-    );
+    const auto* x_ptr =
+        reinterpret_cast<const bf16*>(x.data_ptr());
+    const auto* smooth_ptr =
+        reinterpret_cast<const bf16*>(smooth_factor.data_ptr());
+    auto* output_ptr =
+        reinterpret_cast<fp16*>(output.data_ptr());
+#if defined(OMNI_XPU_ARCH_BMG)
+    auto& queue = utils::get_queue(x.device());
+    if (device::use_b60_kernel_profile(queue)) {
+        constexpr int B60Elements =
+            device::B60KernelPolicy::svdq_smooth_elements;
+        constexpr int B60WorkGroup =
+            device::B60KernelPolicy::svdq_smooth_work_group_size;
+        if (K % B60Elements == 0) {
+            fused_smooth_convert_2d_kernel<
+                B60Elements,
+                B60WorkGroup>(
+                    x_ptr,
+                    smooth_ptr,
+                    output_ptr,
+                    M,
+                    K,
+                    x.device());
+        } else {
+            fused_smooth_convert_kernel<
+                B60Elements,
+                B60WorkGroup>(
+                    x_ptr,
+                    smooth_ptr,
+                    output_ptr,
+                    M,
+                    K,
+                    x.device());
+        }
+    } else {
+        fused_smooth_convert_kernel<
+            device::B70KernelPolicy::svdq_smooth_elements,
+            device::B70KernelPolicy::svdq_smooth_work_group_size>(
+                x_ptr,
+                smooth_ptr,
+                output_ptr,
+                M,
+                K,
+                x.device());
+    }
+#else
+    fused_smooth_convert_kernel<256, 64>(
+        x_ptr, smooth_ptr, output_ptr, M, K, x.device());
+#endif
 
     return output;
 }
@@ -516,29 +625,39 @@ void fused_convert_add(
     int64_t result_N = result.size(1);
     int64_t residual_N = residual.size(1);
 
-    // Check if we can use the flat (fastest) path
-    if (result_N == N_out && residual_N == N_out) {
-        // All tensors have same width — flat path
-        fused_convert_add_kernel_flat(
-            reinterpret_cast<const fp16*>(result.data_ptr()),
-            reinterpret_cast<const bf16*>(residual.data_ptr()),
-            reinterpret_cast<bf16*>(out.data_ptr()),
-            M_out * N_out,
-            out.device()
-        );
+#if defined(OMNI_XPU_ARCH_BMG)
+    auto& queue = utils::get_queue(out.device());
+    if (device::use_b60_kernel_profile(queue)) {
+        launch_fused_convert_add<
+            device::B60KernelPolicy::svdq_convert_add_elements>(
+                out,
+                result,
+                residual,
+                M_out,
+                N_out,
+                result_N,
+                residual_N);
     } else {
-        // Different widths — strided path
-        fused_convert_add_kernel_strided(
-            reinterpret_cast<const fp16*>(result.data_ptr()),
-            result_N,
-            reinterpret_cast<const bf16*>(residual.data_ptr()),
-            residual_N,
-            reinterpret_cast<bf16*>(out.data_ptr()),
-            N_out,
-            M_out, N_out,
-            out.device()
-        );
+        launch_fused_convert_add<
+            device::B70KernelPolicy::svdq_convert_add_elements>(
+                out,
+                result,
+                residual,
+                M_out,
+                N_out,
+                result_N,
+                residual_N);
     }
+#else
+    launch_fused_convert_add<32>(
+        out,
+        result,
+        residual,
+        M_out,
+        N_out,
+        result_N,
+        residual_N);
+#endif
 }
 
 

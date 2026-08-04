@@ -2,6 +2,8 @@
 #include <cmath>
 #include <sycl/sycl.hpp>
 
+#include "bmg_kernel_policy.h"
+#include "device_utils.h"
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -327,6 +329,7 @@ fp16 stochastic_output(fp16 value) {
 template<
     typename InputT,
     bool FuseInputConversion,
+    int ElementsPerWorkItem,
     int ExponentBits,
     int MantissaBits,
     int ExponentBias>
@@ -378,8 +381,6 @@ torch::Tensor stochastic_rounding_fused(
     const fp16 denorm_base = static_cast<fp16>(std::exp2(-ExponentBias + 1));
     const fp16 limit_h = static_cast<fp16>(limit);
 
-    constexpr int ElementsPerWorkItem =
-        OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM;
     const int64_t work_items =
         (numel + ElementsPerWorkItem - 1) / ElementsPerWorkItem;
     auto cgf = [&](sycl::handler& handle) {
@@ -563,13 +564,32 @@ torch::Tensor stochastic_rounding(
     TORCH_CHECK(rng.sizes() == input.sizes(), "rng shape must match input");
 
     const double limit = fp8_max(out_dtype);
-#define DISPATCH_STOCHASTIC(InputT)                                      \
-    if (out_dtype == torch::kFloat8_e4m3fn) {                            \
-        return stochastic_rounding_fused<InputT, true, 4, 3, 7>(         \
-            input, rng, out_dtype, limit);                               \
-    }                                                                    \
-    return stochastic_rounding_fused<InputT, true, 5, 2, 15>(            \
-        input, rng, out_dtype, limit)
+#if defined(OMNI_XPU_ARCH_BMG)
+    auto& queue = utils::get_queue(input.device());
+    const bool use_b60 = device::use_b60_kernel_profile(queue);
+#else
+    const bool use_b60 = false;
+#endif
+#define DISPATCH_STOCHASTIC_ELEMENTS(InputT, Elements)                     \
+    do {                                                                   \
+        if (out_dtype == torch::kFloat8_e4m3fn) {                          \
+            return stochastic_rounding_fused<                              \
+                InputT, true, Elements, 4, 3, 7>(                          \
+                    input, rng, out_dtype, limit);                          \
+        }                                                                  \
+        return stochastic_rounding_fused<                                  \
+            InputT, true, Elements, 5, 2, 15>(                             \
+                input, rng, out_dtype, limit);                              \
+    } while (false)
+#define DISPATCH_STOCHASTIC(InputT)                                        \
+    do {                                                                   \
+        if (use_b60) {                                                      \
+            DISPATCH_STOCHASTIC_ELEMENTS(                                  \
+                InputT, device::B60KernelPolicy::fp8_stochastic_elements); \
+        }                                                                  \
+        DISPATCH_STOCHASTIC_ELEMENTS(                                      \
+            InputT, OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM);           \
+    } while (false)
 #if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
     if (input.scalar_type() == torch::kFloat) {
         DISPATCH_STOCHASTIC(float);
@@ -583,12 +603,25 @@ torch::Tensor stochastic_rounding(
 #endif
     // Uncommon input dtypes retain the established materialized-FP16 path.
     if (out_dtype == torch::kFloat8_e4m3fn) {
-        return stochastic_rounding_fused<fp16, false, 4, 3, 7>(
+        return stochastic_rounding_fused<
+            fp16,
+            false,
+            OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM,
+            4,
+            3,
+            7>(
             input, rng, out_dtype, limit);
     }
-    return stochastic_rounding_fused<fp16, false, 5, 2, 15>(
+    return stochastic_rounding_fused<
+        fp16,
+        false,
+        OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM,
+        5,
+        2,
+        15>(
         input, rng, out_dtype, limit);
 #undef DISPATCH_STOCHASTIC
+#undef DISPATCH_STOCHASTIC_ELEMENTS
 }
 
 }  // namespace fp8

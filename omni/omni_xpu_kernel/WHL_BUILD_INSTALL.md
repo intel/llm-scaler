@@ -13,6 +13,7 @@ oneDNN 2025.3.0 Python package / oneDNN 3.9.1 native API
 Intel Arc Pro B70 / intel_gpu_bmg_g31
 OMNI_XPU_DEVICE=bmg
 Windows wheel tag: cp313-cp313-win_amd64
+llm-scaler source: 0c6cd57c6034929c3f7ee6efc48d7aa0b72b7bed
 ```
 
 本文不把 ComfyUI Portable 当作编译环境。编译环境位于项目目录内，
@@ -94,7 +95,7 @@ Torch/oneDNN 在本次解析出的关键原生传递依赖如下。通常不应�
 | torchaudio | `2.11.0+xpu` |
 | onednn | `2025.3.0` |
 | omni-xpu-kernel | `0.1.0b9.dev0+torch212.bmg` |
-| comfy-kitchen | `0.2.18`，Intel XPU fork commit `fead43b4...` |
+| comfy-kitchen | `0.2.18`，Intel XPU fork commit [`c7ae07e5...`](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/c7ae07e5317d4a073562e278a41d98f05a4fe109) |
 | ComfyUI | `0.28.0` |
 
 `torchvision 0.27.0+xpu` 可从
@@ -120,6 +121,8 @@ omni_xpu_kernel/lgrf_uni/lgrf_sdp.cp313-win_amd64.pyd
 - `lgrf_sdp` 是独立的 ESIMD SDP sidecar。
 - CUTE FMHA 当前是 Linux-only，Windows 必须设置
   `OMNI_XPU_REQUIRE_CUTE=0`。
+- Windows ComfyUI 默认保留 PyTorch SDPA；ESIMD sidecar 仅在显式设置
+  `OMNI_ATTN_BACKEND=esimd` 时由 Custom Node 使用。
 - `OMNI_XPU_DEVICE=bmg` 会把核心扩展和 sidecar 都 AOT 编译为 BMG
   `spir64_gen` 镜像。
 - PTL-H 必须单独使用 `OMNI_XPU_DEVICE=ptl-h` 构建，不能安装 BMG wheel。
@@ -313,9 +316,13 @@ Torch XPU 头文件、库和版本。`--no-deps` 避免打包过程改变环境�
 已验证 artifact：
 
 ```text
-size:   1,085,973 bytes
-SHA256: 875407C932C1A4399F94E8A607C6154EE0BAB60BB7ACBB03798E1B53C2ED4A09
+size:   1,563,303 bytes
+SHA256: 2F3E7363CB4E913031F125540BABDC1DA933E27928BEA408D1020E0A4CC4DC77
 ```
+
+该 artifact 使用与 Linux 相同的 RMSNorm、LayerNorm 和 fused Add+RMSNorm
+GS dispatch ladder；Windows SDP loader 同时解析 sidecar 导出的 D64、D128
+和 FP16 fast-path 符号。
 
 项目的 `scripts\build.bat` 可用于原地安装或开发安装，但需要发布或复制
 artifact 时，应使用上面的 `pip wheel` 命令。
@@ -465,16 +472,25 @@ print("native kernel smoke: PASS")
 
 本次额外验证通过：
 
+- Windows 支持面源码测试：501 passed、36 skipped；
+- packaging 测试：25 passed、4 skipped；
 - RMSNorm：FP16、BF16、FP32；
 - SVDQ UINT4 quantize/unpack/dequantize；
-- standalone SDP：`head_dim=128` 的 FP16、BF16；
+- GGUF Q4_1 capability 和 correctness；
+- BMG GroupNorm；
+- LTX direct split RoPE；
+- INT8 shared/prequantized pair、rowwise 和 cache correctness；
+- standalone SDP：`head_dim=64/128` 的 FP16、BF16；
 - oneDNN FP8 GEMM correctness 和 primitive cache；
-- 两张 Intel Arc Pro B70 的 XPU 张量运算。
+- 两张 Intel Arc Pro B70 的 XPU 张量、RMSNorm 和 D64/D128 SDP
+  correctness；
+- 本轮变更定点测试：Norm/Adaln 143 passed、4 skipped；SDP 91 passed、
+  1 skipped；platform dispatch source test 2 passed。
 
 当前 BMG core-only Windows wheel 的 standalone SDP 实机验收范围是
-`head_dim=128`。源码测试套件还包含 `head_dim=64` 用例；该 wheel 对这些
-配置会明确返回 `kernel not available for this configuration`，不能把上面的
-smoke 结果解释为已经覆盖 `head_dim=64`。
+`head_dim=64/128` 的 FP16、BF16。Windows 与 Linux 使用相同 sidecar
+kernel source 和参数；平台分支只负责分别通过 `GetProcAddress` 和 `dlsym`
+解析相同的五个导出符号。
 
 ### 8.3 ComfyUI 启动 smoke
 

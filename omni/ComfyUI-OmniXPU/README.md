@@ -50,7 +50,7 @@ OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
 Validated sub-routes can be disabled independently:
 
 ```bash
-OMNI_ATTN_BACKEND=auto      # auto, cute, esimd, or torch
+OMNI_ATTN_BACKEND=auto      # auto, cute, esimd, or torch; Windows defaults to torch
 OMNIXPU_NONCONTIG_RMSNORM=0
 OMNIXPU_H120_RMSNORM=0
 OMNIXPU_KREA2_RMSNORM=0
@@ -75,6 +75,11 @@ matching platform, Torch-version, dtype, layout, and operator contracts, and
 uses the original PyTorch attention path for every remaining contract. It
 never selects ESIMD. `cute` and `esimd` are explicit diagnostic policies;
 unsupported contracts still fall back safely.
+
+On Windows, an unset `OMNI_ATTN_BACKEND` defaults to `torch`, leaving ComfyUI's
+PyTorch SDPA route unpatched. ESIMD remains available as an explicit diagnostic
+or performance opt-in with `OMNI_ATTN_BACKEND=esimd`; it is never selected
+automatically.
 
 On BMG with Torch 2.11, the experimental LTX-style BF16 D128 route accepts
 dense B2/H32 self-attention and B1/B2/H32 KV1024 cross-attention inputs as

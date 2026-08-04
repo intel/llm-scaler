@@ -27,6 +27,10 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 
+#if defined(OMNI_XPU_ARCH_BMG)
+#include "bmg_kernel_policy.h"
+#include "device_utils.h"
+#endif
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -71,7 +75,8 @@ constexpr int HALF_GROUP = SVDQ_GROUP_SIZE / 2;  // 32 packed bytes per group
 template<
     typename OT,
     bool Signed = true,
-    int GroupsPerWorkItem = OMNI_SVDQ_DEQUANT_GROUPS_PER_WI>
+    int GroupsPerWorkItem = OMNI_SVDQ_DEQUANT_GROUPS_PER_WI,
+    int WorkGroupSize = 64>
 void dequantize_svdq_w4_kernel(
     const uint8_t* __restrict__ packed,
     const OT* __restrict__ scales,
@@ -84,7 +89,7 @@ void dequantize_svdq_w4_kernel(
     const int64_t group_chunks =
         (num_groups + GroupsPerWorkItem - 1) / GroupsPerWorkItem;
     const int64_t total_items = N * group_chunks;
-    constexpr int WG_SIZE = 64;
+    constexpr int WG_SIZE = WorkGroupSize;
     const int64_t padded_size = (total_items + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
 
     auto cgf = [&](sycl::handler& handle) {
@@ -168,15 +173,15 @@ void dequantize_svdq_w4_kernel(
     utils::submit_kernel(cgf, device, "dequantize_svdq_w4");
 }
 
-#if defined(OMNI_XPU_ARCH_PTL_H)
-// The PTL signed path benefits from expressing sign extension and low/high
-// interleave as ESIMD vector regions. Keep this as a distinct kernel type:
-// its register footprint limits the work-group to 32, while the original
-// unsigned path above remains faster at WG64.
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
+// PTL and B60 benefit from expressing sign extension and low/high interleave
+// as ESIMD vector regions. Keep this as a distinct kernel mechanism; each
+// device profile selects its independently validated work-group size.
 template<
     typename OT,
-    int GroupsPerWorkItem = OMNI_SVDQ_DEQUANT_GROUPS_PER_WI>
-void dequantize_svdq_w4_signed_ptl_kernel(
+    int GroupsPerWorkItem = OMNI_SVDQ_DEQUANT_GROUPS_PER_WI,
+    int WorkGroupSize = 32>
+void dequantize_svdq_w4_signed_vector_kernel(
     const uint8_t* __restrict__ packed,
     const OT* __restrict__ scales,
     OT* __restrict__ output,
@@ -187,7 +192,7 @@ void dequantize_svdq_w4_signed_ptl_kernel(
     const int64_t group_chunks =
         (num_groups + GroupsPerWorkItem - 1) / GroupsPerWorkItem;
     const int64_t total_items = N * group_chunks;
-    constexpr int WG_SIZE = 32;
+    constexpr int WG_SIZE = WorkGroupSize;
     const int64_t padded_size =
         (total_items + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
 
@@ -243,7 +248,7 @@ void dequantize_svdq_w4_signed_ptl_kernel(
                 }
             });
     };
-    utils::submit_kernel(cgf, device, "dequantize_svdq_w4_signed_ptl");
+    utils::submit_kernel(cgf, device, "dequantize_svdq_w4_signed_vector");
 }
 #endif
 
@@ -407,7 +412,9 @@ void unpack_svdq_int4_kernel(
 template<
     typename IT,
     bool Unsigned = false,
-    int GroupsPerWorkItem = OMNI_SVDQ_QUANT_GROUPS_PER_WI>
+    int GroupsPerWorkItem = OMNI_SVDQ_QUANT_GROUPS_PER_WI,
+    int WorkGroupSize = 64,
+    bool WideVector = false>
 void quantize_svdq_act_int4_kernel(
     const IT* __restrict__ input,
     uint8_t* __restrict__ output,
@@ -420,7 +427,7 @@ void quantize_svdq_act_int4_kernel(
     const int64_t group_chunks =
         (num_groups + GroupsPerWorkItem - 1) / GroupsPerWorkItem;
     const int64_t total_items = M * group_chunks;
-    constexpr int WG_SIZE = 64;
+    constexpr int WG_SIZE = WorkGroupSize;
     const int64_t padded_size = (total_items + WG_SIZE - 1) / WG_SIZE * WG_SIZE;
 
     auto cgf = [&](sycl::handler& handle) {
@@ -444,6 +451,59 @@ void quantize_svdq_act_int4_kernel(
                     uint8_t* dst =
                         output + row * (K / 2) + grp * HALF_GROUP;
 
+                    if constexpr (WideVector) {
+                        // B60 path: keep one full quantization group in a
+                        // single ESIMD vector, then pack and store it without
+                        // scalar lane extraction or byte scatters.
+                        simd<float, 64> vals;
+                        if constexpr (std::is_same_v<IT, float>) {
+                            vals = block_load<float, 64>(src);
+                        } else if constexpr (std::is_same_v<IT, bf16>) {
+                            simd<bf16, 64> bvals = block_load<bf16, 64>(
+                                reinterpret_cast<const bf16*>(src));
+                            vals = bvals;
+                        } else {
+                            simd<fp16, 64> hvals = block_load<fp16, 64>(
+                                reinterpret_cast<const fp16*>(src));
+                            vals = hvals;
+                        }
+                        const simd<float, 64> abs_vals =
+                            sycl::ext::intel::esimd::abs<float, 64>(vals);
+                        const float group_max = hmax<float>(abs_vals);
+                        constexpr float qmax =
+                            Unsigned ? 15.0f : 7.0f;
+                        constexpr float qmin =
+                            Unsigned ? 0.0f : -7.0f;
+                        float scale = group_max / qmax;
+                        if (scale < 1e-10f) scale = 1e-10f;
+                        const float rscale =
+                            qmax /
+                            (group_max < 1e-10f ? 1e-10f : group_max);
+                        scales[grp * M + row] =
+                            static_cast<IT>(scale);
+
+                        simd<float, 64> quantized =
+                            sycl::ext::intel::esimd::rnde<float, 64>(
+                                vals * rscale);
+                        quantized =
+                            sycl::ext::intel::esimd::max<float, 64>(
+                                sycl::ext::intel::esimd::min<float, 64>(
+                                    quantized,
+                                    simd<float, 64>(qmax)),
+                                simd<float, 64>(qmin));
+                        simd<int8_t, 64> quantized_i8 =
+                            quantized;
+                        simd<uint8_t, 32> even =
+                            quantized_i8.template select<32, 2>(0);
+                        simd<uint8_t, 32> odd =
+                            quantized_i8.template select<32, 2>(1);
+                        const simd<uint8_t, 32> packed_group =
+                            (even & uint8_t(0x0F)) |
+                            ((odd & uint8_t(0x0F)) << 4);
+                        block_store<uint8_t, 32>(dst, packed_group);
+                    } else {
+                    // B70/generic path: preserve the shipped two-vector
+                    // implementation and byte-scatter store contract.
                     // Load 64 input values in two chunks and find absmax.
                     simd<float, 32> vals_0, vals_1;
                     if constexpr (std::is_same_v<IT, float>) {
@@ -525,12 +585,149 @@ void quantize_svdq_act_int4_kernel(
                     scatter<uint8_t, 16>(dst, store_offsets, packed_0);
                     scatter<uint8_t, 16>(
                         dst + 16, store_offsets, packed_1);
+                    }
                 }
             }
         );
     };
 
     utils::submit_kernel(cgf, device, "quantize_svdq_act_int4");
+}
+
+template<typename OT>
+void launch_svdq_dequant_signed(
+    const uint8_t* packed,
+    const OT* scales,
+    OT* output,
+    int64_t rows,
+    int64_t columns,
+    int64_t groups,
+    const at::Device& target_device) {
+#if defined(OMNI_XPU_ARCH_PTL_H)
+    dequantize_svdq_w4_signed_vector_kernel<OT>(
+        packed, scales, output, rows, columns, groups, target_device);
+#elif defined(OMNI_XPU_ARCH_BMG)
+    auto& queue = utils::get_queue(target_device);
+    if (device::use_b60_kernel_profile(queue)) {
+        dequantize_svdq_w4_signed_vector_kernel<
+            OT,
+            device::B60KernelPolicy::svdq_dequant_groups,
+            device::B60KernelPolicy::svdq_dequant_work_group_size>(
+                packed,
+                scales,
+                output,
+                rows,
+                columns,
+                groups,
+                target_device);
+    } else {
+        dequantize_svdq_w4_kernel<
+            OT,
+            true,
+            device::B70KernelPolicy::svdq_dequant_groups,
+            device::B70KernelPolicy::svdq_dequant_work_group_size>(
+                packed,
+                scales,
+                output,
+                rows,
+                columns,
+                groups,
+                target_device);
+    }
+#else
+    dequantize_svdq_w4_kernel<OT>(
+        packed, scales, output, rows, columns, groups, target_device);
+#endif
+}
+
+template<typename OT>
+void launch_svdq_dequant_unsigned(
+    const uint8_t* packed,
+    const OT* scales,
+    OT* output,
+    int64_t rows,
+    int64_t columns,
+    int64_t groups,
+    const at::Device& target_device) {
+#if defined(OMNI_XPU_ARCH_BMG)
+    auto& queue = utils::get_queue(target_device);
+    if (device::use_b60_kernel_profile(queue)) {
+        dequantize_svdq_w4_kernel<
+            OT,
+            false,
+            device::B60KernelPolicy::svdq_dequant_groups,
+            device::B60KernelPolicy::svdq_dequant_work_group_size>(
+                packed,
+                scales,
+                output,
+                rows,
+                columns,
+                groups,
+                target_device);
+    } else {
+        dequantize_svdq_w4_kernel<
+            OT,
+            false,
+            device::B70KernelPolicy::svdq_dequant_groups,
+            device::B70KernelPolicy::svdq_dequant_work_group_size>(
+                packed,
+                scales,
+                output,
+                rows,
+                columns,
+                groups,
+                target_device);
+    }
+#else
+    dequantize_svdq_w4_kernel<OT, false>(
+        packed, scales, output, rows, columns, groups, target_device);
+#endif
+}
+
+template<typename IT, bool Unsigned>
+void launch_svdq_quant(
+    const IT* input,
+    uint8_t* output,
+    IT* scales,
+    int64_t rows,
+    int64_t columns,
+    int64_t groups,
+    const at::Device& target_device) {
+#if defined(OMNI_XPU_ARCH_BMG)
+    auto& queue = utils::get_queue(target_device);
+    if (device::use_b60_kernel_profile(queue)) {
+        quantize_svdq_act_int4_kernel<
+            IT,
+            Unsigned,
+            device::B60KernelPolicy::svdq_quant_groups,
+            device::B60KernelPolicy::svdq_quant_work_group_size,
+            true>(
+                input,
+                output,
+                scales,
+                rows,
+                columns,
+                groups,
+                target_device);
+    } else {
+        quantize_svdq_act_int4_kernel<
+            IT,
+            Unsigned,
+            device::B70KernelPolicy::svdq_quant_groups,
+            device::B70KernelPolicy::svdq_quant_work_group_size,
+            false>(
+                input,
+                output,
+                scales,
+                rows,
+                columns,
+                groups,
+                target_device);
+    }
+#else
+    quantize_svdq_act_int4_kernel<IT, Unsigned>(
+        input, output, scales, rows, columns, groups, target_device);
+#endif
 }
 
 // ============================================================================
@@ -569,27 +766,15 @@ torch::Tensor dequantize_svdq_w4(
     const uint8_t* packed_ptr = packed.data_ptr<uint8_t>();
 
     if (out_dtype == torch::kFloat32) {
-#if defined(OMNI_XPU_ARCH_PTL_H)
-        dequantize_svdq_w4_signed_ptl_kernel<float>(
-#else
-        dequantize_svdq_w4_kernel<float>(
-#endif
+        launch_svdq_dequant_signed<float>(
             packed_ptr, scales_cast.data_ptr<float>(),
             output.data_ptr<float>(), N, K, num_groups, packed.device());
     } else if (out_dtype == torch::kBFloat16) {
-#if defined(OMNI_XPU_ARCH_PTL_H)
-        dequantize_svdq_w4_signed_ptl_kernel<bf16>(
-#else
-        dequantize_svdq_w4_kernel<bf16>(
-#endif
+        launch_svdq_dequant_signed<bf16>(
             packed_ptr, reinterpret_cast<const bf16*>(scales_cast.data_ptr()),
             reinterpret_cast<bf16*>(output.data_ptr()), N, K, num_groups, packed.device());
     } else if (out_dtype == torch::kFloat16) {
-#if defined(OMNI_XPU_ARCH_PTL_H)
-        dequantize_svdq_w4_signed_ptl_kernel<fp16>(
-#else
-        dequantize_svdq_w4_kernel<fp16>(
-#endif
+        launch_svdq_dequant_signed<fp16>(
             packed_ptr, reinterpret_cast<const fp16*>(scales_cast.data_ptr()),
             reinterpret_cast<fp16*>(output.data_ptr()), N, K, num_groups, packed.device());
     } else {
@@ -616,11 +801,11 @@ torch::Tensor dequantize_svdq_u4(
     auto output = torch::empty({M, K}, torch::TensorOptions().dtype(out_dtype).device(packed.device()));
     auto scales_cast = scales.to(out_dtype).contiguous();
     if (out_dtype == torch::kFloat32) {
-        dequantize_svdq_w4_kernel<float, false>(packed.data_ptr<uint8_t>(), scales_cast.data_ptr<float>(), output.data_ptr<float>(), M, K, groups, packed.device());
+        launch_svdq_dequant_unsigned<float>(packed.data_ptr<uint8_t>(), scales_cast.data_ptr<float>(), output.data_ptr<float>(), M, K, groups, packed.device());
     } else if (out_dtype == torch::kBFloat16) {
-        dequantize_svdq_w4_kernel<bf16, false>(packed.data_ptr<uint8_t>(), reinterpret_cast<const bf16*>(scales_cast.data_ptr()), reinterpret_cast<bf16*>(output.data_ptr()), M, K, groups, packed.device());
+        launch_svdq_dequant_unsigned<bf16>(packed.data_ptr<uint8_t>(), reinterpret_cast<const bf16*>(scales_cast.data_ptr()), reinterpret_cast<bf16*>(output.data_ptr()), M, K, groups, packed.device());
     } else if (out_dtype == torch::kFloat16) {
-        dequantize_svdq_w4_kernel<fp16, false>(packed.data_ptr<uint8_t>(), reinterpret_cast<const fp16*>(scales_cast.data_ptr()), reinterpret_cast<fp16*>(output.data_ptr()), M, K, groups, packed.device());
+        launch_svdq_dequant_unsigned<fp16>(packed.data_ptr<uint8_t>(), reinterpret_cast<const fp16*>(scales_cast.data_ptr()), reinterpret_cast<fp16*>(output.data_ptr()), M, K, groups, packed.device());
     } else {
         TORCH_CHECK(false, "Unsupported output dtype: ", out_dtype);
     }
@@ -674,19 +859,19 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_svdq_act_int4(
 
     auto input_dtype = input.scalar_type();
     if (input_dtype == torch::kFloat32) {
-        quantize_svdq_act_int4_kernel<float>(
+        launch_svdq_quant<float, false>(
             input.data_ptr<float>(),
             packed.data_ptr<uint8_t>(),
             scales_out.data_ptr<float>(),
             M, K, num_groups, input.device());
     } else if (input_dtype == torch::kBFloat16) {
-        quantize_svdq_act_int4_kernel<bf16>(
+        launch_svdq_quant<bf16, false>(
             reinterpret_cast<const bf16*>(input.data_ptr()),
             packed.data_ptr<uint8_t>(),
             reinterpret_cast<bf16*>(scales_out.data_ptr()),
             M, K, num_groups, input.device());
     } else if (input_dtype == torch::kFloat16) {
-        quantize_svdq_act_int4_kernel<fp16>(
+        launch_svdq_quant<fp16, false>(
             reinterpret_cast<const fp16*>(input.data_ptr()),
             packed.data_ptr<uint8_t>(),
             reinterpret_cast<fp16*>(scales_out.data_ptr()),
@@ -712,11 +897,11 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_svdq_act_uint4(
     auto packed = torch::empty({M, K / 2}, torch::TensorOptions().dtype(torch::kByte).device(input.device()));
     auto scales_out = torch::empty({groups, M}, input.options());
     if (input.scalar_type() == torch::kFloat32) {
-        quantize_svdq_act_int4_kernel<float, true>(input.data_ptr<float>(), packed.data_ptr<uint8_t>(), scales_out.data_ptr<float>(), M, K, groups, input.device());
+        launch_svdq_quant<float, true>(input.data_ptr<float>(), packed.data_ptr<uint8_t>(), scales_out.data_ptr<float>(), M, K, groups, input.device());
     } else if (input.scalar_type() == torch::kBFloat16) {
-        quantize_svdq_act_int4_kernel<bf16, true>(reinterpret_cast<const bf16*>(input.data_ptr()), packed.data_ptr<uint8_t>(), reinterpret_cast<bf16*>(scales_out.data_ptr()), M, K, groups, input.device());
+        launch_svdq_quant<bf16, true>(reinterpret_cast<const bf16*>(input.data_ptr()), packed.data_ptr<uint8_t>(), reinterpret_cast<bf16*>(scales_out.data_ptr()), M, K, groups, input.device());
     } else if (input.scalar_type() == torch::kFloat16) {
-        quantize_svdq_act_int4_kernel<fp16, true>(reinterpret_cast<const fp16*>(input.data_ptr()), packed.data_ptr<uint8_t>(), reinterpret_cast<fp16*>(scales_out.data_ptr()), M, K, groups, input.device());
+        launch_svdq_quant<fp16, true>(reinterpret_cast<const fp16*>(input.data_ptr()), packed.data_ptr<uint8_t>(), reinterpret_cast<fp16*>(scales_out.data_ptr()), M, K, groups, input.device());
     } else {
         TORCH_CHECK(false, "Unsupported input dtype: ", input.scalar_type());
     }
