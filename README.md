@@ -5,8 +5,9 @@ LLM Scaler is an GenAI solution for text generation, image generation, video gen
 ---
 
 ## Latest Update
-- 🔥[2026.07] We released `intel/llm-scaler-omni:0.1.0-b8` to support ComfyUI 0.27.0,more workflows and models.
-- 🔥[2026.07] We released `intel/llm-scaler-vllm:0.21.0-b1` to support gemma-4 (12B, 31B and 26B-A4B) and diffusiongemma (26B-A4B) models, and experimentally support XPU graph. 
+- 🔥[2026.08] We released `intel/llm-scaler-vllm:0.21.0-b2` to support Multi-token Prediction (MTP) and Lora Serving for Qwen3.6-27B, Qwen3.6-35B-A3B, gemma-4-31B-it and gemma-4-26B-A4B-it models, and support per-block quantization models Qwen3.6-27B-FP8 and Qwen3.6-35B-A3B-FP8. 
+- [2026.07] We released `intel/llm-scaler-omni:0.1.0-b8` to support ComfyUI 0.27.0,more workflows and models.
+- [2026.07] We released `intel/llm-scaler-vllm:0.21.0-b1` to support gemma-4 (12B, 31B and 26B-A4B) and diffusiongemma (26B-A4B) models, and experimentally support XPU graph. 
 - [2026.06] We released `intel/llm-scaler-vllm:0.14.0-b8.3.2` to fix Qwen3.5/3.6-27B accuracy issues. 
 - [2026.06] We released `intel/llm-scaler-vllm:0.14.0-b8.3.1` to enable FP8 KV Cache and fix bugs for Qwen3/Qwen3.5 models. 
 - [2026.05] We released `intel/llm-scaler-vllm:0.14.0-b8.3` to improve performance for Qwen3.5/3.6 series and Qwen3-Coder-Next, and enabled model streaming load to reduce peak memory. 
