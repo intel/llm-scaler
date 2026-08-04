@@ -20,4 +20,5 @@ exec python /llm/ComfyUI/main.py \
     --listen 0.0.0.0 \
     --port 8188 \
     --reserve-vram "$reserve_vram_gb" \
+    --enable-manager \
     "$@"

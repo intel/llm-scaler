@@ -9,13 +9,17 @@ device and should not encode release-policy assertions in cached build layers.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import importlib.metadata
+import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from runpy import run_path
 
 from packaging.version import Version
 
@@ -32,6 +36,10 @@ REQUIRED_KITCHEN_CAPABILITIES = {
 }
 
 PINNED_CHECKOUTS = {
+    "ComfyUI": (
+        Path("/llm/ComfyUI"),
+        "OMNI_COMFYUI_REVISION",
+    ),
     "Kitchen": (
         Path("/llm/comfy-kitchen-xpu"),
         "OMNI_COMFY_KITCHEN_REVISION",
@@ -51,6 +59,24 @@ GGUF_DEPENDENCIES = {
     "sentencepiece": "sentencepiece",
     "protobuf": "google.protobuf",
 }
+
+COMFYUI_PACKAGE_ENVIRONMENT = {
+    "comfyui-frontend-package": "OMNI_COMFYUI_FRONTEND_VERSION",
+    "comfyui-workflow-templates": "OMNI_COMFYUI_WORKFLOW_TEMPLATES_VERSION",
+    "comfyui-manager": "OMNI_COMFYUI_MANAGER_VERSION",
+}
+
+REQUIRED_MINIMAX_H3_TEMPLATES = {
+    "api_minimax_h3_flf2v.json",
+    "api_minimax_h3_r2v.json",
+    "api_minimax_h3_t2v.json",
+    "video_minimax_h3_i2v.json",
+    "video_minimax_h3_r2v.json",
+    "video_minimax_h3_t2v.json",
+}
+
+COMFYUI_ROOT = Path("/llm/ComfyUI")
+COMFYUI_DATABASE_DIRECTORY = COMFYUI_ROOT / "user"
 
 
 def require_equal(label: str, actual: str, expected: str) -> None:
@@ -78,6 +104,13 @@ def require_checkout_revision(label: str, path: Path, expected: str) -> None:
     require_equal(f"{label} checkout revision", completed.stdout.strip(), expected)
 
 
+def add_comfyui_to_import_path() -> None:
+    """Make integrated packages importable from the runner's /tmp cwd."""
+    comfyui_root = str(COMFYUI_ROOT)
+    if comfyui_root not in sys.path:
+        sys.path.insert(0, comfyui_root)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -92,8 +125,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    add_comfyui_to_import_path()
+
     import torch
     import comfy_kitchen
+    import comfyui_manager
     import nunchaku_torch
     import omni_xpu_kernel
     from omni_xpu_kernel import _version as kernel_version
@@ -101,6 +137,7 @@ def main() -> None:
 
     expected_image = os.environ["OMNI_IMAGE_VERSION"]
     expected_target = os.environ["OMNI_IMAGE_XPU_TARGET"]
+    expected_comfyui = os.environ["OMNI_COMFYUI_VERSION"]
     expected_kitchen = os.environ["OMNI_COMFY_KITCHEN_VERSION"]
     expected_nunchaku = os.environ["OMNI_COMFY_NUNCHAKU_VERSION"]
     source_revision = os.environ["OMNI_LLM_SCALER_SOURCE_REVISION"]
@@ -115,6 +152,8 @@ def main() -> None:
     for label, (path, environment_variable) in PINNED_CHECKOUTS.items():
         require_checkout_revision(label, path, os.environ[environment_variable])
 
+    comfyui_version = run_path("/llm/ComfyUI/comfyui_version.py")["__version__"]
+    require_equal("ComfyUI version", comfyui_version, expected_comfyui)
     require_equal(
         "Kitchen module version",
         comfy_kitchen.__version__,
@@ -125,6 +164,63 @@ def main() -> None:
         importlib.metadata.version("comfy-kitchen"),
         expected_kitchen,
     )
+    comfyui_dependency_versions = {}
+    for distribution_name, environment_variable in (
+        COMFYUI_PACKAGE_ENVIRONMENT.items()
+    ):
+        actual = importlib.metadata.version(distribution_name)
+        expected = os.environ[environment_variable]
+        require_equal(f"{distribution_name} version", actual, expected)
+        comfyui_dependency_versions[distribution_name] = actual
+    if not comfyui_manager.__file__:
+        raise RuntimeError("comfyui_manager package has no importable source")
+
+    template_distribution = importlib.metadata.distribution(
+        "comfyui-workflow-templates-json"
+    )
+    template_root = Path(
+        template_distribution.locate_file(
+            "comfyui_workflow_templates_json/templates"
+        )
+    )
+    missing_templates = sorted(
+        name for name in REQUIRED_MINIMAX_H3_TEMPLATES
+        if not (template_root / name).is_file()
+    )
+    if missing_templates:
+        raise RuntimeError(
+            "ComfyUI workflow template package is missing MiniMax H3 files: "
+            + ", ".join(missing_templates)
+        )
+    h3_template_hashes = {}
+    for name in sorted(REQUIRED_MINIMAX_H3_TEMPLATES):
+        path = template_root / name
+        json.loads(path.read_text(encoding="utf-8"))
+        h3_template_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    dependency_manifest = Path("/llm/manifests/comfyui-python-freeze.txt")
+    if not dependency_manifest.is_file() or not dependency_manifest.read_text(
+        encoding="utf-8"
+    ).strip():
+        raise RuntimeError(
+            "complete ComfyUI Python dependency manifest is missing or empty"
+        )
+    if not COMFYUI_DATABASE_DIRECTORY.is_dir():
+        raise RuntimeError(
+            "ComfyUI default database directory is missing: "
+            f"{COMFYUI_DATABASE_DIRECTORY}"
+        )
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=".comfyui-db-contract-",
+            dir=COMFYUI_DATABASE_DIRECTORY,
+        ):
+            pass
+    except OSError as error:
+        raise RuntimeError(
+            "ComfyUI default database directory is not writable: "
+            f"{COMFYUI_DATABASE_DIRECTORY}"
+        ) from error
     require_equal(
         "ComfyUI-nunchaku-XPU distribution version",
         importlib.metadata.version("ComfyUI-nunchaku-XPU"),
@@ -215,9 +311,15 @@ def main() -> None:
         "ComfyUI image acceptance passed: "
         f"image={expected_image}, target={expected_target}, "
         f"source={source_revision[:12]}, dirty={source_dirty}, "
-        f"torch={torch.__version__}, kitchen={expected_kitchen}, "
+        f"torch={torch.__version__}, comfyui={expected_comfyui}, "
+        f"frontend={comfyui_dependency_versions['comfyui-frontend-package']}, "
+        "templates="
+        f"{comfyui_dependency_versions['comfyui-workflow-templates']}, "
+        f"manager={comfyui_dependency_versions['comfyui-manager']}, "
+        f"kitchen={expected_kitchen}, "
         f"gguf={dependency_versions['gguf']}, nunchaku={expected_nunchaku}, "
-        f"xpu={device_name!r}, kitchen_capabilities={len(capabilities)}"
+        f"xpu={device_name!r}, kitchen_capabilities={len(capabilities)}, "
+        f"h3_templates={len(h3_template_hashes)}"
     )
 
 

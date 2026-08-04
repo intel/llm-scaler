@@ -10,6 +10,7 @@
 **/*.egg-info/
 **/build/
 **/dist/
+omni_xpu_kernel/dist-h3-deps/
 omni_xpu_kernel/build/
 
 # Local-only

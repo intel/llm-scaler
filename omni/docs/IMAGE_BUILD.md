@@ -20,6 +20,12 @@ The supported environment overrides are:
 | `OMNI_IMAGE_REPOSITORY` | Local image repository | `intel/llm-scaler-omni` |
 | `OMNI_BASE_IMAGE` | OMIX development base | `intel/omix:0.1.0-devel-ubuntu24.04` |
 | `MAX_JOBS` | Native build parallelism | `8` |
+| `COMFYUI_REPOSITORY` | ComfyUI source repository | pinned in `build.sh` |
+| `COMFYUI_COMMIT` | ComfyUI source revision | pinned in `build.sh` |
+| `COMFYUI_VERSION` | Expected ComfyUI version | pinned in `build.sh` |
+| `COMFYUI_FRONTEND_VERSION` | ComfyUI frontend package version | pinned in `build.sh` |
+| `COMFYUI_WORKFLOW_TEMPLATES_VERSION` | Official workflow-template bundle version | pinned in `build.sh` |
+| `COMFYUI_MANAGER_VERSION` | Integrated Node Manager package version | pinned in `build.sh` |
 | `COMFY_KITCHEN_REPOSITORY` | Kitchen source repository | pinned in `build.sh` |
 | `COMFY_KITCHEN_COMMIT` | Kitchen source revision | pinned in `build.sh` |
 | `COMFY_KITCHEN_VERSION` | Expected Kitchen wheel version | pinned in `build.sh` |
@@ -29,11 +35,18 @@ The supported environment overrides are:
 | `COMFY_NUNCHAKU_COMMIT` | Combined Nunchaku source revision | pinned in `build.sh` |
 | `COMFY_NUNCHAKU_VERSION` | Expected combined distribution version | pinned in `build.sh` |
 
-Kitchen repository, commit, and version must be updated together. GGUF
+ComfyUI repository, commit, and version must be updated together. Kitchen
+repository, commit, and version must be updated together. GGUF
 repository and commit must be updated together. The same rule applies to the
 combined Nunchaku repository, commit, and distribution version. The kernel
 source is copied from `omni/omni_xpu_kernel` in the current llm-scaler
 checkout.
+
+The focused image installs the v0.30 integrated `comfyui-manager` package and
+does not clone the legacy Manager custom node. Frontend, workflow templates,
+and Manager are explicit build inputs; the final image also records a complete
+`pip freeze --all` dependency snapshot at
+`/llm/manifests/comfyui-python-freeze.txt`.
 
 ## Focused-image build graph
 
@@ -60,6 +73,8 @@ whether `omni/` had uncommitted changes. The final image also records:
 
 - image version and flavor;
 - selected XPU target;
+- ComfyUI version and commit;
+- ComfyUI frontend, workflow-template, and integrated Manager versions;
 - Kitchen version and commit;
 - GGUF custom-node commit;
 - combined Nunchaku custom-node/runtime version and commit;

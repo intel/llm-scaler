@@ -10,7 +10,12 @@ import subprocess
 ENTRYPOINT = Path(__file__).parents[1] / "entrypoints" / "start_comfyui.sh"
 
 
-def _run_entrypoint(tmp_path: Path, *, reserve: str | None = None):
+def _run_entrypoint(
+    tmp_path: Path,
+    *,
+    reserve: str | None = None,
+    extra_arguments: tuple[str, ...] = ("--disable-all-custom-nodes",),
+):
     capture = tmp_path / "args.txt"
     fake_python = tmp_path / "python"
     fake_python.write_text(
@@ -26,7 +31,7 @@ def _run_entrypoint(tmp_path: Path, *, reserve: str | None = None):
     else:
         environment["OMNI_COMFYUI_RESERVE_VRAM_GB"] = reserve
     completed = subprocess.run(
-        ["bash", str(ENTRYPOINT), "--disable-all-custom-nodes"],
+        ["bash", str(ENTRYPOINT), *extra_arguments],
         check=False,
         capture_output=True,
         text=True,
@@ -48,8 +53,17 @@ def test_entrypoint_reserves_four_gib_by_default(tmp_path):
         "8188",
         "--reserve-vram",
         "4",
+        "--enable-manager",
         "--disable-all-custom-nodes",
     ]
+
+
+def test_entrypoint_loads_custom_nodes_by_default(tmp_path):
+    completed, arguments = _run_entrypoint(tmp_path, extra_arguments=())
+
+    assert completed.returncode == 0
+    assert "--enable-manager" in arguments
+    assert "--disable-all-custom-nodes" not in arguments
 
 
 def test_entrypoint_allows_explicit_reserve_override(tmp_path):

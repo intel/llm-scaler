@@ -20,9 +20,15 @@ ARG IMAGE_TAG
 
 ARG SYCL_TLA_REPOSITORY=https://github.com/intel/sycl-tla.git
 ARG SYCL_TLA_COMMIT=2fc09973bfdf15755090fcb0e3b6ad236408a992
+ARG COMFYUI_REPOSITORY=https://github.com/Comfy-Org/ComfyUI.git
+ARG COMFYUI_COMMIT=b1693ecba9f5b65f8c80ab36b195ab963ec92413
+ARG COMFYUI_VERSION=0.30.0
+ARG COMFYUI_FRONTEND_VERSION=1.47.12
+ARG COMFYUI_WORKFLOW_TEMPLATES_VERSION=0.11.28
+ARG COMFYUI_MANAGER_VERSION=4.2.2
 ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
-ARG COMFY_KITCHEN_COMMIT=c7ae07e5317d4a073562e278a41d98f05a4fe109
-ARG COMFY_KITCHEN_VERSION=0.2.18
+ARG COMFY_KITCHEN_COMMIT=f7250fa44cb6f593969ba869be803e7d03c80ec8
+ARG COMFY_KITCHEN_VERSION=0.2.26
 ARG COMFY_GGUF_REPOSITORY=https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git
 ARG COMFY_GGUF_COMMIT=39671fe73117ba97de7011e7e06e32599dcda06d
 ARG COMFY_NUNCHAKU_REPOSITORY=https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git
@@ -110,25 +116,39 @@ FROM python-base AS comfyui-deps
 
 # ComfyUI core and its Python dependencies are target-independent and stay
 # ahead of local source COPY instructions for Docker cache reuse.
+ARG COMFYUI_REPOSITORY
+ARG COMFYUI_COMMIT
+ARG COMFYUI_FRONTEND_VERSION
+ARG COMFYUI_WORKFLOW_TEMPLATES_VERSION
+ARG COMFYUI_MANAGER_VERSION
+
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm && \
     git clone --filter=blob:none --no-checkout \
-        https://github.com/comfyanonymous/ComfyUI.git && \
+        "${COMFYUI_REPOSITORY}" ComfyUI && \
     git -C ComfyUI fetch --depth 1 origin \
-        bb131be9e83d2f773c90f1d6f1e4b248a498c8c5 && \
+        "${COMFYUI_COMMIT}" && \
     git -C ComfyUI checkout --detach FETCH_HEAD && \
-    pip install -r /llm/ComfyUI/requirements.txt
+    grep -Ev \
+        '^(comfyui-frontend-package|comfyui-workflow-templates)==' \
+        /llm/ComfyUI/requirements.txt \
+        > /tmp/comfyui-requirements.txt && \
+    grep -qx \
+        "comfyui_manager==${COMFYUI_MANAGER_VERSION}" \
+        /llm/ComfyUI/manager_requirements.txt && \
+    pip install \
+        -r /tmp/comfyui-requirements.txt \
+        "comfyui-frontend-package==${COMFYUI_FRONTEND_VERSION}" \
+        "comfyui-workflow-templates==${COMFYUI_WORKFLOW_TEMPLATES_VERSION}" \
+        "comfyui-manager==${COMFYUI_MANAGER_VERSION}"
 
-# Pin every default custom node to an exact accepted revision. These stable
-# remote-source layers stay ahead of all frequently edited local native sources.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    cd /llm/ComfyUI/custom_nodes && \
-    git clone --filter=blob:none --no-checkout \
-        https://github.com/ltdrdata/ComfyUI-Manager.git comfyui-manager && \
-    git -C comfyui-manager fetch --depth 1 origin \
-        7955e638db7d4a4b8bf7a614e724a2013b83dfd7 && \
-    git -C comfyui-manager checkout --detach FETCH_HEAD && \
-    pip install -r comfyui-manager/requirements.txt
+# ComfyUI v0.30 integrates Node Manager through the versioned Python package
+# above. Do not also clone the legacy ComfyUI-Manager custom node: loading both
+# creates two manager boundaries and makes missing-node behavior dependent on
+# startup flags rather than the pinned v0.30 package contract.
+
+# Pin every remaining default custom node to an exact accepted revision. These
+# stable remote-source layers stay ahead of frequently edited native sources.
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/ComfyUI/custom_nodes && \
@@ -260,6 +280,7 @@ FROM comfyui-deps AS builder-comfyui
 ARG IMAGE_TAG
 ARG XPU_TARGET
 ARG MAX_JOBS
+ARG COMFYUI_VERSION
 ARG COMFY_KITCHEN_VERSION
 
 ENV TORCH_XPU_ARCH_LIST=${XPU_TARGET} \
@@ -294,6 +315,13 @@ RUN cd /llm/ComfyUI/custom_nodes/ComfyUI-OmniXPU && \
     git -c user.name="llm-scaler" -c user.email="noreply@intel.com" \
         commit --allow-empty -m "ComfyUI-OmniXPU ${IMAGE_TAG}"
 
+# Preserve the complete installed dependency snapshot used by image
+# validation. This records transitive ComfyUI and custom-node packages in
+# addition to the explicitly versioned frontend/templates/manager boundary.
+RUN mkdir -p /llm/manifests && \
+    pip freeze --all | LC_ALL=C sort \
+        > /llm/manifests/comfyui-python-freeze.txt
+
 # Retain project sources needed for in-container development. The focused image
 # intentionally relies on ComfyUI's Template Browser instead of bundled
 # workflow/input snapshots.
@@ -311,6 +339,11 @@ FROM builder-comfyui AS runtime-comfyui
 ARG XPU_TARGET
 ARG IMAGE_TAG
 ARG SYCL_TLA_COMMIT
+ARG COMFYUI_COMMIT
+ARG COMFYUI_VERSION
+ARG COMFYUI_FRONTEND_VERSION
+ARG COMFYUI_WORKFLOW_TEMPLATES_VERSION
+ARG COMFYUI_MANAGER_VERSION
 ARG COMFY_KITCHEN_COMMIT
 ARG COMFY_KITCHEN_VERSION
 ARG COMFY_GGUF_COMMIT
@@ -319,8 +352,9 @@ ARG COMFY_NUNCHAKU_VERSION
 ARG LLM_SCALER_SOURCE_REVISION
 ARG LLM_SCALER_SOURCE_DIRTY
 
-RUN cp /opt/intel/oneapi/compiler/latest/lib/libsycl-native-*.spv \
-    /usr/local/lib/
+RUN mkdir -p /llm/ComfyUI/user && \
+    cp /opt/intel/oneapi/compiler/latest/lib/libsycl-native-*.spv \
+        /usr/local/lib/
 
 LABEL org.opencontainers.image.version="${IMAGE_TAG}" \
       org.opencontainers.image.revision="${LLM_SCALER_SOURCE_REVISION}" \
@@ -328,6 +362,11 @@ LABEL org.opencontainers.image.version="${IMAGE_TAG}" \
       com.intel.omni.xpu-target="${XPU_TARGET}" \
       com.intel.omni.llm-scaler.source-dirty="${LLM_SCALER_SOURCE_DIRTY}" \
       com.intel.omni.sycl-tla.revision="${SYCL_TLA_COMMIT}" \
+      com.intel.omni.comfyui.version="${COMFYUI_VERSION}" \
+      com.intel.omni.comfyui.revision="${COMFYUI_COMMIT}" \
+      com.intel.omni.comfyui.frontend.version="${COMFYUI_FRONTEND_VERSION}" \
+      com.intel.omni.comfyui.workflow-templates.version="${COMFYUI_WORKFLOW_TEMPLATES_VERSION}" \
+      com.intel.omni.comfyui.manager.version="${COMFYUI_MANAGER_VERSION}" \
       com.intel.omni.comfy-kitchen.version="${COMFY_KITCHEN_VERSION}" \
       com.intel.omni.comfy-kitchen.revision="${COMFY_KITCHEN_COMMIT}" \
       com.intel.omni.comfy-gguf.revision="${COMFY_GGUF_COMMIT}" \
@@ -340,6 +379,11 @@ ENV OMNIXPU_INTERPOLATE_FIX=0 \
     OMNI_IMAGE_XPU_TARGET="${XPU_TARGET}" \
     OMNI_LLM_SCALER_SOURCE_REVISION="${LLM_SCALER_SOURCE_REVISION}" \
     OMNI_LLM_SCALER_SOURCE_DIRTY="${LLM_SCALER_SOURCE_DIRTY}" \
+    OMNI_COMFYUI_VERSION="${COMFYUI_VERSION}" \
+    OMNI_COMFYUI_REVISION="${COMFYUI_COMMIT}" \
+    OMNI_COMFYUI_FRONTEND_VERSION="${COMFYUI_FRONTEND_VERSION}" \
+    OMNI_COMFYUI_WORKFLOW_TEMPLATES_VERSION="${COMFYUI_WORKFLOW_TEMPLATES_VERSION}" \
+    OMNI_COMFYUI_MANAGER_VERSION="${COMFYUI_MANAGER_VERSION}" \
     OMNI_COMFY_KITCHEN_VERSION="${COMFY_KITCHEN_VERSION}" \
     OMNI_COMFY_KITCHEN_REVISION="${COMFY_KITCHEN_COMMIT}" \
     OMNI_COMFY_GGUF_REVISION="${COMFY_GGUF_COMMIT}" \

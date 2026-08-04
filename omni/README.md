@@ -72,7 +72,8 @@ docker run --rm -it \
 ```
 
 Open `http://127.0.0.1:8188`. Additional ComfyUI arguments can be appended to
-the command.
+the command. The entrypoint enables ComfyUI v0.30's integrated Node Manager;
+the matching `comfyui-manager` Python package is installed in the image.
 
 The entrypoint reserves 4 GiB of XPU memory by default so a resident diffusion
 model can be offloaded before an XPU text encoder is executed again. Override
@@ -95,10 +96,11 @@ see [ComfyUI usage](docs/COMFYUI.md).
 
 The focused image contains:
 
-- a pinned upstream ComfyUI checkout;
+- upstream [ComfyUI v0.30.0](https://github.com/Comfy-Org/ComfyUI/releases/tag/v0.30.0),
+  pinned to `b1693ecba9f5b65f8c80ab36b195ab963ec92413`;
 - `omni_xpu_kernel`, built for the selected Torch minor and XPU target;
-- `comfy-kitchen==0.2.18` from the XPU-enabled
-  [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/c7ae07e5317d4a073562e278a41d98f05a4fe109),
+- `comfy-kitchen==0.2.26` from the XPU-enabled
+  [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/f7250fa44cb6f593969ba869be803e7d03c80ec8),
   including the managed GGUF and Nunchaku W4A16 routes;
 - [`ComfyUI-GGUF-XPU`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
   with GGUF, SentencePiece, and Protobuf dependencies installed from the same
@@ -106,8 +108,10 @@ The focused image contains:
 - [`ComfyUI-nunchaku-XPU==1.2.1+xpu.3`](https://github.com/xiangyuT/ComfyUI-nunchaku-XPU/commit/5cf4fa9886f45abff102d1dd91af5247b4950148),
   with its `nunchaku_torch` runtime bundled in the same pinned checkout;
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md);
-- pinned ComfyUI Manager, VideoHelperSuite, Easy-Use, KJNodes, CacheDiT, and
-  ControlNet auxiliary nodes.
+- ComfyUI v0.30 integrated Node Manager plus pinned VideoHelperSuite,
+  Easy-Use, KJNodes, CacheDiT, and ControlNet auxiliary nodes;
+- an exact installed Python dependency snapshot at
+  `/llm/manifests/comfyui-python-freeze.txt`.
 
 The focused image does not include Xinference, SGLang Diffusion, the disabled
 audio/3D node bundle, repository workflow snapshots, or example input files.
