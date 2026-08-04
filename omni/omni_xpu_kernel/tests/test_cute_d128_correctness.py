@@ -184,6 +184,54 @@ def test_cute_d128_bmg_matches_minimax_h3_h56_s388_mixed_layout():
     assert float(difference.max().item()) <= 0.0078125
 
 
+@pytest.mark.parametrize("contract", ["dense_self", "qkv_backed_cross"])
+@pytest.mark.skipif(
+    not has_bmg_cute(), reason="BMG CUTE D128 sidecar unavailable"
+)
+def test_cute_d128_bmg_h56_mmak16_policy_keeps_generic_contracts(contract):
+    from omni_xpu_kernel import cute
+
+    if not cute.supports_d128_bhld():
+        pytest.skip("D128 BHLD attention capability is unavailable")
+
+    torch.xpu.manual_seed_all(20260804)
+    if contract == "dense_self":
+        q = torch.randn(
+            (1, 56, 33, 128), device="xpu", dtype=torch.bfloat16
+        )
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+    else:
+
+        def split_qkv(sequence):
+            qkv = torch.randn(
+                (sequence, 3 * 56 * 128),
+                device="xpu",
+                dtype=torch.bfloat16,
+            )
+            return tuple(
+                tensor.view(sequence, 56, 128).transpose(0, 1).unsqueeze(0)
+                for tensor in qkv.split(56 * 128, dim=-1)
+            )
+
+        q, _, _ = split_qkv(33)
+        _, k, v = split_qkv(31)
+
+    actual = cute.sdp_bhld_d128(q, k, v)
+    expected = F.scaled_dot_product_attention(q, k, v)
+
+    assert actual.shape == q.shape
+    expected_stride = (
+        q.stride()
+        if contract == "dense_self"
+        else (33 * 56 * 128, 128, 56 * 128, 1)
+    )
+    assert actual.stride() == expected_stride
+    assert torch.isfinite(actual).all()
+    difference = (actual.float() - expected.float()).abs()
+    assert float(difference.max().item()) <= 0.0078125
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["packed_bhld", "blhd_backed"])
 @pytest.mark.parametrize(

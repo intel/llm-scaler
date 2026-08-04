@@ -250,3 +250,78 @@ def test_h3_packed_qkv_partial_rms_rope_inplace():
     assert k_out.data_ptr() == k_pointer
     torch.testing.assert_close(q_out, q_expected, rtol=0.02, atol=0.02)
     torch.testing.assert_close(k_out, k_expected, rtol=0.02, atol=0.02)
+
+
+@pytest.mark.parametrize("sequence", [31, 388, 1025])
+def test_h3_bmg_bf16_scale_cached_rms_rope_matches_generic(sequence):
+    if not torch.xpu.is_available():
+        pytest.skip("XPU is unavailable")
+    if omni_xpu_kernel.core_aot_target() != "bmg":
+        pytest.skip("BMG-specific MiniMax H3 RMS-RoPE route")
+
+    heads, head_dim, rot_dim = 56, 128, 96
+    inner = heads * head_dim
+    torch.xpu.manual_seed_all(20260804 + sequence)
+    packed = torch.randn(
+        sequence,
+        3 * inner,
+        device="xpu",
+        dtype=torch.bfloat16,
+    )
+    candidate_packed = packed.clone()
+    generic_packed = packed.clone()
+
+    def qk_views(storage):
+        q = storage[:, :inner].view(1, sequence, heads, head_dim)
+        k = storage[:, inner : 2 * inner].view(
+            1, sequence, heads, head_dim
+        )
+        return q, k
+
+    candidate_q, candidate_k = qk_views(candidate_packed)
+    generic_q, generic_k = qk_views(generic_packed)
+    freqs = torch.randn(
+        1,
+        sequence,
+        1,
+        rot_dim // 2,
+        2,
+        2,
+        device="xpu",
+        dtype=torch.bfloat16,
+    )
+    q_scale = torch.linspace(
+        0.75, 1.25, head_dim, device="xpu", dtype=torch.bfloat16
+    )
+    k_scale = torch.linspace(
+        1.25, 0.75, head_dim, device="xpu", dtype=torch.bfloat16
+    )
+    q_pointer, k_pointer = candidate_q.data_ptr(), candidate_k.data_ptr()
+
+    candidate_q, candidate_k = rotary.rms_kitchen_rope_split_half_(
+        candidate_q,
+        candidate_k,
+        freqs,
+        q_scale,
+        k_scale,
+        epsilon=1e-5,
+        rot_dim=rot_dim,
+    )
+    # FP32 scales deliberately select the generic path while preserving the
+    # exact values represented by the workflow's BF16 RMSNorm weights.
+    generic_q, generic_k = rotary.rms_kitchen_rope_split_half_(
+        generic_q,
+        generic_k,
+        freqs,
+        q_scale.float(),
+        k_scale.float(),
+        epsilon=1e-5,
+        rot_dim=rot_dim,
+    )
+
+    assert candidate_q.data_ptr() == q_pointer
+    assert candidate_k.data_ptr() == k_pointer
+    assert torch.isfinite(candidate_q).all()
+    assert torch.isfinite(candidate_k).all()
+    torch.testing.assert_close(candidate_q, generic_q, rtol=0, atol=0)
+    torch.testing.assert_close(candidate_k, generic_k, rtol=0, atol=0)

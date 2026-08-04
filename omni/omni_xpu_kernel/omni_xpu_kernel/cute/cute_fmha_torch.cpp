@@ -412,6 +412,14 @@ at::Tensor sdp_wan22_cross(
 #endif
 
 #if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
+bool is_minimax_h3_h56_tensor_layout(
+    const at::Tensor& tensor, int64_t B, int64_t H, int64_t D) {
+  return B == 1 && H == 56 && D == 128 && tensor.stride(0) > 0 &&
+      tensor.stride(1) == D &&
+      (tensor.stride(2) == H * D || tensor.stride(2) == 3 * H * D) &&
+      tensor.stride(3) == 1;
+}
+
 bool is_supported_bhld_layout(
     const at::Tensor& tensor, int64_t B, int64_t H, int64_t L, int64_t D) {
   if (tensor.stride(3) != 1) {
@@ -423,14 +431,33 @@ bool is_supported_bhld_layout(
   const bool blhd_backed =
       tensor.stride(1) == D && tensor.stride(2) == H * D;
   const bool minimax_h3_qkv_backed =
-      B == 1 && H == 56 && D == 128 && tensor.stride(0) > 0 &&
-      tensor.stride(1) == D &&
-      (tensor.stride(2) == H * D || tensor.stride(2) == 3 * H * D);
+      is_minimax_h3_h56_tensor_layout(tensor, B, H, D);
   return (dense_batch_stride && (packed_bhld || blhd_backed)) ||
       minimax_h3_qkv_backed;
 }
 
 #if defined(OMNI_XPU_ARCH_BMG)
+bool use_minimax_h3_h56_mmak16(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    int64_t B, int64_t H, int64_t Lq, int64_t Lkv, int64_t D) {
+  if (Lq != Lkv ||
+      !is_minimax_h3_h56_tensor_layout(q, B, H, D) ||
+      !is_minimax_h3_h56_tensor_layout(k, B, H, D) ||
+      !is_minimax_h3_h56_tensor_layout(v, B, H, D)) {
+    return false;
+  }
+
+  // Dense BLHD-backed H56 tensors also satisfy the accepted layout contract.
+  // Select the MiniMax-specific tile only when at least one operand still
+  // carries the interleaved QKV backing stride.  This covers the main H3
+  // Q/K/V views and the token-refiner mixed layout without changing the
+  // platform-wide policy for unrelated dense H56 attention.
+  const int64_t qkv_sequence_stride = 3 * H * D;
+  return q.stride(2) == qkv_sequence_stride ||
+      k.stride(2) == qkv_sequence_stride ||
+      v.stride(2) == qkv_sequence_stride;
+}
+
 at::Tensor sdp_bhld_d128(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
   TORCH_CHECK(
@@ -481,6 +508,16 @@ at::Tensor sdp_bhld_d128(
         v.stride(2), v.stride(1), v.stride(0),
         output.stride(2), output.stride(1), output.stride(0));
   } else if (q.scalar_type() == at::kBFloat16) {
+    if (use_minimax_h3_h56_mmak16(q, k, v, B, H, Lq, Lkv, D)) {
+      run_d128_tile<cutlass::bfloat16_t, 0, 0, 0, 16>(
+          q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(),
+          B, H, Lq, Lkv, D, scale,
+          q.stride(2), q.stride(1), q.stride(0),
+          k.stride(2), k.stride(1), k.stride(0),
+          v.stride(2), v.stride(1), v.stride(0),
+          output.stride(2), output.stride(1), output.stride(0));
+      return output;
+    }
     run_d128_tile<cutlass::bfloat16_t>(
         q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(),
         B, H, Lq, Lkv, D, scale,

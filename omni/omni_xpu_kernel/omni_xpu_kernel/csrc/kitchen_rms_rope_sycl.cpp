@@ -14,6 +14,15 @@ namespace {
 
 constexpr int64_t RMS_ROPE_WG = 64;
 
+#if defined(OMNI_XPU_ARCH_BMG)
+constexpr int64_t H3_HEADS = 56;
+constexpr int64_t H3_HEAD_DIM = 128;
+constexpr int64_t H3_ROT_DIM = 96;
+constexpr int64_t H3_ROTARY_PAIRS = H3_ROT_DIM / 2;
+constexpr int64_t H3_PACKED_SEQUENCE_STRIDE =
+    3 * H3_HEADS * H3_HEAD_DIM;
+#endif
+
 struct Tensor4Meta {
     int64_t n0;
     int64_t n1;
@@ -124,6 +133,143 @@ void check_freqs(
     TORCH_CHECK(freqs.size(3) == 1 || freqs.size(3) >= rot_dim / 2,
                 "freqs_cis does not contain enough rotary pairs");
 }
+
+#if defined(OMNI_XPU_ARCH_BMG)
+bool is_minimax_h3_rms_rope_contract(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& freqs,
+    const torch::Tensor& q_scale,
+    const torch::Tensor& k_scale,
+    int64_t rot_dim,
+    bool split_half,
+    bool inplace) {
+    if (!split_half || !inplace ||
+        q.scalar_type() != torch::kBFloat16 ||
+        k.scalar_type() != torch::kBFloat16 ||
+        freqs.scalar_type() != torch::kBFloat16 ||
+        q_scale.scalar_type() != torch::kBFloat16 ||
+        k_scale.scalar_type() != torch::kBFloat16 ||
+        q.sizes() != k.sizes() || q.size(0) != 1 || q.size(1) < 1 ||
+        q.size(2) != H3_HEADS || q.size(3) != H3_HEAD_DIM ||
+        q.stride(0) <= 0 || k.stride(0) <= 0 ||
+        q.stride(1) != H3_PACKED_SEQUENCE_STRIDE ||
+        k.stride(1) != H3_PACKED_SEQUENCE_STRIDE ||
+        q.stride(2) != H3_HEAD_DIM || k.stride(2) != H3_HEAD_DIM ||
+        q.stride(3) != 1 || k.stride(3) != 1 ||
+        rot_dim != H3_ROT_DIM ||
+        !q_scale.is_contiguous() || !k_scale.is_contiguous()) {
+        return false;
+    }
+    return freqs.is_contiguous() && freqs.size(0) == 1 &&
+        freqs.size(1) == q.size(1) && freqs.size(2) == 1 &&
+        freqs.size(3) == H3_ROTARY_PAIRS && freqs.size(4) == 2 &&
+        freqs.size(5) == 2;
+}
+
+void launch_minimax_h3_rms_rope(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& freqs,
+    const torch::Tensor& q_scale,
+    const torch::Tensor& k_scale,
+    float epsilon) {
+    const auto* q_ptr = reinterpret_cast<const bf16*>(q.data_ptr());
+    const auto* k_ptr = reinterpret_cast<const bf16*>(k.data_ptr());
+    const auto* f_ptr = reinterpret_cast<const bf16*>(freqs.data_ptr());
+    const auto* qs_ptr = reinterpret_cast<const bf16*>(q_scale.data_ptr());
+    const auto* ks_ptr = reinterpret_cast<const bf16*>(k_scale.data_ptr());
+    auto* qo_ptr = reinterpret_cast<bf16*>(q.data_ptr());
+    auto* ko_ptr = reinterpret_cast<bf16*>(k.data_ptr());
+    const int64_t rows_per_operand = q.size(1) * H3_HEADS;
+    const int64_t total_rows = 2 * rows_per_operand;
+
+    auto cgf = [&](sycl::handler& handler) {
+        sycl::local_accessor<float, 1> partial(
+            sycl::range<1>(RMS_ROPE_WG), handler);
+        sycl::local_accessor<float, 1> pair_second(
+            sycl::range<1>(H3_ROTARY_PAIRS), handler);
+        handler.parallel_for(
+            sycl::nd_range<1>(
+                sycl::range<1>(
+                    static_cast<size_t>(total_rows * RMS_ROPE_WG)),
+                sycl::range<1>(RMS_ROPE_WG)),
+            [=](sycl::nd_item<1> item) {
+                const int64_t local = item.get_local_id(0);
+                const int64_t global_row = item.get_group(0);
+                const bool is_key = global_row >= rows_per_operand;
+                const int64_t row = is_key
+                    ? global_row - rows_per_operand
+                    : global_row;
+                const int64_t token = row / H3_HEADS;
+                const int64_t head = row - token * H3_HEADS;
+                const int64_t base =
+                    token * H3_PACKED_SEQUENCE_STRIDE + head * H3_HEAD_DIM;
+                const bf16* source = is_key ? k_ptr : q_ptr;
+                bf16* destination = is_key ? ko_ptr : qo_ptr;
+                const bf16* scale = is_key ? ks_ptr : qs_ptr;
+
+                // Keep the generic path's exact reduction partition while
+                // retaining both input values in registers. Only the 48
+                // split-half partners cross work-items through SLM, so the
+                // normalization/rotation pass does not reread Q/K globally.
+                const float value0 = static_cast<float>(source[base + local]);
+                const float value1 = static_cast<float>(
+                    source[base + local + RMS_ROPE_WG]);
+                float square_sum = value0 * value0;
+                square_sum += value1 * value1;
+                partial[local] = square_sum;
+                if (local >= H3_ROTARY_PAIRS) {
+                    pair_second[local - H3_ROTARY_PAIRS] = value0;
+                } else if (local < 32) {
+                    pair_second[16 + local] = value1;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int64_t width = RMS_ROPE_WG / 2; width > 0; width /= 2) {
+                    if (local < width) {
+                        partial[local] += partial[local + width];
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+                const float inverse_rms =
+                    sycl::rsqrt(partial[0] / H3_HEAD_DIM + epsilon);
+
+                if (local < H3_ROTARY_PAIRS) {
+                    const int64_t col0 = local;
+                    const int64_t col1 = H3_ROTARY_PAIRS + local;
+                    const bf16 normalized0 = static_cast<bf16>(
+                        value0 * inverse_rms *
+                        static_cast<float>(scale[col0]));
+                    const bf16 normalized1 = static_cast<bf16>(
+                        pair_second[local] * inverse_rms *
+                        static_cast<float>(scale[col1]));
+                    const float rotated0 = static_cast<float>(normalized0);
+                    const float rotated1 = static_cast<float>(normalized1);
+                    const int64_t freq_base =
+                        token * H3_ROTARY_PAIRS * 4 + local * 4;
+                    const float f00 = static_cast<float>(f_ptr[freq_base]);
+                    const float f01 = static_cast<float>(f_ptr[freq_base + 1]);
+                    const float f10 = static_cast<float>(f_ptr[freq_base + 2]);
+                    const float f11 = static_cast<float>(f_ptr[freq_base + 3]);
+                    destination[base + col0] = static_cast<bf16>(
+                        f00 * rotated0 + f01 * rotated1);
+                    destination[base + col1] = static_cast<bf16>(
+                        f10 * rotated0 + f11 * rotated1);
+                }
+
+                if (local >= H3_ROT_DIM - RMS_ROPE_WG) {
+                    const int64_t col = RMS_ROPE_WG + local;
+                    destination[base + col] = static_cast<bf16>(
+                        value1 * inverse_rms *
+                        static_cast<float>(scale[col]));
+                }
+            });
+    };
+    utils::submit_kernel(
+        cgf, q.device(), "kitchen_rms_rope_h3_cached_input_bmg");
+}
+#endif
 
 template <typename InputT, typename FreqT, bool SplitHalf, bool Pair>
 void launch_rms_rope(
@@ -368,11 +514,21 @@ std::tuple<torch::Tensor, torch::Tensor> rms_kitchen_rope(
     check_freqs(k, freqs_cis, rot_dim);
     check_scale(q_scale, q, "q_scale");
     check_scale(k_scale, k, "k_scale");
-    q_scale = q_scale.to(torch::kFloat32).contiguous();
-    k_scale = k_scale.to(torch::kFloat32).contiguous();
 
     auto q_out = inplace ? q : torch::empty(q.sizes(), q.options());
     auto k_out = inplace ? k : torch::empty(k.sizes(), k.options());
+#if defined(OMNI_XPU_ARCH_BMG)
+    if (is_minimax_h3_rms_rope_contract(
+            q, k, freqs_cis, q_scale, k_scale, rot_dim,
+            split_half, inplace)) {
+        launch_minimax_h3_rms_rope(
+            q, k, freqs_cis, q_scale, k_scale,
+            static_cast<float>(epsilon));
+        return {q_out, k_out};
+    }
+#endif
+    q_scale = q_scale.to(torch::kFloat32).contiguous();
+    k_scale = k_scale.to(torch::kFloat32).contiguous();
     if (split_half) {
         dispatch_input<true, true>(
             q, k, freqs_cis, q_scale, k_scale, q_out, k_out,
