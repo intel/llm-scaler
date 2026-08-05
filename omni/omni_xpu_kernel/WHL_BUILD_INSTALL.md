@@ -9,7 +9,7 @@
 Python 3.13.12
 PyTorch 2.12.0+xpu
 Intel oneAPI DPC++/C++ Compiler 2025.3.3
-oneDNN 2025.3.0 Python package / oneDNN 3.9.1 native API
+oneDNN 3.9.1 native API/runtime（由 Windows wheel 内置）
 Intel Arc Pro B70 / intel_gpu_bmg_g31
 OMNI_XPU_DEVICE=bmg
 Windows wheel tag: cp313-cp313-win_amd64
@@ -35,7 +35,7 @@ Portable 只用于最终安装和运行测试，避免修改其他项目的 Pyth
 | Visual Studio Build Tools 2022 | `17.14.36` | 安装 `Desktop development with C++`；参见 [Microsoft C++ Build Tools 安装文档](https://learn.microsoft.com/en-us/cpp/overview/acquire-msvc) |
 | MSVC v143 x64/x86 | `14.42.34433`，`cl 19.42.34444` | 本次构建显式使用 `-vcvars_ver=14.42`；工作负载组件见 [Microsoft Build Tools component IDs](https://learn.microsoft.com/en-us/visualstudio/install/workload-component-id-vs-build-tools) |
 | Intel oneAPI DPC++/C++ Compiler | `2025.3.3`，build `20260319` | [编译器下载页](https://www.intel.com/content/www/us/en/developer/tools/oneapi/dpc-compiler-download.html)；[2025 release notes](https://www.intel.com/content/www/us/en/developer/articles/release-notes/oneapi-dpcpp/2025.html) |
-| Intel oneAPI oneDNN development install | `2025.3` | 必须包含 oneDNN `3.9.1` 的头文件和 `dnnl.lib`；可随 [Intel oneAPI Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/oneapi-toolkit.html) 安装 |
+| Intel oneAPI oneDNN development install | `2025.3` | 必须包含 oneDNN `3.9.1` 的头文件、`dnnl.lib`、`dnnl.dll` 和 redistribution notices；可随 [Intel oneAPI Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/oneapi-toolkit.html) 安装 |
 | Windows SDK NuGet package | `10.0.26100.3916` | NuGet 包内头文件版本为 `10.0.26100.0`；仅在系统没有 Windows SDK/UCRT 时需要项目内 fallback |
 
 本次使用的三个 Windows SDK NuGet 包：
@@ -57,17 +57,17 @@ NuGet fallback。
 | setuptools | `78.1.0` | wheel 构建后端；[PyPI](https://pypi.org/project/setuptools/78.1.0/) |
 | wheel | `0.47.0` | wheel 打包；[PyPI](https://pypi.org/project/wheel/0.47.0/) |
 | torch | `2.12.0+xpu` | 编译所针对的原生 ABI；[官方 XPU wheel index](https://download.pytorch.org/whl/xpu/torch/)、[PyTorch Intel GPU 指南](https://docs.pytorch.org/docs/stable/notes/get_start_xpu.html) |
-| onednn | `2025.3.0` | oneDNN Windows 运行包；[PyPI](https://pypi.org/project/onednn/2025.3.0/) |
-| onednn-devel | `2025.3.0` | 记录并锁定开发包版本；[PyPI](https://pypi.org/project/onednn-devel/2025.3.0/) |
 | numpy | `2.5.1` | 测试环境数值依赖；[PyPI](https://pypi.org/project/numpy/2.5.1/) |
 | pytest | `9.1.1` | 可选，运行源码测试；[PyPI](https://pypi.org/project/pytest/9.1.1/) |
 
-Windows 上的 `onednn-devel` wheel 当前不能替代 oneAPI oneDNN development
-install：构建仍然需要系统 oneAPI 目录中的 `oneapi/dnnl/dnnl.hpp` 和
-`dnnl.lib`。`setup.py` 会校验原生头文件版本为 oneDNN `3.9.1`。
+当前验证到的 Windows `onednn==2025.3.0`/`onednn-devel==2025.3.0`
+安装只包含 metadata、文档或许可证，不提供构建所需的 `dnnl.lib` 和运行时
+`dnnl.dll`。构建仍然需要同一个 oneAPI oneDNN development install 中的
+`oneapi/dnnl/dnnl.hpp`、`dnnl.lib` 和 `dnnl.dll`。`setup.py` 会校验三者对应
+oneDNN `3.9.1`，并把 DLL 和 redistribution notices 打进 Windows wheel。
 
-Torch/oneDNN 在本次解析出的关键原生传递依赖如下。通常不应逐项手工安装，
-而应让 `torch==2.12.0+xpu` 和 `onednn==2025.3.0` 解析它们：
+Torch XPU 在本次解析出的关键原生传递依赖如下。通常不应逐项手工安装，
+而应让 `torch==2.12.0+xpu` 解析它们：
 
 | 包 | 已验证版本 | 获取地址 |
 |---|---:|---|
@@ -93,8 +93,8 @@ Torch/oneDNN 在本次解析出的关键原生传递依赖如下。通常不应�
 | torch | `2.12.0+xpu` |
 | torchvision | `0.27.0+xpu` |
 | torchaudio | `2.11.0+xpu` |
-| onednn | `2025.3.0` |
-| omni-xpu-kernel | `0.1.0b9.dev0+torch212.bmg` |
+| onednn | `2025.3.0`（旧环境残留；新 Windows wheel 不依赖该包） |
+| omni-xpu-kernel | `0.1.0b9.dev1+torch212.bmg` |
 | comfy-kitchen | `0.2.26`，Intel XPU fork commit [`f7250fa4...`](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/f7250fa44cb6f593969ba869be803e7d03c80ec8) |
 | ComfyUI | `0.30.0`，commit [`b1693ecb...`](https://github.com/Comfy-Org/ComfyUI/commit/b1693ecba9f5b65f8c80ab36b195ab963ec92413) |
 | comfyui-frontend-package | `1.47.12` |
@@ -115,11 +115,16 @@ Torch 2.12 的导入测试通过，但 `omni_xpu_kernel` 本身不依赖 torchvi
 
 ## 2. Windows wheel 的组成与限制
 
-Windows 构建产出两个原生扩展：
+Windows 构建产出两个原生扩展，并把核心扩展直接依赖的 oneDNN runtime
+及其 redistribution notices 内置到同一个 wheel：
 
 ```text
 omni_xpu_kernel/_C.cp313-win_amd64.pyd
 omni_xpu_kernel/lgrf_uni/lgrf_sdp.cp313-win_amd64.pyd
+omni_xpu_kernel/.libs/dnnl.dll
+omni_xpu_kernel/.libs/onednn/LICENSE
+omni_xpu_kernel/.libs/onednn/THIRD-PARTY-PROGRAMS
+omni_xpu_kernel/.libs/onednn/VERSION
 ```
 
 - `_C` 包含 norm、FP8、GGUF、SVDQ、INT8、rotary 和 oneDNN 等核心算子。
@@ -164,8 +169,6 @@ $buildPython = Join-Path $buildRoot "venv\Scripts\python.exe"
     --index-url "https://download.pytorch.org/whl/xpu"
 
 & $buildPython -m pip install `
-    "onednn==2025.3.0" `
-    "onednn-devel==2025.3.0" `
     "numpy==2.5.1" `
     "pytest==9.1.1"
 ```
@@ -315,15 +318,19 @@ Torch XPU 头文件、库和版本。`--no-deps` 避免打包过程改变环境�
 
 ```text
 .venv-win-py313-torch212\wheelhouse\patched\
-  omni_xpu_kernel-0.1.0b9.dev0+torch212.bmg-cp313-cp313-win_amd64.whl
+  omni_xpu_kernel-0.1.0b9.dev1+torch212.bmg-cp313-cp313-win_amd64.whl
 ```
 
 已验证 artifact：
 
 ```text
-size:   2,676,579 bytes
-SHA256: E019D97E0AA71FBAE0DE54969C068D693A09D12A860B0C6A4D4246DE9476D7AD
+size:   25,185,658 bytes
+SHA256: E112C1720ACA4AF975501470A77F654656D6A4A3CF919A36A2EFBC8B1F4F0795
 ```
+
+体积增加来自 wheel 内置的 oneDNN `3.9.1` Windows runtime。构建只复制与
+已校验 `dnnl.lib` 同一个安装根下的 `bin\dnnl.dll`，不会把 Torch、SYCL、
+Unified Runtime 或完整 oneAPI SDK 重复打进 wheel。
 
 该 artifact 使用与 Linux 相同的 RMSNorm、LayerNorm 和 fused Add+RMSNorm
 GS dispatch ladder；Windows SDP loader 同时解析 sidecar 导出的 D64、D128
@@ -336,7 +343,7 @@ artifact 时，应使用上面的 `pip wheel` 命令。
 
 ```powershell
 $wheelPath = Join-Path $buildRoot `
-    "wheelhouse\patched\omni_xpu_kernel-0.1.0b9.dev0+torch212.bmg-cp313-cp313-win_amd64.whl"
+    "wheelhouse\patched\omni_xpu_kernel-0.1.0b9.dev1+torch212.bmg-cp313-cp313-win_amd64.whl"
 
 & $buildPython -m zipfile -l $wheelPath
 Get-FileHash -Algorithm SHA256 -LiteralPath $wheelPath
@@ -346,13 +353,17 @@ Get-FileHash -Algorithm SHA256 -LiteralPath $wheelPath
 
 ```text
 omni_xpu_kernel/_C.cp313-win_amd64.pyd
+omni_xpu_kernel/.libs/dnnl.dll
+omni_xpu_kernel/.libs/onednn/LICENSE
+omni_xpu_kernel/.libs/onednn/THIRD-PARTY-PROGRAMS
+omni_xpu_kernel/.libs/onednn/VERSION
 omni_xpu_kernel/lgrf_uni/lgrf_sdp.cp313-win_amd64.pyd
 omni_xpu_kernel/csrc/kitchen_rms_rope_sycl.cpp
-omni_xpu_kernel-0.1.0b9.dev0+torch212.bmg.dist-info/METADATA
+omni_xpu_kernel-0.1.0b9.dev1+torch212.bmg.dist-info/METADATA
 ```
 
-metadata 应包含精确的 `torch==2.12.0` 要求，以及 Windows x64 上的
-`onednn==2025.3.0` 条件依赖。
+metadata 应包含精确的 `torch==2.12.0` 要求。`onednn==2025.3.0` 只保留
+Linux x86_64 条件依赖，Windows 不再依赖不能提供 DLL 的 Python 包。
 
 ## 7. 安装到 ComfyUI Portable
 
@@ -380,10 +391,9 @@ $embeddedPython = Join-Path $portableRoot "python_embeded\python.exe"
 `omni_xpu_kernel` 的依赖；如果目标 Portable 不使用音频节点，可以不额外
 安装 torchaudio。
 
-安装 oneDNN runtime 和 wheel：
+安装 wheel；oneDNN runtime 已包含在 wheel 内：
 
 ```powershell
-& $embeddedPython -m pip install "onednn==2025.3.0"
 & $embeddedPython -m pip install --force-reinstall --no-deps $wheelPath
 & $embeddedPython -m pip check
 ```
@@ -544,9 +554,14 @@ test 证明 Portable 基础启动、设备发现和 H3 集成可加载；正式�
 set "DNNLROOT=%ProgramFiles(x86)%\Intel\oneAPI\dnnl\2025.3"
 dir "%DNNLROOT%\include\oneapi\dnnl\dnnl.hpp"
 dir "%DNNLROOT%\lib\dnnl.lib"
+dir "%DNNLROOT%\bin\dnnl.dll"
+dir "%DNNLROOT%\share\doc\dnnl\LICENSE"
+dir "%DNNLROOT%\share\doc\dnnl\THIRD-PARTY-PROGRAMS"
 ```
 
-不要混用不同版本的 oneDNN header、import library 和 runtime DLL。
+不要混用不同版本的 oneDNN header、import library 和 runtime DLL。非标准
+目录布局可以同时设置 `ONEDNN_INCLUDE`、`ONEDNN_LIB`、`ONEDNN_RUNTIME`，并
+用 `ONEDNN_LICENSE_DIR` 指向包含两个 notices 的目录。
 
 ### `c10::xpu::XPUStream` 等链接错误
 
@@ -567,7 +582,8 @@ Windows wheel 使用 ABI 后缀，例如
 1. Python tag 是否一致，例如目标必须能使用 `cp313`；
 2. Torch public version 是否为构建时的 `2.12.0`；
 3. wheel target 是否与设备一致，例如 B70 使用 `bmg`；
-4. `python_embeded\Library\bin`、`torch\lib` 和 oneDNN runtime DLL 是否可见；
+4. `omni_xpu_kernel\.libs\dnnl.dll`、`python_embeded\Library\bin` 和
+   `torch\lib` 是否可见；
 5. 测试 cwd 是否离开源码 checkout。
 
 ## 10. Torch 2.13 后续阶段

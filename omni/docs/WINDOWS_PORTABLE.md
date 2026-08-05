@@ -31,8 +31,8 @@ Windows 部署保留 Dockerfile 中的核心分层，但不复制 Linux-only 部
 
 | 层 | Windows 中的组件 | 责任 |
 |---|---|---|
-| XPU runtime | PyTorch XPU、oneDNN runtime | 设备、张量和 oneDNN/SYCL 运行库 |
-| Native kernel | `omni_xpu_kernel` wheel | norm、FP8、INT8、SVDQ、rotary、ESIMD SDP 等 |
+| XPU runtime | PyTorch XPU | 设备、张量以及 SYCL/UR/OpenMP 运行库 |
+| Native kernel | `omni_xpu_kernel` wheel（内置 oneDNN runtime） | norm、FP8、INT8、SVDQ、rotary、ESIMD SDP 等 |
 | Generic dispatch | `comfy-kitchen` XPU fork | 通用算子 API、capability、dispatch 和 eager fallback |
 | ComfyUI adapter | `ComfyUI-OmniXPU` custom node | attention、norm、FP8 model bridge 和 fused INT8 FFN 接入 |
 | Quantized adapters | `ComfyUI-GGUF-XPU`、`ComfyUI-nunchaku-XPU` | GGUF tensor/loader 与 bundled Nunchaku runtime；经 Kitchen/Omni 调用 XPU kernel |
@@ -60,8 +60,8 @@ SDP 仍可通过 `OMNI_ATTN_BACKEND=esimd` 显式启用，但不会被自动选�
 | torch | `2.12.0+xpu` |
 | torchvision | `0.27.0+xpu` |
 | torchaudio | 当前测试目录为 `2.11.0+xpu`；不是 Omni kernel 必需依赖 |
-| onednn Python runtime | `2025.3.0` |
-| omni-xpu-kernel | `0.1.0b9.dev0+torch212.bmg` |
+| onednn Python runtime | `2025.3.0`（旧环境残留；dev1 wheel 不再依赖） |
+| omni-xpu-kernel | `0.1.0b9.dev1+torch212.bmg` |
 | comfy-kitchen XPU fork | `0.2.26`，[`f7250fa4...`](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/f7250fa44cb6f593969ba869be803e7d03c80ec8) |
 | ComfyUI-GGUF-XPU | [`39671fe7...`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d)；`gguf 0.19.0` |
 | ComfyUI-nunchaku-XPU | `1.2.1+xpu.3`，[`5cf4fa98...`](https://github.com/xiangyuT/ComfyUI-nunchaku-XPU/commit/5cf4fa9886f45abff102d1dd91af5247b4950148) |
@@ -168,8 +168,6 @@ uv venv --seed --python 3.13.12 (Join-Path $buildRoot "venv")
     --index-url "https://download.pytorch.org/whl/xpu"
 
 & $buildPython -m pip install `
-    "onednn==2025.3.0" `
-    "onednn-devel==2025.3.0" `
     "numpy==2.5.1" `
     "pytest==9.1.1"
 
@@ -220,9 +218,9 @@ Architecture: intel_gpu_bmg_g31
 当前已验证输出：
 
 ```text
-omni_xpu_kernel-0.1.0b9.dev0+torch212.bmg-cp313-cp313-win_amd64.whl
-size:   2,676,579 bytes
-SHA256: E019D97E0AA71FBAE0DE54969C068D693A09D12A860B0C6A4D4246DE9476D7AD
+omni_xpu_kernel-0.1.0b9.dev1+torch212.bmg-cp313-cp313-win_amd64.whl
+size:   25,185,658 bytes
+SHA256: E112C1720ACA4AF975501470A77F654656D6A4A3CF919A36A2EFBC8B1F4F0795
 ```
 
 在 PowerShell 中取得实际 artifact，并检查 hash：
@@ -352,9 +350,11 @@ kernel wheel。
     --index-url "https://download.pytorch.org/whl/xpu" `
     "torch==2.12.0+xpu" `
     "torchvision==0.27.0+xpu"
-
-& $embeddedPython -m pip install "onednn==2025.3.0"
 ```
+
+Windows `omni_xpu_kernel` wheel 已内置构建时校验过的 oneDNN `3.9.1`
+runtime；不再另外安装 `onednn` Python 包。Torch XPU 提供其余 SYCL、UR、
+OpenMP 等运行库。
 
 `omni_xpu_kernel` 本身不依赖 torchvision 或 torchaudio。2026-07-29
 实际查询 XPU index 时，torchaudio 最新版仍是 `2.11.0+xpu`；当前 Portable
@@ -1178,7 +1178,7 @@ curl.exe --noproxy "*" `
 ComfyUI `0.28.0` 的实际 adapter 日志：
 
 ```text
-[OmniXPU] omni_xpu_kernel 0.1.0b9.dev0+torch212.bmg - available: sdp, norm, rotary, linear_fp8, int8
+[OmniXPU] omni_xpu_kernel 0.1.0b9.dev1+torch212.bmg - available: sdp, norm, rotary, linear_fp8, int8
 [OmniXPU] attention_adapter: skipped (OMNI_ATTN_BACKEND=torch (using PyTorch SDPA, no patch))
 [OmniXPU] rotary_adapter: applied
 [OmniXPU] norm: H120 FP16 native route enabled (target=bmg)
@@ -1230,7 +1230,7 @@ XPU memory management 处理。oneDNN JIT register 提示在更新前基线中�
 
 | Artifact | 身份 |
 |---|---|
-| Kernel wheel | 2,676,579 bytes；SHA256 `E019D97E...6D7AD` |
+| Kernel wheel | 25,185,658 bytes；SHA256 `E112C172...F0795` |
 | Kitchen wheel | 124,788 bytes；SHA256 `080810DB...EB89B` |
 
 Windows 实机结果：

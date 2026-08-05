@@ -38,7 +38,7 @@ Run the supplied acceptance script against the final image with the GPU device
 exposed:
 
 ```bash
-IMAGE=intel/llm-scaler-omni:0.1.0-b9-dev-comfyui-bmg
+IMAGE=intel/llm-scaler-omni:0.1.0-b9-dev1-comfyui-bmg
 
 docker run --rm \
     --device=/dev/dri \
@@ -57,7 +57,7 @@ Mount the existing ComfyUI model directory rather than copying models into the
 image:
 
 ```bash
-IMAGE=intel/llm-scaler-omni:0.1.0-b9-dev-comfyui-bmg
+IMAGE=intel/llm-scaler-omni:0.1.0-b9-dev1-comfyui-bmg
 COMFYUI_MODEL_DIR=/path/to/comfyui_models
 COMFYUI_OUTPUT_DIR=/path/to/comfyui_output
 

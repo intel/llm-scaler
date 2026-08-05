@@ -17,6 +17,7 @@ Supported platforms:
 
 import os
 import ctypes
+import hashlib
 import re
 import sys
 import subprocess
@@ -253,10 +254,28 @@ def find_onednn_library(lib_dir):
     return None
 
 
-def get_onednn_library_version(library):
-    if IS_WINDOWS:
+def find_windows_onednn_runtime(lib_dir, explicit_runtime=""):
+    """Find the dnnl.dll paired with the selected Windows import library."""
+    if not IS_WINDOWS:
         return None
 
+    lib_dir = Path(lib_dir)
+    candidates = []
+    if explicit_runtime:
+        candidates.append(Path(explicit_runtime))
+    candidates.extend(
+        [
+            lib_dir.parent / "bin" / "dnnl.dll",
+            lib_dir / "dnnl.dll",
+        ]
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def get_onednn_library_version(library):
     class DnnlVersion(ctypes.Structure):
         _fields_ = [
             ("major", ctypes.c_int),
@@ -274,26 +293,40 @@ def get_onednn_library_version(library):
 
 
 def get_onednn_paths():
-    """Select a matched oneDNN header/library pair, preferring pip packages."""
+    """Select matched oneDNN headers, import library, and runtime."""
     explicit_include = os.environ.get("ONEDNN_INCLUDE", "")
     explicit_lib = os.environ.get("ONEDNN_LIB", "")
+    explicit_runtime = os.environ.get("ONEDNN_RUNTIME", "")
     if bool(explicit_include) != bool(explicit_lib):
         raise RuntimeError("ONEDNN_INCLUDE and ONEDNN_LIB must be set together")
+    if explicit_runtime and not explicit_include:
+        raise RuntimeError(
+            "ONEDNN_RUNTIME may only be used with ONEDNN_INCLUDE and ONEDNN_LIB"
+        )
 
     candidates = []
     if explicit_include:
-        candidates.append((Path(explicit_include), Path(explicit_lib), "environment"))
+        candidates.append(
+            (
+                Path(explicit_include),
+                Path(explicit_lib),
+                explicit_runtime,
+                "environment",
+            )
+        )
 
     if IS_WINDOWS:
-        # The 2025.3 Windows pip package provides dnnl.dll/dnnl.lib but not the
-        # development headers, so retain the existing oneAPI source-build path.
+        # The 2025.3 Windows pip packages installed in the validated environment
+        # contain metadata/notices but no dnnl.lib or dnnl.dll. Keep this prefix
+        # candidate for distributions that do ship them, then fall back to the
+        # oneAPI development installation used by the Windows build.
         pip_include = Path(sys.prefix) / "Library" / "include"
         pip_lib = Path(sys.prefix) / "Library" / "lib"
     else:
         # onednn-devel and onednn install into the active Python prefix.
         pip_include = Path(sysconfig.get_path("data")) / "include"
         pip_lib = get_runtime_library_dir()
-    candidates.append((pip_include, pip_lib, "pip"))
+    candidates.append((pip_include, pip_lib, "", "pip"))
 
     if IS_WINDOWS:
         oneapi_roots = []
@@ -321,12 +354,19 @@ def get_onednn_paths():
             if normalized in seen_roots:
                 continue
             seen_roots.add(normalized)
-            candidates.append((root / "include", root / "lib", "oneAPI"))
+            candidates.append((root / "include", root / "lib", "", "oneAPI"))
 
-    for include_dir, lib_dir, source in candidates:
+    for include_dir, lib_dir, runtime_override, source in candidates:
         header = include_dir / "oneapi" / "dnnl" / "dnnl.hpp"
         library = find_onednn_library(lib_dir)
         if not header.is_file() or library is None:
+            continue
+        runtime_library = (
+            find_windows_onednn_runtime(lib_dir, runtime_override)
+            if IS_WINDOWS
+            else library
+        )
+        if runtime_library is None:
             continue
 
         header_version = get_onednn_header_version(include_dir)
@@ -337,26 +377,88 @@ def get_onednn_paths():
                 f"Unsupported oneDNN headers {actual} from {include_dir}; "
                 f"expected {expected} to match onednn==2025.3.0"
             )
-        library_version = get_onednn_library_version(library)
+        library_version = get_onednn_library_version(runtime_library)
         if library_version is not None and library_version != header_version:
             header_text = ".".join(map(str, header_version))
             library_text = ".".join(map(str, library_version))
             raise RuntimeError(
-                f"oneDNN header/library mismatch: headers are {header_text} from "
-                f"{include_dir}, library is {library_text} from {library}"
+                f"oneDNN header/runtime mismatch: headers are {header_text} from "
+                f"{include_dir}, runtime is {library_text} from {runtime_library}"
             )
-        return include_dir.resolve(), lib_dir.resolve(), library, source
+        return (
+            include_dir.resolve(),
+            lib_dir.resolve(),
+            library,
+            runtime_library,
+            source,
+        )
 
     if IS_WINDOWS:
         raise RuntimeError(
             "A matched oneDNN 3.9.1 development installation was not found. "
-            "Set ONEDNN_INCLUDE and ONEDNN_LIB to the same oneAPI installation."
+            "Set DNNLROOT to a complete oneAPI installation, or set "
+            "ONEDNN_INCLUDE, ONEDNN_LIB, and ONEDNN_RUNTIME to matched files."
         )
     raise RuntimeError(
         "oneDNN 3.9.1 headers and runtime were not found in the active Python "
         "prefix. Install onednn==2025.3.0 and onednn-devel==2025.3.0. "
         "For an explicit non-pip build, set both ONEDNN_INCLUDE and ONEDNN_LIB."
     )
+
+
+def find_onednn_notice_dir(runtime_library):
+    """Locate redistribution notices belonging to the selected oneDNN DLL."""
+    explicit = os.environ.get("ONEDNN_LICENSE_DIR", "")
+    runtime_root = Path(runtime_library).resolve().parent.parent
+    candidates = []
+    if explicit:
+        candidates.append(Path(explicit))
+    candidates.extend(
+        [
+            runtime_root / "share" / "doc" / "dnnl",
+            runtime_root / "share" / "doc" / "onednn",
+            Path(sys.prefix) / "Library" / "share" / "doc" / "onednn",
+        ]
+    )
+    required = ("LICENSE", "THIRD-PARTY-PROGRAMS")
+    for candidate in candidates:
+        if all((candidate / name).is_file() for name in required):
+            return candidate.resolve()
+    searched = ", ".join(os.fspath(path) for path in candidates)
+    raise RuntimeError(
+        "oneDNN redistribution notices were not found. Expected LICENSE and "
+        f"THIRD-PARTY-PROGRAMS in one of: {searched}. Set ONEDNN_LICENSE_DIR "
+        "when using a custom oneDNN installation."
+    )
+
+
+def bundle_windows_onednn_runtime(
+    output_path, runtime_library, notice_dir=None
+):
+    """Place the validated oneDNN runtime and notices beside the Windows pyd."""
+    if not IS_WINDOWS:
+        return
+
+    output_path = Path(output_path)
+    vendor_dir = output_path.parent / ".libs"
+    notice_target = vendor_dir / "onednn"
+    vendor_dir.mkdir(parents=True, exist_ok=True)
+    notice_target.mkdir(parents=True, exist_ok=True)
+
+    runtime_target = vendor_dir / "dnnl.dll"
+    shutil.copy2(runtime_library, runtime_target)
+    if notice_dir is None:
+        notice_dir = find_onednn_notice_dir(runtime_library)
+    for name in ("LICENSE", "THIRD-PARTY-PROGRAMS"):
+        shutil.copy2(notice_dir / name, notice_target / name)
+
+    digest = hashlib.sha256(runtime_target.read_bytes()).hexdigest()
+    version = ".".join(map(str, VALIDATED_ONEDNN_VERSION))
+    (notice_target / "VERSION").write_text(
+        f"oneDNN={version}\ndnnl.dll.sha256={digest}\n",
+        encoding="utf-8",
+    )
+    print(f"Bundled oneDNN runtime: {runtime_target}")
 
 
 def validate_torch_build(torch, torch_lib):
@@ -446,13 +548,27 @@ class ICPXBuildExt(build_ext):
         # The core extension directly uses oneDNN. Select and validate a
         # matched header/runtime pair instead of falling through to torch's
         # newer bundled headers and an unrelated system libdnnl.
-        onednn_include, onednn_lib, onednn_library, onednn_source = get_onednn_paths()
+        (
+            onednn_include,
+            onednn_lib,
+            onednn_library,
+            onednn_runtime_library,
+            onednn_source,
+        ) = get_onednn_paths()
         runtime_lib = get_runtime_library_dir().resolve()
         torch_runtime_lib = get_torch_runtime_library_dir().resolve()
         has_onednn = True
         print(f"oneDNN source: {onednn_source}")
         print(f"oneDNN include: {onednn_include}")
         print(f"oneDNN library: {onednn_library}")
+        print(f"oneDNN runtime: {onednn_runtime_library}")
+        onednn_notice_dir = (
+            find_onednn_notice_dir(onednn_runtime_library)
+            if IS_WINDOWS
+            else None
+        )
+        if onednn_notice_dir is not None:
+            print(f"oneDNN notices: {onednn_notice_dir}")
         
         if is_cute and IS_WINDOWS:
             # cute FMHA has no Windows build path (and is filtered out of
@@ -646,6 +762,8 @@ class ICPXBuildExt(build_ext):
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=get_compile_env(onednn_include if has_onednn else ""),
         )
         
@@ -653,6 +771,11 @@ class ICPXBuildExt(build_ext):
             print("STDOUT:", result.stdout)
             print("STDERR:", result.stderr)
             raise RuntimeError(f"Compilation failed with exit code {result.returncode}")
+
+        if IS_WINDOWS and ext.name == "omni_xpu_kernel._C":
+            bundle_windows_onednn_runtime(
+                output_path, onednn_runtime_library, onednn_notice_dir
+            )
         
         print(f"Successfully built {output_path}")
 
@@ -752,13 +875,19 @@ setup(
             "benchmarks.*",
         ]
     ),
+    package_data={
+        "omni_xpu_kernel": [
+            ".libs/*.dll",
+            ".libs/onednn/*",
+        ],
+    },
+    include_package_data=True,
     ext_modules=_ext_modules,
     cmdclass={"build_ext": ICPXBuildExt},
     python_requires=">=3.9",
     install_requires=[
         f"torch=={BUILD_TORCH_VERSION}",
         "onednn==2025.3.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
-        "onednn==2025.3.0; platform_system == 'Windows' and platform_machine == 'AMD64'",
     ],
     extras_require={
         "dev": [

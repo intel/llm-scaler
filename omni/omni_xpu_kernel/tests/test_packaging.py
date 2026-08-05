@@ -1,3 +1,4 @@
+import hashlib
 import os
 import subprocess
 import sys
@@ -13,8 +14,8 @@ from packaging.version import Version
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VERSION_FILE = PROJECT_ROOT / "omni_xpu_kernel" / "_version.py"
 PYPROJECT_FILE = PROJECT_ROOT / "pyproject.toml"
-IMAGE_VERSION = "0.1.0-b9-dev"
-BASE_VERSION = "0.1.0b9.dev0"
+IMAGE_VERSION = "0.1.0-b9-dev1"
+BASE_VERSION = "0.1.0b9.dev1"
 SUPPORTED_TORCH_MINORS = ("2.10", "2.11", "2.12")
 SUPPORTED_XPU_TARGETS = ("bmg", "ptl-h")
 VERSION_NAMESPACE = run_path(str(VERSION_FILE))
@@ -289,10 +290,63 @@ def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
     assert extensions["omni_xpu_kernel.lgrf_uni.lgrf_sdp"].sources
     assert f"torch=={TORCH_VERSION}" in captured["install_requires"]
     assert captured["version"] == PACKAGE_VERSION
-    assert any(
-        requirement.startswith("onednn==2025.3.0;")
+    onednn_requirements = [
+        requirement
         for requirement in captured["install_requires"]
+        if requirement.startswith("onednn==2025.3.0;")
+    ]
+    assert onednn_requirements == [
+        "onednn==2025.3.0; platform_system == 'Linux' and platform_machine == 'x86_64'"
+    ]
+    if sys.platform == "win32":
+        assert captured["package_data"]["omni_xpu_kernel"] == [
+            ".libs/*.dll",
+            ".libs/onednn/*",
+        ]
+
+
+def test_windows_onednn_runtime_bundle_contains_notices_and_hash(
+    monkeypatch, tmp_path
+):
+    import setuptools
+
+    monkeypatch.chdir(PROJECT_ROOT)
+    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
+    monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
+    namespace = run_path(
+        str(PROJECT_ROOT / "setup.py"), run_name="__onednn_bundle_test__"
     )
+    find_runtime = namespace["find_windows_onednn_runtime"]
+    bundle_runtime = namespace["bundle_windows_onednn_runtime"]
+    monkeypatch.setitem(find_runtime.__globals__, "IS_WINDOWS", True)
+
+    dnnl_root = tmp_path / "oneapi" / "dnnl" / "2025.3"
+    lib_dir = dnnl_root / "lib"
+    runtime = dnnl_root / "bin" / "dnnl.dll"
+    notices = dnnl_root / "share" / "doc" / "dnnl"
+    lib_dir.mkdir(parents=True)
+    runtime.parent.mkdir(parents=True)
+    notices.mkdir(parents=True)
+    (lib_dir / "dnnl.lib").write_bytes(b"import library")
+    runtime_bytes = b"validated oneDNN runtime"
+    runtime.write_bytes(runtime_bytes)
+    (notices / "LICENSE").write_text("license\n", encoding="utf-8")
+    (notices / "THIRD-PARTY-PROGRAMS").write_text(
+        "third party\n", encoding="utf-8"
+    )
+
+    assert find_runtime(lib_dir) == runtime.resolve()
+    output = tmp_path / "build" / "omni_xpu_kernel" / "_C.pyd"
+    bundle_runtime(output, runtime)
+
+    vendor = output.parent / ".libs"
+    assert (vendor / "dnnl.dll").read_bytes() == runtime_bytes
+    assert (vendor / "onednn" / "LICENSE").read_text(encoding="utf-8") == (
+        "license\n"
+    )
+    version = (vendor / "onednn" / "VERSION").read_text(encoding="utf-8")
+    assert "oneDNN=3.9.1" in version
+    assert hashlib.sha256(runtime_bytes).hexdigest() in version
 
 
 def test_bmg_cute_overlay_patches_private_header_copy(monkeypatch, tmp_path):

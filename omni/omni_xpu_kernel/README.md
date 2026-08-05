@@ -46,8 +46,8 @@ a version is not a validation claim. The generated wheel uses a PEP 440 local
 version such as:
 
 ```text
-omni_xpu_kernel-0.1.0b9.dev0+torch211.bmg
-omni_xpu_kernel-0.1.0b9.dev0+torch211.ptlh
+omni_xpu_kernel-0.1.0b9.dev1+torch211.bmg
+omni_xpu_kernel-0.1.0b9.dev1+torch211.ptlh
 ```
 
 Build and install a different wheel for every Torch/GPU pair. The wheel
@@ -111,6 +111,8 @@ be installed on PTL-H.
 - A packaging-supported PyTorch XPU minor: 2.10.x, 2.11.x, or 2.12.x
 - `onednn==2025.3.0` and `onednn-devel==2025.3.0` for the package's direct
   oneDNN calls on Linux
+- A matched oneAPI oneDNN 3.9.1 development installation on Windows; the
+  build vendors its `dnnl.dll` and redistribution notices into the wheel
 - Intel [`sycl-tla`](https://github.com/intel/sycl-tla) headers for the
   default Linux CUTE build
 

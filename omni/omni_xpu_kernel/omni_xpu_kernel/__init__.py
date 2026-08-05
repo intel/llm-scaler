@@ -18,6 +18,7 @@ Usage::
 
 import os
 import sys
+import ctypes
 from pathlib import Path
 
 from ._version import __torch_version__, __version__, __xpu_target__
@@ -28,6 +29,7 @@ __author__ = "Intel"
 _native_module = None
 _dll_dir_handles = []
 _dll_dir_paths = set()
+_preloaded_dlls = []
 
 
 def _add_windows_dll_directory(path: Path) -> None:
@@ -63,6 +65,26 @@ def _configure_windows_dll_search_paths() -> None:
     except Exception:
         pass
 
+    for raw_path in os.environ.get("OMNI_XPU_DLL_DIRS", "").split(os.pathsep):
+        if raw_path:
+            _add_windows_dll_directory(Path(raw_path))
+
+    package_libs = Path(__file__).resolve().parent / ".libs"
+    _add_windows_dll_directory(package_libs)
+    bundled_dnnl = package_libs / "dnnl.dll"
+    if bundled_dnnl.is_file():
+        try:
+            # Load by absolute path before importing _C so another oneAPI
+            # installation cannot win the basename-based dependency lookup.
+            _preloaded_dlls.append(ctypes.CDLL(str(bundled_dnnl)))
+        except OSError as error:
+            raise ImportError(
+                f"Failed to load bundled oneDNN runtime {bundled_dnnl}: {error}"
+            ) from error
+        return
+
+    # Source checkouts and legacy wheels may not carry a private runtime. Keep
+    # the existing oneAPI lookup as a compatibility fallback only.
     preferred_version = os.environ.get("OMNI_XPU_ONEAPI_VERSION")
     program_roots = (
         Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")),
@@ -83,10 +105,6 @@ def _configure_windows_dll_search_paths() -> None:
                 ("ocloc", version, "bin"),
             ):
                 _add_windows_dll_directory(oneapi_root.joinpath(*relative))
-
-    for raw_path in os.environ.get("OMNI_XPU_DLL_DIRS", "").split(os.pathsep):
-        if raw_path:
-            _add_windows_dll_directory(Path(raw_path))
 
 def _load_extension():
     """Load the native C++ extension module."""

@@ -8,7 +8,7 @@ bundled in the image.
 Mount an existing ComfyUI model directory and invoke the supplied entrypoint:
 
 ```bash
-IMAGE=intel/llm-scaler-omni:0.1.0-b9-dev-comfyui-bmg
+IMAGE=intel/llm-scaler-omni:0.1.0-b9-dev1-comfyui-bmg
 
 docker run --rm -it \
     --device=/dev/dri \
