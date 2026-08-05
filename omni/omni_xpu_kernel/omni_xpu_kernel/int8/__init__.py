@@ -35,6 +35,7 @@ Example:
     output = int8.int8_linear(x, w_int8, w_scale, convrot=True, convrot_groupsize=256)
 """
 
+import os
 import threading
 from typing import Optional, Tuple
 
@@ -81,6 +82,73 @@ def _apply_input_act(
         f"unsupported input_act: {input_act!r} "
         "(expected one of ['gelu_tanh', 'none', 'swiglu'])"
     )
+
+
+_h3_swiglu_trace_logged = False
+
+
+def _is_supported_h3_swiglu_target() -> bool:
+    """Require the BMG package/core pair used for H3 tuning."""
+    try:
+        from .. import __xpu_target__, core_aot_target
+
+        return __xpu_target__ == "bmg" and core_aot_target() == "bmg"
+    except (ImportError, RuntimeError):
+        return False
+
+
+def _can_fuse_h3_swiglu(
+    x: torch.Tensor,
+    native,
+    weight: torch.Tensor,
+    convrot: bool,
+    convrot_groupsize: int,
+    input_act: Optional[str],
+) -> bool:
+    """Match the structural BF16 H3 SwiGLU-to-G256 boundary."""
+    return bool(
+        input_act == "swiglu"
+        and convrot
+        and convrot_groupsize == 256
+        and _is_supported_h3_swiglu_target()
+        and native is not None
+        and hasattr(native, "fused_silu_mul_exact_bf16")
+        and isinstance(x, torch.Tensor)
+        and x.device.type == "xpu"
+        and x.dtype == torch.bfloat16
+        and x.ndim == 2
+        and x.shape[0] > 0
+        and x.shape[1] > 0
+        and x.shape[1] % 2 == 0
+        and (x.shape[1] // 2) % convrot_groupsize == 0
+        and x.is_contiguous()
+        and not x.requires_grad
+        and isinstance(weight, torch.Tensor)
+        and weight.device == x.device
+        and weight.dtype == torch.int8
+        and weight.ndim == 2
+        and weight.shape[1] == x.shape[1] // 2
+    )
+
+
+def _apply_h3_swiglu_exact(x: torch.Tensor, native) -> torch.Tensor:
+    """Preserve PyTorch's BF16 SiLU and product materialization boundaries."""
+    global _h3_swiglu_trace_logged
+
+    gate, up = x.chunk(2, dim=-1)
+    output = native.fused_silu_mul_exact_bf16(gate, up)
+    if (
+        not _h3_swiglu_trace_logged
+        and os.environ.get("OMNIXPU_H3_SWIGLU_TRACE") == "1"
+    ):
+        print(
+            "[OmniXPU] H3 exact SwiGLU route: "
+            f"input={tuple(x.shape)} input_stride={tuple(x.stride())} "
+            f"gate_stride={tuple(gate.stride())}",
+            flush=True,
+        )
+        _h3_swiglu_trace_logged = True
+    return output
 
 
 def _can_fuse_gelu_tanh_quantize(
@@ -650,7 +718,17 @@ def int8_linear(
                 bias,
                 dtype_code,
             )
-        x = _apply_input_act(x, input_act)
+        if _can_fuse_h3_swiglu(
+            x,
+            native,
+            weight,
+            convrot,
+            convrot_groupsize,
+            input_act,
+        ):
+            x = _apply_h3_swiglu_exact(x, native)
+        else:
+            x = _apply_input_act(x, input_act)
         if _can_cache_krea2_int8_convrot(
             x,
             native,
