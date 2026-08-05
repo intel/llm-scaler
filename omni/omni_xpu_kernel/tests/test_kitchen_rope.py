@@ -205,6 +205,7 @@ def test_h3_packed_qkv_partial_rms_rope_inplace():
 
     sequence, heads, head_dim, rot_dim = 37, 56, 128, 96
     inner = heads * head_dim
+    torch.xpu.manual_seed_all(20260804)
     packed = torch.randn(
         sequence,
         3 * inner,

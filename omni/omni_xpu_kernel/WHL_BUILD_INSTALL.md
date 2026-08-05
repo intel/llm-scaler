@@ -13,7 +13,7 @@ oneDNN 2025.3.0 Python package / oneDNN 3.9.1 native API
 Intel Arc Pro B70 / intel_gpu_bmg_g31
 OMNI_XPU_DEVICE=bmg
 Windows wheel tag: cp313-cp313-win_amd64
-llm-scaler source: 0c6cd57c6034929c3f7ee6efc48d7aa0b72b7bed
+llm-scaler source: b9b0c4c900f1a1ef3ec987fe6be5aef26b22e3c8
 ```
 
 本文不把 ComfyUI Portable 当作编译环境。编译环境位于项目目录内，
@@ -95,8 +95,13 @@ Torch/oneDNN 在本次解析出的关键原生传递依赖如下。通常不应�
 | torchaudio | `2.11.0+xpu` |
 | onednn | `2025.3.0` |
 | omni-xpu-kernel | `0.1.0b9.dev0+torch212.bmg` |
-| comfy-kitchen | `0.2.18`，Intel XPU fork commit [`c7ae07e5...`](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/c7ae07e5317d4a073562e278a41d98f05a4fe109) |
-| ComfyUI | `0.28.0` |
+| comfy-kitchen | `0.2.26`，Intel XPU fork commit [`f7250fa4...`](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/f7250fa44cb6f593969ba869be803e7d03c80ec8) |
+| ComfyUI | `0.30.0`，commit [`b1693ecb...`](https://github.com/Comfy-Org/ComfyUI/commit/b1693ecba9f5b65f8c80ab36b195ab963ec92413) |
+| comfyui-frontend-package | `1.47.12` |
+| comfyui-workflow-templates | `0.11.28` |
+| comfyui-embedded-docs | `0.5.9` |
+| comfy-aimdo | `0.4.11` |
+| comfyui-manager | `4.2.2` |
 
 `torchvision 0.27.0+xpu` 可从
 [PyTorch XPU torchvision index](https://download.pytorch.org/whl/xpu/torchvision/)
@@ -316,8 +321,8 @@ Torch XPU 头文件、库和版本。`--no-deps` 避免打包过程改变环境�
 已验证 artifact：
 
 ```text
-size:   1,563,303 bytes
-SHA256: 2F3E7363CB4E913031F125540BABDC1DA933E27928BEA408D1020E0A4CC4DC77
+size:   2,676,579 bytes
+SHA256: E019D97E0AA71FBAE0DE54969C068D693A09D12A860B0C6A4D4246DE9476D7AD
 ```
 
 该 artifact 使用与 Linux 相同的 RMSNorm、LayerNorm 和 fused Add+RMSNorm
@@ -342,6 +347,7 @@ Get-FileHash -Algorithm SHA256 -LiteralPath $wheelPath
 ```text
 omni_xpu_kernel/_C.cp313-win_amd64.pyd
 omni_xpu_kernel/lgrf_uni/lgrf_sdp.cp313-win_amd64.pyd
+omni_xpu_kernel/csrc/kitchen_rms_rope_sycl.cpp
 omni_xpu_kernel-0.1.0b9.dev0+torch212.bmg.dist-info/METADATA
 ```
 
@@ -470,22 +476,23 @@ print("native kernel smoke: PASS")
 '@ | & $embeddedPython -
 ```
 
-本次额外验证通过：
+2026-08-05 的 MiniMax H3 Windows 定点验证通过：
 
-- Windows 支持面源码测试：501 passed、36 skipped；
-- packaging 测试：25 passed、4 skipped；
-- RMSNorm：FP16、BF16、FP32；
-- SVDQ UINT4 quantize/unpack/dequantize；
-- GGUF Q4_1 capability 和 correctness；
-- BMG GroupNorm；
-- LTX direct split RoPE；
-- INT8 shared/prequantized pair、rowwise 和 cache correctness；
-- standalone SDP：`head_dim=64/128` 的 FP16、BF16；
-- oneDNN FP8 GEMM correctness 和 primitive cache；
-- 两张 Intel Arc Pro B70 的 XPU 张量、RMSNorm 和 D64/D128 SDP
-  correctness；
-- 本轮变更定点测试：Norm/Adaln 143 passed、4 skipped；SDP 91 passed、
-  1 skipped；platform dispatch source test 2 passed。
+- Kernel packaging、device dispatch 和 platform source：33 passed、3 skipped；
+- `ComfyUI-OmniXPU` attention control flow：70 passed；
+- Kitchen XPU suite：57 passed；backend suite：20 passed；
+- Kernel H3 cached RMS-RoPE：每张 B70 各 3 passed；
+- Kernel H3 INT8：每张 B70 各 2 passed；
+- Kitchen H3 RMS-RoPE、INT8 和 fullgraph：每张 B70 各 4 passed；
+- `ZE_AFFINITY_MASK=0` 和 `ZE_AFFINITY_MASK=1` 都只暴露目标 B70，
+  上述每卡 9 项定点测试全部通过；
+- MiniMax H3 INT8 safetensors 可读取，ComfyUI 模型检测得到 50 layers、
+  56 heads、head dim 128；
+- `pip check` 无 broken requirements。
+
+H3 低层 packed-QKV RMS-RoPE 测试固定 XPU 随机种子，避免 BF16 随机输入只在
+极少数元素上跨过绝对容差边界；固定后在两张 B70 上分别重复 5 次，10/10
+通过。该修改只影响测试复现性，不改变 kernel。
 
 当前 BMG core-only Windows wheel 的 standalone SDP 实机验收范围是
 `head_dim=64/128` 的 FP16、BF16。Windows 与 Linux 使用相同 sidecar
@@ -499,11 +506,12 @@ kernel source 和参数；平台分支只负责分别通过 `GetProcAddress` 和
     --windows-standalone-build `
     --disable-auto-launch `
     --quick-test-for-ci `
+    --database-url "sqlite:///:memory:" `
     --log-stdout `
     --verbose INFO
 ```
 
-本次测试中该命令返回码为 `0`，ComfyUI `0.28.0` 正确识别：
+本次测试中该命令返回码为 `0`，ComfyUI `0.30.0` 正确识别：
 
 ```text
 pytorch version: 2.12.0+xpu
@@ -511,8 +519,10 @@ Device: xpu:0 Intel(R) Arc(TM) Pro B70 Graphics
 Device: xpu:1 Intel(R) Arc(TM) Pro B70 Graphics
 ```
 
-这只证明 Portable 基础启动、设备发现和内核直接调用正常。具体模型工作流
-仍需要对应的 Omni/ComfyUI 集成代码和模型做端到端验收。
+启动日志还应显示 `comfy-kitchen 0.2.26`、六个 MiniMax H3 workflow 模板、
+`Using pytorch attention`，以及 `ComfyUI-OmniXPU` 成功导入。本文的 quick
+test 证明 Portable 基础启动、设备发现和 H3 集成可加载；正式发布仍应使用
+目标模型和 workflow 完成端到端验收。
 
 ## 9. 常见错误
 

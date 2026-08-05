@@ -6,7 +6,8 @@ ComfyUI Intel XPU Portable。流程覆盖：
 1. 在项目目录内创建独立构建环境；
 2. 构建 `omni_xpu_kernel` Windows wheel；
 3. 下载并检查官方 Intel XPU Portable；
-4. 将 Portable 对齐到已经验证的 Torch XPU 版本；
+4. 将 Portable 的 ComfyUI checkout 和 Python packages 对齐到 milestone，
+   同时保留已经验证的 Torch XPU 版本；
 5. 从 Intel Portable 的 requirements 中移除上游 `comfy-kitchen`
    依赖，由部署流程单独管理 XPU fork；
 6. 构建并安装 XPU-enabled `comfy-kitchen`；
@@ -44,7 +45,7 @@ SDP 仍可通过 `OMNI_ATTN_BACKEND=esimd` 显式启用，但不会被自动选�
 
 ## 2. 当前验证矩阵
 
-以下是 2026-07-29 已经用于 Windows 构建和完整核心工作流测试的组合：
+以下是 2026-08-05 已经用于 MiniMax H3 Windows 构建和验证的组合：
 
 | 组件 | 已验证版本/修订 |
 |---|---|
@@ -61,22 +62,26 @@ SDP 仍可通过 `OMNI_ATTN_BACKEND=esimd` 显式启用，但不会被自动选�
 | torchaudio | 当前测试目录为 `2.11.0+xpu`；不是 Omni kernel 必需依赖 |
 | onednn Python runtime | `2025.3.0` |
 | omni-xpu-kernel | `0.1.0b9.dev0+torch212.bmg` |
-| comfy-kitchen XPU fork | `0.2.18`，[`c7ae07e5...`](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/c7ae07e5317d4a073562e278a41d98f05a4fe109) |
+| comfy-kitchen XPU fork | `0.2.26`，[`f7250fa4...`](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/f7250fa44cb6f593969ba869be803e7d03c80ec8) |
 | ComfyUI-GGUF-XPU | [`39671fe7...`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d)；`gguf 0.19.0` |
 | ComfyUI-nunchaku-XPU | `1.2.1+xpu.3`，[`5cf4fa98...`](https://github.com/xiangyuT/ComfyUI-nunchaku-XPU/commit/5cf4fa9886f45abff102d1dd91af5247b4950148) |
-| ComfyUI | `0.28.0`，测试 commit `700821e1...` |
-| llm-scaler | [`3f554f97...`](https://github.com/xiangyuT/llm-scaler/commit/3f554f97bd97e0e8be7d49396fe3722b33954677)（`feature/omni-0.1.0b9-preview`） |
+| ComfyUI | `0.30.0`，[`b1693ecb...`](https://github.com/Comfy-Org/ComfyUI/commit/b1693ecba9f5b65f8c80ab36b195ab963ec92413) |
+| ComfyUI frontend / templates | `1.47.12` / `0.11.28` |
+| ComfyUI embedded docs / AIMDO / manager | `0.5.9` / `0.4.11` / `4.2.2` |
+| llm-scaler | [`b9b0c4c9...`](https://github.com/xiangyuT/llm-scaler/commit/b9b0c4c900f1a1ef3ec987fe6be5aef26b22e3c8)（`feature/omni-0.1.0b9-preview`） |
 
-`comfy-kitchen 0.2.18` 是 Dockerfile 当前固定的 XPU fork 版本。当前 ComfyUI
-调用的 Kitchen API 已经在该 fork 中完成导入检查，XPU backend 也能在
-Torch 2.12/B70 上注册。它应保留真实版本 `0.2.18`，不伪装为上游
+`comfy-kitchen 0.2.26` 是 Dockerfile 当前固定的 XPU fork 版本。MiniMax H3
+使用的 RMS-RoPE、INT8 input activation 和 fullgraph dispatch API 已经在该
+fork 中完成 Windows 实机检查，XPU backend 也能在 Torch 2.12/B70 上注册。
+它应保留真实版本 `0.2.26`，不伪装为上游
 ComfyUI requirements 中的其他版本。
 
-`c7ae07e5...` 的祖先包含 Windows Triton 修复 `fead43b4...`。它在 Windows
-上默认不注册 Triton backend，因为当前 Portable
-路径没有验证 Triton JIT compiler/runtime。默认 dispatch 顺序因此是
-`xpu -> eager`。只有已自行验证 Windows Triton toolchain 的环境才应在导入
-Kitchen 前设置 `COMFY_KITCHEN_ENABLE_TRITON_WINDOWS=1`。
+Kitchen 在 Windows 上默认把 Triton 标记为 unavailable，但不把它加入
+Kitchen 自己的 disabled 集合；`COMFY_KITCHEN_ENABLE_TRITON_WINDOWS=1`
+保留显式 opt-in。ComfyUI 0.30 的 `quant_ops` 还会按自身 CLI 策略在启动时
+disable Triton，只有同时验证 Windows Triton toolchain、设置该环境变量并
+显式传入 `--enable-triton-backend` 时才应尝试启用。默认 dispatch 为
+`xpu -> eager`。
 
 GGUF 与 combined Nunchaku 节点已经在同一 Portable 中完成依赖安装、节点
 导入、双 B70 native route 和数值正确性验收。固定 revision 的两份目标权重
@@ -88,8 +93,9 @@ fallback 为零。
 
 安装或下载：
 
-- [已验证的 ComfyUI v0.28.0 Intel Portable](https://github.com/comfyanonymous/ComfyUI/releases/download/v0.28.0/ComfyUI_windows_portable_intel.7z)
+- [已验证的 ComfyUI v0.28.0 Intel Portable 基础包](https://github.com/comfyanonymous/ComfyUI/releases/download/v0.28.0/ComfyUI_windows_portable_intel.7z)
 - [ComfyUI v0.28.0 release](https://github.com/Comfy-Org/ComfyUI/releases/tag/v0.28.0)
+- [ComfyUI 0.30.0 milestone commit](https://github.com/Comfy-Org/ComfyUI/commit/b1693ecba9f5b65f8c80ab36b195ab963ec92413)
 - [ComfyUI releases](https://github.com/Comfy-Org/ComfyUI/releases)
 - [7-Zip](https://7-zip.org/)
 - [Intel Arc Pro Windows driver](https://www.intel.com/content/www/us/en/download/741626/intel-arc-pro-graphics-windows.html)
@@ -102,7 +108,7 @@ fallback 为零。
 - [PyTorch Intel GPU guide](https://docs.pytorch.org/docs/main/notes/get_start_xpu.html)
 - [PyTorch XPU wheel index](https://download.pytorch.org/whl/xpu)
 - [`comfy-kitchen-xpu`](https://github.com/xiangyuT/comfy-kitchen-xpu)
-- [`comfy-kitchen-xpu` pinned commit](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/c7ae07e5317d4a073562e278a41d98f05a4fe109)
+- [`comfy-kitchen-xpu` pinned commit](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/f7250fa44cb6f593969ba869be803e7d03c80ec8)
 - [`ComfyUI-GGUF-XPU` pinned commit](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d)
 - [`ComfyUI-nunchaku-XPU` pinned commit](https://github.com/xiangyuT/ComfyUI-nunchaku-XPU/commit/5cf4fa9886f45abff102d1dd91af5247b4950148)
 - [Z-Image Turbo GGUF weights](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF)
@@ -215,8 +221,8 @@ Architecture: intel_gpu_bmg_g31
 
 ```text
 omni_xpu_kernel-0.1.0b9.dev0+torch212.bmg-cp313-cp313-win_amd64.whl
-size:   1,563,303 bytes
-SHA256: 2F3E7363CB4E913031F125540BABDC1DA933E27928BEA408D1020E0A4CC4DC77
+size:   2,676,579 bytes
+SHA256: E019D97E0AA71FBAE0DE54969C068D693A09D12A860B0C6A4D4246DE9476D7AD
 ```
 
 在 PowerShell 中取得实际 artifact，并检查 hash：
@@ -243,7 +249,7 @@ omni_xpu_kernel/_C.cp313-win_amd64.pyd
 omni_xpu_kernel/lgrf_uni/lgrf_sdp.cp313-win_amd64.pyd
 ```
 
-## 6. 下载并检查 Intel Portable
+## 6. 下载基础 Intel Portable，并切换到 ComfyUI 0.30 milestone
 
 官方资产是 `.7z`，本文中的“Portable ZIP”泛指这个可解压的 Portable
 发行包。
@@ -265,8 +271,9 @@ Invoke-WebRequest `
 & $sevenZip x $archive "-o$extractRoot"
 ```
 
-本文固定下载已经完成端到端验证的 `v0.28.0`，不使用会随官方发布变化的
-`latest`。该 release 中的 ComfyUI 应对应 commit
+本文固定下载 `v0.28.0`，是因为它提供了已经验证的 Python 3.13 / Torch XPU
+Portable 基础环境；它不是最终 H3 ComfyUI 版本。该 release 中的初始
+ComfyUI 应对应 commit
 `700821e1364eaab0e8f21c538a2131719fec57bf`。解压后先核对 commit，并记录
 实际 Python、Torch 和 XPU 环境：
 
@@ -292,9 +299,40 @@ Write-Host "ComfyUI commit: $actualComfyCommit"
 & $embeddedPython -m pip list
 ```
 
-升级 Portable 时，不要只把 URL 改回 `latest`。应重新完成本文的 kernel、
-Kitchen、Custom Node 和启动验证，再同时更新 `$comfyVersion` 与
-`$expectedComfyCommit`。
+随后把 ComfyUI checkout 固定到 milestone commit。开始前确保 checkout
+除已知 requirements 策略外没有需要保留的本地修改；未知修改应先审查和
+备份，不要直接覆盖：
+
+```powershell
+$milestoneComfyCommit = "b1693ecba9f5b65f8c80ab36b195ab963ec92413"
+
+git -C $comfyRoot fetch --no-tags origin $milestoneComfyCommit
+git -C $comfyRoot checkout --detach $milestoneComfyCommit
+
+$actualComfyCommit = (git -C $comfyRoot rev-parse HEAD).Trim()
+if ($actualComfyCommit -ne $milestoneComfyCommit) {
+    throw "Unexpected milestone ComfyUI commit: $actualComfyCommit"
+}
+```
+
+安装 Dockerfile 对应的 UI/runtime package 边界，但不要在此处运行未经处理的
+ComfyUI requirements，因为其中的官方 Kitchen 会覆盖 XPU fork：
+
+```powershell
+& $embeddedPython -m pip install --upgrade `
+    "comfyui-frontend-package==1.47.12" `
+    "comfyui-workflow-templates==0.11.28" `
+    "comfyui-embedded-docs==0.5.9" `
+    "comfy-aimdo==0.4.11" `
+    "comfyui-manager==4.2.2"
+```
+
+`comfyui-workflow-templates==0.11.28` 应提供六个 MiniMax H3 workflow
+template。第 8 节会在任何 requirements 同步前移除官方 Kitchen 依赖。
+
+升级 Portable 时，不要只把 URL 改回 `latest`。应分别固定“Portable 基础
+包版本”和“最终 ComfyUI commit”，再重新完成 kernel、Kitchen、Custom
+Node 和启动验证。
 
 如果 Python 不是 3.13，不能使用本文的 `cp313` kernel wheel。如果 Torch
 不是 2.12，可以按下一节对齐到 Torch 2.12，或为新的 Torch minor 重新构建
@@ -430,7 +468,7 @@ Kitchen XPU wheel 是 pure-Python wheel，但仍应在项目内构建环境生�
 不要把 Portable 当作源码构建目录。
 
 ```powershell
-$kitchenCommit = "c7ae07e5317d4a073562e278a41d98f05a4fe109"
+$kitchenCommit = "f7250fa44cb6f593969ba869be803e7d03c80ec8"
 $sourceRoot = Join-Path $buildRoot "sources"
 $kitchenSource = Join-Path $sourceRoot "comfy-kitchen-xpu"
 $kitchenWheelhouse = Join-Path $buildRoot "wheelhouse\kitchen"
@@ -463,7 +501,7 @@ git -C $kitchenSource rev-parse HEAD
 
 ```powershell
 $kitchenWheel = Get-ChildItem $kitchenWheelhouse `
-    -Filter "comfy_kitchen-0.2.18-*.whl" |
+    -Filter "comfy_kitchen-0.2.26-*.whl" |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
 
@@ -484,12 +522,12 @@ comfy_kitchen/backends/eager/
 
 不应包含 `comfy_kitchen/backends/cuda/`。安装到 Portable：
 
-当前 pin `c7ae07e5...` 的本机 Windows 构建得到：
+当前 pin `f7250fa4...` 的本机 Windows 构建得到：
 
 ```text
-file:   comfy_kitchen-0.2.18-py3-none-any.whl
-size:   113,212 bytes
-SHA256: 5E6B5663C1757217D1D51FA098AAE10A119FEEF8513B83DABD0634A5BA1B0D64
+file:   comfy_kitchen-0.2.26-py3-none-any.whl
+size:   124,788 bytes
+SHA256: 080810DB9959CCB61F6125A9BCE0AB6AD86AEC28C8F5D86D72FEAD8167AEB89B
 ```
 
 该 hash 记录本机 artifact；fresh clone 的 ZIP timestamp 可能使 pure-Python
@@ -769,6 +807,7 @@ foreach ($device in 0, 1) {
         --windows-standalone-build `
         --disable-auto-launch `
         --quick-test-for-ci `
+        --database-url "sqlite:///:memory:" `
         --log-stdout `
         --verbose INFO
     if ($LASTEXITCODE -ne 0) {
@@ -964,10 +1003,11 @@ xpu_backend = ck.list_backends().get("xpu", {})
 triton_backend = ck.list_backends().get("triton", {})
 assert torch.__version__ == "2.12.0+xpu"
 assert torch.xpu.is_available()
-assert metadata.version("comfy-kitchen") == "0.2.18"
+assert metadata.version("comfy-kitchen") == "0.2.26"
 assert xpu_backend.get("available") is True
 assert xpu_backend.get("disabled") is False
 assert triton_backend.get("available") is False
+assert triton_backend.get("disabled") is False
 assert "COMFY_KITCHEN_ENABLE_TRITON_WINDOWS=1" in (
     triton_backend.get("unavailable_reason") or ""
 )
@@ -1028,6 +1068,7 @@ $env:OMNIXPU_INTERPOLATE_FIX = "0"
     --windows-standalone-build `
     --disable-auto-launch `
     --quick-test-for-ci `
+    --database-url "sqlite:///:memory:" `
     --log-stdout `
     --verbose INFO
 ```
@@ -1063,7 +1104,7 @@ workflow 做一次结果正确性和显存行为验收。
 
 ```powershell
 & cmd.exe /d /c @"
-echo.| call "$portableRoot\run_intel_gpu.bat" --disable-auto-launch --quick-test-for-ci --log-stdout --verbose INFO
+echo.| call "$portableRoot\run_intel_gpu.bat" --disable-auto-launch --quick-test-for-ci --database-url "sqlite:///:memory:" --log-stdout --verbose INFO
 "@
 ```
 
@@ -1090,7 +1131,11 @@ curl.exe --noproxy "*" `
 
 预期返回 `200`。验收后在第一个终端按 `Ctrl+C` 关闭测试服务。
 
-### 14.5 2026-07-29 实机部署记录
+### 14.5 2026-07-29 实机部署记录（历史基线）
+
+本节保留早期 ComfyUI 0.28 / Kitchen 0.2.18 的 Z-Image、GGUF 和 Nunchaku
+性能证据，不能作为当前 MiniMax H3 milestone 的版本 pin。当前组合见第 2 节
+和下一节。
 
 完成的变更：
 
@@ -1172,6 +1217,46 @@ AIMDO。显式添加 `--disable-dynamic-vram` 会触发 ComfyUI 自己的弃用�
 XPU memory management 处理。oneDNN JIT register 提示在更新前基线中同样
 出现；oneDNN 随后选择可用实现，四个工作流均成功，因此不属于本轮回归。
 
+### 14.6 2026-08-05 MiniMax H3 Windows milestone 验证
+
+当前 H3 验证固定以下源码边界：
+
+- `llm-scaler`：`b9b0c4c900f1a1ef3ec987fe6be5aef26b22e3c8`；
+- `comfy-kitchen-xpu`：`f7250fa44cb6f593969ba869be803e7d03c80ec8`；
+- ComfyUI：`b1693ecba9f5b65f8c80ab36b195ab963ec92413`；
+- Torch：`2.12.0+xpu`；Python：`3.13.12`；AOT target：`bmg`。
+
+当前构建产物：
+
+| Artifact | 身份 |
+|---|---|
+| Kernel wheel | 2,676,579 bytes；SHA256 `E019D97E...6D7AD` |
+| Kitchen wheel | 124,788 bytes；SHA256 `080810DB...EB89B` |
+
+Windows 实机结果：
+
+| 检查 | 结果 |
+|---|---|
+| `pip check` | `No broken requirements found.` |
+| Kernel packaging/device/platform source | 33 passed，3 skipped |
+| OmniXPU attention control flow | 70 passed |
+| Kitchen XPU suite | 57 passed |
+| Kitchen backend suite | 20 passed |
+| 单卡 H3 定点测试 | 每张 B70 各 3 RMS-RoPE + 2 INT8 + 4 Kitchen/fullgraph passed |
+| 双 XPU 隔离 | `ZE_AFFINITY_MASK=0/1` 均只暴露目标 B70，两个设备各 9 项通过 |
+| ComfyUI quick-test | 0.30.0、两张 B70、Kitchen 0.2.26、Custom Node 导入通过 |
+| Attention policy | `OMNI_ATTN_BACKEND=torch`，日志为 `Using pytorch attention` |
+| H3 templates | 六个 MiniMax H3 workflow JSON 存在且可解析 |
+| H3 checkpoint contract | 检测为 50 layers、56 heads、head dim 128 |
+| MiniMax H3 E2E | 已在目标环境另行完成；本文不重复记录模型下载和性能数据 |
+
+Kernel 的 packed-QKV H3 RMS-RoPE 测试使用固定 XPU 随机种子，避免 BF16
+随机输入在极少数元素上跨过固定绝对容差而造成不稳定结果。固定后在两张
+B70 上分别重复 5 次，10/10 通过。该变更仅限测试，不改变 Windows 或 Linux
+runtime。Windows wheel 不包含 CUTE；H3 attention
+继续使用 Torch SDPA，RMS-RoPE 与 INT8 fused paths 由 Kitchen/Omni XPU
+backend 提供。
+
 ## 15. 更新与防覆盖
 
 这是 Intel XPU Portable 最容易被忽略的维护边界。
@@ -1246,7 +1331,7 @@ print(ck.list_backends().get("xpu"))
 - 本文的 native artifact 只验证了 BMG；PTL-H 需要
   `OMNI_XPU_DEVICE=ptl-h` 独立构建和验收。
 - Torch 2.13 不在当前 Windows 验证范围内。
-- `comfy-kitchen 0.2.18` XPU fork 与未来 ComfyUI API 的兼容性必须在每次
+- `comfy-kitchen 0.2.26` XPU fork 与未来 ComfyUI API 的兼容性必须在每次
   上游更新后重新测试。
 - GGUF/Nunchaku 的安装、导入、双卡 native correctness 与单卡正式
   real-model E2E 已通过；当前正式性能仅覆盖 B70、Torch 2.12、默认
