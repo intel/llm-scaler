@@ -114,9 +114,24 @@ RUN --mount=type=bind,from=builder,source=/root/wheels,target=/tmp/wheels \
  && apt-get install -y --no-install-recommends software-properties-common python3-pip \
  && add-apt-repository -y ppa:kobuk-team/intel-graphics \
  && apt-get update \
+ # Keep the production GPU runtime aligned with intel/omix:0.1.0-devel-ubuntu24.04.
+ # Pin direct packages and version-flexible driver dependencies so a later PPA
+ # update cannot silently change the Level Zero/OpenCL runtime.
  && apt-get install -y --no-install-recommends \
-        libze-intel-gpu1 libze1 intel-metrics-discovery intel-opencl-icd clinfo intel-gsc \
-        libze-dev \
+        libze-intel-gpu1=26.14.37833.4-1~24.04~ppa1 \
+        libze1=1.28.2-1~24.04~ppa1 \
+        libze-dev=1.28.2-1~24.04~ppa1 \
+        libze-intel-gpu-raytracing=1.2.2-1~24.04~ppa1 \
+        intel-opencl-icd=26.14.37833.4-1~24.04~ppa1 \
+        intel-metrics-discovery=1.14.183-1~24.04~ppa1 \
+        intel-gsc=0.9.5-1~24.04~ppa2 \
+        libigdgmm12=22.10.0-1~24.04~ppa1 \
+        libigc2=2.32.7-1256~24.04 \
+        libigdfcl2=2.32.7-1256~24.04 \
+        libigsc0=0.9.5-1~24.04~ppa2 \
+        libmetee5=5.0.0-1~24.04~ppa2 \
+        ocl-icd-libopencl1=2.3.2-1build1 \
+        clinfo \
  # --- Intel(R) oneCCL 2021.15.9: contains several enhancements for
  #     Intel(R) Arc(TM) Pro graphics. Only the runtime payload is extracted from
  #     the offline installer (a full `-a --silent` install would drag in the
