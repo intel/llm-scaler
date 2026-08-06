@@ -190,7 +190,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     rm -rf /opt/intel/oneapi/ccl/2021.15 && \
     cp -a /tmp/oneccl-runtime/_installdir/ccl/2021.15 /opt/intel/oneapi/ccl/ && \
     rm "${ONECCL_INSTALLER}" && \
-    echo "source /opt/intel/oneapi/setvars.sh --force" >> /root/.bashrc && \
     echo "source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --force" >> /root/.bashrc && \
     rm -f /opt/intel/oneapi/ccl/latest && \
     ln -s /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/latest && \
