@@ -52,6 +52,10 @@ COMFYUI_MANAGER_VERSION="${COMFYUI_MANAGER_VERSION:-4.2.2}"
 KITCHEN_REPOSITORY="${COMFY_KITCHEN_REPOSITORY:-https://github.com/xiangyuT/comfy-kitchen-xpu.git}"
 KITCHEN_COMMIT="${COMFY_KITCHEN_COMMIT:-f7250fa44cb6f593969ba869be803e7d03c80ec8}"
 KITCHEN_VERSION="${COMFY_KITCHEN_VERSION:-0.2.26}"
+AIMDO_REPOSITORY="${COMFY_AIMDO_REPOSITORY:-https://github.com/xiangyuT/comfy-aimdo.git}"
+AIMDO_COMMIT="${COMFY_AIMDO_COMMIT:-6fda6e619e1647134d4ced4370e5fad488779d62}"
+AIMDO_VERSION="${COMFY_AIMDO_VERSION:-0.4.13}"
+AIMDO_SOURCE_DIR="${COMFY_AIMDO_SOURCE_DIR:-${REPOSITORY_ROOT}/../comfy-aimdo-xpu}"
 GGUF_REPOSITORY="${COMFY_GGUF_REPOSITORY:-https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git}"
 GGUF_COMMIT="${COMFY_GGUF_COMMIT:-39671fe73117ba97de7011e7e06e32599dcda06d}"
 NUNCHAKU_REPOSITORY="${COMFY_NUNCHAKU_REPOSITORY:-https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git}"
@@ -67,6 +71,30 @@ if [ ! -f "${DOCKERFILE_PATH}" ]; then
     echo "Dockerfile not found: ${DOCKERFILE_PATH}" >&2
     exit 1
 fi
+
+if [ ! -d "${AIMDO_SOURCE_DIR}/.git" ]; then
+    echo "Comfy AIMDO source checkout not found: ${AIMDO_SOURCE_DIR}" >&2
+    exit 1
+fi
+AIMDO_SOURCE_REVISION="$(git -C "${AIMDO_SOURCE_DIR}" rev-parse HEAD)"
+if [ "${AIMDO_SOURCE_REVISION}" != "${AIMDO_COMMIT}" ]; then
+    echo "Comfy AIMDO source revision ${AIMDO_SOURCE_REVISION} does not match ${AIMDO_COMMIT}" >&2
+    exit 1
+fi
+if [ -n "$(git -C "${AIMDO_SOURCE_DIR}" status --porcelain --untracked-files=normal)" ]; then
+    echo "Comfy AIMDO source checkout must be clean: ${AIMDO_SOURCE_DIR}" >&2
+    exit 1
+fi
+
+# Export an exact committed tree as a separate BuildKit context. This avoids
+# sending ignored local build products or relying on an unpublished remote
+# branch while preserving the full source commit as image provenance.
+AIMDO_CONTEXT_DIR="$(mktemp -d)"
+trap 'rm -rf -- "${AIMDO_CONTEXT_DIR}"' EXIT
+git -C "${AIMDO_SOURCE_DIR}" archive --format=tar "${AIMDO_COMMIT}" \
+    | tar -xf - -C "${AIMDO_CONTEXT_DIR}"
+printf '%s\n' "${AIMDO_COMMIT}" \
+    > "${AIMDO_CONTEXT_DIR}/.omni-source-revision"
 
 IMAGE_NAME="${IMAGE_REPOSITORY}:${TAG}-comfyui-${DEVICE_TARGET}"
 
@@ -89,6 +117,9 @@ DOCKER_ARGS=(
     --build-arg "COMFY_KITCHEN_REPOSITORY=${KITCHEN_REPOSITORY}"
     --build-arg "COMFY_KITCHEN_COMMIT=${KITCHEN_COMMIT}"
     --build-arg "COMFY_KITCHEN_VERSION=${KITCHEN_VERSION}"
+    --build-arg "COMFY_AIMDO_REPOSITORY=${AIMDO_REPOSITORY}"
+    --build-arg "COMFY_AIMDO_COMMIT=${AIMDO_COMMIT}"
+    --build-arg "COMFY_AIMDO_VERSION=${AIMDO_VERSION}"
     --build-arg "COMFY_GGUF_REPOSITORY=${GGUF_REPOSITORY}"
     --build-arg "COMFY_GGUF_COMMIT=${GGUF_COMMIT}"
     --build-arg "COMFY_NUNCHAKU_REPOSITORY=${NUNCHAKU_REPOSITORY}"
@@ -97,6 +128,7 @@ DOCKER_ARGS=(
     --build-arg "https_proxy=${HTTPS_PROXY}"
     --build-arg "http_proxy=${HTTP_PROXY}"
     --build-arg "no_proxy=${NO_PROXY}"
+    --build-context "comfy_aimdo_source=${AIMDO_CONTEXT_DIR}"
 )
 
 DOCKER_ARGS+=(

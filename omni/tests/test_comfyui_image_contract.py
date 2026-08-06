@@ -39,6 +39,15 @@ COMPONENT_PINS = {
         "f7250fa44cb6f593969ba869be803e7d03c80ec8",
     ),
     "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.26"),
+    "COMFY_AIMDO_REPOSITORY": (
+        "AIMDO_REPOSITORY",
+        "https://github.com/xiangyuT/comfy-aimdo.git",
+    ),
+    "COMFY_AIMDO_COMMIT": (
+        "AIMDO_COMMIT",
+        "6fda6e619e1647134d4ced4370e5fad488779d62",
+    ),
+    "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.4.13"),
     "COMFY_GGUF_REPOSITORY": (
         "GGUF_REPOSITORY",
         "https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git",
@@ -138,9 +147,39 @@ class ComfyUIImageContractTest(unittest.TestCase):
             validator.REQUIRED_KITCHEN_CAPABILITIES,
         )
 
+    def test_aimdo_xpu_is_built_from_an_exact_local_commit(self):
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+        build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
+        validator = load_validator()
+
+        self.assertIn(
+            '--build-context "comfy_aimdo_source=${AIMDO_CONTEXT_DIR}"',
+            build_script,
+        )
+        self.assertIn(
+            "git -C \"${AIMDO_SOURCE_DIR}\" archive",
+            build_script,
+        )
+        self.assertIn("FROM python-base AS aimdo-wheel", dockerfile)
+        self.assertIn("./scripts/build-linux-xpu.sh", dockerfile)
+        self.assertIn(
+            "/wheels/comfy_aimdo-${COMFY_AIMDO_VERSION}-*.whl",
+            dockerfile,
+        )
+        self.assertEqual(
+            validator.AIMDO_SOURCE_MARKER,
+            Path("/llm/comfy-aimdo-xpu/.omni-source-revision"),
+        )
+
     def test_comfyui_v030_dependencies_are_pinned_and_validated(self):
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
         validator = load_validator()
+        self.assertEqual(
+            validator.PINNED_MINIMAX_H3_TEMPLATE_HASHES[
+                "video_minimax_h3_t2v.json"
+            ],
+            "31ab33fdb053a7834cc866bd7aa08b887518fc656e4a796c89779c6b5e1786e6",
+        )
 
         self.assertIn(
             '"comfyui-manager==${COMFYUI_MANAGER_VERSION}"',

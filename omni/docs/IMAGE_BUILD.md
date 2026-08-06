@@ -29,18 +29,28 @@ The supported environment overrides are:
 | `COMFY_KITCHEN_REPOSITORY` | Kitchen source repository | pinned in `build.sh` |
 | `COMFY_KITCHEN_COMMIT` | Kitchen source revision | pinned in `build.sh` |
 | `COMFY_KITCHEN_VERSION` | Expected Kitchen wheel version | pinned in `build.sh` |
+| `COMFY_AIMDO_REPOSITORY` | AIMDO source repository identity | pinned in `build.sh` |
+| `COMFY_AIMDO_COMMIT` | AIMDO source revision | pinned in `build.sh` |
+| `COMFY_AIMDO_VERSION` | Expected AIMDO wheel version | pinned in `build.sh` |
+| `COMFY_AIMDO_SOURCE_DIR` | Clean local AIMDO checkout exported as an exact BuildKit context | adjacent `comfy-aimdo-xpu` checkout |
 | `COMFY_GGUF_REPOSITORY` | GGUF custom-node source repository | pinned in `build.sh` |
 | `COMFY_GGUF_COMMIT` | GGUF custom-node source revision | pinned in `build.sh` |
 | `COMFY_NUNCHAKU_REPOSITORY` | Combined Nunchaku custom-node/runtime repository | pinned in `build.sh` |
 | `COMFY_NUNCHAKU_COMMIT` | Combined Nunchaku source revision | pinned in `build.sh` |
 | `COMFY_NUNCHAKU_VERSION` | Expected combined distribution version | pinned in `build.sh` |
 
-ComfyUI repository, commit, and version must be updated together. Kitchen
-repository, commit, and version must be updated together. GGUF
-repository and commit must be updated together. The same rule applies to the
-combined Nunchaku repository, commit, and distribution version. The kernel
-source is copied from `omni/omni_xpu_kernel` in the current llm-scaler
-checkout.
+ComfyUI repository, commit, and version must be updated together. Kitchen and
+AIMDO repository, commit, and version pins are independently checked against
+their package metadata. GGUF repository and commit must be updated together.
+The same rule applies to the combined Nunchaku repository, commit, and
+distribution version. The kernel source is copied from
+`omni/omni_xpu_kernel` in the current llm-scaler checkout.
+
+The AIMDO revision is exported from a clean local checkout with `git archive`
+and supplied as a named BuildKit context. This permits exact local milestone
+validation before publication while preventing ignored build products from
+entering the image. The source checkout must match the pinned full commit and
+have no tracked or untracked changes.
 
 The focused image installs the v0.30 integrated `comfyui-manager` package and
 does not clone the legacy Manager custom node. Frontend, workflow templates,
@@ -59,12 +69,13 @@ The focused Dockerfile separates the frequently changed native projects:
 | `sycl-tla` | Pinned native headers |
 | `kernel-wheel` | Target-specific `omni_xpu_kernel` wheel |
 | `kitchen-wheel` | Pinned Comfy Kitchen wheel |
+| `aimdo-wheel` | Pinned AIMDO wheel with the Level Zero XPU backend |
 | `builder-comfyui` | Wheel installation and local ComfyUI integration |
 | `runtime-comfyui` | Final labels, environment, and runtime metadata |
 
 BuildKit is enabled by `build.sh`. Normal incremental builds should preserve
-the cache. The `kernel-wheel` and `kitchen-wheel` targets are diagnostics;
-image acceptance must use the default final target.
+the cache. The `kernel-wheel`, `kitchen-wheel`, and `aimdo-wheel` targets are
+diagnostics; image acceptance must use the default final target.
 
 ## Source and artifact identity
 
@@ -76,6 +87,7 @@ whether `omni/` had uncommitted changes. The final image also records:
 - ComfyUI version and commit;
 - ComfyUI frontend, workflow-template, and integrated Manager versions;
 - Kitchen version and commit;
+- AIMDO version and commit;
 - GGUF custom-node commit;
 - combined Nunchaku custom-node/runtime version and commit;
 - SYCL-TLA commit.
@@ -100,6 +112,7 @@ docker run --rm \
 The release check requires a real XPU and clean source metadata. The
 `--allow-no-xpu` and `--allow-dirty-source` switches are intended only for
 explicit diagnostics and do not replace device-backed acceptance. The same
-validator also requires exact Kitchen, GGUF, and combined Nunchaku checkout
-revisions; the GGUF/SentencePiece/Protobuf imports; the bundled
-`nunchaku_torch` runtime; and the managed Kitchen GGUF/W4A16 capabilities.
+validator also requires exact Kitchen, AIMDO, GGUF, and combined Nunchaku
+source revisions; the installed AIMDO XPU backend; the
+GGUF/SentencePiece/Protobuf imports; the bundled `nunchaku_torch` runtime; and
+the managed Kitchen GGUF/W4A16 capabilities.
