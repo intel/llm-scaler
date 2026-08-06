@@ -507,13 +507,16 @@ torch::Tensor mm_int8(
     return output;
 }
 
-torch::Tensor int8_linear_prequantized(
+namespace {
+
+torch::Tensor int8_linear_prequantized_impl(
     torch::Tensor x_int8,
     torch::Tensor x_scale,
     torch::Tensor weight,
     torch::Tensor weight_scale,
     std::optional<torch::Tensor> bias,
-    int64_t out_dtype_code
+    int64_t out_dtype_code,
+    std::optional<torch::Tensor> output_opt
 ) {
     TORCH_CHECK(x_int8.dim() >= 1,
         "x_int8 must have at least one dimension");
@@ -566,7 +569,20 @@ torch::Tensor int8_linear_prequantized(
 
     std::vector<int64_t> out_sizes(orig_sizes.begin(), orig_sizes.end() - 1);
     out_sizes.push_back(n);
+    torch::Tensor output;
+    if (output_opt.has_value()) {
+        output = *output_opt;
+        TORCH_CHECK(output.device() == x_int8.device(),
+            "output must be on the input XPU device");
+        TORCH_CHECK(output.scalar_type() == out_dtype,
+            "output dtype must match out_dtype_code");
+        TORCH_CHECK(output.sizes() == out_sizes,
+            "output shape must be ", out_sizes, ", got ", output.sizes());
+        TORCH_CHECK(output.is_contiguous(),
+            "output must be contiguous");
+    }
     if (m == 0) {
+        if (output_opt.has_value()) return output;
         return torch::empty(
             out_sizes,
             torch::TensorOptions().dtype(out_dtype).device(x_int8.device()));
@@ -586,9 +602,13 @@ torch::Tensor int8_linear_prequantized(
     auto state = get_or_create_int8_scaled_primitive(
         m, k, n, static_cast<int>(out_dtype_code), has_bias,
         w_scale_is_scalar, x_int8.device(), queue);
-
-    auto output = torch::empty(
-        {m, n}, torch::TensorOptions().dtype(out_dtype).device(x_int8.device()));
+    if (!output_opt.has_value()) {
+        // Preserve the established allocation order for every existing
+        // caller.  Only the explicit out variant supplies storage earlier.
+        output = torch::empty(
+            {m, n},
+            torch::TensorOptions().dtype(out_dtype).device(x_int8.device()));
+    }
 
     dnnl::stream stream = dnnl::sycl_interop::make_stream(state->engine, queue);
     std::unordered_map<int, dnnl::memory> args = {
@@ -611,6 +631,45 @@ torch::Tensor int8_linear_prequantized(
     state->primitive.execute(stream, args);
 
     return output.reshape(out_sizes);
+}
+
+}  // namespace
+
+torch::Tensor int8_linear_prequantized(
+    torch::Tensor x_int8,
+    torch::Tensor x_scale,
+    torch::Tensor weight,
+    torch::Tensor weight_scale,
+    std::optional<torch::Tensor> bias,
+    int64_t out_dtype_code
+) {
+    return int8_linear_prequantized_impl(
+        x_int8,
+        x_scale,
+        weight,
+        weight_scale,
+        bias,
+        out_dtype_code,
+        std::nullopt);
+}
+
+torch::Tensor int8_linear_prequantized_out(
+    torch::Tensor x_int8,
+    torch::Tensor x_scale,
+    torch::Tensor weight,
+    torch::Tensor weight_scale,
+    std::optional<torch::Tensor> bias,
+    int64_t out_dtype_code,
+    torch::Tensor output
+) {
+    return int8_linear_prequantized_impl(
+        x_int8,
+        x_scale,
+        weight,
+        weight_scale,
+        bias,
+        out_dtype_code,
+        output);
 }
 
 #if defined(OMNI_XPU_ARCH_BMG)

@@ -105,6 +105,10 @@ namespace int8_ops {
         torch::Tensor x_int8, torch::Tensor x_scale, torch::Tensor weight,
         torch::Tensor weight_scale, std::optional<torch::Tensor> bias,
         int64_t out_dtype_code);
+    torch::Tensor int8_linear_prequantized_out(
+        torch::Tensor x_int8, torch::Tensor x_scale, torch::Tensor weight,
+        torch::Tensor weight_scale, std::optional<torch::Tensor> bias,
+        int64_t out_dtype_code, torch::Tensor output);
 #if defined(OMNI_XPU_ARCH_BMG)
     std::tuple<torch::Tensor, torch::Tensor> int8_linear_pair_prequantized(
         torch::Tensor x_int8, torch::Tensor x_scale,
@@ -534,6 +538,14 @@ PYBIND11_MODULE(_C, m) {
         py::arg("x_int8"), py::arg("x_scale"), py::arg("weight"),
         py::arg("weight_scale"), py::arg("bias") = py::none(),
         py::arg("out_dtype_code") = 2);
+    int8.def(
+        "int8_linear_prequantized_out",
+        &omni_xpu::int8_ops::int8_linear_prequantized_out,
+        "INT8 linear into a caller-provided contiguous output tensor.\n"
+        "Used by bounded-memory row streaming without an extra output copy.",
+        py::arg("x_int8"), py::arg("x_scale"), py::arg("weight"),
+        py::arg("weight_scale"), py::arg("bias"),
+        py::arg("out_dtype_code"), py::arg("output"));
 #if defined(OMNI_XPU_ARCH_BMG)
     int8.def(
         "int8_linear_pair_prequantized",

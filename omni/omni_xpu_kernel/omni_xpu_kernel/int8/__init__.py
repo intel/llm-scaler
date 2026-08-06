@@ -85,6 +85,21 @@ def _apply_input_act(
 
 
 _h3_swiglu_trace_logged = False
+_h3_low_peak_trace_logged = False
+_h3_low_peak_convrot_trace_logged = False
+
+# The failing 720-class/15s allocation is a single 2.671 GiB BF16 H3 SwiGLU
+# output.  Keep established shorter sequences on the faster whole-tensor route
+# and stream rows only once that otherwise-unavoidable activation crosses 2 GiB.
+_H3_LOW_PEAK_MIN_ACTIVATION_BYTES = 2 * 1024**3
+_H3_LOW_PEAK_MIN_ROTATION_BYTES = 1024**3
+_H3_LOW_PEAK_CHUNK_BYTES = 256 * 1024**2
+_H3_LOW_PEAK_ROW_ALIGNMENT = 4096
+_H3_SWIGLU_INPUT_FEATURES = 28672
+_H3_SWIGLU_OUTPUT_FEATURES = 14336
+_H3_FFN_DOWN_FEATURES = 5376
+_H3_ATTN_OUTPUT_INPUT_FEATURES = 7168
+_H3_ATTN_OUTPUT_FEATURES = 5376
 
 
 def _is_supported_h3_swiglu_target() -> bool:
@@ -148,6 +163,196 @@ def _apply_h3_swiglu_exact(x: torch.Tensor, native) -> torch.Tensor:
             flush=True,
         )
         _h3_swiglu_trace_logged = True
+    return output
+
+
+def _h3_low_peak_chunk_rows(columns: int) -> int:
+    """Bound one BF16 chunk while retaining the tuned rowwise threshold."""
+    rows = _H3_LOW_PEAK_CHUNK_BYTES // (columns * 2)
+    rows = rows // _H3_LOW_PEAK_ROW_ALIGNMENT * _H3_LOW_PEAK_ROW_ALIGNMENT
+    return max(_H3_LOW_PEAK_ROW_ALIGNMENT, rows)
+
+
+def _can_stream_h3_swiglu(
+    x: torch.Tensor,
+    native,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    convrot: bool,
+    convrot_groupsize: int,
+    input_act: Optional[str],
+) -> bool:
+    """Match the exact H3 FFN-down boundary that needs bounded peak memory."""
+    if not _can_fuse_h3_swiglu(
+        x,
+        native,
+        weight,
+        convrot,
+        convrot_groupsize,
+        input_act,
+    ):
+        return False
+    activation_bytes = (
+        x.shape[0] * (x.shape[1] // 2) * x.element_size()
+    )
+    return bool(
+        x.shape[1] == _H3_SWIGLU_INPUT_FEATURES
+        and weight.shape
+        == (_H3_FFN_DOWN_FEATURES, _H3_SWIGLU_OUTPUT_FEATURES)
+        and bias is None
+        and out_dtype == torch.bfloat16
+        and activation_bytes >= _H3_LOW_PEAK_MIN_ACTIVATION_BYTES
+        and hasattr(native, "rotate_convrot")
+        and hasattr(native, "quantize_int8_rowwise_fused")
+        and hasattr(native, "int8_linear_prequantized_out")
+    )
+
+
+def _stream_h3_swiglu_int8_linear(
+    x: torch.Tensor,
+    native,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    dtype_code: int,
+) -> torch.Tensor:
+    """Run exact H3 FFN-down row chunks into one final output allocation."""
+    global _h3_low_peak_trace_logged
+
+    rows = x.shape[0]
+    columns = x.shape[1] // 2
+    chunk_rows = _h3_low_peak_chunk_rows(columns)
+    output = torch.empty(
+        (rows, weight.shape[0]), device=x.device, dtype=torch.bfloat16
+    )
+    for start in range(0, rows, chunk_rows):
+        stop = min(start + chunk_rows, rows)
+        chunk = x[start:stop]
+        gate, up = chunk.chunk(2, dim=-1)
+        activated = native.fused_silu_mul_exact_bf16(gate, up)
+        rotated = native.rotate_convrot(activated, 256)
+        x_int8, x_scale = native.quantize_int8_rowwise_fused(rotated)
+        output_chunk = output[start:stop]
+        native.int8_linear_prequantized_out(
+            x_int8,
+            x_scale,
+            weight,
+            weight_scale,
+            None,
+            dtype_code,
+            output_chunk,
+        )
+        # Do not retain the previous chunk while launching the next producer.
+        # PyTorch's XPU allocator records stream use before recycling storage.
+        del (
+            output_chunk,
+            x_scale,
+            x_int8,
+            rotated,
+            activated,
+            up,
+            gate,
+            chunk,
+        )
+
+    if (
+        not _h3_low_peak_trace_logged
+        and os.environ.get("OMNIXPU_H3_LOW_PEAK_TRACE") == "1"
+    ):
+        print(
+            "[OmniXPU] H3 low-peak FFN route: "
+            f"input={tuple(x.shape)} output={tuple(output.shape)} "
+            f"chunk_rows={chunk_rows}",
+            flush=True,
+        )
+        _h3_low_peak_trace_logged = True
+    return output
+
+
+def _can_stream_h3_convrot(
+    x: torch.Tensor,
+    native,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    convrot: bool,
+    convrot_groupsize: int,
+    input_act: Optional[str],
+) -> bool:
+    """Match the long-sequence H3 attention-output ConvRot boundary."""
+    rotation_bytes = x.numel() * x.element_size()
+    return bool(
+        input_act in (None, "none")
+        and convrot
+        and convrot_groupsize == 256
+        and _is_supported_h3_swiglu_target()
+        and native is not None
+        and isinstance(x, torch.Tensor)
+        and x.device.type == "xpu"
+        and x.dtype == torch.bfloat16
+        and x.ndim == 2
+        and x.shape[0] > 0
+        and x.shape[1] == _H3_ATTN_OUTPUT_INPUT_FEATURES
+        and x.is_contiguous()
+        and not x.requires_grad
+        and isinstance(weight, torch.Tensor)
+        and weight.device == x.device
+        and weight.dtype == torch.int8
+        and tuple(weight.shape)
+        == (_H3_ATTN_OUTPUT_FEATURES, _H3_ATTN_OUTPUT_INPUT_FEATURES)
+        and weight.is_contiguous()
+        and bias is None
+        and out_dtype == torch.bfloat16
+        and rotation_bytes >= _H3_LOW_PEAK_MIN_ROTATION_BYTES
+        and hasattr(native, "rotate_convrot")
+        and hasattr(native, "quantize_int8_rowwise_fused")
+        and hasattr(native, "int8_linear_prequantized_out")
+    )
+
+
+def _stream_h3_convrot_int8_linear(
+    x: torch.Tensor,
+    native,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    dtype_code: int,
+) -> torch.Tensor:
+    """Stream H3 attention-output rotation and quantization by rows."""
+    global _h3_low_peak_convrot_trace_logged
+
+    rows = x.shape[0]
+    chunk_rows = _h3_low_peak_chunk_rows(x.shape[1])
+    output = torch.empty(
+        (rows, weight.shape[0]), device=x.device, dtype=torch.bfloat16
+    )
+    for start in range(0, rows, chunk_rows):
+        stop = min(start + chunk_rows, rows)
+        chunk = x[start:stop]
+        rotated = native.rotate_convrot(chunk, 256)
+        x_int8, x_scale = native.quantize_int8_rowwise_fused(rotated)
+        output_chunk = output[start:stop]
+        native.int8_linear_prequantized_out(
+            x_int8,
+            x_scale,
+            weight,
+            weight_scale,
+            None,
+            dtype_code,
+            output_chunk,
+        )
+        del output_chunk, x_scale, x_int8, rotated, chunk
+
+    if (
+        not _h3_low_peak_convrot_trace_logged
+        and os.environ.get("OMNIXPU_H3_LOW_PEAK_TRACE") == "1"
+    ):
+        print(
+            "[OmniXPU] H3 low-peak ConvRot route: "
+            f"input={tuple(x.shape)} output={tuple(output.shape)} "
+            f"chunk_rows={chunk_rows}",
+            flush=True,
+        )
+        _h3_low_peak_convrot_trace_logged = True
     return output
 
 
@@ -716,6 +921,44 @@ def int8_linear(
                 weight,
                 weight_scale,
                 bias,
+                dtype_code,
+            )
+        if _can_stream_h3_swiglu(
+            x,
+            native,
+            weight,
+            bias,
+            out_dtype,
+            convrot,
+            convrot_groupsize,
+            input_act,
+        ):
+            _clear_krea2_activation_cache()
+            _clear_bmg_qkv_activation_cache()
+            return _stream_h3_swiglu_int8_linear(
+                x,
+                native,
+                weight,
+                weight_scale,
+                dtype_code,
+            )
+        if _can_stream_h3_convrot(
+            x,
+            native,
+            weight,
+            bias,
+            out_dtype,
+            convrot,
+            convrot_groupsize,
+            input_act,
+        ):
+            _clear_krea2_activation_cache()
+            _clear_bmg_qkv_activation_cache()
+            return _stream_h3_convrot_int8_linear(
+                x,
+                native,
+                weight,
+                weight_scale,
                 dtype_code,
             )
         if _can_fuse_h3_swiglu(
