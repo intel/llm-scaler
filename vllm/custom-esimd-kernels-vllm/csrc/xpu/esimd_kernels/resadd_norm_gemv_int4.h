@@ -485,6 +485,174 @@ struct ResAddNormGEMV_int4_ksplit_kernel {
     }
 };
 
+/* ================================================================
+ * Prepass kernel: resadd + Gemma-style RMSNorm, K split across WGs.
+ *
+ * Motivation: the fused ResAddNormGEMV kernel above performs the
+ * residual += hidden update only in the n==0 WG, while every WG reads
+ * residual independently in pass-1 sum_sq. When N is large (more WGs
+ * than concurrently resident on the device), later WGs read the
+ * already-updated residual and compute added = h + (h+r_old) instead
+ * of added = h + r_old — producing incorrect GEMV output. The actual
+ * bug manifests at N≳512 even for small K.
+ *
+ * To avoid a cross-WG sync (not expressible in SYCL), split the work:
+ *   Pass A (this kernel): each WG owns a K-chunk, computes added = h+r,
+ *     writes back residual and normed_out. No cross-WG dependency.
+ *   Pass B (GEMV kernel): reads normed_out, writes output.
+ *
+ * Grid: K_WG work-groups × 1 thread, each owns VL=512 elements.
+ * sum_sq is reduced across WGs via a workgroup-local atomic on an
+ * SLM-staged float accumulator, then Gemma-style rsqrt is applied.
+ *
+ * For simplicity and correctness, this prepass uses a two-phase design
+ * mirroring fused_add_rms_norm.h: phase 1 computes partial sums with
+ * atomic add into a device-global scratch; phase 2 reads the final
+ * inv_rms and writes normed_out. But to avoid adding a scratch buffer
+ * to the public ABI, we use the caller-provided normed_out as scratch
+ * for the partial-sum accumulator during phase 1 (word[0] = sum_sq),
+ * which is then overwritten in phase 2.
+ *
+ * Simplest correct implementation: single WG (K<=8192 covers all
+ * callers), one thread, full K pass. For K=5120 fp16 this runs in a
+ * few µs and is not a bottleneck relative to the subsequent N×K GEMV.
+ * ================================================================ */
+struct ResAddNormPrepass_int4_kernel {
+    fp16*       hidden_ptr;
+    fp16*       residual_ptr;   // [K] — updated in-place
+    const fp16* norm_w_ptr;     // [K]
+    fp16*       normed_out;     // [K] — written
+    int K;
+    float eps;
+
+    static constexpr int VL = 512;
+
+    void operator()(sycl::nd_item<1> /*item*/) const SYCL_ESIMD_KERNEL {
+        const int n_chunks = K / VL;
+        const int tail = K - n_chunks * VL;
+
+        // Pass 1: residual += hidden, accumulate sum_sq.
+        float sum_sq = 0.0f;
+        for (int c = 0; c < n_chunks; c++) {
+            int off = c * VL;
+            simd<float, VL> h = block_load<fp16, VL>(hidden_ptr + off);
+            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + off);
+            simd<float, VL> added = h + r;
+            block_store<fp16, VL>(residual_ptr + off, simd<fp16, VL>(added));
+            simd<float, VL> sq = added * added;
+            sq.select<256,1>(0) += sq.select<256,1>(256);
+            sq.select<128,1>(0) += sq.select<128,1>(128);
+            sq.select<64,1>(0)  += sq.select<64,1>(64);
+            sq.select<32,1>(0)  += sq.select<32,1>(32);
+            sq.select<16,1>(0)  += sq.select<16,1>(16);
+            sq.select<8,1>(0)   += sq.select<8,1>(8);
+            sq.select<4,1>(0)   += sq.select<4,1>(4);
+            sq.select<2,1>(0)   += sq.select<2,1>(2);
+            sum_sq += (float)sq[0] + (float)sq[1];
+        }
+        // Handle remainder (callers currently always have K % VL == 0;
+        // guard for safety).
+        if (tail > 0) {
+            for (int i = n_chunks * VL; i < K; i++) {
+                float h = (float)hidden_ptr[i];
+                float r = (float)residual_ptr[i];
+                float a = h + r;
+                residual_ptr[i] = fp16(a);
+                sum_sq += a * a;
+            }
+        }
+
+        float inv_rms = sycl::ext::intel::esimd::rsqrt(
+            simd<float, 8>(sum_sq / (float)K + eps))[0];
+
+        // Pass 2: normed = residual * inv_rms * norm_w  → normed_out.
+        for (int c = 0; c < n_chunks; c++) {
+            int off = c * VL;
+            simd<float, VL> r = block_load<fp16, VL>(residual_ptr + off);
+            simd<float, VL> w = block_load<fp16, VL>(norm_w_ptr + off);
+            simd<float, VL> n = r * inv_rms * w;
+            block_store<fp16, VL>(normed_out + off, simd<fp16, VL>(n));
+        }
+        if (tail > 0) {
+            for (int i = n_chunks * VL; i < K; i++) {
+                normed_out[i] = fp16((float)residual_ptr[i] * inv_rms * (float)norm_w_ptr[i]);
+            }
+        }
+    }
+};
+
+/* ================================================================
+ * GEMV-from-normed kernel: reads the pre-computed normed_out and does
+ * INT4 GEMV. Identical math to ResAddNormGEMV_int4_pert_kernel's
+ * pass-2 without the resadd/norm prelude or the n==0 write-back.
+ * Grid: N work-groups × 1 thread.
+ * ================================================================ */
+struct GEMV_int4_from_normed_kernel {
+    const fp16*    normed_ptr;    // [K] — pre-computed normed hidden
+    const int32_t* gemv_weight;   // [N, K/8]
+    const fp16*    gemv_scale;    // [N, K/128]
+    fp16*          output;        // [N]
+    int N, K;
+
+    static constexpr int BLOCK_SIZE = 128;
+    static constexpr int PACK = 8;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        int n = item.get_group(0);
+        if (n >= N) return;
+
+        constexpr int VL = 512;
+        constexpr int BLOCKS_PER_VL = VL / BLOCK_SIZE;
+        constexpr int PACKED_PER_VL = VL / PACK;
+        const int packed_K = K / PACK;
+        const int num_blocks_per_row = K / BLOCK_SIZE;
+        const int n_chunks = K / VL;
+
+        simd<float, 64> acc = 0.0f;
+
+        if (n_chunks > 0) {
+            xesimd::lsc_prefetch<int32_t, 64, xesimd::lsc_data_size::default_size,
+                xesimd::cache_hint::uncached, xesimd::cache_hint::cached>(
+                gemv_weight + (size_t)n * packed_K);
+        }
+
+        for (int c = 0; c < n_chunks; c++) {
+            int offset = c * VL;
+            if (c + 1 < n_chunks) {
+                xesimd::lsc_prefetch<int32_t, 64, xesimd::lsc_data_size::default_size,
+                    xesimd::cache_hint::uncached, xesimd::cache_hint::cached>(
+                    gemv_weight + (size_t)n * packed_K + (c + 1) * PACKED_PER_VL);
+            }
+
+            simd<float, VL> normed = block_load<fp16, VL>(normed_ptr + offset);
+
+            simd<int32_t, PACKED_PER_VL> all_packed = block_load<int32_t, PACKED_PER_VL>(
+                gemv_weight + (size_t)n * packed_K + c * PACKED_PER_VL);
+
+            #pragma unroll
+            for (int blk = 0; blk < BLOCKS_PER_VL; blk++) {
+                int blk_off = blk * BLOCK_SIZE;
+                float s = (float)gemv_scale[(size_t)n * num_blocks_per_row + c * BLOCKS_PER_VL + blk];
+                float neg_8s = -8.0f * s;
+                simd<int32_t, 16> blk_packed = all_packed.select<16, 1>(blk * 16);
+                simd<uint32_t, 64> u32 = convert<uint32_t>(
+                    blk_packed.template bit_cast_view<uint8_t>().read());
+                simd<float, 64> w_lo = convert<float>(u32 & 0xFu) * s + neg_8s;
+                simd<float, 64> w_hi = convert<float>((u32 >> 4) & 0xFu) * s + neg_8s;
+                acc += normed.select<64, 2>(blk_off) * w_lo
+                     + normed.select<64, 2>(blk_off + 1) * w_hi;
+            }
+        }
+
+        acc.select<32,1>(0) += acc.select<32,1>(32);
+        acc.select<16,1>(0) += acc.select<16,1>(16);
+        acc.select<8,1>(0)  += acc.select<8,1>(8);
+        acc.select<4,1>(0)  += acc.select<4,1>(4);
+        acc.select<2,1>(0)  += acc.select<2,1>(2);
+        output[n] = fp16((float)acc[0] + (float)acc[1]);
+    }
+};
+
 /* Host dispatcher — auto-selects K_SPLIT based on N and K */
 inline void resadd_norm_gemv_int4_pert_host(
     fp16* hidden_ptr, fp16* residual_ptr, const fp16* norm_w_ptr,
@@ -503,7 +671,28 @@ inline void resadd_norm_gemv_int4_pert_host(
     while (ks > 1 && (K % (ks * 128) != 0)) ks /= 2;
 
     if (ks <= 1) {
-        // Original optimized kernel (VL=512 register-cached path)
+        // For large N (> 512) the in-kernel "n==0 writes residual" path
+        // races with readers in other WGs — split into a prepass + a
+        // GEMV-only kernel that reads normed_out. For N ≤ 512 the fused
+        // path is safe (all WGs execute concurrently) and faster.
+        if (N > 512) {
+            q.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(
+                    sycl::nd_range<1>(1, 1),
+                    ResAddNormPrepass_int4_kernel{
+                        hidden_ptr, residual_ptr, norm_w_ptr,
+                        normed_out, K, eps});
+            });
+            q.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(
+                    sycl::nd_range<1>(N, 1),
+                    GEMV_int4_from_normed_kernel{
+                        normed_out, gemv_weight, gemv_scale,
+                        output, N, K});
+            });
+            return;
+        }
+        // Original fused path (safe for small N)
         q.submit([&](sycl::handler& cgh) {
             cgh.parallel_for(
                 sycl::nd_range<1>(N, 1),
