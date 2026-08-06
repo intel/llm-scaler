@@ -273,6 +273,34 @@ def esimd_qkv_split_norm_rope_v(
         q_heads, kv_heads, attn_output_gate, rotary_dim, cos_sin_cache)
 
 
+def esimd_qkv_split_norm_rope_onyx(
+    qkv_state: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    positions: torch.Tensor,
+    q_heads: int,
+    kv_heads: int,
+    q_scale: float,
+    cos_sin_cache: torch.Tensor,
+) -> torch.Tensor:
+    """Onyx (day0) fused Q/K split + parameterless RMSNorm + q_scale + interleaved-pair RoPE.
+
+    head_dim is fixed at 128. Q/K get RMSNorm (parameterless: no weight tensor)
+    then interleaved-pair RoPE (is_neox_style=False). Q is additionally scaled by
+    `q_scale` (Onyx: qk_scale_factor / sqrt(head_dim)) before RoPE.
+
+    qkv_state:     [nTokens, (q_heads + 2*kv_heads)*128] fp16 contiguous
+    q_out:         [nTokens, q_heads*128] fp16
+    k_out/v_out:   [nTokens, kv_heads*128] fp16
+    positions:     [nTokens] int32
+    cos_sin_cache: [max_pos, 128] fp16, per row = concat(cos(64), sin(64))
+    """
+    return _ops.esimd_qkv_split_norm_rope_onyx(
+        qkv_state, q_out, k_out, v_out, positions,
+        q_heads, kv_heads, float(q_scale), cos_sin_cache)
+
+
 # ---- Fused Conv1d + GDN (doubleGRF, LGRF module) ----
 
 def esimd_gdn_conv_fused(
