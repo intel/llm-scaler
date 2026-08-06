@@ -62,7 +62,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_NUNCHAKU_COMMIT": (
         "NUNCHAKU_COMMIT",
-        "5cf4fa9886f45abff102d1dd91af5247b4950148",
+        "cc0f6236b6c329178ad4ef58452a874e774c7b8e",
     ),
     "COMFY_NUNCHAKU_VERSION": ("NUNCHAKU_VERSION", "1.2.1+xpu.3"),
 }
