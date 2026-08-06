@@ -490,6 +490,11 @@ void page_attn_decode(
   torch::Tensor temp_p = torch::zeros({ static_cast<long>(totalSize) },
     torch::device(kv_cache.device()).dtype(torch::kFloat32));
 
+  // The global-max reduction in the phase-1 kernels is an unconditional atomic fmax,
+  // so this slice must start below any real score. The rest of temp_p stays zeroed.
+  temp_p.narrow(0, static_cast<long>(szP + szGroupMax),
+    static_cast<long>(szGlobalMax)).fill_(FP32_MIN);
+
   float* pState = (float*)temp_p.data_ptr();
   float* pGroupMax = pState + szP;
   float* pGlobalMax = pGroupMax + szGroupMax;
