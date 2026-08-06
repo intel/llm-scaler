@@ -163,6 +163,10 @@ class ComfyUIImageContractTest(unittest.TestCase):
         self.assertIn("FROM python-base AS aimdo-wheel", dockerfile)
         self.assertIn("./scripts/build-linux-xpu.sh", dockerfile)
         self.assertIn(
+            'SETUPTOOLS_SCM_PRETEND_VERSION="${COMFY_AIMDO_VERSION}"',
+            dockerfile,
+        )
+        self.assertIn(
             "/wheels/comfy_aimdo-${COMFY_AIMDO_VERSION}-*.whl",
             dockerfile,
         )

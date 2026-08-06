@@ -267,7 +267,7 @@ RUN test "$(cat /llm/comfy-aimdo-xpu/.omni-source-revision)" = \
     source /opt/intel/oneapi/setvars.sh --force && \
     cd /llm/comfy-aimdo-xpu && \
     ./scripts/build-linux-xpu.sh && \
-    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_COMFY_AIMDO="${COMFY_AIMDO_VERSION}" \
+    SETUPTOOLS_SCM_PRETEND_VERSION="${COMFY_AIMDO_VERSION}" \
         pip wheel . --wheel-dir /wheels --no-deps --no-build-isolation
 
 # ======== Omni kernel wheel branch ========
