@@ -104,7 +104,7 @@ The focused image contains:
   [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/f7250fa44cb6f593969ba869be803e7d03c80ec8),
   including the managed GGUF and Nunchaku W4A16 routes;
 - `comfy-aimdo==0.4.13` from the XPU-enabled
-  [`comfy-aimdo` fork](https://github.com/xiangyuT/comfy-aimdo) at revision
+  [`comfy-aimdo` fork](https://github.com/xiangyuT/comfy-aimdo-xpu) at revision
   `6fda6e619e1647134d4ced4370e5fad488779d62`, built with its Level Zero
   allocator backend;
 - [`ComfyUI-GGUF-XPU`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),

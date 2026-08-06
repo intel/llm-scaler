@@ -32,7 +32,6 @@ The supported environment overrides are:
 | `COMFY_AIMDO_REPOSITORY` | AIMDO source repository identity | pinned in `build.sh` |
 | `COMFY_AIMDO_COMMIT` | AIMDO source revision | pinned in `build.sh` |
 | `COMFY_AIMDO_VERSION` | Expected AIMDO wheel version | pinned in `build.sh` |
-| `COMFY_AIMDO_SOURCE_DIR` | Clean local AIMDO checkout exported as an exact BuildKit context | adjacent `comfy-aimdo-xpu` checkout |
 | `COMFY_GGUF_REPOSITORY` | GGUF custom-node source repository | pinned in `build.sh` |
 | `COMFY_GGUF_COMMIT` | GGUF custom-node source revision | pinned in `build.sh` |
 | `COMFY_NUNCHAKU_REPOSITORY` | Combined Nunchaku custom-node/runtime repository | pinned in `build.sh` |
@@ -46,11 +45,9 @@ The same rule applies to the combined Nunchaku repository, commit, and
 distribution version. The kernel source is copied from
 `omni/omni_xpu_kernel` in the current llm-scaler checkout.
 
-The AIMDO revision is exported from a clean local checkout with `git archive`
-and supplied as a named BuildKit context. This permits exact local milestone
-validation before publication while preventing ignored build products from
-entering the image. The source checkout must match the pinned full commit and
-have no tracked or untracked changes.
+The AIMDO revision must be reachable from its pinned remote. The build fetches
+and checks out that exact full commit before compiling the Level Zero backend;
+branch names are not used as image identity.
 
 The focused image installs the v0.30 integrated `comfyui-manager` package and
 does not clone the legacy Manager custom node. Frontend, workflow templates,

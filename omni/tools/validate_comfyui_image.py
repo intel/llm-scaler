@@ -44,6 +44,10 @@ PINNED_CHECKOUTS = {
         Path("/llm/comfy-kitchen-xpu"),
         "OMNI_COMFY_KITCHEN_REVISION",
     ),
+    "Comfy AIMDO": (
+        Path("/llm/comfy-aimdo-xpu"),
+        "OMNI_COMFY_AIMDO_REVISION",
+    ),
     "GGUF custom node": (
         Path("/llm/ComfyUI/custom_nodes/ComfyUI-GGUF-XPU"),
         "OMNI_COMFY_GGUF_REVISION",
@@ -83,7 +87,6 @@ PINNED_MINIMAX_H3_TEMPLATE_HASHES = {
 COMFYUI_ROOT = Path("/llm/ComfyUI")
 COMFYUI_DATABASE_DIRECTORY = COMFYUI_ROOT / "user"
 AIMDO_SOURCE_ROOT = Path("/llm/comfy-aimdo-xpu")
-AIMDO_SOURCE_MARKER = AIMDO_SOURCE_ROOT / ".omni-source-revision"
 
 
 def require_equal(label: str, actual: str, expected: str) -> None:
@@ -162,16 +165,6 @@ def main() -> None:
     for label, (path, environment_variable) in PINNED_CHECKOUTS.items():
         require_checkout_revision(label, path, os.environ[environment_variable])
 
-    require_full_revision("Comfy AIMDO revision", expected_aimdo_revision)
-    if not AIMDO_SOURCE_MARKER.is_file():
-        raise RuntimeError(
-            f"Comfy AIMDO source marker is missing: {AIMDO_SOURCE_MARKER}"
-        )
-    require_equal(
-        "Comfy AIMDO source revision",
-        AIMDO_SOURCE_MARKER.read_text(encoding="utf-8").strip(),
-        expected_aimdo_revision,
-    )
     require_equal(
         "Comfy AIMDO distribution version",
         importlib.metadata.version("comfy-aimdo"),

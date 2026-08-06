@@ -29,7 +29,7 @@ ARG COMFYUI_MANAGER_VERSION=4.2.2
 ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
 ARG COMFY_KITCHEN_COMMIT=f7250fa44cb6f593969ba869be803e7d03c80ec8
 ARG COMFY_KITCHEN_VERSION=0.2.26
-ARG COMFY_AIMDO_REPOSITORY=https://github.com/xiangyuT/comfy-aimdo.git
+ARG COMFY_AIMDO_REPOSITORY=https://github.com/xiangyuT/comfy-aimdo-xpu.git
 ARG COMFY_AIMDO_COMMIT=6fda6e619e1647134d4ced4370e5fad488779d62
 ARG COMFY_AIMDO_VERSION=0.4.13
 ARG COMFY_GGUF_REPOSITORY=https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git
@@ -253,17 +253,19 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip wheel . --wheel-dir /wheels --no-deps --no-build-isolation
 
 # ======== AIMDO XPU wheel branch ========
-# build.sh provides a clean `git archive` of the exact local AIMDO commit as a
-# named BuildKit context. The commit may remain local while milestone evidence
-# is reviewed; the marker and OCI label keep the source identity immutable.
 FROM python-base AS aimdo-wheel
 
+ARG COMFY_AIMDO_REPOSITORY
 ARG COMFY_AIMDO_COMMIT
 ARG COMFY_AIMDO_VERSION
 
-COPY --from=comfy_aimdo_source / /llm/comfy-aimdo-xpu
-RUN test "$(cat /llm/comfy-aimdo-xpu/.omni-source-revision)" = \
+RUN cd /llm && \
+    git clone --filter=blob:none --no-checkout \
+        "${COMFY_AIMDO_REPOSITORY}" comfy-aimdo-xpu && \
+    git -C comfy-aimdo-xpu fetch --depth 1 origin \
         "${COMFY_AIMDO_COMMIT}" && \
+    git -C comfy-aimdo-xpu checkout --detach FETCH_HEAD && \
+    pip install setuptools-scm==10.2.1 && \
     source /opt/intel/oneapi/setvars.sh --force && \
     cd /llm/comfy-aimdo-xpu && \
     ./scripts/build-linux-xpu.sh && \

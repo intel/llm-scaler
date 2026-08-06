@@ -41,7 +41,7 @@ COMPONENT_PINS = {
     "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.26"),
     "COMFY_AIMDO_REPOSITORY": (
         "AIMDO_REPOSITORY",
-        "https://github.com/xiangyuT/comfy-aimdo.git",
+        "https://github.com/xiangyuT/comfy-aimdo-xpu.git",
     ),
     "COMFY_AIMDO_COMMIT": (
         "AIMDO_COMMIT",
@@ -138,6 +138,7 @@ class ComfyUIImageContractTest(unittest.TestCase):
             {
                 "ComfyUI",
                 "Kitchen",
+                "Comfy AIMDO",
                 "GGUF custom node",
                 "combined Nunchaku custom node/runtime",
             },
@@ -147,20 +148,20 @@ class ComfyUIImageContractTest(unittest.TestCase):
             validator.REQUIRED_KITCHEN_CAPABILITIES,
         )
 
-    def test_aimdo_xpu_is_built_from_an_exact_local_commit(self):
+    def test_aimdo_xpu_is_built_from_an_exact_remote_commit(self):
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
-        build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
         validator = load_validator()
 
-        self.assertIn(
-            '--build-context "comfy_aimdo_source=${AIMDO_CONTEXT_DIR}"',
-            build_script,
-        )
-        self.assertIn(
-            "git -C \"${AIMDO_SOURCE_DIR}\" archive",
-            build_script,
-        )
         self.assertIn("FROM python-base AS aimdo-wheel", dockerfile)
+        self.assertIn(
+            '"${COMFY_AIMDO_REPOSITORY}" comfy-aimdo-xpu',
+            dockerfile,
+        )
+        self.assertIn(
+            "git -C comfy-aimdo-xpu fetch --depth 1 origin",
+            dockerfile,
+        )
+        self.assertIn("pip install setuptools-scm==10.2.1", dockerfile)
         self.assertIn("./scripts/build-linux-xpu.sh", dockerfile)
         self.assertIn(
             'SETUPTOOLS_SCM_PRETEND_VERSION="${COMFY_AIMDO_VERSION}"',
@@ -171,8 +172,11 @@ class ComfyUIImageContractTest(unittest.TestCase):
             dockerfile,
         )
         self.assertEqual(
-            validator.AIMDO_SOURCE_MARKER,
-            Path("/llm/comfy-aimdo-xpu/.omni-source-revision"),
+            validator.PINNED_CHECKOUTS["Comfy AIMDO"],
+            (
+                Path("/llm/comfy-aimdo-xpu"),
+                "OMNI_COMFY_AIMDO_REVISION",
+            ),
         )
 
     def test_comfyui_v030_dependencies_are_pinned_and_validated(self):
