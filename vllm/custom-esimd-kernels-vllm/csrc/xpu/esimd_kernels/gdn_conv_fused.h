@@ -68,11 +68,9 @@ ESIMD_INLINE float gdn_dot128(simd<float, 64> a_lo, simd<float, 64> a_hi,
 }
 
 ESIMD_INLINE float gdn_load_fp16_scalar(const fp16* base, int64_t idx) {
-    int64_t aligned = idx & ~15;
-    int lane = (int)(idx & 15);
-    simd<fp16, 16> chunk = block_load<fp16, 16>(base + aligned);
-    simd<float, 16> chunk_f32 = chunk;
-    return chunk_f32[lane];
+    simd<fp16, 1> value = block_load<fp16, 1>(base + idx);
+    simd<float, 1> value_f32 = value;
+    return value_f32[0];
 }
 
 /* ---- SLM layout per WG (byte offsets) ---- */
@@ -104,7 +102,7 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
     fp16* __restrict__ z_out_ptr,
     int N, int H, int HV, int gdn_K, int gdn_V,
     float attn_scale, int64_t conv_stride0, int64_t ssm_stride0,
-    int inline_conv_shift,   // 1 = do conv_state shift inline (safe when N*HV<=32)
+    int num_conv_states, int num_ssm_states,
     nd_item<3>& ndi)
 {
     slm_init<2048>();
@@ -131,6 +129,19 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
 
     const int conv_idx = conv_state_indices_ptr[seq_idx];
     const int ssm_idx = ssm_state_indices_ptr[seq_idx];
+
+    if (conv_idx < 0 || conv_idx >= num_conv_states ||
+        ssm_idx < 0 || ssm_idx >= num_ssm_states) {
+        for (int i = tid; i < HV * gdn_V; i += 32) {
+            block_store<fp16, 1>(
+                output_ptr + (int64_t)seq_idx * HV * gdn_V + i,
+                simd<fp16, 1>(0));
+            block_store<fp16, 1>(
+                z_out_ptr + (int64_t)seq_idx * HV * gdn_V + i,
+                simd<fp16, 1>(0));
+        }
+        return;
+    }
 
     // ---- Compute qkvz read offset and conv_state chunk_start ----
     const int group_dim = gdn_K + gdn_K + heads_per_group * gdn_V * 2;
@@ -357,24 +368,6 @@ ESIMD_INLINE void gdn_conv_fused_kernel_v9(
             out, simd<fp16, 4>(0.0f));
     }
 
-    // ---- Phase 3: conv_state shift (inline path, only when N*HV <= 32) ----
-    // When N*HV > 32, the shift is done by a separate kernel to avoid a
-    // cross-WG race: hv==0's writes could land before a later-scheduled WG's
-    // Phase 1 reads for the same seq_idx.
-    if (inline_conv_shift && conv_idx >= 0 && hv == 0 && is_valid) {
-        // lo chunk (valid threads only)
-        block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start, simd<fp16, 64>(s1));
-        block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start, simd<fp16, 64>(s2));
-        block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start, x_fp16);
-
-        // hi chunk (v-threads only, when double_v)
-        if (double_v && tid >= 4 * H) {
-            block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start_hi, simd<fp16, 64>(s1_hi));
-            block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start_hi, simd<fp16, 64>(s2_hi));
-            block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start_hi, x_fp16_hi);
-        }
-    }
-
     // ---- z extraction: v-threads copy z from qkvz to z_out ----
     if (tid >= 4 * H && is_valid) {
         int v_tid = tid - 4 * H;
@@ -431,6 +424,7 @@ ESIMD_INLINE void conv_state_shift_kernel(
     fp16* __restrict__ conv_state_ptr,
     const int* __restrict__ conv_state_indices_ptr,
     int N, int H, int HV, int gdn_K, int gdn_V,
+    int num_conv_states,
     int64_t conv_stride0,
     nd_item<3>& ndi)
 {
@@ -438,7 +432,7 @@ ESIMD_INLINE void conv_state_shift_kernel(
     const int tid = ndi.get_local_id(2);
 
     const int conv_idx = conv_state_indices_ptr[seq_idx];
-    if (conv_idx < 0) return;
+    if (conv_idx < 0 || conv_idx >= num_conv_states) return;
 
     const int heads_per_group = HV / H;
     const int dim = 2 * H * gdn_K + HV * gdn_V;
@@ -533,21 +527,16 @@ inline void gdn_conv_fused_host(
     float scale,
     int64_t conv_stride0,
     int64_t ssm_stride0,
+    int num_conv_states,
+    int num_ssm_states,
     sycl::queue& q)
 {
     constexpr int WG_SIZE = 32;
-    const int total_wgs = N * HV;
-
-    // When total WGs fit in a single scheduling wave (<=32), all WGs run
-    // concurrently so the hv==0 inline conv_state shift is safe.  Otherwise
-    // split into two kernels to avoid the cross-WG read/write race.
-    const int inline_shift = (total_wgs <= WG_SIZE) ? 1 : 0;
-
     sycl::nd_range<3> Range(
         sycl::range<3>(N, HV, WG_SIZE),
         sycl::range<3>(1, 1, WG_SIZE));
 
-    q.submit([&](sycl::handler& cgh) {
+    auto main_event = q.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(Range, [=](sycl::nd_item<3> ndi) SYCL_ESIMD_KERNEL {
             gdn_conv_fused_kernel_v9(
                 qkvz_ptr, qkvz_stride0, conv_state_ptr,
@@ -556,25 +545,23 @@ inline void gdn_conv_fused_host(
                 ssm_state_ptr, ssm_state_indices_ptr,
                 output_ptr, z_out_ptr,
                 N, H, HV, K, V, scale, conv_stride0, ssm_stride0,
-                inline_shift, ndi);
+                num_conv_states, num_ssm_states, ndi);
         });
     });
 
-    if (!inline_shift) {
-        // Separate kernel for conv_state shift — runs after kernel 1
-        // completes (in-order queue guarantees ordering).
-        sycl::nd_range<3> ShiftRange(
-            sycl::range<3>(N, 1, WG_SIZE),
-            sycl::range<3>(1, 1, WG_SIZE));
+    sycl::nd_range<3> ShiftRange(
+        sycl::range<3>(N, 1, WG_SIZE),
+        sycl::range<3>(1, 1, WG_SIZE));
 
-        q.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(ShiftRange, [=](sycl::nd_item<3> ndi) SYCL_ESIMD_KERNEL {
-                conv_state_shift_kernel(
-                    qkvz_ptr, qkvz_stride0, conv_state_ptr,
-                    conv_state_indices_ptr,
-                    N, H, HV, K, V,
-                    conv_stride0, ndi);
-            });
+    q.submit([&](sycl::handler& cgh) {
+        cgh.depends_on(main_event);
+        cgh.parallel_for(ShiftRange, [=](sycl::nd_item<3> ndi) SYCL_ESIMD_KERNEL {
+            conv_state_shift_kernel(
+                qkvz_ptr, qkvz_stride0, conv_state_ptr,
+                conv_state_indices_ptr,
+                N, H, HV, K, V,
+                num_conv_states,
+                conv_stride0, ndi);
         });
-    }
+    });
 }
