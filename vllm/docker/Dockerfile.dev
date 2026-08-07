@@ -79,7 +79,6 @@ RUN python3 -m venv ${VIRTUAL_ENV}
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
-ENV LD_LIBRARY_PATH=/opt/intel/oneapi/ccl/2021.15/lib:/opt/intel/oneapi/mpi/2021.15/lib:/opt/intel/oneapi/compiler/2025.3/lib:/usr/local/lib
 
 RUN curl -fL --retry 3 -o "${ONECCL_INSTALLER}" \
         "https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.9/${ONECCL_INSTALLER}" \
