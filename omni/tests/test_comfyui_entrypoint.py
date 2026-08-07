@@ -53,6 +53,7 @@ def test_entrypoint_reserves_four_gib_by_default(tmp_path):
         "8188",
         "--reserve-vram",
         "4",
+        "--enable-dynamic-vram",
         "--enable-manager",
         "--disable-all-custom-nodes",
     ]
@@ -63,6 +64,7 @@ def test_entrypoint_loads_custom_nodes_by_default(tmp_path):
 
     assert completed.returncode == 0
     assert "--enable-manager" in arguments
+    assert "--enable-dynamic-vram" in arguments
     assert "--disable-all-custom-nodes" not in arguments
 
 

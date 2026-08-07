@@ -105,6 +105,10 @@ namespace int8_ops {
         torch::Tensor x_int8, torch::Tensor x_scale, torch::Tensor weight,
         torch::Tensor weight_scale, std::optional<torch::Tensor> bias,
         int64_t out_dtype_code);
+    torch::Tensor int8_linear_prequantized_out(
+        torch::Tensor x_int8, torch::Tensor x_scale, torch::Tensor weight,
+        torch::Tensor weight_scale, std::optional<torch::Tensor> bias,
+        int64_t out_dtype_code, torch::Tensor output);
 #if defined(OMNI_XPU_ARCH_BMG)
     std::tuple<torch::Tensor, torch::Tensor> int8_linear_pair_prequantized(
         torch::Tensor x_int8, torch::Tensor x_scale,
@@ -127,6 +131,8 @@ namespace int8_ops {
         torch::Tensor input);
 #endif
     torch::Tensor fused_silu_mul(torch::Tensor x1, torch::Tensor x2);
+    torch::Tensor fused_silu_mul_exact_bf16(
+        torch::Tensor gate, torch::Tensor up);
     std::tuple<torch::Tensor, torch::Tensor> fused_silu_mul_quantize_rowwise(
         torch::Tensor x1, torch::Tensor x2);
     std::tuple<torch::Tensor, torch::Tensor> fused_swiglu_quantize_rowwise(
@@ -532,6 +538,14 @@ PYBIND11_MODULE(_C, m) {
         py::arg("x_int8"), py::arg("x_scale"), py::arg("weight"),
         py::arg("weight_scale"), py::arg("bias") = py::none(),
         py::arg("out_dtype_code") = 2);
+    int8.def(
+        "int8_linear_prequantized_out",
+        &omni_xpu::int8_ops::int8_linear_prequantized_out,
+        "INT8 linear into a caller-provided contiguous output tensor.\n"
+        "Used by bounded-memory row streaming without an extra output copy.",
+        py::arg("x_int8"), py::arg("x_scale"), py::arg("weight"),
+        py::arg("weight_scale"), py::arg("bias"),
+        py::arg("out_dtype_code"), py::arg("output"));
 #if defined(OMNI_XPU_ARCH_BMG)
     int8.def(
         "int8_linear_pair_prequantized",
@@ -583,6 +597,11 @@ PYBIND11_MODULE(_C, m) {
         "Input: x1/x2 identical bf16/f16 tensors\n"
         "Output: floating tensor with the input shape and dtype",
         py::arg("x1"), py::arg("x2"));
+    int8.def(
+        "fused_silu_mul_exact_bf16",
+        &omni_xpu::int8_ops::fused_silu_mul_exact_bf16,
+        "Exact-order BF16 SiLU(gate) * up for strided H3 activation halves",
+        py::arg("gate"), py::arg("up"));
     int8.def("fused_silu_mul_quantize_rowwise", &omni_xpu::int8_ops::fused_silu_mul_quantize_rowwise,
         "Fused SiLU(x1) * x2 followed by deterministic rowwise INT8 quantization.\n"
         "Does not materialize the floating SwiGLU intermediate.\n"

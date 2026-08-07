@@ -44,6 +44,10 @@ PINNED_CHECKOUTS = {
         Path("/llm/comfy-kitchen-xpu"),
         "OMNI_COMFY_KITCHEN_REVISION",
     ),
+    "Comfy AIMDO": (
+        Path("/llm/comfy-aimdo-xpu"),
+        "OMNI_COMFY_AIMDO_REVISION",
+    ),
     "GGUF custom node": (
         Path("/llm/ComfyUI/custom_nodes/ComfyUI-GGUF-XPU"),
         "OMNI_COMFY_GGUF_REVISION",
@@ -74,9 +78,15 @@ REQUIRED_MINIMAX_H3_TEMPLATES = {
     "video_minimax_h3_r2v.json",
     "video_minimax_h3_t2v.json",
 }
+PINNED_MINIMAX_H3_TEMPLATE_HASHES = {
+    "video_minimax_h3_t2v.json": (
+        "31ab33fdb053a7834cc866bd7aa08b887518fc656e4a796c89779c6b5e1786e6"
+    ),
+}
 
 COMFYUI_ROOT = Path("/llm/ComfyUI")
 COMFYUI_DATABASE_DIRECTORY = COMFYUI_ROOT / "user"
+AIMDO_SOURCE_ROOT = Path("/llm/comfy-aimdo-xpu")
 
 
 def require_equal(label: str, actual: str, expected: str) -> None:
@@ -128,6 +138,7 @@ def main() -> None:
     add_comfyui_to_import_path()
 
     import torch
+    import comfy_aimdo.control
     import comfy_kitchen
     import comfyui_manager
     import nunchaku_torch
@@ -139,6 +150,8 @@ def main() -> None:
     expected_target = os.environ["OMNI_IMAGE_XPU_TARGET"]
     expected_comfyui = os.environ["OMNI_COMFYUI_VERSION"]
     expected_kitchen = os.environ["OMNI_COMFY_KITCHEN_VERSION"]
+    expected_aimdo = os.environ["OMNI_COMFY_AIMDO_VERSION"]
+    expected_aimdo_revision = os.environ["OMNI_COMFY_AIMDO_REVISION"]
     expected_nunchaku = os.environ["OMNI_COMFY_NUNCHAKU_VERSION"]
     source_revision = os.environ["OMNI_LLM_SCALER_SOURCE_REVISION"]
     source_dirty = os.environ["OMNI_LLM_SCALER_SOURCE_DIRTY"]
@@ -151,6 +164,26 @@ def main() -> None:
         require_equal("llm-scaler source dirty", source_dirty, "false")
     for label, (path, environment_variable) in PINNED_CHECKOUTS.items():
         require_checkout_revision(label, path, os.environ[environment_variable])
+
+    require_equal(
+        "Comfy AIMDO distribution version",
+        importlib.metadata.version("comfy-aimdo"),
+        expected_aimdo,
+    )
+    require_equal(
+        "Comfy AIMDO detected backend",
+        str(comfy_aimdo.control.detect_vendor()),
+        "xpu",
+    )
+    aimdo_xpu_library = Path(comfy_aimdo.control.__file__).with_name(
+        "aimdo_xpu.so"
+    )
+    if not aimdo_xpu_library.is_file():
+        raise RuntimeError(
+            f"Comfy AIMDO XPU library is missing: {aimdo_xpu_library}"
+        )
+    if not (AIMDO_SOURCE_ROOT / "tests" / "test_xpu_backend.py").is_file():
+        raise RuntimeError("Comfy AIMDO installed-image XPU tests are missing")
 
     comfyui_version = run_path("/llm/ComfyUI/comfyui_version.py")["__version__"]
     require_equal("ComfyUI version", comfyui_version, expected_comfyui)
@@ -197,6 +230,12 @@ def main() -> None:
         path = template_root / name
         json.loads(path.read_text(encoding="utf-8"))
         h3_template_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    for name, expected_hash in PINNED_MINIMAX_H3_TEMPLATE_HASHES.items():
+        require_equal(
+            f"MiniMax H3 official template hash ({name})",
+            h3_template_hashes[name],
+            expected_hash,
+        )
 
     dependency_manifest = Path("/llm/manifests/comfyui-python-freeze.txt")
     if not dependency_manifest.is_file() or not dependency_manifest.read_text(
@@ -317,6 +356,7 @@ def main() -> None:
         f"{comfyui_dependency_versions['comfyui-workflow-templates']}, "
         f"manager={comfyui_dependency_versions['comfyui-manager']}, "
         f"kitchen={expected_kitchen}, "
+        f"aimdo={expected_aimdo}@{expected_aimdo_revision[:12]}, "
         f"gguf={dependency_versions['gguf']}, nunchaku={expected_nunchaku}, "
         f"xpu={device_name!r}, kitchen_capabilities={len(capabilities)}, "
         f"h3_templates={len(h3_template_hashes)}"

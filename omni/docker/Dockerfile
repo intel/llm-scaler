@@ -29,10 +29,13 @@ ARG COMFYUI_MANAGER_VERSION=4.2.2
 ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
 ARG COMFY_KITCHEN_COMMIT=f7250fa44cb6f593969ba869be803e7d03c80ec8
 ARG COMFY_KITCHEN_VERSION=0.2.26
+ARG COMFY_AIMDO_REPOSITORY=https://github.com/xiangyuT/comfy-aimdo-xpu.git
+ARG COMFY_AIMDO_COMMIT=6fda6e619e1647134d4ced4370e5fad488779d62
+ARG COMFY_AIMDO_VERSION=0.4.13
 ARG COMFY_GGUF_REPOSITORY=https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git
 ARG COMFY_GGUF_COMMIT=39671fe73117ba97de7011e7e06e32599dcda06d
 ARG COMFY_NUNCHAKU_REPOSITORY=https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git
-ARG COMFY_NUNCHAKU_COMMIT=5cf4fa9886f45abff102d1dd91af5247b4950148
+ARG COMFY_NUNCHAKU_COMMIT=cc0f6236b6c329178ad4ef58452a874e774c7b8e
 ARG COMFY_NUNCHAKU_VERSION=1.2.1+xpu.3
 ARG LLM_SCALER_SOURCE_REVISION=unknown
 ARG LLM_SCALER_SOURCE_DIRTY=unknown
@@ -249,6 +252,26 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/comfy-kitchen-xpu && \
     pip wheel . --wheel-dir /wheels --no-deps --no-build-isolation
 
+# ======== AIMDO XPU wheel branch ========
+FROM python-base AS aimdo-wheel
+
+ARG COMFY_AIMDO_REPOSITORY
+ARG COMFY_AIMDO_COMMIT
+ARG COMFY_AIMDO_VERSION
+
+RUN cd /llm && \
+    git clone --filter=blob:none --no-checkout \
+        "${COMFY_AIMDO_REPOSITORY}" comfy-aimdo-xpu && \
+    git -C comfy-aimdo-xpu fetch --depth 1 origin \
+        "${COMFY_AIMDO_COMMIT}" && \
+    git -C comfy-aimdo-xpu checkout --detach FETCH_HEAD && \
+    pip install setuptools-scm==10.2.1 && \
+    source /opt/intel/oneapi/setvars.sh --force && \
+    cd /llm/comfy-aimdo-xpu && \
+    ./scripts/build-linux-xpu.sh && \
+    SETUPTOOLS_SCM_PRETEND_VERSION="${COMFY_AIMDO_VERSION}" \
+        pip wheel . --wheel-dir /wheels --no-deps --no-build-isolation
+
 # ======== Omni kernel wheel branch ========
 FROM sycl-tla AS kernel-wheel
 
@@ -282,6 +305,7 @@ ARG XPU_TARGET
 ARG MAX_JOBS
 ARG COMFYUI_VERSION
 ARG COMFY_KITCHEN_VERSION
+ARG COMFY_AIMDO_VERSION
 
 ENV TORCH_XPU_ARCH_LIST=${XPU_TARGET} \
     OMNI_XPU_DEVICE=${XPU_TARGET} \
@@ -292,8 +316,10 @@ ENV TORCH_XPU_ARCH_LIST=${XPU_TARGET} \
 
 COPY --from=sycl-tla /llm/sycl-tla /llm/sycl-tla
 COPY --from=kitchen-wheel /llm/comfy-kitchen-xpu /llm/comfy-kitchen-xpu
+COPY --from=aimdo-wheel /llm/comfy-aimdo-xpu /llm/comfy-aimdo-xpu
 COPY --from=kernel-wheel /llm/omni_xpu_kernel /llm/omni_xpu_kernel
 COPY --from=kitchen-wheel /wheels/ /wheels/
+COPY --from=aimdo-wheel /wheels/ /wheels/
 COPY --from=kernel-wheel /wheels/ /wheels/
 
 # All third-party requirements are already installed. Force the two locally
@@ -305,7 +331,8 @@ COPY --from=kernel-wheel /wheels/ /wheels/
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-deps --force-reinstall \
         /wheels/omni_xpu_kernel-*.whl \
-        /wheels/comfy_kitchen-${COMFY_KITCHEN_VERSION}-*.whl
+        /wheels/comfy_kitchen-${COMFY_KITCHEN_VERSION}-*.whl \
+        /wheels/comfy_aimdo-${COMFY_AIMDO_VERSION}-*.whl
 
 # The local custom node is intentionally a thin ComfyUI integration layer. It
 # is copied after Kitchen/kernel installation so adapter-only edits stay cheap.
@@ -346,6 +373,9 @@ ARG COMFYUI_WORKFLOW_TEMPLATES_VERSION
 ARG COMFYUI_MANAGER_VERSION
 ARG COMFY_KITCHEN_COMMIT
 ARG COMFY_KITCHEN_VERSION
+ARG COMFY_AIMDO_REPOSITORY
+ARG COMFY_AIMDO_COMMIT
+ARG COMFY_AIMDO_VERSION
 ARG COMFY_GGUF_COMMIT
 ARG COMFY_NUNCHAKU_COMMIT
 ARG COMFY_NUNCHAKU_VERSION
@@ -369,6 +399,9 @@ LABEL org.opencontainers.image.version="${IMAGE_TAG}" \
       com.intel.omni.comfyui.manager.version="${COMFYUI_MANAGER_VERSION}" \
       com.intel.omni.comfy-kitchen.version="${COMFY_KITCHEN_VERSION}" \
       com.intel.omni.comfy-kitchen.revision="${COMFY_KITCHEN_COMMIT}" \
+      com.intel.omni.comfy-aimdo.repository="${COMFY_AIMDO_REPOSITORY}" \
+      com.intel.omni.comfy-aimdo.version="${COMFY_AIMDO_VERSION}" \
+      com.intel.omni.comfy-aimdo.revision="${COMFY_AIMDO_COMMIT}" \
       com.intel.omni.comfy-gguf.revision="${COMFY_GGUF_COMMIT}" \
       com.intel.omni.comfy-nunchaku.version="${COMFY_NUNCHAKU_VERSION}" \
       com.intel.omni.comfy-nunchaku.revision="${COMFY_NUNCHAKU_COMMIT}"
@@ -386,6 +419,9 @@ ENV OMNIXPU_INTERPOLATE_FIX=0 \
     OMNI_COMFYUI_MANAGER_VERSION="${COMFYUI_MANAGER_VERSION}" \
     OMNI_COMFY_KITCHEN_VERSION="${COMFY_KITCHEN_VERSION}" \
     OMNI_COMFY_KITCHEN_REVISION="${COMFY_KITCHEN_COMMIT}" \
+    OMNI_COMFY_AIMDO_REPOSITORY="${COMFY_AIMDO_REPOSITORY}" \
+    OMNI_COMFY_AIMDO_VERSION="${COMFY_AIMDO_VERSION}" \
+    OMNI_COMFY_AIMDO_REVISION="${COMFY_AIMDO_COMMIT}" \
     OMNI_COMFY_GGUF_REVISION="${COMFY_GGUF_COMMIT}" \
     OMNI_COMFY_NUNCHAKU_VERSION="${COMFY_NUNCHAKU_VERSION}" \
     OMNI_COMFY_NUNCHAKU_REVISION="${COMFY_NUNCHAKU_COMMIT}"

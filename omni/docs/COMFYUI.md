@@ -26,7 +26,8 @@ ComfyUI:
 /llm/entrypoints/start_comfyui.sh --disable-smart-memory
 ```
 
-The default 4 GiB XPU reserve can be changed with
+The entrypoint enables ComfyUI DynamicVRAM, backed by the image's pinned AIMDO
+XPU/Level Zero allocator. The default 4 GiB XPU reserve can be changed with
 `OMNI_COMFYUI_RESERVE_VRAM_GB`. Keeping a nonzero reserve is important for
 workflows that execute an XPU text encoder again after diffusion weights are
 resident.

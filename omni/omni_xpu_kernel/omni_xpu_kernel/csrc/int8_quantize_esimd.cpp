@@ -242,13 +242,38 @@ struct RowwiseQuantizeBooguFFNDownPTLConfig {
 #endif
 
 #if defined(OMNI_XPU_ARCH_BMG)
-// BMG BF16 routes use exact workflow shapes. Z-Image produces M=4096 and
-// M=4128 at K=3840 and K=10240; Krea2 produces M=4192 at K=6144 and K=16384.
+// Existing Z-Image and Krea2 BMG BF16 routes use exact workflow shapes.
+// Z-Image produces M=4096 and M=4128 at K=3840 and K=10240; Krea2 produces
+// M=4192 at K=6144 and K=16384.
 // Process-isolated continuous benchmarks selected VEC8/SG16 for K=3840,
 // VEC8/SG20 for K=10240, VEC8/SG12 for K=6144, and VEC8/SG32 for K=16384.
 // K=6144 SG12 and SG20 were effectively tied in the continuous benchmark;
 // SG12 is the configuration validated end to end. All selected configurations
 // preserve byte-exact Q/scale results.
+//
+// MiniMax H3 BF16 activations use K=5376 for the transformer hidden state and
+// K=7168 for the FFN down projection. Their sequence-derived row count varies
+// with video length and resolution, so these routes use the measured M>=4096
+// crossover instead of enumerating captured sequence lengths. Both rows fit in
+// SLM, and process-isolated BMG benchmarks selected VEC8/SG12 for each shape.
+struct RowwiseQuantizeH3HiddenBMGConfig {
+    static constexpr int Columns = 5376;
+    static constexpr int MinimumRows = 4096;
+    static constexpr int SubgroupSize = 32;
+    static constexpr int SubgroupsPerRow = 12;
+    static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
+    static constexpr int VectorWidth = 8;
+};
+
+struct RowwiseQuantizeH3FFNDownBMGConfig {
+    static constexpr int Columns = 7168;
+    static constexpr int MinimumRows = 4096;
+    static constexpr int SubgroupSize = 32;
+    static constexpr int SubgroupsPerRow = 12;
+    static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
+    static constexpr int VectorWidth = 8;
+};
+
 struct RowwiseQuantizeZImageHiddenBMGConfig {
     static constexpr int Columns = 3840;
     static constexpr int ImageRows = 4096;
@@ -882,7 +907,23 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(
                 scales.data_ptr<float>(), M, x.device());
         } else {
 #elif defined(OMNI_XPU_ARCH_BMG)
-        if ((M == RowwiseQuantizeZImageHiddenBMGConfig::ImageRows ||
+        if (M >= RowwiseQuantizeH3HiddenBMGConfig::MinimumRows &&
+            K == RowwiseQuantizeH3HiddenBMGConfig::Columns) {
+            quantize_int8_rowwise_large_ptl_kernel<
+                bf16, RowwiseQuantizeH3HiddenBMGConfig>(
+                reinterpret_cast<const bf16*>(x.data_ptr()),
+                reinterpret_cast<int8_t*>(output.data_ptr()),
+                scales.data_ptr<float>(), M, x.device(),
+                "quantize_int8_rowwise_h3_large_bmg");
+        } else if (M >= RowwiseQuantizeH3FFNDownBMGConfig::MinimumRows &&
+                   K == RowwiseQuantizeH3FFNDownBMGConfig::Columns) {
+            quantize_int8_rowwise_large_ptl_kernel<
+                bf16, RowwiseQuantizeH3FFNDownBMGConfig>(
+                reinterpret_cast<const bf16*>(x.data_ptr()),
+                reinterpret_cast<int8_t*>(output.data_ptr()),
+                scales.data_ptr<float>(), M, x.device(),
+                "quantize_int8_rowwise_h3_large_bmg");
+        } else if ((M == RowwiseQuantizeZImageHiddenBMGConfig::ImageRows ||
              M == RowwiseQuantizeZImageHiddenBMGConfig::JointRows) &&
             K == RowwiseQuantizeZImageHiddenBMGConfig::Columns) {
             quantize_int8_rowwise_large_ptl_kernel<

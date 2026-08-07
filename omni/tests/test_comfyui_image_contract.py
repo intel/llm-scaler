@@ -39,6 +39,15 @@ COMPONENT_PINS = {
         "f7250fa44cb6f593969ba869be803e7d03c80ec8",
     ),
     "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.26"),
+    "COMFY_AIMDO_REPOSITORY": (
+        "AIMDO_REPOSITORY",
+        "https://github.com/xiangyuT/comfy-aimdo-xpu.git",
+    ),
+    "COMFY_AIMDO_COMMIT": (
+        "AIMDO_COMMIT",
+        "6fda6e619e1647134d4ced4370e5fad488779d62",
+    ),
+    "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.4.13"),
     "COMFY_GGUF_REPOSITORY": (
         "GGUF_REPOSITORY",
         "https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git",
@@ -53,7 +62,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_NUNCHAKU_COMMIT": (
         "NUNCHAKU_COMMIT",
-        "5cf4fa9886f45abff102d1dd91af5247b4950148",
+        "cc0f6236b6c329178ad4ef58452a874e774c7b8e",
     ),
     "COMFY_NUNCHAKU_VERSION": ("NUNCHAKU_VERSION", "1.2.1+xpu.3"),
 }
@@ -129,6 +138,7 @@ class ComfyUIImageContractTest(unittest.TestCase):
             {
                 "ComfyUI",
                 "Kitchen",
+                "Comfy AIMDO",
                 "GGUF custom node",
                 "combined Nunchaku custom node/runtime",
             },
@@ -138,9 +148,46 @@ class ComfyUIImageContractTest(unittest.TestCase):
             validator.REQUIRED_KITCHEN_CAPABILITIES,
         )
 
+    def test_aimdo_xpu_is_built_from_an_exact_remote_commit(self):
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+        validator = load_validator()
+
+        self.assertIn("FROM python-base AS aimdo-wheel", dockerfile)
+        self.assertIn(
+            '"${COMFY_AIMDO_REPOSITORY}" comfy-aimdo-xpu',
+            dockerfile,
+        )
+        self.assertIn(
+            "git -C comfy-aimdo-xpu fetch --depth 1 origin",
+            dockerfile,
+        )
+        self.assertIn("pip install setuptools-scm==10.2.1", dockerfile)
+        self.assertIn("./scripts/build-linux-xpu.sh", dockerfile)
+        self.assertIn(
+            'SETUPTOOLS_SCM_PRETEND_VERSION="${COMFY_AIMDO_VERSION}"',
+            dockerfile,
+        )
+        self.assertIn(
+            "/wheels/comfy_aimdo-${COMFY_AIMDO_VERSION}-*.whl",
+            dockerfile,
+        )
+        self.assertEqual(
+            validator.PINNED_CHECKOUTS["Comfy AIMDO"],
+            (
+                Path("/llm/comfy-aimdo-xpu"),
+                "OMNI_COMFY_AIMDO_REVISION",
+            ),
+        )
+
     def test_comfyui_v030_dependencies_are_pinned_and_validated(self):
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
         validator = load_validator()
+        self.assertEqual(
+            validator.PINNED_MINIMAX_H3_TEMPLATE_HASHES[
+                "video_minimax_h3_t2v.json"
+            ],
+            "31ab33fdb053a7834cc866bd7aa08b887518fc656e4a796c89779c6b5e1786e6",
+        )
 
         self.assertIn(
             '"comfyui-manager==${COMFYUI_MANAGER_VERSION}"',
