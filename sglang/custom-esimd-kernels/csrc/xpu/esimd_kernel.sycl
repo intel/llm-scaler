@@ -556,6 +556,7 @@ at::Tensor esimd_resadd_norm_gemv2_fp8_pert(
     at::Tensor norm_weight,
     at::Tensor w0, at::Tensor s0, at::Tensor o0,
     at::Tensor w1, at::Tensor s1, at::Tensor o1,
+    at::Tensor new_residual,
     double eps)
 {
     int N0 = (int)w0.size(0);
@@ -563,6 +564,9 @@ at::Tensor esimd_resadd_norm_gemv2_fp8_pert(
     int K = (int)w0.size(1);
     int fp8_mode = get_fp8_mode(w0);
     auto& dpcpp_queue = get_device_queue(hidden_states);
+
+    fp16* new_residual_ptr = new_residual.defined()
+        ? reinterpret_cast<fp16*>(new_residual.data_ptr()) : nullptr;
 
     resadd_norm_gemv2_fp8_pert_host(
         reinterpret_cast<fp16*>(hidden_states.data_ptr()),
@@ -574,6 +578,7 @@ at::Tensor esimd_resadd_norm_gemv2_fp8_pert(
         reinterpret_cast<const uint8_t*>(w1.data_ptr()),
         s1.data_ptr<float>(),
         reinterpret_cast<fp16*>(o1.data_ptr()),
+        new_residual_ptr,
         N0, N1, K, (float)eps, fp8_mode,
         dpcpp_queue);
 

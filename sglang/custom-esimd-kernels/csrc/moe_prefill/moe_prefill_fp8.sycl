@@ -58,6 +58,66 @@ namespace xmx_ns = sycl::ext::intel::esimd::xmx;
 
 #include "../xpu/esimd_kernels/moe_ops.h"
 
+// Build-configurable DPAS tile sizes (bit-exact across choices: per-output
+// fp32 K-accumulation order is unchanged; only token/N grouping differs).
+// Override via -DMP_UP_MAXM / -DMP_UP_N / -DMP_DOWN_MAXM / -DMP_DOWN_N.
+#ifndef MP_UP_MAXM
+#define MP_UP_MAXM 32
+#endif
+#ifndef MP_UP_N
+#define MP_UP_N 16
+#endif
+#ifndef MP_DOWN_MAXM
+#define MP_DOWN_MAXM 32
+#endif
+#ifndef MP_DOWN_N
+#define MP_DOWN_N 64
+#endif
+
+// ── Chunk-based load balancing ───────────────────────────────────────────────
+// The (expert, N-tile) grid serialized each expert's tokens inside a WI via an
+// m_base loop, so a hot expert (2000+ routed tokens) ran ~70 serial MAX_M blocks
+// while cold experts' WIs finished immediately → the GPU idled on the hot tail.
+// Instead we pre-split every expert's token range into uniform MAX_M chunks so
+// each WI does exactly one block; the launch grid is (chunk, N-tile). This is
+// BIT-EXACT: each output element is still summed over the full K by one WI in
+// the same order — only the WI→token-block mapping changed.
+struct MpChunk { int eid; int t0; int nt; };
+
+// Upper bound on #chunks for a MAX_M split: each expert adds at most
+// ceil(nt_e/MAX_M) ≤ nt_e/MAX_M + 1, summed = total_seqlen/MAX_M + num_experts.
+static inline int mp_chunk_capacity(int total_seqlen, int num_experts, int max_m) {
+    return total_seqlen / max_m + num_experts + 1;
+}
+
+// Single-WI fill from expert_offsets (num_experts ~256, trivial). Trailing
+// unused entries get nt=0 so their WIs early-return.
+template<int MAX_M>
+sycl::event moe_prefill_build_chunks_kernel(
+    sycl::queue& q, const int* expert_offsets, MpChunk* chunks,
+    int num_experts, int total_seqlen, int capacity)
+{
+    return q.submit([=](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<1>(1), [=](sycl::id<1>) {
+            int c = 0;
+            for (int eid = 0; eid < num_experts; eid++) {
+                int lo = expert_offsets[eid];
+                int hi = (eid + 1 < num_experts) ? expert_offsets[eid + 1] : total_seqlen;
+                for (int mb = lo; mb < hi; mb += MAX_M) {
+                    if (c < capacity) {
+                        chunks[c].eid = eid;
+                        chunks[c].t0  = mb;
+                        int nt = hi - mb; if (nt > MAX_M) nt = MAX_M;
+                        chunks[c].nt = nt;
+                    }
+                    c++;
+                }
+            }
+            for (; c < capacity; c++) { chunks[c].eid = 0; chunks[c].t0 = 0; chunks[c].nt = 0; }
+        });
+    });
+}
+
 // ── FP8 → half scalar-vector dequant (identical math to the helpers in ──────
 //    csrc/moe_batch/moe.sycl; kept local so this TU is self-contained) ───────
 template<int N>
@@ -169,6 +229,7 @@ sycl::event moe_prefill_up_forward_kernel_fp8(
     sycl::queue& q,
     const IT* input, const uint8_t* gate_up_weight, const float* gate_up_scale,
     IT* intermediate, const int* expert_offsets, const int* expert_tokens,
+    const MpChunk* chunks, int num_chunks,
     int num_experts, int total_seqlen, int hidden_size, int intermediate_size, int top_k)
 {
     static_assert(MAX_M % 16 == 0, "MAX_M must be multiple of 16");
@@ -179,16 +240,18 @@ sycl::event moe_prefill_up_forward_kernel_fp8(
 
     return q.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
-            sycl::range<2>(num_experts, intermediate_size / N),
+            sycl::range<2>(num_chunks, intermediate_size / N),
             [=](sycl::id<2> id) SYCL_ESIMD_KERNEL {
 
             const int two_inter = 2 * intermediate_size;
-            const int eid  = (int)id[0];
+            // One WI = one uniform MAX_M token-chunk × one N-tile (load balanced).
+            const MpChunk ck = chunks[(int)id[0]];
+            const int eid    = ck.eid;
+            const int m_base = ck.t0;
+            const int nt     = ck.nt;
+            if (nt <= 0) return;
             const int tid  = (int)id[1];
             const int n_start = tid * N;                      // gate N-start; up = + intermediate_size
-            const int t0 = expert_offsets[eid];
-            const int t1 = (eid + 1 < num_experts) ? expert_offsets[eid + 1] : total_seqlen;
-            if (t0 == t1) return;
 
             // w13 = [E, 2*I, H]: base for this expert, K = hidden_size = last dim
             const uint8_t* w_base = gate_up_weight + (size_t)eid * two_inter * hidden_size;
@@ -198,10 +261,10 @@ sycl::event moe_prefill_up_forward_kernel_fp8(
             const float    scale_gate = gate_up_scale[(size_t)eid * 2 + 0];
             const float    scale_up   = gate_up_scale[(size_t)eid * 2 + 1];
 
-            for (int m_base = t0; m_base < t1; m_base += MAX_M) {
+            {
                 simd<uint32_t, MAX_M> sorted_idxs =
                     min(simd<uint32_t, MAX_M>(0u, 1u) + (uint32_t)m_base,
-                        simd<uint32_t, MAX_M>((uint32_t)(t1 - 1)));
+                        simd<uint32_t, MAX_M>((uint32_t)(m_base + nt - 1)));
                 simd<uint32_t, MAX_M> pair_idxs =
                     convert<uint32_t>(gather<int, MAX_M>(expert_tokens, sorted_idxs * 4u));
                 simd<uint32_t, MAX_M> in_off =
@@ -235,20 +298,20 @@ sycl::event moe_prefill_up_forward_kernel_fp8(
                     //   col_base : N-row offset into the 2*I weight rows.
                     auto fp8_dpas = [&](int col_base, simd<float, ACC_SZ>& acc)
                                         SYCL_ESIMD_FUNCTION {
+                        // One 2D block load fetches all N weight rows × 16 K for this
+                        // gate/up tile in row-major [row][k] — replaces N/8 * 8 tiny
+                        // block_load<uint8_t,16> scalar-row loads. Rows are strided by
+                        // hidden_size; byte-x = k, row-y = col_base. Bit-identical bytes.
+                        simd<uint8_t, N * 16> wraw_all =
+                            xesimd::lsc_load_2d<uint8_t, 16, N, 1, false, false,
+                                xesimd::cache_hint::cached, xesimd::cache_hint::cached>(
+                                w_base, (unsigned)(hidden_size - 1), (unsigned)(two_inter - 1),
+                                (unsigned)(hidden_size - 1), k, col_base);
                         #pragma unroll
                         for (int ns = 0; ns < NS; ns++) {
-                            // Load FP8 weight [8 N-rows × 16 K] = 128 bytes, row-major.
-                            //   w13[eid][col_base + ns*8 + r][k .. k+15]
-                            simd<uint8_t, 128> wraw;
-                            #pragma unroll
-                            for (int r = 0; r < 8; r++) {
-                                const size_t row = (size_t)(col_base + ns * 8 + r);
-                                wraw.template select<16, 1>(r * 16) =
-                                    block_load<uint8_t, 16>(
-                                        w_base + row * (size_t)hidden_size + k);
-                            }
                             // Dequant → plain [N=8, K=16] = 128 a_tile (DPAS operand A).
-                            simd<fp16, 128> a_tile = mp_fp8_to_half<FP8_MODE, 128>(wraw);
+                            simd<fp16, 128> a_tile = mp_fp8_to_half<FP8_MODE, 128>(
+                                wraw_all.template select<128, 1>(ns * 128));
 
                             #pragma unroll
                             for (int ms = 0; ms < MS; ms++) {
@@ -294,7 +357,7 @@ sycl::event moe_prefill_up_forward_kernel_fp8(
                         }
                     }
                 }
-            } // m_base
+            } // single chunk
         });
     });
 }
@@ -307,6 +370,7 @@ sycl::event moe_prefill_down_forward_kernel_fp8(
     sycl::queue& q,
     const IT* intermediate, const uint8_t* down_weight, const float* down_scale,
     IT* expert_output, const int* expert_offsets, const int* expert_tokens,
+    const MpChunk* chunks, int num_chunks,
     int num_experts, int total_seqlen, int intermediate_size, int hidden_size)
 {
     static_assert(MAX_M % 16 == 0, "MAX_M must be multiple of 16");
@@ -317,24 +381,25 @@ sycl::event moe_prefill_down_forward_kernel_fp8(
 
     return q.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
-            sycl::range<2>(num_experts, hidden_size / N),
+            sycl::range<2>(num_chunks, hidden_size / N),
             [=](sycl::id<2> id) SYCL_ESIMD_KERNEL {
 
-            const int eid   = (int)id[0];
+            const MpChunk ck = chunks[(int)id[0]];
+            const int eid    = ck.eid;
+            const int m_base = ck.t0;
+            const int nt     = ck.nt;
+            if (nt <= 0) return;
             const int tid   = (int)id[1];
             const int n_start = tid * N;
-            const int t0 = expert_offsets[eid];
-            const int t1 = (eid + 1 < num_experts) ? expert_offsets[eid + 1] : total_seqlen;
-            if (t0 == t1) return;
 
             // w2 = [E, H, I]: K = intermediate_size = last dim
             const uint8_t* w_base = down_weight + (size_t)eid * hidden_size * intermediate_size;
             const float    scale  = down_scale[eid];
 
-            for (int m_base = t0; m_base < t1; m_base += MAX_M) {
+            {
                 simd<uint32_t, MAX_M> sorted_idxs =
                     min(simd<uint32_t, MAX_M>(0u, 1u) + (uint32_t)m_base,
-                        simd<uint32_t, MAX_M>((uint32_t)(t1 - 1)));
+                        simd<uint32_t, MAX_M>((uint32_t)(m_base + nt - 1)));
                 simd<uint32_t, MAX_M> pair_idxs =
                     convert<uint32_t>(gather<int, MAX_M>(expert_tokens, sorted_idxs * 4u));
                 simd<uint32_t, MAX_M> in_off =
@@ -358,17 +423,24 @@ sycl::event moe_prefill_down_forward_kernel_fp8(
                         b_tile.template select<256, 1>(ms * 256) = convert<fp16>(btmp);
                     }
 
+                    // 2D block load(s): N weight rows × 16 K, row-major, rows
+                    // strided by intermediate_size. lsc_load_2d block height is
+                    // capped at 32 rows, so for N > 32 we issue N/32 loads.
+                    constexpr int WH  = (N <= 32) ? N : 32;
+                    constexpr int WNB = N / WH;
+                    simd<uint8_t, N * 16> wraw_all;
+                    #pragma unroll
+                    for (int wb = 0; wb < WNB; wb++) {
+                        wraw_all.template select<WH * 16, 1>(wb * WH * 16) =
+                            xesimd::lsc_load_2d<uint8_t, 16, WH, 1, false, false,
+                                xesimd::cache_hint::cached, xesimd::cache_hint::cached>(
+                                w_base, (unsigned)(intermediate_size - 1), (unsigned)(hidden_size - 1),
+                                (unsigned)(intermediate_size - 1), k, n_start + wb * WH);
+                    }
                     #pragma unroll
                     for (int ns = 0; ns < NS; ns++) {
-                        simd<uint8_t, 128> wraw;
-                        #pragma unroll
-                        for (int r = 0; r < 8; r++) {
-                            const size_t row = (size_t)(n_start + ns * 8 + r);
-                            wraw.template select<16, 1>(r * 16) =
-                                block_load<uint8_t, 16>(
-                                    w_base + row * (size_t)intermediate_size + k);
-                        }
-                        simd<fp16, 128> a_tile = mp_fp8_to_half<FP8_MODE, 128>(wraw);
+                        simd<fp16, 128> a_tile = mp_fp8_to_half<FP8_MODE, 128>(
+                            wraw_all.template select<128, 1>(ns * 128));
 
                         #pragma unroll
                         for (int ms = 0; ms < MS; ms++) {
@@ -404,7 +476,7 @@ sycl::event moe_prefill_down_forward_kernel_fp8(
                         }
                     }
                 }
-            } // m_base
+            } // single chunk
         });
     });
 }
@@ -477,13 +549,18 @@ std::vector<torch::Tensor> moe_prefill_gather_forward_fp8(
 }
 
 // w13 = [E, 2*I, H] FP8 ; gate_up_scale = float[E, 2] (gate, up per expert)
-torch::Tensor moe_prefill_up_forward_fp8(
+// Core impl. If chunks_ext is defined, reuse the caller-built load-balancing
+// chunks (built with MP_UP_MAXM) instead of building fresh — lets the fused
+// driver build once and share between up+down (requires MP_UP_MAXM==MP_DOWN_MAXM).
+static torch::Tensor moe_prefill_up_core(
     torch::Tensor x,
     torch::Tensor gate_up_weight,
     torch::Tensor gate_up_scale,
     torch::Tensor expert_offsets,
     torch::Tensor expert_tokens,
-    int64_t top_k) {
+    int64_t top_k,
+    torch::Tensor chunks_ext,
+    int cap_ext) {
 
     TORCH_CHECK(x.dim() == 2);
     TORCH_CHECK(gate_up_weight.dim() == 3, "gate_up_weight must be [E, 2*I, H]");
@@ -515,27 +592,63 @@ torch::Tensor moe_prefill_up_forward_fp8(
     const float* s_ptr   = gate_up_scale.data_ptr<float>();
     fp16* o_ptr          = (fp16*)intermediate.data_ptr();
 
+    // Build load-balancing chunks (uniform MAX_M token blocks) from offsets,
+    // unless the caller passed prebuilt chunks (shared up+down).
+    constexpr int UP_MAXM = MP_UP_MAXM;
+    torch::Tensor chunks_t;
+    MpChunk* chunks;
+    int cap;
+    if (chunks_ext.defined()) {
+        chunks_t = chunks_ext;
+        cap = cap_ext;
+        chunks = reinterpret_cast<MpChunk*>(chunks_t.data_ptr<int>());
+    } else {
+        cap = mp_chunk_capacity(total_seqlen, num_experts, UP_MAXM);
+        chunks_t = torch::empty(
+            {cap * 3}, torch::device(x.device()).dtype(torch::kInt32));
+        chunks = reinterpret_cast<MpChunk*>(chunks_t.data_ptr<int>());
+        moe_prefill_build_chunks_kernel<UP_MAXM>(
+            queue, expert_offsets.data_ptr<int>(), chunks, num_experts, total_seqlen, cap);
+    }
+
     if (fp8_mode == 0)
-        moe_prefill_up_forward_kernel_fp8<fp16, 0>(
+        moe_prefill_up_forward_kernel_fp8<fp16, 0, MP_UP_MAXM, MP_UP_N>(
             queue, x_ptr, w_ptr, s_ptr, o_ptr,
             expert_offsets.data_ptr<int>(), expert_tokens.data_ptr<int>(),
+            chunks, cap,
             num_experts, total_seqlen, hidden_size, intermediate_size, top_k);
     else
-        moe_prefill_up_forward_kernel_fp8<fp16, 1>(
+        moe_prefill_up_forward_kernel_fp8<fp16, 1, MP_UP_MAXM, MP_UP_N>(
             queue, x_ptr, w_ptr, s_ptr, o_ptr,
             expert_offsets.data_ptr<int>(), expert_tokens.data_ptr<int>(),
+            chunks, cap,
             num_experts, total_seqlen, hidden_size, intermediate_size, top_k);
 
     return intermediate;
 }
 
+// Public op: builds its own chunks.
+torch::Tensor moe_prefill_up_forward_fp8(
+    torch::Tensor x,
+    torch::Tensor gate_up_weight,
+    torch::Tensor gate_up_scale,
+    torch::Tensor expert_offsets,
+    torch::Tensor expert_tokens,
+    int64_t top_k) {
+    return moe_prefill_up_core(x, gate_up_weight, gate_up_scale,
+                               expert_offsets, expert_tokens, top_k,
+                               torch::Tensor(), -1);
+}
+
 // w2 = [E, H, I] FP8 ; down_scale = float[E] (per-expert scalar)
-torch::Tensor moe_prefill_down_forward_fp8(
+static torch::Tensor moe_prefill_down_core(
     torch::Tensor intermediate,
     torch::Tensor down_weight,
     torch::Tensor down_scale,
     torch::Tensor expert_offsets,
-    torch::Tensor expert_tokens) {
+    torch::Tensor expert_tokens,
+    torch::Tensor chunks_ext,
+    int cap_ext) {
 
     TORCH_CHECK(intermediate.dim() == 2);
     TORCH_CHECK(down_weight.dim() == 3, "down_weight must be [E, H, I]");
@@ -567,18 +680,49 @@ torch::Tensor moe_prefill_down_forward_fp8(
     const float* s_ptr   = down_scale.data_ptr<float>();
     fp16* o_ptr          = (fp16*)expert_output.data_ptr();
 
+    constexpr int DOWN_MAXM = MP_DOWN_MAXM;
+    torch::Tensor chunks_t;
+    MpChunk* chunks;
+    int cap;
+    if (chunks_ext.defined()) {
+        chunks_t = chunks_ext;
+        cap = cap_ext;
+        chunks = reinterpret_cast<MpChunk*>(chunks_t.data_ptr<int>());
+    } else {
+        cap = mp_chunk_capacity(total_seqlen, num_experts, DOWN_MAXM);
+        chunks_t = torch::empty(
+            {cap * 3}, torch::device(intermediate.device()).dtype(torch::kInt32));
+        chunks = reinterpret_cast<MpChunk*>(chunks_t.data_ptr<int>());
+        moe_prefill_build_chunks_kernel<DOWN_MAXM>(
+            queue, expert_offsets.data_ptr<int>(), chunks, num_experts, total_seqlen, cap);
+    }
+
     if (fp8_mode == 0)
-        moe_prefill_down_forward_kernel_fp8<fp16, 0>(
+        moe_prefill_down_forward_kernel_fp8<fp16, 0, MP_DOWN_MAXM, MP_DOWN_N>(
             queue, i_ptr, w_ptr, s_ptr, o_ptr,
             expert_offsets.data_ptr<int>(), expert_tokens.data_ptr<int>(),
+            chunks, cap,
             num_experts, total_seqlen, intermediate_size, hidden_size);
     else
-        moe_prefill_down_forward_kernel_fp8<fp16, 1>(
+        moe_prefill_down_forward_kernel_fp8<fp16, 1, MP_DOWN_MAXM, MP_DOWN_N>(
             queue, i_ptr, w_ptr, s_ptr, o_ptr,
             expert_offsets.data_ptr<int>(), expert_tokens.data_ptr<int>(),
+            chunks, cap,
             num_experts, total_seqlen, intermediate_size, hidden_size);
 
     return expert_output;
+}
+
+// Public op: builds its own chunks.
+torch::Tensor moe_prefill_down_forward_fp8(
+    torch::Tensor intermediate,
+    torch::Tensor down_weight,
+    torch::Tensor down_scale,
+    torch::Tensor expert_offsets,
+    torch::Tensor expert_tokens) {
+    return moe_prefill_down_core(intermediate, down_weight, down_scale,
+                                 expert_offsets, expert_tokens,
+                                 torch::Tensor(), -1);
 }
 
 torch::Tensor moe_prefill_accumulate_forward_fp8(
@@ -634,15 +778,34 @@ torch::Tensor moe_prefill_full_fp8(
     auto expert_offsets = gather_result[0];
     auto expert_tokens  = gather_result[1];
 
-    // 2. Up GEMM: gate_up projection + SiLU.
-    auto intermediate = moe_prefill_up_forward_fp8(
-        hidden_states, w13, w13_scale, expert_offsets, expert_tokens, top_k);
+    // 2. Build load-balancing chunks ONCE and share between up+down.
+    //    Valid only when MP_UP_MAXM == MP_DOWN_MAXM (identical split); otherwise
+    //    each core builds its own.
+    torch::Tensor shared_chunks;
+    int shared_cap = -1;
+    if (MP_UP_MAXM == MP_DOWN_MAXM) {
+        int total_seqlen = expert_tokens.numel();
+        shared_cap = mp_chunk_capacity(total_seqlen, (int)num_experts, MP_UP_MAXM);
+        shared_chunks = torch::empty(
+            {shared_cap * 3}, torch::device(hidden_states.device()).dtype(torch::kInt32));
+        sycl::queue& q = c10::xpu::getCurrentXPUStream(hidden_states.device().index()).queue();
+        moe_prefill_build_chunks_kernel<MP_UP_MAXM>(
+            q, expert_offsets.data_ptr<int>(),
+            reinterpret_cast<MpChunk*>(shared_chunks.data_ptr<int>()),
+            (int)num_experts, total_seqlen, shared_cap);
+    }
 
-    // 3. Down GEMM.
-    auto expert_output = moe_prefill_down_forward_fp8(
-        intermediate, w2, w2_scale, expert_offsets, expert_tokens);
+    // 3. Up GEMM: gate_up projection + SiLU.
+    auto intermediate = moe_prefill_up_core(
+        hidden_states, w13, w13_scale, expert_offsets, expert_tokens, top_k,
+        shared_chunks, shared_cap);
 
-    // 4. Accumulate: weighted gather over top_k.
+    // 4. Down GEMM.
+    auto expert_output = moe_prefill_down_core(
+        intermediate, w2, w2_scale, expert_offsets, expert_tokens,
+        shared_chunks, shared_cap);
+
+    // 5. Accumulate: weighted gather over top_k.
     auto final_output = moe_prefill_accumulate_forward_fp8(expert_output, topk_weights);
 
     return final_output;

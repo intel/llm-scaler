@@ -46,6 +46,7 @@ struct ResAddNormGEMV2_fp8_pert_kernel {
     const uint8_t* w1_ptr;       // [N1, K] FP8
     const float*   s1_ptr;       // [1]
     fp16*          o1_ptr;       // [1, N1]
+    fp16*          new_residual_ptr;  // [1, K] — written by gid==0 (= hidden+residual); may be null
     int N0, N1, K;
     float eps;
     int fp8_mode;
@@ -60,6 +61,18 @@ struct ResAddNormGEMV2_fp8_pert_kernel {
 
         constexpr int VL = 512;
         int n_chunks = K / VL;
+
+        // gid 0 additionally writes the post-add residual (hidden+residual) so
+        // the caller doesn't need a separate aten::add dispatch. fp16 add to
+        // match the reference (h.half + r.half). Only one group writes → no race.
+        if (gid == 0 && new_residual_ptr != nullptr) {
+            for (int c = 0; c < n_chunks; c++) {
+                int offset = c * VL;
+                simd<fp16, VL> hh = block_load<fp16, VL>(hidden_ptr + offset);
+                simd<fp16, VL> rr = block_load<fp16, VL>(residual_ptr + offset);
+                block_store<fp16, VL>(new_residual_ptr + offset, hh + rr);
+            }
+        }
 
         // Pass 1: compute sum_sq for RMS
         float sum_sq = 0.0f;
@@ -121,6 +134,7 @@ inline void resadd_norm_gemv2_fp8_pert_host(
     const fp16* hidden_ptr, const fp16* residual_ptr, const fp16* norm_w_ptr,
     const uint8_t* w0, const float* s0, fp16* o0,
     const uint8_t* w1, const float* s1, fp16* o1,
+    fp16* new_residual_ptr,
     int N0, int N1, int K, float eps, int fp8_mode,
     sycl::queue& q)
 {
@@ -130,7 +144,7 @@ inline void resadd_norm_gemv2_fp8_pert_host(
             sycl::nd_range<1>(total_N, 1),
             ResAddNormGEMV2_fp8_pert_kernel{
                 hidden_ptr, residual_ptr, norm_w_ptr,
-                w0, s0, o0, w1, s1, o1,
+                w0, s0, o0, w1, s1, o1, new_residual_ptr,
                 N0, N1, K, eps, fp8_mode});
     });
 }

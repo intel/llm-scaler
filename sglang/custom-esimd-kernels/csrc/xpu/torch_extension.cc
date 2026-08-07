@@ -130,6 +130,7 @@ TORCH_LIBRARY(custom_esimd_kernels_sglang, m) {
         "Tensor norm_weight, "
         "Tensor w0, Tensor s0, Tensor o0, "
         "Tensor w1, Tensor s1, Tensor o1, "
+        "Tensor new_residual, "
         "float eps) -> Tensor");
   m.impl("esimd_resadd_norm_gemv2_fp8_pert", torch::kXPU, &esimd_resadd_norm_gemv2_fp8_pert);
 
