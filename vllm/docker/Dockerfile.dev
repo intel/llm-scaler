@@ -39,6 +39,8 @@ ARG https_proxy
 ARG no_proxy
 # vllm-xpu-kernels pinned base commit (identical to prod build).
 ARG VLLM_XPU_KERNELS_COMMIT=3cab97a
+ARG ONECCL_INSTALLER="intel-oneccl-2021.15.9.14_offline.sh"
+ARG ONECCL_INSTALLER_SHA256="f7ab81b6ed1b10dd35fadec366a78046d8af214888dfd625047ce8953d5aa4ef"
 
 ENV VIRTUAL_ENV=/opt/venv \
     PATH="/root/.local/bin:/opt/venv/bin:${PATH}" \
@@ -90,6 +92,41 @@ COPY ./patches/vllm_for_multi_arc.patch ./patches/vllm_xpu_kernels.patch /tmp/
 COPY ./custom-esimd-kernels-vllm /llm-scaler/vllm/custom-esimd-kernels-vllm
 
 WORKDIR /llm-scaler/vllm
+
+# This Intel(R) oneAPI Collective Communications Library (oneCCL) contains several
+# enhancements for Intel(R) Arc(TM) Pro graphics.
+# For details, please refer to:
+# https://github.com/uxlfoundation/oneCCL/releases/tag/2021.15.9
+RUN curl -fL --retry 3 -o "${ONECCL_INSTALLER}" "https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.9/${ONECCL_INSTALLER}" && \
+    printf "%s  %s\n" "${ONECCL_INSTALLER_SHA256}" "${ONECCL_INSTALLER}" > /tmp/oneccl.sha256 && \
+    sha256sum -c /tmp/oneccl.sha256 && \
+    rm -f /tmp/oneccl.sha256 && \
+    bash "${ONECCL_INSTALLER}" -s -x -f /tmp && \
+    ONECCL_CUP="/tmp/${ONECCL_INSTALLER%.sh}/packages/intel.oneapi.lin.ccl.runtime,v=2021.15.9+13/cupPayload.cup" && \
+    ONECCL_DST="/tmp/oneccl-runtime" && \
+    python3 -m zipfile -e "${ONECCL_CUP}" "${ONECCL_DST}" && \
+    ONECCL_LIB="${ONECCL_DST}/_installdir/ccl/2021.15/lib" && \
+    rm -f "${ONECCL_LIB}/libccl.so" "${ONECCL_LIB}/libccl.so.1" "${ONECCL_LIB}/libccl_openmp.so" "${ONECCL_LIB}/libccl_openmp.so.0" && \
+    ln -sf libccl.so.1 "${ONECCL_LIB}/libccl.so" && \
+    ln -sf libccl.so.1.0 "${ONECCL_LIB}/libccl.so.1" && \
+    ln -sf libccl_openmp.so.0 "${ONECCL_LIB}/libccl_openmp.so" && \
+    ln -sf libccl_openmp.so.0.1 "${ONECCL_LIB}/libccl_openmp.so.0" && \
+    ONECCL_CPU_LIB="${ONECCL_DST}/_installdir/ccl/2021.15/lib/ccl/cpu/lib" && \
+    rm -f "${ONECCL_CPU_LIB}/libccl.so" "${ONECCL_CPU_LIB}/libccl.so.1" "${ONECCL_CPU_LIB}/libccl_openmp.so" "${ONECCL_CPU_LIB}/libccl_openmp.so.0" && \
+    ln -sf libccl.so.1 "${ONECCL_CPU_LIB}/libccl.so" && \
+    ln -sf libccl.so.1.0 "${ONECCL_CPU_LIB}/libccl.so.1" && \
+    ln -sf libccl_openmp.so.0 "${ONECCL_CPU_LIB}/libccl_openmp.so" && \
+    ln -sf libccl_openmp.so.0.1 "${ONECCL_CPU_LIB}/libccl_openmp.so.0" && \
+    mkdir -p /opt/intel/oneapi/ccl && \
+    rm -rf /opt/intel/oneapi/ccl/2021.15 && \
+    cp -a /tmp/oneccl-runtime/_installdir/ccl/2021.15 /opt/intel/oneapi/ccl/ && \
+    rm "${ONECCL_INSTALLER}" && \
+    echo "source /opt/intel/oneapi/setvars.sh --force" >> /root/.bashrc && \
+    echo "source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --force" >> /root/.bashrc && \
+    rm -f /opt/intel/oneapi/ccl/latest && \
+    ln -s /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/latest && \
+    find /opt/intel/oneapi/ccl -mindepth 1 -maxdepth 1 -type d -not -name 2021.15 -exec rm -rf {} + && \
+    rm -rf "/tmp/${ONECCL_INSTALLER%.sh}" /tmp/oneccl-runtime
 
 # ---------------------------------------------------------------------------
 # vLLM v0.21.0 + multi-arc patch  ->  EDITABLE install (source kept at
@@ -162,6 +199,16 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     pip uninstall -y triton triton-xpu || true && \
     pip install --no-deps triton-xpu==3.7.0 \
         --extra-index-url https://download.pytorch.org/whl/xpu
+
+# Replace torch-bundled oneCCL stubs in /opt/venv/lib with links to oneCCL 2021.15.
+RUN set -eo pipefail && \
+    pip uninstall -y oneccl oneccl-devel || true && \
+    rm -f /opt/venv/lib/libccl.so /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so.1.0 \
+        /opt/venv/lib/libccl_openmp.so /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so.0.1 && \
+    ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1.0 /opt/venv/lib/libccl.so.1 && \
+    ln -sf /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so && \
+    ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl_openmp.so.0.1 /opt/venv/lib/libccl_openmp.so.0 && \
+    ln -sf /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so
 
 # Component inventory in the build log for sanity.
 RUN pip list 2>/dev/null | grep -iE "^(vllm|torch|triton|transformers|bigdl|accelerate)" || true

@@ -66,16 +66,26 @@ def esimd_gemv_fp8_pert(
 def esimd_gemv_fp16(
     input: torch.Tensor, weight: torch.Tensor, output: torch.Tensor,
 ) -> torch.Tensor:
-    """FP16 weight GEMV (no quantization). Decode (M=1) path.
+    """FP16 weight GEMV (no quantization), including small decode batches.
 
-    input:  [1, K] fp16
+    input:  [M, K] fp16
     weight: [N, K] fp16, contiguous (row-major). N inferred from weight.size(0),
             K from weight.size(1).
-    output: [1, N] fp16.
+    output: [M, N] fp16.
 
     Used by gemma4's decode router projection (GateLinear is fp16 fp16-fp16).
     """
     return _ops.esimd_gemv_fp16(input, weight, output)
+
+
+def esimd_gemv_fp16_gelu_mul(
+    input: torch.Tensor, weight: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """Fused FP16 gate-up GEMV followed by GELU-tanh and elementwise multiply.
+
+    ``weight`` is ``[2 * N, K]`` with gate rows first and up rows second.
+    """
+    return _ops.esimd_gemv_fp16_gelu_mul(input, weight, output)
 
 
 def esimd_gemv_fp8_pert_fused2(
@@ -88,6 +98,34 @@ def esimd_gemv_fp8_pert_fused2(
     N0, N1 inferred from w0.size(0), w1.size(0). K from w0.size(1).
     """
     return _ops.esimd_gemv_fp8_pert_fused2(input, w0, s0, o0, w1, s1, o1)
+
+
+def esimd_gemv_fp8_blockscale_fused2(
+    input: torch.Tensor,
+    w0: torch.Tensor, s0: torch.Tensor, o0: torch.Tensor,
+    w1: torch.Tensor, s1: torch.Tensor, o1: torch.Tensor,
+    block_n: int = 128, block_k: int = 128,
+) -> torch.Tensor:
+    """Decode dual GEMV for two E4M3 weights with 128x128 block scales.
+
+    Results are written to ``o0`` and ``o1`` in place. Returns ``o0``.
+    """
+    return _ops.esimd_gemv_fp8_blockscale_fused2(
+        input, w0, s0, o0, w1, s1, o1, block_n, block_k)
+
+
+def esimd_gemv_fp8_blockscale_fp16_fused2(
+    input: torch.Tensor,
+    w0: torch.Tensor, s0: torch.Tensor, o0: torch.Tensor,
+    w1: torch.Tensor, o1: torch.Tensor,
+    block_n: int = 128, block_k: int = 128,
+) -> torch.Tensor:
+    """Decode dual GEMV for block-E4M3 qkvz plus an FP16 ba weight.
+
+    Results are written to ``o0`` and ``o1`` in place. Returns ``o0``.
+    """
+    return _ops.esimd_gemv_fp8_blockscale_fp16_fused2(
+        input, w0, s0, o0, w1, o1, block_n, block_k)
 
 
 def esimd_gemv_fp8_pert_fused3(
@@ -478,6 +516,26 @@ def esimd_norm_gemv_fp8_pert(
         HV, V, eps)
 
 
+def esimd_norm_gemv_fp8_blockscale(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    norm_weight: torch.Tensor,
+    gemv_weight: torch.Tensor,
+    gemv_scale: torch.Tensor,
+    output: torch.Tensor,
+    HV: int,
+    V: int,
+    eps: float,
+) -> torch.Tensor:
+    """Fused RMSNormGated + E4M3 GEMV with 128x128 weight scales.
+
+    The result is written to ``output`` in place and the same tensor is
+    returned.
+    """
+    return _ops.esimd_norm_gemv_fp8_blockscale(
+        x, z, norm_weight, gemv_weight, gemv_scale, output, HV, V, eps)
+
+
 def esimd_norm_gemv_int4_pert(
     x: torch.Tensor,
     z: torch.Tensor,
@@ -538,6 +596,36 @@ def esimd_gdn_conv_fused_seq(
         A_log, dt_bias, ba,
         ssm_state, ssm_state_indices, output, z_out,
         N, H, HV, K, V, scale)
+
+
+def esimd_gdn_conv_fused_seq_spec(
+    qkvz: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor,
+    spec_state_indices: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    ba: torch.Tensor,
+    ssm_state: torch.Tensor,
+    output: torch.Tensor,
+    z_out: torch.Tensor,
+    token_indx: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    num_spec_decodes: int,
+    num_spec_tokens: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    scale: float,
+) -> torch.Tensor:
+    """Fused sequential GDN for speculative tokens with rollback states."""
+    return _ops.esimd_gdn_conv_fused_seq_spec(
+        qkvz, conv_state, conv_weight, conv_bias, spec_state_indices,
+        A_log, dt_bias, ba, ssm_state, output, z_out, token_indx,
+        num_accepted_tokens, num_spec_decodes, num_spec_tokens,
+        H, HV, K, V, scale)
 
 
 # ---- MoE Auxiliary Ops (doubleGRF, LGRF module) ----
@@ -682,6 +770,32 @@ def esimd_moe_gemm_fp8(
         N, K, num_experts, max_tokens_per_expert)
 
 
+def esimd_moe_gemm_fp8_blockscale(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+    expert_idx: torch.Tensor,
+    N: int,
+    K: int,
+    num_experts: int,
+    block_n: int = 128,
+    block_k: int = 128,
+) -> torch.Tensor:
+    """MoE grouped block-scaled FP8 GEMM (DeepSeek 128x128 weight block, w8a16).
+
+    input:        [total_tokens, K] fp16   (expert-grouped/scattered rows)
+    weight:       [num_experts, N, K] fp8_e4m3 (or uint8 bits)
+    weight_scale: [num_experts, ceil(N/128), ceil(K/128)] float32 (weight_scale_inv)
+    output:       [total_tokens, N] fp16
+    expert_idx:   [num_experts+1] uint32/int32 — token start offsets per expert
+    Activation stays fp16 (no per-token-group act quant).
+    """
+    return _ops.esimd_moe_gemm_fp8_blockscale(
+        input, weight, weight_scale, output, expert_idx,
+        N, K, num_experts, block_n, block_k)
+
+
 def esimd_gemm_fp8_pert(
     input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     output: torch.Tensor,
@@ -696,6 +810,29 @@ def esimd_gemm_fp8_pert(
       M>=2   → DPAS V9 (E4M3, K%64==0) or DPAS V7 (E5M2) or WS fallback
     """
     return _ops.esimd_gemm_fp8_pert(input, weight, weight_scale, output)
+
+
+def esimd_gemm_fp8_blockscale(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor, block_n: int = 128, block_k: int = 128,
+) -> torch.Tensor:
+    """FP8 block-scaled GEMM (DeepSeek-style), w8a16 (fp16 activation).
+
+    Computes: output[M, N] = input[M, K] @ dequant(weight[N, K])^T
+    where the fp8_e4m3 weight is dequantized with a 2D 128x128 block scale
+    (weight_scale[nb, kb] scales the 128x128 weight block). The activation is
+    NOT quantized — it is consumed in fp16 directly.
+
+    input:        [M, K]                         fp16
+    weight:       [N, K]                         fp8_e4m3 (or uint8 bits)
+    weight_scale: [ceil(N/128), ceil(K/128)]     float32  (== weight_scale_inv)
+    output:       [M, N]                         fp16 — pre-allocated
+
+    M, N, K inferred from tensor shapes. K must be a multiple of block_k (128).
+    Only block_n == block_k == 128 is currently supported.
+    """
+    return _ops.esimd_gemm_fp8_blockscale(
+        input, weight, weight_scale, output, block_n, block_k)
 
 
 def esimd_moe_gemm_fp8_pert(
@@ -945,6 +1082,42 @@ def moe_forward_full(
     """
     return _moe_batch.moe_forward_full(
         x, logits, gate_up_weight, gate_up_scale,
+        shared_gate_up_weight, shared_gate_up_scale,
+        down_weight, down_scale,
+        shared_down_weight, shared_down_scale,
+        shared_expert_gate_weight,
+        top_k, num_shared_experts, n_routed_experts)
+
+
+def moe_forward_full_fp8_block(
+    x: torch.Tensor,
+    logits: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    shared_gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_down_scale: torch.Tensor,
+    shared_expert_gate_weight: torch.Tensor,
+    top_k: int,
+    num_shared_experts: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """Small-batch MoE decode for 128x128 offline FP8 block weights.
+
+    Supports 1 to 4 tokens and exactly one shared expert. Activations and the
+    caller-owned output are contiguous fp16 tensors. Weights are contiguous
+    ``float8_e4m3fn`` tensors with contiguous fp32 128x128 block scales;
+    hidden and intermediate dimensions must both be divisible by 128. All
+    tensors must be on the same XPU device. Routed scales have layout
+    ``[E, N/128, K/128]``; shared-expert scales omit the leading expert
+    dimension.
+    """
+    output = torch.empty_like(x)
+    return _moe_batch.moe_forward_full_fp8_block(
+        x, logits, output, gate_up_weight, gate_up_scale,
         shared_gate_up_weight, shared_gate_up_scale,
         down_weight, down_scale,
         shared_down_weight, shared_down_scale,
@@ -1531,6 +1704,25 @@ def moe_forward_full_gelu_tanh(
     return _moe_batch.moe_forward_full_gelu_tanh(
         x, logits, gate_up_weight, gate_up_scale,
         down_weight, down_scale, top_k, n_routed_experts)
+
+
+def moe_forward_full_fp8_grouped(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    routing_weights: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    expert_tokens: torch.Tensor,
+    top_k: int,
+    n_routed_experts: int,
+) -> torch.Tensor:
+    """Full Gemma grouped FP8 forward with routing supplied externally."""
+    return _moe_batch.moe_forward_full_fp8_grouped(
+        x, gate_up_weight, gate_up_scale, down_weight, down_scale,
+        routing_weights, expert_offsets, expert_tokens, top_k,
+        n_routed_experts)
 
 
 def moe_forward_full_gelu_tanh_routed(

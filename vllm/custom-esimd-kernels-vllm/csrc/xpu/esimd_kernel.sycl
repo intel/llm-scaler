@@ -98,16 +98,57 @@ at::Tensor esimd_gemv_fp8_pert(
 }
 
 at::Tensor esimd_gemv_fp16(
-    at::Tensor input,    // [1, K] fp16
+    at::Tensor input,    // [M, K] fp16
     at::Tensor weight,   // [N, K] fp16
-    at::Tensor output) { // [1, N] fp16
+    at::Tensor output) { // [M, N] fp16
+    TORCH_CHECK(input.scalar_type() == at::ScalarType::Half);
+    TORCH_CHECK(weight.scalar_type() == at::ScalarType::Half);
+    TORCH_CHECK(output.scalar_type() == at::ScalarType::Half);
+    TORCH_CHECK(input.dim() == 2);
+    TORCH_CHECK(weight.dim() == 2);
+    TORCH_CHECK(output.dim() == 2);
+    TORCH_CHECK(input.is_contiguous());
+    TORCH_CHECK(weight.is_contiguous());
+    TORCH_CHECK(output.is_contiguous());
+    TORCH_CHECK(input.device() == weight.device());
+    TORCH_CHECK(input.device() == output.device());
+
+    int64_t M = input.size(0);
     int64_t N = weight.size(0);
     int64_t K = weight.size(1);
+    TORCH_CHECK(input.size(1) == K);
+    TORCH_CHECK(output.size(0) == M && output.size(1) == N);
+
     auto p_in  = reinterpret_cast<const fp16*>(input.data_ptr());
     auto p_w   = reinterpret_cast<const fp16*>(weight.data_ptr());
     auto p_out = reinterpret_cast<fp16*>(output.data_ptr());
     auto& dpcpp_queue = get_device_queue(input);
-    GEMV_fp16_host(p_in, p_w, p_out, (uint32_t)N, (uint32_t)K, dpcpp_queue);
+    GEMV_fp16_host(
+        p_in, p_w, p_out, (uint32_t)M, (uint32_t)N, (uint32_t)K,
+        dpcpp_queue);
+    return output;
+}
+
+at::Tensor esimd_gemv_fp16_gelu_mul(
+    at::Tensor input,
+    at::Tensor weight,
+    at::Tensor output) {
+    TORCH_CHECK(input.scalar_type() == at::ScalarType::Half);
+    TORCH_CHECK(weight.scalar_type() == at::ScalarType::Half);
+    TORCH_CHECK(output.scalar_type() == at::ScalarType::Half);
+    TORCH_CHECK(input.dim() == 2 && input.size(0) == 1);
+    TORCH_CHECK(weight.dim() == 2 && weight.size(0) % 2 == 0);
+    TORCH_CHECK(output.dim() == 2 && output.size(0) == 1);
+    int64_t N = weight.size(0) / 2;
+    int64_t K = weight.size(1);
+    TORCH_CHECK(input.size(1) == K);
+    TORCH_CHECK(output.size(1) == N);
+    auto& dpcpp_queue = get_device_queue(input);
+    GEMV_fp16_gelu_mul_host(
+        reinterpret_cast<const fp16*>(input.data_ptr()),
+        reinterpret_cast<const fp16*>(weight.data_ptr()),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        (uint32_t)N, (uint32_t)K, dpcpp_queue);
     return output;
 }
 

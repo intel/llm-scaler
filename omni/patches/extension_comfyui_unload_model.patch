@@ -1,0 +1,43 @@
+diff --git a/unloadModel.py b/unloadModel.py
+index 021c2cb..38c92fb 100644
+--- a/unloadModel.py
++++ b/unloadModel.py
+@@ -3,6 +3,18 @@ import gc
+ import torch
+ import time
+ 
++def clear_torch_cache():
++    """Clear backend cache for CUDA or XPU when available."""
++    if torch.cuda.is_available():
++        torch.cuda.empty_cache()
++        if hasattr(torch.cuda, "ipc_collect"):
++            torch.cuda.ipc_collect()
++        return
++
++    if torch.xpu.is_available():
++        torch.xpu.empty_cache()
++
++
+ # Note: This doesn't work with reroute for some reason?
+ class AnyType(str):
+     def __ne__(self, __value: object) -> bool:
+@@ -47,8 +59,7 @@ class UnloadModelNode:
+         try:
+             print(" - Clearing Cache...")
+             gc.collect()
+-            torch.cuda.empty_cache()
+-            torch.cuda.ipc_collect()
++            clear_torch_cache()
+         except:
+             print("   - Unable to clear cache")
+         return (kwargs.get("value"),)
+@@ -76,8 +87,7 @@ class UnloadAllModelsNode:
+         try:
+             print(" - Clearing Cache...")
+             gc.collect()
+-            torch.cuda.empty_cache()
+-            torch.cuda.ipc_collect()
++            clear_torch_cache()
+         except:
+             print("   - Unable to clear cache")
+         return (kwargs.get("value"),)

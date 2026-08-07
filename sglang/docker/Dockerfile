@@ -115,45 +115,23 @@ RUN --mount=type=bind,from=builder,source=/root/wheels,target=/tmp/wheels \
  && add-apt-repository -y ppa:kobuk-team/intel-graphics \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
-        libze-intel-gpu1 libze1 intel-metrics-discovery intel-opencl-icd clinfo intel-gsc \
-        libze-dev \
- # --- Intel(R) oneCCL 2021.15.9: contains several enhancements for
- #     Intel(R) Arc(TM) Pro graphics. Only the runtime payload is extracted from
- #     the offline installer (a full `-a --silent` install would drag in the
- #     whole oneAPI installer layout).
- #     https://github.com/uxlfoundation/oneCCL/releases/tag/2021.15.9
- && curl -fL --retry 3 -o "${ONECCL_INSTALLER}" "https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.9/${ONECCL_INSTALLER}" \
- && printf "%s  %s\n" "${ONECCL_INSTALLER_SHA256}" "${ONECCL_INSTALLER}" > /tmp/oneccl.sha256 \
- && sha256sum -c /tmp/oneccl.sha256 \
- && rm -f /tmp/oneccl.sha256 \
- && bash "${ONECCL_INSTALLER}" -s -x -f /tmp \
- && ONECCL_CUP="/tmp/${ONECCL_INSTALLER%.sh}/packages/intel.oneapi.lin.ccl.runtime,v=2021.15.9+13/cupPayload.cup" \
- && ONECCL_DST="/tmp/oneccl-runtime" \
- && python3 -m zipfile -e "${ONECCL_CUP}" "${ONECCL_DST}" \
- && ONECCL_LIB="${ONECCL_DST}/_installdir/ccl/2021.15/lib" \
- && rm -f "${ONECCL_LIB}/libccl.so" "${ONECCL_LIB}/libccl.so.1" "${ONECCL_LIB}/libccl_openmp.so" "${ONECCL_LIB}/libccl_openmp.so.0" \
- && ln -sf libccl.so.1 "${ONECCL_LIB}/libccl.so" \
- && ln -sf libccl.so.1.0 "${ONECCL_LIB}/libccl.so.1" \
- && ln -sf libccl_openmp.so.0 "${ONECCL_LIB}/libccl_openmp.so" \
- && ln -sf libccl_openmp.so.0.1 "${ONECCL_LIB}/libccl_openmp.so.0" \
- && ONECCL_CPU_LIB="${ONECCL_DST}/_installdir/ccl/2021.15/lib/ccl/cpu/lib" \
- && rm -f "${ONECCL_CPU_LIB}/libccl.so" "${ONECCL_CPU_LIB}/libccl.so.1" "${ONECCL_CPU_LIB}/libccl_openmp.so" "${ONECCL_CPU_LIB}/libccl_openmp.so.0" \
- && ln -sf libccl.so.1 "${ONECCL_CPU_LIB}/libccl.so" \
- && ln -sf libccl.so.1.0 "${ONECCL_CPU_LIB}/libccl.so.1" \
- && ln -sf libccl_openmp.so.0 "${ONECCL_CPU_LIB}/libccl_openmp.so" \
- && ln -sf libccl_openmp.so.0.1 "${ONECCL_CPU_LIB}/libccl_openmp.so.0" \
- && mkdir -p /opt/intel/oneapi/ccl \
- && rm -rf /opt/intel/oneapi/ccl/2021.15 \
- && cp -a /tmp/oneccl-runtime/_installdir/ccl/2021.15 /opt/intel/oneapi/ccl/ \
- && rm "${ONECCL_INSTALLER}" \
- # The runtime base has no oneAPI toolkit (no setvars.sh), so only the oneCCL
- # component vars.sh is sourced; --ccl-bundled-mpi=no silences the bundled-MPI
- # warning (the runtime payload ships no Intel(R) MPI, and none is needed).
- && echo "source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --ccl-bundled-mpi=no" >> /root/.bashrc \
- && rm -f /opt/intel/oneapi/ccl/latest \
- && ln -s /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/latest \
- && find /opt/intel/oneapi/ccl -mindepth 1 -maxdepth 1 -type d -not -name 2021.15 -exec rm -rf {} + \
- && rm -rf "/tmp/${ONECCL_INSTALLER%.sh}" /tmp/oneccl-runtime \
+       # Keep the production GPU runtime aligned with intel/omix:0.1.0-devel-ubuntu24.04. \
+       # Pin direct packages and version-flexible driver dependencies so a later PPA \
+       # update cannot silently change the Level Zero/OpenCL runtime. \
+        libze-intel-gpu1=26.14.37833.4-1~24.04~ppa1 \
+        libze1=1.28.2-1~24.04~ppa1 \
+        libze-dev=1.28.2-1~24.04~ppa1 \
+        libze-intel-gpu-raytracing=1.2.2-1~24.04~ppa1 \
+        intel-opencl-icd=26.14.37833.4-1~24.04~ppa1 \
+        intel-metrics-discovery=1.14.183-1~24.04~ppa1 \
+        intel-gsc=0.9.5-1~24.04~ppa2 \
+        libigdgmm12=22.10.0-1~24.04~ppa1 \
+        libigc2=2.32.7-1256~24.04 \
+        libigdfcl2=2.32.7-1256~24.04 \
+        libigsc0=0.9.5-1~24.04~ppa2 \
+        libmetee5=5.0.0-1~24.04~ppa2 \
+        ocl-icd-libopencl1=2.3.2-1build1 \
+        clinfo \
  # --- Python deps: pre-built wheels + explicit runtime deps sglang needs ---
  && python3 -m pip config set global.break-system-packages true \
  && pip3 install uv \
