@@ -1503,6 +1503,10 @@ static void ensure_moe_buffers(int n_tokens, int top_k, int num_shared_experts,
 // Shared-expert weights omit the leading expert dimension. Activations remain
 // FP16; FP8 values are converted to FP16/FP32 and multiplied by the 128x128
 // block scale before accumulation. This path does not use FP8 matrix multiply.
+template <int VecWidth>
+class MoeUpFP8BlockBatched;
+
+template <int VecWidth>
 void moe_up_fp8_block_batched_kernel(
     const fp16* x,
     const uint8_t* gate_up_weight, const float* gate_up_scale,
@@ -1516,7 +1520,7 @@ void moe_up_fp8_block_batched_kernel(
     const int scale_kb = (hidden_size + 127) / 128;
 
     auto cgf = [&](sycl::handler& cgh) {
-        cgh.parallel_for<class MoeUpFP8BlockBatched>(
+        cgh.parallel_for<MoeUpFP8BlockBatched<VecWidth>>(
             sycl::range<3>(num_tokens, top_k + 1, intermediate_size),
             [=](sycl::id<3> idx) SYCL_ESIMD_KERNEL {
                 const int token = (int)idx[0];
@@ -1537,22 +1541,21 @@ void moe_up_fp8_block_batched_kernel(
                 const float* up_s = scales
                     + (size_t)((intermediate_size + row) / 128) * scale_kb;
 
-                simd<float, 64> gate_acc(0.f), up_acc(0.f);
-                for (int k = 0; k < hidden_size; k += 64) {
-                    simd<float, 64> xv =
-                        block_load<fp16, 64>(token_x + k);
-                    simd<float, 64> gw = fp8e4m3_to_half<64>(
-                        block_load<uint8_t, 64>(gate_w + k));
-                    simd<float, 64> uw = fp8e4m3_to_half<64>(
-                        block_load<uint8_t, 64>(up_w + k));
+                simd<float, VecWidth> gate_acc(0.f), up_acc(0.f);
+                for (int k = 0; k < hidden_size; k += VecWidth) {
+                    simd<float, VecWidth> xv =
+                        block_load<fp16, VecWidth>(token_x + k);
+                    simd<float, VecWidth> gw = fp8e4m3_to_half<VecWidth>(
+                        block_load<uint8_t, VecWidth>(gate_w + k));
+                    simd<float, VecWidth> uw = fp8e4m3_to_half<VecWidth>(
+                        block_load<uint8_t, VecWidth>(up_w + k));
                     gate_acc += xv * (gw * gate_s[k / 128]);
                     up_acc += xv * (uw * up_s[k / 128]);
                 }
-
                 float gate = sycl::ext::intel::esimd::detail::sum<
-                    float, float, 64>(gate_acc);
+                    float, float, VecWidth>(gate_acc);
                 float up = sycl::ext::intel::esimd::detail::sum<
-                    float, float, 64>(up_acc);
+                    float, float, VecWidth>(up_acc);
                 float silu = gate / (1.f + sycl::exp(-gate));
                 const size_t intermediate_offset =
                     ((size_t)token * (top_k + 1) + route)
@@ -1564,11 +1567,16 @@ void moe_up_fp8_block_batched_kernel(
     submit_kernel(cgf, device, "moe up fp8 block batched");
 }
 
+template <int VecWidth>
+class MoeDownFinalizeFP8BlockBatched;
+
+template <int VecWidth>
 void moe_down_finalize_fp8_block_batched_kernel(
     const fp16* x, const fp16* intermediates,
     const uint8_t* down_weight, const float* down_scale,
     const uint8_t* shared_down_weight, const float* shared_down_scale,
     const fp16* shared_expert_gate_weight,
+    const float* shared_gate_values,
     const fp16* routing_weights, const int* selected_experts,
     fp16* final_output, const int num_tokens, const int hidden_size,
     const int intermediate_size, const int top_k,
@@ -1577,12 +1585,11 @@ void moe_down_finalize_fp8_block_batched_kernel(
     const int scale_kb = (intermediate_size + 127) / 128;
 
     auto cgf = [&](sycl::handler& cgh) {
-        cgh.parallel_for<class MoeDownFinalizeFP8BlockBatched>(
+        cgh.parallel_for<MoeDownFinalizeFP8BlockBatched<VecWidth>>(
             sycl::range<2>(num_tokens, hidden_size),
             [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
                 const int token = (int)idx[0];
                 const int out = (int)idx[1];
-                const fp16* token_x = x + (size_t)token * hidden_size;
                 float result = 0.f;
 
                 for (int route = 0; route < top_k; route++) {
@@ -1595,29 +1602,40 @@ void moe_down_finalize_fp8_block_batched_kernel(
                         + ((size_t)eid * hidden_size + out) * intermediate_size;
                     const float* scales = down_scale
                         + ((size_t)eid * scale_nb + out / 128) * scale_kb;
-                    simd<float, 64> acc(0.f);
-                    for (int k = 0; k < intermediate_size; k += 64) {
-                        simd<float, 64> iv =
-                            block_load<fp16, 64>(input + k);
-                        simd<float, 64> wv = fp8e4m3_to_half<64>(
-                            block_load<uint8_t, 64>(weight + k));
+                    simd<float, VecWidth> acc(0.f);
+                    for (int k = 0; k < intermediate_size; k += VecWidth) {
+                        simd<float, VecWidth> iv =
+                            block_load<fp16, VecWidth>(input + k);
+                        simd<float, VecWidth> wv =
+                            fp8e4m3_to_half<VecWidth>(
+                                block_load<uint8_t, VecWidth>(weight + k));
                         acc += iv * (wv * scales[k / 128]);
                     }
-                    result += sycl::ext::intel::esimd::detail::sum<
-                        float, float, 64>(acc)
+                    float route_result =
+                        sycl::ext::intel::esimd::detail::sum<
+                            float, float, VecWidth>(acc);
+                    result += route_result
                         * (float)routing_weights[route_offset];
                 }
 
-                simd<float, 64> gate_acc(0.f);
-                for (int k = 0; k < hidden_size; k += 64) {
-                    simd<float, 64> xv = block_load<fp16, 64>(token_x + k);
-                    simd<float, 64> gw = block_load<fp16, 64>(
-                        shared_expert_gate_weight + k);
-                    gate_acc += xv * gw;
+                float gate;
+                if (num_tokens < 4) {
+                    const fp16* token_x = x + (size_t)token * hidden_size;
+                    simd<float, VecWidth> gate_acc(0.f);
+                    for (int k = 0; k < hidden_size; k += VecWidth) {
+                        simd<float, VecWidth> xv =
+                            block_load<fp16, VecWidth>(token_x + k);
+                        simd<float, VecWidth> gw =
+                            block_load<fp16, VecWidth>(
+                            shared_expert_gate_weight + k);
+                        gate_acc += xv * gw;
+                    }
+                    gate = sycl::ext::intel::esimd::detail::sum<
+                        float, float, VecWidth>(gate_acc);
+                    gate = 1.f / (1.f + sycl::exp(-gate));
+                } else {
+                    gate = shared_gate_values[token];
                 }
-                float gate = sycl::ext::intel::esimd::detail::sum<
-                    float, float, 64>(gate_acc);
-                gate = 1.f / (1.f + sycl::exp(-gate));
 
                 const fp16* shared_input =
                     intermediates
@@ -1627,16 +1645,17 @@ void moe_down_finalize_fp8_block_batched_kernel(
                     shared_down_weight + (size_t)out * intermediate_size;
                 const float* shared_scales = shared_down_scale
                     + (size_t)(out / 128) * scale_kb;
-                simd<float, 64> shared_acc(0.f);
-                for (int k = 0; k < intermediate_size; k += 64) {
-                    simd<float, 64> iv =
-                        block_load<fp16, 64>(shared_input + k);
-                    simd<float, 64> wv = fp8e4m3_to_half<64>(
-                        block_load<uint8_t, 64>(shared_weight + k));
+                simd<float, VecWidth> shared_acc(0.f);
+                for (int k = 0; k < intermediate_size; k += VecWidth) {
+                    simd<float, VecWidth> iv =
+                        block_load<fp16, VecWidth>(shared_input + k);
+                    simd<float, VecWidth> wv = fp8e4m3_to_half<VecWidth>(
+                        block_load<uint8_t, VecWidth>(shared_weight + k));
                     shared_acc += iv * (wv * shared_scales[k / 128]);
                 }
-                result += gate * sycl::ext::intel::esimd::detail::sum<
-                    float, float, 64>(shared_acc);
+                float shared_result = sycl::ext::intel::esimd::detail::sum<
+                    float, float, VecWidth>(shared_acc);
+                result += gate * shared_result;
                 final_output[(size_t)token * hidden_size + out] = fp16(result);
             });
     };
@@ -1644,21 +1663,21 @@ void moe_down_finalize_fp8_block_batched_kernel(
 }
 
 struct MoeBlockBuffers {
-    torch::Tensor topk_idx, topk_weight, intermediates;
+    torch::Tensor topk_idx, topk_weight, intermediates, shared_gate_values;
     int cached_topk = -1;
     int cached_hidden = -1;
     int cached_intermediate = -1;
     int cached_device = -1;
 };
 
-// Capture and serving commonly alternate among 1..4 decode tokens. Keep one
-// persistent slot per token count so switching shapes does not reallocate all
+// Capture and serving commonly alternate among small decode token counts. Keep
+// one persistent slot per token count so switching shapes does not reallocate all
 // intermediate tensors. The memory cost is tiny for these decode-only buffers.
 // This cache follows vLLM's single model-compute-stream-per-TP-worker contract;
 // concurrent use from multiple compute streams is unsupported. If that
 // execution model changes, use per-stream caches rather than synchronizing the
 // decode hot path on every stream change.
-static thread_local std::array<MoeBlockBuffers, 4> s_block_buffers;
+static thread_local std::array<MoeBlockBuffers, 12> s_block_buffers;
 
 static MoeBlockBuffers& ensure_moe_block_buffers(
         int num_tokens, int top_k, int hidden_size, int intermediate_size,
@@ -1675,6 +1694,8 @@ static MoeBlockBuffers& ensure_moe_block_buffers(
         buffers.intermediates = torch::empty(
             {num_tokens, top_k + 1, intermediate_size},
             torch::device(dev).dtype(torch::kHalf));
+        buffers.shared_gate_values = torch::empty(
+            {num_tokens}, torch::device(dev).dtype(torch::kFloat32));
         buffers.cached_topk = top_k;
         buffers.cached_hidden = hidden_size;
         buffers.cached_intermediate = intermediate_size;
@@ -1692,8 +1713,8 @@ torch::Tensor moe_forward_full_fp8_block(
     torch::Tensor shared_expert_gate_weight,
     int64_t top_k, int64_t num_shared_experts,
     int64_t n_routed_experts) {
-    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 4,
-                "moe_forward_full_fp8_block supports 1 to 4 tokens");
+    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 12,
+                "moe_forward_full_fp8_block supports 1 to 12 tokens");
     TORCH_CHECK(x.is_contiguous() && x.scalar_type() == torch::kHalf);
     const int num_tokens = x.size(0);
     TORCH_CHECK(logits.dim() == 2 && logits.size(0) == num_tokens &&
@@ -1781,26 +1802,53 @@ torch::Tensor moe_forward_full_fp8_block(
         (int)n_routed_experts,
         (int)top_k, /*norm=*/true, logits.device());
 
-    moe_up_fp8_block_batched_kernel(
-        (const fp16*)x.data_ptr(),
-        (const uint8_t*)gate_up_weight.data_ptr(), gate_up_scale.data_ptr<float>(),
-        (const uint8_t*)shared_gate_up_weight.data_ptr(),
-        shared_gate_up_scale.data_ptr<float>(),
-        buffers.topk_idx.data_ptr<int>(),
-        (fp16*)buffers.intermediates.data_ptr(), num_tokens, hidden_size,
-        intermediate_size, top_k, x.device());
+    auto launch_up = [&]<int VecWidth>() {
+        moe_up_fp8_block_batched_kernel<VecWidth>(
+            (const fp16*)x.data_ptr(),
+            (const uint8_t*)gate_up_weight.data_ptr(),
+            gate_up_scale.data_ptr<float>(),
+            (const uint8_t*)shared_gate_up_weight.data_ptr(),
+            shared_gate_up_scale.data_ptr<float>(),
+            buffers.topk_idx.data_ptr<int>(),
+            (fp16*)buffers.intermediates.data_ptr(), num_tokens, hidden_size,
+            intermediate_size, top_k, x.device());
+    };
+    if (num_tokens < 4) {
+        launch_up.template operator()<64>();
+    } else {
+        launch_up.template operator()<128>();
+    }
 
-    moe_down_finalize_fp8_block_batched_kernel(
-        (const fp16*)x.data_ptr(),
-        (const fp16*)buffers.intermediates.data_ptr(),
-        (const uint8_t*)down_weight.data_ptr(), down_scale.data_ptr<float>(),
-        (const uint8_t*)shared_down_weight.data_ptr(),
-        shared_down_scale.data_ptr<float>(),
-        (const fp16*)shared_expert_gate_weight.data_ptr(),
-        (const fp16*)buffers.topk_weight.data_ptr(),
-        buffers.topk_idx.data_ptr<int>(),
-        (fp16*)output.data_ptr(), num_tokens, hidden_size,
-        intermediate_size, top_k, x.device());
+    // The shared-expert gate depends only on the token, not the output row.
+    // Precompute it once instead of repeating the hidden-size dot product for
+    // every one of the hidden_size down-projection work-items.
+    if (num_tokens >= 4) {
+        moe_down_gate_precompute_kernel(
+            (const fp16*)x.data_ptr(),
+            (const fp16*)shared_expert_gate_weight.data_ptr(),
+            buffers.shared_gate_values.data_ptr<float>(), num_tokens,
+            hidden_size, /*num_shared_experts=*/1, x.device());
+    }
+
+    auto launch_down = [&]<int VecWidth>() {
+        moe_down_finalize_fp8_block_batched_kernel<VecWidth>(
+            (const fp16*)x.data_ptr(),
+            (const fp16*)buffers.intermediates.data_ptr(),
+            (const uint8_t*)down_weight.data_ptr(), down_scale.data_ptr<float>(),
+            (const uint8_t*)shared_down_weight.data_ptr(),
+            shared_down_scale.data_ptr<float>(),
+            (const fp16*)shared_expert_gate_weight.data_ptr(),
+            buffers.shared_gate_values.data_ptr<float>(),
+            (const fp16*)buffers.topk_weight.data_ptr(),
+            buffers.topk_idx.data_ptr<int>(),
+            (fp16*)output.data_ptr(), num_tokens, hidden_size,
+            intermediate_size, top_k, x.device());
+    };
+    if (num_tokens < 4) {
+        launch_down.template operator()<64>();
+    } else {
+        launch_down.template operator()<128>();
+    }
     return output;
 }
 
@@ -2405,6 +2453,7 @@ TORCH_LIBRARY_FRAGMENT(moe_ops, m) {
     m.def("moe_forward_full_gelu_tanh_decode(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor per_expert_scale, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_up_fp8_grouped(Tensor x, Tensor gate_up_weight, Tensor gate_up_scale, Tensor expert_offsets, Tensor expert_tokens, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_down_fp8_grouped(Tensor intermediate, Tensor down_weight, Tensor down_scale, Tensor routing_weights, Tensor expert_offsets, Tensor expert_tokens, int top_k, int n_routed_experts) -> Tensor");
+    m.def("moe_forward_full_fp8_grouped(Tensor x, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor routing_weights, Tensor expert_offsets, Tensor expert_tokens, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full_fp8_block(Tensor x, Tensor logits, Tensor(a!) output, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor(a!)");
     m.def("moe_forward_full_v2(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
@@ -2422,6 +2471,7 @@ TORCH_LIBRARY_IMPL(moe_ops, XPU, m) {
     m.impl("moe_forward_full_gelu_tanh_decode", &moe_forward_full_gelu_tanh_decode);
     m.impl("moe_up_fp8_grouped", &moe_up_fp8_grouped);
     m.impl("moe_down_fp8_grouped", &moe_down_fp8_grouped);
+    m.impl("moe_forward_full_fp8_grouped", &moe_forward_full_fp8_grouped);
     m.impl("moe_forward_full_gelu_tanh_routed_no_accum", &moe_forward_full_gelu_tanh_routed_no_accum);
     m.impl("moe_forward_fused", &moe_forward_fused);
     m.impl("moe_forward_full", &moe_forward_full);

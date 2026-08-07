@@ -5,8 +5,9 @@ LLM Scaler is a GenAI solution for text generation, image generation, video gene
 ---
 
 ## Latest Update
-- 🔥[2026.07] We released `intel/llm-scaler-omni:0.1.0-b8` to support ComfyUI 0.27.0,more workflows and models.
-- 🔥[2026.07] We released `intel/llm-scaler-vllm:0.21.0-b1` to support Gemma 4 (12B, 31B and 26B-A4B) and DiffusionGemma (26B-A4B) models, and experimentally support XPU graph. 
+- 🔥[2026.08] We released `intel/llm-scaler-vllm:0.21.0-b2` to support Multi-token Prediction (MTP) and Lora Serving for Qwen3.6-27B, Qwen3.6-35B-A3B, gemma-4-31B-it and gemma-4-26B-A4B-it models, and support per-block quantization models Qwen3.6-27B-FP8 and Qwen3.6-35B-A3B-FP8. 
+- [2026.07] We released `intel/llm-scaler-omni:0.1.0-b8` to support ComfyUI 0.27.0, more workflows and models.
+- [2026.07] We released `intel/llm-scaler-vllm:0.21.0-b1` to support Gemma 4 (12B, 31B and 26B-A4B) and diffusiongemma (26B-A4B) models, and experimentally support XPU graph. 
 - [2026.06] We released `intel/llm-scaler-vllm:0.14.0-b8.3.2` to fix Qwen3.5/3.6-27B accuracy issues. 
 - [2026.06] We released `intel/llm-scaler-vllm:0.14.0-b8.3.1` to enable FP8 KV Cache and fix bugs for Qwen3/Qwen3.5 models. 
 - [2026.05] We released `intel/llm-scaler-vllm:0.14.0-b8.3` to improve performance for Qwen3.5/3.6 series and Qwen3-Coder-Next, and enabled model streaming load to reduce peak memory. 
@@ -32,7 +33,7 @@ LLM Scaler is a GenAI solution for text generation, image generation, video gene
 `llm-scaler-vllm` supports running text generation models using vLLM, featuring: 
 
 - ***CCL*** support (P2P or USM)
-- ***INT4*** and ***FP8*** quantized online serving
+- ***INT4*** and ***FP8*** quantized online serving, plus pre-quantized FP8 model support
 - ***Embedding*** and ***Reranker*** model support
 - ***Multi-Modal*** model support
 - ***Omni*** model support
@@ -68,6 +69,8 @@ Please follow the instructions in the [Getting Started](vllm/README.md/#1-gettin
 | Qwen/Qwen3-Coder-Next                      |  ✅  |         ✅         |                    |       |                           |
 | Qwen/Qwen3.5/3.6-27B                       |  ✅  |         ✅         |          ✅          |       |                           |
 | Qwen/Qwen3.5/3.6-35B-A3B                   |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3.6-27B-FP8                       |      |                    |                      |       | Pre-quantized offline FP8 model |
+| Qwen/Qwen3.6-35B-A3B-FP8                   |      |                    |                      |       | Pre-quantized offline FP8 model |
 | Qwen/Qwen3.5-122B-A10B                     |      |         ✅         |          ✅          |       |                           |
 | Qwen/QwQ-32B                               |  ✅  |         ✅         |          ✅          |       |                           |
 | mistralai/Ministral-8B-Instruct-2410       |  ✅  |         ✅         |          ✅          |       |                           |

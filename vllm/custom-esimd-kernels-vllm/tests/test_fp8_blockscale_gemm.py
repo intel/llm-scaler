@@ -62,6 +62,30 @@ def run_case(M, N, K, dev):
     return ok
 
 
+def run_all_finite_e4m3_codes(dev):
+    """Exercise every finite E4M3 encoding, especially the 14 subnormals."""
+    N, K = 128, 256
+    codes = torch.arange(256, dtype=torch.uint8, device=dev)
+    codes = codes[(codes != 0x7F) & (codes != 0xFF)]
+    raw = codes.repeat((N * K + codes.numel() - 1) // codes.numel())[:N * K]
+    wq = raw.reshape(N, K).view(torch.float8_e4m3fn)
+    ws = torch.ones(N // BN, K // BK, dtype=torch.float32, device=dev)
+    a = torch.linspace(-1, 1, K, dtype=torch.float16, device=dev).reshape(1, K)
+    ref = a.float() @ wq.float().t()
+    out = torch.empty(1, N, dtype=torch.float16, device=dev)
+    esimd.esimd_gemm_fp8_blockscale(a, wq, ws, out, BN, BK)
+    torch.xpu.synchronize()
+
+    rel = (out.float() - ref).abs().mean() / ref.abs().mean().clamp(min=1e-6)
+    cos = torch.nn.functional.cosine_similarity(
+        out.float().flatten(), ref.flatten(), dim=0
+    )
+    ok = rel < 5e-3 and cos > 0.99999
+    print(f"all finite E4M3 codes: mean_rel={rel:.4e} cos={cos:.8f}  "
+          f"{'OK' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     dev = "xpu"
     torch.xpu.synchronize()
@@ -70,11 +94,12 @@ def main():
         for N in (1024, 5120, 6144):
             all_ok &= run_case(1, N, K, dev)      # decode
     # M>1 tiled path + remainder tile
-    for M in (2, 7, 8, 9, 33, 64):
+    for M in (2, 7, 8, 9, 10, 12, 33, 64):
         all_ok &= run_case(M, 5120, 5120, dev)
     # N not a multiple of PPG (scalar tail store path)
     all_ok &= run_case(1, 1000, 5120, dev)
     all_ok &= run_case(4, 1000, 5120, dev)
+    all_ok &= run_all_finite_e4m3_codes(dev)
     print("\nRESULT:", "ALL OK" if all_ok else "FAILURES PRESENT")
     raise SystemExit(0 if all_ok else 1)
 

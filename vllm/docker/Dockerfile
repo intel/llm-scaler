@@ -190,7 +190,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     rm -rf /opt/intel/oneapi/ccl/2021.15 && \
     cp -a /tmp/oneccl-runtime/_installdir/ccl/2021.15 /opt/intel/oneapi/ccl/ && \
     rm "${ONECCL_INSTALLER}" && \
-    echo "source /opt/intel/oneapi/setvars.sh --force" >> /root/.bashrc && \
     echo "source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --force" >> /root/.bashrc && \
     rm -f /opt/intel/oneapi/ccl/latest && \
     ln -s /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/latest && \
@@ -217,9 +216,5 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     strip --strip-debug ${TRITON}/_C/libtriton.so && \
     rm -f ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git && \
     ln -s libMLIRDialectPlugin.so ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git
-
-# --- entrypoint: oneCCL 2021.15 is preloaded via LD_PRELOAD to avoid torch's
-#     /opt/venv/lib libccl.so.1 taking precedence due to libtorch_xpu.so RPATH. ---
-ENV LD_PRELOAD="/opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1"
 
 ENTRYPOINT ["bash", "-c", "exec vllm serve \"$@\"", "--"]

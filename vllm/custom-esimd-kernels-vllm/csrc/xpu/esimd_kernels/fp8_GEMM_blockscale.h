@@ -34,52 +34,18 @@ namespace fp8_blockscale {
 #define BS_WE 4
 #define BS_WM 3
 
-// Vectorized fp8_e4m3 (fn) -> fp16 conversion (handles zero + subnormals; NaN
-// inputs are not expected in weights and are not special-cased). Mirrors the
-// bit manipulation in GEMV_a16_wfp8_block.
+// Branchless fp8_e4m3fn -> fp16 conversion used by the oneDNN JIT path.
+// Shifting the encoded byte into the fp16 subnormal range and multiplying by
+// 2^8 maps all finite E4M3 values exactly, including E4M3 subnormals.
 template <uint32_t N>
 inline simd<fp16, N> fp8e4m3_to_fp16(simd<uint8_t, N> x) {
-  constexpr uint16_t weo = 5;   // fp16 exponent bits
-  constexpr uint16_t wmo = 10;  // fp16 mantissa bits
-
-  // E4M3 has both +0 (0x00) and -0 (0x80). Ignore the sign bit when
-  // identifying zero, then preserve it in the FP16 result below.
-  auto is_zero = ((x & 0x7F) == 0);
-
-  simd<uint16_t, N> mantissa = x & ((1 << BS_WM) - 1);
-  simd<uint16_t, N> exponent = (x & 0x7F) >> BS_WM;
-
-  auto zero_exponent = (exponent == 0);
-  simd<uint16_t, N> mantissa_subnormal = mantissa;
-  simd<uint16_t, N> exponent_subnormal = exponent;
-  {
-    // Re-normalize subnormal fp8 mantissa: count leading zeros via the exponent
-    // of (float)mantissa, then shift into a normalized fp16 representation.
-    simd<uint16_t, N> vec = mantissa;
-    simd<float, N> vec_float = vec;
-    simd<uint32_t, N> vec_uint = vec_float.template bit_cast_view<uint32_t>();
-    simd<uint32_t, N> exponent_tmp = (vec_uint >> 23) & 0xFF;
-    simd<uint32_t, N> lz = 158 - exponent_tmp;  // 158 = 127 + 31
-    simd<uint16_t, N> renorm_shift = lz;
-
-    simd<uint16_t, N> sh = 1 + renorm_shift - (32 - BS_WM);
-    mantissa_subnormal <<= sh;
-    exponent_subnormal += 1 - sh;
-    mantissa_subnormal &= ((1 << BS_WM) - 1);
-  }
-
-  mantissa.merge(mantissa_subnormal, zero_exponent);
-  exponent.merge(exponent_subnormal, zero_exponent);
-
-  const uint16_t exp_low_cutoff = (1 << (weo - 1)) - (1 << (BS_WE - 1));
-  exponent += exp_low_cutoff;
-  mantissa <<= wmo - BS_WM;
-
-  simd<uint16_t, N> sign = x >> 7;
-  simd<uint16_t, N> retval = (sign << 15) | (exponent << 10) | mantissa;
-  retval.merge(sign << 15, is_zero);
-
-  return retval.template bit_cast_view<fp16>();
+  simd<uint16_t, N> u16 = convert<uint16_t>(x);
+  u16 <<= 8;
+  simd<int16_t, N> shifted =
+      u16.template bit_cast_view<int16_t>().read() >> 1;
+  u16 = shifted.template bit_cast_view<uint16_t>().read() & 0xBFFF;
+  simd<fp16, N> value = u16.template bit_cast_view<fp16>().read();
+  return value * fp16(256.0f);
 }
 
 // Block-scaled FP8 GEMV, BMG-tuned (modeled on GEMV_fp8_pert_bmg_kernel).
@@ -119,21 +85,27 @@ struct gemv_block_bmg_kernel {
     simd<float, MAX_M> acc = 0.0f;
 
     for (int k = ks; k < ks + kp; k += VL) {
-      // Load + dequant the weight slice once, fold in the per-128 block scale.
+      // Load + dequant the weight slice once. Apply each 128-wide block scale
+      // after its local dot product: this is algebraically identical to
+      // scaling every weight, but replaces 128 vector multiplies with one
+      // scalar multiply per block.
       simd<uint8_t, VL> raw = block_load<uint8_t, VL>(w_row + k);
       simd<float, VL> wf = fp8e4m3_to_fp16<VL>(raw);
-#pragma unroll
-      for (int sb = 0; sb < VL / BK; sb++) {
-        const float sc = s_row[(k / BK) + sb];
-        wf.template select<BK, 1>(sb * BK) = wf.template select<BK, 1>(sb * BK) * sc;
-      }
-      // Reuse the scaled weight across all M activation rows.
+      // Reuse the decoded weight across all M activation rows.
 #pragma unroll
       for (int m = 0; m < MAX_M; m++) {
         if (m < M) {
           simd<fp16, VL> iv = block_load<fp16, VL>(input + (size_t)m * K + k);
           simd<float, VL> ivf = iv;
-          acc[m] += reduce<float>(ivf * wf, std::plus<>());
+#pragma unroll
+          for (int sb = 0; sb < VL / BK; sb++) {
+            acc[m] +=
+                reduce<float>(
+                    ivf.template select<BK, 1>(sb * BK) *
+                        wf.template select<BK, 1>(sb * BK),
+                    std::plus<>()) *
+                s_row[(k / BK) + sb];
+          }
         }
       }
     }
@@ -219,8 +191,9 @@ inline void dispatch_gemv_block_bmg(const fp16* input, const uint8_t* weight,
 #undef BS_DISPATCH
 }
 
-// Host launcher. block_n/block_k must be 128. Handles any M by tiling into
-// groups of TILE rows (weight is reloaded per tile but reused across the tile).
+// Host launcher. block_n/block_k must be 128. Keep decode batches through 12
+// rows in one launch so the weight is streamed once and reused across all rows.
+// Larger M is tiled in groups of eight to bound register pressure.
 inline void gemm_fp8_blockscale_host(const fp16* input, const uint8_t* weight,
                                      const float* weight_scale, fp16* output,
                                      uint32_t M, uint32_t N, uint32_t K,
@@ -229,6 +202,16 @@ inline void gemm_fp8_blockscale_host(const fp16* input, const uint8_t* weight,
   if (M == 1) {
     dispatch_gemv_block_bmg<1>(input, weight, weight_scale, output, 1, (int)N,
                                (int)K, q);
+    return;
+  }
+  if (M <= 8) {
+    dispatch_gemv_block_bmg<8>(input, weight, weight_scale, output, (int)M,
+                               (int)N, (int)K, q);
+    return;
+  }
+  if (M <= 12) {
+    dispatch_gemv_block_bmg<12>(input, weight, weight_scale, output, (int)M,
+                                (int)N, (int)K, q);
     return;
   }
   constexpr uint32_t TILE = 8;
@@ -273,13 +256,16 @@ struct gemv_block_fused2_bmg_kernel {
     for (int k = ks; k < ks + kp; k += VL) {
       simd<uint8_t, VL> raw = block_load<uint8_t, VL>(w_row + k);
       simd<float, VL> wf = fp8e4m3_to_fp16<VL>(raw);
+      simd<float, VL> iv = block_load<fp16, VL>(input + k);
 #pragma unroll
       for (int sb = 0; sb < VL / BK; sb++) {
-        const float sc = s_row[(k / BK) + sb];
-        wf.template select<BK, 1>(sb * BK) *= sc;
+        acc +=
+            reduce<float>(
+                iv.template select<BK, 1>(sb * BK) *
+                    wf.template select<BK, 1>(sb * BK),
+                std::plus<>()) *
+            s_row[(k / BK) + sb];
       }
-      simd<float, VL> iv = block_load<fp16, VL>(input + k);
-      acc += reduce<float>(iv * wf, std::plus<>());
     }
 
     if constexpr (K_SPLIT == 1) {
@@ -379,14 +365,22 @@ struct gemv_block_fp16_fused2_bmg_kernel {
         simd<uint8_t, VL> raw =
             block_load<uint8_t, VL>(weight0 + (size_t)n * K + k);
         wf = fp8e4m3_to_fp16<VL>(raw);
+      }
+      simd<float, VL> iv = block_load<fp16, VL>(input + k);
+      if (fp16_matrix) {
+        acc += reduce<float>(iv * wf, std::plus<>());
+      } else {
         const float* s_row = scale0 + (size_t)(n / 128) * Kb;
 #pragma unroll
         for (int sb = 0; sb < VL / 128; sb++) {
-          wf.template select<128, 1>(sb * 128) *= s_row[(k / 128) + sb];
+          acc +=
+              reduce<float>(
+                  iv.template select<128, 1>(sb * 128) *
+                      wf.template select<128, 1>(sb * 128),
+                  std::plus<>()) *
+              s_row[(k / 128) + sb];
         }
       }
-      simd<float, VL> iv = block_load<fp16, VL>(input + k);
-      acc += reduce<float>(iv * wf, std::plus<>());
     }
     fp16* output = fp16_matrix ? output1 : output0;
     if constexpr (K_SPLIT == 1) {

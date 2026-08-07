@@ -57,7 +57,6 @@ def run_model(container, model:ModelSpec, config:ScriptConfig):
     outstr += '--gpu-memory-util=0.9 '
     outstr += '--no-enable-prefix-caching '
     outstr += '--max-num-batched-tokens=2048 '
-    outstr += '--disable-log-requests '
     outstr += '--max-model-len=2048 '
     outstr += '--block-size 64 '
     if model.quantization:

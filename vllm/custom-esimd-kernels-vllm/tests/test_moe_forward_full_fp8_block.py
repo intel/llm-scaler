@@ -80,7 +80,7 @@ def reference(
     return out
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 2, 3])
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 4, 8, 10, 12])
 @pytest.mark.parametrize("seed", range(3))
 def test_moe_forward_full_fp8_block(batch_size: int, seed: int):
     device = "xpu"

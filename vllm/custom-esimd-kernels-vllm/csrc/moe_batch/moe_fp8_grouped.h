@@ -91,7 +91,10 @@ inline void moe_build_tile_map_kernel(
 // One work-item == one TILE_M-row tile (expert from tile_expert[tile]), so the
 // per-expert token skew no longer serializes inside a work-item.
 // Output written to intermediate[routed_row, n] for each gathered route row.
-template <int TILE_M = 8>
+template <bool FUSE_TILE_MAP>
+class MoeUpFp8Grouped;
+
+template <int TILE_M = 8, bool FUSE_TILE_MAP = false>
 void moe_up_fp8_grouped_gelu_tanh_kernel(
     const fp16* x,                       // [n_tokens, hidden]
     const uint8_t* gate_up_weight,       // [E, 2*inter, hidden] e4m3
@@ -107,19 +110,38 @@ void moe_up_fp8_grouped_gelu_tanh_kernel(
     const int n_ntiles = intermediate_size / 16;
 
     auto cgf = [&](sycl::handler& cgh) {
-        cgh.parallel_for<class MoeUpFp8Grouped>(
+        cgh.parallel_for<MoeUpFp8Grouped<FUSE_TILE_MAP>>(
             sycl::range<2>(max_tiles, n_ntiles),
             [=](sycl::item<2> item) SYCL_ESIMD_KERNEL {
                 const int tile   = (int)item.get_id(0);
-                const int eid    = tile_expert[tile];
-                if (eid < 0) return;                            // unused tile slot
-                const int n_tile = (int)item.get_id(1);
+            int eid = -1;
+            int m_base = 0;
+            if constexpr (FUSE_TILE_MAP) {
+                int tile_cursor = 0;
+                for (int e = 0; e < num_experts; e++) {
+                    const int e0 = expert_offsets[e];
+                    const int e1 = (e + 1 < num_experts)
+                        ? expert_offsets[e + 1] : total_routes;
+                    const int e_tiles = (e1 - e0 + TILE_M - 1) / TILE_M;
+                    if (tile >= tile_cursor
+                            && tile < tile_cursor + e_tiles) {
+                        eid = e;
+                        m_base = e0 + (tile - tile_cursor) * TILE_M;
+                        break;
+                    }
+                    tile_cursor += e_tiles;
+                }
+            } else {
+                eid = tile_expert[tile];
+                m_base = tile_mbase[tile];
+            }
+            if (eid < 0) return;                            // unused tile slot
+            const int n_tile = (int)item.get_id(1);
                 const int ng     = n_tile * 16;                 // gate N base
                 const int nu     = intermediate_size + ng;      // up N base (row)
 
                 const int t1 = (eid + 1 < num_experts) ? expert_offsets[eid + 1]
                                                        : total_routes;
-                const int m_base = tile_mbase[tile];
                 const int m_cnt = (t1 - m_base) < TILE_M ? (t1 - m_base) : TILE_M;
 
                 // K-major weight: row stride = hidden_size. base[(N row)*hidden + k]
@@ -340,26 +362,46 @@ inline torch::Tensor moe_up_fp8_grouped(
     // Flatten work into fixed TILE_M tiles to remove per-expert skew. Upper
     // bound on tiles: sum_e ceil(c_e / TILE_M) <= total_routes/TILE_M + E.
     constexpr int TILE_M = 16;  // M256 OPT: MG=2 (16 rows/tile, weight reuse)
-    int max_tiles = total_routes / TILE_M + (int)n_routed_experts;
-    auto opts_int = torch::device(x.device()).dtype(torch::kInt32);
-    auto tile_expert = torch::empty({max_tiles}, opts_int);
-    auto tile_mbase  = torch::empty({max_tiles}, opts_int);
-    moe_build_tile_map_kernel(
-        expert_offsets.data_ptr<int>(),
-        tile_expert.data_ptr<int>(),
-        tile_mbase.data_ptr<int>(),
-        (int)n_routed_experts, total_routes, max_tiles, TILE_M, x.device());
-    moe_up_fp8_grouped_gelu_tanh_kernel<TILE_M>(
-        (const fp16*)x.data_ptr(),
-        (const uint8_t*)gate_up_weight.data_ptr(),
-        gate_up_scale.data_ptr<float>(),
-        expert_offsets.data_ptr<int>(),
-        expert_tokens.data_ptr<int>(),
-        tile_expert.data_ptr<int>(),
-        tile_mbase.data_ptr<int>(),
-        (fp16*)intermediate.data_ptr(),
-        (int)n_routed_experts, total_routes, max_tiles,
-        hidden_size, intermediate_size, (int)top_k, x.device());
+    int max_tiles = std::min(
+        total_routes / TILE_M + (int)n_routed_experts, total_routes);
+    const char* enable_env =
+        std::getenv("ENABLE_MOE_GROUPED_TILEMAP_FUSION");
+    const bool enable_fusion =
+        enable_env != nullptr && enable_env[0] == '1'
+        && std::getenv("DISABLE_MOE_GROUPED_TILEMAP_FUSION") == nullptr;
+    if (enable_fusion) {
+        moe_up_fp8_grouped_gelu_tanh_kernel<TILE_M, true>(
+            (const fp16*)x.data_ptr(),
+            (const uint8_t*)gate_up_weight.data_ptr(),
+            gate_up_scale.data_ptr<float>(),
+            expert_offsets.data_ptr<int>(),
+            expert_tokens.data_ptr<int>(),
+            nullptr,
+            nullptr,
+            (fp16*)intermediate.data_ptr(),
+            (int)n_routed_experts, total_routes, max_tiles,
+            hidden_size, intermediate_size, (int)top_k, x.device());
+    } else {
+        auto opts_int = torch::device(x.device()).dtype(torch::kInt32);
+        auto tile_expert = torch::empty({max_tiles}, opts_int);
+        auto tile_mbase  = torch::empty({max_tiles}, opts_int);
+        moe_build_tile_map_kernel(
+            expert_offsets.data_ptr<int>(),
+            tile_expert.data_ptr<int>(),
+            tile_mbase.data_ptr<int>(),
+            (int)n_routed_experts, total_routes, max_tiles, TILE_M, x.device());
+        moe_up_fp8_grouped_gelu_tanh_kernel<TILE_M, false>(
+            (const fp16*)x.data_ptr(),
+            (const uint8_t*)gate_up_weight.data_ptr(),
+            gate_up_scale.data_ptr<float>(),
+            expert_offsets.data_ptr<int>(),
+            expert_tokens.data_ptr<int>(),
+            tile_expert.data_ptr<int>(),
+            tile_mbase.data_ptr<int>(),
+            (fp16*)intermediate.data_ptr(),
+            (int)n_routed_experts, total_routes, max_tiles,
+            hidden_size, intermediate_size, (int)top_k, x.device());
+    }
     return intermediate;
 }
 
@@ -389,5 +431,67 @@ inline torch::Tensor moe_down_fp8_grouped(
         (fp16*)output.data_ptr(),
         (int)n_routed_experts, total_routes,
         hidden_size, intermediate_size, (int)top_k, intermediate.device());
+    return output;
+}
+
+template <int TILE_N = 16>
+void moe_grouped_accumulate_kernel(
+    const fp16* partials,
+    fp16* output,
+    int n_tokens,
+    int hidden_size,
+    int top_k,
+    const torch::Device& device) {
+    const int n_tiles = hidden_size / TILE_N;
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeGroupedAccumulate>(
+            sycl::range<2>(n_tokens, n_tiles),
+            [=](sycl::item<2> item) SYCL_ESIMD_KERNEL {
+                const int token = (int)item.get_id(0);
+                const int n0 = (int)item.get_id(1) * TILE_N;
+                simd<float, TILE_N> acc = 0.0f;
+                for (int k = 0; k < top_k; k++) {
+                    auto row = block_load<fp16, TILE_N>(
+                        partials + (size_t)(token * top_k + k)
+                            * hidden_size + n0);
+                    acc += simd<float, TILE_N>(row);
+                }
+                block_store<fp16, TILE_N>(
+                    output + (size_t)token * hidden_size + n0,
+                    convert<fp16>(acc));
+            });
+    };
+    submit_kernel(cgf, device, "moe grouped accumulate");
+}
+
+// Full grouped forward used by Gemma MTP verify. Routing is still supplied by
+// the caller because Gemma folds per_expert_scale before this op; the up,
+// down, and route accumulation launches stay inside one C++ dispatch so the
+// Python layer does not rebuild intermediate tensors or launch reductions.
+inline torch::Tensor moe_forward_full_fp8_grouped(
+    torch::Tensor x,
+    torch::Tensor gate_up_weight,
+    torch::Tensor gate_up_scale,
+    torch::Tensor down_weight,
+    torch::Tensor down_scale,
+    torch::Tensor routing_weights,
+    torch::Tensor expert_offsets,
+    torch::Tensor expert_tokens,
+    int64_t top_k,
+    int64_t n_routed_experts) {
+    auto intermediate = moe_up_fp8_grouped(
+        x, gate_up_weight, gate_up_scale, expert_offsets, expert_tokens,
+        top_k, n_routed_experts);
+    auto partials = moe_down_fp8_grouped(
+        intermediate, down_weight, down_scale, routing_weights,
+        expert_offsets, expert_tokens, top_k, n_routed_experts);
+    const int n_tokens = x.size(0);
+    const int hidden_size = x.size(1);
+    auto output = torch::empty({n_tokens, hidden_size},
+        torch::device(x.device()).dtype(torch::kHalf));
+    moe_grouped_accumulate_kernel<16>(
+        (const fp16*)partials.data_ptr(),
+        (fp16*)output.data_ptr(),
+        n_tokens, hidden_size, (int)top_k, x.device());
     return output;
 }
