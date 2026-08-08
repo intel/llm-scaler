@@ -18,16 +18,16 @@ COMPONENT_PINS = {
     ),
     "COMFYUI_COMMIT": (
         "COMFYUI_COMMIT",
-        "b1693ecba9f5b65f8c80ab36b195ab963ec92413",
+        "43cb4fffc89bba20ab7bd61467a36d0339338dab",
     ),
-    "COMFYUI_VERSION": ("COMFYUI_VERSION", "0.30.0"),
+    "COMFYUI_VERSION": ("COMFYUI_VERSION", "0.31.0"),
     "COMFYUI_FRONTEND_VERSION": (
         "COMFYUI_FRONTEND_VERSION",
-        "1.47.12",
+        "1.48.7",
     ),
     "COMFYUI_WORKFLOW_TEMPLATES_VERSION": (
         "COMFYUI_WORKFLOW_TEMPLATES_VERSION",
-        "0.11.28",
+        "0.11.34",
     ),
     "COMFYUI_MANAGER_VERSION": ("COMFYUI_MANAGER_VERSION", "4.2.2"),
     "COMFY_KITCHEN_REPOSITORY": (
@@ -179,7 +179,7 @@ class ComfyUIImageContractTest(unittest.TestCase):
             ),
         )
 
-    def test_comfyui_v030_dependencies_are_pinned_and_validated(self):
+    def test_comfyui_dependencies_are_pinned_and_validated(self):
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
         validator = load_validator()
         self.assertEqual(
@@ -191,6 +191,10 @@ class ComfyUIImageContractTest(unittest.TestCase):
 
         self.assertIn(
             '"comfyui-manager==${COMFYUI_MANAGER_VERSION}"',
+            dockerfile,
+        )
+        self.assertIn(
+            "comfyui-workflow-templates|comfy-kitchen|comfy-aimdo",
             dockerfile,
         )
         self.assertNotIn(

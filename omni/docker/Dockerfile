@@ -21,10 +21,10 @@ ARG IMAGE_TAG
 ARG SYCL_TLA_REPOSITORY=https://github.com/intel/sycl-tla.git
 ARG SYCL_TLA_COMMIT=2fc09973bfdf15755090fcb0e3b6ad236408a992
 ARG COMFYUI_REPOSITORY=https://github.com/Comfy-Org/ComfyUI.git
-ARG COMFYUI_COMMIT=b1693ecba9f5b65f8c80ab36b195ab963ec92413
-ARG COMFYUI_VERSION=0.30.0
-ARG COMFYUI_FRONTEND_VERSION=1.47.12
-ARG COMFYUI_WORKFLOW_TEMPLATES_VERSION=0.11.28
+ARG COMFYUI_COMMIT=43cb4fffc89bba20ab7bd61467a36d0339338dab
+ARG COMFYUI_VERSION=0.31.0
+ARG COMFYUI_FRONTEND_VERSION=1.48.7
+ARG COMFYUI_WORKFLOW_TEMPLATES_VERSION=0.11.34
 ARG COMFYUI_MANAGER_VERSION=4.2.2
 ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
 ARG COMFY_KITCHEN_COMMIT=f7250fa44cb6f593969ba869be803e7d03c80ec8
@@ -133,7 +133,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         "${COMFYUI_COMMIT}" && \
     git -C ComfyUI checkout --detach FETCH_HEAD && \
     grep -Ev \
-        '^(comfyui-frontend-package|comfyui-workflow-templates)==' \
+        '^(comfyui-frontend-package|comfyui-workflow-templates|comfy-kitchen|comfy-aimdo)==' \
         /llm/ComfyUI/requirements.txt \
         > /tmp/comfyui-requirements.txt && \
     grep -qx \
@@ -145,10 +145,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         "comfyui-workflow-templates==${COMFYUI_WORKFLOW_TEMPLATES_VERSION}" \
         "comfyui-manager==${COMFYUI_MANAGER_VERSION}"
 
-# ComfyUI v0.30 integrates Node Manager through the versioned Python package
+# ComfyUI integrates Node Manager through the versioned Python package
 # above. Do not also clone the legacy ComfyUI-Manager custom node: loading both
 # creates two manager boundaries and makes missing-node behavior dependent on
-# startup flags rather than the pinned v0.30 package contract.
+# startup flags rather than the pinned package contract. Kitchen and AIMDO are
+# also removed from upstream requirements above because the final image must use
+# the source-built XPU wheels pinned by this Dockerfile.
 
 # Pin every remaining default custom node to an exact accepted revision. These
 # stable remote-source layers stay ahead of frequently edited native sources.

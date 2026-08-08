@@ -72,7 +72,7 @@ docker run --rm -it \
 ```
 
 Open `http://127.0.0.1:8188`. Additional ComfyUI arguments can be appended to
-the command. The entrypoint enables ComfyUI v0.30's integrated Node Manager;
+the command. The entrypoint enables ComfyUI v0.31's integrated Node Manager;
 the matching `comfyui-manager` Python package is installed in the image.
 
 The entrypoint enables ComfyUI DynamicVRAM with the pinned AIMDO XPU backend
@@ -97,8 +97,8 @@ see [ComfyUI usage](docs/COMFYUI.md).
 
 The focused image contains:
 
-- upstream [ComfyUI v0.30.0](https://github.com/Comfy-Org/ComfyUI/releases/tag/v0.30.0),
-  pinned to `b1693ecba9f5b65f8c80ab36b195ab963ec92413`;
+- upstream [ComfyUI v0.31.0](https://github.com/Comfy-Org/ComfyUI/releases/tag/v0.31.0),
+  pinned to `43cb4fffc89bba20ab7bd61467a36d0339338dab`;
 - `omni_xpu_kernel`, built for the selected Torch minor and XPU target;
 - `comfy-kitchen==0.2.26` from the XPU-enabled
   [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/f7250fa44cb6f593969ba869be803e7d03c80ec8),
@@ -113,7 +113,7 @@ The focused image contains:
 - [`ComfyUI-nunchaku-XPU==1.2.1+xpu.3`](https://github.com/xiangyuT/ComfyUI-nunchaku-XPU/commit/cc0f6236b6c329178ad4ef58452a874e774c7b8e),
   with its `nunchaku_torch` runtime bundled in the same pinned checkout;
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md);
-- ComfyUI v0.30 integrated Node Manager plus pinned VideoHelperSuite,
+- ComfyUI v0.31 integrated Node Manager plus pinned VideoHelperSuite,
   Easy-Use, KJNodes, CacheDiT, and ControlNet auxiliary nodes;
 - an exact installed Python dependency snapshot at
   `/llm/manifests/comfyui-python-freeze.txt`.

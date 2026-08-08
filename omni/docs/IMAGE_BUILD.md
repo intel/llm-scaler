@@ -49,7 +49,7 @@ The AIMDO revision must be reachable from its pinned remote. The build fetches
 and checks out that exact full commit before compiling the Level Zero backend;
 branch names are not used as image identity.
 
-The focused image installs the v0.30 integrated `comfyui-manager` package and
+The focused image installs the version-pinned integrated `comfyui-manager` package and
 does not clone the legacy Manager custom node. Frontend, workflow templates,
 and Manager are explicit build inputs; the final image also records a complete
 `pip freeze --all` dependency snapshot at
