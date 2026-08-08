@@ -331,6 +331,75 @@ def _is_dense_bld(tensor, batch, seq, width):
     )
 
 
+_ANIMATE2_CROSS_ENV = "OMNIXPU_ANIMATE2_CROSS"
+_ANIMATE2_SHAPES_ENV = "OMNIXPU_ANIMATE2_SHAPES"
+_ANIMATE2_HEADS = 40
+
+
+def _animate2_cross_enabled():
+    value = os.environ.get(_ANIMATE2_CROSS_ENV, "1").strip().lower()
+    return value not in ("", "0", "false", "no", "off")
+
+
+def _animate2_shape_allowed(q_len, kv_len):
+    spec = os.environ.get(_ANIMATE2_SHAPES_ENV, "all").strip().lower()
+    if spec in ("", "all", "*"):
+        return True
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        q_spec, sep, kv_spec = item.partition(":")
+        if not sep:
+            continue
+        if q_spec.strip() in ("*", str(q_len)) and kv_spec.strip() in (
+            "*",
+            str(kv_len),
+        ):
+            return True
+    return False
+
+
+def _is_animate2_cute_shape(b, heads, dim_head, q_len, kv_len, dtype):
+    """Admission for Wan Animate 2 (14B, heads=40) cross-attention.
+
+    The BMG D128 BHLD CUTE kernel was measured on an idle GPU to accept every
+    Animate 2 cross shape (q44550/kv512, q44550/kv257, q42525/kv512,
+    q42525/kv257, q2025/kv46575, q2025/kv44550) at heads=40 in both FP16 and
+    BF16, with the same fp32-relative error as Torch SDPA and 1.35-1.54x the
+    throughput. A sweep over realistic geometries (512x512 through 1920x1088,
+    21-121 frames) and over shape edges (prime, odd, q>>kv, kv>>q, up to
+    q=262144 / kv=269280) found no shape sensitivity. The bf16-only /
+    heads==32 / kv_len==1024 restrictions above are therefore an admission-list
+    limitation, not a kernel capability limit. The route is enabled by default;
+    set OMNIXPU_ANIMATE2_CROSS=0 to restore the previous routing for diagnosis.
+
+    Wan 2.2 14B T2V is also heads=40 / d128 / fp16, and its q75600/kv512 cross
+    contract has a dedicated validated route (_use_bmg_wan22_cute_cross) that
+    is checked *after* this one in the dispatcher. That exact shape is excluded
+    here so the default route never diverts another model off its validated
+    kernel. Animate 2 can reach the same shape (hw=3600 at 1280x720 with 77
+    frames), in which case it simply takes the Wan 2.2 kernel instead -- same
+    attention math, still a CUTE route, just marginally slower. The exclusion
+    is FP16-only because sdp_wan22_cross rejects BF16 outright ("Wan 2.2 cross
+    attention requires FP16 Q/K/V"), so excluding BF16 there would hand the
+    shape to Torch rather than to a faster kernel.
+    """
+    if dtype == torch.float16 and q_len == 75600 and kv_len == 512:
+        return False
+    return (
+        _animate2_cross_enabled()
+        and b == 1
+        and heads == _ANIMATE2_HEADS
+        and dim_head == 128
+        and dtype in (torch.float16, torch.bfloat16)
+        and q_len != kv_len
+        and q_len >= 256
+        and kv_len >= 128
+        and _animate2_shape_allowed(q_len, kv_len)
+    )
+
+
 def _prepare_bmg_d128_bhld_cute(
     q,
     k,
@@ -355,10 +424,14 @@ def _prepare_bmg_d128_bhld_cute(
         and skip_reshape
         and not skip_output_reshape
     )
+    animate2_attention = _is_animate2_cute_shape(
+        b, heads, dim_head, q_len, kv_len, q.dtype
+    )
     supported_batch_kind = (
         (b == 2 and (self_attention or cross_attention))
         or (b == 1 and cross_attention)
         or minimax_h3_attention
+        or animate2_attention
     )
     if not (
         _backend_name == "cute"
@@ -366,13 +439,16 @@ def _prepare_bmg_d128_bhld_cute(
         and _torch_major_minor() == (2, 11)
         and callable(capability)
         and capability()
-        and q.dtype == torch.bfloat16
+        and (
+            q.dtype == torch.bfloat16
+            or (animate2_attention and q.dtype == torch.float16)
+        )
         and k.dtype == q.dtype
         and v.dtype == q.dtype
         and q.device.type == "xpu"
         and k.device == q.device
         and v.device == q.device
-        and (heads == 32 or minimax_h3_attention)
+        and (heads == 32 or minimax_h3_attention or animate2_attention)
         and dim_head == 128
         and supported_batch_kind
     ):
@@ -809,6 +885,11 @@ def apply():
                 route = "minimax_h3_h56_bf16_d128_qkv_bhld"
             elif q_len == kv_len:
                 route = "bmg_b2_bf16_d128_self"
+            elif heads == _ANIMATE2_HEADS:
+                tag = "fp16" if q.dtype == torch.float16 else "bf16"
+                route = (
+                    f"animate2_b{b}_{tag}_d128_q{q_len}_kv{kv_len}_cross"
+                )
             else:
                 route = f"bmg_b{b}_bf16_d128_kv1024_cross"
             route_call_count = _record_attention_route(route)

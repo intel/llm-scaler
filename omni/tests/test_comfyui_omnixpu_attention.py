@@ -417,6 +417,134 @@ def test_bmg_wan22_t2v_turbo_720p_cross_uses_cute(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("dtype", "q_len", "kv_len", "route"),
+    [
+        (
+            torch.float16,
+            44550,
+            512,
+            "animate2_b1_fp16_d128_q44550_kv512_cross",
+        ),
+        (
+            torch.bfloat16,
+            2025,
+            44550,
+            "animate2_b1_bf16_d128_q2025_kv44550_cross",
+        ),
+        (
+            torch.bfloat16,
+            75600,
+            512,
+            "animate2_b1_bf16_d128_q75600_kv512_cross",
+        ),
+    ],
+)
+def test_bmg_animate2_cross_uses_cute_by_default(
+    monkeypatch, dtype, q_len, kv_len, route
+):
+    monkeypatch.delenv("OMNIXPU_ANIMATE2_CROSS", raising=False)
+    monkeypatch.delenv("OMNIXPU_ANIMATE2_SHAPES", raising=False)
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(
+        seq=q_len,
+        heads=40,
+        dtype=dtype,
+        pre_shaped=False,
+    )
+    kv = _FakeTensor(
+        seq=kv_len,
+        heads=40,
+        dtype=dtype,
+        pre_shaped=False,
+    )
+
+    result = attention.optimized_attention(q, kv, kv, heads=40)
+
+    assert isinstance(result, _FakeTensor)
+    assert calls == ["cute_d128_bhld"]
+    assert patch.get_stats()["fallback"] == 0
+    assert patch.get_stats()["routes"] == {route: 1}
+
+
+def test_bmg_animate2_cross_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("OMNIXPU_ANIMATE2_CROSS", "0")
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(
+        seq=44550,
+        heads=40,
+        dtype=torch.float16,
+        pre_shaped=False,
+    )
+    kv = _FakeTensor(
+        seq=512,
+        heads=40,
+        dtype=torch.float16,
+        pre_shaped=False,
+    )
+
+    result = attention.optimized_attention(q, kv, kv, heads=40)
+
+    assert result == "torch-output"
+    assert calls == ["torch"]
+    assert patch.get_stats()["routes"] == {}
+
+
+def test_bmg_animate2_shape_allowlist_can_bisect_routes(monkeypatch):
+    monkeypatch.delenv("OMNIXPU_ANIMATE2_CROSS", raising=False)
+    monkeypatch.setenv("OMNIXPU_ANIMATE2_SHAPES", "2025:*,*:257")
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(
+        seq=44550,
+        heads=40,
+        dtype=torch.float16,
+        pre_shaped=False,
+    )
+    kv = _FakeTensor(
+        seq=512,
+        heads=40,
+        dtype=torch.float16,
+        pre_shaped=False,
+    )
+
+    result = attention.optimized_attention(q, kv, kv, heads=40)
+
+    assert result == "torch-output"
+    assert calls == ["torch"]
+    assert patch.get_stats()["routes"] == {}
+
+
+@pytest.mark.parametrize(
+    ("batch", "heads", "q_len", "kv_len", "dtype", "expected"),
+    [
+        (1, 40, 256, 128, torch.float16, True),
+        (2, 40, 256, 128, torch.float16, False),
+        (1, 32, 256, 128, torch.float16, False),
+        (1, 40, 256, 256, torch.float16, False),
+        (1, 40, 255, 128, torch.float16, False),
+        (1, 40, 256, 127, torch.float16, False),
+        (1, 40, 256, 128, torch.float32, False),
+        (1, 40, 75600, 512, torch.float16, False),
+        (1, 40, 75600, 512, torch.bfloat16, True),
+    ],
+)
+def test_animate2_cute_shape_contract(
+    monkeypatch, batch, heads, q_len, kv_len, dtype, expected
+):
+    monkeypatch.delenv("OMNIXPU_ANIMATE2_CROSS", raising=False)
+    monkeypatch.delenv("OMNIXPU_ANIMATE2_SHAPES", raising=False)
+    patch, _, _ = _load_patch(monkeypatch, target="bmg")
+
+    assert patch._is_animate2_cute_shape(
+        batch,
+        heads,
+        128,
+        q_len,
+        kv_len,
+        dtype,
+    ) is expected
+
+
+@pytest.mark.parametrize(
     ("q_len", "kv_len", "pre_shaped", "route"),
     [
         (14080, 1024, False, "bmg_b1_bf16_d128_kv1024_cross"),
@@ -647,13 +775,13 @@ def test_auto_unsupported_cross_uses_torch_not_esimd(monkeypatch):
     )
     q = _FakeTensor(
         seq=4096,
-        heads=40,
+        heads=39,
         dtype=torch.float16,
         pre_shaped=False,
     )
     kv = _FakeTensor(
         seq=512,
-        heads=40,
+        heads=39,
         dtype=torch.float16,
         pre_shaped=False,
     )
@@ -661,7 +789,7 @@ def test_auto_unsupported_cross_uses_torch_not_esimd(monkeypatch):
         q,
         kv,
         kv,
-        heads=40,
+        heads=39,
     )
     assert result == "torch-output"
     assert calls == ["torch"]
