@@ -100,8 +100,8 @@ The focused image contains:
 - upstream [ComfyUI v0.31.0](https://github.com/Comfy-Org/ComfyUI/releases/tag/v0.31.0),
   pinned to `43cb4fffc89bba20ab7bd61467a36d0339338dab`;
 - `omni_xpu_kernel`, built for the selected Torch minor and XPU target;
-- `comfy-kitchen==0.2.26` from the XPU-enabled
-  [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/f7250fa44cb6f593969ba869be803e7d03c80ec8),
+- `comfy-kitchen==0.2.28` from the XPU-enabled
+  [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/575741da0edd9a6e34cbf7f0b29b20b9f4df9e34),
   including the managed GGUF and Nunchaku W4A16 routes;
 - `comfy-aimdo==0.4.13` from the XPU-enabled
   [`comfy-aimdo` fork](https://github.com/xiangyuT/comfy-aimdo-xpu) at revision

@@ -36,9 +36,9 @@ COMPONENT_PINS = {
     ),
     "COMFY_KITCHEN_COMMIT": (
         "KITCHEN_COMMIT",
-        "f7250fa44cb6f593969ba869be803e7d03c80ec8",
+        "575741da0edd9a6e34cbf7f0b29b20b9f4df9e34",
     ),
-    "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.26"),
+    "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.28"),
     "COMFY_AIMDO_REPOSITORY": (
         "AIMDO_REPOSITORY",
         "https://github.com/xiangyuT/comfy-aimdo-xpu.git",
