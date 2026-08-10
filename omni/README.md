@@ -6,8 +6,8 @@ default image is a single-XPU ComfyUI environment with target-specific
 ComfyUI integration layer.
 
 > [!IMPORTANT]
-> The current b9 preview is experimental and focused on single-XPU ComfyUI
-> workloads. It does not replace the broader b8 image. For SGLang Diffusion,
+> The current 0.2.0 beta preview is experimental and focused on single-XPU
+> ComfyUI workloads. It does not replace the broader b8 image. For SGLang Diffusion,
 > Raylight, or other multi-XPU scenarios, use the published
 > [`intel/llm-scaler-omni:0.1.0-b8`](https://github.com/intel/llm-scaler/releases/tag/omni-0.1.0-b8)
 > image.
@@ -45,7 +45,7 @@ Run the supplied acceptance script against the final image with the GPU device
 exposed:
 
 ```bash
-IMAGE=intel/llm-scaler-omni:0.1.0-b9-dev1-comfyui-bmg
+IMAGE=intel/llm-scaler-omni:0.2.0-b1-comfyui-bmg
 
 sudo docker run --rm \
     --device=/dev/dri \
@@ -64,7 +64,7 @@ Mount the existing ComfyUI model directory rather than copying models into the
 image:
 
 ```bash
-IMAGE=intel/llm-scaler-omni:0.1.0-b9-dev1-comfyui-bmg
+IMAGE=intel/llm-scaler-omni:0.2.0-b1-comfyui-bmg
 CONTAINER_NAME=comfyui
 COMFYUI_MODEL_DIR=/path/to/comfyui_models
 COMFYUI_OUTPUT_DIR=/path/to/comfyui_output
