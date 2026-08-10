@@ -28,7 +28,7 @@ export GLM_TTS_MODEL_PATH=/path/to/GLM-TTS
 export CONTAINER_NAME=glm-tts
 export DOCKER_IMAGE=llm-scaler-omni:glm-tts
 
-sudo docker run -itd \
+docker run -itd \
     --privileged \
     --net=host \
     --device /dev/dri \
@@ -39,7 +39,7 @@ sudo docker run -itd \
     --entrypoint=/bin/bash \
     ${DOCKER_IMAGE}
 
-sudo docker exec -it ${CONTAINER_NAME} /bin/bash
+docker exec -it ${CONTAINER_NAME} /bin/bash
 ```
 
 ## 4. Inference Examples

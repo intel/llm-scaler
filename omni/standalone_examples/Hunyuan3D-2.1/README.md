@@ -24,12 +24,12 @@ sudo docker run -itd \
 
 Run Hunyuan 3D 2.1 demo:
 ```bash
-sudo docker exec -it hunyuan3d-2.1 bash
+docker exec -it hunyuan3d-2.1 bash
 # At /llm/Hunyuan3D-2.1 path
 
 # Configure proxy to download model files
-export http_proxy=http://proxy.example.com:port
-export https_proxy=http://proxy.example.com:port
+export http_proxy=<your_http_proxy>
+export https_proxy=<your_https_proxy>
 export no_proxy=localhost,127.0.0.1
 
 # Run shape + paint demo

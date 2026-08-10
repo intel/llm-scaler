@@ -27,7 +27,7 @@ export GLM_ASR_MODEL_PATH=/path/to/GLM-ASR-Nano-2512
 export CONTAINER_NAME=glm-asr
 export DOCKER_IMAGE=llm-scaler-omni:glm-asr
 
-sudo docker run -itd \
+docker run -itd \
     --privileged \
     --net=host \
     --device /dev/dri \
@@ -38,7 +38,7 @@ sudo docker run -itd \
     --entrypoint=/bin/bash \
     ${DOCKER_IMAGE}
 
-sudo docker exec -it ${CONTAINER_NAME} /bin/bash
+docker exec -it ${CONTAINER_NAME} /bin/bash
 ```
 
 ## 4. Inference Examples

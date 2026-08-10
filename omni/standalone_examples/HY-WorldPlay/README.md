@@ -10,8 +10,8 @@ This project enables [HY-WorldPlay](https://github.com/Tencent-Hunyuan/HY-WorldP
 ### Build Docker Image
 
 ```bash
-export HTTP_PROXY=http://proxy.example.com:port
-export HTTPS_PROXY=http://proxy.example.com:port
+export HTTP_PROXY=<your_http_proxy>
+export HTTPS_PROXY=<your_https_proxy>
 
 bash build.sh
 ```
@@ -26,8 +26,8 @@ sudo docker run -itd \
         --net=host \
         --device=/dev/dri \
         -e no_proxy=localhost,127.0.0.1 \
-        -e http_proxy="$HTTP_PROXY" \
-        -e https_proxy="$HTTPS_PROXY" \
+        -e http_proxy=<your_http_proxy> \
+        -e https_proxy=<your_https_proxy> \
         --name=$CONTAINER_NAME \
         --shm-size="64g" \
         --entrypoint=/bin/bash \
@@ -37,7 +37,7 @@ sudo docker run -itd \
 ### Run HY-WorldPlay
 
 ```bash
-sudo docker exec -it hy-worldplay bash
+docker exec -it hy-worldplay bash
 # Working directory: /llm/HY-WorldPlay
 
 bash run.sh

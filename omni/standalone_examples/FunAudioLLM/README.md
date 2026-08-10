@@ -44,7 +44,7 @@ sudo docker run -itd \
     --entrypoint=/bin/bash \
     $DOCKER_IMAGE
 
-sudo docker exec -it fun-audio-llm /bin/bash
+docker exec -it fun-audio-llm /bin/bash
 ```
 
 ## 4. Run Inference (CosyVoice3)
