@@ -8,6 +8,7 @@ from unittest import mock
 
 OMNI_ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = OMNI_ROOT / "docker" / "Dockerfile"
+FULL_DOCKERFILE = OMNI_ROOT / "docker" / "Dockerfile.full"
 BUILD_SCRIPT = OMNI_ROOT / "build.sh"
 VALIDATOR = OMNI_ROOT / "tools" / "validate_comfyui_image.py"
 
@@ -80,6 +81,24 @@ def load_validator():
 
 
 class ComfyUIImageContractTest(unittest.TestCase):
+    def test_build_proxy_default_has_no_organization_domains(self):
+        build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
+        full_dockerfile = FULL_DOCKERFILE.read_text(encoding="utf-8")
+
+        self.assertIn(
+            'NO_PROXY="${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,::1}}"',
+            build_script,
+        )
+        self.assertNotIn("intel.com", build_script)
+        self.assertEqual(
+            re.findall(
+                r"^ARG no_proxy=(.+)$",
+                full_dockerfile,
+                flags=re.MULTILINE,
+            ),
+            ["localhost,127.0.0.1,::1"] * 2,
+        )
+
     def test_component_defaults_match_dockerfile_and_build_entrypoint(self):
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
         build_script = BUILD_SCRIPT.read_text(encoding="utf-8")

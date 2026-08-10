@@ -30,7 +30,7 @@ FROM ${BASE_IMAGE} AS builder
 
 ARG https_proxy
 ARG http_proxy
-ARG no_proxy=localhost,127.0.0.1,::1,intel.com,.intel.com
+ARG no_proxy=localhost,127.0.0.1,::1
 ARG PYTHON_VERSION
 ARG TORCH_VERSION
 ARG TORCHVISION_VERSION
@@ -338,7 +338,7 @@ FROM ${BASE_IMAGE} AS runtime
 
 ARG https_proxy
 ARG http_proxy
-ARG no_proxy=localhost,127.0.0.1,::1,intel.com,.intel.com
+ARG no_proxy=localhost,127.0.0.1,::1
 ARG PYTHON_VERSION
 ARG XPU_TARGET
 ARG MAX_JOBS

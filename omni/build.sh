@@ -4,7 +4,7 @@ set -euo pipefail
 
 HTTP_PROXY="${HTTP_PROXY:-${http_proxy:-}}"
 HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY}}}"
-NO_PROXY="${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,::1,intel.com,.intel.com}}"
+NO_PROXY="${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,::1}}"
 export HTTP_PROXY HTTPS_PROXY NO_PROXY
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
