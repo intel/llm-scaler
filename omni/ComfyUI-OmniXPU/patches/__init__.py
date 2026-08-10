@@ -110,10 +110,38 @@ def get_components():
     ]
 
 
-def apply_all_patches(cfg):
+def _load_component(plugin_dir, pkg_name, component):
     import importlib
     import sys
 
+    relative = Path(component.module)
+    parent_parts = relative.parent.parts
+    for depth in range(1, len(parent_parts) + 1):
+        parts = parent_parts[:depth]
+        package_name = f"{pkg_name}.{'.'.join(parts)}"
+        if package_name in sys.modules:
+            continue
+        package_dir = plugin_dir.joinpath(*parts)
+        package_init = package_dir / "__init__.py"
+        spec = importlib.util.spec_from_file_location(
+            package_name,
+            package_init,
+            submodule_search_locations=[str(package_dir)],
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[package_name] = mod
+        spec.loader.exec_module(mod)
+
+    fpath = plugin_dir / relative
+    mod_name = f"{pkg_name}.{'.'.join(relative.with_suffix('').parts)}"
+    spec = importlib.util.spec_from_file_location(mod_name, fpath)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
+    spec.loader.exec_module(mod)
+    return mod.apply
+
+
+def apply_all_patches(cfg):
     _registry.clear()
     if verbose_debug_enabled():
         log.info("[OmniXPU] verbose debug tracing enabled (dispatch + kernel)")
@@ -123,22 +151,12 @@ def apply_all_patches(cfg):
     plugin_dir = Path(__file__).resolve().parent.parent
     pkg_name = __name__.rsplit(".", 1)[0]
 
-    def _load_component(component):
-        relative = Path(component.module)
-        fpath = plugin_dir / relative
-        mod_name = f"{pkg_name}.{'.'.join(relative.with_suffix('').parts)}"
-        spec = importlib.util.spec_from_file_location(mod_name, fpath)
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[mod_name] = mod
-        spec.loader.exec_module(mod)
-        return mod.apply
-
     for component in COMPONENTS:
         if not getattr(cfg, component.flag):
             _record(component, "skipped", "disabled by env")
             continue
         try:
-            apply_fn = _load_component(component)
+            apply_fn = _load_component(plugin_dir, pkg_name, component)
             ok, reason = apply_fn()
             if ok:
                 _record(component, "applied")
