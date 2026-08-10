@@ -23,10 +23,8 @@ Releases.md
 docs/
 assets/
 benchmarks/
-example_inputs/
 standalone_examples/
 tests/
-workflows/
 docker/Dockerfile.full
 docker/Dockerfile-extension
 
