@@ -1144,6 +1144,7 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | mistralai/Mixtral-8x7B-Instruct-v0.1       |  ✅  |         ✅         |          ✅          |       |                           |
 | meta-llama/Llama-3.1-8B                    |  ✅  |         ✅         |          ✅          |       |                           |
 | meta-llama/Llama-3.1-70B                   |  ✅  |         ✅         |          ✅          |       |                           |
+| meta-models/Muse-Glimmer-30B                   |     |         ✅         |                    |       |                           |
 | baichuan-inc/Baichuan2-7B-Chat             |  ✅  |         ✅         |          ✅          |       | with chat_template        |
 | baichuan-inc/Baichuan2-13B-Chat            |  ✅  |         ✅         |          ✅          |       | with chat_template        |
 | THUDM/CodeGeex4-All-9B                     |  ✅  |         ✅         |          ✅          |       | with chat_template        |
