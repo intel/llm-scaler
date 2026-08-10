@@ -5,6 +5,13 @@ default image is a single-XPU ComfyUI environment with target-specific
 `omni_xpu_kernel` binaries, the XPU-enabled Comfy Kitchen backend, and a thin
 ComfyUI integration layer.
 
+> [!IMPORTANT]
+> The current b9 preview is experimental and focused on single-XPU ComfyUI
+> workloads. It does not replace the broader b8 image. For SGLang Diffusion,
+> Raylight, or other multi-XPU scenarios, use the published
+> [`intel/llm-scaler-omni:0.1.0-b8`](https://github.com/intel/llm-scaler/releases/tag/omni-0.1.0-b8)
+> image.
+
 ## Getting Started with the Omni Docker Image
 
 Build from the `omni` directory:
