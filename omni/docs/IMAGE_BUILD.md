@@ -100,7 +100,7 @@ Run the validator inside the final container:
 ```bash
 IMAGE=intel/llm-scaler-omni:0.1.0-b9-dev1-comfyui-bmg
 
-docker run --rm \
+sudo docker run --rm \
     --device=/dev/dri \
     "$IMAGE" \
     python /llm/tools/validate_comfyui_image.py

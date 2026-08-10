@@ -32,7 +32,8 @@ export HOST_FUNASR_MODEL=/path/to/Fun-ASR-Nano-2512
 export DOCKER_IMAGE=llm-scaler-omni:fun-audio-llm
 export CONTAINER_NAME=fun-audio-llm
 
-docker run -itd \
+sudo docker run -itd \
+    --privileged \
     --net=host \
     --device=/dev/dri \
     -e no_proxy=localhost,127.0.0.1 \
@@ -43,7 +44,7 @@ docker run -itd \
     --entrypoint=/bin/bash \
     $DOCKER_IMAGE
 
-docker exec -it fun-audio-llm /bin/bash
+sudo docker exec -it fun-audio-llm /bin/bash
 ```
 
 ## 4. Run Inference (CosyVoice3)

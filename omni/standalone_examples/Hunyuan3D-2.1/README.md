@@ -11,7 +11,8 @@ Run docker image:
 ```bash
 export DOCKER_IMAGE=llm-scaler-omni:latest-hunyuan3d2.1
 export CONTAINER_NAME=hunyuan3d-2.1
-docker run -itd \
+sudo docker run -itd \
+        --privileged \
         --net=host \
         --device=/dev/dri \
         -e no_proxy=localhost,127.0.0.1 \
@@ -23,7 +24,7 @@ docker run -itd \
 
 Run Hunyuan 3D 2.1 demo:
 ```bash
-docker exec -it hunyuan3d-2.1 bash
+sudo docker exec -it hunyuan3d-2.1 bash
 # At /llm/Hunyuan3D-2.1 path
 
 # Configure proxy to download model files

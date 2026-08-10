@@ -21,7 +21,8 @@ bash build.sh
 ```bash
 export DOCKER_IMAGE=llm-scaler-omni:hy-worldplay
 export CONTAINER_NAME=hy-worldplay
-docker run -itd \
+sudo docker run -itd \
+        --privileged \
         --net=host \
         --device=/dev/dri \
         -e no_proxy=localhost,127.0.0.1 \
@@ -36,7 +37,7 @@ docker run -itd \
 ### Run HY-WorldPlay
 
 ```bash
-docker exec -it hy-worldplay bash
+sudo docker exec -it hy-worldplay bash
 # Working directory: /llm/HY-WorldPlay
 
 bash run.sh

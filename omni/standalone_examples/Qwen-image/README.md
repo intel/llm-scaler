@@ -12,7 +12,8 @@ Run docker image:
 export DOCKER_IMAGE=llm-scaler-omni:qwen-image
 export CONTAINER_NAME=qwen-image
 export MODEL_DIR=/path/to/models
-docker run -itd \
+sudo docker run -itd \
+        --privileged \
         --net=host \
         --device=/dev/dri \
         -e no_proxy=localhost,127.0.0.1 \
@@ -22,7 +23,7 @@ docker run -itd \
         --entrypoint=/bin/bash \
         $DOCKER_IMAGE
 
-docker exec -it qwen-image /bin/bash
+sudo docker exec -it qwen-image /bin/bash
 ```
 
 Download models before start example.

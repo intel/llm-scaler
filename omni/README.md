@@ -47,7 +47,7 @@ exposed:
 ```bash
 IMAGE=intel/llm-scaler-omni:0.1.0-b9-dev1-comfyui-bmg
 
-docker run --rm \
+sudo docker run --rm \
     --device=/dev/dri \
     "$IMAGE" \
     python /llm/tools/validate_comfyui_image.py
@@ -65,13 +65,16 @@ image:
 
 ```bash
 IMAGE=intel/llm-scaler-omni:0.1.0-b9-dev1-comfyui-bmg
+CONTAINER_NAME=comfyui
 COMFYUI_MODEL_DIR=/path/to/comfyui_models
 COMFYUI_OUTPUT_DIR=/path/to/comfyui_output
 
-docker run --rm -it \
+sudo docker run -itd \
+    --privileged \
     --device=/dev/dri \
     --network=host \
     --shm-size=64g \
+    --name="$CONTAINER_NAME" \
     -v "$COMFYUI_MODEL_DIR":/llm/ComfyUI/models \
     -v "$COMFYUI_OUTPUT_DIR":/llm/ComfyUI/output \
     "$IMAGE" \
@@ -88,9 +91,11 @@ be evicted under allocator pressure before an XPU text encoder is executed
 again. Override the reserve only when required by the workload:
 
 ```bash
-docker run --rm -it \
+sudo docker run -itd \
+    --privileged \
     --device=/dev/dri \
     --network=host \
+    --name="$CONTAINER_NAME" \
     -e OMNI_COMFYUI_RESERVE_VRAM_GB=6 \
     -v "$COMFYUI_MODEL_DIR":/llm/ComfyUI/models \
     "$IMAGE" \

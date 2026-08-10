@@ -12,7 +12,8 @@ Run docker image:
 export DOCKER_IMAGE=llm-scaler-omni:latest-wan2.2
 export CONTAINER_NAME=wan-2.2
 export MODEL_DIR=/path/to/models
-docker run -itd \
+sudo docker run -itd \
+        --privileged \
         --net=host \
         --device=/dev/dri \
         -e no_proxy=localhost,127.0.0.1 \
@@ -22,7 +23,7 @@ docker run -itd \
         --entrypoint=/bin/bash \
         $DOCKER_IMAGE
 
-docker exec -it wan-2.2 bash
+sudo docker exec -it wan-2.2 bash
 ```
 
 Run Wan 2.2 demo on Single B60 GPU:
