@@ -17,7 +17,6 @@ services:
       --enforce-eager
       --port 8008
       --host 0.0.0.0
-      --disable-log-requests
       --trust-remote-code
       --gpu-memory-util=0.9
       --no-enable-prefix-caching
@@ -53,7 +52,6 @@ services:
       --enforce-eager
       --port 8009
       --host 0.0.0.0
-      --disable-log-requests
       --trust-remote-code
       --gpu-memory-util=0.9
       --no-enable-prefix-caching
@@ -78,4 +76,3 @@ services:
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg
     restart: always
-

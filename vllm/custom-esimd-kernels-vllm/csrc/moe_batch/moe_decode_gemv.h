@@ -87,7 +87,10 @@ struct MoeUpDecodeGeluTanh {
         constexpr float sqrt_2_over_pi = 0.7978845608f, coeff = 0.044715f;
         float gs3 = gs*gs*gs;
         float inner = sqrt_2_over_pi * (gs + coeff*gs3);
-        float e2 = sycl::exp(2.0f*inner);
+        float two_z = 2.0f * inner;
+        if (two_z > 30.0f) two_z = 30.0f;
+        if (two_z < -30.0f) two_z = -30.0f;
+        float e2 = sycl::exp(two_z);
         float tanh_v = (e2 - 1.0f)/(e2 + 1.0f);
         float gelu = 0.5f*gs*(1.0f + tanh_v);
         intermediates[(size_t)route*inter + n] = fp16(gelu * us);

@@ -25,9 +25,9 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    2.9 [Multi-node Distributed Deployment (PP/TP)](#29-multi-node-distributed-deployment-pptp)  
    2.10 [BPE-Qwen Tokenizer](#210-bpe-qwen-tokenizer)  
    2.11 [Load Balancer Solution](#211-load-balancer-solution)
-4. [Supported Models](#3-supported-models)  
-5. [Troubleshooting](#4-troubleshooting)
-6. [Performance tuning](#5-performance-tuning)
+3. [Supported Models](#3-supported-models)
+4. [Troubleshooting](#4-troubleshooting)
+5. [Performance tuning](#5-performance-tuning)
 
 ---
 
@@ -284,7 +284,6 @@ vllm serve \
     --disable-sliding-window \
     --gpu-memory-util=0.9 \
     --max-num-batched-tokens=8192 \
-    --disable-log-requests \
     --max-model-len=8192 \
     --block-size 64 \
     --quantization fp8 \
@@ -354,6 +353,7 @@ To enable online quantization using `llm-scaler-vllm`, specify the desired quant
 | **MXFP4** | `mxfp4` | Microscaling FP4 quantization | `gpt-oss-20b`, `gpt-oss-120b` only |
 | **Online FP8** | `fp8` | Dynamic FP8 quantization at runtime | All supported models |
 | **Online INT4** | `sym_int4` | Dynamic symmetric INT4 quantization at runtime | All supported models |
+| **Offline FP8** | Not required | Uses pre-quantized FP8 weights from the model | `Qwen3.6-27B-FP8`, `Qwen3.6-35B-A3B-FP8` |
 | **Pre-quantized AWQ** | Not required | Auto-detected from model config (`quantization_config.quant_method: awq`) | AWQ-quantized models |
 | **Pre-quantized GPTQ** | Not required | Auto-detected from model config (`quantization_config.quant_method: gptq`) | GPTQ-quantized models |
 
@@ -375,7 +375,6 @@ vllm serve \
     --gpu-memory-util=0.9 \
     --no-enable-prefix-caching \
     --max-num-batched-tokens=8192 \
-    --disable-log-requests \
     --max-model-len=8192 \
     --block-size 64 \
     --quantization sym_int4 \
@@ -395,7 +394,30 @@ To use fp8 online quantization, simply replace `--quantization sym_int4` with:
 --quantization fp8
 ```
 
-For those models that have been quantized before, such as AWQ-Int4/GPTQ-Int4/FP8 models, user do not need to specify the `--quantization` option.
+For pre-quantized models, such as AWQ-Int4, GPTQ-Int4, and Offline FP8 models, do not specify the `--quantization` option.
+
+To serve an Offline FP8 model, provide the model path directly. For example:
+
+```bash
+VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+vllm serve \
+    --model /llm/models/Qwen3.6-27B-FP8 \
+    --dtype=float16 \
+    --enforce-eager \
+    --port 8000 \
+    --host 0.0.0.0 \
+    --trust-remote-code \
+    --disable-sliding-window \
+    --gpu-memory-util=0.9 \
+    --max-num-batched-tokens=8192 \
+    --max-model-len=8192 \
+    --block-size 64 \
+    -tp=2 \
+    2>&1 | tee /llm/vllm.log > /proc/1/fd/1 &
+```
+
+Replace the model path with `/llm/models/Qwen3.6-35B-A3B-FP8` to serve that model.
 
 ---
 
@@ -418,7 +440,6 @@ vllm serve \
     --gpu-memory-util=0.9 \
     --no-enable-prefix-caching \
     --max-num-batched-tokens=2048 \
-    --disable-log-requests \
     --max-model-len=2048 \
     --block-size 64 \
     -tp=1
@@ -457,7 +478,6 @@ vllm serve \
     --gpu-memory-util=0.9 \
     --no-enable-prefix-caching \
     --max-num-batched-tokens=2048 \
-    --disable-log-requests \
     --max-model-len=2048 \
     --block-size 64 \
     -tp=1 \
@@ -510,7 +530,6 @@ vllm serve \
     --gpu-memory-util=0.9 \
     --no-enable-prefix-caching \
     --max-num-batched-tokens=5120 \
-    --disable-log-requests \
     --max-model-len=5120 \
     --block-size 64 \
     --quantization fp8 \
@@ -584,7 +603,6 @@ python3 -m vllm.entrypoints.openai.api_server \
     --gpu-memory-util=0.9 \
     --no-enable-prefix-caching \
     --max-num-batched-tokens=5120 \
-    --disable-log-requests \
     --max-model-len=5120 \
     --block-size 16 \
     --quantization fp8 \
@@ -630,7 +648,6 @@ vllm serve \
     --gpu-memory-util=0.9 \
     --no-enable-prefix-caching \
     --max-num-batched-tokens=5120 \
-    --disable-log-requests \
     --max-model-len=5120 \
     --block-size 64 \
     --quantization fp8 \
@@ -979,7 +996,6 @@ vllm serve \
     --gpu-memory-util=0.9 \
     --no-enable-prefix-caching \
     --max-num-batched-tokens=8192 \
-    --disable-log-requests \
     --max-model-len=20000 \
     --block-size 64 \
     --served-model-name test \
@@ -1118,8 +1134,10 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | Qwen/Qwen3-235B-A22B                       |      |         ✅         |                      |       |                           |
 | Qwen/Qwen3-Coder-30B-A3B-Instruct          |  ✅  |         ✅         |          ✅          |       |                           |
 | Qwen/Qwen3-Coder-Next                      |  ✅  |         ✅         |                    |       |                           |
-| Qwen/Qwen3.5/3.6-27B                       |  ✅  |         ✅         |          ✅          |       |                           |
-| Qwen/Qwen3.5/3.6-35B-A3B                   |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3.6-27B                           |  ✅  |         ✅         |          ✅          |       | LoRA supported, see [LoRA Serving](#34-lora-adapter-serving). MTP supported, see [MTP Enable](#35-mtp-enable).|
+| Qwen/Qwen3.6-35B-A3B                       |  ✅  |         ✅         |          ✅          |       | LoRA supported, see [LoRA Serving](#34-lora-adapter-serving). MTP supported, see [MTP Enable](#35-mtp-enable).|
+| Qwen/Qwen3.6-27B-FP8                       |      |                    |                      |       | Pre-quantized offline FP8 model |
+| Qwen/Qwen3.6-35B-A3B-FP8                   |      |                    |                      |       | Pre-quantized offline FP8 model |
 | Qwen/Qwen3.5-122B-A10B                     |      |         ✅         |          ✅          |       |                           |
 | Qwen/QwQ-32B                               |  ✅  |         ✅         |          ✅          |       |                           |
 | mistralai/Ministral-8B-Instruct-2410       |  ✅  |         ✅         |          ✅          |       |                           |
@@ -1156,8 +1174,8 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | google/gemma-3-12b-it                      |      |         ✅         |                      |       |  use bfloat16  |
 | google/gemma-3-27b-it                      |      |         ✅         |                      |       |  use bfloat16  |
 | google/gemma-4-12B-it                      |      |         ✅         |          ✅         |       | see [Reference Commands](#33-reference-commands-for-running-gemma-4-models-and-diffusiongemma)     |
-| google/gemma-4-31B-it                      |      |         ✅         |          ✅         |       |                            |
-| google/gemma-4-26B-A4B-it                  |      |         ✅         |          ✅         |       |                            |
+| google/gemma-4-31B-it                      |      |         ✅         |          ✅         |       |  MTP supported, see [MTP Enable](#35-mtp-enable).                          |
+| google/gemma-4-26B-A4B-it                  |      |         ✅         |          ✅         |       |      MTP supported, see [MTP Enable](#35-mtp-enable).                      |
 | google/diffusiongemma-26B-A4B-it           |      |         ✅         |          ✅         |       | see [Reference Commands](#33-reference-commands-for-running-gemma-4-models-and-diffusiongemma)                            |
 | THUDM/GLM-4v-9B                            |  ✅  |         ✅         |          ✅         |       |  with --hf-overrides and chat_template  |
 | zai-org/GLM-4.1V-9B-Base                   |  ✅  |         ✅         |          ✅          |       |                           |
@@ -1231,7 +1249,7 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 # or ```export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=0```
 export ZE_AFFINITY_MASK=0,1 # assuming use the first two Arc GPUs
 
-vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-tokens 8192 --max-model-len 40000 --block-size 64 --dtype float16 --model /llm/models/Qwen3.6-35B-A3B/ --served-model-name Qwen3.6-35B-A3B --tensor-parallel-size 2 --quantization fp8 --enforce-eager --trust-remote-code --disable-log-requests 
+vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-tokens 8192 --max-model-len 40000 --block-size 64 --dtype float16 --model /llm/models/Qwen3.6-35B-A3B/ --served-model-name Qwen3.6-35B-A3B --tensor-parallel-size 2 --quantization fp8 --enforce-eager --trust-remote-code
 ```
 
 For Int4, please use 
@@ -1290,6 +1308,112 @@ export DGEMMA_FUSED_CAUSAL=1
 
 vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.8 --max-num-batched-tokens 8192 --max-model-len 90000 --block-size 64 --dtype float16 --mamba-ssm-cache-dtype float16 --model /llm/models/diffusiongemma-26B-A4B-it/ --served-model-name diffusiongemma-26B-A4B-it --tensor-parallel-size 2 --quantization fp8 --max-num-seqs 4 --attention-backend FLASH_ATTN --diffusion-config '{"canvas_length":256,"max_denoising_steps":16}' --hf-overrides '{"diffusion_sampler":"entropy_bound","diffusion_entropy_bound":0.1,"diffusion_confidence_threshold":0.0}' --trust-remote-code 
 ```
+
+### 3.4 LoRA Adapter Serving
+
+vLLM supports serving multiple LoRA adapters with runtime load/unload capabilities. This enables fine-tuned model variants to be served from a single base model instance.
+
+**Supported models:** Currently verified with Qwen3.6-27B and Qwen3.6-35B-A3B models.
+
+#### Starting the server with LoRA adapters
+
+Example for Qwen3.6-27B with two LoRA adapters:
+
+```bash
+export ZE_AFFINITY_MASK=0,1
+export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
+
+vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-tokens 8192 --max-model-len 20000 --block-size 64 --dtype float16 --model /llm/models/Qwen3.6-27B/ --served-model-name Qwen3.6-27B --tensor-parallel-size 2 --quantization fp8 --enforce-eager --trust-remote-code --enable-lora --lora-modules adapter1=/llm/models/adapter/adapter1 adapter2=/llm/models/adapter/adapter2 --max-loras 2 --max-lora-rank 128
+```
+
+Example for Qwen3.6-35B-A3B with a single LoRA adapter:
+
+```bash
+export ZE_AFFINITY_MASK=0,1
+export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
+
+vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-tokens 8192 --max-model-len 40000 --block-size 64 --dtype float16 --model /llm/models/Qwen3.6-35B-A3B/ --served-model-name Qwen3.6-35B-A3B --tensor-parallel-size 2 --quantization fp8 --enforce-eager --trust-remote-code --enable-lora --lora-modules adapter1=/llm/models/adapter/adapter1 --max-loras 1 --max-lora-rank 128
+```
+
+Key LoRA parameters:
+- `--enable-lora`: Enable LoRA serving
+- `--lora-modules <name>=<path> ...`: Register LoRA adapters at startup (format: `name=path`)
+- `--max-loras`: Maximum number of LoRA adapters to serve concurrently
+- `--max-lora-rank`: Maximum LoRA rank supported (set to the highest rank among your adapters)
+- `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True`: Enable runtime adapter load/unload
+
+#### Sending requests to LoRA adapters
+
+Use the adapter name as the model name in your API requests:
+
+```bash
+curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "adapter1",
+  "messages": [{"role": "user", "content": "Hello, how are you?"}],
+  "max_tokens": 100
+}'
+```
+
+To use the base model without any adapter, use the `--served-model-name` value (e.g., `Qwen3.6-27B`).
+
+#### Runtime adapter management
+
+Unload an adapter:
+```bash
+curl -X POST http://localhost:8000/v1/unload_lora_adapter -H "Content-Type: application/json" -d '{"lora_name":"adapter1"}'
+```
+
+Load a new adapter:
+```bash
+curl -X POST http://localhost:8000/v1/load_lora_adapter -H "Content-Type: application/json" -d '{"lora_name":"adapter1","lora_path":"/llm/models/adapter/adapter1"}'
+```
+
+List currently registered models:
+```bash
+curl http://localhost:8000/v1/models
+```
+
+
+### 3.5 MTP Enable
+
+MTP is a speculative decoding method where the target model includes native
+multi-token prediction capability. Unlike draft-model-based methods, you do not
+need to provide a separate draft model.
+
+MTP is useful when:
+
+- Your model natively supports MTP.
+- You want model-based speculative decoding with minimal extra configuration.
+
+**Supported models:** Currently verified with `Qwen3.6-27B` and `Qwen3.6-35B-A3B` and `gemma-4-26B-A4B-it` and `gemma-4-31B-it` models.
+
+#### Qwen Assistant Models
+
+Use `"method": "qwen3_5_mtp"` when serving Qwen MTP:
+
+```bash
+    --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":2}'
+```
+
+#### Gemma 4 Assistant Models
+
+Gemma 4 assistant checkpoints use vLLM's Gemma 4 MTP path. You need to download draft_model first.
+
+Use `"method": "gemma4_mtp"` when serving Gemma 4 with an assistant checkpoint:
+
+```bash
+    --speculative-config '{"method":"gemma4_mtp","model":"/path/to/gemma-4-31B-it-assistant","num_speculative_tokens":2}'
+```
+
+
+You can profile performance by tuning `num_speculative_tokens` from 2 to 5. Adjust this based on your workload.
+
 
 ## 4. Troubleshooting
 

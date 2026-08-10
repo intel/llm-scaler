@@ -28,6 +28,11 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
   m.def("esimd_gemv_fp16(Tensor input, Tensor weight, Tensor output) -> Tensor");
   m.impl("esimd_gemv_fp16", torch::kXPU, &esimd_gemv_fp16);
 
+  m.def("esimd_gemv_fp16_gelu_mul(Tensor input, Tensor weight, "
+        "Tensor output) -> Tensor");
+  m.impl("esimd_gemv_fp16_gelu_mul", torch::kXPU,
+         &esimd_gemv_fp16_gelu_mul);
+
   m.def("esimd_gemv_fp8_pert(Tensor input, Tensor weight, Tensor weight_scale, "
         "Tensor output) -> Tensor");
   m.impl("esimd_gemv_fp8_pert", torch::kXPU, &esimd_gemv_fp8_pert);

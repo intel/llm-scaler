@@ -36,6 +36,11 @@ at::Tensor esimd_gemv_fp8_pert(
 at::Tensor esimd_gemv_fp16(
     at::Tensor input, at::Tensor weight, at::Tensor output);
 
+// Fused FP16 gate-up GEMV plus GELU-tanh and multiply for Gemma MTP.
+// weight is [2*N, K] with gate rows followed by up rows; output is [1, N].
+at::Tensor esimd_gemv_fp16_gelu_mul(
+    at::Tensor input, at::Tensor weight, at::Tensor output);
+
 at::Tensor esimd_gemv_fp8_pert_fused2(
     at::Tensor input,
     at::Tensor w0, at::Tensor s0, at::Tensor o0,
@@ -112,6 +117,19 @@ at::Tensor esimd_gdn_conv_fused_seq(
     at::Tensor output, at::Tensor z_out,
     int64_t N, int64_t H, int64_t HV,
     int64_t K, int64_t V,
+    double scale);
+
+// Rollback-aware fused Conv1d + GDN for speculative sequential tokens.
+at::Tensor esimd_gdn_conv_fused_seq_spec(
+    at::Tensor qkvz,
+    at::Tensor conv_state, at::Tensor conv_weight, at::Tensor conv_bias,
+    at::Tensor spec_state_indices,
+    at::Tensor A_log, at::Tensor dt_bias,
+    at::Tensor ba, at::Tensor ssm_state,
+    at::Tensor output, at::Tensor z_out,
+    at::Tensor token_indx, at::Tensor num_accepted_tokens,
+    int64_t num_spec_decodes, int64_t num_spec_tokens,
+    int64_t H, int64_t HV, int64_t K, int64_t V,
     double scale);
 
 // Fused ResidualAdd + RMSNorm + FP8 GEMV (post_attn_norm + router)
@@ -194,6 +212,11 @@ void esimd_norm_gemv_norm_fp16(
     at::Tensor router_logits, at::Tensor moe_input,
     double eps);
 
+at::Tensor esimd_norm_gemv_fp8_blockscale(
+    at::Tensor x, at::Tensor z, at::Tensor norm_weight,
+    at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output,
+    int64_t HV, int64_t V, double eps);
+
 void esimd_scaled_resadd_norm_gemv_fp8_pert(
     at::Tensor hidden_states, at::Tensor residual,
     at::Tensor norm_weight, at::Tensor qkv_weight,
@@ -242,11 +265,38 @@ at::Tensor esimd_moe_gemm_fp8(
     at::Tensor output, at::Tensor expert_idx,
     int64_t N, int64_t K, int64_t num_experts, int64_t max_tokens_per_expert);
 
+// MoE grouped block-scaled FP8 GEMM (DeepSeek 128x128 weight block, w8a16):
+// input [total_tokens, K] fp16, weight [E, N, K] fp8_e4m3, weight_scale
+// [E, ceil(N/128), ceil(K/128)] fp32 (== weight_scale_inv), output
+// [total_tokens, N] fp16, expert_idx [E+1] uint32 token start offsets.
+at::Tensor esimd_moe_gemm_fp8_blockscale(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output, at::Tensor expert_idx,
+    int64_t N, int64_t K, int64_t num_experts, int64_t block_n, int64_t block_k);
+
 // FP8 GEMM per-tensor scale: input [M, K] fp16, weight [N, K] fp8, output [M, N] fp16
 // Auto-dispatches: M<=3 → batched GEMV, M>=2 E4M3 → DPAS V9, else → WS
 at::Tensor esimd_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output);
+
+// FP8 block-scaled GEMM (DeepSeek-style 128x128 weight block scale, w8a16):
+// input [M, K] fp16, weight [N, K] fp8_e4m3, weight_scale [ceil(N/128), ceil(K/128)]
+// fp32 (== weight_scale_inv), output [M, N] fp16. Activation stays fp16 (no
+// activation quantization). M, N, K auto-detected from tensor shapes.
+at::Tensor esimd_gemm_fp8_blockscale(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output, int64_t block_n, int64_t block_k);
+
+at::Tensor esimd_gemv_fp8_blockscale_fused2(
+    at::Tensor input,
+    at::Tensor w0, at::Tensor s0, at::Tensor o0,
+    at::Tensor w1, at::Tensor s1, at::Tensor o1,
+    int64_t block_n, int64_t block_k);
+
+at::Tensor esimd_gemv_fp8_blockscale_fp16_fused2(
+    at::Tensor input, at::Tensor w0, at::Tensor s0, at::Tensor o0,
+    at::Tensor w1, at::Tensor o1, int64_t block_n, int64_t block_k);
 
 // ======================== INT4 GEMV ========================
 // Symmetric INT4 weight GEMV with per-group scale (group_size=128).
