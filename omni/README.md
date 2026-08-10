@@ -112,7 +112,7 @@ The focused image contains:
   including the managed GGUF and Nunchaku W4A16 routes;
 - `comfy-aimdo==0.4.13` from the XPU-enabled
   [`comfy-aimdo` fork](https://github.com/xiangyuT/comfy-aimdo-xpu) at revision
-  `908ea465c6614896612bf51ede2d1dabe7248d1f`, built with its Level Zero
+  `0523f00f7125eab7669a2efa82d8f57a5c1b4a25`, built with its Level Zero
   allocator backend;
 - [`ComfyUI-GGUF-XPU`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
   with GGUF, SentencePiece, and Protobuf dependencies installed from the same

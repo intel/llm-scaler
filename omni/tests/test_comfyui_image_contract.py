@@ -45,7 +45,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_AIMDO_COMMIT": (
         "AIMDO_COMMIT",
-        "908ea465c6614896612bf51ede2d1dabe7248d1f",
+        "0523f00f7125eab7669a2efa82d8f57a5c1b4a25",
     ),
     "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.4.13"),
     "COMFY_GGUF_REPOSITORY": (
