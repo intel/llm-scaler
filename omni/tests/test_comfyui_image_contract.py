@@ -7,10 +7,16 @@ from unittest import mock
 
 
 OMNI_ROOT = Path(__file__).resolve().parents[1]
+ROOT_README = OMNI_ROOT.parent / "README.md"
 DOCKERFILE = OMNI_ROOT / "docker" / "Dockerfile"
 FULL_DOCKERFILE = OMNI_ROOT / "docker" / "Dockerfile.full"
+DOCKERIGNORE = OMNI_ROOT / ".dockerignore"
 BUILD_SCRIPT = OMNI_ROOT / "build.sh"
 VALIDATOR = OMNI_ROOT / "tools" / "validate_comfyui_image.py"
+DEMO_ASSETS = {
+    "demo_qwen_image.gif",
+    "demo_wan2.2_14b_i2v_multi_xpu.gif",
+}
 
 COMPONENT_PINS = {
     "COMFYUI_REPOSITORY": (
@@ -46,7 +52,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_AIMDO_COMMIT": (
         "AIMDO_COMMIT",
-        "0523f00f7125eab7669a2efa82d8f57a5c1b4a25",
+        "c7baf6240e5ed37fe01ee30330befade7d23497f",
     ),
     "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.4.13"),
     "COMFY_GGUF_REPOSITORY": (
@@ -81,6 +87,38 @@ def load_validator():
 
 
 class ComfyUIImageContractTest(unittest.TestCase):
+    def test_root_readme_omni_links_resolve_to_current_docs_and_assets(self):
+        readme = ROOT_README.read_text(encoding="utf-8")
+
+        for name in DEMO_ASSETS:
+            with self.subTest(asset=name):
+                path = OMNI_ROOT / "assets" / name
+                self.assertTrue(path.is_file())
+                self.assertGreater(path.stat().st_size, 0)
+                self.assertIn(f"./omni/assets/{name}", readme)
+        self.assertIn(
+            "omni/README.md#getting-started-with-the-omni-docker-image",
+            readme,
+        )
+        self.assertIn("omni/docs/COMFYUI.md", readme)
+        self.assertIn(
+            "https://github.com/intel/llm-scaler/blob/"
+            "omni-0.1.0-b8/omni/README.md#xinference",
+            readme,
+        )
+        self.assertNotIn("omni/README.md/#comfyui", readme)
+        self.assertNotIn("omni/README.md/#xinference", readme)
+
+    def test_build_context_keeps_repository_workflow_and_input_directories(self):
+        ignored = {
+            line.strip()
+            for line in DOCKERIGNORE.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+
+        self.assertNotIn("workflows/", ignored)
+        self.assertNotIn("example_inputs/", ignored)
+
     def test_build_proxy_default_has_no_organization_domains(self):
         build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
         full_dockerfile = FULL_DOCKERFILE.read_text(encoding="utf-8")
