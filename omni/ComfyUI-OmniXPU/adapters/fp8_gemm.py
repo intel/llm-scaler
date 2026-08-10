@@ -10,6 +10,7 @@ import torch
 import comfy.model_management
 
 from ..patches.debug import log_debug_event
+from .errors import is_fatal_accelerator_error
 
 log = logging.getLogger("ComfyUI-OmniXPU")
 
@@ -101,6 +102,8 @@ def apply():
                             o = o.reshape((input_shape[0], input_shape[1], w.shape[0]))
                         return o
                 except Exception as e:
+                    if is_fatal_accelerator_error(e):
+                        raise
                     _log_first(f"failed, falling back: {e}")
 
             # --- Original path: QuantizedTensor dispatch ---
@@ -144,6 +147,8 @@ def apply():
                             )
                             return output
                     except Exception as e:
+                        if is_fatal_accelerator_error(e):
+                            raise
                         _log_first(f"_forward failed, falling back: {e}")
                 return _orig_inner_fwd(self, input, weight, bias)
 
@@ -195,6 +200,8 @@ def apply():
                                     o = o.reshape(input_shape[0], input_shape[1], -1)
                                 return o
                         except Exception as e:
+                            if is_fatal_accelerator_error(e):
+                                raise
                             _log_first(f"forward failed, falling back: {e}")
 
                 return _orig_fwd(self, input, *fwd_args, **fwd_kwargs)

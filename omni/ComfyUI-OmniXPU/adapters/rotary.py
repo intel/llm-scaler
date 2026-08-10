@@ -6,6 +6,7 @@ import logging
 import sys
 
 from ..patches.debug import log_debug_event
+from .errors import is_fatal_accelerator_error
 
 log = logging.getLogger("ComfyUI-OmniXPU")
 
@@ -124,6 +125,8 @@ def apply():
                 )
                 return output
             except RuntimeError as error:
+                if is_fatal_accelerator_error(error):
+                    raise
                 _failed_contracts.add(contract)
                 log.warning(
                     "[OmniXPU] rotary: direct LTX split-half route failed "

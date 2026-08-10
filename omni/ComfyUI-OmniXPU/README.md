@@ -56,6 +56,15 @@ OMNIXPU_H120_RMSNORM=0
 OMNIXPU_KREA2_RMSNORM=0
 ```
 
+For diagnostics, the per-call CUTE output scan can be enabled explicitly. It
+is disabled by default because validated CUTE routes accumulate in FP32 and a
+full output scan adds a shape-proportional temporary allocation. Explicit
+ESIMD FP16 routing retains its overflow scan regardless of this setting.
+
+```bash
+OMNIXPU_VALIDATE_ATTENTION_OUTPUT=1
+```
+
 The two global workarounds are opt-in:
 
 ```bash

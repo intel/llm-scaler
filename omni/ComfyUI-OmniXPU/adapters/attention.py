@@ -5,6 +5,7 @@ import sys
 import torch
 
 from ..patches.debug import log_debug_event
+from .errors import is_fatal_accelerator_error
 
 log = logging.getLogger("ComfyUI-OmniXPU")
 
@@ -19,6 +20,7 @@ _attention_traced_contracts = set()
 
 _MINIMAX_H3_H56_CUTE_MIN_SEQUENCE = 31
 _MINIMAX_H3_VAE_D64_CUTE_MIN_SEQUENCE = 6
+_VALIDATE_OUTPUT_ENV = "OMNIXPU_VALIDATE_ATTENTION_OUTPUT"
 
 # ── Attention backend selection ──────────────────────────────────────────────
 # OMNI_ATTN_BACKEND selects which attention routing policy the patched ComfyUI
@@ -51,6 +53,11 @@ def _record_attention_route(route):
     count = _attention_route_counts.get(route, 0) + 1
     _attention_route_counts[route] = count
     return count
+
+
+def _validate_attention_output():
+    value = os.environ.get(_VALIDATE_OUTPUT_ENV, "0").strip().lower()
+    return value not in ("", "0", "false", "no", "off")
 
 
 def _attention_tensor_contract(tensor):
@@ -934,6 +941,8 @@ def apply():
                     b, -1, heads * dim_head
                 )
             except Exception as error:
+                if is_fatal_accelerator_error(error):
+                    raise
                 _attention_failed_contracts.add(bmg_d128_contract)
                 _attention_fallback_count += 1
                 key = "cute_runtime_error"
@@ -997,7 +1006,7 @@ def apply():
             out = _backend_sdp.sdp_wan22_cross(
                 q_blhd, k_blhd, v_blhd
             )
-            if (out != out).any():
+            if _validate_attention_output() and (out != out).any():
                 _attention_fallback_count += 1
                 _attention_fallback_reasons["output_non_finite"] = (
                     _attention_fallback_reasons.get(
@@ -1005,6 +1014,7 @@ def apply():
                     )
                     + 1
                 )
+                del out, q_blhd, k_blhd, v_blhd
                 return _pytorch_fallback(
                     q,
                     k,
@@ -1047,6 +1057,8 @@ def apply():
                     b, q_len, heads * dim_head
                 )
             except Exception as error:
+                if is_fatal_accelerator_error(error):
+                    raise
                 _attention_failed_contracts.add(
                     bmg_minimax_h3_vae_d64_contract
                 )
@@ -1142,8 +1154,17 @@ def apply():
         )
         out = selected_sdp.sdp(q_blhd, k_blhd, v_blhd)
 
-        # FP16 NaN safety
-        if q.dtype == torch.float16 and (out != out).any():
+        # ESIMD accumulates in FP16, so keep its overflow safety check. CUTE
+        # accumulates in FP32 and its validated routes avoid this per-call full
+        # output scan by default; enable the diagnostic switch to restore it.
+        validate_output = (
+            selected_backend == "esimd" or _validate_attention_output()
+        )
+        if (
+            q.dtype == torch.float16
+            and validate_output
+            and (out != out).any()
+        ):
             _attention_fallback_count += 1
             _attention_fallback_reasons["output_non_finite"] = (
                 _attention_fallback_reasons.get("output_non_finite", 0) + 1
@@ -1153,6 +1174,7 @@ def apply():
                     "[OmniXPU] FP16 overflow in %s, falling back to SDPA",
                     selected_backend.upper(),
                 )
+            del out, q_blhd, k_blhd, v_blhd
             return _pytorch_fallback(
                 q,
                 k,

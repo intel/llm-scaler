@@ -36,6 +36,7 @@ class _FakeTensor:
         pre_shaped=True,
         stride=None,
         batch=1,
+        non_finite=False,
     ):
         if pre_shaped:
             self.shape = (batch, heads, seq, dim_head)
@@ -50,6 +51,8 @@ class _FakeTensor:
             self._stride = stride or (seq * heads * dim_head, heads * dim_head, 1)
         self.dtype = dtype
         self.device = types.SimpleNamespace(type="xpu")
+        self.non_finite = non_finite
+        self._non_finite_checks = []
 
     @classmethod
     def _with_metadata(cls, source, shape, stride):
@@ -58,6 +61,8 @@ class _FakeTensor:
         tensor._stride = tuple(stride)
         tensor.dtype = source.dtype
         tensor.device = source.device
+        tensor.non_finite = source.non_finite
+        tensor._non_finite_checks = source._non_finite_checks
         return tensor
 
     @staticmethod
@@ -112,7 +117,12 @@ class _FakeTensor:
         return self._stride
 
     def __ne__(self, other):
-        return types.SimpleNamespace(any=lambda: False)
+        self._non_finite_checks.append(True)
+        return types.SimpleNamespace(any=lambda: self.non_finite)
+
+    @property
+    def non_finite_checks(self):
+        return len(self._non_finite_checks)
 
 
 def _load_patch(
@@ -414,6 +424,86 @@ def test_bmg_wan22_t2v_turbo_720p_cross_uses_cute(monkeypatch):
     assert patch.get_stats()["routes"] == {
         "wan22_t2v_turbo_720p_cross": 1
     }
+
+
+def test_bmg_wan22_cute_skips_output_scan_by_default(monkeypatch):
+    monkeypatch.delenv("OMNIXPU_VALIDATE_ATTENTION_OUTPUT", raising=False)
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(
+        seq=75600,
+        heads=40,
+        dtype=torch.float16,
+        pre_shaped=False,
+        non_finite=True,
+    )
+    kv = _FakeTensor(
+        seq=512,
+        heads=40,
+        dtype=torch.float16,
+        pre_shaped=False,
+    )
+
+    result = attention.optimized_attention(q, kv, kv, heads=40)
+
+    assert isinstance(result, _FakeTensor)
+    assert calls == ["cute_wan22_cross"]
+    assert q.non_finite_checks == 0
+    assert patch.get_stats()["fallback"] == 0
+
+
+def test_bmg_wan22_diagnostic_output_scan_falls_back(monkeypatch):
+    monkeypatch.setenv("OMNIXPU_VALIDATE_ATTENTION_OUTPUT", "1")
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(
+        seq=75600,
+        heads=40,
+        dtype=torch.float16,
+        pre_shaped=False,
+        non_finite=True,
+    )
+    kv = _FakeTensor(
+        seq=512,
+        heads=40,
+        dtype=torch.float16,
+        pre_shaped=False,
+    )
+
+    result = attention.optimized_attention(q, kv, kv, heads=40)
+
+    assert result == "torch-output"
+    assert calls == ["cute_wan22_cross", "torch"]
+    assert q.non_finite_checks == 1
+    assert patch.get_stats()["reasons"] == {"output_non_finite": 1}
+
+
+def test_generic_cute_skips_output_scan_by_default(monkeypatch):
+    monkeypatch.delenv("OMNIXPU_VALIDATE_ATTENTION_OUTPUT", raising=False)
+    patch, attention, calls = _load_patch(monkeypatch, backend="cute")
+    tensor = _FakeTensor(dtype=torch.float16, non_finite=True)
+
+    result = attention.optimized_attention(
+        tensor, tensor, tensor, heads=30, skip_reshape=True
+    )
+
+    assert isinstance(result, _FakeTensor)
+    assert calls == ["cute"]
+    assert tensor.non_finite_checks == 0
+    assert patch.get_stats()["fallback"] == 0
+
+
+def test_explicit_esimd_non_finite_output_still_falls_back(monkeypatch):
+    monkeypatch.delenv("OMNIXPU_VALIDATE_ATTENTION_OUTPUT", raising=False)
+    patch, attention, calls = _load_patch(monkeypatch, backend="esimd")
+    tensor = _FakeTensor(dtype=torch.float16, non_finite=True)
+
+    result = attention.optimized_attention(
+        tensor, tensor, tensor, heads=30, skip_reshape=True
+    )
+
+    assert result == "torch-output"
+    assert calls == ["esimd", "torch"]
+    assert tensor.non_finite_checks == 1
+    assert patch.get_stats()["reasons"] == {"output_non_finite": 1}
 
 
 @pytest.mark.parametrize(
@@ -768,6 +858,34 @@ def test_bmg_b2_runtime_error_warns_falls_back_and_quarantines(
     assert "synthetic CUTE failure" in caplog.text
 
 
+def test_bmg_b2_out_of_memory_is_not_retried_or_quarantined(monkeypatch):
+    error = torch.OutOfMemoryError("synthetic XPU out of memory")
+    patch, attention, calls = _load_patch(
+        monkeypatch,
+        target="bmg",
+        d128_bhld_error=error,
+    )
+    q = _FakeTensor(
+        seq=3520,
+        heads=32,
+        batch=2,
+        pre_shaped=False,
+    )
+    kv = _FakeTensor(
+        seq=1024,
+        heads=32,
+        batch=2,
+        pre_shaped=False,
+    )
+
+    with pytest.raises(torch.OutOfMemoryError, match="synthetic XPU"):
+        attention.optimized_attention(q, kv, kv, heads=32)
+
+    assert calls == ["cute_d128_bhld"]
+    assert patch.get_stats()["fallback"] == 0
+    assert patch.get_stats()["quarantined_contracts"] == 0
+
+
 def test_auto_unsupported_cross_uses_torch_not_esimd(monkeypatch):
     patch, attention, calls = _load_patch(
         monkeypatch,
@@ -940,6 +1058,41 @@ def test_bmg_minimax_h3_video_vae_d64_quarantines_runtime_failure(
 
     assert calls == ["cute_h3_vae_d64", "torch", "torch"]
     assert patch.get_stats()["fallback"] == 2
+
+
+def test_bmg_minimax_h3_video_vae_d64_device_oom_is_not_retried(
+    monkeypatch,
+):
+    error = RuntimeError("UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY")
+    patch, attention, calls = _load_patch(
+        monkeypatch,
+        target="bmg",
+        h3_vae_d64_error=error,
+    )
+    seq = 453
+    q = _FakeTensor(
+        seq=seq,
+        heads=32,
+        dim_head=64,
+        dtype=torch.float16,
+        stride=(seq * 2048, 64, 2048, 1),
+    )
+    v = _FakeTensor(
+        seq=seq,
+        heads=32,
+        dim_head=64,
+        dtype=torch.float16,
+        stride=(seq * 6144, 192, 6144, 1),
+    )
+
+    with pytest.raises(RuntimeError, match="OUT_OF_DEVICE_MEMORY"):
+        attention.optimized_attention(
+            q, q, v, heads=32, skip_reshape=True
+        )
+
+    assert calls == ["cute_h3_vae_d64"]
+    assert patch.get_stats()["fallback"] == 0
+    assert patch.get_stats()["quarantined_contracts"] == 0
 
 
 def test_attention_contract_trace_records_exact_layout_once(

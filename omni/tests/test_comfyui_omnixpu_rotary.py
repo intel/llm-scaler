@@ -7,6 +7,9 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+import torch
+
 
 _PLUGIN = Path(__file__).parents[1] / "ComfyUI-OmniXPU"
 _PATCHES = _PLUGIN / "patches"
@@ -49,6 +52,8 @@ class _Rotary:
     def apply_ltx_split_rope_direct(self, _input, _cos, _sin):
         self.calls += 1
         if self.failure is not None:
+            if isinstance(self.failure, BaseException):
+                raise self.failure
             raise RuntimeError(self.failure)
         return self.output
 
@@ -144,6 +149,33 @@ def test_runtime_failure_quarantines_exact_contract(monkeypatch):
     assert rotary.calls == 1
     assert len(calls) == 2
     assert patch.get_stats()["quarantined_contracts"] == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        torch.OutOfMemoryError("synthetic rotary XPU OOM"),
+        RuntimeError("UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY"),
+    ],
+)
+def test_fatal_runtime_failure_does_not_enter_fallback(
+    monkeypatch, failure
+):
+    patch, rotary, model, calls = _load_patch(monkeypatch)
+    rotary.failure = failure
+    assert patch.apply() == (True, "")
+
+    with pytest.raises(type(failure)) as raised:
+        model.apply_split_rotary_emb(*_inputs())
+
+    assert raised.value is failure
+    assert rotary.calls == 1
+    assert not calls
+    assert patch.get_stats() == {
+        "routed": 0,
+        "fallback": 0,
+        "quarantined_contracts": 0,
+    }
 
 
 def test_non_bmg_package_does_not_patch(monkeypatch):
