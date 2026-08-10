@@ -19,6 +19,473 @@ using namespace sycl::ext::intel::esimd;
 namespace omni_xpu {
 namespace norm {
 
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
+// Boogu Image uses FP16 Q/K heads with D=120. This hidden size cannot enter
+// the generic power-of-two block dispatch. One ESIMD work-item per row keeps
+// the complete head in GRF, performs a 7x16 + 8 reduction, and removes the
+// multi-kernel PyTorch RMSNorm decomposition. PTL-H and BMG independently
+// validated the same one-WI geometry; keep distinct kernel identities so
+// platform-specific traces and AOT images remain unambiguous.
+struct RmsNormH120FP16Config {
+    static constexpr int HiddenSize = 120;
+    static constexpr int WideBlockSize = 16;
+    static constexpr int WideBlocks = 7;
+    static constexpr int TailBlockSize = 8;
+    static constexpr int TailOffset = WideBlockSize * WideBlocks;
+};
+
+#if defined(OMNI_XPU_ARCH_PTL_H)
+class RmsNormH120FP16PTLKernel;
+#else
+class RmsNormH120FP16BMGKernel;
+#endif
+
+void rms_norm_h120_fp16_kernel(
+    const void* weight_ptr,
+    const void* input_ptr,
+    void* output_ptr,
+    float eps,
+    const int input_size,
+    const at::Device& device
+) {
+    using Config = RmsNormH120FP16Config;
+    const fp16* weight = static_cast<const fp16*>(weight_ptr);
+    const fp16* input = static_cast<const fp16*>(input_ptr);
+    fp16* output = static_cast<fp16*>(output_ptr);
+
+    auto cgf = [&](sycl::handler& handle) {
+#if defined(OMNI_XPU_ARCH_PTL_H)
+        handle.parallel_for<RmsNormH120FP16PTLKernel>(
+#else
+        handle.parallel_for<RmsNormH120FP16BMGKernel>(
+#endif
+            sycl::range<1>(input_size),
+            [=](sycl::item<1> item) SYCL_ESIMD_KERNEL {
+                const int row = item.get_id(0);
+                const fp16* input_row =
+                    input + static_cast<size_t>(row) * Config::HiddenSize;
+                fp16* output_row =
+                    output + static_cast<size_t>(row) * Config::HiddenSize;
+                simd<fp16, Config::HiddenSize> cached;
+                simd<float, Config::WideBlockSize> accumulator = 0;
+
+#pragma unroll
+                for (int block = 0; block < Config::WideBlocks; ++block) {
+                    simd<fp16, Config::WideBlockSize> values =
+                        block_load<fp16, Config::WideBlockSize>(
+                            input_row + block * Config::WideBlockSize);
+                    cached.template select<Config::WideBlockSize, 1>(
+                        block * Config::WideBlockSize) = values;
+                    simd<float, Config::WideBlockSize> values_f32 = values;
+                    accumulator += values_f32 * values_f32;
+                }
+                simd<fp16, Config::TailBlockSize> tail =
+                    block_load<fp16, Config::TailBlockSize>(
+                        input_row + Config::TailOffset);
+                cached.template select<Config::TailBlockSize, 1>(
+                    Config::TailOffset) = tail;
+                simd<float, Config::TailBlockSize> tail_f32 = tail;
+                const float sum_squares =
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::WideBlockSize>(accumulator) +
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::TailBlockSize>(
+                        tail_f32 * tail_f32);
+                const float scale = rsqrt(
+                    sum_squares / Config::HiddenSize + eps);
+
+#pragma unroll
+                for (int block = 0; block < Config::WideBlocks; ++block) {
+                    simd<float, Config::WideBlockSize> values =
+                        cached.template select<Config::WideBlockSize, 1>(
+                            block * Config::WideBlockSize);
+                    simd<float, Config::WideBlockSize> weights =
+                        block_load<fp16, Config::WideBlockSize>(
+                            weight + block * Config::WideBlockSize);
+                    block_store<fp16, Config::WideBlockSize>(
+                        output_row + block * Config::WideBlockSize,
+                        simd<fp16, Config::WideBlockSize>(
+                            values * scale * weights));
+                }
+                simd<float, Config::TailBlockSize> tail_values =
+                    cached.template select<Config::TailBlockSize, 1>(
+                        Config::TailOffset);
+                simd<float, Config::TailBlockSize> tail_weights =
+                    block_load<fp16, Config::TailBlockSize>(
+                        weight + Config::TailOffset);
+                block_store<fp16, Config::TailBlockSize>(
+                    output_row + Config::TailOffset,
+                    simd<fp16, Config::TailBlockSize>(
+                        tail_values * scale * tail_weights));
+            });
+    };
+#if defined(OMNI_XPU_ARCH_PTL_H)
+    utils::submit_kernel(cgf, device, "rms_norm_h120_fp16_ptl");
+#else
+    utils::submit_kernel(cgf, device, "rms_norm_h120_fp16_bmg");
+#endif
+}
+#endif
+
+#if defined(OMNI_XPU_ARCH_PTL_H)
+// Z-Image and Krea2 attention projections normalize large batches of
+// contiguous H128 Q/K rows. The generic H128 kernel assigns four work-items
+// to every row, reserves its maximum 8K-element SLM cache, and crosses a
+// work-group barrier. For sufficiently many short rows, one PTL-H work-item
+// per row is faster: it retains the 128 inputs in GRF and only uses four SLM
+// floats. Z-Image reaches this route as BF16; Krea2 uses FP32 to preserve its
+// model-defined accumulation semantics.
+struct RmsNormH128PTLConfig {
+    static constexpr int HiddenSize = 128;
+    static constexpr int BlockSize = 32;
+    static constexpr int Blocks = HiddenSize / BlockSize;
+    static constexpr int MinimumRows = 1024;
+    static constexpr int PartialBytes =
+        ((Blocks * static_cast<int>(sizeof(float)) + 15) / 16) * 16;
+};
+
+class RmsNormH128PTLKernel;
+class RmsNormH128FP32PTLKernel;
+
+// Z-Image applies a second RMSNorm immediately before a BF16 gate multiply
+// and BF16 residual add. At its H3840 workflow shapes, keeping all three
+// operations in one kernel removes two materialized intermediates while
+// preserving the two reduced-precision boundaries explicitly.
+struct RmsNormGateResidualH3840PTLConfig {
+    static constexpr int HiddenSize = 3840;
+    static constexpr int BlockSize = 64;
+    static constexpr int GroupSize = 32;
+    static constexpr int Blocks = HiddenSize / BlockSize;
+    static constexpr int InputBytes = HiddenSize * sizeof(bf16);
+    static constexpr int PartialBytes =
+        ((GroupSize * static_cast<int>(sizeof(float)) + 15) / 16) * 16;
+    static constexpr int SlmBytes = InputBytes + PartialBytes;
+};
+
+class RmsNormGateResidualH3840PTLKernel;
+
+void rms_norm_h128_ptl_kernel(
+    const void* weight_ptr,
+    const void* input_ptr,
+    void* output_ptr,
+    float eps,
+    const int input_size,
+    const at::Device& device
+) {
+    using Config = RmsNormH128PTLConfig;
+    const bf16* weight = static_cast<const bf16*>(weight_ptr);
+    const bf16* input = static_cast<const bf16*>(input_ptr);
+    bf16* output = static_cast<bf16*>(output_ptr);
+
+    auto cgf = [&](sycl::handler& handle) {
+        handle.parallel_for<RmsNormH128PTLKernel>(
+            sycl::nd_range<2>(
+                sycl::range<2>(input_size, 1),
+                sycl::range<2>(1, 1)),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                slm_init<Config::PartialBytes>();
+                const int row = item.get_global_id(0);
+                const bf16* input_row =
+                    input + static_cast<size_t>(row) * Config::HiddenSize;
+                bf16* output_row =
+                    output + static_cast<size_t>(row) * Config::HiddenSize;
+                simd<bf16, Config::HiddenSize> cached;
+
+#pragma unroll
+                for (int block = 0; block < Config::Blocks; ++block) {
+                    simd<bf16, Config::BlockSize> values =
+                        block_load<bf16, Config::BlockSize>(
+                            input_row + block * Config::BlockSize);
+                    cached.template select<Config::BlockSize, 1>(
+                        block * Config::BlockSize) = values;
+                    simd<float, Config::BlockSize> values_f32 = values;
+                    simd<float, Config::BlockSize> squares = 0;
+                    squares += values_f32 * values_f32;
+                    const float partial =
+                        sycl::ext::intel::esimd::detail::sum<
+                            float, float, Config::BlockSize>(squares) /
+                        static_cast<float>(Config::HiddenSize);
+                    slm_block_store<float, 1>(
+                        block * sizeof(float), partial);
+                }
+
+                simd<float, Config::Blocks> partials =
+                    slm_block_load<float, Config::Blocks>(0);
+                const float mean =
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::Blocks>(partials);
+                const float scale = rsqrt(mean + eps);
+
+#pragma unroll
+                for (int block = 0; block < Config::Blocks; ++block) {
+                    simd<float, Config::BlockSize> values =
+                        cached.template select<Config::BlockSize, 1>(
+                            block * Config::BlockSize);
+                    simd<float, Config::BlockSize> weights =
+                        block_load<bf16, Config::BlockSize>(
+                            weight + block * Config::BlockSize);
+                    block_store<bf16, Config::BlockSize>(
+                        output_row + block * Config::BlockSize,
+                        simd<bf16, Config::BlockSize>(
+                            values * scale * weights));
+                }
+            });
+    };
+    utils::submit_kernel(cgf, device, "rms_norm_h128_ptl");
+}
+
+void rms_norm_h128_fp32_ptl_kernel(
+    const void* weight_ptr,
+    const void* input_ptr,
+    void* output_ptr,
+    float eps,
+    const int input_size,
+    const at::Device& device
+) {
+    using Config = RmsNormH128PTLConfig;
+    const float* weight = static_cast<const float*>(weight_ptr);
+    const float* input = static_cast<const float*>(input_ptr);
+    float* output = static_cast<float*>(output_ptr);
+
+    auto cgf = [&](sycl::handler& handle) {
+        handle.parallel_for<RmsNormH128FP32PTLKernel>(
+            sycl::nd_range<2>(
+                sycl::range<2>(input_size, 1),
+                sycl::range<2>(1, 1)),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                slm_init<Config::PartialBytes>();
+                const int row = item.get_global_id(0);
+                const float* input_row =
+                    input + static_cast<size_t>(row) * Config::HiddenSize;
+                float* output_row =
+                    output + static_cast<size_t>(row) * Config::HiddenSize;
+                simd<float, Config::HiddenSize> cached;
+
+#pragma unroll
+                for (int block = 0; block < Config::Blocks; ++block) {
+                    simd<float, Config::BlockSize> values =
+                        block_load<float, Config::BlockSize>(
+                            input_row + block * Config::BlockSize);
+                    cached.template select<Config::BlockSize, 1>(
+                        block * Config::BlockSize) = values;
+                    simd<float, Config::BlockSize> squares = 0;
+                    squares += values * values;
+                    const float partial =
+                        sycl::ext::intel::esimd::detail::sum<
+                            float, float, Config::BlockSize>(squares) /
+                        static_cast<float>(Config::HiddenSize);
+                    slm_block_store<float, 1>(
+                        block * sizeof(float), partial);
+                }
+
+                simd<float, Config::Blocks> partials =
+                    slm_block_load<float, Config::Blocks>(0);
+                const float mean =
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::Blocks>(partials);
+                const float scale = rsqrt(mean + eps);
+
+#pragma unroll
+                for (int block = 0; block < Config::Blocks; ++block) {
+                    simd<float, Config::BlockSize> values =
+                        cached.template select<Config::BlockSize, 1>(
+                            block * Config::BlockSize);
+                    simd<float, Config::BlockSize> weights =
+                        block_load<float, Config::BlockSize>(
+                            weight + block * Config::BlockSize);
+                    block_store<float, Config::BlockSize>(
+                        output_row + block * Config::BlockSize,
+                        values * scale * weights);
+                }
+            });
+    };
+    utils::submit_kernel(cgf, device, "rms_norm_h128_fp32_ptl");
+}
+
+void rms_norm_gate_residual_h3840_ptl_kernel(
+    const bf16* weight,
+    const bf16* input,
+    const bf16* gate,
+    const bf16* residual,
+    bf16* output,
+    float eps,
+    int64_t rows,
+    const at::Device& device
+) {
+    using Config = RmsNormGateResidualH3840PTLConfig;
+    constexpr int SubBlocks = Config::Blocks / Config::GroupSize;
+    constexpr int RemainderBlocks = Config::Blocks % Config::GroupSize;
+
+    auto cgf = [&](sycl::handler& handle) {
+        handle.parallel_for<RmsNormGateResidualH3840PTLKernel>(
+            sycl::nd_range<2>(
+                sycl::range<2>(rows, Config::GroupSize),
+                sycl::range<2>(1, Config::GroupSize)),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                slm_init<Config::SlmBytes>();
+                const int64_t row = item.get_global_id(0);
+                const int tid = item.get_local_id(1);
+                const bf16* input_row =
+                    input + row * Config::HiddenSize;
+                const bf16* residual_row =
+                    residual + row * Config::HiddenSize;
+                bf16* output_row = output + row * Config::HiddenSize;
+                const int start_block =
+                    SubBlocks * tid +
+                    (tid < RemainderBlocks ? tid : RemainderBlocks);
+                const int end_block =
+                    start_block + SubBlocks + (tid < RemainderBlocks);
+
+                simd<float, Config::BlockSize> accumulator = 0;
+                for (int block = start_block; block < end_block; ++block) {
+                    simd<bf16, Config::BlockSize> values =
+                        block_load<bf16, Config::BlockSize>(
+                            input_row + block * Config::BlockSize);
+                    slm_block_store<bf16, Config::BlockSize>(
+                        block * Config::BlockSize * sizeof(bf16), values);
+                    simd<float, Config::BlockSize> values_f32 = values;
+                    accumulator += values_f32 * values_f32;
+                }
+                const float partial =
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::BlockSize>(accumulator) /
+                    static_cast<float>(Config::HiddenSize);
+                slm_block_store<float, 1>(
+                    Config::InputBytes + tid * sizeof(float), partial);
+                barrier();
+
+                simd<float, Config::GroupSize> partials =
+                    slm_block_load<float, Config::GroupSize>(
+                        Config::InputBytes);
+                const float mean =
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::GroupSize>(partials);
+                const float rms_scale = rsqrt(mean + eps);
+
+                for (int block = start_block; block < end_block; ++block) {
+                    const int column = block * Config::BlockSize;
+                    simd<float, Config::BlockSize> values =
+                        slm_block_load<bf16, Config::BlockSize>(
+                            column * sizeof(bf16));
+                    simd<float, Config::BlockSize> weights =
+                        block_load<bf16, Config::BlockSize>(weight + column);
+                    simd<float, Config::BlockSize> gate_values =
+                        block_load<bf16, Config::BlockSize>(gate + column);
+                    simd<float, Config::BlockSize> residual_values =
+                        block_load<bf16, Config::BlockSize>(
+                            residual_row + column);
+
+                    // Match the existing three-op BF16 chain: RMSNorm first
+                    // stores BF16, gate * normalized stores BF16 again, then
+                    // the residual add rounds to BF16.
+                    simd<bf16, Config::BlockSize> normalized_bf16 =
+                        simd<bf16, Config::BlockSize>(
+                            values * rms_scale * weights);
+                    simd<float, Config::BlockSize> normalized =
+                        normalized_bf16;
+                    simd<bf16, Config::BlockSize> product_bf16 =
+                        simd<bf16, Config::BlockSize>(
+                            normalized * gate_values);
+                    simd<float, Config::BlockSize> product = product_bf16;
+                    block_store<bf16, Config::BlockSize>(
+                        output_row + column,
+                        simd<bf16, Config::BlockSize>(
+                            residual_values + product));
+                }
+            });
+    };
+    utils::submit_kernel(
+        cgf, device, "rms_norm_gate_residual_h3840_ptl");
+}
+#endif
+
+#if defined(OMNI_XPU_ARCH_BMG)
+// Krea2 attention projections normalize large batches of contiguous FP32
+// H128 Q/K rows. BMG independently validates the same one-work-item-per-row
+// design used on PTL-H, while preferring a wider reduction block. Keep the
+// BMG kernel identity separate so target-specific AOT images and profiler
+// records remain unambiguous. The analogous BF16 route is intentionally not
+// registered on BMG because its Z-Image endpoint A/B did not improve.
+struct RmsNormH128BMGConfig {
+    static constexpr int HiddenSize = 128;
+    static constexpr int MinimumRows = 4096;
+    static constexpr int BlockSize = 64;
+    static constexpr int Blocks = HiddenSize / BlockSize;
+    static constexpr int PartialBytes =
+        ((Blocks * static_cast<int>(sizeof(float)) + 15) / 16) * 16;
+};
+
+class RmsNormH128FP32BMGKernel;
+
+void rms_norm_h128_fp32_bmg_kernel(
+    const void* weight_ptr,
+    const void* input_ptr,
+    void* output_ptr,
+    float eps,
+    const int input_size,
+    const at::Device& device
+) {
+    using Config = RmsNormH128BMGConfig;
+    const float* weight = static_cast<const float*>(weight_ptr);
+    const float* input = static_cast<const float*>(input_ptr);
+    float* output = static_cast<float*>(output_ptr);
+
+    auto cgf = [&](sycl::handler& handle) {
+        handle.parallel_for<RmsNormH128FP32BMGKernel>(
+            sycl::nd_range<2>(
+                sycl::range<2>(input_size, 1),
+                sycl::range<2>(1, 1)),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                slm_init<Config::PartialBytes>();
+                const int row = item.get_global_id(0);
+                const float* input_row =
+                    input + static_cast<size_t>(row) * Config::HiddenSize;
+                float* output_row =
+                    output + static_cast<size_t>(row) * Config::HiddenSize;
+                simd<float, Config::HiddenSize> cached;
+
+#pragma unroll
+                for (int block = 0; block < Config::Blocks; ++block) {
+                    simd<float, Config::BlockSize> values =
+                        block_load<float, Config::BlockSize>(
+                            input_row + block * Config::BlockSize);
+                    cached.template select<Config::BlockSize, 1>(
+                        block * Config::BlockSize) = values;
+                    simd<float, Config::BlockSize> squares = 0;
+                    squares += values * values;
+                    const float partial =
+                        sycl::ext::intel::esimd::detail::sum<
+                            float, float, Config::BlockSize>(squares) /
+                        static_cast<float>(Config::HiddenSize);
+                    slm_block_store<float, 1>(
+                        block * sizeof(float), partial);
+                }
+
+                simd<float, Config::Blocks> partials =
+                    slm_block_load<float, Config::Blocks>(0);
+                const float mean =
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::Blocks>(partials);
+                const float scale = rsqrt(mean + eps);
+
+#pragma unroll
+                for (int block = 0; block < Config::Blocks; ++block) {
+                    simd<float, Config::BlockSize> values =
+                        cached.template select<Config::BlockSize, 1>(
+                            block * Config::BlockSize);
+                    simd<float, Config::BlockSize> weights =
+                        block_load<float, Config::BlockSize>(
+                            weight + block * Config::BlockSize);
+                    block_store<float, Config::BlockSize>(
+                        output_row + block * Config::BlockSize,
+                        values * scale * weights);
+                }
+            });
+    };
+    utils::submit_kernel(cgf, device, "rms_norm_h128_fp32_bmg");
+}
+#endif
+
 // ============================================================================
 // RMSNorm Kernel  (optimized: right-sized SLM, tuned GS)
 // ============================================================================
@@ -354,6 +821,58 @@ fused_fn_t<IT, BS> select_fused_kernel(int nb) {
 // Public C++ API
 // ============================================================================
 
+#if defined(OMNI_XPU_ARCH_PTL_H)
+torch::Tensor rms_norm_gate_residual(
+    torch::Tensor weight,
+    torch::Tensor input,
+    torch::Tensor gate,
+    torch::Tensor residual,
+    double eps
+) {
+    using Config = RmsNormGateResidualH3840PTLConfig;
+    TORCH_CHECK(
+        input.is_xpu() && weight.is_xpu() && gate.is_xpu() && residual.is_xpu(),
+        "weight, input, gate, and residual must be XPU tensors");
+    TORCH_CHECK(
+        input.device() == weight.device() && input.device() == gate.device() &&
+            input.device() == residual.device(),
+        "weight, input, gate, and residual must be on the same device");
+    TORCH_CHECK(
+        input.dim() == 2 && input.size(1) == Config::HiddenSize,
+        "input must have shape [M, 3840]");
+    TORCH_CHECK(
+        input.size(0) == 64 || input.size(0) == 1024 || input.size(0) == 1088,
+        "M must be one of the validated Z-Image lengths: 64, 1024, or 1088");
+    TORCH_CHECK(
+        weight.dim() == 1 && weight.size(0) == Config::HiddenSize &&
+            gate.dim() == 1 && gate.size(0) == Config::HiddenSize,
+        "weight and gate must have shape [3840]");
+    TORCH_CHECK(
+        residual.sizes() == input.sizes(),
+        "residual must have the same shape as input");
+    TORCH_CHECK(
+        input.scalar_type() == ST::BFloat16 &&
+            weight.scalar_type() == ST::BFloat16 &&
+            gate.scalar_type() == ST::BFloat16 &&
+            residual.scalar_type() == ST::BFloat16,
+        "weight, input, gate, and residual must be BF16 tensors");
+    TORCH_CHECK(
+        input.is_contiguous() && weight.is_contiguous() &&
+            gate.is_contiguous() && residual.is_contiguous(),
+        "weight, input, gate, and residual must be contiguous");
+
+    auto output = torch::empty_like(input);
+    rms_norm_gate_residual_h3840_ptl_kernel(
+        reinterpret_cast<const bf16*>(weight.data_ptr()),
+        reinterpret_cast<const bf16*>(input.data_ptr()),
+        reinterpret_cast<const bf16*>(gate.data_ptr()),
+        reinterpret_cast<const bf16*>(residual.data_ptr()),
+        reinterpret_cast<bf16*>(output.data_ptr()),
+        static_cast<float>(eps), input.size(0), input.device());
+    return output;
+}
+#endif
+
 torch::Tensor rms_norm(
     torch::Tensor weight,
     torch::Tensor input,
@@ -369,8 +888,58 @@ torch::Tensor rms_norm(
     int64_t input_size = input.size(0);
     int64_t hidden_size = input.size(1);
 
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
+    const bool supported_hidden_size =
+        hidden_size % 32 == 0 ||
+        (hidden_size == RmsNormH120FP16Config::HiddenSize &&
+         input.scalar_type() == ST::Half);
+#else
+    const bool supported_hidden_size = hidden_size % 32 == 0;
+#endif
+    TORCH_CHECK(
+        hidden_size > 0 && hidden_size <= 8192 && supported_hidden_size,
+        "hidden_size must be nonzero, <=8192, and divisible by 32"
+        " (PTL-H and BMG additionally support FP16 hidden_size=120)");
+
     auto output = torch::empty({input_size, hidden_size},
         torch::device(input.device()).dtype(input.dtype()));
+
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
+    if (hidden_size == RmsNormH120FP16Config::HiddenSize &&
+        input.scalar_type() == ST::Half) {
+        rms_norm_h120_fp16_kernel(
+            weight.data_ptr(), input.data_ptr(), output.data_ptr(),
+            static_cast<float>(eps), input_size, input.device());
+        return output;
+    }
+#endif
+#if defined(OMNI_XPU_ARCH_PTL_H)
+    if (hidden_size == RmsNormH128PTLConfig::HiddenSize &&
+        input_size >= RmsNormH128PTLConfig::MinimumRows) {
+        if (input.scalar_type() == ST::BFloat16) {
+            rms_norm_h128_ptl_kernel(
+                weight.data_ptr(), input.data_ptr(), output.data_ptr(),
+                static_cast<float>(eps), input_size, input.device());
+            return output;
+        }
+        if (input.scalar_type() == ST::Float) {
+            rms_norm_h128_fp32_ptl_kernel(
+                weight.data_ptr(), input.data_ptr(), output.data_ptr(),
+                static_cast<float>(eps), input_size, input.device());
+            return output;
+        }
+    }
+#elif defined(OMNI_XPU_ARCH_BMG)
+    if (hidden_size == RmsNormH128BMGConfig::HiddenSize &&
+        input_size >= RmsNormH128BMGConfig::MinimumRows) {
+        if (input.scalar_type() == ST::Float) {
+            rms_norm_h128_fp32_bmg_kernel(
+                weight.data_ptr(), input.data_ptr(), output.data_ptr(),
+                static_cast<float>(eps), input_size, input.device());
+            return output;
+        }
+    }
+#endif
 
     // Select BS and GS based on hidden_size
     // Prefer BS=32; for hidden_size >= 2048 also divisible by 64, use BS=64

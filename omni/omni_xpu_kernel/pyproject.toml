@@ -1,10 +1,13 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "cmake>=3.18", "torch>=2.0"]
+requires = [
+    "setuptools>=45",
+    "wheel",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "omni_xpu_kernel"
-dynamic = ["version"]
+dynamic = ["version", "dependencies"]
 description = "High-performance Intel XPU kernels for PyTorch"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -24,18 +27,11 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Operating System :: Microsoft :: Windows",
 ]
-dependencies = [
-    "torch>=2.0",
-]
-
 [project.optional-dependencies]
 dev = [
     "pytest",
     "numpy",
 ]
 
-[tool.setuptools.dynamic]
-version = {attr = "omni_xpu_kernel._version.__version__"}
-
 [tool.setuptools.packages.find]
-exclude = ["tests*", "scripts*"]
+exclude = ["tests*", "scripts*", "benchmarks*"]

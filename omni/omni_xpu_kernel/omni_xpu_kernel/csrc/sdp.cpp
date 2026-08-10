@@ -22,6 +22,12 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #else
 #include <dlfcn.h>
@@ -91,15 +97,42 @@ KernelLibrary& get_kernel_library() {
 
         path_buffer.resize(path_length);
         package_dir = fs::path(path_buffer).parent_path();
-        fs::path library_path = package_dir / "lgrf_uni" / "lgrf_sdp.pyd";
+        fs::path library_dir = package_dir / "lgrf_uni";
+        if (!fs::exists(library_dir)) {
+            load_error = "missing lgrf sidecar directory: " + library_dir.string();
+            return;
+        }
+
+        fs::path library_path;
+        for (const auto& entry : fs::directory_iterator(library_dir)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+
+            const auto name = entry.path().filename().string();
+            if (name.rfind("lgrf_sdp", 0) == 0 && entry.path().extension() == ".pyd") {
+                library_path = entry.path();
+                break;
+            }
+        }
+
+        if (library_path.empty() || !fs::exists(library_path)) {
+            load_error = "missing lgrf sidecar artifact under " + library_dir.string();
+            return;
+        }
+
         library.handle = LoadLibraryW(library_path.wstring().c_str());
         if (library.handle == nullptr) {
-            load_error = "failed to load lgrf sidecar at " + library_path.string();
+            load_error = "failed to load lgrf sidecar at " + library_path.string() +
+                         " (WinError " + std::to_string(GetLastError()) + ")";
             return;
         }
 
         library.fp16 = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_fp16"));
         library.bf16io = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_bf16io"));
+        library.fp16_fast = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_fp16_fast"));
+        library.fp16_hd64 = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_fp16_hd64"));
+        library.bf16io_hd64 = reinterpret_cast<sdp_kernel_fn>(GetProcAddress(library.handle, "sdp_bf16io_hd64"));
 #else
         Dl_info current_module_info;
         if (dladdr(reinterpret_cast<void*>(&get_kernel_library), &current_module_info) == 0 || current_module_info.dli_fname == nullptr) {

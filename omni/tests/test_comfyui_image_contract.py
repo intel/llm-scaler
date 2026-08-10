@@ -1,0 +1,308 @@
+import importlib.util
+import re
+import sys
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+OMNI_ROOT = Path(__file__).resolve().parents[1]
+ROOT_README = OMNI_ROOT.parent / "README.md"
+DOCKERFILE = OMNI_ROOT / "docker" / "Dockerfile"
+FULL_DOCKERFILE = OMNI_ROOT / "docker" / "Dockerfile.full"
+DOCKERIGNORE = OMNI_ROOT / ".dockerignore"
+BUILD_SCRIPT = OMNI_ROOT / "build.sh"
+VALIDATOR = OMNI_ROOT / "tools" / "validate_comfyui_image.py"
+DEMO_ASSETS = {
+    "demo_qwen_image.gif",
+    "demo_wan2.2_14b_i2v_multi_xpu.gif",
+}
+
+COMPONENT_PINS = {
+    "COMFYUI_REPOSITORY": (
+        "COMFYUI_REPOSITORY",
+        "https://github.com/Comfy-Org/ComfyUI.git",
+    ),
+    "COMFYUI_COMMIT": (
+        "COMFYUI_COMMIT",
+        "43cb4fffc89bba20ab7bd61467a36d0339338dab",
+    ),
+    "COMFYUI_VERSION": ("COMFYUI_VERSION", "0.31.0"),
+    "COMFYUI_FRONTEND_VERSION": (
+        "COMFYUI_FRONTEND_VERSION",
+        "1.48.7",
+    ),
+    "COMFYUI_WORKFLOW_TEMPLATES_VERSION": (
+        "COMFYUI_WORKFLOW_TEMPLATES_VERSION",
+        "0.11.34",
+    ),
+    "COMFYUI_MANAGER_VERSION": ("COMFYUI_MANAGER_VERSION", "4.2.2"),
+    "COMFY_KITCHEN_REPOSITORY": (
+        "KITCHEN_REPOSITORY",
+        "https://github.com/xiangyuT/comfy-kitchen-xpu.git",
+    ),
+    "COMFY_KITCHEN_COMMIT": (
+        "KITCHEN_COMMIT",
+        "575741da0edd9a6e34cbf7f0b29b20b9f4df9e34",
+    ),
+    "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.28"),
+    "COMFY_AIMDO_REPOSITORY": (
+        "AIMDO_REPOSITORY",
+        "https://github.com/xiangyuT/comfy-aimdo-xpu.git",
+    ),
+    "COMFY_AIMDO_COMMIT": (
+        "AIMDO_COMMIT",
+        "c7baf6240e5ed37fe01ee30330befade7d23497f",
+    ),
+    "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.4.13"),
+    "COMFY_GGUF_REPOSITORY": (
+        "GGUF_REPOSITORY",
+        "https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git",
+    ),
+    "COMFY_GGUF_COMMIT": (
+        "GGUF_COMMIT",
+        "39671fe73117ba97de7011e7e06e32599dcda06d",
+    ),
+    "COMFY_NUNCHAKU_REPOSITORY": (
+        "NUNCHAKU_REPOSITORY",
+        "https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git",
+    ),
+    "COMFY_NUNCHAKU_COMMIT": (
+        "NUNCHAKU_COMMIT",
+        "cc0f6236b6c329178ad4ef58452a874e774c7b8e",
+    ),
+    "COMFY_NUNCHAKU_VERSION": ("NUNCHAKU_VERSION", "1.2.1+xpu.3"),
+}
+
+
+def load_validator():
+    spec = importlib.util.spec_from_file_location(
+        "validate_comfyui_image_under_test",
+        VALIDATOR,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class ComfyUIImageContractTest(unittest.TestCase):
+    def test_root_readme_omni_links_resolve_to_current_docs_and_assets(self):
+        readme = ROOT_README.read_text(encoding="utf-8")
+
+        for name in DEMO_ASSETS:
+            with self.subTest(asset=name):
+                path = OMNI_ROOT / "assets" / name
+                self.assertTrue(path.is_file())
+                self.assertGreater(path.stat().st_size, 0)
+                self.assertIn(f"./omni/assets/{name}", readme)
+        self.assertIn(
+            "omni/README.md#getting-started-with-the-omni-docker-image",
+            readme,
+        )
+        self.assertIn("omni/docs/COMFYUI.md", readme)
+        self.assertIn(
+            "https://github.com/intel/llm-scaler/blob/"
+            "omni-0.1.0-b8/omni/README.md#xinference",
+            readme,
+        )
+        self.assertNotIn("omni/README.md/#comfyui", readme)
+        self.assertNotIn("omni/README.md/#xinference", readme)
+
+    def test_build_context_keeps_repository_workflow_and_input_directories(self):
+        ignored = {
+            line.strip()
+            for line in DOCKERIGNORE.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+
+        self.assertNotIn("workflows/", ignored)
+        self.assertNotIn("example_inputs/", ignored)
+
+    def test_build_proxy_default_has_no_organization_domains(self):
+        build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
+        full_dockerfile = FULL_DOCKERFILE.read_text(encoding="utf-8")
+
+        self.assertIn(
+            'NO_PROXY="${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,::1}}"',
+            build_script,
+        )
+        self.assertNotIn("intel.com", build_script)
+        self.assertEqual(
+            re.findall(
+                r"^ARG no_proxy=(.+)$",
+                full_dockerfile,
+                flags=re.MULTILINE,
+            ),
+            ["localhost,127.0.0.1,::1"] * 2,
+        )
+
+    def test_component_defaults_match_dockerfile_and_build_entrypoint(self):
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+        build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
+
+        for docker_argument, (shell_variable, expected) in COMPONENT_PINS.items():
+            with self.subTest(argument=docker_argument):
+                docker_match = re.search(
+                    rf"^ARG {re.escape(docker_argument)}=(.+)$",
+                    dockerfile,
+                    flags=re.MULTILINE,
+                )
+                build_match = re.search(
+                    (
+                        rf"^{re.escape(shell_variable)}="
+                        rf'"\$\{{{re.escape(docker_argument)}:-([^}}]+)\}}"$'
+                    ),
+                    build_script,
+                    flags=re.MULTILINE,
+                )
+                self.assertIsNotNone(docker_match)
+                self.assertIsNotNone(build_match)
+                self.assertEqual(docker_match.group(1), expected)
+                self.assertEqual(build_match.group(1), expected)
+                self.assertIn(
+                    f'--build-arg "{docker_argument}=${{{shell_variable}}}"',
+                    build_script,
+                )
+
+    def test_quantized_integrations_install_and_validate_dependencies(self):
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+        validator = load_validator()
+
+        self.assertIn(
+            "pip install -r ComfyUI-GGUF-XPU/requirements.txt",
+            dockerfile,
+        )
+        self.assertIn(
+            "pip install -r ComfyUI-nunchaku-XPU/requirements.txt",
+            dockerfile,
+        )
+        self.assertIn(
+            "pip install --no-deps --no-build-isolation "
+            "./ComfyUI-nunchaku-XPU",
+            dockerfile,
+        )
+        self.assertEqual(
+            validator.GGUF_DEPENDENCIES,
+            {
+                "gguf": "gguf",
+                "sentencepiece": "sentencepiece",
+                "protobuf": "google.protobuf",
+            },
+        )
+        self.assertEqual(
+            set(validator.PINNED_CHECKOUTS),
+            {
+                "ComfyUI",
+                "Kitchen",
+                "Comfy AIMDO",
+                "GGUF custom node",
+                "combined Nunchaku custom node/runtime",
+            },
+        )
+        self.assertIn(
+            "dequantize_gguf",
+            validator.REQUIRED_KITCHEN_CAPABILITIES,
+        )
+
+    def test_aimdo_xpu_is_built_from_an_exact_remote_commit(self):
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+        validator = load_validator()
+
+        self.assertIn("FROM python-base AS aimdo-wheel", dockerfile)
+        self.assertIn(
+            '"${COMFY_AIMDO_REPOSITORY}" comfy-aimdo-xpu',
+            dockerfile,
+        )
+        self.assertIn(
+            "git -C comfy-aimdo-xpu fetch --depth 1 origin",
+            dockerfile,
+        )
+        self.assertIn("pip install setuptools-scm==10.2.1", dockerfile)
+        self.assertIn("./scripts/build-linux-xpu.sh", dockerfile)
+        self.assertIn(
+            'SETUPTOOLS_SCM_PRETEND_VERSION="${COMFY_AIMDO_VERSION}"',
+            dockerfile,
+        )
+        self.assertIn(
+            "/wheels/comfy_aimdo-${COMFY_AIMDO_VERSION}-*.whl",
+            dockerfile,
+        )
+        self.assertEqual(
+            validator.PINNED_CHECKOUTS["Comfy AIMDO"],
+            (
+                Path("/llm/comfy-aimdo-xpu"),
+                "OMNI_COMFY_AIMDO_REVISION",
+            ),
+        )
+
+    def test_comfyui_dependencies_are_pinned_and_validated(self):
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+        validator = load_validator()
+        self.assertEqual(
+            validator.PINNED_MINIMAX_H3_TEMPLATE_HASHES[
+                "video_minimax_h3_t2v.json"
+            ],
+            "31ab33fdb053a7834cc866bd7aa08b887518fc656e4a796c89779c6b5e1786e6",
+        )
+
+        self.assertIn(
+            '"comfyui-manager==${COMFYUI_MANAGER_VERSION}"',
+            dockerfile,
+        )
+        self.assertIn(
+            "comfyui-workflow-templates|comfy-kitchen|comfy-aimdo",
+            dockerfile,
+        )
+        self.assertNotIn(
+            "https://github.com/ltdrdata/ComfyUI-Manager.git",
+            dockerfile,
+        )
+        self.assertEqual(
+            validator.COMFYUI_PACKAGE_ENVIRONMENT,
+            {
+                "comfyui-frontend-package": "OMNI_COMFYUI_FRONTEND_VERSION",
+                "comfyui-workflow-templates": (
+                    "OMNI_COMFYUI_WORKFLOW_TEMPLATES_VERSION"
+                ),
+                "comfyui-manager": "OMNI_COMFYUI_MANAGER_VERSION",
+            },
+        )
+        self.assertEqual(len(validator.REQUIRED_MINIMAX_H3_TEMPLATES), 6)
+        self.assertIn(
+            "/llm/manifests/comfyui-python-freeze.txt",
+            dockerfile,
+        )
+        self.assertIn("mkdir -p /llm/ComfyUI/user", dockerfile)
+        self.assertEqual(
+            validator.COMFYUI_DATABASE_DIRECTORY,
+            Path("/llm/ComfyUI/user"),
+        )
+
+    def test_validator_adds_comfyui_root_before_manager_import(self):
+        validator = load_validator()
+
+        with mock.patch.object(sys, "path", ["sentinel"]):
+            validator.add_comfyui_to_import_path()
+            validator.add_comfyui_to_import_path()
+
+            self.assertEqual(sys.path[0], "/llm/ComfyUI")
+            self.assertEqual(sys.path.count("/llm/ComfyUI"), 1)
+
+    def test_validator_rejects_noncanonical_component_revisions(self):
+        validator = load_validator()
+
+        for revision in ("", "39671fe", "g" * 40, "0" * 39, "A" * 40):
+            with self.subTest(revision=revision):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "full 40-character Git commit",
+                ):
+                    validator.require_full_revision(
+                        "component revision",
+                        revision,
+                    )
+
+
+if __name__ == "__main__":
+    unittest.main()

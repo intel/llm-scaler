@@ -144,7 +144,7 @@ Please follow the instructions in the [Getting Started](vllm/README.md/#1-gettin
 `llm-scaler-omni` supports running image/voice/video generation etc., featuring `Omni Studio` mode (using ComfyUI) and `Omni Serving` mode (via SGLang Diffusion or Xinference).  
 
 
-Please follow the instructions in the [Getting Started](omni/README.md/#getting-started-with-omni-docker-image) to use `llm-scaler-omni`. 
+Please follow the instructions in the [Getting Started](omni/README.md#getting-started-with-the-omni-docker-image) to use `llm-scaler-omni`.
 
 
 ### Omni Demos
@@ -175,7 +175,7 @@ Please follow the instructions in the [Getting Started](omni/README.md/#getting-
 | **Video Upscaling** | SeedVR2 | Video Restoration and Upscaling | 
 
 
-Please check [ComfyUI Support](omni/README.md/#comfyui) for more details.
+Please check [ComfyUI Support](omni/docs/COMFYUI.md) for more details.
 
 ### Omni Serving (OpenAI-API compatible serving)
 
@@ -185,7 +185,7 @@ Please check [ComfyUI Support](omni/README.md/#comfyui) for more details.
 - Text to Speech (`/v1/audio/speech`): Kokoro 82M
 - Speech to Text (`/v1/audio/transcriptions`): whisper-large-v3
 
-Please check [Xinference Support](omni/README.md/#xinference) for more details. 
+Please check the [b8 Xinference documentation](https://github.com/intel/llm-scaler/blob/omni-0.1.0-b8/omni/README.md#xinference) for more details.
 
 ---
 ## Releases

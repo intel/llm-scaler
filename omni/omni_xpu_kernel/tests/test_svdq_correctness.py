@@ -79,15 +79,18 @@ class TestUnpackInt4:
         (1, 1920),   # nunchaku activation shape
         (3840, 1920), # nunchaku weight shape
         (16, 64),    # small
+        (7, 1919),   # unaligned row and tail
+        (7, 1921),   # unaligned row plus a second work-item
     ])
-    def test_unpack_matches_reference(self, xpu_device, shape):
+    @pytest.mark.parametrize("signed", [False, True])
+    def test_unpack_matches_reference(self, xpu_device, shape, signed):
         M, K_half = shape
         packed = torch.randint(0, 256, (M, K_half), dtype=torch.uint8, device=xpu_device)
 
         from omni_xpu_kernel import svdq
-        result = svdq.unpack_int4(packed, signed=True)
+        result = svdq.unpack_int4(packed, signed=signed)
 
-        ref = ref_unpack_int4(packed.cpu(), signed=True)
+        ref = ref_unpack_int4(packed.cpu(), signed=signed)
         assert result.shape == ref.shape, f"Shape mismatch: {result.shape} vs {ref.shape}"
         assert torch.equal(result.cpu().to(torch.int16), ref.to(torch.int16)), \
             f"Max diff: {(result.cpu().to(torch.int16) - ref.to(torch.int16)).abs().max()}"

@@ -14,9 +14,9 @@
 // only pay the creation cost once.
 // ============================================================================
 
+#include "oneapi/dnnl/dnnl.hpp"
+#include "oneapi/dnnl/dnnl_sycl.hpp"
 #include <torch/extension.h>
-#include <oneapi/dnnl/dnnl.hpp>
-#include <oneapi/dnnl/dnnl_sycl.hpp>
 
 #include <cstdio>
 #include <map>

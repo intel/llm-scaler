@@ -10,6 +10,15 @@ namespace int8_ops {
 std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise(
     torch::Tensor x,
     int64_t stochastic_rounding);
+std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(
+    torch::Tensor x);
+torch::Tensor dequantize_int8_convrot_fused(
+    torch::Tensor input,
+    torch::Tensor scale,
+    int64_t group_size);
+std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_fused(
+    torch::Tensor input,
+    int64_t group_size);
 
 namespace {
 
@@ -88,7 +97,21 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_weight(
     int64_t group_size,
     int64_t stochastic_rounding) {
     TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
+#if defined(OMNI_XPU_ARCH_PTL_H)
+    if (stochastic_rounding <= 0 && weight.numel() > 0 &&
+        (weight.scalar_type() == torch::kBFloat16 ||
+         weight.scalar_type() == torch::kHalf) &&
+        (group_size == 64 || group_size == 256) &&
+        weight.size(1) % group_size == 0) {
+        return quantize_int8_convrot_fused(weight, group_size);
+    }
+#endif
     auto rotated = rotate_convrot(weight, group_size);
+    if (stochastic_rounding <= 0 &&
+        (rotated.scalar_type() == torch::kBFloat16 ||
+         rotated.scalar_type() == torch::kHalf)) {
+        return quantize_int8_rowwise_fused(rotated);
+    }
     return quantize_int8_rowwise(rotated, stochastic_rounding);
 }
 
@@ -98,7 +121,14 @@ torch::Tensor dequantize_int8_convrot_weight(
     int64_t group_size) {
     TORCH_CHECK(q.device().is_xpu(), "q must be on XPU");
     TORCH_CHECK(q.scalar_type() == torch::kInt8, "q must be int8");
-    auto dequantized = q.to(torch::kFloat32) * scale.to(q.device()).to(torch::kFloat32);
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
+    if (q.dim() == 2 && (group_size == 64 || group_size == 256) &&
+        q.size(1) % group_size == 0 && scale.numel() == q.size(0)) {
+        return dequantize_int8_convrot_fused(q, scale, group_size);
+    }
+#endif
+    auto dequantized =
+        q.to(torch::kFloat32) * scale.to(q.device()).to(torch::kFloat32);
     return rotate_convrot(dequantized, group_size);
 }
 

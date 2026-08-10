@@ -63,7 +63,7 @@ def probe():
     available = [k for k, v in modules.items() if v]
     missing = [k for k, v in modules.items() if not v]
 
-    log.info("[OmniXPU] omni_xpu_kernel %s — available: %s%s",
+    log.info("[OmniXPU] omni_xpu_kernel %s - available: %s%s",
              version, ", ".join(available) if available else "none",
              f" | missing: {', '.join(missing)}" if missing else "")
 

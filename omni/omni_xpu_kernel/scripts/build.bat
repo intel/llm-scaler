@@ -17,6 +17,13 @@ setlocal enabledelayedexpansion
 set "SCRIPT_DIR=%~dp0"
 set "PROJECT_DIR=%SCRIPT_DIR%.."
 
+if "%OMNI_XPU_DEVICE%"=="" set "OMNI_XPU_DEVICE=bmg"
+if "%OMNI_XPU_REQUIRE_CUTE%"=="" set "OMNI_XPU_REQUIRE_CUTE=0"
+if /I not "%OMNI_XPU_DEVICE%"=="bmg" if /I not "%OMNI_XPU_DEVICE%"=="ptl-h" (
+    echo ERROR: Unsupported OMNI_XPU_DEVICE "%OMNI_XPU_DEVICE%". Use bmg or ptl-h.
+    exit /b 1
+)
+
 cd /d "%PROJECT_DIR%"
 
 REM Parse arguments
@@ -86,14 +93,16 @@ if "%CLEAN%"=="1" (
 REM Build and install
 echo.
 echo Building omni_xpu_kernel...
+echo Intel GPU AOT target: %OMNI_XPU_DEVICE%
+echo CUTE required: %OMNI_XPU_REQUIRE_CUTE%
 echo.
 
 if "%DEV_MODE%"=="1" (
     echo Installing in development mode...
-    pip install -e . --no-build-isolation
+    python -m pip install -e . --no-build-isolation
 ) else (
     echo Installing...
-    pip install . --no-build-isolation
+    python -m pip install . --no-build-isolation
 )
 
 if errorlevel 1 (
