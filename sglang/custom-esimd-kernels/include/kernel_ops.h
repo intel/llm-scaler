@@ -232,6 +232,17 @@ at::Tensor esimd_gemv_q8_0(
     at::Tensor output);
 
 // M-tiled q8_0 dense GEMV (small M, MTP verify): input [M,K], output [M,N].
+void esimd_norm_gemv_q8_0(
+    at::Tensor x, at::Tensor z, at::Tensor nw, at::Tensor y,
+    at::Tensor w0, at::Tensor s0, at::Tensor o0,
+    int64_t HV, int64_t V, double eps);
+
+void esimd_resadd_norm_gemv_q8_ba(
+    at::Tensor h, at::Tensor residual, at::Tensor nw, double eps,
+    at::Tensor xn, at::Tensor nr,
+    at::Tensor w0, at::Tensor s0, at::Tensor o0,
+    at::Tensor w1, at::Tensor o1);
+
 at::Tensor esimd_gemv_q8_0_m(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output);
@@ -276,6 +287,36 @@ at::Tensor esimd_moe_down_q6k(
     at::Tensor inter, at::Tensor ql, at::Tensor qh, at::Tensor sc,
     at::Tensor sel, at::Tensor topk_w, at::Tensor out_partial,
     int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k);
+
+// Fused GGUF Q8_0 shared-expert MLP (gate_up + silu + down + gate*sigmoid).
+at::Tensor esimd_shared_expert_q8(
+    at::Tensor x, at::Tensor gu_qs, at::Tensor gu_sc,
+    at::Tensor d_qs, at::Tensor d_sc, at::Tensor wg, int64_t inter_s);
+
+// Fused GGUF FULL MoE (decode): topk + routed + shared -> one op.
+at::Tensor esimd_moe_forward_full_gguf(
+    at::Tensor x, at::Tensor logits,
+    at::Tensor gate_ql, at::Tensor gate_sc, at::Tensor gate_mn,
+    at::Tensor up_ql, at::Tensor up_sc, at::Tensor up_mn,
+    at::Tensor down_ql, at::Tensor down_qh, at::Tensor down_sc, at::Tensor down_mn,
+    at::Tensor gu_qs, at::Tensor gu_sc, at::Tensor d_qs, at::Tensor d_sc,
+    at::Tensor wg,
+    int64_t n_experts, int64_t top_k, int64_t intermediate, int64_t inter_s,
+    bool down_is_q6, bool renorm);
+
+// Norm-fused variant: absorbs the post-attention GemmaRMSNorm (residual add +
+// RMS norm, `norm_w` = 1 + gemma weight) and the fp16 router GEMV into the MoE
+// op. `residual` is updated in place; returns {moe_out, residual}.
+std::vector<at::Tensor> esimd_moe_forward_full_gguf_norm(
+    at::Tensor h, at::Tensor residual, at::Tensor norm_w, double eps,
+    at::Tensor router_w,
+    at::Tensor gate_ql, at::Tensor gate_sc, at::Tensor gate_mn,
+    at::Tensor up_ql, at::Tensor up_sc, at::Tensor up_mn,
+    at::Tensor down_ql, at::Tensor down_qh, at::Tensor down_sc, at::Tensor down_mn,
+    at::Tensor gu_qs, at::Tensor gu_sc, at::Tensor d_qs, at::Tensor d_sc,
+    at::Tensor wg,
+    int64_t n_experts, int64_t top_k, int64_t intermediate, int64_t inter_s,
+    bool down_is_q6, bool renorm);
 
 // GGUF q4_0 GEMM (prefill / M>=2) via DPAS. Same interleaved weight layout.
 at::Tensor esimd_gemm_q4_0(

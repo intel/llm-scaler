@@ -308,6 +308,9 @@ at::Tensor esimd_gemv_q6_k_m(
 }
 
 #include "esimd_kernels/moe_kquant_GEMV.h"
+#include "esimd_kernels/moe_shared_q8_GEMV.h"
+#include "esimd_kernels/moe_up_fused.h"
+#include "esimd_kernels/moe_norm_router.h"
 
 // Fused GGUF k-quant MoE up/gate stage (Q4_K gate + Q4_K up -> silu*up).
 // gate_ql/up_ql [E,inter,hidden/2] u8; gate_sc/mn,up_sc/mn [E,inter,hidden/32]
@@ -373,6 +376,224 @@ at::Tensor esimd_moe_down_q6k(
     return out_partial;
 }
 
+// Fused GGUF Q8_0 SHARED-expert MLP (decode): one op = one python dispatch.
+//   g[t]       = sigmoid(dot(x[t], wg))
+//   inter[t,c] = silu(<x[t],W_gate[c]>) * <x[t],W_up[c]>   (Q8_0 gate/up merged)
+//   out[t,n]   = g[t] * sum_c inter[t,c]*W_down[n,c]        (Q8_0 down)
+// gu_qs [2*inter_s, hidden] int8 (rows gate then up); gu_sc [2*inter_s, hidden/32]
+// fp16; d_qs [hidden, inter_s] int8; d_sc [hidden, inter_s/32] fp16;
+// wg [hidden] fp16 (shared_expert_gate weight row 0). x/out [M, hidden] fp16.
+at::Tensor esimd_shared_expert_q8(
+    at::Tensor x, at::Tensor gu_qs, at::Tensor gu_sc,
+    at::Tensor d_qs, at::Tensor d_sc, at::Tensor wg, int64_t inter_s) {
+    int64_t M = x.size(0);
+    int64_t hidden = x.size(1);
+    auto out   = at::empty({M, hidden}, x.options());
+    auto inter = at::empty({M, inter_s}, x.options());
+    auto g     = at::empty({M}, x.options());
+    auto p_x  = reinterpret_cast<const fp16*>(x.data_ptr());
+    auto p_gq = reinterpret_cast<const int8_t*>(gu_qs.data_ptr());
+    auto p_gs = reinterpret_cast<const fp16*>(gu_sc.data_ptr());
+    auto p_dq = reinterpret_cast<const int8_t*>(d_qs.data_ptr());
+    auto p_ds = reinterpret_cast<const fp16*>(d_sc.data_ptr());
+    auto p_wg = reinterpret_cast<const fp16*>(wg.data_ptr());
+    auto p_g  = reinterpret_cast<fp16*>(g.data_ptr());
+    auto p_in = reinterpret_cast<fp16*>(inter.data_ptr());
+    auto p_o  = reinterpret_cast<fp16*>(out.data_ptr());
+    auto& dpcpp_queue = get_device_queue(x);
+    moe_shared_up_q8_host(p_x, p_gq, p_gs, p_wg, p_in, p_g,
+                          (int)M, (int)hidden, (int)inter_s, dpcpp_queue);
+    moe_shared_down_q8_host(p_in, p_dq, p_ds, p_g, p_o,
+                            (int)M, (int)hidden, (int)inter_s, dpcpp_queue);
+    return out;
+}
+
+// Fused GGUF FULL MoE (decode): router topk + routed experts + shared expert
+// -> ONE op = ONE python dispatch. Router GEMV stays in python (logits input).
+// Chain: topk -> routed up (Q4_K) -> shared gate/up (Q8_0) -> routed down
+// (Q5_K or Q6_K) -> finalize (routed combine + shared down + gate*sigmoid).
+//   Routed: gate_ql/up_ql [E,inter,hidden/2] u8; *_sc/*_mn [E,inter,hidden/32];
+//           down_ql [E,hidden,inter/2] u8; down_qh [E,hidden,inter/32] u8;
+//           down_sc/down_mn [E,hidden,inter/32] fp16 (q6k: down_mn unused).
+//   Shared: gu_qs [2*inter_s,hidden] i8; gu_sc [2*inter_s,hidden/32] fp16;
+//           d_qs [hidden,inter_s] i8; d_sc [hidden,inter_s/32] fp16; wg [hidden].
+// Shared body of the GGUF decode MoE op. `p_x` is the (already normalised)
+// activation and `p_log` the router logits; the norm-fused entry point below
+// produces both on device instead of taking them from python.
+
+// Pooled decode scratch for the GGUF MoE op (see the comment in the body).
+// One rank == one process == one device, and decode is single-threaded, so a
+// single function-local instance is enough; a shape/dtype/device change simply
+// reallocates.
+struct GgufMoeWs {
+    int64_t M = -1, hidden = -1, n_routed = -1, intermediate = -1, inter_s = -1;
+    at::ScalarType dtype = at::ScalarType::Undefined;
+    c10::DeviceIndex dev = -1;
+    at::Tensor sel, tw, inter_r, inter_sh, g, out_part;
+    at::Tensor xn, logits;  // norm-fused variant only
+};
+
+static GgufMoeWs& gguf_moe_ws() {
+    static GgufMoeWs ws;
+    return ws;
+}
+
+static at::Tensor gguf_moe_full_body(
+    const at::Tensor& x, const fp16* p_x, const fp16* p_log,
+    at::Tensor gate_ql, at::Tensor gate_sc, at::Tensor gate_mn,
+    at::Tensor up_ql, at::Tensor up_sc, at::Tensor up_mn,
+    at::Tensor down_ql, at::Tensor down_qh, at::Tensor down_sc, at::Tensor down_mn,
+    at::Tensor gu_qs, at::Tensor gu_sc, at::Tensor d_qs, at::Tensor d_sc,
+    at::Tensor wg,
+    int64_t n_experts, int64_t top_k, int64_t intermediate, int64_t inter_s,
+    bool down_is_q6, bool renorm) {
+    int64_t M = x.size(0);
+    int64_t hidden = x.size(1);
+    int64_t n_routed = M * top_k;
+    // Scratch is pooled across calls. At decode every one of the 40 MoE layers
+    // asks for the identical shapes, and 6 at::empty per call x 40 layers was
+    // ~0.5ms of pure allocator dispatch per step on this host-bound path.
+    // Safe because all six kernels below go on the SAME in-order queue, so
+    // layer i+1's first kernel cannot start before layer i's last one retired
+    // (the existing code already relies on that ordering between its own
+    // kernels). `out` is NOT pooled: it escapes to python (all-reduce, residual
+    // add) and must stay live past this call.
+    auto& ws = gguf_moe_ws();
+    if (ws.M != M || ws.hidden != hidden || ws.n_routed != n_routed ||
+        ws.intermediate != intermediate || ws.inter_s != inter_s ||
+        ws.dtype != x.scalar_type() || ws.dev != x.device().index()) {
+        auto i32opt = x.options().dtype(at::kInt);
+        ws.sel      = at::empty({n_routed}, i32opt);
+        ws.tw       = at::empty({n_routed}, x.options());
+        ws.inter_r  = at::empty({n_routed, intermediate}, x.options());
+        ws.inter_sh = at::empty({M, inter_s}, x.options());
+        ws.g        = at::empty({M}, x.options());
+        ws.out_part = at::empty({n_routed, hidden}, x.options());
+        ws.M = M; ws.hidden = hidden; ws.n_routed = n_routed;
+        ws.intermediate = intermediate; ws.inter_s = inter_s;
+        ws.dtype = x.scalar_type(); ws.dev = x.device().index();
+    }
+    auto out = at::empty({M, hidden}, x.options());
+
+    auto p_sel = reinterpret_cast<int*>(ws.sel.data_ptr());
+    auto p_tw  = reinterpret_cast<fp16*>(ws.tw.data_ptr());
+    auto p_ir  = reinterpret_cast<fp16*>(ws.inter_r.data_ptr());
+    auto p_ish = reinterpret_cast<fp16*>(ws.inter_sh.data_ptr());
+    auto p_g   = reinterpret_cast<fp16*>(ws.g.data_ptr());
+    auto p_op  = reinterpret_cast<fp16*>(ws.out_part.data_ptr());
+    auto p_o   = reinterpret_cast<fp16*>(out.data_ptr());
+    // routed reps
+    auto p_gq = reinterpret_cast<const uint8_t*>(gate_ql.data_ptr());
+    auto p_gs = reinterpret_cast<const fp16*>(gate_sc.data_ptr());
+    auto p_gm = reinterpret_cast<const fp16*>(gate_mn.data_ptr());
+    auto p_uq = reinterpret_cast<const uint8_t*>(up_ql.data_ptr());
+    auto p_us = reinterpret_cast<const fp16*>(up_sc.data_ptr());
+    auto p_um = reinterpret_cast<const fp16*>(up_mn.data_ptr());
+    auto p_dql = reinterpret_cast<const uint8_t*>(down_ql.data_ptr());
+    auto p_dqh = reinterpret_cast<const uint8_t*>(down_qh.data_ptr());
+    auto p_dsc = reinterpret_cast<const fp16*>(down_sc.data_ptr());
+    auto p_dmn = reinterpret_cast<const fp16*>(down_mn.data_ptr());
+    // shared reps
+    auto p_guq = reinterpret_cast<const int8_t*>(gu_qs.data_ptr());
+    auto p_gus = reinterpret_cast<const fp16*>(gu_sc.data_ptr());
+    auto p_ddq = reinterpret_cast<const int8_t*>(d_qs.data_ptr());
+    auto p_dds = reinterpret_cast<const fp16*>(d_sc.data_ptr());
+    auto p_wg  = reinterpret_cast<const fp16*>(wg.data_ptr());
+
+    auto& q = get_device_queue(x);
+    moe_topk_gguf_host(p_log, p_sel, p_tw, (int)M, (int)n_experts, (int)top_k,
+                       renorm, q);
+    // One enqueue for both up stages when the shape allows it (see
+    // moe_up_fused.h); otherwise the original pair of launches.
+    if (!moe_up_fused_host(p_x, p_gq, p_gs, p_gm, p_uq, p_us, p_um, p_sel, p_ir,
+                           p_guq, p_gus, p_wg, p_ish, p_g,
+                           (int)M, (int)hidden, (int)intermediate, (int)top_k,
+                           (int)inter_s, q)) {
+        moe_up_q4k_host(p_x, p_gq, p_gs, p_gm, p_uq, p_us, p_um, p_sel, p_ir,
+                        (int)M, (int)hidden, (int)intermediate, (int)top_k, q);
+        moe_shared_up_q8_host(p_x, p_guq, p_gus, p_wg, p_ish, p_g,
+                              (int)M, (int)hidden, (int)inter_s, q);
+    }
+    if (down_is_q6)
+        moe_down_q6k_host(p_ir, p_dql, p_dqh, p_dsc, p_sel, p_tw, p_op,
+                          (int)M, (int)hidden, (int)intermediate, (int)top_k, q);
+    else
+        moe_down_q5k_host(p_ir, p_dql, p_dqh, p_dsc, p_dmn, p_sel, p_tw, p_op,
+                          (int)M, (int)hidden, (int)intermediate, (int)top_k, q);
+    moe_finalize_gguf_host(p_op, p_ish, p_ddq, p_dds, p_g, p_o,
+                           (int)M, (int)hidden, (int)inter_s, (int)top_k, q);
+    return out;
+}
+
+#define GGUF_MOE_FULL_ARGS                                                  \
+    gate_ql, gate_sc, gate_mn, up_ql, up_sc, up_mn,                         \
+    down_ql, down_qh, down_sc, down_mn, gu_qs, gu_sc, d_qs, d_sc, wg,       \
+    n_experts, top_k, intermediate, inter_s, down_is_q6, renorm
+
+at::Tensor esimd_moe_forward_full_gguf(
+    at::Tensor x, at::Tensor logits,
+    at::Tensor gate_ql, at::Tensor gate_sc, at::Tensor gate_mn,
+    at::Tensor up_ql, at::Tensor up_sc, at::Tensor up_mn,
+    at::Tensor down_ql, at::Tensor down_qh, at::Tensor down_sc, at::Tensor down_mn,
+    at::Tensor gu_qs, at::Tensor gu_sc, at::Tensor d_qs, at::Tensor d_sc,
+    at::Tensor wg,
+    int64_t n_experts, int64_t top_k, int64_t intermediate, int64_t inter_s,
+    bool down_is_q6, bool renorm) {
+    return gguf_moe_full_body(
+        x, reinterpret_cast<const fp16*>(x.data_ptr()),
+        reinterpret_cast<const fp16*>(logits.data_ptr()), GGUF_MOE_FULL_ARGS);
+}
+
+// Norm-fused variant: absorbs the post-attention GemmaRMSNorm (residual add +
+// RMS norm) and the fp16 router GEMV into the MoE op, removing two per-layer
+// python/dispatcher round-trips on the host-bound decode path.
+// `residual` is updated in place (== h + residual, matching
+// gemma_fused_add_rmsnorm) and returned alongside the MoE output.
+std::vector<at::Tensor> esimd_moe_forward_full_gguf_norm(
+    at::Tensor h, at::Tensor residual, at::Tensor norm_w, double eps,
+    at::Tensor router_w,
+    at::Tensor gate_ql, at::Tensor gate_sc, at::Tensor gate_mn,
+    at::Tensor up_ql, at::Tensor up_sc, at::Tensor up_mn,
+    at::Tensor down_ql, at::Tensor down_qh, at::Tensor down_sc, at::Tensor down_mn,
+    at::Tensor gu_qs, at::Tensor gu_sc, at::Tensor d_qs, at::Tensor d_sc,
+    at::Tensor wg,
+    int64_t n_experts, int64_t top_k, int64_t intermediate, int64_t inter_s,
+    bool down_is_q6, bool renorm) {
+    const int64_t M = h.size(0);
+    const int64_t hidden = h.size(1);
+    // xn/logits never leave this op, so they are pooled like the other scratch.
+    auto& nws = gguf_moe_ws();
+    if (nws.xn.defined() == false || nws.xn.size(0) != M ||
+        nws.xn.size(1) != hidden || nws.logits.size(1) != n_experts ||
+        nws.xn.scalar_type() != h.scalar_type() ||
+        nws.xn.device().index() != h.device().index()) {
+        nws.xn = at::empty({M, hidden}, h.options());
+        nws.logits = at::empty({M, n_experts}, h.options());
+    }
+    auto& xn = nws.xn;
+    auto& logits = nws.logits;
+    // Distinct output buffer: block 0 stores the post-add residual while the
+    // other row-blocks are still loading the OLD residual, so writing in place
+    // would be a data race.
+    auto nr = at::empty({M, hidden}, h.options());
+    auto& q = get_device_queue(h);
+    const bool ok = moe_norm_router_host(
+        reinterpret_cast<const fp16*>(h.data_ptr()),
+        reinterpret_cast<const fp16*>(residual.data_ptr()),
+        reinterpret_cast<fp16*>(nr.data_ptr()),
+        reinterpret_cast<const fp16*>(norm_w.data_ptr()),
+        reinterpret_cast<const fp16*>(router_w.data_ptr()),
+        reinterpret_cast<fp16*>(xn.data_ptr()),
+        reinterpret_cast<fp16*>(logits.data_ptr()),
+        (float)eps, (int)M, (int)hidden, (int)n_experts, q);
+    TORCH_CHECK(ok, "esimd_moe_forward_full_gguf_norm: unsupported hidden ", hidden);
+    auto out = gguf_moe_full_body(
+        xn, reinterpret_cast<const fp16*>(xn.data_ptr()),
+        reinterpret_cast<const fp16*>(logits.data_ptr()), GGUF_MOE_FULL_ARGS);
+    return {out, nr};
+}
+#undef GGUF_MOE_FULL_ARGS
+
 #include "esimd_kernels/q4_0_GEMM.h"
 
 // GGUF q4_0 GEMM (prefill / batched M>=2), non-DPAS SIMD (PTL Xe3 has no XMX).
@@ -392,6 +613,78 @@ at::Tensor esimd_gemm_q4_0(
                    reinterpret_cast<fp16*>(p_out),
                    (uint32_t)M, (uint32_t)N, (uint32_t)K, dpcpp_queue);
     return output;
+}
+
+// Fused (residual-add + GemmaRMSNorm) + GGUF q8_0 GEMV [+ optional fp16 dense
+// GEMV] for the decode attention input projection.
+//
+//   nr       = fp16(h + residual)                     (new residual, distinct
+//                                                      buffer: block 0 stores
+//                                                      while others still read)
+//   xn       = fp16(nr * rsqrt(mean(nr^2)+eps) * nw)   (scratch)
+//   o0       = xn @ w0^T   (q8_0: qs [N0,K] int8, sc [N0,K/32] fp16)
+//   o1       = xn @ w1^T   (fp16 dense [N1,K]; skipped when w1 is empty)
+//
+// Collapses 2-3 torch op dispatches per attention layer into one. Decode is
+// host-bound (~13-25us of dispatch per call vs ~4us of enqueue), so removing
+// the CALL is the win; the two kernels are still enqueued back to back on the
+// same in-order queue, which serialises them correctly (o0's kernel reads the
+// xn that the norm kernel wrote).
+void esimd_resadd_norm_gemv_q8_ba(
+    at::Tensor h, at::Tensor residual, at::Tensor nw, double eps,
+    at::Tensor xn, at::Tensor nr,
+    at::Tensor w0, at::Tensor s0, at::Tensor o0,
+    at::Tensor w1, at::Tensor o1) {
+    const int M      = (int)h.size(0);
+    const int hidden = (int)h.size(1);
+    const bool has_ba = w1.numel() > 0;
+    const int E = has_ba ? (int)w1.size(0) : 0;
+
+    EXTRACT_PTR(p_h, h); EXTRACT_PTR(p_res, residual); EXTRACT_PTR(p_nw, nw);
+    EXTRACT_PTR(p_xn, xn); EXTRACT_PTR(p_nr, nr);
+    auto& dpcpp_queue = get_device_queue(h);
+
+    // Single enqueue: the WG grid covers the fp16 `ba` rows and the q8_0 rows,
+    // every WG recomputing the (register-local) norm.
+    const bool ok = moe_norm_q8_host(
+        reinterpret_cast<const fp16*>(p_h),
+        reinterpret_cast<const fp16*>(p_res), reinterpret_cast<fp16*>(p_nr),
+        reinterpret_cast<const fp16*>(p_nw),
+        has_ba ? reinterpret_cast<const fp16*>(w1.data_ptr()) : nullptr,
+        has_ba ? reinterpret_cast<fp16*>(o1.data_ptr()) : nullptr,
+        reinterpret_cast<int8_t*>(w0.data_ptr()),
+        reinterpret_cast<const fp16*>(s0.data_ptr()),
+        reinterpret_cast<fp16*>(o0.data_ptr()),
+        nullptr, (float)eps, M, hidden, E, (int)w0.size(0), dpcpp_queue);
+    TORCH_CHECK(ok, "esimd_resadd_norm_gemv_q8_ba: unsupported hidden ", hidden);
+    (void)p_xn;
+}
+
+#include "esimd_kernels/gdn_norm_gated.h"
+
+// Fused RMSNormGated + GGUF q8_0 GEMV for the GDN out_proj (decode).
+//
+//   y[h,:] = rmsnorm(x[h,:]) * nw * silu(z[h,:])      (per value head)
+//   out    = y_flat @ dequant(w_q8)^T
+//
+// The GGUF counterpart of esimd_norm_gemv_fp8_pert: collapses the standalone
+// gdn_rms_norm_gated launch and the out_proj GEMV into one op dispatch.
+void esimd_norm_gemv_q8_0(
+    at::Tensor x, at::Tensor z, at::Tensor nw, at::Tensor y,
+    at::Tensor w0, at::Tensor s0, at::Tensor o0,
+    int64_t HV, int64_t V, double eps) {
+    EXTRACT_PTR(p_x, x); EXTRACT_PTR(p_z, z); EXTRACT_PTR(p_nw, nw);
+    EXTRACT_PTR(p_y, y);
+    auto& dpcpp_queue = get_device_queue(x);
+
+    const bool ok = gdn_norm_gated_q8_host(
+        reinterpret_cast<const fp16*>(p_x), reinterpret_cast<const fp16*>(p_z),
+        reinterpret_cast<const fp16*>(p_nw), reinterpret_cast<fp16*>(p_y),
+        reinterpret_cast<int8_t*>(w0.data_ptr()),
+        reinterpret_cast<const fp16*>(s0.data_ptr()),
+        reinterpret_cast<fp16*>(o0.data_ptr()),
+        (float)eps, (int)HV, (int)V, (int)w0.size(0), dpcpp_queue);
+    TORCH_CHECK(ok, "esimd_norm_gemv_q8_0: unsupported head_v_dim ", V);
 }
 
 // Fused 2-matrix INT4 GEMV: two GEMVs sharing the same input vector.
