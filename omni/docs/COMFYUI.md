@@ -22,9 +22,8 @@ sudo docker run -itd \
     /llm/entrypoints/start_comfyui.sh
 ```
 
-The Intel release tag is BMG-only. PTL-H users must build from source with
-`XPU_TARGET=ptl-h` and use the resulting target-qualified local image; the
-unsuffixed release tag must not be used on PTL-H.
+The release image targets BMG. For PTL-H, build with `XPU_TARGET=ptl-h` and use
+the target-qualified local image emitted by `build.sh`.
 
 The entrypoint listens on port `8188`. Extra arguments are forwarded to
 ComfyUI:

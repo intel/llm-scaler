@@ -28,25 +28,22 @@ XPU_TARGET=ptl-h bash build.sh
 
 `XPU_TARGET` is required to match the destination GPU because the native wheel
 is AOT-compiled for that target. Supported local build values are `bmg` and
-`ptl-h`. To prevent accidental cross-target reuse, `build.sh` gives locally
-built development and acceptance images target-qualified tags:
+`ptl-h`. `build.sh` assigns target-qualified tags to local images:
 
 ```text
 intel/llm-scaler-omni:<version>-comfyui-bmg
 intel/llm-scaler-omni:<version>-comfyui-ptl-h
 ```
 
-These are local build tags, not Intel release tags. Intel publishes only the
-BMG image, using the version directly without a platform or flavor suffix:
+Intel publishes only the BMG image, using the version as the image tag:
 
 ```text
 intel/llm-scaler-omni:<version>
 ```
 
-The `0.2.0-b1` release tag is `intel/llm-scaler-omni:0.2.0-b1`. PTL-H remains
-available as a source-build target but is not published as an Intel image. See
-[Releases](../Releases.md) for images that have actually been published.
-Development versions are read from
+Version `0.2.0-b1` is tagged `intel/llm-scaler-omni:0.2.0-b1`. PTL-H images
+must be built from source. Published tags are listed in
+[Releases](../Releases.md). The development version is defined in
 `omni_xpu_kernel/omni_xpu_kernel/_version.py`.
 
 ### Validate the image
@@ -65,8 +62,8 @@ sudo docker run --rm \
 
 The check verifies package identity, the Torch ABI, native AOT target, clean
 source provenance, dependencies, XPU availability, and required Kitchen
-capabilities. The published image is BMG-only and must not be renamed or reused
-for PTL-H. Validate a local PTL-H build using its target-qualified local tag.
+capabilities. The release image targets BMG. Validate a local PTL-H build using
+the target-qualified tag emitted by `build.sh`.
 
 ### Run ComfyUI
 

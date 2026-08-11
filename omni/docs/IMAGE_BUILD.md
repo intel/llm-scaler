@@ -12,11 +12,10 @@ XPU_TARGET=bmg bash build.sh
 XPU_TARGET=ptl-h bash build.sh
 ```
 
-`build.sh` retains target-qualified tags for local development and acceptance
-images because their AOT binaries are not interchangeable. Intel release
-publication is narrower: only the BMG image is pushed, under the unsuffixed
-version tag `intel/llm-scaler-omni:<version>`. There is no published
-`-comfyui-bmg` or `-comfyui-ptl-h` tag. PTL-H is a source-build target only.
+`build.sh` assigns target-qualified tags to local images because their native
+binaries are AOT-compiled for the selected target. Intel publishes only the
+BMG image under `intel/llm-scaler-omni:<version>`; release tags do not include
+flavor or target suffixes. PTL-H images must be built from source.
 
 The supported environment overrides are:
 
@@ -120,6 +119,5 @@ source revisions; the installed AIMDO XPU backend; the
 GGUF/SentencePiece/Protobuf imports; the bundled `nunchaku_torch` runtime; and
 the managed Kitchen GGUF/W4A16 capabilities.
 
-The unsuffixed Intel release tag identifies the BMG image. Do not retag it as a
-PTL-H image or use it for PTL-H acceptance; validate a PTL-H source build with
-the target-qualified local tag emitted by `build.sh`.
+The release image targets BMG. Validate a local PTL-H build using the
+target-qualified tag emitted by `build.sh`.
