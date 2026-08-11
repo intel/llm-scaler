@@ -12,6 +12,12 @@ XPU_TARGET=bmg bash build.sh
 XPU_TARGET=ptl-h bash build.sh
 ```
 
+`build.sh` retains target-qualified tags for local development and acceptance
+images because their AOT binaries are not interchangeable. Intel release
+publication is narrower: only the BMG image is pushed, under the unsuffixed
+version tag `intel/llm-scaler-omni:<version>`. There is no published
+`-comfyui-bmg` or `-comfyui-ptl-h` tag. PTL-H is a source-build target only.
+
 The supported environment overrides are:
 
 | Variable | Purpose | Default |
@@ -98,7 +104,7 @@ the destination XPU.
 Run the validator inside the final container:
 
 ```bash
-IMAGE=intel/llm-scaler-omni:0.2.0-b1-comfyui-bmg
+IMAGE=intel/llm-scaler-omni:0.2.0-b1
 
 sudo docker run --rm \
     --device=/dev/dri \
@@ -113,3 +119,7 @@ validator also requires exact Kitchen, AIMDO, GGUF, and combined Nunchaku
 source revisions; the installed AIMDO XPU backend; the
 GGUF/SentencePiece/Protobuf imports; the bundled `nunchaku_torch` runtime; and
 the managed Kitchen GGUF/W4A16 capabilities.
+
+The unsuffixed Intel release tag identifies the BMG image. Do not retag it as a
+PTL-H image or use it for PTL-H acceptance; validate a PTL-H source build with
+the target-qualified local tag emitted by `build.sh`.

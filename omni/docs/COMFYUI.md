@@ -8,7 +8,7 @@ bundled in the image.
 Mount an existing ComfyUI model directory and invoke the supplied entrypoint:
 
 ```bash
-IMAGE=intel/llm-scaler-omni:0.2.0-b1-comfyui-bmg
+IMAGE=intel/llm-scaler-omni:0.2.0-b1
 CONTAINER_NAME=comfyui
 
 sudo docker run -itd \
@@ -21,6 +21,10 @@ sudo docker run -itd \
     "$IMAGE" \
     /llm/entrypoints/start_comfyui.sh
 ```
+
+The Intel release tag is BMG-only. PTL-H users must build from source with
+`XPU_TARGET=ptl-h` and use the resulting target-qualified local image; the
+unsuffixed release tag must not be used on PTL-H.
 
 The entrypoint listens on port `8188`. Extra arguments are forwarded to
 ComfyUI:
