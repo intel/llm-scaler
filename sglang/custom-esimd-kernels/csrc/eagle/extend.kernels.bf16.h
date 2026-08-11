@@ -16,10 +16,12 @@ ESIMD_INLINE void chunkGatedDeltaRuleExtendBf16(
   uint8_t* betaState,     // fp32
   uint8_t* stateBuf,      // StateT in/out
   uint8_t* oState,        // bf16 out
+  uint8_t* hState,        // StateT out, may be null: [total_chunks, H_v, V, K]
   uint32_t* cuSeqlens,
   uint32_t headQk,        // H_k: headV must be a multiple of this (GQA on GDN)
   uint32_t headV,
   uint32_t headDim,
+  uint32_t hChunkSize,    // token stride between h snapshots (0 = disabled)
   float    qScale,
   sycl::nd_item<2>& ndi)
 {
@@ -69,9 +71,37 @@ ESIMD_INLINE void chunkGatedDeltaRuleExtendBf16(
     fp32InS_persistent.select<128, 1>(r * 128) = raw;
   }
 
+  // Per-chunk snapshot base (see extend.kernels.fp16.h for the layout).
+  const bool emitH = (hState != nullptr) && (hChunkSize > 0);
+  StateT* hMyRows = nullptr;
+  if (emitH) {
+    uint32_t hSeqOffset = 0;
+    for (uint32_t s = 0; s < seqIdx; s++) {
+      const uint32_t len = cuSeqlens[s + 1] - cuSeqlens[s];
+      hSeqOffset += (len + hChunkSize - 1) / hChunkSize;
+    }
+    hMyRows = (StateT*)hState
+            + (size_t)hSeqOffset * stateSeqElems
+            + headIdx * stateHeadElems
+            + (hh * 8) * headDim;
+  }
+  uint32_t hNextSnapTok = 0;
+  uint32_t hSnapIdx = 0;
+
   namespace xens = sycl::ext::intel::experimental::esimd;
   for (uint32_t tRel = 0; tRel < nTokSeq; tRel++) {
     const uint32_t t = tStart + tRel;
+
+    if (emitH && tRel == hNextSnapTok) {
+      StateT* hDst = hMyRows + (size_t)hSnapIdx * stateSeqElems;
+      #pragma unroll
+      for (int r = 0; r < 8; r++) {
+        simd<StateT, 128> hv = fp32InS_persistent.select<128, 1>(r * 128);
+        block_store<StateT, 128>(hDst + r * headDim, hv);
+      }
+      hSnapIdx += 1;
+      hNextSnapTok += hChunkSize;
+    }
 
     simd<bf16, 128> q_bf16 = block_load<bf16, 128>(qPtr + t * qkTokStride + kHeadIdx * headDim);
     simd<bf16, 128> k_bf16 = block_load<bf16, 128>(kPtr + t * qkTokStride + kHeadIdx * headDim);

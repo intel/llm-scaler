@@ -503,7 +503,7 @@ void page_attn_decode(
 //   (out, last_state)  — last_state aliases initial_state (mutated in place)
 //                       and is returned as a convenience so the caller can
 //                       scatter ssm_states[cache_indices] = last_state.
-std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
     torch::Tensor& q,
     torch::Tensor& k,
     torch::Tensor& v,
@@ -511,7 +511,8 @@ std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
     torch::Tensor& beta,
     torch::Tensor& initial_state,
     torch::Tensor& cu_seqlens,
-    double scale)
+    double scale,
+    int64_t h_chunk_size)
 {
   TORCH_CHECK(q.scalar_type() == torch::kHalf || q.scalar_type() == torch::kBFloat16);
   TORCH_CHECK(k.scalar_type() == q.scalar_type());
@@ -550,6 +551,19 @@ std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
 
   auto out = torch::empty({1, T_total, H_v, V}, q.options());
 
+  // Optional per-chunk intermediate states. Sequence s owns ceil(L_s/chunk)
+  // entries; sum_s ceil(L_s/chunk) <= T_total/chunk + n_seqs, so allocate that
+  // upper bound (trailing rows are simply never indexed by the caller).
+  torch::Tensor h;
+  uint8_t* hPtr = nullptr;
+  if (h_chunk_size > 0) {
+    const int64_t max_chunks = T_total / h_chunk_size + n_seqs;
+    h = torch::empty({1, max_chunks, H_v, V, K}, initial_state.options());
+    hPtr = (uint8_t*)h.data_ptr();
+  } else {
+    h = torch::empty({0}, initial_state.options());
+  }
+
   sycl::range<2> globalRange(H_v * 16, n_seqs);
   sycl::range<2> localRange(16, 1);
   sycl::nd_range<2> range(globalRange, localRange);
@@ -559,6 +573,7 @@ std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
   const uint32_t headV  = (uint32_t)H_v;
   const uint32_t headDim = (uint32_t)K;
   const float qScale = (float)scale;
+  const uint32_t hChunk = (uint32_t)(h_chunk_size > 0 ? h_chunk_size : 0);
 
   uint8_t* qPtr = (uint8_t*)q.data_ptr();
   uint8_t* kPtr = (uint8_t*)k.data_ptr();
@@ -580,8 +595,8 @@ std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
           cgh.parallel_for<class chunkGdnExtendFp16Sf16>(
             range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
               chunkGatedDeltaRuleExtendFp16<sycl::half>(
-                qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, cuPtr,
-                headQk, headV, headDim, qScale, ndi);
+                qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, hPtr, cuPtr,
+                headQk, headV, headDim, hChunk, qScale, ndi);
             });
         };
       } else {
@@ -589,8 +604,8 @@ std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
           cgh.parallel_for<class chunkGdnExtendFp16Sf32>(
             range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
               chunkGatedDeltaRuleExtendFp16<float>(
-                qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, cuPtr,
-                headQk, headV, headDim, qScale, ndi);
+                qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, hPtr, cuPtr,
+                headQk, headV, headDim, hChunk, qScale, ndi);
             });
         };
       }
@@ -602,8 +617,8 @@ std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
           cgh.parallel_for<class chunkGdnExtendBf16Sf16>(
             range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
               chunkGatedDeltaRuleExtendBf16<sycl::half>(
-                qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, cuPtr,
-                headQk, headV, headDim, qScale, ndi);
+                qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, hPtr, cuPtr,
+                headQk, headV, headDim, hChunk, qScale, ndi);
             });
         };
       } else {
@@ -611,8 +626,8 @@ std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
           cgh.parallel_for<class chunkGdnExtendBf16Sf32>(
             range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
               chunkGatedDeltaRuleExtendBf16<float>(
-                qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, cuPtr,
-                headQk, headV, headDim, qScale, ndi);
+                qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, hPtr, cuPtr,
+                headQk, headV, headDim, hChunk, qScale, ndi);
             });
         };
       }
@@ -622,7 +637,7 @@ std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
       TORCH_CHECK(false, "unreachable dtype check");
   }
 
-  return std::make_tuple(out, initial_state);
+  return std::make_tuple(out, initial_state, h);
 }
 
 // ===========================================================================
@@ -1844,7 +1859,7 @@ TORCH_LIBRARY_FRAGMENT(eagle_ops, m) {
     m.def("verify_tree_greedy(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, Tensor target_predict) -> ()");
     m.def("gdn_eagle(Tensor! qkvz, Tensor! z_out, Tensor conv_w, Tensor? conv_b, Tensor! conv_state, Tensor accepted_tokens, Tensor ba, Tensor a_log, Tensor dt_bias, Tensor! state_in, Tensor ssm_state_idx, Tensor norm_w, int max_query_len) -> Tensor");
     m.def("page_attn_decode(Tensor query, Tensor key_cache, Tensor value_cache, Tensor block_table, Tensor seq_lens, Tensor! out, int max_query_len, int max_seq_len, Tensor(a!)? temp_p=None) -> ()");
-    m.def("chunk_gated_delta_rule_extend(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor! initial_state, Tensor cu_seqlens, float scale) -> (Tensor, Tensor)");
+    m.def("chunk_gated_delta_rule_extend(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor! initial_state, Tensor cu_seqlens, float scale, int h_chunk_size=0) -> (Tensor, Tensor, Tensor)");
     m.def("mamba_state_scatter(Tensor! dst, Tensor src, Tensor dst_indices, Tensor step_indices) -> ()");
     // Contract: q/k/v/initial_state are fp16 or bf16 (all same); g and beta are fp32
     // (both emitted by fused_gdn_gating). cu_seqlens is int32.
