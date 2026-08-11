@@ -357,6 +357,8 @@ RUN mkdir -p /llm/manifests && \
 COPY ./patches /llm/patches
 COPY ./tools /llm/tools
 COPY ./entrypoints/start_comfyui.sh /llm/entrypoints/start_comfyui.sh
+RUN git -C /llm/ComfyUI apply \
+        /llm/patches/comfyui_xpu_dynamic_vram_opt_in.patch
 
 # ======== ComfyUI Runtime ========
 # The runtime is intentionally the completed development builder rather than a

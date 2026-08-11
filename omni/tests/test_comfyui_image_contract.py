@@ -13,6 +13,9 @@ FULL_DOCKERFILE = OMNI_ROOT / "docker" / "Dockerfile.full"
 DOCKERIGNORE = OMNI_ROOT / ".dockerignore"
 BUILD_SCRIPT = OMNI_ROOT / "build.sh"
 VALIDATOR = OMNI_ROOT / "tools" / "validate_comfyui_image.py"
+COMFYUI_XPU_DYNAMIC_VRAM_PATCH = (
+    OMNI_ROOT / "patches" / "comfyui_xpu_dynamic_vram_opt_in.patch"
+)
 DEMO_ASSETS = {
     "demo_qwen_image.gif",
     "demo_wan2.2_14b_i2v_multi_xpu.gif",
@@ -87,6 +90,18 @@ def load_validator():
 
 
 class ComfyUIImageContractTest(unittest.TestCase):
+    def test_xpu_aimdo_initialization_requires_explicit_dynamic_vram(self):
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+        patch = COMFYUI_XPU_DYNAMIC_VRAM_PATCH.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "git -C /llm/ComfyUI apply \\\n"
+            "        /llm/patches/comfyui_xpu_dynamic_vram_opt_in.patch",
+            dockerfile,
+        )
+        self.assertIn("-if enables_dynamic_vram():", patch)
+        self.assertIn("+if args.enable_dynamic_vram:", patch)
+
     def test_root_readme_omni_links_resolve_to_current_docs_and_assets(self):
         readme = ROOT_README.read_text(encoding="utf-8")
 
