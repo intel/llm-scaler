@@ -58,6 +58,22 @@ static constexpr uint32_t PF_MAX_SLM_BASE = 0x18000;  // 4 KB
 static constexpr uint32_t PF_SUM_SLM_BASE = 0x19000;  // 4 KB
 static constexpr uint32_t PF_TOTAL_SLM    = 0x1A000;  // 104 KB total
 
+// Cross-subgroup exchange of the running max / partial sums / S tiles goes
+// through SLM. A named barrier only orders execution, it does not make the
+// SLM stores visible to the other subgroups, so the split arrive/wait form
+// leaves the exchange racy. barrier() carries the required memory fence.
+// Set PF_SPLIT_BARRIER=1 to get the old (racy) split form back.
+#ifndef PF_SPLIT_BARRIER
+#define PF_SPLIT_BARRIER 0
+#endif
+#if PF_SPLIT_BARRIER
+#define PF_BARRIER_ARRIVE() __esimd_nbarrier_arrive(0, 0, 32, 32)
+#define PF_BARRIER_WAIT()   __esimd_nbarrier(0, 0, 32)
+#else
+#define PF_BARRIER_ARRIVE() ((void)0)
+#define PF_BARRIER_WAIT()   barrier()
+#endif
+
 template<bool CAUSAL, bool IS_BF16>
 ESIMD_INLINE void sdp_paged_prefill_dpas(
     const unsigned short* __restrict__ query_ptr,
@@ -454,7 +470,7 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
         // ========================================
         // BARRIER A: arrive, QK[k+1] overlap, wait
         // ========================================
-        __esimd_nbarrier_arrive(0, 0, 32, 32);
+        PF_BARRIER_ARRIVE();
 
         if (outerIter < kvOuterLoops - 1) {
             uint32_t next_kv_start = (outerIter + 1) * PF_KV_CHUNK;
@@ -550,7 +566,7 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
             }
         }
 
-        __esimd_nbarrier(0, 0, 32);
+        PF_BARRIER_WAIT();
 
         // ========================================
         // SOFTMAX SECOND HALF
@@ -649,7 +665,7 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
         // ========================================
         // BARRIER B: arrive, V loads + compensation, wait
         // ========================================
-        __esimd_nbarrier_arrive(0, 0, 32, 32);
+        PF_BARRIER_ARRIVE();
 
         fp32_sum = fp32_sum * delta + local_sum;
 
@@ -680,7 +696,7 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
             }
         }
 
-        __esimd_nbarrier(0, 0, 32);
+        PF_BARRIER_WAIT();
 
         // ========================================
         // VS PHASE + K PREFETCH (remaining tiles)
