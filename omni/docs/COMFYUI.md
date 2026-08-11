@@ -22,8 +22,7 @@ sudo docker run -itd \
     /llm/entrypoints/start_comfyui.sh
 ```
 
-The release image targets BMG. For PTL-H, build with `XPU_TARGET=ptl-h` and use
-the target-qualified local image emitted by `build.sh`.
+The release image supports Intel Arc B-series/Battlemage GPUs.
 
 The entrypoint listens on port `8188`. Extra arguments are forwarded to
 ComfyUI:

@@ -16,6 +16,12 @@ VALIDATOR = OMNI_ROOT / "tools" / "validate_comfyui_image.py"
 COMFYUI_XPU_DYNAMIC_VRAM_PATCH = (
     OMNI_ROOT / "patches" / "comfyui_xpu_dynamic_vram_opt_in.patch"
 )
+PUBLIC_BMG_DOCUMENTATION = (
+    OMNI_ROOT / "README.md",
+    OMNI_ROOT / "docs" / "COMFYUI.md",
+    OMNI_ROOT / "docs" / "IMAGE_BUILD.md",
+)
+CACHE_DIT_COMMIT = "1d92bbd86ec59aa6223fe2368849b7413a1acb93"
 DEMO_ASSETS = {
     "demo_qwen_image.gif",
     "demo_wan2.2_14b_i2v_multi_xpu.gif",
@@ -90,6 +96,23 @@ def load_validator():
 
 
 class ComfyUIImageContractTest(unittest.TestCase):
+    def test_public_image_documentation_focuses_on_bmg_support(self):
+        for path in PUBLIC_BMG_DOCUMENTATION:
+            with self.subTest(path=path):
+                document = path.read_text(encoding="utf-8")
+                self.assertNotIn("Intel publishes", document)
+                self.assertNotIn("PTL-H", document)
+                self.assertNotIn("ptl-h", document)
+
+    def test_cache_dit_uses_the_pinned_minimax_h3_revision(self):
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "git -C ComfyUI-CacheDiT fetch --depth 1 origin \\\n"
+            f"        {CACHE_DIT_COMMIT}",
+            dockerfile,
+        )
+
     def test_xpu_aimdo_initialization_requires_explicit_dynamic_vram(self):
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
         patch = COMFYUI_XPU_DYNAMIC_VRAM_PATCH.read_text(encoding="utf-8")

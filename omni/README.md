@@ -21,30 +21,24 @@ cd omni
 
 # Intel Arc B-series / Battlemage
 XPU_TARGET=bmg bash build.sh
-
-# Intel Panther Lake H
-XPU_TARGET=ptl-h bash build.sh
 ```
 
-`XPU_TARGET` is required to match the destination GPU because the native wheel
-is AOT-compiled for that target. Supported local build values are `bmg` and
-`ptl-h`. `build.sh` assigns target-qualified tags to local images:
+The current image supports Intel Arc B-series/Battlemage GPUs. Its native wheel
+is AOT-compiled for BMG, and `build.sh` assigns this tag to local images:
 
 ```text
 intel/llm-scaler-omni:<version>-comfyui-bmg
-intel/llm-scaler-omni:<version>-comfyui-ptl-h
 ```
 
-Intel publishes only the BMG image, using the version as the image tag:
+We publish the BMG image using the version as the image tag:
 
 ```text
 intel/llm-scaler-omni:<version>
 ```
 
-Version `0.2.0-b1` is tagged `intel/llm-scaler-omni:0.2.0-b1`. PTL-H images
-must be built from source. Published tags are listed in
-[Releases](../Releases.md). The development version is defined in
-`omni_xpu_kernel/omni_xpu_kernel/_version.py`.
+Version `0.2.0-b1` is tagged `intel/llm-scaler-omni:0.2.0-b1`. Published tags
+are listed in [Releases](../Releases.md). The development version is defined
+in `omni_xpu_kernel/omni_xpu_kernel/_version.py`.
 
 ### Validate the image
 
@@ -62,8 +56,7 @@ sudo docker run --rm \
 
 The check verifies package identity, the Torch ABI, native AOT target, clean
 source provenance, dependencies, XPU availability, and required Kitchen
-capabilities. The release image targets BMG. Validate a local PTL-H build using
-the target-qualified tag emitted by `build.sh`.
+capabilities. The release image supports BMG.
 
 ### Run ComfyUI
 

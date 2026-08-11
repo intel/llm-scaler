@@ -9,13 +9,12 @@ Run builds from `omni/`:
 
 ```bash
 XPU_TARGET=bmg bash build.sh
-XPU_TARGET=ptl-h bash build.sh
 ```
 
-`build.sh` assigns target-qualified tags to local images because their native
-binaries are AOT-compiled for the selected target. Intel publishes only the
-BMG image under `intel/llm-scaler-omni:<version>`; release tags do not include
-flavor or target suffixes. PTL-H images must be built from source.
+The current image supports Intel Arc B-series/Battlemage GPUs. `build.sh`
+assigns the `-comfyui-bmg` suffix to local builds because their native binaries
+are AOT-compiled for BMG. We publish the BMG image under
+`intel/llm-scaler-omni:<version>` without a flavor or target suffix.
 
 The supported environment overrides are:
 
@@ -119,5 +118,4 @@ source revisions; the installed AIMDO XPU backend; the
 GGUF/SentencePiece/Protobuf imports; the bundled `nunchaku_torch` runtime; and
 the managed Kitchen GGUF/W4A16 capabilities.
 
-The release image targets BMG. Validate a local PTL-H build using the
-target-qualified tag emitted by `build.sh`.
+The release image supports BMG.

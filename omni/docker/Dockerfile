@@ -188,7 +188,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git clone --filter=blob:none --no-checkout \
         https://github.com/Jasonzzt/ComfyUI-CacheDiT.git && \
     git -C ComfyUI-CacheDiT fetch --depth 1 origin \
-        ab1a1448a2476a33493c9a9b04e1685971b9e73a && \
+        1d92bbd86ec59aa6223fe2368849b7413a1acb93 && \
     git -C ComfyUI-CacheDiT checkout --detach FETCH_HEAD && \
     pip install -r ComfyUI-CacheDiT/requirements.txt
 
