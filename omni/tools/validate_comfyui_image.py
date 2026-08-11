@@ -87,12 +87,10 @@ PINNED_MINIMAX_H3_TEMPLATE_HASHES = {
 COMFYUI_ROOT = Path("/llm/ComfyUI")
 COMFYUI_DATABASE_DIRECTORY = COMFYUI_ROOT / "user"
 AIMDO_SOURCE_ROOT = Path("/llm/comfy-aimdo-xpu")
-COMFYUI_XPU_DYNAMIC_VRAM_GUARD = """\
-# The Omni image uses the XPU AIMDO allocator only when DynamicVRAM is
-# explicitly requested. Merely installing comfy-aimdo must preserve the
-# native XPU allocator used by the legacy ModelPatcher path.
-if args.enable_dynamic_vram:
-"""
+AIMDO_REQUIRED_XPU_TESTS = {
+    "test_xpu_backend.py",
+    "test_xpu_comfyui_opt_in.py",
+}
 
 
 def require_equal(label: str, actual: str, expected: str) -> None:
@@ -188,16 +186,19 @@ def main() -> None:
         raise RuntimeError(
             f"Comfy AIMDO XPU library is missing: {aimdo_xpu_library}"
         )
-    if not (AIMDO_SOURCE_ROOT / "tests" / "test_xpu_backend.py").is_file():
-        raise RuntimeError("Comfy AIMDO installed-image XPU tests are missing")
+    missing_aimdo_tests = sorted(
+        name
+        for name in AIMDO_REQUIRED_XPU_TESTS
+        if not (AIMDO_SOURCE_ROOT / "tests" / name).is_file()
+    )
+    if missing_aimdo_tests:
+        raise RuntimeError(
+            "Comfy AIMDO installed-image XPU tests are missing: "
+            + ", ".join(missing_aimdo_tests)
+        )
 
     comfyui_version = run_path("/llm/ComfyUI/comfyui_version.py")["__version__"]
     require_equal("ComfyUI version", comfyui_version, expected_comfyui)
-    comfyui_main = (COMFYUI_ROOT / "main.py").read_text(encoding="utf-8")
-    if COMFYUI_XPU_DYNAMIC_VRAM_GUARD not in comfyui_main:
-        raise RuntimeError(
-            "ComfyUI XPU DynamicVRAM explicit opt-in guard is missing"
-        )
     require_equal(
         "Kitchen module version",
         comfy_kitchen.__version__,

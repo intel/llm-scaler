@@ -30,7 +30,7 @@ ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
 ARG COMFY_KITCHEN_COMMIT=575741da0edd9a6e34cbf7f0b29b20b9f4df9e34
 ARG COMFY_KITCHEN_VERSION=0.2.28
 ARG COMFY_AIMDO_REPOSITORY=https://github.com/xiangyuT/comfy-aimdo-xpu.git
-ARG COMFY_AIMDO_COMMIT=c7baf6240e5ed37fe01ee30330befade7d23497f
+ARG COMFY_AIMDO_COMMIT=3ab29453b560cbd831cb98fcabf2bebc3d6a78c5
 ARG COMFY_AIMDO_VERSION=0.4.13
 ARG COMFY_GGUF_REPOSITORY=https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git
 ARG COMFY_GGUF_COMMIT=39671fe73117ba97de7011e7e06e32599dcda06d
@@ -357,8 +357,6 @@ RUN mkdir -p /llm/manifests && \
 COPY ./patches /llm/patches
 COPY ./tools /llm/tools
 COPY ./entrypoints/start_comfyui.sh /llm/entrypoints/start_comfyui.sh
-RUN git -C /llm/ComfyUI apply \
-        /llm/patches/comfyui_xpu_dynamic_vram_opt_in.patch
 
 # ======== ComfyUI Runtime ========
 # The runtime is intentionally the completed development builder rather than a
