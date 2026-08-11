@@ -146,8 +146,22 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
 // Inputs: kv_row (absolute KV position in this sequence).
 // Returns: the Y coordinate to feed into payload.set_y(), accounting for
 // the row's containing phys block.
+//
+// The final PF_KV_CHUNK iteration covers up to 127 KV rows past `seq_len`
+// (their scores are masked to FP32_MIN, so they are numerically inert) but the
+// address computation still runs for them. Without a clamp those rows index
+// block_table_row[] past this request's own blocks. block_table has exactly
+// ceil(max_seq_len_k / page_size) columns, i.e. the longest request in the
+// batch fills its row completely, so for that request the read runs off the end
+// of the row -- and for the last request off the end of the whole tensor, which
+// is an out-of-bounds device read (observed as UR_RESULT_ERROR_DEVICE_LOST).
+// Clamping to the last block that actually belongs to this request keeps the
+// address in range; the loaded values are discarded by the mask either way.
+#define BLK_LOGICAL_CLAMP(idx) \
+    ((int32_t)(idx) < max_valid_blk_idx ? (int32_t)(idx) : max_valid_blk_idx)
+
 #define KV_PHYS_Y(kv_row) \
-    ((uint32_t)((BLK_TABLE_LOAD((int32_t)((kv_row) >> block_size_shift)) \
+    ((uint32_t)((BLK_TABLE_LOAD(BLK_LOGICAL_CLAMP((kv_row) >> block_size_shift)) \
                  << phys_block_shift) \
                 + ((kv_row) & block_size_mask)))
 
@@ -256,7 +270,7 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
         }
     }
     if (kvOuterLoops > 1) {
-        int32_t pf1_logical = (int32_t)PF_KV_CHUNK >> block_size_shift;
+        int32_t pf1_logical = BLK_LOGICAL_CLAMP((int32_t)PF_KV_CHUNK >> block_size_shift);
         int32_t pf1_off = (int32_t)PF_KV_CHUNK & block_size_mask;
         int32_t pf1_phys = BLK_TABLE_LOAD(pf1_logical);
         payloadKpf.set_y((uint32_t)((pf1_phys << phys_block_shift) + pf1_off + sg_i * (int32_t)PF_KV_PER_SG));
@@ -447,7 +461,7 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
             // Per-row K lookup for sg_i's slice of the next chunk.
             uint32_t next_Y_base_K = KV_PHYS_Y(next_kv_start + (uint32_t)(sg_i * PF_KV_PER_SG));
             // V prefetch base — best-effort, use first row's phys.
-            int32_t next_logical = next_kv_start >> block_size_shift;
+            int32_t next_logical = BLK_LOGICAL_CLAMP(next_kv_start >> block_size_shift);
             int32_t next_off = next_kv_start & block_size_mask;
             int32_t next_phys = BLK_TABLE_LOAD(next_logical);
             uint32_t next_Y_base_V = (uint32_t)((next_phys << phys_block_shift) + next_off);
@@ -816,6 +830,7 @@ ESIMD_INLINE void sdp_paged_prefill_dpas(
         }
     }
 #undef BLK_TABLE_LOAD
+#undef BLK_LOGICAL_CLAMP
 }
 
 // ============================================================
