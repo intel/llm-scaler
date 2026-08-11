@@ -245,8 +245,19 @@ struct Moe_topk_gguf_kernel {
         const fp16* row_ptr = logits + (size_t)nid * n_experts;
 
         simd<fp16, PAD> scores(fp16(-65504.f));
-        for (int i = 0; i < n_experts; i += 32)
+        // Load whole 32-blocks, then the tail one element at a time. Reading a
+        // full block past the end of the row would both run off the logits
+        // allocation on the last token and clobber the -65504 padding, letting a
+        // garbage lane win the hmax below and yield a selected expert id >=
+        // n_experts -- which then indexes the expert weights out of range. The
+        // tail loop is dead code whenever n_experts % 32 == 0, which is the case
+        // for every shipped config (Qwen3.5-35B-A3B has 256 routed experts), so
+        // the fast path is unchanged.
+        int i = 0;
+        for (; i + 32 <= n_experts; i += 32)
             scores.template select<32, 1>(i) = block_load<fp16, 32>(row_ptr + i);
+        for (; i < n_experts; ++i)
+            scores[i] = row_ptr[i];
 
         // fp16 bits -> monotonically ordered uint16 key.
         simd<uint16_t, PAD> bits = scores.template bit_cast_view<uint16_t>();

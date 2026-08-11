@@ -76,36 +76,47 @@ inline bool gdn_norm_gated_host(
  * Saves one enqueue per GDN layer; at M=1 decode we are launch-bound, so the
  * redundant per-WG norm recompute (register/L2 local) is cheaper than the
  * second kernel launch.
+ *
+ * Batched decode: the WG grid is M*blocks groups, `token = gid / blocks`
+ * selecting the row of x/z/y/out and `blk = gid % blocks` the band of output
+ * rows, exactly as Moe_norm_q8_kernel does. The weight offset within K stays
+ * `lid*V` (shared by all tokens) while the activation offset carries the extra
+ * `token*K`, so the weights are read once per band and reused across tokens.
  * ------------------------------------------------------------------------- */
 template <int V, int HVT>
 struct Gdn_norm_gated_q8_kernel {
     static constexpr int ROWS = HVT < 8 ? HVT : 8;
-    const fp16*   x;
-    const fp16*   z;
-    const fp16*   nw;
-    fp16*         y;    // may be null
+    const fp16*   x;    // [M*HV, V]
+    const fp16*   z;    // [M*HV, V]
+    const fp16*   nw;   // [V]
+    fp16*         y;    // [M*HV, V]  may be null
     const int8_t* qs;   // [N, HVT*V]
     const fp16*   sc;   // [N, HVT*V/32]
-    fp16*         out;  // [1, N]
+    fp16*         out;  // [M, N]
     float eps;
-    int N, K;
+    int N, K, M, blocks;
 
     void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
         slm_init<HVT*(ROWS + 1) * sizeof(float)>();
-        const int blk  = (int)item.get_group(0);
-        const int lid  = (int)item.get_local_id(0);
-        const size_t off = (size_t)lid * V;
+        const int gid   = (int)item.get_group(0);
+        const int lid   = (int)item.get_local_id(0);
+        const int token = gid / blocks;
+        const int blk   = gid % blocks;
+        // Offset of this lane's head inside the contraction dim K (shared by
+        // every token), and the same offset inside this token's activation row.
+        const size_t koff = (size_t)lid * V;
+        const size_t xoff = (size_t)token * K + koff;
 
-        simd<float, V> x_f = block_load<fp16, V>(x + off);
+        simd<float, V> x_f = block_load<fp16, V>(x + xoff);
         float mean_sq = reduce<float>(x_f * x_f, std::plus<>()) * (1.0f / (float)V);
         float inv_rms =
             sycl::ext::intel::esimd::rsqrt(simd<float, 8>(mean_sq + eps))[0];
 
-        simd<float, V> z_f = block_load<fp16, V>(z + off);
+        simd<float, V> z_f = block_load<fp16, V>(z + xoff);
         simd<float, V> silu_z = z_f / (1.0f + sycl::ext::intel::esimd::exp(-z_f));
         simd<fp16, V> yv = convert<fp16>(
             x_f * inv_rms * simd<float, V>(block_load<fp16, V>(nw)) * silu_z);
-        if (blk == 0 && y) block_store<fp16, V>(y + off, yv);
+        if (blk == 0 && y) block_store<fp16, V>(y + xoff, yv);
 
         simd<float, V> xf = simd<float, V>(yv);
         const int rbase = blk * ROWS;
@@ -114,8 +125,8 @@ struct Gdn_norm_gated_q8_kernel {
             const int row = rbase + r;
             float p = 0.0f;
             if (row < N) {
-                const int8_t* wrow = qs + (size_t)row * K + off;
-                const fp16*   srow = sc + (size_t)row * (K / 32) + (off / 32);
+                const int8_t* wrow = qs + (size_t)row * K + koff;
+                const fp16*   srow = sc + (size_t)row * (K / 32) + (koff / 32);
                 simd<float, 32> acc = 0.0f;
                 for (int k = 0; k < V; k += 32) {
                     simd<float, 32> wf =
@@ -134,7 +145,7 @@ struct Gdn_norm_gated_q8_kernel {
             if (row < N) {
                 simd<float, HVT> d =
                     slm_block_load<float, HVT>(HVT * (1 + lid) * sizeof(float));
-                out[row] = fp16(reduce<float>(d, std::plus<>()));
+                out[(size_t)token * N + row] = fp16(reduce<float>(d, std::plus<>()));
             }
         }
     }
@@ -143,16 +154,17 @@ struct Gdn_norm_gated_q8_kernel {
 inline bool gdn_norm_gated_q8_host(
     const fp16* x, const fp16* z, const fp16* nw, fp16* y,
     const int8_t* qs, const fp16* sc, fp16* out,
-    float eps, int HV, int V, int N, sycl::queue& q) {
+    float eps, int HV, int V, int N, int M, sycl::queue& q) {
     const int rows   = HV < 8 ? HV : 8;
     const int K      = HV * V;
     const int blocks = (N + rows - 1) / rows;
+    if (M < 1) return false;
 
 #define LAUNCH_GDN_NQ(VV, HH)                                                  \
     q.submit([&](sycl::handler& hd) {                                          \
-        hd.parallel_for(sycl::nd_range<1>((size_t)blocks * HH, HH),            \
+        hd.parallel_for(sycl::nd_range<1>((size_t)M * blocks * HH, HH),        \
                         Gdn_norm_gated_q8_kernel<VV, HH>{                \
-                            x, z, nw, y, qs, sc, out, eps, N, K});             \
+                            x, z, nw, y, qs, sc, out, eps, N, K, M, blocks});  \
     });                                                                        \
     return true;
 #define DISPATCH_HV(VV)                                                        \

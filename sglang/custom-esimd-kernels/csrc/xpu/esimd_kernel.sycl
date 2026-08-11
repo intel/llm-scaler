@@ -501,6 +501,11 @@ static at::Tensor gguf_moe_full_body(
     auto p_wg  = reinterpret_cast<const fp16*>(wg.data_ptr());
 
     auto& q = get_device_queue(x);
+    // The topk kernel keeps all expert scores in one simd<fp16, PAD>, and the
+    // host below only instantiates PAD = 256 or 512, so a larger expert count
+    // would index past the end of that vector.
+    TORCH_CHECK(n_experts > 0 && n_experts <= 512,
+                "gguf MoE: n_experts ", n_experts, " outside the supported 1..512");
     moe_topk_gguf_host(p_log, p_sel, p_tw, (int)M, (int)n_experts, (int)top_k,
                        renorm, q);
     // One enqueue for both up stages when the shape allows it (see
@@ -664,11 +669,14 @@ void esimd_resadd_norm_gemv_q8_ba(
 
 // Fused RMSNormGated + GGUF q8_0 GEMV for the GDN out_proj (decode).
 //
-//   y[h,:] = rmsnorm(x[h,:]) * nw * silu(z[h,:])      (per value head)
-//   out    = y_flat @ dequant(w_q8)^T
+//   y[t,h,:] = rmsnorm(x[t,h,:]) * nw * silu(z[t,h,:])   (per token, per head)
+//   out[t,:] = y_flat[t] @ dequant(w_q8)^T
 //
 // The GGUF counterpart of esimd_norm_gemv_fp8_pert: collapses the standalone
 // gdn_rms_norm_gated launch and the out_proj GEMV into one op dispatch.
+//
+// x/z are [M*HV, V] and out is [M, N]; M is inferred from the row count so a
+// batched decode step is one launch, same as the single-token case.
 void esimd_norm_gemv_q8_0(
     at::Tensor x, at::Tensor z, at::Tensor nw, at::Tensor y,
     at::Tensor w0, at::Tensor s0, at::Tensor o0,
@@ -677,13 +685,17 @@ void esimd_norm_gemv_q8_0(
     EXTRACT_PTR(p_y, y);
     auto& dpcpp_queue = get_device_queue(x);
 
+    TORCH_CHECK(HV > 0 && x.size(0) % HV == 0,
+                "esimd_norm_gemv_q8_0: rows ", x.size(0), " not a multiple of HV ", HV);
+    const int M = (int)(x.size(0) / HV);
+
     const bool ok = gdn_norm_gated_q8_host(
         reinterpret_cast<const fp16*>(p_x), reinterpret_cast<const fp16*>(p_z),
         reinterpret_cast<const fp16*>(p_nw), reinterpret_cast<fp16*>(p_y),
         reinterpret_cast<int8_t*>(w0.data_ptr()),
         reinterpret_cast<const fp16*>(s0.data_ptr()),
         reinterpret_cast<fp16*>(o0.data_ptr()),
-        (float)eps, (int)HV, (int)V, (int)w0.size(0), dpcpp_queue);
+        (float)eps, (int)HV, (int)V, (int)w0.size(0), M, dpcpp_queue);
     TORCH_CHECK(ok, "esimd_norm_gemv_q8_0: unsupported head_v_dim ", V);
 }
 
