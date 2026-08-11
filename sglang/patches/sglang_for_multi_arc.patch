@@ -208,10 +208,10 @@ index 44ee91a1a..38de4d83a 100644
      REMOTE = "remote"
 diff --git a/python/sglang/srt/layers/attention/fla/chunk_torch_xpu.py b/python/sglang/srt/layers/attention/fla/chunk_torch_xpu.py
 new file mode 100644
-index 000000000..378fea0cc
+index 000000000..7c2b07690
 --- /dev/null
 +++ b/python/sglang/srt/layers/attention/fla/chunk_torch_xpu.py
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,167 @@
 +"""Pure-PyTorch fallback for chunk_gated_delta_rule on Intel XPU.
 +
 +Triton-XPU 3.7.0 cannot compile the block-pointer-heavy GDN kernels in
@@ -248,7 +248,8 @@ index 000000000..378fea0cc
 +    cu_seqlens: Optional[torch.LongTensor] = None,
 +    head_first: bool = False,
 +    use_qk_l2norm_in_kernel: bool = False,
-+) -> Tuple[torch.Tensor, None, Optional[torch.Tensor]]:
++    intermediate_chunk_size: Optional[int] = None,
++) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
 +    """Drop-in for sglang.srt.layers.attention.fla.chunk.chunk_gated_delta_rule.
 +
 +    Shapes (head_first=False, the only mode sglang uses today):
@@ -301,6 +302,23 @@ index 000000000..378fea0cc
 +        (n_seqs, H, V, K), dtype=torch.float32, device=q.device
 +    )
 +
++    # Optional per-chunk intermediate states. h[i] is the recurrent state after
++    # i full chunks (h[0] == the initial state), packed per sequence with
++    # ceil(L_s / chunk) entries each -- the layout _init_track_ssm_indices
++    # assumes. Only materialised when the caller asks for it.
++    chunk = int(intermediate_chunk_size or 0)
++    h_out = None
++    h_offsets = None
++    if chunk > 0:
++        seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
++        n_h_per_seq = [(L + chunk - 1) // chunk for L in seq_lens]
++        h_offsets = [0]
++        for c in n_h_per_seq[:-1]:
++            h_offsets.append(h_offsets[-1] + c)
++        h_out = torch.empty(
++            (sum(n_h_per_seq), H, V, K), dtype=torch.float32, device=q.device
++        )
++
 +    cu = cu_seqlens.tolist()
 +    idx_list = (
 +        initial_state_indices.tolist() if initial_state_indices is not None else None
@@ -321,6 +339,9 @@ index 000000000..378fea0cc
 +            state = torch.zeros((H, V, K), dtype=torch.float32, device=q.device)
 +
 +        for t in range(t0, t1):
++            if chunk > 0 and (t - t0) % chunk == 0:
++                h_out[h_offsets[s] + (t - t0) // chunk] = state
++
 +            q_t = q[t].to(torch.float32)                     # [H_k, K]
 +            k_t = k[t].to(torch.float32)                     # [H_k, K]
 +            v_t = v[t].to(torch.float32)                     # [H, V]
@@ -355,7 +376,9 @@ index 000000000..378fea0cc
 +    # gdn_backend.forward_extend scatters last_recurrent_state back into
 +    # ssm_states[cache_indices] on non-CUDA backends; returning it as the
 +    # middle element (not as h_aux) is required for that scatter to run.
-+    return o, last_state, None
++    if h_out is not None:
++        h_out = h_out.unsqueeze(0)  # [1, total_chunks, H, V, K]
++    return o, last_state, h_out
 diff --git a/python/sglang/srt/layers/attention/fla/layernorm_gated.py b/python/sglang/srt/layers/attention/fla/layernorm_gated.py
 index 5a8fda41b..99c56f9ff 100644
 --- a/python/sglang/srt/layers/attention/fla/layernorm_gated.py
@@ -447,10 +470,59 @@ index 5a8fda41b..99c56f9ff 100644
 +            activation=self.activation,
 +        )
 diff --git a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
-index d0a8ff7a9..7c0d37076 100644
+index d0a8ff7a9..32d5c8b67 100644
 --- a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
 +++ b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
-@@ -533,7 +533,14 @@ class MambaAttnBackendBase(AttentionBackend):
+@@ -1,4 +1,5 @@
+ import logging
++import os
+ from typing import Optional, Union
+ 
+ import torch
+@@ -25,7 +26,6 @@ from sglang.srt.speculative.spec_info import SpecInput
+ 
+ logger = logging.getLogger(__name__)
+ 
+-
+ # Kernel to track mamba states if needed based on track mask
+ @triton.jit
+ def track_mamba_state_if_needed_kernel(
+@@ -399,6 +399,34 @@ class MambaAttnBackendBase(AttentionBackend):
+         )
+         track_ssm_h_dst = dst_masked[not_aligned]
+ 
++        # Bounds guard. Everything here is already on CPU, so this costs no
++        # device sync. `h` has one row per chunk per sequence; an index past
++        # the end would be an out-of-bounds *device* read in
++        # `_track_mamba_state_extend`, which shows up as a GPU page fault
++        # (UR_RESULT_ERROR_DEVICE_LOST) at the next synchronisation point
++        # rather than as a Python IndexError.
++        if track_ssm_h_src.numel() > 0:
++            total_h_rows = int(num_h_states.sum())
++            bad = (track_ssm_h_src < 0) | (track_ssm_h_src >= total_h_rows)
++            if bool(bad.any()):
++                logger.error(
++                    "Mamba extend tracking: %d/%d h index(es) out of range "
++                    "[0, %d); clamping. extend_seq_lens=%s prefix_lens=%s "
++                    "mamba_track_seqlens=%s mamba_track_mask=%s "
++                    "lens_to_track=%s offsets=%s src=%s",
++                    int(bad.sum()),
++                    track_ssm_h_src.numel(),
++                    total_h_rows,
++                    extend_seq_lens.tolist(),
++                    prefix_lens.tolist(),
++                    mamba_track_seqlens.tolist(),
++                    mamba_track_mask.tolist(),
++                    lens_to_track.tolist(),
++                    track_ssm_src_offset.tolist(),
++                    track_ssm_h_src.tolist(),
++                )
++                track_ssm_h_src = track_ssm_h_src.clamp(0, total_h_rows - 1)
++
+         # Move back to GPU
+         return (
+             track_ssm_h_src.to(self.device, non_blocking=True),
+@@ -533,7 +561,14 @@ class MambaAttnBackendBase(AttentionBackend):
          # Make sure forward metadata is correctly handled for padding reqs
          req_pool_indices[bs - num_padding :] = 0
          mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
@@ -466,21 +538,104 @@ index d0a8ff7a9..7c0d37076 100644
          self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
          if forward_mode.is_decode_or_idle():
              if num_padding == 0:
+@@ -624,10 +659,23 @@ class MambaAttnBackendBase(AttentionBackend):
+                 forward_batch.batch_size,
+             )
+ 
++    def _warn_missing_intermediate_states(self, n_rows: int):
++        """Warn once when the kernel gave us no per-chunk states to snapshot."""
++        if not getattr(self, "_warned_missing_h", False):
++            self._warned_missing_h = True
++            logger.warning(
++                "Mamba extend tracking: kernel returned no intermediate chunk "
++                "states, so %d unaligned snapshot row(s) per batch cannot be "
++                "written. Prefix-cached prefills that resume from those "
++                "snapshots will restore a stale SSM state. Aligned snapshots "
++                "are unaffected.",
++                n_rows,
++            )
++
+     def _track_mamba_state_extend(
+         self,
+         forward_batch: ForwardBatch,
+-        h: torch.Tensor,
++        h: Optional[torch.Tensor],
+         ssm_states: torch.Tensor,
+         forward_metadata: ForwardMetadata,
+     ):
+@@ -640,16 +688,25 @@ class MambaAttnBackendBase(AttentionBackend):
+         to the chunk size. See `_init_track_ssm_indices` for more details on how
+         the source and destination indices are computed.
+ 
++        ``h`` (the per-chunk intermediate states) may be None when the kernel
++        backend does not produce them. Only the *unaligned* branch needs it; the
++        aligned branch copies the final state out of ``ssm_states`` and must
++        still run, otherwise the snapshot inserted into the radix cache keeps a
++        stale SSM state while its conv state is fresh.
++
+         Note: Conv state tracking for extend is handled separately via gather operations
+         using indices computed by `_init_track_conv_indices`.
+         """
+         if forward_metadata.has_mamba_track_mask:
+-            h = h.squeeze(0)
+-
+-            if forward_metadata.track_ssm_h_src.numel() > 0:
+-                ssm_states[forward_metadata.track_ssm_h_dst] = h[
+-                    forward_metadata.track_ssm_h_src
+-                ].to(ssm_states.dtype, copy=False)
++            n_h = forward_metadata.track_ssm_h_src.numel()
++            if n_h > 0:
++                if h is None:
++                    self._warn_missing_intermediate_states(n_h)
++                else:
++                    h = h.squeeze(0)
++                    ssm_states[forward_metadata.track_ssm_h_dst] = h[
++                        forward_metadata.track_ssm_h_src
++                    ].to(ssm_states.dtype, copy=False)
+             if forward_metadata.track_ssm_final_src.numel() > 0:
+                 ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
+                     forward_metadata.track_ssm_final_src
 diff --git a/python/sglang/srt/layers/attention/linear/gdn_backend.py b/python/sglang/srt/layers/attention/linear/gdn_backend.py
-index ade156e98..a430c6695 100644
+index ade156e98..122e952f7 100644
 --- a/python/sglang/srt/layers/attention/linear/gdn_backend.py
 +++ b/python/sglang/srt/layers/attention/linear/gdn_backend.py
-@@ -18,7 +18,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+@@ -1,3 +1,5 @@
++import logging
++import os
+ from typing import Optional, Tuple, Union
+ 
+ import torch
+@@ -18,7 +20,8 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
  from sglang.srt.mem_cache.memory_pool import MambaPool
  from sglang.srt.model_executor.forward_batch_info import ForwardBatch
  from sglang.srt.model_executor.model_runner import ModelRunner
 -from sglang.srt.utils import is_cpu, is_cuda, is_npu
++from sglang.srt.server_args import get_global_server_args
 +from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_xpu
  from sglang.srt.utils.common import rank0_log
  
  if not is_cpu():
-@@ -501,7 +501,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
+@@ -490,6 +493,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
+             )
+         else:
+             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
++            # Per-chunk intermediate states are only needed when this batch has
++            # to snapshot at a position that is not chunk-aligned; asking for
++            # them unconditionally would materialise a large tensor per layer.
++            need_h = (
++                forward_metadata.has_mamba_track_mask
++                and forward_metadata.track_ssm_h_src.numel() > 0
++            )
+             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+                 q=query,
+                 k=key,
+@@ -499,17 +509,26 @@ class GDNAttnBackend(MambaAttnBackendBase):
+                 ssm_states=ssm_states,
+                 cache_indices=cache_indices,
                  query_start_loc=query_start_loc,
++                intermediate_chunk_size=(
++                    get_global_server_args().mamba_cache_chunk_size if need_h else 0
++                ),
              )
  
 -            if (is_npu() or is_cpu()) and last_recurrent_state is not None:
@@ -490,8 +645,24 @@ index ade156e98..a430c6695 100644
                  last_recurrent_state = last_recurrent_state.to(
                      ssm_states.dtype, copy=False
                  )
+                 ssm_states[cache_indices] = last_recurrent_state
+ 
+-            if h is not None:
+-                self._track_mamba_state_extend(
+-                    forward_batch, h, ssm_states, forward_metadata
+-                )
++
++            # `h` may be None: some kernel backends (XPU) do not emit the
++            # per-chunk intermediate states. Only the unaligned branch of the
++            # tracking needs them, so the call must not be gated on `h` -- doing
++            # so silently dropped *every* extend-time SSM snapshot on XPU.
++            self._track_mamba_state_extend(
++                forward_batch, h, ssm_states, forward_metadata
++            )
+ 
+         return core_attn_out
 diff --git a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
-index 0daf8f4e2..cab43381b 100644
+index 0daf8f4e2..93ce0defc 100644
 --- a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
 +++ b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
 @@ -34,6 +34,17 @@ elif is_xpu():
@@ -512,7 +683,7 @@ index 0daf8f4e2..cab43381b 100644
  
  class TritonGDNKernel(LinearAttnKernelBase):
      """Triton-based kernel for GDN (Gated Delta Network) linear attention."""
-@@ -141,9 +152,42 @@ class TritonGDNKernel(LinearAttnKernelBase):
+@@ -141,9 +152,45 @@ class TritonGDNKernel(LinearAttnKernelBase):
      ) -> tuple:
          recurrent_state = ssm_states
          recurrent_state_indices_args = {"initial_state_indices": cache_indices}
@@ -539,23 +710,38 @@ index 0daf8f4e2..cab43381b 100644
 +            and hasattr(torch.ops.eagle_ops, "chunk_gated_delta_rule_extend")
 +        ):
 +            scale = float(q.size(-1)) ** -0.5
-+            # Kernel contract: (q, k, v, g, beta, initial_state, cu_seqlens, scale)
-+            # Returns (out [1, T, H_v, V], last_state [n_seqs, H_v, V, K]).
++            # Kernel contract: (q, k, v, g, beta, initial_state, cu_seqlens,
++            # scale, h_chunk_size) -> (out, last_state, h).
++            # h (per-chunk intermediate states) is only materialised when
++            # h_chunk_size > 0, i.e. when this batch actually has to write a
++            # mamba track snapshot at a non-chunk-aligned position.
 +            # g is fp32 log-space decay; kernel expects exactly that.
 +            # initial_state is IN/OUT: kernel mutates it to last_state.
++            h_chunk = int(kwargs.get("intermediate_chunk_size") or 0)
 +            state_in = recurrent_state.contiguous()
-+            out, last_state = torch.ops.eagle_ops.chunk_gated_delta_rule_extend(
++            out, last_state, h = torch.ops.eagle_ops.chunk_gated_delta_rule_extend(
 +                q.contiguous(), k.contiguous(), v.contiguous(),
 +                g.contiguous(), beta.contiguous(),
 +                state_in, query_start_loc.to(torch.int32).contiguous(),
-+                scale,
++                scale, h_chunk,
 +            )
-+            # Match chunk_gated_delta_rule_torch return: (o, last_recurrent_state, h_aux)
-+            return out, last_state, None
++            return out, last_state, (h if h_chunk > 0 else None)
 +
          return chunk_gated_delta_rule(
              q=q,
              k=k,
+@@ -154,6 +201,11 @@ class TritonGDNKernel(LinearAttnKernelBase):
+             cu_seqlens=query_start_loc,
+             head_first=False,
+             use_qk_l2norm_in_kernel=True,
++            **(
++                {"intermediate_chunk_size": kwargs["intermediate_chunk_size"]}
++                if is_xpu() and kwargs.get("intermediate_chunk_size")
++                else {}
++            ),
+             **recurrent_state_indices_args,
+         )
+ 
 diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py
 index ae5365e8d..0f54d2a8c 100644
 --- a/python/sglang/srt/layers/attention/triton_backend.py
@@ -2041,10 +2227,18 @@ index 30a035a23..c82c83ed6 100644
              # Dynamic scaling
              if use_per_token_if_dynamic:
 diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
-index 6c6827c7d..3124ad633 100755
+index 6c6827c7d..33ba1e5de 100755
 --- a/python/sglang/srt/layers/quantization/fp8_utils.py
 +++ b/python/sglang/srt/layers/quantization/fp8_utils.py
-@@ -46,6 +46,7 @@ from sglang.srt.utils import (
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ from enum import Enum
+ from functools import lru_cache
+ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
+@@ -46,6 +47,7 @@ from sglang.srt.utils import (
      is_sm90_supported,
      is_sm100_supported,
      is_sm120_supported,
@@ -2052,7 +2246,7 @@ index 6c6827c7d..3124ad633 100755
      offloader,
  )
  from sglang.srt.utils.custom_op import register_custom_op
-@@ -59,6 +60,19 @@ _is_sm100_supported = is_sm100_supported()
+@@ -59,6 +61,22 @@ _is_sm100_supported = is_sm100_supported()
  _is_sm120_supported = is_sm120_supported()
  _is_gfx95_supported = is_gfx95_supported()
  _is_musa = is_musa()
@@ -2061,6 +2255,9 @@ index 6c6827c7d..3124ad633 100755
 +# Lazy-loaded handle to the merged custom_esimd_kernels_sglang
 +# esimd_gemm_fp8_pert kernel wrapper.
 +# Only initialised on XPU; None elsewhere or if the package is missing.
++# Output width below which the ESIMD kernel is preferred at any M, because
++# torch._scaled_mm is not reproducible on narrow-N shapes (see apply_fp8_linear).
++_XPU_ESIMD_FP8_NARROW_N = int(os.environ.get("SGL_XPU_ESIMD_FP8_NARROW_N", "128"))
 +_esimd_gemm_fp8_pert = None
 +if _is_xpu:
 +    try:
@@ -2072,7 +2269,7 @@ index 6c6827c7d..3124ad633 100755
  
  _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
  _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
-@@ -121,6 +135,9 @@ if _is_cuda:
+@@ -121,6 +139,9 @@ if _is_cuda:
  
  
  use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
@@ -2082,7 +2279,7 @@ index 6c6827c7d..3124ad633 100755
  
  # Input scaling factors are no longer optional in _scaled_mm starting
  # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
-@@ -188,6 +205,7 @@ class Fp8GemmRunnerBackend(Enum):
+@@ -188,6 +209,7 @@ class Fp8GemmRunnerBackend(Enum):
      DEEP_GEMM = "deep_gemm"
      TRITON = "triton"
      AITER = "aiter"
@@ -2090,7 +2287,7 @@ index 6c6827c7d..3124ad633 100755
  
      def is_auto(self) -> bool:
          return self == Fp8GemmRunnerBackend.AUTO
-@@ -213,6 +231,9 @@ class Fp8GemmRunnerBackend(Enum):
+@@ -213,6 +235,9 @@ class Fp8GemmRunnerBackend(Enum):
      def is_aiter(self) -> bool:
          return self == Fp8GemmRunnerBackend.AITER
  
@@ -2100,7 +2297,7 @@ index 6c6827c7d..3124ad633 100755
  
  FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
  
-@@ -439,6 +460,17 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
+@@ -439,6 +464,17 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
      elif backend.is_triton():
          return triton_w8a8_block_fp8_linear
  
@@ -2118,7 +2315,7 @@ index 6c6827c7d..3124ad633 100755
      else:
          raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
  
-@@ -832,6 +864,55 @@ def triton_w8a8_block_fp8_linear(
+@@ -832,6 +868,55 @@ def triton_w8a8_block_fp8_linear(
      input_2d = input.view(-1, input.shape[-1])
      output_shape = [*input.shape[:-1], weight.shape[0]]
  
@@ -2174,7 +2371,7 @@ index 6c6827c7d..3124ad633 100755
      q_input, x_scale = per_token_group_quant_fp8(
          input_2d, block_size[1], column_major_scales=False
      )
-@@ -843,6 +924,50 @@ def triton_w8a8_block_fp8_linear(
+@@ -843,6 +928,50 @@ def triton_w8a8_block_fp8_linear(
      return output.to(dtype=input_2d.dtype).view(*output_shape)
  
  
@@ -2225,7 +2422,7 @@ index 6c6827c7d..3124ad633 100755
  @lru_cache(maxsize=1)
  def _get_triton_mxfp8_downcast():
      try:
-@@ -1444,6 +1569,55 @@ def _apply_fallback_scaled_mm(
+@@ -1444,6 +1573,55 @@ def _apply_fallback_scaled_mm(
      input_dtype,
  ):
      global TORCH_DEVICE_IDENTITY
@@ -2281,7 +2478,7 @@ index 6c6827c7d..3124ad633 100755
      if TORCH_DEVICE_IDENTITY is None:
          TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32, device=weight.device)
  
-@@ -1482,15 +1656,54 @@ def apply_fp8_linear(
+@@ -1482,15 +1660,62 @@ def apply_fp8_linear(
      # We also don't pad when using torch.compile,
      # as it breaks with dynamic shapes.
      if pad_output is None:
@@ -2302,6 +2499,14 @@ index 6c6827c7d..3124ad633 100755
 +    # Restricted to small M (M<=64) since the kernel's M>=64 weight-stationary
 +    # path is much slower than torch._scaled_mm (verified: 14000us vs 156us at
 +    # M=4096). Triggered for decode (M=1) and small chunked-prefill batches.
++    #
++    # Narrow-N GEMMs take the ESIMD path at any M as well: torch._scaled_mm
++    # splits such shapes along K and reduces the partials in an order that
++    # varies with GPU occupancy, so the same operands can yield two different
++    # results (observed on GDN in_proj_ba, N=32, on prefill tail chunks with
++    # M>64 -- it made prefill non-deterministic). N is tiny there, so the
++    # weight-stationary path costs almost nothing at these shapes.
++    _n_out = weight.shape[1]
 +    if (
 +        _is_xpu
 +        and _esimd_gemm_fp8_pert is not None
@@ -2309,7 +2514,7 @@ index 6c6827c7d..3124ad633 100755
 +        and not (cutlass_fp8_supported and weight_scale.numel() == weight.shape[1])
 +        and (weight_scale.numel() == 1)
 +        and bias is None
-+        and input_2d.shape[0] <= 64
++        and (input_2d.shape[0] <= 64 or _n_out <= _XPU_ESIMD_FP8_NARROW_N)
 +    ):
 +        weight_nk = getattr(weight, "_esimd_t", None)
 +        if weight_nk is None:
@@ -2340,7 +2545,7 @@ index 6c6827c7d..3124ad633 100755
          # Maybe apply padding to output, see comment in __init__
          num_token_padding = output_padding
 diff --git a/python/sglang/srt/layers/quantization/gguf.py b/python/sglang/srt/layers/quantization/gguf.py
-index 5c1e7a63e..ee9d9be32 100644
+index 5c1e7a63e..9ae9c0a6d 100644
 --- a/python/sglang/srt/layers/quantization/gguf.py
 +++ b/python/sglang/srt/layers/quantization/gguf.py
 @@ -1,9 +1,9 @@
@@ -2454,7 +2659,7 @@ index 5c1e7a63e..ee9d9be32 100644
              return GGUFMoEMethod(self)
          return None
  
-@@ -456,6 +534,1362 @@ class GGUFLinearMethod(LinearMethodBase):
+@@ -456,6 +534,1425 @@ class GGUFLinearMethod(LinearMethodBase):
          return out
  
  
@@ -2555,6 +2760,9 @@ index 5c1e7a63e..ee9d9be32 100644
 +    return dequant.view(*x.shape, hidden_size)
 +
 +
++_XPU_EMB_DEBUG = os.environ.get("SGLANG_GGUF_EMB_DEBUG", "0") == "1"
++
++
 +class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
 +    """GGUF embedding for Intel XPU (PTL Xe3).
 +
@@ -2579,18 +2787,35 @@ index 5c1e7a63e..ee9d9be32 100644
 +        layer._xpu_emb_rep = _xpu_prepare_shard(
 +            layer.qweight.data, int(qweight_type), self.params_dtype
 +        )
++        if _XPU_EMB_DEBUG:
++            rep = layer._xpu_emb_rep
++            msg = ["kind=%s" % rep[0]]
++            for i, t in enumerate(rep[1:]):
++                if not torch.is_tensor(t):
++                    continue
++                if t.dtype.is_floating_point:
++                    nb = int((~torch.isfinite(t)).sum().item())
++                    msg.append(
++                        "t%d %s %s nonfinite=%d absmax=%.6g"
++                        % (i, tuple(t.shape), t.dtype, nb,
++                           float(t.abs().float().max().item()))
++                    )
++                else:
++                    msg.append("t%d %s %s" % (i, tuple(t.shape), t.dtype))
++            logger.error("[EMBDEBUG] rep health: %s", " | ".join(msg))
 +        if hasattr(layer, "qweight"):
 +            del layer.qweight
 +
 +    def embedding(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
-+        debug_bounds = False
++        debug_bounds = _XPU_EMB_DEBUG
 +
 +        def _log_nonfinite_once(flag_name: str, stage: str, t: torch.Tensor):
 +            if not debug_bounds or t.numel() == 0 or bool(torch.isfinite(t).all().item()):
 +                return
-+            if getattr(layer, flag_name, False):
++            n = getattr(layer, flag_name, 0)
++            if n >= 8:
 +                return
-+            setattr(layer, flag_name, True)
++            setattr(layer, flag_name, n + 1)
 +            row_bad = ~torch.isfinite(t.reshape(t.shape[0], -1)).all(dim=1)
 +            bad_rows = row_bad.nonzero(as_tuple=False).flatten()
 +            bad_rows_head = bad_rows[:16].tolist()
@@ -2601,16 +2826,26 @@ index 5c1e7a63e..ee9d9be32 100644
 +                and x_flat_dbg.numel() >= int(bad_rows.max().item()) + 1
 +                else []
 +            )
++            # Element-level (not whole-row) badness: report the exact flat
++            # positions so a partial-row corruption is distinguishable from a
++            # bad table row.
++            bad_flat = (~torch.isfinite(t)).nonzero(as_tuple=False)
 +            logger.error(
 +                "GGUFEmbeddingXPUMethod non-finite at %s: dtype=%s shape=%s "
-+                "nan=%d inf=%d bad_rows_head=%s bad_token_ids_head=%s",
++                "nan=%d inf=%d n_bad_rows=%d bad_rows_head=%s bad_token_ids_head=%s "
++                "bad_elem_head=%s id_min=%d id_max=%d ntok=%d",
 +                stage,
 +                str(t.dtype),
 +                tuple(t.shape),
 +                int(torch.isnan(t).sum().item()),
 +                int(torch.isinf(t).sum().item()),
++                int(bad_rows.numel()),
 +                bad_rows_head,
 +                bad_ids_head,
++                bad_flat[:8].tolist(),
++                int(x_flat_dbg.min().item()) if x_flat_dbg.numel() else -1,
++                int(x_flat_dbg.max().item()) if x_flat_dbg.numel() else -1,
++                int(x_flat_dbg.numel()),
 +            )
 +
 +        # Eagle/NEXTN embed-share: set_embed_and_head may have replaced this
@@ -2819,6 +3054,13 @@ index 5c1e7a63e..ee9d9be32 100644
 +_Q4_K_BYTES = 144       # half2 dm(4) + scales[12] + qs[128]
 +_MOE_DOWN_REPACK_CHUNK_ROWS = int(
 +    os.environ.get("SGLANG_GGUF_XPU_MOE_REPACK_CHUNK_ROWS", "65536"))
++# Cap on the transient int32 intermediate produced per repack chunk. The q5/q6
++# repack path materializes several [rows, K] int32 tensors at once, so a fixed
++# row count scales badly with K: the 248320x2048 embedding needs ~1.5-2 GB per
++# 65536-row chunk, which OOMs at TP=1 (the whole table lives on one card).
++# Chunk rows are derived from this budget so wide tensors are split finer.
++_REPACK_CHUNK_BUDGET_BYTES = int(
++    os.environ.get("SGLANG_GGUF_XPU_REPACK_CHUNK_BYTES", str(32 << 20)))
 +
 +
 +def _xpu_repack_q4_k(qweight: torch.Tensor):
@@ -2903,7 +3145,7 @@ index 5c1e7a63e..ee9d9be32 100644
 +
 +
 +def _xpu_repack_rows_chunked(repack_fn, qweight: torch.Tensor,
-+                             chunk_rows: int = _MOE_DOWN_REPACK_CHUNK_ROWS,
++                             chunk_rows: int = None,
 +                             **kwargs):
 +    """Generic row-chunked wrapper for any of the _xpu_repack_q{4,5,6}_k
 +    functions (col_perm only reorders the K/column dim, so it composes
@@ -2911,8 +3153,18 @@ index 5c1e7a63e..ee9d9be32 100644
 +    lm_head weight, vocab_size rows) where a single whole-tensor repack call
 +    creates multi-GB int32 intermediates and was the cause of a second
 +    TP=1-loading OOM (in _xpu_prepare_shard, downstream of
-+    GGUFEmbeddingXPUMethod.process_weights_after_loading)."""
++    GGUFEmbeddingXPUMethod.process_weights_after_loading).
++
++    chunk_rows defaults to whatever keeps one chunk's int32 intermediates
++    under _REPACK_CHUNK_BUDGET_BYTES, so narrow tensors keep using large
++    chunks while wide ones (big K) are split finer."""
 +    N = qweight.shape[0]
++    if chunk_rows is None:
++        # qweight rows are packed bytes; the repack blows them up to int32
++        # elements, so estimate the per-row cost from the byte width.
++        row_bytes = max(1, int(qweight.shape[1])) * 4
++        chunk_rows = max(1024, _REPACK_CHUNK_BUDGET_BYTES // row_bytes)
++        chunk_rows = min(chunk_rows, _MOE_DOWN_REPACK_CHUNK_ROWS)
 +    if N <= chunk_rows:
 +        return repack_fn(qweight, **kwargs)
 +    outs = None
@@ -3670,14 +3922,30 @@ index 5c1e7a63e..ee9d9be32 100644
 +    """D1: if every shard in `ids` is the SAME GEMV rep kind (q8_0 or q4_0) with
 +    the same K, build one merged rep by row-concatenating the per-shard weights,
 +    plus the per-shard N sizes (to slice the output). Returns
-+    (merged_rep, [N0, N1, ...]) or None if not mergeable (mixed kinds / fp16 /
-+    k-quant — those keep the per-shard path). Bit-exact: q8_0/q4_0 rows are
++    (merged_rep, [N0, N1, ...]) or None if not mergeable (mixed kinds /
++    k-quant — those keep the per-shard path). Bit-exact: q8_0/q4_0/fp16 rows are
 +    independent, so cat-then-GEMV == per-shard-GEMV-then-cat.
 +    notes §10bj."""
 +    kinds = {reps[i][0] for i in ids}
 +    if len(ids) < 2 or len(kinds) != 1:
 +        return None
 +    kind = next(iter(kinds))
++    if kind == "fp16":
++        # D2: the GDN in_proj_ba shards (ssm_beta/ssm_alpha) are unquantized F32
++        # -> two fp16 dense reps of N=num_v_heads/tp. Unmerged they cost 2 tiny
++        # oneDNN mm (25us host each) + a torch.cat (62us host) per layer, i.e.
++        # ~3.4ms/step at 30 GDN layers — pure launch overhead, the GEMVs are 64KB.
++        # Row-cat them into one [sumN, K] weight so apply() issues a single mm
++        # and the cat disappears. Bit-exact (dense rows are independent).
++        Ks = {reps[i][1].shape[1] for i in ids if reps[i][1].dim() == 2}
++        if len(Ks) != 1:
++            return None
++        # An unloaded/empty shard must keep the per-shard path (shape is bogus).
++        if any(reps[i][1].dim() != 2 or reps[i][1].numel() == 0 for i in ids):
++            return None
++        sizes = [reps[i][1].shape[0] for i in ids]
++        w = torch.cat([reps[i][1] for i in ids], dim=0).contiguous()
++        return (("fp16", w, None), sizes)
 +    if kind == "q8_0":
 +        # rep = ("q8_0", qs[N,K] int8, scale[N,K/32] f16)
 +        Ks = {reps[i][1].shape[1] for i in ids}
@@ -3817,7 +4085,7 @@ index 5c1e7a63e..ee9d9be32 100644
  class GGUFMoEMethod(FusedMoEMethodBase):
      """MoE method for GGUF.
  
-@@ -565,6 +1999,260 @@ class GGUFMoEMethod(FusedMoEMethodBase):
+@@ -565,6 +2062,260 @@ class GGUFMoEMethod(FusedMoEMethodBase):
          return StandardCombineInput(hidden_states=output)
  
  
@@ -4269,7 +4537,7 @@ index ebbfc2b28..68891945d 100644
  
          if self.model_runner.server_args.debug_cuda_graph:
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 3b30eb0e1..141eb11a4 100644
+index 3b30eb0e1..93c745eef 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -849,6 +849,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
@@ -4292,6 +4560,90 @@ index 3b30eb0e1..141eb11a4 100644
          elif current_platform.is_out_of_tree():
              self.init_attention_backend()
              if current_platform.support_cuda_graph():
+@@ -1273,6 +1286,73 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+                 ),
+             )
+ 
++    def _install_layer_trace_hooks(self):
++        """Dump a per-module fingerprint of every forward output.
++
++        Used to locate where prefill indeterminism first appears: run the same
++        prompt twice, then diff the two traces to find the first module whose
++        output changes. Enabled with SGLANG_XPU_LAYER_TRACE=<path prefix>.
++        """
++        import json as _json
++        import zlib as _zlib
++
++        prefix = os.environ["SGLANG_XPU_LAYER_TRACE"]
++        rank = getattr(self, "tp_rank", 0)
++        path = f"{prefix}.rank{rank}.jsonl"
++        # Truncate any trace left over from a previous server instance.
++        open(path, "w").close()
++
++        def fingerprint(t):
++            if not isinstance(t, torch.Tensor) or t.numel() == 0:
++                return None
++            f = t.detach().to(torch.float64)
++            # A sum/abs-sum pair can collide (any permutation preserves both),
++            # so carry a byte-exact CRC of the raw values as well: "input is
++            # identical" has to be a bit-level claim, not a statistical one.
++            try:
++                b = t.detach().contiguous().cpu().numpy().tobytes()
++                crc = _zlib.crc32(b) & 0xFFFFFFFF
++            except Exception:
++                crc = None
++            return [float(f.sum().item()), float(f.abs().sum().item()),
++                    list(t.shape), crc]
++
++        def make_hook(name):
++            def hook(_mod, inp, out):
++                first = out
++                if isinstance(out, (tuple, list)):
++                    first = next((o for o in out
++                                  if isinstance(o, torch.Tensor)), None)
++                fp = fingerprint(first)
++                if fp is None:
++                    return
++                if name == state["first"]:
++                    state["step"] += 1
++                rec = {"name": name, "fp": fp, "s": state["step"]}
++                # Input fingerprint too: an output-only trace cannot tell a
++                # module that was fed different data from one that is itself
++                # non-deterministic.
++                src = inp[0] if isinstance(inp, (tuple, list)) and inp else inp
++                ifp = fingerprint(src)
++                if ifp is not None:
++                    rec["ifp"] = ifp
++                with open(path, "a") as fh:
++                    fh.write(_json.dumps(rec) + "\n")
++            return hook
++
++        state = {"step": -1, "first": None}
++
++        want = os.environ.get("SGLANG_XPU_LAYER_TRACE_FILTER", "layers.")
++        n = 0
++        for name, mod in self.model.named_modules():
++            if want and want not in name:
++                continue
++            if state["first"] is None:
++                state["first"] = name
++            mod.register_forward_hook(make_hook(name))
++            n += 1
++        logger.warning("[LAYER_TRACE] hooked %d modules -> %s", n, path)
++
+     def load_model(self):
+         tic_total = time.perf_counter()
+         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+@@ -1383,6 +1463,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             pyt_hooks = PytHooks()
+             pyt_hooks.register_hooks(self.model, module_prefix="model")
+ 
++        if os.environ.get("SGLANG_XPU_LAYER_TRACE"):
++            self._install_layer_trace_hooks()
++
+         if self.server_args.kv_cache_dtype == "fp8_e4m3":
+             if self.server_args.quantization_param_path is not None:
+                 if callable(getattr(self.model, "load_kv_cache_scales", None)):
 diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
 index 32ff5bac2..6b7d1eff6 100644
 --- a/python/sglang/srt/model_loader/loader.py
@@ -4687,7 +5039,7 @@ index 32ff5bac2..6b7d1eff6 100644
      # FP8 approach: BF16/FP16 model with native FP8 quantization
      if load_config.load_format == LoadFormat.FLASH_RL:
 diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
-index 37552404b..4498c7d22 100644
+index 37552404b..74b209839 100644
 --- a/python/sglang/srt/models/qwen2_moe.py
 +++ b/python/sglang/srt/models/qwen2_moe.py
 @@ -19,6 +19,7 @@
@@ -4706,7 +5058,47 @@ index 37552404b..4498c7d22 100644
      tensor_model_parallel_all_reduce,
  )
  from sglang.srt.distributed.parallel_state import (
-@@ -123,6 +125,451 @@ _is_hip = is_hip()
+@@ -116,6 +118,39 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+ 
+ logger = logging.getLogger(__name__)
+ 
++# ── NaN/Inf probe (env-gated: SGLANG_NAN_PROBE=1) ───────────────────────────
++# Isolates whether a non-finite MoE output originates in the routed experts
++# (e.g. GGUF grouped prefill GGEMV at batch>8) or the shared expert. Zero
++# overhead when SGLANG_NAN_PROBE is unset. See qwen3_5.py for the layer-level
++# probe that pins down the origin layer / prefill-vs-decode / token count.
++import os as _os_np_moe
++
++_NAN_PROBE_MOE = _os_np_moe.environ.get("SGLANG_NAN_PROBE", "0") == "1"
++
++
++def _nan_probe_moe(tag, t, layer_id=None, forward_batch=None):
++    if not _NAN_PROBE_MOE or not torch.is_tensor(t) or t.numel() == 0:
++        return
++    try:
++        if not t.dtype.is_floating_point or bool(torch.isfinite(t).all()):
++            return
++        mode = "?"
++        if forward_batch is not None:
++            fm = getattr(forward_batch, "forward_mode", None)
++            mode = getattr(fm, "name", str(fm)) if fm is not None else "?"
++        logger.error(
++            "[NANPROBE] tag=%s layer=%s mode=%s ntok=%d shape=%s nan=%d inf=%d",
++            tag,
++            layer_id,
++            mode,
++            int(t.shape[0]) if t.dim() > 0 else -1,
++            tuple(t.shape),
++            int(torch.isnan(t).sum().item()),
++            int(torch.isinf(t).sum().item()),
++        )
++    except Exception:
++        pass
++
+ _is_cuda = is_cuda()
+ _is_cpu = is_cpu()
+ _is_cpu_amx_available = cpu_has_amx_support()
+@@ -123,6 +158,805 @@ _is_hip = is_hip()
  _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
  
  
@@ -5011,6 +5403,360 @@ index 37552404b..4498c7d22 100644
 +    }
 +
 +
++_GGUF_INTROSPECT_DONE = set()
++def _load_shared_q8_op():
++    try:
++        import custom_esimd_kernels_sglang.custom_esimd_kernels  # noqa: F401 (registers ops)
++    except Exception:
++        pass
++    ns = getattr(torch.ops, "custom_esimd_kernels_sglang", None)
++    return getattr(ns, "esimd_shared_expert_q8", None) if ns is not None else None
++
++
++_GGUF_MOE_SHARED = bool(
++    os.environ.get("SGL_XPU_GGUF_MOE_SHARED")
++    or os.environ.get("SGLANG_XPU_GGUF_MOE_SHARED")
++)
++_SHARED_Q8_OP = None
++
++
++def _gather_gguf_shared_q8(block):
++    """Collect + validate the Q8_0 shared-expert tensors for the fused decode op.
++    Returns (gu_qs, gu_sc, d_qs, d_sc, wg, inter_s) or False to disable."""
++    se = getattr(block, "shared_expert", None)
++    sg = getattr(block, "shared_expert_gate", None)
++    if se is None or sg is None:
++        return False
++    gu = getattr(se, "gate_up_proj", None)
++    dn = getattr(se, "down_proj", None)
++    if gu is None or dn is None:
++        return False
++
++    # gate_up: prefer the merged rep (rows gate then up); else concat per-shard.
++    merged = getattr(gu, "_xpu_merged", None)
++    if isinstance(merged, tuple) and merged and merged[0] == "q8_0":
++        gu_qs, gu_sc = merged[1].contiguous(), merged[2].contiguous()
++    else:
++        reps = getattr(gu, "_xpu_reps", None)
++        order = getattr(gu, "_xpu_shard_order", None)
++        if not isinstance(reps, dict) or not order:
++            return False
++        parts = [reps[i] for i in order]
++        if any((not isinstance(p, tuple)) or p[0] != "q8_0" for p in parts):
++            return False
++        gu_qs = torch.cat([p[1] for p in parts], dim=0).contiguous()
++        gu_sc = torch.cat([p[2] for p in parts], dim=0).contiguous()
++
++    dreps = getattr(dn, "_xpu_reps", None)
++    drep = dreps.get("_single") if isinstance(dreps, dict) else None
++    if not (isinstance(drep, tuple) and drep[0] == "q8_0"):
++        return False
++    d_qs, d_sc = drep[1].contiguous(), drep[2].contiguous()
++
++    w = getattr(sg, "weight", None)
++    if w is None or w.dim() != 2 or w.shape[0] != 1:
++        return False
++    wg = (w[0] if w.dtype == torch.float16 else w[0].to(torch.float16)).contiguous()
++
++    two_inter, hidden = gu_qs.shape
++    inter_s = two_inter // 2
++    # shape/dtype guards: a bad tensor never reaches the kernel.
++    if gu_qs.dtype != torch.int8 or d_qs.dtype != torch.int8:
++        return False
++    if (hidden % 32) or (inter_s % 32) or (two_inter % 2):
++        return False
++    if tuple(d_qs.shape) != (hidden, inter_s):
++        return False
++    if tuple(gu_sc.shape) != (two_inter, hidden // 32):
++        return False
++    if tuple(d_sc.shape) != (hidden, inter_s // 32):
++        return False
++    if wg.shape[0] != hidden:
++        return False
++    return (gu_qs, gu_sc, d_qs, d_sc, wg, int(inter_s))
++
++
++def _maybe_gguf_shared_q8(block, x):
++    """One-dispatch fused GGUF Q8_0 shared expert (gate_up+silu+down+gate*sigmoid).
++    Returns the shared-expert partial [M, hidden] fp16, or None to fall back to
++    the unfused ``_forward_shared_experts`` path. Env-gated by
++    SGL_XPU_GGUF_MOE_SHARED=1."""
++    if not _GGUF_MOE_SHARED or x.device.type != "xpu" or x.dim() != 2:
++        return None
++    global _SHARED_Q8_OP
++    if _SHARED_Q8_OP is None:
++        _SHARED_Q8_OP = _load_shared_q8_op()
++        if _SHARED_Q8_OP is None:
++            return None
++    cache = getattr(block, "_gguf_shared_q8_cache", None)
++    if cache is None:
++        cache = _gather_gguf_shared_q8(block)
++        block._gguf_shared_q8_cache = cache
++    if not cache:
++        return None
++    gu_qs, gu_sc, d_qs, d_sc, wg, inter_s = cache
++    xf = x if x.dtype == torch.float16 else x.to(torch.float16)
++    try:
++        return _SHARED_Q8_OP(xf, gu_qs, gu_sc, d_qs, d_sc, wg, inter_s)
++    except Exception:
++        block._gguf_shared_q8_cache = False
++        return None
++
++
++# ═══════════════ GGUF FULL MoE fusion (topk + routed + shared -> 1 op) ═══════════════
++_GGUF_MOE_FULL = bool(
++    os.environ.get("SGL_XPU_GGUF_MOE_FULL")
++    or os.environ.get("SGLANG_XPU_GGUF_MOE_FULL")
++)
++_GGUF_FULL_OP = None
++_GGUF_FULL_NORM_OP = None
++
++
++def _env_int(name, default):
++    try:
++        v = os.environ.get(name)
++        return default if v is None or v == "" else int(v)
++    except Exception:
++        return default
++
++
++# Largest decode batch the norm-fused GGUF MoE op is allowed to serve. Every
++# kernel stage behind it (topk / up_q4k / shared_up_q8 / down / finalize) is
++# already M-generic and the C++ side sizes all scratch from x.size(0), so this
++# is purely a policy cap: it keeps the fused path away from prefill-sized M
++# where the per-token GEMV shape stops paying off. Set to 1 to A/B the fusion.
++_GGUF_MOE_FUSE_MAX_M = _env_int("SGL_XPU_GGUF_MOE_FUSE_MAX_M", 64)
++
++
++def _load_gguf_moe_full_norm_op():
++    """Norm-fused GGUF MoE op: absorbs the post-attention GemmaRMSNorm and the
++    fp16 router GEMV, cutting two host dispatches per layer on the (host-bound)
++    decode path. Returns None on older kernel builds."""
++    try:
++        import custom_esimd_kernels_sglang.custom_esimd_kernels  # noqa: F401
++    except Exception:
++        pass
++    ns = getattr(torch.ops, "custom_esimd_kernels_sglang", None)
++    if ns is None:
++        return None
++    return getattr(ns, "esimd_moe_forward_full_gguf_norm", None)
++
++
++def _gguf_router_weight(gate):
++    """The dense fp16 router weight [E, hidden] behind the MoE gate linear, or
++    None when it cannot be expressed that way.
++
++    Two layouts occur for the 35B GGUF checkpoint: ``ffn_gate_inp`` is stored
++    unquantized (F32), so depending on the quant config the gate is either a
++    plain ``UnquantizedLinearMethod`` (weight on the module) or a GGUF XPU
++    linear holding a single fp16 resident rep. Handle both; the fp16 copy is
++    cached on the module so the (possible) cast happens once, not per step.
++    """
++    w = getattr(gate, "_esimd_router_w16", None)
++    if w is not None:
++        return w
++    reps = getattr(gate, "_xpu_reps", None)
++    if reps is None:
++        qm = getattr(gate, "quant_method", None)
++        reps = getattr(qm, "_xpu_reps", None)
++    if isinstance(reps, dict) and list(reps.keys()) == ["_single"]:
++        rep = reps["_single"]
++        w = rep[1] if rep[0] == "fp16" else None
++    else:
++        w = getattr(gate, "weight", None)
++        w = getattr(w, "data", w)
++    if w is None or w.dim() != 2:
++        return None
++    if w.dtype != torch.float16:
++        w = w.to(torch.float16)
++    w = w.contiguous()
++    gate._esimd_router_w16 = w
++    return w
++
++
++def _load_gguf_moe_full_op():
++    try:
++        import custom_esimd_kernels_sglang.custom_esimd_kernels  # noqa: F401
++    except Exception:
++        pass
++    ns = getattr(torch.ops, "custom_esimd_kernels_sglang", None)
++    return getattr(ns, "esimd_moe_forward_full_gguf", None) if ns is not None else None
++
++
++def _gather_gguf_moe_full(block):
++    """Collect + validate everything the fused GGUF full-MoE op needs:
++    routed Q4_K gate/up + Q5_K/Q6_K down reps (from experts.quant_method),
++    the Q8_0 shared-expert reps, top_k, renorm, and dims. Returns a dict or
++    False. Every layout/dtype check here keeps a bad tensor off the kernel."""
++    experts = getattr(block, "experts", None)
++    topk = getattr(block, "topk", None)
++    gate = getattr(block, "gate", None)
++    if experts is None or topk is None or gate is None:
++        return False
++    qm = getattr(experts, "quant_method", None)
++    if qm is None or not hasattr(qm, "gate_ql") or not hasattr(qm, "down_ql"):
++        return False
++
++    # topk must be plain softmax + renorm (matches the fused kernel selection).
++    tc = getattr(topk, "topk_config", None)
++    if tc is None:
++        return False
++    if getattr(tc, "scoring_func", "softmax") != "softmax":
++        return False
++    if getattr(tc, "use_grouped_topk", False):
++        return False
++    if getattr(tc, "correction_bias", None) is not None:
++        return False
++    if getattr(tc, "custom_routing_function", None) is not None:
++        return False
++    top_k = getattr(tc, "top_k", None)
++    if top_k is None:
++        return False
++    renorm = bool(getattr(tc, "renormalize", True))
++
++    shared = _gather_gguf_shared_q8(block)
++    if not shared:
++        return False
++    gu_qs, gu_sc, d_qs, d_sc, wg, inter_s = shared
++
++    down_mn = getattr(qm, "down_mn", None)
++    down_is_q6 = bool(getattr(qm, "_down_is_q6", False))
++    # q5k needs down_mn; q6k ignores it (pass down_sc as a valid placeholder).
++    if down_mn is None:
++        if not down_is_q6:
++            return False
++        down_mn = qm.down_sc
++
++    hidden = int(getattr(qm, "hidden"))
++    inter = int(getattr(qm, "intermediate"))
++    E = int(getattr(qm, "E"))
++    # shared and routed share the same hidden; inter_s (shared) may differ.
++    if wg.shape[0] != hidden:
++        return False
++    return {
++        "gate": gate, "top_k": int(top_k), "renorm": renorm,
++        "E": E, "hidden": hidden, "inter": inter, "inter_s": int(inter_s),
++        "down_is_q6": down_is_q6,
++        "gate_ql": qm.gate_ql, "gate_sc": qm.gate_sc, "gate_mn": qm.gate_mn,
++        "up_ql": qm.up_ql, "up_sc": qm.up_sc, "up_mn": qm.up_mn,
++        "down_ql": qm.down_ql, "down_qh": qm.down_qh_plain,
++        "down_sc": qm.down_sc, "down_mn": down_mn,
++        "gu_qs": gu_qs, "gu_sc": gu_sc, "d_qs": d_qs, "d_sc": d_sc, "wg": wg,
++    }
++
++
++def _maybe_gguf_moe_full_norm(block, h, residual, nw, eps):
++    """Norm-fused GGUF MoE: GemmaRMSNorm(resadd) + router GEMV + experts in ONE
++    dispatch. Returns ``(moe_out, new_residual)`` or None to fall back.
++
++    ``residual`` is updated in place by the kernel (same as
++    ``gemma_fused_add_rmsnorm``), so a None return must happen BEFORE the call.
++    """
++    if not _GGUF_MOE_FULL or h.device.type != "xpu" or h.dim() != 2:
++        return None
++    if not 1 <= h.shape[0] <= _GGUF_MOE_FUSE_MAX_M:
++        return None
++    global _GGUF_FULL_NORM_OP
++    if _GGUF_FULL_NORM_OP is None:
++        _GGUF_FULL_NORM_OP = _load_gguf_moe_full_norm_op()
++        if _GGUF_FULL_NORM_OP is None:
++            return None
++    cache = getattr(block, "_gguf_moe_full_cache", None)
++    if cache is None:
++        cache = _gather_gguf_moe_full(block)
++        block._gguf_moe_full_cache = cache
++    if not cache:
++        return None
++    if getattr(block, "_gguf_moe_full_norm_off", False):
++        return None
++    rw = cache.get("router_w", None)
++    if rw is None:
++        rw = _gguf_router_weight(cache["gate"])
++        if rw is None or rw.shape != (int(cache["E"]), int(cache["hidden"])):
++            logger.warning(
++                "[gguf_moe_full_norm] disabled: router weight %s, want (%s, %s)",
++                None if rw is None else tuple(rw.shape),
++                cache["E"], cache["hidden"])
++            block._gguf_moe_full_norm_off = True
++            return None
++        cache["router_w"] = rw
++    hf = h if h.dtype == torch.float16 else h.to(torch.float16)
++    hf = hf if hf.is_contiguous() else hf.contiguous()
++    if residual.dtype != torch.float16 or not residual.is_contiguous():
++        if not getattr(block, "_gguf_norm_res_warned", False):
++            block._gguf_norm_res_warned = True
++            logger.warning("[gguf_moe_full_norm] disabled: residual dtype=%s contig=%s",
++                           residual.dtype, residual.is_contiguous())
++        return None
++    try:
++        out, res_out = _GGUF_FULL_NORM_OP(
++            hf, residual, nw, float(eps), rw,
++            cache["gate_ql"], cache["gate_sc"], cache["gate_mn"],
++            cache["up_ql"], cache["up_sc"], cache["up_mn"],
++            cache["down_ql"], cache["down_qh"], cache["down_sc"], cache["down_mn"],
++            cache["gu_qs"], cache["gu_sc"], cache["d_qs"], cache["d_sc"], cache["wg"],
++            int(cache["E"]), int(cache["top_k"]), int(cache["inter"]),
++            int(cache["inter_s"]), bool(cache["down_is_q6"]), bool(cache["renorm"]),
++        )
++    except Exception as e:
++        logger.warning("[gguf_moe_full_norm] disabled: kernel raised %r", e)
++        block._gguf_moe_full_norm_off = True
++        return None
++    if not getattr(block, "_gguf_norm_ok_logged", False):
++        block._gguf_norm_ok_logged = True
++        logger.warning("[gguf_moe_full_norm] ACTIVE (norm + router folded into MoE op)")
++    return out, res_out
++
++
++def _maybe_gguf_moe_full(block, x):
++    """One-dispatch fused GGUF MoE: router topk + routed experts (Q4_K/Q5_K) +
++    Q8_0 shared expert -> the final [M, hidden] fp16 PARTIAL (routed + gate*shared
++    summed; caller does the all_reduce). Returns None to fall back to the unfused
++    router/shared path. Env-gated by SGL_XPU_GGUF_MOE_FULL=1."""
++    if not _GGUF_MOE_FULL or x.device.type != "xpu" or x.dim() != 2 or x.shape[0] > 8:
++        return None
++    global _GGUF_FULL_OP
++    if _GGUF_FULL_OP is None:
++        _GGUF_FULL_OP = _load_gguf_moe_full_op()
++        if _GGUF_FULL_OP is None:
++            _moe_full_dbg("gguf_op_none")
++            return None
++    cache = getattr(block, "_gguf_moe_full_cache", None)
++    if cache is None:
++        cache = _gather_gguf_moe_full(block)
++        block._gguf_moe_full_cache = cache
++    if not cache:
++        return None
++
++    gate = cache["gate"]
++    logits = _esimd_router_logits(gate, x)
++    if logits is None:
++        logits, _ = gate(x)
++    if logits.dtype != torch.float16:
++        logits = logits.to(torch.float16)
++    logits = logits if logits.dim() == 2 else logits.reshape(x.shape[0], -1)
++    logits = logits.contiguous()
++    xf = x if x.dtype == torch.float16 else x.to(torch.float16)
++    try:
++        out = _GGUF_FULL_OP(
++            xf, logits,
++            cache["gate_ql"], cache["gate_sc"], cache["gate_mn"],
++            cache["up_ql"], cache["up_sc"], cache["up_mn"],
++            cache["down_ql"], cache["down_qh"], cache["down_sc"], cache["down_mn"],
++            cache["gu_qs"], cache["gu_sc"], cache["d_qs"], cache["d_sc"], cache["wg"],
++            int(cache["E"]), int(cache["top_k"]), int(cache["inter"]),
++            int(cache["inter_s"]), bool(cache["down_is_q6"]), bool(cache["renorm"]),
++        )
++    except Exception as e:
++        _moe_full_dbg("gguf_kernel_exc", err=repr(e))
++        block._gguf_moe_full_cache = False
++        return None
++    if _MOE_FULL_DEBUG:
++        _moe_full_dbg("SUCCESS", T=int(x.shape[0]), E=int(cache["E"]),
++                      top_k=int(cache["top_k"]), out=tuple(out.shape), path="gguf_full")
++    return out
++
++
 +def _maybe_esimd_moe_full(block, hidden_states: torch.Tensor):
 +    """One-dispatch decode MoE via moe_forward_full_v2. Returns the final
 +    [T, hidden] fp16 tensor (routed + gate*shared, already summed), or None to
@@ -5158,7 +5904,15 @@ index 37552404b..4498c7d22 100644
  def can_fuse_shared_expert(
      config: PretrainedConfig,
      quant_config: Optional[QuantizationConfig],
-@@ -454,7 +901,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+@@ -208,6 +1042,7 @@ class Qwen2MoeMLP(nn.Module):
+ 
+ 
+ class Qwen2MoeSparseMoeBlock(nn.Module):
++    _prep_mlp_skip_seen = set()
+     def __init__(
+         self,
+         layer_id: int,
+@@ -454,7 +1289,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
  
      def _forward_router_experts(self, hidden_states: torch.Tensor):
          # router_logits: (num_tokens, n_experts)
@@ -5169,25 +5923,41 @@ index 37552404b..4498c7d22 100644
          topk_output = self.topk(hidden_states, router_logits)
          if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
              topk_output
-@@ -522,8 +971,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+@@ -522,8 +1359,31 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                  hidden_states
              )
          else:
 -            shared_output = self._forward_shared_experts(hidden_states)
 -            final_hidden_states = self._forward_router_experts(hidden_states)
 +            fused_full = _maybe_esimd_moe_full(self, hidden_states)
++            if fused_full is None:
++                fused_full = _maybe_gguf_moe_full(self, hidden_states)
 +            if fused_full is not None:
-+                # v2 returns routed + gate*shared already summed → skip the
++                # Fused op returns routed + gate*shared already summed → skip the
 +                # separate shared path and its add below.
 +                final_hidden_states = fused_full
 +                shared_output = None
 +            else:
-+                shared_output = self._forward_shared_experts(hidden_states)
++                shared_output = _maybe_gguf_shared_q8(self, hidden_states)
++                if shared_output is None:
++                    shared_output = self._forward_shared_experts(hidden_states)
++                _nan_probe_moe(
++                    "moe_shared_out",
++                    shared_output,
++                    layer_id=getattr(self, "layer_id", None),
++                    forward_batch=forward_batch,
++                )
 +                final_hidden_states = self._forward_router_experts(hidden_states)
++                _nan_probe_moe(
++                    "moe_routed_out",
++                    final_hidden_states,
++                    layer_id=getattr(self, "layer_id", None),
++                    forward_batch=forward_batch,
++                )
  
          if shared_output is not None:
              final_hidden_states += shared_output
-@@ -542,6 +998,96 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+@@ -542,6 +1402,120 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
  
          return final_hidden_states.view(num_tokens, hidden_dim)
  
@@ -5218,37 +5988,57 @@ index 37552404b..4498c7d22 100644
 +        that could invalidate the manual collectives are checked BEFORE any
 +        communication, so a ``None`` return never leaves a stray all-reduce.
 +        """
-+        if not _ESIMD_MOE_FULL:
++        def _skip(why):
++            # One-shot per reason: tells us which guard blocks the fusion
++            # without spamming a 40-layer x N-token decode loop.
++            seen = Qwen2MoeSparseMoeBlock._prep_mlp_skip_seen
++            if why not in seen:
++                seen.add(why)
++                logger.warning("[esimd_prepare_mlp_moe] disabled: %s", why)
 +            return None
++
++        if not _ESIMD_MOE_FULL and not _GGUF_MOE_FULL:
++            return _skip("no MOE_FULL env")
 +        ops = _load_esimd_moe_full_op()
-+        if ops is None or ops.get("rtfused_norm") is None:
-+            return None
++        # Either the fp8 ESIMD norm-fused op or the GGUF norm-fused op must be
++        # available, otherwise there is nothing to fold the norm into.
++        have_fp8 = (
++            _ESIMD_MOE_FULL and ops is not None and ops.get("rtfused_norm") is not None
++        )
++        have_gguf = _GGUF_MOE_FULL and _load_gguf_moe_full_norm_op() is not None
++        if not have_fp8 and not have_gguf:
++            return _skip("no norm-fused op (fp8=%s gguf=%s)" % (have_fp8, have_gguf))
 +        if not (
 +            hidden_states.device.type == "xpu"
 +            and forward_batch is not None
 +            and forward_batch.forward_mode.is_decode()
 +        ):
-+            return None
-+        if hidden_states.dim() != 2 or hidden_states.shape[0] != 1:
-+            return None
++            return _skip("not xpu decode")
++        # M>1 is only serviceable by the GGUF norm-fused op; the fp8 twin
++        # (_maybe_esimd_moe_full_norm) is still single-token. Without GGUF we
++        # keep the original M==1 gate so fp8-only setups are untouched.
++        max_m = _GGUF_MOE_FUSE_MAX_M if have_gguf else 1
++        if hidden_states.dim() != 2 or not (1 <= hidden_states.shape[0] <= max_m):
++            return _skip("shape %s" % (tuple(hidden_states.shape),))
 +        if residual is None or residual.shape != hidden_states.shape:
-+            return None
++            return _skip("residual mismatch")
 +        # Only the plain-TP path (no input-scatter, no DP-attention, no
 +        # all-reduce fusion, no reduce-scatter) matches the manual collectives.
 +        if use_reduce_scatter or should_allreduce_fusion:
-+            return None
++            return _skip("reduce_scatter=%s allreduce_fusion=%s"
++                         % (use_reduce_scatter, should_allreduce_fusion))
 +        if getattr(hidden_states, "_sglang_needs_allreduce_fusion", False):
-+            return None
++            return _skip("needs_allreduce_fusion flag")
 +        try:
 +            from sglang.srt.layers.communicator import get_attn_tp_context
 +            from sglang.srt.layers.dp_attention import get_attention_dp_size
 +
 +            if get_attn_tp_context().input_scattered:
-+                return None
++                return _skip("input_scattered")
 +            if get_attention_dp_size() != 1:
-+                return None
-+        except Exception:
-+            return None
++                return _skip("dp_size != 1")
++        except Exception as e:
++            return _skip("ctx probe exc %r" % (e,))
 +        # Fold GemmaRMSNorm (1 + weight) once per layer.
 +        nw = getattr(norm_module, "_esimd_moe_nw", None)
 +        if nw is None:
@@ -5263,7 +6053,11 @@ index 37552404b..4498c7d22 100644
 +        # ── Commit: reproduce prepare_mlp's attention-output all-reduce ──
 +        h_ar = attention_tensor_model_parallel_all_reduce(hidden_states)
 +
-+        fused = _maybe_esimd_moe_full_norm(self, h_ar, residual, nw, eps)
++        fused = None
++        if have_gguf:
++            fused = _maybe_gguf_moe_full_norm(self, h_ar, residual, nw, eps)
++        if fused is None and have_fp8:
++            fused = _maybe_esimd_moe_full_norm(self, h_ar, residual, nw, eps)
 +        if fused is not None:
 +            moe_out, new_residual = fused
 +            # Reproduce mlp.forward's post-experts all-reduce (kernel is per-rank).
@@ -5285,7 +6079,7 @@ index 37552404b..4498c7d22 100644
  class Qwen2MoeAttention(nn.Module):
      def __init__(
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
-index 65f78e691..65446f811 100644
+index 65f78e691..513307770 100644
 --- a/python/sglang/srt/models/qwen3_5.py
 +++ b/python/sglang/srt/models/qwen3_5.py
 @@ -15,8 +15,9 @@
@@ -5299,7 +6093,7 @@ index 65f78e691..65446f811 100644
  
  import torch
  import torch.nn as nn
-@@ -93,6 +94,7 @@ from sglang.srt.utils import (
+@@ -93,15 +94,107 @@ from sglang.srt.utils import (
      is_gfx95_supported,
      is_hip,
      is_npu,
@@ -5307,7 +6101,99 @@ index 65f78e691..65446f811 100644
      make_layers,
      set_weight_attrs,
  )
-@@ -102,6 +104,7 @@ logger = logging.getLogger(__name__)
+ from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
+ 
+ logger = logging.getLogger(__name__)
++
++# ── NaN/Inf probe (env-gated: SGLANG_NAN_PROBE=1) ───────────────────────────
++# Debug instrumentation to locate the first non-finite tensor in the forward
++# pass (symptom: "！！！" garbage generations, more frequent at batch>8/16).
++# Logs the ORIGIN stage (input clean -> output NaN/Inf) with layer id, forward
++# mode (EXTEND/DECODE), and token count so we can tell which kernel/batch size
++# introduces the NaN. Zero overhead when SGLANG_NAN_PROBE is unset.
++import os as _os_np
++
++_NAN_PROBE = _os_np.environ.get("SGLANG_NAN_PROBE", "0") == "1"
++
++_nan_probe_state = {"origin_found": False, "fwd": -1}
++
++
++def _np_bad(t):
++    """Return (n_nan, n_inf) as python ints; (0, 0) if finite / not applicable."""
++    if t is None or not torch.is_tensor(t) or t.numel() == 0:
++        return (0, 0)
++    if not t.dtype.is_floating_point:
++        return (0, 0)
++    if bool(torch.isfinite(t).all()):
++        return (0, 0)
++    return (int(torch.isnan(t).sum().item()), int(torch.isinf(t).sum().item()))
++
++
++def _nan_probe(tag, t, layer_id=None, forward_batch=None, residual=None):
++    if not _NAN_PROBE:
++        return
++    try:
++        nan_h, inf_h = _np_bad(t)
++        nan_r, inf_r = _np_bad(residual)
++        if (nan_h + inf_h + nan_r + inf_r) == 0:
++            return
++        mode = "?"
++        if forward_batch is not None:
++            fm = getattr(forward_batch, "forward_mode", None)
++            mode = getattr(fm, "name", str(fm)) if fm is not None else "?"
++        ntok = int(t.shape[0]) if (torch.is_tensor(t) and t.dim() > 0) else -1
++        first = not _nan_probe_state["origin_found"]
++        if first:
++            _nan_probe_state["origin_found"] = True
++        extra = ""
++        if tag == "embed_out" and torch.is_tensor(t) and t.dim() == 2:
++            bad = ~torch.isfinite(t)
++            rows = bad.any(dim=1).nonzero(as_tuple=False).flatten()
++            full = int(bad.all(dim=1).sum().item())
++            ids = getattr(forward_batch, "input_ids", None)
++            idh = []
++            if torch.is_tensor(ids) and ids.numel() >= t.shape[0]:
++                idh = (
++                    ids.flatten()[: t.shape[0]].index_select(0, rows[:16]).tolist()
++                )
++            extra = (
++                " | bad_rows=%d full_nan_rows=%d rows_head=%s ids_head=%s"
++                " ids_shape=%s elem_head=%s"
++                % (
++                    int(rows.numel()),
++                    full,
++                    rows[:16].tolist(),
++                    idh,
++                    (tuple(ids.shape) if torch.is_tensor(ids) else None),
++                    bad.nonzero(as_tuple=False)[:8].tolist(),
++                )
++            )
++        logger.error(
++            "[NANPROBE]%s fwd=%d tag=%s layer=%s mode=%s ntok=%d | "
++            "hidden nan=%d inf=%d | residual nan=%d inf=%d%s",
++            " ORIGIN" if first else "",
++            _nan_probe_state["fwd"],
++            tag,
++            layer_id,
++            mode,
++            ntok,
++            nan_h,
++            inf_h,
++            nan_r,
++            inf_r,
++            extra,
++        )
++    except Exception:
++        pass
++
++
++def _nan_probe_new_forward():
++    if not _NAN_PROBE:
++        return
++    _nan_probe_state["origin_found"] = False
++    _nan_probe_state["fwd"] += 1
++
++
  _is_cuda = is_cuda()
  _is_npu = is_npu()
  _is_cpu = is_cpu()
@@ -5315,7 +6201,7 @@ index 65f78e691..65446f811 100644
  _is_gfx95 = is_gfx95_supported()
  _is_hip = is_hip()
  _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-@@ -113,6 +116,24 @@ _qknorm_use_alt_stream = (
+@@ -113,6 +206,240 @@ _qknorm_use_alt_stream = (
      get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
  )
  _is_amx_available = cpu_has_amx_support()
@@ -5337,10 +6223,226 @@ index 65f78e691..65446f811 100644
 +# with kernel-written new_residual. Removes the per-full-attn-layer
 +# gemma_fused_add_rmsnorm dispatch (~10/step). Decode single-token, fp8 qkv only.
 +_XPU_FA_RESADD_NORM = os.environ.get("SGL_XPU_FA_RESADD_NORM", "0") == "1"
++
++# Phase 5c (GGUF): the Phase-5b resadd-norm fusions above are fp8-only, but the
++# 35B GGUF build runs its attention projections as ESIMD q8_0 GEMVs, so they
++# never fire. `esimd_resadd_norm_gemv_q8_ba` is the GGUF counterpart: it folds
++# GemmaRMSNorm(input_layernorm) plus the q8_0 in_proj/qkv GEMV plus (for GDN)
++# the unquantised fp16 in_proj_ba GEMV into ONE op call. Decode at bs=1 is
++# host-bound (~13-25us of torch dispatch per call vs ~4us of actual enqueue), so
++# collapsing 70 op calls/step is worth far more than any kernel-level tuning.
++# On by default whenever the GGUF MoE full fusion is on; SGL_XPU_GGUF_RESADD_NORM=0
++# forces the unfused fallback.
++_XPU_GGUF_RESADD_NORM = (
++    os.environ.get("SGL_XPU_GGUF_MOE_FULL", "0") == "1"
++    and os.environ.get("SGL_XPU_GGUF_RESADD_NORM", "1") == "1"
++)
++# DEPRECATED. First iteration of the GGUF norm+proj fusion, superseded by
++# _gguf_norm_gemv() / _XPU_GGUF_RESADD_NORM above. It drove a single-matrix
++# `esimd_resadd_norm_gemv_q8_0` op that was never landed in
++# custom-esimd-kernels, so the path always ImportErrors and falls back; the
++# shipped design instead uses `esimd_resadd_norm_gemv_q8_ba`, which folds the
++# unquantised fp16 in_proj_ba GEMV into the SAME op call (one launch instead of
++# two) and keeps the q/k/v-merged rep. Kept for reference behind its own opt-in
++# flag so it can never shadow the supported path; remove once the q8_0-only
++# variant is confirmed unnecessary.
++_XPU_GGUF_RESADD_NORM_LEGACY = (
++    os.environ.get("SGL_XPU_GGUF_RESADD_NORM_LEGACY", "0") == "1"
++)
++
++
++def _env_int(name, default):
++    try:
++        return int(os.environ.get(name, default))
++    except (TypeError, ValueError):
++        return default
++
++
++# Largest decode batch the GGUF resadd-norm fusion will handle.
++#
++# The kernel (Moe_norm_q8_kernel) has always been M-generic: its grid is
++# M*blocks*K_SPLIT and every access is indexed off `token = gid / blocks`. The
++# bs=1 restriction lived purely in this file, because the cached output buffers
++# were allocated as [1, N]. Real serving decode batches are almost never 1 (a
++# BFCL multi_turn run spends 87% of its decode steps at batch > 8), so that
++# restriction meant the fusion was bypassed for the large majority of steps.
++#
++# Buffers are now allocated per distinct M, so the only reason for an upper
++# bound is to stop an unbounded prefill-sized M from allocating one buffer set
++# per batch size ever seen. Set to 1 to restore the old single-token behaviour.
++_GGUF_FUSE_MAX_M = _env_int("SGL_XPU_GGUF_FUSE_MAX_M", 64)
++_GGUF_NORM_Q8_OP = None
++
++
++def _load_gguf_norm_q8_op():
++    global _GGUF_NORM_Q8_OP
++    if _GGUF_NORM_Q8_OP is None:
++        try:
++            import custom_esimd_kernels_sglang  # noqa: F401  (registers the lib)
++
++            _GGUF_NORM_Q8_OP = (
++                torch.ops.custom_esimd_kernels_sglang.esimd_resadd_norm_gemv_q8_ba
++            )
++        except Exception as e:
++            logger.warning("[gguf_resadd_norm] op unavailable: %r", e)
++            _GGUF_NORM_Q8_OP = False
++    return _GGUF_NORM_Q8_OP or None
++
++
++def _gguf_xpu_rep(lin, kind):
++    """The single ESIMD weight rep of a GGUF XPU linear, if it is `kind`.
++
++    A GGUF linear keeps one rep per loaded shard; when every shard shares a
++    quant type they are pre-merged into ``_xpu_merged`` (row-cat in output
++    order), which is exactly the ``[N, K]`` matrix the fused kernel needs. A
++    single-shard linear has no merge, so fall back to its only rep.
++    """
++    if lin is None or getattr(lin, "bias", None) is not None:
++        return None
++    merged = getattr(lin, "_xpu_merged", None)
++    rep = merged[0] if merged is not None else None
++    if rep is None:
++        reps = getattr(lin, "_xpu_reps", None)
++        order = getattr(lin, "_xpu_shard_order", None)
++        if isinstance(reps, dict) and order is not None and len(order) == 1:
++            rep = reps[order[0]]
++    if rep is None or rep[0] != kind:
++        return None
++    return rep
++
++
++def _gguf_resadd_norm_guard(hidden_states, residual, forward_batch):
++    """True when the plain-TP decode path is what will run, i.e. prepare_attn
++    reduces to a bare input_layernorm and the fused op is a drop-in."""
++    if not _XPU_GGUF_RESADD_NORM or not _is_xpu:
++        return False
++    if forward_batch is None or not forward_batch.forward_mode.is_decode():
++        return False
++    if forward_batch.forward_mode.is_target_verify():
++        return False
++    if hidden_states.dim() != 2:
++        return False
++    # The kernel handles any M; the bound only caps how many distinct output
++    # buffer sets we are willing to cache (see _GGUF_FUSE_MAX_M).
++    if not 1 <= hidden_states.shape[0] <= _GGUF_FUSE_MAX_M:
++        return False
++    if hidden_states.dtype != torch.float16:
++        return False
++    # Layer 0 has no residual yet. The kernel always does the add, so it is fed
++    # a cached zero buffer: ``h + 0.0`` is exact in fp16 and reproduces the
++    # plain path's ``residual = hidden_states; hidden = norm(hidden)``. Leaving
++    # layer 0 on the unfused path meant its in_proj_ba ran a oneDNN fp16 GEMV
++    # whose split-K reduction order is not reproducible under load, which made
++    # decode non-deterministic (identical operands, two possible results).
++    if residual is not None:
++        if residual.shape != hidden_states.shape:
++            return False
++        if residual.dtype != torch.float16:
++            return False
++    if getattr(hidden_states, "_sglang_needs_allreduce_fusion", False):
++        return False
++    try:
++        from sglang.srt.layers.communicator import get_attn_tp_context
++
++        if get_attn_tp_context().input_scattered:
++            return False
++    except Exception:
++        return False
++    return True
++
++
++def _gguf_norm_gemv(layer, norm, lin0, lin1, hidden_states, residual, tag):
++    """Run the fused resadd-norm + q8_0 GEMV (+ optional fp16 GEMV).
++
++    ``lin1`` is the GDN ``in_proj_ba`` (unquantised fp16) or None for the
++    full-attention layers. Returns ``(out0, out1_or_None, new_residual)`` or
++    None to fall back. Weights and norm constants are resolved once and cached
++    on the layer; output buffers are cached per distinct token count M, so the
++    steady-state cost stays exactly one op dispatch at any batch size.
++    """
++    op = _load_gguf_norm_q8_op()
++    if op is None or getattr(layer, "_gguf_norm_q8_off", False):
++        return None
++    cache = getattr(layer, "_gguf_norm_q8_cache", None)
++    if cache is None:
++        rep0 = _gguf_xpu_rep(lin0, "q8_0")
++        if rep0 is None:
++            logger.warning("[gguf_resadd_norm] %s: proj is not a single q8_0 rep", tag)
++            layer._gguf_norm_q8_off = True
++            return None
++        qs, sc = rep0[1], rep0[2]
++        hidden = hidden_states.shape[1]
++        if qs.dim() != 2 or qs.shape[1] != hidden:
++            logger.warning("[gguf_resadd_norm] %s: q8_0 K=%s != hidden=%s",
++                           tag, tuple(qs.shape), hidden)
++            layer._gguf_norm_q8_off = True
++            return None
++        dev = qs.device
++        w1 = torch.empty(0, dtype=torch.float16, device=dev)
++        if lin1 is not None:
++            rep1 = _gguf_xpu_rep(lin1, "fp16")
++            if rep1 is None or rep1[1].dim() != 2 or rep1[1].shape[1] != hidden:
++                logger.warning("[gguf_resadd_norm] %s: ba is not a single fp16 [N,%s] rep",
++                               tag, hidden)
++                layer._gguf_norm_q8_off = True
++                return None
++            w1 = rep1[1].contiguous()
++        nw = ((norm.weight.data.to(torch.float32) + 1.0)
++              .to(torch.float16).contiguous())
++        cache = {
++            "nw": nw,
++            "eps": float(norm.variance_epsilon),
++            "qs": qs,
++            "sc": sc,
++            "w1": w1,
++            "hidden": hidden,
++            "dev": dev,
++            "has_ba": lin1 is not None,
++            # Output buffers, keyed by token count. Decode batch sizes repeat,
++            # so this is allocated a handful of times and then only looked up.
++            "bufs": {},
++        }
++        layer._gguf_norm_q8_cache = cache
++        logger.warning("[gguf_resadd_norm] %s ACTIVE (norm + proj folded, ba=%s)",
++                       tag, cache["has_ba"])
++
++    M = int(hidden_states.shape[0])
++    buf = cache["bufs"].get(M)
++    if buf is None:
++        dev, hidden = cache["dev"], cache["hidden"]
++        w1 = cache["w1"]
++        buf = {
++            "o0": torch.empty((M, cache["qs"].shape[0]), dtype=torch.float16, device=dev),
++            "o1": (torch.empty((M, w1.shape[0]), dtype=torch.float16, device=dev)
++                   if cache["has_ba"]
++                   else torch.empty(0, dtype=torch.float16, device=dev)),
++            "xn": torch.empty((M, hidden), dtype=torch.float16, device=dev),
++            # Post-add residual goes to its own buffer: the kernel's block 0
++            # stores it while the other row-blocks still read the OLD residual.
++            # Per-layer, so it is never the same buffer the kernel reads (the
++            # incoming residual belongs to the previous layer).
++            "nr": torch.empty((M, hidden), dtype=torch.float16, device=dev),
++            # Zero residual for layer 0 (residual is None there).
++            "zr": torch.zeros((M, hidden), dtype=torch.float16, device=dev),
++        }
++        cache["bufs"][M] = buf
++
++    h = hidden_states if hidden_states.is_contiguous() else hidden_states.contiguous()
++    res = buf["zr"] if residual is None else (
++        residual if residual.is_contiguous() else residual.contiguous())
++    try:
++        op(h, res, cache["nw"], cache["eps"], buf["xn"], buf["nr"],
++           cache["qs"], cache["sc"], buf["o0"], cache["w1"], buf["o1"])
++    except Exception as e:
++        logger.warning("[gguf_resadd_norm] %s: kernel raised %r", tag, e)
++        layer._gguf_norm_q8_off = True
++        return None
++    return buf["o0"], (buf["o1"] if cache["has_ba"] else None), buf["nr"]
++
  
  cached_get_processor = lru_cache(get_processor)
  
-@@ -123,6 +144,80 @@ def _disable_shared_experts_fusion() -> bool:
+@@ -123,6 +450,134 @@ def _disable_shared_experts_fusion() -> bool:
      return get_global_server_args().disable_shared_experts_fusion
  
  
@@ -5418,10 +6520,64 @@ index 65f78e691..65446f811 100644
 +    return result
 +
 +
++def _esimd_q8_0_weight_scale(lin):
++    """DEPRECATED (see _XPU_GGUF_RESADD_NORM_LEGACY).
++
++    Resolve a GGUF-q8_0 Linear's quant weight as ``(qs [N, K] int8, scale
++    [N, K/32] fp16)`` for the legacy single-matrix ESIMD q8_0 GEMV kernel.
++
++    Superseded by ``_gguf_xpu_rep()``, which returns the packed rep tuple
++    directly and additionally handles the fp16 ``in_proj_ba`` shard so both
++    projections can be folded into one ``esimd_resadd_norm_gemv_q8_ba`` call.
++
++    The GGUF XPU linear method stores its resident quant reps on the module:
++      * ``layer._xpu_merged`` = ``(merged_rep, sizes)`` when q/k/v shards were
++        row-concatenated into one big-N GEMV (the D1 optimization); or
++      * ``layer._xpu_reps`` / ``layer._xpu_shard_order`` for the per-shard reps.
++    A single-matrix fused GEMV needs the *whole* projection as one q8_0 matrix,
++    so this returns a value only when the projection is a lone q8_0 shard or a
++    merged q8_0 rep; anything else (multi-shard unmerged, non-q8_0) yields
++    ``None`` and the caller safely falls back. Cached on the module.
++    """
++    cached = getattr(lin, "_esimd_q8_0_ws", None)
++    if cached is not None:
++        return cached
++    rep = None
++    merged = getattr(lin, "_xpu_merged", None)
++    if merged is not None:
++        rep = merged[0]
++    else:
++        order = getattr(lin, "_xpu_shard_order", None)
++        reps = getattr(lin, "_xpu_reps", None)
++        if order is not None and reps is not None and len(order) == 1:
++            rep = reps.get(order[0])
++    if rep is None or rep[0] != "q8_0":
++        return None
++    _, qs, scale = rep
++    # Validate the exact [N, K] int8 + [N, K/32] fp16 layout the kernel reads
++    # from raw pointers (a mismatch would fault with DEVICE_LOST).
++    if qs.dim() != 2 or scale.dim() != 2:
++        return None
++    if qs.dtype != torch.int8 or scale.dtype != torch.float16:
++        return None
++    if qs.shape[1] % 32 != 0 or scale.shape[0] != qs.shape[0]:
++        return None
++    if scale.shape[1] != qs.shape[1] // 32:
++        return None
++    if not (qs.is_contiguous() and scale.is_contiguous()):
++        return None
++    result = (qs, scale)
++    try:
++        lin._esimd_q8_0_ws = result
++    except Exception:
++        pass
++    return result
++
++
  if _is_npu:
      from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
          split_qkvgate_gemma_rmsnorm_rope,
-@@ -235,6 +330,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -235,6 +690,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
          conv_weights = self.conv1d.weight.view(
              self.conv1d.weight.size(0), self.conv1d.weight.size(2)
          )
@@ -5430,7 +6586,7 @@ index 65f78e691..65446f811 100644
          self.attn = RadixLinearAttention(
              layer_id=layer_id,
              num_q_heads=self.num_k_heads // self.attn_tp_size,
-@@ -275,6 +372,32 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -275,6 +732,32 @@ class Qwen3_5GatedDeltaNet(nn.Module):
              tp_size=self.attn_tp_size,
              prefix=add_prefix("out_proj", prefix),
          )
@@ -5463,7 +6619,7 @@ index 65f78e691..65446f811 100644
  
      @staticmethod
      def _override_weight_loader(param, loader):
-@@ -300,7 +423,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -300,7 +783,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
  
      def _bind_packed_weight_loaders(self, module):
          """Bind packed-checkpoint-aware loaders to all relevant params of a merged module."""
@@ -5484,7 +6640,7 @@ index 65f78e691..65446f811 100644
              param = getattr(module, attr_name, None)
              if param is None:
                  continue
-@@ -345,10 +480,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -345,10 +840,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                      module, param, loaded_shard_id
                  )
  
@@ -5505,7 +6661,7 @@ index 65f78e691..65446f811 100644
                  else:
                      split_dim = getattr(param, "output_dim", 0)
                      if _is_cpu:
-@@ -444,7 +585,58 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -444,7 +945,58 @@ class Qwen3_5GatedDeltaNet(nn.Module):
  
          return query, key, value, z, b, a
  
@@ -5564,7 +6720,7 @@ index 65f78e691..65446f811 100644
          if (
              _is_cpu
              or _is_npu
-@@ -472,6 +664,491 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -472,6 +1024,578 @@ class Qwen3_5GatedDeltaNet(nn.Module):
              projected_states_ba, _ = self.in_proj_ba(hidden_states)
          return projected_states_qkvz, projected_states_ba
  
@@ -5769,6 +6925,80 @@ index 65f78e691..65446f811 100644
 +        output, _ = self.out_proj(core_attn_out)
 +        return output
 +
++    def _gguf_norm_out_proj(
++        self, core_attn_out: torch.Tensor, z_out: torch.Tensor
++    ) -> Optional[torch.Tensor]:
++        """RMSNormGated + GGUF q8_0 out_proj in one op dispatch.
++
++        The GGUF counterpart of ``_esimd_norm_out_proj`` (which is fp8-only).
++        Removes the standalone ``gdn_rms_norm_gated`` launch plus the reshape /
++        cast glue around it, ~30 dispatches per decode step.
++
++        The out_proj rep already carries the GGUF->HF value-head column permute
++        (baked into the global pre-shard weight, see __init__), so feeding the
++        raw rep is exactly what the unfused ``out_proj(...)`` would do.
++        """
++        op = getattr(torch.ops.custom_esimd_kernels_sglang,
++                     "esimd_norm_gemv_q8_0", None)
++        if op is None or getattr(self, "_gguf_outproj_off", False):
++            return None
++        cache = getattr(self, "_gguf_outproj_const", None)
++        if cache is None:
++            rep = _gguf_xpu_rep(self.out_proj, "q8_0")
++            if rep is None:
++                logger.warning("[gguf_norm_out_proj] out_proj is not a single q8_0 rep")
++                self._gguf_outproj_off = True
++                return None
++            qs, sc = rep[1], rep[2]
++            HV, V = int(core_attn_out.shape[1]), int(core_attn_out.shape[2])
++            if qs.shape[1] != HV * V:
++                logger.warning("[gguf_norm_out_proj] K=%s != HV*V=%s",
++                               qs.shape[1], HV * V)
++                self._gguf_outproj_off = True
++                return None
++            nw = self.norm.weight
++            nw = nw.to(torch.float16).contiguous() if nw.dtype != torch.float16 \
++                else nw.contiguous()
++            if nw.numel() != V:
++                logger.warning("[gguf_norm_out_proj] norm weight %s != V=%s",
++                               nw.numel(), V)
++                self._gguf_outproj_off = True
++                return None
++            cache = {
++                "qs": qs, "sc": sc, "nw": nw, "HV": HV, "V": V,
++                "eps": float(self.layer_norm_epsilon),
++                # Buffers keyed by token count; the kernel takes any M.
++                "bufs": {},
++            }
++            self._gguf_outproj_const = cache
++            logger.warning("[gguf_norm_out_proj] ACTIVE (gated norm + out_proj folded)")
++        HV, V = cache["HV"], cache["V"]
++        M = int(core_attn_out.shape[0])
++        buf = cache["bufs"].get(M)
++        if buf is None:
++            dev = cache["qs"].device
++            buf = {
++                "y": torch.empty((M * HV, V), dtype=torch.float16, device=dev),
++                "out": torch.empty((M, cache["qs"].shape[0]),
++                                   dtype=torch.float16, device=dev),
++            }
++            cache["bufs"][M] = buf
++        x = core_attn_out.reshape(M * HV, V)
++        z = z_out.reshape(M * HV, V)
++        if not x.is_contiguous():
++            x = x.contiguous()
++        if not z.is_contiguous():
++            z = z.contiguous()
++        try:
++            op(x, z, cache["nw"], buf["y"],
++               cache["qs"], cache["sc"], buf["out"],
++               HV, V, cache["eps"])
++        except Exception as e:
++            logger.warning("[gguf_norm_out_proj] kernel raised %r", e)
++            self._gguf_outproj_off = True
++            return None
++        return buf["out"]
++
 +    def _esimd_norm_out_proj(
 +        self, core_attn_out: torch.Tensor, z_out: torch.Tensor
 +    ) -> Optional[torch.Tensor]:
@@ -5785,21 +7015,34 @@ index 65f78e691..65446f811 100644
 +        collapsed to a single per-tensor scalar (mean), mirroring the dense
 +        ESIMD fp8 GEMV fast path.
 +
-+        Decode single-token only (kernel emits ``[1, N]``). Returns the layer
-+        output ``[1, hidden]`` on success, or ``None`` to fall back to the eager
-+        norm + out_proj path.
++        Returns the layer output ``[M, hidden]`` on success, or ``None`` to fall
++        back to the eager norm + out_proj path. The GGUF q8_0 branch handles any
++        decode batch size; the fp8 branch below is still single-token only
++        (``esimd_norm_gemv_fp8_pert`` emits ``[1, N]``).
 +        """
-+        if not _XPU_GDN_NORM_GEMV:
-+            return None
-+        # Kernel assumes a single decode token: x/z are [HV, V] for one token.
-+        if core_attn_out.dim() != 3 or core_attn_out.shape[0] != 1:
++        if core_attn_out.dim() != 3:
 +            return None
 +        if core_attn_out.shape != z_out.shape:
 +            return None
-+        # Only the swish/silu gate with norm-before-gate matches the kernel.
 +        if getattr(self.norm, "activation", "swish") not in ("swish", "silu"):
 +            return None
 +        if not getattr(self.norm, "norm_before_gate", True):
++            return None
++        # Phase 5c: GGUF q8_0 out_proj (the fp8 path below never matches it).
++        # M-generic: x/z are [M, HV, V] and the kernel derives M from the row
++        # count, so batched decode is still a single launch.
++        if (
++            _XPU_GGUF_RESADD_NORM
++            and core_attn_out.dtype == torch.float16
++            and 1 <= core_attn_out.shape[0] <= _GGUF_FUSE_MAX_M
++        ):
++            r = self._gguf_norm_out_proj(core_attn_out, z_out)
++            if r is not None:
++                return r
++        # fp8 kernel assumes a single decode token: x/z are [HV, V].
++        if core_attn_out.shape[0] != 1:
++            return None
++        if not _XPU_GDN_NORM_GEMV:
 +            return None
 +        try:
 +            from custom_esimd_kernels_sglang import esimd_norm_gemv_fp8_pert
@@ -6056,7 +7299,7 @@ index 65f78e691..65446f811 100644
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -486,6 +1163,58 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -486,6 +1610,62 @@ class Qwen3_5GatedDeltaNet(nn.Module):
          projected_states_qkvz, projected_states_ba = self._forward_input_proj(
              hidden_states
          )
@@ -6079,10 +7322,14 @@ index 65f78e691..65446f811 100644
 +        # --- XPU native conv1d+GDN fast path (sgl_kernel.gdn_attention) ---
 +        # Cherry-picked from origin/dev 7680aecdd4. Env-gated; falls back to
 +        # the default Triton path if the kernel isn't usable on this shape.
++        # Prefill(extend)-only: decode keeps the tuned ESIMD recurrent path
++        # below (esimd_gdn_conv_fused_seq); the native Xe2 kernel is a chunked
++        # (parallel) algorithm that only wins on long prefill sequences.
 +        _ENABLE_XPU_FAST_PATH = _XPU_GDN_FAST_PATH
 +        if (
 +            _ENABLE_XPU_FAST_PATH
 +            and _is_xpu
++            and not forward_batch.forward_mode.is_decode()
 +            and not forward_batch.forward_mode.is_target_verify()
 +            and self.num_v_heads % self.num_k_heads == 0
 +        ):
@@ -6115,19 +7362,110 @@ index 65f78e691..65446f811 100644
  
          if (
              self.num_v_heads // self.num_k_heads in [1, 2, 4]
-@@ -623,6 +1352,132 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
+@@ -623,56 +1803,341 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
              is_last_layer=(layer_id == config.num_hidden_layers - 1),
          )
  
-+    def _esimd_fused_input_norm_in_proj(
+-    def forward(
++    def _esimd_fused_input_norm_in_proj_q8_0(
 +        self,
 +        hidden_states: torch.Tensor,
-+        residual: Optional[torch.Tensor],
-+        forward_batch: ForwardBatch,
++        residual: torch.Tensor,
++        qkvz_lin,
++        ba_lin,
++        r0q,
 +        captured_last_layer_outputs: Optional[List[torch.Tensor]],
 +    ):
-+        """Fused GemmaRMSNorm(input_layernorm) + GDN in_proj (qkvz + ba).
++        """DEPRECATED (see _XPU_GGUF_RESADD_NORM_LEGACY).
 +
++        GGUF-q8_0 variant of the fused input_layernorm + GDN in_proj.
++
++        ``in_proj_qkvz`` is q8_0; ``in_proj_ba`` is fp16 (GGUF keeps the tiny
++        b/a tensors unquantized). A single-matrix q8_0 kernel cannot fuse both,
++        so this fuses the GemmaRMSNorm into the q8_0 qkvz GEMV
++        (``esimd_resadd_norm_gemv_q8_0``, which also writes ``normed_out`` and a
++        separate ``new_residual``), then runs the fp16 ba projection on the
++        kernel-written normed hidden (its fp16 matmul is already
++        transpose-cached). Returns ``(qkvz, ba, new_residual)`` or ``None``.
++        Shared guards are checked by the caller.
++
++        Superseded by ``_gguf_norm_gemv()``: ``esimd_resadd_norm_gemv_q8_ba``
++        folds the fp16 ba GEMV into the same launch, so the shipped path costs
++        one op call here instead of two. ``esimd_resadd_norm_gemv_q8_0`` was
++        never landed, so this always ImportErrors and falls back.
++        """
++        try:
++            from custom_esimd_kernels_sglang import esimd_resadd_norm_gemv_q8_0
++        except ImportError:
++            return None
++        qs, scale = r0q
++        K = hidden_states.shape[1]
++        if qs.shape[1] != K:
++            return None
++        cache = getattr(self, "_esimd_resadd_q8_const", None)
++        if cache is None:
++            nw = (
++                (self.input_layernorm.weight.data.to(torch.float32) + 1.0)
++                .to(torch.float16)
++                .contiguous()
++            )
++            o0 = torch.empty((1, qs.shape[0]), dtype=torch.float16, device=qs.device)
++            normed = torch.empty((1, K), dtype=torch.float16, device=qs.device)
++            nr = torch.empty((1, K), dtype=torch.float16, device=qs.device)
++            cache = {
++                "nw": nw,
++                "qs": qs,
++                "scale": scale,
++                "o0": o0,
++                "normed": normed,
++                "nr": nr,
++            }
++            self._esimd_resadd_q8_const = cache
++        h = (
++            hidden_states
++            if hidden_states.dtype == torch.float16
++            else hidden_states.to(torch.float16)
++        )
++        h = h.contiguous()
++        res = residual if residual.is_contiguous() else residual.contiguous()
++        try:
++            esimd_resadd_norm_gemv_q8_0(
++                h,
++                res,
++                cache["nw"],
++                cache["qs"],
++                cache["scale"],
++                cache["o0"],
++                cache["normed"],
++                cache["nr"],
++                float(self.input_layernorm.variance_epsilon),
++            )
++        except Exception:
++            return None
++        # ba projection reads the normed hidden (matches in_proj_ba(normed) in
++        # the standard prepare_attn -> in_proj flow). fp16 GGUF matmul path.
++        try:
++            o1, _ = ba_lin(cache["normed"])
++        except Exception:
++            return None
++        new_residual = cache["nr"]
++        if captured_last_layer_outputs is not None:
++            captured_last_layer_outputs.append(new_residual.clone())
++        return cache["o0"], o1, new_residual
++
++    def _esimd_fused_input_norm_in_proj(
+         self,
+         hidden_states: torch.Tensor,
+         residual: Optional[torch.Tensor],
+-        **kwargs,
++        forward_batch: ForwardBatch,
++        captured_last_layer_outputs: Optional[List[torch.Tensor]],
+     ):
+-        forward_batch = kwargs.get("forward_batch", None)
++        """Fused GemmaRMSNorm(input_layernorm) + GDN in_proj (qkvz + ba).
+ 
+-        hidden_states, residual = (
+-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
 +        Replaces the prepare_attn ``input_layernorm`` launch plus the two
 +        ``in_proj`` fp8 GEMV launches with a single
 +        ``esimd_resadd_norm_gemv2_fp8_pert`` launch. Gated by
@@ -6138,6 +7476,45 @@ index 65f78e691..65446f811 100644
 +        the plain TP decode path (no input-scatter, no allreduce-fusion) is
 +        intercepted; every other configuration falls back.
 +        """
++        # Phase 5c: GGUF q8_0 build (the fp8 path below never matches it).
++        if _gguf_resadd_norm_guard(hidden_states, residual, forward_batch):
++            gdn = self.linear_attn
++            r = _gguf_norm_gemv(
++                self,
++                self.input_layernorm,
++                gdn.in_proj_qkvz,
++                gdn.in_proj_ba,
+                 hidden_states,
+                 residual,
+-                forward_batch,
+-                captured_last_layer_outputs=kwargs.get(
+-                    "captured_last_layer_outputs", None
+-                ),
++                "gdn_in_proj",
++            )
++            if r is not None:
++                o0, o1, new_residual = r
++                if captured_last_layer_outputs is not None:
++                    captured_last_layer_outputs.append(new_residual.clone())
++                return o0, o1, new_residual
++        # DEPRECATED legacy GGUF q8_0 path, opt-in only and never reached unless
++        # SGL_XPU_GGUF_RESADD_NORM_LEGACY=1 (see the flag's comment).
++        if _XPU_GGUF_RESADD_NORM_LEGACY and residual is not None and _gguf_resadd_norm_guard(
++            hidden_states, residual, forward_batch
++        ):
++            gdn = self.linear_attn
++            r0q = _esimd_q8_0_weight_scale(gdn.in_proj_qkvz)
++            if r0q is not None:
++                q8out = self._esimd_fused_input_norm_in_proj_q8_0(
++                    hidden_states,
++                    residual,
++                    gdn.in_proj_qkvz,
++                    gdn.in_proj_ba,
++                    r0q,
++                    captured_last_layer_outputs,
++                )
++                if q8out is not None:
++                    return q8out
 +        if not _XPU_GDN_RESADD_NORM:
 +            return None
 +        if not (_is_xpu and forward_batch.forward_mode.is_decode()):
@@ -6200,7 +7577,7 @@ index 65f78e691..65446f811 100644
 +            # (input residual belongs to the *previous* layer's nr).
 +            nr = torch.empty(
 +                (1, hidden_states.shape[1]), dtype=torch.float16, device=w0.device
-+            )
+             )
 +            cache = {
 +                "nw": nw,
 +                "w0": w0,
@@ -6217,7 +7594,7 @@ index 65f78e691..65446f811 100644
 +            hidden_states
 +            if hidden_states.dtype == torch.float16
 +            else hidden_states.to(torch.float16)
-+        )
+         )
 +        h = h.contiguous()
 +        # ESIMD kernels read raw contiguous pointers; guard residual layout.
 +        res = residual if residual.is_contiguous() else residual.contiguous()
@@ -6245,32 +7622,28 @@ index 65f78e691..65446f811 100644
 +            captured_last_layer_outputs.append(new_residual.clone())
 +        return cache["o0"], cache["o1"], new_residual
 +
-     def forward(
-         self,
-         hidden_states: torch.Tensor,
-@@ -631,48 +1486,79 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
-     ):
-         forward_batch = kwargs.get("forward_batch", None)
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        residual: Optional[torch.Tensor],
++        **kwargs,
++    ):
++        forward_batch = kwargs.get("forward_batch", None)
  
--        hidden_states, residual = (
--            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
 +        fused = None
-+        if not forward_batch.forward_mode.is_idle():
+         if not forward_batch.forward_mode.is_idle():
+-            hidden_states = self.linear_attn(
 +            fused = self._esimd_fused_input_norm_in_proj(
                  hidden_states,
-                 residual,
++                residual,
                  forward_batch,
--                captured_last_layer_outputs=kwargs.get(
--                    "captured_last_layer_outputs", None
--                ),
 +                kwargs.get("captured_last_layer_outputs", None),
              )
--        )
  
--        if not forward_batch.forward_mode.is_idle():
--            hidden_states = self.linear_attn(
--                hidden_states,
--                forward_batch,
+-        # Fully Connected
+-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+-            hidden_states, residual, forward_batch
+-        )
 +        if fused is not None:
 +            projected_qkvz, projected_ba, residual = fused
 +            hidden_states = self.linear_attn._forward_from_projected(
@@ -6286,18 +7659,21 @@ index 65f78e691..65446f811 100644
 +                        "captured_last_layer_outputs", None
 +                    ),
 +                )
-             )
- 
--        # Fully Connected
--        hidden_states, residual = self.layer_communicator.prepare_mlp(
--            hidden_states, residual, forward_batch
--        )
++            )
++
 +            if not forward_batch.forward_mode.is_idle():
 +                hidden_states = self.linear_attn(
 +                    hidden_states,
 +                    forward_batch,
 +                )
  
++        if _NAN_PROBE: _nan_probe(
++            "gdn_attn_out",
++            hidden_states,
++            layer_id=self.layer_id,
++            forward_batch=forward_batch,
++            residual=residual,
++        )
 +        # Fully Connected
          use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
              forward_batch
@@ -6346,7 +7722,7 @@ index 65f78e691..65446f811 100644
          if should_allreduce_fusion:
              hidden_states._sglang_needs_allreduce_fusion = True
          else:
-@@ -909,8 +1795,133 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -909,8 +2374,133 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
          positions: torch.Tensor,
          hidden_states: torch.Tensor,
          forward_batch: ForwardBatch,
@@ -6481,10 +7857,84 @@ index 65f78e691..65446f811 100644
          if (
              not _is_npu
              or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-@@ -936,6 +1947,120 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -936,6 +2526,227 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
          output, _ = self.o_proj(attn_output)
          return output
  
++    def _esimd_fused_input_norm_qkv_q8_0(
++        self,
++        hidden_states: torch.Tensor,
++        residual: torch.Tensor,
++        r0q,
++        captured_last_layer_outputs: Optional[List[torch.Tensor]],
++    ):
++        """DEPRECATED (see _XPU_GGUF_RESADD_NORM_LEGACY).
++
++        GGUF-q8_0 variant of the fused input_layernorm + qkv_proj.
++
++        Uses the single-matrix ``esimd_resadd_norm_gemv_q8_0`` op (int8 weight +
++        per-32-block fp16 scale). ``normed_out`` is a scratch buffer here (the
++        full-attn path feeds ``o0`` straight into ``esimd_qkv_split_norm_rope``
++        and does not reuse the normed hidden). Returns ``(qkv, new_residual)`` or
++        ``None`` to fall back. Shared guards are checked by the caller.
++
++        Superseded by ``_gguf_norm_gemv()`` on ``esimd_resadd_norm_gemv_q8_ba``.
++        ``esimd_resadd_norm_gemv_q8_0`` was never landed in
++        custom-esimd-kernels, so this always ImportErrors and falls back.
++        """
++        try:
++            from custom_esimd_kernels_sglang import esimd_resadd_norm_gemv_q8_0
++        except ImportError:
++            return None
++        qs, scale = r0q
++        K = hidden_states.shape[1]
++        if qs.shape[1] != K:
++            return None
++        cache = getattr(self, "_esimd_fa_norm_q8_const", None)
++        if cache is None:
++            nw = (
++                (self.input_layernorm.weight.data.to(torch.float32) + 1.0)
++                .to(torch.float16)
++                .contiguous()
++            )
++            o0 = torch.empty((1, qs.shape[0]), dtype=torch.float16, device=qs.device)
++            normed = torch.empty((1, K), dtype=torch.float16, device=qs.device)
++            nr = torch.empty((1, K), dtype=torch.float16, device=qs.device)
++            cache = {
++                "nw": nw,
++                "qs": qs,
++                "scale": scale,
++                "o0": o0,
++                "normed": normed,
++                "nr": nr,
++            }
++            self._esimd_fa_norm_q8_const = cache
++        h = (
++            hidden_states
++            if hidden_states.dtype == torch.float16
++            else hidden_states.to(torch.float16)
++        )
++        h = h.contiguous()
++        res = residual if residual.is_contiguous() else residual.contiguous()
++        try:
++            esimd_resadd_norm_gemv_q8_0(
++                h,
++                res,
++                cache["nw"],
++                cache["qs"],
++                cache["scale"],
++                cache["o0"],
++                cache["normed"],
++                cache["nr"],
++                float(self.input_layernorm.variance_epsilon),
++            )
++        except Exception:
++            return None
++        new_residual = cache["nr"]
++        if captured_last_layer_outputs is not None:
++            captured_last_layer_outputs.append(new_residual.clone())
++        return cache["o0"], new_residual
++
 +    def _esimd_fused_input_norm_qkv(
 +        self,
 +        hidden_states: torch.Tensor,
@@ -6505,6 +7955,39 @@ index 65f78e691..65446f811 100644
 +        Returns ``(qkv, new_residual)`` on success, or ``None`` to fall back to
 +        the standard prepare_attn + self_attention path.
 +        """
++        # Phase 5c: GGUF q8_0 build (the fp8 path below never matches it).
++        if _gguf_resadd_norm_guard(hidden_states, residual, forward_batch):
++            r = _gguf_norm_gemv(
++                self,
++                self.input_layernorm,
++                # self_attention is a method on this layer, not a submodule:
++                # qkv_proj hangs off the layer itself.
++                self.qkv_proj,
++                None,
++                hidden_states,
++                residual,
++                "fa_qkv",
++            )
++            if r is not None:
++                o0, _, new_residual = r
++                if captured_last_layer_outputs is not None:
++                    captured_last_layer_outputs.append(new_residual.clone())
++                return o0, new_residual
++        # DEPRECATED legacy GGUF q8_0 path, opt-in only and never reached unless
++        # SGL_XPU_GGUF_RESADD_NORM_LEGACY=1 (see the flag's comment).
++        if (
++            _XPU_GGUF_RESADD_NORM_LEGACY
++            and _XPU_FA_ESIMD_QKV
++            and residual is not None
++            and _gguf_resadd_norm_guard(hidden_states, residual, forward_batch)
++        ):
++            r0q = _esimd_q8_0_weight_scale(self.qkv_proj)
++            if r0q is not None:
++                q8out = self._esimd_fused_input_norm_qkv_q8_0(
++                    hidden_states, residual, r0q, captured_last_layer_outputs
++                )
++                if q8out is not None:
++                    return q8out
 +        if not (_XPU_FA_RESADD_NORM and _XPU_FA_ESIMD_QKV):
 +            return None
 +        if not (_is_xpu and forward_batch.forward_mode.is_decode()):
@@ -6602,7 +8085,7 @@ index 65f78e691..65446f811 100644
      def forward(
          self,
          positions: torch.Tensor,
-@@ -945,46 +2070,86 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -945,46 +2756,93 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
          captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
          **kwargs,
      ):
@@ -6644,6 +8127,9 @@ index 65f78e691..65446f811 100644
 +                )
              )
  
+-        # Fully Connected
+-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+-            hidden_states, residual, forward_batch
 +            if not forward_batch.forward_mode.is_idle():
 +                hidden_states = self.self_attention(
 +                    positions=positions,
@@ -6651,10 +8137,14 @@ index 65f78e691..65446f811 100644
 +                    forward_batch=forward_batch,
 +                )
 +
-         # Fully Connected
--        hidden_states, residual = self.layer_communicator.prepare_mlp(
--            hidden_states, residual, forward_batch
--        )
++        if _NAN_PROBE: _nan_probe(
++            "full_attn_out",
++            hidden_states,
++            layer_id=self.layer_id,
++            forward_batch=forward_batch,
++            residual=residual,
+         )
++        # Fully Connected
          use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
              forward_batch
          )
@@ -6702,7 +8192,7 @@ index 65f78e691..65446f811 100644
          if should_allreduce_fusion:
              hidden_states._sglang_needs_allreduce_fusion = True
          else:
-@@ -1091,6 +2256,12 @@ class Qwen3_5ForCausalLM(nn.Module):
+@@ -1091,6 +2949,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                  config.hidden_size,
                  org_num_embeddings=config.vocab_size,
                  enable_tp=not is_dp_attention_enabled(),
@@ -6715,7 +8205,31 @@ index 65f78e691..65446f811 100644
              )
          else:
              self.embed_tokens = PPMissingLayer()
-@@ -1718,6 +2889,113 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1167,6 +3031,9 @@ class Qwen3_5ForCausalLM(nn.Module):
+             residual = pp_proxy_tensors["residual"]
+ 
+         aux_hidden_states = []
++        if _NAN_PROBE:
++            _nan_probe_new_forward()
++            _nan_probe("embed_out", hidden_states, forward_batch=forward_batch)
+         # Pass through decoder layers
+         for layer_idx in range(self.start_layer, self.end_layer):
+             layer = self.layers[layer_idx]
+@@ -1184,6 +3051,13 @@ class Qwen3_5ForCausalLM(nn.Module):
+                         else None
+                     ),
+                 )
++            if _NAN_PROBE: _nan_probe(
++                "layer_out",
++                hidden_states,
++                layer_id=layer_idx,
++                forward_batch=forward_batch,
++                residual=residual,
++            )
+ 
+             # Process deepstack embeddings if provided
+             if (
+@@ -1718,6 +3592,113 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
          torch.cuda.empty_cache()
          torch.cuda.synchronize()
  
@@ -6829,7 +8343,7 @@ index 65f78e691..65446f811 100644
      def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
          stacked_params_mapping = [
              # (param_name, shard_name, shard_id)
-@@ -1733,6 +3011,27 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1733,6 +3714,27 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
              ("in_proj_ba.", "in_proj_a.", 1),
          ]
  
@@ -6857,7 +8371,7 @@ index 65f78e691..65446f811 100644
          num_experts = self.config.num_experts
  
          # Params for weights, fp8 weight scales, fp8 activation scales
-@@ -1832,6 +3131,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1832,6 +3834,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                  continue
              if "mtp" in name:
                  continue
@@ -6872,7 +8386,7 @@ index 65f78e691..65446f811 100644
              if "language_model" in name:
                  name = name.replace(r"model.language_model.", r"model.")
              if ".self_attn." in name:
-@@ -1886,6 +3193,24 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1886,6 +3896,24 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                  if "mlp.experts" in name:
                      continue
                  name = name.replace(weight_name, param_name)
@@ -6897,7 +8411,7 @@ index 65f78e691..65446f811 100644
                  # Skip loading extra parameters for GPTQ/modelopt models.
                  if name.endswith(ignore_suffixes) and name not in params_dict:
                      continue
-@@ -2013,6 +3338,24 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -2013,6 +4041,24 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
  
                      if name in params_dict.keys():
                          param = params_dict[name]
