@@ -19,6 +19,10 @@ PUBLIC_BMG_DOCUMENTATION = (
     OMNI_ROOT / "docs" / "COMFYUI.md",
     OMNI_ROOT / "docs" / "IMAGE_BUILD.md",
 )
+COMFYUI_STARTUP_DOCUMENTATION = (
+    OMNI_ROOT / "README.md",
+    OMNI_ROOT / "docs" / "COMFYUI.md",
+)
 CACHE_DIT_COMMIT = "1d92bbd86ec59aa6223fe2368849b7413a1acb93"
 DEMO_ASSETS = {
     "demo_qwen_image.gif",
@@ -94,6 +98,20 @@ def load_validator():
 
 
 class ComfyUIImageContractTest(unittest.TestCase):
+    def test_comfyui_docs_default_to_direct_startup_and_scope_dynamic_vram(self):
+        for path in COMFYUI_STARTUP_DOCUMENTATION:
+            with self.subTest(path=path):
+                document = path.read_text(encoding="utf-8")
+                direct_start = document.index("python main.py")
+                memory_preset = document.index(
+                    "/llm/entrypoints/start_comfyui.sh"
+                )
+
+                self.assertLess(direct_start, memory_preset)
+                self.assertIn("known or observed XPU", document)
+                self.assertIn("out-of-memory risk", document)
+                self.assertIn("reduce performance", document)
+
     def test_public_image_documentation_focuses_on_bmg_support(self):
         for path in PUBLIC_BMG_DOCUMENTATION:
             with self.subTest(path=path):

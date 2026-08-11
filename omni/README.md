@@ -75,20 +75,25 @@ sudo docker run -itd \
     --network=host \
     --shm-size=64g \
     --name="$CONTAINER_NAME" \
+    --workdir=/llm/ComfyUI \
     -v "$COMFYUI_MODEL_DIR":/llm/ComfyUI/models \
     -v "$COMFYUI_OUTPUT_DIR":/llm/ComfyUI/output \
     "$IMAGE" \
-    /llm/entrypoints/start_comfyui.sh
+    python main.py
 ```
 
-Open `http://127.0.0.1:8188`. Additional ComfyUI arguments can be appended to
-the command. The entrypoint enables ComfyUI v0.31's integrated Node Manager;
-the matching `comfyui-manager` Python package is installed in the image.
+Open `http://127.0.0.1:8188`. This direct ComfyUI launch is recommended by
+default because it avoids weight-staging overhead when the workflow fits in
+XPU memory. Append `--listen 0.0.0.0` when the server must accept remote
+connections. The matching `comfyui-manager` Python package is installed in the
+image; append `--enable-manager` when Node Manager is needed.
 
-The entrypoint enables ComfyUI DynamicVRAM with the pinned AIMDO XPU backend
-and reserves 4 GiB of XPU memory by default. This lets resident model weights
-be evicted under allocator pressure before an XPU text encoder is executed
-again. Override the reserve only when required by the workload:
+Use the supplied entrypoint only for workflows with a known or observed XPU
+out-of-memory risk. It enables DynamicVRAM with the pinned AIMDO XPU backend,
+reserves 4 GiB of XPU memory, and enables Node Manager. This lets resident
+model weights be staged, unloaded, or reloaded to preserve activation
+headroom, but the additional memory management can reduce performance for
+workflows that already fit in memory:
 
 ```bash
 sudo docker run -itd \
@@ -96,11 +101,13 @@ sudo docker run -itd \
     --device=/dev/dri \
     --network=host \
     --name="$CONTAINER_NAME" \
-    -e OMNI_COMFYUI_RESERVE_VRAM_GB=6 \
     -v "$COMFYUI_MODEL_DIR":/llm/ComfyUI/models \
     "$IMAGE" \
     /llm/entrypoints/start_comfyui.sh
 ```
+
+Override `OMNI_COMFYUI_RESERVE_VRAM_GB` only when the workload requires a
+different reserve.
 
 For model placement, upstream templates, optional nodes, and runtime switches,
 see [ComfyUI usage](docs/COMFYUI.md).
