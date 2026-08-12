@@ -13,6 +13,17 @@ FULL_DOCKERFILE = OMNI_ROOT / "docker" / "Dockerfile.full"
 DOCKERIGNORE = OMNI_ROOT / ".dockerignore"
 BUILD_SCRIPT = OMNI_ROOT / "build.sh"
 VALIDATOR = OMNI_ROOT / "tools" / "validate_comfyui_image.py"
+PUBLIC_BMG_DOCUMENTATION = (
+    OMNI_ROOT / "README.md",
+    OMNI_ROOT / "ComfyUI-OmniXPU" / "README.md",
+    OMNI_ROOT / "docs" / "COMFYUI.md",
+    OMNI_ROOT / "docs" / "IMAGE_BUILD.md",
+)
+COMFYUI_STARTUP_DOCUMENTATION = (
+    OMNI_ROOT / "README.md",
+    OMNI_ROOT / "docs" / "COMFYUI.md",
+)
+CACHE_DIT_COMMIT = "1d92bbd86ec59aa6223fe2368849b7413a1acb93"
 DEMO_ASSETS = {
     "demo_qwen_image.gif",
     "demo_wan2.2_14b_i2v_multi_xpu.gif",
@@ -52,7 +63,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_AIMDO_COMMIT": (
         "AIMDO_COMMIT",
-        "c7baf6240e5ed37fe01ee30330befade7d23497f",
+        "3ab29453b560cbd831cb98fcabf2bebc3d6a78c5",
     ),
     "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.4.13"),
     "COMFY_GGUF_REPOSITORY": (
@@ -87,6 +98,43 @@ def load_validator():
 
 
 class ComfyUIImageContractTest(unittest.TestCase):
+    def test_comfyui_docs_default_to_direct_startup_and_scope_dynamic_vram(self):
+        for path in COMFYUI_STARTUP_DOCUMENTATION:
+            with self.subTest(path=path):
+                document = path.read_text(encoding="utf-8")
+                direct_start = document.index("python main.py")
+                memory_preset = document.index(
+                    "/llm/entrypoints/start_comfyui.sh"
+                )
+
+                self.assertLess(direct_start, memory_preset)
+                self.assertIn("known or observed XPU", document)
+                self.assertIn("out-of-memory risk", document)
+                self.assertIn("reduce performance", document)
+
+    def test_public_image_documentation_focuses_on_bmg_support(self):
+        for path in PUBLIC_BMG_DOCUMENTATION:
+            with self.subTest(path=path):
+                document = path.read_text(encoding="utf-8")
+                self.assertNotIn("Intel publishes", document)
+                self.assertNotIn("PTL-H", document)
+                self.assertNotIn("ptl-h", document)
+
+        adapter_readme = (
+            OMNI_ROOT / "ComfyUI-OmniXPU" / "README.md"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("## Adapter behavior", adapter_readme)
+        self.assertNotIn("## Contribution boundary", adapter_readme)
+
+    def test_cache_dit_uses_the_pinned_minimax_h3_revision(self):
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "git -C ComfyUI-CacheDiT fetch --depth 1 origin \\\n"
+            f"        {CACHE_DIT_COMMIT}",
+            dockerfile,
+        )
+
     def test_root_readme_omni_links_resolve_to_current_docs_and_assets(self):
         readme = ROOT_README.read_text(encoding="utf-8")
 
@@ -234,6 +282,13 @@ class ComfyUIImageContractTest(unittest.TestCase):
                 Path("/llm/comfy-aimdo-xpu"),
                 "OMNI_COMFY_AIMDO_REVISION",
             ),
+        )
+        self.assertEqual(
+            validator.AIMDO_REQUIRED_XPU_TESTS,
+            {
+                "test_xpu_backend.py",
+                "test_xpu_comfyui_opt_in.py",
+            },
         )
 
     def test_comfyui_dependencies_are_pinned_and_validated(self):
