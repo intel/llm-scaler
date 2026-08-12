@@ -1446,7 +1446,7 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
   --attention-backend FLASH_ATTN \
   --chat-template /path/to/Muse-Glimmer-30B/chat_template.jinja \
   --enable-auto-tool-choice \
-  --limit-mm-per-prompt  '{"image":0}' \
+  --limit-mm-per-prompt  '{"image":0, "video":0}' \
   --tool-call-parser muse_glimmer \
   --reasoning-parser muse_glimmer \
   --enforce-eager \
