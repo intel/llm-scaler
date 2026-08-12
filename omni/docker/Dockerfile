@@ -30,7 +30,7 @@ ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
 ARG COMFY_KITCHEN_COMMIT=575741da0edd9a6e34cbf7f0b29b20b9f4df9e34
 ARG COMFY_KITCHEN_VERSION=0.2.28
 ARG COMFY_AIMDO_REPOSITORY=https://github.com/xiangyuT/comfy-aimdo-xpu.git
-ARG COMFY_AIMDO_COMMIT=c7baf6240e5ed37fe01ee30330befade7d23497f
+ARG COMFY_AIMDO_COMMIT=3ab29453b560cbd831cb98fcabf2bebc3d6a78c5
 ARG COMFY_AIMDO_VERSION=0.4.13
 ARG COMFY_GGUF_REPOSITORY=https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git
 ARG COMFY_GGUF_COMMIT=39671fe73117ba97de7011e7e06e32599dcda06d
@@ -188,7 +188,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git clone --filter=blob:none --no-checkout \
         https://github.com/Jasonzzt/ComfyUI-CacheDiT.git && \
     git -C ComfyUI-CacheDiT fetch --depth 1 origin \
-        ab1a1448a2476a33493c9a9b04e1685971b9e73a && \
+        1d92bbd86ec59aa6223fe2368849b7413a1acb93 && \
     git -C ComfyUI-CacheDiT checkout --detach FETCH_HEAD && \
     pip install -r ComfyUI-CacheDiT/requirements.txt
 

@@ -5,10 +5,11 @@ bundled in the image.
 
 ## Start the server
 
-Mount an existing ComfyUI model directory and invoke the supplied entrypoint:
+Mount an existing ComfyUI model directory and start ComfyUI directly. This is
+the recommended default when the workflow fits in XPU memory:
 
 ```bash
-IMAGE=intel/llm-scaler-omni:0.2.0-b1-comfyui-bmg
+IMAGE=intel/llm-scaler-omni:0.2.0-b1
 CONTAINER_NAME=comfyui
 
 sudo docker run -itd \
@@ -17,23 +18,40 @@ sudo docker run -itd \
     --network=host \
     --shm-size=64g \
     --name="$CONTAINER_NAME" \
+    --workdir=/llm/ComfyUI \
     -v /path/to/comfyui_models:/llm/ComfyUI/models \
     "$IMAGE" \
-    /llm/entrypoints/start_comfyui.sh
+    python main.py
 ```
 
-The entrypoint listens on port `8188`. Extra arguments are forwarded to
-ComfyUI:
+The release image supports Intel Arc B-series/Battlemage GPUs.
+
+The default server is available at `http://127.0.0.1:8188`. Append
+`--listen 0.0.0.0` when remote access is required, and append
+`--enable-manager` when the integrated Node Manager is needed.
+
+## DynamicVRAM for memory-constrained workflows
+
+Use the supplied entrypoint only when a workflow has a known or observed XPU
+out-of-memory risk:
+
+```bash
+/llm/entrypoints/start_comfyui.sh
+```
+
+The entrypoint enables ComfyUI DynamicVRAM, backed by the image's pinned AIMDO
+XPU/Level Zero allocator, enables Node Manager, and reserves 4 GiB of XPU
+memory. DynamicVRAM stages, unloads, and reloads model weights to preserve
+activation headroom during model switching or text re-encoding. This can avoid
+OOM failures, but the additional weight-management work can reduce performance
+when the workflow already fits in XPU memory. The reserve can be changed with
+`OMNI_COMFYUI_RESERVE_VRAM_GB` when required by a specific workload.
+
+Additional ComfyUI arguments are forwarded by the entrypoint. For example:
 
 ```bash
 /llm/entrypoints/start_comfyui.sh --disable-smart-memory
 ```
-
-The entrypoint enables ComfyUI DynamicVRAM, backed by the image's pinned AIMDO
-XPU/Level Zero allocator. The default 4 GiB XPU reserve can be changed with
-`OMNI_COMFYUI_RESERVE_VRAM_GB`. Keeping a nonzero reserve is important for
-workflows that execute an XPU text encoder again after diffusion weights are
-resident.
 
 ## Models and workflows
 
