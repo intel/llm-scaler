@@ -52,8 +52,8 @@ COPY ./custom-esimd-kernels-vllm /src/custom-esimd-kernels-vllm
 # --- build tooling (the oneAPI DPC++ compiler is already in the OMIX devel base) ---
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-    apt-get update -y && \
-    apt-get install -y --no-install-recommends --fix-missing \
+    apt-get -o APT::Update::Error-Mode=any update -y && \
+    apt-get install -y --no-install-recommends \
         git curl ca-certificates \
         python3-dev python3-venv python3-pip \
         ninja-build cmake pkg-config numactl
@@ -162,8 +162,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,from=builder,source=/wheels,target=/wheels \
-    apt-get update -y && \
-    apt-get install -y --no-install-recommends --fix-missing \
+    set -e && \
+    apt-get -o APT::Update::Error-Mode=any update -y && \
+    apt-get install -y --no-install-recommends \
         ffmpeg libsndfile1 libsm6 libxext6 libgl1 numactl curl && \
     rm -rf /var/lib/apt/lists/* && \
     curl -fL --retry 3 -o "${ONECCL_INSTALLER}" "https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.9/${ONECCL_INSTALLER}" && \
@@ -202,10 +203,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     pip install transformers==5.8.0 accelerate hf_transfer 'modelscope!=1.15.0' && \
     pip install librosa soundfile decord ijson && \
     pip install bigdl-core==2.4.0b2 && \
-    pip uninstall -y triton triton-xpu || true && \
+    (pip uninstall -y triton triton-xpu || true) && \
     pip install --no-deps triton-xpu==3.7.0 \
         --extra-index-url https://download.pytorch.org/whl/xpu && \
-    pip uninstall -y oneccl oneccl-devel || true && \
+    (pip uninstall -y oneccl oneccl-devel || true) && \
     rm -f /opt/venv/lib/libccl.so /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so.1.0 \
         /opt/venv/lib/libccl_openmp.so /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so.0.1 && \
     ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1.0 /opt/venv/lib/libccl.so.1 && \
@@ -215,6 +216,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     TRITON=/opt/venv/lib/python3.12/site-packages/triton && \
     strip --strip-debug ${TRITON}/_C/libtriton.so && \
     rm -f ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git && \
-    ln -s libMLIRDialectPlugin.so ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git
+    ln -s libMLIRDialectPlugin.so ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git && \
+    command -v vllm && \
+    python3 -c "import vllm"
 
 ENTRYPOINT ["bash", "-c", "exec vllm serve \"$@\"", "--"]
