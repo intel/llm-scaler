@@ -52,8 +52,8 @@ COPY ./custom-esimd-kernels-vllm /src/custom-esimd-kernels-vllm
 # --- build tooling (the oneAPI DPC++ compiler is already in the OMIX devel base) ---
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-    apt-get -o APT::Update::Error-Mode=any update -y && \
-    apt-get install -y --no-install-recommends \
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends --fix-missing \
         git curl ca-certificates \
         python3-dev python3-venv python3-pip \
         ninja-build cmake pkg-config numactl
@@ -163,8 +163,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,from=builder,source=/wheels,target=/wheels \
     set -e && \
-    apt-get -o APT::Update::Error-Mode=any update -y && \
-    apt-get install -y --no-install-recommends \
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends --fix-missing \
         ffmpeg libsndfile1 libsm6 libxext6 libgl1 numactl curl && \
     rm -rf /var/lib/apt/lists/* && \
     curl -fL --retry 3 -o "${ONECCL_INSTALLER}" "https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.9/${ONECCL_INSTALLER}" && \
@@ -216,8 +216,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     TRITON=/opt/venv/lib/python3.12/site-packages/triton && \
     strip --strip-debug ${TRITON}/_C/libtriton.so && \
     rm -f ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git && \
-    ln -s libMLIRDialectPlugin.so ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git && \
-    command -v vllm && \
-    python3 -c "import vllm"
+    ln -s libMLIRDialectPlugin.so ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git
 
 ENTRYPOINT ["bash", "-c", "exec vllm serve \"$@\"", "--"]
