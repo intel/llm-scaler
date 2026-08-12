@@ -1419,7 +1419,7 @@ You can profile performance by tuning `num_speculative_tokens` from 2 to 5. Adju
 
 ### 3.6 How To Run Muse Glimmer 30B
 
-Transformers version 5.8.0 does not support running Glimmer-based multimodal tasks; you need to install version 5.15.0 to use multimodal or use the flag --limit-mm-per-prompt '{"image": 0}' to run it with language-only. 
+Transformers version 5.8.0 does not support running Glimmer-based multimodal tasks; you need to install version 5.15.0 to use multimodal or use the flag --limit-mm-per-prompt '{"image": 0, "video": 0}' to run it with language-only.
 And the current Muse-Glimmer chat template always enables reasoning and ignores the `enable_thinking` option. When the server is started with `--reasoning-parser muse_glimmer`, reasoning is omitted from responses by default (`include_reasoning=false`). Set `include_reasoning=true` in the request to return it in `message.reasoning`.
 
 Fo instance starting the meta-models/Muse-Glimmer-30B model: 
