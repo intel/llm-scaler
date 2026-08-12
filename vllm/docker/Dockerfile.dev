@@ -196,13 +196,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ---------------------------------------------------------------------------
 RUN --mount=type=cache,target=/root/.cache/uv \
     set -eo pipefail && \
-    pip uninstall -y triton triton-xpu || true && \
+    (pip uninstall -y triton triton-xpu || true) && \
     pip install --no-deps triton-xpu==3.7.0 \
         --extra-index-url https://download.pytorch.org/whl/xpu
 
 # Replace torch-bundled oneCCL stubs in /opt/venv/lib with links to oneCCL 2021.15.
 RUN set -eo pipefail && \
-    pip uninstall -y oneccl oneccl-devel || true && \
+    (pip uninstall -y oneccl oneccl-devel || true) && \
     rm -f /opt/venv/lib/libccl.so /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so.1.0 \
         /opt/venv/lib/libccl_openmp.so /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so.0.1 && \
     ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1.0 /opt/venv/lib/libccl.so.1 && \

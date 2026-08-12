@@ -162,6 +162,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,from=builder,source=/wheels,target=/wheels \
+    set -e && \
     apt-get update -y && \
     apt-get install -y --no-install-recommends --fix-missing \
         ffmpeg libsndfile1 libsm6 libxext6 libgl1 numactl curl && \
@@ -202,10 +203,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     pip install transformers==5.8.0 accelerate hf_transfer 'modelscope!=1.15.0' && \
     pip install librosa soundfile decord ijson && \
     pip install bigdl-core==2.4.0b2 && \
-    pip uninstall -y triton triton-xpu || true && \
+    (pip uninstall -y triton triton-xpu || true) && \
     pip install --no-deps triton-xpu==3.7.0 \
         --extra-index-url https://download.pytorch.org/whl/xpu && \
-    pip uninstall -y oneccl oneccl-devel || true && \
+    (pip uninstall -y oneccl oneccl-devel || true) && \
     rm -f /opt/venv/lib/libccl.so /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so.1.0 \
         /opt/venv/lib/libccl_openmp.so /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so.0.1 && \
     ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1.0 /opt/venv/lib/libccl.so.1 && \
