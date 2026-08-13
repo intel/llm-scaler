@@ -48,6 +48,13 @@ def test_generic_kitchen_operations_are_not_custom_node_components(monkeypatch):
     assert all("patch_fp8_fix" not in module for module in modules)
 
 
+def test_lora_memory_budget_is_registered_as_an_adapter(monkeypatch):
+    patches = _load_registry(monkeypatch)
+    components = {entry["name"]: entry for entry in patches.get_components()}
+
+    assert components["lora_memory_budget"]["kind"] == "adapter"
+
+
 def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     for name in (
         "OMNIXPU_ENABLE",
@@ -56,6 +63,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
         "OMNIXPU_NORM",
         "OMNIXPU_FP8_GEMM",
         "OMNIXPU_INT8_FFN",
+        "OMNIXPU_LORA_MEMORY",
         "OMNIXPU_INTERPOLATE_FIX",
         "OMNIXPU_MEDIAN_FIX",
     ):
@@ -67,6 +75,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     assert config.norm
     assert config.fp8_gemm
     assert config.int8_ffn
+    assert config.lora_memory
     assert not config.interpolate_fix
     assert not config.median_fix
     assert not hasattr(config, "rope")
@@ -82,6 +91,7 @@ def test_disabled_components_are_reported_without_importing_modules(monkeypatch)
         norm=False,
         fp8_gemm=False,
         int8_ffn=False,
+        lora_memory=False,
         interpolate_fix=False,
         median_fix=False,
     )

@@ -58,6 +58,13 @@ COMPONENTS = (
         "adapters/int8_ffn.py",
     ),
     Component(
+        "lora_memory_budget",
+        "lora_memory",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/lora_memory.py",
+    ),
+    Component(
         "legacy_interpolate_fix",
         "interpolate_fix",
         "legacy_fix",
