@@ -1,7 +1,7 @@
 # Copyright (C) 2025 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
-# DEV / DEBUG build of llm-scaler-vllm (Intel XPU).  Single stage.
+# DEV / DEBUG build of llm-scaler-vllm (Intel XPU).
 #
 #   base : intel/omix:0.1.0-devel-ubuntu24.04
 #            - oneAPI 2025.3 DPC++ compiler (icpx), oneCCL 2021.17, oneDNN/oneMKL
@@ -18,9 +18,9 @@
 #       trees AND their build/ dirs, so any component can be rebuilt in place
 #     * debug symbols (NO `strip`, NO plugin dedup, NO cleanup)
 #     * gdb / debug tooling
-#   Package versions are kept in lockstep with prod: torch 2.11.0+xpu, the same
-#   vLLM v0.21.0 + multi_arc patch, the same esimd kernels, the same
-#   vllm-xpu-kernels commit + patch, transformers 5.8.0, triton-xpu 3.7.0,
+#   Target package versions: torch 2.12.0+xpu,
+#   vLLM v0.26.0 + multi_arc patch, the same esimd kernels, the same
+#   vllm-xpu-kernels commit + patch, transformers 5.8.0, triton-xpu 3.7.1,
 #   bigdl-core 2.4.0b2.
 #
 #   The ONE intentional divergence: vLLM is installed EDITABLE (`pip install -e`)
@@ -30,15 +30,40 @@
 #
 # Build context root MUST be the `vllm/` dir (so ./patches, ./custom-esimd-kernels-vllm
 # and ./examples resolve):
-#     docker build -f docker/Dockerfile.dev -t <name>:v0.21.0-omix-pr508-dev .
+#     docker build -f docker/Dockerfile.dev -t <name>:v0.26.0-dev .
+
+FROM ubuntu:22.04 AS rust-build
+
+ARG VLLM_VERSION=v0.26.0
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CARGO_BUILD_JOBS=4
+
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl git build-essential unzip python3 python3-pip && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 --branch "${VLLM_VERSION}" \
+        https://github.com/vllm-project/vllm.git /workspace/vllm
+
+WORKDIR /workspace/vllm
+
+RUN ./tools/install_protoc.sh && \
+    python3 -m pip install --no-cache-dir -r requirements/build/rust.txt
+
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
+    bash build_rust.sh
 
 FROM intel/omix:0.1.0-devel-ubuntu24.04
 
 ARG http_proxy
 ARG https_proxy
 ARG no_proxy
+ARG VLLM_VERSION=v0.26.0
 # vllm-xpu-kernels pinned base commit (identical to prod build).
-ARG VLLM_XPU_KERNELS_COMMIT=3cab97a
+ARG VLLM_XPU_KERNELS_COMMIT=a6929869587fa6c40dbe393eedc96eeab076bfbb
 ARG ONECCL_INSTALLER="intel-oneccl-2021.15.9.14_offline.sh"
 ARG ONECCL_INSTALLER_SHA256="f7ab81b6ed1b10dd35fadec366a78046d8af214888dfd625047ce8953d5aa4ef"
 
@@ -79,11 +104,11 @@ RUN python3 -m venv ${VIRTUAL_ENV}
 # --- uv for fast, deterministic installs (matches prod) ---
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# --- torch pinned to the prod runtime ABI (2.11.0+xpu) so all native .so link
+# --- torch pinned to the prod runtime ABI (2.12.0+xpu) so all native .so link
 #     against the libtorch the image ships ---
 RUN --mount=type=cache,target=/root/.cache/uv \
     pip install --upgrade pip wheel setuptools && \
-    uv pip install torch==2.11.0+xpu torchaudio torchvision \
+    uv pip install torch==2.12.0+xpu torchaudio torchvision \
         --index-url https://download.pytorch.org/whl/xpu
 
 RUN mkdir -p ${WHEELS}
@@ -129,7 +154,7 @@ RUN curl -fL --retry 3 -o "${ONECCL_INSTALLER}" "https://github.com/uxlfoundatio
     rm -rf "/tmp/${ONECCL_INSTALLER%.sh}" /tmp/oneccl-runtime
 
 # ---------------------------------------------------------------------------
-# vLLM v0.21.0 + multi-arc patch  ->  EDITABLE install (source kept at
+# vLLM v0.26.0 + multi-arc patch  ->  EDITABLE install (source kept at
 # /llm-scaler/vllm/vllm, native ext + build/ compiled in place).
 # Deps resolve here (mirrors prod's `pip install vllm-*.whl`); the triton
 # clobber they pull is repaired at the end, same as prod.
@@ -137,11 +162,19 @@ RUN curl -fL --retry 3 -o "${ONECCL_INSTALLER}" "https://github.com/uxlfoundatio
 RUN --mount=type=cache,target=/root/.cache/uv \
     set -eo pipefail && \
     source /opt/intel/oneapi/setvars.sh --force && \
-    git clone --depth 1 -b v0.21.0 https://github.com/vllm-project/vllm.git ./vllm && \
+    git clone --depth 1 -b "${VLLM_VERSION}" https://github.com/vllm-project/vllm.git ./vllm && \
     cd ./vllm && \
     git apply /tmp/vllm_for_multi_arc.patch && \
     uv pip install -r requirements/xpu.txt && \
-    uv pip install grpcio-tools protobuf nanobind && \
+    uv pip install grpcio-tools protobuf nanobind
+
+COPY --from=rust-build /workspace/vllm/vllm/vllm-rs /llm-scaler/vllm/vllm/vllm-rs
+COPY --from=rust-build /workspace/vllm/vllm/_rust_*.so /llm-scaler/vllm/vllm/
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eo pipefail && \
+    source /opt/intel/oneapi/setvars.sh --force && \
+    cd ./vllm && \
     export CMAKE_PREFIX_PATH="$(python3 -c 'import site; print(site.getsitepackages()[0])'):${CMAKE_PREFIX_PATH:-}" && \
     pip install --no-build-isolation -e . \
         --extra-index-url https://download.pytorch.org/whl/xpu
@@ -191,13 +224,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ---------------------------------------------------------------------------
 # triton-xpu fix (same as prod): installing vllm deps pulls upstream CUDA
 # triton==3.7.1 (via xgrammar), which drops the `intel` backend.  Reinstall
-# triton-xpu 3.7.0.  DEV DIFF: do NOT strip libtriton.so / dedup plugins /
+# triton-xpu 3.7.1.  DEV DIFF: do NOT strip libtriton.so / dedup plugins /
 # run any cleanup -- debug symbols are kept.
 # ---------------------------------------------------------------------------
 RUN --mount=type=cache,target=/root/.cache/uv \
     set -eo pipefail && \
     (pip uninstall -y triton triton-xpu || true) && \
-    pip install --no-deps triton-xpu==3.7.0 \
+    pip install --no-deps triton-xpu==3.7.1 \
         --extra-index-url https://download.pytorch.org/whl/xpu
 
 # Replace torch-bundled oneCCL stubs in /opt/venv/lib with links to oneCCL 2021.15.
