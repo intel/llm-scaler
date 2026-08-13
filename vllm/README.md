@@ -1126,6 +1126,7 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | deepseek-ai/DeepSeek-R1-0528-Qwen3-8B      |  ✅  |         ✅         |          ✅          |       |                           |
 | deepseek-ai/DeepSeek-V2-Lite               |  ✅  |         ✅         |                      |       | export VLLM_MLA_DISABLE=1 |
 | deepseek-ai/deepseek-coder-33b-instruct    |  ✅  |         ✅         |          ✅          |       |                           |
+| meta-models/Muse-Glimmer-30B               |  ✅  |         ✅         |                       |       |  follow the guide in [here](#36-how-to-run-muse-glimmer-30b) |
 | Qwen/Qwen3-8B                              |  ✅  |         ✅         |          ✅          |       |                           |
 | Qwen/Qwen3-14B                             |  ✅  |         ✅         |          ✅          |       |                           |
 | Qwen/Qwen3-32B                             |  ✅  |         ✅         |          ✅          |       |                           |
@@ -1415,6 +1416,56 @@ Use `"method": "gemma4_mtp"` when serving Gemma 4 with an assistant checkpoint:
 
 You can profile performance by tuning `num_speculative_tokens` from 2 to 5. Adjust this based on your workload.
 
+
+### 3.6 How To Run Muse Glimmer 30B
+
+Transformers version 5.8.0 does not support running Glimmer-based multimodal tasks; you need to install version 5.15.0 to use multimodal or use the flag --limit-mm-per-prompt '{"image": 0, "video": 0}' to run it with language-only.
+And the current Muse-Glimmer chat template always enables reasoning and ignores the `enable_thinking` option. When the server is started with `--reasoning-parser muse_glimmer`, reasoning is omitted from responses by default (`include_reasoning=false`). Set `include_reasoning=true` in the request to return it in `message.reasoning`.
+
+Fo instance starting the meta-models/Muse-Glimmer-30B model: 
+```bash
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+# use these two env and add dflash config to enable dflash to get better preformance
+#export DISABLE_MUSE_GLIMMER_MLP_ESIMD=1
+#export VLLM_MUSE_GLIMMER_BATCHED_NORM=1
+#--speculative-config '{"method":"dflash","num_speculative_tokens":15, "model":"/path/to/Muse-Glimmer-30B-assistant"}' \
+ 
+  vllm serve \
+  --model /path/to/Muse-Glimmer-30B \
+  --served-model-name muse-glimmer-30b \
+  --quantization fp8 \
+  --dtype float16 \
+  --mamba-ssm-cache-dtype float16 \
+  --block-size 64 \
+  --max-model-len 131072 \
+  --max-num-batched-tokens 8192 \
+  --max-num-seqs 8 \
+  --gpu-memory-util 0.85 \
+  --tensor-parallel-size 2 \
+  --attention-backend FLASH_ATTN \
+  --chat-template /path/to/Muse-Glimmer-30B/chat_template.jinja \
+  --enable-auto-tool-choice \
+  --limit-mm-per-prompt  '{"image":0, "video":0}' \
+  --tool-call-parser muse_glimmer \
+  --reasoning-parser muse_glimmer \
+  --enforce-eager \
+  --no-enable-prefix-caching \
+  --trust-remote-code \
+  --host 0.0.0.0 \
+  --port 8001
+```
+
+### 3.7 Dflash Enable
+
+To get better preformance, you can enable dflash.
+
+**Supported models:** Currently verified with `Qwen3.6-27B` and `Muse-Glimmer-30B` models.
+
+For example, add dflash config:
+```bash
+--speculative-config '{"method":"dflash","num_speculative_tokens":15, "model":"/path/to/Muse-Glimmer-30B-assistant"}'
+```
 
 ## 4. Troubleshooting
 
