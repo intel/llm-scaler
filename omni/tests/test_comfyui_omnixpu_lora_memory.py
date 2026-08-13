@@ -228,6 +228,54 @@ def test_model_loader_keeps_default_minimum_and_deduplicates_shared_tensors():
     assert calls == [(models, (4096 + 2 * 1024,), {})]
 
 
+@pytest.mark.parametrize(
+    ("call_args", "call_kwargs", "expected_args", "expected_kwargs", "kind"),
+    (
+        ((4096, False, True), {}, (4096 + 3 * 1024, False, True), {}, "bool"),
+        (
+            (),
+            {"memory_required": 4096, "minimum_memory_required": "auto"},
+            (),
+            {
+                "memory_required": 4096 + 3 * 1024,
+                "minimum_memory_required": "auto",
+            },
+            "str",
+        ),
+    ),
+)
+def test_model_loader_preserves_non_numeric_minimum(
+    monkeypatch,
+    caplog,
+    call_args,
+    call_kwargs,
+    expected_args,
+    expected_kwargs,
+    kind,
+):
+    monitor = _load_module()
+    patcher = _patcher()
+    monitor._set_budget_entries(patcher, monitor._patcher_entries(patcher))
+    calls = []
+
+    def load_models_gpu(models, *args, **kwargs):
+        calls.append((args, kwargs))
+        return "loaded"
+
+    monkeypatch.setattr(monitor, "_xpu_snapshot", lambda device=None: None)
+    model_management = types.SimpleNamespace(load_models_gpu=load_models_gpu)
+    monitor._patch_model_loader(model_management)
+
+    with caplog.at_level(logging.INFO, logger="ComfyUI-OmniXPU"):
+        result = model_management.load_models_gpu(
+            [patcher], *call_args, **call_kwargs
+        )
+
+    assert result == "loaded"
+    assert calls == [(expected_args, expected_kwargs)]
+    assert f"minimum=unchanged({kind})" in caplog.text
+
+
 def test_apply_does_not_wrap_dynamic_staging_without_trace(monkeypatch):
     monitor = _load_module()
     comfy = types.ModuleType("comfy")

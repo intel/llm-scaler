@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+from numbers import Real
 
 
 log = logging.getLogger("ComfyUI-OmniXPU")
@@ -206,6 +207,10 @@ def _models_budget_entries(models):
     return entries
 
 
+def _is_memory_size(value):
+    return isinstance(value, Real) and not isinstance(value, bool)
+
+
 def _add_budget_to_load_args(args, kwargs, budget):
     new_args = list(args)
     new_kwargs = dict(kwargs)
@@ -221,17 +226,18 @@ def _add_budget_to_load_args(args, kwargs, budget):
         new_kwargs["memory_required"] = budget
     effective_requested = requested + budget
 
+    minimum = None
+    effective_minimum = None
     if "minimum_memory_required" in new_kwargs:
         minimum = new_kwargs["minimum_memory_required"]
-        if minimum is not None:
-            new_kwargs["minimum_memory_required"] = minimum + budget
+        if _is_memory_size(minimum):
+            effective_minimum = minimum + budget
+            new_kwargs["minimum_memory_required"] = effective_minimum
     elif len(new_args) > 2:
         minimum = new_args[2]
-        if minimum is not None:
-            new_args[2] = minimum + budget
-    else:
-        minimum = None
-    effective_minimum = None if minimum is None else minimum + budget
+        if _is_memory_size(minimum):
+            effective_minimum = minimum + budget
+            new_args[2] = effective_minimum
 
     return (
         tuple(new_args),
@@ -241,6 +247,14 @@ def _add_budget_to_load_args(args, kwargs, budget):
         minimum,
         effective_minimum,
     )
+
+
+def _minimum_budget_text(minimum, effective_minimum):
+    if minimum is None:
+        return "default"
+    if effective_minimum is None:
+        return f"unchanged({type(minimum).__name__})"
+    return f"{_mib(minimum):.1f}->{_mib(effective_minimum):.1f}MiB"
 
 
 def _runtime_patch_bytes(modules):
@@ -353,11 +367,7 @@ def _patch_model_loader(model_management):
             budget_stats["tensors"],
             _mib(requested),
             _mib(effective_requested),
-            (
-                "default"
-                if minimum is None
-                else f"{_mib(minimum):.1f}->{_mib(effective_minimum):.1f}MiB"
-            ),
+            _minimum_budget_text(minimum, effective_minimum),
             _snapshot_text(before),
         )
         try:

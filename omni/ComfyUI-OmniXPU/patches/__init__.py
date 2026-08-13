@@ -65,7 +65,7 @@ COMPONENTS = (
         "adapters/dynamic_vram.py",
     ),
     Component(
-        "lora_memory_budget",
+        "lora_memory_adapter",
         "lora_memory",
         "adapter",
         "ComfyUI-OmniXPU",

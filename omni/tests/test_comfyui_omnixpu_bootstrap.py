@@ -48,11 +48,11 @@ def test_generic_kitchen_operations_are_not_custom_node_components(monkeypatch):
     assert all("patch_fp8_fix" not in module for module in modules)
 
 
-def test_lora_memory_budget_is_registered_as_an_adapter(monkeypatch):
+def test_lora_memory_is_registered_as_an_adapter(monkeypatch):
     patches = _load_registry(monkeypatch)
     components = {entry["name"]: entry for entry in patches.get_components()}
 
-    assert components["lora_memory_budget"]["kind"] == "adapter"
+    assert components["lora_memory_adapter"]["kind"] == "adapter"
 
 
 def test_dynamic_vram_trim_runs_inside_lora_budget_wrapper(monkeypatch):
@@ -60,7 +60,7 @@ def test_dynamic_vram_trim_runs_inside_lora_budget_wrapper(monkeypatch):
     names = [entry["name"] for entry in patches.get_components()]
 
     assert names.index("dynamic_vram_boundary_trim") < names.index(
-        "lora_memory_budget"
+        "lora_memory_adapter"
     )
 
 
