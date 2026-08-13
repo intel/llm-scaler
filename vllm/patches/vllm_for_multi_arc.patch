@@ -494,13 +494,13 @@ index e348562a4..c8e01dc38 100644
      dpkg -i *.deb && \
      cd .. && \
      rm -rf neo
-diff --git a/examples/tool_chat_template_onyx.jinja b/examples/tool_chat_template_onyx.jinja
+diff --git a/examples/tool_chat_template_muse_glimmer.jinja b/examples/tool_chat_template_muse_glimmer.jinja
 new file mode 100644
-index 000000000..8a8673897
+index 000000000..7f5d23786
 --- /dev/null
-+++ b/examples/tool_chat_template_onyx.jinja
++++ b/examples/tool_chat_template_muse_glimmer.jinja
 @@ -0,0 +1 @@
-+{%- macro render_content(content) -%}{%- if content is string -%}{{- content -}}{%- elif content is not none -%}{%- for part in content -%}{%- if part['type'] == 'image' -%}{{- '<|patch|>' -}}{%- elif part['type'] == 'video' -%}{{- '<|video|>' -}}{%- elif part['type'] == 'text' -%}{{- part['text'] -}}{%- endif -%}{%- endfor -%}{%- endif -%}{%- endmacro -%}{%- macro render_atem(tc) -%}{%- set args = tc.function.arguments -%}{%- if args is not mapping -%}{{- raise_exception('Onyx ATEM chat template requires tool_call.function.arguments to be a dict (mapping); a JSON string cannot be parsed in the HF jinja sandbox.') -}}{%- endif -%}{{- '<atem:function_calls>\n<atem:invoke name="' + tc.function.name + '">\n' -}}{%- for k, v in args.items() -%}{{- '<atem:parameter name="' + k + '">' -}}{%- if v is boolean -%}{%- if v -%}true{%- else -%}false{%- endif -%}{%- elif v is none -%}null{%- elif v is mapping or (v is iterable and v is not string) -%}{{- v | tojson -}}{%- else -%}{{- v -}}{%- endif -%}{{- '</atem:parameter>\n' -}}{%- endfor -%}{{- '</atem:invoke>\n</atem:function_calls>' -}}{%- endmacro -%}{%- macro render_tool_defs(tools) -%}{{- 'In this environment you have access to a set of tools you can use to answer the user\'s question.\n\n' -}}{{- 'You can invoke a function by writing a "<atem:function_calls>" block like the following:\n' -}}{{- '<atem:function_calls>\n<atem:invoke name="$FUNCTION_NAME">\n<atem:parameter name="$PARAMETER_NAME">$PARAMETER_VALUE</atem:parameter>\n...\n</atem:invoke>\n</atem:function_calls>\n\n' -}}{{- 'String and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\n' -}}{{- 'Here are the functions available in JSONSchema format:\n' -}}{{- '// Tool metadata\n' -}}{%- set nsns = namespace(seen=[]) -%}{%- for tool in tools -%}{%- set fn = tool.function if tool.function is defined else tool -%}{%- set tns = fn.name.split('.')[0] -%}{%- if tns not in nsns.seen -%}{%- set nsns.seen = nsns.seen + [tns] -%}{%- endif -%}{%- endfor -%}{%- set nd = tool_namespace_descriptions if tool_namespace_descriptions is defined else {} -%}{%- for tns in nsns.seen -%}{{- '{"name": ' + (tns | tojson) + ', "description": ' + ((nd[tns] if tns in nd else '') | tojson) + '}\n' -}}{%- endfor -%}{{- '// Function schemas' -}}{%- for tool in tools -%}{%- set fn = tool.function if tool.function is defined else tool -%}{{- '\n{"name": ' + (fn.name | tojson) + ', "description": ' + (fn.description | tojson) + ', "parameters": ' + (fn.parameters | tojson) + '}' -}}{%- endfor -%}{{- '\n\nHere\'s an example of how to call a function in the tool set:\n' -}}{{- '(If the tool namespace is not specified, invoke the function directly as `example_function_name` rather than `example_tool_name.example_function_name`)\n\n' -}}{{- 'to=example_tool_name.example_function_name\n\n' -}}{{- '<atem:function_calls>\n<atem:invoke name="example_tool_name.example_function_name">\n' -}}{{- '<atem:parameter name="example_parameter_1">value_1</atem:parameter>\n' -}}{{- '<atem:parameter name="example_parameter_2">This is the value for the second parameter\nthat can span\n"multiple" lines\n</atem:parameter>\n' -}}{{- '</atem:invoke>\n</atem:function_calls>' -}}{%- endmacro -%}{%- macro render_reasoning() -%}{%- set rs = reasoning_strength if reasoning_strength is defined and reasoning_strength else 'high' -%}{{- 'Reasoning strength: ' + rs + '.' -}}{%- endmacro -%}{%- macro render_system_meta(tools) -%}{%- set rns = namespace(recipients=['"self"'], nslist=[]) -%}{%- if tools -%}{%- for tool in tools -%}{%- set fn = tool.function if tool.function is defined else tool -%}{%- set tns = fn.name.split('.')[0] -%}{%- if tns not in rns.nslist -%}{%- set rns.nslist = rns.nslist + [tns] -%}{%- endif -%}{%- endfor -%}{%- for tns in rns.nslist -%}{%- set rns.recipients = rns.recipients + ['"' + tns + '.*"'] -%}{%- endfor -%}{%- endif -%}{%- set rns.recipients = rns.recipients + ['"user"'] -%}{{- '# Valid recipients: ' + rns.recipients | join(', ') + '.' -}}{%- endmacro -%}{{- bos_token -}}{%- set ns = namespace(has_system=false) -%}{%- for m in messages -%}{%- if m['role'] == 'system' -%}{%- set ns.has_system = true -%}{%- endif -%}{%- endfor -%}{%- if not ns.has_system -%}{{- '<|start|>system<|message|>You are a helpful AI assistant.' -}}{%- set kc = knowledge_cutoff if knowledge_cutoff is defined and knowledge_cutoff else '2026-01-04' -%}{{- '\nKnowledge cutoff: ' + kc + '.' -}}{%- if current_date is defined and current_date -%}{{- '\nCurrent date: ' + current_date + '.' -}}{%- elif strftime_now is defined -%}{{- '\nCurrent date: ' + strftime_now('%Y-%m-%d') + '.' -}}{%- endif -%}{{- '\n\n' -}}{{- render_reasoning() -}}{%- if tools -%}{{- '\n\n' -}}{{- render_tool_defs(tools) -}}{%- endif -%}{{- '\n\n' -}}{{- render_system_meta(tools) -}}{{- '<|eot|>' -}}{%- endif -%}{%- for message in messages -%}{%- set role = message['role'] -%}{%- set end_token = '<|eom|>' if (not loop.last and messages[loop.index0 + 1]['role'] == role) else '<|eot|>' -%}{%- if role == 'system' -%}{{- '<|start|>system<|message|>' -}}{{- render_content(message['content']) -}}{{- '\n\n' -}}{{- render_reasoning() -}}{%- if tools -%}{{- '\n\n' -}}{{- render_tool_defs(tools) -}}{%- endif -%}{{- '\n\n' -}}{{- render_system_meta(tools) -}}{{- '<|eot|>' -}}{%- elif role == 'user' -%}{{- '<|start|>user<|message|>' -}}{{- render_content(message['content']) -}}{{- '<|eot|>' -}}{%- elif role == 'tool' -%}{%- set tname = message.get('name') -%}{%- if not tname -%}{%- set tcid = message.get('tool_call_id') -%}{%- set rns = namespace(name=tcid if tcid else '') -%}{%- for m in messages -%}{%- if m.get('tool_calls') -%}{%- for tc in m['tool_calls'] -%}{%- if tcid is not none and tc.id is defined and tc.id == tcid -%}{%- set rns.name = tc.function.name -%}{%- endif -%}{%- endfor -%}{%- endif -%}{%- endfor -%}{%- set tname = rns.name -%}{%- endif -%}{{- '<|start|>tool ' + tname + '<|message|><tool_output name="' + tname + '">\n' -}}{{- render_content(message['content']) -}}{{- '\n</tool_output><|eot|>' -}}{%- elif role == 'assistant' -%}{%- if message.get('reasoning_content') -%}{{- '<|start|>assistant to=self<|message|>' + message['reasoning_content'] + '<|eom|>' -}}{%- endif -%}{%- if message.get('tool_calls') -%}{%- for tc in message['tool_calls'] -%}{{- '<|start|>assistant to=' + tc.function.name + '<|message|>' -}}{{- render_atem(tc) -}}{%- if loop.last -%}{{- end_token -}}{%- else -%}{{- '<|eom|>' -}}{%- endif -%}{%- endfor -%}{%- else -%}{%- set recipient = message.get('recipient') or 'user' -%}{%- set end_turn = message.get('end_turn') -%}{%- if end_turn is none -%}{%- set end_turn = not (recipient and recipient != 'user') -%}{%- endif -%}{{- '<|start|>assistant' -}}{%- if recipient -%}{{- ' to=' + recipient -}}{%- endif -%}{{- '<|message|>' -}}{{- render_content(message['content']) -}}{{- ('<|eot|>' if end_turn else '<|eom|>') -}}{%- endif -%}{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}{{- '<|start|>assistant' -}}{%- endif -%}
++{%- macro render_content(content) -%}{%- if content is string -%}{{- content -}}{%- elif content is not none -%}{%- for part in content -%}{%- if part['type'] == 'image' -%}{{- '<|patch|>' -}}{%- elif part['type'] == 'video' -%}{{- '<|video|>' -}}{%- elif part['type'] == 'text' -%}{{- part['text'] -}}{%- endif -%}{%- endfor -%}{%- endif -%}{%- endmacro -%}{%- macro render_atem(tc) -%}{%- set args = tc.function.arguments -%}{%- if args is not mapping -%}{{- raise_exception('MuseGlimmer ATEM chat template requires tool_call.function.arguments to be a dict (mapping); a JSON string cannot be parsed in the HF jinja sandbox.') -}}{%- endif -%}{{- '<atem:function_calls>\n<atem:invoke name="' + tc.function.name + '">\n' -}}{%- for k, v in args.items() -%}{{- '<atem:parameter name="' + k + '">' -}}{%- if v is boolean -%}{%- if v -%}true{%- else -%}false{%- endif -%}{%- elif v is none -%}null{%- elif v is mapping or (v is iterable and v is not string) -%}{{- v | tojson -}}{%- else -%}{{- v -}}{%- endif -%}{{- '</atem:parameter>\n' -}}{%- endfor -%}{{- '</atem:invoke>\n</atem:function_calls>' -}}{%- endmacro -%}{%- macro render_tool_defs(tools) -%}{{- 'In this environment you have access to a set of tools you can use to answer the user\'s question.\n\n' -}}{{- 'You can invoke a function by writing a "<atem:function_calls>" block like the following:\n' -}}{{- '<atem:function_calls>\n<atem:invoke name="$FUNCTION_NAME">\n<atem:parameter name="$PARAMETER_NAME">$PARAMETER_VALUE</atem:parameter>\n...\n</atem:invoke>\n</atem:function_calls>\n\n' -}}{{- 'String and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\n' -}}{{- 'Here are the functions available in JSONSchema format:\n' -}}{{- '// Tool metadata\n' -}}{%- set nsns = namespace(seen=[]) -%}{%- for tool in tools -%}{%- set fn = tool.function if tool.function is defined else tool -%}{%- set tns = fn.name.split('.')[0] -%}{%- if tns not in nsns.seen -%}{%- set nsns.seen = nsns.seen + [tns] -%}{%- endif -%}{%- endfor -%}{%- set nd = tool_namespace_descriptions if tool_namespace_descriptions is defined else {} -%}{%- for tns in nsns.seen -%}{{- '{"name": ' + (tns | tojson) + ', "description": ' + ((nd[tns] if tns in nd else '') | tojson) + '}\n' -}}{%- endfor -%}{{- '// Function schemas' -}}{%- for tool in tools -%}{%- set fn = tool.function if tool.function is defined else tool -%}{{- '\n{"name": ' + (fn.name | tojson) + ', "description": ' + (fn.description | tojson) + ', "parameters": ' + (fn.parameters | tojson) + '}' -}}{%- endfor -%}{{- '\n\nHere\'s an example of how to call a function in the tool set:\n' -}}{{- '(If the tool namespace is not specified, invoke the function directly as `example_function_name` rather than `example_tool_name.example_function_name`)\n\n' -}}{{- 'to=example_tool_name.example_function_name\n\n' -}}{{- '<atem:function_calls>\n<atem:invoke name="example_tool_name.example_function_name">\n' -}}{{- '<atem:parameter name="example_parameter_1">value_1</atem:parameter>\n' -}}{{- '<atem:parameter name="example_parameter_2">This is the value for the second parameter\nthat can span\n"multiple" lines\n</atem:parameter>\n' -}}{{- '</atem:invoke>\n</atem:function_calls>' -}}{%- endmacro -%}{%- macro render_reasoning() -%}{%- set rs = reasoning_strength if reasoning_strength is defined and reasoning_strength else 'high' -%}{{- 'Reasoning strength: ' + rs + '.' -}}{%- endmacro -%}{%- macro render_system_meta(tools) -%}{%- set rns = namespace(recipients=['"self"'], nslist=[]) -%}{%- if tools -%}{%- for tool in tools -%}{%- set fn = tool.function if tool.function is defined else tool -%}{%- set tns = fn.name.split('.')[0] -%}{%- if tns not in rns.nslist -%}{%- set rns.nslist = rns.nslist + [tns] -%}{%- endif -%}{%- endfor -%}{%- for tns in rns.nslist -%}{%- set rns.recipients = rns.recipients + ['"' + tns + '.*"'] -%}{%- endfor -%}{%- endif -%}{%- set rns.recipients = rns.recipients + ['"user"'] -%}{{- '# Valid recipients: ' + rns.recipients | join(', ') + '.' -}}{%- endmacro -%}{{- bos_token -}}{%- set ns = namespace(has_system=false) -%}{%- for m in messages -%}{%- if m['role'] == 'system' -%}{%- set ns.has_system = true -%}{%- endif -%}{%- endfor -%}{%- if not ns.has_system -%}{{- '<|start|>system<|message|>You are a helpful AI assistant.' -}}{%- set kc = knowledge_cutoff if knowledge_cutoff is defined and knowledge_cutoff else '2026-01-04' -%}{{- '\nKnowledge cutoff: ' + kc + '.' -}}{%- if current_date is defined and current_date -%}{{- '\nCurrent date: ' + current_date + '.' -}}{%- elif strftime_now is defined -%}{{- '\nCurrent date: ' + strftime_now('%Y-%m-%d') + '.' -}}{%- endif -%}{{- '\n\n' -}}{{- render_reasoning() -}}{%- if tools -%}{{- '\n\n' -}}{{- render_tool_defs(tools) -}}{%- endif -%}{{- '\n\n' -}}{{- render_system_meta(tools) -}}{{- '<|eot|>' -}}{%- endif -%}{%- for message in messages -%}{%- set role = message['role'] -%}{%- set end_token = '<|eom|>' if (not loop.last and messages[loop.index0 + 1]['role'] == role) else '<|eot|>' -%}{%- if role == 'system' -%}{{- '<|start|>system<|message|>' -}}{{- render_content(message['content']) -}}{{- '\n\n' -}}{{- render_reasoning() -}}{%- if tools -%}{{- '\n\n' -}}{{- render_tool_defs(tools) -}}{%- endif -%}{{- '\n\n' -}}{{- render_system_meta(tools) -}}{{- '<|eot|>' -}}{%- elif role == 'user' -%}{{- '<|start|>user<|message|>' -}}{{- render_content(message['content']) -}}{{- '<|eot|>' -}}{%- elif role == 'tool' -%}{%- set tname = message.get('name') -%}{%- if not tname -%}{%- set tcid = message.get('tool_call_id') -%}{%- set rns = namespace(name=tcid if tcid else '') -%}{%- for m in messages -%}{%- if m.get('tool_calls') -%}{%- for tc in m['tool_calls'] -%}{%- if tcid is not none and tc.id is defined and tc.id == tcid -%}{%- set rns.name = tc.function.name -%}{%- endif -%}{%- endfor -%}{%- endif -%}{%- endfor -%}{%- set tname = rns.name -%}{%- endif -%}{{- '<|start|>tool ' + tname + '<|message|><tool_output name="' + tname + '">\n' -}}{{- render_content(message['content']) -}}{{- '\n</tool_output><|eot|>' -}}{%- elif role == 'assistant' -%}{%- if message.get('reasoning_content') -%}{{- '<|start|>assistant to=self<|message|>' + message['reasoning_content'] + '<|eom|>' -}}{%- endif -%}{%- if message.get('tool_calls') -%}{%- for tc in message['tool_calls'] -%}{{- '<|start|>assistant to=' + tc.function.name + '<|message|>' -}}{{- render_atem(tc) -}}{%- if loop.last -%}{{- end_token -}}{%- else -%}{{- '<|eom|>' -}}{%- endif -%}{%- endfor -%}{%- else -%}{%- set recipient = message.get('recipient') or 'user' -%}{%- set end_turn = message.get('end_turn') -%}{%- if end_turn is none -%}{%- set end_turn = not (recipient and recipient != 'user') -%}{%- endif -%}{{- '<|start|>assistant' -}}{%- if recipient -%}{{- ' to=' + recipient -}}{%- endif -%}{{- '<|message|>' -}}{{- render_content(message['content']) -}}{{- ('<|eot|>' if end_turn else '<|eom|>') -}}{%- endif -%}{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}{{- '<|start|>assistant' -}}{%- endif -%}
 \ No newline at end of file
 diff --git a/requirements/test/xpu.txt b/requirements/test/xpu.txt
 index 80b0c1481..bd4db4218 100644
@@ -534,6 +534,74 @@ index 9b147bf69..a5d0cd088 100644
  
 -vllm_xpu_kernels @ https://github.com/vllm-project/vllm-xpu-kernels/releases/download/v0.1.7/vllm_xpu_kernels-0.1.7-cp38-abi3-manylinux_2_28_x86_64.whl
 +vllm_xpu_kernels @ https://github.com/vllm-project/vllm-xpu-kernels/releases/download/v0.1.8.2/vllm_xpu_kernels-0.1.8.2-cp38-abi3-manylinux_2_28_x86_64.whl
+diff --git a/tests/entrypoints/openai/chat_completion/test_batched_chat_completions.py b/tests/entrypoints/openai/chat_completion/test_batched_chat_completions.py
+index c3a8d0b2b..6a00e105f 100644
+--- a/tests/entrypoints/openai/chat_completion/test_batched_chat_completions.py
++++ b/tests/entrypoints/openai/chat_completion/test_batched_chat_completions.py
+@@ -1,17 +1,63 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import asyncio
+ import json
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
+ 
+ import httpx
+ import pytest
+ 
+ from tests.utils import RemoteOpenAIServer
++from vllm.entrypoints.openai.chat_completion.batch_serving import (
++    OpenAIServingChatBatch,
++)
++from vllm.entrypoints.openai.chat_completion.protocol import (
++    BatchChatCompletionRequest,
++)
+ 
+ # any model with a chat template defined in tokenizer_config should work here
+ MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+ 
+ 
++def test_batched_chat_render_passes_reasoning_parser() -> None:
++    service = object.__new__(OpenAIServingChatBatch)
++    service._check_model = AsyncMock(return_value=None)
++    service.engine_client = SimpleNamespace(errored=False)
++    service.reasoning_parser_cls = object
++
++    seen_parsers = []
++
++    async def preprocess_chat(_request, _messages, **kwargs):
++        seen_parsers.append(kwargs["reasoning_parser"])
++        return [], [object()]
++
++    service.openai_serving_render = SimpleNamespace(
++        use_harmony=False,
++        validate_chat_template=lambda **_kwargs: None,
++        trust_request_chat_template=False,
++        chat_template=None,
++        chat_template_content_format=None,
++        default_chat_template_kwargs=None,
++        tool_parser=None,
++        preprocess_chat=preprocess_chat,
++    )
++    request = BatchChatCompletionRequest.model_validate(
++        {
++            "messages": [
++                [{"role": "user", "content": "first"}],
++                [{"role": "user", "content": "second"}],
++            ]
++        }
++    )
++
++    result = asyncio.run(service.render_batch_chat_request(request))
++
++    assert isinstance(result, tuple)
++    assert seen_parsers == [object, object]
++
++
+ @pytest.fixture(scope="module")
+ def default_server_args():
+     return [
 diff --git a/tests/kernels/quantization/test_xpu_fp8_scaled_mm.py b/tests/kernels/quantization/test_xpu_fp8_scaled_mm.py
 new file mode 100644
 index 000000000..132745dd6
@@ -789,12 +857,12 @@ index 000000000..33fb5cf5b
 +    assert module.weight.device.type == "xpu"
 +    assert module.weight._vllm_keep_on_device
 +    assert not getattr(module.weight, "_vllm_is_uva_offloaded", False)
-diff --git a/tests/model_executor/test_onyx.py b/tests/model_executor/test_onyx.py
+diff --git a/tests/model_executor/test_muse_glimmer.py b/tests/model_executor/test_muse_glimmer.py
 new file mode 100644
-index 000000000..509a0e4da
+index 000000000..292ff025b
 --- /dev/null
-+++ b/tests/model_executor/test_onyx.py
-@@ -0,0 +1,245 @@
++++ b/tests/model_executor/test_muse_glimmer.py
+@@ -0,0 +1,359 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -805,14 +873,22 @@ index 000000000..509a0e4da
 +import torch
 +from torch import nn
 +
-+from vllm.model_executor.models import onyx as onyx_module
-+from vllm.model_executor.models.onyx import OnyxAttention, OnyxMLP, OnyxModel
++from vllm.model_executor.models import muse_glimmer as muse_glimmer_module
++from vllm.model_executor.models.muse_glimmer import MuseGlimmerAttention, MuseGlimmerMLP, MuseGlimmerModel
++from vllm.model_executor.models.muse_glimmer_mm import (
++    MuseGlimmerForConditionalGeneration,
++    MuseGlimmerProcessingInfo,
++    MuseGlimmerVisionEncoder,
++    _apply_rotary_emb,
++    _grid_size,
++    _restore_patch_groups,
++)
 +from vllm.model_executor.models.qwen3_dflash import (
 +    _maybe_permute_muse_glimmer_qk_weight,
 +)
-+from vllm.transformers_utils.configs.onyx import (
++from vllm.transformers_utils.configs.muse_glimmer import (
 +    MuseGlimmerAssistantConfig,
-+    OnyxConfig,
++    MuseGlimmerConfig,
 +)
 +
 +
@@ -836,8 +912,114 @@ index 000000000..509a0e4da
 +        return hidden_states.add_(10)
 +
 +
-+def test_onyx_single_token_aux_hidden_state_is_not_aliased() -> None:
-+    model = _new_module(OnyxModel)
++def test_muse_glimmer_vision_rotary_uses_neox_layout() -> None:
++    x = torch.arange(2 * 3 * 8, dtype=torch.float32).reshape(1, 2, 3, 8)
++    angles = torch.arange(2 * 4, dtype=torch.float32).reshape(2, 4) / 10
++    freqs_cis = torch.polar(torch.ones_like(angles), angles)
++
++    cos = angles.cos().unsqueeze(0).unsqueeze(2)
++    sin = angles.sin().unsqueeze(0).unsqueeze(2)
++    x1, x2 = torch.chunk(x, 2, dim=-1)
++    expected = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
++
++    assert torch.allclose(_apply_rotary_emb(x, freqs_cis), expected)
++
++
++def test_muse_glimmer_vision_position_interpolation_is_row_major() -> None:
++    encoder = _new_module(MuseGlimmerVisionEncoder)
++    encoder.latent_dim = 1
++    encoder.pos_emb_grid_h = 2
++    encoder.pos_emb_grid_w = 2
++    encoder.positional_embedding_vlm = nn.Parameter(
++        torch.arange(4, dtype=torch.float32).reshape(4, 1)
++    )
++
++    actual = encoder._get_pos_emb(grid_h=2, grid_w=4, device=torch.device("cpu"))
++    expected = torch.tensor(
++        [0.0, 0.25, 0.75, 0.75, 1.5, 2.25, 2.75, 2.25]
++    ).reshape(8, 1)
++
++    assert torch.allclose(actual, expected)
++
++
++def test_muse_glimmer_grid_size_matches_upstream_processor() -> None:
++    assert _grid_size(100, 60, patch_size=28, max_tokens=4096) == (56, 84, 6)
++
++
++def test_muse_glimmer_restores_image_and_video_patch_groups() -> None:
++    temporal_patch_size = 2
++    patch_size = 2
++    frames = torch.arange(
++        temporal_patch_size * 3 * 4 * 6, dtype=torch.float32
++    ).reshape(temporal_patch_size, 3, 4, 6)
++    patches = (
++        frames.view(temporal_patch_size, 3, 2, patch_size, 3, patch_size)
++        .permute(2, 4, 0, 1, 3, 5)
++        .contiguous()
++        .view(6, -1)
++    )
++    grid = torch.tensor([1, 2, 3])
++
++    image = _restore_patch_groups(
++        patches,
++        grid,
++        patch_size=patch_size,
++        temporal_patch_size=temporal_patch_size,
++        is_video=False,
++    )
++    video = _restore_patch_groups(
++        patches,
++        grid,
++        patch_size=patch_size,
++        temporal_patch_size=temporal_patch_size,
++        is_video=True,
++    )
++
++    assert torch.equal(image, frames[0])
++    assert torch.equal(video, frames.reshape(6, 4, 6).unsqueeze(0))
++
++
++def test_muse_glimmer_processing_budget_includes_video() -> None:
++    image_processor = SimpleNamespace(
++        max_image_tokens=4096,
++        patch_size=14,
++        merge_size=2,
++    )
++    video_processor = SimpleNamespace(
++        max_video_frame_tokens=144,
++        temporal_patch_size=2,
++        num_frames=96,
++    )
++    info = object.__new__(MuseGlimmerProcessingInfo)
++    info.get_hf_processor = lambda: SimpleNamespace(
++        image_processor=image_processor,
++        video_processor=video_processor,
++    )
++
++    assert info.get_supported_mm_limits() == {"image": None, "video": None}
++    assert info.get_image_size_with_most_features() == (1792, 1792)
++    assert info.get_mm_max_tokens_per_item(8192, {"video": 1}) == {
++        "image": 4096,
++        "video": 6912,
++    }
++
++
++def test_muse_glimmer_accepts_single_image_tensor() -> None:
++    model = _new_module(MuseGlimmerForConditionalGeneration)
++    image = torch.zeros(3, 8, 12)
++
++    parsed = model._parse_and_validate_image_input(
++        image_pixel_values=image,
++        image_feature_sizes=torch.tensor([6]),
++    )
++
++    assert parsed is not None
++    assert parsed["pixel_values"].shape == (1, 3, 8, 12)
++    assert parsed["feature_sizes"].tolist() == [6]
++
++
++def test_muse_glimmer_single_token_aux_hidden_state_is_not_aliased() -> None:
++    model = _new_module(MuseGlimmerModel)
 +    model.aux_hidden_state_layers = (2,)
 +    hidden_states = torch.arange(4, dtype=torch.float32).reshape(1, 4)
 +
@@ -850,15 +1032,15 @@ index 000000000..509a0e4da
 +    assert torch.equal(aux_hidden_states[0], expected)
 +
 +
-+def test_onyx_forward_preserves_captured_hidden_state(monkeypatch) -> None:
-+    model = _new_module(OnyxModel)
++def test_muse_glimmer_forward_preserves_captured_hidden_state(monkeypatch) -> None:
++    model = _new_module(MuseGlimmerModel)
 +    model.aux_hidden_state_layers = (1,)
 +    model.start_layer = 0
 +    model.end_layer = 2
 +    model.layers = nn.ModuleList([_AddOneLayer(), _InPlaceAddLayer()])
 +    model.norm = nn.Identity()
 +    monkeypatch.setattr(
-+        onyx_module,
++        muse_glimmer_module,
 +        "get_pp_group",
 +        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
 +    )
@@ -873,8 +1055,8 @@ index 000000000..509a0e4da
 +    assert torch.equal(aux_hidden_states[0], torch.ones(1, 4))
 +
 +
-+def test_onyx_batched_aux_hidden_state_avoids_unnecessary_clone() -> None:
-+    model = _new_module(OnyxModel)
++def test_muse_glimmer_batched_aux_hidden_state_avoids_unnecessary_clone() -> None:
++    model = _new_module(MuseGlimmerModel)
 +    model.aux_hidden_state_layers = (2,)
 +    hidden_states = torch.zeros(2, 4)
 +
@@ -885,10 +1067,10 @@ index 000000000..509a0e4da
 +    assert aux_hidden_states[0] is hidden_states
 +
 +
-+def test_onyx_permute_qk_weight_from_hf_layout() -> None:
++def test_muse_glimmer_permute_qk_weight_from_hf_layout() -> None:
 +    weight = torch.arange(8, dtype=torch.float32).reshape(8, 1)
 +
-+    permuted = OnyxModel._permute_qk_weight(weight, num_heads=2)
++    permuted = MuseGlimmerModel._permute_qk_weight(weight, num_heads=2)
 +
 +    assert torch.equal(
 +        permuted[:, 0],
@@ -896,8 +1078,8 @@ index 000000000..509a0e4da
 +    )
 +
 +
-+def test_muse_glimmer_config_reuses_onyx_layout() -> None:
-+    config = OnyxConfig(
++def test_muse_glimmer_config_reuses_muse_glimmer_layout() -> None:
++    config = MuseGlimmerConfig(
 +        text_config={
 +            "model_type": "muse_glimmer_text",
 +            "hidden_size": 6656,
@@ -971,8 +1153,8 @@ index 000000000..509a0e4da
 +    assert loaded_weight is weight
 +
 +
-+def test_onyx_fused_rope_positions_refresh_in_place() -> None:
-+    attention = _new_module(OnyxAttention)
++def test_muse_glimmer_fused_rope_positions_refresh_in_place() -> None:
++    attention = _new_module(MuseGlimmerAttention)
 +    positions = torch.tensor([7, 8], dtype=torch.int64)
 +
 +    prepared = attention._prepare_fused_rope_positions(positions)
@@ -986,8 +1168,8 @@ index 000000000..509a0e4da
 +    assert torch.equal(refreshed, positions.to(torch.int32))
 +
 +
-+def test_onyx_fused_rope_positions_reallocate_for_new_shape() -> None:
-+    attention = _new_module(OnyxAttention)
++def test_muse_glimmer_fused_rope_positions_reallocate_for_new_shape() -> None:
++    attention = _new_module(MuseGlimmerAttention)
 +    prepared = attention._prepare_fused_rope_positions(torch.tensor([7]))
 +
 +    refreshed = attention._prepare_fused_rope_positions(torch.tensor([8, 9]))
@@ -1003,11 +1185,11 @@ index 000000000..509a0e4da
 +        (torch.float8_e4m3fn, torch.float16),
 +    ],
 +)
-+def test_onyx_dense_esimd_rejects_non_fp8_projection(
++def test_muse_glimmer_dense_esimd_rejects_non_fp8_projection(
 +    gate_up_dtype: torch.dtype,
 +    down_dtype: torch.dtype,
 +) -> None:
-+    mlp = _new_module(OnyxMLP)
++    mlp = _new_module(MuseGlimmerMLP)
 +    mlp.gate_up_proj = SimpleNamespace(
 +        weight=torch.empty(256, 128, dtype=gate_up_dtype),
 +        weight_scale=torch.ones(1),
@@ -1020,8 +1202,8 @@ index 000000000..509a0e4da
 +    assert not mlp._probe_dense_esimd()
 +
 +
-+def test_onyx_dense_esimd_accepts_fp8_projections(monkeypatch) -> None:
-+    mlp = _new_module(OnyxMLP)
++def test_muse_glimmer_dense_esimd_accepts_fp8_projections(monkeypatch) -> None:
++    mlp = _new_module(MuseGlimmerMLP)
 +    mlp._dense_max_bsz = 4
 +    mlp.gate_up_proj = SimpleNamespace(
 +        weight=torch.empty(256, 128, dtype=torch.float8_e4m3fn),
@@ -1034,7 +1216,7 @@ index 000000000..509a0e4da
 +    fake_op = object()
 +    fake_module = SimpleNamespace(esimd_gemm_fp8_pert=fake_op)
 +    monkeypatch.setitem(sys.modules, "custom_esimd_kernels_vllm", fake_module)
-+    monkeypatch.setattr(onyx_module, "get_tensor_model_parallel_world_size", lambda: 1)
++    monkeypatch.setattr(muse_glimmer_module, "get_tensor_model_parallel_world_size", lambda: 1)
 +
 +    assert mlp._probe_dense_esimd()
 +    assert mlp._dense_op is fake_op
@@ -1260,6 +1442,602 @@ index 000000000..b3343b64f
 +    assert layer.scales.untyped_storage().data_ptr() != (
 +        scale.untyped_storage().data_ptr()
 +    )
+diff --git a/tests/reasoning/test_muse_glimmer_reasoning_parser.py b/tests/reasoning/test_muse_glimmer_reasoning_parser.py
+new file mode 100644
+index 000000000..96d9b6109
+--- /dev/null
++++ b/tests/reasoning/test_muse_glimmer_reasoning_parser.py
+@@ -0,0 +1,590 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++
++from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
++from vllm.entrypoints.openai.chat_completion.serving import (
++    _get_initial_reasoning_ended,
++)
++from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++from vllm.parser.abstract_parser import _WrappedParser
++from vllm.reasoning.muse_glimmer_reasoning_parser import MuseGlimmerReasoningParser
++from vllm.tool_parsers.muse_glimmer_tool_parser import MuseGlimmerToolParser
++
++pytestmark = pytest.mark.cpu_test
++
++
++class FakeTokenizer:
++    def __init__(self):
++        self._pieces: dict[int, str] = {}
++        self._next_id = 1000
++        self._vocab = {
++            "<|start|>": 200022,
++            "<|message|>": 200023,
++            "<|eom|>": 200007,
++            "<|eot|>": 200008,
++        }
++        self._pieces.update(
++            {token_id: token for token, token_id in self._vocab.items()}
++        )
++
++    def add(self, text: str) -> int:
++        token_id = self._next_id
++        self._next_id += 1
++        self._pieces[token_id] = text
++        return token_id
++
++    def decode(self, token_ids) -> str:
++        return "".join(self._pieces.get(token_id, "") for token_id in token_ids)
++
++    def get_vocab(self) -> dict[str, int]:
++        return self._vocab
++
++
++@pytest.fixture
++def tokenizer():
++    return FakeTokenizer()
++
++
++@pytest.fixture
++def request_obj():
++    return ChatCompletionRequest(
++        model="muse_glimmer",
++        messages=[{"role": "user", "content": "Hello"}],
++        tool_choice="none",
++    )
++
++
++def test_extracts_private_reasoning_and_visible_answer(tokenizer, request_obj):
++    parser = MuseGlimmerReasoningParser(tokenizer)
++    output = (
++        "<|start|>assistant to=self<|message|>private analysis<|eom|>"
++        "<|start|>assistant to=user<|message|>visible answer<|eot|>"
++    )
++
++    assert parser.extract_reasoning(output, request_obj) == (
++        "private analysis",
++        "visible answer",
++    )
++
++
++def test_recovers_truncated_private_reasoning(tokenizer, request_obj):
++    parser = MuseGlimmerReasoningParser(tokenizer)
++    output = " to=self<|message|>unfinished analysis"
++
++    assert parser.extract_reasoning(output, request_obj) == (
++        "unfinished analysis",
++        None,
++    )
++
++
++def test_preserves_tool_channel_for_tool_parser(tokenizer, request_obj):
++    parser = MuseGlimmerReasoningParser(tokenizer)
++    output = (
++        " to=self<|message|>use the calculator<|eom|>"
++        "<|start|>assistant to=calculator<|message|>"
++        '<atem:function_calls><atem:invoke name="calculator">'
++        '<atem:parameter name="expression">2+2</atem:parameter>'
++        "</atem:invoke></atem:function_calls><|eom|>"
++    )
++
++    reasoning, content = parser.extract_reasoning(output, request_obj)
++
++    assert reasoning == "use the calculator"
++    assert content is not None
++    assert "to=calculator" in content
++    assert "<atem:invoke" in content
++
++
++def test_preserves_tool_channel_when_reasoning_eom_is_missing(
++    tokenizer,
++    request_obj,
++):
++    parser = MuseGlimmerReasoningParser(tokenizer)
++    output = (
++        " to=self<|message|>use the calculator"
++        "<|start|>assistant to=calculator<|message|>"
++        '<atem:function_calls><atem:invoke name="calculator">'
++        '<atem:parameter name="expression">2+2</atem:parameter>'
++        "</atem:invoke></atem:function_calls><|eom|>"
++    )
++
++    reasoning, content = parser.extract_reasoning(output, request_obj)
++
++    assert reasoning == "use the calculator"
++    assert content is not None
++    assert "to=calculator" in content
++    assert "<atem:invoke" in content
++
++
++def test_plain_output_remains_content(tokenizer, request_obj):
++    parser = MuseGlimmerReasoningParser(tokenizer)
++
++    assert parser.extract_reasoning("plain answer", request_obj) == (
++        None,
++        "plain answer",
++    )
++
++
++def test_streaming_plain_output_remains_content(tokenizer, request_obj):
++    parser = MuseGlimmerReasoningParser(tokenizer)
++    previous_text = ""
++    content = []
++
++    for char in "plain answer":
++        current_text = previous_text + char
++        delta = parser.extract_reasoning_streaming(
++            previous_text,
++            current_text,
++            char,
++            [],
++            [],
++            [],
++        )
++        if delta and delta.content:
++            content.append(delta.content)
++        previous_text = current_text
++
++    assert "".join(content) == "plain answer"
++
++
++def test_request_stops_only_at_end_of_turn(tokenizer, request_obj):
++    parser = MuseGlimmerReasoningParser(tokenizer)
++    request_obj.stop_token_ids = [123]
++
++    adjusted = parser.adjust_request(request_obj)
++
++    assert adjusted.include_reasoning is False
++    assert adjusted.skip_special_tokens is False
++    assert adjusted.ignore_eos is True
++    assert adjusted.stop_token_ids == [123, 200008]
++
++
++def test_reasoning_visibility_does_not_end_engine_reasoning_phase(
++    tokenizer,
++):
++    request = ChatCompletionRequest(
++        model="muse_glimmer",
++        messages=[{"role": "user", "content": "Hello"}],
++        include_reasoning=False,
++    )
++    parser = MuseGlimmerReasoningParser(tokenizer)
++    prompt_id = tokenizer.add("<|start|>assistant")
++
++    reasoning_ended = _get_initial_reasoning_ended(
++        request,
++        parser,
++        [prompt_id],
++    )
++
++    assert reasoning_ended is False
++
++
++def test_non_reasoning_request_preserves_initial_engine_state():
++    request = ChatCompletionRequest(
++        model="other-model",
++        messages=[{"role": "user", "content": "Hello"}],
++        include_reasoning=False,
++    )
++
++    reasoning_ended = _get_initial_reasoning_ended(
++        request,
++        reasoning_parser=None,
++        prompt_token_ids=None,
++    )
++
++    assert reasoning_ended is True
++
++
++def test_responses_request_stops_only_at_end_of_turn(tokenizer):
++    parser = MuseGlimmerReasoningParser(tokenizer)
++    request = ResponsesRequest(
++        model="muse_glimmer",
++        input="Hello",
++        stop=["custom-stop"],
++    )
++
++    adjusted = parser.adjust_request(request)
++
++    assert adjusted.skip_special_tokens is False
++    assert adjusted.ignore_eos is True
++    assert adjusted.stop == ["custom-stop", "<|eot|>"]
++
++
++@pytest.mark.parametrize("include_reasoning", [True, False])
++def test_request_preserves_explicit_reasoning_choice(
++    tokenizer,
++    include_reasoning,
++):
++    parser = MuseGlimmerReasoningParser(tokenizer)
++    request = ChatCompletionRequest(
++        model="muse_glimmer",
++        messages=[{"role": "user", "content": "Hello"}],
++        include_reasoning=include_reasoning,
++    )
++
++    adjusted = parser.adjust_request(request)
++
++    assert adjusted.include_reasoning is include_reasoning
++
++
++@pytest.mark.parametrize(
++    ("include_reasoning", "expected_reasoning"),
++    [(True, "private analysis"), (False, "")],
++)
++def test_streaming_with_tool_parser_hides_channel_markers(
++    tokenizer,
++    request_obj,
++    include_reasoning,
++    expected_reasoning,
++):
++    request_obj.include_reasoning = include_reasoning
++    _WrappedParser.reasoning_parser_cls = MuseGlimmerReasoningParser
++    _WrappedParser.tool_parser_cls = MuseGlimmerToolParser
++    parser = _WrappedParser(tokenizer)
++    prompt_id = tokenizer.add("<|start|>user<|message|>Hello<|eot|><|start|>assistant")
++    chunks = (
++        " to=",
++        "self<|message|>private ",
++        "analysis",
++        "<|eom|>",
++        "<|start|>",
++        "assistant",
++        " to=user",
++        "<|message|>visible ",
++        "answer<|eot|>",
++    )
++
++    deltas = []
++    for index, chunk in enumerate(chunks):
++        token_id = tokenizer.add(chunk)
++        deltas.append(
++            parser.parse_delta(
++                chunk,
++                [token_id],
++                request_obj,
++                prompt_token_ids=[prompt_id] if index == 0 else None,
++            )
++        )
++
++    reasoning = "".join(
++        delta.reasoning for delta in deltas if delta and delta.reasoning
++    )
++    content = "".join(delta.content for delta in deltas if delta and delta.content)
++
++    assert reasoning == expected_reasoning
++    assert content == "visible answer"
++
++
++def test_streaming_direct_tool_channel_is_buffered_for_tool_parser(
++    tokenizer,
++):
++    tool = {
++        "type": "function",
++        "function": {
++            "name": "calculator",
++            "parameters": {
++                "type": "object",
++                "properties": {"expression": {"type": "string"}},
++            },
++        },
++    }
++    request = ChatCompletionRequest(
++        model="muse_glimmer",
++        messages=[{"role": "user", "content": "Calculate 2+2."}],
++        tools=[tool],
++        tool_choice="auto",
++    )
++    _WrappedParser.reasoning_parser_cls = MuseGlimmerReasoningParser
++    _WrappedParser.tool_parser_cls = MuseGlimmerToolParser
++    parser = _WrappedParser(tokenizer)
++    prompt_id = tokenizer.add("<|start|>user<|message|>Hello<|eot|><|start|>assistant")
++    chunks = (
++        " to=calcu",
++        'lator<|message|><atem:function_calls><atem:invoke name="calculator">',
++        '<atem:parameter name="expression">2+2</atem:parameter>',
++        "</atem:invoke></atem:function_calls>",
++        "<|eom|>",
++    )
++
++    deltas = []
++    for index, chunk in enumerate(chunks):
++        token_id = tokenizer.add(chunk)
++        deltas.append(
++            parser.parse_delta(
++                chunk,
++                [token_id],
++                request,
++                prompt_token_ids=[prompt_id] if index == 0 else None,
++            )
++        )
++
++    content = "".join(delta.content for delta in deltas if delta and delta.content)
++    tool_calls = [
++        tool_call
++        for delta in deltas
++        if delta and delta.tool_calls
++        for tool_call in delta.tool_calls
++    ]
++
++    assert content == ""
++    assert len(tool_calls) == 1
++    assert tool_calls[0].function.name == "calculator"
++    assert tool_calls[0].function.arguments == '{"expression": "2+2"}'
++
++
++@pytest.mark.parametrize("reasoning_end", ["<|eom|>", ""])
++def test_character_streaming_does_not_leak_framing_or_drop_tool_call(
++    tokenizer,
++    reasoning_end,
++):
++    tool = {
++        "type": "function",
++        "function": {
++            "name": "calculator",
++            "parameters": {
++                "type": "object",
++                "properties": {"expression": {"type": "string"}},
++            },
++        },
++    }
++    request = ChatCompletionRequest(
++        model="muse_glimmer",
++        messages=[{"role": "user", "content": "Calculate 2+2."}],
++        tools=[tool],
++        tool_choice="auto",
++        include_reasoning=True,
++    )
++    _WrappedParser.reasoning_parser_cls = MuseGlimmerReasoningParser
++    _WrappedParser.tool_parser_cls = MuseGlimmerToolParser
++    parser = _WrappedParser(tokenizer)
++    prompt_id = tokenizer.add("<|start|>user<|message|>Hello<|eot|><|start|>assistant")
++    output = (
++        f" to=self<|message|>think{reasoning_end}"
++        "<|start|>assistant to=calculator<|message|>"
++        '<atem:function_calls><atem:invoke name="calculator">'
++        '<atem:parameter name="expression">2+2</atem:parameter>'
++        "</atem:invoke></atem:function_calls><|eom|>"
++    )
++
++    deltas = []
++    for index, char in enumerate(output):
++        token_id = tokenizer.add(char)
++        deltas.append(
++            parser.parse_delta(
++                char,
++                [token_id],
++                request,
++                prompt_token_ids=[prompt_id] if index == 0 else None,
++            )
++        )
++
++    reasoning = "".join(
++        delta.reasoning for delta in deltas if delta and delta.reasoning
++    )
++    content = "".join(delta.content for delta in deltas if delta and delta.content)
++    tool_calls = [
++        tool_call
++        for delta in deltas
++        if delta and delta.tool_calls
++        for tool_call in delta.tool_calls
++    ]
++
++    assert reasoning == "think"
++    assert content == ""
++    assert len(tool_calls) == 1
++    assert tool_calls[0].function.name == "calculator"
++    assert tool_calls[0].function.arguments == '{"expression": "2+2"}'
++
++
++@pytest.mark.parametrize("chunk_size", range(2, 17))
++def test_grouped_streaming_preserves_reasoning_and_tool_handoff(
++    tokenizer,
++    chunk_size,
++):
++    tool = {
++        "type": "function",
++        "function": {
++            "name": "calculator",
++            "parameters": {
++                "type": "object",
++                "properties": {"expression": {"type": "string"}},
++            },
++        },
++    }
++    request = ChatCompletionRequest(
++        model="muse_glimmer",
++        messages=[{"role": "user", "content": "Calculate 2+2."}],
++        tools=[tool],
++        tool_choice="auto",
++        include_reasoning=True,
++    )
++    _WrappedParser.reasoning_parser_cls = MuseGlimmerReasoningParser
++    _WrappedParser.tool_parser_cls = MuseGlimmerToolParser
++    parser = _WrappedParser(tokenizer, request.tools)
++    prompt_id = tokenizer.add("<|start|>user<|message|>Hello<|eot|><|start|>assistant")
++    output = (
++        " to=self<|message|>think<|eom|>"
++        "<|start|>assistant to=calculator<|message|>"
++        '<atem:function_calls><atem:invoke name="calculator">'
++        '<atem:parameter name="expression">2+2</atem:parameter>'
++        "</atem:invoke></atem:function_calls><|eom|>"
++    )
++
++    deltas = []
++    for index in range(0, len(output), chunk_size):
++        chunk = output[index : index + chunk_size]
++        token_id = tokenizer.add(chunk)
++        deltas.append(
++            parser.parse_delta(
++                chunk,
++                [token_id],
++                request,
++                prompt_token_ids=[prompt_id] if index == 0 else None,
++            )
++        )
++
++    reasoning = "".join(
++        delta.reasoning for delta in deltas if delta and delta.reasoning
++    )
++    content = "".join(delta.content for delta in deltas if delta and delta.content)
++    tool_calls = [
++        tool_call
++        for delta in deltas
++        if delta and delta.tool_calls
++        for tool_call in delta.tool_calls
++    ]
++
++    assert reasoning == "think"
++    assert content == ""
++    assert len(tool_calls) == 1
++    assert tool_calls[0].function.name == "calculator"
++    assert tool_calls[0].function.arguments == '{"expression": "2+2"}'
++
++
++@pytest.mark.parametrize("chunk_size", range(2, 17))
++def test_grouped_streaming_preserves_reasoning_and_visible_answer(
++    tokenizer,
++    request_obj,
++    chunk_size,
++):
++    request_obj.include_reasoning = True
++    _WrappedParser.reasoning_parser_cls = MuseGlimmerReasoningParser
++    _WrappedParser.tool_parser_cls = MuseGlimmerToolParser
++    parser = _WrappedParser(tokenizer)
++    prompt_id = tokenizer.add("<|start|>user<|message|>Hello<|eot|><|start|>assistant")
++    output = (
++        " to=self<|message|>think<|eom|>"
++        "<|start|>assistant to=user<|message|>answer<|eot|>"
++    )
++
++    deltas = []
++    for index in range(0, len(output), chunk_size):
++        chunk = output[index : index + chunk_size]
++        token_id = tokenizer.add(chunk)
++        deltas.append(
++            parser.parse_delta(
++                chunk,
++                [token_id],
++                request_obj,
++                prompt_token_ids=[prompt_id] if index == 0 else None,
++            )
++        )
++
++    reasoning = "".join(
++        delta.reasoning for delta in deltas if delta and delta.reasoning
++    )
++    content = "".join(delta.content for delta in deltas if delta and delta.content)
++    tool_calls = [
++        tool_call
++        for delta in deltas
++        if delta and delta.tool_calls
++        for tool_call in delta.tool_calls
++    ]
++
++    assert reasoning == "think"
++    assert content == "answer"
++    assert tool_calls == []
++
++
++def test_streaming_user_channel_strips_later_eot(
++    tokenizer,
++    request_obj,
++):
++    request_obj.include_reasoning = True
++    _WrappedParser.reasoning_parser_cls = MuseGlimmerReasoningParser
++    _WrappedParser.tool_parser_cls = MuseGlimmerToolParser
++    parser = _WrappedParser(tokenizer)
++    prompt_id = tokenizer.add("<|start|>user<|message|>Hello<|eot|><|start|>assistant")
++    chunks = (
++        " to=self<|message|>think<|eom|><|start|>assistant to=user<|message|>answer",
++        "<|eot|>",
++    )
++
++    deltas = []
++    for index, chunk in enumerate(chunks):
++        token_id = tokenizer.add(chunk)
++        deltas.append(
++            parser.parse_delta(
++                chunk,
++                [token_id],
++                request_obj,
++                prompt_token_ids=[prompt_id] if index == 0 else None,
++            )
++        )
++
++    reasoning = "".join(
++        delta.reasoning for delta in deltas if delta and delta.reasoning
++    )
++    content = "".join(delta.content for delta in deltas if delta and delta.content)
++
++    assert reasoning == "think"
++    assert content == "answer"
++    assert "<|eot|>" not in content
++    assert not parser._stream_state.reasoning_ended
++
++
++@pytest.mark.parametrize("with_reasoning", [True, False])
++def test_streaming_user_channel_does_not_leak_atem_markup(
++    tokenizer,
++    request_obj,
++    with_reasoning,
++):
++    request_obj.include_reasoning = True
++    _WrappedParser.reasoning_parser_cls = MuseGlimmerReasoningParser
++    _WrappedParser.tool_parser_cls = MuseGlimmerToolParser
++    parser = _WrappedParser(tokenizer)
++    prompt_id = tokenizer.add("<|start|>user<|message|>Hello<|eot|><|start|>assistant")
++    prefix = (
++        " to=self<|message|>think<|eom|><|start|>assistant" if with_reasoning else ""
++    )
++    output = (
++        f"{prefix} to=user<|message|>Do not emit "
++        '<atem:function_calls><atem:invoke name="calculator">'
++        "</atem:invoke></atem:function_calls> here.<|eot|>"
++    )
++
++    deltas = []
++    for index, char in enumerate(output):
++        token_id = tokenizer.add(char)
++        deltas.append(
++            parser.parse_delta(
++                char,
++                [token_id],
++                request_obj,
++                prompt_token_ids=[prompt_id] if index == 0 else None,
++            )
++        )
++
++    content = "".join(delta.content for delta in deltas if delta and delta.content)
++    tool_calls = [
++        tool_call
++        for delta in deltas
++        if delta and delta.tool_calls
++        for tool_call in delta.tool_calls
++    ]
++
++    assert content == "Do not emit  here."
++    assert "<atem:" not in content
++    assert tool_calls == []
 diff --git a/tests/test_bidir_sliding.py b/tests/test_bidir_sliding.py
 new file mode 100644
 index 000000000..461db8992
@@ -1689,12 +2467,14 @@ index 000000000..caf1c3054
 +ok_sw = check("sliding(causal seq0 + bidir seq1, W=4)", [3, 0])
 +
 +print("ALL PASS" if (ok_full and ok_sw) else "SOME FAILED")
-diff --git a/tests/tool_parsers/test_onyx_tool_parser.py b/tests/tool_parsers/test_onyx_tool_parser.py
+diff --git a/tests/tool_parsers/test_muse_glimmer_tool_parser.py b/tests/tool_parsers/test_muse_glimmer_tool_parser.py
 new file mode 100644
-index 000000000..41a94499c
+index 000000000..07edbeeff
 --- /dev/null
-+++ b/tests/tool_parsers/test_onyx_tool_parser.py
-@@ -0,0 +1,171 @@
++++ b/tests/tool_parsers/test_muse_glimmer_tool_parser.py
+@@ -0,0 +1,249 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +import json
 +
 +import pytest
@@ -1704,15 +2484,16 @@ index 000000000..41a94499c
 +    ChatCompletionToolsParam,
 +    FunctionDefinition,
 +)
-+from vllm.tool_parsers.onyx_tool_parser import OnyxToolParser
++from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++from vllm.tool_parsers.muse_glimmer_tool_parser import MuseGlimmerToolParser
 +
 +pytestmark = pytest.mark.cpu_test
 +
 +
-+def _request() -> ChatCompletionRequest:
++def _request(tool_name: str = "calculator") -> ChatCompletionRequest:
 +    tool = ChatCompletionToolsParam(
 +        function=FunctionDefinition(
-+            name="calculator",
++            name=tool_name,
 +            parameters={
 +                "type": "object",
 +                "properties": {
@@ -1726,15 +2507,17 @@ index 000000000..41a94499c
 +        )
 +    )
 +    return ChatCompletionRequest(
-+        model="onyx",
++        model="muse_glimmer",
 +        messages=[{"role": "user", "content": "Calculate 2+2."}],
 +        tools=[tool],
 +        tool_choice="auto",
 +    )
 +
 +
-+def _parser(request: ChatCompletionRequest) -> OnyxToolParser:
-+    parser = object.__new__(OnyxToolParser)
++def _parser(
++    request: ChatCompletionRequest | ResponsesRequest,
++) -> MuseGlimmerToolParser:
++    parser = object.__new__(MuseGlimmerToolParser)
 +    parser.tools = request.tools or []
 +    parser.eot_token_id = 200008
 +    parser._reset_streaming_state()
@@ -1773,6 +2556,68 @@ index 000000000..41a94499c
 +    }
 +
 +
++def test_ignores_atem_in_reasoning_channel():
++    request = _request()
++    output = (
++        "<|start|>assistant to=self<|message|>"
++        'I considered <atem:function_calls><atem:invoke name="calculator">'
++        '<atem:parameter name="expression">2 + 2</atem:parameter>'
++        "</atem:invoke></atem:function_calls> but did not call it.<|eom|>"
++        "<|start|>assistant to=user<|message|>No tool is needed.<|eot|>"
++    )
++
++    extracted = _parser(request).extract_tool_calls(output, request)
++
++    assert not extracted.tools_called
++    assert extracted.tool_calls == []
++    assert extracted.content == "No tool is needed."
++
++
++def test_normalizes_duplicated_bare_tool_name():
++    request = _request("calculator")
++    output = (
++        "<|start|>assistant to=calculator.calculator<|message|>"
++        '<atem:function_calls><atem:invoke name="calculator.calculator">'
++        '<atem:parameter name="expression">2 + 2</atem:parameter>'
++        "</atem:invoke></atem:function_calls><|eom|>"
++    )
++
++    extracted = _parser(request).extract_tool_calls(output, request)
++
++    assert extracted.tools_called
++    assert len(extracted.tool_calls) == 1
++    assert extracted.tool_calls[0].function.name == "calculator"
++    assert json.loads(extracted.tool_calls[0].function.arguments) == {
++        "expression": "2 + 2"
++    }
++
++
++def test_extracts_parallel_tool_channels():
++    request = _request()
++    output = (
++        "<|start|>assistant to=calculator<|message|>"
++        '<atem:function_calls><atem:invoke name="calculator">'
++        '<atem:parameter name="expression">2 + 2</atem:parameter>'
++        "</atem:invoke></atem:function_calls><|eom|>"
++        "<|start|>assistant to=calculator<|message|>"
++        '<atem:function_calls><atem:invoke name="calculator">'
++        '<atem:parameter name="expression">3 + 3</atem:parameter>'
++        "</atem:invoke></atem:function_calls><|eot|>"
++    )
++
++    extracted = _parser(request).extract_tool_calls(output, request)
++
++    assert extracted.tools_called
++    assert [call.function.name for call in extracted.tool_calls] == [
++        "calculator",
++        "calculator",
++    ]
++    assert [json.loads(call.function.arguments) for call in extracted.tool_calls] == [
++        {"expression": "2 + 2"},
++        {"expression": "3 + 3"},
++    ]
++
++
 +def test_bare_private_channel_is_hidden():
 +    request = _request()
 +    extracted = _parser(request).extract_tool_calls(" to=self", request)
@@ -1801,6 +2646,20 @@ index 000000000..41a94499c
 +    assert adjusted.skip_special_tokens is False
 +    assert adjusted.ignore_eos is True
 +    assert adjusted.stop_token_ids == [123, 200008]
++
++
++def test_responses_request_stops_only_at_end_of_turn():
++    request = ResponsesRequest(
++        model="muse_glimmer",
++        input="Calculate 2+2.",
++        stop="custom-stop",
++    )
++
++    adjusted = _parser(request).adjust_request(request)
++
++    assert adjusted.skip_special_tokens is False
++    assert adjusted.ignore_eos is True
++    assert adjusted.stop == ["custom-stop", "<|eot|>"]
 +
 +
 +def test_partial_channel_prefix_is_buffered():
@@ -1856,12 +2715,9 @@ index 000000000..41a94499c
 +    }
 +
 +
-+def test_old_onyx_json_channel_is_not_parsed():
++def test_old_muse_glimmer_json_channel_is_not_parsed():
 +    request = _request()
-+    output = (
-+        " to=functions.calculator<|message|>"
-+        '{"expression":"2 + 2"}<|eom|>'
-+    )
++    output = ' to=functions.calculator<|message|>{"expression":"2 + 2"}<|eom|>'
 +    extracted = _parser(request).extract_tool_calls(output, request)
 +
 +    assert not extracted.tools_called
@@ -2525,19 +3381,18 @@ index 22a1f6a42..a6317ce65 100644
      def uses_alibi(self) -> bool:
          cfg = self.hf_text_config
 diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
-index 4589820c9..777643978 100644
+index 4589820c9..60620cc6e 100644
 --- a/vllm/config/speculative.py
 +++ b/vllm/config/speculative.py
-@@ -987,6 +987,8 @@ class SpeculativeConfig:
+@@ -987,6 +987,7 @@ class SpeculativeConfig:
              "minimax_m2",
              "gemma4",
              "laguna",
 +            "muse_glimmer",
-+            "onyx",
          ]
          if (
              self.method in ("eagle3", "extract_hidden_states", "dflash")
-@@ -1047,6 +1049,10 @@ class SpeculativeConfig:
+@@ -1047,6 +1048,10 @@ class SpeculativeConfig:
      def use_eagle(self) -> bool:
          return self.method in ("eagle", "eagle3", "mtp", "dflash")
  
@@ -2903,6 +3758,218 @@ index e65ef6e42..87453a56a 100644
              structured_outputs_config=self.structured_outputs_config,
              observability_config=observability_config,
              compilation_config=compilation_config,
+diff --git a/vllm/entrypoints/openai/chat_completion/batch_serving.py b/vllm/entrypoints/openai/chat_completion/batch_serving.py
+index cc49909b8..0841f1da0 100644
+--- a/vllm/entrypoints/openai/chat_completion/batch_serving.py
++++ b/vllm/entrypoints/openai/chat_completion/batch_serving.py
+@@ -11,11 +11,15 @@ from fastapi import Request
+ from vllm.entrypoints.chat_utils import ConversationMessage
+ from vllm.entrypoints.openai.chat_completion.protocol import (
+     BatchChatCompletionRequest,
++    ChatCompletionRequest,
+     ChatCompletionResponse,
+     ChatCompletionResponseChoice,
+     ChatMessage,
+ )
+-from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
++from vllm.entrypoints.openai.chat_completion.serving import (
++    OpenAIServingChat,
++    _get_initial_reasoning_ended,
++)
+ from vllm.entrypoints.openai.engine.protocol import (
+     ErrorResponse,
+     RequestResponseMetadata,
+@@ -43,6 +47,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
+     async def render_batch_chat_request(
+         self,
+         request: BatchChatCompletionRequest,
++        single_requests: list[ChatCompletionRequest] | None = None,
+     ) -> tuple[list[list[ConversationMessage]], list[EngineInput]] | ErrorResponse:
+         """Validate the model and preprocess a batched chat completion request.
+ 
+@@ -80,8 +85,17 @@ class OpenAIServingChatBatch(OpenAIServingChat):
+         all_conversations: list[list[ConversationMessage]] = []
+         all_engine_prompts: list[EngineInput] = []
+ 
+-        for messages in request.messages:
+-            single_request = request.to_chat_completion_request(messages)
++        if single_requests is None:
++            single_requests = [
++                request.to_chat_completion_request(messages)
++                for messages in request.messages
++            ]
++        if len(single_requests) != len(request.messages):
++            raise ValueError("single_requests must match request.messages")
++
++        for messages, single_request in zip(
++            request.messages, single_requests, strict=True
++        ):
+             if render.use_harmony:
+                 conversation, engine_prompts = render._make_request_with_harmony(
+                     single_request, should_include_tools=tool_dicts is not None
+@@ -95,6 +109,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
+                     default_template_kwargs=render.default_chat_template_kwargs,
+                     tool_dicts=tool_dicts,
+                     tool_parser=tool_parser,
++                    reasoning_parser=self.reasoning_parser_cls,
+                 )
+             all_conversations.append(conversation)
+             all_engine_prompts.append(engine_prompts[0])
+@@ -120,6 +135,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
+         ]
+ 
+         reasoning_parser: ReasoningParser | None = None
++        reasoning_parser_kwargs: dict[str, object] | None = None
+         if self.reasoning_parser_cls:
+             chat_template_kwargs = self._effective_chat_template_kwargs(
+                 single_requests[0]
+@@ -128,8 +144,13 @@ class OpenAIServingChatBatch(OpenAIServingChat):
+                 tokenizer,
+                 chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
+             )
++            reasoning_parser_kwargs = {
++                "chat_template_kwargs": chat_template_kwargs,
++            }
+ 
+-        render_result = await self.render_batch_chat_request(request)
++        render_result = await self.render_batch_chat_request(
++            request, single_requests=single_requests
++        )
+         if isinstance(render_result, ErrorResponse):
+             return render_result
+         all_conversations, engine_prompts = render_result
+@@ -149,6 +170,9 @@ class OpenAIServingChatBatch(OpenAIServingChat):
+         generators: list[AsyncGenerator[RequestOutput, None]] = []
+         for i, engine_prompt in enumerate(engine_prompts):
+             sub_request_id = f"{request_id}_{i}"
++            prompt_token_ids = self._extract_prompt_components(
++                engine_prompt
++            ).token_ids
+             max_tokens = get_max_tokens(
+                 max_model_len,
+                 request.max_completion_tokens
+@@ -162,6 +186,11 @@ class OpenAIServingChatBatch(OpenAIServingChat):
+             sampling_params = single_request.to_sampling_params(
+                 max_tokens, self.default_sampling_params
+             )
++            reasoning_ended = _get_initial_reasoning_ended(
++                single_request,
++                reasoning_parser,
++                prompt_token_ids,
++            )
+             self._log_inputs(
+                 sub_request_id,
+                 engine_prompt,
+@@ -182,7 +211,8 @@ class OpenAIServingChatBatch(OpenAIServingChat):
+                     trace_headers=trace_headers,
+                     priority=request.priority if hasattr(request, "priority") else 0,
+                     data_parallel_rank=data_parallel_rank,
+-                    reasoning_ended=None,
++                    reasoning_ended=reasoning_ended,
++                    reasoning_parser_kwargs=reasoning_parser_kwargs,
+                 )
+             )
+ 
+@@ -192,6 +222,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
+             request_id,
+             model_name,
+             all_conversations,
++            single_requests,
+             tokenizer,
+             request_metadata,
+             reasoning_parser,
+@@ -204,6 +235,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
+         request_id: str,
+         model_name: str,
+         all_conversations: list[list[ConversationMessage]],
++        single_requests: list[ChatCompletionRequest],
+         tokenizer: TokenizerLike,
+         request_metadata: RequestResponseMetadata,
+         reasoning_parser: ReasoningParser | None = None,
+@@ -232,6 +264,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
+         total_completion_tokens = 0
+ 
+         for prompt_idx in range(len(generators)):
++            single_request = single_requests[prompt_idx]
+             final_res = final_results.get(prompt_idx)
+             if final_res is None:
+                 return self.create_error_response(
+@@ -267,9 +300,9 @@ class OpenAIServingChatBatch(OpenAIServingChat):
+                 if reasoning_parser:
+                     reasoning, content = reasoning_parser.extract_reasoning(
+                         output.text,
+-                        request=request,  # type: ignore[arg-type]
++                        request=single_request,
+                     )
+-                    if not getattr(request, "include_reasoning", True):
++                    if not single_request.include_reasoning:
+                         reasoning = None
+                 else:
+                     reasoning = None
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index 03e4678c8..bfa8789f8 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -903,6 +903,7 @@ class BatchChatCompletionRequest(OpenAIBaseModel):
+     n: int | None = 1
+     presence_penalty: float | None = 0.0
+     response_format: Any | None = None
++    include_reasoning: bool | None = None
+     seed: int | None = Field(None, ge=_INT64_MIN, le=_INT64_MAX)
+     stop: str | list[str] | None = Field(default_factory=list)
+     temperature: float | None = 0.7
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 10bde6847..fb863a1e1 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -79,6 +79,22 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++def _get_initial_reasoning_ended(
++    request: ChatCompletionRequest,
++    reasoning_parser: ReasoningParser | None,
++    prompt_token_ids: GenericSequence[int] | None,
++) -> bool | None:
++    if request._grammar_from_tool_parser:
++        # The Mistral grammar already includes an optional `think?` rule that
++        # handles both reasoning and non-reasoning outputs.
++        return True
++    if reasoning_parser:
++        return reasoning_parser.is_reasoning_end(prompt_token_ids or [])
++    if not request.include_reasoning:
++        return True
++    return None
++
++
+ class OpenAIServingChat(OpenAIServing):
+     def __init__(
+         self,
+@@ -330,19 +346,11 @@ class OpenAIServingChat(OpenAIServing):
+                     trace_headers=trace_headers,
+                 )
+             else:
+-                if not request.include_reasoning:
+-                    reasoning_ended = True
+-                elif request._grammar_from_tool_parser:
+-                    # The Mistral grammar already includes an optional
+-                    # `think?` rule that handles both reasoning and
+-                    # non-reasoning outputs.
+-                    reasoning_ended = True
+-                elif reasoning_parser:
+-                    reasoning_ended = reasoning_parser.is_reasoning_end(
+-                        prompt_token_ids or []
+-                    )
+-                else:
+-                    reasoning_ended = None
++                reasoning_ended = _get_initial_reasoning_ended(
++                    request,
++                    reasoning_parser,
++                    prompt_token_ids,
++                )
+ 
+                 generator = self.engine_client.generate(
+                     engine_input,
 diff --git a/vllm/entrypoints/openai/engine/serving.py b/vllm/entrypoints/openai/engine/serving.py
 index 2a51cc0bf..965e5081a 100644
 --- a/vllm/entrypoints/openai/engine/serving.py
@@ -4121,7 +5188,7 @@ index d5b67ef04..872d2b3ff 100644
      def extra_repr(self) -> str:
 diff --git a/vllm/model_executor/layers/esimd_fake_ops.py b/vllm/model_executor/layers/esimd_fake_ops.py
 new file mode 100644
-index 000000000..b2a65aeac
+index 000000000..0e3ad8f8f
 --- /dev/null
 +++ b/vllm/model_executor/layers/esimd_fake_ops.py
 @@ -0,0 +1,221 @@
@@ -4213,12 +5280,12 @@ index 000000000..b2a65aeac
 +    _try_register(f"{NS}::esimd_qkv_split_norm_rope", _qkv_split_norm_rope)
 +    _try_register(f"{NS}::esimd_qkv_split_norm_rope_v", _qkv_split_norm_rope_v)
 +
-+    def _qkv_split_norm_rope_onyx(qkv_state, q_out, k_out, v_out, positions,
++    def _qkv_split_norm_rope_muse_glimmer(qkv_state, q_out, k_out, v_out, positions,
 +                                  q_heads, kv_heads, q_scale, cos_sin_cache):
 +        return None
 +
-+    _try_register(f"{NS}::esimd_qkv_split_norm_rope_onyx",
-+                  _qkv_split_norm_rope_onyx)
++    _try_register(f"{NS}::esimd_qkv_split_norm_rope_muse_glimmer",
++                  _qkv_split_norm_rope_muse_glimmer)
 +
 +    # --- RMSNorm family ------------------------------------------------------
 +    # esimd_rms_norm(input, output, weight, eps) -> output
@@ -5679,7 +6746,7 @@ index 3541b9706..8521bd4a3 100644
          gathered = gathered.view(hidden_states.shape[0], tp_size, 2)
          max_rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
 diff --git a/vllm/model_executor/layers/mamba/gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn_linear_attn.py
-index 4493ee783..003639833 100644
+index 4493ee783..b6157acde 100644
 --- a/vllm/model_executor/layers/mamba/gdn_linear_attn.py
 +++ b/vllm/model_executor/layers/mamba/gdn_linear_attn.py
 @@ -2,6 +2,8 @@
@@ -6337,7 +7404,7 @@ index 4493ee783..003639833 100644
          z_shape_og = z.shape
          # Reshape input data into 2D tensor
          core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-@@ -830,6 +1412,185 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
+@@ -830,6 +1412,186 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
          core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
          output[:num_tokens], _ = self.out_proj(core_attn_out)
  
@@ -6366,6 +7433,7 @@ index 4493ee783..003639833 100644
 +            per_tensor_ready = ws is not None and ws.numel() == 1
 +            block_ready = (
 +                esimd_norm_gemv_fp8_blockscale is not None
++                and w is not None
 +                and w.dtype == torch.float8_e4m3fn
 +                and ws_block is not None
 +                and tuple(block_size or ()) == (128, 128)
@@ -11177,14 +12245,14 @@ index cda07ea29..f58f98dac 100644
          return hf_processor
  
      def get_image_processor(self, **kwargs: object):
-diff --git a/vllm/model_executor/models/onyx.py b/vllm/model_executor/models/onyx.py
+diff --git a/vllm/model_executor/models/muse_glimmer.py b/vllm/model_executor/models/muse_glimmer.py
 new file mode 100644
-index 000000000..16ebe7b5d
+index 000000000..10e41fe46
 --- /dev/null
-+++ b/vllm/model_executor/models/onyx.py
++++ b/vllm/model_executor/models/muse_glimmer.py
 @@ -0,0 +1,962 @@
 +# SPDX-License-Identifier: Apache-2.0
-+# vLLM XPU port of Onyx (day0 model).
++# vLLM XPU port of MuseGlimmer (day0 model).
 +#
 +# Architecture (dense decoder, no MoE; vision skipped in this v1 port):
 +#   - GQA (num_heads=32, num_kv_heads=2, head_dim=128)
@@ -11197,14 +12265,14 @@ index 000000000..16ebe7b5d
 +#     (already folded into q), and K is un-scaled.
 +#   - Attention output gate: out = sigmoid(og_proj(x)) * attn_out
 +#   - Norms:
-+#       OnyxRMSNorm       (offset from 1: w+1) -> reuse GemmaRMSNorm
-+#       OnyxFinalRMSNorm  (weight is scale)     -> reuse RMSNorm(has_weight=True)
-+#       OnyxScalelessRMSNorm                    -> reuse RMSNorm(has_weight=False)
++#       MuseGlimmerRMSNorm       (offset from 1: w+1) -> reuse GemmaRMSNorm
++#       MuseGlimmerFinalRMSNorm  (weight is scale)     -> reuse RMSNorm(has_weight=True)
++#       MuseGlimmerScalelessRMSNorm                    -> reuse RMSNorm(has_weight=False)
 +#   - normalize_tok_embeddings: RMSNorm(no weight) on embed output
 +#   - Final logits: temp * tanh(logits * output_multiplier / temp)
 +#     -> LogitsProcessor(soft_cap = temp / output_multiplier, scale=1)
 +#     which produces  soft_cap * tanh(logits / soft_cap)
-+#     = (temp/mul) * tanh(logits * mul / temp). To match Onyx, we must first
++#     = (temp/mul) * tanh(logits * mul / temp). To match MuseGlimmer, we must first
 +#     scale hidden_states so `lm_head(h)` corresponds to `logits * mul`; instead
 +#     we set output_multiplier as a post-hoc scale on the output of soft_cap:
 +#         soft_cap_temp * tanh( logits * output_multiplier / soft_cap_temp )
@@ -11259,7 +12327,7 @@ index 000000000..16ebe7b5d
 +)
 +
 +
-+class OnyxMLP(nn.Module):
++class MuseGlimmerMLP(nn.Module):
 +    def __init__(
 +        self,
 +        hidden_size: int,
@@ -11288,7 +12356,7 @@ index 000000000..16ebe7b5d
 +        # gemma4/qwen3_next opt-in pattern: bypass Linear.forward and drive
 +        # esimd_gemm_fp8_pert directly with pre-allocated output buffers.
 +        # Default ON for fp8 (opt out via DISABLE_ESIMD_DENSE=1). The
-+        # Onyx-specific DISABLE_ONYX_MLP_ESIMD=1 gate selects native FP8
++        # MuseGlimmer-specific DISABLE_MUSE_GLIMMER_MLP_ESIMD=1 gate selects native FP8
 +        # GEMM for this MLP only. Verified byte-identical to the generic
 +        # dispatch on TP=2 image chat + gsm8k.
 +        # down_proj is RowParallel with reduce_results=True; the bypass
@@ -11303,14 +12371,14 @@ index 000000000..16ebe7b5d
 +            ESIMD_AVAILABLE
 +            and _qname == "fp8"
 +            and os.environ.get("DISABLE_ESIMD_DENSE", "0") != "1"
-+            and os.environ.get("DISABLE_ONYX_MLP_ESIMD", "0") != "1"
++            and os.environ.get("DISABLE_MUSE_GLIMMER_MLP_ESIMD", "0") != "1"
 +        )
 +        self._dense_native_enabled = (
 +            _qname == "fp8"
-+            and os.environ.get("DISABLE_ONYX_MLP_ESIMD", "0") == "1"
++            and os.environ.get("DISABLE_MUSE_GLIMMER_MLP_ESIMD", "0") == "1"
 +        )
 +        if self._dense_native_enabled:
-+            # Keep the MLP fallback local to Onyx instead of disabling ESIMD
++            # Keep the MLP fallback local to MuseGlimmer instead of disabling ESIMD
 +            # GEMM globally for attention and other model components.
 +            self.gate_up_proj._force_native_fp8 = True
 +            self.down_proj._force_native_fp8 = True
@@ -11377,7 +12445,7 @@ index 000000000..16ebe7b5d
 +        return self.down_proj(self.act_fn(gate_up))[0]
 +
 +
-+class OnyxAttention(nn.Module):
++class MuseGlimmerAttention(nn.Module):
 +    def __init__(
 +        self,
 +        config,
@@ -11469,7 +12537,7 @@ index 000000000..16ebe7b5d
 +                self.head_dim,
 +                max_position=max_position_embeddings,
 +                rope_parameters={"rope_theta": float(config.rope_theta)},
-+                is_neox_style=False,  # Onyx uses complex/pairwise RoPE (not neox)
++                is_neox_style=False,  # MuseGlimmer uses complex/pairwise RoPE (not neox)
 +            )
 +        else:
 +            self.rotary_emb = None
@@ -11601,18 +12669,18 @@ index 000000000..16ebe7b5d
 +                and 1 <= _n <= self._qkv_proj_max_bsz
 +            ):
 +                _fast_qkv = True
-+                # Onyx-A: for decode M==1, fuse qkv + output_gate into a
++                # MuseGlimmer-A: for decode M==1, fuse qkv + output_gate into a
 +                # single esimd_gemv_fp8_pert_fused2 call (one input load,
 +                # two independent weight matrices). Bit-exact vs two
 +                # separate esimd_gemm_fp8_pert calls (verified maxabs=0).
-+                # Env gate DISABLE_ONYX_FUSED_QKV_GATE=1 falls back to the
++                # Env gate DISABLE_MUSE_GLIMMER_FUSED_QKV_GATE=1 falls back to the
 +                # two-GEMM path for A/B.
 +                _use_fused2 = (
 +                    self._qkv_op_fused2 is not None
 +                    and self.use_output_gate
 +                    and _n == 1
 +                    and os.environ.get(
-+                        "DISABLE_ONYX_FUSED_QKV_GATE", "0"
++                        "DISABLE_MUSE_GLIMMER_FUSED_QKV_GATE", "0"
 +                    ) != "1"
 +                )
 +                if _use_fused2:
@@ -11632,10 +12700,10 @@ index 000000000..16ebe7b5d
 +        if not _fast_qkv:
 +            qkv, _ = self.qkv_proj(hidden_states)
 +
-+        # Onyx-B: fuse qkv-split + parameterless qk_norm + q_scale + interleaved-pair RoPE
-+        # into one esimd_qkv_split_norm_rope_onyx call. Only for the RoPE+qk_norm layers
++        # MuseGlimmer-B: fuse qkv-split + parameterless qk_norm + q_scale + interleaved-pair RoPE
++        # into one esimd_qkv_split_norm_rope_muse_glimmer call. Only for the RoPE+qk_norm layers
 +        # (sliding attn); NoPE full-attn layers keep the Python path.
-+        # Requires head_dim=128 and fp16 qkv. Gate: DISABLE_ONYX_FUSED_QK_NORM_ROPE=1.
++        # Requires head_dim=128 and fp16 qkv. Gate: DISABLE_MUSE_GLIMMER_FUSED_QK_NORM_ROPE=1.
 +        _use_fused_qkn_rope = (
 +            self.qk_norm is not None
 +            and self.rotary_emb is not None
@@ -11643,12 +12711,12 @@ index 000000000..16ebe7b5d
 +            and qkv.dtype == torch.float16
 +            and qkv.is_contiguous()
 +            and self.head_dim == 128
-+            and os.environ.get("DISABLE_ONYX_FUSED_QK_NORM_ROPE", "0") != "1"
++            and os.environ.get("DISABLE_MUSE_GLIMMER_FUSED_QK_NORM_ROPE", "0") != "1"
 +        )
 +        if _use_fused_qkn_rope:
 +            try:
 +                from custom_esimd_kernels_vllm import (
-+                    esimd_qkv_split_norm_rope_onyx,
++                    esimd_qkv_split_norm_rope_muse_glimmer,
 +                )
 +            except ImportError:
 +                _use_fused_qkn_rope = False
@@ -11670,7 +12738,7 @@ index 000000000..16ebe7b5d
 +            q = self._fqkn_q_buf[:_n]
 +            k = self._fqkn_k_buf[:_n]
 +            v = self._fqkn_v_buf[:_n]
-+            esimd_qkv_split_norm_rope_onyx(
++            esimd_qkv_split_norm_rope_muse_glimmer(
 +                qkv, q, k, v, pos_i32,
 +                self.num_heads, self.num_kv_heads,
 +                float(self.q_scale_factor), csc,
@@ -11721,7 +12789,7 @@ index 000000000..16ebe7b5d
 +        return output
 +
 +
-+class OnyxDecoderLayer(nn.Module):
++class MuseGlimmerDecoderLayer(nn.Module):
 +    def __init__(
 +        self,
 +        config,
@@ -11731,7 +12799,7 @@ index 000000000..16ebe7b5d
 +    ) -> None:
 +        super().__init__()
 +        self.hidden_size = config.hidden_size
-+        self.self_attn = OnyxAttention(
++        self.self_attn = MuseGlimmerAttention(
 +            config=config,
 +            hidden_size=self.hidden_size,
 +            num_heads=config.num_attention_heads,
@@ -11741,13 +12809,13 @@ index 000000000..16ebe7b5d
 +            quant_config=quant_config,
 +            prefix=f"{prefix}.self_attn",
 +        )
-+        self.mlp = OnyxMLP(
++        self.mlp = MuseGlimmerMLP(
 +            hidden_size=self.hidden_size,
 +            intermediate_size=config.intermediate_size,
 +            quant_config=quant_config,
 +            prefix=f"{prefix}.mlp",
 +        )
-+        # OnyxRMSNorm(w+1) == GemmaRMSNorm
++        # MuseGlimmerRMSNorm(w+1) == GemmaRMSNorm
 +        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 +        self.post_attn_norm = GemmaRMSNorm(
 +            config.hidden_size, eps=config.post_norm_eps
@@ -11758,21 +12826,21 @@ index 000000000..16ebe7b5d
 +        self.post_ffn_norm = GemmaRMSNorm(
 +            config.hidden_size, eps=config.post_norm_eps
 +        )
-+        # Onyx-C: fuse (post_attn_norm × w1 → add to residual → post_attention_layernorm × w2)
++        # MuseGlimmer-C: fuse (post_attn_norm × w1 → add to residual → post_attention_layernorm × w2)
 +        # into one esimd_norm_add_norm call. Both are GemmaRMSNorm (w+1 offset)
 +        # so pre-fold `w+1` once and cache. Same pattern as gemma4 fused_attn_out.
-+        # Env gate: DISABLE_ONYX_FUSED_RESID_NORM=1 for A/B.
++        # Env gate: DISABLE_MUSE_GLIMMER_FUSED_RESID_NORM=1 for A/B.
 +        try:
 +            from vllm.model_executor.layers.layernorm import ESIMD_AVAILABLE as _EA
 +        except ImportError:
 +            _EA = False
 +        self._resid_norm_esimd_enabled = (
 +            _EA
-+            and os.environ.get("DISABLE_ONYX_FUSED_RESID_NORM", "0") != "1"
++            and os.environ.get("DISABLE_MUSE_GLIMMER_FUSED_RESID_NORM", "0") != "1"
 +        )
 +        self._resid_norm_ready = False
 +        self._batched_norm_enabled = (
-+            os.environ.get("VLLM_ONYX_BATCHED_NORM", "0") == "1"
++            os.environ.get("VLLM_MUSE_GLIMMER_BATCHED_NORM", "0") == "1"
 +        )
 +
 +    def _standalone_norm(
@@ -11836,7 +12904,7 @@ index 000000000..16ebe7b5d
 +        )
 +        attn_out = self.self_attn(positions=positions, hidden_states=hidden_states)
 +
-+        # Onyx-C: fuse (post_attn_norm × w1 → add to residual → post_attention_layernorm × w2)
++        # MuseGlimmer-C: fuse (post_attn_norm × w1 → add to residual → post_attention_layernorm × w2)
 +        # via esimd_norm_add_norm (M==1 decode only). Semantics:
 +        #   residual ← residual + rms_norm(attn_out) * w1        (in-place on residual)
 +        #   hidden_states ← rms_norm(residual_new) * w2          (into output buf)
@@ -11893,7 +12961,7 @@ index 000000000..16ebe7b5d
 +@support_torch_compile(
 +    dynamic_arg_dims={"input_ids": 0, "positions": 0, "inputs_embeds": 0}
 +)
-+class OnyxModel(nn.Module, EagleModelMixin):
++class MuseGlimmerModel(nn.Module, EagleModelMixin):
 +    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
 +        super().__init__()
 +        config = vllm_config.model_config.hf_config
@@ -11902,7 +12970,7 @@ index 000000000..16ebe7b5d
 +        self.config = config
 +        self.quant_config = quant_config
 +        self._permute_qk_weights = (
-+            os.environ.get("VLLM_ONYX_PERMUTE_QK_WEIGHTS", "1") == "1"
++            os.environ.get("VLLM_MUSE_GLIMMER_PERMUTE_QK_WEIGHTS", "1") == "1"
 +        )
 +
 +        self.embed_tokens = VocabParallelEmbedding(
@@ -11912,7 +12980,7 @@ index 000000000..16ebe7b5d
 +            prefix=f"{prefix}.embed_tokens",
 +        )
 +        if config.normalize_tok_embeddings:
-+            # scaleless RMSNorm on hidden_size (same as OnyxScalelessRMSNorm)
++            # scaleless RMSNorm on hidden_size (same as MuseGlimmerScalelessRMSNorm)
 +            self.embed_norm = RMSNorm(
 +                hidden_size=config.hidden_size,
 +                eps=config.rms_norm_eps,
@@ -11924,12 +12992,12 @@ index 000000000..16ebe7b5d
 +
 +        self.start_layer, self.end_layer, self.layers = make_layers(
 +            config.num_hidden_layers,
-+            lambda prefix: OnyxDecoderLayer(
++            lambda prefix: MuseGlimmerDecoderLayer(
 +                config, cache_config, quant_config, prefix=prefix
 +            ),
 +            prefix=f"{prefix}.layers",
 +        )
-+        # OnyxFinalRMSNorm: weight is scale (standard RMSNorm)
++        # MuseGlimmerFinalRMSNorm: weight is scale (standard RMSNorm)
 +        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 +        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
 +            ["hidden_states"], config.hidden_size
@@ -12075,7 +13143,7 @@ index 000000000..16ebe7b5d
 +        return loaded_params
 +
 +
-+class OnyxForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
++class MuseGlimmerForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
 +    packed_modules_mapping = {
 +        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
 +        "gate_up_proj": ["gate_proj", "up_proj"],
@@ -12088,7 +13156,7 @@ index 000000000..16ebe7b5d
 +        self.config = config
 +        self.quant_config = quant_config
 +
-+        self.model = OnyxModel(
++        self.model = MuseGlimmerModel(
 +            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
 +        )
 +        self.lm_head = ParallelLMHead(
@@ -12100,7 +13168,7 @@ index 000000000..16ebe7b5d
 +        if config.tie_word_embeddings:
 +            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
 +
-+        # Onyx: logits = temp * tanh(logits * mul / temp) where temp=20, mul~0.196
++        # MuseGlimmer: logits = temp * tanh(logits * mul / temp) where temp=20, mul~0.196
 +        # LogitsProcessor(soft_cap=T, scale=s) computes: s * T * tanh(logits / T)
 +        # We need T*tanh(logits * mul / T) = (T/mul) * tanh(logits*mul/T) * mul
 +        # equivalently soft_cap=T/mul, scale=mul -> mul * (T/mul) * tanh(logits*mul/T)
@@ -12145,14 +13213,14 @@ index 000000000..16ebe7b5d
 +            ),
 +        )
 +        return loader.load_weights(weights)
-diff --git a/vllm/model_executor/models/onyx_mm.py b/vllm/model_executor/models/onyx_mm.py
+diff --git a/vllm/model_executor/models/muse_glimmer_mm.py b/vllm/model_executor/models/muse_glimmer_mm.py
 new file mode 100644
-index 000000000..6a31d5dff
+index 000000000..cb3f09c4c
 --- /dev/null
-+++ b/vllm/model_executor/models/onyx_mm.py
-@@ -0,0 +1,692 @@
++++ b/vllm/model_executor/models/muse_glimmer_mm.py
+@@ -0,0 +1,1239 @@
 +# SPDX-License-Identifier: Apache-2.0
-+# Onyx multimodal (image) support for vLLM XPU.
++# MuseGlimmer multimodal (image and video) support for vLLM XPU.
 +#
 +# Refactored to align with the gemma4_mm.py / mllama4.py multimodal patterns:
 +#   * `init_vllm_registered_model` + `_mark_language_model` / `_mark_tower_model`
@@ -12162,7 +13230,7 @@ index 000000000..6a31d5dff
 +#     matching / `.data.copy_()`. Weights that need fp8 quantisation, kv scale
 +#     remapping, TP sharding, pp_missing skipping all go through the standard
 +#     path.
-+#   * `OnyxImagePixelInputs(TensorSchema)` with dynamic H/W for the pixel_values
++#   * `MuseGlimmerImagePixelInputs(TensorSchema)` with dynamic H/W for the pixel_values
 +#     tensor list — makes MM budget profiling honest.
 +#   * `embed_multimodal` returns one tensor per input image (aligned with
 +#     mm_items) so multi-image prompts work with `_merge_multimodal_embeddings`.
@@ -12171,7 +13239,7 @@ index 000000000..6a31d5dff
 +#     and cast to the model_config dtype — no accidental fp8 quantisation of
 +#     vision Linears, and no bf16↔fp16 upcasts at runtime.
 +#
-+# Ports of the reference vision tower (day0_model/hf/modeling_onyx.py) are
++# Ports of the reference vision tower (day0_model/hf/modeling_muse_glimmer.py) are
 +# left unchanged from the first version — they stay in the model dtype
 +# because they're small (~1.6 GB) and replicated on every rank.
 +
@@ -12182,10 +13250,14 @@ index 000000000..6a31d5dff
 +from collections.abc import Iterable, Mapping, Sequence
 +from typing import Annotated, Any, Literal
 +
++import numpy as np
 +import torch
 +import torch.nn.functional as F
++from PIL import Image
 +from torch import nn
++from torchvision.transforms.functional import to_pil_image
 +from transformers import BatchFeature
++from transformers.video_utils import VideoMetadata
 +
 +from vllm.config import VllmConfig
 +from vllm.config.multimodal import BaseDummyOptions
@@ -12195,7 +13267,13 @@ index 000000000..6a31d5dff
 +from vllm.model_executor.models.module_mapping import MultiModelKeys
 +from vllm.multimodal import MULTIMODAL_REGISTRY
 +from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
-+from vllm.multimodal.parse import ImageProcessorItems, MultiModalDataItems
++from vllm.multimodal.parse import (
++    ImageSize,
++    MultiModalDataItems,
++    MultiModalDataParser,
++    VideoEmbeddingItems,
++    VideoProcessorItems,
++)
 +from vllm.multimodal.processing import BaseDummyInputsBuilder
 +from vllm.multimodal.processing.processor import (
 +    BaseMultiModalProcessor,
@@ -12228,37 +13306,52 @@ index 000000000..6a31d5dff
 +# --------------------------------------------------------------------------- #
 +
 +
-+class OnyxImagePixelInputs(TensorSchema):
-+    """Pre-processed image pixels for the Onyx vision tower.
++class MuseGlimmerImagePixelInputs(TensorSchema):
++    """Batched variable-resolution image inputs."""
 +
-+    Onyx keeps pixel_values as a Python list of variable-shape tensors,
-+    one per input image (shape [3, H, W] where H/W depend on
-+    `image_processor.compute_image_size(...)` for the actual image).
-+    """
-+
-+    type: Literal["pixel_values"] = "pixel_values"
-+
-+    # A list of tensors — TensorSchema supports this via a dynamic-dims
-+    # batch dimension; we just carry the list through.
++    type: Literal["image_pixels"] = "image_pixels"
 +    pixel_values: Annotated[
 +        list[torch.Tensor] | torch.Tensor,
 +        TensorShape("bn", 3, "h", "w", dynamic_dims={"h", "w"}),
 +    ]
++    feature_sizes: Annotated[torch.Tensor, TensorShape("bn")]
++
++
++class MuseGlimmerVideoPixelInputs(TensorSchema):
++    """Batched variable-length, variable-resolution video inputs."""
++
++    type: Literal["video_pixels"] = "video_pixels"
++    pixel_values: Annotated[
++        list[torch.Tensor] | torch.Tensor,
++        TensorShape(
++            "bn",
++            "ng",
++            "c",
++            "h",
++            "w",
++            dynamic_dims={"ng", "h", "w"},
++        ),
++    ]
++    feature_sizes: Annotated[torch.Tensor, TensorShape("bn")]
 +
 +
 +# --------------------------------------------------------------------------- #
-+# Vision tower — direct port of day0_model/hf/modeling_onyx.py                #
++# Vision tower — direct port of day0_model/hf/modeling_muse_glimmer.py                #
 +# --------------------------------------------------------------------------- #
 +
 +
 +def _apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-+    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-+    freqs = freqs_cis.unsqueeze(0).unsqueeze(2)
-+    x_out = torch.view_as_real(x_complex * freqs).flatten(-2)
-+    return x_out.to(x.dtype)
++    orig_dtype = x.dtype
++    x = x.float()
++    cos = freqs_cis.real.unsqueeze(0).unsqueeze(2)
++    sin = freqs_cis.imag.unsqueeze(0).unsqueeze(2)
++    x1, x2 = torch.chunk(x, 2, dim=-1)
++    return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1).to(
++        orig_dtype
++    )
 +
 +
-+class OnyxVisionAttention(nn.Module):
++class MuseGlimmerVisionAttention(nn.Module):
 +    def __init__(self, dim: int, n_heads: int, head_dim: int):
 +        super().__init__()
 +        self.n_heads = n_heads
@@ -12285,7 +13378,7 @@ index 000000000..6a31d5dff
 +        return self.o_proj(out)
 +
 +
-+class OnyxVisionMLP(nn.Module):
++class MuseGlimmerVisionMLP(nn.Module):
 +    def __init__(self, dim: int, hidden_dim: int):
 +        super().__init__()
 +        self.c_fc = nn.Linear(dim, hidden_dim, bias=True)
@@ -12295,13 +13388,13 @@ index 000000000..6a31d5dff
 +        return self.c_proj(F.gelu(self.c_fc(x)))
 +
 +
-+class OnyxVisionBlock(nn.Module):
++class MuseGlimmerVisionBlock(nn.Module):
 +    def __init__(self, dim, n_heads, head_dim, mlp_hidden):
 +        super().__init__()
 +        self.ln_1 = nn.LayerNorm(dim)
-+        self.attn = OnyxVisionAttention(dim, n_heads, head_dim)
++        self.attn = MuseGlimmerVisionAttention(dim, n_heads, head_dim)
 +        self.ln_2 = nn.LayerNorm(dim)
-+        self.mlp = OnyxVisionMLP(dim, mlp_hidden)
++        self.mlp = MuseGlimmerVisionMLP(dim, mlp_hidden)
 +
 +    def forward(self, x, slen, freqs_cis=None, attn_bias=None):
 +        bs, s, d = x.shape
@@ -12315,7 +13408,7 @@ index 000000000..6a31d5dff
 +        return flat.view(bs, s, d)
 +
 +
-+class OnyxVisionEncoder(nn.Module):
++class MuseGlimmerVisionEncoder(nn.Module):
 +    def __init__(self, config):
 +        super().__init__()
 +        latent_dim = config.vision_latent_dim
@@ -12342,7 +13435,7 @@ index 000000000..6a31d5dff
 +        self.ln_pre = nn.LayerNorm(latent_dim)
 +        self.transformer = nn.ModuleList(
 +            [
-+                OnyxVisionBlock(latent_dim, n_heads, head_dim, mlp_hidden)
++                MuseGlimmerVisionBlock(latent_dim, n_heads, head_dim, mlp_hidden)
 +                for _ in range(config.vision_layers)
 +            ]
 +        )
@@ -12369,21 +13462,63 @@ index 000000000..6a31d5dff
 +        )
 +
 +    def _get_pos_emb(self, grid_h, grid_w, device):
-+        dtype = self.positional_embedding_vlm.dtype
-+        pos_emb = (
-+            self.positional_embedding_vlm.view(
-+                self.pos_emb_grid_h, self.pos_emb_grid_w, self.latent_dim
-+            ).permute(2, 0, 1).unsqueeze(0)
++        h_grid = (
++            torch.arange(grid_h, device=device, dtype=torch.float32) + 0.5
++        ) * (self.pos_emb_grid_h / grid_h) - 0.5
++        w_grid = (
++            torch.arange(grid_w, device=device, dtype=torch.float32) + 0.5
++        ) * (self.pos_emb_grid_w / grid_w) - 0.5
++        h_floor = torch.floor(h_grid).long()
++        w_floor = torch.floor(w_grid).long()
++        h_ceil = h_floor + 1
++        w_ceil = w_floor + 1
++        h_frac = h_grid - h_floor.float()
++        w_frac = w_grid - w_floor.float()
++
++        h_floor_valid = (h_floor >= 0) & (h_floor < self.pos_emb_grid_h)
++        h_ceil_valid = (h_ceil >= 0) & (h_ceil < self.pos_emb_grid_h)
++        w_floor_valid = (w_floor >= 0) & (w_floor < self.pos_emb_grid_w)
++        w_ceil_valid = (w_ceil >= 0) & (w_ceil < self.pos_emb_grid_w)
++        h_floor = h_floor.clamp(0, self.pos_emb_grid_h - 1)
++        h_ceil = h_ceil.clamp(0, self.pos_emb_grid_h - 1)
++        w_floor = w_floor.clamp(0, self.pos_emb_grid_w - 1)
++        w_ceil = w_ceil.clamp(0, self.pos_emb_grid_w - 1)
++
++        h_floor_offset = h_floor * self.pos_emb_grid_w
++        h_ceil_offset = h_ceil * self.pos_emb_grid_w
++        indices = torch.stack(
++            [
++                (h_floor_offset[:, None] + w_floor[None, :]).flatten(),
++                (h_floor_offset[:, None] + w_ceil[None, :]).flatten(),
++                (h_ceil_offset[:, None] + w_floor[None, :]).flatten(),
++                (h_ceil_offset[:, None] + w_ceil[None, :]).flatten(),
++            ]
 +        )
-+        inv_h = 1.0 / grid_h
-+        inv_w = 1.0 / grid_w
-+        ys = torch.linspace(-1 + inv_h, 1 - inv_h, grid_h, device=device, dtype=dtype)
-+        xs = torch.linspace(-1 + inv_w, 1 - inv_w, grid_w, device=device, dtype=dtype)
-+        pos_xy = torch.stack(torch.meshgrid(ys, xs, indexing="xy"), dim=-1).reshape(
-+            -1, 2
-+        )[None, None]
-+        sampled = F.grid_sample(pos_emb, pos_xy, mode="bilinear", align_corners=False)
-+        return sampled[0, :, 0, :].T
++        weights = torch.stack(
++            [
++                (
++                    (1 - h_frac)[:, None]
++                    * (1 - w_frac)[None, :]
++                    * (h_floor_valid[:, None] & w_floor_valid[None, :])
++                ).flatten(),
++                (
++                    (1 - h_frac)[:, None]
++                    * w_frac[None, :]
++                    * (h_floor_valid[:, None] & w_ceil_valid[None, :])
++                ).flatten(),
++                (
++                    h_frac[:, None]
++                    * (1 - w_frac)[None, :]
++                    * (h_ceil_valid[:, None] & w_floor_valid[None, :])
++                ).flatten(),
++                (
++                    h_frac[:, None]
++                    * w_frac[None, :]
++                    * (h_ceil_valid[:, None] & w_ceil_valid[None, :])
++                ).flatten(),
++            ]
++        )
++        return (self.positional_embedding_vlm[indices] * weights[..., None]).sum(0)
 +
 +    def _pixel_shuffle_downsample(self, x, grid_h, grid_w):
 +        f = self.downsample_factor
@@ -12491,7 +13626,7 @@ index 000000000..6a31d5dff
 +        return x.squeeze(0)  # [n_downsampled_tokens, vision_output_dim]
 +
 +
-+class OnyxVisionAdapter(nn.Module):
++class MuseGlimmerVisionAdapter(nn.Module):
 +    def __init__(self, config):
 +        super().__init__()
 +        self.c_fc = nn.Linear(
@@ -12510,20 +13645,217 @@ index 000000000..6a31d5dff
 +# --------------------------------------------------------------------------- #
 +
 +
-+class OnyxProcessingInfo(BaseProcessingInfo):
++IMAGE_TOKEN = "<|patch|>"
++IMAGE_SENTINEL = "<|image|>"
++VIDEO_TOKEN = "<|video|>"
++
++
++def _grid_size(
++    image_width: int,
++    image_height: int,
++    patch_size: int,
++    max_tokens: int,
++) -> tuple[int, int, int]:
++    grid_h = image_height / patch_size
++    grid_w = image_width / patch_size
++    ratio = grid_w / grid_h if grid_h > 0 else 1.0
++    if grid_h * grid_w > max_tokens:
++        grid_h = (max_tokens / ratio) ** 0.5
++        grid_w = grid_h * ratio
++
++    candidates = {
++        (math.floor(grid_h), math.floor(grid_w)),
++        (math.floor(grid_h), math.ceil(grid_w)),
++        (math.ceil(grid_h), math.floor(grid_w)),
++        (math.ceil(grid_h), math.ceil(grid_w)),
++    }
++    candidates = {
++        (height, width)
++        for height, width in candidates
++        if height >= 1 and width >= 1 and height * width <= max_tokens
++    }
++    if not candidates:
++        candidates = {(max(1, round(grid_h)), max(1, round(grid_w)))}
++    target_h, target_w = min(
++        candidates,
++        key=lambda size: abs(size[0] / size[1] - image_height / image_width),
++    )
++    return target_h * patch_size, target_w * patch_size, target_h * target_w
++
++
++def _resize_with_lanczos(
++    image: object,
++    *,
++    patch_size: int,
++    downsample_factor: int,
++    max_tokens: int,
++) -> Image.Image:
++    pil_image = (
++        image if isinstance(image, Image.Image) else to_pil_image(image)
++    ).convert("RGB")
++    target_h, target_w, _ = _grid_size(
++        pil_image.width,
++        pil_image.height,
++        patch_size * downsample_factor,
++        max_tokens,
++    )
++    return pil_image.resize((target_w, target_h), Image.Resampling.LANCZOS)
++
++
++def _restore_patch_groups(
++    pixel_values: torch.Tensor,
++    grid_thw: torch.Tensor,
++    *,
++    patch_size: int,
++    temporal_patch_size: int,
++    is_video: bool,
++) -> torch.Tensor:
++    grid_t, grid_h, grid_w = (int(value) for value in grid_thw.tolist())
++    patches_per_group = grid_h * grid_w
++    expected_patches = grid_t * patches_per_group
++    patch_dim = temporal_patch_size * 3 * patch_size**2
++    if pixel_values.ndim != 2 or tuple(pixel_values.shape) != (
++        expected_patches,
++        patch_dim,
++    ):
++        raise ValueError(
++            "Unexpected Muse pixel patch shape: "
++            f"{tuple(pixel_values.shape)}, expected "
++            f"({expected_patches}, {patch_dim})"
++        )
++
++    groups: list[torch.Tensor] = []
++    for group_idx in range(grid_t):
++        start = group_idx * patches_per_group
++        patches = pixel_values[start : start + patches_per_group].view(
++            grid_h,
++            grid_w,
++            temporal_patch_size,
++            3,
++            patch_size,
++            patch_size,
++        )
++        if is_video:
++            group = (
++                patches.permute(2, 3, 0, 4, 1, 5)
++                .contiguous()
++                .view(
++                    temporal_patch_size * 3,
++                    grid_h * patch_size,
++                    grid_w * patch_size,
++                )
++            )
++        else:
++            if grid_t != 1:
++                raise ValueError(
++                    f"MuseGlimmer image input must have grid_t=1, got {grid_t}"
++                )
++            group = (
++                patches[:, :, 0]
++                .permute(2, 0, 3, 1, 4)
++                .contiguous()
++                .view(3, grid_h * patch_size, grid_w * patch_size)
++            )
++        groups.append(group)
++    return torch.stack(groups) if is_video else groups[0]
++
++
++class MuseGlimmerMultiModalDataParser(MultiModalDataParser):
++    """Preserve video metadata when the media loader provides it."""
++
++    def _parse_video_data(self, data):
++        if data is None:
++            return None
++        if self.is_embeddings(data):
++            return VideoEmbeddingItems(data, self.expected_hidden_size)
++
++        if isinstance(data, tuple) and len(data) == 2:
++            data_items = [data]
++        elif isinstance(data, (np.ndarray, torch.Tensor)) and data.ndim == 4:
++            data_items = [data]
++        elif (
++            isinstance(data, Sequence)
++            and data
++            and isinstance(data[0], Image.Image)
++        ):
++            data_items = [data]
++        elif isinstance(data, (np.ndarray, torch.Tensor)):
++            data_items = list(data)
++        else:
++            data_items = list(data)
++
++        videos = []
++        metadata = []
++        for item in data_items:
++            video, item_metadata = self._get_video_with_metadata(item)
++            videos.append(
++                (video, item_metadata) if item_metadata is not None else video
++            )
++            metadata.append(item_metadata)
++        return VideoProcessorItems(videos, metadata=metadata)
++
++
++class MuseGlimmerProcessingInfo(BaseProcessingInfo):
 +    def get_hf_processor(self, **kwargs: object):
 +        return self.ctx.get_hf_processor(**kwargs)
 +
++    def get_data_parser(self):
++        return MuseGlimmerMultiModalDataParser(
++            expected_hidden_size=self._get_expected_hidden_size()
++        )
++
 +    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-+        return {"image": None}
++        return {"image": None, "video": None}
 +
-+    def _n_tokens_for_image(self, image_width: int, image_height: int) -> int:
-+        proc = self.get_hf_processor()
-+        _, _, n = proc.image_processor.compute_image_size(image_width, image_height)
-+        return n
++    def get_mm_max_tokens_per_item(
++        self,
++        seq_len: int,
++        mm_counts: Mapping[str, int],
++    ) -> Mapping[str, int]:
++        processor = self.get_hf_processor()
++        image_processor = processor.image_processor
++        video_processor = processor.video_processor
++        num_frames = self.get_num_frames_with_most_features(seq_len, mm_counts)
++        return {
++            "image": int(image_processor.max_image_tokens),
++            "video": (
++                num_frames
++                // int(video_processor.temporal_patch_size)
++                * int(video_processor.max_video_frame_tokens)
++            ),
++        }
 +
++    def get_image_size_with_most_features(self) -> ImageSize:
++        image_processor = self.get_hf_processor().image_processor
++        grid_size = math.isqrt(int(image_processor.max_image_tokens))
++        side = (
++            int(image_processor.patch_size)
++            * int(image_processor.merge_size)
++            * grid_size
++        )
++        return ImageSize(width=side, height=side)
 +
-+class OnyxMultiModalProcessor(BaseMultiModalProcessor[OnyxProcessingInfo]):
++    def get_num_frames_with_most_features(
++        self,
++        seq_len: int,
++        mm_counts: Mapping[str, int],
++    ) -> int:
++        video_processor = self.get_hf_processor().video_processor
++        num_videos = max(mm_counts.get("video", 0), 1)
++        groups = max(
++            1,
++            seq_len
++            // num_videos
++            // int(video_processor.max_video_frame_tokens),
++        )
++        temporal_patch_size = int(video_processor.temporal_patch_size)
++        max_groups = max(
++            1,
++            int(video_processor.num_frames) // temporal_patch_size,
++        )
++        return min(groups, max_groups) * temporal_patch_size
++
++class MuseGlimmerMultiModalProcessor(BaseMultiModalProcessor[MuseGlimmerProcessingInfo]):
 +    def _call_hf_processor(
 +        self,
 +        prompt: str,
@@ -12531,30 +13863,218 @@ index 000000000..6a31d5dff
 +        mm_kwargs: Mapping[str, object],
 +        tok_kwargs: Mapping[str, object],
 +    ) -> BatchFeature:
-+        # OnyxProcessor asserts sentinel-count == len(images); vLLM's
-+        # text-only probing path calls the processor with text but no
-+        # images and would trip that check. Fall back to tokenizer-only.
-+        images = mm_data.get("images")
-+        if not images:
-+            tokenizer = self.info.get_tokenizer()
-+            ids = tokenizer.encode(prompt, add_special_tokens=False)
++        processor = self.info.get_hf_processor(**mm_kwargs)
++        tokenizer = self.info.get_tokenizer()
++        image_processor = processor.image_processor
++        video_processor = processor.video_processor
++        images = mm_data.get("images", ())
++        videos = mm_data.get("videos", ())
++        if not isinstance(images, Sequence) or not isinstance(videos, Sequence):
++            raise TypeError("MuseGlimmer multi-modal data must be a sequence")
++
++        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
++        if not images and not videos:
 +            return BatchFeature(
 +                data={
-+                    "input_ids": [ids],
-+                    "attention_mask": [[1] * len(ids)],
++                    "input_ids": [prompt_ids],
++                    "attention_mask": [[1] * len(prompt_ids)],
 +                },
-+                tensor_type="pt",
++                tensor_type=None,
 +            )
-+        return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
++
++        image_sentinel_id = tokenizer.convert_tokens_to_ids(IMAGE_SENTINEL)
++        video_sentinel_id = tokenizer.convert_tokens_to_ids(VIDEO_TOKEN)
++        if prompt_ids.count(image_sentinel_id) != len(images):
++            raise ValueError("The number of image placeholders does not match images")
++        if prompt_ids.count(video_sentinel_id) != len(videos):
++            raise ValueError("The number of video placeholders does not match videos")
++
++        image_pixels: list[torch.Tensor] = []
++        image_sizes: list[int] = []
++        image_prompt_blocks: list[list[int]] = []
++        image_call_kwargs = dict(mm_kwargs)
++        image_kwargs = dict(image_call_kwargs.pop("images_kwargs", {}))
++        image_kwargs["do_resize"] = False
++        image_call_kwargs["images_kwargs"] = image_kwargs
++        media_tok_kwargs = dict(tok_kwargs)
++        media_tok_kwargs["add_special_tokens"] = False
++        for image in images:
++            resized = _resize_with_lanczos(
++                image,
++                patch_size=int(image_processor.patch_size),
++                downsample_factor=int(image_processor.merge_size),
++                max_tokens=int(image_processor.max_image_tokens),
++            )
++            output = super()._call_hf_processor(
++                prompt=IMAGE_SENTINEL,
++                mm_data={"images": [resized]},
++                mm_kwargs=image_call_kwargs,
++                tok_kwargs=media_tok_kwargs,
++            )
++            pixels = output["pixel_values"]
++            grid = torch.as_tensor(output["image_grid_thw"])[0]
++            merge_tokens = int(image_processor.merge_size) ** 2
++            feature_size = int(grid.prod()) // merge_tokens
++            image_pixels.append(
++                _restore_patch_groups(
++                    pixels,
++                    grid,
++                    patch_size=int(image_processor.patch_size),
++                    temporal_patch_size=int(
++                        image_processor.temporal_patch_size
++                    ),
++                    is_video=False,
++                )
++            )
++            image_sizes.append(feature_size)
++            image_prompt_blocks.append(
++                [
++                    tokenizer.convert_tokens_to_ids("<|image_start|>"),
++                    *[tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)] * feature_size,
++                    tokenizer.convert_tokens_to_ids("<|image_end|>"),
++                ]
++            )
++
++        video_pixels: list[torch.Tensor] = []
++        video_sizes: list[int] = []
++        video_prompt_blocks: list[list[int]] = []
++        for item in videos:
++            if isinstance(item, tuple):
++                video, metadata = item
++            else:
++                video, metadata = item, None
++            if not isinstance(video, (np.ndarray, torch.Tensor, Sequence)):
++                raise TypeError("MuseGlimmer video input must contain frames")
++            frames = list(video)
++            if not frames:
++                raise ValueError("MuseGlimmer video must contain at least one frame")
++            resized_frames = [
++                _resize_with_lanczos(
++                    frame,
++                    patch_size=int(video_processor.patch_size),
++                    downsample_factor=int(video_processor.merge_size),
++                    max_tokens=int(video_processor.max_video_frame_tokens),
++                )
++                for frame in frames
++            ]
++
++            if metadata is None:
++                frame_count = len(resized_frames)
++                metadata = {
++                    "fps": float(video_processor.fps),
++                    "duration": frame_count / float(video_processor.fps),
++                    "total_num_frames": frame_count,
++                    "frames_indices": list(range(frame_count)),
++                    "video_backend": "unknown",
++                    "do_sample_frames": frame_count
++                    > int(video_processor.num_frames),
++                }
++            metadata = dict(metadata)
++            do_sample_frames = bool(metadata.pop("do_sample_frames", False))
++            video_metadata = VideoMetadata(
++                **{
++                    key: value
++                    for key, value in metadata.items()
++                    if key
++                    in {
++                        "total_num_frames",
++                        "fps",
++                        "width",
++                        "height",
++                        "duration",
++                        "video_backend",
++                        "frames_indices",
++                    }
++                }
++            )
++            video_call_kwargs = dict(mm_kwargs)
++            video_kwargs = dict(video_call_kwargs.pop("videos_kwargs", {}))
++            video_kwargs.update(
++                do_resize=False,
++                do_sample_frames=do_sample_frames,
++            )
++            video_call_kwargs["videos_kwargs"] = video_kwargs
++            output = super()._call_hf_processor(
++                prompt=VIDEO_TOKEN,
++                mm_data={
++                    "videos": [resized_frames],
++                    "video_metadata": [video_metadata],
++                },
++                mm_kwargs=video_call_kwargs,
++                tok_kwargs=media_tok_kwargs,
++            )
++            pixels = output["pixel_values_videos"]
++            grid = torch.as_tensor(output["video_grid_thw"])[0]
++            merge_tokens = int(video_processor.merge_size) ** 2
++            feature_size = int(grid.prod()) // merge_tokens
++            video_pixels.append(
++                _restore_patch_groups(
++                    pixels,
++                    grid,
++                    patch_size=int(video_processor.patch_size),
++                    temporal_patch_size=int(
++                        video_processor.temporal_patch_size
++                    ),
++                    is_video=True,
++                )
++            )
++            video_sizes.append(feature_size)
++            block_ids = output["input_ids"][0]
++            if isinstance(block_ids, torch.Tensor):
++                block_ids = block_ids.tolist()
++            video_prompt_blocks.append(block_ids)
++
++        combined_prompt_ids: list[int] = []
++        image_idx = video_idx = 0
++        for token_id in prompt_ids:
++            if token_id == image_sentinel_id:
++                combined_prompt_ids.extend(image_prompt_blocks[image_idx])
++                image_idx += 1
++            elif token_id == video_sentinel_id:
++                combined_prompt_ids.extend(video_prompt_blocks[video_idx])
++                video_idx += 1
++            else:
++                combined_prompt_ids.append(token_id)
++
++        data: dict[str, object] = {
++            "input_ids": [combined_prompt_ids],
++            "attention_mask": [[1] * len(combined_prompt_ids)],
++        }
++        if image_pixels:
++            data.update(
++                image_pixel_values=image_pixels,
++                image_feature_sizes=torch.tensor(image_sizes),
++            )
++        if video_pixels:
++            data.update(
++                video_pixel_values=video_pixels,
++                video_feature_sizes=torch.tensor(video_sizes),
++                video_prompt_ids=[
++                    torch.tensor(block) for block in video_prompt_blocks
++                ],
++            )
++        return BatchFeature(data=data, tensor_type=None)
 +
 +    def _get_mm_fields_config(
 +        self,
 +        hf_inputs: BatchFeature,
 +        hf_processor_mm_kwargs: Mapping[str, object],
 +    ) -> Mapping[str, MultiModalFieldConfig]:
-+        # OnyxProcessor returns a Python list of variable-shape tensors —
-+        # one per image. Batched field keeps them aligned with mm items.
-+        return dict(pixel_values=MultiModalFieldConfig.batched("image"))
++        fields = {}
++        if "image_pixel_values" in hf_inputs:
++            fields.update(
++                image_pixel_values=MultiModalFieldConfig.batched("image"),
++                image_feature_sizes=MultiModalFieldConfig.batched("image"),
++            )
++        if "video_pixel_values" in hf_inputs:
++            fields.update(
++                video_pixel_values=MultiModalFieldConfig.batched("video"),
++                video_feature_sizes=MultiModalFieldConfig.batched("video"),
++                video_prompt_ids=MultiModalFieldConfig.batched(
++                    "video", keep_on_cpu=True
++                ),
++            )
++        return fields
 +
 +    def _get_prompt_updates(
 +        self,
@@ -12563,31 +14083,50 @@ index 000000000..6a31d5dff
 +        out_mm_kwargs: MultiModalKwargsItems,
 +    ) -> Sequence[PromptUpdate]:
 +        tokenizer = self.info.get_tokenizer()
-+        img_start = tokenizer.convert_tokens_to_ids("<|image_start|>")
-+        img_end = tokenizer.convert_tokens_to_ids("<|image_end|>")
-+        patch = tokenizer.convert_tokens_to_ids("<|patch|>")
-+        sentinel = tokenizer.convert_tokens_to_ids("<|image|>")
++        image_start = tokenizer.convert_tokens_to_ids("<|image_start|>")
++        image_end = tokenizer.convert_tokens_to_ids("<|image_end|>")
++        patch = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
++        image_sentinel = tokenizer.convert_tokens_to_ids(IMAGE_SENTINEL)
++        video_sentinel = tokenizer.convert_tokens_to_ids(VIDEO_TOKEN)
 +
-+        def get_replacement(item_idx: int):
-+            images = mm_items.get_items("image", ImageProcessorItems)
-+            size = images.get_image_size(item_idx)
-+            n_tokens = self.info._n_tokens_for_image(size.width, size.height)
-+            block = [img_start] + [patch] * n_tokens + [img_end]
++        def image_replacement(item_idx: int):
++            out_item = out_mm_kwargs["image"][item_idx]
++            num_tokens = int(out_item["image_feature_sizes"].data)
++            block = [image_start] + [patch] * num_tokens + [image_end]
 +            return PromptUpdateDetails.select_token_id(block, patch)
++
++        def video_replacement(item_idx: int):
++            out_item = out_mm_kwargs["video"][item_idx]
++            num_tokens = int(out_item["video_feature_sizes"].data)
++            block = out_item["video_prompt_ids"].data
++            if isinstance(block, torch.Tensor):
++                block = block.tolist()
++            if block.count(video_sentinel) != num_tokens:
++                raise ValueError(
++                    "MuseGlimmer video prompt token count does not match "
++                    "video features"
++                )
++            return PromptUpdateDetails.select_token_id(block, video_sentinel)
 +
 +        return [
 +            PromptReplacement(
 +                modality="image",
-+                target=[sentinel],
-+                replacement=get_replacement,
-+            )
++                target=[image_sentinel],
++                replacement=image_replacement,
++            ),
++            PromptReplacement(
++                modality="video",
++                target=[video_sentinel],
++                replacement=video_replacement,
++            ),
 +        ]
 +
 +
-+class OnyxDummyInputsBuilder(BaseDummyInputsBuilder[OnyxProcessingInfo]):
++class MuseGlimmerDummyInputsBuilder(BaseDummyInputsBuilder[MuseGlimmerProcessingInfo]):
 +    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
-+        num = mm_counts.get("image", 0)
-+        return "<|image|>" * num
++        return IMAGE_SENTINEL * mm_counts.get("image", 0) + VIDEO_TOKEN * mm_counts.get(
++            "video", 0
++        )
 +
 +    def get_dummy_mm_data(
 +        self,
@@ -12595,12 +14134,31 @@ index 000000000..6a31d5dff
 +        mm_counts: Mapping[str, int],
 +        mm_options: Mapping[str, BaseDummyOptions],
 +    ) -> MultiModalDataDict:
-+        num = mm_counts.get("image", 0)
-+        image_overrides = mm_options.get("image")
++        processor = self.info.get_hf_processor()
++        video_processor = processor.video_processor
++        image_width, image_height = self.info.get_image_size_with_most_features()
++        video_grid = math.isqrt(int(video_processor.max_video_frame_tokens))
++        video_size = (
++            int(video_processor.patch_size)
++            * int(video_processor.merge_size)
++            * video_grid
++        )
 +        return {
 +            "image": self._get_dummy_images(
-+                width=224, height=224, num_images=num, overrides=image_overrides
-+            )
++                width=image_width,
++                height=image_height,
++                num_images=mm_counts.get("image", 0),
++                overrides=mm_options.get("image"),
++            ),
++            "video": self._get_dummy_videos(
++                width=video_size,
++                height=video_size,
++                num_frames=self.info.get_num_frames_with_most_features(
++                    seq_len, mm_counts
++                ),
++                num_videos=mm_counts.get("video", 0),
++                overrides=mm_options.get("video"),
++            ),
 +        }
 +
 +
@@ -12610,11 +14168,11 @@ index 000000000..6a31d5dff
 +
 +
 +@MULTIMODAL_REGISTRY.register_processor(
-+    OnyxMultiModalProcessor,
-+    info=OnyxProcessingInfo,
-+    dummy_inputs=OnyxDummyInputsBuilder,
++    MuseGlimmerMultiModalProcessor,
++    info=MuseGlimmerProcessingInfo,
++    dummy_inputs=MuseGlimmerDummyInputsBuilder,
 +)
-+class OnyxForConditionalGeneration(
++class MuseGlimmerForConditionalGeneration(
 +    nn.Module, SupportsMultiModal, SupportsPP, SupportsEagle3
 +):
 +    packed_modules_mapping = {
@@ -12691,7 +14249,9 @@ index 000000000..6a31d5dff
 +    @classmethod
 +    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
 +        if modality.startswith("image"):
-+            return "<|image|>"
++            return IMAGE_SENTINEL
++        if modality.startswith("video"):
++            return VIDEO_TOKEN
 +        return None
 +
 +    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -12701,10 +14261,10 @@ index 000000000..6a31d5dff
 +        self.config = config
 +        self.quant_config = vllm_config.quant_config
 +
-+        # ---- Vision tower (image + [future] video). No TP; not quantised. ----
-+        with self._mark_tower_model(vllm_config, "image"):
-+            self.vision_encoder = OnyxVisionEncoder(config).to(model_dtype)
-+            self.vision_adapter = OnyxVisionAdapter(config).to(model_dtype)
++        # ---- Vision tower (image + video). No TP; not quantised. ----
++        with self._mark_tower_model(vllm_config, {"image", "video"}):
++            self.vision_encoder = MuseGlimmerVisionEncoder(config).to(model_dtype)
++            self.vision_adapter = MuseGlimmerVisionAdapter(config).to(model_dtype)
 +            self.vision_projection = nn.Linear(
 +                config.vision_adapter_dim, config.hidden_size, bias=False,
 +            ).to(model_dtype)
@@ -12724,7 +14284,7 @@ index 000000000..6a31d5dff
 +                vllm_config=vllm_config,
 +                hf_config=config,
 +                prefix=maybe_prefix(prefix, "language_model"),
-+                architectures=["OnyxForCausalLM"],
++                architectures=["MuseGlimmerForCausalLM"],
 +            )
 +
 +        self.patch_token_id = config.patch_token_id
@@ -12746,45 +14306,100 @@ index 000000000..6a31d5dff
 +
 +    # ---------------- vision pipeline ----------------
 +
-+    def _parse_and_validate_image_input(self, **kwargs) -> OnyxImagePixelInputs | None:
-+        pixel_values = kwargs.pop("pixel_values", None)
-+        if pixel_values is None:
++    def _parse_and_validate_image_input(self, **kwargs) -> MuseGlimmerImagePixelInputs | None:
++        pixel_values = kwargs.pop("image_pixel_values", None)
++        feature_sizes = kwargs.pop("image_feature_sizes", None)
++        if pixel_values is None and feature_sizes is None:
 +            return None
-+        # `batched("image")` in the field-config gives us either a list, a
-+        # tuple, or a nested list depending on batching internals. Flatten
-+        # any one-level nesting so we always end up with a list[Tensor],
-+        # one entry per image.
-+        if isinstance(pixel_values, torch.Tensor):
-+            # shape [N, 3, H, W] — split back into per-image tensors.
-+            pixel_values = [pixel_values[i] for i in range(pixel_values.shape[0])]
-+        elif (
-+            isinstance(pixel_values, (list, tuple))
-+            and pixel_values
-+            and isinstance(pixel_values[0], (list, tuple))
-+        ):
-+            pixel_values = [t for sub in pixel_values for t in sub]
-+        return OnyxImagePixelInputs(pixel_values=list(pixel_values))
++        if pixel_values is None or feature_sizes is None:
++            raise ValueError(
++                "MuseGlimmer image_pixel_values and image_feature_sizes "
++                "must be provided together"
++            )
++        if not isinstance(feature_sizes, torch.Tensor):
++            raise ValueError("MuseGlimmer image_feature_sizes must be a tensor")
++        if isinstance(pixel_values, torch.Tensor) and pixel_values.ndim == 3:
++            pixel_values = pixel_values.unsqueeze(0)
++        return MuseGlimmerImagePixelInputs(
++            pixel_values=pixel_values,
++            feature_sizes=feature_sizes.reshape(-1),
++        )
++
++    def _parse_and_validate_video_input(
++        self,
++        **kwargs,
++    ) -> MuseGlimmerVideoPixelInputs | None:
++        pixel_values = kwargs.pop("video_pixel_values", None)
++        feature_sizes = kwargs.pop("video_feature_sizes", None)
++        kwargs.pop("video_prompt_ids", None)
++        if pixel_values is None and feature_sizes is None:
++            return None
++        if pixel_values is None or feature_sizes is None:
++            raise ValueError(
++                "MuseGlimmer video_pixel_values and video_feature_sizes "
++                "must be provided together"
++            )
++        if not isinstance(feature_sizes, torch.Tensor):
++            raise ValueError("MuseGlimmer video_feature_sizes must be a tensor")
++        if isinstance(pixel_values, torch.Tensor) and pixel_values.ndim == 4:
++            pixel_values = pixel_values.unsqueeze(0)
++        return MuseGlimmerVideoPixelInputs(
++            pixel_values=pixel_values,
++            feature_sizes=feature_sizes.reshape(-1),
++            resolve_bindings={"c": self.config.vision_patch_temporal * 3},
++        )
++
++    def _encode_pixel_groups(
++        self,
++        pixel_groups: Sequence[torch.Tensor],
++        feature_sizes: Sequence[int],
++    ) -> list[torch.Tensor]:
++        target_dtype = self.vision_projection.weight.dtype
++        encoded_groups: list[torch.Tensor] = []
++        for pixels in pixel_groups:
++            features = self.vision_encoder.encode_one(pixels)
++            features = self.vision_adapter(features)
++            features = self.vision_projection(features)
++            if self.perception_emb_norm is not None:
++                features = self.perception_emb_norm(features.float()).to(target_dtype)
++            encoded_groups.append(features)
++        features = torch.cat(encoded_groups)
++        if features.shape[0] != sum(feature_sizes):
++            raise ValueError(
++                f"MuseGlimmer produced {features.shape[0]} vision features for "
++                f"{sum(feature_sizes)} placeholder tokens"
++            )
++        return list(features.split(list(feature_sizes)))
 +
 +    def _process_image_input(
-+        self, image_input: OnyxImagePixelInputs
++        self, image_input: MuseGlimmerImagePixelInputs
 +    ) -> list[torch.Tensor]:
-+        images: list[torch.Tensor] = image_input["pixel_values"]  # type: ignore[assignment]
-+        target_dtype = self.vision_projection.weight.dtype
-+        per_image: list[torch.Tensor] = []
-+        for img in images:
-+            feats = self.vision_encoder.encode_one(img)          # [N_tok, vis_out]
-+            feats = self.vision_adapter(feats)                   # [N_tok, adapter]
-+            feats = self.vision_projection(feats)                # [N_tok, hidden]
-+            if self.perception_emb_norm is not None:
-+                feats = self.perception_emb_norm(feats.float()).to(target_dtype)
-+            per_image.append(feats)
-+        return per_image
++        images = list(image_input["pixel_values"])
++        sizes = [int(size) for size in image_input["feature_sizes"].tolist()]
++        if len(images) != len(sizes):
++            raise ValueError("MuseGlimmer image batch metadata does not match pixels")
++        return self._encode_pixel_groups(images, sizes)
++
++    def _process_video_input(
++        self, video_input: MuseGlimmerVideoPixelInputs
++    ) -> list[torch.Tensor]:
++        videos = list(video_input["pixel_values"])
++        sizes = [int(size) for size in video_input["feature_sizes"].tolist()]
++        if len(videos) != len(sizes):
++            raise ValueError("MuseGlimmer video batch metadata does not match pixels")
++        groups = [group for video in videos for group in video]
++        return self._encode_pixel_groups(groups, sizes)
 +
 +    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
 +        image_input = self._parse_and_validate_image_input(**kwargs)
-+        if image_input is None:
-+            return []
-+        return self._process_image_input(image_input)
++        video_input = self._parse_and_validate_video_input(**kwargs)
++        embeddings: MultiModalEmbeddings = []
++        for key in kwargs:
++            if key == "image_pixel_values" and image_input is not None:
++                embeddings.extend(self._process_image_input(image_input))
++            elif key == "video_pixel_values" and video_input is not None:
++                embeddings.extend(self._process_video_input(video_input))
++        return embeddings
 +
 +    def embed_input_ids(
 +        self,
@@ -14585,31 +16200,29 @@ index f4c716789..6eeb120cc 100644
          if self.layer_scale:
              if len(hidden_states.shape) == 2:
 diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
-index 5b77da7aa..fc40b49ed 100644
+index 5b77da7aa..a077ac471 100644
 --- a/vllm/model_executor/models/registry.py
 +++ b/vllm/model_executor/models/registry.py
-@@ -153,6 +153,8 @@ _TEXT_GENERATION_MODELS = {
+@@ -153,6 +153,7 @@ _TEXT_GENERATION_MODELS = {
      "Lfm2MoeForCausalLM": ("lfm2_moe", "Lfm2MoeForCausalLM"),
      "LagunaForCausalLM": ("laguna", "LagunaForCausalLM"),
      "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
-+    "MuseGlimmerForCausalLM": ("onyx", "OnyxForCausalLM"),
-+    "OnyxForCausalLM": ("onyx", "OnyxForCausalLM"),
++    "MuseGlimmerForCausalLM": ("muse_glimmer", "MuseGlimmerForCausalLM"),
      "Llama4ForCausalLM": ("llama4", "Llama4ForCausalLM"),
      # For decapoda-research/llama-*
      "LLaMAForCausalLM": ("llama", "LlamaForCausalLM"),
-@@ -343,6 +345,11 @@ _SEQUENCE_CLASSIFICATION_MODELS = {
+@@ -343,6 +344,10 @@ _SEQUENCE_CLASSIFICATION_MODELS = {
  _MULTIMODAL_MODELS = {
      # [Decoder-only]
      "AriaForConditionalGeneration": ("aria", "AriaForConditionalGeneration"),
 +    "MuseGlimmerForConditionalGeneration": (
-+        "onyx_mm",
-+        "OnyxForConditionalGeneration",
++        "muse_glimmer_mm",
++        "MuseGlimmerForConditionalGeneration",
 +    ),
-+    "OnyxForConditionalGeneration": ("onyx_mm", "OnyxForConditionalGeneration"),
      "AudioFlamingo3ForConditionalGeneration": (
          "audioflamingo3",
          "AudioFlamingo3ForConditionalGeneration",
-@@ -403,7 +410,15 @@ _MULTIMODAL_MODELS = {
+@@ -403,7 +408,15 @@ _MULTIMODAL_MODELS = {
          "gemma3n_mm",
          "Gemma3nForConditionalGeneration",
      ),
@@ -14625,7 +16238,7 @@ index 5b77da7aa..fc40b49ed 100644
      "GlmAsrForConditionalGeneration": ("glmasr", "GlmAsrForConditionalGeneration"),
      "GLM4VForCausalLM": ("glm4v", "GLM4VForCausalLM"),
      "Glm4vForConditionalGeneration": ("glm4_1v", "Glm4vForConditionalGeneration"),
-@@ -587,6 +602,11 @@ _SPECULATIVE_DECODING_MODELS = {
+@@ -587,6 +600,11 @@ _SPECULATIVE_DECODING_MODELS = {
      "EagleLlama4ForCausalLM": ("llama4_eagle", "EagleLlama4ForCausalLM"),
      "EagleMiniCPMForCausalLM": ("minicpm_eagle", "EagleMiniCPMForCausalLM"),
      "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
@@ -14681,6 +16294,46 @@ index 04d6de28e..4c68e7519 100644
 +                setattr(module, child_name, new_module)
 +
 +    _recursive_replace(model, prefix=prefix)
+diff --git a/vllm/parser/abstract_parser.py b/vllm/parser/abstract_parser.py
+index 46acc7fb1..d01e8e1bb 100644
+--- a/vllm/parser/abstract_parser.py
++++ b/vllm/parser/abstract_parser.py
+@@ -698,6 +698,9 @@ class DelegatingParser(Parser):
+                 delta_text = current_text
+                 delta_token_ids = current_token_ids
+ 
++            reasoning_from_this_batch = (
++                delta_message.reasoning if delta_message else None
++            )
+             delta_message, state.function_name_returned = (
+                 self._extract_tool_calls_streaming(
+                     previous_text=state.previous_text,
+@@ -712,6 +715,11 @@ class DelegatingParser(Parser):
+                     function_name_returned=state.function_name_returned,
+                 )
+             )
++            if reasoning_from_this_batch:
++                if delta_message is None:
++                    delta_message = DeltaMessage(reasoning=reasoning_from_this_batch)
++                elif not delta_message.reasoning:
++                    delta_message.reasoning = reasoning_from_this_batch
+             if (
+                 delta_message
+                 and delta_message.tool_calls
+@@ -727,6 +735,13 @@ class DelegatingParser(Parser):
+         ):
+             delta_message = DeltaMessage(content=delta_text)
+ 
++        if delta_message is not None and not getattr(
++            request, "include_reasoning", True
++        ):
++            delta_message.reasoning = None
++            if delta_message.content is None and not delta_message.tool_calls:
++                delta_message = None
++
+         state.previous_text = current_text
+         state.previous_token_ids = current_token_ids
+         return delta_message
 diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
 index bd9006f3f..46fd495c5 100644
 --- a/vllm/platforms/xpu.py
@@ -14877,33 +16530,378 @@ index bd9006f3f..46fd495c5 100644
          if new_block_size == cache_config.block_size:
              return
  
+diff --git a/vllm/reasoning/__init__.py b/vllm/reasoning/__init__.py
+index cd51f1065..8facf131d 100644
+--- a/vllm/reasoning/__init__.py
++++ b/vllm/reasoning/__init__.py
+@@ -104,6 +104,10 @@ _REASONING_PARSERS_TO_REGISTER = {
+         "olmo3_reasoning_parser",
+         "Olmo3ReasoningParser",
+     ),
++    "muse_glimmer": (
++        "muse_glimmer_reasoning_parser",
++        "MuseGlimmerReasoningParser",
++    ),
+     "qwen3": (
+         "qwen3_reasoning_parser",
+         "Qwen3ReasoningParser",
+diff --git a/vllm/reasoning/muse_glimmer_reasoning_parser.py b/vllm/reasoning/muse_glimmer_reasoning_parser.py
+new file mode 100644
+index 000000000..88c8daa04
+--- /dev/null
++++ b/vllm/reasoning/muse_glimmer_reasoning_parser.py
+@@ -0,0 +1,324 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Reasoning parser for MuseGlimmer channel-formatted responses."""
++
++from __future__ import annotations
++
++from collections.abc import Iterable, Sequence
++
++import regex as re
++
++from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
++from vllm.entrypoints.openai.engine.protocol import DeltaMessage
++from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
++from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
++
++_ASSISTANT_START = "<|start|>assistant"
++_MESSAGE = "<|message|>"
++_EOM = "<|eom|>"
++_EOT = "<|eot|>"
++_REASONING_OPEN = f"to=self{_MESSAGE}"
++_USER_OPEN = f"to=user{_MESSAGE}"
++_FUNCTION_CALLS_OPEN = "<atem:function_calls>"
++_FUNCTION_CALLS_CLOSE = "</atem:function_calls>"
++_CHANNEL_HEADER_PATTERN = (
++    rf"(?:{re.escape(_ASSISTANT_START)}[ \t]*)?"
++    rf"to=[A-Za-z_][\w.\-]*{re.escape(_MESSAGE)}"
++)
++_CHANNEL_HEADER_RE = re.compile(
++    rf"(?:{re.escape(_ASSISTANT_START)}[ \t]*)?"
++    rf"to=(?P<recipient>[A-Za-z_][\w.\-]*){re.escape(_MESSAGE)}"
++)
++
++_REASONING_RE = re.compile(
++    rf"{re.escape(_REASONING_OPEN)}"
++    rf"((?:(?!{re.escape(_EOM)})(?!{_CHANNEL_HEADER_PATTERN}).)*)"
++    rf"{re.escape(_EOM)}",
++    re.DOTALL,
++)
++_OPEN_REASONING_RE = re.compile(
++    rf"{re.escape(_REASONING_OPEN)}"
++    rf"((?:(?!{re.escape(_EOM)})(?!{_CHANNEL_HEADER_PATTERN}).)*)"
++    rf"(?={_CHANNEL_HEADER_PATTERN}|$)",
++    re.DOTALL,
++)
++_CONTENT_RE = re.compile(
++    rf"{re.escape(_USER_OPEN)}"
++    rf"(.*?)(?={re.escape(_EOT)}|{re.escape(_EOM)}|$)",
++    re.DOTALL,
++)
++_STRIP_REASONING_RE = re.compile(
++    rf"(?:{re.escape(_ASSISTANT_START)}\s*)?"
++    rf"{re.escape(_REASONING_OPEN)}"
++    rf"(?:(?!{re.escape(_EOM)})(?!{_CHANNEL_HEADER_PATTERN}).)*"
++    rf"{re.escape(_EOM)}",
++    re.DOTALL,
++)
++_STRIP_OPEN_REASONING_RE = re.compile(
++    rf"(?:{re.escape(_ASSISTANT_START)}\s*)?"
++    rf"{re.escape(_REASONING_OPEN)}"
++    rf"(?:(?!{re.escape(_EOM)})(?!{_CHANNEL_HEADER_PATTERN}).)*"
++    rf"(?={_CHANNEL_HEADER_PATTERN}|$)",
++    re.DOTALL,
++)
++_ATEM_BLOCK_RE = re.compile(
++    rf"{re.escape(_FUNCTION_CALLS_OPEN)}.*?"
++    rf"{re.escape(_FUNCTION_CALLS_CLOSE)}",
++    re.DOTALL,
++)
++_STRUCTURAL_MARKERS = (
++    _EOM,
++    _EOT,
++    "<|start|>",
++    _MESSAGE,
++    _FUNCTION_CALLS_OPEN,
++)
++_OPEN_TAIL_HEADER_RE = re.compile(r"[\s](?:t|to|to=[^\s<]*)$")
++_PARTIAL_CHANNEL_RE = re.compile(r"^[ \t]*(?:t|to(?:=(?:[A-Za-z_][\w.\-]*)?)?)$")
++
++
++def _append_responses_stop(request: ResponsesRequest) -> None:
++    stop = request.stop
++    stops = [stop] if isinstance(stop, str) else list(stop or [])
++    if _EOT not in stops:
++        request.stop = [*stops, _EOT]
++
++
++def _trim_open_body(body: str) -> str:
++    while True:
++        trimmed = body
++        for marker in _STRUCTURAL_MARKERS:
++            for overlap in range(min(len(marker) - 1, len(trimmed)), 0, -1):
++                if trimmed.endswith(marker[:overlap]):
++                    trimmed = trimmed[:-overlap]
++                    break
++            else:
++                continue
++            break
++
++        partial_header = _OPEN_TAIL_HEADER_RE.search(trimmed)
++        if partial_header is not None:
++            trimmed = trimmed[: partial_header.start()]
++
++        if trimmed == body:
++            return body
++        body = trimmed
++
++
++def _is_partial_channel(text: str) -> bool:
++    stripped = text.lstrip()
++    if _ASSISTANT_START.startswith(stripped):
++        return True
++    if stripped.startswith(_ASSISTANT_START):
++        stripped = stripped[len(_ASSISTANT_START) :].lstrip()
++
++    if not stripped or _PARTIAL_CHANNEL_RE.fullmatch(stripped):
++        return True
++
++    marker_index = stripped.find("<")
++    if marker_index < 0:
++        return False
++    recipient = stripped[:marker_index]
++    marker = stripped[marker_index:]
++    return bool(
++        re.fullmatch(r"to=[A-Za-z_][\w.\-]*", recipient) and _MESSAGE.startswith(marker)
++    )
++
++
++def _visible_body(body: str) -> str:
++    body = _ATEM_BLOCK_RE.sub("", body)
++    open_index = body.find(_FUNCTION_CALLS_OPEN)
++    return body[:open_index] if open_index >= 0 else body
++
++
++class MuseGlimmerReasoningParser(ReasoningParser):
++    """Split private ``to=self`` reasoning from the ``to=user`` answer.
++
++    Reasoning is hidden unless the chat request explicitly opts in with
++    ``include_reasoning=true``.
++    """
++
++    def __init__(self, tokenizer, *args, **kwargs) -> None:
++        super().__init__(tokenizer, *args, **kwargs)
++        self.eom_token_id = self.vocab.get(_EOM)
++        self.eot_token_id = self.vocab.get(_EOT)
++        self._reset_streaming_state()
++
++    def _reset_streaming_state(self) -> None:
++        self._emitted_reasoning = ""
++        self._emitted_content = ""
++        self._stream_reasoning_ended = False
++        self._tool_handoff_done = False
++
++    def adjust_request(
++        self,
++        request: ChatCompletionRequest | ResponsesRequest,
++    ) -> ChatCompletionRequest | ResponsesRequest:
++        if (
++            isinstance(request, ChatCompletionRequest)
++            and "include_reasoning" not in request.model_fields_set
++        ):
++            request.include_reasoning = False
++        request.skip_special_tokens = False
++
++        # <|eom|> closes an internal channel, not the assistant turn.
++        request.ignore_eos = True
++        if isinstance(request, ResponsesRequest):
++            _append_responses_stop(request)
++        elif self.eot_token_id is not None:
++            stop_token_ids = request.stop_token_ids or []
++            if self.eot_token_id not in stop_token_ids:
++                request.stop_token_ids = [*stop_token_ids, self.eot_token_id]
++        return request
++
++    def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
++        if self._stream_reasoning_ended:
++            return True
++
++        text = self.model_tokenizer.decode(input_ids)
++
++        # The generation prompt ends immediately before the model emits its
++        # to=self opener. Historical turns may already contain <|eom|>.
++        if text.rstrip().endswith(_ASSISTANT_START):
++            return False
++
++        tool_channel = self._tool_channel_remainder(text)
++        return _FUNCTION_CALLS_OPEN in tool_channel or "<atem:invoke" in tool_channel
++
++    def is_reasoning_end_streaming(
++        self,
++        input_ids: Sequence[int],
++        delta_ids: Iterable[int],
++    ) -> bool:
++        return self.is_reasoning_end([*input_ids, *delta_ids])
++
++    def extract_content_ids(self, input_ids: list[int]) -> list[int]:
++        if self.eom_token_id is None or self.eom_token_id not in input_ids:
++            return []
++        end_index = len(input_ids) - 1 - input_ids[::-1].index(self.eom_token_id)
++        return input_ids[end_index + 1 :]
++
++    def extract_reasoning(
++        self,
++        model_output: str,
++        request: ChatCompletionRequest | ResponsesRequest,
++    ) -> tuple[str | None, str | None]:
++        reasoning_parts = _REASONING_RE.findall(model_output)
++        open_match = _OPEN_REASONING_RE.search(model_output)
++        if open_match and open_match.group(1):
++            reasoning_parts.append(open_match.group(1))
++        reasoning = "\n".join(reasoning_parts) if reasoning_parts else None
++
++        remainder = _STRIP_REASONING_RE.sub("", model_output)
++        remainder = _STRIP_OPEN_REASONING_RE.sub("", remainder)
++        if "<atem:invoke" in remainder or _FUNCTION_CALLS_OPEN in remainder:
++            return reasoning, remainder or None
++
++        content_parts = _CONTENT_RE.findall(model_output)
++        if content_parts:
++            return reasoning, "".join(content_parts) or None
++        if _REASONING_OPEN in model_output:
++            return reasoning, None
++        return None, model_output or None
++
++    @staticmethod
++    def _classify_stream_parts(text: str) -> tuple[str, str]:
++        reasoning_parts: list[str] = []
++        content_parts: list[str] = []
++        position = 0
++        found_channel = False
++
++        while match := _CHANNEL_HEADER_RE.search(text, position):
++            found_channel = True
++            recipient = match.group("recipient")
++            body_start = match.end()
++            eom_index = text.find(_EOM, body_start)
++            eot_index = text.find(_EOT, body_start)
++            next_header = _CHANNEL_HEADER_RE.search(text, body_start)
++            boundaries = [index for index in (eom_index, eot_index) if index >= 0]
++            if next_header is not None:
++                boundaries.append(next_header.start())
++
++            body_end = min(boundaries) if boundaries else len(text)
++            body = text[body_start:body_end]
++            is_open = not boundaries
++            if is_open:
++                partial_start = body.find("<|start|>")
++                if partial_start >= 0:
++                    body = body[:partial_start]
++                body = _trim_open_body(body)
++
++            if recipient == "self":
++                reasoning_parts.append(body)
++            elif recipient == "user":
++                content_parts.append(_visible_body(body))
++
++            if body_end == eom_index:
++                position = body_end + len(_EOM)
++            elif body_end == eot_index:
++                position = body_end + len(_EOT)
++            elif next_header is not None:
++                position = next_header.start()
++            else:
++                break
++
++        if not found_channel and not _is_partial_channel(text):
++            content_parts.append(text)
++
++        return "".join(reasoning_parts), "".join(content_parts)
++
++    @staticmethod
++    def _tool_channel_remainder(text: str) -> str:
++        remainder = _STRIP_REASONING_RE.sub("", text)
++        remainder = _STRIP_OPEN_REASONING_RE.sub("", remainder)
++        for match in _CHANNEL_HEADER_RE.finditer(remainder):
++            if match.group("recipient") not in ("self", "user"):
++                return remainder[match.start() :]
++        return ""
++
++    def _new_stream_suffix(self, current: str, attribute: str) -> str:
++        emitted = getattr(self, attribute)
++        if not current.startswith(emitted):
++            return ""
++        delta = current[len(emitted) :]
++        setattr(self, attribute, current)
++        return delta
++
++    def extract_reasoning_streaming(
++        self,
++        previous_text: str,
++        current_text: str,
++        delta_text: str,
++        previous_token_ids: Sequence[int],
++        current_token_ids: Sequence[int],
++        delta_token_ids: Sequence[int],
++    ) -> DeltaMessage | None:
++        if not previous_text:
++            self._reset_streaming_state()
++
++        current_reasoning, current_content = self._classify_stream_parts(current_text)
++        reasoning_delta = self._new_stream_suffix(
++            current_reasoning,
++            "_emitted_reasoning",
++        )
++        content_delta = self._new_stream_suffix(
++            current_content,
++            "_emitted_content",
++        )
++
++        if not self._tool_handoff_done:
++            candidate = self._tool_channel_remainder(current_text)
++            if _FUNCTION_CALLS_OPEN in candidate or "<atem:invoke" in candidate:
++                self._tool_handoff_done = True
++                self._stream_reasoning_ended = True
++                return DeltaMessage(
++                    reasoning=reasoning_delta or None,
++                    content=candidate,
++                )
++
++        if not reasoning_delta and not content_delta:
++            return None
++        return DeltaMessage(
++            reasoning=reasoning_delta or None,
++            content=content_delta or None,
++        )
 diff --git a/vllm/tool_parsers/__init__.py b/vllm/tool_parsers/__init__.py
-index 7c5f45d20..8cac1a684 100644
+index 7c5f45d20..4df3e57ef 100644
 --- a/vllm/tool_parsers/__init__.py
 +++ b/vllm/tool_parsers/__init__.py
 @@ -182,6 +182,10 @@ _TOOL_PARSERS_TO_REGISTER = {
          "functiongemma_tool_parser",
          "FunctionGemmaToolParser",
      ),
-+    "onyx": (
-+        "onyx_tool_parser",
-+        "OnyxToolParser",
++    "muse_glimmer": (
++        "muse_glimmer_tool_parser",
++        "MuseGlimmerToolParser",
 +    ),
      "gemma4": (
          "gemma4_tool_parser",
          "Gemma4ToolParser",
-diff --git a/vllm/tool_parsers/onyx_tool_parser.py b/vllm/tool_parsers/onyx_tool_parser.py
+diff --git a/vllm/tool_parsers/muse_glimmer_tool_parser.py b/vllm/tool_parsers/muse_glimmer_tool_parser.py
 new file mode 100644
-index 000000000..1fb56f67d
+index 000000000..4e685ed49
 --- /dev/null
-+++ b/vllm/tool_parsers/onyx_tool_parser.py
-@@ -0,0 +1,353 @@
++++ b/vllm/tool_parsers/muse_glimmer_tool_parser.py
+@@ -0,0 +1,466 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""
-+Tool-call parser for the Onyx ATEM chat format.
++Tool-call parser for the MuseGlimmer ATEM chat format.
 +
-+The Onyx chat template emits assistant channels as
++The MuseGlimmer chat template emits assistant channels as
 +
 +    to=self<|message|>...<|eom|>
 +    to=user<|message|>...<|eot|>
@@ -14917,7 +16915,7 @@ index 000000000..1fb56f67d
 +from __future__ import annotations
 +
 +import json
-+from collections.abc import Sequence
++from collections.abc import Iterator, Sequence
 +from typing import Any
 +
 +import regex as re
@@ -14957,22 +16955,102 @@ index 000000000..1fb56f67d
 +    r'<atem:parameter\s+name="([^"]+)"\s*>(.*?)</atem:parameter>',
 +    re.DOTALL,
 +)
-+_CHANNEL_RE = re.compile(
++_CHANNEL_HEADER_RE = re.compile(
 +    r"(?:<\|start\|>assistant)?[ \t]*"
-+    r'(?:to=([A-Za-z_][\w.\-]*))?<\|message\|>'
-+    r"(.*?)(?=<\|eom\|>|<\|eot\|>|\Z)",
-+    re.DOTALL,
++    r"(?:to=(?P<recipient>[A-Za-z_][\w.\-]*))?<\|message\|>"
 +)
++_CHANNEL_END_RE = re.compile(r"<\|eom\|>|<\|eot\|>")
 +_BARE_CHANNEL_RE = re.compile(
 +    r"^(?:<\|start\|>assistant)?[ \t]*"
 +    r"to=([A-Za-z_][A-Za-z0-9_.\-]*)"
 +    r"(?:<\|message\|>)?(.*)$",
 +    re.DOTALL,
 +)
-+_PARTIAL_CHANNEL_RE = re.compile(
-+    r"^(?:<\|start\|>assistant)?[ \t]*to"
-+    r"(?:=(?:[A-Za-z_][\w.\-]*)?)?$"
++_PARTIAL_CHANNEL_RE = re.compile(r"^[ \t]*(?:t|to(?:=(?:[A-Za-z_][\w.\-]*)?)?)$")
++_STRUCTURAL_MARKERS = (
++    EOM_TOKEN,
++    EOT_TOKEN,
++    "<|start|>",
++    MESSAGE_TOKEN,
++    "<atem:function_calls>",
 +)
++_OPEN_TAIL_CHANNEL_RE = re.compile(r"[^\S\n]+(?:t|to|to=(?:[A-Za-z_][\w.\-]*)?)$")
++
++
++def _is_partial_channel(text: str) -> bool:
++    stripped = text.lstrip()
++    assistant_prefix = "<|start|>assistant"
++    if assistant_prefix.startswith(stripped):
++        return True
++    if stripped.startswith(assistant_prefix):
++        stripped = stripped[len(assistant_prefix) :].lstrip()
++
++    if not stripped or _PARTIAL_CHANNEL_RE.fullmatch(stripped):
++        return True
++
++    marker_index = stripped.find("<")
++    if marker_index < 0:
++        return False
++    recipient = stripped[:marker_index]
++    marker = stripped[marker_index:]
++    return bool(
++        re.fullmatch(r"to=[A-Za-z_][\w.\-]*", recipient)
++        and MESSAGE_TOKEN.startswith(marker)
++    )
++
++
++def _append_responses_stop(request: ResponsesRequest) -> None:
++    stop = request.stop
++    stops = [stop] if isinstance(stop, str) else list(stop or [])
++    if EOT_TOKEN not in stops:
++        request.stop = [*stops, EOT_TOKEN]
++
++
++def _iter_channels(text: str) -> Iterator[tuple[str | None, str, bool]]:
++    position = 0
++    while header := _CHANNEL_HEADER_RE.search(text, position):
++        body_start = header.end()
++        end = _CHANNEL_END_RE.search(text, body_start)
++        next_header = _CHANNEL_HEADER_RE.search(text, body_start)
++        body_end = end.start() if end is not None else len(text)
++        closed = end is not None
++
++        if next_header is not None and next_header.start() < body_end:
++            body_end = next_header.start()
++            closed = False
++            next_position = next_header.start()
++        else:
++            next_position = end.end() if end is not None else len(text)
++
++        body = text[body_start:body_end]
++        partial_start = body.find("<|start|>")
++        if partial_start >= 0:
++            body = body[:partial_start]
++            closed = False
++
++        yield header.group("recipient"), body, closed
++        position = next_position
++
++
++def _trim_open_body(body: str) -> str:
++    while True:
++        trimmed = body
++        for marker in _STRUCTURAL_MARKERS:
++            for overlap in range(min(len(marker) - 1, len(trimmed)), 0, -1):
++                if trimmed.endswith(marker[:overlap]):
++                    trimmed = trimmed[:-overlap]
++                    break
++            else:
++                continue
++            break
++
++        partial_channel = _OPEN_TAIL_CHANNEL_RE.search(trimmed)
++        if partial_channel is not None:
++            trimmed = trimmed[: partial_channel.start()]
++
++        if trimmed == body:
++            return body
++        body = trimmed
 +
 +
 +def _schema_types(schema: Any) -> set[str]:
@@ -15025,6 +17103,29 @@ index 000000000..1fb56f67d
 +    return {}
 +
 +
++def _registered_tool_names(tools: list[Tool]) -> set[str]:
++    names: set[str] = set()
++    for tool in tools:
++        function = getattr(tool, "function", None) or tool
++        name = getattr(function, "name", None)
++        if name is None and isinstance(function, dict):
++            name = function.get("name")
++        if name:
++            names.add(name)
++    return names
++
++
++def _normalize_tool_name(function_name: str, tools: list[Tool]) -> str:
++    registered_names = _registered_tool_names(tools)
++    if function_name in registered_names:
++        return function_name
++
++    namespace, separator, leaf = function_name.partition(".")
++    if separator and namespace == leaf and namespace in registered_names:
++        return namespace
++    return function_name
++
++
 +def _convert_parameter_value(raw_value: str, schema: Any) -> Any:
 +    types = _schema_types(schema)
 +    stripped = raw_value.strip()
@@ -15066,6 +17167,7 @@ index 000000000..1fb56f67d
 +    body: str,
 +    tools: list[Tool],
 +) -> ToolCall:
++    function_name = _normalize_tool_name(function_name, tools)
 +    parameters = _tool_parameters(tools, function_name)
 +    properties = parameters.get("properties", {})
 +    if not isinstance(properties, dict):
@@ -15089,18 +17191,23 @@ index 000000000..1fb56f67d
 +
 +def _extract_invocations(text: str, tools: list[Tool]) -> list[ToolCall]:
 +    tool_calls: list[ToolCall] = []
-+    for function_name, body in _ATEM_INVOKE_RE.findall(text):
++    tool_channels = "\n".join(
++        body
++        for recipient, body, _closed in _iter_channels(text)
++        if recipient not in (None, "self", "user")
++    )
++    for function_name, body in _ATEM_INVOKE_RE.findall(tool_channels):
 +        tool_calls.append(_parse_invoke(function_name, body, tools))
 +    return tool_calls
 +
 +
 +def _visible_content(text: str, *, strip: bool = True) -> str:
 +    """Keep only ``to=user`` content and remove ATEM/tool channels."""
-+    if _PARTIAL_CHANNEL_RE.fullmatch(text):
++    if _is_partial_channel(text):
 +        return ""
 +
-+    matches = list(_CHANNEL_RE.finditer(text))
-+    if not matches:
++    channels = list(_iter_channels(text))
++    if not channels:
 +        bare_channel = _BARE_CHANNEL_RE.fullmatch(text)
 +        if bare_channel:
 +            if bare_channel.group(1) != "user":
@@ -15111,18 +17218,22 @@ index 000000000..1fb56f67d
 +        return content.strip() if strip else content
 +
 +    parts: list[str] = []
-+    for match in matches:
-+        recipient = match.group(1) or ""
++    for recipient, body, closed in channels:
++        recipient = recipient or ""
 +        if recipient not in ("", "user"):
 +            continue
-+        parts.append(_ATEM_BLOCK_RE.sub("", match.group(2)))
++        if not closed:
++            body = _trim_open_body(body)
++        body = _ATEM_BLOCK_RE.sub("", body)
++        open_index = body.find("<atem:function_calls>")
++        parts.append(body[:open_index] if open_index >= 0 else body)
 +
 +    content = "".join(parts)
 +    return content.strip() if strip else content
 +
 +
-+class OnyxToolParser(ToolParser):
-+    """Tool-call parser for the Onyx ATEM chat template."""
++class MuseGlimmerToolParser(ToolParser):
++    """Tool-call parser for the MuseGlimmer ATEM chat template."""
 +
 +    supports_required_and_named = False
 +    adjust_request_for_tool_choice_none = True
@@ -15144,8 +17255,8 @@ index 000000000..1fb56f67d
 +        self._reset_streaming_state()
 +
 +    def _reset_streaming_state(self) -> None:
-+        self.prev_tool_call_arr = []
-+        self.streamed_args_for_tool = []
++        self.prev_tool_call_arr: list[dict] = []
++        self.streamed_args_for_tool: list[str] = []
 +        self._stream_emitted_invokes = 0
 +        self._stream_visible_text = ""
 +
@@ -15153,7 +17264,7 @@ index 000000000..1fb56f67d
 +        self,
 +        request: ChatCompletionRequest | ResponsesRequest,
 +    ) -> ChatCompletionRequest | ResponsesRequest:
-+        # ATEM and Onyx channel tokens are part of the parser protocol.
++        # ATEM and MuseGlimmer channel tokens are part of the parser protocol.
 +        # JSON guided decoding is not compatible with this format.
 +        request.skip_special_tokens = False
 +
@@ -15162,13 +17273,16 @@ index 000000000..1fb56f67d
 +        # stopping there hides the subsequent user answer or ATEM tool call.
 +        # Ignore the model EOS set and restore <|eot|> as the sole turn stop.
 +        request.ignore_eos = True
-+        eot_token_id = getattr(self, "eot_token_id", None)
-+        if eot_token_id is None:
-+            eot_token_id = self.vocab.get(EOT_TOKEN)
-+        if eot_token_id is not None:
-+            stop_token_ids = request.stop_token_ids or []
-+            if eot_token_id not in stop_token_ids:
-+                request.stop_token_ids = [*stop_token_ids, eot_token_id]
++        if isinstance(request, ResponsesRequest):
++            _append_responses_stop(request)
++        else:
++            eot_token_id = getattr(self, "eot_token_id", None)
++            if eot_token_id is None:
++                eot_token_id = self.vocab.get(EOT_TOKEN)
++            if eot_token_id is not None:
++                stop_token_ids = request.stop_token_ids or []
++                if eot_token_id not in stop_token_ids:
++                    request.stop_token_ids = [*stop_token_ids, eot_token_id]
 +
 +        return request
 +
@@ -15208,11 +17322,12 @@ index 000000000..1fb56f67d
 +        content_delta = ""
 +        if visible.startswith(self._stream_visible_text):
 +            content_delta = visible[len(self._stream_visible_text) :]
++            self._stream_visible_text = visible
 +        else:
-+            logger.warning("Onyx visible content changed unexpectedly while streaming")
-+            self._stream_visible_text = ""
-+            content_delta = visible
-+        self._stream_visible_text = visible
++            logger.warning(
++                "MuseGlimmer visible content changed unexpectedly while streaming"
++            )
++            content_delta = ""
 +
 +        if request.tool_choice == "none":
 +            return DeltaMessage(content=content_delta) if content_delta else None
@@ -15244,15 +17359,11 @@ index 000000000..1fb56f67d
 +
 +        # Ensure the streaming serving path observes the end of a tool turn
 +        # even when the final special token has no decoded text.
-+        if (
-+            not delta_text
-+            and delta_token_ids
-+            and self._stream_emitted_invokes
-+        ):
++        if not delta_text and delta_token_ids and self._stream_emitted_invokes:
 +            return DeltaMessage(content="")
 +        return None
 diff --git a/vllm/transformers_utils/config.py b/vllm/transformers_utils/config.py
-index e6c497c0b..d1fbfe0e4 100644
+index e6c497c0b..60a570686 100644
 --- a/vllm/transformers_utils/config.py
 +++ b/vllm/transformers_utils/config.py
 @@ -95,6 +95,8 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
@@ -15264,23 +17375,17 @@ index e6c497c0b..d1fbfe0e4 100644
      deepseek_v32="DeepseekV3Config",
      deepseek_v4="DeepseekV4Config",
      flex_olmo="FlexOlmoConfig",
-@@ -116,11 +118,14 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
+@@ -116,6 +118,8 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
      medusa="MedusaConfig",
      midashenglm="MiDashengLMConfig",
      moondream3="Moondream3Config",
-+    muse_glimmer="OnyxConfig",
++    muse_glimmer="MuseGlimmerConfig",
 +    muse_glimmer_assistant="MuseGlimmerAssistantConfig",
      eagle="EAGLEConfig",
      speculators="SpeculatorsConfig",
      nemotron="NemotronConfig",
-     olmo_hybrid="OlmoHybridConfig",
-     ovis="OvisConfig",
-+    onyx="OnyxConfig",
-     ultravox="UltravoxConfig",
-     step3_vl="Step3VLConfig",
-     step3_text="Step3TextConfig",
 diff --git a/vllm/transformers_utils/configs/__init__.py b/vllm/transformers_utils/configs/__init__.py
-index c3466fddd..3a942c900 100644
+index c3466fddd..81442e70e 100644
 --- a/vllm/transformers_utils/configs/__init__.py
 +++ b/vllm/transformers_utils/configs/__init__.py
 @@ -26,6 +26,9 @@ _CLASS_TO_MODULE: dict[str, str] = {
@@ -15297,7 +17402,7 @@ index c3466fddd..3a942c900 100644
      "Moondream3TextConfig": "vllm.transformers_utils.configs.moondream3",
      "Moondream3VisionConfig": "vllm.transformers_utils.configs.moondream3",
      "MoonViTConfig": "vllm.transformers_utils.configs.moonvit",
-+    "MuseGlimmerAssistantConfig": "vllm.transformers_utils.configs.onyx",
++    "MuseGlimmerAssistantConfig": "vllm.transformers_utils.configs.muse_glimmer",
      "KimiLinearConfig": "vllm.transformers_utils.configs.kimi_linear",
      "KimiVLConfig": "vllm.transformers_utils.configs.kimi_vl",
      "KimiK25Config": "vllm.transformers_utils.configs.kimi_k25",
@@ -15305,7 +17410,7 @@ index c3466fddd..3a942c900 100644
      "NemotronHConfig": "vllm.transformers_utils.configs.nemotron_h",
      "OlmoHybridConfig": "vllm.transformers_utils.configs.olmo_hybrid",
      "OvisConfig": "vllm.transformers_utils.configs.ovis",
-+    "OnyxConfig": "vllm.transformers_utils.configs.onyx",
++    "MuseGlimmerConfig": "vllm.transformers_utils.configs.muse_glimmer",
      "PixelShuffleSiglip2VisionConfig": "vllm.transformers_utils.configs.isaac",
      "RadioConfig": "vllm.transformers_utils.configs.radio",
      "SpeculatorsConfig": "vllm.transformers_utils.configs.speculators",
@@ -15331,7 +17436,7 @@ index c3466fddd..3a942c900 100644
      "NemotronHConfig",
      "OlmoHybridConfig",
      "OvisConfig",
-+    "OnyxConfig",
++    "MuseGlimmerConfig",
      "PixelShuffleSiglip2VisionConfig",
      "RadioConfig",
      "SpeculatorsConfig",
@@ -15710,17 +17815,17 @@ index 000000000..c8cb21ace
 +
 +
 +__all__ = ["Gemma4UnifiedAudioConfig", "Gemma4UnifiedConfig", "Gemma4UnifiedTextConfig", "Gemma4UnifiedVisionConfig"]
-diff --git a/vllm/transformers_utils/configs/onyx.py b/vllm/transformers_utils/configs/onyx.py
+diff --git a/vllm/transformers_utils/configs/muse_glimmer.py b/vllm/transformers_utils/configs/muse_glimmer.py
 new file mode 100644
-index 000000000..16ddc7eb9
+index 000000000..981965266
 --- /dev/null
-+++ b/vllm/transformers_utils/configs/onyx.py
++++ b/vllm/transformers_utils/configs/muse_glimmer.py
 @@ -0,0 +1,305 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-+# Vendored OnyxConfig for vLLM registration.
-+# Copied verbatim from day0_model/hf/configuration_onyx.py (container transformers=5.8.0
-+# does not recognise model_type="onyx"), then trimmed unused fields left as-is.
++# Vendored MuseGlimmerConfig for vLLM registration.
++# Copied verbatim from day0_model/hf/configuration_muse_glimmer.py (container transformers=5.8.0
++# does not recognise model_type="muse_glimmer"), then trimmed unused fields left as-is.
 +from __future__ import annotations
 +
 +import math
@@ -15728,8 +17833,8 @@ index 000000000..16ddc7eb9
 +from transformers import PretrainedConfig
 +
 +
-+class OnyxConfig(PretrainedConfig):
-+    model_type = "onyx"
++class MuseGlimmerConfig(PretrainedConfig):
++    model_type = "muse_glimmer"
 +
 +    def __init__(
 +        self,
@@ -19236,7 +21341,7 @@ index db74044f4..0a0040af5 100644
                  f"Attention metadata for layer {layer_name} does not have"
                  " non-causal support, which is required for DFlash."
 diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
-index cc113025c..9389f9549 100644
+index cc113025c..b00ddb649 100644
 --- a/vllm/v1/spec_decode/llm_base_proposer.py
 +++ b/vllm/v1/spec_decode/llm_base_proposer.py
 @@ -130,6 +130,8 @@ class SpecDecodeBaseProposer:
@@ -19394,7 +21499,7 @@ index cc113025c..9389f9549 100644
                  self.model.config.image_token_index = (
                      target_model.config.media_placeholder_token_id
                  )
-+            elif self.get_model_name(target_model) == "OnyxForConditionalGeneration":
++            elif self.get_model_name(target_model) == "MuseGlimmerForConditionalGeneration":
 +                self.model.config.image_token_index = target_model.config.patch_token_id
              else:
                  self.model.config.image_token_index = (
