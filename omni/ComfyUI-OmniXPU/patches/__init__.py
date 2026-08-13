@@ -58,6 +58,13 @@ COMPONENTS = (
         "adapters/int8_ffn.py",
     ),
     Component(
+        "dynamic_vram_boundary_trim",
+        "dynamic_vram_boundary_trim",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/dynamic_vram.py",
+    ),
+    Component(
         "lora_memory_budget",
         "lora_memory",
         "adapter",

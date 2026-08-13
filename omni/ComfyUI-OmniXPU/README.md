@@ -46,8 +46,14 @@ OMNIXPU_ATTENTION=0         # Disable the attention adapter
 OMNIXPU_NORM=0              # Disable the norm adapter
 OMNIXPU_FP8_GEMM=0          # Disable the temporary FP8 model/factory adapter
 OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
+OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM=0  # Disable Windows XPU model-boundary trim
 OMNIXPU_LORA_MEMORY=0       # Disable cached whole-LoRA budgets and staging logs
 ```
+
+On Windows XPU, the boundary trim turns an unmet DynamicVRAM minimum-memory
+budget into an explicit partial VBAR reclaim before model loading. It preserves
+loaded models and is enabled by default; the environment variable above is the
+A/B-test escape hatch.
 
 Validated sub-routes can be disabled independently:
 

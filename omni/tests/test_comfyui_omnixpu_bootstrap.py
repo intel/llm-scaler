@@ -55,6 +55,15 @@ def test_lora_memory_budget_is_registered_as_an_adapter(monkeypatch):
     assert components["lora_memory_budget"]["kind"] == "adapter"
 
 
+def test_dynamic_vram_trim_runs_inside_lora_budget_wrapper(monkeypatch):
+    patches = _load_registry(monkeypatch)
+    names = [entry["name"] for entry in patches.get_components()]
+
+    assert names.index("dynamic_vram_boundary_trim") < names.index(
+        "lora_memory_budget"
+    )
+
+
 def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     for name in (
         "OMNIXPU_ENABLE",
@@ -63,6 +72,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
         "OMNIXPU_NORM",
         "OMNIXPU_FP8_GEMM",
         "OMNIXPU_INT8_FFN",
+        "OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM",
         "OMNIXPU_LORA_MEMORY",
         "OMNIXPU_INTERPOLATE_FIX",
         "OMNIXPU_MEDIAN_FIX",
@@ -75,6 +85,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     assert config.norm
     assert config.fp8_gemm
     assert config.int8_ffn
+    assert config.dynamic_vram_boundary_trim
     assert config.lora_memory
     assert not config.interpolate_fix
     assert not config.median_fix
@@ -91,6 +102,7 @@ def test_disabled_components_are_reported_without_importing_modules(monkeypatch)
         norm=False,
         fp8_gemm=False,
         int8_ffn=False,
+        dynamic_vram_boundary_trim=False,
         lora_memory=False,
         interpolate_fix=False,
         median_fix=False,
