@@ -17,6 +17,10 @@
 template<int N>
 SYCL_ESIMD_FUNCTION simd<sycl::half, N> fp8e4m3_to_half(simd<uint8_t, N> raw);
 
+SYCL_ESIMD_FUNCTION inline simd<sycl::half, 256>
+fp8g_load_wtile_native(const uint8_t* base, uint32_t N_total,
+                       uint32_t K_total, uint32_t k0, uint32_t n0);
+
 // Fast E4M3→half: uint16 bit-twiddle for normals + correct subnormal handling.
 // e4m3 bias=7, fp16 bias=15 → exp_fp16 = exp_e4m3 + 8. mant 3b → fp16 mant top.
 // Subnormal (e==0): value = mant * 2^-9 (representable as normal fp16).
@@ -136,6 +140,109 @@ struct MoeDownDecode {
         float w = (float)routing_weights[route];
         float ds = down_scale[eid];
         output[(size_t)route*hidden + h] = fp16(s * w * ds);
+    }
+};
+
+// Native XPU weights are K-major: gate_up [E, hidden, 2*inter] and
+// down [E, inter, hidden]. One work-item computes 16 output channels for one
+// route. DPAS operates on an 8-row tile; decode fills row 0 and leaves the
+// remaining rows zero.
+struct MoeUpDecodeGeluTanhNative {
+    const fp16*    x;
+    const uint8_t* gate_up_weight;
+    const float*   gate_up_scale;
+    const int*     selected_experts;
+    fp16*          intermediates;
+    int hidden, inter, top_k;
+
+    void operator()(sycl::nd_item<2> item) const SYCL_ESIMD_KERNEL {
+        using namespace sycl::ext::intel::esimd;
+        using namespace sycl::ext::intel::esimd::xmx;
+        const int route = (int)item.get_global_id(0);
+        const int n0 = (int)item.get_global_id(1) * 16;
+        if (n0 >= inter) return;
+
+        const int eid = selected_experts[route];
+        const int two_inter = 2 * inter;
+        const uint8_t* wbase = gate_up_weight
+            + (size_t)eid * hidden * two_inter;
+        const fp16 scale = fp16(gate_up_scale[eid]);
+        simd<fp16, 128> gate_acc(fp16(0));
+        simd<fp16, 128> up_acc(fp16(0));
+
+        for (int k = 0; k < hidden; k += 16) {
+            simd<fp16, 128> input_tile(fp16(0));
+            input_tile.template select<16, 1>(0) =
+                block_load<fp16, 16>(x + k);
+            simd<fp16, 256> gate_tile = fp8g_load_wtile_native(
+                wbase, two_inter, hidden, k, n0);
+            simd<fp16, 256> up_tile = fp8g_load_wtile_native(
+                wbase, two_inter, hidden, k, inter + n0);
+            gate_acc = dpas<8, 8, fp16, fp16, fp16, fp16>(
+                gate_acc, gate_tile * scale, input_tile);
+            up_acc = dpas<8, 8, fp16, fp16, fp16, fp16>(
+                up_acc, up_tile * scale, input_tile);
+        }
+
+        simd<float, 16> gate =
+            simd<float, 16>(gate_acc.template select<16, 1>(0));
+        simd<float, 16> up =
+            simd<float, 16>(up_acc.template select<16, 1>(0));
+        constexpr float c0 = 0.7978845608f;
+        constexpr float c1 = 0.044715f;
+        simd<float, 16> inner = c0 * (gate + c1 * gate * gate * gate);
+        inner = min<float, 16>(
+            max<float, 16>(inner, simd<float, 16>(-30.0f)),
+            simd<float, 16>(30.0f));
+        simd<float, 16> e2 =
+            sycl::ext::intel::esimd::exp<float, 16>(2.0f * inner);
+        simd<float, 16> gelu = 0.5f * gate
+            * (1.0f + (e2 - 1.0f) / (e2 + 1.0f));
+        block_store<fp16, 16>(
+            intermediates + (size_t)route * inter + n0,
+            convert<fp16>(gelu * up));
+    }
+};
+
+struct MoeDownDecodeNative {
+    const fp16*    intermediates;
+    const uint8_t* down_weight;
+    const float*   down_scale;
+    const fp16*    routing_weights;
+    const int*     selected_experts;
+    fp16*          output;
+    int hidden, inter, top_k;
+
+    void operator()(sycl::nd_item<2> item) const SYCL_ESIMD_KERNEL {
+        using namespace sycl::ext::intel::esimd;
+        using namespace sycl::ext::intel::esimd::xmx;
+        const int route = (int)item.get_global_id(0);
+        const int n0 = (int)item.get_global_id(1) * 16;
+        if (n0 >= hidden) return;
+
+        const int eid = selected_experts[route];
+        const uint8_t* wbase = down_weight
+            + (size_t)eid * inter * hidden;
+        const fp16* input = intermediates + (size_t)route * inter;
+        const fp16 scale = fp16(down_scale[eid]);
+        simd<fp16, 128> acc(fp16(0));
+
+        for (int k = 0; k < inter; k += 16) {
+            simd<fp16, 128> input_tile(fp16(0));
+            input_tile.template select<16, 1>(0) =
+                block_load<fp16, 16>(input + k);
+            simd<fp16, 256> weight_tile = fp8g_load_wtile_native(
+                wbase, hidden, inter, k, n0);
+            acc = dpas<8, 8, fp16, fp16, fp16, fp16>(
+                acc, weight_tile * scale, input_tile);
+        }
+
+        simd<float, 16> row =
+            simd<float, 16>(acc.template select<16, 1>(0));
+        row *= (float)routing_weights[route];
+        block_store<fp16, 16>(
+            output + (size_t)route * hidden + n0,
+            convert<fp16>(row));
     }
 };
 
