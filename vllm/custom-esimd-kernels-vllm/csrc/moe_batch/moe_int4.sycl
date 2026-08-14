@@ -3829,8 +3829,8 @@ void moe_tiny_m_down_cutlass_int4_grouped_kernel(
 
 // ── gemma int4 decode: 内部 topk(fp32-internal) + per_expert_scale fold +
 // gelu_tanh up + down(+routing weight & accumulate). M==1 (decode). ──
-// w13_qweight_s4 [E, 2*inter, hidden/2] uint8, w13_scales [E, 2*inter, hidden/group] fp16
-// w2_qweight_s4  [E, hidden, inter/2] uint8,   w2_scales  [E, hidden, inter/group] fp16
+// w13_qweight_s4 [E, 2*inter, hidden/2] uint8, w13_scales [E, 2*inter, hidden/up_group] fp16
+// w2_qweight_s4  [E, hidden, inter/2] uint8,   w2_scales  [E, hidden, inter/down_group] fp16
 // per_expert_scale [E] float32. logits [n_tokens, E] fp16.
 torch::Tensor moe_forward_gelu_tanh_int4_decode(
     torch::Tensor x, torch::Tensor logits,
@@ -3860,10 +3860,9 @@ torch::Tensor moe_forward_gelu_tanh_int4_decode(
                 intermediate_size % w2_scales.size(2) == 0);
     const int up_group_size = hidden_size / w13_scales.size(2);
     const int down_group_size = intermediate_size / w2_scales.size(2);
-    TORCH_CHECK(up_group_size == down_group_size &&
-                up_group_size > 0 && (up_group_size & 1) == 0,
-                "Gemma INT4 MoE requires the same even group size for up/down");
-    const int group_size = up_group_size;
+    TORCH_CHECK(up_group_size > 0 && (up_group_size & 1) == 0 &&
+                down_group_size > 0 && (down_group_size & 1) == 0,
+                "Gemma INT4 MoE requires even up/down group sizes");
     sycl::queue& q = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
 
     // internal topk (fp32-internal softmax+top8+norm) — same v2 kernel as fp8 path
@@ -3900,7 +3899,7 @@ torch::Tensor moe_forward_gelu_tanh_int4_decode(
         (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
         (const fp16*)w13_scales.data_ptr(), topk_idx.data_ptr<int>(),
         (fp16*)intermediates.data_ptr(), n_tokens, (int)top_k, hidden_size,
-        intermediate_size, group_size, x.device());
+        intermediate_size, up_group_size, x.device());
 
     // down (the runtime group size is derived from the scale tensor)
     int hidden_out = w2_qweight_s4.size(1);
@@ -3910,7 +3909,7 @@ torch::Tensor moe_forward_gelu_tanh_int4_decode(
         (const fp16*)intermediates.data_ptr(), (const uint8_t*)w2_qweight_s4.data_ptr(),
         (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
         topk_idx.data_ptr<int32_t>(), (fp16*)output.data_ptr(),
-        n_tokens, (int)top_k, hidden_out, intermediate_size, group_size,
+        n_tokens, (int)top_k, hidden_out, intermediate_size, down_group_size,
         x.device());
     return output;
 }
