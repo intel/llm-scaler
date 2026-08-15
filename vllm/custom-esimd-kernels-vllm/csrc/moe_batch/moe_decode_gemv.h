@@ -12,10 +12,17 @@
 // ============================================================================
 #pragma once
 #include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+
+namespace xesimd = sycl::ext::intel::experimental::esimd;
+namespace esimd_math = sycl::ext::intel::esimd;
 
 // Forward decl: defined in moe.sycl above the include point's use site.
 template<int N>
 SYCL_ESIMD_FUNCTION simd<sycl::half, N> fp8e4m3_to_half(simd<uint8_t, N> raw);
+
+SYCL_ESIMD_FUNCTION simd<sycl::half, 256>
+fp8e4m3_block_to_vnni(simd<uint8_t, 256> raw);
 
 SYCL_ESIMD_FUNCTION inline simd<sycl::half, 256>
 fp8g_load_wtile_native(const uint8_t* base, uint32_t N_total,
@@ -243,6 +250,149 @@ struct MoeDownDecodeNative {
         block_store<fp16, 16>(
             output + (size_t)route * hidden + n0,
             convert<fp16>(row));
+    }
+};
+
+// Native-layout decode variant using a 16-thread K reduction. The serial
+// native kernel above performs the same number of DPAS operations per route,
+// but one work-item walks the entire hidden/intermediate dimension. Matching
+// the routed native kernel's local geometry exposes K parallelism and avoids
+// the transposed dword load/repack in fp8g_load_wtile_native.
+struct MoeUpDecodeGeluTanhNativeGrouped {
+    const fp16*    x;
+    const uint8_t* gate_up_weight;
+    const float*   gate_up_scale;
+    const int*     selected_experts;
+    fp16*          intermediates;
+    int hidden, inter, top_k;
+
+    void operator()(sycl::nd_item<2> item) const SYCL_ESIMD_KERNEL {
+        using namespace sycl::ext::intel::esimd;
+        using namespace sycl::ext::intel::esimd::xmx;
+        constexpr int GS = 16;
+        slm_init<GS * 32 * sizeof(float)>();
+
+        const int route = (int)item.get_group(0);
+        const int n_tile = (int)item.get_group(1);
+        const int tid = (int)item.get_local_id(1);
+        const int n0 = n_tile * 16;
+        if (n0 >= inter) return;
+
+        const int eid = selected_experts[route];
+        const int two_inter = 2 * inter;
+        const uint8_t* base = gate_up_weight
+            + (size_t)eid * hidden * two_inter;
+        const int up_n0 = inter + n0;
+        simd<float, 16> gate_acc(0.f), up_acc(0.f);
+
+        for (int k = 16 * tid; k < hidden; k += 16 * GS) {
+            simd<fp16, 16> a_tile = block_load<fp16, 16>(x + k);
+
+            xesimd::config_2d_mem_access<uint8_t, 16, 16, 1> gate_pay(
+                base, (uint32_t)two_inter - 1u, (uint32_t)hidden - 1u,
+                (uint32_t)two_inter - 1u, (uint32_t)n0, (uint32_t)k);
+            auto gate_raw = xesimd::lsc_load_2d<uint8_t, 16, 16, 1,
+                false, false, xesimd::cache_hint::cached,
+                xesimd::cache_hint::cached>(gate_pay);
+            gate_acc = dpas<8, 1, float, float, fp16, fp16>(
+                gate_acc, fp8e4m3_block_to_vnni(gate_raw), a_tile);
+
+            xesimd::config_2d_mem_access<uint8_t, 16, 16, 1> up_pay(
+                base, (uint32_t)two_inter - 1u, (uint32_t)hidden - 1u,
+                (uint32_t)two_inter - 1u, (uint32_t)up_n0, (uint32_t)k);
+            auto up_raw = xesimd::lsc_load_2d<uint8_t, 16, 16, 1,
+                false, false, xesimd::cache_hint::cached,
+                xesimd::cache_hint::cached>(up_pay);
+            up_acc = dpas<8, 1, float, float, fp16, fp16>(
+                up_acc, fp8e4m3_block_to_vnni(up_raw), a_tile);
+        }
+
+        const uint32_t slm_off = (uint32_t)(tid * 32) * 4u;
+        slm_block_store<float, 16>(slm_off, gate_acc);
+        slm_block_store<float, 16>(slm_off + 64u, up_acc);
+        barrier();
+
+        if (tid == 0) {
+            simd<float, 16> gate(0.f), up(0.f);
+            #pragma unroll
+            for (int i = 0; i < GS; i++) {
+                gate += slm_block_load<float, 16>((uint32_t)(i * 128));
+                up += slm_block_load<float, 16>((uint32_t)(i * 128 + 64));
+            }
+
+            const float scale = gate_up_scale[eid];
+            gate *= scale;
+            up *= scale;
+            constexpr float c0 = 0.7978845608f;
+            constexpr float c1 = 0.044715f;
+            simd<float, 16> inner = c0 * (gate + c1 * gate * gate * gate);
+            simd<float, 16> two_z = 2.0f * inner;
+            two_z.merge(simd<float, 16>(30.0f), two_z > 30.0f);
+            two_z.merge(simd<float, 16>(-30.0f), two_z < -30.0f);
+            simd<float, 16> exp2z = esimd_math::exp<float, 16>(two_z);
+            simd<float, 16> tanh_v = (exp2z - 1.0f) / (exp2z + 1.0f);
+            simd<float, 16> result = 0.5f * gate * (1.0f + tanh_v) * up;
+            block_store<fp16, 16>(
+                intermediates + (size_t)route * inter + n0,
+                convert<fp16>(result));
+        }
+    }
+};
+
+struct MoeDownDecodeNativeGrouped {
+    const fp16*    intermediates;
+    const uint8_t* down_weight;
+    const float*   down_scale;
+    const fp16*    routing_weights;
+    const int*     selected_experts;
+    fp16*          output;
+    int hidden, inter, top_k;
+
+    void operator()(sycl::nd_item<2> item) const SYCL_ESIMD_KERNEL {
+        using namespace sycl::ext::intel::esimd;
+        using namespace sycl::ext::intel::esimd::xmx;
+        constexpr int GS = 16;
+        slm_init<GS * 32 * sizeof(float)>();
+
+        const int route = (int)item.get_group(0);
+        const int n_tile = (int)item.get_group(1);
+        const int tid = (int)item.get_local_id(1);
+        const int n0 = n_tile * 16;
+        if (n0 >= hidden) return;
+
+        const int eid = selected_experts[route];
+        const uint8_t* base = down_weight
+            + (size_t)eid * inter * hidden;
+        const fp16* input = intermediates + (size_t)route * inter;
+        simd<float, 16> acc(0.f);
+
+        for (int k = 16 * tid; k < inter; k += 16 * GS) {
+            simd<fp16, 16> a_tile = block_load<fp16, 16>(input + k);
+            xesimd::config_2d_mem_access<uint8_t, 16, 16, 1> pay(
+                base, (uint32_t)hidden - 1u, (uint32_t)inter - 1u,
+                (uint32_t)hidden - 1u, (uint32_t)n0, (uint32_t)k);
+            auto raw = xesimd::lsc_load_2d<uint8_t, 16, 16, 1,
+                false, false, xesimd::cache_hint::cached,
+                xesimd::cache_hint::cached>(pay);
+            acc = dpas<8, 1, float, float, fp16, fp16>(
+                acc, fp8e4m3_block_to_vnni(raw), a_tile);
+        }
+
+        const uint32_t slm_off = (uint32_t)(tid * 16) * 4u;
+        slm_block_store<float, 16>(slm_off, acc);
+        barrier();
+
+        if (tid == 0) {
+            simd<float, 16> row(0.f);
+            #pragma unroll
+            for (int i = 0; i < GS; i++) {
+                row += slm_block_load<float, 16>((uint32_t)(i * 64));
+            }
+            row *= (float)routing_weights[route] * down_scale[eid];
+            block_store<fp16, 16>(
+                output + (size_t)route * hidden + n0,
+                convert<fp16>(row));
+        }
     }
 };
 

@@ -80,13 +80,80 @@ fp8g_load_wtile_native(const uint8_t* base, uint32_t N_total,
     return b_vnni_u16.template bit_cast_view<fp16>().read();
 }
 
-template <bool NATIVE_LAYOUT>
+SYCL_ESIMD_FUNCTION inline simd<fp16, 256>
+fp8g_load_wtile_native_packed(const uint8_t* base, uint32_t N_total,
+                              uint32_t K_total, uint32_t k0, uint32_t n0) {
+    xesimd::config_2d_mem_access<uint32_t, 4, 16, 1> pay(
+        reinterpret_cast<const uint32_t*>(base),
+        N_total - 1u, K_total - 1u, N_total - 1u,
+        n0 / 4u, k0);
+    auto raw_t = xesimd::lsc_load_2d<uint32_t, 4, 16, 1, true, false,
+        xesimd::cache_hint::cached, xesimd::cache_hint::cached>(pay);
+
+    // Keep the low-K path's small conversion footprint, but write the VNNI
+    // pairs with strided SIMD selects instead of extracting 128 scalar lanes.
+    simd<uint16_t, 256> b_vnni_u16;
+    #pragma unroll
+    for (int ng = 0; ng < 4; ng++) {
+        simd<uint32_t, 16> k_rows = raw_t.template select<16, 1>(ng * 16);
+        #pragma unroll
+        for (int n = 0; n < 4; n++) {
+            simd<uint8_t, 16> raw_k = convert<uint8_t>(
+                (k_rows >> (8 * n)) & 0xFF);
+            simd<fp16, 16> w = fp8e4m3_to_half<16>(raw_k);
+            simd<uint16_t, 16> w_u16 =
+                w.template bit_cast_view<uint16_t>().read();
+            const int n_global = ng * 4 + n;
+            b_vnni_u16.template select<8, 32>(2 * n_global) =
+                w_u16.template select<8, 2>(0);
+            b_vnni_u16.template select<8, 32>(2 * n_global + 1) =
+                w_u16.template select<8, 2>(1);
+        }
+    }
+    return b_vnni_u16.template bit_cast_view<fp16>().read();
+}
+
+SYCL_ESIMD_FUNCTION inline simd<fp16, 256>
+fp8g_load_wtile_native_fast(const uint8_t* base, uint32_t N_total,
+                            uint32_t K_total, uint32_t k0, uint32_t n0) {
+    xesimd::config_2d_mem_access<uint32_t, 4, 16, 1> pay(
+        reinterpret_cast<const uint32_t*>(base),
+        N_total - 1u, K_total - 1u, N_total - 1u,
+        n0 / 4u, k0);
+    auto raw_t = xesimd::lsc_load_2d<uint32_t, 4, 16, 1, true, false,
+        xesimd::cache_hint::cached, xesimd::cache_hint::cached>(pay);
+
+    // The transposed load is laid out as four-byte N groups for each K row.
+    // Deinterleave those groups with SIMD selects, then reuse the vectorized
+    // canonical FP8 conversion and VNNI pack instead of doing 128 scalar
+    // element extractions and stores.
+    simd<uint8_t, 256> raw_bytes =
+        raw_t.template bit_cast_view<uint8_t>().read();
+    simd<uint8_t, 256> raw_nk;
+    #pragma unroll
+    for (int ng = 0; ng < 4; ng++) {
+        #pragma unroll
+        for (int n = 0; n < 4; n++) {
+            const int n_global = ng * 4 + n;
+            raw_nk.template select<16, 1>(n_global * 16) =
+                raw_bytes.template select<16, 4>(ng * 64 + n);
+        }
+    }
+    return fp8e4m3_block_to_vnni_nk(raw_nk);
+}
+
+template <bool NATIVE_LAYOUT, bool FAST_NATIVE>
 SYCL_ESIMD_FUNCTION inline simd<fp16, 256>
 fp8g_load_wtile_layout(const uint8_t* base, uint32_t K_total,
                        uint32_t n_rows_total, uint32_t k0, uint32_t n0) {
     if constexpr (NATIVE_LAYOUT) {
-        return fp8g_load_wtile_native(
-            base, n_rows_total, K_total, k0, n0);
+        if constexpr (FAST_NATIVE) {
+            return fp8g_load_wtile_native_fast(
+                base, n_rows_total, K_total, k0, n0);
+        } else {
+            return fp8g_load_wtile_native_packed(
+                base, n_rows_total, K_total, k0, n0);
+        }
     } else {
         return fp8g_load_wtile(
             base, K_total, n_rows_total, k0, n0);
@@ -223,10 +290,12 @@ void moe_up_fp8_grouped_gelu_tanh_kernel(
                     for (int g = 0; g < MG; g++) { g_acc[g] = fp16(0); u_acc[g] = fp16(0); }
 
                     for (int k = 0; k < hidden_size; k += 16) {
-                        simd<fp16, 256> bg = fp8g_load_wtile_layout<NATIVE_LAYOUT>(
+                        simd<fp16, 256> bg =
+                            fp8g_load_wtile_layout<NATIVE_LAYOUT, true>(
                             wbase, (uint32_t)hidden_size,
                             (uint32_t)(2 * intermediate_size), (uint32_t)k, (uint32_t)ng);
-                        simd<fp16, 256> bu = fp8g_load_wtile_layout<NATIVE_LAYOUT>(
+                        simd<fp16, 256> bu =
+                            fp8g_load_wtile_layout<NATIVE_LAYOUT, true>(
                             wbase, (uint32_t)hidden_size,
                             (uint32_t)(2 * intermediate_size), (uint32_t)k, (uint32_t)nu);
                         // Fold per-tensor scale pre-DPAS (fp16-accum overflow
@@ -349,7 +418,8 @@ void moe_down_fp8_grouped_kernel(
                     for (int g = 0; g < MGD; g++) acc[g] = fp16(0);
 
                     for (int k = 0; k < intermediate_size; k += 16) {
-                        simd<fp16, 256> bd = fp8g_load_wtile_layout<NATIVE_LAYOUT>(
+                        simd<fp16, 256> bd =
+                            fp8g_load_wtile_layout<NATIVE_LAYOUT, false>(
                             wbase, (uint32_t)intermediate_size,
                             (uint32_t)hidden_size, (uint32_t)k, (uint32_t)ng);
                         // Fold per-tensor down_scale pre-DPAS (fp16-accum overflow

@@ -2283,29 +2283,59 @@ torch::Tensor moe_forward_full_gelu_tanh_decode_native(
     const int* idx_ptr = sg_topk_idx.data_ptr<int>();
     const fp16* route_weight =
         (const fp16*)sg_topk_weight.data_ptr();
-    q.submit([&](sycl::handler& h){
-        h.parallel_for(sycl::nd_range<2>(
-            sycl::range<2>(top_k, intermediate_size / 16),
-            sycl::range<2>(1, 1)), MoeUpDecodeGeluTanhNative{
-                (const fp16*)x.data_ptr(),
-                (const uint8_t*)gate_up_weight.data_ptr(),
-                gate_up_scale.data_ptr<float>(),
-                idx_ptr,
-                (fp16*)sg_intermediates.data_ptr(),
-                hidden_size, intermediate_size, (int)top_k});
-    });
-    q.submit([&](sycl::handler& h){
-        h.parallel_for(sycl::nd_range<2>(
-            sycl::range<2>(top_k, hidden_size / 16),
-            sycl::range<2>(1, 1)), MoeDownDecodeNative{
-                (const fp16*)sg_intermediates.data_ptr(),
-                (const uint8_t*)down_weight.data_ptr(),
-                down_scale.data_ptr<float>(),
-                route_weight,
-                idx_ptr,
-                (fp16*)sg_routed_output.data_ptr(),
-                hidden_size, intermediate_size, (int)top_k});
-    });
+    const char* disable_grouped =
+        std::getenv("DISABLE_GEMMA4_NATIVE_MOE_GROUPED");
+    const bool use_grouped_native =
+        disable_grouped == nullptr || disable_grouped[0] != '1';
+    if (use_grouped_native) {
+        q.submit([&](sycl::handler& h){
+            h.parallel_for(sycl::nd_range<2>(
+                sycl::range<2>(top_k, intermediate_size),
+                sycl::range<2>(1, 16)), MoeUpDecodeGeluTanhNativeGrouped{
+                    (const fp16*)x.data_ptr(),
+                    (const uint8_t*)gate_up_weight.data_ptr(),
+                    gate_up_scale.data_ptr<float>(),
+                    idx_ptr,
+                    (fp16*)sg_intermediates.data_ptr(),
+                    hidden_size, intermediate_size, (int)top_k});
+        });
+        q.submit([&](sycl::handler& h){
+            h.parallel_for(sycl::nd_range<2>(
+                sycl::range<2>(top_k, hidden_size),
+                sycl::range<2>(1, 16)), MoeDownDecodeNativeGrouped{
+                    (const fp16*)sg_intermediates.data_ptr(),
+                    (const uint8_t*)down_weight.data_ptr(),
+                    down_scale.data_ptr<float>(),
+                    route_weight,
+                    idx_ptr,
+                    (fp16*)sg_routed_output.data_ptr(),
+                    hidden_size, intermediate_size, (int)top_k});
+        });
+    } else {
+        q.submit([&](sycl::handler& h){
+            h.parallel_for(sycl::nd_range<2>(
+                sycl::range<2>(top_k, intermediate_size / 16),
+                sycl::range<2>(1, 1)), MoeUpDecodeGeluTanhNative{
+                    (const fp16*)x.data_ptr(),
+                    (const uint8_t*)gate_up_weight.data_ptr(),
+                    gate_up_scale.data_ptr<float>(),
+                    idx_ptr,
+                    (fp16*)sg_intermediates.data_ptr(),
+                    hidden_size, intermediate_size, (int)top_k});
+        });
+        q.submit([&](sycl::handler& h){
+            h.parallel_for(sycl::nd_range<2>(
+                sycl::range<2>(top_k, hidden_size / 16),
+                sycl::range<2>(1, 1)), MoeDownDecodeNative{
+                    (const fp16*)sg_intermediates.data_ptr(),
+                    (const uint8_t*)down_weight.data_ptr(),
+                    down_scale.data_ptr<float>(),
+                    route_weight,
+                    idx_ptr,
+                    (fp16*)sg_routed_output.data_ptr(),
+                    hidden_size, intermediate_size, (int)top_k});
+        });
+    }
 
     auto& final_out = sg_take_final_output();
     moe_accumulate_kernel(
