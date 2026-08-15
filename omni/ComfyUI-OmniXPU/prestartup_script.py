@@ -1,15 +1,18 @@
-"""Apply opt-in XPU allocator policy before ComfyUI imports torch."""
+"""Apply the Windows XPU allocator policy before ComfyUI imports torch."""
 
 from __future__ import annotations
 
 import logging
 import math
 import os
+import sys
 from typing import NoReturn
 
 
 _ENV_NAME = "OMNIXPU_XPU_MEMORY_FRACTION"
 _MASTER_ENV_NAME = "OMNIXPU_ENABLE"
+_DEFAULT_WINDOWS_FRACTION = 0.99
+_DISABLED_VALUES = frozenset(("0", "disable", "disabled", "false", "no", "off"))
 _LOG = logging.getLogger("ComfyUI-OmniXPU")
 
 
@@ -28,12 +31,21 @@ def _parse_fraction(raw_value: str) -> float:
     return fraction
 
 
-def apply_xpu_memory_fraction_from_env() -> float | None:
-    """Apply the requested caching-allocator fraction, if explicitly set."""
-
+def _requested_fraction() -> tuple[float, str] | None:
     raw_value = os.environ.get(_ENV_NAME)
-    if raw_value is None or not raw_value.strip():
-        return None
+    if raw_value is not None:
+        value = raw_value.strip()
+        if not value or value.lower() in _DISABLED_VALUES:
+            return None
+        return _parse_fraction(value), "environment"
+
+    if sys.platform == "win32":
+        return _DEFAULT_WINDOWS_FRACTION, "Windows default"
+    return None
+
+
+def apply_xpu_memory_fraction() -> float | None:
+    """Apply the caching-allocator fraction selected for this platform."""
 
     if os.environ.get(_MASTER_ENV_NAME, "1") == "0":
         _LOG.info(
@@ -42,7 +54,10 @@ def apply_xpu_memory_fraction_from_env() -> float | None:
         )
         return None
 
-    fraction = _parse_fraction(raw_value.strip())
+    requested = _requested_fraction()
+    if requested is None:
+        return None
+    fraction, source = requested
 
     try:
         import torch
@@ -55,7 +70,7 @@ def apply_xpu_memory_fraction_from_env() -> float | None:
     except Exception as exc:
         _fail(f"could not query torch.xpu availability: {exc}")
     if not available:
-        _fail("was set, but torch.xpu is unavailable")
+        _fail("torch.xpu is unavailable")
 
     setter = getattr(xpu, "set_per_process_memory_fraction", None)
     if not callable(setter):
@@ -70,11 +85,12 @@ def apply_xpu_memory_fraction_from_env() -> float | None:
 
     _LOG.info(
         "[OmniXPU] XPU allocator memory fraction applied during prestartup: "
-        "requested=%.12g actual=%.12g",
+        "requested=%.12g actual=%.12g source=%s",
         fraction,
         actual,
+        source,
     )
     return actual
 
 
-apply_xpu_memory_fraction_from_env()
+apply_xpu_memory_fraction()

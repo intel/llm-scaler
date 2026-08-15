@@ -48,20 +48,7 @@ OMNIXPU_FP8_GEMM=0          # Disable the temporary FP8 model/factory adapter
 OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
 OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM=0  # Disable Windows XPU model-boundary trim
 OMNIXPU_LORA_MEMORY=0       # Disable cached whole-LoRA budgets and staging logs
-OMNIXPU_XPU_MEMORY_FRACTION=0.99  # Optional PyTorch XPU allocator cap
 ```
-
-`OMNIXPU_XPU_MEMORY_FRACTION` is unset by default. When set, the custom
-node's prestartup script validates a finite value in `(0, 1]`, imports Torch,
-and calls `torch.xpu.set_per_process_memory_fraction()` before ComfyUI imports
-Torch itself. The applied value is read back into the startup log. Invalid
-values, an unavailable XPU, or an unsupported PyTorch build fail startup rather
-than silently running without the requested cap. `OMNIXPU_ENABLE=0` disables
-this prestartup policy together with the rest of the custom node. ComfyUI will
-emit its generic early-Torch-import warning because this policy intentionally
-imports Torch during custom-node prestartup. The fraction only limits the
-PyTorch XPU caching allocator; it is not a WDDM process-memory or AIMDO VBAR
-mapping limit.
 
 On Windows XPU, the boundary trim turns an unmet DynamicVRAM minimum-memory
 budget into an explicit partial VBAR reclaim before model loading. It preserves
