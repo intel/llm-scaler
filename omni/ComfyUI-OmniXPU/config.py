@@ -15,6 +15,13 @@ class Config:
         self.norm = master and os.environ.get("OMNIXPU_NORM", "1") != "0"
         self.fp8_gemm = master and os.environ.get("OMNIXPU_FP8_GEMM", "1") != "0"
         self.int8_ffn = master and os.environ.get("OMNIXPU_INT8_FFN", "1") != "0"
+        self.lora_memory = (
+            master and os.environ.get("OMNIXPU_LORA_MEMORY", "1") != "0"
+        )
+        self.dynamic_vram_boundary_trim = (
+            master
+            and os.environ.get("OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM", "1") != "0"
+        )
         self.interpolate_fix = (
             master and os.environ.get("OMNIXPU_INTERPOLATE_FIX", "0") != "0"
         )
