@@ -1,4 +1,5 @@
 FROM qwen36-b70-vllm:b3-maxperf-final-v7
+# Base: Intel XPU vLLM fork. Kernel fix source: https://github.com/rmacy/vllm (main branch)
 COPY qwen3_dflash.py /opt/venv/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_dflash.py
 COPY dflash.py /opt/venv/lib/python3.12/site-packages/vllm/v1/spec_decode/dflash.py
 COPY utils.py /opt/venv/lib/python3.12/site-packages/vllm/v1/spec_decode/utils.py
