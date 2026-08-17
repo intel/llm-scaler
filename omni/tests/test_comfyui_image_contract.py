@@ -54,7 +54,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_KITCHEN_COMMIT": (
         "KITCHEN_COMMIT",
-        "575741da0edd9a6e34cbf7f0b29b20b9f4df9e34",
+        "82b6537698a87e33d9fa07eac809b7733d5c5ce6",
     ),
     "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.28"),
     "COMFY_AIMDO_REPOSITORY": (
