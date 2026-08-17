@@ -19,7 +19,9 @@ No workflow or model-pipeline replacement is required.
 | Kitchen XPU backend | INT8/QTensor operations, FP8 QDQ and stochastic rounding, SVDQuant, AdaLN, four RoPE APIs, and ConvRot |
 | ComfyUI adapter | Attention routing, LayerNorm/RMSNorm class integration, the remaining FP8 model/factory bridge, and fused Lumina/Z-Image INT8 FFN wiring |
 | Memory adapter | Cached whole-LoRA model budgets plus optional DynamicVRAM per-layer XPU staging measurements |
-| Compatibility patch | Guarded SeedVR2 Ada embedding reshape; skipped once upstream provides the explicit layout |
+| SeedVR2 capacity | Guarded Ada broadcast plus byte-bounded RMSNorm, SwiGLU, and window-attention materialization |
+| SeedVR2 native adapters | Validated BMG FP16 GroupNorm and causal-prefix cat-pad routing |
+| Large-video preprocessing | Source-guarded, bounded CPU materialization for PIL Lanczos resize, SeedVR input padding, and XPU VAE input staging |
 | Legacy fix | Global `F.interpolate` and `torch.median`/`torch.nanmedian` workarounds; disabled by default |
 
 RoPE, generic INT8 linear dispatch, and the old FP8 negative-zero wrapper are
@@ -50,6 +52,9 @@ OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
 OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM=0  # Disable Windows XPU model-boundary trim
 OMNIXPU_LORA_MEMORY=0       # Disable cached whole-LoRA budgets and staging logs
 OMNIXPU_SEEDVR_ADA_RESHAPE=0  # Disable the guarded SeedVR2 Ada reshape patch
+OMNIXPU_SEEDVR_CAPACITY=0     # Disable bounded SeedVR2 activation scheduling
+OMNIXPU_SEEDVR_CAT_PAD=0      # Disable validated BMG causal-prefix cat-pad routing
+OMNIXPU_LARGE_VIDEO_PREPROCESS=0  # Disable bounded large-video CPU preprocessing
 ```
 
 On Windows XPU, the boundary trim turns an unmet DynamicVRAM minimum-memory
@@ -64,6 +69,7 @@ OMNI_ATTN_BACKEND=auto      # auto, cute, esimd, or torch; Windows defaults to t
 OMNIXPU_NONCONTIG_RMSNORM=0
 OMNIXPU_H120_RMSNORM=0
 OMNIXPU_KREA2_RMSNORM=0
+OMNIXPU_SEEDVR_GROUPNORM=0
 ```
 
 For diagnostics, the per-call CUTE output scan can be enabled explicitly. It

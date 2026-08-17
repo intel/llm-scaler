@@ -1,7 +1,7 @@
-"""Apply the explicit SeedVR2 Ada embedding reshape at runtime.
+"""Bound SeedVR2 Ada modulation and apply its explicit embedding reshape.
 
 The patch is intentionally source guarded.  It changes only the known
-upstream reshape expression and declines to patch an unknown implementation.
+upstream expressions and declines to patch an unknown implementation.
 """
 
 import functools
@@ -14,6 +14,47 @@ _LEGACY_RESHAPE = (
 _EXPLICIT_RESHAPE = (
     "emb.reshape(emb.shape[0], self.dim, -1, 3)"
 )
+_LEGACY_REPEAT = """    if hid_len is not None:
+        emb = cache(
+            f"emb_repeat_{idx}_{branch_tag}",
+            lambda: torch.repeat_interleave(emb, hid_len, dim=0),
+        )
+
+"""
+_LEGACY_IN = """    if mode == "in":
+        shiftB = comfy.ops.cast_to_input(shiftB, hid)
+        scaleB = comfy.ops.cast_to_input(scaleB, hid)
+        return hid.mul_(scaleA + scaleB).add_(shiftA + shiftB)
+"""
+_BOUNDED_IN = """    if mode == "in":
+        shiftB = comfy.ops.cast_to_input(shiftB, hid)
+        scaleB = comfy.ops.cast_to_input(scaleB, hid)
+        if hid_len is not None and emb.shape[0] > 1:
+            offset = 0
+            for length, shift, scale in zip(hid_len.tolist(), shiftA, scaleA):
+                hid[offset:offset + length].mul_(scale + scaleB).add_(shift + shiftB)
+                offset += length
+            return hid
+        return hid.mul_(scaleA + scaleB).add_(shiftA + shiftB)
+"""
+_LEGACY_OUT = """    if mode == "out":
+        if gateB is not None:
+            gateB = comfy.ops.cast_to_input(gateB, hid)
+            return hid.mul_(gateA + gateB)
+        else:
+            return hid.mul_(gateA)
+"""
+_BOUNDED_OUT = """    if mode == "out":
+        if gateB is not None:
+            gateB = comfy.ops.cast_to_input(gateB, hid)
+        if hid_len is not None and emb.shape[0] > 1:
+            offset = 0
+            for length, gate in zip(hid_len.tolist(), gateA):
+                hid[offset:offset + length].mul_(gate if gateB is None else gate + gateB)
+                offset += length
+            return hid
+        return hid.mul_(gateA if gateB is None else gateA + gateB)
+"""
 _PATCH_MARKER = "_omnixpu_seedvr_ada_reshape_patched"
 
 
@@ -27,12 +68,23 @@ def _rewrite_forward(forward):
     except (OSError, TypeError) as exc:
         return None, f"AdaSingle.forward source unavailable: {exc}"
 
-    if _EXPLICIT_RESHAPE in source:
-        return None, "upstream Ada reshape is already explicit"
-    if source.count(_LEGACY_RESHAPE) != 1:
+    reshape_changed = source.count(_LEGACY_RESHAPE) == 1
+    if reshape_changed:
+        source = source.replace(_LEGACY_RESHAPE, _EXPLICIT_RESHAPE)
+    elif source.count(_EXPLICIT_RESHAPE) != 1:
         return None, "unsupported AdaSingle.forward reshape contract"
 
-    source = source.replace(_LEGACY_RESHAPE, _EXPLICIT_RESHAPE)
+    if _LEGACY_REPEAT in source:
+        if source.count(_LEGACY_IN) != 1 or source.count(_LEGACY_OUT) != 1:
+            return None, "unsupported AdaSingle.forward modulation contract"
+        source = source.replace(_LEGACY_REPEAT, "")
+        source = source.replace(_LEGACY_IN, _BOUNDED_IN)
+        source = source.replace(_LEGACY_OUT, _BOUNDED_OUT)
+    elif "torch.repeat_interleave(emb, hid_len, dim=0)" in source:
+        return None, "unsupported AdaSingle.forward repeat contract"
+    elif _EXPLICIT_RESHAPE in source and not reshape_changed:
+        return None, "upstream Ada reshape and broadcast are already bounded"
+
     namespace = {}
     filename = inspect.getsourcefile(forward) or "<seedvr_ada.py>"
     exec(  # noqa: S102 - exact, source-guarded upstream function rewrite

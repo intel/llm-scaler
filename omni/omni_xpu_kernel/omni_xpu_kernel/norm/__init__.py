@@ -35,6 +35,13 @@ def supports_group_norm_bmg() -> bool:
     return bool(getattr(_get_native(), "__group_norm_bmg__", False))
 
 
+def supports_group_norm_seedvr_bmg() -> bool:
+    """Return whether the native binary contains the SeedVR BMG route."""
+    return bool(
+        getattr(_get_native(), "__group_norm_seedvr_bmg__", False)
+    )
+
+
 def group_norm_bmg(
     input: torch.Tensor,
     num_groups: int,
@@ -49,6 +56,19 @@ def group_norm_bmg(
     ``eps=1e-6``. Callers must retain their normal fallback for other inputs.
     """
     return _get_native().group_norm_bmg(
+        input, num_groups, weight, bias, eps
+    )
+
+
+def group_norm_seedvr_bmg(
+    input: torch.Tensor,
+    num_groups: int,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Run validated SeedVR2 temporal-interleaved FP16 GroupNorm contracts."""
+    return _get_native().group_norm_seedvr_bmg(
         input, num_groups, weight, bias, eps
     )
 
@@ -211,6 +231,7 @@ def fused_rms_adaln(
 
 __all__ = [
     "group_norm_bmg",
+    "group_norm_seedvr_bmg",
     "rms_norm",
     "rms_norm_gate_residual",
     "layer_norm",
@@ -219,4 +240,5 @@ __all__ = [
     "fused_adaln",
     "fused_rms_adaln",
     "supports_group_norm_bmg",
+    "supports_group_norm_seedvr_bmg",
 ]

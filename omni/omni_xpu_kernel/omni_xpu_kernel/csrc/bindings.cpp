@@ -17,6 +17,12 @@
 #include "utils.h"
 
 namespace omni_xpu {
+namespace layout {
+#if defined(OMNI_XPU_ARCH_BMG)
+    torch::Tensor cat_pad_bmg(
+        torch::Tensor prefix, torch::Tensor input, int64_t spatial_pad);
+#endif
+}
 namespace gguf {
     torch::Tensor dequantize_q4_0(const torch::Tensor& input, torch::ScalarType dtype);
     torch::Tensor dequantize_q4_1(const torch::Tensor& input, torch::ScalarType dtype);
@@ -32,6 +38,9 @@ namespace norm {
     torch::Tensor rms_norm(torch::Tensor weight, torch::Tensor input, double eps);
 #if defined(OMNI_XPU_ARCH_BMG)
     torch::Tensor group_norm_bmg(
+        torch::Tensor input, int64_t groups, torch::Tensor weight,
+        torch::Tensor bias, double eps);
+    torch::Tensor group_norm_seedvr_bmg(
         torch::Tensor input, int64_t groups, torch::Tensor weight,
         torch::Tensor bias, double eps);
 #endif
@@ -269,6 +278,19 @@ PYBIND11_MODULE(_C, m) {
             return result;
         },
         py::arg("index") = 0);
+
+    auto layout = m.def_submodule(
+        "layout", "Validated layout and materialization fusions");
+#if defined(OMNI_XPU_ARCH_BMG)
+    layout.attr("__cat_pad_bmg__") = true;
+    layout.def(
+        "cat_pad_bmg",
+        &omni_xpu::layout::cat_pad_bmg,
+        "BMG temporal-prefix concatenation and symmetric spatial zero-pad",
+        py::arg("prefix"), py::arg("input"), py::arg("spatial_pad") = 1);
+#else
+    layout.attr("__cat_pad_bmg__") = false;
+#endif
     
     // GGUF Dequantization
     auto gguf = m.def_submodule("gguf", "GGUF dequantization kernels");
@@ -316,14 +338,22 @@ PYBIND11_MODULE(_C, m) {
 
 #if defined(OMNI_XPU_ARCH_BMG)
     norm.attr("__group_norm_bmg__") = true;
+    norm.attr("__group_norm_seedvr_bmg__") = true;
     norm.def(
         "group_norm_bmg",
         &omni_xpu::norm::group_norm_bmg,
         "BMG GroupNorm for validated Boogu Image Turbo activation shapes",
         py::arg("input"), py::arg("groups"), py::arg("weight"),
         py::arg("bias"), py::arg("eps") = 1e-6);
+    norm.def(
+        "group_norm_seedvr_bmg",
+        &omni_xpu::norm::group_norm_seedvr_bmg,
+        "BMG GroupNorm for validated SeedVR2 temporal-interleaved activations",
+        py::arg("input"), py::arg("groups"), py::arg("weight"),
+        py::arg("bias"), py::arg("eps") = 1e-6);
 #else
     norm.attr("__group_norm_bmg__") = false;
+    norm.attr("__group_norm_seedvr_bmg__") = false;
 #endif
 
 #if defined(OMNI_XPU_ARCH_PTL_H)

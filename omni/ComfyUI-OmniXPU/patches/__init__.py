@@ -79,6 +79,27 @@ COMPONENTS = (
         "fixes/seedvr_ada.py",
     ),
     Component(
+        "seedvr_capacity_adapter",
+        "seedvr_capacity",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/seedvr_capacity.py",
+    ),
+    Component(
+        "seedvr_cat_pad_adapter",
+        "seedvr_cat_pad",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/seedvr_cat_pad.py",
+    ),
+    Component(
+        "large_video_preprocess_adapter",
+        "large_video_preprocess",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/large_video_preprocess.py",
+    ),
+    Component(
         "legacy_interpolate_fix",
         "interpolate_fix",
         "legacy_fix",

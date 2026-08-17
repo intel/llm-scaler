@@ -10,6 +10,7 @@ Optimised SYCL/ESIMD kernels for Intel GPUs:
 * **sdp** — Standalone scaled dot-product attention
 * **linear** — FP8 GEMM (oneDNN W8A16, E4M3/E5M2)
 * **int8** — INT8 quantization, GEMM, and linear (oneDNN s8 matmul + ESIMD fusion)
+* **layout** — Validated layout and materialization fusions
 
 Usage::
 
@@ -158,6 +159,7 @@ from . import linear
 from . import int8
 from . import fp8
 from . import device
+from . import layout
 
 # cute FMHA (CUTLASS-SYCL) is required by default at build time. Import remains
 # defensive for explicit core-only/Windows builds and older installed wheels.
@@ -176,6 +178,7 @@ __all__ = [
     "int8",
     "fp8",
     "device",
+    "layout",
     "cute",
     "core_aot_target",
     "is_available",
@@ -201,6 +204,7 @@ def native_capabilities() -> dict[str, tuple[str, ...]]:
         "sdp",
         "linear",
         "int8",
+        "layout",
     )
     return {
         name: tuple(sorted(item for item in dir(getattr(native, name)) if not item.startswith("_")))
