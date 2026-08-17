@@ -18,6 +18,10 @@ class Config:
         self.lora_memory = (
             master and os.environ.get("OMNIXPU_LORA_MEMORY", "1") != "0"
         )
+        self.seedvr_ada_reshape = (
+            master
+            and os.environ.get("OMNIXPU_SEEDVR_ADA_RESHAPE", "1") != "0"
+        )
         self.dynamic_vram_boundary_trim = (
             master
             and os.environ.get("OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM", "1") != "0"

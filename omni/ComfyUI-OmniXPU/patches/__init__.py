@@ -72,6 +72,13 @@ COMPONENTS = (
         "adapters/lora_memory.py",
     ),
     Component(
+        "seedvr_ada_reshape_patch",
+        "seedvr_ada_reshape",
+        "compatibility_patch",
+        "upstream_pending",
+        "fixes/seedvr_ada.py",
+    ),
+    Component(
         "legacy_interpolate_fix",
         "interpolate_fix",
         "legacy_fix",

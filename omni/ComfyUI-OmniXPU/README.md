@@ -19,6 +19,7 @@ No workflow or model-pipeline replacement is required.
 | Kitchen XPU backend | INT8/QTensor operations, FP8 QDQ and stochastic rounding, SVDQuant, AdaLN, four RoPE APIs, and ConvRot |
 | ComfyUI adapter | Attention routing, LayerNorm/RMSNorm class integration, the remaining FP8 model/factory bridge, and fused Lumina/Z-Image INT8 FFN wiring |
 | Memory adapter | Cached whole-LoRA model budgets plus optional DynamicVRAM per-layer XPU staging measurements |
+| Compatibility patch | Guarded SeedVR2 Ada embedding reshape; skipped once upstream provides the explicit layout |
 | Legacy fix | Global `F.interpolate` and `torch.median`/`torch.nanmedian` workarounds; disabled by default |
 
 RoPE, generic INT8 linear dispatch, and the old FP8 negative-zero wrapper are
@@ -48,6 +49,7 @@ OMNIXPU_FP8_GEMM=0          # Disable the temporary FP8 model/factory adapter
 OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
 OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM=0  # Disable Windows XPU model-boundary trim
 OMNIXPU_LORA_MEMORY=0       # Disable cached whole-LoRA budgets and staging logs
+OMNIXPU_SEEDVR_ADA_RESHAPE=0  # Disable the guarded SeedVR2 Ada reshape patch
 ```
 
 On Windows XPU, the boundary trim turns an unmet DynamicVRAM minimum-memory
@@ -114,7 +116,8 @@ OMNIXPU_LORA_MEMORY_TRACE=1 python main.py
 Set tracing variables before startup. The **OmniXPU Status** node reports:
 
 - GPU and `omni_xpu_kernel` capabilities;
-- each component's kind (`adapter` or `legacy_fix`) and apply status;
+- each component's kind (`adapter`, `compatibility_patch`, or `legacy_fix`)
+  and apply status;
 - attention and fused INT8 FFN routing counters.
 
 Kitchen backend ownership can be inspected independently:
