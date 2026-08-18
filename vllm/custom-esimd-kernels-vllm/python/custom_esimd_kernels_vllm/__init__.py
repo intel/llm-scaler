@@ -67,6 +67,7 @@ from custom_esimd_kernels_vllm.ops import (
     # Eagle ops
     eagle_gdn,
     eagle_page_attn_decode,
+    eagle_page_attn_decode_separate,
     # MoE Batch ops
     moe_router_forward,
     moe_batch_topk,

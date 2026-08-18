@@ -938,6 +938,8 @@ def eagle_page_attn_decode(
     out: torch.Tensor,
     max_query_len: int,
     max_seq_len: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
 ) -> None:
     """Eagle paged attention decode.
 
@@ -949,7 +951,30 @@ def eagle_page_attn_decode(
     """
     return _eagle_ops.page_attn_decode(
         query, kv_cache, block_table, seq_lens, out,
-        max_query_len, max_seq_len)
+        max_query_len, max_seq_len, k_scale, v_scale)
+
+
+def eagle_page_attn_decode_separate(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor,
+    max_query_len: int,
+    max_seq_len: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> None:
+    """Eagle paged attention for v0.26's separate K/V cache views.
+
+    key_cache and value_cache are [num_blocks, page_size, num_kv_heads,
+    head_dim] views into the packed vLLM cache.  The kernel consumes their
+    strides directly, so this path does not materialize a reordered cache.
+    """
+    return _eagle_ops.page_attn_decode_separate(
+        query, key_cache, value_cache, block_table, seq_lens, out,
+        max_query_len, max_seq_len, k_scale, v_scale)
 
 
 # ---- MoE Batch Ops (Router, TopK, Up/Down, Accumulate) ----

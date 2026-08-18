@@ -9,6 +9,8 @@
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
 
 #include <array>
+#include <unordered_map>
+#include <vector>
 
 #include "moe_topk.h"
 #include "moe_decode_gemv.h"
@@ -1976,9 +1978,9 @@ static void ensure_moe_buffers_v2(int n_tokens, int top_k, int num_shared_expert
 }
 
 // ========== gemma4: moe_forward_full_gelu_tanh (no shared expert) ==========
-// Scratch buffers (topk + intermediates + routed_output) are reused every
-// call — a single pair is fine because the next call overwrites them only
-// after the previous call's accumulate has consumed them.
+// Scratch buffers are reused only within the same stream and shape. Keeping
+// separate sets avoids retiring storage that an earlier asynchronous launch
+// still uses when callers alternate shapes or streams.
 //
 // The final output is different: callers (e.g. vllm Gemma4MoE.forward)
 // hold the returned tensor across the rest of the layer's compute (residual
@@ -1986,13 +1988,22 @@ static void ensure_moe_buffers_v2(int n_tokens, int top_k, int num_shared_expert
 // next call. Use a small ring of output buffers and rotate per call so each
 // returned tensor stays valid until at least SG_FINAL_RING-1 further calls
 // have happened — enough that the consuming work has finished by then.
-static thread_local torch::Tensor sg_topk_idx, sg_topk_weight;
-static thread_local torch::Tensor sg_intermediates, sg_routed_output;
-static thread_local int sg_cached_ntokens = -1;
-
 static constexpr int SG_FINAL_RING = 4;
-static thread_local torch::Tensor sg_final_outputs[SG_FINAL_RING];
-static thread_local int sg_final_ring_idx = 0;
+
+struct Gemma4MoeBuffers {
+    torch::Tensor topk_idx, topk_weight;
+    torch::Tensor intermediates, routed_output;
+    std::array<torch::Tensor, SG_FINAL_RING> final_outputs;
+    int final_ring_idx = 0;
+    int cached_ntokens = -1;
+    int cached_topk = -1;
+    int cached_hidden = -1;
+    int cached_intermediate = -1;
+};
+
+static thread_local std::unordered_map<
+    c10::xpu::XPUStream, std::vector<Gemma4MoeBuffers>>
+    sg_buffers_by_stream;
 
 static bool moe_kernel_debug_enabled() {
     static const bool enabled = [] {
@@ -2018,27 +2029,83 @@ static void moe_kernel_debug_check(
     std::fflush(stderr);
 }
 
-static void ensure_gemma4_moe_buffers(int n_tokens, int top_k,
+static Gemma4MoeBuffers& ensure_gemma4_moe_buffers(int n_tokens, int top_k,
     int hidden_size, int intermediate_size, const torch::Device& dev) {
+    auto stream = c10::xpu::getCurrentXPUStream(dev.index());
+    auto& stream_buffers = sg_buffers_by_stream[stream];
+    for (auto& buffers : stream_buffers) {
+        if (buffers.cached_ntokens >= n_tokens
+            && buffers.cached_topk == top_k
+            && buffers.cached_hidden == hidden_size
+            && buffers.cached_intermediate == intermediate_size) {
+            return buffers;
+        }
+    }
+
+    auto& buffers = stream_buffers.emplace_back();
     int rows_per_token = top_k;
-    if (sg_cached_ntokens >= n_tokens) return;
-    sg_topk_idx = torch::empty({n_tokens, top_k}, torch::device(dev).dtype(torch::kInt32));
-    sg_topk_weight = torch::empty({n_tokens, top_k}, torch::device(dev).dtype(torch::kHalf));
-    sg_intermediates = torch::empty({n_tokens * rows_per_token, intermediate_size},
+    buffers.topk_idx = torch::empty(
+        {n_tokens, top_k}, torch::device(dev).dtype(torch::kInt32));
+    buffers.topk_weight = torch::empty(
+        {n_tokens, top_k}, torch::device(dev).dtype(torch::kHalf));
+    buffers.intermediates = torch::empty(
+        {n_tokens * rows_per_token, intermediate_size},
         torch::device(dev).dtype(torch::kHalf));
-    sg_routed_output = torch::empty({n_tokens * rows_per_token, hidden_size},
+    buffers.routed_output = torch::empty(
+        {n_tokens * rows_per_token, hidden_size},
         torch::device(dev).dtype(torch::kHalf));
     for (int i = 0; i < SG_FINAL_RING; i++) {
-        sg_final_outputs[i] = torch::empty({n_tokens, hidden_size},
+        buffers.final_outputs[i] = torch::empty({n_tokens, hidden_size},
             torch::device(dev).dtype(torch::kHalf));
     }
-    sg_cached_ntokens = n_tokens;
+    buffers.final_ring_idx = 0;
+    buffers.cached_ntokens = n_tokens;
+    buffers.cached_topk = top_k;
+    buffers.cached_hidden = hidden_size;
+    buffers.cached_intermediate = intermediate_size;
+    return buffers;
 }
 
-static torch::Tensor& sg_take_final_output() {
-    auto& t = sg_final_outputs[sg_final_ring_idx];
-    sg_final_ring_idx = (sg_final_ring_idx + 1) % SG_FINAL_RING;
+static torch::Tensor& sg_take_final_output(Gemma4MoeBuffers& buffers) {
+    auto& t = buffers.final_outputs[buffers.final_ring_idx];
+    buffers.final_ring_idx =
+        (buffers.final_ring_idx + 1) % SG_FINAL_RING;
     return t;
+}
+
+static void dispatch_moe_up_decode(
+    sycl::queue& q, const fp16* x, const uint8_t* gate_up_weight,
+    const float* gate_up_scale, const int* selected_experts,
+    fp16* intermediates, int hidden_size, int intermediate_size,
+    int top_k) {
+    TORCH_CHECK(hidden_size % 32 == 0,
+                "decode hidden_size must be a multiple of 32");
+    auto kernel = MoeUpDecodeGeluTanh<256>{
+        x, gate_up_weight, gate_up_scale, selected_experts, intermediates,
+        hidden_size, intermediate_size, top_k, /*fp8_mode=*/0};
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<2>(
+            sycl::range<2>(top_k, intermediate_size),
+            sycl::range<2>(1, 1)), kernel);
+    });
+}
+
+static void dispatch_moe_down_decode(
+    sycl::queue& q, const fp16* intermediates, const uint8_t* down_weight,
+    const float* down_scale, const fp16* routing_weights,
+    const int* selected_experts, fp16* output, int hidden_size,
+    int intermediate_size, int top_k) {
+    TORCH_CHECK(intermediate_size % 32 == 0,
+                "decode intermediate_size must be a multiple of 32");
+    auto kernel = MoeDownDecode<256>{
+        intermediates, down_weight, down_scale, routing_weights,
+        selected_experts, output, hidden_size, intermediate_size, top_k,
+        /*fp8_mode=*/0};
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<2>(
+            sycl::range<2>(top_k, hidden_size),
+            sycl::range<2>(1, 1)), kernel);
+    });
 }
 
 torch::Tensor moe_forward_full_gelu_tanh(
@@ -2052,7 +2119,12 @@ torch::Tensor moe_forward_full_gelu_tanh(
     int intermediate_size = gate_up_weight.size(1) / 2;
     int rows_per_token = top_k;
 
-    ensure_gemma4_moe_buffers(n_tokens, top_k, hidden_size, intermediate_size, x.device());
+    auto& buffers = ensure_gemma4_moe_buffers(
+        n_tokens, top_k, hidden_size, intermediate_size, x.device());
+    auto& sg_topk_idx = buffers.topk_idx;
+    auto& sg_topk_weight = buffers.topk_weight;
+    auto& sg_intermediates = buffers.intermediates;
+    auto& sg_routed_output = buffers.routed_output;
 
     // TopK
     dispatch_moe_topk_forward<class MoeTopKGemma4>(
@@ -2081,7 +2153,7 @@ torch::Tensor moe_forward_full_gelu_tanh(
         top_k, rows_per_token, x.device());
 
     // Accumulate (sum over top_k experts per token)
-    auto& final_out = sg_take_final_output();
+    auto& final_out = sg_take_final_output(buffers);
     moe_accumulate_kernel(
         (const fp16*)sg_routed_output.data_ptr(),
         (fp16*)final_out.data_ptr(),
@@ -2107,7 +2179,10 @@ torch::Tensor moe_forward_full_gelu_tanh_routed_decode(
     int hidden_size = x.size(1);
     int intermediate_size = gate_up_weight.size(1) / 2;
     int rows_per_token = top_k;
-    ensure_gemma4_moe_buffers(1, top_k, hidden_size, intermediate_size, x.device());
+    auto& buffers = ensure_gemma4_moe_buffers(
+        1, top_k, hidden_size, intermediate_size, x.device());
+    auto& sg_intermediates = buffers.intermediates;
+    auto& sg_routed_output = buffers.routed_output;
 
     const int* idx_ptr = topk_indices.data_ptr<int>();
     const fp16* w_ptr  = (const fp16*)topk_weights.data_ptr();
@@ -2115,47 +2190,21 @@ torch::Tensor moe_forward_full_gelu_tanh_routed_decode(
     // moe_kernel_debug_check("routed_decode_input", x);
     // moe_kernel_debug_check("routed_decode_topk_weights", topk_weights);
 
-    // ---- Up + gelu_tanh: K = hidden_size ----
-    // gemma: hidden=2816 → VL=256 divides cleanly (tail 0).
-    {
-        const int VL = 256;
-        const int n_routes = top_k;
-        auto k = MoeUpDecodeGeluTanh<VL, 0>{
-            (const fp16*)x.data_ptr(),
-            (const uint8_t*)gate_up_weight.data_ptr(),
-            gate_up_scale.data_ptr<float>(),
-            idx_ptr,
-            (fp16*)sg_intermediates.data_ptr(),
-            hidden_size, intermediate_size, (int)top_k, /*fp8_mode=*/0};
-        q.submit([&](sycl::handler& h){
-            h.parallel_for(sycl::nd_range<2>(
-                sycl::range<2>(n_routes, intermediate_size),
-                sycl::range<2>(1, 1)), k);
-        });
-    }
+    dispatch_moe_up_decode(
+        q, (const fp16*)x.data_ptr(),
+        (const uint8_t*)gate_up_weight.data_ptr(),
+        gate_up_scale.data_ptr<float>(), idx_ptr,
+        (fp16*)sg_intermediates.data_ptr(),
+        hidden_size, intermediate_size, (int)top_k);
     // moe_kernel_debug_check("routed_decode_up_gelu", sg_intermediates);
-    // ---- Down: K = intermediate_size ----
-    // gemma per-card inter=1056 = 256*4 + 32 → VL=256 big chunks + 32 tail.
-    {
-        const int VL = 256;
-        const int VL_TAIL = 32;
-        const int n_routes = top_k;
-        auto k = MoeDownDecode<VL, VL_TAIL>{
-            (const fp16*)sg_intermediates.data_ptr(),
-            (const uint8_t*)down_weight.data_ptr(),
-            down_scale.data_ptr<float>(),
-            w_ptr, idx_ptr,
-            (fp16*)sg_routed_output.data_ptr(),
-            hidden_size, intermediate_size, (int)top_k, /*fp8_mode=*/0};
-        q.submit([&](sycl::handler& h){
-            h.parallel_for(sycl::nd_range<2>(
-                sycl::range<2>(n_routes, hidden_size),
-                sycl::range<2>(1, 1)), k);
-        });
-    }
+    dispatch_moe_down_decode(
+        q, (const fp16*)sg_intermediates.data_ptr(),
+        (const uint8_t*)down_weight.data_ptr(), down_scale.data_ptr<float>(),
+        w_ptr, idx_ptr, (fp16*)sg_routed_output.data_ptr(),
+        hidden_size, intermediate_size, (int)top_k);
     // moe_kernel_debug_check("routed_decode_down", sg_routed_output);
     // ---- Accumulate over top_k ----
-    auto& final_out = sg_take_final_output();
+    auto& final_out = sg_take_final_output(buffers);
     moe_accumulate_kernel(
         (const fp16*)sg_routed_output.data_ptr(),
         (fp16*)final_out.data_ptr(),
@@ -2180,7 +2229,12 @@ torch::Tensor moe_forward_full_gelu_tanh_decode(
     int hidden_size = x.size(1);
     int intermediate_size = gate_up_weight.size(1) / 2;
     int rows_per_token = top_k;
-    ensure_gemma4_moe_buffers(1, top_k, hidden_size, intermediate_size, x.device());
+    auto& buffers = ensure_gemma4_moe_buffers(
+        1, top_k, hidden_size, intermediate_size, x.device());
+    auto& sg_topk_idx = buffers.topk_idx;
+    auto& sg_topk_weight = buffers.topk_weight;
+    auto& sg_intermediates = buffers.intermediates;
+    auto& sg_routed_output = buffers.routed_output;
     sycl::queue& q = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
 
     // ---- TopK (fp32-internal production kernel, norm=true) ----
@@ -2203,36 +2257,128 @@ torch::Tensor moe_forward_full_gelu_tanh_decode(
     const int* idx_ptr = sg_topk_idx.data_ptr<int>();
     const fp16* w_ptr  = (const fp16*)sg_topk_weight.data_ptr();
 
-    // ---- Up + gelu_tanh (1D-load GEMV) ----
-    {
-        const int VL = 256;
-        auto k = MoeUpDecodeGeluTanh<VL, 0>{
-            (const fp16*)x.data_ptr(),
-            (const uint8_t*)gate_up_weight.data_ptr(), gate_up_scale.data_ptr<float>(),
-            idx_ptr, (fp16*)sg_intermediates.data_ptr(),
-            hidden_size, intermediate_size, (int)top_k, /*fp8_mode=*/0};
+    dispatch_moe_up_decode(
+        q, (const fp16*)x.data_ptr(),
+        (const uint8_t*)gate_up_weight.data_ptr(),
+        gate_up_scale.data_ptr<float>(), idx_ptr,
+        (fp16*)sg_intermediates.data_ptr(),
+        hidden_size, intermediate_size, (int)top_k);
+    dispatch_moe_down_decode(
+        q, (const fp16*)sg_intermediates.data_ptr(),
+        (const uint8_t*)down_weight.data_ptr(), down_scale.data_ptr<float>(),
+        w_ptr, idx_ptr, (fp16*)sg_routed_output.data_ptr(),
+        hidden_size, intermediate_size, (int)top_k);
+    // ---- Accumulate over top_k ----
+    auto& final_out = sg_take_final_output(buffers);
+    moe_accumulate_kernel(
+        (const fp16*)sg_routed_output.data_ptr(),
+        (fp16*)final_out.data_ptr(),
+        1, hidden_size, rows_per_token, x.device());
+    return final_out.narrow(0, 0, 1);
+}
+
+// Native XPU expert layout: gate_up [E, hidden, 2*inter],
+// down [E, inter, hidden]. Keeps the fully-fused decode contract without
+// materializing a canonical [E,N,K] copy for every layer.
+torch::Tensor moe_forward_full_gelu_tanh_decode_native(
+    torch::Tensor x, torch::Tensor logits,
+    torch::Tensor gate_up_weight, torch::Tensor gate_up_scale,
+    torch::Tensor down_weight, torch::Tensor down_scale,
+    torch::Tensor per_expert_scale,
+    int64_t top_k, int64_t n_routed_experts) {
+    TORCH_CHECK(x.scalar_type() == torch::kHalf);
+    TORCH_CHECK(x.size(0) == 1, "decode kernel requires n_tokens==1");
+    TORCH_CHECK(gate_up_weight.dim() == 3 && down_weight.dim() == 3);
+    int hidden_size = x.size(1);
+    TORCH_CHECK(gate_up_weight.size(1) == hidden_size);
+    TORCH_CHECK(gate_up_weight.size(2) % 2 == 0);
+    int intermediate_size = gate_up_weight.size(2) / 2;
+    TORCH_CHECK(down_weight.size(1) == intermediate_size);
+    TORCH_CHECK(down_weight.size(2) == hidden_size);
+    TORCH_CHECK(hidden_size % 16 == 0 && intermediate_size % 16 == 0);
+    int rows_per_token = top_k;
+    auto& buffers = ensure_gemma4_moe_buffers(
+        1, top_k, hidden_size, intermediate_size, x.device());
+    auto& sg_topk_idx = buffers.topk_idx;
+    auto& sg_topk_weight = buffers.topk_weight;
+    auto& sg_intermediates = buffers.intermediates;
+    auto& sg_routed_output = buffers.routed_output;
+    sycl::queue& q =
+        c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+
+    dispatch_moe_topk_forward<class MoeTopKGemma4DecodeNative>(
+        (const fp16*)logits.data_ptr(),
+        sg_topk_idx.data_ptr<int>(),
+        (fp16*)sg_topk_weight.data_ptr(),
+        1, (int)n_routed_experts, (int)top_k, /*norm=*/true,
+        logits.device());
+
+    q.submit([&](sycl::handler& h){
+        h.parallel_for(sycl::range<1>(top_k), MoeFoldExpertScale{
+            (fp16*)sg_topk_weight.data_ptr(),
+            sg_topk_idx.data_ptr<int>(),
+            per_expert_scale.data_ptr<float>(),
+            (int)top_k});
+    });
+
+    const int* idx_ptr = sg_topk_idx.data_ptr<int>();
+    const fp16* route_weight =
+        (const fp16*)sg_topk_weight.data_ptr();
+    const char* disable_grouped =
+        std::getenv("DISABLE_GEMMA4_NATIVE_MOE_GROUPED");
+    const bool use_grouped_native =
+        disable_grouped == nullptr || disable_grouped[0] != '1';
+    if (use_grouped_native) {
         q.submit([&](sycl::handler& h){
             h.parallel_for(sycl::nd_range<2>(
                 sycl::range<2>(top_k, intermediate_size),
-                sycl::range<2>(1, 1)), k);
+                sycl::range<2>(1, 16)), MoeUpDecodeGeluTanhNativeGrouped{
+                    (const fp16*)x.data_ptr(),
+                    (const uint8_t*)gate_up_weight.data_ptr(),
+                    gate_up_scale.data_ptr<float>(),
+                    idx_ptr,
+                    (fp16*)sg_intermediates.data_ptr(),
+                    hidden_size, intermediate_size, (int)top_k});
         });
-    }
-    // ---- Down (1D-load GEMV, VL=256 + tail 32) ----
-    {
-        const int VL = 256; const int VL_TAIL = 32;
-        auto k = MoeDownDecode<VL, VL_TAIL>{
-            (const fp16*)sg_intermediates.data_ptr(),
-            (const uint8_t*)down_weight.data_ptr(), down_scale.data_ptr<float>(),
-            w_ptr, idx_ptr, (fp16*)sg_routed_output.data_ptr(),
-            hidden_size, intermediate_size, (int)top_k, /*fp8_mode=*/0};
         q.submit([&](sycl::handler& h){
             h.parallel_for(sycl::nd_range<2>(
                 sycl::range<2>(top_k, hidden_size),
-                sycl::range<2>(1, 1)), k);
+                sycl::range<2>(1, 16)), MoeDownDecodeNativeGrouped{
+                    (const fp16*)sg_intermediates.data_ptr(),
+                    (const uint8_t*)down_weight.data_ptr(),
+                    down_scale.data_ptr<float>(),
+                    route_weight,
+                    idx_ptr,
+                    (fp16*)sg_routed_output.data_ptr(),
+                    hidden_size, intermediate_size, (int)top_k});
+        });
+    } else {
+        q.submit([&](sycl::handler& h){
+            h.parallel_for(sycl::nd_range<2>(
+                sycl::range<2>(top_k, intermediate_size / 16),
+                sycl::range<2>(1, 1)), MoeUpDecodeGeluTanhNative{
+                    (const fp16*)x.data_ptr(),
+                    (const uint8_t*)gate_up_weight.data_ptr(),
+                    gate_up_scale.data_ptr<float>(),
+                    idx_ptr,
+                    (fp16*)sg_intermediates.data_ptr(),
+                    hidden_size, intermediate_size, (int)top_k});
+        });
+        q.submit([&](sycl::handler& h){
+            h.parallel_for(sycl::nd_range<2>(
+                sycl::range<2>(top_k, hidden_size / 16),
+                sycl::range<2>(1, 1)), MoeDownDecodeNative{
+                    (const fp16*)sg_intermediates.data_ptr(),
+                    (const uint8_t*)down_weight.data_ptr(),
+                    down_scale.data_ptr<float>(),
+                    route_weight,
+                    idx_ptr,
+                    (fp16*)sg_routed_output.data_ptr(),
+                    hidden_size, intermediate_size, (int)top_k});
         });
     }
-    // ---- Accumulate over top_k ----
-    auto& final_out = sg_take_final_output();
+
+    auto& final_out = sg_take_final_output(buffers);
     moe_accumulate_kernel(
         (const fp16*)sg_routed_output.data_ptr(),
         (fp16*)final_out.data_ptr(),
@@ -2262,7 +2408,10 @@ torch::Tensor moe_forward_full_gelu_tanh_routed(
     int intermediate_size = gate_up_weight.size(1) / 2;
     int rows_per_token = top_k;
 
-    ensure_gemma4_moe_buffers(n_tokens, top_k, hidden_size, intermediate_size, x.device());
+    auto& buffers = ensure_gemma4_moe_buffers(
+        n_tokens, top_k, hidden_size, intermediate_size, x.device());
+    auto& sg_intermediates = buffers.intermediates;
+    auto& sg_routed_output = buffers.routed_output;
 
     const int* idx_ptr = topk_indices.data_ptr<int>();
     const fp16* w_ptr  = (const fp16*)topk_weights.data_ptr();
@@ -2283,7 +2432,7 @@ torch::Tensor moe_forward_full_gelu_tanh_routed(
         n_tokens, hidden_size, intermediate_size,
         top_k, rows_per_token, x.device());
 
-    auto& final_out = sg_take_final_output();
+    auto& final_out = sg_take_final_output(buffers);
     moe_accumulate_kernel(
         (const fp16*)sg_routed_output.data_ptr(),
         (fp16*)final_out.data_ptr(),
@@ -2310,7 +2459,10 @@ torch::Tensor moe_forward_full_gelu_tanh_routed_no_accum(
     int intermediate_size = gate_up_weight.size(1) / 2;
     int rows_per_token = top_k;
 
-    ensure_gemma4_moe_buffers(n_tokens, top_k, hidden_size, intermediate_size, x.device());
+    auto& buffers = ensure_gemma4_moe_buffers(
+        n_tokens, top_k, hidden_size, intermediate_size, x.device());
+    auto& sg_intermediates = buffers.intermediates;
+    auto& sg_routed_output = buffers.routed_output;
 
     const int* idx_ptr = topk_indices.data_ptr<int>();
     const fp16* w_ptr  = (const fp16*)topk_weights.data_ptr();
@@ -2451,9 +2603,11 @@ TORCH_LIBRARY_FRAGMENT(moe_ops, m) {
     m.def("moe_forward_full_gelu_tanh_routed(Tensor x, Tensor topk_weights, Tensor topk_indices, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full_gelu_tanh_routed_decode(Tensor x, Tensor topk_weights, Tensor topk_indices, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full_gelu_tanh_decode(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor per_expert_scale, int top_k, int n_routed_experts) -> Tensor");
+    m.def("moe_forward_full_gelu_tanh_decode_native(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor per_expert_scale, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_up_fp8_grouped(Tensor x, Tensor gate_up_weight, Tensor gate_up_scale, Tensor expert_offsets, Tensor expert_tokens, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_down_fp8_grouped(Tensor intermediate, Tensor down_weight, Tensor down_scale, Tensor routing_weights, Tensor expert_offsets, Tensor expert_tokens, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full_fp8_grouped(Tensor x, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor routing_weights, Tensor expert_offsets, Tensor expert_tokens, int top_k, int n_routed_experts) -> Tensor");
+    m.def("moe_forward_full_fp8_grouped_native(Tensor x, Tensor gate_up_weight, Tensor gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor routing_weights, Tensor expert_offsets, Tensor expert_tokens, int top_k, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
     m.def("moe_forward_full_fp8_block(Tensor x, Tensor logits, Tensor(a!) output, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor(a!)");
     m.def("moe_forward_full_v2(Tensor x, Tensor logits, Tensor gate_up_weight, Tensor gate_up_scale, Tensor shared_gate_up_weight, Tensor shared_gate_up_scale, Tensor down_weight, Tensor down_scale, Tensor shared_down_weight, Tensor shared_down_scale, Tensor shared_expert_gate_weight, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
@@ -2469,9 +2623,11 @@ TORCH_LIBRARY_IMPL(moe_ops, XPU, m) {
     m.impl("moe_forward_full_gelu_tanh_routed", &moe_forward_full_gelu_tanh_routed);
     m.impl("moe_forward_full_gelu_tanh_routed_decode", &moe_forward_full_gelu_tanh_routed_decode);
     m.impl("moe_forward_full_gelu_tanh_decode", &moe_forward_full_gelu_tanh_decode);
+    m.impl("moe_forward_full_gelu_tanh_decode_native", &moe_forward_full_gelu_tanh_decode_native);
     m.impl("moe_up_fp8_grouped", &moe_up_fp8_grouped);
     m.impl("moe_down_fp8_grouped", &moe_down_fp8_grouped);
     m.impl("moe_forward_full_fp8_grouped", &moe_forward_full_fp8_grouped);
+    m.impl("moe_forward_full_fp8_grouped_native", &moe_forward_full_fp8_grouped_native);
     m.impl("moe_forward_full_gelu_tanh_routed_no_accum", &moe_forward_full_gelu_tanh_routed_no_accum);
     m.impl("moe_forward_fused", &moe_forward_fused);
     m.impl("moe_forward_full", &moe_forward_full);

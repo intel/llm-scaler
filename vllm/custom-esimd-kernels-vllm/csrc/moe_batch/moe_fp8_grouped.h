@@ -45,6 +45,121 @@ fp8g_load_wtile(const uint8_t* base, uint32_t K_total, uint32_t n_rows_total,
     return fp8e4m3_block_to_vnni_nk(raw);
 }
 
+// Load the same logical [16 N, 16 K] tile from native XPU [K, N] storage.
+// A transposed dword load gives four contiguous N bytes for each K row.
+// Repack those four-byte groups directly into the DPAS VNNI layout instead
+// of materializing a full canonical [N, K] copy in HBM.
+SYCL_ESIMD_FUNCTION inline simd<fp16, 256>
+fp8g_load_wtile_native(const uint8_t* base, uint32_t N_total,
+                       uint32_t K_total, uint32_t k0, uint32_t n0) {
+    xesimd::config_2d_mem_access<uint32_t, 4, 16, 1> pay(
+        reinterpret_cast<const uint32_t*>(base),
+        N_total - 1u, K_total - 1u, N_total - 1u,
+        n0 / 4u, k0);
+    auto raw_t = xesimd::lsc_load_2d<uint32_t, 4, 16, 1, true, false,
+        xesimd::cache_hint::cached, xesimd::cache_hint::cached>(pay);
+
+    simd<uint16_t, 256> b_vnni_u16;
+    #pragma unroll
+    for (int ng = 0; ng < 4; ng++) {
+        simd<uint32_t, 16> k_rows = raw_t.template select<16, 1>(ng * 16);
+        #pragma unroll
+        for (int n = 0; n < 4; n++) {
+            simd<uint8_t, 16> raw_k = convert<uint8_t>(
+                (k_rows >> (8 * n)) & 0xFF);
+            simd<fp16, 16> w = fp8e4m3_to_half<16>(raw_k);
+            simd<uint16_t, 16> w_u16 =
+                w.template bit_cast_view<uint16_t>().read();
+            const int n_global = ng * 4 + n;
+            for (int kp = 0; kp < 8; kp++) {
+                b_vnni_u16[kp * 32 + 2 * n_global] = w_u16[2 * kp];
+                b_vnni_u16[kp * 32 + 2 * n_global + 1] = w_u16[2 * kp + 1];
+            }
+        }
+    }
+    return b_vnni_u16.template bit_cast_view<fp16>().read();
+}
+
+SYCL_ESIMD_FUNCTION inline simd<fp16, 256>
+fp8g_load_wtile_native_packed(const uint8_t* base, uint32_t N_total,
+                              uint32_t K_total, uint32_t k0, uint32_t n0) {
+    xesimd::config_2d_mem_access<uint32_t, 4, 16, 1> pay(
+        reinterpret_cast<const uint32_t*>(base),
+        N_total - 1u, K_total - 1u, N_total - 1u,
+        n0 / 4u, k0);
+    auto raw_t = xesimd::lsc_load_2d<uint32_t, 4, 16, 1, true, false,
+        xesimd::cache_hint::cached, xesimd::cache_hint::cached>(pay);
+
+    // Keep the low-K path's small conversion footprint, but write the VNNI
+    // pairs with strided SIMD selects instead of extracting 128 scalar lanes.
+    simd<uint16_t, 256> b_vnni_u16;
+    #pragma unroll
+    for (int ng = 0; ng < 4; ng++) {
+        simd<uint32_t, 16> k_rows = raw_t.template select<16, 1>(ng * 16);
+        #pragma unroll
+        for (int n = 0; n < 4; n++) {
+            simd<uint8_t, 16> raw_k = convert<uint8_t>(
+                (k_rows >> (8 * n)) & 0xFF);
+            simd<fp16, 16> w = fp8e4m3_to_half<16>(raw_k);
+            simd<uint16_t, 16> w_u16 =
+                w.template bit_cast_view<uint16_t>().read();
+            const int n_global = ng * 4 + n;
+            b_vnni_u16.template select<8, 32>(2 * n_global) =
+                w_u16.template select<8, 2>(0);
+            b_vnni_u16.template select<8, 32>(2 * n_global + 1) =
+                w_u16.template select<8, 2>(1);
+        }
+    }
+    return b_vnni_u16.template bit_cast_view<fp16>().read();
+}
+
+SYCL_ESIMD_FUNCTION inline simd<fp16, 256>
+fp8g_load_wtile_native_fast(const uint8_t* base, uint32_t N_total,
+                            uint32_t K_total, uint32_t k0, uint32_t n0) {
+    xesimd::config_2d_mem_access<uint32_t, 4, 16, 1> pay(
+        reinterpret_cast<const uint32_t*>(base),
+        N_total - 1u, K_total - 1u, N_total - 1u,
+        n0 / 4u, k0);
+    auto raw_t = xesimd::lsc_load_2d<uint32_t, 4, 16, 1, true, false,
+        xesimd::cache_hint::cached, xesimd::cache_hint::cached>(pay);
+
+    // The transposed load is laid out as four-byte N groups for each K row.
+    // Deinterleave those groups with SIMD selects, then reuse the vectorized
+    // canonical FP8 conversion and VNNI pack instead of doing 128 scalar
+    // element extractions and stores.
+    simd<uint8_t, 256> raw_bytes =
+        raw_t.template bit_cast_view<uint8_t>().read();
+    simd<uint8_t, 256> raw_nk;
+    #pragma unroll
+    for (int ng = 0; ng < 4; ng++) {
+        #pragma unroll
+        for (int n = 0; n < 4; n++) {
+            const int n_global = ng * 4 + n;
+            raw_nk.template select<16, 1>(n_global * 16) =
+                raw_bytes.template select<16, 4>(ng * 64 + n);
+        }
+    }
+    return fp8e4m3_block_to_vnni_nk(raw_nk);
+}
+
+template <bool NATIVE_LAYOUT, bool FAST_NATIVE>
+SYCL_ESIMD_FUNCTION inline simd<fp16, 256>
+fp8g_load_wtile_layout(const uint8_t* base, uint32_t K_total,
+                       uint32_t n_rows_total, uint32_t k0, uint32_t n0) {
+    if constexpr (NATIVE_LAYOUT) {
+        if constexpr (FAST_NATIVE) {
+            return fp8g_load_wtile_native_fast(
+                base, n_rows_total, K_total, k0, n0);
+        } else {
+            return fp8g_load_wtile_native_packed(
+                base, n_rows_total, K_total, k0, n0);
+        }
+    } else {
+        return fp8g_load_wtile(
+            base, K_total, n_rows_total, k0, n0);
+    }
+}
+
 // ---- Tile map builder: even out the per-expert token skew ------------------
 // The up GEMM was gridded (num_experts, n_ntiles): one work-item walked ALL of
 // an expert's token tiles serially. With skewed routing (one expert up to ~164
@@ -91,10 +206,11 @@ inline void moe_build_tile_map_kernel(
 // One work-item == one TILE_M-row tile (expert from tile_expert[tile]), so the
 // per-expert token skew no longer serializes inside a work-item.
 // Output written to intermediate[routed_row, n] for each gathered route row.
-template <bool FUSE_TILE_MAP>
+template <bool FUSE_TILE_MAP, bool NATIVE_LAYOUT>
 class MoeUpFp8Grouped;
 
-template <int TILE_M = 8, bool FUSE_TILE_MAP = false>
+template <int TILE_M = 8, bool FUSE_TILE_MAP = false,
+          bool NATIVE_LAYOUT = false>
 void moe_up_fp8_grouped_gelu_tanh_kernel(
     const fp16* x,                       // [n_tokens, hidden]
     const uint8_t* gate_up_weight,       // [E, 2*inter, hidden] e4m3
@@ -110,7 +226,7 @@ void moe_up_fp8_grouped_gelu_tanh_kernel(
     const int n_ntiles = intermediate_size / 16;
 
     auto cgf = [&](sycl::handler& cgh) {
-        cgh.parallel_for<MoeUpFp8Grouped<FUSE_TILE_MAP>>(
+        cgh.parallel_for<MoeUpFp8Grouped<FUSE_TILE_MAP, NATIVE_LAYOUT>>(
             sycl::range<2>(max_tiles, n_ntiles),
             [=](sycl::item<2> item) SYCL_ESIMD_KERNEL {
                 const int tile   = (int)item.get_id(0);
@@ -174,10 +290,12 @@ void moe_up_fp8_grouped_gelu_tanh_kernel(
                     for (int g = 0; g < MG; g++) { g_acc[g] = fp16(0); u_acc[g] = fp16(0); }
 
                     for (int k = 0; k < hidden_size; k += 16) {
-                        simd<fp16, 256> bg = fp8g_load_wtile(
+                        simd<fp16, 256> bg =
+                            fp8g_load_wtile_layout<NATIVE_LAYOUT, true>(
                             wbase, (uint32_t)hidden_size,
                             (uint32_t)(2 * intermediate_size), (uint32_t)k, (uint32_t)ng);
-                        simd<fp16, 256> bu = fp8g_load_wtile(
+                        simd<fp16, 256> bu =
+                            fp8g_load_wtile_layout<NATIVE_LAYOUT, true>(
                             wbase, (uint32_t)hidden_size,
                             (uint32_t)(2 * intermediate_size), (uint32_t)k, (uint32_t)nu);
                         // Fold per-tensor scale pre-DPAS (fp16-accum overflow
@@ -243,7 +361,10 @@ void moe_up_fp8_grouped_gelu_tanh_kernel(
 // Grid: (num_experts, hidden_size / 16). TILE_M=8.
 // Reads intermediate[routed_row, :inter], writes output[routed_row, :hidden]
 // (per-route output rows; Python accumulate folds top_k rows back per token).
-template <int TILE_M = 8>
+template <bool NATIVE_LAYOUT>
+class MoeDownFp8Grouped;
+
+template <int TILE_M = 8, bool NATIVE_LAYOUT = false>
 void moe_down_fp8_grouped_kernel(
     const fp16* intermediate,            // [n_tokens*top_k, inter]
     const uint8_t* down_weight,          // [E, hidden, inter] e4m3
@@ -258,7 +379,7 @@ void moe_down_fp8_grouped_kernel(
     const int n_ntiles = hidden_size / 16;
 
     auto cgf = [&](sycl::handler& cgh) {
-        cgh.parallel_for<class MoeDownFp8Grouped>(
+        cgh.parallel_for<MoeDownFp8Grouped<NATIVE_LAYOUT>>(
             sycl::range<2>(num_experts, n_ntiles),
             [=](sycl::item<2> item) SYCL_ESIMD_KERNEL {
                 const int eid    = (int)item.get_id(0);
@@ -297,7 +418,8 @@ void moe_down_fp8_grouped_kernel(
                     for (int g = 0; g < MGD; g++) acc[g] = fp16(0);
 
                     for (int k = 0; k < intermediate_size; k += 16) {
-                        simd<fp16, 256> bd = fp8g_load_wtile(
+                        simd<fp16, 256> bd =
+                            fp8g_load_wtile_layout<NATIVE_LAYOUT, false>(
                             wbase, (uint32_t)intermediate_size,
                             (uint32_t)hidden_size, (uint32_t)k, (uint32_t)ng);
                         // Fold per-tensor down_scale pre-DPAS (fp16-accum overflow
@@ -345,9 +467,10 @@ void moe_down_fp8_grouped_kernel(
 // These two ops are the fp8 grouped GEMMs.
 
 // Up: returns intermediate [n_tokens*top_k, inter] (gelu_tanh(gate)*up).
-inline torch::Tensor moe_up_fp8_grouped(
+template <bool NATIVE_LAYOUT>
+inline torch::Tensor moe_up_fp8_grouped_impl(
     torch::Tensor x,                 // [n_tokens, hidden] fp16
-    torch::Tensor gate_up_weight,    // [E, 2*inter, hidden] e4m3 (uint8 view)
+    torch::Tensor gate_up_weight,    // [E, 2*inter, hidden] or [E, hidden, 2*inter]
     torch::Tensor gate_up_scale,     // [E] float
     torch::Tensor expert_offsets,    // [E] int32
     torch::Tensor expert_tokens,     // [total_routes] int32
@@ -355,7 +478,19 @@ inline torch::Tensor moe_up_fp8_grouped(
     TORCH_CHECK(x.scalar_type() == torch::kHalf);
     int n_tokens = x.size(0);
     int hidden_size = x.size(1);
-    int intermediate_size = gate_up_weight.size(1) / 2;
+    TORCH_CHECK(gate_up_weight.dim() == 3);
+    TORCH_CHECK(
+        (NATIVE_LAYOUT && gate_up_weight.size(1) == hidden_size
+            && gate_up_weight.size(2) % 2 == 0)
+        || (!NATIVE_LAYOUT && gate_up_weight.size(2) == hidden_size
+            && gate_up_weight.size(1) % 2 == 0),
+        "gate_up_weight does not match the selected grouped FP8 layout");
+    int intermediate_size = NATIVE_LAYOUT
+        ? gate_up_weight.size(2) / 2
+        : gate_up_weight.size(1) / 2;
+    TORCH_CHECK(
+        hidden_size % 16 == 0 && intermediate_size % 16 == 0,
+        "grouped FP8 hidden and intermediate sizes must be multiples of 16");
     int total_routes = n_tokens * (int)top_k;
     auto intermediate = torch::empty({total_routes, intermediate_size},
         torch::device(x.device()).dtype(torch::kHalf));
@@ -370,7 +505,7 @@ inline torch::Tensor moe_up_fp8_grouped(
         enable_env != nullptr && enable_env[0] == '1'
         && std::getenv("DISABLE_MOE_GROUPED_TILEMAP_FUSION") == nullptr;
     if (enable_fusion) {
-        moe_up_fp8_grouped_gelu_tanh_kernel<TILE_M, true>(
+        moe_up_fp8_grouped_gelu_tanh_kernel<TILE_M, true, NATIVE_LAYOUT>(
             (const fp16*)x.data_ptr(),
             (const uint8_t*)gate_up_weight.data_ptr(),
             gate_up_scale.data_ptr<float>(),
@@ -390,7 +525,7 @@ inline torch::Tensor moe_up_fp8_grouped(
             tile_expert.data_ptr<int>(),
             tile_mbase.data_ptr<int>(),
             (int)n_routed_experts, total_routes, max_tiles, TILE_M, x.device());
-        moe_up_fp8_grouped_gelu_tanh_kernel<TILE_M, false>(
+        moe_up_fp8_grouped_gelu_tanh_kernel<TILE_M, false, NATIVE_LAYOUT>(
             (const fp16*)x.data_ptr(),
             (const uint8_t*)gate_up_weight.data_ptr(),
             gate_up_scale.data_ptr<float>(),
@@ -405,9 +540,34 @@ inline torch::Tensor moe_up_fp8_grouped(
     return intermediate;
 }
 
+inline torch::Tensor moe_up_fp8_grouped(
+    torch::Tensor x,
+    torch::Tensor gate_up_weight,
+    torch::Tensor gate_up_scale,
+    torch::Tensor expert_offsets,
+    torch::Tensor expert_tokens,
+    int64_t top_k, int64_t n_routed_experts) {
+    return moe_up_fp8_grouped_impl<false>(
+        x, gate_up_weight, gate_up_scale, expert_offsets, expert_tokens,
+        top_k, n_routed_experts);
+}
+
+inline torch::Tensor moe_up_fp8_grouped_native(
+    torch::Tensor x,
+    torch::Tensor gate_up_weight,
+    torch::Tensor gate_up_scale,
+    torch::Tensor expert_offsets,
+    torch::Tensor expert_tokens,
+    int64_t top_k, int64_t n_routed_experts) {
+    return moe_up_fp8_grouped_impl<true>(
+        x, gate_up_weight, gate_up_scale, expert_offsets, expert_tokens,
+        top_k, n_routed_experts);
+}
+
 // Down: returns per-route output [n_tokens*top_k, hidden] (routing-weighted).
 // Python then sums the top_k rows per token (moe_prefill_accumulate or a view-sum).
-inline torch::Tensor moe_down_fp8_grouped(
+template <bool NATIVE_LAYOUT>
+inline torch::Tensor moe_down_fp8_grouped_impl(
     torch::Tensor intermediate,      // [n_tokens*top_k, inter] fp16
     torch::Tensor down_weight,       // [E, hidden, inter] e4m3 (uint8 view)
     torch::Tensor down_scale,        // [E] float
@@ -418,10 +578,20 @@ inline torch::Tensor moe_down_fp8_grouped(
     TORCH_CHECK(intermediate.scalar_type() == torch::kHalf);
     int total_routes = intermediate.size(0);
     int intermediate_size = intermediate.size(1);
-    int hidden_size = down_weight.size(1);
+    TORCH_CHECK(down_weight.dim() == 3);
+    TORCH_CHECK(
+        (NATIVE_LAYOUT && down_weight.size(1) == intermediate_size)
+        || (!NATIVE_LAYOUT && down_weight.size(2) == intermediate_size),
+        "down_weight does not match the selected grouped FP8 layout");
+    int hidden_size = NATIVE_LAYOUT
+        ? down_weight.size(2)
+        : down_weight.size(1);
+    TORCH_CHECK(
+        hidden_size % 16 == 0 && intermediate_size % 16 == 0,
+        "grouped FP8 hidden and intermediate sizes must be multiples of 16");
     auto output = torch::empty({total_routes, hidden_size},
         torch::device(intermediate.device()).dtype(torch::kHalf));
-    moe_down_fp8_grouped_kernel<16>(
+    moe_down_fp8_grouped_kernel<16, NATIVE_LAYOUT>(
         (const fp16*)intermediate.data_ptr(),
         (const uint8_t*)down_weight.data_ptr(),
         down_scale.data_ptr<float>(),
@@ -432,6 +602,32 @@ inline torch::Tensor moe_down_fp8_grouped(
         (int)n_routed_experts, total_routes,
         hidden_size, intermediate_size, (int)top_k, intermediate.device());
     return output;
+}
+
+inline torch::Tensor moe_down_fp8_grouped(
+    torch::Tensor intermediate,
+    torch::Tensor down_weight,
+    torch::Tensor down_scale,
+    torch::Tensor routing_weights,
+    torch::Tensor expert_offsets,
+    torch::Tensor expert_tokens,
+    int64_t top_k, int64_t n_routed_experts) {
+    return moe_down_fp8_grouped_impl<false>(
+        intermediate, down_weight, down_scale, routing_weights,
+        expert_offsets, expert_tokens, top_k, n_routed_experts);
+}
+
+inline torch::Tensor moe_down_fp8_grouped_native(
+    torch::Tensor intermediate,
+    torch::Tensor down_weight,
+    torch::Tensor down_scale,
+    torch::Tensor routing_weights,
+    torch::Tensor expert_offsets,
+    torch::Tensor expert_tokens,
+    int64_t top_k, int64_t n_routed_experts) {
+    return moe_down_fp8_grouped_impl<true>(
+        intermediate, down_weight, down_scale, routing_weights,
+        expert_offsets, expert_tokens, top_k, n_routed_experts);
 }
 
 template <int TILE_N = 16>
@@ -468,7 +664,8 @@ void moe_grouped_accumulate_kernel(
 // the caller because Gemma folds per_expert_scale before this op; the up,
 // down, and route accumulation launches stay inside one C++ dispatch so the
 // Python layer does not rebuild intermediate tensors or launch reductions.
-inline torch::Tensor moe_forward_full_fp8_grouped(
+template <bool NATIVE_LAYOUT>
+inline torch::Tensor moe_forward_full_fp8_grouped_impl(
     torch::Tensor x,
     torch::Tensor gate_up_weight,
     torch::Tensor gate_up_scale,
@@ -479,10 +676,10 @@ inline torch::Tensor moe_forward_full_fp8_grouped(
     torch::Tensor expert_tokens,
     int64_t top_k,
     int64_t n_routed_experts) {
-    auto intermediate = moe_up_fp8_grouped(
+    auto intermediate = moe_up_fp8_grouped_impl<NATIVE_LAYOUT>(
         x, gate_up_weight, gate_up_scale, expert_offsets, expert_tokens,
         top_k, n_routed_experts);
-    auto partials = moe_down_fp8_grouped(
+    auto partials = moe_down_fp8_grouped_impl<NATIVE_LAYOUT>(
         intermediate, down_weight, down_scale, routing_weights,
         expert_offsets, expert_tokens, top_k, n_routed_experts);
     const int n_tokens = x.size(0);
@@ -494,4 +691,38 @@ inline torch::Tensor moe_forward_full_fp8_grouped(
         (fp16*)output.data_ptr(),
         n_tokens, hidden_size, (int)top_k, x.device());
     return output;
+}
+
+inline torch::Tensor moe_forward_full_fp8_grouped(
+    torch::Tensor x,
+    torch::Tensor gate_up_weight,
+    torch::Tensor gate_up_scale,
+    torch::Tensor down_weight,
+    torch::Tensor down_scale,
+    torch::Tensor routing_weights,
+    torch::Tensor expert_offsets,
+    torch::Tensor expert_tokens,
+    int64_t top_k,
+    int64_t n_routed_experts) {
+    return moe_forward_full_fp8_grouped_impl<false>(
+        x, gate_up_weight, gate_up_scale, down_weight, down_scale,
+        routing_weights, expert_offsets, expert_tokens, top_k,
+        n_routed_experts);
+}
+
+inline torch::Tensor moe_forward_full_fp8_grouped_native(
+    torch::Tensor x,
+    torch::Tensor gate_up_weight,
+    torch::Tensor gate_up_scale,
+    torch::Tensor down_weight,
+    torch::Tensor down_scale,
+    torch::Tensor routing_weights,
+    torch::Tensor expert_offsets,
+    torch::Tensor expert_tokens,
+    int64_t top_k,
+    int64_t n_routed_experts) {
+    return moe_forward_full_fp8_grouped_impl<true>(
+        x, gate_up_weight, gate_up_scale, down_weight, down_scale,
+        routing_weights, expert_offsets, expert_tokens, top_k,
+        n_routed_experts);
 }
