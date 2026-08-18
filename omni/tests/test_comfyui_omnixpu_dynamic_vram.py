@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -126,6 +127,21 @@ def test_minimum_target_includes_reserved_vram(monkeypatch):
     assert minimum_target == 20 * 1024 * _MIB
 
 
+def test_inference_budget_uses_raw_single_batch_requirement(monkeypatch):
+    dynamic_vram = _load_module(monkeypatch)
+
+    assert dynamic_vram._inference_memory_budget(
+        (), {"memory_required": 32 * 1024 * _MIB}
+    ) == 32 * 1024 * _MIB
+    assert dynamic_vram._inference_memory_budget(
+        (),
+        {
+            "memory_required": 32 * 1024 * _MIB,
+            "minimum_memory_required": 16 * 1024 * _MIB,
+        },
+    ) == 16 * 1024 * _MIB
+
+
 def test_boundary_trim_reclaims_inactive_before_requested_model(monkeypatch):
     dynamic_vram = _load_module(monkeypatch)
     device = _Device("xpu")
@@ -166,6 +182,42 @@ def test_boundary_trim_stops_after_inactive_models_meet_target(monkeypatch):
     assert inactive.loaded == 2 * 1024 * _MIB
     assert requested.loaded == 5 * 1024 * _MIB
     assert requested.free_calls == []
+
+
+def test_model_loader_scopes_inference_budget_to_xpu_devices(monkeypatch):
+    dynamic_vram = _load_module(monkeypatch)
+    device = _Device("xpu", 1)
+    requested = _Patcher("requested", device)
+    management, calls = _model_management([requested], free=32 * 1024 * _MIB)
+    events = []
+
+    @contextmanager
+    def inference_memory_budget(budget, devices):
+        events.append(("enter", budget, tuple(devices)))
+        try:
+            yield
+        finally:
+            events.append(("exit", budget, tuple(devices)))
+
+    monkeypatch.setattr(
+        dynamic_vram,
+        "_aimdo_model_vbar",
+        SimpleNamespace(inference_memory_budget=inference_memory_budget),
+    )
+    dynamic_vram._patch_model_loader(management)
+
+    result = management.load_models_gpu(
+        [requested],
+        memory_required=32 * 1024 * _MIB,
+        minimum_memory_required=16 * 1024 * _MIB,
+    )
+
+    assert result == "loaded"
+    assert calls
+    assert events == [
+        ("enter", 16 * 1024 * _MIB, (1,)),
+        ("exit", 16 * 1024 * _MIB, (1,)),
+    ]
 
 
 def test_boundary_trim_skips_mixed_and_non_xpu_requests(monkeypatch):
@@ -214,6 +266,18 @@ def test_lora_budget_reaches_boundary_trim_before_core_loader(monkeypatch):
     lora_memory._set_budget_entries(
         requested, {id(lora_tensor): (2 * 1024 * _MIB, 2 * 1024 * _MIB)}
     )
+    budgets = []
+
+    @contextmanager
+    def inference_memory_budget(budget, devices):
+        budgets.append((budget, tuple(devices)))
+        yield
+
+    monkeypatch.setattr(
+        dynamic_vram,
+        "_aimdo_model_vbar",
+        SimpleNamespace(inference_memory_budget=inference_memory_budget),
+    )
 
     dynamic_vram._patch_model_loader(management)
     lora_memory._patch_model_loader(management)
@@ -224,3 +288,4 @@ def test_lora_budget_reaches_boundary_trim_before_core_loader(monkeypatch):
     assert management.get_free_memory(device) == 20 * 1024 * _MIB
     assert calls[0][2]["minimum_memory_required"] == 16 * 1024 * _MIB
     assert calls[0][3] == 20 * 1024 * _MIB
+    assert budgets == [(16 * 1024 * _MIB, (0,))]
