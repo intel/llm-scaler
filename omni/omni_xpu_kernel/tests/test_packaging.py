@@ -265,6 +265,8 @@ def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
     assert "bindings.cpp" in main_sources
     assert "kitchen_rope.cpp" in main_sources
     assert "kitchen_rms_rope_sycl.cpp" in main_sources
+    assert "group_norm_seedvr_bmg.cpp" in main_sources
+    assert "cat_pad_bmg.cpp" in main_sources
     assert "svdq_dequant.cpp" in main_sources
     assert setup_namespace["BUILD_XPU_TARGET"] == XPU_TARGET
     assert setup_namespace["XPU_ARCH_MACRO"] == (

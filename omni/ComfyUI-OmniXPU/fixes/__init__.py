@@ -1,5 +1,5 @@
-"""Opt-in legacy correctness workarounds.
+"""Guarded ComfyUI compatibility patches and legacy workarounds.
 
-These modules mutate global PyTorch or ComfyUI functions, so they remain
-disabled by default and are not a substitute for an upstream fix.
+Compatibility patches decline unknown upstream implementations.  Legacy
+global PyTorch workarounds remain disabled by default.
 """

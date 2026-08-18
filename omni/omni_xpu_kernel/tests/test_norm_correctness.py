@@ -234,6 +234,82 @@ class TestGroupNormBMGCorrectness:
             norm.group_norm_bmg(input, 32, weight, bias, eps=1e-6)
 
 
+class TestGroupNormSeedVRBMGCorrectness:
+    """Correctness tests for exact SeedVR temporal-interleaved contracts."""
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (4, 128, 512, 512),
+            (4, 256, 256, 256),
+            (4, 256, 512, 512),
+            (4, 512, 256, 256),
+            (2, 512, 128, 128),
+        ],
+    )
+    def test_group_norm_seedvr_bmg_correctness(self, shape):
+        from omni_xpu_kernel import norm
+
+        if not norm.supports_group_norm_seedvr_bmg():
+            pytest.skip("loaded binary does not contain the SeedVR route")
+
+        torch.manual_seed(sum(shape) + 29)
+        temporal, channels, height, width = shape
+        backing = torch.randn(
+            (1, channels, temporal, height, width),
+            device="xpu",
+            dtype=torch.float16,
+        )
+        input = backing.transpose(1, 2).reshape(shape)
+        weight = torch.randn(
+            channels, device="xpu", dtype=torch.float16
+        )
+        bias = torch.randn(
+            channels, device="xpu", dtype=torch.float16
+        )
+        expected = torch.nn.functional.group_norm(
+            input, 32, weight, bias, eps=1e-6
+        )
+        actual = norm.group_norm_seedvr_bmg(
+            input, 32, weight, bias, eps=1e-6
+        )
+
+        assert input.stride() == (
+            height * width,
+            temporal * height * width,
+            width,
+            1,
+        )
+        assert actual.is_contiguous()
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(
+            actual, expected, rtol=0.02, atol=0.03125
+        )
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    def test_group_norm_seedvr_bmg_rejects_contiguous_input(self):
+        from omni_xpu_kernel import norm
+
+        if not norm.supports_group_norm_seedvr_bmg():
+            pytest.skip("loaded binary does not contain the SeedVR route")
+
+        input = torch.randn(
+            (2, 512, 128, 128),
+            device="xpu",
+            dtype=torch.float16,
+        )
+        weight = torch.randn(512, device="xpu", dtype=torch.float16)
+        bias = torch.randn(512, device="xpu", dtype=torch.float16)
+        with pytest.raises(
+            RuntimeError,
+            match="requires temporal-interleaved N/C strides",
+        ):
+            norm.group_norm_seedvr_bmg(
+                input, 32, weight, bias, eps=1e-6
+            )
+
+
 class TestLayerNormCorrectness:
     """Correctness tests for LayerNorm kernel."""
     

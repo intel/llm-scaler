@@ -7,7 +7,6 @@ import sys
 import types
 from pathlib import Path
 
-
 _PLUGIN = Path(__file__).parents[1] / "ComfyUI-OmniXPU"
 
 
@@ -74,6 +73,10 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
         "OMNIXPU_INT8_FFN",
         "OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM",
         "OMNIXPU_LORA_MEMORY",
+        "OMNIXPU_SEEDVR_ADA_RESHAPE",
+        "OMNIXPU_SEEDVR_CAPACITY",
+        "OMNIXPU_SEEDVR_CAT_PAD",
+        "OMNIXPU_LARGE_VIDEO_PREPROCESS",
         "OMNIXPU_INTERPOLATE_FIX",
         "OMNIXPU_MEDIAN_FIX",
     ):
@@ -87,6 +90,10 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     assert config.int8_ffn
     assert config.dynamic_vram_boundary_trim
     assert config.lora_memory
+    assert config.seedvr_ada_reshape
+    assert config.seedvr_capacity
+    assert config.seedvr_cat_pad
+    assert config.large_video_preprocess
     assert not config.interpolate_fix
     assert not config.median_fix
     assert not hasattr(config, "rope")
@@ -104,6 +111,10 @@ def test_disabled_components_are_reported_without_importing_modules(monkeypatch)
         int8_ffn=False,
         dynamic_vram_boundary_trim=False,
         lora_memory=False,
+        seedvr_ada_reshape=False,
+        seedvr_capacity=False,
+        seedvr_cat_pad=False,
+        large_video_preprocess=False,
         interpolate_fix=False,
         median_fix=False,
     )

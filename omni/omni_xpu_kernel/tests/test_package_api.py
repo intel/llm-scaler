@@ -47,6 +47,22 @@ def test_norm_h120_capability_is_false_for_legacy_binary(monkeypatch):
     assert norm.supports_h120_fp16() is False
 
 
+def test_layout_cat_pad_capability_comes_from_loaded_binary(monkeypatch):
+    from omni_xpu_kernel import layout
+
+    monkeypatch.setattr(
+        layout, "_get_native", lambda: SimpleNamespace(__cat_pad_bmg__=True)
+    )
+    assert layout.supports_cat_pad_bmg() is True
+
+
+def test_layout_cat_pad_capability_is_false_for_legacy_binary(monkeypatch):
+    from omni_xpu_kernel import layout
+
+    monkeypatch.setattr(layout, "_get_native", lambda: SimpleNamespace())
+    assert layout.supports_cat_pad_bmg() is False
+
+
 def test_rotary_fast_capability_comes_from_loaded_binary(monkeypatch):
     from omni_xpu_kernel import rotary
 

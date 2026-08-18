@@ -17,9 +17,14 @@ log = logging.getLogger("ComfyUI-OmniXPU")
 
 _omni_norm = None
 _logged_first_use = False
+_logged_chunked_rms = False
+_logged_seedvr_group_norm = False
 _allow_noncontiguous_rms = False
 _allow_h120_rms = False
 _allow_bmg_group_norm = False
+_allow_seedvr_group_norm = False
+_RMS_CHUNK_THRESHOLD_BYTES = 4 * 1024**3
+_RMS_CHUNK_INPUT_BYTES = 320 * 1024**2
 _bmg_group_norm_shapes = {
     (1, 512, 128, 128),
     (1, 512, 256, 256),
@@ -27,6 +32,13 @@ _bmg_group_norm_shapes = {
     (1, 256, 512, 512),
     (1, 256, 1024, 1024),
     (1, 128, 1024, 1024),
+}
+_seedvr_group_norm_shapes = {
+    (4, 128, 512, 512),
+    (4, 256, 256, 256),
+    (4, 256, 512, 512),
+    (4, 512, 256, 256),
+    (2, 512, 128, 128),
 }
 
 
@@ -56,6 +68,42 @@ def _can_use_bmg_group_norm(x, num_groups, weight, bias, eps):
         and bias.device == x.device
         and weight.dtype == torch.bfloat16
         and bias.dtype == torch.bfloat16
+        and weight.is_contiguous()
+        and bias.is_contiguous()
+        and weight.ndim == 1
+        and bias.ndim == 1
+        and weight.numel() == x.shape[1]
+        and bias.numel() == x.shape[1]
+        and float(eps) == 1e-6
+    )
+
+
+def _is_seedvr_group_norm_layout(x):
+    if tuple(x.shape) not in _seedvr_group_norm_shapes:
+        return False
+    batch, _channels, height, width = x.shape
+    spatial = height * width
+    return tuple(x.stride()) == (
+        spatial,
+        batch * spatial,
+        width,
+        1,
+    )
+
+
+def _can_use_seedvr_group_norm(x, num_groups, weight, bias, eps):
+    return (
+        _allow_seedvr_group_norm
+        and x.is_xpu
+        and x.dtype == torch.float16
+        and _is_seedvr_group_norm_layout(x)
+        and int(num_groups) == 32
+        and weight is not None
+        and bias is not None
+        and weight.device == x.device
+        and bias.device == x.device
+        and weight.dtype == torch.float16
+        and bias.dtype == torch.float16
         and weight.is_contiguous()
         and bias.is_contiguous()
         and weight.ndim == 1
@@ -135,6 +183,43 @@ def _run_rms_norm(weight, x, eps):
     return _omni_norm.rms_norm(weight, x, eps)
 
 
+def _chunked_weightless_rms_norm(input, normalized_shape, eps):
+    """Bound Torch's temporary storage while preserving its RMSNorm math."""
+    global _logged_chunked_rms
+    hidden = input.shape[-1]
+    input_2d = input.reshape(-1, hidden)
+    chunk_rows = max(1, _RMS_CHUNK_INPUT_BYTES // (hidden * input.element_size()))
+    if not _logged_chunked_rms:
+        log.info(
+            "[OmniXPU] bounded weightless RMSNorm: rows=%d hidden=%d "
+            "chunk_rows=%d input_bytes=%d",
+            input_2d.shape[0],
+            hidden,
+            chunk_rows,
+            input.numel() * input.element_size(),
+        )
+        _logged_chunked_rms = True
+    output = torch.empty_like(input_2d)
+    for start in range(0, input_2d.shape[0], chunk_rows):
+        stop = min(start + chunk_rows, input_2d.shape[0])
+        output[start:stop] = torch.nn.functional.rms_norm(
+            input_2d[start:stop], normalized_shape, None, eps
+        )
+    return output.reshape(input.shape)
+
+
+def _should_chunk_weightless_rms(input, weight):
+    return bool(
+        input is not None
+        and weight is None
+        and input.is_xpu
+        and input.is_contiguous()
+        and not input.requires_grad
+        and not comfy.model_management.in_training
+        and input.numel() * input.element_size() > _RMS_CHUNK_THRESHOLD_BYTES
+    )
+
+
 def _run_group_norm(x, num_groups, weight, bias, eps):
     log_debug_event(
         "kernel",
@@ -147,8 +232,25 @@ def _run_group_norm(x, num_groups, weight, bias, eps):
     )
 
 
+def _run_seedvr_group_norm(x, num_groups, weight, bias, eps):
+    global _logged_seedvr_group_norm
+    if not _logged_seedvr_group_norm:
+        log.info(
+            "[OmniXPU] SeedVR BMG GroupNorm: shape=%s stride=%s "
+            "dtype=%s groups=%d",
+            tuple(x.shape),
+            tuple(x.stride()),
+            x.dtype,
+            int(num_groups),
+        )
+        _logged_seedvr_group_norm = True
+    return _omni_norm.group_norm_seedvr_bmg(
+        x, num_groups, weight, bias, eps
+    )
+
+
 def apply():
-    global _allow_bmg_group_norm
+    global _allow_bmg_group_norm, _allow_seedvr_group_norm
     global _allow_h120_rms, _allow_noncontiguous_rms, _omni_norm
     import sys
     probe = sys.modules.get("ComfyUI-OmniXPU.probe")
@@ -179,6 +281,15 @@ def apply():
             and supports_group_norm()
             and os.environ.get("OMNIXPU_BMG_GROUPNORM", "1") != "0"
         )
+        supports_seedvr_group_norm = getattr(
+            _omni_norm, "supports_group_norm_seedvr_bmg", None
+        )
+        _allow_seedvr_group_norm = (
+            _target_supports_group_norm(target)
+            and callable(supports_seedvr_group_norm)
+            and supports_seedvr_group_norm()
+            and os.environ.get("OMNIXPU_SEEDVR_GROUPNORM", "1") != "0"
+        )
         log.info(
             "[OmniXPU] norm: H120 FP16 native route %s (target=%s)",
             "enabled" if _allow_h120_rms else "disabled",
@@ -189,8 +300,14 @@ def apply():
             "enabled" if _allow_bmg_group_norm else "disabled",
             target or "unknown",
         )
+        log.info(
+            "[OmniXPU] norm: SeedVR BMG GroupNorm route %s (target=%s)",
+            "enabled" if _allow_seedvr_group_norm else "disabled",
+            target or "unknown",
+        )
     except ImportError:
         _allow_bmg_group_norm = False
+        _allow_seedvr_group_norm = False
         _allow_noncontiguous_rms = False
         _allow_h120_rms = False
 
@@ -272,7 +389,12 @@ def apply():
             bias = None
             offload_stream = None
         input_2d = _rms_input_2d(input)
-        if input_2d is not None and weight is not None and weight.shape[0] == input.shape[-1]:
+        if _should_chunk_weightless_rms(input, weight):
+            _log_first("RMSNorm-chunked", input.shape)
+            x = _chunked_weightless_rms_norm(
+                input, self.normalized_shape, self.eps
+            )
+        elif input_2d is not None and weight is not None and weight.shape[0] == input.shape[-1]:
             _log_first("RMSNorm", input.shape)
             orig = input.shape
             eps = self.eps if self.eps is not None else 1e-6
@@ -293,6 +415,11 @@ def apply():
             return _rn_cast(self, *args, **kwargs)
         input = args[0] if args else kwargs.get("input")
         input_2d = _rms_input_2d(input) if input is not None else None
+        if _should_chunk_weightless_rms(input, self.weight):
+            _log_first("RMSNorm-chunked", input.shape)
+            return _chunked_weightless_rms_norm(
+                input, self.normalized_shape, self.eps
+            )
         if (input_2d is not None and self.weight is not None
                 and self.weight.shape[0] == input.shape[-1]):
             _log_first("RMSNorm", input.shape)
@@ -354,10 +481,9 @@ def apply():
         pass  # comfy.rmsnorm may not exist in all versions
 
     # --- BMG GroupNorm exact workflow contracts ---
-    # The global functional wrapper reaches the Boogu model's GroupNorm call
-    # sites without changing its modules or graph. Every other tensor contract
-    # remains on Torch.
-    if _allow_bmg_group_norm:
+    # The global functional wrapper reaches validated activation contracts
+    # without changing model modules or graphs. All other inputs stay on Torch.
+    if _allow_bmg_group_norm or _allow_seedvr_group_norm:
         _orig_group_norm = torch.nn.functional.group_norm
 
         @trace_patch(
@@ -373,6 +499,13 @@ def apply():
             bias=None,
             eps=1e-5,
         ):
+            if _can_use_seedvr_group_norm(
+                input, num_groups, weight, bias, eps
+            ):
+                _log_first("SeedVR BMG GroupNorm", input.shape)
+                return _run_seedvr_group_norm(
+                    input, num_groups, weight, bias, eps
+                )
             if _can_use_bmg_group_norm(
                 input, num_groups, weight, bias, eps
             ):

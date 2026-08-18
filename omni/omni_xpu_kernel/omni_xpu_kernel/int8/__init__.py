@@ -87,6 +87,127 @@ def _apply_input_act(
 _h3_swiglu_trace_logged = False
 _h3_low_peak_trace_logged = False
 _h3_low_peak_convrot_trace_logged = False
+_int8_linear_tiling_trace_logged = False
+
+# A single very-large dynamic INT8 matmul keeps its full MxK quantized
+# activation live beside the unavoidable MxN output.  Under resident model
+# weights this can exhaust device memory or Level Zero resources.  Bound each
+# dispatch by its quantized-input plus output span; rowwise quantization makes
+# rows independent, so tiling preserves the quantization and output contracts.
+_INT8_LINEAR_TILING_MIN_QUANTIZED_BYTES = 512 * 1024**2
+_INT8_LINEAR_TILING_MIN_LIVE_BYTES = 2 * 1024**3
+_INT8_LINEAR_TILING_CHUNK_BYTES = 512 * 1024**2
+_INT8_LINEAR_TILING_ROW_ALIGNMENT = 4096
+
+
+def _int8_linear_chunk_rows(
+    input_features: int, output_features: int, element_size: int
+) -> int:
+    """Return a row tile from the operator's per-row live-byte contract."""
+    row_bytes = input_features + 4 + output_features * element_size
+    rows = max(1, _INT8_LINEAR_TILING_CHUNK_BYTES // row_bytes)
+    if rows >= _INT8_LINEAR_TILING_ROW_ALIGNMENT:
+        rows = (
+            rows // _INT8_LINEAR_TILING_ROW_ALIGNMENT
+            * _INT8_LINEAR_TILING_ROW_ALIGNMENT
+        )
+    return rows
+
+
+def _can_tile_int8_linear(
+    x: torch.Tensor,
+    native,
+    weight: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> bool:
+    """Select bounded row tiling from the operator contract, not model identity."""
+    if (
+        native is None
+        or not hasattr(native, "quantize_int8_rowwise_fused")
+        or not hasattr(native, "int8_linear_prequantized_out")
+        or not isinstance(x, torch.Tensor)
+        or x.device.type != "xpu"
+        or x.dtype not in (torch.float16, torch.bfloat16)
+        or x.ndim < 1
+        or x.shape[-1] <= 0
+        or x.requires_grad
+        or not isinstance(weight, torch.Tensor)
+        or weight.ndim != 2
+        or weight.shape[0] <= 0
+        or weight.shape[1] != x.shape[-1]
+        or weight.device != x.device
+        or weight.dtype != torch.int8
+        or out_dtype not in (torch.float32, torch.float16, torch.bfloat16)
+    ):
+        return False
+    element_size = 4 if out_dtype == torch.float32 else 2
+    rows = x.numel() // x.shape[-1]
+    chunk_rows = _int8_linear_chunk_rows(
+        x.shape[-1], weight.shape[0], element_size
+    )
+    quantized_activation_bytes = rows * (x.shape[-1] + 4)
+    output_bytes = rows * weight.shape[0] * element_size
+    return bool(
+        rows > chunk_rows
+        and quantized_activation_bytes
+        >= _INT8_LINEAR_TILING_MIN_QUANTIZED_BYTES
+        and quantized_activation_bytes + output_bytes
+        >= _INT8_LINEAR_TILING_MIN_LIVE_BYTES
+    )
+
+
+def _tile_int8_linear(
+    x: torch.Tensor,
+    native,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    dtype_code: int,
+) -> torch.Tensor:
+    """Quantize and project independent row tiles into one final output."""
+    global _int8_linear_tiling_trace_logged
+
+    input_shape = tuple(x.shape)
+    rows = x.numel() // x.shape[-1]
+    output_features = weight.shape[0]
+    element_size = 4 if out_dtype == torch.float32 else 2
+    chunk_rows = _int8_linear_chunk_rows(
+        x.shape[-1], output_features, element_size
+    )
+    x_2d = x.reshape(rows, x.shape[-1])
+    output_2d = torch.empty(
+        (rows, output_features), device=x.device, dtype=out_dtype
+    )
+    for start in range(0, rows, chunk_rows):
+        stop = min(start + chunk_rows, rows)
+        chunk = x_2d[start:stop].contiguous()
+        x_int8, x_scale = native.quantize_int8_rowwise_fused(chunk)
+        output_chunk = output_2d[start:stop]
+        native.int8_linear_prequantized_out(
+            x_int8,
+            x_scale,
+            weight,
+            weight_scale,
+            bias,
+            dtype_code,
+            output_chunk,
+        )
+        del output_chunk, x_scale, x_int8, chunk
+
+    if (
+        not _int8_linear_tiling_trace_logged
+        and os.environ.get("OMNIXPU_INT8_TILING_TRACE") == "1"
+    ):
+        print(
+            "[OmniXPU] bounded int8_linear: "
+            f"input={input_shape} output_features={output_features} "
+            f"chunk_rows={chunk_rows}",
+            flush=True,
+        )
+        _int8_linear_tiling_trace_logged = True
+
+    return output_2d.reshape(*input_shape[:-1], output_features)
 
 # The failing 720-class/15s allocation is a single 2.671 GiB BF16 H3 SwiGLU
 # output.  Keep established shorter sequences on the faster whole-tensor route
@@ -1041,6 +1162,16 @@ def int8_linear(
 
                 h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
                 x = _rotate_activation(x, h, convrot_groupsize)
+        if _can_tile_int8_linear(x, native, weight, out_dtype):
+            return _tile_int8_linear(
+                x,
+                native,
+                weight,
+                weight_scale,
+                bias,
+                out_dtype,
+                dtype_code,
+            )
         return native.int8_linear(
             x, weight, weight_scale, bias, dtype_code, False, convrot_groupsize
         )
