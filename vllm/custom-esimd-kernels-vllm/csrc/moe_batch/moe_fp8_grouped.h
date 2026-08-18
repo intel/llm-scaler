@@ -478,9 +478,19 @@ inline torch::Tensor moe_up_fp8_grouped_impl(
     TORCH_CHECK(x.scalar_type() == torch::kHalf);
     int n_tokens = x.size(0);
     int hidden_size = x.size(1);
+    TORCH_CHECK(gate_up_weight.dim() == 3);
+    TORCH_CHECK(
+        (NATIVE_LAYOUT && gate_up_weight.size(1) == hidden_size
+            && gate_up_weight.size(2) % 2 == 0)
+        || (!NATIVE_LAYOUT && gate_up_weight.size(2) == hidden_size
+            && gate_up_weight.size(1) % 2 == 0),
+        "gate_up_weight does not match the selected grouped FP8 layout");
     int intermediate_size = NATIVE_LAYOUT
         ? gate_up_weight.size(2) / 2
         : gate_up_weight.size(1) / 2;
+    TORCH_CHECK(
+        hidden_size % 16 == 0 && intermediate_size % 16 == 0,
+        "grouped FP8 hidden and intermediate sizes must be multiples of 16");
     int total_routes = n_tokens * (int)top_k;
     auto intermediate = torch::empty({total_routes, intermediate_size},
         torch::device(x.device()).dtype(torch::kHalf));
@@ -568,9 +578,17 @@ inline torch::Tensor moe_down_fp8_grouped_impl(
     TORCH_CHECK(intermediate.scalar_type() == torch::kHalf);
     int total_routes = intermediate.size(0);
     int intermediate_size = intermediate.size(1);
+    TORCH_CHECK(down_weight.dim() == 3);
+    TORCH_CHECK(
+        (NATIVE_LAYOUT && down_weight.size(1) == intermediate_size)
+        || (!NATIVE_LAYOUT && down_weight.size(2) == intermediate_size),
+        "down_weight does not match the selected grouped FP8 layout");
     int hidden_size = NATIVE_LAYOUT
         ? down_weight.size(2)
         : down_weight.size(1);
+    TORCH_CHECK(
+        hidden_size % 16 == 0 && intermediate_size % 16 == 0,
+        "grouped FP8 hidden and intermediate sizes must be multiples of 16");
     auto output = torch::empty({total_routes, hidden_size},
         torch::device(intermediate.device()).dtype(torch::kHalf));
     moe_down_fp8_grouped_kernel<16, NATIVE_LAYOUT>(

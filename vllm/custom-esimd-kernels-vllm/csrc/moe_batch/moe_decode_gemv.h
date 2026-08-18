@@ -52,9 +52,9 @@ SYCL_ESIMD_FUNCTION simd<float, N> fp8e4m3_dequant_fast(simd<uint8_t, N> raw) {
 }
 
 
-// VL_BIG full chunks + one VL_TAIL chunk (VL_TAIL may be 0). KS=1.
+// VL-wide full chunks plus 32-element tail chunks. KS=1.
 // Up + gelu_tanh. gate_up_weight [E, 2*inter, hidden], K = hidden.
-template<int VL, int VL_TAIL>
+template<int VL>
 struct MoeUpDecodeGeluTanh {
     const fp16*    x;
     const uint8_t* gate_up_weight;
@@ -85,13 +85,16 @@ struct MoeUpDecodeGeluTanh {
         }
         float g_sum = reduce<float>(g_acc, std::plus<>());
         float u_sum = reduce<float>(u_acc, std::plus<>());
-        if constexpr (VL_TAIL > 0) {
-            int kt = kp_full;
-            simd<fp16, VL_TAIL> xv = block_load<fp16, VL_TAIL>(x + kt);
-            simd<float, VL_TAIL> xf = xv;
-            g_sum += reduce<float>(xf * fp8e4m3_dequant_fast<VL_TAIL>((block_load<uint8_t, VL_TAIL>(w_gate + kt))), std::plus<>());
-            u_sum += reduce<float>(xf * fp8e4m3_dequant_fast<VL_TAIL>((block_load<uint8_t, VL_TAIL>(w_up + kt))), std::plus<>());
+        simd<float, 32> g_tail(0.f), u_tail(0.f);
+        for (int k = kp_full; k < hidden; k += 32) {
+            simd<float, 32> xf = block_load<fp16, 32>(x + k);
+            g_tail += xf * fp8e4m3_dequant_fast<32>(
+                block_load<uint8_t, 32>(w_gate + k));
+            u_tail += xf * fp8e4m3_dequant_fast<32>(
+                block_load<uint8_t, 32>(w_up + k));
         }
+        g_sum += reduce<float>(g_tail, std::plus<>());
+        u_sum += reduce<float>(u_tail, std::plus<>());
 
         float scale = gate_up_scale[eid];
         float gs = g_sum * scale, us = u_sum * scale;
@@ -109,7 +112,7 @@ struct MoeUpDecodeGeluTanh {
 };
 
 // Down. down_weight [E, hidden, inter], K = inter.
-template<int VL, int VL_TAIL>
+template<int VL>
 struct MoeDownDecode {
     const fp16*    intermediates;   // [top_k, inter]
     const uint8_t* down_weight;
@@ -137,12 +140,13 @@ struct MoeDownDecode {
             acc += hf * fp8e4m3_dequant_fast<VL>((block_load<uint8_t, VL>(wrow + k)));
         }
         float s = reduce<float>(acc, std::plus<>());
-        if constexpr (VL_TAIL > 0) {
-            int kt = kp_full;
-            simd<fp16, VL_TAIL> hv = block_load<fp16, VL_TAIL>(hi + kt);
-            simd<float, VL_TAIL> hf = hv;
-            s += reduce<float>(hf * fp8e4m3_dequant_fast<VL_TAIL>((block_load<uint8_t, VL_TAIL>(wrow + kt))), std::plus<>());
+        simd<float, 32> tail(0.f);
+        for (int k = kp_full; k < inter; k += 32) {
+            simd<float, 32> hf = block_load<fp16, 32>(hi + k);
+            tail += hf * fp8e4m3_dequant_fast<32>(
+                block_load<uint8_t, 32>(wrow + k));
         }
+        s += reduce<float>(tail, std::plus<>());
 
         float w = (float)routing_weights[route];
         float ds = down_scale[eid];
