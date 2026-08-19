@@ -235,17 +235,6 @@ This way, only the first GPU will be mapped into the Docker container.
 
 ---
 
-**Note — Intel XPU Runtime Environment**
-> The image includes the required Intel XPU runtime libraries and configures
-> `/opt/venv/bin` in `PATH`. Do not source `/opt/intel/oneapi/setvars.sh`;
-> the runtime image does not include that script. Commands such as `vllm serve`
-> can be invoked directly from interactive shells, Docker Compose, or an
-> overridden entrypoint.
-
----
-
-
-
 ### 1.4 Launching the Serving Service
 
 ### 1.4.0 (Optional)
