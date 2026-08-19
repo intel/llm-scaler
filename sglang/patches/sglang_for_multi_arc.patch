@@ -1,9 +1,9 @@
 diff --git a/GEMMA4_BMG_OPTIMIZATION_STATUS.md b/GEMMA4_BMG_OPTIMIZATION_STATUS.md
 new file mode 100644
-index 0000000000..f030b24990
+index 0000000000..81e6627457
 --- /dev/null
 +++ b/GEMMA4_BMG_OPTIMIZATION_STATUS.md
-@@ -0,0 +1,1301 @@
+@@ -0,0 +1,1325 @@
 +# Gemma4-31B FP16 FP8 Decode Optimization Status (BMG TP=2)
 +
 +## ✅ UPDATE (2026-07-08): Gemma4 MTP 在 BMG/XPU 已打通（GAP AUDIT 中的阻塞项已解决）
@@ -264,6 +264,30 @@ index 0000000000..f030b24990
 +208 GRF > 128 → large-GRF/spill), and the extra `kvStart`+compound-`simd_mask`
 +comparisons perturb module splitting past what the AOT flow accepts (per_kernel
 +split is already on). Host-side windowing sidesteps this entirely.
++
++## ✅ FIXED (2026-08-19): 同一个 SWA 窗口 bug 还存在于**真正在跑的那条 decode 路径**（sglang_decode_attn）
++
++上面 2026-07-06 那节修的是 `page_attn_decode`（paged 路径）。但**当前 stack 根本不走那条路**：
++
++- `SGL_XPU_DECODE_SGLANG_ATTN` 默认 `1`，gate 是 `layer.head_dim == 256`，即**所有 50 个 sliding 层**的 decode 都走 `_sglang_decode_attn_fn`。
++- 而且本镜像的 ESIMD wheel **没有 `page_attn_decode` 这个 op**（实测 `custom_esimd_kernels_sglang` 89 个 op 中不含），所以 `_use_esimd_pa` 恒为 False —— paged 分支和它那段窗口修复都是**死代码**。
++
++`_build_sglang_decode_attn_inputs_eager` 的 `kv_indptr/kv_indices` 用**全池** `req_to_token` + 完整 `cache_seqlens` 构建，然后拿去索引 **SWA 池**的 k/v buffer，两个缺陷叠加：
++
++1. **没有窗口裁剪**：sliding 层遍历全部 `[0, seq_len)`，而只有末尾 `window` 个 token 还驻留；
++2. **索引空间错误**：`req_to_token` 存的是 full-pool 槽位号，未经 `translate_loc_from_full_to_swa` 转换。槽位号一旦超过 SWA 池大小（本配置 18240）就**越界读**。
++
++**症状**：某个 sliding 层（实测稳定是 layer 4）的 `core_attn_out` 突然全 NaN → 整条请求 logits 全 NaN。
++- **贪心解码时静默**：argmax 对 NaN 不报错，只是输出垃圾（BFCL 表现为 "Empty response from the model"，结果长度 13–31）。
++- **温度采样时炸**：`torch.multinomial` 的异步断言触发（`TensorCompareKernels.cpp:180: Assertion input_[0] != 0`），server 死，且**把 XPU context 弄成 wedged**——下次启动会卡在 `torch.xpu.empty_cache()` / `_move_module_tensors_to_device`，**容器要重启两次**才恢复。
++
++**定位过程中被实测排除的因素**（都不是原因）：`swa_full_tokens_ratio`(0.2 vs 0.4)、并发(threads 1 vs 4)、radix cache(SWARadixCache vs SWAChunkCache)、全部 ESIMD fast path（QKV / decode / page attn / fused norm 全关仍复现）、KV cache 内容本身（实测 layer4 整个 KV buffer `nonfinite=0`，`|k|<=0.91`、`|v|<=16`）。**长上下文本身也不是充分条件**：单条 4k/8k/14k/22k 合成 prompt 贪心解码 logprob 全有限——因为那时分配到的槽位号还没超过 SWA 池大小。
++
++**修复**（`xpu_backend.py`，commit `a8d3bae93e`）：sliding 层单独构建 kv 输入——按 `min(seq_len, window)` 裁长度、用 triton builder 的 `kv_start_idx` 从 `seq_len - len` 起始、再经 `translate_loc_from_full_to_swa` 转换槽位；full-attention 层不变，两者分开 memoize。同时把已有的 window view 也接到 split-K fallback（它同样接受 head_dim 256）。
++
++**验证**：BFCL smoke 5/5 OK（修复前 5/5 connection error）；gsm8k_chat_eval n=100 = **0.980**；bench 同配置背靠背 **TPOT 8192×256 47.15 → 41.78ms（-11.4%）**、4096 42.07 → 41.00ms，TTFT 不变（改动只影响 decode）。BFCL 生成速率 0.25 条/分 → **10.5 条/分**。
++
++**教训**：`page_attn_decode` 缺失是静默的（`is not None` 判空后直接换路径），所以"给 paged 路径修了 SWA 窗口"这件事对交付配置**零效果**。改 attention 相关代码前，先确认**哪条分支真的在跑**（读 gate + 确认 op 是否存在于 wheel）。
 +
 +## ✅ BFCL v4 multi_turn_base FORMAL BENCHMARK (2026-07-06): FULL 200 = 72.50% (radix on)
 +
@@ -3011,10 +3035,10 @@ index ae5365e8d6..0f54d2a8ce 100644
              q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
              self.token_to_kv_pool.get_key_buffer(layer.layer_id),
 diff --git a/python/sglang/srt/layers/attention/xpu_backend.py b/python/sglang/srt/layers/attention/xpu_backend.py
-index ea02e001f1..81f165d61d 100644
+index ea02e001f1..330dcaa6d1 100644
 --- a/python/sglang/srt/layers/attention/xpu_backend.py
 +++ b/python/sglang/srt/layers/attention/xpu_backend.py
-@@ -1,9 +1,29 @@
+@@ -1,9 +1,68 @@
  from __future__ import annotations
  
 +import os
@@ -3041,10 +3065,49 @@ index ea02e001f1..81f165d61d 100644
 +# whether the graph garble is in page_attn_decode vs split-K.
 +_DISABLE_PAGE_ATTN = os.environ.get("SGLANG_DISABLE_PAGE_ATTN", "0") == "1"
 +
++# Diagnostic: validate the SWA windowed page table against the pool bounds.
++_DEBUG_SWA_WINDOW = os.environ.get("SGLANG_DEBUG_SWA_WINDOW", "0") == "1"
++_swa_window_reports = 0
++
++
++def _debug_swa_window(layer_id, page_table_pa, pa_seqlens, max_seq, key_cache, page_size):
++    """Check the two ways the windowed page table can break the ESIMD kernel:
++    an effective seq_len longer than the windowed table (kernel walks past the
++    table) and page indices that fall outside the SWA pool."""
++    global _swa_window_reports
++    if _swa_window_reports >= 6:
++        return
++    import logging as _logging
++
++    _log = _logging.getLogger(__name__)
++    sl_max = int(pa_seqlens.max().item())
++    pt_min = int(page_table_pa.min().item())
++    pt_max = int(page_table_pa.max().item())
++    pool_slots = int(key_cache.shape[0])
++    max_slot = pt_max * page_size + page_size - 1 if pt_max < pool_slots else pt_max
++    overrun = sl_max > max_seq
++    oob = pt_min < 0 or max_slot >= pool_slots
++    if overrun or oob or _swa_window_reports < 2:
++        _swa_window_reports += 1
++        _log.error(
++            "[swa-win] layer=%d sl_max=%d max_seq=%d cols=%d pt_range=[%d,%d] "
++            "pool_slots=%d overrun=%s oob=%s seqlens=%s",
++            layer_id,
++            sl_max,
++            max_seq,
++            page_table_pa.shape[1],
++            pt_min,
++            pt_max,
++            pool_slots,
++            overrun,
++            oob,
++            pa_seqlens.tolist()[:8],
++        )
++
  from sglang.srt.configs.model_config import AttentionArch
  from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
  from sglang.srt.layers.attention.flashattention_backend import (
-@@ -20,9 +40,81 @@ if TYPE_CHECKING:
+@@ -20,9 +79,81 @@ if TYPE_CHECKING:
      from sglang.srt.layers.radix_attention import RadixAttention
      from sglang.srt.model_executor.model_runner import ModelRunner
  
@@ -3126,7 +3189,7 @@ index ea02e001f1..81f165d61d 100644
  
  class XPUAttentionBackend(AttentionBackend):
      """XPU FlashAttention backend, currently based on FlashAttentionBackend, will be refactored later.
-@@ -30,7 +122,8 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -30,7 +161,8 @@ class XPUAttentionBackend(AttentionBackend):
      TODO:
      - Prefill and Decode disaggregation, currently only chunked prefill is supported
      - Speculative Decoding support
@@ -3136,7 +3199,7 @@ index ea02e001f1..81f165d61d 100644
      - MLA Prefill support
      """
  
-@@ -71,6 +164,15 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -71,6 +203,15 @@ class XPUAttentionBackend(AttentionBackend):
          self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
          self.page_size = model_runner.page_size
          self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
@@ -3152,7 +3215,7 @@ index ea02e001f1..81f165d61d 100644
          self.skip_prefill = skip_prefill
          self.is_hybrid_swa = model_runner.is_hybrid_swa
          self.use_sliding_window_kv_pool = (
-@@ -103,6 +205,346 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -103,6 +244,401 @@ class XPUAttentionBackend(AttentionBackend):
          self.has_swa = (
              self.sliding_window_size is not None and self.sliding_window_size > -1
          )
@@ -3160,7 +3223,12 @@ index ea02e001f1..81f165d61d 100644
 +        self._graph_state: dict = {}
 +
 +    def _build_sglang_decode_attn_inputs_eager(
-+        self, forward_batch: ForwardBatch, metadata, tp_q_head_num: int, head_dim: int
++        self,
++        forward_batch: ForwardBatch,
++        metadata,
++        tp_q_head_num: int,
++        head_dim: int,
++        sliding_window_size: int = -1,
 +    ):
 +        """Build the flat-NHD kv_indptr/kv_indices/temp_p inputs that
 +        sglang_decode_attn needs, without requiring XPU device-graph capture
@@ -3190,7 +3258,20 @@ index ea02e001f1..81f165d61d 100644
 +        # remaining layers reuse them -- removing ~9x (cumsum + kv_indptr fill +
 +        # create_flashinfer_kv_indices) dispatched ops per step on the
 +        # disable-XPU-graph path.
-+        cached = getattr(metadata, "_eager_kv_inputs", None)
++        # Sliding-window layers must NOT reuse the full-attention inputs: their
++        # KV lives in the (much smaller) SWA pool and is addressed by translated
++        # slot ids, so they get their own memoized variant.
++        is_swa = sliding_window_size is not None and sliding_window_size > -1
++        swa_index_map = getattr(self, "full_to_swa_index_mapping", None)
++        if swa_index_map is None:
++            swa_index_map = getattr(
++                self.token_to_kv_pool, "full_to_swa_index_mapping", None
++            )
++        translate_swa = (
++            is_swa and self.use_sliding_window_kv_pool and swa_index_map is not None
++        )
++        cache_attr = "_eager_kv_inputs_swa" if is_swa else "_eager_kv_inputs"
++        cached = getattr(metadata, cache_attr, None)
 +        if cached is not None and cached[0].numel() == bs + 1:
 +            return cached
 +        device = metadata.cache_seqlens_int32.device
@@ -3205,12 +3286,26 @@ index ea02e001f1..81f165d61d 100644
 +        max_seq_len_k = getattr(metadata, "max_seq_len_k", None)
 +        if not isinstance(max_seq_len_k, int) or max_seq_len_k <= 0:
 +            max_seq_len_k = self.max_context_len
-+        need_kv = max(bs * max_seq_len_k, 1)
++        # For a sliding layer only the last `window` tokens are resident in the
++        # SWA pool; everything older was evicted and its full->swa mapping is
++        # stale. Walking [0, seq_len) there reads other tokens' KV or, once the
++        # full-pool slot ids exceed the SWA pool size, reads out of bounds --
++        # which is what poisoned decode with NaN.
++        window_tokens = (sliding_window_size + 1) if is_swa else 0
++        if is_swa:
++            need_kv = max(bs * window_tokens, 1)
++        else:
++            need_kv = max(bs * max_seq_len_k, 1)
 +        need_temp = max(bs * tp_q_head_num * _MAX_N_SPLITS * (1 + 1 + 256), 1)
 +
 +        # Persistent grow-only scratch: allocate once, reuse (and only grow)
 +        # across decode steps. No per-step torch.empty, no per-bs rebuild.
-+        cache = getattr(self, "_sglang_decode_eager_scratch", None)
++        scratch_attr = (
++            "_sglang_decode_eager_scratch_swa"
++            if is_swa
++            else "_sglang_decode_eager_scratch"
++        )
++        cache = getattr(self, scratch_attr, None)
 +        if (
 +            cache is None
 +            or cache["kv_indptr"].numel() < bs + 1
@@ -3228,15 +3323,23 @@ index ea02e001f1..81f165d61d 100644
 +                    need_temp, dtype=torch.float32, device=device
 +                ),
 +            }
-+            self._sglang_decode_eager_scratch = cache
++            setattr(self, scratch_attr, cache)
 +
 +        kv_indptr = cache["kv_indptr"][: bs + 1]
 +        kv_indices = cache["kv_indices"]
 +        temp_p = cache["temp_p"]
 +
++        seqlens = metadata.cache_seqlens_int32
++        kv_start_idx = None
++        if is_swa:
++            # Keep only the trailing `window` tokens: length = min(seq_len,
++            # window), starting at seq_len - length.
++            seqlens = torch.clamp(seqlens, max=window_tokens)
++            kv_start_idx = metadata.cache_seqlens_int32 - seqlens
++
 +        kv_indptr[0] = 0
 +        torch.cumsum(
-+            metadata.cache_seqlens_int32,
++            seqlens,
 +            dim=0,
 +            dtype=torch.int32,
 +            out=kv_indptr[1:],
@@ -3248,15 +3351,30 @@ index ea02e001f1..81f165d61d 100644
 +        create_flashinfer_kv_indices_triton[(bs,)](
 +            self.req_to_token,
 +            forward_batch.req_pool_indices,
-+            metadata.cache_seqlens_int32,
++            seqlens,
 +            kv_indptr,
-+            None,
++            kv_start_idx,
 +            kv_indices,
 +            self.req_to_token.stride(0),
 +        )
++        if translate_swa:
++            # req_to_token holds FULL-pool slot ids; the sliding layers read the
++            # SWA pool, so the ids must go through the same full->swa slot map
++            # the paged path applies to its page table. Untranslated ids index a
++            # different (and for large ids, out-of-range) buffer.
++            n_used = min(kv_indices.numel(), max(bs * window_tokens, 1))
++            used = kv_indices[:n_used]
++            # Entries past kv_indptr[-1] are stale scratch; clamp so the gather
++            # below can never run off the mapping table.
++            used.clamp_(0, swa_index_map.numel() - 1)
++            used.copy_(
++                self.token_to_kv_pool.translate_loc_from_full_to_swa(used).to(
++                    torch.int32
++                )
++            )
 +        result = (kv_indptr, kv_indices, temp_p, graph_max_seq)
 +        try:
-+            metadata._eager_kv_inputs = result
++            setattr(metadata, cache_attr, result)
 +        except Exception:
 +            pass
 +        return result
@@ -3499,7 +3617,7 @@ index ea02e001f1..81f165d61d 100644
  
      def init_forward_metadata(self, forward_batch: ForwardBatch):
          """Initialize forward metadata hence all layers in the forward pass can reuse it."""
-@@ -590,24 +1032,52 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -590,24 +1126,52 @@ class XPUAttentionBackend(AttentionBackend):
                  cu_seqlens_k = metadata.encoder_cu_seqlens_k
                  window_size = (-1, -1)
  
@@ -3569,7 +3687,7 @@ index ea02e001f1..81f165d61d 100644
  
              if use_cascade_attn:
                  o, softmax_lse, *rest = result
-@@ -865,10 +1335,31 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -865,10 +1429,31 @@ class XPUAttentionBackend(AttentionBackend):
                  -1, self.page_size, layer.tp_v_head_num, layer.head_dim
              )
  
@@ -3602,7 +3720,7 @@ index ea02e001f1..81f165d61d 100644
                      k_cache=key_cache,
                      v_cache=value_cache,
                      page_table=metadata.encoder_page_table,
-@@ -887,7 +1378,7 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -887,7 +1472,7 @@ class XPUAttentionBackend(AttentionBackend):
              elif use_local_attn:
                  # Use chunked (local) attention batching for self-attention
                  o = flash_attn_with_kvcache(
@@ -3611,7 +3729,7 @@ index ea02e001f1..81f165d61d 100644
                      k_cache=key_cache,
                      v_cache=value_cache,
                      page_table=local_attn_metadata.local_block_table,
-@@ -903,6 +1394,74 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -903,6 +1488,78 @@ class XPUAttentionBackend(AttentionBackend):
                      v_descale=v_descale,
                      **kwargs,
                  )
@@ -3656,7 +3774,11 @@ index ea02e001f1..81f165d61d 100644
 +                        temp_p,
 +                        graph_max_seq,
 +                    ) = self._build_sglang_decode_attn_inputs_eager(
-+                        forward_batch, metadata, layer.tp_q_head_num, layer.head_dim
++                        forward_batch,
++                        metadata,
++                        layer.tp_q_head_num,
++                        layer.head_dim,
++                        layer.sliding_window_size,
 +                    )
 +                _sglang_decode_attn_fn(
 +                    q_fp16,
@@ -3686,7 +3808,7 @@ index ea02e001f1..81f165d61d 100644
              else:
                  is_swa_layer = (
                      layer.sliding_window_size is not None
-@@ -929,25 +1488,192 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -929,25 +1586,210 @@ class XPUAttentionBackend(AttentionBackend):
                      -1, layer.tp_q_head_num, layer.head_dim
                  )
  
@@ -3708,6 +3830,82 @@ index ea02e001f1..81f165d61d 100644
 -                    v_descale=v_descale,
 -                    return_softmax_lse=use_cascade_attn,
 -                    **kwargs,
++                # Sliding-window (SWA) layers: every decode kernel here reads the
++                # full [0, seq_len) page table. Once seq_len > window, positions
++                # older than the window have been evicted from the SWA pool and
++                # their full->swa mapping points at a stale slot, so those reads
++                # return another token's KV (or land outside the pool) and poison
++                # the output — observed as all-NaN hidden states on the first
++                # sliding layer whose garbage happens to overflow.
++                #
++                # Fix WITHOUT any kernel change: page-align the page table to the
++                # LAST `window` tokens and pass the reduced seq_len, so the kernel
++                # only ever reads resident, in-window KV. The SWA pool evicts per
++                # page, so the window-boundary page is resident whenever it holds
++                # any in-window token; floor-aligning the start therefore reads
++                # only valid slots (it may attend up to page_size-1 extra,
++                # still-resident, slightly-older tokens — a benign superset of
++                # FA3's window_size=(sliding_window_size, 0)).
++                #
++                # This must be applied to BOTH decode kernels: page_attn_decode is
++                # absent from some sgl-kernel builds, and the split-K fallback
++                # accepts head_dim 256 and would otherwise silently read evicted
++                # slots. The windowed table depends only on cache_seqlens + the
++                # SWA page table, which are identical across all ~50 SWA layers in
++                # a step, so compute it ONCE per step and cache it on the
++                # (per-step-fresh) metadata object.
++                swa_window_view = None
++                if (
++                    is_swa_layer
++                    and max_seqlen_q == 1
++                    and layer.sliding_window_size is not None
++                    and layer.sliding_window_size > -1
++                    and metadata.max_seq_len_k > (layer.sliding_window_size + 1)
++                ):
++                    swa_window_view = getattr(metadata, "_swa_win_cache", None)
++                    if swa_window_view is None:
++                        window_tokens = layer.sliding_window_size + 1
++                        ps = self.page_size
++                        n_win_pages = (window_tokens - 1) // ps + 2
++                        n_cols = page_table.shape[1]
++                        # bs==1 takes a host-side fast path: the window is a
++                        # CONTIGUOUS page span, so slice the page table (a
++                        # zero-copy view) instead of building an index tensor and
++                        # gathering. Microbench: 74us (gather) -> 8us (slice).
++                        if forward_batch.batch_size == 1:
++                            start_pg = (
++                                max(metadata.max_seq_len_k - window_tokens, 0)
++                                // ps
++                            )
++                            end_pg = min(start_pg + n_win_pages, n_cols)
++                            pt_win = page_table[:, start_pg:end_pg]
++                            sl_win = cache_seqlens - (start_pg * ps)
++                        else:
++                            start_page = (
++                                torch.clamp(cache_seqlens - window_tokens, min=0) // ps
++                            )
++                            col = start_page.to(torch.int64).unsqueeze(
++                                1
++                            ) + torch.arange(
++                                n_win_pages,
++                                device=page_table.device,
++                                dtype=torch.int64,
++                            )
++                            col = col.clamp_(max=n_cols - 1)
++                            pt_win = torch.gather(page_table, 1, col)
++                            sl_win = (cache_seqlens - start_page * ps).to(torch.int32)
++                        swa_window_view = (pt_win, sl_win, pt_win.shape[1] * ps)
++                        metadata._swa_win_cache = swa_window_view
++                    if _DEBUG_SWA_WINDOW:
++                        _debug_swa_window(
++                            layer.layer_id,
++                            swa_window_view[0],
++                            swa_window_view[1],
++                            swa_window_view[2],
++                            key_cache,
++                            self.page_size,
++                        )
++
 +                # ESIMD page_attn_decode fast path: no SLM, graph-capturable.
 +                # Fires for head_dim==256 layers, which for gemma4 are the SWA
 +                # (sliding-window) layers (global layers have head_dim=512 and
@@ -3735,79 +3933,12 @@ index ea02e001f1..81f165d61d 100644
 +                        ("pa_out", layer.layer_id), (bs, layer.tp_q_head_num, layer.head_dim),
 +                        torch.float16, q_reshaped.device,
 +                    )
-+                    pa_seqlens = cache_seqlens
-+                    page_table_pa = page_table
-+                    max_seq = page_table.shape[1] * self.page_size
-+                    # Sliding-window (SWA) layers: the ESIMD kernel reads the full
-+                    # [0, seq_len) page table. Once seq_len > window, positions
-+                    # older than the window have been evicted from the SWA pool
-+                    # and their full->swa mapping points to slot 0 (another
-+                    # token's KV = garbage), which garbled decode output. The old
-+                    # clamp hack kept the FIRST window+1 columns (the OLDEST /
-+                    # evicted positions) so it read garbage too.
-+                    #
-+                    # Fix WITHOUT any kernel change: page-align the page table to
-+                    # the LAST `window` tokens and pass the reduced seq_len, so
-+                    # the kernel only ever reads resident, in-window KV. The SWA
-+                    # pool evicts per page (page_size), so the window-boundary
-+                    # page is resident whenever it holds any in-window token;
-+                    # floor-aligning the start therefore reads only valid slots
-+                    # (it may attend up to page_size-1 extra, still-resident,
-+                    # slightly-older tokens — a benign superset of FA3's
-+                    # window_size=(sliding_window_size,0)). This also shrinks the
-+                    # decode grid for long sequences.
-+                    #
-+                    # The windowed table depends only on cache_seqlens + the SWA
-+                    # page table, which are identical across all ~50 SWA layers
-+                    # in a step. Compute it ONCE per step and cache on the
-+                    # (per-step-fresh) metadata object; recomputing per layer
-+                    # added ~7ms TPOT (50x redundant host work).
-+                    #
-+                    # bs==1 (the shippable --max-running-requests 1 config) takes
-+                    # a host-side fast path: the window is a CONTIGUOUS page span
-+                    # [start_page : start_page+n_win_pages], so we slice the page
-+                    # table (a zero-copy view) instead of building an index tensor
-+                    # and gathering. start_page is derived from
-+                    # metadata.max_seq_len_k, which is already a host int (no new
-+                    # device->host sync). Microbench: 74us (gather) -> 8us (slice).
-+                    # bs>1 keeps the gather path (per-batch start pages differ).
-+                    if (
-+                        is_swa_layer
-+                        and layer.sliding_window_size is not None
-+                        and layer.sliding_window_size > -1
-+                        and metadata.max_seq_len_k > (layer.sliding_window_size + 1)
-+                    ):
-+                        cached = getattr(metadata, "_swa_win_cache", None)
-+                        if cached is None:
-+                            window_tokens = layer.sliding_window_size + 1
-+                            ps = self.page_size
-+                            n_win_pages = (window_tokens - 1) // ps + 2
-+                            n_cols = page_table.shape[1]
-+                            if bs == 1:
-+                                start_pg = max(
-+                                    metadata.max_seq_len_k - window_tokens, 0
-+                                ) // ps
-+                                end_pg = min(start_pg + n_win_pages, n_cols)
-+                                pt_pa = page_table[:, start_pg:end_pg]
-+                                sl = cache_seqlens - (start_pg * ps)
-+                            else:
-+                                start_page = (
-+                                    torch.clamp(cache_seqlens - window_tokens, min=0)
-+                                    // ps
-+                                )
-+                                col = start_page.to(torch.int64).unsqueeze(
-+                                    1
-+                                ) + torch.arange(
-+                                    n_win_pages,
-+                                    device=page_table.device,
-+                                    dtype=torch.int64,
-+                                )
-+                                col = col.clamp_(max=n_cols - 1)
-+                                pt_pa = torch.gather(page_table, 1, col)
-+                                sl = (cache_seqlens - start_page * ps).to(torch.int32)
-+                            cached = (pt_pa, sl, pt_pa.shape[1] * self.page_size)
-+                            metadata._swa_win_cache = cached
-+                        page_table_pa, pa_seqlens, max_seq = cached
++                    if swa_window_view is not None:
++                        page_table_pa, pa_seqlens, max_seq = swa_window_view
++                    else:
++                        page_table_pa = page_table
++                        pa_seqlens = cache_seqlens
++                        max_seq = page_table.shape[1] * self.page_size
 +                    # ESIMD kernel hardcodes matMulQuantCoeff=0.0625 (1/sqrt(256)).
 +                    # Compensate for the model's actual scaling factor.
 +                    if layer.scaling != 0.0625:
@@ -3860,6 +3991,15 @@ index ea02e001f1..81f165d61d 100644
 +                            torch.float32, q_reshaped.device,
 +                        )
 +                        max_seq = page_table.shape[1] * self.page_size
++                        # SWA layers: read only the resident window (see the
++                        # swa_window_view comment above). page_attn_decode is
++                        # missing from some sgl-kernel builds, so head_dim 256
++                        # sliding layers land here and must be windowed too;
++                        # without this they read evicted slots and emit NaN.
++                        page_table_sk = page_table
++                        seqlens_sk = cache_seqlens
++                        if swa_window_view is not None:
++                            page_table_sk, seqlens_sk, max_seq = swa_window_view
 +                        # Split-K kernel has built-in 1/sqrt(HD) scaling
 +                        if layer.scaling != hd ** -0.5:
 +                            q_scaled = self._decode_buf(
@@ -3871,7 +4011,7 @@ index ea02e001f1..81f165d61d 100644
 +                            q_scaled = q_reshaped
 +                        _splitk_decode_attention(
 +                            q_scaled, key_cache, value_cache,
-+                            page_table, cache_seqlens,
++                            page_table_sk, seqlens_sk,
 +                            out_sk, scratch, max_seq, G,
 +                        )
 +                        result = out_sk
@@ -3897,7 +4037,7 @@ index ea02e001f1..81f165d61d 100644
                  if use_cascade_attn:
                      o, softmax_lse, *rest = result
                      o_expand, softmax_lse_expand, *rest_expand = (
-@@ -1006,6 +1732,27 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -1006,6 +1848,27 @@ class XPUAttentionBackend(AttentionBackend):
          out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
          return out
  
@@ -6998,6 +7138,74 @@ index 5c1e7a63e6..9ae9c0a6d6 100644
  class GGUFEmbeddingMethod(GGUFLinearMethod):
      """Embedding method for GGUF.
  
+diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
+index 84d57b8e2c..691fad4ddf 100644
+--- a/python/sglang/srt/layers/sampler.py
++++ b/python/sglang/srt/layers/sampler.py
+@@ -60,10 +60,53 @@ logger = logging.getLogger(__name__)
+ 
+ SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
+ SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
++# Diagnostic: report logits/probs stats around temperature scaling. Costs a
++# device->host sync per decode step, so it is off by default.
++SGLANG_SAMPLER_DEBUG_NAN = get_bool_env_var("SGLANG_SAMPLER_DEBUG_NAN")
++_sampler_debug_reports = 0
+ _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
+ _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+ 
+ 
++def _debug_report_sampling_inputs(
++    logits: torch.Tensor, sampling_info: SamplingBatchInfo
++) -> None:
++    """Report whether non-finite values exist before vs. after temperature
++    scaling. Distinguishes a model-side NaN from an overflow introduced by the
++    division itself (e.g. fp16 logits with a tiny temperature)."""
++    global _sampler_debug_reports
++    if _sampler_debug_reports >= 20:
++        return
++
++    pre_bad = int((~torch.isfinite(logits)).sum().item())
++    pre_absmax = float(logits.abs().amax().item()) if logits.numel() else 0.0
++    temps = sampling_info.temperatures
++    tmin = float(temps.min().item())
++    scaled = logits.to(torch.float32) / temps.to(torch.float32)
++    post_bad = int((~torch.isfinite(scaled)).sum().item())
++
++    if pre_bad or post_bad:
++        _sampler_debug_reports += 1
++        logger.error(
++            "[sampler-debug] non-finite logits: dtype=%s shape=%s temp_min=%.6g "
++            "pre_absmax=%.6g pre_nonfinite=%d post_nonfinite=%d",
++            logits.dtype,
++            tuple(logits.shape),
++            tmin,
++            pre_absmax,
++            pre_bad,
++            post_bad,
++        )
++    elif _sampler_debug_reports < 3:
++        _sampler_debug_reports += 1
++        logger.info(
++            "[sampler-debug] clean step: dtype=%s temp_min=%.6g pre_absmax=%.6g",
++            logits.dtype,
++            tmin,
++            pre_absmax,
++        )
++
++
+ class Sampler(nn.Module):
+     def __init__(self):
+         super().__init__()
+@@ -175,6 +218,9 @@ class Sampler(nn.Module):
+                     logprobs = logprobs_via_logsoftmax_kernel
+             else:
+                 # Standard path: do softmax and sample from probs.
++                if SGLANG_SAMPLER_DEBUG_NAN:
++                    _debug_report_sampling_inputs(logits, sampling_info)
++
+                 logits.div_(sampling_info.temperatures)
+ 
+                 # In-place op to save memory
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
 index 8e32640fc6..120fc5e29a 100644
 --- a/python/sglang/srt/managers/scheduler.py
@@ -8100,7 +8308,7 @@ index 32ff5bac25..e8ee7b4ae0 100644
      # FP8 approach: BF16/FP16 model with native FP8 quantization
      if load_config.load_format == LoadFormat.FLASH_RL:
 diff --git a/python/sglang/srt/models/gemma4_causal.py b/python/sglang/srt/models/gemma4_causal.py
-index 9c2f9c25db..b6d47b7b93 100644
+index 9c2f9c25db..44965d9540 100644
 --- a/python/sglang/srt/models/gemma4_causal.py
 +++ b/python/sglang/srt/models/gemma4_causal.py
 @@ -13,6 +13,7 @@
@@ -8111,7 +8319,7 @@ index 9c2f9c25db..b6d47b7b93 100644
  import re
  from typing import Iterable, List, Optional, Set, Tuple, Union
  
-@@ -65,6 +66,28 @@ from sglang.srt.utils import add_prefix, make_layers
+@@ -65,6 +66,108 @@ from sglang.srt.utils import add_prefix, make_layers
  
  logger = logging.getLogger(__name__)
  
@@ -8137,10 +8345,90 @@ index 9c2f9c25db..b6d47b7b93 100644
 +    _esimd_rmsnorm_residual_scalar = None
 +    _esimd_norm_add_norm = None
 +
++
++# Diagnostic: locate the first decoder layer whose output turns non-finite.
++# Forces a device sync per layer, so it is off by default.
++_DEBUG_LAYER_NAN = os.environ.get("SGLANG_GEMMA4_DEBUG_LAYER_NAN", "0") == "1"
++_layer_nan_reports = 0
++
++
++_kv_pool_reports = 0
++
++
++def _debug_probe_kv_pool(attn, attn_output, forward_batch):
++    """When core attention emits non-finite output, decide whether the KV cache
++    itself already holds non-finite values (garbage written earlier) or whether
++    the attention math produced them (fp16 overflow)."""
++    global _kv_pool_reports
++    if _kv_pool_reports >= 4 or attn_output is None:
++        return
++    if not bool((~torch.isfinite(attn_output)).any().item()):
++        return
++    pool = getattr(forward_batch, "token_to_kv_pool", None)
++    if pool is None:
++        try:
++            from sglang.srt.model_executor.forward_context import get_attn_backend
++
++            pool = getattr(get_attn_backend(), "token_to_kv_pool", None)
++        except Exception:
++            pool = None
++    if pool is None:
++        _kv_pool_reports += 1
++        logger.error("[kv-probe] no token_to_kv_pool reachable")
++        return
++    try:
++        kbuf = pool.get_key_buffer(attn.layer_id)
++        vbuf = pool.get_value_buffer(attn.layer_id)
++    except Exception as exc:  # pragma: no cover - diagnostic only
++        logger.error("[kv-probe] cannot read pool: %r", exc)
++        _kv_pool_reports += 1
++        return
++    _kv_pool_reports += 1
++    k_bad = int((~torch.isfinite(kbuf)).sum().item())
++    v_bad = int((~torch.isfinite(vbuf)).sum().item())
++    logger.error(
++        "[kv-probe] layer=%d kbuf%s dtype=%s nonfinite_k=%d absmax_k=%.6g "
++        "| vbuf nonfinite_v=%d absmax_v=%.6g",
++        attn.layer_id,
++        tuple(kbuf.shape),
++        kbuf.dtype,
++        k_bad,
++        float(kbuf[torch.isfinite(kbuf)].abs().amax().item()) if k_bad < kbuf.numel() else float("nan"),
++        v_bad,
++        float(vbuf[torch.isfinite(vbuf)].abs().amax().item()) if v_bad < vbuf.numel() else float("nan"),
++    )
++
++
++def _debug_layer_nan_check(layer_idx, hidden_states, forward_batch, tag="layer_out"):
++    """Log the first tensor that turns non-finite, plus enough batch context to
++    tell prefill from decode."""
++    global _layer_nan_reports
++    if _layer_nan_reports >= 12 or hidden_states is None:
++        return
++    bad = ~torch.isfinite(hidden_states)
++    if not bool(bad.any().item()):
++        return
++    _layer_nan_reports += 1
++    rows = bad.reshape(bad.shape[0], -1).any(dim=-1).nonzero().flatten().tolist()
++    logger.error(
++        "[layer-nan] non-finite at layer=%d tag=%s mode=%s shape=%s "
++        "bad_rows=%s seq_lens=%s",
++        layer_idx,
++        tag,
++        getattr(forward_batch.forward_mode, "name", "?"),
++        tuple(hidden_states.shape),
++        rows[:8],
++        (
++            forward_batch.seq_lens.tolist()[:8]
++            if forward_batch.seq_lens is not None
++            else None
++        ),
++    )
++
  
  # Aligned with HF's implementation, using sliding window inclusive with the last token
  # SGLang assumes exclusive
-@@ -404,6 +427,20 @@ class Gemma4Attention(nn.Module):
+@@ -404,6 +507,20 @@ class Gemma4Attention(nn.Module):
              prefix=add_prefix("attn", prefix),
          )
  
@@ -8161,7 +8449,7 @@ index 9c2f9c25db..b6d47b7b93 100644
      def forward(
          self,
          positions: torch.Tensor,
-@@ -412,6 +449,72 @@ class Gemma4Attention(nn.Module):
+@@ -412,6 +529,80 @@ class Gemma4Attention(nn.Module):
          **kwargs,
      ):
          qkv, _ = self.qkv_proj(hidden_states)
@@ -8226,6 +8514,14 @@ index 9c2f9c25db..b6d47b7b93 100644
 +            attn_output = self.attn(
 +                q, k, v, forward_batch=forward_batch, save_kv_cache=True,
 +            )
++            if _DEBUG_LAYER_NAN:
++                _debug_layer_nan_check(self.layer_id, q, forward_batch, tag="esimd_q")
++                _debug_layer_nan_check(self.layer_id, k, forward_batch, tag="esimd_k")
++                _debug_layer_nan_check(self.layer_id, v, forward_batch, tag="esimd_v")
++                _debug_layer_nan_check(
++                    self.layer_id, attn_output, forward_batch, tag="core_attn_out"
++                )
++                _debug_probe_kv_pool(self.attn, attn_output, forward_batch)
 +            if attn_output.dim() == 3:
 +                attn_output = attn_output.flatten(-2, -1)
 +            output, _ = self.o_proj(attn_output)
@@ -8234,7 +8530,7 @@ index 9c2f9c25db..b6d47b7b93 100644
          q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
  
          # Fused Q/K/V RMSNorm: replaces three separate norm kernels with one.
-@@ -424,9 +527,11 @@ class Gemma4Attention(nn.Module):
+@@ -424,9 +615,11 @@ class Gemma4Attention(nn.Module):
          )
          can_fuse_qkv_norm = (
              (q.is_cuda or q.is_xpu)
@@ -8246,11 +8542,15 @@ index 9c2f9c25db..b6d47b7b93 100644
          )
          if can_fuse_qkv_norm:
              if is_kv_shared:
-@@ -665,9 +770,10 @@ class Gemma4DecoderLayer(nn.Module):
+@@ -665,9 +858,14 @@ class Gemma4DecoderLayer(nn.Module):
              hidden_states=hidden_states,
              forward_batch=forward_batch,
          )
 -        hidden_states = self.post_attention_layernorm(hidden_states)
++        if _DEBUG_LAYER_NAN:
++            _debug_layer_nan_check(
++                self.layer_id, hidden_states, forward_batch, tag="attn_out"
++            )
  
          if self.enable_moe_block:
 +            # MoE path keeps the standalone post-attention norm.
@@ -8258,7 +8558,7 @@ index 9c2f9c25db..b6d47b7b93 100644
              # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
              # Also need raw (unfused) residual for router and pre_ff_norm_2
              hidden_states, residual = self.pre_feedforward_layernorm(
-@@ -714,10 +820,53 @@ class Gemma4DecoderLayer(nn.Module):
+@@ -714,10 +912,53 @@ class Gemma4DecoderLayer(nn.Module):
              # Combine branches
              hidden_states = hidden_states_1 + hidden_states_2
          else:
@@ -8316,7 +8616,7 @@ index 9c2f9c25db..b6d47b7b93 100644
              hidden_states = self.mlp(hidden_states)
  
          if (
-@@ -726,15 +875,32 @@ class Gemma4DecoderLayer(nn.Module):
+@@ -726,15 +967,32 @@ class Gemma4DecoderLayer(nn.Module):
              and (hidden_states.is_cuda or hidden_states.is_xpu)
              and hidden_states.dim() == 2
          ):
@@ -8357,6 +8657,15 @@ index 9c2f9c25db..b6d47b7b93 100644
          else:
              hidden_states = self.post_feedforward_layernorm(hidden_states)
              hidden_states = hidden_states + residual
+@@ -992,6 +1250,8 @@ class Gemma4TextModel(PreTrainedModel):
+                 **kwargs,
+             )
+             hidden_states = layer_outputs[0]
++            if _DEBUG_LAYER_NAN:
++                _debug_layer_nan_check(layer_idx, hidden_states, forward_batch)
+             # Gemma4DecoderLayer.forward always returns (hidden_states, None);
+             # the residual is fused inside the layer, so nothing to thread.
+ 
 diff --git a/python/sglang/srt/models/gemma4_mm.py b/python/sglang/srt/models/gemma4_mm.py
 index 3629782ca3..3d7068ab44 100644
 --- a/python/sglang/srt/models/gemma4_mm.py
