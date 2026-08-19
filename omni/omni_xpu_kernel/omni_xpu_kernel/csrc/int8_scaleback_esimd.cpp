@@ -15,6 +15,8 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 
+#include "bmg_kernel_policy.h"
+#include "device_utils.h"
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -29,7 +31,11 @@ namespace int8_ops {
 // 2D grid [M, N/32] — each WI does block_load<int32,32> → scale → block_store
 // ============================================================================
 
-template <typename OutputT, int ELEM_PER_WI>
+template <
+    typename OutputT,
+    int ELEM_PER_WI,
+    int WG_ROWS,
+    int WG_COLS>
 static void fused_scaleback_fast_kernel(
     const int32_t* __restrict__ gemm_result,
     const float* __restrict__ x_scale,
@@ -43,8 +49,6 @@ static void fused_scaleback_fast_kernel(
     const at::Device& device
 ) {
     const int64_t col_tiles = N / ELEM_PER_WI;
-    constexpr int WG_COLS = 8;
-    constexpr int WG_ROWS = 4;
     const int64_t global_cols = ((col_tiles + WG_COLS - 1) / WG_COLS) * WG_COLS;
     const int64_t global_rows = ((M + WG_ROWS - 1) / WG_ROWS) * WG_ROWS;
 
@@ -182,15 +186,25 @@ torch::Tensor fused_scaleback(
     torch::Tensor output = torch::empty({M, N},
         torch::TensorOptions().dtype(out_dtype).device(gemm_result.device()));
 
-    constexpr int FAST_ELEM = 32;
-    bool use_fast = (N % FAST_ELEM == 0);
+    auto& queue = utils::get_queue(gemm_result.device());
+    const bool use_b60 =
+        device::use_b60_kernel_profile(queue) &&
+        M == 4096 && N == 4096 && out_dtype == torch::kBFloat16;
+    const int fast_elements =
+        use_b60
+        ? device::B60KernelPolicy::int8_scaleback_elements
+        : device::B70KernelPolicy::int8_scaleback_elements;
+    bool use_fast = (N % fast_elements == 0);
 
     torch::Tensor bias_c;
     if (has_bias) bias_c = bias->to(out_dtype).contiguous();
 
-    #define DISPATCH_SCALEBACK(OT, bias_ptr) \
+    #define DISPATCH_SCALEBACK_POLICY(OT, bias_ptr, Policy) \
         if (use_fast) { \
-            fused_scaleback_fast_kernel<OT, FAST_ELEM>( \
+            fused_scaleback_fast_kernel< \
+                OT, Policy::int8_scaleback_elements, \
+                Policy::int8_scaleback_work_group_rows, \
+                Policy::int8_scaleback_work_group_cols>( \
                 gemm_result.data_ptr<int32_t>(), x_scale.data_ptr<float>(), \
                 w_scale.data_ptr<float>(), bias_ptr, \
                 reinterpret_cast<OT*>(output.data_ptr()), \
@@ -202,6 +216,17 @@ torch::Tensor fused_scaleback(
                 reinterpret_cast<OT*>(output.data_ptr()), \
                 M, N, w_scale_is_scalar, has_bias, gemm_result.device()); \
         }
+
+    #define DISPATCH_SCALEBACK(OT, bias_ptr) \
+        do { \
+            if (use_b60) { \
+                DISPATCH_SCALEBACK_POLICY( \
+                    OT, bias_ptr, device::B60KernelPolicy); \
+            } else { \
+                DISPATCH_SCALEBACK_POLICY( \
+                    OT, bias_ptr, device::B70KernelPolicy); \
+            } \
+        } while (false)
 
     if (out_dtype == torch::kBFloat16) {
         const bf16* bp = has_bias ? reinterpret_cast<const bf16*>(bias_c.data_ptr()) : nullptr;
@@ -215,6 +240,7 @@ torch::Tensor fused_scaleback(
     }
 
     #undef DISPATCH_SCALEBACK
+    #undef DISPATCH_SCALEBACK_POLICY
     return output;
 }
 

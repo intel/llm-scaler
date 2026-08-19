@@ -15,6 +15,7 @@
 // Primitive caching: keyed by {device, M, K, N} to amortize creation cost.
 // ============================================================================
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -22,15 +23,23 @@
 #include <tuple>
 #include <unordered_map>
 
+#include "oneapi/dnnl/dnnl.hpp"
+#include "oneapi/dnnl/dnnl_sycl.hpp"
 #include <torch/extension.h>
 #include <ATen/xpu/XPUGeneratorImpl.h>
-#include <oneapi/dnnl/dnnl.hpp>
-#include <oneapi/dnnl/dnnl_sycl.hpp>
 
 #include "utils.h"
 
 namespace omni_xpu {
 namespace int8_ops {
+
+torch::Tensor dequantize_int8_fused(
+    torch::Tensor input,
+    torch::Tensor scale,
+    torch::ScalarType out_dtype);
+std::tuple<torch::Tensor, torch::Tensor> quantize_int8_tensorwise_fused(
+    torch::Tensor input,
+    std::optional<torch::Tensor> scale_opt);
 
 // Forward declaration — defined in int8_quantize_esimd.cpp
 std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(torch::Tensor x);
@@ -134,6 +143,17 @@ struct Int8ScaledState {
     bool w_scale_is_scalar;
 };
 
+struct Int8PairState {
+    dnnl::engine engine;
+    dnnl::memory::desc src_md;
+    dnnl::memory::desc wei_md;
+    dnnl::memory::desc dst_md;
+    dnnl::memory::desc src_scale_md;
+    dnnl::memory::desc wei_scale_md;
+    dnnl::memory::desc scratchpad_md;
+    dnnl::matmul primitive;
+};
+
 struct Int8ScaledCacheKey {
     int device_index;
     int out_dtype;  // 0=f32, 1=f16, 2=bf16
@@ -169,8 +189,42 @@ struct Int8ScaledCacheKeyHash {
     }
 };
 
+struct Int8PairCacheKey {
+    int device_index;
+    int out_dtype;
+    int64_t m;
+    int64_t k;
+    int64_t n;
+
+    bool operator==(const Int8PairCacheKey& other) const {
+        return device_index == other.device_index
+            && out_dtype == other.out_dtype
+            && m == other.m && k == other.k && n == other.n;
+    }
+};
+
+struct Int8PairCacheKeyHash {
+    size_t operator()(const Int8PairCacheKey& key) const {
+        size_t seed = 0;
+        auto combine = [&](size_t value) {
+            seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+        };
+        combine(std::hash<int>{}(key.device_index));
+        combine(std::hash<int>{}(key.out_dtype));
+        combine(std::hash<int64_t>{}(key.m));
+        combine(std::hash<int64_t>{}(key.k));
+        combine(std::hash<int64_t>{}(key.n));
+        return seed;
+    }
+};
+
 std::unordered_map<Int8ScaledCacheKey, std::shared_ptr<Int8ScaledState>, Int8ScaledCacheKeyHash>& int8_scaled_cache() {
     static std::unordered_map<Int8ScaledCacheKey, std::shared_ptr<Int8ScaledState>, Int8ScaledCacheKeyHash> cache;
+    return cache;
+}
+
+std::unordered_map<Int8PairCacheKey, std::shared_ptr<Int8PairState>, Int8PairCacheKeyHash>& int8_pair_cache() {
+    static std::unordered_map<Int8PairCacheKey, std::shared_ptr<Int8PairState>, Int8PairCacheKeyHash> cache;
     return cache;
 }
 
@@ -258,6 +312,68 @@ std::shared_ptr<Int8ScaledState> get_or_create_int8_scaled_primitive(
     return state;
 }
 
+std::shared_ptr<Int8PairState> get_or_create_int8_pair_primitive(
+    int64_t m,
+    int64_t k,
+    int64_t n,
+    int out_dtype_code,
+    const torch::Device& device,
+    const sycl::queue& queue
+) {
+    Int8PairCacheKey key{device.index(), out_dtype_code, m, k, n};
+
+    auto& cache = int8_pair_cache();
+    auto& counters = int8_cache_counters();
+    std::lock_guard<std::mutex> lock(int8_cache_mutex());
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        ++counters.hits;
+        return it->second;
+    }
+
+    DT dst_dt;
+    switch (out_dtype_code) {
+        case 1: dst_dt = DT::f16; break;
+        case 2: dst_dt = DT::bf16; break;
+        default:
+            TORCH_CHECK(
+                false,
+                "paired INT8 linear supports float16 or bfloat16 output");
+    }
+
+    auto state = std::make_shared<Int8PairState>();
+    state->engine = dnnl::sycl_interop::make_engine(
+        queue.get_device(), queue.get_context());
+    state->src_md = dnnl::memory::desc(
+        {m, k}, DT::s8, dnnl::memory::format_tag::ab);
+    state->wei_md = dnnl::memory::desc(
+        {k, n}, DT::s8, dnnl::memory::format_tag::ba);
+    state->dst_md = dnnl::memory::desc(
+        {m, n}, dst_dt, dnnl::memory::format_tag::ab);
+    state->src_scale_md = dnnl::memory::desc(
+        {m}, DT::f32, dnnl::memory::format_tag::a);
+    state->wei_scale_md = dnnl::memory::desc(
+        {n}, DT::f32, dnnl::memory::format_tag::a);
+
+    dnnl::primitive_attr attr;
+    attr.set_scales(
+        DNNL_ARG_SRC, (1 << 0) | (1 << 1), {1, k}, DT::f32);
+    attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 1), {}, DT::f32);
+    attr.set_fpmath_mode(dnnl::fpmath_mode::any, true);
+    attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+    dnnl::matmul::primitive_desc pd(
+        state->engine,
+        state->src_md,
+        state->wei_md,
+        state->dst_md,
+        attr);
+    state->scratchpad_md = pd.scratchpad_desc();
+    state->primitive = dnnl::matmul(pd);
+    cache.emplace(key, state);
+    ++counters.misses;
+    return state;
+}
+
 std::shared_ptr<Int8PrimitiveState> get_or_create_int8_primitive(
     int64_t m,
     int64_t k,
@@ -329,6 +445,7 @@ void int8_cache_clear() {
     std::lock_guard<std::mutex> lock(int8_cache_mutex());
     int8_primitive_cache().clear();
     int8_scaled_cache().clear();
+    int8_pair_cache().clear();
     int8_cache_counters() = {};
 }
 
@@ -338,7 +455,10 @@ std::tuple<int64_t, int64_t, int64_t> int8_cache_stats() {
     return {
         counters.hits,
         counters.misses,
-        static_cast<int64_t>(int8_primitive_cache().size() + int8_scaled_cache().size()),
+        static_cast<int64_t>(
+            int8_primitive_cache().size()
+            + int8_scaled_cache().size()
+            + int8_pair_cache().size()),
     };
 }
 
@@ -387,6 +507,344 @@ torch::Tensor mm_int8(
     return output;
 }
 
+namespace {
+
+torch::Tensor int8_linear_prequantized_impl(
+    torch::Tensor x_int8,
+    torch::Tensor x_scale,
+    torch::Tensor weight,
+    torch::Tensor weight_scale,
+    std::optional<torch::Tensor> bias,
+    int64_t out_dtype_code,
+    std::optional<torch::Tensor> output_opt
+) {
+    TORCH_CHECK(x_int8.dim() >= 1,
+        "x_int8 must have at least one dimension");
+    TORCH_CHECK(weight.dim() == 2,
+        "weight must be 2D [N, K], got ", weight.dim(), "D");
+    TORCH_CHECK(x_int8.device().is_xpu(),
+        "x_int8 must be on XPU device");
+    TORCH_CHECK(weight.device().is_xpu(),
+        "weight must be on XPU device");
+    TORCH_CHECK(x_int8.device() == weight.device(),
+        "x_int8 and weight must be on the same XPU device");
+    TORCH_CHECK(x_int8.scalar_type() == torch::kInt8,
+        "x_int8 must be int8, got ", x_int8.scalar_type());
+    TORCH_CHECK(weight.scalar_type() == torch::kInt8,
+        "weight must be int8, got ", weight.scalar_type());
+    TORCH_CHECK(out_dtype_code >= 0 && out_dtype_code <= 2,
+        "out_dtype_code must be 0 (float32), 1 (float16), or 2 (bfloat16), got ",
+        out_dtype_code);
+
+    const int64_t k = x_int8.size(-1);
+    const int64_t n = weight.size(0);
+    TORCH_CHECK(k > 0, "x_int8.size(-1) must be greater than zero");
+    TORCH_CHECK(n > 0, "weight.size(0) must be greater than zero");
+    TORCH_CHECK(weight.size(1) == k,
+        "weight.size(1)=", weight.size(1),
+        " must match x_int8.size(-1)=", k);
+
+    const auto orig_sizes = x_int8.sizes().vec();
+    x_int8 = x_int8.reshape({-1, k}).contiguous();
+    const int64_t m = x_int8.size(0);
+    weight = weight.contiguous();
+
+    // oneDNN consumes one fp32 activation scale per flattened input row and a
+    // scalar or per-output-channel fp32 weight scale.
+    x_scale = x_scale.to(x_int8.device()).to(torch::kFloat32).reshape(-1).contiguous();
+    weight_scale = weight_scale.to(x_int8.device()).to(torch::kFloat32).reshape(-1).contiguous();
+    TORCH_CHECK(x_scale.numel() == m,
+        "x_scale must contain one value per flattened activation row (M=", m,
+        "), got numel=", x_scale.numel());
+    TORCH_CHECK(weight_scale.numel() == 1 || weight_scale.numel() == n,
+        "weight_scale must be scalar or contain one value per output channel (N=",
+        n, "), got numel=", weight_scale.numel());
+
+    torch::ScalarType out_dtype = torch::kBFloat16;
+    switch (out_dtype_code) {
+        case 0: out_dtype = torch::kFloat; break;
+        case 1: out_dtype = torch::kHalf; break;
+        case 2: out_dtype = torch::kBFloat16; break;
+    }
+
+    std::vector<int64_t> out_sizes(orig_sizes.begin(), orig_sizes.end() - 1);
+    out_sizes.push_back(n);
+    torch::Tensor output;
+    if (output_opt.has_value()) {
+        output = *output_opt;
+        TORCH_CHECK(output.device() == x_int8.device(),
+            "output must be on the input XPU device");
+        TORCH_CHECK(output.scalar_type() == out_dtype,
+            "output dtype must match out_dtype_code");
+        TORCH_CHECK(output.sizes() == out_sizes,
+            "output shape must be ", out_sizes, ", got ", output.sizes());
+        TORCH_CHECK(output.is_contiguous(),
+            "output must be contiguous");
+    }
+    if (m == 0) {
+        if (output_opt.has_value()) return output;
+        return torch::empty(
+            out_sizes,
+            torch::TensorOptions().dtype(out_dtype).device(x_int8.device()));
+    }
+
+    const bool w_scale_is_scalar = (weight_scale.numel() == 1);
+    const bool has_bias = bias.has_value();
+    torch::Tensor bias_f32;
+    if (has_bias) {
+        TORCH_CHECK(bias->numel() == n,
+            "bias must contain one value per output channel (N=", n,
+            "), got numel=", bias->numel());
+        bias_f32 = bias->to(x_int8.device()).to(torch::kFloat32).reshape({1, n}).contiguous();
+    }
+
+    sycl::queue& queue = omni_xpu::utils::get_queue(x_int8.device());
+    auto state = get_or_create_int8_scaled_primitive(
+        m, k, n, static_cast<int>(out_dtype_code), has_bias,
+        w_scale_is_scalar, x_int8.device(), queue);
+    if (!output_opt.has_value()) {
+        // Preserve the established allocation order for every existing
+        // caller.  Only the explicit out variant supplies storage earlier.
+        output = torch::empty(
+            {m, n},
+            torch::TensorOptions().dtype(out_dtype).device(x_int8.device()));
+    }
+
+    dnnl::stream stream = dnnl::sycl_interop::make_stream(state->engine, queue);
+    std::unordered_map<int, dnnl::memory> args = {
+        {DNNL_ARG_SRC,
+         dnnl::memory(state->src_md, state->engine, x_int8.data_ptr())},
+        {DNNL_ARG_WEIGHTS,
+         dnnl::memory(state->wei_md, state->engine, weight.data_ptr())},
+        {DNNL_ARG_DST,
+         dnnl::memory(state->dst_md, state->engine, output.data_ptr())},
+        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC,
+         dnnl::memory(state->src_scale_md, state->engine, x_scale.data_ptr())},
+        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS,
+         dnnl::memory(state->wei_scale_md, state->engine, weight_scale.data_ptr())},
+    };
+    if (has_bias) {
+        args.emplace(
+            DNNL_ARG_BIAS,
+            dnnl::memory(state->bias_md, state->engine, bias_f32.data_ptr()));
+    }
+    state->primitive.execute(stream, args);
+
+    return output.reshape(out_sizes);
+}
+
+}  // namespace
+
+torch::Tensor int8_linear_prequantized(
+    torch::Tensor x_int8,
+    torch::Tensor x_scale,
+    torch::Tensor weight,
+    torch::Tensor weight_scale,
+    std::optional<torch::Tensor> bias,
+    int64_t out_dtype_code
+) {
+    return int8_linear_prequantized_impl(
+        x_int8,
+        x_scale,
+        weight,
+        weight_scale,
+        bias,
+        out_dtype_code,
+        std::nullopt);
+}
+
+torch::Tensor int8_linear_prequantized_out(
+    torch::Tensor x_int8,
+    torch::Tensor x_scale,
+    torch::Tensor weight,
+    torch::Tensor weight_scale,
+    std::optional<torch::Tensor> bias,
+    int64_t out_dtype_code,
+    torch::Tensor output
+) {
+    return int8_linear_prequantized_impl(
+        x_int8,
+        x_scale,
+        weight,
+        weight_scale,
+        bias,
+        out_dtype_code,
+        output);
+}
+
+#if defined(OMNI_XPU_ARCH_BMG)
+std::tuple<torch::Tensor, torch::Tensor> int8_linear_pair_prequantized(
+    torch::Tensor x_int8,
+    torch::Tensor x_scale,
+    torch::Tensor weight1,
+    torch::Tensor weight_scale1,
+    torch::Tensor weight2,
+    torch::Tensor weight_scale2,
+    int64_t out_dtype_code
+) {
+    TORCH_CHECK(x_int8.dim() >= 1,
+        "x_int8 must have at least one dimension");
+    TORCH_CHECK(x_int8.device().is_xpu(),
+        "x_int8 must be on XPU device");
+    TORCH_CHECK(x_int8.scalar_type() == torch::kInt8,
+        "x_int8 must be int8");
+    TORCH_CHECK(weight1.dim() == 2 && weight2.dim() == 2,
+        "weights must be 2D [N,K]");
+    TORCH_CHECK(weight1.sizes() == weight2.sizes(),
+        "paired weights must have the same shape");
+    TORCH_CHECK(weight1.device() == x_int8.device()
+            && weight2.device() == x_int8.device(),
+        "paired weights must be on the input XPU device");
+    TORCH_CHECK(weight1.scalar_type() == torch::kInt8
+            && weight2.scalar_type() == torch::kInt8,
+        "paired weights must be int8");
+    TORCH_CHECK(out_dtype_code == 1 || out_dtype_code == 2,
+        "paired output must be float16 or bfloat16");
+
+    const int64_t k = x_int8.size(-1);
+    const int64_t n = weight1.size(0);
+    TORCH_CHECK(k > 0 && n > 0, "paired dimensions must be positive");
+    TORCH_CHECK(weight1.size(1) == k,
+        "paired weight K must match x_int8 K");
+    const auto input_sizes = x_int8.sizes().vec();
+    x_int8 = x_int8.reshape({-1, k}).contiguous();
+    const int64_t m = x_int8.size(0);
+    weight1 = weight1.contiguous();
+    weight2 = weight2.contiguous();
+    x_scale = x_scale.to(x_int8.device())
+                  .to(torch::kFloat32)
+                  .reshape(-1)
+                  .contiguous();
+    weight_scale1 = weight_scale1.to(x_int8.device())
+                        .to(torch::kFloat32)
+                        .reshape(-1)
+                        .contiguous();
+    weight_scale2 = weight_scale2.to(x_int8.device())
+                        .to(torch::kFloat32)
+                        .reshape(-1)
+                        .contiguous();
+    TORCH_CHECK(x_scale.numel() == m,
+        "x_scale must contain one value per flattened activation row");
+    TORCH_CHECK(weight_scale1.numel() == n
+            && weight_scale2.numel() == n,
+        "paired weight scales must contain one value per output channel");
+
+    const torch::ScalarType out_dtype = out_dtype_code == 1
+        ? torch::kHalf
+        : torch::kBFloat16;
+    std::vector<int64_t> output_sizes(
+        input_sizes.begin(), input_sizes.end() - 1);
+    output_sizes.push_back(n);
+    if (m == 0) {
+        auto options = torch::TensorOptions()
+            .dtype(out_dtype)
+            .device(x_int8.device());
+        return {
+            torch::empty(output_sizes, options),
+            torch::empty(output_sizes, options),
+        };
+    }
+
+    sycl::queue& queue = omni_xpu::utils::get_queue(x_int8.device());
+    auto state = get_or_create_int8_pair_primitive(
+        m, k, n, static_cast<int>(out_dtype_code), x_int8.device(), queue);
+    auto output1 = torch::empty(
+        {m, n},
+        torch::TensorOptions().dtype(out_dtype).device(x_int8.device()));
+    auto output2 = torch::empty_like(output1);
+    const int64_t scratchpad_bytes = std::max<int64_t>(
+        1, static_cast<int64_t>(state->scratchpad_md.get_size()));
+    auto scratchpad = torch::empty(
+        {scratchpad_bytes},
+        torch::TensorOptions().dtype(torch::kUInt8).device(x_int8.device()));
+    dnnl::stream stream = dnnl::sycl_interop::make_stream(
+        state->engine, queue);
+
+    auto execute = [&](torch::Tensor& weight,
+                       torch::Tensor& weight_scale,
+                       torch::Tensor& output) {
+        std::unordered_map<int, dnnl::memory> args = {
+            {DNNL_ARG_SRC,
+             dnnl::memory(
+                 state->src_md, state->engine, x_int8.data_ptr())},
+            {DNNL_ARG_WEIGHTS,
+             dnnl::memory(
+                 state->wei_md, state->engine, weight.data_ptr())},
+            {DNNL_ARG_DST,
+             dnnl::memory(
+                 state->dst_md, state->engine, output.data_ptr())},
+            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC,
+             dnnl::memory(
+                 state->src_scale_md,
+                 state->engine,
+                 x_scale.data_ptr())},
+            {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS,
+             dnnl::memory(
+                 state->wei_scale_md,
+                 state->engine,
+                 weight_scale.data_ptr())},
+            {DNNL_ARG_SCRATCHPAD,
+             dnnl::memory(
+                 state->scratchpad_md,
+                 state->engine,
+                 scratchpad.data_ptr())},
+        };
+        state->primitive.execute(stream, args);
+    };
+    execute(weight1, weight_scale1, output1);
+    execute(weight2, weight_scale2, output2);
+    return {
+        output1.reshape(output_sizes),
+        output2.reshape(output_sizes),
+    };
+}
+#endif
+
+std::tuple<torch::Tensor, torch::Tensor> int8_linear_shared_input(
+    torch::Tensor x,
+    torch::Tensor weight1,
+    torch::Tensor weight_scale1,
+    torch::Tensor weight2,
+    torch::Tensor weight_scale2,
+    std::optional<torch::Tensor> bias1,
+    std::optional<torch::Tensor> bias2,
+    int64_t out_dtype_code
+) {
+    TORCH_CHECK(x.device().is_xpu(), "x must be on XPU device");
+    TORCH_CHECK(x.dim() >= 1, "x must have at least one dimension");
+    TORCH_CHECK(
+        x.scalar_type() == torch::kHalf || x.scalar_type() == torch::kBFloat16,
+        "x must be float16 or bfloat16, got ", x.scalar_type());
+    TORCH_CHECK(weight1.dim() == 2 && weight2.dim() == 2,
+        "weight1 and weight2 must be 2D [N, K]");
+
+    const int64_t k = x.size(-1);
+    TORCH_CHECK(weight1.size(1) == k,
+        "weight1.size(1)=", weight1.size(1),
+        " must match x.size(-1)=", k);
+    TORCH_CHECK(weight2.size(1) == k,
+        "weight2.size(1)=", weight2.size(1),
+        " must match x.size(-1)=", k);
+
+    const auto orig_sizes = x.sizes().vec();
+    x = x.reshape({-1, k}).contiguous();
+    auto [x_int8, x_scale] = quantize_int8_rowwise_fused(x);
+
+    auto output1 = int8_linear_prequantized(
+        x_int8, x_scale, weight1, weight_scale1, bias1, out_dtype_code);
+    auto output2 = int8_linear_prequantized(
+        x_int8, x_scale, weight2, weight_scale2, bias2, out_dtype_code);
+
+    std::vector<int64_t> out_sizes1(orig_sizes.begin(), orig_sizes.end() - 1);
+    out_sizes1.push_back(weight1.size(0));
+    std::vector<int64_t> out_sizes2(orig_sizes.begin(), orig_sizes.end() - 1);
+    out_sizes2.push_back(weight2.size(0));
+    return {
+        output1.reshape(out_sizes1),
+        output2.reshape(out_sizes2),
+    };
+}
+
 torch::Tensor int8_linear(
     torch::Tensor x,
     torch::Tensor weight,
@@ -405,6 +863,9 @@ torch::Tensor int8_linear(
         "x must be float16 or bfloat16, got ", x.scalar_type()
     );
 
+    TORCH_CHECK(x.dim() >= 1, "x must have at least one dimension");
+    TORCH_CHECK(weight.dim() == 2, "weight must be 2D [N, K], got ", weight.dim(), "D");
+
     const int64_t k = x.size(-1);
     const int64_t n = weight.size(0);
     TORCH_CHECK(weight.size(1) == k,
@@ -413,12 +874,6 @@ torch::Tensor int8_linear(
     // Reshape to 2D
     auto orig_sizes = x.sizes().vec();
     x = x.reshape({-1, k}).contiguous();
-    const int64_t m = x.size(0);
-
-    weight = weight.contiguous();
-    weight_scale = weight_scale.to(x.device()).to(torch::kFloat32).reshape(-1).contiguous();
-    TORCH_CHECK(weight_scale.numel() == 1 || weight_scale.numel() == n,
-        "weight_scale must be scalar or [N], got numel=", weight_scale.numel());
 
     // Step 1: ConvRot (online activation rotation)
     // For now, this falls back to PyTorch — ESIMD rotation kernel will replace later
@@ -433,123 +888,8 @@ torch::Tensor int8_linear(
     // Step 2: Dynamic per-row quantization of activation.
     // One plain-SYCL launch performs two coalesced passes for absmax + quantize.
     auto [x_int8, x_scale] = quantize_int8_rowwise_fused(x);
-    x_int8 = x_int8.contiguous();
-    // Per-token activation scale as a flat [M] f32 vector for the fused epilogue.
-    x_scale = x_scale.to(torch::kFloat32).reshape(-1).contiguous();
-
-    // Step 3: Fully-fused INT8 GEMM via oneDNN.
-    //   dst[m,n] = x_scale[m] * wei_scale[n] * (src_s8 × wei_s8) + bias[n]
-    // Both the per-token activation scale and the per-channel weight scale (and
-    // bias) are folded into the matmul epilogue, so there is no separate
-    // scaleback (`output.mul_(x_scale)`) or bias-add kernel — one HBM pass only.
-    bool w_scale_is_scalar = (weight_scale.numel() == 1);
-    bool has_bias = bias.has_value();
-    torch::Tensor bias_f32;
-    if (has_bias) {
-        TORCH_CHECK(bias->size(0) == n, "bias size must match N=", n);
-        bias_f32 = bias->to(x.device()).to(torch::kFloat32).reshape({1, -1}).contiguous();
-    }
-
-    sycl::queue& queue = omni_xpu::utils::get_queue(x.device());
-
-    // Fused scaled primitive: per-token src scale + per-channel weight scale (+bias).
-    Int8ScaledCacheKey skey{x.device().index(), static_cast<int>(out_dtype_code), m, k, n, has_bias, w_scale_is_scalar};
-    std::shared_ptr<Int8ScaledState> sstate;
-    {
-        auto& cache = int8_scaled_cache();
-        auto& counters = int8_cache_counters();
-        std::lock_guard<std::mutex> lock(int8_cache_mutex());
-
-        auto it = cache.find(skey);
-        if (it != cache.end()) {
-            ++counters.hits;
-            sstate = it->second;
-        } else {
-            dnnl::engine engine = dnnl::sycl_interop::make_engine(queue.get_device(), queue.get_context());
-
-            DT dst_dt;
-            switch (out_dtype_code) {
-                case 0: dst_dt = DT::f32; break;
-                case 1: dst_dt = DT::f16; break;
-                case 2: dst_dt = DT::bf16; break;
-                default: dst_dt = DT::bf16; break;
-            }
-
-            sstate = std::make_shared<Int8ScaledState>();
-            sstate->engine = engine;
-            sstate->has_bias = has_bias;
-            sstate->w_scale_is_scalar = w_scale_is_scalar;
-
-            sstate->src_md = dnnl::memory::desc({m, k}, DT::s8, dnnl::memory::format_tag::ab);
-            sstate->wei_md = dnnl::memory::desc({k, n}, DT::s8, dnnl::memory::format_tag::ba);
-            sstate->dst_md = dnnl::memory::desc({m, n}, dst_dt, dnnl::memory::format_tag::ab);
-
-            // Per-token src scale: one f32 per row (M values).
-            sstate->src_scale_md = dnnl::memory::desc({m}, DT::f32, dnnl::memory::format_tag::a);
-            if (w_scale_is_scalar) {
-                sstate->wei_scale_md = dnnl::memory::desc({1}, DT::f32, dnnl::memory::format_tag::a);
-            } else {
-                sstate->wei_scale_md = dnnl::memory::desc({n}, DT::f32, dnnl::memory::format_tag::a);
-            }
-            if (has_bias) {
-                sstate->bias_md = dnnl::memory::desc({1, n}, DT::f32, dnnl::memory::format_tag::ab);
-            }
-
-            dnnl::primitive_attr attr;
-            // Per-token src scale via the grouped-scale API: mask over {M,K} with
-            // group {1, K} == one scale per row. oneDNN >= 3.9 supports this on
-            // XPU s8 matmul (jit:gemm). NOTE: the mask=(1<<0), group {1,1} form
-            // throws "unsupported scales configuration" — do not use it.
-            attr.set_scales(DNNL_ARG_SRC, (1 << 0) | (1 << 1), {1, k}, DT::f32);
-            // Per-channel weight scale (mask over N), or scalar (mask 0).
-            attr.set_scales(DNNL_ARG_WEIGHTS, w_scale_is_scalar ? 0 : (1 << 1), {}, DT::f32);
-            attr.set_fpmath_mode(dnnl::fpmath_mode::any, true);
-
-            dnnl::matmul::primitive_desc pd = has_bias
-                ? dnnl::matmul::primitive_desc(engine, sstate->src_md, sstate->wei_md, sstate->bias_md, sstate->dst_md, attr)
-                : dnnl::matmul::primitive_desc(engine, sstate->src_md, sstate->wei_md, sstate->dst_md, attr);
-            sstate->primitive = dnnl::matmul(pd);
-
-            const std::string impl = pd.impl_info_str();
-            OMNI_DEBUG("int8", "scaled(fused) cache MISS: impl=%s (M=%ld K=%ld N=%ld bias=%d)",
-                       impl.c_str(), m, k, n, (int)has_bias);
-            if (impl.find("ref") != std::string::npos) {
-                std::fprintf(stderr,
-                    "[omni_xpu::int8] WARNING: fused oneDNN ref impl for M=%ld K=%ld N=%ld: %s\n",
-                    m, k, n, impl.c_str());
-            }
-
-            cache.emplace(skey, sstate);
-            ++counters.misses;
-        }
-    }
-
-    torch::ScalarType out_dtype;
-    switch (out_dtype_code) {
-        case 0: out_dtype = torch::kFloat; break;
-        case 1: out_dtype = torch::kHalf; break;
-        case 2: out_dtype = torch::kBFloat16; break;
-        default: out_dtype = torch::kBFloat16; break;
-    }
-
-    torch::Tensor output = torch::empty({m, n},
-        torch::TensorOptions().dtype(out_dtype).device(x.device()));
-
-    dnnl::stream stream = dnnl::sycl_interop::make_stream(sstate->engine, queue);
-    std::unordered_map<int, dnnl::memory> args = {
-        {DNNL_ARG_SRC, dnnl::memory(sstate->src_md, sstate->engine, x_int8.data_ptr())},
-        {DNNL_ARG_WEIGHTS, dnnl::memory(sstate->wei_md, sstate->engine, weight.data_ptr())},
-        {DNNL_ARG_DST, dnnl::memory(sstate->dst_md, sstate->engine, output.data_ptr())},
-        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, dnnl::memory(sstate->src_scale_md, sstate->engine, x_scale.data_ptr())},
-        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, dnnl::memory(sstate->wei_scale_md, sstate->engine, weight_scale.data_ptr())},
-    };
-    if (has_bias) {
-        args.emplace(DNNL_ARG_BIAS, dnnl::memory(sstate->bias_md, sstate->engine, bias_f32.data_ptr()));
-    }
-    sstate->primitive.execute(stream, args);
-
-    // Per-token src scale, per-channel weight scale, and bias are all fused into
-    // the matmul epilogue above — no separate scaleback / bias kernels.
+    auto output = int8_linear_prequantized(
+        x_int8, x_scale, weight, weight_scale, bias, out_dtype_code);
 
     // Reshape back to original batch dimensions
     std::vector<int64_t> out_sizes(orig_sizes.begin(), orig_sizes.end() - 1);
@@ -567,6 +907,13 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_tensorwise(
     int64_t stochastic_rounding
 ) {
     TORCH_CHECK(x.device().is_xpu(), "x must be on XPU device");
+
+    if (stochastic_rounding <= 0 &&
+        (x.scalar_type() == torch::kBFloat16 ||
+         x.scalar_type() == torch::kHalf ||
+         x.scalar_type() == torch::kFloat)) {
+        return quantize_int8_tensorwise_fused(x, scale_opt);
+    }
 
     // Compute scale from absmax if not provided
     torch::Tensor scale;
@@ -599,6 +946,13 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise(
 ) {
     TORCH_CHECK(x.device().is_xpu(), "x must be on XPU device");
 
+    if (stochastic_rounding <= 0 && x.dim() >= 1 &&
+        (x.scalar_type() == torch::kBFloat16 ||
+         x.scalar_type() == torch::kHalf ||
+         x.scalar_type() == torch::kFloat)) {
+        return quantize_int8_rowwise_fused(x);
+    }
+
     auto abs_max = x.abs().amax(-1, true); // [..., 1]
     auto scale = (abs_max.to(torch::kFloat32) / 127.0f).clamp_min(1e-30f);
 
@@ -621,8 +975,7 @@ torch::Tensor dequantize_int8_simple(
     torch::Tensor q,
     torch::Tensor scale
 ) {
-    TORCH_CHECK(q.scalar_type() == torch::kInt8, "q must be int8");
-    return q.to(torch::kFloat32) * scale.to(torch::kFloat32);
+    return dequantize_int8_fused(q, scale, torch::kFloat);
 }
 
 torch::Tensor dequantize_int8_simple_dtype(
@@ -637,7 +990,7 @@ torch::Tensor dequantize_int8_simple_dtype(
         case 2: out_dtype = torch::kBFloat16; break;
         default: out_dtype = torch::kFloat; break;
     }
-    return dequantize_int8_simple(q, scale).to(out_dtype);
+    return dequantize_int8_fused(q, scale, out_dtype);
 }
 
 }  // namespace int8_ops

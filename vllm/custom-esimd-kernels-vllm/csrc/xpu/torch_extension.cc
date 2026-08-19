@@ -28,6 +28,11 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
   m.def("esimd_gemv_fp16(Tensor input, Tensor weight, Tensor output) -> Tensor");
   m.impl("esimd_gemv_fp16", torch::kXPU, &esimd_gemv_fp16);
 
+  m.def("esimd_gemv_fp16_gelu_mul(Tensor input, Tensor weight, "
+        "Tensor output) -> Tensor");
+  m.impl("esimd_gemv_fp16_gelu_mul", torch::kXPU,
+         &esimd_gemv_fp16_gelu_mul);
+
   m.def("esimd_gemv_fp8_pert(Tensor input, Tensor weight, Tensor weight_scale, "
         "Tensor output) -> Tensor");
   m.impl("esimd_gemv_fp8_pert", torch::kXPU, &esimd_gemv_fp8_pert);
@@ -93,6 +98,22 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
                                        norm_wq, norm_wk, norm_wv, positions,
                                        q_heads, kv_heads, attn_output_gate,
                                        rotary_dim, cos_sin_cache);
+         });
+
+  // Onyx-specific: fused Q/K split + parameterless RMSNorm + q_scale + interleaved-pair RoPE.
+  // head_dim hardcoded to 128, no gate head, no V-Norm.
+  m.def("esimd_qkv_split_norm_rope_onyx(Tensor qkv_state, "
+        "Tensor(a!) q_out, Tensor(b!) k_out, Tensor(c!) v_out, "
+        "Tensor positions, int q_heads, int kv_heads, float q_scale, "
+        "Tensor cos_sin_cache) -> ()");
+  m.impl("esimd_qkv_split_norm_rope_onyx", torch::kXPU,
+         [](at::Tensor qkv_state, at::Tensor q_out, at::Tensor k_out,
+            at::Tensor v_out, at::Tensor positions, int64_t q_heads,
+            int64_t kv_heads, double q_scale,
+            at::Tensor cos_sin_cache) -> void {
+           esimd_qkv_split_norm_rope_onyx(qkv_state, q_out, k_out, v_out,
+                                          positions, q_heads, kv_heads,
+                                          q_scale, cos_sin_cache);
          });
 
   // Fused ResidualAdd + RMSNorm + FP8 GEMV (post_attn_norm + router)

@@ -105,13 +105,20 @@ at::Tensor esimd_gdn_conv_fused_seq(
     auto* p_out     = reinterpret_cast<fp16*>(output.data_ptr());
     auto* p_zout    = reinterpret_cast<fp16*>(z_out.data_ptr());
 
+    // Detect conv_state memory layout. The native MambaPool stores conv as
+    // (cache, conv_dim, W-1) whose last dim (W-1, e.g. 3) is tiny, so taps for
+    // each channel are interleaved (stride = W-1). The legacy path passes a
+    // transposed (cache, W-1, conv_dim) copy whose last dim is conv_dim (large,
+    // contiguous per tap). Distinguish by the size of the last dim.
+    int conv_native = (conv_state.dim() >= 2 && conv_state.size(-1) <= 8) ? 1 : 0;
+
     gdn_conv_fused_seq_host(
         p_qkvz, qkvz_stride0, p_cstate, p_cweight, p_cbias, p_csidx,
         p_alog, p_dtbias, p_ba, ba_stride0,
         p_sstate, p_ssidx, p_out, p_zout,
         (int)N, (int)H, (int)HV, (int)K, (int)V,
         (float)scale, conv_stride0, ssm_stride0,
-        dpcpp_queue);
+        conv_native, dpcpp_queue);
 
     return output;
 }

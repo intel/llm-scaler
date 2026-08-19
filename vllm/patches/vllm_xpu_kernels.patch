@@ -2712,7 +2712,7 @@ index b9729cd..ef79217 100644
        pad_slot_id,                                                 \
        batch_size,                                                  \
 diff --git a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp b/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
-index 10d7a1b..d4b3eb7 100644
+index 10d7a1b..4fe1e6a 100644
 --- a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
 +++ b/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
 @@ -121,6 +121,16 @@ CUTE_DEVICE void chunk_prepare_kernel(
@@ -2769,7 +2769,19 @@ index 10d7a1b..d4b3eb7 100644
          g_local[c] = a_h;
          g_local_sum += a_h;
        }
-@@ -309,6 +343,10 @@ CUTE_DEVICE void chunk_compute_A_kernel(
+@@ -245,6 +279,11 @@ CUTE_DEVICE void chunk_compute_A_kernel(
+       const int chunk_start_offset = chunk_id * chunk_size;
+ 
+       for (int v_head_id = 0; v_head_id < num_v_heads; ++v_head_id) {
++        // WAR fence: sub-groups from the previous (chunk, v_head)
++        // iteration may still be reading g_slm_ptr in the exp()
++        // epilogue; all must arrive before any sub-group refills the
++        // SLM (g_slm_ptr) for this iteration.
++        item.barrier(sycl::access::fence_space::local_space);
+         CUTE_UNROLL
+         for (int e = local_id; e < chunk_size; e += local_range) {
+           g_slm_ptr[e] =
+@@ -309,6 +348,10 @@ CUTE_DEVICE void chunk_compute_A_kernel(
  
          reorder(tSrA_c, tCrA_c);
          copy(copy_A_c, tCrA_c, tCgA_c);
@@ -2780,7 +2792,18 @@ index 10d7a1b..d4b3eb7 100644
        }
        chunk_id += global_chunk_range;
      }
-@@ -928,9 +966,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -815,6 +858,10 @@ CUTE_DEVICE void chunk_compute_wu_kernel(
+       const int chunk_start_offset = chunk_id * chunk_size;
+ 
+       for (int v_head_id = 0; v_head_id < num_v_heads; ++v_head_id) {
++        // WAR fence: previous iteration's sub-groups may still be
++        // reading beta_slm_ptr/g_slm_ptr; all must arrive before any
++        // sub-group refills the SLM for this iteration.
++        item.barrier(sycl::access::fence_space::local_space);
+         CUTE_UNROLL
+         for (int e = local_id; e < chunk_size; e += local_range) {
+           float beta_value =
+@@ -928,9 +975,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
      StateT*
          ssm_state,  // [cache_batch_size, num_v_heads, head_v_dim, head_k_dim]
      const int ssm_state_stride_0,
@@ -2792,7 +2815,7 @@ index 10d7a1b..d4b3eb7 100644
      const int batch_size,
      const int total_virtual_seqlen,
      const int num_k_heads,
-@@ -997,6 +1037,23 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -997,6 +1046,23 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
          static_cast<int64_t>(cache_indices[batch_id]) * ssm_state_stride_0 +
          v_head_id * head_v_dim * head_k_dim;
  
@@ -2816,7 +2839,19 @@ index 10d7a1b..d4b3eb7 100644
      for (int chunk_id = 0; chunk_id < current_chunks; ++chunk_id) {
        const bool has_prev_state = (chunk_id != 0) || initial_state;
        const int out_chunk_offset = seq_start_offset + chunk_id * chunk_size;
-@@ -1049,6 +1106,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1011,6 +1077,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+           a[(chunk_offset + current_chunk_size - 1) +
+             v_head_id * total_virtual_seqlen];
+       float g_last_value_exp = sycl::exp(g_last_value);
++      // WAR fence: the previous chunk iteration's sub-groups may
++      // still be reading g_slm_ptr/g_multi_slm_ptr/g_exp_slm_ptr in
++      // their output/state GEMM epilogues; all must arrive before any
++      // sub-group refills these SLM buffers for this chunk.
++      item.barrier(sycl::access::fence_space::local_space);
+       CUTE_UNROLL
+       for (int e = local_id; e < current_chunk_size; e += local_range) {
+         float g_cumsum_value =
+@@ -1049,6 +1120,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
            make_gmem_ptr(S_ptr),
            make_layout(S_tensor_shape, make_stride(head_k_dim, _1{})));
  
@@ -2828,7 +2863,7 @@ index 10d7a1b..d4b3eb7 100644
        Tensor cU = make_identity_tensor(U_tensor.shape());
  
        auto copy_U_c = get_block_2d_copy_C<void>(mma, U_tensor);
-@@ -1084,7 +1146,8 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1084,7 +1160,8 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
            reorder(tCrU_c, tCrU_d);
            copy(copy_U_d, tCrU_d, tCgU_d);
          }
@@ -2838,7 +2873,7 @@ index 10d7a1b..d4b3eb7 100644
        }
  
        auto q_ptr =
-@@ -1145,8 +1208,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1145,8 +1222,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
        auto U_tensor_T = make_tensor(
            make_gmem_ptr(U_ptr),
            make_layout(U_tensor_T_shape, make_stride(_1{}, head_v_dim)));
@@ -2852,7 +2887,7 @@ index 10d7a1b..d4b3eb7 100644
        auto O_tensor_shape = make_shape(current_chunk_size, head_v_dim);
        auto O_tensor = make_tensor(
            make_gmem_ptr(O_ptr),
-@@ -1190,29 +1256,30 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1190,29 +1270,30 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
                K_tensor_T_shape, make_stride(_1{}, head_k_dim * num_k_heads)));
  
        Tensor cS = make_identity_tensor(S_tensor.shape());
@@ -2893,7 +2928,7 @@ index 10d7a1b..d4b3eb7 100644
                tSrS_d(i) *= g_last_value_exp;
              }
            } else {
-@@ -1221,7 +1288,17 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
+@@ -1221,7 +1302,17 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
  
            gemm_TTS_k_multi(
                U_tensor_T, K_tensor_T, tSrS_d, dv, dk, mma, g_multi_slm_ptr);
@@ -2912,7 +2947,7 @@ index 10d7a1b..d4b3eb7 100644
            copy(copy_S_d, tCrS_d, tCgS_d);
          }
        }
-@@ -1279,9 +1356,11 @@ void kernel_launcher(
+@@ -1279,9 +1370,11 @@ void kernel_launcher(
      const T* dt_bias,
      StateT* ssm_state,
      const int ssm_state_stride_0,
@@ -2924,7 +2959,7 @@ index 10d7a1b..d4b3eb7 100644
      const int batch_size,
      const int total_virtual_seqlen,
      const int num_k_heads,
-@@ -1507,9 +1586,11 @@ void kernel_launcher(
+@@ -1507,9 +1600,11 @@ void kernel_launcher(
                a,
                ssm_state,
                ssm_state_stride_0,
@@ -2936,7 +2971,7 @@ index 10d7a1b..d4b3eb7 100644
                batch_size,
                total_virtual_seqlen,
                num_k_heads,
-@@ -1537,7 +1618,8 @@ void chunk_gated_delta_rule_impl_xe2(
+@@ -1537,7 +1632,8 @@ void chunk_gated_delta_rule_impl_xe2(
      const std::optional<torch::Tensor>&
          has_initial_state,  // [batch_size] or None
      const int num_prefills,
@@ -2946,7 +2981,7 @@ index 10d7a1b..d4b3eb7 100644
    if (num_prefills == 0 && num_decodes == 0) {
      return;
    }
-@@ -1583,6 +1665,17 @@ void chunk_gated_delta_rule_impl_xe2(
+@@ -1583,6 +1679,17 @@ void chunk_gated_delta_rule_impl_xe2(
        {num_v_heads, total_seqlen + padding_size, head_v_dim},
        torch::dtype(dtype).device(device).requires_grad(false));
  
@@ -2964,7 +2999,7 @@ index 10d7a1b..d4b3eb7 100644
  #define KERNEL_LAUNCHER(scalar_t, state_scalar_t)                  \
    kernel_launcher<scalar_t, state_scalar_t>(                       \
        queue,                                                       \
-@@ -1599,11 +1692,13 @@ void chunk_gated_delta_rule_impl_xe2(
+@@ -1599,11 +1706,13 @@ void chunk_gated_delta_rule_impl_xe2(
        reinterpret_cast<scalar_t*>(dt_bias.data_ptr()),             \
        reinterpret_cast<state_scalar_t*>(ssm_state.data_ptr()),     \
        ssm_state_stride_0,                                          \
@@ -2978,6 +3013,13 @@ index 10d7a1b..d4b3eb7 100644
        batch_size,                                                  \
        total_virtual_seqlen,                                        \
        num_k_heads,                                                 \
+@@ -1647,4 +1756,4 @@ void chunk_gated_delta_rule_impl_xe2(
+ #undef KERNEL_LAUNCHER
+ }
+ 
+-}  // namespace gdn
+\ No newline at end of file
++}  // namespace gdn
 diff --git a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_xe2.cpp b/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_xe2.cpp
 index 424964b..beec710 100755
 --- a/csrc/xpu/gdn_attn/xe_2/chunk_gated_delta_rule_xe2.cpp
@@ -3014,11 +3056,55 @@ index 6ec4561..32436dd 100644
 +    const int num_decodes,
 +    const int* token_indx = nullptr);
 \ No newline at end of file
+diff --git a/csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp b/csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp
+index 1649412..8fd4728 100644
+--- a/csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp
++++ b/csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp
+@@ -20,7 +20,15 @@ torch::Tensor cutlass_grouped_gemm_interface(
+     int64_t K,
+     int64_t num_experts,
+     bool is_B_int4,
+-    bool is_B_mxfp4) {
++    bool is_B_mxfp4,
++    bool is_B_fp8_block) {
++  TORCH_CHECK(
++      !is_B_fp8_block || vllm::xpu::is_xe2_arch(),
++      "FP8 block-scaled grouped GEMM requires an Xe2 device");
++  TORCH_CHECK(
++      !is_B_fp8_block || !vllm::xpu::force_xe_default_kernel(),
++      "FP8 block-scaled grouped GEMM does not support the forced XE default "
++      "kernel");
+   if (vllm::xpu::force_xe_default_kernel()) {
+ #ifdef VLLM_XPU_ENABLE_XE_DEFAULT
+     int64_t groups = num_experts;
+@@ -46,7 +54,8 @@ torch::Tensor cutlass_grouped_gemm_interface(
+         K,
+         num_experts,
+         is_B_int4,
+-        is_B_mxfp4);
++        is_B_mxfp4,
++        is_B_fp8_block);
+ #else
+     TORCH_CHECK(false, "XE2 cutlass kernel is not enabled in this build.");
+ #endif
+diff --git a/csrc/xpu/grouped_gemm/grouped_gemm_interface.h b/csrc/xpu/grouped_gemm/grouped_gemm_interface.h
+index 8e7c298..460579c 100644
+--- a/csrc/xpu/grouped_gemm/grouped_gemm_interface.h
++++ b/csrc/xpu/grouped_gemm/grouped_gemm_interface.h
+@@ -11,4 +11,5 @@ torch::Tensor cutlass_grouped_gemm_interface(
+     int64_t K,
+     int64_t num_experts,
+     bool is_B_int4,
+-    bool is_B_mxfp4);
+\ No newline at end of file
++    bool is_B_mxfp4,
++    bool is_B_fp8_block);
+\ No newline at end of file
 diff --git a/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp b/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp
-index ac2d7d6..fb51306 100644
+index ac2d7d6..22d9435 100644
 --- a/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp
 +++ b/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp
-@@ -339,6 +339,19 @@ CUTE_DEVICE void xe_gemm_4bits(
+@@ -339,8 +339,22 @@ CUTE_DEVICE void xe_gemm_4bits(
    int group_num = get<1>(A.shape()) / group_size;
    int x_idx = sg_local_id / channel_num;
  
@@ -3037,31 +3123,488 @@ index ac2d7d6..fb51306 100644
 +
    using scaleStoreType = conditional_t<is_same_v<TA, half_t>, half_t, float>;
    scaleStoreType scales[thr_N * channel_num];
++  scaleStoreType fp8_block_scale;
  
-@@ -354,7 +367,7 @@ CUTE_DEVICE void xe_gemm_4bits(
+   clear(tCrC);
+ 
+@@ -354,21 +368,24 @@ CUTE_DEVICE void xe_gemm_4bits(
      prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
      prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
  
 -    if (k_tile_prefetch * group_size < shape<1>(A)) {
-+    if (can_prefetch_scales && k_tile_prefetch * group_size < shape<1>(A)) {
-       auto next_scales_tensor = make_tensor(
-           make_gmem_ptr(
-               reinterpret_cast<const ElementS*>(
-@@ -406,7 +419,8 @@ CUTE_DEVICE void xe_gemm_4bits(
+-      auto next_scales_tensor = make_tensor(
+-          make_gmem_ptr(
+-              reinterpret_cast<const ElementS*>(
+-                  Scales + (n_tile_start + n_sg_start) * group_num +
+-                  k_tile_prefetch)),
+-          make_layout(
+-              make_shape(Int<SG_N>{}, Int<1>{}),
+-              make_stride(group_num, Int<1>{})));
+-      auto prefetch_scales = make_block_2d_prefetch<1>(
+-          make_shape(Int<SG_N>{}, Int<1>{}), next_scales_tensor);
+-      auto thr_prefetch_scales = prefetch_scales.get_slice(sg_local_id);
+-      auto pSgS = thr_prefetch_scales.partition_S(
+-          make_identity_tensor(make_shape(Int<SG_N>{}, Int<1>{})));
+-      prefetch(prefetch_scales, pSgS(_, 0, 0));
++    if constexpr (!is_B_fp8_type) {
++      if (can_prefetch_scales &&
++          k_tile_prefetch * group_size < shape<1>(A)) {
++        auto next_scales_tensor = make_tensor(
++            make_gmem_ptr(
++                reinterpret_cast<const ElementS*>(
++                    Scales + (n_tile_start + n_sg_start) * group_num +
++                    k_tile_prefetch)),
++            make_layout(
++                make_shape(Int<SG_N>{}, Int<1>{}),
++                make_stride(group_num, Int<1>{})));
++        auto prefetch_scales = make_block_2d_prefetch<1>(
++            make_shape(Int<SG_N>{}, Int<1>{}), next_scales_tensor);
++        auto thr_prefetch_scales = prefetch_scales.get_slice(sg_local_id);
++        auto pSgS = thr_prefetch_scales.partition_S(
++            make_identity_tensor(make_shape(Int<SG_N>{}, Int<1>{})));
++        prefetch(prefetch_scales, pSgS(_, 0, 0));
++      }
+     }
+   }
+ 
+@@ -381,46 +398,57 @@ CUTE_DEVICE void xe_gemm_4bits(
+     if (k_tile * tile_k % group_size == 0) {
+       int group_idx = (k_tile * tile_k) / group_size;
+ 
+-      CUTLASS_PRAGMA_UNROLL
+-      for (int n = 0; n < thr_N; ++n) {
++      if constexpr (is_B_fp8_type) {
++        // A block-FP8 scale covers a 128-wide N block, which can span multiple
++        // workgroup N tiles. Load it once per thread and reuse it for every B
++        // fragment instead of issuing identical loads and retaining duplicates.
++        fp8_block_scale = Scales
++            [(n_tile_start / group_size) * group_num + group_idx];
++      } else {
+         CUTLASS_PRAGMA_UNROLL
+-        for (int c = 0; c < channel_num; ++c) {
+-          int real_idx = x_idx + c * (sg_local_range / channel_num);
+-          int sg_local_n = n * sg_local_range + real_idx;
+-          scaleStoreType scale;
+-          if constexpr (std::is_same_v<TB, int4_t>) {
+-            scale = Scales
+-                [(n_tile_start + n_sg_start + sg_local_n) * group_num +
+-                 group_idx];
+-          } else if constexpr (std::is_same_v<TB, float_e2m1_t>) {
+-            uint32_t scale_u32 =
+-                Scales
+-                    [(n_tile_start + n_sg_start + sg_local_n) * group_num +
+-                     group_idx]
+-                << 23;
+-            scale = static_cast<scaleStoreType>(
+-                reinterpret_cast<float&>(scale_u32));
++        for (int n = 0; n < thr_N; ++n) {
++          CUTLASS_PRAGMA_UNROLL
++          for (int c = 0; c < channel_num; ++c) {
++            int real_idx = x_idx + c * (sg_local_range / channel_num);
++            int sg_local_n = n * sg_local_range + real_idx;
++            scaleStoreType scale;
++            if constexpr (std::is_same_v<TB, int4_t>) {
++              scale = Scales
++                  [(n_tile_start + n_sg_start + sg_local_n) * group_num +
++                   group_idx];
++            } else if constexpr (std::is_same_v<TB, float_e2m1_t>) {
++              uint32_t scale_u32 =
++                  Scales
++                      [(n_tile_start + n_sg_start + sg_local_n) * group_num +
++                       group_idx]
++                  << 23;
++              scale = static_cast<scaleStoreType>(
++                  reinterpret_cast<float&>(scale_u32));
++            }
++
++            scales[n * channel_num + c] = scale;
+           }
+-
+-          scales[n * channel_num + c] = scale;
          }
        }
  
 -      if ((group_idx + prefetch_dist) * group_size < shape<1>(A)) {
-+      if (can_prefetch_scales &&
-+          (group_idx + prefetch_dist) * group_size < shape<1>(A)) {
-         auto next_scales_tensor = make_tensor(
-             make_gmem_ptr(
-                 reinterpret_cast<const ElementS*>(
+-        auto next_scales_tensor = make_tensor(
+-            make_gmem_ptr(
+-                reinterpret_cast<const ElementS*>(
+-                    Scales + (n_tile_start + n_sg_start) * group_num +
+-                    group_idx + prefetch_dist)),
+-            make_layout(
+-                make_shape(Int<SG_N>{}, Int<1>{}),
+-                make_stride(group_num, Int<1>{})));
+-        auto prefetch_scales = make_block_2d_prefetch<1>(
+-            make_shape(Int<SG_N>{}, Int<1>{}), next_scales_tensor);
+-        auto thr_prefetch_scales = prefetch_scales.get_slice(sg_local_id);
+-        auto pSgS = thr_prefetch_scales.partition_S(
+-            make_identity_tensor(make_shape(Int<SG_N>{}, Int<1>{})));
+-        prefetch(prefetch_scales, pSgS(_, 0, 0));
++      if constexpr (!is_B_fp8_type) {
++        if (can_prefetch_scales &&
++            (group_idx + prefetch_dist) * group_size < shape<1>(A)) {
++          auto next_scales_tensor = make_tensor(
++              make_gmem_ptr(
++                  reinterpret_cast<const ElementS*>(
++                      Scales + (n_tile_start + n_sg_start) * group_num +
++                      group_idx + prefetch_dist)),
++              make_layout(
++                  make_shape(Int<SG_N>{}, Int<1>{}),
++                  make_stride(group_num, Int<1>{})));
++          auto prefetch_scales = make_block_2d_prefetch<1>(
++              make_shape(Int<SG_N>{}, Int<1>{}), next_scales_tensor);
++          auto thr_prefetch_scales = prefetch_scales.get_slice(sg_local_id);
++          auto pSgS = thr_prefetch_scales.partition_S(
++              make_identity_tensor(make_shape(Int<SG_N>{}, Int<1>{})));
++          prefetch(prefetch_scales, pSgS(_, 0, 0));
++        }
+       }
+     }
+ 
+@@ -439,10 +467,12 @@ CUTE_DEVICE void xe_gemm_4bits(
+         CUTLASS_PRAGMA_UNROLL
+         for (int i = 0; i < tCrB.size() / thr_N / channel_num; ++i) {
+           if constexpr (std::is_same_v<TA, half_t>) {
+-            tCrB(cute::tuple(c, _), n, _)[i] *= scales[n * channel_num + c];
++            tCrB(cute::tuple(c, _), n, _)[i] *=
++                is_B_fp8_type ? fp8_block_scale : scales[n * channel_num + c];
+           } else {
+             tCrB(cute::tuple(c, _), n, _)[i] = apply_scale(
+-                tCrB(cute::tuple(c, _), n, _)[i], scales[n * channel_num + c]);
++                tCrB(cute::tuple(c, _), n, _)[i],
++                is_B_fp8_type ? fp8_block_scale : scales[n * channel_num + c]);
+           }
+         }
+       }
+diff --git a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.cpp b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.cpp
+index 78f1650..72853b2 100644
+--- a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.cpp
++++ b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.cpp
+@@ -13,7 +13,8 @@ torch::Tensor cutlass_grouped_gemm_xe2(
+     int64_t K,
+     int64_t num_experts,
+     bool is_B_int4,
+-    bool is_B_mxfp4) {
++    bool is_B_mxfp4,
++    bool is_B_fp8_block) {
+   return MoE::cutlass_grouped_gemm_xe2_impl(
+       ptr_A,
+       ptr_B,
+@@ -25,5 +26,6 @@ torch::Tensor cutlass_grouped_gemm_xe2(
+       K,
+       num_experts,
+       is_B_int4,
+-      is_B_mxfp4);
++      is_B_mxfp4,
++      is_B_fp8_block);
+ }
+\ No newline at end of file
+diff --git a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.h b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.h
+index a8b943c..85bbc7a 100644
+--- a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.h
++++ b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.h
+@@ -11,4 +11,5 @@ torch::Tensor cutlass_grouped_gemm_xe2(
+     int64_t K,
+     int64_t num_experts,
+     bool is_B_int4,
+-    bool is_B_mxfp4);
+\ No newline at end of file
++    bool is_B_mxfp4,
++    bool is_B_fp8_block);
+\ No newline at end of file
+diff --git a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp
+index 2cf77c6..ccd84cb 100644
+--- a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp
++++ b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp
+@@ -91,6 +91,9 @@ CUTE_DEVICE void MoEGEMM(
+   static constexpr bool is_B_mxfp4 = (std::is_same_v<ElementB, uint8_t>) &&
+                                      (std::is_same_v<ElementS, uint8_t>);
+   static constexpr bool is_B_4bits = std::is_same_v<ElementB, uint8_t>;
++  static constexpr bool is_B_fp8 =
++      std::is_same_v<ElementB, cutlass::float_e5m2_t> ||
++      std::is_same_v<ElementB, cutlass::float_e4m3_t>;
+ 
+   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+   auto wg_tile = mma.tile_mnk();
+@@ -146,6 +149,13 @@ CUTE_DEVICE void MoEGEMM(
+     if constexpr (is_B_4bits) {
+       ptr_Scales_curr_batch =
+           const_cast<ElementS*>(Scales) + B_offset * 2 / group_size;
++    } else if constexpr (is_B_fp8) {
++      if (group_size > 0) {
++        ptr_Scales_curr_batch =
++            const_cast<ElementS*>(Scales) +
++            static_cast<int64_t>(expert_id) * (gemm_n / group_size) *
++                (gemm_k / group_size);
++      }
+     }
+     ElementBI* ptr_Bias_curr_batch = nullptr;
+     if (Bias != static_cast<ElementBI*>(nullptr)) {
+@@ -194,6 +204,30 @@ CUTE_DEVICE void MoEGEMM(
+           XE_GEMM_4BITS_CALLER(256)
+         }
+ #undef XE_GEMM_4BITS_CALLER
++      } else if constexpr (is_B_fp8) {
++        if (group_size == 128) {
++          xe_gemm_4bits<
++              GmemTiledCopyA,
++              GmemTiledCopyB,
++              GmemTiledCopyD,
++              128>(
++              A_tensor,
++              B_tensor,
++              ptr_Scales_curr_batch,
++              ptr_Bias_curr_batch,
++              D_tensor,
++              tile_coord,
++              mma);
++        } else {
++          xe_gemm<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD>(
++              A_tensor,
++              B_tensor,
++              ptr_Scales_curr_batch,
++              ptr_Bias_curr_batch,
++              D_tensor,
++              tile_coord,
++              mma);
++        }
+       } else {
+         xe_gemm<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD>(
+             A_tensor,
+diff --git a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp
+index b47b627..826ac59 100644
+--- a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp
++++ b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp
+@@ -170,7 +170,8 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
+     int64_t K,
+     int64_t num_experts,
+     bool is_B_int4,
+-    bool is_B_mxfp4) {
++    bool is_B_mxfp4,
++    bool is_B_fp8_block) {
+   auto& dpcpp_queue =
+       at::xpu::getCurrentXPUStream(ptr_A.device().index()).queue();
+   auto A_dtype = ptr_A.dtype();
+@@ -203,6 +204,9 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
+   if (is_B_int4 || is_B_mxfp4) {
+     B_K = ptr_B.size(2) * 2;
+     B_N = ptr_B.size(1);
++  } else if (is_B_fp8_block) {
++    B_K = ptr_B.size(2);
++    B_N = ptr_B.size(1);
+   }
+ 
+   int D_total_M = ptr_D.size(0);
+@@ -301,28 +305,56 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
+   } else if (is_weight_fp8) {
+     TORCH_CHECK(ptr_scales.has_value(), "w8a16 grouped gemm must have scales");
+     TORCH_CHECK(ptr_scales->is_contiguous(), "ptr_scales must be contiguous");
+-    TORCH_CHECK(
+-        ptr_scales->dim() == 1, "ptr_scales of fp8 must be 1D [num_experts]");
+-    TORCH_CHECK(
+-        ptr_scales->size(0) == num_experts,
+-        "ptr_scales.size(0) of fp8 must match num_experts");
+     TORCH_CHECK(ptr_scales->dtype() == at::kFloat, "ptr_scales must be float");
+ 
+-#define W8A16LauncherCallER(policy)                                         \
+-  if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kHalf) {              \
+-    using scalar_t = half_t;                                                \
+-    MoEGEMMLauncherCallER('R', 'R', policy, scalar_t, float_e4m3_t, float); \
+-  } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kHalf) {         \
+-    using scalar_t = half_t;                                                \
+-    MoEGEMMLauncherCallER('R', 'R', policy, scalar_t, float_e5m2_t, float); \
+-  } else if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kBFloat16) {   \
+-    using scalar_t = bfloat16_t;                                            \
+-    MoEGEMMLauncherCallER('R', 'R', policy, scalar_t, float_e4m3_t, float); \
+-  } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kBFloat16) {     \
+-    using scalar_t = bfloat16_t;                                            \
+-    MoEGEMMLauncherCallER('R', 'R', policy, scalar_t, float_e5m2_t, float); \
++#define W8A16LauncherCallER(policy)                                          \
++  if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kHalf) {               \
++    using scalar_t = half_t;                                                 \
++    if (is_B_fp8_block) {                                                    \
++      MoEGEMMLauncherCallER('R', 'C', policy, scalar_t, float_e4m3_t, float); \
++    } else {                                                                 \
++      MoEGEMMLauncherCallER('R', 'R', policy, scalar_t, float_e4m3_t, float); \
++    }                                                                        \
++  } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kHalf) {          \
++    using scalar_t = half_t;                                                 \
++    MoEGEMMLauncherCallER('R', 'R', policy, scalar_t, float_e5m2_t, float);  \
++  } else if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kBFloat16) {    \
++    using scalar_t = bfloat16_t;                                             \
++    if (is_B_fp8_block) {                                                    \
++      MoEGEMMLauncherCallER('R', 'C', policy, scalar_t, float_e4m3_t, float); \
++    } else {                                                                 \
++      MoEGEMMLauncherCallER('R', 'R', policy, scalar_t, float_e4m3_t, float); \
++    }                                                                        \
++  } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kBFloat16) {      \
++    using scalar_t = bfloat16_t;                                             \
++    MoEGEMMLauncherCallER('R', 'R', policy, scalar_t, float_e5m2_t, float);  \
+   }
+ 
++    if (is_B_fp8_block) {
++      TORCH_CHECK(
++          B_dtype == at::kFloat8_e4m3fn,
++          "block-scaled grouped GEMM only supports float8_e4m3fn weights");
++      TORCH_CHECK(
++          N % 128 == 0 && K % 128 == 0,
++          "block-scaled grouped GEMM requires N and K divisible by 128");
++      TORCH_CHECK(
++          ptr_scales->dim() == 3,
++          "block scales must be 3D [num_experts, N / 128, K / 128]");
++      TORCH_CHECK(
++          ptr_scales->size(0) == num_experts &&
++              ptr_scales->size(1) == N / 128 &&
++              ptr_scales->size(2) == K / 128,
++          "block scales must have shape [num_experts, N / 128, K / 128]");
++      group_size = 128;
++    } else {
++      TORCH_CHECK(
++          ptr_scales->dim() == 1,
++          "ptr_scales of fp8 must be 1D [num_experts]");
++      TORCH_CHECK(
++          ptr_scales->size(0) == num_experts,
++          "ptr_scales.size(0) of fp8 must match num_experts");
++    }
++
+     if (A_avg_M <= 8) {
+       using policy = w8a16_policy_m_16;
+       W8A16LauncherCallER(policy);
+diff --git a/csrc/xpu/onednn/fp8_gemm_w8a16.h b/csrc/xpu/onednn/fp8_gemm_w8a16.h
+index 59a6f01..9cba23c 100644
+--- a/csrc/xpu/onednn/fp8_gemm_w8a16.h
++++ b/csrc/xpu/onednn/fp8_gemm_w8a16.h
+@@ -70,7 +70,14 @@ static inline void dnnl_matmul_w8a16_fp8(
+ 
+   auto f_attr = [&](dnnl::primitive_attr& pattr) {
+     pattr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+-    if (m2_sc.numel() == 1) {
++    if (group_size > 0) {
++      pattr.set_scales(
++          DNNL_ARG_WEIGHTS,
++          /* mask */ (1 << 0) | (1 << 1),
++          {group_size, group_size},
++          get_onednn_dtype(m2_sc));
++      /* 2D group quantization */
++    } else if (m2_sc.numel() == 1) {
+       pattr.set_scales(
+           DNNL_ARG_WEIGHTS,
+           /* mask */ 0,
+@@ -95,8 +102,18 @@ static inline void dnnl_matmul_w8a16_fp8(
+   at::Device curDevice = at::Device(at::kXPU, dev_id);
+   auto engine = GpuEngineManager::Instance().get_engine(curDevice);
+ 
+-  int m2_sc_group_size = m2_sc.numel();
+-  int sc_group_size = (group_size << 8) | m2_sc_group_size;
++  constexpr int scale_dtype_slots = 64;
++  const int scale_cache_discriminator =
++      static_cast<int>(m2_sc.numel()) * scale_dtype_slots +
++      static_cast<int>(m2_sc.scalar_type());
++  const uint64_t grouped_scale_cache_hash =
++      static_cast<uint64_t>(group_size) * 1315423911ULL ^
++      static_cast<uint64_t>(scale_cache_discriminator);
++  int sc_group_size =
++      group_size > 0
++          ? -static_cast<int>(
++                (grouped_scale_cache_hash & 0x7ffffffeULL) + 1)
++          : scale_cache_discriminator;
+   auto& matmul_ext = matmul_primitive_create_and_cache(
+       jd, tt, b_type, m, n, k, lda, ldb, ldc, dev_id, f_attr, sc_group_size);
+ 
+diff --git a/csrc/xpu/onednn/fp8_gemm_w8a8.h b/csrc/xpu/onednn/fp8_gemm_w8a8.h
+index 8c23686..939f4cc 100644
+--- a/csrc/xpu/onednn/fp8_gemm_w8a8.h
++++ b/csrc/xpu/onednn/fp8_gemm_w8a8.h
+@@ -171,4 +171,4 @@ static inline void dnnl_matmul_w8a8_fp8(
+   auto qfp8_matmul_event =
+       matmul_ext.execute(strm, engine, std::move(arg_handles), arg_off);
+ }
+-}  // namespace oneDNN
+\ No newline at end of file
++}  // namespace oneDNN
+diff --git a/csrc/xpu/onednn/onednn_matmul.cpp b/csrc/xpu/onednn/onednn_matmul.cpp
+index 2a3dace..6f104dd 100644
+--- a/csrc/xpu/onednn/onednn_matmul.cpp
++++ b/csrc/xpu/onednn/onednn_matmul.cpp
+@@ -82,19 +82,52 @@ torch::Tensor fp8_gemm_w8a16(
+     const torch::Tensor& A,
+     const torch::Tensor& B,
+     const std::optional<torch::Tensor>& B_scale_,
+-    const std::optional<torch::Tensor>& bias_) {
++    const std::optional<torch::Tensor>& bias_,
++    int64_t group_size) {
+   const at::DeviceGuard device_guard(A.device());
+   torch::Tensor result = check_and_create_output_tensor(A, B, A.scalar_type());
+   TORCH_CHECK(
+       is_supported_fp8(B.scalar_type()),
+       "weight must be f8_e5m2 or f8_e4m3fn for fp8 matmul");
++  TORCH_CHECK(group_size >= 0, "group_size must be non-negative");
++  if (group_size > 0) {
++    TORCH_CHECK(
++        A.scalar_type() == at::kHalf,
++        "grouped FP8 weight scales currently require float16 activations");
++    TORCH_CHECK(
++        B_scale_.has_value(),
++        "grouped FP8 weight scales must be provided");
++    TORCH_CHECK(
++        B.dim() == 2 && B.size(0) % group_size == 0 &&
++            B.size(1) % group_size == 0,
++        "grouped FP8 weight dimensions must be divisible by group_size");
++    TORCH_CHECK(
++        B_scale_->dim() == 2 &&
++            B_scale_->size(0) == B.size(0) / group_size &&
++            B_scale_->size(1) == B.size(1) / group_size,
++        "grouped FP8 weight scales must have shape "
++        "[K / group_size, N / group_size]");
++    TORCH_CHECK(
++        B_scale_->is_contiguous(),
++        "grouped FP8 weight scales must be contiguous in "
++        "[K / group_size, N / group_size] order");
++    TORCH_CHECK(
++        B_scale_->device() == B.device(),
++        "grouped FP8 weight scales and weight must be on the same device");
++    TORCH_CHECK(
++        B_scale_->scalar_type() == at::kFloat ||
++            B_scale_->scalar_type() == at::kBFloat16 ||
++            B_scale_->scalar_type() == at::kHalf,
++        "grouped FP8 weight scales must be float32, bfloat16, or float16");
++  }
+   // check if nt format
+   bool is_nt = B.strides()[B.dim() - 2] == 1;
+ 
+   torch::Tensor B_scale = B_scale_.has_value()
+                               ? B_scale_.value()
+                               : at::ones({1}, B.options().dtype(A.dtype()));
+-  oneDNN::dnnl_matmul_w8a16_fp8(result, A, B, is_nt, bias_, B_scale);
++  oneDNN::dnnl_matmul_w8a16_fp8(
++      result, A, B, is_nt, bias_, B_scale, group_size);
+   return result;
+ }
+ 
 diff --git a/csrc/xpu/ops.h b/csrc/xpu/ops.h
-index 1f8c046..39edf06 100644
+index 1f8c046..a6f128e 100644
 --- a/csrc/xpu/ops.h
 +++ b/csrc/xpu/ops.h
-@@ -95,9 +95,15 @@ void gdn_attention(
+@@ -22,7 +22,8 @@ torch::Tensor fp8_gemm_w8a16(
+     const torch::Tensor& A,
+     const torch::Tensor& B,
+     const std::optional<torch::Tensor>& B_scale_,
+-    const std::optional<torch::Tensor>& bias_);
++    const std::optional<torch::Tensor>& bias_,
++    int64_t group_size);
+ 
+ torch::Tensor fp4_gemm(
+     const torch::Tensor& A,
+@@ -64,7 +65,8 @@ torch::Tensor cutlass_grouped_gemm_interface(
+     int64_t K,
+     int64_t num_experts,
+     bool is_B_int4,
+-    bool is_B_mxfp4);
++    bool is_B_mxfp4,
++    bool is_B_fp8_block);
+ #endif
+ 
+ std::tuple<at::Tensor, at::Tensor> deepseek_scaling_rope(
+@@ -95,9 +97,15 @@ void gdn_attention(
      const torch::Tensor& dt_bias,
      const int64_t num_prefills,
      const int64_t num_decodes,
@@ -3079,11 +3622,37 @@ index 1f8c046..39edf06 100644
      const int64_t num_actual_tokens,
      const int64_t tp_size,
      const bool reorder_input);
+@@ -139,4 +147,4 @@ torch::Tensor fp8_paged_mqa_logits(
+     const torch::Tensor& block_tables,
+     const c10::optional<at::Tensor>& schedule_metadata,
+     int64_t max_model_len);
+-#endif
+\ No newline at end of file
++#endif
 diff --git a/csrc/xpu/torch_bindings.cpp b/csrc/xpu/torch_bindings.cpp
-index 7089a0b..157def8 100644
+index 7089a0b..e28d769 100644
 --- a/csrc/xpu/torch_bindings.cpp
 +++ b/csrc/xpu/torch_bindings.cpp
-@@ -83,9 +83,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
+@@ -18,7 +18,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
+ 
+   xpu_ops.def(
+       "fp8_gemm_w8a16(Tensor A, Tensor B, Tensor? B_scale_, "
+-      "Tensor? bias_) -> Tensor");
++      "Tensor? bias_, int group_size=0) -> Tensor");
+   xpu_ops.impl("fp8_gemm_w8a16", torch::kXPU, &fp8_gemm_w8a16);
+ 
+   xpu_ops.def(
+@@ -45,7 +45,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
+       "Tensor "
+       "ptr_D, Tensor "
+       "rows_per_expert, int N, int K, int "
+-      "num_experts, bool is_B_int4, bool is_B_mxfp4) -> "
++      "num_experts, bool is_B_int4, bool is_B_mxfp4, "
++      "bool is_B_fp8_block=False) -> "
+       "Tensor");
+   xpu_ops.impl(
+       "cutlass_grouped_gemm_interface",
+@@ -83,9 +84,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
        "int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim,"
        "Tensor! conv_state, Tensor! ssm_state, Tensor conv_weights, Tensor? "
        "conv_bias, str activation, Tensor A_log, Tensor dt_bias,"
@@ -3099,8 +3668,105 @@ index 7089a0b..157def8 100644
        "tp_size, bool reorder_input) -> ()");
    xpu_ops.impl("gdn_attention", torch::kXPU, &gdn_attention);
  #endif
+diff --git a/tests/fused_moe/test_grouped_gemm.py b/tests/fused_moe/test_grouped_gemm.py
+index 48a2192..64a85d5 100644
+--- a/tests/fused_moe/test_grouped_gemm.py
++++ b/tests/fused_moe/test_grouped_gemm.py
+@@ -222,6 +222,92 @@ def test_xe_grouped_gemm_fp8(m, n, k, e, topk, dtype, fp8_dtype, has_bias):
+     torch.testing.assert_close(output, ref, rtol=1e-2, atol=1e-2)
+ 
+ 
++@pytest.mark.parametrize("n,k", [(1024, 2048), (2048, 512)])
++def test_xe_grouped_gemm_fp8_block_qwen_shape(n, k):
++    seed_everything(7)
++    rows = [130, 0, 67, 9]
++    num_experts = len(rows)
++    total_m = sum(rows)
++    input_a = (torch.randn(total_m, k, device=DEVICE) * 0.3).half()
++    scales = (
++        torch.rand(num_experts, n // 128, k // 128, device=DEVICE) * 0.015
++        + 0.005
++    ).float()
++    expanded_scales = scales.repeat_interleave(128, 1).repeat_interleave(128, 2)
++    source = torch.randn(num_experts, n, k, device=DEVICE) * 0.08
++    input_b = (source / expanded_scales).clamp(-448, 448).to(
++        torch.float8_e4m3fn
++    )
++    rows_per_expert = torch.tensor(rows, dtype=torch.int32, device=DEVICE)
++    output = torch.empty(total_m, n, dtype=torch.float16, device=DEVICE)
++
++    cutlass_grouped_gemm_xe2(
++        input_a,
++        input_b,
++        scales,
++        None,
++        output,
++        rows_per_expert,
++        n,
++        k,
++        num_experts,
++        False,
++        False,
++        True,
++    )
++
++    reference = torch.empty_like(output)
++    row_start = 0
++    for expert, expert_rows in enumerate(rows):
++        if expert_rows == 0:
++            continue
++        dequantized = input_b[expert].float() * expanded_scales[expert]
++        reference[row_start : row_start + expert_rows] = (
++            input_a[row_start : row_start + expert_rows].float()
++            @ dequantized.transpose(0, 1)
++        ).half()
++        row_start += expert_rows
++
++    torch.testing.assert_close(output, reference, rtol=8e-2, atol=2e-1)
++
++
++def test_xe_grouped_gemm_fp8_block_all_finite_e4m3():
++    n, k = 128, 256
++    input_a = torch.eye(k, dtype=torch.float16, device=DEVICE)
++    input_b = torch.empty(1, n, k, dtype=torch.float8_e4m3fn, device=DEVICE)
++    finite_codes = torch.tensor(
++        [code for code in range(256) if code not in (0x7F, 0xFF)],
++        dtype=torch.uint8,
++        device=DEVICE,
++    )
++    input_b.view(torch.uint8).flatten().copy_(
++        finite_codes.repeat((input_b.numel() + finite_codes.numel() - 1)
++                            // finite_codes.numel())[:input_b.numel()]
++    )
++    scales = torch.tensor([[[0.5, 2.0]]], dtype=torch.float32, device=DEVICE)
++    rows_per_expert = torch.tensor([k], dtype=torch.int32, device=DEVICE)
++    output = torch.empty(k, n, dtype=torch.float16, device=DEVICE)
++
++    cutlass_grouped_gemm_xe2(
++        input_a,
++        input_b,
++        scales,
++        None,
++        output,
++        rows_per_expert,
++        n,
++        k,
++        1,
++        False,
++        False,
++        True,
++    )
++
++    expanded_scales = scales.repeat_interleave(128, 1).repeat_interleave(128, 2)
++    reference = (input_b.float() * expanded_scales).squeeze(0).transpose(0, 1)
++    torch.testing.assert_close(output, reference.half(), rtol=0, atol=0)
++
++
+ def dequantize_uint4(qweight, scales, group_size):
+     import numpy as np
+     k = qweight.shape[1] * 2
 diff --git a/tests/gdn_attn/test_gdn_attn.py b/tests/gdn_attn/test_gdn_attn.py
-index 3fe54c0..1822793 100755
+index 3fe54c0..3b6f66c 100755
 --- a/tests/gdn_attn/test_gdn_attn.py
 +++ b/tests/gdn_attn/test_gdn_attn.py
 @@ -190,57 +190,69 @@ def ref_gdn_attention(
@@ -3229,10 +3895,30 @@ index 3fe54c0..1822793 100755
          num_actual_tokens=num_actual_tokens,
          tp_size=tp_size,
          reorder_input=reorder_input)
-@@ -440,3 +458,388 @@ def test_gdn_attention(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
-                                        ref_ssm_state[state_id],
-                                        atol=atol,
-                                        rtol=rtol)
+@@ -418,9 +436,6 @@ def test_gdn_attention(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
+ 
+     torch.testing.assert_close(z, ref_z, atol=atol, rtol=rtol)
+ 
+-    if num_actual_tokens == 8192:
+-        pytest.skip("FIXME, skip core_attn_out test because of random error")
+-
+     torch.testing.assert_close(core_attn_out,
+                                ref_core_attn_out,
+                                atol=atol,
+@@ -432,11 +447,392 @@ def test_gdn_attention(num_actual_tokens, batch_size, num_k_heads, head_k_dim,
+                                    ref_conv_state[state_id],
+                                    atol=atol,
+                                    rtol=rtol)
+-        if num_actual_tokens == 8192:
+-            # FIXME: remove this skip
+-            # skip because of random error, will be fixed in future
+-            pytest.skip("FIXME, skip ssm_state test because of random error")
+-            torch.testing.assert_close(ssm_state[state_id],
+-                                       ref_ssm_state[state_id],
++        torch.testing.assert_close(ssm_state[state_id],
++                                   ref_ssm_state[state_id],
++                                   atol=atol,
++                                   rtol=rtol)
 +
 +
 +NUM_SPEC_DECODES = [1, 4]
@@ -3616,8 +4302,137 @@ index 3fe54c0..1822793 100755
 +            slot = int(spec_state_indices_tensor[n, t].item())
 +            torch.testing.assert_close(ssm_state[slot],
 +                                       ref_ssm_state[slot],
-+                                       atol=atol,
-+                                       rtol=rtol)
+                                        atol=atol,
+                                        rtol=rtol)
+diff --git a/tests/register_ops.py b/tests/register_ops.py
+index a372db9..0c08faf 100644
+--- a/tests/register_ops.py
++++ b/tests/register_ops.py
+@@ -354,8 +354,10 @@ def fp4_gemm(
+ 
+ def fp8_gemm_w8a16(input: torch.Tensor, weight: torch.Tensor,
+                    scale_wei: Optional[torch.Tensor],
+-                   scale_act: Optional[torch.Tensor]):
+-    return torch.ops._xpu_C.fp8_gemm_w8a16(input, weight, scale_wei, scale_act)
++                   scale_act: Optional[torch.Tensor],
++                   group_size: int = 0):
++    return torch.ops._xpu_C.fp8_gemm_w8a16(
++        input, weight, scale_wei, scale_act, group_size)
+ 
+ 
+ # moe
+diff --git a/tests/test_fp8_gemm_onednn.py b/tests/test_fp8_gemm_onednn.py
+index 298ca12..a7c5f26 100644
+--- a/tests/test_fp8_gemm_onednn.py
++++ b/tests/test_fp8_gemm_onednn.py
+@@ -230,6 +230,107 @@ def test_fp8_gemm_w8a16_per_channel(fp8_dtype, out_dtype, is_nt, is_mbk, batch,
+     torch.testing.assert_close(output_fp8, output_ref, atol=5e-2, rtol=5e-2)
+ 
+ 
++@pytest.mark.parametrize("out_dtype", [torch.float16])
++@pytest.mark.parametrize(
++    "scale_dtype", [torch.float32, torch.bfloat16, torch.float16]
++)
++def test_fp8_gemm_w8a16_block_scale(out_dtype, scale_dtype):
++    torch.manual_seed(1234)
++    m, n, k, group_size = 17, 256, 512, 128
++
++    input = torch.randn(m, k, dtype=out_dtype, device="xpu") / 10.0
++    weight = torch.randn(n, k, dtype=out_dtype, device="xpu") / 10.0
++    weight_fp8 = weight.to(torch.float8_e4m3fn)
++    scales_nk = (
++        torch.rand(
++            n // group_size,
++            k // group_size,
++            dtype=torch.float32,
++            device="xpu",
++        )
++        / 100.0
++        + 0.001
++    )
++    # oneDNN runtime scales are a plain row-major array. A transposed view of
++    # the checkpoint's [N/group, K/group] scales has the right logical shape
++    # but the wrong physical order, so materialize [K/group, N/group].
++    scales_kn = scales_nk.to(scale_dtype).t().contiguous()
++
++    output = fp8_gemm_w8a16(
++        input,
++        weight_fp8.t(),
++        scales_kn,
++        None,
++        group_size,
++    )
++    expanded_scales = scales_nk.repeat_interleave(
++        group_size, 0
++    ).repeat_interleave(group_size, 1)
++    reference = input.float() @ (
++        weight_fp8.float() * expanded_scales.to(scale_dtype).float()
++    ).t()
++
++    output_float = output.float()
++    reference_float = reference.float()
++    relative_mae = (
++        (output_float - reference_float).abs().mean()
++        / reference_float.abs().mean().clamp_min(1e-8)
++    )
++    cosine = torch.nn.functional.cosine_similarity(
++        output_float.flatten(), reference_float.flatten(), dim=0
++    )
++    assert relative_mae < 1e-3
++    assert cosine > 0.99999
++
++
++def test_fp8_gemm_w8a16_block_scale_rejects_strided_scale():
++    m, n, k, group_size = 17, 256, 512, 128
++    input = torch.randn(m, k, dtype=torch.float16, device="xpu")
++    weight = torch.randn(n, k, dtype=torch.float16, device="xpu").to(
++        torch.float8_e4m3fn
++    )
++    scales_nk = torch.rand(
++        n // group_size,
++        k // group_size,
++        dtype=torch.float32,
++        device="xpu",
++    )
++    scales_kn = scales_nk.t()
++    assert not scales_kn.is_contiguous()
++
++    with pytest.raises(RuntimeError, match="must be contiguous"):
++        fp8_gemm_w8a16(
++            input,
++            weight.t(),
++            scales_kn,
++            None,
++            group_size,
++        )
++
++
++def test_fp8_gemm_w8a16_block_scale_rejects_bfloat16_activation():
++    m, n, k, group_size = 17, 256, 512, 128
++    input = torch.randn(m, k, dtype=torch.bfloat16, device="xpu")
++    weight = torch.randn(n, k, dtype=torch.bfloat16, device="xpu").to(
++        torch.float8_e4m3fn
++    )
++    scales_kn = torch.rand(
++        k // group_size,
++        n // group_size,
++        dtype=torch.float32,
++        device="xpu",
++    )
++
++    with pytest.raises(RuntimeError, match="require float16 activations"):
++        fp8_gemm_w8a16(
++            input,
++            weight.t(),
++            scales_kn,
++            None,
++            group_size,
++        )
++
++
+ def _convert_to_mxfp8_with_hp_ref(t):
+     # Convert a tensor to mxfp8, returning:
+     #   t_hp : reconstructed bf16 version of t_lp
 diff --git a/vllm_xpu_kernels/flash_attn_interface.py b/vllm_xpu_kernels/flash_attn_interface.py
 index 70df0b2..c43f92d 100644
 --- a/vllm_xpu_kernels/flash_attn_interface.py
@@ -3641,10 +4456,29 @@ index 70df0b2..c43f92d 100644
      else:
          raise NotImplementedError("not support yet")
 diff --git a/vllm_xpu_kernels/fused_moe_interface.py b/vllm_xpu_kernels/fused_moe_interface.py
-index e3049c9..0781f0b 100755
+index e3049c9..1cf103b 100755
 --- a/vllm_xpu_kernels/fused_moe_interface.py
 +++ b/vllm_xpu_kernels/fused_moe_interface.py
-@@ -97,6 +97,8 @@ def fused_moe_activation(act_output, gemm1_output, activation):
+@@ -65,7 +65,7 @@ def cutlass_grouped_gemm(input_A, input_B, bias, output, expert_token_count, n,
+ 
+ def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
+                              num_rows_per_expert, n, k, num_experts, is_B_int4,
+-                             is_B_mxfp4):
++                             is_B_mxfp4, is_B_fp8_block=False):
+     torch.ops._xpu_C.cutlass_grouped_gemm_interface(
+         ptr_A=input_A,
+         ptr_B=input_B,
+@@ -77,7 +77,8 @@ def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
+         K=k,
+         num_experts=num_experts,
+         is_B_int4=is_B_int4,
+-        is_B_mxfp4=is_B_mxfp4)
++        is_B_mxfp4=is_B_mxfp4,
++        is_B_fp8_block=is_B_fp8_block)
+ 
+ 
+ def ceilDiv(a, b):
+@@ -97,6 +98,8 @@ def fused_moe_activation(act_output, gemm1_output, activation):
          torch.ops._C.silu_and_mul(act_output, gemm1_output)
      elif activation == "gelu":
          torch.ops._C.gelu_and_mul(act_output, gemm1_output)
@@ -3653,7 +4487,7 @@ index e3049c9..0781f0b 100755
      elif activation == "swigluoai" or ("SWIGLUOAI" in str(activation)):
          torch.ops._C.swigluoai_and_mul(act_output, gemm1_output, 1.702, 7.0)
      elif activation == "relu2_no_mul":
-@@ -111,6 +113,8 @@ def _naive_fused_moe_activation(gemm1_output, activation):
+@@ -111,6 +114,8 @@ def _naive_fused_moe_activation(gemm1_output, activation):
          return torch.nn.functional.silu(gemm1_output)
      elif activation == "gelu":
          return torch.nn.functional.gelu(gemm1_output)
@@ -3662,7 +4496,34 @@ index e3049c9..0781f0b 100755
      elif activation == "swigluoai" or ("SWIGLUOAI" in str(activation)):
          gate, up = gemm1_output.chunk(2, dim=-1)
          return torch.nn.functional.silu(gate) * up * 1.702 * 7.0
-@@ -358,6 +362,8 @@ class XpuFusedMoe:
+@@ -304,12 +309,12 @@ class XpuFusedMoe:
+         is_mxfp8=False,
+         is_block_fp8=False
+     ):
+-        # 4bits support [E, N, K]
+-        # other types [E, K, N]
+-        if not is_int4 and not is_mxfp4:
+-            self.inter_size = w13.shape[-1] // 2
+-        else:
++        # Quantized block/group formats use [E, N, K]; other types use
++        # [E, K, N].
++        if is_int4 or is_mxfp4 or is_block_fp8:
+             self.inter_size = w13.shape[-2] // 2
++        else:
++            self.inter_size = w13.shape[-1] // 2
+ 
+         assert w13.is_contiguous() and w2.is_contiguous()
+ 
+@@ -329,7 +334,7 @@ class XpuFusedMoe:
+         self.w13 = w13
+         self.w2 = w2
+ 
+-        if not is_fp8 and not is_int4 and not is_mxfp4:
++        if not is_fp8 and not is_block_fp8 and not is_int4 and not is_mxfp4:
+             self.gemm1_scales = None
+             self.gemm2_scales = None
+         else:
+@@ -358,6 +363,8 @@ class XpuFusedMoe:
              self.act_func = torch.ops._C.silu_and_mul
          elif self.activation == "gelu":
              self.act_func = torch.ops._C.gelu_and_mul
@@ -3671,3 +4532,69 @@ index e3049c9..0781f0b 100755
          elif self.activation == "swigluoai" \
              or ("SWIGLUOAI" in str(self.activation)):
              self.act_func = torch.ops._C.swigluoai_and_mul
+@@ -481,7 +488,8 @@ class XpuFusedMoe:
+             K=hidden_size,
+             num_experts=self.num_experts,
+             is_B_int4=self.is_int4,
+-            is_B_mxfp4=self.is_mxfp4)
++            is_B_mxfp4=self.is_mxfp4,
++            is_B_fp8_block=self.is_block_fp8)
+ 
+         # act
+         act_output = torch.empty(
+@@ -506,7 +514,8 @@ class XpuFusedMoe:
+             K=self.inter_size * self.inter_size_scale,
+             num_experts=self.num_experts,
+             is_B_int4=self.is_int4,
+-            is_B_mxfp4=self.is_mxfp4)
++            is_B_mxfp4=self.is_mxfp4,
++            is_B_fp8_block=self.is_block_fp8)
+ 
+         torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
+                                     unpermuted_row_to_permuted_row,
+@@ -583,12 +592,11 @@ def xpu_fused_moe(hidden_states,
+         output.copy_(out)
+         return output
+ 
+-    # 4bits support [E, N, K]
+-    # other types [E, K, N]
+-    if not is_int4 and not is_mxfp4:
+-        inter_size = list(w13.shape)[-1] // 2
+-    else:
++    # Quantized block/group formats use [E, N, K]; other types use [E, K, N].
++    if is_int4 or is_mxfp4 or is_block_fp8:
+         inter_size = list(w13.shape)[-2] // 2
++    else:
++        inter_size = list(w13.shape)[-1] // 2
+ 
+     assert w13.is_contiguous() and w2.is_contiguous()
+ 
+@@ -611,7 +619,7 @@ def xpu_fused_moe(hidden_states,
+                                dtype=hidden_states.dtype,
+                                device=hidden_states.device)
+ 
+-    if not is_fp8 and not is_int4 and not is_mxfp4:
++    if not is_fp8 and not is_block_fp8 and not is_int4 and not is_mxfp4:
+         gemm1_scales = None
+         gemm2_scales = None
+     else:
+@@ -669,7 +677,8 @@ def xpu_fused_moe(hidden_states,
+         K=hidden_size,
+         num_experts=num_experts,
+         is_B_int4=is_int4,
+-        is_B_mxfp4=is_mxfp4)
++        is_B_mxfp4=is_mxfp4,
++        is_B_fp8_block=is_block_fp8)
+ 
+     inter_size_scale = 2 if activation == "relu2_no_mul" else 1
+     # act
+@@ -696,7 +705,8 @@ def xpu_fused_moe(hidden_states,
+         K=inter_size * inter_size_scale,
+         num_experts=num_experts,
+         is_B_int4=is_int4,
+-        is_B_mxfp4=is_mxfp4)
++        is_B_mxfp4=is_mxfp4,
++        is_B_fp8_block=is_block_fp8)
+ 
+     torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
+                                 unpermuted_row_to_permuted_row,

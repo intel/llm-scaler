@@ -1,117 +1,133 @@
 # ComfyUI-OmniXPU
 
-Intel XPU acceleration for upstream ComfyUI via [omni_xpu_kernel](https://github.com/intel/llm-scaler/tree/main/omni/omni_xpu_kernel).
+Thin Intel XPU integration for upstream ComfyUI.
 
-All optimizations are applied transparently at startup — no workflow changes needed.
+The runtime is deliberately split into three layers:
+
+1. `omni_xpu_kernel` supplies native XPU kernels.
+2. `comfy_kitchen` owns generic operator APIs, capability checks, dispatch,
+   and safe eager fallback.
+3. `ComfyUI-OmniXPU` only adapts ComfyUI call sites that do not yet expose a
+   Kitchen entry point, plus a small set of opt-in legacy correctness fixes.
+
+No workflow or model-pipeline replacement is required.
+
+## Ownership
+
+| Layer | Current responsibility |
+|---|---|
+| Kitchen XPU backend | INT8/QTensor operations, FP8 QDQ and stochastic rounding, SVDQuant, AdaLN, four RoPE APIs, and ConvRot |
+| ComfyUI adapter | Attention routing, LayerNorm/RMSNorm class integration, the remaining FP8 model/factory bridge, and fused Lumina/Z-Image INT8 FFN wiring |
+| Memory adapter | Cached whole-LoRA model budgets plus optional DynamicVRAM per-layer XPU staging measurements |
+| SeedVR2 capacity | Guarded Ada broadcast plus byte-bounded RMSNorm, SwiGLU, and window-attention materialization |
+| SeedVR2 native adapters | Validated BMG FP16 GroupNorm and causal-prefix cat-pad routing |
+| Large-video preprocessing | Source-guarded, bounded CPU materialization for PIL Lanczos resize, SeedVR input padding, and XPU VAE input staging |
+| Legacy fix | Global `F.interpolate` and `torch.median`/`torch.nanmedian` workarounds; disabled by default |
+
+RoPE, generic INT8 linear dispatch, and the old FP8 negative-zero wrapper are
+not registered by this custom node. Duplicating those registrations here can
+override Kitchen's constraints and fallback policy.
 
 ## Install
 
-Bundled with the `llm-scaler-omni` Docker image. No manual installation needed.
+The node is bundled with the `llm-scaler-omni` ComfyUI image. It requires:
 
-Requires `omni_xpu_kernel` installed. Without it the node loads silently with no patches applied.
+- an `omni_xpu_kernel` wheel built for the active XPU target and Torch minor;
+- the pinned `comfy_kitchen` XPU integration;
+- upstream ComfyUI.
 
-## What it does
+If an Intel XPU is unavailable, initialization is skipped.
 
-| Patch | Target |
-|-------|--------|
-| Auto-routed cute/ESIMD Attention | `optimized_attention` |
-| ESIMD RoPE | `_apply_rope1` / `apply_rope1` / `apply_rope` (flux.math dual-tensor) |
-| ESIMD LayerNorm/RMSNorm | `LayerNorm.forward` / `RMSNorm.forward` / `rms_norm()` |
-| FP8 GEMM | `fp8_linear` / `mixed_precision_ops` |
-| INT8 Linear | `comfy_kitchen::int8_linear` (oneDNN s8 GEMM) |
-| FP8 Negative Zero Fix | `manual_stochastic_round_to_float8` |
-| Interpolate Fix | `F.interpolate` |
-| Median Fix | `torch.median` / `torch.nanmedian` (XPU dim-reduction) |
+## Components and switches
 
-## Environment Variables
-
-All patches enabled by default. Disable with `=0`:
+Adapters are enabled by default and always retain the original ComfyUI route
+for unsupported inputs:
 
 ```bash
-OMNIXPU_ENABLE=0            # Master switch — disable everything
-OMNIXPU_ATTENTION=0         # Disable the XPU attention patch only
-OMNIXPU_ROPE=0              # Disable ESIMD RoPE only
-OMNIXPU_NORM=0              # Disable ESIMD LayerNorm/RMSNorm only
-OMNIXPU_KREA2_RMSNORM=0     # Disable the Krea2-specific local RMSNorm hook only
-OMNIXPU_FP8_GEMM=0          # Disable FP8 GEMM only
-OMNIXPU_INT8=0              # Disable INT8 Linear only
-OMNIXPU_FP8_NEG_ZERO_FIX=0  # Disable FP8 negative zero fix only
-OMNIXPU_INTERPOLATE_FIX=0   # Disable interpolate workaround only
-OMNIXPU_MEDIAN_FIX=0        # Disable median workaround only
+OMNIXPU_ENABLE=0            # Disable every custom-node component
+OMNIXPU_ATTENTION=0         # Disable the attention adapter
+OMNIXPU_NORM=0              # Disable the norm adapter
+OMNIXPU_FP8_GEMM=0          # Disable the temporary FP8 model/factory adapter
+OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
+OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM=0  # Disable Windows XPU model-boundary trim
+OMNIXPU_LORA_MEMORY=0       # Disable cached whole-LoRA budgets and staging logs
+OMNIXPU_SEEDVR_ADA_RESHAPE=0  # Disable the guarded SeedVR2 Ada reshape patch
+OMNIXPU_SEEDVR_CAPACITY=0     # Disable bounded SeedVR2 activation scheduling
+OMNIXPU_SEEDVR_CAT_PAD=0      # Disable validated BMG causal-prefix cat-pad routing
+OMNIXPU_LARGE_VIDEO_PREPROCESS=0  # Disable bounded large-video CPU preprocessing
 ```
 
-Attention routing is selected independently:
+On Windows XPU, the boundary trim turns an unmet DynamicVRAM minimum-memory
+budget into an explicit partial VBAR reclaim before model loading. It preserves
+loaded models and is enabled by default; the environment variable above is the
+A/B-test escape hatch.
+
+Validated sub-routes can be disabled independently:
 
 ```bash
-OMNI_ATTN_BACKEND=auto   # default: cute d128 self-attn, then ESIMD, then PyTorch
-OMNI_ATTN_BACKEND=cute   # force cute where supported; otherwise PyTorch
-OMNI_ATTN_BACKEND=esimd  # force ESIMD where supported; otherwise PyTorch
-OMNI_ATTN_BACKEND=torch  # keep the original PyTorch attention path
+OMNI_ATTN_BACKEND=auto      # auto, cute, esimd, or torch; Windows defaults to torch
+OMNIXPU_NONCONTIG_RMSNORM=0
+OMNIXPU_H120_RMSNORM=0
+OMNIXPU_KREA2_RMSNORM=0
+OMNIXPU_SEEDVR_GROUPNORM=0
 ```
 
-With `auto`, CUTE handles its validated B=1, unmasked, standard-scale d128
-self-attention domain. Supported d64 and cross-attention calls use ESIMD.
-Masked attention, other batch sizes or head dimensions, GQA, custom scaling,
-and any unsupported shape fall back to the original PyTorch implementation.
-Explicit `cute` and `esimd` select only that fused backend and still use the
-safe PyTorch fallback outside its supported domain.
+For diagnostics, the per-call CUTE output scan can be enabled explicitly. It
+is disabled by default because validated CUTE routes accumulate in FP32 and a
+full output scan adds a shape-proportional temporary allocation. Explicit
+ESIMD FP16 routing retains its overflow scan regardless of this setting.
 
-`OMNIXPU_MEDIAN_STRICT_INDICES=1` makes the median workaround reproduce
-`torch.median`'s exact tie-break indices (values are always bit-exact).
-
-> **Note:** the XPU median slowdown this works around has only been verified on Intel Arc B60/B70 with torch 2.10. It should be re-checked on other hardware or torch versions before relying on it there.
-
-## Diagnostics
-
-Add the **OmniXPU Status** node to any workflow to see:
-
-```
-=== ComfyUI-OmniXPU Status ===
-  GPU: Intel(R) Arc(TM) B580 Graphics (11605 MB)
-  omni_xpu_kernel: 0.1.0-b8-dev
-    available: sdp, norm, rotary, linear_fp8
-
-  [+] interpolate_fix: applied
-  [+] median_fix: applied
-  [+] fp8_neg_zero_fix: applied
-  [+] norm: applied
-  [+] rope: applied
-  [+] fp8_gemm: applied
-  [+] attention: applied
+```bash
+OMNIXPU_VALIDATE_ATTENTION_OUTPUT=1
 ```
 
-## Startup Log
+The two global workarounds are opt-in:
 
-When loaded successfully, ComfyUI logs:
-
-```
-[OmniXPU] omni_xpu_kernel 0.1.0-b8-dev — available: sdp, norm, rotary, linear_fp8
-[OmniXPU] interpolate_fix: applied
-[OmniXPU] median_fix: applied
-[OmniXPU] fp8_neg_zero_fix: applied
-[OmniXPU] norm: applied
-[OmniXPU] rope: applied
-[OmniXPU] fp8_gemm: applied
-[OmniXPU] attention[cute]: rebound 45 by-value imports across sys.modules
-[OmniXPU] attention: applied
-[OmniXPU] INT8: registered XPU impl for comfy_kitchen::int8_linear
-[OmniXPU] int8: applied
+```bash
+OMNIXPU_INTERPOLATE_FIX=1
+OMNIXPU_MEDIAN_FIX=1
+OMNIXPU_MEDIAN_STRICT_INDICES=1
 ```
 
-## How it works
+`OMNIXPU_MEDIAN_STRICT_INDICES=1` reproduces the exact tie-break indices. The
+median workaround was only verified on BMG with Torch 2.10 and remains
+disabled by default on other configurations.
 
-The node monkey-patches ComfyUI internals at import time. Each patch:
+## Debugging and diagnostics
 
-1. Checks if the corresponding `omni_xpu_kernel` submodule is available (via centralized probe)
-2. Verifies the target function/class exists in the current ComfyUI version
-3. Wraps the original with an XPU-accelerated version that falls back to the original for non-XPU tensors or unsupported shapes
-4. Records status for the diagnostics node
+Kernel-only tracing:
 
-No ComfyUI core files are modified. Works with unmodified upstream ComfyUI.
+```bash
+OMNIXPU_DEBUG=1 python main.py
+```
 
-## Compatibility
+Dispatch decisions and fallback reasons:
 
-- ComfyUI >= 0.18.x (>= 0.27.0 for INT8 ConvRot model support)
-- PyTorch >= 2.7 with XPU support
-- `omni_xpu_kernel` >= 0.1.0b8.dev0 (Omni image `0.1.0-b8-dev`)
-- `comfy_kitchen` >= 0.2.8 (for INT8 custom ops)
+```bash
+OMNIXPU_DEBUG_VERBOSE=1 python main.py
+```
+
+LoRA weights are measured once when the LoRA node executes. Unique tensor sizes
+are cached in a `ModelPatcher` attachment, inherited by clones, accumulated for
+stacked LoRAs, and added to both `memory_required` and an explicitly supplied
+`minimum_memory_required`. The base model's `model_size()` semantics stay
+unchanged. Model loads read the cached attachment instead of rescanning patches.
+DynamicVRAM layer scanning is disabled by default. To diagnose every LoRA
+staging operation, including its XPU state and any failure, enable:
+
+```bash
+OMNIXPU_LORA_MEMORY_TRACE=1 python main.py
+```
+
+Set tracing variables before startup. The **OmniXPU Status** node reports:
+
+- GPU and `omni_xpu_kernel` capabilities;
+- each component's kind (`adapter`, `compatibility_patch`, or `legacy_fix`)
+  and apply status;
+- attention and fused INT8 FFN routing counters.
+
+Kitchen backend ownership can be inspected independently:
+
+```bash
+python -c 'import comfy_kitchen as ck; print(ck.list_backends()["xpu"])'
+```

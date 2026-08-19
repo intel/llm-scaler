@@ -1,0 +1,113 @@
+# ComfyUI usage
+
+The default Omni image runs upstream ComfyUI on one Intel XPU. Models are not
+bundled in the image.
+
+## Start the server
+
+Mount an existing ComfyUI model directory and start ComfyUI directly. This is
+the recommended default when the workflow fits in XPU memory:
+
+```bash
+IMAGE=intel/llm-scaler-omni:0.2.0-b1
+CONTAINER_NAME=comfyui
+
+sudo docker run -itd \
+    --privileged \
+    --device=/dev/dri \
+    --network=host \
+    --shm-size=64g \
+    --name="$CONTAINER_NAME" \
+    --workdir=/llm/ComfyUI \
+    -v /path/to/comfyui_models:/llm/ComfyUI/models \
+    "$IMAGE" \
+    python main.py
+```
+
+The release image supports Intel Arc B-series/Battlemage GPUs.
+
+The default server is available at `http://127.0.0.1:8188`. Append
+`--listen 0.0.0.0` when remote access is required, and append
+`--enable-manager` when the integrated Node Manager is needed.
+
+## DynamicVRAM for memory-constrained workflows
+
+Use the supplied entrypoint only when a workflow has a known or observed XPU
+out-of-memory risk:
+
+```bash
+/llm/entrypoints/start_comfyui.sh
+```
+
+The entrypoint enables ComfyUI DynamicVRAM, backed by the image's pinned AIMDO
+XPU/Level Zero allocator, enables Node Manager, and reserves 4 GiB of XPU
+memory. DynamicVRAM stages, unloads, and reloads model weights to preserve
+activation headroom during model switching or text re-encoding. This can avoid
+OOM failures, but the additional weight-management work can reduce performance
+when the workflow already fits in XPU memory. The reserve can be changed with
+`OMNI_COMFYUI_RESERVE_VRAM_GB` when required by a specific workload.
+
+Additional ComfyUI arguments are forwarded by the entrypoint. For example:
+
+```bash
+/llm/entrypoints/start_comfyui.sh --disable-smart-memory
+```
+
+## Models and workflows
+
+Place model files under the standard `/llm/ComfyUI/models` subdirectories used
+by their loader nodes. Use the model's official ComfyUI documentation for the
+exact file names and directory:
+
+- [ComfyUI documentation](https://docs.comfy.org/)
+- [ComfyUI Template Browser](https://docs.comfy.org/interface/features/template)
+- [ComfyUI model tutorials](https://docs.comfy.org/tutorials)
+
+The focused image deliberately does not copy `omni/workflows` or
+`omni/example_inputs`. This prevents stale workflow snapshots from replacing
+maintained upstream templates.
+
+## Included custom nodes
+
+The focused image installs pinned revisions of:
+
+- ComfyUI Manager;
+- VideoHelperSuite;
+- Easy-Use;
+- KJNodes;
+- CacheDiT;
+- ComfyUI-GGUF-XPU;
+- ComfyUI-nunchaku-XPU;
+- ControlNet auxiliary nodes;
+- ComfyUI-OmniXPU.
+
+The Dockerfile is the source of truth for exact revisions. Installing or
+updating nodes through ComfyUI Manager changes the running container and is
+not part of the reproducible image build.
+
+## Omni XPU switches
+
+ComfyUI-OmniXPU adapters are enabled by default and fall back to the original
+ComfyUI path when a capability or input is unsupported. Common switches are:
+
+```bash
+OMNIXPU_ENABLE=0
+OMNIXPU_ATTENTION=0
+OMNIXPU_NORM=0
+OMNIXPU_FP8_GEMM=0
+OMNIXPU_INT8_FFN=0
+```
+
+See [ComfyUI-OmniXPU](../ComfyUI-OmniXPU/README.md) for adapter behavior,
+diagnostics, and opt-in legacy workarounds.
+
+## Outputs
+
+Mount `/llm/ComfyUI/output` when generated files must survive container
+removal:
+
+```bash
+-v /path/to/comfyui_output:/llm/ComfyUI/output
+```
+
+Input files can similarly be mounted at `/llm/ComfyUI/input`.

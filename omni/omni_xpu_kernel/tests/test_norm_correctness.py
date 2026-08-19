@@ -54,6 +54,261 @@ class TestRMSNormCorrectness:
         
         torch.testing.assert_close(output_esimd, output_ref, rtol=rtol, atol=atol)
 
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    @pytest.mark.parametrize("rows", [763, 3052, 29435, 117740])
+    def test_rms_norm_h120_fp16_correctness(self, rows):
+        """Cover the target-validated H120 route used by Boogu Q/K normalization."""
+        from omni_xpu_kernel import norm
+
+        if not norm.supports_h120_fp16():
+            pytest.skip("loaded binary does not contain a validated H120 route")
+
+        torch.manual_seed(120 + rows)
+        eps = 1e-5
+        input = torch.randn(rows, 120, device="xpu", dtype=torch.float16)
+        weight = torch.randn(120, device="xpu", dtype=torch.float16)
+
+        output_esimd = norm.rms_norm(weight, input, eps=eps)
+        output_ref = torch.nn.functional.rms_norm(
+            input, (120,), weight, eps=eps
+        )
+
+        assert torch.isfinite(output_esimd).all()
+        torch.testing.assert_close(
+            output_esimd, output_ref, rtol=1e-2, atol=1e-2
+        )
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    def test_rms_norm_rejects_unsupported_hidden_size(self):
+        """Reject unsupported shapes instead of returning partially written data."""
+        from omni_xpu_kernel import norm
+
+        if norm.supports_h120_fp16():
+            pytest.skip("FP16 H120 is supported by the loaded target binary")
+
+        input = torch.randn(1, 120, device="xpu", dtype=torch.float16)
+        weight = torch.randn(120, device="xpu", dtype=torch.float16)
+
+        with pytest.raises(RuntimeError, match="divisible by 32"):
+            norm.rms_norm(weight, input)
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    @pytest.mark.parametrize("rows", [960, 4095, 4096, 122880])
+    def test_rms_norm_h128_bf16_correctness(self, rows):
+        """Cover the PTL-H BF16 route and generic fallback on other targets."""
+        from omni_xpu_kernel import norm
+
+        torch.manual_seed(rows)
+        eps = 1e-5
+        input = torch.randn(rows, 128, device="xpu", dtype=torch.bfloat16)
+        weight = torch.randn(128, device="xpu", dtype=torch.bfloat16)
+
+        output_esimd = norm.rms_norm(weight, input, eps=eps)
+        output_ref = torch.nn.functional.rms_norm(
+            input.float(), (128,), weight.float(), eps=eps
+        ).to(torch.bfloat16)
+
+        assert torch.isfinite(output_esimd).all()
+        torch.testing.assert_close(output_esimd, output_ref, rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    @pytest.mark.parametrize("rows", [1023, 4095, 4096, 50304, 201216])
+    def test_rms_norm_h128_fp32_correctness(self, rows):
+        """Cover validated target FP32 H128 routes used by Krea2 Q/K normalization."""
+        from omni_xpu_kernel import norm
+
+        torch.manual_seed(128 + rows)
+        eps = 1e-5
+        input = torch.randn(rows, 128, device="xpu", dtype=torch.float32)
+        weight = torch.randn(128, device="xpu", dtype=torch.float32)
+
+        output_esimd = norm.rms_norm(weight, input, eps=eps)
+        output_ref = torch.nn.functional.rms_norm(
+            input, (128,), weight, eps=eps
+        )
+
+        assert torch.isfinite(output_esimd).all()
+        torch.testing.assert_close(
+            output_esimd, output_ref, rtol=1e-5, atol=2e-6
+        )
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    @pytest.mark.parametrize("rows", [64, 1024, 1088])
+    def test_rms_norm_gate_residual_h3840_bf16(self, rows):
+        """Validate the PTL-H Z-Image fused modulation boundary."""
+        from omni_xpu_kernel import norm
+
+        native = norm._get_native()
+        if not hasattr(native, "rms_norm_gate_residual"):
+            pytest.skip("PTL-H fused RMS/gate kernel is not in this build")
+
+        torch.manual_seed(3840 + rows)
+        value = torch.randn(
+            rows, 3840, device="xpu", dtype=torch.bfloat16
+        )
+        weight = torch.randn(3840, device="xpu", dtype=torch.bfloat16)
+        gate = torch.randn(3840, device="xpu", dtype=torch.bfloat16).tanh()
+        residual = torch.randn(
+            rows, 3840, device="xpu", dtype=torch.bfloat16
+        )
+
+        normalized = norm.rms_norm(weight, value, eps=1e-5)
+        expected = residual + gate.reshape(1, 3840) * normalized
+        actual = norm.rms_norm_gate_residual(
+            weight, value, gate, residual, eps=1e-5
+        )
+
+        difference = (actual.float() - expected.float()).abs()
+        mismatches = int((actual != expected).sum().item())
+        assert torch.isfinite(actual).all()
+        # A separately compiled fused reduction can move a very small number
+        # of BF16 values by one representable step. Bound both incidence and
+        # magnitude rather than hiding it behind a broad relative tolerance.
+        assert mismatches <= max(4, actual.numel() // 200_000)
+        assert float(difference.max().item()) <= 0.0625
+
+
+class TestGroupNormBMGCorrectness:
+    """Correctness tests for the exact BMG Boogu GroupNorm route."""
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (1, 512, 128, 128),
+            (1, 512, 256, 256),
+            (1, 512, 512, 512),
+            (1, 256, 512, 512),
+            (1, 256, 1024, 1024),
+            (1, 128, 1024, 1024),
+        ],
+    )
+    def test_group_norm_bmg_correctness(self, shape):
+        from omni_xpu_kernel import norm
+
+        if not norm.supports_group_norm_bmg():
+            pytest.skip("loaded binary does not contain the BMG GroupNorm route")
+
+        torch.manual_seed(sum(shape))
+        channels = shape[1]
+        input = torch.randn(
+            shape, device="xpu", dtype=torch.bfloat16
+        )
+        weight = torch.randn(
+            channels, device="xpu", dtype=torch.bfloat16
+        )
+        bias = torch.randn(
+            channels, device="xpu", dtype=torch.bfloat16
+        )
+        expected = torch.nn.functional.group_norm(
+            input, 32, weight, bias, eps=1e-6
+        )
+        actual = norm.group_norm_bmg(
+            input, 32, weight, bias, eps=1e-6
+        )
+
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(
+            actual, expected, rtol=0.02, atol=0.03125
+        )
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    def test_group_norm_bmg_rejects_uncaptured_shape(self):
+        from omni_xpu_kernel import norm
+
+        if not norm.supports_group_norm_bmg():
+            pytest.skip("loaded binary does not contain the BMG GroupNorm route")
+
+        input = torch.randn(
+            (1, 512, 64, 64),
+            device="xpu",
+            dtype=torch.bfloat16,
+        )
+        weight = torch.randn(
+            512, device="xpu", dtype=torch.bfloat16
+        )
+        bias = torch.randn(
+            512, device="xpu", dtype=torch.bfloat16
+        )
+        with pytest.raises(RuntimeError, match="unsupported BMG GroupNorm shape"):
+            norm.group_norm_bmg(input, 32, weight, bias, eps=1e-6)
+
+
+class TestGroupNormSeedVRBMGCorrectness:
+    """Correctness tests for exact SeedVR temporal-interleaved contracts."""
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (4, 128, 512, 512),
+            (4, 256, 256, 256),
+            (4, 256, 512, 512),
+            (4, 512, 256, 256),
+            (2, 512, 128, 128),
+        ],
+    )
+    def test_group_norm_seedvr_bmg_correctness(self, shape):
+        from omni_xpu_kernel import norm
+
+        if not norm.supports_group_norm_seedvr_bmg():
+            pytest.skip("loaded binary does not contain the SeedVR route")
+
+        torch.manual_seed(sum(shape) + 29)
+        temporal, channels, height, width = shape
+        backing = torch.randn(
+            (1, channels, temporal, height, width),
+            device="xpu",
+            dtype=torch.float16,
+        )
+        input = backing.transpose(1, 2).reshape(shape)
+        weight = torch.randn(
+            channels, device="xpu", dtype=torch.float16
+        )
+        bias = torch.randn(
+            channels, device="xpu", dtype=torch.float16
+        )
+        expected = torch.nn.functional.group_norm(
+            input, 32, weight, bias, eps=1e-6
+        )
+        actual = norm.group_norm_seedvr_bmg(
+            input, 32, weight, bias, eps=1e-6
+        )
+
+        assert input.stride() == (
+            height * width,
+            temporal * height * width,
+            width,
+            1,
+        )
+        assert actual.is_contiguous()
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(
+            actual, expected, rtol=0.02, atol=0.03125
+        )
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    def test_group_norm_seedvr_bmg_rejects_contiguous_input(self):
+        from omni_xpu_kernel import norm
+
+        if not norm.supports_group_norm_seedvr_bmg():
+            pytest.skip("loaded binary does not contain the SeedVR route")
+
+        input = torch.randn(
+            (2, 512, 128, 128),
+            device="xpu",
+            dtype=torch.float16,
+        )
+        weight = torch.randn(512, device="xpu", dtype=torch.float16)
+        bias = torch.randn(512, device="xpu", dtype=torch.float16)
+        with pytest.raises(
+            RuntimeError,
+            match="requires temporal-interleaved N/C strides",
+        ):
+            norm.group_norm_seedvr_bmg(
+                input, 32, weight, bias, eps=1e-6
+            )
+
 
 class TestLayerNormCorrectness:
     """Correctness tests for LayerNorm kernel."""

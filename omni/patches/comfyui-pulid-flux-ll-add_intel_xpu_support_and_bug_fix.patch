@@ -1,0 +1,57 @@
+From c8c5280857ef77e10d556336b58fb8992c1910be Mon Sep 17 00:00:00 2001
+From: Haoming Zhang <haomingzh@126.com>
+Date: Tue, 30 Jun 2026 13:33:33 +0800
+Subject: [PATCH] add_intel_xpu_support_and_bug_fix
+
+---
+ PulidFluxHook.py | 2 ++
+ pulidflux.py     | 6 ++++--
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/PulidFluxHook.py b/PulidFluxHook.py
+index f750920..7569977 100644
+--- a/PulidFluxHook.py
++++ b/PulidFluxHook.py
+@@ -148,6 +148,8 @@ def pulid_forward_orig(
+     control = None,
+     transformer_options={},
+     attn_mask: Tensor = None,
++    timestep_zero_index=None,   # NEW: accept the arg core now passes
++    **kwargs,                   # NEW: absorb any future additions
+ ) -> Tensor:
+     patches_replace = transformer_options.get("patches_replace", {})
+ 
+diff --git a/pulidflux.py b/pulidflux.py
+index 802cd1d..bde75c2 100644
+--- a/pulidflux.py
++++ b/pulidflux.py
+@@ -171,7 +171,7 @@ class PulidFluxInsightFaceLoader:
+     def INPUT_TYPES(s):
+         return {
+             "required": {
+-                "provider": (["CPU", "CUDA", "ROCM"], ),
++                "provider": (["CPU", "CUDA", "ROCM", "XPU"], ),
+             },
+         }
+ 
+@@ -829,7 +829,7 @@ class PulidFluxFaceNetLoader:
+     def INPUT_TYPES(cls):
+         return {
+             "required": {
+-                "provider": (["CPU", "CUDA"],),
++                "provider": (["CPU", "CUDA", "XPU"],),
+             }
+         }
+ 
+@@ -843,6 +843,8 @@ class PulidFluxFaceNetLoader:
+             device = torch.device("cpu")
+         elif provider in ["CUDA"]:
+             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++        elif provider in ["XPU"]:
++            device = torch.device("xpu")
+         else:
+             device = torch.device("cpu")
+         
+-- 
+2.43.0
+

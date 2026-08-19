@@ -1,300 +1,467 @@
 # omni_xpu_kernel
 
-High-performance Intel XPU kernels for PyTorch.
+Native Intel XPU kernels used by llm-scaler image and video workloads.
 
-The Kernel version and the `intel/llm-scaler-omni` image version share the
-single source in `omni_xpu_kernel/_version.py`. The current development version
-is `0.1.0-b8-dev`; Python packaging normalizes it to `0.1.0b8.dev0` in wheel
-metadata and filenames.
+The package combines SYCL/ESIMD kernels, oneDNN-backed quantized GEMM, and a
+CUTLASS-SYCL attention backend behind a small PyTorch API. Linux wheels are
+compiled for one Torch minor and one GPU architecture; they are not portable
+across those native ABI boundaries.
 
-## Modules
+## Package contents
 
-### sdp — Scaled Dot-Product Attention (Flash Attention)
+| Module | Main functionality |
+|---|---|
+| `sdp` | ESIMD scaled dot-product attention |
+| `cute` | CUTLASS-SYCL fused attention |
+| `cute.sdp_bhld_d128` | BMG batched/rectangular D128 BHLD attention |
+| `cute.sdp_minimax_h3_vae_d64` | Structural BMG MiniMax H3 VideoVAE D64 tile attention |
+| `cute.sdp_wan22_cross` | Exact BMG Wan 2.2 14B T2V Turbo cross-attention |
+| `linear` | oneDNN FP8 weight-only GEMM |
+| `fp8` | FP8 quantization, dequantization, and stochastic rounding |
+| `gguf` | Q4_0, Q4_1, Q8_0, Q4_K, and Q6_K dequantization |
+| `norm` | RMSNorm, LayerNorm, and fused normalization operations |
+| `svdq` | SVDQuant W4A4 dequantization, INT4 GEMM, and post-processing |
+| `int8` | INT8 quantization, linear, fused GELU/SwiGLU, and ConvRot operations |
+| `rotary` | Rotary embedding and Comfy Kitchen-compatible RoPE operations |
 
-ESIMD Flash Attention with doubleGRF, AOT-compiled for target GPU.
-
-**Optimizations applied:**
-- K prefetch moved before softmax (+89-113% vs baseline)
-- Overflow-safe fp32 compensation + clamp (prevents NaN/Inf)
-- Adaptive per-head V-scaling with cached decision (zero overhead on normal models)
-- Template parameterization via `sdp_config.h` for hardware adaptation
-
-**Performance on Arc B580 (vs PyTorch SDPA):**
-
-| Config | FP16 TFLOPS | BF16 TFLOPS | vs Torch |
-|--------|-------------|-------------|----------|
-| flux-4096x24 | 73 | 83 | 1.09x / 1.23x |
-| wan-3600x40 | 69 | 79 | 1.10x / 1.24x |
+The exact native symbols available in an installed artifact can be inspected
+without relying on a hard-coded capability list:
 
 ```python
-from omni_xpu_kernel import sdp
+import omni_xpu_kernel as omni
 
-# Input: [B, L, H, 128] fp16/bf16, B==1
-output = sdp.sdp(q, k, v)
-# V-scaling is automatic: models with large V values (e.g., Qwen Image)
-# are scaled to prevent fp16 overflow, with zero overhead on normal models.
+print(omni.native_capabilities())
 ```
 
-**AOT compilation for target GPU:**
+## Artifact identity
+
+The package and `intel/llm-scaler-omni` image versions share the source in
+[`omni_xpu_kernel/_version.py`](omni_xpu_kernel/_version.py). A source build
+derives its native identity from the active Torch installation and
+`OMNI_XPU_DEVICE`.
+
+The packaging layer recognizes Torch XPU minors 2.10, 2.11, and 2.12. Each
+Torch/GPU pair still requires its own build and runtime validation; recognizing
+a version is not a validation claim. The generated wheel uses a PEP 440 local
+version such as:
+
+```text
+omni_xpu_kernel-0.2.0b1+torch211.bmg
+omni_xpu_kernel-0.2.0b1+torch211.ptlh
+```
+
+Build and install a different wheel for every Torch/GPU pair. The wheel
+metadata pins the exact public Torch version used at build time.
+
+After installation, these values come from the wheel's own metadata:
+
+```python
+import omni_xpu_kernel as omni
+
+print(omni.__version__)
+print(omni.__torch_version__)
+print(omni.__xpu_target__)
+```
+
+On Linux, `core_aot_target()` reads the architecture marker embedded in the
+loaded `_C` extension. It must equal `__xpu_target__`; an empty or different
+value indicates an old, JIT-only, or stale native artifact.
+
+```python
+assert omni.is_available()
+assert omni.core_aot_target() == omni.__xpu_target__
+```
+
+## Build targets
+
+`OMNI_XPU_DEVICE` selects the AOT ISA and architecture-level policy. Unknown
+values are rejected before compilation. One BMG wheel contains both B60 and
+B70 kernel profiles and selects between them from the exact runtime PCI Device
+ID:
+
+| PCI Device ID | Runtime BMG profile |
+|---|---|
+| `0xE210`, `0xE211` | `b60` |
+| `0xE223` | `b70` |
+| other BMG ID | `generic-bmg` (the shipped B70-compatible defaults) |
+
+Use `omni_xpu_kernel.device.info(index)` to inspect the detected ID, selected
+profile, and concrete policy values.
+
+| GPU architecture | `sycl-ls --verbose` architecture | `OMNI_XPU_DEVICE` |
+|---|---|---|
+| Intel Arc B-series / Battlemage | `intel_gpu_bmg_*` | `bmg` |
+| Intel Panther Lake H | `intel_gpu_ptl_h` | `ptl-h` |
+
+Identify the device before building:
+
 ```bash
-# Default target: bmg (Arc B580)
-CUTLASS_SYCL_ROOT=/path/to/sycl-tla \
-OMNI_XPU_DEVICE=bmg pip install -e . --no-build-isolation
-
-# For other GPUs:
-CUTLASS_SYCL_ROOT=/path/to/sycl-tla \
-OMNI_XPU_DEVICE=pvc pip install -e . --no-build-isolation   # Data Center GPU Max
+source /opt/intel/oneapi/setvars.sh --force
+sycl-ls --verbose | grep -E 'Name|Architecture|Version|DeviceID'
 ```
 
-### cute — CUTLASS-SYCL Flash Attention
+Do not infer the AOT target only from a product name. In particular, `ptl-h`
+and `ptl-u` are different compiler targets, and a wheel built for BMG must not
+be installed on PTL-H.
 
-CUTLASS-SYCL fused Flash Attention with fp32 accumulation, AOT-compiled for
-the target GPU. The currently validated domain is B=1, unmasked self-attention
-with standard `1/sqrt(head_dim)` scaling, head dimension 128, equal Q/K/V head
-counts, and fp16 or bf16 inputs in `[B, L, H, D]` layout.
+## Build requirements
+
+- Python 3.9 or newer development environment
+- Intel oneAPI DPC++/C++ Compiler (`icpx`)
+- A packaging-supported PyTorch XPU minor: 2.10.x, 2.11.x, or 2.12.x
+- `onednn==2025.3.0` and `onednn-devel==2025.3.0` for the package's direct
+  oneDNN calls on Linux
+- A matched oneAPI oneDNN 3.9.1 development installation on Windows; the
+  build vendors its `dnnl.dll` and redistribution notices into the wheel
+- Intel [`sycl-tla`](https://github.com/intel/sycl-tla) headers for the
+  default Linux CUTE build
+
+Torch and oneDNN are intentionally not listed as isolated build dependencies.
+Install the target runtime first, then build with `--no-build-isolation` so the
+compiler uses the same Torch headers and libraries as the final environment.
+
+### Build through the llm-scaler image
+
+The canonical Linux integration path is the llm-scaler Omni Docker build. It
+pins the base environment, `sycl-tla`, oneDNN, Torch, Python, and the target
+architecture:
+
+```bash
+cd /path/to/llm-scaler/omni
+
+XPU_TARGET=bmg bash build.sh
+# or
+XPU_TARGET=ptl-h bash build.sh
+```
+
+See the [Omni image documentation](../README.md) for image tags,
+runtime setup, and acceptance checks.
+
+### Build a standalone Linux wheel
+
+Prepare a matching Torch XPU environment and the pinned `sycl-tla` source:
+
+```bash
+python3 -m venv /opt/venv
+source /opt/venv/bin/activate
+
+python -m pip install --upgrade pip wheel
+python -m pip install \
+  torch==2.11.0+xpu torchvision==0.26.0+xpu torchaudio==2.11.0+xpu \
+  --index-url https://download.pytorch.org/whl/xpu
+python -m pip install onednn==2025.3.0 onednn-devel==2025.3.0
+
+git clone https://github.com/intel/sycl-tla.git /opt/sycl-tla
+git -C /opt/sycl-tla checkout 2fc09973bfdf15755090fcb0e3b6ad236408a992
+```
+
+Build the wheel from this directory:
+
+```bash
+source /opt/intel/oneapi/setvars.sh --force
+
+CUTLASS_SYCL_ROOT=/opt/sycl-tla \
+OMNI_XPU_REQUIRE_CUTE=1 \
+OMNI_XPU_DEVICE=bmg \
+python -m pip wheel . --no-build-isolation --no-deps --wheel-dir dist
+```
+
+Replace `bmg` with `ptl-h` only when building on the matching target. CUTE is
+required by default on Linux; the build fails if `CUTLASS_SYCL_ROOT` is absent
+or incomplete. `OMNI_XPU_REQUIRE_CUTE=0` is an explicit core-only build and
+must not be mistaken for the default image artifact.
+
+For Windows build and installation details, see
+[`WHL_BUILD_INSTALL.md`](WHL_BUILD_INSTALL.md).
+
+### oneDNN consistency
+
+The native extensions call oneDNN directly. The `2025.3.0` pin belongs to
+`omni_xpu_kernel`; it is not inherited from the selected Torch wheel. Using
+headers from one oneDNN release with a library from another can produce
+missing-symbol errors during import. The default Linux path therefore uses the
+matched pip runtime and development packages shown above for every recognized
+Torch minor. A new Torch minor is accepted only after rebuilding and testing
+that complete combination.
+
+For a non-pip development installation, set both variables to the same oneDNN
+installation:
+
+```bash
+ONEDNN_INCLUDE=/path/to/include \
+ONEDNN_LIB=/path/to/lib \
+python -m pip wheel . --no-build-isolation --no-deps --wheel-dir dist
+```
+
+Setting only one variable is rejected.
+
+## Verify an installed wheel
+
+Install the wheel without resolving a different Torch build:
+
+```bash
+python -m pip install --force-reinstall --no-deps dist/omni_xpu_kernel-*.whl
+```
+
+Run the import check outside the source directory so the local package cannot
+shadow the installed wheel:
+
+```bash
+cd /tmp
+python - <<'PY'
+import torch
+import omni_xpu_kernel as omni
+
+print("torch:", torch.__version__)
+print("device:", torch.xpu.get_device_name(0))
+print("package:", omni.__version__)
+print("built torch:", omni.__torch_version__)
+print("metadata target:", omni.__xpu_target__)
+print("core AOT target:", omni.core_aot_target())
+print("runtime kernel profile:", omni.device.info(0))
+print("available:", omni.is_available())
+
+assert omni.is_available()
+assert omni.core_aot_target() == omni.__xpu_target__
+PY
+```
+
+A default Linux wheel contains:
+
+```text
+omni_xpu_kernel/_C.cpython-312-x86_64-linux-gnu.so
+omni_xpu_kernel/lgrf_uni/lgrf_sdp.cpython-312-x86_64-linux-gnu.so
+omni_xpu_kernel/cute/cute_fmha_torch.cpython-312-x86_64-linux-gnu.so
+```
+
+## API examples
+
+### Attention
 
 ```python
-from omni_xpu_kernel import cute
+from omni_xpu_kernel import cute, sdp
 
-if cute.is_available():
+# q, k, v use [B, L, H, D] layout.
+output = sdp.sdp(q, k, v)
+
+if cute is not None and cute.is_available():
     output = cute.sdp(q, k, v)
+
+# PTL-H and BMG wheels expose a separate dense-BHLD D120 capability.
+if cute is not None and cute.supports_d120_bhld():
+    output = cute.sdp_bhld_d120(q_bhld, k_bhld, v_bhld)
+
+# BMG wheels expose batched self/cross attention for dense packed-BHLD,
+# BLHD-backed BHLD, or the B1/H56 MiniMax H3 QKV-backed D128 layout.
+if cute is not None and cute.supports_d128_bhld():
+    output = cute.sdp_bhld_d128(q_bhld, k_bhld, v_bhld)
+
+# BMG wheels expose the structural MiniMax H3 VideoVAE FP16 D64 tile family.
+if cute is not None and cute.supports_minimax_h3_vae_d64():
+    output = cute.sdp_minimax_h3_vae_d64(q_bhld, k_bhld, v_bhld)
+
+# BMG wheels expose the exact official Wan 2.2 14B T2V Turbo 720p
+# tuned cross-attention contract separately from the general BHLD API.
+if cute is not None and cute.supports_wan22_cross():
+    output = cute.sdp_wan22_cross(q_blhd, k_blhd, v_blhd)
 ```
 
-The CUTE extension is Linux-only and required by default. `CUTLASS_SYCL_ROOT`
-must point to a complete Intel `sycl-tla`/CUTLASS-SYCL source tree; otherwise
-the build fails instead of silently omitting the default attention backend.
+The legacy BLHD `cute.sdp` entry point accepts unmasked self-attention with
+`B=1`. The BMG `cute.sdp_bhld_d128` entry point accepts positive batch, head,
+query-length, and key/value-length dimensions; matching Q/K/V batch, head,
+dtype, and head dimension; dense packed-BHLD, BLHD-backed BHLD, or the B1/H56
+MiniMax H3 QKV-backed layout; D128; standard `1/sqrt(head_dim)` scaling; and
+FP16 or BF16. Neither entry point
+accepts masks, causal mode, GQA, or custom scaling. API capability does not
+imply that every shape is faster than PyTorch; callers must retain a
+performance-qualified fallback policy.
 
-### linear — FP8 GEMM (oneDNN W8A16)
+`sdp_wan22_cross` remains an exact MMA-K16 specialization. It accepts only
+dense FP16 BMG tensors with Q `[1, 75600, 40, 128]` and K/V
+`[1, 512, 40, 128]`; other structurally supported BHLD contracts use
+`sdp_bhld_d128`.
 
-FP8 weight × FP16/BF16 activation GEMM via oneDNN, with primitive caching.
-Supports E4M3 and E5M2 weight formats. E5M2 is 12-17% faster.
+`sdp_minimax_h3_vae_d64` accepts the MiniMax H3 VideoVAE tile family: FP16
+Q/K/V `[1, 32, S, 64]`, where `S` varies with the decoder's temporal and
+spatial tile extent. Q/K use the runtime-derived `H*D` sequence stride and V
+retains the three-wide QKV projection stride. Other D64 layouts remain with
+the caller's fallback.
 
-```python
-from omni_xpu_kernel import linear
-
-# E4M3 or E5M2 weights accepted automatically
-output = linear.onednn_w8a16_fp8(x_fp16, weight_fp8, scales_f32)
-output = linear.onednn_w8a16_fp8(x_fp16, weight_fp8, scales_f32, bias=bias)
-
-# Cache management
-linear.fp8_cache_clear()
-hits, misses, size = linear.fp8_cache_stats()
-```
-
-### fp8 — FP8 Quantization
-
-Per-tensor quantization, dequantization, and seed-data-driven stochastic
-rounding with Comfy Kitchen-compatible FP8 semantics.
+### Quantized linear operations
 
 ```python
-from omni_xpu_kernel import fp8
+from omni_xpu_kernel import int8, linear
 
-quantized = fp8.quantize_per_tensor(x, scale, torch.float8_e4m3fn)
-restored = fp8.dequantize_per_tensor(quantized, scale, torch.bfloat16)
-rounded = fp8.stochastic_rounding(x, rng, torch.float8_e4m3fn)
-```
+output = linear.onednn_w8a16_fp8(
+    activation, fp8_weight, weight_scales, bias=bias
+)
 
-### gguf — GGUF Dequantization
+w_int8, w_scale = int8.quantize_int8_tensorwise(weight)
+output = int8.int8_linear(
+    activation,
+    w_int8,
+    w_scale,
+    bias=bias,
+    out_dtype=activation.dtype,
+)
 
-| Format | Block Size | Elements |
-|--------|------------|----------|
-| Q4_0   | 18 bytes   | 32       |
-| Q8_0   | 34 bytes   | 32       |
-| Q4_K   | 144 bytes  | 256      |
-| Q6_K   | 210 bytes  | 256      |
+# Fold a concatenated [gate | up] SwiGLU into rowwise quantization. The
+# activated width is half the input width and must match the INT8 weight.
+output = int8.int8_linear(
+    gate_up,
+    w_int8,
+    w_scale,
+    out_dtype=gate_up.dtype,
+    input_act="swiglu",
+)
 
-```python
-from omni_xpu_kernel import gguf
+# GELU-tanh is fused directly into rowwise INT8 quantization for the validated
+# profitable BMG row range when ConvRot is disabled. Larger rows retain the
+# faster materialized XPU route.
+output = int8.int8_linear(
+    activation,
+    w_int8,
+    w_scale,
+    out_dtype=activation.dtype,
+    input_act="gelu_tanh",
+)
 
-output = gguf.dequantize_q4_0(quantized, torch.float16)
-output = gguf.dequantize_q8_0(quantized, torch.float16)
-output = gguf.dequantize_q4_k(quantized, torch.float16)
-output = gguf.dequantize_q6_k(quantized, torch.float16)
-
-# Batch dequantization (groups by format, fewer kernel launches)
-outputs = gguf.dequantize_batch(
-    [tensor1, tensor2, tensor3],
-    ['q4_0', 'q4_0', 'q8_0'],
-    torch.float16
+x_int8, x_scale = int8.quantize_int8_rowwise(activation)
+output = int8.int8_linear_prequantized(
+    x_int8,
+    x_scale,
+    w_int8,
+    w_scale,
+    out_dtype=activation.dtype,
 )
 ```
 
-### norm — Normalization
-
-RMSNorm, LayerNorm, fused Add+RMSNorm, and fused RMSNorm+Linear.
-Supports fp32/fp16/bf16, hidden_size <= 8192 (divisible by 32).
+### FP8 and GGUF
 
 ```python
-from omni_xpu_kernel import norm
+from omni_xpu_kernel import fp8, gguf
 
-output = norm.rms_norm(weight, input, eps=1e-6)
-output = norm.layer_norm(input, weight=weight, bias=None, eps=1e-5)
-norm.fused_add_rms_norm(input, residual, weight, eps=1e-6)  # in-place
+quantized = fp8.quantize_per_tensor(x, scale, torch.float8_e4m3fn)
+restored = fp8.dequantize_per_tensor(
+    quantized, scale, torch.bfloat16
+)
+rounded = fp8.stochastic_rounding(
+    x, rng, torch.float8_e4m3fn
+)
 
-# Fused RMSNorm + Linear projection (chains in C++, keeps data in L3 cache)
-output = norm.fused_rms_norm_linear(input, norm_weight, proj_weight, eps=1e-6)
-
-# LayerNorm followed by AdaLN scale/shift modulation
-output = norm.fused_adaln(input, scale, shift, row_repeat=1, eps=1e-6)
+q4 = gguf.dequantize_q4_0(packed_q4, torch.float16)
+q8 = gguf.dequantize_q8_0(packed_q8, torch.float16)
+outputs = gguf.dequantize_batch(
+    [packed_q4, packed_q8],
+    ["q4_0", "q8_0"],
+    torch.float16,
+)
 ```
 
-### svdq — SVDQuant W4A4
-
-INT4 weight dequantization, activation quantization, and oneDNN fused
-dequant+GEMM for SVDQuant W4A4 inference.
+### Normalization and SVDQuant
 
 ```python
-from omni_xpu_kernel import svdq
+from omni_xpu_kernel import norm, svdq
 
-# ESIMD dequantization
-dequantized = svdq.dequantize_w4(packed, scales, out_dtype=torch.bfloat16)
-unpacked = svdq.unpack_int4(packed, signed=True)
-packed_act, act_scales = svdq.quantize_act_int4(activation, group_size=64)
-packed_u4, u4_scales = svdq.quantize_act_uint4(nonnegative_activation, group_size=64)
-restored_u4 = svdq.dequantize_u4(packed_u4, u4_scales)
+output = norm.rms_norm(weight, x, eps=1e-6)
+output = norm.layer_norm(x, weight=weight, bias=bias, eps=1e-5)
+norm.fused_add_rms_norm(x, residual, weight, eps=1e-6)
+output = norm.fused_rms_adaln(x_2d, scale_2d, shift_2d, row_repeat, eps=1e-6)
 
-# oneDNN INT4 GEMM (pre-convert weights once, then use preconverted variant)
-packed_u4, scales_f16 = svdq.prepare_onednn_weights(packed, wscales)
-output = svdq.onednn_int4_gemm_preconverted(act_f16, packed_u4, scales_f16)
-
-# Fused f16->bf16 convert + add
-svdq.fused_convert_add(out_bf16, result_f16, residual_bf16)
+unpacked = svdq.unpack_int4(packed_weight, signed=True)
+dequantized = svdq.dequantize_w4(
+    packed_weight, scales, out_dtype=torch.bfloat16
+)
+prepared_weight, prepared_scales = svdq.prepare_onednn_weights(
+    packed_weight, scales
+)
+output = svdq.onednn_int4_gemm_preconverted(
+    activation, prepared_weight, prepared_scales
+)
 ```
 
-### int8 — INT8 Quantization and Linear
-
-INT8 dynamic quantization and linear layer for ComfyUI INT8-ConvRot models.
-Uses oneDNN s8×s8→s32 GEMM with ESIMD fused quantization and scale-back.
-
-```python
-from omni_xpu_kernel import int8
-
-# Quantize weight offline
-w_int8, w_scale = int8.quantize_int8_tensorwise(weight)
-
-# INT8 linear (dynamic activation quantization + oneDNN GEMM + rescale)
-output = int8.int8_linear(x_bf16, w_int8, w_scale, bias=bias, out_dtype=torch.bfloat16)
-
-# With ConvRot (Hadamard rotation for improved accuracy)
-output = int8.int8_linear(x, w_int8, w_scale, convrot=True, convrot_groupsize=256)
-
-# Native ConvRot weight preparation using a cached Hadamard matrix multiplication
-w_int8, w_scale = int8.quantize_int8_convrot_weight(weight, group_size=256)
-
-# Cache management
-int8.int8_cache_clear()
-stats = int8.int8_cache_stats()  # {"hits": ..., "misses": ..., "size": ...}
-```
-
-### rotary — Rotary Position Embedding
-
-Fused bf16->f32 + rotary rotation + f32->bf16 in a single ESIMD kernel.
-Supports head_dim 64 and 128.
+### Comfy Kitchen RoPE
 
 ```python
 from omni_xpu_kernel import rotary
 
-output = rotary.rotary_emb(x, cos_cache, sin_cache, seq_len, heads)
-
-# Comfy Kitchen adjacent-pair and split-half semantics
 output = rotary.apply_kitchen_rope1(x, freqs_cis)
 output = rotary.apply_kitchen_rope_split_half1(x, freqs_cis)
+
+# The fused pair API supports strided packed-QKV views, in-place output, and a
+# partial split-half rotary prefix while RMSNorm still covers the full head.
+q, k = rotary.rms_kitchen_rope_split_half_(
+    q,
+    k,
+    freqs_cis,
+    q_scale,
+    k_scale,
+    epsilon=1e-5,
+    rot_dim=96,
+)
+
+if rotary.kitchen_rope_fast_supported(x, freqs_cis):
+    output = rotary.apply_kitchen_rope1(x, freqs_cis)
 ```
 
-## Requirements
+Callers should use the capability query before selecting a specialized native
+route and preserve the established PyTorch fallback.
 
-- Intel oneAPI DPC++/C++ Compiler (icpx)
-- PyTorch >= 2.0 with XPU support
-- Intel GPU: Arc B-series (BMG), Data Center GPU Max (PVC), or compatible
-- oneDNN (for INT4/FP8 GEMM; auto-detected from oneAPI)
-- Intel `sycl-tla`/CUTLASS-SYCL headers (for the default Linux CUTE FMHA)
+## Debug logging
 
-## Installation
+Native logging is disabled by default. Enable all modules or a comma-separated
+subset with `OMNI_XPU_DEBUG`:
 
 ```bash
-source /opt/intel/oneapi/setvars.sh
-
-# Default Linux build: CUTE is mandatory. The build fails if the source tree
-# is missing or invalid.
-CUTLASS_SYCL_ROOT=/path/to/sycl-tla \
-OMNI_XPU_DEVICE=bmg \
-pip install -e . --no-build-isolation
-
-# Explicit core-only opt-out (also required for Windows builds):
-OMNI_XPU_REQUIRE_CUTE=0 \
-OMNI_XPU_DEVICE=bmg \
-pip install -e . --no-build-isolation
-```
-
-On Windows, see [WHL_BUILD_INSTALL.md](WHL_BUILD_INSTALL.md).
-
-## Debug Logging
-
-Controlled by `OMNI_XPU_DEBUG` environment variable. **Disabled by default.**
-
-```bash
-# Enable all modules
 OMNI_XPU_DEBUG=1 python your_script.py
-
-# Enable specific modules (comma-separated)
-OMNI_XPU_DEBUG=sdp python your_script.py       # SDP only
-OMNI_XPU_DEBUG=fp8 python your_script.py       # FP8 only
-OMNI_XPU_DEBUG=sdp,fp8 python your_script.py   # SDP + FP8
-
-# Legacy FP8 debug (still works)
-OMNI_FP8_DEBUG=1 python your_script.py
+OMNI_XPU_DEBUG=sdp,fp8 python your_script.py
 ```
 
-Log format: `[omni_xpu::<module>] <message>`
+Messages use this format:
 
-Example output:
-```
-[omni_xpu::sdp] call #0: V_max=4.9 threshold=256 needs_scaling=0 q=[1,4096,24,128]
-[omni_xpu::fp8] cache MISS: impl=jit:gemm:any (M=4096 K=4096 N=12288 wtype=10)
+```text
+[omni_xpu::<module>] <message>
 ```
 
-## Tests & Benchmarks
+`OMNI_FP8_DEBUG=1` remains available for compatibility.
+
+## Tests and benchmarks
+
+Run source tests from this directory in a matching XPU build environment:
 
 ```bash
-# Correctness tests
-python -m pytest tests/
-
-# All kernel benchmarks
-python -m tests.benchmarks.run_all
-
-# Individual benchmarks
-python -m tests.benchmarks.run_all --sdp
-python -m tests.benchmarks.run_all --norm
-python -m tests.benchmarks.run_all --gguf
-python -m tests.benchmarks.run_all --onednn
-python -m tests.benchmarks.run_all --rotary
+python -m pytest tests
 ```
 
-## Architecture
+Benchmarks live outside `tests/` so pytest cannot collect performance
+workloads. Run the available groups explicitly:
 
-### Attention Kernel Compilation
+```bash
+python -m benchmarks.run_all --fp8
+python -m benchmarks.run_all --gguf
+python -m benchmarks.run_all --norm
+python -m benchmarks.run_all --sdp
+```
 
-The SDP Flash Attention kernel uses ESIMD with doubleGRF and is compiled as a
-separate sidecar shared library (`lgrf_sdp.so`). AOT compilation targets a
-specific GPU via `-device <target>` (default: bmg).
+See [`benchmarks/README.md`](benchmarks/README.md) for workload-specific
+programs and measurement boundaries.
 
-On Linux, the default build requires a valid `CUTLASS_SYCL_ROOT` and produces
-the CUTLASS-SYCL attention sidecar (`cute_fmha_torch.so`). Set
-`OMNI_XPU_REQUIRE_CUTE=0` only for an explicit core-only build. The remaining
-native operations are built into the main `_C` extension.
+Benchmark results are device-, driver-, Torch-, shape-, and power-state
+specific. Do not treat a number from one target as validation for another.
 
-Configuration is via `sdp_config.h`:
-- `ConfigBMG` — Arc B580 (default)
-- `ConfigPVC` — Data Center GPU Max
-- `ConfigLNL` — Lunar Lake
+## Native layout
 
-To switch config at compile time: `-DSDP_CONFIG_PVC`
+The Linux build produces three extension components:
 
-### Build System
+- `_C.so`: main AOT extension for normalization, quantization, GGUF, SVDQuant,
+  rotary, and oneDNN-backed operations;
+- `lgrf_sdp.so`: target-specific ESIMD attention sidecar;
+- `cute_fmha_torch.so`: target-specific CUTLASS-SYCL attention sidecar.
 
-The package builds multiple extension modules:
-- `_C.so` — Main extension (norm, gguf, svdq, rotary, sdp loader, fp8, int8)
-- `lgrf_sdp.so` — SDP ESIMD sidecar (AOT, doubleGRF)
+`setup.py` derives one architecture macro from `OMNI_XPU_DEVICE` so wheel
+metadata, core AOT ISA, and sidecars identify the same target. BMG core and
+CUTE components query the exact runtime Device ID and share the B60/B70 policy
+table.
 
 ## License
 

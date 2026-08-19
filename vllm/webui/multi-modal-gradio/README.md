@@ -48,7 +48,6 @@ vllm serve \
 --gpu-memory-util=0.9 \
 --no-enable-prefix-caching \
 --max-num-batched-tokens=8192 \
---disable-log-requests \
 --max-model-len=32768 \
 --block-size 64 \
 --quantization fp8 \

@@ -129,6 +129,8 @@ FROM intel/pytorch:xpu-2.11.0-ubuntu24.04
 ARG http_proxy
 ARG https_proxy
 ARG no_proxy
+ARG ONECCL_INSTALLER="intel-oneccl-2021.15.9.14_offline.sh"
+ARG ONECCL_INSTALLER_SHA256="f7ab81b6ed1b10dd35fadec366a78046d8af214888dfd625047ce8953d5aa4ef"
 
 # The base already exports PATH=/opt/venv/bin:... and DEVICE=xpu.
 ENV PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/xpu" \
@@ -160,10 +162,40 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,from=builder,source=/wheels,target=/wheels \
+    set -e && \
     apt-get update -y && \
     apt-get install -y --no-install-recommends --fix-missing \
         ffmpeg libsndfile1 libsm6 libxext6 libgl1 numactl curl && \
     rm -rf /var/lib/apt/lists/* && \
+    curl -fL --retry 3 -o "${ONECCL_INSTALLER}" "https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.9/${ONECCL_INSTALLER}" && \
+    printf "%s  %s\n" "${ONECCL_INSTALLER_SHA256}" "${ONECCL_INSTALLER}" > /tmp/oneccl.sha256 && \
+    sha256sum -c /tmp/oneccl.sha256 && \
+    rm -f /tmp/oneccl.sha256 && \
+    bash "${ONECCL_INSTALLER}" -s -x -f /tmp && \
+    ONECCL_CUP="/tmp/${ONECCL_INSTALLER%.sh}/packages/intel.oneapi.lin.ccl.runtime,v=2021.15.9+13/cupPayload.cup" && \
+    ONECCL_DST="/tmp/oneccl-runtime" && \
+    python3 -m zipfile -e "${ONECCL_CUP}" "${ONECCL_DST}" && \
+    ONECCL_LIB="${ONECCL_DST}/_installdir/ccl/2021.15/lib" && \
+    rm -f "${ONECCL_LIB}/libccl.so" "${ONECCL_LIB}/libccl.so.1" "${ONECCL_LIB}/libccl_openmp.so" "${ONECCL_LIB}/libccl_openmp.so.0" && \
+    ln -sf libccl.so.1 "${ONECCL_LIB}/libccl.so" && \
+    ln -sf libccl.so.1.0 "${ONECCL_LIB}/libccl.so.1" && \
+    ln -sf libccl_openmp.so.0 "${ONECCL_LIB}/libccl_openmp.so" && \
+    ln -sf libccl_openmp.so.0.1 "${ONECCL_LIB}/libccl_openmp.so.0" && \
+    ONECCL_CPU_LIB="${ONECCL_DST}/_installdir/ccl/2021.15/lib/ccl/cpu/lib" && \
+    rm -f "${ONECCL_CPU_LIB}/libccl.so" "${ONECCL_CPU_LIB}/libccl.so.1" "${ONECCL_CPU_LIB}/libccl_openmp.so" "${ONECCL_CPU_LIB}/libccl_openmp.so.0" && \
+    ln -sf libccl.so.1 "${ONECCL_CPU_LIB}/libccl.so" && \
+    ln -sf libccl.so.1.0 "${ONECCL_CPU_LIB}/libccl.so.1" && \
+    ln -sf libccl_openmp.so.0 "${ONECCL_CPU_LIB}/libccl_openmp.so" && \
+    ln -sf libccl_openmp.so.0.1 "${ONECCL_CPU_LIB}/libccl_openmp.so.0" && \
+    mkdir -p /opt/intel/oneapi/ccl && \
+    rm -rf /opt/intel/oneapi/ccl/2021.15 && \
+    cp -a /tmp/oneccl-runtime/_installdir/ccl/2021.15 /opt/intel/oneapi/ccl/ && \
+    rm "${ONECCL_INSTALLER}" && \
+    echo "source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --force" >> /root/.bashrc && \
+    rm -f /opt/intel/oneapi/ccl/latest && \
+    ln -s /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/latest && \
+    find /opt/intel/oneapi/ccl -mindepth 1 -maxdepth 1 -type d -not -name 2021.15 -exec rm -rf {} + && \
+    rm -rf "/tmp/${ONECCL_INSTALLER%.sh}" /tmp/oneccl-runtime && \
     pip install /wheels/vllm-*.whl --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-deps --force-reinstall \
         /wheels/custom_esimd_kernels_vllm-*.whl \
@@ -171,14 +203,19 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     pip install transformers==5.8.0 accelerate hf_transfer 'modelscope!=1.15.0' && \
     pip install librosa soundfile decord ijson && \
     pip install bigdl-core==2.4.0b2 && \
-    pip uninstall -y triton triton-xpu || true && \
+    (pip uninstall -y triton triton-xpu || true) && \
     pip install --no-deps triton-xpu==3.7.0 \
         --extra-index-url https://download.pytorch.org/whl/xpu && \
+    (pip uninstall -y oneccl oneccl-devel || true) && \
+    rm -f /opt/venv/lib/libccl.so /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so.1.0 \
+        /opt/venv/lib/libccl_openmp.so /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so.0.1 && \
+    ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1.0 /opt/venv/lib/libccl.so.1 && \
+    ln -sf /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so && \
+    ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl_openmp.so.0.1 /opt/venv/lib/libccl_openmp.so.0 && \
+    ln -sf /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so && \
     TRITON=/opt/venv/lib/python3.12/site-packages/triton && \
     strip --strip-debug ${TRITON}/_C/libtriton.so && \
     rm -f ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git && \
     ln -s libMLIRDialectPlugin.so ${TRITON}/plugins/libMLIRDialectPlugin.so.22.0git
 
-# --- entrypoint: no oneCCL vars.sh (absent in this base); multi-card relies on
-#     torch 2.11 built-in XCCL. ---
 ENTRYPOINT ["bash", "-c", "exec vllm serve \"$@\"", "--"]

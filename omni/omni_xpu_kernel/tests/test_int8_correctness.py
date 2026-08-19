@@ -11,6 +11,8 @@ Test structure mirrors comfy-kitchen's test_int8.py + test_qdq.py:
 - Cache reuse verification (when native available)
 """
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 
@@ -150,6 +152,28 @@ class TestQuantizeInt8Rowwise:
         assert q.shape == (2, 16, 128)
         assert scale.shape == (2, 16, 1)
 
+    @pytest.mark.skipif(not has_xpu(), reason="Native quant dispatch requires XPU")
+    @pytest.mark.parametrize(
+        ("shape", "dtype", "scale_shape"),
+        [
+            ((128,), torch.bfloat16, (1,)),
+            ((4, 128), torch.float32, (4, 1)),
+        ],
+    )
+    def test_generic_native_fallback_inputs(
+        self, shape, dtype, scale_shape, seed
+    ):
+        """Public dispatch retains generic-native shape and dtype support."""
+        from omni_xpu_kernel import int8
+
+        x = torch.randn(shape, device="xpu", dtype=dtype)
+        q, scale = int8.quantize_int8_rowwise(x)
+
+        assert q.shape == x.shape
+        assert q.dtype == torch.int8
+        assert scale.shape == scale_shape
+        assert scale.dtype == torch.float32
+
     @pytest.mark.skipif(not has_xpu(), reason="Fused quant kernel requires XPU")
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     @pytest.mark.parametrize("k", [7, 8, 255, 256, 512, 513, 1024, 3840])
@@ -174,6 +198,48 @@ class TestQuantizeInt8Rowwise:
 
         torch.testing.assert_close(scale, expected_scale, rtol=1e-6, atol=1e-8)
         max_quant_diff = (q.to(torch.int16) - expected_q.to(torch.int16)).abs().max()
+        assert max_quant_diff.item() <= 1
+
+    @pytest.mark.skipif(not has_xpu(), reason="Large quant kernel requires XPU")
+    @pytest.mark.parametrize(
+        ("shape", "dtype"),
+        [
+            ((1024, 10240), torch.bfloat16),
+            ((4096, 3840), torch.bfloat16),
+            ((4128, 3840), torch.bfloat16),
+            ((4096, 10240), torch.bfloat16),
+            ((4128, 10240), torch.bfloat16),
+            ((4192, 6144), torch.bfloat16),
+            ((4192, 16384), torch.bfloat16),
+            ((4096, 3360), torch.float16),
+            ((4205, 3360), torch.float16),
+            ((4096, 13568), torch.float16),
+            ((4205, 13568), torch.float16),
+        ],
+    )
+    def test_target_workflow_shapes(self, shape, dtype, seed):
+        """Target-specialized workflow shapes match rowwise QDQ."""
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(native, "quantize_int8_rowwise_fused"):
+            pytest.skip("Native fused quant kernel is unavailable")
+
+        x = torch.randn(*shape, device="xpu", dtype=dtype)
+        q, scale = native.quantize_int8_rowwise_fused(x)
+        expected_scale = (
+            x.float().abs().amax(dim=-1, keepdim=True) / 127.0
+        ).clamp(min=1e-30)
+        expected_q = (
+            torch.round(x.float() / expected_scale)
+            .clamp(-128, 127)
+            .to(torch.int8)
+        )
+
+        torch.testing.assert_close(scale, expected_scale, rtol=1e-6, atol=1e-8)
+        max_quant_diff = (
+            q.to(torch.int16) - expected_q.to(torch.int16)
+        ).abs().max()
         assert max_quant_diff.item() <= 1
 
 
@@ -427,6 +493,413 @@ class TestInt8Linear:
             int8.int8_linear(x, w, w_scale)
 
 
+class TestInt8LinearPrequantized:
+    """Tests for the explicit rowwise-quantized activation path."""
+
+    def test_reference_matches_manual_scaled_int_mm(self, seed):
+        """Reference path applies row and channel scales before output cast."""
+        from omni_xpu_kernel.int8 import _reference
+
+        x_int8 = torch.randint(-127, 128, (6, 16), dtype=torch.int8)
+        x_scale = torch.rand(6, 1, dtype=torch.float32) * 0.05 + 1e-4
+        weight = torch.randint(-127, 128, (8, 16), dtype=torch.int8)
+        weight_scale = torch.rand(8, dtype=torch.float32) * 0.05 + 1e-4
+        bias = torch.randn(8, dtype=torch.float32)
+
+        out = _reference.int8_linear_prequantized(
+            x_int8,
+            x_scale,
+            weight,
+            weight_scale,
+            bias=bias,
+            out_dtype=torch.float32,
+        )
+        accum = x_int8.to(torch.int32) @ weight.to(torch.int32).T
+        expected = (
+            accum.float()
+            * x_scale.reshape(-1, 1)
+            * weight_scale.reshape(1, -1)
+            + bias.reshape(1, -1)
+        )
+
+        # Floating-point multiplication order may differ between the combined
+        # scale expression and the reference implementation.
+        torch.testing.assert_close(out, expected, rtol=2e-6, atol=5e-6)
+
+    def test_reference_preserves_leading_dimensions(self, seed):
+        """One scale per flattened row supports arbitrary leading dimensions."""
+        from omni_xpu_kernel.int8 import _reference
+
+        x_int8 = torch.randint(-127, 128, (2, 3, 16), dtype=torch.int8)
+        x_scale = torch.rand(2, 3, 1, dtype=torch.float32) + 1e-4
+        weight = torch.randint(-127, 128, (8, 16), dtype=torch.int8)
+        weight_scale = torch.tensor(0.01, dtype=torch.float32)
+
+        out = _reference.int8_linear_prequantized(
+            x_int8, x_scale, weight, weight_scale, out_dtype=torch.bfloat16
+        )
+
+        assert out.shape == (2, 3, 8)
+        assert out.dtype == torch.bfloat16
+
+    def test_reference_rejects_wrong_activation_scale_count(self, seed):
+        """Activation scale count must equal the flattened row count."""
+        from omni_xpu_kernel.int8 import _reference
+
+        x_int8 = torch.randint(-127, 128, (2, 3, 16), dtype=torch.int8)
+        weight = torch.randint(-127, 128, (8, 16), dtype=torch.int8)
+
+        with pytest.raises(ValueError, match="one value per flattened activation row"):
+            _reference.int8_linear_prequantized(
+                x_int8,
+                torch.ones(2),
+                weight,
+                torch.ones(8),
+            )
+
+    def test_public_reference_fallback(self, monkeypatch, seed):
+        """Python dispatch exposes the API when the native symbol is absent."""
+        from omni_xpu_kernel import int8
+
+        monkeypatch.setattr(int8, "_get_native", lambda: None)
+        x_int8 = torch.randint(-127, 128, (4, 16), dtype=torch.int8)
+        x_scale = torch.rand(4, 1, dtype=torch.float32) + 1e-4
+        weight = torch.randint(-127, 128, (8, 16), dtype=torch.int8)
+
+        out = int8.int8_linear_prequantized(
+            x_int8,
+            x_scale,
+            weight,
+            torch.tensor(0.01),
+            out_dtype=torch.float16,
+        )
+
+        assert out.shape == (4, 8)
+        assert out.dtype == torch.float16
+
+    def test_native_matches_reference_for_fixed_quantized_input(self, device, seed):
+        """Native and reference consume exactly the same quantized boundary."""
+        if device.type != "xpu":
+            pytest.skip("native prequantized Linear requires XPU")
+
+        from omni_xpu_kernel import int8
+        from omni_xpu_kernel.int8 import _reference
+
+        native = int8._get_native()
+        if native is None or not hasattr(native, "int8_linear_prequantized"):
+            pytest.skip("native extension does not expose int8_linear_prequantized")
+
+        x_int8 = torch.randint(-127, 128, (2, 7, 128), device=device, dtype=torch.int8)
+        x_scale = torch.rand(2, 7, 1, device=device, dtype=torch.float32) * 0.02 + 1e-4
+        weight = torch.randint(-127, 128, (64, 128), device=device, dtype=torch.int8)
+        weight_scale = torch.rand(64, device=device, dtype=torch.float32) * 0.02 + 1e-4
+        bias = torch.randn(64, device=device, dtype=torch.float32)
+
+        out = int8.int8_linear_prequantized(
+            x_int8,
+            x_scale,
+            weight,
+            weight_scale,
+            bias=bias,
+            out_dtype=torch.bfloat16,
+        )
+        ref = _reference.int8_linear_prequantized(
+            x_int8,
+            x_scale,
+            weight,
+            weight_scale,
+            bias=bias,
+            out_dtype=torch.bfloat16,
+        )
+
+        torch.testing.assert_close(out.float(), ref.float(), rtol=0.02, atol=0.2)
+
+    def test_dynamic_and_prequantized_share_primitive_cache(self, device, seed):
+        """Both entry points use the same scaled oneDNN primitive key."""
+        if device.type != "xpu":
+            pytest.skip("oneDNN primitive cache requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(native, "int8_linear_prequantized"):
+            pytest.skip("native extension does not expose int8_linear_prequantized")
+
+        x = torch.randn(16, 128, device=device, dtype=torch.bfloat16)
+        weight = torch.randint(-127, 128, (64, 128), device=device, dtype=torch.int8)
+        weight_scale = torch.ones(64, device=device, dtype=torch.float32)
+        x_int8, x_scale = int8.quantize_int8_rowwise(x)
+
+        int8.int8_cache_clear()
+        int8.int8_linear_prequantized(
+            x_int8, x_scale, weight, weight_scale, out_dtype=torch.bfloat16
+        )
+        prequant_stats = int8.int8_cache_stats()
+        int8.int8_linear(x, weight, weight_scale, out_dtype=torch.bfloat16)
+        dynamic_stats = int8.int8_cache_stats()
+
+        assert dynamic_stats["hits"] > prequant_stats["hits"]
+        assert dynamic_stats["size"] == prequant_stats["size"]
+
+
+class TestInt8LinearSharedInput:
+    """Tests for two projections sharing one activation quantization."""
+
+    def test_reference_matches_two_single_calls(self, seed):
+        from omni_xpu_kernel.int8 import _reference
+
+        x = torch.randn(2, 3, 32, dtype=torch.bfloat16)
+        w1 = torch.randn(24, 32, dtype=torch.bfloat16)
+        w2 = torch.randn(24, 32, dtype=torch.bfloat16)
+        w1_q, w1_scale = _reference.quantize_int8_rowwise(w1)
+        w2_q, w2_scale = _reference.quantize_int8_rowwise(w2)
+
+        pair = _reference.int8_linear_shared_input(
+            x, w1_q, w1_scale, w2_q, w2_scale
+        )
+        expected1 = _reference.int8_linear(x, w1_q, w1_scale)
+        expected2 = _reference.int8_linear(x, w2_q, w2_scale)
+
+        assert torch.equal(pair[0], expected1)
+        assert torch.equal(pair[1], expected2)
+
+    def test_native_matches_two_dynamic_calls(self, device, seed):
+        if device.type != "xpu":
+            pytest.skip("native shared-input Linear requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(native, "int8_linear_shared_input"):
+            pytest.skip("native extension does not expose int8_linear_shared_input")
+
+        x = torch.randn(2, 7, 128, device=device, dtype=torch.bfloat16)
+        w1 = torch.randint(-127, 128, (64, 128), device=device, dtype=torch.int8)
+        w2 = torch.randint(-127, 128, (64, 128), device=device, dtype=torch.int8)
+        s1 = torch.rand(64, 1, device=device, dtype=torch.float32) * 0.02 + 1e-4
+        s2 = torch.rand(64, 1, device=device, dtype=torch.float32) * 0.02 + 1e-4
+        b1 = torch.randn(64, device=device, dtype=torch.bfloat16)
+        b2 = torch.randn(64, device=device, dtype=torch.bfloat16)
+
+        output1, output2 = int8.int8_linear_shared_input(
+            x, w1, s1, w2, s2, bias1=b1, bias2=b2
+        )
+        expected1 = int8.int8_linear(x, w1, s1, bias=b1)
+        expected2 = int8.int8_linear(x, w2, s2, bias=b2)
+
+        assert output1.shape == (2, 7, 64)
+        assert output2.shape == (2, 7, 64)
+        assert torch.equal(output1, expected1)
+        assert torch.equal(output2, expected2)
+
+    def test_same_shapes_share_one_primitive(self, device, seed):
+        if device.type != "xpu":
+            pytest.skip("oneDNN primitive cache requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(native, "int8_linear_shared_input"):
+            pytest.skip("native extension does not expose int8_linear_shared_input")
+
+        x = torch.randn(16, 128, device=device, dtype=torch.bfloat16)
+        w1 = torch.randint(-127, 128, (64, 128), device=device, dtype=torch.int8)
+        w2 = torch.randint(-127, 128, (64, 128), device=device, dtype=torch.int8)
+        scale = torch.ones(64, device=device, dtype=torch.float32)
+
+        int8.int8_cache_clear()
+        int8.int8_linear_shared_input(x, w1, scale, w2, scale)
+        stats = int8.int8_cache_stats()
+
+        assert stats["misses"] == 1
+        assert stats["hits"] >= 1
+        assert stats["size"] == 1
+
+    def test_bmg_prequantized_pair_matches_two_single_calls(
+        self, device, seed
+    ):
+        if device.type != "xpu":
+            pytest.skip("native paired Linear requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "int8_linear_pair_prequantized"
+        ):
+            pytest.skip("native extension is not a BMG build with paired Linear")
+
+        x_int8 = torch.randint(
+            -127, 128, (2, 7, 128), device=device, dtype=torch.int8
+        )
+        x_scale = torch.rand(14, device=device, dtype=torch.float32) * 0.02
+        weight1 = torch.randint(
+            -127, 128, (64, 128), device=device, dtype=torch.int8
+        )
+        weight2 = torch.randint(
+            -127, 128, (64, 128), device=device, dtype=torch.int8
+        )
+        scale1 = torch.rand(64, device=device, dtype=torch.float32) * 0.02
+        scale2 = torch.rand(64, device=device, dtype=torch.float32) * 0.02
+
+        actual1, actual2 = native.int8_linear_pair_prequantized(
+            x_int8,
+            x_scale,
+            weight1,
+            scale1,
+            weight2,
+            scale2,
+            1,
+        )
+        expected1 = native.int8_linear_prequantized(
+            x_int8, x_scale, weight1, scale1, None, 1
+        )
+        expected2 = native.int8_linear_prequantized(
+            x_int8, x_scale, weight2, scale2, None, 1
+        )
+
+        assert actual1.shape == (2, 7, 64)
+        assert actual2.shape == (2, 7, 64)
+        assert actual1.dtype == torch.float16
+        assert actual2.dtype == torch.float16
+        assert torch.equal(actual1, expected1)
+        assert torch.equal(actual2, expected2)
+
+
+class TestFusedSiluMulQuantize:
+    """Tests for the no-floating-intermediate SwiGLU quantizer."""
+
+    def test_reference_shape_dtype(self, seed):
+        from omni_xpu_kernel.int8 import _reference
+
+        x1 = torch.randn(2, 3, 32, dtype=torch.bfloat16)
+        x2 = torch.randn_like(x1)
+        q, scale = _reference.fused_silu_mul_quantize_rowwise(x1, x2)
+
+        assert q.shape == x1.shape
+        assert q.dtype == torch.int8
+        assert scale.shape == (2, 3, 1)
+        assert scale.dtype == torch.float32
+        floating = _reference.fused_silu_mul(x1, x2)
+        torch.testing.assert_close(
+            floating, torch.nn.functional.silu(x1) * x2, rtol=0, atol=0
+        )
+
+    def test_fused_floating_public_reference_fallback(self, monkeypatch, seed):
+        from omni_xpu_kernel import int8
+
+        monkeypatch.setattr(int8, "_get_native", lambda: None)
+        x1 = torch.randn(2, 3, 32, dtype=torch.bfloat16)
+        x2 = torch.randn_like(x1)
+        output = int8.fused_silu_mul(x1, x2)
+        torch.testing.assert_close(
+            output, torch.nn.functional.silu(x1) * x2, rtol=0, atol=0
+        )
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("k", [7, 256, 1024])
+    def test_fused_floating_output_matches_materialized(
+        self, device, seed, dtype, k
+    ):
+        from omni_xpu_kernel import int8
+
+        x1 = torch.randn(7, k, device=device, dtype=dtype)
+        x2 = torch.randn_like(x1)
+        expected = torch.nn.functional.silu(x1) * x2
+        if dtype == torch.float16:
+            expected = torch.nan_to_num(
+                expected, nan=0.0, posinf=65504.0, neginf=-65504.0
+            )
+        output = int8.fused_silu_mul(x1, x2)
+
+        assert output.shape == x1.shape
+        assert output.dtype == dtype
+        torch.testing.assert_close(output, expected, rtol=0.01, atol=0.01)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("k", [7, 256, 1024])
+    def test_native_matches_materialized_boundary(self, device, seed, dtype, k):
+        if device.type != "xpu":
+            pytest.skip("native fused SwiGLU quantization requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "fused_silu_mul_quantize_rowwise"
+        ):
+            pytest.skip("native extension lacks fused SwiGLU quantization")
+
+        x1 = torch.randn(7, k, device=device, dtype=dtype)
+        x2 = torch.randn_like(x1)
+        materialized = torch.nn.functional.silu(x1) * x2
+        if dtype == torch.float16:
+            materialized = torch.nan_to_num(
+                materialized, nan=0.0, posinf=65504.0, neginf=-65504.0
+            )
+        expected_q, expected_scale = native.quantize_int8_rowwise_fused(
+            materialized
+        )
+        q, scale = int8.fused_silu_mul_quantize_rowwise(x1, x2)
+
+        torch.testing.assert_close(scale, expected_scale, rtol=0.01, atol=1e-7)
+        max_quant_diff = (q.to(torch.int16) - expected_q.to(torch.int16)).abs().max()
+        assert max_quant_diff.item() <= 1
+
+    def test_down_projection_close_to_materialized_path(self, device, seed):
+        if device.type != "xpu":
+            pytest.skip("native fused SwiGLU quantization requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "fused_silu_mul_quantize_rowwise"
+        ):
+            pytest.skip("native extension lacks fused SwiGLU quantization")
+
+        x1 = torch.randn(32, 256, device=device, dtype=torch.bfloat16)
+        x2 = torch.randn_like(x1)
+        weight = torch.randn(128, 256, device=device, dtype=torch.bfloat16)
+        weight_q, weight_scale = int8.quantize_int8_rowwise(weight)
+
+        materialized = torch.nn.functional.silu(x1) * x2
+        expected = int8.int8_linear(
+            materialized, weight_q, weight_scale, out_dtype=torch.bfloat16
+        )
+        q, scale = int8.fused_silu_mul_quantize_rowwise(x1, x2)
+        output = int8.int8_linear_prequantized(
+            q, scale, weight_q, weight_scale, out_dtype=torch.bfloat16
+        )
+
+        error = (output.float() - expected.float()).abs()
+        assert error.mean().item() < 0.05
+        assert error.max().item() < 0.5
+
+    def test_fp16_nonfinite_values_follow_lumina_clamp(self, device):
+        if device.type != "xpu":
+            pytest.skip("native fused SwiGLU quantization requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "fused_silu_mul_quantize_rowwise"
+        ):
+            pytest.skip("native extension lacks fused SwiGLU quantization")
+
+        x1 = torch.tensor(
+            [[float("nan"), float("inf"), -float("inf"), 1.0] * 8],
+            device=device,
+            dtype=torch.float16,
+        )
+        x2 = torch.ones_like(x1)
+        q, scale = int8.fused_silu_mul_quantize_rowwise(x1, x2)
+
+        assert torch.isfinite(scale).all()
+        assert q.dtype == torch.int8
+
+
 # =============================================================================
 # ConvRot Tests
 # =============================================================================
@@ -434,6 +907,518 @@ class TestInt8Linear:
 
 class TestConvRot:
     """Tests for ConvRot (Hadamard rotation) operations."""
+
+    @pytest.mark.parametrize("rows", [109, 110, 4096, 4205, 4206])
+    def test_bmg_g16_fused_quantize_matches_materialized_path(
+        self, device, seed, rows
+    ):
+        """The BMG DPAS route preserves the public FP16 materialization."""
+        if device.type != "xpu":
+            pytest.skip("BMG fused ConvRot quantization requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "quantize_int8_convrot_g16_bmg"
+        ):
+            pytest.skip("native extension is not a BMG build with the fused route")
+
+        x = torch.randn(rows, 3360, device=device, dtype=torch.float16)
+        rotated = native.rotate_convrot(x, 16)
+        expected_q, expected_scale = native.quantize_int8_rowwise_fused(
+            rotated
+        )
+        actual_q, actual_scale = native.quantize_int8_convrot_g16_bmg(x)
+
+        assert torch.equal(actual_q, expected_q)
+        assert torch.equal(actual_scale, expected_scale)
+
+    def test_bmg_g16_public_linear_dispatches_to_fused_route(
+        self, device, seed, monkeypatch
+    ):
+        """The public linear API consumes the fused quantized activation."""
+        if device.type != "xpu":
+            pytest.skip("BMG fused ConvRot quantization requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "quantize_int8_convrot_g16_bmg"
+        ):
+            pytest.skip("native extension is not a BMG build with the fused route")
+
+        calls = {"fused": 0, "rotate": 0, "prequantized": 0}
+
+        class NativeProxy:
+            def __getattr__(self, name):
+                return getattr(native, name)
+
+            def quantize_int8_convrot_g16_bmg(self, x):
+                calls["fused"] += 1
+                return native.quantize_int8_convrot_g16_bmg(x)
+
+            def rotate_convrot(self, x, group_size):
+                calls["rotate"] += 1
+                return native.rotate_convrot(x, group_size)
+
+            def int8_linear_prequantized(
+                self,
+                x_int8,
+                x_scale,
+                weight,
+                weight_scale,
+                bias,
+                dtype_code,
+            ):
+                calls["prequantized"] += 1
+                return native.int8_linear_prequantized(
+                    x_int8,
+                    x_scale,
+                    weight,
+                    weight_scale,
+                    bias,
+                    dtype_code,
+                )
+
+        x = torch.randn(109, 3360, device=device, dtype=torch.float16)
+        weight = torch.randint(
+            -128, 128, (16, 3360), device=device, dtype=torch.int8
+        )
+        weight_scale = torch.rand(16, device=device, dtype=torch.float32)
+        bias = torch.randn(16, device=device, dtype=torch.float16)
+
+        monkeypatch.setattr(int8, "_get_native", lambda: NativeProxy())
+        output = int8.int8_linear(
+            x,
+            weight,
+            weight_scale,
+            bias=bias,
+            out_dtype=torch.float16,
+            convrot=True,
+            convrot_groupsize=16,
+        )
+
+        assert output.shape == (109, 16)
+        assert output.dtype == torch.float16
+        assert calls == {"fused": 1, "rotate": 0, "prequantized": 1}
+
+    @pytest.mark.parametrize("inference_mode", [False, True])
+    def test_bmg_g16_public_linear_reuses_exact_qkv_activation(
+        self, device, seed, monkeypatch, inference_mode
+    ):
+        """One Q quantization is reused only by the following K and V calls."""
+        if device.type != "xpu":
+            pytest.skip("BMG QKV activation cache requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "quantize_int8_convrot_g16_bmg"
+        ):
+            pytest.skip("native extension is not a BMG build with the fused route")
+
+        calls = {"quantize": 0, "prequantized": 0}
+
+        class NativeProxy:
+            def int8_linear(self, *args):
+                raise AssertionError("generic linear route must not run")
+
+            def quantize_int8_convrot_g16_bmg(self, x):
+                calls["quantize"] += 1
+                rows = x.numel() // x.shape[-1]
+                return (
+                    torch.empty_like(x, dtype=torch.int8),
+                    torch.ones(rows, 1, device=x.device, dtype=torch.float32),
+                )
+
+            def int8_linear_prequantized(
+                self,
+                x_int8,
+                x_scale,
+                weight,
+                weight_scale,
+                bias,
+                dtype_code,
+            ):
+                calls["prequantized"] += 1
+                assert bias is None
+                assert dtype_code == 1
+                return torch.empty(
+                    (*x_int8.shape[:-1], weight.shape[0]),
+                    device=x_int8.device,
+                    dtype=torch.float16,
+                )
+
+        context = torch.inference_mode() if inference_mode else nullcontext()
+        with context:
+            x = torch.randn(109, 3360, device=device, dtype=torch.float16)
+            q_weight = torch.empty(
+                3360, 3360, device=device, dtype=torch.int8
+            )
+            kv_weight = torch.empty(
+                840, 3360, device=device, dtype=torch.int8
+            )
+            q_scale = torch.ones(3360, device=device, dtype=torch.float32)
+            kv_scale = torch.ones(840, device=device, dtype=torch.float32)
+
+            int8._clear_bmg_qkv_activation_cache()
+            monkeypatch.setattr(int8, "_get_native", lambda: NativeProxy())
+            q = int8.int8_linear(
+                x,
+                q_weight,
+                q_scale,
+                out_dtype=torch.float16,
+                convrot=True,
+                convrot_groupsize=16,
+            )
+            k = int8.int8_linear(
+                x,
+                kv_weight,
+                kv_scale,
+                out_dtype=torch.float16,
+                convrot=True,
+                convrot_groupsize=16,
+            )
+            v = int8.int8_linear(
+                x,
+                kv_weight,
+                kv_scale,
+                out_dtype=torch.float16,
+                convrot=True,
+                convrot_groupsize=16,
+            )
+            extra = int8.int8_linear(
+                x,
+                kv_weight,
+                kv_scale,
+                out_dtype=torch.float16,
+                convrot=True,
+                convrot_groupsize=16,
+            )
+
+        assert torch.is_inference(x) is inference_mode
+        assert q.shape == (109, 3360)
+        assert k.shape == v.shape == extra.shape == (109, 840)
+        assert calls == {"quantize": 2, "prequantized": 4}
+        int8._clear_bmg_qkv_activation_cache()
+
+    def test_bmg_g16_qkv_cache_observes_tensor_mutation(
+        self, device, seed, monkeypatch
+    ):
+        """A normal tensor version change invalidates a pending Q cache."""
+        if device.type != "xpu":
+            pytest.skip("BMG QKV activation cache requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "quantize_int8_convrot_g16_bmg"
+        ):
+            pytest.skip("native extension is not a BMG build with the fused route")
+
+        quantize_calls = 0
+
+        class NativeProxy:
+            def int8_linear(self, *args):
+                raise AssertionError("generic linear route must not run")
+
+            def quantize_int8_convrot_g16_bmg(self, x):
+                nonlocal quantize_calls
+                quantize_calls += 1
+                rows = x.numel() // x.shape[-1]
+                return (
+                    torch.empty_like(x, dtype=torch.int8),
+                    torch.ones(rows, 1, device=x.device, dtype=torch.float32),
+                )
+
+            def int8_linear_prequantized(
+                self,
+                x_int8,
+                x_scale,
+                weight,
+                weight_scale,
+                bias,
+                dtype_code,
+            ):
+                return torch.empty(
+                    (*x_int8.shape[:-1], weight.shape[0]),
+                    device=x_int8.device,
+                    dtype=torch.float16,
+                )
+
+        x = torch.randn(109, 3360, device=device, dtype=torch.float16)
+        q_weight = torch.empty(3360, 3360, device=device, dtype=torch.int8)
+        kv_weight = torch.empty(840, 3360, device=device, dtype=torch.int8)
+        q_scale = torch.ones(3360, device=device, dtype=torch.float32)
+        kv_scale = torch.ones(840, device=device, dtype=torch.float32)
+
+        int8._clear_bmg_qkv_activation_cache()
+        monkeypatch.setattr(int8, "_get_native", lambda: NativeProxy())
+        int8.int8_linear(
+            x,
+            q_weight,
+            q_scale,
+            out_dtype=torch.float16,
+            convrot=True,
+            convrot_groupsize=16,
+        )
+        x.add_(1)
+        int8.int8_linear(
+            x,
+            kv_weight,
+            kv_scale,
+            out_dtype=torch.float16,
+            convrot=True,
+            convrot_groupsize=16,
+        )
+        int8.int8_linear(
+            x,
+            kv_weight,
+            kv_scale,
+            out_dtype=torch.float16,
+            convrot=True,
+            convrot_groupsize=16,
+        )
+
+        assert quantize_calls == 3
+        int8._clear_bmg_qkv_activation_cache()
+
+    @pytest.mark.parametrize("inference_mode", [False, True])
+    def test_krea2_public_linear_reuses_exact_projection_activation(
+        self, device, seed, monkeypatch, inference_mode
+    ):
+        """Krea2 attention and MLP projections reuse only the same activation."""
+        if device.type != "xpu":
+            pytest.skip("Krea2 activation cache requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        if not int8._is_supported_krea2_cache_target():
+            pytest.skip("test requires an aligned supported package/core target")
+
+        calls = {"rotate": 0, "quantize": 0, "prequantized": 0}
+
+        class NativeProxy:
+            def int8_linear(self, *args):
+                raise AssertionError("generic linear route must not run")
+
+            def rotate_convrot(self, x, group_size):
+                calls["rotate"] += 1
+                assert group_size == 256
+                return x
+
+            def quantize_int8_rowwise_fused(self, x):
+                calls["quantize"] += 1
+                rows = x.numel() // x.shape[-1]
+                return (
+                    torch.empty_like(x, dtype=torch.int8),
+                    torch.ones(rows, 1, device=x.device, dtype=torch.float32),
+                )
+
+            def int8_linear_prequantized(
+                self,
+                x_int8,
+                x_scale,
+                weight,
+                weight_scale,
+                bias,
+                dtype_code,
+            ):
+                calls["prequantized"] += 1
+                assert bias is None
+                assert dtype_code == 2
+                return torch.empty(
+                    (*x_int8.shape[:-1], weight.shape[0]),
+                    device=x_int8.device,
+                    dtype=torch.bfloat16,
+                )
+
+        context = torch.inference_mode() if inference_mode else nullcontext()
+        with context:
+            x1 = torch.empty(
+                1, 4192, 6144, device=device, dtype=torch.bfloat16
+            )
+            x2 = torch.empty_like(x1)
+            weights = {
+                output_features: torch.empty(
+                    output_features,
+                    6144,
+                    device=device,
+                    dtype=torch.int8,
+                )
+                for output_features in (1536, 6144, 16384)
+            }
+            scales = {
+                output_features: torch.ones(
+                    output_features,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                for output_features in weights
+            }
+
+            int8._clear_krea2_activation_cache()
+            monkeypatch.setattr(int8, "_get_native", lambda: NativeProxy())
+            for output_features in (6144, 1536, 1536, 6144, 1536):
+                int8.int8_linear(
+                    x1,
+                    weights[output_features],
+                    scales[output_features],
+                    out_dtype=torch.bfloat16,
+                    convrot=True,
+                    convrot_groupsize=256,
+                )
+            for output_features in (16384, 16384):
+                int8.int8_linear(
+                    x2,
+                    weights[output_features],
+                    scales[output_features],
+                    out_dtype=torch.bfloat16,
+                    convrot=True,
+                    convrot_groupsize=256,
+                )
+
+        assert torch.is_inference(x1) is inference_mode
+        assert calls == {"rotate": 3, "quantize": 3, "prequantized": 7}
+        int8._clear_krea2_activation_cache()
+
+    def test_krea2_cache_observes_tensor_mutation(
+        self, device, seed, monkeypatch
+    ):
+        """A normal tensor version change invalidates a pending Krea2 entry."""
+        if device.type != "xpu":
+            pytest.skip("Krea2 activation cache requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        if not int8._is_supported_krea2_cache_target():
+            pytest.skip("test requires an aligned supported package/core target")
+
+        quantize_calls = 0
+
+        class NativeProxy:
+            def int8_linear(self, *args):
+                raise AssertionError("generic linear route must not run")
+
+            def rotate_convrot(self, x, group_size):
+                return x
+
+            def quantize_int8_rowwise_fused(self, x):
+                nonlocal quantize_calls
+                quantize_calls += 1
+                rows = x.numel() // x.shape[-1]
+                return (
+                    torch.empty_like(x, dtype=torch.int8),
+                    torch.ones(rows, 1, device=x.device, dtype=torch.float32),
+                )
+
+            def int8_linear_prequantized(
+                self,
+                x_int8,
+                x_scale,
+                weight,
+                weight_scale,
+                bias,
+                dtype_code,
+            ):
+                return torch.empty(
+                    (*x_int8.shape[:-1], weight.shape[0]),
+                    device=x_int8.device,
+                    dtype=torch.bfloat16,
+                )
+
+        x = torch.zeros(1, 4192, 6144, device=device, dtype=torch.bfloat16)
+        weight = torch.empty(6144, 6144, device=device, dtype=torch.int8)
+        scale = torch.ones(6144, device=device, dtype=torch.float32)
+
+        int8._clear_krea2_activation_cache()
+        monkeypatch.setattr(int8, "_get_native", lambda: NativeProxy())
+        int8.int8_linear(
+            x,
+            weight,
+            scale,
+            out_dtype=torch.bfloat16,
+            convrot=True,
+            convrot_groupsize=256,
+        )
+        x.add_(1)
+        int8.int8_linear(
+            x,
+            weight,
+            scale,
+            out_dtype=torch.bfloat16,
+            convrot=True,
+            convrot_groupsize=256,
+        )
+
+        assert quantize_calls == 2
+        int8._clear_krea2_activation_cache()
+
+    def test_bmg_g16_public_shared_dispatches_to_pair(
+        self, device, seed, monkeypatch
+    ):
+        if device.type != "xpu":
+            pytest.skip("BMG paired ConvRot route requires XPU")
+
+        from omni_xpu_kernel import int8
+
+        native = int8._get_native()
+        if native is None or not hasattr(
+            native, "int8_linear_pair_prequantized"
+        ):
+            pytest.skip("native extension is not a BMG build with paired Linear")
+
+        calls = {"fused": 0, "pair": 0, "rotate": 0, "shared": 0}
+
+        class NativeProxy:
+            def __getattr__(self, name):
+                return getattr(native, name)
+
+            def quantize_int8_convrot_g16_bmg(self, x):
+                calls["fused"] += 1
+                return native.quantize_int8_convrot_g16_bmg(x)
+
+            def int8_linear_pair_prequantized(self, *args):
+                calls["pair"] += 1
+                return native.int8_linear_pair_prequantized(*args)
+
+            def rotate_convrot(self, x, group_size):
+                calls["rotate"] += 1
+                return native.rotate_convrot(x, group_size)
+
+            def int8_linear_shared_input(self, *args):
+                calls["shared"] += 1
+                return native.int8_linear_shared_input(*args)
+
+        x = torch.randn(109, 3360, device=device, dtype=torch.float16)
+        weight1 = torch.zeros(
+            13568, 3360, device=device, dtype=torch.int8
+        )
+        weight2 = torch.zeros_like(weight1)
+        scale1 = torch.ones(13568, 1, device=device, dtype=torch.float32)
+        scale2 = torch.ones_like(scale1)
+
+        monkeypatch.setattr(int8, "_get_native", lambda: NativeProxy())
+        output1, output2 = int8.int8_linear_shared_input(
+            x,
+            weight1,
+            scale1,
+            weight2,
+            scale2,
+            out_dtype=torch.float16,
+            convrot=True,
+            convrot_groupsize=16,
+        )
+
+        assert output1.shape == (109, 13568)
+        assert output2.shape == (109, 13568)
+        assert output1.dtype == torch.float16
+        assert output2.dtype == torch.float16
+        assert calls == {"fused": 1, "pair": 1, "rotate": 0, "shared": 0}
 
     def test_hadamard_properties(self, device, seed):
         """Hadamard matrix is orthogonal and symmetric."""
@@ -478,6 +1463,24 @@ class TestConvRot:
         assert q.shape == (64, 256)
         assert scale.shape == (64, 1)
         assert scale.dtype == torch.float32
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("group_size", [64, 256])
+    def test_convrot_fused_quantize_matches_composed(
+        self, device, seed, dtype, group_size
+    ):
+        """PTL fused transform+quantize preserves the composed API exactly."""
+        from omni_xpu_kernel import int8
+
+        weight = torch.randn(129, 512, device=device, dtype=dtype)
+        rotated = int8.rotate_convrot(weight, group_size)
+        expected_q, expected_scale = int8.quantize_int8_rowwise(rotated)
+        actual_q, actual_scale = int8.quantize_int8_convrot_weight(
+            weight, group_size=group_size
+        )
+
+        assert torch.equal(actual_q, expected_q)
+        assert torch.equal(actual_scale, expected_scale)
 
     def test_convrot_divisibility_error(self, device, seed):
         """Error when channels not divisible by group_size."""
@@ -811,6 +1814,153 @@ class TestXPUNativeInt8:
         stats = int8.int8_cache_stats()
         assert stats["misses"] >= 2, "Different shapes should cause cache misses"
         assert stats["size"] >= 2, "Cache should have separate entries"
+
+
+def test_h3_swiglu_input_act_uses_fused_quantized_boundary(device, seed):
+    if device.type != "xpu":
+        pytest.skip("native XPU extension required")
+
+    from omni_xpu_kernel import int8
+
+    rows, hidden, output = 37, 256, 96
+    x = torch.randn(rows, 2 * hidden, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(output, hidden, device=device, dtype=torch.bfloat16)
+    qweight, weight_scale = int8.quantize_int8_tensorwise(weight)
+
+    actual_q, actual_scale = int8.fused_swiglu_quantize_rowwise(x)
+    gate, up = x.chunk(2, dim=-1)
+    activated = torch.nn.functional.silu(gate).mul(up)
+    expected_q, expected_scale = int8.quantize_int8_rowwise(activated)
+    torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
+    torch.testing.assert_close(actual_scale, expected_scale, rtol=1e-5, atol=1e-7)
+
+    actual = int8.int8_linear(
+        x,
+        qweight,
+        weight_scale,
+        out_dtype=torch.bfloat16,
+        input_act="swiglu",
+    )
+    expected = int8.int8_linear(
+        activated,
+        qweight,
+        weight_scale,
+        out_dtype=torch.bfloat16,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+
+
+def test_h3_exact_ffn_width_swiglu_quantizer(device, seed):
+    if device.type != "xpu":
+        pytest.skip("native XPU extension required")
+
+    from omni_xpu_kernel import int8
+
+    rows, hidden = 3, 14336
+    x = torch.randn(rows, 2 * hidden, device=device, dtype=torch.bfloat16)
+    actual_q, actual_scale = int8.fused_swiglu_quantize_rowwise(x)
+    gate, up = x.chunk(2, dim=-1)
+    activated = torch.nn.functional.silu(gate).mul(up)
+    expected_q, expected_scale = int8.quantize_int8_rowwise(activated)
+
+    assert actual_q.shape == (rows, hidden)
+    assert actual_scale.shape == (rows, 1)
+    torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
+    torch.testing.assert_close(actual_scale, expected_scale, rtol=1e-5, atol=1e-7)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(37, 300), (2, 17, 256), (4, 4096)])
+def test_fused_gelu_tanh_quantizer_matches_materialized_boundary(
+    device, seed, dtype, shape
+):
+    if device.type != "xpu":
+        pytest.skip("native XPU extension required")
+
+    from omni_xpu_kernel import int8
+
+    x = torch.randn(shape, device=device, dtype=dtype)
+    actual_q, actual_scale = int8.fused_gelu_tanh_quantize_rowwise(x)
+    activated = torch.nn.functional.gelu(x, approximate="tanh")
+    expected_q, expected_scale = int8.quantize_int8_rowwise(activated)
+
+    assert actual_q.shape == x.shape
+    assert actual_scale.shape == (*x.shape[:-1], 1)
+    q_difference = (actual_q.int() - expected_q.int()).abs()
+    if dtype is torch.bfloat16:
+        assert q_difference.count_nonzero().item() == 0
+        torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)
+    else:
+        # oneAPI's native tanh and PyTorch's XPU GELU can round differently in
+        # FP16. The accepted boundary is at most one quantized LSB for fewer
+        # than one percent of elements, with matching row scales to 0.1%.
+        assert q_difference.max().item() <= 1
+        assert q_difference.count_nonzero().item() / q_difference.numel() < 0.01
+        torch.testing.assert_close(
+            actual_scale, expected_scale, rtol=1e-3, atol=1e-7
+        )
+
+
+def test_gelu_tanh_int8_linear_uses_native_fused_boundary(device, seed, monkeypatch):
+    if device.type != "xpu":
+        pytest.skip("native XPU extension required")
+
+    from omni_xpu_kernel import int8
+
+    batch, tokens, hidden, output = 2, 17, 256, 96
+    x = torch.randn(batch, tokens, hidden, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(output, hidden, device=device, dtype=torch.bfloat16)
+    qweight, weight_scale = int8.quantize_int8_tensorwise(weight)
+    x_int8, x_scale = int8.fused_gelu_tanh_quantize_rowwise(x)
+    expected = int8.int8_linear_prequantized(
+        x_int8,
+        x_scale,
+        qweight,
+        weight_scale,
+        out_dtype=torch.bfloat16,
+    )
+
+    def reject_materialized_activation(*_args, **_kwargs):
+        raise AssertionError("gelu_tanh materialized a floating activation")
+
+    monkeypatch.setattr(int8, "_apply_input_act", reject_materialized_activation)
+    actual = int8.int8_linear(
+        x,
+        qweight,
+        weight_scale,
+        out_dtype=torch.bfloat16,
+        input_act="gelu_tanh",
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_gelu_tanh_large_dispatch_keeps_materialized_route(device, seed, monkeypatch):
+    if device.type != "xpu":
+        pytest.skip("native XPU extension required")
+
+    from omni_xpu_kernel import int8
+
+    rows, hidden, output = 128, 256, 32
+    x = torch.randn(rows, hidden, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(output, hidden, device=device, dtype=torch.bfloat16)
+    qweight, weight_scale = int8.quantize_int8_tensorwise(weight)
+    original_apply = int8._apply_input_act
+    materialized = []
+
+    def record_materialized_activation(value, input_act):
+        materialized.append(input_act)
+        return original_apply(value, input_act)
+
+    monkeypatch.setattr(int8, "_apply_input_act", record_materialized_activation)
+    actual = int8.int8_linear(
+        x,
+        qweight,
+        weight_scale,
+        out_dtype=torch.bfloat16,
+        input_act="gelu_tanh",
+    )
+    assert materialized == ["gelu_tanh"]
+    assert actual.shape == (rows, output)
 
 
 if __name__ == "__main__":

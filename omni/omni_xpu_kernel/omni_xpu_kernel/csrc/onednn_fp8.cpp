@@ -6,10 +6,11 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 
+#include "oneapi/dnnl/dnnl.hpp"
+#include "oneapi/dnnl/dnnl_sycl.hpp"
 #include <torch/extension.h>
-#include <oneapi/dnnl/dnnl.hpp>
-#include <oneapi/dnnl/dnnl_sycl.hpp>
 
 #include "utils.h"
 
@@ -85,6 +86,8 @@ struct FP8PrimitiveState {
 struct FP8CacheCounters {
     int64_t hits = 0;
     int64_t misses = 0;
+    int64_t failures = 0;
+    int64_t negative_hits = 0;
 };
 
 std::mutex& fp8_cache_mutex() {
@@ -99,6 +102,11 @@ FP8CacheCounters& fp8_cache_counters() {
 
 std::unordered_map<FP8CacheKey, std::shared_ptr<FP8PrimitiveState>, FP8CacheKeyHash>& fp8_primitive_cache() {
     static std::unordered_map<FP8CacheKey, std::shared_ptr<FP8PrimitiveState>, FP8CacheKeyHash> cache;
+    return cache;
+}
+
+std::unordered_set<FP8CacheKey, FP8CacheKeyHash>& fp8_failed_primitive_cache() {
+    static std::unordered_set<FP8CacheKey, FP8CacheKeyHash> cache;
     return cache;
 }
 
@@ -186,11 +194,23 @@ std::optional<int64_t> select_chunk_n_for_shape(
     int64_t m,
     int64_t k,
     int64_t n,
-    torch::ScalarType input_type
+    torch::ScalarType input_type,
+    const torch::Device& device
 ) {
     // Known good chunk sizes for specific shapes (empirically tuned)
     if (m == 4096 && k == 4096) {
         if (n == 12288) {
+            namespace syclex = sycl::ext::oneapi::experimental;
+            const auto architecture = utils::get_queue(device)
+                .get_device()
+                .get_info<syclex::info::device::architecture>();
+            if (input_type == ST::Half &&
+                architecture == syclex::architecture::intel_gpu_ptl_h) {
+                // oneDNN 3.9 exhausts the requested register bundle for the
+                // f16 M=4096/K=4096/N=4096 primitive on PTL-H. N=2048 is the
+                // largest tested chunk that creates and executes reliably.
+                return int64_t{2048};
+            }
             return int64_t{4096};
         }
 
@@ -267,6 +287,23 @@ std::shared_ptr<FP8PrimitiveState> get_or_create_fp8_primitive_state(
         return it->second;
     }
 
+    if (fp8_failed_primitive_cache().find(key) != fp8_failed_primitive_cache().end()) {
+        ++counters.negative_hits;
+        TORCH_CHECK(
+            false,
+            "OMNI_FP8_PRIMITIVE_UNSUPPORTED:cached: device=",
+            device,
+            " M=",
+            m,
+            " K=",
+            k,
+            " N=",
+            n,
+            " bias=",
+            has_bias
+        );
+    }
+
     dnnl::engine engine = dnnl::sycl_interop::make_engine(
         queue.get_device(),
         queue.get_context()
@@ -281,31 +318,59 @@ std::shared_ptr<FP8PrimitiveState> get_or_create_fp8_primitive_state(
     attr.set_scales_mask(DNNL_ARG_WEIGHTS, 2);
     attr.set_fpmath_mode(dnnl::fpmath_mode::any, true);
 
-    dnnl::matmul::primitive_desc pd = has_bias
-        ? dnnl::matmul::primitive_desc(engine, x_md, w_md, bias_md, out_md, attr)
-        : dnnl::matmul::primitive_desc(engine, x_md, w_md, out_md, attr);
+    try {
+        dnnl::matmul::primitive_desc pd = has_bias
+            ? dnnl::matmul::primitive_desc(engine, x_md, w_md, bias_md, out_md, attr)
+            : dnnl::matmul::primitive_desc(engine, x_md, w_md, out_md, attr);
 
-    const std::string impl = pd.impl_info_str();
-    OMNI_DEBUG("fp8", "cache MISS: impl=%s (M=%ld K=%ld N=%ld wtype=%d)",
-               impl.c_str(), m, k, n, static_cast<int>(weight_type));
-    if (impl.find("ref") != std::string::npos) {
-        // Always warn about reference fallback, even without debug enabled
-        std::fprintf(stderr, "[omni_xpu::fp8] WARNING: oneDNN reference impl for M=%ld K=%ld N=%ld: %s\n",
-                     m, k, n, impl.c_str());
+        const std::string impl = pd.impl_info_str();
+        OMNI_DEBUG("fp8", "cache MISS: impl=%s (M=%ld K=%ld N=%ld wtype=%d)",
+                   impl.c_str(), m, k, n, static_cast<int>(weight_type));
+        if (impl.find("ref") != std::string::npos) {
+            // Always warn about reference fallback, even without debug enabled
+            std::fprintf(stderr, "[omni_xpu::fp8] WARNING: oneDNN reference impl for M=%ld K=%ld N=%ld: %s\n",
+                         m, k, n, impl.c_str());
+        }
+
+        auto state = std::make_shared<FP8PrimitiveState>(
+            std::move(engine),
+            std::move(x_md),
+            std::move(w_md),
+            std::move(scales_md),
+            std::move(out_md),
+            std::move(bias_md),
+            std::move(pd)
+        );
+        cache.emplace(key, state);
+        ++counters.misses;
+        return state;
+    } catch (const dnnl::error& error) {
+        const bool primitive_unsupported = error.status == dnnl_unimplemented
+            || (error.status == dnnl_runtime_error
+                && std::string(error.what()) == "could not create a primitive");
+        if (primitive_unsupported) {
+            const bool inserted = fp8_failed_primitive_cache().emplace(key).second;
+            if (inserted) {
+                ++counters.failures;
+            }
+            TORCH_CHECK(
+                false,
+                "OMNI_FP8_PRIMITIVE_UNSUPPORTED:new: device=",
+                device,
+                " M=",
+                m,
+                " K=",
+                k,
+                " N=",
+                n,
+                " bias=",
+                has_bias,
+                "; oneDNN: ",
+                error.what()
+            );
+        }
+        throw;
     }
-
-    auto state = std::make_shared<FP8PrimitiveState>(
-        std::move(engine),
-        std::move(x_md),
-        std::move(w_md),
-        std::move(scales_md),
-        std::move(out_md),
-        std::move(bias_md),
-        std::move(pd)
-    );
-    cache.emplace(key, state);
-    ++counters.misses;
-    return state;
 }
 
 template <DT InputType>
@@ -344,6 +409,7 @@ void onednn_w8a16_fp8_impl(
 void fp8_cache_clear() {
     std::lock_guard<std::mutex> lock(fp8_cache_mutex());
     fp8_primitive_cache().clear();
+    fp8_failed_primitive_cache().clear();
     fp8_cache_counters() = {};
 }
 
@@ -354,6 +420,16 @@ std::tuple<int64_t, int64_t, int64_t> fp8_cache_stats() {
         counters.hits,
         counters.misses,
         static_cast<int64_t>(fp8_primitive_cache().size()),
+    };
+}
+
+std::tuple<int64_t, int64_t, int64_t> fp8_failure_cache_stats() {
+    std::lock_guard<std::mutex> lock(fp8_cache_mutex());
+    const auto& counters = fp8_cache_counters();
+    return {
+        counters.failures,
+        counters.negative_hits,
+        static_cast<int64_t>(fp8_failed_primitive_cache().size()),
     };
 }
 
@@ -430,7 +506,13 @@ torch::Tensor onednn_w8a16_fp8(
 
     // Check N-chunking first: some large-N shapes are split into smaller chunks
     // that individually satisfy the per-primitive shape constraints.
-    auto selected_chunk_n = select_chunk_n_for_shape(m, k, n, x_materialized.scalar_type());
+    auto selected_chunk_n = select_chunk_n_for_shape(
+        m,
+        k,
+        n,
+        x_materialized.scalar_type(),
+        x_materialized.device()
+    );
 
     // Shape guard: only enable FP8 for shapes where it's faster than bf16 GEMM.
     // Empirically on BMG/B60, FP8 is beneficial when N <= 4096, M <= 8192, K >= 2048.

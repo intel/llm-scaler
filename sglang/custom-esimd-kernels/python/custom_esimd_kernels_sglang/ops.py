@@ -534,16 +534,19 @@ def esimd_resadd_norm_gemv2_fp8_pert(
     norm_weight: torch.Tensor,
     w0: torch.Tensor, s0: torch.Tensor, o0: torch.Tensor,
     w1: torch.Tensor, s1: torch.Tensor, o1: torch.Tensor,
+    new_residual: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
     """Fused ResidualAdd + RMSNorm + 2-matrix FP8 GEMV.
 
     For input_layernorm + GDN in_proj (qkvz + ba projections).
-    residual updated in-place. o0/o1 are output buffers.
+    o0/o1 are output buffers. ``new_residual`` is written with
+    ``hidden + residual`` (fp16) by the kernel, removing the separate
+    aten::add dispatch on the caller side.
     """
     return _ops.esimd_resadd_norm_gemv2_fp8_pert(
         hidden_states, residual, norm_weight,
-        w0, s0, o0, w1, s1, o1, eps)
+        w0, s0, o0, w1, s1, o1, new_residual, eps)
 
 
 def esimd_norm_gemv_fp8_pert(

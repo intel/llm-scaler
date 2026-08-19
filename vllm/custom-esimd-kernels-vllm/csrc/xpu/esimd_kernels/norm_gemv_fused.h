@@ -37,10 +37,14 @@ SYCL_ESIMD_FUNCTION inline simd<float, VL> fp8_dequant_norm(
     simd<uint16_t, VL> fp16_bits;
 
     if (fp8_mode == 0) {
-        simd<uint16_t, VL> fp8_exp  = (u16 >> 3) & 0xF;
-        simd<uint16_t, VL> fp8_mant = u16 & 0x7;
-        fp16_bits = (fp8_sign << 15) | ((fp8_exp + 8) << 10) | (fp8_mant << 7);
-        fp16_bits.merge(fp8_sign << 15, fp8_exp == 0);
+        u16 <<= 8;
+        simd<int16_t, VL> shifted =
+            u16.template bit_cast_view<int16_t>().read() >> 1;
+        fp16_bits =
+            shifted.template bit_cast_view<uint16_t>().read() & 0xBFFF;
+        simd<fp16, VL> wh =
+            fp16_bits.template bit_cast_view<fp16>().read();
+        return simd<float, VL>(wh * fp16(256.0f));
     } else {
         simd<uint16_t, VL> fp8_exp  = (u16 >> 2) & 0x1F;
         simd<uint16_t, VL> fp8_mant = u16 & 0x3;
@@ -146,5 +150,61 @@ inline void norm_gemv_fp8_pert_host(
                 x_ptr, z_ptr, norm_w_ptr,
                 gemv_weight, gemv_scale, output,
                 N, HV, V, eps, fp8_mode});
+    });
+}
+
+/* Fused RMSNormGated + E4M3 block-scaled GEMV (128x128 scales). */
+struct NormGEMV_fp8_blockscale_kernel {
+    const fp16* x_ptr;
+    const fp16* z_ptr;
+    const fp16* norm_w_ptr;
+    const uint8_t* gemv_weight;
+    const float* gemv_scale;  // [ceil(N/128), K/128]
+    fp16* output;
+    int N;
+    int HV;
+    int V;
+    int Kb;
+    float eps;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        const int n = item.get_group(0);
+        if (n >= N) return;
+        const int K = HV * V;
+        const float* scale_row = gemv_scale + (size_t)(n / 128) * Kb;
+        simd<float, 128> norm_w = block_load<fp16, 128>(norm_w_ptr);
+        simd<float, 128> acc = 0.0f;
+
+        for (int h = 0; h < HV; h++) {
+            const int offset = h * V;
+            simd<float, 128> x_f = block_load<fp16, 128>(x_ptr + offset);
+            simd<float, 128> z_f = block_load<fp16, 128>(z_ptr + offset);
+            const float mean_sq = reduce128(x_f * x_f) * (1.0f / V);
+            const float inv_rms = sycl::ext::intel::esimd::rsqrt(
+                simd<float, 8>(mean_sq + eps))[0];
+            simd<float, 128> normed = x_f * inv_rms * norm_w;
+            normed *= z_f / (1.0f + sycl::ext::intel::esimd::exp(-z_f));
+
+            simd<uint8_t, 128> w_raw = block_load<uint8_t, 128>(
+                gemv_weight + (size_t)n * K + offset);
+            simd<float, 128> w_f = fp8_dequant_norm<128>(w_raw, 0);
+            w_f *= scale_row[offset / 128];
+            acc += normed * w_f;
+        }
+        output[n] = fp16(reduce128(acc));
+    }
+};
+
+inline void norm_gemv_fp8_blockscale_host(
+    const fp16* x_ptr, const fp16* z_ptr, const fp16* norm_w_ptr,
+    const uint8_t* gemv_weight, const float* gemv_scale, fp16* output,
+    int N, int HV, int V, float eps, sycl::queue& q) {
+    const int Kb = HV * V / 128;
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(N, 1),
+            NormGEMV_fp8_blockscale_kernel{
+                x_ptr, z_ptr, norm_w_ptr, gemv_weight, gemv_scale, output,
+                N, HV, V, Kb, eps});
     });
 }

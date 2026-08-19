@@ -9,11 +9,13 @@ sdp = None
 norm = None
 rotary = None
 linear_fp8 = None
+int8 = None
+layout = None
 
 
 def probe():
     """Probe omni_xpu_kernel and populate available submodules."""
-    global version, sdp, norm, rotary, linear_fp8
+    global version, sdp, norm, rotary, linear_fp8, int8, layout
 
     try:
         import omni_xpu_kernel as pkg
@@ -47,15 +49,29 @@ def probe():
 
     try:
         from omni_xpu_kernel import linear as _linear
-        linear_fp8 = _linear.onednn_w8a16_fp8
+        linear_fp8 = getattr(_linear, "try_onednn_w8a16_fp8", _linear.onednn_w8a16_fp8)
         modules["linear_fp8"] = True
     except (ImportError, AttributeError):
         modules["linear_fp8"] = False
 
+    try:
+        from omni_xpu_kernel import int8 as _int8
+        int8 = _int8
+        modules["int8"] = True
+    except ImportError:
+        modules["int8"] = False
+
+    try:
+        from omni_xpu_kernel import layout as _layout
+        layout = _layout
+        modules["layout"] = True
+    except ImportError:
+        modules["layout"] = False
+
     available = [k for k, v in modules.items() if v]
     missing = [k for k, v in modules.items() if not v]
 
-    log.info("[OmniXPU] omni_xpu_kernel %s — available: %s%s",
+    log.info("[OmniXPU] omni_xpu_kernel %s - available: %s%s",
              version, ", ".join(available) if available else "none",
              f" | missing: {', '.join(missing)}" if missing else "")
 
@@ -68,4 +84,6 @@ def summary():
         "norm": norm is not None,
         "rotary": rotary is not None,
         "linear_fp8": linear_fp8 is not None,
+        "int8": int8 is not None,
+        "layout": layout is not None,
     }

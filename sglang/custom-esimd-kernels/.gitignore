@@ -1,5 +1,5 @@
 *.so
-build/
+build*/
 __pycache__/
 *.egg-info/
 *.egg-link

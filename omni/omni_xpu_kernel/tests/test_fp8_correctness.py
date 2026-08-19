@@ -114,6 +114,48 @@ class TestFP8GEMMCorrectness:
         stats = linear.fp8_cache_stats()
         assert stats["misses"] == 2
         assert stats["size"] == 2
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    def test_onednn_w8a16_fp8_negative_cache_skips_repeated_failure(self, xpu_device):
+        """An unsupported descriptor should attempt primitive creation only once."""
+        from omni_xpu_kernel import linear
+
+        linear.fp8_cache_clear()
+        assert linear.fp8_failure_cache_stats() == {
+            "failures": 0,
+            "negative_hits": 0,
+            "size": 0,
+        }
+
+        case = make_fp8_case(
+            xpu_device,
+            m=4205,
+            n=840,
+            k=3360,
+            dtype=torch.float16,
+            has_bias=False,
+        )
+
+        output_first = linear.try_onednn_w8a16_fp8(*case)
+        if output_first is not None:
+            pytest.skip("oneDNN supports the Boogu KV projection shape on this device")
+
+        stats = linear.fp8_failure_cache_stats()
+        assert stats == {"failures": 1, "negative_hits": 0, "size": 1}
+
+        output_second = linear.try_onednn_w8a16_fp8(*case)
+        assert output_second is None
+        stats = linear.fp8_failure_cache_stats()
+        assert stats["failures"] == 1
+        assert stats["negative_hits"] == 1
+        assert stats["size"] == 1
+
+        linear.fp8_cache_clear()
+        assert linear.fp8_failure_cache_stats() == {
+            "failures": 0,
+            "negative_hits": 0,
+            "size": 0,
+        }
     
     @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
     @pytest.mark.parametrize("m", [1, 16, 67]) # Including non-power-of-two shape

@@ -9,15 +9,13 @@ services:
     shm_size: "32gb"
     working_dir: /llm
     entrypoint: >
-      bash -lc "source /opt/intel/oneapi/setvars.sh --force &&
-      vllm serve
+      bash -lc "exec vllm serve
       --model /llm/models/DeepSeek-R1-Distill-Qwen-7B
       --served-model-name model
       --dtype=float16
       --enforce-eager
       --port 8008
       --host 0.0.0.0
-      --disable-log-requests
       --trust-remote-code
       --gpu-memory-util=0.9
       --no-enable-prefix-caching
@@ -45,15 +43,13 @@ services:
     shm_size: "32gb"
     working_dir: /llm
     entrypoint: >
-      bash -lc "source /opt/intel/oneapi/setvars.sh --force &&
-      vllm serve
+      bash -lc "exec vllm serve
       --model /llm/models/DeepSeek-R1-Distill-Qwen-7B
       --served-model-name model
       --dtype=float16
       --enforce-eager
       --port 8009
       --host 0.0.0.0
-      --disable-log-requests
       --trust-remote-code
       --gpu-memory-util=0.9
       --no-enable-prefix-caching
@@ -78,4 +74,3 @@ services:
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg
     restart: always
-
