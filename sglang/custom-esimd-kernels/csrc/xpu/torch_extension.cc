@@ -100,6 +100,45 @@ TORCH_LIBRARY(custom_esimd_kernels_sglang, m) {
         "int n_tokens, int hidden, int intermediate, int top_k) -> Tensor");
   m.impl("esimd_moe_down_q6k", torch::kXPU, &esimd_moe_down_q6k);
 
+  m.def("esimd_shared_expert_q8(Tensor x, Tensor gu_qs, Tensor gu_sc, "
+        "Tensor d_qs, Tensor d_sc, Tensor wg, int inter_s) -> Tensor");
+  m.impl("esimd_shared_expert_q8", torch::kXPU, &esimd_shared_expert_q8);
+
+  m.def("esimd_moe_forward_full_gguf(Tensor x, Tensor logits, "
+        "Tensor gate_ql, Tensor gate_sc, Tensor gate_mn, "
+        "Tensor up_ql, Tensor up_sc, Tensor up_mn, "
+        "Tensor down_ql, Tensor down_qh, Tensor down_sc, Tensor down_mn, "
+        "Tensor gu_qs, Tensor gu_sc, Tensor d_qs, Tensor d_sc, Tensor wg, "
+        "int n_experts, int top_k, int intermediate, int inter_s, "
+        "bool down_is_q6, bool renorm) -> Tensor");
+  m.impl("esimd_moe_forward_full_gguf", torch::kXPU, &esimd_moe_forward_full_gguf);
+
+  m.def("esimd_moe_forward_full_gguf_norm(Tensor h, Tensor residual, "
+        "Tensor norm_w, float eps, Tensor router_w, "
+        "Tensor gate_ql, Tensor gate_sc, Tensor gate_mn, "
+        "Tensor up_ql, Tensor up_sc, Tensor up_mn, "
+        "Tensor down_ql, Tensor down_qh, Tensor down_sc, Tensor down_mn, "
+        "Tensor gu_qs, Tensor gu_sc, Tensor d_qs, Tensor d_sc, Tensor wg, "
+        "int n_experts, int top_k, int intermediate, int inter_s, "
+        "bool down_is_q6, bool renorm) -> Tensor[]");
+  m.impl("esimd_moe_forward_full_gguf_norm", torch::kXPU,
+         &esimd_moe_forward_full_gguf_norm);
+
+  // Fused (resadd + GemmaRMSNorm) + q8_0 GEMV [+ optional fp16 GEMV] for the
+  // decode attention input projection. `w1`/`o1` empty => no second GEMV.
+  m.def("esimd_resadd_norm_gemv_q8_ba(Tensor h, Tensor residual, "
+        "Tensor nw, float eps, Tensor(b!) xn, Tensor(e!) nr, "
+        "Tensor w0, Tensor s0, Tensor(c!) o0, "
+        "Tensor w1, Tensor(d!) o1) -> ()");
+  m.impl("esimd_resadd_norm_gemv_q8_ba", torch::kXPU,
+         &esimd_resadd_norm_gemv_q8_ba);
+
+  // Fused RMSNormGated + q8_0 GEMV for the GGUF GDN out_proj.
+  m.def("esimd_norm_gemv_q8_0(Tensor x, Tensor z, Tensor nw, Tensor(a!) y, "
+        "Tensor w0, Tensor s0, Tensor(b!) o0, "
+        "int HV, int V, float eps) -> ()");
+  m.impl("esimd_norm_gemv_q8_0", torch::kXPU, &esimd_norm_gemv_q8_0);
+
   // GGUF q4_0 GEMM (prefill / M>=2) via DPAS. Same interleaved weight layout.
   m.def("esimd_gemm_q4_0(Tensor input, Tensor weight, Tensor weight_scale, "
         "Tensor output) -> Tensor");
@@ -130,6 +169,7 @@ TORCH_LIBRARY(custom_esimd_kernels_sglang, m) {
         "Tensor norm_weight, "
         "Tensor w0, Tensor s0, Tensor o0, "
         "Tensor w1, Tensor s1, Tensor o1, "
+        "Tensor new_residual, "
         "float eps) -> Tensor");
   m.impl("esimd_resadd_norm_gemv2_fp8_pert", torch::kXPU, &esimd_resadd_norm_gemv2_fp8_pert);
 

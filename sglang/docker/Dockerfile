@@ -95,6 +95,8 @@ ARG http_proxy
 ARG https_proxy
 ARG no_proxy=localhost,127.0.0.1,::1,intel.com,.intel.com
 ARG DPCPP_SYCL_TARGET=bmg
+ARG ONECCL_INSTALLER="intel-oneccl-2021.15.9.14_offline.sh"
+ARG ONECCL_INSTALLER_SHA256="f7ab81b6ed1b10dd35fadec366a78046d8af214888dfd625047ce8953d5aa4ef"
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 ENV http_proxy=${http_proxy} https_proxy=${https_proxy} no_proxy=${no_proxy}
 ENV TORCH_XPU_ARCH_LIST=${DPCPP_SYCL_TARGET}
@@ -141,6 +143,16 @@ RUN --mount=type=bind,from=builder,source=/root/wheels,target=/tmp/wheels \
  # --- runtime helpers (eval scripts: gsm8k, etc.) ---
  && uv pip install --python /opt/venv/bin/python \
         pytest expecttest ray huggingface_hub \
+ # --- Replace the torch-bundled oneCCL in /opt/venv/lib with links to
+ #     oneCCL 2021.15 (libtorch_xpu.so resolves libccl.so.1 through its
+ #     RPATH into /opt/venv/lib). ---
+ && uv pip uninstall --python /opt/venv/bin/python oneccl oneccl-devel || true \
+ && rm -f /opt/venv/lib/libccl.so /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so.1.0 \
+        /opt/venv/lib/libccl_openmp.so /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so.0.1 \
+ && ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1.0 /opt/venv/lib/libccl.so.1 \
+ && ln -sf /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so \
+ && ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl_openmp.so.0.1 /opt/venv/lib/libccl_openmp.so.0 \
+ && ln -sf /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so \
  && chmod +x /llm-scaler/sglang/scripts/*.sh \
  # --- Size cleanup: drop caches + bytecode ---
  && find /opt/venv /usr/local/lib/python3* -name "*.pyc" -delete 2>/dev/null || true \
@@ -150,4 +162,12 @@ RUN --mount=type=bind,from=builder,source=/root/wheels,target=/tmp/wheels \
  && rm -rf /root/.cache /root/.cmake /var/tmp/* /var/lib/apt/lists/*
 
 WORKDIR /llm-scaler/sglang
+
+# NOTE: no global LD_PRELOAD for oneCCL. The 2021.15 libccl.so.1 carries no
+# RPATH/RUNPATH, so preloading it into *every* process (including /bin/bash)
+# fails with "libsvml.so: cannot open shared object file" — its oneAPI runtime
+# deps only live in /opt/venv/lib, which is not on the loader search path.
+# The /opt/venv/lib/libccl.so.1 -> 2021.15 symlink above is what makes torch
+# pick up this oneCCL: libtorch_xpu.so has DT_RPATH=$ORIGIN/../../../..
+# (= /opt/venv/lib), which is inherited by its transitive dependencies.
 ENTRYPOINT ["bash", "-c", "exec sglang serve \"$@\"", "--"]
