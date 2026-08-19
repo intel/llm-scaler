@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <tuple>
 #include <unordered_map>
 
@@ -45,6 +46,7 @@ struct CachedPrimitive {
 
 static std::map<CacheKey, CachedPrimitive> g_cache;       // plain GEMM
 static std::map<CacheKey, CachedPrimitive> g_cache_sum;   // GEMM + append_sum
+static std::map<CacheKey, CachedPrimitive> g_cache_zp;    // per-block zero-point GEMM (TINT4)
 static std::mutex g_cache_mutex;
 
 // Per-device engine/stream (keyed by device index for multi-XPU support)
@@ -150,6 +152,86 @@ static void onednn_int4_gemm_kernel(
     cached->prim.execute(cached->strm, args);
 }
 
+// TINT4/torchao variant: unsigned u4 weights + per-block zero points + per-block
+// f16 scales. w = (q - zp) * scale exactly inside oneDNN (no Python correction).
+template <dnnl::memory::data_type ActDT>
+static CachedPrimitive& get_or_create_primitive_zp(
+    const CacheKey& key,
+    int64_t M, int64_t K, int64_t N, int64_t group_size,
+    const dnnl::engine& eng,
+    const dnnl::stream& strm
+) {
+    auto it = g_cache_zp.find(key);
+    if (it != g_cache_zp.end()) return it->second;
+
+    CachedPrimitive cp;
+    cp.eng = eng;
+    cp.strm = strm;
+
+    cp.src_md = dnnl::memory::desc({M, K}, ActDT, dnnl::memory::format_tag::ab);
+    cp.wei_md = dnnl::memory::desc({K, N}, dnnl::memory::data_type::u4,
+                                   dnnl::memory::format_tag::ba);
+    cp.dst_md = dnnl::memory::desc({M, N}, ActDT, dnnl::memory::format_tag::ab);
+
+    int64_t num_groups = K / group_size;
+    cp.scale_md = dnnl::memory::desc({num_groups, N}, dnnl::memory::data_type::f16,
+                                     dnnl::memory::format_tag::ab);
+    cp.zp_md = dnnl::memory::desc({num_groups, N}, dnnl::memory::data_type::u8,
+                                  dnnl::memory::format_tag::ab);
+
+    dnnl::primitive_attr attr;
+    attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1),
+                    {group_size, 1}, dnnl::memory::data_type::f16);
+    attr.set_zero_points(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1),
+                         {group_size, 1}, dnnl::memory::data_type::u8);
+    attr.set_fpmath_mode(dnnl::fpmath_mode::any, true);
+
+    dnnl::matmul::primitive_desc pd(cp.eng, cp.src_md, cp.wei_md, cp.dst_md, attr);
+
+    std::string impl_info = pd.impl_info_str();
+    fprintf(stderr, "[onednn_int4_gemm_zp] CACHE MISS: impl=%s (M=%ld K=%ld N=%ld gs=%ld)\n",
+            impl_info.c_str(), M, K, N, group_size);
+    if (impl_info.find("ref") != std::string::npos) {
+        fprintf(stderr, "[onednn_int4_gemm_zp] WARNING: reference fallback (slow)\n");
+    }
+
+    cp.prim = dnnl::matmul(pd);
+
+    auto [ins, _] = g_cache_zp.emplace(key, std::move(cp));
+    return ins->second;
+}
+
+template <dnnl::memory::data_type ActDT>
+static void onednn_int4_gemm_zp_kernel(
+    void* act_ptr,
+    void* weight_ptr,
+    void* scales_ptr,
+    void* zero_ptr,
+    void* output_ptr,
+    int64_t M, int64_t K, int64_t N,
+    int64_t group_size,
+    const torch::Device& device
+) {
+    CacheKey key(static_cast<int>(ActDT), M, K, N, group_size);
+
+    CachedPrimitive* cached = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        auto& [eng, strm] = ensure_engine_initialized(device);
+        cached = &get_or_create_primitive_zp<ActDT>(key, M, K, N, group_size, eng, strm);
+    }
+
+    std::unordered_map<int, dnnl::memory> args = {
+        {DNNL_ARG_SRC,                                  dnnl::memory(cached->src_md,   cached->eng, act_ptr)},
+        {DNNL_ARG_WEIGHTS,                              dnnl::memory(cached->wei_md,   cached->eng, weight_ptr)},
+        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS,       dnnl::memory(cached->scale_md, cached->eng, scales_ptr)},
+        {DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS,  dnnl::memory(cached->zp_md,    cached->eng, zero_ptr)},
+        {DNNL_ARG_DST,                                  dnnl::memory(cached->dst_md,   cached->eng, output_ptr)},
+    };
+
+    cached->prim.execute(cached->strm, args);
+}
+
 // GEMM with append_sum: dst = GEMM(act, wgt) + dst
 // Caller must pre-fill dst with the residual before calling this.
 // Activation: f16, Weights: u4, Dst: bf16.
@@ -189,7 +271,8 @@ static void onednn_int4_gemm_sum_kernel(
 torch::Tensor onednn_int4_gemm_preconverted(
     const torch::Tensor& act,
     const torch::Tensor& packed_u4,
-    const torch::Tensor& scales_f16
+    const torch::Tensor& scales_f16,
+    std::optional<torch::Tensor> zp_u8 = std::nullopt
 );
 
 // Convenience wrapper: converts signed INT4 packed → u4 and bf16 scales → f16 per call
@@ -211,7 +294,8 @@ torch::Tensor onednn_int4_gemm(
 torch::Tensor onednn_int4_gemm_preconverted(
     const torch::Tensor& act,
     const torch::Tensor& packed_u4,
-    const torch::Tensor& scales_f16
+    const torch::Tensor& scales_f16,
+    std::optional<torch::Tensor> zp_u8
 ) {
     TORCH_CHECK(act.dim() == 2, "act must be 2D [M, K], got ", act.dim(), "D");
     TORCH_CHECK(packed_u4.dim() == 2, "packed_u4 must be 2D [N, K/2], got ", packed_u4.dim(), "D");
@@ -242,33 +326,61 @@ torch::Tensor onednn_int4_gemm_preconverted(
     torch::Tensor output = torch::empty({M, N},
         torch::TensorOptions().dtype(act.scalar_type()).device(act.device()));
 
-    // Persistent scalar zero-point = 8 on XPU
-    static torch::Tensor zp;
-    if (!zp.defined() || zp.device() != act.device()) {
-        zp = torch::tensor({8}, torch::TensorOptions().dtype(torch::kUInt8).device(act.device()));
-    }
-
     torch::Tensor act_c = act.contiguous();
 
-    switch (act_c.scalar_type()) {
-        case torch::kBFloat16:
-            onednn_int4_gemm_kernel<dnnl::memory::data_type::bf16>(
-                act_c.data_ptr(), packed_u4.data_ptr(), scales_f16.data_ptr(),
-                zp.data_ptr(), output.data_ptr(), M, K, N, group_size, act_c.device());
-            break;
-        case torch::kFloat16:
-            onednn_int4_gemm_kernel<dnnl::memory::data_type::f16>(
-                act_c.data_ptr(), packed_u4.data_ptr(), scales_f16.data_ptr(),
-                zp.data_ptr(), output.data_ptr(), M, K, N, group_size, act_c.device());
-            break;
-        case torch::kFloat:
-            onednn_int4_gemm_kernel<dnnl::memory::data_type::f32>(
-                act_c.data_ptr(), packed_u4.data_ptr(), scales_f16.data_ptr(),
-                zp.data_ptr(), output.data_ptr(), M, K, N, group_size, act_c.device());
-            break;
-        default:
-            TORCH_CHECK(false, "Unsupported activation dtype: ", act_c.scalar_type(),
-                        ". Only bf16, f16, f32 are supported.");
+    if (zp_u8.has_value()) {
+        // TINT4/torchao: per-block zero points, w = (q - zp) * scale.
+        const torch::Tensor& zpt = zp_u8.value();
+        TORCH_CHECK(zpt.dim() == 2, "zp_u8 must be 2D [G, N]");
+        TORCH_CHECK(zpt.scalar_type() == torch::kUInt8, "zp_u8 must be uint8");
+        TORCH_CHECK(zpt.size(0) == num_groups && zpt.size(1) == N,
+                    "zp_u8 must be [G, N] = [", num_groups, ", ", N, "]");
+        switch (act_c.scalar_type()) {
+            case torch::kBFloat16:
+                onednn_int4_gemm_zp_kernel<dnnl::memory::data_type::bf16>(
+                    act_c.data_ptr(), packed_u4.data_ptr(), scales_f16.data_ptr(),
+                    zpt.data_ptr(), output.data_ptr(), M, K, N, group_size, act_c.device());
+                break;
+            case torch::kFloat16:
+                onednn_int4_gemm_zp_kernel<dnnl::memory::data_type::f16>(
+                    act_c.data_ptr(), packed_u4.data_ptr(), scales_f16.data_ptr(),
+                    zpt.data_ptr(), output.data_ptr(), M, K, N, group_size, act_c.device());
+                break;
+            case torch::kFloat:
+                onednn_int4_gemm_zp_kernel<dnnl::memory::data_type::f32>(
+                    act_c.data_ptr(), packed_u4.data_ptr(), scales_f16.data_ptr(),
+                    zpt.data_ptr(), output.data_ptr(), M, K, N, group_size, act_c.device());
+                break;
+            default:
+                TORCH_CHECK(false, "Unsupported activation dtype: ", act_c.scalar_type(),
+                            ". Only bf16, f16, f32 are supported.");
+        }
+    } else {
+        // Persistent scalar zero-point = 8 on XPU
+        static torch::Tensor zp;
+        if (!zp.defined() || zp.device() != act.device()) {
+            zp = torch::tensor({8}, torch::TensorOptions().dtype(torch::kUInt8).device(act.device()));
+        }
+        switch (act_c.scalar_type()) {
+            case torch::kBFloat16:
+                onednn_int4_gemm_kernel<dnnl::memory::data_type::bf16>(
+                    act_c.data_ptr(), packed_u4.data_ptr(), scales_f16.data_ptr(),
+                    zp.data_ptr(), output.data_ptr(), M, K, N, group_size, act_c.device());
+                break;
+            case torch::kFloat16:
+                onednn_int4_gemm_kernel<dnnl::memory::data_type::f16>(
+                    act_c.data_ptr(), packed_u4.data_ptr(), scales_f16.data_ptr(),
+                    zp.data_ptr(), output.data_ptr(), M, K, N, group_size, act_c.device());
+                break;
+            case torch::kFloat:
+                onednn_int4_gemm_kernel<dnnl::memory::data_type::f32>(
+                    act_c.data_ptr(), packed_u4.data_ptr(), scales_f16.data_ptr(),
+                    zp.data_ptr(), output.data_ptr(), M, K, N, group_size, act_c.device());
+                break;
+            default:
+                TORCH_CHECK(false, "Unsupported activation dtype: ", act_c.scalar_type(),
+                            ". Only bf16, f16, f32 are supported.");
+        }
     }
 
     return output;

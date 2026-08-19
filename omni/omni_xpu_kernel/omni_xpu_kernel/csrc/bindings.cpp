@@ -62,7 +62,10 @@ namespace svdq {
     std::tuple<torch::Tensor, torch::Tensor> quantize_svdq_act_int4(const torch::Tensor& input, int64_t group_size);
     std::tuple<torch::Tensor, torch::Tensor> quantize_svdq_act_uint4(const torch::Tensor& input, int64_t group_size);
     torch::Tensor onednn_int4_gemm(const torch::Tensor& act, const torch::Tensor& packed, const torch::Tensor& wscales);
-    torch::Tensor onednn_int4_gemm_preconverted(const torch::Tensor& act, const torch::Tensor& packed_u4, const torch::Tensor& scales_f16);
+    torch::Tensor onednn_int4_gemm_preconverted(
+        const torch::Tensor& act, const torch::Tensor& packed_u4,
+        const torch::Tensor& scales_f16,
+        std::optional<torch::Tensor> zp_u8);
     void onednn_int4_gemm_add_to_output(const torch::Tensor& act, const torch::Tensor& packed_u4, const torch::Tensor& scales_f16, torch::Tensor& dst);
     void fused_convert_add(torch::Tensor& out, const torch::Tensor& result, const torch::Tensor& residual);
     torch::Tensor fused_smooth_convert(const torch::Tensor& x, const torch::Tensor& smooth_factor);
@@ -425,10 +428,13 @@ PYBIND11_MODULE(_C, m) {
 
     svdq.def("onednn_int4_gemm_preconverted", &omni_xpu::svdq::onednn_int4_gemm_preconverted,
         "Fused INT4 dequant + GEMM using oneDNN u4 matmul (pre-converted weights)\n"
-        "Accepts already-converted u4 weights (packed^0x88) and f16 scales\n"
+        "Accepts already-converted u4 weights (packed^0x88) and f16 scales; "
+        "optional zp_u8 [G, N] enables TINT4/torchao per-block zero points "
+        "w = (q - zp) * scale inside oneDNN\n"
         "Input: act [M, K] bf16/f16/f32, packed_u4 [N, K/2] uint8, scales_f16 [G, N] f16\n"
         "Output: [M, N] same dtype as act",
-        py::arg("act"), py::arg("packed_u4"), py::arg("scales_f16"));
+        py::arg("act"), py::arg("packed_u4"), py::arg("scales_f16"),
+        py::arg("zp_u8") = py::none());
 
     svdq.def("onednn_int4_gemm_add_to_output", &omni_xpu::svdq::onednn_int4_gemm_add_to_output,
         "Fused INT4 GEMM + accumulate into bf16 output using oneDNN append_sum post-op\n"
