@@ -44,10 +44,13 @@ ESIMD_INLINE void chunkGatedDeltaRuleExtendFp16(
   uint8_t* betaState,     // fp32 post-sigmoid
   uint8_t* stateBuf,      // StateT in/out: initial_state on entry, last_state on exit
   uint8_t* oState,
+  uint8_t* hState,        // StateT out, may be null: per-chunk intermediate states
+                          // [total_chunks, H_v, V, K]; h[i] = state after i chunks
   uint32_t* cuSeqlens,
   uint32_t headQk,        // H_k: headV must be a multiple of this (GQA on GDN)
   uint32_t headV,
   uint32_t headDim,       // = 128
+  uint32_t hChunkSize,    // token stride between successive h snapshots (0 = disabled)
   float    qScale,
   sycl::nd_item<2>& ndi)
 {
@@ -106,10 +109,43 @@ ESIMD_INLINE void chunkGatedDeltaRuleExtendFp16(
     fp32InS_persistent.select<128, 1>(r * 128) = raw;
   }
 
+  // Base pointer to this thread's 8-row slab inside h, when the caller asked
+  // for per-chunk snapshots. h is packed per sequence: sequence s owns
+  // ceil(L_s / hChunkSize) entries, so our base is the running sum over the
+  // preceding sequences (n_seqs is small, so the serial scan is cheap).
+  const bool emitH = (hState != nullptr) && (hChunkSize > 0);
+  StateT* hMyRows = nullptr;
+  if (emitH) {
+    uint32_t hSeqOffset = 0;
+    for (uint32_t s = 0; s < seqIdx; s++) {
+      const uint32_t len = cuSeqlens[s + 1] - cuSeqlens[s];
+      hSeqOffset += (len + hChunkSize - 1) / hChunkSize;
+    }
+    hMyRows = (StateT*)hState
+            + (size_t)hSeqOffset * stateSeqElems
+            + headIdx * stateHeadElems
+            + (hh * 8) * headDim;
+  }
+  // Snapshot cursor: avoids a division per token.
+  uint32_t hNextSnapTok = 0;
+  uint32_t hSnapIdx = 0;
+
   // ---- Per-token loop --------------------------------------------------
   namespace xens = sycl::ext::intel::experimental::esimd;
   for (uint32_t tRel = 0; tRel < nTokSeq; tRel++) {
     const uint32_t t = tStart + tRel;
+
+    // --- h snapshot: state *before* this token, i.e. after hSnapIdx chunks --
+    if (emitH && tRel == hNextSnapTok) {
+      StateT* hDst = hMyRows + (size_t)hSnapIdx * stateSeqElems;
+      #pragma unroll
+      for (int r = 0; r < 8; r++) {
+        simd<StateT, 128> hv = fp32InS_persistent.select<128, 1>(r * 128);
+        block_store<StateT, 128>(hDst + r * headDim, hv);
+      }
+      hSnapIdx += 1;
+      hNextSnapTok += hChunkSize;
+    }
 
     // --- Load q, k, v for the token's head -----------------------------
     simd<fp16, 128> q_fp16 = block_load<fp16, 128>(qPtr + t * qkTokStride + kHeadIdx * headDim);

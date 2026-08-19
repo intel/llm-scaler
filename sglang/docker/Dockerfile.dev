@@ -46,6 +46,8 @@ ARG SGL_KERNEL_UPSTREAM_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
 # sgl-kernel-xpu has no release tags; pin to the exact upstream/main commit
 # the analytics-zoo/dev-bmg fork was branched from.
 ARG SGL_KERNEL_UPSTREAM_COMMIT=ea5c70f0909bcd55ceaf1803302651fc0593b64d
+ARG ONECCL_INSTALLER="intel-oneccl-2021.15.9.14_offline.sh"
+ARG ONECCL_INSTALLER_SHA256="f7ab81b6ed1b10dd35fadec366a78046d8af214888dfd625047ce8953d5aa4ef"
 
 SHELL ["bash", "-c"]
 
@@ -70,6 +72,48 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         gdb vim less htop procps && \
     curl -LsSf https://astral.sh/uv/install.sh | sh && \
     mkdir -p ${WHEELS}
+
+# ---------------------------------------------------------------------------
+# Intel(R) oneAPI Collective Communications Library (oneCCL) 2021.15.9, which
+# contains several enhancements for Intel(R) Arc(TM) Pro graphics.
+# For details, please refer to:
+# https://github.com/uxlfoundation/oneCCL/releases/tag/2021.15.9
+#
+# Only the runtime payload is extracted from the offline installer (a full
+# `-a --silent` install would drag in the whole oneAPI installer layout), and
+# it replaces the oneCCL shipped by the OMIX base image.
+# ---------------------------------------------------------------------------
+RUN set -eo pipefail && \
+    curl -fL --retry 3 -o "${ONECCL_INSTALLER}" "https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.9/${ONECCL_INSTALLER}" && \
+    printf "%s  %s\n" "${ONECCL_INSTALLER_SHA256}" "${ONECCL_INSTALLER}" > /tmp/oneccl.sha256 && \
+    sha256sum -c /tmp/oneccl.sha256 && \
+    rm -f /tmp/oneccl.sha256 && \
+    bash "${ONECCL_INSTALLER}" -s -x -f /tmp && \
+    ONECCL_CUP="/tmp/${ONECCL_INSTALLER%.sh}/packages/intel.oneapi.lin.ccl.runtime,v=2021.15.9+13/cupPayload.cup" && \
+    ONECCL_DST="/tmp/oneccl-runtime" && \
+    python3 -m zipfile -e "${ONECCL_CUP}" "${ONECCL_DST}" && \
+    ONECCL_LIB="${ONECCL_DST}/_installdir/ccl/2021.15/lib" && \
+    rm -f "${ONECCL_LIB}/libccl.so" "${ONECCL_LIB}/libccl.so.1" "${ONECCL_LIB}/libccl_openmp.so" "${ONECCL_LIB}/libccl_openmp.so.0" && \
+    ln -sf libccl.so.1 "${ONECCL_LIB}/libccl.so" && \
+    ln -sf libccl.so.1.0 "${ONECCL_LIB}/libccl.so.1" && \
+    ln -sf libccl_openmp.so.0 "${ONECCL_LIB}/libccl_openmp.so" && \
+    ln -sf libccl_openmp.so.0.1 "${ONECCL_LIB}/libccl_openmp.so.0" && \
+    ONECCL_CPU_LIB="${ONECCL_DST}/_installdir/ccl/2021.15/lib/ccl/cpu/lib" && \
+    rm -f "${ONECCL_CPU_LIB}/libccl.so" "${ONECCL_CPU_LIB}/libccl.so.1" "${ONECCL_CPU_LIB}/libccl_openmp.so" "${ONECCL_CPU_LIB}/libccl_openmp.so.0" && \
+    ln -sf libccl.so.1 "${ONECCL_CPU_LIB}/libccl.so" && \
+    ln -sf libccl.so.1.0 "${ONECCL_CPU_LIB}/libccl.so.1" && \
+    ln -sf libccl_openmp.so.0 "${ONECCL_CPU_LIB}/libccl_openmp.so" && \
+    ln -sf libccl_openmp.so.0.1 "${ONECCL_CPU_LIB}/libccl_openmp.so.0" && \
+    mkdir -p /opt/intel/oneapi/ccl && \
+    rm -rf /opt/intel/oneapi/ccl/2021.15 && \
+    cp -a /tmp/oneccl-runtime/_installdir/ccl/2021.15 /opt/intel/oneapi/ccl/ && \
+    rm "${ONECCL_INSTALLER}" && \
+    echo "source /opt/intel/oneapi/setvars.sh --force" >> /root/.bashrc && \
+    echo "source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --ccl-bundled-mpi=no" >> /root/.bashrc && \
+    rm -f /opt/intel/oneapi/ccl/latest && \
+    ln -s /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/latest && \
+    find /opt/intel/oneapi/ccl -mindepth 1 -maxdepth 1 -type d -not -name 2021.15 -exec rm -rf {} + && \
+    rm -rf "/tmp/${ONECCL_INSTALLER%.sh}" /tmp/oneccl-runtime
 
 # Install the same Torch version used by the production runtime.
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -162,6 +206,18 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         huggingface_hub && \
     chmod +x /llm-scaler/sglang/scripts/*.sh
 
+# Replace the torch-bundled oneCCL with links to oneCCL 2021.15. With
+# `uv pip install --system` on this base the wheel data files land in
+# /usr/local/lib, which is where libtorch_xpu.so resolves libccl.so.1 from.
+RUN set -eo pipefail && \
+    uv pip uninstall --system oneccl oneccl-devel || true && \
+    rm -f /usr/local/lib/libccl.so /usr/local/lib/libccl.so.1 /usr/local/lib/libccl.so.1.0 \
+        /usr/local/lib/libccl_openmp.so /usr/local/lib/libccl_openmp.so.0 /usr/local/lib/libccl_openmp.so.0.1 && \
+    ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1.0 /usr/local/lib/libccl.so.1 && \
+    ln -sf /usr/local/lib/libccl.so.1 /usr/local/lib/libccl.so && \
+    ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl_openmp.so.0.1 /usr/local/lib/libccl_openmp.so.0 && \
+    ln -sf /usr/local/lib/libccl_openmp.so.0 /usr/local/lib/libccl_openmp.so
+
 # Keep wheels, source trees, build directories, caches, bytecode, and debug
 # symbols. Print an inventory for build-log validation.
 RUN echo "Built wheels:" && \
@@ -170,6 +226,12 @@ RUN echo "Built wheels:" && \
     uv pip list --system | \
         grep -iE "^(sglang|sgl-kernel|custom-esimd|torch|triton|transformers|xgrammar)" \
         || true
+
+# NOTE: no global LD_PRELOAD for oneCCL — the 2021.15 libccl.so.1 has no
+# RPATH/RUNPATH, so preloading it into every process breaks plain binaries
+# (e.g. /bin/bash) with "libsvml.so: cannot open shared object file". The
+# /usr/local/lib/libccl.so.1 -> 2021.15 symlink above is what makes torch load
+# this oneCCL, via the libtorch_xpu.so DT_RPATH.
 
 # Interactive development shell. The OMIX base configures the oneAPI
 # environment for login-shell workflows.

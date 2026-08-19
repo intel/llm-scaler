@@ -122,6 +122,7 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
     int N, int H, int HV, int gdn_K, int gdn_V,
     float attn_scale, int64_t conv_stride0, int64_t ssm_stride0,
     int inline_conv_shift,   // 1 = do conv_state shift inline (safe when N*HV<=32)
+    int conv_native,         // 1 = conv_state is native pool layout (cache, conv_dim, W-1=3)
     nd_item<3>& ndi)
 {
     slm_init<2048>();
@@ -208,9 +209,21 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
     simd<fp16, 64> x_fp16 = block_load<fp16, 64>(qkvz_row + qkvz_offset);
     simd<float, 64> x_f32 = x_fp16;
 
-    simd<float, 64> s0 = block_load<fp16, 64>(cstate_base + 0 * dim + chunk_start);
-    simd<float, 64> s1 = block_load<fp16, 64>(cstate_base + 1 * dim + chunk_start);
-    simd<float, 64> s2 = block_load<fp16, 64>(cstate_base + 2 * dim + chunk_start);
+    simd<float, 64> s0, s1, s2;
+    if (conv_native) {
+        // Native pool layout (cache, conv_dim, W-1=3): taps for each channel
+        // are stored interleaved with stride 3. Load 64 channels x 3 taps as a
+        // contiguous 192-vector starting at chunk_start*3, then deinterleave.
+        simd<fp16, 192> raw = block_load<fp16, 192>(cstate_base + (int64_t)chunk_start * 3);
+        simd<fp16, 64> t0 = raw.select<64, 3>(0);
+        simd<fp16, 64> t1 = raw.select<64, 3>(1);
+        simd<fp16, 64> t2 = raw.select<64, 3>(2);
+        s0 = t0; s1 = t1; s2 = t2;
+    } else {
+        s0 = block_load<fp16, 64>(cstate_base + 0 * dim + chunk_start);
+        s1 = block_load<fp16, 64>(cstate_base + 1 * dim + chunk_start);
+        s2 = block_load<fp16, 64>(cstate_base + 2 * dim + chunk_start);
+    }
 
     simd<fp16, 256> w_raw = block_load<fp16, 256>(conv_weight_ptr + (int64_t)chunk_start * 4);
     simd<float, 64> conv_result =
@@ -232,9 +245,17 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
         x_fp16_hi = block_load<fp16, 64>(qkvz_row + qkvz_offset_hi);
         simd<float, 64> x_f32_hi = x_fp16_hi;
 
-        s0_hi = block_load<fp16, 64>(cstate_base + 0 * dim + chunk_start_hi);
-        s1_hi = block_load<fp16, 64>(cstate_base + 1 * dim + chunk_start_hi);
-        s2_hi = block_load<fp16, 64>(cstate_base + 2 * dim + chunk_start_hi);
+        if (conv_native) {
+            simd<fp16, 192> raw_hi = block_load<fp16, 192>(cstate_base + (int64_t)chunk_start_hi * 3);
+            simd<fp16, 64> h0 = raw_hi.select<64, 3>(0);
+            simd<fp16, 64> h1 = raw_hi.select<64, 3>(1);
+            simd<fp16, 64> h2 = raw_hi.select<64, 3>(2);
+            s0_hi = h0; s1_hi = h1; s2_hi = h2;
+        } else {
+            s0_hi = block_load<fp16, 64>(cstate_base + 0 * dim + chunk_start_hi);
+            s1_hi = block_load<fp16, 64>(cstate_base + 1 * dim + chunk_start_hi);
+            s2_hi = block_load<fp16, 64>(cstate_base + 2 * dim + chunk_start_hi);
+        }
 
         simd<fp16, 256> w_raw_hi = block_load<fp16, 256>(
             conv_weight_ptr + (int64_t)chunk_start_hi * 4);
@@ -419,16 +440,33 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
     // Phase 1 reads for the same seq_idx.
     // Uses register-cached s1, s2, x_fp16 from Phase 1 (not re-read from memory).
     if (inline_conv_shift && conv_idx >= 0 && hv == 0 && !v_oob) {
-        // lo chunk (all threads)
-        block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start, simd<fp16, 64>(s1));
-        block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start, simd<fp16, 64>(s2));
-        block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start, x_fp16);
+        if (conv_native) {
+            // Native layout: shift row0<-s1, row1<-s2, row2<-x, interleaved
+            // (stride 3) then one 192-wide store per chunk.
+            simd<fp16, 192> out;
+            out.select<64, 3>(0) = simd<fp16, 64>(s1);
+            out.select<64, 3>(1) = simd<fp16, 64>(s2);
+            out.select<64, 3>(2) = x_fp16;
+            block_store<fp16, 192>(cstate_base + (int64_t)chunk_start * 3, out);
+            if (double_v && tid >= 4 * H) {
+                simd<fp16, 192> out_hi;
+                out_hi.select<64, 3>(0) = simd<fp16, 64>(s1_hi);
+                out_hi.select<64, 3>(1) = simd<fp16, 64>(s2_hi);
+                out_hi.select<64, 3>(2) = x_fp16_hi;
+                block_store<fp16, 192>(cstate_base + (int64_t)chunk_start_hi * 3, out_hi);
+            }
+        } else {
+            // lo chunk (all threads)
+            block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start, simd<fp16, 64>(s1));
+            block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start, simd<fp16, 64>(s2));
+            block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start, x_fp16);
 
-        // hi chunk (v-threads only, when double_v)
-        if (double_v && tid >= 4 * H) {
-            block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start_hi, simd<fp16, 64>(s1_hi));
-            block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start_hi, simd<fp16, 64>(s2_hi));
-            block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start_hi, x_fp16_hi);
+            // hi chunk (v-threads only, when double_v)
+            if (double_v && tid >= 4 * H) {
+                block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start_hi, simd<fp16, 64>(s1_hi));
+                block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start_hi, simd<fp16, 64>(s2_hi));
+                block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start_hi, x_fp16_hi);
+            }
         }
     }
 
@@ -478,6 +516,7 @@ ESIMD_INLINE void conv_state_shift_seq_kernel(
     const int* __restrict__ conv_state_indices_ptr,
     int N, int H, int HV, int gdn_K, int gdn_V,
     int64_t conv_stride0,
+    int conv_native,
     nd_item<3>& ndi)
 {
     const int seq_idx = ndi.get_group(0);
@@ -530,23 +569,43 @@ ESIMD_INLINE void conv_state_shift_seq_kernel(
     fp16* cstate_base = conv_state_ptr + (int64_t)conv_idx * conv_stride0;
 
     // lo chunk (all threads)
-    simd<float, 64> s1_val = block_load<fp16, 64>(cstate_base + 1 * dim + chunk_start);
-    simd<float, 64> s2_val = block_load<fp16, 64>(cstate_base + 2 * dim + chunk_start);
     simd<fp16, 64> x_new = block_load<fp16, 64>(qkvz_row + qkvz_offset);
-
-    block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start, simd<fp16, 64>(s1_val));
-    block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start, simd<fp16, 64>(s2_val));
-    block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start, x_new);
+    if (conv_native) {
+        simd<fp16, 192> raw = block_load<fp16, 192>(cstate_base + (int64_t)chunk_start * 3);
+        simd<fp16, 64> s1_val = raw.select<64, 3>(1);
+        simd<fp16, 64> s2_val = raw.select<64, 3>(2);
+        simd<fp16, 192> out;
+        out.select<64, 3>(0) = s1_val;
+        out.select<64, 3>(1) = s2_val;
+        out.select<64, 3>(2) = x_new;
+        block_store<fp16, 192>(cstate_base + (int64_t)chunk_start * 3, out);
+    } else {
+        simd<float, 64> s1_val = block_load<fp16, 64>(cstate_base + 1 * dim + chunk_start);
+        simd<float, 64> s2_val = block_load<fp16, 64>(cstate_base + 2 * dim + chunk_start);
+        block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start, simd<fp16, 64>(s1_val));
+        block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start, simd<fp16, 64>(s2_val));
+        block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start, x_new);
+    }
 
     // hi chunk (v-threads only, when double_v)
     if (double_v && tid >= 4 * H) {
-        simd<float, 64> s1_hi = block_load<fp16, 64>(cstate_base + 1 * dim + chunk_start_hi);
-        simd<float, 64> s2_hi = block_load<fp16, 64>(cstate_base + 2 * dim + chunk_start_hi);
         simd<fp16, 64> x_hi = block_load<fp16, 64>(qkvz_row + qkvz_offset_hi);
-
-        block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start_hi, simd<fp16, 64>(s1_hi));
-        block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start_hi, simd<fp16, 64>(s2_hi));
-        block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start_hi, x_hi);
+        if (conv_native) {
+            simd<fp16, 192> raw_hi = block_load<fp16, 192>(cstate_base + (int64_t)chunk_start_hi * 3);
+            simd<fp16, 64> s1_hi = raw_hi.select<64, 3>(1);
+            simd<fp16, 64> s2_hi = raw_hi.select<64, 3>(2);
+            simd<fp16, 192> out_hi;
+            out_hi.select<64, 3>(0) = s1_hi;
+            out_hi.select<64, 3>(1) = s2_hi;
+            out_hi.select<64, 3>(2) = x_hi;
+            block_store<fp16, 192>(cstate_base + (int64_t)chunk_start_hi * 3, out_hi);
+        } else {
+            simd<float, 64> s1_hi = block_load<fp16, 64>(cstate_base + 1 * dim + chunk_start_hi);
+            simd<float, 64> s2_hi = block_load<fp16, 64>(cstate_base + 2 * dim + chunk_start_hi);
+            block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start_hi, simd<fp16, 64>(s1_hi));
+            block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start_hi, simd<fp16, 64>(s2_hi));
+            block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start_hi, x_hi);
+        }
     }
 }
 
@@ -564,6 +623,7 @@ inline void gdn_conv_fused_seq_dispatch(
     fp16* output_ptr, fp16* z_out_ptr,
     int N, int H, int HV, int K, int V, float scale,
     int64_t conv_stride0, int64_t ssm_stride0,
+    int conv_native,
     sycl::queue& q)
 {
     const int total_wgs = N * HV;
@@ -582,7 +642,7 @@ inline void gdn_conv_fused_seq_dispatch(
                 ssm_state_ptr, ssm_state_indices_ptr,
                 output_ptr, z_out_ptr,
                 N, H, HV, K, V, scale, conv_stride0, ssm_stride0,
-                inline_shift, ndi);
+                inline_shift, conv_native, ndi);
         });
     });
 
@@ -597,7 +657,7 @@ inline void gdn_conv_fused_seq_dispatch(
                     qkvz_ptr, qkvz_stride0, conv_state_ptr,
                     conv_state_indices_ptr,
                     N, H, HV, K, V,
-                    conv_stride0, ndi);
+                    conv_stride0, conv_native, ndi);
             });
         });
     }
@@ -625,6 +685,7 @@ inline void gdn_conv_fused_seq_host(
     float scale,
     int64_t conv_stride0,
     int64_t ssm_stride0,
+    int conv_native,
     sycl::queue& q)
 {
     TORCH_CHECK(HV > 0 && HV % H == 0,
@@ -642,7 +703,7 @@ inline void gdn_conv_fused_seq_host(
             A_log_ptr, dt_bias_ptr, ba_ptr, ba_stride0,
             ssm_state_ptr, ssm_state_indices_ptr,
             output_ptr, z_out_ptr,
-            N, H, HV, K, V, scale, conv_stride0, ssm_stride0, q);
+            N, H, HV, K, V, scale, conv_stride0, ssm_stride0, conv_native, q);
     } else {
         const int v_slots_64 = 64 - 4 * H;
         TORCH_CHECK(v_slots_64 > 0 && HV <= v_slots_64,
@@ -654,6 +715,6 @@ inline void gdn_conv_fused_seq_host(
             A_log_ptr, dt_bias_ptr, ba_ptr, ba_stride0,
             ssm_state_ptr, ssm_state_indices_ptr,
             output_ptr, z_out_ptr,
-            N, H, HV, K, V, scale, conv_stride0, ssm_stride0, q);
+            N, H, HV, K, V, scale, conv_stride0, ssm_stride0, conv_native, q);
     }
 }
