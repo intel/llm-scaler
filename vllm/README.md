@@ -235,21 +235,12 @@ This way, only the first GPU will be mapped into the Docker container.
 
 ---
 
-**Note — Intel oneAPI Environment**
-> How you start the container determines whether you need to manually source the Intel oneAPI environment (`source /opt/intel/oneapi/setvars.sh --force`):
->
-> * **Interactive shell (`docker exec -it <container> bash`)**  
->   `/root/.bashrc` already sources the oneAPI environment. No manual action needed.
->
-> * **Docker Compose, overridden ENTRYPOINT, or direct `docker run` without interactive bash**  
->   The environment is **not automatically loaded** if no shell is involved. Prepend your command with `source /opt/intel/oneapi/setvars.sh --force &&` to ensure proper GPU/XPU setup.
->   
->   ```yaml
->   entrypoint: >
->     entrypoint: source /opt/intel/oneapi/setvars.sh --force && vllm serve --model /llm/models/Qwen3-14B
->   ```
->
-> **Summary:** Automated starts require sourcing the oneAPI script; interactive bash sessions are ready to use.
+**Note — Intel XPU Runtime Environment**
+> The image includes the required Intel XPU runtime libraries and configures
+> `/opt/venv/bin` in `PATH`. Do not source `/opt/intel/oneapi/setvars.sh`;
+> the runtime image does not include that script. Commands such as `vllm serve`
+> can be invoked directly from interactive shells, Docker Compose, or an
+> overridden entrypoint.
 
 ---
 
