@@ -2,15 +2,12 @@
 #include "utils.h"
 #include <cmath>
 
-// Fused QKV Split + parameterless RMSNorm + interleaved-pair RoPE + q_scale
+// Fused QKV Split + parameterless RMSNorm + RoPE + q_scale
 // for the Onyx (day0) architecture:
 //   - head_dim = 128
 //   - qk_norm is parameterless (`x / rms(x)` — no weight)
 //   - after norm on Q: multiply by a q_scale scalar (q_scale_factor / sqrt(head_dim))
-//   - RoPE is interleaved-pair (`is_neox_style=False`):
-//       x1 = x[..., 0::2], x2 = x[..., 1::2]
-//       out[0::2] = x1*cos - x2*sin
-//       out[1::2] = x2*cos + x1*sin
+//   - RoPE supports both interleaved-pair and half-split (NEOX) layouts.
 //   - V heads: copy only (no norm, no RoPE)
 //   - no gate head (Onyx's output_gate_proj is a separate ColumnParallelLinear
 //     driven from hidden_states, not shared with QKV)
@@ -37,6 +34,7 @@ ESIMD_INLINE void qkv_split_norm_rope_onyx_kernel(
     uint32_t qHead,
     uint32_t kvHead,
     float qScale,            // Onyx: qk_scale_factor / sqrt(head_dim)
+    bool neoxStyle,
     sycl::nd_item<2>& ndi) {
 
     constexpr uint32_t headDim = 128;
@@ -83,10 +81,7 @@ ESIMD_INLINE void qkv_split_norm_rope_onyx_kernel(
         outputTemp = outputTemp * qScale;
     }
 
-    // Interleaved-pair RoPE
-    // x1 = elements at even indices (0,2,4,...,126), x2 = odd (1,3,...,127)
-    // out[2i]   = x1[i]*cos[i] - x2[i]*sin[i]
-    // out[2i+1] = x2[i]*cos[i] + x1[i]*sin[i]
+    // The cache is [cos[64] || sin[64]] for both layouts.
     uint32_t rowOffset = ropePos[tokIdx] * headDim;
     // cos: [rowOffset .. +64), sin: [rowOffset+64 .. +128)
     simd<fp16, 64> cos16;
@@ -98,13 +93,21 @@ ESIMD_INLINE void qkv_split_norm_rope_onyx_kernel(
     simd<float, 64> fcos = cos16;
     simd<float, 64> fsin = sin16;
 
-    // Gather even and odd lanes with strided select (stride=2, count=64)
-    simd<float, 64> x1 = outputTemp.select<64, 2>(0);   // indices 0,2,...,126
-    simd<float, 64> x2 = outputTemp.select<64, 2>(1);   // indices 1,3,...,127
-    simd<float, 64> o1 = x1 * fcos - x2 * fsin;
-    simd<float, 64> o2 = x2 * fcos + x1 * fsin;
-    outputTemp.select<64, 2>(0) = o1;
-    outputTemp.select<64, 2>(1) = o2;
+    if (neoxStyle) {
+        simd<float, 64> x1 = outputTemp.select<64, 1>(0);
+        simd<float, 64> x2 = outputTemp.select<64, 1>(64);
+        simd<float, 64> o1 = x1 * fcos - x2 * fsin;
+        simd<float, 64> o2 = x2 * fcos + x1 * fsin;
+        outputTemp.select<64, 1>(0) = o1;
+        outputTemp.select<64, 1>(64) = o2;
+    } else {
+        simd<float, 64> x1 = outputTemp.select<64, 2>(0);
+        simd<float, 64> x2 = outputTemp.select<64, 2>(1);
+        simd<float, 64> o1 = x1 * fcos - x2 * fsin;
+        simd<float, 64> o2 = x2 * fcos + x1 * fsin;
+        outputTemp.select<64, 2>(0) = o1;
+        outputTemp.select<64, 2>(1) = o2;
+    }
 
     activation = outputTemp;
     if (whereAmI == ONYX_QKV_LOC_Q) {
@@ -128,6 +131,7 @@ inline void qkv_split_norm_rope_onyx_host(
     uint32_t qHead,
     uint32_t kvHead,
     float qScale,
+    bool neoxStyle,
     sycl::queue& q) {
 
     uint32_t totalHeads = qHead + 2 * kvHead;
@@ -139,7 +143,7 @@ inline void qkv_split_norm_rope_onyx_host(
             [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
                 qkv_split_norm_rope_onyx_kernel(
                     qkvState, qState, kState, vState, ropePos, ropeCosSinCache,
-                    hiddenDim, qHead, kvHead, qScale, ndi);
+                    hiddenDim, qHead, kvHead, qScale, neoxStyle, ndi);
             });
     });
 }
