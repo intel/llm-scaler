@@ -16,7 +16,15 @@ export SGLANG_USE_SGL_XPU=1
 export SGLANG_SKIP_VISION_GPU=1
 export SGLANG_FP8_IGNORED_LAYERS=vision_tower,embed_vision
 export SGLANG_SPLITK_G="${SGLANG_SPLITK_G:-64}"
-export SGL_XPU_FP8_W8A16_PREFILL="${SGL_XPU_FP8_W8A16_PREFILL:-1}"
+# NOTE: the gate sglang actually reads is SGLANG_XPU_FP8_W8A16_PREFILL
+# (python/sglang/srt/layers/quantization/fp8_utils.py); it defaults to true.
+# The old SGL_XPU_FP8_W8A16_PREFILL spelling is a no-op.
+export SGLANG_XPU_FP8_W8A16_PREFILL="${SGLANG_XPU_FP8_W8A16_PREFILL:-1}"
+# Prefill SDPA via DPAS/XMX, same as start_qwen3_6_service.sh. Only engages for
+# fp16 head_dim=256 layers (xpu_backend.py).
+export SGL_XPU_PREFILL_DPAS="${SGL_XPU_PREFILL_DPAS:-1}"
+# Decode runs eager: XPU graph is known-broken at TP>1 on this stack.
+export SGL_XPU_ENABLE_GRAPH="${SGL_XPU_ENABLE_GRAPH:-0}"
 
 speculative_args=()
 if [[ -n "${SPECULATIVE_DRAFT_MODEL_PATH}" ]]; then
