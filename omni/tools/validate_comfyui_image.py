@@ -91,6 +91,21 @@ AIMDO_REQUIRED_XPU_TESTS = {
     "test_xpu_backend.py",
     "test_xpu_comfyui_opt_in.py",
 }
+ONEDNN_PROVENANCE_MANIFEST = Path("/llm/manifests/onednn-runtime.env")
+ONEDNN_PATCH = Path(
+    "/llm/patches/onednn-v3.11.2-enable-bf16-int4-dequantization.patch"
+)
+ONEDNN_RUNTIME_LIBRARY = Path("/opt/venv/lib/libdnnl.so.3.11")
+ONEDNN_RUNTIME_LINK = Path("/opt/venv/lib/libdnnl.so.3")
+ONEDNN_PROVENANCE_FIELDS = {
+    "schema_version",
+    "package_version",
+    "source_repository",
+    "source_revision",
+    "patch_sha256",
+    "library_path",
+    "library_sha256",
+}
 
 
 def require_equal(label: str, actual: str, expected: str) -> None:
@@ -118,11 +133,125 @@ def require_checkout_revision(label: str, path: Path, expected: str) -> None:
     require_equal(f"{label} checkout revision", completed.stdout.strip(), expected)
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def require_onednn_runtime_provenance(
+    *,
+    expected_package_version: str,
+    expected_source_repository: str,
+    expected_source_revision: str,
+    expected_patch_sha256: str,
+    manifest_path: Path = ONEDNN_PROVENANCE_MANIFEST,
+    patch_path: Path = ONEDNN_PATCH,
+    runtime_library: Path = ONEDNN_RUNTIME_LIBRARY,
+    runtime_link: Path | None = ONEDNN_RUNTIME_LINK,
+) -> dict[str, str]:
+    """Require the patched oneDNN source, patch, and DSO to match the image."""
+
+    require_full_revision("oneDNN source revision", expected_source_revision)
+    if re.fullmatch(r"[0-9a-f]{64}", expected_patch_sha256) is None:
+        raise RuntimeError(
+            "oneDNN patch SHA256 must be 64 lowercase hexadecimal characters, "
+            f"got {expected_patch_sha256!r}"
+        )
+    if not manifest_path.is_file():
+        raise RuntimeError(f"oneDNN provenance manifest is missing: {manifest_path}")
+
+    provenance = {}
+    for line_number, raw_line in enumerate(
+        manifest_path.read_text(encoding="utf-8").splitlines(),
+        start=1,
+    ):
+        key, separator, value = raw_line.partition("=")
+        if not separator or not key or not value:
+            raise RuntimeError(
+                f"invalid oneDNN provenance line {line_number}: {raw_line!r}"
+            )
+        if key in provenance:
+            raise RuntimeError(f"duplicate oneDNN provenance field: {key}")
+        provenance[key] = value
+
+    require_equal(
+        "oneDNN provenance fields",
+        ",".join(sorted(provenance)),
+        ",".join(sorted(ONEDNN_PROVENANCE_FIELDS)),
+    )
+    expected_values = {
+        "schema_version": "1",
+        "package_version": expected_package_version,
+        "source_repository": expected_source_repository,
+        "source_revision": expected_source_revision,
+        "patch_sha256": expected_patch_sha256,
+        "library_path": str(runtime_library),
+    }
+    for key, expected in expected_values.items():
+        require_equal(f"oneDNN provenance {key}", provenance[key], expected)
+
+    if not patch_path.is_file():
+        raise RuntimeError(f"oneDNN patch is missing: {patch_path}")
+    require_equal(
+        "oneDNN patch SHA256",
+        file_sha256(patch_path),
+        expected_patch_sha256,
+    )
+    if not runtime_library.is_file():
+        raise RuntimeError(f"patched oneDNN runtime is missing: {runtime_library}")
+    require_equal(
+        "oneDNN runtime SHA256",
+        file_sha256(runtime_library),
+        provenance["library_sha256"],
+    )
+    if runtime_link is not None:
+        if not runtime_link.is_symlink():
+            raise RuntimeError(f"oneDNN runtime link is missing: {runtime_link}")
+        require_equal(
+            "oneDNN runtime link target",
+            str(runtime_link.resolve(strict=True)),
+            str(runtime_library.resolve(strict=True)),
+        )
+    return provenance
+
+
 def add_comfyui_to_import_path() -> None:
     """Make integrated packages importable from the runner's /tmp cwd."""
     comfyui_root = str(COMFYUI_ROOT)
     if comfyui_root not in sys.path:
         sys.path.insert(0, comfyui_root)
+
+
+def require_torch_matched_oneapi_runtime() -> dict[str, list[str]]:
+    """Require the loaded SYCL/UR libraries to come from the Torch venv."""
+    loaded = Path("/proc/self/maps").read_text(encoding="utf-8")
+    expected_root = Path("/opt/venv/lib")
+    resolved = {}
+    for library in ("libsycl.so", "libur_loader.so"):
+        paths = sorted(
+            {
+                line.rsplit(maxsplit=1)[-1]
+                for line in loaded.splitlines()
+                if library in line and line.rsplit(maxsplit=1)[-1].startswith("/")
+            }
+        )
+        if not paths:
+            raise RuntimeError(f"{library} is not loaded")
+        unexpected = [
+            path
+            for path in paths
+            if not Path(path).is_relative_to(expected_root)
+        ]
+        if unexpected:
+            raise RuntimeError(
+                f"{library} must load from {expected_root}, got: "
+                + ", ".join(unexpected)
+            )
+        resolved[library] = paths
+    return resolved
 
 
 def main() -> None:
@@ -147,11 +276,23 @@ def main() -> None:
     import comfyui_manager
     import nunchaku_torch
     import omni_xpu_kernel
+    import torchaudio
     from omni_xpu_kernel import _version as kernel_version
     from omni_xpu_kernel import gguf as omni_gguf
 
     expected_image = os.environ["OMNI_IMAGE_VERSION"]
     expected_target = os.environ["OMNI_IMAGE_XPU_TARGET"]
+    expected_torch = os.environ["OMNI_TORCH_VERSION"]
+    expected_torchvision = os.environ["OMNI_TORCHVISION_VERSION"]
+    expected_torchaudio = os.environ["OMNI_TORCHAUDIO_VERSION"]
+    expected_onednn = os.environ["OMNI_ONEDNN_VERSION"]
+    expected_onednn_source_repository = os.environ[
+        "OMNI_ONEDNN_SOURCE_REPOSITORY"
+    ]
+    expected_onednn_source_revision = os.environ[
+        "OMNI_ONEDNN_SOURCE_REVISION"
+    ]
+    expected_onednn_patch_sha256 = os.environ["OMNI_ONEDNN_PATCH_SHA256"]
     expected_comfyui = os.environ["OMNI_COMFYUI_VERSION"]
     expected_kitchen = os.environ["OMNI_COMFY_KITCHEN_VERSION"]
     expected_aimdo = os.environ["OMNI_COMFY_AIMDO_VERSION"]
@@ -161,6 +302,29 @@ def main() -> None:
     source_dirty = os.environ["OMNI_LLM_SCALER_SOURCE_DIRTY"]
 
     require_equal("image version", kernel_version.__image_version__, expected_image)
+    require_equal("Torch version", torch.__version__, expected_torch)
+    require_equal(
+        "torchvision distribution version",
+        importlib.metadata.version("torchvision"),
+        expected_torchvision,
+    )
+    require_equal(
+        "torchaudio distribution version",
+        importlib.metadata.version("torchaudio"),
+        expected_torchaudio,
+    )
+    require_equal(
+        "oneDNN distribution version",
+        importlib.metadata.version("onednn"),
+        expected_onednn,
+    )
+    onednn_provenance = require_onednn_runtime_provenance(
+        expected_package_version=expected_onednn,
+        expected_source_repository=expected_onednn_source_repository,
+        expected_source_revision=expected_onednn_source_revision,
+        expected_patch_sha256=expected_onednn_patch_sha256,
+    )
+    oneapi_runtime_libraries = require_torch_matched_oneapi_runtime()
     require_equal("kernel package target", omni_xpu_kernel.__xpu_target__, expected_target)
     require_equal("kernel AOT target", omni_xpu_kernel.core_aot_target(), expected_target)
     require_full_revision("llm-scaler source revision", source_revision)
@@ -357,12 +521,28 @@ def main() -> None:
             + ", ".join(sorted(missing))
         )
 
+    audio = torch.linspace(-1.0, 1.0, 1600, device="xpu").unsqueeze(0)
+    resampled_audio = torchaudio.functional.resample(audio, 16000, 24000)
+    torch.xpu.synchronize()
+    if tuple(resampled_audio.shape) != (1, 2400):
+        raise RuntimeError(
+            "torchaudio XPU resample returned unexpected shape: "
+            f"{tuple(resampled_audio.shape)}"
+        )
+    if not bool(torch.isfinite(resampled_audio).all().item()):
+        raise RuntimeError("torchaudio XPU resample returned non-finite values")
+
     device_name = torch.xpu.get_device_name(0)
     print(
         "ComfyUI image acceptance passed: "
         f"image={expected_image}, target={expected_target}, "
         f"source={source_revision[:12]}, dirty={source_dirty}, "
-        f"torch={torch.__version__}, comfyui={expected_comfyui}, "
+        f"base={os.environ['OMNI_BASE_IMAGE']}, torch={torch.__version__}, "
+        f"torchvision={expected_torchvision}, torchaudio={expected_torchaudio}, "
+        f"onednn={expected_onednn}@{expected_onednn_source_revision[:12]}, "
+        f"onednn_dso={onednn_provenance['library_sha256'][:12]}, "
+        f"oneapi_runtime={oneapi_runtime_libraries}, "
+        f"comfyui={expected_comfyui}, "
         f"frontend={comfyui_dependency_versions['comfyui-frontend-package']}, "
         "templates="
         f"{comfyui_dependency_versions['comfyui-workflow-templates']}, "

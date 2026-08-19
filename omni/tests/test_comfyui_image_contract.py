@@ -1,6 +1,8 @@
+import hashlib
 import importlib.util
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -13,6 +15,12 @@ FULL_DOCKERFILE = OMNI_ROOT / "docker" / "Dockerfile.full"
 DOCKERIGNORE = OMNI_ROOT / ".dockerignore"
 BUILD_SCRIPT = OMNI_ROOT / "build.sh"
 VALIDATOR = OMNI_ROOT / "tools" / "validate_comfyui_image.py"
+RUNTIME_ENTRYPOINT = OMNI_ROOT / "entrypoints" / "omix_torch_runtime.sh"
+ONEDNN_PATCH = (
+    OMNI_ROOT
+    / "patches"
+    / "onednn-v3.11.2-enable-bf16-int4-dequantization.patch"
+)
 PUBLIC_BMG_DOCUMENTATION = (
     OMNI_ROOT / "README.md",
     OMNI_ROOT / "ComfyUI-OmniXPU" / "README.md",
@@ -27,6 +35,30 @@ CACHE_DIT_COMMIT = "1d92bbd86ec59aa6223fe2368849b7413a1acb93"
 DEMO_ASSETS = {
     "demo_qwen_image.gif",
     "demo_wan2.2_14b_i2v_multi_xpu.gif",
+}
+
+STACK_PINS = {
+    "BASE_IMAGE": (
+        "BASE_IMAGE",
+        "intel/omix:0.3.0-devel-ubuntu24.04@sha256:"
+        "53e2c4503beeea4aff906dea180933be672449bcf04eb38df3d89622a1cd0967",
+    ),
+    "TORCH_VERSION": ("TORCH_VERSION", "2.13.0+xpu"),
+    "TORCHVISION_VERSION": ("TORCHVISION_VERSION", "0.28.0+xpu"),
+    "TORCHAUDIO_VERSION": ("TORCHAUDIO_VERSION", "2.11.0+xpu"),
+    "ONEDNN_VERSION": ("ONEDNN_VERSION", "2026.0.0"),
+    "ONEDNN_SOURCE_REPOSITORY": (
+        "ONEDNN_SOURCE_REPOSITORY",
+        "https://github.com/uxlfoundation/oneDNN.git",
+    ),
+    "ONEDNN_SOURCE_COMMIT": (
+        "ONEDNN_SOURCE_COMMIT",
+        "03c022d3ffdcee958cfacbe720048e725fdf644c",
+    ),
+    "ONEDNN_PATCH_SHA256": (
+        "ONEDNN_PATCH_SHA256",
+        "0a7afff4134f115b4bc53f46301ca3d62b1c11dc02e32c64635c469769fcdaeb",
+    ),
 }
 
 COMPONENT_PINS = {
@@ -54,9 +86,9 @@ COMPONENT_PINS = {
     ),
     "COMFY_KITCHEN_COMMIT": (
         "KITCHEN_COMMIT",
-        "82b6537698a87e33d9fa07eac809b7733d5c5ce6",
+        "74aead36b68cc67f156d8b6724ed7f6acb05a528",
     ),
-    "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.28"),
+    "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.31"),
     "COMFY_AIMDO_REPOSITORY": (
         "AIMDO_REPOSITORY",
         "https://github.com/xiangyuT/comfy-aimdo-xpu.git",
@@ -213,6 +245,58 @@ class ComfyUIImageContractTest(unittest.TestCase):
                     build_script,
                 )
 
+    def test_base_and_python_stack_defaults_are_explicit_build_inputs(self):
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+        build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
+
+        for docker_argument, (shell_variable, expected) in STACK_PINS.items():
+            with self.subTest(argument=docker_argument):
+                docker_match = re.search(
+                    rf"^ARG {re.escape(docker_argument)}=(.+)$",
+                    dockerfile,
+                    flags=re.MULTILINE,
+                )
+                build_match = re.search(
+                    (
+                        rf"^{re.escape(shell_variable)}="
+                        rf'"\$\{{OMNI_{re.escape(docker_argument)}:-([^}}]+)\}}"$'
+                    ),
+                    build_script,
+                    flags=re.MULTILINE,
+                )
+                self.assertIsNotNone(docker_match)
+                self.assertIsNotNone(build_match)
+                self.assertEqual(docker_match.group(1), expected)
+                self.assertEqual(build_match.group(1), expected)
+                self.assertIn(
+                    f'--build-arg "{docker_argument}=${{{shell_variable}}}"',
+                    build_script,
+                )
+
+        self.assertIn(
+            "'^(torch|torchvision|torchaudio)"
+            "([[:space:]<>=!~].*)?$|^(",
+            dockerfile,
+        )
+        self.assertIn(
+            'ENTRYPOINT ["/llm/entrypoints/omix_torch_runtime.sh"]',
+            dockerfile,
+        )
+        runtime_entrypoint = RUNTIME_ENTRYPOINT.read_text(encoding="utf-8")
+        self.assertIn(
+            'source /opt/intel/oneapi/setvars.sh --force',
+            runtime_entrypoint,
+        )
+        self.assertIn(
+            '"${VIRTUAL_ENV}"/lib/python*/site-packages/torch/lib',
+            runtime_entrypoint,
+        )
+        self.assertIn(
+            'export LD_LIBRARY_PATH="${VIRTUAL_ENV}/lib:'
+            '${torch_library_directories[0]}:${LD_LIBRARY_PATH:-}"',
+            runtime_entrypoint,
+        )
+
     def test_quantized_integrations_install_and_validate_dependencies(self):
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
         validator = load_validator()
@@ -253,6 +337,87 @@ class ComfyUIImageContractTest(unittest.TestCase):
             validator.REQUIRED_KITCHEN_CAPABILITIES,
         )
 
+    def test_onednn_bf16_int4_patch_is_pinned_and_validated(self):
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+        validator = load_validator()
+        patch_sha256 = hashlib.sha256(ONEDNN_PATCH.read_bytes()).hexdigest()
+
+        self.assertEqual(
+            patch_sha256,
+            STACK_PINS["ONEDNN_PATCH_SHA256"][1],
+        )
+        self.assertIn(
+            "git -C /tmp/onednn-source apply --check",
+            dockerfile,
+        )
+        self.assertIn(
+            "-DONEDNN_BUILD_GRAPH=OFF",
+            dockerfile,
+        )
+        self.assertIn(
+            "/llm/manifests/onednn-runtime.env",
+            dockerfile,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            patch_path = temporary_root / "patch"
+            runtime_library = temporary_root / "libdnnl.so.3.11"
+            runtime_link = temporary_root / "libdnnl.so.3"
+            manifest_path = temporary_root / "onednn-runtime.env"
+            patch_path.write_bytes(ONEDNN_PATCH.read_bytes())
+            runtime_library.write_bytes(b"patched oneDNN runtime")
+            runtime_link.symlink_to(runtime_library.name)
+            library_sha256 = hashlib.sha256(runtime_library.read_bytes()).hexdigest()
+            manifest_path.write_text(
+                "\n".join(
+                    (
+                        "schema_version=1",
+                        "package_version=2026.0.0",
+                        "source_repository=https://github.com/uxlfoundation/oneDNN.git",
+                        "source_revision=03c022d3ffdcee958cfacbe720048e725fdf644c",
+                        f"patch_sha256={patch_sha256}",
+                        f"library_path={runtime_library}",
+                        f"library_sha256={library_sha256}",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            provenance = validator.require_onednn_runtime_provenance(
+                expected_package_version="2026.0.0",
+                expected_source_repository=(
+                    "https://github.com/uxlfoundation/oneDNN.git"
+                ),
+                expected_source_revision=(
+                    "03c022d3ffdcee958cfacbe720048e725fdf644c"
+                ),
+                expected_patch_sha256=patch_sha256,
+                manifest_path=manifest_path,
+                patch_path=patch_path,
+                runtime_library=runtime_library,
+                runtime_link=runtime_link,
+            )
+            self.assertEqual(provenance["library_sha256"], library_sha256)
+
+            runtime_library.write_bytes(b"tampered runtime")
+            with self.assertRaisesRegex(RuntimeError, "oneDNN runtime SHA256"):
+                validator.require_onednn_runtime_provenance(
+                    expected_package_version="2026.0.0",
+                    expected_source_repository=(
+                        "https://github.com/uxlfoundation/oneDNN.git"
+                    ),
+                    expected_source_revision=(
+                        "03c022d3ffdcee958cfacbe720048e725fdf644c"
+                    ),
+                    expected_patch_sha256=patch_sha256,
+                    manifest_path=manifest_path,
+                    patch_path=patch_path,
+                    runtime_library=runtime_library,
+                    runtime_link=runtime_link,
+                )
+
     def test_aimdo_xpu_is_built_from_an_exact_remote_commit(self):
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
         validator = load_validator()
@@ -267,6 +432,18 @@ class ComfyUIImageContractTest(unittest.TestCase):
             dockerfile,
         )
         self.assertIn("pip install setuptools-scm==10.2.1", dockerfile)
+        self.assertIn(
+            "test -f /opt/venv/include/unified-runtime/ur_api.h",
+            dockerfile,
+        )
+        self.assertIn(
+            "UR_INCLUDE_DIR=/opt/venv/include/unified-runtime",
+            dockerfile,
+        )
+        self.assertIn(
+            'UR_INCLUDE_DIR="/opt/venv/include/unified-runtime"',
+            dockerfile,
+        )
         self.assertIn("./scripts/build-linux-xpu.sh", dockerfile)
         self.assertIn(
             'SETUPTOOLS_SCM_PRETEND_VERSION="${COMFY_AIMDO_VERSION}"',
@@ -313,6 +490,18 @@ class ComfyUIImageContractTest(unittest.TestCase):
             "https://github.com/ltdrdata/ComfyUI-Manager.git",
             dockerfile,
         )
+        self.assertIn(
+            "# Easy-Use v1.3.6 (release tag resolved to an immutable commit).",
+            dockerfile,
+        )
+        self.assertIn(
+            "b5e31ef12ad9d0b187b545c2707735cc7d581c52",
+            dockerfile,
+        )
+        self.assertNotIn(
+            "54d080bf6a4f52da287e984f305243c10db097f5",
+            dockerfile,
+        )
         self.assertEqual(
             validator.COMFYUI_PACKAGE_ENVIRONMENT,
             {
@@ -329,6 +518,7 @@ class ComfyUIImageContractTest(unittest.TestCase):
             dockerfile,
         )
         self.assertIn("mkdir -p /llm/ComfyUI/user", dockerfile)
+        self.assertNotIn("libsycl-native-*.spv", dockerfile)
         self.assertEqual(
             validator.COMFYUI_DATABASE_DIRECTORY,
             Path("/llm/ComfyUI/user"),

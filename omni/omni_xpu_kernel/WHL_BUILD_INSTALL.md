@@ -137,7 +137,7 @@ omni_xpu_kernel/.libs/onednn/VERSION
   `spir64_gen` 镜像。
 - PTL-H 必须单独使用 `OMNI_XPU_DEVICE=ptl-h` 构建，不能安装 BMG wheel。
 
-项目当前识别 Torch XPU 2.10、2.11 和 2.12。识别某个 minor 不代表所有
+项目当前识别 Torch XPU 2.10、2.11、2.12 和 2.13。识别某个 minor 不代表所有
 组合都已经验收；本文只对 Torch `2.12.0+xpu`、Python 3.13、BMG 作出验证
 声明。
 

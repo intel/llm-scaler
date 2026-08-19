@@ -1,0 +1,27 @@
+diff --git a/src/gpu/intel/gemm/jit/generator/pieces/quantization.cpp b/src/gpu/intel/gemm/jit/generator/pieces/quantization.cpp
+index 961e7ac54..23b929798 100644
+--- a/src/gpu/intel/gemm/jit/generator/pieces/quantization.cpp
++++ b/src/gpu/intel/gemm/jit/generator/pieces/quantization.cpp
+@@ -25,7 +25,7 @@ bool canDequantizeInt4(const RegisterLayout &layoutSrc, const RegisterLayout &la
+                        const RegisterLayout &layoutOffset, const RegisterLayout &layoutScale)
+ {
+     auto Tsrc = layoutSrc.type(), Tdst = layoutDst.type();
+-    if (!Tsrc.isInt4() || !one_of(Tdst, {Type::f16, Type::f32}))
++    if (!Tsrc.isInt4() || !one_of(Tdst, {Type::f16, Type::bf16, Type::f32}))
+         return false;
+ 
+     if (layoutOffset.empty() || layoutScale.empty())
+diff --git a/src/gpu/intel/gemm/jit/generator/pieces/quantization.cxx b/src/gpu/intel/gemm/jit/generator/pieces/quantization.cxx
+index 00c432653..314ba170f 100644
+--- a/src/gpu/intel/gemm/jit/generator/pieces/quantization.cxx
++++ b/src/gpu/intel/gemm/jit/generator/pieces/quantization.cxx
+@@ -86,7 +86,8 @@ bool Generator<hw>::gemmMake2DQuantizationLayouts(bool isA, const GEMMProblem &p
+         Txs_int = problem.Tc;
+     }
+ 
+-    bool int4SpecialPath = Tx_ext.isInt4() && one_of(Tx, {Type::f16, Type::f32});
++    bool int4SpecialPath
++            = Tx_ext.isInt4() && one_of(Tx, {Type::f16, Type::bf16, Type::f32});
+     if (int4SpecialPath) {
+         Txo_int = Type::f16;
+         Txs_int = Tx;

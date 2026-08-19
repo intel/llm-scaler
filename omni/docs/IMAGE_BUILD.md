@@ -22,7 +22,14 @@ The supported environment overrides are:
 |---|---|---|
 | `XPU_TARGET` | Native GPU build target | `bmg` |
 | `OMNI_IMAGE_REPOSITORY` | Local image repository | `intel/llm-scaler-omni` |
-| `OMNI_BASE_IMAGE` | OMIX development base | `intel/omix:0.1.0-devel-ubuntu24.04` |
+| `OMNI_BASE_IMAGE` | OMIX development base | `intel/omix:0.3.0-devel-ubuntu24.04` at the digest pinned in `build.sh` |
+| `OMNI_TORCH_VERSION` | PyTorch XPU wheel | `2.13.0+xpu` |
+| `OMNI_TORCHVISION_VERSION` | torchvision XPU wheel | `0.28.0+xpu` |
+| `OMNI_TORCHAUDIO_VERSION` | ComfyUI audio compatibility wheel | `2.11.0+xpu` |
+| `OMNI_ONEDNN_VERSION` | Matched oneDNN runtime/development wheels | `2026.0.0` (oneDNN `3.11.2`) |
+| `OMNI_ONEDNN_SOURCE_REPOSITORY` | oneDNN source repository | official oneDNN repository pinned in `build.sh` |
+| `OMNI_ONEDNN_SOURCE_COMMIT` | oneDNN release source revision | oneDNN `v3.11.2` commit pinned in `build.sh` |
+| `OMNI_ONEDNN_PATCH_SHA256` | Reviewed BF16/INT4 compatibility patch identity | SHA256 pinned in `build.sh` |
 | `MAX_JOBS` | Native build parallelism | `8` |
 | `COMFYUI_REPOSITORY` | ComfyUI source repository | pinned in `build.sh` |
 | `COMFYUI_COMMIT` | ComfyUI source revision | pinned in `build.sh` |
@@ -53,11 +60,52 @@ The AIMDO revision must be reachable from its pinned remote. The build fetches
 and checks out that exact full commit before compiling the Level Zero backend;
 branch names are not used as image identity.
 
+The AIMDO Unified Runtime hook is compiled against
+`/opt/venv/include/unified-runtime/ur_api.h`, which belongs to the
+Torch-matched runtime family used by the final image. OMIX 0.3 supplies the
+oneAPI 2026.1 compiler, but its compiler include tree is not used as the AIMDO
+hook ABI contract. The runtime entrypoint likewise places the venv Unified
+Runtime loader before the OMIX build-toolchain libraries. The final image also
+exports that directory as `UR_INCLUDE_DIR` so AIMDO's maintained native-hook
+helper build uses the same explicit ABI contract during installed-image
+validation.
+
+This focused image is single-XPU and does not copy the legacy
+`libsycl-native-*.spv` multi-XPU blobs used by older platform images. OMIX 0.3
+and oneAPI 2026.1 do not ship those files; the card-specific BMG binaries are
+embedded in the AOT kernel wheel instead.
+
 The focused image installs the version-pinned integrated `comfyui-manager` package and
 does not clone the legacy Manager custom node. Frontend, workflow templates,
 and Manager are explicit build inputs; the final image also records a complete
 `pip freeze --all` dependency snapshot at
 `/llm/manifests/comfyui-python-freeze.txt`.
+
+The official XPU index does not provide a Torch-2.13-matched `torchaudio`
+wheel, while ComfyUI requires torchaudio and the maintained workflows include
+audio. The focused image therefore keeps the existing `2.11.0+xpu` wheel as
+an explicit compatibility exception. That XPU wheel has no exact Torch
+dependency in its package metadata; the installed-image validator still
+requires its exact version and performs an XPU resample with shape and finite
+output checks. The canonical audio workflows remain the milestone-level gate.
+
+The `onednn` and `onednn-devel` wheels provide the 2026.0 runtime package
+layout and SYCL/Unified Runtime dependencies expected by Torch 2.13. The
+focused build replaces only `libdnnl` with the exact official oneDNN 3.11.2
+release source plus the checked-in, SHA256-pinned two-site BF16/INT4
+dequantization compatibility patch. The patch restores the behavior removed
+by upstream commit `0d99c32b03614d6943b993974f91d419e3c3a0f6`; it does not
+downgrade the rest of the Torch/oneAPI stack. The build records source,
+patch, and installed-library identities in
+`/llm/manifests/onednn-runtime.env`.
+
+OMIX 0.3 supplies the 2026.1 compiler toolchain, while Torch 2.13 pins its
+packaged SYCL and Unified Runtime libraries to 2026.0. The final image keeps
+OMIX initialization for compiler and tool discovery, then restores
+`/opt/venv/lib` and the discovered Torch library directory to the front of
+`LD_LIBRARY_PATH` through `entrypoints/omix_torch_runtime.sh`. This prevents a process
+from mixing the Torch wheel's `libsycl` with OMIX's newer `libur_loader`; the
+installed-image validator checks the libraries actually mapped by the process.
 
 ## Focused-image build graph
 
@@ -84,6 +132,9 @@ For focused images, `build.sh` records the full llm-scaler Git revision and
 whether `omni/` had uncommitted changes. The final image also records:
 
 - image version and flavor;
+- exact OMIX base reference, Torch, torchvision, torchaudio, and oneDNN package versions;
+- exact oneDNN source repository and revision, compatibility-patch SHA256,
+  and installed `libdnnl.so.3.11` SHA256;
 - selected XPU target;
 - ComfyUI version and commit;
 - ComfyUI frontend, workflow-template, and integrated Manager versions;
@@ -105,7 +156,9 @@ Run the validator inside the final container:
 IMAGE=intel/llm-scaler-omni:0.2.0-b1
 
 sudo docker run --rm \
-    --device=/dev/dri \
+    --device=/dev/dri/card0 \
+    --device=/dev/dri/renderD128 \
+    -e ZE_AFFINITY_MASK=0 \
     "$IMAGE" \
     python /llm/tools/validate_comfyui_image.py
 ```
@@ -116,6 +169,8 @@ explicit diagnostics and do not replace device-backed acceptance. The same
 validator also requires exact Kitchen, AIMDO, GGUF, and combined Nunchaku
 source revisions; the installed AIMDO XPU backend; the
 GGUF/SentencePiece/Protobuf imports; the bundled `nunchaku_torch` runtime; and
-the managed Kitchen GGUF/W4A16 capabilities.
+the managed Kitchen GGUF/W4A16 capabilities. It additionally fails closed if
+the oneDNN manifest, checked-in patch, installed runtime DSO, or
+`libdnnl.so.3` symlink does not match the identities recorded by the image.
 
 The release image supports BMG.

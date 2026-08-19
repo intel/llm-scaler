@@ -30,7 +30,16 @@ from setuptools import setup, Extension, find_packages
 from setuptools.command.build_ext import build_ext
 
 IS_WINDOWS = platform.system() == "Windows"
-VALIDATED_ONEDNN_VERSION = (3, 9, 1)
+LINUX_ONEDNN_PACKAGE_VERSION = "2026.0.0"
+LINUX_VALIDATED_ONEDNN_VERSION = (3, 11, 2)
+WINDOWS_VALIDATED_ONEDNN_VERSION = (3, 9, 1)
+
+
+def get_validated_onednn_version():
+    """Return the platform-specific native oneDNN ABI contract."""
+    if IS_WINDOWS:
+        return WINDOWS_VALIDATED_ONEDNN_VERSION
+    return LINUX_VALIDATED_ONEDNN_VERSION
 
 
 VERSION_NAMESPACE = run_path(str(Path(__file__).parent / "omni_xpu_kernel" / "_version.py"))
@@ -370,12 +379,14 @@ def get_onednn_paths():
             continue
 
         header_version = get_onednn_header_version(include_dir)
-        if header_version != VALIDATED_ONEDNN_VERSION:
-            expected = ".".join(map(str, VALIDATED_ONEDNN_VERSION))
+        validated_version = get_validated_onednn_version()
+        if header_version != validated_version:
+            expected = ".".join(map(str, validated_version))
             actual = ".".join(map(str, header_version))
+            package = "2025.3.0" if IS_WINDOWS else LINUX_ONEDNN_PACKAGE_VERSION
             raise RuntimeError(
                 f"Unsupported oneDNN headers {actual} from {include_dir}; "
-                f"expected {expected} to match onednn==2025.3.0"
+                f"expected {expected} to match onednn=={package}"
             )
         library_version = get_onednn_library_version(runtime_library)
         if library_version is not None and library_version != header_version:
@@ -399,10 +410,13 @@ def get_onednn_paths():
             "Set DNNLROOT to a complete oneAPI installation, or set "
             "ONEDNN_INCLUDE, ONEDNN_LIB, and ONEDNN_RUNTIME to matched files."
         )
+    expected = ".".join(map(str, get_validated_onednn_version()))
+    package = "2025.3.0" if IS_WINDOWS else LINUX_ONEDNN_PACKAGE_VERSION
     raise RuntimeError(
-        "oneDNN 3.9.1 headers and runtime were not found in the active Python "
-        "prefix. Install onednn==2025.3.0 and onednn-devel==2025.3.0. "
-        "For an explicit non-pip build, set both ONEDNN_INCLUDE and ONEDNN_LIB."
+        f"oneDNN {expected} headers and runtime were not found in the active "
+        f"Python prefix. Install onednn=={package} and "
+        f"onednn-devel=={package}. For an explicit non-pip build, set both "
+        "ONEDNN_INCLUDE and ONEDNN_LIB."
     )
 
 
@@ -453,7 +467,7 @@ def bundle_windows_onednn_runtime(
         shutil.copy2(notice_dir / name, notice_target / name)
 
     digest = hashlib.sha256(runtime_target.read_bytes()).hexdigest()
-    version = ".".join(map(str, VALIDATED_ONEDNN_VERSION))
+    version = ".".join(map(str, get_validated_onednn_version()))
     (notice_target / "VERSION").write_text(
         f"oneDNN={version}\ndnnl.dll.sha256={digest}\n",
         encoding="utf-8",
@@ -887,7 +901,7 @@ setup(
     python_requires=">=3.9",
     install_requires=[
         f"torch=={BUILD_TORCH_VERSION}",
-        "onednn==2025.3.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
+        f"onednn=={LINUX_ONEDNN_PACKAGE_VERSION}; platform_system == 'Linux' and platform_machine == 'x86_64'",
     ],
     extras_require={
         "dev": [
