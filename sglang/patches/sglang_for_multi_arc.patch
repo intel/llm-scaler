@@ -1,9 +1,9 @@
 diff --git a/GEMMA4_BMG_OPTIMIZATION_STATUS.md b/GEMMA4_BMG_OPTIMIZATION_STATUS.md
 new file mode 100644
-index 0000000000..81e6627457
+index 0000000000..655f988bba
 --- /dev/null
 +++ b/GEMMA4_BMG_OPTIMIZATION_STATUS.md
-@@ -0,0 +1,1325 @@
+@@ -0,0 +1,1373 @@
 +# Gemma4-31B FP16 FP8 Decode Optimization Status (BMG TP=2)
 +
 +## ✅ UPDATE (2026-07-08): Gemma4 MTP 在 BMG/XPU 已打通（GAP AUDIT 中的阻塞项已解决）
@@ -264,6 +264,54 @@ index 0000000000..81e6627457
 +208 GRF > 128 → large-GRF/spill), and the extra `kvStart`+compound-`simd_mask`
 +comparisons perturb module splitting past what the AOT flow accepts (per_kernel
 +split is already on). Host-side windowing sidesteps this entirely.
++
++## ✅ FIXED (2026-08-20): DPAS prefill 忽略 Gemma4 sliding-window 下界
++
++**引入点不是 merge 本身，而是新启动配置。** PR #1 基线已经包含 opt-in
++`SGL_XPU_PREFILL_DPAS` 分支，但 2026-07-06 的 shippable 启动块没有开启它。
++`llm-scaler` commit `c08a2d0` 照抄 Qwen3.6 启动脚本，首次在 Gemma4 上强制
++`SGL_XPU_PREFILL_DPAS=1`，于是 50/60 个 `head_dim=256` sliding 层改走该 op。
++
++这条 DPAS kernel 只实现 full causal attention：
++
++- op 参数只有 `q/key_cache/value_cache/cu_seqlens_q/seq_lens/is_causal/scale/block_table`，
++  没有 `window_left`；
++- kernel 的 mask 只有 `kv_pos <= causal_bound` 上界，没有
++  `kv_pos >= q_pos - sliding_window` 下界；
++- Python 路径仍传完整 `cache_seqlens`。超过 1024 token 后，它会访问窗外位置，
++  而 SWA pool 中这些位置的 full→SWA 映射已经回收/复用。
++
++独立 2k kernel UT（FP16、HD256、Q=128、KV=2048、window=1023）：
++windowed flash 对 PyTorch SWA 参考 cosine=`0.99999994`；DPAS 对同一参考只有
++`0.70322025`。这不是模型采样波动，而是 attention 语义不一致。
++
++**修复**：`xpu_backend.py` 的 DPAS gate 增加 `not is_hybrid_swa`。DPAS 仍可用于
++非滑窗 HD256 模型；Gemma4 sliding 层回到能接收 `window_size` 的
++`flash_attn_with_kvcache`。同时从两个 Gemma4 启动脚本删除误加的 DPAS env。
++W8A16 prefill、ESIMD QKV `normalize_v=True` 和后面的 SWA decode 修复均保持不变。
++
++**端到端验证（故意保留 `SGL_XPU_PREFILL_DPAS=1`，证明 Python guard 生效）：**
++
++- 原始 2373-token doc-QA 在修复前把 `March 14th` 答成 `March 4th`；修复后同一
++  prompt、chat template 和 greedy 参数精确返回 `March 14th` 与
++  `checksum errors`。
++- 原始 2782-token passphrase case 在修复前返回 `violet-passphrase7`；修复后
++  精确返回 `violet-harbor-77`。
++- BFCL v4 `multi_turn_base` 官方全量 generate + evaluate：
++  **146/200 = 73.0%**（验收线 60%，历史基线 145/200 = 72.5%）。正式配置为
++  radix on、`swa_full_tokens_ratio=0.2`、8 并发；全程 0 retract、0 NaN/assert。
++- 正确路径的 bsz=1 runtime bench（radix off、ratio=0.05、max-running=1，
++  warmup=2、trials=3、out=256）：
++
++| input | TTFT (ms) | TPOT (ms) | decode tok/s | E2E (s) |
++|---:|---:|---:|---:|---:|
++| 1024 | 349.7 | 40.39 | 24.8 | 10.65 |
++| 2048 | 684.1 | 40.60 | 24.6 | 11.04 |
++| 4096 | 1382.9 | 40.99 | 24.4 | 11.84 |
++| 8192 | 2906.9 | 41.78 | 23.9 | 13.56 |
++
++固定后的 TPOT 仍在本文已记录的 eager 约 39–43ms band；因历史 DPAS 数字来自
++错误输出路径，不用它计算性能 delta。
 +
 +## ✅ FIXED (2026-08-19): 同一个 SWA 窗口 bug 还存在于**真正在跑的那条 decode 路径**（sglang_decode_attn）
 +
@@ -3035,7 +3083,7 @@ index ae5365e8d6..0f54d2a8ce 100644
              q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
              self.token_to_kv_pool.get_key_buffer(layer.layer_id),
 diff --git a/python/sglang/srt/layers/attention/xpu_backend.py b/python/sglang/srt/layers/attention/xpu_backend.py
-index ea02e001f1..330dcaa6d1 100644
+index ea02e001f1..f8de84cb50 100644
 --- a/python/sglang/srt/layers/attention/xpu_backend.py
 +++ b/python/sglang/srt/layers/attention/xpu_backend.py
 @@ -1,9 +1,68 @@
@@ -3107,7 +3155,7 @@ index ea02e001f1..330dcaa6d1 100644
  from sglang.srt.configs.model_config import AttentionArch
  from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
  from sglang.srt.layers.attention.flashattention_backend import (
-@@ -20,9 +79,81 @@ if TYPE_CHECKING:
+@@ -20,9 +79,80 @@ if TYPE_CHECKING:
      from sglang.srt.layers.radix_attention import RadixAttention
      from sglang.srt.model_executor.model_runner import ModelRunner
  
@@ -3135,11 +3183,10 @@ index ea02e001f1..330dcaa6d1 100644
 +    pass
 +
 +# PTL-proven fp16 prefill SDPA DPAS kernel (custom_esimd_kernels_sglang, HD=256).
-+# Replaces the cutlass-sycl flash fp16 prefill (which NaNs on Xe / produces
-+# garbage prefill logits) for head_dim==256 fp16. Lazily resolved; gated by
-+# SGL_XPU_PREFILL_DPAS=1. Op namespace is custom_esimd_kernels_vllm (unchanged
-+# from the ported kernel). Falls through to flash_attn_with_kvcache when the op
-+# is unavailable / ineligible.
++# It implements full causal attention only, so hybrid-SWA layers must stay on
++# flash_attn_with_kvcache until the DPAS op accepts a sliding-window bound.
++# Lazily resolved; gated by SGL_XPU_PREFILL_DPAS=1. Op namespace is
++# custom_esimd_kernels_vllm (unchanged from the ported kernel).
 +_prefill_dpas_op = None
 +_prefill_dpas_tried = False
 +
@@ -3189,7 +3236,7 @@ index ea02e001f1..330dcaa6d1 100644
  
  class XPUAttentionBackend(AttentionBackend):
      """XPU FlashAttention backend, currently based on FlashAttentionBackend, will be refactored later.
-@@ -30,7 +161,8 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -30,7 +160,8 @@ class XPUAttentionBackend(AttentionBackend):
      TODO:
      - Prefill and Decode disaggregation, currently only chunked prefill is supported
      - Speculative Decoding support
@@ -3199,7 +3246,7 @@ index ea02e001f1..330dcaa6d1 100644
      - MLA Prefill support
      """
  
-@@ -71,6 +203,15 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -71,6 +202,15 @@ class XPUAttentionBackend(AttentionBackend):
          self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
          self.page_size = model_runner.page_size
          self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
@@ -3215,7 +3262,7 @@ index ea02e001f1..330dcaa6d1 100644
          self.skip_prefill = skip_prefill
          self.is_hybrid_swa = model_runner.is_hybrid_swa
          self.use_sliding_window_kv_pool = (
-@@ -103,6 +244,401 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -103,6 +243,401 @@ class XPUAttentionBackend(AttentionBackend):
          self.has_swa = (
              self.sliding_window_size is not None and self.sliding_window_size > -1
          )
@@ -3617,7 +3664,7 @@ index ea02e001f1..330dcaa6d1 100644
  
      def init_forward_metadata(self, forward_batch: ForwardBatch):
          """Initialize forward metadata hence all layers in the forward pass can reuse it."""
-@@ -590,24 +1126,52 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -590,24 +1125,52 @@ class XPUAttentionBackend(AttentionBackend):
                  cu_seqlens_k = metadata.encoder_cu_seqlens_k
                  window_size = (-1, -1)
  
@@ -3638,11 +3685,10 @@ index ea02e001f1..330dcaa6d1 100644
 -                v_descale=v_descale,
 -                return_softmax_lse=use_cascade_attn,
 -                **kwargs,
-+            # 腿C (#69): for fp16 HD=256 prefill, prefer the PTL-proven DPAS SDPA
-+            # kernel over the cutlass-sycl flash fp16 path (which NaNs / produces
-+            # garbage prefill logits on this Xe stack). Gated by
-+            # SGL_XPU_PREFILL_DPAS=1; falls through to flash_attn_with_kvcache when
-+            # off / ineligible / op missing.
++            # For full-attention fp16 HD=256 prefill, optionally prefer the
++            # PTL-proven DPAS SDPA kernel. The op has no sliding-window argument:
++            # routing an SWA layer through it attends [0, q_pos] instead of
++            # [q_pos-window, q_pos] and can read evicted SWA mappings.
 +            _dpas = (
 +                _get_prefill_dpas_op()
 +                if (
@@ -3651,6 +3697,7 @@ index ea02e001f1..330dcaa6d1 100644
 +                    and layer.head_dim == 256
 +                    and not layer.is_cross_attention
 +                    and not use_cascade_attn
++                    and not is_hybrid_swa
 +                )
 +                else None
              )
@@ -3687,7 +3734,7 @@ index ea02e001f1..330dcaa6d1 100644
  
              if use_cascade_attn:
                  o, softmax_lse, *rest = result
-@@ -865,10 +1429,31 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -865,10 +1428,31 @@ class XPUAttentionBackend(AttentionBackend):
                  -1, self.page_size, layer.tp_v_head_num, layer.head_dim
              )
  
@@ -3720,7 +3767,7 @@ index ea02e001f1..330dcaa6d1 100644
                      k_cache=key_cache,
                      v_cache=value_cache,
                      page_table=metadata.encoder_page_table,
-@@ -887,7 +1472,7 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -887,7 +1471,7 @@ class XPUAttentionBackend(AttentionBackend):
              elif use_local_attn:
                  # Use chunked (local) attention batching for self-attention
                  o = flash_attn_with_kvcache(
@@ -3729,7 +3776,7 @@ index ea02e001f1..330dcaa6d1 100644
                      k_cache=key_cache,
                      v_cache=value_cache,
                      page_table=local_attn_metadata.local_block_table,
-@@ -903,6 +1488,78 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -903,6 +1487,78 @@ class XPUAttentionBackend(AttentionBackend):
                      v_descale=v_descale,
                      **kwargs,
                  )
@@ -3808,7 +3855,7 @@ index ea02e001f1..330dcaa6d1 100644
              else:
                  is_swa_layer = (
                      layer.sliding_window_size is not None
-@@ -929,25 +1586,210 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -929,25 +1585,210 @@ class XPUAttentionBackend(AttentionBackend):
                      -1, layer.tp_q_head_num, layer.head_dim
                  )
  
@@ -4037,7 +4084,7 @@ index ea02e001f1..330dcaa6d1 100644
                  if use_cascade_attn:
                      o, softmax_lse, *rest = result
                      o_expand, softmax_lse_expand, *rest_expand = (
-@@ -1006,6 +1848,27 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -1006,6 +1847,27 @@ class XPUAttentionBackend(AttentionBackend):
          out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
          return out
  
