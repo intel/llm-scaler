@@ -1714,7 +1714,7 @@ index 48ce422..28df482 100644
              set(GENERATED_FILE
                  "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}.cpp")
 diff --git a/src/FMHAPrefillXe20.cmake b/src/FMHAPrefillXe20.cmake
-index 10e836b..52fcd45 100644
+index 10e836b..cb28fbb 100644
 --- a/src/FMHAPrefillXe20.cmake
 +++ b/src/FMHAPrefillXe20.cmake
 @@ -1,8 +1,14 @@
@@ -1745,7 +1745,12 @@ index 10e836b..52fcd45 100644
  set(FMHA_PREFILL_TILED_Q_96 128)
  set(FMHA_PREFILL_TILED_KV_96 64)
  set(FMHA_PREFILL_NUM_SG_96 8)
-@@ -36,10 +38,64 @@ set(FMHA_PREFILL_TILED_Q_512 256)
+@@ -32,14 +34,68 @@ set(FMHA_PREFILL_TILED_Q_256 256)
+ set(FMHA_PREFILL_TILED_KV_256 64)
+ set(FMHA_PREFILL_NUM_SG_256 32)
+ 
+-set(FMHA_PREFILL_TILED_Q_512 256)
++set(FMHA_PREFILL_TILED_Q_512 128)
  set(FMHA_PREFILL_TILED_KV_512 64)
  set(FMHA_PREFILL_NUM_SG_512 32)
  
@@ -12168,11 +12173,27 @@ index 67daca1..52542c3 100644
      auto kernel = PerTensorQuantFP8Kernel<T, DST_DTYPE, VEC_SIZE>(                      \
          static_cast<T*>(input.data_ptr()),                                              \
 diff --git a/src/sycl/xe_fmha_fwd_decode_kernel.cpp.in b/src/sycl/xe_fmha_fwd_decode_kernel.cpp.in
-index 25adf61..6b75e29 100644
+index 25adf61..f91d788 100644
 --- a/src/sycl/xe_fmha_fwd_decode_kernel.cpp.in
 +++ b/src/sycl/xe_fmha_fwd_decode_kernel.cpp.in
-@@ -39,6 +39,36 @@ namespace decode {
+@@ -37,8 +37,45 @@
  
+ namespace decode {
+ 
++// Dispatch helper: instantiate DecodeConfig with the correct Element types based
++// on params.is_bf16. Without this, only the bf16 template was ever compiled,
++// causing fp16 inputs to be silently reinterpreted as bf16 (producing garbage).
++#define DISPATCH_DTYPE_DECODE(LOCAL, SINK, TILEQK, TILEPV, TILEOUT, SGLAYOUT, RUN_FN, PARAMS) \
++  do {                                                                                         \
++    if ((PARAMS).is_bf16) {                                                                    \
++      DecodeConfig<false, LOCAL, SINK, TILEQK, TILEPV, TILEOUT, SGLAYOUT,                     \
++                   void, 1, false, bfloat16_t, bfloat16_t, bfloat16_t, bfloat16_t>::RUN_FN(PARAMS); \
++    } else {                                                                                   \
++      DecodeConfig<false, LOCAL, SINK, TILEQK, TILEPV, TILEOUT, SGLAYOUT,                     \
++                   void, 1, false, half_t, half_t, half_t, half_t>::RUN_FN(PARAMS);            \
++    }                                                                                          \
++  } while (0)
++
  template <>
  void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Arguments& params) const {
 +#if @PAGE_SIZE@ == 128 && @EMIT_NP@
@@ -12191,14 +12212,7 @@ index 25adf61..6b75e29 100644
 +    using SubgroupLayoutQK_NP = cute::Layout<cute::Shape<cute::_1, cute::Int<@TILED_KV_NP@ / 16>, cute::_1>>;
 +    // No sink support for no_page path; always use Sink=false
 +    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-+      DecodeConfig<
-+          false,
-+          LocalMask,
-+          false,
-+          TileShapeQK_NP,
-+          TileShapePV_NP,
-+          TileShapeOutput_NP,
-+          SubgroupLayoutQK_NP>::run_nopaged(params);
++      DISPATCH_DTYPE_DECODE(LocalMask, false, TileShapeQK_NP, TileShapePV_NP, TileShapeOutput_NP, SubgroupLayoutQK_NP, run_nopaged, params);
 +    });
 +    return;
 +  }
@@ -12208,7 +12222,7 @@ index 25adf61..6b75e29 100644
    using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
    using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
    // Round the head-dim of the output tile up to a multiple of get<1>(TileShapePV) (32) so that
-@@ -48,11 +78,25 @@ void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Argume
+@@ -48,13 +85,27 @@ void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Argume
    using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
    using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<@PAGE_SIZE@ / 16>, cute::_1>>;
  
@@ -12216,8 +12230,7 @@ index 25adf61..6b75e29 100644
      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
        AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
 -        DecodeConfig<false, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
-+        DecodeConfig<false, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
-+            params);
++        DISPATCH_DTYPE_DECODE(LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, run_paged, params);
        });
    });
 +#else
@@ -12225,8 +12238,7 @@ index 25adf61..6b75e29 100644
 +        !params.use_sink,
 +        "sink is only supported for head_size == 64, got @HEAD_DIM@");
 +    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-+      DecodeConfig<false, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
-+          params);
++      DISPATCH_DTYPE_DECODE(LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, run_paged, params);
 +    });
 +#endif
 +#else
@@ -12234,13 +12246,33 @@ index 25adf61..6b75e29 100644
 +#endif
  }
  
++#undef DISPATCH_DTYPE_DECODE
++
  template struct FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>;
+ 
+ }  // namespace decode
 diff --git a/src/sycl/xe_fmha_fwd_prefill_kernel.cpp.in b/src/sycl/xe_fmha_fwd_prefill_kernel.cpp.in
-index 1305225..3421dc8 100644
+index 1305225..d296966 100644
 --- a/src/sycl/xe_fmha_fwd_prefill_kernel.cpp.in
 +++ b/src/sycl/xe_fmha_fwd_prefill_kernel.cpp.in
-@@ -38,6 +38,32 @@ namespace prefill {
+@@ -36,8 +36,47 @@
  
+ namespace prefill {
+ 
++// Dispatch helper: instantiate FMHAConfig with the correct Element types based
++// on params.is_bf16. Without this, only the bf16 template was ever compiled,
++// causing fp16 inputs to be silently reinterpreted as bf16 (producing garbage).
++#define DISPATCH_DTYPE_PREFILL(CAUSAL, LOCAL, SINK, TILEQK, TILEPV, TILEOUT, SGLAYOUT, RUN_FN, PARAMS) \
++  do {                                                                                                  \
++    if ((PARAMS).is_bf16) {                                                                             \
++      FMHAConfig<CAUSAL, LOCAL, SINK, TILEQK, TILEPV, TILEOUT, SGLAYOUT,                               \
++                 void, 2, false, bfloat16_t, bfloat16_t, bfloat16_t, bfloat16_t>::RUN_FN(PARAMS);      \
++    } else {                                                                                            \
++      FMHAConfig<CAUSAL, LOCAL, SINK, TILEQK, TILEPV, TILEOUT, SGLAYOUT,                               \
++                 void, 2, false, half_t, half_t, half_t, half_t>::RUN_FN(PARAMS);                       \
++    }                                                                                                   \
++  } while (0)
++
  template <>
  void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
 +  bool use_sink = (params.softmax_sink_ptr != nullptr);
@@ -12260,8 +12292,7 @@ index 1305225..3421dc8 100644
 +    // No sink support for no_page path; always use Sink=false
 +    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
 +      AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-+        FMHAConfig<Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_nopaged(
-+            params);
++        DISPATCH_DTYPE_PREFILL(Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, run_nopaged, params);
 +      });
 +    });
 +    return;
@@ -12272,7 +12303,7 @@ index 1305225..3421dc8 100644
    using TileShapeQK = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_KV@>, cute::_32>;
    using TileShapePV = cute::Shape<cute::Int<@TILED_Q@>, cute::_32, cute::Int<@TILED_KV@>>;
    // Round the head-dim of the output tile up to a multiple of get<1>(TileShapePV) (32) so that
-@@ -48,14 +74,29 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
+@@ -48,16 +87,31 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
    using SubgroupLayoutQK =
        cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
  
@@ -12282,8 +12313,7 @@ index 1305225..3421dc8 100644
      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
        AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
 -        FMHAConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(params);
-+        FMHAConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
-+            params);
++        DISPATCH_DTYPE_PREFILL(Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, run_paged, params);
        });
      });
    });
@@ -12293,8 +12323,7 @@ index 1305225..3421dc8 100644
 +      "sink is only supported for head_size == 64, got @HEAD_DIM@");
 +  AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
 +    AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-+      FMHAConfig<Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
-+          params);
++      DISPATCH_DTYPE_PREFILL(Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, run_paged, params);
 +    });
 +  });
 +#endif
@@ -12303,20 +12332,43 @@ index 1305225..3421dc8 100644
 +#endif
  }
  
++#undef DISPATCH_DTYPE_PREFILL
++
  template struct FmhaPrefillRunner<@HEAD_DIM@>;
+ 
+ }  // namespace prefill
 diff --git a/src/sycl/xe_fmha_fwd_split_decode_kernel.cpp.in b/src/sycl/xe_fmha_fwd_split_decode_kernel.cpp.in
-index 5cadeb5..1e05464 100644
+index 5cadeb5..99a154f 100644
 --- a/src/sycl/xe_fmha_fwd_split_decode_kernel.cpp.in
 +++ b/src/sycl/xe_fmha_fwd_split_decode_kernel.cpp.in
-@@ -48,12 +48,22 @@ void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const A
+@@ -37,6 +37,17 @@
+ 
+ namespace decode {
+ 
++#define DISPATCH_DTYPE_SPLIT_DECODE(LOCAL, SINK, TILEQK, TILEPV, TILEOUT, SGLAYOUT, PARAMS) \
++  do {                                                                                       \
++    if ((PARAMS).is_bf16) {                                                                  \
++      SplitDecodeConfig<false, LOCAL, SINK, TILEQK, TILEPV, TILEOUT, SGLAYOUT,              \
++                        void, 1, bfloat16_t, bfloat16_t, bfloat16_t, bfloat16_t>::run(PARAMS); \
++    } else {                                                                                 \
++      SplitDecodeConfig<false, LOCAL, SINK, TILEQK, TILEPV, TILEOUT, SGLAYOUT,              \
++                        void, 1, half_t, half_t, half_t, half_t>::run(PARAMS);               \
++    }                                                                                        \
++  } while (0)
++
+ template <>
+ void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const Arguments& params) const {
+   using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
+@@ -48,14 +59,24 @@ void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>::operator()(const A
    using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
    using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<@PAGE_SIZE@ / 16>, cute::_1>>;
  
 +#if @HEAD_DIM@ == 64
      AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
        AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-         SplitDecodeConfig<false, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(
-             params);
+-        SplitDecodeConfig<false, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(
+-            params);
++        DISPATCH_DTYPE_SPLIT_DECODE(LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, params);
        });
    });
 +#else
@@ -12324,13 +12376,16 @@ index 5cadeb5..1e05464 100644
 +        !params.use_sink,
 +        "sink is only supported for head_size == 64, got @HEAD_DIM@");
 +    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-+      SplitDecodeConfig<false, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run(
-+          params);
++      DISPATCH_DTYPE_SPLIT_DECODE(LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK, params);
 +    });
 +#endif
  }
  
++#undef DISPATCH_DTYPE_SPLIT_DECODE
++
  template struct FmhaSplitDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@>;
+ 
+ }  // namespace decode
 diff --git a/src/torch_extension_sycl.cc b/src/torch_extension_sycl.cc
 index 06f702b..6f7cc45 100644
 --- a/src/torch_extension_sycl.cc
