@@ -1,10 +1,158 @@
 diff --git a/GEMMA4_BMG_OPTIMIZATION_STATUS.md b/GEMMA4_BMG_OPTIMIZATION_STATUS.md
 new file mode 100644
-index 0000000000..655f988bba
+index 0000000000000000000000000000000000000000..75468f56596b62b26a3952c2ca06677039cbf181
 --- /dev/null
 +++ b/GEMMA4_BMG_OPTIMIZATION_STATUS.md
-@@ -0,0 +1,1373 @@
+@@ -0,0 +1,1521 @@
 +# Gemma4-31B FP16 FP8 Decode Optimization Status (BMG TP=2)
++
++## UPDATE (2026-08-20): Gemma4-26B-A4B TP=2 online FP8
++
++Work is based on the post-merge `analytics-zoo/sglang:dev-bmg`,
++`analytics-zoo/sgl-kernel-xpu:dev-bmg`, and `intel/llm-scaler:main` branches.
++The model has 30 decoder layers, hidden size 2816, 128 experts, top-k 8, and
++MoE intermediate size 704 (352 per TP=2 rank).
++
++### Implemented path
++
++- Online-FP8 routed GELU-tanh MoE supports both E4M3 and E5M2.
++- Decode consumes raw router logits and fuses top-k, route scaling, eight expert
++  up/GELU/down paths, accumulation, and the TP allreduce handoff.
++- Prefill uses the M-tiled DPAS expert kernels plus the production ESIMD top-k.
++- Decode-only ESIMD fusion covers input RMSNorm+QKV GEMV, post-attention
++  norm+residual+pre-FF norm+dense gate/up/GELU, and router norm+GEMV+MoE-input
++  norm.
++- Batched ESIMD dual RMSNorm covers both prefill and decode; the final XPU
++  request trace has no Gemma or infrastructure Triton kernel.
++- The Gemma fused fast path requires one FP32 scalar scale per expert;
++  block-quant checkpoints retain the existing block-aware fallback. The
++  supported checkpoint dynamically quantizes BF16 fused expert weights to the
++  scalar-scale format.
++
++The first E4M3 end-to-end run emitted only `<pad>`. Layer probes located the
++first non-finite value at layer-0 `moe_out`: a finite gate value of 23.8125
++entered `(exp(2*z)-1)/(exp(2*z)+1)`, producing `inf/inf`. Clamping `2*z` to
++`[-30, 30]`, matching the root-cause fix in `intel/llm-scaler#574`, fixes
++E4M3/E5M2 decode and prefill.
++
++### Kernel and model correctness
++
++- The final kernel suite has 21 tests covering E4M3/E5M2, direct and prefill
++  MoE, overflow gates, raw-logits decode, fused dense/router/QKV/dual-norm
++  kernels, production top-k, and int32/int64 KV request indices.
++- The reviewed sgl-kernel wheel also passes all 229 KVCacheIO tests, including
++  rejection of CPU/non-contiguous metadata and unaligned page-head layouts.
++- E4M3 answers the arithmetic sanity prompt correctly and recalls
++  `XPU-MOE-FINAL-E4` from a real 7705-token chat prompt.
++- E5M2 answers the arithmetic sanity prompt correctly and recalls
++  `XPU-MOE-FINAL-E5` from the same long-context test.
++- BFCL v4 `multi_turn_base` formal results are **128/200 = 64.00%** for both
++  E4M3 and E5M2, above the required 60%. Both runs completed with zero
++  inference errors and left the server healthy. The checkpoint emits native
++  `call:name(...)` syntax, so the vendored Gemma handler normalizes it to
++  BFCL's `[name(...)]` form before execution.
++
++### Long-run BFCL non-finite root cause
++
++The first E4M3 full run exited after a delayed prefill non-finite value. The
++failure was not resolved by synchronizing large or all collectives, cloning
++allreduce buffers, disabling W8A16 prefill, or synchronizing the M-tiled MoE
++kernel. Forcing direct MoE changed the trigger, but was not a production fix.
++
++The 0818 base image actually loaded pip-provided oneCCL **2021.17.2** through
++`libtorch_xpu.so`'s RPATH. The llm-scaler Dockerfile requires **2021.15.9** and
++links the torch-visible `libccl.so.1` to
++`/opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1.0`. After restoring that runtime:
++
++- dynamic TP=2 allreduce passed 1000 iterations;
++- production M-tiled MoE prefill followed by XCCL passed 3000 iterations;
++- the original cases 94-168 completed in one server process (75/75, zero
++  inference errors, zero non-finite probes);
++- E4M3 and E5M2 each completed the formal 200-case BFCL run with zero
++  inference errors.
++
++The ineffective sync/clone/direct-MoE diagnostic switches were removed. Derived
++images must preserve the Dockerfile's oneCCL 2021.15.9 link; installing a
++package that restores 2021.17.2 invalidates this configuration.
++
++### Canonical performance
++
++Radix-off, `max-running-requests=1`, bsz=1, two warmups, three trials, median:
++
++| input | baseline TPOT | final TTFT | final TPOT | decode tok/s |
++|---:|---:|---:|---:|---:|
++| 1024 | 37.18 ms | 121.6 ms | **17.37 ms** | 57.6 |
++| 2048 | 37.24 ms | 242.4 ms | **17.54 ms** | 57.0 |
++| 4096 | 37.12 ms | 491.6 ms | **17.60 ms** | 56.8 |
++| 8192 | — | 1024.0 ms | **17.47 ms** | 57.2 |
++
++These final numbers use the shippable oneCCL 2021.15.9 runtime after removing
++all diagnostic synchronization. The path is about **2.11-2.14x** faster than
++the original 37.2 ms path and clears the requested `<20 ms` target at every
++canonical context length. E5M2 is likewise flat at **17.16/17.21/17.27/17.34
++ms** for 1K/2K/4K/8K.
++
++These numbers were revalidated from the reviewed final image. Both FP8 formats
++returned `42` for chat sanity, and the live TP0 scheduler mapped
++`/opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1.0`.
++
++The initial profiler-based claim that allreduce was the primary remaining
++bottleneck was wrong. An exact TP=2 `[1,2816]` microbenchmark measures one
++allreduce at about 57 us; 90 launches cost about 5.1 ms per step. The original
++MoE kernel costs about 3 ms/step and the four projection GEMVs about 4 ms/step.
++The recoverable gap was primarily hundreds of eager launches and Python
++dispatch around norm/router/MLP chains, not collective self-time.
++
++The optimization sequence was approximately 37.2 -> 30.0 -> 25.3 -> 23.1 ->
++21.0 -> 20.5 -> 17.5 ms as router, full-MoE, dense, QKV, MoE-down accumulation,
++and final norm chains were fused. Replacing the remaining KV-index Triton
++kernel with native SYCL gives the final 17.1-17.2 ms result.
++
++### Triton audit
++
++Trace
++`gemma26-triton-free-v2-profile/1787211431.66563-TP-0.trace.json.gz`
++contains one prefill plus 64 decode forwards and 38,892 kernel events:
++
++- `DualRmsNormResidualScalarKernel`: 1950
++- `MoE_TopK_V2_Kernel`: 1950
++- `MoeUpDecodeGeluTanh`: 1920
++- `MoeDownAccumulateDecode`: 1920
++- `XpuCreateKvIndicesKernel`: 64
++- names containing `triton` or the old `_gemma*` fallbacks: **0**
++
++Batched dual RMSNorm microbenchmarks are 8.3 us vs 22.2 us at M=32 and
++14.4 us vs 37.4 us at M=1024 (ESIMD vs Triton). The native KV-index builder is
++5.55 us vs 15.66 us at bs=1, length=1024, and 5.60 us vs 14.88 us at length
++4096.
++
++### 8K prefill observation
++
++An earlier synthetic 8K request stalled after four 1024-token chunks. That was
++recorded as an observation rather than attributed to a kernel because a 7.7K
++real-text recall request already worked. The final path no longer reproduces
++the stall: the canonical 8192-input, 256-output benchmark completes with
++1024.0 ms median TTFT and 17.47 ms TPOT.
++The original one-off stall remains unassigned; it is not evidence that 8K or
++the M-tiled MoE path is unsupported.
++
++### Workload-specific launch profiles
++
++The launch configuration is now persisted as separate scripts in llm-scaler:
++
++- `run_gemma4_26b_moe_canonical.sh`: radix off, max-running=1; use only for
++  fixed-length bsz=1 latency.
++- `run_gemma4_26b_moe_bfcl.sh`: radix on, SWA full-token ratio 0.2,
++  max-running=1; use for BFCL cumulative multi-turn prompts.
++- `run_gemma4_26b_moe.sh`: radix-on serving default with an explicit
++  `GEMMA4_WORKLOAD_PROFILE` banner.
++
++Switching profiles requires a full container restart. A BFCL full run was
++mistakenly started on the canonical radix-off server: each case made 5-14
++generations with cumulative 6.6K-11.5K-token prompts, causing the entire history
++to be re-prefilled every step. The first 92 completed rows remain valid for
++accuracy and are resumed on the radix-on profile; their latency must not be used
++as BFCL performance data.
 +
 +## ✅ UPDATE (2026-07-08): Gemma4 MTP 在 BMG/XPU 已打通（GAP AUDIT 中的阻塞项已解决）
 +
@@ -98,19 +246,19 @@ index 0000000000..655f988bba
 +1. **workload-specific accept_len 塌**（跟 bs 无关）：BFCL bs=1 accept_len 已经只有 1.0–2.4，bs=2/4 也是 1.00–1.25。gsm8k bs=1/2/4 全部 3+。差异在 workload 本身：BFCL 输出高度结构化 tool_call（`[cd(folder='document'), ...]`），具体参数值不可预测；gemma-4 chat template 里 tool_call 前后有特殊 marker，assistant/target 对这些位置的分布分歧大。**这不是 XPU 或 spec 实现的 bug，是 draft 与 target 对 tool-call 语言的一致性差。**
 +
 +   **实测证据（2026-07-08，`analyze_mtp_dump.py`，MTP bs=1 各跑 1 条 gsm8k 和 1 条 BFCL multi_turn_base_0）：**
-+   
++
 +   | workload | steps | avg accept_len | accept_rate | pos0 拒率 | pos1 拒率 | pos2 拒率 |
 +   |---|---|---|---|---|---|---|
 +   | gsm8k | 204 | 2.108 | 0.369 | 0.490 | 0.667 | 0.735 |
 +   | BFCL | 584 | **1.120** | **0.040** | **0.901** | **0.990** | **0.990** |
-+   
++
 +   BFCL 上 draft 的第一个 token 就有 90% 概率被拒，第 2/3 位几乎不可能命中。看被拒 target token 的分布（top-20 出现频次）：
 +   - **具体参数 payload**：`'pdf'`(64), `'report'`(62), `'final'`(54), `'analysis'`(40), `'temp'`(30), `'budget'`(30), `'content'`(26) —— 每例独有的文件名/字段值，assistant 4 层小模型无法从上下文预测；
 +   - **tool_call 语法 delimiter**：`'_'`(84), `"='"`(80), `" '"`(66), `"'"`(54), `'('`(44), `"',"`(22), `"')]"`(22) —— tool_call 结构符号序列；
 +   - **chat template 结构 marker**：`'<turn|>'`(38) —— gemma-4 template 的 turn boundary，每次 tool_call 结束都要正确 emit，draft 判断能力弱。
-+   
++
 +   对比 gsm8k 被拒 top-20 包含 `' day'`, `' used'`, `' remaining'`, `' the'`, `' of'`, `' to'` 等自然语言高频词，assistant 至少能猜对相当比例（accept_rate 37%）。
-+   
++
 +   BFCL 单条请求共生成 654 tokens、88 个 unique token，top 30 里几乎全是 `_ = ' ( 'pdf' 'report' 'final' Year` 之类 payload/语法，**结构上就是"低 self-consistency"的高熵序列**——每个 token 都在 encoding 独有信息，assistant 猜不到不是 bug，是 draft 模型自身能力上限（`num_hidden_layers=4`, `hidden=1024`）+ workload 特性。
 +
 +2. **bs=8 + BFCL hang（bs≤4 相同 workload 不 hang；同 bs=8 但 gsm8k workload 不 hang）**：BFCL bs=4 accept 也塌到 1.00，但没 hang（93s 跑完 10 例）；后续用 gsm8k n=200 parallel=8 复测，**同 server config 但换 gsm8k workload 也不 hang**（299.9s 顺跑，见下 §gsm8k bs=8 A/B）。所以 hang **同时需要 bs=8 + BFCL 长累积 context**（每 turn 追加 tool_call 结果，10 turn 后单请求 context 数千 tok，8 并发就是数万活跃 KV），不是纯 bs=8 或纯 spec 逻辑问题。
@@ -159,51 +307,51 @@ index 0000000000..655f988bba
 +
 +### 2) 阻塞本项目交付的核心 gap
 +
-+1. **intel_xpu attention backend 对 speculative 仍硬阻断**  
++1. **intel_xpu attention backend 对 speculative 仍硬阻断**
 +   `python/sglang/srt/layers/attention/xpu_backend.py` 在 decode 分支中，当
 +   `forward_batch.spec_info is not None` 时直接 `assert False`，报错
-+   “XPUAttentionBackend doesn't support speculative decoding yet...”。  
++   “XPUAttentionBackend doesn't support speculative decoding yet...”。
 +   这意味着只要走 `intel_xpu` backend，就无法跑 MTP/Frozen-KV。
 +
-+2. **与本项目 shippable 启动块冲突**  
++2. **与本项目 shippable 启动块冲突**
 +   本文 “Launch Configuration” 的已交付命令固定使用
-+   `--attention-backend intel_xpu`（TP=2 eager 路径）。  
++   `--attention-backend intel_xpu`（TP=2 eager 路径）。
 +   因为上面第 1 条，该交付路径与 Gemma4 MTP 当前不可兼容。
 +
-+3. **Frozen-KV MTP 在调度能力上仍是 spec-v1 语义**  
++3. **Frozen-KV MTP 在调度能力上仍是 spec-v1 语义**
 +   `speculative_hook.py::_handle_frozen_kv_mtp` 与
-+   `spec_info.py` 明确：  
-+   - 不支持 spec v2 overlap（会强制 `disable_overlap_schedule=True`）；  
-+   - 会关闭 mixed chunk；  
-+   - 采用独立的 FrozenKVMTPWorker 路径。  
++   `spec_info.py` 明确：
++   - 不支持 spec v2 overlap（会强制 `disable_overlap_schedule=True`）；
++   - 会关闭 mixed chunk；
++   - 采用独立的 FrozenKVMTPWorker 路径。
 +   这与我们当前对 overlap/chunk 的性能调优路线存在结构性差异，后续需单独评估。
 +
-+4. **Frozen-KV MTP 的图捕获仅支持 CUDA，不支持 XPU graph**  
++4. **Frozen-KV MTP 的图捕获仅支持 CUDA，不支持 XPU graph**
 +   `speculative/frozen_kv_mtp_worker.py::init_cuda_graphs` 明确仅在
-+   `target_worker.device == "cuda"` 时启用 draft CUDA graph；在 XPU 只走 eager draft loop。  
++   `target_worker.device == "cuda"` 时启用 draft CUDA graph；在 XPU 只走 eager draft loop。
 +   即便功能打通，XPU 侧仍缺少 draft/verify 图化收益。
 +
-+5. **文档与本项目现实能力存在“可用性口径差”**  
-+   - `docs_new/cookbook/autoregressive/Google/Gemma4.mdx` 给出 Gemma4 + NEXTN 命令；  
++5. **文档与本项目现实能力存在“可用性口径差”**
++   - `docs_new/cookbook/autoregressive/Google/Gemma4.mdx` 给出 Gemma4 + NEXTN 命令；
 +   - 交互部署片段 `docs_new/src/snippets/autoregressive/gemma4-deployment.jsx`
-+     也提供 MTP 开关（仅对 MI300X 隐藏），但没有 Intel XPU/BMG 专项限制说明。  
++     也提供 MTP 开关（仅对 MI300X 隐藏），但没有 Intel XPU/BMG 专项限制说明。
 +   对本项目而言，这会造成“文档看似可开 MTP，但 intel_xpu 路径实不可用”的认知偏差。
 +
 +### 3) 尚未完成的验证 gap（必须补测）
 +
-+- **未有本机 BMG 上 “intel_xpu + ESIMD 路径 + Gemma4 assistant + NEXTN(FROZEN_KV_MTP)” 的正确性门禁结果**  
++- **未有本机 BMG 上 “intel_xpu + ESIMD 路径 + Gemma4 assistant + NEXTN(FROZEN_KV_MTP)” 的正确性门禁结果**
 +  （至少应有 chat harness 正确性 gate；不以 Triton 作为目标实现）。
-+- **未有同口径性能数据**：  
++- **未有同口径性能数据**：
 +  目前没有 “MTP(intel_xpu+ESIMD 路径) vs 非 MTP(intel_xpu shippable 路径)” 的对齐 A/B。
-+- **未形成 XPU 迁移方案的代码级拆解任务**：  
++- **未形成 XPU 迁移方案的代码级拆解任务**：
 +  例如：`xpu_backend` speculative metadata/verify/draft 扩展、与 SWA/full pool 的一致性、
 +  topk/page_size 组合约束、以及是否借鉴 ptl 分支的 XPU speculative kernel 资产。
 +
 +### 4) 建议的收敛顺序（后续执行项）
 +
-+1. 先做 **intel_xpu 后端 speculative 打通**：移除当前 assert 路障，补齐 metadata/verify/draft 路径，目标实现为 ESIMD 内核方案（不引入 Triton 目标依赖）。  
-+2. 做 **功能可用性最小闭环**：在 BMG 上跑通 `intel_xpu + NEXTN + gemma4-31B-assistant`，拿到正确性 gate。  
-+3. 再做 **同口径性能 A/B**：与当前 `intel_xpu` 非 MTP shippable 路径做对齐对比。  
++1. 先做 **intel_xpu 后端 speculative 打通**：移除当前 assert 路障，补齐 metadata/verify/draft 路径，目标实现为 ESIMD 内核方案（不引入 Triton 目标依赖）。
++2. 做 **功能可用性最小闭环**：在 BMG 上跑通 `intel_xpu + NEXTN + gemma4-31B-assistant`，拿到正确性 gate。
++3. 再做 **同口径性能 A/B**：与当前 `intel_xpu` 非 MTP shippable 路径做对齐对比。
 +4. 最后补文档：明确“Gemma4 MTP 在 Intel XPU（ESIMD 路径）的已验证组合与限制”。
 +
 +## ✅ FIXED (2026-07-06): SWA seq>1024 decode garble — host-side page-aligned windowing
@@ -1379,7 +1527,7 @@ index 0000000000..655f988bba
 +  移除 `and False` 守卫）。注：lm_head 未分片 2.82GB 已在内存墙，ESIMD 相对 oneDNN 仅 +0.13ms，启用无害但非 3ms 提升。
 diff --git a/GEMMA4_DECODE_PERF_ROOFLINE.md b/GEMMA4_DECODE_PERF_ROOFLINE.md
 new file mode 100644
-index 0000000000..0f6c8025eb
+index 0000000000000000000000000000000000000000..0f6c8025ebdc5c82fc32253c339cb2953b1e303b
 --- /dev/null
 +++ b/GEMMA4_DECODE_PERF_ROOFLINE.md
 @@ -0,0 +1,410 @@
@@ -1795,7 +1943,7 @@ index 0000000000..0f6c8025eb
 +  `_per_token_group_quant_8bit` last-cluster boundary).
 diff --git a/GEMMA4_FP16_OPTIMIZATION_PLAN.md b/GEMMA4_FP16_OPTIMIZATION_PLAN.md
 new file mode 100644
-index 0000000000..0ff498a9df
+index 0000000000000000000000000000000000000000..0ff498a9df9c7c910cdbbf01a7a25a3fe27de0c3
 --- /dev/null
 +++ b/GEMMA4_FP16_OPTIMIZATION_PLAN.md
 @@ -0,0 +1,100 @@
@@ -1901,7 +2049,7 @@ index 0000000000..0ff498a9df
 +| 8 | Allreduce overlap with compute | Overlap TP comm with non-dependent kernels | ~5-10% | Algorithmic; ⚠️ **修正 2026-07-06**：`overlap_schedule` 实测在 bsz=1 **decode 上有收益（TPOT −1.4ms/~3.7%）**，对 prefill(TTFT) 反而略有负担（见 STATUS 文档 "Overlap Schedule A/B"）。此处旧论断"helps prefill not decode"已被推翻。保持 overlap ON（默认）。 |
 diff --git a/GEMMA4_XPU_GRAPH_STATUS.md b/GEMMA4_XPU_GRAPH_STATUS.md
 new file mode 100644
-index 0000000000..21de805cb7
+index 0000000000000000000000000000000000000000..21de805cb7954aaa3afd58aea81b4cdd222cfe30
 --- /dev/null
 +++ b/GEMMA4_XPU_GRAPH_STATUS.md
 @@ -0,0 +1,140 @@
@@ -2047,7 +2195,7 @@ index 0000000000..21de805cb7
 +  `6eaf848187` (SWA order fix + breakable-graph WIP).
 diff --git a/HD512_PAGE_ATTN_KERNEL_BUG.md b/HD512_PAGE_ATTN_KERNEL_BUG.md
 new file mode 100644
-index 0000000000..489b4979ec
+index 0000000000000000000000000000000000000000..489b4979ec6c4db1f56d3b9c6c5a5020a3c31327
 --- /dev/null
 +++ b/HD512_PAGE_ATTN_KERNEL_BUG.md
 @@ -0,0 +1,124 @@
@@ -2176,7 +2324,7 @@ index 0000000000..489b4979ec
 +
 +Option 3 is simplest: set `SGLANG_GEMMA4_DISABLE_FUSED_QKV_NORM=1` or gate the fused path on `head_dim == 256` (same as ESIMD qkv eligibility).
 diff --git a/python/pyproject.toml b/python/pyproject.toml
-index a8e086c361..bec0935373 100755
+index a8e086c3612bac67c907ccb88f4ff529e06eefc8..bec0935373211eb2a63c9be415b8c64dc046ef2d 100755
 --- a/python/pyproject.toml
 +++ b/python/pyproject.toml
 @@ -1,5 +1,5 @@
@@ -2372,7 +2520,7 @@ index a8e086c361..bec0935373 100755
 -[tool.kernels.dependencies]
 -"kernels-community/sgl-flash-attn3" = 1
 diff --git a/python/sglang/srt/configs/load_config.py b/python/sglang/srt/configs/load_config.py
-index 44ee91a1a2..38de4d83ab 100644
+index 44ee91a1a2106212ecbb2ef26a367893eaf1f41b..38de4d83abb81bf8033d10fa6192a121b89dc27f 100644
 --- a/python/sglang/srt/configs/load_config.py
 +++ b/python/sglang/srt/configs/load_config.py
 @@ -25,6 +25,7 @@ class LoadFormat(str, enum.Enum):
@@ -2384,7 +2532,7 @@ index 44ee91a1a2..38de4d83ab 100644
      JAX = "jax"
      REMOTE = "remote"
 diff --git a/python/sglang/srt/distributed/device_communicators/xpu_communicator.py b/python/sglang/srt/distributed/device_communicators/xpu_communicator.py
-index 78931ac7c4..ed639a3b60 100644
+index 78931ac7c4fb5efae9035e089a0d9589153e759a..ed639a3b60939b0e9bd00909b1adf03ed1991338 100644
 --- a/python/sglang/srt/distributed/device_communicators/xpu_communicator.py
 +++ b/python/sglang/srt/distributed/device_communicators/xpu_communicator.py
 @@ -9,6 +9,14 @@ from torch.distributed import ProcessGroup
@@ -2421,7 +2569,7 @@ index 78931ac7c4..ed639a3b60 100644
          return x
  
 diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index 435c30a5cf..5abb15f221 100644
+index 435c30a5cfd99f457b580bd3d3894424a89d3df8..5abb15f221ee34af22fc31b46fb48d76eaa79888 100644
 --- a/python/sglang/srt/environ.py
 +++ b/python/sglang/srt/environ.py
 @@ -656,6 +656,11 @@ class Envs:
@@ -2438,7 +2586,7 @@ index 435c30a5cf..5abb15f221 100644
  
 diff --git a/python/sglang/srt/layers/attention/fla/chunk_torch_xpu.py b/python/sglang/srt/layers/attention/fla/chunk_torch_xpu.py
 new file mode 100644
-index 0000000000..7c2b076900
+index 0000000000000000000000000000000000000000..7c2b0769003ff2ba169c49cde30871acd59b9580
 --- /dev/null
 +++ b/python/sglang/srt/layers/attention/fla/chunk_torch_xpu.py
 @@ -0,0 +1,167 @@
@@ -2610,7 +2758,7 @@ index 0000000000..7c2b076900
 +        h_out = h_out.unsqueeze(0)  # [1, total_chunks, H, V, K]
 +    return o, last_state, h_out
 diff --git a/python/sglang/srt/layers/attention/fla/layernorm_gated.py b/python/sglang/srt/layers/attention/fla/layernorm_gated.py
-index 5a8fda41b4..99c56f9ff8 100644
+index 5a8fda41b4f1620ddb428484f7229d5d99556dad..99c56f9ff86ab66af82b89f81d0eed8bde39af19 100644
 --- a/python/sglang/srt/layers/attention/fla/layernorm_gated.py
 +++ b/python/sglang/srt/layers/attention/fla/layernorm_gated.py
 @@ -22,11 +22,27 @@ from sglang.srt.utils import (
@@ -2700,7 +2848,7 @@ index 5a8fda41b4..99c56f9ff8 100644
 +            activation=self.activation,
 +        )
 diff --git a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
-index d0a8ff7a90..32d5c8b672 100644
+index d0a8ff7a90bbea0a4d22232c6640f2678cc470a7..32d5c8b6727a3e12906c117154a370f4d103eda0 100644
 --- a/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
 +++ b/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
 @@ -1,4 +1,5 @@
@@ -2826,7 +2974,7 @@ index d0a8ff7a90..32d5c8b672 100644
                  ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
                      forward_metadata.track_ssm_final_src
 diff --git a/python/sglang/srt/layers/attention/linear/gdn_backend.py b/python/sglang/srt/layers/attention/linear/gdn_backend.py
-index ade156e98c..122e952f76 100644
+index ade156e98cdbd5e95746a7387450ef55aa17e3c3..122e952f768413204a07bb7e85a770c4bf3bd7ad 100644
 --- a/python/sglang/srt/layers/attention/linear/gdn_backend.py
 +++ b/python/sglang/srt/layers/attention/linear/gdn_backend.py
 @@ -1,3 +1,5 @@
@@ -2892,7 +3040,7 @@ index ade156e98c..122e952f76 100644
  
          return core_attn_out
 diff --git a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
-index 0daf8f4e25..93ce0defcc 100644
+index 0daf8f4e25714bccc4debc93a75c02304335dbab..93ce0defcc21daf8a96af7f8bd47eeb6a2a81e94 100644
 --- a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
 +++ b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
 @@ -34,6 +34,17 @@ elif is_xpu():
@@ -2973,7 +3121,7 @@ index 0daf8f4e25..93ce0defcc 100644
          )
  
 diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py
-index ae5365e8d6..0f54d2a8ce 100644
+index ae5365e8d6f760ff5837216f5e235495e7f44683..0f54d2a8ceb03e37f529a72df7833ca23cabc014 100644
 --- a/python/sglang/srt/layers/attention/triton_backend.py
 +++ b/python/sglang/srt/layers/attention/triton_backend.py
 @@ -36,6 +36,21 @@ _is_gfx942 = is_gfx942_supported()
@@ -3083,7 +3231,7 @@ index ae5365e8d6..0f54d2a8ce 100644
              q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
              self.token_to_kv_pool.get_key_buffer(layer.layer_id),
 diff --git a/python/sglang/srt/layers/attention/xpu_backend.py b/python/sglang/srt/layers/attention/xpu_backend.py
-index ea02e001f1..f8de84cb50 100644
+index ea02e001f13ef31d784ffc9623198a174694f594..51a1a5b0c27b802b78ecfa77872d97cd5b4e75af 100644
 --- a/python/sglang/srt/layers/attention/xpu_backend.py
 +++ b/python/sglang/srt/layers/attention/xpu_backend.py
 @@ -1,9 +1,68 @@
@@ -3155,7 +3303,7 @@ index ea02e001f1..f8de84cb50 100644
  from sglang.srt.configs.model_config import AttentionArch
  from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
  from sglang.srt.layers.attention.flashattention_backend import (
-@@ -20,9 +79,80 @@ if TYPE_CHECKING:
+@@ -20,9 +79,85 @@ if TYPE_CHECKING:
      from sglang.srt.layers.radix_attention import RadixAttention
      from sglang.srt.model_executor.model_runner import ModelRunner
  
@@ -3168,10 +3316,15 @@ index ea02e001f1..f8de84cb50 100644
 +# head, so the XPU graph decode path routes here instead. Gated by
 +# SGL_XPU_DECODE_SGLANG_ATTN (default on); falls back to eagle when unavailable.
 +_sglang_decode_attn_fn = None
++_xpu_create_kv_indices_fn = None
 +try:
 +    from custom_esimd_kernels_sglang import sglang_decode_attn as _sglang_decode_attn_fn
++    from custom_esimd_kernels_sglang import (
++        xpu_create_kv_indices as _xpu_create_kv_indices_fn,
++    )
 +except Exception:
 +    _sglang_decode_attn_fn = None
++    _xpu_create_kv_indices_fn = None
  from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
  
 +_esimd_page_attn_decode = None
@@ -3236,7 +3389,7 @@ index ea02e001f1..f8de84cb50 100644
  
  class XPUAttentionBackend(AttentionBackend):
      """XPU FlashAttention backend, currently based on FlashAttentionBackend, will be refactored later.
-@@ -30,7 +160,8 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -30,7 +165,8 @@ class XPUAttentionBackend(AttentionBackend):
      TODO:
      - Prefill and Decode disaggregation, currently only chunked prefill is supported
      - Speculative Decoding support
@@ -3246,7 +3399,7 @@ index ea02e001f1..f8de84cb50 100644
      - MLA Prefill support
      """
  
-@@ -71,6 +202,15 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -71,6 +207,15 @@ class XPUAttentionBackend(AttentionBackend):
          self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
          self.page_size = model_runner.page_size
          self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
@@ -3262,7 +3415,7 @@ index ea02e001f1..f8de84cb50 100644
          self.skip_prefill = skip_prefill
          self.is_hybrid_swa = model_runner.is_hybrid_swa
          self.use_sliding_window_kv_pool = (
-@@ -103,6 +243,401 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -103,6 +248,393 @@ class XPUAttentionBackend(AttentionBackend):
          self.has_swa = (
              self.sliding_window_size is not None and self.sliding_window_size > -1
          )
@@ -3293,8 +3446,8 @@ index ea02e001f1..f8de84cb50 100644
 +        CPU-GPU pipeline on every full-attention layer) is removed:
 +        kv_indices is sized to the upper bound ``bs * max_seq_len_k`` (a CPU
 +        int already available on ``metadata``, no device readback needed).
-+        create_flashinfer_kv_indices_triton only writes into the ranges
-+        indexed by kv_indptr, so an over-sized buffer is safe, and
++        xpu_create_kv_indices only writes into the ranges indexed by
++        kv_indptr, so an over-sized buffer is safe, and
 +        sglang_decode_attn only reads the kv_indptr-delimited ranges."""
 +        bs = forward_batch.batch_size
 +        # kv_indptr/kv_indices/temp_p depend only on this step's cache_seqlens
@@ -3391,18 +3544,14 @@ index ea02e001f1..f8de84cb50 100644
 +            dtype=torch.int32,
 +            out=kv_indptr[1:],
 +        )
-+        from sglang.srt.layers.attention.triton_ops.kv_indices import (
-+            create_flashinfer_kv_indices_triton,
-+        )
-+
-+        create_flashinfer_kv_indices_triton[(bs,)](
++        _xpu_create_kv_indices_fn(
 +            self.req_to_token,
 +            forward_batch.req_pool_indices,
 +            seqlens,
 +            kv_indptr,
 +            kv_start_idx,
 +            kv_indices,
-+            self.req_to_token.stride(0),
++            window_tokens if is_swa else max_seq_len_k,
 +        )
 +        if translate_swa:
 +            # req_to_token holds FULL-pool slot ids; the sliding layers read the
@@ -3540,18 +3689,14 @@ index ea02e001f1..f8de84cb50 100644
 +                out=kv_indptr[1:],
 +            )
 +            kv_indices = state["kv_indices"]
-+            from sglang.srt.layers.attention.triton_ops.kv_indices import (
-+                create_flashinfer_kv_indices_triton,
-+            )
-+
-+            create_flashinfer_kv_indices_triton[(bs,)](
++            _xpu_create_kv_indices_fn(
 +                self.req_to_token,
 +                req_pool_indices,
 +                metadata.cache_seqlens_int32,
 +                kv_indptr,
 +                None,
 +                kv_indices,
-+                self.req_to_token.stride(0),
++                self.max_context_len,
 +            )
 +            metadata.kv_indptr = kv_indptr
 +            metadata.kv_indices = kv_indices
@@ -3664,7 +3809,7 @@ index ea02e001f1..f8de84cb50 100644
  
      def init_forward_metadata(self, forward_batch: ForwardBatch):
          """Initialize forward metadata hence all layers in the forward pass can reuse it."""
-@@ -590,24 +1125,52 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -590,24 +1122,52 @@ class XPUAttentionBackend(AttentionBackend):
                  cu_seqlens_k = metadata.encoder_cu_seqlens_k
                  window_size = (-1, -1)
  
@@ -3734,7 +3879,7 @@ index ea02e001f1..f8de84cb50 100644
  
              if use_cascade_attn:
                  o, softmax_lse, *rest = result
-@@ -865,10 +1428,31 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -865,10 +1425,31 @@ class XPUAttentionBackend(AttentionBackend):
                  -1, self.page_size, layer.tp_v_head_num, layer.head_dim
              )
  
@@ -3767,7 +3912,7 @@ index ea02e001f1..f8de84cb50 100644
                      k_cache=key_cache,
                      v_cache=value_cache,
                      page_table=metadata.encoder_page_table,
-@@ -887,7 +1471,7 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -887,7 +1468,7 @@ class XPUAttentionBackend(AttentionBackend):
              elif use_local_attn:
                  # Use chunked (local) attention batching for self-attention
                  o = flash_attn_with_kvcache(
@@ -3776,7 +3921,7 @@ index ea02e001f1..f8de84cb50 100644
                      k_cache=key_cache,
                      v_cache=value_cache,
                      page_table=local_attn_metadata.local_block_table,
-@@ -903,6 +1487,78 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -903,6 +1484,78 @@ class XPUAttentionBackend(AttentionBackend):
                      v_descale=v_descale,
                      **kwargs,
                  )
@@ -3855,7 +4000,7 @@ index ea02e001f1..f8de84cb50 100644
              else:
                  is_swa_layer = (
                      layer.sliding_window_size is not None
-@@ -929,25 +1585,210 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -929,25 +1582,210 @@ class XPUAttentionBackend(AttentionBackend):
                      -1, layer.tp_q_head_num, layer.head_dim
                  )
  
@@ -4084,7 +4229,7 @@ index ea02e001f1..f8de84cb50 100644
                  if use_cascade_attn:
                      o, softmax_lse, *rest = result
                      o_expand, softmax_lse_expand, *rest_expand = (
-@@ -1006,6 +1847,27 @@ class XPUAttentionBackend(AttentionBackend):
+@@ -1006,6 +1844,27 @@ class XPUAttentionBackend(AttentionBackend):
          out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
          return out
  
@@ -4113,7 +4258,7 @@ index ea02e001f1..f8de84cb50 100644
          """Get the fill value for sequence length in CUDA graph."""
          return 1
 diff --git a/python/sglang/srt/layers/linear.py b/python/sglang/srt/layers/linear.py
-index fc197860da..9b01ec583f 100644
+index fc197860da3097e1416f2aa7c7b88c0e8eb2ccc2..9b01ec583f29b37ae03287802e6c8f0b67bb0ef9 100644
 --- a/python/sglang/srt/layers/linear.py
 +++ b/python/sglang/srt/layers/linear.py
 @@ -6,6 +6,7 @@ from __future__ import annotations
@@ -4136,7 +4281,7 @@ index fc197860da..9b01ec583f 100644
              else:
                  quantize_communications = (
 diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
-index 15a3d6aac9..4fe805001c 100644
+index 15a3d6aac9b15878b314a411e3535359fa2987a5..4fe805001c389e7c57a9f120306b03c30ed4fd67 100644
 --- a/python/sglang/srt/layers/logits_processor.py
 +++ b/python/sglang/srt/layers/logits_processor.py
 @@ -21,6 +21,12 @@ from typing import Any, Dict, List, Optional, Tuple, Union
@@ -4172,7 +4317,7 @@ index 15a3d6aac9..4fe805001c 100644
                  logits = torch.matmul(
                      hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-index 59ca3f9cce..e104249d26 100644
+index 59ca3f9cce61ce71ccd0df02ee14f22018b8e78e..e104249d26334b6e00cfb27c96d7ae7d6805c280 100644
 --- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 +++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 @@ -733,12 +733,23 @@ class FusedMoE(torch.nn.Module):
@@ -4201,7 +4346,7 @@ index 59ca3f9cce..e104249d26 100644
              # Store in data_container with expert/shard info
              if not hasattr(param, "expert_data_map"):
 diff --git a/python/sglang/srt/layers/moe/moe_runner/triton.py b/python/sglang/srt/layers/moe/moe_runner/triton.py
-index 96e431d4e3..cd890f1947 100644
+index 96e431d4e38597be063d4366aa44067e139ac9eb..cd890f19473121a088ff756e03360a1e742a7308 100644
 --- a/python/sglang/srt/layers/moe/moe_runner/triton.py
 +++ b/python/sglang/srt/layers/moe/moe_runner/triton.py
 @@ -1,5 +1,6 @@
@@ -4620,7 +4765,7 @@ index 96e431d4e3..cd890f1947 100644
          hidden_states=dispatch_output.hidden_states,
          w1=quant_info.w13_weight,
 diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
-index b104e40d74..4da941e2ed 100644
+index b104e40d7437a8cd2aee0855f27f00bbe6853612..4da941e2edec1b6bef39068761a93dd886a95836 100644
 --- a/python/sglang/srt/layers/moe/topk.py
 +++ b/python/sglang/srt/layers/moe/topk.py
 @@ -114,6 +114,11 @@ from sglang.srt.utils import (
@@ -4647,10 +4792,10 @@ index b104e40d74..4da941e2ed 100644
          raise ValueError(
              "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
 diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
-index b4e05df013..c003da1f1f 100644
+index b4e05df0132f56f4e8e2cd2cc638cc5afa2ead37..c27eab3c0ace63e330710609c984b6a71a58427e 100644
 --- a/python/sglang/srt/layers/quantization/fp8.py
 +++ b/python/sglang/srt/layers/quantization/fp8.py
-@@ -116,6 +116,145 @@ _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
+@@ -116,6 +116,317 @@ _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
  _is_shuffle_moe_mxfp4 = is_gfx95_supported()
  
  
@@ -4793,10 +4938,182 @@ index b4e05df013..c003da1f1f 100644
 +    return out
 +
 +
++def _apply_xpu_gemma4_fp8_moe(
++    x: torch.Tensor,
++    layer: torch.nn.Module,
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    moe_runner_config: MoeRunnerConfig,
++    *,
++    block_quant: bool,
++) -> torch.Tensor:
++    if block_quant:
++        raise RuntimeError(
++            "Gemma4 XPU FP8 MoE requires per-expert scalar weight scales; "
++            "block-quantized expert weights are not supported."
++        )
++    if x.device.type != "xpu":
++        raise RuntimeError("Gemma4 XPU FP8 MoE received a non-XPU input.")
++    if moe_runner_config.activation != "gelu":
++        raise RuntimeError(
++            f"Gemma4 XPU FP8 MoE requires GELU-tanh, got "
++            f"{moe_runner_config.activation!r}."
++        )
++    if (
++        moe_runner_config.gemm1_alpha is not None
++        or moe_runner_config.gemm1_clamp_limit is not None
++        or moe_runner_config.swiglu_limit is not None
++    ):
++        raise RuntimeError("Gemma4 XPU FP8 MoE does not support gated clamps.")
++    if (
++        getattr(layer, "w13_weight_bias", None) is not None
++        or getattr(layer, "w2_weight_bias", None) is not None
++    ):
++        raise RuntimeError("Gemma4 XPU FP8 MoE does not support expert bias.")
++
++    w13 = layer.w13_weight
++    w2 = layer.w2_weight
++    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
++    if w13.dtype not in fp8_dtypes or w2.dtype != w13.dtype:
++        raise RuntimeError(
++            "Gemma4 XPU FP8 MoE requires matching E4M3 or E5M2 expert weights; "
++            f"got w13={w13.dtype}, w2={w2.dtype}."
++        )
++    if w13.dim() != 3 or w2.dim() != 3:
++        raise RuntimeError("Gemma4 XPU FP8 MoE expert weights must be 3D.")
++    num_experts, two_intermediate, hidden_size = w13.shape
++    if two_intermediate % 2 != 0:
++        raise RuntimeError("Gemma4 w13 output dimension must be even.")
++    intermediate_size = two_intermediate // 2
++    if w2.shape != (num_experts, hidden_size, intermediate_size):
++        raise RuntimeError(
++            "Gemma4 XPU FP8 MoE expects w13=[E,2I,H] and w2=[E,H,I], "
++            f"got w13={tuple(w13.shape)}, w2={tuple(w2.shape)}."
++        )
++    if x.dim() != 2 or x.shape[1] != hidden_size:
++        raise RuntimeError(
++            f"Gemma4 XPU FP8 MoE input must be [T,{hidden_size}], "
++            f"got {tuple(x.shape)}."
++        )
++    if hidden_size % 32 != 0 or intermediate_size % 16 != 0:
++        raise RuntimeError(
++            "Gemma4 XPU FP8 MoE requires H divisible by 32 and I by 16."
++        )
++
++    w13_scale = layer.w13_weight_scale
++    w2_scale = layer.w2_weight_scale
++    if w13_scale is None or w2_scale is None:
++        raise RuntimeError("Gemma4 XPU FP8 MoE weight scales are missing.")
++
++    def _scalar_scale(scale: torch.Tensor, name: str) -> torch.Tensor:
++        values = scale.reshape(num_experts, -1)
++        if values.shape[1] != 1:
++            raise RuntimeError(
++                f"Gemma4 XPU FP8 MoE {name} must have one scale per expert, "
++                f"got {tuple(scale.shape)}."
++            )
++        return values[:, 0].to(torch.float32).contiguous()
++
++    s13 = _scalar_scale(w13_scale, "w13 scale")
++    s2 = _scalar_scale(w2_scale, "w2 scale")
++    topk_weights = topk_weights.to(torch.float16).contiguous()
++    topk_ids = topk_ids.to(torch.int32).contiguous()
++    x_fp16 = x.to(torch.float16).contiguous()
++    top_k = topk_ids.shape[-1]
++
++    if x.shape[0] <= 8:
++        from custom_esimd_kernels_sglang import (
++            moe_forward_full_gelu_tanh_routed,
++        )
++
++        output = moe_forward_full_gelu_tanh_routed(
++            x_fp16,
++            topk_weights,
++            topk_ids,
++            w13,
++            s13,
++            w2,
++            s2,
++            top_k,
++            num_experts,
++        )
++    else:
++        from custom_esimd_kernels_sglang import (
++            moe_prefill_full_fp8_gelu_tanh,
++        )
++
++        s13_gate_up = (
++            s13[:, None].expand(num_experts, 2).contiguous()
++        )
++        output = moe_prefill_full_fp8_gelu_tanh(
++            x_fp16,
++            topk_weights,
++            topk_ids,
++            w13,
++            s13_gate_up,
++            w2,
++            s2,
++            top_k,
++            num_experts,
++        )
++    return output if output.dtype == x.dtype else output.to(x.dtype)
++
++
++def apply_xpu_gemma4_fp8_moe_from_logits(
++    x: torch.Tensor,
++    layer: torch.nn.Module,
++    router_logits: torch.Tensor,
++    per_expert_scale: torch.Tensor,
++) -> torch.Tensor:
++    """Run the Gemma4-26B TP=2 decode MoE from raw router logits."""
++    w13 = layer.w13_weight
++    w2 = layer.w2_weight
++    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
++    if (
++        x.device.type != "xpu"
++        or x.dtype != torch.float16
++        or x.shape != (1, 2816)
++        or router_logits.shape != (1, 128)
++        or router_logits.dtype != torch.float16
++        or w13.shape != (128, 704, 2816)
++        or w2.shape != (128, 2816, 352)
++        or w13.dtype not in fp8_dtypes
++        or w2.dtype != w13.dtype
++    ):
++        raise RuntimeError(
++            "Fused Gemma4-26B decode requires FP16 [1,2816] input, "
++            "FP16 [1,128] logits, and matching E4M3/E5M2 TP=2 weights."
++        )
++
++    def _expert_scale(scale: torch.Tensor, name: str) -> torch.Tensor:
++        values = scale.reshape(128, -1)
++        if values.shape[1] != 1:
++            raise RuntimeError(
++                f"Fused Gemma4-26B decode requires one {name} per expert."
++            )
++        return values[:, 0].to(torch.float32).contiguous()
++
++    from custom_esimd_kernels_sglang import (
++        moe_forward_full_gelu_tanh_decode,
++    )
++
++    return moe_forward_full_gelu_tanh_decode(
++        x.contiguous(),
++        router_logits.contiguous(),
++        w13,
++        _expert_scale(layer.w13_weight_scale, "w13 scale"),
++        w2,
++        _expert_scale(layer.w2_weight_scale, "w2 scale"),
++        _expert_scale(per_expert_scale, "output scale"),
++        8,
++        128,
++    )
++
++
  def _require_fp4_dtype():
      fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
      if fp4_dtype is None:
-@@ -430,7 +569,7 @@ class Fp8LinearMethod(LinearMethodBase):
+@@ -430,7 +741,7 @@ class Fp8LinearMethod(LinearMethodBase):
  
          # Create the weight
          weight_dtype = (
@@ -4805,7 +5122,7 @@ index b4e05df013..c003da1f1f 100644
          )
          weight = ModelWeightParameter(
              data=torch.empty(
-@@ -891,7 +1030,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -891,7 +1202,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
          from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
  
          if self.quant_config.is_checkpoint_fp8_serialized:
@@ -4814,21 +5131,7 @@ index b4e05df013..c003da1f1f 100644
          tp_size = get_tensor_model_parallel_world_size()
  
          w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
-@@ -1547,6 +1686,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
-             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
- 
-     def process_weights_after_loading(self, layer: Module) -> None:
-+        import sys as _sys
-+        _sys.stderr.write(
-+            f"[fp8-moe-pwfl] block_quant={self.block_quant} "
-+            f"is_ckpt_fp8={self.quant_config.is_checkpoint_fp8_serialized} "
-+            f"w13.dtype={layer.w13_weight.dtype}\n"
-+        )
-+        _sys.stderr.flush()
-         if _is_hip and _use_hip_int4:
-             self.process_weights_hip_int4(layer)
- 
-@@ -1580,6 +1726,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -1580,6 +1891,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
              layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
              layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
  
@@ -4844,7 +5147,7 @@ index b4e05df013..c003da1f1f 100644
              if _is_hip:
                  self.process_weights_hip_scale_padding(layer)
  
-@@ -1807,7 +1962,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -1807,7 +2127,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
          layer: torch.nn.Module,
          dispatch_output: DispatchOutput,
      ) -> CombineInput:
@@ -4852,8 +5155,12 @@ index b4e05df013..c003da1f1f 100644
          from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
  
          x = dispatch_output.hidden_states
-@@ -1860,9 +2014,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -1856,13 +2175,41 @@ class Fp8MoEMethod(FusedMoEMethodBase):
  
+         if use_intel_xpu_backend():
+             # sgl-kernel-xpu path
+-            from sgl_kernel import fused_experts
+-
              topk_weights, topk_ids, _ = dispatch_output.topk_output
              assert layer.w13_weight.dtype == layer.w2_weight.dtype
 -            use_fp8_w8a8 = layer.w13_weight.dtype == torch.float8_e4m3fn
@@ -4864,11 +5171,37 @@ index b4e05df013..c003da1f1f 100644
              use_mxfp4_w4a16 = layer.w13_weight.dtype == torch.int8
              assert self.is_fp4_expert == use_mxfp4_w4a16
 +
++            is_gemma4_26b_tp2 = (
++                x.dim() == 2
++                and x.shape[1] == 2816
++                and tuple(layer.w13_weight.shape) == (128, 704, 2816)
++                and tuple(layer.w2_weight.shape) == (128, 2816, 352)
++                and topk_ids.dim() == 2
++                and topk_ids.shape[1] == 8
++            )
++            if (
++                use_fp8_w8a8
++                and not self.block_quant
++                and moe_runner_config.activation == "gelu"
++                and is_gemma4_26b_tp2
++            ):
++                output = _apply_xpu_gemma4_fp8_moe(
++                    x,
++                    layer,
++                    topk_weights,
++                    topk_ids,
++                    moe_runner_config,
++                    block_quant=self.block_quant,
++                )
++                return StandardCombineInput(hidden_states=output)
++
++            from sgl_kernel import fused_experts
++
              output = fused_experts(
                  x,
                  layer.w13_weight,
 diff --git a/python/sglang/srt/layers/quantization/fp8_kernel.py b/python/sglang/srt/layers/quantization/fp8_kernel.py
-index 30a035a23c..c82c83ed6d 100644
+index 30a035a23c0126ffc1f0e57dd9325f29dbba0c10..c82c83ed6df77d6d44aa8ee9f248b86fc534fb19 100644
 --- a/python/sglang/srt/layers/quantization/fp8_kernel.py
 +++ b/python/sglang/srt/layers/quantization/fp8_kernel.py
 @@ -40,6 +40,7 @@ from sglang.srt.utils import (
@@ -4970,7 +5303,7 @@ index 30a035a23c..c82c83ed6d 100644
              # Dynamic scaling
              if use_per_token_if_dynamic:
 diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
-index 6c6827c7d2..59bdd53384 100755
+index 6c6827c7d20bf351bbbc2c7ee2b838899540c281..59bdd53384f3e12cf132e084f60cdab907683767 100755
 --- a/python/sglang/srt/layers/quantization/fp8_utils.py
 +++ b/python/sglang/srt/layers/quantization/fp8_utils.py
 @@ -1,6 +1,7 @@
@@ -5384,7 +5717,7 @@ index 6c6827c7d2..59bdd53384 100755
                      qinput, x_scale = per_token_group_quant_fp8(
                          input_2d, group_size=input_2d.shape[1]
 diff --git a/python/sglang/srt/layers/quantization/gguf.py b/python/sglang/srt/layers/quantization/gguf.py
-index 5c1e7a63e6..9ae9c0a6d6 100644
+index 5c1e7a63e6d90693033108dedd016df02ef5a19b..9ae9c0a6d6b064de4e96bfb69501c666343251d6 100644
 --- a/python/sglang/srt/layers/quantization/gguf.py
 +++ b/python/sglang/srt/layers/quantization/gguf.py
 @@ -1,9 +1,9 @@
@@ -7185,76 +7518,96 @@ index 5c1e7a63e6..9ae9c0a6d6 100644
  class GGUFEmbeddingMethod(GGUFLinearMethod):
      """Embedding method for GGUF.
  
-diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
-index 84d57b8e2c..691fad4ddf 100644
---- a/python/sglang/srt/layers/sampler.py
-+++ b/python/sglang/srt/layers/sampler.py
-@@ -60,10 +60,53 @@ logger = logging.getLogger(__name__)
+diff --git a/python/sglang/srt/managers/cache_controller.py b/python/sglang/srt/managers/cache_controller.py
+index ba1e27479e4774323badac3a415dec90bbbdacbe..e538976e2e2031160a2d7dd8aa50726cfcc4095e 100644
+--- a/python/sglang/srt/managers/cache_controller.py
++++ b/python/sglang/srt/managers/cache_controller.py
+@@ -50,6 +50,12 @@ from sglang.srt.utils import get_device_module
  
- SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
- SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
-+# Diagnostic: report logits/probs stats around temperature scaling. Costs a
-+# device->host sync per decode step, so it is off by default.
-+SGLANG_SAMPLER_DEBUG_NAN = get_bool_env_var("SGLANG_SAMPLER_DEBUG_NAN")
-+_sampler_debug_reports = 0
- _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
- _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+ logger = logging.getLogger(__name__)
+ 
++# Accelerator device types whose caching allocator requires record_stream() when a tensor
++# is consumed by a stream other than the one it was allocated on. "npu" is deliberately
++# absent: NPU has the same requirement, but we have no NPU hardware to validate against,
++# so enabling it there would be an untested behaviour change. Tracked as a TODO.
++_RECORD_STREAM_DEVICES = ("cuda", "xpu")
++
+ device_module = get_device_module()
  
  
-+def _debug_report_sampling_inputs(
-+    logits: torch.Tensor, sampling_info: SamplingBatchInfo
-+) -> None:
-+    """Report whether non-finite values exist before vs. after temperature
-+    scaling. Distinguishes a model-side NaN from an overflow introduced by the
-+    division itself (e.g. fp16 logits with a tiny temperature)."""
-+    global _sampler_debug_reports
-+    if _sampler_debug_reports >= 20:
-+        return
-+
-+    pre_bad = int((~torch.isfinite(logits)).sum().item())
-+    pre_absmax = float(logits.abs().amax().item()) if logits.numel() else 0.0
-+    temps = sampling_info.temperatures
-+    tmin = float(temps.min().item())
-+    scaled = logits.to(torch.float32) / temps.to(torch.float32)
-+    post_bad = int((~torch.isfinite(scaled)).sum().item())
-+
-+    if pre_bad or post_bad:
-+        _sampler_debug_reports += 1
-+        logger.error(
-+            "[sampler-debug] non-finite logits: dtype=%s shape=%s temp_min=%.6g "
-+            "pre_absmax=%.6g pre_nonfinite=%d post_nonfinite=%d",
-+            logits.dtype,
-+            tuple(logits.shape),
-+            tmin,
-+            pre_absmax,
-+            pre_bad,
-+            post_bad,
-+        )
-+    elif _sampler_debug_reports < 3:
-+        _sampler_debug_reports += 1
-+        logger.info(
-+            "[sampler-debug] clean step: dtype=%s temp_min=%.6g pre_absmax=%.6g",
-+            logits.dtype,
-+            tmin,
-+            pre_absmax,
-+        )
-+
-+
- class Sampler(nn.Module):
-     def __init__(self):
-         super().__init__()
-@@ -175,6 +218,9 @@ class Sampler(nn.Module):
-                     logprobs = logprobs_via_logsoftmax_kernel
-             else:
-                 # Standard path: do softmax and sample from probs.
-+                if SGLANG_SAMPLER_DEBUG_NAN:
-+                    _debug_report_sampling_inputs(logits, sampling_info)
-+
-                 logits.div_(sampling_info.temperatures)
+@@ -653,6 +659,15 @@ class HiCacheController:
  
-                 # In-place op to save memory
+         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+ 
++        # KV geometry for the storage key. Read from the device pool rather than
++        # ServerArgs, because that is the dtype actually in use after "auto" has been
++        # resolved against the model. Stays None when the pool exposes no dtype:
++        # str(None) is the string "None", which passes HiCacheFile's `is not None` check
++        # and would append a meaningless "_dtNone" to every key instead of omitting the
++        # field as intended.
++        device_kv_dtype = getattr(self.mem_pool_device, "dtype", None)
++        kv_cache_dtype = None if device_kv_dtype is None else str(device_kv_dtype)
++
+         return HiCacheStorageConfig(
+             tp_rank=self.tp_rank,
+             tp_size=self.tp_size,
+@@ -667,6 +682,9 @@ class HiCacheController:
+             model_name=model_name,
+             tp_lcm_size=tp_lcm_size,
+             should_split_heads=should_split_heads,
++            # KV geometry, so an L3 entry cannot be read back under a different encoding.
++            kv_cache_dtype=kv_cache_dtype,
++            page_size=getattr(self.mem_pool_device, "page_size", None),
+             extra_config=storage_backend_extra_config,
+         )
+ 
+@@ -749,9 +767,17 @@ class HiCacheController:
+             # NOTE: We must save the host indices and device indices here,
+             # this is because we need to guarantee that these tensors are
+             # still alive when the write stream is executing.
+-            if host_indices.is_cuda:
++            #
++            # `.is_cuda` is False on every non-CUDA accelerator, so this guard silently
++            # skipped record_stream on XPU (and still does on NPU). record_stream is what
++            # stops the caching allocator recycling these tensors while the async copy on
++            # write_stream is still reading them -- without it the failure mode is rare,
++            # load-dependent KV corruption, not a crash. Match on device type instead.
++            # TODO(npu): NPU has the same latent use-after-free. Not enabled here because
++            #            we have no NPU hardware to validate it on.
++            if host_indices.device.type in _RECORD_STREAM_DEVICES:
+                 host_indices.record_stream(self.write_stream)
+-            if device_indices.is_cuda:
++            if device_indices.device.type in _RECORD_STREAM_DEVICES:
+                 device_indices.record_stream(self.write_stream)
+ 
+         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+@@ -776,7 +802,9 @@ class HiCacheController:
+     def move_indices(self, host_indices: torch.Tensor, device_indices: torch.Tensor):
+         # move indices to GPU if using kernels, to host if using direct indexing
+         if self.io_backend == "kernel":
+-            if not host_indices.is_cuda:
++            # `.is_cuda` is False for an XPU tensor that is ALREADY on the right device,
++            # so this re-issued a redundant .to() on every call. Compare device types.
++            if host_indices.device.type != torch.device(self.device).type:
+                 host_indices = host_indices.to(self.device, non_blocking=True)
+             return host_indices, device_indices
+         elif self.io_backend == "direct":
+@@ -830,9 +858,11 @@ class HiCacheController:
+             # NOTE: We must save the host indices and device indices here,
+             # this is because we need to guarantee that these tensors are
+             # still alive when the load stream is executing.
+-            if host_indices.is_cuda:
++            # See the note in start_writing(): `.is_cuda` skips this entirely on
++            # non-CUDA accelerators. TODO(npu): same latent UAF, untested here.
++            if host_indices.device.type in _RECORD_STREAM_DEVICES:
+                 host_indices.record_stream(self.load_stream)
+-            if device_indices.is_cuda:
++            if device_indices.device.type in _RECORD_STREAM_DEVICES:
+                 device_indices.record_stream(self.load_stream)
+ 
+         self.ack_load_queue.append(
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 8e32640fc6..120fc5e29a 100644
+index 8e32640fc6a9085425a0dd2e45b38c09a5bc643d..120fc5e29a42c7102a5e99227f708a634cc022ca 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -2542,6 +2542,15 @@ class Scheduler(
@@ -7274,7 +7627,7 @@ index 8e32640fc6..120fc5e29a 100644
  
      def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index a282339587..3b7c99c7b0 100644
+index a282339587133c315eec0e47770a8c7bbf8bab0b..3b7c99c7b01ceb48864f612c95c7866c7aebff82 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 @@ -1,6 +1,7 @@
@@ -7350,8 +7703,98 @@ index a282339587..3b7c99c7b0 100644
      def _normalize_decode_outputs(
          self,
          *,
+diff --git a/python/sglang/srt/mem_cache/common.py b/python/sglang/srt/mem_cache/common.py
+index f201c225766b67cf49deec28d9417871384c3749..4814fcb79826d36753a243f133037d19877a2fc6 100644
+--- a/python/sglang/srt/mem_cache/common.py
++++ b/python/sglang/srt/mem_cache/common.py
+@@ -74,7 +74,10 @@ def write_cache_indices(
+     prefix_tensors: list[torch.Tensor],
+     req_to_token_pool: ReqToTokenPool,
+ ):
+-    if support_triton(get_global_server_args().attention_backend):
++    if (
++        support_triton(get_global_server_args().attention_backend)
++        and torch.device(req_to_token_pool.device).type != "xpu"
++    ):
+         prefix_pointers = torch.tensor(
+             [t.data_ptr() for t in prefix_tensors],
+             device=req_to_token_pool.device,
+diff --git a/python/sglang/srt/mem_cache/hicache_storage.py b/python/sglang/srt/mem_cache/hicache_storage.py
+index a982cb7c8258951fde9a0c1bbc73499c9c39ff9a..1a30f581bd26329c64f2871560b79d2f79f93ad9 100644
+--- a/python/sglang/srt/mem_cache/hicache_storage.py
++++ b/python/sglang/srt/mem_cache/hicache_storage.py
+@@ -34,7 +34,17 @@ class HiCacheStorageConfig:
+     model_name: Optional[str]
+     tp_lcm_size: Optional[int] = None
+     should_split_heads: bool = False
++    # An L3 entry is only readable by a server with identical KV geometry. Without these
++    # two, a server running --kv-cache-dtype fp8_e5m2 and one running bf16 -- same model,
++    # same TP -- derive IDENTICAL keys for differently-encoded KV, and the second reads
++    # the first's bytes under the wrong interpretation. That produces fluent, wrong
++    # output rather than an error. page_size has the same problem: it changes how many
++    # tokens a page holds, so the payload length differs for the same key.
++    # Optional with None defaults so third-party HiCacheStorage backends that construct
++    # this dataclass positionally keep working.
+     extra_config: Optional[dict] = None
++    kv_cache_dtype: Optional[str] = None
++    page_size: Optional[int] = None
+ 
+ 
+ @dataclass
+@@ -336,6 +346,17 @@ class HiCacheFile(HiCacheStorage):
+             self.config_suffix += f"_{tp_rank}_{tp_size}"
+         if enable_pp:
+             self.config_suffix += f"_{pp_size}_{pp_rank}"
++
++        # KV geometry: see the note on HiCacheStorageConfig. Appended only when known, so
++        # a caller that cannot report the geometry keys on the fields it does know rather
++        # than on the literal string "None". Note that once a caller DOES report them the
++        # keys change, so an L3 directory written before this lands is not readable by a
++        # server after it -- that is a one-off cold cache, not a corrupted read.
++        if storage_config.kv_cache_dtype is not None:
++            self.config_suffix += f"_dt{storage_config.kv_cache_dtype}"
++        if storage_config.page_size is not None:
++            self.config_suffix += f"_ps{storage_config.page_size}"
++
+         if not os.path.exists(self.file_path) and tp_rank == 0:
+             os.makedirs(self.file_path)
+             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
+diff --git a/python/sglang/srt/mem_cache/hisparse_memory_pool.py b/python/sglang/srt/mem_cache/hisparse_memory_pool.py
+index c0dcd02b8a111692aed7d35cf54a4957aaca29f6..cfc476438dc8a11d3ba9b95a9649aca713e61f98 100644
+--- a/python/sglang/srt/mem_cache/hisparse_memory_pool.py
++++ b/python/sglang/srt/mem_cache/hisparse_memory_pool.py
+@@ -16,22 +16,24 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+     HiSparseC4DevicePool,
+ )
+ from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+-from sglang.srt.utils import is_cuda, is_hip
++from sglang.srt.utils import is_cuda, is_hip, is_xpu
+ from sglang.srt.utils.common import get_num_new_pages
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# sgl_kernel.kvcacheio is only available in CUDA/ROCm sgl-kernel builds (not XPU/MPS/NPU/CPU).
++# sgl_kernel.kvcacheio is available in CUDA/ROCm and XPU sgl-kernel builds
++# (not MPS/NPU/CPU). XPU support comes from sgl-kernel-xpu PR #261.
+ _is_cuda = is_cuda()
+ _is_hip = is_hip()
+-if _is_cuda or _is_hip:
++_is_xpu = is_xpu()
++if _is_cuda or _is_hip or _is_xpu:
+     from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
+ else:
+ 
+     def transfer_kv_all_layer_mla(*args, **kwargs):
+         raise RuntimeError(
+-            "HiSparse device KV transfer requires sgl_kernel.kvcacheio (CUDA/ROCm). "
+-            "It is not available on this backend."
++            "HiSparse device KV transfer requires sgl_kernel.kvcacheio "
++            "(CUDA/ROCm/XPU). It is not available on this backend."
+         )
+ 
+ 
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index 8efe9aae94..8a33403ef3 100644
+index 8efe9aae94e05a94e56e8507396d0ad3964dbe3a..8a33403ef3fe5852789b4b3c72654633c0a18ae4 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
 @@ -62,6 +62,7 @@ from sglang.srt.utils import (
@@ -7427,8 +7870,127 @@ index 8efe9aae94..8a33403ef3 100644
                      )
                      for conv_shape in conv_state_shape
                  ]
+diff --git a/python/sglang/srt/mem_cache/memory_pool_host.py b/python/sglang/srt/mem_cache/memory_pool_host.py
+index b42ad7ba6fa7f08da9f8801ad424467b2e83a24e..fe35698efcf7db0b98fc7ecfa9ee38af3a827476 100644
+--- a/python/sglang/srt/mem_cache/memory_pool_host.py
++++ b/python/sglang/srt/mem_cache/memory_pool_host.py
+@@ -46,7 +46,17 @@ _is_hip = is_hip()
+ _is_npu = is_npu()
+ _is_xpu = is_xpu()
+ _is_mps = is_mps()
+-if _is_cuda or _is_hip:
++# XPU: sgl-kernel-xpu (PR #261, 2026-07-29) implements the kvcacheio transfer ops for
++# torch::kXPU using the SAME names and signatures, so the io_backend=="kernel" dispatch
++# below works unmodified -- no separate xpu branch is needed (unlike Ascend, whose kernel
++# signature genuinely differs).
++# NOTE: 3 of the 13 ops (the "direct" family) are Python bindings with NO SYCL
++# implementation. Importing them is safe; CALLING them raises AttributeError. ServerArgs
++# rejects --hicache-io-backend direct on XPU so they are never reached.
++# NOTE: this is the fallback path on XPU in a second sense too -- the fork's fused
++# sglang.jit_kernel.hicache kernels are gated on `_is_cuda` (see can_use_jit below), so
++# XPU always takes the kvcacheio route these imports provide.
++if _is_cuda or _is_hip or _is_xpu:
+     from sgl_kernel.kvcacheio import (
+         transfer_kv_all_layer,
+         transfer_kv_all_layer_direct_lf_pf,
+@@ -222,10 +232,32 @@ ALLOC_MEMORY_FUNCS = defaultdict(
+     {
+         "npu": alloc_with_pin_memory,
+         "musa": alloc_with_pin_memory,
++        # XPU: torch.empty(..., pin_memory=True) works and reports is_pinned()==True.
++        # Without this entry the defaultdict falls through to alloc_with_host_register,
++        # which calls torch.cuda.cudart() and raises on an XPU box -- so HiCache cannot
++        # start at all.
++        "xpu": alloc_with_pin_memory,
+     },
+ )
+ 
+ 
++def get_alloc_func(device):
++    """Host-buffer allocator for a device, keyed by device TYPE.
++
++    ALLOC_MEMORY_FUNCS is keyed by bare type ("npu", "musa", "xpu"), but callers pass
++    `device_pool.device`, which carries an index whenever the pool was built with an
++    explicit ordinal:
++
++        device="xpu"    -> "xpu"    -> hits the table
++        device="xpu:0"  -> "xpu:0"  -> MISSES, falls through to the CUDA default and
++                                       raises "Torch not compiled with CUDA enabled"
++
++    That silently affects npu and musa exactly the same way. Normalise here so every
++    non-CUDA backend gets its intended allocator regardless of how `device` was spelled.
++    """
++    return ALLOC_MEMORY_FUNCS[torch.device(device).type]
++
++
+ class HostKVCache(abc.ABC):
+ 
+     def __init__(
+@@ -463,7 +495,7 @@ class MHATokenToKVPoolHost(HostKVCache):
+         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
+         self.layout_dim = self.token_stride_size * self.layer_num
+ 
+-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
++        alloc_func = get_alloc_func(self.device_pool.device)
+         buffer = alloc_func(
+             dims,
+             dtype=self.dtype,
+@@ -991,7 +1023,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
+                 self.page_size,
+                 1,
+             )
+-            alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
++            alloc_func = get_alloc_func(self.device_pool.device)
+             self.k_buffer = alloc_func(
+                 (*base_dims, self.kv_lora_rank),
+                 dtype=self.dtype,
+@@ -1023,7 +1055,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
+         self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
+         self.layout_dim = self.token_stride_size * self.layer_num
+ 
+-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
++        alloc_func = get_alloc_func(self.device_pool.device)
+         buffer = alloc_func(
+             dims,
+             dtype=self.dtype,
+@@ -1388,7 +1420,7 @@ class MambaPoolHost(HostKVCache):
+         self.clear()
+ 
+     def init_kv_buffer(self):
+-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
++        alloc_func = get_alloc_func(self.device_pool.device)
+ 
+         if self.layout in ["page_first", "page_first_direct"]:
+             # page-first: (page_num, num_layers, 1, *shape) — per-page data is contiguous
+@@ -1920,7 +1952,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
+                 f"{available_bytes / 1e9:.2f} GB free."
+             )
+ 
+-        alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
++        alloc_func = get_alloc_func(self.gpu_device)
+         self.data_refs = []
+         if self.layout == "layer_first":
+             self.kv_buffer = [
+@@ -2270,7 +2302,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
+                 f"{available_bytes / 1e9:.2f} GB free."
+             )
+ 
+-        alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
++        alloc_func = get_alloc_func(self.gpu_device)
+         self.data_refs = []
+         if self.layout == "layer_first":
+             self.kv_buffer = [
+@@ -2789,7 +2821,7 @@ class DSAIndexerPoolHost(HostKVCache):
+         return self.get_size_per_token()
+ 
+     def init_kv_buffer(self):
+-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
++        alloc_func = get_alloc_func(self.device_pool.device)
+         self.index_k_device_ptrs = torch.tensor(
+             [x.data_ptr() for x in self.device_pool.index_k_with_scale_buffer],
+             dtype=torch.uint64,
 diff --git a/python/sglang/srt/model_executor/breakable_cuda_graph/breakable_cuda_graph.py b/python/sglang/srt/model_executor/breakable_cuda_graph/breakable_cuda_graph.py
-index 7341301ef4..464151c42e 100644
+index 7341301ef4b2503cb93bcf72228a65a617a7c535..464151c42ea66f4fd1c32612032cc6516c73e8c8 100644
 --- a/python/sglang/srt/model_executor/breakable_cuda_graph/breakable_cuda_graph.py
 +++ b/python/sglang/srt/model_executor/breakable_cuda_graph/breakable_cuda_graph.py
 @@ -315,9 +315,13 @@ class BreakableCUDAGraphCapture:
@@ -7450,7 +8012,7 @@ index 7341301ef4..464151c42e 100644
      def _end_current_segment(self) -> None:
 diff --git a/python/sglang/srt/model_executor/breakable_cuda_graph/xpu_breakable_graph.py b/python/sglang/srt/model_executor/breakable_cuda_graph/xpu_breakable_graph.py
 new file mode 100644
-index 0000000000..7bbbd2d5b5
+index 0000000000000000000000000000000000000000..7bbbd2d5b5c28fb3a826c1cf4cca072edcbd5441
 --- /dev/null
 +++ b/python/sglang/srt/model_executor/breakable_cuda_graph/xpu_breakable_graph.py
 @@ -0,0 +1,271 @@
@@ -7726,7 +8288,7 @@ index 0000000000..7bbbd2d5b5
 +    """
 +    return fn(*args, **kwargs)
 diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
-index ebbfc2b288..56497dcc76 100644
+index ebbfc2b288d8a82978e13bb83ac156980cc00ae6..56497dcc763b5cd8e42c857000f19a7dd705b701 100644
 --- a/python/sglang/srt/model_executor/cuda_graph_runner.py
 +++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
 @@ -75,6 +75,7 @@ from sglang.srt.utils import (
@@ -7843,7 +8405,7 @@ index ebbfc2b288..56497dcc76 100644
              if _is_hip:
                  raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 3b30eb0e1f..93c745eefe 100644
+index 3b30eb0e1f74721eaacd2d066b6de30c78ceec64..93c745eefe157ccbd93cc4ac67766532e1171588 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -849,6 +849,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
@@ -7951,7 +8513,7 @@ index 3b30eb0e1f..93c745eefe 100644
              if self.server_args.quantization_param_path is not None:
                  if callable(getattr(self.model, "load_kv_cache_scales", None)):
 diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
-index 32ff5bac25..e8ee7b4ae0 100644
+index 32ff5bac255940253408e70a361e2bb843505986..e8ee7b4ae04bfd97ffa41cc92433df2f6cebab62 100644
 --- a/python/sglang/srt/model_loader/loader.py
 +++ b/python/sglang/srt/model_loader/loader.py
 @@ -115,6 +115,7 @@ from sglang.srt.utils import (
@@ -8355,7 +8917,7 @@ index 32ff5bac25..e8ee7b4ae0 100644
      # FP8 approach: BF16/FP16 model with native FP8 quantization
      if load_config.load_format == LoadFormat.FLASH_RL:
 diff --git a/python/sglang/srt/models/gemma4_causal.py b/python/sglang/srt/models/gemma4_causal.py
-index 9c2f9c25db..44965d9540 100644
+index 9c2f9c25dbf7c2d8cbd9b10bd8f34fa51f457b40..864aeb208dfd2e19d8cbdfb10f6b7b6f7f175920 100644
 --- a/python/sglang/srt/models/gemma4_causal.py
 +++ b/python/sglang/srt/models/gemma4_causal.py
 @@ -13,6 +13,7 @@
@@ -8366,7 +8928,15 @@ index 9c2f9c25db..44965d9540 100644
  import re
  from typing import Iterable, List, Optional, Set, Tuple, Union
  
-@@ -65,6 +66,108 @@ from sglang.srt.utils import add_prefix, make_layers
+@@ -28,6 +29,7 @@ from sglang.srt.distributed import (
+     get_pp_group,
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
++    tensor_model_parallel_all_reduce,
+ )
+ from sglang.srt.layers.gemma4_fused_ops import (
+     gemma4_fused_routing,
+@@ -65,6 +67,40 @@ from sglang.srt.utils import add_prefix, make_layers
  
  logger = logging.getLogger(__name__)
  
@@ -8375,107 +8945,120 @@ index 9c2f9c25db..44965d9540 100644
 +_esimd_fused_add_rms_norm = None
 +_esimd_rmsnorm_residual_scalar = None
 +_esimd_norm_add_norm = None
++_esimd_norm_add_norm_gemv_gelu_fp8 = None
++_esimd_norm_gemv_norm_fp16 = None
++_esimd_rmsnorm_gemv_fp8 = None
++_esimd_dual_rmsnorm_residual_scalar = None
 +try:
 +    from custom_esimd_kernels_sglang import (
 +        esimd_qkv_split_norm_rope as _esimd_qkv_split_norm_rope,
 +        esimd_fused_add_rms_norm as _esimd_fused_add_rms_norm,
-+        esimd_rmsnorm_residual_scalar as _esimd_rmsnorm_residual_scalar,
 +        esimd_norm_add_norm as _esimd_norm_add_norm,
++        esimd_norm_add_norm_gemv_gelu_fp8 as _esimd_norm_add_norm_gemv_gelu_fp8,
++        esimd_norm_gemv_norm_fp16 as _esimd_norm_gemv_norm_fp16,
++        esimd_rmsnorm_gemv_fp8 as _esimd_rmsnorm_gemv_fp8,
++        esimd_dual_rmsnorm_residual_scalar as _esimd_dual_rmsnorm_residual_scalar,
++        esimd_rmsnorm_residual_scalar as _esimd_rmsnorm_residual_scalar,
 +    )
 +except ImportError:
 +    pass
 +
-+# Diagnostic kill switch: the three fused-norm fast paths above have no
++# Diagnostic kill switch: the fused-norm fast paths above have no
 +# individual env gate, so this disables all of them at once for A/B isolation.
 +if os.environ.get("SGLANG_GEMMA4_DISABLE_ESIMD_NORM", "0") == "1":
 +    _esimd_fused_add_rms_norm = None
 +    _esimd_rmsnorm_residual_scalar = None
 +    _esimd_norm_add_norm = None
-+
-+
-+# Diagnostic: locate the first decoder layer whose output turns non-finite.
-+# Forces a device sync per layer, so it is off by default.
-+_DEBUG_LAYER_NAN = os.environ.get("SGLANG_GEMMA4_DEBUG_LAYER_NAN", "0") == "1"
-+_layer_nan_reports = 0
-+
-+
-+_kv_pool_reports = 0
-+
-+
-+def _debug_probe_kv_pool(attn, attn_output, forward_batch):
-+    """When core attention emits non-finite output, decide whether the KV cache
-+    itself already holds non-finite values (garbage written earlier) or whether
-+    the attention math produced them (fp16 overflow)."""
-+    global _kv_pool_reports
-+    if _kv_pool_reports >= 4 or attn_output is None:
-+        return
-+    if not bool((~torch.isfinite(attn_output)).any().item()):
-+        return
-+    pool = getattr(forward_batch, "token_to_kv_pool", None)
-+    if pool is None:
-+        try:
-+            from sglang.srt.model_executor.forward_context import get_attn_backend
-+
-+            pool = getattr(get_attn_backend(), "token_to_kv_pool", None)
-+        except Exception:
-+            pool = None
-+    if pool is None:
-+        _kv_pool_reports += 1
-+        logger.error("[kv-probe] no token_to_kv_pool reachable")
-+        return
-+    try:
-+        kbuf = pool.get_key_buffer(attn.layer_id)
-+        vbuf = pool.get_value_buffer(attn.layer_id)
-+    except Exception as exc:  # pragma: no cover - diagnostic only
-+        logger.error("[kv-probe] cannot read pool: %r", exc)
-+        _kv_pool_reports += 1
-+        return
-+    _kv_pool_reports += 1
-+    k_bad = int((~torch.isfinite(kbuf)).sum().item())
-+    v_bad = int((~torch.isfinite(vbuf)).sum().item())
-+    logger.error(
-+        "[kv-probe] layer=%d kbuf%s dtype=%s nonfinite_k=%d absmax_k=%.6g "
-+        "| vbuf nonfinite_v=%d absmax_v=%.6g",
-+        attn.layer_id,
-+        tuple(kbuf.shape),
-+        kbuf.dtype,
-+        k_bad,
-+        float(kbuf[torch.isfinite(kbuf)].abs().amax().item()) if k_bad < kbuf.numel() else float("nan"),
-+        v_bad,
-+        float(vbuf[torch.isfinite(vbuf)].abs().amax().item()) if v_bad < vbuf.numel() else float("nan"),
-+    )
-+
-+
-+def _debug_layer_nan_check(layer_idx, hidden_states, forward_batch, tag="layer_out"):
-+    """Log the first tensor that turns non-finite, plus enough batch context to
-+    tell prefill from decode."""
-+    global _layer_nan_reports
-+    if _layer_nan_reports >= 12 or hidden_states is None:
-+        return
-+    bad = ~torch.isfinite(hidden_states)
-+    if not bool(bad.any().item()):
-+        return
-+    _layer_nan_reports += 1
-+    rows = bad.reshape(bad.shape[0], -1).any(dim=-1).nonzero().flatten().tolist()
-+    logger.error(
-+        "[layer-nan] non-finite at layer=%d tag=%s mode=%s shape=%s "
-+        "bad_rows=%s seq_lens=%s",
-+        layer_idx,
-+        tag,
-+        getattr(forward_batch.forward_mode, "name", "?"),
-+        tuple(hidden_states.shape),
-+        rows[:8],
-+        (
-+            forward_batch.seq_lens.tolist()[:8]
-+            if forward_batch.seq_lens is not None
-+            else None
-+        ),
-+    )
++    _esimd_norm_add_norm_gemv_gelu_fp8 = None
++    _esimd_norm_gemv_norm_fp16 = None
++    _esimd_rmsnorm_gemv_fp8 = None
++    _esimd_dual_rmsnorm_residual_scalar = None
 +
  
  # Aligned with HF's implementation, using sliding window inclusive with the last token
  # SGLang assumes exclusive
-@@ -404,6 +507,20 @@ class Gemma4Attention(nn.Module):
+@@ -235,6 +271,27 @@ class Gemma4MoE(nn.Module):
+             ):
+                 return gemma4_fused_routing(gating_output, per_expert_scale, topk)
+ 
++            if (
++                gating_output.is_xpu
++                and gating_output.dim() == 2
++                and gating_output.dtype == torch.float16
++                and gating_output.shape[1] == 128
++                and topk == 8
++                and os.environ.get(
++                    "SGLANG_GEMMA4_DISABLE_ESIMD_TOPK", "0"
++                )
++                != "1"
++            ):
++                from custom_esimd_kernels_sglang import moe_batch_topk
++
++                topk_ids, topk_weights = moe_batch_topk(
++                    gating_output.contiguous(), topk, True
++                )
++                topk_weights *= per_expert_scale[
++                    topk_ids.to(torch.long)
++                ].to(torch.float16)
++                return topk_weights, topk_ids
++
+             topk_logits, topk_ids = torch.topk(gating_output, k=topk, dim=-1)
+ 
+             # Fused: softmax + per_expert_scale gather + mul + casts in one kernel
+@@ -272,6 +329,41 @@ class Gemma4MoE(nn.Module):
+         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+     ) -> torch.Tensor:
+         num_tokens, hidden_dim = hidden_states.shape
++        expert_layer = self.experts
++        w13 = getattr(expert_layer, "w13_weight", None)
++        w2 = getattr(expert_layer, "w2_weight", None)
++        if (
++            os.environ.get("SGLANG_GEMMA4_DISABLE_FUSED_MOE", "0") != "1"
++            and num_tokens == 1
++            and hidden_states.is_xpu
++            and hidden_states.dtype == torch.float16
++            and router_logits.dtype == torch.float16
++            and w13 is not None
++            and w2 is not None
++            and not getattr(
++                getattr(expert_layer, "quant_method", None), "block_quant", False
++            )
++            and tuple(w13.shape) == (128, 704, 2816)
++            and tuple(w2.shape) == (128, 2816, 352)
++            and w13.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
++            and w2.dtype == w13.dtype
++        ):
++            from sglang.srt.layers.quantization.fp8 import (
++                apply_xpu_gemma4_fp8_moe_from_logits,
++            )
++
++            hidden_states = apply_xpu_gemma4_fp8_moe_from_logits(
++                hidden_states,
++                expert_layer,
++                router_logits,
++                self.per_expert_scale,
++            )
++            if self.tp_size > 1:
++                hidden_states = tensor_model_parallel_all_reduce(
++                    hidden_states
++                )
++            return hidden_states.view(num_tokens, hidden_dim)
++
+         topk_output = self.topk(hidden_states, router_logits)
+         hidden_states = self.experts(hidden_states, topk_output)
+         return hidden_states.view(num_tokens, hidden_dim)
+@@ -295,7 +387,9 @@ class Gemma4Attention(nn.Module):
+ 
+         layer_type = config.layer_types[layer_id]
+         self.sliding_window = (
+-            config.sliding_window if layer_type == "sliding_attention" else None
++            get_attention_sliding_window_size(config)
++            if layer_type == "sliding_attention"
++            else None
+         )
+ 
+         self.total_num_heads = config.num_attention_heads
+@@ -404,14 +498,143 @@ class Gemma4Attention(nn.Module):
              prefix=add_prefix("attn", prefix),
          )
  
@@ -8493,13 +9076,62 @@ index 9c2f9c25db..44965d9540 100644
 +        self._esimd_qkv_cache = cache
 +        return cache
 +
++    def fused_input_norm_qkv(
++        self, hidden_states: torch.Tensor, input_norm: RMSNorm
++    ) -> Optional[torch.Tensor]:
++        weight = self.qkv_proj.weight
++        if (
++            _esimd_rmsnorm_gemv_fp8 is None
++            or os.environ.get(
++                "SGLANG_GEMMA4_DISABLE_FUSED_QKV_PROJ", "0"
++            )
++            == "1"
++            or hidden_states.shape != (1, 2816)
++            or hidden_states.dtype != torch.float16
++            or input_norm.weight.dtype != torch.float16
++            or weight.dtype
++            not in (torch.float8_e4m3fn, torch.float8_e5m2)
++            or weight.dim() != 2
++            or weight.shape[0] != 2816
++            or self.qkv_proj.weight_scale.numel() != 1
++        ):
++            return None
++        if not hasattr(self.qkv_proj, "_gemma4_weight_nk"):
++            self.qkv_proj._gemma4_weight_nk = weight.t().contiguous()
++            self.qkv_proj._gemma4_scale = (
++                self.qkv_proj.weight_scale.to(torch.float32)
++                .reshape(-1)[:1]
++                .contiguous()
++            )
++            self.qkv_proj._gemma4_output = torch.empty(
++                1,
++                weight.shape[1],
++                dtype=torch.float16,
++                device=hidden_states.device,
++            )
++        _esimd_rmsnorm_gemv_fp8(
++            hidden_states,
++            input_norm.weight.data,
++            self.qkv_proj._gemma4_weight_nk,
++            self.qkv_proj._gemma4_scale,
++            self.qkv_proj._gemma4_output,
++            input_norm.variance_epsilon,
++        )
++        return self.qkv_proj._gemma4_output
++
      def forward(
          self,
          positions: torch.Tensor,
-@@ -412,6 +529,80 @@ class Gemma4Attention(nn.Module):
+         hidden_states: torch.Tensor,
+         forward_batch: ForwardBatch,
++        qkv_override: Optional[torch.Tensor] = None,
          **kwargs,
      ):
-         qkv, _ = self.qkv_proj(hidden_states)
+-        qkv, _ = self.qkv_proj(hidden_states)
++        if qkv_override is None:
++            qkv, _ = self.qkv_proj(hidden_states)
++        else:
++            qkv = qkv_override
 +
 +        # ESIMD fast path: fused QKV split + Q/K RMSNorm + RoPE in one kernel.
 +        # Eligible when: head_dim==256, fp16, non-kv-shared, decode (M small).
@@ -8561,23 +9193,17 @@ index 9c2f9c25db..44965d9540 100644
 +            attn_output = self.attn(
 +                q, k, v, forward_batch=forward_batch, save_kv_cache=True,
 +            )
-+            if _DEBUG_LAYER_NAN:
-+                _debug_layer_nan_check(self.layer_id, q, forward_batch, tag="esimd_q")
-+                _debug_layer_nan_check(self.layer_id, k, forward_batch, tag="esimd_k")
-+                _debug_layer_nan_check(self.layer_id, v, forward_batch, tag="esimd_v")
-+                _debug_layer_nan_check(
-+                    self.layer_id, attn_output, forward_batch, tag="core_attn_out"
-+                )
-+                _debug_probe_kv_pool(self.attn, attn_output, forward_batch)
 +            if attn_output.dim() == 3:
 +                attn_output = attn_output.flatten(-2, -1)
++            if attn_output.dtype != qkv.dtype:
++                attn_output = attn_output.to(qkv.dtype)
 +            output, _ = self.o_proj(attn_output)
 +            return output
 +
          q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
  
          # Fused Q/K/V RMSNorm: replaces three separate norm kernels with one.
-@@ -424,9 +615,11 @@ class Gemma4Attention(nn.Module):
+@@ -424,9 +647,11 @@ class Gemma4Attention(nn.Module):
          )
          can_fuse_qkv_norm = (
              (q.is_cuda or q.is_xpu)
@@ -8589,23 +9215,253 @@ index 9c2f9c25db..44965d9540 100644
          )
          if can_fuse_qkv_norm:
              if is_kv_shared:
-@@ -665,9 +858,14 @@ class Gemma4DecoderLayer(nn.Module):
+@@ -507,8 +732,9 @@ class Gemma4Attention(nn.Module):
+         )
+         if attn_output.dim() == 3:
+             attn_output = attn_output.flatten(-2, -1)
++        if attn_output.dtype != qkv.dtype:
++            attn_output = attn_output.to(qkv.dtype)
+         output, _ = self.o_proj(attn_output)
+-
+         return output
+ 
+ 
+@@ -659,30 +885,146 @@ class Gemma4DecoderLayer(nn.Module):
+         residual = hidden_states
+ 
+         # Apply input layernorm
+-        hidden_states = self.input_layernorm(hidden_states)
++        qkv_override = self.self_attn.fused_input_norm_qkv(
++            hidden_states, self.input_layernorm
++        )
++        if qkv_override is None:
++            hidden_states = self.input_layernorm(hidden_states)
+         hidden_states = self.self_attn(
+             positions=positions,
              hidden_states=hidden_states,
              forward_batch=forward_batch,
++            qkv_override=qkv_override,
          )
 -        hidden_states = self.post_attention_layernorm(hidden_states)
-+        if _DEBUG_LAYER_NAN:
-+            _debug_layer_nan_check(
-+                self.layer_id, hidden_states, forward_batch, tag="attn_out"
-+            )
- 
+-
          if self.enable_moe_block:
-+            # MoE path keeps the standalone post-attention norm.
-+            hidden_states = self.post_attention_layernorm(hidden_states)
-             # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
-             # Also need raw (unfused) residual for router and pre_ff_norm_2
-             hidden_states, residual = self.pre_feedforward_layernorm(
-@@ -714,10 +912,53 @@ class Gemma4DecoderLayer(nn.Module):
+-            # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
+-            # Also need raw (unfused) residual for router and pre_ff_norm_2
+-            hidden_states, residual = self.pre_feedforward_layernorm(
+-                hidden_states, residual
+-            )
++            dense_activation = None
++            gate_up_proj = self.mlp.gate_up_proj
++            if (
++                _esimd_norm_add_norm_gemv_gelu_fp8 is not None
++                and os.environ.get(
++                    "SGLANG_GEMMA4_DISABLE_FUSED_DENSE", "0"
++                )
++                != "1"
++                and hidden_states.shape == (1, 2816)
++                and hidden_states.dtype == torch.float16
++                and hidden_states.is_contiguous()
++                and residual.is_contiguous()
++                and gate_up_proj.weight.dtype
++                in (torch.float8_e4m3fn, torch.float8_e5m2)
++                and tuple(gate_up_proj.weight.shape) == (2816, 2112)
++                and gate_up_proj.weight_scale.numel() == 1
++            ):
++                if not hasattr(gate_up_proj, "_gemma4_weight_nk"):
++                    gate_up_proj._gemma4_weight_nk = (
++                        gate_up_proj.weight.t().contiguous()
++                    )
++                    gate_up_proj._gemma4_scale = (
++                        gate_up_proj.weight_scale.to(torch.float32)
++                        .reshape(-1)[:1]
++                        .contiguous()
++                    )
++                    self._fused_dense_residual = torch.empty_like(residual)
++                    self._fused_dense_activation = torch.empty(
++                        1,
++                        1056,
++                        dtype=torch.float16,
++                        device=hidden_states.device,
++                    )
++                _esimd_norm_add_norm_gemv_gelu_fp8(
++                    hidden_states,
++                    residual,
++                    self.post_attention_layernorm.weight.data,
++                    self.pre_feedforward_layernorm.weight.data,
++                    gate_up_proj._gemma4_weight_nk,
++                    gate_up_proj._gemma4_scale,
++                    self._fused_dense_residual,
++                    self._fused_dense_activation,
++                    self.post_attention_layernorm.variance_epsilon,
++                    self.pre_feedforward_layernorm.variance_epsilon,
++                )
++                residual = self._fused_dense_residual
++                dense_activation = self._fused_dense_activation
++            elif (
++                _esimd_norm_add_norm is not None
++                and hidden_states.shape[0] == 1
++                and hidden_states.dtype == torch.float16
++                and hidden_states.is_contiguous()
++                and residual.is_contiguous()
++            ):
++                if not hasattr(self, "_nan_w1"):
++                    self._nan_w1 = (
++                        self.post_attention_layernorm.weight.data.to(
++                            torch.float16
++                        ).contiguous()
++                    )
++                    self._nan_w2 = (
++                        self.pre_feedforward_layernorm.weight.data.to(
++                            torch.float16
++                        ).contiguous()
++                    )
++                _esimd_norm_add_norm(
++                    hidden_states,
++                    residual,
++                    self._nan_w1,
++                    self._nan_w2,
++                    hidden_states,
++                    self.post_attention_layernorm.variance_epsilon,
++                    self.pre_feedforward_layernorm.variance_epsilon,
++                )
++            else:
++                hidden_states = self.post_attention_layernorm(hidden_states)
++                hidden_states, residual = self.pre_feedforward_layernorm(
++                    hidden_states, residual
++                )
+             # For MoE: router and pre_ff_norm_2 need the unfused residual
+             # (which is now updated to post_attn_out + old_residual)
+             moe_input = residual
+ 
+             # Dense MLP branch
+-            hidden_states_1 = self.mlp(hidden_states)
+-
+-            # MoE branch: router sees residual (= post_attn_out + old_residual)
+-            router_logits = self.router(moe_input)
+-            hidden_states_2 = self.pre_feedforward_layernorm_2(moe_input)
++            if dense_activation is not None:
++                hidden_states_1, _ = self.mlp.down_proj(dense_activation)
++            else:
++                hidden_states_1 = self.mlp(hidden_states)
++            router = self.router
++            if (
++                _esimd_norm_gemv_norm_fp16 is not None
++                and os.environ.get(
++                    "SGLANG_GEMMA4_DISABLE_FUSED_ROUTER", "0"
++                )
++                != "1"
++                and moe_input.shape[0] == 1
++                and moe_input.dtype == torch.float16
++                and moe_input.is_contiguous()
++                and router.proj.weight.dtype == torch.float16
++                and router.proj.weight.is_contiguous()
++                and self.pre_feedforward_layernorm_2.weight.dtype
++                == torch.float16
++            ):
++                if not hasattr(router, "_fused_scale_with_root"):
++                    router._fused_scale_with_root = (
++                        router.scale.data * router.root_size
++                    ).to(torch.float16).contiguous()
++                    router._fused_logits = torch.empty(
++                        1,
++                        router.proj.weight.shape[0],
++                        dtype=torch.float16,
++                        device=moe_input.device,
++                    )
++                    self._fused_moe_input = torch.empty_like(moe_input)
++                _esimd_norm_gemv_norm_fp16(
++                    moe_input,
++                    router._fused_scale_with_root,
++                    router.proj.weight,
++                    self.pre_feedforward_layernorm_2.weight.data,
++                    router._fused_logits,
++                    self._fused_moe_input,
++                    self.pre_feedforward_layernorm_2.variance_epsilon,
++                )
++                router_logits = router._fused_logits
++                hidden_states_2 = self._fused_moe_input
++            else:
++                router_logits = router(moe_input)
++                hidden_states_2 = self.pre_feedforward_layernorm_2(moe_input)
+             hidden_states_2 = self.moe(hidden_states_2, router_logits)
+ 
+             # Fused: (rmsnorm(rmsnorm(h1,w1) + rmsnorm(h2,w2), w3) + residual) * scalar
+@@ -694,18 +1036,62 @@ class Gemma4DecoderLayer(nn.Module):
+                 norm1 = self.post_feedforward_layernorm_1
+                 norm2 = self.post_feedforward_layernorm_2
+                 norm3 = self.post_feedforward_layernorm
+-                hidden_states = gemma_dual_rmsnorm_residual_scalar(
+-                    hidden_states_1,
+-                    norm1.weight.data,
+-                    hidden_states_2,
+-                    norm2.weight.data,
+-                    norm3.weight.data,
+-                    residual,
+-                    self.layer_scalar,
+-                    norm1.variance_epsilon,
+-                    norm2.variance_epsilon,
+-                    norm3.variance_epsilon,
+-                )
++                if (
++                    _esimd_dual_rmsnorm_residual_scalar is not None
++                    and os.environ.get(
++                        "SGLANG_GEMMA4_DISABLE_FUSED_DUAL_NORM", "0"
++                    )
++                    != "1"
++                    and hidden_states_1.dim() == 2
++                    and hidden_states_1.shape[1] == 2816
++                    and hidden_states_1.dtype == torch.float16
++                    and hidden_states_1.is_contiguous()
++                    and hidden_states_2.is_contiguous()
++                    and residual.is_contiguous()
++                ):
++                    if not hasattr(self, "_dual_norm_scalar"):
++                        self._dual_norm_scalar = float(
++                            self.layer_scalar.item()
++                        )
++                    output_attr = (
++                        "_dual_norm_decode_output"
++                        if hidden_states_1.shape[0] == 1
++                        else "_dual_norm_prefill_output"
++                    )
++                    dual_norm_output = getattr(self, output_attr, None)
++                    if (
++                        dual_norm_output is None
++                        or dual_norm_output.shape != hidden_states_1.shape
++                    ):
++                        dual_norm_output = torch.empty_like(hidden_states_1)
++                        setattr(self, output_attr, dual_norm_output)
++                    _esimd_dual_rmsnorm_residual_scalar(
++                        hidden_states_1,
++                        norm1.weight.data,
++                        hidden_states_2,
++                        norm2.weight.data,
++                        norm3.weight.data,
++                        residual,
++                        dual_norm_output,
++                        norm1.variance_epsilon,
++                        norm2.variance_epsilon,
++                        norm3.variance_epsilon,
++                        self._dual_norm_scalar,
++                    )
++                    hidden_states = dual_norm_output
++                else:
++                    hidden_states = gemma_dual_rmsnorm_residual_scalar(
++                        hidden_states_1,
++                        norm1.weight.data,
++                        hidden_states_2,
++                        norm2.weight.data,
++                        norm3.weight.data,
++                        residual,
++                        self.layer_scalar,
++                        norm1.variance_epsilon,
++                        norm2.variance_epsilon,
++                        norm3.variance_epsilon,
++                    )
+                 return hidden_states, None
+ 
+             hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states_1)
+@@ -714,10 +1100,53 @@ class Gemma4DecoderLayer(nn.Module):
              # Combine branches
              hidden_states = hidden_states_1 + hidden_states_2
          else:
@@ -8663,7 +9519,7 @@ index 9c2f9c25db..44965d9540 100644
              hidden_states = self.mlp(hidden_states)
  
          if (
-@@ -726,15 +967,32 @@ class Gemma4DecoderLayer(nn.Module):
+@@ -726,15 +1155,32 @@ class Gemma4DecoderLayer(nn.Module):
              and (hidden_states.is_cuda or hidden_states.is_xpu)
              and hidden_states.dim() == 2
          ):
@@ -8704,17 +9560,8 @@ index 9c2f9c25db..44965d9540 100644
          else:
              hidden_states = self.post_feedforward_layernorm(hidden_states)
              hidden_states = hidden_states + residual
-@@ -992,6 +1250,8 @@ class Gemma4TextModel(PreTrainedModel):
-                 **kwargs,
-             )
-             hidden_states = layer_outputs[0]
-+            if _DEBUG_LAYER_NAN:
-+                _debug_layer_nan_check(layer_idx, hidden_states, forward_batch)
-             # Gemma4DecoderLayer.forward always returns (hidden_states, None);
-             # the residual is fused inside the layer, so nothing to thread.
- 
 diff --git a/python/sglang/srt/models/gemma4_mm.py b/python/sglang/srt/models/gemma4_mm.py
-index 3629782ca3..3d7068ab44 100644
+index 3629782ca3ba6bf6c84ca16a40cf99dac72a6700..3d7068ab445cbca34cba2e6cd00513acc45cf2c1 100644
 --- a/python/sglang/srt/models/gemma4_mm.py
 +++ b/python/sglang/srt/models/gemma4_mm.py
 @@ -606,12 +606,17 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
@@ -8742,7 +9589,7 @@ index 3629782ca3..3d7068ab44 100644
          # Prepare bidirectional attention masks for image tokens during prefill.
          # mm_inputs is preserved on every PP rank up to the first-rank embed
 diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
-index 37552404b9..74b209839b 100644
+index 37552404b90d46726cdf0debf7e831254cc55baf..74b209839b251d53194c02e8c85394561d9ed14b 100644
 --- a/python/sglang/srt/models/qwen2_moe.py
 +++ b/python/sglang/srt/models/qwen2_moe.py
 @@ -19,6 +19,7 @@
@@ -9782,7 +10629,7 @@ index 37552404b9..74b209839b 100644
  class Qwen2MoeAttention(nn.Module):
      def __init__(
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
-index 65f78e6917..5133077702 100644
+index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a57375a40e 100644
 --- a/python/sglang/srt/models/qwen3_5.py
 +++ b/python/sglang/srt/models/qwen3_5.py
 @@ -15,8 +15,9 @@
@@ -12140,7 +12987,7 @@ index 65f78e6917..5133077702 100644
                              param, "weight_loader", default_weight_loader
                          )
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index 6c77ff64f9..78d88e51c6 100644
+index 6c77ff64f92cd08d9f00eb96f8f1514a39d4dd2c..49c88898cab9e5b1f60750028fd5b67748477d57 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
 @@ -119,6 +119,7 @@ LOAD_FORMAT_CHOICES = [
@@ -12170,8 +13017,100 @@ index 6c77ff64f9..78d88e51c6 100644
              if self.speculative_num_draft_tokens is not None:
                  assert not self.enable_mamba_extra_buffer_lazy(), (
                      "extra_buffer_lazy is not yet supported with speculative decoding. "
+@@ -3763,6 +3765,7 @@ class ServerArgs:
+         2) Storage <-> layout compatibility (may rewrite layout).
+         3) I/O <-> decode-attention compatibility (may rewrite I/O or decode backend).
+         4) Re-run step (1) if step (3) changed I/O backend.
++        5) Reject combinations this accelerator cannot execute (XPU).
+         """
+         # Skip all normalization when neither hicache nor decode-offload path is active.
+         if not (
+@@ -3784,6 +3787,83 @@ class ServerArgs:
+         if io_changed:
+             self._resolve_layout_io_compatibility()
+ 
++        # Step 5: reject what XPU cannot execute. This runs LAST, on the fully resolved
++        # values, because steps 1-4 rewrite both knobs: page_first_direct silently
++        # selects io_backend="direct", so a user who never typed "direct" can still land
++        # on the unimplemented path.
++        self._reject_unsupported_xpu_hicache()
++
++    def _reject_unsupported_xpu_hicache(self):
++        """Fail fast on HiCache layouts / IO backends not yet validated on XPU.
++
++        On the 'direct' family, correcting an earlier claim in this file: those ops are
++        NOT missing on XPU. sgl-kernel-xpu implements transfer_kv_direct,
++        transfer_kv_per_layer_direct_pf_lf and transfer_kv_all_layer_direct_lf_pf as
++        Group B Python fallbacks built on page-by-page torch.Tensor.copy_(
++        non_blocking=True) -- see sgl_kernel/kvcacheio.py:322 _transfer_page_direct --
++        because XPU has no equivalent of cudaMemcpyBatchAsync. Verified against the
++        installed package: transfer_kv_direct contains no torch.ops.sgl_kernel call, so
++        the AttributeError this guard used to predict cannot occur.
++
++        They are therefore blocked for being *unvalidated on XPU*, not unimplemented, and
++        the expectation is 'works but slower' (one copy_ per page instead of one batched
++        submission). Measuring that is a TODO. Set SGLANG_XPU_ALLOW_UNVALIDATED_HICACHE=1
++        to downgrade this to a warning so the path can be evaluated without editing code;
++        results from that configuration are not supported.
++        """
++        if not is_xpu():
++            return
++
++        # XPU currently validates only these two layouts. The others are not blocked
++        # because they are known-broken -- they are simply unverified, and two of them
++        # route to kernels that do not exist:
++        #   page_first_direct  -> silently selects io_backend="direct" (step 1)
++        #   page_first_kv_split, page_head -> untested on XPU
++        _XPU_SUPPORTED_LAYOUTS = ("layer_first", "page_first")
++
++        # Report the RESOLVED pair, and say so. Because this guard deliberately runs last,
++        # the values it sees may not be the ones the user typed: `--hicache-io-backend
++        # direct` is rewritten by _resolve_layout_io_compatibility() into
++        # hicache_mem_layout="page_first_direct". Naming only the layout in that case tells
++        # a user who never mentioned a layout that their layout is wrong.
++        resolved = (
++            f"(resolved: --hicache-mem-layout {self.hicache_mem_layout} "
++            f"--hicache-io-backend {self.hicache_io_backend}; note that these two flags "
++            f"rewrite each other, so this pair may differ from what you passed)"
++        )
++        # An escape hatch, so "unvalidated" does not become "unmeasurable". A hard error
++        # on an unvalidated-but-working path would force the next person to patch this
++        # file to evaluate it, and patched-source results are not comparable.
++        allow_unvalidated = (
++            os.environ.get("SGLANG_XPU_ALLOW_UNVALIDATED_HICACHE", "0") == "1"
++        )
++
++        def _reject(msg: str):
++            if allow_unvalidated:
++                logger.warning(
++                    "SGLANG_XPU_ALLOW_UNVALIDATED_HICACHE=1, proceeding anyway: %s", msg
++                )
++                return
++            raise ValueError(msg)
++
++        if self.hicache_mem_layout not in _XPU_SUPPORTED_LAYOUTS:
++            _reject(
++                f"--hicache-mem-layout '{self.hicache_mem_layout}' is not validated "
++                f"on XPU yet. Validated: {', '.join(_XPU_SUPPORTED_LAYOUTS)}. "
++                "Note 'page_first_direct' also switches the IO backend to 'direct'. "
++                + resolved
++            )
++        if self.hicache_io_backend == "direct":
++            _reject(
++                "--hicache-io-backend 'direct' is not validated on XPU. It is "
++                "implemented -- sgl-kernel-xpu provides the direct-family ops as "
++                "page-by-page torch copy_ fallbacks, since XPU has no "
++                "cudaMemcpyBatchAsync equivalent -- but it is untested here and expected "
++                "to be slower than the batched path. Use --hicache-io-backend kernel "
++                "(the default), which is validated across all three cache tiers. "
++                + resolved
++            )
++
+     def _resolve_layout_io_compatibility(self):
+         if (
+             self.hicache_mem_layout == "page_first_direct"
 diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
-index 3bb3cec3ae..49e3644c03 100644
+index 3bb3cec3ae3364a7f5e97dc1751ad3d1ad5b9fb0..49e3644c03789b4e9a36afe01a549a0720328831 100644
 --- a/python/sglang/srt/speculative/eagle_utils.py
 +++ b/python/sglang/srt/speculative/eagle_utils.py
 @@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, List, Optional
@@ -12272,7 +13211,7 @@ index 3bb3cec3ae..49e3644c03 100644
  
  
 diff --git a/python/sglang/srt/speculative/spec_utils.py b/python/sglang/srt/speculative/spec_utils.py
-index 48d07334af..c00eb1e982 100644
+index 48d07334af78dfc7ddcf74288ce327fd18357ec4..c00eb1e982d03521f9d6d4d912b1542a8054ad4d 100644
 --- a/python/sglang/srt/speculative/spec_utils.py
 +++ b/python/sglang/srt/speculative/spec_utils.py
 @@ -39,12 +39,13 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
@@ -12309,7 +13248,7 @@ index 48d07334af..c00eb1e982 100644
      i: int,
      topk_p: torch.Tensor,
 diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
-index 4556d06b16..c5e35caf9a 100644
+index 4556d06b16f88c55e10d4703f2bdfdf1a4d3c92d..c5e35caf9ada0d0360ecfcf72650ac15b159e1df 100644
 --- a/python/sglang/srt/utils/common.py
 +++ b/python/sglang/srt/utils/common.py
 @@ -329,6 +329,7 @@ def xpu_has_xmx_support():
@@ -12321,7 +13260,7 @@ index 4556d06b16..c5e35caf9a 100644
      return get_bool_env_var("SGLANG_USE_SGL_XPU") and is_xpu()
  
 diff --git a/python/sglang/srt/utils/hf_transformers/config.py b/python/sglang/srt/utils/hf_transformers/config.py
-index f66ea9a672..8e5f7beda7 100644
+index f66ea9a672e55dfd7b44f40feece4592dfc4c960..8e5f7beda725af2662f2e24ae8a6064c76437b29 100644
 --- a/python/sglang/srt/utils/hf_transformers/config.py
 +++ b/python/sglang/srt/utils/hf_transformers/config.py
 @@ -13,6 +13,7 @@
@@ -12394,3 +13333,568 @@ index f66ea9a672..8e5f7beda7 100644
          if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
              raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
          _set_architectures(config, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type])
+diff --git a/test/registered/unit/server_args/test_xpu_hicache_server_args.py b/test/registered/unit/server_args/test_xpu_hicache_server_args.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..47b4372a0827a8dba1fd51caa65acd9fcd324e84
+--- /dev/null
++++ b/test/registered/unit/server_args/test_xpu_hicache_server_args.py
+@@ -0,0 +1,100 @@
++"""
++Unit tests for the XPU HiCache validation guard in ServerArgs.
++
++The guard (ServerArgs._reject_unsupported_xpu_hicache) rejects HiCache mem layouts
++and IO backends that have not been validated on Intel XPU, and honours
++SGLANG_XPU_ALLOW_UNVALIDATED_HICACHE=1 as an escape hatch so an unvalidated-but-
++implemented path can still be measured without patching this file.
++
++No XPU hardware is required: is_xpu() is patched, so this runs on CPU CI runners.
++
++Usage:
++python3 -m unittest test_xpu_hicache_server_args -v
++"""
++
++import unittest
++from unittest.mock import patch
++
++from sglang.srt.server_args import ServerArgs
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cpu_ci(est_time=5, suite="base-a-test-cpu")
++register_cpu_ci(est_time=5, suite="base-b-test-cpu")
++
++
++def _args(layout: str, io_backend: str) -> ServerArgs:
++    """Build only the two fields the guard reads.
++
++    The guard runs at the end of __post_init__, which also resolves the device, the
++    ports and the model config -- none of which exist on a CPU-only runner. Bypassing
++    __init__ keeps this a unit test of the guard rather than an integration test of
++    ServerArgs, so it cannot start passing (or failing) because of an unrelated
++    __post_init__ change.
++    """
++    server_args = ServerArgs.__new__(ServerArgs)
++    server_args.hicache_mem_layout = layout
++    server_args.hicache_io_backend = io_backend
++    return server_args
++
++
++class TestXPUHiCacheGuard(CustomTestCase):
++    """Testcase: HiCache flag validation on Intel XPU.
++
++    Cover scenarios:
++    1. Validated layout/backend pairs are accepted
++    2. Unvalidated layouts are rejected, naming the resolved pair
++    3. io_backend=direct is rejected as unvalidated, not as unimplemented
++    4. The escape hatch downgrades every rejection to a warning
++    5. Non-XPU devices are never touched by the guard
++
++    [Test Category] HiCache
++    [Test Target] ServerArgs._reject_unsupported_xpu_hicache
++    """
++
++    def test_validated_pairs_are_accepted(self):
++        with patch("sglang.srt.server_args.is_xpu", return_value=True):
++            for layout in ("layer_first", "page_first"):
++                _args(layout, "kernel")._reject_unsupported_xpu_hicache()
++
++    def test_unvalidated_layout_is_rejected(self):
++        with patch("sglang.srt.server_args.is_xpu", return_value=True):
++            for layout in ("page_first_direct", "page_first_kv_split", "page_head"):
++                with self.assertRaises(ValueError) as ctx:
++                    _args(layout, "kernel")._reject_unsupported_xpu_hicache()
++                # The message must report the RESOLVED pair. hicache_mem_layout and
++                # hicache_io_backend rewrite each other before the guard runs, so a
++                # message naming only one of them can describe a flag the user never
++                # passed.
++                self.assertIn("resolved:", str(ctx.exception))
++                self.assertIn("not validated", str(ctx.exception))
++
++    def test_direct_io_backend_is_rejected_as_unvalidated(self):
++        with patch("sglang.srt.server_args.is_xpu", return_value=True):
++            with self.assertRaises(ValueError) as ctx:
++                _args("layer_first", "direct")._reject_unsupported_xpu_hicache()
++            msg = str(ctx.exception)
++            self.assertIn("not validated on XPU", msg)
++            # The direct-family ops DO exist on XPU as page-by-page torch copy_
++            # fallbacks (sgl_kernel/kvcacheio.py _transfer_page_direct). Asserting the
++            # wording keeps the guard from regressing back to claiming they are
++            # missing, which is what an earlier revision of it wrongly said.
++            self.assertIn("implemented", msg)
++
++    def test_escape_hatch_downgrades_to_warning(self):
++        env = {"SGLANG_XPU_ALLOW_UNVALIDATED_HICACHE": "1"}
++        with patch("sglang.srt.server_args.is_xpu", return_value=True), patch.dict(
++            "os.environ", env
++        ), patch("sglang.srt.server_args.logger") as mock_logger:
++            # Both rejection sites must honour the hatch, so exercise both.
++            _args("page_first_direct", "direct")._reject_unsupported_xpu_hicache()
++            self.assertEqual(mock_logger.warning.call_count, 2)
++
++    def test_guard_is_inert_off_xpu(self):
++        with patch("sglang.srt.server_args.is_xpu", return_value=False):
++            # A CUDA user must never see an XPU message, even on a pair that XPU rejects.
++            _args("page_first_direct", "direct")._reject_unsupported_xpu_hicache()
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/xpu/test_xpu_hicache_storage_file.py b/test/registered/xpu/test_xpu_hicache_storage_file.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..42576c8404f47a44c64b3a95b9a0e29de262201f
+--- /dev/null
++++ b/test/registered/xpu/test_xpu_hicache_storage_file.py
+@@ -0,0 +1,209 @@
++"""
++HiCache L3 (file storage backend) tests on Intel XPU.
++
++Two properties, in order, because the second is meaningless without the first:
++  1. write:  a prefix served by the device tier is backed up to disk
++  2. read:   after the server is restarted -- which destroys the host tier -- the same
++             prefix is served from disk
++
++The restart is what makes the read test honest. With a live host tier, a hit proves
++nothing about L3, because L2 could have answered.
++
++Usage:
++python3 -m unittest test_xpu_hicache_storage_file -v
++"""
++
++import os
++import shutil
++import tempfile
++import time
++import unittest
++import uuid
++
++import requests
++
++from sglang.srt.utils import kill_process_tree
++from sglang.test.ci.ci_register import register_xpu_ci
++from sglang.test.test_utils import (
++    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
++    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++    DEFAULT_URL_FOR_TEST,
++    CustomTestCase,
++    popen_launch_server,
++)
++
++register_xpu_ci(est_time=600, suite="stage-b-test-1-gpu-xpu")
++
++# See test_xpu_hierarchical_cache.py: --hicache-ratio sizes the pinned host pool from
++# the device pool, so the device pool must be pinned too.
++MAX_TOTAL_TOKENS = 4096
++PAGE_SIZE = 64
++# How long to wait for the write-through backup to reach disk. The backup is
++# asynchronous: the device write acks first, the host write acks next, and only then is
++# the page handed to the storage backend.
++WRITE_TIMEOUT_S = 60
++
++
++def pin_loopback_no_proxy():
++    """Keep the loopback address out of any ambient HTTP proxy.
++
++    Duplicated from test_xpu_hierarchical_cache.py rather than imported, so each test
++    file stays runnable on its own from any working directory. See that file for the
++    failure this prevents: a proxied self-warmup GET makes the server kill its own pid,
++    and the test reports a launch failure that names neither HTTP nor the proxy.
++    """
++    for var in ("no_proxy", "NO_PROXY"):
++        current = os.environ.get(var, "")
++        missing = [h for h in ("127.0.0.1", "localhost", "::1") if h not in current]
++        if missing:
++            os.environ[var] = ",".join(missing + ([current] if current else []))
++
++
++class TestXPUHiCacheStorageFile(CustomTestCase):
++    """Testcase: HiCache file storage backend on Intel XPU.
++
++    Cover scenarios:
++    1. write_through backs a served prefix up to the file backend
++    2. the prefix is read back from disk after a server restart
++
++    [Test Category] HiCache
++    [Test Target] --hicache-storage-backend file on --device xpu
++    """
++
++    @classmethod
++    def setUpClass(cls):
++        pin_loopback_no_proxy()
++        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
++        cls.base_url = DEFAULT_URL_FOR_TEST
++        cls.storage_dir = tempfile.mkdtemp(prefix="xpu-hicache-l3-")
++        # Nonce the prefix so a rerun cannot read files planted by a previous run. The
++        # L3 key is a chained hash of the token pages, so different text is a different
++        # key.
++        cls.nonce = uuid.uuid4().hex[:8]
++        cls.prefix = f"Document {cls.nonce}. " + "Section 7.4 of the manual. " * 64
++        cls.process = None
++
++    @classmethod
++    def tearDownClass(cls):
++        if cls.process:
++            kill_process_tree(cls.process.pid)
++        shutil.rmtree(cls.storage_dir, ignore_errors=True)
++
++    @classmethod
++    def _launch(cls):
++        """Launch a server against the shared storage dir.
++
++        The dir is deliberately NOT cleared between launches: keeping it is the entire
++        experiment. Clearing it on relaunch produces a correct miss that reads exactly
++        like a broken read path.
++        """
++        other_args = [
++            "--device",
++            "xpu",
++            "--attention-backend",
++            "intel_xpu",
++            "--mem-fraction-static",
++            "0.6",
++            "--tp-size",
++            "1",
++            "--page-size",
++            str(PAGE_SIZE),
++            "--max-total-tokens",
++            str(MAX_TOTAL_TOKENS),
++            "--enable-cache-report",
++            "--enable-hierarchical-cache",
++            "--hicache-ratio",
++            "2",
++            "--hicache-write-policy",
++            "write_through",
++            "--hicache-io-backend",
++            "kernel",
++            "--hicache-mem-layout",
++            "layer_first",
++            "--hicache-storage-backend",
++            "file",
++            # wait_complete is mandatory, not a tuning choice. Under the default
++            # best_effort policy can_terminate_prefetch() returns True unconditionally,
++            # so the L3 prefetch is cancelled on the first scheduler tick and a cold
++            # request keeps zero prefetched tokens. The read assertion below would then
++            # be unfalsifiable.
++            "--hicache-storage-prefetch-policy",
++            "wait_complete",
++        ]
++        return popen_launch_server(
++            cls.model,
++            cls.base_url,
++            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++            other_args=other_args,
++            # See test_xpu_hierarchical_cache.py: device="auto" would append a second
++            # --device after ours and win.
++            device="xpu",
++            env={
++                **os.environ,
++                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.storage_dir,
++            },
++        )
++
++    def _generate(self, text: str) -> dict:
++        response = requests.post(
++            f"{self.base_url}/generate",
++            json={
++                "text": text,
++                "sampling_params": {"temperature": 0, "max_new_tokens": 1},
++            },
++        )
++        self.assertEqual(response.status_code, 200, response.text)
++        return response.json()["meta_info"]
++
++    @staticmethod
++    def _tiers(meta: dict) -> tuple:
++        details = meta.get("cached_tokens_details") or {}
++        return (
++            meta.get("cached_tokens", 0),
++            details.get("device", 0),
++            details.get("host", 0),
++            details.get("storage", 0),
++        )
++
++    def _files(self) -> int:
++        return len(os.listdir(self.storage_dir))
++
++    def test_l3_write_then_read_across_restart(self):
++        # One test method, not two, because the read step depends on state the write
++        # step creates. Split across methods it would depend on execution order.
++        type(self).process = self._launch()
++
++        # --- write ---
++        self._generate(self.prefix)
++        deadline = time.monotonic() + WRITE_TIMEOUT_S
++        while self._files() == 0 and time.monotonic() < deadline:
++            time.sleep(1)
++        planted = self._files()
++        self.assertGreater(
++            planted,
++            0,
++            "write_through did not back the prefix up to the file backend; there is "
++            "nothing on disk, so the read step below could only fail for the wrong "
++            "reason",
++        )
++
++        # --- restart: this is what destroys the host tier ---
++        kill_process_tree(type(self).process.pid)
++        type(self).process = None
++        self.assertEqual(
++            self._files(), planted, "the restart must not disturb the planted files"
++        )
++        type(self).process = self._launch()
++
++        # --- read ---
++        cached, device, host, storage = self._tiers(self._generate(self.prefix))
++        self.assertGreater(
++            storage,
++            0,
++            f"expected an L3 hit, got cached={cached} device={device} host={host}",
++        )
++        self.assertGreaterEqual(cached, storage)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/xpu/test_xpu_hierarchical_cache.py b/test/registered/xpu/test_xpu_hierarchical_cache.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d66b31f29b27e978c46e22c3d8004c9264d3bce1
+--- /dev/null
++++ b/test/registered/xpu/test_xpu_hierarchical_cache.py
+@@ -0,0 +1,238 @@
++"""
++HierarchicalCache (L1 device <-> L2 pinned host) tests on Intel XPU.
++
++Mirrors the Ascend HiCache suite under test/registered/ascend/basic_function/HiCache/,
++with one XPU-specific addition: a test that a prefix evicted from the device pool is
++reloaded from the host tier rather than recomputed. That is the only test here that
++actually exercises the XPU KV transfer kernels in both directions.
++
++Usage:
++python3 -m unittest test_xpu_hierarchical_cache -v
++"""
++
++import os
++import unittest
++import uuid
++
++import requests
++
++from sglang.srt.utils import kill_process_tree
++from sglang.test.ci.ci_register import register_xpu_ci
++from sglang.test.test_utils import (
++    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
++    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++    DEFAULT_URL_FOR_TEST,
++    CustomTestCase,
++    popen_launch_server,
++)
++
++register_xpu_ci(est_time=420, suite="stage-b-test-1-gpu-xpu")
++
++# The device KV pool is pinned, not auto-sized, for two independent reasons:
++#   1. --hicache-ratio sizes the PINNED HOST pool as a multiple of the DEVICE pool, so
++#      an auto-sized device pool makes the host allocation unpredictable. On BMG an
++#      oversized pinned allocation presents as a device fault, i.e. as a driver bug
++#      rather than as a configuration error.
++#   2. The eviction test below has to overflow this pool. A known size is what makes
++#      the flood self-sizing and quick instead of a guess.
++MAX_TOTAL_TOKENS = 4096
++PAGE_SIZE = 64
++# Must match --hicache-ratio below. The host pool is this multiple of the device pool:
++# measured 2026-08-19, "KV Cache is allocated ... K size: 0.06 GB, V size: 0.06 GB" for
++# 4096 device tokens against "Allocating 0.24 GB host memory", i.e. exactly 2x.
++HICACHE_RATIO = 2
++HOST_TOTAL_TOKENS = HICACHE_RATIO * MAX_TOTAL_TOKENS
++
++# The flood in test_3 has to land inside a WINDOW, not just be "big":
++#   lower bound  > MAX_TOTAL_TOKENS   or the device copy is never displaced, the request
++#                                     is answered from L1, and the host tier is not read
++#   upper bound  < HOST_TOTAL_TOKENS  or the flood evicts the HOST copy too, and the
++#                                     prefix is recomputed -- indistinguishable from a
++#                                     broken transfer path
++# The first version of this test used 3x the device pool, which is 1.5x the HOST pool,
++# and failed with cached=0 on a working system: 37 fillers x 384 allocated tokens =
++# 14208 tokens through an 8192-token host pool. 1.25x sits above the device pool and
++# leaves ~1.4k tokens of host headroom for the target.
++FLOOD_TOKENS = int(1.25 * MAX_TOTAL_TOKENS)
++assert MAX_TOTAL_TOKENS < FLOOD_TOKENS < HOST_TOTAL_TOKENS - 8 * PAGE_SIZE, (
++    "flood target is outside the eviction window; re-derive it if MAX_TOTAL_TOKENS or "
++    "HICACHE_RATIO changes"
++)
++
++
++def pin_loopback_no_proxy():
++    """Keep the loopback address out of any ambient HTTP proxy.
++
++    The server warms ITSELF up over HTTP: _execute_server_warmup() polls
++    GET http://127.0.0.1:<port>/model_info 120 times and, on failure, calls
++    kill_process_tree on its own pid. Behind a corporate proxy whose no_proxy does not
++    cover the loopback address, that GET is answered by the proxy with a 403 block page,
++    the request never reaches the server, and after ~130 s the server kills itself. The
++    launch then fails in setUpClass with "Server process exited with code -9" and zero
++    tests run -- a failure that mentions neither the proxy nor HTTP, and that reads like
++    a HiCache or driver problem.
++
++    Measured on this box 2026-08-19 00:12-00:14: both the offline and the online launch
++    attempt died this way, 320 s wasted, `Ran 0 tests`.
++    """
++    for var in ("no_proxy", "NO_PROXY"):
++        current = os.environ.get(var, "")
++        missing = [h for h in ("127.0.0.1", "localhost", "::1") if h not in current]
++        if missing:
++            os.environ[var] = ",".join(missing + ([current] if current else []))
++
++
++class TestXPUHierarchicalCache(CustomTestCase):
++    """Testcase: HierarchicalCache test on Intel XPU.
++
++    Cover scenarios:
++    1. Long identical texts: cache is reused
++    2. Short identical texts (< one page): cache is not reused
++    3. A prefix evicted from L1 is reloaded from L2, not recomputed
++
++    [Test Category] HiCache
++    [Test Target] --enable-hierarchical-cache on --device xpu
++    """
++
++    @classmethod
++    def setUpClass(cls):
++        # Before the launch, not after: the server's self-warmup is the first thing that
++        # breaks, and popen_launch_server passes this process's environ to the child.
++        pin_loopback_no_proxy()
++        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
++        cls.base_url = DEFAULT_URL_FOR_TEST
++        # Nonce every prompt in this class. Without it a rerun on the same machine can
++        # hit a cache populated by the previous run, which turns a broken write path
++        # into a passing test.
++        cls.nonce = uuid.uuid4().hex[:8]
++        other_args = [
++            "--device",
++            "xpu",
++            "--attention-backend",
++            "intel_xpu",
++            "--mem-fraction-static",
++            "0.6",
++            "--tp-size",
++            "1",
++            "--page-size",
++            str(PAGE_SIZE),
++            "--max-total-tokens",
++            str(MAX_TOTAL_TOKENS),
++            "--enable-cache-report",
++            "--enable-hierarchical-cache",
++            "--hicache-ratio",
++            "2",
++            "--hicache-write-policy",
++            "write_through",
++            "--hicache-io-backend",
++            "kernel",
++            "--hicache-mem-layout",
++            "layer_first",
++        ]
++        cls.process = popen_launch_server(
++            cls.model,
++            cls.base_url,
++            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++            other_args=other_args,
++            # Pass the device explicitly, as test_gemma_4_e2b.py does. The default
++            # device="auto" makes popen_launch_server call auto_config_device() and
++            # APPEND its own --device to the end of the command line, after the one in
++            # other_args. argparse takes the last occurrence, so on a box where
++            # detection falls back to "cpu" this XPU test would silently run on CPU and
++            # still pass -- proving nothing about the XPU transfer kernels.
++            device="xpu",
++        )
++
++    @classmethod
++    def tearDownClass(cls):
++        if hasattr(cls, "process") and cls.process:
++            kill_process_tree(cls.process.pid)
++
++    def _generate(self, text: str) -> dict:
++        """Return meta_info for one greedy single-token request."""
++        response = requests.post(
++            f"{self.base_url}/generate",
++            json={
++                "text": text,
++                "sampling_params": {"temperature": 0, "max_new_tokens": 1},
++            },
++        )
++        self.assertEqual(response.status_code, 200, response.text)
++        return response.json()["meta_info"]
++
++    @staticmethod
++    def _tiers(meta: dict) -> tuple:
++        """(cached, device, host, storage) from one meta_info.
++
++        cached_tokens_details is None when every tier counter is zero -- an absent dict
++        is a legitimate all-zero report, not a missing field.
++        """
++        details = meta.get("cached_tokens_details") or {}
++        return (
++            meta.get("cached_tokens", 0),
++            details.get("device", 0),
++            details.get("host", 0),
++            details.get("storage", 0),
++        )
++
++    def test_1_reuse_long_identical(self):
++        """A long prompt sent twice must hit on the second send."""
++        text = f"Document {self.nonce}. " + "Section 7.4 of the manual. " * 64
++
++        cached, _, _, _ = self._tiers(self._generate(text))
++        self.assertEqual(cached, 0, "first send of a nonced prompt must be a cold miss")
++
++        cached, device, _, _ = self._tiers(self._generate(text))
++        self.assertGreater(cached, 0, "second send must reuse the cached prefix")
++        self.assertGreater(device, 0, "a just-used prefix should still be on device")
++
++    def test_2_no_reuse_shorter_than_one_page(self):
++        """A prompt below page_size cannot be cached: the radix tree stores whole pages."""
++        text = f"who am i {self.nonce}?"
++        for _ in range(2):
++            cached, _, _, _ = self._tiers(self._generate(text))
++            self.assertEqual(cached, 0)
++
++    def test_3_evicted_prefix_returns_from_host(self):
++        """Overflow L1, then prove the prefix comes back from L2 instead of recompute.
++
++        This is the test that exercises the XPU transfer kernels in both directions:
++        write_through pushes the prefix to the host pool, the flood evicts the device
++        copy, and the final request has to load it back.
++        """
++        target = f"Target {self.nonce}. " + "Section 7.4 of the manual. " * 64
++
++        # Populate, and confirm the prefix is genuinely resident before evicting it.
++        self._generate(target)
++        cached, _, _, _ = self._tiers(self._generate(target))
++        self.assertGreater(cached, 0, "precondition: target must be cached before flood")
++
++        # Flood into the window defined at the top of this file. Count what the server
++        # ALLOCATES, not what the client sent: allocation is page-aligned, so a 332-token
++        # filler occupies 384 tokens of pool. Counting prompt_tokens undercounts by ~15%
++        # per request and the flood then overshoots into host-eviction territory.
++        allocated = 0
++        i = 0
++        while allocated < FLOOD_TOKENS:
++            filler = f"Filler {self.nonce} {i}. " + "Unrelated background text. " * 64
++            meta = self._generate(filler)
++            fresh = max(meta.get("prompt_tokens", 0) - meta.get("cached_tokens", 0), 0)
++            allocated += -(-fresh // PAGE_SIZE) * PAGE_SIZE
++            i += 1
++        self.assertLess(
++            allocated,
++            HOST_TOTAL_TOKENS,
++            f"flood allocated {allocated} tokens against a {HOST_TOTAL_TOKENS}-token "
++            "host pool, so a miss below would say nothing about the transfer path",
++        )
++
++        cached, device, host, _ = self._tiers(self._generate(target))
++        self.assertGreater(cached, 0, "evicted prefix was recomputed instead of reloaded")
++        # host > 0 is the whole point. HiCache prefers a device copy whenever one
++        # exists, so host stays 0 unless the device copy really was evicted -- which
++        # makes this assertion, not `cached > 0`, the one that proves L2 was read.
++        self.assertGreater(host, 0, f"expected an L2 hit, got device={device} host={host}")
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -14,8 +14,12 @@ sglang/
 ├── scripts/
 │   ├── build_image.sh               # wrapper around `docker buildx build`
 │   ├── start_qwen3_6_service.sh     # launches the TP=2 e5m2 fp8 server
+│   ├── run_gemma4_26b_moe.sh        # Gemma4-26B-A4B TP=2, e4m3/e5m2
+│   ├── run_gemma4_26b_moe_bfcl.sh   # radix-on BFCL profile
+│   ├── run_gemma4_26b_moe_canonical.sh # radix-off latency profile
 │   └── run_gsm8k.py                 # standalone GSM8K accuracy harness
 ├── patches/                         # sglang / sgl-kernel-xpu source patches
+│                                    # (base BMG + Gemma4/KVCacheIO delta)
 └── custom-esimd-kernels/            # merged ESIMD kernel package:
                                      #   decode attn, fp8 GEMM, fp8 MoE (silu + prefill),
                                      #   fused QKV, GDN conv fused_seq, RMSNormGated
@@ -46,6 +50,78 @@ docker run --rm -it \
     llm-scaler-sgl:bmg \
     /llm-scaler/sglang/scripts/start_qwen3_6_service.sh
 ```
+
+The Gemma4 launch script creates the `/dev/dri/by-path/*-render` links needed
+by oneCCL 2021.15 when Docker exposes only the render nodes through
+`--device=/dev/dri`; privileged mode is not required.
+
+### Gemma4-26B-A4B
+
+The Gemma4 MoE path dynamically quantizes the BF16 expert weights and supports
+both FP8 formats. E4M3 is the default; select E5M2 explicitly:
+
+```bash
+MODEL_PATH=/llm/models/gemma-4-26B-A4B-it \
+ZE_AFFINITY_MASK=0,1 \
+SGLANG_FP8_DTYPE=e4m3 \
+scripts/run_gemma4_26b_moe.sh
+
+SGLANG_FP8_DTYPE=e5m2 scripts/run_gemma4_26b_moe.sh
+```
+
+Both formats use the routed GELU-tanh kernel for decode and the M-tiled kernel
+for prefill. The GELU exponent is saturated before `exp` to avoid `inf/inf`
+for large positive gates. Radix cache is enabled by default for multi-turn
+prefix reuse; set `RADIX_CACHE=0` for an uncached comparison. XPU graph remains
+disabled for TP=2.
+
+This path requires the Dockerfile-pinned **oneCCL 2021.15.9** runtime. The
+Dockerfile removes the pip-provided oneCCL package and links the copy loaded by
+`libtorch_xpu.so` to `/opt/intel/oneapi/ccl/2021.15`. Do not install a package
+that restores oneCCL 2021.17 after the image build: 2021.17 caused delayed
+non-finite prefill outputs during long BFCL runs. Verify the scheduler mappings
+in `/proc/<scheduler-pid>/maps` when deriving another image.
+
+For the exact TP=2 model shape, ESIMD fast paths also fuse input RMSNorm+QKV,
+the dense branch, router normalization, logits-to-MoE decode, and the final
+dual-branch RMSNorm chain. Prefill uses the production ESIMD top-k and batched
+dual RMSNorm. The XPU KV-index builder and request-cache write path do not use
+Triton; the acceptance trace contains no Triton kernels.
+
+#### Workload profiles
+
+Do not reuse a server across BFCL and canonical latency measurement. Restart
+the whole container before switching profiles.
+
+| Profile | Launch script | Radix | SWA full ratio | Max running | Intended use |
+|---|---|---:|---:|---:|---|
+| Serving | `run_gemma4_26b_moe.sh` | on | 0.05 | 1 | normal interactive requests |
+| BFCL | `run_gemma4_26b_moe_bfcl.sh` | **on** | **0.2** | 1 | cumulative multi-turn prompts |
+| Canonical | `run_gemma4_26b_moe_canonical.sh` | **off** | 0.05 | 1 | isolated 1K/2K/4K/8K latency |
+
+BFCL repeatedly sends the full cumulative conversation, commonly 6K-12K input
+tokens per generation step. Running it on the canonical radix-off profile
+re-prefills that history at every step and is invalid as a BFCL throughput
+configuration. Its larger full-attention pool ratio also preserves headroom for
+long cumulative histories. The BFCL harness should use `--num-threads 1` with
+the validated profile above; concurrency changes require a separate
+correctness/performance validation.
+
+#### Validated Gemma4-26B results
+
+The final TP=2 path was measured from the reviewed image with oneCCL 2021.15.9,
+W8A16 prefill enabled, M-tiled MoE prefill, eager decode, and no diagnostic
+synchronization:
+
+| FP8 | BFCL v4 `multi_turn_base` | 1K / 2K / 4K / 8K TPOT |
+|---|---:|---|
+| E4M3 | 128/200 = **64.00%** | 17.37 / 17.54 / 17.60 / 17.47 ms |
+| E5M2 | 128/200 = **64.00%** | 17.16 / 17.21 / 17.27 / 17.34 ms |
+
+Both full BFCL runs had zero inference errors and left the server healthy.
+Canonical latency used bsz=1, two warmups, three trials, 256 output tokens, and
+the median of each set. The exact image also passed 21 Gemma4 ESIMD tests and
+229 KVCacheIO tests; E4M3 and E5M2 chat sanity both returned `42`.
 
 ## Fast-paths enabled
 
