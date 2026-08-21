@@ -1,5 +1,5 @@
 diff --git a/.github/workflows/pr-test-xpu.yml b/.github/workflows/pr-test-xpu.yml
-index 5e852f3..597e5b7 100644
+index 5e852f3432e90d82d4ed3ede332284ff19afbda7..597e5b7e6b5381a186b55d34a3882cc55a13dac9 100644
 --- a/.github/workflows/pr-test-xpu.yml
 +++ b/.github/workflows/pr-test-xpu.yml
 @@ -77,7 +77,8 @@ jobs:
@@ -13,7 +13,7 @@ index 5e852f3..597e5b7 100644
                python3 bench_fused_experts_mxfp4.py 2>&1 | tee bench_fused_experts_mxfp4.py.log \
              "
 diff --git a/benchmark/bench_flash_attn.py b/benchmark/bench_flash_attn.py
-index 94bba73..55937d8 100644
+index 94bba73d19a7d5d597bb17b7c5d5b3e5c2375dce..55937d80f764077a7131b361a2135f6a4e6168fa 100644
 --- a/benchmark/bench_flash_attn.py
 +++ b/benchmark/bench_flash_attn.py
 @@ -86,29 +86,44 @@ local = [True, False]
@@ -79,7 +79,7 @@ index 94bba73..55937d8 100644
  all_results = []
 diff --git a/benchmark/bench_hc_pre_fuse.py b/benchmark/bench_hc_pre_fuse.py
 new file mode 100644
-index 0000000..a9cfa53
+index 0000000000000000000000000000000000000000..a9cfa53b20e7f156e8311c2ae7dcedbc483f2603
 --- /dev/null
 +++ b/benchmark/bench_hc_pre_fuse.py
 @@ -0,0 +1,219 @@
@@ -302,11 +302,771 @@ index 0000000..a9cfa53
 +        print(f"  Mean bandwidth: {df_variant['bandwidth_gb_s'].mean():.2f} GB/s")
 +        print(f"  Best throughput: {df_variant['Mtok_per_sec'].max():.2f} Mtok/s")
 +        print(f"  Best bandwidth: {df_variant['bandwidth_gb_s'].max():.2f} GB/s")
+diff --git a/benchmark/bench_kvcacheio.py b/benchmark/bench_kvcacheio.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8d2c4952a7bc30b07aa1cbe7187c028300351b8c
+--- /dev/null
++++ b/benchmark/bench_kvcacheio.py
+@@ -0,0 +1,633 @@
++"""Benchmark for KV-cache scatter/gather transfer kernels (XPU).
++
++Covers:
++  - transfer_kv_per_layer      (lf→lf, K+V, device↔device)
++  - transfer_kv_per_layer_mla  (lf→lf, K only, device↔device)
++  - transfer_kv_all_layer      (lf_tbl→lf_tbl, K+V, all layers fused)
++  - transfer_kv_all_layer_lf_ph / transfer_kv_per_layer_ph_lf
++  - transfer_kv_all_layer_lf_pf / transfer_kv_per_layer_pf_lf (device kernels)
++  - transfer_kv_all_layer_mla_lf_pf / transfer_kv_per_layer_mla_pf_lf
++  - transfer_kv_direct         (Python copy_ fallback, host↔device)
++  - transfer_kv_all_layer_direct_lf_pf / transfer_kv_per_layer_direct_pf_lf
++
++Usage:
++    python benchmark/bench_kvcacheio.py
++    python benchmark/bench_kvcacheio.py --num-tokens 128 512 1024 4096 8192
++    python benchmark/bench_kvcacheio.py --suite per_layer all_layer host_device page_head page_first
++"""
++
++import argparse
++
++import sgl_kernel  # noqa: F401 – registers XPU ops
++import torch
++from sgl_kernel.kvcacheio import (
++    transfer_kv_all_layer,
++    transfer_kv_all_layer_direct_lf_pf,
++    transfer_kv_all_layer_lf_pf,
++    transfer_kv_all_layer_lf_ph,
++    transfer_kv_all_layer_mla,
++    transfer_kv_all_layer_mla_lf_pf,
++    transfer_kv_direct,
++    transfer_kv_per_layer,
++    transfer_kv_per_layer_direct_pf_lf,
++    transfer_kv_per_layer_mla,
++    transfer_kv_per_layer_mla_pf_lf,
++    transfer_kv_per_layer_pf_lf,
++    transfer_kv_per_layer_ph_lf,
++)
++
++DEVICE = "xpu"
++DTYPE = torch.bfloat16
++ELEM = DTYPE.itemsize  # 2 bytes
++
++
++def _sync():
++    torch.xpu.synchronize()
++
++
++def _bench(fn, warmup=10, rep=100):
++    """Return median latency in ms using XPU events (no host-sync overhead)."""
++    for _ in range(warmup):
++        fn()
++    _sync()
++    start = torch.xpu.Event(enable_timing=True)
++    end = torch.xpu.Event(enable_timing=True)
++    start.record()
++    for _ in range(rep):
++        fn()
++    end.record()
++    _sync()
++    return start.elapsed_time(end) / rep
++
++
++def _header(title):
++    print(f"\n{'='*70}")
++    print(f"  {title}")
++    print(f"{'='*70}")
++    print(f"  {'N':>6}  {'item_size':>10}  {'BW GB/s':>9}  {'us':>8}  {'% peak':>8}")
++    print(f"  {'-'*55}")
++
++
++def _row(N, item_size, nbytes, ms):
++    bw = nbytes / (ms * 1e-3) / 1e9
++    pct = bw / 192 * 100
++    print(f"  {N:>6}  {item_size:>10}  {bw:>9.1f}  {ms*1000:>8.1f}  {pct:>7.0f}%")
++    return bw
++
++
++# ---------------------------------------------------------------------------
++# Suite 1: per_layer  (device→device)
++# ---------------------------------------------------------------------------
++
++
++def bench_per_layer(token_counts, item_sizes):
++    _header("transfer_kv_per_layer  [lf→lf, K+V, device→device]")
++    for N in token_counts:
++        for item_size in item_sizes:
++            total = max(N * 4, 16384)
++            src_k = torch.randn(total, item_size, dtype=DTYPE, device=DEVICE)
++            src_v = torch.randn(total, item_size, dtype=DTYPE, device=DEVICE)
++            dst_k = torch.zeros_like(src_k)
++            dst_v = torch.zeros_like(src_v)
++            perm = torch.randperm(total, device=DEVICE)
++            si, di = perm[:N], perm[N : 2 * N]
++            ib = item_size * ELEM
++            nbytes = N * ib * 4  # read K+V, write K+V
++
++            ms = _bench(
++                lambda: transfer_kv_per_layer(src_k, dst_k, src_v, dst_v, si, di, ib)
++            )
++            _row(N, item_size, nbytes, ms)
++
++
++def bench_per_layer_mla(token_counts, item_sizes):
++    _header("transfer_kv_per_layer_mla  [lf→lf, K only / MLA, device→device]")
++    for N in token_counts:
++        for item_size in item_sizes:
++            total = max(N * 4, 16384)
++            src = torch.randn(total, item_size, dtype=DTYPE, device=DEVICE)
++            dst = torch.zeros_like(src)
++            perm = torch.randperm(total, device=DEVICE)
++            si, di = perm[:N], perm[N : 2 * N]
++            ib = item_size * ELEM
++            nbytes = N * ib * 2  # read K, write K
++
++            ms = _bench(lambda: transfer_kv_per_layer_mla(src, dst, si, di, ib))
++            _row(N, item_size, nbytes, ms)
++
++
++# ---------------------------------------------------------------------------
++# Suite 2: all_layer  (fused across layers, device→device)
++# ---------------------------------------------------------------------------
++
++
++def bench_all_layer(token_counts, item_sizes, num_layers=32):
++    _header(
++        f"transfer_kv_all_layer  [lf_tbl→lf_tbl, K+V, {num_layers} layers fused, device→device]"
++    )
++    for N in token_counts:
++        for item_size in item_sizes:
++            total = max(N * 4, 16384)
++            # Skip configs that would exhaust B580 VRAM (6 GB).
++            # 4 (src_k+src_v+dst_k+dst_v) × num_layers × total × item_size × 2B
++            if 4 * num_layers * total * item_size * ELEM > 4 * 1024**3:
++                print(f"  {N:>6}  {item_size:>10}  (skipped — would exceed VRAM)")
++                continue
++            src_k = [
++                torch.randn(total, item_size, dtype=DTYPE, device=DEVICE)
++                for _ in range(num_layers)
++            ]
++            src_v = [
++                torch.randn(total, item_size, dtype=DTYPE, device=DEVICE)
++                for _ in range(num_layers)
++            ]
++            dst_k = [torch.zeros_like(x) for x in src_k]
++            dst_v = [torch.zeros_like(x) for x in src_v]
++            perm = torch.randperm(total, device=DEVICE)
++            si, di = perm[:N], perm[N : 2 * N]
++
++            def _ptrs(lst):
++                return torch.tensor(
++                    [x.data_ptr() for x in lst], dtype=torch.uint64, device=DEVICE
++                )
++
++            sk_t, sv_t = _ptrs(src_k), _ptrs(src_v)
++            dk_t, dv_t = _ptrs(dst_k), _ptrs(dst_v)
++            ib = item_size * ELEM
++            nbytes = N * ib * 4 * num_layers
++
++            ms = _bench(
++                lambda: transfer_kv_all_layer(
++                    sk_t, dk_t, sv_t, dv_t, si, di, ib, num_layers
++                )
++            )
++            _row(N, item_size, nbytes, ms)
++
++
++def bench_all_layer_mla(token_counts, item_sizes, num_layers=32):
++    _header(
++        f"transfer_kv_all_layer_mla  [lf_tbl→lf_tbl, K only, {num_layers} layers, device→device]"
++    )
++    for N in token_counts:
++        for item_size in item_sizes:
++            total = max(N * 4, 16384)
++            # 2 (src+dst) × num_layers × total × item_size × 2B
++            if 2 * num_layers * total * item_size * ELEM > 4 * 1024**3:
++                print(f"  {N:>6}  {item_size:>10}  (skipped — would exceed VRAM)")
++                continue
++            src = [
++                torch.randn(total, item_size, dtype=DTYPE, device=DEVICE)
++                for _ in range(num_layers)
++            ]
++            dst = [torch.zeros_like(x) for x in src]
++            perm = torch.randperm(total, device=DEVICE)
++            si, di = perm[:N], perm[N : 2 * N]
++
++            def _ptrs(lst):
++                return torch.tensor(
++                    [x.data_ptr() for x in lst], dtype=torch.uint64, device=DEVICE
++                )
++
++            s_t, d_t = _ptrs(src), _ptrs(dst)
++            ib = item_size * ELEM
++            nbytes = N * ib * 2 * num_layers
++
++            ms = _bench(
++                lambda: transfer_kv_all_layer_mla(s_t, d_t, si, di, ib, num_layers)
++            )
++            _row(N, item_size, nbytes, ms)
++
++
++# ---------------------------------------------------------------------------
++# Suite 3: host↔device  (pinned memory, PCIe path)
++# ---------------------------------------------------------------------------
++
++
++def bench_host_device(token_counts, item_sizes):
++    _header("transfer_kv_direct  [pinned host→device, copy_ fallback]")
++    for N in token_counts:
++        for item_size in item_sizes:
++            total = max(N * 4, 16384)
++            src_k = torch.randn(total, item_size, dtype=DTYPE).pin_memory()
++            src_v = torch.randn(total, item_size, dtype=DTYPE).pin_memory()
++            dst_k = torch.zeros(total, item_size, dtype=DTYPE, device=DEVICE)
++            dst_v = torch.zeros_like(dst_k)
++            perm = torch.randperm(total)
++            si = perm[:N]
++            di = perm[N : 2 * N].to(DEVICE)
++            page_size = 16
++            nbytes = N * item_size * ELEM * 2  # read from host only counts once
++
++            ms = _bench(
++                lambda: transfer_kv_direct(
++                    [src_k, src_v], [dst_k, dst_v], si, di, page_size
++                ),
++                warmup=5,
++                rep=20,
++            )
++            _row(N, item_size, nbytes, ms)
++
++    _header("transfer_kv_all_layer_direct_lf_pf  [device lf→pinned host pf]")
++    for N in token_counts:
++        for item_size in item_sizes:
++            page_size = 16
++            if N % page_size != 0:
++                continue
++            total = max(N * 4, 16384)
++            total_pages = total // page_size
++            num_layers = 4
++            src_k = [
++                torch.randn(total, item_size, dtype=DTYPE, device=DEVICE)
++                for _ in range(num_layers)
++            ]
++            src_v = [
++                torch.randn(total, item_size, dtype=DTYPE, device=DEVICE)
++                for _ in range(num_layers)
++            ]
++            dst_k = torch.zeros(
++                total_pages, num_layers, page_size, item_size, dtype=DTYPE
++            ).pin_memory()
++            dst_v = torch.zeros_like(dst_k).pin_memory()
++            perm = torch.randperm(total_pages)
++            num_pages = N // page_size
++            si = torch.cat(
++                [
++                    torch.arange(p * page_size, (p + 1) * page_size)
++                    for p in perm[:num_pages]
++                ]
++            )
++            di = torch.cat(
++                [
++                    torch.arange(p * page_size, (p + 1) * page_size)
++                    for p in perm[num_pages : 2 * num_pages]
++                ]
++            )
++            nbytes = N * item_size * ELEM * 2 * num_layers
++
++            ms = _bench(
++                lambda: transfer_kv_all_layer_direct_lf_pf(
++                    src_k + src_v, [dst_k, dst_v], si, di, page_size
++                ),
++                warmup=5,
++                rep=20,
++            )
++            _row(N, item_size, nbytes, ms)
++
++    _header("transfer_kv_per_layer_direct_pf_lf  [pinned host pf→device lf, 1 layer]")
++    for N in token_counts:
++        for item_size in item_sizes:
++            page_size = 16
++            if N % page_size != 0:
++                continue
++            total = max(N * 4, 16384)
++            total_pages = total // page_size
++            num_layers = 4
++            layer_id = 0
++            src_k = torch.randn(
++                total_pages, num_layers, page_size, item_size, dtype=DTYPE
++            ).pin_memory()
++            src_v = torch.randn(
++                total_pages, num_layers, page_size, item_size, dtype=DTYPE
++            ).pin_memory()
++            dst_k = torch.zeros(total, item_size, dtype=DTYPE, device=DEVICE)
++            dst_v = torch.zeros_like(dst_k)
++            perm = torch.randperm(total_pages)
++            num_pages = N // page_size
++            si = torch.cat(
++                [
++                    torch.arange(p * page_size, (p + 1) * page_size)
++                    for p in perm[:num_pages]
++                ]
++            )
++            di = torch.cat(
++                [
++                    torch.arange(p * page_size, (p + 1) * page_size)
++                    for p in perm[num_pages : 2 * num_pages]
++                ]
++            )
++            # Single layer transferred (K+V): read from host counts once.
++            nbytes = N * item_size * ELEM * 2
++
++            ms = _bench(
++                lambda: transfer_kv_per_layer_direct_pf_lf(
++                    [src_k, src_v], [dst_k, dst_v], si, di, layer_id, page_size
++                ),
++                warmup=5,
++                rep=20,
++            )
++            _row(N, item_size, nbytes, ms)
++
++
++# ---------------------------------------------------------------------------
++# Suite 4: page-head layout
++# ---------------------------------------------------------------------------
++
++
++def bench_page_head(token_counts, item_sizes, head_num=16, num_layers=4):
++    page_size = 16
++
++    _header(
++        f"transfer_kv_all_layer_lf_ph  [lf_tbl→ph, {num_layers} layers, head_num={head_num}]"
++    )
++    for N in token_counts:
++        for item_size in item_sizes:
++            if item_size % head_num != 0:
++                continue
++            total = max(N * 4, 16384)
++            total_pages = total // page_size
++            src_k = [
++                torch.randn(total, item_size, dtype=DTYPE, device=DEVICE)
++                for _ in range(num_layers)
++            ]
++            src_v = [
++                torch.randn(total, item_size, dtype=DTYPE, device=DEVICE)
++                for _ in range(num_layers)
++            ]
++            dst_k = torch.zeros(
++                total_pages,
++                head_num,
++                page_size,
++                num_layers,
++                item_size // head_num,
++                dtype=DTYPE,
++            ).pin_memory()
++            dst_v = torch.zeros_like(dst_k).pin_memory()
++
++            sk_t = torch.tensor(
++                [x.data_ptr() for x in src_k], dtype=torch.uint64, device=DEVICE
++            )
++            sv_t = torch.tensor(
++                [x.data_ptr() for x in src_v], dtype=torch.uint64, device=DEVICE
++            )
++            perm = torch.randperm(total, device=DEVICE)
++            si, di = perm[:N], perm[N : 2 * N]
++            ib = item_size * ELEM
++            dst_layout_dim = item_size * num_layers * ELEM
++            nbytes = N * ib * 4 * num_layers
++
++            ms = _bench(
++                lambda: transfer_kv_all_layer_lf_ph(
++                    sk_t,
++                    dst_k,
++                    sv_t,
++                    dst_v,
++                    si,
++                    di,
++                    ib,
++                    dst_layout_dim,
++                    num_layers,
++                    page_size,
++                    head_num,
++                ),
++                warmup=5,
++                rep=20,
++            )
++            _row(N, item_size, nbytes, ms)
++
++    _header(f"transfer_kv_per_layer_ph_lf  [ph→lf, layer 0, head_num={head_num}]")
++    for N in token_counts:
++        for item_size in item_sizes:
++            if item_size % head_num != 0:
++                continue
++            total = max(N * 4, 16384)
++            total_pages = total // page_size
++            src_k = torch.randn(
++                total_pages,
++                head_num,
++                page_size,
++                num_layers,
++                item_size // head_num,
++                dtype=DTYPE,
++            ).pin_memory()
++            src_v = torch.zeros_like(src_k).pin_memory()
++            dst_k = torch.zeros(total, item_size, dtype=DTYPE, device=DEVICE)
++            dst_v = torch.zeros_like(dst_k)
++            perm = torch.randperm(total, device=DEVICE)
++            si, di = perm[:N], perm[N : 2 * N]
++            ib = item_size * ELEM
++            src_layout_dim = item_size * num_layers * ELEM
++            nbytes = N * ib * 4
++
++            ms = _bench(
++                lambda: transfer_kv_per_layer_ph_lf(
++                    src_k,
++                    dst_k,
++                    src_v,
++                    dst_v,
++                    si,
++                    di,
++                    0,
++                    ib,
++                    src_layout_dim,
++                    page_size,
++                    head_num,
++                ),
++                warmup=5,
++                rep=20,
++            )
++            _row(N, item_size, nbytes, ms)
++
++
++# ---------------------------------------------------------------------------
++# Suite 5: page-first layout (device kernels, lf↔pf)
++# ---------------------------------------------------------------------------
++# pf pool layout is [num_tokens, num_layers, item_size], per-token addressing:
++#   base + token * (num_layers * item_size) + layer * item_size
++# pf pools live in pinned host memory (CPU-side eviction/disaggregation
++# buffers), matching the page_head / direct benchmarks.
++
++
++def bench_page_first(token_counts, item_sizes):
++    num_layers = 4
++    _header(
++        f"transfer_kv_all_layer_lf_pf  [device lf_tbl→pinned host pf, {num_layers} layers, K+V]"
++    )
++    for N in token_counts:
++        for item_size in item_sizes:
++            total = max(N * 4, 16384)
++            src_k = [
++                torch.randn(total, item_size, dtype=DTYPE, device=DEVICE)
++                for _ in range(num_layers)
++            ]
++            src_v = [
++                torch.randn(total, item_size, dtype=DTYPE, device=DEVICE)
++                for _ in range(num_layers)
++            ]
++            dst_k = torch.zeros(total, num_layers, item_size, dtype=DTYPE).pin_memory()
++            dst_v = torch.zeros_like(dst_k).pin_memory()
++
++            def _ptrs(lst):
++                return torch.tensor(
++                    [x.data_ptr() for x in lst], dtype=torch.uint64, device=DEVICE
++                )
++
++            sk_t, sv_t = _ptrs(src_k), _ptrs(src_v)
++            perm = torch.randperm(total, device=DEVICE)
++            si, di = perm[:N], perm[N : 2 * N]
++            ib = item_size * ELEM
++            layout_dim = item_size * num_layers * ELEM
++            nbytes = N * ib * 4 * num_layers  # read+write K+V over all layers
++
++            ms = _bench(
++                lambda: transfer_kv_all_layer_lf_pf(
++                    sk_t, dst_k, sv_t, dst_v, si, di, ib, layout_dim, num_layers
++                ),
++                warmup=5,
++                rep=20,
++            )
++            _row(N, item_size, nbytes, ms)
++
++    _header(
++        f"transfer_kv_per_layer_pf_lf  [pinned host pf→device lf, layer 0, {num_layers} layers, K+V]"
++    )
++    for N in token_counts:
++        for item_size in item_sizes:
++            total = max(N * 4, 16384)
++            src_k = torch.randn(total, num_layers, item_size, dtype=DTYPE).pin_memory()
++            src_v = torch.randn(total, num_layers, item_size, dtype=DTYPE).pin_memory()
++            dst_k = torch.zeros(total, item_size, dtype=DTYPE, device=DEVICE)
++            dst_v = torch.zeros_like(dst_k)
++            perm = torch.randperm(total, device=DEVICE)
++            si, di = perm[:N], perm[N : 2 * N]
++            ib = item_size * ELEM
++            layout_dim = item_size * num_layers * ELEM
++            nbytes = N * ib * 4  # read+write K+V, single layer
++
++            ms = _bench(
++                lambda: transfer_kv_per_layer_pf_lf(
++                    src_k, dst_k, src_v, dst_v, si, di, 0, ib, layout_dim
++                ),
++                warmup=5,
++                rep=20,
++            )
++            _row(N, item_size, nbytes, ms)
++
++    _header(
++        f"transfer_kv_all_layer_mla_lf_pf  [device lf_tbl→pinned host pf, {num_layers} layers, K only]"
++    )
++    for N in token_counts:
++        for item_size in item_sizes:
++            total = max(N * 4, 16384)
++            src = [
++                torch.randn(total, item_size, dtype=DTYPE, device=DEVICE)
++                for _ in range(num_layers)
++            ]
++            dst = torch.zeros(total, num_layers, item_size, dtype=DTYPE).pin_memory()
++
++            s_t = torch.tensor(
++                [x.data_ptr() for x in src], dtype=torch.uint64, device=DEVICE
++            )
++            perm = torch.randperm(total, device=DEVICE)
++            si, di = perm[:N], perm[N : 2 * N]
++            ib = item_size * ELEM
++            layout_dim = item_size * num_layers * ELEM
++            nbytes = N * ib * 2 * num_layers  # read+write K over all layers
++
++            ms = _bench(
++                lambda: transfer_kv_all_layer_mla_lf_pf(
++                    s_t, dst, si, di, ib, layout_dim, num_layers
++                ),
++                warmup=5,
++                rep=20,
++            )
++            _row(N, item_size, nbytes, ms)
++
++    _header(
++        f"transfer_kv_per_layer_mla_pf_lf  [pinned host pf→device lf, layer 0, {num_layers} layers, K only]"
++    )
++    for N in token_counts:
++        for item_size in item_sizes:
++            total = max(N * 4, 16384)
++            src = torch.randn(total, num_layers, item_size, dtype=DTYPE).pin_memory()
++            dst = torch.zeros(total, item_size, dtype=DTYPE, device=DEVICE)
++            perm = torch.randperm(total, device=DEVICE)
++            si, di = perm[:N], perm[N : 2 * N]
++            ib = item_size * ELEM
++            layout_dim = item_size * num_layers * ELEM
++            nbytes = N * ib * 2  # read+write K, single layer
++
++            ms = _bench(
++                lambda: transfer_kv_per_layer_mla_pf_lf(
++                    src, dst, si, di, 0, ib, layout_dim
++                ),
++                warmup=5,
++                rep=20,
++            )
++            _row(N, item_size, nbytes, ms)
++
++
++# ---------------------------------------------------------------------------
++# Main
++# ---------------------------------------------------------------------------
++
++SUITES = {
++    "per_layer": [bench_per_layer, bench_per_layer_mla],
++    "all_layer": [bench_all_layer, bench_all_layer_mla],
++    "host_device": [bench_host_device],
++    "page_head": [bench_page_head],
++    "page_first": [bench_page_first],
++}
++
++
++def parse_args():
++    p = argparse.ArgumentParser(description="KV cache IO benchmark for XPU")
++    p.add_argument(
++        "--num-tokens",
++        type=int,
++        nargs="+",
++        default=[128, 512, 1024, 4096, 8192],
++        metavar="N",
++        help="Token counts to sweep (default: 128 512 1024 4096 8192)",
++    )
++    p.add_argument(
++        "--item-sizes",
++        type=int,
++        nargs="+",
++        default=[256, 512, 1024],
++        metavar="S",
++        help="item_size values (number of elements, default: 256 512 1024)",
++    )
++    p.add_argument(
++        "--suite",
++        nargs="+",
++        choices=list(SUITES.keys()),
++        default=list(SUITES.keys()),
++        help="Which benchmark suites to run (default: all)",
++    )
++    p.add_argument(
++        "--num-layers",
++        type=int,
++        default=32,
++        help="Number of layers for all_layer benchmarks (default: 32)",
++    )
++    return p.parse_args()
++
++
++def main():
++    args = parse_args()
++
++    print(f"Device : {torch.xpu.get_device_name(0)}")
++    print(f"dtype  : {DTYPE}")
++    print(f"tokens : {args.num_tokens}")
++    print(f"items  : {args.item_sizes}")
++    print(f"suites : {args.suite}")
++
++    fns_to_run = []
++    for s in args.suite:
++        fns_to_run.extend(SUITES[s])
++
++    for fn in fns_to_run:
++        import inspect
++
++        sig = inspect.signature(fn)
++        params = list(sig.parameters.keys())
++        kwargs = {"token_counts": args.num_tokens, "item_sizes": args.item_sizes}
++        if "num_layers" in params:
++            kwargs["num_layers"] = args.num_layers
++        fn(**kwargs)
++
++    print()
++
++
++if __name__ == "__main__":
++    main()
 diff --git a/include/sgl_kernel_ops.h b/include/sgl_kernel_ops.h
-index 370f18b..527a230 100644
+index 370f18ba0f6d315ae61ce49e2dcb3f15ae03b3e2..494cd9da45cf61dd44e5876aa84d16c49569db4c 100644
 --- a/include/sgl_kernel_ops.h
 +++ b/include/sgl_kernel_ops.h
-@@ -433,6 +433,25 @@ void hc_split_sinkhorn(
+@@ -204,6 +204,120 @@ void sgl_per_token_group_quant_fp4(
+     at::Tensor input, at::Tensor output_q, at::Tensor output_s, int64_t group_size, double eps);
+ void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices);
+ }  // namespace at::native::xpu
++
++/*
++ * From csrc/kvcacheio — KV cache scatter/gather transfer kernels
++ */
++void transfer_kv_per_layer(
++    const at::Tensor& src_k,
++    at::Tensor& dst_k,
++    const at::Tensor& src_v,
++    at::Tensor& dst_v,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t item_size,
++    int64_t block_quota,
++    int64_t sgs_per_wg);
++void transfer_kv_per_layer_mla(
++    const at::Tensor& src,
++    at::Tensor& dst,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t item_size,
++    int64_t block_quota,
++    int64_t sgs_per_wg);
++void transfer_kv_all_layer(
++    const at::Tensor& src_k_layers,
++    const at::Tensor& dst_k_layers,
++    const at::Tensor& src_v_layers,
++    const at::Tensor& dst_v_layers,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t item_size,
++    int64_t num_layers,
++    int64_t block_quota,
++    int64_t sgs_per_wg);
++void transfer_kv_all_layer_mla(
++    const at::Tensor& src_layers,
++    const at::Tensor& dst_layers,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t item_size,
++    int64_t num_layers,
++    int64_t block_quota,
++    int64_t sgs_per_wg);
++void transfer_kv_all_layer_lf_ph(
++    const at::Tensor& src_k_layers,
++    at::Tensor& dst_k,
++    const at::Tensor& src_v_layers,
++    at::Tensor& dst_v,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t item_size,
++    int64_t dst_layout_dim,
++    int64_t num_layers,
++    int64_t page_size,
++    int64_t head_num,
++    int64_t block_quota,
++    int64_t sgs_per_wg);
++void transfer_kv_per_layer_ph_lf(
++    const at::Tensor& src_k,
++    at::Tensor& dst_k,
++    const at::Tensor& src_v,
++    at::Tensor& dst_v,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t layer_id,
++    int64_t item_size,
++    int64_t src_layout_dim,
++    int64_t page_size,
++    int64_t head_num,
++    int64_t block_quota,
++    int64_t sgs_per_wg);
++void transfer_kv_per_layer_pf_lf(
++    const at::Tensor& src_k,
++    at::Tensor& dst_k,
++    const at::Tensor& src_v,
++    at::Tensor& dst_v,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t layer_id,
++    int64_t item_size,
++    int64_t src_layout_dim,
++    int64_t block_quota,
++    int64_t sgs_per_wg);
++void transfer_kv_all_layer_lf_pf(
++    const at::Tensor& src_k_layers,
++    at::Tensor& dst_k,
++    const at::Tensor& src_v_layers,
++    at::Tensor& dst_v,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t item_size,
++    int64_t dst_layout_dim,
++    int64_t num_layers,
++    int64_t block_quota,
++    int64_t sgs_per_wg);
++void transfer_kv_per_layer_mla_pf_lf(
++    const at::Tensor& src,
++    at::Tensor& dst,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t layer_id,
++    int64_t item_size,
++    int64_t src_layout_dim,
++    int64_t block_quota,
++    int64_t sgs_per_wg);
++void transfer_kv_all_layer_mla_lf_pf(
++    const at::Tensor& src_layers,
++    at::Tensor& dst,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t item_size,
++    int64_t dst_layout_dim,
++    int64_t num_layers,
++    int64_t block_quota,
++    int64_t sgs_per_wg);
+ void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
+ void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
+ void gelu_and_mul(torch::Tensor& out, torch::Tensor& input);
+@@ -433,6 +547,25 @@ void hc_split_sinkhorn(
      int64_t sinkhorn_iters,
      double eps);
  
@@ -333,19 +1093,35 @@ index 370f18b..527a230 100644
   * From csrc/speculative
   */
 diff --git a/python/sgl_kernel/__init__.py b/python/sgl_kernel/__init__.py
-index 8466564..5d577ec 100755
+index 846656474b0ce1f13f8ceb59d310e7b730d1438e..2d2dd42f7a8e88917a4590dd4dfefcc902bbfa32 100755
 --- a/python/sgl_kernel/__init__.py
 +++ b/python/sgl_kernel/__init__.py
-@@ -54,7 +54,7 @@ from sgl_kernel.gemm import (
+@@ -53,8 +53,23 @@ from sgl_kernel.gemm import (
+     sgl_per_token_quant_fp8,
  )
  from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
++from sgl_kernel.kvcacheio import (
++    transfer_kv_all_layer,
++    transfer_kv_all_layer_direct_lf_pf,
++    transfer_kv_all_layer_lf_pf,
++    transfer_kv_all_layer_lf_ph,
++    transfer_kv_all_layer_mla,
++    transfer_kv_all_layer_mla_lf_pf,
++    transfer_kv_direct,
++    transfer_kv_per_layer,
++    transfer_kv_per_layer_direct_pf_lf,
++    transfer_kv_per_layer_mla,
++    transfer_kv_per_layer_mla_pf_lf,
++    transfer_kv_per_layer_pf_lf,
++    transfer_kv_per_layer_ph_lf,
++)
  from sgl_kernel.lora import embedding_lora_a_fwd
 -from sgl_kernel.mhc import hc_split_sinkhorn
 +from sgl_kernel.mhc import hc_pre_big_fuse, hc_split_sinkhorn
  from sgl_kernel.moe import (
      apply_shuffle_mul_sum,
      cutlass_fp4_group_mm,
-@@ -77,6 +77,12 @@ from sgl_kernel.sampling import (
+@@ -77,6 +92,12 @@ from sgl_kernel.sampling import (
      top_p_renorm_prob,
      top_p_sampling_from_probs,
  )
@@ -358,7 +1134,7 @@ index 8466564..5d577ec 100755
  from sgl_kernel.speculative import (
      build_tree_kernel_efficient,
      segment_packbits,
-@@ -86,6 +92,9 @@ from sgl_kernel.speculative import (
+@@ -86,6 +107,9 @@ from sgl_kernel.speculative import (
  from sgl_kernel.utils import get_device_capability, is_xe2_arch
  from sgl_kernel.version import __version__
  
@@ -369,7 +1145,7 @@ index 8466564..5d577ec 100755
      None  # TODO(ying): remove this after updating the sglang python code.
  )
 diff --git a/python/sgl_kernel/flash_attn.py b/python/sgl_kernel/flash_attn.py
-index 0880eb9..ef6c67b 100644
+index 0880eb9cc64d0ef841faac565bbe3f45fe5f5c49..ef6c67b111ec76c61b6b70ed5f005756fcdecbb1 100644
 --- a/python/sgl_kernel/flash_attn.py
 +++ b/python/sgl_kernel/flash_attn.py
 @@ -306,7 +306,7 @@ def flash_attn_varlen_func(
@@ -383,7 +1159,7 @@ index 0880eb9..ef6c67b 100644
      return_softmax_lse=False,
 diff --git a/python/sgl_kernel/gdn.py b/python/sgl_kernel/gdn.py
 new file mode 100644
-index 0000000..ec95197
+index 0000000000000000000000000000000000000000..ec95197ddc2b9c9af18f2bb398f6165ef8ef9872
 --- /dev/null
 +++ b/python/sgl_kernel/gdn.py
 @@ -0,0 +1,75 @@
@@ -462,8 +1238,467 @@ index 0000000..ec95197
 +        inter_conv,
 +        inter_conv_indices,
 +    )
+diff --git a/python/sgl_kernel/kvcacheio.py b/python/sgl_kernel/kvcacheio.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b65f159e359719f1f35dc9b15d3c34cd6a2352ba
+--- /dev/null
++++ b/python/sgl_kernel/kvcacheio.py
+@@ -0,0 +1,453 @@
++# Copyright 2025 SGLang Team. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++
++# KV-cache scatter/gather transfer ops for Intel XPU.
++#
++# Layout naming conventions:
++#   lf  = layer-first  [num_layers, num_tokens, item_size]
++#   pf  = page-first   [num_pages, num_layers, page_size, item_size]
++#   ph  = page-head    [num_pages, head_num, page_size, num_layers, head_dim]
++
++from typing import List
++
++import torch
++
++# Tuned for B580 (Xe2, 20 Xe-cores).
++# sgs_per_wg=32: work-group size of 512 threads (32 sub-groups × 16 lanes).
++# block_quota=16: fixed pool of 16*32=512 sub-groups.  num_wgs scales with the
++#   token count up to that pool, filling all Xe-cores across the whole range
++#   (measured 5-8x faster than an N-derived quota at N<=1024, which starves the
++#   GPU to 1-2 work-groups).
++_DEFAULT_SGS_PER_WG = 32
++_DEFAULT_BLOCK_QUOTA = 16
++
++
++# ---------------------------------------------------------------------------
++# Group A: SYCL kernel-backed ops (device-side layout conversion)
++# ---------------------------------------------------------------------------
++
++
++def transfer_kv_per_layer(
++    src_k: torch.Tensor,
++    dst_k: torch.Tensor,
++    src_v: torch.Tensor,
++    dst_v: torch.Tensor,
++    src_indices: torch.Tensor,
++    dst_indices: torch.Tensor,
++    item_size: int,
++    block_quota: int = _DEFAULT_BLOCK_QUOTA,
++    sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
++) -> None:
++    """Single-layer lf→lf transfer for K and V."""
++    torch.ops.sgl_kernel.transfer_kv_per_layer.default(
++        src_k,
++        dst_k,
++        src_v,
++        dst_v,
++        src_indices,
++        dst_indices,
++        item_size,
++        block_quota,
++        sgs_per_wg,
++    )
++
++
++def transfer_kv_per_layer_mla(
++    src: torch.Tensor,
++    dst: torch.Tensor,
++    src_indices: torch.Tensor,
++    dst_indices: torch.Tensor,
++    item_size: int,
++    block_quota: int = _DEFAULT_BLOCK_QUOTA,
++    sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
++) -> None:
++    """Single-layer lf→lf transfer, MLA (K only)."""
++    torch.ops.sgl_kernel.transfer_kv_per_layer_mla.default(
++        src,
++        dst,
++        src_indices,
++        dst_indices,
++        item_size,
++        block_quota,
++        sgs_per_wg,
++    )
++
++
++def transfer_kv_all_layer(
++    src_k_layers: torch.Tensor,
++    dst_k_layers: torch.Tensor,
++    src_v_layers: torch.Tensor,
++    dst_v_layers: torch.Tensor,
++    src_indices: torch.Tensor,
++    dst_indices: torch.Tensor,
++    item_size: int,
++    num_layers: int,
++    block_quota: int = _DEFAULT_BLOCK_QUOTA,
++    sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
++) -> None:
++    """All-layer lf_tbl→lf_tbl transfer for K and V.
++
++    src_k_layers / dst_k_layers are uint64 tensors of data_ptr() values,
++    one per layer.
++    """
++    torch.ops.sgl_kernel.transfer_kv_all_layer.default(
++        src_k_layers,
++        dst_k_layers,
++        src_v_layers,
++        dst_v_layers,
++        src_indices,
++        dst_indices,
++        item_size,
++        num_layers,
++        block_quota,
++        sgs_per_wg,
++    )
++
++
++def transfer_kv_all_layer_mla(
++    src_layers: torch.Tensor,
++    dst_layers: torch.Tensor,
++    src_indices: torch.Tensor,
++    dst_indices: torch.Tensor,
++    item_size: int,
++    num_layers: int,
++    block_quota: int = _DEFAULT_BLOCK_QUOTA,
++    sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
++) -> None:
++    """All-layer lf_tbl→lf_tbl transfer, MLA (K only)."""
++    torch.ops.sgl_kernel.transfer_kv_all_layer_mla.default(
++        src_layers,
++        dst_layers,
++        src_indices,
++        dst_indices,
++        item_size,
++        num_layers,
++        block_quota,
++        sgs_per_wg,
++    )
++
++
++def transfer_kv_all_layer_lf_ph(
++    src_k_layers: torch.Tensor,
++    dst_k: torch.Tensor,
++    src_v_layers: torch.Tensor,
++    dst_v: torch.Tensor,
++    src_indices: torch.Tensor,
++    dst_indices: torch.Tensor,
++    item_size: int,
++    dst_layout_dim: int,
++    num_layers: int,
++    page_size: int,
++    head_num: int,
++    block_quota: int = _DEFAULT_BLOCK_QUOTA,
++    sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
++) -> None:
++    """All-layer lf_tbl → page-head transfer for K and V."""
++    torch.ops.sgl_kernel.transfer_kv_all_layer_lf_ph.default(
++        src_k_layers,
++        dst_k,
++        src_v_layers,
++        dst_v,
++        src_indices,
++        dst_indices,
++        item_size,
++        dst_layout_dim,
++        num_layers,
++        page_size,
++        head_num,
++        block_quota,
++        sgs_per_wg,
++    )
++
++
++def transfer_kv_per_layer_ph_lf(
++    src_k: torch.Tensor,
++    dst_k: torch.Tensor,
++    src_v: torch.Tensor,
++    dst_v: torch.Tensor,
++    src_indices: torch.Tensor,
++    dst_indices: torch.Tensor,
++    layer_id: int,
++    item_size: int,
++    src_layout_dim: int,
++    page_size: int,
++    head_num: int,
++    block_quota: int = _DEFAULT_BLOCK_QUOTA,
++    sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
++) -> None:
++    """Single-layer page-head → lf transfer for K and V."""
++    torch.ops.sgl_kernel.transfer_kv_per_layer_ph_lf.default(
++        src_k,
++        dst_k,
++        src_v,
++        dst_v,
++        src_indices,
++        dst_indices,
++        layer_id,
++        item_size,
++        src_layout_dim,
++        page_size,
++        head_num,
++        block_quota,
++        sgs_per_wg,
++    )
++
++
++def transfer_kv_per_layer_pf_lf(
++    src_k: torch.Tensor,
++    dst_k: torch.Tensor,
++    src_v: torch.Tensor,
++    dst_v: torch.Tensor,
++    src_indices: torch.Tensor,
++    dst_indices: torch.Tensor,
++    layer_id: int,
++    item_size: int,
++    src_layout_dim: int,
++    block_quota: int = _DEFAULT_BLOCK_QUOTA,
++    sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
++) -> None:
++    """Single-layer page-first → lf transfer for K and V."""
++    torch.ops.sgl_kernel.transfer_kv_per_layer_pf_lf.default(
++        src_k,
++        dst_k,
++        src_v,
++        dst_v,
++        src_indices,
++        dst_indices,
++        layer_id,
++        item_size,
++        src_layout_dim,
++        block_quota,
++        sgs_per_wg,
++    )
++
++
++def transfer_kv_all_layer_lf_pf(
++    src_k_layers: torch.Tensor,
++    dst_k: torch.Tensor,
++    src_v_layers: torch.Tensor,
++    dst_v: torch.Tensor,
++    src_indices: torch.Tensor,
++    dst_indices: torch.Tensor,
++    item_size: int,
++    dst_layout_dim: int,
++    num_layers: int,
++    block_quota: int = _DEFAULT_BLOCK_QUOTA,
++    sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
++) -> None:
++    """All-layers lf → page-first transfer for K and V."""
++    torch.ops.sgl_kernel.transfer_kv_all_layer_lf_pf.default(
++        src_k_layers,
++        dst_k,
++        src_v_layers,
++        dst_v,
++        src_indices,
++        dst_indices,
++        item_size,
++        dst_layout_dim,
++        num_layers,
++        block_quota,
++        sgs_per_wg,
++    )
++
++
++def transfer_kv_per_layer_mla_pf_lf(
++    src: torch.Tensor,
++    dst: torch.Tensor,
++    src_indices: torch.Tensor,
++    dst_indices: torch.Tensor,
++    layer_id: int,
++    item_size: int,
++    src_layout_dim: int,
++    block_quota: int = _DEFAULT_BLOCK_QUOTA,
++    sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
++) -> None:
++    """Single-layer page-first → lf transfer for K only (MLA)."""
++    torch.ops.sgl_kernel.transfer_kv_per_layer_mla_pf_lf.default(
++        src,
++        dst,
++        src_indices,
++        dst_indices,
++        layer_id,
++        item_size,
++        src_layout_dim,
++        block_quota,
++        sgs_per_wg,
++    )
++
++
++def transfer_kv_all_layer_mla_lf_pf(
++    src_layers: torch.Tensor,
++    dst: torch.Tensor,
++    src_indices: torch.Tensor,
++    dst_indices: torch.Tensor,
++    item_size: int,
++    dst_layout_dim: int,
++    num_layers: int,
++    block_quota: int = _DEFAULT_BLOCK_QUOTA,
++    sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
++) -> None:
++    """All-layers lf → page-first transfer for K only (MLA)."""
++    torch.ops.sgl_kernel.transfer_kv_all_layer_mla_lf_pf.default(
++        src_layers,
++        dst,
++        src_indices,
++        dst_indices,
++        item_size,
++        dst_layout_dim,
++        num_layers,
++        block_quota,
++        sgs_per_wg,
++    )
++
++
++# ---------------------------------------------------------------------------
++# Group B: Python/PyTorch fallbacks (host↔device; no equivalent of
++# cudaMemcpyBatchAsync on XPU — use PyTorch copy_ page-by-page).
++# ---------------------------------------------------------------------------
++
++
++def _transfer_page_direct(
++    src_buf: torch.Tensor,
++    dst_buf: torch.Tensor,
++    src_start: int,
++    dst_start: int,
++    count: int,
++) -> None:
++    dst_buf[dst_start : dst_start + count].copy_(
++        src_buf[src_start : src_start + count], non_blocking=True
++    )
++
++
++def transfer_kv_direct(
++    src_layers: List[torch.Tensor],
++    dst_layers: List[torch.Tensor],
++    src_indices: torch.Tensor,
++    dst_indices: torch.Tensor,
++    page_size: int,
++) -> None:
++    """Direct (PyTorch copy_) transfer for an arbitrary list of tensor pools.
++
++    Contiguous runs of indices are coalesced into a single copy_ call.
++    """
++    assert len(src_layers) == len(dst_layers)
++    assert src_indices.numel() == dst_indices.numel()
++    assert src_indices.numel() % page_size == 0
++
++    src_cpu = src_indices.cpu()
++    dst_cpu = dst_indices.cpu()
++    n = src_cpu.numel()
++    src_ptr = src_cpu.tolist()
++    dst_ptr = dst_cpu.tolist()
++
++    num_layers = len(src_layers)
++    start = 0
++    for i in range(n):
++        if i < n - 1:
++            if src_ptr[i + 1] - src_ptr[i] == 1 and dst_ptr[i + 1] - dst_ptr[i] == 1:
++                continue
++            end = i + 1
++        else:
++            end = n
++        count = end - start
++        for j in range(num_layers):
++            _transfer_page_direct(
++                src_layers[j], dst_layers[j], src_ptr[start], dst_ptr[start], count
++            )
++        start = end
++
++
++def transfer_kv_per_layer_direct_pf_lf(
++    src_ptrs: List[torch.Tensor],
++    dst_ptrs: List[torch.Tensor],
++    src_indices: torch.Tensor,
++    dst_indices: torch.Tensor,
++    layer_id: int,
++    page_size: int,
++) -> None:
++    """Page-first (pinned host) → layer-first (device) for one layer.
++
++    src_ptrs: list of per-layer tensors from the pf pool (or [kv_pool] for MLA).
++    dst_ptrs: list of per-layer destination tensors.
++    """
++    assert src_indices.numel() == dst_indices.numel()
++    assert src_indices.numel() % page_size == 0
++
++    src_cpu = src_indices.cpu()
++    dst_cpu = dst_indices.cpu()
++    num_pages = src_cpu.numel() // page_size
++    src_ptr = src_cpu.tolist()
++    dst_ptr = dst_cpu.tolist()
++
++    is_mla = len(src_ptrs) == 1
++    num_layers = len(dst_ptrs) if is_mla else len(dst_ptrs) // 2
++
++    for i in range(num_pages):
++        s_page = src_ptr[i * page_size] // page_size
++        d_start = dst_ptr[i * page_size]
++        for j in range(num_layers):
++            # src is pf: [num_pages, num_layers, page_size, item_size]
++            # copy page_size rows from src_ptrs[0 or 1][s_page][layer_id+j]
++            # to dst_ptrs[j] starting at d_start.
++            # Mirror the CUDA fallback: src_ptrs[0].select(0, s_page).select(0, layer_id+j)
++            # gives a [page_size, item_size] slice.
++            src_slice = (
++                src_ptrs[0 if is_mla else j].select(0, s_page).select(0, layer_id + j)
++            )
++            _transfer_page_direct(src_slice, dst_ptrs[j], 0, d_start, page_size)
++            if not is_mla:
++                src_slice_v = src_ptrs[1].select(0, s_page).select(0, layer_id + j)
++                _transfer_page_direct(
++                    src_slice_v, dst_ptrs[j + num_layers], 0, d_start, page_size
++                )
++
++
++def transfer_kv_all_layer_direct_lf_pf(
++    src_ptrs: List[torch.Tensor],
++    dst_ptrs: List[torch.Tensor],
++    src_indices: torch.Tensor,
++    dst_indices: torch.Tensor,
++    page_size: int,
++) -> None:
++    """Layer-first (device) → page-first (pinned host) for all layers.
++
++    src_ptrs: per-layer tensors [k0, k1, ..., v0, v1, ...] or [kv0, kv1, ...] for MLA.
++    dst_ptrs: [dst_k_pool] or [dst_k_pool, dst_v_pool] where pools are
++              shaped [num_pages, num_layers, page_size, item_size].
++    """
++    assert src_indices.numel() == dst_indices.numel()
++    assert src_indices.numel() % page_size == 0
++
++    src_cpu = src_indices.cpu()
++    dst_cpu = dst_indices.cpu()
++    num_pages = src_cpu.numel() // page_size
++    src_ptr = src_cpu.tolist()
++    dst_ptr = dst_cpu.tolist()
++
++    is_mla = len(dst_ptrs) == 1
++    num_layers = len(src_ptrs) if is_mla else len(src_ptrs) // 2
++
++    for i in range(num_pages):
++        s_start = src_ptr[i * page_size]
++        d_page = dst_ptr[i * page_size] // page_size
++        for j in range(num_layers):
++            # dst is pf: dst_ptrs[0][d_page][j] is shape [page_size, item_size]
++            dst_slice = dst_ptrs[0].select(0, d_page).select(0, j)
++            _transfer_page_direct(src_ptrs[j], dst_slice, s_start, 0, page_size)
++            if not is_mla:
++                dst_slice_v = dst_ptrs[1].select(0, d_page).select(0, j)
++                _transfer_page_direct(
++                    src_ptrs[j + num_layers], dst_slice_v, s_start, 0, page_size
++                )
 diff --git a/python/sgl_kernel/mhc.py b/python/sgl_kernel/mhc.py
-index ded79d4..7333415 100644
+index ded79d4d1736c248b4de59478ad94d1ac3a1e783..7333415108cf747e4ec5c6dac00af280cd9906a2 100644
 --- a/python/sgl_kernel/mhc.py
 +++ b/python/sgl_kernel/mhc.py
 @@ -89,3 +89,61 @@ def hc_split_sinkhorn(
@@ -529,7 +1764,7 @@ index ded79d4..7333415 100644
 +        norm_eps_arg,
 +    )
 diff --git a/python/sgl_kernel/sparse_flash_attn.py b/python/sgl_kernel/sparse_flash_attn.py
-index 29b2f04..386e7dc 100644
+index 29b2f04054932075c1351d1401242871f2ea5a82..386e7dc012a642f16cfeace612a921dc60c2476e 100644
 --- a/python/sgl_kernel/sparse_flash_attn.py
 +++ b/python/sgl_kernel/sparse_flash_attn.py
 @@ -1,14 +1,597 @@
@@ -1624,7 +2859,7 @@ index 29b2f04..386e7dc 100644
 +
      return (out, softmax_lse) if return_softmax_lse else out
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index ec9dd8c..2ec2bf2 100644
+index ec9dd8c8f6612bae711e9db2ecf0a31d422f0747..2ec2bf2b5f2f2d27dbaee668ecaa84f88c20b079 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
 @@ -38,3 +38,10 @@ set(ATen_XPU_SYCL_COMMON ${ATen_XPU_SYCL_COMMON} PARENT_SCOPE)
@@ -1639,7 +2874,7 @@ index ec9dd8c..2ec2bf2 100644
 +# get_block_2d_copy_A) already exist there.
 +include(${CMAKE_CURRENT_SOURCE_DIR}/GdnAttn.cmake)
 diff --git a/src/FMHADecodeXe20.cmake b/src/FMHADecodeXe20.cmake
-index 48ce422..28df482 100644
+index 48ce422db6f9115af3ea32a04ddb01bfba7f4bd4..28df48273c975962b65c0c140f71da7882b49632 100644
 --- a/src/FMHADecodeXe20.cmake
 +++ b/src/FMHADecodeXe20.cmake
 @@ -1,19 +1,68 @@
@@ -1714,7 +2949,7 @@ index 48ce422..28df482 100644
              set(GENERATED_FILE
                  "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_kernel_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}.cpp")
 diff --git a/src/FMHAPrefillXe20.cmake b/src/FMHAPrefillXe20.cmake
-index 10e836b..cb28fbb 100644
+index 10e836b50a0d650a17b779a78d2626871ec1f017..cb28fbb0b0f5b741be5df6ec474f6832657ec534 100644
 --- a/src/FMHAPrefillXe20.cmake
 +++ b/src/FMHAPrefillXe20.cmake
 @@ -1,8 +1,14 @@
@@ -1820,7 +3055,7 @@ index 10e836b..cb28fbb 100644
          "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_prefill_kernel_${HEAD_DIM}.cpp")
 diff --git a/src/GdnAttn.cmake b/src/GdnAttn.cmake
 new file mode 100644
-index 0000000..83027ba
+index 0000000000000000000000000000000000000000..83027ba3a600eb492ebf10ca613577e7f0c37d3d
 --- /dev/null
 +++ b/src/GdnAttn.cmake
 @@ -0,0 +1,116 @@
@@ -1942,7 +3177,7 @@ index 0000000..83027ba
 +endforeach()
 diff --git a/src/gdn_attn/causal_conv1d.hpp b/src/gdn_attn/causal_conv1d.hpp
 new file mode 100644
-index 0000000..aa1fec4
+index 0000000000000000000000000000000000000000..aa1fec4de7f613913c987231fa6dd92721af04de
 --- /dev/null
 +++ b/src/gdn_attn/causal_conv1d.hpp
 @@ -0,0 +1,656 @@
@@ -2605,7 +3840,7 @@ index 0000000..aa1fec4
 \ No newline at end of file
 diff --git a/src/gdn_attn/gated_delta_rule.hpp b/src/gdn_attn/gated_delta_rule.hpp
 new file mode 100644
-index 0000000..1794c91
+index 0000000000000000000000000000000000000000..1794c91128dc1b7aee5fa95184f18336ae5e7e88
 --- /dev/null
 +++ b/src/gdn_attn/gated_delta_rule.hpp
 @@ -0,0 +1,415 @@
@@ -3027,7 +4262,7 @@ index 0000000..1794c91
 \ No newline at end of file
 diff --git a/src/gdn_attn/gdn_attn_interface.cpp b/src/gdn_attn/gdn_attn_interface.cpp
 new file mode 100644
-index 0000000..10ada77
+index 0000000000000000000000000000000000000000..10ada77f71304594ec0b5697fac5e1af0bfa0ee0
 --- /dev/null
 +++ b/src/gdn_attn/gdn_attn_interface.cpp
 @@ -0,0 +1,246 @@
@@ -3280,7 +4515,7 @@ index 0000000..10ada77
 \ No newline at end of file
 diff --git a/src/gdn_attn/gdn_attn_utils.h b/src/gdn_attn/gdn_attn_utils.h
 new file mode 100644
-index 0000000..d97c912
+index 0000000000000000000000000000000000000000..d97c9122f92677c31466513f18c3d58da526fa8d
 --- /dev/null
 +++ b/src/gdn_attn/gdn_attn_utils.h
 @@ -0,0 +1,14 @@
@@ -3301,7 +4536,7 @@ index 0000000..d97c912
 \ No newline at end of file
 diff --git a/src/gdn_attn/rms_norm_gated_sycl.cpp b/src/gdn_attn/rms_norm_gated_sycl.cpp
 new file mode 100644
-index 0000000..79c814c
+index 0000000000000000000000000000000000000000..79c814c971b58a6547bab4e8236c6c8ebedef9af
 --- /dev/null
 +++ b/src/gdn_attn/rms_norm_gated_sycl.cpp
 @@ -0,0 +1,127 @@
@@ -3434,7 +4669,7 @@ index 0000000..79c814c
 +}  // namespace gdn
 diff --git a/src/gdn_attn/torch_bindings_gdn_attn.cc b/src/gdn_attn/torch_bindings_gdn_attn.cc
 new file mode 100644
-index 0000000..89ad45b
+index 0000000000000000000000000000000000000000..89ad45bb2dc90531d0fce9bea5d57c1184f75744
 --- /dev/null
 +++ b/src/gdn_attn/torch_bindings_gdn_attn.cc
 @@ -0,0 +1,75 @@
@@ -3515,7 +4750,7 @@ index 0000000..89ad45b
 +}
 diff --git a/src/gdn_attn/vllm_xpu_dispatch_utils.h b/src/gdn_attn/vllm_xpu_dispatch_utils.h
 new file mode 100644
-index 0000000..47ce28a
+index 0000000000000000000000000000000000000000..47ce28abe54080633ae3e3fe1a5b1d2c415c05ab
 --- /dev/null
 +++ b/src/gdn_attn/vllm_xpu_dispatch_utils.h
 @@ -0,0 +1,110 @@
@@ -3631,7 +4866,7 @@ index 0000000..47ce28a
 +  }
 diff --git a/src/gdn_attn/vllm_xpu_utils.h b/src/gdn_attn/vllm_xpu_utils.h
 new file mode 100644
-index 0000000..34a2e10
+index 0000000000000000000000000000000000000000..34a2e1092047a95085f7d8f54c4cfd88e7ea0cc6
 --- /dev/null
 +++ b/src/gdn_attn/vllm_xpu_utils.h
 @@ -0,0 +1,123 @@
@@ -3760,7 +4995,7 @@ index 0000000..34a2e10
 +}  // namespace vllm
 diff --git a/src/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp b/src/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp
 new file mode 100755
-index 0000000..ea6be74
+index 0000000000000000000000000000000000000000..ea6be748d7b2535b83b2e6f922ec4a316fd9d4d1
 --- /dev/null
 +++ b/src/gdn_attn/xe_2/chunk_causal_conv1d_xe2.hpp
 @@ -0,0 +1,825 @@
@@ -4592,7 +5827,7 @@ index 0000000..ea6be74
 \ No newline at end of file
 diff --git a/src/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp b/src/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
 new file mode 100644
-index 0000000..b04240d
+index 0000000000000000000000000000000000000000..b04240d50332e5398e46d0ec5876214e9f4b346e
 --- /dev/null
 +++ b/src/gdn_attn/xe_2/chunk_gated_delta_rule_kernels_xe2.hpp
 @@ -0,0 +1,1711 @@
@@ -6310,7 +7545,7 @@ index 0000000..b04240d
 \ No newline at end of file
 diff --git a/src/gdn_attn/xe_2/chunk_gated_delta_rule_xe2.h b/src/gdn_attn/xe_2/chunk_gated_delta_rule_xe2.h
 new file mode 100644
-index 0000000..43cfaf8
+index 0000000000000000000000000000000000000000..43cfaf81b364a13eea61eafbdfa2a2616a01e8a0
 --- /dev/null
 +++ b/src/gdn_attn/xe_2/chunk_gated_delta_rule_xe2.h
 @@ -0,0 +1,23 @@
@@ -6340,7 +7575,7 @@ index 0000000..43cfaf8
 \ No newline at end of file
 diff --git a/src/gdn_attn/xe_2/chunk_gated_delta_rule_xe2Xe20.cpp b/src/gdn_attn/xe_2/chunk_gated_delta_rule_xe2Xe20.cpp
 new file mode 100755
-index 0000000..6bd109e
+index 0000000000000000000000000000000000000000..6bd109e1dd718d87528ddd695d2d66a255885894
 --- /dev/null
 +++ b/src/gdn_attn/xe_2/chunk_gated_delta_rule_xe2Xe20.cpp
 @@ -0,0 +1,46 @@
@@ -6393,7 +7628,7 @@ index 0000000..6bd109e
 \ No newline at end of file
 diff --git a/src/gdn_attn/xe_2/gemm.hpp b/src/gdn_attn/xe_2/gemm.hpp
 new file mode 100644
-index 0000000..eea5afc
+index 0000000000000000000000000000000000000000..eea5afc4dad9c3af013f5b9868cafa6b001825e6
 --- /dev/null
 +++ b/src/gdn_attn/xe_2/gemm.hpp
 @@ -0,0 +1,381 @@
@@ -6781,7 +8016,7 @@ index 0000000..eea5afc
 \ No newline at end of file
 diff --git a/src/sycl/HCPreFuse.cpp b/src/sycl/HCPreFuse.cpp
 new file mode 100644
-index 0000000..4b55303
+index 0000000000000000000000000000000000000000..4b5530388f15e3c06ed833f21f64d8962c9d65ec
 --- /dev/null
 +++ b/src/sycl/HCPreFuse.cpp
 @@ -0,0 +1,608 @@
@@ -7393,8 +8628,959 @@ index 0000000..4b55303
 +
 +#undef LAUNCH_HC_PRE_FUSE
 +}
+diff --git a/src/sycl/KVCacheIO.cpp b/src/sycl/KVCacheIO.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb78d8f4b3d666180b43b8521a8cd9ed01e7bf91
+--- /dev/null
++++ b/src/sycl/KVCacheIO.cpp
+@@ -0,0 +1,945 @@
++/* Copyright 2025 SGLang Team. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++// KV-cache scatter/gather transfer kernels for XPU (SYCL port of sgl-kernel
++// csrc/kvcacheio/transfer.cu).
++//
++// Layout conventions:
++//   lf  = layer-first  [num_layers, num_tokens, item_size]
++//   pf  = page-first   [num_tokens, num_layers, item_size]
++//         (per-token addressing: base + token * layout_dim + layer * item_size,
++//          where layout_dim = num_layers * item_size)
++//   ph  = page-head    [num_pages, head_num, page_size, num_layers, head_dim]
++//
++// pf/ph pools live in pinned host memory (CPU-side eviction/disaggregation
++// buffers); the device kernels address them directly over the fabric.  Both
++// lf↔pf and lf↔ph layout conversions have on-device kernels here, matching the
++// CUDA sgl-kernel API.  The pf_lf/lf_pf variants mirror CUDA transfer_kernel_impl
++// with get_global_offset_pf; a Python copy_ fallback (transfer_kv_*_direct_*)
++// remains available for the page_first_direct layout.
++
++#include <ATen/ATen.h>
++
++#include <cstdint>
++#include <vector>
++
++#include "Utils.h"
++#include "comm/General.h"
++
++// Sub-group size on Xe2/BMG.  WARP_SIZE in the CUDA source = 32;
++// Xe2 sub-group size = 16.  All work-items within one sub-group cooperate
++// to copy one token's KV entry.
++//
++// Cache hints: CUDA uses ld.global.nc (L1 bypass) + st.global.cg (L2 write).
++// The XPU equivalent is ESIMD block_load/block_store with cache_hint::streaming.
++// Not implemented here because: (a) ESIMD requires a different kernel model
++// incompatible with sycl::nd_item; (b) at our working-set sizes (>8 MB) we
++// already achieve 50–95% of DRAM peak without them.
++static constexpr int64_t XPU_SG_SIZE = 16;
++
++// ---------------------------------------------------------------------------
++// Offset helpers – used only by TransferKVPageHeadKernel.
++// The standard lf/lf_tbl addressing is inlined directly in TransferKVKernel.
++// ---------------------------------------------------------------------------
++
++// Layer-first with pointer table, per-head variant (for lf→ph source path).
++static inline const char* get_offset_per_head_lf_tbl(
++    const char* /*unused*/,
++    const uintptr_t* tbl,
++    int64_t layer_id,
++    int64_t /*layout_dim*/,
++    int64_t page_id,
++    int64_t item_size_bytes,
++    int64_t head_id,
++    int64_t head_num,
++    int64_t /*page_size*/) {
++  return reinterpret_cast<const char*>(tbl[layer_id]) + page_id * item_size_bytes +
++         item_size_bytes / head_num * head_id;
++}
++
++// Layer-first contiguous, per-head variant (for ph→lf destination path).
++// layer_id is unused because callers pre-slice dst to the correct layer base
++// (e.g. dst_k_pool_kernel_ptrs[layer_idx]), so layer_dim is always 0 here.
++// This matches the CUDA get_global_offset_per_head_lf with layer_dim=0.
++static inline char* get_offset_per_head_lf_mut(
++    char* base,
++    const uintptr_t* /*unused*/,
++    int64_t layer_id,
++    int64_t layer_dim,
++    int64_t page_id,
++    int64_t item_size_bytes,
++    int64_t head_id,
++    int64_t head_num,
++    int64_t /*page_size*/) {
++  return base + layer_id * layer_dim + page_id * item_size_bytes + item_size_bytes / head_num * head_id;
++}
++
++// Page-head layout: [num_pages, head_num, page_size, num_layers, head_dim]
++// page_id here is a flat token index.
++static inline char* get_offset_ph_mut(
++    char* base,
++    const uintptr_t* /*unused*/,
++    int64_t layer_id,
++    int64_t page_dim,
++    int64_t page_id,
++    int64_t item_size_bytes,
++    int64_t head_id,
++    int64_t head_num,
++    int64_t page_size) {
++  const int64_t head_dim_bytes = item_size_bytes / head_num;
++  return base + (page_id / page_size) * page_size * page_dim +  // page bucket
++         (page_dim / head_num) * head_id * page_size +          // head dim
++         (page_id % page_size) * page_dim / head_num +          // slot within page
++         layer_id * head_dim_bytes;                             // layer slot
++}
++
++// Page-head layout, const variant (for ph→lf source path).
++static inline const char* get_offset_ph(
++    const char* base,
++    const uintptr_t* /*unused*/,
++    int64_t layer_id,
++    int64_t page_dim,
++    int64_t page_id,
++    int64_t item_size_bytes,
++    int64_t head_id,
++    int64_t head_num,
++    int64_t page_size) {
++  const int64_t head_dim_bytes = item_size_bytes / head_num;
++  return base + (page_id / page_size) * page_size * page_dim + (page_dim / head_num) * head_id * page_size +
++         (page_id % page_size) * page_dim / head_num + layer_id * head_dim_bytes;
++}
++
++// ---------------------------------------------------------------------------
++// Kernel functors
++// ---------------------------------------------------------------------------
++
++// Standard transfer kernel (lf↔lf and lf_tbl↔lf_tbl).
++// One sub-group (XPU_SG_SIZE work-items) handles one token per iteration.
++// IsMLA=true: only K is transferred (no separate V tensor).
++template <bool IsMLA>
++struct TransferKVKernel {
++  void operator()(sycl::nd_item<1> item) const {
++    const int64_t lane = static_cast<int64_t>(item.get_local_id(0)) % XPU_SG_SIZE;
++    const int64_t sg_id =
++        static_cast<int64_t>(item.get_local_id(0)) / XPU_SG_SIZE +
++        static_cast<int64_t>(item.get_group(0)) * (static_cast<int64_t>(item.get_local_range(0)) / XPU_SG_SIZE);
++
++    for (int64_t i = 0; i < items_per_sg_; ++i) {
++      const int64_t item_id = sg_id * items_per_sg_ + i;
++      if (item_id >= num_items_) break;
++
++      const int64_t src_page = src_indices_[item_id];
++      const int64_t dst_page = dst_indices_[item_id];
++
++      for (int64_t layer = start_layer_; layer < start_layer_ + num_layers_; ++layer) {
++        const char* src_k_ptr = src_k_base_ == nullptr
++                                    ? reinterpret_cast<const char*>(src_k_tbl_[layer]) + src_page * item_size_
++                                    : src_k_base_ + src_page * item_size_;
++        char* dst_k_ptr = dst_k_base_ == nullptr ? reinterpret_cast<char*>(dst_k_tbl_[layer]) + dst_page * item_size_
++                                                 : dst_k_base_ + dst_page * item_size_;
++
++        const int64_t chunks = item_size_ / static_cast<int64_t>(sizeof(uint64_t));
++        const auto* src64 = reinterpret_cast<const uint64_t*>(src_k_ptr);
++        auto* dst64 = reinterpret_cast<uint64_t*>(dst_k_ptr);
++
++        if constexpr (!IsMLA) {
++          // Interleave K and V loads/stores so both streams are in-flight
++          // simultaneously, hiding load latency across the two independent
++          // address streams.
++          const char* src_v_ptr = src_v_base_ == nullptr
++                                      ? reinterpret_cast<const char*>(src_v_tbl_[layer]) + src_page * item_size_
++                                      : src_v_base_ + src_page * item_size_;
++          char* dst_v_ptr = dst_v_base_ == nullptr ? reinterpret_cast<char*>(dst_v_tbl_[layer]) + dst_page * item_size_
++                                                   : dst_v_base_ + dst_page * item_size_;
++
++          const auto* sv64 = reinterpret_cast<const uint64_t*>(src_v_ptr);
++          auto* dv64 = reinterpret_cast<uint64_t*>(dst_v_ptr);
++          for (int64_t j = lane; j < chunks; j += XPU_SG_SIZE) {
++            const uint64_t k_val = src64[j];
++            const uint64_t v_val = sv64[j];
++            dst64[j] = k_val;
++            dv64[j] = v_val;
++          }
++        } else {
++          for (int64_t j = lane; j < chunks; j += XPU_SG_SIZE) {
++            dst64[j] = src64[j];
++          }
++        }
++      }
++    }
++  }
++
++  // K source: either a flat base pointer (single-layer lf) or a layer table.
++  const char* src_k_base_;
++  char* dst_k_base_;
++  const char* src_v_base_;
++  char* dst_v_base_;
++  const uintptr_t* src_k_tbl_;
++  const uintptr_t* dst_k_tbl_;
++  const uintptr_t* src_v_tbl_;
++  const uintptr_t* dst_v_tbl_;
++  const int64_t* src_indices_;
++  const int64_t* dst_indices_;
++  int64_t start_layer_;
++  int64_t num_layers_;
++  int64_t num_items_;
++  int64_t items_per_sg_;
++  int64_t item_size_;
++};
++
++// Page-first transfer kernel (pf↔lf).
++// pf layout:  [num_pages, num_layers, page_size, item_size], addressed as
++//   base + page_id * layout_dim + layer_id * item_size
++// lf side is the flat/tabled layer-first addressing (base + page_id * item_size,
++// or a per-layer pointer table).  Direction is fixed at compile time:
++//   IsPfToLf=true : src is pf, dst is lf   (transfer_kv_*_pf_lf)
++//   IsPfToLf=false: src is lf, dst is pf   (transfer_kv_*_lf_pf)
++// IsMLA=true: only K is transferred (no separate V tensor).
++// Mirrors CUDA transfer_kernel_impl with get_global_offset_pf on the pf side.
++template <bool IsMLA, bool IsPfToLf>
++struct TransferKVPageFirstKernel {
++  // pf side: base + page * layout_dim + layer * item_size.
++  static inline const char*
++  pf_offset(const char* base, int64_t layer, int64_t page, int64_t item_size, int64_t layout_dim) {
++    return base + page * layout_dim + layer * item_size;
++  }
++  // lf side: flat base (base + page * item_size) or per-layer table.
++  static inline const char*
++  lf_offset(const char* base, const uintptr_t* tbl, int64_t layer, int64_t page, int64_t item_size) {
++    return base == nullptr ? reinterpret_cast<const char*>(tbl[layer]) + page * item_size : base + page * item_size;
++  }
++
++  void operator()(sycl::nd_item<1> item) const {
++    const int64_t lane = static_cast<int64_t>(item.get_local_id(0)) % XPU_SG_SIZE;
++    const int64_t sg_id =
++        static_cast<int64_t>(item.get_local_id(0)) / XPU_SG_SIZE +
++        static_cast<int64_t>(item.get_group(0)) * (static_cast<int64_t>(item.get_local_range(0)) / XPU_SG_SIZE);
++
++    const int64_t chunks = item_size_ / static_cast<int64_t>(sizeof(uint64_t));
++
++    for (int64_t i = 0; i < items_per_sg_; ++i) {
++      const int64_t item_id = sg_id * items_per_sg_ + i;
++      if (item_id >= num_items_) break;
++
++      const int64_t src_page = src_indices_[item_id];
++      const int64_t dst_page = dst_indices_[item_id];
++
++      for (int64_t layer = start_layer_; layer < start_layer_ + num_layers_; ++layer) {
++        const char* src_k_ptr;
++        char* dst_k_ptr;
++        if constexpr (IsPfToLf) {
++          src_k_ptr = pf_offset(src_k_base_, layer, src_page, item_size_, src_layout_dim_);
++          dst_k_ptr = const_cast<char*>(lf_offset(dst_k_base_, dst_k_tbl_, layer, dst_page, item_size_));
++        } else {
++          src_k_ptr = lf_offset(src_k_base_, src_k_tbl_, layer, src_page, item_size_);
++          dst_k_ptr = const_cast<char*>(pf_offset(dst_k_base_, layer, dst_page, item_size_, dst_layout_dim_));
++        }
++
++        const auto* src64 = reinterpret_cast<const uint64_t*>(src_k_ptr);
++        auto* dst64 = reinterpret_cast<uint64_t*>(dst_k_ptr);
++
++        if constexpr (!IsMLA) {
++          const char* src_v_ptr;
++          char* dst_v_ptr;
++          if constexpr (IsPfToLf) {
++            src_v_ptr = pf_offset(src_v_base_, layer, src_page, item_size_, src_layout_dim_);
++            dst_v_ptr = const_cast<char*>(lf_offset(dst_v_base_, dst_v_tbl_, layer, dst_page, item_size_));
++          } else {
++            src_v_ptr = lf_offset(src_v_base_, src_v_tbl_, layer, src_page, item_size_);
++            dst_v_ptr = const_cast<char*>(pf_offset(dst_v_base_, layer, dst_page, item_size_, dst_layout_dim_));
++          }
++          const auto* sv64 = reinterpret_cast<const uint64_t*>(src_v_ptr);
++          auto* dv64 = reinterpret_cast<uint64_t*>(dst_v_ptr);
++          for (int64_t j = lane; j < chunks; j += XPU_SG_SIZE) {
++            const uint64_t k_val = src64[j];
++            const uint64_t v_val = sv64[j];
++            dst64[j] = k_val;
++            dv64[j] = v_val;
++          }
++        } else {
++          for (int64_t j = lane; j < chunks; j += XPU_SG_SIZE) {
++            dst64[j] = src64[j];
++          }
++        }
++      }
++    }
++  }
++
++  // pf side uses a flat base pointer; lf side may use a base or a layer table.
++  const char* src_k_base_;
++  char* dst_k_base_;
++  const char* src_v_base_;
++  char* dst_v_base_;
++  const uintptr_t* src_k_tbl_;
++  const uintptr_t* dst_k_tbl_;
++  const uintptr_t* src_v_tbl_;
++  const uintptr_t* dst_v_tbl_;
++  const int64_t* src_indices_;
++  const int64_t* dst_indices_;
++  int64_t start_layer_;
++  int64_t num_layers_;
++  int64_t num_items_;
++  int64_t items_per_sg_;
++  int64_t item_size_;
++  int64_t src_layout_dim_;
++  int64_t dst_layout_dim_;
++};
++
++// Page-head transfer kernel: loops over heads because each head's data is
++// non-contiguous in the page-head layout.
++// Direction is fixed to lf→ph (IsLfToPh=true) or ph→lf (false).
++template <bool IsLfToPh>
++struct TransferKVPageHeadKernel {
++  void operator()(sycl::nd_item<1> item) const {
++    const int64_t lane = static_cast<int64_t>(item.get_local_id(0)) % XPU_SG_SIZE;
++    const int64_t sg_id =
++        static_cast<int64_t>(item.get_local_id(0)) / XPU_SG_SIZE +
++        static_cast<int64_t>(item.get_group(0)) * (static_cast<int64_t>(item.get_local_range(0)) / XPU_SG_SIZE);
++
++    const int64_t head_dim_bytes = item_size_ / head_num_;
++
++    for (int64_t i = 0; i < items_per_sg_; ++i) {
++      const int64_t item_id = sg_id * items_per_sg_ + i;
++      if (item_id >= num_items_) break;
++
++      const int64_t src_page = src_indices_[item_id];
++      const int64_t dst_page = dst_indices_[item_id];
++
++      for (int64_t layer = start_layer_; layer < start_layer_ + num_layers_; ++layer) {
++        for (int64_t head = 0; head < head_num_; ++head) {
++          const char* sk;
++          char* dk;
++          const char* sv;
++          char* dv;
++
++          if constexpr (IsLfToPh) {
++            // src: lf_tbl per-head  dst: ph
++            sk = get_offset_per_head_lf_tbl(
++                nullptr, src_k_tbl_, layer, 0, src_page, item_size_, head, head_num_, page_size_);
++            dk = get_offset_ph_mut(
++                dst_k_base_, nullptr, layer, dst_layout_dim_, dst_page, item_size_, head, head_num_, page_size_);
++            sv = get_offset_per_head_lf_tbl(
++                nullptr, src_v_tbl_, layer, 0, src_page, item_size_, head, head_num_, page_size_);
++            dv = get_offset_ph_mut(
++                dst_v_base_, nullptr, layer, dst_layout_dim_, dst_page, item_size_, head, head_num_, page_size_);
++          } else {
++            // src: ph  dst: lf per-head
++            sk = get_offset_ph(
++                src_k_base_, nullptr, layer, src_layout_dim_, src_page, item_size_, head, head_num_, page_size_);
++            dk = get_offset_per_head_lf_mut(
++                dst_k_base_, nullptr, layer, 0, dst_page, item_size_, head, head_num_, page_size_);
++            sv = get_offset_ph(
++                src_v_base_, nullptr, layer, src_layout_dim_, src_page, item_size_, head, head_num_, page_size_);
++            dv = get_offset_per_head_lf_mut(
++                dst_v_base_, nullptr, layer, 0, dst_page, item_size_, head, head_num_, page_size_);
++          }
++
++          const int64_t chunks = head_dim_bytes / static_cast<int64_t>(sizeof(uint64_t));
++          const auto* sk64 = reinterpret_cast<const uint64_t*>(sk);
++          auto* dk64 = reinterpret_cast<uint64_t*>(dk);
++          const auto* sv64 = reinterpret_cast<const uint64_t*>(sv);
++          auto* dv64 = reinterpret_cast<uint64_t*>(dv);
++          for (int64_t j = lane; j < chunks; j += XPU_SG_SIZE) {
++            dk64[j] = sk64[j];
++            dv64[j] = sv64[j];
++          }
++        }
++      }
++    }
++  }
++
++  const char* src_k_base_;
++  char* dst_k_base_;
++  const char* src_v_base_;
++  char* dst_v_base_;
++  const uintptr_t* src_k_tbl_;
++  const uintptr_t* dst_k_tbl_;
++  const uintptr_t* src_v_tbl_;
++  const uintptr_t* dst_v_tbl_;
++  const int64_t* src_indices_;
++  const int64_t* dst_indices_;
++  int64_t start_layer_;
++  int64_t num_layers_;
++  int64_t num_items_;
++  int64_t items_per_sg_;
++  int64_t item_size_;
++  int64_t src_layout_dim_;
++  int64_t dst_layout_dim_;
++  int64_t page_size_;
++  int64_t head_num_;
++};
++
++// ---------------------------------------------------------------------------
++// Launcher helpers
++// ---------------------------------------------------------------------------
++
++static int64_t div_up(int64_t x, int64_t y) {
++  return (x + y - 1) / y;
++}
++
++// Validate a per-layer pointer table: it must hold exactly num_layers entries
++// and be a UInt64 tensor (each element is a raw data_ptr() value).  Reading it
++// as a uintptr_t table with a mismatched length or dtype would dereference
++// invalid addresses in the kernel.
++static void check_layer_ptr_table(const at::Tensor& tbl, int64_t num_layers, const char* name) {
++  TORCH_CHECK(tbl.scalar_type() == at::kUInt64, name, " must be a uint64 pointer table");
++  TORCH_CHECK(tbl.numel() == num_layers, name, " must have num_layers entries");
++  TORCH_CHECK(tbl.is_xpu(), name, " must be an XPU tensor");
++  TORCH_CHECK(tbl.is_contiguous(), name, " must be contiguous");
++}
++
++static void check_indices(const at::Tensor& src_indices, const at::Tensor& dst_indices) {
++  TORCH_CHECK(src_indices.scalar_type() == at::kLong, "src_indices must be int64");
++  TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "dst_indices must be int64");
++  TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "index count mismatch");
++  TORCH_CHECK(src_indices.is_xpu(), "src_indices must be an XPU tensor");
++  TORCH_CHECK(dst_indices.is_xpu(), "dst_indices must be an XPU tensor");
++  TORCH_CHECK(src_indices.is_contiguous(), "src_indices must be contiguous");
++  TORCH_CHECK(dst_indices.is_contiguous(), "dst_indices must be contiguous");
++  TORCH_CHECK(src_indices.device() == dst_indices.device(), "indices must be on the same XPU device");
++}
++
++// Launch the standard (non-page-head) transfer kernel.
++// Uses TransferKVKernel<IsMLA>.
++template <bool IsMLA>
++static void launch_transfer_kv(
++    const void* src_k,
++    void* dst_k,
++    const void* src_v,
++    void* dst_v,
++    const uintptr_t* src_k_tbl,
++    const uintptr_t* dst_k_tbl,
++    const uintptr_t* src_v_tbl,
++    const uintptr_t* dst_v_tbl,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t start_layer,
++    int64_t num_layers,
++    int64_t item_size,
++    int64_t block_quota,
++    int64_t sgs_per_wg) {
++  TORCH_CHECK(item_size % 8 == 0, "item_size must be divisible by 8");
++  TORCH_CHECK(sgs_per_wg > 0, "sgs_per_wg must be positive");
++  check_indices(src_indices, dst_indices);
++
++  const int64_t num_items = src_indices.numel();
++  if (num_items == 0) return;  // nothing to transfer; avoids div-by-zero below
++
++  // block_quota fixes the total sub-group pool (block_quota * sgs_per_wg
++  // sub-groups); num_wgs then scales with the token count up to that pool.
++  // A fixed pool of 16*32=512 sub-groups fills all 20 Xe-cores on B580 across
++  // the whole token-count range (measured: 5-8x faster than an N-derived quota
++  // at N<=1024, which starves the GPU to 1-2 work-groups).  block_quota<=0
++  // falls back to this default.
++  const int64_t effective_bq = block_quota > 0 ? block_quota : 16;
++  const int64_t total_sgs = effective_bq * sgs_per_wg;
++  const int64_t items_per_sg = div_up(num_items, total_sgs);
++  const int64_t num_wgs = div_up(num_items, items_per_sg * sgs_per_wg);
++  const int64_t wg_size = sgs_per_wg * XPU_SG_SIZE;
++
++  TransferKVKernel<IsMLA> kernel{
++      .src_k_base_ = static_cast<const char*>(src_k),
++      .dst_k_base_ = static_cast<char*>(dst_k),
++      .src_v_base_ = static_cast<const char*>(src_v),
++      .dst_v_base_ = static_cast<char*>(dst_v),
++      .src_k_tbl_ = src_k_tbl,
++      .dst_k_tbl_ = dst_k_tbl,
++      .src_v_tbl_ = src_v_tbl,
++      .dst_v_tbl_ = dst_v_tbl,
++      .src_indices_ = src_indices.data_ptr<int64_t>(),
++      .dst_indices_ = dst_indices.data_ptr<int64_t>(),
++      .start_layer_ = start_layer,
++      .num_layers_ = num_layers,
++      .num_items_ = num_items,
++      .items_per_sg_ = items_per_sg,
++      .item_size_ = item_size,
++  };
++
++  auto cgf = DPCPP_Q_CGF(cgh) {
++    cgh.parallel_for<decltype(kernel)>(
++        sycl::nd_range<1>(
++            sycl::range<1>(static_cast<size_t>(num_wgs * wg_size)), sycl::range<1>(static_cast<size_t>(wg_size))),
++        kernel);
++  };
++  dpcppGetCurrentQueue().submit(cgf);
++}
++
++// Launch the page-first transfer kernel.  Uses TransferKVPageFirstKernel.
++// The pf side is always a flat base pointer; the lf side may be a flat base
++// (single layer) or a per-layer pointer table (all layers).
++template <bool IsMLA, bool IsPfToLf>
++static void launch_transfer_kv_page_first(
++    const void* src_k,
++    void* dst_k,
++    const void* src_v,
++    void* dst_v,
++    const uintptr_t* src_k_tbl,
++    const uintptr_t* dst_k_tbl,
++    const uintptr_t* src_v_tbl,
++    const uintptr_t* dst_v_tbl,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t start_layer,
++    int64_t num_layers,
++    int64_t item_size,
++    int64_t src_layout_dim,
++    int64_t dst_layout_dim,
++    int64_t block_quota,
++    int64_t sgs_per_wg) {
++  TORCH_CHECK(item_size % 8 == 0, "item_size must be divisible by 8");
++  TORCH_CHECK(sgs_per_wg > 0, "sgs_per_wg must be positive");
++  check_indices(src_indices, dst_indices);
++
++  const int64_t num_items = src_indices.numel();
++  if (num_items == 0) return;  // nothing to transfer; avoids div-by-zero below
++
++  const int64_t effective_bq = block_quota > 0 ? block_quota : 16;
++  const int64_t total_sgs = effective_bq * sgs_per_wg;
++  const int64_t items_per_sg = div_up(num_items, total_sgs);
++  const int64_t num_wgs = div_up(num_items, items_per_sg * sgs_per_wg);
++  const int64_t wg_size = sgs_per_wg * XPU_SG_SIZE;
++
++  TransferKVPageFirstKernel<IsMLA, IsPfToLf> kernel{
++      .src_k_base_ = static_cast<const char*>(src_k),
++      .dst_k_base_ = static_cast<char*>(dst_k),
++      .src_v_base_ = static_cast<const char*>(src_v),
++      .dst_v_base_ = static_cast<char*>(dst_v),
++      .src_k_tbl_ = src_k_tbl,
++      .dst_k_tbl_ = dst_k_tbl,
++      .src_v_tbl_ = src_v_tbl,
++      .dst_v_tbl_ = dst_v_tbl,
++      .src_indices_ = src_indices.data_ptr<int64_t>(),
++      .dst_indices_ = dst_indices.data_ptr<int64_t>(),
++      .start_layer_ = start_layer,
++      .num_layers_ = num_layers,
++      .num_items_ = num_items,
++      .items_per_sg_ = items_per_sg,
++      .item_size_ = item_size,
++      .src_layout_dim_ = src_layout_dim,
++      .dst_layout_dim_ = dst_layout_dim,
++  };
++
++  auto cgf = DPCPP_Q_CGF(cgh) {
++    cgh.parallel_for<decltype(kernel)>(
++        sycl::nd_range<1>(
++            sycl::range<1>(static_cast<size_t>(num_wgs * wg_size)), sycl::range<1>(static_cast<size_t>(wg_size))),
++        kernel);
++  };
++  dpcppGetCurrentQueue().submit(cgf);
++}
++
++template <bool IsLfToPh>
++static void launch_transfer_kv_page_head(
++    const void* src_k,
++    void* dst_k,
++    const void* src_v,
++    void* dst_v,
++    const uintptr_t* src_k_tbl,
++    const uintptr_t* dst_k_tbl,
++    const uintptr_t* src_v_tbl,
++    const uintptr_t* dst_v_tbl,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t num_layers,
++    int64_t item_size,
++    int64_t src_layout_dim,
++    int64_t dst_layout_dim,
++    int64_t page_size,
++    int64_t head_num,
++    int64_t block_quota,
++    int64_t sgs_per_wg,
++    int64_t start_layer = 0) {
++  TORCH_CHECK(item_size % 8 == 0, "item_size must be divisible by 8");
++  TORCH_CHECK(head_num > 0, "head_num must be positive");
++  TORCH_CHECK(item_size % head_num == 0, "item_size must be divisible by head_num");
++  TORCH_CHECK((item_size / head_num) % 8 == 0, "per-head item size must be divisible by 8");
++  TORCH_CHECK(sgs_per_wg > 0, "sgs_per_wg must be positive");
++  check_indices(src_indices, dst_indices);
++
++  const int64_t num_items = src_indices.numel();
++  if (num_items == 0) return;  // nothing to transfer; avoids div-by-zero below
++
++  const int64_t effective_bq = block_quota > 0 ? block_quota : 16;
++  const int64_t total_sgs = effective_bq * sgs_per_wg;
++  const int64_t items_per_sg = div_up(num_items, total_sgs);
++  const int64_t num_wgs = div_up(num_items, items_per_sg * sgs_per_wg);
++  const int64_t wg_size = sgs_per_wg * XPU_SG_SIZE;
++
++  TransferKVPageHeadKernel<IsLfToPh> kernel{
++      .src_k_base_ = static_cast<const char*>(src_k),
++      .dst_k_base_ = static_cast<char*>(dst_k),
++      .src_v_base_ = static_cast<const char*>(src_v),
++      .dst_v_base_ = static_cast<char*>(dst_v),
++      .src_k_tbl_ = src_k_tbl,
++      .dst_k_tbl_ = dst_k_tbl,
++      .src_v_tbl_ = src_v_tbl,
++      .dst_v_tbl_ = dst_v_tbl,
++      .src_indices_ = src_indices.data_ptr<int64_t>(),
++      .dst_indices_ = dst_indices.data_ptr<int64_t>(),
++      .start_layer_ = start_layer,
++      .num_layers_ = num_layers,
++      .num_items_ = num_items,
++      .items_per_sg_ = items_per_sg,
++      .item_size_ = item_size,
++      .src_layout_dim_ = src_layout_dim,
++      .dst_layout_dim_ = dst_layout_dim,
++      .page_size_ = page_size,
++      .head_num_ = head_num,
++  };
++
++  auto cgf = DPCPP_Q_CGF(cgh) {
++    cgh.parallel_for<decltype(kernel)>(
++        sycl::nd_range<1>(
++            sycl::range<1>(static_cast<size_t>(num_wgs * wg_size)), sycl::range<1>(static_cast<size_t>(wg_size))),
++        kernel);
++  };
++  dpcppGetCurrentQueue().submit(cgf);
++}
++
++// ---------------------------------------------------------------------------
++// Public API
++// ---------------------------------------------------------------------------
++
++// Single-layer, lf→lf, K+V.
++void transfer_kv_per_layer(
++    const at::Tensor& src_k,
++    at::Tensor& dst_k,
++    const at::Tensor& src_v,
++    at::Tensor& dst_v,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t item_size,
++    int64_t block_quota,
++    int64_t sgs_per_wg) {
++  launch_transfer_kv<false>(
++      src_k.data_ptr(),
++      dst_k.data_ptr(),
++      src_v.data_ptr(),
++      dst_v.data_ptr(),
++      nullptr,
++      nullptr,
++      nullptr,
++      nullptr,
++      src_indices,
++      dst_indices,
++      0,
++      1,
++      item_size,
++      block_quota,
++      sgs_per_wg);
++}
++
++// Single-layer, lf→lf, K only (MLA).
++void transfer_kv_per_layer_mla(
++    const at::Tensor& src,
++    at::Tensor& dst,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t item_size,
++    int64_t block_quota,
++    int64_t sgs_per_wg) {
++  launch_transfer_kv<true>(
++      src.data_ptr(),
++      dst.data_ptr(),
++      nullptr,
++      nullptr,
++      nullptr,
++      nullptr,
++      nullptr,
++      nullptr,
++      src_indices,
++      dst_indices,
++      0,
++      1,
++      item_size,
++      block_quota,
++      sgs_per_wg);
++}
++
++// All-layers, lf_tbl→lf_tbl, K+V.
++void transfer_kv_all_layer(
++    const at::Tensor& src_k_layers,
++    const at::Tensor& dst_k_layers,
++    const at::Tensor& src_v_layers,
++    const at::Tensor& dst_v_layers,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t item_size,
++    int64_t num_layers,
++    int64_t block_quota,
++    int64_t sgs_per_wg) {
++  check_layer_ptr_table(src_k_layers, num_layers, "src_k_layers");
++  check_layer_ptr_table(dst_k_layers, num_layers, "dst_k_layers");
++  check_layer_ptr_table(src_v_layers, num_layers, "src_v_layers");
++  check_layer_ptr_table(dst_v_layers, num_layers, "dst_v_layers");
++  launch_transfer_kv<false>(
++      nullptr,
++      nullptr,
++      nullptr,
++      nullptr,
++      src_k_layers.data_ptr<uintptr_t>(),
++      dst_k_layers.data_ptr<uintptr_t>(),
++      src_v_layers.data_ptr<uintptr_t>(),
++      dst_v_layers.data_ptr<uintptr_t>(),
++      src_indices,
++      dst_indices,
++      0,
++      num_layers,
++      item_size,
++      block_quota,
++      sgs_per_wg);
++}
++
++// All-layers, lf_tbl→lf_tbl, K only (MLA).
++void transfer_kv_all_layer_mla(
++    const at::Tensor& src_layers,
++    const at::Tensor& dst_layers,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t item_size,
++    int64_t num_layers,
++    int64_t block_quota,
++    int64_t sgs_per_wg) {
++  check_layer_ptr_table(src_layers, num_layers, "src_layers");
++  check_layer_ptr_table(dst_layers, num_layers, "dst_layers");
++  launch_transfer_kv<true>(
++      nullptr,
++      nullptr,
++      nullptr,
++      nullptr,
++      src_layers.data_ptr<uintptr_t>(),
++      dst_layers.data_ptr<uintptr_t>(),
++      nullptr,
++      nullptr,
++      src_indices,
++      dst_indices,
++      0,
++      num_layers,
++      item_size,
++      block_quota,
++      sgs_per_wg);
++}
++
++// All-layers, lf_tbl→ph (page-head destination).
++void transfer_kv_all_layer_lf_ph(
++    const at::Tensor& src_k_layers,
++    at::Tensor& dst_k,
++    const at::Tensor& src_v_layers,
++    at::Tensor& dst_v,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t item_size,
++    int64_t dst_layout_dim,
++    int64_t num_layers,
++    int64_t page_size,
++    int64_t head_num,
++    int64_t block_quota,
++    int64_t sgs_per_wg) {
++  check_layer_ptr_table(src_k_layers, num_layers, "src_k_layers");
++  check_layer_ptr_table(src_v_layers, num_layers, "src_v_layers");
++  launch_transfer_kv_page_head<true>(
++      nullptr,
++      dst_k.data_ptr(),
++      nullptr,
++      dst_v.data_ptr(),
++      src_k_layers.data_ptr<uintptr_t>(),
++      nullptr,
++      src_v_layers.data_ptr<uintptr_t>(),
++      nullptr,
++      src_indices,
++      dst_indices,
++      num_layers,
++      item_size,
++      0,
++      dst_layout_dim,
++      page_size,
++      head_num,
++      block_quota,
++      sgs_per_wg);
++}
++
++// Single-layer, ph→lf.
++// layer_id: which layer slot to read from the page-head source layout.
++// dst_k/dst_v already point to the correct layer's contiguous buffer.
++void transfer_kv_per_layer_ph_lf(
++    const at::Tensor& src_k,
++    at::Tensor& dst_k,
++    const at::Tensor& src_v,
++    at::Tensor& dst_v,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t layer_id,
++    int64_t item_size,
++    int64_t src_layout_dim,
++    int64_t page_size,
++    int64_t head_num,
++    int64_t block_quota,
++    int64_t sgs_per_wg) {
++  // We launch with start_layer=layer_id, num_layers=1 so the ph offset
++  // function reads the correct layer slot from the source.
++  launch_transfer_kv_page_head<false>(
++      src_k.data_ptr(),
++      dst_k.data_ptr(),
++      src_v.data_ptr(),
++      dst_v.data_ptr(),
++      nullptr,
++      nullptr,
++      nullptr,
++      nullptr,
++      src_indices,
++      dst_indices,
++      1,
++      item_size,
++      src_layout_dim,
++      0,
++      page_size,
++      head_num,
++      block_quota,
++      sgs_per_wg,
++      layer_id);
++}
++
++// Single-layer, pf→lf, K+V.
++// src_k/src_v are the page-first pool base pointers; layer_id selects the layer
++// slot within each page.  dst_k/dst_v are the contiguous per-layer buffers.
++void transfer_kv_per_layer_pf_lf(
++    const at::Tensor& src_k,
++    at::Tensor& dst_k,
++    const at::Tensor& src_v,
++    at::Tensor& dst_v,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t layer_id,
++    int64_t item_size,
++    int64_t src_layout_dim,
++    int64_t block_quota,
++    int64_t sgs_per_wg) {
++  launch_transfer_kv_page_first<false, true>(
++      src_k.data_ptr(),
++      dst_k.data_ptr(),
++      src_v.data_ptr(),
++      dst_v.data_ptr(),
++      nullptr,
++      nullptr,
++      nullptr,
++      nullptr,
++      src_indices,
++      dst_indices,
++      layer_id,
++      1,
++      item_size,
++      src_layout_dim,
++      0,
++      block_quota,
++      sgs_per_wg);
++}
++
++// All-layers, lf_tbl→pf, K+V.
++void transfer_kv_all_layer_lf_pf(
++    const at::Tensor& src_k_layers,
++    at::Tensor& dst_k,
++    const at::Tensor& src_v_layers,
++    at::Tensor& dst_v,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t item_size,
++    int64_t dst_layout_dim,
++    int64_t num_layers,
++    int64_t block_quota,
++    int64_t sgs_per_wg) {
++  check_layer_ptr_table(src_k_layers, num_layers, "src_k_layers");
++  check_layer_ptr_table(src_v_layers, num_layers, "src_v_layers");
++  launch_transfer_kv_page_first<false, false>(
++      nullptr,
++      dst_k.data_ptr(),
++      nullptr,
++      dst_v.data_ptr(),
++      src_k_layers.data_ptr<uintptr_t>(),
++      nullptr,
++      src_v_layers.data_ptr<uintptr_t>(),
++      nullptr,
++      src_indices,
++      dst_indices,
++      0,
++      num_layers,
++      item_size,
++      0,
++      dst_layout_dim,
++      block_quota,
++      sgs_per_wg);
++}
++
++// Single-layer, pf→lf, K only (MLA).
++void transfer_kv_per_layer_mla_pf_lf(
++    const at::Tensor& src,
++    at::Tensor& dst,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t layer_id,
++    int64_t item_size,
++    int64_t src_layout_dim,
++    int64_t block_quota,
++    int64_t sgs_per_wg) {
++  launch_transfer_kv_page_first<true, true>(
++      src.data_ptr(),
++      dst.data_ptr(),
++      nullptr,
++      nullptr,
++      nullptr,
++      nullptr,
++      nullptr,
++      nullptr,
++      src_indices,
++      dst_indices,
++      layer_id,
++      1,
++      item_size,
++      src_layout_dim,
++      0,
++      block_quota,
++      sgs_per_wg);
++}
++
++// All-layers, lf_tbl→pf, K only (MLA).
++void transfer_kv_all_layer_mla_lf_pf(
++    const at::Tensor& src_layers,
++    at::Tensor& dst,
++    const at::Tensor& src_indices,
++    const at::Tensor& dst_indices,
++    int64_t item_size,
++    int64_t dst_layout_dim,
++    int64_t num_layers,
++    int64_t block_quota,
++    int64_t sgs_per_wg) {
++  check_layer_ptr_table(src_layers, num_layers, "src_layers");
++  launch_transfer_kv_page_first<true, false>(
++      nullptr,
++      dst.data_ptr(),
++      nullptr,
++      nullptr,
++      src_layers.data_ptr<uintptr_t>(),
++      nullptr,
++      nullptr,
++      nullptr,
++      src_indices,
++      dst_indices,
++      0,
++      num_layers,
++      item_size,
++      0,
++      dst_layout_dim,
++      block_quota,
++      sgs_per_wg);
++}
 diff --git a/src/sycl/Utils.h b/src/sycl/Utils.h
-index b688fe5..600f088 100644
+index b688fe552091ef72a95bf61d1883ff5861b40335..600f088146c402bab972478837cb5662e15ae8b8 100644
 --- a/src/sycl/Utils.h
 +++ b/src/sycl/Utils.h
 @@ -323,6 +323,15 @@ inline T div_up(T x, T y) {
@@ -7414,7 +9600,7 @@ index b688fe5..600f088 100644
    if (a <= 1) return 1;
    return 1 << (32 - __builtin_clz(a - 1));
 diff --git a/src/sycl/flash_attention.cpp b/src/sycl/flash_attention.cpp
-index da46c08..0092a07 100644
+index da46c086ed8f418811dae0a67e53cf7acf127016..0092a0796fec20d787290668e785af5316714202 100644
 --- a/src/sycl/flash_attention.cpp
 +++ b/src/sycl/flash_attention.cpp
 @@ -35,89 +35,205 @@
@@ -8379,7 +10565,7 @@ index da46c08..0092a07 100644
          v,
 diff --git a/src/sycl/kernels/chunk_prefill/chunk_prefill_runner.hpp b/src/sycl/kernels/chunk_prefill/chunk_prefill_runner.hpp
 deleted file mode 100644
-index 7f8d286..0000000
+index 7f8d28630895ba069a6dc087fa2a575dd5299f0e..0000000000000000000000000000000000000000
 --- a/src/sycl/kernels/chunk_prefill/chunk_prefill_runner.hpp
 +++ /dev/null
 @@ -1,904 +0,0 @@
@@ -9289,7 +11475,7 @@ index 7f8d286..0000000
 -}  // namespace chunkprefill
 diff --git a/src/sycl/kernels/chunk_prefill/tile_scheduler_chunk_prefill.hpp b/src/sycl/kernels/chunk_prefill/tile_scheduler_chunk_prefill.hpp
 deleted file mode 100644
-index 823c5a3..0000000
+index 823c5a3db1635c02b844d78d6f22826d0a7618bf..0000000000000000000000000000000000000000
 --- a/src/sycl/kernels/chunk_prefill/tile_scheduler_chunk_prefill.hpp
 +++ /dev/null
 @@ -1,222 +0,0 @@
@@ -9517,7 +11703,7 @@ index 823c5a3..0000000
 -}  // namespace cutlass::flash_attention
 diff --git a/src/sycl/kernels/chunk_prefill/xe_chunk_prefill.hpp b/src/sycl/kernels/chunk_prefill/xe_chunk_prefill.hpp
 deleted file mode 100644
-index 8be1629..0000000
+index 8be16294d3906a6c30173fdde9e6abd5a0db973d..0000000000000000000000000000000000000000
 --- a/src/sycl/kernels/chunk_prefill/xe_chunk_prefill.hpp
 +++ /dev/null
 @@ -1,592 +0,0 @@
@@ -10115,7 +12301,7 @@ index 8be1629..0000000
 -}  // namespace cutlass::flash_attention::kernel
 diff --git a/src/sycl/kernels/chunk_prefill/xe_flash_attn_chunk_prefill_epilogue.hpp b/src/sycl/kernels/chunk_prefill/xe_flash_attn_chunk_prefill_epilogue.hpp
 deleted file mode 100644
-index 6f3d9db..0000000
+index 6f3d9dbc10d555164525abf908ac57b97cfedc98..0000000000000000000000000000000000000000
 --- a/src/sycl/kernels/chunk_prefill/xe_flash_attn_chunk_prefill_epilogue.hpp
 +++ /dev/null
 @@ -1,324 +0,0 @@
@@ -10445,7 +12631,7 @@ index 6f3d9db..0000000
 -/////////////////////////////////////////////////////////////////////////////////////////////////
 diff --git a/src/sycl/kernels/chunk_prefill/xe_flash_attn_chunk_prefill_mma.hpp b/src/sycl/kernels/chunk_prefill/xe_flash_attn_chunk_prefill_mma.hpp
 deleted file mode 100644
-index c622d65..0000000
+index c622d65866ebbd42c7f2eff969098c517e804a7a..0000000000000000000000000000000000000000
 --- a/src/sycl/kernels/chunk_prefill/xe_flash_attn_chunk_prefill_mma.hpp
 +++ /dev/null
 @@ -1,511 +0,0 @@
@@ -10962,7 +13148,7 @@ index c622d65..0000000
 -/////////////////////////////////////////////////////////////////////////////////////////////////
 diff --git a/src/sycl/kernels/chunk_prefill/xe_flash_attn_chunk_prefill_softmax_epilogue.hpp b/src/sycl/kernels/chunk_prefill/xe_flash_attn_chunk_prefill_softmax_epilogue.hpp
 deleted file mode 100644
-index ab918ca..0000000
+index ab918ca40827bef7d9b581906d8f33eb84e257db..0000000000000000000000000000000000000000
 --- a/src/sycl/kernels/chunk_prefill/xe_flash_attn_chunk_prefill_softmax_epilogue.hpp
 +++ /dev/null
 @@ -1,208 +0,0 @@
@@ -11175,7 +13361,7 @@ index ab918ca..0000000
 -
 -/////////////////////////////////////////////////////////////////////////////////////////////////
 diff --git a/src/sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp b/src/sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp
-index a87a450..088302d 100644
+index a87a450255a3072e2700582b807aa2833fb6f5ae..088302d417c3bdcf1aca862d05aa56de45b767ab 100644
 --- a/src/sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp
 +++ b/src/sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp
 @@ -43,7 +43,6 @@ struct VariableLength {
@@ -11187,7 +13373,7 @@ index a87a450..088302d 100644
      return max_length;
    }
 diff --git a/src/sycl/kernels/flash_attention_v2/collective/xe_fmha_fwd_epilogue.hpp b/src/sycl/kernels/flash_attention_v2/collective/xe_fmha_fwd_epilogue.hpp
-index df0698a..bf3a6d0 100644
+index df0698a1abeb8f0ce03d5a5795a568e4ab568e41..bf3a6d057956606e17dbb6a5897bc25c68f03d35 100644
 --- a/src/sycl/kernels/flash_attention_v2/collective/xe_fmha_fwd_epilogue.hpp
 +++ b/src/sycl/kernels/flash_attention_v2/collective/xe_fmha_fwd_epilogue.hpp
 @@ -40,6 +40,7 @@
@@ -11351,7 +13537,7 @@ index df0698a..bf3a6d0 100644
      }
  
 diff --git a/src/sycl/kernels/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp b/src/sycl/kernels/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp
-index 89b1f0d..2509dcb 100644
+index 89b1f0d605019215dd1f9ccd3e3a796b405e7805..2509dcbf7b4f2283d2617f04ee47419f0dea968d 100644
 --- a/src/sycl/kernels/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp
 +++ b/src/sycl/kernels/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp
 @@ -70,7 +70,12 @@ template <
@@ -11409,7 +13595,7 @@ index 89b1f0d..2509dcb 100644
            bool right_mask = col_idx > row_kv_idx + params.window_size_right;
            if (left_mask || right_mask) {
 diff --git a/src/sycl/kernels/flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp b/src/sycl/kernels/flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp
-index 03ca4e8..1056967 100644
+index 03ca4e8b394e85313dfb222992a4a15bfe16c2fb..1056967b4eedeaa55fb0554e5099c20220b22e34 100644
 --- a/src/sycl/kernels/flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp
 +++ b/src/sycl/kernels/flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp
 @@ -65,7 +65,13 @@ template <
@@ -11631,7 +13817,7 @@ index 03ca4e8..1056967 100644
        int head_q_start = head * head_group_q;
  
 diff --git a/src/sycl/kernels/flash_attention_v2/kernel/xe_reduce_split_k.hpp b/src/sycl/kernels/flash_attention_v2/kernel/xe_reduce_split_k.hpp
-index 91a8b44..d23a2ce 100644
+index 91a8b44d1e89720a0b5c63e06477e7958182e80e..d23a2ce13d6d8d55e262f5b0cb6b1a6aebe2f99a 100644
 --- a/src/sycl/kernels/flash_attention_v2/kernel/xe_reduce_split_k.hpp
 +++ b/src/sycl/kernels/flash_attention_v2/kernel/xe_reduce_split_k.hpp
 @@ -94,6 +94,9 @@ class ReduceSplitK {
@@ -11654,7 +13840,7 @@ index 91a8b44..d23a2ce 100644
        auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
        auto [seq_len_qo, seq_len_kv] = sequence_length_shape;
 diff --git a/src/sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp b/src/sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp
-index 5f94a64..235ad7c 100644
+index 5f94a646aab6320ab440b13f081306aad6c136bb..235ad7c1e4366ecca03ca3edec137be5ed1ba1fa 100644
 --- a/src/sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp
 +++ b/src/sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp
 @@ -98,4 +98,83 @@ EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(512)
@@ -11742,7 +13928,7 @@ index 5f94a64..235ad7c 100644
 +
  }  // namespace decode
 diff --git a/src/sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp b/src/sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp
-index fc4d2db..c2c7b5d 100644
+index fc4d2db4b1cf21938913778110f8e7c6262f9471..c2c7b5df57913f1857ce941625eeba43fc8dd62d 100644
 --- a/src/sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp
 +++ b/src/sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp
 @@ -187,6 +187,11 @@ struct Arguments {
@@ -11890,7 +14076,7 @@ index fc4d2db..c2c7b5d 100644
  
  template <
 diff --git a/src/sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_dispatch.hpp b/src/sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_dispatch.hpp
-index c992108..58ced28 100644
+index c9921085cd57289a3ff5f8702a5db5995551de84..58ced287be7f0af22cd2bcdd7a406fab26794287 100644
 --- a/src/sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_dispatch.hpp
 +++ b/src/sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_dispatch.hpp
 @@ -52,4 +52,10 @@ EXTERN_FMHA_PREFILL_RUNNER(512)
@@ -11905,7 +14091,7 @@ index c992108..58ced28 100644
 +
  }  // namespace prefill
 diff --git a/src/sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp b/src/sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp
-index 7105f65..28dd124 100644
+index 7105f659585996bf4a35df81da898f18974f3574..28dd12430c2bde8847b97134a2b64199ac2a3f4e 100644
 --- a/src/sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp
 +++ b/src/sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp
 @@ -170,6 +170,11 @@ struct Arguments {
@@ -11961,7 +14147,7 @@ index 7105f65..28dd124 100644
  
  // Struct functor for prefill kernel dispatch.
 diff --git a/src/sycl/merge_states.cpp b/src/sycl/merge_states.cpp
-index 910b1d6..f40aaee 100644
+index 910b1d6b5e24da65e615ca9ea8cf1bbdfa6a278f..f40aaee52e9d5cebf5cde30a3b7696a8a2daa760 100644
 --- a/src/sycl/merge_states.cpp
 +++ b/src/sycl/merge_states.cpp
 @@ -171,6 +171,127 @@ void merge_attn_states_sycl(
@@ -12158,7 +14344,7 @@ index 910b1d6..f40aaee 100644
 +  SYCL_DISPATCH_BY_SCALAR_DTYPE(v_merged.dtype(), CALL_MERGE_STATE_LAUNCHER_SYCL);
 +}
 diff --git a/src/sycl/per_tensor_quant_fp8.cpp b/src/sycl/per_tensor_quant_fp8.cpp
-index 67daca1..52542c3 100644
+index 67daca1de63223625eb8a1571ae918861ba6bae3..52542c30a99100529cbbc3900c1d26453977cdae 100644
 --- a/src/sycl/per_tensor_quant_fp8.cpp
 +++ b/src/sycl/per_tensor_quant_fp8.cpp
 @@ -182,7 +182,9 @@ void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor
@@ -12173,7 +14359,7 @@ index 67daca1..52542c3 100644
      auto kernel = PerTensorQuantFP8Kernel<T, DST_DTYPE, VEC_SIZE>(                      \
          static_cast<T*>(input.data_ptr()),                                              \
 diff --git a/src/sycl/xe_fmha_fwd_decode_kernel.cpp.in b/src/sycl/xe_fmha_fwd_decode_kernel.cpp.in
-index 25adf61..f91d788 100644
+index 25adf61d762eb3b323a8337bda2463bc2e200243..f91d788447da11f7f24d01cddf054ca01f892229 100644
 --- a/src/sycl/xe_fmha_fwd_decode_kernel.cpp.in
 +++ b/src/sycl/xe_fmha_fwd_decode_kernel.cpp.in
 @@ -37,8 +37,45 @@
@@ -12252,7 +14438,7 @@ index 25adf61..f91d788 100644
  
  }  // namespace decode
 diff --git a/src/sycl/xe_fmha_fwd_prefill_kernel.cpp.in b/src/sycl/xe_fmha_fwd_prefill_kernel.cpp.in
-index 1305225..d296966 100644
+index 13052259e8177c4ef148387c74ca7349148246a4..d29696694a4c9d96cfc64835d1bf55b21004c5c6 100644
 --- a/src/sycl/xe_fmha_fwd_prefill_kernel.cpp.in
 +++ b/src/sycl/xe_fmha_fwd_prefill_kernel.cpp.in
 @@ -36,8 +36,47 @@
@@ -12338,7 +14524,7 @@ index 1305225..d296966 100644
  
  }  // namespace prefill
 diff --git a/src/sycl/xe_fmha_fwd_split_decode_kernel.cpp.in b/src/sycl/xe_fmha_fwd_split_decode_kernel.cpp.in
-index 5cadeb5..99a154f 100644
+index 5cadeb59908f97221a9893f51adda1db0a4bc122..99a154f06bea9863e8a15259378bb46de49b3de8 100644
 --- a/src/sycl/xe_fmha_fwd_split_decode_kernel.cpp.in
 +++ b/src/sycl/xe_fmha_fwd_split_decode_kernel.cpp.in
 @@ -37,6 +37,17 @@
@@ -12387,10 +14573,80 @@ index 5cadeb5..99a154f 100644
  
  }  // namespace decode
 diff --git a/src/torch_extension_sycl.cc b/src/torch_extension_sycl.cc
-index 06f702b..6f7cc45 100644
+index 06f702bab044a8ff3988fd0c927cda94e1812b08..d55c83892beeb543b7a82c5f61117eb076665037 100644
 --- a/src/torch_extension_sycl.cc
 +++ b/src/torch_extension_sycl.cc
-@@ -110,6 +110,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+@@ -73,6 +73,69 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+       "Tensor indices) -> ()");
+   m.impl("store_cache", torch::kXPU, &at::native::xpu::store_cache);
+ 
++  // KV cache transfer ops
++  m.def(
++      "transfer_kv_per_layer(Tensor src_k, Tensor(a!) dst_k, Tensor src_v, Tensor(b!) dst_v, "
++      "Tensor src_indices, Tensor dst_indices, int item_size, int block_quota, int sgs_per_wg) -> ()");
++  m.impl("transfer_kv_per_layer", torch::kXPU, &transfer_kv_per_layer);
++
++  m.def(
++      "transfer_kv_per_layer_mla(Tensor src, Tensor(a!) dst, "
++      "Tensor src_indices, Tensor dst_indices, int item_size, int block_quota, int sgs_per_wg) -> ()");
++  m.impl("transfer_kv_per_layer_mla", torch::kXPU, &transfer_kv_per_layer_mla);
++
++  m.def(
++      "transfer_kv_all_layer(Tensor src_k_layers, Tensor(a!) dst_k_layers, "
++      "Tensor src_v_layers, Tensor(b!) dst_v_layers, "
++      "Tensor src_indices, Tensor dst_indices, int item_size, int num_layers, "
++      "int block_quota, int sgs_per_wg) -> ()");
++  m.impl("transfer_kv_all_layer", torch::kXPU, &transfer_kv_all_layer);
++
++  m.def(
++      "transfer_kv_all_layer_mla(Tensor src_layers, Tensor(a!) dst_layers, "
++      "Tensor src_indices, Tensor dst_indices, int item_size, int num_layers, "
++      "int block_quota, int sgs_per_wg) -> ()");
++  m.impl("transfer_kv_all_layer_mla", torch::kXPU, &transfer_kv_all_layer_mla);
++
++  m.def(
++      "transfer_kv_all_layer_lf_ph(Tensor src_k_layers, Tensor(a!) dst_k, "
++      "Tensor src_v_layers, Tensor(b!) dst_v, "
++      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, "
++      "int num_layers, int page_size, int head_num, int block_quota, int sgs_per_wg) -> ()");
++  m.impl("transfer_kv_all_layer_lf_ph", torch::kXPU, &transfer_kv_all_layer_lf_ph);
++
++  m.def(
++      "transfer_kv_per_layer_ph_lf(Tensor src_k, Tensor(a!) dst_k, "
++      "Tensor src_v, Tensor(b!) dst_v, "
++      "Tensor src_indices, Tensor dst_indices, int layer_id, int item_size, int src_layout_dim, "
++      "int page_size, int head_num, int block_quota, int sgs_per_wg) -> ()");
++  m.impl("transfer_kv_per_layer_ph_lf", torch::kXPU, &transfer_kv_per_layer_ph_lf);
++
++  m.def(
++      "transfer_kv_per_layer_pf_lf(Tensor src_k, Tensor(a!) dst_k, Tensor src_v, Tensor(b!) dst_v, "
++      "Tensor src_indices, Tensor dst_indices, int layer_id, int item_size, int src_layout_dim, "
++      "int block_quota, int sgs_per_wg) -> ()");
++  m.impl("transfer_kv_per_layer_pf_lf", torch::kXPU, &transfer_kv_per_layer_pf_lf);
++
++  m.def(
++      "transfer_kv_all_layer_lf_pf(Tensor src_k_layers, Tensor(a!) dst_k, "
++      "Tensor src_v_layers, Tensor(b!) dst_v, "
++      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, "
++      "int num_layers, int block_quota, int sgs_per_wg) -> ()");
++  m.impl("transfer_kv_all_layer_lf_pf", torch::kXPU, &transfer_kv_all_layer_lf_pf);
++
++  m.def(
++      "transfer_kv_per_layer_mla_pf_lf(Tensor src, Tensor(a!) dst, "
++      "Tensor src_indices, Tensor dst_indices, int layer_id, int item_size, int src_layout_dim, "
++      "int block_quota, int sgs_per_wg) -> ()");
++  m.impl("transfer_kv_per_layer_mla_pf_lf", torch::kXPU, &transfer_kv_per_layer_mla_pf_lf);
++
++  m.def(
++      "transfer_kv_all_layer_mla_lf_pf(Tensor src_layers, Tensor(a!) dst, "
++      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, "
++      "int num_layers, int block_quota, int sgs_per_wg) -> ()");
++  m.impl("transfer_kv_all_layer_mla_lf_pf", torch::kXPU, &transfer_kv_all_layer_mla_lf_pf);
++
+   m.def("moe_sum_reduce(Tensor input, Tensor output, float routed_scaling_factor) -> ()");
+   m.impl("moe_sum_reduce", torch::kXPU, &moe_sum_reduce);
+   m.def(
+@@ -110,6 +173,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
  
    m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
    m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
@@ -12399,7 +14655,7 @@ index 06f702b..6f7cc45 100644
    /*
     * From cutlass attention
     */
-@@ -213,6 +215,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+@@ -213,6 +278,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
        "int hc_mult, int sinkhorn_iters, float eps) -> ()");
    m.impl("hc_split_sinkhorn", torch::kXPU, &hc_split_sinkhorn);
  
@@ -12416,7 +14672,7 @@ index 06f702b..6f7cc45 100644
     * From LoRA
     */
 diff --git a/tests/conftest.py b/tests/conftest.py
-index 4aae7ff..9caae54 100644
+index 4aae7ffbbd09d7d98cceb30b999b4e4bba6d549b..9caae54b682a1f4a92f383d839b52595abec4578 100644
 --- a/tests/conftest.py
 +++ b/tests/conftest.py
 @@ -12,3 +12,14 @@ def reset_torch_defaults():
@@ -12435,7 +14691,7 @@ index 4aae7ff..9caae54 100644
 +    if torch.xpu.is_available():
 +        torch.xpu.empty_cache()
 diff --git a/tests/run_suite.py b/tests/run_suite.py
-index f2be93e..c4f3cc0 100644
+index f2be93e6f6aa51cabe871d76b6026a66e2cd9c09..c4f3cc0379ab9c1ae81ae9a7690cf261b29a54fb 100644
 --- a/tests/run_suite.py
 +++ b/tests/run_suite.py
 @@ -18,6 +18,7 @@ suites = {
@@ -12463,7 +14719,7 @@ index f2be93e..c4f3cc0 100644
          TestFile("test_store_cache_xpu.py"),
      ],
 diff --git a/tests/test_awq_dequant.py b/tests/test_awq_dequant.py
-index da58fae..7ca4c11 100644
+index da58fae920cdf417f5a7f274d5927cbf835ff214..7ca4c113a332f6368c04a480b5981e32f6cae080 100644
 --- a/tests/test_awq_dequant.py
 +++ b/tests/test_awq_dequant.py
 @@ -69,13 +69,18 @@ def sglang_awq_dequantize(
@@ -12489,7 +14745,7 @@ index da58fae..7ca4c11 100644
  def test_awq_dequant_compare_implementations(
      qweight_row: int, qweight_col: int, is_bf16_act: bool
 diff --git a/tests/test_flash_attention.py b/tests/test_flash_attention.py
-index f05eaa7..0d3a493 100644
+index f05eaa71343b90e7da08a16b264d71f37420e7fd..0d3a4934942684d41706bb02b911ecb68f3a50f5 100644
 --- a/tests/test_flash_attention.py
 +++ b/tests/test_flash_attention.py
 @@ -478,7 +478,7 @@ def generate_qkv(
@@ -13072,7 +15328,7 @@ index f05eaa7..0d3a493 100644
          dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
          print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
 diff --git a/tests/test_flash_attn_sparse.py b/tests/test_flash_attn_sparse.py
-index 7b29488..e433860 100644
+index 7b2948870186abc0c9e595dd3637aef6aac94dab..e433860a6227cc669c224261f2e90ae900ac9756 100644
 --- a/tests/test_flash_attn_sparse.py
 +++ b/tests/test_flash_attn_sparse.py
 @@ -269,7 +269,6 @@ def test_sparse_attention(
@@ -13176,7 +15432,7 @@ index 7b29488..e433860 100644
  # skip cause use fa2 for test
 diff --git a/tests/test_hc_pre_fuse.py b/tests/test_hc_pre_fuse.py
 new file mode 100644
-index 0000000..30baf52
+index 0000000000000000000000000000000000000000..30baf525079e52763ecfa05dd4b88e83cf91eec7
 --- /dev/null
 +++ b/tests/test_hc_pre_fuse.py
 @@ -0,0 +1,194 @@
@@ -13374,3 +15630,325 @@ index 0000000..30baf52
 +    assert torch.allclose(
 +        layer_input.float(), layer_input_ref, atol=atol_bf16, rtol=1e-2
 +    ), f"layer_input mismatch: max={(layer_input.float() - layer_input_ref).abs().max():.2e}"
+diff --git a/tests/test_kvcacheio.py b/tests/test_kvcacheio.py
+index 0220aad36dd00794488bff165975223b6ca0661c..8867785f9d4c0c8e8ec25c4ada5b224f831750ea 100644
+--- a/tests/test_kvcacheio.py
++++ b/tests/test_kvcacheio.py
+@@ -4,12 +4,16 @@ import utils
+ from sgl_kernel.kvcacheio import (
+     transfer_kv_all_layer,
+     transfer_kv_all_layer_direct_lf_pf,
++    transfer_kv_all_layer_lf_pf,
+     transfer_kv_all_layer_lf_ph,
+     transfer_kv_all_layer_mla,
++    transfer_kv_all_layer_mla_lf_pf,
+     transfer_kv_direct,
+     transfer_kv_per_layer,
+     transfer_kv_per_layer_direct_pf_lf,
+     transfer_kv_per_layer_mla,
++    transfer_kv_per_layer_mla_pf_lf,
++    transfer_kv_per_layer_pf_lf,
+ )
+ 
+ from sglang.srt.utils import is_hip
+@@ -36,6 +40,27 @@ def ref_copy_with_indices_pf_direct(
+             ][layer_id].to(dst_pool.device)
+ 
+ 
++def ref_copy_with_indices_pf(
++    src_pool, dst_pool, src_indices, dst_indices, layer_id, pf_to_lf=True
++):
++    """Reference for the page-first kernel layout.
++
++    pf pool is [num_tokens, num_layers, item_size] (per-token addressing:
++    base + token * (num_layers * item_size) + layer * item_size).
++    lf pool is [num_layers, num_tokens, item_size].
++    """
++    if pf_to_lf:
++        # src is pf [tokens, layers, item], dst is lf [layers, tokens, item]
++        dst_pool[layer_id][dst_indices] = src_pool[src_indices, layer_id].to(
++            dst_pool.device
++        )
++    else:
++        # src is lf [layers, tokens, item], dst is pf [tokens, layers, item]
++        dst_pool[dst_indices, layer_id] = src_pool[layer_id][src_indices].to(
++            dst_pool.device
++        )
++
++
+ def ref_copy_with_indices_page_head(
+     src_pool,
+     dst_pool,
+@@ -84,7 +109,7 @@ def test_transfer_kv(
+ 
+     original_dtype = torch.get_default_dtype()
+     torch.set_default_dtype(dtype)
+-    device = device
++
+     torch.manual_seed(42)
+ 
+     num_layers = 4  # A small number of layers for pool creation
+@@ -318,7 +343,7 @@ def test_transfer_kv_pf_direct(
+ ):
+     original_dtype = torch.get_default_dtype()
+     torch.set_default_dtype(dtype)
+-    device = device
++
+     torch.manual_seed(42)
+ 
+     num_layers = 4
+@@ -532,7 +557,7 @@ def test_transfer_kv_page_head(
+ ):
+     original_dtype = torch.get_default_dtype()
+     torch.set_default_dtype(dtype)
+-    device = device
++
+     torch.manual_seed(42)
+ 
+     num_layers = 4
+@@ -693,5 +718,245 @@ def test_transfer_kv_page_head(
+     torch.set_default_dtype(original_dtype)
+ 
+ 
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("num_items_to_transfer", [256, 1024])
++@pytest.mark.parametrize("page_size", [16, 64])
++@pytest.mark.parametrize("item_size", [256])
++@pytest.mark.parametrize("total_items_in_pool", [10240])
++@pytest.mark.parametrize("is_mla", [False, True])
++@pytest.mark.parametrize("lf_to_pf", [False, True])
++def test_transfer_kv_pf_kernel(
++    dtype: torch.dtype,
++    num_items_to_transfer: int,
++    page_size: int,
++    item_size: int,
++    total_items_in_pool: int,
++    is_mla: bool,
++    lf_to_pf: bool,
++):
++    """Device-kernel page-first transfers (transfer_kv_*_pf_lf / *_lf_pf).
++
++    pf pool layout is [num_tokens, num_layers, item_size]; lf pool is
++    [num_layers, num_tokens, item_size].  Validated against a pure-torch
++    reference (ref_copy_with_indices_pf).
++    """
++    original_dtype = torch.get_default_dtype()
++    torch.set_default_dtype(dtype)
++
++    torch.manual_seed(42)
++
++    num_layers = 4
++    layer_idx_to_test = 0
++    item_bytes = item_size * dtype.itemsize
++    layout_dim_bytes = item_size * num_layers * dtype.itemsize
++
++    total_pages_in_pool = total_items_in_pool // page_size
++    num_pages_to_transfer = num_items_to_transfer // page_size
++    if num_pages_to_transfer == 0:
++        torch.set_default_dtype(original_dtype)
++        return
++
++    page_indices = torch.randperm(total_pages_in_pool, dtype=torch.int64)
++    src_indices = torch.cat(
++        [
++            torch.arange(p * page_size, (p + 1) * page_size)
++            for p in page_indices[:num_pages_to_transfer]
++        ]
++    ).to(device)
++    dst_indices = torch.cat(
++        [
++            torch.arange(p * page_size, (p + 1) * page_size)
++            for p in page_indices[num_pages_to_transfer : 2 * num_pages_to_transfer]
++        ]
++    ).to(device)
++
++    def make_lf_tbl(pool):
++        return torch.tensor(
++            [pool[i].data_ptr() for i in range(num_layers)],
++            dtype=torch.uint64,
++            device=device,
++        )
++
++    if lf_to_pf:
++        # src lf [layers, tokens, item] -> dst pf [tokens, layers, item], all layers.
++        src_k = torch.randn(num_layers, total_items_in_pool, item_size).to(device)
++        dst_k_ref = torch.zeros(total_items_in_pool, num_layers, item_size).to(device)
++        dst_k_kernel = torch.zeros_like(dst_k_ref)
++        if is_mla:
++            torch.accelerator.synchronize()
++            transfer_kv_all_layer_mla_lf_pf(
++                make_lf_tbl(src_k),
++                dst_k_kernel,
++                src_indices,
++                dst_indices,
++                item_bytes,
++                layout_dim_bytes,
++                num_layers,
++            )
++            for i in range(num_layers):
++                ref_copy_with_indices_pf(
++                    src_k, dst_k_ref, src_indices, dst_indices, i, pf_to_lf=False
++                )
++            torch.accelerator.synchronize()
++            torch.testing.assert_close(dst_k_kernel, dst_k_ref)
++        else:
++            src_v = torch.randn(num_layers, total_items_in_pool, item_size).to(device)
++            dst_v_ref = torch.zeros_like(dst_k_ref)
++            dst_v_kernel = torch.zeros_like(dst_v_ref)
++            torch.accelerator.synchronize()
++            transfer_kv_all_layer_lf_pf(
++                make_lf_tbl(src_k),
++                dst_k_kernel,
++                make_lf_tbl(src_v),
++                dst_v_kernel,
++                src_indices,
++                dst_indices,
++                item_bytes,
++                layout_dim_bytes,
++                num_layers,
++            )
++            for i in range(num_layers):
++                ref_copy_with_indices_pf(
++                    src_k, dst_k_ref, src_indices, dst_indices, i, pf_to_lf=False
++                )
++                ref_copy_with_indices_pf(
++                    src_v, dst_v_ref, src_indices, dst_indices, i, pf_to_lf=False
++                )
++            torch.accelerator.synchronize()
++            torch.testing.assert_close(dst_k_kernel, dst_k_ref)
++            torch.testing.assert_close(dst_v_kernel, dst_v_ref)
++    else:
++        # src pf [tokens, layers, item] -> dst lf [layers, tokens, item], one layer.
++        src_k = torch.randn(total_items_in_pool, num_layers, item_size).to(device)
++        dst_k_ref = torch.zeros(num_layers, total_items_in_pool, item_size).to(device)
++        dst_k_kernel = torch.zeros_like(dst_k_ref)
++        if is_mla:
++            torch.accelerator.synchronize()
++            transfer_kv_per_layer_mla_pf_lf(
++                src_k,
++                dst_k_kernel[layer_idx_to_test],
++                src_indices,
++                dst_indices,
++                layer_idx_to_test,
++                item_bytes,
++                layout_dim_bytes,
++            )
++            ref_copy_with_indices_pf(
++                src_k, dst_k_ref, src_indices, dst_indices, layer_idx_to_test
++            )
++            torch.accelerator.synchronize()
++            torch.testing.assert_close(dst_k_kernel, dst_k_ref)
++        else:
++            src_v = torch.randn(total_items_in_pool, num_layers, item_size).to(device)
++            dst_v_ref = torch.zeros_like(dst_k_ref)
++            dst_v_kernel = torch.zeros_like(dst_v_ref)
++            torch.accelerator.synchronize()
++            transfer_kv_per_layer_pf_lf(
++                src_k,
++                dst_k_kernel[layer_idx_to_test],
++                src_v,
++                dst_v_kernel[layer_idx_to_test],
++                src_indices,
++                dst_indices,
++                layer_idx_to_test,
++                item_bytes,
++                layout_dim_bytes,
++            )
++            ref_copy_with_indices_pf(
++                src_k, dst_k_ref, src_indices, dst_indices, layer_idx_to_test
++            )
++            ref_copy_with_indices_pf(
++                src_v, dst_v_ref, src_indices, dst_indices, layer_idx_to_test
++            )
++            torch.accelerator.synchronize()
++            torch.testing.assert_close(dst_k_kernel, dst_k_ref)
++            torch.testing.assert_close(dst_v_kernel, dst_v_ref)
++    torch.set_default_dtype(original_dtype)
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++def test_transfer_kv_empty_indices(dtype: torch.dtype):
++    """Empty index tensors must be a no-op, not a div-by-zero crash.
++
++    Regression test: num_items==0 previously produced num_wgs = div_up(0, 0)
++    in the SYCL launcher and crashed the process with SIGFPE.
++    """
++    original_dtype = torch.get_default_dtype()
++    torch.set_default_dtype(dtype)
++
++    item_size = 256
++    src_k = torch.randn(16, item_size).to(device)
++    src_v = torch.randn(16, item_size).to(device)
++    dst_k = torch.zeros_like(src_k)
++    dst_v = torch.zeros_like(src_v)
++    empty = torch.empty(0, dtype=torch.int64, device=device)
++
++    transfer_kv_per_layer(
++        src_k, dst_k, src_v, dst_v, empty, empty, item_size * dtype.itemsize
++    )
++    transfer_kv_per_layer_mla(src_k, dst_k, empty, empty, item_size * dtype.itemsize)
++    torch.accelerator.synchronize()
++
++    # Destinations stay zero: nothing was transferred.
++    torch.testing.assert_close(dst_k, torch.zeros_like(dst_k))
++    torch.testing.assert_close(dst_v, torch.zeros_like(dst_v))
++    torch.set_default_dtype(original_dtype)
++
++
++def test_transfer_kv_rejects_invalid_index_metadata():
++    src = torch.zeros(8, 8, device=device)
++    dst = torch.zeros_like(src)
++    xpu_indices = torch.arange(4, dtype=torch.int64, device=device)
++
++    with pytest.raises(RuntimeError, match="src_indices must be an XPU tensor"):
++        transfer_kv_per_layer_mla(
++            src, dst, xpu_indices.cpu(), xpu_indices, item_size=32
++        )
++
++    noncontiguous = torch.arange(8, dtype=torch.int64, device=device).view(2, 4).t()
++    with pytest.raises(RuntimeError, match="src_indices must be contiguous"):
++        transfer_kv_per_layer_mla(
++            src, dst, noncontiguous, noncontiguous, item_size=32
++        )
++
++
++def test_transfer_kv_rejects_invalid_pointer_table():
++    indices = torch.arange(1, dtype=torch.int64, device=device)
++    pointer_table = torch.tensor([0], dtype=torch.uint64)
++
++    with pytest.raises(RuntimeError, match="src_layers must be an XPU tensor"):
++        transfer_kv_all_layer_mla(
++            pointer_table,
++            pointer_table.to(device),
++            indices,
++            indices,
++            item_size=8,
++            num_layers=1,
++        )
++
++
++def test_transfer_kv_page_head_rejects_unaligned_heads():
++    indices = torch.arange(1, dtype=torch.int64, device=device)
++    src = torch.zeros(1, 24, device=device)
++    ptrs = torch.tensor([src.data_ptr()], dtype=torch.uint64, device=device)
++    dst_k = torch.zeros(1, 2, 1, 1, 12).pin_memory()
++    dst_v = torch.zeros_like(dst_k).pin_memory()
++
++    with pytest.raises(RuntimeError, match="per-head item size must be divisible by 8"):
++        transfer_kv_all_layer_lf_ph(
++            ptrs,
++            dst_k,
++            ptrs,
++            dst_v,
++            indices,
++            indices,
++            item_size=24,
++            dst_layout_dim=24,
++            num_layers=1,
++            page_size=1,
++            head_num=2,
++        )
++
++
+ if __name__ == "__main__":
+     pytest.main([__file__])

@@ -109,6 +109,11 @@ _EXPORTS = [
     "esimd_gemm_fp8_pert",
     "esimd_gemm_int4_pgrp",
     "esimd_gemv_fp16",
+    "esimd_norm_add_norm_gemv_gelu_fp8",
+    "esimd_norm_gemv_norm_fp16",
+    "esimd_rmsnorm_gemv_fp8",
+    "esimd_dual_rmsnorm_residual_scalar",
+    "xpu_create_kv_indices",
     "esimd_norm_add_norm",
     "esimd_kv_scatter",
     "esimd_rmsnorm_residual_scalar",
@@ -116,6 +121,7 @@ _EXPORTS = [
     "onednn_fp8_gemm_w8a16",
     # v2-merged: FP8 MoE prefill + decode SDPA
     "moe_prefill_full_fp8",
+    "moe_prefill_full_fp8_gelu_tanh",
     "sglang_decode_attn",
     "sglang_decode_attn_temp_size",
     # Eagle ops
@@ -129,6 +135,8 @@ _EXPORTS = [
     "moe_accumulate",
     "moe_forward_fused",
     "moe_forward_full",
+    "moe_forward_full_gelu_tanh_decode",
+    "moe_forward_full_gelu_tanh_routed",
     # MoE INT4 Batch ops
     "moe_router_forward_int4",
     "moe_router_topk_int4",

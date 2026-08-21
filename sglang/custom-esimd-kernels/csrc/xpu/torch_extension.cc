@@ -206,6 +206,33 @@ TORCH_LIBRARY(custom_esimd_kernels_sglang, m) {
   m.def("esimd_gemv_fp16(Tensor input, Tensor weight, Tensor output) -> Tensor");
   m.impl("esimd_gemv_fp16", torch::kXPU, &esimd_gemv_fp16);
 
+  m.def("esimd_norm_gemv_norm_fp16(Tensor residual, Tensor scale_with_root, "
+        "Tensor proj_weight, Tensor pre_ff_weight, Tensor router_logits, "
+        "Tensor moe_input, float eps) -> ()");
+  m.impl("esimd_norm_gemv_norm_fp16", torch::kXPU, &esimd_norm_gemv_norm_fp16);
+
+  m.def("esimd_norm_add_norm_gemv_gelu_fp8(Tensor attention_output, "
+        "Tensor residual_input, Tensor post_attention_weight, "
+        "Tensor pre_feedforward_weight, Tensor gate_up_weight, "
+        "Tensor gate_up_scale, Tensor residual_output, "
+        "Tensor activation_output, float post_attention_eps, "
+        "float pre_feedforward_eps) -> ()");
+  m.impl("esimd_norm_add_norm_gemv_gelu_fp8", torch::kXPU,
+         &esimd_norm_add_norm_gemv_gelu_fp8);
+
+  m.def("esimd_rmsnorm_gemv_fp8(Tensor input, Tensor norm_weight, "
+        "Tensor gemv_weight, Tensor gemv_scale, Tensor output, float eps) "
+        "-> ()");
+  m.impl("esimd_rmsnorm_gemv_fp8", torch::kXPU,
+         &esimd_rmsnorm_gemv_fp8);
+
+  m.def("esimd_dual_rmsnorm_residual_scalar(Tensor x1, Tensor weight1, "
+        "Tensor x2, Tensor weight2, Tensor weight3, Tensor residual, "
+        "Tensor output, float eps1, float eps2, float eps3, float scalar) "
+        "-> ()");
+  m.impl("esimd_dual_rmsnorm_residual_scalar", torch::kXPU,
+         &esimd_dual_rmsnorm_residual_scalar);
+
   m.def("esimd_norm_add_norm(Tensor h2_raw, Tensor h1, Tensor w1, Tensor w2, "
         "Tensor out, float eps1, float eps2) -> ()");
   m.impl("esimd_norm_add_norm", torch::kXPU, &esimd_norm_add_norm);
@@ -213,6 +240,11 @@ TORCH_LIBRARY(custom_esimd_kernels_sglang, m) {
   m.def("esimd_kv_scatter(Tensor k, Tensor v, Tensor(a!) k_cache, "
         "Tensor(b!) v_cache, Tensor indices) -> ()");
   m.impl("esimd_kv_scatter", torch::kXPU, &esimd_kv_scatter);
+
+  m.def("xpu_create_kv_indices(Tensor req_to_token, Tensor req_pool_indices, "
+        "Tensor page_kernel_lens, Tensor kv_indptr, Tensor kv_start_idx, "
+        "Tensor(a!) kv_indices, int max_len, bool has_start) -> ()");
+  m.impl("xpu_create_kv_indices", torch::kXPU, &xpu_create_kv_indices);
 
   m.def("esimd_rmsnorm_residual_scalar(Tensor x, Tensor weight, Tensor residual, "
         "Tensor output, float eps, float scalar) -> Tensor");

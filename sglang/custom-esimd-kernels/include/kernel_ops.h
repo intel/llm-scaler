@@ -338,12 +338,37 @@ at::Tensor esimd_moe_gemm_fp8_pert(
 
 at::Tensor esimd_gemv_fp16(
     at::Tensor input, at::Tensor weight, at::Tensor output);
+void esimd_norm_gemv_norm_fp16(
+    at::Tensor residual, at::Tensor scale_with_root,
+    at::Tensor proj_weight, at::Tensor pre_ff_weight,
+    at::Tensor router_logits, at::Tensor moe_input, double eps);
+void esimd_norm_add_norm_gemv_gelu_fp8(
+    at::Tensor attention_output, at::Tensor residual_input,
+    at::Tensor post_attention_weight, at::Tensor pre_feedforward_weight,
+    at::Tensor gate_up_weight, at::Tensor gate_up_scale,
+    at::Tensor residual_output, at::Tensor activation_output,
+    double post_attention_eps, double pre_feedforward_eps);
+void esimd_rmsnorm_gemv_fp8(
+    at::Tensor input, at::Tensor norm_weight,
+    at::Tensor gemv_weight, at::Tensor gemv_scale,
+    at::Tensor output, double eps);
+void esimd_dual_rmsnorm_residual_scalar(
+    at::Tensor x1, at::Tensor weight1,
+    at::Tensor x2, at::Tensor weight2,
+    at::Tensor weight3, at::Tensor residual,
+    at::Tensor output, double eps1, double eps2,
+    double eps3, double scalar);
 void esimd_norm_add_norm(
     at::Tensor h2_raw, at::Tensor h1, at::Tensor w1, at::Tensor w2,
     at::Tensor out, double eps1, double eps2);
 void esimd_kv_scatter(
     at::Tensor k, at::Tensor v, at::Tensor k_cache, at::Tensor v_cache,
     at::Tensor indices);
+void xpu_create_kv_indices(
+    at::Tensor req_to_token, at::Tensor req_pool_indices,
+    at::Tensor page_kernel_lens, at::Tensor kv_indptr,
+    at::Tensor kv_start_idx, at::Tensor kv_indices,
+    int64_t max_len, bool has_start);
 at::Tensor esimd_rmsnorm_residual_scalar(
     at::Tensor x, at::Tensor weight, at::Tensor residual, at::Tensor output,
     double eps, double scalar);

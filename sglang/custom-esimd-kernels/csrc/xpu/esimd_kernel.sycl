@@ -7,6 +7,7 @@
 #include <sycl/sycl.hpp>
 
 #include "esimd_kernels/fp8_GEMV_v2.h"
+#include "esimd_kernels/dual_rmsnorm_residual_scalar.h"
 #include "esimd_kernels/qkv_split_norm_rope.h"
 #include "esimd_kernels/norm_gemv_fused.h"
 #include "esimd_kernels/fused_add_rms_norm.h"
@@ -16,9 +17,12 @@
 #include "esimd_kernels/fused_add_rms_norm_batched.h"
 #include "esimd_kernels/norm_gemv_int4.h"
 #include "esimd_kernels/resadd_norm_gemv_int4.h"
+#include "esimd_kernels/rmsnorm_gemv_fp8.h"
 #include "esimd_kernels/fp16_GEMV.h"
 #include "esimd_kernels/kv_scatter.h"
 #include "esimd_kernels/norm_add_norm.h"
+#include "esimd_kernels/norm_add_norm_gemv_gelu.h"
+#include "esimd_kernels/norm_gemv_norm_fp16.h"
 #include "esimd_kernels/rmsnorm_residual_scalar.h"
 
 #define EXTRACT_PTR(var, tensor) auto var = reinterpret_cast<uint8_t*>(tensor.data_ptr())
@@ -998,6 +1002,226 @@ at::Tensor esimd_gemv_fp16(
     return output;
 }
 
+void esimd_norm_gemv_norm_fp16(
+    at::Tensor residual,
+    at::Tensor scale_with_root,
+    at::Tensor proj_weight,
+    at::Tensor pre_ff_weight,
+    at::Tensor router_logits,
+    at::Tensor moe_input,
+    double eps) {
+    TORCH_CHECK(
+        residual.scalar_type() == at::kHalf
+            && scale_with_root.scalar_type() == at::kHalf
+            && proj_weight.scalar_type() == at::kHalf
+            && pre_ff_weight.scalar_type() == at::kHalf
+            && router_logits.scalar_type() == at::kHalf
+            && moe_input.scalar_type() == at::kHalf,
+        "Gemma4 router-fusion tensors must be fp16");
+    TORCH_CHECK(
+        residual.numel() == 2816
+            && scale_with_root.numel() == 2816
+            && proj_weight.sizes() == at::IntArrayRef({128, 2816})
+            && pre_ff_weight.numel() == 2816
+            && router_logits.numel() == 128
+            && moe_input.sizes() == residual.sizes(),
+        "Gemma4-26B router fusion requires E=128 and H=2816");
+    TORCH_CHECK(
+        residual.is_contiguous()
+            && scale_with_root.is_contiguous()
+            && proj_weight.is_contiguous()
+            && pre_ff_weight.is_contiguous()
+            && router_logits.is_contiguous()
+            && moe_input.is_contiguous(),
+        "Gemma4 router-fusion tensors must be contiguous");
+    int num_experts = static_cast<int>(proj_weight.size(0));
+    int hidden_size = static_cast<int>(proj_weight.size(1));
+    auto& queue = get_device_queue(residual);
+    norm_gemv_norm_fp16_host(
+        reinterpret_cast<const fp16*>(residual.data_ptr()),
+        reinterpret_cast<const fp16*>(scale_with_root.data_ptr()),
+        reinterpret_cast<const fp16*>(proj_weight.data_ptr()),
+        reinterpret_cast<const fp16*>(pre_ff_weight.data_ptr()),
+        reinterpret_cast<fp16*>(router_logits.data_ptr()),
+        reinterpret_cast<fp16*>(moe_input.data_ptr()),
+        num_experts,
+        hidden_size,
+        static_cast<float>(eps),
+        queue);
+}
+
+void esimd_norm_add_norm_gemv_gelu_fp8(
+    at::Tensor attention_output,
+    at::Tensor residual_input,
+    at::Tensor post_attention_weight,
+    at::Tensor pre_feedforward_weight,
+    at::Tensor gate_up_weight,
+    at::Tensor gate_up_scale,
+    at::Tensor residual_output,
+    at::Tensor activation_output,
+    double post_attention_eps,
+    double pre_feedforward_eps) {
+    TORCH_CHECK(
+        attention_output.scalar_type() == at::kHalf
+            && residual_input.scalar_type() == at::kHalf
+            && post_attention_weight.scalar_type() == at::kHalf
+            && pre_feedforward_weight.scalar_type() == at::kHalf
+            && residual_output.scalar_type() == at::kHalf
+            && activation_output.scalar_type() == at::kHalf,
+        "Gemma4 dense-fusion activations and norm weights must be fp16");
+    TORCH_CHECK(
+        gate_up_weight.scalar_type() == at::kFloat8_e4m3fn
+            || gate_up_weight.scalar_type() == at::kFloat8_e5m2,
+        "gate_up_weight must be E4M3 or E5M2");
+    TORCH_CHECK(
+        attention_output.numel() == 2816
+            && residual_input.numel() == 2816
+            && post_attention_weight.numel() == 2816
+            && pre_feedforward_weight.numel() == 2816
+            && gate_up_weight.dim() == 2
+            && gate_up_weight.size(0) == 2112
+            && gate_up_weight.size(1) == 2816
+            && residual_output.numel() == 2816
+            && activation_output.numel() == 1056,
+        "Gemma4-26B TP=2 dense fusion requires H=2816 and I/TP=1056");
+    TORCH_CHECK(
+        gate_up_scale.scalar_type() == at::kFloat
+            && gate_up_scale.numel() == 1,
+        "gate_up_scale must be one fp32 value");
+    TORCH_CHECK(
+        attention_output.is_contiguous()
+            && residual_input.is_contiguous()
+            && post_attention_weight.is_contiguous()
+            && pre_feedforward_weight.is_contiguous()
+            && gate_up_weight.is_contiguous()
+            && gate_up_scale.is_contiguous()
+            && residual_output.is_contiguous()
+            && activation_output.is_contiguous(),
+        "Gemma4 dense-fusion tensors must be contiguous");
+    auto& queue = get_device_queue(attention_output);
+    norm_add_norm_gemv_gelu_fp8_host(
+        reinterpret_cast<const fp16*>(attention_output.data_ptr()),
+        reinterpret_cast<const fp16*>(residual_input.data_ptr()),
+        reinterpret_cast<const fp16*>(post_attention_weight.data_ptr()),
+        reinterpret_cast<const fp16*>(pre_feedforward_weight.data_ptr()),
+        reinterpret_cast<const uint8_t*>(gate_up_weight.data_ptr()),
+        gate_up_scale.data_ptr<float>(),
+        reinterpret_cast<fp16*>(residual_output.data_ptr()),
+        reinterpret_cast<fp16*>(activation_output.data_ptr()),
+        1056,
+        2816,
+        static_cast<float>(post_attention_eps),
+        static_cast<float>(pre_feedforward_eps),
+        get_fp8_mode(gate_up_weight),
+        queue);
+}
+
+void esimd_rmsnorm_gemv_fp8(
+    at::Tensor input,
+    at::Tensor norm_weight,
+    at::Tensor gemv_weight,
+    at::Tensor gemv_scale,
+    at::Tensor output,
+    double eps) {
+    TORCH_CHECK(
+        input.scalar_type() == at::kHalf
+            && norm_weight.scalar_type() == at::kHalf
+            && output.scalar_type() == at::kHalf,
+        "input, norm_weight, and output must be fp16");
+    TORCH_CHECK(
+        gemv_weight.scalar_type() == at::kFloat8_e4m3fn
+            || gemv_weight.scalar_type() == at::kFloat8_e5m2,
+        "gemv_weight must be E4M3 or E5M2");
+    TORCH_CHECK(
+        input.numel() == 2816
+            && norm_weight.numel() == 2816
+            && gemv_weight.dim() == 2
+            && gemv_weight.size(1) == 2816
+            && output.numel() == gemv_weight.size(0),
+        "Gemma4-26B RMSNorm GEMV requires K=2816");
+    TORCH_CHECK(
+        gemv_scale.scalar_type() == at::kFloat
+            && gemv_scale.numel() == 1,
+        "gemv_scale must be one fp32 value");
+    TORCH_CHECK(
+        input.is_contiguous()
+            && norm_weight.is_contiguous()
+            && gemv_weight.is_contiguous()
+            && gemv_scale.is_contiguous()
+            && output.is_contiguous(),
+        "Gemma4 RMSNorm GEMV tensors must be contiguous");
+    auto& queue = get_device_queue(input);
+    rmsnorm_gemv_fp8_host(
+        reinterpret_cast<const fp16*>(input.data_ptr()),
+        reinterpret_cast<const fp16*>(norm_weight.data_ptr()),
+        reinterpret_cast<const uint8_t*>(gemv_weight.data_ptr()),
+        gemv_scale.data_ptr<float>(),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        gemv_weight.size(0),
+        2816,
+        static_cast<float>(eps),
+        get_fp8_mode(gemv_weight),
+        queue);
+}
+
+void esimd_dual_rmsnorm_residual_scalar(
+    at::Tensor x1,
+    at::Tensor weight1,
+    at::Tensor x2,
+    at::Tensor weight2,
+    at::Tensor weight3,
+    at::Tensor residual,
+    at::Tensor output,
+    double eps1,
+    double eps2,
+    double eps3,
+    double scalar) {
+    TORCH_CHECK(
+        x1.scalar_type() == at::kHalf
+            && weight1.scalar_type() == at::kHalf
+            && x2.scalar_type() == at::kHalf
+            && weight2.scalar_type() == at::kHalf
+            && weight3.scalar_type() == at::kHalf
+            && residual.scalar_type() == at::kHalf
+            && output.scalar_type() == at::kHalf,
+        "Gemma4 dual RMSNorm tensors must be fp16");
+    TORCH_CHECK(
+        x1.dim() == 2
+            && x1.size(1) == 2816
+            && x2.sizes() == x1.sizes()
+            && residual.sizes() == x1.sizes()
+            && output.sizes() == x1.sizes()
+            && weight1.numel() == 2816
+            && weight2.numel() == 2816
+            && weight3.numel() == 2816,
+        "Gemma4-26B dual RMSNorm requires H=2816");
+    TORCH_CHECK(
+        x1.is_contiguous()
+            && weight1.is_contiguous()
+            && x2.is_contiguous()
+            && weight2.is_contiguous()
+            && weight3.is_contiguous()
+            && residual.is_contiguous()
+            && output.is_contiguous(),
+        "Gemma4 dual RMSNorm tensors must be contiguous");
+    auto& queue = get_device_queue(x1);
+    dual_rmsnorm_residual_scalar_host(
+        reinterpret_cast<const fp16*>(x1.data_ptr()),
+        reinterpret_cast<const fp16*>(weight1.data_ptr()),
+        reinterpret_cast<const fp16*>(x2.data_ptr()),
+        reinterpret_cast<const fp16*>(weight2.data_ptr()),
+        reinterpret_cast<const fp16*>(weight3.data_ptr()),
+        reinterpret_cast<const fp16*>(residual.data_ptr()),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        x1.size(0),
+        2816,
+        static_cast<float>(eps1),
+        static_cast<float>(eps2),
+        static_cast<float>(eps3),
+        static_cast<float>(scalar),
+        queue);
+}
+
 void esimd_norm_add_norm(
     at::Tensor h2_raw,
     at::Tensor h1,
@@ -1015,6 +1239,84 @@ void esimd_norm_add_norm(
         reinterpret_cast<const fp16*>(w2.data_ptr()),
         reinterpret_cast<fp16*>(out.data_ptr()),
         k, static_cast<float>(eps1), static_cast<float>(eps2), queue);
+}
+
+class XpuCreateKvIndicesKernel;
+
+void xpu_create_kv_indices(
+    at::Tensor req_to_token,
+    at::Tensor req_pool_indices,
+    at::Tensor page_kernel_lens,
+    at::Tensor kv_indptr,
+    at::Tensor kv_start_idx,
+    at::Tensor kv_indices,
+    int64_t max_len,
+    bool has_start) {
+    TORCH_CHECK(
+        req_to_token.scalar_type() == at::kInt
+           && (req_pool_indices.scalar_type() == at::kInt
+               || req_pool_indices.scalar_type() == at::kLong)
+           && page_kernel_lens.scalar_type() == at::kInt
+           && kv_indptr.scalar_type() == at::kInt
+           && kv_start_idx.scalar_type() == at::kInt
+           && kv_indices.scalar_type() == at::kInt,
+        "XPU KV-index data must be int32; request indices may be int64");
+    TORCH_CHECK(
+        req_to_token.dim() == 2
+           && req_pool_indices.dim() == 1
+           && page_kernel_lens.dim() == 1
+           && kv_indptr.dim() == 1
+           && kv_indices.dim() == 1,
+        "invalid XPU KV-index tensor ranks");
+    TORCH_CHECK(
+        req_to_token.is_contiguous()
+           && req_pool_indices.is_contiguous()
+           && page_kernel_lens.is_contiguous()
+           && kv_indptr.is_contiguous()
+           && kv_start_idx.is_contiguous()
+           && kv_indices.is_contiguous(),
+        "XPU KV-index tensors must be contiguous");
+    const int64_t batch_size = req_pool_indices.numel();
+    TORCH_CHECK(
+        page_kernel_lens.numel() == batch_size
+           && kv_indptr.numel() >= batch_size + 1
+           && (!has_start || kv_start_idx.numel() == batch_size)
+           && max_len >= 0
+           && max_len <= req_to_token.size(1),
+        "invalid XPU KV-index sizes");
+    if (batch_size == 0 || max_len == 0) {
+        return;
+    }
+
+    const int* req_to_token_ptr = req_to_token.data_ptr<int>();
+    const bool req_indices_i64 =
+        req_pool_indices.scalar_type() == at::kLong;
+    const int* req_pool_indices_i32 =
+        req_indices_i64 ? nullptr : req_pool_indices.data_ptr<int>();
+    const int64_t* req_pool_indices_i64 =
+        req_indices_i64 ? req_pool_indices.data_ptr<int64_t>() : nullptr;
+    const int* page_kernel_lens_ptr = page_kernel_lens.data_ptr<int>();
+    const int* kv_indptr_ptr = kv_indptr.data_ptr<int>();
+    const int* kv_start_idx_ptr = kv_start_idx.data_ptr<int>();
+    int* kv_indices_ptr = kv_indices.data_ptr<int>();
+    const int64_t req_stride = req_to_token.stride(0);
+    auto& queue = get_device_queue(req_to_token);
+    queue.parallel_for<XpuCreateKvIndicesKernel>(
+        sycl::range<1>(batch_size * max_len), [=](sycl::id<1> item) {
+           const int64_t linear = item[0];
+           const int64_t row = linear / max_len;
+           const int offset = static_cast<int>(linear % max_len);
+           if (offset >= page_kernel_lens_ptr[row]) {
+               return;
+           }
+           const int64_t req = req_indices_i64
+               ? req_pool_indices_i64[row]
+               : req_pool_indices_i32[row];
+           const int start = has_start ? kv_start_idx_ptr[row] : 0;
+           kv_indices_ptr[kv_indptr_ptr[row] + offset] =
+               req_to_token_ptr[
+                   req * req_stride + start + offset];
+        });
 }
 
 void esimd_kv_scatter(

@@ -14,6 +14,8 @@ sglang/
 ├── scripts/
 │   ├── build_image.sh               # wrapper around `docker buildx build`
 │   ├── start_qwen3_6_service.sh     # launches the TP=2 e5m2 fp8 server
+│   ├── run_gemma4_26b_moe.sh        # Gemma4-26B-A4B TP=2, e4m3/e5m2
+│   ├── run_gemma4_31b.sh             # Gemma4-31B TP=2 online FP8
 │   └── run_gsm8k.py                 # standalone GSM8K accuracy harness
 ├── patches/                         # sglang / sgl-kernel-xpu source patches
 └── custom-esimd-kernels/            # merged ESIMD kernel package:
@@ -37,6 +39,8 @@ and the sgl-kernel-xpu cmake build.
 
 ## Run
 
+### Qwen3.6-35B-A3B
+
 ```bash
 docker run --rm -it \
     --device=/dev/dri \
@@ -45,6 +49,30 @@ docker run --rm -it \
     -p 30000:30000 \
     llm-scaler-sgl:bmg \
     /llm-scaler/sglang/scripts/start_qwen3_6_service.sh
+```
+
+### Gemma4-26B-A4B
+
+```bash
+docker run --rm -it \
+    --device=/dev/dri \
+    --shm-size=32g \
+    -v /path/to/gemma-4-26B-A4B-it:/models/gemma-4-26B-A4B-it:ro \
+    -p 30000:30000 \
+    --entrypoint /llm-scaler/sglang/scripts/run_gemma4_26b_moe.sh \
+    llm-scaler-sgl:bmg
+```
+
+### Gemma4-31B
+
+```bash
+docker run --rm -it \
+    --device=/dev/dri \
+    --shm-size=32g \
+    -v /path/to/gemma-4-31B-it:/models/gemma-4-31B-it:ro \
+    -p 30000:30000 \
+    --entrypoint /llm-scaler/sglang/scripts/run_gemma4_31b.sh \
+    llm-scaler-sgl:bmg
 ```
 
 ## Fast-paths enabled
