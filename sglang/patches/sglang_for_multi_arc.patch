@@ -2573,7 +2573,7 @@ index b104e40d7437a8cd2aee0855f27f00bbe6853612..4da941e2edec1b6bef39068761a93dd8
          raise ValueError(
              "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
 diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
-index b4e05df0132f56f4e8e2cd2cc638cc5afa2ead37..c27eab3c0ace63e330710609c984b6a71a58427e 100644
+index b4e05df0132f56f4e8e2cd2cc638cc5afa2ead37..5386abbd1b6af0a7c1c4ffc24028e2194bf89b28 100644
 --- a/python/sglang/srt/layers/quantization/fp8.py
 +++ b/python/sglang/srt/layers/quantization/fp8.py
 @@ -116,6 +116,317 @@ _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
@@ -2936,7 +2936,7 @@ index b4e05df0132f56f4e8e2cd2cc638cc5afa2ead37..c27eab3c0ace63e330710609c984b6a7
          from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
  
          x = dispatch_output.hidden_states
-@@ -1856,13 +2175,41 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -1856,13 +2175,43 @@ class Fp8MoEMethod(FusedMoEMethodBase):
  
          if use_intel_xpu_backend():
              # sgl-kernel-xpu path
@@ -2952,6 +2952,8 @@ index b4e05df0132f56f4e8e2cd2cc638cc5afa2ead37..c27eab3c0ace63e330710609c984b6a7
              use_mxfp4_w4a16 = layer.w13_weight.dtype == torch.int8
              assert self.is_fp4_expert == use_mxfp4_w4a16
 +
++            # TODO: Replace this hard-coded Gemma4-26B TP=2 shape gate with
++            # model/quant-config-driven kernel capability matching.
 +            is_gemma4_26b_tp2 = (
 +                x.dim() == 2
 +                and x.shape[1] == 2816
