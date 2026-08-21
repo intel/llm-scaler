@@ -3500,7 +3500,7 @@ index 6c6827c7d20bf351bbbc2c7ee2b838899540c281..59bdd53384f3e12cf132e084f60cdab9
                      qinput, x_scale = per_token_group_quant_fp8(
                          input_2d, group_size=input_2d.shape[1]
 diff --git a/python/sglang/srt/layers/quantization/gguf.py b/python/sglang/srt/layers/quantization/gguf.py
-index 5c1e7a63e6d90693033108dedd016df02ef5a19b..9ae9c0a6d6b064de4e96bfb69501c666343251d6 100644
+index 5c1e7a63e6d90693033108dedd016df02ef5a19b..8a174a38b879717d125f45e39b78031f840fbf34 100644
 --- a/python/sglang/srt/layers/quantization/gguf.py
 +++ b/python/sglang/srt/layers/quantization/gguf.py
 @@ -1,9 +1,9 @@
@@ -3614,7 +3614,7 @@ index 5c1e7a63e6d90693033108dedd016df02ef5a19b..9ae9c0a6d6b064de4e96bfb69501c666
              return GGUFMoEMethod(self)
          return None
  
-@@ -456,6 +534,1425 @@ class GGUFLinearMethod(LinearMethodBase):
+@@ -456,6 +534,1428 @@ class GGUFLinearMethod(LinearMethodBase):
          return out
  
  
@@ -4587,6 +4587,9 @@ index 5c1e7a63e6d90693033108dedd016df02ef5a19b..9ae9c0a6d6b064de4e96bfb69501c666
 +            scale = _q5q6_col_perm_elems(scale, (ratio, nk, hvd // 32))
 +        return ("q8_0", qs, scale)
 +    if qweight_type == _Q4_K_TYPE and esimd_gemv_q4_k is not None and not _force_dq:
++        # _xpu_repack_q4_k_chunked has no col_perm support; fail loudly rather
++        # than silently dropping the permute and producing wrong weights.
++        assert col_perm is None, "q4_k GDN out_proj col-perm unsupported"
 +        ql, scale, minv = _xpu_repack_q4_k_chunked(qweight)
 +        return ("q4_k", ql, scale, minv)
 +    _no_q5 = os.environ.get("SGLANG_GGUF_XPU_NO_Q5K") == "1"
@@ -5040,7 +5043,7 @@ index 5c1e7a63e6d90693033108dedd016df02ef5a19b..9ae9c0a6d6b064de4e96bfb69501c666
  class GGUFMoEMethod(FusedMoEMethodBase):
      """MoE method for GGUF.
  
-@@ -565,6 +2062,260 @@ class GGUFMoEMethod(FusedMoEMethodBase):
+@@ -565,6 +2065,260 @@ class GGUFMoEMethod(FusedMoEMethodBase):
          return StandardCombineInput(hidden_states=output)
  
  
@@ -8411,7 +8414,7 @@ index 37552404b90d46726cdf0debf7e831254cc55baf..74b209839b251d53194c02e8c8539456
  class Qwen2MoeAttention(nn.Module):
      def __init__(
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
-index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a57375a40e 100644
+index 65f78e6917e8c6f9e0c418f9afc00375347a361d..53ddf9891a6b01fc9860d4efc2f93cd03be89830 100644
 --- a/python/sglang/srt/models/qwen3_5.py
 +++ b/python/sglang/srt/models/qwen3_5.py
 @@ -15,8 +15,9 @@
@@ -8918,19 +8921,22 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
          self.attn = RadixLinearAttention(
              layer_id=layer_id,
              num_q_heads=self.num_k_heads // self.attn_tp_size,
-@@ -275,6 +732,32 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -275,6 +732,35 @@ class Qwen3_5GatedDeltaNet(nn.Module):
              tp_size=self.attn_tp_size,
              prefix=add_prefix("out_proj", prefix),
          )
-+        # NOTE (Qwen3.6 ratio=2 GGUF): out_proj's input (value-head) columns are
++        # NOTE (Qwen3.6 GGUF): out_proj's input (value-head) columns are
 +        # stored by GGUF in [ratio, num_k] order but HF/core_attn_out expects
-+        # [num_k, ratio]. This is an INPUT-dim (column) permute. It CANNOT be done
-+        # per-rank in the XPU method (the older `_gguf_gdn_col_perm` path): under
-+        # TP the value-head grouping crosses the RowParallel input-shard boundary
-+        # (rank0's HF heads map to GGUF cols in BOTH ratio halves), so a per-rank
-+        # reshape is impossible. Instead it is applied to the GLOBAL pre-shard
-+        # weight in `_gguf_gdn_transform` (raw-byte, head_v_dim-granular; safe on
-+        # Q8_0 whose block=32 divides head_v_dim). At ratio=1 the layouts coincide.
++        # [num_k, ratio]. This is an INPUT-dim (column) permute, and under TP the
++        # value-head grouping crosses the RowParallel input-shard boundary
++        # (rank0's HF heads map to GGUF cols in BOTH ratio halves), so it cannot
++        # be done entirely per-rank. It is applied to the GLOBAL pre-shard weight
++        # in `_gguf_gdn_transform`: as a single raw-byte per-head permute when
++        # head_v_dim is a multiple of the quant block (the 35B's Q8_0, block=32),
++        # or otherwise split into a coarse pre-shard group permute plus a
++        # per-rank element-order permute carried by `_gguf_gdn_col_perm` (the
++        # 27B's Q5_K, whose 256-elem super-block is twice head_v_dim).
++        # At ratio=1 the layouts coincide.
 +
 +    def rebind_device_views(self):
 +        """Re-derive tensors that alias conv1d.weight's storage.
@@ -8951,7 +8957,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
  
      @staticmethod
      def _override_weight_loader(param, loader):
-@@ -300,7 +783,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -300,7 +786,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
  
      def _bind_packed_weight_loaders(self, module):
          """Bind packed-checkpoint-aware loaders to all relevant params of a merged module."""
@@ -8972,7 +8978,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
              param = getattr(module, attr_name, None)
              if param is None:
                  continue
-@@ -345,10 +840,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -345,10 +843,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                      module, param, loaded_shard_id
                  )
  
@@ -8993,7 +8999,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
                  else:
                      split_dim = getattr(param, "output_dim", 0)
                      if _is_cpu:
-@@ -444,7 +945,58 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -444,7 +948,58 @@ class Qwen3_5GatedDeltaNet(nn.Module):
  
          return query, key, value, z, b, a
  
@@ -9052,7 +9058,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
          if (
              _is_cpu
              or _is_npu
-@@ -472,6 +1024,578 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -472,6 +1027,578 @@ class Qwen3_5GatedDeltaNet(nn.Module):
              projected_states_ba, _ = self.in_proj_ba(hidden_states)
          return projected_states_qkvz, projected_states_ba
  
@@ -9631,7 +9637,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -486,6 +1610,62 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -486,6 +1613,62 @@ class Qwen3_5GatedDeltaNet(nn.Module):
          projected_states_qkvz, projected_states_ba = self._forward_input_proj(
              hidden_states
          )
@@ -9694,7 +9700,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
  
          if (
              self.num_v_heads // self.num_k_heads in [1, 2, 4]
-@@ -623,56 +1803,341 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
+@@ -623,56 +1806,341 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
              is_last_layer=(layer_id == config.num_hidden_layers - 1),
          )
  
@@ -9795,14 +9801,14 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
      ):
 -        forward_batch = kwargs.get("forward_batch", None)
 +        """Fused GemmaRMSNorm(input_layernorm) + GDN in_proj (qkvz + ba).
- 
--        hidden_states, residual = (
--            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
++
 +        Replaces the prepare_attn ``input_layernorm`` launch plus the two
 +        ``in_proj`` fp8 GEMV launches with a single
 +        ``esimd_resadd_norm_gemv2_fp8_pert`` launch. Gated by
 +        ``SGL_XPU_GDN_RESADD_NORM=1``; decode single-token only.
-+
+ 
+-        hidden_states, residual = (
+-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
 +        Returns ``(projected_qkvz, projected_ba, new_residual)`` on success, or
 +        ``None`` to fall back to the standard prepare_attn + in_proj path. Only
 +        the plain TP decode path (no input-scatter, no allreduce-fusion) is
@@ -9900,7 +9906,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
 +                (self.input_layernorm.weight.data.to(torch.float32) + 1.0)
 +                .to(torch.float16)
 +                .contiguous()
-+            )
+             )
 +            o0 = torch.empty((1, w0.shape[0]), dtype=torch.float16, device=w0.device)
 +            o1 = torch.empty((1, w1.shape[0]), dtype=torch.float16, device=w1.device)
 +            # Per-layer buffer for the kernel-written post-add residual
@@ -9909,7 +9915,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
 +            # (input residual belongs to the *previous* layer's nr).
 +            nr = torch.empty(
 +                (1, hidden_states.shape[1]), dtype=torch.float16, device=w0.device
-             )
++            )
 +            cache = {
 +                "nw": nw,
 +                "w0": w0,
@@ -9992,13 +9998,13 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
 +                    ),
 +                )
 +            )
-+
+ 
 +            if not forward_batch.forward_mode.is_idle():
 +                hidden_states = self.linear_attn(
 +                    hidden_states,
 +                    forward_batch,
 +                )
- 
++
 +        if _NAN_PROBE: _nan_probe(
 +            "gdn_attn_out",
 +            hidden_states,
@@ -10054,7 +10060,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
          if should_allreduce_fusion:
              hidden_states._sglang_needs_allreduce_fusion = True
          else:
-@@ -909,8 +2374,133 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -909,8 +2377,133 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
          positions: torch.Tensor,
          hidden_states: torch.Tensor,
          forward_batch: ForwardBatch,
@@ -10189,7 +10195,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
          if (
              not _is_npu
              or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-@@ -936,6 +2526,227 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -936,6 +2529,227 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
          output, _ = self.o_proj(attn_output)
          return output
  
@@ -10417,7 +10423,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
      def forward(
          self,
          positions: torch.Tensor,
-@@ -945,46 +2756,93 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -945,46 +2759,93 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
          captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
          **kwargs,
      ):
@@ -10524,7 +10530,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
          if should_allreduce_fusion:
              hidden_states._sglang_needs_allreduce_fusion = True
          else:
-@@ -1091,6 +2949,12 @@ class Qwen3_5ForCausalLM(nn.Module):
+@@ -1091,6 +2952,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                  config.hidden_size,
                  org_num_embeddings=config.vocab_size,
                  enable_tp=not is_dp_attention_enabled(),
@@ -10537,7 +10543,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
              )
          else:
              self.embed_tokens = PPMissingLayer()
-@@ -1167,6 +3031,9 @@ class Qwen3_5ForCausalLM(nn.Module):
+@@ -1167,6 +3034,9 @@ class Qwen3_5ForCausalLM(nn.Module):
              residual = pp_proxy_tensors["residual"]
  
          aux_hidden_states = []
@@ -10547,7 +10553,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
          # Pass through decoder layers
          for layer_idx in range(self.start_layer, self.end_layer):
              layer = self.layers[layer_idx]
-@@ -1184,6 +3051,13 @@ class Qwen3_5ForCausalLM(nn.Module):
+@@ -1184,6 +3054,13 @@ class Qwen3_5ForCausalLM(nn.Module):
                          else None
                      ),
                  )
@@ -10561,7 +10567,89 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
  
              # Process deepstack embeddings if provided
              if (
-@@ -1718,6 +3592,113 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1580,11 +3457,41 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+ 
+         loaded_params: Set[str] = set()
+         params_dict = dict(self.named_parameters(remove_duplicate=False))
++
++        # GGUF load-path detection. A GGUF checkpoint stores weights in
++        # llama.cpp conventions that differ from the HF safetensors this model
++        # code expects; the fixups below mirror the MoE class one-for-one,
++        # minus shared_expert_gate (no MoE layers in the dense arch):
++        #   * GemmaRMSNorm weights are stored standard (~1.0), but GemmaRMSNorm
++        #     computes x*(1+w) so the param must be (standard-1) -> subtract 1.
++        #   * GDN linear_attn.* needs the value-head permute / A_log / dt_bias
++        #     transform (_gguf_gdn_transform).
++        #   * conv1d is stored 2-D [ch, kernel] but the param is 3-D.
++        _is_gguf = (
++            getattr(self, "quant_config", None) is not None
++            and getattr(self.quant_config, "get_name", lambda: "")() == "gguf"
++        )
++        # The GDN linear_attn.norm uses plain RMSNormGated (no offset) -- exclude.
++        _gemma_norm_suffixes = (
++            "input_layernorm.weight",
++            "post_attention_layernorm.weight",
++            "self_attn.q_norm.weight",
++            "self_attn.k_norm.weight",
++        )
++
+         for name, loaded_weight in weights:
+             if "rotary_emb.inv_freq" in name:
+                 continue
+             if "mtp" in name:
+                 continue
++            if _is_gguf and (
++                name.endswith(_gemma_norm_suffixes)
++                or name == "model.language_model.norm.weight"
++                or name == "model.norm.weight"
++            ):
++                loaded_weight = loaded_weight - 1.0
++            if _is_gguf and ".linear_attn." in name:
++                loaded_weight = self._gguf_gdn_transform(name, loaded_weight)
+             if "language_model" in name:
+                 name = name.replace(r"model.language_model.", r"model.")
+             if ".self_attn." in name:
+@@ -1616,6 +3523,22 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+                     continue
+ 
+                 name = name.replace(weight_name, param_name)
++                # GGUF F32 GDN gate shards (ssm_beta/ssm_alpha -> in_proj_b/a)
++                # are yielded as `.weight`: the gguf iterator only renames
++                # non-F32 tensors to `.qweight`. But the fused `in_proj_ba` is a
++                # GGUF quantized module whose merged param is `.qweight`, so the
++                # F32 `...in_proj_ba.weight` target is absent from params_dict
++                # and the shard would otherwise fall through to the non-stacked
++                # branch, losing its shard_id (-> shard_id=[None, None] and an
++                # unsortable merge in GGUFLinearXPUMethod). Redirect here,
++                # inside the stacked loop, so the shard_id is preserved.
++                if (
++                    _is_gguf
++                    and name.endswith(".weight")
++                    and name not in params_dict
++                    and (name[: -len(".weight")] + ".qweight") in params_dict
++                ):
++                    name = name[: -len(".weight")] + ".qweight"
+                 # Skip loading extra bias for GPTQ models.
+                 if name.endswith(".bias") and name not in params_dict:
+                     continue
+@@ -1643,6 +3566,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+                     continue
+                 param = params_dict[name]
+ 
++                # GGUF stores conv1d 2-D [ch, kernel] but the param is
++                # 3-D [ch, 1, kernel]; insert the singleton middle dim.
++                if (
++                    _is_gguf
++                    and "conv1d.weight" in name
++                    and loaded_weight.dim() == 2
++                    and param.dim() == 3
++                ):
++                    loaded_weight = loaded_weight.unsqueeze(1)
++
+                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                 weight_loader(param, loaded_weight)
+                 if (
+@@ -1718,6 +3651,203 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
          torch.cuda.empty_cache()
          torch.cuda.synchronize()
  
@@ -10581,9 +10669,9 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
 +        Permuting whole *rows* (dim 0) is bit-identical on quantized bytes since
 +        GGUF packs each output row contiguously (verified: dequant∘rowperm ==
 +        rowperm∘dequant, max diff 0). Therefore every transform here is a dim-0
-+        row permutation only. ``out_proj`` needs an INPUT-dim (column) permute
-+        that would break q-blocks, so it is handled post-dequant in the XPU
-+        method (see GGUFLinearXPUMethod), not here. The key-head q/k slices of
++        row permutation only, EXCEPT ``out_proj``, which needs an INPUT-dim
++        (column) permute; see that branch for how it avoids splitting q-blocks.
++        The key-head q/k slices of
 +        in_proj_qkv / conv1d are NOT permuted. (notes §3.6.)
 +        """
 +        # The weight iterator also yields per-tensor ``qweight_type`` scalars
@@ -10617,15 +10705,62 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
 +        # contiguous span of the last axis (block_bytes // nv bytes, or head_v_dim
 +        # elems). Reordering whole per-head spans is bit-identical to a
 +        # post-dequant column permute (verified vs HF golden, maxdiff = quant
-+        # error) because head_v_dim (128) is a multiple of the Q8_0 block (32),
-+        # so no packed block is split. Verified: dequant(colperm(raw)) == HF.
++        # error) ONLY IF head_v_dim is a multiple of the quant block, so that no
++        # packed block is split. That holds for the 35B (Q8_0 block=32 divides
++        # head_v_dim=128) but NOT for k-quants whose super-block is 256 elems
++        # (the 27B's ssm_out is Q5_K: head_v_dim=128 is HALF a super-block, and
++        # a super-block's shared d/dmin/scales header plus its de-interleaved
++        # qh/qs payload means no byte range maps to a contiguous element range
++        # at all). See the two-level path below for that case.
 +        if ".linear_attn.out_proj." in name:
-+            span = w.shape[1] // nv  # bytes-per-head (raw) or head_v_dim (F32)
 +            assert w.shape[1] % nv == 0, (
 +                f"out_proj last dim {w.shape[1]} not divisible by nv={nv}"
 +            )
++            span = w.shape[1] // nv  # bytes-per-head (raw) or head_v_dim (F32)
++            hvd = tc.linear_value_head_dim
++            block_elems = self._gguf_block_elems(w.shape[1], nv * hvd)
++            if hvd % block_elems == 0:
++                # Block-safe: whole per-head spans are whole quant blocks.
++                return (
++                    w.reshape(w.shape[0], ratio, nk, span)
++                    .transpose(1, 2)
++                    .reshape(w.shape)
++                    .contiguous()
++                )
++            # Not block-safe (k-quant with head_v_dim < super-block). Split the
++            # permute into two levels so neither one ever cuts a packed block:
++            #   (1) HERE, on the GLOBAL pre-shard weight, permute at the
++            #       coarser (nk // tp)-head GROUP granularity. That is all the
++            #       cross-rank regrouping there is: it just moves each rank's
++            #       columns into its own contiguous RowParallel slice, and a
++            #       group spans (nk // tp) * head_v_dim elems, a whole number of
++            #       super-blocks. After it, each rank's slice holds exactly its
++            #       columns in [ratio, nk_loc] order.
++            #   (2) PER-RANK, in element order, via layer._gguf_gdn_col_perm:
++            #       _xpu_repack_* unpacks -> permutes -> repacks, turning
++            #       [ratio, nk_loc] into HF's [nk_loc, ratio]. Never splits a
++            #       block because it works on unpacked elements.
++            # The two compose to exactly the full [ratio, nk] -> [nk, ratio]
++            # value-head permute.
++            mod = self._resolve_gdn_out_proj(name)
++            tp = int(getattr(mod, "tp_size", 1) or 1)
++            if nk % tp != 0:
++                raise ValueError(
++                    f"GGUF GDN out_proj col-permute: linear_num_key_heads={nk} "
++                    f"is not divisible by out_proj tp_size={tp}."
++                )
++            nk_loc = nk // tp
++            if (nk_loc * hvd) % block_elems != 0:
++                raise ValueError(
++                    f"GGUF GDN out_proj col-permute: (nk/tp)*head_v_dim = "
++                    f"{nk_loc}*{hvd} = {nk_loc * hvd} is not a multiple of the "
++                    f"quant block ({block_elems} elems) for {name}; the "
++                    f"pre-shard group permute would split a packed block. "
++                    f"Use a smaller tp_size."
++                )
++            mod._gguf_gdn_col_perm = (ratio, nk_loc, hvd)
 +            return (
-+                w.reshape(w.shape[0], ratio, nk, span)
++                w.reshape(w.shape[0], ratio, tp, nk_loc * span)
 +                .transpose(1, 2)
 +                .reshape(w.shape)
 +                .contiguous()
@@ -10659,6 +10794,49 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
 +        return w
 +
 +    @staticmethod
++    def _gguf_block_elems(nbytes_last: int, n_elems: int) -> int:
++        """Recover the GGUF quant block size, in ELEMENTS, of a raw-byte last
++        axis of ``nbytes_last`` bytes that encodes ``n_elems`` values.
++
++        Returns 1 when the tensor carries real (unquantized) values, i.e. the
++        weight iterator already dequantized it, so any element-granular permute
++        is exact. Used to decide whether a raw-byte column permute would split
++        a packed block.
++        """
++        if nbytes_last == n_elems:
++            return 1
++        import gguf as _gguf
++
++        cands = [
++            be
++            for be, ts in _gguf.GGML_QUANT_SIZES.values()
++            if be and n_elems % be == 0 and (n_elems // be) * ts == nbytes_last
++        ]
++        if not cands:
++            raise ValueError(
++                f"cannot infer GGUF block size: last axis of {nbytes_last} "
++                f"bytes encoding {n_elems} elements matches no GGML quant type"
++            )
++        # Ambiguity is only possible between types with identical bytes/elem;
++        # take the largest block, which is the conservative choice (it can only
++        # push us onto the safe two-level path, never off it).
++        return max(cands)
++
++    def _resolve_gdn_out_proj(self, name: str) -> torch.nn.Module:
++        """Resolve the ``linear_attn.out_proj`` module that a GGUF weight named
++        ``name`` belongs to, so its per-rank column permute can be recorded."""
++        marker = ".linear_attn.out_proj."
++        path = name.replace("model.language_model.", "model.")
++        path = path[: path.index(marker)] + ".linear_attn.out_proj"
++        try:
++            return self.get_submodule(path)
++        except AttributeError as exc:
++            raise AttributeError(
++                f"GGUF GDN out_proj col-permute: cannot resolve module "
++                f"'{path}' for weight '{name}'"
++            ) from exc
++
++    @staticmethod
 +    def _perm_value_rows(t: torch.Tensor, ratio: int, nk: int) -> torch.Tensor:
 +        """Reorder the value-head axis (dim 0) from GGUF [ratio, nk, per_head]
 +        to HF [nk, ratio, per_head]. Works on real values and on raw quantized
@@ -10675,7 +10853,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
      def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
          stacked_params_mapping = [
              # (param_name, shard_name, shard_id)
-@@ -1733,6 +3714,27 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1733,6 +3863,27 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
              ("in_proj_ba.", "in_proj_a.", 1),
          ]
  
@@ -10703,7 +10881,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
          num_experts = self.config.num_experts
  
          # Params for weights, fp8 weight scales, fp8 activation scales
-@@ -1832,6 +3834,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1832,6 +3983,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                  continue
              if "mtp" in name:
                  continue
@@ -10718,7 +10896,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
              if "language_model" in name:
                  name = name.replace(r"model.language_model.", r"model.")
              if ".self_attn." in name:
-@@ -1886,6 +3896,24 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1886,6 +4045,24 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                  if "mlp.experts" in name:
                      continue
                  name = name.replace(weight_name, param_name)
@@ -10743,7 +10921,7 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
                  # Skip loading extra parameters for GPTQ/modelopt models.
                  if name.endswith(ignore_suffixes) and name not in params_dict:
                      continue
-@@ -2013,6 +4041,24 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -2013,6 +4190,24 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
  
                      if name in params_dict.keys():
                          param = params_dict[name]
@@ -10768,6 +10946,28 @@ index 65f78e6917e8c6f9e0c418f9afc00375347a361d..5133077702962ccd90994d4e117184a5
                          weight_loader = getattr(
                              param, "weight_loader", default_weight_loader
                          )
+@@ -2045,4 +4240,21 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+         )
+ 
+ 
++# The GGUF GDN layout transform is arch-independent (it only reads
++# linear_num_{key,value}_heads / linear_{key,value}_head_dim), so the dense
++# class reuses the MoE implementation rather than duplicating it. Bound here
++# because Qwen3_5MoeForConditionalGeneration is defined after the dense class.
++Qwen3_5ForConditionalGeneration._gguf_gdn_transform = (
++    Qwen3_5MoeForConditionalGeneration._gguf_gdn_transform
++)
++Qwen3_5ForConditionalGeneration._perm_value_rows = staticmethod(
++    Qwen3_5MoeForConditionalGeneration._perm_value_rows
++)
++Qwen3_5ForConditionalGeneration._gguf_block_elems = staticmethod(
++    Qwen3_5MoeForConditionalGeneration._gguf_block_elems
++)
++Qwen3_5ForConditionalGeneration._resolve_gdn_out_proj = (
++    Qwen3_5MoeForConditionalGeneration._resolve_gdn_out_proj
++)
++
+ EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
 index 6c77ff64f92cd08d9f00eb96f8f1514a39d4dd2c..49c88898cab9e5b1f60750028fd5b67748477d57 100644
 --- a/python/sglang/srt/server_args.py
