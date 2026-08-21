@@ -63,17 +63,6 @@ docker run --rm -it \
     llm-scaler-sgl:bmg
 ```
 
-E4M3 is the default. Set `-e SGLANG_FP8_DTYPE=e5m2` to select E5M2. The
-launcher uses TP=2, eager decode, radix cache, W8A16 prefill, and the
-Dockerfile-pinned oneCCL 2021.15.9 runtime. It also creates the
-`/dev/dri/by-path/*-render` links required by oneCCL in a non-privileged
-container.
-
-The source patches are generated from the merged
-`analytics-zoo/sglang@3a7753f4b` and
-`analytics-zoo/sgl-kernel-xpu@fd89d0f` dev-bmg trees against the upstream
-revisions pinned in `docker/Dockerfile`.
-
 ## Fast-paths enabled
 
 Each is gated by an env var (set by `start_qwen3_6_service.sh`):
