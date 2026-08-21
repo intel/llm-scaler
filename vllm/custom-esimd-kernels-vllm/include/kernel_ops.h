@@ -95,6 +95,7 @@ at::Tensor esimd_qkv_split_norm_rope_onyx_neox(
     at::Tensor positions,
     int64_t q_heads, int64_t kv_heads,
     double q_scale,
+    double eps,
     at::Tensor cos_sin_cache);
 
 // Fused Conv1d + GDN for Qwen3-Next-80B-A3B decode — reads from projections directly

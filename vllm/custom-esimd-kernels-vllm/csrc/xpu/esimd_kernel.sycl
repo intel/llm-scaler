@@ -339,7 +339,7 @@ at::Tensor esimd_qkv_split_norm_rope_onyx(
         p_qkv, p_q, p_k, p_v, p_pos, p_cs,
         ntoks, hiddenDim,
         (uint32_t)q_heads, (uint32_t)kv_heads,
-        (float)q_scale, false, dpcpp_queue);
+        (float)q_scale, 1e-6f, false, dpcpp_queue);
     return q_out;
 }
 
@@ -354,6 +354,7 @@ at::Tensor esimd_qkv_split_norm_rope_onyx_neox(
     int64_t q_heads,
     int64_t kv_heads,
     double q_scale,
+    double eps,
     at::Tensor cos_sin_cache) {
 
     EXTRACT_PTR(p_qkv, qkv_state);
@@ -371,7 +372,7 @@ at::Tensor esimd_qkv_split_norm_rope_onyx_neox(
         p_qkv, p_q, p_k, p_v, p_pos, p_cs,
         ntoks, hiddenDim,
         (uint32_t)q_heads, (uint32_t)kv_heads,
-        (float)q_scale, true, dpcpp_queue);
+        (float)q_scale, (float)eps, true, dpcpp_queue);
     return q_out;
 }
 

@@ -311,12 +311,13 @@ def esimd_qkv_split_norm_rope_muse_glimmer_neox(
     q_heads: int,
     kv_heads: int,
     q_scale: float,
+    eps: float,
     cos_sin_cache: torch.Tensor,
 ) -> torch.Tensor:
     """MuseGlimmer fused Q/K split + norm + half-split (NEOX) RoPE."""
     return _ops.esimd_qkv_split_norm_rope_onyx_neox(
         qkv_state, q_out, k_out, v_out, positions,
-        q_heads, kv_heads, float(q_scale), cos_sin_cache)
+        q_heads, kv_heads, float(q_scale), float(eps), cos_sin_cache)
 
 
 # ---- Fused Conv1d + GDN (doubleGRF, LGRF module) ----

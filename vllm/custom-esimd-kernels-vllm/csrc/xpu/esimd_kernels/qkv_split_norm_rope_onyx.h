@@ -34,12 +34,12 @@ ESIMD_INLINE void qkv_split_norm_rope_onyx_kernel(
     uint32_t qHead,
     uint32_t kvHead,
     float qScale,            // Onyx: qk_scale_factor / sqrt(head_dim)
+    float eps,
     bool neoxStyle,
     sycl::nd_item<2>& ndi) {
 
     constexpr uint32_t headDim = 128;
     constexpr uint32_t halfDim = 64;
-    constexpr float eps = 1e-6f;
 
     int32_t headIdx = ndi.get_group(0);
     int32_t tokIdx  = ndi.get_group(1);
@@ -131,6 +131,7 @@ inline void qkv_split_norm_rope_onyx_host(
     uint32_t qHead,
     uint32_t kvHead,
     float qScale,
+    float eps,
     bool neoxStyle,
     sycl::queue& q) {
 
@@ -143,7 +144,7 @@ inline void qkv_split_norm_rope_onyx_host(
             [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
                 qkv_split_norm_rope_onyx_kernel(
                     qkvState, qState, kState, vState, ropePos, ropeCosSinCache,
-                    hiddenDim, qHead, kvHead, qScale, neoxStyle, ndi);
+                    hiddenDim, qHead, kvHead, qScale, eps, neoxStyle, ndi);
             });
     });
 }
