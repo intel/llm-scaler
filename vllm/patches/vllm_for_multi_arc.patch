@@ -4607,15 +4607,17 @@ index 58316cb75..2cef6682e 100755
          self._update_base_metadata(mapping, lora_index_to_id, max_loras, vocab_size)
  
          # Prepare kernel metadata tensors
-@@ -87,2 +92,7 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+@@ -87,2 +92,9 @@ class PunicaWrapperXPU(PunicaWrapperBase):
 +    def _should_skip_lora(self) -> bool:
-+        # no_lora is mutable host state. During compilation it describes the
-+        # warmup batch and must not prune LoRA ops from the compiled graph.
-+        return self.no_lora and not torch.compiler.is_compiling()
++        # LoRA ops must remain in the graph during compilation. At runtime,
++        # token_lora_indices determines which tokens actually apply LoRA.
++        if torch.compiler.is_compiling():
++            return False
++        return self.no_lora
 +
      def _get_token_lora_indices(self, x: torch.Tensor) -> torch.IntTensor:
          return torch.narrow(self._token_lora_indices, 0, 0, x.size(0))
-@@ -131,6 +141,8 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+@@ -131,6 +143,8 @@ class PunicaWrapperXPU(PunicaWrapperBase):
              lora_a_stacked (tuple[torch.Tensor, ...]): lora_a's weights
              scale (float): Scaling factor for the operation
          """
@@ -4624,7 +4626,7 @@ index 58316cb75..2cef6682e 100755
  
          x = x.view(-1, x.shape[-1])
          for slice_idx in range(len(lora_a_stacked)):
-@@ -162,6 +174,9 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+@@ -162,6 +176,9 @@ class PunicaWrapperXPU(PunicaWrapperBase):
              output_slices (tuple[int, ...]): Every slice's size
              add_inputs (bool): Defaults to True.
          """
@@ -4634,7 +4636,7 @@ index 58316cb75..2cef6682e 100755
          y_org = y
          y = y.view(-1, y.shape[-1])
  
-@@ -201,6 +216,9 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+@@ -201,6 +218,9 @@ class PunicaWrapperXPU(PunicaWrapperBase):
              lora_b_stacked (torch.Tensor): lora_b's weights.
              add_inputs (bool): Default to True.
          """
@@ -4644,7 +4646,7 @@ index 58316cb75..2cef6682e 100755
          token_lora_indices = self._get_token_lora_indices(x)
          bgmv_expand(x, lora_b_stacked, y, token_lora_indices, add_inputs)
  
-@@ -237,6 +255,8 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+@@ -237,6 +257,8 @@ class PunicaWrapperXPU(PunicaWrapperBase):
              output_slices (tuple[int, ...]): Every slice's size.
              buffer (Optional[torch.Tensor]): Defaults to None.
          """
@@ -4653,7 +4655,7 @@ index 58316cb75..2cef6682e 100755
  
          assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)
  
-@@ -296,6 +316,9 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+@@ -296,6 +318,9 @@ class PunicaWrapperXPU(PunicaWrapperBase):
              scale (float): Scaling factor.
              buffer (Optional[torch.Tensor]): Default to None.
          """
@@ -4663,7 +4665,7 @@ index 58316cb75..2cef6682e 100755
          y_org = y
          y = y.view(-1, y.shape[-1])
          x = x.view(-1, x.shape[-1])
-@@ -390,6 +413,8 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+@@ -390,6 +415,8 @@ class PunicaWrapperXPU(PunicaWrapperBase):
          fully_sharded: bool = False,
          offset: int = 0,
          token_lora_mapping: torch.Tensor | None = None,
@@ -4672,7 +4674,7 @@ index 58316cb75..2cef6682e 100755
      ):
          """
          Performs a fused forward computation for LoRA of Mixture-of-Experts (MoE) layer.
-@@ -439,6 +464,8 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+@@ -439,6 +466,8 @@ class PunicaWrapperXPU(PunicaWrapperBase):
              mul_routed_weight,
              fully_sharded,
              offset,
@@ -4681,7 +4683,7 @@ index 58316cb75..2cef6682e 100755
          )
  
      def add_lora_w13(
-@@ -462,6 +489,7 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+@@ -462,6 +491,7 @@ class PunicaWrapperXPU(PunicaWrapperBase):
          fully_sharded: bool,
          use_tuned_config: bool,
          token_lora_mapping: torch.Tensor | None = None,
@@ -4689,7 +4691,7 @@ index 58316cb75..2cef6682e 100755
      ) -> tuple[
          torch.Tensor | None,
          torch.Tensor | None,
-@@ -564,6 +592,7 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+@@ -564,6 +594,7 @@ class PunicaWrapperXPU(PunicaWrapperBase):
              adapter_enabled,
              fully_sharded=fully_sharded,
              token_lora_mapping=token_lora_mapping,
@@ -4697,7 +4699,7 @@ index 58316cb75..2cef6682e 100755
          )
  
          return (
-@@ -594,6 +623,7 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+@@ -594,6 +625,7 @@ class PunicaWrapperXPU(PunicaWrapperBase):
          fully_sharded: bool,
          tp_rank: int,
          use_tuned_config: bool,
@@ -4705,7 +4707,7 @@ index 58316cb75..2cef6682e 100755
      ) -> None:
          import functools
  
-@@ -676,4 +706,6 @@ class PunicaWrapperXPU(PunicaWrapperBase):
+@@ -676,4 +708,6 @@ class PunicaWrapperXPU(PunicaWrapperBase):
              fully_sharded=fully_sharded,
              offset=offset,
              token_lora_mapping=token_lora_mapping,
