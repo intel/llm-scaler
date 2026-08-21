@@ -19,11 +19,9 @@ ENV OMNI_XPU_DEVICE=${DPCPP_SYCL_TARGET}
 ENV UV_BREAK_SYSTEM_PACKAGES=1
 ENV MAX_JOBS=1
 
-# Pinned to upstream (sgl-project) releases/commits instead of the
-# analytics-zoo dev-bmg forks. All BMG-specific changes are carried as
-# patches under ./patches/ (see "Build sgl-kernel-xpu wheel" and "Build
-# sglang wheel" below) and applied with `git apply` after checkout, so the
-# exact upstream base is pinned and reproducible.
+# Pinned to upstream (sgl-project) releases/commits. The patches under
+# ./patches are snapshots of the merged analytics-zoo dev-bmg branches:
+# sglang@3a7753f4b and sgl-kernel-xpu@fd89d0f.
 ARG SGLANG_UPSTREAM_REPO=https://github.com/sgl-project/sglang.git
 ARG SGLANG_UPSTREAM_TAG=v0.5.13
 ARG SGL_KERNEL_UPSTREAM_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
@@ -44,14 +42,12 @@ RUN apt-get update \
  && rm -rf /root/.cache /root/.cmake /tmp/* /var/tmp/* /var/lib/apt/lists/*
 
 # --- Build sgl-kernel-xpu wheel ---
-# Pinned upstream commit + our BMG patch (mha_fwd init, gdn_attention,
-# rms_norm_gated bf16/fp16, fp8 per-tensor quant graph-capture fix, ...),
-# applied on top instead of pulling the analytics-zoo/dev-bmg fork directly.
+# Pinned upstream commit + merged dev-bmg patch, including the BMG,
+# Gemma4, and KVCacheIO changes.
 RUN git clone ${SGL_KERNEL_UPSTREAM_REPO} /root/sk \
  && cd /root/sk \
  && git checkout ${SGL_KERNEL_UPSTREAM_COMMIT} \
  && git apply --whitespace=nowarn /llm-scaler/sglang/patches/sgl_kernel_xpu.patch \
- && git apply /llm-scaler/sglang/patches/sgl_kernel_xpu_gemma4.patch \
  && pip3 wheel -v /root/sk --config-settings=cmake.define.DPCPP_SYCL_TARGET=${DPCPP_SYCL_TARGET} --wheel-dir /root/wheels --no-deps \
  && rm -rf /root/sk \
  && rm -rf /root/.cache /root/.cmake /tmp/* /var/tmp/* /var/lib/apt/lists/*
@@ -61,13 +57,10 @@ RUN git clone ${SGL_KERNEL_UPSTREAM_REPO} /root/sk \
 # build script passes a cache-bust arg for this step only so the rest of the
 # image can stay cached while the pinned base + patch are refreshed on each
 # build.
-# Patch carries ESIMD fast-paths (decode attn, MoE fp8, fp8 GEMM,
-# QKV split-norm-rope, GDN conv fused_seq, RMSNormGated SYCL, prefill DPAS),
-# fp8 e5m2 weight dtype, XPU Graph scaffold + Qwen3.5/3.6 capture wiring —
-# applied on top of the pinned upstream release instead of pulling the
-# analytics-zoo/dev-bmg fork directly.
+# Patch carries the merged dev-bmg BMG, Qwen3.6, and Gemma4 changes on top of
+# the pinned upstream release.
 ARG SGLANG_CACHEBUST=0
-RUN echo "Refreshing sglang ${SGLANG_UPSTREAM_TAG} + BMG patch (cache bust ${SGLANG_CACHEBUST})" && \
+RUN echo "Refreshing sglang ${SGLANG_UPSTREAM_TAG} + merged dev-bmg patch (cache bust ${SGLANG_CACHEBUST})" && \
     git clone --depth 1 -b ${SGLANG_UPSTREAM_TAG} ${SGLANG_UPSTREAM_REPO} /root/sglang \
  && cd /root/sglang \
  && git apply --whitespace=nowarn /llm-scaler/sglang/patches/sglang_for_multi_arc.patch \
