@@ -15,9 +15,9 @@ sglang/
 │   ├── build_image.sh               # wrapper around `docker buildx build`
 │   ├── start_qwen3_6_service.sh     # launches the TP=2 e5m2 fp8 server
 │   ├── run_gemma4_26b_moe.sh        # Gemma4-26B-A4B TP=2, e4m3/e5m2
+│   ├── run_gemma4_31b.sh             # Gemma4-31B TP=2 online FP8
 │   └── run_gsm8k.py                 # standalone GSM8K accuracy harness
 ├── patches/                         # sglang / sgl-kernel-xpu source patches
-│                                    # snapshots of merged dev-bmg branches
 └── custom-esimd-kernels/            # merged ESIMD kernel package:
                                      #   decode attn, fp8 GEMM, fp8 MoE (silu + prefill),
                                      #   fused QKV, GDN conv fused_seq, RMSNormGated
