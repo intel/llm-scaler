@@ -146,7 +146,7 @@ RUN --mount=type=bind,from=builder,source=/root/wheels,target=/tmp/wheels \
  && uv pip install --python /opt/venv/bin/python \
         pytest expecttest ray huggingface_hub \
  # --- Pin the runtime to oneCCL 2021.15.9 ---
- && (uv pip uninstall --python /opt/venv/bin/python oneccl oneccl-devel || true) \
+ && uv pip uninstall --python /opt/venv/bin/python oneccl oneccl-devel \
  && curl -fL --retry 3 -o "${ONECCL_INSTALLER}" \
         "https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.9/${ONECCL_INSTALLER}" \
  && printf "%s  %s\n" "${ONECCL_INSTALLER_SHA256}" "${ONECCL_INSTALLER}" \
@@ -176,8 +176,6 @@ RUN --mount=type=bind,from=builder,source=/root/wheels,target=/tmp/wheels \
  && cp -a "${ONECCL_DST}/_installdir/ccl/2021.15" /opt/intel/oneapi/ccl/ \
  && rm -f /opt/intel/oneapi/ccl/latest \
  && ln -s /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/latest \
- && rm -f /opt/venv/lib/libccl.so /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so.1.0 \
-        /opt/venv/lib/libccl_openmp.so /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so.0.1 \
  && ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1.0 /opt/venv/lib/libccl.so.1 \
  && ln -sf /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so \
  && ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl_openmp.so.0.1 /opt/venv/lib/libccl_openmp.so.0 \
