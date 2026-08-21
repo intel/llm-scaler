@@ -134,7 +134,19 @@ RUN --mount=type=bind,from=builder,source=/root/wheels,target=/tmp/wheels \
         libmetee5=5.0.0-1~24.04~ppa2 \
         ocl-icd-libopencl1=2.3.2-1build1 \
         clinfo \
- # --- oneCCL 2021.15.9 runtime required by the BMG TP=2 path ---
+ # --- Python deps: pre-built wheels + explicit runtime deps sglang needs ---
+ && python3 -m pip config set global.break-system-packages true \
+ && pip3 install uv \
+ && uv pip install --python /opt/venv/bin/python \
+        /tmp/wheels/*.whl \
+        --extra-index-url https://download.pytorch.org/whl/xpu \
+ && uv pip install --python /opt/venv/bin/python \
+        --no-deps xgrammar==0.1.33 || true \
+ # --- runtime helpers (eval scripts: gsm8k, etc.) ---
+ && uv pip install --python /opt/venv/bin/python \
+        pytest expecttest ray huggingface_hub \
+ # --- Pin the runtime to oneCCL 2021.15.9 ---
+ && (uv pip uninstall --python /opt/venv/bin/python oneccl oneccl-devel || true) \
  && curl -fL --retry 3 -o "${ONECCL_INSTALLER}" \
         "https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.9/${ONECCL_INSTALLER}" \
  && printf "%s  %s\n" "${ONECCL_INSTALLER_SHA256}" "${ONECCL_INSTALLER}" \
@@ -164,29 +176,14 @@ RUN --mount=type=bind,from=builder,source=/root/wheels,target=/tmp/wheels \
  && cp -a "${ONECCL_DST}/_installdir/ccl/2021.15" /opt/intel/oneapi/ccl/ \
  && rm -f /opt/intel/oneapi/ccl/latest \
  && ln -s /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/latest \
- && rm -f "${ONECCL_INSTALLER}" \
- && rm -rf "/tmp/${ONECCL_INSTALLER%.sh}" "${ONECCL_DST}" \
- # --- Python deps: pre-built wheels + explicit runtime deps sglang needs ---
- && python3 -m pip config set global.break-system-packages true \
- && pip3 install uv \
- && uv pip install --python /opt/venv/bin/python \
-        /tmp/wheels/*.whl \
-        --extra-index-url https://download.pytorch.org/whl/xpu \
- && uv pip install --python /opt/venv/bin/python \
-        --no-deps xgrammar==0.1.33 || true \
- # --- runtime helpers (eval scripts: gsm8k, etc.) ---
- && uv pip install --python /opt/venv/bin/python \
-        pytest expecttest ray huggingface_hub \
- # --- Replace the torch-bundled oneCCL in /opt/venv/lib with links to
- #     oneCCL 2021.15 (libtorch_xpu.so resolves libccl.so.1 through its
- #     RPATH into /opt/venv/lib). ---
- && uv pip uninstall --python /opt/venv/bin/python oneccl oneccl-devel || true \
  && rm -f /opt/venv/lib/libccl.so /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so.1.0 \
         /opt/venv/lib/libccl_openmp.so /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so.0.1 \
  && ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1.0 /opt/venv/lib/libccl.so.1 \
  && ln -sf /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so \
  && ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl_openmp.so.0.1 /opt/venv/lib/libccl_openmp.so.0 \
  && ln -sf /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so \
+ && rm -f "${ONECCL_INSTALLER}" \
+ && rm -rf "/tmp/${ONECCL_INSTALLER%.sh}" "${ONECCL_DST}" \
  && chmod +x /llm-scaler/sglang/scripts/*.sh \
  # --- Size cleanup: drop caches + bytecode ---
  && find /opt/venv /usr/local/lib/python3* -name "*.pyc" -delete 2>/dev/null || true \
