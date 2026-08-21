@@ -1,7 +1,9 @@
 # SGLang on Intel BMG
 
-End-to-end recipe for running Qwen3.6-35B-A3B and Gemma4-26B-A4B online FP8
-inference on Intel Battlemage (BMG) GPUs with optimized ESIMD fast paths.
+End-to-end recipe for running Qwen3.6-35B-A3B online fp8 (e5m2) inference on
+Intel Battlemage (BMG) GPUs with the optimized ESIMD kernel fast-paths. Decode
+runs eager (XPU graph disabled for accuracy); the e5m2 fused decode kernels
+recover the per-step host-dispatch cost.
 
 ## What's in here
 
