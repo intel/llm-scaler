@@ -5501,10 +5501,10 @@ index f201c225766b67cf49deec28d9417871384c3749..4814fcb79826d36753a243f133037d19
              [t.data_ptr() for t in prefix_tensors],
              device=req_to_token_pool.device,
 diff --git a/python/sglang/srt/mem_cache/hicache_storage.py b/python/sglang/srt/mem_cache/hicache_storage.py
-index a982cb7c8258951fde9a0c1bbc73499c9c39ff9a..1a30f581bd26329c64f2871560b79d2f79f93ad9 100644
+index a982cb7c8258951fde9a0c1bbc73499c9c39ff9a..531027db38e2263cb3fbf84d38b8b212f57f33f7 100644
 --- a/python/sglang/srt/mem_cache/hicache_storage.py
 +++ b/python/sglang/srt/mem_cache/hicache_storage.py
-@@ -34,7 +34,17 @@ class HiCacheStorageConfig:
+@@ -34,6 +34,16 @@ class HiCacheStorageConfig:
      model_name: Optional[str]
      tp_lcm_size: Optional[int] = None
      should_split_heads: bool = False
@@ -5516,12 +5516,11 @@ index a982cb7c8258951fde9a0c1bbc73499c9c39ff9a..1a30f581bd26329c64f2871560b79d2f
 +    # tokens a page holds, so the payload length differs for the same key.
 +    # Optional with None defaults so third-party HiCacheStorage backends that construct
 +    # this dataclass positionally keep working.
-     extra_config: Optional[dict] = None
 +    kv_cache_dtype: Optional[str] = None
 +    page_size: Optional[int] = None
+     extra_config: Optional[dict] = None
  
  
- @dataclass
 @@ -336,6 +346,17 @@ class HiCacheFile(HiCacheStorage):
              self.config_suffix += f"_{tp_rank}_{tp_size}"
          if enable_pp:
