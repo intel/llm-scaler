@@ -30,18 +30,50 @@ ARG SGL_KERNEL_UPSTREAM_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
 # sgl-kernel-xpu has no release tags; pin to the exact upstream/main commit
 # the analytics-zoo/dev-bmg fork was branched from.
 ARG SGL_KERNEL_UPSTREAM_COMMIT=ea5c70f0909bcd55ceaf1803302651fc0593b64d
+ARG ONECCL_INSTALLER="intel-oneccl-2021.15.9.14_offline.sh"
+ARG ONECCL_INSTALLER_SHA256="f7ab81b6ed1b10dd35fadec366a78046d8af214888dfd625047ce8953d5aa4ef"
 
 WORKDIR /llm-scaler/sglang
 COPY . .
 
 # --- System packages + pip/uv base setup ---
 RUN apt-get update \
- && apt-get install -y --no-install-recommends python3-pip python3-dev git ninja-build \
+ && apt-get install -y --no-install-recommends python3-pip python3-dev git ninja-build curl ca-certificates \
  && python3 -m pip config set global.break-system-packages true \
  && pip3 install uv \
  && uv pip install --system ninja \
  && uv pip install --system torch==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu \
  && rm -rf /root/.cache /root/.cmake /tmp/* /var/tmp/* /var/lib/apt/lists/*
+
+# --- Install the validated oneCCL runtime in the oneAPI builder ---
+RUN curl -fL --retry 3 -o "${ONECCL_INSTALLER}" \
+        "https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.9/${ONECCL_INSTALLER}" \
+ && printf "%s  %s\n" "${ONECCL_INSTALLER_SHA256}" "${ONECCL_INSTALLER}" \
+        > /tmp/oneccl.sha256 \
+ && sha256sum -c /tmp/oneccl.sha256 \
+ && rm -f /tmp/oneccl.sha256 \
+ && bash "${ONECCL_INSTALLER}" -s -x -f /tmp \
+ && ONECCL_CUP="/tmp/${ONECCL_INSTALLER%.sh}/packages/intel.oneapi.lin.ccl.runtime,v=2021.15.9+13/cupPayload.cup" \
+ && ONECCL_DST="/tmp/oneccl-runtime" \
+ && python3 -m zipfile -e "${ONECCL_CUP}" "${ONECCL_DST}" \
+ && ONECCL_LIB="${ONECCL_DST}/_installdir/ccl/2021.15/lib" \
+ && rm -f "${ONECCL_LIB}/libccl.so" "${ONECCL_LIB}/libccl.so.1" \
+        "${ONECCL_LIB}/libccl_openmp.so" "${ONECCL_LIB}/libccl_openmp.so.0" \
+ && ln -sf libccl.so.1 "${ONECCL_LIB}/libccl.so" \
+ && ln -sf libccl.so.1.0 "${ONECCL_LIB}/libccl.so.1" \
+ && ln -sf libccl_openmp.so.0 "${ONECCL_LIB}/libccl_openmp.so" \
+ && ln -sf libccl_openmp.so.0.1 "${ONECCL_LIB}/libccl_openmp.so.0" \
+ && ONECCL_CPU_LIB="${ONECCL_LIB}/ccl/cpu/lib" \
+ && rm -f "${ONECCL_CPU_LIB}/libccl.so" "${ONECCL_CPU_LIB}/libccl.so.1" \
+        "${ONECCL_CPU_LIB}/libccl_openmp.so" "${ONECCL_CPU_LIB}/libccl_openmp.so.0" \
+ && ln -sf libccl.so.1 "${ONECCL_CPU_LIB}/libccl.so" \
+ && ln -sf libccl.so.1.0 "${ONECCL_CPU_LIB}/libccl.so.1" \
+ && ln -sf libccl_openmp.so.0 "${ONECCL_CPU_LIB}/libccl_openmp.so" \
+ && ln -sf libccl_openmp.so.0.1 "${ONECCL_CPU_LIB}/libccl_openmp.so.0" \
+ && rm -rf /opt/intel/oneapi/ccl/2021.15 \
+ && cp -a "${ONECCL_DST}/_installdir/ccl/2021.15" /opt/intel/oneapi/ccl/ \
+ && rm -f "${ONECCL_INSTALLER}" \
+ && rm -rf "/tmp/${ONECCL_INSTALLER%.sh}" "${ONECCL_DST}"
 
 # --- Build sgl-kernel-xpu wheel ---
 # Pinned upstream commit + our BMG patch (mha_fwd init, gdn_attention,
@@ -96,8 +128,6 @@ ARG http_proxy
 ARG https_proxy
 ARG no_proxy=localhost,127.0.0.1,::1,intel.com,.intel.com
 ARG DPCPP_SYCL_TARGET=bmg
-ARG ONECCL_INSTALLER="intel-oneccl-2021.15.9.14_offline.sh"
-ARG ONECCL_INSTALLER_SHA256="f7ab81b6ed1b10dd35fadec366a78046d8af214888dfd625047ce8953d5aa4ef"
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 ENV http_proxy=${http_proxy} https_proxy=${https_proxy} no_proxy=${no_proxy}
 ENV TORCH_XPU_ARCH_LIST=${DPCPP_SYCL_TARGET}
@@ -105,6 +135,7 @@ ENV OMNI_XPU_DEVICE=${DPCPP_SYCL_TARGET}
 
 WORKDIR /llm-scaler/sglang
 COPY . .
+COPY --from=builder /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/2021.15
 COPY --from=builder /opt/intel/oneapi/2025.3/lib/libdnnl.so* /opt/intel/oneapi/2025.3/lib/
 
 # Single RUN: install UMD driver (BMG) + all pre-built wheels via bind-mounted /root/wheels
@@ -113,7 +144,7 @@ RUN --mount=type=bind,from=builder,source=/root/wheels,target=/tmp/wheels \
     export no_proxy=localhost,127.0.0.1,::1 \
  # --- Intel BMG user-mode driver (pytorch base does not bundle it) ---
  && apt-get update \
- && apt-get install -y --no-install-recommends software-properties-common python3-pip curl \
+ && apt-get install -y --no-install-recommends software-properties-common python3-pip \
  && add-apt-repository -y ppa:kobuk-team/intel-graphics \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -147,41 +178,12 @@ RUN --mount=type=bind,from=builder,source=/root/wheels,target=/tmp/wheels \
         pytest expecttest ray huggingface_hub \
  # --- Pin the runtime to oneCCL 2021.15.9 ---
  && uv pip uninstall --python /opt/venv/bin/python oneccl oneccl-devel \
- && curl -fL --retry 3 -o "${ONECCL_INSTALLER}" \
-        "https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.9/${ONECCL_INSTALLER}" \
- && printf "%s  %s\n" "${ONECCL_INSTALLER_SHA256}" "${ONECCL_INSTALLER}" \
-        > /tmp/oneccl.sha256 \
- && sha256sum -c /tmp/oneccl.sha256 \
- && rm -f /tmp/oneccl.sha256 \
- && bash "${ONECCL_INSTALLER}" -s -x -f /tmp \
- && ONECCL_CUP="/tmp/${ONECCL_INSTALLER%.sh}/packages/intel.oneapi.lin.ccl.runtime,v=2021.15.9+13/cupPayload.cup" \
- && ONECCL_DST="/tmp/oneccl-runtime" \
- && python3 -m zipfile -e "${ONECCL_CUP}" "${ONECCL_DST}" \
- && ONECCL_LIB="${ONECCL_DST}/_installdir/ccl/2021.15/lib" \
- && rm -f "${ONECCL_LIB}/libccl.so" "${ONECCL_LIB}/libccl.so.1" \
-        "${ONECCL_LIB}/libccl_openmp.so" "${ONECCL_LIB}/libccl_openmp.so.0" \
- && ln -sf libccl.so.1 "${ONECCL_LIB}/libccl.so" \
- && ln -sf libccl.so.1.0 "${ONECCL_LIB}/libccl.so.1" \
- && ln -sf libccl_openmp.so.0 "${ONECCL_LIB}/libccl_openmp.so" \
- && ln -sf libccl_openmp.so.0.1 "${ONECCL_LIB}/libccl_openmp.so.0" \
- && ONECCL_CPU_LIB="${ONECCL_DST}/_installdir/ccl/2021.15/lib/ccl/cpu/lib" \
- && rm -f "${ONECCL_CPU_LIB}/libccl.so" "${ONECCL_CPU_LIB}/libccl.so.1" \
-        "${ONECCL_CPU_LIB}/libccl_openmp.so" "${ONECCL_CPU_LIB}/libccl_openmp.so.0" \
- && ln -sf libccl.so.1 "${ONECCL_CPU_LIB}/libccl.so" \
- && ln -sf libccl.so.1.0 "${ONECCL_CPU_LIB}/libccl.so.1" \
- && ln -sf libccl_openmp.so.0 "${ONECCL_CPU_LIB}/libccl_openmp.so" \
- && ln -sf libccl_openmp.so.0.1 "${ONECCL_CPU_LIB}/libccl_openmp.so.0" \
- && mkdir -p /opt/intel/oneapi/ccl \
- && rm -rf /opt/intel/oneapi/ccl/2021.15 \
- && cp -a "${ONECCL_DST}/_installdir/ccl/2021.15" /opt/intel/oneapi/ccl/ \
  && rm -f /opt/intel/oneapi/ccl/latest \
  && ln -s /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/latest \
  && ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1.0 /opt/venv/lib/libccl.so.1 \
  && ln -sf /opt/venv/lib/libccl.so.1 /opt/venv/lib/libccl.so \
  && ln -sf /opt/intel/oneapi/ccl/2021.15/lib/libccl_openmp.so.0.1 /opt/venv/lib/libccl_openmp.so.0 \
  && ln -sf /opt/venv/lib/libccl_openmp.so.0 /opt/venv/lib/libccl_openmp.so \
- && rm -f "${ONECCL_INSTALLER}" \
- && rm -rf "/tmp/${ONECCL_INSTALLER%.sh}" "${ONECCL_DST}" \
  && chmod +x /llm-scaler/sglang/scripts/*.sh \
  # --- Size cleanup: drop caches + bytecode ---
  && find /opt/venv /usr/local/lib/python3* -name "*.pyc" -delete 2>/dev/null || true \

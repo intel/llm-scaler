@@ -13,32 +13,6 @@ SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.05}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-32768}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-1}"
 
-ensure_oneccl_render_links() {
-    if compgen -G "/dev/dri/by-path/*-render" >/dev/null; then
-        return
-    fi
-
-    mkdir -p /dev/dri/by-path
-    local render device_path bdf node
-    local created=0
-    for render in /sys/class/drm/renderD*; do
-        [[ -e "${render}" ]] || continue
-        device_path="$(readlink -f "${render}/device")"
-        bdf="${device_path##*/}"
-        node="${render##*/}"
-        [[ -e "/dev/dri/${node}" ]] || continue
-        ln -sf "../${node}" "/dev/dri/by-path/pci-${bdf}-render"
-        created=1
-    done
-
-    if [[ "${created}" -ne 1 ]]; then
-        echo "Cannot create oneCCL render links under /dev/dri/by-path" >&2
-        return 1
-    fi
-}
-
-ensure_oneccl_render_links
-
 case "${FP8_DTYPE}" in
     e4m3|e5m2) ;;
     *)
