@@ -63,6 +63,18 @@ docker run --rm -it \
     llm-scaler-sgl:bmg
 ```
 
+### Gemma4-31B
+
+```bash
+docker run --rm -it \
+    --device=/dev/dri \
+    --shm-size=32g \
+    -v /path/to/gemma-4-31B-it:/models/gemma-4-31B-it:ro \
+    -p 30000:30000 \
+    --entrypoint /llm-scaler/sglang/scripts/run_gemma4_31b.sh \
+    llm-scaler-sgl:bmg
+```
+
 ## Fast-paths enabled
 
 Each is gated by an env var (set by `start_qwen3_6_service.sh`):
