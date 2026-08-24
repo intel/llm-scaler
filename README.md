@@ -1,6 +1,6 @@
 # LLM Scaler
 
-LLM Scaler is an GenAI solution for text generation, image generation, video generation etc. running on Intel® Arc™ Pro B60 and B70 GPUs. LLM Scalar leverages standard frameworks such as vLLM, ComfyUI, SGLang Diffusion, Xinference etc and ensures the best performance for State-of-Art GenAI models running on Arc Pro B60/B70 GPUs.
+LLM Scaler is a GenAI solution for text generation, image generation, video generation etc. running on Intel® Arc™ Pro B60 and B70 GPUs. LLM Scaler leverages standard frameworks such as vLLM, ComfyUI, SGLang Diffusion, Xinference etc and ensures the best performance for State-of-the-Art GenAI models running on Arc Pro B60/B70 GPUs.
 
 ---
 
@@ -9,24 +9,24 @@ LLM Scaler is an GenAI solution for text generation, image generation, video gen
 - 🔥[2026.08] We released `intel/llm-scaler-omni:0.2.0-b1` to support ComfyUI 0.31 XPU stack, MiniMax H3 local video generation, Wan Animate 2 workflows, add optimizations for Wan 2.2 14B T2V Turbo, LTX-2, Z-Image/Lumina and Krea2 workflows, and support Quantized ComfyUI workflows (GGUF Q4_1 and Nunchaku W4A16)
 - 🔥[2026.08] We released `intel/llm-scaler-vllm:0.21.0-b3` to support Muse-Glimmer-30B, support DFlash for Muse-Glimmer-30B and Qwen3.6-27B, and improve TTFT for gemma-4-31B-it and gemma-4-26B-A4B-it. 
 - 🔥[2026.08] We released `intel/llm-scaler-vllm:0.21.0-b2` to support Multi-token Prediction (MTP) and Lora Serving for Qwen3.6-27B, Qwen3.6-35B-A3B, gemma-4-31B-it and gemma-4-26B-A4B-it models, and support per-block quantization models Qwen3.6-27B-FP8 and Qwen3.6-35B-A3B-FP8. 
-- [2026.07] We released `intel/llm-scaler-omni:0.1.0-b8` to support ComfyUI 0.27.0,more workflows and models.
-- [2026.07] We released `intel/llm-scaler-vllm:0.21.0-b1` to support gemma-4 (12B, 31B and 26B-A4B) and diffusiongemma (26B-A4B) models, and experimentally support XPU graph. 
+- [2026.07] We released `intel/llm-scaler-omni:0.1.0-b8` to support ComfyUI 0.27.0, more workflows and models.
+- [2026.07] We released `intel/llm-scaler-vllm:0.21.0-b1` to support Gemma 4 (12B, 31B and 26B-A4B) and diffusiongemma (26B-A4B) models, and experimentally support XPU graph. 
 - [2026.06] We released `intel/llm-scaler-vllm:0.14.0-b8.3.2` to fix Qwen3.5/3.6-27B accuracy issues. 
 - [2026.06] We released `intel/llm-scaler-vllm:0.14.0-b8.3.1` to enable FP8 KV Cache and fix bugs for Qwen3/Qwen3.5 models. 
 - [2026.05] We released `intel/llm-scaler-vllm:0.14.0-b8.3` to improve performance for Qwen3.5/3.6 series and Qwen3-Coder-Next, and enabled model streaming load to reduce peak memory. 
 - [2026.05] We released `intel/llm-scaler-vllm:1.4` (or, `intel/llm-scaler-vllm:0.14.0-b8.2.1`) with new platform image and support Intel® Arc™ Pro B70 GPU. 
-- [2026.05] We released `intel/llm-scaler-omni:0.1.0-b7` for more model workflows and performance improvments. 
+- [2026.05] We released `intel/llm-scaler-omni:0.1.0-b7` for more model workflows and performance improvements. 
 - [2026.03] We released `intel/llm-scaler-vllm:0.14.0-b8.1` to support Qwen3.5-27B, Qwen3.5-35B-A3B and Qwen3.5-122B-A10B (FP8/INT4 online quantization, GPTQ)
 - [2026.03] We released `intel/llm-scaler-omni:0.1.0-b6` for ComfyUI to support CacheDiT and torch.compile(), ComfyUI-GGUF, and more model workflows, and support FP8 for SGLang Diffusion.
 - [2026.03] We released `intel/llm-scaler-vllm:0.14.0-b8` for vLLM 0.14.0 and PyTorch 2.10 support, various new models support and performance improvement. 
 - [2026.01] We released `intel/llm-scaler-vllm:1.3` (or, `intel/llm-scaler-vllm:0.11.1-b7`) for vLLM 0.11.1 and PyTorch 2.9 support, various new models support and performance improvement.
 - [2026.01] We released `intel/llm-scaler-omni:0.1.0-b5` for Python 3.12 and PyTorch 2.9 support, various ComfyUI workflows and more SGLang Diffusion support.
 - [2025.12] We released `intel/llm-scaler-vllm:1.2`, same image as `intel/llm-scaler-vllm:0.10.2-b6`. 
-- [2025.12] We released `intel/llm-scaler-omni:0.1.0-b4` to support ComfyUI workflows for Z-Image-Turbo, Hunyuan-Video-1.5 T2V/I2V with multi-XPU, and experimentially support SGLang Diffusion. 
+- [2025.12] We released `intel/llm-scaler-omni:0.1.0-b4` to support ComfyUI workflows for Z-Image-Turbo, Hunyuan-Video-1.5 T2V/I2V with multi-XPU, and experimentally support SGLang Diffusion. 
 - [2025.11] We released `intel/llm-scaler-vllm:0.10.2-b6` to support Qwen3-VL (Dense/MoE), Qwen3-Omni, Qwen3-30B-A3B (MoE Int4), MinerU 2.5, ERNIE-4.5-vl etc. 
 - [2025.11] We released `intel/llm-scaler-vllm:0.10.2-b5` to support gpt-oss models and released `intel/llm-scaler-omni:0.1.0-b3` to support more ComfyUI workflows, and Windows installation.
 - [2025.10] We released `intel/llm-scaler-omni:0.1.0-b2` to support more models with ComfyUI workflows and Xinference.
-- [2025.09] We released `intel/llm-scaler-vllm:0.10.0-b3` to support more models (MinerU, MiniCPM-v-4.5 etc), and released `intel/llm-scaler-omni:0.1.0-b1` to enable first omni GenAI models using ComfyUI and Xinference on Arc Pro B60 GPU.
+- [2025.09] We released `intel/llm-scaler-vllm:0.10.0-b3` to support more models (MinerU, MiniCPM-v-4.5 etc), and released `intel/llm-scaler-omni:0.1.0-b1` to enable first Omni GenAI models using ComfyUI and Xinference on Arc Pro B60 GPU.
 - [2025.08] We released `intel/llm-scaler-vllm:1.0`.
 
 
