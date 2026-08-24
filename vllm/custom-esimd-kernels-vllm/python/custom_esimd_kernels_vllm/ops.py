@@ -293,13 +293,34 @@ def esimd_qkv_split_norm_rope_muse_glimmer(
     qkv_state:     [nTokens, (q_heads + 2*kv_heads)*128] fp16 contiguous
     q_out:         [nTokens, q_heads*128] fp16
     k_out/v_out:   [nTokens, kv_heads*128] fp16
-    positions:     [nTokens] int32
+    positions:     [nTokens] int32 or int64
     cos_sin_cache: [max_pos, 128] fp16, per row = concat(cos(64), sin(64))
     """
     # Keep the legacy compiled operator name until the next kernel rebuild.
     return _ops.esimd_qkv_split_norm_rope_onyx(
         qkv_state, q_out, k_out, v_out, positions,
         q_heads, kv_heads, float(q_scale), cos_sin_cache)
+
+
+def esimd_qkv_split_norm_rope_muse_glimmer_neox(
+    qkv_state: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    positions: torch.Tensor,
+    q_heads: int,
+    kv_heads: int,
+    q_scale: float,
+    eps: float,
+    cos_sin_cache: torch.Tensor,
+) -> torch.Tensor:
+    """MuseGlimmer fused Q/K split + norm + half-split (NEOX) RoPE.
+
+    ``positions`` accepts contiguous int32 or int64 tensors.
+    """
+    return _ops.esimd_qkv_split_norm_rope_onyx_neox(
+        qkv_state, q_out, k_out, v_out, positions,
+        q_heads, kv_heads, float(q_scale), float(eps), cos_sin_cache)
 
 
 # ---- Fused Conv1d + GDN (doubleGRF, LGRF module) ----
