@@ -3,11 +3,35 @@
 import torch
 
 from custom_esimd_kernels_vllm import (
+    esimd_qkv_split_norm_rope_muse_glimmer,
     esimd_qkv_split_norm_rope_muse_glimmer_neox,
 )
 
 
-def check(m: int, position_dtype: torch.dtype) -> None:
+def apply_rope(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    neox_style: bool,
+) -> torch.Tensor:
+    if neox_style:
+        return torch.cat(
+            (x[..., :64] * cos - x[..., 64:] * sin,
+             x[..., 64:] * cos + x[..., :64] * sin),
+            dim=-1,
+        )
+    even, odd = x[..., 0::2], x[..., 1::2]
+    return torch.stack(
+        (even * cos - odd * sin, odd * cos + even * sin),
+        dim=-1,
+    ).flatten(-2)
+
+
+def check(
+    m: int,
+    position_dtype: torch.dtype,
+    neox_style: bool,
+) -> None:
     q_heads, kv_heads, head_dim = 16, 1, 128
     hidden = (q_heads + 2 * kv_heads) * head_dim
     positions = torch.tensor(
@@ -22,10 +46,15 @@ def check(m: int, position_dtype: torch.dtype) -> None:
     v = torch.empty_like(k)
 
     q_scale = 3.87
-    eps = 1e-5
-    esimd_qkv_split_norm_rope_muse_glimmer_neox(
-        qkv, q, k, v, positions, q_heads, kv_heads, q_scale, eps, cache
-    )
+    eps = 1e-5 if neox_style else 1e-6
+    if neox_style:
+        esimd_qkv_split_norm_rope_muse_glimmer_neox(
+            qkv, q, k, v, positions, q_heads, kv_heads, q_scale, eps, cache
+        )
+    else:
+        esimd_qkv_split_norm_rope_muse_glimmer(
+            qkv, q, k, v, positions, q_heads, kv_heads, q_scale, cache
+        )
     torch.xpu.synchronize()
 
     chunks = qkv.reshape(m, q_heads + 2 * kv_heads, head_dim)
@@ -38,22 +67,14 @@ def check(m: int, position_dtype: torch.dtype) -> None:
     s = sin[positions.long()].float()
     q_ref = normed[:, :q_heads].reshape(m, q_heads, 128)
     k_ref = normed[:, q_heads:].reshape(m, kv_heads, 128)
-    q_ref = torch.cat(
-        (q_ref[..., :64] * c[:, None] - q_ref[..., 64:] * s[:, None],
-         q_ref[..., 64:] * c[:, None] + q_ref[..., :64] * s[:, None]),
-        dim=-1,
-    )
-    k_ref = torch.cat(
-        (k_ref[..., :64] * c[:, None] - k_ref[..., 64:] * s[:, None],
-         k_ref[..., 64:] * c[:, None] + k_ref[..., :64] * s[:, None]),
-        dim=-1,
-    )
+    q_ref = apply_rope(q_ref, c[:, None], s[:, None], neox_style)
+    k_ref = apply_rope(k_ref, c[:, None], s[:, None], neox_style)
     q_ref = q_ref.reshape_as(q).to(torch.float16)
     k_ref = k_ref.reshape_as(k).to(torch.float16)
     v_ref = chunks[:, q_heads + kv_heads:].reshape_as(v)
     torch.xpu.synchronize()
     print(
-        f"m={m} positions={position_dtype}:",
+        f"m={m} positions={position_dtype} neox={neox_style}:",
         "q max", (q.float() - q_ref.float()).abs().max().item(),
         "k max", (k.float() - k_ref.float()).abs().max().item(),
         "v max", (v.float() - v_ref.float()).abs().max().item(),
@@ -63,12 +84,15 @@ def check(m: int, position_dtype: torch.dtype) -> None:
     assert torch.equal(v, v_ref)
 
 
-def main() -> None:
+def test_supported_position_dtypes() -> None:
     torch.xpu.set_device(0)
     torch.manual_seed(0)
-    check(1, torch.int64)
-    check(3, torch.int32)
+    check(3, torch.int32, False)
+    check(3, torch.int64, False)
+    check(1, torch.int64, True)
+    check(3, torch.int32, True)
+    check(3, torch.int64, True)
 
 
 if __name__ == "__main__":
-    main()
+    test_supported_position_dtypes()

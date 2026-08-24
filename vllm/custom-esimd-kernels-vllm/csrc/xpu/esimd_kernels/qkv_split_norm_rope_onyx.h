@@ -23,12 +23,13 @@
 #define ONYX_QKV_LOC_K 1
 #define ONYX_QKV_LOC_V 2
 
+template <typename PositionT>
 ESIMD_INLINE void qkv_split_norm_rope_onyx_kernel(
     uint8_t* qkvState,
     uint8_t* qState,
     uint8_t* kState,
     uint8_t* vState,
-    uint32_t* ropePos,
+    PositionT* ropePos,
     fp16* ropeCosSinCache,   // [max_pos, 128] fp16 (cos[64] || sin[64])
     uint32_t hiddenDim,
     uint32_t qHead,
@@ -82,7 +83,7 @@ ESIMD_INLINE void qkv_split_norm_rope_onyx_kernel(
     }
 
     // The cache is [cos[64] || sin[64]] for both layouts.
-    uint32_t rowOffset = ropePos[tokIdx] * headDim;
+    uint32_t rowOffset = static_cast<uint32_t>(ropePos[tokIdx]) * headDim;
     // cos: [rowOffset .. +64), sin: [rowOffset+64 .. +128)
     simd<fp16, 64> cos16;
     simd<fp16, 64> sin16;
@@ -119,12 +120,13 @@ ESIMD_INLINE void qkv_split_norm_rope_onyx_kernel(
     }
 }
 
+template <typename PositionT>
 inline void qkv_split_norm_rope_onyx_host(
     uint8_t* qkvState,
     uint8_t* qState,
     uint8_t* kState,
     uint8_t* vState,
-    uint32_t* ropePos,
+    PositionT* ropePos,
     fp16* ropeCosSinCache,
     uint32_t ntoks,
     uint32_t hiddenDim,
