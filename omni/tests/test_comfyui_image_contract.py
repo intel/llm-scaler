@@ -97,7 +97,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_AIMDO_COMMIT": (
         "AIMDO_COMMIT",
-        "6ba00211f006d3686b9bbf27b7dbc399c3fbcbf0",
+        "563b2a8562a6fc124cc4bae29042a23f3c0a8f5e",
     ),
     "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.4.13"),
     "COMFY_GGUF_REPOSITORY": (
@@ -594,6 +594,20 @@ class ComfyUIImageContractTest(unittest.TestCase):
 
             self.assertEqual(sys.path[0], "/llm/ComfyUI")
             self.assertEqual(sys.path.count("/llm/ComfyUI"), 1)
+
+    def test_validator_completes_aimdo_device_lifecycle_before_allocation(self):
+        validator = load_validator()
+        control = mock.Mock()
+        control.init_devices.return_value = True
+        control.devctxs = [123]
+
+        validator.require_aimdo_xpu_devices(control, (0,))
+
+        control.init_devices.assert_called_once_with([0])
+
+        control.init_devices.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "failed to initialize"):
+            validator.require_aimdo_xpu_devices(control, (0,))
 
     def test_validator_rejects_noncanonical_component_revisions(self):
         validator = load_validator()

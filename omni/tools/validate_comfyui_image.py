@@ -290,6 +290,25 @@ def activate_runtime_providers():
     return runtime, providers, official_control, state
 
 
+def require_aimdo_xpu_devices(control, device_ids=(0,)) -> None:
+    """Complete the post-prestartup AIMDO lifecycle before XPU allocation."""
+
+    requested = list(device_ids)
+    init_devices = getattr(control, "init_devices", None)
+    if not callable(init_devices):
+        raise RuntimeError("Comfy AIMDO control has no init_devices()")
+    if not init_devices(requested):
+        raise RuntimeError(
+            f"Comfy AIMDO failed to initialize XPU devices {requested}"
+        )
+    contexts = list(getattr(control, "devctxs", ()))
+    if len(contexts) != len(requested) or any(not context for context in contexts):
+        raise RuntimeError(
+            "Comfy AIMDO returned incomplete XPU device contexts: "
+            f"requested={requested}, contexts={contexts}"
+        )
+
+
 def require_runtime_provider_wheel_manifest(
     manifest_path: Path = RUNTIME_PROVIDER_WHEEL_MANIFEST,
 ) -> dict[str, str]:
@@ -749,6 +768,8 @@ def main() -> None:
         raise RuntimeError(
             "PyTorch XPU is unavailable; run the container with --device=/dev/dri"
         )
+
+    require_aimdo_xpu_devices(comfy_aimdo.control)
 
     backend = comfy_kitchen.list_backends()["xpu"]
     if not backend["available"]:
