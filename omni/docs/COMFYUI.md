@@ -12,7 +12,7 @@ uses the local image produced by the source-build command in
 published image:
 
 ```bash
-IMAGE=local-audit/llm-scaler-omni:0.2.0-b2-comfyui-bmg
+IMAGE=llm-scaler-omni:0.2.0-b2-comfyui-bmg
 CONTAINER_NAME=comfyui
 
 sudo docker run -itd \

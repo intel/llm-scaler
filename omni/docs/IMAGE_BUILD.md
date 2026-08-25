@@ -8,7 +8,7 @@ default output is the ComfyUI-focused image.
 Run builds from `omni/`:
 
 ```bash
-OMNI_IMAGE_REPOSITORY=local-audit/llm-scaler-omni \
+OMNI_IMAGE_REPOSITORY=llm-scaler-omni \
 XPU_TARGET=bmg bash build.sh
 ```
 
@@ -17,7 +17,7 @@ assigns the `-comfyui-bmg` suffix to local builds because their native binaries
 are AOT-compiled for BMG. Published BMG releases use
 `intel/llm-scaler-omni:<version>` without a flavor or target suffix, but
 `0.2.0-b2` is currently available only as a source build. The command above
-produces `local-audit/llm-scaler-omni:0.2.0-b2-comfyui-bmg`.
+produces `llm-scaler-omni:0.2.0-b2-comfyui-bmg`.
 
 The supported environment overrides are:
 
@@ -173,7 +173,7 @@ the destination XPU.
 Run the validator inside the final container:
 
 ```bash
-IMAGE=local-audit/llm-scaler-omni:0.2.0-b2-comfyui-bmg
+IMAGE=llm-scaler-omni:0.2.0-b2-comfyui-bmg
 
 sudo docker run --rm \
     --device=/dev/dri/card0 \

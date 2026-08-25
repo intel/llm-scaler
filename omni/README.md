@@ -21,7 +21,7 @@ Build from the `omni` directory:
 cd omni
 
 # Intel Arc B-series / Battlemage
-OMNI_IMAGE_REPOSITORY=local-audit/llm-scaler-omni \
+OMNI_IMAGE_REPOSITORY=llm-scaler-omni \
 XPU_TARGET=bmg bash build.sh
 ```
 
@@ -40,7 +40,7 @@ intel/llm-scaler-omni:<version>
 
 `0.2.0-b2` has not been published as `intel/llm-scaler-omni:0.2.0-b2`.
 The source-build command above produces the local tag
-`local-audit/llm-scaler-omni:0.2.0-b2-comfyui-bmg`. Published tags are listed
+`llm-scaler-omni:0.2.0-b2-comfyui-bmg`. Published tags are listed
 in [Releases](../Releases.md). The development version is defined in
 `omni_xpu_kernel/omni_xpu_kernel/_version.py`.
 
@@ -50,7 +50,7 @@ Run the supplied acceptance script against the final image with the GPU device
 exposed:
 
 ```bash
-IMAGE=local-audit/llm-scaler-omni:0.2.0-b2-comfyui-bmg
+IMAGE=llm-scaler-omni:0.2.0-b2-comfyui-bmg
 
 sudo docker run --rm \
     --device=/dev/dri \
@@ -68,7 +68,7 @@ Mount the existing ComfyUI model directory rather than copying models into the
 image:
 
 ```bash
-IMAGE=local-audit/llm-scaler-omni:0.2.0-b2-comfyui-bmg
+IMAGE=llm-scaler-omni:0.2.0-b2-comfyui-bmg
 CONTAINER_NAME=comfyui
 COMFYUI_MODEL_DIR=/path/to/comfyui_models
 COMFYUI_OUTPUT_DIR=/path/to/comfyui_output
