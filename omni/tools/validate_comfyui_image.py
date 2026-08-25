@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import importlib
 import importlib.metadata
+import importlib.util
 import json
 import os
 import re
@@ -21,6 +22,7 @@ import tempfile
 from pathlib import Path
 from runpy import run_path
 
+from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 
@@ -42,11 +44,11 @@ PINNED_CHECKOUTS = {
     ),
     "Kitchen": (
         Path("/llm/comfy-kitchen-xpu"),
-        "OMNI_COMFY_KITCHEN_REVISION",
+        "OMNI_COMFY_KITCHEN_PROVIDER_REVISION",
     ),
     "Comfy AIMDO": (
         Path("/llm/comfy-aimdo-xpu"),
-        "OMNI_COMFY_AIMDO_REVISION",
+        "OMNI_COMFY_AIMDO_PROVIDER_REVISION",
     ),
     "GGUF custom node": (
         Path("/llm/ComfyUI/custom_nodes/ComfyUI-GGUF-XPU"),
@@ -86,6 +88,16 @@ PINNED_MINIMAX_H3_TEMPLATE_HASHES = {
 
 COMFYUI_ROOT = Path("/llm/ComfyUI")
 COMFYUI_DATABASE_DIRECTORY = COMFYUI_ROOT / "user"
+OMNIXPU_ROOT = COMFYUI_ROOT / "custom_nodes" / "ComfyUI-OmniXPU"
+OMNIXPU_RUNTIME_BOOTSTRAP = OMNIXPU_ROOT / "runtime_bootstrap.py"
+RUNTIME_PROVIDER_DISTRIBUTIONS = {
+    "comfy_kitchen.xpu": "comfy-kitchen-xpu-runtime",
+    "comfy_aimdo.xpu": "comfy-aimdo-xpu-runtime",
+}
+RUNTIME_PROVIDER_WHEEL_MANIFEST = Path(
+    "/llm/manifests/xpu-runtime-providers.sha256"
+)
+RUNTIME_CONSTRAINTS = Path("/llm/manifests/omni-runtime-constraints.txt")
 AIMDO_SOURCE_ROOT = Path("/llm/comfy-aimdo-xpu")
 AIMDO_REQUIRED_XPU_TESTS = {
     "test_xpu_backend.py",
@@ -225,6 +237,129 @@ def add_comfyui_to_import_path() -> None:
         sys.path.insert(0, comfyui_root)
 
 
+def activate_runtime_providers():
+    """Exercise the installed prestartup provider contract before Torch import."""
+
+    import comfy_aimdo.control as official_control
+
+    # ComfyUI calls official AIMDO init before custom-node prestartup. Reproduce
+    # that lifecycle so the provider must prove it can safely unwind only the
+    # official package's pre-device DSO state before taking allocator ownership.
+    official_control.init()
+    if "torch" in sys.modules:
+        raise RuntimeError("Torch was imported before runtime provider validation")
+    spec = importlib.util.spec_from_file_location(
+        "_comfyui_omnixpu_runtime_bootstrap", OMNIXPU_RUNTIME_BOOTSTRAP
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(
+            f"cannot load OmniXPU runtime bootstrap: {OMNIXPU_RUNTIME_BOOTSTRAP}"
+        )
+    runtime = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = runtime
+    try:
+        spec.loader.exec_module(runtime)
+        providers, errors = runtime.discover_providers()
+        if errors:
+            raise RuntimeError(
+                "installed XPU runtime providers were rejected: " + "; ".join(errors)
+            )
+        require_equal(
+            "installed XPU runtime provider ids",
+            ",".join(sorted(providers)),
+            ",".join(sorted(RUNTIME_PROVIDER_DISTRIBUTIONS)),
+        )
+        state = runtime.bootstrap(
+            providers_override=providers,
+            dynamic_vram_override=True,
+        )
+    except BaseException:
+        if sys.modules.get(spec.name) is runtime:
+            sys.modules.pop(spec.name, None)
+        raise
+
+    for provider_id in sorted(RUNTIME_PROVIDER_DISTRIBUTIONS):
+        provider_state = state["providers"].get(provider_id, {})
+        require_equal(
+            f"{provider_id} activation status",
+            str(provider_state.get("status", "missing")),
+            "active",
+        )
+    if sys.modules.get("comfy_aimdo.control") is not official_control:
+        raise RuntimeError("AIMDO provider replaced the imported control module object")
+    return runtime, providers, official_control, state
+
+
+def require_runtime_provider_wheel_manifest(
+    manifest_path: Path = RUNTIME_PROVIDER_WHEEL_MANIFEST,
+) -> dict[str, str]:
+    """Verify the two immutable provider wheel artifacts retained by the image."""
+
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            f"XPU runtime provider wheel manifest is missing: {manifest_path}"
+        )
+    expected_prefixes = {
+        "comfy_aimdo_xpu_runtime-": "comfy-aimdo-xpu-runtime",
+        "comfy_kitchen_xpu_runtime-": "comfy-kitchen-xpu-runtime",
+    }
+    observed: dict[str, str] = {}
+    for line in manifest_path.read_text(encoding="utf-8").splitlines():
+        fields = line.split(maxsplit=1)
+        if len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{64}", fields[0]):
+            raise RuntimeError(f"invalid provider wheel manifest line: {line!r}")
+        expected_sha256, raw_path = fields
+        wheel = Path(raw_path.strip())
+        if not wheel.is_absolute() or wheel.parent != Path("/wheels/providers"):
+            raise RuntimeError(f"provider wheel path is not canonical: {wheel}")
+        matches = [
+            distribution
+            for prefix, distribution in expected_prefixes.items()
+            if wheel.name.startswith(prefix) and wheel.suffix == ".whl"
+        ]
+        if len(matches) != 1 or matches[0] in observed:
+            raise RuntimeError(f"unexpected or duplicate provider wheel: {wheel}")
+        if not wheel.is_file():
+            raise RuntimeError(f"provider wheel is missing: {wheel}")
+        actual_sha256 = hashlib.sha256(wheel.read_bytes()).hexdigest()
+        require_equal(
+            f"{matches[0]} wheel SHA256", actual_sha256, expected_sha256
+        )
+        observed[matches[0]] = actual_sha256
+    require_equal(
+        "provider wheel manifest distributions",
+        set(observed),
+        set(RUNTIME_PROVIDER_DISTRIBUTIONS.values()),
+    )
+    return observed
+
+
+def require_runtime_constraints(expected: dict[str, str]) -> dict[str, str]:
+    """Require pip's upgrade guard to match the installed XPU ABI boundary."""
+
+    require_equal(
+        "PIP_CONSTRAINT",
+        os.environ.get("PIP_CONSTRAINT"),
+        str(RUNTIME_CONSTRAINTS),
+    )
+    if not RUNTIME_CONSTRAINTS.is_file():
+        raise RuntimeError(f"runtime constraints are missing: {RUNTIME_CONSTRAINTS}")
+    observed: dict[str, str] = {}
+    for line in RUNTIME_CONSTRAINTS.read_text(encoding="utf-8").splitlines():
+        fields = line.strip().split("==", 1)
+        if len(fields) != 2 or not fields[0] or not fields[1]:
+            raise RuntimeError(f"invalid runtime constraint: {line!r}")
+        name = canonicalize_name(fields[0])
+        if name in observed:
+            raise RuntimeError(f"duplicate runtime constraint: {name}")
+        observed[name] = fields[1]
+    normalized_expected = {
+        canonicalize_name(name): version for name, version in expected.items()
+    }
+    require_equal("runtime constraints", observed, normalized_expected)
+    return observed
+
+
 def require_torch_matched_oneapi_runtime() -> dict[str, list[str]]:
     """Require the loaded SYCL/UR libraries to come from the Torch venv."""
     loaded = Path("/proc/self/maps").read_text(encoding="utf-8")
@@ -270,6 +405,13 @@ def main() -> None:
 
     add_comfyui_to_import_path()
 
+    (
+        provider_runtime,
+        runtime_providers,
+        activated_aimdo_control,
+        runtime_provider_state,
+    ) = activate_runtime_providers()
+
     import torch
     import comfy_aimdo.control
     import comfy_kitchen
@@ -295,11 +437,27 @@ def main() -> None:
     expected_onednn_patch_sha256 = os.environ["OMNI_ONEDNN_PATCH_SHA256"]
     expected_comfyui = os.environ["OMNI_COMFYUI_VERSION"]
     expected_kitchen = os.environ["OMNI_COMFY_KITCHEN_VERSION"]
+    expected_kitchen_provider_revision = os.environ[
+        "OMNI_COMFY_KITCHEN_PROVIDER_REVISION"
+    ]
     expected_aimdo = os.environ["OMNI_COMFY_AIMDO_VERSION"]
-    expected_aimdo_revision = os.environ["OMNI_COMFY_AIMDO_REVISION"]
+    expected_aimdo_provider_revision = os.environ[
+        "OMNI_COMFY_AIMDO_PROVIDER_REVISION"
+    ]
     expected_nunchaku = os.environ["OMNI_COMFY_NUNCHAKU_VERSION"]
     source_revision = os.environ["OMNI_LLM_SCALER_SOURCE_REVISION"]
     source_dirty = os.environ["OMNI_LLM_SCALER_SOURCE_DIRTY"]
+
+    runtime_constraints = require_runtime_constraints(
+        {
+            "torch": expected_torch,
+            "torchvision": expected_torchvision,
+            "torchaudio": expected_torchaudio,
+            "omni-xpu-kernel": importlib.metadata.version("omni-xpu-kernel"),
+            "comfy-kitchen-xpu-runtime": expected_kitchen,
+            "comfy-aimdo-xpu-runtime": expected_aimdo,
+        }
+    )
 
     require_equal("image version", kernel_version.__image_version__, expected_image)
     require_equal("Torch version", torch.__version__, expected_torch)
@@ -325,6 +483,7 @@ def main() -> None:
         expected_patch_sha256=expected_onednn_patch_sha256,
     )
     oneapi_runtime_libraries = require_torch_matched_oneapi_runtime()
+    provider_wheel_hashes = require_runtime_provider_wheel_manifest()
     require_equal("kernel package target", omni_xpu_kernel.__xpu_target__, expected_target)
     require_equal("kernel AOT target", omni_xpu_kernel.core_aot_target(), expected_target)
     require_full_revision("llm-scaler source revision", source_revision)
@@ -338,18 +497,94 @@ def main() -> None:
         importlib.metadata.version("comfy-aimdo"),
         expected_aimdo,
     )
+    if comfy_aimdo.control is not activated_aimdo_control:
+        raise RuntimeError("ComfyUI does not reference the activated AIMDO module")
+    require_equal(
+        "runtime provider bootstrap status",
+        str(runtime_provider_state.get("status")),
+        "active",
+    )
+    require_equal(
+        "runtime provider diagnostic state",
+        provider_runtime.get_state(),
+        runtime_provider_state,
+    )
+    aimdo_provider = runtime_providers["comfy_aimdo.xpu"]
+    kitchen_provider = runtime_providers["comfy_kitchen.xpu"]
+    provider_expectations = {
+        "comfy_aimdo.xpu": (
+            expected_aimdo,
+            expected_aimdo_provider_revision,
+            "comfy_aimdo",
+        ),
+        "comfy_kitchen.xpu": (
+            expected_kitchen,
+            expected_kitchen_provider_revision,
+            "comfy_kitchen",
+        ),
+    }
+    provider_details = {}
+    for provider_id, (
+        expected_version,
+        expected_revision,
+        canonical_import,
+    ) in provider_expectations.items():
+        provider = runtime_providers[provider_id]
+        distribution_name = RUNTIME_PROVIDER_DISTRIBUTIONS[provider_id]
+        require_equal(
+            f"{provider_id} distribution version",
+            importlib.metadata.version(distribution_name),
+            expected_version,
+        )
+        require_equal(
+            f"{provider_id} manifest source revision",
+            provider.manifest["source"]["revision"],
+            expected_revision,
+        )
+        require_full_revision(
+            f"{provider_id} manifest source revision", expected_revision
+        )
+        distribution = importlib.metadata.distribution(distribution_name)
+        if any(
+            str(path).startswith(f"{canonical_import}/")
+            for path in (distribution.files or ())
+        ):
+            raise RuntimeError(
+                f"{distribution_name} illegally owns canonical {canonical_import} files"
+            )
+        provider_details[provider_id] = {
+            "version": expected_version,
+            "revision": expected_revision,
+            "canonical_root": str(provider.canonical_root),
+        }
     require_equal(
         "Comfy AIMDO detected backend",
         str(comfy_aimdo.control.detect_vendor()),
         "xpu",
     )
-    aimdo_xpu_library = Path(comfy_aimdo.control.__file__).with_name(
-        "aimdo_xpu.so"
-    )
+    aimdo_control_path = Path(comfy_aimdo.control.__file__).resolve()
+    if not aimdo_control_path.is_relative_to(aimdo_provider.canonical_root):
+        raise RuntimeError(
+            "Comfy AIMDO control is not routed from the XPU provider: "
+            f"{aimdo_control_path}"
+        )
+    aimdo_xpu_library = aimdo_control_path.with_name("aimdo_xpu.so")
     if not aimdo_xpu_library.is_file():
         raise RuntimeError(
             f"Comfy AIMDO XPU library is missing: {aimdo_xpu_library}"
         )
+    if sys.platform == "linux":
+        require_equal(
+            "Comfy AIMDO Linux allocator mode",
+            str(comfy_aimdo.control.get_xpu_allocator_mode()),
+            "global",
+        )
+        if not getattr(comfy_aimdo.control, "_xpu_allocator_ready", False):
+            raise RuntimeError("Comfy AIMDO Linux allocator takeover is not ready")
+        if getattr(comfy_aimdo.control, "lib", None) is None:
+            raise RuntimeError("Comfy AIMDO Linux native runtime is not loaded")
+        if getattr(comfy_aimdo.control, "_torch_allocator", None) is None:
+            raise RuntimeError("Comfy AIMDO Linux Torch allocator is not installed")
     missing_aimdo_tests = sorted(
         name
         for name in AIMDO_REQUIRED_XPU_TESTS
@@ -368,6 +603,12 @@ def main() -> None:
         comfy_kitchen.__version__,
         expected_kitchen,
     )
+    kitchen_module_path = Path(comfy_kitchen.__file__).resolve()
+    if not kitchen_module_path.is_relative_to(kitchen_provider.canonical_root):
+        raise RuntimeError(
+            "Kitchen is not routed from the XPU provider: "
+            f"{kitchen_module_path}"
+        )
     require_equal(
         "Kitchen distribution version",
         importlib.metadata.version("comfy-kitchen"),
@@ -548,7 +789,13 @@ def main() -> None:
         f"{comfyui_dependency_versions['comfyui-workflow-templates']}, "
         f"manager={comfyui_dependency_versions['comfyui-manager']}, "
         f"kitchen={expected_kitchen}, "
-        f"aimdo={expected_aimdo}@{expected_aimdo_revision[:12]}, "
+        "kitchen_provider="
+        f"{provider_details['comfy_kitchen.xpu']['revision'][:12]}, "
+        f"aimdo={expected_aimdo}, "
+        "aimdo_provider="
+        f"{provider_details['comfy_aimdo.xpu']['revision'][:12]}, "
+        f"provider_wheels={provider_wheel_hashes}, "
+        f"runtime_constraints={runtime_constraints}, "
         f"gguf={dependency_versions['gguf']}, nunchaku={expected_nunchaku}, "
         f"xpu={device_name!r}, kitchen_capabilities={len(capabilities)}, "
         f"h3_templates={len(h3_template_hashes)}"

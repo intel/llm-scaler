@@ -15,6 +15,8 @@ FULL_DOCKERFILE = OMNI_ROOT / "docker" / "Dockerfile.full"
 DOCKERIGNORE = OMNI_ROOT / ".dockerignore"
 BUILD_SCRIPT = OMNI_ROOT / "build.sh"
 VALIDATOR = OMNI_ROOT / "tools" / "validate_comfyui_image.py"
+UPGRADE_VALIDATOR = OMNI_ROOT / "tools" / "validate_comfyui_upgrade.py"
+UPDATE_COMFYUI = OMNI_ROOT / "tools" / "update_comfyui.sh"
 RUNTIME_ENTRYPOINT = OMNI_ROOT / "entrypoints" / "omix_torch_runtime.sh"
 ONEDNN_PATCH = (
     OMNI_ROOT
@@ -86,7 +88,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_KITCHEN_COMMIT": (
         "KITCHEN_COMMIT",
-        "74aead36b68cc67f156d8b6724ed7f6acb05a528",
+        "4b1115d50d98b8a50b826945730b3d4ba831cc91",
     ),
     "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.31"),
     "COMFY_AIMDO_REPOSITORY": (
@@ -95,7 +97,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_AIMDO_COMMIT": (
         "AIMDO_COMMIT",
-        "8600b938a517af7329cbf290d6e70a52ae78187d",
+        "6ba00211f006d3686b9bbf27b7dbc399c3fbcbf0",
     ),
     "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.4.13"),
     "COMFY_GGUF_REPOSITORY": (
@@ -450,14 +452,23 @@ class ComfyUIImageContractTest(unittest.TestCase):
             dockerfile,
         )
         self.assertIn(
-            "/wheels/comfy_aimdo-${COMFY_AIMDO_VERSION}-*.whl",
+            "/wheels/aimdo-source/comfy_aimdo-${COMFY_AIMDO_VERSION}-*.whl",
+            dockerfile,
+        )
+        self.assertIn(
+            "python packaging/xpu_runtime_provider/build_wheel.py",
+            dockerfile,
+        )
+        self.assertIn(
+            "/wheels/providers/comfy_aimdo_xpu_runtime-"
+            "${COMFY_AIMDO_VERSION}-*.whl",
             dockerfile,
         )
         self.assertEqual(
             validator.PINNED_CHECKOUTS["Comfy AIMDO"],
             (
                 Path("/llm/comfy-aimdo-xpu"),
-                "OMNI_COMFY_AIMDO_REVISION",
+                "OMNI_COMFY_AIMDO_PROVIDER_REVISION",
             ),
         )
         self.assertEqual(
@@ -484,6 +495,34 @@ class ComfyUIImageContractTest(unittest.TestCase):
         )
         self.assertIn(
             "comfyui-workflow-templates|comfy-kitchen|comfy-aimdo",
+            dockerfile,
+        )
+        self.assertIn(
+            '"comfy-kitchen==${COMFY_KITCHEN_VERSION}"',
+            dockerfile,
+        )
+        self.assertIn(
+            '"comfy-aimdo==${COMFY_AIMDO_VERSION}"',
+            dockerfile,
+        )
+        self.assertIn(
+            "/llm/manifests/xpu-runtime-providers.sha256",
+            dockerfile,
+        )
+        self.assertIn(
+            "/llm/manifests/omni-runtime-constraints.txt",
+            dockerfile,
+        )
+        self.assertIn(
+            'PIP_CONSTRAINT="/llm/manifests/omni-runtime-constraints.txt"',
+            dockerfile,
+        )
+        self.assertNotIn(
+            "/wheels/comfy_kitchen-${COMFY_KITCHEN_VERSION}-*.whl",
+            dockerfile,
+        )
+        self.assertNotIn(
+            "/wheels/comfy_aimdo-${COMFY_AIMDO_VERSION}-*.whl",
             dockerfile,
         )
         self.assertNotIn(
@@ -523,6 +562,28 @@ class ComfyUIImageContractTest(unittest.TestCase):
             validator.COMFYUI_DATABASE_DIRECTORY,
             Path("/llm/ComfyUI/user"),
         )
+
+    def test_upgrade_path_preserves_provider_ownership_and_runtime_constraints(self):
+        update_script = UPDATE_COMFYUI.read_text(encoding="utf-8")
+        upgrade_validator = UPGRADE_VALIDATOR.read_text(encoding="utf-8")
+
+        self.assertNotIn("git stash", update_script)
+        self.assertNotIn("git pull origin master", update_script)
+        self.assertIn('COMFYUI_UPGRADE_REF="${COMFYUI_UPGRADE_REF:-master}"', update_script)
+        self.assertIn('git checkout --detach FETCH_HEAD', update_script)
+        self.assertIn('python -m pip install --upgrade -r requirements.txt', update_script)
+        self.assertIn("PIP_CONSTRAINT", update_script)
+        for distribution in (
+            "comfy-aimdo-xpu-runtime",
+            "comfy-kitchen-xpu-runtime",
+        ):
+            with self.subTest(distribution=distribution):
+                self.assertIn(distribution, upgrade_validator)
+        self.assertIn("provider_snapshot()", upgrade_validator)
+        self.assertIn("official package or ComfyUI upgrade changed", upgrade_validator)
+        self.assertIn('"OMNIXPU_PROVIDER_BOOTSTRAP": mode', upgrade_validator)
+        self.assertIn('activation_probe("auto")', upgrade_validator)
+        self.assertIn('activation_probe("required")', upgrade_validator)
 
     def test_validator_adds_comfyui_root_before_manager_import(self):
         validator = load_validator()

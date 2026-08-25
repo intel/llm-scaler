@@ -43,6 +43,30 @@ class OmniXPUStatus:
             except Exception:
                 pass
 
+        # Runtime providers are activated during prestartup, before this custom
+        # node package imports Torch. Keep their ownership and fallback state
+        # visible without importing either provider again.
+        runtime = sys.modules.get("_comfyui_omnixpu_runtime_bootstrap")
+        if runtime and hasattr(runtime, "get_state"):
+            try:
+                provider_state = runtime.get_state()
+                lines.append(
+                    "  runtime providers: "
+                    f"{provider_state.get('status', 'unknown')} "
+                    f"(mode={provider_state.get('mode', 'unknown')})"
+                )
+                for provider_id, state in sorted(
+                    provider_state.get("providers", {}).items()
+                ):
+                    line = f"    {provider_id}: {state.get('status', 'unknown')}"
+                    if state.get("reason"):
+                        line += f" ({state['reason']})"
+                    lines.append(line)
+                for error in provider_state.get("errors", ()):
+                    lines.append(f"    rejected: {error}")
+            except Exception as exc:
+                lines.append(f"  runtime providers: diagnostics failed ({exc})")
+
         # Kitchen is the authority for generic operator registration and
         # fallback. Report it separately from custom-node adapters.
         try:

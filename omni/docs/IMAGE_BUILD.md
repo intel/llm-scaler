@@ -37,12 +37,12 @@ The supported environment overrides are:
 | `COMFYUI_FRONTEND_VERSION` | ComfyUI frontend package version | pinned in `build.sh` |
 | `COMFYUI_WORKFLOW_TEMPLATES_VERSION` | Official workflow-template bundle version | pinned in `build.sh` |
 | `COMFYUI_MANAGER_VERSION` | Integrated Node Manager package version | pinned in `build.sh` |
-| `COMFY_KITCHEN_REPOSITORY` | Kitchen source repository | pinned in `build.sh` |
-| `COMFY_KITCHEN_COMMIT` | Kitchen source revision | pinned in `build.sh` |
-| `COMFY_KITCHEN_VERSION` | Expected Kitchen wheel version | pinned in `build.sh` |
-| `COMFY_AIMDO_REPOSITORY` | AIMDO source repository identity | pinned in `build.sh` |
-| `COMFY_AIMDO_COMMIT` | AIMDO source revision | pinned in `build.sh` |
-| `COMFY_AIMDO_VERSION` | Expected AIMDO wheel version | pinned in `build.sh` |
+| `COMFY_KITCHEN_REPOSITORY` | Kitchen XPU provider source repository | pinned in `build.sh` |
+| `COMFY_KITCHEN_COMMIT` | Kitchen XPU provider source revision | pinned in `build.sh` |
+| `COMFY_KITCHEN_VERSION` | Official Kitchen and matching provider version | pinned in `build.sh` |
+| `COMFY_AIMDO_REPOSITORY` | AIMDO XPU provider source repository | pinned in `build.sh` |
+| `COMFY_AIMDO_COMMIT` | AIMDO XPU provider source revision | pinned in `build.sh` |
+| `COMFY_AIMDO_VERSION` | Official AIMDO and matching provider version | pinned in `build.sh` |
 | `COMFY_GGUF_REPOSITORY` | GGUF custom-node source repository | pinned in `build.sh` |
 | `COMFY_GGUF_COMMIT` | GGUF custom-node source revision | pinned in `build.sh` |
 | `COMFY_NUNCHAKU_REPOSITORY` | Combined Nunchaku custom-node/runtime repository | pinned in `build.sh` |
@@ -50,15 +50,20 @@ The supported environment overrides are:
 | `COMFY_NUNCHAKU_VERSION` | Expected combined distribution version | pinned in `build.sh` |
 
 ComfyUI repository, commit, and version must be updated together. Kitchen and
-AIMDO repository, commit, and version pins are independently checked against
-their package metadata. GGUF repository and commit must be updated together.
+AIMDO official distribution versions and matching XPU provider source pins are
+independently checked against their package and provider manifests. GGUF
+repository and commit must be updated together.
 The same rule applies to the combined Nunchaku repository, commit, and
 distribution version. The kernel source is copied from
 `omni/omni_xpu_kernel` in the current llm-scaler checkout.
 
-The AIMDO revision must be reachable from its pinned remote. The build fetches
-and checks out that exact full commit before compiling the Level Zero backend;
-branch names are not used as image identity.
+Each provider revision must be reachable from its pinned remote. The build
+fetches and checks out those exact full commits before constructing the private
+provider wheels; branch names are not used as image identity. The normal XPU
+wheel is only an intermediate input. Its canonical package tree is re-homed
+below the distinct `comfy-kitchen-xpu-runtime` or
+`comfy-aimdo-xpu-runtime` distribution, so it cannot overwrite the official
+top-level package.
 
 The AIMDO Unified Runtime hook is compiled against
 `/opt/venv/include/unified-runtime/ur_api.h`, which belongs to the
@@ -80,6 +85,17 @@ does not clone the legacy Manager custom node. Frontend, workflow templates,
 and Manager are explicit build inputs; the final image also records a complete
 `pip freeze --all` dependency snapshot at
 `/llm/manifests/comfyui-python-freeze.txt`.
+
+The official `comfy-kitchen` and `comfy-aimdo` packages remain installed as
+ordinary ComfyUI dependencies. Matching XPU runtime providers use private
+package names and are discovered by ComfyUI-OmniXPU during the normal custom
+node prestartup phase. The image retains the two exact provider wheels and
+their SHA256 values in `/llm/manifests/xpu-runtime-providers.sha256`. No
+launcher, Python entry point, or global `sitecustomize` hook is modified.
+The runtime also exports a narrow pip constraint file for Torch, torchvision,
+torchaudio, `omni_xpu_kernel`, and the two provider distributions. Normal
+ComfyUI dependency upgrades can move the official packages, but cannot
+silently replace the Torch ABI or provider artifacts.
 
 The official XPU index does not provide a Torch-2.13-matched `torchaudio`
 wheel, while ComfyUI requires torchaudio and the maintained workflows include
@@ -117,8 +133,8 @@ The focused Dockerfile separates the frequently changed native projects:
 | `comfyui-deps` | Pinned ComfyUI and third-party custom nodes |
 | `sycl-tla` | Pinned native headers |
 | `kernel-wheel` | Target-specific `omni_xpu_kernel` wheel |
-| `kitchen-wheel` | Pinned Comfy Kitchen wheel |
-| `aimdo-wheel` | Pinned AIMDO wheel with the Level Zero XPU backend |
+| `kitchen-wheel` | Pinned Kitchen XPU source wheel and co-installable provider wheel |
+| `aimdo-wheel` | Pinned AIMDO Level Zero source wheel and co-installable provider wheel |
 | `builder-comfyui` | Wheel installation and local ComfyUI integration |
 | `runtime-comfyui` | Final labels, environment, and runtime metadata |
 
@@ -138,8 +154,9 @@ whether `omni/` had uncommitted changes. The final image also records:
 - selected XPU target;
 - ComfyUI version and commit;
 - ComfyUI frontend, workflow-template, and integrated Manager versions;
-- Kitchen version and commit;
-- AIMDO version and commit;
+- official Kitchen version and Kitchen XPU provider commit;
+- official AIMDO version and AIMDO XPU provider commit;
+- retained XPU provider wheel SHA256 values;
 - GGUF custom-node commit;
 - combined Nunchaku custom-node/runtime version and commit;
 - SYCL-TLA commit.
@@ -167,10 +184,32 @@ The release check requires a real XPU and clean source metadata. The
 `--allow-no-xpu` and `--allow-dirty-source` switches are intended only for
 explicit diagnostics and do not replace device-backed acceptance. The same
 validator also requires exact Kitchen, AIMDO, GGUF, and combined Nunchaku
-source revisions; the installed AIMDO XPU backend; the
+provider source revisions; both official distributions; both disjoint provider
+distributions; conditional routing; the installed AIMDO XPU backend and Linux
+allocator takeover after a verified unwind of official AIMDO's reversible
+pre-device state; the
 GGUF/SentencePiece/Protobuf imports; the bundled `nunchaku_torch` runtime; and
 the managed Kitchen GGUF/W4A16 capabilities. It additionally fails closed if
 the oneDNN manifest, checked-in patch, installed runtime DSO, or
 `libdnnl.so.3` symlink does not match the identities recorded by the image.
 
 The release image supports BMG.
+
+Run the upgrade lifecycle check in a disposable container, passing an exact
+official ComfyUI revision accepted for the milestone:
+
+```bash
+docker run --rm "$IMAGE" \
+    python /llm/tools/validate_comfyui_upgrade.py \
+        --comfyui-revision <full-40-character-commit> \
+        --upgrade-kitchen-version <resolved-official-version> \
+        --upgrade-aimdo-version <resolved-official-version>
+```
+
+This fetches that ComfyUI revision, installs its normal Python requirements,
+upgrades to the explicitly resolved official Kitchen and AIMDO versions, and
+verifies that compatible providers activate while incompatible providers are
+safely left unwired. It then restores the image's accepted official versions
+and requires both XPU providers to activate. Every provider-owned file is
+hashed across each phase. The test mutates the container's writable layer and
+therefore does not replace clean-image acceptance.

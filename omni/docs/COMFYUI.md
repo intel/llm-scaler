@@ -98,6 +98,37 @@ OMNIXPU_FP8_GEMM=0
 OMNIXPU_INT8_FFN=0
 ```
 
+Kitchen and AIMDO are installed as their official distributions. Their XPU
+implementations are separately named runtime-provider distributions, activated
+only during the normal ComfyUI custom-node prestartup lifecycle when the
+official version, Torch XPU build, platform, target, and provider integrity all
+match. No launcher change is required:
+
+```bash
+OMNIXPU_PROVIDER_BOOTSTRAP=auto      # use each compatible XPU provider
+OMNIXPU_PROVIDER_BOOTSTRAP=off       # retain the official implementations
+OMNIXPU_PROVIDER_BOOTSTRAP=required  # fail unless both providers activate
+```
+
+Reinstalling or upgrading an official Kitchen or AIMDO distribution does not
+overwrite provider-owned files. If the official version no longer matches the
+installed provider, `auto` mode leaves that provider inactive until its
+matching XPU provider wheel is installed. AIMDO XPU activation additionally
+requires DynamicVRAM; Kitchen routing does not.
+
+The image exports a pip constraint for the Torch/XPU ABI and the provider
+distributions. Upgrade the detached ComfyUI checkout with:
+
+```bash
+bash /llm/tools/update_comfyui.sh
+```
+
+The helper refuses tracked local edits, fetches ComfyUI `master` by default, and
+installs its normal requirements under that runtime constraint. Set
+`COMFYUI_UPGRADE_REF` to an exact commit for a reproducible upgrade. Run such
+changes in a new container or preserve the container explicitly; they do not
+modify the source image.
+
 See [ComfyUI-OmniXPU](../ComfyUI-OmniXPU/README.md) for adapter behavior,
 diagnostics, and opt-in legacy workarounds.
 
