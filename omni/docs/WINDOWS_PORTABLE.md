@@ -895,9 +895,8 @@ Get-FileHash -Algorithm SHA256 `
 [`unsloth/Z-Image-Turbo-GGUF@6c808143...`](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF/tree/6c80814333b7b6a70a2e5b469a7c6437ce65de0f)
 和
 [`nunchaku-ai/nunchaku-z-image-turbo@ca6bac69...`](https://huggingface.co/nunchaku-ai/nunchaku-z-image-turbo/tree/ca6bac69c3b0b2bdd31ca5196bf87c5f2a9eaedf)。
-使用
-[`omni-xpu-kernel-tuning` 的固定量化对比 API graphs](https://github.com/xiangyuT/omni-xpu-kernel-tuning/tree/main/workflows/bmg-zimage-quantization-comparison)
-执行 fresh server、cold、resident warm、formal 和 forced-text gate。
+使用与本节固定模型、分辨率和采样参数一致的量化对比 API graphs，执行 fresh
+server、cold、resident warm、formal 和 forced-text gate。
 
 验收要求：
 
