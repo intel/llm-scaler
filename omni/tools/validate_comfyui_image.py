@@ -82,7 +82,7 @@ REQUIRED_MINIMAX_H3_TEMPLATES = {
 }
 PINNED_MINIMAX_H3_TEMPLATE_HASHES = {
     "video_minimax_h3_t2v.json": (
-        "31ab33fdb053a7834cc866bd7aa08b887518fc656e4a796c89779c6b5e1786e6"
+        "eb9cc8c78a4e83a2657c9926677b6353db0ed2947d91da736e9cdae194a3db4a"
     ),
 }
 
