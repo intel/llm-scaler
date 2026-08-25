@@ -14,8 +14,8 @@ from packaging.version import Version
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VERSION_FILE = PROJECT_ROOT / "omni_xpu_kernel" / "_version.py"
 PYPROJECT_FILE = PROJECT_ROOT / "pyproject.toml"
-IMAGE_VERSION = "0.2.0-b1"
-BASE_VERSION = "0.2.0b1"
+IMAGE_VERSION = "0.2.0-b2"
+BASE_VERSION = "0.2.0b2"
 SUPPORTED_TORCH_MINORS = ("2.10", "2.11", "2.12", "2.13")
 SUPPORTED_XPU_TARGETS = ("bmg", "ptl-h")
 VERSION_NAMESPACE = run_path(str(VERSION_FILE))

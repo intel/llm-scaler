@@ -40,14 +40,14 @@ The package and `intel/llm-scaler-omni` image versions share the source in
 derives its native identity from the active Torch installation and
 `OMNI_XPU_DEVICE`.
 
-The packaging layer recognizes Torch XPU minors 2.10, 2.11, and 2.12. Each
+The packaging layer recognizes Torch XPU minors 2.10, 2.11, 2.12, and 2.13. Each
 Torch/GPU pair still requires its own build and runtime validation; recognizing
 a version is not a validation claim. The generated wheel uses a PEP 440 local
 version such as:
 
 ```text
-omni_xpu_kernel-0.2.0b1+torch211.bmg
-omni_xpu_kernel-0.2.0b1+torch211.ptlh
+omni_xpu_kernel-0.2.0b2+torch213.bmg
+omni_xpu_kernel-0.2.0b2+torch213.ptlh
 ```
 
 Build and install a different wheel for every Torch/GPU pair. The wheel

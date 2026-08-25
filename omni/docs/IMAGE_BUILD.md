@@ -170,7 +170,7 @@ the destination XPU.
 Run the validator inside the final container:
 
 ```bash
-IMAGE=intel/llm-scaler-omni:0.2.0-b1
+IMAGE=intel/llm-scaler-omni:0.2.0-b2
 
 sudo docker run --rm \
     --device=/dev/dri/card0 \

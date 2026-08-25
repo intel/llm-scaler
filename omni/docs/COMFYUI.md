@@ -9,7 +9,7 @@ Mount an existing ComfyUI model directory and start ComfyUI directly. This is
 the recommended default when the workflow fits in XPU memory:
 
 ```bash
-IMAGE=intel/llm-scaler-omni:0.2.0-b1
+IMAGE=intel/llm-scaler-omni:0.2.0-b2
 CONTAINER_NAME=comfyui
 
 sudo docker run -itd \
