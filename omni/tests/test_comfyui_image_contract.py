@@ -88,7 +88,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_KITCHEN_COMMIT": (
         "KITCHEN_COMMIT",
-        "4b1115d50d98b8a50b826945730b3d4ba831cc91",
+        "9eccb7fa42edf14bc4a4c41aafd645ff1f1dcb75",
     ),
     "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.31"),
     "COMFY_AIMDO_REPOSITORY": (
@@ -97,7 +97,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_AIMDO_COMMIT": (
         "AIMDO_COMMIT",
-        "563b2a8562a6fc124cc4bae29042a23f3c0a8f5e",
+        "063d66e5345fea58d1a4e8aa6f160ccc0c593f16",
     ),
     "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.4.13"),
     "COMFY_GGUF_REPOSITORY": (
