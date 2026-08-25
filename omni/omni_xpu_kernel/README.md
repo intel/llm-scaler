@@ -129,8 +129,10 @@ architecture:
 ```bash
 cd /path/to/llm-scaler/omni
 
+OMNI_IMAGE_REPOSITORY=local-audit/llm-scaler-omni \
 XPU_TARGET=bmg bash build.sh
 # or
+OMNI_IMAGE_REPOSITORY=local-audit/llm-scaler-omni \
 XPU_TARGET=ptl-h bash build.sh
 ```
 

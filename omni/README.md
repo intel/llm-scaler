@@ -6,9 +6,10 @@ default image is a single-XPU ComfyUI environment with target-specific
 ComfyUI integration layer.
 
 > [!IMPORTANT]
-> The current 0.2.0 beta preview is experimental and focused on single-XPU
-> ComfyUI workloads. It does not replace the broader b8 image. For SGLang Diffusion,
-> Raylight, or other multi-XPU scenarios, use the published
+> The current `0.2.0-b2` beta preview is available only as a source build. It is
+> experimental and focused on single-XPU ComfyUI workloads, and does not replace
+> the broader b8 image. For SGLang Diffusion, Raylight, or other multi-XPU
+> scenarios, use the published
 > [`intel/llm-scaler-omni:0.1.0-b8`](https://github.com/intel/llm-scaler/releases/tag/omni-0.1.0-b8)
 > image.
 
@@ -20,6 +21,7 @@ Build from the `omni` directory:
 cd omni
 
 # Intel Arc B-series / Battlemage
+OMNI_IMAGE_REPOSITORY=local-audit/llm-scaler-omni \
 XPU_TARGET=bmg bash build.sh
 ```
 
@@ -30,15 +32,17 @@ is AOT-compiled for BMG, and `build.sh` assigns this tag to local images:
 intel/llm-scaler-omni:<version>-comfyui-bmg
 ```
 
-We publish the BMG image using the version as the image tag:
+Published BMG releases use the version as the image tag:
 
 ```text
 intel/llm-scaler-omni:<version>
 ```
 
-Version `0.2.0-b2` is tagged `intel/llm-scaler-omni:0.2.0-b2`. Published tags
-are listed in [Releases](../Releases.md). The development version is defined
-in `omni_xpu_kernel/omni_xpu_kernel/_version.py`.
+`0.2.0-b2` has not been published as `intel/llm-scaler-omni:0.2.0-b2`.
+The source-build command above produces the local tag
+`local-audit/llm-scaler-omni:0.2.0-b2-comfyui-bmg`. Published tags are listed
+in [Releases](../Releases.md). The development version is defined in
+`omni_xpu_kernel/omni_xpu_kernel/_version.py`.
 
 ### Validate the image
 
@@ -46,7 +50,7 @@ Run the supplied acceptance script against the final image with the GPU device
 exposed:
 
 ```bash
-IMAGE=intel/llm-scaler-omni:0.2.0-b2
+IMAGE=local-audit/llm-scaler-omni:0.2.0-b2-comfyui-bmg
 
 sudo docker run --rm \
     --device=/dev/dri \
@@ -56,7 +60,7 @@ sudo docker run --rm \
 
 The check verifies package identity, the Torch ABI, native AOT target, clean
 source provenance, dependencies, XPU availability, and required Kitchen
-capabilities. The release image supports BMG.
+capabilities. This source-built image supports BMG.
 
 ### Run ComfyUI
 
@@ -64,7 +68,7 @@ Mount the existing ComfyUI model directory rather than copying models into the
 image:
 
 ```bash
-IMAGE=intel/llm-scaler-omni:0.2.0-b2
+IMAGE=local-audit/llm-scaler-omni:0.2.0-b2-comfyui-bmg
 CONTAINER_NAME=comfyui
 COMFYUI_MODEL_DIR=/path/to/comfyui_models
 COMFYUI_OUTPUT_DIR=/path/to/comfyui_output

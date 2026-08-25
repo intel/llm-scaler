@@ -6,10 +6,13 @@ bundled in the image.
 ## Start the server
 
 Mount an existing ComfyUI model directory and start ComfyUI directly. This is
-the recommended default when the workflow fits in XPU memory:
+the recommended default when the workflow fits in XPU memory. The following
+uses the local image produced by the source-build command in
+[`../README.md`](../README.md); `0.2.0-b2` is not currently available as a
+published image:
 
 ```bash
-IMAGE=intel/llm-scaler-omni:0.2.0-b2
+IMAGE=local-audit/llm-scaler-omni:0.2.0-b2-comfyui-bmg
 CONTAINER_NAME=comfyui
 
 sudo docker run -itd \
@@ -24,7 +27,7 @@ sudo docker run -itd \
     python main.py
 ```
 
-The release image supports Intel Arc B-series/Battlemage GPUs.
+This source-built image supports Intel Arc B-series/Battlemage GPUs.
 
 The default server is available at `http://127.0.0.1:8188`. Append
 `--listen 0.0.0.0` when remote access is required, and append

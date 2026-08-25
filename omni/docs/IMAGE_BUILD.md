@@ -8,13 +8,16 @@ default output is the ComfyUI-focused image.
 Run builds from `omni/`:
 
 ```bash
+OMNI_IMAGE_REPOSITORY=local-audit/llm-scaler-omni \
 XPU_TARGET=bmg bash build.sh
 ```
 
 The current image supports Intel Arc B-series/Battlemage GPUs. `build.sh`
 assigns the `-comfyui-bmg` suffix to local builds because their native binaries
-are AOT-compiled for BMG. We publish the BMG image under
-`intel/llm-scaler-omni:<version>` without a flavor or target suffix.
+are AOT-compiled for BMG. Published BMG releases use
+`intel/llm-scaler-omni:<version>` without a flavor or target suffix, but
+`0.2.0-b2` is currently available only as a source build. The command above
+produces `local-audit/llm-scaler-omni:0.2.0-b2-comfyui-bmg`.
 
 The supported environment overrides are:
 
@@ -170,7 +173,7 @@ the destination XPU.
 Run the validator inside the final container:
 
 ```bash
-IMAGE=intel/llm-scaler-omni:0.2.0-b2
+IMAGE=local-audit/llm-scaler-omni:0.2.0-b2-comfyui-bmg
 
 sudo docker run --rm \
     --device=/dev/dri/card0 \
@@ -180,7 +183,7 @@ sudo docker run --rm \
     python /llm/tools/validate_comfyui_image.py
 ```
 
-The release check requires a real XPU and clean source metadata. The
+The acceptance check requires a real XPU and clean source metadata. The
 `--allow-no-xpu` and `--allow-dirty-source` switches are intended only for
 explicit diagnostics and do not replace device-backed acceptance. The same
 validator also requires exact Kitchen, AIMDO, GGUF, and combined Nunchaku
@@ -193,7 +196,7 @@ the managed Kitchen GGUF/W4A16 capabilities. It additionally fails closed if
 the oneDNN manifest, checked-in patch, installed runtime DSO, or
 `libdnnl.so.3` symlink does not match the identities recorded by the image.
 
-The release image supports BMG.
+This source-built image supports BMG.
 
 Run the upgrade lifecycle check in a disposable container, passing an exact
 official ComfyUI revision accepted for the milestone:
