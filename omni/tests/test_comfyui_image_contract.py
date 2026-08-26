@@ -18,6 +18,8 @@ VALIDATOR = OMNI_ROOT / "tools" / "validate_comfyui_image.py"
 UPGRADE_VALIDATOR = OMNI_ROOT / "tools" / "validate_comfyui_upgrade.py"
 UPDATE_COMFYUI = OMNI_ROOT / "tools" / "update_comfyui.sh"
 RUNTIME_ENTRYPOINT = OMNI_ROOT / "entrypoints" / "omix_torch_runtime.sh"
+COMFYUI_ENTRYPOINT = OMNI_ROOT / "entrypoints" / "start_comfyui.sh"
+HOST_MODELS_CONFIG = OMNI_ROOT / "configs" / "comfyui_host_models.yaml"
 ONEDNN_PATCH = (
     OMNI_ROOT
     / "patches"
@@ -161,6 +163,59 @@ class ComfyUIImageContractTest(unittest.TestCase):
                 self.assertIn("known or observed XPU", document)
                 self.assertIn("out-of-memory risk", document)
                 self.assertIn("reduce performance", document)
+
+    def test_comfyui_host_models_stay_outside_the_upgradable_checkout(self):
+        config = HOST_MODELS_CONFIG.read_text(encoding="utf-8")
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+        entrypoint = COMFYUI_ENTRYPOINT.read_text(encoding="utf-8")
+
+        self.assertIn("base_path: /models/host", config)
+        for model_type in (
+            "checkpoints",
+            "diffusion_models",
+            "text_encoders",
+            "vae",
+            "loras",
+            "controlnet",
+        ):
+            with self.subTest(model_type=model_type):
+                self.assertRegex(config, rf"(?m)^  {model_type}:")
+
+        self.assertIn(
+            "COPY ./configs/comfyui_host_models.yaml "
+            "/llm/configs/comfyui_host_models.yaml",
+            dockerfile,
+        )
+        self.assertIn(
+            "RUN mkdir -p /models/host /data/input /data/output /data/user",
+            dockerfile,
+        )
+        self.assertIn(
+            "--extra-model-paths-config "
+            "/llm/configs/comfyui_host_models.yaml",
+            entrypoint,
+        )
+        for option, directory in (
+            ("--input-directory", "/data/input"),
+            ("--output-directory", "/data/output"),
+            ("--user-directory", "/data/user"),
+        ):
+            with self.subTest(option=option):
+                self.assertIn(f"{option} {directory}", entrypoint)
+        for path in COMFYUI_STARTUP_DOCUMENTATION:
+            with self.subTest(path=path):
+                document = path.read_text(encoding="utf-8")
+                self.assertIn("/models/host:ro", document)
+                for runtime_directory in ("models", "input", "output", "user"):
+                    self.assertNotIn(
+                        f":/llm/ComfyUI/{runtime_directory}", document
+                    )
+                for data_directory in ("input", "output", "user"):
+                    self.assertIn(f"/data/{data_directory}", document)
+                self.assertIn(
+                    "/llm/configs/comfyui_host_models.yaml",
+                    document,
+                )
 
     def test_public_image_documentation_focuses_on_bmg_support(self):
         for path in PUBLIC_BMG_DOCUMENTATION:

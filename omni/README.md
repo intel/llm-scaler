@@ -72,7 +72,9 @@ image:
 IMAGE=llm-scaler-omni:0.2.0-b2-comfyui-bmg
 CONTAINER_NAME=comfyui
 COMFYUI_MODEL_DIR=/path/to/comfyui_models
+COMFYUI_INPUT_DIR=/path/to/comfyui_input
 COMFYUI_OUTPUT_DIR=/path/to/comfyui_output
+COMFYUI_USER_DIR=/path/to/comfyui_user
 
 sudo docker run -itd \
     --device=/dev/dri \
@@ -80,10 +82,16 @@ sudo docker run -itd \
     --shm-size=64g \
     --name="$CONTAINER_NAME" \
     --workdir=/llm/ComfyUI \
-    -v "$COMFYUI_MODEL_DIR":/llm/ComfyUI/models \
-    -v "$COMFYUI_OUTPUT_DIR":/llm/ComfyUI/output \
+    -v "$COMFYUI_MODEL_DIR":/models/host:ro \
+    -v "$COMFYUI_INPUT_DIR":/data/input \
+    -v "$COMFYUI_OUTPUT_DIR":/data/output \
+    -v "$COMFYUI_USER_DIR":/data/user \
     "$IMAGE" \
-    python main.py
+    python main.py \
+        --extra-model-paths-config /llm/configs/comfyui_host_models.yaml \
+        --input-directory /data/input \
+        --output-directory /data/output \
+        --user-directory /data/user
 ```
 
 Open `http://127.0.0.1:8188`. This direct ComfyUI launch is recommended by
@@ -104,13 +112,24 @@ sudo docker run -itd \
     --device=/dev/dri \
     --network=host \
     --name="$CONTAINER_NAME" \
-    -v "$COMFYUI_MODEL_DIR":/llm/ComfyUI/models \
+    -v "$COMFYUI_MODEL_DIR":/models/host:ro \
+    -v "$COMFYUI_INPUT_DIR":/data/input \
+    -v "$COMFYUI_OUTPUT_DIR":/data/output \
+    -v "$COMFYUI_USER_DIR":/data/user \
     "$IMAGE" \
     /llm/entrypoints/start_comfyui.sh
 ```
 
 Override `OMNI_COMFYUI_RESERVE_VRAM_GB` only when the workload requires a
-different reserve.
+different reserve. The supplied entrypoint automatically loads
+`/llm/configs/comfyui_host_models.yaml`.
+
+Keep host models and mutable runtime data outside `/llm/ComfyUI`. Mounting over
+its `models`, `input`, or `output` directories hides files tracked by upstream
+ComfyUI, which makes the checkout appear modified and causes
+`tools/update_comfyui.sh` to refuse an upgrade. The external mounts, supplied
+extra-model-paths config, and explicit data-directory arguments preserve model
+discovery, generated data, and a clean, upgradable ComfyUI checkout.
 
 For model placement, upstream templates, optional nodes, and runtime switches,
 see [ComfyUI usage](docs/COMFYUI.md).

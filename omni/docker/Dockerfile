@@ -465,6 +465,8 @@ RUN mkdir -p /llm/manifests && \
 # workflow/input snapshots.
 COPY ./patches /llm/patches
 COPY ./tools /llm/tools
+RUN mkdir -p /models/host /data/input /data/output /data/user
+COPY ./configs/comfyui_host_models.yaml /llm/configs/comfyui_host_models.yaml
 COPY ./entrypoints/start_comfyui.sh /llm/entrypoints/start_comfyui.sh
 COPY --chmod=755 ./entrypoints/omix_torch_runtime.sh /llm/entrypoints/omix_torch_runtime.sh
 

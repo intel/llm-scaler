@@ -13,6 +13,10 @@ fi
 exec python /llm/ComfyUI/main.py \
     --listen 0.0.0.0 \
     --port 8188 \
+    --extra-model-paths-config /llm/configs/comfyui_host_models.yaml \
+    --input-directory /data/input \
+    --output-directory /data/output \
+    --user-directory /data/user \
     --reserve-vram "$reserve_vram_gb" \
     --enable-dynamic-vram \
     --enable-manager \

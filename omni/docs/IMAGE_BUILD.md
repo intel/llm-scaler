@@ -89,6 +89,12 @@ and Manager are explicit build inputs; the final image also records a complete
 `pip freeze --all` dependency snapshot at
 `/llm/manifests/comfyui-python-freeze.txt`.
 
+The image includes `/llm/configs/comfyui_host_models.yaml` for registering a
+read-only host model tree mounted at `/models/host`, plus external runtime data
+directories below `/data`. Keeping model, input, output, and user mounts
+outside the ComfyUI checkout preserves upstream's tracked files, so
+in-container ComfyUI upgrades retain a clean Git worktree.
+
 The official `comfy-kitchen` and `comfy-aimdo` packages remain installed as
 ordinary ComfyUI dependencies. Matching XPU runtime providers use private
 package names and are discovered by ComfyUI-OmniXPU during the normal custom

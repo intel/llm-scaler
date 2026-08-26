@@ -6,9 +6,10 @@ COMFYUI_UPGRADE_REF="${COMFYUI_UPGRADE_REF:-master}"
 
 cd "${COMFYUI_ROOT}"
 
-# Preserve user edits instead of hiding them in an implicit stash. Custom-node,
-# model, input, and output directories are ignored by the core checkout and do
-# not make the tracked ComfyUI source dirty.
+# Preserve user edits instead of hiding them in an implicit stash. Runtime
+# model, input, output, and user directories must be mounted outside this Git
+# checkout and selected through ComfyUI's path arguments; mounting over its
+# tracked directories correctly makes the checkout appear modified.
 if ! git diff --quiet || ! git diff --cached --quiet; then
     echo "Refusing to upgrade a ComfyUI checkout with tracked local changes" >&2
     exit 1

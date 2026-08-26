@@ -21,9 +21,16 @@ sudo docker run -itd \
     --shm-size=64g \
     --name="$CONTAINER_NAME" \
     --workdir=/llm/ComfyUI \
-    -v /path/to/comfyui_models:/llm/ComfyUI/models \
+    -v /path/to/comfyui_models:/models/host:ro \
+    -v /path/to/comfyui_input:/data/input \
+    -v /path/to/comfyui_output:/data/output \
+    -v /path/to/comfyui_user:/data/user \
     "$IMAGE" \
-    python main.py
+    python main.py \
+        --extra-model-paths-config /llm/configs/comfyui_host_models.yaml \
+        --input-directory /data/input \
+        --output-directory /data/output \
+        --user-directory /data/user
 ```
 
 This source-built image supports Intel Arc B-series/Battlemage GPUs.
@@ -57,9 +64,11 @@ Additional ComfyUI arguments are forwarded by the entrypoint. For example:
 
 ## Models and workflows
 
-Place model files under the standard `/llm/ComfyUI/models` subdirectories used
-by their loader nodes. Use the model's official ComfyUI documentation for the
-exact file names and directory:
+Organize the host directory with the standard ComfyUI model subdirectories and
+mount it read-only at `/models/host`. The supplied
+`/llm/configs/comfyui_host_models.yaml` registers those directories with the
+loader nodes. Use the model's official ComfyUI documentation for the exact
+file names and directory:
 
 - [ComfyUI documentation](https://docs.comfy.org/)
 - [ComfyUI Template Browser](https://docs.comfy.org/interface/features/template)
@@ -131,16 +140,24 @@ installs its normal requirements under that runtime constraint. Set
 changes in a new container or preserve the container explicitly; they do not
 modify the source image.
 
+Do not mount host directories over `/llm/ComfyUI/models`, `input`, or `output`
+when the checkout must remain upgradable. Upstream tracks files below those
+directories; replacing them with bind mounts makes the files appear deleted,
+so the helper correctly rejects the checkout as modified. Mount host models at
+`/models/host:ro`, mount mutable state below `/data`, and use the supplied
+configuration and path arguments as in the startup command above.
+
 See [ComfyUI-OmniXPU](../ComfyUI-OmniXPU/README.md) for adapter behavior,
 diagnostics, and opt-in legacy workarounds.
 
 ## Outputs
 
-Mount `/llm/ComfyUI/output` when generated files must survive container
-removal:
+Mount `/data/output` and select it with `--output-directory` when generated
+files must survive container removal:
 
 ```bash
--v /path/to/comfyui_output:/llm/ComfyUI/output
+-v /path/to/comfyui_output:/data/output
 ```
 
-Input files can similarly be mounted at `/llm/ComfyUI/input`.
+Input files and user state can similarly be mounted at `/data/input` and
+`/data/user`, selected with `--input-directory` and `--user-directory`.
