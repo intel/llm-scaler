@@ -13,7 +13,6 @@ export DOCKER_IMAGE=llm-scaler-omni:latest-wan2.2
 export CONTAINER_NAME=wan-2.2
 export MODEL_DIR=<your_model_dir>
 sudo docker run -itd \
-        --privileged \
         --net=host \
         --device=/dev/dri \
         -e no_proxy=localhost,127.0.0.1 \

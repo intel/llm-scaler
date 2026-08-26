@@ -1,11 +1,13 @@
-"""Apply the Windows XPU allocator policy before ComfyUI imports torch."""
+"""Activate XPU providers and allocator policy before ComfyUI imports torch."""
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import math
 import os
 import sys
+from pathlib import Path
 from typing import NoReturn
 
 
@@ -14,6 +16,30 @@ _MASTER_ENV_NAME = "OMNIXPU_ENABLE"
 _DEFAULT_WINDOWS_FRACTION = 0.99
 _DISABLED_VALUES = frozenset(("0", "disable", "disabled", "false", "no", "off"))
 _LOG = logging.getLogger("ComfyUI-OmniXPU")
+_RUNTIME_MODULE_NAME = "_comfyui_omnixpu_runtime_bootstrap"
+
+
+def apply_runtime_providers():
+    """Load the local bootstrap without importing the custom-node package."""
+
+    runtime_path = Path(__file__).with_name("runtime_bootstrap.py")
+    module = sys.modules.get(_RUNTIME_MODULE_NAME)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(
+            _RUNTIME_MODULE_NAME, runtime_path
+        )
+        if spec is None or spec.loader is None:
+            raise SystemExit(
+                f"[OmniXPU] could not load runtime bootstrap from {runtime_path}"
+            )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[_RUNTIME_MODULE_NAME] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(_RUNTIME_MODULE_NAME, None)
+            raise
+    return module.bootstrap()
 
 
 def _fail(message: str) -> NoReturn:
@@ -93,4 +119,5 @@ def apply_xpu_memory_fraction() -> float | None:
     return actual
 
 
+apply_runtime_providers()
 apply_xpu_memory_fraction()

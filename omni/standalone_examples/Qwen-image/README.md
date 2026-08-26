@@ -13,7 +13,6 @@ export DOCKER_IMAGE=llm-scaler-omni:qwen-image
 export CONTAINER_NAME=qwen-image
 export MODEL_DIR=<your_model_dir>
 sudo docker run -itd \
-        --privileged \
         --net=host \
         --device=/dev/dri \
         -e no_proxy=localhost,127.0.0.1 \

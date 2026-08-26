@@ -8,12 +8,15 @@
 # and the disabled media/3D node bundle. Raylight's xDiT-based multi-XPU
 # ComfyUI integration is not part of this image; this image targets one XPU.
 
-ARG BASE_IMAGE=intel/omix:0.1.0-devel-ubuntu24.04
+ARG BASE_IMAGE=intel/omix:0.3.0-devel-ubuntu24.04@sha256:53e2c4503beeea4aff906dea180933be672449bcf04eb38df3d89622a1cd0967
 ARG PYTHON_VERSION=3.12
-ARG TORCH_VERSION=2.11.0+xpu
-ARG TORCHVISION_VERSION=0.26.0+xpu
+ARG TORCH_VERSION=2.13.0+xpu
+ARG TORCHVISION_VERSION=0.28.0+xpu
 ARG TORCHAUDIO_VERSION=2.11.0+xpu
-ARG ONEDNN_VERSION=2025.3.0
+ARG ONEDNN_VERSION=2026.0.0
+ARG ONEDNN_SOURCE_REPOSITORY=https://github.com/uxlfoundation/oneDNN.git
+ARG ONEDNN_SOURCE_COMMIT=03c022d3ffdcee958cfacbe720048e725fdf644c
+ARG ONEDNN_PATCH_SHA256=0a7afff4134f115b4bc53f46301ca3d62b1c11dc02e32c64635c469769fcdaeb
 ARG XPU_TARGET=bmg
 ARG MAX_JOBS=8
 ARG IMAGE_TAG
@@ -21,16 +24,16 @@ ARG IMAGE_TAG
 ARG SYCL_TLA_REPOSITORY=https://github.com/intel/sycl-tla.git
 ARG SYCL_TLA_COMMIT=2fc09973bfdf15755090fcb0e3b6ad236408a992
 ARG COMFYUI_REPOSITORY=https://github.com/Comfy-Org/ComfyUI.git
-ARG COMFYUI_COMMIT=43cb4fffc89bba20ab7bd61467a36d0339338dab
-ARG COMFYUI_VERSION=0.31.0
-ARG COMFYUI_FRONTEND_VERSION=1.48.7
-ARG COMFYUI_WORKFLOW_TEMPLATES_VERSION=0.11.34
+ARG COMFYUI_COMMIT=7a131a3afadc8200120f67f9236311a2c48b7445
+ARG COMFYUI_VERSION=0.33.4
+ARG COMFYUI_FRONTEND_VERSION=1.49.6
+ARG COMFYUI_WORKFLOW_TEMPLATES_VERSION=0.11.46
 ARG COMFYUI_MANAGER_VERSION=4.2.2
 ARG COMFY_KITCHEN_REPOSITORY=https://github.com/xiangyuT/comfy-kitchen-xpu.git
-ARG COMFY_KITCHEN_COMMIT=82b6537698a87e33d9fa07eac809b7733d5c5ce6
-ARG COMFY_KITCHEN_VERSION=0.2.28
+ARG COMFY_KITCHEN_COMMIT=9eccb7fa42edf14bc4a4c41aafd645ff1f1dcb75
+ARG COMFY_KITCHEN_VERSION=0.2.31
 ARG COMFY_AIMDO_REPOSITORY=https://github.com/xiangyuT/comfy-aimdo-xpu.git
-ARG COMFY_AIMDO_COMMIT=8600b938a517af7329cbf290d6e70a52ae78187d
+ARG COMFY_AIMDO_COMMIT=063d66e5345fea58d1a4e8aa6f160ccc0c593f16
 ARG COMFY_AIMDO_VERSION=0.4.13
 ARG COMFY_GGUF_REPOSITORY=https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git
 ARG COMFY_GGUF_COMMIT=39671fe73117ba97de7011e7e06e32599dcda06d
@@ -74,6 +77,10 @@ ARG TORCH_VERSION
 ARG TORCHVISION_VERSION
 ARG TORCHAUDIO_VERSION
 ARG ONEDNN_VERSION
+ARG ONEDNN_SOURCE_REPOSITORY
+ARG ONEDNN_SOURCE_COMMIT
+ARG ONEDNN_PATCH_SHA256
+ARG MAX_JOBS
 
 ENV VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:/opt/intel/oneapi/compiler/latest/bin:${PATH}" \
@@ -94,7 +101,66 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
         pytest \
         onednn==${ONEDNN_VERSION} \
-        onednn-devel==${ONEDNN_VERSION}
+        onednn-devel==${ONEDNN_VERSION} && \
+    pip check
+
+COPY ./patches/onednn-v3.11.2-enable-bf16-int4-dequantization.patch \
+    /llm/patches/onednn-v3.11.2-enable-bf16-int4-dequantization.patch
+
+# oneDNN 3.11 disabled its optimized BF16 INT4 dequantization path in
+# 0d99c32b03614d6943b993974f91d419e3c3a0f6. That changes the observable
+# BF16 materialization contract used by Kitchen SVDQuant. Build the exact
+# 3.11.2 release with the reviewed two-site restoration instead of downgrading
+# the runtime or weakening exact correctness. Keep the Python distribution
+# version pinned above and record source, patch, and installed-DSO identities.
+RUN set -euo pipefail && \
+    echo "${ONEDNN_PATCH_SHA256}  /llm/patches/onednn-v3.11.2-enable-bf16-int4-dequantization.patch" \
+        | sha256sum --check - && \
+    git clone --filter=blob:none --no-checkout \
+        "${ONEDNN_SOURCE_REPOSITORY}" /tmp/onednn-source && \
+    git -C /tmp/onednn-source fetch --depth 1 origin \
+        "${ONEDNN_SOURCE_COMMIT}" && \
+    git -C /tmp/onednn-source checkout --detach FETCH_HEAD && \
+    test "$(git -C /tmp/onednn-source rev-parse HEAD)" \
+        = "${ONEDNN_SOURCE_COMMIT}" && \
+    git -C /tmp/onednn-source apply --check \
+        /llm/patches/onednn-v3.11.2-enable-bf16-int4-dequantization.patch && \
+    git -C /tmp/onednn-source apply \
+        /llm/patches/onednn-v3.11.2-enable-bf16-int4-dequantization.patch && \
+    git -C /tmp/onednn-source diff --check && \
+    set +u && \
+    source /opt/intel/oneapi/setvars.sh --force && \
+    set -u && \
+    cmake -S /tmp/onednn-source -B /tmp/onednn-build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="${VIRTUAL_ENV}" \
+        -DCMAKE_C_COMPILER=/opt/intel/oneapi/compiler/2026.1/bin/icx \
+        -DCMAKE_CXX_COMPILER=/opt/intel/oneapi/compiler/2026.1/bin/icpx \
+        -DDNNL_BUILD_DOC=OFF \
+        -DDNNL_BUILD_EXAMPLES=OFF \
+        -DDNNL_BUILD_TESTS=OFF \
+        -DDNNL_CPU_RUNTIME=NONE \
+        -DDNNL_GPU_RUNTIME=SYCL \
+        -DDNNL_GPU_VENDOR=INTEL \
+        -DONEDNN_BUILD_GRAPH=OFF && \
+    cmake --build /tmp/onednn-build --parallel "${MAX_JOBS}" && \
+    cmake --install /tmp/onednn-build && \
+    test "$(readlink -f "${VIRTUAL_ENV}/lib/libdnnl.so.3")" \
+        = "${VIRTUAL_ENV}/lib/libdnnl.so.3.11" && \
+    mkdir -p /llm/manifests && \
+    library_sha256="$(sha256sum "${VIRTUAL_ENV}/lib/libdnnl.so.3.11" \
+        | awk '{print $1}')" && \
+    printf '%s\n' \
+        "schema_version=1" \
+        "package_version=${ONEDNN_VERSION}" \
+        "source_repository=${ONEDNN_SOURCE_REPOSITORY}" \
+        "source_revision=${ONEDNN_SOURCE_COMMIT}" \
+        "patch_sha256=${ONEDNN_PATCH_SHA256}" \
+        "library_path=${VIRTUAL_ENV}/lib/libdnnl.so.3.11" \
+        "library_sha256=${library_sha256}" \
+        > /llm/manifests/onednn-runtime.env && \
+    rm -rf /tmp/onednn-source /tmp/onednn-build && \
+    pip check
 
 RUN mkdir -p /llm /wheels /llm/patches
 
@@ -124,6 +190,8 @@ ARG COMFYUI_COMMIT
 ARG COMFYUI_FRONTEND_VERSION
 ARG COMFYUI_WORKFLOW_TEMPLATES_VERSION
 ARG COMFYUI_MANAGER_VERSION
+ARG COMFY_KITCHEN_VERSION
+ARG COMFY_AIMDO_VERSION
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm && \
@@ -133,7 +201,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         "${COMFYUI_COMMIT}" && \
     git -C ComfyUI checkout --detach FETCH_HEAD && \
     grep -Ev \
-        '^(comfyui-frontend-package|comfyui-workflow-templates|comfy-kitchen|comfy-aimdo)==' \
+        '^(torch|torchvision|torchaudio)([[:space:]<>=!~].*)?$|^(comfyui-frontend-package|comfyui-workflow-templates|comfy-kitchen|comfy-aimdo)==' \
         /llm/ComfyUI/requirements.txt \
         > /tmp/comfyui-requirements.txt && \
     grep -qx \
@@ -143,14 +211,18 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         -r /tmp/comfyui-requirements.txt \
         "comfyui-frontend-package==${COMFYUI_FRONTEND_VERSION}" \
         "comfyui-workflow-templates==${COMFYUI_WORKFLOW_TEMPLATES_VERSION}" \
-        "comfyui-manager==${COMFYUI_MANAGER_VERSION}"
+        "comfyui-manager==${COMFYUI_MANAGER_VERSION}" \
+        "comfy-kitchen==${COMFY_KITCHEN_VERSION}" \
+        "comfy-aimdo==${COMFY_AIMDO_VERSION}" && \
+    pip check
 
 # ComfyUI integrates Node Manager through the versioned Python package
 # above. Do not also clone the legacy ComfyUI-Manager custom node: loading both
 # creates two manager boundaries and makes missing-node behavior dependent on
 # startup flags rather than the pinned package contract. Kitchen and AIMDO are
-# also removed from upstream requirements above because the final image must use
-# the source-built XPU wheels pinned by this Dockerfile.
+# removed from upstream requirements only so their accepted official versions
+# can be installed explicitly above. The XPU implementations are installed as
+# separately named providers and never overwrite these official packages.
 
 # Pin every remaining default custom node to an exact accepted revision. These
 # stable remote-source layers stay ahead of frequently edited native sources.
@@ -165,12 +237,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     git -C comfyui-videohelpersuite checkout --detach FETCH_HEAD && \
     pip install -r comfyui-videohelpersuite/requirements.txt
 
+# Easy-Use v1.3.6 (release tag resolved to an immutable commit).
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/ComfyUI/custom_nodes && \
     git clone --filter=blob:none --no-checkout \
         https://github.com/yolain/ComfyUI-Easy-Use.git comfyui-easy-use && \
     git -C comfyui-easy-use fetch --depth 1 origin \
-        54d080bf6a4f52da287e984f305243c10db097f5 && \
+        b5e31ef12ad9d0b187b545c2707735cc7d581c52 && \
     git -C comfyui-easy-use checkout --detach FETCH_HEAD && \
     pip install -r comfyui-easy-use/requirements.txt
 
@@ -242,6 +315,9 @@ FROM python-base AS kitchen-wheel
 
 ARG COMFY_KITCHEN_REPOSITORY
 ARG COMFY_KITCHEN_COMMIT
+ARG COMFY_KITCHEN_VERSION
+ARG TORCH_VERSION
+ARG XPU_TARGET
 
 RUN cd /llm && \
     git clone --filter=blob:none --no-checkout \
@@ -252,7 +328,17 @@ RUN cd /llm && \
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /llm/comfy-kitchen-xpu && \
-    pip wheel . --wheel-dir /wheels --no-deps --no-build-isolation
+    mkdir -p /wheels/kitchen-source /wheels/kitchen-provider && \
+    pip wheel . --wheel-dir /wheels/kitchen-source \
+        --no-deps --no-build-isolation && \
+    source_wheels=(/wheels/kitchen-source/comfy_kitchen-${COMFY_KITCHEN_VERSION}-*.whl) && \
+    test "${#source_wheels[@]}" -eq 1 && \
+    python packaging/xpu_runtime_provider/build_wheel.py \
+        --source-wheel "${source_wheels[0]}" \
+        --output-dir /wheels/kitchen-provider \
+        --source-revision "${COMFY_KITCHEN_COMMIT}" \
+        --torch-version "${TORCH_VERSION}" \
+        --xpu-target "${XPU_TARGET}"
 
 # ======== AIMDO XPU wheel branch ========
 FROM python-base AS aimdo-wheel
@@ -260,6 +346,8 @@ FROM python-base AS aimdo-wheel
 ARG COMFY_AIMDO_REPOSITORY
 ARG COMFY_AIMDO_COMMIT
 ARG COMFY_AIMDO_VERSION
+ARG TORCH_VERSION
+ARG XPU_TARGET
 
 RUN cd /llm && \
     git clone --filter=blob:none --no-checkout \
@@ -270,9 +358,21 @@ RUN cd /llm && \
     pip install setuptools-scm==10.2.1 && \
     source /opt/intel/oneapi/setvars.sh --force && \
     cd /llm/comfy-aimdo-xpu && \
-    ./scripts/build-linux-xpu.sh && \
+    test -f /opt/venv/include/unified-runtime/ur_api.h && \
+    UR_INCLUDE_DIR=/opt/venv/include/unified-runtime \
+        ./scripts/build-linux-xpu.sh && \
+    mkdir -p /wheels/aimdo-source /wheels/aimdo-provider && \
     SETUPTOOLS_SCM_PRETEND_VERSION="${COMFY_AIMDO_VERSION}" \
-        pip wheel . --wheel-dir /wheels --no-deps --no-build-isolation
+        pip wheel . --wheel-dir /wheels/aimdo-source \
+            --no-deps --no-build-isolation && \
+    source_wheels=(/wheels/aimdo-source/comfy_aimdo-${COMFY_AIMDO_VERSION}-*.whl) && \
+    test "${#source_wheels[@]}" -eq 1 && \
+    python packaging/xpu_runtime_provider/build_wheel.py \
+        --source-wheel "${source_wheels[0]}" \
+        --output-dir /wheels/aimdo-provider \
+        --source-revision "${COMFY_AIMDO_COMMIT}" \
+        --torch-version "${TORCH_VERSION}" \
+        --xpu-target "${XPU_TARGET}"
 
 # ======== Omni kernel wheel branch ========
 FROM sycl-tla AS kernel-wheel
@@ -320,21 +420,23 @@ COPY --from=sycl-tla /llm/sycl-tla /llm/sycl-tla
 COPY --from=kitchen-wheel /llm/comfy-kitchen-xpu /llm/comfy-kitchen-xpu
 COPY --from=aimdo-wheel /llm/comfy-aimdo-xpu /llm/comfy-aimdo-xpu
 COPY --from=kernel-wheel /llm/omni_xpu_kernel /llm/omni_xpu_kernel
-COPY --from=kitchen-wheel /wheels/ /wheels/
-COPY --from=aimdo-wheel /wheels/ /wheels/
+COPY --from=kitchen-wheel /wheels/kitchen-provider/ /wheels/providers/
+COPY --from=aimdo-wheel /wheels/aimdo-provider/ /wheels/providers/
 COPY --from=kernel-wheel /wheels/ /wheels/
 
-# All third-party requirements are already installed. Force the two locally
-# iterated native packages into the final environment without dependency
-# resolution so neither can silently replace the accepted Torch/Kitchen stack.
+# All third-party requirements, including official Kitchen and AIMDO, are
+# already installed. Install the kernel and the two privately named XPU runtime
+# providers without dependency resolution. The providers own no canonical
+# comfy_kitchen or comfy_aimdo files, so later official upgrades are disjoint.
 # Artifact and device acceptance belongs in tools/validate_comfyui_image.py,
 # where the check can run with the real /dev/dri device rather than Docker's
 # device-less build sandbox.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-deps --force-reinstall \
         /wheels/omni_xpu_kernel-*.whl \
-        /wheels/comfy_kitchen-${COMFY_KITCHEN_VERSION}-*.whl \
-        /wheels/comfy_aimdo-${COMFY_AIMDO_VERSION}-*.whl
+        /wheels/providers/comfy_kitchen_xpu_runtime-${COMFY_KITCHEN_VERSION}-*.whl \
+        /wheels/providers/comfy_aimdo_xpu_runtime-${COMFY_AIMDO_VERSION}-*.whl && \
+    pip check
 
 # The local custom node is intentionally a thin ComfyUI integration layer. It
 # is copied after Kitchen/kernel installation so adapter-only edits stay cheap.
@@ -348,15 +450,25 @@ RUN cd /llm/ComfyUI/custom_nodes/ComfyUI-OmniXPU && \
 # validation. This records transitive ComfyUI and custom-node packages in
 # addition to the explicitly versioned frontend/templates/manager boundary.
 RUN mkdir -p /llm/manifests && \
+    sha256sum /wheels/providers/*.whl \
+        > /llm/manifests/xpu-runtime-providers.sha256 && \
     pip freeze --all | LC_ALL=C sort \
-        > /llm/manifests/comfyui-python-freeze.txt
+        > /llm/manifests/comfyui-python-freeze.txt && \
+    pip list --format=freeze | grep -Ei \
+        '^(torch|torchvision|torchaudio|omni[-_]xpu[-_]kernel|comfy-kitchen-xpu-runtime|comfy-aimdo-xpu-runtime)==' \
+        | LC_ALL=C sort \
+        > /llm/manifests/omni-runtime-constraints.txt && \
+    test "$(wc -l < /llm/manifests/omni-runtime-constraints.txt)" -eq 6
 
 # Retain project sources needed for in-container development. The focused image
 # intentionally relies on ComfyUI's Template Browser instead of bundled
 # workflow/input snapshots.
 COPY ./patches /llm/patches
 COPY ./tools /llm/tools
+RUN mkdir -p /models/host /data/input /data/output /data/user
+COPY ./configs/comfyui_host_models.yaml /llm/configs/comfyui_host_models.yaml
 COPY ./entrypoints/start_comfyui.sh /llm/entrypoints/start_comfyui.sh
+COPY --chmod=755 ./entrypoints/omix_torch_runtime.sh /llm/entrypoints/omix_torch_runtime.sh
 
 # ======== ComfyUI Runtime ========
 # The runtime is intentionally the completed development builder rather than a
@@ -365,6 +477,14 @@ COPY ./entrypoints/start_comfyui.sh /llm/entrypoints/start_comfyui.sh
 # replacement layers after each kernel/Kitchen edit and slows image export.
 FROM builder-comfyui AS runtime-comfyui
 
+ARG BASE_IMAGE
+ARG TORCH_VERSION
+ARG TORCHVISION_VERSION
+ARG TORCHAUDIO_VERSION
+ARG ONEDNN_VERSION
+ARG ONEDNN_SOURCE_REPOSITORY
+ARG ONEDNN_SOURCE_COMMIT
+ARG ONEDNN_PATCH_SHA256
 ARG XPU_TARGET
 ARG IMAGE_TAG
 ARG SYCL_TLA_COMMIT
@@ -373,6 +493,7 @@ ARG COMFYUI_VERSION
 ARG COMFYUI_FRONTEND_VERSION
 ARG COMFYUI_WORKFLOW_TEMPLATES_VERSION
 ARG COMFYUI_MANAGER_VERSION
+ARG COMFY_KITCHEN_REPOSITORY
 ARG COMFY_KITCHEN_COMMIT
 ARG COMFY_KITCHEN_VERSION
 ARG COMFY_AIMDO_REPOSITORY
@@ -384,13 +505,21 @@ ARG COMFY_NUNCHAKU_VERSION
 ARG LLM_SCALER_SOURCE_REVISION
 ARG LLM_SCALER_SOURCE_DIRTY
 
-RUN mkdir -p /llm/ComfyUI/user && \
-    cp /opt/intel/oneapi/compiler/latest/lib/libsycl-native-*.spv \
-        /usr/local/lib/
+# The focused image is single-XPU. OMIX 0.3 / oneAPI 2026.1 no longer ships
+# the legacy multi-XPU libsycl-native SPIR-V blobs copied by older images.
+RUN mkdir -p /llm/ComfyUI/user
 
 LABEL org.opencontainers.image.version="${IMAGE_TAG}" \
       org.opencontainers.image.revision="${LLM_SCALER_SOURCE_REVISION}" \
       com.intel.omni.image-flavor="comfyui" \
+      com.intel.omni.base-image="${BASE_IMAGE}" \
+      com.intel.omni.torch.version="${TORCH_VERSION}" \
+      com.intel.omni.torchvision.version="${TORCHVISION_VERSION}" \
+      com.intel.omni.torchaudio.version="${TORCHAUDIO_VERSION}" \
+      com.intel.omni.onednn.package.version="${ONEDNN_VERSION}" \
+      com.intel.omni.onednn.source.repository="${ONEDNN_SOURCE_REPOSITORY}" \
+      com.intel.omni.onednn.source.revision="${ONEDNN_SOURCE_COMMIT}" \
+      com.intel.omni.onednn.patch.sha256="${ONEDNN_PATCH_SHA256}" \
       com.intel.omni.xpu-target="${XPU_TARGET}" \
       com.intel.omni.llm-scaler.source-dirty="${LLM_SCALER_SOURCE_DIRTY}" \
       com.intel.omni.sycl-tla.revision="${SYCL_TLA_COMMIT}" \
@@ -400,17 +529,30 @@ LABEL org.opencontainers.image.version="${IMAGE_TAG}" \
       com.intel.omni.comfyui.workflow-templates.version="${COMFYUI_WORKFLOW_TEMPLATES_VERSION}" \
       com.intel.omni.comfyui.manager.version="${COMFYUI_MANAGER_VERSION}" \
       com.intel.omni.comfy-kitchen.version="${COMFY_KITCHEN_VERSION}" \
-      com.intel.omni.comfy-kitchen.revision="${COMFY_KITCHEN_COMMIT}" \
-      com.intel.omni.comfy-aimdo.repository="${COMFY_AIMDO_REPOSITORY}" \
       com.intel.omni.comfy-aimdo.version="${COMFY_AIMDO_VERSION}" \
-      com.intel.omni.comfy-aimdo.revision="${COMFY_AIMDO_COMMIT}" \
+      com.intel.omni.comfy-kitchen-xpu-runtime.repository="${COMFY_KITCHEN_REPOSITORY}" \
+      com.intel.omni.comfy-kitchen-xpu-runtime.version="${COMFY_KITCHEN_VERSION}" \
+      com.intel.omni.comfy-kitchen-xpu-runtime.revision="${COMFY_KITCHEN_COMMIT}" \
+      com.intel.omni.comfy-aimdo-xpu-runtime.repository="${COMFY_AIMDO_REPOSITORY}" \
+      com.intel.omni.comfy-aimdo-xpu-runtime.version="${COMFY_AIMDO_VERSION}" \
+      com.intel.omni.comfy-aimdo-xpu-runtime.revision="${COMFY_AIMDO_COMMIT}" \
       com.intel.omni.comfy-gguf.revision="${COMFY_GGUF_COMMIT}" \
       com.intel.omni.comfy-nunchaku.version="${COMFY_NUNCHAKU_VERSION}" \
       com.intel.omni.comfy-nunchaku.revision="${COMFY_NUNCHAKU_COMMIT}"
 
 ENV OMNIXPU_INTERPOLATE_FIX=0 \
+    UR_INCLUDE_DIR="/opt/venv/include/unified-runtime" \
+    PIP_CONSTRAINT="/llm/manifests/omni-runtime-constraints.txt" \
     OMNI_IMAGE_VERSION="${IMAGE_TAG}" \
     OMNI_IMAGE_FLAVOR="comfyui" \
+    OMNI_BASE_IMAGE="${BASE_IMAGE}" \
+    OMNI_TORCH_VERSION="${TORCH_VERSION}" \
+    OMNI_TORCHVISION_VERSION="${TORCHVISION_VERSION}" \
+    OMNI_TORCHAUDIO_VERSION="${TORCHAUDIO_VERSION}" \
+    OMNI_ONEDNN_VERSION="${ONEDNN_VERSION}" \
+    OMNI_ONEDNN_SOURCE_REPOSITORY="${ONEDNN_SOURCE_REPOSITORY}" \
+    OMNI_ONEDNN_SOURCE_REVISION="${ONEDNN_SOURCE_COMMIT}" \
+    OMNI_ONEDNN_PATCH_SHA256="${ONEDNN_PATCH_SHA256}" \
     OMNI_IMAGE_XPU_TARGET="${XPU_TARGET}" \
     OMNI_LLM_SCALER_SOURCE_REVISION="${LLM_SCALER_SOURCE_REVISION}" \
     OMNI_LLM_SCALER_SOURCE_DIRTY="${LLM_SCALER_SOURCE_DIRTY}" \
@@ -420,13 +562,20 @@ ENV OMNIXPU_INTERPOLATE_FIX=0 \
     OMNI_COMFYUI_WORKFLOW_TEMPLATES_VERSION="${COMFYUI_WORKFLOW_TEMPLATES_VERSION}" \
     OMNI_COMFYUI_MANAGER_VERSION="${COMFYUI_MANAGER_VERSION}" \
     OMNI_COMFY_KITCHEN_VERSION="${COMFY_KITCHEN_VERSION}" \
-    OMNI_COMFY_KITCHEN_REVISION="${COMFY_KITCHEN_COMMIT}" \
-    OMNI_COMFY_AIMDO_REPOSITORY="${COMFY_AIMDO_REPOSITORY}" \
+    OMNI_COMFY_KITCHEN_PROVIDER_REPOSITORY="${COMFY_KITCHEN_REPOSITORY}" \
+    OMNI_COMFY_KITCHEN_PROVIDER_REVISION="${COMFY_KITCHEN_COMMIT}" \
     OMNI_COMFY_AIMDO_VERSION="${COMFY_AIMDO_VERSION}" \
-    OMNI_COMFY_AIMDO_REVISION="${COMFY_AIMDO_COMMIT}" \
+    OMNI_COMFY_AIMDO_PROVIDER_REPOSITORY="${COMFY_AIMDO_REPOSITORY}" \
+    OMNI_COMFY_AIMDO_PROVIDER_REVISION="${COMFY_AIMDO_COMMIT}" \
     OMNI_COMFY_GGUF_REVISION="${COMFY_GGUF_COMMIT}" \
     OMNI_COMFY_NUNCHAKU_VERSION="${COMFY_NUNCHAKU_VERSION}" \
     OMNI_COMFY_NUNCHAKU_REVISION="${COMFY_NUNCHAKU_COMMIT}"
+
+# Retain OMIX's oneAPI environment initialization, then restore the venv's
+# Torch-matched 2026.0 SYCL/UR runtime ahead of the OMIX 2026.1 build
+# toolchain. Without this final reorder the inherited OMIX entrypoint mixes
+# libsycl from the Torch wheel with libur_loader from the compiler image.
+ENTRYPOINT ["/llm/entrypoints/omix_torch_runtime.sh"]
 
 WORKDIR /llm/entrypoints
 CMD ["/bin/bash"]

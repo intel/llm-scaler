@@ -33,7 +33,6 @@ export DOCKER_IMAGE=llm-scaler-omni:fun-audio-llm
 export CONTAINER_NAME=fun-audio-llm
 
 sudo docker run -itd \
-    --privileged \
     --net=host \
     --device=/dev/dri \
     -e no_proxy=localhost,127.0.0.1 \

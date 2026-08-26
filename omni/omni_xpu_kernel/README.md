@@ -40,14 +40,14 @@ The package and `intel/llm-scaler-omni` image versions share the source in
 derives its native identity from the active Torch installation and
 `OMNI_XPU_DEVICE`.
 
-The packaging layer recognizes Torch XPU minors 2.10, 2.11, and 2.12. Each
+The packaging layer recognizes Torch XPU minors 2.10, 2.11, 2.12, and 2.13. Each
 Torch/GPU pair still requires its own build and runtime validation; recognizing
 a version is not a validation claim. The generated wheel uses a PEP 440 local
 version such as:
 
 ```text
-omni_xpu_kernel-0.2.0b1+torch211.bmg
-omni_xpu_kernel-0.2.0b1+torch211.ptlh
+omni_xpu_kernel-0.2.0b2+torch213.bmg
+omni_xpu_kernel-0.2.0b2+torch213.ptlh
 ```
 
 Build and install a different wheel for every Torch/GPU pair. The wheel
@@ -108,9 +108,9 @@ be installed on PTL-H.
 
 - Python 3.9 or newer development environment
 - Intel oneAPI DPC++/C++ Compiler (`icpx`)
-- A packaging-supported PyTorch XPU minor: 2.10.x, 2.11.x, or 2.12.x
-- `onednn==2025.3.0` and `onednn-devel==2025.3.0` for the package's direct
-  oneDNN calls on Linux
+- A packaging-supported PyTorch XPU minor: 2.10.x, 2.11.x, 2.12.x, or 2.13.x
+- `onednn==2026.0.0` and `onednn-devel==2026.0.0` (oneDNN 3.11.2) for the
+  package's direct oneDNN calls on Linux
 - A matched oneAPI oneDNN 3.9.1 development installation on Windows; the
   build vendors its `dnnl.dll` and redistribution notices into the wheel
 - Intel [`sycl-tla`](https://github.com/intel/sycl-tla) headers for the
@@ -129,8 +129,10 @@ architecture:
 ```bash
 cd /path/to/llm-scaler/omni
 
+OMNI_IMAGE_REPOSITORY=llm-scaler-omni \
 XPU_TARGET=bmg bash build.sh
 # or
+OMNI_IMAGE_REPOSITORY=llm-scaler-omni \
 XPU_TARGET=ptl-h bash build.sh
 ```
 
@@ -147,13 +149,18 @@ source /opt/venv/bin/activate
 
 python -m pip install --upgrade pip wheel
 python -m pip install \
-  torch==2.11.0+xpu torchvision==0.26.0+xpu torchaudio==2.11.0+xpu \
+  torch==2.13.0+xpu torchvision==0.28.0+xpu \
   --index-url https://download.pytorch.org/whl/xpu
-python -m pip install onednn==2025.3.0 onednn-devel==2025.3.0
+python -m pip install onednn==2026.0.0 onednn-devel==2026.0.0
 
 git clone https://github.com/intel/sycl-tla.git /opt/sycl-tla
 git -C /opt/sycl-tla checkout 2fc09973bfdf15755090fcb0e3b6ad236408a992
 ```
+
+There is no Torch-2.13-matched `torchaudio` wheel on the official XPU index.
+It is not required by `omni_xpu_kernel`; the complete ComfyUI image separately
+keeps its existing `2.11.0+xpu` audio wheel as a validated workflow
+compatibility exception.
 
 Build the wheel from this directory:
 
@@ -176,13 +183,19 @@ For Windows build and installation details, see
 
 ### oneDNN consistency
 
-The native extensions call oneDNN directly. The `2025.3.0` pin belongs to
+The native extensions call oneDNN directly. The Linux `2026.0.0` pin belongs to
 `omni_xpu_kernel`; it is not inherited from the selected Torch wheel. Using
 headers from one oneDNN release with a library from another can produce
 missing-symbol errors during import. The default Linux path therefore uses the
 matched pip runtime and development packages shown above for every recognized
 Torch minor. A new Torch minor is accepted only after rebuilding and testing
 that complete combination.
+
+Torch 2.13 pins its Intel runtime packages to 2026.0.0. oneDNN 2026.0.0 is the
+matching Linux package: later 2026.0.x oneDNN wheels require 2026.1 runtimes
+and cannot satisfy this exact Torch environment. The separately maintained
+Windows build remains on its validated oneDNN 3.9.1 development/runtime
+contract.
 
 For a non-pip development installation, set both variables to the same oneDNN
 installation:

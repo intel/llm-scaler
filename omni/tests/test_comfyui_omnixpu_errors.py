@@ -147,3 +147,102 @@ def test_fp8_oom_does_not_enter_original_fallback(monkeypatch):
 
     assert fallback_calls == []
     assert uncast_calls == []
+
+
+@pytest.mark.parametrize(
+    "lifecycle",
+    ["comfy_cast", "vbar", "weight_lowvram", "bias_lowvram"],
+)
+def test_mixed_precision_uses_comfy_weight_lifecycle(monkeypatch, lifecycle):
+    package_name = _install_test_package(monkeypatch)
+    fp8_calls = []
+
+    class FakeInput2D:
+        is_xpu = True
+        ndim = 2
+        shape = (2, 8)
+
+    class FakeInput:
+        is_xpu = True
+        ndim = 3
+        shape = (1, 2, 8)
+
+        def reshape(self, *shape):
+            assert shape == (-1, 8)
+            return FakeInput2D()
+
+    class FakeOutput:
+        def reshape(self, *shape):
+            return ("reshaped", shape)
+
+    class OriginalLinear:
+        def forward(self, input_tensor, *args, **kwargs):
+            return self._forward(input_tensor, self.dynamic_weight, None)
+
+        def _forward(self, input_tensor, weight, bias):
+            return ("inner-route", input_tensor, weight, bias)
+
+    class MixedPrecisionOps:
+        Linear = OriginalLinear
+
+    class FakeQData:
+        dtype = torch.float8_e4m3fn
+        shape = (4, 8)
+
+    class FakeQuantizedTensor:
+        def __init__(self):
+            self._qdata = FakeQData()
+            self.params = types.SimpleNamespace(
+                scale=torch.ones((), dtype=torch.float32)
+            )
+
+    model_management = types.ModuleType("comfy.model_management")
+    model_management.cast_to_device = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("outer resident-weight shortcut must not bypass Comfy")
+    )
+    comfy_ops = types.ModuleType("comfy.ops")
+    comfy_ops.mixed_precision_ops = lambda *args, **kwargs: MixedPrecisionOps
+    comfy_ops.QuantizedTensor = FakeQuantizedTensor
+    comfy = types.ModuleType("comfy")
+    comfy.__path__ = []
+    comfy.model_management = model_management
+    comfy.ops = comfy_ops
+    probe = types.SimpleNamespace(
+        linear_fp8=lambda *args: fp8_calls.append(args) or FakeOutput()
+    )
+    monkeypatch.setitem(sys.modules, "comfy", comfy)
+    monkeypatch.setitem(sys.modules, "comfy.model_management", model_management)
+    monkeypatch.setitem(sys.modules, "comfy.ops", comfy_ops)
+    monkeypatch.setitem(sys.modules, "ComfyUI-OmniXPU.probe", probe)
+
+    fp8_gemm = _load_module(
+        f"{package_name}.adapters.fp8_gemm",
+        _ADAPTERS / "fp8_gemm.py",
+    )
+    assert fp8_gemm.apply() == (True, None)
+    monkeypatch.setattr(
+        fp8_gemm,
+        "_prepare_scale",
+        lambda scale, weight, input_tensor: scale,
+    )
+
+    klass = comfy_ops.mixed_precision_ops()
+    module = klass.Linear()
+    module.comfy_cast_weights = lifecycle == "comfy_cast"
+    if lifecycle == "vbar":
+        module._v = object()
+    if lifecycle == "weight_lowvram":
+        module.weight_lowvram_function = object()
+    if lifecycle == "bias_lowvram":
+        module.bias_lowvram_function = object()
+    module.quant_format = "float8_e4m3fn"
+    module.weight_function = []
+    module.bias_function = []
+    module.scale_weight = None
+    module.dynamic_weight = FakeQuantizedTensor()
+
+    input_tensor = FakeInput()
+    assert module.forward(input_tensor) == ("reshaped", (1, 2, 4))
+    assert len(fp8_calls) == 1
+    assert isinstance(fp8_calls[0][0], FakeInput2D)
+    assert fp8_calls[0][1] is module.dynamic_weight._qdata

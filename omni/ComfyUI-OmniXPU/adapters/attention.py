@@ -164,6 +164,20 @@ def _torch_major_minor():
         return None
 
 
+# Keep this closed: a kernel capability bit does not validate a future Torch
+# minor or a different device target for these workflow-specific routes.
+_VALIDATED_ROUTED_TORCH_BY_TARGET = {
+    "ptl-h": frozenset({(2, 11), (2, 12)}),
+    "bmg": frozenset({(2, 11), (2, 12), (2, 13)}),
+}
+
+
+def _torch_supports_versioned_routes():
+    version = _torch_major_minor()
+    target = _omni_xpu_target()
+    return version in _VALIDATED_ROUTED_TORCH_BY_TARGET.get(target, ())
+
+
 def _omni_xpu_target():
     try:
         import omni_xpu_kernel as pkg
@@ -182,14 +196,14 @@ def _use_ptl_torch_sdpa(
     skip_reshape,
     skip_output_reshape,
 ):
-    """Select only workflow shapes validated on PTL-H with Torch 2.11."""
+    """Select the guarded PTL-H workflow shapes on validated Torch minors."""
     is_zimage = heads == 30 and q_len in (64, 1024, 1088)
     is_krea2 = heads == 48 and q_len == 4192
     return (
         _backend == "auto"
         and _backend_name == "cute"
         and _omni_xpu_target() == "ptl-h"
-        and _torch_major_minor() == (2, 11)
+        and _torch_supports_versioned_routes()
         and q.dtype == torch.bfloat16
         and dim_head == 128
         and q_len == kv_len
@@ -266,7 +280,7 @@ def _use_bmg_minimax_h3_vae_d64(
     return (
         _backend_name == "cute"
         and _omni_xpu_target() == "bmg"
-        and _torch_major_minor() == (2, 11)
+        and _torch_supports_versioned_routes()
         and callable(capability)
         and capability()
         and q.dtype == torch.float16
@@ -304,7 +318,7 @@ def _use_workflow_cute_d120(
         _backend == "auto"
         and _backend_name == "cute"
         and _omni_xpu_target() in ("ptl-h", "bmg")
-        and _torch_major_minor() == (2, 11)
+        and _torch_supports_versioned_routes()
         and callable(capability)
         and capability()
         and q.dtype == torch.float16
@@ -443,7 +457,7 @@ def _prepare_bmg_d128_bhld_cute(
     if not (
         _backend_name == "cute"
         and _omni_xpu_target() == "bmg"
-        and _torch_major_minor() == (2, 11)
+        and _torch_supports_versioned_routes()
         and callable(capability)
         and capability()
         and (
@@ -516,7 +530,7 @@ def _use_bmg_wan22_cute_cross(
     return (
         _backend_name == "cute"
         and _omni_xpu_target() == "bmg"
-        and _torch_major_minor() == (2, 11)
+        and _torch_supports_versioned_routes()
         and callable(capability)
         and capability()
         and q.dtype == torch.float16
@@ -815,10 +829,11 @@ def apply():
 
         selected_sdp = _backend_sdp
         selected_backend = _backend_name
-        # Torch 2.11 SDPA is faster end-to-end for the measured PTL-H D128
-        # workflow shapes. Keep this route narrower than the generic d128 CUTE
-        # domain: explicit `cute`, other platforms/versions, dtypes, head
-        # counts, and sequence lengths retain the existing policy.
+        # Torch SDPA is faster end-to-end for the measured PTL-H D128 workflow
+        # shapes. Keep this route narrower than the generic d128 CUTE domain:
+        # explicit `cute`, versions outside the validated target matrix, other
+        # platforms, dtypes, head counts, and sequence lengths retain the
+        # existing policy.
         if not reasons and _use_ptl_torch_sdpa(
             q,
             heads,
@@ -841,7 +856,7 @@ def apply():
                 "kernel",
                 "attention",
                 {"q": q, "k": k, "v": v},
-                details={"backend": "torch", "route": "ptl_torch211_workflow"},
+                details={"backend": "torch", "route": "ptl_torch_workflow"},
             )
             return _pytorch_fallback(
                 q,
@@ -858,8 +873,8 @@ def apply():
         # Boogu's PTL-H/BMG D120 route consumes the exact BHLD input strides and
         # returns a BLHD-backed BHLD view.  The final transpose+reshape is a
         # metadata-only view, avoiding all layout copies.  This remains an
-        # auto-only, Torch-2.11, workflow-shape route; unsupported wheels and
-        # layouts retain the unmodified Torch fallback.
+        # auto-only route for validated target/Torch pairs and workflow shapes;
+        # unsupported wheels and layouts retain the unmodified Torch fallback.
         if not reasons and use_workflow_cute_d120:
             _cute_call_count += 1
             route_call_count = _record_attention_route(

@@ -43,6 +43,37 @@ def _prepare_scale(scale, weight, input):
     return scale
 
 
+def _has_dynamic_weight_lifecycle(module):
+    return (
+        bool(getattr(module, "comfy_cast_weights", False))
+        or hasattr(module, "_v")
+        or getattr(module, "weight_lowvram_function", None) is not None
+        or getattr(module, "bias_lowvram_function", None) is not None
+    )
+
+
+def _fp8_storage(weight, quantized_tensor_type):
+    if quantized_tensor_type is not None and isinstance(
+        weight, quantized_tensor_type
+    ):
+        qdata = getattr(weight, "_qdata", None)
+        if getattr(qdata, "dtype", None) in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ):
+            params = getattr(weight, "params", None)
+            if params is None:
+                params = getattr(weight, "_params", None)
+            return qdata, getattr(params, "scale", None)
+        return None, None
+    if getattr(weight, "dtype", None) in (
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ):
+        return weight, None
+    return None, None
+
+
 def apply():
     global _omni_fp8_linear
     import sys
@@ -126,25 +157,40 @@ def apply():
             # -- Intercept 1: _forward(input, weight, bias) --
             # Called from forward_comfy_cast_weights after cast_bias_weight.
             def _mp_inner_forward(self, input, weight, bias):
-                if (_omni_fp8_linear is not None and input.is_xpu and input.ndim == 2 and
-                        hasattr(weight, 'dtype') and weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)):
-                    _log_first(f"input={list(input.shape)} weight={list(weight.shape)} dtype={weight.dtype}")
+                fp8_weight, layout_scale = _fp8_storage(
+                    weight, QuantizedTensor
+                )
+                input_shape = input.shape
+                input_2d = (
+                    input.reshape(-1, input_shape[-1])
+                    if input.ndim >= 3
+                    else input
+                )
+                if (_omni_fp8_linear is not None and input.is_xpu and input_2d.ndim == 2 and
+                        fp8_weight is not None):
+                    _log_first(f"input={list(input_2d.shape)} weight={list(fp8_weight.shape)} dtype={fp8_weight.dtype}")
                     try:
                         scale_w = getattr(self, 'scale_weight', None)
-                        if scale_w is None:
+                        if layout_scale is not None:
+                            scale_w = layout_scale
+                        elif scale_w is None:
                             p = getattr(self.weight, 'params', None) or getattr(self.weight, '_layout_params', None)
                             scale_w = getattr(p, 'scale', None) if p else None
                         if scale_w is None:
                             scale_w = torch.ones((), device=input.device, dtype=torch.float32)
-                        scale_w = _prepare_scale(scale_w, weight, input)
-                        output = _omni_fp8_linear(input, weight, scale_w, bias)
+                        scale_w = _prepare_scale(scale_w, fp8_weight, input_2d)
+                        output = _omni_fp8_linear(input_2d, fp8_weight, scale_w, bias)
                         if output is not None:
                             log_debug_event(
                                 "kernel",
                                 "fp8_linear",
-                                {"input": input, "weight": weight, "weight_scale": scale_w, "bias": bias},
-                                details={"backend": "omni_xpu", "format": weight.dtype},
+                                {"input": input_2d, "weight": fp8_weight, "weight_scale": scale_w, "bias": bias},
+                                details={"backend": "omni_xpu", "format": fp8_weight.dtype},
                             )
+                            if input.ndim >= 3:
+                                output = output.reshape(
+                                    *input_shape[:-1], fp8_weight.shape[0]
+                                )
                             return output
                     except Exception as e:
                         if is_fatal_accelerator_error(e):
@@ -164,6 +210,7 @@ def apply():
                 )
                 if (_omni_fp8_linear is not None and input.is_xpu and
                         getattr(self, 'quant_format', None) in ('float8_e4m3fn', 'float8_e5m2') and
+                        not _has_dynamic_weight_lifecycle(self) and
                         len(self.weight_function) == 0 and len(self.bias_function) == 0):
                     input_shape = input.shape
                     input_2d = input.reshape(-1, input_shape[-1]) if input.ndim == 3 else input

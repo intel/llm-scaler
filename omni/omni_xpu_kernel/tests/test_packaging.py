@@ -14,9 +14,9 @@ from packaging.version import Version
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VERSION_FILE = PROJECT_ROOT / "omni_xpu_kernel" / "_version.py"
 PYPROJECT_FILE = PROJECT_ROOT / "pyproject.toml"
-IMAGE_VERSION = "0.2.0-b1"
-BASE_VERSION = "0.2.0b1"
-SUPPORTED_TORCH_MINORS = ("2.10", "2.11", "2.12")
+IMAGE_VERSION = "0.2.0-b2"
+BASE_VERSION = "0.2.0b2"
+SUPPORTED_TORCH_MINORS = ("2.10", "2.11", "2.12", "2.13")
 SUPPORTED_XPU_TARGETS = ("bmg", "ptl-h")
 VERSION_NAMESPACE = run_path(str(VERSION_FILE))
 TORCH_VERSION = VERSION_NAMESPACE["get_installed_torch_version"]()
@@ -85,6 +85,7 @@ def test_kernel_version_is_exposed_by_package_metadata():
         ("2.11.0+xpu", "2.11.0", "2.11", "torch211"),
         ("2.12.0+xpu", "2.12.0", "2.12", "torch212"),
         ("2.12.1+xpu", "2.12.1", "2.12", "torch212"),
+        ("2.13.0+xpu", "2.13.0", "2.13", "torch213"),
     ],
 )
 def test_supported_torch_minors_select_distinct_wheel_tags(
@@ -158,7 +159,7 @@ def test_inconsistent_installed_wheel_metadata_is_rejected(monkeypatch, tmp_path
         get_build_info(packaged_version_file)
 
 
-@pytest.mark.parametrize("torch_version", ["2.9.1+xpu", "2.13.0+xpu", "invalid"])
+@pytest.mark.parametrize("torch_version", ["2.9.1+xpu", "2.14.0+xpu", "invalid"])
 def test_unsupported_torch_versions_are_rejected(torch_version):
     with pytest.raises(RuntimeError, match="Torch minor|Unsupported Torch version"):
         VERSION_NAMESPACE["get_torch_minor"](torch_version)
@@ -295,10 +296,10 @@ def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
     onednn_requirements = [
         requirement
         for requirement in captured["install_requires"]
-        if requirement.startswith("onednn==2025.3.0;")
+        if requirement.startswith("onednn==2026.0.0;")
     ]
     assert onednn_requirements == [
-        "onednn==2025.3.0; platform_system == 'Linux' and platform_machine == 'x86_64'"
+        "onednn==2026.0.0; platform_system == 'Linux' and platform_machine == 'x86_64'"
     ]
     if sys.platform == "win32":
         assert captured["package_data"]["omni_xpu_kernel"] == [

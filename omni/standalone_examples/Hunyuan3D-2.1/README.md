@@ -12,7 +12,6 @@ Run docker image:
 export DOCKER_IMAGE=llm-scaler-omni:latest-hunyuan3d2.1
 export CONTAINER_NAME=hunyuan3d-2.1
 sudo docker run -itd \
-        --privileged \
         --net=host \
         --device=/dev/dri \
         -e no_proxy=localhost,127.0.0.1 \

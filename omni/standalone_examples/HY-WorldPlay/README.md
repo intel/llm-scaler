@@ -22,7 +22,6 @@ bash build.sh
 export DOCKER_IMAGE=llm-scaler-omni:hy-worldplay
 export CONTAINER_NAME=hy-worldplay
 sudo docker run -itd \
-        --privileged \
         --net=host \
         --device=/dev/dri \
         -e no_proxy=localhost,127.0.0.1 \

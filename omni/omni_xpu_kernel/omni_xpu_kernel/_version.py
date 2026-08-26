@@ -12,9 +12,9 @@ from pathlib import Path
 # Docker tags cannot contain the PEP 440 ``+`` local-version separator, so the
 # image keeps the shared base version while Python artifacts add the Torch ABI
 # they were compiled against.
-__image_version__ = "0.2.0-b1"
-__base_version__ = "0.2.0b1"
-__supported_torch_minors__ = ("2.10", "2.11", "2.12")
+__image_version__ = "0.2.0-b2"
+__base_version__ = "0.2.0b2"
+__supported_torch_minors__ = ("2.10", "2.11", "2.12", "2.13")
 __supported_xpu_targets__ = ("bmg", "ptl-h")
 
 
