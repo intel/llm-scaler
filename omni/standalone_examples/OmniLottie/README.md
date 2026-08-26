@@ -25,7 +25,6 @@ export CONTAINER_NAME=omnilottie
 export DOCKER_IMAGE=llm-scaler-omni:omnilottie
 
 docker run -itd \
-    --privileged \
     --net=host \
     --device /dev/dri \
     -e no_proxy=localhost,127.0.0.1 \

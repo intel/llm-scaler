@@ -176,9 +176,7 @@ Run the validator inside the final container:
 IMAGE=llm-scaler-omni:0.2.0-b2-comfyui-bmg
 
 sudo docker run --rm \
-    --device=/dev/dri/card0 \
-    --device=/dev/dri/renderD128 \
-    -e ZE_AFFINITY_MASK=0 \
+    --device=/dev/dri \
     "$IMAGE" \
     python /llm/tools/validate_comfyui_image.py
 ```

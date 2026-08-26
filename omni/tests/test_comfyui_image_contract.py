@@ -33,6 +33,11 @@ COMFYUI_STARTUP_DOCUMENTATION = (
     OMNI_ROOT / "README.md",
     OMNI_ROOT / "docs" / "COMFYUI.md",
 )
+OMNI_DOCKER_DOCUMENTATION = tuple(
+    path
+    for path in OMNI_ROOT.rglob("*.md")
+    if "docker run" in path.read_text(encoding="utf-8")
+)
 CACHE_DIT_COMMIT = "1d92bbd86ec59aa6223fe2368849b7413a1acb93"
 DEMO_ASSETS = {
     "demo_qwen_image.gif",
@@ -132,6 +137,17 @@ def load_validator():
 
 
 class ComfyUIImageContractTest(unittest.TestCase):
+    def test_omni_docker_docs_use_portable_least_privilege_gpu_access(self):
+        self.assertTrue(OMNI_DOCKER_DOCUMENTATION)
+        hardcoded_drm_node = re.compile(
+            r"--device(?:=|\s+)/dev/dri/(?:card|renderD)\d+"
+        )
+        for path in OMNI_DOCKER_DOCUMENTATION:
+            with self.subTest(path=path):
+                document = path.read_text(encoding="utf-8")
+                self.assertNotIn("--privileged", document)
+                self.assertIsNone(hardcoded_drm_node.search(document))
+
     def test_comfyui_docs_default_to_direct_startup_and_scope_dynamic_vram(self):
         for path in COMFYUI_STARTUP_DOCUMENTATION:
             with self.subTest(path=path):

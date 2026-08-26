@@ -26,10 +26,11 @@ XPU_TARGET=bmg bash build.sh
 ```
 
 The current image supports Intel Arc B-series/Battlemage GPUs. Its native wheel
-is AOT-compiled for BMG, and `build.sh` assigns this tag to local images:
+is AOT-compiled for BMG, and the source-build command above assigns this tag to
+local images:
 
 ```text
-intel/llm-scaler-omni:<version>-comfyui-bmg
+llm-scaler-omni:<version>-comfyui-bmg
 ```
 
 Published BMG releases use the version as the image tag:
@@ -74,7 +75,6 @@ COMFYUI_MODEL_DIR=/path/to/comfyui_models
 COMFYUI_OUTPUT_DIR=/path/to/comfyui_output
 
 sudo docker run -itd \
-    --privileged \
     --device=/dev/dri \
     --network=host \
     --shm-size=64g \
@@ -101,7 +101,6 @@ workflows that already fit in memory:
 
 ```bash
 sudo docker run -itd \
-    --privileged \
     --device=/dev/dri \
     --network=host \
     --name="$CONTAINER_NAME" \

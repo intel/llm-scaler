@@ -16,7 +16,6 @@ IMAGE=llm-scaler-omni:0.2.0-b2-comfyui-bmg
 CONTAINER_NAME=comfyui
 
 sudo docker run -itd \
-    --privileged \
     --device=/dev/dri \
     --network=host \
     --shm-size=64g \
