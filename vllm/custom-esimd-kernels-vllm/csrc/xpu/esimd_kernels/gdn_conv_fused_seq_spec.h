@@ -140,6 +140,7 @@ ESIMD_INLINE void gdn_conv_fused_seq_spec_kernel(
     int gdn_K,
     int gdn_V,
     float attn_scale,
+    int conv_state_len,
     int64_t conv_stride0,
     int64_t ssm_stride0,
     nd_item<3>& ndi)
@@ -199,13 +200,17 @@ ESIMD_INLINE void gdn_conv_fused_seq_spec_kernel(
         chunk_start_hi = v_base + 64;
     }
 
+    const bool packed_conv_state =
+        conv_state_len >= num_spec_tokens + 2;
     const int accepted_prev = num_accepted_tokens_ptr[seq_idx] - 1;
     const int init_col = accepted_prev > 0 ? accepted_prev : 0;
-    const int init_state_idx = spec_state_indices_ptr[state_row + init_col];
+    const int init_state_idx = spec_state_indices_ptr[
+        state_row + (packed_conv_state ? 0 : init_col)];
     fp16* init_conv_state = nullptr;
     if (init_state_idx >= 0) {
         init_conv_state =
-            conv_state_ptr + (int64_t)init_state_idx * conv_stride0;
+            conv_state_ptr + (int64_t)init_state_idx * conv_stride0 +
+            (packed_conv_state ? (int64_t)init_col * dim : 0);
     }
     simd<float, 64> s0(0.0f), s1(0.0f), s2(0.0f);
     if (init_conv_state != nullptr) {
@@ -266,52 +271,70 @@ ESIMD_INLINE void gdn_conv_fused_seq_spec_kernel(
                 (1.0f + sycl::ext::intel::esimd::exp(-conv_result_hi));
         }
 
-        // Each value-head work-group owns its V slice. Only hv=0 writes the
-        // replicated Q/K slices, so every checkpoint slot has one writer.
-        if (save_state_idx >= 0) {
+        // v0.26 stores all speculative conv checkpoints in one wide cache
+        // block. Older layouts use one three-row block per token.
+        const int conv_save_state_idx = packed_conv_state
+            ? spec_state_indices_ptr[state_row]
+            : save_state_idx;
+        if (conv_save_state_idx >= 0) {
             fp16* save_state =
-                conv_state_ptr + (int64_t)save_state_idx * conv_stride0;
+                conv_state_ptr +
+                (int64_t)conv_save_state_idx * conv_stride0;
             if (hv == 0 && tid < 4 * H) {
+                if (!packed_conv_state || t == 0) {
+                    block_store<fp16, 64>(
+                        save_state + 0 * dim + chunk_start,
+                        simd<fp16, 64>(s1));
+                    block_store<fp16, 64>(
+                        save_state + 1 * dim + chunk_start,
+                        simd<fp16, 64>(s2));
+                }
                 block_store<fp16, 64>(
-                    save_state + 0 * dim + chunk_start,
-                    simd<fp16, 64>(s1));
-                block_store<fp16, 64>(
-                    save_state + 1 * dim + chunk_start,
-                    simd<fp16, 64>(s2));
-                block_store<fp16, 64>(
-                    save_state + 2 * dim + chunk_start,
+                    save_state +
+                        (packed_conv_state ? 2 + t : 2) * dim +
+                        chunk_start,
                     x_fp16);
             }
             if (!v_oob && tid >= 4 * H) {
                 const int v_tid = tid - 4 * H;
                 if (double_v && v_tid == hv) {
+                    if (!packed_conv_state || t == 0) {
+                        block_store<fp16, 64>(
+                            save_state + 0 * dim + chunk_start,
+                            simd<fp16, 64>(s1));
+                        block_store<fp16, 64>(
+                            save_state + 1 * dim + chunk_start,
+                            simd<fp16, 64>(s2));
+                        block_store<fp16, 64>(
+                            save_state + 0 * dim + chunk_start_hi,
+                            simd<fp16, 64>(s1_hi));
+                        block_store<fp16, 64>(
+                            save_state + 1 * dim + chunk_start_hi,
+                            simd<fp16, 64>(s2_hi));
+                    }
                     block_store<fp16, 64>(
-                        save_state + 0 * dim + chunk_start,
-                        simd<fp16, 64>(s1));
-                    block_store<fp16, 64>(
-                        save_state + 1 * dim + chunk_start,
-                        simd<fp16, 64>(s2));
-                    block_store<fp16, 64>(
-                        save_state + 2 * dim + chunk_start,
+                        save_state +
+                            (packed_conv_state ? 2 + t : 2) * dim +
+                            chunk_start,
                         x_fp16);
                     block_store<fp16, 64>(
-                        save_state + 0 * dim + chunk_start_hi,
-                        simd<fp16, 64>(s1_hi));
-                    block_store<fp16, 64>(
-                        save_state + 1 * dim + chunk_start_hi,
-                        simd<fp16, 64>(s2_hi));
-                    block_store<fp16, 64>(
-                        save_state + 2 * dim + chunk_start_hi,
+                        save_state +
+                            (packed_conv_state ? 2 + t : 2) * dim +
+                            chunk_start_hi,
                         x_fp16_hi);
                 } else if (!double_v && v_tid / 2 == hv) {
+                    if (!packed_conv_state || t == 0) {
+                        block_store<fp16, 64>(
+                            save_state + 0 * dim + chunk_start,
+                            simd<fp16, 64>(s1));
+                        block_store<fp16, 64>(
+                            save_state + 1 * dim + chunk_start,
+                            simd<fp16, 64>(s2));
+                    }
                     block_store<fp16, 64>(
-                        save_state + 0 * dim + chunk_start,
-                        simd<fp16, 64>(s1));
-                    block_store<fp16, 64>(
-                        save_state + 1 * dim + chunk_start,
-                        simd<fp16, 64>(s2));
-                    block_store<fp16, 64>(
-                        save_state + 2 * dim + chunk_start,
+                        save_state +
+                            (packed_conv_state ? 2 + t : 2) * dim +
+                            chunk_start,
                         x_fp16);
                 }
             }
@@ -414,6 +437,7 @@ inline void gdn_conv_fused_seq_spec_host(
     int K,
     int V,
     float scale,
+    int conv_state_len,
     int64_t conv_stride0,
     int64_t ssm_stride0,
     sycl::queue& q)
@@ -423,6 +447,10 @@ inline void gdn_conv_fused_seq_spec_host(
         H, " HV=", HV, " K=", K, " V=", V);
     TORCH_CHECK(num_spec_decodes > 0 && num_spec_tokens > 0,
         "speculative GDN dimensions must be positive");
+    TORCH_CHECK(
+        conv_state_len == 3 || conv_state_len >= num_spec_tokens + 2,
+        "speculative GDN conv state must have 3 rows or at least ",
+        num_spec_tokens + 2, "; got ", conv_state_len);
 
     constexpr int WG_SIZE = 64;
     sycl::nd_range<3> range(
@@ -436,7 +464,8 @@ inline void gdn_conv_fused_seq_spec_host(
                 A_log_ptr, dt_bias_ptr, ba_ptr, ba_stride0,
                 ssm_state_ptr, output_ptr, z_out_ptr, token_indx_ptr,
                 num_accepted_tokens_ptr, num_spec_decodes, num_spec_tokens,
-                H, HV, K, V, scale, conv_stride0, ssm_stride0, ndi);
+                H, HV, K, V, scale, conv_state_len, conv_stride0,
+                ssm_stride0, ndi);
         });
     });
 }
