@@ -274,19 +274,28 @@ def _load_patch(
 
 
 @pytest.mark.parametrize(
-    ("torch_version", "expected"),
+    ("target", "torch_version", "expected"),
     [
-        ("2.10.0+xpu", False),
-        ("2.11.0+xpu", True),
-        ("2.13.0+xpu", True),
-        ("3.0.0+xpu", True),
-        ("invalid", False),
+        ("ptl-h", "2.10.0+xpu", False),
+        ("ptl-h", "2.11.0+xpu", True),
+        ("ptl-h", "2.12.0+xpu", True),
+        ("ptl-h", "2.13.0+xpu", False),
+        ("bmg", "2.10.0+xpu", False),
+        ("bmg", "2.11.0+xpu", True),
+        ("bmg", "2.12.0+xpu", True),
+        ("bmg", "2.13.0+xpu", True),
+        ("bmg", "2.14.0+xpu", False),
+        ("bmg", "3.0.0+xpu", False),
+        ("unknown", "2.13.0+xpu", False),
+        ("bmg", "invalid", False),
     ],
 )
-def test_versioned_routes_use_torch_211_as_a_minimum(
-    monkeypatch, torch_version, expected
+def test_versioned_routes_use_explicit_target_matrix(
+    monkeypatch, target, torch_version, expected
 ):
-    patch, _, _ = _load_patch(monkeypatch, torch_version=torch_version)
+    patch, _, _ = _load_patch(
+        monkeypatch, target=target, torch_version=torch_version
+    )
 
     assert patch._torch_supports_versioned_routes() is expected
 
@@ -331,9 +340,9 @@ def test_non_windows_keeps_auto_as_default(monkeypatch):
     assert patch.get_stats()["esimd"] == 0
 
 
-@pytest.mark.parametrize("torch_version", ["2.11.0+xpu", "2.13.0+xpu"])
+@pytest.mark.parametrize("torch_version", ["2.11.0+xpu", "2.12.0+xpu"])
 @pytest.mark.parametrize("seq", [64, 1024, 1088])
-def test_ptl_auto_torch_211_or_newer_zimage_shape_uses_torch(
+def test_ptl_auto_validated_torch_zimage_shape_uses_torch(
     monkeypatch, torch_version, seq
 ):
     patch, attention, calls = _load_patch(
@@ -349,8 +358,8 @@ def test_ptl_auto_torch_211_or_newer_zimage_shape_uses_torch(
     assert patch.get_stats()["fallback"] == 0
 
 
-@pytest.mark.parametrize("torch_version", ["2.11.0+xpu", "2.13.0+xpu"])
-def test_ptl_auto_torch_211_or_newer_krea2_shape_uses_torch(
+@pytest.mark.parametrize("torch_version", ["2.11.0+xpu", "2.12.0+xpu"])
+def test_ptl_auto_validated_torch_krea2_shape_uses_torch(
     monkeypatch, torch_version
 ):
     patch, attention, calls = _load_patch(
@@ -421,7 +430,9 @@ def test_esimd_is_selected_only_when_explicitly_requested(monkeypatch):
     assert patch.get_stats()["esimd"] == 1
 
 
-@pytest.mark.parametrize("torch_version", ["2.11.0+xpu", "2.13.0+xpu"])
+@pytest.mark.parametrize(
+    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu"]
+)
 def test_bmg_wan22_t2v_turbo_720p_cross_uses_cute(
     monkeypatch, torch_version
 ):
@@ -683,7 +694,9 @@ def test_animate2_cute_shape_contract(
         (14080, 1024, False, "bmg_b2_bf16_d128_kv1024_cross"),
     ],
 )
-@pytest.mark.parametrize("torch_version", ["2.11.0+xpu", "2.13.0+xpu"])
+@pytest.mark.parametrize(
+    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu"]
+)
 def test_bmg_attention_open_ended_domain_uses_general_bhld_cute(
     monkeypatch, q_len, kv_len, pre_shaped, route, torch_version
 ):
@@ -748,7 +761,9 @@ def test_bmg_b1_self_keeps_legacy_cute_route(monkeypatch):
         (15787, (7168, 128, 21504, 1), (7168, 128, 21504, 1)),
     ],
 )
-@pytest.mark.parametrize("torch_version", ["2.11.0+xpu", "2.13.0+xpu"])
+@pytest.mark.parametrize(
+    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu"]
+)
 def test_bmg_minimax_h3_h56_uses_direct_qkv_bhld_cute(
     monkeypatch, seq, qk_stride, v_stride, torch_version
 ):
@@ -805,7 +820,7 @@ def test_bmg_minimax_h3_h56_rejects_unvalidated_contract(
     [
         ("ptl-h", "2.11.0+xpu", True, 3520, 3520),
         ("bmg", "2.10.0+xpu", True, 3520, 3520),
-        ("bmg", "invalid", True, 3520, 3520),
+        ("bmg", "2.14.0+xpu", True, 3520, 3520),
         ("bmg", "2.11.0+xpu", False, 3520, 3520),
         ("bmg", "2.11.0+xpu", True, 767, 767),
         ("bmg", "2.11.0+xpu", True, 1023, 1024),
@@ -978,7 +993,9 @@ def test_auto_d64_uses_torch_not_esimd(monkeypatch):
     assert patch.get_stats()["fallback"] == 1
 
 
-@pytest.mark.parametrize("torch_version", ["2.11.0+xpu", "2.13.0+xpu"])
+@pytest.mark.parametrize(
+    "torch_version", ["2.11.0+xpu", "2.12.0+xpu", "2.13.0+xpu"]
+)
 @pytest.mark.parametrize("seq", [6, 12, 261, 453, 901, 1797])
 def test_bmg_minimax_h3_video_vae_d64_uses_structural_cute(
     monkeypatch, torch_version, seq
@@ -1169,7 +1186,7 @@ def test_attention_contract_trace_records_exact_layout_once(
     [
         ("bmg", "2.11.0+xpu", _FakeTensor(), 30),
         ("ptl-h", "2.10.0+xpu", _FakeTensor(), 30),
-        ("ptl-h", "invalid", _FakeTensor(), 30),
+        ("ptl-h", "2.13.0+xpu", _FakeTensor(), 30),
         ("ptl-h", "2.11.0+xpu", _FakeTensor(heads=24), 24),
         ("ptl-h", "2.11.0+xpu", _FakeTensor(seq=4096), 30),
         ("ptl-h", "2.11.0+xpu", _FakeTensor(seq=4191, heads=48), 48),
@@ -1216,8 +1233,16 @@ def test_unvalidated_layouts_keep_cute(monkeypatch, tensor, kwargs):
     assert patch.get_stats()["torch_sdpa"] == 0
 
 
-@pytest.mark.parametrize("target", ["ptl-h", "bmg"])
-@pytest.mark.parametrize("torch_version", ["2.11.0+xpu", "2.13.0+xpu"])
+@pytest.mark.parametrize(
+    ("target", "torch_version"),
+    [
+        ("ptl-h", "2.11.0+xpu"),
+        ("ptl-h", "2.12.0+xpu"),
+        ("bmg", "2.11.0+xpu"),
+        ("bmg", "2.12.0+xpu"),
+        ("bmg", "2.13.0+xpu"),
+    ],
+)
 @pytest.mark.parametrize("seq", [4096, 4205])
 def test_validated_auto_boogu_d120_uses_strided_cute(
     monkeypatch, target, torch_version, seq
@@ -1246,7 +1271,7 @@ def test_validated_auto_boogu_d120_uses_strided_cute(
     ("target", "torch_version", "backend", "d120_capable", "seq"),
     [
         ("ptl-h", "2.10.0+xpu", "auto", True, 4096),
-        ("ptl-h", "invalid", "auto", True, 4096),
+        ("ptl-h", "2.13.0+xpu", "auto", True, 4096),
         ("ptl-h", "2.11.0+xpu", "cute", True, 4096),
         ("ptl-h", "2.11.0+xpu", "auto", False, 4096),
         ("ptl-h", "2.11.0+xpu", "auto", True, 109),

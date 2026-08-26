@@ -164,12 +164,18 @@ def _torch_major_minor():
         return None
 
 
-_MINIMUM_ROUTED_TORCH = (2, 11)
+# Keep this closed: a kernel capability bit does not validate a future Torch
+# minor or a different device target for these workflow-specific routes.
+_VALIDATED_ROUTED_TORCH_BY_TARGET = {
+    "ptl-h": frozenset({(2, 11), (2, 12)}),
+    "bmg": frozenset({(2, 11), (2, 12), (2, 13)}),
+}
 
 
 def _torch_supports_versioned_routes():
     version = _torch_major_minor()
-    return version is not None and version >= _MINIMUM_ROUTED_TORCH
+    target = _omni_xpu_target()
+    return version in _VALIDATED_ROUTED_TORCH_BY_TARGET.get(target, ())
 
 
 def _omni_xpu_target():
@@ -190,7 +196,7 @@ def _use_ptl_torch_sdpa(
     skip_reshape,
     skip_output_reshape,
 ):
-    """Select the guarded PTL-H workflow shapes on Torch 2.11 or newer."""
+    """Select the guarded PTL-H workflow shapes on validated Torch minors."""
     is_zimage = heads == 30 and q_len in (64, 1024, 1088)
     is_krea2 = heads == 48 and q_len == 4192
     return (
@@ -825,8 +831,9 @@ def apply():
         selected_backend = _backend_name
         # Torch SDPA is faster end-to-end for the measured PTL-H D128 workflow
         # shapes. Keep this route narrower than the generic d128 CUTE domain:
-        # explicit `cute`, older Torch versions, other platforms, dtypes, head
-        # counts, and sequence lengths retain the existing policy.
+        # explicit `cute`, versions outside the validated target matrix, other
+        # platforms, dtypes, head counts, and sequence lengths retain the
+        # existing policy.
         if not reasons and _use_ptl_torch_sdpa(
             q,
             heads,
@@ -866,8 +873,8 @@ def apply():
         # Boogu's PTL-H/BMG D120 route consumes the exact BHLD input strides and
         # returns a BLHD-backed BHLD view.  The final transpose+reshape is a
         # metadata-only view, avoiding all layout copies.  This remains an
-        # auto-only, Torch>=2.11, workflow-shape route; unsupported wheels and
-        # layouts retain the unmodified Torch fallback.
+        # auto-only route for validated target/Torch pairs and workflow shapes;
+        # unsupported wheels and layouts retain the unmodified Torch fallback.
         if not reasons and use_workflow_cute_d120:
             _cute_call_count += 1
             route_call_count = _record_attention_route(
