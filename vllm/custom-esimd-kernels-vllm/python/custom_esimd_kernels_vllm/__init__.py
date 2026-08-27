@@ -17,6 +17,10 @@ from custom_esimd_kernels_vllm import moe_int4_ops
 
 from custom_esimd_kernels_vllm.ops import (
     # Core ESIMD ops
+    QWEN38_NGRAM_OFFSETS,
+    QWEN38_NGRAM_VOCAB_SIZES,
+    esimd_qwen38_ngram_ids_decode,
+    esimd_qwen38_ngram_ids_decode_out,
     esimd_gemv_fp8_pern,
     esimd_gemv_fp8_pern_fused2,
     esimd_gemv_fp8_pern_fused3,

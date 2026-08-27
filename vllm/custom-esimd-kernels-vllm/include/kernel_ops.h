@@ -359,6 +359,20 @@ void esimd_accum_norm_add_norm(
     at::Tensor w1, at::Tensor w2, at::Tensor out,
     int64_t top_k, double eps1, double eps2);
 
+// Qwen3.8 decode N-gram ID generation specialized for the checkpoint's fixed
+// 8-bigram + 8-trigram vocab sizes and offsets. The caller must guard those
+// metadata values before dispatch and use the Torch fallback on a mismatch.
+at::Tensor esimd_qwen38_ngram_ids_decode(
+    at::Tensor input_ids,
+    at::Tensor ngram_context,
+    at::Tensor layer_multipliers);
+
+at::Tensor esimd_qwen38_ngram_ids_decode_out(
+    at::Tensor input_ids,
+    at::Tensor ngram_context,
+    at::Tensor layer_multipliers,
+    at::Tensor output);
+
 at::Tensor esimd_gemv_fp8_pert_bmg(
     at::Tensor input, at::Tensor weight,
     at::Tensor weight_scale, at::Tensor output);

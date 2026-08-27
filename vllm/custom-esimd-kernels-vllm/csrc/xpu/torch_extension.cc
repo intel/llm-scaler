@@ -205,6 +205,21 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
         "float eps1, float eps2) -> ()");
   m.impl("esimd_accum_norm_add_norm", torch::kXPU, &esimd_accum_norm_add_norm);
 
+  m.def("esimd_qwen38_ngram_ids_decode(Tensor input_ids, "
+        "Tensor ngram_context, Tensor layer_multipliers) -> Tensor");
+  m.impl("esimd_qwen38_ngram_ids_decode", torch::kXPU,
+         &esimd_qwen38_ngram_ids_decode);
+
+  m.def("esimd_qwen38_ngram_ids_decode_out(Tensor input_ids, "
+        "Tensor ngram_context, Tensor layer_multipliers, "
+        "Tensor(a!) output) -> ()");
+  m.impl("esimd_qwen38_ngram_ids_decode_out", torch::kXPU,
+         [](at::Tensor input_ids, at::Tensor ngram_context,
+            at::Tensor layer_multipliers, at::Tensor output) -> void {
+           esimd_qwen38_ngram_ids_decode_out(
+               input_ids, ngram_context, layer_multipliers, output);
+         });
+
   m.def("esimd_gemv_fp8_pert_bmg(Tensor input, Tensor weight, Tensor weight_scale, Tensor output) -> Tensor");
   m.impl("esimd_gemv_fp8_pert_bmg", torch::kXPU, &esimd_gemv_fp8_pert_bmg);
 }

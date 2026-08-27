@@ -24,6 +24,7 @@
 #include "esimd_kernels/fused_add_rms_norm_batched.h"
 #include "esimd_kernels/norm_gemv_int4.h"
 #include "esimd_kernels/resadd_norm_gemv_int4.h"
+#include "esimd_kernels/qwen38_ngram_ids.h"
 
 #define EXTRACT_PTR(var, tensor) auto var = reinterpret_cast<uint8_t*>(tensor.data_ptr())
 
@@ -740,6 +741,70 @@ void esimd_accum_norm_add_norm(
         reinterpret_cast<const fp16*>(w2.data_ptr()),
         reinterpret_cast<fp16*>(out.data_ptr()),
         K, (int)top_k, (float)eps1, (float)eps2, dpcpp_queue);
+}
+
+// ---- Qwen3.8 fixed-metadata decode N-gram IDs ----
+namespace {
+
+void check_qwen38_ngram_input(
+    const at::Tensor& tensor,
+    const at::Device& device,
+    const char* name) {
+    TORCH_CHECK(tensor.device().is_xpu(), name, " must be on XPU");
+    TORCH_CHECK(tensor.device() == device,
+                name, " must be on the same XPU device as input_ids");
+    TORCH_CHECK(tensor.scalar_type() == at::kLong,
+                name, " must have dtype int64");
+    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+}  // namespace
+
+at::Tensor esimd_qwen38_ngram_ids_decode_out(
+    at::Tensor input_ids,
+    at::Tensor ngram_context,
+    at::Tensor layer_multipliers,
+    at::Tensor output) {
+    TORCH_CHECK(input_ids.device().is_xpu(), "input_ids must be on XPU");
+    const at::Device device = input_ids.device();
+
+    check_qwen38_ngram_input(input_ids, device, "input_ids");
+    check_qwen38_ngram_input(ngram_context, device, "ngram_context");
+    check_qwen38_ngram_input(layer_multipliers, device, "layer_multipliers");
+    check_qwen38_ngram_input(output, device, "output");
+
+    TORCH_CHECK(input_ids.dim() == 1 && input_ids.size(0) == 1,
+                "input_ids must have shape [1]");
+    TORCH_CHECK(ngram_context.dim() == 2 && ngram_context.size(0) == 1 &&
+                    ngram_context.size(1) == 2,
+                "ngram_context must have shape [1, 2]");
+    TORCH_CHECK(layer_multipliers.dim() == 1 &&
+                    layer_multipliers.size(0) == 3,
+                "layer_multipliers must have shape [3]");
+    TORCH_CHECK(output.dim() == 2 && output.size(0) == 1 &&
+                    output.size(1) == 16,
+                "output must have shape [1, 16]");
+
+    // The device kernel specializes the Qwen3.8 checkpoint's fixed vocab sizes
+    // and offsets. The future model call site must guard those values once at
+    // initialization and retain the existing Torch fallback on a mismatch.
+    auto& dpcpp_queue = get_device_queue(input_ids);
+    qwen38_ngram_ids::decode_host(
+        input_ids.data_ptr<std::int64_t>(),
+        ngram_context.data_ptr<std::int64_t>(),
+        layer_multipliers.data_ptr<std::int64_t>(),
+        output.data_ptr<std::int64_t>(),
+        dpcpp_queue);
+    return output;
+}
+
+at::Tensor esimd_qwen38_ngram_ids_decode(
+    at::Tensor input_ids,
+    at::Tensor ngram_context,
+    at::Tensor layer_multipliers) {
+    at::Tensor output = at::empty({1, 16}, input_ids.options());
+    return esimd_qwen38_ngram_ids_decode_out(
+        input_ids, ngram_context, layer_multipliers, output);
 }
 
 // ---- BMG-tuned FP8 GEMV (per-tensor) ----

@@ -5,6 +5,49 @@ import torch.nn.functional as F
 _ops = torch.ops.custom_esimd_kernels_vllm
 
 
+QWEN38_NGRAM_VOCAB_SIZES = (
+    20000003, 20000023, 20000033, 20000047,
+    20000059, 20000063, 20000069, 20000077,
+    20000081, 20000093, 20000107, 20000147,
+    20000153, 20000159, 20000161, 20000171,
+)
+QWEN38_NGRAM_OFFSETS = (
+    0, 20000003, 40000026, 60000059,
+    80000106, 100000165, 120000228, 140000297,
+    160000374, 180000455, 200000548, 220000655,
+    240000802, 260000955, 280001114, 300001275,
+)
+
+
+def esimd_qwen38_ngram_ids_decode(
+    input_ids: torch.Tensor,
+    ngram_context: torch.Tensor,
+    layer_multipliers: torch.Tensor,
+) -> torch.Tensor:
+    """Generate the 16 Qwen3.8 decode N-gram IDs in one XPU launch.
+
+    This fast path specializes ``QWEN38_NGRAM_VOCAB_SIZES`` and
+    ``QWEN38_NGRAM_OFFSETS``. The model call site must verify those immutable
+    metadata values once before dispatch and retain the Torch fallback when
+    they do not match. Native checks cover dtype, device, contiguity and the
+    frozen decode shapes without adding a device-to-host synchronization.
+    """
+    return _ops.esimd_qwen38_ngram_ids_decode(
+        input_ids, ngram_context, layer_multipliers)
+
+
+def esimd_qwen38_ngram_ids_decode_out(
+    input_ids: torch.Tensor,
+    ngram_context: torch.Tensor,
+    layer_multipliers: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Preallocated-output variant for a guarded model decode hot path."""
+    _ops.esimd_qwen38_ngram_ids_decode_out(
+        input_ids, ngram_context, layer_multipliers, output)
+    return output
+
+
 def esimd_gemv_fp8_pern(
     input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     output: torch.Tensor,
