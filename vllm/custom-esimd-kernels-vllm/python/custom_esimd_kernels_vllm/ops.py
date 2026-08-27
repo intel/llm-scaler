@@ -48,6 +48,36 @@ def esimd_qwen38_ngram_ids_decode_out(
     return output
 
 
+def esimd_qwen38_ngram_embedding_gather(
+    ngram_ids: torch.Tensor,
+    local_weight: torch.Tensor,
+    local_vocab_start: torch.Tensor,
+    local_num_rows: torch.Tensor,
+) -> torch.Tensor:
+    """Gather 16 global IDs from one runtime FP16 local shard.
+
+    The result is the local partial ``[1, 2560]`` before TP all-reduce.
+    ``local_weight`` and both shard metadata tensors are runtime inputs; this
+    op is not tied to the small correctness fixture or a particular TP rank.
+    """
+    return _ops.esimd_qwen38_ngram_embedding_gather(
+        ngram_ids, local_weight, local_vocab_start, local_num_rows)
+
+
+def esimd_qwen38_ngram_embedding_gather_out(
+    ngram_ids: torch.Tensor,
+    local_weight: torch.Tensor,
+    local_vocab_start: torch.Tensor,
+    local_num_rows: torch.Tensor,
+    local_partial: torch.Tensor,
+) -> torch.Tensor:
+    """Preallocated-output variant for a model hot path."""
+    _ops.esimd_qwen38_ngram_embedding_gather_out(
+        ngram_ids, local_weight, local_vocab_start, local_num_rows,
+        local_partial)
+    return local_partial
+
+
 def esimd_gemv_fp8_pern(
     input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     output: torch.Tensor,

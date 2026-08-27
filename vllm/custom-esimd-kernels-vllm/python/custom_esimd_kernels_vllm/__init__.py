@@ -21,6 +21,8 @@ from custom_esimd_kernels_vllm.ops import (
     QWEN38_NGRAM_VOCAB_SIZES,
     esimd_qwen38_ngram_ids_decode,
     esimd_qwen38_ngram_ids_decode_out,
+    esimd_qwen38_ngram_embedding_gather,
+    esimd_qwen38_ngram_embedding_gather_out,
     esimd_gemv_fp8_pern,
     esimd_gemv_fp8_pern_fused2,
     esimd_gemv_fp8_pern_fused3,

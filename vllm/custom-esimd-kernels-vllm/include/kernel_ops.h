@@ -373,6 +373,22 @@ at::Tensor esimd_qwen38_ngram_ids_decode_out(
     at::Tensor layer_multipliers,
     at::Tensor output);
 
+// Qwen3.8 NG-2a single-rank local FP16 gather before TP all-reduce.
+// local_vocab_start/local_num_rows are runtime device scalars; the table row
+// count and row width are checked by the host wrapper.
+at::Tensor esimd_qwen38_ngram_embedding_gather(
+    at::Tensor ngram_ids,
+    at::Tensor local_weight,
+    at::Tensor local_vocab_start,
+    at::Tensor local_num_rows);
+
+at::Tensor esimd_qwen38_ngram_embedding_gather_out(
+    at::Tensor ngram_ids,
+    at::Tensor local_weight,
+    at::Tensor local_vocab_start,
+    at::Tensor local_num_rows,
+    at::Tensor local_partial);
+
 at::Tensor esimd_gemv_fp8_pert_bmg(
     at::Tensor input, at::Tensor weight,
     at::Tensor weight_scale, at::Tensor output);

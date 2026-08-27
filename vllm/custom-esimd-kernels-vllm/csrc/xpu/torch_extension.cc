@@ -220,6 +220,24 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
                input_ids, ngram_context, layer_multipliers, output);
          });
 
+  m.def("esimd_qwen38_ngram_embedding_gather(Tensor ngram_ids, "
+        "Tensor local_weight, Tensor local_vocab_start, "
+        "Tensor local_num_rows) -> Tensor");
+  m.impl("esimd_qwen38_ngram_embedding_gather", torch::kXPU,
+         &esimd_qwen38_ngram_embedding_gather);
+
+  m.def("esimd_qwen38_ngram_embedding_gather_out(Tensor ngram_ids, "
+        "Tensor local_weight, Tensor local_vocab_start, "
+        "Tensor local_num_rows, Tensor(a!) local_partial) -> ()");
+  m.impl("esimd_qwen38_ngram_embedding_gather_out", torch::kXPU,
+         [](at::Tensor ngram_ids, at::Tensor local_weight,
+            at::Tensor local_vocab_start, at::Tensor local_num_rows,
+            at::Tensor local_partial) -> void {
+           esimd_qwen38_ngram_embedding_gather_out(
+               ngram_ids, local_weight, local_vocab_start, local_num_rows,
+               local_partial);
+         });
+
   m.def("esimd_gemv_fp8_pert_bmg(Tensor input, Tensor weight, Tensor weight_scale, Tensor output) -> Tensor");
   m.impl("esimd_gemv_fp8_pert_bmg", torch::kXPU, &esimd_gemv_fp8_pert_bmg);
 }

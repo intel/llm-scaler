@@ -25,6 +25,7 @@
 #include "esimd_kernels/norm_gemv_int4.h"
 #include "esimd_kernels/resadd_norm_gemv_int4.h"
 #include "esimd_kernels/qwen38_ngram_ids.h"
+#include "esimd_kernels/qwen38_ngram_embedding.h"
 
 #define EXTRACT_PTR(var, tensor) auto var = reinterpret_cast<uint8_t*>(tensor.data_ptr())
 
@@ -805,6 +806,82 @@ at::Tensor esimd_qwen38_ngram_ids_decode(
     at::Tensor output = at::empty({1, 16}, input_ids.options());
     return esimd_qwen38_ngram_ids_decode_out(
         input_ids, ngram_context, layer_multipliers, output);
+}
+
+// ---- Qwen3.8 NG-2a local FP16 embedding gather ----
+namespace {
+
+void check_qwen38_gather_weight(
+    const at::Tensor& tensor,
+    const at::Device& device,
+    const char* name) {
+    TORCH_CHECK(tensor.device().is_xpu(), name, " must be on XPU");
+    TORCH_CHECK(tensor.device() == device,
+                name, " must be on the same XPU device as ngram_ids");
+    TORCH_CHECK(tensor.scalar_type() == at::ScalarType::Half,
+                name, " must have dtype float16");
+    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+}  // namespace
+
+at::Tensor esimd_qwen38_ngram_embedding_gather_out(
+    at::Tensor ngram_ids,
+    at::Tensor local_weight,
+    at::Tensor local_vocab_start,
+    at::Tensor local_num_rows,
+    at::Tensor local_partial) {
+    TORCH_CHECK(ngram_ids.device().is_xpu(), "ngram_ids must be on XPU");
+    const at::Device device = ngram_ids.device();
+
+    check_qwen38_ngram_input(ngram_ids, device, "ngram_ids");
+    check_qwen38_ngram_input(
+        local_vocab_start, device, "local_vocab_start");
+    check_qwen38_ngram_input(local_num_rows, device, "local_num_rows");
+    check_qwen38_gather_weight(local_weight, device, "local_weight");
+    check_qwen38_gather_weight(local_partial, device, "local_partial");
+
+    TORCH_CHECK(ngram_ids.dim() == 2 && ngram_ids.size(0) == 1 &&
+                    ngram_ids.size(1) == qwen38_ngram_embedding::kRows,
+                "ngram_ids must have shape [1, 16]");
+    TORCH_CHECK(local_weight.dim() == 2 &&
+                    local_weight.size(1) == qwen38_ngram_embedding::kRowWidth,
+                "local_weight must have shape [N, 160]");
+    TORCH_CHECK(local_vocab_start.dim() == 1 &&
+                    local_vocab_start.size(0) == 1,
+                "local_vocab_start must have shape [1]");
+    TORCH_CHECK(local_num_rows.dim() == 1 &&
+                    local_num_rows.size(0) == 1,
+                "local_num_rows must have shape [1]");
+    TORCH_CHECK(local_partial.dim() == 2 && local_partial.size(0) == 1 &&
+                    local_partial.size(1) ==
+                        qwen38_ngram_embedding::kRows *
+                            qwen38_ngram_embedding::kRowWidth,
+                "local_partial must have shape [1, 2560]");
+
+    auto& dpcpp_queue = get_device_queue(ngram_ids);
+    qwen38_ngram_embedding::launch(
+        dpcpp_queue,
+        ngram_ids.data_ptr<std::int64_t>(),
+        reinterpret_cast<const sycl::half*>(local_weight.data_ptr()),
+        local_vocab_start.data_ptr<std::int64_t>(),
+        local_num_rows.data_ptr<std::int64_t>(),
+        reinterpret_cast<sycl::half*>(local_partial.data_ptr()));
+    return local_partial;
+}
+
+at::Tensor esimd_qwen38_ngram_embedding_gather(
+    at::Tensor ngram_ids,
+    at::Tensor local_weight,
+    at::Tensor local_vocab_start,
+    at::Tensor local_num_rows) {
+    at::Tensor local_partial = at::empty(
+        {1, qwen38_ngram_embedding::kRows *
+                qwen38_ngram_embedding::kRowWidth},
+        local_weight.options());
+    return esimd_qwen38_ngram_embedding_gather_out(
+        ngram_ids, local_weight, local_vocab_start, local_num_rows,
+        local_partial);
 }
 
 // ---- BMG-tuned FP8 GEMV (per-tensor) ----
