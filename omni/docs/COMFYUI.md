@@ -89,12 +89,18 @@ The focused image installs pinned revisions of:
 - CacheDiT;
 - ComfyUI-GGUF-XPU;
 - ComfyUI-nunchaku-XPU;
+- ComfyUI-SolAttn;
 - ControlNet auxiliary nodes;
 - ComfyUI-OmniXPU.
 
 The Dockerfile is the source of truth for exact revisions. Installing or
 updating nodes through ComfyUI Manager changes the running container and is
 not part of the reproducible image build.
+
+The image enables the Sol-Attn XPU adapter and uses the Sol-Attn implementation
+packaged in `omni_xpu_kernel`; it does not install Triton for the XPU path. Add
+**Patch Sol-Attn** after the model loader to opt a workflow into sparse
+attention. Unsupported tensor contracts retain the original dense path.
 
 ## Omni XPU switches
 

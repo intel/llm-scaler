@@ -58,6 +58,10 @@ PINNED_CHECKOUTS = {
         Path("/llm/ComfyUI/custom_nodes/ComfyUI-nunchaku-XPU"),
         "OMNI_COMFY_NUNCHAKU_REVISION",
     ),
+    "Sol-Attn custom node": (
+        Path("/llm/ComfyUI/custom_nodes/ComfyUI-SolAttn"),
+        "OMNI_COMFY_SOL_ATTN_REVISION",
+    ),
 }
 
 GGUF_DEPENDENCIES = {
@@ -118,6 +122,9 @@ ONEDNN_PROVENANCE_FIELDS = {
     "library_path",
     "library_sha256",
 }
+SOL_ATTN_XPU_ADAPTER = (
+    Path("/llm/ComfyUI/custom_nodes/ComfyUI-SolAttn") / "_xpu_fwd.py"
+)
 
 
 def require_equal(label: str, actual: str, expected: str) -> None:
@@ -235,6 +242,47 @@ def add_comfyui_to_import_path() -> None:
     comfyui_root = str(COMFYUI_ROOT)
     if comfyui_root not in sys.path:
         sys.path.insert(0, comfyui_root)
+
+
+def require_sol_attn_xpu_backend(
+    adapter_path: Path = SOL_ATTN_XPU_ADAPTER,
+) -> dict[str, str]:
+    """Require the installed custom node to use the packaged CUTE backend."""
+
+    require_equal(
+        "Sol-Attn XPU experimental gate",
+        os.environ.get("SOL_ATTN_XPU_EXPERIMENTAL", ""),
+        "1",
+    )
+    if not adapter_path.is_file():
+        raise RuntimeError(f"Sol-Attn XPU adapter is missing: {adapter_path}")
+    spec = importlib.util.spec_from_file_location(
+        "_omni_installed_sol_attn_xpu_adapter",
+        adapter_path,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load Sol-Attn XPU adapter: {adapter_path}")
+    adapter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(adapter)
+    if not adapter.backend_available():
+        raise RuntimeError(
+            "installed Sol-Attn XPU backend is unavailable: "
+            f"{adapter.backend_error()}"
+        )
+    require_equal("Sol-Attn XPU backend", adapter._BACKEND, "omni-cute")
+    library = Path(adapter._LOADED_LIBRARY).resolve()
+    if not library.is_file():
+        raise RuntimeError(f"Sol-Attn packaged CUTE DSO is missing: {library}")
+    require_equal(
+        "Sol-Attn packaged CUTE DSO SHA256",
+        file_sha256(library),
+        adapter._LOADED_LIBRARY_SHA256,
+    )
+    return {
+        "backend": adapter._BACKEND,
+        "library": str(library),
+        "library_sha256": adapter._LOADED_LIBRARY_SHA256,
+    }
 
 
 def activate_runtime_providers():
@@ -510,6 +558,7 @@ def main() -> None:
         require_equal("llm-scaler source dirty", source_dirty, "false")
     for label, (path, environment_variable) in PINNED_CHECKOUTS.items():
         require_checkout_revision(label, path, os.environ[environment_variable])
+    sol_attn_backend = require_sol_attn_xpu_backend()
 
     require_equal(
         "Comfy AIMDO distribution version",
@@ -817,6 +866,8 @@ def main() -> None:
         f"{provider_details['comfy_aimdo.xpu']['revision'][:12]}, "
         f"provider_wheels={provider_wheel_hashes}, "
         f"runtime_constraints={runtime_constraints}, "
+        f"sol_attn={sol_attn_backend['backend']}@"
+        f"{sol_attn_backend['library_sha256'][:12]}, "
         f"gguf={dependency_versions['gguf']}, nunchaku={expected_nunchaku}, "
         f"xpu={device_name!r}, kitchen_capabilities={len(capabilities)}, "
         f"h3_templates={len(h3_template_hashes)}"
