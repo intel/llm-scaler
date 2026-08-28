@@ -1,7 +1,7 @@
 /***************************************************************************************************
  * Copyright (C) 2025 - 2026 Intel Corporation, All rights reserved.
  * Copyright (C) 2026 Sol-Attn XPU contributors.
- * SPDX-License-Identifier: BSD-3-Clause
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Sol-Attn CUTE/DPAS mainloop derived from SYCL-TLA's XeDefault FMHA
  * mainloop.  It follows the algorithm used by NVIDIA's official Metal

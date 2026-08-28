@@ -1,7 +1,7 @@
 /***************************************************************************************************
  * Copyright (C) 2025 - 2026 Intel Corporation, All rights reserved.
  * Copyright (C) 2026 Sol-Attn XPU contributors.
- * SPDX-License-Identifier: BSD-3-Clause
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Torch wrapper for the Triton-free Sol-Attn CUTE/DPAS mainloop.
  * Launch and type-assembly patterns follow SYCL-TLA example 06 and the

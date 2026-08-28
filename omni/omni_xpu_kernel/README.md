@@ -490,5 +490,4 @@ table.
 
 ## License
 
-Apache 2.0. The Sol-Attn CUTE wrapper and mainloop retain their
-BSD-3-Clause source notices and upstream attribution.
+Apache 2.0.
