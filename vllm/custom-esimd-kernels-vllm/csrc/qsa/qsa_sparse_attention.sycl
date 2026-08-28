@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <limits>
 
+#include "qsa_ops.h"
+
 namespace {
 
 #ifndef QSA_NATIVE_ACTIVATION_FP16
@@ -737,6 +739,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       "sparse_paged_attention_bounded",
       &sparse_paged_attention_bounded,
       "Qwen3.8 TP8-rank sparse paged attention with trusted scan bound (XPU)");
+  module.def(
+      "qsa_select_paged_tokens",
+      &qsa::select_paged_tokens,
+      "Qwen3.8 TP8-rank fused paged index selection and expansion (XPU)");
   module.attr("kv_tile") = QSA_NATIVE_KV_TILE;
   module.attr("subgroup") = QSA_NATIVE_SUBGROUP;
   module.attr("token_loader") = QSA_NATIVE_TOKEN_LOADER;
@@ -751,4 +757,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.attr("activation_dtype") = kActivationName;
   module.attr("strided_kv") = 1;
   module.attr("exact_packed_cache") = QSA_NATIVE_EXACT_PACKED_CACHE;
+  module.attr("selection_output_width") = 2051;
 }

@@ -1,0 +1,311 @@
+// Copyright 2026
+// SPDX-License-Identifier: Apache-2.0
+//
+// Fused Qwen3.8 TP8-rank compressed-key scoring, top-k and token expansion.
+
+#include "qsa_ops.h"
+
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+
+#include <sycl/sycl.hpp>
+
+#include <cstdint>
+#include <limits>
+
+namespace qsa {
+namespace {
+
+using activation_t = sycl::half;
+
+constexpr int64_t kIndexHeads = 4;
+constexpr int64_t kHeadDim = 128;
+constexpr int64_t kCompressedPageSize = 128;
+constexpr int64_t kTokenTopk = 2048;
+constexpr int64_t kCompressRatio = 4;
+constexpr int64_t kBlockTopk = kTokenTopk / kCompressRatio;
+constexpr int64_t kOutputWidth = kTokenTopk + kCompressRatio - 1;
+constexpr int64_t kChunkBlocks = kBlockTopk;
+constexpr int64_t kSortSize = 2 * kBlockTopk;
+constexpr int64_t kSubgroup = 32;
+constexpr int64_t kWorkgroup = 256;
+constexpr int64_t kSubgroups = kWorkgroup / kSubgroup;
+constexpr float kScoreScale = 0.08838834764831845f;
+
+class QsaSelectPagedTokensKernel;
+
+void check_fp16_xpu(
+    const at::Tensor& tensor, const char* name, bool require_contiguous) {
+  TORCH_CHECK(tensor.device().is_xpu(), name, " must be on XPU");
+  TORCH_CHECK(tensor.scalar_type() == at::kHalf, name, " must be float16");
+  TORCH_CHECK(
+      !require_contiguous || tensor.is_contiguous(),
+      name,
+      " must be contiguous");
+}
+
+void check_int32_xpu(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().is_xpu(), name, " must be on XPU");
+  TORCH_CHECK(tensor.scalar_type() == at::kInt, name, " must be int32");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+void check_int64_xpu(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().is_xpu(), name, " must be on XPU");
+  TORCH_CHECK(tensor.scalar_type() == at::kLong, name, " must be int64");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+}  // namespace
+
+at::Tensor select_paged_tokens(
+    const at::Tensor& q,
+    const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths,
+    int64_t token_topk,
+    int64_t compress_ratio,
+    at::Tensor out) {
+  check_fp16_xpu(q, "q", true);
+  check_fp16_xpu(compressed_key_cache, "compressed_key_cache", true);
+  check_int32_xpu(page_table, "page_table");
+  check_int32_xpu(token_to_req, "token_to_req");
+  check_int64_xpu(query_positions, "query_positions");
+  check_int32_xpu(sequence_lengths, "sequence_lengths");
+  check_int32_xpu(out, "out");
+  TORCH_CHECK(
+      q.dim() == 3 && q.size(1) == kIndexHeads && q.size(2) == kHeadDim,
+      "q must have shape [R,4,128]");
+  TORCH_CHECK(
+      compressed_key_cache.dim() == 4 &&
+          compressed_key_cache.size(1) == kCompressedPageSize &&
+          compressed_key_cache.size(2) == 1 &&
+          compressed_key_cache.size(3) == kHeadDim,
+      "compressed_key_cache must have shape [P,128,1,128]");
+  TORCH_CHECK(
+      page_table.dim() == 2 && page_table.size(0) > 0 &&
+          page_table.size(1) > 0,
+      "page_table must have shape [requests,pages]");
+  TORCH_CHECK(
+      token_to_req.dim() == 1 && token_to_req.size(0) == q.size(0),
+      "token_to_req must have shape [R]");
+  TORCH_CHECK(
+      query_positions.dim() == 1 && query_positions.size(0) == q.size(0),
+      "query_positions must have shape [R]");
+  TORCH_CHECK(
+      sequence_lengths.dim() == 1 &&
+          sequence_lengths.size(0) == page_table.size(0),
+      "sequence_lengths must have shape [requests]");
+  TORCH_CHECK(
+      out.dim() == 2 && out.size(0) == q.size(0) &&
+          out.size(1) == kOutputWidth,
+      "out must have shape [R,2051]");
+  TORCH_CHECK(token_topk == kTokenTopk, "token_topk must be 2048");
+  TORCH_CHECK(compress_ratio == kCompressRatio, "compress_ratio must be 4");
+  TORCH_CHECK(
+      q.device() == compressed_key_cache.device() &&
+          q.device() == page_table.device() &&
+          q.device() == token_to_req.device() &&
+          q.device() == query_positions.device() &&
+          q.device() == sequence_lengths.device() && q.device() == out.device(),
+      "all tensors must share one XPU device");
+
+  const int64_t rows = q.size(0);
+  if (rows == 0) {
+    return out;
+  }
+  const int64_t physical_pages = compressed_key_cache.size(0);
+  const int64_t requests = page_table.size(0);
+  const int64_t pages_per_request = page_table.size(1);
+  const int64_t cache_page_stride = compressed_key_cache.stride(0);
+  const int64_t cache_token_stride = compressed_key_cache.stride(1);
+  const auto* q_ptr = reinterpret_cast<const activation_t*>(q.data_ptr());
+  const auto* cache_ptr = reinterpret_cast<const activation_t*>(
+      compressed_key_cache.data_ptr());
+  const auto* page_table_ptr = page_table.data_ptr<int32_t>();
+  const auto* request_ptr = token_to_req.data_ptr<int32_t>();
+  const auto* position_ptr = query_positions.data_ptr<int64_t>();
+  const auto* sequence_ptr = sequence_lengths.data_ptr<int32_t>();
+  auto* out_ptr = out.data_ptr<int32_t>();
+
+  auto& queue = c10::xpu::getCurrentXPUStream(q.device().index()).queue();
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> scores(
+        sycl::range<1>(kSortSize), cgh);
+    sycl::local_accessor<int32_t, 1> indices(
+        sycl::range<1>(kSortSize), cgh);
+    cgh.parallel_for<QsaSelectPagedTokensKernel>(
+        sycl::nd_range<1>(
+            sycl::range<1>(static_cast<size_t>(rows * kWorkgroup)),
+            sycl::range<1>(static_cast<size_t>(kWorkgroup))),
+        [=](sycl::nd_item<1> item)
+            [[sycl::reqd_sub_group_size(kSubgroup)]] {
+          const int64_t row = item.get_group_linear_id();
+          const int64_t local = item.get_local_linear_id();
+          const int64_t subgroup_id = local / kSubgroup;
+          const int64_t lane = local % kSubgroup;
+          const int32_t request = request_ptr[row];
+          const bool request_valid = request >= 0 && request < requests;
+          const int64_t sequence_length = request_valid
+              ? static_cast<int64_t>(sequence_ptr[request])
+              : 0;
+          const int64_t visible_tokens = position_ptr[row] + 1;
+          const int64_t position_blocks = visible_tokens > 0
+              ? visible_tokens / kCompressRatio
+              : 0;
+          const int64_t sequence_blocks = sequence_length > 0
+              ? sequence_length / kCompressRatio
+              : 0;
+          const int64_t visible_blocks = sycl::min(
+              position_blocks, sequence_blocks);
+
+          for (int64_t slot = local; slot < kBlockTopk;
+               slot += kWorkgroup) {
+            scores[slot] = -std::numeric_limits<float>::infinity();
+            indices[slot] = -1;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          for (int64_t chunk_start = 0; chunk_start < visible_blocks;
+               chunk_start += kChunkBlocks) {
+            for (int64_t block_in_chunk = subgroup_id;
+                 block_in_chunk < kChunkBlocks;
+                 block_in_chunk += kSubgroups) {
+              const int64_t logical_block = chunk_start + block_in_chunk;
+              bool valid = logical_block < visible_blocks && request_valid;
+              int64_t cache_base = -1;
+              if (valid) {
+                const int64_t page_column =
+                    logical_block / kCompressedPageSize;
+                valid = page_column < pages_per_request;
+                if (valid) {
+                  const int32_t physical_page = page_table_ptr[
+                      static_cast<int64_t>(request) * pages_per_request +
+                      page_column];
+                  valid = physical_page >= 0 && physical_page < physical_pages;
+                  if (valid) {
+                    cache_base =
+                        static_cast<int64_t>(physical_page) *
+                            cache_page_stride +
+                        (logical_block % kCompressedPageSize) *
+                            cache_token_stride;
+                  }
+                }
+              }
+
+              float partial[kIndexHeads] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+              for (int64_t fragment = 0; fragment < kHeadDim / kSubgroup;
+                   ++fragment) {
+                const int64_t dim = lane + fragment * kSubgroup;
+                const float key = valid
+                    ? static_cast<float>(cache_ptr[cache_base + dim])
+                    : 0.0f;
+#pragma unroll
+                for (int64_t head = 0; head < kIndexHeads; ++head) {
+                  const float query = static_cast<float>(
+                      q_ptr[(row * kIndexHeads + head) * kHeadDim + dim]);
+                  partial[head] += query * key;
+                }
+              }
+              float score = 0.0f;
+#pragma unroll
+              for (int64_t head = 0; head < kIndexHeads; ++head) {
+                const float dot = sycl::reduce_over_group(
+                    item.get_sub_group(), partial[head], sycl::plus<float>());
+                score += sycl::fmax(dot, 0.0f);
+              }
+              if (lane == 0) {
+                const int64_t slot = kBlockTopk + block_in_chunk;
+                scores[slot] = valid
+                    ? score * kScoreScale
+                    : -std::numeric_limits<float>::infinity();
+                indices[slot] = valid
+                    ? static_cast<int32_t>(logical_block)
+                    : -1;
+              }
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+
+            // Ascending (score, descending-index) bitonic order. Reversing the
+            // retained high half yields torch.topk-compatible descending score
+            // order with ascending logical indices for exact score ties.
+            for (int64_t size = 2; size <= kSortSize; size <<= 1) {
+              for (int64_t stride = size >> 1; stride > 0; stride >>= 1) {
+                for (int64_t left = local; left < kSortSize;
+                     left += kWorkgroup) {
+                  const int64_t right = left ^ stride;
+                  if (right > left) {
+                    const float left_score = scores[left];
+                    const float right_score = scores[right];
+                    const int32_t left_index = indices[left];
+                    const int32_t right_index = indices[right];
+                    const bool ascending = (left & size) == 0;
+                    const bool swap = ascending
+                        ? (left_score > right_score ||
+                           (left_score == right_score &&
+                            left_index < right_index))
+                        : (left_score < right_score ||
+                           (left_score == right_score &&
+                            left_index > right_index));
+                    if (swap) {
+                      scores[left] = right_score;
+                      scores[right] = left_score;
+                      indices[left] = right_index;
+                      indices[right] = left_index;
+                    }
+                  }
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+              }
+            }
+            for (int64_t rank = local; rank < kBlockTopk;
+                 rank += kWorkgroup) {
+              const int64_t source = kSortSize - 1 - rank;
+              scores[rank] = scores[source];
+              indices[rank] = indices[source];
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+          }
+
+          const int64_t output_base = row * kOutputWidth;
+          for (int64_t column = local; column < kOutputWidth;
+               column += kWorkgroup) {
+            out_ptr[output_base + column] = -1;
+          }
+          item.barrier(sycl::access::fence_space::global_and_local);
+
+          const int64_t selected_blocks = sycl::min(
+              visible_blocks, kBlockTopk);
+          const int64_t expanded_tokens =
+              selected_blocks * kCompressRatio;
+          for (int64_t column = local; column < expanded_tokens;
+               column += kWorkgroup) {
+            const int64_t rank = column / kCompressRatio;
+            const int64_t offset = column % kCompressRatio;
+            const int32_t block = indices[rank];
+            const int64_t token =
+                static_cast<int64_t>(block) * kCompressRatio + offset;
+            if (block >= 0 && token < sequence_length) {
+              out_ptr[output_base + column] = static_cast<int32_t>(token);
+            }
+          }
+          if (local < kCompressRatio - 1) {
+            const int64_t tail_start =
+                visible_tokens / kCompressRatio * kCompressRatio;
+            const int64_t tail_count = visible_tokens - tail_start;
+            const int64_t tail_token = tail_start + local;
+            if (local < tail_count && tail_token >= 0 &&
+                tail_token < sequence_length) {
+              out_ptr[output_base + expanded_tokens + local] =
+                  static_cast<int32_t>(tail_token);
+            }
+          }
+        });
+  });
+  return out;
+}
+
+}  // namespace qsa
