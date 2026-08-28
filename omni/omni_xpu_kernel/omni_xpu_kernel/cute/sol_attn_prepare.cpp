@@ -365,4 +365,3 @@ TORCH_LIBRARY_IMPL(omni_xpu_sol_attn, XPU, m) {
   m.impl("prepare", &omni_xpu_sol_attn::prepare);
   m.impl("materialize_routes", &omni_xpu_sol_attn::materialize_routes);
 }
-
