@@ -15,6 +15,9 @@ from custom_esimd_kernels_vllm import moe_ops
 # MoE INT4 Batch kernels — registers torch.ops.moe_int4_ops.*
 from custom_esimd_kernels_vllm import moe_int4_ops
 
+# Qwen3.8 QSA — direct pybind API: qsa_ops.sparse_paged_attention(...)
+from custom_esimd_kernels_vllm import qsa_ops
+
 from custom_esimd_kernels_vllm.ops import (
     # Core ESIMD ops
     QWEN38_NGRAM_OFFSETS,
