@@ -4,7 +4,11 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from qsa_build import QSA_DEFINES, QSA_EXTENSION_NAME  # noqa: E402
+from qsa_build import (  # noqa: E402
+    QSA_DEFINES,
+    QSA_EXTENSION_NAME,
+    make_qsa_extension,
+)
 
 
 def test_qsa_extension_name_is_stable():
@@ -27,3 +31,13 @@ def test_qsa_build_matches_validated_fp16_packed_contract():
         "QSA_NATIVE_BLOCK_SOFTMAX=0",
         "QSA_NATIVE_FAST_EXP=1",
     }
+
+
+def test_qsa_build_contains_attention_and_selection_sources():
+    root = Path(__file__).resolve().parents[1]
+    extension = make_qsa_extension(root, "/torch/include")
+
+    assert extension.sources == [
+        "csrc/qsa/qsa_sparse_attention.sycl",
+        "csrc/qsa/qsa_select_paged_tokens.sycl",
+    ]

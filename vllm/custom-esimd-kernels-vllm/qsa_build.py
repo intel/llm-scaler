@@ -28,7 +28,10 @@ def make_qsa_extension(root: Path, torch_include: str) -> SyclExtension:
 
     return SyclExtension(
         name=QSA_EXTENSION_NAME,
-        sources=["csrc/qsa/qsa_sparse_attention.sycl"],
+        sources=[
+            "csrc/qsa/qsa_sparse_attention.sycl",
+            "csrc/qsa/qsa_select_paged_tokens.sycl",
+        ],
         include_dirs=[root / "csrc" / "qsa"],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
