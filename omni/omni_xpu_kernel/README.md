@@ -16,6 +16,7 @@ across those native ABI boundaries.
 | `cute.sdp_bhld_d128` | BMG batched/rectangular D128 BHLD attention |
 | `cute.sdp_minimax_h3_vae_d64` | Structural BMG MiniMax H3 VideoVAE D64 tile attention |
 | `cute.sdp_wan22_cross` | Exact BMG Wan 2.2 14B T2V Turbo cross-attention |
+| `cute.sol_attn` | BMG sparse Sol-Attn for BF16 BTHD D128 tensors |
 | `linear` | oneDNN FP8 weight-only GEMM |
 | `fp8` | FP8 quantization, dequantization, and stochastic rounding |
 | `gguf` | Q4_0, Q4_1, Q8_0, Q4_K, and Q6_K dequantization |
@@ -277,6 +278,11 @@ if cute is not None and cute.supports_minimax_h3_vae_d64():
 # tuned cross-attention contract separately from the general BHLD API.
 if cute is not None and cute.supports_wan22_cross():
     output = cute.sdp_wan22_cross(q_blhd, k_blhd, v_blhd)
+
+# BMG builds expose sparse Sol-Attn for the validated BF16 BTHD D128
+# self-attention contract. Routing thresholds remain explicit call policy.
+if cute is not None and cute.supports_sol_attn():
+    output = cute.sol_attn(q_bthd, k_bthd, v_bthd, tau=1.3)
 ```
 
 The legacy BLHD `cute.sdp` entry point accepts unmasked self-attention with
@@ -299,6 +305,12 @@ Q/K/V `[1, 32, S, 64]`, where `S` varies with the decoder's temporal and
 spatial tile extent. Q/K use the runtime-derived `H*D` sequence stride and V
 retains the three-wide QKV projection stride. Other D64 layouts remain with
 the caller's fallback.
+
+`sol_attn` is BMG-only and accepts matching XPU BF16 Q/K/V in BTHD layout,
+with non-empty sequence length, D128, and contiguous head dimension. It does
+not accept masks, causal mode, GQA, or cross-attention. The approximation
+policy is controlled by `tau`, `sink_blocks`, and `sink_q`; callers must not
+substitute it for dense attention unless their model has selected Sol-Attn.
 
 ### Quantized linear operations
 
@@ -478,4 +490,5 @@ table.
 
 ## License
 
-Apache 2.0
+Apache 2.0. The Sol-Attn CUTE wrapper and mainloop retain their
+BSD-3-Clause source notices and upstream attribution.

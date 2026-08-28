@@ -280,11 +280,24 @@ def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
     if sys.platform == "win32":
         assert "omni_xpu_kernel.cute.cute_fmha_torch" not in extensions
     else:
+        cute_extension = extensions[
+            "omni_xpu_kernel.cute.cute_fmha_torch"
+        ]
+        cute_sources = {
+            Path(source).name for source in cute_extension.sources
+        }
         cute_dependencies = {
             Path(dependency).name
-            for dependency in extensions["omni_xpu_kernel.cute.cute_fmha_torch"].depends
+            for dependency in cute_extension.depends
+        }
+        assert cute_sources == {
+            "cute_fmha_torch.cpp",
+            "sol_attn_prepare.cpp",
+            "sol_attn_torch.cpp",
         }
         assert "cute_fmha_config.h" in cute_dependencies
+        assert "sol_attn_config.h" in cute_dependencies
+        assert "sol_attn_mainloop.hpp" in cute_dependencies
     assert all(
         not Path(dependency).is_absolute()
         for extension in extensions.values()
