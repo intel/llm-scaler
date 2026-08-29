@@ -335,6 +335,7 @@ def test_device_independent_native_selection_compiles_and_runs(tmp_path):
             ASSERT_GENERIC_MATCHES_B70(kitchen_rope_pairs_per_work_item);
             ASSERT_GENERIC_MATCHES_B70(kitchen_rope_work_group_size);
             ASSERT_GENERIC_MATCHES_B70(d120_l4205_v_tile);
+            ASSERT_GENERIC_MATCHES_B70(h3_vae_d64_s1797_kv_tile);
             #undef ASSERT_GENERIC_MATCHES_B70
 
             const auto detected = resolve_bmg_selection(kArcB580, nullptr);
@@ -361,6 +362,17 @@ def test_device_independent_native_selection_compiles_and_runs(tmp_path):
             static_assert(
                 B580AdalnCandidatePolicy::int8_scaleback_elements ==
                 GenericBmgKernelPolicy::int8_scaleback_elements);
+            const auto h3_candidate = resolve_bmg_selection(
+                kArcB580, nullptr, "h3-vae-d64-s1797-kv-tile");
+            assert(h3_candidate.b580_policy_candidate ==
+                   B580PolicyCandidate::h3_vae_d64_s1797_kv_tile);
+            assert(b580_policy_candidate_name(
+                       h3_candidate.b580_policy_candidate) ==
+                   "h3-vae-d64-s1797-kv-tile");
+            static_assert(
+                B580H3VaeD64S1797CandidatePolicy::
+                    h3_vae_d64_s1797_kv_tile ==
+                B60KernelPolicy::h3_vae_d64_s1797_kv_tile);
 
             const auto forced = resolve_bmg_selection(kArcProB70, "b60");
             assert(forced.physical_sku == BmgSku::b70);
@@ -576,4 +588,9 @@ def test_b580_candidate_axes_are_explicit_and_route_local():
     assert "B580PolicyCandidate::d120_l4205_v_tile" in policy
     assert "B580PolicyCandidate::d120_l4205_v_tile" in cute_source
     assert "B580D120L4205CandidatePolicy" in kernel_policy
+    assert "B580PolicyCandidate::h3_vae_d64_s1797_kv_tile" in policy
+    assert "B580PolicyCandidate::\n            h3_vae_d64_s1797_kv_tile" in (
+        cute_source
+    )
+    assert "B580H3VaeD64S1797CandidatePolicy" in kernel_policy
     assert "B580CandidateKernelPolicy" in kernel_policy

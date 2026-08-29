@@ -274,6 +274,10 @@ py::dict b580_candidate_kernel_policy_dict(
         case Candidate::d120_l4205_v_tile:
             policy["d120_l4205_v_tile"] = B60::d120_l4205_v_tile;
             break;
+        case Candidate::h3_vae_d64_s1797_kv_tile:
+            policy["h3_vae_d64_s1797_kv_tile"] =
+                B60::h3_vae_d64_s1797_kv_tile;
+            break;
         default:
             break;
     }

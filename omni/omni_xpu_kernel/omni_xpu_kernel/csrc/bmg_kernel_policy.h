@@ -117,6 +117,7 @@ struct GenericBmgKernelPolicy {
     static constexpr int kitchen_rope_work_group_size = 0;
 
     static constexpr int d120_l4205_v_tile = 32;
+    static constexpr int h3_vae_d64_s1797_kv_tile = 32;
 };
 
 // A candidate type differs from GenericBmgKernelPolicy in exactly one legal
@@ -213,6 +214,10 @@ struct B580CandidateKernelPolicy {
         Candidate == B580PolicyCandidate::d120_l4205_v_tile
         ? B60KernelPolicy::d120_l4205_v_tile
         : GenericBmgKernelPolicy::d120_l4205_v_tile;
+    static constexpr int h3_vae_d64_s1797_kv_tile =
+        Candidate == B580PolicyCandidate::h3_vae_d64_s1797_kv_tile
+        ? B60KernelPolicy::h3_vae_d64_s1797_kv_tile
+        : GenericBmgKernelPolicy::h3_vae_d64_s1797_kv_tile;
 };
 
 using B580AdalnCandidatePolicy =
@@ -239,6 +244,9 @@ using B580KitchenRopeCandidatePolicy =
     B580CandidateKernelPolicy<B580PolicyCandidate::kitchen_rope>;
 using B580D120L4205CandidatePolicy =
     B580CandidateKernelPolicy<B580PolicyCandidate::d120_l4205_v_tile>;
+using B580H3VaeD64S1797CandidatePolicy =
+    B580CandidateKernelPolicy<
+        B580PolicyCandidate::h3_vae_d64_s1797_kv_tile>;
 
 }  // namespace device
 }  // namespace omni_xpu

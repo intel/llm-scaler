@@ -79,12 +79,17 @@ def test_h3_vae_s1797_keeps_explicit_b60_and_b70_kv_policies():
     b60_policy = BMG_POLICY_SOURCE.split("struct B60KernelPolicy", 1)[1]
     b60_policy = b60_policy.split("struct B70KernelPolicy", 1)[0]
     b70_policy = BMG_POLICY_SOURCE.split("struct B70KernelPolicy", 1)[1]
+    b70_policy = b70_policy.split("struct GenericBmgKernelPolicy", 1)[0]
+    generic_policy = BMG_POLICY_SOURCE.split(
+        "struct GenericBmgKernelPolicy", 1
+    )[1].split("template <B580PolicyCandidate Candidate>", 1)[0]
     assert "h3_vae_d64_s1797_kv_tile = 64" in b60_policy
     assert "h3_vae_d64_s1797_kv_tile = 32" in b70_policy
+    assert "h3_vae_d64_s1797_kv_tile = 32" in generic_policy
     assert 'policy["h3_vae_d64_s1797_kv_tile"]' in BINDINGS_SOURCE
 
 
-def test_h3_vae_s1797_queries_b60_only_inside_exact_shape_dispatch():
+def test_h3_vae_s1797_queries_b60_and_b580_candidate_inside_exact_shape():
     template_section = CUTE_FMHA_SOURCE.split("struct D128TileKernel", 1)[0]
     assert "int KvTileOverride = 0" in template_section
     assert (
@@ -96,9 +101,16 @@ def test_h3_vae_s1797_queries_b60_only_inside_exact_shape_dispatch():
         "at::Tensor sdp_minimax_h3_vae_d64", 1
     )[1].split("at::Tensor sdp_bhld_d120", 1)[0]
     shape_guard = h3_section.index("if (L == 1797)")
-    device_query = h3_section.index("use_b60_kernel_profile(queue)")
+    device_query = h3_section.index("get_bmg_selection_unwarned(queue)")
+    b580_candidate = h3_section.index(
+        "B580PolicyCandidate::\n            h3_vae_d64_s1797_kv_tile"
+    )
+    b60_profile = h3_section.index("BmgKernelProfile::b60")
     candidate = h3_section.index("h3_vae_d64_s1797_kv_tile")
     fallback = h3_section.index(
         "run_d128_tile<cutlass::half_t, 0, 0, 0, 0, 0, 64>("
     )
-    assert shape_guard < device_query < candidate < fallback
+    assert (
+        shape_guard < device_query < b580_candidate < b60_profile < fallback
+    )
+    assert candidate < fallback

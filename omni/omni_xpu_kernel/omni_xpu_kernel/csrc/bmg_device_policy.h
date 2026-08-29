@@ -45,6 +45,7 @@ enum class B580PolicyCandidate : uint8_t {
     svdq_convert_add = 10,
     kitchen_rope = 11,
     d120_l4205_v_tile = 12,
+    h3_vae_d64_s1797_kv_tile = 13,
 };
 
 constexpr uint32_t kBmgE210 = 0xE210;
@@ -133,6 +134,8 @@ constexpr std::string_view b580_policy_candidate_name(
             return "kitchen-rope";
         case B580PolicyCandidate::d120_l4205_v_tile:
             return "d120-l4205-v-tile";
+        case B580PolicyCandidate::h3_vae_d64_s1797_kv_tile:
+            return "h3-vae-d64-s1797-kv-tile";
         default:
             return "none";
     }
@@ -208,13 +211,16 @@ inline BmgSelection resolve_bmg_selection(
             candidate = B580PolicyCandidate::kitchen_rope;
         } else if (value == "d120-l4205-v-tile") {
             candidate = B580PolicyCandidate::d120_l4205_v_tile;
+        } else if (value == "h3-vae-d64-s1797-kv-tile") {
+            candidate = B580PolicyCandidate::h3_vae_d64_s1797_kv_tile;
         } else {
             throw std::runtime_error(
                 "invalid OMNI_XPU_B580_POLICY_CANDIDATE='" + value +
                 "'; expected adaln, int8-dequant-fp32, "
                 "int8-dequant-bf16, int8-scaleback, convrot-g16, "
                 "fp8-stochastic, svdq-dequant, svdq-quant, svdq-smooth, "
-                "svdq-convert-add, kitchen-rope, d120-l4205-v-tile, or none");
+                "svdq-convert-add, kitchen-rope, d120-l4205-v-tile, "
+                "h3-vae-d64-s1797-kv-tile, or none");
         }
     }
     return {

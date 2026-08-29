@@ -124,10 +124,11 @@ candidate policy through `device.info()`, emits a warning, and always keeps
 The accepted values are `adaln`, `int8-dequant-fp32`,
 `int8-dequant-bf16`, `int8-scaleback`, `convrot-g16`, `fp8-stochastic`,
 `svdq-dequant`, `svdq-quant`, `svdq-smooth`, `svdq-convert-add`,
-`kitchen-rope`, and `d120-l4205-v-tile`. Each value changes only the named
-legal policy axis from the generic B580 baseline to the B60 candidate. Coupled
-template fields such as AdaLN block/work-group size and ConvRot DPAS/work-item
-geometry remain one axis so the selector cannot instantiate an invalid mix.
+`kitchen-rope`, `d120-l4205-v-tile`, and
+`h3-vae-d64-s1797-kv-tile`. Each value changes only the named legal policy
+axis from the generic B580 baseline to the B60 candidate. Coupled template
+fields such as AdaLN block/work-group size and ConvRot DPAS/work-item geometry
+remain one axis so the selector cannot instantiate an invalid mix.
 
 ```bash
 OMNI_XPU_B580_POLICY_CANDIDATE=d120-l4205-v-tile python -c \
