@@ -552,6 +552,11 @@ class ICPXBuildExt(build_ext):
         elif is_cute:
             src_dir = Path(ext.sourcedir) / "omni_xpu_kernel" / "cute"
             sources = [src_dir / "cute_fmha_torch.cpp"]
+            if BUILD_XPU_TARGET == "bmg":
+                sources += [
+                    src_dir / "sol_attn_prepare.cpp",
+                    src_dir / "sol_attn_torch.cpp",
+                ]
         else:
             src_dir = Path(ext.sourcedir) / "omni_xpu_kernel" / "csrc"
             sources = list(src_dir.glob("*.cpp"))
@@ -809,10 +814,15 @@ class ICPXExtension(Extension):
             depends = sorted(kernel_root.rglob("*.h"))
         elif name.endswith("cute_fmha_torch"):
             kernel_root = source_root / "omni_xpu_kernel" / "cute"
-            sources = [kernel_root / "cute_fmha_torch.cpp"]
+            sources = [
+                kernel_root / "cute_fmha_torch.cpp",
+                kernel_root / "sol_attn_prepare.cpp",
+                kernel_root / "sol_attn_torch.cpp",
+            ]
             csrc_root = source_root / "omni_xpu_kernel" / "csrc"
-            depends = [
-                kernel_root / "cute_fmha_config.h",
+            depends = sorted(kernel_root.glob("*.h")) + sorted(
+                kernel_root.glob("*.hpp")
+            ) + [
                 csrc_root / "bmg_kernel_policy.h",
                 csrc_root / "device_utils.h",
             ]

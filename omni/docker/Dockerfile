@@ -40,6 +40,8 @@ ARG COMFY_GGUF_COMMIT=39671fe73117ba97de7011e7e06e32599dcda06d
 ARG COMFY_NUNCHAKU_REPOSITORY=https://github.com/xiangyuT/ComfyUI-nunchaku-XPU.git
 ARG COMFY_NUNCHAKU_COMMIT=cc0f6236b6c329178ad4ef58452a874e774c7b8e
 ARG COMFY_NUNCHAKU_VERSION=1.2.1+xpu.3
+ARG COMFY_SOL_ATTN_REPOSITORY=https://github.com/xiangyuT/ComfyUI-SolAttn_xpu.git
+ARG COMFY_SOL_ATTN_COMMIT=5f1c4aac3ca32a00b0b4c15ddbb7cb53fa43344d
 ARG LLM_SCALER_SOURCE_REVISION=unknown
 ARG LLM_SCALER_SOURCE_DIRTY=unknown
 
@@ -264,6 +266,19 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         1d92bbd86ec59aa6223fe2368849b7413a1acb93 && \
     git -C ComfyUI-CacheDiT checkout --detach FETCH_HEAD && \
     pip install -r ComfyUI-CacheDiT/requirements.txt
+
+# Sol-Attn owns only ComfyUI dispatch; its Intel XPU implementation is built
+# into the pinned omni_xpu_kernel wheel below. Keep the custom node at an exact
+# revision and do not install Triton or build a second native sidecar.
+ARG COMFY_SOL_ATTN_REPOSITORY
+ARG COMFY_SOL_ATTN_COMMIT
+
+RUN cd /llm/ComfyUI/custom_nodes && \
+    git clone --filter=blob:none --no-checkout \
+        "${COMFY_SOL_ATTN_REPOSITORY}" ComfyUI-SolAttn && \
+    git -C ComfyUI-SolAttn fetch --depth 1 origin \
+        "${COMFY_SOL_ATTN_COMMIT}" && \
+    git -C ComfyUI-SolAttn checkout --detach FETCH_HEAD
 
 ARG COMFY_GGUF_REPOSITORY
 ARG COMFY_GGUF_COMMIT
@@ -502,6 +517,8 @@ ARG COMFY_AIMDO_VERSION
 ARG COMFY_GGUF_COMMIT
 ARG COMFY_NUNCHAKU_COMMIT
 ARG COMFY_NUNCHAKU_VERSION
+ARG COMFY_SOL_ATTN_REPOSITORY
+ARG COMFY_SOL_ATTN_COMMIT
 ARG LLM_SCALER_SOURCE_REVISION
 ARG LLM_SCALER_SOURCE_DIRTY
 
@@ -538,9 +555,12 @@ LABEL org.opencontainers.image.version="${IMAGE_TAG}" \
       com.intel.omni.comfy-aimdo-xpu-runtime.revision="${COMFY_AIMDO_COMMIT}" \
       com.intel.omni.comfy-gguf.revision="${COMFY_GGUF_COMMIT}" \
       com.intel.omni.comfy-nunchaku.version="${COMFY_NUNCHAKU_VERSION}" \
-      com.intel.omni.comfy-nunchaku.revision="${COMFY_NUNCHAKU_COMMIT}"
+      com.intel.omni.comfy-nunchaku.revision="${COMFY_NUNCHAKU_COMMIT}" \
+      com.intel.omni.comfy-sol-attn.repository="${COMFY_SOL_ATTN_REPOSITORY}" \
+      com.intel.omni.comfy-sol-attn.revision="${COMFY_SOL_ATTN_COMMIT}"
 
 ENV OMNIXPU_INTERPOLATE_FIX=0 \
+    SOL_ATTN_XPU_EXPERIMENTAL=1 \
     UR_INCLUDE_DIR="/opt/venv/include/unified-runtime" \
     PIP_CONSTRAINT="/llm/manifests/omni-runtime-constraints.txt" \
     OMNI_IMAGE_VERSION="${IMAGE_TAG}" \
@@ -569,7 +589,8 @@ ENV OMNIXPU_INTERPOLATE_FIX=0 \
     OMNI_COMFY_AIMDO_PROVIDER_REVISION="${COMFY_AIMDO_COMMIT}" \
     OMNI_COMFY_GGUF_REVISION="${COMFY_GGUF_COMMIT}" \
     OMNI_COMFY_NUNCHAKU_VERSION="${COMFY_NUNCHAKU_VERSION}" \
-    OMNI_COMFY_NUNCHAKU_REVISION="${COMFY_NUNCHAKU_COMMIT}"
+    OMNI_COMFY_NUNCHAKU_REVISION="${COMFY_NUNCHAKU_COMMIT}" \
+    OMNI_COMFY_SOL_ATTN_REVISION="${COMFY_SOL_ATTN_COMMIT}"
 
 # Retain OMIX's oneAPI environment initialization, then restore the venv's
 # Torch-matched 2026.0 SYCL/UR runtime ahead of the OMIX 2026.1 build

@@ -152,6 +152,9 @@ The focused image contains:
   pinned checkout's requirements;
 - [`ComfyUI-nunchaku-XPU==1.2.1+xpu.3`](https://github.com/xiangyuT/ComfyUI-nunchaku-XPU/commit/cc0f6236b6c329178ad4ef58452a874e774c7b8e),
   with its `nunchaku_torch` runtime bundled in the same pinned checkout;
+- [`ComfyUI-SolAttn`](https://github.com/xiangyuT/ComfyUI-SolAttn_xpu/commit/5f1c4aac3ca32a00b0b4c15ddbb7cb53fa43344d),
+  using the packaged `omni_xpu_kernel` CUTE/DPAS backend without a second XPU
+  build path or Triton dependency;
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md);
 - ComfyUI v0.33.4 integrated Node Manager plus pinned VideoHelperSuite,
   Easy-Use, KJNodes, CacheDiT, and ControlNet auxiliary nodes;

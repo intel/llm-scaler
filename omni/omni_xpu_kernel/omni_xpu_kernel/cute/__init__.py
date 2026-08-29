@@ -169,6 +169,58 @@ def sdp_bhld_d120(
     return torch.ops.cute_fmha.sdp_bhld_d120(q, k, v)
 
 
+def _sol_attn_ops():
+    return torch.ops.omni_xpu_sol_attn
+
+
+def supports_sol_attn() -> bool:
+    """Whether this BMG sidecar exports the validated sparse Sol-Attn path."""
+    try:
+        _ensure_loaded()
+        ops = _sol_attn_ops()
+        return hasattr(ops, "prepare") and hasattr(ops, "forward_cute")
+    except Exception:
+        return False
+
+
+def sol_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    scale: float | None = None,
+    tau: float = 1.0,
+    sink_blocks: tuple[int, int] = (0, 0),
+    sink_q: tuple[int, int] = (0, 0),
+) -> torch.Tensor:
+    """Sparse Sol-Attn for the validated BMG BF16 BTHD D128 contract.
+
+    Route preparation remains an internal implementation detail. Unsupported
+    targets and tensor contracts raise instead of silently changing attention
+    semantics; callers may use :func:`supports_sol_attn` for capability
+    routing.
+    """
+    _ensure_loaded()
+    ops = _sol_attn_ops()
+    if not hasattr(ops, "prepare") or not hasattr(ops, "forward_cute"):
+        raise RuntimeError("packaged Sol-Attn is unavailable in this sidecar")
+    if len(sink_blocks) != 2 or len(sink_q) != 2:
+        raise ValueError("sink_blocks and sink_q must each contain two indices")
+    scale_value = q.shape[-1] ** -0.5 if scale is None else float(scale)
+    prepared = ops.prepare(
+        q,
+        k,
+        v,
+        float(scale_value),
+        float(tau),
+        int(sink_blocks[0]),
+        int(sink_blocks[1]),
+        int(sink_q[0]),
+        int(sink_q[1]),
+    )
+    return ops.forward_cute(q, k, v, *prepared, float(scale_value))
+
+
 __all__ = [
     "sdp",
     "sdp_wan22_cross",
@@ -179,5 +231,7 @@ __all__ = [
     "supports_minimax_h3_vae_d64",
     "sdp_bhld_d120",
     "supports_d120_bhld",
+    "sol_attn",
+    "supports_sol_attn",
     "is_available",
 ]
