@@ -31,6 +31,7 @@
 #include "bmg_kernel_policy.h"
 #include "device_utils.h"
 #endif
+#include "kernel_tuning_overrides.h"
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -61,16 +62,6 @@ constexpr int HALF_GROUP = SVDQ_GROUP_SIZE / 2;  // 32 packed bytes per group
 //   scale is at scales[g, n]
 //   output[n, g*64 .. (g+1)*64 - 1] = unpack(packed) * scale
 // ============================================================================
-
-#ifndef OMNI_SVDQ_DEQUANT_GROUPS_PER_WI
-#if defined(OMNI_XPU_ARCH_PTL_H)
-#define OMNI_SVDQ_DEQUANT_GROUPS_PER_WI 60
-#elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_SVDQ_DEQUANT_GROUPS_PER_WI 60
-#else
-#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
-#endif
-#endif
 
 template<
     typename OT,
@@ -265,36 +256,6 @@ void dequantize_svdq_w4_signed_vector_kernel(
 // Signed: range [-8, 7]
 // ============================================================================
 
-#ifndef OMNI_SVDQ_UNPACK_COLS_PER_WI
-#if defined(OMNI_XPU_ARCH_PTL_H)
-#define OMNI_SVDQ_UNPACK_COLS_PER_WI 3840
-#elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_SVDQ_UNPACK_COLS_PER_WI 3840
-#else
-#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
-#endif
-#endif
-
-#ifndef OMNI_SVDQ_UNPACK_BYTES_PER_ITERATION
-#if defined(OMNI_XPU_ARCH_PTL_H)
-#define OMNI_SVDQ_UNPACK_BYTES_PER_ITERATION 64
-#elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_SVDQ_UNPACK_BYTES_PER_ITERATION 128
-#else
-#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
-#endif
-#endif
-
-#ifndef OMNI_SVDQ_UNPACK_WG_SIZE
-#if defined(OMNI_XPU_ARCH_PTL_H)
-#define OMNI_SVDQ_UNPACK_WG_SIZE 32
-#elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_SVDQ_UNPACK_WG_SIZE 1
-#else
-#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
-#endif
-#endif
-
 template<bool Signed = true, int COLS_PER_WI = OMNI_SVDQ_UNPACK_COLS_PER_WI>
 void unpack_svdq_int4_kernel(
     const uint8_t* __restrict__ packed,
@@ -398,16 +359,6 @@ void unpack_svdq_int4_kernel(
 //   unsigned: scale = absmax / 15, q clamped to [0, 15]
 //   packed[m, k/2] = (q[even] & 0xF) | (q[odd] << 4)
 // ============================================================================
-
-#ifndef OMNI_SVDQ_QUANT_GROUPS_PER_WI
-#if defined(OMNI_XPU_ARCH_PTL_H)
-#define OMNI_SVDQ_QUANT_GROUPS_PER_WI 60
-#elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_SVDQ_QUANT_GROUPS_PER_WI 60
-#else
-#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
-#endif
-#endif
 
 template<
     typename IT,
@@ -608,11 +559,26 @@ void launch_svdq_dequant_signed(
         packed, scales, output, rows, columns, groups, target_device);
 #elif defined(OMNI_XPU_ARCH_BMG)
     auto& queue = utils::get_queue(target_device);
-    if (device::use_b60_kernel_profile(queue)) {
+    const auto kernel_profile =
+        device::get_bmg_selection(queue).kernel_profile;
+    if (kernel_profile == device::BmgKernelProfile::b60) {
         dequantize_svdq_w4_signed_vector_kernel<
             OT,
             device::B60KernelPolicy::svdq_dequant_groups,
             device::B60KernelPolicy::svdq_dequant_work_group_size>(
+                packed,
+                scales,
+                output,
+                rows,
+                columns,
+                groups,
+                target_device);
+    } else if (kernel_profile == device::BmgKernelProfile::generic_bmg) {
+        dequantize_svdq_w4_kernel<
+            OT,
+            true,
+            device::GenericBmgKernelPolicy::svdq_dequant_groups,
+            device::GenericBmgKernelPolicy::svdq_dequant_work_group_size>(
                 packed,
                 scales,
                 output,
@@ -651,12 +617,27 @@ void launch_svdq_dequant_unsigned(
     const at::Device& target_device) {
 #if defined(OMNI_XPU_ARCH_BMG)
     auto& queue = utils::get_queue(target_device);
-    if (device::use_b60_kernel_profile(queue)) {
+    const auto kernel_profile =
+        device::get_bmg_selection(queue).kernel_profile;
+    if (kernel_profile == device::BmgKernelProfile::b60) {
         dequantize_svdq_w4_kernel<
             OT,
             false,
             device::B60KernelPolicy::svdq_dequant_groups,
             device::B60KernelPolicy::svdq_dequant_work_group_size>(
+                packed,
+                scales,
+                output,
+                rows,
+                columns,
+                groups,
+                target_device);
+    } else if (kernel_profile == device::BmgKernelProfile::generic_bmg) {
+        dequantize_svdq_w4_kernel<
+            OT,
+            false,
+            device::GenericBmgKernelPolicy::svdq_dequant_groups,
+            device::GenericBmgKernelPolicy::svdq_dequant_work_group_size>(
                 packed,
                 scales,
                 output,
@@ -695,13 +676,29 @@ void launch_svdq_quant(
     const at::Device& target_device) {
 #if defined(OMNI_XPU_ARCH_BMG)
     auto& queue = utils::get_queue(target_device);
-    if (device::use_b60_kernel_profile(queue)) {
+    const auto kernel_profile =
+        device::get_bmg_selection(queue).kernel_profile;
+    if (kernel_profile == device::BmgKernelProfile::b60) {
         quantize_svdq_act_int4_kernel<
             IT,
             Unsigned,
             device::B60KernelPolicy::svdq_quant_groups,
             device::B60KernelPolicy::svdq_quant_work_group_size,
             true>(
+                input,
+                output,
+                scales,
+                rows,
+                columns,
+                groups,
+                target_device);
+    } else if (kernel_profile == device::BmgKernelProfile::generic_bmg) {
+        quantize_svdq_act_int4_kernel<
+            IT,
+            Unsigned,
+            device::GenericBmgKernelPolicy::svdq_quant_groups,
+            device::GenericBmgKernelPolicy::svdq_quant_work_group_size,
+            false>(
                 input,
                 output,
                 scales,

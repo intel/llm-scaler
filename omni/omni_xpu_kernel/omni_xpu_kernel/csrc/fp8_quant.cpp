@@ -4,6 +4,7 @@
 
 #include "bmg_kernel_policy.h"
 #include "device_utils.h"
+#include "kernel_tuning_overrides.h"
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -18,24 +19,6 @@ torch::Tensor dequantize_per_tensor_fused(
     torch::ScalarType out_dtype);
 
 namespace {
-
-#ifndef OMNI_FP8_QUANT_VEC
-#if defined(OMNI_XPU_ARCH_PTL_H)
-#define OMNI_FP8_QUANT_VEC 16
-#elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_FP8_QUANT_VEC 8
-#else
-#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
-#endif
-#endif
-
-#ifndef OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM
-#if defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM 6
-#else
-#define OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM 8
-#endif
-#endif
 
 double fp8_max(torch::ScalarType dtype) {
     if (dtype == torch::kFloat8_e4m3fn) return 448.0;

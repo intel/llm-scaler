@@ -615,8 +615,12 @@ at::Tensor sdp_bhld_d120(
 #if defined(OMNI_XPU_ARCH_BMG)
     auto& queue =
         c10::xpu::getCurrentXPUStream(q.device().index()).queue();
+    // The public Python wrapper asks the core _C extension to emit the one-shot
+    // policy warning. This sidecar only selects a profile, avoiding one warning
+    // per DSO when both native components are used in the same process.
     const bool use_b60 =
-        omni_xpu::device::use_b60_kernel_profile(queue);
+        omni_xpu::device::get_bmg_selection_unwarned(queue).kernel_profile ==
+        omni_xpu::device::BmgKernelProfile::b60;
     // B60's L4205 workflow benefits from a 64-wide V tile. B70 and
     // unrecognized BMG IDs keep the shipped V32 specialization.
     if (use_b60 && L == 4205) {

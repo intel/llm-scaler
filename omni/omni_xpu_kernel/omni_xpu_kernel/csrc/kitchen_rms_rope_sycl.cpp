@@ -2,7 +2,9 @@
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
+#include <type_traits>
 
+#include "kernel_tuning_overrides.h"
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -15,12 +17,24 @@ namespace {
 constexpr int64_t RMS_ROPE_WG = 64;
 
 #if defined(OMNI_XPU_ARCH_BMG)
+static_assert(
+    OMNI_H3_RMS_ROPE_FAST_REDUCE == 0 ||
+        OMNI_H3_RMS_ROPE_FAST_REDUCE == 1,
+    "OMNI_H3_RMS_ROPE_FAST_REDUCE must be zero or one");
+static_assert(
+    OMNI_H3_RMS_ROPE_SLM_BF16 == 0 ||
+        OMNI_H3_RMS_ROPE_SLM_BF16 == 1,
+    "OMNI_H3_RMS_ROPE_SLM_BF16 must be zero or one");
 constexpr int64_t H3_HEADS = 56;
 constexpr int64_t H3_HEAD_DIM = 128;
 constexpr int64_t H3_ROT_DIM = 96;
 constexpr int64_t H3_ROTARY_PAIRS = H3_ROT_DIM / 2;
 constexpr int64_t H3_PACKED_SEQUENCE_STRIDE =
     3 * H3_HEADS * H3_HEAD_DIM;
+using H3PairCacheT = std::conditional_t<
+    OMNI_H3_RMS_ROPE_SLM_BF16,
+    bf16,
+    float>;
 #endif
 
 struct Tensor4Meta {
@@ -187,14 +201,18 @@ void launch_minimax_h3_rms_rope(
     auto cgf = [&](sycl::handler& handler) {
         sycl::local_accessor<float, 1> partial(
             sycl::range<1>(RMS_ROPE_WG), handler);
-        sycl::local_accessor<float, 1> pair_second(
+        sycl::local_accessor<H3PairCacheT, 1> pair_second(
             sycl::range<1>(H3_ROTARY_PAIRS), handler);
         handler.parallel_for(
             sycl::nd_range<1>(
                 sycl::range<1>(
                     static_cast<size_t>(total_rows * RMS_ROPE_WG)),
                 sycl::range<1>(RMS_ROPE_WG)),
-            [=](sycl::nd_item<1> item) {
+            [=](sycl::nd_item<1> item)
+#if OMNI_H3_RMS_ROPE_FAST_REDUCE
+                [[sycl::reqd_sub_group_size(16)]]
+#endif
+            {
                 const int64_t local = item.get_local_id(0);
                 const int64_t global_row = item.get_group(0);
                 const bool is_key = global_row >= rows_per_operand;
@@ -226,12 +244,39 @@ void launch_minimax_h3_rms_rope(
                 }
                 item.barrier(sycl::access::fence_space::local_space);
 
-                for (int64_t width = RMS_ROPE_WG / 2; width > 0; width /= 2) {
+#if OMNI_H3_RMS_ROPE_FAST_REDUCE
+                if (local < 32) {
+                    partial[local] += partial[local + 32];
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                if (local < 16) {
+                    float reduced = partial[local] + partial[local + 16];
+                    const auto subgroup = item.get_sub_group();
+                    const uint32_t lane = subgroup.get_local_linear_id();
+#pragma unroll
+                    for (uint32_t width = 8; width > 0; width /= 2) {
+                        const uint32_t remote =
+                            lane < width ? lane + width : lane;
+                        const float partner = sycl::select_from_group(
+                            subgroup, reduced, remote);
+                        if (lane < width) {
+                            reduced += partner;
+                        }
+                    }
+                    if (lane == 0) {
+                        partial[0] = reduced;
+                    }
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+#else
+                for (int64_t width = RMS_ROPE_WG / 2; width > 0;
+                     width /= 2) {
                     if (local < width) {
                         partial[local] += partial[local + width];
                     }
                     item.barrier(sycl::access::fence_space::local_space);
                 }
+#endif
                 const float inverse_rms =
                     sycl::rsqrt(partial[0] / H3_HEAD_DIM + epsilon);
 
@@ -242,7 +287,7 @@ void launch_minimax_h3_rms_rope(
                         value0 * inverse_rms *
                         static_cast<float>(scale[col0]));
                     const bf16 normalized1 = static_cast<bf16>(
-                        pair_second[local] * inverse_rms *
+                        static_cast<float>(pair_second[local]) * inverse_rms *
                         static_cast<float>(scale[col1]));
                     const float rotated0 = static_cast<float>(normalized0);
                     const float rotated1 = static_cast<float>(normalized1);

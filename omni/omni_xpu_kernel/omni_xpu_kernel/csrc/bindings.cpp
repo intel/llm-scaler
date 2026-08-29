@@ -14,6 +14,7 @@
 
 #include "bmg_kernel_policy.h"
 #include "device_utils.h"
+#include "kernel_tuning_overrides.h"
 #include "utils.h"
 
 namespace omni_xpu {
@@ -208,6 +209,37 @@ py::dict bmg_kernel_policy_dict() {
     return policy;
 }
 
+py::dict kernel_tuning_overrides_dict() {
+    py::dict overrides;
+#define OMNI_EXPORT_TUNING_OVERRIDE(NAME) overrides[#NAME] = NAME
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_FP8_DEQUANT_ELEMENTS_PER_WI);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_FP8_QUANT_VEC);
+    OMNI_EXPORT_TUNING_OVERRIDE(
+        OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_CONVROT_DEQUANT_WG_SIZE);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_CONVROT_QUANT_WG_SIZE);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_INT8_DEQUANT_ELEMENTS_PER_WI);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_SILU_MUL_ELEMENTS_PER_WI);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_INT8_TENSORWISE_VEC);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_KITCHEN_ROPE_PAIR_WG_SIZE);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_SVDQ_DEQUANT_GROUPS_PER_WI);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_SVDQ_QUANT_GROUPS_PER_WI);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_SVDQ_UNPACK_COLS_PER_WI);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_SVDQ_UNPACK_BYTES_PER_ITERATION);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_SVDQ_UNPACK_WG_SIZE);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_RMS_NORM_H120_MODE);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_RMS_NORM_H128_BLOCK_SIZE);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_GROUP_NORM_BMG_TILE);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_GROUP_NORM_BMG_REDUCE_VECTOR);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_H3_RMS_ROPE_FAST_REDUCE);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_H3_RMS_ROPE_SLM_BF16);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_ROWQ_VECTOR_WIDTH_OVERRIDE);
+    OMNI_EXPORT_TUNING_OVERRIDE(OMNI_ROWQ_SUBGROUPS_PER_ROW_OVERRIDE);
+#undef OMNI_EXPORT_TUNING_OVERRIDE
+    return overrides;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_C, m) {
@@ -224,8 +256,9 @@ PYBIND11_MODULE(_C, m) {
     m.attr("__core_aot_target__") = "";
 #endif
 
-    // Exact runtime device identity.  B60/B70 share one BMG AOT image; host
-    // dispatch selects the kernel profile from the input device's queue.
+    // Exact runtime device identity. One BMG AOT image contains all profiles;
+    // host dispatch selects from the input device's queue without guessing from
+    // memory size, EU count, or the marketing name.
     auto device = m.def_submodule(
         "device", "Exact Intel BMG identity and kernel-profile selection");
     device.def(
@@ -241,7 +274,25 @@ PYBIND11_MODULE(_C, m) {
             auto& queue = omni_xpu::utils::get_queue(
                 torch::Device(torch::kXPU, index));
             return std::string(omni_xpu::device::bmg_sku_name(
-                omni_xpu::device::get_bmg_sku(queue)));
+                omni_xpu::device::get_bmg_selection(queue).effective_sku));
+        },
+        py::arg("index") = 0);
+    device.def(
+        "physical_bmg_sku",
+        [](int64_t index) {
+            auto& queue = omni_xpu::utils::get_queue(
+                torch::Device(torch::kXPU, index));
+            return std::string(omni_xpu::device::bmg_sku_name(
+                omni_xpu::device::get_bmg_selection(queue).physical_sku));
+        },
+        py::arg("index") = 0);
+    device.def(
+        "kernel_profile",
+        [](int64_t index) {
+            auto& queue = omni_xpu::utils::get_queue(
+                torch::Device(torch::kXPU, index));
+            return std::string(omni_xpu::device::bmg_kernel_profile_name(
+                omni_xpu::device::get_bmg_selection(queue).kernel_profile));
         },
         py::arg("index") = 0);
     device.def(
@@ -252,28 +303,40 @@ PYBIND11_MODULE(_C, m) {
             const auto sycl_device = queue.get_device();
             const uint32_t device_id =
                 omni_xpu::device::get_device_id(sycl_device);
-            const auto sku =
-                omni_xpu::device::classify_bmg_device_id(device_id);
+            const auto selection =
+                omni_xpu::device::get_bmg_selection(sycl_device);
             py::dict result;
             result["index"] = index;
             result["name"] =
                 sycl_device.get_info<sycl::info::device::name>();
             result["device_id"] = device_id;
+            result["physical_bmg_sku"] = std::string(
+                omni_xpu::device::bmg_sku_name(selection.physical_sku));
             result["bmg_sku"] = std::string(
-                omni_xpu::device::bmg_sku_name(sku));
-            if (sku == omni_xpu::device::BmgSku::b60) {
-                result["kernel_profile"] = "b60";
+                omni_xpu::device::bmg_sku_name(selection.effective_sku));
+            result["sku_forced"] = selection.forced;
+            result["kernel_profile"] = std::string(
+                omni_xpu::device::bmg_kernel_profile_name(
+                    selection.kernel_profile));
+            result["performance_claim_allowed"] =
+                !selection.forced &&
+                selection.kernel_profile !=
+                    omni_xpu::device::BmgKernelProfile::generic_bmg;
+            result["tuning_overrides"] = kernel_tuning_overrides_dict();
+            if (selection.kernel_profile ==
+                    omni_xpu::device::BmgKernelProfile::b60) {
                 result["kernel_policy"] =
                     bmg_kernel_policy_dict<
                         omni_xpu::device::B60KernelPolicy>();
-            } else {
-                result["kernel_profile"] =
-                    sku == omni_xpu::device::BmgSku::b70
-                    ? "b70"
-                    : "generic-bmg";
+            } else if (selection.kernel_profile ==
+                    omni_xpu::device::BmgKernelProfile::b70) {
                 result["kernel_policy"] =
                     bmg_kernel_policy_dict<
                         omni_xpu::device::B70KernelPolicy>();
+            } else {
+                result["kernel_policy"] =
+                    bmg_kernel_policy_dict<
+                        omni_xpu::device::GenericBmgKernelPolicy>();
             }
             return result;
         },

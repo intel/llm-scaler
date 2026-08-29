@@ -76,18 +76,43 @@ assert omni.core_aot_target() == omni.__xpu_target__
 ## Build targets
 
 `OMNI_XPU_DEVICE` selects the AOT ISA and architecture-level policy. Unknown
-values are rejected before compilation. One BMG wheel contains both B60 and
-B70 kernel profiles and selects between them from the exact runtime PCI Device
-ID:
+values are rejected before compilation. One BMG wheel contains the B60, B70,
+and generic-BMG profiles and selects from the exact runtime PCI Device ID:
 
 | PCI Device ID | Runtime BMG profile |
 |---|---|
 | `0xE210`, `0xE211` | `b60` |
+| `0xE20B` (B580), `0xE212` (B50) | `generic-bmg` (identity known; SKU policy unvalidated) |
 | `0xE223` | `b70` |
 | other BMG ID | `generic-bmg` (the shipped B70-compatible defaults) |
 
 Use `omni_xpu_kernel.device.info(index)` to inspect the detected ID, selected
-profile, and concrete policy values.
+physical/effective SKU, profile, debug-override state, performance-claim
+eligibility, concrete policy values, and the exact compiled values of all 23
+build-time controls in `tuning_overrides`. Generic fallback emits a native
+one-shot warning with the Device ID and unvalidated profile.
+
+For development sweeps, pass a comma-separated, integer-only whitelist through
+`OMNI_XPU_TUNING_DEFINES`, for example
+`OMNI_RMS_NORM_H120_MODE=1,OMNI_RMS_NORM_H128_BLOCK_SIZE=64`. Unknown or
+duplicate controls fail the build. The unset defaults reproduce the maintained
+target routes; a non-default build is a candidate and requires its own exact
+correctness and performance validation.
+
+`OMNI_XPU_FORCE_SKU=b580|b50|b60|b70|generic` overrides only the effective
+SKU/profile for dispatch testing. It never changes `device_id` or
+`physical_bmg_sku`, emits a warning, and forces
+`performance_claim_allowed=false`. This is suitable for classifier, AOT, and
+parameter-portability prescreens; it cannot validate another SKU's performance:
+
+```bash
+OMNI_XPU_FORCE_SKU=b60 python -c \
+  'import omni_xpu_kernel as omni; print(omni.device.info(0))'
+```
+
+Invalid override values fail closed. Do not set the variable in a publication,
+wheel, image-milestone, or formal benchmark environment.
+`generic-bmg` is accepted as a compatibility spelling of `generic`.
 
 | GPU architecture | `sycl-ls --verbose` architecture | `OMNI_XPU_DEVICE` |
 |---|---|---|
@@ -485,8 +510,8 @@ The Linux build produces three extension components:
 
 `setup.py` derives one architecture macro from `OMNI_XPU_DEVICE` so wheel
 metadata, core AOT ISA, and sidecars identify the same target. BMG core and
-CUTE components query the exact runtime Device ID and share the B60/B70 policy
-table.
+CUTE components query the exact runtime Device ID and share the
+B60/B70/generic profile selection contract.
 
 ## License
 

@@ -53,6 +53,66 @@ XPU_ARCH_MACROS = {
     "ptl-h": "OMNI_XPU_ARCH_PTL_H",
 }
 XPU_ARCH_MACRO = XPU_ARCH_MACROS[BUILD_XPU_TARGET]
+KERNEL_TUNING_DEFINE_NAMES = (
+    "OMNI_FP8_DEQUANT_ELEMENTS_PER_WI",
+    "OMNI_FP8_QUANT_VEC",
+    "OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM",
+    "OMNI_CONVROT_DEQUANT_WG_SIZE",
+    "OMNI_CONVROT_QUANT_WG_SIZE",
+    "OMNI_INT8_DEQUANT_ELEMENTS_PER_WI",
+    "OMNI_SILU_MUL_ELEMENTS_PER_WI",
+    "OMNI_INT8_TENSORWISE_VEC",
+    "OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE",
+    "OMNI_KITCHEN_ROPE_PAIR_WG_SIZE",
+    "OMNI_SVDQ_DEQUANT_GROUPS_PER_WI",
+    "OMNI_SVDQ_QUANT_GROUPS_PER_WI",
+    "OMNI_SVDQ_UNPACK_COLS_PER_WI",
+    "OMNI_SVDQ_UNPACK_BYTES_PER_ITERATION",
+    "OMNI_SVDQ_UNPACK_WG_SIZE",
+    "OMNI_RMS_NORM_H120_MODE",
+    "OMNI_RMS_NORM_H128_BLOCK_SIZE",
+    "OMNI_GROUP_NORM_BMG_TILE",
+    "OMNI_GROUP_NORM_BMG_REDUCE_VECTOR",
+    "OMNI_H3_RMS_ROPE_FAST_REDUCE",
+    "OMNI_H3_RMS_ROPE_SLM_BF16",
+    "OMNI_ROWQ_VECTOR_WIDTH_OVERRIDE",
+    "OMNI_ROWQ_SUBGROUPS_PER_ROW_OVERRIDE",
+)
+
+
+def get_kernel_tuning_compile_args(*, windows=None):
+    """Parse the intentionally narrow build-time kernel tuning surface."""
+    if windows is None:
+        windows = IS_WINDOWS
+    raw = os.environ.get("OMNI_XPU_TUNING_DEFINES", "").strip()
+    if not raw:
+        return []
+
+    allowed = set(KERNEL_TUNING_DEFINE_NAMES)
+    parsed = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        match = re.fullmatch(r"(OMNI_[A-Z0-9_]+)=(-?[0-9]+)", entry)
+        if match is None:
+            raise RuntimeError(
+                "OMNI_XPU_TUNING_DEFINES entries must use NAME=integer: "
+                f"{entry!r}"
+            )
+        name, value = match.groups()
+        if name not in allowed:
+            raise RuntimeError(
+                f"Unsupported kernel tuning define {name!r}"
+            )
+        if name in parsed:
+            raise RuntimeError(f"Duplicate kernel tuning define {name!r}")
+        parsed[name] = value
+
+    prefix = "/D" if windows else "-D"
+    return [
+        f"{prefix}{name}={parsed[name]}"
+        for name in KERNEL_TUNING_DEFINE_NAMES
+        if name in parsed
+    ]
 
 BMG_CUTE_REMAINDER_MASK_ORIGINAL = """\
           FragSRow k_rem_mask;
@@ -635,6 +695,7 @@ class ICPXBuildExt(build_ext):
                     "/EHsc",  # Enable C++ exception handling
                     "/std:c++17",
                 ]
+                cmd += get_kernel_tuning_compile_args(windows=True)
                 # PyTorch XPU wheels also bundle oneDNN headers. Keep the
                 # headers selected with the external oneDNN library first so
                 # declarations and exported symbols use the same ABI.
@@ -737,6 +798,7 @@ class ICPXBuildExt(build_ext):
                     "-fPIC", "-shared",
                     "-std=c++17",
                 ]
+                cmd += get_kernel_tuning_compile_args(windows=False)
                 # torch/include contains another oneDNN header tree. Put the
                 # explicitly selected installation first so it matches -ldnnl.
                 if has_onednn:
@@ -823,6 +885,8 @@ class ICPXExtension(Extension):
             depends = sorted(kernel_root.glob("*.h")) + sorted(
                 kernel_root.glob("*.hpp")
             ) + [
+                csrc_root / "bmg_device_policy.h",
+                csrc_root / "bmg_device_warning.h",
                 csrc_root / "bmg_kernel_policy.h",
                 csrc_root / "device_utils.h",
             ]

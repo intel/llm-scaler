@@ -9,6 +9,7 @@
 #include "bmg_kernel_policy.h"
 #include "device_utils.h"
 #endif
+#include "kernel_tuning_overrides.h"
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -18,26 +19,6 @@ namespace omni_xpu {
 namespace rotary {
 
 namespace {
-
-#ifndef OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE
-#if defined(OMNI_XPU_ARCH_PTL_H)
-#define OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE 1
-#elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE 1
-#else
-#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
-#endif
-#endif
-
-#ifndef OMNI_KITCHEN_ROPE_PAIR_WG_SIZE
-#if defined(OMNI_XPU_ARCH_PTL_H)
-#define OMNI_KITCHEN_ROPE_PAIR_WG_SIZE 128
-#elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_KITCHEN_ROPE_PAIR_WG_SIZE 32
-#else
-#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
-#endif
-#endif
 
 bool broadcastable_dim(int64_t source, int64_t target, bool allow_longer) {
     return source == 1 || source == target || (allow_longer && source >= target);

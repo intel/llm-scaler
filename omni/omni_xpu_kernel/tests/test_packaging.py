@@ -9,6 +9,7 @@ from typing import Optional
 
 import pytest
 from packaging.version import Version
+import setuptools
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -269,6 +270,11 @@ def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
     assert "group_norm_seedvr_bmg.cpp" in main_sources
     assert "cat_pad_bmg.cpp" in main_sources
     assert "svdq_dequant.cpp" in main_sources
+    main_dependencies = {
+        Path(dependency).name
+        for dependency in extensions["omni_xpu_kernel._C"].depends
+    }
+    assert "kernel_tuning_overrides.h" in main_dependencies
     assert setup_namespace["BUILD_XPU_TARGET"] == XPU_TARGET
     assert setup_namespace["XPU_ARCH_MACRO"] == (
         "OMNI_XPU_ARCH_PTL_H" if XPU_TARGET == "ptl-h" else "OMNI_XPU_ARCH_BMG"
@@ -296,6 +302,8 @@ def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
             "sol_attn_torch.cpp",
         }
         assert "cute_fmha_config.h" in cute_dependencies
+        assert "bmg_device_policy.h" in cute_dependencies
+        assert "bmg_device_warning.h" in cute_dependencies
         assert "sol_attn_config.h" in cute_dependencies
         assert "sol_attn_mainloop.hpp" in cute_dependencies
     assert all(
@@ -319,6 +327,52 @@ def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
             ".libs/*.dll",
             ".libs/onednn/*",
         ]
+
+
+def test_kernel_tuning_build_defines_are_whitelisted(monkeypatch):
+    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
+    monkeypatch.setenv(
+        "OMNI_XPU_TUNING_DEFINES",
+        "OMNI_RMS_NORM_H128_BLOCK_SIZE=16,OMNI_RMS_NORM_H120_MODE=1",
+    )
+    monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
+    namespace = run_path(
+        str(PROJECT_ROOT / "setup.py"),
+        run_name="__setup_tuning_defines_test__",
+    )
+
+    assert namespace["get_kernel_tuning_compile_args"](windows=False) == [
+        "-DOMNI_RMS_NORM_H120_MODE=1",
+        "-DOMNI_RMS_NORM_H128_BLOCK_SIZE=16",
+    ]
+    assert namespace["get_kernel_tuning_compile_args"](windows=True) == [
+        "/DOMNI_RMS_NORM_H120_MODE=1",
+        "/DOMNI_RMS_NORM_H128_BLOCK_SIZE=16",
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "OMNI_NOT_A_CONTROL=1",
+        "OMNI_RMS_NORM_H120_MODE=1,OMNI_RMS_NORM_H120_MODE=2",
+        "OMNI_RMS_NORM_H120_MODE=true",
+        "-DOMNI_RMS_NORM_H120_MODE=1",
+    ],
+)
+def test_invalid_kernel_tuning_build_defines_fail_closed(
+    monkeypatch, value
+):
+    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
+    monkeypatch.setenv("OMNI_XPU_TUNING_DEFINES", value)
+    monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
+    namespace = run_path(
+        str(PROJECT_ROOT / "setup.py"),
+        run_name="__setup_invalid_tuning_defines_test__",
+    )
+
+    with pytest.raises(RuntimeError):
+        namespace["get_kernel_tuning_compile_args"]()
 
 
 def test_windows_onednn_runtime_bundle_contains_notices_and_hash(
@@ -430,6 +484,10 @@ def test_linux_core_compile_command_is_aot_for_every_supported_target(
     monkeypatch.chdir(PROJECT_ROOT)
     monkeypatch.delenv("CUTLASS_SYCL_ROOT", raising=False)
     monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
+    monkeypatch.setenv(
+        "OMNI_XPU_TUNING_DEFINES",
+        "OMNI_RMS_NORM_H120_MODE=1,OMNI_RMS_NORM_H128_BLOCK_SIZE=16",
+    )
     monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
     namespace = run_path(
         str(PROJECT_ROOT / "setup.py"), run_name="__core_aot_command_test__"
@@ -472,6 +530,8 @@ def test_linux_core_compile_command_is_aot_for_every_supported_target(
     assert compile_command[backend_index + 1] == f"-device {target}"
     assert "-DOMNI_XPU_CORE_AOT=1" in compile_command
     assert f"-D{target_macro}=1" in compile_command
+    assert "-DOMNI_RMS_NORM_H120_MODE=1" in compile_command
+    assert "-DOMNI_RMS_NORM_H128_BLOCK_SIZE=16" in compile_command
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="ELF $ORIGIN is Linux-only")

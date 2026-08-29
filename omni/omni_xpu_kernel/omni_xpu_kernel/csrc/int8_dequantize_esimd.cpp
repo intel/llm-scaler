@@ -4,6 +4,7 @@
 
 #include "bmg_kernel_policy.h"
 #include "device_utils.h"
+#include "kernel_tuning_overrides.h"
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -13,16 +14,6 @@ using namespace sycl::ext::intel::esimd;
 namespace omni_xpu {
 namespace int8_ops {
 namespace {
-
-#ifndef OMNI_INT8_DEQUANT_ELEMENTS_PER_WI
-#if defined(OMNI_XPU_ARCH_PTL_H)
-#define OMNI_INT8_DEQUANT_ELEMENTS_PER_WI 64
-#elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_INT8_DEQUANT_ELEMENTS_PER_WI 32
-#else
-#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
-#endif
-#endif
 
 template<typename OutputT, int ElementsPerWorkItem, int WorkGroupSize>
 void dequantize_esimd_kernel(

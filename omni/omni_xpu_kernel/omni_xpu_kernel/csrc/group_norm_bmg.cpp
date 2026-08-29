@@ -8,6 +8,7 @@
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/sycl.hpp>
 
+#include "kernel_tuning_overrides.h"
 #include "utils.h"
 
 #if defined(OMNI_XPU_ARCH_BMG)
@@ -20,8 +21,16 @@ namespace norm {
 namespace {
 
 constexpr int64_t kGroups = 32;
-constexpr int64_t kTile = 32768;
-constexpr int kReduceVector = 32;
+constexpr int64_t kTile = OMNI_GROUP_NORM_BMG_TILE;
+constexpr int kReduceVector = OMNI_GROUP_NORM_BMG_REDUCE_VECTOR;
+static_assert(
+    kTile == 1024 || kTile == 2048 || kTile == 4096 || kTile == 8192 ||
+        kTile == 16384 || kTile == 32768 || kTile == 65536,
+    "unsupported OMNI_GROUP_NORM_BMG_TILE");
+static_assert(
+    kReduceVector == 16 || kReduceVector == 32 || kReduceVector == 64,
+    "unsupported OMNI_GROUP_NORM_BMG_REDUCE_VECTOR");
+static_assert(kTile % kReduceVector == 0);
 
 class GroupNormPartialMomentsBMGKernel;
 class GroupNormFinalizeMomentsBMGKernel;

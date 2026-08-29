@@ -104,13 +104,22 @@ torch::Tensor fused_adaln(
                 "modulation rows and row_repeat do not cover input rows");
     auto output = torch::empty_like(input);
     auto& queue = utils::get_queue(input.device());
+    const auto kernel_profile =
+        device::get_bmg_selection(queue).kernel_profile;
     const bool use_b60 =
-        device::use_b60_kernel_profile(queue) &&
+        kernel_profile == device::BmgKernelProfile::b60 &&
         rows == 4096 && hidden == 3072;
+    const bool use_generic =
+        kernel_profile == device::BmgKernelProfile::generic_bmg;
 #define DISPATCH_ADALN(T, input_ptr, scale_ptr, shift_ptr, output_ptr)     \
     do {                                                                  \
         if (use_b60) {                                                     \
             fused_adaln_kernel<T, false, device::B60KernelPolicy>(         \
+                input_ptr, scale_ptr, shift_ptr, output_ptr, rows, hidden, \
+                modulation_rows, row_repeat, static_cast<float>(eps),      \
+                input.device());                                           \
+        } else if (use_generic) {                                          \
+            fused_adaln_kernel<T, false, device::GenericBmgKernelPolicy>(  \
                 input_ptr, scale_ptr, shift_ptr, output_ptr, rows, hidden, \
                 modulation_rows, row_repeat, static_cast<float>(eps),      \
                 input.device());                                           \

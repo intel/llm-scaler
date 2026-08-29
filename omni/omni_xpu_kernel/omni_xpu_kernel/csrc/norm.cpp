@@ -8,6 +8,7 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 
+#include "kernel_tuning_overrides.h"
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -28,11 +29,16 @@ namespace norm {
 // platform-specific traces and AOT images remain unambiguous.
 struct RmsNormH120FP16Config {
     static constexpr int HiddenSize = 120;
+    static constexpr int NarrowBlockSize = 8;
+    static constexpr int NarrowBlocks = HiddenSize / NarrowBlockSize;
     static constexpr int WideBlockSize = 16;
     static constexpr int WideBlocks = 7;
     static constexpr int TailBlockSize = 8;
     static constexpr int TailOffset = WideBlockSize * WideBlocks;
 };
+static_assert(
+    OMNI_RMS_NORM_H120_MODE >= 0 && OMNI_RMS_NORM_H120_MODE <= 2,
+    "OMNI_RMS_NORM_H120_MODE must be 0, 1, or 2");
 
 #if defined(OMNI_XPU_ARCH_PTL_H)
 class RmsNormH120FP16PTLKernel;
@@ -67,6 +73,7 @@ void rms_norm_h120_fp16_kernel(
                 fp16* output_row =
                     output + static_cast<size_t>(row) * Config::HiddenSize;
                 simd<fp16, Config::HiddenSize> cached;
+#if OMNI_RMS_NORM_H120_MODE == 2
                 simd<float, Config::WideBlockSize> accumulator = 0;
 
 #pragma unroll
@@ -91,9 +98,44 @@ void rms_norm_h120_fp16_kernel(
                     sycl::ext::intel::esimd::detail::sum<
                         float, float, Config::TailBlockSize>(
                         tail_f32 * tail_f32);
+#elif OMNI_RMS_NORM_H120_MODE == 1
+                simd<float, Config::NarrowBlocks> partials;
+#pragma unroll
+                for (int block = 0; block < Config::NarrowBlocks; ++block) {
+                    simd<fp16, Config::NarrowBlockSize> values =
+                        block_load<fp16, Config::NarrowBlockSize>(
+                            input_row + block * Config::NarrowBlockSize);
+                    cached.template select<Config::NarrowBlockSize, 1>(
+                        block * Config::NarrowBlockSize) = values;
+                    simd<float, Config::NarrowBlockSize> values_f32 = values;
+                    partials[block] =
+                        sycl::ext::intel::esimd::detail::sum<
+                            float, float, Config::NarrowBlockSize>(
+                            values_f32 * values_f32);
+                }
+                const float sum_squares =
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::NarrowBlocks>(partials);
+#else
+                simd<float, Config::NarrowBlockSize> accumulator = 0;
+#pragma unroll
+                for (int block = 0; block < Config::NarrowBlocks; ++block) {
+                    simd<fp16, Config::NarrowBlockSize> values =
+                        block_load<fp16, Config::NarrowBlockSize>(
+                            input_row + block * Config::NarrowBlockSize);
+                    cached.template select<Config::NarrowBlockSize, 1>(
+                        block * Config::NarrowBlockSize) = values;
+                    simd<float, Config::NarrowBlockSize> values_f32 = values;
+                    accumulator += values_f32 * values_f32;
+                }
+                const float sum_squares =
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::NarrowBlockSize>(accumulator);
+#endif
                 const float scale = rsqrt(
                     sum_squares / Config::HiddenSize + eps);
 
+#if OMNI_RMS_NORM_H120_MODE == 2
 #pragma unroll
                 for (int block = 0; block < Config::WideBlocks; ++block) {
                     simd<float, Config::WideBlockSize> values =
@@ -117,6 +159,21 @@ void rms_norm_h120_fp16_kernel(
                     output_row + Config::TailOffset,
                     simd<fp16, Config::TailBlockSize>(
                         tail_values * scale * tail_weights));
+#else
+#pragma unroll
+                for (int block = 0; block < Config::NarrowBlocks; ++block) {
+                    simd<float, Config::NarrowBlockSize> values =
+                        cached.template select<Config::NarrowBlockSize, 1>(
+                            block * Config::NarrowBlockSize);
+                    simd<float, Config::NarrowBlockSize> weights =
+                        block_load<fp16, Config::NarrowBlockSize>(
+                            weight + block * Config::NarrowBlockSize);
+                    block_store<fp16, Config::NarrowBlockSize>(
+                        output_row + block * Config::NarrowBlockSize,
+                        simd<fp16, Config::NarrowBlockSize>(
+                            values * scale * weights));
+                }
+#endif
             });
     };
 #if defined(OMNI_XPU_ARCH_PTL_H)
@@ -137,7 +194,8 @@ void rms_norm_h120_fp16_kernel(
 // model-defined accumulation semantics.
 struct RmsNormH128PTLConfig {
     static constexpr int HiddenSize = 128;
-    static constexpr int BlockSize = 32;
+    static constexpr int BlockSize = OMNI_RMS_NORM_H128_BLOCK_SIZE;
+    static_assert(HiddenSize % BlockSize == 0);
     static constexpr int Blocks = HiddenSize / BlockSize;
     static constexpr int MinimumRows = 1024;
     static constexpr int PartialBytes =
@@ -409,7 +467,8 @@ void rms_norm_gate_residual_h3840_ptl_kernel(
 struct RmsNormH128BMGConfig {
     static constexpr int HiddenSize = 128;
     static constexpr int MinimumRows = 4096;
-    static constexpr int BlockSize = 64;
+    static constexpr int BlockSize = OMNI_RMS_NORM_H128_BLOCK_SIZE;
+    static_assert(HiddenSize % BlockSize == 0);
     static constexpr int Blocks = HiddenSize / BlockSize;
     static constexpr int PartialBytes =
         ((Blocks * static_cast<int>(sizeof(float)) + 15) / 16) * 16;

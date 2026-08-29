@@ -2,6 +2,7 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 
+#include "kernel_tuning_overrides.h"
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -11,16 +12,6 @@ using namespace sycl::ext::intel::esimd;
 namespace omni_xpu {
 namespace fp8 {
 namespace {
-
-#ifndef OMNI_FP8_DEQUANT_ELEMENTS_PER_WI
-#if defined(OMNI_XPU_ARCH_PTL_H)
-#define OMNI_FP8_DEQUANT_ELEMENTS_PER_WI 256
-#elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_FP8_DEQUANT_ELEMENTS_PER_WI 256
-#else
-#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
-#endif
-#endif
 
 template<int MantissaBits, int Bias, bool FiniteOnly>
 float decode_fp8(uint8_t code) {

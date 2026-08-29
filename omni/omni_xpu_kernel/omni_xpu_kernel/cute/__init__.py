@@ -31,6 +31,7 @@ import os
 import torch
 
 _loaded = False
+_prepared_bmg_policy_dispatches = set()
 
 
 def _find_so():
@@ -63,6 +64,19 @@ def _ensure_loaded():
         )
     torch.ops.load_library(so)
     _loaded = True
+
+
+def _prepare_bmg_policy_dispatch(tensor: torch.Tensor) -> None:
+    """Let the core extension own the process-wide BMG policy warning."""
+
+    from .. import __xpu_target__, device
+
+    if __xpu_target__ == "bmg":
+        index = 0 if tensor.device.index is None else tensor.device.index
+        key = (index, os.environ.get("OMNI_XPU_FORCE_SKU"))
+        if key not in _prepared_bmg_policy_dispatches:
+            device.info(index)
+            _prepared_bmg_policy_dispatches.add(key)
 
 
 def is_available():
@@ -166,6 +180,7 @@ def sdp_bhld_d120(
     _ensure_loaded()
     if not hasattr(torch.ops.cute_fmha, "sdp_bhld_d120"):
         raise RuntimeError("CUTE D120 BHLD kernel is unavailable in this sidecar")
+    _prepare_bmg_policy_dispatch(q)
     return torch.ops.cute_fmha.sdp_bhld_d120(q, k, v)
 
 
