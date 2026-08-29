@@ -687,7 +687,26 @@ torch::Tensor apply_kitchen_rope1_fast(
     auto unused = torch::Tensor();
 #if defined(OMNI_XPU_ARCH_BMG)
     auto& queue = utils::get_queue(x.device());
-    if (device::use_b60_kernel_profile(queue) &&
+    const auto selection = device::get_bmg_selection(queue);
+    if (selection.b580_policy_candidate ==
+            device::B580PolicyCandidate::kitchen_rope &&
+        b60_exact_row_supported(x, freqs, 4352)) {
+        launch_b60_exact_row<
+            4352,
+            false,
+            device::B580KitchenRopeCandidatePolicy::
+                kitchen_rope_pairs_per_work_item,
+            device::B580KitchenRopeCandidatePolicy::
+                kitchen_rope_work_group_size>(
+                x,
+                unused,
+                freqs,
+                output,
+                unused,
+                split_half);
+        return output;
+    }
+    if (selection.kernel_profile == device::BmgKernelProfile::b60 &&
         b60_exact_row_supported(x, freqs, 4352)) {
         launch_b60_exact_row<
             4352,
@@ -729,7 +748,27 @@ std::tuple<torch::Tensor, torch::Tensor> apply_kitchen_rope_fast(
     auto out_k = torch::empty_like(xk);
 #if defined(OMNI_XPU_ARCH_BMG)
     auto& queue = utils::get_queue(xq.device());
-    if (device::use_b60_kernel_profile(queue) &&
+    const auto selection = device::get_bmg_selection(queue);
+    if (selection.b580_policy_candidate ==
+            device::B580PolicyCandidate::kitchen_rope &&
+        b60_exact_row_supported(xq, freqs, 4096) &&
+        b60_exact_row_supported(xk, freqs, 4096)) {
+        launch_b60_exact_row<
+            4096,
+            true,
+            device::B580KitchenRopeCandidatePolicy::
+                kitchen_rope_pairs_per_work_item,
+            device::B580KitchenRopeCandidatePolicy::
+                kitchen_rope_work_group_size>(
+                xq,
+                xk,
+                freqs,
+                out_q,
+                out_k,
+                split_half);
+        return {out_q, out_k};
+    }
+    if (selection.kernel_profile == device::BmgKernelProfile::b60 &&
         b60_exact_row_supported(xq, freqs, 4096) &&
         b60_exact_row_supported(xk, freqs, 4096)) {
         launch_b60_exact_row<

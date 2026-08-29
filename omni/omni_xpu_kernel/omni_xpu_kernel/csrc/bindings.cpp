@@ -209,6 +209,75 @@ py::dict bmg_kernel_policy_dict() {
     return policy;
 }
 
+py::dict b580_candidate_kernel_policy_dict(
+        omni_xpu::device::B580PolicyCandidate candidate) {
+    py::dict policy = bmg_kernel_policy_dict<
+        omni_xpu::device::GenericBmgKernelPolicy>();
+    using Candidate = omni_xpu::device::B580PolicyCandidate;
+    using B60 = omni_xpu::device::B60KernelPolicy;
+    switch (candidate) {
+        case Candidate::adaln:
+            policy["adaln"] = py::make_tuple(
+                B60::adaln_block_size, B60::adaln_work_group_size);
+            break;
+        case Candidate::int8_dequant_fp32:
+            policy["int8_dequant_fp32"] = py::make_tuple(
+                B60::int8_dequant_fp32_elements,
+                B60::int8_dequant_fp32_work_group_size);
+            break;
+        case Candidate::int8_dequant_bf16:
+            policy["int8_dequant_bf16"] = py::make_tuple(
+                B60::int8_dequant_bf16_elements,
+                B60::int8_dequant_bf16_work_group_size);
+            break;
+        case Candidate::int8_scaleback:
+            policy["int8_scaleback"] = py::make_tuple(
+                B60::int8_scaleback_elements,
+                B60::int8_scaleback_work_group_rows,
+                B60::int8_scaleback_work_group_cols);
+            break;
+        case Candidate::convrot_g16:
+            policy["convrot_g16"] = py::make_tuple(
+                B60::convrot_g16_groups_per_dpas,
+                B60::convrot_g16_work_items_per_row);
+            break;
+        case Candidate::fp8_stochastic:
+            policy["fp8_stochastic_elements"] =
+                B60::fp8_stochastic_elements;
+            break;
+        case Candidate::svdq_dequant:
+            policy["svdq_dequant"] = py::make_tuple(
+                B60::svdq_dequant_groups,
+                B60::svdq_dequant_work_group_size);
+            break;
+        case Candidate::svdq_quant:
+            policy["svdq_quant"] = py::make_tuple(
+                B60::svdq_quant_groups,
+                B60::svdq_quant_work_group_size);
+            break;
+        case Candidate::svdq_smooth:
+            policy["svdq_smooth"] = py::make_tuple(
+                B60::svdq_smooth_elements,
+                B60::svdq_smooth_work_group_size);
+            break;
+        case Candidate::svdq_convert_add:
+            policy["svdq_convert_add_elements"] =
+                B60::svdq_convert_add_elements;
+            break;
+        case Candidate::kitchen_rope:
+            policy["kitchen_rope"] = py::make_tuple(
+                B60::kitchen_rope_pairs_per_work_item,
+                B60::kitchen_rope_work_group_size);
+            break;
+        case Candidate::d120_l4205_v_tile:
+            policy["d120_l4205_v_tile"] = B60::d120_l4205_v_tile;
+            break;
+        default:
+            break;
+    }
+    return policy;
+}
+
 py::dict kernel_tuning_overrides_dict() {
     py::dict overrides;
 #define OMNI_EXPORT_TUNING_OVERRIDE(NAME) overrides[#NAME] = NAME
@@ -296,6 +365,17 @@ PYBIND11_MODULE(_C, m) {
         },
         py::arg("index") = 0);
     device.def(
+        "b580_policy_candidate",
+        [](int64_t index) {
+            auto& queue = omni_xpu::utils::get_queue(
+                torch::Device(torch::kXPU, index));
+            return std::string(
+                omni_xpu::device::b580_policy_candidate_name(
+                    omni_xpu::device::get_bmg_selection(queue)
+                        .b580_policy_candidate));
+        },
+        py::arg("index") = 0);
+    device.def(
         "info",
         [](int64_t index) {
             auto& queue = omni_xpu::utils::get_queue(
@@ -318,12 +398,22 @@ PYBIND11_MODULE(_C, m) {
             result["kernel_profile"] = std::string(
                 omni_xpu::device::bmg_kernel_profile_name(
                     selection.kernel_profile));
+            result["b580_policy_candidate"] = std::string(
+                omni_xpu::device::b580_policy_candidate_name(
+                    selection.b580_policy_candidate));
             result["performance_claim_allowed"] =
                 !selection.forced &&
+                selection.b580_policy_candidate ==
+                    omni_xpu::device::B580PolicyCandidate::none &&
                 selection.kernel_profile !=
                     omni_xpu::device::BmgKernelProfile::generic_bmg;
             result["tuning_overrides"] = kernel_tuning_overrides_dict();
-            if (selection.kernel_profile ==
+            if (selection.b580_policy_candidate !=
+                    omni_xpu::device::B580PolicyCandidate::none) {
+                result["kernel_policy"] =
+                    b580_candidate_kernel_policy_dict(
+                        selection.b580_policy_candidate);
+            } else if (selection.kernel_profile ==
                     omni_xpu::device::BmgKernelProfile::b60) {
                 result["kernel_policy"] =
                     bmg_kernel_policy_dict<

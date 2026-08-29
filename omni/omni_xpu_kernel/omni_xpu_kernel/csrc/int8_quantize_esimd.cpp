@@ -1451,8 +1451,16 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_g16_bmg(
 ) {
     TORCH_CHECK(input.device().is_xpu(), "input must be on XPU");
     auto& queue = utils::get_queue(input.device());
-    const auto kernel_profile =
-        device::get_bmg_selection(queue).kernel_profile;
+    const auto selection = device::get_bmg_selection(queue);
+    const auto kernel_profile = selection.kernel_profile;
+    if (selection.b580_policy_candidate ==
+            device::B580PolicyCandidate::convrot_g16) {
+        return quantize_int8_convrot_g16_bmg_policy<
+            device::B580ConvrotG16CandidatePolicy::
+                convrot_g16_groups_per_dpas,
+            device::B580ConvrotG16CandidatePolicy::
+                convrot_g16_work_items_per_row>(input);
+    }
     if (kernel_profile == device::BmgKernelProfile::b60) {
         return quantize_int8_convrot_g16_bmg_policy<
             device::B60KernelPolicy::convrot_g16_groups_per_dpas,

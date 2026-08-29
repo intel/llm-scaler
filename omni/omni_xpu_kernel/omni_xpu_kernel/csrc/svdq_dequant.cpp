@@ -559,9 +559,26 @@ void launch_svdq_dequant_signed(
         packed, scales, output, rows, columns, groups, target_device);
 #elif defined(OMNI_XPU_ARCH_BMG)
     auto& queue = utils::get_queue(target_device);
-    const auto kernel_profile =
-        device::get_bmg_selection(queue).kernel_profile;
-    if (kernel_profile == device::BmgKernelProfile::b60) {
+    const auto selection = device::get_bmg_selection(queue);
+    const auto kernel_profile = selection.kernel_profile;
+    if (selection.b580_policy_candidate ==
+            device::B580PolicyCandidate::svdq_dequant) {
+        // Keep B580's generic signed algorithm fixed so this A/B isolates the
+        // candidate policy values from B60's separate vector route.
+        dequantize_svdq_w4_kernel<
+            OT,
+            true,
+            device::B580SvdqDequantCandidatePolicy::svdq_dequant_groups,
+            device::B580SvdqDequantCandidatePolicy::
+                svdq_dequant_work_group_size>(
+                packed,
+                scales,
+                output,
+                rows,
+                columns,
+                groups,
+                target_device);
+    } else if (kernel_profile == device::BmgKernelProfile::b60) {
         dequantize_svdq_w4_signed_vector_kernel<
             OT,
             device::B60KernelPolicy::svdq_dequant_groups,
@@ -617,9 +634,24 @@ void launch_svdq_dequant_unsigned(
     const at::Device& target_device) {
 #if defined(OMNI_XPU_ARCH_BMG)
     auto& queue = utils::get_queue(target_device);
-    const auto kernel_profile =
-        device::get_bmg_selection(queue).kernel_profile;
-    if (kernel_profile == device::BmgKernelProfile::b60) {
+    const auto selection = device::get_bmg_selection(queue);
+    const auto kernel_profile = selection.kernel_profile;
+    if (selection.b580_policy_candidate ==
+            device::B580PolicyCandidate::svdq_dequant) {
+        dequantize_svdq_w4_kernel<
+            OT,
+            false,
+            device::B580SvdqDequantCandidatePolicy::svdq_dequant_groups,
+            device::B580SvdqDequantCandidatePolicy::
+                svdq_dequant_work_group_size>(
+                packed,
+                scales,
+                output,
+                rows,
+                columns,
+                groups,
+                target_device);
+    } else if (kernel_profile == device::BmgKernelProfile::b60) {
         dequantize_svdq_w4_kernel<
             OT,
             false,
@@ -676,9 +708,26 @@ void launch_svdq_quant(
     const at::Device& target_device) {
 #if defined(OMNI_XPU_ARCH_BMG)
     auto& queue = utils::get_queue(target_device);
-    const auto kernel_profile =
-        device::get_bmg_selection(queue).kernel_profile;
-    if (kernel_profile == device::BmgKernelProfile::b60) {
+    const auto selection = device::get_bmg_selection(queue);
+    const auto kernel_profile = selection.kernel_profile;
+    if (selection.b580_policy_candidate ==
+            device::B580PolicyCandidate::svdq_quant) {
+        // Preserve the generic B580 algorithm flag and vary only the policy
+        // work-group axis.
+        quantize_svdq_act_int4_kernel<
+            IT,
+            Unsigned,
+            device::B580SvdqQuantCandidatePolicy::svdq_quant_groups,
+            device::B580SvdqQuantCandidatePolicy::svdq_quant_work_group_size,
+            false>(
+                input,
+                output,
+                scales,
+                rows,
+                columns,
+                groups,
+                target_device);
+    } else if (kernel_profile == device::BmgKernelProfile::b60) {
         quantize_svdq_act_int4_kernel<
             IT,
             Unsigned,

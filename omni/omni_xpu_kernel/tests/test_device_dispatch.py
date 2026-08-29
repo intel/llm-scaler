@@ -89,6 +89,7 @@ def test_device_info_and_sku_forward_to_native(monkeypatch):
                 "physical_bmg_sku": "b60",
                 "bmg_sku": "b60",
                 "kernel_profile": "b60",
+                "b580_policy_candidate": "none",
                 "sku_forced": False,
                 "performance_claim_allowed": True,
                 "tuning_overrides": {
@@ -98,6 +99,7 @@ def test_device_info_and_sku_forward_to_native(monkeypatch):
             bmg_sku=lambda index: "b60" if index == 1 else "b70",
             physical_bmg_sku=lambda index: "b60" if index == 1 else "b70",
             kernel_profile=lambda index: "b60" if index == 1 else "b70",
+            b580_policy_candidate=lambda index: "none",
         )
     )
     monkeypatch.setattr(device, "_load_extension", lambda: native)
@@ -108,6 +110,7 @@ def test_device_info_and_sku_forward_to_native(monkeypatch):
         "physical_bmg_sku": "b60",
         "bmg_sku": "b60",
         "kernel_profile": "b60",
+        "b580_policy_candidate": "none",
         "sku_forced": False,
         "performance_claim_allowed": True,
         "tuning_overrides": {
@@ -120,6 +123,7 @@ def test_device_info_and_sku_forward_to_native(monkeypatch):
     assert device.physical_bmg_sku(0) == "b70"
     assert device.kernel_profile(1) == "b60"
     assert device.kernel_profile(0) == "b70"
+    assert device.b580_policy_candidate(1) == "none"
 
 
 def test_native_source_contract_covers_identity_profile_and_override():
@@ -146,6 +150,7 @@ def test_native_source_contract_covers_identity_profile_and_override():
     assert 'value != "generic"' in policy
     assert "resolve_bmg_selection" in policy
     assert 'std::getenv("OMNI_XPU_FORCE_SKU")' in utilities
+    assert 'std::getenv("OMNI_XPU_B580_POLICY_CANDIDATE")' in utilities
     assert "warn_bmg_selection_once(device_id, selection)" in utilities
     assert "debug/prescreen only, performance_claim=false" in warning
     assert "SKU-specific kernel policy is unvalidated" in warning
@@ -337,6 +342,25 @@ def test_device_independent_native_selection_compiles_and_runs(tmp_path):
             assert(detected.effective_sku == BmgSku::b580);
             assert(detected.kernel_profile == BmgKernelProfile::generic_bmg);
             assert(!detected.forced);
+            assert(detected.b580_policy_candidate ==
+                   B580PolicyCandidate::none);
+
+            const auto candidate =
+                resolve_bmg_selection(kArcB580, nullptr, "adaln");
+            assert(candidate.physical_sku == BmgSku::b580);
+            assert(candidate.effective_sku == BmgSku::b580);
+            assert(candidate.kernel_profile == BmgKernelProfile::generic_bmg);
+            assert(!candidate.forced);
+            assert(candidate.b580_policy_candidate ==
+                   B580PolicyCandidate::adaln);
+            assert(b580_policy_candidate_name(
+                       candidate.b580_policy_candidate) == "adaln");
+            static_assert(
+                B580AdalnCandidatePolicy::adaln_block_size ==
+                B60KernelPolicy::adaln_block_size);
+            static_assert(
+                B580AdalnCandidatePolicy::int8_scaleback_elements ==
+                GenericBmgKernelPolicy::int8_scaleback_elements);
 
             const auto forced = resolve_bmg_selection(kArcProB70, "b60");
             assert(forced.physical_sku == BmgSku::b70);
@@ -358,12 +382,41 @@ def test_device_independent_native_selection_compiles_and_runs(tmp_path):
             }
             assert(rejected);
 
+            rejected = false;
+            try {
+                (void)resolve_bmg_selection(
+                    kArcProB70, nullptr, "adaln");
+            } catch (const std::runtime_error&) {
+                rejected = true;
+            }
+            assert(rejected);
+
+            rejected = false;
+            try {
+                (void)resolve_bmg_selection(
+                    kArcB580, "b60", "adaln");
+            } catch (const std::runtime_error&) {
+                rejected = true;
+            }
+            assert(rejected);
+
+            rejected = false;
+            try {
+                (void)resolve_bmg_selection(
+                    kArcB580, nullptr, "not-a-candidate");
+            } catch (const std::runtime_error&) {
+                rejected = true;
+            }
+            assert(rejected);
+
             std::ostringstream warnings;
             auto* previous = std::cerr.rdbuf(warnings.rdbuf());
             warn_bmg_selection_once(kArcB580, detected);
             warn_bmg_selection_once(kArcB580, detected);
             warn_bmg_selection_once(kArcProB70, forced);
             warn_bmg_selection_once(kArcProB70, forced);
+            warn_bmg_selection_once(kArcB580, candidate);
+            warn_bmg_selection_once(kArcB580, candidate);
             const auto normal_b70 = resolve_bmg_selection(kArcProB70, nullptr);
             warn_bmg_selection_once(kArcProB70, normal_b70);
             std::cerr.rdbuf(previous);
@@ -378,6 +431,12 @@ def test_device_independent_native_selection_compiles_and_runs(tmp_path):
             assert(text.find("OMNI_XPU_FORCE_SKU overrides", forced_at + 1) ==
                    std::string::npos);
             assert(text.find("performance_claim=false") != std::string::npos);
+            const auto candidate_at = text.find(
+                "OMNI_XPU_B580_POLICY_CANDIDATE=adaln");
+            assert(candidate_at != std::string::npos);
+            assert(text.find(
+                       "OMNI_XPU_B580_POLICY_CANDIDATE=adaln",
+                       candidate_at + 1) == std::string::npos);
             return 0;
         }
         """
@@ -415,6 +474,7 @@ def test_native_info_keeps_physical_and_effective_identity_separate():
         'result["bmg_sku"]',
         'result["sku_forced"]',
         'result["kernel_profile"]',
+        'result["b580_policy_candidate"]',
         'result["performance_claim_allowed"]',
     ):
         assert field in bindings
@@ -454,6 +514,12 @@ def test_cute_warning_preparation_is_cached_by_device_and_override(
     cute._prepare_bmg_policy_dispatch(tensor)
     cute._prepare_bmg_policy_dispatch(tensor)
     assert calls == [2, 2]
+
+    monkeypatch.delenv("OMNI_XPU_FORCE_SKU")
+    monkeypatch.setenv("OMNI_XPU_B580_POLICY_CANDIDATE", "adaln")
+    cute._prepare_bmg_policy_dispatch(tensor)
+    cute._prepare_bmg_policy_dispatch(tensor)
+    assert calls == [2, 2, 2]
     cute._prepared_bmg_policy_dispatches.clear()
 
 
@@ -475,3 +541,39 @@ def test_generic_bmg_policy_is_independent_from_b70():
             package_root / f"omni_xpu_kernel/csrc/{source}"
         ).read_text(encoding="utf-8")
         assert "GenericBmgKernelPolicy" in contents
+
+
+def test_b580_candidate_axes_are_explicit_and_route_local():
+    package_root = Path(__file__).resolve().parents[1]
+    csrc_root = package_root / "omni_xpu_kernel/csrc"
+    policy = (csrc_root / "bmg_device_policy.h").read_text(encoding="utf-8")
+    kernel_policy = (csrc_root / "bmg_kernel_policy.h").read_text(
+        encoding="utf-8"
+    )
+
+    routes = {
+        "adaln": "adaln.cpp",
+        "int8_dequant_fp32": "int8_dequantize_esimd.cpp",
+        "int8_dequant_bf16": "int8_dequantize_esimd.cpp",
+        "int8_scaleback": "int8_scaleback_esimd.cpp",
+        "convrot_g16": "int8_quantize_esimd.cpp",
+        "fp8_stochastic": "fp8_quant.cpp",
+        "svdq_dequant": "svdq_dequant.cpp",
+        "svdq_quant": "svdq_dequant.cpp",
+        "svdq_smooth": "svdq_fused_postproc.cpp",
+        "svdq_convert_add": "svdq_fused_postproc.cpp",
+        "kitchen_rope": "kitchen_rope_sycl.cpp",
+    }
+    for candidate, source_name in routes.items():
+        assert f"B580PolicyCandidate::{candidate}" in policy
+        assert f"B580PolicyCandidate::{candidate}" in (
+            csrc_root / source_name
+        ).read_text(encoding="utf-8")
+
+    cute_source = (
+        package_root / "omni_xpu_kernel/cute/cute_fmha_torch.cpp"
+    ).read_text(encoding="utf-8")
+    assert "B580PolicyCandidate::d120_l4205_v_tile" in policy
+    assert "B580PolicyCandidate::d120_l4205_v_tile" in cute_source
+    assert "B580D120L4205CandidatePolicy" in kernel_policy
+    assert "B580CandidateKernelPolicy" in kernel_policy

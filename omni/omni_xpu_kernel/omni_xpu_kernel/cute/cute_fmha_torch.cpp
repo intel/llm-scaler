@@ -618,11 +618,30 @@ at::Tensor sdp_bhld_d120(
     // The public Python wrapper asks the core _C extension to emit the one-shot
     // policy warning. This sidecar only selects a profile, avoiding one warning
     // per DSO when both native components are used in the same process.
+    const auto selection =
+        omni_xpu::device::get_bmg_selection_unwarned(queue);
     const bool use_b60 =
-        omni_xpu::device::get_bmg_selection_unwarned(queue).kernel_profile ==
-        omni_xpu::device::BmgKernelProfile::b60;
+        selection.kernel_profile == omni_xpu::device::BmgKernelProfile::b60;
+    const bool use_b580_candidate =
+        selection.b580_policy_candidate ==
+        omni_xpu::device::B580PolicyCandidate::d120_l4205_v_tile;
     // B60's L4205 workflow benefits from a 64-wide V tile. B70 and
     // unrecognized BMG IDs keep the shipped V32 specialization.
+    if (use_b580_candidate && L == 4205) {
+      run_d128_tile<
+          cutlass::half_t,
+          1,
+          0,
+          0,
+          0,
+          omni_xpu::device::B580D120L4205CandidatePolicy::
+              d120_l4205_v_tile>(
+          q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(), B, H, L, L,
+          D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+          k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+          o.stride(2), o.stride(1), o.stride(0));
+      return o;
+    }
     if (use_b60 && L == 4205) {
       run_d128_tile<
           cutlass::half_t,

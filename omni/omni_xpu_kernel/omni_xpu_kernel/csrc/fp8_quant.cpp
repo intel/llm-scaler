@@ -549,9 +549,15 @@ torch::Tensor stochastic_rounding(
     const double limit = fp8_max(out_dtype);
 #if defined(OMNI_XPU_ARCH_BMG)
     auto& queue = utils::get_queue(input.device());
-    const bool use_b60 = device::use_b60_kernel_profile(queue);
+    const auto selection = device::get_bmg_selection(queue);
+    const bool use_b60 =
+        selection.kernel_profile == device::BmgKernelProfile::b60;
+    const bool use_b580_candidate =
+        selection.b580_policy_candidate ==
+            device::B580PolicyCandidate::fp8_stochastic;
 #else
     const bool use_b60 = false;
+    const bool use_b580_candidate = false;
 #endif
 #define DISPATCH_STOCHASTIC_ELEMENTS(InputT, Elements)                     \
     do {                                                                   \
@@ -566,6 +572,11 @@ torch::Tensor stochastic_rounding(
     } while (false)
 #define DISPATCH_STOCHASTIC(InputT)                                        \
     do {                                                                   \
+        if (use_b580_candidate) {                                           \
+            DISPATCH_STOCHASTIC_ELEMENTS(                                  \
+                InputT, device::B580Fp8StochasticCandidatePolicy::         \
+                    fp8_stochastic_elements);                              \
+        }                                                                  \
         if (use_b60) {                                                      \
             DISPATCH_STOCHASTIC_ELEMENTS(                                  \
                 InputT, device::B60KernelPolicy::fp8_stochastic_elements); \

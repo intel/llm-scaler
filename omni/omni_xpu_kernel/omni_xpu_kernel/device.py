@@ -39,7 +39,14 @@ def kernel_profile(index: int = 0) -> str:
     return str(_load_extension().device.kernel_profile(index))
 
 
+def b580_policy_candidate(index: int = 0) -> str:
+    """Return the active development-only B580 policy candidate axis."""
+
+    return str(_load_extension().device.b580_policy_candidate(index))
+
+
 __all__ = [
+    "b580_policy_candidate",
     "bmg_sku",
     "classify_bmg_device_id",
     "info",

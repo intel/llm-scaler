@@ -73,7 +73,11 @@ def _prepare_bmg_policy_dispatch(tensor: torch.Tensor) -> None:
 
     if __xpu_target__ == "bmg":
         index = 0 if tensor.device.index is None else tensor.device.index
-        key = (index, os.environ.get("OMNI_XPU_FORCE_SKU"))
+        key = (
+            index,
+            os.environ.get("OMNI_XPU_FORCE_SKU"),
+            os.environ.get("OMNI_XPU_B580_POLICY_CANDIDATE"),
+        )
         if key not in _prepared_bmg_policy_dispatches:
             device.info(index)
             _prepared_bmg_policy_dispatches.add(key)

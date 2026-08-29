@@ -31,7 +31,8 @@ inline BmgSelection get_bmg_selection_unwarned(
         const sycl::device& sycl_device) {
     return resolve_bmg_selection(
         get_device_id(sycl_device),
-        std::getenv("OMNI_XPU_FORCE_SKU"));
+        std::getenv("OMNI_XPU_FORCE_SKU"),
+        std::getenv("OMNI_XPU_B580_POLICY_CANDIDATE"));
 }
 
 inline BmgSelection get_bmg_selection_unwarned(const sycl::queue& queue) {
@@ -61,6 +62,11 @@ inline BmgSku get_bmg_sku(const sycl::queue& queue) {
 
 inline bool use_b60_kernel_profile(const sycl::queue& queue) {
     return get_bmg_selection(queue).kernel_profile == BmgKernelProfile::b60;
+}
+
+inline bool use_b580_policy_candidate(
+        const sycl::queue& queue, B580PolicyCandidate candidate) {
+    return get_bmg_selection(queue).b580_policy_candidate == candidate;
 }
 
 }  // namespace device

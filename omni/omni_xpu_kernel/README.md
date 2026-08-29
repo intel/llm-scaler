@@ -114,6 +114,29 @@ Invalid override values fail closed. Do not set the variable in a publication,
 wheel, image-milestone, or formal benchmark environment.
 `generic-bmg` is accepted as a compatibility spelling of `generic`.
 
+Physical B580 development builds additionally expose one attributable policy
+candidate at a time through `OMNI_XPU_B580_POLICY_CANDIDATE`. The selector is
+rejected on every non-B580 physical device and when `OMNI_XPU_FORCE_SKU` is
+also set. It preserves B580's `generic-bmg` identity, reports the concrete
+candidate policy through `device.info()`, emits a warning, and always keeps
+`performance_claim_allowed=false`.
+
+The accepted values are `adaln`, `int8-dequant-fp32`,
+`int8-dequant-bf16`, `int8-scaleback`, `convrot-g16`, `fp8-stochastic`,
+`svdq-dequant`, `svdq-quant`, `svdq-smooth`, `svdq-convert-add`,
+`kitchen-rope`, and `d120-l4205-v-tile`. Each value changes only the named
+legal policy axis from the generic B580 baseline to the B60 candidate. Coupled
+template fields such as AdaLN block/work-group size and ConvRot DPAS/work-item
+geometry remain one axis so the selector cannot instantiate an invalid mix.
+
+```bash
+OMNI_XPU_B580_POLICY_CANDIDATE=d120-l4205-v-tile python -c \
+  'import omni_xpu_kernel as omni; print(omni.device.info(0))'
+```
+
+This surface is only for matched generic/candidate/generic B580 verification;
+it does not accept a candidate or authorize a performance claim.
+
 | GPU architecture | `sycl-ls --verbose` architecture | `OMNI_XPU_DEVICE` |
 |---|---|---|
 | Intel Arc B-series / Battlemage | `intel_gpu_bmg_*` | `bmg` |

@@ -187,15 +187,21 @@ torch::Tensor fused_scaleback(
         torch::TensorOptions().dtype(out_dtype).device(gemm_result.device()));
 
     auto& queue = utils::get_queue(gemm_result.device());
-    const auto kernel_profile =
-        device::get_bmg_selection(queue).kernel_profile;
+    const auto selection = device::get_bmg_selection(queue);
+    const auto kernel_profile = selection.kernel_profile;
+    const bool use_b580_candidate =
+        selection.b580_policy_candidate ==
+            device::B580PolicyCandidate::int8_scaleback &&
+        M == 4096 && N == 4096 && out_dtype == torch::kBFloat16;
     const bool use_b60 =
         kernel_profile == device::BmgKernelProfile::b60 &&
         M == 4096 && N == 4096 && out_dtype == torch::kBFloat16;
     const bool use_generic =
         kernel_profile == device::BmgKernelProfile::generic_bmg;
     const int fast_elements =
-        use_b60
+        use_b580_candidate
+        ? device::B580Int8ScalebackCandidatePolicy::int8_scaleback_elements
+        : use_b60
         ? device::B60KernelPolicy::int8_scaleback_elements
         : (
               use_generic
@@ -226,7 +232,10 @@ torch::Tensor fused_scaleback(
 
     #define DISPATCH_SCALEBACK(OT, bias_ptr) \
         do { \
-            if (use_b60) { \
+            if (use_b580_candidate) { \
+                DISPATCH_SCALEBACK_POLICY( \
+                    OT, bias_ptr, device::B580Int8ScalebackCandidatePolicy); \
+            } else if (use_b60) { \
                 DISPATCH_SCALEBACK_POLICY( \
                     OT, bias_ptr, device::B60KernelPolicy); \
             } else if (use_generic) { \

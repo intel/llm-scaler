@@ -27,6 +27,19 @@ inline void warn_bmg_selection_once(
                 << bmg_kernel_profile_name(selection.kernel_profile)
                 << "); debug/prescreen only, performance_claim=false\n";
         });
+    } else if (
+            selection.b580_policy_candidate != B580PolicyCandidate::none) {
+        static std::once_flag candidate_warning;
+        std::call_once(candidate_warning, [device_id, selection]() {
+            std::cerr
+                << "[omni_xpu::device] warning: physical Device ID 0x"
+                << std::hex << device_id << std::dec
+                << " (physical_sku=b580) enables "
+                << "OMNI_XPU_B580_POLICY_CANDIDATE="
+                << b580_policy_candidate_name(
+                       selection.b580_policy_candidate)
+                << "; development A/B only, performance_claim=false\n";
+        });
     } else if (selection.kernel_profile == BmgKernelProfile::generic_bmg) {
         static std::once_flag generic_warning;
         std::call_once(generic_warning, [device_id, selection]() {

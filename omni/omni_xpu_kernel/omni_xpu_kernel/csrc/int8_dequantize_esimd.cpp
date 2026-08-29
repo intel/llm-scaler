@@ -86,14 +86,33 @@ torch::Tensor dequantize_int8_fused(
         scale.numel() == rows && scale.numel() != 1;
 #if defined(OMNI_XPU_ARCH_BMG)
     auto& queue = utils::get_queue(input.device());
-    const bool use_b60 =
-        device::use_b60_kernel_profile(queue) &&
+    const auto selection = device::get_bmg_selection(queue);
+    const bool exact_candidate_shape =
         input.dim() == 2 && rows == 16384 && row_width == 4096;
+    const bool use_b60 =
+        selection.kernel_profile == device::BmgKernelProfile::b60 &&
+        exact_candidate_shape;
+    const bool use_b580_fp32_candidate =
+        selection.b580_policy_candidate ==
+            device::B580PolicyCandidate::int8_dequant_fp32 &&
+        exact_candidate_shape && out_dtype == torch::kFloat;
+    const bool use_b580_bf16_candidate =
+        selection.b580_policy_candidate ==
+            device::B580PolicyCandidate::int8_dequant_bf16 &&
+        exact_candidate_shape && out_dtype == torch::kBFloat16;
 #else
     const bool use_b60 = false;
+    const bool use_b580_fp32_candidate = false;
+    const bool use_b580_bf16_candidate = false;
 #endif
     const int elements_per_work_item =
-        use_b60
+        use_b580_fp32_candidate
+        ? device::B580Int8DequantFp32CandidatePolicy::
+              int8_dequant_fp32_elements
+        : use_b580_bf16_candidate
+        ? device::B580Int8DequantBf16CandidatePolicy::
+              int8_dequant_bf16_elements
+        : use_b60
         ? (
               out_dtype == torch::kFloat
               ? device::B60KernelPolicy::int8_dequant_fp32_elements
@@ -117,7 +136,16 @@ torch::Tensor dequantize_int8_fused(
     const auto* input_ptr = input.data_ptr<int8_t>();
     const auto* scale_ptr = scales.data_ptr<float>();
     if (out_dtype == torch::kFloat) {
-        if (use_b60) {
+        if (use_b580_fp32_candidate) {
+            dequantize_esimd_kernel<
+                float,
+                device::B580Int8DequantFp32CandidatePolicy::
+                    int8_dequant_fp32_elements,
+                device::B580Int8DequantFp32CandidatePolicy::
+                    int8_dequant_fp32_work_group_size>(
+                    input_ptr, scale_ptr, output.data_ptr<float>(),
+                    input.numel(), row_width, rowwise, input.device());
+        } else if (use_b60) {
             dequantize_esimd_kernel<
                 float,
                 device::B60KernelPolicy::int8_dequant_fp32_elements,
@@ -151,7 +179,17 @@ torch::Tensor dequantize_int8_fused(
                     input.numel(), row_width, rowwise, input.device());
         }
     } else {
-        if (use_b60) {
+        if (use_b580_bf16_candidate) {
+            dequantize_esimd_kernel<
+                bf16,
+                device::B580Int8DequantBf16CandidatePolicy::
+                    int8_dequant_bf16_elements,
+                device::B580Int8DequantBf16CandidatePolicy::
+                    int8_dequant_bf16_work_group_size>(
+                    input_ptr, scale_ptr,
+                    reinterpret_cast<bf16*>(output.data_ptr()),
+                    input.numel(), row_width, rowwise, input.device());
+        } else if (use_b60) {
             dequantize_esimd_kernel<
                 bf16,
                 device::B60KernelPolicy::int8_dequant_bf16_elements,
