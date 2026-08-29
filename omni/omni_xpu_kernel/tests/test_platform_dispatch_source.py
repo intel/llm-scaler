@@ -8,6 +8,15 @@ NORM_SOURCE = (
 SDP_SOURCE = (
     PROJECT_ROOT / "omni_xpu_kernel" / "csrc" / "sdp.cpp"
 ).read_text(encoding="utf-8")
+CUTE_FMHA_SOURCE = (
+    PROJECT_ROOT / "omni_xpu_kernel" / "cute" / "cute_fmha_torch.cpp"
+).read_text(encoding="utf-8")
+BMG_POLICY_SOURCE = (
+    PROJECT_ROOT / "omni_xpu_kernel" / "csrc" / "bmg_kernel_policy.h"
+).read_text(encoding="utf-8")
+BINDINGS_SOURCE = (
+    PROJECT_ROOT / "omni_xpu_kernel" / "csrc" / "bindings.cpp"
+).read_text(encoding="utf-8")
 
 
 def _selector_section(selector: str, next_section: str) -> str:
@@ -64,3 +73,32 @@ def test_windows_sdp_loader_resolves_every_exported_kernel():
             in windows_loader
         )
         assert f'dlsym(library.handle, "{symbol}")' in linux_loader
+
+
+def test_h3_vae_s1797_keeps_explicit_b60_and_b70_kv_policies():
+    b60_policy = BMG_POLICY_SOURCE.split("struct B60KernelPolicy", 1)[1]
+    b60_policy = b60_policy.split("struct B70KernelPolicy", 1)[0]
+    b70_policy = BMG_POLICY_SOURCE.split("struct B70KernelPolicy", 1)[1]
+    assert "h3_vae_d64_s1797_kv_tile = 64" in b60_policy
+    assert "h3_vae_d64_s1797_kv_tile = 32" in b70_policy
+    assert 'policy["h3_vae_d64_s1797_kv_tile"]' in BINDINGS_SOURCE
+
+
+def test_h3_vae_s1797_queries_b60_only_inside_exact_shape_dispatch():
+    template_section = CUTE_FMHA_SOURCE.split("struct D128TileKernel", 1)[0]
+    assert "int KvTileOverride = 0" in template_section
+    assert (
+        "KvTileOverride > 0 ? KvTileOverride : PlatformConfig::KV_TILE"
+        in CUTE_FMHA_SOURCE
+    )
+
+    h3_section = CUTE_FMHA_SOURCE.split(
+        "at::Tensor sdp_minimax_h3_vae_d64", 1
+    )[1].split("at::Tensor sdp_bhld_d120", 1)[0]
+    shape_guard = h3_section.index("if (L == 1797)")
+    device_query = h3_section.index("use_b60_kernel_profile(queue)")
+    candidate = h3_section.index("h3_vae_d64_s1797_kv_tile")
+    fallback = h3_section.index(
+        "run_d128_tile<cutlass::half_t, 0, 0, 0, 0, 0, 64>("
+    )
+    assert shape_guard < device_query < candidate < fallback

@@ -205,6 +205,8 @@ py::dict bmg_kernel_policy_dict() {
         Policy::kitchen_rope_work_group_size);
     policy["d120_l4205_v_tile"] =
         Policy::d120_l4205_v_tile;
+    policy["h3_vae_d64_s1797_kv_tile"] =
+        Policy::h3_vae_d64_s1797_kv_tile;
     return policy;
 }
 
