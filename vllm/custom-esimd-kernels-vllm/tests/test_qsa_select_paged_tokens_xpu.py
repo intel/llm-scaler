@@ -12,7 +12,6 @@ import torch
 
 INDEX_HEADS = 4
 HEAD_DIM = 128
-PAGE_SIZE = 128
 TOKEN_TOPK = 2048
 COMPRESS_RATIO = 4
 OUTPUT_WIDTH = TOKEN_TOPK + COMPRESS_RATIO - 1
@@ -99,6 +98,7 @@ def _select_reference(
     token_to_req: torch.Tensor,
     query_positions: torch.Tensor,
     sequence_lengths: torch.Tensor,
+    page_size: int,
 ) -> torch.Tensor:
     rows = q.shape[0]
     selected = torch.full(
@@ -119,8 +119,8 @@ def _select_reference(
             continue
         logical = torch.arange(visible, device=q.device)
         request = int(token_to_req[row].item())
-        pages = page_table[request, logical // PAGE_SIZE].long()
-        keys = cache[pages, logical % PAGE_SIZE, 0]
+        pages = page_table[request, logical // page_size].long()
+        keys = cache[pages, logical % page_size, 0]
         scores = torch.relu(
             torch.einsum("hd,nd->nh", q[row].float(), keys.float())
         ).sum(dim=-1) * (HEAD_DIM**-0.5)
@@ -150,14 +150,14 @@ def _case_metadata(case: str):
     raise ValueError(case)
 
 
-def _make_inputs(case: str):
+def _make_inputs(case: str, page_size: int):
     positions, sequence_lengths, requests, zero_query = _case_metadata(case)
     rows = len(positions)
     num_requests = len(sequence_lengths)
     page_columns = max(
         1,
         max(length // COMPRESS_RATIO for length in sequence_lengths)
-        // PAGE_SIZE
+        // page_size
         + 1,
     )
     physical_pages = num_requests * page_columns
@@ -170,7 +170,7 @@ def _make_inputs(case: str):
         page_table[:, 1::2] = page_table[:, :1]
     cache = torch.randn(
         physical_pages,
-        PAGE_SIZE,
+        page_size,
         1,
         HEAD_DIM,
         dtype=torch.float16,
@@ -204,10 +204,12 @@ def _make_inputs(case: str):
         seq_lens,
         TOKEN_TOPK,
         COMPRESS_RATIO,
+        page_size,
         out,
     )
 
 
+@pytest.mark.parametrize("page_size", [64, 128])
 @pytest.mark.parametrize(
     "case",
     [
@@ -221,14 +223,14 @@ def _make_inputs(case: str):
         "multi_request",
     ],
 )
-def test_qsa_select_matches_reference(qsa_ops, case):
+def test_qsa_select_matches_reference(qsa_ops, case, page_size):
     torch.manual_seed(20260828)
-    args = _make_inputs(case)
+    args = _make_inputs(case, page_size)
     tensor_inputs = [value for value in args if isinstance(value, torch.Tensor)]
     snapshots = [value.clone() for value in tensor_inputs[:-1]]
-    expected = _select_reference(*args[:6])
+    expected = _select_reference(*args[:6], page_size)
 
-    returned = qsa_ops.qsa_select_paged_tokens(*args)
+    returned = qsa_ops.qsa_select_paged_tokens_v2(*args)
     torch.xpu.synchronize()
 
     assert returned.data_ptr() == args[-1].data_ptr()
@@ -245,14 +247,14 @@ def test_qsa_select_matches_reference(qsa_ops, case):
 
 
 def test_qsa_select_rejects_bf16(qsa_ops):
-    args = list(_make_inputs("short_tail"))
+    args = list(_make_inputs("short_tail", 64))
     args[0] = args[0].to(torch.bfloat16)
     with pytest.raises(RuntimeError, match="q must be float16"):
-        qsa_ops.qsa_select_paged_tokens(*args)
+        qsa_ops.qsa_select_paged_tokens_v2(*args)
 
 
 def test_qsa_select_rejects_wrong_output_width(qsa_ops):
-    args = list(_make_inputs("short_tail"))
+    args = list(_make_inputs("short_tail", 64))
     args[-1] = torch.empty(1, 2048, dtype=torch.int32, device="xpu")
     with pytest.raises(RuntimeError, match="out must have shape"):
-        qsa_ops.qsa_select_paged_tokens(*args)
+        qsa_ops.qsa_select_paged_tokens_v2(*args)

@@ -6,6 +6,9 @@ from torch.utils.cpp_extension import SyclExtension
 
 
 QSA_EXTENSION_NAME = "custom_esimd_kernels_vllm.qsa_ops"
+QSA_ABI_VERSION = 2
+QSA_SELECTION_PAGE_SIZES = (64, 128)
+QSA_ATTENTION_PAGE_SIZES = (256, 512)
 QSA_DEFINES = (
     "QSA_NATIVE_ACTIVATION_FP16=1",
     "QSA_NATIVE_EXACT_PACKED_CACHE=1",

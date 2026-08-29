@@ -5,14 +5,23 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from qsa_build import (  # noqa: E402
+    QSA_ABI_VERSION,
+    QSA_ATTENTION_PAGE_SIZES,
     QSA_DEFINES,
     QSA_EXTENSION_NAME,
+    QSA_SELECTION_PAGE_SIZES,
     make_qsa_extension,
 )
 
 
 def test_qsa_extension_name_is_stable():
     assert QSA_EXTENSION_NAME == "custom_esimd_kernels_vllm.qsa_ops"
+
+
+def test_qsa_build_exposes_page_specialization_contract():
+    assert QSA_ABI_VERSION == 2
+    assert QSA_SELECTION_PAGE_SIZES == (64, 128)
+    assert QSA_ATTENTION_PAGE_SIZES == (256, 512)
 
 
 def test_qsa_build_matches_validated_fp16_packed_contract():

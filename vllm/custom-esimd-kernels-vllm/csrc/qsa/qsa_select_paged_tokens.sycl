@@ -20,7 +20,6 @@ using activation_t = sycl::half;
 
 constexpr int64_t kIndexHeads = 4;
 constexpr int64_t kHeadDim = 128;
-constexpr int64_t kCompressedPageSize = 128;
 constexpr int64_t kTokenTopk = 2048;
 constexpr int64_t kCompressRatio = 4;
 constexpr int64_t kBlockTopk = kTokenTopk / kCompressRatio;
@@ -32,6 +31,7 @@ constexpr int64_t kWorkgroup = 256;
 constexpr int64_t kSubgroups = kWorkgroup / kSubgroup;
 constexpr float kScoreScale = 0.08838834764831845f;
 
+template <int64_t PageSizeT>
 class QsaSelectPagedTokensKernel;
 
 void check_fp16_xpu(
@@ -58,7 +58,8 @@ void check_int64_xpu(const at::Tensor& tensor, const char* name) {
 
 }  // namespace
 
-at::Tensor select_paged_tokens(
+template <int64_t PageSizeT>
+at::Tensor select_paged_tokens_impl(
     const at::Tensor& q,
     const at::Tensor& compressed_key_cache,
     const at::Tensor& page_table,
@@ -68,6 +69,7 @@ at::Tensor select_paged_tokens(
     int64_t token_topk,
     int64_t compress_ratio,
     at::Tensor out) {
+  static_assert(PageSizeT == 64 || PageSizeT == 128);
   check_fp16_xpu(q, "q", true);
   check_fp16_xpu(compressed_key_cache, "compressed_key_cache", true);
   check_int32_xpu(page_table, "page_table");
@@ -80,10 +82,10 @@ at::Tensor select_paged_tokens(
       "q must have shape [R,4,128]");
   TORCH_CHECK(
       compressed_key_cache.dim() == 4 &&
-          compressed_key_cache.size(1) == kCompressedPageSize &&
+          compressed_key_cache.size(1) == PageSizeT &&
           compressed_key_cache.size(2) == 1 &&
           compressed_key_cache.size(3) == kHeadDim,
-      "compressed_key_cache must have shape [P,128,1,128]");
+      "compressed_key_cache must have shape [P,", PageSizeT, ",1,128]");
   TORCH_CHECK(
       page_table.dim() == 2 && page_table.size(0) > 0 &&
           page_table.size(1) > 0,
@@ -136,7 +138,7 @@ at::Tensor select_paged_tokens(
         sycl::range<1>(kSortSize), cgh);
     sycl::local_accessor<int32_t, 1> indices(
         sycl::range<1>(kSortSize), cgh);
-    cgh.parallel_for<QsaSelectPagedTokensKernel>(
+    cgh.parallel_for<QsaSelectPagedTokensKernel<PageSizeT>>(
         sycl::nd_range<1>(
             sycl::range<1>(static_cast<size_t>(rows * kWorkgroup)),
             sycl::range<1>(static_cast<size_t>(kWorkgroup))),
@@ -178,7 +180,7 @@ at::Tensor select_paged_tokens(
               int64_t cache_base = -1;
               if (valid) {
                 const int64_t page_column =
-                    logical_block / kCompressedPageSize;
+                    logical_block / PageSizeT;
                 valid = page_column < pages_per_request;
                 if (valid) {
                   const int32_t physical_page = page_table_ptr[
@@ -189,7 +191,7 @@ at::Tensor select_paged_tokens(
                     cache_base =
                         static_cast<int64_t>(physical_page) *
                             cache_page_stride +
-                        (logical_block % kCompressedPageSize) *
+                        (logical_block % PageSizeT) *
                             cache_token_stride;
                   }
                 }
@@ -306,6 +308,45 @@ at::Tensor select_paged_tokens(
         });
   });
   return out;
+}
+
+at::Tensor select_paged_tokens(
+    const at::Tensor& q,
+    const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths,
+    int64_t token_topk,
+    int64_t compress_ratio,
+    at::Tensor out) {
+  return select_paged_tokens_impl<128>(
+      q, compressed_key_cache, page_table, token_to_req, query_positions,
+      sequence_lengths, token_topk, compress_ratio, out);
+}
+
+at::Tensor select_paged_tokens_v2(
+    const at::Tensor& q,
+    const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths,
+    int64_t token_topk,
+    int64_t compress_ratio,
+    int64_t compressed_page_size,
+    at::Tensor out) {
+  TORCH_CHECK(
+      compressed_page_size == 64 || compressed_page_size == 128,
+      "compressed_page_size must be 64 or 128");
+  if (compressed_page_size == 64) {
+    return select_paged_tokens_impl<64>(
+        q, compressed_key_cache, page_table, token_to_req, query_positions,
+        sequence_lengths, token_topk, compress_ratio, out);
+  }
+  return select_paged_tokens_impl<128>(
+      q, compressed_key_cache, page_table, token_to_req, query_positions,
+      sequence_lengths, token_topk, compress_ratio, out);
 }
 
 }  // namespace qsa

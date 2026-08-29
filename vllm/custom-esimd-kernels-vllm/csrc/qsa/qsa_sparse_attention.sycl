@@ -82,7 +82,6 @@ constexpr const char* kActivationName = "bfloat16";
 constexpr int64_t kQueryHeads = 3;
 constexpr int64_t kKvHeads = 1;
 constexpr int64_t kHeadDim = 256;
-constexpr int64_t kPageSize = 512;
 constexpr int64_t kIndexWidth = 2051;
 constexpr int64_t kSubgroup = QSA_NATIVE_SUBGROUP;
 constexpr int64_t kWorkgroup = 4 * kSubgroup;
@@ -90,7 +89,6 @@ constexpr int64_t kValuesPerLane = kHeadDim / kSubgroup;
 constexpr int64_t kTile = QSA_NATIVE_KV_TILE;
 constexpr int64_t kTileElements = kTile * kHeadDim;
 constexpr int64_t kPackedTokenStride = 2 * kHeadDim;
-constexpr int64_t kPackedPageStride = kPageSize * kPackedTokenStride;
 
 static_assert(
     kTile == 4 || kTile == 8 || kTile == 16 || kTile == 32 || kTile == 64);
@@ -128,6 +126,7 @@ static_assert(!QSA_NATIVE_PIPELINED_LOADER);
 static_assert(!QSA_NATIVE_SINGLE_EXP);
 #endif
 
+template <int64_t PageSize>
 class SparsePagedAttentionKernel;
 
 inline float qsa_exp(float value) {
@@ -154,6 +153,7 @@ void check_int32_xpu(const at::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
+template <int64_t PageSize>
 at::Tensor sparse_paged_attention_impl(
     const at::Tensor& q,
     const at::Tensor& k_cache,
@@ -163,6 +163,9 @@ at::Tensor sparse_paged_attention_impl(
     const at::Tensor& token_to_req,
     int64_t valid_width_scan_bound,
     at::Tensor out) {
+  static_assert(PageSize == 256 || PageSize == 512);
+  constexpr int64_t kPageSize = PageSize;
+  constexpr int64_t kPackedPageStride = kPageSize * kPackedTokenStride;
   check_activation_xpu(q, "q", true);
   check_activation_xpu(k_cache, "k_cache", false);
   check_activation_xpu(v_cache, "v_cache", false);
@@ -176,7 +179,7 @@ at::Tensor sparse_paged_attention_impl(
   TORCH_CHECK(k_cache.dim() == 4 && k_cache.size(1) == kPageSize &&
                   k_cache.size(2) == kKvHeads &&
                   k_cache.size(3) == kHeadDim,
-              "k_cache must have shape [P,512,1,256]");
+              "k_cache must have shape [P,", PageSize, ",1,256]");
   TORCH_CHECK(v_cache.sizes() == k_cache.sizes(),
               "v_cache must match k_cache");
   TORCH_CHECK(k_cache.stride(0) > 0 && k_cache.stride(1) >= kHeadDim &&
@@ -195,7 +198,7 @@ at::Tensor sparse_paged_attention_impl(
                   v_cache.stride(1) == kPackedTokenStride &&
                   v_cache.stride(2) == kHeadDim,
               "k_cache and v_cache must have exact packed strides "
-              "[262144,512,256,1]");
+              "[", kPackedPageStride, ",512,256,1]");
 #endif
   TORCH_CHECK(logical_indices.dim() == 2 &&
                   logical_indices.size(0) == q.size(0) &&
@@ -252,7 +255,7 @@ at::Tensor sparse_paged_attention_impl(
 #else
         sycl::range<1>(2 * kTileElements), cgh);
 #endif
-    cgh.parallel_for<SparsePagedAttentionKernel>(
+    cgh.parallel_for<SparsePagedAttentionKernel<PageSize>>(
         sycl::nd_range<1>(
             sycl::range<1>(static_cast<size_t>(rows * kWorkgroup)),
             sycl::range<1>(static_cast<size_t>(kWorkgroup))),
@@ -701,6 +704,8 @@ at::Tensor sparse_paged_attention_impl(
   return out;
 }
 
+}  // namespace
+
 at::Tensor sparse_paged_attention(
     const at::Tensor& q,
     const at::Tensor& k_cache,
@@ -709,7 +714,7 @@ at::Tensor sparse_paged_attention(
     const at::Tensor& block_table,
     const at::Tensor& token_to_req,
     at::Tensor out) {
-  return sparse_paged_attention_impl(
+  return sparse_paged_attention_impl<512>(
       q, k_cache, v_cache, logical_indices, block_table, token_to_req,
       kIndexWidth, out);
 }
@@ -723,12 +728,55 @@ at::Tensor sparse_paged_attention_bounded(
     const at::Tensor& token_to_req,
     int64_t max_valid_width,
     at::Tensor out) {
-  return sparse_paged_attention_impl(
+  return sparse_paged_attention_impl<512>(
       q, k_cache, v_cache, logical_indices, block_table, token_to_req,
       max_valid_width, out);
 }
 
-}  // namespace
+at::Tensor sparse_paged_attention_v2(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t main_page_size,
+    at::Tensor out) {
+  TORCH_CHECK(
+      main_page_size == 256 || main_page_size == 512,
+      "main_page_size must be 256 or 512");
+  if (main_page_size == 256) {
+    return sparse_paged_attention_impl<256>(
+        q, k_cache, v_cache, logical_indices, block_table, token_to_req,
+        kIndexWidth, out);
+  }
+  return sparse_paged_attention_impl<512>(
+      q, k_cache, v_cache, logical_indices, block_table, token_to_req,
+      kIndexWidth, out);
+}
+
+at::Tensor sparse_paged_attention_bounded_v2(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t max_valid_width,
+    int64_t main_page_size,
+    at::Tensor out) {
+  TORCH_CHECK(
+      main_page_size == 256 || main_page_size == 512,
+      "main_page_size must be 256 or 512");
+  if (main_page_size == 256) {
+    return sparse_paged_attention_impl<256>(
+        q, k_cache, v_cache, logical_indices, block_table, token_to_req,
+        max_valid_width, out);
+  }
+  return sparse_paged_attention_impl<512>(
+      q, k_cache, v_cache, logical_indices, block_table, token_to_req,
+      max_valid_width, out);
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def(
@@ -740,9 +788,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       &sparse_paged_attention_bounded,
       "Qwen3.8 TP8-rank sparse paged attention with trusted scan bound (XPU)");
   module.def(
+      "sparse_paged_attention_v2",
+      &sparse_paged_attention_v2,
+      "Qwen3.8 page-specialized sparse paged attention (XPU)");
+  module.def(
+      "sparse_paged_attention_bounded_v2",
+      &sparse_paged_attention_bounded_v2,
+      "Qwen3.8 page-specialized sparse paged attention with trusted scan bound (XPU)");
+  module.def(
       "qsa_select_paged_tokens",
       &qsa::select_paged_tokens,
       "Qwen3.8 TP8-rank fused paged index selection and expansion (XPU)");
+  module.def(
+      "qsa_select_paged_tokens_v2",
+      &qsa::select_paged_tokens_v2,
+      "Qwen3.8 page-specialized fused paged index selection and expansion (XPU)");
+  module.attr("qsa_abi_version") = 2;
+  module.attr("selection_page_sizes") = py::make_tuple(64, 128);
+  module.attr("attention_page_sizes") = py::make_tuple(256, 512);
   module.attr("kv_tile") = QSA_NATIVE_KV_TILE;
   module.attr("subgroup") = QSA_NATIVE_SUBGROUP;
   module.attr("token_loader") = QSA_NATIVE_TOKEN_LOADER;

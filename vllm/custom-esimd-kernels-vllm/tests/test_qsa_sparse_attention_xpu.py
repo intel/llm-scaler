@@ -12,9 +12,11 @@ import torch
 
 HEADS = 3
 HEAD_DIM = 256
-PAGE_SIZE = 512
 INDEX_WIDTH = 2051
-PACKED_STRIDE = (262144, 512, 256, 1)
+PACKED_STRIDES = {
+    256: (131072, 512, 256, 1),
+    512: (262144, 512, 256, 1),
+}
 
 
 def _xpu_available() -> bool:
@@ -67,13 +69,13 @@ def _canonicalize_singleton_dim_strides(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.as_strided(tensor.shape, strides) if changed else tensor
 
 
-def _make_inputs(case: str, rows: int):
-    pages_per_request = 5
+def _make_inputs(case: str, rows: int, page_size: int):
+    pages_per_request = (INDEX_WIDTH + page_size - 1) // page_size
     pages = rows * pages_per_request
     packed_kv = torch.randn(
         pages,
         1,
-        PAGE_SIZE,
+        page_size,
         2 * HEAD_DIM,
         dtype=torch.float16,
         device="xpu",
@@ -113,8 +115,8 @@ def _make_inputs(case: str, rows: int):
     else:
         raise ValueError(case)
 
-    assert tuple(k_cache.stride()) == PACKED_STRIDE
-    assert tuple(v_cache.stride()) == PACKED_STRIDE
+    assert tuple(k_cache.stride()) == PACKED_STRIDES[page_size]
+    assert tuple(v_cache.stride()) == PACKED_STRIDES[page_size]
     assert v_cache.storage_offset() == HEAD_DIM
     return (
         q,
@@ -123,12 +125,15 @@ def _make_inputs(case: str, rows: int):
         logical_indices,
         block_table,
         token_to_req,
+        page_size,
         torch.empty_like(q),
         packed_kv,
     )
 
 
-def _reference(q, k_cache, v_cache, logical_indices, block_table, token_to_req):
+def _reference(
+    q, k_cache, v_cache, logical_indices, block_table, token_to_req, page_size
+):
     output = torch.zeros_like(q)
     for row in range(q.shape[0]):
         logical = logical_indices[row]
@@ -136,8 +141,8 @@ def _reference(q, k_cache, v_cache, logical_indices, block_table, token_to_req):
         if logical.numel() == 0:
             continue
         request = int(token_to_req[row].item())
-        pages = block_table[request, logical // PAGE_SIZE].long()
-        offsets = logical % PAGE_SIZE
+        pages = block_table[request, logical // page_size].long()
+        offsets = logical % page_size
         keys = k_cache[pages, offsets, 0]
         values = v_cache[pages, offsets, 0]
         scores = torch.einsum("hd,kd->hk", q[row].float(), keys.float())
@@ -149,6 +154,9 @@ def _reference(q, k_cache, v_cache, logical_indices, block_table, token_to_req):
 
 
 def test_qsa_module_contract(qsa_ops):
+    assert qsa_ops.qsa_abi_version == 2
+    assert qsa_ops.selection_page_sizes == (64, 128)
+    assert qsa_ops.attention_page_sizes == (256, 512)
     assert qsa_ops.activation_dtype == "float16"
     assert qsa_ops.exact_packed_cache == 1
     assert qsa_ops.kv_tile == 4
@@ -160,16 +168,19 @@ def test_qsa_module_contract(qsa_ops):
     assert qsa_ops.selection_output_width == INDEX_WIDTH
 
 
+@pytest.mark.parametrize("page_size", [256, 512])
 @pytest.mark.parametrize(
     "case",
     ["empty", "holes_duplicates_pages", "valid_width_32", "full_width_2051"],
 )
 @pytest.mark.parametrize("rows", [1, 2])
-def test_qsa_matches_reference_and_preserves_inputs(qsa_ops, case, rows):
+def test_qsa_matches_reference_and_preserves_inputs(
+    qsa_ops, case, rows, page_size
+):
     torch.manual_seed(20260828)
-    args = list(_make_inputs(case, rows))
+    args = list(_make_inputs(case, rows, page_size))
     packed_kv = args.pop()
-    q, _, _, logical_indices, block_table, token_to_req, out = args
+    q, _, _, logical_indices, block_table, token_to_req, page_size, out = args
     snapshots = [
         q.clone(),
         packed_kv.clone(),
@@ -177,17 +188,17 @@ def test_qsa_matches_reference_and_preserves_inputs(qsa_ops, case, rows):
         block_table.clone(),
         token_to_req.clone(),
     ]
-    expected = _reference(*args[:6])
+    expected = _reference(*args[:6], page_size)
 
-    returned = qsa_ops.sparse_paged_attention(*args)
+    returned = qsa_ops.sparse_paged_attention_v2(*args)
     torch.xpu.synchronize()
 
     assert q.dtype == torch.float16
     assert args[1].dtype == torch.float16
     assert args[2].dtype == torch.float16
     assert out.dtype == torch.float16
-    assert tuple(args[1].stride()) == PACKED_STRIDE
-    assert tuple(args[2].stride()) == PACKED_STRIDE
+    assert tuple(args[1].stride()) == PACKED_STRIDES[page_size]
+    assert tuple(args[2].stride()) == PACKED_STRIDES[page_size]
     assert args[2].storage_offset() == HEAD_DIM
     assert returned.data_ptr() == out.data_ptr()
     assert torch.isfinite(returned).all()
@@ -201,15 +212,15 @@ def test_qsa_matches_reference_and_preserves_inputs(qsa_ops, case, rows):
 
 
 def test_qsa_rejects_bf16_query(qsa_ops):
-    args = list(_make_inputs("valid_width_32", 1)[:-1])
+    args = list(_make_inputs("valid_width_32", 1, 256)[:-1])
     args[0] = args[0].to(torch.bfloat16)
     with pytest.raises(RuntimeError, match="q must be float16"):
-        qsa_ops.sparse_paged_attention(*args)
+        qsa_ops.sparse_paged_attention_v2(*args)
 
 
 def test_qsa_rejects_nonpacked_cache(qsa_ops):
-    args = list(_make_inputs("valid_width_32", 1)[:-1])
+    args = list(_make_inputs("valid_width_32", 1, 256)[:-1])
     args[1] = args[1].contiguous()
     args[2] = args[2].contiguous()
     with pytest.raises(RuntimeError, match="must have exact packed strides"):
-        qsa_ops.sparse_paged_attention(*args)
+        qsa_ops.sparse_paged_attention_v2(*args)
