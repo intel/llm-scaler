@@ -106,7 +106,8 @@ template <
     int SubgroupLayoutQOverride = 0,
     int MmaKOverride = 0,
     int VTileOverride = 0,
-    int HeadDimOverride = 0>
+    int HeadDimOverride = 0,
+    int KvTileOverride = 0>
 struct D128TileKernel {
   using PlatformConfig = cute_fmha_config::ActiveConfig;
   static constexpr int QTile =
@@ -128,7 +129,8 @@ struct D128TileKernel {
   // K-dim match and tripped the gemm.hpp static_assert.)
   static constexpr int KvTile = 64;
 #else
-  static constexpr int KvTile = PlatformConfig::KV_TILE;
+  static constexpr int KvTile =
+      KvTileOverride > 0 ? KvTileOverride : PlatformConfig::KV_TILE;
 #endif
   using ShapeQK = Shape<
       Int<QTile>, Int<KvTile>, Int<MmaK>>;
@@ -206,7 +208,8 @@ template <
     int SubgroupLayoutQOverride = 0,
     int MmaKOverride = 0,
     int VTileOverride = 0,
-    int HeadDimOverride = 0>
+    int HeadDimOverride = 0,
+    int KvTileOverride = 0>
 void run_d128_tile(
     const void* q_ptr, const void* k_ptr, const void* v_ptr, void* o_ptr,
     int B, int H, int Lq, int Lkv, int D, float scale,
@@ -223,7 +226,8 @@ void run_d128_tile(
       SubgroupLayoutQOverride,
       MmaKOverride,
       VTileOverride,
-      HeadDimOverride>;
+      HeadDimOverride,
+      KvTileOverride>;
   using K    = typename KT::Kernel;
   using PS   = typename KT::ProblemShapeType;
 
@@ -576,6 +580,29 @@ at::Tensor sdp_minimax_h3_vae_d64(
   at::Tensor output =
       at::empty({B, L, H, D}, q.options()).permute({0, 2, 1, 3});
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+  // Only the measured E210/E211 S1797 contract selects KV64. Query the
+  // runtime profile inside the exact-shape guard so every shorter legal tile
+  // and every B70/generic BMG device retains the shipped KV32 instance.
+  if (L == 1797) {
+    auto& queue =
+        c10::xpu::getCurrentXPUStream(q.device().index()).queue();
+    if (omni_xpu::device::use_b60_kernel_profile(queue)) {
+      run_d128_tile<
+          cutlass::half_t,
+          0,
+          0,
+          0,
+          0,
+          0,
+          64,
+          omni_xpu::device::B60KernelPolicy::h3_vae_d64_s1797_kv_tile>(
+          q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(), B, H, L,
+          L, D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+          k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+          output.stride(2), output.stride(1), output.stride(0));
+      return output;
+    }
+  }
   run_d128_tile<cutlass::half_t, 0, 0, 0, 0, 0, 64>(
       q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(), B, H, L, L,
       D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),

@@ -44,6 +44,7 @@ struct B60KernelPolicy {
     static constexpr int kitchen_rope_work_group_size = 64;
 
     static constexpr int d120_l4205_v_tile = 64;
+    static constexpr int h3_vae_d64_s1797_kv_tile = 64;
 };
 
 struct B70KernelPolicy {
@@ -78,6 +79,7 @@ struct B70KernelPolicy {
     static constexpr int kitchen_rope_work_group_size = 0;
 
     static constexpr int d120_l4205_v_tile = 32;
+    static constexpr int h3_vae_d64_s1797_kv_tile = 32;
 };
 
 // Recognized-but-unvalidated and unknown BMG IDs preserve the previously
