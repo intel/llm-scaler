@@ -119,6 +119,8 @@ at::Tensor esimd_gemv_fp16(
     int64_t M = input.size(0);
     int64_t N = weight.size(0);
     int64_t K = weight.size(1);
+    TORCH_CHECK(M > 0 && N > 0 && K > 0,
+                "FP16 GEMV dimensions must be positive");
     TORCH_CHECK(input.size(1) == K);
     TORCH_CHECK(output.size(0) == M && output.size(1) == N);
 
@@ -142,8 +144,15 @@ at::Tensor esimd_gemv_fp16_gelu_mul(
     TORCH_CHECK(input.dim() == 2 && input.size(0) == 1);
     TORCH_CHECK(weight.dim() == 2 && weight.size(0) % 2 == 0);
     TORCH_CHECK(output.dim() == 2 && output.size(0) == 1);
+    TORCH_CHECK(input.is_contiguous());
+    TORCH_CHECK(weight.is_contiguous());
+    TORCH_CHECK(output.is_contiguous());
+    TORCH_CHECK(input.device() == weight.device());
+    TORCH_CHECK(input.device() == output.device());
     int64_t N = weight.size(0) / 2;
     int64_t K = weight.size(1);
+    TORCH_CHECK(N > 0 && K > 0,
+                "FP16 GELU GEMV dimensions must be positive");
     TORCH_CHECK(input.size(1) == K);
     TORCH_CHECK(output.size(1) == N);
     auto& dpcpp_queue = get_device_queue(input);

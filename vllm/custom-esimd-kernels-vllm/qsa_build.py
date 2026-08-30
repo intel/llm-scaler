@@ -26,11 +26,22 @@ QSA_DEFINES = (
 )
 
 
-def make_qsa_extension(root: Path, torch_include: str) -> SyclExtension:
-    """Return the production FP16 packed-cache QSA extension definition."""
+def make_qsa_extension(
+    root: Path,
+    torch_include: str,
+    *,
+    extension_name: str = QSA_EXTENSION_NAME,
+    rpath: str = "$ORIGIN/../../torch/lib",
+) -> SyclExtension:
+    """Return a FP16 packed-cache QSA extension definition.
+
+    Production keeps the canonical package name and package-relative RPATH.
+    Isolated build-only variants can opt into a top-level name and matching
+    RPATH without changing the production setup.
+    """
 
     return SyclExtension(
-        name=QSA_EXTENSION_NAME,
+        name=extension_name,
         sources=[
             "csrc/qsa/qsa_sparse_attention.sycl",
             "csrc/qsa/qsa_select_paged_tokens.sycl",
@@ -45,6 +56,6 @@ def make_qsa_extension(root: Path, torch_include: str) -> SyclExtension:
                 *(f"-D{definition}" for definition in QSA_DEFINES),
             ],
         },
-        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+        extra_link_args=[f"-Wl,-rpath,{rpath}"],
         py_limited_api=False,
     )

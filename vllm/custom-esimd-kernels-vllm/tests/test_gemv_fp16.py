@@ -1,8 +1,16 @@
-"""Numerical regression for esimd_gemv_fp16 at the gemma4 router shape."""
+"""Numerical regression for the FP16 GEMV dispatch and small-K safety."""
+import os
 import sys
 
-import custom_esimd_kernels_vllm  # noqa: F401  (registers ops)
 import torch
+
+# Build-only regression runs can load an explicitly fingerprinted DSO without
+# importing the production package (which may contain a different artifact).
+_gemv_dso = os.environ.get("GEMV_FP16_DSO")
+if _gemv_dso:
+    torch.ops.load_library(_gemv_dso)
+else:
+    import custom_esimd_kernels_vllm  # noqa: F401  (registers ops)
 
 
 def run(M, N, K, tol=5e-2):
@@ -34,6 +42,18 @@ def rejects(label, x, w, out):
 
 if __name__ == "__main__":
     cases = [
+        # Small and non-aligned K values exercise every scalar-safe tail width.
+        (1, 3, 1),
+        (1, 4, 2),
+        (2, 5, 6),
+        (1, 6, 7),
+        (1, 4, 8),
+        (2, 5, 16),
+        (3, 7, 24),
+        (1, 4, 33),
+        (1, 8, 65),
+        (1, 128, 2052),
+        # Production-shaped and split-dispatch regressions.
         (1, 128, 2816),  # gemma4-26B router (TP=2)
         (1, 128, 1408),  # gemma4-26B router (TP=4 hypothetical)
         (2, 32, 2048),   # Qwen3.6 GDN in_proj_ba
@@ -62,6 +82,12 @@ if __name__ == "__main__":
             x,
             w,
             torch.empty(M, N - 1, dtype=torch.float16, device=dev),
+        ),
+        rejects(
+            "zero K dimension",
+            torch.empty(1, 0, dtype=torch.float16, device=dev),
+            torch.empty(3, 0, dtype=torch.float16, device=dev),
+            torch.empty(1, 3, dtype=torch.float16, device=dev),
         ),
     ]
     sys.exit(0 if all(run(*c) for c in cases) and all(invalid_cases) else 1)
