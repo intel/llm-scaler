@@ -5,6 +5,8 @@
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include "xpu/esimd_kernels/ple.h"
+
 // FP8 weight GEMV with per-N scale: output = input @ dequant(weight_fp8) * scale
 // FP32 accumulation, element-wise acc + deferred scale. Optimized for decode (M=1).
 at::Tensor esimd_gemv_fp8_pern(
