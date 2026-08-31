@@ -112,13 +112,17 @@ static CachedPrimitive& get_or_create_s8u4(
 
     dnnl::matmul::primitive_desc pd(cp.eng, cp.src_md, cp.wei_md, cp.dst_md, attr);
     std::string impl_info = pd.impl_info_str();
-    fprintf(stderr,
-            "[onednn_s8u4_gemm] CACHE MISS: impl=%s (M=%ld K=%ld N=%ld "
-            "act_gs=%ld wei_gs=%ld zp=%d)\n",
-            impl_info.c_str(), (long)M, (long)K, (long)N,
-            (long)act_gs, (long)wei_gs, (int)per_block_zp);
-    if (impl_info.find("ref") != std::string::npos) {
-        fprintf(stderr, "[onednn_s8u4_gemm] WARNING: reference fallback (slow)\n");
+    // Primitive cache misses are expected during warm-up (one per new shape).
+    // Print only when requested: OMNI_XPU_DEBUG=gemm (or =1 / =all).
+    if (omni_xpu::debug::is_enabled("gemm")) {
+        fprintf(stderr,
+                "[onednn_s8u4_gemm] CACHE MISS: impl=%s (M=%ld K=%ld N=%ld "
+                "act_gs=%ld wei_gs=%ld zp=%d)\n",
+                impl_info.c_str(), (long)M, (long)K, (long)N,
+                (long)act_gs, (long)wei_gs, (int)per_block_zp);
+        if (impl_info.find("ref") != std::string::npos) {
+            fprintf(stderr, "[onednn_s8u4_gemm] WARNING: reference fallback (slow)\n");
+        }
     }
     cp.prim = dnnl::matmul(pd);
     auto [ins, _] = g_cache.emplace(key, std::move(cp));
@@ -162,6 +166,9 @@ torch::Tensor onednn_s8u4_gemm(
     TORCH_CHECK(act.dim() == 2, "act must be [M, K]");
     TORCH_CHECK(act.scalar_type() == torch::kInt8, "act must be int8");
     TORCH_CHECK(act.device().is_xpu(), "act must be on XPU");
+    TORCH_CHECK(xscales.device().is_xpu(), "xscales must be on XPU");
+    TORCH_CHECK(packed_u4.device().is_xpu(), "packed_u4 must be on XPU");
+    TORCH_CHECK(scales_f16.device().is_xpu(), "scales_f16 must be on XPU");
     TORCH_CHECK(packed_u4.scalar_type() == torch::kUInt8, "packed_u4 must be uint8");
     TORCH_CHECK(xscales.scalar_type() == torch::kFloat16 ||
                     xscales.scalar_type() == torch::kFloat,
@@ -195,6 +202,7 @@ torch::Tensor onednn_s8u4_gemm(
         TORCH_CHECK(zpt.dim() == 2, "zp_u8 must be [G_wei, N]");
         TORCH_CHECK(zpt.size(0) == G_wei && zpt.size(1) == N,
                     "zp_u8 must be [G_wei, N]");
+        TORCH_CHECK(zpt.device().is_xpu(), "zp_u8 must be on XPU");
         zp_c = zpt.contiguous();
         zp_ptr = zp_c.data_ptr();
     } else {
