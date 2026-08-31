@@ -3,7 +3,7 @@
 #
 # Three-stage OMIX build of llm-scaler-vllm (Intel XPU).
 #
-#   rust-build : ubuntu:22.04                         -- builds vLLM Rust extensions.
+#   rust-build : ubuntu:24.04                         -- builds vLLM Rust extensions.
 #   builder    : intel/omix:0.1.0-devel-ubuntu24.04  -- oneAPI 2025.3 DPC++ compiler
 #                                                         + oneCCL/oneDNN/oneMKL.  Compiles
 #                                                         all native wheels.  NOT shipped.
@@ -25,7 +25,7 @@
 # =========================================================================
 # Stage 1: rust-build -- compile vLLM Rust extensions
 # =========================================================================
-FROM ubuntu:22.04 AS rust-build
+FROM ubuntu:24.04 AS rust-build
 
 ARG VLLM_VERSION=v0.26.0
 
