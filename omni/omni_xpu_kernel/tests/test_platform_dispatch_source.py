@@ -89,7 +89,7 @@ def test_h3_vae_s1797_keeps_explicit_b60_and_b70_kv_policies():
     assert 'policy["h3_vae_d64_s1797_kv_tile"]' in BINDINGS_SOURCE
 
 
-def test_h3_vae_s1797_queries_b60_and_b580_candidate_inside_exact_shape():
+def test_h3_vae_s1797_queries_b580_geometry_and_b60_inside_exact_shape():
     template_section = CUTE_FMHA_SOURCE.split("struct D128TileKernel", 1)[0]
     assert "int KvTileOverride = 0" in template_section
     assert (
@@ -105,12 +105,25 @@ def test_h3_vae_s1797_queries_b60_and_b580_candidate_inside_exact_shape():
     b580_candidate = h3_section.index(
         "B580PolicyCandidate::\n            h3_vae_d64_s1797_kv_tile"
     )
+    physical_b580 = h3_section.index(
+        "selection.physical_sku == omni_xpu::device::BmgSku::b580"
+    )
+    b580_geometry = h3_section.index(
+        "run_d128_tile<cutlass::half_t, 0, 128, 8, 0, 0, 64, 32>("
+    )
     b60_profile = h3_section.index("BmgKernelProfile::b60")
     candidate = h3_section.index("h3_vae_d64_s1797_kv_tile")
     fallback = h3_section.index(
         "run_d128_tile<cutlass::half_t, 0, 0, 0, 0, 0, 64>("
     )
     assert (
-        shape_guard < device_query < b580_candidate < b60_profile < fallback
+        shape_guard
+        < device_query
+        < b580_candidate
+        < physical_b580
+        < b580_geometry
+        < b60_profile
+        < fallback
     )
     assert candidate < fallback
+    assert "!selection.forced" in h3_section

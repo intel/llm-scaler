@@ -581,9 +581,10 @@ at::Tensor sdp_minimax_h3_vae_d64(
       at::empty({B, L, H, D}, q.options()).permute({0, 2, 1, 3});
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
   // Only the measured E210/E211 S1797 contract selects KV64 by default. The
-  // physical-B580 selector exposes the same value for attributable A/B only;
-  // every shorter legal tile and every unselected B70/generic BMG device
-  // retains the shipped KV32 instance.
+  // physical-B580 selector exposes the same value for attributable A/B only.
+  // An unforced physical B580 retains KV32 but uses its independently validated
+  // Q128/SG8 geometry. Every shorter legal tile and every B50/B70/generic BMG
+  // device retains the shipped Q256/SG16/KV32 instance.
   if (L == 1797) {
     auto& queue =
         c10::xpu::getCurrentXPUStream(q.device().index()).queue();
@@ -602,6 +603,15 @@ at::Tensor sdp_minimax_h3_vae_d64(
           64,
           omni_xpu::device::B580H3VaeD64S1797CandidatePolicy::
               h3_vae_d64_s1797_kv_tile>(
+          q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(), B, H, L,
+          L, D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+          k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+          output.stride(2), output.stride(1), output.stride(0));
+      return output;
+    }
+    if (selection.physical_sku == omni_xpu::device::BmgSku::b580 &&
+        !selection.forced) {
+      run_d128_tile<cutlass::half_t, 0, 128, 8, 0, 0, 64, 32>(
           q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(), B, H, L,
           L, D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
           k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),

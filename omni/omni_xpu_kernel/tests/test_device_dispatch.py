@@ -607,4 +607,11 @@ def test_b580_candidate_axes_are_explicit_and_route_local():
         cute_source
     )
     assert "B580H3VaeD64S1797CandidatePolicy" in kernel_policy
+    assert "selection.physical_sku == omni_xpu::device::BmgSku::b580" in (
+        cute_source
+    )
+    assert "run_d128_tile<cutlass::half_t, 0, 128, 8, 0, 0, 64, 32>" in (
+        cute_source
+    )
+    assert "!selection.forced" in cute_source
     assert "B580CandidateKernelPolicy" in kernel_policy
