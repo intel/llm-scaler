@@ -44,6 +44,13 @@ COMPONENTS = (
         "adapters/norm.py",
     ),
     Component(
+        "h3_rms_modulation_adapter",
+        "h3_rms_modulation",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/h3_rms_modulation.py",
+    ),
+    Component(
         "fp8_model_adapter",
         "fp8_gemm",
         "adapter",

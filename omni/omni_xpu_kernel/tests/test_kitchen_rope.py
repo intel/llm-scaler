@@ -253,7 +253,7 @@ def test_h3_packed_qkv_partial_rms_rope_inplace():
     torch.testing.assert_close(k_out, k_expected, rtol=0.02, atol=0.02)
 
 
-@pytest.mark.parametrize("sequence", [31, 388, 1025])
+@pytest.mark.parametrize("sequence", [31, 388, 1025, 15787])
 def test_h3_bmg_bf16_scale_cached_rms_rope_matches_generic(sequence):
     if not torch.xpu.is_available():
         pytest.skip("XPU is unavailable")
