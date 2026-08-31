@@ -30,12 +30,17 @@ FROM ubuntu:24.04 AS rust-build
 ARG VLLM_VERSION=v0.26.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    CARGO_BUILD_JOBS=4
+    CARGO_BUILD_JOBS=4 \
+    VIRTUAL_ENV=/opt/rust-venv \
+    PATH="/opt/rust-venv/bin:${PATH}"
 
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
-        ca-certificates curl git build-essential unzip python3 python3-pip && \
+        ca-certificates curl git build-essential unzip \
+        python3 python3-pip python3-venv && \
     rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv ${VIRTUAL_ENV}
 
 RUN git clone --depth 1 --branch "${VLLM_VERSION}" \
         https://github.com/vllm-project/vllm.git /workspace/vllm
