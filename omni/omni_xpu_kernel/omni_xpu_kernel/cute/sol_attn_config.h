@@ -13,6 +13,13 @@
 #define SOL_ATTN_SUBGROUP_LAYOUT_Q 32
 #define SOL_ATTN_GRF_SIZE 256
 
+// Physical Arc B580 keeps the same route/cache policy but uses the smaller
+// query tile admitted by the local multi-shape and real-activation gates.
+// Other BMG products retain the packaged default above.
+#define SOL_ATTN_B580_Q_TILE 128
+#define SOL_ATTN_B580_SUBGROUP_LAYOUT_Q 16
+#define SOL_ATTN_B580_GRF_SIZE 256
+
 #define SOL_ATTN_INLINE_ROUTE 1
 #define SOL_ATTN_SHARED_INLINE_ROUTE 1
 #define SOL_ATTN_PREFETCH_ROUTED_KV 1

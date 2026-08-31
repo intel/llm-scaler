@@ -34,6 +34,7 @@
 
 #include "sol_attn_config.h"
 #include "sol_attn_mainloop.hpp"
+#include "../csrc/device_utils.h"
 
 namespace omni_xpu_sol_attn::cute_backend {
 
@@ -49,6 +50,18 @@ using namespace cute;
 
 #ifndef SOL_ATTN_GRF_SIZE
 #define SOL_ATTN_GRF_SIZE 256
+#endif
+
+#ifndef SOL_ATTN_B580_Q_TILE
+#define SOL_ATTN_B580_Q_TILE 128
+#endif
+
+#ifndef SOL_ATTN_B580_SUBGROUP_LAYOUT_Q
+#define SOL_ATTN_B580_SUBGROUP_LAYOUT_Q 16
+#endif
+
+#ifndef SOL_ATTN_B580_GRF_SIZE
+#define SOL_ATTN_B580_GRF_SIZE 256
 #endif
 
 #ifndef SOL_ATTN_NESTED_EXACT
@@ -187,22 +200,39 @@ struct SolPairedQ256TileScheduler {
 };
 #endif
 
+template <int QTile_, int SubgroupLayoutQ_, int GrfSize_>
+struct SolTilePolicy {
+  static constexpr int QTile = QTile_;
+  static constexpr int SubgroupLayoutQ = SubgroupLayoutQ_;
+  static constexpr int GrfSize = GrfSize_;
+};
+
+using SolConfiguredTilePolicy = SolTilePolicy<
+    SOL_ATTN_Q_TILE,
+    SOL_ATTN_SUBGROUP_LAYOUT_Q,
+    SOL_ATTN_GRF_SIZE>;
+using SolB580TilePolicy = SolTilePolicy<
+    SOL_ATTN_B580_Q_TILE,
+    SOL_ATTN_B580_SUBGROUP_LAYOUT_Q,
+    SOL_ATTN_B580_GRF_SIZE>;
+
 template <
     typename Element,
+    typename TilePolicy,
     bool CacheableExactKV = (SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS != 0),
     bool ParallelSharedRoute =
         (SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE != 0),
     bool CrossQueryRouteColumns =
         (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0)>
 struct SolKernel {
-  static constexpr int QTile = SOL_ATTN_Q_TILE;
+  static constexpr int QTile = TilePolicy::QTile;
   static constexpr int KvTile = 64;
   static constexpr int VTile = 32;
   static constexpr int MmaK = 16;
   static constexpr int HeadDim = 128;
-  static constexpr int SubgroupLayoutQ = SOL_ATTN_SUBGROUP_LAYOUT_Q;
+  static constexpr int SubgroupLayoutQ = TilePolicy::SubgroupLayoutQ;
   static constexpr int PipelineStages = 1;
-  static constexpr int GrfSize = SOL_ATTN_GRF_SIZE;
+  static constexpr int GrfSize = TilePolicy::GrfSize;
 
   static_assert(QTile % 64 == 0,
                 "Sol-Attn Q tile must contain whole Q64 route blocks");
@@ -280,6 +310,7 @@ struct SolKernel {
 
 template <
     typename Element,
+    typename TilePolicy,
     bool CacheableExactKV,
     bool ParallelSharedRoute,
     bool CrossQueryRouteColumns,
@@ -301,6 +332,7 @@ void run(
     float scale) {
   using KT = SolKernel<
       Element,
+      TilePolicy,
       CacheableExactKV,
       ParallelSharedRoute,
       CrossQueryRouteColumns>;
@@ -390,6 +422,7 @@ void run(
 }
 
 template <
+    typename TilePolicy,
     bool CacheableExactKV,
     bool ParallelSharedRoute,
     bool CrossQueryRouteColumns,
@@ -461,6 +494,7 @@ at::Tensor forward_cute_impl(
   auto output = at::empty(q.sizes(), q.options());
   run<
       cutlass::bfloat16_t,
+      TilePolicy,
       CacheableExactKV,
       ParallelSharedRoute,
       CrossQueryRouteColumns,
@@ -474,6 +508,14 @@ at::Tensor forward_cute_impl(
       output,
       static_cast<float>(scale_value));
   return output;
+}
+
+bool use_b580_tile_policy(const at::Tensor& q) {
+  TORCH_CHECK(q.device().is_xpu(),
+              "Sol-Attn CUTE requires Q on an XPU device");
+  auto& queue = c10::xpu::getCurrentXPUStream(q.device().index()).queue();
+  return omni_xpu::device::get_bmg_selection_unwarned(queue).physical_sku ==
+      omni_xpu::device::BmgSku::b580;
 }
 
 at::Tensor forward_cute(
@@ -490,7 +532,23 @@ at::Tensor forward_cute(
     const at::Tensor& routes,
 #endif
     double scale_value) {
+  if (use_b580_tile_policy(q)) {
+    return forward_cute_impl<
+        SolB580TilePolicy,
+        (SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS != 0),
+        (SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE != 0),
+        (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0),
+        false>(
+        q, k, v, k_centroids, v_means,
+#if SOL_ATTN_INLINE_ROUTE
+        q_centroids, thresholds, key_sinks,
+#else
+        routes,
+#endif
+        scale_value);
+  }
   return forward_cute_impl<
+      SolConfiguredTilePolicy,
       (SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS != 0),
       (SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE != 0),
       (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0),
@@ -519,7 +577,23 @@ at::Tensor forward_cute_parent(
     const at::Tensor& routes,
 #endif
     double scale_value) {
+  if (use_b580_tile_policy(q)) {
+    return forward_cute_impl<
+        SolB580TilePolicy,
+        false,
+        (SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE != 0),
+        (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0),
+        true>(
+        q, k, v, k_centroids, v_means,
+#if SOL_ATTN_INLINE_ROUTE
+        q_centroids, thresholds, key_sinks,
+#else
+        routes,
+#endif
+        scale_value);
+  }
   return forward_cute_impl<
+      SolConfiguredTilePolicy,
       false,
       (SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE != 0),
       (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0),
@@ -549,7 +623,23 @@ at::Tensor forward_cute_serial_route_parent(
     const at::Tensor& routes,
 #endif
     double scale_value) {
+  if (use_b580_tile_policy(q)) {
+    return forward_cute_impl<
+        SolB580TilePolicy,
+        (SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS != 0),
+        false,
+        false,
+        true>(
+        q, k, v, k_centroids, v_means,
+#if SOL_ATTN_INLINE_ROUTE
+        q_centroids, thresholds, key_sinks,
+#else
+        routes,
+#endif
+        scale_value);
+  }
   return forward_cute_impl<
+      SolConfiguredTilePolicy,
       (SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS != 0),
       false,
       false,
