@@ -94,17 +94,25 @@ def test_sol_attn_rejects_malformed_sink_ranges(monkeypatch):
         cute.sol_attn(q, object(), object(), sink_blocks=(0,))
 
 
-def test_sol_attn_b580_tile_policy_is_physical_device_local():
+def test_sol_attn_b580_tile_policy_requires_unforced_physical_device():
     config = SOL_CONFIG.read_text(encoding="utf-8")
     wrapper = SOL_WRAPPER.read_text(encoding="utf-8")
+    compact = "".join(wrapper.split())
 
     assert "#define SOL_ATTN_Q_TILE 256" in config
     assert "#define SOL_ATTN_SUBGROUP_LAYOUT_Q 32" in config
     assert "#define SOL_ATTN_B580_Q_TILE 128" in config
     assert "#define SOL_ATTN_B580_SUBGROUP_LAYOUT_Q 16" in config
     assert "#define SOL_ATTN_B580_GRF_SIZE 256" in config
-    assert "get_bmg_selection_unwarned(queue).physical_sku" in wrapper
-    assert "omni_xpu::device::BmgSku::b580" in wrapper
+    assert (
+        "constautoselection="
+        "omni_xpu::device::get_bmg_selection_unwarned(queue);"
+    ) in compact
+    assert (
+        "returnselection.physical_sku=="
+        "omni_xpu::device::BmgSku::b580&&!selection.forced;"
+    ) in compact
+    assert "get_bmg_selection_unwarned(queue).physical_sku" not in wrapper
     assert wrapper.count("if (use_b580_tile_policy(q))") == 3
     assert "SolConfiguredTilePolicy" in wrapper
     assert "SolB580TilePolicy" in wrapper

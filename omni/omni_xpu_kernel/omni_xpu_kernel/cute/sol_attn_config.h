@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Production Sol-Attn policy admitted by the BMG kernel and canonical
-// workflow gates. Experimental alternatives remain in omni-xpu-kernel-tuning.
+// workflow gates.
 #pragma once
 
 #if !defined(OMNI_XPU_ARCH_BMG) || defined(OMNI_XPU_ARCH_PTL_H)

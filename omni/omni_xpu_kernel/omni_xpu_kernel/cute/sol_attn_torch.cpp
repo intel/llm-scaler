@@ -514,8 +514,10 @@ bool use_b580_tile_policy(const at::Tensor& q) {
   TORCH_CHECK(q.device().is_xpu(),
               "Sol-Attn CUTE requires Q on an XPU device");
   auto& queue = c10::xpu::getCurrentXPUStream(q.device().index()).queue();
-  return omni_xpu::device::get_bmg_selection_unwarned(queue).physical_sku ==
-      omni_xpu::device::BmgSku::b580;
+  const auto selection =
+      omni_xpu::device::get_bmg_selection_unwarned(queue);
+  return selection.physical_sku == omni_xpu::device::BmgSku::b580 &&
+      !selection.forced;
 }
 
 at::Tensor forward_cute(

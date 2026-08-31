@@ -455,8 +455,9 @@ void launch_minimax_h3_rms_rope_b580(
 
 bool use_b580_h3_rms_rope(const torch::Tensor& q) {
     auto& queue = utils::get_queue(q.device());
-    return device::get_bmg_selection_unwarned(queue).physical_sku ==
-        device::BmgSku::b580;
+    const auto selection = device::get_bmg_selection_unwarned(queue);
+    return selection.physical_sku == device::BmgSku::b580 &&
+        !selection.forced;
 }
 #endif
 

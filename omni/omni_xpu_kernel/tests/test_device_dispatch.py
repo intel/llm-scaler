@@ -280,17 +280,24 @@ def test_tuning_override_nondefaults_compile(tmp_path):
     subprocess.run([str(executable)], check=True)
 
 
-def test_h3_rms_rope_b580_head_reuse_is_physical_device_local():
+def test_h3_rms_rope_b580_head_reuse_requires_unforced_physical_device():
     package_root = Path(__file__).resolve().parents[1]
     source = (
         package_root / "omni_xpu_kernel/csrc/kitchen_rms_rope_sycl.cpp"
     ).read_text(encoding="utf-8")
+    compact = "".join(source.split())
 
     assert "launch_minimax_h3_rms_rope_b580" in source
     assert "constexpr int64_t HeadsPerGroup = 7" in source
     assert "for (int operand = 0; operand < 2; ++operand)" in source
-    assert "get_bmg_selection_unwarned(queue).physical_sku" in source
-    assert "device::BmgSku::b580" in source
+    assert (
+        "constautoselection=device::get_bmg_selection_unwarned(queue);"
+    ) in compact
+    assert (
+        "returnselection.physical_sku==device::BmgSku::b580&&"
+        "!selection.forced;"
+    ) in compact
+    assert "get_bmg_selection_unwarned(queue).physical_sku" not in source
     assert "if (use_b580_h3_rms_rope(q))" in source
 
 
@@ -399,6 +406,30 @@ def test_device_independent_native_selection_compiles_and_runs(tmp_path):
             assert(generic.effective_sku == BmgSku::unknown);
             assert(generic.kernel_profile == BmgKernelProfile::generic_bmg);
             assert(generic.forced);
+
+            const auto b580_forced_b60 =
+                resolve_bmg_selection(kArcB580, "b60");
+            assert(b580_forced_b60.physical_sku == BmgSku::b580);
+            assert(b580_forced_b60.effective_sku == BmgSku::b60);
+            assert(b580_forced_b60.kernel_profile ==
+                   BmgKernelProfile::b60);
+            assert(b580_forced_b60.forced);
+
+            const auto b580_forced_b70 =
+                resolve_bmg_selection(kArcB580, "b70");
+            assert(b580_forced_b70.physical_sku == BmgSku::b580);
+            assert(b580_forced_b70.effective_sku == BmgSku::b70);
+            assert(b580_forced_b70.kernel_profile ==
+                   BmgKernelProfile::b70);
+            assert(b580_forced_b70.forced);
+
+            const auto b580_forced_generic =
+                resolve_bmg_selection(kArcB580, "generic");
+            assert(b580_forced_generic.physical_sku == BmgSku::b580);
+            assert(b580_forced_generic.effective_sku == BmgSku::unknown);
+            assert(b580_forced_generic.kernel_profile ==
+                   BmgKernelProfile::generic_bmg);
+            assert(b580_forced_generic.forced);
 
             bool rejected = false;
             try {
