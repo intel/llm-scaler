@@ -108,10 +108,14 @@ static CachedPrimitive& get_or_create_primitive(
 
     std::string impl_info = pd.impl_info_str();
     const char* tag = use_sum_postop ? "onednn_int4_gemm_sum" : "onednn_int4_gemm";
-    fprintf(stderr, "[%s] CACHE MISS: impl=%s (M=%ld K=%ld N=%ld gs=%ld)\n",
-            tag, impl_info.c_str(), M, K, N, group_size);
-    if (impl_info.find("ref") != std::string::npos) {
-        fprintf(stderr, "[%s] WARNING: reference fallback (slow)\n", tag);
+    // Primitive cache misses are expected during warm-up (one per new shape).
+    // Print only when requested: OMNI_XPU_DEBUG=gemm (or =1 / =all).
+    if (omni_xpu::debug::is_enabled("gemm")) {
+        fprintf(stderr, "[%s] CACHE MISS: impl=%s (M=%ld K=%ld N=%ld gs=%ld)\n",
+                tag, impl_info.c_str(), M, K, N, group_size);
+        if (impl_info.find("ref") != std::string::npos) {
+            fprintf(stderr, "[%s] WARNING: reference fallback (slow)\n", tag);
+        }
     }
 
     cp.prim = dnnl::matmul(pd);
@@ -189,10 +193,14 @@ static CachedPrimitive& get_or_create_primitive_zp(
     dnnl::matmul::primitive_desc pd(cp.eng, cp.src_md, cp.wei_md, cp.dst_md, attr);
 
     std::string impl_info = pd.impl_info_str();
-    fprintf(stderr, "[onednn_int4_gemm_zp] CACHE MISS: impl=%s (M=%ld K=%ld N=%ld gs=%ld)\n",
-            impl_info.c_str(), M, K, N, group_size);
-    if (impl_info.find("ref") != std::string::npos) {
-        fprintf(stderr, "[onednn_int4_gemm_zp] WARNING: reference fallback (slow)\n");
+    // Primitive cache misses are expected during warm-up (one per new shape).
+    // Print only when requested: OMNI_XPU_DEBUG=gemm (or =1 / =all).
+    if (omni_xpu::debug::is_enabled("gemm")) {
+        fprintf(stderr, "[onednn_int4_gemm_zp] CACHE MISS: impl=%s (M=%ld K=%ld N=%ld gs=%ld)\n",
+                impl_info.c_str(), M, K, N, group_size);
+        if (impl_info.find("ref") != std::string::npos) {
+            fprintf(stderr, "[onednn_int4_gemm_zp] WARNING: reference fallback (slow)\n");
+        }
     }
 
     cp.prim = dnnl::matmul(pd);
@@ -335,6 +343,7 @@ torch::Tensor onednn_int4_gemm_preconverted(
         TORCH_CHECK(zpt.scalar_type() == torch::kUInt8, "zp_u8 must be uint8");
         TORCH_CHECK(zpt.size(0) == num_groups && zpt.size(1) == N,
                     "zp_u8 must be [G, N] = [", num_groups, ", ", N, "]");
+        TORCH_CHECK(zpt.device().is_xpu(), "zp_u8 must be on XPU device");
         switch (act_c.scalar_type()) {
             case torch::kBFloat16:
                 onednn_int4_gemm_zp_kernel<dnnl::memory::data_type::bf16>(
