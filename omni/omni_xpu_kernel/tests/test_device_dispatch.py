@@ -280,6 +280,20 @@ def test_tuning_override_nondefaults_compile(tmp_path):
     subprocess.run([str(executable)], check=True)
 
 
+def test_h3_rms_rope_b580_head_reuse_is_physical_device_local():
+    package_root = Path(__file__).resolve().parents[1]
+    source = (
+        package_root / "omni_xpu_kernel/csrc/kitchen_rms_rope_sycl.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert "launch_minimax_h3_rms_rope_b580" in source
+    assert "constexpr int64_t HeadsPerGroup = 7" in source
+    assert "for (int operand = 0; operand < 2; ++operand)" in source
+    assert "get_bmg_selection_unwarned(queue).physical_sku" in source
+    assert "device::BmgSku::b580" in source
+    assert "if (use_b580_h3_rms_rope(q))" in source
+
+
 def test_device_independent_native_selection_compiles_and_runs(tmp_path):
     compiler = shutil.which("c++") or shutil.which("g++")
     if compiler is None:

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "device_utils.h"
 #include "kernel_tuning_overrides.h"
 #include "utils.h"
 
@@ -314,6 +315,149 @@ void launch_minimax_h3_rms_rope(
     utils::submit_kernel(
         cgf, q.device(), "kitchen_rms_rope_h3_cached_input_bmg");
 }
+
+void launch_minimax_h3_rms_rope_b580(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& freqs,
+    const torch::Tensor& q_scale,
+    const torch::Tensor& k_scale,
+    float epsilon) {
+    constexpr int64_t HeadsPerGroup = 7;
+    constexpr int64_t HeadBlocks = H3_HEADS / HeadsPerGroup;
+    static_assert(H3_HEADS % HeadsPerGroup == 0);
+    const auto* q_ptr = reinterpret_cast<const bf16*>(q.data_ptr());
+    const auto* k_ptr = reinterpret_cast<const bf16*>(k.data_ptr());
+    const auto* f_ptr = reinterpret_cast<const bf16*>(freqs.data_ptr());
+    const auto* qs_ptr = reinterpret_cast<const bf16*>(q_scale.data_ptr());
+    const auto* ks_ptr = reinterpret_cast<const bf16*>(k_scale.data_ptr());
+    auto* qo_ptr = reinterpret_cast<bf16*>(q.data_ptr());
+    auto* ko_ptr = reinterpret_cast<bf16*>(k.data_ptr());
+    const int64_t total_groups = q.size(1) * HeadBlocks;
+
+    auto cgf = [&](sycl::handler& handler) {
+        sycl::local_accessor<float, 1> partial(
+            sycl::range<1>(RMS_ROPE_WG), handler);
+        sycl::local_accessor<float, 1> pair_second(
+            sycl::range<1>(H3_ROTARY_PAIRS), handler);
+        handler.parallel_for(
+            sycl::nd_range<1>(
+                sycl::range<1>(
+                    static_cast<size_t>(total_groups * RMS_ROPE_WG)),
+                sycl::range<1>(RMS_ROPE_WG)),
+            [=](sycl::nd_item<1> item) {
+                const int64_t local = item.get_local_id(0);
+                const int64_t group = item.get_group(0);
+                const int64_t token = group / HeadBlocks;
+                const int64_t head_begin =
+                    (group - token * HeadBlocks) * HeadsPerGroup;
+
+                // Frequencies are identical across all 56 heads and both Q/K
+                // operands for one token. Keep one copy per work-item while
+                // processing a seven-head block and both operands.
+                float f00 = 0.0f;
+                float f01 = 0.0f;
+                float f10 = 0.0f;
+                float f11 = 0.0f;
+                if (local < H3_ROTARY_PAIRS) {
+                    const int64_t freq_base =
+                        token * H3_ROTARY_PAIRS * 4 + local * 4;
+                    f00 = static_cast<float>(f_ptr[freq_base]);
+                    f01 = static_cast<float>(f_ptr[freq_base + 1]);
+                    f10 = static_cast<float>(f_ptr[freq_base + 2]);
+                    f11 = static_cast<float>(f_ptr[freq_base + 3]);
+                }
+
+                for (int operand = 0; operand < 2; ++operand) {
+                    const bool is_key = operand == 1;
+                    const bf16* source = is_key ? k_ptr : q_ptr;
+                    bf16* destination = is_key ? ko_ptr : qo_ptr;
+                    const bf16* scale = is_key ? ks_ptr : qs_ptr;
+                    const float scale_low = local < H3_ROTARY_PAIRS
+                        ? static_cast<float>(scale[local])
+                        : 0.0f;
+                    const float scale_second = local < H3_ROTARY_PAIRS
+                        ? static_cast<float>(
+                              scale[H3_ROTARY_PAIRS + local])
+                        : 0.0f;
+                    const float scale_tail =
+                        local >= H3_ROT_DIM - RMS_ROPE_WG
+                        ? static_cast<float>(scale[RMS_ROPE_WG + local])
+                        : 0.0f;
+
+#pragma unroll
+                    for (int head_offset = 0;
+                         head_offset < HeadsPerGroup;
+                         ++head_offset) {
+                        const int64_t head = head_begin + head_offset;
+                        const int64_t base =
+                            token * H3_PACKED_SEQUENCE_STRIDE +
+                            head * H3_HEAD_DIM;
+                        const float value0 =
+                            static_cast<float>(source[base + local]);
+                        const float value1 = static_cast<float>(
+                            source[base + local + RMS_ROPE_WG]);
+                        float square_sum = value0 * value0;
+                        square_sum += value1 * value1;
+                        partial[local] = square_sum;
+                        if (local >= H3_ROTARY_PAIRS) {
+                            pair_second[local - H3_ROTARY_PAIRS] = value0;
+                        } else if (local < 32) {
+                            pair_second[16 + local] = value1;
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+
+#pragma unroll
+                        for (int64_t width = RMS_ROPE_WG / 2;
+                             width > 0;
+                             width /= 2) {
+                            if (local < width) {
+                                partial[local] += partial[local + width];
+                            }
+                            item.barrier(
+                                sycl::access::fence_space::local_space);
+                        }
+                        const float inverse_rms =
+                            sycl::rsqrt(
+                                partial[0] / H3_HEAD_DIM + epsilon);
+
+                        if (local < H3_ROTARY_PAIRS) {
+                            const int64_t col0 = local;
+                            const int64_t col1 = H3_ROTARY_PAIRS + local;
+                            const bf16 normalized0 = static_cast<bf16>(
+                                value0 * inverse_rms * scale_low);
+                            const bf16 normalized1 = static_cast<bf16>(
+                                pair_second[local] * inverse_rms *
+                                scale_second);
+                            const float rotated0 =
+                                static_cast<float>(normalized0);
+                            const float rotated1 =
+                                static_cast<float>(normalized1);
+                            destination[base + col0] = static_cast<bf16>(
+                                f00 * rotated0 + f01 * rotated1);
+                            destination[base + col1] = static_cast<bf16>(
+                                f10 * rotated0 + f11 * rotated1);
+                        }
+                        if (local >= H3_ROT_DIM - RMS_ROPE_WG) {
+                            const int64_t col = RMS_ROPE_WG + local;
+                            destination[base + col] = static_cast<bf16>(
+                                value1 * inverse_rms * scale_tail);
+                        }
+                        item.barrier(
+                            sycl::access::fence_space::local_space);
+                    }
+                }
+            });
+    };
+    utils::submit_kernel(
+        cgf, q.device(), "kitchen_rms_rope_h3_b580_qk_head7");
+}
+
+bool use_b580_h3_rms_rope(const torch::Tensor& q) {
+    auto& queue = utils::get_queue(q.device());
+    return device::get_bmg_selection_unwarned(queue).physical_sku ==
+        device::BmgSku::b580;
+}
 #endif
 
 template <typename InputT, typename FreqT, bool SplitHalf, bool Pair>
@@ -566,9 +710,15 @@ std::tuple<torch::Tensor, torch::Tensor> rms_kitchen_rope(
     if (is_minimax_h3_rms_rope_contract(
             q, k, freqs_cis, q_scale, k_scale, rot_dim,
             split_half, inplace)) {
-        launch_minimax_h3_rms_rope(
-            q, k, freqs_cis, q_scale, k_scale,
-            static_cast<float>(epsilon));
+        if (use_b580_h3_rms_rope(q)) {
+            launch_minimax_h3_rms_rope_b580(
+                q, k, freqs_cis, q_scale, k_scale,
+                static_cast<float>(epsilon));
+        } else {
+            launch_minimax_h3_rms_rope(
+                q, k, freqs_cis, q_scale, k_scale,
+                static_cast<float>(epsilon));
+        }
         return {q_out, k_out};
     }
 #endif
