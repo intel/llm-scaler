@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import omni_xpu_kernel
+import pytest
 
 
 def test_native_capabilities_is_empty_when_extension_is_unavailable(monkeypatch):
@@ -45,6 +46,45 @@ def test_norm_h120_capability_is_false_for_legacy_binary(monkeypatch):
 
     monkeypatch.setattr(norm, "_get_native", lambda: SimpleNamespace())
     assert norm.supports_h120_fp16() is False
+
+
+def test_b580_h3_rms_modulation_capability_and_wrapper(monkeypatch):
+    from omni_xpu_kernel import norm
+
+    calls = []
+    native = SimpleNamespace(
+        __rms_norm_modulate_b580__=True,
+        rms_norm_modulate_b580=lambda *args: calls.append(args) or "output",
+    )
+    monkeypatch.setattr(norm, "_get_native", lambda: native)
+    tensors = [object() for _ in range(4)]
+    segments = [(0, 3, 2), (3, 7, 0)]
+
+    assert norm.supports_rms_norm_modulate_b580() is True
+    assert norm.rms_norm_modulate_b580(
+        *tensors, segments, eps=1e-5
+    ) == "output"
+    assert calls == [
+        (
+            *tensors,
+            [0, 3],
+            [3, 7],
+            [2, 0],
+            1e-5,
+        )
+    ]
+
+
+def test_b580_h3_rms_modulation_rejects_non_integer_segments(monkeypatch):
+    from omni_xpu_kernel import norm
+
+    monkeypatch.setattr(norm, "_get_native", lambda: SimpleNamespace())
+    with pytest.raises(TypeError, match="Python integers"):
+        norm.rms_norm_modulate_b580(
+            object(), object(), object(), object(), [(0, 7, True)]
+        )
+
+    assert norm.supports_rms_norm_modulate_b580() is False
 
 
 def test_layout_cat_pad_capability_comes_from_loaded_binary(monkeypatch):

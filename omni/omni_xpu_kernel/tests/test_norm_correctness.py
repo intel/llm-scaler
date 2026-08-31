@@ -167,6 +167,57 @@ class TestRMSNormCorrectness:
         assert mismatches <= max(4, actual.numel() // 200_000)
         assert float(difference.max().item()) <= 0.0625
 
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    @pytest.mark.parametrize("rows", [17, 129])
+    def test_rms_norm_modulate_b580_is_bit_exact(self, rows):
+        """Validate the physical-B580 H3 packed AdaLN view contract."""
+        from omni_xpu_kernel import device, norm
+
+        if not norm.supports_rms_norm_modulate_b580():
+            pytest.skip("loaded binary does not contain the B580 H3 route")
+        observed = device.info(torch.xpu.current_device())
+        if (
+            observed.get("physical_bmg_sku") != "b580"
+            or observed.get("sku_forced") is not False
+        ):
+            pytest.skip("an unforced physical B580 is required")
+
+        generator = torch.Generator(device="xpu").manual_seed(5376 + rows)
+        value = torch.randn(
+            rows,
+            5376,
+            device="xpu",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        weight = torch.randn(
+            5376,
+            device="xpu",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        packed = torch.randn(
+            3,
+            6 * 5376,
+            device="xpu",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        shift, scale, *_unused = packed.chunk(6, dim=-1)
+        segments = [(0, 3, 0), (3, 8, 1), (8, rows, 2)]
+
+        expected = norm.rms_norm(weight, value, eps=1e-6)
+        for start, stop, row in segments:
+            expected[start:stop].mul_(1.0 + scale[row]).add_(shift[row])
+        actual = norm.rms_norm_modulate_b580(
+            weight, value, scale, shift, segments, eps=1e-6
+        )
+
+        assert scale.stride() == (6 * 5376, 1)
+        assert shift.stride() == (6 * 5376, 1)
+        assert torch.isfinite(actual).all()
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
 
 class TestGroupNormBMGCorrectness:
     """Correctness tests for the exact BMG Boogu GroupNorm route."""

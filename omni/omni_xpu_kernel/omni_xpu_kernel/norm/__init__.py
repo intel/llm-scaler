@@ -15,7 +15,7 @@ Example:
 """
 
 import torch
-from typing import Optional
+from typing import Optional, Sequence
 
 
 def _get_native():
@@ -39,6 +39,13 @@ def supports_group_norm_seedvr_bmg() -> bool:
     """Return whether the native binary contains the SeedVR BMG route."""
     return bool(
         getattr(_get_native(), "__group_norm_seedvr_bmg__", False)
+    )
+
+
+def supports_rms_norm_modulate_b580() -> bool:
+    """Return whether the native binary contains the B580 H3 fused route."""
+    return bool(
+        getattr(_get_native(), "__rms_norm_modulate_b580__", False)
     )
 
 
@@ -98,6 +105,51 @@ def rms_norm(
         - Supports fp32, fp16, bf16
     """
     return _get_native().rms_norm(weight, input, eps)
+
+
+def rms_norm_modulate_b580(
+    weight: torch.Tensor,
+    input: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    segments: Sequence[tuple[int, int, int]],
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Fuse the exact MiniMax H3 RMSNorm and segmented modulation on B580.
+
+    This route preserves BF16 materialization after RMSNorm, ``1 + scale``,
+    multiplication, and shift addition. ``segments`` must contain one to eight
+    ordered contiguous ``(start, stop, modulation_row)`` integer triples that
+    cover the complete contiguous BF16 ``[S,5376]`` input. Scale and shift may
+    be row-strided ``[modulation_rows,5376]`` views.
+
+    The native implementation independently requires an unforced physical
+    B580. Callers must retain their normal fallback for every other contract.
+    """
+    starts = []
+    stops = []
+    modulation_rows = []
+    for segment in segments:
+        if not isinstance(segment, (tuple, list)) or len(segment) != 3:
+            raise TypeError(
+                "segments must contain (start, stop, modulation_row) triples"
+            )
+        if any(type(value) is not int for value in segment):
+            raise TypeError("segment values must be Python integers")
+        start, stop, modulation_row = segment
+        starts.append(start)
+        stops.append(stop)
+        modulation_rows.append(modulation_row)
+    return _get_native().rms_norm_modulate_b580(
+        weight,
+        input,
+        scale,
+        shift,
+        starts,
+        stops,
+        modulation_rows,
+        eps,
+    )
 
 
 def rms_norm_gate_residual(
@@ -233,6 +285,7 @@ __all__ = [
     "group_norm_bmg",
     "group_norm_seedvr_bmg",
     "rms_norm",
+    "rms_norm_modulate_b580",
     "rms_norm_gate_residual",
     "layer_norm",
     "fused_add_rms_norm",
@@ -241,4 +294,5 @@ __all__ = [
     "fused_rms_adaln",
     "supports_group_norm_bmg",
     "supports_group_norm_seedvr_bmg",
+    "supports_rms_norm_modulate_b580",
 ]
