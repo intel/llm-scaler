@@ -186,7 +186,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update -y && \
     apt-get install -y --no-install-recommends --fix-missing \
         ffmpeg libsndfile1 libsm6 libxext6 libgl1 numactl curl \
-        python3-venv python3-pip && \
+        python3-dev python3-venv python3-pip && \
     rm -rf /var/lib/apt/lists/* && \
     python3 -m venv ${VIRTUAL_ENV} && \
     pip install --upgrade pip wheel setuptools && \
