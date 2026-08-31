@@ -198,13 +198,28 @@ static void validate_query_start_loc(
                 name, " last entry must equal input token count");
 }
 
+static void validate_null_block_id(
+    int64_t state_slots,
+    int64_t null_block_id) {
+    TORCH_CHECK(null_block_id < 0 || null_block_id >= state_slots,
+                "null_block_id must not identify a real state slot");
+}
+
+static void validate_trusted_null_block_id(
+    int64_t state_slots,
+    int64_t null_block_id) {
+    TORCH_CHECK(null_block_id == 0 || null_block_id < 0 ||
+                    null_block_id >= state_slots,
+                "trusted null_block_id must be reserved slot 0 or outside "
+                "the state slot range");
+}
+
 static void validate_unique_state_indices(
     const at::Tensor& state_indices,
     int64_t state_slots,
     int64_t null_block_id) {
     const auto indices = copy_index_values(state_indices);
-    TORCH_CHECK(null_block_id < 0 || null_block_id >= state_slots,
-                "null_block_id must not identify a real state slot");
+    validate_null_block_id(state_slots, null_block_id);
     std::unordered_set<int64_t> seen;
     for (const int64_t index : indices) {
         if (index == null_block_id) {
@@ -722,7 +737,7 @@ static inline void check_state_common(
     const at::Tensor& conv_state,
     const at::Tensor& conv_weights,
     const at::Tensor& state_indices,
-    const at::Tensor& has_initial_state,
+    const at::Tensor* has_initial_state,
     const at::Tensor& output,
     int64_t dilation,
     bool state_dim_first,
@@ -734,14 +749,18 @@ static inline void check_state_common(
     check_contiguous(input, "input");
     check_half(input, conv_weights, "conv_weights");
     check_index_tensor(input, state_indices, "state_indices");
-    check_same_xpu(input, has_initial_state, "has_initial_state");
-    TORCH_CHECK(has_initial_state.scalar_type() == at::kBool &&
-                    has_initial_state.dim() == 1 && has_initial_state.is_contiguous(),
-                "has_initial_state must be contiguous bool [rows]");
+    if (has_initial_state != nullptr) {
+        check_same_xpu(input, *has_initial_state, "has_initial_state");
+        TORCH_CHECK(has_initial_state->scalar_type() == at::kBool &&
+                        has_initial_state->dim() == 1 &&
+                        has_initial_state->is_contiguous(),
+                    "has_initial_state must be contiguous bool [rows]");
+    }
     check_output(input, output, "output");
     TORCH_CHECK(!output.is_alias_of(conv_weights) &&
                     !output.is_alias_of(state_indices) &&
-                    !output.is_alias_of(has_initial_state),
+                    (has_initial_state == nullptr ||
+                     !output.is_alias_of(*has_initial_state)),
                 "output must not share storage with metadata or conv_weights");
     TORCH_CHECK(conv_weights.dim() == 2 && conv_weights.size(0) == input.size(1) &&
                     conv_weights.size(1) >= 1,
@@ -765,14 +784,16 @@ static inline void check_state_common(
     TORCH_CHECK(!conv_state.is_alias_of(input) &&
                     !conv_state.is_alias_of(conv_weights) &&
                     !conv_state.is_alias_of(state_indices) &&
-                    !conv_state.is_alias_of(has_initial_state) &&
+                    (has_initial_state == nullptr ||
+                     !conv_state.is_alias_of(*has_initial_state)) &&
                     !conv_state.is_alias_of(output),
                 "conv_state must not share storage with other inputs/output");
     const bool shape_ok = state_dim_first
         ? conv_state.size(1) == input.size(1) && conv_state.size(2) >= required_width
         : conv_state.size(2) == input.size(1) && conv_state.size(1) >= required_width;
     TORCH_CHECK(shape_ok, "conv_state shape/layout is incompatible with input and state width");
-    TORCH_CHECK(state_indices.numel() == has_initial_state.numel(),
+    TORCH_CHECK(has_initial_state == nullptr ||
+                    state_indices.numel() == has_initial_state->numel(),
                 "state_indices and has_initial_state lengths must match");
     TORCH_CHECK(output.sizes() == input.sizes(), "output must have the same shape as input");
     TORCH_CHECK(output.data_ptr() != conv_state.data_ptr(),
@@ -1098,7 +1119,7 @@ at::Tensor residual_add(
     return output;
 }
 
-at::Tensor short_conv_decode(
+static at::Tensor short_conv_decode_impl(
     at::Tensor input,
     at::Tensor conv_state,
     at::Tensor conv_weights,
@@ -1107,18 +1128,23 @@ at::Tensor short_conv_decode(
     at::Tensor output,
     int64_t dilation,
     bool state_dim_first,
-    int64_t null_block_id) {
+    int64_t null_block_id,
+    bool metadata_values_prevalidated) {
     TORCH_CHECK(conv_weights.dim() == 2,
                 "conv_weights must be rank 2");
     const int64_t state_len =
         checked_state_length(conv_weights.size(1), dilation);
     check_state_common(input, conv_state, conv_weights, state_indices,
-                       has_initial_state, output, dilation, state_dim_first,
+                       &has_initial_state, output, dilation, state_dim_first,
                        state_len);
     TORCH_CHECK(state_indices.numel() == input.size(0),
                 "decode state metadata must have one row per input token");
-    validate_unique_state_indices(state_indices, conv_state.size(0),
-                                  null_block_id);
+    if (metadata_values_prevalidated) {
+        validate_trusted_null_block_id(conv_state.size(0), null_block_id);
+    } else {
+        validate_unique_state_indices(state_indices, conv_state.size(0),
+                                      null_block_id);
+    }
     if (input.size(0) > 0) {
         if (conv_state.scalar_type() == at::kHalf) {
             if (state_indices.scalar_type() == at::kInt) {
@@ -1149,7 +1175,37 @@ at::Tensor short_conv_decode(
     return output;
 }
 
-at::Tensor short_conv_prefill(
+at::Tensor short_conv_decode(
+    at::Tensor input,
+    at::Tensor conv_state,
+    at::Tensor conv_weights,
+    at::Tensor state_indices,
+    at::Tensor has_initial_state,
+    at::Tensor output,
+    int64_t dilation,
+    bool state_dim_first,
+    int64_t null_block_id) {
+    return short_conv_decode_impl(
+        input, conv_state, conv_weights, state_indices, has_initial_state,
+        output, dilation, state_dim_first, null_block_id, false);
+}
+
+at::Tensor short_conv_decode_trusted(
+    at::Tensor input,
+    at::Tensor conv_state,
+    at::Tensor conv_weights,
+    at::Tensor state_indices,
+    at::Tensor has_initial_state,
+    at::Tensor output,
+    int64_t dilation,
+    bool state_dim_first,
+    int64_t null_block_id) {
+    return short_conv_decode_impl(
+        input, conv_state, conv_weights, state_indices, has_initial_state,
+        output, dilation, state_dim_first, null_block_id, true);
+}
+
+static at::Tensor short_conv_prefill_impl(
     at::Tensor input,
     at::Tensor query_start_loc,
     at::Tensor conv_state,
@@ -1159,23 +1215,31 @@ at::Tensor short_conv_prefill(
     at::Tensor output,
     int64_t dilation,
     bool state_dim_first,
-    int64_t null_block_id) {
+    int64_t null_block_id,
+    bool metadata_values_prevalidated) {
     TORCH_CHECK(conv_weights.dim() == 2,
                 "conv_weights must be rank 2");
     const int64_t state_len =
         checked_state_length(conv_weights.size(1), dilation);
     check_state_common(input, conv_state, conv_weights, state_indices,
-                       has_initial_state, output, dilation, state_dim_first,
+                       &has_initial_state, output, dilation, state_dim_first,
                        state_len);
     check_index_tensor(input, query_start_loc, "query_start_loc");
     TORCH_CHECK(!output.is_alias_of(query_start_loc) &&
                     !conv_state.is_alias_of(query_start_loc),
                 "state/output must not share storage with query_start_loc");
     const int64_t requests = state_indices.numel();
-    validate_query_start_loc(query_start_loc, requests, input.size(0),
-                             "query_start_loc");
-    validate_unique_state_indices(state_indices, conv_state.size(0),
-                                  null_block_id);
+    TORCH_CHECK(query_start_loc.dim() == 1 &&
+                    query_start_loc.numel() == requests + 1,
+                "query_start_loc must have exactly requests + 1 entries");
+    if (metadata_values_prevalidated) {
+        validate_trusted_null_block_id(conv_state.size(0), null_block_id);
+    } else {
+        validate_query_start_loc(query_start_loc, requests, input.size(0),
+                                 "query_start_loc");
+        validate_unique_state_indices(state_indices, conv_state.size(0),
+                                      null_block_id);
+    }
     if (requests > 0 && input.size(0) > 0) {
         const bool offsets_i32 = query_start_loc.scalar_type() == at::kInt;
         if (conv_state.scalar_type() == at::kHalf) {
@@ -1229,7 +1293,41 @@ at::Tensor short_conv_prefill(
     return output;
 }
 
-at::Tensor short_conv_spec(
+at::Tensor short_conv_prefill(
+    at::Tensor input,
+    at::Tensor query_start_loc,
+    at::Tensor conv_state,
+    at::Tensor conv_weights,
+    at::Tensor state_indices,
+    at::Tensor has_initial_state,
+    at::Tensor output,
+    int64_t dilation,
+    bool state_dim_first,
+    int64_t null_block_id) {
+    return short_conv_prefill_impl(
+        input, query_start_loc, conv_state, conv_weights, state_indices,
+        has_initial_state, output, dilation, state_dim_first, null_block_id,
+        false);
+}
+
+at::Tensor short_conv_prefill_trusted(
+    at::Tensor input,
+    at::Tensor query_start_loc,
+    at::Tensor conv_state,
+    at::Tensor conv_weights,
+    at::Tensor state_indices,
+    at::Tensor has_initial_state,
+    at::Tensor output,
+    int64_t dilation,
+    bool state_dim_first,
+    int64_t null_block_id) {
+    return short_conv_prefill_impl(
+        input, query_start_loc, conv_state, conv_weights, state_indices,
+        has_initial_state, output, dilation, state_dim_first, null_block_id,
+        true);
+}
+
+static at::Tensor short_conv_spec_impl(
     at::Tensor input,
     at::Tensor query_start_loc,
     at::Tensor conv_state,
@@ -1240,11 +1338,10 @@ at::Tensor short_conv_spec(
     int64_t num_spec_tokens,
     int64_t dilation,
     bool state_dim_first,
-    int64_t null_block_id) {
+    int64_t null_block_id,
+    bool metadata_values_prevalidated) {
     TORCH_CHECK(num_spec_tokens >= 0 && num_spec_tokens <= kMaxSpecTokens,
                 "num_spec_tokens exceeds implementation limit");
-    at::Tensor has_initial_state = at::ones(
-        {state_indices.numel()}, input.options().dtype(at::kBool));
     TORCH_CHECK(conv_weights.dim() == 2,
                 "conv_weights must be rank 2");
     const int64_t state_len =
@@ -1255,8 +1352,7 @@ at::Tensor short_conv_spec(
                 "speculative state capacity is invalid");
     const int64_t capacity = state_len + num_spec_tokens;
     check_state_common(input, conv_state, conv_weights, state_indices,
-                       has_initial_state, output, dilation, state_dim_first,
-                       capacity);
+                       nullptr, output, dilation, state_dim_first, capacity);
     check_index_tensor(input, query_start_loc, "query_start_loc");
     check_index_tensor(input, num_accepted_tokens, "num_accepted_tokens");
     TORCH_CHECK(!output.is_alias_of(query_start_loc) &&
@@ -1265,12 +1361,22 @@ at::Tensor short_conv_spec(
                     !conv_state.is_alias_of(num_accepted_tokens),
                 "state/output must not share storage with speculative metadata");
     const int64_t requests = state_indices.numel();
-    validate_query_start_loc(query_start_loc, requests, input.size(0),
-                             "query_start_loc");
-    validate_spec_query_lengths(query_start_loc, requests, num_spec_tokens);
-    validate_accepted_tokens(num_accepted_tokens, requests, num_spec_tokens);
-    validate_unique_state_indices(state_indices, conv_state.size(0),
-                                  null_block_id);
+    TORCH_CHECK(query_start_loc.dim() == 1 &&
+                    query_start_loc.numel() == requests + 1,
+                "query_start_loc must have exactly requests + 1 entries");
+    TORCH_CHECK(num_accepted_tokens.dim() == 1 &&
+                    num_accepted_tokens.numel() == requests,
+                "num_accepted_tokens must have one entry per request");
+    if (metadata_values_prevalidated) {
+        validate_trusted_null_block_id(conv_state.size(0), null_block_id);
+    } else {
+        validate_query_start_loc(query_start_loc, requests, input.size(0),
+                                 "query_start_loc");
+        validate_spec_query_lengths(query_start_loc, requests, num_spec_tokens);
+        validate_accepted_tokens(num_accepted_tokens, requests, num_spec_tokens);
+        validate_unique_state_indices(state_indices, conv_state.size(0),
+                                      null_block_id);
+    }
     if (requests > 0 && input.size(0) > 0) {
         if (conv_state.scalar_type() == at::kHalf) {
             if (state_indices.scalar_type() == at::kInt) {
@@ -1297,6 +1403,42 @@ at::Tensor short_conv_spec(
         }
     }
     return output;
+}
+
+at::Tensor short_conv_spec(
+    at::Tensor input,
+    at::Tensor query_start_loc,
+    at::Tensor conv_state,
+    at::Tensor conv_weights,
+    at::Tensor state_indices,
+    at::Tensor num_accepted_tokens,
+    at::Tensor output,
+    int64_t num_spec_tokens,
+    int64_t dilation,
+    bool state_dim_first,
+    int64_t null_block_id) {
+    return short_conv_spec_impl(
+        input, query_start_loc, conv_state, conv_weights, state_indices,
+        num_accepted_tokens, output, num_spec_tokens, dilation,
+        state_dim_first, null_block_id, false);
+}
+
+at::Tensor short_conv_spec_trusted(
+    at::Tensor input,
+    at::Tensor query_start_loc,
+    at::Tensor conv_state,
+    at::Tensor conv_weights,
+    at::Tensor state_indices,
+    at::Tensor num_accepted_tokens,
+    at::Tensor output,
+    int64_t num_spec_tokens,
+    int64_t dilation,
+    bool state_dim_first,
+    int64_t null_block_id) {
+    return short_conv_spec_impl(
+        input, query_start_loc, conv_state, conv_weights, state_indices,
+        num_accepted_tokens, output, num_spec_tokens, dilation,
+        state_dim_first, null_block_id, true);
 }
 
 }  // namespace ple

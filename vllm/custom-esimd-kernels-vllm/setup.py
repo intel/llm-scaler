@@ -17,6 +17,8 @@ ext_modules = [
         sources=[
             "csrc/xpu/esimd_kernel.sycl",
             "csrc/xpu/torch_extension.cc",
+            "csrc/xpu/esimd_kernel_ple.sycl",
+            "csrc/xpu/torch_extension_ple.cc",
         ],
         include_dirs=[
             root / "include",

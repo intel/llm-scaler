@@ -2,8 +2,9 @@
 
 Run with one physical card exposed, for example::
 
-    ZE_AFFINITY_MASK=6 PLE_DSO=/tmp/libple_standalone.so \
-      pytest -q tests/test_ple_xpu.py
+    ZE_AFFINITY_MASK=0 \
+      PLE_FIXTURE_ROOT=/tmp/qwen38-ple-fixtures-v2-20260831 \
+      PLE_DSO=/tmp/libple_standalone.so pytest -q tests/test_ple_xpu.py
 
 The test loads only the standalone PLE registration DSO.  It does not start a
 vLLM server and does not use a TP process group.
@@ -15,12 +16,11 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import pytest
 import torch
-
 
 FIXTURE_ROOT = Path(
     os.environ.get(
@@ -31,6 +31,43 @@ FIXTURE_ROOT = Path(
 DSO = os.environ.get("PLE_DSO", "/tmp/libple_standalone.so")
 GEMV_DSO = os.environ.get("PLE_GEMV_DSO", "")
 GEMM_DSO = os.environ.get("PLE_GEMM_DSO", "")
+REQUIRED_FIXTURE_CASES = frozenset(
+    {
+        "ple_embedding_local_assembly",
+        "ple_gated_value_norm",
+        "ple_grouped_norm_key_query",
+        "ple_ngram_ids_decode",
+        "ple_ngram_ids_prefill_eos",
+        "ple_projection_int4_canonical_gemm",
+        "ple_projection_int4_canonical_gemv",
+        "ple_projection_int4_key_value",
+        "ple_residual_add",
+        "ple_score_gate",
+        "ple_short_conv_decode",
+        "ple_short_conv_decode_float16_ds_padded_offset",
+        "ple_short_conv_decode_float16_sd_padded_offset",
+        "ple_short_conv_decode_float32_ds_padded_offset",
+        "ple_short_conv_decode_float32_sd_padded_offset",
+        "ple_short_conv_mixed_permutation",
+        "ple_short_conv_mixed_permutation_float16_ds",
+        "ple_short_conv_mixed_permutation_float16_sd",
+        "ple_short_conv_mixed_permutation_float32_ds",
+        "ple_short_conv_prefill",
+        "ple_short_conv_prefill_float16_ds_padded_offset",
+        "ple_short_conv_prefill_float16_sd_padded_offset",
+        "ple_short_conv_prefill_float32_ds_padded_offset",
+        "ple_short_conv_prefill_float32_sd_padded_offset",
+        "ple_short_conv_spec",
+        "ple_short_conv_spec_float16_ds_padded_offset",
+        "ple_short_conv_spec_float16_sd_padded_offset",
+        "ple_short_conv_spec_float32_ds_padded_offset",
+        "ple_short_conv_spec_float32_sd_padded_offset",
+        "ple_staged_decode_fp16",
+        "ple_staged_full_decode_fp16",
+        "ple_staged_prefill_fp16",
+        "ple_staged_spec_fp16",
+    }
+)
 DTYPES = {
     "float16": torch.float16,
     "float32": torch.float32,
@@ -39,6 +76,22 @@ DTYPES = {
     "uint8": torch.uint8,
     "bool": torch.bool,
 }
+
+
+def _require_fixture_root() -> None:
+    missing = sorted(
+        case
+        for case in REQUIRED_FIXTURE_CASES
+        if not (FIXTURE_ROOT / case / "manifest.json").is_file()
+    )
+    if missing:
+        preview = ", ".join(missing[:3])
+        if len(missing) > 3:
+            preview += f", ... ({len(missing)} total)"
+        pytest.skip(
+            f"PLE fixture root is incomplete: {FIXTURE_ROOT}; missing {preview}. "
+            "Set PLE_FIXTURE_ROOT to the generated qwen38.ple.fixture.v2 root."
+        )
 
 
 def _require_xpu() -> torch.device:
@@ -53,6 +106,11 @@ def _load_case(name: str, device: torch.device):
     if sys.byteorder != "little":
         pytest.fail("PLE fixtures require a little-endian host")
     manifest_path = FIXTURE_ROOT / name / "manifest.json"
+    if not manifest_path.is_file():
+        pytest.skip(
+            f"PLE fixture is missing: {manifest_path}. Set PLE_FIXTURE_ROOT to "
+            "the generated qwen38.ple.fixture.v2 root."
+        )
     manifest_bytes = manifest_path.read_bytes()
     manifest = json.loads(manifest_bytes)
     assert manifest["schema"] == "qwen38.ple.fixture.v2"
@@ -154,6 +212,10 @@ def device() -> torch.device:
                 pytest.skip(f"{env_name} does not exist: {path}")
             torch.ops.load_library(path)
     return device
+
+
+def test_frozen_fixture_manifest_is_complete() -> None:
+    _require_fixture_root()
 
 
 def test_arithmetic_primitives_match_frozen_golden(device: torch.device) -> None:
@@ -403,12 +465,18 @@ def test_int4_gemm_m_boundaries_are_bounded_and_correct(
         )
 
 
-def test_short_conv_decode_matches_output_and_final_state(device: torch.device) -> None:
+@pytest.mark.parametrize(
+    "op_name", ("ple_short_conv_decode", "ple_short_conv_decode_trusted")
+)
+def test_short_conv_decode_matches_output_and_final_state(
+    device: torch.device, op_name: str
+) -> None:
     inputs, golden, meta = _load_case("ple_short_conv_decode", device)
     state_before = inputs["conv_state"].clone()
     input_before = inputs["input"].clone()
     output = torch.empty_like(golden["output"])
-    torch.ops.custom_esimd_kernels_vllm.ple_short_conv_decode(
+    operation = getattr(torch.ops.custom_esimd_kernels_vllm, op_name)
+    operation(
         inputs["input"], inputs["conv_state"], inputs["conv_weights"],
         inputs["state_indices"], inputs["has_initial_state"], output,
         meta["dilation"], meta["state_dim_first"], meta["null_block_id"],
@@ -420,10 +488,16 @@ def test_short_conv_decode_matches_output_and_final_state(device: torch.device) 
     assert inputs["conv_state"].shape == state_before.shape
 
 
-def test_short_conv_prefill_matches_output_and_final_state(device: torch.device) -> None:
+@pytest.mark.parametrize(
+    "op_name", ("ple_short_conv_prefill", "ple_short_conv_prefill_trusted")
+)
+def test_short_conv_prefill_matches_output_and_final_state(
+    device: torch.device, op_name: str
+) -> None:
     inputs, golden, meta = _load_case("ple_short_conv_prefill", device)
     output = torch.empty_like(golden["output"])
-    torch.ops.custom_esimd_kernels_vllm.ple_short_conv_prefill(
+    operation = getattr(torch.ops.custom_esimd_kernels_vllm, op_name)
+    operation(
         inputs["input"], inputs["query_start_loc"], inputs["conv_state"],
         inputs["conv_weights"], inputs["state_indices"],
         inputs["has_initial_state"], output, meta["dilation"],
@@ -434,10 +508,16 @@ def test_short_conv_prefill_matches_output_and_final_state(device: torch.device)
     _assert_equal(inputs["conv_state"], golden["final_conv_state"])
 
 
-def test_short_conv_spec_matches_output_and_final_state(device: torch.device) -> None:
+@pytest.mark.parametrize(
+    "op_name", ("ple_short_conv_spec", "ple_short_conv_spec_trusted")
+)
+def test_short_conv_spec_matches_output_and_final_state(
+    device: torch.device, op_name: str
+) -> None:
     inputs, golden, meta = _load_case("ple_short_conv_spec", device)
     output = torch.empty_like(golden["output"])
-    torch.ops.custom_esimd_kernels_vllm.ple_short_conv_spec(
+    operation = getattr(torch.ops.custom_esimd_kernels_vllm, op_name)
+    operation(
         inputs["input"], inputs["query_start_loc"], inputs["conv_state"],
         inputs["conv_weights"], inputs["state_indices"],
         inputs["num_accepted_tokens"], output, meta["num_spec_tokens"],
@@ -520,6 +600,319 @@ def test_spec_supports_independent_offset_and_accepted_dtypes(
             torch.xpu.synchronize()
             _assert_equal(output, golden["output"])
             _assert_equal(state, golden["final_conv_state"])
+
+
+def test_trusted_decode_accepts_reserved_null_slot_zero(
+    device: torch.device,
+) -> None:
+    inputs, _, meta = _load_case("ple_short_conv_decode", device)
+    reserved = torch.full_like(inputs["conv_state"][:1], 17.0)
+    initial_state = torch.cat((reserved, inputs["conv_state"]), dim=0)
+    trusted_state = initial_state.clone()
+    legacy_state = initial_state.clone()
+    source_indices = inputs["state_indices"].to(torch.int64)
+    trusted_indices = torch.where(
+        source_indices == meta["null_block_id"],
+        torch.zeros_like(source_indices),
+        source_indices + 1,
+    )
+    legacy_indices = torch.where(
+        trusted_indices == 0,
+        torch.full_like(trusted_indices, meta["null_block_id"]),
+        trusted_indices,
+    )
+    trusted_output = torch.empty_like(inputs["input"])
+    legacy_output = torch.empty_like(inputs["input"])
+
+    torch.ops.custom_esimd_kernels_vllm.ple_short_conv_decode_trusted(
+        inputs["input"],
+        trusted_state,
+        inputs["conv_weights"],
+        trusted_indices,
+        inputs["has_initial_state"],
+        trusted_output,
+        meta["dilation"],
+        meta["state_dim_first"],
+        0,
+    )
+    torch.ops.custom_esimd_kernels_vllm.ple_short_conv_decode(
+        inputs["input"],
+        legacy_state,
+        inputs["conv_weights"],
+        legacy_indices,
+        inputs["has_initial_state"],
+        legacy_output,
+        meta["dilation"],
+        meta["state_dim_first"],
+        -1,
+    )
+    torch.xpu.synchronize()
+
+    _assert_equal(trusted_output, legacy_output)
+    _assert_equal(trusted_state, legacy_state)
+    null_rows = trusted_indices == 0
+    assert torch.count_nonzero(trusted_output[null_rows]) == 0
+    assert torch.equal(trusted_state[0], reserved[0])
+
+    with pytest.raises(RuntimeError, match="must not identify a real state slot"):
+        torch.ops.custom_esimd_kernels_vllm.ple_short_conv_decode(
+            inputs["input"],
+            initial_state.clone(),
+            inputs["conv_weights"],
+            trusted_indices,
+            inputs["has_initial_state"],
+            torch.empty_like(inputs["input"]),
+            meta["dilation"],
+            meta["state_dim_first"],
+            0,
+        )
+
+
+def _reserved_zero_state_and_indices(inputs: dict, null_block_id: int):
+    reserved = torch.full_like(inputs["conv_state"][:1], 17.0)
+    initial_state = torch.cat((reserved, inputs["conv_state"]), dim=0)
+    source_indices = inputs["state_indices"].to(torch.int64)
+    trusted_indices = torch.where(
+        source_indices == null_block_id,
+        torch.zeros_like(source_indices),
+        source_indices + 1,
+    )
+    legacy_indices = torch.where(
+        trusted_indices == 0,
+        torch.full_like(trusted_indices, null_block_id),
+        trusted_indices,
+    )
+    return reserved, initial_state, trusted_indices, legacy_indices
+
+
+def _force_nonempty_request_to_reserved_zero(
+    query_start_loc: torch.Tensor,
+    trusted_indices: torch.Tensor,
+    legacy_indices: torch.Tensor,
+    legacy_null_block_id: int,
+) -> None:
+    starts = query_start_loc.cpu().tolist()
+    request = next(
+        request
+        for request in range(len(starts) - 1)
+        if starts[request] < starts[request + 1]
+    )
+    trusted_indices[request] = 0
+    legacy_indices[request] = legacy_null_block_id
+
+
+def _null_token_rows(
+    query_start_loc: torch.Tensor, trusted_indices: torch.Tensor
+) -> list[int]:
+    starts = query_start_loc.cpu().tolist()
+    slots = trusted_indices.cpu().tolist()
+    rows = [
+        row
+        for request, slot in enumerate(slots)
+        if slot == 0
+        for row in range(starts[request], starts[request + 1])
+    ]
+    assert rows
+    return rows
+
+
+def test_trusted_prefill_accepts_reserved_null_slot_zero(
+    device: torch.device,
+) -> None:
+    inputs, _, meta = _load_case("ple_short_conv_prefill", device)
+    reserved, initial_state, trusted_indices, legacy_indices = (
+        _reserved_zero_state_and_indices(inputs, meta["null_block_id"])
+    )
+    _force_nonempty_request_to_reserved_zero(
+        inputs["query_start_loc"],
+        trusted_indices,
+        legacy_indices,
+        meta["null_block_id"],
+    )
+    trusted_state = initial_state.clone()
+    legacy_state = initial_state.clone()
+    trusted_output = torch.empty_like(inputs["input"])
+    legacy_output = torch.empty_like(inputs["input"])
+
+    torch.ops.custom_esimd_kernels_vllm.ple_short_conv_prefill_trusted(
+        inputs["input"],
+        inputs["query_start_loc"],
+        trusted_state,
+        inputs["conv_weights"],
+        trusted_indices,
+        inputs["has_initial_state"],
+        trusted_output,
+        meta["dilation"],
+        meta["state_dim_first"],
+        0,
+    )
+    torch.ops.custom_esimd_kernels_vllm.ple_short_conv_prefill(
+        inputs["input"],
+        inputs["query_start_loc"],
+        legacy_state,
+        inputs["conv_weights"],
+        legacy_indices,
+        inputs["has_initial_state"],
+        legacy_output,
+        meta["dilation"],
+        meta["state_dim_first"],
+        meta["null_block_id"],
+    )
+    torch.xpu.synchronize()
+
+    _assert_equal(trusted_output, legacy_output)
+    _assert_equal(trusted_state, legacy_state)
+    null_rows = _null_token_rows(inputs["query_start_loc"], trusted_indices)
+    assert torch.count_nonzero(trusted_output[null_rows]) == 0
+    assert torch.equal(trusted_state[0], reserved[0])
+
+
+def test_trusted_spec_accepts_reserved_null_slot_zero(
+    device: torch.device,
+) -> None:
+    inputs, _, meta = _load_case("ple_short_conv_spec", device)
+    reserved, initial_state, trusted_indices, legacy_indices = (
+        _reserved_zero_state_and_indices(inputs, meta["null_block_id"])
+    )
+    _force_nonempty_request_to_reserved_zero(
+        inputs["query_start_loc"],
+        trusted_indices,
+        legacy_indices,
+        meta["null_block_id"],
+    )
+    trusted_state = initial_state.clone()
+    legacy_state = initial_state.clone()
+    trusted_output = torch.empty_like(inputs["input"])
+    legacy_output = torch.empty_like(inputs["input"])
+
+    torch.ops.custom_esimd_kernels_vllm.ple_short_conv_spec_trusted(
+        inputs["input"],
+        inputs["query_start_loc"],
+        trusted_state,
+        inputs["conv_weights"],
+        trusted_indices,
+        inputs["num_accepted_tokens"],
+        trusted_output,
+        meta["num_spec_tokens"],
+        meta["dilation"],
+        meta["state_dim_first"],
+        0,
+    )
+    torch.ops.custom_esimd_kernels_vllm.ple_short_conv_spec(
+        inputs["input"],
+        inputs["query_start_loc"],
+        legacy_state,
+        inputs["conv_weights"],
+        legacy_indices,
+        inputs["num_accepted_tokens"],
+        legacy_output,
+        meta["num_spec_tokens"],
+        meta["dilation"],
+        meta["state_dim_first"],
+        meta["null_block_id"],
+    )
+    torch.xpu.synchronize()
+
+    _assert_equal(trusted_output, legacy_output)
+    _assert_equal(trusted_state, legacy_state)
+    null_rows = _null_token_rows(inputs["query_start_loc"], trusted_indices)
+    assert torch.count_nonzero(trusted_output[null_rows]) == 0
+    assert torch.equal(trusted_state[0], reserved[0])
+
+
+def test_trusted_short_conv_rejects_structure_alias_and_capacity(
+    device: torch.device,
+) -> None:
+    inputs, golden, meta = _load_case("ple_short_conv_decode", device)
+    operation = torch.ops.custom_esimd_kernels_vllm.ple_short_conv_decode_trusted
+    state_before = inputs["conv_state"].clone()
+
+    with pytest.raises(RuntimeError, match="one row per input token"):
+        operation(
+            inputs["input"],
+            inputs["conv_state"],
+            inputs["conv_weights"],
+            inputs["state_indices"][:-1],
+            inputs["has_initial_state"][:-1],
+            torch.empty_like(golden["output"]),
+            meta["dilation"],
+            meta["state_dim_first"],
+            meta["null_block_id"],
+        )
+    assert torch.equal(inputs["conv_state"], state_before)
+
+    with pytest.raises(RuntimeError, match="must not share storage"):
+        operation(
+            inputs["input"],
+            inputs["conv_state"],
+            inputs["conv_weights"],
+            inputs["state_indices"],
+            inputs["has_initial_state"],
+            inputs["input"],
+            meta["dilation"],
+            meta["state_dim_first"],
+            meta["null_block_id"],
+        )
+    assert torch.equal(inputs["conv_state"], state_before)
+
+    required_state = (inputs["conv_weights"].size(1) - 1) * meta["dilation"]
+    if meta["state_dim_first"]:
+        undersized_state = inputs["conv_state"][..., : required_state - 1].clone()
+    else:
+        undersized_state = inputs["conv_state"][:, : required_state - 1, :].clone()
+    undersized_before = undersized_state.clone()
+    with pytest.raises(RuntimeError, match="shape/layout is incompatible"):
+        operation(
+            inputs["input"],
+            undersized_state,
+            inputs["conv_weights"],
+            inputs["state_indices"],
+            inputs["has_initial_state"],
+            torch.empty_like(golden["output"]),
+            meta["dilation"],
+            meta["state_dim_first"],
+            meta["null_block_id"],
+        )
+    assert torch.equal(undersized_state, undersized_before)
+
+
+def test_trusted_prefill_and_spec_reject_metadata_structure(
+    device: torch.device,
+) -> None:
+    prefill, prefill_golden, prefill_meta = _load_case(
+        "ple_short_conv_prefill", device
+    )
+    with pytest.raises(RuntimeError, match=r"exactly requests \+ 1"):
+        torch.ops.custom_esimd_kernels_vllm.ple_short_conv_prefill_trusted(
+            prefill["input"],
+            prefill["query_start_loc"][:-1],
+            prefill["conv_state"],
+            prefill["conv_weights"],
+            prefill["state_indices"],
+            prefill["has_initial_state"],
+            torch.empty_like(prefill_golden["output"]),
+            prefill_meta["dilation"],
+            prefill_meta["state_dim_first"],
+            prefill_meta["null_block_id"],
+        )
+
+    spec, spec_golden, spec_meta = _load_case("ple_short_conv_spec", device)
+    state_before = spec["conv_state"].clone()
+    with pytest.raises(RuntimeError, match="one entry per request"):
+        torch.ops.custom_esimd_kernels_vllm.ple_short_conv_spec_trusted(
+            spec["input"],
+            spec["query_start_loc"],
+            spec["conv_state"],
+            spec["conv_weights"],
+            spec["state_indices"],
+            spec["num_accepted_tokens"][:-1],
+            torch.empty_like(spec_golden["output"]),
+            spec_meta["num_spec_tokens"],
+            spec_meta["dilation"],
+            spec_meta["state_dim_first"],
+            spec_meta["null_block_id"],
+        )
+    assert torch.equal(spec["conv_state"], state_before)
 
 
 def test_state_metadata_rejects_duplicate_and_malformed_requests(
@@ -806,7 +1199,7 @@ def test_primitive_alias_guards_reject_storage_views(device: torch.device) -> No
             residual_input,
         )
 
-    decode_inputs, decode_golden, decode_meta = _load_case(
+    decode_inputs, _, decode_meta = _load_case(
         "ple_short_conv_decode", device
     )
     with pytest.raises(RuntimeError, match="must not share storage"):

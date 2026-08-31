@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import re
 from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
+SETUP_PRODUCTION = ROOT / "setup.py"
 SETUP_PLE_ONLY = ROOT / "setup_ple_only.py"
 SETUP_GEMV_ONLY = ROOT / "setup_gemv_only.py"
 SETUP_SYCL = ROOT / "setup_sycl.py"
@@ -62,6 +63,30 @@ def _extension_names(path: Path) -> list[str]:
         assert isinstance(value, ast.Constant) and isinstance(value.value, str)
         names.append(value.value)
     return names
+
+
+def test_production_main_dso_is_the_single_ple_owner() -> None:
+    source = SETUP_PRODUCTION.read_text()
+    registration = (ROOT / "csrc/xpu/torch_extension_ple.cc").read_text()
+
+    assert source.count("csrc/xpu/esimd_kernel_ple.sycl") == 1
+    assert source.count("csrc/xpu/torch_extension_ple.cc") == 1
+    assert "TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m)" in registration
+    assert "TORCH_LIBRARY(custom_esimd_kernels_vllm, m)" not in registration
+    assert set(re.findall(r'm\.def\("([^("]+)\(', registration)) == {
+        "ple_ngram_ids",
+        "ple_embedding_gather",
+        "ple_grouped_norm",
+        "ple_score_gate",
+        "ple_gated_value",
+        "ple_residual_add",
+        "ple_short_conv_decode",
+        "ple_short_conv_decode_trusted",
+        "ple_short_conv_prefill",
+        "ple_short_conv_prefill_trusted",
+        "ple_short_conv_spec",
+        "ple_short_conv_spec_trusted",
+    }
 
 
 def test_ple_only_is_dso_artifact_without_production_package() -> None:
@@ -129,7 +154,7 @@ def test_ambiguous_exact_prefix_fails_closed(tmp_path: Path) -> None:
     second.touch()
 
     module = _load_esimd_utils()
-    with pytest.raises(ImportError, match="ambiguous"):
+    with pytest.raises(RuntimeError, match="ambiguous"):
         module._require_single_extension(tmp_path, "custom_esimd_kernels")
 
 
@@ -150,11 +175,19 @@ def test_default_loader_loads_canonical_main_before_gemm(tmp_path: Path, monkeyp
 
     module = _load_esimd_utils()
     loaded: list[Path] = []
+    registered: set[str] = set()
+
+    def load_library(path: str) -> None:
+        candidate = Path(path)
+        loaded.append(candidate)
+        if candidate == main:
+            registered.add(module._MAIN_SCHEMA)
+
     monkeypatch.setattr(module, "_find_esimd_package_dir", lambda: tmp_path)
-    monkeypatch.setattr(module, "_dispatcher_has_schema", lambda schema: False)
     monkeypatch.setattr(
-        module.torch.ops, "load_library", lambda path: loaded.append(Path(path))
+        module, "_dispatcher_has_schema", registered.__contains__
     )
+    monkeypatch.setattr(module.torch.ops, "load_library", load_library)
     module._ESIMD_LOADED = False
 
     module._load_esimd_extensions()
@@ -187,7 +220,7 @@ def test_ple_standalone_loader_requires_all_short_conv_schemas(
     monkeypatch.setattr(
         module.torch.ops, "load_library", lambda path: loaded.append(Path(path))
     )
-    with pytest.raises(ImportError, match="missing schemas"):
+    with pytest.raises(RuntimeError, match="missing schemas"):
         module.load_qwen38_ple_standalone_library(dso)
     assert loaded == [dso]
 
@@ -201,25 +234,40 @@ def test_ple_standalone_loader_refuses_existing_dispatcher_owner(
     monkeypatch.setattr(
         module, "_dispatcher_has_schema", lambda schema: schema == module._PLE_SCHEMA
     )
-    with pytest.raises(ImportError, match="already owned"):
+    with pytest.raises(RuntimeError, match="already owned"):
         module.load_qwen38_ple_standalone_library(dso)
 
 
-def test_production_short_conv_candidate_is_explicit_and_stateful() -> None:
+def test_production_short_conv_dependency_contract_is_coherent() -> None:
     ple_layer = (
         ROOT.parents[2]
         / "applications.ai.gpu.llm-scaler-vllm"
         / "vllm/models/qwen3_8_flash_next/xpu/ple_layer.py"
     ).read_text()
-    assert '"VLLM_XPU_QWEN38_PLE_STANDALONE_DSO"' in ple_layer
-    assert '"ple_short_conv_decode"' in ple_layer
-    assert '"ple_short_conv_prefill"' in ple_layer
-    assert '"ple_short_conv_spec"' in ple_layer
-    assert "existing stateful short-conv path" in ple_layer
-    assert "indices == NULL_BLOCK_ID" in ple_layer
-    assert "torch.full_like(indices, -1)" in ple_layer
-    assert "self._standalone_state_indices" in ple_layer
-    assert "True,\n                -1," in ple_layer
+    assert "VLLM_XPU_QWEN38_PLE_STANDALONE_DSO" not in ple_layer
+    assert "get_qwen38_ple_op" in ple_layer
+    assert "VLLM_XPU_ENABLE_QWEN38_PLE_NATIVE" in ple_layer
+
+    requested_ops = {
+        ast.literal_eval(node.args[0])
+        for node in ast.walk(ast.parse(ple_layer))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_production_ple_op"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and str(node.args[0].value).startswith("ple_short_conv_")
+    }
+    legacy_ops = {
+        "ple_short_conv_decode",
+        "ple_short_conv_prefill",
+        "ple_short_conv_spec",
+    }
+    trusted_ops = {f"{name}_trusted" for name in legacy_ops}
+    # The llm-scaler ABI commit precedes its dependent vLLM caller commit.  The
+    # caller must select one complete family; vLLM tests own the final cutover.
+    assert requested_ops in (legacy_ops, trusted_ops)
+
     null_id_source = (
         ROOT.parents[2]
         / "applications.ai.gpu.llm-scaler-vllm"

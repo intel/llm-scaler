@@ -57,6 +57,21 @@ at::Tensor short_conv_decode(
     bool state_dim_first,
     int64_t null_block_id);
 
+// Production-only entry points. Metadata values must be proven by the
+// scheduler-owned CPU construction path before these functions are called.
+// They retain device, dtype, shape, stride, alias, and capacity checks but do
+// not copy XPU metadata to the host.
+at::Tensor short_conv_decode_trusted(
+    at::Tensor input,
+    at::Tensor conv_state,
+    at::Tensor conv_weights,
+    at::Tensor state_indices,
+    at::Tensor has_initial_state,
+    at::Tensor output,
+    int64_t dilation,
+    bool state_dim_first,
+    int64_t null_block_id);
+
 at::Tensor short_conv_prefill(
     at::Tensor input,
     at::Tensor query_start_loc,
@@ -69,7 +84,32 @@ at::Tensor short_conv_prefill(
     bool state_dim_first,
     int64_t null_block_id);
 
+at::Tensor short_conv_prefill_trusted(
+    at::Tensor input,
+    at::Tensor query_start_loc,
+    at::Tensor conv_state,
+    at::Tensor conv_weights,
+    at::Tensor state_indices,
+    at::Tensor has_initial_state,
+    at::Tensor output,
+    int64_t dilation,
+    bool state_dim_first,
+    int64_t null_block_id);
+
 at::Tensor short_conv_spec(
+    at::Tensor input,
+    at::Tensor query_start_loc,
+    at::Tensor conv_state,
+    at::Tensor conv_weights,
+    at::Tensor state_indices,
+    at::Tensor num_accepted_tokens,
+    at::Tensor output,
+    int64_t num_spec_tokens,
+    int64_t dilation,
+    bool state_dim_first,
+    int64_t null_block_id);
+
+at::Tensor short_conv_spec_trusted(
     at::Tensor input,
     at::Tensor query_start_loc,
     at::Tensor conv_state,

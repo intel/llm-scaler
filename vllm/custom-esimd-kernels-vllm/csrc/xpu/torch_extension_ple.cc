@@ -78,6 +78,22 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
                                   dilation, state_dim_first, null_block_id);
          });
 
+  m.def("ple_short_conv_decode_trusted(Tensor input, Tensor(a!) conv_state, "
+        "Tensor conv_weights, Tensor state_indices, "
+        "Tensor has_initial_state, Tensor(b!) output, int dilation, "
+        "bool state_dim_first, int null_block_id) -> ()");
+  m.impl("ple_short_conv_decode_trusted", torch::kXPU,
+         [](at::Tensor input, at::Tensor conv_state,
+            at::Tensor conv_weights, at::Tensor state_indices,
+            at::Tensor has_initial_state, at::Tensor output,
+            int64_t dilation, bool state_dim_first,
+            int64_t null_block_id) -> void {
+           ple::short_conv_decode_trusted(
+               input, conv_state, conv_weights, state_indices,
+               has_initial_state, output, dilation, state_dim_first,
+               null_block_id);
+         });
+
   m.def("ple_short_conv_prefill(Tensor input, Tensor query_start_loc, "
         "Tensor(a!) conv_state, Tensor conv_weights, Tensor state_indices, "
         "Tensor has_initial_state, Tensor(b!) output, int dilation, "
@@ -92,6 +108,22 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
                                    conv_weights, state_indices,
                                    has_initial_state, output, dilation,
                                    state_dim_first, null_block_id);
+         });
+
+  m.def("ple_short_conv_prefill_trusted(Tensor input, Tensor query_start_loc, "
+        "Tensor(a!) conv_state, Tensor conv_weights, Tensor state_indices, "
+        "Tensor has_initial_state, Tensor(b!) output, int dilation, "
+        "bool state_dim_first, int null_block_id) -> ()");
+  m.impl("ple_short_conv_prefill_trusted", torch::kXPU,
+         [](at::Tensor input, at::Tensor query_start_loc,
+            at::Tensor conv_state, at::Tensor conv_weights,
+            at::Tensor state_indices, at::Tensor has_initial_state,
+            at::Tensor output, int64_t dilation, bool state_dim_first,
+            int64_t null_block_id) -> void {
+           ple::short_conv_prefill_trusted(
+               input, query_start_loc, conv_state, conv_weights,
+               state_indices, has_initial_state, output, dilation,
+               state_dim_first, null_block_id);
          });
 
   m.def("ple_short_conv_spec(Tensor input, Tensor query_start_loc, "
@@ -109,5 +141,22 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
                                 conv_weights, state_indices,
                                 num_accepted_tokens, output, num_spec_tokens,
                                 dilation, state_dim_first, null_block_id);
+         });
+
+  m.def("ple_short_conv_spec_trusted(Tensor input, Tensor query_start_loc, "
+        "Tensor(a!) conv_state, Tensor conv_weights, Tensor state_indices, "
+        "Tensor num_accepted_tokens, Tensor(b!) output, "
+        "int num_spec_tokens, int dilation, bool state_dim_first, "
+        "int null_block_id) -> ()");
+  m.impl("ple_short_conv_spec_trusted", torch::kXPU,
+         [](at::Tensor input, at::Tensor query_start_loc,
+            at::Tensor conv_state, at::Tensor conv_weights,
+            at::Tensor state_indices, at::Tensor num_accepted_tokens,
+            at::Tensor output, int64_t num_spec_tokens, int64_t dilation,
+            bool state_dim_first, int64_t null_block_id) -> void {
+           ple::short_conv_spec_trusted(
+               input, query_start_loc, conv_state, conv_weights,
+               state_indices, num_accepted_tokens, output, num_spec_tokens,
+               dilation, state_dim_first, null_block_id);
          });
 }
