@@ -53,6 +53,15 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
            ple::hc_gate_mix_v1(input, gate, output);
          });
 
+  m.def("hc_combine_v1(Tensor hidden_states, Tensor block_output, "
+        "Tensor injection, Tensor(a!) output) -> ()");
+  m.impl("hc_combine_v1", torch::kXPU,
+         [](at::Tensor hidden_states, at::Tensor block_output,
+            at::Tensor injection, at::Tensor output) -> void {
+           ple::hc_combine_v1(
+               hidden_states, block_output, injection, output);
+         });
+
   m.def("ple_score_gate(Tensor key, Tensor query, Tensor(a!) output, "
         "int hidden_size) -> ()");
   m.impl("ple_score_gate", torch::kXPU,

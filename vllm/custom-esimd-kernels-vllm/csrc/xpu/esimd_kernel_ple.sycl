@@ -28,6 +28,11 @@ constexpr int kHcNormVectorLength = 256;
 constexpr int kHcNormChunks = kHcHiddenSize / kHcNormVectorLength;
 constexpr int kHcGateMixVectorLength = 128;
 constexpr int kHcGateMixChunks = kHcHiddenSize / kHcGateMixVectorLength;
+constexpr int kHcCombineVectorLength = 256;
+constexpr int kHcCombineChunksPerStream =
+    kHcHiddenSize / kHcCombineVectorLength;
+constexpr int kHcCombineWorkItems =
+    kHcCount * kHcCombineChunksPerStream;
 
 namespace esimd = sycl::ext::intel::esimd;
 
@@ -503,6 +508,68 @@ static void launch_hc_gate_mix_v1(
             sycl::nd_range<1>(
                 {static_cast<size_t>(kHcGateMixChunks)}, {1}),
             HcGateMixV1Kernel{input, gate, output});
+    });
+}
+
+struct HcCombineV1Kernel {
+    const sycl::half* hidden_states;
+    const sycl::half* block_output;
+    const sycl::half* injection;
+    sycl::half* output;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        const int64_t work_item =
+            static_cast<int64_t>(item.get_group(0));
+        if (work_item >= kHcCombineWorkItems) {
+            return;
+        }
+        const int64_t stream =
+            work_item / kHcCombineChunksPerStream;
+        const int64_t chunk =
+            work_item % kHcCombineChunksPerStream;
+        const int64_t hidden_offset =
+            stream * kHcHiddenSize +
+            chunk * kHcCombineVectorLength;
+        const int64_t block_offset =
+            chunk * kHcCombineVectorLength;
+
+        const esimd::simd<float, 1> injection_value =
+            esimd::block_load<sycl::half, 1>(
+                injection + stream);
+        const float scaled_injection =
+            injection_value[0] / static_cast<float>(kHcCount);
+        const float injection_weight =
+            2.0f /
+            (1.0f + esimd::exp(
+                esimd::simd<float, 8>(-scaled_injection))[0]);
+        esimd::simd<float, kHcCombineVectorLength> residual =
+            esimd::block_load<
+                sycl::half, kHcCombineVectorLength>(
+                hidden_states + hidden_offset);
+        const esimd::simd<float, kHcCombineVectorLength> block =
+            esimd::block_load<
+                sycl::half, kHcCombineVectorLength>(
+                block_output + block_offset);
+        residual += block * injection_weight;
+        esimd::block_store<sycl::half, kHcCombineVectorLength>(
+            output + hidden_offset,
+            esimd::simd<sycl::half, kHcCombineVectorLength>(
+                residual));
+    }
+};
+
+static void launch_hc_combine_v1(
+    sycl::queue& queue,
+    const sycl::half* hidden_states,
+    const sycl::half* block_output,
+    const sycl::half* injection,
+    sycl::half* output) {
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(
+                {static_cast<size_t>(kHcCombineWorkItems)}, {1}),
+            HcCombineV1Kernel{
+                hidden_states, block_output, injection, output});
     });
 }
 
@@ -1203,6 +1270,48 @@ at::Tensor hc_gate_mix_v1(
     launch_hc_gate_mix_v1(
         queue, reinterpret_cast<const sycl::half*>(input.data_ptr()),
         reinterpret_cast<const sycl::half*>(gate.data_ptr()),
+        reinterpret_cast<sycl::half*>(output.data_ptr()));
+    return output;
+}
+
+at::Tensor hc_combine_v1(
+    at::Tensor hidden_states,
+    at::Tensor block_output,
+    at::Tensor injection,
+    at::Tensor output) {
+    check_primary_half(hidden_states, "hidden_states");
+    check_half(hidden_states, block_output, "block_output");
+    check_half(hidden_states, injection, "injection");
+    check_output(hidden_states, output, "output");
+    TORCH_CHECK(
+        hidden_states.dim() == 2 && hidden_states.size(0) == 1 &&
+            hidden_states.size(1) == kHcWidth &&
+            block_output.dim() == 2 && block_output.size(0) == 1 &&
+            block_output.size(1) == kHcHiddenSize &&
+            injection.dim() == 2 && injection.size(0) == 1 &&
+            injection.size(1) == kHcCount &&
+            output.sizes() == hidden_states.sizes(),
+        "hc_combine_v1 expects hidden/output [1, 10240], "
+        "block_output [1, 2560], and injection [1, 4]");
+    TORCH_CHECK(
+        !output.is_alias_of(block_output) &&
+            !output.is_alias_of(injection),
+        "hc_combine_v1 output must not share storage with inputs");
+    TORCH_CHECK(
+        hidden_states.storage_offset() % 2 == 0 &&
+            block_output.storage_offset() % 2 == 0 &&
+            injection.storage_offset() % 2 == 0 &&
+            output.storage_offset() % 2 == 0,
+        "hc_combine_v1 requires 4-byte aligned tensor data");
+    auto& queue = get_device_queue(hidden_states);
+    launch_hc_combine_v1(
+        queue,
+        reinterpret_cast<const sycl::half*>(
+            hidden_states.data_ptr()),
+        reinterpret_cast<const sycl::half*>(
+            block_output.data_ptr()),
+        reinterpret_cast<const sycl::half*>(
+            injection.data_ptr()),
         reinterpret_cast<sycl::half*>(output.data_ptr()));
     return output;
 }

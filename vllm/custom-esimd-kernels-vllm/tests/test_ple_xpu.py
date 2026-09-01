@@ -377,6 +377,139 @@ def test_hc_gate_mix_v1_rejects_wrong_shape_and_alias(
         )
 
 
+def test_hc_combine_v1_matches_target_reference(
+    device: torch.device,
+) -> None:
+    torch.manual_seed(47)
+    hidden_states = (
+        torch.randn((1, 10240), dtype=torch.float16, device=device)
+        * 0.5
+    )
+    block_output = (
+        torch.randn((1, 2560), dtype=torch.float16, device=device)
+        * 0.5
+    )
+    injection = torch.randn(
+        (1, 4), dtype=torch.float16, device=device
+    )
+    output = torch.empty_like(hidden_states)
+    output_pointer = output.data_ptr()
+
+    injection_weight = 2.0 * torch.sigmoid(injection.float() / 4)
+    expected = (
+        hidden_states.float().reshape(1, 4, 2560)
+        + block_output.float().unsqueeze(1)
+        * injection_weight.unsqueeze(-1)
+    ).reshape_as(hidden_states).to(hidden_states.dtype)
+
+    torch.ops.custom_esimd_kernels_vllm.hc_combine_v1(
+        hidden_states, block_output, injection, output
+    )
+    torch.xpu.synchronize()
+
+    assert output.data_ptr() == output_pointer
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_hc_combine_v1_accepts_offset_injection_view(
+    device: torch.device,
+) -> None:
+    hidden_states = torch.randn(
+        (1, 10240), dtype=torch.float16, device=device
+    )
+    block_output = torch.randn(
+        (1, 2560), dtype=torch.float16, device=device
+    )
+    merged = torch.randn(
+        (1, 336), dtype=torch.float16, device=device
+    )
+    injection = merged.split((320, 4, 12), dim=-1)[1]
+    assert injection.storage_offset() == 320
+    assert injection.is_contiguous()
+    output = torch.empty_like(hidden_states)
+    expected = (
+        hidden_states.float().reshape(1, 4, 2560)
+        + block_output.float().unsqueeze(1)
+        * (2.0 * torch.sigmoid(injection.float() / 4)).unsqueeze(-1)
+    ).reshape_as(hidden_states).to(hidden_states.dtype)
+
+    torch.ops.custom_esimd_kernels_vllm.hc_combine_v1(
+        hidden_states, block_output, injection, output
+    )
+    torch.xpu.synchronize()
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_hc_combine_v1_rejects_wrong_shape_and_alias(
+    device: torch.device,
+) -> None:
+    hidden_states = torch.randn(
+        (1, 10240), dtype=torch.float16, device=device
+    )
+    block_output = torch.randn(
+        (1, 2560), dtype=torch.float16, device=device
+    )
+    injection = torch.randn((1, 4), dtype=torch.float16, device=device)
+    output = torch.empty_like(hidden_states)
+
+    with pytest.raises(RuntimeError, match="expects hidden/output"):
+        torch.ops.custom_esimd_kernels_vllm.hc_combine_v1(
+            hidden_states.repeat(2, 1),
+            block_output.repeat(2, 1),
+            injection.repeat(2, 1),
+            output.repeat(2, 1),
+        )
+
+    with pytest.raises(RuntimeError, match="must not share storage"):
+        torch.ops.custom_esimd_kernels_vllm.hc_combine_v1(
+            hidden_states, block_output, injection, hidden_states
+        )
+
+    block_backing = torch.empty(
+        (1, 10240), dtype=torch.float16, device=device
+    )
+    with pytest.raises(RuntimeError, match="must not share storage"):
+        torch.ops.custom_esimd_kernels_vllm.hc_combine_v1(
+            hidden_states, block_backing[:, :2560], injection, block_backing
+        )
+
+    injection_backing = torch.empty(
+        (1, 10240), dtype=torch.float16, device=device
+    )
+    with pytest.raises(RuntimeError, match="must not share storage"):
+        torch.ops.custom_esimd_kernels_vllm.hc_combine_v1(
+            hidden_states,
+            block_output,
+            injection_backing[:, :4],
+            injection_backing,
+        )
+
+    odd_hidden = torch.empty(
+        (1, 10241), dtype=torch.float16, device=device
+    )[:, 1:]
+    odd_block = torch.empty(
+        (1, 2561), dtype=torch.float16, device=device
+    )[:, 1:]
+    odd_injection = torch.empty(
+        (1, 5), dtype=torch.float16, device=device
+    )[:, 1:]
+    odd_output = torch.empty(
+        (1, 10241), dtype=torch.float16, device=device
+    )[:, 1:]
+    assert all(
+        tensor.is_contiguous() and tensor.storage_offset() == 1
+        for tensor in (odd_hidden, odd_block, odd_injection, odd_output)
+    )
+    for tensors in (
+        (odd_hidden, block_output, injection, output),
+        (hidden_states, odd_block, injection, output),
+        (hidden_states, block_output, odd_injection, output),
+        (hidden_states, block_output, injection, odd_output),
+    ):
+        with pytest.raises(RuntimeError, match="4-byte aligned"):
+            torch.ops.custom_esimd_kernels_vllm.hc_combine_v1(*tensors)
+
+
 def test_canonical_int4_projection_dispatch_and_golden(
     device: torch.device,
 ) -> None:
