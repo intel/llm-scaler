@@ -3025,6 +3025,38 @@ def moe_forward_m1_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1(
     )
 
 
+def moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1(
+    hidden_states: torch.Tensor,
+    logits: torch.Tensor,
+    w13_qweight_s4: torch.Tensor,
+    w13_scales: torch.Tensor,
+    w2_qweight_s4: torch.Tensor,
+    w2_scales: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_expert_gate_weight: torch.Tensor,
+    output: torch.Tensor,
+    top_k: int,
+    num_shared_experts: int,
+    num_experts: int,
+) -> torch.Tensor:
+    return _moe_int4.moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1(
+        hidden_states,
+        logits,
+        w13_qweight_s4,
+        w13_scales,
+        w2_qweight_s4,
+        w2_scales,
+        shared_gate_up_weight,
+        shared_down_weight,
+        shared_expert_gate_weight,
+        output,
+        top_k,
+        num_shared_experts,
+        num_experts,
+    )
+
+
 def moe_tiny_fp16_shared_up(
     hidden_states: torch.Tensor,
     shared_gate_up_weight: torch.Tensor,
