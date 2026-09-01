@@ -19,7 +19,8 @@ MiniMax H3 VideoVAE D64 tile family is exposed separately through
 
 Unlike the ESIMD ``sdp`` kernel (fp16 accumulator + adaptive V-scaling), the cute
 FMHA accumulates QK and P*V in fp32, so it does not overflow on large-magnitude
-activations (e.g. Qwen-Image). It is AOT-compiled into ``cute_fmha_torch.so`` and
+activations (e.g. Qwen-Image). It is AOT-compiled into a native
+``cute_fmha_torch`` extension (``.so`` on Linux or ``.pyd`` on Windows) and
 exposes ``torch.ops.cute_fmha.sdp``. The generic entry point accepts
 self-attention only; validated rectangular workflow contracts use dedicated
 entry points.
@@ -27,41 +28,54 @@ entry points.
 
 import glob
 import os
+from importlib.machinery import EXTENSION_SUFFIXES
 
 import torch
 
 _loaded = False
 
 
-def _find_so():
-    """Locate the cute FMHA .so.
+def _find_extension():
+    """Locate the platform-native CUTE FMHA extension.
 
-    setuptools names it with the Python ABI suffix (cute_fmha_torch.cpython-*.so);
-    a hand build may drop a plain cute_fmha_torch.so. OMNI_CUTE_FMHA_SO overrides.
+    setuptools adds a Python ABI suffix. A hand build may use a plain ``.so``
+    or ``.pyd``. ``OMNI_CUTE_FMHA_SO`` remains the compatible path override.
     """
     env = os.environ.get("OMNI_CUTE_FMHA_SO", "")
     if env:
         return env
     here = os.path.dirname(os.path.abspath(__file__))
-    cands = [os.path.join(here, "cute_fmha_torch.so")]
-    cands += sorted(glob.glob(os.path.join(here, "cute_fmha_torch*.so")))
+    cands = []
+    for suffix in (*EXTENSION_SUFFIXES, ".pyd", ".so"):
+        cands.append(os.path.join(here, "cute_fmha_torch" + suffix))
+        cands.extend(
+            sorted(glob.glob(os.path.join(here, "cute_fmha_torch*" + suffix)))
+        )
+    seen = set()
     for c in cands:
-        if os.path.exists(c):
+        if c not in seen and os.path.isfile(c):
             return c
+        seen.add(c)
     return ""
+
+
+def _find_so():
+    """Compatibility alias used by the pinned ComfyUI-SolAttn node."""
+    return _find_extension()
 
 
 def _ensure_loaded():
     global _loaded
     if _loaded:
         return
-    so = _find_so()
-    if not so or not os.path.exists(so):
+    extension = _find_extension()
+    if not extension or not os.path.exists(extension):
         raise ImportError(
-            "cute_fmha_torch .so not found next to omni_xpu_kernel.cute "
+            "cute_fmha_torch native extension not found next to "
+            "omni_xpu_kernel.cute "
             "(set OMNI_CUTE_FMHA_SO to override)"
         )
-    torch.ops.load_library(so)
+    torch.ops.load_library(extension)
     _loaded = True
 
 

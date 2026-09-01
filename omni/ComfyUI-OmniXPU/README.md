@@ -113,6 +113,10 @@ OMNIXPU_KREA2_RMSNORM=0
 OMNIXPU_SEEDVR_GROUPNORM=0
 ```
 
+On Windows, CUTE is never selected implicitly. A wheel built explicitly with
+`OMNI_XPU_REQUIRE_CUTE=1` still uses PyTorch SDPA by default; set
+`OMNI_ATTN_BACKEND=cute` before launching ComfyUI to enable the CUTE routes.
+
 For diagnostics, the per-call CUTE output scan can be enabled explicitly. It
 is disabled by default because validated CUTE routes accumulate in FP32 and a
 full output scan adds a shape-proportional temporary allocation. Explicit

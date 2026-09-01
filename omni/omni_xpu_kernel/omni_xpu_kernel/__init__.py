@@ -161,8 +161,9 @@ from . import fp8
 from . import device
 from . import layout
 
-# cute FMHA (CUTLASS-SYCL) is required by default at build time. Import remains
-# defensive for explicit core-only/Windows builds and older installed wheels.
+# cute FMHA (CUTLASS-SYCL) is required by default on Linux and an explicit
+# build opt-in on Windows. Import remains defensive for core-only and older
+# installed wheels.
 try:
     from . import cute
 except Exception:  # pragma: no cover
