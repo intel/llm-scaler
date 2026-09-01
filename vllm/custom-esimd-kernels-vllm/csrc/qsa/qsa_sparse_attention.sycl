@@ -807,8 +807,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       "qsa_store_cache_rows_v3",
       &qsa::store_cache_rows_v3,
       "Qwen3.8 predicated strided QSA cache row-store (XPU)");
+  module.def(
+      "qsa_indexer_norm_rope_v1",
+      &qsa::indexer_norm_rope_v1,
+      "Qwen3.8 QSA indexer Gemma norm and RoPE (XPU)");
   module.attr("qsa_abi_version") = 2;
   module.attr("qsa_row_store_abi_version") = 3;
+  module.attr("qsa_indexer_postprocess_abi_version") = 1;
+  module.attr("qsa_indexer_head_dim") = 128;
+  module.attr("qsa_indexer_rotary_dim") = 64;
+  module.attr("qsa_indexer_mrope_interleaved") = 1;
+  module.attr("qsa_indexer_gemma_weight_plus_one") = 1;
+  module.attr("qsa_indexer_fp32_rms") = 1;
   module.attr("row_store_predicated_bounds") = 1;
   module.attr("row_store_duplicate_slots_last_write") = 1;
   module.attr("row_store_strided_rows") = 1;

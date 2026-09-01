@@ -640,6 +640,19 @@ def test_build_only_variants_cannot_install_or_build_canonical_package() -> None
         assert "torch_extension_ple.cc" not in source
 
 
+def test_qsa_indexer_postprocess_stays_owned_by_qsa_dso() -> None:
+    qsa_build = (ROOT / "qsa_build.py").read_text()
+    production_setup = SETUP_PRODUCTION.read_text()
+    sycl_setup = SETUP_SYCL.read_text()
+
+    assert qsa_build.count("csrc/qsa/qsa_indexer_norm_rope.sycl") == 1
+    assert "csrc/qsa/qsa_indexer_norm_rope.sycl" not in production_setup
+    assert "make_qsa_extension(root, torch_include)" in production_setup
+    assert "make_qsa_extension(" in sycl_setup
+    assert "extension_name=\"qsa_ops_sycl_only\"" in sycl_setup
+
+
+
 def test_main_prefix_does_not_match_gemm_variant(tmp_path: Path) -> None:
     main = tmp_path / "custom_esimd_kernels.cpython-312-x86_64-linux-gnu.so"
     gemm = tmp_path / "custom_esimd_kernels_gemm.cpython-312-x86_64-linux-gnu.so"

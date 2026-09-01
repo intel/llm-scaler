@@ -35,6 +35,15 @@ at::Tensor store_cache_rows_v3(
     const at::Tensor& slot_mapping,
     const at::Tensor& rows);
 
+at::Tensor indexer_norm_rope_v1(
+    const at::Tensor& input,
+    at::Tensor output,
+    const at::Tensor& weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    bool mrope,
+    bool positions_bounds_proven);
+
 }  // namespace qsa
 
 at::Tensor sparse_paged_attention_v2(

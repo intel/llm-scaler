@@ -27,6 +27,7 @@
 #include "esimd_kernels/resadd_norm_gemv_int4.h"
 #include "esimd_kernels/qwen38_ngram_ids.h"
 #include "esimd_kernels/qwen38_ngram_embedding.h"
+#include "mrope_ranges.h"
 
 #define EXTRACT_PTR(var, tensor) auto var = reinterpret_cast<uint8_t*>(tensor.data_ptr())
 
@@ -38,79 +39,6 @@ inline int get_fp8_mode(const at::Tensor& weight) {
 // Get queue for the specific device (multi-card safe)
 static inline sycl::queue& get_device_queue(const at::Tensor& tensor) {
     return c10::xpu::getCurrentXPUStream(tensor.device().index()).queue();
-}
-
-// The MRoPE ABI uses contiguous tensors except for the position rows.  The
-// position layout is checked separately; this helper handles the contiguous
-// tensors and checks each position row for physical aliasing.
-static inline bool qwen38_mrope_byte_ranges_overlap(
-    std::uintptr_t left_begin, std::uintptr_t left_bytes,
-    std::uintptr_t right_begin, std::uintptr_t right_bytes) {
-    constexpr auto kMaxAddress =
-        std::numeric_limits<std::uintptr_t>::max();
-    if (left_begin > kMaxAddress - left_bytes ||
-        right_begin > kMaxAddress - right_bytes) {
-        return true;
-    }
-    const auto left_end = left_begin + left_bytes;
-    const auto right_end = right_begin + right_bytes;
-    return left_begin < right_end && right_begin < left_end;
-}
-
-static inline bool qwen38_mrope_ranges_overlap(
-    const at::Tensor& left, const at::Tensor& right) {
-    if (left.numel() == 0 || right.numel() == 0) {
-        return false;
-    }
-    if (left.is_contiguous() && right.is_contiguous()) {
-        const auto left_begin = reinterpret_cast<std::uintptr_t>(left.data_ptr());
-        const auto right_begin = reinterpret_cast<std::uintptr_t>(right.data_ptr());
-        const auto left_numel = static_cast<std::uintptr_t>(left.numel());
-        const auto right_numel = static_cast<std::uintptr_t>(right.numel());
-        if (left_numel > std::numeric_limits<std::uintptr_t>::max() /
-                left.element_size() ||
-            right_numel > std::numeric_limits<std::uintptr_t>::max() /
-                right.element_size()) {
-            return true;
-        }
-        return qwen38_mrope_byte_ranges_overlap(
-            left_begin, left_numel * left.element_size(), right_begin,
-            right_numel * right.element_size());
-    }
-
-    // Only positions may be non-contiguous under this ABI.  Its three rows are
-    // individually contiguous, so checking their exact intervals avoids both
-    // missing an alias in the capacity gap and rejecting a valid gap as an alias.
-    const at::Tensor& positions = left.is_contiguous() ? right : left;
-    const at::Tensor& contiguous = left.is_contiguous() ? left : right;
-    if (positions.dim() == 2 && positions.size(0) == 3 &&
-        positions.stride(1) == 1) {
-        const auto contiguous_begin =
-            reinterpret_cast<std::uintptr_t>(contiguous.data_ptr());
-        const auto contiguous_numel =
-            static_cast<std::uintptr_t>(contiguous.numel());
-        if (contiguous_numel > std::numeric_limits<std::uintptr_t>::max() /
-                contiguous.element_size()) {
-            return true;
-        }
-        const auto contiguous_bytes =
-            contiguous_numel * contiguous.element_size();
-        const auto row_bytes = static_cast<std::uintptr_t>(positions.size(1)) *
-            positions.element_size();
-        for (int64_t row = 0; row < positions.size(0); ++row) {
-            const auto row_offset = static_cast<std::uintptr_t>(row) *
-                static_cast<std::uintptr_t>(positions.stride(0)) *
-                positions.element_size();
-            const auto row_begin =
-                reinterpret_cast<std::uintptr_t>(positions.data_ptr()) + row_offset;
-            if (qwen38_mrope_byte_ranges_overlap(
-                    row_begin, row_bytes, contiguous_begin, contiguous_bytes)) {
-                return true;
-            }
-        }
-        return false;
-    }
-    return true;
 }
 
 at::Tensor esimd_gemv_fp8_pern(

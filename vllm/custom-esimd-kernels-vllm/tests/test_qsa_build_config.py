@@ -8,6 +8,7 @@ from qsa_build import (
     QSA_ATTENTION_PAGE_SIZES,
     QSA_DEFINES,
     QSA_EXTENSION_NAME,
+    QSA_INDEXER_POSTPROCESS_ABI_VERSION,
     QSA_ROW_STORE_ABI_VERSION,
     QSA_SELECTION_PAGE_SIZES,
     make_qsa_extension,
@@ -21,6 +22,7 @@ def test_qsa_extension_name_is_stable():
 def test_qsa_build_exposes_page_specialization_contract():
     assert QSA_ABI_VERSION == 2
     assert QSA_ROW_STORE_ABI_VERSION == 3
+    assert QSA_INDEXER_POSTPROCESS_ABI_VERSION == 1
     assert QSA_SELECTION_PAGE_SIZES == (64, 128)
     assert QSA_ATTENTION_PAGE_SIZES == (256, 512)
 
@@ -51,6 +53,7 @@ def test_qsa_build_contains_attention_and_selection_sources():
         "csrc/qsa/qsa_sparse_attention.sycl",
         "csrc/qsa/qsa_select_paged_tokens.sycl",
         "csrc/qsa/qsa_store_cache_rows.sycl",
+        "csrc/qsa/qsa_indexer_norm_rope.sycl",
     ]
 
 
