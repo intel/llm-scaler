@@ -510,6 +510,156 @@ def test_hc_combine_v1_rejects_wrong_shape_and_alias(
             torch.ops.custom_esimd_kernels_vllm.hc_combine_v1(*tensors)
 
 
+def _hc_combine_norm_reference(
+    hidden_states: torch.Tensor,
+    block_output: torch.Tensor,
+    injection: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    combined = (
+        hidden_states.float().reshape(1, 4, 2560)
+        + block_output.float().unsqueeze(1)
+        * (2.0 * torch.sigmoid(injection.float() / 4)).unsqueeze(-1)
+    ).reshape_as(hidden_states).to(hidden_states.dtype)
+    grouped = combined.float().reshape(1, 4, 2560)
+    inverse = torch.rsqrt(grouped.square().mean(dim=-1, keepdim=True) + eps)
+    normed = (
+        grouped * inverse * (1.0 + weight.float().reshape(1, 4, 2560))
+    ).reshape_as(hidden_states).to(hidden_states.dtype)
+    return combined, normed
+
+
+def test_hc_combine_norm_v1_matches_sequential_reference(
+    device: torch.device,
+) -> None:
+    torch.manual_seed(89)
+    eps = 1.0e-6
+    hidden_states = torch.randn(
+        (1, 10240), dtype=torch.float16, device=device
+    ) * 0.25
+    block_output = torch.randn(
+        (1, 2560), dtype=torch.float16, device=device
+    ) * 0.25
+    merged = torch.randn((1, 336), dtype=torch.float16, device=device)
+    injection = merged.split((320, 4, 12), dim=-1)[1]
+    weight = torch.randn((10240,), dtype=torch.float16, device=device) * 0.05
+    combined_output = torch.empty_like(hidden_states)
+    normed_output = torch.empty_like(hidden_states)
+    combined_pointer = combined_output.data_ptr()
+    normed_pointer = normed_output.data_ptr()
+    expected_combined, expected_normed = _hc_combine_norm_reference(
+        hidden_states, block_output, injection, weight, eps
+    )
+
+    torch.ops.custom_esimd_kernels_vllm.hc_combine_norm_v1(
+        hidden_states,
+        block_output,
+        injection,
+        weight,
+        combined_output,
+        normed_output,
+        eps,
+    )
+    torch.xpu.synchronize()
+
+    assert injection.storage_offset() == 320
+    assert combined_output.data_ptr() == combined_pointer
+    assert normed_output.data_ptr() == normed_pointer
+    torch.testing.assert_close(
+        combined_output, expected_combined, rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        normed_output, expected_normed, rtol=2e-2, atol=2e-2
+    )
+
+
+def test_hc_combine_norm_v1_rejects_contract_violations(
+    device: torch.device,
+) -> None:
+    hidden_states = torch.randn(
+        (1, 10240), dtype=torch.float16, device=device
+    )
+    block_output = torch.randn(
+        (1, 2560), dtype=torch.float16, device=device
+    )
+    injection = torch.randn((1, 4), dtype=torch.float16, device=device)
+    weight = torch.randn((10240,), dtype=torch.float16, device=device)
+    combined_output = torch.empty_like(hidden_states)
+    normed_output = torch.empty_like(hidden_states)
+
+    with pytest.raises(RuntimeError, match="expects hidden/combined/normed"):
+        torch.ops.custom_esimd_kernels_vllm.hc_combine_norm_v1(
+            hidden_states.repeat(2, 1),
+            block_output,
+            injection,
+            weight,
+            combined_output,
+            normed_output,
+            1.0e-6,
+        )
+    with pytest.raises(RuntimeError, match="must not share storage"):
+        torch.ops.custom_esimd_kernels_vllm.hc_combine_norm_v1(
+            hidden_states,
+            block_output,
+            injection,
+            weight,
+            hidden_states,
+            normed_output,
+            1.0e-6,
+        )
+    shared_outputs = torch.empty(
+        (1, 20480), dtype=torch.float16, device=device
+    )
+    with pytest.raises(RuntimeError, match="must not share storage"):
+        torch.ops.custom_esimd_kernels_vllm.hc_combine_norm_v1(
+            hidden_states,
+            block_output,
+            injection,
+            weight,
+            shared_outputs[:, :10240],
+            shared_outputs[:, 10240:],
+            1.0e-6,
+        )
+    weight_backing = torch.empty(
+        (1, 10240), dtype=torch.float16, device=device
+    )
+    with pytest.raises(RuntimeError, match="must not share storage"):
+        torch.ops.custom_esimd_kernels_vllm.hc_combine_norm_v1(
+            hidden_states,
+            block_output,
+            injection,
+            weight_backing.reshape(-1),
+            combined_output,
+            weight_backing,
+            1.0e-6,
+        )
+    odd_weight = torch.empty(
+        (10241,), dtype=torch.float16, device=device
+    )[1:]
+    with pytest.raises(RuntimeError, match="4-byte aligned"):
+        torch.ops.custom_esimd_kernels_vllm.hc_combine_norm_v1(
+            hidden_states,
+            block_output,
+            injection,
+            odd_weight,
+            combined_output,
+            normed_output,
+            1.0e-6,
+        )
+    for invalid_eps in (0.0, 1.0e-300):
+        with pytest.raises(RuntimeError, match="finite and positive"):
+            torch.ops.custom_esimd_kernels_vllm.hc_combine_norm_v1(
+                hidden_states,
+                block_output,
+                injection,
+                weight,
+                combined_output,
+                normed_output,
+                invalid_eps,
+            )
+
+
 def test_canonical_int4_projection_dispatch_and_golden(
     device: torch.device,
 ) -> None:

@@ -573,6 +573,113 @@ static void launch_hc_combine_v1(
     });
 }
 
+struct HcCombineNormV1Kernel {
+    const sycl::half* hidden_states;
+    const sycl::half* block_output;
+    const sycl::half* injection;
+    const sycl::half* weight;
+    sycl::half* combined_output;
+    sycl::half* normed_output;
+    float eps;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        const int64_t stream =
+            static_cast<int64_t>(item.get_group(0));
+        if (stream >= kHcCount) {
+            return;
+        }
+        const int64_t stream_offset =
+            stream * kHcHiddenSize;
+        const esimd::simd<float, 1> injection_value =
+            esimd::block_load<sycl::half, 1>(
+                injection + stream);
+        const float scaled_injection =
+            injection_value[0] / static_cast<float>(kHcCount);
+        const float injection_weight =
+            2.0f /
+            (1.0f + esimd::exp(
+                esimd::simd<float, 8>(-scaled_injection))[0]);
+
+        float sum_sq = 0.0f;
+#pragma unroll
+        for (int chunk = 0;
+             chunk < kHcCombineChunksPerStream;
+             ++chunk) {
+            const int64_t output_offset =
+                stream_offset + chunk * kHcCombineVectorLength;
+            const int64_t block_offset =
+                chunk * kHcCombineVectorLength;
+            esimd::simd<float, kHcCombineVectorLength> residual =
+                esimd::block_load<
+                    sycl::half, kHcCombineVectorLength>(
+                    hidden_states + output_offset);
+            const esimd::simd<float, kHcCombineVectorLength> block =
+                esimd::block_load<
+                    sycl::half, kHcCombineVectorLength>(
+                    block_output + block_offset);
+            residual += block * injection_weight;
+            const esimd::simd<
+                sycl::half, kHcCombineVectorLength> rounded(residual);
+            esimd::block_store<
+                sycl::half, kHcCombineVectorLength>(
+                combined_output + output_offset, rounded);
+            const esimd::simd<float, kHcCombineVectorLength> values =
+                rounded;
+            sum_sq += esimd::reduce<float>(
+                values * values, std::plus<>());
+        }
+
+        const float inverse = esimd::rsqrt(esimd::simd<float, 8>(
+            sum_sq / static_cast<float>(kHcHiddenSize) + eps))[0];
+#pragma unroll
+        for (int chunk = 0;
+             chunk < kHcCombineChunksPerStream;
+             ++chunk) {
+            const int64_t offset =
+                stream_offset + chunk * kHcCombineVectorLength;
+            const esimd::simd<float, kHcCombineVectorLength> values =
+                esimd::block_load<
+                    sycl::half, kHcCombineVectorLength>(
+                    combined_output + offset);
+            const esimd::simd<float, kHcCombineVectorLength> scales =
+                esimd::block_load<
+                    sycl::half, kHcCombineVectorLength>(
+                    weight + offset);
+            const esimd::simd<float, kHcCombineVectorLength> normalized =
+                values * inverse * (1.0f + scales);
+            esimd::block_store<
+                sycl::half, kHcCombineVectorLength>(
+                normed_output + offset,
+                esimd::simd<sycl::half, kHcCombineVectorLength>(
+                    normalized));
+        }
+    }
+};
+
+static void launch_hc_combine_norm_v1(
+    sycl::queue& queue,
+    const sycl::half* hidden_states,
+    const sycl::half* block_output,
+    const sycl::half* injection,
+    const sycl::half* weight,
+    sycl::half* combined_output,
+    sycl::half* normed_output,
+    float eps) {
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(
+                {static_cast<size_t>(kHcCount)}, {1}),
+            HcCombineNormV1Kernel{
+                hidden_states,
+                block_output,
+                injection,
+                weight,
+                combined_output,
+                normed_output,
+                eps});
+    });
+}
+
 static void launch_grouped_norm(
     sycl::queue& queue,
     const sycl::half* input,
@@ -1314,6 +1421,71 @@ at::Tensor hc_combine_v1(
             injection.data_ptr()),
         reinterpret_cast<sycl::half*>(output.data_ptr()));
     return output;
+}
+
+at::Tensor hc_combine_norm_v1(
+    at::Tensor hidden_states,
+    at::Tensor block_output,
+    at::Tensor injection,
+    at::Tensor weight,
+    at::Tensor combined_output,
+    at::Tensor normed_output,
+    double eps) {
+    check_primary_half(hidden_states, "hidden_states");
+    check_half(hidden_states, block_output, "block_output");
+    check_half(hidden_states, injection, "injection");
+    check_half(hidden_states, weight, "weight");
+    check_output(hidden_states, combined_output, "combined_output");
+    check_output(hidden_states, normed_output, "normed_output");
+    TORCH_CHECK(
+        hidden_states.dim() == 2 && hidden_states.size(0) == 1 &&
+            hidden_states.size(1) == kHcWidth &&
+            block_output.dim() == 2 && block_output.size(0) == 1 &&
+            block_output.size(1) == kHcHiddenSize &&
+            injection.dim() == 2 && injection.size(0) == 1 &&
+            injection.size(1) == kHcCount &&
+            weight.dim() == 1 && weight.numel() == kHcWidth &&
+            combined_output.sizes() == hidden_states.sizes() &&
+            normed_output.sizes() == hidden_states.sizes(),
+        "hc_combine_norm_v1 expects hidden/combined/normed [1, 10240], "
+        "block_output [1, 2560], injection [1, 4], and weight [10240]");
+    TORCH_CHECK(
+        !combined_output.is_alias_of(block_output) &&
+            !combined_output.is_alias_of(injection) &&
+            !combined_output.is_alias_of(weight) &&
+            !normed_output.is_alias_of(block_output) &&
+            !normed_output.is_alias_of(injection) &&
+            !normed_output.is_alias_of(weight) &&
+            !normed_output.is_alias_of(combined_output),
+        "hc_combine_norm_v1 outputs must not share storage with inputs "
+        "or each other");
+    TORCH_CHECK(
+        hidden_states.storage_offset() % 2 == 0 &&
+            block_output.storage_offset() % 2 == 0 &&
+            injection.storage_offset() % 2 == 0 &&
+            weight.storage_offset() % 2 == 0 &&
+            combined_output.storage_offset() % 2 == 0 &&
+            normed_output.storage_offset() % 2 == 0,
+        "hc_combine_norm_v1 requires 4-byte aligned tensor data");
+    const float eps_float = static_cast<float>(eps);
+    TORCH_CHECK(
+        std::isfinite(eps) && eps > 0.0 &&
+            std::isfinite(eps_float) && eps_float > 0.0f,
+        "hc_combine_norm_v1 eps must remain finite and positive in FP32");
+    auto& queue = get_device_queue(hidden_states);
+    launch_hc_combine_norm_v1(
+        queue,
+        reinterpret_cast<const sycl::half*>(
+            hidden_states.data_ptr()),
+        reinterpret_cast<const sycl::half*>(
+            block_output.data_ptr()),
+        reinterpret_cast<const sycl::half*>(
+            injection.data_ptr()),
+        reinterpret_cast<const sycl::half*>(weight.data_ptr()),
+        reinterpret_cast<sycl::half*>(combined_output.data_ptr()),
+        reinterpret_cast<sycl::half*>(normed_output.data_ptr()),
+        eps_float);
+    return combined_output;
 }
 
 at::Tensor score_gate(

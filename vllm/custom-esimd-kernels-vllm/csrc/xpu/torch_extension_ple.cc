@@ -62,6 +62,19 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
                hidden_states, block_output, injection, output);
          });
 
+  m.def("hc_combine_norm_v1(Tensor hidden_states, Tensor block_output, "
+        "Tensor injection, Tensor weight, Tensor(a!) combined_output, "
+        "Tensor(b!) normed_output, float eps) -> ()");
+  m.impl("hc_combine_norm_v1", torch::kXPU,
+         [](at::Tensor hidden_states, at::Tensor block_output,
+            at::Tensor injection, at::Tensor weight,
+            at::Tensor combined_output, at::Tensor normed_output,
+            double eps) -> void {
+           ple::hc_combine_norm_v1(
+               hidden_states, block_output, injection, weight,
+               combined_output, normed_output, eps);
+         });
+
   m.def("ple_score_gate(Tensor key, Tensor query, Tensor(a!) output, "
         "int hidden_size) -> ()");
   m.impl("ple_score_gate", torch::kXPU,

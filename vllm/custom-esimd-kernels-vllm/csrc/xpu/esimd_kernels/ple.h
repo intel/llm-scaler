@@ -46,6 +46,15 @@ at::Tensor hc_combine_v1(
     at::Tensor injection,
     at::Tensor output);
 
+at::Tensor hc_combine_norm_v1(
+    at::Tensor hidden_states,
+    at::Tensor block_output,
+    at::Tensor injection,
+    at::Tensor weight,
+    at::Tensor combined_output,
+    at::Tensor normed_output,
+    double eps);
+
 at::Tensor score_gate(
     at::Tensor key,
     at::Tensor query,
