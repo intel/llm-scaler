@@ -160,6 +160,21 @@ def ple_gated_value(
     return output
 
 
+def ple_gated_value_grouped_norm(
+    gate: torch.Tensor,
+    value: torch.Tensor,
+    weight: torch.Tensor,
+    raw_output: torch.Tensor,
+    normalized_output: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Write rounded gated values and their grouped norm in one launch."""
+    _ops.ple_gated_value_grouped_norm(
+        gate, value, weight, raw_output, normalized_output, eps
+    )
+    return raw_output, normalized_output
+
+
 def ple_residual_add(
     gated_value_flat: torch.Tensor,
     conv_output: torch.Tensor,

@@ -466,6 +466,82 @@ static void launch_hc_grouped_norm_v1(
     });
 }
 
+struct PleGatedValueGroupedNormV1Kernel {
+    const sycl::half* gate;
+    const sycl::half* value;
+    const sycl::half* weight;
+    sycl::half* raw_output;
+    sycl::half* normalized_output;
+    float eps;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        const int64_t group = static_cast<int64_t>(item.get_group(0));
+        if (group >= kHcCount) {
+            return;
+        }
+        const int64_t group_offset = group * kHcHiddenSize;
+        const esimd::simd<float, kHcCount> gate_values =
+            esimd::block_load<sycl::half, kHcCount>(gate);
+        const float gate_value = gate_values[group];
+        float sum_sq = 0.0f;
+#pragma unroll
+        for (int chunk = 0; chunk < kHcNormChunks; ++chunk) {
+            const int64_t value_offset = chunk * kHcNormVectorLength;
+            const int64_t output_offset = group_offset + value_offset;
+            const esimd::simd<float, kHcNormVectorLength> values =
+                esimd::block_load<sycl::half, kHcNormVectorLength>(
+                    value + value_offset);
+            const esimd::simd<sycl::half, kHcNormVectorLength> rounded(
+                values * gate_value);
+            esimd::block_store<sycl::half, kHcNormVectorLength>(
+                raw_output + output_offset, rounded);
+            const esimd::simd<float, kHcNormVectorLength> raw_values = rounded;
+            sum_sq += esimd::reduce<float>(
+                raw_values * raw_values, std::plus<>());
+        }
+
+        const float inverse = esimd::rsqrt(esimd::simd<float, 8>(
+            sum_sq / static_cast<float>(kHcHiddenSize) + eps))[0];
+#pragma unroll
+        for (int chunk = 0; chunk < kHcNormChunks; ++chunk) {
+            const int64_t offset =
+                group_offset + chunk * kHcNormVectorLength;
+            const esimd::simd<float, kHcNormVectorLength> raw_values =
+                esimd::block_load<sycl::half, kHcNormVectorLength>(
+                    raw_output + offset);
+            const esimd::simd<float, kHcNormVectorLength> scales =
+                esimd::block_load<sycl::half, kHcNormVectorLength>(
+                    weight + offset);
+            const esimd::simd<float, kHcNormVectorLength> normalized =
+                raw_values * inverse * (1.0f + scales);
+            esimd::block_store<sycl::half, kHcNormVectorLength>(
+                normalized_output + offset,
+                esimd::simd<sycl::half, kHcNormVectorLength>(normalized));
+        }
+    }
+};
+
+static void launch_ple_gated_value_grouped_norm_v1(
+    sycl::queue& queue,
+    const sycl::half* gate,
+    const sycl::half* value,
+    const sycl::half* weight,
+    sycl::half* raw_output,
+    sycl::half* normalized_output,
+    float eps) {
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>({static_cast<size_t>(kHcCount)}, {1}),
+            PleGatedValueGroupedNormV1Kernel{
+                gate,
+                value,
+                weight,
+                raw_output,
+                normalized_output,
+                eps});
+    });
+}
+
 struct HcGateMixV1Kernel {
     const sycl::half* input;
     const sycl::half* gate;
@@ -1623,6 +1699,62 @@ at::Tensor gated_value(
         reinterpret_cast<sycl::half*>(output.data_ptr()), rows, hc_count,
         hidden_size);
     return output;
+}
+
+at::Tensor gated_value_grouped_norm(
+    at::Tensor gate,
+    at::Tensor value,
+    at::Tensor weight,
+    at::Tensor raw_output,
+    at::Tensor normalized_output,
+    double eps) {
+    check_primary_half(gate, "gate");
+    check_half(gate, value, "value");
+    check_half(gate, weight, "weight");
+    check_output(gate, raw_output, "raw_output");
+    check_output(gate, normalized_output, "normalized_output");
+    TORCH_CHECK(
+        gate.dim() == 2 && gate.size(0) == 1 &&
+            gate.size(1) == kHcCount && value.dim() == 2 &&
+            value.size(0) == 1 && value.size(1) == kHcHiddenSize &&
+            weight.dim() == 1 && weight.numel() == kHcWidth &&
+            raw_output.dim() == 2 && raw_output.size(0) == 1 &&
+            raw_output.size(1) == kHcWidth &&
+            normalized_output.sizes() == raw_output.sizes(),
+        "ple_gated_value_grouped_norm expects gate [1, 4], value [1, 2560], "
+        "weight [10240], and raw/normalized outputs [1, 10240]");
+    TORCH_CHECK(
+        !raw_output.is_alias_of(value) &&
+            !raw_output.is_alias_of(weight) &&
+            !normalized_output.is_alias_of(value) &&
+            !normalized_output.is_alias_of(weight) &&
+            !normalized_output.is_alias_of(raw_output),
+        "ple_gated_value_grouped_norm outputs must not share storage with "
+        "inputs or each other");
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(gate.data_ptr()) % 4 == 0 &&
+            reinterpret_cast<std::uintptr_t>(value.data_ptr()) % 4 == 0 &&
+            reinterpret_cast<std::uintptr_t>(weight.data_ptr()) % 4 == 0 &&
+            reinterpret_cast<std::uintptr_t>(raw_output.data_ptr()) % 4 == 0 &&
+            reinterpret_cast<std::uintptr_t>(
+                normalized_output.data_ptr()) % 4 == 0,
+        "ple_gated_value_grouped_norm requires 4-byte aligned tensor data");
+    const float eps_float = static_cast<float>(eps);
+    TORCH_CHECK(
+        std::isfinite(eps) && eps > 0.0 &&
+            std::isfinite(eps_float) && eps_float > 0.0f,
+        "ple_gated_value_grouped_norm eps must remain finite and positive "
+        "in FP32");
+    auto& queue = get_device_queue(gate);
+    launch_ple_gated_value_grouped_norm_v1(
+        queue,
+        reinterpret_cast<const sycl::half*>(gate.data_ptr()),
+        reinterpret_cast<const sycl::half*>(value.data_ptr()),
+        reinterpret_cast<const sycl::half*>(weight.data_ptr()),
+        reinterpret_cast<sycl::half*>(raw_output.data_ptr()),
+        reinterpret_cast<sycl::half*>(normalized_output.data_ptr()),
+        eps_float);
+    return raw_output;
 }
 
 at::Tensor residual_add(

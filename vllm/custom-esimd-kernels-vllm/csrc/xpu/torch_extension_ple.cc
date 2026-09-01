@@ -91,6 +91,17 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
            ple::gated_value(gate, value, output, hc_count);
          });
 
+  m.def("ple_gated_value_grouped_norm(Tensor gate, Tensor value, "
+        "Tensor weight, Tensor(a!) raw_output, "
+        "Tensor(b!) normalized_output, float eps) -> ()");
+  m.impl("ple_gated_value_grouped_norm", torch::kXPU,
+         [](at::Tensor gate, at::Tensor value, at::Tensor weight,
+            at::Tensor raw_output, at::Tensor normalized_output,
+            double eps) -> void {
+           ple::gated_value_grouped_norm(
+               gate, value, weight, raw_output, normalized_output, eps);
+         });
+
   m.def("ple_residual_add(Tensor gated_value_flat, Tensor conv_output, "
         "Tensor(a!) output) -> ()");
   m.impl("ple_residual_add", torch::kXPU,

@@ -31,6 +31,7 @@ from custom_esimd_kernels_vllm.ops import (
     ple_grouped_norm,
     ple_score_gate,
     ple_gated_value,
+    ple_gated_value_grouped_norm,
     ple_gated_value_norm,
     ple_embedding_assemble,
     ple_projection_int4,

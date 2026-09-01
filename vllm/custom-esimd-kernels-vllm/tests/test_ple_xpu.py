@@ -288,6 +288,111 @@ def _score_gate_reference(
     return torch.sigmoid(signed_root).to(key.dtype)
 
 
+def test_ple_gated_value_grouped_norm_matches_split_and_reference(
+    device: torch.device,
+) -> None:
+    torch.manual_seed(49)
+    gate = torch.randn((1, 4), dtype=torch.float16, device=device)
+    value = torch.randn((1, 2560), dtype=torch.float16, device=device) * 0.25
+    weight = torch.randn((10240,), dtype=torch.float16, device=device) * 0.05
+    split_raw = torch.empty((1, 10240), dtype=torch.float16, device=device)
+    split_normalized = torch.empty_like(split_raw)
+    fused_raw = torch.empty_like(split_raw)
+    fused_normalized = torch.empty_like(split_raw)
+    raw_pointer = fused_raw.data_ptr()
+    normalized_pointer = fused_normalized.data_ptr()
+    eps = 1.0e-5
+
+    torch.ops.custom_esimd_kernels_vllm.ple_gated_value(
+        gate, value, split_raw.view(1, 4, 2560), 4
+    )
+    torch.ops.custom_esimd_kernels_vllm.ple_grouped_norm(
+        split_raw, weight, split_normalized, eps, 2560
+    )
+    torch.ops.custom_esimd_kernels_vllm.ple_gated_value_grouped_norm(
+        gate, value, weight, fused_raw, fused_normalized, eps
+    )
+    torch.xpu.synchronize()
+
+    expected_raw = (
+        gate.float().unsqueeze(-1) * value.float().unsqueeze(1)
+    ).to(torch.float16).reshape(1, 10240)
+    grouped = expected_raw.float().reshape(1, 4, 2560)
+    variance = grouped.square().mean(-1, keepdim=True)
+    expected_normalized = (
+        grouped * torch.rsqrt(variance + eps)
+    ).reshape(1, 10240) * (1.0 + weight.float())
+    expected_normalized = expected_normalized.to(torch.float16)
+
+    assert fused_raw.data_ptr() == raw_pointer
+    assert fused_normalized.data_ptr() == normalized_pointer
+    torch.testing.assert_close(fused_raw, expected_raw, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(fused_raw, split_raw, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        fused_normalized, expected_normalized, rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        fused_normalized, split_normalized, rtol=0.0, atol=0.0
+    )
+
+
+def test_ple_gated_value_grouped_norm_rejects_contract_violations(
+    device: torch.device,
+) -> None:
+    gate = torch.ones((1, 4), dtype=torch.float16, device=device)
+    value = torch.ones((1, 2560), dtype=torch.float16, device=device)
+    weight = torch.ones((10240,), dtype=torch.float16, device=device)
+    raw_output = torch.full(
+        (1, 10240), 19.0, dtype=torch.float16, device=device
+    )
+    normalized_output = torch.full_like(raw_output, 23.0)
+    operation = (
+        torch.ops.custom_esimd_kernels_vllm.ple_gated_value_grouped_norm
+    )
+
+    with pytest.raises(RuntimeError, match="expects gate"):
+        operation(
+            gate.reshape(4),
+            value,
+            weight,
+            raw_output,
+            normalized_output,
+            1.0e-5,
+        )
+    with pytest.raises(RuntimeError, match="must not share storage"):
+        operation(
+            gate, value, weight, raw_output, raw_output, 1.0e-5
+        )
+
+    odd_backing = torch.empty(
+        (2561,), dtype=torch.float16, device=device
+    )
+    odd_value = odd_backing[1:].reshape_as(value)
+    with pytest.raises(RuntimeError, match="4-byte aligned"):
+        operation(
+            gate,
+            odd_value,
+            weight,
+            raw_output,
+            normalized_output,
+            1.0e-5,
+        )
+    with pytest.raises(RuntimeError, match="remain finite and positive"):
+        operation(
+            gate,
+            value,
+            weight,
+            raw_output,
+            normalized_output,
+            1.0e-50,
+        )
+
+    assert torch.equal(raw_output, torch.full_like(raw_output, 19.0))
+    assert torch.equal(
+        normalized_output, torch.full_like(normalized_output, 23.0)
+    )
+
+
 @pytest.mark.parametrize(
     ("input_shape", "output_shape"),
     [((1, 10240), (1, 4)), ((1, 4, 2560), (1, 4, 1))],

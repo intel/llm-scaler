@@ -584,6 +584,7 @@ def test_production_main_dso_is_the_single_ple_owner() -> None:
         "hc_combine_norm_v1",
         "ple_score_gate",
         "ple_gated_value",
+        "ple_gated_value_grouped_norm",
         "ple_residual_add",
         "ple_short_conv_decode",
         "ple_short_conv_decode_trusted",

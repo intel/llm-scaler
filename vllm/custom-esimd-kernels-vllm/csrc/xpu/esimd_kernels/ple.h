@@ -67,6 +67,14 @@ at::Tensor gated_value(
     at::Tensor output,
     int64_t hc_count);
 
+at::Tensor gated_value_grouped_norm(
+    at::Tensor gate,
+    at::Tensor value,
+    at::Tensor weight,
+    at::Tensor raw_output,
+    at::Tensor normalized_output,
+    double eps);
+
 at::Tensor residual_add(
     at::Tensor gated_value_flat,
     at::Tensor conv_output,
