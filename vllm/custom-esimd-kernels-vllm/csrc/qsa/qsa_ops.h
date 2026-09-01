@@ -30,6 +30,11 @@ at::Tensor select_paged_tokens_v2(
     int64_t compressed_page_size,
     at::Tensor out);
 
+at::Tensor store_cache_rows_v3(
+    at::Tensor cache,
+    const at::Tensor& slot_mapping,
+    const at::Tensor& rows);
+
 }  // namespace qsa
 
 at::Tensor sparse_paged_attention_v2(

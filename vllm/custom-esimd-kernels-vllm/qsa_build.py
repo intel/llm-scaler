@@ -4,9 +4,9 @@ from pathlib import Path
 
 from torch.utils.cpp_extension import SyclExtension
 
-
 QSA_EXTENSION_NAME = "custom_esimd_kernels_vllm.qsa_ops"
 QSA_ABI_VERSION = 2
+QSA_ROW_STORE_ABI_VERSION = 3
 QSA_SELECTION_PAGE_SIZES = (64, 128)
 QSA_ATTENTION_PAGE_SIZES = (256, 512)
 QSA_DEFINES = (
@@ -45,6 +45,7 @@ def make_qsa_extension(
         sources=[
             "csrc/qsa/qsa_sparse_attention.sycl",
             "csrc/qsa/qsa_select_paged_tokens.sycl",
+            "csrc/qsa/qsa_store_cache_rows.sycl",
         ],
         include_dirs=[root / "csrc" / "qsa"],
         extra_compile_args={

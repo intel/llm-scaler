@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 import torch
 
-
 HEADS = 3
 HEAD_DIM = 256
 INDEX_WIDTH = 2051
@@ -155,6 +154,17 @@ def _reference(
 
 def test_qsa_module_contract(qsa_ops):
     assert qsa_ops.qsa_abi_version == 2
+    assert qsa_ops.qsa_row_store_abi_version == 3
+    assert callable(qsa_ops.qsa_store_cache_rows_v3)
+    assert qsa_ops.row_store_predicated_bounds == 1
+    assert qsa_ops.row_store_duplicate_slots_last_write == 1
+    assert qsa_ops.row_store_strided_rows == 1
+    assert qsa_ops.row_store_storage_offsets == 1
+    assert qsa_ops.row_store_inner_contiguous == 1
+    assert qsa_ops.row_store_no_workspace == 1
+    assert qsa_ops.row_store_fp16_width == 128
+    assert qsa_ops.row_store_bf16_width == 128
+    assert qsa_ops.row_store_int64_width == 3
     assert qsa_ops.selection_page_sizes == (64, 128)
     assert qsa_ops.attention_page_sizes == (256, 512)
     assert qsa_ops.activation_dtype == "float16"

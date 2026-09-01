@@ -803,7 +803,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       "qsa_select_paged_tokens_v2",
       &qsa::select_paged_tokens_v2,
       "Qwen3.8 page-specialized fused paged index selection and expansion (XPU)");
+  module.def(
+      "qsa_store_cache_rows_v3",
+      &qsa::store_cache_rows_v3,
+      "Qwen3.8 predicated strided QSA cache row-store (XPU)");
   module.attr("qsa_abi_version") = 2;
+  module.attr("qsa_row_store_abi_version") = 3;
+  module.attr("row_store_predicated_bounds") = 1;
+  module.attr("row_store_duplicate_slots_last_write") = 1;
+  module.attr("row_store_strided_rows") = 1;
+  module.attr("row_store_storage_offsets") = 1;
+  module.attr("row_store_inner_contiguous") = 1;
+  module.attr("row_store_no_workspace") = 1;
+  module.attr("row_store_fp16_width") = 128;
+  module.attr("row_store_bf16_width") = 128;
+  module.attr("row_store_int64_width") = 3;
   module.attr("selection_page_sizes") = py::make_tuple(64, 128);
   module.attr("attention_page_sizes") = py::make_tuple(256, 512);
   module.attr("kv_tile") = QSA_NATIVE_KV_TILE;
