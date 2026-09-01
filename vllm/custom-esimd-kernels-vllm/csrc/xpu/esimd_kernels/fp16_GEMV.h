@@ -35,7 +35,27 @@ SYCL_ESIMD_FUNCTION inline float gelu_tanh_scalar_esimd(float x) {
     return (0.5f * xv * (1.0f + tanh_v))[0];
 }
 
-template<int VL, int K_SPLIT>
+constexpr int kHcDownSiluWidth = 320;
+
+template<bool APPLY_HC_DOWN_EPILOGUE>
+SYCL_ESIMD_FUNCTION inline fp16 gemv_fp16_epilogue(float value, int n) {
+    const fp16 rounded_linear(value);
+    if constexpr (APPLY_HC_DOWN_EPILOGUE) {
+        if (n < kHcDownSiluWidth) {
+            // Preserve F.linear(fp16) -> fp16 division -> SiLU ordering.
+            const fp16 rounded_scaled(
+                static_cast<float>(rounded_linear) * 0.25f);
+            const simd<float, 1> scaled(
+                static_cast<float>(rounded_scaled));
+            const simd<float, 1> activated =
+                scaled / (1.0f + esimd_math::exp<float, 1>(-scaled));
+            return fp16(activated[0]);
+        }
+    }
+    return rounded_linear;
+}
+
+template<int VL, int K_SPLIT, bool APPLY_HC_DOWN_EPILOGUE = false>
 struct GEMV_fp16_kernel {
     const fp16* input;
     const fp16* weight;
@@ -71,14 +91,16 @@ struct GEMV_fp16_kernel {
         float my_sum = reduce<float>(acc, std::plus<>());
 
         if constexpr (K_SPLIT == 1) {
-            output[(size_t)m * N + n] = fp16(my_sum);
+            output[(size_t)m * N + n] =
+                gemv_fp16_epilogue<APPLY_HC_DOWN_EPILOGUE>(my_sum, n);
         } else {
             slm_block_store<float, 1>(lid * sizeof(float), simd<float, 1>(my_sum));
             barrier();
             if (lid == 0) {
                 simd<float, K_SPLIT> parts = slm_block_load<float, K_SPLIT>(0);
-                output[(size_t)m * N + n] = fp16(
-                    reduce<float>(parts, std::plus<>()));
+                output[(size_t)m * N + n] =
+                    gemv_fp16_epilogue<APPLY_HC_DOWN_EPILOGUE>(
+                        reduce<float>(parts, std::plus<>()), n);
             }
         }
     }
@@ -191,7 +213,8 @@ inline void select_vl_ks_fp16(uint32_t N, uint32_t K, int& vl, int& ks) {
     vl = 1;
 }
 
-inline void GEMV_fp16_host(
+template<bool APPLY_HC_DOWN_EPILOGUE>
+inline void GEMV_fp16_host_impl(
     const fp16* input,
     const fp16* weight,
     fp16*       output,
@@ -206,7 +229,7 @@ inline void GEMV_fp16_host(
     uint32_t global = M * N * ks;
     uint32_t local  = ks;
 
-    #define LAUNCH(V, KS)         q.submit([&](sycl::handler& cgh) {             cgh.parallel_for(                 sycl::nd_range<1>(global, local),                 GEMV_fp16_kernel<V, KS>{input, weight, output, (int)N, (int)K});         });
+    #define LAUNCH(V, KS)         q.submit([&](sycl::handler& cgh) {             cgh.parallel_for(                 sycl::nd_range<1>(global, local),                 GEMV_fp16_kernel<V, KS, APPLY_HC_DOWN_EPILOGUE>{input, weight, output, (int)N, (int)K});         });
 
     if      (vl == 512 && ks == 1) { LAUNCH(512, 1) }
     else if (vl == 256 && ks == 1) { LAUNCH(256, 1) }
@@ -247,6 +270,26 @@ inline void GEMV_fp16_host(
     }
 
     #undef LAUNCH
+}
+
+inline void GEMV_fp16_host(
+    const fp16* input,
+    const fp16* weight,
+    fp16* output,
+    uint32_t M,
+    uint32_t N,
+    uint32_t K,
+    sycl::queue& q) {
+    GEMV_fp16_host_impl<false>(input, weight, output, M, N, K, q);
+}
+
+inline void GEMV_fp16_hc_down_host(
+    const fp16* input,
+    const fp16* weight,
+    fp16* output,
+    uint32_t N,
+    sycl::queue& q) {
+    GEMV_fp16_host_impl<true>(input, weight, output, 1, N, 10240, q);
 }
 
 inline void GEMV_fp16_gelu_mul_host(

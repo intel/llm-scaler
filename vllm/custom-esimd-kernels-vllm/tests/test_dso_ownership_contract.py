@@ -1117,6 +1117,10 @@ def test_projection_schemas_declare_caller_owned_outputs() -> None:
         'esimd_gemv_fp16(Tensor input, Tensor weight, '
         'Tensor(a!) output) -> Tensor(a!)' in gemv_source
     )
+    assert (
+        'esimd_hc_down_fp16_out(Tensor input, Tensor weight, '
+        'Tensor(a!) output) -> ()' in gemv_source
+    )
     assert 'esimd_gemv_int4(Tensor input, Tensor weight, Tensor weight_scale, ' in gemv_source
     assert 'Tensor(a!) output) -> Tensor(a!)' in gemv_source
     assert 'esimd_gemm_int4_pgrp(Tensor input, Tensor weight, Tensor weight_scale, ' in gemm_source

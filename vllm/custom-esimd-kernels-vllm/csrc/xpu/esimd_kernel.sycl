@@ -134,6 +134,52 @@ at::Tensor esimd_gemv_fp16(
     return output;
 }
 
+void esimd_hc_down_fp16_out(
+    at::Tensor input,
+    at::Tensor weight,
+    at::Tensor output) {
+    TORCH_CHECK(
+        input.scalar_type() == at::ScalarType::Half &&
+            weight.scalar_type() == at::ScalarType::Half &&
+            output.scalar_type() == at::ScalarType::Half,
+        "esimd_hc_down_fp16_out requires FP16 tensors");
+    TORCH_CHECK(
+        input.dim() == 2 && input.size(0) == 1 && input.size(1) == 10240,
+        "esimd_hc_down_fp16_out input must have shape [1, 10240]");
+    TORCH_CHECK(
+        weight.dim() == 2 && weight.size(1) == 10240 &&
+            (weight.size(0) == 320 || weight.size(0) == 336),
+        "esimd_hc_down_fp16_out weight must have shape [320, 10240] "
+        "or [336, 10240]");
+    const int64_t N = weight.size(0);
+    TORCH_CHECK(
+        output.dim() == 2 && output.size(0) == 1 && output.size(1) == N,
+        "esimd_hc_down_fp16_out output must have shape [1, N]");
+    TORCH_CHECK(
+        input.is_contiguous() && weight.is_contiguous() &&
+            output.is_contiguous(),
+        "esimd_hc_down_fp16_out tensors must be contiguous");
+    TORCH_CHECK(
+        input.device() == weight.device() && input.device() == output.device(),
+        "esimd_hc_down_fp16_out tensors must be on the same XPU device");
+    TORCH_CHECK(
+        !output.is_alias_of(input) && !output.is_alias_of(weight),
+        "esimd_hc_down_fp16_out output must not alias input or weight");
+    TORCH_CHECK(
+        input.storage_offset() % 2 == 0 &&
+            weight.storage_offset() % 2 == 0 &&
+            output.storage_offset() % 2 == 0,
+        "esimd_hc_down_fp16_out tensors must be 4-byte aligned");
+
+    auto& dpcpp_queue = get_device_queue(input);
+    GEMV_fp16_hc_down_host(
+        reinterpret_cast<const fp16*>(input.data_ptr()),
+        reinterpret_cast<const fp16*>(weight.data_ptr()),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        static_cast<uint32_t>(N),
+        dpcpp_queue);
+}
+
 at::Tensor esimd_gemv_fp16_gelu_mul(
     at::Tensor input,
     at::Tensor weight,

@@ -38,6 +38,11 @@ at::Tensor esimd_gemv_fp8_pert(
 at::Tensor esimd_gemv_fp16(
     at::Tensor input, at::Tensor weight, at::Tensor output);
 
+// Qwen3.8 HC down GEMV.  The first 320 outputs receive SiLU(x / 4)
+// after the linear FP16 rounding boundary; an optional 16-row tail stays linear.
+void esimd_hc_down_fp16_out(
+    at::Tensor input, at::Tensor weight, at::Tensor output);
+
 // Fused FP16 gate-up GEMV plus GELU-tanh and multiply for Gemma MTP.
 // weight is [2*N, K] with gate rows followed by up rows; output is [1, N].
 at::Tensor esimd_gemv_fp16_gelu_mul(
