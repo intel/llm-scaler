@@ -6,6 +6,7 @@
 #include <torch/python.h>
 
 #include <cstdint>
+#include <limits>
 
 #include "esimd_kernels/fp8_GEMV_v2.h"
 #include "esimd_kernels/fp8_GEMV_bmg.h"
@@ -37,6 +38,35 @@ inline int get_fp8_mode(const at::Tensor& weight) {
 // Get queue for the specific device (multi-card safe)
 static inline sycl::queue& get_device_queue(const at::Tensor& tensor) {
     return c10::xpu::getCurrentXPUStream(tensor.device().index()).queue();
+}
+
+// The MRoPE ABI requires contiguous tensors, so data_ptr()+numel*element_size
+// describes the complete physical byte range. Unlike is_alias_of(), this also
+// catches independently wrapped storage such as a same-address DLPack view.
+static inline bool qwen38_mrope_ranges_overlap(
+    const at::Tensor& left, const at::Tensor& right) {
+    if (left.numel() == 0 || right.numel() == 0) {
+        return false;
+    }
+    constexpr auto kMaxAddress =
+        std::numeric_limits<std::uintptr_t>::max();
+    const auto left_begin = reinterpret_cast<std::uintptr_t>(left.data_ptr());
+    const auto right_begin = reinterpret_cast<std::uintptr_t>(right.data_ptr());
+    const auto left_numel = static_cast<std::uintptr_t>(left.numel());
+    const auto right_numel = static_cast<std::uintptr_t>(right.numel());
+    if (left_numel > kMaxAddress / left.element_size() ||
+        right_numel > kMaxAddress / right.element_size()) {
+        return true;
+    }
+    const auto left_bytes = left_numel * left.element_size();
+    const auto right_bytes = right_numel * right.element_size();
+    if (left_begin > kMaxAddress - left_bytes ||
+        right_begin > kMaxAddress - right_bytes) {
+        return true;
+    }
+    const auto left_end = left_begin + left_bytes;
+    const auto right_end = right_begin + right_bytes;
+    return left_begin < right_end && right_begin < left_end;
 }
 
 at::Tensor esimd_gemv_fp8_pern(
@@ -326,6 +356,162 @@ at::Tensor esimd_qkv_split_norm_rope(
         ntoks, hiddenDim,
         (uint32_t)q_heads, (uint32_t)kv_heads,
         attn_output_gate, (uint32_t)rotary_dim, dpcpp_queue);
+    return q_out;
+}
+
+// Qwen3.8 exact 3-axis interleaved MRoPE variant.  This is deliberately a
+// separate versioned entry point: it consumes [T,H,W] positions directly and
+// never collapses them to positions[0].
+template <typename PosT>
+static void qkv_split_norm_rope_mrope_v1_host(
+    uint8_t* qkvState, uint8_t* qState, uint8_t* gateState,
+    uint8_t* kState, uint8_t* vState, uint8_t* normWq, uint8_t* normWk,
+    const PosT* ropePos, fp16* ropeCosSinCache, uint32_t ntoks,
+    uint32_t hiddenDim, uint32_t qHead, uint32_t kvHead, bool attnOutputGate,
+    sycl::queue& q) {
+    constexpr uint32_t headDim = 256;
+    const uint32_t totalHeads = attnOutputGate
+        ? (2 * qHead + 2 * kvHead)
+        : (qHead + 2 * kvHead);
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>(totalHeads, ntoks),
+                              sycl::range<2>(1, 1)),
+            [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+                qkv_split_norm_rope_kernel<PosT>(
+                    qkvState, qState, gateState, kState, vState,
+                    normWq, normWk, nullptr, ropePos, ropeCosSinCache,
+                    ntoks, hiddenDim, headDim, qHead, kvHead, 64, true, ndi);
+            });
+    });
+}
+
+at::Tensor esimd_qkv_split_norm_rope_mrope_v1(
+    at::Tensor qkv_state, at::Tensor q_out, at::Tensor gate_out,
+    at::Tensor k_out, at::Tensor v_out, at::Tensor norm_wq, at::Tensor norm_wk,
+    at::Tensor positions, int64_t q_heads, int64_t kv_heads,
+    bool attn_output_gate, bool positions_bounds_proven,
+    at::Tensor cos_sin_cache) {
+    TORCH_CHECK(
+        qkv_state.defined() && q_out.defined() && gate_out.defined() &&
+            k_out.defined() && v_out.defined() && norm_wq.defined() &&
+            norm_wk.defined() && positions.defined() && cos_sin_cache.defined(),
+        "Qwen3.8 MRoPE v1 received an undefined tensor");
+    TORCH_CHECK(
+        qkv_state.device().type() == c10::DeviceType::XPU,
+        "qkv_state must be an XPU tensor");
+    TORCH_CHECK(
+        qkv_state.scalar_type() == at::kHalf && qkv_state.dim() == 2,
+        "qkv_state must be a 2D float16 tensor");
+    TORCH_CHECK(
+        q_heads == 3 && kv_heads == 1 && attn_output_gate,
+        "Qwen3.8 MRoPE v1 requires local q_heads=3, kv_heads=1 and a gate");
+    // The native path cannot inspect XPU position values without introducing
+    // a synchronizing D2H read. QSA passes this proof bit only after scheduler
+    // metadata establishes 0 <= position < cache rows.
+    TORCH_CHECK(
+        positions_bounds_proven,
+        "Qwen3.8 MRoPE v1 requires a trusted scheduler position-bound proof");
+    const auto ntoks = qkv_state.size(0);
+    TORCH_CHECK(
+        ntoks >= 1 && ntoks <= 64 && qkv_state.size(1) == 2048,
+        "Qwen3.8 MRoPE v1 requires [1..64, 2048] qkv_state");
+    TORCH_CHECK(
+        positions.dim() == 2 && positions.size(0) == 3 &&
+            positions.size(1) == ntoks &&
+            (positions.scalar_type() == at::kInt ||
+             positions.scalar_type() == at::kLong),
+        "positions must be contiguous [3, nTokens] int32 or int64");
+    TORCH_CHECK(
+        norm_wq.scalar_type() == at::kHalf && norm_wk.scalar_type() == at::kHalf &&
+            norm_wq.dim() == 1 && norm_wk.dim() == 1 &&
+            norm_wq.size(0) == 256 && norm_wk.size(0) == 256,
+        "Qwen3.8 MRoPE v1 norm weights must be float16 [256]");
+    TORCH_CHECK(
+        cos_sin_cache.scalar_type() == at::kHalf &&
+            cos_sin_cache.dim() == 2 && cos_sin_cache.size(0) > 0 &&
+            cos_sin_cache.size(1) == 64 &&
+            cos_sin_cache.size(0) <=
+                static_cast<int64_t>(std::numeric_limits<uint32_t>::max() / 64),
+        "cos_sin_cache must have shape [max_pos, 64] float16 with a safe row offset");
+    TORCH_CHECK(
+        q_out.scalar_type() == at::kHalf && gate_out.scalar_type() == at::kHalf &&
+            k_out.scalar_type() == at::kHalf && v_out.scalar_type() == at::kHalf &&
+            q_out.sizes() == at::IntArrayRef({ntoks, 768}) &&
+            gate_out.sizes() == at::IntArrayRef({ntoks, 768}) &&
+            k_out.sizes() == at::IntArrayRef({ntoks, 256}) &&
+            v_out.sizes() == at::IntArrayRef({ntoks, 256}),
+        "Qwen3.8 MRoPE v1 output shapes must be Q/G[T,768] and K/V[T,256]");
+
+    const at::Tensor all_tensors[] = {
+        qkv_state, q_out, gate_out, k_out, v_out,
+        norm_wq, norm_wk, positions, cos_sin_cache};
+    for (const auto& tensor : all_tensors) {
+        TORCH_CHECK(
+            tensor.device() == qkv_state.device(),
+            "all Qwen3.8 MRoPE v1 tensors must use qkv_state's XPU device");
+        TORCH_CHECK(
+            tensor.is_contiguous(),
+            "all Qwen3.8 MRoPE v1 tensors must be contiguous");
+    }
+    const at::Tensor outputs[] = {q_out, gate_out, k_out, v_out};
+    const at::Tensor inputs[] = {
+        qkv_state, norm_wq, norm_wk, positions, cos_sin_cache};
+    for (size_t i = 0; i < 4; ++i) {
+        for (size_t j = i + 1; j < 4; ++j) {
+            TORCH_CHECK(
+                !qwen38_mrope_ranges_overlap(outputs[i], outputs[j]),
+                "Qwen3.8 MRoPE v1 output tensors must not overlap");
+        }
+        for (const auto& input : inputs) {
+            TORCH_CHECK(
+                !qwen38_mrope_ranges_overlap(outputs[i], input),
+                "Qwen3.8 MRoPE v1 outputs must not overlap an input tensor");
+        }
+    }
+    auto aligned = [](const at::Tensor& tensor, size_t alignment) {
+        return reinterpret_cast<std::uintptr_t>(tensor.data_ptr()) % alignment == 0;
+    };
+    TORCH_CHECK(
+        aligned(qkv_state, 16) && aligned(q_out, 16) && aligned(gate_out, 16) &&
+            aligned(k_out, 16) && aligned(v_out, 16) && aligned(norm_wq, 16) &&
+            aligned(norm_wk, 16) && aligned(cos_sin_cache, 16),
+        "Qwen3.8 MRoPE v1 tensors must have 16-byte aligned data");
+    TORCH_CHECK(
+        aligned(positions, positions.scalar_type() == at::kLong ? 8 : 4),
+        "Qwen3.8 MRoPE v1 positions have an invalid alignment");
+
+    EXTRACT_PTR(p_qkv, qkv_state);
+    EXTRACT_PTR(p_q, q_out);
+    EXTRACT_PTR(p_gate, gate_out);
+    EXTRACT_PTR(p_k, k_out);
+    EXTRACT_PTR(p_v, v_out);
+    EXTRACT_PTR(p_nwq, norm_wq);
+    EXTRACT_PTR(p_nwk, norm_wk);
+    auto p_cs = reinterpret_cast<sycl::half*>(cos_sin_cache.data_ptr());
+    auto stream = c10::xpu::getCurrentXPUStream(qkv_state.device().index());
+    auto& dpcpp_queue = stream.queue();
+    TORCH_CHECK(
+        stream.device_index() == qkv_state.device().index(),
+        "current XPU stream does not match qkv_state device");
+    TORCH_CHECK(
+        dpcpp_queue.get_context() == c10::xpu::get_device_context(),
+        "current XPU stream uses a foreign SYCL context");
+    TORCH_CHECK(
+        dpcpp_queue.get_device() ==
+            c10::xpu::get_raw_device(qkv_state.device().index()),
+        "current XPU stream queue does not match qkv_state device");
+    if (positions.scalar_type() == at::kInt) {
+        qkv_split_norm_rope_mrope_v1_host<int32_t>(
+            p_qkv, p_q, p_gate, p_k, p_v, p_nwq, p_nwk,
+            positions.data_ptr<int32_t>(), p_cs, ntoks, qkv_state.size(1),
+            q_heads, kv_heads, attn_output_gate, dpcpp_queue);
+    } else {
+        qkv_split_norm_rope_mrope_v1_host<int64_t>(
+            p_qkv, p_q, p_gate, p_k, p_v, p_nwq, p_nwk,
+            positions.data_ptr<int64_t>(), p_cs, ntoks, qkv_state.size(1),
+            q_heads, kv_heads, attn_output_gate, dpcpp_queue);
+    }
     return q_out;
 }
 

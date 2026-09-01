@@ -20,6 +20,36 @@
 #define QKV_LOCATION_K 2
 #define QKV_LOCATION_V 3
 
+// Exact Qwen3.8 interleaved MRoPE for rotary_dim=64 and sections 11/11/10.
+// The cache stores [cos(32), sin(32)] per position.  Interleaved MRoPE
+// selects T/H/W by pair index modulo three: 0,3,... -> T; 1,4,... -> H;
+// 2,5,... -> W.
+template <typename PosT>
+ESIMD_INLINE void qkv_apply_mrope64(
+    simd<float, 256>& value, const PosT* positions, uint32_t ntoks,
+    uint32_t tokIdx, fp16* cosSinCache) {
+    const uint32_t posT = static_cast<uint32_t>(positions[tokIdx]);
+    const uint32_t posH = static_cast<uint32_t>(positions[ntoks + tokIdx]);
+    const uint32_t posW = static_cast<uint32_t>(positions[2 * ntoks + tokIdx]);
+    simd<fp16, 32> t16 = block_load<fp16, 32>(cosSinCache + posT * 64);
+    simd<fp16, 32> h16 = block_load<fp16, 32>(cosSinCache + posH * 64);
+    simd<fp16, 32> w16 = block_load<fp16, 32>(cosSinCache + posW * 64);
+    simd<fp16, 32> ts16 = block_load<fp16, 32>(cosSinCache + posT * 64 + 32);
+    simd<fp16, 32> hs16 = block_load<fp16, 32>(cosSinCache + posH * 64 + 32);
+    simd<fp16, 32> ws16 = block_load<fp16, 32>(cosSinCache + posW * 64 + 32);
+    simd<float, 32> cosv = t16;
+    simd<float, 32> sinv = ts16;
+    cosv.select<11, 3>(1) = h16.select<11, 3>(1);
+    sinv.select<11, 3>(1) = hs16.select<11, 3>(1);
+    cosv.select<10, 3>(2) = w16.select<10, 3>(2);
+    sinv.select<10, 3>(2) = ws16.select<10, 3>(2);
+    simd<float, 32> first = value.select<32, 1>(0);
+    simd<float, 32> second = value.select<32, 1>(32);
+    value.select<32, 1>(0) = first * cosv - second * sinv;
+    value.select<32, 1>(32) = second * cosv + first * sinv;
+}
+
+template <typename PosT>
 ESIMD_INLINE void qkv_split_norm_rope_kernel(
     uint8_t* qkvState,
     uint8_t* qState,
@@ -29,7 +59,7 @@ ESIMD_INLINE void qkv_split_norm_rope_kernel(
     uint8_t* normWq,
     uint8_t* normWk,
     uint8_t* normWv,        // optional: if non-null, V is RMSNormed (gemma4)
-    uint32_t* ropePos,
+    const PosT* ropePos,
     fp16* ropeCosSinCache,  // [max_pos, rotaryDim] fp16 — first half cos, second half sin
     uint32_t ntoks,
     uint32_t hiddenDim,
@@ -37,6 +67,7 @@ ESIMD_INLINE void qkv_split_norm_rope_kernel(
     uint32_t qHead,
     uint32_t kvHead,
     uint32_t rotaryDim,
+    bool mrope,
     sycl::nd_item<2>& ndi) {
 
     constexpr float eps = 1e-6f;
@@ -54,8 +85,7 @@ ESIMD_INLINE void qkv_split_norm_rope_kernel(
     uint32_t inputOffset = tokIdx * hiddenDim + headIdx * headDim;
     uint32_t outputOffset;
 
-    uint32_t i32RopeCoord = ropePos[tokIdx];
-    float fp32RopeCoord = (float)i32RopeCoord;
+    uint32_t i32RopeCoord = static_cast<uint32_t>(ropePos[tokIdx]);
 
     simd<fp16, 256> activation;
 
@@ -113,6 +143,9 @@ ESIMD_INLINE void qkv_split_norm_rope_kernel(
 
         // RoPE: read from rotary_emb.cos_sin_cache [max_pos, rotaryDim]
         // Layout: [cos(rotaryHalf), sin(rotaryHalf)] per row
+        if (mrope) {
+            qkv_apply_mrope64(outputTemp, ropePos, ntoks, tokIdx, ropeCosSinCache);
+        } else {
         {
             uint32_t rH = rotaryDim / 2;
             // Row offset in fp16 elements: position * rotaryDim
@@ -149,6 +182,7 @@ ESIMD_INLINE void qkv_split_norm_rope_kernel(
                 outputTemp.select<128, 1>(128) = x2 * fcos + x1 * fsin;
             }
         }
+        }
 
         activation = outputTemp;
         block_store<fp16, 256>((fp16*)qState + outputOffset, activation);
@@ -179,6 +213,9 @@ ESIMD_INLINE void qkv_split_norm_rope_kernel(
         outputTemp.select<256, 1>(0) = outputTemp.select<256, 1>(0) * scale;
 
         // RoPE: read from cos_sin_cache (same as Q)
+        if (mrope) {
+            qkv_apply_mrope64(outputTemp, ropePos, ntoks, tokIdx, ropeCosSinCache);
+        } else {
         {
             uint32_t krow_offset = i32RopeCoord * rotaryDim;
             if (rotaryDim == 64) {
@@ -210,6 +247,7 @@ ESIMD_INLINE void qkv_split_norm_rope_kernel(
                 outputTemp.select<128, 1>(0)   = kx1 * kfcos - kx2 * kfsin;
                 outputTemp.select<128, 1>(128) = kx2 * kfcos + kx1 * kfsin;
             }
+        }
         }
 
         activation = outputTemp;
@@ -269,10 +307,10 @@ inline void qkv_split_norm_rope_host(
         cgh.parallel_for(
             sycl::nd_range<2>(globalRange, localRange),
             [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
-                qkv_split_norm_rope_kernel(
+                qkv_split_norm_rope_kernel<uint32_t>(
                     qkvState, qState, gateState, kState, vState,
                     normWq, normWk, normWv, ropePos, ropeCosSinCache,
-                    ntoks, hiddenDim, headDim, qHead, kvHead, rotaryDim, ndi);
+                    ntoks, hiddenDim, headDim, qHead, kvHead, rotaryDim, false, ndi);
             });
     });
 }

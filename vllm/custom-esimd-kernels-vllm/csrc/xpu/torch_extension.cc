@@ -86,6 +86,16 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
                                      cos_sin_cache);
          });
 
+  // Qwen3.8 exact interleaved 3-axis MRoPE, fixed [11,11,10]/rotary_dim=64.
+  // The returned q_out is also declared as the first mutable alias.
+  m.def("esimd_qkv_split_norm_rope_mrope_v1(Tensor qkv_state, "
+        "Tensor(a!) q_out, Tensor(b!) gate_out, Tensor(c!) k_out, Tensor(d!) v_out, "
+        "Tensor norm_wq, Tensor norm_wk, Tensor positions, "
+        "int q_heads, int kv_heads, bool attn_output_gate, "
+        "bool positions_bounds_proven, Tensor cos_sin_cache) -> Tensor(a!)");
+  m.impl("esimd_qkv_split_norm_rope_mrope_v1", torch::kXPU,
+         &esimd_qkv_split_norm_rope_mrope_v1);
+
   // Variant with V-Norm (gemma4): same as above but also RMSNorms V heads.
   m.def("esimd_qkv_split_norm_rope_v(Tensor qkv_state, "
         "Tensor(a!) q_out, Tensor(b!) gate_out, Tensor(c!) k_out, Tensor(d!) v_out, "

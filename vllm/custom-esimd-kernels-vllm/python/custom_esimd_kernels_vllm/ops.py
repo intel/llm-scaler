@@ -1598,6 +1598,35 @@ def esimd_qkv_split_norm_rope_muse_glimmer_neox(
         q_heads, kv_heads, float(q_scale), float(eps), cos_sin_cache)
 
 
+def esimd_qkv_split_norm_rope_mrope_v1(
+    qkv_state: torch.Tensor,
+    q_out: torch.Tensor,
+    gate_out: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    norm_wq: torch.Tensor,
+    norm_wk: torch.Tensor,
+    positions: torch.Tensor,
+    q_heads: int,
+    kv_heads: int,
+    attn_output_gate: bool,
+    positions_bounds_proven: bool,
+    cos_sin_cache: torch.Tensor,
+) -> torch.Tensor:
+    """Qwen3.8 exact 3-axis interleaved MRoPE QKV postprocess.
+
+    Fixed ABI: head_dim=256, rotary_dim=64, and mrope_section=[11, 11, 10].
+    ``positions`` is [3, nTokens] and is consumed without collapsing axes.
+    ``positions_bounds_proven`` is a scheduler-owned CPU proof bit; the native
+    path intentionally does not perform a synchronizing XPU bounds read.
+    """
+    return _ops.esimd_qkv_split_norm_rope_mrope_v1(
+        qkv_state, q_out, gate_out, k_out, v_out, norm_wq, norm_wk, positions,
+        q_heads, kv_heads, attn_output_gate, positions_bounds_proven,
+        cos_sin_cache
+    )
+
+
 # ---- Fused Conv1d + GDN (doubleGRF, LGRF module) ----
 
 def esimd_gdn_conv_fused(

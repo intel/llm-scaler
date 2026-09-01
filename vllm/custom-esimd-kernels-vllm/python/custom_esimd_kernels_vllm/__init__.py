@@ -59,6 +59,7 @@ from custom_esimd_kernels_vllm.ops import (
     esimd_gemv_int4_fused2,
     esimd_gemm_int4_pgrp,
     esimd_qkv_split_norm_rope,
+    esimd_qkv_split_norm_rope_mrope_v1,
     esimd_qkv_split_norm_rope_v,
     esimd_qkv_split_norm_rope_muse_glimmer,
     esimd_qkv_split_norm_rope_muse_glimmer_neox,

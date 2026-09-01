@@ -76,6 +76,20 @@ at::Tensor esimd_qkv_split_norm_rope(
     int64_t q_heads, int64_t kv_heads, bool attn_output_gate,
     int64_t rotary_dim, at::Tensor cos_sin_cache);
 
+// Qwen3.8 exact interleaved 3-axis MRoPE variant.  The versioned ABI fixes
+// rotary_dim=64 and mrope_section=[11,11,10], matching the production QSA
+// checkpoint; positions are [3, nTokens] and may be int32 or int64.
+// positions_bounds_proven must be true only when scheduler CPU metadata proves
+// every position is non-negative and within cos_sin_cache rows.
+at::Tensor esimd_qkv_split_norm_rope_mrope_v1(
+    at::Tensor qkv_state,
+    at::Tensor q_out, at::Tensor gate_out,
+    at::Tensor k_out, at::Tensor v_out,
+    at::Tensor norm_wq, at::Tensor norm_wk,
+    at::Tensor positions,
+    int64_t q_heads, int64_t kv_heads, bool attn_output_gate,
+    bool positions_bounds_proven, at::Tensor cos_sin_cache);
+
 // Variant with V-Norm (gemma4): also RMSNorms V heads.
 at::Tensor esimd_qkv_split_norm_rope_v(
     at::Tensor qkv_state,
