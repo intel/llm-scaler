@@ -1,3 +1,4 @@
+#include <sycl/ext/intel/esimd.hpp>
 #include <sycl/sycl.hpp>
 
 #include <ATen/ATen.h>
@@ -6,7 +7,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <unordered_set>
 #include <utility>
@@ -18,6 +21,13 @@ namespace {
 
 constexpr int kMaxConvState = 128;
 constexpr int kMaxSpecTokens = 128;
+constexpr int kHcCount = 4;
+constexpr int kHcHiddenSize = 2560;
+constexpr int kHcWidth = kHcCount * kHcHiddenSize;
+constexpr int kHcNormVectorLength = 256;
+constexpr int kHcNormChunks = kHcHiddenSize / kHcNormVectorLength;
+
+namespace esimd = sycl::ext::intel::esimd;
 
 static inline sycl::queue& get_device_queue(const at::Tensor& tensor) {
     return c10::xpu::getCurrentXPUStream(tensor.device().index()).queue();
@@ -390,6 +400,62 @@ static void launch_embedding(
                 output[linear] = sycl::half(0.0f);
             }
         });
+    });
+}
+
+struct HcGroupedNormV1Kernel {
+    const sycl::half* input;
+    const sycl::half* weight;
+    sycl::half* output;
+    float eps;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        const int64_t group = static_cast<int64_t>(item.get_group(0));
+        if (group >= kHcCount) {
+            return;
+        }
+        const int64_t begin = group * kHcHiddenSize;
+        float sum_sq = 0.0f;
+#pragma unroll
+        for (int chunk = 0; chunk < kHcNormChunks; ++chunk) {
+            const int64_t offset = begin + chunk * kHcNormVectorLength;
+            esimd::simd<float, kHcNormVectorLength> values =
+                esimd::block_load<sycl::half, kHcNormVectorLength>(
+                    input + offset);
+            const esimd::simd<float, kHcNormVectorLength> squared =
+                values * values;
+            sum_sq += esimd::reduce<float>(squared, std::plus<>());
+        }
+        const float inverse = esimd::rsqrt(esimd::simd<float, 8>(
+            sum_sq / static_cast<float>(kHcHiddenSize) + eps))[0];
+#pragma unroll
+        for (int chunk = 0; chunk < kHcNormChunks; ++chunk) {
+            const int64_t offset = begin + chunk * kHcNormVectorLength;
+            esimd::simd<float, kHcNormVectorLength> values =
+                esimd::block_load<sycl::half, kHcNormVectorLength>(
+                    input + offset);
+            esimd::simd<float, kHcNormVectorLength> scales =
+                esimd::block_load<sycl::half, kHcNormVectorLength>(
+                    weight + offset);
+            const esimd::simd<float, kHcNormVectorLength> normalized =
+                values * inverse * (1.0f + scales);
+            esimd::block_store<sycl::half, kHcNormVectorLength>(
+                output + offset,
+                esimd::simd<sycl::half, kHcNormVectorLength>(normalized));
+        }
+    }
+};
+
+static void launch_hc_grouped_norm_v1(
+    sycl::queue& queue,
+    const sycl::half* input,
+    const sycl::half* weight,
+    sycl::half* output,
+    float eps) {
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>({static_cast<size_t>(kHcCount)}, {1}),
+            HcGroupedNormV1Kernel{input, weight, output, eps});
     });
 }
 
@@ -1040,6 +1106,34 @@ at::Tensor grouped_norm(
         reinterpret_cast<const sycl::half*>(weight.data_ptr()),
         reinterpret_cast<sycl::half*>(output.data_ptr()), input.numel() / width, width,
         group_size, static_cast<float>(eps));
+    return output;
+}
+
+at::Tensor hc_grouped_norm_v1(
+    at::Tensor input,
+    at::Tensor weight,
+    at::Tensor output,
+    double eps) {
+    check_primary_half(input, "input");
+    check_half(input, weight, "weight");
+    check_output(input, output, "output");
+    TORCH_CHECK(
+        input.dim() == 2 && input.size(0) == 1 &&
+            input.size(1) == kHcWidth &&
+            weight.dim() == 1 && weight.numel() == kHcWidth &&
+            output.sizes() == input.sizes(),
+        "hc_grouped_norm_v1 expects input/output [1, 10240] and "
+        "weight [10240]");
+    TORCH_CHECK(!output.is_alias_of(weight),
+                "hc_grouped_norm_v1 output must not share storage with weight");
+    TORCH_CHECK(std::isfinite(eps) && eps > 0.0,
+                "hc_grouped_norm_v1 eps must be finite and positive");
+    auto& queue = get_device_queue(input);
+    launch_hc_grouped_norm_v1(
+        queue, reinterpret_cast<const sycl::half*>(input.data_ptr()),
+        reinterpret_cast<const sycl::half*>(weight.data_ptr()),
+        reinterpret_cast<sycl::half*>(output.data_ptr()),
+        static_cast<float>(eps));
     return output;
 }
 

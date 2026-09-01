@@ -39,6 +39,14 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
            ple::grouped_norm(input, weight, output, eps, group_size);
          });
 
+  m.def("hc_grouped_norm_v1(Tensor input, Tensor weight, "
+        "Tensor(a!) output, float eps) -> ()");
+  m.impl("hc_grouped_norm_v1", torch::kXPU,
+         [](at::Tensor input, at::Tensor weight, at::Tensor output,
+            double eps) -> void {
+           ple::hc_grouped_norm_v1(input, weight, output, eps);
+         });
+
   m.def("ple_score_gate(Tensor key, Tensor query, Tensor(a!) output, "
         "int hidden_size) -> ()");
   m.impl("ple_score_gate", torch::kXPU,

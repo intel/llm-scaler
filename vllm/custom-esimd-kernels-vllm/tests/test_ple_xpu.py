@@ -272,6 +272,58 @@ def test_arithmetic_primitives_match_frozen_golden(device: torch.device) -> None
     _assert_equal(residual_out, golden["output"])
 
 
+def test_hc_grouped_norm_v1_matches_target_reference(
+    device: torch.device,
+) -> None:
+    torch.manual_seed(41)
+    input_tensor = (
+        torch.randn((1, 10240), dtype=torch.float16, device=device) * 0.25
+    )
+    weight = (
+        torch.randn((10240,), dtype=torch.float16, device=device) * 0.05
+    )
+    output = torch.empty_like(input_tensor)
+    output_pointer = output.data_ptr()
+    eps = 1e-6
+
+    grouped = input_tensor.float().reshape(1, 4, 2560)
+    variance = grouped.square().mean(-1, keepdim=True)
+    expected = (
+        grouped * torch.rsqrt(variance + eps)
+    ).reshape_as(input_tensor) * (1.0 + weight.float())
+    expected = expected.to(input_tensor.dtype)
+
+    torch.ops.custom_esimd_kernels_vllm.hc_grouped_norm_v1(
+        input_tensor, weight, output, eps
+    )
+    torch.xpu.synchronize()
+
+    assert output.data_ptr() == output_pointer
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_hc_grouped_norm_v1_rejects_wrong_shape_and_alias(
+    device: torch.device,
+) -> None:
+    input_tensor = torch.randn(
+        (1, 10240), dtype=torch.float16, device=device
+    )
+    weight = torch.randn((10240,), dtype=torch.float16, device=device)
+
+    with pytest.raises(RuntimeError, match="expects input/output"):
+        torch.ops.custom_esimd_kernels_vllm.hc_grouped_norm_v1(
+            input_tensor.repeat(2, 1),
+            weight,
+            torch.empty((2, 10240), dtype=torch.float16, device=device),
+            1e-6,
+        )
+
+    with pytest.raises(RuntimeError, match="must not share storage"):
+        torch.ops.custom_esimd_kernels_vllm.hc_grouped_norm_v1(
+            input_tensor, weight, input_tensor, 1e-6
+        )
+
+
 def test_canonical_int4_projection_dispatch_and_golden(
     device: torch.device,
 ) -> None:

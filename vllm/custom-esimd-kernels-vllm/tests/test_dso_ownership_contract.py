@@ -578,6 +578,7 @@ def test_production_main_dso_is_the_single_ple_owner() -> None:
         "ple_ngram_ids",
         "ple_embedding_gather",
         "ple_grouped_norm",
+        "hc_grouped_norm_v1",
         "ple_score_gate",
         "ple_gated_value",
         "ple_residual_add",

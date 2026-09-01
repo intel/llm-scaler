@@ -29,6 +29,12 @@ at::Tensor grouped_norm(
     double eps,
     int64_t group_size);
 
+at::Tensor hc_grouped_norm_v1(
+    at::Tensor input,
+    at::Tensor weight,
+    at::Tensor output,
+    double eps);
+
 at::Tensor score_gate(
     at::Tensor key,
     at::Tensor query,
