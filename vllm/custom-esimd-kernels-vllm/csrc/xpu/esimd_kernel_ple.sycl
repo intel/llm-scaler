@@ -33,6 +33,9 @@ constexpr int kHcCombineChunksPerStream =
     kHcHiddenSize / kHcCombineVectorLength;
 constexpr int kHcCombineWorkItems =
     kHcCount * kHcCombineChunksPerStream;
+constexpr int kPleResidualVectorLength = 256;
+constexpr int kPleResidualWorkItems =
+    kHcWidth / kPleResidualVectorLength;
 
 namespace esimd = sycl::ext::intel::esimd;
 
@@ -933,13 +936,61 @@ static void launch_gated_value(
     });
 }
 
+struct PleResidualAddV1Kernel {
+    const sycl::half* first;
+    const sycl::half* second;
+    sycl::half* output;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        const int64_t chunk = static_cast<int64_t>(item.get_group(0));
+        if (chunk >= kPleResidualWorkItems) {
+            return;
+        }
+        const int64_t offset = chunk * kPleResidualVectorLength;
+        const esimd::simd<float, kPleResidualVectorLength> first_values =
+            esimd::block_load<sycl::half, kPleResidualVectorLength>(
+                first + offset);
+        const esimd::simd<float, kPleResidualVectorLength> second_values =
+            esimd::block_load<sycl::half, kPleResidualVectorLength>(
+                second + offset);
+        esimd::block_store<sycl::half, kPleResidualVectorLength>(
+            output + offset,
+            esimd::simd<sycl::half, kPleResidualVectorLength>(
+                first_values + second_values));
+    }
+};
+
+static void launch_ple_residual_add_v1(
+    sycl::queue& queue,
+    const sycl::half* first,
+    const sycl::half* second,
+    sycl::half* output) {
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(
+                {static_cast<size_t>(kPleResidualWorkItems)}, {1}),
+            PleResidualAddV1Kernel{first, second, output});
+    });
+}
+
 static void launch_residual_add(
     sycl::queue& queue,
     const sycl::half* first,
     const sycl::half* second,
     sycl::half* output,
+    bool target_shape,
     int64_t elements) {
     if (elements <= 0) {
+        return;
+    }
+    // Stateless FP16 block loads accept dword alignment, while the default
+    // OWORD block store requires a 16-byte-aligned destination.
+    const bool block_io_aligned =
+        reinterpret_cast<std::uintptr_t>(first) % 4 == 0 &&
+        reinterpret_cast<std::uintptr_t>(second) % 4 == 0 &&
+        reinterpret_cast<std::uintptr_t>(output) % 16 == 0;
+    if (target_shape && block_io_aligned) {
+        launch_ple_residual_add_v1(queue, first, second, output);
         return;
     }
     queue.submit([&](sycl::handler& cgh) {
@@ -1770,11 +1821,15 @@ at::Tensor residual_add(
     TORCH_CHECK(!output.is_alias_of(gated_value_flat) &&
                     !output.is_alias_of(conv_output),
                 "residual_add output must not share storage with inputs");
+    const bool target_shape =
+        gated_value_flat.dim() == 2 && gated_value_flat.size(0) == 1 &&
+        gated_value_flat.size(1) == kHcWidth;
     auto& queue = get_device_queue(gated_value_flat);
     launch_residual_add(
         queue, reinterpret_cast<const sycl::half*>(gated_value_flat.data_ptr()),
         reinterpret_cast<const sycl::half*>(conv_output.data_ptr()),
-        reinterpret_cast<sycl::half*>(output.data_ptr()), gated_value_flat.numel());
+        reinterpret_cast<sycl::half*>(output.data_ptr()), target_shape,
+        gated_value_flat.numel());
     return output;
 }
 

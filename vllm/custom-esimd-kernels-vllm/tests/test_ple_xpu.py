@@ -393,6 +393,73 @@ def test_ple_gated_value_grouped_norm_rejects_contract_violations(
     )
 
 
+def test_ple_residual_add_target_and_generic_paths_match_reference(
+    device: torch.device,
+) -> None:
+    torch.manual_seed(53)
+    first = torch.randn((1, 10240), dtype=torch.float16, device=device) * 0.25
+    second = torch.randn_like(first) * 0.25
+    expected = (first.float() + second.float()).to(torch.float16)
+    target_output = torch.empty_like(first)
+    target_pointer = target_output.data_ptr()
+
+    torch.ops.custom_esimd_kernels_vllm.ple_residual_add(
+        first, second, target_output
+    )
+
+    first_backing = torch.empty(
+        (1, 10241), dtype=torch.float16, device=device
+    )
+    second_backing = torch.empty_like(first_backing)
+    output_backing = torch.empty_like(first_backing)
+    odd_first = first_backing[:, 1:]
+    odd_second = second_backing[:, 1:]
+    odd_output = output_backing[:, 1:]
+    odd_first.copy_(first)
+    odd_second.copy_(second)
+    odd_pointer = odd_output.data_ptr()
+    torch.ops.custom_esimd_kernels_vllm.ple_residual_add(
+        odd_first, odd_second, odd_output
+    )
+
+    four_byte_output_backing = torch.full(
+        (1, 10244), 17.0, dtype=torch.float16, device=device
+    )
+    four_byte_output = four_byte_output_backing[:, 2:10242]
+    torch.ops.custom_esimd_kernels_vllm.ple_residual_add(
+        first, second, four_byte_output
+    )
+
+    generic_output = torch.empty((4, 2560), dtype=torch.float16, device=device)
+    torch.ops.custom_esimd_kernels_vllm.ple_residual_add(
+        first.view(4, 2560), second.view(4, 2560), generic_output
+    )
+    torch.xpu.synchronize()
+
+    assert target_output.data_ptr() == target_pointer
+    assert odd_output.data_ptr() == odd_pointer
+    assert odd_first.storage_offset() == 1
+    assert odd_second.storage_offset() == 1
+    assert odd_output.storage_offset() == 1
+    assert four_byte_output.storage_offset() == 2
+    assert four_byte_output.data_ptr() % 4 == 0
+    assert four_byte_output.data_ptr() % 16 != 0
+    torch.testing.assert_close(target_output, expected, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(odd_output, expected, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(four_byte_output, expected, rtol=0.0, atol=0.0)
+    assert torch.equal(
+        four_byte_output_backing[:, :2],
+        torch.full_like(four_byte_output_backing[:, :2], 17.0),
+    )
+    assert torch.equal(
+        four_byte_output_backing[:, 10242:],
+        torch.full_like(four_byte_output_backing[:, 10242:], 17.0),
+    )
+    torch.testing.assert_close(
+        generic_output, expected.view_as(generic_output), rtol=0.0, atol=0.0
+    )
+
+
 @pytest.mark.parametrize(
     ("input_shape", "output_shape"),
     [((1, 10240), (1, 4)), ((1, 4, 2560), (1, 4, 1))],
