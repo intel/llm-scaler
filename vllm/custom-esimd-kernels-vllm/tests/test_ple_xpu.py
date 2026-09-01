@@ -716,6 +716,123 @@ def _null_token_rows(
     return rows
 
 
+def _short_conv_args(
+    case_name: str,
+    inputs: dict,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    output: torch.Tensor,
+    meta: dict,
+    null_block_id: int,
+) -> tuple:
+    if case_name == "ple_short_conv_decode":
+        return (
+            inputs["input"],
+            state,
+            inputs["conv_weights"],
+            state_indices,
+            inputs["has_initial_state"],
+            output,
+            meta["dilation"],
+            meta["state_dim_first"],
+            null_block_id,
+        )
+    prefix = (
+        inputs["input"],
+        inputs["query_start_loc"],
+        state,
+        inputs["conv_weights"],
+        state_indices,
+    )
+    if case_name == "ple_short_conv_prefill":
+        return (
+            *prefix,
+            inputs["has_initial_state"],
+            output,
+            meta["dilation"],
+            meta["state_dim_first"],
+            null_block_id,
+        )
+    assert case_name == "ple_short_conv_spec"
+    return (
+        *prefix,
+        inputs["num_accepted_tokens"],
+        output,
+        meta["num_spec_tokens"],
+        meta["dilation"],
+        meta["state_dim_first"],
+        null_block_id,
+    )
+
+
+@pytest.mark.parametrize(
+    "case_name",
+    (
+        "ple_short_conv_decode",
+        "ple_short_conv_prefill",
+        "ple_short_conv_spec",
+    ),
+)
+def test_legacy_short_conv_rejects_null_block_id_zero(
+    device: torch.device, case_name: str
+) -> None:
+    inputs, golden, meta = _load_case(case_name, device)
+    state = inputs["conv_state"].clone()
+    state_before = state.clone()
+    assert state.size(0) > 0
+    operation = getattr(torch.ops.custom_esimd_kernels_vllm, case_name)
+    arguments = _short_conv_args(
+        case_name,
+        inputs,
+        state,
+        inputs["state_indices"],
+        torch.empty_like(golden["output"]),
+        meta,
+        0,
+    )
+
+    with pytest.raises(RuntimeError, match="null_block_id"):
+        operation(*arguments)
+    assert torch.equal(state, state_before)
+
+
+@pytest.mark.parametrize(
+    "case_name",
+    (
+        "ple_short_conv_decode",
+        "ple_short_conv_prefill",
+        "ple_short_conv_spec",
+    ),
+)
+def test_trusted_short_conv_rejects_nonreserved_state_slot_one(
+    device: torch.device, case_name: str
+) -> None:
+    inputs, golden, meta = _load_case(case_name, device)
+    reserved, state, trusted_indices, _ = _reserved_zero_state_and_indices(
+        inputs, meta["null_block_id"]
+    )
+    state_before = state.clone()
+    assert state.size(0) > 1
+    assert torch.equal(state[0], reserved[0])
+    assert torch.equal(state[1], inputs["conv_state"][0])
+    operation = getattr(
+        torch.ops.custom_esimd_kernels_vllm, f"{case_name}_trusted"
+    )
+    arguments = _short_conv_args(
+        case_name,
+        inputs,
+        state,
+        trusted_indices,
+        torch.empty_like(golden["output"]),
+        meta,
+        1,
+    )
+
+    with pytest.raises(RuntimeError, match="null_block_id"):
+        operation(*arguments)
+    assert torch.equal(state, state_before)
+
+
 def test_trusted_prefill_accepts_reserved_null_slot_zero(
     device: torch.device,
 ) -> None:
