@@ -324,6 +324,59 @@ def test_hc_grouped_norm_v1_rejects_wrong_shape_and_alias(
         )
 
 
+def test_hc_gate_mix_v1_matches_target_reference(
+    device: torch.device,
+) -> None:
+    torch.manual_seed(43)
+    input_tensor = (
+        torch.randn((1, 10240), dtype=torch.float16, device=device) * 0.5
+    )
+    gate = torch.randn(
+        (1, 10240), dtype=torch.float16, device=device
+    )
+    output = torch.empty(
+        (1, 2560), dtype=torch.float16, device=device
+    )
+    output_pointer = output.data_ptr()
+
+    expected = (
+        torch.sigmoid(gate.float()) * input_tensor.float()
+    ).reshape(1, 4, 2560).mean(1).to(input_tensor.dtype)
+
+    torch.ops.custom_esimd_kernels_vllm.hc_gate_mix_v1(
+        input_tensor, gate, output
+    )
+    torch.xpu.synchronize()
+
+    assert output.data_ptr() == output_pointer
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_hc_gate_mix_v1_rejects_wrong_shape_and_alias(
+    device: torch.device,
+) -> None:
+    input_tensor = torch.randn(
+        (1, 10240), dtype=torch.float16, device=device
+    )
+    gate = torch.randn((1, 10240), dtype=torch.float16, device=device)
+    output = torch.empty((1, 2560), dtype=torch.float16, device=device)
+
+    with pytest.raises(RuntimeError, match="expects input/gate"):
+        torch.ops.custom_esimd_kernels_vllm.hc_gate_mix_v1(
+            input_tensor.repeat(2, 1), gate.repeat(2, 1), output
+        )
+
+    with pytest.raises(RuntimeError, match="must not share storage"):
+        torch.ops.custom_esimd_kernels_vllm.hc_gate_mix_v1(
+            input_tensor, gate, input_tensor[:, :2560]
+        )
+
+    with pytest.raises(RuntimeError, match="must not share storage"):
+        torch.ops.custom_esimd_kernels_vllm.hc_gate_mix_v1(
+            input_tensor, gate, gate[:, :2560]
+        )
+
+
 def test_canonical_int4_projection_dispatch_and_golden(
     device: torch.device,
 ) -> None:

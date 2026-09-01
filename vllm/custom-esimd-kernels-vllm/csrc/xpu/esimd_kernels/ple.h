@@ -35,6 +35,11 @@ at::Tensor hc_grouped_norm_v1(
     at::Tensor output,
     double eps);
 
+at::Tensor hc_gate_mix_v1(
+    at::Tensor input,
+    at::Tensor gate,
+    at::Tensor output);
+
 at::Tensor score_gate(
     at::Tensor key,
     at::Tensor query,

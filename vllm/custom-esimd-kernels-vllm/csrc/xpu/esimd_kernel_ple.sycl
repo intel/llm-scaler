@@ -26,6 +26,8 @@ constexpr int kHcHiddenSize = 2560;
 constexpr int kHcWidth = kHcCount * kHcHiddenSize;
 constexpr int kHcNormVectorLength = 256;
 constexpr int kHcNormChunks = kHcHiddenSize / kHcNormVectorLength;
+constexpr int kHcGateMixVectorLength = 128;
+constexpr int kHcGateMixChunks = kHcHiddenSize / kHcGateMixVectorLength;
 
 namespace esimd = sycl::ext::intel::esimd;
 
@@ -456,6 +458,51 @@ static void launch_hc_grouped_norm_v1(
         cgh.parallel_for(
             sycl::nd_range<1>({static_cast<size_t>(kHcCount)}, {1}),
             HcGroupedNormV1Kernel{input, weight, output, eps});
+    });
+}
+
+struct HcGateMixV1Kernel {
+    const sycl::half* input;
+    const sycl::half* gate;
+    sycl::half* output;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        const int64_t chunk = static_cast<int64_t>(item.get_group(0));
+        if (chunk >= kHcGateMixChunks) {
+            return;
+        }
+        const int64_t output_offset = chunk * kHcGateMixVectorLength;
+        esimd::simd<float, kHcGateMixVectorLength> mixed = 0.0f;
+#pragma unroll
+        for (int stream = 0; stream < kHcCount; ++stream) {
+            const int64_t input_offset =
+                stream * kHcHiddenSize + output_offset;
+            esimd::simd<float, kHcGateMixVectorLength> gate_values =
+                esimd::block_load<sycl::half, kHcGateMixVectorLength>(
+                    gate + input_offset);
+            const esimd::simd<float, kHcGateMixVectorLength> exp_neg_gate =
+                esimd::exp(-gate_values);
+            esimd::simd<float, kHcGateMixVectorLength> input_values =
+                esimd::block_load<sycl::half, kHcGateMixVectorLength>(
+                    input + input_offset);
+            mixed += input_values / (1.0f + exp_neg_gate);
+        }
+        esimd::block_store<sycl::half, kHcGateMixVectorLength>(
+            output + output_offset,
+            esimd::simd<sycl::half, kHcGateMixVectorLength>(mixed * 0.25f));
+    }
+};
+
+static void launch_hc_gate_mix_v1(
+    sycl::queue& queue,
+    const sycl::half* input,
+    const sycl::half* gate,
+    sycl::half* output) {
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(
+                {static_cast<size_t>(kHcGateMixChunks)}, {1}),
+            HcGateMixV1Kernel{input, gate, output});
     });
 }
 
@@ -1134,6 +1181,29 @@ at::Tensor hc_grouped_norm_v1(
         reinterpret_cast<const sycl::half*>(weight.data_ptr()),
         reinterpret_cast<sycl::half*>(output.data_ptr()),
         static_cast<float>(eps));
+    return output;
+}
+
+at::Tensor hc_gate_mix_v1(
+    at::Tensor input,
+    at::Tensor gate,
+    at::Tensor output) {
+    check_primary_half(input, "input");
+    check_half(input, gate, "gate");
+    check_output(input, output, "output");
+    TORCH_CHECK(
+        input.dim() == 2 && input.size(0) == 1 &&
+            input.size(1) == kHcWidth && gate.sizes() == input.sizes() &&
+            output.dim() == 2 && output.size(0) == 1 &&
+            output.size(1) == kHcHiddenSize,
+        "hc_gate_mix_v1 expects input/gate [1, 10240] and output [1, 2560]");
+    TORCH_CHECK(!output.is_alias_of(gate),
+                "hc_gate_mix_v1 output must not share storage with gate");
+    auto& queue = get_device_queue(input);
+    launch_hc_gate_mix_v1(
+        queue, reinterpret_cast<const sycl::half*>(input.data_ptr()),
+        reinterpret_cast<const sycl::half*>(gate.data_ptr()),
+        reinterpret_cast<sycl::half*>(output.data_ptr()));
     return output;
 }
 
