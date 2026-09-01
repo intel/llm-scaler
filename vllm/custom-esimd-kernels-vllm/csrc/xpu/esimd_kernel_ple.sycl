@@ -689,6 +689,18 @@ static void launch_grouped_norm(
     int64_t width,
     int64_t group_size,
     float eps) {
+    // Batch-1 PLE decode has the same four 2560-wide groups as HC.
+    // Preserve the generic ABI for odd FP16 storage offsets because ESIMD
+    // block I/O requires at least dword-aligned data pointers.
+    const bool block_io_aligned =
+        reinterpret_cast<std::uintptr_t>(input) % 4 == 0 &&
+        reinterpret_cast<std::uintptr_t>(weight) % 4 == 0 &&
+        reinterpret_cast<std::uintptr_t>(output) % 4 == 0;
+    if (rows == 1 && width == kHcWidth &&
+        group_size == kHcHiddenSize && block_io_aligned) {
+        launch_hc_grouped_norm_v1(queue, input, weight, output, eps);
+        return;
+    }
     const int64_t groups = width / group_size;
     if (rows <= 0 || groups <= 0) {
         return;

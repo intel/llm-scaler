@@ -272,6 +272,102 @@ def test_arithmetic_primitives_match_frozen_golden(device: torch.device) -> None
     _assert_equal(residual_out, golden["output"])
 
 
+@pytest.mark.parametrize("rows", [1, 2])
+def test_ple_grouped_norm_target_fast_path_preserves_generic_rows(
+    device: torch.device,
+    rows: int,
+) -> None:
+    torch.manual_seed(40 + rows)
+    input_tensor = (
+        torch.randn((rows, 10240), dtype=torch.float16, device=device) * 0.25
+    )
+    weight = (
+        torch.randn((10240,), dtype=torch.float16, device=device) * 0.05
+    )
+    output = torch.empty_like(input_tensor)
+    output_pointer = output.data_ptr()
+    eps = 1.0e-5
+
+    grouped = input_tensor.float().reshape(rows, 4, 2560)
+    variance = grouped.square().mean(-1, keepdim=True)
+    expected = (
+        grouped * torch.rsqrt(variance + eps)
+    ).reshape_as(input_tensor) * (1.0 + weight.float())
+    expected = expected.to(input_tensor.dtype)
+
+    torch.ops.custom_esimd_kernels_vllm.ple_grouped_norm(
+        input_tensor,
+        weight,
+        output,
+        eps,
+        2560,
+    )
+    torch.xpu.synchronize()
+
+    assert output.data_ptr() == output_pointer
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("odd_tensor", ["input", "weight", "output"])
+def test_ple_grouped_norm_target_shape_preserves_odd_offset_views(
+    device: torch.device,
+    odd_tensor: str,
+) -> None:
+    def odd_offset(shape: tuple[int, ...]) -> torch.Tensor:
+        numel = 1
+        for dimension in shape:
+            numel *= dimension
+        backing = torch.empty(
+            (numel + 1,),
+            dtype=torch.float16,
+            device=device,
+        )
+        view = backing[1:].reshape(shape)
+        assert view.is_contiguous()
+        assert view.data_ptr() % 4 == 2
+        return view
+
+    torch.manual_seed(45)
+    input_tensor = (
+        odd_offset((1, 10240))
+        if odd_tensor == "input"
+        else torch.empty((1, 10240), dtype=torch.float16, device=device)
+    )
+    weight = (
+        odd_offset((10240,))
+        if odd_tensor == "weight"
+        else torch.empty((10240,), dtype=torch.float16, device=device)
+    )
+    output = (
+        odd_offset((1, 10240))
+        if odd_tensor == "output"
+        else torch.empty((1, 10240), dtype=torch.float16, device=device)
+    )
+    input_tensor.normal_(mean=0.0, std=0.25)
+    weight.normal_(mean=0.0, std=0.05)
+    output_pointer = output.data_ptr()
+    eps = 1.0e-5
+
+    grouped = input_tensor.float().reshape(1, 4, 2560)
+    variance = grouped.square().mean(-1, keepdim=True)
+    expected = (
+        grouped * torch.rsqrt(variance + eps)
+    ).reshape_as(input_tensor) * (1.0 + weight.float())
+    expected = expected.to(input_tensor.dtype)
+
+    torch.ops.custom_esimd_kernels_vllm.ple_grouped_norm(
+        input_tensor,
+        weight,
+        output,
+        eps,
+        2560,
+    )
+    torch.xpu.synchronize()
+
+    assert output.data_ptr() == output_pointer
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+
 def test_hc_grouped_norm_v1_matches_target_reference(
     device: torch.device,
 ) -> None:
