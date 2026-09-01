@@ -26,11 +26,13 @@
 // 2,5,... -> W.
 template <typename PosT>
 ESIMD_INLINE void qkv_apply_mrope64(
-    simd<float, 256>& value, const PosT* positions, uint32_t ntoks,
-    uint32_t tokIdx, fp16* cosSinCache) {
+    simd<float, 256>& value, const PosT* positions,
+    uint32_t positionRowStride, uint32_t tokIdx, fp16* cosSinCache) {
     const uint32_t posT = static_cast<uint32_t>(positions[tokIdx]);
-    const uint32_t posH = static_cast<uint32_t>(positions[ntoks + tokIdx]);
-    const uint32_t posW = static_cast<uint32_t>(positions[2 * ntoks + tokIdx]);
+    const uint32_t posH = static_cast<uint32_t>(
+        positions[positionRowStride + tokIdx]);
+    const uint32_t posW = static_cast<uint32_t>(
+        positions[2 * positionRowStride + tokIdx]);
     simd<fp16, 32> t16 = block_load<fp16, 32>(cosSinCache + posT * 64);
     simd<fp16, 32> h16 = block_load<fp16, 32>(cosSinCache + posH * 64);
     simd<fp16, 32> w16 = block_load<fp16, 32>(cosSinCache + posW * 64);
@@ -62,6 +64,7 @@ ESIMD_INLINE void qkv_split_norm_rope_kernel(
     const PosT* ropePos,
     fp16* ropeCosSinCache,  // [max_pos, rotaryDim] fp16 — first half cos, second half sin
     uint32_t ntoks,
+    uint32_t positionRowStride,
     uint32_t hiddenDim,
     uint32_t headDim,
     uint32_t qHead,
@@ -144,7 +147,8 @@ ESIMD_INLINE void qkv_split_norm_rope_kernel(
         // RoPE: read from rotary_emb.cos_sin_cache [max_pos, rotaryDim]
         // Layout: [cos(rotaryHalf), sin(rotaryHalf)] per row
         if (mrope) {
-            qkv_apply_mrope64(outputTemp, ropePos, ntoks, tokIdx, ropeCosSinCache);
+            qkv_apply_mrope64(
+                outputTemp, ropePos, positionRowStride, tokIdx, ropeCosSinCache);
         } else {
         {
             uint32_t rH = rotaryDim / 2;
@@ -214,7 +218,8 @@ ESIMD_INLINE void qkv_split_norm_rope_kernel(
 
         // RoPE: read from cos_sin_cache (same as Q)
         if (mrope) {
-            qkv_apply_mrope64(outputTemp, ropePos, ntoks, tokIdx, ropeCosSinCache);
+            qkv_apply_mrope64(
+                outputTemp, ropePos, positionRowStride, tokIdx, ropeCosSinCache);
         } else {
         {
             uint32_t krow_offset = i32RopeCoord * rotaryDim;
@@ -310,7 +315,7 @@ inline void qkv_split_norm_rope_host(
                 qkv_split_norm_rope_kernel<uint32_t>(
                     qkvState, qState, gateState, kState, vState,
                     normWq, normWk, normWv, ropePos, ropeCosSinCache,
-                    ntoks, hiddenDim, headDim, qHead, kvHead, rotaryDim, false, ndi);
+                    ntoks, ntoks, hiddenDim, headDim, qHead, kvHead, rotaryDim, false, ndi);
             });
     });
 }

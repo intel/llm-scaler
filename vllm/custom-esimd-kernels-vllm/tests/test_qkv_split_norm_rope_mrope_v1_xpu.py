@@ -56,25 +56,44 @@ def _reference(
     return q, torch.sigmoid(gate), k, v.contiguous()
 
 
-def _positions(tokens: int, dtype: torch.dtype, different: bool) -> torch.Tensor:
+def _positions(
+    tokens: int, dtype: torch.dtype, different: bool, production_layout: bool = False
+) -> torch.Tensor:
     base = torch.arange(1, tokens + 1, device="xpu", dtype=dtype)
-    if different:
-        return torch.stack((base, base + 17, base + 33), dim=0).contiguous()
-    return base.repeat(3, 1).contiguous()
+    values = (
+        torch.stack((base, base + 17, base + 33), dim=0)
+        if different
+        else base.repeat(3, 1)
+    )
+    if not production_layout:
+        return values.contiguous()
+    backing = torch.empty((3, tokens + 7), dtype=dtype, device="xpu")
+    view = backing[:, :tokens]
+    view.copy_(values)
+    return view
 
 
 @pytest.mark.parametrize("tokens", [1, 2, 32])
 @pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("different_axes", [False, True])
+@pytest.mark.parametrize("production_layout", [False, True])
 def test_qwen38_mrope_v1_matches_reference(
-    tokens: int, position_dtype: torch.dtype, different_axes: bool
+    tokens: int,
+    position_dtype: torch.dtype,
+    different_axes: bool,
+    production_layout: bool,
 ) -> None:
     torch.manual_seed(1000 + tokens + int(position_dtype == torch.int64) * 10)
     qkv = torch.randn((tokens, 2048), dtype=torch.float16, device="xpu")
     norm_wq = torch.randn(256, dtype=torch.float16, device="xpu") * 0.1
     norm_wk = torch.randn(256, dtype=torch.float16, device="xpu") * 0.1
     cache = torch.randn((256, 64), dtype=torch.float16, device="xpu")
-    positions = _positions(tokens, position_dtype, different_axes)
+    positions = _positions(
+        tokens, position_dtype, different_axes, production_layout
+    )
+    if production_layout:
+        assert positions.stride() == (tokens + 7, 1)
+        assert not positions.is_contiguous()
     q = torch.empty((tokens, 768), dtype=torch.float16, device="xpu")
     gate = torch.empty_like(q)
     k = torch.empty((tokens, 256), dtype=torch.float16, device="xpu")
@@ -169,6 +188,100 @@ def test_qwen38_mrope_v1_rejects_physical_output_overlap() -> None:
             qkv,
             q,
             independent_q_wrapper,
+            k,
+            v,
+            norm,
+            norm,
+            positions,
+            3,
+            1,
+            True,
+            True,
+            cache,
+        )
+
+
+def test_qwen38_mrope_v1_rejects_position_inner_stride() -> None:
+    tokens = 2
+    qkv = torch.randn((tokens, 2048), dtype=torch.float16, device="xpu")
+    norm = torch.ones(256, dtype=torch.float16, device="xpu")
+    cache = torch.ones((64, 64), dtype=torch.float16, device="xpu")
+    backing = torch.zeros((3, tokens * 2), dtype=torch.int32, device="xpu")
+    positions = backing[:, ::2]
+    q = torch.empty((tokens, 768), dtype=torch.float16, device="xpu")
+    gate = torch.empty_like(q)
+    k = torch.empty((tokens, 256), dtype=torch.float16, device="xpu")
+    v = torch.empty_like(k)
+
+    assert positions.stride() == (tokens * 2, 2)
+    with pytest.raises(RuntimeError, match="inner stride"):
+        _QKV_OP(
+            qkv,
+            q,
+            gate,
+            k,
+            v,
+            norm,
+            norm,
+            positions,
+            3,
+            1,
+            True,
+            True,
+            cache,
+        )
+
+
+def test_qwen38_mrope_v1_rejects_overlapping_position_rows() -> None:
+    tokens = 2
+    qkv = torch.randn((tokens, 2048), dtype=torch.float16, device="xpu")
+    norm = torch.ones(256, dtype=torch.float16, device="xpu")
+    cache = torch.ones((64, 64), dtype=torch.float16, device="xpu")
+    backing = torch.zeros(5, dtype=torch.int32, device="xpu")
+    positions = backing.as_strided((3, tokens), (1, 1))
+    q = torch.empty((tokens, 768), dtype=torch.float16, device="xpu")
+    gate = torch.empty_like(q)
+    k = torch.empty((tokens, 256), dtype=torch.float16, device="xpu")
+    v = torch.empty_like(k)
+
+    assert positions.stride() == (1, 1)
+    with pytest.raises(RuntimeError, match="non-overlapping"):
+        _QKV_OP(
+            qkv,
+            q,
+            gate,
+            k,
+            v,
+            norm,
+            norm,
+            positions,
+            3,
+            1,
+            True,
+            True,
+            cache,
+        )
+
+
+def test_qwen38_mrope_v1_checks_all_strided_position_rows_for_alias() -> None:
+    tokens = 2
+    qkv = torch.randn((tokens, 2048), dtype=torch.float16, device="xpu")
+    norm = torch.ones(256, dtype=torch.float16, device="xpu")
+    cache = torch.ones((64, 64), dtype=torch.float16, device="xpu")
+    storage = torch.empty(1544, dtype=torch.int32, device="xpu")
+    positions = storage[:10].as_strided((3, tokens), (4, 1))
+    q = storage[8:776].view(torch.float16).reshape(tokens, 768)
+    gate = torch.empty_like(q)
+    k = torch.empty((tokens, 256), dtype=torch.float16, device="xpu")
+    v = torch.empty_like(k)
+
+    assert positions.stride() == (4, 1)
+    assert q.is_contiguous()
+    with pytest.raises(RuntimeError, match="overlap"):
+        _QKV_OP(
+            qkv,
+            q,
+            gate,
             k,
             v,
             norm,

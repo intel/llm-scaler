@@ -40,26 +40,14 @@ static inline sycl::queue& get_device_queue(const at::Tensor& tensor) {
     return c10::xpu::getCurrentXPUStream(tensor.device().index()).queue();
 }
 
-// The MRoPE ABI requires contiguous tensors, so data_ptr()+numel*element_size
-// describes the complete physical byte range. Unlike is_alias_of(), this also
-// catches independently wrapped storage such as a same-address DLPack view.
-static inline bool qwen38_mrope_ranges_overlap(
-    const at::Tensor& left, const at::Tensor& right) {
-    if (left.numel() == 0 || right.numel() == 0) {
-        return false;
-    }
+// The MRoPE ABI uses contiguous tensors except for the position rows.  The
+// position layout is checked separately; this helper handles the contiguous
+// tensors and checks each position row for physical aliasing.
+static inline bool qwen38_mrope_byte_ranges_overlap(
+    std::uintptr_t left_begin, std::uintptr_t left_bytes,
+    std::uintptr_t right_begin, std::uintptr_t right_bytes) {
     constexpr auto kMaxAddress =
         std::numeric_limits<std::uintptr_t>::max();
-    const auto left_begin = reinterpret_cast<std::uintptr_t>(left.data_ptr());
-    const auto right_begin = reinterpret_cast<std::uintptr_t>(right.data_ptr());
-    const auto left_numel = static_cast<std::uintptr_t>(left.numel());
-    const auto right_numel = static_cast<std::uintptr_t>(right.numel());
-    if (left_numel > kMaxAddress / left.element_size() ||
-        right_numel > kMaxAddress / right.element_size()) {
-        return true;
-    }
-    const auto left_bytes = left_numel * left.element_size();
-    const auto right_bytes = right_numel * right.element_size();
     if (left_begin > kMaxAddress - left_bytes ||
         right_begin > kMaxAddress - right_bytes) {
         return true;
@@ -67,6 +55,62 @@ static inline bool qwen38_mrope_ranges_overlap(
     const auto left_end = left_begin + left_bytes;
     const auto right_end = right_begin + right_bytes;
     return left_begin < right_end && right_begin < left_end;
+}
+
+static inline bool qwen38_mrope_ranges_overlap(
+    const at::Tensor& left, const at::Tensor& right) {
+    if (left.numel() == 0 || right.numel() == 0) {
+        return false;
+    }
+    if (left.is_contiguous() && right.is_contiguous()) {
+        const auto left_begin = reinterpret_cast<std::uintptr_t>(left.data_ptr());
+        const auto right_begin = reinterpret_cast<std::uintptr_t>(right.data_ptr());
+        const auto left_numel = static_cast<std::uintptr_t>(left.numel());
+        const auto right_numel = static_cast<std::uintptr_t>(right.numel());
+        if (left_numel > std::numeric_limits<std::uintptr_t>::max() /
+                left.element_size() ||
+            right_numel > std::numeric_limits<std::uintptr_t>::max() /
+                right.element_size()) {
+            return true;
+        }
+        return qwen38_mrope_byte_ranges_overlap(
+            left_begin, left_numel * left.element_size(), right_begin,
+            right_numel * right.element_size());
+    }
+
+    // Only positions may be non-contiguous under this ABI.  Its three rows are
+    // individually contiguous, so checking their exact intervals avoids both
+    // missing an alias in the capacity gap and rejecting a valid gap as an alias.
+    const at::Tensor& positions = left.is_contiguous() ? right : left;
+    const at::Tensor& contiguous = left.is_contiguous() ? left : right;
+    if (positions.dim() == 2 && positions.size(0) == 3 &&
+        positions.stride(1) == 1) {
+        const auto contiguous_begin =
+            reinterpret_cast<std::uintptr_t>(contiguous.data_ptr());
+        const auto contiguous_numel =
+            static_cast<std::uintptr_t>(contiguous.numel());
+        if (contiguous_numel > std::numeric_limits<std::uintptr_t>::max() /
+                contiguous.element_size()) {
+            return true;
+        }
+        const auto contiguous_bytes =
+            contiguous_numel * contiguous.element_size();
+        const auto row_bytes = static_cast<std::uintptr_t>(positions.size(1)) *
+            positions.element_size();
+        for (int64_t row = 0; row < positions.size(0); ++row) {
+            const auto row_offset = static_cast<std::uintptr_t>(row) *
+                static_cast<std::uintptr_t>(positions.stride(0)) *
+                positions.element_size();
+            const auto row_begin =
+                reinterpret_cast<std::uintptr_t>(positions.data_ptr()) + row_offset;
+            if (qwen38_mrope_byte_ranges_overlap(
+                    row_begin, row_bytes, contiguous_begin, contiguous_bytes)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return true;
 }
 
 at::Tensor esimd_gemv_fp8_pern(
@@ -367,6 +411,7 @@ static void qkv_split_norm_rope_mrope_v1_host(
     uint8_t* qkvState, uint8_t* qState, uint8_t* gateState,
     uint8_t* kState, uint8_t* vState, uint8_t* normWq, uint8_t* normWk,
     const PosT* ropePos, fp16* ropeCosSinCache, uint32_t ntoks,
+    uint32_t positionRowStride,
     uint32_t hiddenDim, uint32_t qHead, uint32_t kvHead, bool attnOutputGate,
     sycl::queue& q) {
     constexpr uint32_t headDim = 256;
@@ -381,7 +426,8 @@ static void qkv_split_norm_rope_mrope_v1_host(
                 qkv_split_norm_rope_kernel<PosT>(
                     qkvState, qState, gateState, kState, vState,
                     normWq, normWk, nullptr, ropePos, ropeCosSinCache,
-                    ntoks, hiddenDim, headDim, qHead, kvHead, 64, true, ndi);
+                    ntoks, positionRowStride, hiddenDim, headDim, qHead,
+                    kvHead, 64, true, ndi);
             });
     });
 }
@@ -421,7 +467,13 @@ at::Tensor esimd_qkv_split_norm_rope_mrope_v1(
             positions.size(1) == ntoks &&
             (positions.scalar_type() == at::kInt ||
              positions.scalar_type() == at::kLong),
-        "positions must be contiguous [3, nTokens] int32 or int64");
+        "positions must be [3, nTokens] int32 or int64");
+    const auto position_row_stride = positions.stride(0);
+    TORCH_CHECK(
+        positions.stride(1) == 1 && position_row_stride >= ntoks &&
+            position_row_stride <=
+                static_cast<int64_t>(std::numeric_limits<uint32_t>::max()),
+        "positions must have positive, non-overlapping rows with inner stride 1");
     TORCH_CHECK(
         norm_wq.scalar_type() == at::kHalf && norm_wk.scalar_type() == at::kHalf &&
             norm_wq.dim() == 1 && norm_wk.dim() == 1 &&
@@ -450,9 +502,14 @@ at::Tensor esimd_qkv_split_norm_rope_mrope_v1(
         TORCH_CHECK(
             tensor.device() == qkv_state.device(),
             "all Qwen3.8 MRoPE v1 tensors must use qkv_state's XPU device");
+    }
+    const at::Tensor contiguous_tensors[] = {
+        qkv_state, q_out, gate_out, k_out, v_out,
+        norm_wq, norm_wk, cos_sin_cache};
+    for (const auto& tensor : contiguous_tensors) {
         TORCH_CHECK(
             tensor.is_contiguous(),
-            "all Qwen3.8 MRoPE v1 tensors must be contiguous");
+            "all Qwen3.8 MRoPE v1 tensors except positions must be contiguous");
     }
     const at::Tensor outputs[] = {q_out, gate_out, k_out, v_out};
     const at::Tensor inputs[] = {
@@ -504,12 +561,14 @@ at::Tensor esimd_qkv_split_norm_rope_mrope_v1(
     if (positions.scalar_type() == at::kInt) {
         qkv_split_norm_rope_mrope_v1_host<int32_t>(
             p_qkv, p_q, p_gate, p_k, p_v, p_nwq, p_nwk,
-            positions.data_ptr<int32_t>(), p_cs, ntoks, qkv_state.size(1),
+            positions.data_ptr<int32_t>(), p_cs, ntoks,
+            static_cast<uint32_t>(positions.stride(0)), qkv_state.size(1),
             q_heads, kv_heads, attn_output_gate, dpcpp_queue);
     } else {
         qkv_split_norm_rope_mrope_v1_host<int64_t>(
             p_qkv, p_q, p_gate, p_k, p_v, p_nwq, p_nwk,
-            positions.data_ptr<int64_t>(), p_cs, ntoks, qkv_state.size(1),
+            positions.data_ptr<int64_t>(), p_cs, ntoks,
+            static_cast<uint32_t>(positions.stride(0)), qkv_state.size(1),
             q_heads, kv_heads, attn_output_gate, dpcpp_queue);
     }
     return q_out;
