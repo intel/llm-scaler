@@ -99,6 +99,59 @@ def test_supported_torch_minors_select_distinct_wheel_tags(
     )
 
 
+def test_windows_onednn_contract_tracks_torch_minor(monkeypatch):
+    import setuptools
+
+    monkeypatch.chdir(PROJECT_ROOT)
+    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
+    monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
+    namespace = run_path(
+        str(PROJECT_ROOT / "setup.py"), run_name="__windows_onednn_contract_test__"
+    )
+    get_contract = namespace["get_windows_onednn_contract"]
+
+    assert get_contract("2.12.0+xpu") == ("2025.3.0", (3, 9, 1), "2025.3")
+    assert get_contract("2.13.0+xpu") == ("2026.0.0", (3, 11, 2), "2026.0")
+
+
+def test_windows_compile_env_adds_aot_companion_tools(monkeypatch, tmp_path):
+    import setuptools
+
+    monkeypatch.chdir(PROJECT_ROOT)
+    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
+    monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
+    namespace = run_path(
+        str(PROJECT_ROOT / "setup.py"), run_name="__windows_compile_env_test__"
+    )
+    get_compile_env = namespace["get_compile_env"]
+    monkeypatch.setitem(get_compile_env.__globals__, "IS_WINDOWS", True)
+
+    oneapi_root = tmp_path / "oneAPI"
+    compiler_bin = oneapi_root / "compiler" / "2026.0" / "bin"
+    compiler_tools = compiler_bin / "compiler"
+    compiler_lib = compiler_bin.parent / "lib"
+    ocloc_bin = oneapi_root / "ocloc" / "2026.0" / "bin"
+    compiler_tools.mkdir(parents=True)
+    compiler_lib.mkdir(parents=True)
+    ocloc_bin.mkdir(parents=True)
+    compiler = compiler_bin / "icx.exe"
+    compiler.write_bytes(b"")
+    monkeypatch.setenv("PATH", os.fspath(tmp_path / "existing"))
+    monkeypatch.setenv("LIB", os.fspath(tmp_path / "existing-lib"))
+
+    env = get_compile_env(compiler=os.fspath(compiler))
+    paths = env["PATH"].split(os.pathsep)
+
+    assert paths[:2] == [
+        os.fspath(compiler_tools.resolve()),
+        os.fspath(ocloc_bin.resolve()),
+    ]
+    assert env["LIB"].split(os.pathsep)[:2] == [
+        os.fspath(compiler_lib.resolve()),
+        os.fspath(tmp_path / "existing-lib"),
+    ]
+
+
 @pytest.mark.parametrize(
     ("target", "target_tag"),
     [("bmg", "bmg"), ("ptl-h", "ptlh")],
@@ -223,6 +276,7 @@ def test_build_system_does_not_force_a_torch_environment():
     assert "omni_xpu_kernel._version.__version__" not in pyproject
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows CUTE is opt-in")
 def test_cute_is_required_by_default():
     result = run_setup_name(require_cute=None)
 
@@ -231,11 +285,20 @@ def test_cute_is_required_by_default():
     assert "CUTE is required by default" in output
 
 
-def test_core_only_build_requires_explicit_cute_opt_out():
+def test_explicit_cute_opt_out_builds_core_only():
     result = run_setup_name(require_cute="0")
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "omni_xpu_kernel" in result.stdout
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows CUTE default")
+def test_windows_cute_enable_requires_a_complete_sycl_tla_tree():
+    result = run_setup_name(require_cute="1")
+
+    assert result.returncode != 0
+    output = result.stdout + result.stderr
+    assert "CUTE was explicitly enabled on Windows" in output
 
 
 def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
@@ -321,6 +384,42 @@ def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
         ]
 
 
+def test_windows_cute_extension_is_explicit_opt_in(monkeypatch, tmp_path):
+    import platform
+    import setuptools
+
+    for required_dir in (
+        "include",
+        "tools/util/include",
+        "examples/common",
+        "applications",
+    ):
+        (tmp_path / required_dir).mkdir(parents=True)
+    monkeypatch.chdir(PROJECT_ROOT)
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setenv("CUTLASS_SYCL_ROOT", str(tmp_path))
+
+    def extension_names(require_cute):
+        captured = {}
+        if require_cute is None:
+            monkeypatch.delenv("OMNI_XPU_REQUIRE_CUTE", raising=False)
+        else:
+            monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", require_cute)
+        monkeypatch.setattr(
+            setuptools, "setup", lambda **kwargs: captured.update(kwargs)
+        )
+        run_path(
+            str(PROJECT_ROOT / "setup.py"),
+            run_name=f"__windows_cute_metadata_{require_cute}__",
+        )
+        return {extension.name for extension in captured["ext_modules"]}
+
+    extension = "omni_xpu_kernel.cute.cute_fmha_torch"
+    assert extension not in extension_names(None)
+    assert extension not in extension_names("0")
+    assert extension in extension_names("1")
+
+
 def test_windows_onednn_runtime_bundle_contains_notices_and_hash(
     monkeypatch, tmp_path
 ):
@@ -336,7 +435,7 @@ def test_windows_onednn_runtime_bundle_contains_notices_and_hash(
     bundle_runtime = namespace["bundle_windows_onednn_runtime"]
     monkeypatch.setitem(find_runtime.__globals__, "IS_WINDOWS", True)
 
-    dnnl_root = tmp_path / "oneapi" / "dnnl" / "2025.3"
+    dnnl_root = tmp_path / "oneapi" / "dnnl" / "2026.0"
     lib_dir = dnnl_root / "lib"
     runtime = dnnl_root / "bin" / "dnnl.dll"
     notices = dnnl_root / "share" / "doc" / "dnnl"
@@ -361,7 +460,10 @@ def test_windows_onednn_runtime_bundle_contains_notices_and_hash(
         "license\n"
     )
     version = (vendor / "onednn" / "VERSION").read_text(encoding="utf-8")
-    assert "oneDNN=3.9.1" in version
+    expected_version = ".".join(
+        map(str, namespace["get_validated_onednn_version"]())
+    )
+    assert f"oneDNN={expected_version}" in version
     assert hashlib.sha256(runtime_bytes).hexdigest() in version
 
 
@@ -386,6 +488,16 @@ def test_bmg_cute_overlay_patches_private_header_copy(monkeypatch, tmp_path):
     namespace = run_path(
         str(PROJECT_ROOT / "setup.py"), run_name="__cute_bmg_overlay_test__"
     )
+    if sys.platform == "win32":
+        for relative_path, patches in namespace[
+            "WINDOWS_CUTE_HEADER_PATCHES"
+        ].items():
+            source = cutlass_root / "include" / relative_path
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(
+                "\n".join(original for original, _, _ in patches) + "\n",
+                encoding="utf-8",
+            )
 
     collective = (
         cutlass_root
@@ -418,6 +530,203 @@ def test_bmg_cute_overlay_patches_private_header_copy(monkeypatch, tmp_path):
     assert (
         overlay_collective / "fmha_fusion.hpp"
     ).read_text(encoding="utf-8") == "fusion sentinel\n"
+
+
+def _write_synthetic_bmg_cute_headers(namespace, cutlass_root):
+    collective = (
+        cutlass_root
+        / "applications"
+        / "flash_attention_v2"
+        / "collective"
+    )
+    collective.mkdir(parents=True, exist_ok=True)
+    (collective / "xe_fmha_fwd_mainloop.hpp").write_text(
+        namespace["BMG_CUTE_REMAINDER_MASK_ORIGINAL"], encoding="utf-8"
+    )
+    (collective / "fmha_fusion.hpp").write_text(
+        "fusion sentinel\n", encoding="utf-8"
+    )
+    for relative_path, patches in namespace[
+        "WINDOWS_CUTE_HEADER_PATCHES"
+    ].items():
+        source = cutlass_root / "include" / relative_path
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(
+            "\n".join(original for original, _, _ in patches) + "\n",
+            encoding="utf-8",
+        )
+
+
+def test_windows_cute_overlay_is_private_and_fail_closed(monkeypatch, tmp_path):
+    import setuptools
+
+    cutlass_root = tmp_path / "sycl-tla"
+    for required_dir in (
+        "include",
+        "tools/util/include",
+        "examples/common",
+        "applications",
+    ):
+        (cutlass_root / required_dir).mkdir(parents=True)
+    monkeypatch.chdir(PROJECT_ROOT)
+    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
+    monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
+    namespace = run_path(
+        str(PROJECT_ROOT / "setup.py"),
+        run_name="__windows_cute_overlay_test__",
+    )
+    _write_synthetic_bmg_cute_headers(namespace, cutlass_root)
+    prepare_overlay = namespace["prepare_bmg_cute_include_overlay"]
+    monkeypatch.setitem(prepare_overlay.__globals__, "IS_WINDOWS", True)
+
+    overlay = prepare_overlay(cutlass_root, tmp_path / "build")
+    for relative_path, patches in namespace[
+        "WINDOWS_CUTE_HEADER_PATCHES"
+    ].items():
+        source = cutlass_root / "include" / relative_path
+        source_text = source.read_text(encoding="utf-8")
+        overlay_text = (overlay / relative_path).read_text(encoding="utf-8")
+        for original, replacement, _ in patches:
+            assert original in source_text
+            assert replacement in overlay_text
+            if original not in replacement:
+                assert original not in overlay_text
+
+    drifted = (
+        cutlass_root / "include" / "cute" / "atom" / "copy_traits_xe_2d.hpp"
+    )
+    drifted.write_text("upstream changed\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="matches=0"):
+        prepare_overlay(cutlass_root, tmp_path / "drifted-build")
+
+
+def test_windows_cute_compile_command_uses_validated_flags(monkeypatch, tmp_path):
+    import setuptools
+
+    cutlass_root = tmp_path / "sycl-tla"
+    for required_dir in (
+        "include",
+        "tools/util/include",
+        "examples/common",
+        "applications",
+    ):
+        (cutlass_root / required_dir).mkdir(parents=True)
+    monkeypatch.chdir(PROJECT_ROOT)
+    monkeypatch.setenv("CUTLASS_SYCL_ROOT", str(cutlass_root))
+    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
+    monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
+    namespace = run_path(
+        str(PROJECT_ROOT / "setup.py"),
+        run_name="__windows_cute_command_test__",
+    )
+    _write_synthetic_bmg_cute_headers(namespace, cutlass_root)
+
+    build_extension = namespace["ICPXBuildExt"].build_extension
+    build_globals = build_extension.__globals__
+    monkeypatch.setitem(build_globals, "IS_WINDOWS", True)
+    monkeypatch.setitem(build_globals, "BUILD_XPU_TARGET", "bmg")
+    monkeypatch.setitem(build_globals, "XPU_ARCH_MACRO", "OMNI_XPU_ARCH_BMG")
+    monkeypatch.setitem(build_globals, "get_icpx_path", lambda: "C:/fake/icx.exe")
+    monkeypatch.setitem(build_globals, "validate_torch_build", lambda *args: None)
+    fake_onednn = tmp_path / "onednn"
+    monkeypatch.setitem(
+        build_globals,
+        "get_onednn_paths",
+        lambda: (
+            fake_onednn / "include",
+            fake_onednn / "lib",
+            fake_onednn / "lib" / "dnnl.lib",
+            fake_onednn / "bin" / "dnnl.dll",
+            "test",
+        ),
+    )
+    monkeypatch.setitem(
+        build_globals, "get_runtime_library_dir", lambda: tmp_path / "runtime"
+    )
+    monkeypatch.setitem(
+        build_globals,
+        "get_torch_runtime_library_dir",
+        lambda: tmp_path / "torch-runtime",
+    )
+    monkeypatch.setitem(
+        build_globals, "find_onednn_notice_dir", lambda runtime: None
+    )
+    monkeypatch.setitem(
+        build_globals,
+        "get_compile_env",
+        lambda include, compiler="": {},
+    )
+
+    commands = []
+
+    def capture_compile(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", capture_compile)
+    command = namespace["ICPXBuildExt"](setuptools.Distribution())
+    command.build_temp = str(tmp_path / "build")
+    monkeypatch.setattr(
+        command,
+        "get_ext_fullpath",
+        lambda name: str(tmp_path / "cute_fmha_torch.cp313-win_amd64.pyd"),
+    )
+    extension = namespace["ICPXExtension"](
+        "omni_xpu_kernel.cute.cute_fmha_torch",
+        sourcedir=str(PROJECT_ROOT),
+    )
+    command.build_extension(extension)
+
+    assert len(commands) == 1
+    compile_command = commands[0]
+    assert compile_command[:2] == ["C:/fake/icx.exe", "-fsycl"]
+    assert "/MD" in compile_command
+    assert "/LD" in compile_command
+    assert "-Xsycl-target-backend=spir64_gen" in compile_command
+    assert "-device bmg-g31" in compile_command
+    assert "-fno-sycl-instrument-device-code" in compile_command
+    assert "-DCUTLASS_ENABLE_SYCL" in compile_command
+    assert "-DSYCL_INTEL_TARGET" in compile_command
+    assert "-DOMNI_XPU_ARCH_BMG=1" in compile_command
+    assert any(
+        argument.startswith("/I") and "cute_bmg_include_overlay" in argument
+        for argument in compile_command
+    )
+    assert "torch_xpu.lib" in compile_command
+    assert any(argument.endswith("sol_attn_prepare.cpp") for argument in compile_command)
+    assert any(argument.endswith("sol_attn_torch.cpp") for argument in compile_command)
+    assert compile_command.index("/link") > compile_command.index(
+        str(
+            PROJECT_ROOT
+            / "omni_xpu_kernel"
+            / "cute"
+            / "cute_fmha_torch.cpp"
+        )
+    )
+
+
+def test_cute_loader_finds_windows_pyd(monkeypatch, tmp_path):
+    namespace = run_path(
+        str(PROJECT_ROOT / "omni_xpu_kernel" / "cute" / "__init__.py"),
+        run_name="__cute_loader_test__",
+    )
+    package_dir = tmp_path / "omni_xpu_kernel" / "cute"
+    package_dir.mkdir(parents=True)
+    extension = package_dir / "cute_fmha_torch.cp313-win_amd64.pyd"
+    extension.write_bytes(b"test extension")
+    find_extension = namespace["_find_extension"]
+    monkeypatch.setitem(
+        find_extension.__globals__, "__file__", str(package_dir / "__init__.py")
+    )
+    monkeypatch.setitem(
+        find_extension.__globals__,
+        "EXTENSION_SUFFIXES",
+        [".cp313-win_amd64.pyd", ".pyd"],
+    )
+    monkeypatch.delenv("OMNI_CUTE_FMHA_SO", raising=False)
+
+    assert Path(find_extension()) == extension
+    assert Path(namespace["_find_so"]()) == extension
 
 
 @pytest.mark.parametrize("target", SUPPORTED_XPU_TARGETS)
@@ -520,11 +829,5 @@ def test_default_build_accepts_complete_cutlass_tree(tmp_path):
         env=env,
     )
 
-    if sys.platform == "win32":
-        assert result.returncode != 0
-        assert "CUTE is required by default but unsupported on Windows" in (
-            result.stdout + result.stderr
-        )
-    else:
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert "omni_xpu_kernel" in result.stdout
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "omni_xpu_kernel" in result.stdout
