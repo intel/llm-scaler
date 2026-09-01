@@ -243,6 +243,24 @@ def _returned_assignment_value(function: ast.FunctionDef) -> ast.AST:
     return assignments[0]
 
 
+def _short_conv_operation_names(node: ast.AST) -> tuple[str, ...]:
+    if isinstance(node, ast.Constant):
+        assert isinstance(node.value, str)
+        assert node.value.startswith("ple_short_conv_")
+        return (node.value,)
+    assert isinstance(node, ast.IfExp)
+    assert isinstance(node.test, ast.Name) and node.test.id == "trusted"
+    assert isinstance(node.body, ast.Constant)
+    assert isinstance(node.orelse, ast.Constant)
+    assert isinstance(node.body.value, str)
+    assert isinstance(node.orelse.value, str)
+    trusted_name = node.body.value
+    legacy_name = node.orelse.value
+    assert trusted_name == f"{legacy_name}_trusted"
+    assert legacy_name.startswith("ple_short_conv_")
+    return trusted_name, legacy_name
+
+
 def _short_conv_prepare_contracts(
     tree: ast.Module,
 ) -> dict[str, tuple[ast.FunctionDef, ast.Tuple]]:
@@ -257,17 +275,28 @@ def _short_conv_prepare_contracts(
     assert resolver_function.args.args
     resolver_receiver = resolver_function.args.args[0].arg
     _assert_unique_local_binding(resolver_function, resolver_receiver)
-    resolver_call = _returned_assignment_value(resolver_function)
-    assert (
-        isinstance(resolver_call, ast.Call)
-        and isinstance(resolver_call.func, ast.Attribute)
-        and isinstance(resolver_call.func.value, ast.Name)
-        and resolver_call.func.value.id == resolver_receiver
-        and resolver_call.func.attr == "_production_ple_op"
-    )
+    resolver_calls = [
+        node
+        for node in ast.walk(resolver_function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == resolver_receiver
+        and node.func.attr == "_production_ple_op"
+    ]
+    assert len(resolver_calls) == 1
+    resolver_call = resolver_calls[0]
     resolved_name = _call_argument(resolver_call, 0, "name")
     assert isinstance(resolved_name, ast.Name) and resolved_name.id == "name"
     _assert_unique_local_binding(resolver_function, resolved_name.id)
+    successful_returns = [
+        node
+        for node in ast.walk(resolver_function)
+        if isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "operation"
+    ]
+    assert len(successful_returns) == 2
 
     contracts: dict[str, tuple[ast.FunctionDef, ast.Tuple]] = {}
     for function in (
@@ -289,12 +318,7 @@ def _short_conv_prepare_contracts(
             ):
                 continue
             op_name = _call_argument(value, 2, "name")
-            if not (
-                isinstance(op_name, ast.Constant)
-                and isinstance(op_name.value, str)
-                and op_name.value.startswith("ple_short_conv_")
-            ):
-                continue
+            operation_names = _short_conv_operation_names(op_name)
             operation_name = _assigned_name(assignment)
             assert operation_name is not None
             caller_receiver = function.args.args[0].arg
@@ -318,8 +342,12 @@ def _short_conv_prepare_contracts(
                 ):
                     prepared_args.append(saved_args)
             assert len(prepared_args) == 1
-            assert op_name.value not in contracts
-            contracts[op_name.value] = (function, prepared_args[0])
+            for operation_name_literal in operation_names:
+                assert operation_name_literal not in contracts
+                contracts[operation_name_literal] = (
+                    function,
+                    prepared_args[0],
+                )
     return contracts
 
 
@@ -562,8 +590,15 @@ def _assert_ple_loader_supports_ops(
     used_op_schemas = {
         name: f"{namespace}::{name}" for name in operation_names
     }
+    # Trusted short-conv schemas are owned only by the canonical production
+    # DSO; the explicitly standalone artifact owns the legacy family.
     assert used_op_schemas.items() <= loader_op_schemas.items()
-    assert set(used_op_schemas.values()) <= standalone_schemas
+    standalone_op_schemas = {
+        schema
+        for name, schema in used_op_schemas.items()
+        if not name.endswith("_trusted")
+    }
+    assert standalone_op_schemas <= standalone_schemas
 
 
 def test_production_main_dso_is_the_single_ple_owner() -> None:
@@ -804,9 +839,9 @@ def test_production_short_conv_dependency_contract_is_coherent() -> None:
     }
     trusted_ops = {f"{name}_trusted" for name in legacy_ops}
     requested_ops = set(contracts)
-    # The llm-scaler ABI commit precedes its dependent vLLM caller commit.  The
-    # caller must select one complete family and obey that family's null ABI.
-    assert requested_ops in (legacy_ops, trusted_ops)
+    # The caller selects a complete legacy/trusted family from the same
+    # resolver, depending on whether the CPU proof is available.
+    assert requested_ops == legacy_ops | trusted_ops
 
     loader_source = ESIMD_UTILS.read_text()
     loader_tree = ast.parse(loader_source)
@@ -820,7 +855,7 @@ def test_production_short_conv_dependency_contract_is_coherent() -> None:
         and isinstance(node.value, ast.Call)
         and isinstance(node.value.func, ast.Attribute)
         and node.value.func.attr == "_resolve_short_conv_op"
-        and isinstance(_call_argument(node.value, 2, "name"), ast.Constant)
+        and _short_conv_operation_names(_call_argument(node.value, 2, "name"))
     ]
     assert len(resolved_assignments) == 3
     overwritten_operation = _assigned_name(resolved_assignments[0])
@@ -844,7 +879,7 @@ def test_production_short_conv_dependency_contract_is_coherent() -> None:
         and isinstance(node.value, ast.Call)
         and isinstance(node.value.func, ast.Attribute)
         and node.value.func.attr == "_resolve_short_conv_op"
-        and isinstance(_call_argument(node.value, 2, "name"), ast.Constant)
+        and _short_conv_operation_names(_call_argument(node.value, 2, "name"))
     ]
     assert len(nested_resolved_assignments) == 3
     nested_operation_name = _assigned_name(nested_resolved_assignments[0])
@@ -954,9 +989,16 @@ def test_production_short_conv_dependency_contract_is_coherent() -> None:
         and node.name == "_resolve_short_conv_op"
     ]
     assert len(receiver_resolvers) == 1
-    receiver_call = _returned_assignment_value(receiver_resolvers[0])
-    assert isinstance(receiver_call, ast.Call)
-    assert isinstance(receiver_call.func, ast.Attribute)
+    receiver_calls = [
+        node
+        for node in ast.walk(receiver_resolvers[0])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.attr == "_production_ple_op"
+    ]
+    assert len(receiver_calls) == 1
+    receiver_call = receiver_calls[0]
     receiver_call.func.value = ast.Name(
         id="unrelated_loader", ctx=ast.Load()
     )
@@ -978,7 +1020,7 @@ def test_production_short_conv_dependency_contract_is_coherent() -> None:
         and isinstance(node.value, ast.Name)
         and node.value.id == "operation"
     ]
-    assert len(successful_returns) == 1
+    assert len(successful_returns) == 2
     successful_returns[0].value = ast.Call(
         func=ast.Attribute(
             value=ast.Name(id="self", ctx=ast.Load()),
@@ -1083,11 +1125,7 @@ def test_production_short_conv_dependency_contract_is_coherent() -> None:
     with pytest.raises(AssertionError):
         _assert_ple_loader_supports_ops(undeclared_trusted, trusted_ops)
 
-    sentinel = (
-        _legacy_null_sentinel(ple_layer_tree)
-        if requested_ops == legacy_ops
-        else None
-    )
+    sentinel = _legacy_null_sentinel(ple_layer_tree)
     state_index_positions = {
         "ple_short_conv_decode": 3,
         "ple_short_conv_prefill": 4,
@@ -1106,21 +1144,47 @@ def test_production_short_conv_dependency_contract_is_coherent() -> None:
             and isinstance(node.value.func, ast.Attribute)
             and node.value.func.attr == "_native_state_indices"
         ]
-        if requested_ops == trusted_ops:
-            inline_conversions = [
-                node
-                for node in ast.walk(state_indices)
-                if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_native_state_indices"
-            ]
-            assert _is_direct_null_zero(prepared_args.elts[-1])
-            assert not conversions and not inline_conversions
-        else:
-            assert sentinel is not None
-            assert _integer_literal(prepared_args.elts[-1]) == sentinel
-            assert isinstance(state_indices, ast.Name)
-            assert len(conversions) == 1
+        assert sentinel is not None
+        assert isinstance(state_indices, ast.Name)
+        assert len(conversions) == 1
+        null_block_id = prepared_args.elts[-1]
+        assert isinstance(null_block_id, ast.Name)
+        assert null_block_id.id == "null_block_id"
+        trusted_branches = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "trusted"
+            and any(
+                isinstance(statement, (ast.Assign, ast.AnnAssign))
+                and _assigned_name(statement) == null_block_id.id
+                for statement in node.body
+            )
+            and any(
+                isinstance(statement, (ast.Assign, ast.AnnAssign))
+                and _assigned_name(statement) == null_block_id.id
+                for statement in node.orelse
+            )
+        ]
+        assert len(trusted_branches) == 1
+        trusted_branch = trusted_branches[0]
+        trusted_assignments = [
+            node
+            for node in trusted_branch.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and _assigned_name(node) == null_block_id.id
+        ]
+        legacy_assignments = [
+            node
+            for node in trusted_branch.orelse
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and _assigned_name(node) == null_block_id.id
+        ]
+        assert len(trusted_assignments) == 1
+        assert len(legacy_assignments) == 1
+        assert _is_direct_null_zero(trusted_assignments[0].value)
+        assert _integer_literal(legacy_assignments[0].value) == sentinel
 
 
 def test_projection_schemas_declare_caller_owned_outputs() -> None:
