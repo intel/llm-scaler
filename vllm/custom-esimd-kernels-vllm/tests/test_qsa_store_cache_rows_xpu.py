@@ -134,6 +134,34 @@ def test_qsa_store_cache_rows_v3_matches_strided_reference(
     assert torch.equal(slots.cpu(), slots_before)
 
 
+def test_qsa_store_cache_rows_v3_accepts_production_position_stride(qsa_ops):
+    cache, cache_backing = _make_cache(torch.int64, 3)
+    max_positions = 19
+    source = torch.arange(
+        3 * max_positions, dtype=torch.int64, device="xpu"
+    ).reshape(3, max_positions)
+    rows = source[:, 7:8].transpose(0, 1).unsqueeze(1)
+    slots = torch.tensor([5], dtype=torch.int64, device="xpu")
+
+    assert rows.shape == (1, 1, 3)
+    assert rows.stride(-1) == max_positions
+    source_before = source.cpu().clone()
+    expected = cache_backing.cpu().clone()
+    page, token = divmod(5, cache.shape[1])
+    begin = (
+        cache.storage_offset()
+        + page * cache.stride(0)
+        + token * cache.stride(1)
+    )
+    expected[begin : begin + 3] = rows.cpu()[0, 0]
+
+    qsa_ops.qsa_store_cache_rows_v3(cache, slots, rows)
+    torch.xpu.synchronize()
+
+    assert torch.equal(cache_backing.cpu(), expected)
+    assert torch.equal(source.cpu(), source_before)
+
+
 def test_qsa_store_cache_rows_v3_duplicate_slot_last_row_wins(qsa_ops):
     cache = torch.zeros((1, 4, 1, 128), dtype=torch.float16, device="xpu")
     slots = torch.tensor([2, 2], dtype=torch.int64, device="xpu")

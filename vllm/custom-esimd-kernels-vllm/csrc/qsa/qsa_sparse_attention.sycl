@@ -812,6 +812,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.attr("row_store_predicated_bounds") = 1;
   module.attr("row_store_duplicate_slots_last_write") = 1;
   module.attr("row_store_strided_rows") = 1;
+  module.attr("row_store_strided_position_width") = 1;
   module.attr("row_store_storage_offsets") = 1;
   module.attr("row_store_inner_contiguous") = 1;
   module.attr("row_store_no_workspace") = 1;

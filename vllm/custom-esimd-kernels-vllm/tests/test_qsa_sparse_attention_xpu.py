@@ -159,6 +159,7 @@ def test_qsa_module_contract(qsa_ops):
     assert qsa_ops.row_store_predicated_bounds == 1
     assert qsa_ops.row_store_duplicate_slots_last_write == 1
     assert qsa_ops.row_store_strided_rows == 1
+    assert qsa_ops.row_store_strided_position_width == 1
     assert qsa_ops.row_store_storage_offsets == 1
     assert qsa_ops.row_store_inner_contiguous == 1
     assert qsa_ops.row_store_no_workspace == 1

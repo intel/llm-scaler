@@ -25,7 +25,7 @@ using namespace sycl::ext::intel::esimd;
 constexpr int64_t kKeyWidth = 128;
 constexpr int64_t kPositionWidth = 3;
 
-template <typename scalar_t, int Width>
+template <typename scalar_t, int Width, bool StridedColumns>
 class QsaStoreCacheRowsKernel;
 
 bool is_positive_non_overlapping(const at::Tensor& tensor) {
@@ -104,9 +104,11 @@ void validate_store_inputs(
   TORCH_CHECK(
       supported,
       "row-store supports float16/bfloat16 width 128 or int64 width 3");
+  const bool position_rows = cache.scalar_type() == at::kLong;
   TORCH_CHECK(
-      cache.stride(3) == 1 && rows.stride(rows.dim() - 1) == 1,
-      "cache and rows must have contiguous inner width");
+      cache.stride(3) == 1 &&
+          (position_rows || rows.stride(rows.dim() - 1) == 1),
+      "cache and key rows must have contiguous inner width");
   TORCH_CHECK(
       is_positive_non_overlapping(cache),
       "cache must have positive non-overlapping strides");
@@ -124,7 +126,7 @@ void validate_store_inputs(
       "cache capacity overflows int64");
 }
 
-template <typename scalar_t, int Width>
+template <typename scalar_t, int Width, bool StridedColumns = false>
 void launch_store(
     const at::Tensor& cache,
     const at::Tensor& slot_mapping,
@@ -143,11 +145,13 @@ void launch_store(
   const int64_t cache_page_stride = cache.stride(0);
   const int64_t cache_token_stride = cache.stride(1);
   const int64_t rows_stride = rows.stride(0);
+  const int64_t rows_column_stride = rows.stride(rows.dim() - 1);
 
   auto& queue =
       c10::xpu::getCurrentXPUStream(cache.device().index()).queue();
   queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for<QsaStoreCacheRowsKernel<scalar_t, Width>>(
+    cgh.parallel_for<
+        QsaStoreCacheRowsKernel<scalar_t, Width, StridedColumns>>(
         sycl::range<1>(1), [=](sycl::id<1>) SYCL_ESIMD_KERNEL {
           for (int64_t row = 0; row < row_count; ++row) {
             const int64_t slot = slots_ptr[row];
@@ -165,8 +169,11 @@ void launch_store(
               simd<scalar_t, kChunk> values;
 #pragma unroll
               for (int column = 0; column < kChunk; ++column) {
+                const int64_t source_column =
+                    (begin + column) *
+                    (StridedColumns ? rows_column_stride : 1);
                 values[column] =
-                    rows_ptr[row * rows_stride + begin + column];
+                    rows_ptr[row * rows_stride + source_column];
               }
 #pragma unroll
               for (int column = 0; column < kChunk; ++column) {
@@ -194,8 +201,10 @@ at::Tensor store_cache_rows_v3(
   } else if (cache.scalar_type() == at::kBFloat16) {
     launch_store<sycl::ext::oneapi::bfloat16, kKeyWidth>(
         cache, slot_mapping, rows);
-  } else {
+  } else if (rows.stride(rows.dim() - 1) == 1) {
     launch_store<int64_t, kPositionWidth>(cache, slot_mapping, rows);
+  } else {
+    launch_store<int64_t, kPositionWidth, true>(cache, slot_mapping, rows);
   }
   return cache;
 }
