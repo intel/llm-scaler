@@ -123,6 +123,7 @@ from custom_esimd_kernels_vllm.ops import (
     moe_forward_tiny_cutlass_nmajor_int4,
     moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared,
     moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits,
+    moe_forward_m1_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1,
     moe_tiny_cutlass_nmajor_int4_up,
     moe_tiny_cutlass_nmajor_int4_down,
     moe_tiny_fp16_shared_up,
