@@ -474,6 +474,13 @@ at::Tensor esimd_qkv_split_norm_rope_mrope_v1(
             position_row_stride <=
                 static_cast<int64_t>(std::numeric_limits<uint32_t>::max()),
         "positions must have positive, non-overlapping rows with inner stride 1");
+    const auto max_position_row_stride =
+        (std::numeric_limits<uint32_t>::max() -
+         static_cast<uint32_t>(ntoks - 1)) / 2;
+    TORCH_CHECK(
+        position_row_stride <=
+            static_cast<int64_t>(max_position_row_stride),
+        "positions row stride is too large for the 32-bit MRoPE index ABI");
     TORCH_CHECK(
         norm_wq.scalar_type() == at::kHalf && norm_wk.scalar_type() == at::kHalf &&
             norm_wq.dim() == 1 && norm_wk.dim() == 1 &&
