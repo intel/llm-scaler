@@ -729,6 +729,64 @@ static void launch_grouped_norm(
     });
 }
 
+struct HcScoreGateV1Kernel {
+    const sycl::half* key;
+    const sycl::half* query;
+    sycl::half* output;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        const int64_t group = static_cast<int64_t>(item.get_group(0));
+        if (group >= kHcCount) {
+            return;
+        }
+        const int64_t begin = group * kHcHiddenSize;
+        float dot = 0.0f;
+#pragma unroll
+        for (int chunk = 0; chunk < kHcNormChunks; ++chunk) {
+            const int64_t offset = begin + chunk * kHcNormVectorLength;
+            const esimd::simd<float, kHcNormVectorLength> key_values =
+                esimd::block_load<sycl::half, kHcNormVectorLength>(
+                    key + offset);
+            const esimd::simd<float, kHcNormVectorLength> query_values =
+                esimd::block_load<sycl::half, kHcNormVectorLength>(
+                    query + offset);
+            dot += esimd::reduce<float>(
+                key_values * query_values, std::plus<>());
+        }
+
+        const float score =
+            dot / sycl::sqrt(static_cast<float>(kHcHiddenSize));
+        if (score == 0.0f) {
+            output[group] = sycl::half(0.5f);
+            return;
+        }
+        const float magnitude = score < 0.0f ? -score : score;
+        // Match fmax(fabs(score), 1e-6), including its NaN behavior.
+        const float clamped =
+            magnitude >= 1.0e-6f ? magnitude : 1.0e-6f;
+        float signed_root =
+            esimd::sqrt(esimd::simd<float, 8>(clamped))[0];
+        if (score < 0.0f) {
+            signed_root = -signed_root;
+        }
+        const float exp_neg_root =
+            esimd::exp(esimd::simd<float, 8>(-signed_root))[0];
+        output[group] = sycl::half(1.0f / (1.0f + exp_neg_root));
+    }
+};
+
+static void launch_hc_score_gate_v1(
+    sycl::queue& queue,
+    const sycl::half* key,
+    const sycl::half* query,
+    sycl::half* output) {
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>({static_cast<size_t>(kHcCount)}, {1}),
+            HcScoreGateV1Kernel{key, query, output});
+    });
+}
+
 static void launch_score_gate(
     sycl::queue& queue,
     const sycl::half* key,
@@ -738,6 +796,18 @@ static void launch_score_gate(
     int64_t groups,
     int64_t hidden_size) {
     if (rows <= 0 || groups <= 0 || hidden_size <= 0) {
+        return;
+    }
+    // The production decode input is [1, 10240].  Preserve equivalent public
+    // ABI views whose contiguous storage is still four 2560-element groups.
+    // Odd FP16 input offsets remain on the generic path because ESIMD block
+    // loads require at least dword-aligned data pointers.
+    const bool block_load_aligned =
+        reinterpret_cast<std::uintptr_t>(key) % 4 == 0 &&
+        reinterpret_cast<std::uintptr_t>(query) % 4 == 0;
+    if (rows * groups == kHcCount && hidden_size == kHcHiddenSize &&
+        block_load_aligned) {
+        launch_hc_score_gate_v1(queue, key, query, output);
         return;
     }
     queue.submit([&](sycl::handler& cgh) {

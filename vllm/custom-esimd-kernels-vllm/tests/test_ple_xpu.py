@@ -272,6 +272,184 @@ def test_arithmetic_primitives_match_frozen_golden(device: torch.device) -> None
     _assert_equal(residual_out, golden["output"])
 
 
+def _score_gate_reference(
+    key: torch.Tensor,
+    query: torch.Tensor,
+    hidden_size: int = 2560,
+) -> torch.Tensor:
+    key_groups = key.float().reshape(-1, hidden_size)
+    query_groups = query.float().reshape(-1, hidden_size)
+    score = (key_groups * query_groups).sum(-1) / (hidden_size**0.5)
+    signed_root = torch.where(
+        score == 0.0,
+        torch.zeros_like(score),
+        torch.sign(score) * torch.sqrt(torch.clamp(score.abs(), min=1.0e-6)),
+    )
+    return torch.sigmoid(signed_root).to(key.dtype)
+
+
+@pytest.mark.parametrize(
+    ("input_shape", "output_shape"),
+    [((1, 10240), (1, 4)), ((1, 4, 2560), (1, 4, 1))],
+)
+def test_ple_score_gate_target_fast_path_matches_reference(
+    device: torch.device,
+    input_shape: tuple[int, ...],
+    output_shape: tuple[int, ...],
+) -> None:
+    torch.manual_seed(46)
+    key = torch.randn(input_shape, dtype=torch.float16, device=device) * 0.25
+    query = torch.randn(input_shape, dtype=torch.float16, device=device) * 0.25
+    output = torch.empty(output_shape, dtype=torch.float16, device=device)
+    output_pointer = output.data_ptr()
+    expected = _score_gate_reference(key, query).reshape(output_shape)
+
+    torch.ops.custom_esimd_kernels_vllm.ple_score_gate(
+        key, query, output, 2560
+    )
+    torch.xpu.synchronize()
+
+    assert output.data_ptr() == output_pointer
+    torch.testing.assert_close(output, expected, rtol=2e-3, atol=2e-3)
+
+
+def test_ple_score_gate_target_fast_path_preserves_exact_zero(
+    device: torch.device,
+) -> None:
+    key = torch.zeros((1, 10240), dtype=torch.float16, device=device)
+    query = torch.zeros_like(key)
+    key[0, 2560:2562] = 1.0
+    query[0, 2560:2562] = torch.tensor(
+        [1.0, -1.0], dtype=torch.float16, device=device
+    )
+    output = torch.empty((1, 4), dtype=torch.float16, device=device)
+
+    torch.ops.custom_esimd_kernels_vllm.ple_score_gate(
+        key, query, output, 2560
+    )
+    torch.xpu.synchronize()
+
+    assert torch.equal(output, torch.full_like(output, 0.5))
+
+
+def test_ple_score_gate_target_fast_path_preserves_signed_clamp(
+    device: torch.device,
+) -> None:
+    key = torch.zeros((1, 10240), dtype=torch.float16, device=device)
+    query = torch.zeros_like(key)
+    key[0, 0] = 1.0e-3
+    query[0, 0] = 1.0e-3
+    key[0, 2560] = 1.0e-3
+    query[0, 2560] = -1.0e-3
+    output = torch.empty((1, 4), dtype=torch.float16, device=device)
+    expected = _score_gate_reference(key, query).reshape_as(output)
+
+    torch.ops.custom_esimd_kernels_vllm.ple_score_gate(
+        key, query, output, 2560
+    )
+    torch.xpu.synchronize()
+
+    torch.testing.assert_close(output, expected, rtol=0.0, atol=5.0e-4)
+    assert output[0, 0].cpu() > 0.5
+    assert output[0, 1].cpu() < 0.5
+    assert torch.equal(output[0, 2:].cpu(), torch.full((2,), 0.5))
+
+
+def test_ple_score_gate_target_fast_path_matches_generic_nan_semantics(
+    device: torch.device,
+) -> None:
+    key = torch.zeros((1, 10240), dtype=torch.float16, device=device)
+    query = torch.ones_like(key)
+    key[0, 0] = float("nan")
+    fast_output = torch.empty((1, 4), dtype=torch.float16, device=device)
+
+    odd_backing = torch.empty(
+        (10241,), dtype=torch.float16, device=device
+    )
+    odd_key = odd_backing[1:].reshape_as(key)
+    assert odd_key.is_contiguous()
+    assert odd_key.data_ptr() % 4 == 2
+    odd_key.copy_(key)
+    generic_output = torch.empty_like(fast_output)
+
+    torch.ops.custom_esimd_kernels_vllm.ple_score_gate(
+        key, query, fast_output, 2560
+    )
+    torch.ops.custom_esimd_kernels_vllm.ple_score_gate(
+        odd_key, query, generic_output, 2560
+    )
+    torch.xpu.synchronize()
+
+    assert torch.isfinite(fast_output).all().cpu()
+    assert torch.equal(fast_output, generic_output)
+    assert fast_output[0, 0].cpu() > 0.5
+    assert torch.equal(
+        fast_output[0, 1:].cpu(), torch.full((3,), 0.5)
+    )
+
+
+def test_ple_score_gate_generic_rows_match_reference(
+    device: torch.device,
+) -> None:
+    torch.manual_seed(47)
+    key = torch.randn((2, 10240), dtype=torch.float16, device=device) * 0.25
+    query = torch.randn((2, 10240), dtype=torch.float16, device=device) * 0.25
+    output = torch.empty((2, 4), dtype=torch.float16, device=device)
+    expected = _score_gate_reference(key, query).reshape_as(output)
+
+    torch.ops.custom_esimd_kernels_vllm.ple_score_gate(
+        key, query, output, 2560
+    )
+    torch.xpu.synchronize()
+
+    torch.testing.assert_close(output, expected, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("odd_tensor", ["key", "query", "output"])
+def test_ple_score_gate_target_shape_preserves_odd_offset_views(
+    device: torch.device,
+    odd_tensor: str,
+) -> None:
+    def odd_offset(shape: tuple[int, ...]) -> torch.Tensor:
+        numel = 1
+        for dimension in shape:
+            numel *= dimension
+        backing = torch.empty(
+            (numel + 1,), dtype=torch.float16, device=device
+        )
+        view = backing[1:].reshape(shape)
+        assert view.is_contiguous()
+        assert view.data_ptr() % 4 == 2
+        return view
+
+    torch.manual_seed(48)
+    key = (
+        odd_offset((1, 10240))
+        if odd_tensor == "key"
+        else torch.empty((1, 10240), dtype=torch.float16, device=device)
+    )
+    query = (
+        odd_offset((1, 10240))
+        if odd_tensor == "query"
+        else torch.empty((1, 10240), dtype=torch.float16, device=device)
+    )
+    key.normal_(mean=0.0, std=0.25)
+    query.normal_(mean=0.0, std=0.25)
+    output = (
+        odd_offset((1, 4))
+        if odd_tensor == "output"
+        else torch.empty((1, 4), dtype=torch.float16, device=device)
+    )
+    expected = _score_gate_reference(key, query).reshape_as(output)
+
+    torch.ops.custom_esimd_kernels_vllm.ple_score_gate(
+        key, query, output, 2560
+    )
+    torch.xpu.synchronize()
+
+    torch.testing.assert_close(output, expected, rtol=2e-3, atol=2e-3)
+
+
 @pytest.mark.parametrize("rows", [1, 2])
 def test_ple_grouped_norm_target_fast_path_preserves_generic_rows(
     device: torch.device,
