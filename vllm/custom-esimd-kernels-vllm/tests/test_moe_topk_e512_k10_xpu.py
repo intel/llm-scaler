@@ -82,11 +82,12 @@ def _assert_matches_reference(logits: torch.Tensor) -> None:
     assert torch.all((native_idx >= 0) & (native_idx < NUM_EXPERTS))
     for row in range(logits.shape[0]):
         assert torch.unique(native_idx[row]).numel() == TOP_K
+    torch.testing.assert_close(native_idx, reference_idx, rtol=0, atol=0)
     torch.testing.assert_close(
-        native_idx.sort(dim=-1).values,
-        reference_idx.sort(dim=-1).values,
-        rtol=0,
-        atol=0,
+        native_weight,
+        reference_weight,
+        rtol=2e-3,
+        atol=2e-4,
     )
 
     native_by_expert = torch.zeros(
@@ -127,3 +128,23 @@ def test_e512_k10_unique_logits(rows: int) -> None:
 @pytest.mark.parametrize("case", ("all_tie", "partial_tie", "finite_extremes"))
 def test_e512_k10_edge_logits(case: str, rows: int) -> None:
     _assert_matches_reference(_edge_logits(case, rows))
+
+
+def test_topk_v2_tail_stores_declare_natural_alignment() -> None:
+    source = (
+        Path(__file__).parents[1] / "csrc/xpu/esimd_kernels/moe_ops.h"
+    ).read_text()
+    start = source.index("        // block_store first 8")
+    end = source.index("template<int NUM_EXPERTS, int TOPK>\ninline void", start)
+    stores = source[start:end]
+    fp16_alignment = "properties{alignment<sizeof(fp16)>}"
+    int32_alignment = "properties{alignment<sizeof(int32_t)>}"
+    assert stores.count(fp16_alignment) == 3
+    assert stores.count(int32_alignment) == 3
+    assert "(TOPK * sizeof(fp16)) % 16 == 0" in stores
+    assert "(TOPK * sizeof(int32_t)) % 16 == 0" in stores
+    assert "constexpr size_t values_alignment" in source
+    assert "constexpr size_t indices_alignment" in source
+    assert "reinterpret_cast<uintptr_t>(logits) % 16" in source
+    assert "reinterpret_cast<uintptr_t>(values) % values_alignment" in source
+    assert "reinterpret_cast<uintptr_t>(indices) % indices_alignment" in source
