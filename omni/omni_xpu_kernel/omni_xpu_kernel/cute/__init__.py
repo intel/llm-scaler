@@ -236,7 +236,7 @@ def sol_attn(
     Route preparation remains an internal implementation detail. Unsupported
     targets and tensor contracts raise instead of silently changing attention
     semantics; callers may use :func:`supports_sol_attn` for capability
-    routing.
+    routing. A query row with no finite routed key score returns zero.
     """
     _ensure_loaded()
     ops = _sol_attn_ops()

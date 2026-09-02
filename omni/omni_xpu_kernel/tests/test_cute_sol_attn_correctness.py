@@ -146,6 +146,9 @@ def reference(
                         batch_index, head, query_block, key_block
                     ]
                 )
+                if torch.isneginf(maximum):
+                    output[batch_index, query_token, head] = 0
+                    continue
                 numerator = torch.zeros(dim, device=q.device)
                 denominator = torch.zeros((), device=q.device)
                 for key_block, (score, value) in enumerate(
@@ -333,3 +336,55 @@ def test_sol_attn_key_bias_matches_reference_at_zero_qk_scale(bias_kind):
     torch.xpu.synchronize()
     torch.testing.assert_close(actual, expected, rtol=5e-2, atol=5e-2)
     assert torch.isfinite(actual).all()
+
+
+@pytest.mark.skipif(
+    not has_bmg_sol_attn(), reason="BMG packaged Sol-Attn unavailable"
+)
+@pytest.mark.parametrize("bias_kind", ["bool", "float"])
+@pytest.mark.parametrize("tail", [False, True])
+@pytest.mark.parametrize("tokens", [65, 257])
+def test_sol_attn_fully_masked_key_bias_is_finite(
+    bias_kind, tail, tokens
+):
+    from omni_xpu_kernel import cute
+
+    generator = torch.Generator(device="xpu").manual_seed(12)
+    shape = (1, tokens, 1, 128)
+    q = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    k = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    v = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    if bias_kind == "bool":
+        key_bias = torch.zeros(tokens, device="xpu", dtype=torch.bool)
+        reference_bias = torch.full(
+            (1, tokens), float("-inf"), device="xpu"
+        )
+    else:
+        key_bias = torch.full((1, tokens), float("-inf"), device="xpu")
+        reference_bias = key_bias
+    scale = 128**-0.5
+    actual = cute.sol_attn(
+        q,
+        k,
+        v,
+        scale=scale,
+        tau=100.0,
+        key_bias=key_bias,
+        tail=tail,
+    )
+    expected = reference(
+        q,
+        k,
+        v,
+        scale,
+        100.0,
+        (0, 0),
+        (0, 0),
+        tail=tail,
+        key_bias=reference_bias,
+    )
+    torch.xpu.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=5e-2, atol=5e-2)
+    assert torch.isfinite(actual).all()
+    if not tail:
+        torch.testing.assert_close(actual, torch.zeros_like(actual))
