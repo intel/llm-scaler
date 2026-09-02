@@ -124,6 +124,21 @@ def test_dequantize_covers_all_fp8_encodings(fp8_dtype, out_dtype):
 
 
 @pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_dequantize_accepts_byte_misaligned_view(fp8_dtype):
+    torch.manual_seed(20260902)
+    source = torch.randn(1031, device="xpu", dtype=torch.float16).to(fp8_dtype)
+    scale = torch.tensor(1.0, device="xpu", dtype=torch.float32)
+    view = source[1:]
+
+    actual = fp8.dequantize_per_tensor(view, scale, torch.float16)
+    aligned = fp8.dequantize_per_tensor(view.clone(), scale, torch.float16)
+    expected = view.to(torch.float16)
+
+    assert torch.equal(actual.view(torch.uint16), expected.view(torch.uint16))
+    assert torch.equal(actual.view(torch.uint16), aligned.view(torch.uint16))
+
+
+@pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 def test_stochastic_rounding_is_deterministic_for_rng(fp8_dtype):
     x = torch.randn(32, 64, device="xpu", dtype=torch.float32)
     rng = torch.randint(0, 256, x.shape, device="xpu", dtype=torch.uint8)

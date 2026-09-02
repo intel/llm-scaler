@@ -74,8 +74,13 @@ void dequantize_kernel(
                 const int64_t remaining = numel - first;
 
                 if (remaining >= ElementsPerWorkItem) {
-                    simd<uint8_t, ElementsPerWorkItem> codes =
-                        block_load<uint8_t, ElementsPerWorkItem>(input + first);
+                    // FP8 views may start at any byte offset.  ESIMD
+                    // block_load<uint8_t> requires stronger alignment and
+                    // corrupts every fourth code for a one-byte-offset view
+                    // on BMG.  copy_from preserves the vectorized load while
+                    // accepting arbitrary element alignment.
+                    simd<uint8_t, ElementsPerWorkItem> codes;
+                    codes.copy_from(input + first);
                     simd<uint32_t, ElementsPerWorkItem> raw = codes;
                     simd<uint32_t, ElementsPerWorkItem> sign =
                         (raw & 0x80u) << 24;
