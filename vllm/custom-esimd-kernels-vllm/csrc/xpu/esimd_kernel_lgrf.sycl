@@ -161,7 +161,8 @@ at::Tensor esimd_gdn_conv_fused_seq_spec(
         p_alog, p_dtbias, p_ba, ba.stride(0), p_sstate, p_out, p_zout,
         p_token_indx, p_accepted, (int)num_spec_decodes,
         (int)num_spec_tokens, (int)H, (int)HV, (int)K, (int)V,
-        (float)scale, conv_state.stride(0), ssm_state.stride(0),
+        (float)scale, (int)conv_state.size(1), conv_state.stride(0),
+        ssm_state.stride(0),
         dpcpp_queue);
     return output;
 }

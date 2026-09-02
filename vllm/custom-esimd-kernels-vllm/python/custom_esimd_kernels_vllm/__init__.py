@@ -34,6 +34,7 @@ from custom_esimd_kernels_vllm.ops import (
     esimd_qkv_split_norm_rope,
     esimd_qkv_split_norm_rope_v,
     esimd_qkv_split_norm_rope_muse_glimmer,
+    esimd_qkv_split_norm_rope_muse_glimmer_neox,
     esimd_gdn_conv_fused,
     esimd_fused_add_rms_norm,
     esimd_norm_gemv_norm_fp16,
@@ -67,6 +68,7 @@ from custom_esimd_kernels_vllm.ops import (
     # Eagle ops
     eagle_gdn,
     eagle_page_attn_decode,
+    eagle_page_attn_decode_separate,
     # MoE Batch ops
     moe_router_forward,
     moe_batch_topk,

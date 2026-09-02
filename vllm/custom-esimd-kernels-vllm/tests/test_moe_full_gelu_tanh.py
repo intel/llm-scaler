@@ -3,8 +3,11 @@ weight layout: w13 [E, 2*inter, hidden], w2 [E, hidden, inter] fp8_e4m3fn.
 
 Reference uses fp16 dequant + matmul; tolerates fp8 quant noise (~1e-2).
 """
-import math, sys, torch
+import math
+import sys
+
 import custom_esimd_kernels_vllm  # noqa: F401  (registers torch.ops.moe_ops)
+import torch
 
 
 def gelu_tanh(t):
@@ -53,7 +56,5 @@ def run(n_experts, top_k, hidden, inter, tokens, seed, tol):
 
 if __name__ == "__main__":
     # gemma4 real shape (E=128, top_k=8, hidden=2816, inter=704).
-    # Note: kernel reuses internal buffers across calls keyed by n_tokens only,
-    # so a single shape per test process is the safe pattern.
     ok = run(128, 8, 2816, 704, 2, 42, 2e-2)
     sys.exit(0 if ok else 1)

@@ -1,6 +1,8 @@
 #define FP32_MIN (-1e+38)
-// kv cache shape [2 (k/v), reserved size, page_size, head_num, head_dim]
-// kv cache strid: [2 * page_size * head_num * head_dim, page_size * head_num * head_dim, head_dim, head_dim, 1]
+// K and V are passed as separate base pointers.  The page, token, and head
+// strides are expressed in elements so the kernel can consume both the
+// legacy [2, blocks, page, heads, head_dim] cache and v0.26's packed
+// [blocks, page, heads, 2 * head_dim] cache without a copy.
 ESIMD_INLINE void sdpaDecodeGqa4Phase1(
   uint8_t* qState,
   uint8_t* kState,
@@ -11,8 +13,9 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1(
   uint32_t* pageTable,
   uint32_t* batchKvSeqLen,
   uint32_t batchSize,
-  uint32_t kvCacheBatchStride0, 
-  uint32_t kvCacheBatchStride1,
+  uint32_t kvCachePageStride,
+  uint32_t kvCacheTokenStride,
+  uint32_t kvCacheHeadStride,
   uint32_t pageTableBatchStride,
   uint32_t pageTableSizeLog2,
   uint32_t pStride,
@@ -57,7 +60,9 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1(
   uint32_t outputMaxOffset = qHeadIdx * maxStride + globalLinearId1 + hh * maxStride + batchIdx * headQ * maxStride;
   uint32_t offsetQ = qHeadIdx * headDim * sizeof(fp16) + hh * 32 * sizeof(fp16) + batchIdx * headQ * headDim * sizeof(fp16);
   uint32_t baseCoordK = globalLinearId1 * outputPerGroup;
-  uint32_t offsetBaseK = hh * 32 * sizeof(fp16) + headDim * kvHeadIdx * sizeof(fp16);
+  uint32_t offsetBaseK =
+    hh * 32 * sizeof(fp16) +
+    kvHeadIdx * kvCacheHeadStride * sizeof(fp16);
   uint32_t kvSeqOffset = baseCoordK;
 
   if (baseCoordK >= kvSeqLen) {
@@ -96,12 +101,10 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1(
       maskNeg = logicSimdOffsetK >= kvSeqLen;
       simdOffsetsK = baseOffsetInc16AsSimd;
 
-      simdOffsetsK = 
-        simdOffsetsK * headKv * headDim * sizeof(fp16) +
+      simdOffsetsK =
+        (simdOffsetsK + pageTableOffset) * kvCacheTokenStride * sizeof(fp16) +
         offsetBaseK +
-        pageIdx * kvCacheBatchStride1 * sizeof(fp16) +
-        pageTableOffset * headKv * headDim * sizeof(fp16)
-        ;
+        pageIdx * kvCachePageStride * sizeof(fp16);
 
 #pragma unroll
       for (int kk = 0; kk < 2; kk++) {
@@ -232,8 +235,9 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
   uint32_t* pageTable,
   uint32_t* batchKvSeqLen,
   uint32_t batchSize,
-  uint32_t kvCacheBatchStride0,
-  uint32_t kvCacheBatchStride1,
+  uint32_t kvCachePageStride,
+  uint32_t kvCacheTokenStride,
+  uint32_t kvCacheHeadStride,
   uint32_t pageTableBatchStride,
   uint32_t pageTableSizeLog2,
   uint32_t pStride,
@@ -298,16 +302,16 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
   uint32_t offsetP = qBaseIdx * pStride + hh * 32 + groupIdx * 1024 + batchIdx * headQ * pStride;
   uint32_t offsetMax = qBaseIdx * maxStride + batchIdx * headQ * maxStride + groupIdx * 16;
   uint32_t offsetGlobalMax = batchIdx * headQ + qBaseIdx;
-  uint32_t widthV = headKv * headDim * sizeof(fp16) - 1;
+  uint32_t widthV = kvCacheTokenStride * sizeof(fp16) - 1;
   uint32_t heightV = pageTableSize - 1;
-  uint32_t vX = channelOffset * 16 + headDim * kvHeadIdx;
+  uint32_t vX = channelOffset * 16 + kvCacheHeadStride * kvHeadIdx;
   uint32_t vY = 32 * hh;
   uint32_t totalPages = (kvSeqLen + pageTableSize - 1) >> pageTableSizeLog2;
   uint32_t lastPageHeight = (kvSeqLen - 1) & (pageTableSize - 1);
   if (kvSeqLen == 0) {
     lastPageHeight = 0;
   }
-  fp16* vPtrBase = (fp16*)vState + kvCacheBatchStride0;
+  fp16* vPtrBase = (fp16*)vState;
 
   historicMax = FP32_MIN * matMulQuantCoeff;
   softmaxSum = 0;
@@ -333,7 +337,7 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
     1,
     uint32_t>(pageTable, pageTableOffsets, mask);
 
-  pageAlignedOffsets = pageNumbers * kvCacheBatchStride1;
+  pageAlignedOffsets = pageNumbers * kvCachePageStride;
   pageAlignedOffsets.merge(0, maskNeg);
   globalMax = block_load<float, 4>(pGlobalMax + offsetGlobalMax);
 
@@ -574,8 +578,9 @@ ESIMD_INLINE void sdpaDecodeGqa2Phase1(
   uint32_t* pageTable,
   uint32_t* batchKvSeqLen,
   uint32_t batchSize,
-  uint32_t kvCacheBatchStride0,
-  uint32_t kvCacheBatchStride1,
+  uint32_t kvCachePageStride,
+  uint32_t kvCacheTokenStride,
+  uint32_t kvCacheHeadStride,
   uint32_t pageTableBatchStride,
   uint32_t pageTableSizeLog2,
   uint32_t pStride,
@@ -618,7 +623,9 @@ ESIMD_INLINE void sdpaDecodeGqa2Phase1(
   uint32_t outputMaxOffset = qHeadIdx * maxStride + globalLinearId1 + hh * maxStride + batchIdx * headQ * maxStride;
   uint32_t offsetQ = qHeadIdx * headDim * sizeof(fp16) + hh * 32 * sizeof(fp16) + batchIdx * headQ * headDim * sizeof(fp16);
   uint32_t baseCoordK = globalLinearId1 * outputPerGroup;
-  uint32_t offsetBaseK = hh * 32 * sizeof(fp16) + headDim * kvHeadIdx * sizeof(fp16);
+  uint32_t offsetBaseK =
+    hh * 32 * sizeof(fp16) +
+    kvHeadIdx * kvCacheHeadStride * sizeof(fp16);
   uint32_t kvSeqOffset = baseCoordK;
 
   if (baseCoordK >= kvSeqLen) {
@@ -658,11 +665,9 @@ ESIMD_INLINE void sdpaDecodeGqa2Phase1(
       simdOffsetsK = baseOffsetInc16AsSimd;
 
       simdOffsetsK =
-        simdOffsetsK * headKv * headDim * sizeof(fp16) +
+        (simdOffsetsK + pageTableOffset) * kvCacheTokenStride * sizeof(fp16) +
         offsetBaseK +
-        pageIdx * kvCacheBatchStride1 * sizeof(fp16) +
-        pageTableOffset * headKv * headDim * sizeof(fp16)
-        ;
+        pageIdx * kvCachePageStride * sizeof(fp16);
 
 #pragma unroll
       for (int kk = 0; kk < 2; kk++) {
@@ -795,8 +800,9 @@ ESIMD_INLINE void sdpaDecodeGqa2Phase2(
   uint32_t* pageTable,
   uint32_t* batchKvSeqLen,
   uint32_t batchSize,
-  uint32_t kvCacheBatchStride0,
-  uint32_t kvCacheBatchStride1,
+  uint32_t kvCachePageStride,
+  uint32_t kvCacheTokenStride,
+  uint32_t kvCacheHeadStride,
   uint32_t pageTableBatchStride,
   uint32_t pageTableSizeLog2,
   uint32_t pStride,
@@ -858,16 +864,16 @@ ESIMD_INLINE void sdpaDecodeGqa2Phase2(
   uint32_t offsetP = qBaseIdx * pStride + hh * 32 + groupIdx * 1024 + batchIdx * headQ * pStride;
   uint32_t offsetMax = qBaseIdx * maxStride + batchIdx * headQ * maxStride + groupIdx * 16;
   uint32_t offsetGlobalMax = batchIdx * headQ + qBaseIdx;
-  uint32_t widthV = headKv * headDim * sizeof(fp16) - 1;
+  uint32_t widthV = kvCacheTokenStride * sizeof(fp16) - 1;
   uint32_t heightV = pageTableSize - 1;
-  uint32_t vX = channelOffset * 16 + headDim * kvHeadIdx;
+  uint32_t vX = channelOffset * 16 + kvCacheHeadStride * kvHeadIdx;
   uint32_t vY = 32 * hh;
   uint32_t totalPages = (kvSeqLen + pageTableSize - 1) >> pageTableSizeLog2;
   uint32_t lastPageHeight = (kvSeqLen - 1) & (pageTableSize - 1);
   if (kvSeqLen == 0) {
     lastPageHeight = 0;
   }
-  fp16* vPtrBase = (fp16*)vState + kvCacheBatchStride0;
+  fp16* vPtrBase = (fp16*)vState;
 
   historicMax = FP32_MIN * matMulQuantCoeff;
   softmaxSum = 0;
@@ -893,7 +899,7 @@ ESIMD_INLINE void sdpaDecodeGqa2Phase2(
     1,
     uint32_t>(pageTable, pageTableOffsets, mask);
 
-  pageAlignedOffsets = pageNumbers * kvCacheBatchStride1;
+  pageAlignedOffsets = pageNumbers * kvCachePageStride;
   pageAlignedOffsets.merge(0, maskNeg);
   globalMax = block_load<float, QPER>(pGlobalMax + offsetGlobalMax);
 

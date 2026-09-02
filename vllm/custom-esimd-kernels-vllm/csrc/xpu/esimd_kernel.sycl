@@ -312,7 +312,7 @@ at::Tensor esimd_qkv_split_norm_rope_v(
 }
 
 // Onyx-specific fused Q/K split + parameterless RMSNorm + q_scale + interleaved-pair RoPE.
-// Fixed head_dim=128, is_neox_style=False, no output_gate head, no V-Norm.
+// Fixed head_dim=128, no output_gate head, no V-Norm.
 at::Tensor esimd_qkv_split_norm_rope_onyx(
     at::Tensor qkv_state,
     at::Tensor q_out,
@@ -328,18 +328,77 @@ at::Tensor esimd_qkv_split_norm_rope_onyx(
     EXTRACT_PTR(p_q, q_out);
     EXTRACT_PTR(p_k, k_out);
     EXTRACT_PTR(p_v, v_out);
-    auto p_pos = reinterpret_cast<uint32_t*>(positions.data_ptr());
     auto p_cs = reinterpret_cast<sycl::half*>(cos_sin_cache.data_ptr());
 
     uint32_t ntoks = qkv_state.size(0);
     uint32_t hiddenDim = qkv_state.size(1);
 
+    TORCH_CHECK(positions.is_contiguous(),
+                "positions must be contiguous");
+    TORCH_CHECK(positions.numel() >= ntoks,
+                "positions must contain at least one value per token");
     auto& dpcpp_queue = get_device_queue(qkv_state);
-    qkv_split_norm_rope_onyx_host(
-        p_qkv, p_q, p_k, p_v, p_pos, p_cs,
-        ntoks, hiddenDim,
-        (uint32_t)q_heads, (uint32_t)kv_heads,
-        (float)q_scale, dpcpp_queue);
+    if (positions.scalar_type() == at::kInt) {
+        qkv_split_norm_rope_onyx_host(
+            p_qkv, p_q, p_k, p_v, positions.data_ptr<int32_t>(), p_cs,
+            ntoks, hiddenDim,
+            (uint32_t)q_heads, (uint32_t)kv_heads,
+            (float)q_scale, 1e-6f, false, dpcpp_queue);
+    } else if (positions.scalar_type() == at::kLong) {
+        qkv_split_norm_rope_onyx_host(
+            p_qkv, p_q, p_k, p_v, positions.data_ptr<int64_t>(), p_cs,
+            ntoks, hiddenDim,
+            (uint32_t)q_heads, (uint32_t)kv_heads,
+            (float)q_scale, 1e-6f, false, dpcpp_queue);
+    } else {
+        TORCH_CHECK(false, "positions must have dtype int32 or int64");
+    }
+    return q_out;
+}
+
+// Muse Glimmer variant for checkpoints whose Q/K rows are already in NEOX
+// half-split layout.
+at::Tensor esimd_qkv_split_norm_rope_onyx_neox(
+    at::Tensor qkv_state,
+    at::Tensor q_out,
+    at::Tensor k_out,
+    at::Tensor v_out,
+    at::Tensor positions,
+    int64_t q_heads,
+    int64_t kv_heads,
+    double q_scale,
+    double eps,
+    at::Tensor cos_sin_cache) {
+
+    EXTRACT_PTR(p_qkv, qkv_state);
+    EXTRACT_PTR(p_q, q_out);
+    EXTRACT_PTR(p_k, k_out);
+    EXTRACT_PTR(p_v, v_out);
+    auto p_cs = reinterpret_cast<sycl::half*>(cos_sin_cache.data_ptr());
+
+    uint32_t ntoks = qkv_state.size(0);
+    uint32_t hiddenDim = qkv_state.size(1);
+
+    TORCH_CHECK(positions.is_contiguous(),
+                "positions must be contiguous");
+    TORCH_CHECK(positions.numel() >= ntoks,
+                "positions must contain at least one value per token");
+    auto& dpcpp_queue = get_device_queue(qkv_state);
+    if (positions.scalar_type() == at::kInt) {
+        qkv_split_norm_rope_onyx_host(
+            p_qkv, p_q, p_k, p_v, positions.data_ptr<int32_t>(), p_cs,
+            ntoks, hiddenDim,
+            (uint32_t)q_heads, (uint32_t)kv_heads,
+            (float)q_scale, (float)eps, true, dpcpp_queue);
+    } else if (positions.scalar_type() == at::kLong) {
+        qkv_split_norm_rope_onyx_host(
+            p_qkv, p_q, p_k, p_v, positions.data_ptr<int64_t>(), p_cs,
+            ntoks, hiddenDim,
+            (uint32_t)q_heads, (uint32_t)kv_heads,
+            (float)q_scale, (float)eps, true, dpcpp_queue);
+    } else {
+        TORCH_CHECK(false, "positions must have dtype int32 or int64");
+    }
     return q_out;
 }
 

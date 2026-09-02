@@ -296,7 +296,12 @@ inline void GEMM_int4_pgrp_host(
     int n_wgs = ((int)N + 15) / 16;
     int k_threads = std::max(1, std::min(4, 640 / std::max(n_wgs, 1)));
     while (k_threads > 1 && ((int)K % (k_threads * INT4_GEMM_GROUP_SIZE) != 0)) k_threads--;
-    if (k_threads == 3) k_threads = 2;
+    if (k_threads == 3) {
+        // Avoid the 3-thread variant only after preserving whole scale groups
+        // per thread.  For example, K=1152 is divisible by 3*128 but not
+        // 2*128, so forcing 2 here would start a thread inside a scale group.
+        k_threads = ((int)K % (2 * INT4_GEMM_GROUP_SIZE) == 0) ? 2 : 1;
+    }
 
     #define DISPATCH(KT, MT) gemm_int4_pgrp_host_impl<KT, MT>( \
         input, weight, scale, output, M, N, K, q)

@@ -25,7 +25,16 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    2.9 [Multi-node Distributed Deployment (PP/TP)](#29-multi-node-distributed-deployment-pptp)  
    2.10 [BPE-Qwen Tokenizer](#210-bpe-qwen-tokenizer)  
    2.11 [Load Balancer Solution](#211-load-balancer-solution)
-3. [Supported Models](#3-supported-models)
+3. [Supported Models](#3-supported-models)<br>
+   3.1 [How to use Hunyuan-7B-Instruct](#31-how-to-use-hunyuan-7b-instruct)<br>
+   3.2 [Reference commands for Qwen3.5/3.6 models](#32-reference-commands-for-running-the-supported-qwen3536-models)<br>
+   3.3 [Reference commands for Gemma 4 and DiffusionGemma](#33-reference-commands-for-running-gemma-4-models-and-diffusiongemma)<br>
+   3.4 [LoRA Adapter Serving](#34-lora-adapter-serving)<br>
+   3.5 [FP8 KV Cache](#35-fp8-kv-cache)<br>
+   3.6 [MTP Enable](#36-mtp-enable)<br>
+   3.7 [How to Run Muse Glimmer 30B](#37-how-to-run-muse-glimmer-30b)<br>
+   3.8 [DFlash Enable](#38-dflash-enable)<br>
+   3.9 [Rust Frontend](#39-rust-frontend)<br>
 4. [Troubleshooting](#4-troubleshooting)
 5. [Performance tuning](#5-performance-tuning)
 
@@ -290,13 +299,15 @@ you can add the argument `--api-key xxx` for user authentication. Users are supp
 ```bash
 vllm bench serve \
     --model /llm/models/DeepSeek-R1-Distill-Qwen-7B \
+    --tokenizer /llm/models/DeepSeek-R1-Distill-Qwen-7B \
     --dataset-name random \
     --served-model-name DeepSeek-R1-Distill-Qwen-7B \
     --random-input-len=1024 \
     --random-output-len=512 \
     --ignore-eos \
-    --num-prompt 10 \
-    --trust_remote_code \
+    --num-prompts 10 \
+    --max-concurrency 10 \
+    --trust-remote-code \
     --request-rate inf \
     --backend vllm \
     --port=8000
@@ -310,6 +321,11 @@ Refer to [here](monitor/README.md) for details.
 ### 2.1 CCL Support (both P2P & USM)
 
 The image includes OneCCL with automatic fallback between P2P and USM memory exchange modes.
+
+Use the oneCCL toolkit bundled with the selected image or offline installer.
+Do not install the Python distributions `oneccl` or `oneccl-devel` on top of
+that environment, because they can replace libraries required by the tested
+XPU runtime.
 
 * To manually switch modes, use:
 
@@ -961,7 +977,6 @@ Run on **Node-1**:
 export MODEL_NAME="/llm/models/Qwen2.5-7B-Instruct"
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 export CCL_ATL_TRANSPORT=ofi
 export VLLM_HOST_IP=10.0.1.19
 
@@ -1106,7 +1121,7 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | deepseek-ai/DeepSeek-R1-0528-Qwen3-8B      |  ✅  |         ✅         |          ✅          |       |                           |
 | deepseek-ai/DeepSeek-V2-Lite               |  ✅  |         ✅         |                      |       | export VLLM_MLA_DISABLE=1 |
 | deepseek-ai/deepseek-coder-33b-instruct    |  ✅  |         ✅         |          ✅          |       |                           |
-| meta-models/Muse-Glimmer-30B               |  ✅  |         ✅         |                       |       |  follow the guide in [here](#36-how-to-run-muse-glimmer-30b) |
+| meta-models/Muse-Glimmer-30B               |  ✅  |         ✅         |          ✅          |       | See [Muse Glimmer](#37-how-to-run-muse-glimmer-30b) and [DFlash](#38-dflash-enable). |
 | Qwen/Qwen3-8B                              |  ✅  |         ✅         |          ✅          |       |                           |
 | Qwen/Qwen3-14B                             |  ✅  |         ✅         |          ✅          |       |                           |
 | Qwen/Qwen3-32B                             |  ✅  |         ✅         |          ✅          |       |                           |
@@ -1115,17 +1130,18 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | Qwen/Qwen3-235B-A22B                       |      |         ✅         |                      |       |                           |
 | Qwen/Qwen3-Coder-30B-A3B-Instruct          |  ✅  |         ✅         |          ✅          |       |                           |
 | Qwen/Qwen3-Coder-Next                      |  ✅  |         ✅         |                    |       |                           |
-| Qwen/Qwen3.6-27B                           |  ✅  |         ✅         |          ✅          |       | LoRA supported, see [LoRA Serving](#34-lora-adapter-serving). MTP supported, see [MTP Enable](#35-mtp-enable).|
-| Qwen/Qwen3.6-35B-A3B                       |  ✅  |         ✅         |          ✅          |       | LoRA supported, see [LoRA Serving](#34-lora-adapter-serving). MTP supported, see [MTP Enable](#35-mtp-enable).|
+| Qwen/Qwen3.6-27B                           |  ✅  |         ✅         |          ✅          |       | LoRA supported, see [LoRA Serving](#34-lora-adapter-serving). MTP supported, see [MTP Enable](#36-mtp-enable).|
+| Qwen/Qwen3.6-35B-A3B                       |  ✅  |         ✅         |          ✅          |       | LoRA supported, see [LoRA Serving](#34-lora-adapter-serving). MTP supported, see [MTP Enable](#36-mtp-enable).|
 | Qwen/Qwen3.6-27B-FP8                       |      |                    |                      |       | Pre-quantized offline FP8 model |
 | Qwen/Qwen3.6-35B-A3B-FP8                   |      |                    |                      |       | Pre-quantized offline FP8 model |
+| Qwen/Qwen3.8-27B                           |  ✅  |         ✅         |          ✅          |       |                           |
+| Qwen/Qwen3.8-27B-FP8                       |      |                    |                      |       | Pre-quantized offline FP8 model |
 | Qwen/Qwen3.5-122B-A10B                     |      |         ✅         |          ✅          |       |                           |
 | Qwen/QwQ-32B                               |  ✅  |         ✅         |          ✅          |       |                           |
 | mistralai/Ministral-8B-Instruct-2410       |  ✅  |         ✅         |          ✅          |       |                           |
 | mistralai/Mixtral-8x7B-Instruct-v0.1       |  ✅  |         ✅         |          ✅          |       |                           |
 | meta-llama/Llama-3.1-8B                    |  ✅  |         ✅         |          ✅          |       |                           |
 | meta-llama/Llama-3.1-70B                   |  ✅  |         ✅         |          ✅          |       |                           |
-| meta-models/Muse-Glimmer-30B                   |     |         ✅         |                    |       |                           |
 | baichuan-inc/Baichuan2-7B-Chat             |  ✅  |         ✅         |          ✅          |       | with chat_template        |
 | baichuan-inc/Baichuan2-13B-Chat            |  ✅  |         ✅         |          ✅          |       | with chat_template        |
 | THUDM/CodeGeex4-All-9B                     |  ✅  |         ✅         |          ✅          |       | with chat_template        |
@@ -1156,8 +1172,8 @@ crontab -l | grep -v "vllm_bootstrap_and_rotate.sh" | crontab -
 | google/gemma-3-12b-it                      |      |         ✅         |                      |       |  use bfloat16  |
 | google/gemma-3-27b-it                      |      |         ✅         |                      |       |  use bfloat16  |
 | google/gemma-4-12B-it                      |      |         ✅         |          ✅         |       | see [Reference Commands](#33-reference-commands-for-running-gemma-4-models-and-diffusiongemma)     |
-| google/gemma-4-31B-it                      |      |         ✅         |          ✅         |       |  MTP supported, see [MTP Enable](#35-mtp-enable).                          |
-| google/gemma-4-26B-A4B-it                  |      |         ✅         |          ✅         |       |      MTP supported, see [MTP Enable](#35-mtp-enable).                      |
+| google/gemma-4-31B-it                      |      |         ✅         |          ✅         |       |  MTP supported, see [MTP Enable](#36-mtp-enable).                          |
+| google/gemma-4-26B-A4B-it                  |      |         ✅         |          ✅         |       |      MTP supported, see [MTP Enable](#36-mtp-enable).                      |
 | google/diffusiongemma-26B-A4B-it           |      |         ✅         |          ✅         |       | see [Reference Commands](#33-reference-commands-for-running-gemma-4-models-and-diffusiongemma)                            |
 | THUDM/GLM-4v-9B                            |  ✅  |         ✅         |          ✅         |       |  with --hf-overrides and chat_template  |
 | zai-org/GLM-4.1V-9B-Base                   |  ✅  |         ✅         |          ✅          |       |                           |
@@ -1212,26 +1228,33 @@ curl http://localhost:8001/v1/chat/completions -H 'Content-Type: application/jso
 
 ### 3.2 Reference commands for running the supported Qwen3.5/3.6 models
 
-`intel/llm-scaler-vllm:0.14.0-b8.3.1` release is recommended for running Qwen3.5/3.6-27B, Qwen3.5/3.6-35B-A3B and Qwen3.5-122B-A10B models. You may start by using the reference commands and parameters as follows: 
+Use the exact image listed as the latest compatible release in
+[Releases.md](../Releases.md) for Qwen3.5/3.6-27B, Qwen3.5/3.6-35B-A3B and
+Qwen3.5-122B-A10B models. Do not use the floating `latest` tag.
 
 1. Starting the container on host: 
 ```bash
-sudo docker run -td --privileged --net=host --device=/dev/dri --name=test -v $your_model_path:/llm/models/  --shm-size="32g" --entrypoint /bin/bash intel/llm-scaler-vllm:0.14.0-b8.3
+sudo docker run -td --privileged --net=host --device=/dev/dri --name=test \
+  -v "$your_model_path":/llm/models/ --shm-size="32g" \
+  --entrypoint /bin/bash intel/llm-scaler-vllm:<VERSION>
 ```
 Use ```-e http_proxy=$your_proxy -e https_proxy=$your_proxy -e no_proxy=localhost,127.0.0.1``` if needed.  
 
 
 2. Starting the vllm server
 
-Fo instance starting the Qwen3.6-35B-A3B model: 
+For instance, start the Qwen3.6-35B-A3B model with:
 ```bash
 sudo docker exec -it test bash 
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 # or ```export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=0```
-export ZE_AFFINITY_MASK=0,1 # assuming use the first two Arc GPUs
 
-vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-tokens 8192 --max-model-len 40000 --block-size 64 --dtype float16 --model /llm/models/Qwen3.6-35B-A3B/ --served-model-name Qwen3.6-35B-A3B --tensor-parallel-size 2 --quantization fp8 --enforce-eager --trust-remote-code
+vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 \
+  --max-num-batched-tokens 8192 --max-model-len 40000 --block-size 64 \
+  --dtype float16 --mamba-ssm-cache-dtype float16 \
+  --model /llm/models/Qwen3.6-35B-A3B/ \
+  --served-model-name Qwen3.6-35B-A3B --tensor-parallel-size 2 \
+  --quantization fp8 --enforce-eager --trust-remote-code
 ```
 
 For Int4, please use 
@@ -1248,7 +1271,12 @@ Prefix Caching and Tool Calling features are supported with additional parameter
 
 For instance sending one 32K random input: 
 ```bash
-vllm bench serve --model /llm/models/Qwen3.6-35B-A3B/ --served-model-name Qwen3.6-35B-A3B --port 8000 --backend vllm --request-rate inf --ignore-eos --trust-remote-code --dataset-name random --num-prompt 1 --random-output-len 2048 --random-input-len 32768 
+vllm bench serve --model /llm/models/Qwen3.6-35B-A3B/ \
+  --tokenizer /llm/models/Qwen3.6-35B-A3B/ \
+  --served-model-name Qwen3.6-35B-A3B --port 8000 --backend vllm \
+  --request-rate inf --max-concurrency 1 --ignore-eos --trust-remote-code \
+  --dataset-name random --num-prompts 1 \
+  --random-output-len 2048 --random-input-len 32768
 ```
 
 Please note the performance will vary according to the combinations of these parameters: 
@@ -1256,7 +1284,7 @@ Please note the performance will vary according to the combinations of these par
 --max-model-len
 --tensor-parallel-size
 --quantization
---num-prompt
+--num-prompts
 --random-input-len
 --random-output-len
 ```
@@ -1268,10 +1296,8 @@ The gemma-4 models (12B-it, 31B-it and 26B-A4B-it) and diffusiongemma-26B-A4B-it
 Reference commands for running gemma-4-12B-it model with fp8 quantization: 
 
 ```bash
-export ZE_AFFINITY_MASK=0 
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 
 export VLLM_WORKER_MULTIPROC_METHOD=spawn 
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 
 
 vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-tokens 8192 --max-model-len 90000 --block-size 64 --dtype float16 --mamba-ssm-cache-dtype float16 --model /llm/models/gemma-4-12B-it/ --served-model-name gemma-4-12B-it --tensor-parallel-size 1 --quantization fp8 --trust-remote-code 
 ```
@@ -1279,31 +1305,47 @@ vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-to
 Reference commands for running diffusiongemma-26B-A4B-it model with fp8 quantization: 
 
 ```bash 
-export ZE_AFFINITY_MASK=0,1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
-export VLLM_INT4_GROUP_SIZE=32 
-export VLLM_USE_V2_MODEL_RUNNER=1 
-export VLLM_USE_V1=1 
-export DGEMMA_FUSED_CAUSAL=1 
 
-vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.8 --max-num-batched-tokens 8192 --max-model-len 90000 --block-size 64 --dtype float16 --mamba-ssm-cache-dtype float16 --model /llm/models/diffusiongemma-26B-A4B-it/ --served-model-name diffusiongemma-26B-A4B-it --tensor-parallel-size 2 --quantization fp8 --max-num-seqs 4 --attention-backend FLASH_ATTN --diffusion-config '{"canvas_length":256,"max_denoising_steps":16}' --hf-overrides '{"diffusion_sampler":"entropy_bound","diffusion_entropy_bound":0.1,"diffusion_confidence_threshold":0.0}' --trust-remote-code 
+vllm serve --port 8000 --host 0.0.0.0 \
+  --model /llm/models/diffusiongemma-26B-A4B-it/ \
+  --served-model-name diffusiongemma-26B-A4B-it \
+  --tensor-parallel-size 2 \
+  --quantization fp8 \
+  --dtype float16 \
+  --mamba-ssm-cache-dtype float16 \
+  --block-size 64 \
+  --gpu-memory-util 0.8 \
+  --max-model-len 8192 \
+  --max-num-batched-tokens 2048 \
+  --max-num-seqs 2 \
+  --attention-backend FLASH_ATTN \
+  --enforce-eager \
+  --diffusion-config '{"canvas_length":256,"max_denoising_steps":16}' \
+  --hf-overrides '{"diffusion_sampler":"entropy_bound","diffusion_entropy_bound":0.1,"diffusion_confidence_threshold":0.0}' \
+  --trust-remote-code
 ```
+
+DiffusionGemma does not accept every sampling field supported by autoregressive
+models. Start with only `model`, `messages` and `max_tokens` in
+`/v1/chat/completions` requests, then add only fields supported by the selected
+DiffusionGemma sampler. In particular, do not copy `temperature` into the
+request unless the configured sampler supports it.
 
 ### 3.4 LoRA Adapter Serving
 
 vLLM supports serving multiple LoRA adapters with runtime load/unload capabilities. This enables fine-tuned model variants to be served from a single base model instance.
 
-**Supported models:** Currently verified with Qwen3.6-27B and Qwen3.6-35B-A3B models.
+**Supported models:** Currently verified with Qwen3.6-27B,
+Qwen3.6-35B-A3B, Gemma 4 31B and Gemma 4 26B-A4B models. Both regular
+adapters and model-specific 3D expert adapters are supported.
 
 #### Starting the server with LoRA adapters
 
 Example for Qwen3.6-27B with two LoRA adapters:
 
 ```bash
-export ZE_AFFINITY_MASK=0,1
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
@@ -1314,8 +1356,6 @@ vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-to
 Example for Qwen3.6-35B-A3B with a single LoRA adapter:
 
 ```bash
-export ZE_AFFINITY_MASK=0,1
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
@@ -1325,7 +1365,10 @@ vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-to
 
 Key LoRA parameters:
 - `--enable-lora`: Enable LoRA serving
-- `--lora-modules <name>=<path> ...`: Register LoRA adapters at startup (format: `name=path`)
+- `--lora-modules <name>=<path> ...`: Register regular LoRA adapters using the short `name=path` format
+- `--lora-modules '{"name":"adapter1","path":"/path/to/adapter","is_3d_lora_weight":false}'`: Register an adapter using the explicit JSON format
+- `is_3d_lora_weight=true`: Mark a model-specific 3D expert adapter
+- `--lora-target-modules`: List every module targeted by the adapter; expert adapters must include the matching expert modules
 - `--max-loras`: Maximum number of LoRA adapters to serve concurrently
 - `--max-lora-rank`: Maximum LoRA rank supported (set to the highest rank among your adapters)
 - `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True`: Enable runtime adapter load/unload
@@ -1361,12 +1404,70 @@ List currently registered models:
 curl http://localhost:8000/v1/models
 ```
 
+### 3.5 FP8 KV Cache
 
-### 3.5 MTP Enable
+Weight quantization and KV-cache quantization are independent. For example,
+`--quantization fp8` quantizes model weights online, while
+`--kv-cache-dtype fp8_e4m3` stores attention KV cache in FP8.
 
-MTP is a speculative decoding method where the target model includes native
-multi-token prediction capability. Unlike draft-model-based methods, you do not
-need to provide a separate draft model.
+The following Qwen3.6-27B command uses static FP8 KV-cache scales:
+
+```bash
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+vllm serve /llm/models/Qwen3.6-27B \
+  --served-model-name Qwen3.6-27B \
+  --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 2 \
+  --quantization fp8 \
+  --dtype float16 \
+  --kv-cache-dtype fp8_e4m3 \
+  --mamba-ssm-cache-dtype float16 \
+  --gpu-memory-utilization 0.8 \
+  --max-model-len 40000 \
+  --max-num-batched-tokens 8192 \
+  --max-num-seqs 64 \
+  --block-size 64 \
+  --enforce-eager \
+  --no-enable-prefix-caching \
+  --trust-remote-code
+```
+
+Use `--kv-cache-dtype auto` as the control configuration. Keep every other
+server and benchmark parameter identical when comparing KV-cache capacity,
+accuracy or performance.
+
+Dynamic scale calculation with `--calculate-kv-scales` is not supported for
+every model/runtime combination. Check `vllm serve --help` before using it.
+If the option is unavailable, use static FP8 KV-cache scales and do not claim
+that dynamic scale calculation was enabled.
+
+For a deterministic 32K-input/512-output capacity and latency probe:
+
+```bash
+vllm bench serve \
+  --backend openai --base-url http://127.0.0.1:8000 \
+  --model Qwen3.6-27B \
+  --tokenizer /llm/models/Qwen3.6-27B \
+  --dataset-name random \
+  --random-input-len 32768 \
+  --random-output-len 512 \
+  --random-range-ratio 0 \
+  --num-prompts 1 \
+  --max-concurrency 1 \
+  --request-rate inf \
+  --ignore-eos \
+  --temperature 0 \
+  --seed 0 \
+  --trust-remote-code
+```
+
+### 3.6 MTP Enable
+
+MTP is a speculative decoding method based on multi-token prediction. Qwen
+models use native MTP without a separate assistant checkpoint. Gemma 4 uses
+the Gemma MTP path with a matching assistant checkpoint.
 
 MTP is useful when:
 
@@ -1375,38 +1476,46 @@ MTP is useful when:
 
 **Supported models:** Currently verified with `Qwen3.6-27B` and `Qwen3.6-35B-A3B` and `gemma-4-26B-A4B-it` and `gemma-4-31B-it` models.
 
-#### Qwen Assistant Models
+#### Qwen Native MTP
 
 Use `"method": "qwen3_5_mtp"` when serving Qwen MTP:
 
 ```bash
-    --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":2}'
+--speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":4}'
 ```
 
 #### Gemma 4 Assistant Models
 
-Gemma 4 assistant checkpoints use vLLM's Gemma 4 MTP path. You need to download draft_model first.
+Gemma 4 assistant checkpoints use vLLM's Gemma 4 MTP path. Download the
+assistant checkpoint that matches the target model first.
 
 Use `"method": "gemma4_mtp"` when serving Gemma 4 with an assistant checkpoint:
 
 ```bash
-    --speculative-config '{"method":"gemma4_mtp","model":"/path/to/gemma-4-31B-it-assistant","num_speculative_tokens":2}'
+--speculative-config '{"method":"gemma4_mtp","model":"/path/to/gemma-4-31B-it-assistant","num_speculative_tokens":4}'
 ```
 
 
 You can profile performance by tuning `num_speculative_tokens` from 2 to 5. Adjust this based on your workload.
 
 
-### 3.6 How To Run Muse Glimmer 30B
+### 3.7 How to Run Muse Glimmer 30B
 
 Transformers version 5.8.0 does not support running Glimmer-based multimodal tasks; you need to install version 5.15.0 to use multimodal or use the flag --limit-mm-per-prompt '{"image": 0, "video": 0}' to run it with language-only.
 And the current Muse-Glimmer chat template always enables reasoning and ignores the `enable_thinking` option. When the server is started with `--reasoning-parser muse_glimmer`, reasoning is omitted from responses by default (`include_reasoning=false`). Set `include_reasoning=true` in the request to return it in `message.reasoning`.
 
-Fo instance starting the meta-models/Muse-Glimmer-30B model: 
+Reasoning tokens count toward the request's output-token budget. If
+`max_tokens` is too small, Muse Glimmer can consume the entire budget in
+reasoning and return an empty `message.content` with `finish_reason=length`.
+Use `include_reasoning=true` when diagnosing this result, and allocate enough
+output tokens for both reasoning and the final answer.
+
+For instance, start the meta-models/Muse-Glimmer-30B model with:
 ```bash
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 
-# use these two env and add dflash config to enable dflash to get better preformance
+# Use these two variables and add the DFlash config to improve performance.
 #export DISABLE_MUSE_GLIMMER_MLP_ESIMD=1
 #export VLLM_MUSE_GLIMMER_BATCHED_NORM=1
 #--speculative-config '{"method":"dflash","num_speculative_tokens":15, "model":"/path/to/Muse-Glimmer-30B-assistant"}' \
@@ -1436,16 +1545,71 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
   --port 8001
 ```
 
-### 3.7 Dflash Enable
+### 3.8 DFlash Enable
 
-To get better preformance, you can enable dflash.
+DFlash provides speculative decoding with a separate assistant model.
 
-**Supported models:** Currently verified with `Qwen3.6-27B` and `Muse-Glimmer-30B` models.
+**Supported models:** Currently verified with `Qwen3.6-27B`,
+`Qwen3.6-35B-A3B` and `Muse-Glimmer-30B`, using both online FP8 and
+`sym_int4` target-model quantization.
 
-For example, add dflash config:
+Set the V2 model runner and add a DFlash speculative configuration:
+
 ```bash
---speculative-config '{"method":"dflash","num_speculative_tokens":15, "model":"/path/to/Muse-Glimmer-30B-assistant"}'
+export VLLM_USE_V2_MODEL_RUNNER=1
+
+vllm serve /llm/models/Qwen3.6-35B-A3B \
+  --served-model-name Qwen3.6-35B-A3B \
+  --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 2 \
+  --quantization fp8 \
+  --dtype float16 \
+  --mamba-ssm-cache-dtype float16 \
+  --gpu-memory-utilization 0.85 \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 4096 \
+  --max-num-seqs 4 \
+  --block-size 64 \
+  --enforce-eager \
+  --no-enable-prefix-caching \
+  --speculative-config \
+  '{"method":"dflash","num_speculative_tokens":15,"model":"/llm/models/Qwen3.6-35B-A3B-DFlash"}' \
+  --trust-remote-code
 ```
+
+For Muse Glimmer, use the same Muse chat template, multimodal limits,
+tool-call parser and reasoning parser shown in the previous section, and set
+the assistant path to the matching Muse Glimmer assistant model. Compare
+DFlash ON and OFF with otherwise identical server and benchmark parameters.
+
+### 3.9 Rust Frontend
+
+The Rust frontend can be enabled without changing the serving CLI:
+
+```bash
+export VLLM_USE_RUST_FRONTEND=1
+
+vllm serve /llm/models/Qwen3.6-35B-A3B \
+  --served-model-name Qwen3.6-35B-A3B \
+  --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 2 \
+  --quantization fp8 \
+  --dtype float16 \
+  --mamba-ssm-cache-dtype float16 \
+  --gpu-memory-utilization 0.85 \
+  --max-model-len 70000 \
+  --max-num-batched-tokens 8192 \
+  --max-num-seqs 64 \
+  --block-size 64 \
+  --enforce-eager \
+  --trust-remote-code
+```
+
+The packaged frontend binary is discovered automatically. Do not set
+`VLLM_RUST_FRONTEND_PATH` unless using a separately built binary. For A/B
+validation, run the same request set once without
+`VLLM_USE_RUST_FRONTEND` and once with `VLLM_USE_RUST_FRONTEND=1`, keeping all
+other parameters unchanged.
 
 ## 4. Troubleshooting
 
@@ -1465,17 +1629,6 @@ To avoid this error, make sure to run your commands from the `/llm` root directo
 cd /llm
 python3 -m vllm.entrypoints.openai.api_server
 ```
-
-### 4.2 Out-of-memory while online quantization
-
-When the model size is very large, running FP8 online quantization may cause out-of-memory errors.
-
-To avoid this issue, set the following environment variable before starting the service:
-
-```bash
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
-```
-
 
 ## 5. Performance tuning
 
