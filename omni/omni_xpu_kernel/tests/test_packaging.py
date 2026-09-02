@@ -654,7 +654,33 @@ def test_windows_cute_overlay_is_private_and_fail_closed(monkeypatch, tmp_path):
         prepare_overlay(cutlass_root, tmp_path / "drifted-build")
 
 
-def test_windows_cute_compile_command_uses_validated_flags(monkeypatch, tmp_path):
+def test_cute_aot_targets_cover_concrete_bmg_skus_once(monkeypatch):
+    import setuptools
+
+    monkeypatch.chdir(PROJECT_ROOT)
+    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
+    monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
+    namespace = run_path(
+        str(PROJECT_ROOT / "setup.py"),
+        run_name="__cute_aot_targets_test__",
+    )
+
+    assert namespace["BMG_CUTE_SKU_AOT_TARGETS"] == {
+        "b580": "bmg-g21",
+        "b60": "bmg-g21",
+        "b70": "bmg-g31",
+    }
+    get_target = namespace["get_cute_aot_target"]
+    assert get_target("bmg") == "bmg-g21,bmg-g31"
+    assert get_target("ptl-h") == "ptl-h"
+    with pytest.raises(RuntimeError, match="Unsupported CUTE AOT architecture"):
+        get_target("pvc")
+
+
+@pytest.mark.parametrize("windows", [False, True])
+def test_cute_compile_command_uses_same_bmg_fat_target(
+    monkeypatch, tmp_path, windows
+):
     import setuptools
 
     cutlass_root = tmp_path / "sycl-tla"
@@ -671,16 +697,17 @@ def test_windows_cute_compile_command_uses_validated_flags(monkeypatch, tmp_path
     monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
     namespace = run_path(
         str(PROJECT_ROOT / "setup.py"),
-        run_name="__windows_cute_command_test__",
+        run_name="__cute_fat_command_test__",
     )
     _write_synthetic_bmg_cute_headers(namespace, cutlass_root)
 
     build_extension = namespace["ICPXBuildExt"].build_extension
     build_globals = build_extension.__globals__
-    monkeypatch.setitem(build_globals, "IS_WINDOWS", True)
+    monkeypatch.setitem(build_globals, "IS_WINDOWS", windows)
     monkeypatch.setitem(build_globals, "BUILD_XPU_TARGET", "bmg")
     monkeypatch.setitem(build_globals, "XPU_ARCH_MACRO", "OMNI_XPU_ARCH_BMG")
-    monkeypatch.setitem(build_globals, "get_icpx_path", lambda: "C:/fake/icx.exe")
+    compiler = "C:/fake/icx.exe" if windows else "/fake/icpx"
+    monkeypatch.setitem(build_globals, "get_icpx_path", lambda: compiler)
     monkeypatch.setitem(build_globals, "validate_torch_build", lambda *args: None)
     fake_onednn = tmp_path / "onednn"
     monkeypatch.setitem(
@@ -723,7 +750,14 @@ def test_windows_cute_compile_command_uses_validated_flags(monkeypatch, tmp_path
     monkeypatch.setattr(
         command,
         "get_ext_fullpath",
-        lambda name: str(tmp_path / "cute_fmha_torch.cp313-win_amd64.pyd"),
+        lambda name: str(
+            tmp_path
+            / (
+                "cute_fmha_torch.cp313-win_amd64.pyd"
+                if windows
+                else "cute_fmha_torch.so"
+            )
+        ),
     )
     extension = namespace["ICPXExtension"](
         "omni_xpu_kernel.cute.cute_fmha_torch",
@@ -733,30 +767,33 @@ def test_windows_cute_compile_command_uses_validated_flags(monkeypatch, tmp_path
 
     assert len(commands) == 1
     compile_command = commands[0]
-    assert compile_command[:2] == ["C:/fake/icx.exe", "-fsycl"]
-    assert "/MD" in compile_command
-    assert "/LD" in compile_command
-    assert "-Xsycl-target-backend=spir64_gen" in compile_command
-    assert "-device bmg-g31" in compile_command
+    assert compile_command[:2] == [compiler, "-fsycl"]
+    assert "-device bmg-g21,bmg-g31" in compile_command
     assert "-fno-sycl-instrument-device-code" in compile_command
     assert "-DCUTLASS_ENABLE_SYCL" in compile_command
     assert "-DSYCL_INTEL_TARGET" in compile_command
     assert "-DOMNI_XPU_ARCH_BMG=1" in compile_command
-    assert any(
-        argument.startswith("/I") and "cute_bmg_include_overlay" in argument
-        for argument in compile_command
-    )
-    assert "torch_xpu.lib" in compile_command
+    assert any("cute_bmg_include_overlay" in argument for argument in compile_command)
     assert any(argument.endswith("sol_attn_prepare.cpp") for argument in compile_command)
     assert any(argument.endswith("sol_attn_torch.cpp") for argument in compile_command)
-    assert compile_command.index("/link") > compile_command.index(
-        str(
-            PROJECT_ROOT
-            / "omni_xpu_kernel"
-            / "cute"
-            / "cute_fmha_torch.cpp"
+    if windows:
+        assert "/MD" in compile_command
+        assert "/LD" in compile_command
+        assert "-Xsycl-target-backend=spir64_gen" in compile_command
+        assert "torch_xpu.lib" in compile_command
+        assert compile_command.index("/link") > compile_command.index(
+            str(
+                PROJECT_ROOT
+                / "omni_xpu_kernel"
+                / "cute"
+                / "cute_fmha_torch.cpp"
+            )
         )
-    )
+    else:
+        assert "-fPIC" in compile_command
+        assert "-shared" in compile_command
+        assert "-Xsycl-target-backend" in compile_command
+        assert "-ltorch_xpu" in compile_command
 
 
 def test_cute_loader_finds_windows_pyd(monkeypatch, tmp_path):

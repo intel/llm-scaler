@@ -86,6 +86,13 @@ and generic-BMG profiles and selects from the exact runtime PCI Device ID:
 | `0xE223` | `b70` |
 | other BMG ID | `generic-bmg` (the shipped B70-compatible defaults) |
 
+Each OS-specific BMG CUTE sidecar uses the same fat-target contract. It
+contains the compiler's explicit `bmg-g21` image used by B580 and B60, the
+explicit `bmg-g31` image used by B70, and the compiler-provided generic IR
+fallback. Runtime Device ID dispatch still selects the concrete kernel policy.
+The presence of an image is a build property, not a physical-SKU correctness
+or performance claim.
+
 Use `omni_xpu_kernel.device.info(index)` to inspect the detected ID, selected
 physical/effective SKU, profile, debug-override state, performance-claim
 eligibility, concrete policy values, and the exact compiled values of all 23

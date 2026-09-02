@@ -141,10 +141,31 @@ def get_kernel_tuning_compile_args(*, windows=None):
     ]
 
 
-WINDOWS_CUTE_AOT_TARGETS = {
-    # The Windows B70 validation used the compiler's explicit BMG-G31 target.
-    "bmg": "bmg-g31",
+BMG_CUTE_SKU_AOT_TARGETS = {
+    "b580": "bmg-g21",
+    "b60": "bmg-g21",
+    "b70": "bmg-g31",
 }
+CUTE_AOT_TARGETS = {
+    # Keep one BMG sidecar portable across the maintained physical SKUs. The
+    # target list de-duplicates the shared G21 image used by B580 and B60.
+    "bmg": tuple(dict.fromkeys(BMG_CUTE_SKU_AOT_TARGETS.values())),
+    "ptl-h": ("ptl-h",),
+}
+
+
+def get_cute_aot_target(xpu_target):
+    """Return the OS-independent compiler target list for a CUTE sidecar."""
+    target = str(xpu_target).strip().lower()
+    try:
+        targets = CUTE_AOT_TARGETS[target]
+    except KeyError as error:
+        supported = ", ".join(CUTE_AOT_TARGETS)
+        raise RuntimeError(
+            f"Unsupported CUTE AOT architecture {xpu_target!r}; "
+            f"supported architectures: {supported}"
+        ) from error
+    return ",".join(targets)
 
 BMG_CUTE_REMAINDER_MASK_ORIGINAL = """\
           FragSRow k_rem_mask;
@@ -815,12 +836,13 @@ class ICPXBuildExt(build_ext):
                         "include/, tools/util/include/, examples/common/, "
                         "applications/. Got: " + repr(cutlass)
                     )
-                cute_aot_target = WINDOWS_CUTE_AOT_TARGETS.get(BUILD_XPU_TARGET)
-                if cute_aot_target is None:
+                if BUILD_XPU_TARGET != "bmg":
                     raise RuntimeError(
-                        "Windows CUTE is currently validated only for "
+                        "Windows CUTE is currently available only for "
                         "OMNI_XPU_DEVICE=bmg"
                     )
+                cute_aot_target = get_cute_aot_target(BUILD_XPU_TARGET)
+                print(f"CUTE AOT target: {cute_aot_target}")
                 overlay = prepare_bmg_cute_include_overlay(
                     cutlass, self.build_temp
                 )
@@ -942,10 +964,12 @@ class ICPXBuildExt(build_ext):
                         cutlass, self.build_temp
                     )
                     cute_overlay_flags.append(f"-I{overlay}")
+                cute_aot_target = get_cute_aot_target(BUILD_XPU_TARGET)
+                print(f"CUTE AOT target: {cute_aot_target}")
                 cmd += [
                     "-std=c++17", "-O3", "-DNDEBUG", "-fPIC", "-shared",
                     "-fsycl-targets=spir64_gen",
-                    "-Xsycl-target-backend", f"-device {BUILD_XPU_TARGET}",
+                    "-Xsycl-target-backend", f"-device {cute_aot_target}",
                     "-Xspirv-translator",
                     "-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,"
                     "+SPV_INTEL_subgroup_matrix_multiply_accumulate",

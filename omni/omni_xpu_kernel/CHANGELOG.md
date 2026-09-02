@@ -14,3 +14,6 @@ Notable user-facing changes will be recorded here when a public
   Sol-Attn API.
 - Keep Windows CUTE compilation and ComfyUI routing as separate explicit
   opt-ins.
+- Use the same BMG CUTE fat-target contract on Linux and Windows, containing
+  both G21 and G31 AOT device images for the maintained B580, B60, and B70
+  SKU set.
