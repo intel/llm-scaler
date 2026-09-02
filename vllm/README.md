@@ -25,16 +25,16 @@ llm-scaler-vllm is an extended and optimized version of vLLM, specifically adapt
    2.9 [Multi-node Distributed Deployment (PP/TP)](#29-multi-node-distributed-deployment-pptp)  
    2.10 [BPE-Qwen Tokenizer](#210-bpe-qwen-tokenizer)  
    2.11 [Load Balancer Solution](#211-load-balancer-solution)
-3. [Supported Models](#3-supported-models)
-   3.1 [How to use Hunyuan-7B-Instruct](#31-how-to-use-hunyuan-7b-instruct)
-   3.2 [Reference commands for Qwen3.5/3.6 models](#32-reference-commands-for-running-the-supported-qwen3536-models)
-   3.3 [Reference commands for Gemma 4 and DiffusionGemma](#33-reference-commands-for-running-gemma-4-models-and-diffusiongemma)
-   3.4 [LoRA Adapter Serving](#34-lora-adapter-serving)
-   3.5 [FP8 KV Cache](#35-fp8-kv-cache)
-   3.6 [MTP Enable](#36-mtp-enable)
-   3.7 [How to Run Muse Glimmer 30B](#37-how-to-run-muse-glimmer-30b)
-   3.8 [DFlash Enable](#38-dflash-enable)
-   3.9 [Rust Frontend](#39-rust-frontend)
+3. [Supported Models](#3-supported-models)<br>
+   3.1 [How to use Hunyuan-7B-Instruct](#31-how-to-use-hunyuan-7b-instruct)<br>
+   3.2 [Reference commands for Qwen3.5/3.6 models](#32-reference-commands-for-running-the-supported-qwen3536-models)<br>
+   3.3 [Reference commands for Gemma 4 and DiffusionGemma](#33-reference-commands-for-running-gemma-4-models-and-diffusiongemma)<br>
+   3.4 [LoRA Adapter Serving](#34-lora-adapter-serving)<br>
+   3.5 [FP8 KV Cache](#35-fp8-kv-cache)<br>
+   3.6 [MTP Enable](#36-mtp-enable)<br>
+   3.7 [How to Run Muse Glimmer 30B](#37-how-to-run-muse-glimmer-30b)<br>
+   3.8 [DFlash Enable](#38-dflash-enable)<br>
+   3.9 [Rust Frontend](#39-rust-frontend)<br>
 4. [Troubleshooting](#4-troubleshooting)
 5. [Performance tuning](#5-performance-tuning)
 
