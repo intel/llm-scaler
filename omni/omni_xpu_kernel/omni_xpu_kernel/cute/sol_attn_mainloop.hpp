@@ -615,10 +615,15 @@ struct SolFwdMainloop : DenseMainloop {
     const float* q_centroids;
     const float* thresholds;
     const uint8_t* key_sinks;
+    const uint8_t* topk_routes;
 #else
     const uint8_t* routes;
 #endif
     const ElementK* k_base;
+    const float* key_bias;
+    const int32_t* block_lengths;
+    bool tail;
+    bool route_inclusive;
     int tokens;
     int heads;
     int blocks;
@@ -634,10 +639,15 @@ struct SolFwdMainloop : DenseMainloop {
     const float* q_centroids;
     const float* thresholds;
     const uint8_t* key_sinks;
+    const uint8_t* topk_routes;
 #else
     const uint8_t* routes;
 #endif
     const ElementK* k_base;
+    const float* key_bias;
+    const int32_t* block_lengths;
+    bool tail;
+    bool route_inclusive;
     int tokens;
     int heads;
     int blocks;
@@ -660,10 +670,15 @@ struct SolFwdMainloop : DenseMainloop {
         args.q_centroids,
         args.thresholds,
         args.key_sinks,
+        args.topk_routes,
 #else
         args.routes,
 #endif
         args.k_base,
+        args.key_bias,
+        args.block_lengths,
+        args.tail,
+        args.route_inclusive,
         args.tokens,
         args.heads,
         args.blocks,
@@ -676,6 +691,7 @@ struct SolFwdMainloop : DenseMainloop {
 #if SOL_ATTN_INLINE_ROUTE
         args.q_centroids != nullptr && args.thresholds != nullptr &&
         args.key_sinks != nullptr &&
+        (!args.route_inclusive || args.topk_routes != nullptr) &&
 #else
         args.routes != nullptr &&
 #endif
@@ -701,8 +717,7 @@ struct SolFwdMainloop : DenseMainloop {
     FragARow rescale;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tA_max.size(); ++i) {
-      ElementS new_max =
-          sycl::max(tA_max(i), sol_params.scale * tS_bmax(i));
+      ElementS new_max = sycl::max(tA_max(i), tS_bmax(i));
       rescale(i) = sycl::native::exp2(tA_max(i) - new_max);
       tA_max(i) = new_max;
     }
@@ -710,7 +725,7 @@ struct SolFwdMainloop : DenseMainloop {
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS.size(); ++i) {
       tS(i) = sycl::native::exp2(
-          sol_params.scale * tS(i) - broadcast<0>(tA_max, tS, i));
+          tS(i) - broadcast<0>(tA_max, tS, i));
     }
 
     auto tS_partial_sum =
@@ -760,6 +775,15 @@ struct SolFwdMainloop : DenseMainloop {
     const int head = static_cast<int>(head_offset / sol_params.k_stride_head);
     const int batch_head = l_coord * sol_params.heads + head;
     const int summary_offset = batch_head * sol_params.blocks * 128;
+    auto block_length_of = [&](int block) {
+      const int physical_length = cute::min(64, seq_len - block * 64);
+      if (sol_params.block_lengths == nullptr) {
+        return physical_length;
+      }
+      return cute::min(
+          physical_length,
+          cute::max(1, sol_params.block_lengths[block]));
+    };
 
     auto summary_k = make_tensor(
         make_gmem_ptr(const_cast<ElementK*>(sol_params.k_centroids + summary_offset)),
@@ -984,6 +1008,17 @@ struct SolFwdMainloop : DenseMainloop {
     }
 #endif
     auto route_block = [&](int key_block) {
+      const int distance = query_block > key_block
+          ? query_block - key_block
+          : key_block - query_block;
+      if (key_sinks[key_block] != 0 || distance <= 1) {
+        return true;
+      }
+      if (sol_params.route_inclusive) {
+        return sol_params.topk_routes[
+            (batch_head * sol_params.blocks + query_block) *
+                sol_params.blocks + key_block] != 0;
+      }
       const int lane = static_cast<int>(sg.get_local_linear_id());
       float partial = 0.0f;
 #if SOL_ATTN_GROUP_LOAD_ROUTE_K_CENTROID
@@ -1028,14 +1063,31 @@ struct SolFwdMainloop : DenseMainloop {
       }
       const float score = sycl::reduce_over_group(
           sg, partial, sycl::plus<float>()) * sol_params.scale;
-      const int distance = query_block > key_block
-          ? query_block - key_block
-          : key_block - query_block;
-      return key_sinks[key_block] != 0 || distance <= 1 ||
-          score > route_threshold;
+      return score > route_threshold;
     };
 #if SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS
     auto route_columns_for_key = [&](int key_block) {
+      if (sol_params.route_inclusive) {
+        uint8_t columns = 0;
+        CUTLASS_PRAGMA_UNROLL
+        for (int query_slot = 0;
+             query_slot < kQueryBlocksPerWorkgroup;
+             ++query_slot) {
+          const int route_query_block = cute::min(
+              get<0>(blk_qv) * kQueryBlocksPerWorkgroup + query_slot,
+              sol_params.blocks - 1);
+          const int distance = route_query_block > key_block
+              ? route_query_block - key_block
+              : key_block - route_query_block;
+          if (key_sinks[key_block] != 0 || distance <= 1 ||
+              sol_params.topk_routes[
+                  (batch_head * sol_params.blocks + route_query_block) *
+                      sol_params.blocks + key_block] != 0) {
+            columns |= uint8_t(1) << query_slot;
+          }
+        }
+        return columns;
+      }
       const int lane = static_cast<int>(sg.get_local_linear_id());
       std::array<float, kQueryBlocksPerWorkgroup> partial{};
       CUTLASS_PRAGMA_UNROLL
@@ -1155,18 +1207,20 @@ struct SolFwdMainloop : DenseMainloop {
       ElementS full_block_log2_bias = ElementS(0.0f);
       ElementS tail_block_log2_bias = ElementS(0.0f);
       if (approximate) {
-        full_block_log2_bias = ElementS(6.0f) / sol_params.scale;
+        full_block_log2_bias = ElementS(6.0f);
         const int tail_block_length =
             seq_len - (sol_params.blocks - 1) * 64;
         tail_block_log2_bias =
-            ElementS(sycl::log2(static_cast<float>(tail_block_length))) /
-            sol_params.scale;
+            ElementS(sycl::log2(static_cast<float>(tail_block_length)));
       }
 #endif
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tSrS.size(); ++i) {
         const int key = get<1>(score_coords(i));
         if (key >= key_extent) {
+          tSrS(i) = ElementS(-INFINITY);
+        } else if (!approximate && sol_params.block_lengths != nullptr &&
+                   key % 64 >= block_length_of(key / 64)) {
           tSrS(i) = ElementS(-INFINITY);
 #if SOL_ATTN_INLINE_ROUTE
         } else if (approximate &&
@@ -1175,16 +1229,30 @@ struct SolFwdMainloop : DenseMainloop {
         } else if (approximate && route[key] != 0) {
 #endif
           tSrS(i) = ElementS(-INFINITY);
-        } else if (approximate) {
+        } else {
+          // Keep every score in log2-softmax units. This permits an exact
+          // per-key log-bias even when the caller deliberately sets the QK
+          // scale to zero.
+          tSrS(i) *= sol_params.scale;
+          if (!approximate && sol_params.key_bias != nullptr) {
+            tSrS(i) += ElementS(
+                sol_params.key_bias[
+                    static_cast<int64_t>(l_coord) * seq_len + key]);
+          } else if (approximate) {
 #if SOL_ATTN_HOIST_APPROXIMATE_LOG2
-          tSrS(i) += key == sol_params.blocks - 1
-              ? tail_block_log2_bias
-              : full_block_log2_bias;
+            if (sol_params.block_lengths == nullptr) {
+              tSrS(i) += key == sol_params.blocks - 1
+                  ? tail_block_log2_bias
+                  : full_block_log2_bias;
+            } else {
+              tSrS(i) += ElementS(
+                  sycl::log2(static_cast<float>(block_length_of(key))));
+            }
 #else
-          const int block_length = cute::min(64, seq_len - key * 64);
-          tSrS(i) += ElementS(sycl::log2(static_cast<float>(block_length))) /
-              sol_params.scale;
+            tSrS(i) += ElementS(
+                sycl::log2(static_cast<float>(block_length_of(key))));
 #endif
+          }
         }
       }
 
@@ -1435,7 +1503,7 @@ struct SolFwdMainloop : DenseMainloop {
         }
       }
 #endif
-      if (has_approximate) {
+      if (sol_params.tail && has_approximate) {
         process_tile(
             copy_k_summary, copy_v_summary, tKgK_summary, tVgV_summary,
             tile, true, route_mask, begin);

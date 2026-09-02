@@ -27,6 +27,7 @@ entry points.
 """
 
 import glob
+import math
 import os
 from importlib.machinery import EXTENSION_SUFFIXES
 
@@ -220,11 +221,15 @@ def sol_attn(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    *,
-    scale: float | None = None,
     tau: float = 1.0,
-    sink_blocks: tuple[int, int] = (0, 0),
-    sink_q: tuple[int, int] = (0, 0),
+    scale: float | None = None,
+    sink_blocks: tuple[int, int] | list[int] | None = None,
+    sink_q: tuple[int, int] | list[int] | None = None,
+    key_bias: torch.Tensor | None = None,
+    topk_ratio: float = 0.0,
+    tail: bool = True,
+    block_len: torch.Tensor | None = None,
+    coarse_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse Sol-Attn for the validated BMG BF16 BTHD D128 contract.
 
@@ -237,8 +242,88 @@ def sol_attn(
     ops = _sol_attn_ops()
     if not hasattr(ops, "prepare") or not hasattr(ops, "forward_cute"):
         raise RuntimeError("packaged Sol-Attn is unavailable in this sidecar")
+    sink_blocks = (0, 0) if sink_blocks is None else sink_blocks
+    sink_q = (0, 0) if sink_q is None else sink_q
     if len(sink_blocks) != 2 or len(sink_q) != 2:
         raise ValueError("sink_blocks and sink_q must each contain two indices")
+    blocks = (q.shape[1] + 63) // 64
+    if key_bias is None:
+        key_bias_log2 = torch.empty(0, dtype=torch.float32, device=q.device)
+    else:
+        if key_bias.device != q.device:
+            raise ValueError(
+                f"key_bias must be on {q.device}, got {key_bias.device}"
+            )
+        if key_bias.dim() == 4:
+            if key_bias.shape[1:3] != (1, 1):
+                raise ValueError(
+                    "key_bias must not vary over heads or queries"
+                )
+            key_bias = key_bias[:, 0, 0, :]
+        if key_bias.dim() == 1:
+            key_bias = key_bias.unsqueeze(0)
+        if (
+            key_bias.dim() != 2
+            or key_bias.shape[-1] != q.shape[1]
+            or key_bias.shape[0] not in (1, q.shape[0])
+        ):
+            raise ValueError(
+                "key_bias must be (T,), (B, T), or (B|1, 1, 1, T); "
+                f"got {tuple(key_bias.shape)} for B={q.shape[0]}, "
+                f"T={q.shape[1]}"
+            )
+        if key_bias.dtype == torch.bool:
+            key_bias = torch.where(key_bias, 0.0, float("-inf"))
+        elif not torch.is_floating_point(key_bias):
+            raise ValueError("key_bias must have bool or floating dtype")
+        key_bias_log2 = (
+            key_bias.float()
+            .mul(math.log2(math.e))
+            .expand(q.shape[0], q.shape[1])
+            .contiguous()
+        )
+    if block_len is None:
+        block_lengths = torch.empty(0, dtype=torch.int32, device=q.device)
+    else:
+        if (
+            block_len.device != q.device
+            or block_len.dtype != torch.int32
+            or block_len.dim() != 1
+            or block_len.numel() != blocks
+        ):
+            raise ValueError(
+                "block_len must be contiguous int32 (N,) on the Q device; "
+                f"got {block_len.dtype} {tuple(block_len.shape)} on "
+                f"{block_len.device}, expected N={blocks} on {q.device}"
+            )
+        block_lengths = block_len.contiguous()
+    if coarse_gate is not None:
+        if (
+            coarse_gate.device != q.device
+            or tuple(coarse_gate.shape) != tuple(q.shape)
+            or not torch.is_floating_point(coarse_gate)
+        ):
+            raise ValueError(
+                "coarse_gate must be a floating tensor with Q's shape and device"
+            )
+    topk_ratio = float(topk_ratio)
+    if topk_ratio != 0.0 and not 0.0 < topk_ratio < 1.0:
+        raise ValueError("topk_ratio must be 0 or in (0, 1)")
+    sink_count = max(
+        0,
+        min(int(sink_blocks[1]), blocks)
+        - min(int(sink_blocks[0]), blocks),
+    )
+    selectable_blocks = blocks - sink_count
+    topk_count = -1
+    if topk_ratio != 0.0:
+        topk_count = max(
+            0,
+            min(
+                selectable_blocks - 1,
+                max(1, round(topk_ratio * selectable_blocks)),
+            ),
+        )
     scale_value = q.shape[-1] ** -0.5 if scale is None else float(scale)
     prepared = ops.prepare(
         q,
@@ -250,8 +335,37 @@ def sol_attn(
         int(sink_blocks[1]),
         int(sink_q[0]),
         int(sink_q[1]),
+        int(topk_count),
+        block_lengths,
     )
-    return ops.forward_cute(q, k, v, *prepared, float(scale_value))
+    output = ops.forward_cute(
+        q,
+        k,
+        v,
+        *prepared,
+        key_bias_log2,
+        block_lengths,
+        float(scale_value),
+        bool(tail),
+        topk_count >= 0,
+    )
+    if coarse_gate is not None:
+        batch, _, heads, dim = q.shape
+        q_means = prepared[2].reshape(batch * heads, blocks, dim)
+        k_means = prepared[0].float().reshape(batch * heads, blocks, dim)
+        v_means = prepared[1].float().reshape(batch * heads, blocks, dim)
+        coarse = torch.softmax(
+            torch.bmm(q_means, k_means.transpose(1, 2)) * scale_value,
+            dim=-1,
+        )
+        coarse = torch.bmm(coarse, v_means)
+        coarse = (
+            coarse.view(batch, heads, blocks, dim)
+            .permute(0, 2, 1, 3)
+            .repeat_interleave(64, dim=1)[:, : q.shape[1]]
+        )
+        output.addcmul_(coarse_gate.contiguous(), coarse)
+    return output
 
 
 __all__ = [

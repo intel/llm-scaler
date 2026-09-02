@@ -325,11 +325,16 @@ void run(
     const at::Tensor& q_centroids,
     const at::Tensor& thresholds,
     const at::Tensor& key_sinks,
+    const at::Tensor& topk_routes,
 #else
     const at::Tensor& routes,
 #endif
+    const at::Tensor& key_bias,
+    const at::Tensor& block_len,
     at::Tensor& output,
-    float scale) {
+    float scale,
+    bool tail,
+    bool route_inclusive) {
   using KT = SolKernel<
       Element,
       TilePolicy,
@@ -398,10 +403,15 @@ void run(
       q_centroids.data_ptr<float>(),
       thresholds.data_ptr<float>(),
       key_sinks.data_ptr<uint8_t>(),
+      route_inclusive ? topk_routes.data_ptr<uint8_t>() : nullptr,
 #else
       routes.data_ptr<uint8_t>(),
 #endif
       static_cast<const Element*>(k.data_ptr()),
+      key_bias.numel() == 0 ? nullptr : key_bias.data_ptr<float>(),
+      block_len.numel() == 0 ? nullptr : block_len.data_ptr<int32_t>(),
+      tail,
+      route_inclusive,
       T,
       H,
       blocks,
@@ -437,10 +447,15 @@ at::Tensor forward_cute_impl(
     const at::Tensor& q_centroids,
     const at::Tensor& thresholds,
     const at::Tensor& key_sinks,
+    const at::Tensor& topk_routes,
 #else
     const at::Tensor& routes,
 #endif
-    double scale_value) {
+    const at::Tensor& key_bias,
+    const at::Tensor& block_len,
+    double scale_value,
+    bool tail,
+    bool route_inclusive) {
   TORCH_CHECK(q.device().is_xpu() && k.device() == q.device() && v.device() == q.device(),
               "Sol-Attn CUTE requires Q/K/V on one XPU device");
   TORCH_CHECK(q.dim() == 4 && q.sizes() == k.sizes() && q.sizes() == v.sizes(),
@@ -459,11 +474,27 @@ at::Tensor forward_cute_impl(
   TORCH_CHECK(k_centroids.device() == q.device() && v_means.device() == q.device()
 #if SOL_ATTN_INLINE_ROUTE
                   && q_centroids.device() == q.device() &&
-                  thresholds.device() == q.device() && key_sinks.device() == q.device(),
+                  thresholds.device() == q.device() &&
+                  key_sinks.device() == q.device() &&
+                  topk_routes.device() == q.device(),
 #else
                   && routes.device() == q.device(),
 #endif
               "Sol-Attn summaries/routes must be on the Q device");
+  TORCH_CHECK(
+      key_bias.device() == q.device() &&
+          key_bias.scalar_type() == at::kFloat &&
+          key_bias.is_contiguous() &&
+          (key_bias.numel() == 0 ||
+           key_bias.sizes() == at::IntArrayRef({q.size(0), q.size(1)})),
+      "Sol-Attn key-bias contract mismatch");
+  TORCH_CHECK(
+      block_len.device() == q.device() &&
+          block_len.scalar_type() == at::kInt &&
+          block_len.is_contiguous() &&
+          (block_len.numel() == 0 ||
+           (block_len.dim() == 1 && block_len.numel() == blocks)),
+      "Sol-Attn block-length contract mismatch");
   TORCH_CHECK(k_centroids.scalar_type() == q.scalar_type() &&
                   v_means.scalar_type() == q.scalar_type() &&
                   k_centroids.sizes() == at::IntArrayRef(
@@ -485,6 +516,14 @@ at::Tensor forward_cute_impl(
                   key_sinks.is_contiguous() &&
                   key_sinks.sizes() == thresholds.sizes(),
               "Sol-Attn key-sink contract mismatch");
+  TORCH_CHECK(
+      topk_routes.scalar_type() == at::kByte &&
+          topk_routes.is_contiguous() &&
+          (route_inclusive
+               ? topk_routes.sizes() == at::IntArrayRef(
+                     {q.size(0), q.size(2), blocks, blocks})
+               : topk_routes.numel() == 0),
+      "Sol-Attn top-k route contract mismatch");
 #else
   TORCH_CHECK(routes.scalar_type() == at::kByte && routes.is_contiguous() &&
                   routes.sizes() == at::IntArrayRef(
@@ -501,12 +540,16 @@ at::Tensor forward_cute_impl(
       ParentTag>(
       q, k, v, k_centroids, v_means,
 #if SOL_ATTN_INLINE_ROUTE
-      q_centroids, thresholds, key_sinks,
+      q_centroids, thresholds, key_sinks, topk_routes,
 #else
       routes,
 #endif
+      key_bias,
+      block_len,
       output,
-      static_cast<float>(scale_value));
+      static_cast<float>(scale_value),
+      tail,
+      route_inclusive);
   return output;
 }
 
@@ -530,10 +573,15 @@ at::Tensor forward_cute(
     const at::Tensor& q_centroids,
     const at::Tensor& thresholds,
     const at::Tensor& key_sinks,
+    const at::Tensor& topk_routes,
 #else
     const at::Tensor& routes,
 #endif
-    double scale_value) {
+    const at::Tensor& key_bias,
+    const at::Tensor& block_len,
+    double scale_value,
+    bool tail,
+    bool route_inclusive) {
   if (use_b580_tile_policy(q)) {
     return forward_cute_impl<
         SolB580TilePolicy,
@@ -543,11 +591,11 @@ at::Tensor forward_cute(
         false>(
         q, k, v, k_centroids, v_means,
 #if SOL_ATTN_INLINE_ROUTE
-        q_centroids, thresholds, key_sinks,
+        q_centroids, thresholds, key_sinks, topk_routes,
 #else
         routes,
 #endif
-        scale_value);
+        key_bias, block_len, scale_value, tail, route_inclusive);
   }
   return forward_cute_impl<
       SolConfiguredTilePolicy,
@@ -557,11 +605,11 @@ at::Tensor forward_cute(
       false>(
       q, k, v, k_centroids, v_means,
 #if SOL_ATTN_INLINE_ROUTE
-      q_centroids, thresholds, key_sinks,
+      q_centroids, thresholds, key_sinks, topk_routes,
 #else
       routes,
 #endif
-      scale_value);
+      key_bias, block_len, scale_value, tail, route_inclusive);
 }
 
 #if SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS
@@ -575,10 +623,15 @@ at::Tensor forward_cute_parent(
     const at::Tensor& q_centroids,
     const at::Tensor& thresholds,
     const at::Tensor& key_sinks,
+    const at::Tensor& topk_routes,
 #else
     const at::Tensor& routes,
 #endif
-    double scale_value) {
+    const at::Tensor& key_bias,
+    const at::Tensor& block_len,
+    double scale_value,
+    bool tail,
+    bool route_inclusive) {
   if (use_b580_tile_policy(q)) {
     return forward_cute_impl<
         SolB580TilePolicy,
@@ -588,11 +641,11 @@ at::Tensor forward_cute_parent(
         true>(
         q, k, v, k_centroids, v_means,
 #if SOL_ATTN_INLINE_ROUTE
-        q_centroids, thresholds, key_sinks,
+        q_centroids, thresholds, key_sinks, topk_routes,
 #else
         routes,
 #endif
-        scale_value);
+        key_bias, block_len, scale_value, tail, route_inclusive);
   }
   return forward_cute_impl<
       SolConfiguredTilePolicy,
@@ -602,11 +655,11 @@ at::Tensor forward_cute_parent(
       true>(
       q, k, v, k_centroids, v_means,
 #if SOL_ATTN_INLINE_ROUTE
-      q_centroids, thresholds, key_sinks,
+      q_centroids, thresholds, key_sinks, topk_routes,
 #else
       routes,
 #endif
-      scale_value);
+      key_bias, block_len, scale_value, tail, route_inclusive);
 }
 #endif
 
@@ -621,10 +674,15 @@ at::Tensor forward_cute_serial_route_parent(
     const at::Tensor& q_centroids,
     const at::Tensor& thresholds,
     const at::Tensor& key_sinks,
+    const at::Tensor& topk_routes,
 #else
     const at::Tensor& routes,
 #endif
-    double scale_value) {
+    const at::Tensor& key_bias,
+    const at::Tensor& block_len,
+    double scale_value,
+    bool tail,
+    bool route_inclusive) {
   if (use_b580_tile_policy(q)) {
     return forward_cute_impl<
         SolB580TilePolicy,
@@ -634,11 +692,11 @@ at::Tensor forward_cute_serial_route_parent(
         true>(
         q, k, v, k_centroids, v_means,
 #if SOL_ATTN_INLINE_ROUTE
-        q_centroids, thresholds, key_sinks,
+        q_centroids, thresholds, key_sinks, topk_routes,
 #else
         routes,
 #endif
-        scale_value);
+        key_bias, block_len, scale_value, tail, route_inclusive);
   }
   return forward_cute_impl<
       SolConfiguredTilePolicy,
@@ -648,11 +706,11 @@ at::Tensor forward_cute_serial_route_parent(
       true>(
       q, k, v, k_centroids, v_means,
 #if SOL_ATTN_INLINE_ROUTE
-      q_centroids, thresholds, key_sinks,
+      q_centroids, thresholds, key_sinks, topk_routes,
 #else
       routes,
 #endif
-      scale_value);
+      key_bias, block_len, scale_value, tail, route_inclusive);
 }
 #endif
 
@@ -663,33 +721,38 @@ TORCH_LIBRARY_FRAGMENT(omni_xpu_sol_attn, m) {
   m.def(
       "forward_cute(Tensor q, Tensor k, Tensor v, Tensor k_centroids, "
       "Tensor v_means, Tensor q_centroids, Tensor thresholds, "
-      "Tensor key_sinks, float scale) -> Tensor");
+      "Tensor key_sinks, Tensor topk_routes, Tensor key_bias, Tensor block_len, float scale, bool tail, "
+      "bool route_inclusive) -> Tensor");
 #if SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS
   m.def(
       "forward_cute_parent(Tensor q, Tensor k, Tensor v, Tensor k_centroids, "
       "Tensor v_means, Tensor q_centroids, Tensor thresholds, "
-      "Tensor key_sinks, float scale) -> Tensor");
+      "Tensor key_sinks, Tensor topk_routes, Tensor key_bias, Tensor block_len, float scale, bool tail, "
+      "bool route_inclusive) -> Tensor");
 #endif
 #if SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE
   m.def(
       "forward_cute_serial_route_parent(Tensor q, Tensor k, Tensor v, "
       "Tensor k_centroids, Tensor v_means, Tensor q_centroids, "
-      "Tensor thresholds, Tensor key_sinks, float scale) -> Tensor");
+      "Tensor thresholds, Tensor key_sinks, Tensor topk_routes, Tensor key_bias, Tensor block_len, float scale, "
+      "bool tail, bool route_inclusive) -> Tensor");
 #endif
 #else
   m.def(
       "forward_cute(Tensor q, Tensor k, Tensor v, Tensor k_centroids, "
-      "Tensor v_means, Tensor routes, float scale) -> Tensor");
+      "Tensor v_means, Tensor routes, Tensor key_bias, Tensor block_len, float scale, bool tail, "
+      "bool route_inclusive) -> Tensor");
 #if SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS
   m.def(
       "forward_cute_parent(Tensor q, Tensor k, Tensor v, Tensor k_centroids, "
-      "Tensor v_means, Tensor routes, float scale) -> Tensor");
+      "Tensor v_means, Tensor routes, Tensor key_bias, Tensor block_len, float scale, bool tail, "
+      "bool route_inclusive) -> Tensor");
 #endif
 #if SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE
   m.def(
       "forward_cute_serial_route_parent(Tensor q, Tensor k, Tensor v, "
-      "Tensor k_centroids, Tensor v_means, Tensor routes, float scale) "
-      "-> Tensor");
+      "Tensor k_centroids, Tensor v_means, Tensor routes, Tensor key_bias, Tensor block_len, float scale, "
+      "bool tail, bool route_inclusive) -> Tensor");
 #endif
 #endif
 }

@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from omni_xpu_kernel import cute
 
@@ -39,7 +40,7 @@ def test_sol_attn_hides_native_prepare_contract(monkeypatch):
 
     def prepare(*args):
         calls.append(("prepare", args))
-        return ("kc", "vm", "qc", "thresholds", "sinks")
+        return ("kc", "vm", "qc", "thresholds", "sinks", "topk_routes")
 
     def forward(*args):
         calls.append(("forward", args))
@@ -51,7 +52,7 @@ def test_sol_attn_hides_native_prepare_contract(monkeypatch):
         "_sol_attn_ops",
         lambda: SimpleNamespace(prepare=prepare, forward_cute=forward),
     )
-    q = SimpleNamespace(shape=(1, 15787, 56, 128))
+    q = torch.empty((1, 15787, 56, 128), device="meta")
     k = object()
     v = object()
 
@@ -66,20 +67,161 @@ def test_sol_attn_hides_native_prepare_contract(monkeypatch):
 
     assert actual is result
     prepare_args = calls[0][1]
-    assert prepare_args[:3] == (q, k, v)
+    assert prepare_args[0] is q
+    assert prepare_args[1] is k
+    assert prepare_args[2] is v
     assert prepare_args[3] == pytest.approx(128**-0.5)
-    assert prepare_args[4:] == (1.3, 2, 4, 5, 6)
-    assert calls[1][1] == (
-        q,
-        k,
-        v,
-        "kc",
-        "vm",
-        "qc",
-        "thresholds",
-        "sinks",
-        pytest.approx(128**-0.5),
+    assert prepare_args[4:-1] == (1.3, 2, 4, 5, 6, -1)
+    assert prepare_args[-1].dtype == torch.int32
+    assert prepare_args[-1].numel() == 0
+    forward_args = calls[1][1]
+    assert forward_args[0] is q
+    assert forward_args[1] is k
+    assert forward_args[2] is v
+    assert forward_args[3:9] == (
+        "kc", "vm", "qc", "thresholds", "sinks", "topk_routes"
     )
+    assert forward_args[9].dtype == torch.float32
+    assert forward_args[9].numel() == 0
+    assert forward_args[10].dtype == torch.int32
+    assert forward_args[10].numel() == 0
+    assert forward_args[11:] == (
+        pytest.approx(128**-0.5), True, False
+    )
+
+
+def test_sol_attn_forwards_tail_bias_and_block_lengths(
+    monkeypatch,
+):
+    calls = []
+
+    monkeypatch.setattr(cute, "_ensure_loaded", lambda: None)
+    monkeypatch.setattr(
+        cute,
+        "_sol_attn_ops",
+        lambda: SimpleNamespace(
+            prepare=lambda *args: (
+                "kc",
+                "vm",
+                "qc",
+                "thresholds",
+                "sinks",
+                "topk_routes",
+            ),
+            forward_cute=lambda *args: calls.append(args) or "out",
+        ),
+    )
+    q = torch.empty((1, 64, 1, 128))
+
+    assert cute.sol_attn(q, object(), object(), tail=False) == "out"
+    assert calls[0][-2] is False
+
+    with pytest.raises(ValueError, match="block_len"):
+        cute.sol_attn(
+            q,
+            object(),
+            object(),
+            block_len=torch.ones(2, dtype=torch.int32),
+        )
+    with pytest.raises(ValueError, match="coarse_gate"):
+        cute.sol_attn(
+            q,
+            object(),
+            object(),
+            coarse_gate=torch.ones(1),
+        )
+
+    calls.clear()
+    bias = torch.tensor([True, False]).repeat(32)
+    assert cute.sol_attn(q, object(), object(), key_bias=bias) == "out"
+    forwarded_bias = calls[0][-5]
+    assert forwarded_bias.shape == (1, 64)
+    assert forwarded_bias.dtype == torch.float32
+    assert forwarded_bias[0, 0] == 0
+    assert forwarded_bias[0, 1] == float("-inf")
+
+    calls.clear()
+    lengths = torch.tensor([32], dtype=torch.int32)
+    assert cute.sol_attn(q, object(), object(), block_len=lengths) == "out"
+    assert torch.equal(calls[0][-4], lengths)
+
+    calls.clear()
+    assert cute.sol_attn(
+        q,
+        object(),
+        object(),
+        topk_ratio=0.25,
+        tail=False,
+    ) == "out"
+    assert calls[0][-2:] == (False, True)
+
+
+def test_sol_attn_topk_budget_matches_kitchen_rounding(monkeypatch):
+    prepare_calls = []
+
+    monkeypatch.setattr(cute, "_ensure_loaded", lambda: None)
+    monkeypatch.setattr(
+        cute,
+        "_sol_attn_ops",
+        lambda: SimpleNamespace(
+            prepare=lambda *args: prepare_calls.append(args)
+            or (
+                "kc",
+                "vm",
+                "qc",
+                "thresholds",
+                "sinks",
+                "topk_routes",
+            ),
+            forward_cute=lambda *args: "out",
+        ),
+    )
+    q = torch.empty((1, 64 * 10, 1, 128))
+
+    cute.sol_attn(q, object(), object(), topk_ratio=0.25)
+    assert prepare_calls[-1][-2] == 2
+
+    cute.sol_attn(
+        q,
+        object(),
+        object(),
+        topk_ratio=0.5,
+        sink_blocks=(0, 9),
+    )
+    assert prepare_calls[-1][-2] == 0
+
+    with pytest.raises(ValueError, match="topk_ratio"):
+        cute.sol_attn(q, object(), object(), topk_ratio=1.0)
+
+
+def test_sol_attn_adds_coarse_gate_from_prepared_block_means(monkeypatch):
+    q = torch.zeros((1, 64, 1, 128), dtype=torch.bfloat16)
+    k_centroids = torch.ones((1, 1, 1, 128), dtype=torch.bfloat16)
+    v_means = torch.full_like(k_centroids, 2)
+    q_centroids = torch.ones((1, 1, 1, 128), dtype=torch.float32)
+    thresholds = torch.zeros((1, 1, 1), dtype=torch.float32)
+    sinks = torch.zeros((1, 1, 1), dtype=torch.uint8)
+    routes = torch.empty(0, dtype=torch.uint8)
+
+    monkeypatch.setattr(cute, "_ensure_loaded", lambda: None)
+    monkeypatch.setattr(
+        cute,
+        "_sol_attn_ops",
+        lambda: SimpleNamespace(
+            prepare=lambda *args: (
+                k_centroids,
+                v_means,
+                q_centroids,
+                thresholds,
+                sinks,
+                routes,
+            ),
+            forward_cute=lambda *args: torch.zeros_like(q),
+        ),
+    )
+    gate = torch.full_like(q, 0.5)
+    actual = cute.sol_attn(q, q, q, coarse_gate=gate)
+    torch.testing.assert_close(actual, torch.ones_like(actual))
 
 
 def test_sol_attn_rejects_malformed_sink_ranges(monkeypatch):
@@ -89,7 +231,7 @@ def test_sol_attn_rejects_malformed_sink_ranges(monkeypatch):
         "_sol_attn_ops",
         lambda: SimpleNamespace(prepare=lambda: None, forward_cute=lambda: None),
     )
-    q = SimpleNamespace(shape=(1, 64, 1, 128))
+    q = torch.empty((1, 64, 1, 128))
     with pytest.raises(ValueError, match="must each contain two indices"):
         cute.sol_attn(q, object(), object(), sink_blocks=(0,))
 
