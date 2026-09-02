@@ -997,7 +997,6 @@ Run on **Node-1**:
 export MODEL_NAME="/llm/models/Qwen2.5-7B-Instruct"
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 export CCL_ATL_TRANSPORT=ofi
 export VLLM_HOST_IP=10.0.1.19
 
@@ -1269,7 +1268,6 @@ For instance, start the Qwen3.6-35B-A3B model with:
 sudo docker exec -it test bash 
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 # or ```export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=0```
 
 vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 \
   --max-num-batched-tokens 8192 --max-model-len 40000 --block-size 64 \
@@ -1320,7 +1318,6 @@ Reference commands for running gemma-4-12B-it model with fp8 quantization:
 ```bash
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 
 export VLLM_WORKER_MULTIPROC_METHOD=spawn 
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 
 
 vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-tokens 8192 --max-model-len 90000 --block-size 64 --dtype float16 --mamba-ssm-cache-dtype float16 --model /llm/models/gemma-4-12B-it/ --served-model-name gemma-4-12B-it --tensor-parallel-size 1 --quantization fp8 --trust-remote-code 
 ```
@@ -1330,7 +1327,6 @@ Reference commands for running diffusiongemma-26B-A4B-it model with fp8 quantiza
 ```bash 
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 
 vllm serve --port 8000 --host 0.0.0.0 \
   --model /llm/models/diffusiongemma-26B-A4B-it/ \
@@ -1370,7 +1366,6 @@ adapters and model-specific 3D expert adapters are supported.
 Example for Qwen3.6-27B with two LoRA adapters:
 
 ```bash
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
@@ -1381,7 +1376,6 @@ vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-to
 Example for Qwen3.6-35B-A3B with a single LoRA adapter:
 
 ```bash
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
@@ -1441,7 +1435,6 @@ The following Qwen3.6-27B command uses static FP8 KV-cache scales:
 ```bash
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 
 vllm serve /llm/models/Qwen3.6-27B \
   --served-model-name Qwen3.6-27B \
@@ -1541,7 +1534,6 @@ For instance, start the meta-models/Muse-Glimmer-30B model with:
 ```bash
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 
 # Use these two variables and add the DFlash config to improve performance.
 #export DISABLE_MUSE_GLIMMER_MLP_ESIMD=1
@@ -1657,17 +1649,6 @@ To avoid this error, make sure to run your commands from the `/llm` root directo
 cd /llm
 python3 -m vllm.entrypoints.openai.api_server
 ```
-
-### 4.2 Out-of-memory while online quantization
-
-When the model size is very large, running FP8 online quantization may cause out-of-memory errors.
-
-To avoid this issue, set the following environment variable before starting the service:
-
-```bash
-export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
-```
-
 
 ## 5. Performance tuning
 
