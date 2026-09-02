@@ -1555,9 +1555,9 @@ export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
   --dtype float16 \
   --mamba-ssm-cache-dtype float16 \
   --block-size 64 \
-  --max-model-len 8192 \
-  --max-num-batched-tokens 2048 \
-  --max-num-seqs 2 \
+  --max-model-len 131072 \
+  --max-num-batched-tokens 8192 \
+  --max-num-seqs 8 \
   --gpu-memory-util 0.85 \
   --tensor-parallel-size 2 \
   --attention-backend FLASH_ATTN \
