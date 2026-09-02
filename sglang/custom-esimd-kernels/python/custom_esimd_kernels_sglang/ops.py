@@ -202,6 +202,24 @@ def esimd_gemv_q4_k(
     return _ops.esimd_gemv_q4_k(input, weight, weight_scale, weight_min, output)
 
 
+def esimd_gemv_q4_k_m(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    weight_min: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """M-tiled GGUF q4_K GEMV (small M: MTP verify, or plain decode at batch>1).
+
+    Same layout as esimd_gemv_q4_k, but reads the q4_K weights ONCE per row-tile
+    and multiplies against all M activation rows — vs the generic M>1 path that
+    dequantizes the whole matrix to a 4x-bigger fp16 table on every call (the
+    dequant cost is independent of M, so it dominates already at M=2).
+
+    input [M,K] fp16 (row-major); output [M,N] fp16.
+    N=weight.size(0), K=weight.size(1)*2. K not a multiple of 512 falls back to
+    M separate M=1 GEMVs (still no fp16 dequant round-trip).
+    """
+    return _ops.esimd_gemv_q4_k_m(input, weight, weight_scale, weight_min, output)
+
+
 def esimd_gemv_q5_k(
     input: torch.Tensor, ql: torch.Tensor, qh: torch.Tensor,
     weight_scale: torch.Tensor, weight_min: torch.Tensor, output: torch.Tensor,
@@ -216,6 +234,22 @@ def esimd_gemv_q5_k(
     input [1,K] fp16; output [1,N] fp16. N=ql.size(0), K=ql.size(1)*2 (mult 512).
     """
     return _ops.esimd_gemv_q5_k(input, ql, qh, weight_scale, weight_min, output)
+
+
+def esimd_gemv_q5_k_m(
+    input: torch.Tensor, ql: torch.Tensor, qh: torch.Tensor,
+    weight_scale: torch.Tensor, weight_min: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """M-tiled GGUF q5_K GEMV (small M: MTP verify, or plain decode at batch>1).
+
+    Same PACKED layout as esimd_gemv_q5_k, but reads the q5_K weights ONCE per
+    row-tile and multiplies against all M activation rows — vs the generic M>1
+    path that dequantizes to a 3.2x-bigger fp16 table on every call.
+
+    input [M,K] fp16 (row-major); output [M,N] fp16. N=ql.size(0),
+    K=ql.size(1)*2 (multiple of 512).
+    """
+    return _ops.esimd_gemv_q5_k_m(input, ql, qh, weight_scale, weight_min, output)
 
 
 def esimd_gemv_q6_k(
@@ -249,24 +283,25 @@ def esimd_gemv_q6_k_m(
 
 def esimd_moe_up_q4k(
     x, gate_ql, gate_sc, gate_mn, up_ql, up_sc, up_mn, sel, inter,
-    n_tokens, hidden, intermediate, top_k,
+    n_tokens, hidden, intermediate, top_k, act: int = 0,
 ):
     """Fused GGUF k-quant MoE up/gate stage (Q4_K gate + Q4_K up).
 
     One launch over all routed (token,expert) pairs: dequant gate+up (Q4_K
-    interleaved nibble, per-32 scale+min), silu(gate)*up -> inter.
+    interleaved nibble, per-32 scale+min), act(gate)*up -> inter.
+    act: 0 = SiLU (default), 1 = GELU tanh ("gelu_pytorch_tanh", gemma-4).
     gate_ql/up_ql [E,inter,hidden/2] u8; gate_sc/mn,up_sc/mn [E,inter,hidden/32]
     fp16; sel [n_routed] int32; inter [n_routed, intermediate] fp16 (out).
     """
     return _ops.esimd_moe_up_q4k(
         x, gate_ql, gate_sc, gate_mn, up_ql, up_sc, up_mn, sel, inter,
-        n_tokens, hidden, intermediate, top_k,
+        n_tokens, hidden, intermediate, top_k, act,
     )
 
 
 def esimd_moe_down_q5k(
     inter, ql, qh, sc, mn, sel, topk_w, out_partial,
-    n_tokens, hidden, intermediate, top_k,
+    n_tokens, hidden, intermediate, top_k, add_min: bool = False,
 ):
     """Fused GGUF Q5_K MoE down stage, PACKED (zero extra memory).
 
@@ -274,9 +309,28 @@ def esimd_moe_down_q5k(
     (ql nibble + pre-shuffled 1-bit qh + per-32 scale+min) . dot(inter) * topk_w
     -> per-route partial out_partial [n_routed, hidden] (host sums top_k).
     ql [E,hidden,inter/2] u8; qh [E,hidden,inter/8] u8; sc/mn [E,hidden,inter/32].
+
+    add_min selects the offset sign: False = Q5_K (w = v*scale - min), True =
+    legacy Q5_1 (w = v*d + m), which the host repacks into this same layout.
     """
     return _ops.esimd_moe_down_q5k(
         inter, ql, qh, sc, mn, sel, topk_w, out_partial,
+        n_tokens, hidden, intermediate, top_k, add_min,
+    )
+
+
+def esimd_moe_down_q8(
+    inter, qs, sc, sel, topk_w, out_partial,
+    n_tokens, hidden, intermediate, top_k,
+):
+    """Fused GGUF Q8_0 MoE down stage (symmetric: w = scale * qs).
+
+    Same contract as esimd_moe_down_q5k but for the legacy Q8_0 down tensors a
+    Q4_K_M mix can leave behind. qs [E,hidden,inter] int8; sc [E,hidden,inter/32]
+    fp16; out_partial [n_routed, hidden] fp16 (host sums over top_k).
+    """
+    return _ops.esimd_moe_down_q8(
+        inter, qs, sc, sel, topk_w, out_partial,
         n_tokens, hidden, intermediate, top_k,
     )
 
@@ -365,7 +419,8 @@ def esimd_qkv_split_norm_rope(
     rotary_dim:    number of dimensions to apply RoPE.
     cos_sin_cache: [max_pos, rotary_dim] fp16 — from rotary_emb.cos_sin_cache.
                    Layout: [cos(rotary_dim/2), sin(rotary_dim/2)] per row.
-    normalize_v:   apply Gemma4's weight-free RMSNorm to V.
+    normalize_v:   apply a weight-free RMSNorm to the V branch (gemma-4);
+                   False keeps the Qwen3 plain-copy behaviour.
     headDim=256 only.
     """
     return _ops.esimd_qkv_split_norm_rope(

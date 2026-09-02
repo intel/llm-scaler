@@ -5,6 +5,7 @@
 // 2-phase split-K decode attention for sglang's flat-NHD KV layout.
 // Registers `sglang_decode_attn` as a torch op.
 
+#include <cstdlib>
 #include <torch/extension.h>
 #include <c10/xpu/XPUStream.h>
 #include <sycl/sycl.hpp>
@@ -73,6 +74,7 @@ void launch_sglang_decode_attn(
     uint32_t gqa_ratio,
     uint32_t n_splits,
     float    sm_scale,
+    uint32_t split_tile,
     sycl::queue& queue) {
 
     // Phase 1: (batches, Hq, n_splits) work-items, one slot of partial stats each.
@@ -91,7 +93,7 @@ void launch_sglang_decode_attn(
                     q_ptr, k_buf, v_buf, kv_indptr, kv_indices,
                     m_part, l_part, o_part,
                     batch, q_head, split,
-                    Hq, Hkv, gqa_ratio, n_splits, sm_scale);
+                    Hq, Hkv, gqa_ratio, n_splits, sm_scale, split_tile);
             });
     });
 
@@ -146,7 +148,18 @@ void sglang_decode_attn(
 
     // Compute n_splits. Prefer the caller-provided max_seq_len so we never
     // hit a device->host sync (which would break XPUGraph capture).
-    constexpr uint32_t SPLIT_TILE = 64;
+    // Adaptive tile: keep n_splits <= cap by growing tokens-per-work-item.
+    // Env knobs are for benchmarking only; defaults reproduce legacy behaviour
+    // for any sequence that fits in cap * 64 tokens.
+    static const uint32_t kCap = [] {
+        const char* e = std::getenv("SGL_XPU_PA_MAX_SPLITS");
+        uint32_t v = e ? (uint32_t)std::atoi(e) : 256u;
+        return (v == 0) ? 256u : v;
+    }();
+    static const uint32_t kForceTile = [] {
+        const char* e = std::getenv("SGL_XPU_PA_TILE");
+        return e ? (uint32_t)std::atoi(e) : 0u;
+    }();
     uint32_t max_len;
     if (max_seq_len > 0) {
         max_len = (uint32_t)max_seq_len;
@@ -159,9 +172,15 @@ void sglang_decode_attn(
             if (L > max_len) max_len = L;
         }
     }
-    uint32_t n_splits = (max_len + SPLIT_TILE - 1) / SPLIT_TILE;
+    uint32_t split_tile = 64;
+    if (kForceTile) {
+        split_tile = kForceTile;
+    } else {
+        while ((max_len + split_tile - 1) / split_tile > kCap) split_tile <<= 1;
+    }
+    uint32_t n_splits = (max_len + split_tile - 1) / split_tile;
     if (n_splits == 0) n_splits = 1;
-    TORCH_CHECK(n_splits <= 256, "n_splits exceeds MAX_SPLITS (=256)");
+    TORCH_CHECK(n_splits <= kCap, "n_splits ", n_splits, " exceeds cap ", kCap);
 
     // Phase-1 scratch. Reuse caller-provided buffer when available.
     auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(q.device());
@@ -203,14 +222,14 @@ void sglang_decode_attn(
             indptr_ptr, idx_ptr, out_ptr,
             m_p, l_p, o_p,
             batches, Hq, Hkv, gqa_ratio, n_splits,
-            (float)sm_scale_d, queue);
+            (float)sm_scale_d, split_tile, queue);
     } else if (k_buffer.scalar_type() == torch::kBFloat16) {
         launch_sglang_decode_attn<bf16>(
             q_ptr, (const bf16*)k_buffer.data_ptr(), (const bf16*)v_buffer.data_ptr(),
             indptr_ptr, idx_ptr, out_ptr,
             m_p, l_p, o_p,
             batches, Hq, Hkv, gqa_ratio, n_splits,
-            (float)sm_scale_d, queue);
+            (float)sm_scale_d, split_tile, queue);
     } else {
         TORCH_CHECK(false, "k_buffer dtype must be fp16 or bf16, got ",
                     k_buffer.scalar_type());

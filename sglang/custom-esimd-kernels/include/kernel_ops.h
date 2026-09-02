@@ -243,6 +243,31 @@ void esimd_resadd_norm_gemv_q8_ba(
     at::Tensor w0, at::Tensor s0, at::Tensor o0,
     at::Tensor w1, at::Tensor o1);
 
+// Fused (resadd + GemmaRMSNorm) + q4_K / q6_K / fp16 GEMVs, single launch.
+void esimd_resadd_norm_gemv_kq(
+    at::Tensor h, at::Tensor residual, at::Tensor nw, double eps,
+    at::Tensor nr, at::Tensor xn,
+    at::Tensor q4_w, at::Tensor q4_sc, at::Tensor q4_mn,
+    at::Tensor o4, int64_t of4,
+    at::Tensor q6_ql, at::Tensor q6_qh, at::Tensor q6_sc,
+    at::Tensor o6, int64_t of6,
+    at::Tensor w_ba, at::Tensor o_ba);
+
+void esimd_resadd_norm_gemv_q4k_silu(
+    at::Tensor h, at::Tensor residual, at::Tensor nw, double eps,
+    at::Tensor nr, at::Tensor q4_w, at::Tensor q4_sc, at::Tensor q4_mn,
+    at::Tensor y);
+
+void esimd_norm_add_norm_gemv_q4k_gelu(
+    at::Tensor h, at::Tensor residual, at::Tensor nr,
+    at::Tensor w1, at::Tensor w2, double eps1, double eps2,
+    at::Tensor q4_w, at::Tensor q4_sc, at::Tensor q4_mn, at::Tensor y);
+
+void esimd_norm_gemv_q5k(
+    at::Tensor x, at::Tensor z, at::Tensor nw,
+    at::Tensor ql, at::Tensor qh, at::Tensor sc, at::Tensor mn,
+    at::Tensor y, int64_t V, double eps);
+
 at::Tensor esimd_gemv_q8_0_m(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output);
@@ -254,9 +279,21 @@ at::Tensor esimd_gemv_q4_k(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor weight_min, at::Tensor output);
 
+// M-tiled q4_K GEMV (small M: MTP verify, or decode at batch>1).
+// input [M,K], output [M,N]. Reads the q4_K weights once per row-tile.
+at::Tensor esimd_gemv_q4_k_m(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor weight_min, at::Tensor output);
+
 // GGUF q5_K GEMV: PACKED (ql nibble [N,K/2] + pre-shuffled 1-bit qh [N,K/8]),
 // asymmetric scale+min [N,K/32]. dequant v5=nibble|(qh<<4); w=scale*v5-min.
 at::Tensor esimd_gemv_q5_k(
+    at::Tensor input, at::Tensor ql, at::Tensor qh,
+    at::Tensor weight_scale, at::Tensor weight_min, at::Tensor output);
+
+// M-tiled q5_K GEMV (small M: MTP verify, or decode at batch>1).
+// input [M,K], output [M,N]. Reads the q5_K weights once per row-tile.
+at::Tensor esimd_gemv_q5_k_m(
     at::Tensor input, at::Tensor ql, at::Tensor qh,
     at::Tensor weight_scale, at::Tensor weight_min, at::Tensor output);
 
@@ -276,11 +313,17 @@ at::Tensor esimd_moe_up_q4k(
     at::Tensor x, at::Tensor gate_ql, at::Tensor gate_sc, at::Tensor gate_mn,
     at::Tensor up_ql, at::Tensor up_sc, at::Tensor up_mn,
     at::Tensor sel, at::Tensor inter,
-    int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k);
+    int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k,
+    int64_t act);
 
 // Fused GGUF k-quant MoE down, PACKED -> per-route weighted partial.
 at::Tensor esimd_moe_down_q5k(
     at::Tensor inter, at::Tensor ql, at::Tensor qh, at::Tensor sc, at::Tensor mn,
+    at::Tensor sel, at::Tensor topk_w, at::Tensor out_partial,
+    int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k,
+    bool add_min);
+at::Tensor esimd_moe_down_q8(
+    at::Tensor inter, at::Tensor qs, at::Tensor sc,
     at::Tensor sel, at::Tensor topk_w, at::Tensor out_partial,
     int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k);
 at::Tensor esimd_moe_down_q6k(

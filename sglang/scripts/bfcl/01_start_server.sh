@@ -21,6 +21,11 @@
 # intel_xpu XE FMHA decode kernel rejects; extra_buffer snapshots intermediate
 # state every track_interval -> page-granular 64 reuse). The track-buffer fix
 # makes that snapshot actually correct on XPU (else multi-turn restores 0 state).
+#
+# NOTE: this is a TP=1 single-tile config with XPU graph on and no MoE fusion —
+# it is the config this kit was validated against, NOT a performance config.
+# For throughput use ../start_qwen3_6_service.sh with a .gguf MODEL_PATH
+# (TP=2, ESIMD MoE fusion) and run 04_run.sh with SKIP_START=1.
 set -e
 
 GGUF="${GGUF:-/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}"

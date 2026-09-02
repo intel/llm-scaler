@@ -218,12 +218,13 @@ ESIMD_INLINE void qkv_split_norm_rope_kernel(
     else if (whereAmI == QKV_LOCATION_V) {
         outputOffset = kvHead * headDim * tokIdx + outHead * headDim;
         if (normalizeV) {
+            // Weight-free RMSNorm (gemma-4 applies a scale-less V norm; Qwen3
+            // passes normalizeV=false and keeps the plain copy).
             simd<float, 256> vTemp = activation;
-            simd<float, 256> vOutputSq = vTemp * vTemp;
-            float vacc =
-                sycl::ext::intel::esimd::detail::sum<float, float, 256>(vOutputSq) /
-                static_cast<float>(headDim);
-            activation = vTemp * __ESIMD_NS::rsqrt(vacc + eps);
+            simd<float, 256> vSq = vTemp * vTemp;
+            float vAcc = sycl::ext::intel::esimd::detail::sum<float, float, 256>(vSq) / (float)headDim;
+            vTemp = vTemp * __ESIMD_NS::rsqrt(vAcc + eps);
+            activation = vTemp;
         }
         block_store<fp16, 256>((fp16*)vState + outputOffset, activation);
     }

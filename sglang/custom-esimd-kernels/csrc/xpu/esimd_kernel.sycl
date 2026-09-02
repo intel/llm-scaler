@@ -246,6 +246,30 @@ at::Tensor esimd_gemv_q4_k(
     return output;
 }
 
+// M-tiled q4_K GEMV (small M: MTP verify, or plain decode at batch>1).
+// input [M,K], output [M,N]. Reads the q4_K weights ONCE per row-tile instead
+// of dequantizing the whole matrix to a 4x-bigger fp16 table per call.
+at::Tensor esimd_gemv_q4_k_m(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor weight_min, at::Tensor output) {
+    int64_t M = input.size(0);
+    int64_t N = weight.size(0);
+    int64_t K = weight.size(1) * 2;
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_w, weight);
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_mn, weight_min);
+    EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    q4_k_gemv_M_host(reinterpret_cast<const fp16*>(p_in), p_w,
+                     reinterpret_cast<const fp16*>(p_sc),
+                     reinterpret_cast<const fp16*>(p_mn),
+                     reinterpret_cast<fp16*>(p_out),
+                     (uint32_t)M, (uint32_t)N, (uint32_t)K,
+                     // Row stride, not N: `output` may be a column slice of a
+                     // wider buffer (mixed-kind group path at M>1).
+                     (uint32_t)output.stride(0), dpcpp_queue);
+    return output;
+}
+
 // ---- GGUF q5_K GEMV: PACKED (ql nibble + pre-shuffled 1-bit qh), asym ----
 
 #include "esimd_kernels/q5_k_GEMV.h"
@@ -268,6 +292,32 @@ at::Tensor esimd_gemv_q5_k(
                    reinterpret_cast<const fp16*>(p_mn),
                    reinterpret_cast<fp16*>(p_out),
                    (uint32_t)N, (uint32_t)K, dpcpp_queue);
+    return output;
+}
+
+// M-tiled q5_K GEMV (small M: MTP verify, or plain decode at batch>1).
+// input [M,K], output [M,N]. Reads the q5_K weights ONCE per row-tile instead
+// of dequantizing the whole matrix to a 3.2x-bigger fp16 table per call.
+at::Tensor esimd_gemv_q5_k_m(
+    at::Tensor input, at::Tensor ql, at::Tensor qh,
+    at::Tensor weight_scale, at::Tensor weight_min, at::Tensor output) {
+    int64_t M = input.size(0);
+    int64_t N = ql.size(0);
+    int64_t K = ql.size(1) * 2;
+    EXTRACT_PTR(p_in, input);
+    auto p_ql = reinterpret_cast<uint8_t*>(ql.data_ptr());
+    auto p_qh = reinterpret_cast<uint8_t*>(qh.data_ptr());
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_mn, weight_min);
+    EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    q5_k_gemv_M_host(reinterpret_cast<const fp16*>(p_in), p_ql, p_qh,
+                     reinterpret_cast<const fp16*>(p_sc),
+                     reinterpret_cast<const fp16*>(p_mn),
+                     reinterpret_cast<fp16*>(p_out),
+                     (uint32_t)M, (uint32_t)N, (uint32_t)K,
+                     // Row stride, not N: `output` may be a column slice of a
+                     // wider buffer (mixed-kind group path at M>1).
+                     (uint32_t)output.stride(0), dpcpp_queue);
     return output;
 }
 
@@ -311,12 +361,16 @@ at::Tensor esimd_gemv_q6_k_m(
     q6_k_gemv_M_host(reinterpret_cast<const fp16*>(p_in), p_ql, p_qh,
                      reinterpret_cast<const fp16*>(p_sc),
                      reinterpret_cast<fp16*>(p_out),
-                     (uint32_t)M, (uint32_t)N, (uint32_t)K, dpcpp_queue);
+                     (uint32_t)M, (uint32_t)N, (uint32_t)K,
+                     // Row stride, not N: `output` may be a column slice of a
+                     // wider buffer (mixed-kind group path at M>1).
+                     (uint32_t)output.stride(0), dpcpp_queue);
     return output;
 }
 
 #include "esimd_kernels/moe_kquant_GEMV.h"
 #include "esimd_kernels/moe_shared_q8_GEMV.h"
+#include "esimd_kernels/moe_down_fin_fused.h"
 #include "esimd_kernels/moe_up_fused.h"
 #include "esimd_kernels/moe_norm_router.h"
 
@@ -327,7 +381,8 @@ at::Tensor esimd_moe_up_q4k(
     at::Tensor x, at::Tensor gate_ql, at::Tensor gate_sc, at::Tensor gate_mn,
     at::Tensor up_ql, at::Tensor up_sc, at::Tensor up_mn,
     at::Tensor sel, at::Tensor inter,
-    int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k) {
+    int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k,
+    int64_t act) {
     auto p_x = reinterpret_cast<const fp16*>(x.data_ptr());
     auto p_gq = reinterpret_cast<const uint8_t*>(gate_ql.data_ptr());
     auto p_gs = reinterpret_cast<const fp16*>(gate_sc.data_ptr());
@@ -340,7 +395,7 @@ at::Tensor esimd_moe_up_q4k(
     auto& dpcpp_queue = get_device_queue(x);
     moe_up_q4k_host(p_x, p_gq, p_gs, p_gm, p_uq, p_us, p_um, p_sel, p_int,
                     (int)n_tokens, (int)hidden, (int)intermediate, (int)top_k,
-                    dpcpp_queue);
+                    dpcpp_queue, (int)act);
     return inter;
 }
 
@@ -350,7 +405,8 @@ at::Tensor esimd_moe_up_q4k(
 at::Tensor esimd_moe_down_q5k(
     at::Tensor inter, at::Tensor ql, at::Tensor qh, at::Tensor sc, at::Tensor mn,
     at::Tensor sel, at::Tensor topk_w, at::Tensor out_partial,
-    int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k) {
+    int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k,
+    bool add_min) {
     auto p_int = reinterpret_cast<const fp16*>(inter.data_ptr());
     auto p_ql = reinterpret_cast<const uint8_t*>(ql.data_ptr());
     auto p_qh = reinterpret_cast<const uint8_t*>(qh.data_ptr());
@@ -362,7 +418,25 @@ at::Tensor esimd_moe_down_q5k(
     auto& dpcpp_queue = get_device_queue(inter);
     moe_down_q5k_host(p_int, p_ql, p_qh, p_sc, p_mn, p_sel, p_tw, p_out,
                       (int)n_tokens, (int)hidden, (int)intermediate, (int)top_k,
-                      dpcpp_queue);
+                      dpcpp_queue, add_min);
+    return out_partial;
+}
+
+// Fused GGUF Q8_0 MoE down stage (symmetric, w = scale * qs).
+at::Tensor esimd_moe_down_q8(
+    at::Tensor inter, at::Tensor qs, at::Tensor sc,
+    at::Tensor sel, at::Tensor topk_w, at::Tensor out_partial,
+    int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k) {
+    auto p_int = reinterpret_cast<const fp16*>(inter.data_ptr());
+    auto p_qs = reinterpret_cast<const int8_t*>(qs.data_ptr());
+    auto p_sc = reinterpret_cast<const fp16*>(sc.data_ptr());
+    auto p_sel = reinterpret_cast<const int*>(sel.data_ptr());
+    auto p_tw = reinterpret_cast<const fp16*>(topk_w.data_ptr());
+    auto p_out = reinterpret_cast<fp16*>(out_partial.data_ptr());
+    auto& dpcpp_queue = get_device_queue(inter);
+    moe_down_q8_host(p_int, p_qs, p_sc, p_sel, p_tw, p_out,
+                     (int)n_tokens, (int)hidden, (int)intermediate, (int)top_k,
+                     dpcpp_queue);
     return out_partial;
 }
 
@@ -527,14 +601,24 @@ static at::Tensor gguf_moe_full_body(
         moe_shared_up_q8_host(p_x, p_guq, p_gus, p_wg, p_ish, p_g,
                               (int)M, (int)hidden, (int)inter_s, q);
     }
-    if (down_is_q6)
-        moe_down_q6k_host(p_ir, p_dql, p_dqh, p_dsc, p_sel, p_tw, p_op,
-                          (int)M, (int)hidden, (int)intermediate, (int)top_k, q);
-    else
-        moe_down_q5k_host(p_ir, p_dql, p_dqh, p_dsc, p_dmn, p_sel, p_tw, p_op,
-                          (int)M, (int)hidden, (int)intermediate, (int)top_k, q);
-    moe_finalize_gguf_host(p_op, p_ish, p_ddq, p_dds, p_g, p_o,
-                           (int)M, (int)hidden, (int)inter_s, (int)top_k, q);
+    // One enqueue for routed-down + finalize when the shape allows it (see
+    // moe_down_fin_fused.h); otherwise the original pair of launches.
+    const bool df_fused =
+        !down_is_q6 &&
+        moe_down_fin_q5k_host(p_ir, p_dql, p_dqh, p_dsc, p_dmn, p_sel, p_tw,
+                              p_ish, p_ddq, p_dds, p_g, p_o,
+                              (int)M, (int)hidden, (int)intermediate,
+                              (int)top_k, (int)inter_s, q);
+    if (!df_fused) {
+        if (down_is_q6)
+            moe_down_q6k_host(p_ir, p_dql, p_dqh, p_dsc, p_sel, p_tw, p_op,
+                              (int)M, (int)hidden, (int)intermediate, (int)top_k, q);
+        else
+            moe_down_q5k_host(p_ir, p_dql, p_dqh, p_dsc, p_dmn, p_sel, p_tw, p_op,
+                              (int)M, (int)hidden, (int)intermediate, (int)top_k, q);
+        moe_finalize_gguf_host(p_op, p_ish, p_ddq, p_dds, p_g, p_o,
+                               (int)M, (int)hidden, (int)inter_s, (int)top_k, q);
+    }
     return out;
 }
 
@@ -673,6 +757,202 @@ void esimd_resadd_norm_gemv_q8_ba(
     (void)p_xn;
 }
 
+#include "esimd_kernels/resadd_norm_gemv_kq.h"
+#include "esimd_kernels/resadd_norm_gemv_kq_mt.h"
+#include "esimd_kernels/resadd_norm_gemv_q4k_silu.h"
+#include "esimd_kernels/resadd_norm_gemv_q4k_silu_mt.h"
+#include "esimd_kernels/norm_gemv_q5k.h"
+#include "esimd_kernels/norm_add_norm_gemv_q4k_gelu.h"
+
+// Fused (residual-add + GemmaRMSNorm) + up to three GEMVs (q4_K run, q6_K run,
+// fp16 dense) in ONE launch, for the GGUF decode path.
+//
+// A Q4_K_M file mixes quant kinds inside a single fused linear (qkv is
+// [q4_K, q4_K, q6_K]; GDN in_proj_qkvz is [q6_K, q6_K, q6_K, q4_K]), so after
+// the adjacent-same-kind merge each site has at most one q4_K run and one q6_K
+// run. `o4` / `o6` are plain pointers, so the caller passes column slices of a
+// single output buffer and the run order is whatever the shard order was.
+//
+// Empty tensors mean "this matrix is absent". `w_ba` covers the GDN in_proj_ba
+// fp16 matrix, which is otherwise a separate aten::mm.
+//
+// Returns false (throws) only on unsupported hidden size; the python caller
+// gates on shape before calling.
+void esimd_resadd_norm_gemv_kq(
+    at::Tensor h, at::Tensor residual, at::Tensor nw, double eps,
+    at::Tensor nr, at::Tensor xn,
+    at::Tensor q4_w, at::Tensor q4_sc, at::Tensor q4_mn,
+    at::Tensor o4, int64_t of4,
+    at::Tensor q6_ql, at::Tensor q6_qh, at::Tensor q6_sc,
+    at::Tensor o6, int64_t of6,
+    at::Tensor w_ba, at::Tensor o_ba) {
+    const int M = (int)h.size(0);
+    const int K = (int)h.size(1);
+    const int N4 = q4_w.numel() > 0 ? (int)q4_w.size(0) : 0;
+    const int N6 = q6_ql.numel() > 0 ? (int)q6_ql.size(0) : 0;
+    const int NF = w_ba.numel() > 0 ? (int)w_ba.size(0) : 0;
+
+    EXTRACT_PTR(p_h, h); EXTRACT_PTR(p_res, residual); EXTRACT_PTR(p_nw, nw);
+    EXTRACT_PTR(p_nr, nr);
+    auto& dpcpp_queue = get_device_queue(h);
+
+    // At M > 1 (speculative-decoding verify) prefer the M-tiled kernel: it
+    // reads each weight tile once for all M tokens instead of once per token.
+    // It declines shapes it was not instantiated for, in which case the
+    // per-token kernel below still runs.
+    bool ok = false;
+    if (M > 1)
+        ok = resadd_norm_gemv_kq_mt_host(
+            reinterpret_cast<const fp16*>(p_h),
+            reinterpret_cast<const fp16*>(p_res),
+            reinterpret_cast<fp16*>(p_nr),
+            reinterpret_cast<const fp16*>(p_nw),
+            xn.numel() > 0 ? reinterpret_cast<fp16*>(xn.data_ptr()) : nullptr,
+            N4 ? reinterpret_cast<const uint8_t*>(q4_w.data_ptr()) : nullptr,
+            N4 ? reinterpret_cast<const fp16*>(q4_sc.data_ptr()) : nullptr,
+            N4 ? reinterpret_cast<const fp16*>(q4_mn.data_ptr()) : nullptr,
+            N4 ? reinterpret_cast<fp16*>(o4.data_ptr()) : nullptr,
+            N4 ? (int)o4.size(1) : 0, (int)of4,
+            N6 ? reinterpret_cast<const uint8_t*>(q6_ql.data_ptr()) : nullptr,
+            N6 ? reinterpret_cast<const uint8_t*>(q6_qh.data_ptr()) : nullptr,
+            N6 ? reinterpret_cast<const fp16*>(q6_sc.data_ptr()) : nullptr,
+            N6 ? reinterpret_cast<fp16*>(o6.data_ptr()) : nullptr,
+            N6 ? (int)o6.size(1) : 0, (int)of6,
+            NF ? reinterpret_cast<const fp16*>(w_ba.data_ptr()) : nullptr,
+            NF ? reinterpret_cast<fp16*>(o_ba.data_ptr()) : nullptr,
+            NF ? (int)o_ba.size(1) : 0, 0,
+            (float)eps, M, K, N4, N6, NF, dpcpp_queue);
+
+    if (!ok) ok = resadd_norm_gemv_kq_host(
+        reinterpret_cast<const fp16*>(p_h),
+        reinterpret_cast<const fp16*>(p_res),
+        reinterpret_cast<fp16*>(p_nr),
+        reinterpret_cast<const fp16*>(p_nw),
+        xn.numel() > 0 ? reinterpret_cast<fp16*>(xn.data_ptr()) : nullptr,
+        N4 ? reinterpret_cast<const uint8_t*>(q4_w.data_ptr()) : nullptr,
+        N4 ? reinterpret_cast<const fp16*>(q4_sc.data_ptr()) : nullptr,
+        N4 ? reinterpret_cast<const fp16*>(q4_mn.data_ptr()) : nullptr,
+        N4 ? reinterpret_cast<fp16*>(o4.data_ptr()) : nullptr,
+        N4 ? (int)o4.size(1) : 0, (int)of4,
+        N6 ? reinterpret_cast<const uint8_t*>(q6_ql.data_ptr()) : nullptr,
+        N6 ? reinterpret_cast<const uint8_t*>(q6_qh.data_ptr()) : nullptr,
+        N6 ? reinterpret_cast<const fp16*>(q6_sc.data_ptr()) : nullptr,
+        N6 ? reinterpret_cast<fp16*>(o6.data_ptr()) : nullptr,
+        N6 ? (int)o6.size(1) : 0, (int)of6,
+        NF ? reinterpret_cast<const fp16*>(w_ba.data_ptr()) : nullptr,
+        NF ? reinterpret_cast<fp16*>(o_ba.data_ptr()) : nullptr,
+        NF ? (int)o_ba.size(1) : 0, 0,
+        (float)eps, M, K, N4, N6, NF, dpcpp_queue);
+    TORCH_CHECK(ok, "esimd_resadd_norm_gemv_kq: unsupported hidden ", K);
+}
+
+// Fused residual-add + GemmaRMSNorm + q4_K gate_up GEMV + SiluAndMul for the
+// GGUF dense MLP. `q4_w` is the merged [2I, K] gate_up matrix (gate rows first)
+// and `y` is the [M, I] activated output that feeds down_proj.
+void esimd_resadd_norm_gemv_q4k_silu(
+    at::Tensor h, at::Tensor residual, at::Tensor nw, double eps,
+    at::Tensor nr, at::Tensor q4_w, at::Tensor q4_sc, at::Tensor q4_mn,
+    at::Tensor y) {
+    const int M = (int)h.size(0);
+    const int K = (int)h.size(1);
+    const int I = (int)y.size(1);
+    TORCH_CHECK((int)q4_w.size(0) == 2 * I,
+                "esimd_resadd_norm_gemv_q4k_silu: gate_up rows ", q4_w.size(0),
+                " != 2*I=", 2 * I);
+
+    EXTRACT_PTR(p_h, h); EXTRACT_PTR(p_res, residual); EXTRACT_PTR(p_nw, nw);
+    EXTRACT_PTR(p_nr, nr); EXTRACT_PTR(p_y, y);
+    auto& dpcpp_queue = get_device_queue(h);
+
+    bool ok = false;
+    if (M > 1)
+        ok = resadd_norm_gemv_q4k_silu_mt_host(
+            reinterpret_cast<const fp16*>(p_h),
+            reinterpret_cast<const fp16*>(p_res),
+            reinterpret_cast<fp16*>(p_nr),
+            reinterpret_cast<const fp16*>(p_nw),
+            reinterpret_cast<const uint8_t*>(q4_w.data_ptr()),
+            reinterpret_cast<const fp16*>(q4_sc.data_ptr()),
+            reinterpret_cast<const fp16*>(q4_mn.data_ptr()),
+            reinterpret_cast<fp16*>(p_y),
+            (float)eps, M, K, I, dpcpp_queue);
+
+    if (!ok) ok = resadd_norm_gemv_q4k_silu_host(
+        reinterpret_cast<const fp16*>(p_h),
+        reinterpret_cast<const fp16*>(p_res),
+        reinterpret_cast<fp16*>(p_nr),
+        reinterpret_cast<const fp16*>(p_nw),
+        reinterpret_cast<const uint8_t*>(q4_w.data_ptr()),
+        reinterpret_cast<const fp16*>(q4_sc.data_ptr()),
+        reinterpret_cast<const fp16*>(q4_mn.data_ptr()),
+        reinterpret_cast<fp16*>(p_y),
+        (float)eps, M, K, I, dpcpp_queue);
+    TORCH_CHECK(ok, "esimd_resadd_norm_gemv_q4k_silu: unsupported hidden ", K);
+}
+
+// Fused RMSNorm + residual-add + RMSNorm + q4_K gate_up GEMV + GeluAndMul for
+// the gemma-4 dense-MLP GGUF decode path (replaces esimd_norm_add_norm +
+// esimd_gemv_q4_k + gelu_tanh_and_mul). `nr` may alias `residual`.
+void esimd_norm_add_norm_gemv_q4k_gelu(
+    at::Tensor h, at::Tensor residual, at::Tensor nr,
+    at::Tensor w1, at::Tensor w2, double eps1, double eps2,
+    at::Tensor q4_w, at::Tensor q4_sc, at::Tensor q4_mn, at::Tensor y) {
+    const int M = (int)h.size(0);
+    const int K = (int)h.size(1);
+    const int I = (int)y.size(1);
+    TORCH_CHECK((int)q4_w.size(0) == 2 * I,
+                "esimd_norm_add_norm_gemv_q4k_gelu: gate_up rows ", q4_w.size(0),
+                " != 2*I=", 2 * I);
+
+    EXTRACT_PTR(p_h, h); EXTRACT_PTR(p_res, residual); EXTRACT_PTR(p_nr, nr);
+    EXTRACT_PTR(p_w1, w1); EXTRACT_PTR(p_w2, w2); EXTRACT_PTR(p_y, y);
+    auto& dpcpp_queue = get_device_queue(h);
+
+    const bool ok = norm_add_norm_gemv_q4k_gelu_host(
+        reinterpret_cast<const fp16*>(p_h),
+        reinterpret_cast<const fp16*>(p_res),
+        reinterpret_cast<fp16*>(p_nr),
+        reinterpret_cast<const fp16*>(p_w1),
+        reinterpret_cast<const fp16*>(p_w2),
+        reinterpret_cast<const uint8_t*>(q4_w.data_ptr()),
+        reinterpret_cast<const fp16*>(q4_sc.data_ptr()),
+        reinterpret_cast<const fp16*>(q4_mn.data_ptr()),
+        reinterpret_cast<fp16*>(p_y),
+        (float)eps1, (float)eps2, M, K, I, dpcpp_queue);
+    TORCH_CHECK(ok, "esimd_norm_add_norm_gemv_q4k_gelu: unsupported hidden ", K,
+                " (or nr aliases residual, which the kernel cannot do in place)");
+}
+
+// Fused RMSNormGated + q5_K GEMV for the GGUF GDN out_proj. `x`/`z` are the
+// [M, HV*V] core-attn output and gate; `y` is [M, N].
+void esimd_norm_gemv_q5k(
+    at::Tensor x, at::Tensor z, at::Tensor nw,
+    at::Tensor ql, at::Tensor qh, at::Tensor sc, at::Tensor mn,
+    at::Tensor y, int64_t V, double eps) {
+    const int M = (int)x.size(0);
+    const int K = (int)x.size(1);
+    const int N = (int)y.size(1);
+    TORCH_CHECK((int)ql.size(0) == N && (int)ql.size(1) * 2 == K,
+                "esimd_norm_gemv_q5k: weight ", ql.sizes(), " vs K=", K,
+                " N=", N);
+
+    EXTRACT_PTR(p_x, x); EXTRACT_PTR(p_z, z); EXTRACT_PTR(p_nw, nw);
+    EXTRACT_PTR(p_y, y);
+    auto& dpcpp_queue = get_device_queue(x);
+
+    const bool ok = norm_gemv_q5k_host(
+        reinterpret_cast<const fp16*>(p_x),
+        reinterpret_cast<const fp16*>(p_z),
+        reinterpret_cast<const fp16*>(p_nw),
+        reinterpret_cast<const uint8_t*>(ql.data_ptr()),
+        reinterpret_cast<const uint8_t*>(qh.data_ptr()),
+        reinterpret_cast<const fp16*>(sc.data_ptr()),
+        reinterpret_cast<const fp16*>(mn.data_ptr()),
+        reinterpret_cast<fp16*>(p_y),
+        (float)eps, M, K, N, (int)V, dpcpp_queue);
+    TORCH_CHECK(ok, "esimd_norm_gemv_q5k: unsupported K=", K, " V=", V);
+}
+
 #include "esimd_kernels/gdn_norm_gated.h"
 
 // Fused RMSNormGated + GGUF q8_0 GEMV for the GDN out_proj (decode).
@@ -786,6 +1066,12 @@ at::Tensor esimd_resadd_norm_gemv_fp8_pert(
     int K = (int)gemv_weight.size(1);
     int fp8_mode = get_fp8_mode(gemv_weight);
 
+    // The kernel walks K in whole 512-lane chunks (n_chunks = K / 512), so a K
+    // that is not a multiple of 512 would drop its tail without any error --
+    // no crash, no NaN, just quietly wrong numbers. Fail loudly instead.
+    TORCH_CHECK(K % 512 == 0,
+                "esimd_resadd_norm_gemv_fp8_pert: K must be a multiple of 512, got K=", K);
+
     auto& dpcpp_queue = get_device_queue(hidden_states);
 
     resadd_norm_gemv_fp8_pert_host(
@@ -818,6 +1104,31 @@ at::Tensor esimd_norm_gemv_fp8_pert(
     int fp8_mode = get_fp8_mode(gemv_weight);
 
     auto& dpcpp_queue = get_device_queue(x);
+
+    // M > 1 (TARGET_VERIFY): x/z are [M, HV, V] and output is [M, N]. The
+    // M-tiled kernel dequantises each weight row once and reuses it for all M
+    // rows.
+    const int64_t rowK = (int64_t)HV * V;
+    const int M = (int)(x.numel() / rowK);
+    if (M > 1) {
+        TORCH_CHECK(x.numel() % rowK == 0 && z.numel() == x.numel(),
+                    "norm_gemv: x/z must hold M*HV*V elements");
+        TORCH_CHECK(x.is_contiguous() && z.is_contiguous(),
+                    "norm_gemv: x/z must be contiguous for M>1");
+        TORCH_CHECK(output.is_contiguous() && output.numel() == (int64_t)M * N,
+                    "norm_gemv: output must be a contiguous [M, N] tensor");
+        bool ok = norm_gemm_fp8_pert_mtile_host(
+            reinterpret_cast<const fp16*>(x.data_ptr()),
+            reinterpret_cast<const fp16*>(z.data_ptr()),
+            reinterpret_cast<const fp16*>(norm_weight.data_ptr()),
+            reinterpret_cast<const uint8_t*>(gemv_weight.data_ptr()),
+            gemv_scale.data_ptr<float>(),
+            reinterpret_cast<fp16*>(output.data_ptr()),
+            M, N, (int)HV, (int)V, (float)eps, fp8_mode,
+            dpcpp_queue);
+        TORCH_CHECK(ok, "norm_gemv: unsupported M=", M, " or V=", V);
+        return output;
+    }
 
     norm_gemv_fp8_pert_host(
         reinterpret_cast<const fp16*>(x.data_ptr()),
@@ -881,6 +1192,39 @@ at::Tensor esimd_resadd_norm_gemv2_fp8_pert(
 
     fp16* new_residual_ptr = new_residual.defined()
         ? reinterpret_cast<fp16*>(new_residual.data_ptr()) : nullptr;
+
+    // M > 1 (TARGET_VERIFY): use the M-tiled kernel, which dequantises each
+    // weight chunk once and reuses it across all M rows.
+    const int M = (int)hidden_states.size(0);
+    if (M > 1) {
+        TORCH_CHECK(hidden_states.is_contiguous() && residual.is_contiguous(),
+                    "resadd_norm_gemv2: hidden/residual must be contiguous for M>1");
+        TORCH_CHECK(o0.is_contiguous() && o1.is_contiguous(),
+                    "resadd_norm_gemv2: outputs must be contiguous for M>1");
+        TORCH_CHECK(o0.size(0) == M && o1.size(0) == M,
+                    "resadd_norm_gemv2: output rows must match M");
+        bool ok = resadd_norm_gemm2_fp8_pert_mtile_host(
+            reinterpret_cast<fp16*>(hidden_states.data_ptr()),
+            reinterpret_cast<fp16*>(residual.data_ptr()),
+            reinterpret_cast<const fp16*>(norm_weight.data_ptr()),
+            reinterpret_cast<const uint8_t*>(w0.data_ptr()),
+            s0.data_ptr<float>(),
+            reinterpret_cast<fp16*>(o0.data_ptr()),
+            reinterpret_cast<const uint8_t*>(w1.data_ptr()),
+            s1.data_ptr<float>(),
+            reinterpret_cast<fp16*>(o1.data_ptr()),
+            new_residual_ptr,
+            M, N0, N1, K, (float)eps, fp8_mode,
+            dpcpp_queue);
+        TORCH_CHECK(ok, "resadd_norm_gemv2: unsupported M=", M, " or K=", K);
+        return o0;
+    }
+
+    // The M==1 kernel walks K in whole 512-lane chunks (n_chunks = K / 512), so
+    // a K that is not a multiple of 512 would drop its tail without any error --
+    // no crash, no NaN, just quietly wrong numbers. Fail loudly instead.
+    TORCH_CHECK(K % 512 == 0,
+                "resadd_norm_gemv2: K must be a multiple of 512 at M=1, got K=", K);
 
     resadd_norm_gemv2_fp8_pert_host(
         reinterpret_cast<fp16*>(hidden_states.data_ptr()),

@@ -30,12 +30,31 @@ namespace esimd_detail2 = sycl::ext::intel::esimd::detail;
 static constexpr int MOE_Q4K_GROUP = 32;
 static constexpr int MOE_Q4K_HALF = 16;
 
+// Gated activation applied to the up/gate stage. SiLU covers Qwen; GELU_TANH
+// ("gelu_pytorch_tanh") covers gemma-4, whose MoE block is otherwise the same
+// Q4_K gate/up shape.
+static constexpr int MOE_ACT_SILU = 0;
+static constexpr int MOE_ACT_GELU_TANH = 1;
+
+template <int ACT>
+inline float moe_act(float g) {
+    if constexpr (ACT == MOE_ACT_GELU_TANH) {
+        // ESIMD has no sycl::tanh, so use the exact algebraic rewrite
+        // 0.5*g*(1+tanh(z)) == g / (1 + exp(-2z)), z = c*(g + 0.044715 g^3).
+        const float c = 0.7978845608028654f;  // sqrt(2/pi)
+        const float z = c * (g + 0.044715f * g * g * g);
+        return g / (1.0f + sycl::exp(-2.0f * z));
+    } else {
+        return g / (1.0f + sycl::exp(-g));
+    }
+}
+
 // ── Up/gate stage: Q4_K gate + Q4_K up -> silu(gate)*up -> intermediate ──────
 // grid (n_routed = n_tokens*top_k, intermediate_size). Each WI: one n_col.
 // VL elements per iteration: the original stepped 32 at a time, issuing 16-byte
 // nibble loads (below LSC granularity) and re-reading a scalar scale/min per
 // block. Wider tiles cut the load count by VL/32 and keep one flat accumulator.
-template <int VL>
+template <int VL, int ACT = MOE_ACT_SILU>
 struct Moe_up_q4k_kernel {
     const fp16*    x;          // [n_tokens, hidden]
     const uint8_t* gate_ql;    // [E, inter, hidden/2]
@@ -106,8 +125,7 @@ struct Moe_up_q4k_kernel {
         }
         float g = reduce<float>(ag, std::plus<>());
         float u = reduce<float>(au, std::plus<>());
-        float silu = g / (1.0f + sycl::exp(-g));
-        inter[(size_t)route * intermediate + n_col] = fp16(silu * u);
+        inter[(size_t)route * intermediate + n_col] = fp16(moe_act<ACT>(g) * u);
     }
 };
 
@@ -115,18 +133,23 @@ inline void moe_up_q4k_host(
     const fp16* x, const uint8_t* gq, const fp16* gs, const fp16* gm,
     const uint8_t* uq, const fp16* us, const fp16* um,
     const int* sel, fp16* inter,
-    int n_tokens, int hidden, int intermediate, int top_k, sycl::queue& q) {
-#define LAUNCH_MOE_UP_Q4K(V)                                                 \
+    int n_tokens, int hidden, int intermediate, int top_k, sycl::queue& q,
+    int act = MOE_ACT_SILU) {
+#define LAUNCH_MOE_UP_Q4K_A(V, A)                                            \
     q.submit([&](sycl::handler& h) {                                         \
         h.parallel_for(sycl::range<2>((size_t)n_tokens * top_k, intermediate),\
-            Moe_up_q4k_kernel<V>{x, gq, gs, gm, uq, us, um, sel, inter,      \
-                                 n_tokens, hidden, intermediate, top_k});    \
+            Moe_up_q4k_kernel<V, A>{x, gq, gs, gm, uq, us, um, sel, inter,   \
+                                    n_tokens, hidden, intermediate, top_k}); \
     });
+#define LAUNCH_MOE_UP_Q4K(V)                                                 \
+    if (act == MOE_ACT_GELU_TANH) { LAUNCH_MOE_UP_Q4K_A(V, MOE_ACT_GELU_TANH) } \
+    else                          { LAUNCH_MOE_UP_Q4K_A(V, MOE_ACT_SILU) }
 
     if      (hidden % 128 == 0) { LAUNCH_MOE_UP_Q4K(128) }
     else if (hidden % 64  == 0) { LAUNCH_MOE_UP_Q4K(64)  }
     else                        { LAUNCH_MOE_UP_Q4K(32)  }
 #undef LAUNCH_MOE_UP_Q4K
+#undef LAUNCH_MOE_UP_Q4K_A
 }
 
 // ── Down stage: PACKED (zero extra memory, mirrors q5_k/q6_k_GEMV.h) ─────────
@@ -145,7 +168,11 @@ inline void moe_up_q4k_host(
 // ROWS>1 additionally amortises the `inter` row load, which every work-item
 // otherwise re-reads in full (N=2048 work-items x 512B = 1MB of cache traffic
 // per route for a 4KB tensor).
-template <int VL, int ROWS>
+// Q5_1 (legacy, gemma-4 down) shares this kernel verbatim: the host repacks it
+// to the SAME layout (interleaved nibble + plain 1-bit qh, one scale/min pair
+// per 32 elements), and the only arithmetic difference is the sign of the
+// offset term -- q5_K is `v*scale - min`, q5_1 is `v*d + m`. ADDMIN selects it.
+template <int VL, int ROWS, bool ADDMIN = false>
 struct Moe_down_q5k_kernel {
     const fp16*    inter;      // [n_routed, K]
     const uint8_t* ql;         // [E, N, K/2]
@@ -157,9 +184,10 @@ struct Moe_down_q5k_kernel {
     fp16*          out;        // [n_routed, N] partial
     int n_tokens, N, K, top_k;
 
-    void operator()(sycl::id<2> idx) const SYCL_ESIMD_KERNEL {
-        const int route = (int)idx[0];
-        const int n0 = (int)idx[1] * ROWS;     // first hidden output col
+    // Unscaled dot products for the ROWS output cols starting at `n0` of one
+    // (token, expert-slot) route. Split out of operator() so the fused
+    // down+finalize kernel can reuse the dequant math verbatim.
+    inline simd<float, ROWS> dots_for(int route, int n0) const {
         const int eid = sel_experts[route];
         const int Kh = K / 2, Kq = K / 8, Kg = K / 32;
         const fp16* i_row = inter + (size_t)route * K;
@@ -198,11 +226,21 @@ struct Moe_down_q5k_kernel {
                     simd<uint32_t, 32> hb = (simd<uint32_t, 32>(qh32) >> lane) & 1u;
                     fp16 s = scv[c], m = mnv[c];
                     auto blk = wf.template select<32, 1>(c * 32);
-                    blk = (blk + simd<float, 32>(hb) * 16.0f) * (float)s - (float)m;
+                    if constexpr (ADDMIN)
+                        blk = (blk + simd<float, 32>(hb) * 16.0f) * (float)s + (float)m;
+                    else
+                        blk = (blk + simd<float, 32>(hb) * 16.0f) * (float)s - (float)m;
                 }
                 dots[r] += reduce<float>(xf * wf, std::plus<>());
             }
         }
+        return dots;
+    }
+
+    void operator()(sycl::id<2> idx) const SYCL_ESIMD_KERNEL {
+        const int route = (int)idx[0];
+        const int n0 = (int)idx[1] * ROWS;     // first hidden output col
+        simd<float, ROWS> dots = dots_for(route, n0);
         const float tw = (float)topk_w[route];
         #pragma unroll
         for (int r = 0; r < ROWS; r++)
@@ -262,16 +300,94 @@ struct Moe_down_q6k_kernel {
     }
 };
 
+// Q8_0 routed down: qs [E,N,K] int8 + scale [E,N,K/32] fp16, symmetric
+// (w = scale * qs). gemma-4's Q4_K_M mix leaves a single layer's down tensor at
+// Q8_0 while the other 29 are Q5_1; without this it alone would fall back to
+// the per-route python path and dominate the step.
+template <int VL, int ROWS>
+struct Moe_down_q8_kernel {
+    const fp16*   inter;       // [n_routed, K]
+    const int8_t* qs;          // [E, N, K]
+    const fp16*   sc;          // [E, N, K/32]
+    const int*    sel_experts;
+    const fp16*   topk_w;      // [n_routed]
+    fp16*         out;         // [n_routed, N] partial
+    int n_tokens, N, K, top_k;
+
+    void operator()(sycl::id<2> idx) const SYCL_ESIMD_KERNEL {
+        const int route = (int)idx[0];
+        const int n0 = (int)idx[1] * ROWS;
+        const int eid = sel_experts[route];
+        const int Kg = K / 32;
+        constexpr int VW = VL / 32;               // scale entries per tile
+        const fp16* i_row = inter + (size_t)route * K;
+        const size_t rbase = (size_t)eid * N + n0;
+
+        simd<float, ROWS> dots = 0.0f;
+        for (int k = 0; k < K; k += VL) {
+            const int gi = k / 32;
+            simd<fp16, VL>  iv = block_load<fp16, VL>(i_row + k);
+            simd<float, VL> xf = simd<float, VL>(iv);
+            #pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                simd<int8_t, VL> qr =
+                    block_load<int8_t, VL>(qs + (rbase + r) * K + k);
+                simd<fp16, VW>   sv = block_load<fp16, VW>(sc + (rbase + r) * Kg + gi);
+                simd<float, VL>  wf = convert<float>(qr);
+                #pragma unroll
+                for (int c = 0; c < VW; c++) {
+                    fp16 s = sv[c];
+                    wf.template select<32, 1>(c * 32) =
+                        wf.template select<32, 1>(c * 32) * (float)s;
+                }
+                dots[r] += reduce<float>(xf * wf, std::plus<>());
+            }
+        }
+        const float tw = (float)topk_w[route];
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++)
+            out[(size_t)route * N + n0 + r] = fp16(dots[r] * tw);
+    }
+};
+
+inline void moe_down_q8_host(
+    const fp16* inter, const int8_t* qs, const fp16* sc, const int* sel,
+    const fp16* topk_w, fp16* out_partial,
+    int n_tokens, int N, int K, int top_k, sycl::queue& q) {
+#define LAUNCH_MOE_DOWN_Q8(V, R)                                              \
+    q.submit([&](sycl::handler& h) {                                          \
+        h.parallel_for(sycl::range<2>((size_t)n_tokens * top_k, N / (R)),     \
+            Moe_down_q8_kernel<V, R>{inter, qs, sc, sel, topk_w,              \
+                                     out_partial, n_tokens, N, K, top_k});    \
+    });
+
+    const int R = (N % 4 == 0) ? 4 : 1;
+    if (K % 256 == 0) {
+        if (R == 4) { LAUNCH_MOE_DOWN_Q8(256, 4) } else { LAUNCH_MOE_DOWN_Q8(256, 1) }
+    } else if (K % 128 == 0) {
+        if (R == 4) { LAUNCH_MOE_DOWN_Q8(128, 4) } else { LAUNCH_MOE_DOWN_Q8(128, 1) }
+    } else if (K % 64 == 0) {
+        if (R == 4) { LAUNCH_MOE_DOWN_Q8(64, 4) } else { LAUNCH_MOE_DOWN_Q8(64, 1) }
+    } else {
+        if (R == 4) { LAUNCH_MOE_DOWN_Q8(32, 4) } else { LAUNCH_MOE_DOWN_Q8(32, 1) }
+    }
+#undef LAUNCH_MOE_DOWN_Q8
+}
+
 inline void moe_down_q5k_host(
     const fp16* inter, const uint8_t* ql, const uint8_t* qh, const fp16* sc,
     const fp16* mn, const int* sel, const fp16* topk_w, fp16* out_partial,
-    int n_tokens, int N, int K, int top_k, sycl::queue& q) {
-#define LAUNCH_MOE_DOWN_Q5K(V, R)                                             \
+    int n_tokens, int N, int K, int top_k, sycl::queue& q,
+    bool add_min = false) {
+#define LAUNCH_MOE_DOWN_Q5K_S(V, R, A)                                        \
     q.submit([&](sycl::handler& h) {                                          \
         h.parallel_for(sycl::range<2>((size_t)n_tokens * top_k, N / (R)),     \
-            Moe_down_q5k_kernel<V, R>{inter, ql, qh, sc, mn, sel, topk_w,     \
-                                      out_partial, n_tokens, N, K, top_k});   \
+            Moe_down_q5k_kernel<V, R, A>{inter, ql, qh, sc, mn, sel, topk_w,  \
+                                         out_partial, n_tokens, N, K, top_k});\
     });
+#define LAUNCH_MOE_DOWN_Q5K(V, R)                                             \
+    if (add_min) { LAUNCH_MOE_DOWN_Q5K_S(V, R, true) }                        \
+    else         { LAUNCH_MOE_DOWN_Q5K_S(V, R, false) }
 
     const int R = (N % 4 == 0) ? 4 : 1;
     if (K % 256 == 0) {
@@ -284,6 +400,7 @@ inline void moe_down_q5k_host(
         if (R == 4) { LAUNCH_MOE_DOWN_Q5K(32, 4) } else { LAUNCH_MOE_DOWN_Q5K(32, 1) }
     }
 #undef LAUNCH_MOE_DOWN_Q5K
+#undef LAUNCH_MOE_DOWN_Q5K_S
 }
 
 inline void moe_down_q6k_host(

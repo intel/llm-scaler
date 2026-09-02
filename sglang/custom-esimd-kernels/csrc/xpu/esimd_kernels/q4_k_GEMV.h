@@ -15,16 +15,26 @@
  *
  * dequant: w[k] = scale[k/32] * nibble[k] - min[k/32]   (nibble in 0..15)
  *
- * Structure = q4_0_GEMV.h (K_SPLIT + SLM reduce) + a min term. The only
- * algorithmic difference from q4_0 is: q4_0 does (nibble-8)*scale (symmetric),
- * q4_K does nibble*scale - min (asymmetric). Same interleaved deinterleave.
+ * Structure: the default M=1 path is Q4_K_gemv_wide_kernel, a VL=512 K-tile
+ * loop (grid = ceil(N/ROWS) x ROWS), matching q5_K/q6_K. The older
+ * Q4_K_gemv_kernel (q4_0_GEMV.h-style K_SPLIT + SLM reduce) is kept as the
+ * fallback for shards whose K is not a multiple of 256. The only algorithmic
+ * difference from q4_0 is: q4_0 does (nibble-8)*scale (symmetric), q4_K does
+ * nibble*scale - min (asymmetric). Same interleaved deinterleave.
  *
  * Included into esimd_kernel.sycl (utils.h provides fp16 + esimd namespace).
  */
 #pragma once
 
+// Alias also (re)declared in q5_k_GEMV.h; repeating a namespace alias with the
+// same target is legal and keeps this header include-order independent.
+namespace esimd_detail = sycl::ext::intel::esimd::detail;
+
 static constexpr int Q4_K_GROUP = 32;  // q4_K sub-block size
 static constexpr int Q4_K_HALF = 16;   // qs bytes per 32-block (= group/2)
+
+static constexpr int Q4_K_VL   = 512;  // K-tile (wide path, M=1 and M-tiled)
+static constexpr int Q4_K_ROWS = 4;    // rows per work-group (wide path)
 
 inline void select_ks_q4_k(uint32_t N, uint32_t K, int& ks) {
     ks = 1;
@@ -107,9 +117,122 @@ struct Q4_K_gemv_kernel {
     }
 };
 
+// ---- Wide-tile q4_K GEMV (M=1 decode, default path) ----
+//
+// The K_SPLIT kernel above steps 32 elements at a time, which issues 16-byte
+// nibble loads (below LSC granularity) and re-reads a scalar scale/min per
+// block. This is the same shape that was measured at ~180 GB/s in
+// moe_kquant_GEMV.h before it was widened. Since q4_K carries ~2/3 of the
+// weight bytes in a Q4_K_M file, the M=1 decode path was the dominant term in
+// the step time while q5_K/q6_K had already moved to the VL=512 structure.
+//
+// This kernel is the q4_K instance of that same structure: one VL=512 tile per
+// iteration, so the weight load becomes block_load<uint8_t, 256> and the
+// scale/min are loaded as VL_GS-wide vectors instead of scalars. Grid is
+// ceil(N/ROWS) x ROWS with one row per work-item, matching q5_K/q6_K.
+//
+// The dequant/unpack body is identical to Q4_K_gemv_M_kernel's (already
+// validated) with M fixed to 1.
+template <int VLP>
+struct Q4_K_gemv_wide_kernel {
+    const fp16*    input;   // [1, K]
+    const uint8_t* weight;  // [N, K/2]
+    const fp16*    scale;   // [N, K/32]
+    const fp16*    minv;    // [N, K/32]
+    fp16*          output;  // [1, N]
+    int N, K;
+
+    void operator()(sycl::nd_item<1> ndi) const SYCL_ESIMD_KERNEL {
+        const int row = (int)ndi.get_group(0) * Q4_K_ROWS + (int)ndi.get_local_id(0);
+        if (row >= N) return;
+
+        constexpr int VL = VLP;
+        constexpr int VL_HALF = VL / 2;         // packed bytes per tile
+        constexpr int VL_GS = VL / Q4_K_GROUP;  // scale/min entries per tile
+        const int K_ITERS = K / VL;
+        const int W_STRIDE = K / 2;
+        const int SC_STRIDE = K / Q4_K_GROUP;
+
+        const uint8_t* w_row = weight + (size_t)row * W_STRIDE;
+        const fp16*    s_row = scale  + (size_t)row * SC_STRIDE;
+        const fp16*    m_row = minv   + (size_t)row * SC_STRIDE;
+
+        // 8 rotating accumulators break the serial dependency between the
+        // per-tile horizontal sums (same trick as q5_K/q6_K).
+        simd<float, 8> acc(0.0f);
+        int ai = 0;
+
+        for (int iter = 0; iter < K_ITERS; iter++) {
+            const int k = iter * VL;
+            simd<fp16, VL> act = block_load<fp16, VL>(input + k);
+
+            simd<uint8_t, VL_HALF> w_data =
+                block_load<uint8_t, VL_HALF>(w_row + k / 2);
+            simd<fp16, VL_GS> sc_h =
+                block_load<fp16, VL_GS>(s_row + k / Q4_K_GROUP);
+            simd<fp16, VL_GS> mn_h =
+                block_load<fp16, VL_GS>(m_row + k / Q4_K_GROUP);
+            simd<float, VL_GS> sc_f = sc_h, mn_f = mn_h;
+
+            // nibble unpack: byte j low -> elem 2j, high -> elem 2j+1
+            simd<float, VL> weight_f;
+            #pragma unroll
+            for (int c = 0; c < VL_HALF / 64; c++) {
+                auto p = w_data.template select<64, 1>(c * 64);
+                simd<float, 64> lo = p & 0x0F;
+                simd<float, 64> hi = (p >> 4) & 0x0F;
+                weight_f.template select<64, 2>(c * 128) = lo;
+                weight_f.template select<64, 2>(c * 128 + 1) = hi;
+            }
+            // asymmetric dequant w = scale*nibble - min (per 32-block)
+            #pragma unroll
+            for (int sb = 0; sb < VL_GS; sb++) {
+                float s = sc_f[sb], m = mn_f[sb];
+                weight_f.template select<Q4_K_GROUP, 1>(sb * Q4_K_GROUP) =
+                    weight_f.template select<Q4_K_GROUP, 1>(sb * Q4_K_GROUP) * s - m;
+            }
+
+            simd<float, VL> prod = weight_f * simd<float, VL>(act);
+            acc[ai] += esimd_detail::sum<float, float, VL>(prod);
+            ai = (ai + 1) & 7;
+        }
+        output[row] = (fp16)esimd_detail::sum<float, float, 8>(acc);
+    }
+};
+
 inline void q4_k_gemv_host(
     const fp16* input, const uint8_t* weight, const fp16* scale,
     const fp16* minv, fp16* output, uint32_t N, uint32_t K, sycl::queue& q) {
+    // Wide path requires K % VL == 0. Every GGUF k-quant tensor has
+    // K % 256 == 0 (256 = super-block), and TP row-splits keep that property,
+    // so the 512/256 pair covers every shard seen in practice. The K_SPLIT
+    // kernel below stays as the fallback for anything else.
+    //
+    // Kill switch: the wide path wins the isolated microbenchmark by ~2.6x but
+    // was measured to LOSE ~1.8 ms of e2e decode on a launch-bound step, where
+    // the extra work-groups it spawns compete with host dispatch. Set
+    // SGL_XPU_Q4K_WIDE=0 to fall back to the K_SPLIT kernel.
+    static const bool wide_enabled = [] {
+        const char* e = std::getenv("SGL_XPU_Q4K_WIDE");
+        return !(e && e[0] == '0');
+    }();
+    const bool wide512 = wide_enabled && (K % Q4_K_VL) == 0;
+    const bool wide256 = wide_enabled && (K % (Q4_K_VL / 2)) == 0;
+    if (wide512 || wide256) {
+        const int NWG = ((int)N + Q4_K_ROWS - 1) / Q4_K_ROWS;
+        q.submit([&](sycl::handler& h) {
+            sycl::nd_range<1> r((size_t)NWG * Q4_K_ROWS, Q4_K_ROWS);
+            if (wide512) {
+                h.parallel_for(r, Q4_K_gemv_wide_kernel<Q4_K_VL>{
+                    input, weight, scale, minv, output, (int)N, (int)K});
+            } else {
+                h.parallel_for(r, Q4_K_gemv_wide_kernel<Q4_K_VL / 2>{
+                    input, weight, scale, minv, output, (int)N, (int)K});
+            }
+        });
+        return;
+    }
+
     int n_groups = K / Q4_K_GROUP;
     int ks;
     select_ks_q4_k(N, K, ks);
@@ -129,4 +252,130 @@ inline void q4_k_gemv_host(
     else if (ks == 8) { LAUNCH_Q4_K(8) }
     else              { LAUNCH_Q4_K(1) }
 #undef LAUNCH_Q4_K
+}
+
+// ---- M-tiled q4_K GEMV (small M: MTP verify, or plain decode at batch>1) ----
+//
+// The generic M>1 path dequantizes q4_K into a fp16 table (4x the bytes) on
+// EVERY call and then runs a dense GEMM; the dequant cost is independent of M,
+// so at M=2 it already dominates. This kernel loads+unpacks+dequants each
+// K-tile ONCE and multiplies it against all M activation rows, keeping the
+// weights resident in their 4.5-bit form. input [M,K], output [M,N] row-major.
+//
+// Uses the same VL=512 tile structure as q5_K/q6_K rather than the M=1
+// K_SPLIT structure: with M rows to amortize, per-row work-group splitting is
+// no longer needed and a tile loop keeps the weight registers live.
+
+// VLP is the K-tile length. 512 is the fast default; 256 covers shards whose K
+// is not a multiple of 512 (gemma-4 hidden_size 5376). Every K-quant tensor has
+// K % 256 == 0 because that is the GGUF super-block size, so the two
+// instantiations together span every possible shard.
+template <int M, int VLP>
+struct Q4_K_gemv_M_kernel {
+    const fp16*    input;   // [M, K]
+    const uint8_t* weight;  // [N, K/2]
+    const fp16*    scale;   // [N, K/32]
+    const fp16*    minv;    // [N, K/32]
+    fp16*          output;  // [M, N]
+    int N, K;
+    // Row stride of `output`, so a caller can write a column slice of a
+    // wider buffer (the GGUF mixed-kind group path) without a torch.cat.
+    int ldo;
+
+    void operator()(sycl::nd_item<1> ndi) const SYCL_ESIMD_KERNEL {
+        const int row = (int)ndi.get_group(0) * Q4_K_ROWS + (int)ndi.get_local_id(0);
+        if (row >= N) return;
+
+        constexpr int VL = VLP;
+        constexpr int VL_HALF = VL / 2;         // 256 packed bytes/tile
+        constexpr int VL_GS = VL / Q4_K_GROUP;  // 16 scale/min per tile
+        const int K_ITERS = K / VL;
+        const int W_STRIDE = K / 2;
+        const int SC_STRIDE = K / Q4_K_GROUP;
+
+        simd<float, 8> acc[M];
+        #pragma unroll
+        for (int m = 0; m < M; m++) acc[m] = 0.0f;
+        int ai = 0;
+
+        for (int iter = 0; iter < K_ITERS; iter++) {
+            const int k = iter * VL;
+            // --- load + unpack + dequant the weight tile ONCE ---
+            simd<uint8_t, VL_HALF> w_data = block_load<uint8_t, VL_HALF>(
+                weight + (size_t)row * W_STRIDE + k / 2);
+            simd<fp16, VL_GS> sc_h = block_load<fp16, VL_GS>(
+                scale + (size_t)row * SC_STRIDE + k / Q4_K_GROUP);
+            simd<fp16, VL_GS> mn_h = block_load<fp16, VL_GS>(
+                minv + (size_t)row * SC_STRIDE + k / Q4_K_GROUP);
+            simd<float, VL_GS> sc_f = sc_h, mn_f = mn_h;
+
+            // nibble unpack: byte j low -> elem 2j, high -> elem 2j+1
+            simd<float, VL> weight_f;
+            #pragma unroll
+            for (int c = 0; c < VL_HALF / 64; c++) {
+                auto p = w_data.template select<64, 1>(c * 64);
+                simd<float, 64> lo = p & 0x0F;
+                simd<float, 64> hi = (p >> 4) & 0x0F;
+                weight_f.template select<64, 2>(c * 128) = lo;
+                weight_f.template select<64, 2>(c * 128 + 1) = hi;
+            }
+            // asymmetric dequant w = scale*nibble - min (per 32-block)
+            #pragma unroll
+            for (int sb = 0; sb < VL_GS; sb++) {
+                float s = sc_f[sb], m = mn_f[sb];
+                weight_f.template select<Q4_K_GROUP, 1>(sb * Q4_K_GROUP) =
+                    weight_f.template select<Q4_K_GROUP, 1>(sb * Q4_K_GROUP) * s - m;
+            }
+            // --- reuse weight_f across all M activation rows ---
+            #pragma unroll
+            for (int m = 0; m < M; m++) {
+                simd<fp16, VL> act = block_load<fp16, VL>(input + (size_t)m * K + k);
+                simd<float, VL> prod = weight_f * simd<float, VL>(act);
+                acc[m][ai] += esimd_detail::sum<float, float, VL>(prod);
+            }
+            ai = (ai + 1) & 7;
+        }
+        #pragma unroll
+        for (int m = 0; m < M; m++)
+            output[(size_t)m * ldo + row] = (fp16)esimd_detail::sum<float, float, 8>(acc[m]);
+    }
+};
+
+template <int M>
+inline void q4_k_gemv_M_launch(
+    const fp16* input, const uint8_t* weight, const fp16* scale,
+    const fp16* minv, fp16* output, uint32_t N, uint32_t K, uint32_t ldo, sycl::queue& q) {
+    const int NWG = ((int)N + Q4_K_ROWS - 1) / Q4_K_ROWS;
+    const bool wide = (K % Q4_K_VL) == 0;
+    q.submit([&](sycl::handler& h) {
+        sycl::nd_range<1> r((size_t)NWG * Q4_K_ROWS, Q4_K_ROWS);
+        if (wide) {
+            h.parallel_for(
+                r, Q4_K_gemv_M_kernel<M, Q4_K_VL>{input, weight, scale, minv, output,
+                                                  (int)N, (int)K, (int)ldo});
+        } else {
+            h.parallel_for(
+                r, Q4_K_gemv_M_kernel<M, Q4_K_VL / 2>{input, weight, scale, minv, output,
+                                                      (int)N, (int)K, (int)ldo});
+        }
+    });
+}
+
+// Dispatch arbitrary M onto fixed-M kernels by tiling in chunks of {8,4,2,1}.
+// q4_k_gemv_M_launch picks the VL=512 or VL=256 tile instantiation from K, so
+// every K is served by the tiled kernel (no per-row M=1 fan-out).
+inline void q4_k_gemv_M_host(
+    const fp16* input, const uint8_t* weight, const fp16* scale,
+    const fp16* minv, fp16* output, uint32_t M, uint32_t N, uint32_t K, uint32_t ldo,
+    sycl::queue& q) {
+    uint32_t m0 = 0;
+    while (m0 < M) {
+        uint32_t r = M - m0;
+        const fp16* in = input + (size_t)m0 * K;
+        fp16* out = output + (size_t)m0 * ldo;
+        if      (r >= 8) { q4_k_gemv_M_launch<8>(in, weight, scale, minv, out, N, K, ldo, q); m0 += 8; }
+        else if (r >= 4) { q4_k_gemv_M_launch<4>(in, weight, scale, minv, out, N, K, ldo, q); m0 += 4; }
+        else if (r >= 2) { q4_k_gemv_M_launch<2>(in, weight, scale, minv, out, N, K, ldo, q); m0 += 2; }
+        else { q4_k_gemv_host(in, weight, scale, minv, out, N, K, q); m0 += 1; }
+    }
 }

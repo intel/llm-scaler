@@ -328,13 +328,9 @@ struct Moe_finalize_gguf_kernel {
     fp16*         out;         // [M, hidden]
     int M, hidden, inter_s, top_k;
 
-    void operator()(sycl::id<2> idx) const SYCL_ESIMD_KERNEL {
-        const int token = (int)idx[0];
-        const int n     = (int)idx[1];
-        float acc = 0.0f;
-        for (int k = 0; k < top_k; k++)
-            acc += (float)out_partial[((size_t)token * top_k + k) * hidden + n];
-
+    // Shared-expert Q8_0 down dot for one (token, out col). Split out so the
+    // fused down+finalize kernel can reuse it verbatim.
+    inline float shared_dot(int token, int n) const {
         constexpr int NSC = VL / MOE_Q8_GROUP;
         const int Kg = inter_s / MOE_Q8_GROUP;
         const fp16*   ir = inter_sh + (size_t)token * inter_s;
@@ -355,7 +351,17 @@ struct Moe_finalize_gguf_kernel {
             }
             sacc += simd<float, VL>(iv) * wf;
         }
-        float sdot = reduce<float>(sacc, std::plus<>());
+        return reduce<float>(sacc, std::plus<>());
+    }
+
+    void operator()(sycl::id<2> idx) const SYCL_ESIMD_KERNEL {
+        const int token = (int)idx[0];
+        const int n     = (int)idx[1];
+        float acc = 0.0f;
+        for (int k = 0; k < top_k; k++)
+            acc += (float)out_partial[((size_t)token * top_k + k) * hidden + n];
+
+        float sdot = shared_dot(token, n);
         out[(size_t)token * hidden + n] = fp16(acc + (float)g[token] * sdot);
     }
 };

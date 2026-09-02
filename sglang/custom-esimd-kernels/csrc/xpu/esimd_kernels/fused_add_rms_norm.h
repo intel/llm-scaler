@@ -4,6 +4,12 @@
  * Gemma convention: weight is pre-adjusted (w+1.0 already applied by caller).
  *
  * Single WG, 1 thread. K=2048 → 4 iterations with VL=512.
+ * VL is chosen by the host from K rather than fixed at 512: the loop is a whole
+ * number of VL-wide chunks with no tail handling, so a hidden size that is not
+ * a multiple of VL would silently drop its last K % VL elements from BOTH the
+ * residual add and the normalisation. That is not hypothetical — gemma-4-31B
+ * has hidden_size 5376 (= 512*10 + 256), so the fixed-512 version dropped 256
+ * of 5376 channels in every decoder layer.
  * Two-pass: pass 1 = add + sum_sq; pass 2 = normalize + write output.
  * Residual updated in-place.
  */
@@ -11,6 +17,7 @@
 #pragma once
 #include "utils.h"
 
+template <int VL>
 struct FusedAddRmsNorm_kernel {
     fp16*       hidden_ptr;    // [1, K] — input, also used as output
     fp16*       residual_ptr;  // [1, K] — updated in-place
@@ -19,7 +26,6 @@ struct FusedAddRmsNorm_kernel {
     float eps;
 
     void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
-        constexpr int VL = 512;
         int n_chunks = K / VL;
 
         // Pass 1: residual += hidden, accumulate sum_sq
@@ -33,16 +39,9 @@ struct FusedAddRmsNorm_kernel {
             // Write residual in-place
             block_store<fp16, VL>(residual_ptr + offset, simd<fp16, VL>(added));
 
-            simd<float, VL> sq = added * added;
-            sq.select<256,1>(0) += sq.select<256,1>(256);
-            sq.select<128,1>(0) += sq.select<128,1>(128);
-            sq.select<64,1>(0) += sq.select<64,1>(64);
-            sq.select<32,1>(0) += sq.select<32,1>(32);
-            sq.select<16,1>(0) += sq.select<16,1>(16);
-            sq.select<8,1>(0) += sq.select<8,1>(8);
-            sq.select<4,1>(0) += sq.select<4,1>(4);
-            sq.select<2,1>(0) += sq.select<2,1>(2);
-            sum_sq += (float)sq[0] + (float)sq[1];
+            // VL-generic pairwise tree (the previous hand-rolled version
+            // started at select<256> and so was only valid for VL == 512).
+            sum_sq += sycl::ext::intel::esimd::detail::sum<float, float, VL>(added * added);
         }
 
         float inv_rms = sycl::ext::intel::esimd::rsqrt(
@@ -63,9 +62,18 @@ inline void fused_add_rms_norm_host(
     fp16* hidden_ptr, fp16* residual_ptr, const fp16* weight_ptr,
     int K, float eps, sycl::queue& q)
 {
-    q.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(
-            sycl::nd_range<1>(1, 1),
-            FusedAddRmsNorm_kernel{hidden_ptr, residual_ptr, weight_ptr, K, eps});
-    });
+    #define LAUNCH_FARN(V)                                                    \
+        q.submit([&](sycl::handler& cgh) {                                    \
+            cgh.parallel_for(                                                 \
+                sycl::nd_range<1>(1, 1),                                      \
+                FusedAddRmsNorm_kernel<V>{                                    \
+                    hidden_ptr, residual_ptr, weight_ptr, K, eps});           \
+        });
+
+    if      (K % 512 == 0) { LAUNCH_FARN(512) }
+    else if (K % 256 == 0) { LAUNCH_FARN(256) }
+    else if (K % 128 == 0) { LAUNCH_FARN(128) }
+    else                   { LAUNCH_FARN(64)  }
+
+    #undef LAUNCH_FARN
 }

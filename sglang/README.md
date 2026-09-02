@@ -112,6 +112,32 @@ Both accept `TP_SIZE`, `HOST`, `PORT`, and `MEM_FRACTION_STATIC` overrides.
 For function-calling evaluation of the four FP8 models, see
 [`scripts/bfcl/README.md`](scripts/bfcl/README.md).
 
+### MTP (speculative decoding)
+
+Both formats accept an MTP draft model. Set `SPEC_DRAFT_PATH` to a checkpoint
+that carries the `mtp.*` tensors and the script adds the NEXTN speculative
+flags. For GGUF the MTP-enabled file is its own draft model, so it is passed
+twice:
+
+```bash
+cd /llm-scaler/sglang
+
+MODEL_PATH=/models/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
+GGUF_CFG_DIR=/models/Qwen3.6-35B-A3B \
+SPEC_DRAFT_PATH=$MODEL_PATH ZE_AFFINITY_MASK=6,7 \
+  bash scripts/start_qwen3_6_service.sh
+```
+
+Defaults are `SPEC_NUM_STEPS=3`, `SPEC_TOPK=1`, `SPEC_NUM_DRAFT_TOKENS=4`;
+override them to change the tree width. Each verify step runs the target model
+on `num_draft_tokens x concurrency` rows at once, which is the batch the
+M-tiled ESIMD GEMVs are tuned for, so the gain grows with concurrency. XPU
+graph capture cannot express the speculative control flow, so decode stays
+eager (`--disable-cuda-graph`) as it already does for the non-MTP paths.
+
+Long-context runs such as BFCL multi-turn additionally need
+`MAMBA_TRACK_INTERVAL=8192 CHUNKED_PREFILL_SIZE=8192`.
+
 ### Gemma4-26B-A4B
 
 ```bash
@@ -145,6 +171,10 @@ Each is gated by an env var (set by `start_qwen3_6_service.sh`):
 | `SGL_XPU_ESIMD_MOE_PREFILL`        | FP8 MoE prefill (M-tiled DPAS)         |
 | `SGL_XPU_FA_ESIMD_QKV`             | Full-attention fused QKV+RMSNorm+RoPE  |
 | `SGL_XPU_FA_RESADD_NORM`           | Fuse FA input_layernorm (resadd+rmsnorm) into qkv_proj (decode) |
+| `SGL_XPU_GGUF_MOE_FULL`            | Full GGUF decode MoE fusion (router topk + Q4_K/Q5_K routed + Q8_0 shared) |
+| `SGL_XPU_GGUF_MOE_SHARED`          | Q8_0 shared-expert kernel (used when the full fusion declines) |
+| `SGL_XPU_GGUF_RESADD_NORM`         | Fuse GemmaRMSNorm(input_layernorm) + q8_0 in_proj/qkv + fp16 in_proj_ba |
+| `SGL_XPU_GGUF_FUSE_MAX_M`          | Largest decode batch the GGUF fusions handle (default 64) |
 | `SGL_XPU_GDN_ESIMD`                | GDN conv fused_seq decode              |
 | `SGL_XPU_GDN_EXTEND_ESIMD`         | GDN chunk_gated_delta_rule prefill     |
 | `SGL_XPU_GDN_NORM_GEMV`            | GDN gated-RMSNorm as ESIMD GEMV (decode) |
@@ -154,6 +184,12 @@ Each is gated by an env var (set by `start_qwen3_6_service.sh`):
 | `SGL_XPU_ENABLE_GRAPH`             | XPU device-graph capture/replay (kept **0** here) |
 
 > **Note:** all ESIMD/XPU fast-path gates use the `SGL_XPU_*` prefix.
+
+The `SGL_XPU_GGUF_*` gates only apply to the GGUF path and are set by the
+script's `.gguf` branch. `SGL_XPU_GGUF_MOE_FULL` defaults to **off** in the
+loader and is the main decode lever for GGUF, so the script turns it on.
+The fp8 fusions above never fire under GGUF, because the attention and GDN
+projections run as ESIMD q8_0 GEMVs instead.
 
 The full decode MoE fusion (`SGL_XPU_ESIMD_MOE_FULL`) and the MoE router fp8
 path require online fp8 to be quantized as **e5m2** — set `SGLANG_FP8_DTYPE=e5m2`
