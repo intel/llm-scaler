@@ -345,8 +345,7 @@ The image includes OneCCL with automatic fallback between P2P and USM memory exc
 Use the oneCCL toolkit bundled with the selected image or offline installer.
 Do not install the Python distributions `oneccl` or `oneccl-devel` on top of
 that environment, because they can replace libraries required by the tested
-XPU runtime. When reporting a problem, include the image/installer version and
-the installed oneCCL toolkit version.
+XPU runtime.
 
 * To manually switch modes, use:
 
@@ -1290,10 +1289,6 @@ Prefix Caching and Tool Calling features are supported with additional parameter
 --enable-auto-tool-choice 
 --tool-call-parser qwen3_coder 
 ```
-
-Tool calls must contain both `name` and `arguments`; use an empty object for
-tools without parameters. Clients and evaluation harnesses should validate
-this schema before adding an assistant tool call to multi-turn history.
 
 3. Sending bench requests to the vllm server 
 
