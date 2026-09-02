@@ -222,6 +222,13 @@ at::Tensor esimd_norm_gemv_int4_pert(
     at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output,
     int64_t HV, int64_t V, double eps);
 
+// Fused RMSNormGated + sigmoid gate + INT4 GEMV.  This is a separate ABI
+// because the legacy ``_pert`` entry point is defined to use SiLU gating.
+at::Tensor esimd_norm_gemv_int4_sigmoid(
+    at::Tensor x, at::Tensor z, at::Tensor norm_weight,
+    at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output,
+    int64_t HV, int64_t V, double eps);
+
 // Standalone RMSNorm (no add): output[k] = input[k] * inv_rms(input) * weight[k]
 at::Tensor esimd_rms_norm(
     at::Tensor input, at::Tensor output,

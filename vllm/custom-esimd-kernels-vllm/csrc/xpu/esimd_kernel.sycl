@@ -5,6 +5,7 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/python.h>
 
+#include <cmath>
 #include <cstdint>
 #include <limits>
 
@@ -765,6 +766,124 @@ at::Tensor esimd_resadd_norm_gemv2_fp8_pert(
 
 // ---- Fused RMSNormGated + INT4 GEMV (out_proj) ----
 
+namespace {
+
+static void check_norm_gemv_int4_contract(
+    const at::Tensor& x,
+    const at::Tensor& z,
+    const at::Tensor& norm_weight,
+    const at::Tensor& gemv_weight,
+    const at::Tensor& gemv_scale,
+    const at::Tensor& output,
+    int64_t HV,
+    int64_t V,
+    double eps) {
+    TORCH_CHECK(x.defined() && z.defined() && norm_weight.defined() &&
+                    gemv_weight.defined() && gemv_scale.defined() &&
+                    output.defined(),
+                "GDN INT4 output projection received an undefined tensor");
+    TORCH_CHECK(x.device().is_xpu(),
+                "GDN INT4 output projection tensors must be on XPU");
+    const at::Device device = x.device();
+    const at::Tensor tensors[] = {
+        z, norm_weight, gemv_weight, gemv_scale, output};
+    for (const auto& tensor : tensors) {
+        TORCH_CHECK(tensor.device() == device,
+                    "GDN INT4 output projection tensors must share one XPU device");
+    }
+
+    TORCH_CHECK(HV > 0 && V == 128,
+                "GDN INT4 output projection requires HV > 0 and V == 128");
+    TORCH_CHECK(std::isfinite(eps) && eps >= 0.0,
+                "GDN INT4 output projection eps must be finite and non-negative");
+    TORCH_CHECK(x.scalar_type() == at::kHalf && z.scalar_type() == at::kHalf &&
+                    norm_weight.scalar_type() == at::kHalf &&
+                    gemv_scale.scalar_type() == at::kHalf &&
+                    output.scalar_type() == at::kHalf,
+                "GDN INT4 output projection activations and scales must be FP16");
+    TORCH_CHECK(gemv_weight.scalar_type() == at::kInt,
+                "GDN INT4 packed weight must have dtype int32");
+    TORCH_CHECK(x.dim() == 2 && z.dim() == 2 && norm_weight.dim() == 1 &&
+                    gemv_weight.dim() == 2 && gemv_scale.dim() == 2 &&
+                    output.dim() == 2,
+                "GDN INT4 output projection has an invalid tensor rank");
+    TORCH_CHECK(x.is_contiguous() && z.is_contiguous() &&
+                    norm_weight.is_contiguous() && gemv_weight.is_contiguous() &&
+                    gemv_scale.is_contiguous() && output.is_contiguous(),
+                "GDN INT4 output projection tensors must be contiguous");
+    TORCH_CHECK(x.storage_offset() % 2 == 0 && z.storage_offset() % 2 == 0 &&
+                    norm_weight.storage_offset() % 2 == 0 &&
+                    gemv_scale.storage_offset() % 2 == 0 &&
+                    output.storage_offset() % 2 == 0,
+                "GDN INT4 FP16 tensors must have 4-byte aligned starts");
+    TORCH_CHECK(x.size(0) == HV && x.size(1) == V && z.sizes() == x.sizes() &&
+                    norm_weight.size(0) == V,
+                "GDN INT4 output projection head shape does not match HV/V");
+
+    TORCH_CHECK(HV <= std::numeric_limits<int64_t>::max() / V,
+                "GDN INT4 output projection HV/V product overflows");
+    const int64_t K = HV * V;
+    TORCH_CHECK(K <= std::numeric_limits<int>::max() &&
+                    gemv_weight.size(0) > 0 &&
+                    gemv_weight.size(0) <= std::numeric_limits<int>::max(),
+                "GDN INT4 output projection dimensions exceed the ABI");
+    TORCH_CHECK(gemv_weight.size(1) == K / 8 &&
+                    gemv_scale.size(0) == gemv_weight.size(0) &&
+                    gemv_scale.size(1) == K / 128,
+                "GDN INT4 packed weight or scale shape is invalid");
+    TORCH_CHECK(output.size(0) == 1 && output.size(1) == gemv_weight.size(0),
+                "GDN INT4 output projection output must have shape [1, N]");
+
+    const at::Tensor inputs[] = {
+        x, z, norm_weight, gemv_weight, gemv_scale};
+    for (const auto& input : inputs) {
+        TORCH_CHECK(!output.is_alias_of(input),
+                    "GDN INT4 output projection output must not alias an input");
+    }
+}
+
+static at::Tensor run_norm_gemv_int4(
+    at::Tensor x,
+    at::Tensor z,
+    at::Tensor norm_weight,
+    at::Tensor gemv_weight,
+    at::Tensor gemv_scale,
+    at::Tensor output,
+    int64_t HV,
+    int64_t V,
+    double eps,
+    bool sigmoid_gate) {
+    check_norm_gemv_int4_contract(
+        x, z, norm_weight, gemv_weight, gemv_scale, output, HV, V, eps);
+    const int N = static_cast<int>(gemv_weight.size(0));
+    auto& dpcpp_queue = get_device_queue(x);
+
+    if (sigmoid_gate) {
+        norm_gemv_int4_sigmoid_host(
+            reinterpret_cast<const fp16*>(x.data_ptr()),
+            reinterpret_cast<const fp16*>(z.data_ptr()),
+            reinterpret_cast<const fp16*>(norm_weight.data_ptr()),
+            gemv_weight.data_ptr<int32_t>(),
+            reinterpret_cast<const fp16*>(gemv_scale.data_ptr()),
+            reinterpret_cast<fp16*>(output.data_ptr()),
+            N, static_cast<int>(HV), static_cast<int>(V), static_cast<float>(eps),
+            dpcpp_queue);
+    } else {
+        norm_gemv_int4_host(
+            reinterpret_cast<const fp16*>(x.data_ptr()),
+            reinterpret_cast<const fp16*>(z.data_ptr()),
+            reinterpret_cast<const fp16*>(norm_weight.data_ptr()),
+            gemv_weight.data_ptr<int32_t>(),
+            reinterpret_cast<const fp16*>(gemv_scale.data_ptr()),
+            reinterpret_cast<fp16*>(output.data_ptr()),
+            N, static_cast<int>(HV), static_cast<int>(V), static_cast<float>(eps),
+            dpcpp_queue);
+    }
+    return output;
+}
+
+}  // namespace
+
 at::Tensor esimd_norm_gemv_int4_pert(
     at::Tensor x,             // [HV, V] fp16 — core_attn_out
     at::Tensor z,             // [HV, V] fp16 — z_out
@@ -773,22 +892,26 @@ at::Tensor esimd_norm_gemv_int4_pert(
     at::Tensor gemv_scale,    // [N, K/128] fp16 per-block
     at::Tensor output,        // [1, N] fp16
     int64_t HV, int64_t V,
-    double eps)
-{
-    int N = (int)gemv_weight.size(0);
-    auto& dpcpp_queue = get_device_queue(x);
+    double eps) {
+    return run_norm_gemv_int4(
+        std::move(x), std::move(z), std::move(norm_weight),
+        std::move(gemv_weight), std::move(gemv_scale), std::move(output),
+        HV, V, eps, false);
+}
 
-    norm_gemv_int4_host(
-        reinterpret_cast<const fp16*>(x.data_ptr()),
-        reinterpret_cast<const fp16*>(z.data_ptr()),
-        reinterpret_cast<const fp16*>(norm_weight.data_ptr()),
-        gemv_weight.data_ptr<int32_t>(),
-        reinterpret_cast<const fp16*>(gemv_scale.data_ptr()),
-        reinterpret_cast<fp16*>(output.data_ptr()),
-        N, (int)HV, (int)V, (float)eps,
-        dpcpp_queue);
-
-    return output;
+at::Tensor esimd_norm_gemv_int4_sigmoid(
+    at::Tensor x,             // [HV, V] fp16 — core_attn_out
+    at::Tensor z,             // [HV, V] fp16 — z_out
+    at::Tensor norm_weight,   // [V] fp16
+    at::Tensor gemv_weight,   // [N, K/8] int32 packed, K = HV*V
+    at::Tensor gemv_scale,    // [N, K/128] fp16 per-block
+    at::Tensor output,        // [1, N] fp16
+    int64_t HV, int64_t V,
+    double eps) {
+    return run_norm_gemv_int4(
+        std::move(x), std::move(z), std::move(norm_weight),
+        std::move(gemv_weight), std::move(gemv_scale), std::move(output),
+        HV, V, eps, true);
 }
 
 // ---- Fused Add + RMSNorm (Gemma-style, replace IPEX fused_add_rms_norm) ----

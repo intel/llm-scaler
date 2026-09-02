@@ -1,10 +1,14 @@
 """Unit tests for esimd_norm_gemv_int4_pert — fused RMSNormGated + INT4 GEMV."""
-import pytest
-import torch
 import ctypes
 import os
 
-from custom_esimd_kernels_vllm import esimd_norm_gemv_int4_pert, esimd_norm_gemv_fp8_pert
+import pytest
+import torch
+from custom_esimd_kernels_vllm import (
+    esimd_norm_gemv_fp8_pert,
+    esimd_norm_gemv_int4_pert,
+    esimd_norm_gemv_int4_sigmoid,
+)
 
 DEVICE = "xpu"
 CLIB_PATH = os.environ.get(
@@ -33,11 +37,13 @@ def cpu_quantize(weight_fp16, block_size=128):
     return qweight, scale
 
 
-def ref_norm_gemv_fp16(x, z, norm_weight, weight_fp16, HV, V, eps):
+def ref_norm_gemv_fp16(
+    x, z, norm_weight, weight_fp16, HV, V, eps, gate="silu"
+):
     """Reference: RMSNormGated + fp16 matmul on CPU (no quantization).
 
     1. Per-head RMSNorm: normed = x * rsqrt(mean(x^2) + eps) * weight
-    2. SiLU gate: normed *= z * sigmoid(z)
+    2. Gate: normed *= SiLU(z) or sigmoid(z)
     3. FP16 matmul: output = normed_flat @ weight^T
     """
     K = HV * V
@@ -57,9 +63,11 @@ def ref_norm_gemv_fp16(x, z, norm_weight, weight_fp16, HV, V, eps):
         inv_rms = torch.rsqrt(mean_sq + eps)
         normed = xh * inv_rms * nw
 
-        # SiLU gate: silu(z) = z * sigmoid(z)
-        silu_z = zh * torch.sigmoid(zh)
-        normed = normed * silu_z
+        if gate == "sigmoid":
+            gate_z = torch.sigmoid(zh)
+        else:
+            gate_z = zh * torch.sigmoid(zh)
+        normed = normed * gate_z
 
         normed_flat[0, h * V:(h + 1) * V] = normed
 
@@ -186,6 +194,102 @@ def test_norm_gemv_zero_z(HV, V, N):
     # silu(0) = 0 * sigmoid(0) = 0, so gated output = normed * 0 = 0
     assert output.cpu().abs().max().item() == 0.0, \
         f"Expected zero output for zero z gate, got max={output.cpu().abs().max().item()}"
+
+
+@pytest.mark.parametrize("HV,N", [(1, 16), (4, 64), (8, 256)])
+def test_norm_gemv_sigmoid_correctness(HV, N):
+    """The sigmoid ABI matches a reference using the dequantized INT4 weight."""
+    torch.manual_seed(123)
+    V = 128
+    eps = 1e-6
+    K = HV * V
+    x = torch.randn(HV, V, dtype=torch.float16, device=DEVICE)
+    z = torch.randn(HV, V, dtype=torch.float16, device=DEVICE)
+    norm_weight = torch.randn(V, dtype=torch.float16, device=DEVICE) * 0.1 + 1.0
+
+    weight_fp16 = torch.randn(N, K, dtype=torch.float16)
+    qw, sc = cpu_quantize(weight_fp16)
+    weight_deq = cpu_dequantize(qw, sc, N, K)
+    output = torch.empty(1, N, dtype=torch.float16, device=DEVICE)
+    esimd_norm_gemv_int4_sigmoid(
+        x, z, norm_weight, qw.to(DEVICE), sc.to(DEVICE), output,
+        HV, V, eps)
+    torch.xpu.synchronize()
+
+    reference, _ = ref_norm_gemv_fp16(
+        x, z, norm_weight, weight_deq.to(DEVICE), HV, V, eps,
+        gate="sigmoid")
+    error = (output.cpu().float() - reference).abs()
+    relative = error.mean().item() / (reference.abs().mean().item() + 1e-6)
+    assert relative < 0.05, f"sigmoid INT4 relative error is {relative:.6f}"
+    assert error.max().item() < 0.2, f"sigmoid INT4 max error is {error.max().item():.6f}"
+
+
+def test_norm_gemv_sigmoid_zero_gate_is_distinct_from_legacy_silu():
+    """At z=0, sigmoid produces half the normalized value while SiLU is zero."""
+    HV, V, N = 1, 128, 16
+    K = HV * V
+    x = torch.ones(HV, V, dtype=torch.float16, device=DEVICE)
+    z = torch.zeros(HV, V, dtype=torch.float16, device=DEVICE)
+    norm_weight = torch.ones(V, dtype=torch.float16, device=DEVICE)
+    weight_fp16 = torch.full((N, K), 0.5, dtype=torch.float16)
+    qw, sc = cpu_quantize(weight_fp16)
+    qw = qw.to(DEVICE)
+    sc = sc.to(DEVICE)
+    sigmoid_output = torch.empty(1, N, dtype=torch.float16, device=DEVICE)
+    silu_output = torch.empty(1, N, dtype=torch.float16, device=DEVICE)
+
+    esimd_norm_gemv_int4_sigmoid(
+        x, z, norm_weight, qw, sc, sigmoid_output, HV, V, 1e-6)
+    esimd_norm_gemv_int4_pert(
+        x, z, norm_weight, qw, sc, silu_output, HV, V, 1e-6)
+    torch.xpu.synchronize()
+
+    assert silu_output.cpu().abs().max().item() == 0.0
+    assert sigmoid_output.cpu().abs().max().item() > 1.0
+    reference, _ = ref_norm_gemv_fp16(
+        x, z, norm_weight, cpu_dequantize(qw, sc, N, K).to(DEVICE),
+        HV, V, 1e-6, gate="sigmoid")
+    torch.testing.assert_close(
+        sigmoid_output.cpu().float(), reference, rtol=0.05, atol=0.05)
+
+
+@pytest.mark.parametrize("z_value", [-20.0, 20.0])
+def test_norm_gemv_sigmoid_extreme_gate(z_value):
+    """Large positive and negative gates remain numerically finite and accurate."""
+    HV, V, N = 4, 128, 32
+    K = HV * V
+    x = torch.ones(HV, V, dtype=torch.float16, device=DEVICE)
+    z = torch.full((HV, V), z_value, dtype=torch.float16, device=DEVICE)
+    norm_weight = torch.ones(V, dtype=torch.float16, device=DEVICE)
+    weight_fp16 = torch.full((N, K), 0.25, dtype=torch.float16)
+    qw, sc = cpu_quantize(weight_fp16)
+    output = torch.empty(1, N, dtype=torch.float16, device=DEVICE)
+    esimd_norm_gemv_int4_sigmoid(
+        x, z, norm_weight, qw.to(DEVICE), sc.to(DEVICE), output,
+        HV, V, 1e-6)
+    torch.xpu.synchronize()
+
+    reference, _ = ref_norm_gemv_fp16(
+        x, z, norm_weight, cpu_dequantize(qw, sc, N, K).to(DEVICE),
+        HV, V, 1e-6, gate="sigmoid")
+    assert torch.isfinite(output).all().item()
+    torch.testing.assert_close(
+        output.cpu().float(), reference, rtol=0.05, atol=0.05)
+
+
+def test_norm_gemv_sigmoid_rejects_non_128_head_dim():
+    """The INT4 scale layout is invalid when V is not the fixed 128."""
+    HV, V, N = 1, 64, 16
+    x = torch.ones(HV, V, dtype=torch.float16, device=DEVICE)
+    z = torch.ones_like(x)
+    norm_weight = torch.ones(V, dtype=torch.float16, device=DEVICE)
+    weight = torch.zeros(N, HV * V // 8, dtype=torch.int32, device=DEVICE)
+    scale = torch.ones(N, HV * V // 128, dtype=torch.float16, device=DEVICE)
+    output = torch.empty(1, N, dtype=torch.float16, device=DEVICE)
+    with pytest.raises(RuntimeError, match="V == 128"):
+        esimd_norm_gemv_int4_sigmoid(
+            x, z, norm_weight, weight, scale, output, HV, V, 1e-6)
 
 
 @pytest.mark.parametrize("HV,V,N", [

@@ -177,6 +177,13 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
         "int HV, int V, float eps) -> Tensor");
   m.impl("esimd_norm_gemv_int4_pert", torch::kXPU, &esimd_norm_gemv_int4_pert);
 
+  // Separate ABI: the legacy _pert entry point uses SiLU gating.
+  m.def("esimd_norm_gemv_int4_sigmoid(Tensor x, Tensor z, Tensor norm_weight, "
+        "Tensor gemv_weight, Tensor gemv_scale, Tensor output, "
+        "int HV, int V, float eps) -> Tensor");
+  m.impl("esimd_norm_gemv_int4_sigmoid", torch::kXPU,
+         &esimd_norm_gemv_int4_sigmoid);
+
   // Standalone RMSNorm (no add): for the spots where input differs from
   // the accumulating residual stream (post_attn_norm, post_ff_norm_1, etc.).
   m.def("esimd_rms_norm(Tensor input, Tensor output, "
