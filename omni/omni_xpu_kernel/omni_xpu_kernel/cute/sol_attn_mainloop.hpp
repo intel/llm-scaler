@@ -1586,7 +1586,12 @@ struct SolFwdMainloop : DenseMainloop {
         decltype(tA_sum.size())::value);
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tA_sum.size(); ++i) {
-      tA_sum(i) = tA_sum_full(i);
+      // A fully masked row has a zero numerator and zero softmax sum. Keep the
+      // zero numerator, but use a unit denominator so the shared epilogue
+      // produces the explicitly defined finite-zero result instead of 0 / 0.
+      tA_sum(i) = tA_sum_full(i) == ElementA(0)
+          ? ElementA(1)
+          : tA_sum_full(i);
     }
   }
 };
