@@ -1270,7 +1270,6 @@ sudo docker exec -it test bash
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 # or ```export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=0```
-export ZE_AFFINITY_MASK=0,1 # assuming use the first two Arc GPUs
 
 vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 \
   --max-num-batched-tokens 8192 --max-model-len 40000 --block-size 64 \
@@ -1319,7 +1318,6 @@ The gemma-4 models (12B-it, 31B-it and 26B-A4B-it) and diffusiongemma-26B-A4B-it
 Reference commands for running gemma-4-12B-it model with fp8 quantization: 
 
 ```bash
-export ZE_AFFINITY_MASK=0 
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 
 export VLLM_WORKER_MULTIPROC_METHOD=spawn 
 export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 
@@ -1330,7 +1328,6 @@ vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-to
 Reference commands for running diffusiongemma-26B-A4B-it model with fp8 quantization: 
 
 ```bash 
-export ZE_AFFINITY_MASK=0,1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
@@ -1373,7 +1370,6 @@ adapters and model-specific 3D expert adapters are supported.
 Example for Qwen3.6-27B with two LoRA adapters:
 
 ```bash
-export ZE_AFFINITY_MASK=0,1
 export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -1385,7 +1381,6 @@ vllm serve --port 8000 --host 0.0.0.0 --gpu-memory-util 0.9 --max-num-batched-to
 Example for Qwen3.6-35B-A3B with a single LoRA adapter:
 
 ```bash
-export ZE_AFFINITY_MASK=0,1
 export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -1444,7 +1439,6 @@ Weight quantization and KV-cache quantization are independent. For example,
 The following Qwen3.6-27B command uses static FP8 KV-cache scales:
 
 ```bash
-export ZE_AFFINITY_MASK=0,1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
@@ -1548,7 +1542,6 @@ For instance, start the meta-models/Muse-Glimmer-30B model with:
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1
-export ZE_AFFINITY_MASK=0,1
 
 # Use these two variables and add the DFlash config to improve performance.
 #export DISABLE_MUSE_GLIMMER_MLP_ESIMD=1
