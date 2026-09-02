@@ -11,10 +11,11 @@ from omni_xpu_kernel import cute
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOL_CONFIG = PROJECT_ROOT / "omni_xpu_kernel/cute/sol_attn_config.h"
+SOL_PREPARE = PROJECT_ROOT / "omni_xpu_kernel/cute/sol_attn_prepare.cpp"
 SOL_WRAPPER = PROJECT_ROOT / "omni_xpu_kernel/cute/sol_attn_torch.cpp"
 
 
-def test_sol_attn_capability_requires_prepare_and_forward(monkeypatch):
+def test_sol_attn_capability_requires_control_aware_ops(monkeypatch):
     monkeypatch.setattr(cute, "_ensure_loaded", lambda: None)
     monkeypatch.setattr(
         cute,
@@ -27,11 +28,40 @@ def test_sol_attn_capability_requires_prepare_and_forward(monkeypatch):
         cute,
         "_sol_attn_ops",
         lambda: SimpleNamespace(
-            prepare=lambda: None,
-            forward_cute=lambda: None,
+            prepare_with_controls=lambda: None,
+            forward_cute_with_controls=lambda: None,
         ),
     )
     assert cute.supports_sol_attn() is True
+
+
+def test_sol_attn_native_ops_preserve_legacy_caller_abi():
+    prepare = "".join(SOL_PREPARE.read_text(encoding="utf-8").split())
+    wrapper = "".join(SOL_WRAPPER.read_text(encoding="utf-8").split())
+
+    assert (
+        '"prepare(Tensorq,Tensork,Tensorv,floatscale,floattau,"'
+        '"intsink_start,intsink_end,intsink_q_start,intsink_q_end)"'
+        '"->(Tensor,Tensor,Tensor,Tensor,Tensor)"'
+    ) in prepare
+    assert (
+        '"prepare_with_controls(Tensorq,Tensork,Tensorv,floatscale,"'
+        '"floattau,intsink_start,intsink_end,intsink_q_start,"'
+        '"intsink_q_end,inttopk_count,Tensorblock_len)"'
+        '"->(Tensor,Tensor,Tensor,Tensor,Tensor,Tensor)"'
+    ) in prepare
+    assert (
+        '"forward_cute(Tensorq,Tensork,Tensorv,Tensork_centroids,"'
+        '"Tensorv_means,Tensorq_centroids,Tensorthresholds,"'
+        '"Tensorkey_sinks,floatscale)->Tensor"'
+    ) in wrapper
+    assert "forward_cute_with_controls" in wrapper
+    assert (
+        '"forward_cute_serial_route_parent(Tensorq,Tensork,Tensorv,"'
+        '"Tensork_centroids,Tensorv_means,Tensorq_centroids,"'
+        '"Tensorthresholds,Tensorkey_sinks,floatscale)->Tensor"'
+    ) in wrapper
+    assert "forward_cute_serial_route_parent_with_controls" in wrapper
 
 
 def test_sol_attn_hides_native_prepare_contract(monkeypatch):
@@ -50,7 +80,10 @@ def test_sol_attn_hides_native_prepare_contract(monkeypatch):
     monkeypatch.setattr(
         cute,
         "_sol_attn_ops",
-        lambda: SimpleNamespace(prepare=prepare, forward_cute=forward),
+        lambda: SimpleNamespace(
+            prepare_with_controls=prepare,
+            forward_cute_with_controls=forward,
+        ),
     )
     q = torch.empty((1, 15787, 56, 128), device="meta")
     k = object()
@@ -100,7 +133,7 @@ def test_sol_attn_forwards_tail_bias_and_block_lengths(
         cute,
         "_sol_attn_ops",
         lambda: SimpleNamespace(
-            prepare=lambda *args: (
+            prepare_with_controls=lambda *args: (
                 "kc",
                 "vm",
                 "qc",
@@ -108,7 +141,8 @@ def test_sol_attn_forwards_tail_bias_and_block_lengths(
                 "sinks",
                 "topk_routes",
             ),
-            forward_cute=lambda *args: calls.append(args) or "out",
+            forward_cute_with_controls=lambda *args: calls.append(args)
+            or "out",
         ),
     )
     q = torch.empty((1, 64, 1, 128))
@@ -164,7 +198,7 @@ def test_sol_attn_topk_budget_matches_kitchen_rounding(monkeypatch):
         cute,
         "_sol_attn_ops",
         lambda: SimpleNamespace(
-            prepare=lambda *args: prepare_calls.append(args)
+            prepare_with_controls=lambda *args: prepare_calls.append(args)
             or (
                 "kc",
                 "vm",
@@ -173,7 +207,7 @@ def test_sol_attn_topk_budget_matches_kitchen_rounding(monkeypatch):
                 "sinks",
                 "topk_routes",
             ),
-            forward_cute=lambda *args: "out",
+            forward_cute_with_controls=lambda *args: "out",
         ),
     )
     q = torch.empty((1, 64 * 10, 1, 128))
@@ -208,7 +242,7 @@ def test_sol_attn_adds_coarse_gate_from_prepared_block_means(monkeypatch):
         cute,
         "_sol_attn_ops",
         lambda: SimpleNamespace(
-            prepare=lambda *args: (
+            prepare_with_controls=lambda *args: (
                 k_centroids,
                 v_means,
                 q_centroids,
@@ -216,7 +250,7 @@ def test_sol_attn_adds_coarse_gate_from_prepared_block_means(monkeypatch):
                 sinks,
                 routes,
             ),
-            forward_cute=lambda *args: torch.zeros_like(q),
+            forward_cute_with_controls=lambda *args: torch.zeros_like(q),
         ),
     )
     gate = torch.full_like(q, 0.5)
@@ -229,7 +263,10 @@ def test_sol_attn_rejects_malformed_sink_ranges(monkeypatch):
     monkeypatch.setattr(
         cute,
         "_sol_attn_ops",
-        lambda: SimpleNamespace(prepare=lambda: None, forward_cute=lambda: None),
+        lambda: SimpleNamespace(
+            prepare_with_controls=lambda: None,
+            forward_cute_with_controls=lambda: None,
+        ),
     )
     q = torch.empty((1, 64, 1, 128))
     with pytest.raises(ValueError, match="must each contain two indices"):

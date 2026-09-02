@@ -174,6 +174,36 @@ def reference(
 @pytest.mark.skipif(
     not has_bmg_sol_attn(), reason="BMG packaged Sol-Attn unavailable"
 )
+def test_sol_attn_legacy_raw_ops_remain_callable():
+    from omni_xpu_kernel import cute
+
+    generator = torch.Generator(device="xpu").manual_seed(17)
+    shape = (1, 129, 1, 128)
+    q = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    k = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    v = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    scale = 128**-0.5
+    ops = torch.ops.omni_xpu_sol_attn
+    prepared = ops.prepare(q, k, v, scale, 1.0, 0, 0, 0, 0)
+
+    assert len(prepared) == 5
+    expected = cute.sol_attn(q, k, v, scale=scale)
+    for op_name in (
+        "forward_cute",
+        "forward_cute_parent",
+        "forward_cute_serial_route_parent",
+    ):
+        if not hasattr(ops, op_name):
+            continue
+        actual = getattr(ops, op_name)(q, k, v, *prepared, scale)
+        torch.xpu.synchronize()
+        torch.testing.assert_close(actual, expected, rtol=5e-2, atol=5e-2)
+        assert torch.isfinite(actual).all()
+
+
+@pytest.mark.skipif(
+    not has_bmg_sol_attn(), reason="BMG packaged Sol-Attn unavailable"
+)
 @pytest.mark.parametrize(
     "tokens,heads,tau,sink_blocks,sink_q,seed",
     [

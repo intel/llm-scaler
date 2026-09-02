@@ -212,7 +212,9 @@ def supports_sol_attn() -> bool:
     try:
         _ensure_loaded()
         ops = _sol_attn_ops()
-        return hasattr(ops, "prepare") and hasattr(ops, "forward_cute")
+        return hasattr(ops, "prepare_with_controls") and hasattr(
+            ops, "forward_cute_with_controls"
+        )
     except Exception:
         return False
 
@@ -240,7 +242,9 @@ def sol_attn(
     """
     _ensure_loaded()
     ops = _sol_attn_ops()
-    if not hasattr(ops, "prepare") or not hasattr(ops, "forward_cute"):
+    if not hasattr(ops, "prepare_with_controls") or not hasattr(
+        ops, "forward_cute_with_controls"
+    ):
         raise RuntimeError("packaged Sol-Attn is unavailable in this sidecar")
     sink_blocks = (0, 0) if sink_blocks is None else sink_blocks
     sink_q = (0, 0) if sink_q is None else sink_q
@@ -325,7 +329,7 @@ def sol_attn(
             ),
         )
     scale_value = q.shape[-1] ** -0.5 if scale is None else float(scale)
-    prepared = ops.prepare(
+    prepared = ops.prepare_with_controls(
         q,
         k,
         v,
@@ -338,7 +342,7 @@ def sol_attn(
         int(topk_count),
         block_lengths,
     )
-    output = ops.forward_cute(
+    output = ops.forward_cute_with_controls(
         q,
         k,
         v,

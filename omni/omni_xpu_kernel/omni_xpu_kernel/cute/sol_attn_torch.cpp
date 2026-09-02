@@ -563,7 +563,7 @@ bool use_b580_tile_policy(const at::Tensor& q) {
       !selection.forced;
 }
 
-at::Tensor forward_cute(
+at::Tensor forward_cute_with_controls(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
@@ -612,8 +612,36 @@ at::Tensor forward_cute(
       key_bias, block_len, scale_value, tail, route_inclusive);
 }
 
+at::Tensor forward_cute(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& k_centroids,
+    const at::Tensor& v_means,
+#if SOL_ATTN_INLINE_ROUTE
+    const at::Tensor& q_centroids,
+    const at::Tensor& thresholds,
+    const at::Tensor& key_sinks,
+#else
+    const at::Tensor& routes,
+#endif
+    double scale_value) {
+  auto key_bias = at::empty({0}, q.options().dtype(at::kFloat));
+  auto block_len = at::empty({0}, q.options().dtype(at::kInt));
+#if SOL_ATTN_INLINE_ROUTE
+  auto topk_routes = at::empty({0}, q.options().dtype(at::kByte));
+  return forward_cute_with_controls(
+      q, k, v, k_centroids, v_means, q_centroids, thresholds, key_sinks,
+      topk_routes, key_bias, block_len, scale_value, true, false);
+#else
+  return forward_cute_with_controls(
+      q, k, v, k_centroids, v_means, routes, key_bias, block_len,
+      scale_value, true, false);
+#endif
+}
+
 #if SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS
-at::Tensor forward_cute_parent(
+at::Tensor forward_cute_parent_with_controls(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
@@ -661,10 +689,38 @@ at::Tensor forward_cute_parent(
 #endif
       key_bias, block_len, scale_value, tail, route_inclusive);
 }
+
+at::Tensor forward_cute_parent(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& k_centroids,
+    const at::Tensor& v_means,
+#if SOL_ATTN_INLINE_ROUTE
+    const at::Tensor& q_centroids,
+    const at::Tensor& thresholds,
+    const at::Tensor& key_sinks,
+#else
+    const at::Tensor& routes,
+#endif
+    double scale_value) {
+  auto key_bias = at::empty({0}, q.options().dtype(at::kFloat));
+  auto block_len = at::empty({0}, q.options().dtype(at::kInt));
+#if SOL_ATTN_INLINE_ROUTE
+  auto topk_routes = at::empty({0}, q.options().dtype(at::kByte));
+  return forward_cute_parent_with_controls(
+      q, k, v, k_centroids, v_means, q_centroids, thresholds, key_sinks,
+      topk_routes, key_bias, block_len, scale_value, true, false);
+#else
+  return forward_cute_parent_with_controls(
+      q, k, v, k_centroids, v_means, routes, key_bias, block_len,
+      scale_value, true, false);
+#endif
+}
 #endif
 
 #if SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE
-at::Tensor forward_cute_serial_route_parent(
+at::Tensor forward_cute_serial_route_parent_with_controls(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
@@ -712,6 +768,34 @@ at::Tensor forward_cute_serial_route_parent(
 #endif
       key_bias, block_len, scale_value, tail, route_inclusive);
 }
+
+at::Tensor forward_cute_serial_route_parent(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& k_centroids,
+    const at::Tensor& v_means,
+#if SOL_ATTN_INLINE_ROUTE
+    const at::Tensor& q_centroids,
+    const at::Tensor& thresholds,
+    const at::Tensor& key_sinks,
+#else
+    const at::Tensor& routes,
+#endif
+    double scale_value) {
+  auto key_bias = at::empty({0}, q.options().dtype(at::kFloat));
+  auto block_len = at::empty({0}, q.options().dtype(at::kInt));
+#if SOL_ATTN_INLINE_ROUTE
+  auto topk_routes = at::empty({0}, q.options().dtype(at::kByte));
+  return forward_cute_serial_route_parent_with_controls(
+      q, k, v, k_centroids, v_means, q_centroids, thresholds, key_sinks,
+      topk_routes, key_bias, block_len, scale_value, true, false);
+#else
+  return forward_cute_serial_route_parent_with_controls(
+      q, k, v, k_centroids, v_means, routes, key_bias, block_len,
+      scale_value, true, false);
+#endif
+}
 #endif
 
 }  // namespace omni_xpu_sol_attn::cute_backend
@@ -721,37 +805,65 @@ TORCH_LIBRARY_FRAGMENT(omni_xpu_sol_attn, m) {
   m.def(
       "forward_cute(Tensor q, Tensor k, Tensor v, Tensor k_centroids, "
       "Tensor v_means, Tensor q_centroids, Tensor thresholds, "
-      "Tensor key_sinks, Tensor topk_routes, Tensor key_bias, Tensor block_len, float scale, bool tail, "
+      "Tensor key_sinks, float scale) -> Tensor");
+  m.def(
+      "forward_cute_with_controls(Tensor q, Tensor k, Tensor v, "
+      "Tensor k_centroids, Tensor v_means, Tensor q_centroids, "
+      "Tensor thresholds, Tensor key_sinks, Tensor topk_routes, "
+      "Tensor key_bias, Tensor block_len, float scale, bool tail, "
       "bool route_inclusive) -> Tensor");
 #if SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS
   m.def(
       "forward_cute_parent(Tensor q, Tensor k, Tensor v, Tensor k_centroids, "
       "Tensor v_means, Tensor q_centroids, Tensor thresholds, "
-      "Tensor key_sinks, Tensor topk_routes, Tensor key_bias, Tensor block_len, float scale, bool tail, "
+      "Tensor key_sinks, float scale) -> Tensor");
+  m.def(
+      "forward_cute_parent_with_controls(Tensor q, Tensor k, Tensor v, "
+      "Tensor k_centroids, Tensor v_means, Tensor q_centroids, "
+      "Tensor thresholds, Tensor key_sinks, Tensor topk_routes, "
+      "Tensor key_bias, Tensor block_len, float scale, bool tail, "
       "bool route_inclusive) -> Tensor");
 #endif
 #if SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE
   m.def(
       "forward_cute_serial_route_parent(Tensor q, Tensor k, Tensor v, "
       "Tensor k_centroids, Tensor v_means, Tensor q_centroids, "
-      "Tensor thresholds, Tensor key_sinks, Tensor topk_routes, Tensor key_bias, Tensor block_len, float scale, "
+      "Tensor thresholds, Tensor key_sinks, float scale) -> Tensor");
+  m.def(
+      "forward_cute_serial_route_parent_with_controls(Tensor q, Tensor k, "
+      "Tensor v, Tensor k_centroids, Tensor v_means, Tensor q_centroids, "
+      "Tensor thresholds, Tensor key_sinks, Tensor topk_routes, "
+      "Tensor key_bias, Tensor block_len, float scale, "
       "bool tail, bool route_inclusive) -> Tensor");
 #endif
 #else
   m.def(
       "forward_cute(Tensor q, Tensor k, Tensor v, Tensor k_centroids, "
-      "Tensor v_means, Tensor routes, Tensor key_bias, Tensor block_len, float scale, bool tail, "
+      "Tensor v_means, Tensor routes, float scale) -> Tensor");
+  m.def(
+      "forward_cute_with_controls(Tensor q, Tensor k, Tensor v, "
+      "Tensor k_centroids, Tensor v_means, Tensor routes, Tensor key_bias, "
+      "Tensor block_len, float scale, bool tail, "
       "bool route_inclusive) -> Tensor");
 #if SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS
   m.def(
       "forward_cute_parent(Tensor q, Tensor k, Tensor v, Tensor k_centroids, "
-      "Tensor v_means, Tensor routes, Tensor key_bias, Tensor block_len, float scale, bool tail, "
+      "Tensor v_means, Tensor routes, float scale) -> Tensor");
+  m.def(
+      "forward_cute_parent_with_controls(Tensor q, Tensor k, Tensor v, "
+      "Tensor k_centroids, Tensor v_means, Tensor routes, Tensor key_bias, "
+      "Tensor block_len, float scale, bool tail, "
       "bool route_inclusive) -> Tensor");
 #endif
 #if SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE
   m.def(
       "forward_cute_serial_route_parent(Tensor q, Tensor k, Tensor v, "
-      "Tensor k_centroids, Tensor v_means, Tensor routes, Tensor key_bias, Tensor block_len, float scale, "
+      "Tensor k_centroids, Tensor v_means, Tensor routes, float scale) "
+      "-> Tensor");
+  m.def(
+      "forward_cute_serial_route_parent_with_controls(Tensor q, Tensor k, "
+      "Tensor v, Tensor k_centroids, Tensor v_means, Tensor routes, "
+      "Tensor key_bias, Tensor block_len, float scale, "
       "bool tail, bool route_inclusive) -> Tensor");
 #endif
 #endif
@@ -759,14 +871,24 @@ TORCH_LIBRARY_FRAGMENT(omni_xpu_sol_attn, m) {
 
 TORCH_LIBRARY_IMPL(omni_xpu_sol_attn, XPU, m) {
   m.impl("forward_cute", &omni_xpu_sol_attn::cute_backend::forward_cute);
+  m.impl(
+      "forward_cute_with_controls",
+      &omni_xpu_sol_attn::cute_backend::forward_cute_with_controls);
 #if SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS
   m.impl(
       "forward_cute_parent",
       &omni_xpu_sol_attn::cute_backend::forward_cute_parent);
+  m.impl(
+      "forward_cute_parent_with_controls",
+      &omni_xpu_sol_attn::cute_backend::forward_cute_parent_with_controls);
 #endif
 #if SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE
   m.impl(
       "forward_cute_serial_route_parent",
       &omni_xpu_sol_attn::cute_backend::forward_cute_serial_route_parent);
+  m.impl(
+      "forward_cute_serial_route_parent_with_controls",
+      &omni_xpu_sol_attn::cute_backend::
+          forward_cute_serial_route_parent_with_controls);
 #endif
 }

@@ -64,9 +64,9 @@ std::tuple<
     at::Tensor,
     at::Tensor,
     at::Tensor,
-    at::Tensor> prepare(
+    at::Tensor> prepare_with_controls(
 #else
-std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare_with_controls(
 #endif
     const at::Tensor& q,
     const at::Tensor& k,
@@ -423,6 +423,36 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare(
 #endif
 }
 
+#if SOL_ATTN_INLINE_ROUTE
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> prepare(
+#else
+std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare(
+#endif
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    double scale_value,
+    double tau_value,
+    int64_t sink_start,
+    int64_t sink_end,
+    int64_t sink_q_start,
+    int64_t sink_q_end) {
+  auto block_len = at::empty({0}, q.options().dtype(at::kInt));
+  auto prepared = prepare_with_controls(
+      q, k, v, scale_value, tau_value, sink_start, sink_end,
+      sink_q_start, sink_q_end, -1, block_len);
+#if SOL_ATTN_INLINE_ROUTE
+  return {
+      std::get<0>(prepared),
+      std::get<1>(prepared),
+      std::get<2>(prepared),
+      std::get<3>(prepared),
+      std::get<4>(prepared)};
+#else
+  return prepared;
+#endif
+}
+
 at::Tensor materialize_routes(
     const at::Tensor& k_centroids,
     const at::Tensor& q_centroids,
@@ -518,14 +548,22 @@ TORCH_LIBRARY_FRAGMENT(omni_xpu_sol_attn, m) {
 #if SOL_ATTN_INLINE_ROUTE
   m.def(
       "prepare(Tensor q, Tensor k, Tensor v, float scale, float tau, "
-      "int sink_start, int sink_end, int sink_q_start, int sink_q_end, "
-      "int topk_count, Tensor block_len) "
+      "int sink_start, int sink_end, int sink_q_start, int sink_q_end) "
+      "-> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+  m.def(
+      "prepare_with_controls(Tensor q, Tensor k, Tensor v, float scale, "
+      "float tau, int sink_start, int sink_end, int sink_q_start, "
+      "int sink_q_end, int topk_count, Tensor block_len) "
       "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
 #else
   m.def(
       "prepare(Tensor q, Tensor k, Tensor v, float scale, float tau, "
-      "int sink_start, int sink_end, int sink_q_start, int sink_q_end, "
-      "int topk_count, Tensor block_len) "
+      "int sink_start, int sink_end, int sink_q_start, int sink_q_end) "
+      "-> (Tensor, Tensor, Tensor)");
+  m.def(
+      "prepare_with_controls(Tensor q, Tensor k, Tensor v, float scale, "
+      "float tau, int sink_start, int sink_end, int sink_q_start, "
+      "int sink_q_end, int topk_count, Tensor block_len) "
       "-> (Tensor, Tensor, Tensor)");
 #endif
   m.def(
@@ -535,5 +573,8 @@ TORCH_LIBRARY_FRAGMENT(omni_xpu_sol_attn, m) {
 
 TORCH_LIBRARY_IMPL(omni_xpu_sol_attn, XPU, m) {
   m.impl("prepare", &omni_xpu_sol_attn::prepare);
+  m.impl(
+      "prepare_with_controls",
+      &omni_xpu_sol_attn::prepare_with_controls);
   m.impl("materialize_routes", &omni_xpu_sol_attn::materialize_routes);
 }
