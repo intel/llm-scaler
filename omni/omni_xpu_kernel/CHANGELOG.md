@@ -5,20 +5,12 @@ Notable user-facing changes will be recorded here when a public
 
 ## Unreleased
 
-No public release has been published.
-
-## 0.2.0b1 - 2026-08-10
-
-- Add the focused ComfyUI v0.31 image with pinned XPU Kitchen and AIMDO
-  integrations.
-- Include the accepted BMG and PTL-H kernel routes accumulated for the
-  preview milestone.
-
-## 0.1.0b9.dev1 - 2026-08-05
-
-- Vendor the validated oneDNN 3.9.1 runtime and redistribution notices in
-  Windows wheels.
-- Prefer the wheel-private `dnnl.dll` at runtime and retain system oneAPI only
-  as a source-checkout and legacy-wheel fallback.
-- Remove the ineffective Windows `onednn` Python package dependency while
-  preserving the Linux dependency and runtime layout.
+- Support the current Torch 2.13 XPU runtime and matched oneAPI 2026.0
+  oneDNN 3.11.2 development contract on Windows.
+- Vendor the validated `dnnl.dll` and redistribution notices in Windows
+  wheels.
+- Add the explicit Windows BMG CUTE FMHA and Sol-Attn sidecar build.
+- Discover ABI-suffixed Windows `.pyd` extensions and expose the packaged
+  Sol-Attn API.
+- Keep Windows CUTE compilation and ComfyUI routing as separate explicit
+  opt-ins.
