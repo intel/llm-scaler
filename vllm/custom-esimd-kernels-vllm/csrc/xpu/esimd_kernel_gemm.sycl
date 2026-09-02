@@ -67,6 +67,11 @@ at::Tensor esimd_gemm_int4_pgrp(
                 "esimd_gemm_int4_pgrp: weight_scale must be fp16");
     TORCH_CHECK(output.scalar_type() == at::ScalarType::Half,
                 "esimd_gemm_int4_pgrp: output must be fp16");
+    // int4_GEMM.h has eight 8-row tiles as its largest specialization.
+    // Reject direct oversized calls so callers cannot receive a partially
+    // written output; the PLE wrapper chunks larger batches before dispatch.
+    TORCH_CHECK(M >= 2 && M <= 64,
+                "esimd_gemm_int4_pgrp: M must be in [2, 64], got M=", M);
     TORCH_CHECK(N % 16 == 0,
                 "esimd_gemm_int4_pgrp: N must be a multiple of 16 (DPAS N tile), got N=", N);
     TORCH_CHECK(K % INT4_GEMM_GROUP_SIZE == 0,

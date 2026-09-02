@@ -25,7 +25,7 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
 
   // Per-tensor scale variants (N/K inferred from weight shape)
   // FP16 GEMV (no scale): for fp16 GateLinear-style decode router projection
-  m.def("esimd_gemv_fp16(Tensor input, Tensor weight, Tensor output) -> Tensor");
+  m.def("esimd_gemv_fp16(Tensor input, Tensor weight, Tensor(a!) output) -> Tensor(a!)");
   m.impl("esimd_gemv_fp16", torch::kXPU, &esimd_gemv_fp16);
 
   m.def("esimd_gemv_fp16_gelu_mul(Tensor input, Tensor weight, "
@@ -51,7 +51,7 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
   // INT4 GEMV with per-group scale (group_size=128)
   // Weight [N, K/2] uint8 packed, scale [N, K/128] fp16. N/K auto-detected.
   m.def("esimd_gemv_int4(Tensor input, Tensor weight, Tensor weight_scale, "
-        "Tensor output) -> Tensor");
+        "Tensor(a!) output) -> Tensor(a!)");
   m.impl("esimd_gemv_int4", torch::kXPU, &esimd_gemv_int4);
 
   // Fused 2-matrix INT4 GEMV (GDN in_proj_qkvz + in_proj_ba)
@@ -204,6 +204,39 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
         "Tensor w1, Tensor w2, Tensor out, int top_k, "
         "float eps1, float eps2) -> ()");
   m.impl("esimd_accum_norm_add_norm", torch::kXPU, &esimd_accum_norm_add_norm);
+
+  m.def("esimd_qwen38_ngram_ids_decode(Tensor input_ids, "
+        "Tensor ngram_context, Tensor layer_multipliers) -> Tensor");
+  m.impl("esimd_qwen38_ngram_ids_decode", torch::kXPU,
+         &esimd_qwen38_ngram_ids_decode);
+
+  m.def("esimd_qwen38_ngram_ids_decode_out(Tensor input_ids, "
+        "Tensor ngram_context, Tensor layer_multipliers, "
+        "Tensor(a!) output) -> ()");
+  m.impl("esimd_qwen38_ngram_ids_decode_out", torch::kXPU,
+         [](at::Tensor input_ids, at::Tensor ngram_context,
+            at::Tensor layer_multipliers, at::Tensor output) -> void {
+           esimd_qwen38_ngram_ids_decode_out(
+               input_ids, ngram_context, layer_multipliers, output);
+         });
+
+  m.def("esimd_qwen38_ngram_embedding_gather(Tensor ngram_ids, "
+        "Tensor local_weight, Tensor local_vocab_start, "
+        "Tensor local_num_rows) -> Tensor");
+  m.impl("esimd_qwen38_ngram_embedding_gather", torch::kXPU,
+         &esimd_qwen38_ngram_embedding_gather);
+
+  m.def("esimd_qwen38_ngram_embedding_gather_out(Tensor ngram_ids, "
+        "Tensor local_weight, Tensor local_vocab_start, "
+        "Tensor local_num_rows, Tensor(a!) local_partial) -> ()");
+  m.impl("esimd_qwen38_ngram_embedding_gather_out", torch::kXPU,
+         [](at::Tensor ngram_ids, at::Tensor local_weight,
+            at::Tensor local_vocab_start, at::Tensor local_num_rows,
+            at::Tensor local_partial) -> void {
+           esimd_qwen38_ngram_embedding_gather_out(
+               ngram_ids, local_weight, local_vocab_start, local_num_rows,
+               local_partial);
+         });
 
   m.def("esimd_gemv_fp8_pert_bmg(Tensor input, Tensor weight, Tensor weight_scale, Tensor output) -> Tensor");
   m.impl("esimd_gemv_fp8_pert_bmg", torch::kXPU, &esimd_gemv_fp8_pert_bmg);

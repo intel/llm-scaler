@@ -15,8 +15,34 @@ from custom_esimd_kernels_vllm import moe_ops
 # MoE INT4 Batch kernels — registers torch.ops.moe_int4_ops.*
 from custom_esimd_kernels_vllm import moe_int4_ops
 
+# Qwen3.8 QSA — direct pybind API: qsa_ops.sparse_paged_attention(...)
+from custom_esimd_kernels_vllm import qsa_ops
+
 from custom_esimd_kernels_vllm.ops import (
     # Core ESIMD ops
+    QWEN38_NGRAM_OFFSETS,
+    QWEN38_NGRAM_VOCAB_SIZES,
+    esimd_qwen38_ngram_ids_decode,
+    esimd_qwen38_ngram_ids_decode_out,
+    esimd_qwen38_ngram_embedding_gather,
+    esimd_qwen38_ngram_embedding_gather_out,
+    ple_ngram_ids,
+    ple_embedding_gather,
+    ple_grouped_norm,
+    ple_score_gate,
+    ple_gated_value,
+    ple_gated_value_norm,
+    ple_embedding_assemble,
+    ple_projection_int4,
+    ple_projection_fp16,
+    ple_staged,
+    ple_staged_full,
+    ple_short_conv_mixed,
+    ple_short_conv_mixed_three_way,
+    ple_residual_add,
+    ple_short_conv_decode,
+    ple_short_conv_prefill,
+    ple_short_conv_spec,
     esimd_gemv_fp8_pern,
     esimd_gemv_fp8_pern_fused2,
     esimd_gemv_fp8_pern_fused3,

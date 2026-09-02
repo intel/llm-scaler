@@ -1,0 +1,824 @@
+// Copyright 2026
+// SPDX-License-Identifier: Apache-2.0
+//
+// Fixed-contract Qwen3.8 TP8-rank sparse paged attention for Intel XPU.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+
+#include <sycl/sycl.hpp>
+
+#include <cmath>
+#include <cstdint>
+#include <limits>
+
+#include "qsa_ops.h"
+
+namespace {
+
+#ifndef QSA_NATIVE_ACTIVATION_FP16
+#define QSA_NATIVE_ACTIVATION_FP16 0
+#endif
+
+#if QSA_NATIVE_ACTIVATION_FP16
+using activation_t = sycl::half;
+constexpr at::ScalarType kActivationScalarType = at::kHalf;
+constexpr const char* kActivationName = "float16";
+#else
+using activation_t = sycl::ext::oneapi::bfloat16;
+constexpr at::ScalarType kActivationScalarType = at::kBFloat16;
+constexpr const char* kActivationName = "bfloat16";
+#endif
+
+#ifndef QSA_NATIVE_KV_TILE
+#define QSA_NATIVE_KV_TILE 32
+#endif
+
+#ifndef QSA_NATIVE_SUBGROUP
+#define QSA_NATIVE_SUBGROUP 16
+#endif
+
+#ifndef QSA_NATIVE_TOKEN_LOADER
+#define QSA_NATIVE_TOKEN_LOADER 0
+#endif
+
+#ifndef QSA_NATIVE_TRIM_VALID_WIDTH
+#define QSA_NATIVE_TRIM_VALID_WIDTH 0
+#endif
+
+#ifndef QSA_NATIVE_PACKED_KV
+#define QSA_NATIVE_PACKED_KV 0
+#endif
+
+#ifndef QSA_NATIVE_PIPELINED_LOADER
+#define QSA_NATIVE_PIPELINED_LOADER 0
+#endif
+
+#ifndef QSA_NATIVE_STAGE_VALIDITY
+#define QSA_NATIVE_STAGE_VALIDITY 0
+#endif
+
+#ifndef QSA_NATIVE_BOUNDED_SCAN
+#define QSA_NATIVE_BOUNDED_SCAN 0
+#endif
+
+#ifndef QSA_NATIVE_SINGLE_EXP
+#define QSA_NATIVE_SINGLE_EXP 0
+#endif
+
+#ifndef QSA_NATIVE_BLOCK_SOFTMAX
+#define QSA_NATIVE_BLOCK_SOFTMAX 0
+#endif
+
+#ifndef QSA_NATIVE_FAST_EXP
+#define QSA_NATIVE_FAST_EXP 0
+#endif
+
+#ifndef QSA_NATIVE_EXACT_PACKED_CACHE
+#define QSA_NATIVE_EXACT_PACKED_CACHE 0
+#endif
+
+constexpr int64_t kQueryHeads = 3;
+constexpr int64_t kKvHeads = 1;
+constexpr int64_t kHeadDim = 256;
+constexpr int64_t kIndexWidth = 2051;
+constexpr int64_t kSubgroup = QSA_NATIVE_SUBGROUP;
+constexpr int64_t kWorkgroup = 4 * kSubgroup;
+constexpr int64_t kValuesPerLane = kHeadDim / kSubgroup;
+constexpr int64_t kTile = QSA_NATIVE_KV_TILE;
+constexpr int64_t kTileElements = kTile * kHeadDim;
+constexpr int64_t kPackedTokenStride = 2 * kHeadDim;
+
+static_assert(
+    kTile == 4 || kTile == 8 || kTile == 16 || kTile == 32 || kTile == 64);
+static_assert(kSubgroup == 16 || kSubgroup == 32);
+static_assert(kHeadDim % kSubgroup == 0);
+#if QSA_NATIVE_TOKEN_LOADER
+static_assert(kWorkgroup % kTile == 0);
+constexpr int64_t kWorkersPerToken = kWorkgroup / kTile;
+static_assert(kSubgroup % kWorkersPerToken == 0);
+static_assert(kHeadDim % kWorkersPerToken == 0);
+constexpr int64_t kDimsPerWorker = kHeadDim / kWorkersPerToken;
+#if QSA_NATIVE_PACKED_KV
+constexpr int64_t kPackedElements = 8;
+static_assert(kDimsPerWorker % kPackedElements == 0);
+#endif
+#endif
+#if QSA_NATIVE_PIPELINED_LOADER
+static_assert(QSA_NATIVE_TOKEN_LOADER);
+static_assert(QSA_NATIVE_PACKED_KV);
+static_assert(kTile == 16);
+static_assert(kSubgroup == 32);
+constexpr int64_t kPipelineLoaderSubgroup = kQueryHeads;
+constexpr int64_t kPipelineWorkersPerToken = kSubgroup / kTile;
+constexpr int64_t kPipelineDimsPerWorker =
+    kHeadDim / kPipelineWorkersPerToken;
+static_assert(kSubgroup % kTile == 0);
+static_assert(kHeadDim % kPipelineWorkersPerToken == 0);
+static_assert(kPipelineDimsPerWorker % kPackedElements == 0);
+#endif
+#if QSA_NATIVE_STAGE_VALIDITY
+static_assert(QSA_NATIVE_TOKEN_LOADER);
+static_assert(!QSA_NATIVE_PIPELINED_LOADER);
+#endif
+#if QSA_NATIVE_BLOCK_SOFTMAX
+static_assert(!QSA_NATIVE_SINGLE_EXP);
+#endif
+
+template <int64_t PageSize>
+class SparsePagedAttentionKernel;
+
+inline float qsa_exp(float value) {
+#if QSA_NATIVE_FAST_EXP
+  return sycl::native::exp(value);
+#else
+  return sycl::exp(value);
+#endif
+}
+
+void check_activation_xpu(const at::Tensor& tensor, const char* name,
+                          bool require_contiguous) {
+  TORCH_CHECK(tensor.device().is_xpu(), name, " must be on XPU");
+  TORCH_CHECK(tensor.scalar_type() == kActivationScalarType,
+              name, " must be ", kActivationName);
+  TORCH_CHECK(!require_contiguous || tensor.is_contiguous(),
+              name, " must be contiguous");
+}
+
+void check_int32_xpu(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().is_xpu(), name, " must be on XPU");
+  TORCH_CHECK(tensor.scalar_type() == at::kInt,
+              name, " must be int32");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+template <int64_t PageSize>
+at::Tensor sparse_paged_attention_impl(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t valid_width_scan_bound,
+    at::Tensor out) {
+  static_assert(PageSize == 256 || PageSize == 512);
+  constexpr int64_t kPageSize = PageSize;
+  constexpr int64_t kPackedPageStride = kPageSize * kPackedTokenStride;
+  check_activation_xpu(q, "q", true);
+  check_activation_xpu(k_cache, "k_cache", false);
+  check_activation_xpu(v_cache, "v_cache", false);
+  check_activation_xpu(out, "out", true);
+  check_int32_xpu(logical_indices, "logical_indices");
+  check_int32_xpu(block_table, "block_table");
+  check_int32_xpu(token_to_req, "token_to_req");
+  TORCH_CHECK(q.dim() == 3 && q.size(1) == kQueryHeads &&
+                  q.size(2) == kHeadDim,
+              "q must have shape [R,3,256]");
+  TORCH_CHECK(k_cache.dim() == 4 && k_cache.size(1) == kPageSize &&
+                  k_cache.size(2) == kKvHeads &&
+                  k_cache.size(3) == kHeadDim,
+              "k_cache must have shape [P,", PageSize, ",1,256]");
+  TORCH_CHECK(v_cache.sizes() == k_cache.sizes(),
+              "v_cache must match k_cache");
+  TORCH_CHECK(k_cache.stride(0) > 0 && k_cache.stride(1) >= kHeadDim &&
+                  k_cache.stride(3) == 1,
+              "k_cache must have positive page stride, token stride >= 256, "
+              "and unit head-dimension stride");
+  TORCH_CHECK(v_cache.stride(0) > 0 && v_cache.stride(1) >= kHeadDim &&
+                  v_cache.stride(3) == 1,
+              "v_cache must have positive page stride, token stride >= 256, "
+              "and unit head-dimension stride");
+#if QSA_NATIVE_EXACT_PACKED_CACHE
+  TORCH_CHECK(k_cache.stride(0) == kPackedPageStride &&
+                  k_cache.stride(1) == kPackedTokenStride &&
+                  k_cache.stride(2) == kHeadDim &&
+                  v_cache.stride(0) == kPackedPageStride &&
+                  v_cache.stride(1) == kPackedTokenStride &&
+                  v_cache.stride(2) == kHeadDim,
+              "k_cache and v_cache must have exact packed strides "
+              "[", kPackedPageStride, ",512,256,1]");
+#endif
+  TORCH_CHECK(logical_indices.dim() == 2 &&
+                  logical_indices.size(0) == q.size(0) &&
+                  logical_indices.size(1) == kIndexWidth,
+              "logical_indices must have shape [R,2051]");
+  TORCH_CHECK(block_table.dim() == 2 && block_table.size(1) > 0,
+              "block_table must have shape [requests,pages]");
+  TORCH_CHECK(token_to_req.dim() == 1 && token_to_req.size(0) == q.size(0),
+              "token_to_req must have shape [R]");
+  TORCH_CHECK(out.sizes() == q.sizes(), "out must match q");
+  TORCH_CHECK(valid_width_scan_bound >= 0 &&
+                  valid_width_scan_bound <= kIndexWidth,
+              "valid-width scan bound must be in [0,2051]");
+  TORCH_CHECK(q.device() == k_cache.device() && q.device() == v_cache.device() &&
+                  q.device() == logical_indices.device() &&
+                  q.device() == block_table.device() &&
+                  q.device() == token_to_req.device() && q.device() == out.device(),
+              "all tensors must share one XPU device");
+
+  const int64_t rows = q.size(0);
+  if (rows == 0) {
+    return out;
+  }
+  const int64_t physical_pages = k_cache.size(0);
+  const int64_t requests = block_table.size(0);
+  const int64_t pages_per_request = block_table.size(1);
+#if QSA_NATIVE_EXACT_PACKED_CACHE
+  constexpr int64_t k_page_stride = kPackedPageStride;
+  constexpr int64_t k_token_stride = kPackedTokenStride;
+  constexpr int64_t v_page_stride = kPackedPageStride;
+  constexpr int64_t v_token_stride = kPackedTokenStride;
+#else
+  const int64_t k_page_stride = k_cache.stride(0);
+  const int64_t k_token_stride = k_cache.stride(1);
+  const int64_t v_page_stride = v_cache.stride(0);
+  const int64_t v_token_stride = v_cache.stride(1);
+#endif
+  const auto* q_ptr = reinterpret_cast<const activation_t*>(q.data_ptr());
+  const auto* k_ptr = reinterpret_cast<const activation_t*>(k_cache.data_ptr());
+  const auto* v_ptr = reinterpret_cast<const activation_t*>(v_cache.data_ptr());
+  const auto* index_ptr = logical_indices.data_ptr<int32_t>();
+  const auto* table_ptr = block_table.data_ptr<int32_t>();
+  const auto* request_ptr = token_to_req.data_ptr<int32_t>();
+  auto* out_ptr = reinterpret_cast<activation_t*>(out.data_ptr());
+  constexpr float scale = 1.0f / 16.0f;
+
+  auto& queue = c10::xpu::getCurrentXPUStream(q.device().index()).queue();
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<activation_t, 1> staged(
+#if QSA_NATIVE_PIPELINED_LOADER
+        sycl::range<1>(4 * kTileElements), cgh);
+#elif QSA_NATIVE_STAGE_VALIDITY
+        sycl::range<1>(2 * kTileElements + kTile), cgh);
+#else
+        sycl::range<1>(2 * kTileElements), cgh);
+#endif
+    cgh.parallel_for<SparsePagedAttentionKernel<PageSize>>(
+        sycl::nd_range<1>(
+            sycl::range<1>(static_cast<size_t>(rows * kWorkgroup)),
+            sycl::range<1>(static_cast<size_t>(kWorkgroup))),
+        [=](sycl::nd_item<1> item)
+            [[sycl::reqd_sub_group_size(QSA_NATIVE_SUBGROUP)]] {
+          const int64_t row = item.get_group_linear_id();
+          const int64_t local = item.get_local_linear_id();
+          const int64_t subgroup_id = local / kSubgroup;
+          const int64_t lane = local % kSubgroup;
+          const int32_t request = request_ptr[row];
+#if QSA_NATIVE_TRIM_VALID_WIDTH
+          int32_t local_last_valid = -1;
+#if QSA_NATIVE_BOUNDED_SCAN
+          for (int64_t column = local; column < valid_width_scan_bound;
+#else
+          for (int64_t column = local; column < kIndexWidth;
+#endif
+               column += kWorkgroup) {
+            if (index_ptr[row * kIndexWidth + column] >= 0) {
+              local_last_valid = static_cast<int32_t>(column);
+            }
+          }
+          const int32_t last_valid = sycl::reduce_over_group(
+              item.get_group(), local_last_valid, sycl::maximum<int32_t>());
+          const int64_t valid_width = static_cast<int64_t>(last_valid) + 1;
+#endif
+
+          float q_values[kValuesPerLane];
+          float accumulators[kValuesPerLane];
+          if (subgroup_id < kQueryHeads) {
+            for (int64_t fragment = 0; fragment < kValuesPerLane; ++fragment) {
+              const int64_t dim = lane + fragment * kSubgroup;
+              q_values[fragment] = static_cast<float>(
+                  q_ptr[(row * kQueryHeads + subgroup_id) * kHeadDim + dim]);
+              accumulators[fragment] = 0.0f;
+            }
+          }
+          float row_max = -std::numeric_limits<float>::infinity();
+          float denominator = 0.0f;
+
+#if QSA_NATIVE_PIPELINED_LOADER
+          auto staged_ptr = staged.template get_multi_ptr<
+              sycl::access::decorated::no>();
+          auto load_pipeline_tile = [&](int64_t load_tile_start,
+                                        int64_t stage_base) {
+            if (subgroup_id != kPipelineLoaderSubgroup) {
+              return;
+            }
+            const int64_t token_in_tile =
+                lane / kPipelineWorkersPerToken;
+            const int64_t worker_in_token =
+                lane % kPipelineWorkersPerToken;
+            const uint32_t source_lane = static_cast<uint32_t>(
+                token_in_tile * kPipelineWorkersPerToken);
+            const int64_t column = load_tile_start + token_in_tile;
+            int64_t key_cache_base = -1;
+            int64_t value_cache_base = -1;
+            if (static_cast<uint32_t>(lane) == source_lane &&
+#if QSA_NATIVE_TRIM_VALID_WIDTH
+                column < valid_width) {
+#else
+                column < kIndexWidth) {
+#endif
+              const int32_t logical =
+                  index_ptr[row * kIndexWidth + column];
+              if (logical >= 0 && request >= 0 && request < requests) {
+                const int64_t page_column = logical / kPageSize;
+                if (page_column < pages_per_request) {
+                  const int32_t physical =
+                      table_ptr[request * pages_per_request + page_column];
+                  if (physical >= 0 && physical < physical_pages) {
+                    const int64_t offset = logical % kPageSize;
+                    key_cache_base =
+                        static_cast<int64_t>(physical) * k_page_stride +
+                        offset * k_token_stride;
+                    value_cache_base =
+                        static_cast<int64_t>(physical) * v_page_stride +
+                        offset * v_token_stride;
+                  }
+                }
+              }
+            }
+            key_cache_base = sycl::select_from_group(
+                item.get_sub_group(), key_cache_base, source_lane);
+            value_cache_base = sycl::select_from_group(
+                item.get_sub_group(), value_cache_base, source_lane);
+            const int64_t dim_start =
+                worker_in_token * kPipelineDimsPerWorker;
+#pragma unroll
+            for (int64_t dim_offset = 0;
+                 dim_offset < kPipelineDimsPerWorker;
+                 dim_offset += kPackedElements) {
+              const int64_t dim = dim_start + dim_offset;
+              const int64_t linear =
+                  stage_base + token_in_tile * kHeadDim + dim;
+              {
+                sycl::vec<activation_t, kPackedElements> key_values(
+                    static_cast<activation_t>(0.0f));
+                if (key_cache_base >= 0) {
+                  key_values.load(0, k_ptr + key_cache_base + dim);
+                }
+                key_values.store(0, staged_ptr + linear);
+              }
+              {
+                sycl::vec<activation_t, kPackedElements> value_values(
+                    static_cast<activation_t>(0.0f));
+                if (value_cache_base >= 0) {
+                  value_values.load(0, v_ptr + value_cache_base + dim);
+                }
+                value_values.store(
+                    0, staged_ptr + kTileElements + linear);
+              }
+            }
+          };
+#if QSA_NATIVE_TRIM_VALID_WIDTH
+          if (valid_width > 0) {
+            load_pipeline_tile(0, 0);
+            item.barrier(sycl::access::fence_space::local_space);
+          }
+#else
+          load_pipeline_tile(0, 0);
+          item.barrier(sycl::access::fence_space::local_space);
+#endif
+          int64_t stage_slot = 0;
+#endif
+
+#if QSA_NATIVE_TRIM_VALID_WIDTH
+          for (int64_t tile_start = 0; tile_start < valid_width;
+#else
+          for (int64_t tile_start = 0; tile_start < kIndexWidth;
+#endif
+               tile_start += kTile) {
+#if QSA_NATIVE_PIPELINED_LOADER
+              const int64_t next_tile_start = tile_start + kTile;
+#if QSA_NATIVE_TRIM_VALID_WIDTH
+              const bool has_next_tile = next_tile_start < valid_width;
+#else
+              const bool has_next_tile = next_tile_start < kIndexWidth;
+#endif
+              if (has_next_tile) {
+                const int64_t next_stage_base =
+                    (stage_slot ^ 1) * 2 * kTileElements;
+                load_pipeline_tile(next_tile_start, next_stage_base);
+              }
+#else
+#if QSA_NATIVE_TOKEN_LOADER
+              const int64_t token_in_tile = local / kWorkersPerToken;
+              const int64_t worker_in_token = local % kWorkersPerToken;
+              const int64_t token_in_subgroup = lane / kWorkersPerToken;
+              const uint32_t source_lane = static_cast<uint32_t>(
+                  token_in_subgroup * kWorkersPerToken);
+              const int64_t column = tile_start + token_in_tile;
+              int64_t key_cache_base = -1;
+              int64_t value_cache_base = -1;
+              int32_t logical_for_token = -1;
+              if (static_cast<uint32_t>(lane) == source_lane &&
+#if QSA_NATIVE_TRIM_VALID_WIDTH
+                  column < valid_width) {
+#else
+                  column < kIndexWidth) {
+#endif
+                logical_for_token = index_ptr[row * kIndexWidth + column];
+                const int32_t logical = logical_for_token;
+                if (logical >= 0 && request >= 0 && request < requests) {
+                  const int64_t page_column = logical / kPageSize;
+                  if (page_column < pages_per_request) {
+                    const int32_t physical =
+                        table_ptr[request * pages_per_request + page_column];
+                    if (physical >= 0 && physical < physical_pages) {
+                      const int64_t offset = logical % kPageSize;
+                      key_cache_base =
+                          static_cast<int64_t>(physical) * k_page_stride +
+                          offset * k_token_stride;
+                      value_cache_base =
+                          static_cast<int64_t>(physical) * v_page_stride +
+                          offset * v_token_stride;
+                    }
+                  }
+                }
+              }
+#if QSA_NATIVE_STAGE_VALIDITY
+              if (static_cast<uint32_t>(lane) == source_lane) {
+                staged[2 * kTileElements + token_in_tile] =
+                    logical_for_token >= 0
+                    ? static_cast<activation_t>(1.0f)
+                    : static_cast<activation_t>(0.0f);
+              }
+#endif
+              key_cache_base = sycl::select_from_group(
+                  item.get_sub_group(), key_cache_base, source_lane);
+              value_cache_base = sycl::select_from_group(
+                  item.get_sub_group(), value_cache_base, source_lane);
+              const int64_t dim_start = worker_in_token * kDimsPerWorker;
+#if QSA_NATIVE_PACKED_KV
+              auto staged_ptr = staged.template get_multi_ptr<
+                  sycl::access::decorated::no>();
+#pragma unroll
+              for (int64_t dim_offset = 0; dim_offset < kDimsPerWorker;
+                   dim_offset += kPackedElements) {
+                const int64_t dim = dim_start + dim_offset;
+                const int64_t linear = token_in_tile * kHeadDim + dim;
+                {
+                  sycl::vec<activation_t, kPackedElements> key_values(
+                      static_cast<activation_t>(0.0f));
+                  if (key_cache_base >= 0) {
+                    key_values.load(0, k_ptr + key_cache_base + dim);
+                  }
+                  key_values.store(0, staged_ptr + linear);
+                }
+                {
+                  sycl::vec<activation_t, kPackedElements> value_values(
+                      static_cast<activation_t>(0.0f));
+                  if (value_cache_base >= 0) {
+                    value_values.load(0, v_ptr + value_cache_base + dim);
+                  }
+                  value_values.store(
+                      0, staged_ptr + kTileElements + linear);
+                }
+              }
+#else
+#pragma unroll 4
+              for (int64_t dim_offset = 0; dim_offset < kDimsPerWorker;
+                   ++dim_offset) {
+                const int64_t dim = dim_start + dim_offset;
+                const int64_t linear = token_in_tile * kHeadDim + dim;
+                activation_t key_value = static_cast<activation_t>(0.0f);
+                activation_t value_value = static_cast<activation_t>(0.0f);
+                if (key_cache_base >= 0) {
+                  key_value = k_ptr[key_cache_base + dim];
+                  value_value = v_ptr[value_cache_base + dim];
+                }
+                staged[linear] = key_value;
+                staged[kTileElements + linear] = value_value;
+              }
+#endif
+#else
+              for (int64_t linear = local; linear < kTileElements;
+                   linear += kWorkgroup) {
+                const int64_t token_in_tile = linear / kHeadDim;
+                const int64_t dim = linear % kHeadDim;
+                const int64_t column = tile_start + token_in_tile;
+                int32_t logical = -1;
+                if (
+#if QSA_NATIVE_TRIM_VALID_WIDTH
+                    column < valid_width) {
+#else
+                    column < kIndexWidth) {
+#endif
+                  logical = index_ptr[row * kIndexWidth + column];
+                }
+                activation_t key_value = static_cast<activation_t>(0.0f);
+                activation_t value_value = static_cast<activation_t>(0.0f);
+                if (logical >= 0 && request >= 0 && request < requests) {
+                  const int64_t page_column = logical / kPageSize;
+                  if (page_column < pages_per_request) {
+                    const int32_t physical =
+                        table_ptr[request * pages_per_request + page_column];
+                    if (physical >= 0 && physical < physical_pages) {
+                      const int64_t offset = logical % kPageSize;
+                      const int64_t key_cache_offset =
+                          static_cast<int64_t>(physical) * k_page_stride +
+                          offset * k_token_stride + dim;
+                      const int64_t value_cache_offset =
+                          static_cast<int64_t>(physical) * v_page_stride +
+                          offset * v_token_stride + dim;
+                      key_value = k_ptr[key_cache_offset];
+                      value_value = v_ptr[value_cache_offset];
+                    }
+                  }
+                }
+                staged[linear] = key_value;
+                staged[kTileElements + linear] = value_value;
+              }
+#endif
+              item.barrier(sycl::access::fence_space::local_space);
+#endif
+
+              if (subgroup_id < kQueryHeads) {
+#if QSA_NATIVE_PIPELINED_LOADER
+                const int64_t stage_base =
+                    stage_slot * 2 * kTileElements;
+#else
+                constexpr int64_t stage_base = 0;
+#endif
+#if QSA_NATIVE_TRIM_VALID_WIDTH
+                const int64_t remaining = valid_width - tile_start;
+#else
+                const int64_t remaining = kIndexWidth - tile_start;
+#endif
+                const int64_t tile_tokens =
+                    sycl::min<int64_t>(kTile, remaining);
+#if QSA_NATIVE_BLOCK_SOFTMAX
+                float tile_scores[kTile];
+                float tile_max = -std::numeric_limits<float>::infinity();
+                for (int64_t token = 0; token < tile_tokens; ++token) {
+#if QSA_NATIVE_STAGE_VALIDITY
+                  if (static_cast<float>(
+                          staged[2 * kTileElements + token]) == 0.0f) {
+                    tile_scores[token] =
+                        -std::numeric_limits<float>::infinity();
+                    continue;
+                  }
+#else
+                  const int32_t logical =
+                      index_ptr[row * kIndexWidth + tile_start + token];
+                  if (logical < 0) {
+                    tile_scores[token] =
+                        -std::numeric_limits<float>::infinity();
+                    continue;
+                  }
+#endif
+                  float partial = 0.0f;
+                  for (int64_t fragment = 0; fragment < kValuesPerLane;
+                       ++fragment) {
+                    const int64_t dim = lane + fragment * kSubgroup;
+                    partial += q_values[fragment] * static_cast<float>(
+                        staged[stage_base + token * kHeadDim + dim]);
+                  }
+                  const float score = sycl::reduce_over_group(
+                      item.get_sub_group(), partial, sycl::plus<float>()) *
+                      scale;
+                  tile_scores[token] = score;
+                  tile_max = sycl::fmax(tile_max, score);
+                }
+                float tile_denominator = 0.0f;
+                float tile_accumulators[kValuesPerLane];
+                for (int64_t fragment = 0; fragment < kValuesPerLane;
+                     ++fragment) {
+                  tile_accumulators[fragment] = 0.0f;
+                }
+                for (int64_t token = 0; token < tile_tokens; ++token) {
+#if QSA_NATIVE_STAGE_VALIDITY
+                  if (static_cast<float>(
+                          staged[2 * kTileElements + token]) == 0.0f) {
+                    continue;
+                  }
+#else
+                  const int32_t logical =
+                      index_ptr[row * kIndexWidth + tile_start + token];
+                  if (logical < 0) {
+                    continue;
+                  }
+#endif
+                  const float probability =
+                      qsa_exp(tile_scores[token] - tile_max);
+                  for (int64_t fragment = 0; fragment < kValuesPerLane;
+                       ++fragment) {
+                    const int64_t dim = lane + fragment * kSubgroup;
+                    const float value = static_cast<float>(
+                        staged[stage_base + kTileElements +
+                               token * kHeadDim + dim]);
+                    tile_accumulators[fragment] += probability * value;
+                  }
+                  tile_denominator += probability;
+                }
+                if (tile_denominator > 0.0f) {
+                  const float next_max = sycl::fmax(row_max, tile_max);
+                  const float rescale = qsa_exp(
+                      sycl::fmin(row_max, tile_max) - next_max);
+                  const bool replace_max = tile_max > row_max;
+                  const float alpha = replace_max ? rescale : 1.0f;
+                  const float beta = replace_max ? 1.0f : rescale;
+                  for (int64_t fragment = 0; fragment < kValuesPerLane;
+                       ++fragment) {
+                    accumulators[fragment] =
+                        accumulators[fragment] * alpha +
+                        tile_accumulators[fragment] * beta;
+                  }
+                  denominator =
+                      denominator * alpha + tile_denominator * beta;
+                  row_max = next_max;
+                }
+#else
+                for (int64_t token = 0; token < tile_tokens; ++token) {
+#if QSA_NATIVE_STAGE_VALIDITY
+                  if (static_cast<float>(
+                          staged[2 * kTileElements + token]) == 0.0f) {
+                    continue;
+                  }
+#else
+                  const int32_t logical =
+                      index_ptr[row * kIndexWidth + tile_start + token];
+                  if (logical < 0) {
+                    continue;
+                  }
+#endif
+                  float partial = 0.0f;
+                  for (int64_t fragment = 0; fragment < kValuesPerLane;
+                       ++fragment) {
+                    const int64_t dim = lane + fragment * kSubgroup;
+                    partial += q_values[fragment] * static_cast<float>(
+                        staged[stage_base + token * kHeadDim + dim]);
+                  }
+                  const float score = sycl::reduce_over_group(
+                      item.get_sub_group(), partial, sycl::plus<float>()) *
+                      scale;
+                  const float next_max = sycl::fmax(row_max, score);
+#if QSA_NATIVE_SINGLE_EXP
+                  float alpha = 1.0f;
+                  float probability = 1.0f;
+                  if (score > row_max) {
+                    alpha = qsa_exp(row_max - score);
+                  } else {
+                    probability = qsa_exp(score - row_max);
+                  }
+#else
+                  const float alpha = qsa_exp(row_max - next_max);
+                  const float probability = qsa_exp(score - next_max);
+#endif
+                  for (int64_t fragment = 0; fragment < kValuesPerLane;
+                       ++fragment) {
+                    const int64_t dim = lane + fragment * kSubgroup;
+                    const float value = static_cast<float>(
+                        staged[stage_base + kTileElements +
+                               token * kHeadDim + dim]);
+                    accumulators[fragment] =
+                        accumulators[fragment] * alpha + probability * value;
+                  }
+                  denominator = denominator * alpha + probability;
+                  row_max = next_max;
+                }
+#endif
+              }
+#if QSA_NATIVE_PIPELINED_LOADER
+              if (has_next_tile) {
+                item.barrier(sycl::access::fence_space::local_space);
+                stage_slot ^= 1;
+              }
+#else
+              item.barrier(sycl::access::fence_space::local_space);
+#endif
+          }
+
+          if (subgroup_id < kQueryHeads) {
+            for (int64_t fragment = 0; fragment < kValuesPerLane; ++fragment) {
+              const int64_t dim = lane + fragment * kSubgroup;
+              const float value = denominator > 0.0f
+                  ? accumulators[fragment] / denominator
+                  : 0.0f;
+              out_ptr[(row * kQueryHeads + subgroup_id) * kHeadDim + dim] =
+                  static_cast<activation_t>(value);
+            }
+          }
+        });
+  });
+  return out;
+}
+
+}  // namespace
+
+at::Tensor sparse_paged_attention(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    at::Tensor out) {
+  return sparse_paged_attention_impl<512>(
+      q, k_cache, v_cache, logical_indices, block_table, token_to_req,
+      kIndexWidth, out);
+}
+
+at::Tensor sparse_paged_attention_bounded(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t max_valid_width,
+    at::Tensor out) {
+  return sparse_paged_attention_impl<512>(
+      q, k_cache, v_cache, logical_indices, block_table, token_to_req,
+      max_valid_width, out);
+}
+
+at::Tensor sparse_paged_attention_v2(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t main_page_size,
+    at::Tensor out) {
+  TORCH_CHECK(
+      main_page_size == 256 || main_page_size == 512,
+      "main_page_size must be 256 or 512");
+  if (main_page_size == 256) {
+    return sparse_paged_attention_impl<256>(
+        q, k_cache, v_cache, logical_indices, block_table, token_to_req,
+        kIndexWidth, out);
+  }
+  return sparse_paged_attention_impl<512>(
+      q, k_cache, v_cache, logical_indices, block_table, token_to_req,
+      kIndexWidth, out);
+}
+
+at::Tensor sparse_paged_attention_bounded_v2(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t max_valid_width,
+    int64_t main_page_size,
+    at::Tensor out) {
+  TORCH_CHECK(
+      main_page_size == 256 || main_page_size == 512,
+      "main_page_size must be 256 or 512");
+  if (main_page_size == 256) {
+    return sparse_paged_attention_impl<256>(
+        q, k_cache, v_cache, logical_indices, block_table, token_to_req,
+        max_valid_width, out);
+  }
+  return sparse_paged_attention_impl<512>(
+      q, k_cache, v_cache, logical_indices, block_table, token_to_req,
+      max_valid_width, out);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def(
+      "sparse_paged_attention",
+      &sparse_paged_attention,
+      "Qwen3.8 TP8-rank sparse paged attention (XPU)");
+  module.def(
+      "sparse_paged_attention_bounded",
+      &sparse_paged_attention_bounded,
+      "Qwen3.8 TP8-rank sparse paged attention with trusted scan bound (XPU)");
+  module.def(
+      "sparse_paged_attention_v2",
+      &sparse_paged_attention_v2,
+      "Qwen3.8 page-specialized sparse paged attention (XPU)");
+  module.def(
+      "sparse_paged_attention_bounded_v2",
+      &sparse_paged_attention_bounded_v2,
+      "Qwen3.8 page-specialized sparse paged attention with trusted scan bound (XPU)");
+  module.def(
+      "qsa_select_paged_tokens",
+      &qsa::select_paged_tokens,
+      "Qwen3.8 TP8-rank fused paged index selection and expansion (XPU)");
+  module.def(
+      "qsa_select_paged_tokens_v2",
+      &qsa::select_paged_tokens_v2,
+      "Qwen3.8 page-specialized fused paged index selection and expansion (XPU)");
+  module.attr("qsa_abi_version") = 2;
+  module.attr("selection_page_sizes") = py::make_tuple(64, 128);
+  module.attr("attention_page_sizes") = py::make_tuple(256, 512);
+  module.attr("kv_tile") = QSA_NATIVE_KV_TILE;
+  module.attr("subgroup") = QSA_NATIVE_SUBGROUP;
+  module.attr("token_loader") = QSA_NATIVE_TOKEN_LOADER;
+  module.attr("trim_valid_width") = QSA_NATIVE_TRIM_VALID_WIDTH;
+  module.attr("packed_kv") = QSA_NATIVE_PACKED_KV;
+  module.attr("pipelined_loader") = QSA_NATIVE_PIPELINED_LOADER;
+  module.attr("stage_validity") = QSA_NATIVE_STAGE_VALIDITY;
+  module.attr("bounded_scan") = QSA_NATIVE_BOUNDED_SCAN;
+  module.attr("single_exp") = QSA_NATIVE_SINGLE_EXP;
+  module.attr("block_softmax") = QSA_NATIVE_BLOCK_SOFTMAX;
+  module.attr("fast_exp") = QSA_NATIVE_FAST_EXP;
+  module.attr("activation_dtype") = kActivationName;
+  module.attr("strided_kv") = 1;
+  module.attr("exact_packed_cache") = QSA_NATIVE_EXACT_PACKED_CACHE;
+  module.attr("selection_output_width") = 2051;
+}

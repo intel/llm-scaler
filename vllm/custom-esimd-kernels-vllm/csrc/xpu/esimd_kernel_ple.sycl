@@ -1,0 +1,1302 @@
+#include <sycl/sycl.hpp>
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/all.h>
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <limits>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include "esimd_kernels/ple.h"
+
+namespace {
+
+constexpr int kMaxConvState = 128;
+constexpr int kMaxSpecTokens = 128;
+
+static inline sycl::queue& get_device_queue(const at::Tensor& tensor) {
+    return c10::xpu::getCurrentXPUStream(tensor.device().index()).queue();
+}
+
+static inline float silu(float value) {
+    return value / (1.0f + sycl::exp(-value));
+}
+
+static inline float sigmoid(float value) {
+    return 1.0f / (1.0f + sycl::exp(-value));
+}
+
+static inline void check_same_xpu(
+    const at::Tensor& reference,
+    const at::Tensor& tensor,
+    const char* name) {
+    TORCH_CHECK(tensor.device().is_xpu(), name, " must be on XPU");
+    TORCH_CHECK(tensor.device() == reference.device(),
+                name, " must be on the same XPU device as the first input");
+}
+
+static inline void check_contiguous(const at::Tensor& tensor, const char* name) {
+    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+// ``conv_state[..., -capacity:]`` is a valid view in the vLLM path: it has
+// padding between rows and is therefore not dense, while still being safe for
+// the explicit positive-stride indexing used below.  Prove non-overlap rather
+// than requiring the stronger dense-view property.
+static inline bool is_positive_non_overlapping(const at::Tensor& tensor) {
+    TORCH_CHECK(tensor.dim() == 3, "state overlap check expects rank-3 tensor");
+    std::array<std::pair<int64_t, int64_t>, 3> dims{};
+    for (int64_t dim = 0; dim < 3; ++dim) {
+        dims[dim] = {tensor.stride(dim), tensor.size(dim)};
+        if (dims[dim].first <= 0) {
+            return false;
+        }
+    }
+    std::sort(dims.begin(), dims.end(),
+              [](const auto& lhs, const auto& rhs) {
+                  return lhs.first < rhs.first;
+              });
+    int64_t required_span = 1;
+    for (const auto& [stride, size] : dims) {
+        if (size <= 1) {
+            continue;
+        }
+        if (stride < required_span) {
+            return false;
+        }
+        const int64_t extent = size - 1;
+        if (extent > std::numeric_limits<int64_t>::max() / stride) {
+            return false;
+        }
+        const int64_t contribution = extent * stride;
+        if (required_span > std::numeric_limits<int64_t>::max() - contribution) {
+            return false;
+        }
+        required_span += contribution;
+    }
+    return true;
+}
+
+static inline void check_primary_xpu(
+    const at::Tensor& tensor,
+    const char* name) {
+    TORCH_CHECK(tensor.device().is_xpu(), name, " must be on XPU");
+    check_contiguous(tensor, name);
+}
+
+static inline void check_primary_int64(
+    const at::Tensor& tensor,
+    const char* name) {
+    check_primary_xpu(tensor, name);
+    TORCH_CHECK(tensor.scalar_type() == at::kLong,
+                name, " must have dtype int64");
+}
+
+static inline void check_primary_half(
+    const at::Tensor& tensor,
+    const char* name) {
+    check_primary_xpu(tensor, name);
+    TORCH_CHECK(tensor.scalar_type() == at::kHalf,
+                name, " must have dtype float16");
+}
+
+static inline void check_int64(
+    const at::Tensor& reference,
+    const at::Tensor& tensor,
+    const char* name) {
+    check_same_xpu(reference, tensor, name);
+    TORCH_CHECK(tensor.scalar_type() == at::kLong,
+                name, " must have dtype int64");
+    check_contiguous(tensor, name);
+}
+
+static inline void check_half(
+    const at::Tensor& reference,
+    const at::Tensor& tensor,
+    const char* name) {
+    check_same_xpu(reference, tensor, name);
+    TORCH_CHECK(tensor.scalar_type() == at::kHalf,
+                name, " must have dtype float16");
+    check_contiguous(tensor, name);
+}
+
+static inline void check_index_tensor(
+    const at::Tensor& reference,
+    const at::Tensor& tensor,
+    const char* name) {
+    check_same_xpu(reference, tensor, name);
+    TORCH_CHECK(tensor.scalar_type() == at::kInt ||
+                    tensor.scalar_type() == at::kLong,
+                name, " must have dtype int32 or int64");
+    check_contiguous(tensor, name);
+}
+
+// Metadata values are copied to host only for fail-closed validation.  The
+// standalone ABI accepts caller-owned XPU metadata, so dereferencing it on
+// the host would be invalid; the copy also makes bounds checks independent of
+// the metadata scalar dtype.
+static std::vector<int64_t> copy_index_values(const at::Tensor& tensor) {
+    at::Tensor host = tensor.to(at::kCPU).contiguous();
+    std::vector<int64_t> values(host.numel());
+    if (host.scalar_type() == at::kInt) {
+        const auto* data = host.data_ptr<int32_t>();
+        std::transform(data, data + host.numel(), values.begin(),
+                       [](int32_t value) { return static_cast<int64_t>(value); });
+    } else {
+        TORCH_CHECK(host.scalar_type() == at::kLong,
+                    "metadata must have dtype int32 or int64");
+        const auto* data = host.data_ptr<int64_t>();
+        std::copy(data, data + host.numel(), values.begin());
+    }
+    return values;
+}
+
+static void validate_embedding_shard_metadata(
+    const at::Tensor& local_weight,
+    const at::Tensor& local_vocab_start,
+    const at::Tensor& local_num_rows) {
+    const auto starts = copy_index_values(local_vocab_start);
+    const auto rows = copy_index_values(local_num_rows);
+    TORCH_CHECK(starts.size() == 1 && rows.size() == 1,
+                "embedding shard metadata must contain one value each");
+    const int64_t start = starts.front();
+    const int64_t count = rows.front();
+    TORCH_CHECK(start >= 0,
+                "local_vocab_start must be non-negative, got ", start);
+    TORCH_CHECK(count >= 0,
+                "local_num_rows must be non-negative, got ", count);
+    TORCH_CHECK(count <= local_weight.size(0),
+                "local_num_rows must not exceed local_weight rows: got ",
+                count, " for ", local_weight.size(0), " rows");
+    TORCH_CHECK(start <= std::numeric_limits<int64_t>::max() - count,
+                "local_vocab_start + local_num_rows overflows int64");
+}
+
+static void validate_query_start_loc(
+    const at::Tensor& query_start_loc,
+    int64_t requests,
+    int64_t tokens,
+    const char* name) {
+    TORCH_CHECK(query_start_loc.dim() == 1 &&
+                    query_start_loc.numel() == requests + 1,
+                name, " must have exactly requests + 1 entries");
+    const auto offsets = copy_index_values(query_start_loc);
+    TORCH_CHECK(!offsets.empty() && offsets.front() == 0,
+                name, " must start at zero");
+    int64_t previous = 0;
+    for (const int64_t offset : offsets) {
+        TORCH_CHECK(offset >= previous && offset <= tokens,
+                    name, " must be monotonic and within [0, token_count]");
+        previous = offset;
+    }
+    TORCH_CHECK(offsets.back() == tokens,
+                name, " last entry must equal input token count");
+}
+
+static void validate_unique_state_indices(
+    const at::Tensor& state_indices,
+    int64_t state_slots,
+    int64_t null_block_id) {
+    const auto indices = copy_index_values(state_indices);
+    TORCH_CHECK(null_block_id < 0 || null_block_id >= state_slots,
+                "null_block_id must not identify a real state slot");
+    std::unordered_set<int64_t> seen;
+    for (const int64_t index : indices) {
+        if (index == null_block_id) {
+            continue;
+        }
+        TORCH_CHECK(index >= 0 && index < state_slots,
+                    "state_indices contains an out-of-range non-null slot ", index);
+        TORCH_CHECK(seen.insert(index).second,
+                    "state_indices contains duplicate valid state slot ", index);
+    }
+}
+
+static void validate_accepted_tokens(
+    const at::Tensor& num_accepted_tokens,
+    int64_t requests,
+    int64_t num_spec_tokens) {
+    TORCH_CHECK(num_accepted_tokens.dim() == 1 &&
+                    num_accepted_tokens.numel() == requests,
+                "num_accepted_tokens must have one entry per request");
+    const auto accepted = copy_index_values(num_accepted_tokens);
+    for (const int64_t count : accepted) {
+        TORCH_CHECK(count >= 1 && count <= num_spec_tokens + 1,
+                    "num_accepted_tokens must be in [1, num_spec_tokens + 1]");
+    }
+}
+
+static inline int64_t checked_state_length(
+    int64_t kernel_size,
+    int64_t dilation) {
+    TORCH_CHECK(kernel_size >= 1, "kernel_size must be positive");
+    TORCH_CHECK(dilation > 0, "dilation must be positive");
+    const int64_t kernel_span = kernel_size - 1;
+    TORCH_CHECK(kernel_span <= kMaxConvState / dilation,
+                "dilated convolution state length exceeds implementation limit");
+    return kernel_span * dilation;
+}
+
+static void validate_spec_query_lengths(
+    const at::Tensor& query_start_loc,
+    int64_t requests,
+    int64_t num_spec_tokens) {
+    const auto offsets = copy_index_values(query_start_loc);
+    for (int64_t request = 0; request < requests; ++request) {
+        TORCH_CHECK(offsets[request + 1] - offsets[request] <= num_spec_tokens + 1,
+                    "spec query length exceeds num_spec_tokens + 1");
+    }
+}
+
+static inline void check_output(
+    const at::Tensor& reference,
+    const at::Tensor& output,
+    const char* name) {
+    check_half(reference, output, name);
+    TORCH_CHECK(!output.is_alias_of(reference),
+                name, " must not share storage with its input");
+}
+
+static inline int64_t sequence_value(
+    const int64_t* input_ids,
+    const int64_t* context,
+    int64_t request_start,
+    int64_t request,
+    int64_t context_width,
+    int64_t sequence_position) {
+    if (sequence_position < context_width) {
+        return context[request * context_width + sequence_position];
+    }
+    return input_ids[request_start + sequence_position - context_width];
+}
+
+static void launch_ngram_ids(
+    sycl::queue& queue,
+    const int64_t* input_ids,
+    const int64_t* query_start_loc,
+    const int64_t* context,
+    const int64_t* multipliers,
+    const int64_t* vocab_sizes,
+    const int64_t* offsets,
+    int64_t* output,
+    int64_t tokens,
+    int64_t requests,
+    int64_t ngram_size,
+    int64_t heads_per_ngram,
+    int64_t eos_token_id) {
+    const int64_t heads = (ngram_size - 1) * heads_per_ngram;
+    if (tokens <= 0 || heads <= 0) {
+        return;
+    }
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<1>(static_cast<size_t>(tokens * heads)),
+                         [=](sycl::id<1> work_id) {
+            const int64_t linear = static_cast<int64_t>(work_id[0]);
+            const int64_t token = linear / heads;
+            const int64_t head = linear % heads;
+            int64_t request = requests - 1;
+            for (int64_t candidate = 0; candidate < requests; ++candidate) {
+                if (token < query_start_loc[candidate + 1]) {
+                    request = candidate;
+                    break;
+                }
+            }
+            const int64_t request_start = query_start_loc[request];
+            const int64_t local_position = token - request_start;
+            const int64_t context_width = ngram_size - 1;
+            const int64_t sequence_position = context_width + local_position;
+
+            int64_t previous_eos = -1;
+            // Include the current token in the segment scan. An EOS token
+            // starts a new segment, so every shifted predecessor for that
+            // token must be EOS rather than a token from the prior segment.
+            for (int64_t position = 0; position <= sequence_position; ++position) {
+                if (sequence_value(input_ids, context, request_start, request,
+                                   context_width, position) == eos_token_id) {
+                    previous_eos = position;
+                }
+            }
+            const int64_t position_in_segment = sequence_position - previous_eos - 1;
+            const int64_t ngram = head / heads_per_ngram + 2;
+            const int64_t current = input_ids[token];
+            uint64_t mixed = static_cast<uint64_t>(current) *
+                             static_cast<uint64_t>(multipliers[0]);
+            for (int64_t shift = 1; shift < ngram; ++shift) {
+                int64_t prior = eos_token_id;
+                if (shift <= position_in_segment) {
+                    prior = sequence_value(input_ids, context, request_start,
+                                           request, context_width,
+                                           sequence_position - shift);
+                }
+                mixed ^= static_cast<uint64_t>(prior) *
+                         static_cast<uint64_t>(multipliers[shift]);
+            }
+            const int64_t signed_mixed = static_cast<int64_t>(mixed);
+            const int64_t modulus = vocab_sizes[head];
+            int64_t remainder = signed_mixed % modulus;
+            if (remainder < 0) remainder += modulus;
+            output[token * heads + head] = remainder + offsets[head];
+        });
+    });
+}
+
+template <typename StateT>
+static void launch_embedding(
+    sycl::queue& queue,
+    const int64_t* ids,
+    const sycl::half* weight,
+    const int64_t* local_start,
+    const int64_t* local_rows,
+    sycl::half* output,
+    int64_t tokens,
+    int64_t heads,
+    int64_t row_width) {
+    if (tokens <= 0 || heads <= 0 || row_width <= 0) {
+        return;
+    }
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<1>(static_cast<size_t>(tokens * heads * row_width)),
+                         [=](sycl::id<1> work_id) {
+            const int64_t linear = static_cast<int64_t>(work_id[0]);
+            const int64_t column = linear % row_width;
+            const int64_t head = (linear / row_width) % heads;
+            const int64_t token = linear / (row_width * heads);
+            const int64_t id = ids[token * heads + head];
+            const int64_t start = local_start[0];
+            const int64_t rows = local_rows[0];
+            if (id >= start && id < start + rows) {
+                output[linear] = weight[(id - start) * row_width + column];
+            } else {
+                output[linear] = sycl::half(0.0f);
+            }
+        });
+    });
+}
+
+static void launch_grouped_norm(
+    sycl::queue& queue,
+    const sycl::half* input,
+    const sycl::half* weight,
+    sycl::half* output,
+    int64_t rows,
+    int64_t width,
+    int64_t group_size,
+    float eps) {
+    const int64_t groups = width / group_size;
+    if (rows <= 0 || groups <= 0) {
+        return;
+    }
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<1>(static_cast<size_t>(rows * groups)),
+                         [=](sycl::id<1> work_id) {
+            const int64_t linear = static_cast<int64_t>(work_id[0]);
+            const int64_t group = linear % groups;
+            const int64_t row = linear / groups;
+            const int64_t begin = row * width + group * group_size;
+            float variance = 0.0f;
+            for (int64_t j = 0; j < group_size; ++j) {
+                const float value = static_cast<float>(input[begin + j]);
+                variance += value * value;
+            }
+            variance /= static_cast<float>(group_size);
+            const float inverse = sycl::rsqrt(variance + eps);
+            for (int64_t j = 0; j < group_size; ++j) {
+                const int64_t index = begin + j;
+                const float value = static_cast<float>(input[index]);
+                const float scale = 1.0f + static_cast<float>(weight[group * group_size + j]);
+                output[index] = sycl::half(value * inverse * scale);
+            }
+        });
+    });
+}
+
+static void launch_score_gate(
+    sycl::queue& queue,
+    const sycl::half* key,
+    const sycl::half* query,
+    sycl::half* output,
+    int64_t rows,
+    int64_t groups,
+    int64_t hidden_size) {
+    if (rows <= 0 || groups <= 0 || hidden_size <= 0) {
+        return;
+    }
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<1>(static_cast<size_t>(rows * groups)),
+                         [=](sycl::id<1> work_id) {
+            const int64_t linear = static_cast<int64_t>(work_id[0]);
+            const int64_t group = linear % groups;
+            const int64_t row = linear / groups;
+            const int64_t begin = row * groups * hidden_size + group * hidden_size;
+            float dot = 0.0f;
+            for (int64_t j = 0; j < hidden_size; ++j) {
+                dot += static_cast<float>(key[begin + j]) *
+                       static_cast<float>(query[begin + j]);
+            }
+            dot /= sycl::sqrt(static_cast<float>(hidden_size));
+            const float signed_root = dot == 0.0f
+                ? 0.0f
+                : (dot < 0.0f ? -1.0f : 1.0f) *
+                      sycl::sqrt(sycl::fmax(sycl::fabs(dot), 1e-6f));
+            output[linear] = sycl::half(sigmoid(signed_root));
+        });
+    });
+}
+
+static void launch_gated_value(
+    sycl::queue& queue,
+    const sycl::half* gate,
+    const sycl::half* value,
+    sycl::half* output,
+    int64_t rows,
+    int64_t groups,
+    int64_t hidden_size) {
+    if (rows <= 0 || groups <= 0 || hidden_size <= 0) {
+        return;
+    }
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<1>(static_cast<size_t>(rows * groups * hidden_size)),
+                         [=](sycl::id<1> work_id) {
+            const int64_t linear = static_cast<int64_t>(work_id[0]);
+            const int64_t column = linear % hidden_size;
+            const int64_t group = (linear / hidden_size) % groups;
+            const int64_t row = linear / (hidden_size * groups);
+            output[linear] = sycl::half(
+                static_cast<float>(gate[row * groups + group]) *
+                static_cast<float>(value[row * hidden_size + column]));
+        });
+    });
+}
+
+static void launch_residual_add(
+    sycl::queue& queue,
+    const sycl::half* first,
+    const sycl::half* second,
+    sycl::half* output,
+    int64_t elements) {
+    if (elements <= 0) {
+        return;
+    }
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<1>(static_cast<size_t>(elements)),
+                         [=](sycl::id<1> work_id) {
+            const int64_t index = static_cast<int64_t>(work_id[0]);
+            output[index] = sycl::half(
+                static_cast<float>(first[index]) + static_cast<float>(second[index]));
+        });
+    });
+}
+
+template <typename StateT, typename IndexT>
+static void launch_short_conv_decode(
+    sycl::queue& queue,
+    const sycl::half* input,
+    StateT* state,
+    const sycl::half* weights,
+    const IndexT* indices,
+    const bool* has_initial,
+    sycl::half* output,
+    int64_t rows,
+    int64_t width,
+    int64_t kernel_size,
+    int64_t dilation,
+    int64_t state_slots,
+    int64_t stride0,
+    int64_t stride1,
+    int64_t stride2,
+    bool state_dim_first,
+    int64_t null_block_id) {
+    const int64_t state_len = (kernel_size - 1) * dilation;
+    if (rows <= 0 || width <= 0) {
+        return;
+    }
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<1>(static_cast<size_t>(rows * width)),
+                         [=](sycl::id<1> work_id) {
+            const int64_t linear = static_cast<int64_t>(work_id[0]);
+            const int64_t channel = linear % width;
+            const int64_t row = linear / width;
+            const int64_t slot = static_cast<int64_t>(indices[row]);
+            const bool valid = slot != null_block_id && slot >= 0 && slot < state_slots;
+            if (!valid) {
+                output[linear] = sycl::half(0.0f);
+                return;
+            }
+            const bool initial = has_initial[row];
+            float history[kMaxConvState + 1];
+            for (int64_t position = 0; position < state_len; ++position) {
+                const int64_t offset = state_dim_first
+                    ? slot * stride0 + channel * stride1 + position * stride2
+                    : slot * stride0 + position * stride1 + channel * stride2;
+                history[position] = initial ? static_cast<float>(state[offset]) : 0.0f;
+            }
+            history[state_len] = static_cast<float>(input[linear]);
+            float accumulated = 0.0f;
+            for (int64_t k = 0; k < kernel_size; ++k) {
+                accumulated += static_cast<float>(weights[channel * kernel_size + k]) *
+                               history[k * dilation];
+            }
+            output[linear] = sycl::half(silu(accumulated));
+            for (int64_t position = 0; position < state_len; ++position) {
+                const int64_t offset = state_dim_first
+                    ? slot * stride0 + channel * stride1 + position * stride2
+                    : slot * stride0 + position * stride1 + channel * stride2;
+                state[offset] = static_cast<StateT>(history[position + 1]);
+            }
+        });
+    });
+}
+
+template <typename StateT, typename IndexT, typename OffsetT>
+static void launch_short_conv_prefill(
+    sycl::queue& queue,
+    const sycl::half* input,
+    const OffsetT* query_start_loc,
+    StateT* state,
+    const sycl::half* weights,
+    const IndexT* indices,
+    const bool* has_initial,
+    sycl::half* output,
+    int64_t requests,
+    int64_t width,
+    int64_t kernel_size,
+    int64_t dilation,
+    int64_t state_slots,
+    int64_t stride0,
+    int64_t stride1,
+    int64_t stride2,
+    bool state_dim_first,
+    int64_t null_block_id) {
+    const int64_t state_len = (kernel_size - 1) * dilation;
+    if (requests <= 0 || width <= 0) {
+        return;
+    }
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<1>(static_cast<size_t>(requests * width)),
+                         [=](sycl::id<1> work_id) {
+            const int64_t linear = static_cast<int64_t>(work_id[0]);
+            const int64_t channel = linear % width;
+            const int64_t request = linear / width;
+            const int64_t begin = query_start_loc[request];
+            const int64_t end = query_start_loc[request + 1];
+            const int64_t slot = static_cast<int64_t>(indices[request]);
+            const bool valid = slot != null_block_id && slot >= 0 && slot < state_slots;
+            if (!valid) {
+                for (int64_t token = begin; token < end; ++token) {
+                    output[token * width + channel] = sycl::half(0.0f);
+                }
+                return;
+            }
+            if (begin == end) {
+                return;
+            }
+            float history[kMaxConvState + 1];
+            for (int64_t position = 0; position < state_len; ++position) {
+                const int64_t offset = state_dim_first
+                    ? slot * stride0 + channel * stride1 + position * stride2
+                    : slot * stride0 + position * stride1 + channel * stride2;
+                history[position] = has_initial[request]
+                    ? static_cast<float>(state[offset]) : 0.0f;
+            }
+            for (int64_t token = begin; token < end; ++token) {
+                history[state_len] = static_cast<float>(input[token * width + channel]);
+                float accumulated = 0.0f;
+                for (int64_t k = 0; k < kernel_size; ++k) {
+                    accumulated += static_cast<float>(weights[channel * kernel_size + k]) *
+                                   history[k * dilation];
+                }
+                output[token * width + channel] = sycl::half(silu(accumulated));
+                for (int64_t position = 0; position < state_len; ++position) {
+                    history[position] = history[position + 1];
+                }
+            }
+            for (int64_t position = 0; position < state_len; ++position) {
+                const int64_t offset = state_dim_first
+                    ? slot * stride0 + channel * stride1 + position * stride2
+                    : slot * stride0 + position * stride1 + channel * stride2;
+                state[offset] = static_cast<StateT>(history[position]);
+            }
+        });
+    });
+}
+
+template <typename StateT, typename IndexT, typename OffsetT, typename AcceptedT>
+static void launch_short_conv_spec(
+    sycl::queue& queue,
+    const sycl::half* input,
+    const OffsetT* query_start_loc,
+    StateT* state,
+    const sycl::half* weights,
+    const IndexT* indices,
+    const AcceptedT* accepted_tokens,
+    sycl::half* output,
+    int64_t requests,
+    int64_t width,
+    int64_t kernel_size,
+    int64_t num_spec_tokens,
+    int64_t dilation,
+    int64_t state_slots,
+    int64_t stride0,
+    int64_t stride1,
+    int64_t stride2,
+    bool state_dim_first,
+    int64_t null_block_id) {
+    const int64_t state_len = (kernel_size - 1) * dilation;
+    const int64_t capacity = state_len + num_spec_tokens;
+    if (requests <= 0 || width <= 0) {
+        return;
+    }
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<1>(static_cast<size_t>(requests * width)),
+                         [=](sycl::id<1> work_id) {
+            const int64_t linear = static_cast<int64_t>(work_id[0]);
+            const int64_t channel = linear % width;
+            const int64_t request = linear / width;
+            const int64_t begin = query_start_loc[request];
+            const int64_t end = query_start_loc[request + 1];
+            const int64_t slot = static_cast<int64_t>(indices[request]);
+            const bool valid = slot != null_block_id && slot >= 0 && slot < state_slots;
+            if (!valid) {
+                for (int64_t token = begin; token < end; ++token) {
+                    output[token * width + channel] = sycl::half(0.0f);
+                }
+                return;
+            }
+            // An empty valid request has no candidate to evaluate or consume.
+            // It must preserve the rollback-capable state exactly.
+            if (begin == end) {
+                return;
+            }
+            int64_t rollback = accepted_tokens[request] - 1;
+            if (rollback < 0) rollback = 0;
+            if (rollback > num_spec_tokens) rollback = num_spec_tokens;
+            float history[kMaxConvState + 1];
+            float extended[kMaxConvState + kMaxSpecTokens + 1];
+            for (int64_t position = 0; position < state_len; ++position) {
+                const int64_t logical = rollback + position;
+                const int64_t offset = state_dim_first
+                    ? slot * stride0 + channel * stride1 + logical * stride2
+                    : slot * stride0 + logical * stride1 + channel * stride2;
+                history[position] = static_cast<float>(state[offset]);
+                extended[position] = history[position];
+            }
+            int64_t candidate_count = 0;
+            for (int64_t token = begin; token < end; ++token) {
+                history[state_len] = static_cast<float>(input[token * width + channel]);
+                float accumulated = 0.0f;
+                for (int64_t k = 0; k < kernel_size; ++k) {
+                    accumulated += static_cast<float>(weights[channel * kernel_size + k]) *
+                                   history[k * dilation];
+                }
+                output[token * width + channel] = sycl::half(silu(accumulated));
+                if (state_len + candidate_count < kMaxConvState + kMaxSpecTokens + 1) {
+                    extended[state_len + candidate_count] = history[state_len];
+                }
+                ++candidate_count;
+                for (int64_t position = 0; position < state_len; ++position) {
+                    history[position] = history[position + 1];
+                }
+            }
+            if (state_len > 0) {
+                int64_t keep = state_len + candidate_count - 1;
+                if (keep < 0) keep = 0;
+                if (keep > capacity) keep = capacity;
+                for (int64_t position = 0; position < keep; ++position) {
+                    const int64_t offset = state_dim_first
+                        ? slot * stride0 + channel * stride1 + position * stride2
+                        : slot * stride0 + position * stride1 + channel * stride2;
+                    state[offset] = static_cast<StateT>(extended[position + 1]);
+                }
+            }
+        });
+    });
+}
+
+static inline void check_state_common(
+    const at::Tensor& input,
+    const at::Tensor& conv_state,
+    const at::Tensor& conv_weights,
+    const at::Tensor& state_indices,
+    const at::Tensor& has_initial_state,
+    const at::Tensor& output,
+    int64_t dilation,
+    bool state_dim_first,
+    int64_t required_width) {
+    TORCH_CHECK(input.device().is_xpu(), "input must be on XPU");
+    TORCH_CHECK(input.scalar_type() == at::kHalf && input.dim() == 2,
+                "input must be a 2D float16 tensor");
+    TORCH_CHECK(input.size(1) > 0, "input width must be positive");
+    check_contiguous(input, "input");
+    check_half(input, conv_weights, "conv_weights");
+    check_index_tensor(input, state_indices, "state_indices");
+    check_same_xpu(input, has_initial_state, "has_initial_state");
+    TORCH_CHECK(has_initial_state.scalar_type() == at::kBool &&
+                    has_initial_state.dim() == 1 && has_initial_state.is_contiguous(),
+                "has_initial_state must be contiguous bool [rows]");
+    check_output(input, output, "output");
+    TORCH_CHECK(!output.is_alias_of(conv_weights) &&
+                    !output.is_alias_of(state_indices) &&
+                    !output.is_alias_of(has_initial_state),
+                "output must not share storage with metadata or conv_weights");
+    TORCH_CHECK(conv_weights.dim() == 2 && conv_weights.size(0) == input.size(1) &&
+                    conv_weights.size(1) >= 1,
+                "conv_weights must have shape [input_width, kernel_size] with kernel_size >= 1");
+    const int64_t state_len = checked_state_length(conv_weights.size(1), dilation);
+    TORCH_CHECK(state_len <= kMaxConvState,
+                "conv state length exceeds implementation limit");
+    TORCH_CHECK(conv_state.dim() == 3,
+                "conv_state must have rank 3 [slots, channels, state] or [slots, state, channels]");
+    TORCH_CHECK(conv_state.size(0) > 0,
+                "conv_state must have at least one state slot");
+    check_same_xpu(input, conv_state, "conv_state");
+    TORCH_CHECK(conv_state.scalar_type() == at::kHalf ||
+                    conv_state.scalar_type() == at::kFloat,
+                "conv_state must have dtype float16 or float32");
+    TORCH_CHECK(conv_state.stride(0) > 0 && conv_state.stride(1) > 0 &&
+                    conv_state.stride(2) > 0,
+                "conv_state must have strictly positive strides");
+    TORCH_CHECK(is_positive_non_overlapping(conv_state),
+                "conv_state must have positive, non-overlapping strides");
+    TORCH_CHECK(!conv_state.is_alias_of(input) &&
+                    !conv_state.is_alias_of(conv_weights) &&
+                    !conv_state.is_alias_of(state_indices) &&
+                    !conv_state.is_alias_of(has_initial_state) &&
+                    !conv_state.is_alias_of(output),
+                "conv_state must not share storage with other inputs/output");
+    const bool shape_ok = state_dim_first
+        ? conv_state.size(1) == input.size(1) && conv_state.size(2) >= required_width
+        : conv_state.size(2) == input.size(1) && conv_state.size(1) >= required_width;
+    TORCH_CHECK(shape_ok, "conv_state shape/layout is incompatible with input and state width");
+    TORCH_CHECK(state_indices.numel() == has_initial_state.numel(),
+                "state_indices and has_initial_state lengths must match");
+    TORCH_CHECK(output.sizes() == input.sizes(), "output must have the same shape as input");
+    TORCH_CHECK(output.data_ptr() != conv_state.data_ptr(),
+                "output must not alias conv_state");
+}
+
+template <typename StateT, typename IndexT>
+static void dispatch_decode_state(
+    const at::Tensor& input,
+    const at::Tensor& conv_state,
+    const at::Tensor& conv_weights,
+    const at::Tensor& state_indices,
+    const at::Tensor& has_initial_state,
+    const at::Tensor& output,
+    int64_t dilation,
+    bool state_dim_first,
+    int64_t null_block_id) {
+    auto& queue = get_device_queue(input);
+    launch_short_conv_decode<StateT, IndexT>(
+        queue,
+        reinterpret_cast<const sycl::half*>(input.data_ptr()),
+        reinterpret_cast<StateT*>(conv_state.data_ptr()),
+        reinterpret_cast<const sycl::half*>(conv_weights.data_ptr()),
+        state_indices.data_ptr<IndexT>(), has_initial_state.data_ptr<bool>(),
+        reinterpret_cast<sycl::half*>(output.data_ptr()),
+        input.size(0), input.size(1), conv_weights.size(1), dilation,
+        conv_state.size(0), conv_state.stride(0), conv_state.stride(1),
+        conv_state.stride(2), state_dim_first, null_block_id);
+}
+
+template <typename StateT, typename IndexT, typename OffsetT>
+static void dispatch_prefill_state(
+    const at::Tensor& input,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& conv_state,
+    const at::Tensor& conv_weights,
+    const at::Tensor& state_indices,
+    const at::Tensor& has_initial_state,
+    const at::Tensor& output,
+    int64_t dilation,
+    bool state_dim_first,
+    int64_t null_block_id) {
+    auto& queue = get_device_queue(input);
+    launch_short_conv_prefill<StateT, IndexT, OffsetT>(
+        queue,
+        reinterpret_cast<const sycl::half*>(input.data_ptr()),
+        query_start_loc.data_ptr<OffsetT>(),
+        reinterpret_cast<StateT*>(conv_state.data_ptr()),
+        reinterpret_cast<const sycl::half*>(conv_weights.data_ptr()),
+        state_indices.data_ptr<IndexT>(), has_initial_state.data_ptr<bool>(),
+        reinterpret_cast<sycl::half*>(output.data_ptr()),
+        query_start_loc.size(0) - 1, input.size(1), conv_weights.size(1), dilation,
+        conv_state.size(0), conv_state.stride(0), conv_state.stride(1),
+        conv_state.stride(2), state_dim_first, null_block_id);
+}
+
+template <typename StateT, typename IndexT, typename OffsetT, typename AcceptedT>
+static void dispatch_spec_state(
+    const at::Tensor& input,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& conv_state,
+    const at::Tensor& conv_weights,
+    const at::Tensor& state_indices,
+    const at::Tensor& num_accepted_tokens,
+    const at::Tensor& output,
+    int64_t num_spec_tokens,
+    int64_t dilation,
+    bool state_dim_first,
+    int64_t null_block_id) {
+    auto& queue = get_device_queue(input);
+    launch_short_conv_spec<StateT, IndexT, OffsetT, AcceptedT>(
+        queue,
+        reinterpret_cast<const sycl::half*>(input.data_ptr()),
+        query_start_loc.data_ptr<OffsetT>(),
+        reinterpret_cast<StateT*>(conv_state.data_ptr()),
+        reinterpret_cast<const sycl::half*>(conv_weights.data_ptr()),
+        state_indices.data_ptr<IndexT>(), num_accepted_tokens.data_ptr<AcceptedT>(),
+        reinterpret_cast<sycl::half*>(output.data_ptr()),
+        query_start_loc.size(0) - 1, input.size(1), conv_weights.size(1),
+        num_spec_tokens, dilation, conv_state.size(0), conv_state.stride(0),
+        conv_state.stride(1), conv_state.stride(2), state_dim_first, null_block_id);
+}
+
+template <typename StateT, typename IndexT>
+static void dispatch_spec_metadata(
+    const at::Tensor& input,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& conv_state,
+    const at::Tensor& conv_weights,
+    const at::Tensor& state_indices,
+    const at::Tensor& num_accepted_tokens,
+    const at::Tensor& output,
+    int64_t num_spec_tokens,
+    int64_t dilation,
+    bool state_dim_first,
+    int64_t null_block_id) {
+    const bool offsets_i32 = query_start_loc.scalar_type() == at::kInt;
+    const bool accepted_i32 = num_accepted_tokens.scalar_type() == at::kInt;
+    if (offsets_i32 && accepted_i32) {
+        dispatch_spec_state<StateT, IndexT, int32_t, int32_t>(
+            input, query_start_loc, conv_state, conv_weights, state_indices,
+            num_accepted_tokens, output, num_spec_tokens, dilation,
+            state_dim_first, null_block_id);
+    } else if (offsets_i32) {
+        dispatch_spec_state<StateT, IndexT, int32_t, int64_t>(
+            input, query_start_loc, conv_state, conv_weights, state_indices,
+            num_accepted_tokens, output, num_spec_tokens, dilation,
+            state_dim_first, null_block_id);
+    } else if (accepted_i32) {
+        dispatch_spec_state<StateT, IndexT, int64_t, int32_t>(
+            input, query_start_loc, conv_state, conv_weights, state_indices,
+            num_accepted_tokens, output, num_spec_tokens, dilation,
+            state_dim_first, null_block_id);
+    } else {
+        dispatch_spec_state<StateT, IndexT, int64_t, int64_t>(
+            input, query_start_loc, conv_state, conv_weights, state_indices,
+            num_accepted_tokens, output, num_spec_tokens, dilation,
+            state_dim_first, null_block_id);
+    }
+}
+
+}  // namespace
+
+namespace ple {
+
+at::Tensor ngram_ids(
+    at::Tensor input_ids,
+    at::Tensor query_start_loc,
+    at::Tensor ngram_context,
+    at::Tensor layer_multipliers,
+    at::Tensor ngram_heads_vocab_sizes,
+    at::Tensor ngram_heads_offsets,
+    at::Tensor output,
+    int64_t eos_token_id,
+    int64_t heads_per_ngram) {
+    check_primary_int64(input_ids, "input_ids");
+    check_int64(input_ids, query_start_loc, "query_start_loc");
+    check_int64(input_ids, ngram_context, "ngram_context");
+    check_int64(input_ids, layer_multipliers, "layer_multipliers");
+    check_int64(input_ids, ngram_heads_vocab_sizes, "ngram_heads_vocab_sizes");
+    check_int64(input_ids, ngram_heads_offsets, "ngram_heads_offsets");
+    check_int64(input_ids, output, "output");
+    TORCH_CHECK(heads_per_ngram > 0, "heads_per_ngram must be positive");
+    TORCH_CHECK(input_ids.dim() == 1 && query_start_loc.dim() == 1 &&
+                    query_start_loc.numel() >= 1,
+                "input_ids/query_start_loc must be [T]/[R+1]");
+    const int64_t ngram_size = layer_multipliers.numel();
+    TORCH_CHECK(ngram_size >= 2, "at least bigram metadata is required");
+    const int64_t heads = (ngram_size - 1) * heads_per_ngram;
+    const int64_t requests = query_start_loc.numel() - 1;
+    TORCH_CHECK(requests >= 0,
+                "query_start_loc must contain at least one offset");
+    validate_query_start_loc(query_start_loc, requests, input_ids.numel(),
+                             "query_start_loc");
+    TORCH_CHECK(ngram_context.dim() == 2 &&
+                    ngram_context.size(0) == query_start_loc.size(0) - 1 &&
+                    ngram_context.size(1) == ngram_size - 1,
+                "ngram_context must be [requests, ngram_size-1]");
+    TORCH_CHECK(ngram_heads_vocab_sizes.numel() == heads &&
+                    ngram_heads_offsets.numel() == heads,
+                "N-gram head metadata has an invalid length");
+    for (const int64_t vocab_size : copy_index_values(ngram_heads_vocab_sizes)) {
+        TORCH_CHECK(vocab_size > 0,
+                    "N-gram head vocab sizes must be positive");
+    }
+    TORCH_CHECK(output.sizes() == at::IntArrayRef({input_ids.size(0), heads}),
+                "output has an invalid N-gram ID shape");
+    TORCH_CHECK(!output.is_alias_of(input_ids) &&
+                    !output.is_alias_of(query_start_loc) &&
+                    !output.is_alias_of(ngram_context) &&
+                    !output.is_alias_of(layer_multipliers) &&
+                    !output.is_alias_of(ngram_heads_vocab_sizes) &&
+                    !output.is_alias_of(ngram_heads_offsets),
+                "output must not alias N-gram inputs or metadata");
+    auto& queue = get_device_queue(input_ids);
+    if (input_ids.numel() > 0) {
+        launch_ngram_ids(
+            queue, input_ids.data_ptr<int64_t>(), query_start_loc.data_ptr<int64_t>(),
+            ngram_context.data_ptr<int64_t>(), layer_multipliers.data_ptr<int64_t>(),
+            ngram_heads_vocab_sizes.data_ptr<int64_t>(), ngram_heads_offsets.data_ptr<int64_t>(),
+            output.data_ptr<int64_t>(), input_ids.size(0), query_start_loc.size(0) - 1,
+            ngram_size, heads_per_ngram, eos_token_id);
+    }
+    return output;
+}
+
+at::Tensor embedding_gather(
+    at::Tensor ngram_ids_tensor,
+    at::Tensor local_weight,
+    at::Tensor local_vocab_start,
+    at::Tensor local_num_rows,
+    at::Tensor local_partial) {
+    check_primary_int64(ngram_ids_tensor, "ngram_ids");
+    check_int64(ngram_ids_tensor, local_vocab_start, "local_vocab_start");
+    check_int64(ngram_ids_tensor, local_num_rows, "local_num_rows");
+    check_half(ngram_ids_tensor, local_weight, "local_weight");
+    check_half(ngram_ids_tensor, local_partial, "local_partial");
+    TORCH_CHECK(ngram_ids_tensor.dim() == 2 && local_weight.dim() == 2 &&
+                    local_vocab_start.numel() == 1 && local_num_rows.numel() == 1,
+                "invalid embedding gather rank/metadata");
+    TORCH_CHECK(local_partial.dim() == 2 &&
+                    local_partial.size(0) == ngram_ids_tensor.size(0) &&
+                    local_partial.size(1) == ngram_ids_tensor.size(1) * local_weight.size(1),
+                "local_partial has an invalid shape");
+    validate_embedding_shard_metadata(
+        local_weight, local_vocab_start, local_num_rows);
+    TORCH_CHECK(!local_partial.is_alias_of(ngram_ids_tensor) &&
+                    !local_partial.is_alias_of(local_weight) &&
+                    !local_partial.is_alias_of(local_vocab_start) &&
+                    !local_partial.is_alias_of(local_num_rows),
+                "local_partial must not share storage with input tensors or metadata");
+    auto& queue = get_device_queue(ngram_ids_tensor);
+    if (local_partial.numel() > 0) {
+        launch_embedding<sycl::half>(
+            queue, ngram_ids_tensor.data_ptr<int64_t>(),
+            reinterpret_cast<const sycl::half*>(local_weight.data_ptr()),
+            local_vocab_start.data_ptr<int64_t>(), local_num_rows.data_ptr<int64_t>(),
+            reinterpret_cast<sycl::half*>(local_partial.data_ptr()),
+            ngram_ids_tensor.size(0), ngram_ids_tensor.size(1), local_weight.size(1));
+    }
+    return local_partial;
+}
+
+at::Tensor grouped_norm(
+    at::Tensor input,
+    at::Tensor weight,
+    at::Tensor output,
+    double eps,
+    int64_t group_size) {
+    check_primary_half(input, "input");
+    check_half(input, weight, "weight");
+    check_output(input, output, "output");
+    TORCH_CHECK(input.dim() >= 1 && weight.dim() == 1 &&
+                    weight.numel() == input.size(-1) && output.sizes() == input.sizes(),
+                "grouped_norm shapes are invalid");
+    TORCH_CHECK(!output.is_alias_of(weight),
+                "grouped_norm output must not share storage with weight");
+    const int64_t width = input.size(-1);
+    TORCH_CHECK(width > 0 && group_size > 0 && width % group_size == 0,
+                "input width must be positive and divisible by group_size");
+    auto& queue = get_device_queue(input);
+    launch_grouped_norm(
+        queue, reinterpret_cast<const sycl::half*>(input.data_ptr()),
+        reinterpret_cast<const sycl::half*>(weight.data_ptr()),
+        reinterpret_cast<sycl::half*>(output.data_ptr()), input.numel() / width, width,
+        group_size, static_cast<float>(eps));
+    return output;
+}
+
+at::Tensor score_gate(
+    at::Tensor key,
+    at::Tensor query,
+    at::Tensor output,
+    int64_t hidden_size) {
+    check_primary_half(key, "key");
+    check_half(key, query, "query");
+    check_half(key, output, "output");
+    TORCH_CHECK(key.dim() >= 1 && query.sizes() == key.sizes(),
+                "key/query must have the same shape and a non-empty rank");
+    const int64_t width = key.size(-1);
+    TORCH_CHECK(width > 0 && hidden_size > 0 && width % hidden_size == 0,
+                "key width must be positive and divisible by hidden_size");
+    const int64_t groups = width / hidden_size;
+    TORCH_CHECK(output.numel() == (key.numel() / width) * groups,
+                "gate output has an invalid element count");
+    TORCH_CHECK(!output.is_alias_of(key) && !output.is_alias_of(query),
+                "gate output must not share storage with key/query");
+    auto& queue = get_device_queue(key);
+    launch_score_gate(
+        queue, reinterpret_cast<const sycl::half*>(key.data_ptr()),
+        reinterpret_cast<const sycl::half*>(query.data_ptr()),
+        reinterpret_cast<sycl::half*>(output.data_ptr()), key.numel() / width,
+        groups, hidden_size);
+    return output;
+}
+
+at::Tensor gated_value(
+    at::Tensor gate,
+    at::Tensor value,
+    at::Tensor output,
+    int64_t hc_count) {
+    check_primary_half(gate, "gate");
+    check_half(gate, value, "value");
+    check_half(gate, output, "output");
+    TORCH_CHECK(gate.dim() >= 1 && value.dim() >= 1,
+                "gate/value must have a non-empty rank");
+    TORCH_CHECK(hc_count > 0, "hc_count must be positive");
+    const int64_t hidden_size = value.size(-1);
+    TORCH_CHECK(hidden_size > 0, "value hidden width must be positive");
+    const int64_t rows = value.numel() / hidden_size;
+    TORCH_CHECK(gate.numel() == rows * hc_count &&
+                    output.numel() == rows * hc_count * hidden_size,
+                "gated_value shapes are invalid");
+    TORCH_CHECK(!output.is_alias_of(gate) && !output.is_alias_of(value),
+                "gated value output must not share storage with inputs");
+    auto& queue = get_device_queue(gate);
+    launch_gated_value(
+        queue, reinterpret_cast<const sycl::half*>(gate.data_ptr()),
+        reinterpret_cast<const sycl::half*>(value.data_ptr()),
+        reinterpret_cast<sycl::half*>(output.data_ptr()), rows, hc_count,
+        hidden_size);
+    return output;
+}
+
+at::Tensor residual_add(
+    at::Tensor gated_value_flat,
+    at::Tensor conv_output,
+    at::Tensor output) {
+    check_primary_half(gated_value_flat, "gated_value_flat");
+    check_half(gated_value_flat, conv_output, "conv_output");
+    check_half(gated_value_flat, output, "output");
+    TORCH_CHECK(gated_value_flat.sizes() == conv_output.sizes() &&
+                    gated_value_flat.sizes() == output.sizes(),
+                "residual_add tensors must have identical shapes");
+    TORCH_CHECK(!output.is_alias_of(gated_value_flat) &&
+                    !output.is_alias_of(conv_output),
+                "residual_add output must not share storage with inputs");
+    auto& queue = get_device_queue(gated_value_flat);
+    launch_residual_add(
+        queue, reinterpret_cast<const sycl::half*>(gated_value_flat.data_ptr()),
+        reinterpret_cast<const sycl::half*>(conv_output.data_ptr()),
+        reinterpret_cast<sycl::half*>(output.data_ptr()), gated_value_flat.numel());
+    return output;
+}
+
+at::Tensor short_conv_decode(
+    at::Tensor input,
+    at::Tensor conv_state,
+    at::Tensor conv_weights,
+    at::Tensor state_indices,
+    at::Tensor has_initial_state,
+    at::Tensor output,
+    int64_t dilation,
+    bool state_dim_first,
+    int64_t null_block_id) {
+    TORCH_CHECK(conv_weights.dim() == 2,
+                "conv_weights must be rank 2");
+    const int64_t state_len =
+        checked_state_length(conv_weights.size(1), dilation);
+    check_state_common(input, conv_state, conv_weights, state_indices,
+                       has_initial_state, output, dilation, state_dim_first,
+                       state_len);
+    TORCH_CHECK(state_indices.numel() == input.size(0),
+                "decode state metadata must have one row per input token");
+    validate_unique_state_indices(state_indices, conv_state.size(0),
+                                  null_block_id);
+    if (input.size(0) > 0) {
+        if (conv_state.scalar_type() == at::kHalf) {
+            if (state_indices.scalar_type() == at::kInt) {
+                dispatch_decode_state<sycl::half, int32_t>(
+                    input, conv_state, conv_weights, state_indices,
+                    has_initial_state, output, dilation, state_dim_first,
+                    null_block_id);
+            } else {
+                dispatch_decode_state<sycl::half, int64_t>(
+                    input, conv_state, conv_weights, state_indices,
+                    has_initial_state, output, dilation, state_dim_first,
+                    null_block_id);
+            }
+        } else {
+            if (state_indices.scalar_type() == at::kInt) {
+                dispatch_decode_state<float, int32_t>(
+                    input, conv_state, conv_weights, state_indices,
+                    has_initial_state, output, dilation, state_dim_first,
+                    null_block_id);
+            } else {
+                dispatch_decode_state<float, int64_t>(
+                    input, conv_state, conv_weights, state_indices,
+                    has_initial_state, output, dilation, state_dim_first,
+                    null_block_id);
+            }
+        }
+    }
+    return output;
+}
+
+at::Tensor short_conv_prefill(
+    at::Tensor input,
+    at::Tensor query_start_loc,
+    at::Tensor conv_state,
+    at::Tensor conv_weights,
+    at::Tensor state_indices,
+    at::Tensor has_initial_state,
+    at::Tensor output,
+    int64_t dilation,
+    bool state_dim_first,
+    int64_t null_block_id) {
+    TORCH_CHECK(conv_weights.dim() == 2,
+                "conv_weights must be rank 2");
+    const int64_t state_len =
+        checked_state_length(conv_weights.size(1), dilation);
+    check_state_common(input, conv_state, conv_weights, state_indices,
+                       has_initial_state, output, dilation, state_dim_first,
+                       state_len);
+    check_index_tensor(input, query_start_loc, "query_start_loc");
+    TORCH_CHECK(!output.is_alias_of(query_start_loc) &&
+                    !conv_state.is_alias_of(query_start_loc),
+                "state/output must not share storage with query_start_loc");
+    const int64_t requests = state_indices.numel();
+    validate_query_start_loc(query_start_loc, requests, input.size(0),
+                             "query_start_loc");
+    validate_unique_state_indices(state_indices, conv_state.size(0),
+                                  null_block_id);
+    if (requests > 0 && input.size(0) > 0) {
+        const bool offsets_i32 = query_start_loc.scalar_type() == at::kInt;
+        if (conv_state.scalar_type() == at::kHalf) {
+            if (state_indices.scalar_type() == at::kInt) {
+                if (offsets_i32) {
+                    dispatch_prefill_state<sycl::half, int32_t, int32_t>(
+                        input, query_start_loc, conv_state, conv_weights,
+                        state_indices, has_initial_state, output, dilation,
+                        state_dim_first, null_block_id);
+                } else {
+                    dispatch_prefill_state<sycl::half, int32_t, int64_t>(
+                        input, query_start_loc, conv_state, conv_weights,
+                        state_indices, has_initial_state, output, dilation,
+                        state_dim_first, null_block_id);
+                }
+            } else if (offsets_i32) {
+                dispatch_prefill_state<sycl::half, int64_t, int32_t>(
+                    input, query_start_loc, conv_state, conv_weights,
+                    state_indices, has_initial_state, output, dilation,
+                    state_dim_first, null_block_id);
+            } else {
+                dispatch_prefill_state<sycl::half, int64_t, int64_t>(
+                    input, query_start_loc, conv_state, conv_weights,
+                    state_indices, has_initial_state, output, dilation,
+                    state_dim_first, null_block_id);
+            }
+        } else if (state_indices.scalar_type() == at::kInt) {
+            if (offsets_i32) {
+                dispatch_prefill_state<float, int32_t, int32_t>(
+                    input, query_start_loc, conv_state, conv_weights,
+                    state_indices, has_initial_state, output, dilation,
+                    state_dim_first, null_block_id);
+            } else {
+                dispatch_prefill_state<float, int32_t, int64_t>(
+                    input, query_start_loc, conv_state, conv_weights,
+                    state_indices, has_initial_state, output, dilation,
+                    state_dim_first, null_block_id);
+            }
+        } else if (offsets_i32) {
+            dispatch_prefill_state<float, int64_t, int32_t>(
+                input, query_start_loc, conv_state, conv_weights,
+                state_indices, has_initial_state, output, dilation,
+                state_dim_first, null_block_id);
+        } else {
+            dispatch_prefill_state<float, int64_t, int64_t>(
+                input, query_start_loc, conv_state, conv_weights,
+                state_indices, has_initial_state, output, dilation,
+                state_dim_first, null_block_id);
+        }
+    }
+    return output;
+}
+
+at::Tensor short_conv_spec(
+    at::Tensor input,
+    at::Tensor query_start_loc,
+    at::Tensor conv_state,
+    at::Tensor conv_weights,
+    at::Tensor state_indices,
+    at::Tensor num_accepted_tokens,
+    at::Tensor output,
+    int64_t num_spec_tokens,
+    int64_t dilation,
+    bool state_dim_first,
+    int64_t null_block_id) {
+    TORCH_CHECK(num_spec_tokens >= 0 && num_spec_tokens <= kMaxSpecTokens,
+                "num_spec_tokens exceeds implementation limit");
+    at::Tensor has_initial_state = at::ones(
+        {state_indices.numel()}, input.options().dtype(at::kBool));
+    TORCH_CHECK(conv_weights.dim() == 2,
+                "conv_weights must be rank 2");
+    const int64_t state_len =
+        checked_state_length(conv_weights.size(1), dilation);
+    TORCH_CHECK(state_len <= kMaxConvState &&
+                    num_spec_tokens <= kMaxSpecTokens &&
+                    state_len <= std::numeric_limits<int64_t>::max() - num_spec_tokens,
+                "speculative state capacity is invalid");
+    const int64_t capacity = state_len + num_spec_tokens;
+    check_state_common(input, conv_state, conv_weights, state_indices,
+                       has_initial_state, output, dilation, state_dim_first,
+                       capacity);
+    check_index_tensor(input, query_start_loc, "query_start_loc");
+    check_index_tensor(input, num_accepted_tokens, "num_accepted_tokens");
+    TORCH_CHECK(!output.is_alias_of(query_start_loc) &&
+                    !conv_state.is_alias_of(query_start_loc) &&
+                    !output.is_alias_of(num_accepted_tokens) &&
+                    !conv_state.is_alias_of(num_accepted_tokens),
+                "state/output must not share storage with speculative metadata");
+    const int64_t requests = state_indices.numel();
+    validate_query_start_loc(query_start_loc, requests, input.size(0),
+                             "query_start_loc");
+    validate_spec_query_lengths(query_start_loc, requests, num_spec_tokens);
+    validate_accepted_tokens(num_accepted_tokens, requests, num_spec_tokens);
+    validate_unique_state_indices(state_indices, conv_state.size(0),
+                                  null_block_id);
+    if (requests > 0 && input.size(0) > 0) {
+        if (conv_state.scalar_type() == at::kHalf) {
+            if (state_indices.scalar_type() == at::kInt) {
+                dispatch_spec_metadata<sycl::half, int32_t>(
+                    input, query_start_loc, conv_state, conv_weights,
+                    state_indices, num_accepted_tokens, output, num_spec_tokens,
+                    dilation, state_dim_first, null_block_id);
+            } else {
+                dispatch_spec_metadata<sycl::half, int64_t>(
+                    input, query_start_loc, conv_state, conv_weights,
+                    state_indices, num_accepted_tokens, output, num_spec_tokens,
+                    dilation, state_dim_first, null_block_id);
+            }
+        } else if (state_indices.scalar_type() == at::kInt) {
+            dispatch_spec_metadata<float, int32_t>(
+                input, query_start_loc, conv_state, conv_weights,
+                state_indices, num_accepted_tokens, output, num_spec_tokens,
+                dilation, state_dim_first, null_block_id);
+        } else {
+            dispatch_spec_metadata<float, int64_t>(
+                input, query_start_loc, conv_state, conv_weights,
+                state_indices, num_accepted_tokens, output, num_spec_tokens,
+                dilation, state_dim_first, null_block_id);
+        }
+    }
+    return output;
+}
+
+}  // namespace ple

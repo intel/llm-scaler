@@ -5,6 +5,8 @@
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include "xpu/esimd_kernels/ple.h"
+
 // FP8 weight GEMV with per-N scale: output = input @ dequant(weight_fp8) * scale
 // FP32 accumulation, element-wise acc + deferred scale. Optimized for decode (M=1).
 at::Tensor esimd_gemv_fp8_pern(
@@ -358,6 +360,36 @@ void esimd_accum_norm_add_norm(
     at::Tensor routed_output, at::Tensor h1,
     at::Tensor w1, at::Tensor w2, at::Tensor out,
     int64_t top_k, double eps1, double eps2);
+
+// Qwen3.8 decode N-gram ID generation specialized for the checkpoint's fixed
+// 8-bigram + 8-trigram vocab sizes and offsets. The caller must guard those
+// metadata values before dispatch and use the Torch fallback on a mismatch.
+at::Tensor esimd_qwen38_ngram_ids_decode(
+    at::Tensor input_ids,
+    at::Tensor ngram_context,
+    at::Tensor layer_multipliers);
+
+at::Tensor esimd_qwen38_ngram_ids_decode_out(
+    at::Tensor input_ids,
+    at::Tensor ngram_context,
+    at::Tensor layer_multipliers,
+    at::Tensor output);
+
+// Qwen3.8 NG-2a single-rank local FP16 gather before TP all-reduce.
+// local_vocab_start/local_num_rows are runtime device scalars; the table row
+// count and row width are checked by the host wrapper.
+at::Tensor esimd_qwen38_ngram_embedding_gather(
+    at::Tensor ngram_ids,
+    at::Tensor local_weight,
+    at::Tensor local_vocab_start,
+    at::Tensor local_num_rows);
+
+at::Tensor esimd_qwen38_ngram_embedding_gather_out(
+    at::Tensor ngram_ids,
+    at::Tensor local_weight,
+    at::Tensor local_vocab_start,
+    at::Tensor local_num_rows,
+    at::Tensor local_partial);
 
 at::Tensor esimd_gemv_fp8_pert_bmg(
     at::Tensor input, at::Tensor weight,

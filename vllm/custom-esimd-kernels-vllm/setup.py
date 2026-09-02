@@ -4,6 +4,7 @@ from pathlib import Path
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import SyclExtension
 from esimd_build_extention import BuildExtension
+from qsa_build import make_qsa_extension
 
 root = Path(__file__).parent.resolve()
 
@@ -237,6 +238,10 @@ ext_modules.append(
     )
 )
 ### Q4_0 quantize kernel
+
+### Qwen3.8 TP8-rank sparse paged attention — FP16 packed-cache ABI
+ext_modules.append(make_qsa_extension(root, torch_include))
+### Qwen3.8 QSA kernel
 
 setup(
     name="custom-esimd-kernels-vllm",
