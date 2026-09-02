@@ -808,12 +808,36 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       &qsa::store_cache_rows_v3,
       "Qwen3.8 predicated strided QSA cache row-store (XPU)");
   module.def(
+      "qsa_store_cache_rows_v4",
+      &qsa::store_cache_rows_v4,
+      "Qwen3.8 QSA cache row-store with caller-owned write receipt (XPU)");
+  module.def(
       "qsa_indexer_norm_rope_v1",
       &qsa::indexer_norm_rope_v1,
       "Qwen3.8 QSA indexer Gemma norm and RoPE (XPU)");
+  module.def(
+      "qsa_group_compress_v1",
+      &qsa::group_compress_v1,
+      "Qwen3.8 QSA decode group compression (XPU)");
   module.attr("qsa_abi_version") = 2;
   module.attr("qsa_row_store_abi_version") = 3;
+  module.attr("qsa_row_store_receipt_abi_version") = 4;
+  module.attr("row_store_receipt_caller_owned") = 1;
+  module.attr("row_store_receipt_dtype") = "int64";
+  module.attr("row_store_receipt_rank") = 2;
+  module.attr("row_store_receipt_columns") = 2;
+  module.attr("row_store_receipt_actual_slot") = 1;
+  module.attr("row_store_receipt_invalid_status") = 1;
+  module.attr("row_store_receipt_async_completion_required") = 1;
   module.attr("qsa_indexer_postprocess_abi_version") = 1;
+  module.attr("qsa_group_compression_abi_version") = 1;
+  module.attr("qsa_group_compression_ratio") = 4;
+  module.attr("qsa_group_compression_head_dim") = 128;
+  module.attr("qsa_group_compression_fp16") = 1;
+  module.attr("qsa_group_compression_bf16") = 1;
+  module.attr("qsa_group_compression_historical_ring_proof") = 1;
+  module.attr("qsa_group_compression_caller_owned_outputs") = 1;
+  module.attr("qsa_group_compression_no_cache_write") = 1;
   module.attr("qsa_indexer_head_dim") = 128;
   module.attr("qsa_indexer_rotary_dim") = 64;
   module.attr("qsa_indexer_mrope_interleaved") = 1;

@@ -8,8 +8,10 @@ from qsa_build import (
     QSA_ATTENTION_PAGE_SIZES,
     QSA_DEFINES,
     QSA_EXTENSION_NAME,
+    QSA_GROUP_COMPRESSION_ABI_VERSION,
     QSA_INDEXER_POSTPROCESS_ABI_VERSION,
     QSA_ROW_STORE_ABI_VERSION,
+    QSA_ROW_STORE_RECEIPT_ABI_VERSION,
     QSA_SELECTION_PAGE_SIZES,
     make_qsa_extension,
 )
@@ -22,7 +24,9 @@ def test_qsa_extension_name_is_stable():
 def test_qsa_build_exposes_page_specialization_contract():
     assert QSA_ABI_VERSION == 2
     assert QSA_ROW_STORE_ABI_VERSION == 3
+    assert QSA_ROW_STORE_RECEIPT_ABI_VERSION == 4
     assert QSA_INDEXER_POSTPROCESS_ABI_VERSION == 1
+    assert QSA_GROUP_COMPRESSION_ABI_VERSION == 1
     assert QSA_SELECTION_PAGE_SIZES == (64, 128)
     assert QSA_ATTENTION_PAGE_SIZES == (256, 512)
 
@@ -54,6 +58,7 @@ def test_qsa_build_contains_attention_and_selection_sources():
         "csrc/qsa/qsa_select_paged_tokens.sycl",
         "csrc/qsa/qsa_store_cache_rows.sycl",
         "csrc/qsa/qsa_indexer_norm_rope.sycl",
+        "csrc/qsa/qsa_group_compression.sycl",
     ]
 
 
@@ -62,6 +67,13 @@ def test_qsa_row_store_source_has_fixed_allocation_free_contract():
     source = (root / "csrc/qsa/qsa_store_cache_rows.sycl").read_text()
 
     assert "sycl::range<1>(1)" in source
+    assert "store_cache_rows_v4" in source
+    assert "receipt_ptr" in source
+    assert "kReceiptUnwritten" in source
+    assert "receipt_ptr[row * 2] = kReceiptUnwritten" in source
+    assert "row_store_receipt_async_completion_required" in (
+        root / "csrc/qsa/qsa_sparse_attention.sycl"
+    ).read_text()
     assert "slot < 0 || slot >= capacity" in source
     for forbidden in (
         "std::vector",
@@ -71,5 +83,35 @@ def test_qsa_row_store_source_has_fixed_allocation_free_contract():
         ".wait_and_throw(",
         "synchronize(",
         "nonzero",
+    ):
+        assert forbidden not in source
+
+
+def test_qsa_group_compression_source_has_fixed_decode_contract():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "csrc/qsa/qsa_group_compression.sycl").read_text()
+
+    for required in (
+        "group_compress_v1",
+        "historical_ring_proven",
+        "kCompressionRatio = 4",
+        "kHeadDim = 128",
+        "group compression",
+        "caller-owned",
+        "rope position cache",
+        "packed_key_position_views_disjoint",
+        "at::kBFloat16",
+        "max_uint / key_element_size",
+    ):
+        assert required in source
+    for forbidden in (
+        "at::empty",
+        "at::zeros",
+        "std::vector",
+        ".wait(",
+        ".wait_and_throw(",
+        "synchronize(",
+        "index_copy",
+        "store_cache",
     ):
         assert forbidden not in source

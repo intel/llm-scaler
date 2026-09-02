@@ -23,23 +23,22 @@ pytestmark = pytest.mark.skipif(
 
 
 def _load_qsa_extension():
-    try:
-        return importlib.import_module("custom_esimd_kernels_vllm.qsa_ops")
-    except ImportError:
-        package_dir = (
-            Path(__file__).resolve().parents[1]
-            / "python"
-            / "custom_esimd_kernels_vllm"
-        )
-        candidates = sorted(package_dir.glob("qsa_ops*.so"))
-        if len(candidates) != 1:
-            raise
+    # Prefer the focused build artifact so ABI4 tests cannot silently exercise
+    # an older installed DSO.
+    package_dir = (
+        Path(__file__).resolve().parents[1]
+        / "python"
+        / "custom_esimd_kernels_vllm"
+    )
+    candidates = sorted(package_dir.glob("qsa_ops*.so"))
+    if len(candidates) == 1:
         spec = importlib.util.spec_from_file_location("qsa_ops", candidates[0])
         if spec is None or spec.loader is None:
             raise ImportError(f"cannot load QSA extension: {candidates[0]}")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
+    return importlib.import_module("custom_esimd_kernels_vllm.qsa_ops")
 
 
 @pytest.fixture(scope="module")
@@ -254,3 +253,69 @@ def test_qsa_store_cache_rows_v3_rejects_overlapping_layout_and_alias(qsa_ops):
         qsa_ops.qsa_store_cache_rows_v3(
             position_cache, aliased_slots, position_rows
         )
+
+
+@pytest.mark.parametrize("rank3_rows", [False, True])
+def test_qsa_store_cache_rows_v4_reports_valid_pad_and_oob_rows(
+    qsa_ops, rank3_rows: bool
+):
+    cache, cache_backing = _make_cache(torch.float16, 128)
+    rows, _ = _make_rows(torch.float16, 128, 3)
+    rows_arg = rows.unsqueeze(1) if rank3_rows else rows
+    capacity = cache.shape[0] * cache.shape[1]
+    slots = torch.tensor([0, -1, capacity], dtype=torch.int64, device="xpu")
+    receipt = torch.full((3, 2), 99, dtype=torch.int64, device="xpu")
+    before = cache_backing.cpu().clone()
+
+    returned_cache, returned_receipt = qsa_ops.qsa_store_cache_rows_v4(
+        cache, slots, rows_arg, receipt
+    )
+    torch.xpu.synchronize()
+
+    assert returned_cache.data_ptr() == cache.data_ptr()
+    assert returned_receipt.data_ptr() == receipt.data_ptr()
+    assert torch.equal(
+        receipt.cpu(), torch.tensor([[1, 0], [2, -1], [3, -1]], dtype=torch.int64)
+    )
+    expected = before.clone()
+    begin = cache.storage_offset()
+    expected[begin : begin + 128] = rows[0].cpu()
+    assert torch.equal(cache_backing.cpu(), expected)
+
+
+def test_qsa_store_cache_rows_v4_rejects_invalid_receipt_contracts(qsa_ops):
+    cache = torch.zeros((1, 4, 1, 128), dtype=torch.float16, device="xpu")
+    slot_storage = torch.zeros((4,), dtype=torch.int64, device="xpu")
+    slots = slot_storage[:2]
+    rows = torch.zeros((2, 128), dtype=torch.float16, device="xpu")
+
+    with pytest.raises(RuntimeError, match="contiguous int64"):
+        qsa_ops.qsa_store_cache_rows_v4(
+            cache, slots, rows, torch.zeros((1, 2), dtype=torch.int32, device="xpu")
+        )
+    with pytest.raises(RuntimeError, match="contiguous int64"):
+        qsa_ops.qsa_store_cache_rows_v4(
+            cache, slots, rows, torch.zeros((1, 1), dtype=torch.int64, device="xpu")
+        )
+    with pytest.raises(RuntimeError, match="cache XPU device"):
+        qsa_ops.qsa_store_cache_rows_v4(
+            cache, slots, rows, torch.zeros((1, 2), dtype=torch.int64)
+        )
+
+    aliased_receipt = slot_storage.view(2, 2)
+    with pytest.raises(RuntimeError, match="must not alias"):
+        qsa_ops.qsa_store_cache_rows_v4(cache, slots, rows, aliased_receipt)
+
+
+def test_qsa_store_cache_rows_v4_zero_rows_preserves_caller_receipt(qsa_ops):
+    cache = torch.zeros((1, 2, 1, 128), dtype=torch.float16, device="xpu")
+    slots = torch.empty((0,), dtype=torch.int64, device="xpu")
+    rows = torch.empty((0, 128), dtype=torch.float16, device="xpu")
+    receipt = torch.full((0, 2), 99, dtype=torch.int64, device="xpu")
+
+    returned_cache, returned_receipt = qsa_ops.qsa_store_cache_rows_v4(
+        cache, slots, rows, receipt
+    )
+
+    assert returned_cache.data_ptr() == cache.data_ptr()
+    assert returned_receipt.data_ptr() == receipt.data_ptr()

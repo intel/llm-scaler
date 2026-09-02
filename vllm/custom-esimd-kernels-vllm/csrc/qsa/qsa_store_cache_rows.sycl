@@ -15,6 +15,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <tuple>
 #include <utility>
 
 namespace qsa {
@@ -24,6 +25,10 @@ using namespace sycl::ext::intel::esimd;
 
 constexpr int64_t kKeyWidth = 128;
 constexpr int64_t kPositionWidth = 3;
+constexpr int64_t kReceiptUnwritten = 0;
+constexpr int64_t kReceiptWritten = 1;
+constexpr int64_t kReceiptPad = 2;
+constexpr int64_t kReceiptOutOfBounds = 3;
 
 template <typename scalar_t, int Width, bool StridedColumns>
 class QsaStoreCacheRowsKernel;
@@ -130,7 +135,8 @@ template <typename scalar_t, int Width, bool StridedColumns = false>
 void launch_store(
     const at::Tensor& cache,
     const at::Tensor& slot_mapping,
-    const at::Tensor& rows) {
+    const at::Tensor& rows,
+    const at::Tensor& receipt = at::Tensor()) {
   const int64_t row_count = slot_mapping.numel();
   if (row_count == 0) {
     return;
@@ -139,6 +145,7 @@ void launch_store(
   auto* cache_ptr = reinterpret_cast<scalar_t*>(cache.data_ptr());
   const auto* slots_ptr = slot_mapping.data_ptr<int64_t>();
   const auto* rows_ptr = reinterpret_cast<const scalar_t*>(rows.data_ptr());
+  auto* receipt_ptr = receipt.defined() ? receipt.data_ptr<int64_t>() : nullptr;
   const int64_t pages = cache.size(0);
   const int64_t page_size = cache.size(1);
   const int64_t capacity = pages * page_size;
@@ -154,8 +161,19 @@ void launch_store(
         QsaStoreCacheRowsKernel<scalar_t, Width, StridedColumns>>(
         sycl::range<1>(1), [=](sycl::id<1>) SYCL_ESIMD_KERNEL {
           for (int64_t row = 0; row < row_count; ++row) {
+            // Initialize in native code so a reused receipt cannot prove a
+            // row that this submission did not reach.
+            if (receipt_ptr != nullptr) {
+              receipt_ptr[row * 2] = kReceiptUnwritten;
+              receipt_ptr[row * 2 + 1] = -1;
+            }
             const int64_t slot = slots_ptr[row];
             if (slot < 0 || slot >= capacity) {
+              if (receipt_ptr != nullptr) {
+                receipt_ptr[row * 2] =
+                    slot == -1 ? kReceiptPad : kReceiptOutOfBounds;
+                receipt_ptr[row * 2 + 1] = -1;
+              }
               continue;
             }
             const int64_t page = slot / page_size;
@@ -179,6 +197,10 @@ void launch_store(
               for (int column = 0; column < kChunk; ++column) {
                 cache_ptr[destination + begin + column] = values[column];
               }
+            }
+            if (receipt_ptr != nullptr) {
+              receipt_ptr[row * 2] = kReceiptWritten;
+              receipt_ptr[row * 2 + 1] = slot;
             }
           }
         });
@@ -207,6 +229,42 @@ at::Tensor store_cache_rows_v3(
     launch_store<int64_t, kPositionWidth, true>(cache, slot_mapping, rows);
   }
   return cache;
+}
+
+std::tuple<at::Tensor, at::Tensor> store_cache_rows_v4(
+    at::Tensor cache,
+    const at::Tensor& slot_mapping,
+    const at::Tensor& rows,
+    at::Tensor receipt) {
+  validate_store_inputs(cache, slot_mapping, rows);
+  TORCH_CHECK(
+      receipt.device() == cache.device() && receipt.scalar_type() == at::kLong &&
+          receipt.dim() == 2 && receipt.size(0) == slot_mapping.numel() &&
+          receipt.size(1) == 2 && receipt.is_contiguous(),
+      "receipt must be contiguous int64 [N,2] on the cache XPU device");
+  TORCH_CHECK(
+      is_positive_non_overlapping(receipt),
+      "receipt must have positive non-overlapping strides");
+  TORCH_CHECK(
+      !cache.is_alias_of(receipt) && !slot_mapping.is_alias_of(receipt) &&
+          !rows.is_alias_of(receipt),
+      "receipt must not alias cache, slot_mapping or rows");
+  if (rows.size(0) == 0) {
+    return {cache, receipt};
+  }
+
+  if (cache.scalar_type() == at::kHalf) {
+    launch_store<sycl::half, kKeyWidth>(cache, slot_mapping, rows, receipt);
+  } else if (cache.scalar_type() == at::kBFloat16) {
+    launch_store<sycl::ext::oneapi::bfloat16, kKeyWidth>(
+        cache, slot_mapping, rows, receipt);
+  } else if (rows.stride(rows.dim() - 1) == 1) {
+    launch_store<int64_t, kPositionWidth>(cache, slot_mapping, rows, receipt);
+  } else {
+    launch_store<int64_t, kPositionWidth, true>(
+        cache, slot_mapping, rows, receipt);
+  }
+  return {cache, receipt};
 }
 
 }  // namespace qsa
