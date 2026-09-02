@@ -13,7 +13,7 @@
 # Why: vLLM v0.26.0 requires separately built Rust extensions, while an Intel
 # PyTorch 2.12 runtime image is not available.  OMIX provides the required GPU
 # runtime, and the final stage installs torch 2.12.0+xpu into an isolated venv.
-# Build outputs still cross stage boundaries only as source trees and wheels.
+# Build outputs cross stage boundaries only as Rust artifacts, source trees, and wheels.
 #
 # Scope ("lean core"): vLLM + custom ESIMD kernels + vllm-xpu-kernels + core serving
 # deps + bigdl-core (ships vllm_int4_for_multi_arc.so used by the sym_int4 path).
