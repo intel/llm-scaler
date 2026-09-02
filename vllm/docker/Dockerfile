@@ -58,7 +58,7 @@ ARG http_proxy
 ARG https_proxy
 ARG no_proxy
 ARG VLLM_VERSION=v0.26.0
-# vllm-xpu-kernels pinned base commit (identical to legacy build).
+# vllm-xpu-kernels pinned base commit (aligned with Dockerfile.dev).
 ARG VLLM_XPU_KERNELS_COMMIT=a6929869587fa6c40dbe393eedc96eeab076bfbb
 
 ENV VIRTUAL_ENV=/opt/buildenv \
