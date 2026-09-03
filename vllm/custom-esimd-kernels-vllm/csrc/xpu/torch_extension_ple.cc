@@ -53,6 +53,13 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
            ple::hc_gate_mix_v1(input, gate, output);
          });
 
+  m.def("hc_gate_mix_m4_v1(Tensor input, Tensor gate, "
+        "Tensor(a!) output) -> ()");
+  m.impl("hc_gate_mix_m4_v1", torch::kXPU,
+         [](at::Tensor input, at::Tensor gate, at::Tensor output) -> void {
+           ple::hc_gate_mix_m4_v1(input, gate, output);
+         });
+
   m.def("hc_combine_v1(Tensor hidden_states, Tensor block_output, "
         "Tensor injection, Tensor(a!) output) -> ()");
   m.impl("hc_combine_v1", torch::kXPU,
@@ -71,6 +78,19 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
             at::Tensor combined_output, at::Tensor normed_output,
             double eps) -> void {
            ple::hc_combine_norm_v1(
+               hidden_states, block_output, injection, weight,
+               combined_output, normed_output, eps);
+         });
+
+  m.def("hc_combine_norm_m4_v1(Tensor hidden_states, Tensor block_output, "
+        "Tensor injection, Tensor weight, Tensor(a!) combined_output, "
+        "Tensor(b!) normed_output, float eps) -> ()");
+  m.impl("hc_combine_norm_m4_v1", torch::kXPU,
+         [](at::Tensor hidden_states, at::Tensor block_output,
+            at::Tensor injection, at::Tensor weight,
+            at::Tensor combined_output, at::Tensor normed_output,
+            double eps) -> void {
+           ple::hc_combine_norm_m4_v1(
                hidden_states, block_output, injection, weight,
                combined_output, normed_output, eps);
          });

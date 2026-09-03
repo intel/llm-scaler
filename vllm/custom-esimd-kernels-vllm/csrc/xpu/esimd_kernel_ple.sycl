@@ -590,6 +590,59 @@ static void launch_hc_gate_mix_v1(
     });
 }
 
+struct HcGateMixM4V1Kernel {
+    const sycl::half* input;
+    const sycl::half* gate;
+    sycl::half* output;
+
+    void operator()(sycl::id<2> item) const SYCL_ESIMD_KERNEL {
+        constexpr int vector_length = 64;
+        const int batch = static_cast<int>(item[0]);
+        const int chunk = static_cast<int>(item[1]);
+        const int input_offset = batch * kHcWidth + chunk * vector_length;
+        const int output_offset = batch * kHcHiddenSize + chunk * vector_length;
+        esimd::simd<float, vector_length> mixed = 0.0f;
+
+#pragma unroll
+        for (int stream = 0; stream < kHcCount; ++stream) {
+            const int offset = input_offset + stream * kHcHiddenSize;
+            const esimd::simd<sycl::half, vector_length> input_h =
+                esimd::block_load<sycl::half, vector_length>(
+                    input + offset,
+                    esimd::properties{esimd::alignment<2>});
+            const esimd::simd<sycl::half, vector_length> gate_h =
+                esimd::block_load<sycl::half, vector_length>(
+                    gate + offset,
+                    esimd::properties{esimd::alignment<2>});
+            const esimd::simd<float, vector_length> input_f =
+                esimd::convert<float>(input_h);
+            const esimd::simd<float, vector_length> gate_f =
+                esimd::convert<float>(gate_h);
+            mixed += input_f * (1.0f / (1.0f + esimd::exp(-gate_f)));
+        }
+
+        esimd::block_store<sycl::half, vector_length>(
+            output + output_offset,
+            esimd::convert<sycl::half>(mixed * 0.25f),
+            esimd::properties{esimd::alignment<2>});
+    }
+};
+
+static void launch_hc_gate_mix_m4_v1(
+    sycl::queue& queue,
+    const sycl::half* input,
+    const sycl::half* gate,
+    sycl::half* output) {
+    constexpr int m4_chunks = kHcHiddenSize / 64;
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::range<2>(
+                static_cast<size_t>(4),
+                static_cast<size_t>(m4_chunks)),
+            HcGateMixM4V1Kernel{input, gate, output});
+    });
+}
+
 struct HcCombineV1Kernel {
     const sycl::half* hidden_states;
     const sycl::half* block_output;
@@ -812,6 +865,160 @@ static void launch_hc_combine_norm_v1(
                 combined_output,
                 normed_output,
                 eps});
+    });
+}
+
+constexpr int kHcCombineNormM4DataThreads = 20;
+constexpr int kHcCombineNormM4WorkgroupThreads =
+    kHcCombineNormM4DataThreads + 1;
+constexpr int kHcCombineNormM4VectorLength = 128;
+constexpr int kHcCombineNormM4DataBytes =
+    kHcHiddenSize * static_cast<int>(sizeof(sycl::half));
+constexpr int kHcCombineNormM4PartialBase = kHcCombineNormM4DataBytes;
+constexpr int kHcCombineNormM4RmsBase =
+    kHcCombineNormM4PartialBase +
+    kHcCombineNormM4DataThreads * static_cast<int>(sizeof(float));
+constexpr int kHcCombineNormM4SlmBytes =
+    kHcCombineNormM4RmsBase + static_cast<int>(sizeof(float));
+
+static_assert(
+    kHcHiddenSize %
+        (kHcCombineNormM4DataThreads * kHcCombineNormM4VectorLength) == 0);
+
+struct HcCombineNormM4V1Kernel {
+    const sycl::half* hidden_states;
+    const sycl::half* block_output;
+    const sycl::half* injection;
+    const sycl::half* weight;
+    sycl::half* combined_output;
+    sycl::half* normed_output;
+    float eps;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        esimd::slm_init<kHcCombineNormM4SlmBytes>();
+        const int group = static_cast<int>(item.get_group(0));
+        const int lane = static_cast<int>(item.get_local_id(0));
+        const int batch = group / kHcCount;
+        const int stream = group % kHcCount;
+        const bool helper = lane == kHcCombineNormM4DataThreads;
+
+        if (!helper) {
+            const int column = lane * kHcCombineNormM4VectorLength;
+            const int stream_offset =
+                (batch * kHcCount + stream) * kHcHiddenSize;
+            const int block_offset =
+                batch * kHcHiddenSize + column;
+            const esimd::simd<sycl::half, 1> injection_h =
+                esimd::block_load<sycl::half, 1>(
+                    injection + batch * kHcCount + stream,
+                    esimd::properties{esimd::alignment<2>});
+            const float injection_value =
+                static_cast<float>(injection_h[0]);
+            const esimd::simd<float, kHcCombineNormM4VectorLength> gate =
+                2.0f / (1.0f + esimd::exp(esimd::simd<float,
+                    kHcCombineNormM4VectorLength>(
+                        -injection_value * 0.25f)));
+            const esimd::simd<sycl::half,
+                              kHcCombineNormM4VectorLength> hidden_h =
+                esimd::block_load<sycl::half,
+                                  kHcCombineNormM4VectorLength>(
+                    hidden_states + stream_offset + column,
+                    esimd::properties{esimd::alignment<2>});
+            const esimd::simd<sycl::half,
+                              kHcCombineNormM4VectorLength> block_h =
+                esimd::block_load<sycl::half,
+                                  kHcCombineNormM4VectorLength>(
+                    block_output + block_offset,
+                    esimd::properties{esimd::alignment<2>});
+            const esimd::simd<float, kHcCombineNormM4VectorLength> combined_f =
+                esimd::convert<float>(hidden_h) +
+                esimd::convert<float>(block_h) * gate;
+            const esimd::simd<sycl::half,
+                              kHcCombineNormM4VectorLength> combined_h =
+                esimd::convert<sycl::half>(combined_f);
+            const int slm_offset = column * static_cast<int>(sizeof(sycl::half));
+            esimd::slm_block_store<sycl::half,
+                                   kHcCombineNormM4VectorLength>(
+                static_cast<uint32_t>(slm_offset), combined_h);
+            const esimd::simd<float, kHcCombineNormM4VectorLength> values =
+                esimd::convert<float>(combined_h);
+            esimd::slm_block_store<float, 1>(
+                static_cast<uint32_t>(kHcCombineNormM4PartialBase +
+                                      lane * sizeof(float)),
+                esimd::simd<float, 1>(
+                    esimd::reduce<float>(values * values, std::plus<>())));
+        }
+        esimd::barrier();
+
+        if (helper) {
+            const esimd::simd<float, kHcCombineNormM4DataThreads> partials =
+                esimd::slm_block_load<float, kHcCombineNormM4DataThreads>(
+                    static_cast<uint32_t>(kHcCombineNormM4PartialBase));
+            const float sum_sq =
+                esimd::reduce<float>(partials, std::plus<>());
+            const float rms_inverse = esimd::rsqrt(esimd::simd<float, 1>(
+                sum_sq / static_cast<float>(kHcHiddenSize) + eps))[0];
+            esimd::slm_block_store<float, 1>(
+                static_cast<uint32_t>(kHcCombineNormM4RmsBase),
+                esimd::simd<float, 1>(rms_inverse));
+        }
+        esimd::barrier();
+
+        if (!helper) {
+            const int column = lane * kHcCombineNormM4VectorLength;
+            const int stream_offset =
+                (batch * kHcCount + stream) * kHcHiddenSize;
+            const int offset = stream_offset + column;
+            const esimd::simd<sycl::half,
+                              kHcCombineNormM4VectorLength> combined_h =
+                esimd::slm_block_load<sycl::half,
+                                      kHcCombineNormM4VectorLength>(
+                    static_cast<uint32_t>(
+                        column * static_cast<int>(sizeof(sycl::half))));
+            const esimd::simd<sycl::half,
+                              kHcCombineNormM4VectorLength> scale_h =
+                esimd::block_load<sycl::half,
+                                  kHcCombineNormM4VectorLength>(
+                    weight + stream * kHcHiddenSize + column,
+                    esimd::properties{esimd::alignment<2>});
+            const float rms_inverse = esimd::slm_block_load<float, 1>(
+                static_cast<uint32_t>(kHcCombineNormM4RmsBase))[0];
+            const esimd::simd<float, kHcCombineNormM4VectorLength> normed =
+                esimd::convert<float>(combined_h) * rms_inverse *
+                (1.0f + esimd::convert<float>(scale_h));
+            const int output_offset =
+                batch * kHcWidth + stream * kHcHiddenSize + column;
+            esimd::block_store<sycl::half,
+                               kHcCombineNormM4VectorLength>(
+                combined_output + output_offset, combined_h,
+                esimd::properties{esimd::alignment<2>});
+            esimd::block_store<sycl::half,
+                               kHcCombineNormM4VectorLength>(
+                normed_output + output_offset,
+                esimd::convert<sycl::half>(normed),
+                esimd::properties{esimd::alignment<2>});
+        }
+    }
+};
+
+static void launch_hc_combine_norm_m4_v1(
+    sycl::queue& queue,
+    const sycl::half* hidden_states,
+    const sycl::half* block_output,
+    const sycl::half* injection,
+    const sycl::half* weight,
+    sycl::half* combined_output,
+    sycl::half* normed_output,
+    float eps) {
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(
+                {static_cast<size_t>(4 * kHcCount *
+                                      kHcCombineNormM4WorkgroupThreads)},
+                {static_cast<size_t>(kHcCombineNormM4WorkgroupThreads)}),
+            HcCombineNormM4V1Kernel{
+                hidden_states, block_output, injection, weight,
+                combined_output, normed_output, eps});
     });
 }
 
@@ -1646,6 +1853,31 @@ at::Tensor hc_gate_mix_v1(
     return output;
 }
 
+at::Tensor hc_gate_mix_m4_v1(
+    at::Tensor input,
+    at::Tensor gate,
+    at::Tensor output) {
+    check_primary_half(input, "input");
+    check_half(input, gate, "gate");
+    check_output(input, output, "output");
+    TORCH_CHECK(
+        input.dim() == 2 && input.size(0) == 4 &&
+            input.size(1) == kHcWidth && gate.sizes() == input.sizes() &&
+            output.dim() == 2 && output.size(0) == 4 &&
+            output.size(1) == kHcHiddenSize,
+        "hc_gate_mix_m4_v1 expects input/gate [4, 10240] and "
+        "output [4, 2560]");
+    TORCH_CHECK(!output.is_alias_of(gate),
+                "hc_gate_mix_m4_v1 output must not share storage with gate");
+    auto& queue = get_device_queue(input);
+    launch_hc_gate_mix_m4_v1(
+        queue,
+        reinterpret_cast<const sycl::half*>(input.data_ptr()),
+        reinterpret_cast<const sycl::half*>(gate.data_ptr()),
+        reinterpret_cast<sycl::half*>(output.data_ptr()));
+    return output;
+}
+
 at::Tensor hc_combine_v1(
     at::Tensor hidden_states,
     at::Tensor block_output,
@@ -1746,6 +1978,68 @@ at::Tensor hc_combine_norm_v1(
             block_output.data_ptr()),
         reinterpret_cast<const sycl::half*>(
             injection.data_ptr()),
+        reinterpret_cast<const sycl::half*>(weight.data_ptr()),
+        reinterpret_cast<sycl::half*>(combined_output.data_ptr()),
+        reinterpret_cast<sycl::half*>(normed_output.data_ptr()),
+        eps_float);
+    return combined_output;
+}
+
+at::Tensor hc_combine_norm_m4_v1(
+    at::Tensor hidden_states,
+    at::Tensor block_output,
+    at::Tensor injection,
+    at::Tensor weight,
+    at::Tensor combined_output,
+    at::Tensor normed_output,
+    double eps) {
+    check_primary_half(hidden_states, "hidden_states");
+    check_half(hidden_states, block_output, "block_output");
+    check_half(hidden_states, injection, "injection");
+    check_half(hidden_states, weight, "weight");
+    check_output(hidden_states, combined_output, "combined_output");
+    check_output(hidden_states, normed_output, "normed_output");
+    TORCH_CHECK(
+        hidden_states.dim() == 2 && hidden_states.size(0) == 4 &&
+            hidden_states.size(1) == kHcWidth &&
+            block_output.dim() == 2 && block_output.size(0) == 4 &&
+            block_output.size(1) == kHcHiddenSize &&
+            injection.dim() == 2 && injection.size(0) == 4 &&
+            injection.size(1) == kHcCount &&
+            weight.dim() == 1 && weight.numel() == kHcWidth &&
+            combined_output.sizes() == hidden_states.sizes() &&
+            normed_output.sizes() == hidden_states.sizes(),
+        "hc_combine_norm_m4_v1 expects hidden/combined/normed [4, 10240], "
+        "block_output [4, 2560], injection [4, 4], and weight [10240]");
+    TORCH_CHECK(
+        !combined_output.is_alias_of(block_output) &&
+            !combined_output.is_alias_of(injection) &&
+            !combined_output.is_alias_of(weight) &&
+            !normed_output.is_alias_of(block_output) &&
+            !normed_output.is_alias_of(injection) &&
+            !normed_output.is_alias_of(weight) &&
+            !normed_output.is_alias_of(combined_output),
+        "hc_combine_norm_m4_v1 outputs must not share storage with inputs "
+        "or each other");
+    TORCH_CHECK(
+        hidden_states.storage_offset() % 2 == 0 &&
+            block_output.storage_offset() % 2 == 0 &&
+            injection.storage_offset() % 2 == 0 &&
+            weight.storage_offset() % 2 == 0 &&
+            combined_output.storage_offset() % 2 == 0 &&
+            normed_output.storage_offset() % 2 == 0,
+        "hc_combine_norm_m4_v1 requires 4-byte aligned tensor data");
+    const float eps_float = static_cast<float>(eps);
+    TORCH_CHECK(
+        std::isfinite(eps) && eps > 0.0 &&
+            std::isfinite(eps_float) && eps_float > 0.0f,
+        "hc_combine_norm_m4_v1 eps must remain finite and positive in FP32");
+    auto& queue = get_device_queue(hidden_states);
+    launch_hc_combine_norm_m4_v1(
+        queue,
+        reinterpret_cast<const sycl::half*>(hidden_states.data_ptr()),
+        reinterpret_cast<const sycl::half*>(block_output.data_ptr()),
+        reinterpret_cast<const sycl::half*>(injection.data_ptr()),
         reinterpret_cast<const sycl::half*>(weight.data_ptr()),
         reinterpret_cast<sycl::half*>(combined_output.data_ptr()),
         reinterpret_cast<sycl::half*>(normed_output.data_ptr()),

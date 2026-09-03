@@ -40,6 +40,11 @@ at::Tensor hc_gate_mix_v1(
     at::Tensor gate,
     at::Tensor output);
 
+at::Tensor hc_gate_mix_m4_v1(
+    at::Tensor input,
+    at::Tensor gate,
+    at::Tensor output);
+
 at::Tensor hc_combine_v1(
     at::Tensor hidden_states,
     at::Tensor block_output,
@@ -47,6 +52,15 @@ at::Tensor hc_combine_v1(
     at::Tensor output);
 
 at::Tensor hc_combine_norm_v1(
+    at::Tensor hidden_states,
+    at::Tensor block_output,
+    at::Tensor injection,
+    at::Tensor weight,
+    at::Tensor combined_output,
+    at::Tensor normed_output,
+    double eps);
+
+at::Tensor hc_combine_norm_m4_v1(
     at::Tensor hidden_states,
     at::Tensor block_output,
     at::Tensor injection,
