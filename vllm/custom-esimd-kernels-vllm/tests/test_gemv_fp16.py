@@ -97,6 +97,7 @@ if __name__ == "__main__":
         (1, 4, 33),
         (1, 8, 65),
         (1, 128, 2052),
+        (1, 10240, 320),  # Qwen3.8 HC up-projection M=1 fast path
         # Production-shaped and split-dispatch regressions.
         (1, 128, 2816),  # gemma4-26B router (TP=2)
         (1, 128, 1408),  # gemma4-26B router (TP=4 hypothetical)

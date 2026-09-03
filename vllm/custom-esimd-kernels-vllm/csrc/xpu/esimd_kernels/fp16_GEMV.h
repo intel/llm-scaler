@@ -106,6 +106,37 @@ struct GEMV_fp16_kernel {
     }
 };
 
+// HC up-projection M=1 fast path: the short K dimension does not benefit
+// from a one-output work-group.  Use one output row per work-item and group
+// 32 rows so the scheduler pays one work-group launch per output block.
+struct GEMV_fp16_hc_up_m1_kernel {
+    const fp16* input;
+    const fp16* weight;
+    fp16*       output;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        constexpr int W = 128;
+        constexpr int T = 64;
+        const int row = item.get_global_id(0);
+        const size_t row_base = static_cast<size_t>(row) * 320;
+
+        simd<fp16, W> x0 = block_load<fp16, W>(input);
+        simd<fp16, W> w0 = block_load<fp16, W>(weight + row_base);
+        simd<fp16, W> x1 = block_load<fp16, W>(input + W);
+        simd<fp16, W> w1 = block_load<fp16, W>(weight + row_base + W);
+        simd<fp16, T> x2 = block_load<fp16, T>(input + 2 * W);
+        simd<fp16, T> w2 = block_load<fp16, T>(weight + row_base + 2 * W);
+
+        float acc0 = reduce<float>(simd<float, W>(x0) * simd<float, W>(w0),
+                                   std::plus<>());
+        float acc1 = reduce<float>(simd<float, W>(x1) * simd<float, W>(w1),
+                                   std::plus<>());
+        float acc2 = reduce<float>(simd<float, T>(x2) * simd<float, T>(w2),
+                                   std::plus<>());
+        output[row] = fp16(acc0 + acc1 + acc2);
+    }
+};
+
 template<int VL, int K_SPLIT>
 struct GEMV_fp16_gelu_mul_kernel {
     const fp16* input;
@@ -222,6 +253,17 @@ inline void GEMV_fp16_host_impl(
     uint32_t N,
     uint32_t K,
     sycl::queue& q) {
+
+    if constexpr (!APPLY_HC_DOWN_EPILOGUE) {
+        if (M == 1 && N == 10240 && K == 320) {
+            q.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(
+                    sycl::nd_range<1>(N, 32),
+                    GEMV_fp16_hc_up_m1_kernel{input, weight, output});
+            });
+            return;
+        }
+    }
 
     int vl, ks;
     select_vl_ks_fp16(N, K, vl, ks);

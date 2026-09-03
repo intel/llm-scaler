@@ -652,6 +652,36 @@ static void launch_hc_combine_v1(
     });
 }
 
+constexpr int kHcCombineNormM1LocalSize = 20;
+constexpr int kHcCombineNormM1ElementsPerThread = 128;
+constexpr int kHcCombineNormM1SlmBytes =
+    kHcCount * kHcCombineNormM1LocalSize * static_cast<int>(sizeof(float));
+
+SYCL_ESIMD_FUNCTION inline esimd::simd<sycl::half,
+                                        kHcCombineNormM1ElementsPerThread>
+hc_combine_norm_m1_tile(
+    const sycl::half* hidden_states,
+    const sycl::half* block_output,
+    const esimd::simd<float, kHcCount>& injection_scale,
+    int stream,
+    int column) {
+    constexpr int width = kHcCombineNormM1ElementsPerThread;
+    const int offset = stream * kHcHiddenSize + column;
+    const esimd::simd<sycl::half, width> residual =
+        esimd::block_load<sycl::half, width>(
+            hidden_states + offset,
+            esimd::properties{esimd::alignment<2>});
+    const esimd::simd<sycl::half, width> block =
+        esimd::block_load<sycl::half, width>(
+            block_output + column,
+            esimd::properties{esimd::alignment<2>});
+    const float stream_scale = injection_scale[stream];
+    const esimd::simd<float, width> combined =
+        esimd::convert<float>(residual) +
+        stream_scale * esimd::convert<float>(block);
+    return esimd::convert<sycl::half>(combined);
+}
+
 struct HcCombineNormV1Kernel {
     const sycl::half* hidden_states;
     const sycl::half* block_output;
@@ -662,75 +692,100 @@ struct HcCombineNormV1Kernel {
     float eps;
 
     void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
-        const int64_t stream =
-            static_cast<int64_t>(item.get_group(0));
-        if (stream >= kHcCount) {
-            return;
-        }
-        const int64_t stream_offset =
-            stream * kHcHiddenSize;
-        const esimd::simd<float, 1> injection_value =
-            esimd::block_load<sycl::half, 1>(
-                injection + stream);
-        const float scaled_injection =
-            injection_value[0] / static_cast<float>(kHcCount);
-        const float injection_weight =
-            2.0f /
-            (1.0f + esimd::exp(
-                esimd::simd<float, 8>(-scaled_injection))[0]);
+        esimd::slm_init<kHcCombineNormM1SlmBytes>();
+        const int lane = static_cast<int>(item.get_local_id(0));
+        const int column0 = lane * kHcCombineNormM1ElementsPerThread;
+        constexpr int tiles = 1;
 
-        float sum_sq = 0.0f;
+        const esimd::simd<sycl::half, kHcCount> injection_h =
+            esimd::block_load<sycl::half, kHcCount>(
+                injection, esimd::properties{esimd::alignment<2>});
+        const esimd::simd<float, kHcCount> injection_f =
+            esimd::convert<float>(injection_h);
+        const esimd::simd<float, kHcCount> injection_scale =
+            2.0f / (1.0f + esimd::exp(-injection_f / 4.0f));
+        esimd::simd<float, kHcCount> partial = 0.0f;
+
 #pragma unroll
-        for (int chunk = 0;
-             chunk < kHcCombineChunksPerStream;
-             ++chunk) {
-            const int64_t output_offset =
-                stream_offset + chunk * kHcCombineVectorLength;
-            const int64_t block_offset =
-                chunk * kHcCombineVectorLength;
-            esimd::simd<float, kHcCombineVectorLength> residual =
-                esimd::block_load<
-                    sycl::half, kHcCombineVectorLength>(
-                    hidden_states + output_offset);
-            const esimd::simd<float, kHcCombineVectorLength> block =
-                esimd::block_load<
-                    sycl::half, kHcCombineVectorLength>(
-                    block_output + block_offset);
-            residual += block * injection_weight;
-            const esimd::simd<
-                sycl::half, kHcCombineVectorLength> rounded(residual);
-            esimd::block_store<
-                sycl::half, kHcCombineVectorLength>(
-                combined_output + output_offset, rounded);
-            const esimd::simd<float, kHcCombineVectorLength> values =
-                rounded;
-            sum_sq += esimd::reduce<float>(
-                values * values, std::plus<>());
+        for (int stream = 0; stream < kHcCount; ++stream) {
+            float sum_sq = 0.0f;
+#pragma unroll
+            for (int tile = 0; tile < tiles; ++tile) {
+                const int column =
+                    column0 + tile * kHcCombineNormM1ElementsPerThread;
+                const esimd::simd<sycl::half,
+                                  kHcCombineNormM1ElementsPerThread>
+                    combined = hc_combine_norm_m1_tile(
+                        hidden_states, block_output, injection_scale,
+                        stream, column);
+                const esimd::simd<float,
+                                  kHcCombineNormM1ElementsPerThread>
+                    values = esimd::convert<float>(combined);
+                sum_sq += esimd::reduce<float>(
+                    values * values, std::plus<>());
+            }
+            partial[stream] = sum_sq;
         }
 
-        const float inverse = esimd::rsqrt(esimd::simd<float, 8>(
-            sum_sq / static_cast<float>(kHcHiddenSize) + eps))[0];
 #pragma unroll
-        for (int chunk = 0;
-             chunk < kHcCombineChunksPerStream;
-             ++chunk) {
-            const int64_t offset =
-                stream_offset + chunk * kHcCombineVectorLength;
-            const esimd::simd<float, kHcCombineVectorLength> values =
-                esimd::block_load<
-                    sycl::half, kHcCombineVectorLength>(
-                    combined_output + offset);
-            const esimd::simd<float, kHcCombineVectorLength> scales =
-                esimd::block_load<
-                    sycl::half, kHcCombineVectorLength>(
-                    weight + offset);
-            const esimd::simd<float, kHcCombineVectorLength> normalized =
-                values * inverse * (1.0f + scales);
-            esimd::block_store<
-                sycl::half, kHcCombineVectorLength>(
-                normed_output + offset,
-                esimd::simd<sycl::half, kHcCombineVectorLength>(
-                    normalized));
+        for (int stream = 0; stream < kHcCount; ++stream) {
+            esimd::slm_block_store<float, 1>(
+                static_cast<uint32_t>(
+                    (stream * kHcCombineNormM1LocalSize + lane) *
+                    sizeof(float)),
+                esimd::simd<float, 1>(partial[stream]));
+        }
+        esimd::barrier();
+
+        esimd::simd<float, kHcCount> inverse = 0.0f;
+#pragma unroll
+        for (int stream = 0; stream < kHcCount; ++stream) {
+            const esimd::simd<float, kHcCombineNormM1LocalSize> sums =
+                esimd::slm_block_load<float, kHcCombineNormM1LocalSize>(
+                    static_cast<uint32_t>(
+                        stream * kHcCombineNormM1LocalSize * sizeof(float)));
+            const float mean_square =
+                esimd::reduce<float>(sums, std::plus<>()) /
+                static_cast<float>(kHcHiddenSize);
+            inverse[stream] = esimd::rsqrt(
+                esimd::simd<float, 1>(mean_square + eps))[0];
+        }
+
+#pragma unroll
+        for (int stream = 0; stream < kHcCount; ++stream) {
+#pragma unroll
+            for (int tile = 0; tile < tiles; ++tile) {
+                const int column =
+                    column0 + tile * kHcCombineNormM1ElementsPerThread;
+                const esimd::simd<sycl::half,
+                                  kHcCombineNormM1ElementsPerThread>
+                    combined = hc_combine_norm_m1_tile(
+                        hidden_states, block_output, injection_scale,
+                        stream, column);
+                const int offset = stream * kHcHiddenSize + column;
+                esimd::block_store<sycl::half,
+                                   kHcCombineNormM1ElementsPerThread>(
+                    combined_output + offset, combined,
+                    esimd::properties{esimd::alignment<2>});
+                const esimd::simd<sycl::half,
+                                  kHcCombineNormM1ElementsPerThread>
+                    scale_h = esimd::block_load<
+                        sycl::half,
+                        kHcCombineNormM1ElementsPerThread>(
+                        weight + offset,
+                        esimd::properties{esimd::alignment<2>});
+                const float stream_inverse = inverse[stream];
+                const esimd::simd<float,
+                                  kHcCombineNormM1ElementsPerThread>
+                    normalized =
+                        esimd::convert<float>(combined) * stream_inverse *
+                        (1.0f + esimd::convert<float>(scale_h));
+                esimd::block_store<sycl::half,
+                                   kHcCombineNormM1ElementsPerThread>(
+                    normed_output + offset,
+                    esimd::convert<sycl::half>(normalized),
+                    esimd::properties{esimd::alignment<2>});
+            }
         }
     }
 };
@@ -747,7 +802,8 @@ static void launch_hc_combine_norm_v1(
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
             sycl::nd_range<1>(
-                {static_cast<size_t>(kHcCount)}, {1}),
+                {static_cast<size_t>(kHcCombineNormM1LocalSize)},
+                {static_cast<size_t>(kHcCombineNormM1LocalSize)}),
             HcCombineNormV1Kernel{
                 hidden_states,
                 block_output,
