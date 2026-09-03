@@ -319,3 +319,44 @@ def test_qsa_store_cache_rows_v4_zero_rows_preserves_caller_receipt(qsa_ops):
 
     assert returned_cache.data_ptr() == cache.data_ptr()
     assert returned_receipt.data_ptr() == receipt.data_ptr()
+
+
+def test_qsa_store_cache_rows_r_aware_requires_unique_proof(qsa_ops):
+    operation = getattr(qsa_ops, "qsa_store_cache_rows_r_aware_v1", None)
+    if operation is None:
+        pytest.skip("parallel QSA row-store ABI is not built")
+    cache, cache_backing = _make_cache(torch.float16, 128)
+    rows, _ = _make_rows(torch.float16, 128, 2)
+    slots = torch.tensor([0, 5], dtype=torch.int64, device="xpu")
+    before = cache_backing.cpu().clone()
+
+    with pytest.raises(RuntimeError, match="trusted unique-slot proof"):
+        operation(cache, slots, rows, False)
+    torch.xpu.synchronize()
+    assert torch.equal(cache_backing.cpu(), before)
+
+
+def test_qsa_store_cache_rows_r_aware_writes_unique_rows(qsa_ops):
+    operation = getattr(qsa_ops, "qsa_store_cache_rows_r_aware_v1", None)
+    if operation is None:
+        pytest.skip("parallel QSA row-store ABI is not built")
+    cache, cache_backing = _make_cache(torch.float16, 128)
+    rows, rows_backing = _make_rows(torch.float16, 128, 2)
+    slots = torch.tensor([0, 5], dtype=torch.int64, device="xpu")
+    cache_before = cache_backing.cpu().clone()
+    rows_before = rows_backing.cpu().clone()
+    expected = cache_before.clone()
+    for row, slot in enumerate((0, 5)):
+        page, token = divmod(slot, cache.shape[1])
+        begin = (
+            cache.storage_offset()
+            + page * cache.stride(0)
+            + token * cache.stride(1)
+        )
+        expected[begin : begin + 128] = rows.cpu()[row]
+
+    returned = operation(cache, slots, rows, True)
+    torch.xpu.synchronize()
+    assert returned.data_ptr() == cache.data_ptr()
+    assert torch.equal(cache_backing.cpu(), expected)
+    assert torch.equal(rows_backing.cpu(), rows_before)

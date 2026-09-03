@@ -43,6 +43,12 @@ std::tuple<at::Tensor, at::Tensor> store_cache_rows_v4(
     const at::Tensor& rows,
     at::Tensor receipt);
 
+at::Tensor store_cache_rows_r_aware_v1(
+    at::Tensor cache,
+    const at::Tensor& slot_mapping,
+    const at::Tensor& rows,
+    bool unique_slots_proven);
+
 at::Tensor group_compress_v1(
     const at::Tensor& raw_keys,
     const at::Tensor& raw_positions,

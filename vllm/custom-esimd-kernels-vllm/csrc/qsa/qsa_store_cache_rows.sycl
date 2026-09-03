@@ -209,6 +209,132 @@ void launch_store(
 
 }  // namespace
 
+namespace {
+
+#ifndef QSA_PARALLEL_ROWS_PER_WG
+#define QSA_PARALLEL_ROWS_PER_WG 1
+#endif
+#ifndef QSA_PARALLEL_LANES
+#define QSA_PARALLEL_LANES 16
+#endif
+
+static_assert(
+    QSA_PARALLEL_ROWS_PER_WG >= 1 && QSA_PARALLEL_ROWS_PER_WG <= 8,
+    "QSA parallel row-store rows-per-WG must stay in 1..8");
+static_assert(
+    QSA_PARALLEL_LANES == 8 || QSA_PARALLEL_LANES == 16,
+    "QSA parallel key row-store lanes must be 8 or 16");
+
+template <typename scalar_t, int Width, bool StridedColumns, int RowsPerWG,
+          int LanesPerRow>
+class QsaStoreCacheRowsParallelKernel;
+
+template <typename scalar_t, int Width, bool StridedColumns, int RowsPerWG,
+          int LanesPerRow>
+void launch_store_parallel(
+    const at::Tensor& cache,
+    const at::Tensor& slot_mapping,
+    const at::Tensor& rows) {
+  const int64_t row_count = slot_mapping.numel();
+  if (row_count == 0) {
+    return;
+  }
+
+  auto* cache_ptr = reinterpret_cast<scalar_t*>(cache.data_ptr());
+  const auto* slots_ptr = slot_mapping.data_ptr<int64_t>();
+  const auto* rows_ptr = reinterpret_cast<const scalar_t*>(rows.data_ptr());
+  const int64_t pages = cache.size(0);
+  const int64_t page_size = cache.size(1);
+  const int64_t capacity = pages * page_size;
+  const int64_t cache_page_stride = cache.stride(0);
+  const int64_t cache_token_stride = cache.stride(1);
+  const int64_t rows_stride = rows.stride(0);
+  const int64_t rows_column_stride = rows.stride(rows.dim() - 1);
+  const size_t groups = static_cast<size_t>(
+      (row_count + RowsPerWG - 1) / RowsPerWG);
+  const size_t global = groups * RowsPerWG;
+
+  auto& queue =
+      c10::xpu::getCurrentXPUStream(cache.device().index()).queue();
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(
+        sycl::nd_range<1>(
+            sycl::range<1>(global), sycl::range<1>(RowsPerWG)),
+        [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+          const int64_t row = static_cast<int64_t>(item.get_global_id(0));
+          if (row >= row_count) {
+            return;
+          }
+          const int64_t slot = slots_ptr[row];
+          if (slot < 0 || slot >= capacity) {
+            return;
+          }
+          const int64_t page = slot / page_size;
+          const int64_t token = slot - page * page_size;
+          const int64_t destination =
+              page * cache_page_stride + token * cache_token_stride;
+          static_assert(
+              Width % LanesPerRow == 0,
+              "QSA row width must be divisible by vector lanes");
+#pragma unroll
+          for (int begin = 0; begin < Width; begin += LanesPerRow) {
+            simd<scalar_t, LanesPerRow> values;
+#pragma unroll
+            for (int column = 0; column < LanesPerRow; ++column) {
+              const int64_t source_column =
+                  (begin + column) *
+                  (StridedColumns ? rows_column_stride : 1);
+              values[column] =
+                  rows_ptr[row * rows_stride + source_column];
+            }
+#pragma unroll
+            for (int column = 0; column < LanesPerRow; ++column) {
+              cache_ptr[destination + begin + column] = values[column];
+            }
+          }
+        });
+  });
+}
+
+}  // namespace
+
+at::Tensor store_cache_rows_r_aware_v1(
+    at::Tensor cache,
+    const at::Tensor& slot_mapping,
+    const at::Tensor& rows,
+    bool unique_slots_proven) {
+  validate_store_inputs(cache, slot_mapping, rows);
+  TORCH_CHECK(
+      unique_slots_proven,
+      "parallel QSA row-store requires a trusted unique-slot proof");
+  TORCH_CHECK(
+      slot_mapping.numel() <= 32,
+      "parallel QSA row-store staging ABI is limited to R<=32");
+  if (rows.size(0) == 0) {
+    return cache;
+  }
+
+  if (cache.scalar_type() == at::kHalf) {
+    launch_store_parallel<
+        sycl::half, kKeyWidth, false, QSA_PARALLEL_ROWS_PER_WG,
+        QSA_PARALLEL_LANES>(cache, slot_mapping, rows);
+  } else if (cache.scalar_type() == at::kBFloat16) {
+    launch_store_parallel<
+        sycl::ext::oneapi::bfloat16, kKeyWidth, false,
+        QSA_PARALLEL_ROWS_PER_WG, QSA_PARALLEL_LANES>(
+        cache, slot_mapping, rows);
+  } else if (rows.stride(rows.dim() - 1) == 1) {
+    launch_store_parallel<
+        int64_t, kPositionWidth, false, QSA_PARALLEL_ROWS_PER_WG,
+        kPositionWidth>(cache, slot_mapping, rows);
+  } else {
+    launch_store_parallel<
+        int64_t, kPositionWidth, true, QSA_PARALLEL_ROWS_PER_WG,
+        kPositionWidth>(cache, slot_mapping, rows);
+  }
+  return cache;
+}
+
 at::Tensor store_cache_rows_v3(
     at::Tensor cache,
     const at::Tensor& slot_mapping,

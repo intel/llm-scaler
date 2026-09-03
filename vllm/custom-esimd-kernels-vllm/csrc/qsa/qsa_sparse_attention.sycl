@@ -812,6 +812,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       &qsa::store_cache_rows_v4,
       "Qwen3.8 QSA cache row-store with caller-owned write receipt (XPU)");
   module.def(
+      "qsa_store_cache_rows_r_aware_v1",
+      &qsa::store_cache_rows_r_aware_v1,
+      "Qwen3.8 proof-gated parallel QSA row-store (XPU)");
+  module.def(
       "qsa_indexer_norm_rope_v1",
       &qsa::indexer_norm_rope_v1,
       "Qwen3.8 QSA indexer Gemma norm and RoPE (XPU)");
@@ -849,6 +853,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.attr("row_store_strided_position_width") = 1;
   module.attr("row_store_storage_offsets") = 1;
   module.attr("row_store_inner_contiguous") = 1;
+  module.attr("qsa_row_store_parallel_abi_version") = 1;
+  module.attr("qsa_row_store_parallel_requires_unique_slots") = 1;
+  module.attr("qsa_row_store_parallel_rows_per_wg") = QSA_PARALLEL_ROWS_PER_WG;
+  module.attr("qsa_row_store_parallel_lanes_per_row") = QSA_PARALLEL_LANES;
   module.attr("row_store_no_workspace") = 1;
   module.attr("row_store_fp16_width") = 128;
   module.attr("row_store_bf16_width") = 128;

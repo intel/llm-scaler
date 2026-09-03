@@ -27,7 +27,7 @@ constexpr int64_t kOutputWidth = kTokenTopk + kCompressRatio - 1;
 constexpr int64_t kChunkBlocks = kBlockTopk;
 constexpr int64_t kSortSize = 2 * kBlockTopk;
 constexpr int64_t kSubgroup = 32;
-constexpr int64_t kWorkgroup = 256;
+constexpr int64_t kWorkgroup = 512;
 constexpr int64_t kSubgroups = kWorkgroup / kSubgroup;
 constexpr float kScoreScale = 0.08838834764831845f;
 
