@@ -151,7 +151,7 @@
 namespace omni_xpu {
 namespace tuning {
 
-inline constexpr const char* policy_manifest_sha256 = "d5b60bb1d237bb6a671381a89cea7fb12bceccef351c201cfdce46c38471177f";
+inline constexpr const char* policy_manifest_sha256 = "a0fda7afcfe3bc909e24db41c2935b95e80e9a12c71bc7c85ffbb37c80f3d03a";
 inline constexpr const char* build_tuning_policy_id =
     OMNI_BUILD_TUNING_POLICY_ID;
 

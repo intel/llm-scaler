@@ -99,7 +99,7 @@
           "additionalProperties": false,
           "required": ["level", "scope", "performance_claim"],
           "properties": {
-            "level": {"const": "image_passed"},
+            "level": {"const": "functional_pass"},
             "scope": {"type": "string", "minLength": 1},
             "performance_claim": {"const": false}
           }

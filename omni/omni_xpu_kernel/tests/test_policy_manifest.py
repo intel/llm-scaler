@@ -32,6 +32,7 @@ def test_b580_defaults_have_independent_experimental_policy_identity():
     # The accepted values currently match the maintained defaults, but remain
     # copied into a B580-owned record so later SKU tuning cannot drift by alias.
     assert b580["parameters"] == b70["parameters"]
+    assert b580_profile["functional_evidence"]["level"] == "functional_pass"
     assert b580_profile["functional_evidence"]["performance_claim"] is False
 
 

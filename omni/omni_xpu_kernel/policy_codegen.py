@@ -235,7 +235,7 @@ def load_policy_manifest(path=MANIFEST_PATH):
                 f"SKU {sku}.functional_evidence",
             )
             if (
-                evidence["level"] != "image_passed"
+                evidence["level"] != "functional_pass"
                 or not isinstance(evidence["scope"], str)
                 or not evidence["scope"]
                 or evidence["performance_claim"] is not False

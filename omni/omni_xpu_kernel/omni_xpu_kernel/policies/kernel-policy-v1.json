@@ -201,8 +201,8 @@
       "build_target": "bmg-g21",
       "effective_policy": "b580",
       "functional_evidence": {
-        "level": "image_passed",
-        "scope": "B580-local Sol-Attn, H3 RMS+RoPE, RMS modulation, and VideoVAE D64 routes",
+        "level": "functional_pass",
+        "scope": "Linux B580 isolated installed-wheel provider and focused native-route correctness",
         "performance_claim": false
       }
     },
