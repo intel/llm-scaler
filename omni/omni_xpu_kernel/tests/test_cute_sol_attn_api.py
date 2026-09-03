@@ -15,6 +15,11 @@ SOL_PREPARE = PROJECT_ROOT / "omni_xpu_kernel/cute/sol_attn_prepare.cpp"
 SOL_WRAPPER = PROJECT_ROOT / "omni_xpu_kernel/cute/sol_attn_torch.cpp"
 
 
+@pytest.fixture(autouse=True)
+def _stub_policy_warning_preparation(monkeypatch):
+    monkeypatch.setattr(cute, "_prepare_bmg_policy_dispatch", lambda tensor: None)
+
+
 def test_sol_attn_capability_requires_control_aware_ops(monkeypatch):
     monkeypatch.setattr(cute, "_ensure_loaded", lambda: None)
     monkeypatch.setattr(
@@ -121,6 +126,28 @@ def test_sol_attn_hides_native_prepare_contract(monkeypatch):
     assert forward_args[11:] == (
         pytest.approx(128**-0.5), True, False
     )
+
+
+def test_sol_attn_prepares_core_owned_bmg_policy_warning(monkeypatch):
+    prepared = []
+    monkeypatch.setattr(cute, "_ensure_loaded", lambda: None)
+    monkeypatch.setattr(
+        cute, "_prepare_bmg_policy_dispatch", prepared.append
+    )
+    monkeypatch.setattr(
+        cute,
+        "_sol_attn_ops",
+        lambda: SimpleNamespace(
+            prepare_with_controls=lambda *args: (
+                "kc", "vm", "qc", "thresholds", "sinks", "routes"
+            ),
+            forward_cute_with_controls=lambda *args: "out",
+        ),
+    )
+    q = torch.empty((1, 64, 1, 128), device="meta")
+
+    assert cute.sol_attn(q, object(), object()) == "out"
+    assert prepared == [q]
 
 
 def test_sol_attn_forwards_tail_bias_and_block_lengths(

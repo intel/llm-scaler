@@ -338,6 +338,11 @@ def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
         for dependency in extensions["omni_xpu_kernel._C"].depends
     }
     assert "kernel_tuning_overrides.h" in main_dependencies
+    assert "policy_codegen.py" in main_dependencies
+    assert "kernel-policy-v1.json" in main_dependencies
+    assert "kernel-policy-v1.schema.json" in main_dependencies
+    assert "kernel_tuning_defaults_generated.h" in main_dependencies
+    assert "bmg_kernel_policy_generated.h" in main_dependencies
     assert setup_namespace["BUILD_XPU_TARGET"] == XPU_TARGET
     assert setup_namespace["XPU_ARCH_MACRO"] == (
         "OMNI_XPU_ARCH_PTL_H" if XPU_TARGET == "ptl-h" else "OMNI_XPU_ARCH_BMG"
@@ -389,6 +394,7 @@ def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
         assert captured["package_data"]["omni_xpu_kernel"] == [
             ".libs/*.dll",
             ".libs/onednn/*",
+            "policies/*.json",
         ]
 
 

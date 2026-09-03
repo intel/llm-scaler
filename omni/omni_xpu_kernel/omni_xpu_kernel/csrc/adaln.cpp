@@ -113,6 +113,8 @@ torch::Tensor fused_adaln(
     const bool use_b60 =
         kernel_profile == device::BmgKernelProfile::b60 &&
         rows == 4096 && hidden == 3072;
+    const bool use_b580 =
+        kernel_profile == device::BmgKernelProfile::b580;
     const bool use_generic =
         kernel_profile == device::BmgKernelProfile::generic_bmg;
 #define DISPATCH_ADALN(T, input_ptr, scale_ptr, shift_ptr, output_ptr)     \
@@ -120,6 +122,11 @@ torch::Tensor fused_adaln(
         if (use_b580_candidate) {                                          \
             fused_adaln_kernel<                                            \
                 T, false, device::B580AdalnCandidatePolicy>(               \
+                input_ptr, scale_ptr, shift_ptr, output_ptr, rows, hidden, \
+                modulation_rows, row_repeat, static_cast<float>(eps),      \
+                input.device());                                           \
+        } else if (use_b580) {                                             \
+            fused_adaln_kernel<T, false, device::B580KernelPolicy>(        \
                 input_ptr, scale_ptr, shift_ptr, output_ptr, rows, hidden, \
                 modulation_rows, row_repeat, static_cast<float>(eps),      \
                 input.device());                                           \

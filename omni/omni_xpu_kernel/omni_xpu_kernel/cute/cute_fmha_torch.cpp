@@ -611,7 +611,16 @@ at::Tensor sdp_minimax_h3_vae_d64(
     }
     if (selection.physical_sku == omni_xpu::device::BmgSku::b580 &&
         !selection.forced) {
-      run_d128_tile<cutlass::half_t, 0, 128, 8, 0, 0, 64, 32>(
+      run_d128_tile<
+          cutlass::half_t,
+          0,
+          128,
+          8,
+          0,
+          0,
+          64,
+          omni_xpu::device::B580KernelPolicy::
+              h3_vae_d64_s1797_kv_tile>(
           q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(), B, H, L,
           L, D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
           k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
@@ -682,6 +691,8 @@ at::Tensor sdp_bhld_d120(
         omni_xpu::device::get_bmg_selection_unwarned(queue);
     const bool use_b60 =
         selection.kernel_profile == omni_xpu::device::BmgKernelProfile::b60;
+    const bool use_b580 =
+        selection.kernel_profile == omni_xpu::device::BmgKernelProfile::b580;
     const bool use_b580_candidate =
         selection.b580_policy_candidate ==
         omni_xpu::device::B580PolicyCandidate::d120_l4205_v_tile;
@@ -696,6 +707,20 @@ at::Tensor sdp_bhld_d120(
           0,
           omni_xpu::device::B580D120L4205CandidatePolicy::
               d120_l4205_v_tile>(
+          q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(), B, H, L, L,
+          D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+          k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+          o.stride(2), o.stride(1), o.stride(0));
+      return o;
+    }
+    if (use_b580 && L == 4205) {
+      run_d128_tile<
+          cutlass::half_t,
+          1,
+          0,
+          0,
+          0,
+          omni_xpu::device::B580KernelPolicy::d120_l4205_v_tile>(
           q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(), B, H, L, L,
           D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
           k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),

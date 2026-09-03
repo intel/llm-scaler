@@ -1461,6 +1461,12 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_g16_bmg(
             device::B580ConvrotG16CandidatePolicy::
                 convrot_g16_work_items_per_row>(input);
     }
+    if (kernel_profile == device::BmgKernelProfile::b580) {
+        return quantize_int8_convrot_g16_bmg_policy<
+            device::B580KernelPolicy::convrot_g16_groups_per_dpas,
+            device::B580KernelPolicy::convrot_g16_work_items_per_row>(
+                input);
+    }
     if (kernel_profile == device::BmgKernelProfile::b60) {
         return quantize_int8_convrot_g16_bmg_policy<
             device::B60KernelPolicy::convrot_g16_groups_per_dpas,

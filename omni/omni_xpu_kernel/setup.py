@@ -69,6 +69,10 @@ def get_onednn_package_version():
 
 
 VERSION_NAMESPACE = run_path(str(Path(__file__).parent / "omni_xpu_kernel" / "_version.py"))
+POLICY_CODEGEN_FILE = Path(__file__).parent / "policy_codegen.py"
+POLICY_CODEGEN_NAMESPACE = run_path(str(POLICY_CODEGEN_FILE))
+POLICY_MANIFEST = POLICY_CODEGEN_NAMESPACE["load_policy_manifest"]()
+POLICY_CODEGEN_NAMESPACE["verify_generated_headers"](POLICY_MANIFEST)
 BUILD_TORCH_VERSION = VERSION_NAMESPACE["get_installed_torch_version"]()
 BUILD_XPU_TARGET = VERSION_NAMESPACE["get_build_xpu_target"]()
 PACKAGE_VERSION = VERSION_NAMESPACE["get_package_version"](
@@ -79,31 +83,9 @@ XPU_ARCH_MACROS = {
     "ptl-h": "OMNI_XPU_ARCH_PTL_H",
 }
 XPU_ARCH_MACRO = XPU_ARCH_MACROS[BUILD_XPU_TARGET]
-KERNEL_TUNING_DEFINE_NAMES = (
-    "OMNI_FP8_DEQUANT_ELEMENTS_PER_WI",
-    "OMNI_FP8_QUANT_VEC",
-    "OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM",
-    "OMNI_CONVROT_DEQUANT_WG_SIZE",
-    "OMNI_CONVROT_QUANT_WG_SIZE",
-    "OMNI_INT8_DEQUANT_ELEMENTS_PER_WI",
-    "OMNI_SILU_MUL_ELEMENTS_PER_WI",
-    "OMNI_INT8_TENSORWISE_VEC",
-    "OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE",
-    "OMNI_KITCHEN_ROPE_PAIR_WG_SIZE",
-    "OMNI_SVDQ_DEQUANT_GROUPS_PER_WI",
-    "OMNI_SVDQ_QUANT_GROUPS_PER_WI",
-    "OMNI_SVDQ_UNPACK_COLS_PER_WI",
-    "OMNI_SVDQ_UNPACK_BYTES_PER_ITERATION",
-    "OMNI_SVDQ_UNPACK_WG_SIZE",
-    "OMNI_RMS_NORM_H120_MODE",
-    "OMNI_RMS_NORM_H128_BLOCK_SIZE",
-    "OMNI_GROUP_NORM_BMG_TILE",
-    "OMNI_GROUP_NORM_BMG_REDUCE_VECTOR",
-    "OMNI_H3_RMS_ROPE_FAST_REDUCE",
-    "OMNI_H3_RMS_ROPE_SLM_BF16",
-    "OMNI_ROWQ_VECTOR_WIDTH_OVERRIDE",
-    "OMNI_ROWQ_SUBGROUPS_PER_ROW_OVERRIDE",
-)
+KERNEL_TUNING_DEFINE_NAMES = POLICY_CODEGEN_NAMESPACE[
+    "EXPECTED_TUNING_PARAMETERS"
+]
 
 
 def get_kernel_tuning_compile_args(*, windows=None):
@@ -142,9 +124,8 @@ def get_kernel_tuning_compile_args(*, windows=None):
 
 
 BMG_CUTE_SKU_AOT_TARGETS = {
-    "b580": "bmg-g21",
-    "b60": "bmg-g21",
-    "b70": "bmg-g31",
+    sku: POLICY_MANIFEST["sku_profiles"][sku]["build_target"]
+    for sku in ("b580", "b60", "b70")
 }
 CUTE_AOT_TARGETS = {
     # Keep one BMG sidecar portable across the maintained physical SKUs. The
@@ -1109,6 +1090,25 @@ class ICPXExtension(Extension):
             kernel_root = source_root / "omni_xpu_kernel" / "csrc"
             sources = sorted(kernel_root.glob("*.cpp"))
             depends = sorted(kernel_root.glob("*.h"))
+        depends += [
+            source_root / "policy_codegen.py",
+            source_root
+            / "omni_xpu_kernel"
+            / "policies"
+            / "kernel-policy-v1.json",
+            source_root
+            / "omni_xpu_kernel"
+            / "policies"
+            / "kernel-policy-v1.schema.json",
+        ]
+        depends += sorted(
+            (
+                source_root
+                / "omni_xpu_kernel"
+                / "csrc"
+                / "generated"
+            ).glob("*.h")
+        )
         super().__init__(
             name,
             sources=[source.as_posix() for source in sources],
@@ -1190,6 +1190,7 @@ setup(
         "omni_xpu_kernel": [
             ".libs/*.dll",
             ".libs/onednn/*",
+            "policies/*.json",
         ],
     },
     include_package_data=True,

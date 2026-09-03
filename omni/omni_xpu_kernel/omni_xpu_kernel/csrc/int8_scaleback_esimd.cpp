@@ -196,11 +196,15 @@ torch::Tensor fused_scaleback(
     const bool use_b60 =
         kernel_profile == device::BmgKernelProfile::b60 &&
         M == 4096 && N == 4096 && out_dtype == torch::kBFloat16;
+    const bool use_b580 =
+        kernel_profile == device::BmgKernelProfile::b580;
     const bool use_generic =
         kernel_profile == device::BmgKernelProfile::generic_bmg;
     const int fast_elements =
         use_b580_candidate
         ? device::B580Int8ScalebackCandidatePolicy::int8_scaleback_elements
+        : use_b580
+        ? device::B580KernelPolicy::int8_scaleback_elements
         : use_b60
         ? device::B60KernelPolicy::int8_scaleback_elements
         : (
@@ -235,6 +239,9 @@ torch::Tensor fused_scaleback(
             if (use_b580_candidate) { \
                 DISPATCH_SCALEBACK_POLICY( \
                     OT, bias_ptr, device::B580Int8ScalebackCandidatePolicy); \
+            } else if (use_b580) { \
+                DISPATCH_SCALEBACK_POLICY( \
+                    OT, bias_ptr, device::B580KernelPolicy); \
             } else if (use_b60) { \
                 DISPATCH_SCALEBACK_POLICY( \
                     OT, bias_ptr, device::B60KernelPolicy); \

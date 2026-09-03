@@ -563,7 +563,7 @@ void launch_svdq_dequant_signed(
     const auto kernel_profile = selection.kernel_profile;
     if (selection.b580_policy_candidate ==
             device::B580PolicyCandidate::svdq_dequant) {
-        // Keep B580's generic signed algorithm fixed so this A/B isolates the
+        // Keep B580's base signed algorithm fixed so this A/B isolates the
         // candidate policy values from B60's separate vector route.
         dequantize_svdq_w4_kernel<
             OT,
@@ -571,6 +571,19 @@ void launch_svdq_dequant_signed(
             device::B580SvdqDequantCandidatePolicy::svdq_dequant_groups,
             device::B580SvdqDequantCandidatePolicy::
                 svdq_dequant_work_group_size>(
+                packed,
+                scales,
+                output,
+                rows,
+                columns,
+                groups,
+                target_device);
+    } else if (kernel_profile == device::BmgKernelProfile::b580) {
+        dequantize_svdq_w4_kernel<
+            OT,
+            true,
+            device::B580KernelPolicy::svdq_dequant_groups,
+            device::B580KernelPolicy::svdq_dequant_work_group_size>(
                 packed,
                 scales,
                 output,
@@ -651,6 +664,19 @@ void launch_svdq_dequant_unsigned(
                 columns,
                 groups,
                 target_device);
+    } else if (kernel_profile == device::BmgKernelProfile::b580) {
+        dequantize_svdq_w4_kernel<
+            OT,
+            false,
+            device::B580KernelPolicy::svdq_dequant_groups,
+            device::B580KernelPolicy::svdq_dequant_work_group_size>(
+                packed,
+                scales,
+                output,
+                rows,
+                columns,
+                groups,
+                target_device);
     } else if (kernel_profile == device::BmgKernelProfile::b60) {
         dequantize_svdq_w4_kernel<
             OT,
@@ -712,13 +738,27 @@ void launch_svdq_quant(
     const auto kernel_profile = selection.kernel_profile;
     if (selection.b580_policy_candidate ==
             device::B580PolicyCandidate::svdq_quant) {
-        // Preserve the generic B580 algorithm flag and vary only the policy
+        // Preserve the B580 base algorithm flag and vary only the policy
         // work-group axis.
         quantize_svdq_act_int4_kernel<
             IT,
             Unsigned,
             device::B580SvdqQuantCandidatePolicy::svdq_quant_groups,
             device::B580SvdqQuantCandidatePolicy::svdq_quant_work_group_size,
+            false>(
+                input,
+                output,
+                scales,
+                rows,
+                columns,
+                groups,
+                target_device);
+    } else if (kernel_profile == device::BmgKernelProfile::b580) {
+        quantize_svdq_act_int4_kernel<
+            IT,
+            Unsigned,
+            device::B580KernelPolicy::svdq_quant_groups,
+            device::B580KernelPolicy::svdq_quant_work_group_size,
             false>(
                 input,
                 output,

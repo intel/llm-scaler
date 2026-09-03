@@ -12,41 +12,15 @@ from omni_xpu_kernel import cute
 from omni_xpu_kernel import device
 
 
-TUNING_OVERRIDE_NAMES = (
-    "OMNI_FP8_DEQUANT_ELEMENTS_PER_WI",
-    "OMNI_FP8_QUANT_VEC",
-    "OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM",
-    "OMNI_CONVROT_DEQUANT_WG_SIZE",
-    "OMNI_CONVROT_QUANT_WG_SIZE",
-    "OMNI_INT8_DEQUANT_ELEMENTS_PER_WI",
-    "OMNI_SILU_MUL_ELEMENTS_PER_WI",
-    "OMNI_INT8_TENSORWISE_VEC",
-    "OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE",
-    "OMNI_KITCHEN_ROPE_PAIR_WG_SIZE",
-    "OMNI_SVDQ_DEQUANT_GROUPS_PER_WI",
-    "OMNI_SVDQ_QUANT_GROUPS_PER_WI",
-    "OMNI_SVDQ_UNPACK_COLS_PER_WI",
-    "OMNI_SVDQ_UNPACK_BYTES_PER_ITERATION",
-    "OMNI_SVDQ_UNPACK_WG_SIZE",
-    "OMNI_RMS_NORM_H120_MODE",
-    "OMNI_RMS_NORM_H128_BLOCK_SIZE",
-    "OMNI_GROUP_NORM_BMG_TILE",
-    "OMNI_GROUP_NORM_BMG_REDUCE_VECTOR",
-    "OMNI_H3_RMS_ROPE_FAST_REDUCE",
-    "OMNI_H3_RMS_ROPE_SLM_BF16",
-    "OMNI_ROWQ_VECTOR_WIDTH_OVERRIDE",
-    "OMNI_ROWQ_SUBGROUPS_PER_ROW_OVERRIDE",
+POLICY_MANIFEST = device.policy_manifest()
+TUNING_OVERRIDE_NAMES = tuple(
+    POLICY_MANIFEST["build_tuning_profiles"]["bmg"]["parameters"]
 )
-
 TUNING_DEFAULTS = {
-    "ptl-h": (
-        256, 16, 8, 1, 1, 64, 1, 16, 1, 128, 60, 60, 3840, 64,
-        32, 2, 32, 32768, 32, 0, 0, 0, 0,
-    ),
-    "bmg": (
-        256, 8, 6, 1, 8, 32, 1, 8, 1, 32, 60, 60, 3840, 128,
-        1, 2, 64, 32768, 32, 0, 0, 0, 0,
-    ),
+    target: tuple(
+        profile["parameters"][name] for name in TUNING_OVERRIDE_NAMES
+    )
+    for target, profile in POLICY_MANIFEST["build_tuning_profiles"].items()
 }
 
 
@@ -90,8 +64,15 @@ def test_device_info_and_sku_forward_to_native(monkeypatch):
                 "bmg_sku": "b60",
                 "kernel_profile": "b60",
                 "b580_policy_candidate": "none",
+                "sku_profile_id": "bmg-b60",
+                "physical_build_target": "bmg-g21",
+                "policy_id": "b60-v1",
+                "policy_status": "experimental",
+                "policy_manifest_sha256": "digest",
+                "build_tuning_policy_id": "bmg-build-defaults-v1",
+                "tuning_candidate_build": False,
                 "sku_forced": False,
-                "performance_claim_allowed": True,
+                "performance_claim_allowed": False,
                 "tuning_overrides": {
                     "OMNI_RMS_NORM_H120_MODE": 2,
                 },
@@ -111,8 +92,15 @@ def test_device_info_and_sku_forward_to_native(monkeypatch):
         "bmg_sku": "b60",
         "kernel_profile": "b60",
         "b580_policy_candidate": "none",
+        "sku_profile_id": "bmg-b60",
+        "physical_build_target": "bmg-g21",
+        "policy_id": "b60-v1",
+        "policy_status": "experimental",
+        "policy_manifest_sha256": "digest",
+        "build_tuning_policy_id": "bmg-build-defaults-v1",
+        "tuning_candidate_build": False,
         "sku_forced": False,
-        "performance_claim_allowed": True,
+        "performance_claim_allowed": False,
         "tuning_overrides": {
             "OMNI_RMS_NORM_H120_MODE": 2,
         },
@@ -153,15 +141,15 @@ def test_native_source_contract_covers_identity_profile_and_override():
     assert 'std::getenv("OMNI_XPU_B580_POLICY_CANDIDATE")' in utilities
     assert "warn_bmg_selection_once(device_id, selection)" in utilities
     assert "debug/prescreen only, performance_claim=false" in warning
-    assert "SKU-specific kernel policy is unvalidated" in warning
+    assert "functional support may be accepted independently" in warning
 
 
 def test_tuning_override_surface_is_centralized_and_exported():
     package_root = Path(__file__).resolve().parents[1]
     csrc_root = package_root / "omni_xpu_kernel/csrc"
-    header = (csrc_root / "kernel_tuning_overrides.h").read_text(
-        encoding="utf-8"
-    )
+    header = (
+        csrc_root / "generated/kernel_tuning_defaults_generated.h"
+    ).read_text(encoding="utf-8")
     bindings = (csrc_root / "bindings.cpp").read_text(encoding="utf-8")
 
     defined_names = tuple(re.findall(r"^#ifndef (OMNI_[A-Z0-9_]+)$", header, re.M))
@@ -208,7 +196,11 @@ def test_tuning_override_defaults_compile_for_each_target(tmp_path, target):
         f"static_assert({name} == {value});"
         for name, value in zip(TUNING_OVERRIDE_NAMES, TUNING_DEFAULTS[target])
     )
-    source = f'#include "kernel_tuning_overrides.h"\n{assertions}\nint main() {{}}\n'
+    source = (
+        f'#include "kernel_tuning_overrides.h"\n{assertions}\n'
+        "static_assert(!omni_xpu::tuning::is_candidate_build());\n"
+        "int main() {}\n"
+    )
     executable = tmp_path / f"tuning_defaults_{target}"
     subprocess.run(
         [
@@ -254,7 +246,11 @@ def test_tuning_override_nondefaults_compile(tmp_path):
         f"static_assert({name} == {value});"
         for name, value in overrides.items()
     )
-    source = f'#include "kernel_tuning_overrides.h"\n{assertions}\nint main() {{}}\n'
+    source = (
+        f'#include "kernel_tuning_overrides.h"\n{assertions}\n'
+        "static_assert(omni_xpu::tuning::is_candidate_build());\n"
+        "int main() {}\n"
+    )
     executable = tmp_path / "tuning_nondefaults"
     subprocess.run(
         [
@@ -291,7 +287,7 @@ def test_h3_rms_rope_b580_head_reuse_requires_unforced_physical_device():
     assert "constexpr int64_t HeadsPerGroup = 7" in source
     assert "for (int operand = 0; operand < 2; ++operand)" in source
     assert (
-        "constautoselection=device::get_bmg_selection_unwarned(queue);"
+        "constautoselection=device::get_bmg_selection(queue);"
     ) in compact
     assert (
         "returnselection.physical_sku==device::BmgSku::b580&&"
@@ -359,10 +355,25 @@ def test_device_independent_native_selection_compiles_and_runs(tmp_path):
             ASSERT_GENERIC_MATCHES_B70(h3_vae_d64_s1797_kv_tile);
             #undef ASSERT_GENERIC_MATCHES_B70
 
+            // Equal values do not collapse the accepted B580 route back into
+            // generic/B70 identity: policy ownership remains SKU-specific.
+            static_assert(B580KernelPolicy::adaln_block_size ==
+                          B70KernelPolicy::adaln_block_size);
+            static_assert(B580KernelPolicy::d120_l4205_v_tile ==
+                          B70KernelPolicy::d120_l4205_v_tile);
+            static_assert(kernel_policy_id(BmgKernelProfile::b580) ==
+                          std::string_view("b580-v1"));
+            static_assert(kernel_policy_status(BmgKernelProfile::b580) ==
+                          std::string_view("experimental"));
+            static_assert(!kernel_policy_performance_claim_allowed(
+                BmgKernelProfile::b580));
+            static_assert(kernel_policy_performance_claim_allowed(
+                BmgKernelProfile::b70));
+
             const auto detected = resolve_bmg_selection(kArcB580, nullptr);
             assert(detected.physical_sku == BmgSku::b580);
             assert(detected.effective_sku == BmgSku::b580);
-            assert(detected.kernel_profile == BmgKernelProfile::generic_bmg);
+            assert(detected.kernel_profile == BmgKernelProfile::b580);
             assert(!detected.forced);
             assert(detected.b580_policy_candidate ==
                    B580PolicyCandidate::none);
@@ -371,7 +382,7 @@ def test_device_independent_native_selection_compiles_and_runs(tmp_path):
                 resolve_bmg_selection(kArcB580, nullptr, "adaln");
             assert(candidate.physical_sku == BmgSku::b580);
             assert(candidate.effective_sku == BmgSku::b580);
-            assert(candidate.kernel_profile == BmgKernelProfile::generic_bmg);
+            assert(candidate.kernel_profile == BmgKernelProfile::b580);
             assert(!candidate.forced);
             assert(candidate.b580_policy_candidate ==
                    B580PolicyCandidate::adaln);
@@ -382,7 +393,7 @@ def test_device_independent_native_selection_compiles_and_runs(tmp_path):
                 B60KernelPolicy::adaln_block_size);
             static_assert(
                 B580AdalnCandidatePolicy::int8_scaleback_elements ==
-                GenericBmgKernelPolicy::int8_scaleback_elements);
+                B580KernelPolicy::int8_scaleback_elements);
             const auto h3_candidate = resolve_bmg_selection(
                 kArcB580, nullptr, "h3-vae-d64-s1797-kv-tile");
             assert(h3_candidate.b580_policy_candidate ==
@@ -479,10 +490,11 @@ def test_device_independent_native_selection_compiles_and_runs(tmp_path):
             std::cerr.rdbuf(previous);
 
             const std::string text = warnings.str();
-            const auto generic_at = text.find("uses kernel_profile=generic-bmg");
-            assert(generic_at != std::string::npos);
-            assert(text.find("uses kernel_profile=generic-bmg", generic_at + 1) ==
+            const auto b580_at = text.find("uses kernel_profile=b580");
+            assert(b580_at != std::string::npos);
+            assert(text.find("uses kernel_profile=b580", b580_at + 1) ==
                    std::string::npos);
+            assert(text.find("policy_id=b580-v1") != std::string::npos);
             const auto forced_at = text.find("OMNI_XPU_FORCE_SKU overrides");
             assert(forced_at != std::string::npos);
             assert(text.find("OMNI_XPU_FORCE_SKU overrides", forced_at + 1) ==
@@ -532,6 +544,12 @@ def test_native_info_keeps_physical_and_effective_identity_separate():
         'result["sku_forced"]',
         'result["kernel_profile"]',
         'result["b580_policy_candidate"]',
+        'result["sku_profile_id"]',
+        'result["physical_build_target"]',
+        'result["policy_id"]',
+        'result["policy_status"]',
+        'result["policy_manifest_sha256"]',
+        'result["tuning_candidate_build"]',
         'result["performance_claim_allowed"]',
     ):
         assert field in bindings
@@ -547,7 +565,12 @@ def test_cute_sidecar_delegates_warning_ownership_to_core():
     ).read_text(encoding="utf-8")
 
     assert "get_bmg_selection_unwarned(queue)" in sidecar
-    assert "_prepare_bmg_policy_dispatch(q)" in wrapper
+    h3_wrapper = wrapper.split("def sdp_minimax_h3_vae_d64", 1)[1].split(
+        "def supports_d120_bhld", 1
+    )[0]
+    sol_wrapper = wrapper.split("def sol_attn", 1)[1]
+    assert "_prepare_bmg_policy_dispatch(q)" in h3_wrapper
+    assert "_prepare_bmg_policy_dispatch(q)" in sol_wrapper
     assert "device.info(" in wrapper
 
 
@@ -583,7 +606,8 @@ def test_cute_warning_preparation_is_cached_by_device_and_override(
 def test_generic_bmg_policy_is_independent_from_b70():
     package_root = Path(__file__).resolve().parents[1]
     policy = (
-        package_root / "omni_xpu_kernel/csrc/bmg_kernel_policy.h"
+        package_root
+        / "omni_xpu_kernel/csrc/generated/bmg_kernel_policy_generated.h"
     ).read_text(encoding="utf-8")
 
     assert "struct GenericBmgKernelPolicy" in policy
@@ -604,9 +628,9 @@ def test_b580_candidate_axes_are_explicit_and_route_local():
     package_root = Path(__file__).resolve().parents[1]
     csrc_root = package_root / "omni_xpu_kernel/csrc"
     policy = (csrc_root / "bmg_device_policy.h").read_text(encoding="utf-8")
-    kernel_policy = (csrc_root / "bmg_kernel_policy.h").read_text(
-        encoding="utf-8"
-    )
+    kernel_policy = (
+        csrc_root / "generated/bmg_kernel_policy_generated.h"
+    ).read_text(encoding="utf-8")
 
     routes = {
         "adaln": "adaln.cpp",
@@ -641,8 +665,9 @@ def test_b580_candidate_axes_are_explicit_and_route_local():
     assert "selection.physical_sku == omni_xpu::device::BmgSku::b580" in (
         cute_source
     )
-    assert "run_d128_tile<cutlass::half_t, 0, 128, 8, 0, 0, 64, 32>" in (
+    assert "B580KernelPolicy::\n              h3_vae_d64_s1797_kv_tile" in (
         cute_source
     )
     assert "!selection.forced" in cute_source
-    assert "B580CandidateKernelPolicy" in kernel_policy
+    assert "struct B580KernelPolicy" in kernel_policy
+    assert "struct B580AdalnCandidatePolicy : B580KernelPolicy" in kernel_policy

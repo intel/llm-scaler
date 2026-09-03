@@ -521,12 +521,22 @@ torch::Tensor fused_smooth_convert(
     const auto kernel_profile = selection.kernel_profile;
     if (selection.b580_policy_candidate ==
             device::B580PolicyCandidate::svdq_smooth) {
-        // Keep the generic B580 algorithm fixed; B60's separate 2D route is
+        // Keep the B580 base algorithm fixed; B60's separate 2D route is
         // outside this policy-value A/B.
         fused_smooth_convert_kernel<
             device::B580SvdqSmoothCandidatePolicy::svdq_smooth_elements,
             device::B580SvdqSmoothCandidatePolicy::
                 svdq_smooth_work_group_size>(
+                x_ptr,
+                smooth_ptr,
+                output_ptr,
+                M,
+                K,
+                x.device());
+    } else if (kernel_profile == device::BmgKernelProfile::b580) {
+        fused_smooth_convert_kernel<
+            device::B580KernelPolicy::svdq_smooth_elements,
+            device::B580KernelPolicy::svdq_smooth_work_group_size>(
                 x_ptr,
                 smooth_ptr,
                 output_ptr,
@@ -660,6 +670,16 @@ void fused_convert_add(
         launch_fused_convert_add<
             device::B580SvdqConvertAddCandidatePolicy::
                 svdq_convert_add_elements>(
+                out,
+                result,
+                residual,
+                M_out,
+                N_out,
+                result_N,
+                residual_N);
+    } else if (kernel_profile == device::BmgKernelProfile::b580) {
+        launch_fused_convert_add<
+            device::B580KernelPolicy::svdq_convert_add_elements>(
                 out,
                 result,
                 residual,

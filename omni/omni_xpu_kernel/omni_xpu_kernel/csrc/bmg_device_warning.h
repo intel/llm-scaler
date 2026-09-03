@@ -8,7 +8,7 @@
 #include <iostream>
 #include <mutex>
 
-#include "bmg_device_policy.h"
+#include "bmg_kernel_policy.h"
 
 namespace omni_xpu {
 namespace device {
@@ -40,16 +40,21 @@ inline void warn_bmg_selection_once(
                        selection.b580_policy_candidate)
                 << "; development A/B only, performance_claim=false\n";
         });
-    } else if (selection.kernel_profile == BmgKernelProfile::generic_bmg) {
-        static std::once_flag generic_warning;
-        std::call_once(generic_warning, [device_id, selection]() {
+    } else if (!kernel_policy_performance_claim_allowed(
+                   selection.kernel_profile)) {
+        static std::once_flag experimental_warning;
+        std::call_once(experimental_warning, [device_id, selection]() {
             std::cerr
                 << "[omni_xpu::device] warning: physical Device ID 0x"
                 << std::hex << device_id << std::dec
                 << " (physical_sku=" << bmg_sku_name(selection.physical_sku)
-                << ") uses kernel_profile=generic-bmg; "
-                << "policy=GenericBmgKernelPolicy; "
-                << "SKU-specific kernel policy is unvalidated\n";
+                << ") uses kernel_profile="
+                << bmg_kernel_profile_name(selection.kernel_profile)
+                << ", policy_id=" << kernel_policy_id(selection.kernel_profile)
+                << ", support="
+                << kernel_policy_status(selection.kernel_profile)
+                << "; functional support may be accepted independently, "
+                << "performance_claim=false\n";
         });
     }
 }

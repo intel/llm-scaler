@@ -12,7 +12,11 @@ CUTE_FMHA_SOURCE = (
     PROJECT_ROOT / "omni_xpu_kernel" / "cute" / "cute_fmha_torch.cpp"
 ).read_text(encoding="utf-8")
 BMG_POLICY_SOURCE = (
-    PROJECT_ROOT / "omni_xpu_kernel" / "csrc" / "bmg_kernel_policy.h"
+    PROJECT_ROOT
+    / "omni_xpu_kernel"
+    / "csrc"
+    / "generated"
+    / "bmg_kernel_policy_generated.h"
 ).read_text(encoding="utf-8")
 BINDINGS_SOURCE = (
     PROJECT_ROOT / "omni_xpu_kernel" / "csrc" / "bindings.cpp"
@@ -75,14 +79,17 @@ def test_windows_sdp_loader_resolves_every_exported_kernel():
         assert f'dlsym(library.handle, "{symbol}")' in linux_loader
 
 
-def test_h3_vae_s1797_keeps_explicit_b60_and_b70_kv_policies():
+def test_h3_vae_s1797_keeps_explicit_b580_b60_and_b70_kv_policies():
+    b580_policy = BMG_POLICY_SOURCE.split("struct B580KernelPolicy", 1)[1]
+    b580_policy = b580_policy.split("struct B60KernelPolicy", 1)[0]
     b60_policy = BMG_POLICY_SOURCE.split("struct B60KernelPolicy", 1)[1]
     b60_policy = b60_policy.split("struct B70KernelPolicy", 1)[0]
     b70_policy = BMG_POLICY_SOURCE.split("struct B70KernelPolicy", 1)[1]
     b70_policy = b70_policy.split("struct GenericBmgKernelPolicy", 1)[0]
     generic_policy = BMG_POLICY_SOURCE.split(
         "struct GenericBmgKernelPolicy", 1
-    )[1].split("template <B580PolicyCandidate Candidate>", 1)[0]
+    )[1].split("struct B580AdalnCandidatePolicy", 1)[0]
+    assert "h3_vae_d64_s1797_kv_tile = 32" in b580_policy
     assert "h3_vae_d64_s1797_kv_tile = 64" in b60_policy
     assert "h3_vae_d64_s1797_kv_tile = 32" in b70_policy
     assert "h3_vae_d64_s1797_kv_tile = 32" in generic_policy
@@ -108,9 +115,7 @@ def test_h3_vae_s1797_queries_b580_geometry_and_b60_inside_exact_shape():
     physical_b580 = h3_section.index(
         "selection.physical_sku == omni_xpu::device::BmgSku::b580"
     )
-    b580_geometry = h3_section.index(
-        "run_d128_tile<cutlass::half_t, 0, 128, 8, 0, 0, 64, 32>("
-    )
+    b580_geometry = h3_section.index("B580KernelPolicy::")
     b60_profile = h3_section.index("BmgKernelProfile::b60")
     candidate = h3_section.index("h3_vae_d64_s1797_kv_tile")
     fallback = h3_section.index(

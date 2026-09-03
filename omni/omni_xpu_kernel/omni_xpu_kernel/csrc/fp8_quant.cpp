@@ -552,11 +552,14 @@ torch::Tensor stochastic_rounding(
     const auto selection = device::get_bmg_selection(queue);
     const bool use_b60 =
         selection.kernel_profile == device::BmgKernelProfile::b60;
+    const bool use_b580 =
+        selection.kernel_profile == device::BmgKernelProfile::b580;
     const bool use_b580_candidate =
         selection.b580_policy_candidate ==
             device::B580PolicyCandidate::fp8_stochastic;
 #else
     const bool use_b60 = false;
+    const bool use_b580 = false;
     const bool use_b580_candidate = false;
 #endif
 #define DISPATCH_STOCHASTIC_ELEMENTS(InputT, Elements)                     \
@@ -576,6 +579,10 @@ torch::Tensor stochastic_rounding(
             DISPATCH_STOCHASTIC_ELEMENTS(                                  \
                 InputT, device::B580Fp8StochasticCandidatePolicy::         \
                     fp8_stochastic_elements);                              \
+        }                                                                  \
+        if (use_b580) {                                                     \
+            DISPATCH_STOCHASTIC_ELEMENTS(                                  \
+                InputT, device::B580KernelPolicy::fp8_stochastic_elements);\
         }                                                                  \
         if (use_b60) {                                                      \
             DISPATCH_STOCHASTIC_ELEMENTS(                                  \

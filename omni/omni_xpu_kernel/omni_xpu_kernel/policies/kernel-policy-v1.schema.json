@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Omni XPU kernel policy manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "kind",
+    "build_tuning_profiles",
+    "runtime_policies",
+    "sku_profiles",
+    "b580_candidates"
+  ],
+  "properties": {
+    "$schema": {"const": "kernel-policy-v1.schema.json"},
+    "schema_version": {"const": 1},
+    "kind": {"const": "omni_xpu_kernel_policy_manifest"},
+    "build_tuning_profiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bmg", "ptl-h"],
+      "properties": {
+        "bmg": {"$ref": "#/$defs/buildProfile"},
+        "ptl-h": {"$ref": "#/$defs/buildProfile"}
+      }
+    },
+    "runtime_policies": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["b580", "b60", "b70", "generic-bmg"],
+      "properties": {
+        "b580": {"$ref": "#/$defs/runtimePolicy"},
+        "b60": {"$ref": "#/$defs/runtimePolicy"},
+        "b70": {"$ref": "#/$defs/runtimePolicy"},
+        "generic-bmg": {"$ref": "#/$defs/runtimePolicy"}
+      }
+    },
+    "sku_profiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["b580", "b50", "b60", "b70"],
+      "properties": {
+        "b580": {"$ref": "#/$defs/skuProfile"},
+        "b50": {"$ref": "#/$defs/skuProfile"},
+        "b60": {"$ref": "#/$defs/skuProfile"},
+        "b70": {"$ref": "#/$defs/skuProfile"}
+      }
+    },
+    "b580_candidates": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/candidate"}
+    }
+  },
+  "$defs": {
+    "integerMap": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"type": "integer"}
+    },
+    "buildProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_id", "parameters"],
+      "properties": {
+        "policy_id": {"type": "string", "minLength": 1},
+        "parameters": {"$ref": "#/$defs/integerMap"}
+      }
+    },
+    "runtimePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpp_type", "policy_id", "status", "performance_claim_allowed", "parameters"],
+      "properties": {
+        "cpp_type": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9]*$"},
+        "policy_id": {"type": "string", "minLength": 1},
+        "status": {"enum": ["stable", "experimental", "experimental-fallback"]},
+        "performance_claim_allowed": {"type": "boolean"},
+        "parameters": {"$ref": "#/$defs/integerMap"}
+      }
+    },
+    "skuProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sku_id", "device_ids", "build_target", "effective_policy"],
+      "properties": {
+        "sku_id": {"type": "string", "minLength": 1},
+        "device_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^0x[0-9A-F]{4}$"}
+        },
+        "build_target": {"enum": ["bmg-g21", "bmg-g31"]},
+        "effective_policy": {"enum": ["b580", "b60", "b70", "generic-bmg"]},
+        "functional_evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["level", "scope", "performance_claim"],
+          "properties": {
+            "level": {"const": "image_passed"},
+            "scope": {"type": "string", "minLength": 1},
+            "performance_claim": {"const": false}
+          }
+        }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpp_type", "overrides"],
+      "properties": {
+        "cpp_type": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9]*$"},
+        "overrides": {"$ref": "#/$defs/integerMap"}
+      }
+    }
+  }
+}

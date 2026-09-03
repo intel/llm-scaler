@@ -180,6 +180,7 @@ def sdp_minimax_h3_vae_d64(
             "CUTE MiniMax H3 VideoVAE D64 kernel is unavailable "
             "in this sidecar"
         )
+    _prepare_bmg_policy_dispatch(q)
     return torch.ops.cute_fmha.sdp_minimax_h3_vae_d64(q, k, v)
 
 
@@ -246,6 +247,7 @@ def sol_attn(
         ops, "forward_cute_with_controls"
     ):
         raise RuntimeError("packaged Sol-Attn is unavailable in this sidecar")
+    _prepare_bmg_policy_dispatch(q)
     sink_blocks = (0, 0) if sink_blocks is None else sink_blocks
     sink_q = (0, 0) if sink_q is None else sink_q
     if len(sink_blocks) != 2 or len(sink_q) != 2:

@@ -24,8 +24,9 @@ enum class BmgSku : uint8_t {
 
 enum class BmgKernelProfile : uint8_t {
     generic_bmg = 0,
-    b60 = 1,
-    b70 = 2,
+    b580 = 1,
+    b60 = 2,
+    b70 = 3,
 };
 
 // Development-only B580 candidate axes. Fields that form one legal template
@@ -87,6 +88,8 @@ constexpr std::string_view bmg_sku_name(BmgSku sku) {
 
 constexpr BmgKernelProfile bmg_kernel_profile(BmgSku sku) {
     switch (sku) {
+        case BmgSku::b580:
+            return BmgKernelProfile::b580;
         case BmgSku::b60:
             return BmgKernelProfile::b60;
         case BmgSku::b70:
@@ -98,6 +101,8 @@ constexpr BmgKernelProfile bmg_kernel_profile(BmgSku sku) {
 
 constexpr std::string_view bmg_kernel_profile_name(BmgKernelProfile profile) {
     switch (profile) {
+        case BmgKernelProfile::b580:
+            return "b580";
         case BmgKernelProfile::b60:
             return "b60";
         case BmgKernelProfile::b70:
