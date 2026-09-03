@@ -86,6 +86,13 @@ and generic-BMG profiles and selects from the exact runtime PCI Device ID:
 | `0xE223` | `b70` |
 | other BMG ID | `generic-bmg` (the shipped B70-compatible defaults) |
 
+Each OS-specific BMG CUTE sidecar uses the same fat-target contract. It
+contains the compiler's explicit `bmg-g21` image used by B580 and B60, the
+explicit `bmg-g31` image used by B70, and the compiler-provided generic IR
+fallback. Runtime Device ID dispatch still selects the concrete kernel policy.
+The presence of an image is a build property, not a physical-SKU correctness
+or performance claim.
+
 Use `omni_xpu_kernel.device.info(index)` to inspect the detected ID, selected
 physical/effective SKU, profile, debug-override state, performance-claim
 eligibility, concrete policy values, and the exact compiled values of all 23
@@ -158,13 +165,13 @@ be installed on PTL-H.
 
 - Python 3.9 or newer development environment
 - Intel oneAPI DPC++/C++ Compiler (`icpx`)
-- A packaging-supported PyTorch XPU minor: 2.10.x, 2.11.x, 2.12.x, or 2.13.x
+- PyTorch XPU 2.13.x for the current validated build
 - `onednn==2026.0.0` and `onednn-devel==2026.0.0` (oneDNN 3.11.2) for the
   package's direct oneDNN calls on Linux
-- A matched oneAPI oneDNN 3.9.1 development installation on Windows; the
-  build vendors its `dnnl.dll` and redistribution notices into the wheel
+- A matched oneAPI 2026.0 oneDNN 3.11.2 development installation on Windows.
+  The build vendors its `dnnl.dll` and redistribution notices into the wheel.
 - Intel [`sycl-tla`](https://github.com/intel/sycl-tla) headers for the
-  default Linux CUTE build
+  default Linux CUTE build or explicit experimental Windows BMG CUTE build
 
 Torch and oneDNN are intentionally not listed as isolated build dependencies.
 Install the target runtime first, then build with `--no-build-isolation` so the
@@ -231,6 +238,12 @@ must not be mistaken for the default image artifact.
 For Windows build and installation details, see
 [`WHL_BUILD_INSTALL.md`](WHL_BUILD_INSTALL.md).
 
+Windows wheels remain core-only by default even when a sycl-tla checkout is
+present. Set both `CUTLASS_SYCL_ROOT=<clean-sycl-tla-v0.8-checkout>` and
+`OMNI_XPU_REQUIRE_CUTE=1` to include the experimental BMG CUTE `.pyd`. Runtime
+routing is a separate opt-in: ComfyUI continues to use PyTorch SDPA unless
+`OMNI_ATTN_BACKEND=cute` is set before launch.
+
 ### oneDNN consistency
 
 The native extensions call oneDNN directly. The Linux `2026.0.0` pin belongs to
@@ -242,10 +255,10 @@ Torch minor. A new Torch minor is accepted only after rebuilding and testing
 that complete combination.
 
 Torch 2.13 pins its Intel runtime packages to 2026.0.0. oneDNN 2026.0.0 is the
-matching Linux package: later 2026.0.x oneDNN wheels require 2026.1 runtimes
-and cannot satisfy this exact Torch environment. The separately maintained
-Windows build remains on its validated oneDNN 3.9.1 development/runtime
-contract.
+matching package release: later 2026.0.x oneDNN wheels require 2026.1 runtimes
+and cannot satisfy this exact Torch environment. The Windows Torch 2.13 build
+uses the matching oneAPI 2026.0 oneDNN 3.11.2 headers, import library, and
+runtime.
 
 For a non-pip development installation, set both variables to the same oneDNN
 installation:
@@ -525,12 +538,16 @@ specific. Do not treat a number from one target as validation for another.
 
 ## Native layout
 
-The Linux build produces three extension components:
+The default Linux build produces three extension components:
 
 - `_C.so`: main AOT extension for normalization, quantization, GGUF, SVDQuant,
   rotary, and oneDNN-backed operations;
 - `lgrf_sdp.so`: target-specific ESIMD attention sidecar;
 - `cute_fmha_torch.so`: target-specific CUTLASS-SYCL attention sidecar.
+
+The default Windows build contains `_C.pyd` and `lgrf_sdp.pyd`. An explicitly
+enabled BMG CUTE build adds `cute_fmha_torch.pyd`, including the packaged
+Sol-Attn operators; it does not enable either runtime route automatically.
 
 `setup.py` derives one architecture macro from `OMNI_XPU_DEVICE` so wheel
 metadata, core AOT ISA, and sidecars identify the same target. BMG core and

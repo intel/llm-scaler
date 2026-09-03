@@ -34,7 +34,18 @@ def summaries(tensor, operation):
     )
 
 
-def reference(q, k, v, scale, tau, sink_blocks, sink_q):
+def reference(
+    q,
+    k,
+    v,
+    scale,
+    tau,
+    sink_blocks,
+    sink_q,
+    tail=True,
+    topk_ratio=0.0,
+    key_bias=None,
+):
     batch, tokens, heads, dim = q.shape
     blocks = (tokens + 63) // 64
     q_centroids = summaries(q, "mean").float()
@@ -56,7 +67,28 @@ def reference(q, k, v, scale, tau, sink_blocks, sink_q):
     route_scores = torch.einsum(
         "bhqd,bhkd->bhqk", q_centroids, k_centroids.float()
     ) * log2_scale
-    routes = route_scores > thresholds.unsqueeze(-1)
+    if topk_ratio:
+        ranked = route_scores.clone()
+        ranked[..., sink_blocks[0] : sink_blocks[1]] = float("-inf")
+        sink_count = max(
+            0,
+            min(sink_blocks[1], blocks) - min(sink_blocks[0], blocks),
+        )
+        selectable = blocks - sink_count
+        topk_count = max(
+            0,
+            min(
+                selectable - 1,
+                max(1, round(topk_ratio * selectable)),
+            ),
+        )
+        if topk_count:
+            row_threshold = ranked.topk(topk_count, dim=-1).values[..., -1:]
+            routes = ranked >= row_threshold
+        else:
+            routes = torch.zeros_like(ranked, dtype=torch.bool)
+    else:
+        routes = route_scores > thresholds.unsqueeze(-1)
     block_ids = torch.arange(blocks, device=q.device)
     routes |= (
         (block_ids[:, None] - block_ids[None, :]).abs()[None, None] <= 1
@@ -96,7 +128,27 @@ def reference(q, k, v, scale, tau, sink_blocks, sink_q):
                             / (stop - start)
                         )
                 scaled = [item * scale for item in scores]
-                maximum = max(item.max() for item in scaled)
+                if key_bias is not None:
+                    for key_block in range(blocks):
+                        if routes[
+                            batch_index, head, query_block, key_block
+                        ]:
+                            start = key_block * 64
+                            stop = min(tokens, start + 64)
+                            scaled[key_block] += key_bias[
+                                batch_index, start:stop
+                            ].float()
+                maximum = max(
+                    item.max()
+                    for key_block, item in enumerate(scaled)
+                    if tail
+                    or routes[
+                        batch_index, head, query_block, key_block
+                    ]
+                )
+                if torch.isneginf(maximum):
+                    output[batch_index, query_token, head] = 0
+                    continue
                 numerator = torch.zeros(dim, device=q.device)
                 denominator = torch.zeros((), device=q.device)
                 for key_block, (score, value) in enumerate(
@@ -108,7 +160,7 @@ def reference(q, k, v, scale, tau, sink_blocks, sink_q):
                     ]:
                         numerator += probability @ value
                         denominator += probability.sum()
-                    else:
+                    elif tail:
                         start = key_block * 64
                         length = min(tokens, start + 64) - start
                         numerator += probability * value[0] * length
@@ -117,6 +169,36 @@ def reference(q, k, v, scale, tau, sink_blocks, sink_q):
                     numerator / denominator
                 ).to(q.dtype)
     return output
+
+
+@pytest.mark.skipif(
+    not has_bmg_sol_attn(), reason="BMG packaged Sol-Attn unavailable"
+)
+def test_sol_attn_legacy_raw_ops_remain_callable():
+    from omni_xpu_kernel import cute
+
+    generator = torch.Generator(device="xpu").manual_seed(17)
+    shape = (1, 129, 1, 128)
+    q = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    k = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    v = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    scale = 128**-0.5
+    ops = torch.ops.omni_xpu_sol_attn
+    prepared = ops.prepare(q, k, v, scale, 1.0, 0, 0, 0, 0)
+
+    assert len(prepared) == 5
+    expected = cute.sol_attn(q, k, v, scale=scale)
+    for op_name in (
+        "forward_cute",
+        "forward_cute_parent",
+        "forward_cute_serial_route_parent",
+    ):
+        if not hasattr(ops, op_name):
+            continue
+        actual = getattr(ops, op_name)(q, k, v, *prepared, scale)
+        torch.xpu.synchronize()
+        torch.testing.assert_close(actual, expected, rtol=5e-2, atol=5e-2)
+        assert torch.isfinite(actual).all()
 
 
 @pytest.mark.skipif(
@@ -172,3 +254,167 @@ def test_sol_attn_accepts_h3_qkv_stride_and_zero_adversarial():
     torch.xpu.synchronize()
     torch.testing.assert_close(actual, torch.zeros_like(actual), rtol=0, atol=0)
     assert actual.stride() == (tokens * 2 * 128, 2 * 128, 128, 1)
+
+
+@pytest.mark.skipif(
+    not has_bmg_sol_attn(), reason="BMG packaged Sol-Attn unavailable"
+)
+def test_sol_attn_tail_false_matches_routed_only_reference():
+    from omni_xpu_kernel import cute
+
+    generator = torch.Generator(device="xpu").manual_seed(5)
+    shape = (1, 257, 1, 128)
+    q = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    k = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    v = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    scale = 128**-0.5
+    actual = cute.sol_attn(q, k, v, scale=scale, tau=100.0, tail=False)
+    expected = reference(
+        q, k, v, scale, 100.0, (0, 0), (0, 0), tail=False
+    )
+    torch.xpu.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=5e-2, atol=5e-2)
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.skipif(
+    not has_bmg_sol_attn(), reason="BMG packaged Sol-Attn unavailable"
+)
+@pytest.mark.parametrize(
+    "tokens,topk_ratio,sink_blocks,seed",
+    [
+        (320, 0.4, (0, 0), 6),
+        (320, 0.5, (0, 4), 7),
+        (512, 0.25, (0, 0), 8),
+    ],
+)
+def test_sol_attn_topk_no_tail_matches_reference(
+    tokens, topk_ratio, sink_blocks, seed
+):
+    from omni_xpu_kernel import cute
+
+    generator = torch.Generator(device="xpu").manual_seed(seed)
+    shape = (1, tokens, 1, 128)
+    q = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    k = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    v = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    scale = 128**-0.5
+    actual = cute.sol_attn(
+        q,
+        k,
+        v,
+        scale=scale,
+        topk_ratio=topk_ratio,
+        tail=False,
+        sink_blocks=sink_blocks,
+    )
+    expected = reference(
+        q,
+        k,
+        v,
+        scale,
+        1.0,
+        sink_blocks,
+        (0, 0),
+        tail=False,
+        topk_ratio=topk_ratio,
+    )
+    torch.xpu.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=5e-2, atol=5e-2)
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.skipif(
+    not has_bmg_sol_attn(), reason="BMG packaged Sol-Attn unavailable"
+)
+@pytest.mark.parametrize("bias_kind", ["float", "bool"])
+def test_sol_attn_key_bias_matches_reference_at_zero_qk_scale(bias_kind):
+    from omni_xpu_kernel import cute
+
+    generator = torch.Generator(device="xpu").manual_seed(11)
+    shape = (1, 65, 1, 128)
+    q = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    k = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    v = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    if bias_kind == "bool":
+        key_bias = torch.ones(65, device="xpu", dtype=torch.bool)
+        key_bias[::3] = False
+        reference_bias = torch.where(key_bias, 0.0, float("-inf")).view(1, -1)
+    else:
+        key_bias = torch.linspace(-2.0, 2.0, 65, device="xpu")
+        reference_bias = key_bias.view(1, -1)
+    actual = cute.sol_attn(
+        q,
+        k,
+        v,
+        scale=0.0,
+        sink_q=(0, 2),
+        key_bias=key_bias,
+        tail=False,
+    )
+    expected = reference(
+        q,
+        k,
+        v,
+        0.0,
+        1.0,
+        (0, 0),
+        (0, 2),
+        tail=False,
+        key_bias=reference_bias,
+    )
+    torch.xpu.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=5e-2, atol=5e-2)
+    assert torch.isfinite(actual).all()
+
+
+@pytest.mark.skipif(
+    not has_bmg_sol_attn(), reason="BMG packaged Sol-Attn unavailable"
+)
+@pytest.mark.parametrize("bias_kind", ["bool", "float"])
+@pytest.mark.parametrize("tail", [False, True])
+@pytest.mark.parametrize("tokens", [65, 257])
+def test_sol_attn_fully_masked_key_bias_is_finite(
+    bias_kind, tail, tokens
+):
+    from omni_xpu_kernel import cute
+
+    generator = torch.Generator(device="xpu").manual_seed(12)
+    shape = (1, tokens, 1, 128)
+    q = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    k = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    v = torch.randn(shape, generator=generator, device="xpu").bfloat16()
+    if bias_kind == "bool":
+        key_bias = torch.zeros(tokens, device="xpu", dtype=torch.bool)
+        reference_bias = torch.full(
+            (1, tokens), float("-inf"), device="xpu"
+        )
+    else:
+        key_bias = torch.full((1, tokens), float("-inf"), device="xpu")
+        reference_bias = key_bias
+    scale = 128**-0.5
+    actual = cute.sol_attn(
+        q,
+        k,
+        v,
+        scale=scale,
+        tau=100.0,
+        key_bias=key_bias,
+        tail=tail,
+    )
+    expected = reference(
+        q,
+        k,
+        v,
+        scale,
+        100.0,
+        (0, 0),
+        (0, 0),
+        tail=tail,
+        key_bias=reference_bias,
+    )
+    torch.xpu.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=5e-2, atol=5e-2)
+    assert torch.isfinite(actual).all()
+    if not tail:
+        torch.testing.assert_close(actual, torch.zeros_like(actual))

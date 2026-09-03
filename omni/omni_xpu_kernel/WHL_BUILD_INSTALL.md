@@ -1,602 +1,439 @@
 # omni_xpu_kernel Windows WHL 构建与 Portable 安装
 
-本文记录 `omni_xpu_kernel` 在 Windows x64 上的独立构建、wheel
-检查、ComfyUI Portable 安装和验收流程。
-
-当前已实际验证的组合是：
+本文只描述当前 Windows 构建合同：
 
 ```text
-Python 3.13.12
-PyTorch 2.12.0+xpu
-Intel oneAPI DPC++/C++ Compiler 2025.3.3
-oneDNN 3.9.1 native API/runtime（由 Windows wheel 内置）
+Python 3.13.14
+PyTorch 2.13.0+xpu
+Intel oneAPI DPC++/C++ Compiler 2026.0
+oneDNN 3.11.2 / package release 2026.0.0
 Intel Arc Pro B70 / intel_gpu_bmg_g31
 OMNI_XPU_DEVICE=bmg
 Windows wheel tag: cp313-cp313-win_amd64
-llm-scaler source: b9b0c4c900f1a1ef3ec987fe6be5aef26b22e3c8
+omni-xpu-kernel: 0.2.0b2+torch213.bmg
 ```
 
-本文不把 ComfyUI Portable 当作编译环境。编译环境位于项目目录内，
-Portable 只用于最终安装和运行测试，避免修改其他项目的 Python 环境。
-
 > [!IMPORTANT]
-> Torch、Python ABI 和 GPU AOT 目标都属于 wheel 身份的一部分。不同
-> Python ABI、Torch minor 或 GPU 架构必须分别构建，不能通过重命名 wheel
-> 互换。Torch 2.13 尚未包含在本文的已验证范围内。
+> Python ABI、Torch minor、oneDNN ABI 和 GPU AOT target 都属于 wheel
+> 身份。目标 Portable 必须保留上面的 Torch XPU 组合；不得通过调整 Torch
+> 版本、重命名 wheel 或跨 GPU target 安装来复用其他构建产物。
 
-## 1. 已验证版本矩阵
+Portable 只用于安装和运行。原生扩展应在独立、可复用的项目构建环境中完成，
+以便后续继续构建 Kitchen、AIMDO 和 kernel。
 
-### 1.1 系统工具链
+## 1. 当前依赖
 
-| 组件 | 已验证版本 | 说明与获取地址 |
-|---|---:|---|
-| Windows | Windows 11 Pro x64，`10.0.26200` | Windows 10/11 x64；这里记录的是本次验证主机，而不是硬性最低版本 |
-| Intel Arc Pro 驱动 | `32.0.101.8515` | 本机验证版本，不代表硬性最低版本；从 [Intel Arc Pro Windows 驱动页](https://www.intel.com/content/www/us/en/download/741626/intel-arc-pro-graphics-windows.html) 获取当前驱动 |
-| Visual Studio Build Tools 2022 | `17.14.36` | 安装 `Desktop development with C++`；参见 [Microsoft C++ Build Tools 安装文档](https://learn.microsoft.com/en-us/cpp/overview/acquire-msvc) |
-| MSVC v143 x64/x86 | `14.42.34433`，`cl 19.42.34444` | 本次构建显式使用 `-vcvars_ver=14.42`；工作负载组件见 [Microsoft Build Tools component IDs](https://learn.microsoft.com/en-us/visualstudio/install/workload-component-id-vs-build-tools) |
-| Intel oneAPI DPC++/C++ Compiler | `2025.3.3`，build `20260319` | [编译器下载页](https://www.intel.com/content/www/us/en/developer/tools/oneapi/dpc-compiler-download.html)；[2025 release notes](https://www.intel.com/content/www/us/en/developer/articles/release-notes/oneapi-dpcpp/2025.html) |
-| Intel oneAPI oneDNN development install | `2025.3` | 必须包含 oneDNN `3.9.1` 的头文件、`dnnl.lib`、`dnnl.dll` 和 redistribution notices；可随 [Intel oneAPI Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/oneapi-toolkit.html) 安装 |
-| Windows SDK NuGet package | `10.0.26100.3916` | NuGet 包内头文件版本为 `10.0.26100.0`；仅在系统没有 Windows SDK/UCRT 时需要项目内 fallback |
+| 组件 | 当前要求 |
+|---|---|
+| Windows | Windows 10/11 x64 |
+| GPU | Intel Arc Pro B70，AOT target `bmg` |
+| Visual Studio | Build Tools 2022，Desktop development with C++ |
+| Windows SDK | Visual Studio 提供的 Windows 10/11 SDK，或第 4 节的项目内 fallback |
+| Intel compiler | oneAPI DPC++/C++ Compiler 2026.0 |
+| oneDNN development files | oneAPI oneDNN 2026.0，native ABI 3.11.2 |
+| Python | 3.13.14 |
+| Torch | `2.13.0+xpu` |
+| sycl-tla | `2fc09973bfdf15755090fcb0e3b6ad236408a992` |
 
-本次使用的三个 Windows SDK NuGet 包：
+Torch 2.13 Windows 构建必须使用 matched oneDNN 3.11.2 headers、
+`dnnl.lib` 和 `dnnl.dll`。`setup.py` 会检查 header/runtime ABI，并把
+`dnnl.dll`、许可证和第三方 notices 放入 wheel。
 
-- [Microsoft.Windows.SDK.CPP 10.0.26100.3916](https://www.nuget.org/packages/Microsoft.Windows.SDK.CPP/10.0.26100.3916)
-- [Microsoft.Windows.SDK.CPP.x64 10.0.26100.3916](https://www.nuget.org/packages/Microsoft.Windows.SDK.CPP.x64/10.0.26100.3916)
-- [Microsoft.Windows.SDK.BuildTools 10.0.26100.3916](https://www.nuget.org/packages/Microsoft.Windows.SDK.BuildTools/10.0.26100.3916)
+## 2. Windows wheel 组成
 
-如果 Visual Studio 已经安装 Windows 10/11 SDK 和 Universal CRT，通常不需要
-NuGet fallback。
-
-### 1.2 独立 Python 构建环境
-
-| 包 | 精确版本 | 用途与获取地址 |
-|---|---:|---|
-| CPython | `3.13.12` | 必须与目标 Portable 的 `cp313` ABI 一致；[Python 3.13.12](https://www.python.org/downloads/release/python-31312/) |
-| uv | `0.11.21` | 仅用于在项目目录管理 Python 和 venv；[uv 0.11.21](https://pypi.org/project/uv/0.11.21/)、[安装文档](https://docs.astral.sh/uv/getting-started/installation/) |
-| pip | `26.1.2` | Python 包安装器；[PyPI](https://pypi.org/project/pip/26.1.2/) |
-| setuptools | `78.1.0` | wheel 构建后端；[PyPI](https://pypi.org/project/setuptools/78.1.0/) |
-| wheel | `0.47.0` | wheel 打包；[PyPI](https://pypi.org/project/wheel/0.47.0/) |
-| torch | `2.12.0+xpu` | 编译所针对的原生 ABI；[官方 XPU wheel index](https://download.pytorch.org/whl/xpu/torch/)、[PyTorch Intel GPU 指南](https://docs.pytorch.org/docs/stable/notes/get_start_xpu.html) |
-| numpy | `2.5.1` | 测试环境数值依赖；[PyPI](https://pypi.org/project/numpy/2.5.1/) |
-| pytest | `9.1.1` | 可选，运行源码测试；[PyPI](https://pypi.org/project/pytest/9.1.1/) |
-
-当前验证到的 Windows `onednn==2025.3.0`/`onednn-devel==2025.3.0`
-安装只包含 metadata、文档或许可证，不提供构建所需的 `dnnl.lib` 和运行时
-`dnnl.dll`。构建仍然需要同一个 oneAPI oneDNN development install 中的
-`oneapi/dnnl/dnnl.hpp`、`dnnl.lib` 和 `dnnl.dll`。`setup.py` 会校验三者对应
-oneDNN `3.9.1`，并把 DLL 和 redistribution notices 打进 Windows wheel。
-
-Torch XPU 在本次解析出的关键原生传递依赖如下。通常不应逐项手工安装，
-而应让 `torch==2.12.0+xpu` 解析它们：
-
-| 包 | 已验证版本 | 获取地址 |
-|---|---:|---|
-| dpcpp-cpp-rt | `2025.3.2` | [PyPI](https://pypi.org/project/dpcpp-cpp-rt/2025.3.2/) |
-| intel-sycl-rt | `2025.3.2` | [PyPI](https://pypi.org/project/intel-sycl-rt/2025.3.2/) |
-| intel-opencl-rt | `2025.3.2` | [PyPI](https://pypi.org/project/intel-opencl-rt/2025.3.2/) |
-| intel-openmp | `2025.3.2` | [PyPI](https://pypi.org/project/intel-openmp/2025.3.2/) |
-| intel-cmplr-lib-rt | `2025.3.2` | [PyPI](https://pypi.org/project/intel-cmplr-lib-rt/2025.3.2/) |
-| intel-cmplr-lib-ur | `2025.3.2` | [PyPI](https://pypi.org/project/intel-cmplr-lib-ur/2025.3.2/) |
-| intel-cmplr-lic-rt | `2025.3.2` | [PyPI](https://pypi.org/project/intel-cmplr-lic-rt/2025.3.2/) |
-| intel-pti | `0.16.0` | [PyPI](https://pypi.org/project/intel-pti/0.16.0/) |
-| mkl | `2025.3.1` | [PyPI](https://pypi.org/project/mkl/2025.3.1/) |
-| tbb | `2022.3.1` | [PyPI](https://pypi.org/project/tbb/2022.3.1/) |
-| tcmlib | `1.4.1` | [PyPI](https://pypi.org/project/tcmlib/1.4.1/) |
-| umf | `1.0.3` | [PyPI](https://pypi.org/project/umf/1.0.3/) |
-| triton-xpu | `3.7.1` | [PyTorch XPU index](https://download.pytorch.org/whl/xpu/triton-xpu/) |
-
-### 1.3 已验证的 ComfyUI Portable 运行环境
-
-| 包 | 精确版本 |
-|---|---:|
-| Python | `3.13.12` |
-| torch | `2.12.0+xpu` |
-| torchvision | `0.27.0+xpu` |
-| torchaudio | `2.11.0+xpu` |
-| onednn | `2025.3.0`（旧环境残留；新 Windows wheel 不依赖该包） |
-| omni-xpu-kernel | `0.1.0b9.dev1+torch212.bmg` |
-| comfy-kitchen | `0.2.26`，Intel XPU fork commit [`f7250fa4...`](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/f7250fa44cb6f593969ba869be803e7d03c80ec8) |
-| ComfyUI | `0.30.0`，commit [`b1693ecb...`](https://github.com/Comfy-Org/ComfyUI/commit/b1693ecba9f5b65f8c80ab36b195ab963ec92413) |
-| comfyui-frontend-package | `1.47.12` |
-| comfyui-workflow-templates | `0.11.28` |
-| comfyui-embedded-docs | `0.5.9` |
-| comfy-aimdo | `0.4.11` |
-| comfyui-manager | `4.2.2` |
-
-`torchvision 0.27.0+xpu` 可从
-[PyTorch XPU torchvision index](https://download.pytorch.org/whl/xpu/torchvision/)
-获取。当前 XPU index 中 torchaudio 的可用最新版是 `2.11.0+xpu`；本次与
-Torch 2.12 的导入测试通过，但 `omni_xpu_kernel` 本身不依赖 torchvision
-或 torchaudio。
-
-完整 Omni runtime 会从 ComfyUI requirements 中省略官方 `comfy-kitchen`
-依赖，并由 Intel XPU 部署流程单独安装 fork。原因、安装和更新流程见
-[`docs/WINDOWS_PORTABLE.md`](../docs/WINDOWS_PORTABLE.md)。
-
-## 2. Windows wheel 的组成与限制
-
-Windows 构建产出两个原生扩展，并把核心扩展直接依赖的 oneDNN runtime
-及其 redistribution notices 内置到同一个 wheel：
+当前 BMG CUTE/Sol-Attn wheel 包含：
 
 ```text
 omni_xpu_kernel/_C.cp313-win_amd64.pyd
 omni_xpu_kernel/lgrf_uni/lgrf_sdp.cp313-win_amd64.pyd
+omni_xpu_kernel/cute/cute_fmha_torch.cp313-win_amd64.pyd
 omni_xpu_kernel/.libs/dnnl.dll
 omni_xpu_kernel/.libs/onednn/LICENSE
 omni_xpu_kernel/.libs/onednn/THIRD-PARTY-PROGRAMS
 omni_xpu_kernel/.libs/onednn/VERSION
 ```
 
-- `_C` 包含 norm、FP8、GGUF、SVDQ、INT8、rotary 和 oneDNN 等核心算子。
-- `lgrf_sdp` 是独立的 ESIMD SDP sidecar。
-- CUTE FMHA 当前是 Linux-only，Windows 必须设置
-  `OMNI_XPU_REQUIRE_CUTE=0`。
-- Windows ComfyUI 默认保留 PyTorch SDPA；ESIMD sidecar 仅在显式设置
-  `OMNI_ATTN_BACKEND=esimd` 时由 Custom Node 使用。
-- `OMNI_XPU_DEVICE=bmg` 会把核心扩展和 sidecar 都 AOT 编译为 BMG
-  `spir64_gen` 镜像。
-- PTL-H 必须单独使用 `OMNI_XPU_DEVICE=ptl-h` 构建，不能安装 BMG wheel。
+- `_C` 提供 norm、FP8、GGUF、SVDQ、INT8、rotary 和 oneDNN 算子。
+- `lgrf_sdp` 提供 ESIMD SDP sidecar。
+- `cute_fmha_torch` 同时导出 CUTE FMHA 和 Sol-Attn。
+- Windows 默认不构建 CUTE；当前完整 wheel 必须显式设置
+  `OMNI_XPU_REQUIRE_CUTE=1`。
+- 编译开关不会改变 ComfyUI runtime policy。运行时仍需显式设置
+  `OMNI_ATTN_BACKEND=cute`。
 
-项目当前识别 Torch XPU 2.10、2.11、2.12 和 2.13。识别某个 minor 不代表所有
-组合都已经验收；本文只对 Torch `2.12.0+xpu`、Python 3.13、BMG 作出验证
-声明。
+## 3. 准备持久构建环境
 
-## 3. 准备项目内独立构建环境
-
-以下命令在 PowerShell 中执行。先把尖括号占位符替换为
-`omni_xpu_kernel` 源码目录：
+以下 PowerShell 示例把构建环境放在仓库同级目录，避免污染 Portable，并可在
+后续构建中继续复用：
 
 ```powershell
-$kernelRoot = (Resolve-Path "<omni_xpu_kernel-source-directory>").Path
-$buildRoot = Join-Path $kernelRoot ".venv-win-py313-torch212"
+$repoRoot = (Resolve-Path "<llm-scaler-repository-root>").Path
+$kernelRoot = Join-Path $repoRoot "omni\omni_xpu_kernel"
+$workspaceRoot = Split-Path $repoRoot -Parent
+$buildRoot = Join-Path $workspaceRoot ".omni-portable-build"
+$venvRoot = Join-Path $buildRoot "venv"
+$buildPython = Join-Path $venvRoot "Scripts\python.exe"
+
 $env:UV_PYTHON_INSTALL_DIR = Join-Path $buildRoot "python"
-$env:UV_CACHE_DIR = Join-Path $buildRoot "cache"
+$env:UV_CACHE_DIR = Join-Path $buildRoot "uv-cache"
 
-Set-Location $kernelRoot
+New-Item -ItemType Directory -Force -Path $buildRoot | Out-Null
 
-uv python install 3.13.12
-uv venv --seed --python 3.13.12 (Join-Path $buildRoot "venv")
+if (-not (Test-Path $buildPython)) {
+    uv python install 3.13.14
+    uv venv --seed --python 3.13.14 $venvRoot
+}
 
-$buildPython = Join-Path $buildRoot "venv\Scripts\python.exe"
-
+& $buildPython -m pip install --upgrade pip setuptools wheel
 & $buildPython -m pip install `
-    "pip==26.1.2" `
-    "setuptools==78.1.0" `
-    "wheel==0.47.0"
-
-& $buildPython -m pip install `
-    "torch==2.12.0+xpu" `
+    "torch==2.13.0+xpu" `
     --index-url "https://download.pytorch.org/whl/xpu"
-
-& $buildPython -m pip install `
-    "numpy==2.5.1" `
-    "pytest==9.1.1"
-```
-
-检查环境，不要依赖其他 Python：
-
-```powershell
-& $buildPython -c @"
-import torch
-print("torch:", torch.__version__)
-print("torch XPU runtime:", torch.version.xpu)
-print("XPU available:", torch.xpu.is_available())
-print("devices:", [torch.xpu.get_device_name(i) for i in range(torch.xpu.device_count())])
-"@
-
+& $buildPython -m pip install pytest numpy
 & $buildPython -m pip check
 ```
 
-预期 Torch 版本为 `2.12.0+xpu`，`torch.version.xpu` 为 `20250302`。
+确认构建解释器没有引用 Portable 或其他项目环境：
 
-## 4. 没有系统 Windows SDK 时的项目内 fallback
+```powershell
+& $buildPython -c @"
+import sys
+import torch
 
-如果编译探针或正式构建报错：
+print("python:", sys.executable)
+print("torch:", torch.__version__)
+print("torch XPU runtime:", torch.version.xpu)
+print("XPU available:", torch.xpu.is_available())
 
-```text
-fatal error: 'assert.h' file not found
+assert torch.__version__ == "2.13.0+xpu"
+"@
 ```
 
-说明 MSVC/Intel 编译器环境没有取得 Windows SDK/UCRT 头文件。首选方案是
-通过 Visual Studio Installer 安装 Windows 10/11 SDK 和 Universal CRT。
-如果不希望修改系统安装，可以把已验证的 NuGet SDK 放进 `$buildRoot`。
+## 4. Windows SDK fallback
+
+如果构建报错 `assert.h`、`windows.h` 或 UCRT 头文件缺失，首选通过 Visual
+Studio Installer 添加 Windows 10/11 SDK。无法修改系统安装时，可以在
+`$buildRoot` 中准备项目内 SDK：
 
 ```powershell
 $sdkRoot = Join-Path $buildRoot "windows-sdk-nuget"
-New-Item -ItemType Directory -Force -Path $sdkRoot | Out-Null
-
+$sdkPackageVersion = "10.0.26100.3916"
 $sdkPackages = @(
     "Microsoft.Windows.SDK.CPP",
     "Microsoft.Windows.SDK.CPP.x64",
     "Microsoft.Windows.SDK.BuildTools"
 )
-$sdkPackageVersion = "10.0.26100.3916"
+
+New-Item -ItemType Directory -Force -Path $sdkRoot | Out-Null
 
 foreach ($package in $sdkPackages) {
-    $fileName = "$($package.ToLowerInvariant()).$sdkPackageVersion.nupkg"
-    $packageFile = Join-Path $sdkRoot $fileName
-    $extractDir = Join-Path $sdkRoot $package.ToLowerInvariant()
-    $downloadUrl = "https://www.nuget.org/api/v2/package/$package/$sdkPackageVersion"
-
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $packageFile
-    New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
-    tar.exe -xf $packageFile -C $extractDir
+    $archive = Join-Path $sdkRoot "$($package.ToLowerInvariant()).$sdkPackageVersion.nupkg"
+    $destination = Join-Path $sdkRoot $package.ToLowerInvariant()
+    Invoke-WebRequest `
+        -Uri "https://www.nuget.org/api/v2/package/$package/$sdkPackageVersion" `
+        -OutFile $archive
+    New-Item -ItemType Directory -Force -Path $destination | Out-Null
+    tar.exe -xf $archive -C $destination
 }
 ```
 
-本次解压后的关键目录是：
+包版本为 `10.0.26100.3916`，解压后的 SDK 文件目录为
+`10.0.26100.0`。第 5 节的构建 shell 只在系统 SDK 不完整时需要添加这些
+`INCLUDE`、`LIB` 和 `PATH`。
 
-```text
-windows-sdk-nuget\
-  microsoft.windows.sdk.cpp\c\Include\10.0.26100.0\
-    ucrt\
-    shared\
-    um\
-    winrt\
-    cppwinrt\
-  microsoft.windows.sdk.cpp.x64\c\
-    ucrt\x64\
-    um\x64\
-  microsoft.windows.sdk.buildtools\bin\10.0.26100.0\x64\
+## 5. 准备 sycl-tla
+
+使用干净 checkout，不能直接修改 sycl-tla。Windows LLP64、host scalar 和
+BMG remainder-mask 修复由 kernel build 在临时 include overlay 中应用。
+
+```powershell
+$syclTlaRoot = Join-Path $buildRoot "sycl-tla"
+$syclTlaCommit = "2fc09973bfdf15755090fcb0e3b6ad236408a992"
+
+if (-not (Test-Path (Join-Path $syclTlaRoot ".git"))) {
+    git clone --filter=blob:none --no-checkout `
+        "https://github.com/intel/sycl-tla.git" `
+        $syclTlaRoot
+}
+
+git -C $syclTlaRoot fetch --depth 1 origin $syclTlaCommit
+git -C $syclTlaRoot checkout --detach $syclTlaCommit
+
+if ((git -C $syclTlaRoot status --short)) {
+    throw "sycl-tla checkout must be clean"
+}
 ```
 
-NuGet 包版本 `10.0.26100.3916` 与包内 SDK 文件版本
-`10.0.26100.0` 不同，这是正常的。
+## 6. 构建 BMG CUTE/Sol-Attn wheel
 
-## 5. 初始化编译环境并构建 wheel
-
-建议打开普通 `cmd.exe`，显式初始化 MSVC 和 oneAPI，然后调用项目 venv
-中的 Python。下面的命令适用于本次已验证机器：
+在同一个 `cmd.exe` 中初始化 MSVC、oneAPI、oneDNN 和项目 venv。oneAPI
+`setvars.bat` 在部分 Windows 安装上不能正确调用 component `vars.bat`，
+因此下面直接设置当前 2026.0 安装布局：
 
 ```bat
 @echo off
 
-set "KERNEL_ROOT=<omni_xpu_kernel-source-directory>"
-set "BUILD_ROOT=%KERNEL_ROOT%\.venv-win-py313-torch212"
+set "REPO_ROOT=<llm-scaler-repository-root>"
+set "KERNEL_ROOT=%REPO_ROOT%\omni\omni_xpu_kernel"
+set "BUILD_ROOT=<persistent-build-root>"
 set "BUILD_PYTHON=%BUILD_ROOT%\venv\Scripts\python.exe"
+set "CUTLASS_SYCL_ROOT=%BUILD_ROOT%\sycl-tla"
 
-call "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64 -vcvars_ver=14.42
+call "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64
 if errorlevel 1 exit /b 1
 
-call "%ProgramFiles(x86)%\Intel\oneAPI\setvars.bat" --force
-if errorlevel 1 exit /b 1
+set "ONEAPI_ROOT=%ProgramFiles(x86)%\Intel\oneAPI"
+set "ONEAPI_COMPILER_ROOT=%ONEAPI_ROOT%\compiler\2026.0"
+set "DNNLROOT=%ONEAPI_ROOT%\dnnl\2026.0"
 
-set "DNNLROOT=%ProgramFiles(x86)%\Intel\oneAPI\dnnl\2025.3"
+set "PATH=%ONEAPI_COMPILER_ROOT%\bin;%ONEAPI_COMPILER_ROOT%\bin\compiler;%ONEAPI_ROOT%\ocloc\2026.0\bin;%BUILD_ROOT%\venv\Library\bin;%BUILD_ROOT%\venv\Lib\site-packages\torch\lib;%DNNLROOT%\bin;%PATH%"
+set "INCLUDE=%ONEAPI_COMPILER_ROOT%\include;%ONEAPI_COMPILER_ROOT%\include\sycl;%INCLUDE%"
+set "LIB=%ONEAPI_COMPILER_ROOT%\lib;%ONEAPI_COMPILER_ROOT%\opt\compiler\lib;%BUILD_ROOT%\venv\Lib\site-packages\torch\lib;%DNNLROOT%\lib;%LIB%"
+
 set "OMNI_XPU_DEVICE=bmg"
-set "OMNI_XPU_REQUIRE_CUTE=0"
+set "OMNI_XPU_REQUIRE_CUTE=1"
+set "MAX_JOBS=8"
 
-set "PATH=%BUILD_ROOT%\venv\Library\bin;%BUILD_ROOT%\venv\Lib\site-packages\torch\lib;%DNNLROOT%\bin;%PATH%"
-```
-
-如果使用第 4 节的项目内 Windows SDK，继续在同一个 `cmd.exe` 设置：
-
-```bat
-set "SDK_NUGET=%BUILD_ROOT%\windows-sdk-nuget"
-set "SDK_CPP=%SDK_NUGET%\microsoft.windows.sdk.cpp\c"
-set "SDK_X64=%SDK_NUGET%\microsoft.windows.sdk.cpp.x64\c"
-set "SDK_TOOLS=%SDK_NUGET%\microsoft.windows.sdk.buildtools"
-set "SDK_FILE_VERSION=10.0.26100.0"
-
-set "INCLUDE=%SDK_CPP%\Include\%SDK_FILE_VERSION%\ucrt;%SDK_CPP%\Include\%SDK_FILE_VERSION%\shared;%SDK_CPP%\Include\%SDK_FILE_VERSION%\um;%SDK_CPP%\Include\%SDK_FILE_VERSION%\winrt;%SDK_CPP%\Include\%SDK_FILE_VERSION%\cppwinrt;%INCLUDE%"
-set "LIB=%SDK_X64%\ucrt\x64;%SDK_X64%\um\x64;%LIB%"
-set "PATH=%SDK_TOOLS%\bin\%SDK_FILE_VERSION%\x64;%PATH%"
-```
-
-先检查当前 shell 确实使用预期工具链：
-
-```bat
 where cl
 where icx
-cl /Bv
-icx --version
-"%BUILD_PYTHON%" -c "import torch; print(torch.__version__, torch.version.xpu)"
+where llvm-foreach
+where ocloc
+"%BUILD_PYTHON%" -c "import torch; assert torch.__version__ == '2.13.0+xpu'; print(torch.__version__, torch.version.xpu)"
 sycl-ls --verbose
+
+cd /d "%KERNEL_ROOT%"
+if not exist "%BUILD_ROOT%\wheels\kernel-solattn" mkdir "%BUILD_ROOT%\wheels\kernel-solattn"
+
+"%BUILD_PYTHON%" -m pip wheel . ^
+  --wheel-dir "%BUILD_ROOT%\wheels\kernel-solattn" ^
+  --no-build-isolation ^
+  --no-deps
 ```
 
-在 B70 上，`sycl-ls --verbose` 应包含：
+B70 的 `sycl-ls --verbose` 应报告：
 
 ```text
 Architecture: intel_gpu_bmg_g31
 ```
 
-正式构建：
+### 6.1 下一轮 multi-SKU candidate
+
+当前开发源码把 Linux 和 Windows 的 BMG CUTE target list 统一为：
+
+```text
+-device bmg-g21,bmg-g31
+```
+
+同一个 `.pyd` 因而包含 B580/B60 使用的 G21 image、B70 使用的 G31 image，
+以及编译器保留的 generic IR，不再按操作系统选择不同默认值。这是下一轮候选
+构建合同，不是对第 7 节现有验收 wheel 的追溯描述。第 7 节的文件名、SHA256 和
+第 9 节结果仍是此前 B70/G31 产物的历史证据，不能用于证明该 fat-binary candidate。
+
+fat binary 构建成功只证明 artifact 组成；当前 Windows runtime 结论仍限于实际
+验收过的 B70。新 candidate 需要重新生成并记录 wheel SHA256，B580 还必须在物理
+设备上单独完成 correctness 和工作流 gate。
+
+如果使用第 4 节的项目内 Windows SDK，在 `pip wheel` 前添加：
 
 ```bat
-cd /d "%KERNEL_ROOT%"
-if not exist "%BUILD_ROOT%\wheelhouse\patched" mkdir "%BUILD_ROOT%\wheelhouse\patched"
+set "SDK_ROOT=%BUILD_ROOT%\windows-sdk-nuget"
+set "SDK_VERSION=10.0.26100.0"
+set "SDK_CPP=%SDK_ROOT%\microsoft.windows.sdk.cpp\c"
+set "SDK_X64=%SDK_ROOT%\microsoft.windows.sdk.cpp.x64\c"
+set "SDK_TOOLS=%SDK_ROOT%\microsoft.windows.sdk.buildtools"
 
-"%BUILD_PYTHON%" -m pip wheel . ^
-  --wheel-dir "%BUILD_ROOT%\wheelhouse\patched" ^
-  --no-build-isolation ^
-  --no-deps
+set "INCLUDE=%SDK_CPP%\Include\%SDK_VERSION%\ucrt;%SDK_CPP%\Include\%SDK_VERSION%\shared;%SDK_CPP%\Include\%SDK_VERSION%\um;%SDK_CPP%\Include\%SDK_VERSION%\winrt;%SDK_CPP%\Include\%SDK_VERSION%\cppwinrt;%INCLUDE%"
+set "LIB=%SDK_X64%\ucrt\x64;%SDK_X64%\um\x64;%LIB%"
+set "PATH=%SDK_TOOLS%\bin\%SDK_VERSION%\x64;%PATH%"
 ```
 
-`--no-build-isolation` 是必需的：构建必须读取当前 venv 中已安装的
-Torch XPU 头文件、库和版本。`--no-deps` 避免打包过程改变环境。
+`--no-build-isolation` 是必需的，构建必须读取当前 venv 中 Torch 2.13 XPU
+的 headers、libraries 和 ABI。`--no-deps` 防止构建过程改变环境。
 
-已验证输出：
-
-```text
-.venv-win-py313-torch212\wheelhouse\patched\
-  omni_xpu_kernel-0.1.0b9.dev1+torch212.bmg-cp313-cp313-win_amd64.whl
-```
-
-已验证 artifact：
-
-```text
-size:   25,185,658 bytes
-SHA256: E112C1720ACA4AF975501470A77F654656D6A4A3CF919A36A2EFBC8B1F4F0795
-```
-
-体积增加来自 wheel 内置的 oneDNN `3.9.1` Windows runtime。构建只复制与
-已校验 `dnnl.lib` 同一个安装根下的 `bin\dnnl.dll`，不会把 Torch、SYCL、
-Unified Runtime 或完整 oneAPI SDK 重复打进 wheel。
-
-该 artifact 使用与 Linux 相同的 RMSNorm、LayerNorm 和 fused Add+RMSNorm
-GS dispatch ladder；Windows SDP loader 同时解析 sidecar 导出的 D64、D128
-和 FP16 fast-path 符号。
-
-项目的 `scripts\build.bat` 可用于原地安装或开发安装，但需要发布或复制
-artifact 时，应使用上面的 `pip wheel` 命令。
-
-## 6. 检查 wheel 内容和元数据
+## 7. 检查 artifact
 
 ```powershell
-$wheelPath = Join-Path $buildRoot `
-    "wheelhouse\patched\omni_xpu_kernel-0.1.0b9.dev1+torch212.bmg-cp313-cp313-win_amd64.whl"
+$wheelRoot = Join-Path $buildRoot "wheels\kernel-solattn"
+$kernelWheel = Get-ChildItem $wheelRoot `
+    -Filter "omni_xpu_kernel-0.2.0b2+torch213.bmg-cp313-cp313-win_amd64.whl" |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
 
-& $buildPython -m zipfile -l $wheelPath
-Get-FileHash -Algorithm SHA256 -LiteralPath $wheelPath
+if (-not $kernelWheel) {
+    throw "kernel wheel not found"
+}
+
+Get-FileHash -Algorithm SHA256 -LiteralPath $kernelWheel.FullName
+& $buildPython -m zipfile -l $kernelWheel.FullName
 ```
 
-应至少看到：
+当前验收 artifact：
 
 ```text
-omni_xpu_kernel/_C.cp313-win_amd64.pyd
-omni_xpu_kernel/.libs/dnnl.dll
-omni_xpu_kernel/.libs/onednn/LICENSE
-omni_xpu_kernel/.libs/onednn/THIRD-PARTY-PROGRAMS
-omni_xpu_kernel/.libs/onednn/VERSION
-omni_xpu_kernel/lgrf_uni/lgrf_sdp.cp313-win_amd64.pyd
-omni_xpu_kernel/csrc/kitchen_rms_rope_sycl.cpp
-omni_xpu_kernel-0.1.0b9.dev1+torch212.bmg.dist-info/METADATA
+omni_xpu_kernel-0.2.0b2+torch213.bmg-cp313-cp313-win_amd64.whl
+SHA256: 054B5AD9B7AC046153446A249ADBBAED56C95F00CC82FB40C5AF595F6345183A
 ```
 
-metadata 应包含精确的 `torch==2.12.0` 要求。`onednn==2025.3.0` 只保留
-Linux x86_64 条件依赖，Windows 不再依赖不能提供 DLL 的 Python 包。
+zip listing 必须包含第 2 节列出的三个 `.pyd`、`dnnl.dll` 和 oneDNN
+redistribution notices。缺少 CUTE `.pyd` 表示构建没有实际启用
+`OMNI_XPU_REQUIRE_CUTE=1`。
 
-## 7. 安装到 ComfyUI Portable
+## 8. 安装到 Portable
 
-下面仅以本次测试 Portable 为例。安装前先关闭所有正在使用该 Portable
-Python 的 ComfyUI/Python 进程，并记录原环境：
+先关闭所有使用目标 `python_embeded` 的进程，然后验证基础包身份：
 
 ```powershell
 $portableRoot = (Resolve-Path "<ComfyUI_windows_portable-root>").Path
 $embeddedPython = Join-Path $portableRoot "python_embeded\python.exe"
 
-& $embeddedPython -m pip list
-& $embeddedPython -c "import torch; print(torch.__version__)"
+& $embeddedPython -c @"
+import torch
+import torchvision
+import torchaudio
+
+assert torch.__version__ == "2.13.0+xpu"
+assert torchvision.__version__ == "0.28.0+xpu"
+assert torchaudio.__version__ == "2.11.0+xpu"
+assert torch.xpu.is_available()
+"@
 ```
 
-如果 Portable 原来不是 Torch 2.12，先安装匹配组合：
+安装时保留 `--no-deps`：
 
 ```powershell
-& $embeddedPython -m pip install --force-reinstall `
-    --index-url "https://download.pytorch.org/whl/xpu" `
-    "torch==2.12.0+xpu" `
-    "torchvision==0.27.0+xpu"
-```
+& $embeddedPython -m pip install `
+    --force-reinstall `
+    --no-deps `
+    $kernelWheel.FullName
 
-本次 Portable 保留了可用的 `torchaudio==2.11.0+xpu`。它不是
-`omni_xpu_kernel` 的依赖；如果目标 Portable 不使用音频节点，可以不额外
-安装 torchaudio。
-
-安装 wheel；oneDNN runtime 已包含在 wheel 内：
-
-```powershell
-& $embeddedPython -m pip install --force-reinstall --no-deps $wheelPath
 & $embeddedPython -m pip check
 ```
 
-安装本地 wheel 时必须保留 `--no-deps`，避免 pip 从其他 index 替换已确认的
-Torch XPU build。预期 `pip check` 输出：
+## 9. 验收
 
-```text
-No broken requirements found.
-```
-
-如果 Torch 降级后 pip 报告 `Ignoring invalid distribution ~orch`，检查
-`python_embeded\Lib\site-packages` 是否留下旧版本的
-`~orch-*.dist-info` 临时目录。仅删除这个已经确认的临时目录，不要删除
-`torch` 或有效的 `torch-2.12.0+xpu.dist-info`。
-
-## 8. 验收
-
-所有安装后测试都应在源码目录之外运行，否则源码 checkout 可能遮蔽
-Portable 中真正安装的 wheel。
-
-### 8.1 包身份和 XPU
+所有安装态检查都应离开 kernel source checkout，避免本地源码遮蔽 Portable
+中的 wheel：
 
 ```powershell
 Set-Location $portableRoot
 
 & $embeddedPython -c @"
+from importlib import metadata
 from pathlib import Path
-import importlib.metadata as metadata
+
 import torch
 import omni_xpu_kernel as omni
+from omni_xpu_kernel import cute
 
 print("torch:", torch.__version__)
-print("torch XPU runtime:", torch.version.xpu)
-print("devices:", [torch.xpu.get_device_name(i) for i in range(torch.xpu.device_count())])
-print("package:", metadata.version("omni-xpu-kernel"))
+print("kernel:", metadata.version("omni-xpu-kernel"))
 print("module:", Path(omni.__file__).resolve())
-print("metadata target:", omni.__xpu_target__)
-print("core AOT target:", omni.core_aot_target())
-print("available:", omni.is_available())
+print("target:", omni.__xpu_target__, omni.core_aot_target())
 print("capabilities:", omni.native_capabilities())
+print("CUTE:", cute.is_available())
+print("Sol-Attn:", cute.supports_sol_attn())
 
-assert torch.__version__ == "2.12.0+xpu"
-assert torch.xpu.is_available()
+assert torch.__version__ == "2.13.0+xpu"
+assert metadata.version("omni-xpu-kernel") == "0.2.0b2+torch213.bmg"
 assert omni.__xpu_target__ == "bmg"
 assert omni.core_aot_target() == "bmg"
 assert omni.is_available()
+assert cute.is_available()
+assert cute.supports_sol_attn()
 "@
 ```
 
-### 8.2 最小原生 kernel correctness smoke
+最小 D128 CUTE correctness：
 
 ```powershell
 @'
 import torch
-from omni_xpu_kernel import norm, sdp
+from omni_xpu_kernel import cute
 
-for dtype in (torch.float16, torch.bfloat16, torch.float32):
-    x = torch.randn(8, 2048, device="xpu", dtype=dtype)
-    weight = torch.randn(2048, device="xpu", dtype=dtype)
-    actual = norm.rms_norm(weight, x, eps=1e-6)
-    x32 = x.float()
-    expected = (
-        x32
-        / torch.sqrt(torch.mean(x32 * x32, dim=-1, keepdim=True) + 1e-6)
-        * weight.float()
-    ).to(dtype)
-    tolerance = 1e-4 if dtype == torch.float32 else 1e-2
-    torch.testing.assert_close(
-        actual, expected, rtol=tolerance, atol=tolerance
-    )
+q = torch.randn(1, 256, 8, 128, device="xpu", dtype=torch.float16)
+k = torch.randn_like(q)
+v = torch.randn_like(q)
 
-for dtype in (torch.float16, torch.bfloat16):
-    q = torch.randn(1, 64, 8, 128, device="xpu", dtype=dtype)
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-    actual = sdp.sdp(q, k, v)
-    expected = torch.nn.functional.scaled_dot_product_attention(
-        q.permute(0, 2, 1, 3).contiguous(),
-        k.permute(0, 2, 1, 3).contiguous(),
-        v.permute(0, 2, 1, 3).contiguous(),
-    ).permute(0, 2, 1, 3).contiguous()
-    tolerance = 5e-2 if dtype == torch.bfloat16 else 1e-2
-    torch.testing.assert_close(
-        actual, expected, rtol=tolerance, atol=tolerance
-    )
+actual = cute.sdp(q, k, v)
+expected = torch.nn.functional.scaled_dot_product_attention(
+    q.permute(0, 2, 1, 3),
+    k.permute(0, 2, 1, 3),
+    v.permute(0, 2, 1, 3),
+).permute(0, 2, 1, 3)
 
+torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 torch.xpu.synchronize()
-print("native kernel smoke: PASS")
+print("Windows BMG CUTE D128: PASS")
 '@ | & $embeddedPython -
 ```
 
-2026-08-05 的 MiniMax H3 Windows 定点验证通过：
-
-- Kernel packaging、device dispatch 和 platform source：33 passed、3 skipped；
-- `ComfyUI-OmniXPU` attention control flow：70 passed；
-- Kitchen XPU suite：57 passed；backend suite：20 passed；
-- Kernel H3 cached RMS-RoPE：每张 B70 各 3 passed；
-- Kernel H3 INT8：每张 B70 各 2 passed；
-- Kitchen H3 RMS-RoPE、INT8 和 fullgraph：每张 B70 各 4 passed；
-- `ZE_AFFINITY_MASK=0` 和 `ZE_AFFINITY_MASK=1` 都只暴露目标 B70，
-  上述每卡 9 项定点测试全部通过；
-- MiniMax H3 INT8 safetensors 可读取，ComfyUI 模型检测得到 50 layers、
-  56 heads、head dim 128；
-- `pip check` 无 broken requirements。
-
-H3 低层 packed-QKV RMS-RoPE 测试固定 XPU 随机种子，避免 BF16 随机输入只在
-极少数元素上跨过绝对容差边界；固定后在两张 B70 上分别重复 5 次，10/10
-通过。该修改只影响测试复现性，不改变 kernel。
-
-当前 BMG core-only Windows wheel 的 standalone SDP 实机验收范围是
-`head_dim=64/128` 的 FP16、BF16。Windows 与 Linux 使用相同 sidecar
-kernel source 和参数；平台分支只负责分别通过 `GetProcAddress` 和 `dlsym`
-解析相同的五个导出符号。
-
-### 8.3 ComfyUI 启动 smoke
+源码侧当前回归入口：
 
 ```powershell
-& $embeddedPython (Join-Path $portableRoot "ComfyUI\main.py") `
-    --windows-standalone-build `
-    --disable-auto-launch `
-    --quick-test-for-ci `
-    --database-url "sqlite:///:memory:" `
-    --log-stdout `
-    --verbose INFO
+Set-Location $kernelRoot
+& $buildPython -m pytest -q `
+    tests\test_packaging.py `
+    tests\test_cute_sol_attn_api.py
 ```
 
-本次测试中该命令返回码为 `0`，ComfyUI `0.30.0` 正确识别：
+## 10. 常见错误
 
-```text
-pytorch version: 2.12.0+xpu
-Device: xpu:0 Intel(R) Arc(TM) Pro B70 Graphics
-Device: xpu:1 Intel(R) Arc(TM) Pro B70 Graphics
-```
+### 找不到 oneDNN 3.11.2
 
-启动日志还应显示 `comfy-kitchen 0.2.26`、六个 MiniMax H3 workflow 模板、
-`Using pytorch attention`，以及 `ComfyUI-OmniXPU` 成功导入。本文的 quick
-test 证明 Portable 基础启动、设备发现和 H3 集成可加载；正式发布仍应使用
-目标模型和 workflow 完成端到端验收。
-
-## 9. 常见错误
-
-### `assert.h` 或 Windows/UCRT 头文件缺失
-
-安装 Visual Studio 的 Windows SDK/UCRT，或使用第 4 节的项目内 NuGet SDK，
-并确认 `INCLUDE` 和 `LIB` 是在同一个已初始化的构建 shell 中设置的。
-
-### Torch 头文件出现 `min`/`max` 宏冲突
-
-当前 Windows build 已定义 `NOMINMAX` 和 `WIN32_LEAN_AND_MEAN`。旧 checkout
-缺少这些定义时，会在 Torch 模板头文件中出现看似无关的语法错误。
-
-### 找不到 oneDNN headers 或 `dnnl.lib`
-
-确认：
+确认 `DNNLROOT` 指向完整 oneAPI oneDNN 2026.0 安装：
 
 ```bat
-set "DNNLROOT=%ProgramFiles(x86)%\Intel\oneAPI\dnnl\2025.3"
 dir "%DNNLROOT%\include\oneapi\dnnl\dnnl.hpp"
 dir "%DNNLROOT%\lib\dnnl.lib"
 dir "%DNNLROOT%\bin\dnnl.dll"
-dir "%DNNLROOT%\share\doc\dnnl\LICENSE"
-dir "%DNNLROOT%\share\doc\dnnl\THIRD-PARTY-PROGRAMS"
 ```
 
-不要混用不同版本的 oneDNN header、import library 和 runtime DLL。非标准
-目录布局可以同时设置 `ONEDNN_INCLUDE`、`ONEDNN_LIB`、`ONEDNN_RUNTIME`，并
-用 `ONEDNN_LICENSE_DIR` 指向包含两个 notices 的目录。
+不要混用不同安装根的 headers、import library 和 runtime DLL。自定义布局应
+同时设置 `ONEDNN_INCLUDE`、`ONEDNN_LIB`、`ONEDNN_RUNTIME` 和
+`ONEDNN_LICENSE_DIR`。
 
-### `c10::xpu::XPUStream` 等链接错误
+### `LNK1104: cannot open file 'libircmt.lib'`
 
-Windows 核心扩展必须链接 `torch_xpu.lib` 和 `c10_xpu.lib`。当前 `setup.py`
-已经包含它们；出现错误通常意味着安装的不是 XPU Torch，或 Torch
-`Lib\site-packages\torch\lib` 没有进入链接搜索路径。
+把 oneAPI compiler library 加入同一个构建 shell：
 
-### `lgrf_sdp.pyd` 找不到
+```bat
+set "LIB=%ONEAPI_COMPILER_ROOT%\lib;%ONEAPI_COMPILER_ROOT%\opt\compiler\lib;%LIB%"
+```
 
-Windows wheel 使用 ABI 后缀，例如
-`lgrf_sdp.cp313-win_amd64.pyd`。当前 loader 会扫描 `lgrf_sdp*.pyd`；
-固定查找无 ABI 后缀文件的旧 wheel/旧源码需要重新构建。
+### 找不到 `llvm-foreach.exe`、`sycl-post-link.exe` 或 `ocloc.exe`
 
-### wheel 可以安装但 import 失败
+确认 `PATH` 包含：
 
-依次检查：
+```text
+compiler\2026.0\bin
+compiler\2026.0\bin\compiler
+ocloc\2026.0\bin
+```
 
-1. Python tag 是否一致，例如目标必须能使用 `cp313`；
-2. Torch public version 是否为构建时的 `2.12.0`；
-3. wheel target 是否与设备一致，例如 B70 使用 `bmg`；
-4. `omni_xpu_kernel\.libs\dnnl.dll`、`python_embeded\Library\bin` 和
-   `torch\lib` 是否可见；
-5. 测试 cwd 是否离开源码 checkout。
+### sycl-tla overlay 校验失败
 
-## 10. Torch 2.13 后续阶段
+只使用第 5 节固定的干净 revision。overlay 是 fail-closed 的；源码内容不匹配
+时必须更新 port 或 pin，不能跳过校验继续构建。
 
-Torch 2.13 不能直接复用本文的 `torch212.bmg` wheel。原 Portable 的
-Torch 2.13 runtime 使用 2026 系列 SYCL/oneDNN，而本文已验证编译器是
-2025.3.3。下一阶段应至少：
+### CUTE `.pyd` 存在但无法加载
 
-1. 在新的项目内目录创建独立 Torch 2.13 build environment；
-2. 使用与 Torch 2.13 runtime 对齐的 2026 系列 DPC++ compiler；
-3. 明确并校验对应 oneDNN header/library/runtime 版本；
-4. 在 `_version.py` 和 packaging metadata 中增加 Torch 2.13 映射；
-5. 重新构建 `torch213.bmg` wheel；
-6. 重跑本文全部 kernel correctness 和 ComfyUI smoke。
+确认 Python tag 是 `cp313`，Torch 是 XPU build，wheel target 是 `bmg`，并且
+Portable 的 `python_embeded\Library\bin` 和
+`python_embeded\Lib\site-packages\torch\lib` 位于 `PATH`。
 
-在以上步骤完成前，不应把 Torch 2.13 标记为 Windows 已支持。
+### 测试完成后 Python 进程不退出
+
+部分 XPU 测试会在所有输出和断言完成后卡在 interpreter teardown。先确认测试
+结果已经完整打印，再终止具体 PID；不要删除被进程锁定的 `.pyd`。
+
+## 11. 当前边界
+
+- Windows CUTE/Sol-Attn 当前只验收 BMG；PTL-H 需要独立构建与验收。
+- 当前开发源码的 BMG CUTE candidate 同时携带 G21/G31 AOT image；现有 Windows
+  runtime 证据仍只有此前的 B70/G31 artifact，不能据此宣称新 candidate 或
+  Windows B580 已验收。
+- 当前 ComfyUI CUTE route 以已验证 D128 contract 为主；不支持的
+  dtype、layout、mask、head dimension 或 GQA contract 回退到 dense
+  attention。
+- CUTE 是 build-time 和 runtime 双重 opt-in。
+- Sol-Attn 还需要固定版本的 ComfyUI custom node 和
+  `SOL_ATTN_XPU_EXPERIMENTAL=1`。
