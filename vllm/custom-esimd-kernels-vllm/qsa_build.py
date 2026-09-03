@@ -11,6 +11,11 @@ QSA_ROW_STORE_RECEIPT_ABI_VERSION = 4
 QSA_ROW_STORE_PARALLEL_ABI_VERSION = 1
 QSA_PARALLEL_ROWS_PER_WG = 1
 QSA_PARALLEL_LANES = 16
+QSA_FUSION_ABI_VERSION = 1
+QSA_FUSION_PAGE_SIZE = 64
+QSA_FUSION_WORKGROUP = 1024
+QSA_FUSION_PAGE_CACHE = 0
+QSA_FUSION_Q_LOCAL_FP32 = 0
 QSA_INDEXER_POSTPROCESS_ABI_VERSION = 1
 QSA_GROUP_COMPRESSION_ABI_VERSION = 1
 QSA_SELECTION_PAGE_SIZES = (64, 128)
@@ -18,6 +23,10 @@ QSA_ATTENTION_PAGE_SIZES = (256, 512)
 QSA_DEFINES = (
     "QSA_PARALLEL_ROWS_PER_WG=1",
     "QSA_PARALLEL_LANES=16",
+    "FUSED_WG_SIZE=1024",
+    "FUSED_PAGE_CACHE=0",
+    "FUSED_PAGE_CACHE_SLOTS=64",
+    "FUSED_Q_LOCAL_FP32=0",
     "QSA_NATIVE_ACTIVATION_FP16=1",
     "QSA_NATIVE_EXACT_PACKED_CACHE=1",
     "QSA_NATIVE_KV_TILE=4",
@@ -55,6 +64,7 @@ def make_qsa_extension(
             "csrc/qsa/qsa_select_paged_tokens.sycl",
             "csrc/qsa/qsa_store_cache_rows.sycl",
             "csrc/qsa/qsa_indexer_norm_rope.sycl",
+            "csrc/qsa/qsa_q_norm_rope_select.sycl",
             "csrc/qsa/qsa_group_compression.sycl",
         ],
         include_dirs=[root / "csrc" / "qsa"],

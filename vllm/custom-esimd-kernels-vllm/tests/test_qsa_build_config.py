@@ -8,6 +8,9 @@ from qsa_build import (
     QSA_ATTENTION_PAGE_SIZES,
     QSA_DEFINES,
     QSA_EXTENSION_NAME,
+    QSA_FUSION_ABI_VERSION,
+    QSA_FUSION_PAGE_SIZE,
+    QSA_FUSION_WORKGROUP,
     QSA_GROUP_COMPRESSION_ABI_VERSION,
     QSA_INDEXER_POSTPROCESS_ABI_VERSION,
     QSA_PARALLEL_LANES,
@@ -31,6 +34,9 @@ def test_qsa_build_exposes_page_specialization_contract():
     assert QSA_ROW_STORE_PARALLEL_ABI_VERSION == 1
     assert QSA_PARALLEL_ROWS_PER_WG == 1
     assert QSA_PARALLEL_LANES == 16
+    assert QSA_FUSION_ABI_VERSION == 1
+    assert QSA_FUSION_PAGE_SIZE == 64
+    assert QSA_FUSION_WORKGROUP == 1024
     assert QSA_INDEXER_POSTPROCESS_ABI_VERSION == 1
     assert QSA_GROUP_COMPRESSION_ABI_VERSION == 1
     assert QSA_SELECTION_PAGE_SIZES == (64, 128)
@@ -41,6 +47,10 @@ def test_qsa_build_matches_validated_fp16_packed_contract():
     assert set(QSA_DEFINES) == {
         "QSA_PARALLEL_ROWS_PER_WG=1",
         "QSA_PARALLEL_LANES=16",
+        "FUSED_WG_SIZE=1024",
+        "FUSED_PAGE_CACHE=0",
+        "FUSED_PAGE_CACHE_SLOTS=64",
+        "FUSED_Q_LOCAL_FP32=0",
         "QSA_NATIVE_ACTIVATION_FP16=1",
         "QSA_NATIVE_EXACT_PACKED_CACHE=1",
         "QSA_NATIVE_KV_TILE=4",
@@ -66,11 +76,14 @@ def test_qsa_build_contains_attention_and_selection_sources():
         "csrc/qsa/qsa_select_paged_tokens.sycl",
         "csrc/qsa/qsa_store_cache_rows.sycl",
         "csrc/qsa/qsa_indexer_norm_rope.sycl",
+        "csrc/qsa/qsa_q_norm_rope_select.sycl",
         "csrc/qsa/qsa_group_compression.sycl",
     ]
     module_source = (root / "csrc/qsa/qsa_sparse_attention.sycl").read_text()
     for required in (
         "qsa_store_cache_rows_r_aware_v1",
+        "qsa_q_norm_rope_select_v1",
+        "qsa_fusion_abi_version",
         "qsa_row_store_parallel_abi_version",
         "qsa_row_store_parallel_requires_unique_slots",
     ):

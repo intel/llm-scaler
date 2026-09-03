@@ -820,6 +820,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       &qsa::indexer_norm_rope_v1,
       "Qwen3.8 QSA indexer Gemma norm and RoPE (XPU)");
   module.def(
+      "qsa_q_norm_rope_select_v1",
+      &qsa::qsa_q_norm_rope_select_v1,
+      "Qwen3.8 QSA fused Q norm, RoPE and selection (XPU)");
+  module.def(
       "qsa_group_compress_v1",
       &qsa::group_compress_v1,
       "Qwen3.8 QSA decode group compression (XPU)");
@@ -834,6 +838,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.attr("row_store_receipt_invalid_status") = 1;
   module.attr("row_store_receipt_async_completion_required") = 1;
   module.attr("qsa_indexer_postprocess_abi_version") = 1;
+  module.attr("qsa_fusion_abi_version") = 1;
+  module.attr("qsa_fusion_head_dim") = 128;
+  module.attr("qsa_fusion_rotary_dim") = 64;
+  module.attr("qsa_fusion_mrope_interleaved") = 1;
+  module.attr("qsa_fusion_gemma_weight_plus_one") = 1;
+  module.attr("qsa_fusion_fp32_rms") = 1;
+  module.attr("qsa_fusion_page_size") = 64;
+  module.attr("qsa_fusion_output_width") = 2051;
+  module.attr("qsa_fusion_launches") = 1;
+  module.attr("qsa_fusion_workgroup") = FUSED_WG_SIZE;
+  module.attr("qsa_fusion_page_cache") = FUSED_PAGE_CACHE;
+  module.attr("qsa_fusion_page_cache_slots") = FUSED_PAGE_CACHE_SLOTS;
+  module.attr("qsa_fusion_q_local_fp32") = FUSED_Q_LOCAL_FP32;
   module.attr("qsa_group_compression_abi_version") = 1;
   module.attr("qsa_group_compression_ratio") = 4;
   module.attr("qsa_group_compression_head_dim") = 128;
