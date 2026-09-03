@@ -11,6 +11,7 @@ from omni_xpu_kernel import cute
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOL_CONFIG = PROJECT_ROOT / "omni_xpu_kernel/cute/sol_attn_config.h"
+SOL_MAINLOOP = PROJECT_ROOT / "omni_xpu_kernel/cute/sol_attn_mainloop.hpp"
 SOL_PREPARE = PROJECT_ROOT / "omni_xpu_kernel/cute/sol_attn_prepare.cpp"
 SOL_WRAPPER = PROJECT_ROOT / "omni_xpu_kernel/cute/sol_attn_torch.cpp"
 
@@ -322,3 +323,21 @@ def test_sol_attn_b580_tile_policy_requires_unforced_physical_device():
     assert wrapper.count("if (use_b580_tile_policy(q))") == 3
     assert "SolConfiguredTilePolicy" in wrapper
     assert "SolB580TilePolicy" in wrapper
+
+
+def test_sol_attn_default_contract_selects_compile_time_no_controls_mainloop():
+    mainloop = "".join(SOL_MAINLOOP.read_text(encoding="utf-8").split())
+    wrapper = "".join(SOL_WRAPPER.read_text(encoding="utf-8").split())
+
+    assert "boolControlAware=true" in mainloop
+    assert "ifconstexpr(ControlAware)" in mainloop
+    assert "ifconstexpr(!ControlAware)" in mainloop
+    assert (
+        "constboolhas_controls=key_bias.numel()!=0||block_len.numel()!=0||"
+        "!tail||route_inclusive;"
+    ) in wrapper
+    assert "ParentTag,true>(" in wrapper
+    assert "ParentTag,false>(" in wrapper
+    assert (
+        "key_bias.numel()==0&&block_len.numel()==0&&tail&&!route_inclusive"
+    ) in wrapper

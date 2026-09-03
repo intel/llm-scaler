@@ -223,7 +223,8 @@ template <
     bool ParallelSharedRoute =
         (SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE != 0),
     bool CrossQueryRouteColumns =
-        (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0)>
+        (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0),
+    bool ControlAware = true>
 struct SolKernel {
   static constexpr int QTile = TilePolicy::QTile;
   static constexpr int KvTile = 64;
@@ -285,7 +286,8 @@ struct SolKernel {
       DenseMainloop,
       CacheableExactKV,
       ParallelSharedRoute,
-      CrossQueryRouteColumns>;
+      CrossQueryRouteColumns,
+      ControlAware>;
   using CollectiveEpilogue = cutlass::fmha::collective::FMHAFwdEpilogue<
       CollectiveMainloop, ShapeOutput, TensorO, void>;
   using ProblemShape = cutlass::fmha::kernel::FMHAProblemShape<false>;
@@ -314,7 +316,8 @@ template <
     bool CacheableExactKV,
     bool ParallelSharedRoute,
     bool CrossQueryRouteColumns,
-    bool ParentTag = false>
+    bool ParentTag = false,
+    bool ControlAware = true>
 void run(
     const at::Tensor& q,
     const at::Tensor& k,
@@ -340,8 +343,16 @@ void run(
       TilePolicy,
       CacheableExactKV,
       ParallelSharedRoute,
-      CrossQueryRouteColumns>;
+      CrossQueryRouteColumns,
+      ControlAware>;
   using K = typename KT::Kernel;
+
+  if constexpr (!ControlAware) {
+    TORCH_INTERNAL_ASSERT(
+        key_bias.numel() == 0 && block_len.numel() == 0 && tail &&
+        !route_inclusive,
+        "Sol-Attn no-controls mainloop requires the legacy/default contract");
+  }
 
   const int B = checked_int(q.size(0), "batch");
   const int T = checked_int(q.size(1), "sequence length");
@@ -531,25 +542,52 @@ at::Tensor forward_cute_impl(
               "Sol-Attn route contract mismatch");
 #endif
   auto output = at::empty(q.sizes(), q.options());
-  run<
-      cutlass::bfloat16_t,
-      TilePolicy,
-      CacheableExactKV,
-      ParallelSharedRoute,
-      CrossQueryRouteColumns,
-      ParentTag>(
-      q, k, v, k_centroids, v_means,
+  const bool has_controls =
+      key_bias.numel() != 0 || block_len.numel() != 0 || !tail ||
+      route_inclusive;
+  if (has_controls) {
+    run<
+        cutlass::bfloat16_t,
+        TilePolicy,
+        CacheableExactKV,
+        ParallelSharedRoute,
+        CrossQueryRouteColumns,
+        ParentTag,
+        true>(
+        q, k, v, k_centroids, v_means,
 #if SOL_ATTN_INLINE_ROUTE
-      q_centroids, thresholds, key_sinks, topk_routes,
+        q_centroids, thresholds, key_sinks, topk_routes,
 #else
-      routes,
+        routes,
 #endif
-      key_bias,
-      block_len,
-      output,
-      static_cast<float>(scale_value),
-      tail,
-      route_inclusive);
+        key_bias,
+        block_len,
+        output,
+        static_cast<float>(scale_value),
+        tail,
+        route_inclusive);
+  } else {
+    run<
+        cutlass::bfloat16_t,
+        TilePolicy,
+        CacheableExactKV,
+        ParallelSharedRoute,
+        CrossQueryRouteColumns,
+        ParentTag,
+        false>(
+        q, k, v, k_centroids, v_means,
+#if SOL_ATTN_INLINE_ROUTE
+        q_centroids, thresholds, key_sinks, topk_routes,
+#else
+        routes,
+#endif
+        key_bias,
+        block_len,
+        output,
+        static_cast<float>(scale_value),
+        tail,
+        route_inclusive);
+  }
   return output;
 }
 

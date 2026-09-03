@@ -521,7 +521,8 @@ template <
     bool ParallelSharedRoute =
         (SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE != 0),
     bool CrossQueryRouteColumns =
-        (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0)>
+        (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0),
+    bool ControlAware = true>
 struct SolFwdMainloop : DenseMainloop {
   using Base = DenseMainloop;
   using TiledMMAQK = typename Base::TiledMMAQK;
@@ -777,12 +778,16 @@ struct SolFwdMainloop : DenseMainloop {
     const int summary_offset = batch_head * sol_params.blocks * 128;
     auto block_length_of = [&](int block) {
       const int physical_length = cute::min(64, seq_len - block * 64);
-      if (sol_params.block_lengths == nullptr) {
+      if constexpr (!ControlAware) {
         return physical_length;
+      } else {
+        if (sol_params.block_lengths == nullptr) {
+          return physical_length;
+        }
+        return cute::min(
+            physical_length,
+            cute::max(1, sol_params.block_lengths[block]));
       }
-      return cute::min(
-          physical_length,
-          cute::max(1, sol_params.block_lengths[block]));
     };
 
     auto summary_k = make_tensor(
@@ -1014,10 +1019,12 @@ struct SolFwdMainloop : DenseMainloop {
       if (key_sinks[key_block] != 0 || distance <= 1) {
         return true;
       }
-      if (sol_params.route_inclusive) {
-        return sol_params.topk_routes[
-            (batch_head * sol_params.blocks + query_block) *
-                sol_params.blocks + key_block] != 0;
+      if constexpr (ControlAware) {
+        if (sol_params.route_inclusive) {
+          return sol_params.topk_routes[
+              (batch_head * sol_params.blocks + query_block) *
+                  sol_params.blocks + key_block] != 0;
+        }
       }
       const int lane = static_cast<int>(sg.get_local_linear_id());
       float partial = 0.0f;
@@ -1067,26 +1074,28 @@ struct SolFwdMainloop : DenseMainloop {
     };
 #if SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS
     auto route_columns_for_key = [&](int key_block) {
-      if (sol_params.route_inclusive) {
-        uint8_t columns = 0;
-        CUTLASS_PRAGMA_UNROLL
-        for (int query_slot = 0;
-             query_slot < kQueryBlocksPerWorkgroup;
-             ++query_slot) {
-          const int route_query_block = cute::min(
-              get<0>(blk_qv) * kQueryBlocksPerWorkgroup + query_slot,
-              sol_params.blocks - 1);
-          const int distance = route_query_block > key_block
-              ? route_query_block - key_block
-              : key_block - route_query_block;
-          if (key_sinks[key_block] != 0 || distance <= 1 ||
-              sol_params.topk_routes[
-                  (batch_head * sol_params.blocks + route_query_block) *
-                      sol_params.blocks + key_block] != 0) {
-            columns |= uint8_t(1) << query_slot;
+      if constexpr (ControlAware) {
+        if (sol_params.route_inclusive) {
+          uint8_t columns = 0;
+          CUTLASS_PRAGMA_UNROLL
+          for (int query_slot = 0;
+               query_slot < kQueryBlocksPerWorkgroup;
+               ++query_slot) {
+            const int route_query_block = cute::min(
+                get<0>(blk_qv) * kQueryBlocksPerWorkgroup + query_slot,
+                sol_params.blocks - 1);
+            const int distance = route_query_block > key_block
+                ? route_query_block - key_block
+                : key_block - route_query_block;
+            if (key_sinks[key_block] != 0 || distance <= 1 ||
+                sol_params.topk_routes[
+                    (batch_head * sol_params.blocks + route_query_block) *
+                        sol_params.blocks + key_block] != 0) {
+              columns |= uint8_t(1) << query_slot;
+            }
           }
+          return columns;
         }
-        return columns;
       }
       const int lane = static_cast<int>(sg.get_local_linear_id());
       std::array<float, kQueryBlocksPerWorkgroup> partial{};
@@ -1214,13 +1223,20 @@ struct SolFwdMainloop : DenseMainloop {
             ElementS(sycl::log2(static_cast<float>(tail_block_length)));
       }
 #endif
+      auto exact_key_is_masked = [&](int key) {
+        if constexpr (ControlAware) {
+          return sol_params.block_lengths != nullptr &&
+              key % 64 >= block_length_of(key / 64);
+        } else {
+          return false;
+        }
+      };
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tSrS.size(); ++i) {
         const int key = get<1>(score_coords(i));
         if (key >= key_extent) {
           tSrS(i) = ElementS(-INFINITY);
-        } else if (!approximate && sol_params.block_lengths != nullptr &&
-                   key % 64 >= block_length_of(key / 64)) {
+        } else if (!approximate && exact_key_is_masked(key)) {
           tSrS(i) = ElementS(-INFINITY);
 #if SOL_ATTN_INLINE_ROUTE
         } else if (approximate &&
@@ -1234,20 +1250,31 @@ struct SolFwdMainloop : DenseMainloop {
           // per-key log-bias even when the caller deliberately sets the QK
           // scale to zero.
           tSrS(i) *= sol_params.scale;
-          if (!approximate && sol_params.key_bias != nullptr) {
-            tSrS(i) += ElementS(
-                sol_params.key_bias[
-                    static_cast<int64_t>(l_coord) * seq_len + key]);
-          } else if (approximate) {
+          if constexpr (ControlAware) {
+            if (!approximate && sol_params.key_bias != nullptr) {
+              tSrS(i) += ElementS(
+                  sol_params.key_bias[
+                      static_cast<int64_t>(l_coord) * seq_len + key]);
+            } else if (approximate) {
 #if SOL_ATTN_HOIST_APPROXIMATE_LOG2
-            if (sol_params.block_lengths == nullptr) {
-              tSrS(i) += key == sol_params.blocks - 1
-                  ? tail_block_log2_bias
-                  : full_block_log2_bias;
-            } else {
+              if (sol_params.block_lengths == nullptr) {
+                tSrS(i) += key == sol_params.blocks - 1
+                    ? tail_block_log2_bias
+                    : full_block_log2_bias;
+              } else {
+                tSrS(i) += ElementS(
+                    sycl::log2(static_cast<float>(block_length_of(key))));
+              }
+#else
               tSrS(i) += ElementS(
                   sycl::log2(static_cast<float>(block_length_of(key))));
+#endif
             }
+          } else if (approximate) {
+#if SOL_ATTN_HOIST_APPROXIMATE_LOG2
+            tSrS(i) += key == sol_params.blocks - 1
+                ? tail_block_log2_bias
+                : full_block_log2_bias;
 #else
             tSrS(i) += ElementS(
                 sycl::log2(static_cast<float>(block_length_of(key))));
@@ -1503,7 +1530,13 @@ struct SolFwdMainloop : DenseMainloop {
         }
       }
 #endif
-      if (sol_params.tail && has_approximate) {
+      if constexpr (ControlAware) {
+        if (sol_params.tail && has_approximate) {
+          process_tile(
+              copy_k_summary, copy_v_summary, tKgK_summary, tVgV_summary,
+              tile, true, route_mask, begin);
+        }
+      } else if (has_approximate) {
         process_tile(
             copy_k_summary, copy_v_summary, tKgK_summary, tVgV_summary,
             tile, true, route_mask, begin);

@@ -139,7 +139,7 @@ def test_unforced_physical_b580_uses_local_sol_and_rms_rope(tmp_path):
     assert result == {
         "effective_sku": "b580",
         "forced": False,
-        "kernel_profile": "generic-bmg",
+        "kernel_profile": "b580",
         "physical_sku": "b580",
         "rms_b580": True,
         "sol_q_tile": 128,
