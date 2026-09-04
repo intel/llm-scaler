@@ -65,6 +65,25 @@ at::Tensor group_compress_v1(
     int64_t compressed_capacity,
     bool historical_ring_proven);
 
+// Stream-ordered group compression for one or more query rows.  Unlike v1,
+// v2 derives each row's raw-versus-ring sources from query_start_loc and
+// accepts [M,1,128] inputs.  The caller still owns both output tensors.
+at::Tensor group_compress_v2(
+    const at::Tensor& raw_keys,
+    const at::Tensor& raw_positions,
+    const at::Tensor& compressor_state_cache,
+    const at::Tensor& rope_position_cache,
+    const at::Tensor& compressor_state_block_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& logical_positions,
+    const at::Tensor& compressed_slots,
+    at::Tensor pooled,
+    at::Tensor first_positions,
+    int64_t compress_ratio,
+    int64_t compressed_capacity,
+    bool historical_ring_proven);
+
 at::Tensor indexer_norm_rope_v1(
     const at::Tensor& input,
     at::Tensor output,

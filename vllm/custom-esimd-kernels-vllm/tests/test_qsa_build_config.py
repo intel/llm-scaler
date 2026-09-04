@@ -38,7 +38,7 @@ def test_qsa_build_exposes_page_specialization_contract():
     assert QSA_FUSION_PAGE_SIZE == 64
     assert QSA_FUSION_WORKGROUP == 1024
     assert QSA_INDEXER_POSTPROCESS_ABI_VERSION == 1
-    assert QSA_GROUP_COMPRESSION_ABI_VERSION == 1
+    assert QSA_GROUP_COMPRESSION_ABI_VERSION == 2
     assert QSA_SELECTION_PAGE_SIZES == (64, 128)
     assert QSA_ATTENTION_PAGE_SIZES == (256, 512)
 
@@ -131,6 +131,7 @@ def test_qsa_group_compression_source_has_fixed_decode_contract():
 
     for required in (
         "group_compress_v1",
+        "group_compress_v2",
         "historical_ring_proven",
         "kCompressionRatio = 4",
         "kHeadDim = 128",
@@ -142,6 +143,13 @@ def test_qsa_group_compression_source_has_fixed_decode_contract():
         "max_uint / key_element_size",
     ):
         assert required in source
+    module_source = (root / "csrc/qsa/qsa_sparse_attention.sycl").read_text()
+    for required in (
+        "qsa_group_compression_v1_abi_version",
+        "qsa_group_compression_v2_m_rows",
+        "qsa_group_compression_v2_async_stream_ordered",
+    ):
+        assert required in module_source
     for forbidden in (
         "at::empty",
         "at::zeros",

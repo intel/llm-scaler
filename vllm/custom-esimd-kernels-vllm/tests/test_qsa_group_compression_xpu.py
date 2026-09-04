@@ -1,4 +1,4 @@
-"""Single-device parity and preflight checks for QSA compression ABI1."""
+"""Single-device parity and preflight checks for QSA compression ABI1/ABI2."""
 
 from __future__ import annotations
 
@@ -139,6 +139,114 @@ def test_qsa_group_compress_v1_matches_ring_reference(qsa_ops, dtype):
     assert pages == 16
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_qsa_group_compress_v2_supports_m1(qsa_ops, dtype):
+    case = _make_case(dtype)
+    returned = qsa_ops.qsa_group_compress_v2(*case, 4, 16, True)
+    torch.xpu.synchronize()
+
+    expected = (
+        case[2][1, 0, 0].float()
+        + case[2][1, 1, 0].float()
+        + case[2][1, 2, 0].float()
+        + case[0][0, 0].float()
+    ) / 4.0
+    torch.testing.assert_close(
+        case[9].float(), expected.reshape(1, 1, 128), atol=2e-2, rtol=2e-2
+    )
+    assert torch.equal(case[10], case[3][1, 0, 0].reshape(1, 3))
+    assert returned.data_ptr() == case[9].data_ptr()
+
+
+def _make_m_gt1_case(dtype: torch.dtype):
+    device = torch.device("xpu")
+    pages, ring_size, rows = 2, 8, 4
+    storage = torch.empty((pages, ring_size, 1, 140), dtype=dtype, device=device)
+    cache = storage[..., :128]
+    positions = storage[..., 128:].view(torch.int64)
+    for page in range(pages):
+        for slot in range(ring_size):
+            cache[page, slot, 0].fill_(page * 100 + slot)
+            positions[page, slot, 0] = torch.tensor(
+                [page * 1000 + slot, page * 1000 + slot + 10, page * 1000 + slot + 20],
+                dtype=torch.int64,
+                device=device,
+            )
+    raw = torch.empty((rows, 1, 128), dtype=dtype, device=device)
+    raw_positions = torch.empty((rows, 1, 3), dtype=torch.int64, device=device)
+    for row in range(rows):
+        raw[row, 0].fill_(10 + row)
+        raw_positions[row, 0] = torch.tensor(
+            [100 + row, 200 + row, 300 + row],
+            dtype=torch.int64,
+            device=device,
+        )
+    block_table = torch.tensor([[0], [1]], dtype=torch.int32, device=device)
+    token_to_req = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32, device=device)
+    logical_positions = torch.tensor([10, 11, 20, 21], dtype=torch.int64, device=device)
+    compressed_slots = torch.arange(rows, dtype=torch.int64, device=device)
+    pooled = torch.full((rows, 1, 128), -99, dtype=dtype, device=device)
+    first_positions = torch.full((rows, 3), -99, dtype=torch.int64, device=device)
+    return (
+        raw,
+        raw_positions,
+        cache,
+        positions,
+        block_table,
+        token_to_req,
+        query_start_loc,
+        logical_positions,
+        compressed_slots,
+        pooled,
+        first_positions,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_qsa_group_compress_v2_supports_m_gt1_raw_and_ring(qsa_ops, dtype):
+    case = _make_m_gt1_case(dtype)
+    returned = qsa_ops.qsa_group_compress_v2(*case, 4, 16, True)
+    torch.xpu.synchronize()
+
+    raw, _, cache, positions = case[:4]
+    expected = torch.stack(
+        [
+            cache[0, 7, 0].float()
+            + cache[0, 0, 0].float()
+            + cache[0, 1, 0].float()
+            + raw[0, 0].float(),
+            cache[0, 0, 0].float()
+            + cache[0, 1, 0].float()
+            + raw[0, 0].float()
+            + raw[1, 0].float(),
+            cache[1, 1, 0].float()
+            + cache[1, 2, 0].float()
+            + cache[1, 3, 0].float()
+            + raw[2, 0].float(),
+            cache[1, 2, 0].float()
+            + cache[1, 3, 0].float()
+            + raw[2, 0].float()
+            + raw[3, 0].float(),
+        ],
+        dim=0,
+    ) / 4.0
+    expected_positions = torch.stack(
+        [
+            positions[0, 7, 0],
+            positions[0, 0, 0],
+            positions[1, 1, 0],
+            positions[1, 2, 0],
+        ],
+        dim=0,
+    )
+    torch.testing.assert_close(
+        case[9].float(), expected.reshape(4, 1, 128), atol=2e-2, rtol=2e-2
+    )
+    assert torch.equal(case[10], expected_positions)
+    assert returned.data_ptr() == case[9].data_ptr()
+
+
 def test_qsa_group_compress_v1_invalid_block_matches_partial_fallback(qsa_ops):
     case = list(_make_case(torch.float16))
     case[4].fill_(-1)
@@ -181,3 +289,157 @@ def test_qsa_group_compress_v1_rejects_dlpack_physical_overlap(qsa_ops):
     case[9] = pooled_alias
     with pytest.raises(RuntimeError, match="outputs must not overlap"):
         qsa_ops.qsa_group_compress_v1(*case, 4, 16, True)
+
+
+def test_qsa_group_compress_v2_supports_m1_after_empty_request(qsa_ops):
+    case = list(_make_case(torch.float16))
+    case[4] = torch.tensor([[0], [1]], dtype=torch.int32, device="xpu")
+    case[5] = torch.tensor([1], dtype=torch.int32, device="xpu")
+    case[6] = torch.tensor([0, 0, 1], dtype=torch.int32, device="xpu")
+    returned = qsa_ops.qsa_group_compress_v2(*case, 4, 16, True)
+    expected = (
+        case[2][1, 0, 0].float()
+        + case[2][1, 1, 0].float()
+        + case[2][1, 2, 0].float()
+        + case[0][0, 0].float()
+    ) / 4.0
+    torch.xpu.synchronize()
+    torch.testing.assert_close(
+        case[9].float(), expected.reshape(1, 1, 128), atol=2e-2, rtol=2e-2
+    )
+    assert torch.equal(case[10], case[3][1, 0, 0].reshape(1, 3))
+    assert returned.data_ptr() == case[9].data_ptr()
+
+
+def test_qsa_group_compress_v2_uses_nonidentity_block_table(qsa_ops):
+    case = list(_make_m_gt1_case(torch.float16))
+    case[4] = torch.tensor([[1], [0]], dtype=torch.int32, device="xpu")
+    returned = qsa_ops.qsa_group_compress_v2(*case, 4, 16, True)
+    raw, _, cache, positions = case[:4]
+    expected = torch.stack(
+        [
+            cache[1, 7, 0].float()
+            + cache[1, 0, 0].float()
+            + cache[1, 1, 0].float()
+            + raw[0, 0].float(),
+            cache[1, 0, 0].float()
+            + cache[1, 1, 0].float()
+            + raw[0, 0].float()
+            + raw[1, 0].float(),
+            cache[0, 1, 0].float()
+            + cache[0, 2, 0].float()
+            + cache[0, 3, 0].float()
+            + raw[2, 0].float(),
+            cache[0, 2, 0].float()
+            + cache[0, 3, 0].float()
+            + raw[2, 0].float()
+            + raw[3, 0].float(),
+        ],
+        dim=0,
+    ) / 4.0
+    expected_positions = torch.stack(
+        [positions[1, 7, 0], positions[1, 0, 0], positions[0, 1, 0], positions[0, 2, 0]],
+        dim=0,
+    )
+    torch.xpu.synchronize()
+    torch.testing.assert_close(
+        case[9].float(), expected.reshape(4, 1, 128), atol=2e-2, rtol=2e-2
+    )
+    assert torch.equal(case[10], expected_positions)
+    assert returned.data_ptr() == case[9].data_ptr()
+
+
+def _make_raw_first_case(dtype: torch.dtype):
+    device = torch.device("xpu")
+    pages, ring_size, rows = 3, 8, 4
+    storage = torch.empty((pages, ring_size, 1, 140), dtype=dtype, device=device)
+    cache = storage[..., :128]
+    positions = storage[..., 128:].view(torch.int64)
+    for page in range(pages):
+        for slot in range(ring_size):
+            cache[page, slot, 0].fill_(page * 1000 + slot * 10)
+            positions[page, slot, 0] = torch.tensor(
+                [page * 100 + slot, page * 100 + slot + 1, page * 100 + slot + 2],
+                dtype=torch.int64,
+                device=device,
+            )
+    raw = torch.stack(
+        [torch.full((1, 128), float(row + 1), dtype=dtype, device=device) for row in range(rows)],
+        dim=0,
+    )
+    raw_positions = torch.tensor(
+        [[[400, 401, 402]], [[500, 501, 502]], [[600, 601, 602]], [[700, 701, 702]]],
+        dtype=torch.int64,
+        device=device,
+    )
+    block_table = torch.tensor([[2]], dtype=torch.int32, device=device)
+    token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, rows], dtype=torch.int32, device=device)
+    logical_positions = torch.arange(4, 8, dtype=torch.int64, device=device)
+    compressed_slots = torch.tensor([-1, -1, -1, 0], dtype=torch.int64, device=device)
+    pooled = torch.full((rows, 1, 128), -99, dtype=dtype, device=device)
+    first_positions = torch.full((rows, 3), -99, dtype=torch.int64, device=device)
+    return (raw, raw_positions, cache, positions, block_table, token_to_req,
+            query_start_loc, logical_positions, compressed_slots, pooled, first_positions)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_qsa_group_compress_v2_raw_first_and_boundary_slots(qsa_ops, dtype):
+    case = _make_raw_first_case(dtype)
+    returned = qsa_ops.qsa_group_compress_v2(*case, 4, 24, True)
+    torch.xpu.synchronize()
+    expected = sum(case[0][row, 0].float() for row in range(4)) / 4.0
+    torch.testing.assert_close(
+        case[9][3].float(), expected.reshape(1, 128), atol=2e-2, rtol=2e-2
+    )
+    assert torch.equal(case[10][3], case[1][0, 0])
+    assert torch.count_nonzero(case[9][:3]) == 0
+    assert torch.count_nonzero(case[10][:3]) == 0
+    assert returned.data_ptr() == case[9].data_ptr()
+
+
+def test_qsa_group_compress_v2_same_stream_enqueue_without_intermediate_sync(qsa_ops):
+    case = _make_case(torch.float16)
+    returned = qsa_ops.qsa_group_compress_v2(*case, 4, 16, True)
+    # This consumer is enqueued before the only explicit synchronize below.
+    checksum = case[9].float().sum() + case[10].float().sum()
+    torch.xpu.synchronize()
+    assert returned.data_ptr() == case[9].data_ptr()
+    assert bool(torch.isfinite(checksum).cpu())
+
+
+def test_qsa_group_compress_v2_rejects_unproven_history(qsa_ops):
+    case = _make_case(torch.float16)
+    with pytest.raises(RuntimeError, match="historical ring proof"):
+        qsa_ops.qsa_group_compress_v2(*case, 4, 16, False)
+
+
+def test_qsa_group_compress_v2_rejects_wrong_raw_shape(qsa_ops):
+    case = list(_make_case(torch.float16))
+    case[0] = case[0].expand(2, 2, 128).contiguous()
+    case[1] = case[1].expand(2, 1, 3).contiguous()
+    with pytest.raises(RuntimeError, match=r"raw_keys must have shape \[M,1,128\]"):
+        qsa_ops.qsa_group_compress_v2(*case, 4, 16, True)
+
+
+def test_qsa_group_compress_v2_rejects_output_alias(qsa_ops):
+    case = list(_make_case(torch.float16))
+    case[9] = case[2][0, 0].view(1, 1, 128)
+    with pytest.raises(RuntimeError, match="cache must not alias"):
+        qsa_ops.qsa_group_compress_v2(*case, 4, 16, True)
+
+
+def test_qsa_group_compress_v2_supports_zero_rows(qsa_ops):
+    case = list(_make_case(torch.float16))
+    device = torch.device("xpu")
+    case[0] = torch.empty((0, 1, 128), dtype=torch.float16, device=device)
+    case[1] = torch.empty((0, 1, 3), dtype=torch.int64, device=device)
+    case[5] = torch.empty((0,), dtype=torch.int32, device=device)
+    case[6] = torch.tensor([0, 0], dtype=torch.int32, device=device)
+    case[7] = torch.empty((0,), dtype=torch.int64, device=device)
+    case[8] = torch.empty((0,), dtype=torch.int64, device=device)
+    case[9] = torch.empty((0, 1, 128), dtype=torch.float16, device=device)
+    case[10] = torch.empty((0, 3), dtype=torch.int64, device=device)
+    returned = qsa_ops.qsa_group_compress_v2(*case, 4, 16, True)
+    assert returned.data_ptr() == case[9].data_ptr()
+    assert returned.numel() == 0

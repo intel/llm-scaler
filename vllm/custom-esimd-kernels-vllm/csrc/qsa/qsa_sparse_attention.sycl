@@ -827,6 +827,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       "qsa_group_compress_v1",
       &qsa::group_compress_v1,
       "Qwen3.8 QSA decode group compression (XPU)");
+  module.def(
+      "qsa_group_compress_v2",
+      &qsa::group_compress_v2,
+      "Qwen3.8 QSA stream-ordered M-row group compression (XPU)");
   module.attr("qsa_abi_version") = 2;
   module.attr("qsa_row_store_abi_version") = 3;
   module.attr("qsa_row_store_receipt_abi_version") = 4;
@@ -851,7 +855,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.attr("qsa_fusion_page_cache") = FUSED_PAGE_CACHE;
   module.attr("qsa_fusion_page_cache_slots") = FUSED_PAGE_CACHE_SLOTS;
   module.attr("qsa_fusion_q_local_fp32") = FUSED_Q_LOCAL_FP32;
-  module.attr("qsa_group_compression_abi_version") = 1;
+  module.attr("qsa_group_compression_abi_version") = 2;
+  module.attr("qsa_group_compression_v1_abi_version") = 1;
+  module.attr("qsa_group_compression_v2_m_rows") = 1;
+  module.attr("qsa_group_compression_v2_async_stream_ordered") = 1;
   module.attr("qsa_group_compression_ratio") = 4;
   module.attr("qsa_group_compression_head_dim") = 128;
   module.attr("qsa_group_compression_fp16") = 1;
