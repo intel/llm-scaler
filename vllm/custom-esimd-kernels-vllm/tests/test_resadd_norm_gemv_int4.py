@@ -5,6 +5,7 @@ import ctypes
 import os
 
 from custom_esimd_kernels_vllm import (
+    esimd_gemv_int4,
     esimd_resadd_norm_gemv_int4_pert,
     esimd_resadd_norm_gemv_fp8_pert,
 )
@@ -131,6 +132,32 @@ def test_resadd_norm_gemv_zero_hidden(N, K):
     # residual should be 0 + residual = unchanged
     diff = (residual.cpu().float() - residual_orig.cpu().float()).abs().max().item()
     assert diff < 0.01, f"Residual changed with zero hidden: max diff={diff}"
+
+
+def test_resadd_norm_gemv_router_uses_consistent_normalized_input():
+    """All router work-groups must consume the same normalized input."""
+    torch.manual_seed(671)
+    n, k = 4096, 2048
+    eps = 1e-6
+
+    hidden = torch.randn(1, k, dtype=torch.float16, device=DEVICE)
+    residual = torch.randn(1, k, dtype=torch.float16, device=DEVICE)
+    norm_weight = torch.randn(k, dtype=torch.float16, device=DEVICE) * 0.1 + 1.0
+    weight_fp16 = torch.randn(n, k, dtype=torch.float16)
+    qw, sc = cpu_quantize(weight_fp16)
+    qw = qw.to(DEVICE)
+    sc = sc.to(DEVICE)
+
+    output = torch.empty(1, n, dtype=torch.float16, device=DEVICE)
+    expected = torch.empty_like(output)
+    normed_out = torch.empty_like(hidden)
+    esimd_resadd_norm_gemv_int4_pert(
+        hidden, residual, norm_weight, qw, sc, output, normed_out, eps
+    )
+    esimd_gemv_int4(normed_out, qw.view(torch.uint8), sc, expected)
+    torch.xpu.synchronize()
+
+    torch.testing.assert_close(output, expected, rtol=2e-3, atol=2e-2)
 
 
 @pytest.mark.parametrize("N,K", [
