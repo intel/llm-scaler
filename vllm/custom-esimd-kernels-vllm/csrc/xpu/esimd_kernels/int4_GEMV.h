@@ -265,9 +265,9 @@ struct GEMV_int4_kernel {
 // ============================================================================
 
 inline void GEMV_int4_host(
-    uint8_t* input_data,
-    uint8_t* weight_data,
-    uint8_t* scale_data,
+    const uint8_t* input_data,
+    const uint8_t* weight_data,
+    const uint8_t* scale_data,
     uint8_t* output_data,
     uint32_t N,
     uint32_t K,
