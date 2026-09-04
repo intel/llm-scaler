@@ -169,18 +169,12 @@ class TestRMSNormCorrectness:
 
     @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
     @pytest.mark.parametrize("rows", [17, 129])
-    def test_rms_norm_modulate_b580_is_bit_exact(self, rows):
-        """Validate the physical-B580 H3 packed AdaLN view contract."""
-        from omni_xpu_kernel import device, norm
+    def test_rms_norm_segmented_modulation_is_bit_exact(self, rows):
+        """Validate the H3 packed AdaLN view contract selected by policy."""
+        from omni_xpu_kernel import norm
 
-        if not norm.supports_rms_norm_modulate_b580():
-            pytest.skip("loaded binary does not contain the B580 H3 route")
-        observed = device.info(torch.xpu.current_device())
-        if (
-            observed.get("physical_bmg_sku") != "b580"
-            or observed.get("sku_forced") is not False
-        ):
-            pytest.skip("an unforced physical B580 is required")
+        if not norm.supports_rms_norm_segmented_modulation():
+            pytest.skip("loaded binary does not contain the segmented route")
 
         generator = torch.Generator(device="xpu").manual_seed(5376 + rows)
         value = torch.randn(
@@ -190,6 +184,8 @@ class TestRMSNormCorrectness:
             dtype=torch.bfloat16,
             generator=generator,
         )
+        if not norm.rms_norm_segmented_modulation_supported(value):
+            pytest.skip("native device policy did not select the route")
         weight = torch.randn(
             5376,
             device="xpu",
@@ -209,7 +205,7 @@ class TestRMSNormCorrectness:
         expected = norm.rms_norm(weight, value, eps=1e-6)
         for start, stop, row in segments:
             expected[start:stop].mul_(1.0 + scale[row]).add_(shift[row])
-        actual = norm.rms_norm_modulate_b580(
+        actual = norm.rms_norm_segmented_modulation(
             weight, value, scale, shift, segments, eps=1e-6
         )
 

@@ -42,11 +42,27 @@ def supports_group_norm_seedvr_bmg() -> bool:
     )
 
 
-def supports_rms_norm_modulate_b580() -> bool:
-    """Return whether the native binary contains the B580 H3 fused route."""
+def supports_rms_norm_segmented_modulation() -> bool:
+    """Return whether the native binary contains segmented RMS modulation."""
     return bool(
-        getattr(_get_native(), "__rms_norm_modulate_b580__", False)
+        getattr(
+            _get_native(),
+            "__rms_norm_segmented_modulation__",
+            False,
+        )
     )
+
+
+def rms_norm_segmented_modulation_supported(input: torch.Tensor) -> bool:
+    """Return whether native policy selects the route for ``input``."""
+    if not supports_rms_norm_segmented_modulation():
+        return False
+    try:
+        return bool(
+            _get_native().rms_norm_segmented_modulation_supported(input)
+        )
+    except (RuntimeError, TypeError):
+        return False
 
 
 def group_norm_bmg(
@@ -107,7 +123,7 @@ def rms_norm(
     return _get_native().rms_norm(weight, input, eps)
 
 
-def rms_norm_modulate_b580(
+def rms_norm_segmented_modulation(
     weight: torch.Tensor,
     input: torch.Tensor,
     scale: torch.Tensor,
@@ -115,7 +131,7 @@ def rms_norm_modulate_b580(
     segments: Sequence[tuple[int, int, int]],
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Fuse the exact MiniMax H3 RMSNorm and segmented modulation on B580.
+    """Fuse RMSNorm and ordered segmented scale/shift modulation.
 
     This route preserves BF16 materialization after RMSNorm, ``1 + scale``,
     multiplication, and shift addition. ``segments`` must contain one to eight
@@ -123,8 +139,9 @@ def rms_norm_modulate_b580(
     cover the complete contiguous BF16 ``[S,5376]`` input. Scale and shift may
     be row-strided ``[modulation_rows,5376]`` views.
 
-    The native implementation independently requires an unforced physical
-    B580. Callers must retain their normal fallback for every other contract.
+    Runtime eligibility is owned by native device-policy dispatch. Callers
+    must query :func:`rms_norm_segmented_modulation_supported` and retain their
+    normal fallback for every unsupported policy or tensor contract.
     """
     starts = []
     stops = []
@@ -140,7 +157,7 @@ def rms_norm_modulate_b580(
         starts.append(start)
         stops.append(stop)
         modulation_rows.append(modulation_row)
-    return _get_native().rms_norm_modulate_b580(
+    return _get_native().rms_norm_segmented_modulation(
         weight,
         input,
         scale,
@@ -285,7 +302,8 @@ __all__ = [
     "group_norm_bmg",
     "group_norm_seedvr_bmg",
     "rms_norm",
-    "rms_norm_modulate_b580",
+    "rms_norm_segmented_modulation",
+    "rms_norm_segmented_modulation_supported",
     "rms_norm_gate_residual",
     "layer_norm",
     "fused_add_rms_norm",
@@ -294,5 +312,5 @@ __all__ = [
     "fused_rms_adaln",
     "supports_group_norm_bmg",
     "supports_group_norm_seedvr_bmg",
-    "supports_rms_norm_modulate_b580",
+    "supports_rms_norm_segmented_modulation",
 ]

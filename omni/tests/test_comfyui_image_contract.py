@@ -239,6 +239,21 @@ class ComfyUIImageContractTest(unittest.TestCase):
         self.assertNotIn("## Adapter behavior", adapter_readme)
         self.assertNotIn("## Contribution boundary", adapter_readme)
 
+    def test_llm_scaler_documentation_has_no_b580_support_claim(self):
+        repository_root = OMNI_ROOT.parent
+        documentation = tuple(
+            path
+            for suffix in ("*.md", "*.rst", "*.txt", "*.adoc")
+            for path in repository_root.rglob(suffix)
+        )
+
+        self.assertTrue(documentation)
+        forbidden = re.compile(r"(?i)b580|0xe20b|arc[ -]?b580")
+        for path in documentation:
+            with self.subTest(path=path):
+                document = path.read_text(encoding="utf-8")
+                self.assertIsNone(forbidden.search(document))
+
     def test_cache_dit_uses_the_pinned_minimax_h3_revision(self):
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
 

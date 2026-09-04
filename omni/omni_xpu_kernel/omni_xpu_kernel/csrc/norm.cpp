@@ -553,7 +553,7 @@ void rms_norm_h128_fp32_bmg_kernel(
 // scale/shift row to each ordered contiguous segment. Keep the generic H5376
 // RMSNorm reduction source-shaped: changing the SLM allocation or folding the
 // runtime block partition into constants can alter sparse BF16 output bits.
-struct H3RmsModulationB580Config {
+struct H3SegmentedRmsModulationConfig {
     static constexpr int HiddenSize = 5376;
     static constexpr int BlockSize = 64;
     static constexpr int GroupSize = 32;
@@ -562,9 +562,9 @@ struct H3RmsModulationB580Config {
 
 struct H3RmsModulationSegmentMap {
     int32_t count;
-    int64_t starts[H3RmsModulationB580Config::MaxSegments];
-    int64_t stops[H3RmsModulationB580Config::MaxSegments];
-    int64_t modulation_rows[H3RmsModulationB580Config::MaxSegments];
+    int64_t starts[H3SegmentedRmsModulationConfig::MaxSegments];
+    int64_t stops[H3SegmentedRmsModulationConfig::MaxSegments];
+    int64_t modulation_rows[H3SegmentedRmsModulationConfig::MaxSegments];
 };
 
 H3RmsModulationSegmentMap make_h3_rms_modulation_segment_map(
@@ -574,7 +574,7 @@ H3RmsModulationSegmentMap make_h3_rms_modulation_segment_map(
     const std::vector<int64_t>& stops,
     const std::vector<int64_t>& modulation_rows
 ) {
-    using Config = H3RmsModulationB580Config;
+    using Config = H3SegmentedRmsModulationConfig;
     TORCH_CHECK(
         !starts.empty() && starts.size() <= Config::MaxSegments &&
             starts.size() == stops.size() &&
@@ -609,7 +609,7 @@ inline int64_t h3_rms_modulation_row(
     int64_t result = 0;
 #pragma unroll
     for (int index = 0;
-         index < H3RmsModulationB580Config::MaxSegments;
+         index < H3SegmentedRmsModulationConfig::MaxSegments;
          ++index) {
         if (index < segments.count && input_row >= segments.starts[index] &&
             input_row < segments.stops[index]) {
@@ -619,7 +619,7 @@ inline int64_t h3_rms_modulation_row(
     return result;
 }
 
-void rms_norm_modulate_h3_b580_kernel(
+void rms_norm_segmented_modulation_kernel(
     const bf16* weight,
     const bf16* input,
     const bf16* scale,
@@ -633,7 +633,7 @@ void rms_norm_modulate_h3_b580_kernel(
     int hidden_size,
     const at::Device& device
 ) {
-    using Config = H3RmsModulationB580Config;
+    using Config = H3SegmentedRmsModulationConfig;
     const int nb = hidden_size / Config::BlockSize;
     const int sub_nb = nb / Config::GroupSize;
     const int rem_nb = nb % Config::GroupSize;
@@ -726,10 +726,20 @@ void rms_norm_modulate_h3_b580_kernel(
             });
     };
     utils::submit_kernel(
-        cgf, device, "rms_norm_modulate_h3_b580");
+        cgf, device, "rms_norm_segmented_modulation_h3");
 }
 
-torch::Tensor rms_norm_modulate_b580(
+bool rms_norm_segmented_modulation_supported(torch::Tensor input) {
+    if (!input.is_xpu()) {
+        return false;
+    }
+    auto& queue = utils::get_queue(input.device());
+    const auto selection = device::get_bmg_selection(queue);
+    return !selection.forced &&
+        selection.kernel_profile == device::BmgKernelProfile::b580;
+}
+
+torch::Tensor rms_norm_segmented_modulation(
     torch::Tensor weight,
     torch::Tensor input,
     torch::Tensor scale,
@@ -739,7 +749,7 @@ torch::Tensor rms_norm_modulate_b580(
     const std::vector<int64_t>& modulation_rows,
     double eps
 ) {
-    using Config = H3RmsModulationB580Config;
+    using Config = H3SegmentedRmsModulationConfig;
     TORCH_CHECK(
         input.is_xpu() && weight.is_xpu() && scale.is_xpu() && shift.is_xpu(),
         "weight, input, scale, and shift must be XPU tensors");
@@ -752,7 +762,7 @@ torch::Tensor rms_norm_modulate_b580(
             weight.scalar_type() == ST::BFloat16 &&
             scale.scalar_type() == ST::BFloat16 &&
             shift.scalar_type() == ST::BFloat16,
-        "B580 H3 RMS modulation requires BF16 tensors");
+        "segmented RMS modulation requires BF16 tensors");
     TORCH_CHECK(
         input.dim() == 2 && input.size(0) > 0 &&
             input.size(1) == Config::HiddenSize && input.is_contiguous(),
@@ -771,17 +781,15 @@ torch::Tensor rms_norm_modulate_b580(
         "scale and shift must be matched row-strided BF16 [mod_rows,5376] tables");
     TORCH_CHECK(
         input.size(0) <= static_cast<int64_t>(INT32_MAX),
-        "input row count exceeds the B580 H3 indexing contract");
+        "input row count exceeds the segmented RMS modulation contract");
 
-    auto& queue = utils::get_queue(input.device());
-    const auto selection = device::get_bmg_selection(queue);
     TORCH_CHECK(
-        selection.physical_sku == device::BmgSku::b580 && !selection.forced,
-        "B580 H3 RMS modulation requires an unforced physical B580");
+        rms_norm_segmented_modulation_supported(input),
+        "segmented RMS modulation is disabled by native device policy");
     const auto segment_map = make_h3_rms_modulation_segment_map(
         input.size(0), scale.size(0), starts, stops, modulation_rows);
     auto output = torch::empty_like(input);
-    rms_norm_modulate_h3_b580_kernel(
+    rms_norm_segmented_modulation_kernel(
         reinterpret_cast<const bf16*>(weight.data_ptr()),
         reinterpret_cast<const bf16*>(input.data_ptr()),
         reinterpret_cast<const bf16*>(scale.data_ptr()),

@@ -60,6 +60,23 @@ def test_norm_dispatch_ladders_are_platform_independent():
     )
 
 
+def test_segmented_rms_modulation_uses_semantic_api_and_native_policy():
+    policy_query = NORM_SOURCE.split(
+        "bool rms_norm_segmented_modulation_supported", 1
+    )[1].split("torch::Tensor rms_norm_segmented_modulation", 1)[0]
+
+    assert "selection.kernel_profile" in policy_query
+    assert "selection.physical_sku" not in policy_query
+    assert "!selection.forced" in policy_query
+    for legacy_name in (
+        "rms_norm_modulate_b580",
+        "supports_rms_norm_modulate_b580",
+        "__rms_norm_modulate_b580__",
+    ):
+        assert legacy_name not in NORM_SOURCE
+        assert legacy_name not in BINDINGS_SOURCE
+
+
 def test_windows_sdp_loader_resolves_every_exported_kernel():
     loader = SDP_SOURCE.split("std::call_once(load_once", 1)[1]
     platform_loader = loader.split("#ifdef _WIN32", 1)[1]

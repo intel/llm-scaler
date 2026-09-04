@@ -38,7 +38,8 @@ namespace gguf {
 namespace norm {
     torch::Tensor rms_norm(torch::Tensor weight, torch::Tensor input, double eps);
 #if defined(OMNI_XPU_ARCH_BMG)
-    torch::Tensor rms_norm_modulate_b580(
+    bool rms_norm_segmented_modulation_supported(torch::Tensor input);
+    torch::Tensor rms_norm_segmented_modulation(
         torch::Tensor weight, torch::Tensor input, torch::Tensor scale,
         torch::Tensor shift, const std::vector<int64_t>& starts,
         const std::vector<int64_t>& stops,
@@ -501,13 +502,18 @@ PYBIND11_MODULE(_C, m) {
         py::arg("weight"), py::arg("input"), py::arg("eps") = 1e-6);
 
 #if defined(OMNI_XPU_ARCH_BMG)
-    norm.attr("__rms_norm_modulate_b580__") = true;
+    norm.attr("__rms_norm_segmented_modulation__") = true;
     norm.attr("__group_norm_bmg__") = true;
     norm.attr("__group_norm_seedvr_bmg__") = true;
     norm.def(
-        "rms_norm_modulate_b580",
-        &omni_xpu::norm::rms_norm_modulate_b580,
-        "Physical-B580 MiniMax H3 RMSNorm plus segmented BF16 modulation",
+        "rms_norm_segmented_modulation_supported",
+        &omni_xpu::norm::rms_norm_segmented_modulation_supported,
+        "Whether native policy enables segmented RMSNorm modulation",
+        py::arg("input"));
+    norm.def(
+        "rms_norm_segmented_modulation",
+        &omni_xpu::norm::rms_norm_segmented_modulation,
+        "RMSNorm plus ordered segmented BF16 scale/shift modulation",
         py::arg("weight"), py::arg("input"), py::arg("scale"),
         py::arg("shift"), py::arg("starts"), py::arg("stops"),
         py::arg("modulation_rows"), py::arg("eps") = 1e-6);
@@ -524,7 +530,7 @@ PYBIND11_MODULE(_C, m) {
         py::arg("input"), py::arg("groups"), py::arg("weight"),
         py::arg("bias"), py::arg("eps") = 1e-6);
 #else
-    norm.attr("__rms_norm_modulate_b580__") = false;
+    norm.attr("__rms_norm_segmented_modulation__") = false;
     norm.attr("__group_norm_bmg__") = false;
     norm.attr("__group_norm_seedvr_bmg__") = false;
 #endif

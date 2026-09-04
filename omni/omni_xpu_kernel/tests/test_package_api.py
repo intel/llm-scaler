@@ -48,20 +48,28 @@ def test_norm_h120_capability_is_false_for_legacy_binary(monkeypatch):
     assert norm.supports_h120_fp16() is False
 
 
-def test_b580_h3_rms_modulation_capability_and_wrapper(monkeypatch):
+def test_segmented_rms_modulation_capability_policy_and_wrapper(monkeypatch):
     from omni_xpu_kernel import norm
 
     calls = []
+
+    def run_native(*args):
+        calls.append(args)
+        return "output"
+
     native = SimpleNamespace(
-        __rms_norm_modulate_b580__=True,
-        rms_norm_modulate_b580=lambda *args: calls.append(args) or "output",
+        __rms_norm_segmented_modulation__=True,
+        rms_norm_segmented_modulation_supported=lambda value: value == "input",
+        rms_norm_segmented_modulation=run_native,
     )
     monkeypatch.setattr(norm, "_get_native", lambda: native)
     tensors = [object() for _ in range(4)]
     segments = [(0, 3, 2), (3, 7, 0)]
 
-    assert norm.supports_rms_norm_modulate_b580() is True
-    assert norm.rms_norm_modulate_b580(
+    assert norm.supports_rms_norm_segmented_modulation() is True
+    assert norm.rms_norm_segmented_modulation_supported("input") is True
+    assert norm.rms_norm_segmented_modulation_supported("other") is False
+    assert norm.rms_norm_segmented_modulation(
         *tensors, segments, eps=1e-5
     ) == "output"
     assert calls == [
@@ -75,16 +83,32 @@ def test_b580_h3_rms_modulation_capability_and_wrapper(monkeypatch):
     ]
 
 
-def test_b580_h3_rms_modulation_rejects_non_integer_segments(monkeypatch):
+def test_segmented_rms_modulation_rejects_non_integer_segments(monkeypatch):
     from omni_xpu_kernel import norm
 
     monkeypatch.setattr(norm, "_get_native", lambda: SimpleNamespace())
     with pytest.raises(TypeError, match="Python integers"):
-        norm.rms_norm_modulate_b580(
+        norm.rms_norm_segmented_modulation(
             object(), object(), object(), object(), [(0, 7, True)]
         )
 
-    assert norm.supports_rms_norm_modulate_b580() is False
+    assert norm.supports_rms_norm_segmented_modulation() is False
+    assert norm.rms_norm_segmented_modulation_supported(object()) is False
+
+
+def test_segmented_rms_modulation_policy_query_fails_closed(monkeypatch):
+    from omni_xpu_kernel import norm
+
+    def rejected(_input):
+        raise RuntimeError("unsupported device policy")
+
+    native = SimpleNamespace(
+        __rms_norm_segmented_modulation__=True,
+        rms_norm_segmented_modulation_supported=rejected,
+    )
+    monkeypatch.setattr(norm, "_get_native", lambda: native)
+
+    assert norm.rms_norm_segmented_modulation_supported(object()) is False
 
 
 def test_layout_cat_pad_capability_comes_from_loaded_binary(monkeypatch):
