@@ -3,9 +3,10 @@
 ## llm-scaler-vllm
 
 ### Latest Release
-* [`intel/llm-scaler-vllm:0.21.0-b3.1`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.21.0-b3.1/images/sha256-032916bd9264da44cab3e99092ffaf12331072ec51c3b380cbbe5fd98eb0254b) [08/2026] 
+* [`intel/llm-scaler-vllm:0.26.0-b1`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.26.0-b1/images/sha256-70e7eafdd52c281263f2a19266086b88e55064402a17ef731ba5657c4bd86490) [09/2026] 
     
 ### Previous Releases
+* [`intel/llm-scaler-vllm:0.21.0-b3.1`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.21.0-b3.1/images/sha256-032916bd9264da44cab3e99092ffaf12331072ec51c3b380cbbe5fd98eb0254b) [08/2026] 
 * [`intel/llm-scaler-vllm:0.21.0-b3`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.21.0-b3/images/sha256-7a526dcfc49c77afeabf77e2e2a41a9a0221126580d144d2d1a15e320befb210) [08/2026] 
 * [`intel/llm-scaler-vllm:0.21.0-b2`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.21.0-b2/images/sha256-3f0a8c60fbaf376ec09538f093cba91f171238b99c117445c0bcc6096272ec3e) [08/2026] 
 * [`intel/llm-scaler-vllm:0.21.0-b1`](https://hub.docker.com/layers/intel/llm-scaler-vllm/0.21.0-b1/images/sha256-5d87be271e4db54539f1dbb29c071e9122f4e57b74594dbb26a55d27a569d780) [07/2026] 
