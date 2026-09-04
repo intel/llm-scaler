@@ -16,7 +16,18 @@
 
 #include <sycl/sycl.hpp>
 #include <torch/extension.h>
+#include <c10/xpu/XPUFunctions.h>
 #include <c10/xpu/XPUStream.h>
+
+#include <cstdint>
+#include <functional>
+#include <initializer_list>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <utility>
+
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
 
@@ -34,6 +45,32 @@ static inline sycl::event submit_kernel(
     const char* desc) {
     sycl::queue& queue = c10::xpu::getCurrentXPUStream(device.index()).queue();
     return queue.submit(kernel);
+}
+
+static inline bool try_moe_topk_v2_int4(
+    const fp16* logits,
+    fp16* topk_weight,
+    int32_t* topk_idx,
+    int n_tokens,
+    int n_experts,
+    int top_k,
+    sycl::queue& queue) {
+    if (n_experts == 512 && top_k == 10) {
+        moe_topk_v2_host<512, 10>(
+            logits, topk_weight, topk_idx, n_tokens, queue);
+    } else if (n_experts == 256 && top_k == 8) {
+        moe_topk_v2_host<256, 8>(
+            logits, topk_weight, topk_idx, n_tokens, queue);
+    } else if (n_experts == 128 && top_k == 8) {
+        moe_topk_v2_host<128, 8>(
+            logits, topk_weight, topk_idx, n_tokens, queue);
+    } else if (n_experts == 128 && top_k == 10) {
+        moe_topk_v2_host<128, 10>(
+            logits, topk_weight, topk_idx, n_tokens, queue);
+    } else {
+        return false;
+    }
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -319,25 +356,11 @@ std::tuple<torch::Tensor, torch::Tensor> moe_router_topk_int4(
         torch::device(x.device()).dtype(torch::kInt32));
 
     sycl::queue& queue = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
-    if (num_experts == 256 && top_k == 8) {
-        moe_topk_v2_host<256, 8>(
+    if (!try_moe_topk_v2_int4(
             (const fp16*)s_int4_router_logits.data_ptr(),
             (fp16*)topk_weight.data_ptr(),
-            topk_idx.data_ptr<int32_t>(),
-            n_tokens, queue);
-    } else if (num_experts == 128 && top_k == 8) {
-        moe_topk_v2_host<128, 8>(
-            (const fp16*)s_int4_router_logits.data_ptr(),
-            (fp16*)topk_weight.data_ptr(),
-            topk_idx.data_ptr<int32_t>(),
-            n_tokens, queue);
-    } else if (num_experts == 128 && top_k == 10) {
-        moe_topk_v2_host<128, 10>(
-            (const fp16*)s_int4_router_logits.data_ptr(),
-            (fp16*)topk_weight.data_ptr(),
-            topk_idx.data_ptr<int32_t>(),
-            n_tokens, queue);
-    } else {
+            topk_idx.data_ptr<int32_t>(), n_tokens, num_experts,
+            (int)top_k, queue)) {
         moe_topk_forward_kernel_impl<class MoeRouterTopKInt4>(
             (const fp16*)s_int4_router_logits.data_ptr(),
             topk_idx.data_ptr<int32_t>(),
@@ -1374,73 +1397,285 @@ void moe_down_finalize_int4_kernel(
 // moe_forward_full_int4 — Full pipeline: TopK → Up → Down → Finalize
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Pre-allocated scratch/output buffers reused across all MoE layers.
-//
-// ⚠️ XPU-graph correctness: these buffers' addresses are baked into captured
-// graphs at capture time and are NOT re-resolved on replay (the host-side
-// ensure_* call does not run during replay). The previous behavior reallocated
-// whenever `n_tokens` changed (`!= n_tokens`), which moved the addresses — so a
-// later batch-size change (a different decode size, or a small prefill chunk
-// <= 64 that also routes through this ESIMD path) freed the storage the
-// captured decode graphs still point at, producing garbage / "!!!!" output.
-//
-// Fix: allocate ONCE at the kernel's hard cap (S_INT4_MAX_NTOKENS == 64, see
-// the `x.size(0) <= 64` TORCH_CHECK in the callers) and grow-only beyond it.
-// Because every real n_tokens is <= 64, the buffers are allocated on the first
-// call and never moved again, so the captured-graph pointers stay valid for the
-// process lifetime. Each call uses only the first `n_tokens` rows (via
-// .narrow / explicit n_tokens row counts); the unused tail is harmless.
-// Cost is a one-time ~few-MB-per-rank bump, independent of layer count.
+// Eager calls reuse process-lifetime scratch keyed by stream and geometry. Graph
+// capture needs invocation-private addresses because replay can outlive its host
+// thread and can run independently of later eager submissions. A capture therefore
+// uses one backing storage whose returned output view owns every scratch span.
 static constexpr int S_INT4_MAX_NTOKENS = 64;
-
-static thread_local torch::Tensor s_int4_topk_idx, s_int4_topk_weight;
-static thread_local torch::Tensor s_int4_routed_output;
-static thread_local torch::Tensor s_int4_intermediates;
-static thread_local torch::Tensor s_int4_gate_values;  // BSZ>1 precomputed gate sigmoid
-static thread_local int s_int4_cached_cap = -1;
-
-// The returned final output is held by the caller across the rest of the layer
-// (TP all-reduce, residual add, next layer's input), so it must not be
-// overwritten by the next MoE call. Rotate a small ring so each returned tensor
-// stays valid for several subsequent calls — same approach as the FP8 gemma4
-// path (sg_final_outputs in moe.sycl).
 static constexpr int S_INT4_FINAL_RING = 4;
-static thread_local torch::Tensor s_int4_final_outputs[S_INT4_FINAL_RING];
-static thread_local int s_int4_final_ring_idx = 0;
+static constexpr size_t S_INT4_CAPTURE_ALIGNMENT = 16;
 
-static void ensure_int4_moe_buffers(int n_tokens, int top_k, int num_shared_experts,
-                                     int hidden_size, int intermediate_size,
-                                     const torch::Device& dev) {
-    int rows_per_token = top_k + num_shared_experts;
-    // Allocate at (at least) the kernel's max batch so smaller batches never
-    // trigger a realloc that would move the addresses out from under a captured
-    // XPU graph. Grow-only guard in case the cap is ever exceeded.
-    int cap = n_tokens > S_INT4_MAX_NTOKENS ? n_tokens : S_INT4_MAX_NTOKENS;
-    if (s_int4_cached_cap >= cap && s_int4_topk_idx.defined()) return;
-    s_int4_topk_idx = torch::empty({cap, top_k},
-        torch::device(dev).dtype(torch::kInt32));
-    s_int4_topk_weight = torch::empty({cap, top_k},
-        torch::device(dev).dtype(torch::kHalf));
-    s_int4_routed_output = torch::empty(
-        {cap * rows_per_token, hidden_size},
-        torch::device(dev).dtype(torch::kHalf));
-    s_int4_intermediates = torch::empty(
-        {cap * rows_per_token, intermediate_size},
-        torch::device(dev).dtype(torch::kHalf));
-    s_int4_gate_values = torch::empty(
-        {cap * num_shared_experts},
-        torch::device(dev).dtype(torch::kFloat));
-    for (int i = 0; i < S_INT4_FINAL_RING; i++) {
-        s_int4_final_outputs[i] = torch::empty({cap, hidden_size},
-            torch::device(dev).dtype(torch::kHalf));
+struct Int4MoeBufferKey {
+    c10::xpu::XPUStream stream;
+    int capacity;
+    int top_k;
+    int num_shared_experts;
+    int hidden_size;
+    int intermediate_size;
+
+    bool operator==(const Int4MoeBufferKey& other) const {
+        return stream == other.stream && capacity == other.capacity
+            && top_k == other.top_k
+            && num_shared_experts == other.num_shared_experts
+            && hidden_size == other.hidden_size
+            && intermediate_size == other.intermediate_size;
     }
-    s_int4_cached_cap = cap;
+};
+
+struct Int4MoeBufferKeyHash {
+    size_t operator()(const Int4MoeBufferKey& key) const {
+        size_t value = std::hash<c10::xpu::XPUStream>{}(key.stream);
+        auto combine = [&value](int field) {
+            value ^= std::hash<int>{}(field) + 0x9e3779b9 + (value << 6)
+                + (value >> 2);
+        };
+        combine(key.capacity);
+        combine(key.top_k);
+        combine(key.num_shared_experts);
+        combine(key.hidden_size);
+        combine(key.intermediate_size);
+        return value;
+    }
+};
+
+struct Int4MoeBuffers {
+    torch::Tensor topk_idx;
+    torch::Tensor topk_weight;
+    torch::Tensor routed_output;
+    torch::Tensor intermediates;
+    torch::Tensor gate_values;
+    torch::Tensor final_outputs[S_INT4_FINAL_RING];
+    int final_ring_idx = 0;
+    std::recursive_mutex submit_mutex;
+};
+
+struct Int4MoeRawBuffers {
+    int32_t* topk_idx = nullptr;
+    fp16* topk_weight = nullptr;
+    fp16* routed_output = nullptr;
+    fp16* intermediates = nullptr;
+    float* gate_values = nullptr;
+    torch::Tensor final_output;
+};
+
+struct Int4MoeWorkspaceLease {
+    Int4MoeRawBuffers buffers;
+    std::unique_lock<std::recursive_mutex> submit_lock;
+};
+
+static std::unordered_map<
+    Int4MoeBufferKey, std::unique_ptr<Int4MoeBuffers>, Int4MoeBufferKeyHash>
+    s_int4_moe_buffers;
+static std::mutex s_int4_moe_buffers_mutex;
+
+static Int4MoeBuffers& ensure_int4_moe_buffers(
+    int n_tokens,
+    int top_k,
+    int num_shared_experts,
+    int hidden_size,
+    int intermediate_size,
+    const torch::Device& dev,
+    const c10::xpu::XPUStream& stream) {
+    const int rows_per_token = top_k + num_shared_experts;
+    int capacity = S_INT4_MAX_NTOKENS;
+    while (capacity < n_tokens) {
+        TORCH_CHECK(
+            capacity <= std::numeric_limits<int>::max() / 2,
+            "INT4 MoE token capacity is too large");
+        capacity *= 2;
+    }
+    const Int4MoeBufferKey key{
+        stream,
+        capacity,
+        top_k,
+        num_shared_experts,
+        hidden_size,
+        intermediate_size,
+    };
+    std::lock_guard<std::mutex> lock(s_int4_moe_buffers_mutex);
+    auto existing = s_int4_moe_buffers.find(key);
+    if (existing != s_int4_moe_buffers.end()) {
+        return *existing->second;
+    }
+
+    auto candidate = std::make_unique<Int4MoeBuffers>();
+    candidate->topk_idx = torch::empty(
+        {capacity, top_k}, torch::device(dev).dtype(torch::kInt32));
+    candidate->topk_weight = torch::empty(
+        {capacity, top_k}, torch::device(dev).dtype(torch::kHalf));
+    candidate->routed_output = torch::empty(
+        {capacity * rows_per_token, hidden_size},
+        torch::device(dev).dtype(torch::kHalf));
+    candidate->intermediates = torch::empty(
+        {capacity * rows_per_token, intermediate_size},
+        torch::device(dev).dtype(torch::kHalf));
+    candidate->gate_values = torch::empty(
+        {capacity * num_shared_experts},
+        torch::device(dev).dtype(torch::kFloat));
+    for (int i = 0; i < S_INT4_FINAL_RING; ++i) {
+        candidate->final_outputs[i] = torch::empty(
+            {capacity, hidden_size}, torch::device(dev).dtype(torch::kHalf));
+    }
+
+    auto inserted = s_int4_moe_buffers.emplace(key, std::move(candidate));
+    return *inserted.first->second;
 }
 
-static torch::Tensor& s_int4_take_final_output() {
-    auto& t = s_int4_final_outputs[s_int4_final_ring_idx];
-    s_int4_final_ring_idx = (s_int4_final_ring_idx + 1) % S_INT4_FINAL_RING;
-    return t;
+static torch::Tensor take_int4_final_output(
+    Int4MoeBuffers& buffers,
+    int n_tokens) {
+    auto output = buffers.final_outputs[buffers.final_ring_idx];
+    buffers.final_ring_idx =
+        (buffers.final_ring_idx + 1) % S_INT4_FINAL_RING;
+    return output.narrow(0, 0, n_tokens);
+}
+
+static size_t int4_moe_checked_product(
+    std::initializer_list<size_t> factors) {
+    size_t product = 1;
+    for (const size_t factor : factors) {
+        TORCH_CHECK(
+            factor == 0
+                || product <= std::numeric_limits<size_t>::max() / factor,
+            "INT4 MoE capture workspace size overflow");
+        product *= factor;
+    }
+    return product;
+}
+
+static size_t reserve_int4_moe_capture_span(
+    size_t& total_bytes,
+    size_t span_bytes) {
+    TORCH_CHECK(
+        total_bytes <= std::numeric_limits<size_t>::max()
+            - (S_INT4_CAPTURE_ALIGNMENT - 1),
+        "INT4 MoE capture workspace alignment overflow");
+    total_bytes = (total_bytes + S_INT4_CAPTURE_ALIGNMENT - 1)
+        & ~(S_INT4_CAPTURE_ALIGNMENT - 1);
+    TORCH_CHECK(
+        span_bytes <= std::numeric_limits<size_t>::max() - total_bytes,
+        "INT4 MoE capture workspace size overflow");
+    const size_t offset = total_bytes;
+    total_bytes += span_bytes;
+    return offset;
+}
+
+static Int4MoeRawBuffers allocate_int4_moe_capture_workspace(
+    int n_tokens,
+    int top_k,
+    int num_shared_experts,
+    int hidden_size,
+    int intermediate_size,
+    const torch::Device& dev) {
+    const size_t tokens = static_cast<size_t>(n_tokens);
+    const size_t rows_per_token =
+        static_cast<size_t>(top_k + num_shared_experts);
+    const size_t hidden = static_cast<size_t>(hidden_size);
+    const size_t intermediate = static_cast<size_t>(intermediate_size);
+
+    size_t total_bytes = 0;
+    // Keep the public graph output at storage offset zero. Its view owns the
+    // complete backing allocation and therefore the private scratch lifetime.
+    const size_t final_output_offset = reserve_int4_moe_capture_span(
+        total_bytes,
+        int4_moe_checked_product({tokens, hidden, sizeof(fp16)}));
+    const size_t topk_idx_offset = reserve_int4_moe_capture_span(
+        total_bytes,
+        int4_moe_checked_product(
+            {tokens, static_cast<size_t>(top_k), sizeof(int32_t)}));
+    const size_t topk_weight_offset = reserve_int4_moe_capture_span(
+        total_bytes,
+        int4_moe_checked_product(
+            {tokens, static_cast<size_t>(top_k), sizeof(fp16)}));
+    const size_t routed_output_offset = reserve_int4_moe_capture_span(
+        total_bytes,
+        int4_moe_checked_product(
+            {tokens, rows_per_token, hidden, sizeof(fp16)}));
+    const size_t intermediates_offset = reserve_int4_moe_capture_span(
+        total_bytes,
+        int4_moe_checked_product(
+            {tokens, rows_per_token, intermediate, sizeof(fp16)}));
+    const size_t gate_values_offset = reserve_int4_moe_capture_span(
+        total_bytes,
+        int4_moe_checked_product(
+            {tokens, static_cast<size_t>(num_shared_experts), sizeof(float)}));
+
+    TORCH_CHECK(
+        total_bytes % sizeof(fp16) == 0
+            && total_bytes / sizeof(fp16)
+                <= static_cast<size_t>(std::numeric_limits<int64_t>::max()),
+        "INT4 MoE capture workspace is too large");
+    auto backing = torch::empty(
+        {static_cast<int64_t>(total_bytes / sizeof(fp16))},
+        torch::device(dev).dtype(torch::kHalf));
+    auto* base = reinterpret_cast<uint8_t*>(backing.data_ptr());
+    auto final_output = backing
+        .narrow(
+            0,
+            static_cast<int64_t>(final_output_offset / sizeof(fp16)),
+            static_cast<int64_t>(tokens * hidden))
+        .view({n_tokens, hidden_size});
+
+    return Int4MoeRawBuffers{
+        reinterpret_cast<int32_t*>(base + topk_idx_offset),
+        reinterpret_cast<fp16*>(base + topk_weight_offset),
+        reinterpret_cast<fp16*>(base + routed_output_offset),
+        reinterpret_cast<fp16*>(base + intermediates_offset),
+        reinterpret_cast<float*>(base + gate_values_offset),
+        std::move(final_output),
+    };
+}
+
+static Int4MoeRawBuffers view_int4_moe_eager_buffers(
+    Int4MoeBuffers& buffers,
+    int n_tokens) {
+    return Int4MoeRawBuffers{
+        buffers.topk_idx.data_ptr<int32_t>(),
+        reinterpret_cast<fp16*>(buffers.topk_weight.data_ptr()),
+        reinterpret_cast<fp16*>(buffers.routed_output.data_ptr()),
+        reinterpret_cast<fp16*>(buffers.intermediates.data_ptr()),
+        buffers.gate_values.data_ptr<float>(),
+        take_int4_final_output(buffers, n_tokens),
+    };
+}
+
+static Int4MoeWorkspaceLease acquire_int4_moe_workspace(
+    int n_tokens,
+    int top_k,
+    int num_shared_experts,
+    int hidden_size,
+    int intermediate_size,
+    const torch::Device& dev) {
+    TORCH_CHECK(n_tokens > 0, "INT4 MoE expects at least one token");
+    TORCH_CHECK(top_k > 0, "INT4 MoE expects top_k > 0");
+    TORCH_CHECK(
+        num_shared_experts >= 0,
+        "INT4 MoE expects num_shared_experts >= 0");
+    TORCH_CHECK(hidden_size > 0, "INT4 MoE expects hidden_size > 0");
+    TORCH_CHECK(
+        intermediate_size > 0,
+        "INT4 MoE expects intermediate_size > 0");
+    TORCH_CHECK(
+        top_k <= std::numeric_limits<int>::max() - num_shared_experts,
+        "INT4 MoE rows_per_token overflow");
+
+    const auto stream = c10::xpu::getCurrentXPUStream(dev.index());
+    if (stream.is_capturing()) {
+        return Int4MoeWorkspaceLease{
+            allocate_int4_moe_capture_workspace(
+                n_tokens, top_k, num_shared_experts, hidden_size,
+                intermediate_size, dev),
+            std::unique_lock<std::recursive_mutex>(),
+        };
+    }
+
+    auto& cached = ensure_int4_moe_buffers(
+        n_tokens, top_k, num_shared_experts, hidden_size,
+        intermediate_size, dev, stream);
+    std::unique_lock<std::recursive_mutex> submit_lock(cached.submit_mutex);
+    auto buffers = view_int4_moe_eager_buffers(cached, n_tokens);
+    return Int4MoeWorkspaceLease{
+        std::move(buffers), std::move(submit_lock)};
 }
 
 std::tuple<torch::Tensor, torch::Tensor> moe_topk_int4(
@@ -1460,25 +1695,11 @@ std::tuple<torch::Tensor, torch::Tensor> moe_topk_int4(
         torch::device(logits.device()).dtype(torch::kInt32));
 
     sycl::queue& queue = c10::xpu::getCurrentXPUStream(logits.device().index()).queue();
-    if (n_routed_experts == 256 && top_k == 8) {
-        moe_topk_v2_host<256, 8>(
+    if (!try_moe_topk_v2_int4(
             (const fp16*)logits.data_ptr(),
             (fp16*)topk_weight.data_ptr(),
-            topk_idx.data_ptr<int32_t>(),
-            n_tokens, queue);
-    } else if (n_routed_experts == 128 && top_k == 8) {
-        moe_topk_v2_host<128, 8>(
-            (const fp16*)logits.data_ptr(),
-            (fp16*)topk_weight.data_ptr(),
-            topk_idx.data_ptr<int32_t>(),
-            n_tokens, queue);
-    } else if (n_routed_experts == 128 && top_k == 10) {
-        moe_topk_v2_host<128, 10>(
-            (const fp16*)logits.data_ptr(),
-            (fp16*)topk_weight.data_ptr(),
-            topk_idx.data_ptr<int32_t>(),
-            n_tokens, queue);
-    } else {
+            topk_idx.data_ptr<int32_t>(), n_tokens,
+            (int)n_routed_experts, (int)top_k, queue)) {
         moe_topk_forward_kernel_impl<class MoeTopKInt4Standalone>(
             (const fp16*)logits.data_ptr(),
             topk_idx.data_ptr<int32_t>(),
@@ -2285,7 +2506,8 @@ void moe_ws_down_cutlass_int4_with_shared_fp16_kernel(
                     simd<float, VL> acc[H_TILE];
                     #pragma unroll
                     for (int hh = 0; hh < H_TILE; ++hh) acc[hh] = 0.f;
-                    for (int k = 0; k < shared_inter_size; k += VL) {
+                    int k = 0;
+                    for (; k + VL <= shared_inter_size; k += VL) {
                         simd<fp16, VL> hv = block_load<fp16, VL>(hi_row + k);
                         simd<float, VL> hvf = hv;
                         #pragma unroll
@@ -2298,6 +2520,20 @@ void moe_ws_down_cutlass_int4_with_shared_fp16_kernel(
                     #pragma unroll
                     for (int hh = 0; hh < H_TILE; ++hh)
                         sum[hh] += gate * sycl::ext::intel::esimd::detail::sum<float, float, VL>(acc[hh]);
+                    // A block load may not cross a shared row: for Qwen3.8 S=80,
+                    // the second 64-lane load would consume 48 values from the
+                    // following token/output row and include them in the dot.
+                    for (; k < shared_inter_size; ++k) {
+                        float hv = (float)hi_row[k];
+                        #pragma unroll
+                        for (int hh = 0; hh < H_TILE; ++hh) {
+                            int h = h_base + hh;
+                            const fp16* w_row = shared_down_weight
+                                + (size_t)sid * hidden_size * shared_inter_size
+                                + (size_t)h * shared_inter_size;
+                            sum[hh] += gate * hv * (float)w_row[k];
+                        }
+                    }
                 }
 
                 #pragma unroll
@@ -2683,6 +2919,239 @@ torch::Tensor moe_tiny_cutlass_nmajor_int4_down(
     return output;
 }
 
+static constexpr int S_INT4_NMAJOR_GROUP_SIZE = 128;
+
+struct MoeTinyFullFP16SharedGeometry {
+    int n_tokens;
+    int hidden_size;
+    int intermediate_size;
+    int shared_intermediate_size;
+    int n_routed_experts;
+};
+
+static MoeTinyFullFP16SharedGeometry
+check_moe_tiny_full_fp16_shared_inputs(
+    const torch::Tensor& x,
+    const torch::Tensor& w13_qweight_s4,
+    const torch::Tensor& w13_scales,
+    const torch::Tensor& w2_qweight_s4,
+    const torch::Tensor& w2_scales,
+    const torch::Tensor& shared_gate_up_weight,
+    const torch::Tensor& shared_down_weight,
+    const torch::Tensor& shared_expert_gate_weight,
+    int64_t num_shared_experts) {
+    TORCH_CHECK(
+        x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 64
+            && x.is_contiguous());
+    TORCH_CHECK(x.device().is_xpu());
+    TORCH_CHECK(x.scalar_type() == torch::kHalf);
+    TORCH_CHECK(
+        x.size(1) > 0
+            && x.size(1) <= std::numeric_limits<int>::max(),
+        "tiny full FP16 shared path has an invalid hidden_size");
+    TORCH_CHECK(num_shared_experts > 0);
+    TORCH_CHECK(
+        num_shared_experts <= std::numeric_limits<int>::max() / 2,
+        "num_shared_experts is too large");
+
+    for (const auto& tensor : {
+             w13_qweight_s4, w13_scales, w2_qweight_s4, w2_scales,
+             shared_gate_up_weight, shared_down_weight,
+             shared_expert_gate_weight}) {
+        TORCH_CHECK(tensor.device() == x.device());
+        TORCH_CHECK(tensor.is_contiguous());
+    }
+    TORCH_CHECK(
+        w13_qweight_s4.dim() == 3
+            && w13_qweight_s4.scalar_type() == torch::kByte,
+        "w13_qweight_s4 must be a 3D uint8 tensor");
+    TORCH_CHECK(
+        w13_scales.dim() == 3
+            && w13_scales.scalar_type() == torch::kHalf,
+        "w13_scales must be a 3D FP16 tensor");
+    TORCH_CHECK(
+        w2_qweight_s4.dim() == 3
+            && w2_qweight_s4.scalar_type() == torch::kByte,
+        "w2_qweight_s4 must be a 3D uint8 tensor");
+    TORCH_CHECK(
+        w2_scales.dim() == 3
+            && w2_scales.scalar_type() == torch::kHalf,
+        "w2_scales must be a 3D FP16 tensor");
+    TORCH_CHECK(shared_gate_up_weight.scalar_type() == torch::kHalf);
+    TORCH_CHECK(shared_down_weight.scalar_type() == torch::kHalf);
+    TORCH_CHECK(shared_expert_gate_weight.scalar_type() == torch::kHalf);
+
+    const int n_tokens = (int)x.size(0);
+    const int hidden_size = (int)x.size(1);
+    TORCH_CHECK(
+        hidden_size % S_INT4_NMAJOR_GROUP_SIZE == 0,
+        "tiny full FP16 shared path requires hidden_size divisible by 128");
+
+    const int64_t n_routed_experts_i64 = w13_qweight_s4.size(0);
+    TORCH_CHECK(
+        n_routed_experts_i64 > 0
+            && n_routed_experts_i64 <= std::numeric_limits<int>::max(),
+        "tiny full FP16 shared path has an invalid routed expert count");
+    const int n_routed_experts = (int)n_routed_experts_i64;
+    const int64_t two_inter = w13_qweight_s4.size(1);
+    TORCH_CHECK(
+        two_inter > 0 && two_inter % 2 == 0
+            && two_inter / 2 <= std::numeric_limits<int>::max(),
+        "w13_qweight_s4 has an invalid intermediate_size");
+    const int intermediate_size = (int)(two_inter / 2);
+    TORCH_CHECK(
+        intermediate_size % S_INT4_NMAJOR_GROUP_SIZE == 0,
+        "tiny full FP16 shared path requires intermediate_size divisible by 128");
+    TORCH_CHECK(
+        w13_qweight_s4.size(2) == hidden_size / 2,
+        "w13_qweight_s4 has an unsupported shape");
+    TORCH_CHECK(
+        w13_scales.size(0) == n_routed_experts_i64
+            && w13_scales.size(1) == two_inter
+            && w13_scales.size(2)
+                == hidden_size / S_INT4_NMAJOR_GROUP_SIZE,
+        "w13_scales has an unsupported shape");
+    TORCH_CHECK(
+        w2_qweight_s4.size(0) == n_routed_experts_i64
+            && w2_qweight_s4.size(1) == hidden_size
+            && w2_qweight_s4.size(2) == intermediate_size / 2,
+        "w2_qweight_s4 has an unsupported shape");
+    TORCH_CHECK(
+        w2_scales.size(0) == n_routed_experts_i64
+            && w2_scales.size(1) == hidden_size
+            && w2_scales.size(2)
+                == intermediate_size / S_INT4_NMAJOR_GROUP_SIZE,
+        "w2_scales has an unsupported shape");
+
+    TORCH_CHECK(
+        shared_gate_up_weight.numel() % hidden_size == 0,
+        "shared_gate_up_weight has an unsupported shape");
+    const int64_t shared_gate_rows =
+        shared_gate_up_weight.numel() / hidden_size;
+    const int64_t shared_rows_per_expert = 2 * num_shared_experts;
+    TORCH_CHECK(
+        shared_gate_rows % shared_rows_per_expert == 0,
+        "shared_gate_up_weight has an unsupported shape");
+    const int64_t shared_inter_size_i64 =
+        shared_gate_rows / shared_rows_per_expert;
+    TORCH_CHECK(
+        shared_inter_size_i64 > 0
+            && shared_inter_size_i64 <= std::numeric_limits<int>::max(),
+        "shared_gate_up_weight has an unsupported shape");
+    const int shared_inter_size = (int)shared_inter_size_i64;
+    TORCH_CHECK(
+        shared_inter_size == intermediate_size,
+        "tiny full FP16 shared path currently requires "
+        "shared_inter_size == routed intermediate_size");
+    TORCH_CHECK(
+        shared_down_weight.numel() % hidden_size == 0
+            && shared_down_weight.numel() / hidden_size
+                == num_shared_experts * shared_inter_size_i64,
+        "shared_down_weight has an unsupported shape");
+    TORCH_CHECK(
+        shared_expert_gate_weight.numel() % hidden_size == 0
+            && shared_expert_gate_weight.numel() / hidden_size
+                == num_shared_experts,
+        "shared_expert_gate_weight has an unsupported shape");
+
+    return MoeTinyFullFP16SharedGeometry{
+        n_tokens, hidden_size, intermediate_size, shared_inter_size,
+        n_routed_experts};
+}
+
+static void submit_moe_tiny_full_fp16_shared(
+    const torch::Tensor& x,
+    const torch::Tensor& w13_qweight_s4,
+    const torch::Tensor& w13_scales,
+    const torch::Tensor& w2_qweight_s4,
+    const torch::Tensor& w2_scales,
+    const fp16* topk_weight,
+    const int32_t* topk_idx,
+    const torch::Tensor& shared_gate_up_weight,
+    const torch::Tensor& shared_down_weight,
+    const torch::Tensor& shared_expert_gate_weight,
+    int num_shared_experts,
+    int top_k,
+    const MoeTinyFullFP16SharedGeometry& geometry,
+    Int4MoeRawBuffers& buffers) {
+    fp16* routed_intermediates_ptr = buffers.intermediates;
+    fp16* shared_intermediates_ptr = routed_intermediates_ptr
+        + (size_t)geometry.n_tokens * top_k * geometry.intermediate_size;
+
+    if (geometry.n_tokens == 1) {
+        moe_tiny_m_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
+            (const fp16*)x.data_ptr(),
+            (const uint8_t*)w13_qweight_s4.data_ptr(),
+            (const fp16*)w13_scales.data_ptr(), topk_idx,
+            (const fp16*)shared_gate_up_weight.data_ptr(),
+            (const fp16*)shared_expert_gate_weight.data_ptr(),
+            routed_intermediates_ptr, shared_intermediates_ptr,
+            buffers.gate_values, geometry.n_tokens, top_k,
+            geometry.hidden_size, geometry.intermediate_size,
+            geometry.shared_intermediate_size, num_shared_experts, x.device());
+        moe_tiny_m_down_cutlass_int4_with_shared_fp16_htile_kernel<int32_t>(
+            routed_intermediates_ptr,
+            (const uint8_t*)w2_qweight_s4.data_ptr(),
+            (const fp16*)w2_scales.data_ptr(), topk_weight, topk_idx,
+            shared_intermediates_ptr, buffers.gate_values,
+            (const fp16*)shared_down_weight.data_ptr(),
+            (fp16*)buffers.final_output.data_ptr(), geometry.n_tokens, top_k,
+            geometry.hidden_size, geometry.intermediate_size,
+            geometry.shared_intermediate_size, num_shared_experts, x.device());
+        return;
+    }
+
+    moe_ws_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
+        (const fp16*)x.data_ptr(),
+        (const uint8_t*)w13_qweight_s4.data_ptr(),
+        (const fp16*)w13_scales.data_ptr(), topk_idx,
+        (const fp16*)shared_gate_up_weight.data_ptr(),
+        (const fp16*)shared_expert_gate_weight.data_ptr(),
+        routed_intermediates_ptr, shared_intermediates_ptr,
+        buffers.gate_values, geometry.n_tokens, top_k,
+        geometry.hidden_size, geometry.intermediate_size,
+        geometry.shared_intermediate_size, num_shared_experts, x.device());
+    if (geometry.n_tokens <= 2) {
+        moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t, 4>(
+            routed_intermediates_ptr,
+            (const uint8_t*)w2_qweight_s4.data_ptr(),
+            (const fp16*)w2_scales.data_ptr(), topk_weight, topk_idx,
+            shared_intermediates_ptr, buffers.gate_values,
+            (const fp16*)shared_down_weight.data_ptr(),
+            (fp16*)buffers.final_output.data_ptr(), geometry.n_tokens, top_k,
+            geometry.hidden_size, geometry.intermediate_size,
+            geometry.shared_intermediate_size, num_shared_experts, x.device());
+    } else {
+        moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t, 8>(
+            routed_intermediates_ptr,
+            (const uint8_t*)w2_qweight_s4.data_ptr(),
+            (const fp16*)w2_scales.data_ptr(), topk_weight, topk_idx,
+            shared_intermediates_ptr, buffers.gate_values,
+            (const fp16*)shared_down_weight.data_ptr(),
+            (fp16*)buffers.final_output.data_ptr(), geometry.n_tokens, top_k,
+            geometry.hidden_size, geometry.intermediate_size,
+            geometry.shared_intermediate_size, num_shared_experts, x.device());
+    }
+}
+
+class MoeTopKIndexInt64ToInt32;
+
+static void submit_moe_topk_index_int64_to_int32(
+    const int64_t* source,
+    int32_t* destination,
+    size_t count,
+    const torch::Device& device) {
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeTopKIndexInt64ToInt32>(
+            sycl::range<1>(count),
+            [=](sycl::id<1> item) {
+                const size_t index = item[0];
+                destination[index] = static_cast<int32_t>(source[index]);
+            });
+    };
+    submit_kernel(cgf, device, "moe topk index int64 to int32");
+}
+
 torch::Tensor moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared(
     torch::Tensor x,
     torch::Tensor w13_qweight_s4,
@@ -2695,103 +3164,49 @@ torch::Tensor moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared(
     torch::Tensor shared_down_weight,
     torch::Tensor shared_expert_gate_weight,
     int64_t num_shared_experts) {
+    const auto geometry = check_moe_tiny_full_fp16_shared_inputs(
+        x, w13_qweight_s4, w13_scales, w2_qweight_s4, w2_scales,
+        shared_gate_up_weight, shared_down_weight,
+        shared_expert_gate_weight, num_shared_experts);
+    TORCH_CHECK(
+        topk_weight.device() == x.device()
+            && topk_weight.dim() == 2
+            && topk_weight.size(0) == geometry.n_tokens
+            && topk_weight.scalar_type() == torch::kHalf
+            && topk_weight.is_contiguous());
+    TORCH_CHECK(
+        topk_idx.device() == x.device()
+            && topk_idx.dim() == 2
+            && topk_idx.sizes() == topk_weight.sizes()
+            && topk_idx.is_contiguous());
+    TORCH_CHECK(
+        topk_idx.scalar_type() == torch::kInt
+            || topk_idx.scalar_type() == torch::kLong);
+    const int64_t top_k_i64 = topk_idx.size(1);
+    TORCH_CHECK(
+        top_k_i64 > 0 && top_k_i64 <= geometry.n_routed_experts,
+        "top_k must be in the routed expert range");
+    const int top_k = (int)top_k_i64;
 
-    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 64 && x.is_contiguous());
-    TORCH_CHECK(x.scalar_type() == torch::kHalf);
-    TORCH_CHECK(shared_gate_up_weight.scalar_type() == torch::kHalf && shared_gate_up_weight.is_contiguous());
-    TORCH_CHECK(shared_down_weight.scalar_type() == torch::kHalf && shared_down_weight.is_contiguous());
-    TORCH_CHECK(shared_expert_gate_weight.scalar_type() == torch::kHalf && shared_expert_gate_weight.is_contiguous());
-    TORCH_CHECK(num_shared_experts > 0);
-
-    int hidden_size = x.size(1);
-    int shared_gate_rows = shared_gate_up_weight.numel() / hidden_size;
-    int shared_inter_size = shared_gate_rows / (2 * (int)num_shared_experts);
-    TORCH_CHECK(shared_inter_size > 0);
-    TORCH_CHECK(shared_gate_rows == 2 * (int)num_shared_experts * shared_inter_size);
-    TORCH_CHECK(shared_down_weight.numel() == (int64_t)num_shared_experts * hidden_size * shared_inter_size);
-    TORCH_CHECK(shared_expert_gate_weight.numel() == (int64_t)num_shared_experts * hidden_size);
-
-    TORCH_CHECK(topk_weight.dim() == 2 && topk_weight.size(0) == x.size(0) && topk_weight.is_contiguous());
-    TORCH_CHECK(topk_weight.scalar_type() == torch::kHalf);
-    TORCH_CHECK(topk_idx.dim() == 2 && topk_idx.size(0) == x.size(0) && topk_idx.is_contiguous());
-    TORCH_CHECK(topk_idx.scalar_type() == torch::kInt || topk_idx.scalar_type() == torch::kLong);
-    TORCH_CHECK(w13_qweight_s4.scalar_type() == torch::kByte && w13_qweight_s4.is_contiguous());
-    TORCH_CHECK(w13_scales.scalar_type() == torch::kHalf && w13_scales.is_contiguous());
-    TORCH_CHECK(w2_qweight_s4.scalar_type() == torch::kByte && w2_qweight_s4.is_contiguous());
-    TORCH_CHECK(w2_scales.scalar_type() == torch::kHalf && w2_scales.is_contiguous());
-
-    int top_k = topk_idx.size(1);
-    int n_tokens = x.size(0);
-    int two_inter = w13_qweight_s4.size(1);
-    int intermediate_size = two_inter / 2;
-    TORCH_CHECK(w13_qweight_s4.size(2) == hidden_size / 2);
-    TORCH_CHECK(w2_qweight_s4.size(1) == hidden_size);
-    TORCH_CHECK(w2_qweight_s4.size(2) == intermediate_size / 2);
-
-    TORCH_CHECK(shared_inter_size == intermediate_size,
-        "tiny full FP16 shared path currently requires shared_inter_size == routed intermediate_size");
-    TORCH_CHECK(intermediate_size % 4 == 0,
-        "tiny full FP16 shared path expects intermediate_size divisible by 4");
-    ensure_int4_moe_buffers(n_tokens, top_k, (int)num_shared_experts, hidden_size,
-                            intermediate_size, x.device());
-
-    fp16* routed_intermediates_ptr = (fp16*)s_int4_intermediates.data_ptr();
-    fp16* shared_intermediates_ptr = routed_intermediates_ptr + (size_t)n_tokens * top_k * intermediate_size;
-    float* shared_gate_values_ptr = (float*)s_int4_gate_values.data_ptr();
-    // Rotate the final-output ring so the returned tensor is not overwritten by
-    // a later MoE layer before the caller has consumed it (see ring comment).
-    auto& final_output = s_int4_take_final_output();
-
-    // Cast topk_idx to int32 if needed (internal topk always produces int32;
-    // external callers may pass int64 which we cast here to avoid double template instantiation)
-    auto topk_idx_i32 = topk_idx.scalar_type() == torch::kInt
-        ? topk_idx : topk_idx.to(torch::kInt);
-
-    if (n_tokens == 1) {
-        moe_tiny_m_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
-            (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
-            (const fp16*)w13_scales.data_ptr(), topk_idx_i32.data_ptr<int32_t>(),
-            (const fp16*)shared_gate_up_weight.data_ptr(),
-            (const fp16*)shared_expert_gate_weight.data_ptr(),
-            routed_intermediates_ptr, shared_intermediates_ptr,
-            shared_gate_values_ptr, n_tokens, top_k, hidden_size,
-            intermediate_size, shared_inter_size, (int)num_shared_experts, x.device());
-        moe_tiny_m_down_cutlass_int4_with_shared_fp16_htile_kernel<int32_t>(
-            (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
-            (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
-            topk_idx_i32.data_ptr<int32_t>(), (const fp16*)shared_intermediates_ptr,
-            (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
-            (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
-            shared_inter_size, (int)num_shared_experts, x.device());
+    auto workspace = acquire_int4_moe_workspace(
+        geometry.n_tokens, top_k, (int)num_shared_experts,
+        geometry.hidden_size, geometry.intermediate_size, x.device());
+    const int32_t* topk_idx_i32 = nullptr;
+    if (topk_idx.scalar_type() == torch::kInt) {
+        topk_idx_i32 = topk_idx.data_ptr<int32_t>();
     } else {
-        moe_ws_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
-            (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
-            (const fp16*)w13_scales.data_ptr(), topk_idx_i32.data_ptr<int32_t>(),
-            (const fp16*)shared_gate_up_weight.data_ptr(),
-            (const fp16*)shared_expert_gate_weight.data_ptr(),
-            routed_intermediates_ptr, shared_intermediates_ptr,
-            shared_gate_values_ptr, n_tokens, top_k, hidden_size,
-            intermediate_size, shared_inter_size, (int)num_shared_experts, x.device());
-        if (n_tokens <= 2) {
-            moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t, 4>(
-                (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
-                (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
-                topk_idx_i32.data_ptr<int32_t>(), (const fp16*)shared_intermediates_ptr,
-                (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
-                (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
-                shared_inter_size, (int)num_shared_experts, x.device());
-        } else {
-            moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t, 8>(
-                (const fp16*)routed_intermediates_ptr, (const uint8_t*)w2_qweight_s4.data_ptr(),
-                (const fp16*)w2_scales.data_ptr(), (const fp16*)topk_weight.data_ptr(),
-                topk_idx_i32.data_ptr<int32_t>(), (const fp16*)shared_intermediates_ptr,
-                (const float*)shared_gate_values_ptr, (const fp16*)shared_down_weight.data_ptr(),
-                (fp16*)final_output.data_ptr(), n_tokens, top_k, hidden_size, intermediate_size,
-                shared_inter_size, (int)num_shared_experts, x.device());
-        }
+        submit_moe_topk_index_int64_to_int32(
+            topk_idx.data_ptr<int64_t>(), workspace.buffers.topk_idx,
+            (size_t)geometry.n_tokens * top_k, x.device());
+        topk_idx_i32 = workspace.buffers.topk_idx;
     }
-    // Buffer is sized to the capacity (>= n_tokens); hand back only this call's rows.
-    return final_output.narrow(0, 0, n_tokens);
+    submit_moe_tiny_full_fp16_shared(
+        x, w13_qweight_s4, w13_scales, w2_qweight_s4, w2_scales,
+        (const fp16*)topk_weight.data_ptr(), topk_idx_i32,
+        shared_gate_up_weight, shared_down_weight,
+        shared_expert_gate_weight, (int)num_shared_experts, top_k,
+        geometry, workspace.buffers);
+    return workspace.buffers.final_output;
 }
 
 torch::Tensor moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits(
@@ -2807,63 +3222,440 @@ torch::Tensor moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits(
     int64_t top_k,
     int64_t num_shared_experts,
     int64_t n_routed_experts) {
+    const auto geometry = check_moe_tiny_full_fp16_shared_inputs(
+        x, w13_qweight_s4, w13_scales, w2_qweight_s4, w2_scales,
+        shared_gate_up_weight, shared_down_weight,
+        shared_expert_gate_weight, num_shared_experts);
+    TORCH_CHECK(
+        logits.device() == x.device() && logits.dim() == 2
+            && logits.size(0) == geometry.n_tokens
+            && logits.scalar_type() == torch::kHalf
+            && logits.is_contiguous());
+    TORCH_CHECK(
+        top_k > 0 && top_k <= std::numeric_limits<int>::max());
+    TORCH_CHECK(
+        n_routed_experts > 0
+            && n_routed_experts <= std::numeric_limits<int>::max());
+    TORCH_CHECK(logits.size(1) == n_routed_experts);
+    TORCH_CHECK(top_k <= n_routed_experts);
+    TORCH_CHECK(
+        n_routed_experts == geometry.n_routed_experts,
+        "n_routed_experts must match the routed weight expert dimension");
 
-    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 64 && x.is_contiguous());
-    TORCH_CHECK(x.scalar_type() == torch::kHalf);
-    TORCH_CHECK(logits.dim() == 2 && logits.size(0) == x.size(0) && logits.is_contiguous());
-    TORCH_CHECK(logits.scalar_type() == torch::kHalf);
-    TORCH_CHECK(w13_qweight_s4.scalar_type() == torch::kByte && w13_qweight_s4.is_contiguous());
-    TORCH_CHECK(w13_scales.scalar_type() == torch::kHalf && w13_scales.is_contiguous());
-    TORCH_CHECK(w2_qweight_s4.scalar_type() == torch::kByte && w2_qweight_s4.is_contiguous());
-    TORCH_CHECK(w2_scales.scalar_type() == torch::kHalf && w2_scales.is_contiguous());
-
-    int n_tokens = x.size(0);
-    int hidden_size = x.size(1);
-    int two_inter = w13_qweight_s4.size(1);
-    int intermediate_size = two_inter / 2;
-    TORCH_CHECK(w13_qweight_s4.size(2) == hidden_size / 2);
-    TORCH_CHECK(w2_qweight_s4.size(1) == hidden_size);
-    TORCH_CHECK(w2_qweight_s4.size(2) == intermediate_size / 2);
-
-    ensure_int4_moe_buffers(n_tokens, (int)top_k, (int)num_shared_experts,
-                            hidden_size, intermediate_size, x.device());
-
-    sycl::queue& queue = c10::xpu::getCurrentXPUStream(logits.device().index()).queue();
-    if (n_routed_experts == 256 && top_k == 8) {
-        moe_topk_v2_host<256, 8>(
-            (const fp16*)logits.data_ptr(),
-            (fp16*)s_int4_topk_weight.data_ptr(),
-            s_int4_topk_idx.data_ptr<int32_t>(),
-            n_tokens, queue);
-    } else if (n_routed_experts == 128 && top_k == 8) {
-        moe_topk_v2_host<128, 8>(
-            (const fp16*)logits.data_ptr(),
-            (fp16*)s_int4_topk_weight.data_ptr(),
-            s_int4_topk_idx.data_ptr<int32_t>(),
-            n_tokens, queue);
-    } else if (n_routed_experts == 128 && top_k == 10) {
-        moe_topk_v2_host<128, 10>(
-            (const fp16*)logits.data_ptr(),
-            (fp16*)s_int4_topk_weight.data_ptr(),
-            s_int4_topk_idx.data_ptr<int32_t>(),
-            n_tokens, queue);
-    } else {
+    auto workspace = acquire_int4_moe_workspace(
+        geometry.n_tokens, (int)top_k, (int)num_shared_experts,
+        geometry.hidden_size, geometry.intermediate_size, x.device());
+    sycl::queue& queue =
+        c10::xpu::getCurrentXPUStream(logits.device().index()).queue();
+    if (!try_moe_topk_v2_int4(
+            (const fp16*)logits.data_ptr(), workspace.buffers.topk_weight,
+            workspace.buffers.topk_idx, geometry.n_tokens,
+            (int)n_routed_experts, (int)top_k, queue)) {
         moe_topk_forward_kernel_impl<class MoeTopKInt4TinyFull>(
-            (const fp16*)logits.data_ptr(),
-            s_int4_topk_idx.data_ptr<int32_t>(),
-            (fp16*)s_int4_topk_weight.data_ptr(),
-            n_tokens, (int)n_routed_experts, (int)top_k, /*norm=*/true,
-            queue);
+            (const fp16*)logits.data_ptr(), workspace.buffers.topk_idx,
+            workspace.buffers.topk_weight, geometry.n_tokens,
+            (int)n_routed_experts, (int)top_k, /*norm=*/true, queue);
+    }
+    submit_moe_tiny_full_fp16_shared(
+        x, w13_qweight_s4, w13_scales, w2_qweight_s4, w2_scales,
+        workspace.buffers.topk_weight, workspace.buffers.topk_idx,
+        shared_gate_up_weight, shared_down_weight,
+        shared_expert_gate_weight, (int)num_shared_experts, (int)top_k,
+        geometry, workspace.buffers);
+    return workspace.buffers.final_output;
+}
+
+static inline void check_moe_asymmetric_v1_tensor(
+    const torch::Tensor& tensor,
+    const char* name,
+    torch::ScalarType scalar_type,
+    c10::IntArrayRef shape,
+    const torch::Device& device) {
+    TORCH_CHECK(tensor.device().is_xpu(), name, " must be on XPU");
+    TORCH_CHECK(tensor.device() == device, name, " must be on the same XPU device as x");
+    TORCH_CHECK(tensor.scalar_type() == scalar_type, name, " has an unsupported dtype");
+    TORCH_CHECK(tensor.sizes() == shape, name, " has an unsupported shape: ", tensor.sizes());
+    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0,
+                name, " data pointer must be 16-byte aligned");
+}
+
+static inline bool moe_asymmetric_v1_tensors_overlap(
+    const torch::Tensor& left,
+    const torch::Tensor& right) {
+    if (left.numel() == 0 || right.numel() == 0) {
+        return false;
+    }
+    const auto left_begin = reinterpret_cast<uintptr_t>(left.data_ptr());
+    const auto right_begin = reinterpret_cast<uintptr_t>(right.data_ptr());
+    const auto left_bytes =
+        static_cast<uintptr_t>(left.numel()) * left.element_size();
+    const auto right_bytes =
+        static_cast<uintptr_t>(right.numel()) * right.element_size();
+    if (left_begin <= right_begin) {
+        return right_begin - left_begin < left_bytes;
+    }
+    return left_begin - right_begin < right_bytes;
+}
+
+struct MoeM1AsymmetricV1Buffers {
+    torch::Tensor topk_idx;
+    torch::Tensor topk_weight;
+    torch::Tensor intermediates;
+    torch::Tensor gate_values;
+};
+
+// Keep this fixed-geometry ABI isolated from the generic grow-only cache. The
+// generic cache currently keys only on token capacity, so publishing P128/H2560
+// buffers there could make a later equal-width call reuse incompatible storage.
+// A separate value per c10 XPU stream also prevents cross-queue scratch races.
+static thread_local std::unordered_map<
+    c10::xpu::XPUStream, MoeM1AsymmetricV1Buffers>
+    s_moe_m1_asymmetric_v1_buffers_by_stream;
+
+static MoeM1AsymmetricV1Buffers& ensure_moe_m1_asymmetric_v1_buffers(
+    const torch::Device& device,
+    const c10::xpu::XPUStream& stream) {
+    constexpr int N_TOKENS = 1;
+    constexpr int TOP_K = 10;
+    constexpr int ROUTED_INTERMEDIATE_SIZE = 128;
+    constexpr int NUM_SHARED_EXPERTS = 1;
+    constexpr int ROWS = N_TOKENS * (TOP_K + NUM_SHARED_EXPERTS);
+
+    auto existing = s_moe_m1_asymmetric_v1_buffers_by_stream.find(stream);
+    if (existing != s_moe_m1_asymmetric_v1_buffers_by_stream.end()) {
+        return existing->second;
     }
 
-    // The topk buffers are now sized to the capacity (>= n_tokens); narrow to
-    // this call's rows so the callee's `topk.size(0) == x.size(0)` checks hold.
-    // A dim-0 prefix narrow of a contiguous tensor stays contiguous.
-    return moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared(
-        x, w13_qweight_s4, w13_scales, w2_qweight_s4, w2_scales,
-        s_int4_topk_weight.narrow(0, 0, n_tokens),
-        s_int4_topk_idx.narrow(0, 0, n_tokens), shared_gate_up_weight,
-        shared_down_weight, shared_expert_gate_weight, num_shared_experts);
+    // Build the complete cache entry locally. Allocation failure destroys this
+    // candidate and leaves the published per-stream map unchanged.
+    MoeM1AsymmetricV1Buffers candidate;
+    auto int_options = torch::device(device).dtype(torch::kInt32);
+    auto half_options = torch::device(device).dtype(torch::kHalf);
+    candidate.topk_idx = torch::empty({N_TOKENS, TOP_K}, int_options);
+    candidate.topk_weight = torch::empty({N_TOKENS, TOP_K}, half_options);
+    candidate.intermediates =
+        torch::empty({ROWS, ROUTED_INTERMEDIATE_SIZE}, half_options);
+    candidate.gate_values = torch::empty(
+        {N_TOKENS * NUM_SHARED_EXPERTS},
+        torch::device(device).dtype(torch::kFloat));
+    auto committed = s_moe_m1_asymmetric_v1_buffers_by_stream.emplace(
+        stream, std::move(candidate));
+    return committed.first->second;
+}
+
+torch::Tensor moe_forward_m1_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1(
+    torch::Tensor x,
+    torch::Tensor logits,
+    torch::Tensor w13_qweight_s4,
+    torch::Tensor w13_scales,
+    torch::Tensor w2_qweight_s4,
+    torch::Tensor w2_scales,
+    torch::Tensor shared_gate_up_weight,
+    torch::Tensor shared_down_weight,
+    torch::Tensor shared_expert_gate_weight,
+    torch::Tensor output,
+    int64_t top_k,
+    int64_t num_shared_experts,
+    int64_t n_routed_experts) {
+
+    constexpr int N_TOKENS = 1;
+    constexpr int HIDDEN_SIZE = 2560;
+    constexpr int N_ROUTED_EXPERTS = 512;
+    constexpr int TOP_K = 10;
+    constexpr int ROUTED_INTERMEDIATE_SIZE = 128;
+    constexpr int SHARED_INTERMEDIATE_SIZE = 80;
+    constexpr int NUM_SHARED_EXPERTS = 1;
+
+    TORCH_CHECK(top_k == TOP_K,
+                "asymmetric out v1 requires top_k=10");
+    TORCH_CHECK(num_shared_experts == NUM_SHARED_EXPERTS,
+                "asymmetric out v1 requires one shared expert");
+    TORCH_CHECK(n_routed_experts == N_ROUTED_EXPERTS,
+                "asymmetric out v1 requires 512 routed experts");
+
+    const torch::Device device = x.device();
+    check_moe_asymmetric_v1_tensor(
+        x, "x", torch::kHalf, {N_TOKENS, HIDDEN_SIZE}, device);
+    check_moe_asymmetric_v1_tensor(
+        logits, "logits", torch::kHalf,
+        {N_TOKENS, N_ROUTED_EXPERTS}, device);
+    check_moe_asymmetric_v1_tensor(
+        w13_qweight_s4, "w13_qweight_s4", torch::kByte,
+        {N_ROUTED_EXPERTS, 2 * ROUTED_INTERMEDIATE_SIZE, HIDDEN_SIZE / 2},
+        device);
+    check_moe_asymmetric_v1_tensor(
+        w13_scales, "w13_scales", torch::kHalf,
+        {N_ROUTED_EXPERTS, 2 * ROUTED_INTERMEDIATE_SIZE, HIDDEN_SIZE / 128},
+        device);
+    check_moe_asymmetric_v1_tensor(
+        w2_qweight_s4, "w2_qweight_s4", torch::kByte,
+        {N_ROUTED_EXPERTS, HIDDEN_SIZE, ROUTED_INTERMEDIATE_SIZE / 2},
+        device);
+    check_moe_asymmetric_v1_tensor(
+        w2_scales, "w2_scales", torch::kHalf,
+        {N_ROUTED_EXPERTS, HIDDEN_SIZE, ROUTED_INTERMEDIATE_SIZE / 128},
+        device);
+    check_moe_asymmetric_v1_tensor(
+        shared_gate_up_weight, "shared_gate_up_weight", torch::kHalf,
+        {2 * SHARED_INTERMEDIATE_SIZE, HIDDEN_SIZE}, device);
+    check_moe_asymmetric_v1_tensor(
+        shared_down_weight, "shared_down_weight", torch::kHalf,
+        {HIDDEN_SIZE, SHARED_INTERMEDIATE_SIZE}, device);
+    check_moe_asymmetric_v1_tensor(
+        shared_expert_gate_weight, "shared_expert_gate_weight", torch::kHalf,
+        {NUM_SHARED_EXPERTS, HIDDEN_SIZE}, device);
+    check_moe_asymmetric_v1_tensor(
+        output, "output", torch::kHalf, {N_TOKENS, HIDDEN_SIZE}, device);
+    TORCH_CHECK(
+        !moe_asymmetric_v1_tensors_overlap(output, x) &&
+            !moe_asymmetric_v1_tensors_overlap(output, logits) &&
+            !moe_asymmetric_v1_tensors_overlap(output, w13_qweight_s4) &&
+            !moe_asymmetric_v1_tensors_overlap(output, w13_scales) &&
+            !moe_asymmetric_v1_tensors_overlap(output, w2_qweight_s4) &&
+            !moe_asymmetric_v1_tensors_overlap(output, w2_scales) &&
+            !moe_asymmetric_v1_tensors_overlap(output, shared_gate_up_weight) &&
+            !moe_asymmetric_v1_tensors_overlap(output, shared_down_weight) &&
+            !moe_asymmetric_v1_tensors_overlap(
+                output, shared_expert_gate_weight),
+        "output must not alias any input tensor");
+
+    // Every contract check above precedes allocation and the first native submit.
+    auto stream = c10::xpu::getCurrentXPUStream(device.index());
+    sycl::queue& queue = stream.queue();
+    TORCH_CHECK(stream.device_index() == device.index(),
+                "current XPU stream does not match x device");
+    TORCH_CHECK(queue.get_context() == c10::xpu::get_device_context(),
+                "current XPU stream uses a foreign SYCL context");
+    TORCH_CHECK(
+        queue.get_device() == c10::xpu::get_raw_device(device.index()),
+        "current XPU stream queue does not match x device");
+    auto& buffers = ensure_moe_m1_asymmetric_v1_buffers(device, stream);
+
+    moe_topk_v2_host<N_ROUTED_EXPERTS, TOP_K>(
+        (const fp16*)logits.data_ptr(),
+        (fp16*)buffers.topk_weight.data_ptr(),
+        buffers.topk_idx.data_ptr<int32_t>(), N_TOKENS, queue);
+
+    fp16* routed_intermediates_ptr = (fp16*)buffers.intermediates.data_ptr();
+    fp16* shared_intermediates_ptr = routed_intermediates_ptr
+        + (size_t)N_TOKENS * TOP_K * ROUTED_INTERMEDIATE_SIZE;
+    float* shared_gate_values_ptr = (float*)buffers.gate_values.data_ptr();
+
+    moe_tiny_m_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
+        (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
+        (const fp16*)w13_scales.data_ptr(),
+        buffers.topk_idx.data_ptr<int32_t>(),
+        (const fp16*)shared_gate_up_weight.data_ptr(),
+        (const fp16*)shared_expert_gate_weight.data_ptr(),
+        routed_intermediates_ptr, shared_intermediates_ptr,
+        shared_gate_values_ptr, N_TOKENS, TOP_K, HIDDEN_SIZE,
+        ROUTED_INTERMEDIATE_SIZE, SHARED_INTERMEDIATE_SIZE,
+        NUM_SHARED_EXPERTS, device);
+    moe_tiny_m_down_cutlass_int4_with_shared_fp16_htile_kernel<int32_t>(
+        (const fp16*)routed_intermediates_ptr,
+        (const uint8_t*)w2_qweight_s4.data_ptr(),
+        (const fp16*)w2_scales.data_ptr(),
+        (const fp16*)buffers.topk_weight.data_ptr(),
+        buffers.topk_idx.data_ptr<int32_t>(),
+        (const fp16*)shared_intermediates_ptr,
+        (const float*)shared_gate_values_ptr,
+        (const fp16*)shared_down_weight.data_ptr(),
+        (fp16*)output.data_ptr(), N_TOKENS, TOP_K, HIDDEN_SIZE,
+        ROUTED_INTERMEDIATE_SIZE, SHARED_INTERMEDIATE_SIZE,
+        NUM_SHARED_EXPERTS, device);
+
+    return output;
+}
+
+struct MoeMultiMAsymmetricV1Buffers {
+    torch::Tensor topk_idx;
+    torch::Tensor topk_weight;
+    torch::Tensor routed_intermediates;
+    torch::Tensor shared_intermediates;
+    torch::Tensor gate_values;
+};
+
+// This fixed Qwen3.8 geometry is isolated from both the legacy grow-only cache
+// and the M=1 cache. Allocate the full supported token capacity once per XPU
+// stream so steady-state dispatch neither reallocates nor races another queue.
+static thread_local std::unordered_map<
+    c10::xpu::XPUStream, MoeMultiMAsymmetricV1Buffers>
+    s_moe_multi_m_asymmetric_v1_buffers_by_stream;
+
+static MoeMultiMAsymmetricV1Buffers& ensure_moe_multi_m_asymmetric_v1_buffers(
+    const torch::Device& device,
+    const c10::xpu::XPUStream& stream) {
+    constexpr int MAX_N_TOKENS = 32;
+    constexpr int TOP_K = 10;
+    constexpr int ROUTED_INTERMEDIATE_SIZE = 128;
+    constexpr int SHARED_INTERMEDIATE_SIZE = 80;
+    constexpr int NUM_SHARED_EXPERTS = 1;
+
+    auto existing = s_moe_multi_m_asymmetric_v1_buffers_by_stream.find(stream);
+    if (existing != s_moe_multi_m_asymmetric_v1_buffers_by_stream.end()) {
+        return existing->second;
+    }
+
+    // Publish only after every allocation succeeds, preserving the previous
+    // per-stream entry if allocation raises.
+    MoeMultiMAsymmetricV1Buffers candidate;
+    auto int_options = torch::device(device).dtype(torch::kInt32);
+    auto half_options = torch::device(device).dtype(torch::kHalf);
+    candidate.topk_idx = torch::empty({MAX_N_TOKENS, TOP_K}, int_options);
+    candidate.topk_weight = torch::empty({MAX_N_TOKENS, TOP_K}, half_options);
+    candidate.routed_intermediates = torch::empty(
+        {MAX_N_TOKENS * TOP_K, ROUTED_INTERMEDIATE_SIZE}, half_options);
+    candidate.shared_intermediates = torch::empty(
+        {MAX_N_TOKENS * NUM_SHARED_EXPERTS, SHARED_INTERMEDIATE_SIZE},
+        half_options);
+    candidate.gate_values = torch::empty(
+        {MAX_N_TOKENS * NUM_SHARED_EXPERTS},
+        torch::device(device).dtype(torch::kFloat));
+    auto committed = s_moe_multi_m_asymmetric_v1_buffers_by_stream.emplace(
+        stream, std::move(candidate));
+    return committed.first->second;
+}
+
+torch::Tensor moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1(
+    torch::Tensor x,
+    torch::Tensor logits,
+    torch::Tensor w13_qweight_s4,
+    torch::Tensor w13_scales,
+    torch::Tensor w2_qweight_s4,
+    torch::Tensor w2_scales,
+    torch::Tensor shared_gate_up_weight,
+    torch::Tensor shared_down_weight,
+    torch::Tensor shared_expert_gate_weight,
+    torch::Tensor output,
+    int64_t top_k,
+    int64_t num_shared_experts,
+    int64_t n_routed_experts) {
+
+    constexpr int MIN_N_TOKENS = 2;
+    constexpr int MAX_N_TOKENS = 32;
+    constexpr int HIDDEN_SIZE = 2560;
+    constexpr int N_ROUTED_EXPERTS = 512;
+    constexpr int TOP_K = 10;
+    constexpr int ROUTED_INTERMEDIATE_SIZE = 128;
+    constexpr int SHARED_INTERMEDIATE_SIZE = 80;
+    constexpr int NUM_SHARED_EXPERTS = 1;
+
+    TORCH_CHECK(top_k == TOP_K,
+                "multi-m asymmetric out v1 requires top_k=10");
+    TORCH_CHECK(num_shared_experts == NUM_SHARED_EXPERTS,
+                "multi-m asymmetric out v1 requires one shared expert");
+    TORCH_CHECK(n_routed_experts == N_ROUTED_EXPERTS,
+                "multi-m asymmetric out v1 requires 512 routed experts");
+    TORCH_CHECK(x.dim() == 2,
+                "multi-m asymmetric out v1 requires rank-2 x");
+    const int n_tokens = (int)x.size(0);
+    TORCH_CHECK(n_tokens >= MIN_N_TOKENS && n_tokens <= MAX_N_TOKENS,
+                "multi-m asymmetric out v1 requires 2..32 tokens");
+
+    const torch::Device device = x.device();
+    check_moe_asymmetric_v1_tensor(
+        x, "x", torch::kHalf, {n_tokens, HIDDEN_SIZE}, device);
+    check_moe_asymmetric_v1_tensor(
+        logits, "logits", torch::kHalf,
+        {n_tokens, N_ROUTED_EXPERTS}, device);
+    check_moe_asymmetric_v1_tensor(
+        w13_qweight_s4, "w13_qweight_s4", torch::kByte,
+        {N_ROUTED_EXPERTS, 2 * ROUTED_INTERMEDIATE_SIZE, HIDDEN_SIZE / 2},
+        device);
+    check_moe_asymmetric_v1_tensor(
+        w13_scales, "w13_scales", torch::kHalf,
+        {N_ROUTED_EXPERTS, 2 * ROUTED_INTERMEDIATE_SIZE, HIDDEN_SIZE / 128},
+        device);
+    check_moe_asymmetric_v1_tensor(
+        w2_qweight_s4, "w2_qweight_s4", torch::kByte,
+        {N_ROUTED_EXPERTS, HIDDEN_SIZE, ROUTED_INTERMEDIATE_SIZE / 2},
+        device);
+    check_moe_asymmetric_v1_tensor(
+        w2_scales, "w2_scales", torch::kHalf,
+        {N_ROUTED_EXPERTS, HIDDEN_SIZE, ROUTED_INTERMEDIATE_SIZE / 128},
+        device);
+    check_moe_asymmetric_v1_tensor(
+        shared_gate_up_weight, "shared_gate_up_weight", torch::kHalf,
+        {2 * SHARED_INTERMEDIATE_SIZE, HIDDEN_SIZE}, device);
+    check_moe_asymmetric_v1_tensor(
+        shared_down_weight, "shared_down_weight", torch::kHalf,
+        {HIDDEN_SIZE, SHARED_INTERMEDIATE_SIZE}, device);
+    check_moe_asymmetric_v1_tensor(
+        shared_expert_gate_weight, "shared_expert_gate_weight", torch::kHalf,
+        {NUM_SHARED_EXPERTS, HIDDEN_SIZE}, device);
+    check_moe_asymmetric_v1_tensor(
+        output, "output", torch::kHalf, {n_tokens, HIDDEN_SIZE}, device);
+    TORCH_CHECK(
+        !moe_asymmetric_v1_tensors_overlap(output, x) &&
+            !moe_asymmetric_v1_tensors_overlap(output, logits) &&
+            !moe_asymmetric_v1_tensors_overlap(output, w13_qweight_s4) &&
+            !moe_asymmetric_v1_tensors_overlap(output, w13_scales) &&
+            !moe_asymmetric_v1_tensors_overlap(output, w2_qweight_s4) &&
+            !moe_asymmetric_v1_tensors_overlap(output, w2_scales) &&
+            !moe_asymmetric_v1_tensors_overlap(output, shared_gate_up_weight) &&
+            !moe_asymmetric_v1_tensors_overlap(output, shared_down_weight) &&
+            !moe_asymmetric_v1_tensors_overlap(
+                output, shared_expert_gate_weight),
+        "output must not alias any input tensor");
+
+    // All tensor/scalar/alias checks precede cache allocation and submission.
+    auto stream = c10::xpu::getCurrentXPUStream(device.index());
+    sycl::queue& queue = stream.queue();
+    TORCH_CHECK(stream.device_index() == device.index(),
+                "current XPU stream does not match x device");
+    TORCH_CHECK(queue.get_context() == c10::xpu::get_device_context(),
+                "current XPU stream uses a foreign SYCL context");
+    TORCH_CHECK(
+        queue.get_device() == c10::xpu::get_raw_device(device.index()),
+        "current XPU stream queue does not match x device");
+    auto& buffers = ensure_moe_multi_m_asymmetric_v1_buffers(device, stream);
+
+    moe_topk_v2_host<N_ROUTED_EXPERTS, TOP_K>(
+        (const fp16*)logits.data_ptr(),
+        (fp16*)buffers.topk_weight.data_ptr(),
+        buffers.topk_idx.data_ptr<int32_t>(), n_tokens, queue);
+
+    moe_ws_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
+        (const fp16*)x.data_ptr(), (const uint8_t*)w13_qweight_s4.data_ptr(),
+        (const fp16*)w13_scales.data_ptr(),
+        buffers.topk_idx.data_ptr<int32_t>(),
+        (const fp16*)shared_gate_up_weight.data_ptr(),
+        (const fp16*)shared_expert_gate_weight.data_ptr(),
+        (fp16*)buffers.routed_intermediates.data_ptr(),
+        (fp16*)buffers.shared_intermediates.data_ptr(),
+        buffers.gate_values.data_ptr<float>(), n_tokens, TOP_K, HIDDEN_SIZE,
+        ROUTED_INTERMEDIATE_SIZE, SHARED_INTERMEDIATE_SIZE,
+        NUM_SHARED_EXPERTS, device);
+    if (n_tokens <= 2) {
+        moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t, 4>(
+            (const fp16*)buffers.routed_intermediates.data_ptr(),
+            (const uint8_t*)w2_qweight_s4.data_ptr(),
+            (const fp16*)w2_scales.data_ptr(),
+            (const fp16*)buffers.topk_weight.data_ptr(),
+            buffers.topk_idx.data_ptr<int32_t>(),
+            (const fp16*)buffers.shared_intermediates.data_ptr(),
+            (const float*)buffers.gate_values.data_ptr(),
+            (const fp16*)shared_down_weight.data_ptr(),
+            (fp16*)output.data_ptr(), n_tokens, TOP_K, HIDDEN_SIZE,
+            ROUTED_INTERMEDIATE_SIZE, SHARED_INTERMEDIATE_SIZE,
+            NUM_SHARED_EXPERTS, device);
+    } else {
+        moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t, 8>(
+            (const fp16*)buffers.routed_intermediates.data_ptr(),
+            (const uint8_t*)w2_qweight_s4.data_ptr(),
+            (const fp16*)w2_scales.data_ptr(),
+            (const fp16*)buffers.topk_weight.data_ptr(),
+            buffers.topk_idx.data_ptr<int32_t>(),
+            (const fp16*)buffers.shared_intermediates.data_ptr(),
+            (const float*)buffers.gate_values.data_ptr(),
+            (const fp16*)shared_down_weight.data_ptr(),
+            (fp16*)output.data_ptr(), n_tokens, TOP_K, HIDDEN_SIZE,
+            ROUTED_INTERMEDIATE_SIZE, SHARED_INTERMEDIATE_SIZE,
+            NUM_SHARED_EXPERTS, device);
+    }
+
+    return output;
 }
 
 torch::Tensor moe_tiny_fp16_shared_up(
@@ -2978,37 +3770,24 @@ torch::Tensor moe_forward_full_int4(
     TORCH_CHECK(intermediate_size % 16 == 0, "intermediate_size must be divisible by 16");
     TORCH_CHECK(hidden_size % 16 == 0, "hidden_size must be divisible by 16");
 
-    ensure_int4_moe_buffers(n_tokens, top_k, num_shared_experts, hidden_size,
-                            intermediate_size, x.device());
-    // Rotate the final-output ring (caller holds the result across the layer).
-    auto& final_output = s_int4_take_final_output();
+    auto workspace = acquire_int4_moe_workspace(
+        n_tokens, (int)top_k, (int)num_shared_experts, hidden_size,
+        intermediate_size, x.device());
+    auto& buffers = workspace.buffers;
+    auto& final_output = buffers.final_output;
 
     sycl::queue& queue = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
 
     // ── TopK (V2 vectorized argmax when supported, fallback to heap-based) ──
-    if (n_routed_experts == 256 && top_k == 8) {
-        moe_topk_v2_host<256, 8>(
+    if (!try_moe_topk_v2_int4(
             (const fp16*)logits.data_ptr(),
-            (fp16*)s_int4_topk_weight.data_ptr(),
-            s_int4_topk_idx.data_ptr<int32_t>(),
-            n_tokens, queue);
-    } else if (n_routed_experts == 128 && top_k == 8) {
-        moe_topk_v2_host<128, 8>(
-            (const fp16*)logits.data_ptr(),
-            (fp16*)s_int4_topk_weight.data_ptr(),
-            s_int4_topk_idx.data_ptr<int32_t>(),
-            n_tokens, queue);
-    } else if (n_routed_experts == 128 && top_k == 10) {
-        moe_topk_v2_host<128, 10>(
-            (const fp16*)logits.data_ptr(),
-            (fp16*)s_int4_topk_weight.data_ptr(),
-            s_int4_topk_idx.data_ptr<int32_t>(),
-            n_tokens, queue);
-    } else {
+            buffers.topk_weight,
+            buffers.topk_idx, n_tokens,
+            (int)n_routed_experts, (int)top_k, queue)) {
         moe_topk_forward_kernel_impl<class MoeTopKInt4>(
             (const fp16*)logits.data_ptr(),
-            s_int4_topk_idx.data_ptr<int>(),
-            (fp16*)s_int4_topk_weight.data_ptr(),
+            buffers.topk_idx,
+            buffers.topk_weight,
             n_tokens, (int)n_routed_experts, (int)top_k, /*norm=*/true,
             queue);
     }
@@ -3021,8 +3800,8 @@ torch::Tensor moe_forward_full_int4(
             (const fp16*)x.data_ptr(),
             (const uint32_t*)gate_up_qweight.data_ptr(),
             (const fp16*)gate_up_scales.data_ptr(),
-            s_int4_topk_idx.data_ptr<int>(),
-            (fp16*)s_int4_intermediates.data_ptr(),
+            buffers.topk_idx,
+            buffers.intermediates,
             n_tokens, hidden_size, intermediate_size,
             top_k, rows_per_token, use_ggml_layout, x.device());
     } else {
@@ -3030,8 +3809,8 @@ torch::Tensor moe_forward_full_int4(
             (const fp16*)x.data_ptr(),
             (const uint32_t*)gate_up_qweight.data_ptr(),
             (const fp16*)gate_up_scales.data_ptr(),
-            s_int4_topk_idx.data_ptr<int>(),
-            (fp16*)s_int4_intermediates.data_ptr(),
+            buffers.topk_idx,
+            buffers.intermediates,
             n_tokens, hidden_size, intermediate_size,
             top_k, rows_per_token, use_ggml_layout, x.device());
     }
@@ -3049,7 +3828,7 @@ torch::Tensor moe_forward_full_int4(
             (const fp16*)x.data_ptr(),
             (const uint32_t*)shared_gu_reshaped.data_ptr(),
             (const fp16*)shared_gate_up_scale.data_ptr(),  // scales NOT repacked
-            (fp16*)s_int4_intermediates.data_ptr(),
+            buffers.intermediates,
             n_tokens, hidden_size, shared_intermediate_size,
             intermediate_size,
             top_k, num_shared_experts, rows_per_token,
@@ -3058,7 +3837,7 @@ torch::Tensor moe_forward_full_int4(
         moe_up_shared_fp16_kernel(
             (const fp16*)x.data_ptr(),
             (const fp16*)shared_gate_up_weight.data_ptr(),
-            (fp16*)s_int4_intermediates.data_ptr(),
+            buffers.intermediates,
             n_tokens, hidden_size, shared_intermediate_size,
             intermediate_size,
             top_k, num_shared_experts, rows_per_token, x.device());
@@ -3068,22 +3847,22 @@ torch::Tensor moe_forward_full_int4(
     int down_wis = n_tokens * top_k * (hidden_size / 16);
     if (down_wis < 2048) {
         moe_down_routed_int4_slm_kernel(
-            (const fp16*)s_int4_intermediates.data_ptr(),
+            buffers.intermediates,
             (const uint32_t*)down_qweight.data_ptr(),
             (const fp16*)down_scales.data_ptr(),
-            (const fp16*)s_int4_topk_weight.data_ptr(),
-            s_int4_topk_idx.data_ptr<int>(),
-            (fp16*)s_int4_routed_output.data_ptr(),
+            buffers.topk_weight,
+            buffers.topk_idx,
+            buffers.routed_output,
             n_tokens, hidden_size, intermediate_size,
             top_k, rows_per_token, use_ggml_layout, x.device());
     } else {
         moe_down_routed_int4_kernel(
-            (const fp16*)s_int4_intermediates.data_ptr(),
+            buffers.intermediates,
             (const uint32_t*)down_qweight.data_ptr(),
             (const fp16*)down_scales.data_ptr(),
-            (const fp16*)s_int4_topk_weight.data_ptr(),
-            s_int4_topk_idx.data_ptr<int>(),
-            (fp16*)s_int4_routed_output.data_ptr(),
+            buffers.topk_weight,
+            buffers.topk_idx,
+            buffers.routed_output,
             n_tokens, hidden_size, intermediate_size,
             top_k, rows_per_token, use_ggml_layout, x.device());
     }
@@ -3097,7 +3876,7 @@ torch::Tensor moe_forward_full_int4(
         moe_down_gate_precompute_int4_kernel(
             (const fp16*)x.data_ptr(),
             (const fp16*)shared_expert_gate_weight.data_ptr(),
-            s_int4_gate_values.data_ptr<float>(),
+            buffers.gate_values,
             n_tokens, hidden_size, num_shared_experts, x.device());
 
         // Shared expert down GEMV (standalone, parallel over tokens × hidden)
@@ -3107,20 +3886,20 @@ torch::Tensor moe_forward_full_int4(
             auto shared_dw_reshaped = shared_down_weight.reshape(
                 {hidden_size, K_packed_down});
             moe_down_shared_int4_standalone_kernel(
-                (const fp16*)s_int4_intermediates.data_ptr(),
+                buffers.intermediates,
                 (const uint32_t*)shared_dw_reshaped.data_ptr(),
                 (const fp16*)shared_down_scale.data_ptr(),
-                s_int4_gate_values.data_ptr<float>(),
-                (fp16*)s_int4_routed_output.data_ptr(),
+                buffers.gate_values,
+                buffers.routed_output,
                 n_tokens, hidden_size, shared_intermediate_size,
                 intermediate_size, K_packed_down, K_groups_down,
                 top_k, num_shared_experts, rows_per_token, x.device());
         } else {
             moe_down_shared_fp16_standalone_kernel(
-                (const fp16*)s_int4_intermediates.data_ptr(),
+                buffers.intermediates,
                 (const fp16*)shared_down_weight.data_ptr(),
-                s_int4_gate_values.data_ptr<float>(),
-                (fp16*)s_int4_routed_output.data_ptr(),
+                buffers.gate_values,
+                buffers.routed_output,
                 n_tokens, hidden_size, shared_intermediate_size,
                 intermediate_size,
                 top_k, num_shared_experts, rows_per_token, x.device());
@@ -3128,7 +3907,7 @@ torch::Tensor moe_forward_full_int4(
 
         // Accumulate all rows (routed + shared) per token
         moe_accumulate_int4_kernel(
-            (const fp16*)s_int4_routed_output.data_ptr(),
+            buffers.routed_output,
             (fp16*)final_output.data_ptr(),
             n_tokens, hidden_size, rows_per_token, x.device());
     } else {
@@ -3140,8 +3919,8 @@ torch::Tensor moe_forward_full_int4(
                 {hidden_size, K_packed_down});
             moe_down_finalize_int4_kernel(
                 (const fp16*)x.data_ptr(),
-                (const fp16*)s_int4_intermediates.data_ptr(),
-                (const fp16*)s_int4_routed_output.data_ptr(),
+                buffers.intermediates,
+                buffers.routed_output,
                 (const uint32_t*)shared_dw_reshaped.data_ptr(),
                 (const fp16*)shared_down_scale.data_ptr(),
                 (const fp16*)shared_expert_gate_weight.data_ptr(),
@@ -3152,8 +3931,8 @@ torch::Tensor moe_forward_full_int4(
         } else {
             moe_down_finalize_fp16_kernel(
                 (const fp16*)x.data_ptr(),
-                (const fp16*)s_int4_intermediates.data_ptr(),
-                (const fp16*)s_int4_routed_output.data_ptr(),
+                buffers.intermediates,
+                buffers.routed_output,
                 (const fp16*)shared_down_weight.data_ptr(),
                 (const fp16*)shared_expert_gate_weight.data_ptr(),
                 (fp16*)final_output.data_ptr(),
@@ -3163,8 +3942,7 @@ torch::Tensor moe_forward_full_int4(
         }
     }
 
-    // Buffer is sized to the capacity (>= n_tokens); hand back only this call's rows.
-    return final_output.narrow(0, 0, n_tokens);
+    return final_output;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3732,14 +4510,15 @@ torch::Tensor moe_forward_cutlass_nmajor_int4_full(
 
     auto topk_w = torch::empty({M,top_k}, torch::device(x.device()).dtype(torch::kHalf));
     auto topk_i = torch::empty({M,top_k}, torch::device(x.device()).dtype(torch::kInt));
-    if(n_routed_experts==256 && top_k==8)
-        moe_topk_v2_host<256,8>((const fp16*)logits.data_ptr(),(fp16*)topk_w.data_ptr(),topk_i.data_ptr<int32_t>(),M,q);
-    else if(n_routed_experts==128 && top_k==8)
-        moe_topk_v2_host<128,8>((const fp16*)logits.data_ptr(),(fp16*)topk_w.data_ptr(),topk_i.data_ptr<int32_t>(),M,q);
-    else if(n_routed_experts==128 && top_k==10)
-        moe_topk_v2_host<128,10>((const fp16*)logits.data_ptr(),(fp16*)topk_w.data_ptr(),topk_i.data_ptr<int32_t>(),M,q);
-    else
-        moe_topk_forward_kernel_impl<class MoeCNMFullTopK>((const fp16*)logits.data_ptr(),topk_i.data_ptr<int32_t>(),(fp16*)topk_w.data_ptr(),M,(int)n_routed_experts,top_k,true,q);
+    if (!try_moe_topk_v2_int4(
+            (const fp16*)logits.data_ptr(), (fp16*)topk_w.data_ptr(),
+            topk_i.data_ptr<int32_t>(), M, (int)n_routed_experts,
+            (int)top_k, q)) {
+        moe_topk_forward_kernel_impl<class MoeCNMFullTopK>(
+            (const fp16*)logits.data_ptr(), topk_i.data_ptr<int32_t>(),
+            (fp16*)topk_w.data_ptr(), M, (int)n_routed_experts,
+            (int)top_k, true, q);
+    }
 
     auto inter = torch::empty({M*top_k,I}, torch::device(x.device()).dtype(torch::kHalf));
     auto output = torch::empty({M,H}, torch::device(x.device()).dtype(torch::kHalf));
@@ -3935,6 +4714,14 @@ TORCH_LIBRARY_FRAGMENT(moe_int4_ops, m) {
                 "Tensor w13_qweight_s4, Tensor w13_scales, Tensor w2_qweight_s4, Tensor w2_scales, "
                 "Tensor shared_gate_up_weight, Tensor shared_down_weight, Tensor shared_expert_gate_weight, "
                 "int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
+            m.def("moe_forward_m1_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1(Tensor x, Tensor logits, "
+                "Tensor w13_qweight_s4, Tensor w13_scales, Tensor w2_qweight_s4, Tensor w2_scales, "
+                "Tensor shared_gate_up_weight, Tensor shared_down_weight, Tensor shared_expert_gate_weight, "
+                "Tensor(a!) output, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor(a!)");
+            m.def("moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1(Tensor x, Tensor logits, "
+                "Tensor w13_qweight_s4, Tensor w13_scales, Tensor w2_qweight_s4, Tensor w2_scales, "
+                "Tensor shared_gate_up_weight, Tensor shared_down_weight, Tensor shared_expert_gate_weight, "
+                "Tensor(a!) output, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor(a!)");
                 m.def("moe_tiny_fp16_shared_up(Tensor x, Tensor shared_gate_up_weight, int num_shared_experts) -> Tensor");
                 m.def("moe_tiny_fp16_shared_finalize(Tensor x, Tensor shared_intermediates, Tensor routed_output, "
                     "Tensor shared_down_weight, Tensor shared_expert_gate_weight, int num_shared_experts) -> Tensor");
@@ -3971,6 +4758,8 @@ TORCH_LIBRARY_IMPL(moe_int4_ops, XPU, m) {
     m.impl("moe_tiny_cutlass_nmajor_int4_down", &moe_tiny_cutlass_nmajor_int4_down);
     m.impl("moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared", &moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared);
     m.impl("moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits", &moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits);
+    m.impl("moe_forward_m1_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1", &moe_forward_m1_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1);
+    m.impl("moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1", &moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1);
     m.impl("moe_tiny_fp16_shared_up", &moe_tiny_fp16_shared_up);
     m.impl("moe_tiny_fp16_shared_finalize", &moe_tiny_fp16_shared_finalize);
     m.impl("moe_forward_full_int4", &moe_forward_full_int4);
@@ -3992,6 +4781,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_tiny_cutlass_nmajor_int4_down", &moe_tiny_cutlass_nmajor_int4_down);
     m.def("moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared", &moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared);
     m.def("moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits", &moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits);
+    m.def("moe_forward_m1_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1", &moe_forward_m1_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1);
+    m.def("moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1", &moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1);
     m.def("moe_tiny_fp16_shared_up", &moe_tiny_fp16_shared_up);
     m.def("moe_tiny_fp16_shared_finalize", &moe_tiny_fp16_shared_finalize);
     m.def("moe_forward_full_int4", &moe_forward_full_int4);

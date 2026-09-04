@@ -1,0 +1,547 @@
+// Copyright 2026
+// SPDX-License-Identifier: Apache-2.0
+//
+// Fixed-contract streaming group compression for Qwen3.8 QSA decode.
+
+#include "qsa_ops.h"
+
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/sycl.hpp>
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <limits>
+#include <utility>
+#include <type_traits>
+
+namespace qsa {
+namespace {
+
+constexpr int64_t kHeadDim = 128;
+constexpr int64_t kCompressionTile = 32;
+constexpr int64_t kCompressionRatio = 4;
+constexpr int64_t kPositionWidth = 3;
+
+using fp16 = sycl::half;
+using bf16 = sycl::ext::oneapi::bfloat16;
+using namespace sycl::ext::intel::esimd;
+
+template <typename scalar_t>
+class QsaGroupCompressionKernel;
+
+bool is_positive_non_overlapping(const at::Tensor& tensor) {
+  std::array<std::pair<int64_t, int64_t>, 4> dimensions{};
+  int64_t dimension_count = 0;
+  for (int64_t dimension = 0; dimension < tensor.dim(); ++dimension) {
+    const int64_t size = tensor.size(dimension);
+    if (size <= 1) {
+      continue;
+    }
+    const int64_t stride = tensor.stride(dimension);
+    if (stride <= 0 || dimension_count == dimensions.size()) {
+      return false;
+    }
+    dimensions[dimension_count++] = {stride, size};
+  }
+  std::sort(
+      dimensions.begin(), dimensions.begin() + dimension_count,
+      [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+
+  int64_t required_span = 1;
+  for (int64_t dimension = 0; dimension < dimension_count; ++dimension) {
+    const auto [stride, size] = dimensions[dimension];
+    if (stride < required_span) {
+      return false;
+    }
+    const int64_t extent = size - 1;
+    if (extent > std::numeric_limits<int64_t>::max() / stride) {
+      return false;
+    }
+    const int64_t contribution = extent * stride;
+    if (required_span >
+        std::numeric_limits<int64_t>::max() - contribution) {
+      return false;
+    }
+    required_span += contribution;
+  }
+  return true;
+}
+
+// Prove the exact packed MRoPE key/position layout is disjoint.  The two
+// views intentionally share a backing allocation, so a bounding-box test would
+// report a false overlap across every subsequent ring row.
+bool packed_key_position_views_disjoint(
+    const at::Tensor& left, const at::Tensor& right) {
+  const at::Tensor* key = nullptr;
+  const at::Tensor* positions = nullptr;
+  const bool left_is_key = left.scalar_type() == at::kHalf ||
+      left.scalar_type() == at::kBFloat16;
+  const bool right_is_key = right.scalar_type() == at::kHalf ||
+      right.scalar_type() == at::kBFloat16;
+  if (left_is_key && right.scalar_type() == at::kLong) {
+    key = &left;
+    positions = &right;
+  } else if (right_is_key && left.scalar_type() == at::kLong) {
+    key = &right;
+    positions = &left;
+  } else {
+    return false;
+  }
+  if (key->dim() != 4 || positions->dim() != 4 || key->size(2) != 1 ||
+      positions->size(2) != 1 || key->size(3) != kHeadDim ||
+      positions->size(3) != kPositionWidth || key->size(0) <= 0 ||
+      key->size(1) <= 0 || key->size(0) != positions->size(0) ||
+      key->size(1) != positions->size(1)) {
+    return false;
+  }
+  if (key->stride(3) != 1 || positions->stride(3) != 1 ||
+      key->stride(0) <= 0 || key->stride(1) <= 0 ||
+      positions->stride(0) <= 0 || positions->stride(1) <= 0) {
+    return false;
+  }
+  const auto key_element_size = static_cast<std::uintptr_t>(key->element_size());
+  const auto position_element_size =
+      static_cast<std::uintptr_t>(positions->element_size());
+  const auto max_uint = std::numeric_limits<std::uintptr_t>::max();
+  const auto key_row_stride_elements = static_cast<std::uintptr_t>(key->stride(1));
+  const auto position_row_stride_elements =
+      static_cast<std::uintptr_t>(positions->stride(1));
+  const auto key_page_stride_elements = static_cast<std::uintptr_t>(key->stride(0));
+  const auto position_page_stride_elements =
+      static_cast<std::uintptr_t>(positions->stride(0));
+  if (key_row_stride_elements > max_uint / key_element_size ||
+      position_row_stride_elements > max_uint / position_element_size ||
+      key_page_stride_elements > max_uint / key_element_size ||
+      position_page_stride_elements > max_uint / position_element_size) {
+    return false;
+  }
+  const auto key_row_stride = key_row_stride_elements * key_element_size;
+  const auto position_row_stride =
+      position_row_stride_elements * position_element_size;
+  const auto key_page_stride = key_page_stride_elements * key_element_size;
+  const auto position_page_stride =
+      position_page_stride_elements * position_element_size;
+  const auto key_width =
+      static_cast<std::uintptr_t>(key->size(3)) * key_element_size;
+  const auto position_width =
+      static_cast<std::uintptr_t>(positions->size(3)) * position_element_size;
+  if (key_row_stride != position_row_stride ||
+      key_page_stride != position_page_stride ||
+      key_width > max_uint - position_width ||
+      key_row_stride < key_width + position_width) {
+    return false;
+  }
+  const auto key_begin = reinterpret_cast<std::uintptr_t>(key->data_ptr());
+  const auto position_begin =
+      reinterpret_cast<std::uintptr_t>(positions->data_ptr());
+  if (key_begin > max_uint - key_width ||
+      position_begin != key_begin + key_width) {
+    return false;
+  }
+  // Identical page/token strides and a position view immediately after each
+  // key row establish disjoint intervals for every [page, ring] coordinate.
+  return true;
+}
+
+// Return a conservative physical byte range. Unknown arithmetic is treated
+// as overlap so an independently wrapped or malformed view cannot enter the
+// device launch.
+bool ranges_overlap_conservative(
+    const at::Tensor& left, const at::Tensor& right) {
+  if (packed_key_position_views_disjoint(left, right)) {
+    return false;
+  }
+  if (left.numel() == 0 || right.numel() == 0) {
+    return false;
+  }
+  auto range = [](const at::Tensor& tensor,
+                  std::uintptr_t* begin,
+                  std::uintptr_t* bytes) -> bool {
+    std::uintptr_t extent = 0;
+    for (int64_t dimension = 0; dimension < tensor.dim(); ++dimension) {
+      const int64_t size = tensor.size(dimension);
+      const int64_t stride = tensor.stride(dimension);
+      if (size < 0 || stride < 0) {
+        return false;
+      }
+      const auto count = static_cast<std::uintptr_t>(size > 0 ? size - 1 : 0);
+      const auto step = static_cast<std::uintptr_t>(stride);
+      if (count > std::numeric_limits<std::uintptr_t>::max() /
+                      std::max(step, std::uintptr_t{1})) {
+        return false;
+      }
+      const auto contribution = count * step;
+      if (extent > std::numeric_limits<std::uintptr_t>::max() - contribution) {
+        return false;
+      }
+      extent += contribution;
+    }
+    const auto element_size = static_cast<std::uintptr_t>(tensor.element_size());
+    if (extent == std::numeric_limits<std::uintptr_t>::max() ||
+        extent + 1 > std::numeric_limits<std::uintptr_t>::max() /
+                         std::max(element_size, std::uintptr_t{1})) {
+      return false;
+    }
+    *begin = reinterpret_cast<std::uintptr_t>(tensor.data_ptr());
+    *bytes = (extent + 1) * element_size;
+    if (*begin > std::numeric_limits<std::uintptr_t>::max() - *bytes) {
+      return false;
+    }
+    return true;
+  };
+
+  std::uintptr_t left_begin = 0;
+  std::uintptr_t left_bytes = 0;
+  std::uintptr_t right_begin = 0;
+  std::uintptr_t right_bytes = 0;
+  if (!range(left, &left_begin, &left_bytes) ||
+      !range(right, &right_begin, &right_bytes)) {
+    return true;
+  }
+  const auto left_end = left_begin + left_bytes;
+  const auto right_end = right_begin + right_bytes;
+  return left_begin < right_end && right_begin < left_end;
+}
+
+void validate_group_compression_inputs(
+    const at::Tensor& raw_keys,
+    const at::Tensor& raw_positions,
+    const at::Tensor& compressor_state_cache,
+    const at::Tensor& rope_position_cache,
+    const at::Tensor& compressor_state_block_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& logical_positions,
+    const at::Tensor& compressed_slots,
+    at::Tensor pooled,
+    at::Tensor first_positions,
+    int64_t compress_ratio,
+    int64_t compressed_capacity,
+    bool historical_ring_proven) {
+  TORCH_CHECK(
+      historical_ring_proven,
+      "QSA group compression requires a trusted historical ring proof");
+  TORCH_CHECK(
+      compress_ratio == kCompressionRatio,
+      "QSA native group compression only supports ratio=4");
+  TORCH_CHECK(
+      compressed_capacity > 0,
+      "QSA native group compression requires positive compressed capacity");
+
+  TORCH_CHECK(
+      raw_keys.device().is_xpu(),
+      "QSA group compression tensors must be on XPU");
+  const at::Tensor tensors[] = {
+      raw_positions, compressor_state_cache, rope_position_cache,
+      compressor_state_block_table, token_to_req, query_start_loc, logical_positions, compressed_slots, pooled,
+      first_positions};
+  for (const auto& tensor : tensors) {
+    TORCH_CHECK(
+        tensor.device() == raw_keys.device(),
+        "QSA group compression tensors must share one XPU device");
+  }
+  TORCH_CHECK(
+      raw_keys.scalar_type() == at::kHalf ||
+          raw_keys.scalar_type() == at::kBFloat16,
+      "QSA native group compression supports float16 or bfloat16 keys");
+  TORCH_CHECK(
+      raw_keys.dim() == 3 && raw_keys.size(0) == 1 && raw_keys.size(1) == 1 &&
+          raw_keys.size(2) == kHeadDim,
+      "raw_keys must have shape [1,1,128]");
+  TORCH_CHECK(
+      raw_positions.scalar_type() == at::kLong && raw_positions.dim() == 3 &&
+          raw_positions.size(0) == 1 && raw_positions.size(1) == 1 &&
+          raw_positions.size(2) == kPositionWidth,
+      "raw_positions must have shape [1,1,3] int64");
+  TORCH_CHECK(
+      compressor_state_cache.scalar_type() == raw_keys.scalar_type() &&
+          compressor_state_cache.dim() == 4 &&
+          compressor_state_cache.size(0) > 0 &&
+          compressor_state_cache.size(1) >= kCompressionRatio &&
+          compressor_state_cache.size(2) == 1 &&
+          compressor_state_cache.size(3) == kHeadDim,
+      "compressor state cache must be [pages,ring>=4,1,128] with key dtype");
+  TORCH_CHECK(
+      rope_position_cache.scalar_type() == at::kLong &&
+          rope_position_cache.dim() == 4 &&
+          rope_position_cache.size(0) == compressor_state_cache.size(0) &&
+          rope_position_cache.size(1) == compressor_state_cache.size(1) &&
+          rope_position_cache.size(2) == 1 &&
+          rope_position_cache.size(3) == kPositionWidth &&
+          rope_position_cache.stride(3) == 1 &&
+          is_positive_non_overlapping(rope_position_cache),
+      "rope position cache must be [pages,ring,1,3] int64 with inner stride 1");
+  TORCH_CHECK(
+      compressor_state_block_table.scalar_type() == at::kInt &&
+          compressor_state_block_table.dim() == 2 &&
+          compressor_state_block_table.size(0) >= 1 &&
+          compressor_state_block_table.size(1) >= 1 &&
+          compressor_state_block_table.is_contiguous(),
+      "compressor state block table must be contiguous int32 [requests,blocks]");
+  TORCH_CHECK(
+      token_to_req.scalar_type() == at::kInt && token_to_req.numel() == 1 &&
+          token_to_req.is_contiguous(),
+      "token_to_req must be contiguous int32 [1]");
+  TORCH_CHECK(
+      query_start_loc.scalar_type() == at::kInt && query_start_loc.numel() == 2 &&
+          query_start_loc.is_contiguous(),
+      "query_start_loc must be contiguous int32 [2]");
+  TORCH_CHECK(
+      logical_positions.scalar_type() == at::kLong && logical_positions.numel() == 1 &&
+          logical_positions.is_contiguous(),
+      "logical_positions must be contiguous int64 [1]");
+  TORCH_CHECK(
+      compressed_slots.scalar_type() == at::kLong && compressed_slots.numel() == 1 &&
+          compressed_slots.is_contiguous(),
+      "compressed_slots must be contiguous int64 [1]");
+  TORCH_CHECK(
+      pooled.scalar_type() == raw_keys.scalar_type() && pooled.dim() == 3 &&
+          pooled.size(0) == 1 && pooled.size(1) == 1 &&
+          pooled.size(2) == kHeadDim && pooled.is_contiguous(),
+      "pooled must be caller-owned contiguous [1,1,128] with key dtype");
+  TORCH_CHECK(
+      first_positions.scalar_type() == at::kLong && first_positions.dim() == 2 &&
+          first_positions.size(0) == 1 && first_positions.size(1) == kPositionWidth &&
+          first_positions.is_contiguous(),
+      "first_positions must be caller-owned contiguous int64 [1,3]");
+
+  TORCH_CHECK(
+      raw_keys.is_contiguous() && raw_positions.is_contiguous() &&
+          raw_positions.stride(2) == 1 &&
+          compressor_state_cache.stride(3) == 1,
+      "QSA group compression requires contiguous raw inputs and inner cache width");
+  TORCH_CHECK(
+      is_positive_non_overlapping(compressor_state_cache),
+      "compressor state cache must have positive non-overlapping strides");
+  TORCH_CHECK(
+      is_positive_non_overlapping(raw_keys) &&
+          is_positive_non_overlapping(raw_positions) &&
+          is_positive_non_overlapping(rope_position_cache),
+      "raw group compression inputs must have positive non-overlapping strides");
+  TORCH_CHECK(
+      !compressor_state_cache.is_alias_of(raw_keys) &&
+          !compressor_state_cache.is_alias_of(raw_positions) &&
+          !compressor_state_cache.is_alias_of(pooled) &&
+          !compressor_state_cache.is_alias_of(first_positions),
+      "QSA group compression cache must not alias raw inputs or outputs");
+  // The production MRoPE cache exposes key and position views from one packed
+  // half backing.  ``is_alias_of`` is intentionally true for those views even
+  // though their byte ranges are disjoint; reject only a real physical overlap.
+  TORCH_CHECK(
+      !ranges_overlap_conservative(compressor_state_cache, rope_position_cache),
+      "QSA key and position cache views must not physically overlap");
+
+  const at::Tensor inputs[] = {
+      raw_keys, raw_positions, compressor_state_cache, rope_position_cache,
+      compressor_state_block_table, token_to_req, query_start_loc,
+      logical_positions, compressed_slots};
+  for (const auto& input : inputs) {
+    TORCH_CHECK(
+        !ranges_overlap_conservative(pooled, input) &&
+            !ranges_overlap_conservative(first_positions, input),
+        "QSA group compression outputs must not overlap an input");
+  }
+  TORCH_CHECK(
+      !ranges_overlap_conservative(pooled, first_positions),
+      "QSA group compression outputs must not overlap each other");
+
+  const int64_t pages = compressor_state_cache.size(0);
+  const int64_t ring_size = compressor_state_cache.size(1);
+  TORCH_CHECK(
+      pages <= std::numeric_limits<int64_t>::max() / ring_size,
+      "QSA compressor state capacity overflows int64");
+}
+
+template <typename scalar_t>
+void launch_group_compression(
+    const at::Tensor& raw_keys,
+    const at::Tensor& compressor_state_cache,
+    const at::Tensor& rope_position_cache,
+    const at::Tensor& compressor_state_block_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& logical_positions,
+    const at::Tensor& compressed_slots,
+    at::Tensor pooled,
+    at::Tensor first_positions,
+    int64_t compressed_capacity) {
+  const auto* raw_ptr = reinterpret_cast<const scalar_t*>(raw_keys.data_ptr());
+  const auto* ring_ptr =
+      reinterpret_cast<const scalar_t*>(compressor_state_cache.data_ptr());
+  const auto* position_ptr = rope_position_cache.data_ptr<int64_t>();
+  const auto* block_ptr = compressor_state_block_table.data_ptr<int32_t>();
+  const auto* request_ptr = token_to_req.data_ptr<int32_t>();
+  const auto* query_ptr = query_start_loc.data_ptr<int32_t>();
+  const auto* logical_ptr = logical_positions.data_ptr<int64_t>();
+  const auto* slot_ptr = compressed_slots.data_ptr<int64_t>();
+  auto* pooled_ptr = reinterpret_cast<scalar_t*>(pooled.data_ptr());
+  auto* first_ptr = first_positions.data_ptr<int64_t>();
+
+  const int64_t ring_size = compressor_state_cache.size(1);
+  const int64_t pages = compressor_state_cache.size(0);
+  const int64_t block_rows = compressor_state_block_table.size(0);
+  const int64_t block_stride = compressor_state_block_table.stride(0);
+  const int64_t cache_page_stride = compressor_state_cache.stride(0);
+  const int64_t cache_token_stride = compressor_state_cache.stride(1);
+  const int64_t cache_column_stride = compressor_state_cache.stride(3);
+  const int64_t position_page_stride = rope_position_cache.stride(0);
+  const int64_t position_token_stride = rope_position_cache.stride(1);
+  const int64_t position_column_stride = rope_position_cache.stride(3);
+  const int64_t raw_column_stride = raw_keys.stride(2);
+
+  auto& queue = c10::xpu::getCurrentXPUStream(raw_keys.device().index()).queue();
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<QsaGroupCompressionKernel<scalar_t>>(
+        sycl::range<1>(1), [=](sycl::id<1>) SYCL_ESIMD_KERNEL {
+          const int64_t end_position = logical_ptr[0];
+          const int32_t request = request_ptr[0];
+          const int32_t query_start = query_ptr[0];
+          const int32_t query_end = query_ptr[1];
+          const int32_t block =
+              (request >= 0 && request < block_rows)
+              ? block_ptr[request * block_stride]
+              : -1;
+          const int64_t compressed_slot = slot_ptr[0];
+          const bool valid =
+              request == 0 && query_start == 0 && query_end == 1 &&
+              end_position >= kCompressionRatio - 1 &&
+              compressed_slot >= 0 && compressed_slot < compressed_capacity;
+          const bool history_valid = block >= 0 && block < pages;
+
+          if constexpr (std::is_same_v<scalar_t, fp16>) {
+            for (int64_t column = 0; column < kHeadDim;
+                 column += kCompressionTile) {
+              simd<float, kCompressionTile> accumulator(0.0f);
+              if (valid) {
+                if (history_valid) {
+                  for (int64_t group_offset = 0;
+                       group_offset < kCompressionRatio - 1; ++group_offset) {
+                    const int64_t position =
+                        end_position - (kCompressionRatio - 1 - group_offset);
+                    const int64_t ring_slot = position % ring_size;
+                    const int64_t source = block * cache_page_stride +
+                        ring_slot * cache_token_stride + column;
+                    const simd<scalar_t, kCompressionTile> ring_values =
+                        block_load<scalar_t, kCompressionTile>(ring_ptr + source);
+                    accumulator += ring_values;
+                  }
+                }
+                const simd<scalar_t, kCompressionTile> raw_values =
+                    block_load<scalar_t, kCompressionTile>(raw_ptr + column);
+                accumulator += raw_values;
+              }
+              block_store<scalar_t, kCompressionTile>(
+                  pooled_ptr + column,
+                  accumulator / static_cast<float>(kCompressionRatio));
+            }
+          } else {
+            // Keep BF16 arithmetic in FP32, but avoid instantiating BF16
+            // vector arithmetic in the device compiler.  Loading/storing the
+            // raw 16-bit representation still gives the same coalesced
+            // traffic as the FP16 path while keeping the conversion explicit.
+            for (int64_t column = 0; column < kHeadDim;
+                 column += kCompressionTile) {
+              simd<float, kCompressionTile> accumulator(0.0f);
+              if (valid) {
+                if (history_valid) {
+                  for (int64_t group_offset = 0;
+                       group_offset < kCompressionRatio - 1; ++group_offset) {
+                    const int64_t position =
+                        end_position - (kCompressionRatio - 1 - group_offset);
+                    const int64_t ring_slot = position % ring_size;
+                    const int64_t source = block * cache_page_stride +
+                        ring_slot * cache_token_stride + column;
+                    simd<uint16_t, kCompressionTile> ring_bits =
+                        block_load<uint16_t, kCompressionTile>(
+                            reinterpret_cast<const uint16_t*>(
+                                ring_ptr + source));
+                    simd<uint32_t, kCompressionTile> ring_float_bits =
+                        convert<uint32_t>(ring_bits);
+                    ring_float_bits <<= 16;
+                    accumulator +=
+                        ring_float_bits.template bit_cast_view<float>().read();
+                  }
+                }
+                simd<uint16_t, kCompressionTile> raw_bits =
+                    block_load<uint16_t, kCompressionTile>(
+                        reinterpret_cast<const uint16_t*>(raw_ptr + column));
+                simd<uint32_t, kCompressionTile> raw_float_bits =
+                    convert<uint32_t>(raw_bits);
+                raw_float_bits <<= 16;
+                accumulator +=
+                    raw_float_bits.template bit_cast_view<float>().read();
+              }
+              simd<float, kCompressionTile> averaged =
+                  accumulator / static_cast<float>(kCompressionRatio);
+              simd<uint32_t, kCompressionTile> output_float_bits =
+                  averaged.template bit_cast_view<uint32_t>().read();
+              simd<uint32_t, kCompressionTile> output_truncated =
+                  output_float_bits >> 16;
+              simd<uint32_t, kCompressionTile> output_rounding =
+                  0x7fff + (output_truncated & 1);
+              simd<uint16_t, kCompressionTile> output_bits = convert<uint16_t>(
+                  (output_float_bits + output_rounding) >> 16);
+              block_store<uint16_t, kCompressionTile>(
+                  reinterpret_cast<uint16_t*>(pooled_ptr + column),
+                  output_bits);
+            }
+          }
+
+          for (int64_t axis = 0; axis < kPositionWidth; ++axis) {
+            if (!valid || !history_valid) {
+              first_ptr[axis] = 0;
+            } else {
+              const int64_t first_slot =
+                  (end_position - kCompressionRatio + 1) % ring_size;
+              const int64_t source =
+                  block * position_page_stride +
+                  first_slot * position_token_stride +
+                  axis * position_column_stride;
+              first_ptr[axis] = position_ptr[source];
+            }
+          }
+        });
+  });
+}
+
+}  // namespace
+
+at::Tensor group_compress_v1(
+    const at::Tensor& raw_keys,
+    const at::Tensor& raw_positions,
+    const at::Tensor& compressor_state_cache,
+    const at::Tensor& rope_position_cache,
+    const at::Tensor& compressor_state_block_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& logical_positions,
+    const at::Tensor& compressed_slots,
+    at::Tensor pooled,
+    at::Tensor first_positions,
+    int64_t compress_ratio,
+    int64_t compressed_capacity,
+    bool historical_ring_proven) {
+  validate_group_compression_inputs(
+      raw_keys, raw_positions, compressor_state_cache, rope_position_cache,
+      compressor_state_block_table, token_to_req, query_start_loc,
+      logical_positions, compressed_slots, pooled, first_positions,
+      compress_ratio, compressed_capacity, historical_ring_proven);
+  if (raw_keys.scalar_type() == at::kHalf) {
+    launch_group_compression<fp16>(
+        raw_keys, compressor_state_cache, rope_position_cache,
+        compressor_state_block_table, token_to_req, query_start_loc, logical_positions, compressed_slots,
+        pooled, first_positions, compressed_capacity);
+  } else {
+    launch_group_compression<bf16>(
+        raw_keys, compressor_state_cache, rope_position_cache,
+        compressor_state_block_table, token_to_req, query_start_loc, logical_positions, compressed_slots,
+        pooled, first_positions, compressed_capacity);
+  }
+  return pooled;
+}
+
+}  // namespace qsa

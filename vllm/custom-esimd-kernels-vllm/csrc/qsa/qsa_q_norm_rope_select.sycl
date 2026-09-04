@@ -1,0 +1,599 @@
+// Copyright 2026
+// SPDX-License-Identifier: Apache-2.0
+//
+// Qwen3.8 QSA fused indexer Q norm+RoPE and compressed-key selection.
+//
+// QSA projected_q -> Gemma RMSNorm -> 1D/interleaved MRoPE ->
+// compressed-key score/TopK/token expansion, one workgroup launch.
+
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+
+#include <sycl/sycl.hpp>
+
+#include <cstdint>
+#include <limits>
+#include <type_traits>
+
+#ifndef FUSED_WG_SIZE
+#define FUSED_WG_SIZE 1024
+#endif
+#ifndef FUSED_PAGE_CACHE
+#define FUSED_PAGE_CACHE 0
+#endif
+#ifndef FUSED_PAGE_CACHE_SLOTS
+#define FUSED_PAGE_CACHE_SLOTS 64
+#endif
+#ifndef FUSED_Q_LOCAL_FP32
+#define FUSED_Q_LOCAL_FP32 0
+#endif
+
+namespace qsa {
+namespace {
+
+using fp16 = sycl::half;
+
+constexpr int kIndexHeads = 4;
+constexpr int kHeadDim = 128;
+constexpr int kRotaryDim = 64;
+constexpr int kRotaryHalf = 32;
+constexpr int kTokenTopk = 2048;
+constexpr int kCompressRatio = 4;
+constexpr int kBlockTopk = kTokenTopk / kCompressRatio;
+constexpr int kOutputWidth = kTokenTopk + kCompressRatio - 1;
+constexpr int kSortSize = 2 * kBlockTopk;
+constexpr int kSubgroup = 32;
+constexpr int kWorkgroup = FUSED_WG_SIZE;
+constexpr int kSubgroups = kWorkgroup / kSubgroup;
+constexpr int kQStageThreads = kIndexHeads * kSubgroup;
+constexpr int kPageCacheSlots =
+    FUSED_PAGE_CACHE ? FUSED_PAGE_CACHE_SLOTS : 1;
+constexpr bool kUsePageCache = FUSED_PAGE_CACHE != 0;
+constexpr bool kUseFp32LocalQ = FUSED_Q_LOCAL_FP32 != 0;
+constexpr float kEpsilon = 1.0e-6f;
+constexpr float kScoreScale = 0.08838834764831845f;
+
+static_assert(kWorkgroup >= kSubgroup && kWorkgroup % kSubgroup == 0);
+static_assert(kWorkgroup <= 1024);
+static_assert(kPageCacheSlots > 0);
+
+// The production QSA MRoPE contract is interleaved [11,11,10] in pair space:
+// pair 0 mod 3 uses T, pair 1 mod 3 uses H, and pair 2 mod 3 uses W.
+template <bool Mrope, typename PosT>
+inline uint32_t position_for_pair(
+    const PosT* positions,
+    uint32_t position_row_stride,
+    uint32_t row,
+    uint32_t pair) {
+  const uint32_t text = static_cast<uint32_t>(positions[row]);
+  if constexpr (!Mrope) {
+    (void)position_row_stride;
+    (void)pair;
+    return text;
+  } else {
+    const uint32_t axis = pair % 3;
+    return static_cast<uint32_t>(
+        positions[axis * position_row_stride + row]);
+  }
+}
+
+template <bool Mrope, typename PosT, typename QLocalT>
+class QsaQNormRopeSelectKernel;
+
+template <bool Mrope, typename PosT, typename QLocalT>
+void launch_fused(
+    const at::Tensor& projected_q,
+    const at::Tensor& norm_weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths,
+    at::Tensor q_output,
+    at::Tensor out) {
+  const uint32_t rows = static_cast<uint32_t>(projected_q.size(0));
+  const uint32_t requests = static_cast<uint32_t>(page_table.size(0));
+  const uint32_t pages_per_request = static_cast<uint32_t>(page_table.size(1));
+  const uint32_t physical_pages =
+      static_cast<uint32_t>(compressed_key_cache.size(0));
+  const uint32_t position_row_stride = Mrope
+      ? static_cast<uint32_t>(positions.stride(0))
+      : 1u;
+
+  const auto* input_ptr = reinterpret_cast<const fp16*>(
+      projected_q.data_ptr());
+  const auto* weight_ptr = reinterpret_cast<const fp16*>(
+      norm_weight.data_ptr());
+  const auto* position_ptr = positions.data_ptr<PosT>();
+  const auto* cos_ptr = reinterpret_cast<const fp16*>(
+      cos_sin_cache.data_ptr());
+  const auto* cache_ptr = reinterpret_cast<const fp16*>(
+      compressed_key_cache.data_ptr());
+  const auto* page_ptr = page_table.data_ptr<int32_t>();
+  const auto* request_ptr = token_to_req.data_ptr<int32_t>();
+  const auto* query_position_ptr = query_positions.data_ptr<int64_t>();
+  const auto* sequence_ptr = sequence_lengths.data_ptr<int32_t>();
+  auto* q_out_ptr = q_output.numel() == 0
+      ? static_cast<fp16*>(nullptr)
+      : reinterpret_cast<fp16*>(q_output.data_ptr());
+  auto* out_ptr = out.data_ptr<int32_t>();
+
+  const int64_t cache_page_stride = compressed_key_cache.stride(0);
+  const int64_t cache_token_stride = compressed_key_cache.stride(1);
+
+  auto& queue = c10::xpu::getCurrentXPUStream(projected_q.device().index())
+                    .queue();
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<QLocalT, 1> q_shared(
+        sycl::range<1>(kIndexHeads * kHeadDim), cgh);
+    sycl::local_accessor<float, 1> scores(
+        sycl::range<1>(kSortSize), cgh);
+    sycl::local_accessor<int32_t, 1> indices(
+        sycl::range<1>(kSortSize), cgh);
+    sycl::local_accessor<int32_t, 1> page_cache(
+        sycl::range<1>(kPageCacheSlots), cgh);
+
+    cgh.parallel_for<QsaQNormRopeSelectKernel<Mrope, PosT, QLocalT>>(
+        sycl::nd_range<1>(
+            sycl::range<1>(static_cast<size_t>(rows * kWorkgroup)),
+            sycl::range<1>(static_cast<size_t>(kWorkgroup))),
+        [=](sycl::nd_item<1> item)
+            [[sycl::reqd_sub_group_size(kSubgroup)]] {
+          const uint32_t row = item.get_group_linear_id();
+          const uint32_t local = item.get_local_linear_id();
+          const uint32_t subgroup_id = local / kSubgroup;
+          const uint32_t lane = local % kSubgroup;
+          const auto subgroup = item.get_sub_group();
+
+          // Four subgroups cooperate on the four independent RMSNorm rows.
+          // Each lane owns four dimensions, keeping only four FP32 values live.
+          if (local < kQStageThreads) {
+            const uint32_t head = subgroup_id;
+            float values[4];
+            float partial_sum = 0.0f;
+            const uint32_t input_base =
+                row * kIndexHeads * kHeadDim + head * kHeadDim;
+#pragma unroll
+            for (int fragment = 0; fragment < 4; ++fragment) {
+              const int dim = static_cast<int>(lane) + fragment * kSubgroup;
+              const float value = static_cast<float>(
+                  input_ptr[input_base + static_cast<uint32_t>(dim)]);
+              values[fragment] = value;
+              partial_sum += value * value;
+            }
+            const float sum_sq = sycl::reduce_over_group(
+                subgroup, partial_sum, sycl::plus<float>());
+            const float inverse_rms =
+                sycl::rsqrt(sum_sq / static_cast<float>(kHeadDim) + kEpsilon);
+
+            const uint32_t text_position = position_for_pair<Mrope, PosT>(
+                position_ptr, position_row_stride, row, lane);
+            const uint32_t horizontal_position = Mrope
+                ? position_for_pair<Mrope, PosT>(
+                      position_ptr, position_row_stride, row, 1)
+                : text_position;
+            const uint32_t width_position = Mrope
+                ? position_for_pair<Mrope, PosT>(
+                      position_ptr, position_row_stride, row, 2)
+                : text_position;
+            (void)horizontal_position;
+            (void)width_position;
+
+#pragma unroll
+            for (int fragment = 0; fragment < 4; ++fragment) {
+              const uint32_t dim =
+                  lane + static_cast<uint32_t>(fragment * kSubgroup);
+              float value = values[fragment] * inverse_rms;
+              value *= 1.0f + static_cast<float>(weight_ptr[dim]);
+              if (dim < kRotaryHalf) {
+                const uint32_t pair = dim;
+                const uint32_t position = position_for_pair<Mrope, PosT>(
+                    position_ptr, position_row_stride, row, pair);
+                const float cosine = static_cast<float>(
+                    cos_ptr[position * kRotaryDim + pair]);
+                const float sine = static_cast<float>(
+                    cos_ptr[position * kRotaryDim + kRotaryHalf + pair]);
+                const float second = values[fragment + 1] * inverse_rms *
+                    (1.0f + static_cast<float>(weight_ptr[dim + kRotaryHalf]));
+                const float rotated_first = value * cosine - second * sine;
+                q_shared[head * kHeadDim + dim] =
+                    static_cast<QLocalT>(rotated_first);
+                q_shared[head * kHeadDim + dim + kRotaryHalf] =
+                    static_cast<QLocalT>(second * cosine + value * sine);
+                if (q_out_ptr != nullptr) {
+                  const uint32_t output_base =
+                      row * kIndexHeads * kHeadDim + head * kHeadDim;
+                  q_out_ptr[output_base + dim] =
+                      static_cast<fp16>(rotated_first);
+                  q_out_ptr[output_base + dim + kRotaryHalf] =
+                      static_cast<fp16>(second * cosine + value * sine);
+                }
+              } else if (dim >= kRotaryDim) {
+                q_shared[head * kHeadDim + dim] =
+                    static_cast<QLocalT>(value);
+                if (q_out_ptr != nullptr) {
+                  const uint32_t output_base =
+                      row * kIndexHeads * kHeadDim + head * kHeadDim;
+                  q_out_ptr[output_base + dim] = static_cast<fp16>(value);
+                }
+              }
+            }
+          }
+
+          // The page-table cache is initialized by a uniform prefix of threads.
+          if constexpr (kUsePageCache) {
+            if (local < kPageCacheSlots && local < pages_per_request) {
+              const int32_t request = request_ptr[row];
+              page_cache[local] = request >= 0 &&
+                      static_cast<uint32_t>(request) < requests
+                  ? page_ptr[static_cast<int64_t>(request) * pages_per_request +
+                             local]
+                  : -1;
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+          }
+
+          // This barrier is unconditional: it publishes q_shared and (when
+          // enabled) page_cache to all scoring subgroups.
+          item.barrier(sycl::access::fence_space::local_space);
+
+          const int32_t request = request_ptr[row];
+          const bool request_valid = request >= 0 &&
+              static_cast<uint32_t>(request) < requests;
+          const int64_t sequence_length = request_valid
+              ? static_cast<int64_t>(sequence_ptr[request])
+              : 0;
+          const int64_t visible_tokens = query_position_ptr[row] + 1;
+          const int64_t position_blocks = visible_tokens > 0
+              ? visible_tokens / kCompressRatio
+              : 0;
+          const int64_t sequence_blocks = sequence_length > 0
+              ? sequence_length / kCompressRatio
+              : 0;
+          const int64_t visible_blocks = position_blocks < sequence_blocks
+              ? position_blocks
+              : sequence_blocks;
+
+          for (int slot = static_cast<int>(local); slot < kBlockTopk;
+               slot += kWorkgroup) {
+            scores[slot] = -std::numeric_limits<float>::infinity();
+            indices[slot] = -1;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          // Walk the full visible block range in 512-block chunks.  After
+          // every chunk, the high half is retained in scores[0:512], exactly
+          // as in qsa_select_paged_tokens_v2.  The query is read from local
+          // storage, while compressed K remains in the production
+          // [physical_page, token_in_page, 1, dim] layout.
+          for (int64_t chunk_start = 0; chunk_start < visible_blocks;
+               chunk_start += kBlockTopk) {
+            for (int block_in_chunk = static_cast<int>(subgroup_id);
+                 block_in_chunk < kBlockTopk;
+                 block_in_chunk += kSubgroups) {
+              const int64_t logical_block = chunk_start + block_in_chunk;
+            bool valid = logical_block < visible_blocks && request_valid;
+            int64_t cache_base = -1;
+            if (valid) {
+              const int64_t page_column = logical_block / 64;
+              valid = page_column < pages_per_request;
+              if (valid) {
+                int32_t physical_page;
+                if constexpr (kUsePageCache) {
+                  physical_page = page_column < kPageCacheSlots
+                      ? page_cache[page_column]
+                      : page_ptr[static_cast<int64_t>(request) *
+                                     pages_per_request + page_column];
+                } else {
+                  physical_page = page_ptr[static_cast<int64_t>(request) *
+                                               pages_per_request + page_column];
+                }
+                valid = physical_page >= 0 &&
+                    static_cast<uint32_t>(physical_page) < physical_pages;
+                if (valid) {
+                  cache_base = static_cast<int64_t>(physical_page) *
+                          cache_page_stride +
+                      (logical_block % 64) * cache_token_stride;
+                }
+              }
+            }
+
+            float partial[kIndexHeads] =
+                {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int fragment = 0; fragment < kHeadDim / kSubgroup;
+                 ++fragment) {
+              const int dim = static_cast<int>(lane) + fragment * kSubgroup;
+              const float key = valid
+                  ? static_cast<float>(cache_ptr[cache_base + dim])
+                  : 0.0f;
+#pragma unroll
+              for (int head = 0; head < kIndexHeads; ++head) {
+                const float query = static_cast<float>(
+                    q_shared[head * kHeadDim + dim]);
+                partial[head] += query * key;
+              }
+            }
+            float score = 0.0f;
+#pragma unroll
+            for (int head = 0; head < kIndexHeads; ++head) {
+              const float dot = sycl::reduce_over_group(
+                  subgroup, partial[head], sycl::plus<float>());
+              score += sycl::fmax(dot, 0.0f);
+            }
+            if (lane == 0) {
+              scores[kBlockTopk + block_in_chunk] = valid
+                  ? score * kScoreScale
+                  : -std::numeric_limits<float>::infinity();
+              indices[kBlockTopk + block_in_chunk] = valid
+                  ? static_cast<int32_t>(logical_block)
+                  : -1;
+            }
+          }
+
+          item.barrier(sycl::access::fence_space::local_space);
+
+          // Ascending (score, descending-index) bitonic order.  Reversing the
+          // retained high half reproduces the production tie order: descending
+          // score and ascending logical index for exact ties.
+          for (int size = 2; size <= kSortSize; size <<= 1) {
+            for (int stride = size >> 1; stride > 0; stride >>= 1) {
+              for (int left = static_cast<int>(local); left < kSortSize;
+                   left += kWorkgroup) {
+                const int right = left ^ stride;
+                if (right > left) {
+                  const float left_score = scores[left];
+                  const float right_score = scores[right];
+                  const int32_t left_index = indices[left];
+                  const int32_t right_index = indices[right];
+                  const bool ascending = (left & size) == 0;
+                  const bool swap = ascending
+                      ? (left_score > right_score ||
+                         (left_score == right_score &&
+                          left_index < right_index))
+                      : (left_score < right_score ||
+                         (left_score == right_score &&
+                          left_index > right_index));
+                  if (swap) {
+                    scores[left] = right_score;
+                    scores[right] = left_score;
+                    indices[left] = right_index;
+                    indices[right] = left_index;
+                  }
+                }
+              }
+              item.barrier(sycl::access::fence_space::local_space);
+            }
+          }
+
+          for (int rank = static_cast<int>(local); rank < kBlockTopk;
+               rank += kWorkgroup) {
+            const int source = kSortSize - 1 - rank;
+            scores[rank] = scores[source];
+            indices[rank] = indices[source];
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+          }
+
+          const int64_t output_base =
+              static_cast<int64_t>(row) * kOutputWidth;
+          for (int column = static_cast<int>(local); column < kOutputWidth;
+               column += kWorkgroup) {
+            out_ptr[output_base + column] = -1;
+          }
+          item.barrier(sycl::access::fence_space::global_and_local);
+
+          const int64_t selected_blocks = visible_blocks < kBlockTopk
+              ? visible_blocks
+              : kBlockTopk;
+          const int64_t expanded_tokens = selected_blocks * kCompressRatio;
+          for (int column = static_cast<int>(local);
+               column < expanded_tokens; column += kWorkgroup) {
+            const int64_t rank = column / kCompressRatio;
+            const int64_t offset = column % kCompressRatio;
+            const int32_t block = indices[rank];
+            const int64_t token =
+                static_cast<int64_t>(block) * kCompressRatio + offset;
+            if (block >= 0 && token < sequence_length) {
+              out_ptr[output_base + column] = static_cast<int32_t>(token);
+            }
+          }
+          if (local < kCompressRatio - 1) {
+            const int64_t tail_start =
+                visible_tokens / kCompressRatio * kCompressRatio;
+            const int64_t tail_count = visible_tokens - tail_start;
+            const int64_t tail_token = tail_start + local;
+            if (tail_count > 0 &&
+                static_cast<int64_t>(local) < tail_count &&
+                tail_token >= 0 && tail_token < sequence_length) {
+              out_ptr[output_base + expanded_tokens + local] =
+                  static_cast<int32_t>(tail_token);
+            }
+          }
+        });
+  });
+}
+
+bool ranges_overlap(const at::Tensor& left, const at::Tensor& right) {
+  if (left.numel() == 0 || right.numel() == 0) {
+    return false;
+  }
+  const auto left_begin = reinterpret_cast<uintptr_t>(left.data_ptr());
+  const auto right_begin = reinterpret_cast<uintptr_t>(right.data_ptr());
+  const auto left_end = left_begin + left.numel() * left.element_size();
+  const auto right_end = right_begin + right.numel() * right.element_size();
+  return left_begin < right_end && right_begin < left_end;
+}
+
+template <typename T, bool Mrope>
+void validate_and_launch(
+    const at::Tensor& projected_q,
+    const at::Tensor& norm_weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths,
+    at::Tensor q_output,
+    at::Tensor out,
+    bool mrope,
+    bool positions_bounds_proven) {
+  TORCH_CHECK(positions_bounds_proven,
+              "QSA fusion requires a trusted position-bound proof");
+  const at::Tensor tensors[] = {
+      projected_q, norm_weight, positions, cos_sin_cache,
+      compressed_key_cache, page_table, token_to_req, query_positions,
+      sequence_lengths};
+  for (const auto& tensor : tensors) {
+    TORCH_CHECK(tensor.device().is_xpu(),
+                "all QSA fusion tensors must be on XPU");
+    TORCH_CHECK(tensor.device() == projected_q.device(),
+                "all QSA fusion tensors must share one XPU device");
+  }
+  TORCH_CHECK(projected_q.scalar_type() == at::kHalf &&
+                  norm_weight.scalar_type() == at::kHalf &&
+                  cos_sin_cache.scalar_type() == at::kHalf &&
+                  compressed_key_cache.scalar_type() == at::kHalf,
+              "QSA fusion activation/cache tensors must be float16");
+  TORCH_CHECK(page_table.scalar_type() == at::kInt &&
+                  token_to_req.scalar_type() == at::kInt &&
+                  sequence_lengths.scalar_type() == at::kInt &&
+                  query_positions.scalar_type() == at::kLong,
+              "QSA fusion metadata must be int32/int64 as specified");
+  TORCH_CHECK(projected_q.dim() == 3 && projected_q.size(0) >= 1 &&
+                  projected_q.size(0) <= 64 && projected_q.size(1) == kIndexHeads &&
+                  projected_q.size(2) == kHeadDim && projected_q.is_contiguous(),
+              "projected_q must be contiguous [1..64,4,128] float16");
+  TORCH_CHECK(norm_weight.dim() == 1 && norm_weight.size(0) == kHeadDim &&
+                  norm_weight.is_contiguous(),
+              "norm_weight must be contiguous [128] float16");
+  TORCH_CHECK(cos_sin_cache.dim() == 2 && cos_sin_cache.size(0) > 0 &&
+                  cos_sin_cache.size(1) == kRotaryDim &&
+                  cos_sin_cache.is_contiguous(),
+              "cos_sin_cache must be contiguous [max_position,64]");
+  TORCH_CHECK(compressed_key_cache.dim() == 4 &&
+                  compressed_key_cache.size(1) == 64 &&
+                  compressed_key_cache.size(2) == 1 &&
+                  compressed_key_cache.size(3) == kHeadDim &&
+                  compressed_key_cache.is_contiguous(),
+              "fusion requires compressed page=64 [P,64,1,128]");
+  TORCH_CHECK(page_table.dim() == 2 && page_table.size(0) > 0 &&
+                  page_table.size(1) > 0 && page_table.is_contiguous(),
+              "page_table must be contiguous [requests,pages]");
+  TORCH_CHECK(token_to_req.dim() == 1 &&
+                  token_to_req.size(0) == projected_q.size(0) &&
+                  token_to_req.is_contiguous(),
+              "token_to_req must be contiguous [R]");
+  TORCH_CHECK(query_positions.dim() == 1 &&
+                  query_positions.size(0) == projected_q.size(0) &&
+                  query_positions.is_contiguous(),
+              "query_positions must be contiguous int64 [R]");
+  TORCH_CHECK(sequence_lengths.dim() == 1 &&
+                  sequence_lengths.size(0) == page_table.size(0) &&
+                  sequence_lengths.is_contiguous(),
+              "sequence_lengths must be contiguous int32 [requests]");
+  TORCH_CHECK(out.dim() == 2 && out.size(0) == projected_q.size(0) &&
+                  out.size(1) == kOutputWidth && out.scalar_type() == at::kInt &&
+                  out.is_contiguous(),
+              "out must be contiguous int32 [R,2051]");
+
+  if (mrope) {
+    TORCH_CHECK(positions.dim() == 2 && positions.size(0) == 3 &&
+                    positions.size(1) == projected_q.size(0) &&
+                    positions.stride(1) == 1 && positions.stride(0) >= positions.size(1),
+                "MRoPE positions must be [3,R] with row stride >= R");
+  } else {
+    TORCH_CHECK(positions.dim() == 1 &&
+                    positions.size(0) == projected_q.size(0) &&
+                    positions.is_contiguous(),
+                "1D positions must be contiguous [R]");
+  }
+  TORCH_CHECK(q_output.numel() == 0 ||
+                  (q_output.device() == projected_q.device() &&
+                   q_output.scalar_type() == at::kHalf && q_output.dim() == 3 &&
+                   q_output.sizes() == projected_q.sizes() &&
+                   q_output.is_contiguous()),
+              "q_output must be empty or caller-owned contiguous [R,4,128] FP16");
+  for (const auto& input : tensors) {
+    TORCH_CHECK(!ranges_overlap(out, input),
+                "fusion output must not overlap an input");
+  }
+  TORCH_CHECK(!ranges_overlap(q_output, projected_q) &&
+                  !ranges_overlap(q_output, norm_weight) &&
+                  !ranges_overlap(q_output, positions) &&
+                  !ranges_overlap(q_output, cos_sin_cache) &&
+                  !ranges_overlap(q_output, compressed_key_cache) &&
+                  !ranges_overlap(q_output, page_table) &&
+                  !ranges_overlap(q_output, token_to_req) &&
+                  !ranges_overlap(q_output, query_positions) &&
+                  !ranges_overlap(q_output, sequence_lengths) &&
+                  !ranges_overlap(q_output, out),
+              "q_output must not overlap any fusion input/output");
+  TORCH_CHECK(positions.size(0) == 0 || positions.data_ptr() != nullptr,
+              "positions must have a valid data pointer");
+
+  if constexpr (std::is_same_v<T, int32_t>) {
+    launch_fused<Mrope, int32_t, std::conditional_t<kUseFp32LocalQ, float, fp16>>(
+        projected_q, norm_weight, positions, cos_sin_cache,
+        compressed_key_cache, page_table, token_to_req, query_positions,
+        sequence_lengths, q_output, out);
+  } else {
+    launch_fused<Mrope, int64_t, std::conditional_t<kUseFp32LocalQ, float, fp16>>(
+        projected_q, norm_weight, positions, cos_sin_cache,
+        compressed_key_cache, page_table, token_to_req, query_positions,
+        sequence_lengths, q_output, out);
+  }
+}
+
+}  // namespace
+
+at::Tensor qsa_q_norm_rope_select_v1(
+    const at::Tensor& projected_q,
+    const at::Tensor& norm_weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths,
+    at::Tensor q_output,
+    at::Tensor out,
+    bool mrope,
+    bool positions_bounds_proven) {
+  TORCH_CHECK(positions.scalar_type() == at::kInt ||
+                  positions.scalar_type() == at::kLong,
+              "positions must be int32 or int64");
+  if (positions.scalar_type() == at::kInt) {
+    if (mrope) {
+      validate_and_launch<int32_t, true>(
+          projected_q, norm_weight, positions, cos_sin_cache,
+          compressed_key_cache, page_table, token_to_req, query_positions,
+          sequence_lengths, q_output, out, mrope, positions_bounds_proven);
+    } else {
+      validate_and_launch<int32_t, false>(
+          projected_q, norm_weight, positions, cos_sin_cache,
+          compressed_key_cache, page_table, token_to_req, query_positions,
+          sequence_lengths, q_output, out, mrope, positions_bounds_proven);
+    }
+  } else {
+    if (mrope) {
+      validate_and_launch<int64_t, true>(
+          projected_q, norm_weight, positions, cos_sin_cache,
+          compressed_key_cache, page_table, token_to_req, query_positions,
+          sequence_lengths, q_output, out, mrope, positions_bounds_proven);
+    } else {
+      validate_and_launch<int64_t, false>(
+          projected_q, norm_weight, positions, cos_sin_cache,
+          compressed_key_cache, page_table, token_to_req, query_positions,
+          sequence_lengths, q_output, out, mrope, positions_bounds_proven);
+    }
+  }
+  return out;
+}
+
+}  // namespace qsa

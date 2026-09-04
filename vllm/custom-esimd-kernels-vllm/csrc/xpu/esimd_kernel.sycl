@@ -5,7 +5,9 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/python.h>
 
+#include <cmath>
 #include <cstdint>
+#include <limits>
 
 #include "esimd_kernels/fp8_GEMV_v2.h"
 #include "esimd_kernels/fp8_GEMV_bmg.h"
@@ -24,6 +26,9 @@
 #include "esimd_kernels/fused_add_rms_norm_batched.h"
 #include "esimd_kernels/norm_gemv_int4.h"
 #include "esimd_kernels/resadd_norm_gemv_int4.h"
+#include "esimd_kernels/qwen38_ngram_ids.h"
+#include "esimd_kernels/qwen38_ngram_embedding.h"
+#include "mrope_ranges.h"
 
 #define EXTRACT_PTR(var, tensor) auto var = reinterpret_cast<uint8_t*>(tensor.data_ptr())
 
@@ -117,6 +122,8 @@ at::Tensor esimd_gemv_fp16(
     int64_t M = input.size(0);
     int64_t N = weight.size(0);
     int64_t K = weight.size(1);
+    TORCH_CHECK(M > 0 && N > 0 && K > 0,
+                "FP16 GEMV dimensions must be positive");
     TORCH_CHECK(input.size(1) == K);
     TORCH_CHECK(output.size(0) == M && output.size(1) == N);
 
@@ -130,6 +137,52 @@ at::Tensor esimd_gemv_fp16(
     return output;
 }
 
+void esimd_hc_down_fp16_out(
+    at::Tensor input,
+    at::Tensor weight,
+    at::Tensor output) {
+    TORCH_CHECK(
+        input.scalar_type() == at::ScalarType::Half &&
+            weight.scalar_type() == at::ScalarType::Half &&
+            output.scalar_type() == at::ScalarType::Half,
+        "esimd_hc_down_fp16_out requires FP16 tensors");
+    TORCH_CHECK(
+        input.dim() == 2 && input.size(0) == 1 && input.size(1) == 10240,
+        "esimd_hc_down_fp16_out input must have shape [1, 10240]");
+    TORCH_CHECK(
+        weight.dim() == 2 && weight.size(1) == 10240 &&
+            (weight.size(0) == 320 || weight.size(0) == 336),
+        "esimd_hc_down_fp16_out weight must have shape [320, 10240] "
+        "or [336, 10240]");
+    const int64_t N = weight.size(0);
+    TORCH_CHECK(
+        output.dim() == 2 && output.size(0) == 1 && output.size(1) == N,
+        "esimd_hc_down_fp16_out output must have shape [1, N]");
+    TORCH_CHECK(
+        input.is_contiguous() && weight.is_contiguous() &&
+            output.is_contiguous(),
+        "esimd_hc_down_fp16_out tensors must be contiguous");
+    TORCH_CHECK(
+        input.device() == weight.device() && input.device() == output.device(),
+        "esimd_hc_down_fp16_out tensors must be on the same XPU device");
+    TORCH_CHECK(
+        !output.is_alias_of(input) && !output.is_alias_of(weight),
+        "esimd_hc_down_fp16_out output must not alias input or weight");
+    TORCH_CHECK(
+        input.storage_offset() % 2 == 0 &&
+            weight.storage_offset() % 2 == 0 &&
+            output.storage_offset() % 2 == 0,
+        "esimd_hc_down_fp16_out tensors must be 4-byte aligned");
+
+    auto& dpcpp_queue = get_device_queue(input);
+    GEMV_fp16_hc_down_host(
+        reinterpret_cast<const fp16*>(input.data_ptr()),
+        reinterpret_cast<const fp16*>(weight.data_ptr()),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        static_cast<uint32_t>(N),
+        dpcpp_queue);
+}
+
 at::Tensor esimd_gemv_fp16_gelu_mul(
     at::Tensor input,
     at::Tensor weight,
@@ -140,8 +193,15 @@ at::Tensor esimd_gemv_fp16_gelu_mul(
     TORCH_CHECK(input.dim() == 2 && input.size(0) == 1);
     TORCH_CHECK(weight.dim() == 2 && weight.size(0) % 2 == 0);
     TORCH_CHECK(output.dim() == 2 && output.size(0) == 1);
+    TORCH_CHECK(input.is_contiguous());
+    TORCH_CHECK(weight.is_contiguous());
+    TORCH_CHECK(output.is_contiguous());
+    TORCH_CHECK(input.device() == weight.device());
+    TORCH_CHECK(input.device() == output.device());
     int64_t N = weight.size(0) / 2;
     int64_t K = weight.size(1);
+    TORCH_CHECK(N > 0 && K > 0,
+                "FP16 GELU GEMV dimensions must be positive");
     TORCH_CHECK(input.size(1) == K);
     TORCH_CHECK(output.size(1) == N);
     auto& dpcpp_queue = get_device_queue(input);
@@ -269,6 +329,184 @@ at::Tensor esimd_qkv_split_norm_rope(
         ntoks, hiddenDim,
         (uint32_t)q_heads, (uint32_t)kv_heads,
         attn_output_gate, (uint32_t)rotary_dim, dpcpp_queue);
+    return q_out;
+}
+
+// Qwen3.8 exact 3-axis interleaved MRoPE variant.  This is deliberately a
+// separate versioned entry point: it consumes [T,H,W] positions directly and
+// never collapses them to positions[0].
+template <typename PosT>
+static void qkv_split_norm_rope_mrope_v1_host(
+    uint8_t* qkvState, uint8_t* qState, uint8_t* gateState,
+    uint8_t* kState, uint8_t* vState, uint8_t* normWq, uint8_t* normWk,
+    const PosT* ropePos, fp16* ropeCosSinCache, uint32_t ntoks,
+    uint32_t positionRowStride,
+    uint32_t hiddenDim, uint32_t qHead, uint32_t kvHead, bool attnOutputGate,
+    sycl::queue& q) {
+    constexpr uint32_t headDim = 256;
+    const uint32_t totalHeads = attnOutputGate
+        ? (2 * qHead + 2 * kvHead)
+        : (qHead + 2 * kvHead);
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>(totalHeads, ntoks),
+                              sycl::range<2>(1, 1)),
+            [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+                qkv_split_norm_rope_kernel<PosT>(
+                    qkvState, qState, gateState, kState, vState,
+                    normWq, normWk, nullptr, ropePos, ropeCosSinCache,
+                    ntoks, positionRowStride, hiddenDim, headDim, qHead,
+                    kvHead, 64, true, ndi);
+            });
+    });
+}
+
+at::Tensor esimd_qkv_split_norm_rope_mrope_v1(
+    at::Tensor qkv_state, at::Tensor q_out, at::Tensor gate_out,
+    at::Tensor k_out, at::Tensor v_out, at::Tensor norm_wq, at::Tensor norm_wk,
+    at::Tensor positions, int64_t q_heads, int64_t kv_heads,
+    bool attn_output_gate, bool positions_bounds_proven,
+    at::Tensor cos_sin_cache) {
+    TORCH_CHECK(
+        qkv_state.defined() && q_out.defined() && gate_out.defined() &&
+            k_out.defined() && v_out.defined() && norm_wq.defined() &&
+            norm_wk.defined() && positions.defined() && cos_sin_cache.defined(),
+        "Qwen3.8 MRoPE v1 received an undefined tensor");
+    TORCH_CHECK(
+        qkv_state.device().type() == c10::DeviceType::XPU,
+        "qkv_state must be an XPU tensor");
+    TORCH_CHECK(
+        qkv_state.scalar_type() == at::kHalf && qkv_state.dim() == 2,
+        "qkv_state must be a 2D float16 tensor");
+    TORCH_CHECK(
+        q_heads == 3 && kv_heads == 1 && attn_output_gate,
+        "Qwen3.8 MRoPE v1 requires local q_heads=3, kv_heads=1 and a gate");
+    // The native path cannot inspect XPU position values without introducing
+    // a synchronizing D2H read. QSA passes this proof bit only after scheduler
+    // metadata establishes 0 <= position < cache rows.
+    TORCH_CHECK(
+        positions_bounds_proven,
+        "Qwen3.8 MRoPE v1 requires a trusted scheduler position-bound proof");
+    const auto ntoks = qkv_state.size(0);
+    TORCH_CHECK(
+        ntoks >= 1 && ntoks <= 64 && qkv_state.size(1) == 2048,
+        "Qwen3.8 MRoPE v1 requires [1..64, 2048] qkv_state");
+    TORCH_CHECK(
+        positions.dim() == 2 && positions.size(0) == 3 &&
+            positions.size(1) == ntoks &&
+            (positions.scalar_type() == at::kInt ||
+             positions.scalar_type() == at::kLong),
+        "positions must be [3, nTokens] int32 or int64");
+    const auto position_row_stride = positions.stride(0);
+    TORCH_CHECK(
+        positions.stride(1) == 1 && position_row_stride >= ntoks &&
+            position_row_stride <=
+                static_cast<int64_t>(std::numeric_limits<uint32_t>::max()),
+        "positions must have positive, non-overlapping rows with inner stride 1");
+    const auto max_position_row_stride =
+        (std::numeric_limits<uint32_t>::max() -
+         static_cast<uint32_t>(ntoks - 1)) / 2;
+    TORCH_CHECK(
+        position_row_stride <=
+            static_cast<int64_t>(max_position_row_stride),
+        "positions row stride is too large for the 32-bit MRoPE index ABI");
+    TORCH_CHECK(
+        norm_wq.scalar_type() == at::kHalf && norm_wk.scalar_type() == at::kHalf &&
+            norm_wq.dim() == 1 && norm_wk.dim() == 1 &&
+            norm_wq.size(0) == 256 && norm_wk.size(0) == 256,
+        "Qwen3.8 MRoPE v1 norm weights must be float16 [256]");
+    TORCH_CHECK(
+        cos_sin_cache.scalar_type() == at::kHalf &&
+            cos_sin_cache.dim() == 2 && cos_sin_cache.size(0) > 0 &&
+            cos_sin_cache.size(1) == 64 &&
+            cos_sin_cache.size(0) <=
+                static_cast<int64_t>(std::numeric_limits<uint32_t>::max() / 64),
+        "cos_sin_cache must have shape [max_pos, 64] float16 with a safe row offset");
+    TORCH_CHECK(
+        q_out.scalar_type() == at::kHalf && gate_out.scalar_type() == at::kHalf &&
+            k_out.scalar_type() == at::kHalf && v_out.scalar_type() == at::kHalf &&
+            q_out.sizes() == at::IntArrayRef({ntoks, 768}) &&
+            gate_out.sizes() == at::IntArrayRef({ntoks, 768}) &&
+            k_out.sizes() == at::IntArrayRef({ntoks, 256}) &&
+            v_out.sizes() == at::IntArrayRef({ntoks, 256}),
+        "Qwen3.8 MRoPE v1 output shapes must be Q/G[T,768] and K/V[T,256]");
+
+    const at::Tensor all_tensors[] = {
+        qkv_state, q_out, gate_out, k_out, v_out,
+        norm_wq, norm_wk, positions, cos_sin_cache};
+    for (const auto& tensor : all_tensors) {
+        TORCH_CHECK(
+            tensor.device() == qkv_state.device(),
+            "all Qwen3.8 MRoPE v1 tensors must use qkv_state's XPU device");
+    }
+    const at::Tensor contiguous_tensors[] = {
+        qkv_state, q_out, gate_out, k_out, v_out,
+        norm_wq, norm_wk, cos_sin_cache};
+    for (const auto& tensor : contiguous_tensors) {
+        TORCH_CHECK(
+            tensor.is_contiguous(),
+            "all Qwen3.8 MRoPE v1 tensors except positions must be contiguous");
+    }
+    const at::Tensor outputs[] = {q_out, gate_out, k_out, v_out};
+    const at::Tensor inputs[] = {
+        qkv_state, norm_wq, norm_wk, positions, cos_sin_cache};
+    for (size_t i = 0; i < 4; ++i) {
+        for (size_t j = i + 1; j < 4; ++j) {
+            TORCH_CHECK(
+                !qwen38_mrope_ranges_overlap(outputs[i], outputs[j]),
+                "Qwen3.8 MRoPE v1 output tensors must not overlap");
+        }
+        for (const auto& input : inputs) {
+            TORCH_CHECK(
+                !qwen38_mrope_ranges_overlap(outputs[i], input),
+                "Qwen3.8 MRoPE v1 outputs must not overlap an input tensor");
+        }
+    }
+    auto aligned = [](const at::Tensor& tensor, size_t alignment) {
+        return reinterpret_cast<std::uintptr_t>(tensor.data_ptr()) % alignment == 0;
+    };
+    TORCH_CHECK(
+        aligned(qkv_state, 16) && aligned(q_out, 16) && aligned(gate_out, 16) &&
+            aligned(k_out, 16) && aligned(v_out, 16) && aligned(norm_wq, 16) &&
+            aligned(norm_wk, 16) && aligned(cos_sin_cache, 16),
+        "Qwen3.8 MRoPE v1 tensors must have 16-byte aligned data");
+    TORCH_CHECK(
+        aligned(positions, positions.scalar_type() == at::kLong ? 8 : 4),
+        "Qwen3.8 MRoPE v1 positions have an invalid alignment");
+
+    EXTRACT_PTR(p_qkv, qkv_state);
+    EXTRACT_PTR(p_q, q_out);
+    EXTRACT_PTR(p_gate, gate_out);
+    EXTRACT_PTR(p_k, k_out);
+    EXTRACT_PTR(p_v, v_out);
+    EXTRACT_PTR(p_nwq, norm_wq);
+    EXTRACT_PTR(p_nwk, norm_wk);
+    auto p_cs = reinterpret_cast<sycl::half*>(cos_sin_cache.data_ptr());
+    auto stream = c10::xpu::getCurrentXPUStream(qkv_state.device().index());
+    auto& dpcpp_queue = stream.queue();
+    TORCH_CHECK(
+        stream.device_index() == qkv_state.device().index(),
+        "current XPU stream does not match qkv_state device");
+    TORCH_CHECK(
+        dpcpp_queue.get_context() == c10::xpu::get_device_context(),
+        "current XPU stream uses a foreign SYCL context");
+    TORCH_CHECK(
+        dpcpp_queue.get_device() ==
+            c10::xpu::get_raw_device(qkv_state.device().index()),
+        "current XPU stream queue does not match qkv_state device");
+    if (positions.scalar_type() == at::kInt) {
+        qkv_split_norm_rope_mrope_v1_host<int32_t>(
+            p_qkv, p_q, p_gate, p_k, p_v, p_nwq, p_nwk,
+            positions.data_ptr<int32_t>(), p_cs, ntoks,
+            static_cast<uint32_t>(positions.stride(0)), qkv_state.size(1),
+            q_heads, kv_heads, attn_output_gate, dpcpp_queue);
+    } else {
+        qkv_split_norm_rope_mrope_v1_host<int64_t>(
+            p_qkv, p_q, p_gate, p_k, p_v, p_nwq, p_nwk,
+            positions.data_ptr<int64_t>(), p_cs, ntoks,
+            static_cast<uint32_t>(positions.stride(0)), qkv_state.size(1),
+            q_heads, kv_heads, attn_output_gate, dpcpp_queue);
+    }
     return q_out;
 }
 
@@ -528,6 +766,124 @@ at::Tensor esimd_resadd_norm_gemv2_fp8_pert(
 
 // ---- Fused RMSNormGated + INT4 GEMV (out_proj) ----
 
+namespace {
+
+static void check_norm_gemv_int4_contract(
+    const at::Tensor& x,
+    const at::Tensor& z,
+    const at::Tensor& norm_weight,
+    const at::Tensor& gemv_weight,
+    const at::Tensor& gemv_scale,
+    const at::Tensor& output,
+    int64_t HV,
+    int64_t V,
+    double eps) {
+    TORCH_CHECK(x.defined() && z.defined() && norm_weight.defined() &&
+                    gemv_weight.defined() && gemv_scale.defined() &&
+                    output.defined(),
+                "GDN INT4 output projection received an undefined tensor");
+    TORCH_CHECK(x.device().is_xpu(),
+                "GDN INT4 output projection tensors must be on XPU");
+    const at::Device device = x.device();
+    const at::Tensor tensors[] = {
+        z, norm_weight, gemv_weight, gemv_scale, output};
+    for (const auto& tensor : tensors) {
+        TORCH_CHECK(tensor.device() == device,
+                    "GDN INT4 output projection tensors must share one XPU device");
+    }
+
+    TORCH_CHECK(HV > 0 && V == 128,
+                "GDN INT4 output projection requires HV > 0 and V == 128");
+    TORCH_CHECK(std::isfinite(eps) && eps >= 0.0,
+                "GDN INT4 output projection eps must be finite and non-negative");
+    TORCH_CHECK(x.scalar_type() == at::kHalf && z.scalar_type() == at::kHalf &&
+                    norm_weight.scalar_type() == at::kHalf &&
+                    gemv_scale.scalar_type() == at::kHalf &&
+                    output.scalar_type() == at::kHalf,
+                "GDN INT4 output projection activations and scales must be FP16");
+    TORCH_CHECK(gemv_weight.scalar_type() == at::kInt,
+                "GDN INT4 packed weight must have dtype int32");
+    TORCH_CHECK(x.dim() == 2 && z.dim() == 2 && norm_weight.dim() == 1 &&
+                    gemv_weight.dim() == 2 && gemv_scale.dim() == 2 &&
+                    output.dim() == 2,
+                "GDN INT4 output projection has an invalid tensor rank");
+    TORCH_CHECK(x.is_contiguous() && z.is_contiguous() &&
+                    norm_weight.is_contiguous() && gemv_weight.is_contiguous() &&
+                    gemv_scale.is_contiguous() && output.is_contiguous(),
+                "GDN INT4 output projection tensors must be contiguous");
+    TORCH_CHECK(x.storage_offset() % 2 == 0 && z.storage_offset() % 2 == 0 &&
+                    norm_weight.storage_offset() % 2 == 0 &&
+                    gemv_scale.storage_offset() % 2 == 0 &&
+                    output.storage_offset() % 2 == 0,
+                "GDN INT4 FP16 tensors must have 4-byte aligned starts");
+    TORCH_CHECK(x.size(0) == HV && x.size(1) == V && z.sizes() == x.sizes() &&
+                    norm_weight.size(0) == V,
+                "GDN INT4 output projection head shape does not match HV/V");
+
+    TORCH_CHECK(HV <= std::numeric_limits<int64_t>::max() / V,
+                "GDN INT4 output projection HV/V product overflows");
+    const int64_t K = HV * V;
+    TORCH_CHECK(K <= std::numeric_limits<int>::max() &&
+                    gemv_weight.size(0) > 0 &&
+                    gemv_weight.size(0) <= std::numeric_limits<int>::max(),
+                "GDN INT4 output projection dimensions exceed the ABI");
+    TORCH_CHECK(gemv_weight.size(1) == K / 8 &&
+                    gemv_scale.size(0) == gemv_weight.size(0) &&
+                    gemv_scale.size(1) == K / 128,
+                "GDN INT4 packed weight or scale shape is invalid");
+    TORCH_CHECK(output.size(0) == 1 && output.size(1) == gemv_weight.size(0),
+                "GDN INT4 output projection output must have shape [1, N]");
+
+    const at::Tensor inputs[] = {
+        x, z, norm_weight, gemv_weight, gemv_scale};
+    for (const auto& input : inputs) {
+        TORCH_CHECK(!output.is_alias_of(input),
+                    "GDN INT4 output projection output must not alias an input");
+    }
+}
+
+static at::Tensor run_norm_gemv_int4(
+    at::Tensor x,
+    at::Tensor z,
+    at::Tensor norm_weight,
+    at::Tensor gemv_weight,
+    at::Tensor gemv_scale,
+    at::Tensor output,
+    int64_t HV,
+    int64_t V,
+    double eps,
+    bool sigmoid_gate) {
+    check_norm_gemv_int4_contract(
+        x, z, norm_weight, gemv_weight, gemv_scale, output, HV, V, eps);
+    const int N = static_cast<int>(gemv_weight.size(0));
+    auto& dpcpp_queue = get_device_queue(x);
+
+    if (sigmoid_gate) {
+        norm_gemv_int4_sigmoid_host(
+            reinterpret_cast<const fp16*>(x.data_ptr()),
+            reinterpret_cast<const fp16*>(z.data_ptr()),
+            reinterpret_cast<const fp16*>(norm_weight.data_ptr()),
+            gemv_weight.data_ptr<int32_t>(),
+            reinterpret_cast<const fp16*>(gemv_scale.data_ptr()),
+            reinterpret_cast<fp16*>(output.data_ptr()),
+            N, static_cast<int>(HV), static_cast<int>(V), static_cast<float>(eps),
+            dpcpp_queue);
+    } else {
+        norm_gemv_int4_host(
+            reinterpret_cast<const fp16*>(x.data_ptr()),
+            reinterpret_cast<const fp16*>(z.data_ptr()),
+            reinterpret_cast<const fp16*>(norm_weight.data_ptr()),
+            gemv_weight.data_ptr<int32_t>(),
+            reinterpret_cast<const fp16*>(gemv_scale.data_ptr()),
+            reinterpret_cast<fp16*>(output.data_ptr()),
+            N, static_cast<int>(HV), static_cast<int>(V), static_cast<float>(eps),
+            dpcpp_queue);
+    }
+    return output;
+}
+
+}  // namespace
+
 at::Tensor esimd_norm_gemv_int4_pert(
     at::Tensor x,             // [HV, V] fp16 — core_attn_out
     at::Tensor z,             // [HV, V] fp16 — z_out
@@ -536,22 +892,26 @@ at::Tensor esimd_norm_gemv_int4_pert(
     at::Tensor gemv_scale,    // [N, K/128] fp16 per-block
     at::Tensor output,        // [1, N] fp16
     int64_t HV, int64_t V,
-    double eps)
-{
-    int N = (int)gemv_weight.size(0);
-    auto& dpcpp_queue = get_device_queue(x);
+    double eps) {
+    return run_norm_gemv_int4(
+        std::move(x), std::move(z), std::move(norm_weight),
+        std::move(gemv_weight), std::move(gemv_scale), std::move(output),
+        HV, V, eps, false);
+}
 
-    norm_gemv_int4_host(
-        reinterpret_cast<const fp16*>(x.data_ptr()),
-        reinterpret_cast<const fp16*>(z.data_ptr()),
-        reinterpret_cast<const fp16*>(norm_weight.data_ptr()),
-        gemv_weight.data_ptr<int32_t>(),
-        reinterpret_cast<const fp16*>(gemv_scale.data_ptr()),
-        reinterpret_cast<fp16*>(output.data_ptr()),
-        N, (int)HV, (int)V, (float)eps,
-        dpcpp_queue);
-
-    return output;
+at::Tensor esimd_norm_gemv_int4_sigmoid(
+    at::Tensor x,             // [HV, V] fp16 — core_attn_out
+    at::Tensor z,             // [HV, V] fp16 — z_out
+    at::Tensor norm_weight,   // [V] fp16
+    at::Tensor gemv_weight,   // [N, K/8] int32 packed, K = HV*V
+    at::Tensor gemv_scale,    // [N, K/128] fp16 per-block
+    at::Tensor output,        // [1, N] fp16
+    int64_t HV, int64_t V,
+    double eps) {
+    return run_norm_gemv_int4(
+        std::move(x), std::move(z), std::move(norm_weight),
+        std::move(gemv_weight), std::move(gemv_scale), std::move(output),
+        HV, V, eps, true);
 }
 
 // ---- Fused Add + RMSNorm (Gemma-style, replace IPEX fused_add_rms_norm) ----
@@ -740,6 +1100,146 @@ void esimd_accum_norm_add_norm(
         reinterpret_cast<const fp16*>(w2.data_ptr()),
         reinterpret_cast<fp16*>(out.data_ptr()),
         K, (int)top_k, (float)eps1, (float)eps2, dpcpp_queue);
+}
+
+// ---- Qwen3.8 fixed-metadata decode N-gram IDs ----
+namespace {
+
+void check_qwen38_ngram_input(
+    const at::Tensor& tensor,
+    const at::Device& device,
+    const char* name) {
+    TORCH_CHECK(tensor.device().is_xpu(), name, " must be on XPU");
+    TORCH_CHECK(tensor.device() == device,
+                name, " must be on the same XPU device as input_ids");
+    TORCH_CHECK(tensor.scalar_type() == at::kLong,
+                name, " must have dtype int64");
+    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+}  // namespace
+
+at::Tensor esimd_qwen38_ngram_ids_decode_out(
+    at::Tensor input_ids,
+    at::Tensor ngram_context,
+    at::Tensor layer_multipliers,
+    at::Tensor output) {
+    TORCH_CHECK(input_ids.device().is_xpu(), "input_ids must be on XPU");
+    const at::Device device = input_ids.device();
+
+    check_qwen38_ngram_input(input_ids, device, "input_ids");
+    check_qwen38_ngram_input(ngram_context, device, "ngram_context");
+    check_qwen38_ngram_input(layer_multipliers, device, "layer_multipliers");
+    check_qwen38_ngram_input(output, device, "output");
+
+    TORCH_CHECK(input_ids.dim() == 1 && input_ids.size(0) == 1,
+                "input_ids must have shape [1]");
+    TORCH_CHECK(ngram_context.dim() == 2 && ngram_context.size(0) == 1 &&
+                    ngram_context.size(1) == 2,
+                "ngram_context must have shape [1, 2]");
+    TORCH_CHECK(layer_multipliers.dim() == 1 &&
+                    layer_multipliers.size(0) == 3,
+                "layer_multipliers must have shape [3]");
+    TORCH_CHECK(output.dim() == 2 && output.size(0) == 1 &&
+                    output.size(1) == 16,
+                "output must have shape [1, 16]");
+
+    // The device kernel specializes the Qwen3.8 checkpoint's fixed vocab sizes
+    // and offsets. The future model call site must guard those values once at
+    // initialization and retain the existing Torch fallback on a mismatch.
+    auto& dpcpp_queue = get_device_queue(input_ids);
+    qwen38_ngram_ids::decode_host(
+        input_ids.data_ptr<std::int64_t>(),
+        ngram_context.data_ptr<std::int64_t>(),
+        layer_multipliers.data_ptr<std::int64_t>(),
+        output.data_ptr<std::int64_t>(),
+        dpcpp_queue);
+    return output;
+}
+
+at::Tensor esimd_qwen38_ngram_ids_decode(
+    at::Tensor input_ids,
+    at::Tensor ngram_context,
+    at::Tensor layer_multipliers) {
+    at::Tensor output = at::empty({1, 16}, input_ids.options());
+    return esimd_qwen38_ngram_ids_decode_out(
+        input_ids, ngram_context, layer_multipliers, output);
+}
+
+// ---- Qwen3.8 NG-2a local FP16 embedding gather ----
+namespace {
+
+void check_qwen38_gather_weight(
+    const at::Tensor& tensor,
+    const at::Device& device,
+    const char* name) {
+    TORCH_CHECK(tensor.device().is_xpu(), name, " must be on XPU");
+    TORCH_CHECK(tensor.device() == device,
+                name, " must be on the same XPU device as ngram_ids");
+    TORCH_CHECK(tensor.scalar_type() == at::ScalarType::Half,
+                name, " must have dtype float16");
+    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+}  // namespace
+
+at::Tensor esimd_qwen38_ngram_embedding_gather_out(
+    at::Tensor ngram_ids,
+    at::Tensor local_weight,
+    at::Tensor local_vocab_start,
+    at::Tensor local_num_rows,
+    at::Tensor local_partial) {
+    TORCH_CHECK(ngram_ids.device().is_xpu(), "ngram_ids must be on XPU");
+    const at::Device device = ngram_ids.device();
+
+    check_qwen38_ngram_input(ngram_ids, device, "ngram_ids");
+    check_qwen38_ngram_input(
+        local_vocab_start, device, "local_vocab_start");
+    check_qwen38_ngram_input(local_num_rows, device, "local_num_rows");
+    check_qwen38_gather_weight(local_weight, device, "local_weight");
+    check_qwen38_gather_weight(local_partial, device, "local_partial");
+
+    TORCH_CHECK(ngram_ids.dim() == 2 && ngram_ids.size(0) == 1 &&
+                    ngram_ids.size(1) == qwen38_ngram_embedding::kRows,
+                "ngram_ids must have shape [1, 16]");
+    TORCH_CHECK(local_weight.dim() == 2 &&
+                    local_weight.size(1) == qwen38_ngram_embedding::kRowWidth,
+                "local_weight must have shape [N, 160]");
+    TORCH_CHECK(local_vocab_start.dim() == 1 &&
+                    local_vocab_start.size(0) == 1,
+                "local_vocab_start must have shape [1]");
+    TORCH_CHECK(local_num_rows.dim() == 1 &&
+                    local_num_rows.size(0) == 1,
+                "local_num_rows must have shape [1]");
+    TORCH_CHECK(local_partial.dim() == 2 && local_partial.size(0) == 1 &&
+                    local_partial.size(1) ==
+                        qwen38_ngram_embedding::kRows *
+                            qwen38_ngram_embedding::kRowWidth,
+                "local_partial must have shape [1, 2560]");
+
+    auto& dpcpp_queue = get_device_queue(ngram_ids);
+    qwen38_ngram_embedding::launch(
+        dpcpp_queue,
+        ngram_ids.data_ptr<std::int64_t>(),
+        reinterpret_cast<const sycl::half*>(local_weight.data_ptr()),
+        local_vocab_start.data_ptr<std::int64_t>(),
+        local_num_rows.data_ptr<std::int64_t>(),
+        reinterpret_cast<sycl::half*>(local_partial.data_ptr()));
+    return local_partial;
+}
+
+at::Tensor esimd_qwen38_ngram_embedding_gather(
+    at::Tensor ngram_ids,
+    at::Tensor local_weight,
+    at::Tensor local_vocab_start,
+    at::Tensor local_num_rows) {
+    at::Tensor local_partial = at::empty(
+        {1, qwen38_ngram_embedding::kRows *
+                qwen38_ngram_embedding::kRowWidth},
+        local_weight.options());
+    return esimd_qwen38_ngram_embedding_gather_out(
+        ngram_ids, local_weight, local_vocab_start, local_num_rows,
+        local_partial);
 }
 
 // ---- BMG-tuned FP8 GEMV (per-tensor) ----

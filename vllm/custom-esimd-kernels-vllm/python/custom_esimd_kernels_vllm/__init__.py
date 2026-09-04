@@ -15,8 +15,35 @@ from custom_esimd_kernels_vllm import moe_ops
 # MoE INT4 Batch kernels — registers torch.ops.moe_int4_ops.*
 from custom_esimd_kernels_vllm import moe_int4_ops
 
+# Qwen3.8 QSA — direct pybind API: qsa_ops.sparse_paged_attention(...)
+from custom_esimd_kernels_vllm import qsa_ops
+
 from custom_esimd_kernels_vllm.ops import (
     # Core ESIMD ops
+    QWEN38_NGRAM_OFFSETS,
+    QWEN38_NGRAM_VOCAB_SIZES,
+    esimd_qwen38_ngram_ids_decode,
+    esimd_qwen38_ngram_ids_decode_out,
+    esimd_qwen38_ngram_embedding_gather,
+    esimd_qwen38_ngram_embedding_gather_out,
+    ple_ngram_ids,
+    ple_embedding_gather,
+    ple_grouped_norm,
+    ple_score_gate,
+    ple_gated_value,
+    ple_gated_value_grouped_norm,
+    ple_gated_value_norm,
+    ple_embedding_assemble,
+    ple_projection_int4,
+    ple_projection_fp16,
+    ple_staged,
+    ple_staged_full,
+    ple_short_conv_mixed,
+    ple_short_conv_mixed_three_way,
+    ple_residual_add,
+    ple_short_conv_decode,
+    ple_short_conv_prefill,
+    ple_short_conv_spec,
     esimd_gemv_fp8_pern,
     esimd_gemv_fp8_pern_fused2,
     esimd_gemv_fp8_pern_fused3,
@@ -32,6 +59,7 @@ from custom_esimd_kernels_vllm.ops import (
     esimd_gemv_int4_fused2,
     esimd_gemm_int4_pgrp,
     esimd_qkv_split_norm_rope,
+    esimd_qkv_split_norm_rope_mrope_v1,
     esimd_qkv_split_norm_rope_v,
     esimd_qkv_split_norm_rope_muse_glimmer,
     esimd_qkv_split_norm_rope_muse_glimmer_neox,
@@ -52,6 +80,7 @@ from custom_esimd_kernels_vllm.ops import (
     esimd_norm_gemv_fp8_pert,
     esimd_norm_gemv_fp8_blockscale,
     esimd_norm_gemv_int4_pert,
+    esimd_norm_gemv_int4_sigmoid,
     esimd_gdn_conv_fused_seq,
     esimd_gdn_conv_fused_seq_spec,
     esimd_moe_topk,
@@ -96,6 +125,8 @@ from custom_esimd_kernels_vllm.ops import (
     moe_forward_tiny_cutlass_nmajor_int4,
     moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared,
     moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits,
+    moe_forward_m1_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1,
+    moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1,
     moe_tiny_cutlass_nmajor_int4_up,
     moe_tiny_cutlass_nmajor_int4_down,
     moe_tiny_fp16_shared_up,

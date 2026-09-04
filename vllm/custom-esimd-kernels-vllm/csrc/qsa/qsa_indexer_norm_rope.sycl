@@ -1,0 +1,259 @@
+// Copyright 2026
+// SPDX-License-Identifier: Apache-2.0
+//
+// Qwen3.8 QSA indexer Gemma RMSNorm + exact 1D/interleaved MRoPE.
+
+#include "qsa_ops.h"
+#include "../xpu/mrope_ranges.h"
+
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/sycl.hpp>
+
+#include <cstdint>
+#include <limits>
+
+namespace qsa {
+namespace {
+
+using fp16 = sycl::half;
+using namespace sycl::ext::intel::esimd;
+
+constexpr int64_t kHeadDim = 128;
+constexpr int64_t kRotaryDim = 64;
+constexpr int64_t kRotaryHalf = kRotaryDim / 2;
+constexpr int64_t kMropeAxes = 3;
+constexpr int64_t kMropeSection1 = 11;
+constexpr int64_t kMropeSection2 = 10;
+constexpr float kEpsilon = 1e-6f;
+
+static_assert(kMropeSection1 + kMropeSection1 + kMropeSection2 == kRotaryHalf);
+
+template <bool Mrope, typename PosT>
+class QsaIndexerNormRopeKernel;
+
+template <bool Mrope, typename PosT>
+ESIMD_INLINE void apply_rope(
+    simd<float, kHeadDim>& value,
+    const PosT* positions,
+    uint32_t position_row_stride,
+    uint32_t row,
+    fp16* cos_sin_cache) {
+  uint32_t pos_t = static_cast<uint32_t>(positions[row]);
+  uint32_t pos_h = pos_t;
+  uint32_t pos_w = pos_t;
+  if constexpr (Mrope) {
+    pos_h = static_cast<uint32_t>(positions[position_row_stride + row]);
+    pos_w = static_cast<uint32_t>(positions[2 * position_row_stride + row]);
+  }
+
+  simd<fp16, kRotaryHalf> t_cos16 =
+      block_load<fp16, kRotaryHalf>(cos_sin_cache + pos_t * kRotaryDim);
+  simd<fp16, kRotaryHalf> t_sin16 = block_load<fp16, kRotaryHalf>(
+      cos_sin_cache + pos_t * kRotaryDim + kRotaryHalf);
+  simd<float, kRotaryHalf> cos_values = t_cos16;
+  simd<float, kRotaryHalf> sin_values = t_sin16;
+
+  if constexpr (Mrope) {
+    simd<fp16, kRotaryHalf> h_cos16 =
+        block_load<fp16, kRotaryHalf>(cos_sin_cache + pos_h * kRotaryDim);
+    simd<fp16, kRotaryHalf> h_sin16 = block_load<fp16, kRotaryHalf>(
+        cos_sin_cache + pos_h * kRotaryDim + kRotaryHalf);
+    simd<fp16, kRotaryHalf> w_cos16 =
+        block_load<fp16, kRotaryHalf>(cos_sin_cache + pos_w * kRotaryDim);
+    simd<fp16, kRotaryHalf> w_sin16 = block_load<fp16, kRotaryHalf>(
+        cos_sin_cache + pos_w * kRotaryDim + kRotaryHalf);
+    // Qwen3.8 interleaved sections select T/H/W by pair index modulo three.
+    cos_values.select<kMropeSection1, 3>(1) =
+        h_cos16.select<kMropeSection1, 3>(1);
+    sin_values.select<kMropeSection1, 3>(1) =
+        h_sin16.select<kMropeSection1, 3>(1);
+    cos_values.select<kMropeSection2, 3>(2) =
+        w_cos16.select<kMropeSection2, 3>(2);
+    sin_values.select<kMropeSection2, 3>(2) =
+        w_sin16.select<kMropeSection2, 3>(2);
+  }
+
+  simd<float, kRotaryHalf> first = value.select<kRotaryHalf, 1>(0);
+  simd<float, kRotaryHalf> second =
+      value.select<kRotaryHalf, 1>(kRotaryHalf);
+  value.select<kRotaryHalf, 1>(0) = first * cos_values - second * sin_values;
+  value.select<kRotaryHalf, 1>(kRotaryHalf) =
+      second * cos_values + first * sin_values;
+}
+
+template <bool Mrope, typename PosT>
+void launch_indexer_norm_rope(
+    const at::Tensor& input,
+    at::Tensor output,
+    const at::Tensor& weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache) {
+  const uint32_t rows = static_cast<uint32_t>(input.size(0));
+  const uint32_t heads = static_cast<uint32_t>(input.size(1));
+  const uint32_t position_row_stride = Mrope
+      ? static_cast<uint32_t>(positions.stride(0))
+      : 1;
+  const auto* input_ptr = reinterpret_cast<const fp16*>(input.data_ptr());
+  auto* output_ptr = reinterpret_cast<fp16*>(output.data_ptr());
+  const auto* weight_ptr = reinterpret_cast<const fp16*>(weight.data_ptr());
+  const auto* position_ptr = positions.data_ptr<PosT>();
+  auto* cache_ptr = reinterpret_cast<fp16*>(cos_sin_cache.data_ptr());
+
+  auto& queue = c10::xpu::getCurrentXPUStream(input.device().index()).queue();
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<QsaIndexerNormRopeKernel<Mrope, PosT>>(
+        sycl::nd_range<2>(sycl::range<2>(heads, rows), sycl::range<2>(1, 1)),
+        [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+          const uint32_t head = item.get_group(0);
+          const uint32_t row = item.get_group(1);
+          const uint32_t offset = row * heads * kHeadDim + head * kHeadDim;
+          simd<fp16, kHeadDim> input_values =
+              block_load<fp16, kHeadDim>(input_ptr + offset);
+          simd<float, kHeadDim> values = input_values;
+          simd<float, kHeadDim> squares = values * values;
+          const float variance =
+              sycl::ext::intel::esimd::detail::sum<float, float, kHeadDim>(
+                  squares) /
+              static_cast<float>(kHeadDim);
+          const float inverse_rms = __ESIMD_NS::rsqrt(variance + kEpsilon);
+          simd<float, kHeadDim> norm_weight =
+              block_load<fp16, kHeadDim>(weight_ptr);
+          values = values * (norm_weight + 1.0f);
+          values *= inverse_rms;
+          apply_rope<Mrope, PosT>(
+              values, position_ptr, position_row_stride, row, cache_ptr);
+          block_store<fp16, kHeadDim>(output_ptr + offset, values);
+        });
+  });
+}
+
+bool aligned(const at::Tensor& tensor, size_t alignment) {
+  return reinterpret_cast<std::uintptr_t>(tensor.data_ptr()) % alignment == 0;
+}
+
+void validate_indexer_norm_rope(
+    const at::Tensor& input,
+    const at::Tensor& output,
+    const at::Tensor& weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    bool mrope,
+    bool positions_bounds_proven) {
+  TORCH_CHECK(
+      positions_bounds_proven,
+      "QSA indexer norm+RoPE requires a trusted position-bound proof");
+  TORCH_CHECK(
+      input.device().is_xpu() && output.device() == input.device() &&
+          weight.device() == input.device() &&
+          positions.device() == input.device() &&
+          cos_sin_cache.device() == input.device(),
+      "QSA indexer norm+RoPE tensors must share one XPU device");
+  TORCH_CHECK(
+      input.scalar_type() == at::kHalf && output.scalar_type() == at::kHalf &&
+          weight.scalar_type() == at::kHalf &&
+          cos_sin_cache.scalar_type() == at::kHalf,
+      "QSA indexer norm+RoPE activations, weight and cache must be float16");
+  TORCH_CHECK(
+      input.dim() == 3 && input.size(0) >= 1 && input.size(0) <= 64 &&
+          (input.size(1) == 1 || input.size(1) == 4) &&
+          input.size(2) == kHeadDim,
+      "input must have shape [1..64,1|4,128]");
+  TORCH_CHECK(
+      output.sizes() == input.sizes(),
+      "output must have the same shape as input");
+  TORCH_CHECK(
+      weight.dim() == 1 && weight.size(0) == kHeadDim,
+      "weight must have shape [128]");
+  TORCH_CHECK(
+      positions.dim() == (mrope ? 2 : 1) &&
+          positions.size(mrope ? 1 : 0) == input.size(0) &&
+          (positions.scalar_type() == at::kInt ||
+           positions.scalar_type() == at::kLong),
+      mrope ? "MRoPE positions must be [3,R] int32/int64"
+            : "RoPE positions must be [R] int32/int64");
+  if (mrope) {
+    TORCH_CHECK(
+        positions.size(0) == kMropeAxes && positions.stride(1) == 1 &&
+            positions.stride(0) >= input.size(0) &&
+            positions.stride(0) <=
+                static_cast<int64_t>(
+                    (std::numeric_limits<uint32_t>::max() -
+                     static_cast<uint32_t>(input.size(0) - 1)) /
+                    2),
+        "MRoPE positions must have safe [3,R] row-strided layout");
+  } else {
+    TORCH_CHECK(
+        positions.is_contiguous(),
+        "RoPE positions must be contiguous");
+  }
+  TORCH_CHECK(
+      cos_sin_cache.dim() == 2 && cos_sin_cache.size(0) > 0 &&
+          cos_sin_cache.size(1) == kRotaryDim &&
+          cos_sin_cache.size(0) <=
+              static_cast<int64_t>(std::numeric_limits<uint32_t>::max() /
+                                   kRotaryDim),
+      "cos_sin_cache must have shape [max_position,64]");
+  const at::Tensor contiguous_tensors[] = {
+      input, output, weight, cos_sin_cache};
+  for (const auto& tensor : contiguous_tensors) {
+    TORCH_CHECK(
+        tensor.is_contiguous(),
+        "QSA indexer norm+RoPE tensors must be contiguous");
+  }
+  TORCH_CHECK(
+      aligned(input, 16) && aligned(output, 16) && aligned(weight, 16) &&
+          aligned(cos_sin_cache, 16),
+      "QSA indexer norm+RoPE tensors must be 16-byte aligned");
+  TORCH_CHECK(
+      aligned(positions, positions.scalar_type() == at::kLong ? 8 : 4),
+      "QSA indexer norm+RoPE positions have invalid alignment");
+  TORCH_CHECK(
+      !qwen38_mrope_ranges_overlap(output, input) &&
+          !qwen38_mrope_ranges_overlap(output, weight) &&
+          !qwen38_mrope_ranges_overlap(output, positions) &&
+          !qwen38_mrope_ranges_overlap(output, cos_sin_cache),
+      "QSA indexer norm+RoPE output must not overlap an input");
+}
+
+}  // namespace
+
+at::Tensor indexer_norm_rope_v1(
+    const at::Tensor& input,
+    at::Tensor output,
+    const at::Tensor& weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    bool mrope,
+    bool positions_bounds_proven) {
+  validate_indexer_norm_rope(
+      input, output, weight, positions, cos_sin_cache, mrope,
+      positions_bounds_proven);
+  if (positions.scalar_type() == at::kInt) {
+    if (mrope) {
+      launch_indexer_norm_rope<true, int32_t>(
+          input, output, weight, positions, cos_sin_cache);
+    } else {
+      launch_indexer_norm_rope<false, int32_t>(
+          input, output, weight, positions, cos_sin_cache);
+    }
+  } else {
+    // The implementation uses the same 32-bit index ABI after this host
+    // contract proves positions fit in the representable range.
+    TORCH_CHECK(
+        positions.numel() <= std::numeric_limits<uint32_t>::max(),
+        "QSA indexer norm+RoPE positions are too large");
+    if (mrope) {
+      launch_indexer_norm_rope<true, int64_t>(
+          input, output, weight, positions, cos_sin_cache);
+    } else {
+      launch_indexer_norm_rope<false, int64_t>(
+          input, output, weight, positions, cos_sin_cache);
+    }
+  }
+  return output;
+}
+
+}  // namespace qsa

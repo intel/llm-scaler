@@ -5,6 +5,1281 @@ import torch.nn.functional as F
 _ops = torch.ops.custom_esimd_kernels_vllm
 
 
+def _tensors_alias(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """Use the alias API available across supported PyTorch XPU builds."""
+    method = getattr(left, "is_alias_of", None)
+    if method is not None:
+        return bool(method(right))
+    return bool(torch._C._is_alias_of(left, right))
+
+
+QWEN38_NGRAM_VOCAB_SIZES = (
+    20000003, 20000023, 20000033, 20000047,
+    20000059, 20000063, 20000069, 20000077,
+    20000081, 20000093, 20000107, 20000147,
+    20000153, 20000159, 20000161, 20000171,
+)
+QWEN38_NGRAM_OFFSETS = (
+    0, 20000003, 40000026, 60000059,
+    80000106, 100000165, 120000228, 140000297,
+    160000374, 180000455, 200000548, 220000655,
+    240000802, 260000955, 280001114, 300001275,
+)
+
+# The current BMG INT4 GEMM kernel has a fixed maximum of eight 8-row tiles.
+# Keep larger packed batches correct by submitting bounded chunks rather than
+# allowing the native kernel to silently leave rows unwritten.
+_PLE_PROJECTION_MAX_GEMM_ROWS = 64
+
+
+def esimd_qwen38_ngram_ids_decode(
+    input_ids: torch.Tensor,
+    ngram_context: torch.Tensor,
+    layer_multipliers: torch.Tensor,
+) -> torch.Tensor:
+    """Generate the 16 Qwen3.8 decode N-gram IDs in one XPU launch.
+
+    This fast path specializes ``QWEN38_NGRAM_VOCAB_SIZES`` and
+    ``QWEN38_NGRAM_OFFSETS``. The model call site must verify those immutable
+    metadata values once before dispatch and retain the Torch fallback when
+    they do not match. Native checks cover dtype, device, contiguity and the
+    frozen decode shapes without adding a device-to-host synchronization.
+    """
+    return _ops.esimd_qwen38_ngram_ids_decode(
+        input_ids, ngram_context, layer_multipliers)
+
+
+def esimd_qwen38_ngram_ids_decode_out(
+    input_ids: torch.Tensor,
+    ngram_context: torch.Tensor,
+    layer_multipliers: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Preallocated-output variant for a guarded model decode hot path."""
+    _ops.esimd_qwen38_ngram_ids_decode_out(
+        input_ids, ngram_context, layer_multipliers, output)
+    return output
+
+
+def esimd_qwen38_ngram_embedding_gather(
+    ngram_ids: torch.Tensor,
+    local_weight: torch.Tensor,
+    local_vocab_start: torch.Tensor,
+    local_num_rows: torch.Tensor,
+) -> torch.Tensor:
+    """Gather 16 global IDs from one runtime FP16 local shard.
+
+    The result is the local partial ``[1, 2560]`` before TP all-reduce.
+    ``local_weight`` and both shard metadata tensors are runtime inputs; this
+    op is not tied to the small correctness fixture or a particular TP rank.
+    """
+    return _ops.esimd_qwen38_ngram_embedding_gather(
+        ngram_ids, local_weight, local_vocab_start, local_num_rows)
+
+
+def esimd_qwen38_ngram_embedding_gather_out(
+    ngram_ids: torch.Tensor,
+    local_weight: torch.Tensor,
+    local_vocab_start: torch.Tensor,
+    local_num_rows: torch.Tensor,
+    local_partial: torch.Tensor,
+) -> torch.Tensor:
+    """Preallocated-output variant for a model hot path."""
+    _ops.esimd_qwen38_ngram_embedding_gather_out(
+        ngram_ids, local_weight, local_vocab_start, local_num_rows,
+        local_partial)
+    return local_partial
+
+
+# ---- Qwen3.8 PLE standalone primitives ----
+
+
+def ple_ngram_ids(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    layer_multipliers: torch.Tensor,
+    ngram_heads_vocab_sizes: torch.Tensor,
+    ngram_heads_offsets: torch.Tensor,
+    output: torch.Tensor,
+    eos_token_id: int,
+    heads_per_ngram: int,
+) -> torch.Tensor:
+    """Generate general EOS-aware N-gram IDs into a caller-owned buffer."""
+    _ops.ple_ngram_ids(
+        input_ids, query_start_loc, ngram_context, layer_multipliers,
+        ngram_heads_vocab_sizes, ngram_heads_offsets, output,
+        eos_token_id, heads_per_ngram)
+    return output
+
+
+def ple_embedding_gather(
+    ngram_ids: torch.Tensor,
+    local_weight: torch.Tensor,
+    local_vocab_start: torch.Tensor,
+    local_num_rows: torch.Tensor,
+    local_partial: torch.Tensor,
+) -> torch.Tensor:
+    """Gather local embedding contributions before the TP assembly boundary."""
+    _ops.ple_embedding_gather(
+        ngram_ids, local_weight, local_vocab_start, local_num_rows, local_partial)
+    return local_partial
+
+
+def ple_grouped_norm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    eps: float,
+    group_size: int,
+) -> torch.Tensor:
+    """PLE grouped norm with FP32 variance and a caller-owned output."""
+    _ops.ple_grouped_norm(input, weight, output, eps, group_size)
+    return output
+
+
+def ple_score_gate(
+    key: torch.Tensor,
+    query: torch.Tensor,
+    output: torch.Tensor,
+    hidden_size: int,
+) -> torch.Tensor:
+    """Compute the signed-square-root gate into ``[tokens, hc_count]``."""
+    _ops.ple_score_gate(key, query, output, hidden_size)
+    return output
+
+
+def ple_gated_value(
+    gate: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    hc_count: int,
+) -> torch.Tensor:
+    """Broadcast gate over value and write ``[tokens, hc_count, hidden]``."""
+    _ops.ple_gated_value(gate, value, output, hc_count)
+    return output
+
+
+def ple_gated_value_grouped_norm(
+    gate: torch.Tensor,
+    value: torch.Tensor,
+    weight: torch.Tensor,
+    raw_output: torch.Tensor,
+    normalized_output: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Write rounded gated values and their grouped norm in one launch."""
+    _ops.ple_gated_value_grouped_norm(
+        gate, value, weight, raw_output, normalized_output, eps
+    )
+    return raw_output, normalized_output
+
+
+def ple_residual_add(
+    gated_value_flat: torch.Tensor,
+    conv_output: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Add the flattened gated value and short-conv output."""
+    _ops.ple_residual_add(gated_value_flat, conv_output, output)
+    return output
+
+
+def ple_short_conv_decode(
+    input: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weights: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    output: torch.Tensor,
+    dilation: int,
+    state_dim_first: bool = True,
+    null_block_id: int = -1,
+) -> torch.Tensor:
+    """Run ordinary decode short-conv and mutate the caller-owned state."""
+    _ops.ple_short_conv_decode(
+        input, conv_state, conv_weights, state_indices, has_initial_state,
+        output, dilation, state_dim_first, null_block_id)
+    return output
+
+
+def ple_short_conv_prefill(
+    input: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weights: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    output: torch.Tensor,
+    dilation: int,
+    state_dim_first: bool = True,
+    null_block_id: int = -1,
+) -> torch.Tensor:
+    """Run ragged prefill short-conv and mutate the per-request state."""
+    _ops.ple_short_conv_prefill(
+        input, query_start_loc, conv_state, conv_weights, state_indices,
+        has_initial_state, output, dilation, state_dim_first, null_block_id)
+    return output
+
+
+def ple_short_conv_spec(
+    input: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weights: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    output: torch.Tensor,
+    num_spec_tokens: int,
+    dilation: int,
+    state_dim_first: bool = True,
+    null_block_id: int = -1,
+) -> torch.Tensor:
+    """Run speculative rollback/extension short-conv and mutate state."""
+    _ops.ple_short_conv_spec(
+        input, query_start_loc, conv_state, conv_weights, state_indices,
+        num_accepted_tokens, output, num_spec_tokens, dilation,
+        state_dim_first, null_block_id)
+    return output
+
+
+def ple_gated_value_norm(
+    gated_value: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    eps: float,
+    group_size: int,
+) -> torch.Tensor:
+    """K8 grouped norm for ``[tokens, hc_count, hidden]`` gated values."""
+    if gated_value.dim() != 3:
+        raise ValueError("gated_value must have shape [tokens, hc_count, hidden]")
+    flattened = gated_value.flatten(-2)
+    if output.shape == gated_value.shape:
+        if not output.is_contiguous():
+            raise ValueError("three-dimensional output must be contiguous")
+        output_flat = output.view_as(flattened)
+    elif output.shape == flattened.shape:
+        output_flat = output
+    else:
+        raise ValueError("output must be flattened or match gated_value shape")
+    return ple_grouped_norm(
+        flattened, weight, output_flat, eps, group_size
+    )
+
+
+def ple_embedding_assemble(
+    local_partials: torch.Tensor,
+    assembled: torch.Tensor,
+) -> torch.Tensor:
+    """Assemble TP-local embedding partials without owning a communicator.
+
+    ``local_partials`` is ``[tp, tokens, embed_dim]``.  The caller controls
+    the all-reduce boundary; this helper only performs the deterministic
+    mathematical sum into a caller-owned output buffer.
+    """
+    if local_partials.dim() != 3:
+        raise ValueError("local_partials must have shape [tp, tokens, embed_dim]")
+    if assembled.shape != local_partials.shape[1:]:
+        raise ValueError("assembled shape must match one local partial")
+    if assembled.device != local_partials.device or assembled.dtype != local_partials.dtype:
+        raise ValueError("assembled must share device and dtype with local_partials")
+    if assembled.numel() == 0:
+        return assembled
+    assembled.copy_(local_partials.sum(dim=0))
+    return assembled
+
+
+def _validate_ple_projection_int4(
+    input: torch.Tensor,
+    weight_esimd: torch.Tensor,
+    scale_esimd: torch.Tensor,
+    output: torch.Tensor,
+) -> tuple[int, int, int]:
+    tensors = {
+        "input": input,
+        "weight_esimd": weight_esimd,
+        "scale_esimd": scale_esimd,
+        "output": output,
+    }
+    if any(t.device.type != "xpu" for t in tensors.values()):
+        raise ValueError("PLE INT4 projection tensors must be on XPU")
+    if any(t.device != input.device for t in tensors.values()):
+        raise ValueError("PLE INT4 projection tensors must share one XPU device")
+    if any(not t.is_contiguous() for t in tensors.values()):
+        raise ValueError("PLE INT4 projection tensors must be contiguous")
+    if input.dtype != torch.float16 or output.dtype != torch.float16:
+        raise ValueError("PLE INT4 projection input/output must be float16")
+    if weight_esimd.dtype != torch.uint8 or scale_esimd.dtype != torch.float16:
+        raise ValueError("PLE INT4 weight/scale dtypes must be uint8/float16")
+    if input.ndim != 2 or weight_esimd.ndim != 2 or scale_esimd.ndim != 2:
+        raise ValueError("PLE INT4 projection input/weight/scale must be rank 2")
+    if output.ndim != 2:
+        raise ValueError("PLE INT4 projection output must be rank 2")
+    m, k = input.shape
+    n = weight_esimd.size(0)
+    # Empty token batches are valid no-ops; channel dimensions remain strict.
+    if n <= 0 or k <= 0 or k % 128:
+        raise ValueError("PLE INT4 projection requires positive K divisible by 128")
+    if weight_esimd.size(1) != k // 2:
+        raise ValueError("projection K does not match packed weight")
+    if n % 16:
+        raise ValueError("PLE INT4 projection N must be divisible by 16")
+    if scale_esimd.shape != (n, k // 128):
+        raise ValueError("projection scale shape must be [N, K/128]")
+    if output.shape != (m, n):
+        raise ValueError("projection output shape is invalid")
+    if any(_tensors_alias(output, t) for t in (input, weight_esimd, scale_esimd)):
+        raise ValueError("projection output must not alias an input")
+    return m, n, k
+
+
+def ple_projection_int4(
+    input: torch.Tensor,
+    weight_esimd: torch.Tensor,
+    scale_esimd: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Run a PLE INT4 projection using the confirmed packed-weight ABI.
+
+    ``weight_esimd`` is ``[N, K/2]`` uint8 and ``scale_esimd`` is
+    ``[N, K/128]`` fp16.  M=1 uses the fused GEMV implementation; M>1 uses
+    the batch INT4 GEMM implementation.  No logical-transpose view is passed
+    to either kernel.  Batches larger than 64 rows are split into bounded
+    GEMM/GEMV submissions because the native GEMM supports at most 64 rows.
+    """
+    m, _, _ = _validate_ple_projection_int4(
+        input, weight_esimd, scale_esimd, output
+    )
+    if m == 0:
+        return output
+    if m == 1:
+        return esimd_gemv_int4(input, weight_esimd, scale_esimd, output)
+
+    for row_start in range(0, m, _PLE_PROJECTION_MAX_GEMM_ROWS):
+        row_end = min(row_start + _PLE_PROJECTION_MAX_GEMM_ROWS, m)
+        input_chunk = input[row_start:row_end]
+        output_chunk = output[row_start:row_end]
+        if row_end - row_start == 1:
+            esimd_gemv_int4(
+                input_chunk, weight_esimd, scale_esimd, output_chunk
+            )
+        else:
+            esimd_gemm_int4_pgrp(
+                input_chunk, weight_esimd, scale_esimd, output_chunk
+            )
+    return output
+
+
+def ple_projection_fp16(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Fallback/diagnostic FP16 PLE projection with row-major weights."""
+    tensors = (input, weight, output)
+    if any(t.device.type != "xpu" for t in tensors):
+        raise ValueError("PLE FP16 projection tensors must be on XPU")
+    if any(t.device != input.device for t in tensors):
+        raise ValueError("PLE FP16 projection tensors must share one XPU device")
+    if any(not t.is_contiguous() for t in tensors):
+        raise ValueError("PLE FP16 projection tensors must be contiguous")
+    if any(t.dtype != torch.float16 for t in tensors):
+        raise ValueError("PLE FP16 projection tensors must be float16")
+    if any(t.dim() != 2 for t in tensors):
+        raise ValueError("PLE FP16 projection tensors must be rank 2")
+    if input.size(1) <= 0 or weight.size(0) <= 0:
+        raise ValueError("PLE FP16 projection dimensions must be positive")
+    if input.size(1) != weight.size(1):
+        raise ValueError("FP16 projection K mismatch")
+    if output.shape != (input.size(0), weight.size(0)):
+        raise ValueError("invalid FP16 projection shape")
+    if any(_tensors_alias(output, t) for t in (input, weight)):
+        raise ValueError("FP16 projection output must not alias an input")
+    if input.size(0) == 0:
+        return output
+    return esimd_gemv_fp16(input, weight, output)
+
+
+def ple_staged(
+    embedding: torch.Tensor,
+    hidden_states: torch.Tensor,
+    key_weight: torch.Tensor,
+    key_scale: torch.Tensor | None,
+    value_weight: torch.Tensor,
+    value_scale: torch.Tensor | None,
+    norm_key_weight: torch.Tensor,
+    norm_query_weight: torch.Tensor,
+    norm_conv_weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weights: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    mode: str,
+    eps: float,
+    group_size: int,
+    dilation: int,
+    query_start_loc: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    num_spec_tokens: int = 0,
+    state_dim_first: bool = True,
+    null_block_id: int = -1,
+    projection_kind: str = "int4",
+) -> dict[str, torch.Tensor]:
+    """Run the caller-owned PLE primitive pipeline without vLLM integration.
+
+    The returned dictionary intentionally exposes each intermediate so the
+    standalone harness can identify the first divergent stage.  ``embedding``
+    must already be the assembled TP result; K2's communicator boundary stays
+    outside this function.
+    """
+    if embedding.dim() != 2 or hidden_states.dim() != 2:
+        raise ValueError("embedding and hidden_states must be rank 2")
+    if embedding.size(0) != hidden_states.size(0):
+        raise ValueError("embedding and hidden_states token counts differ")
+    tokens = hidden_states.size(0)
+    if group_size <= 0:
+        raise ValueError("group_size must be positive")
+    if hidden_states.size(1) <= 0 or hidden_states.size(1) % group_size:
+        raise ValueError("hidden width must be positive and divisible by group_size")
+    hc_count = hidden_states.size(1) // group_size
+    key_linear = torch.empty(
+        (tokens, hc_count * group_size),
+        dtype=embedding.dtype,
+        device=embedding.device,
+    )
+    value = torch.empty(
+        (tokens, group_size), dtype=embedding.dtype, device=embedding.device
+    )
+    if projection_kind == "int4":
+        if key_scale is None or value_scale is None:
+            raise ValueError("INT4 projections require both scale tensors")
+        ple_projection_int4(embedding, key_weight, key_scale, key_linear)
+        ple_projection_int4(embedding, value_weight, value_scale, value)
+    elif projection_kind == "fp16":
+        ple_projection_fp16(embedding, key_weight, key_linear)
+        ple_projection_fp16(embedding, value_weight, value)
+    else:
+        raise ValueError("projection_kind must be 'int4' or 'fp16'")
+
+    key = key_linear.view(tokens, hc_count, group_size)
+    query = hidden_states.view(tokens, hc_count, group_size)
+    key_norm_flat = torch.empty_like(key_linear)
+    query_norm_flat = torch.empty_like(hidden_states)
+    ple_grouped_norm(
+        key_linear, norm_key_weight, key_norm_flat, eps, group_size
+    )
+    ple_grouped_norm(
+        hidden_states, norm_query_weight, query_norm_flat, eps, group_size
+    )
+    key_norm = key_norm_flat.view_as(key)
+    query_norm = query_norm_flat.view_as(query)
+    gate = torch.empty(
+        (tokens, hc_count, 1), dtype=embedding.dtype, device=embedding.device
+    )
+    ple_score_gate(key_norm, query_norm, gate, group_size)
+    gated = torch.empty(
+        (tokens, hc_count, group_size),
+        dtype=embedding.dtype,
+        device=embedding.device,
+    )
+    ple_gated_value(gate, value, gated, hc_count)
+    normalized = torch.empty_like(gated.reshape(tokens, -1))
+    ple_gated_value_norm(
+        gated, norm_conv_weight, normalized, eps, group_size
+    )
+    conv_output = torch.empty_like(normalized)
+    if mode == "decode":
+        ple_short_conv_decode(
+            normalized, conv_state, conv_weights, state_indices,
+            has_initial_state, conv_output, dilation, state_dim_first,
+            null_block_id,
+        )
+    elif mode == "prefill":
+        if query_start_loc is None:
+            raise ValueError("prefill requires query_start_loc")
+        ple_short_conv_prefill(
+            normalized, query_start_loc, conv_state, conv_weights,
+            state_indices, has_initial_state, conv_output, dilation,
+            state_dim_first, null_block_id,
+        )
+    elif mode == "spec":
+        if query_start_loc is None or num_accepted_tokens is None:
+            raise ValueError("spec requires query_start_loc and accepted tokens")
+        ple_short_conv_spec(
+            normalized, query_start_loc, conv_state, conv_weights,
+            state_indices, num_accepted_tokens, conv_output, num_spec_tokens,
+            dilation, state_dim_first, null_block_id,
+        )
+    else:
+        raise ValueError("mode must be decode, prefill, or spec")
+    output = torch.empty_like(normalized)
+    ple_residual_add(gated.flatten(-2), conv_output, output)
+    return {
+        "key": key,
+        "value": value,
+        "query": query,
+        "key_norm": key_norm,
+        "query_norm": query_norm,
+        "gate": gate,
+        "gated_value": gated,
+        "normalized": normalized,
+        "conv_output": conv_output,
+        "output": output,
+        # Return a snapshot: stateful primitives mutate the caller-owned state,
+        # but staged diagnostics need a stable post-call artifact.
+        "final_state": conv_state.clone(),
+    }
+
+
+def ple_staged_full(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    layer_multipliers: torch.Tensor,
+    ngram_heads_vocab_sizes: torch.Tensor,
+    ngram_heads_offsets: torch.Tensor,
+    local_weight: torch.Tensor,
+    local_vocab_start: torch.Tensor,
+    local_num_rows: torch.Tensor,
+    rank_local_partials: torch.Tensor,
+    assembled_embedding: torch.Tensor,
+    hidden_states: torch.Tensor,
+    key_weight: torch.Tensor,
+    key_scale: torch.Tensor | None,
+    value_weight: torch.Tensor,
+    value_scale: torch.Tensor | None,
+    norm_key_weight: torch.Tensor,
+    norm_query_weight: torch.Tensor,
+    norm_conv_weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weights: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    mode: str,
+    eps: float,
+    group_size: int,
+    dilation: int,
+    eos_token_id: int,
+    heads_per_ngram: int,
+    query_start_loc_conv: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    num_spec_tokens: int = 0,
+    state_dim_first: bool = True,
+    null_block_id: int = -1,
+    projection_kind: str = "int4",
+) -> dict[str, torch.Tensor]:
+    """Run standalone K0-K10 with an explicit K2 assembly boundary.
+
+    ``rank_local_partials`` is caller-supplied mathematical input for K2.  Its
+    rank-zero row is replaced in a private clone by the K1 gather result, then
+    ``ple_embedding_assemble`` performs only the explicit sum.  No process group
+    or all-reduce is created here; a caller integrating TP must own that boundary
+    and pass the resulting partials/assembly contract explicitly.
+    """
+    if input_ids.dim() != 1 or input_ids.dtype != torch.int64:
+        raise ValueError("input_ids must be a one-dimensional int64 tensor")
+    if query_start_loc.dim() != 1 or ngram_context.dim() != 2:
+        raise ValueError("N-gram metadata has an invalid rank")
+    if hidden_states.dim() != 2 or hidden_states.size(0) != input_ids.size(0):
+        raise ValueError("hidden_states must match packed input token count")
+    if local_weight.dim() != 2 or local_weight.size(1) <= 0:
+        raise ValueError("local_weight must be a rank-2 tensor with positive width")
+    if local_weight.device != input_ids.device or local_weight.dtype != torch.float16:
+        raise ValueError("local_weight must be FP16 on the input device")
+    if heads_per_ngram <= 0 or layer_multipliers.numel() < 2:
+        raise ValueError("N-gram metadata must define a positive head count")
+    if ngram_context.size(1) != layer_multipliers.numel() - 1:
+        raise ValueError("ngram_context width does not match multipliers")
+    expected_embedding_width = (
+        (layer_multipliers.numel() - 1)
+        * heads_per_ngram
+        * local_weight.size(1)
+    )
+    if rank_local_partials.dim() != 3 or rank_local_partials.size(0) <= 0:
+        raise ValueError("rank_local_partials must have shape [tp, tokens, E]")
+    if rank_local_partials.size(1) != input_ids.size(0):
+        raise ValueError("rank_local_partials token count does not match input")
+    if rank_local_partials.size(2) != expected_embedding_width:
+        raise ValueError("rank_local_partials width does not match K1 output")
+    if rank_local_partials.device != input_ids.device:
+        raise ValueError("rank_local_partials must share the input device")
+    if rank_local_partials.dtype != local_weight.dtype:
+        raise ValueError("rank_local_partials must share local_weight dtype")
+    if assembled_embedding.shape != rank_local_partials.shape[1:]:
+        raise ValueError("assembled_embedding must match one local partial")
+    if assembled_embedding.device != input_ids.device:
+        raise ValueError("assembled_embedding must share the input device")
+    if assembled_embedding.dtype != rank_local_partials.dtype:
+        raise ValueError("assembled_embedding must match partial dtype")
+    if not assembled_embedding.is_contiguous() or not rank_local_partials.is_contiguous():
+        raise ValueError("K2 embedding buffers must be contiguous")
+    if any(
+        _tensors_alias(assembled_embedding, tensor)
+        for tensor in (
+            input_ids,
+            query_start_loc,
+            ngram_context,
+            layer_multipliers,
+            ngram_heads_vocab_sizes,
+            ngram_heads_offsets,
+            local_weight,
+            local_vocab_start,
+            local_num_rows,
+            rank_local_partials,
+            hidden_states,
+        )
+    ):
+        raise ValueError("assembled_embedding must not alias K0-K2 inputs")
+    if local_vocab_start.dim() != 1 or local_num_rows.dim() != 1:
+        raise ValueError("local shard metadata must be one-dimensional")
+    if local_vocab_start.dtype not in (torch.int32, torch.int64) or local_num_rows.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise ValueError("local shard metadata must be int32 or int64")
+    if local_vocab_start.device != input_ids.device or local_num_rows.device != input_ids.device:
+        raise ValueError("local shard metadata must share the input device")
+
+    tokens = input_ids.size(0)
+    ngram_heads = (layer_multipliers.numel() - 1) * heads_per_ngram
+    if ngram_heads <= 0:
+        raise ValueError("N-gram metadata must define at least one head")
+    ngram_output = torch.empty(
+        (tokens, ngram_heads),
+        dtype=torch.int64,
+        device=input_ids.device,
+    )
+    ple_ngram_ids(
+        input_ids,
+        query_start_loc,
+        ngram_context,
+        layer_multipliers,
+        ngram_heads_vocab_sizes,
+        ngram_heads_offsets,
+        ngram_output,
+        eos_token_id,
+        heads_per_ngram,
+    )
+    local_partial = torch.empty_like(rank_local_partials[0])
+    ple_embedding_gather(
+        ngram_output,
+        local_weight,
+        local_vocab_start,
+        local_num_rows,
+        local_partial,
+    )
+
+    # Keep the caller's partials immutable while making the K1 -> K2 boundary
+    # explicit.  The first row is the gathered local result; remaining rows are
+    # deterministic caller-provided partials for the assembly contract.
+    partials_for_assembly = rank_local_partials.clone()
+    partials_for_assembly[0].copy_(local_partial)
+    ple_embedding_assemble(partials_for_assembly, assembled_embedding)
+    staged = ple_staged(
+        assembled_embedding,
+        hidden_states,
+        key_weight,
+        key_scale,
+        value_weight,
+        value_scale,
+        norm_key_weight,
+        norm_query_weight,
+        norm_conv_weight,
+        conv_state,
+        conv_weights,
+        state_indices,
+        has_initial_state,
+        mode,
+        eps,
+        group_size,
+        dilation,
+        query_start_loc_conv,
+        num_accepted_tokens,
+        num_spec_tokens,
+        state_dim_first,
+        null_block_id,
+        projection_kind,
+    )
+    return {
+        "ngram_ids": ngram_output,
+        "local_partial": local_partial,
+        "assembled_embedding": assembled_embedding,
+        **staged,
+    }
+
+
+def _mixed_positive_non_overlapping(tensor: torch.Tensor) -> bool:
+    dims = sorted(zip(tensor.stride(), tensor.shape))
+    required_span = 1
+    for stride, size in dims:
+        if stride <= 0:
+            return False
+        if size <= 1:
+            continue
+        if stride < required_span:
+            return False
+        required_span += (size - 1) * stride
+    return True
+
+
+def _mixed_values(tensor: torch.Tensor, name: str) -> list[int]:
+    if tensor.dtype not in (torch.int32, torch.int64):
+        raise ValueError(f"{name} must be int32 or int64")
+    return [int(value) for value in tensor.to(torch.int64).cpu().tolist()]
+
+
+def _validate_mixed_short_conv_contract(
+    input: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weights: torch.Tensor,
+    spec_token_indices: torch.Tensor,
+    non_spec_token_indices: torch.Tensor,
+    spec_query_start_loc: torch.Tensor,
+    spec_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    non_spec_mode: str,
+    non_spec_query_start_loc: torch.Tensor,
+    non_spec_state_indices: torch.Tensor,
+    non_spec_has_initial_state: torch.Tensor,
+    output: torch.Tensor,
+    num_spec_tokens: int,
+    dilation: int,
+    state_dim_first: bool,
+    null_block_id: int,
+) -> None:
+    if input.dim() != 2 or input.size(1) <= 0 or not input.is_contiguous():
+        raise ValueError("mixed input must be contiguous rank-2 with positive width")
+    if output.device != input.device or output.dtype != input.dtype:
+        raise ValueError("mixed output must share input device and dtype")
+    if output.shape != input.shape or not output.is_contiguous():
+        raise ValueError("mixed output must be contiguous and match input shape")
+    if conv_weights.device != input.device or conv_weights.dtype != torch.float16:
+        raise ValueError("mixed conv_weights must be FP16 on the input device")
+    if conv_weights.dim() != 2 or not conv_weights.is_contiguous():
+        raise ValueError("mixed conv_weights must be contiguous rank-2")
+    if conv_weights.size(0) != input.size(1) or conv_weights.size(1) < 1:
+        raise ValueError("mixed conv_weights shape does not match input width")
+    if conv_state.device != input.device or conv_state.dim() != 3:
+        raise ValueError("mixed conv_state must be rank-3 on the input device")
+    if conv_state.size(0) <= 0 or conv_state.dtype not in (torch.float16, torch.float32):
+        raise ValueError("mixed conv_state must have positive slots and FP16/FP32 dtype")
+    if not _mixed_positive_non_overlapping(conv_state):
+        raise ValueError("mixed conv_state must have positive non-overlapping strides")
+    if dilation <= 0:
+        raise ValueError("mixed dilation must be positive")
+    kernel_span = int(conv_weights.size(1)) - 1
+    if kernel_span > 128 // dilation:
+        raise ValueError("mixed dilated convolution state length exceeds limit")
+    state_length = kernel_span * dilation
+    if num_spec_tokens < 0 or num_spec_tokens > 128:
+        raise ValueError("mixed num_spec_tokens is outside the supported range")
+    state_capacity = state_length + int(num_spec_tokens)
+    channels = conv_state.size(1) if state_dim_first else conv_state.size(2)
+    capacity = conv_state.size(2) if state_dim_first else conv_state.size(1)
+    if channels != input.size(1) or capacity < state_capacity:
+        raise ValueError("mixed conv_state shape/layout is incompatible")
+
+    metadata = (
+        spec_token_indices, non_spec_token_indices, spec_query_start_loc,
+        spec_state_indices, num_accepted_tokens, non_spec_query_start_loc,
+        non_spec_state_indices, non_spec_has_initial_state,
+    )
+    if any(t.device != input.device for t in metadata):
+        raise ValueError("mixed metadata must share input device")
+    if any(t.dim() != 1 or not t.is_contiguous() for t in metadata):
+        raise ValueError("mixed metadata must be contiguous one-dimensional tensors")
+    for name, tensor in (
+        ("spec_token_indices", spec_token_indices),
+        ("non_spec_token_indices", non_spec_token_indices),
+        ("spec_query_start_loc", spec_query_start_loc),
+        ("spec_state_indices", spec_state_indices),
+        ("num_accepted_tokens", num_accepted_tokens),
+        ("non_spec_query_start_loc", non_spec_query_start_loc),
+        ("non_spec_state_indices", non_spec_state_indices),
+    ):
+        if tensor.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"{name} must be int32 or int64")
+    if non_spec_has_initial_state.dtype != torch.bool:
+        raise ValueError("non_spec_has_initial_state must be bool")
+
+    readonly = (input, conv_weights, *metadata)
+    for target, target_name in ((output, "output"), (conv_state, "conv_state")):
+        for source in readonly:
+            if _tensors_alias(target, source):
+                raise ValueError(f"{target_name} must not alias mixed inputs or metadata")
+    if _tensors_alias(output, conv_state):
+        raise ValueError("mixed output and conv_state must not share storage")
+
+    spec_tokens = _mixed_values(spec_token_indices, "spec_token_indices")
+    non_spec_tokens = _mixed_values(non_spec_token_indices, "non_spec_token_indices")
+    token_indices = spec_tokens + non_spec_tokens
+    if len(token_indices) != input.size(0):
+        raise ValueError("mixed token indices must cover every input token")
+    if sorted(token_indices) != list(range(input.size(0))):
+        raise ValueError("mixed token indices must be a disjoint permutation")
+
+    spec_states = _mixed_values(spec_state_indices, "spec_state_indices")
+    non_spec_states = _mixed_values(non_spec_state_indices, "non_spec_state_indices")
+    state_indices = spec_states + non_spec_states
+    if null_block_id >= 0 and null_block_id < conv_state.size(0):
+        raise ValueError("null_block_id must not identify a real state slot")
+    seen: set[int] = set()
+    for index in state_indices:
+        if index == null_block_id:
+            continue
+        if index < 0 or index >= conv_state.size(0):
+            raise ValueError("mixed state metadata contains an out-of-range non-null slot")
+        if index in seen:
+            raise ValueError("mixed state metadata contains duplicate valid slots")
+        seen.add(index)
+
+    spec_starts = _mixed_values(spec_query_start_loc, "spec_query_start_loc")
+    if len(spec_starts) != len(spec_states) + 1:
+        raise ValueError("spec_query_start_loc must have one entry per spec request plus one")
+    if not spec_starts or spec_starts[0] != 0 or spec_starts[-1] != len(spec_tokens):
+        raise ValueError("spec_query_start_loc must cover spec tokens")
+    previous = 0
+    for begin, end in zip(spec_starts, spec_starts[1:]):
+        if begin < previous or end < begin or end - begin > num_spec_tokens + 1:
+            raise ValueError("spec query metadata is invalid")
+        previous = end
+
+    accepted = _mixed_values(num_accepted_tokens, "num_accepted_tokens")
+    if len(accepted) != len(spec_states):
+        raise ValueError("num_accepted_tokens must match spec requests")
+    if any(value < 1 or value > num_spec_tokens + 1 for value in accepted):
+        raise ValueError(
+            "num_accepted_tokens is outside the supported range "
+            "[1, num_spec_tokens + 1]"
+        )
+
+    if non_spec_mode not in ("decode", "prefill"):
+        raise ValueError("non_spec_mode must be 'decode' or 'prefill'")
+    non_initial = non_spec_has_initial_state.numel()
+    if non_spec_mode == "decode":
+        if len(non_spec_states) != len(non_spec_tokens) or non_initial != len(non_spec_tokens):
+            raise ValueError("decode branch metadata must be token-indexed")
+    else:
+        non_starts = _mixed_values(
+            non_spec_query_start_loc, "non_spec_query_start_loc"
+        )
+        if len(non_starts) != len(non_spec_states) + 1:
+            raise ValueError("non-spec prefill offsets must match requests")
+        if not non_starts or non_starts[0] != 0 or non_starts[-1] != len(non_spec_tokens):
+            raise ValueError("non-spec prefill offsets must cover tokens")
+        previous = 0
+        for begin, end in zip(non_starts, non_starts[1:]):
+            if begin < previous or end < begin:
+                raise ValueError("non-spec prefill offsets must be monotonic")
+            previous = end
+        if non_initial != len(non_spec_states):
+            raise ValueError("prefill branch initial mask must be request-indexed")
+
+
+def ple_short_conv_mixed(
+    input: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weights: torch.Tensor,
+    spec_token_indices: torch.Tensor,
+    non_spec_token_indices: torch.Tensor,
+    spec_query_start_loc: torch.Tensor,
+    spec_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    non_spec_mode: str,
+    non_spec_query_start_loc: torch.Tensor,
+    non_spec_state_indices: torch.Tensor,
+    non_spec_has_initial_state: torch.Tensor,
+    output: torch.Tensor,
+    num_spec_tokens: int,
+    dilation: int,
+    state_dim_first: bool = True,
+    null_block_id: int = -1,
+) -> torch.Tensor:
+    """Compose spec and non-spec branches and restore original token order.
+
+    The two index tensors are an explicit stable permutation contract.  This
+    wrapper deliberately does not infer request type from token position.
+    ``non_spec_mode`` is either ``decode`` or ``prefill``; callers needing
+    both regular modes invoke this wrapper twice with disjoint explicit
+    permutations and a shared output/state only on the current stream.
+    """
+    _validate_mixed_short_conv_contract(
+        input, conv_state, conv_weights, spec_token_indices,
+        non_spec_token_indices, spec_query_start_loc, spec_state_indices,
+        num_accepted_tokens, non_spec_mode, non_spec_query_start_loc,
+        non_spec_state_indices, non_spec_has_initial_state, output,
+        num_spec_tokens, dilation, state_dim_first, null_block_id,
+    )
+
+    # All validation happens before a stateful launch.  An entirely empty
+    # packed batch is a validated no-op: do not clone or commit state.
+    if input.size(0) == 0:
+        return output
+
+    # Work on a private copy so a later branch error cannot partially mutate
+    # caller-owned state.  Empty branches are deliberately not dispatched.
+    working_state = conv_state.clone()
+    spec_input = input.index_select(0, spec_token_indices.to(torch.int64))
+    non_spec_input = input.index_select(0, non_spec_token_indices.to(torch.int64))
+    spec_output = torch.empty_like(spec_input)
+    non_spec_output = torch.empty_like(non_spec_input)
+    if spec_input.size(0) > 0:
+        ple_short_conv_spec(
+            spec_input, spec_query_start_loc, working_state, conv_weights,
+            spec_state_indices, num_accepted_tokens, spec_output, num_spec_tokens,
+            dilation, state_dim_first, null_block_id,
+        )
+    if non_spec_input.size(0) > 0:
+        if non_spec_mode == "decode":
+            ple_short_conv_decode(
+                non_spec_input, working_state, conv_weights, non_spec_state_indices,
+                non_spec_has_initial_state, non_spec_output, dilation,
+                state_dim_first, null_block_id,
+            )
+        else:
+            ple_short_conv_prefill(
+                non_spec_input, non_spec_query_start_loc, working_state,
+                conv_weights, non_spec_state_indices, non_spec_has_initial_state,
+                non_spec_output, dilation, state_dim_first, null_block_id,
+            )
+
+    # Both non-empty branches have passed synchronous validation and are ordered
+    # on the current stream. Commit state first, then restore token order.
+    conv_state.copy_(working_state)
+    if spec_input.size(0) > 0:
+        output.index_copy_(0, spec_token_indices.to(torch.int64), spec_output)
+    if non_spec_input.size(0) > 0:
+        output.index_copy_(0, non_spec_token_indices.to(torch.int64), non_spec_output)
+    return output
+
+
+def _validate_mixed_three_way_contract(
+    input: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weights: torch.Tensor,
+    spec_token_indices: torch.Tensor,
+    decode_token_indices: torch.Tensor,
+    prefill_token_indices: torch.Tensor,
+    spec_query_start_loc: torch.Tensor,
+    spec_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    decode_state_indices: torch.Tensor,
+    decode_has_initial_state: torch.Tensor,
+    prefill_query_start_loc: torch.Tensor,
+    prefill_state_indices: torch.Tensor,
+    prefill_has_initial_state: torch.Tensor,
+    output: torch.Tensor,
+    num_spec_tokens: int,
+    dilation: int,
+    state_dim_first: bool,
+    null_block_id: int,
+) -> None:
+    """Validate the cold-path metadata for the three-way composition."""
+    if input.dim() != 2 or input.size(1) <= 0 or not input.is_contiguous():
+        raise ValueError(
+            "mixed input must be contiguous rank-2 with positive width"
+        )
+    if output.device != input.device or output.dtype != input.dtype:
+        raise ValueError("mixed output must share input device and dtype")
+    if output.shape != input.shape or not output.is_contiguous():
+        raise ValueError("mixed output must be contiguous and match input shape")
+    if conv_weights.device != input.device or conv_weights.dtype != torch.float16:
+        raise ValueError("mixed conv_weights must be FP16 on the input device")
+    if conv_weights.dim() != 2 or not conv_weights.is_contiguous():
+        raise ValueError("mixed conv_weights must be contiguous rank-2")
+    if conv_weights.size(0) != input.size(1) or conv_weights.size(1) < 1:
+        raise ValueError("mixed conv_weights shape does not match input width")
+    if conv_state.device != input.device or conv_state.dim() != 3:
+        raise ValueError("mixed conv_state must be rank-3 on the input device")
+    if conv_state.size(0) <= 0 or conv_state.dtype not in (
+        torch.float16,
+        torch.float32,
+    ):
+        raise ValueError(
+            "mixed conv_state must have positive slots and FP16/FP32 dtype"
+        )
+    if not _mixed_positive_non_overlapping(conv_state):
+        raise ValueError(
+            "mixed conv_state must have positive non-overlapping strides"
+        )
+    if dilation <= 0:
+        raise ValueError("mixed dilation must be positive")
+    kernel_span = int(conv_weights.size(1)) - 1
+    if kernel_span > 128 // dilation:
+        raise ValueError("mixed dilated convolution state length exceeds limit")
+    if num_spec_tokens < 0 or num_spec_tokens > 128:
+        raise ValueError("mixed num_spec_tokens is outside the supported range")
+    state_length = kernel_span * dilation
+    state_capacity = state_length + int(num_spec_tokens)
+    channels = conv_state.size(1) if state_dim_first else conv_state.size(2)
+    capacity = conv_state.size(2) if state_dim_first else conv_state.size(1)
+    if channels != input.size(1) or capacity < state_capacity:
+        raise ValueError("mixed conv_state shape/layout is incompatible")
+
+    metadata = (
+        spec_token_indices,
+        decode_token_indices,
+        prefill_token_indices,
+        spec_query_start_loc,
+        spec_state_indices,
+        num_accepted_tokens,
+        decode_state_indices,
+        decode_has_initial_state,
+        prefill_query_start_loc,
+        prefill_state_indices,
+        prefill_has_initial_state,
+    )
+    if any(t.device != input.device for t in metadata):
+        raise ValueError("mixed metadata must share input device")
+    if any(t.dim() != 1 or not t.is_contiguous() for t in metadata):
+        raise ValueError(
+            "mixed metadata must be contiguous one-dimensional tensors"
+        )
+    integer_metadata = (
+        ("spec_token_indices", spec_token_indices),
+        ("decode_token_indices", decode_token_indices),
+        ("prefill_token_indices", prefill_token_indices),
+        ("spec_query_start_loc", spec_query_start_loc),
+        ("spec_state_indices", spec_state_indices),
+        ("num_accepted_tokens", num_accepted_tokens),
+        ("decode_state_indices", decode_state_indices),
+        ("prefill_query_start_loc", prefill_query_start_loc),
+        ("prefill_state_indices", prefill_state_indices),
+    )
+    for name, tensor in integer_metadata:
+        if tensor.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"{name} must be int32 or int64")
+    for name, tensor in (
+        ("decode_has_initial_state", decode_has_initial_state),
+        ("prefill_has_initial_state", prefill_has_initial_state),
+    ):
+        if tensor.dtype != torch.bool:
+            raise ValueError(f"{name} must be bool")
+
+    readonly = (input, conv_weights, *metadata)
+    for target, target_name in ((output, "output"), (conv_state, "conv_state")):
+        for source in readonly:
+            if _tensors_alias(target, source):
+                raise ValueError(
+                    f"{target_name} must not alias mixed inputs or metadata"
+                )
+    if _tensors_alias(output, conv_state):
+        raise ValueError("mixed output and conv_state must not share storage")
+
+    spec_tokens = _mixed_values(spec_token_indices, "spec_token_indices")
+    decode_tokens = _mixed_values(decode_token_indices, "decode_token_indices")
+    prefill_tokens = _mixed_values(
+        prefill_token_indices, "prefill_token_indices"
+    )
+    token_indices = spec_tokens + decode_tokens + prefill_tokens
+    if len(token_indices) != input.size(0):
+        raise ValueError("mixed token indices must cover every input token")
+    if sorted(token_indices) != list(range(input.size(0))):
+        raise ValueError("mixed token indices must be a disjoint permutation")
+
+    spec_states = _mixed_values(spec_state_indices, "spec_state_indices")
+    decode_states = _mixed_values(decode_state_indices, "decode_state_indices")
+    prefill_states = _mixed_values(
+        prefill_state_indices, "prefill_state_indices"
+    )
+    if null_block_id >= 0 and null_block_id < conv_state.size(0):
+        raise ValueError("null_block_id must not identify a real state slot")
+    seen: set[int] = set()
+    for index in spec_states + decode_states + prefill_states:
+        if index == null_block_id:
+            continue
+        if index < 0 or index >= conv_state.size(0):
+            raise ValueError(
+                "mixed state metadata contains an out-of-range non-null slot"
+            )
+        if index in seen:
+            raise ValueError(
+                "mixed state metadata contains duplicate valid slots"
+            )
+        seen.add(index)
+
+    spec_starts = _mixed_values(spec_query_start_loc, "spec_query_start_loc")
+    if len(spec_starts) != len(spec_states) + 1:
+        raise ValueError(
+            "spec_query_start_loc must have one entry per spec request plus one"
+        )
+    if (
+        not spec_starts
+        or spec_starts[0] != 0
+        or spec_starts[-1] != len(spec_tokens)
+    ):
+        raise ValueError("spec_query_start_loc must cover spec tokens")
+    previous = 0
+    for begin, end in zip(spec_starts, spec_starts[1:]):
+        if (
+            begin < previous
+            or end < begin
+            or end - begin > num_spec_tokens + 1
+        ):
+            raise ValueError("spec query metadata is invalid")
+        previous = end
+
+    accepted = _mixed_values(num_accepted_tokens, "num_accepted_tokens")
+    if len(accepted) != len(spec_states):
+        raise ValueError("num_accepted_tokens must match spec requests")
+    if any(value < 1 or value > num_spec_tokens + 1 for value in accepted):
+        raise ValueError(
+            "num_accepted_tokens is outside the supported range "
+            "[1, num_spec_tokens + 1]"
+        )
+
+    if len(decode_states) != len(decode_tokens):
+        raise ValueError("decode state metadata must be token-indexed")
+    if decode_has_initial_state.numel() != len(decode_tokens):
+        raise ValueError(
+            "decode initial-state metadata must be token-indexed"
+        )
+
+    prefill_starts = _mixed_values(
+        prefill_query_start_loc, "prefill_query_start_loc"
+    )
+    if len(prefill_starts) != len(prefill_states) + 1:
+        raise ValueError(
+            "prefill_query_start_loc must have one entry per request plus one"
+        )
+    if (
+        not prefill_starts
+        or prefill_starts[0] != 0
+        or prefill_starts[-1] != len(prefill_tokens)
+    ):
+        raise ValueError("prefill_query_start_loc must cover prefill tokens")
+    previous = 0
+    for begin, end in zip(prefill_starts, prefill_starts[1:]):
+        if begin < previous or end < begin:
+            raise ValueError("prefill query metadata is invalid")
+        previous = end
+    if prefill_has_initial_state.numel() != len(prefill_states):
+        raise ValueError(
+            "prefill initial-state metadata must be request-indexed"
+        )
+
+
+def ple_short_conv_mixed_three_way(
+    input: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weights: torch.Tensor,
+    spec_token_indices: torch.Tensor,
+    decode_token_indices: torch.Tensor,
+    prefill_token_indices: torch.Tensor,
+    spec_query_start_loc: torch.Tensor,
+    spec_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    decode_state_indices: torch.Tensor,
+    decode_has_initial_state: torch.Tensor,
+    prefill_query_start_loc: torch.Tensor,
+    prefill_state_indices: torch.Tensor,
+    prefill_has_initial_state: torch.Tensor,
+    output: torch.Tensor,
+    num_spec_tokens: int,
+    dilation: int,
+    state_dim_first: bool = True,
+    null_block_id: int = -1,
+) -> torch.Tensor:
+    """Run speculative, decode, and prefill branches as one transaction.
+
+    Each token-index tensor selects a stable branch-local packing from the
+    original input.  The three tensors must form a disjoint permutation, while
+    each branch supplies its own request offsets and state metadata.  All
+    synchronous validation happens before any native stateful launch.  Branches
+    execute in the production order spec -> decode -> prefill on a private state
+    clone; caller-owned state and output are committed only after all branches
+    return successfully.  Device-side asynchronous faults are outside this
+    synchronous transaction guarantee.
+    """
+    _validate_mixed_three_way_contract(
+        input,
+        conv_state,
+        conv_weights,
+        spec_token_indices,
+        decode_token_indices,
+        prefill_token_indices,
+        spec_query_start_loc,
+        spec_state_indices,
+        num_accepted_tokens,
+        decode_state_indices,
+        decode_has_initial_state,
+        prefill_query_start_loc,
+        prefill_state_indices,
+        prefill_has_initial_state,
+        output,
+        num_spec_tokens,
+        dilation,
+        state_dim_first,
+        null_block_id,
+    )
+
+    if input.size(0) == 0:
+        return output
+
+    working_state = conv_state.clone()
+    spec_input = input.index_select(0, spec_token_indices.to(torch.int64))
+    decode_input = input.index_select(0, decode_token_indices.to(torch.int64))
+    prefill_input = input.index_select(
+        0, prefill_token_indices.to(torch.int64)
+    )
+    spec_output = torch.empty_like(spec_input)
+    decode_output = torch.empty_like(decode_input)
+    prefill_output = torch.empty_like(prefill_input)
+
+    if spec_input.size(0) > 0:
+        ple_short_conv_spec(
+            spec_input,
+            spec_query_start_loc,
+            working_state,
+            conv_weights,
+            spec_state_indices,
+            num_accepted_tokens,
+            spec_output,
+            num_spec_tokens,
+            dilation,
+            state_dim_first,
+            null_block_id,
+        )
+    if decode_input.size(0) > 0:
+        ple_short_conv_decode(
+            decode_input,
+            working_state,
+            conv_weights,
+            decode_state_indices,
+            decode_has_initial_state,
+            decode_output,
+            dilation,
+            state_dim_first,
+            null_block_id,
+        )
+    if prefill_input.size(0) > 0:
+        ple_short_conv_prefill(
+            prefill_input,
+            prefill_query_start_loc,
+            working_state,
+            conv_weights,
+            prefill_state_indices,
+            prefill_has_initial_state,
+            prefill_output,
+            dilation,
+            state_dim_first,
+            null_block_id,
+        )
+
+    # Commit only after every branch has completed; restore the original order
+    # with the same explicit permutation used for branch-local inputs.
+    conv_state.copy_(working_state)
+    if spec_input.size(0) > 0:
+        output.index_copy_(0, spec_token_indices.to(torch.int64), spec_output)
+    if decode_input.size(0) > 0:
+        output.index_copy_(0, decode_token_indices.to(torch.int64), decode_output)
+    if prefill_input.size(0) > 0:
+        output.index_copy_(
+            0, prefill_token_indices.to(torch.int64), prefill_output
+        )
+    return output
+
+
 def esimd_gemv_fp8_pern(
     input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     output: torch.Tensor,
@@ -323,6 +1598,35 @@ def esimd_qkv_split_norm_rope_muse_glimmer_neox(
         q_heads, kv_heads, float(q_scale), float(eps), cos_sin_cache)
 
 
+def esimd_qkv_split_norm_rope_mrope_v1(
+    qkv_state: torch.Tensor,
+    q_out: torch.Tensor,
+    gate_out: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    norm_wq: torch.Tensor,
+    norm_wk: torch.Tensor,
+    positions: torch.Tensor,
+    q_heads: int,
+    kv_heads: int,
+    attn_output_gate: bool,
+    positions_bounds_proven: bool,
+    cos_sin_cache: torch.Tensor,
+) -> torch.Tensor:
+    """Qwen3.8 exact 3-axis interleaved MRoPE QKV postprocess.
+
+    Fixed ABI: head_dim=256, rotary_dim=64, and mrope_section=[11, 11, 10].
+    ``positions`` is [3, nTokens] and is consumed without collapsing axes.
+    ``positions_bounds_proven`` is a scheduler-owned CPU proof bit; the native
+    path intentionally does not perform a synchronizing XPU bounds read.
+    """
+    return _ops.esimd_qkv_split_norm_rope_mrope_v1(
+        qkv_state, q_out, gate_out, k_out, v_out, norm_wq, norm_wk, positions,
+        q_heads, kv_heads, attn_output_gate, positions_bounds_proven,
+        cos_sin_cache
+    )
+
+
 # ---- Fused Conv1d + GDN (doubleGRF, LGRF module) ----
 
 def esimd_gdn_conv_fused(
@@ -597,19 +1901,25 @@ def esimd_norm_gemv_int4_pert(
     V: int,
     eps: float,
 ) -> torch.Tensor:
-    """Fused RMSNormGated + INT4 GEMV for GDN out_proj decode path.
-
-    Combines norm(x, z) + out_proj(normed) into a single kernel.
-    INT4 analogue of esimd_norm_gemv_fp8_pert.
-
-    x:            [HV, V] fp16 — core_attn_out
-    z:            [HV, V] fp16 — z_out
-    norm_weight:  [V] fp16 — RMSNorm weight
-    gemv_weight:  [N, K//8] int32 packed INT4, K = HV*V — out_proj weight
-    gemv_scale:   [N, K//128] fp16 — per-block INT4 scale
-    output:       [1, N] fp16 — pre-allocated output buffer
-    """
+    """Fused RMSNormGated + SiLU INT4 GEMV for GDN decode."""
     return _ops.esimd_norm_gemv_int4_pert(
+        x, z, norm_weight, gemv_weight, gemv_scale, output,
+        HV, V, eps)
+
+
+def esimd_norm_gemv_int4_sigmoid(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    norm_weight: torch.Tensor,
+    gemv_weight: torch.Tensor,
+    gemv_scale: torch.Tensor,
+    output: torch.Tensor,
+    HV: int,
+    V: int,
+    eps: float,
+) -> torch.Tensor:
+    """Fused RMSNormGated + sigmoid INT4 GEMV for GDN decode."""
+    return _ops.esimd_norm_gemv_int4_sigmoid(
         x, z, norm_weight, gemv_weight, gemv_scale, output,
         HV, V, eps)
 
@@ -1716,6 +3026,70 @@ def moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits(
         shared_gate_up_weight.contiguous(), shared_down_weight.contiguous(),
         shared_expert_gate_weight.contiguous(), top_k, num_shared_experts,
         num_experts)
+
+
+def moe_forward_m1_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1(
+    hidden_states: torch.Tensor,
+    logits: torch.Tensor,
+    w13_qweight_s4: torch.Tensor,
+    w13_scales: torch.Tensor,
+    w2_qweight_s4: torch.Tensor,
+    w2_scales: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_expert_gate_weight: torch.Tensor,
+    output: torch.Tensor,
+    top_k: int,
+    num_shared_experts: int,
+    num_experts: int,
+) -> torch.Tensor:
+    return _moe_int4.moe_forward_m1_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1(
+        hidden_states,
+        logits,
+        w13_qweight_s4,
+        w13_scales,
+        w2_qweight_s4,
+        w2_scales,
+        shared_gate_up_weight,
+        shared_down_weight,
+        shared_expert_gate_weight,
+        output,
+        top_k,
+        num_shared_experts,
+        num_experts,
+    )
+
+
+def moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1(
+    hidden_states: torch.Tensor,
+    logits: torch.Tensor,
+    w13_qweight_s4: torch.Tensor,
+    w13_scales: torch.Tensor,
+    w2_qweight_s4: torch.Tensor,
+    w2_scales: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    shared_expert_gate_weight: torch.Tensor,
+    output: torch.Tensor,
+    top_k: int,
+    num_shared_experts: int,
+    num_experts: int,
+) -> torch.Tensor:
+    return _moe_int4.moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1(
+        hidden_states,
+        logits,
+        w13_qweight_s4,
+        w13_scales,
+        w2_qweight_s4,
+        w2_scales,
+        shared_gate_up_weight,
+        shared_down_weight,
+        shared_expert_gate_weight,
+        output,
+        top_k,
+        num_shared_experts,
+        num_experts,
+    )
 
 
 def moe_tiny_fp16_shared_up(

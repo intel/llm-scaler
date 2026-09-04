@@ -1,0 +1,396 @@
+// Copyright 2026
+// SPDX-License-Identifier: Apache-2.0
+//
+// Predicated strided row-store for Qwen3.8 QSA side caches.
+
+#include "qsa_ops.h"
+
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/sycl.hpp>
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <limits>
+#include <tuple>
+#include <utility>
+
+namespace qsa {
+namespace {
+
+using namespace sycl::ext::intel::esimd;
+
+constexpr int64_t kKeyWidth = 128;
+constexpr int64_t kPositionWidth = 3;
+constexpr int64_t kReceiptUnwritten = 0;
+constexpr int64_t kReceiptWritten = 1;
+constexpr int64_t kReceiptPad = 2;
+constexpr int64_t kReceiptOutOfBounds = 3;
+
+template <typename scalar_t, int Width, bool StridedColumns>
+class QsaStoreCacheRowsKernel;
+
+bool is_positive_non_overlapping(const at::Tensor& tensor) {
+  std::array<std::pair<int64_t, int64_t>, 4> dimensions{};
+  int64_t dimension_count = 0;
+  for (int64_t dimension = 0; dimension < tensor.dim(); ++dimension) {
+    const int64_t size = tensor.size(dimension);
+    if (size <= 1) {
+      continue;
+    }
+    const int64_t stride = tensor.stride(dimension);
+    if (stride <= 0) {
+      return false;
+    }
+    dimensions[dimension_count++] = {stride, size};
+  }
+  std::sort(
+      dimensions.begin(), dimensions.begin() + dimension_count,
+      [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+
+  int64_t required_span = 1;
+  for (int64_t dimension = 0; dimension < dimension_count; ++dimension) {
+    const auto [stride, size] = dimensions[dimension];
+    if (stride < required_span) {
+      return false;
+    }
+    const int64_t extent = size - 1;
+    if (extent > std::numeric_limits<int64_t>::max() / stride) {
+      return false;
+    }
+    const int64_t contribution = extent * stride;
+    if (required_span >
+        std::numeric_limits<int64_t>::max() - contribution) {
+      return false;
+    }
+    required_span += contribution;
+  }
+  return true;
+}
+
+void validate_store_inputs(
+    const at::Tensor& cache,
+    const at::Tensor& slot_mapping,
+    const at::Tensor& rows) {
+  TORCH_CHECK(cache.device().is_xpu(), "cache must be on XPU");
+  TORCH_CHECK(
+      slot_mapping.device().is_xpu() && rows.device().is_xpu(),
+      "slot_mapping and rows must be on XPU");
+  TORCH_CHECK(
+      cache.device() == slot_mapping.device() && cache.device() == rows.device(),
+      "cache, slot_mapping and rows must share one XPU device");
+  TORCH_CHECK(
+      cache.dim() == 4 && cache.size(1) > 0 && cache.size(2) == 1,
+      "cache must have shape [pages,page_size,1,width] with page_size > 0");
+  TORCH_CHECK(
+      slot_mapping.dim() == 1 && slot_mapping.scalar_type() == at::kLong &&
+          slot_mapping.is_contiguous(),
+      "slot_mapping must be contiguous int64 [N]");
+  TORCH_CHECK(
+      rows.dim() == 2 || (rows.dim() == 3 && rows.size(1) == 1),
+      "rows must have shape [N,width] or [N,1,width]");
+
+  const int64_t row_count = slot_mapping.numel();
+  const int64_t row_width = rows.size(rows.dim() - 1);
+  TORCH_CHECK(
+      rows.size(0) == row_count && cache.size(3) == row_width,
+      "cache, slot_mapping and rows have incompatible shapes");
+  TORCH_CHECK(
+      cache.scalar_type() == rows.scalar_type(),
+      "cache and rows must have the same dtype");
+  const bool key_dtype =
+      cache.scalar_type() == at::kHalf || cache.scalar_type() == at::kBFloat16;
+  const bool supported =
+      (key_dtype && row_width == kKeyWidth) ||
+      (cache.scalar_type() == at::kLong && row_width == kPositionWidth);
+  TORCH_CHECK(
+      supported,
+      "row-store supports float16/bfloat16 width 128 or int64 width 3");
+  const bool position_rows = cache.scalar_type() == at::kLong;
+  TORCH_CHECK(
+      cache.stride(3) == 1 &&
+          (position_rows || rows.stride(rows.dim() - 1) == 1),
+      "cache and key rows must have contiguous inner width");
+  TORCH_CHECK(
+      is_positive_non_overlapping(cache),
+      "cache must have positive non-overlapping strides");
+  TORCH_CHECK(
+      is_positive_non_overlapping(rows),
+      "rows must have positive non-overlapping strides");
+  TORCH_CHECK(
+      !cache.is_alias_of(slot_mapping) && !cache.is_alias_of(rows),
+      "cache must not alias slot_mapping or rows");
+
+  const int64_t pages = cache.size(0);
+  const int64_t page_size = cache.size(1);
+  TORCH_CHECK(
+      pages <= std::numeric_limits<int64_t>::max() / page_size,
+      "cache capacity overflows int64");
+}
+
+template <typename scalar_t, int Width, bool StridedColumns = false>
+void launch_store(
+    const at::Tensor& cache,
+    const at::Tensor& slot_mapping,
+    const at::Tensor& rows,
+    const at::Tensor& receipt = at::Tensor()) {
+  const int64_t row_count = slot_mapping.numel();
+  if (row_count == 0) {
+    return;
+  }
+
+  auto* cache_ptr = reinterpret_cast<scalar_t*>(cache.data_ptr());
+  const auto* slots_ptr = slot_mapping.data_ptr<int64_t>();
+  const auto* rows_ptr = reinterpret_cast<const scalar_t*>(rows.data_ptr());
+  auto* receipt_ptr = receipt.defined() ? receipt.data_ptr<int64_t>() : nullptr;
+  const int64_t pages = cache.size(0);
+  const int64_t page_size = cache.size(1);
+  const int64_t capacity = pages * page_size;
+  const int64_t cache_page_stride = cache.stride(0);
+  const int64_t cache_token_stride = cache.stride(1);
+  const int64_t rows_stride = rows.stride(0);
+  const int64_t rows_column_stride = rows.stride(rows.dim() - 1);
+
+  auto& queue =
+      c10::xpu::getCurrentXPUStream(cache.device().index()).queue();
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<
+        QsaStoreCacheRowsKernel<scalar_t, Width, StridedColumns>>(
+        sycl::range<1>(1), [=](sycl::id<1>) SYCL_ESIMD_KERNEL {
+          for (int64_t row = 0; row < row_count; ++row) {
+            // Initialize in native code so a reused receipt cannot prove a
+            // row that this submission did not reach.
+            if (receipt_ptr != nullptr) {
+              receipt_ptr[row * 2] = kReceiptUnwritten;
+              receipt_ptr[row * 2 + 1] = -1;
+            }
+            const int64_t slot = slots_ptr[row];
+            if (slot < 0 || slot >= capacity) {
+              if (receipt_ptr != nullptr) {
+                receipt_ptr[row * 2] =
+                    slot == -1 ? kReceiptPad : kReceiptOutOfBounds;
+                receipt_ptr[row * 2 + 1] = -1;
+              }
+              continue;
+            }
+            const int64_t page = slot / page_size;
+            const int64_t token = slot - page * page_size;
+            const int64_t destination =
+                page * cache_page_stride + token * cache_token_stride;
+            constexpr int kChunk = Width < 16 ? Width : 16;
+            static_assert(Width % kChunk == 0);
+#pragma unroll
+            for (int begin = 0; begin < Width; begin += kChunk) {
+              simd<scalar_t, kChunk> values;
+#pragma unroll
+              for (int column = 0; column < kChunk; ++column) {
+                const int64_t source_column =
+                    (begin + column) *
+                    (StridedColumns ? rows_column_stride : 1);
+                values[column] =
+                    rows_ptr[row * rows_stride + source_column];
+              }
+#pragma unroll
+              for (int column = 0; column < kChunk; ++column) {
+                cache_ptr[destination + begin + column] = values[column];
+              }
+            }
+            if (receipt_ptr != nullptr) {
+              receipt_ptr[row * 2] = kReceiptWritten;
+              receipt_ptr[row * 2 + 1] = slot;
+            }
+          }
+        });
+  });
+}
+
+}  // namespace
+
+namespace {
+
+#ifndef QSA_PARALLEL_ROWS_PER_WG
+#define QSA_PARALLEL_ROWS_PER_WG 1
+#endif
+#ifndef QSA_PARALLEL_LANES
+#define QSA_PARALLEL_LANES 16
+#endif
+
+static_assert(
+    QSA_PARALLEL_ROWS_PER_WG >= 1 && QSA_PARALLEL_ROWS_PER_WG <= 8,
+    "QSA parallel row-store rows-per-WG must stay in 1..8");
+static_assert(
+    QSA_PARALLEL_LANES == 8 || QSA_PARALLEL_LANES == 16,
+    "QSA parallel key row-store lanes must be 8 or 16");
+
+template <typename scalar_t, int Width, bool StridedColumns, int RowsPerWG,
+          int LanesPerRow>
+class QsaStoreCacheRowsParallelKernel;
+
+template <typename scalar_t, int Width, bool StridedColumns, int RowsPerWG,
+          int LanesPerRow>
+void launch_store_parallel(
+    const at::Tensor& cache,
+    const at::Tensor& slot_mapping,
+    const at::Tensor& rows) {
+  const int64_t row_count = slot_mapping.numel();
+  if (row_count == 0) {
+    return;
+  }
+
+  auto* cache_ptr = reinterpret_cast<scalar_t*>(cache.data_ptr());
+  const auto* slots_ptr = slot_mapping.data_ptr<int64_t>();
+  const auto* rows_ptr = reinterpret_cast<const scalar_t*>(rows.data_ptr());
+  const int64_t pages = cache.size(0);
+  const int64_t page_size = cache.size(1);
+  const int64_t capacity = pages * page_size;
+  const int64_t cache_page_stride = cache.stride(0);
+  const int64_t cache_token_stride = cache.stride(1);
+  const int64_t rows_stride = rows.stride(0);
+  const int64_t rows_column_stride = rows.stride(rows.dim() - 1);
+  const size_t groups = static_cast<size_t>(
+      (row_count + RowsPerWG - 1) / RowsPerWG);
+  const size_t global = groups * RowsPerWG;
+
+  auto& queue =
+      c10::xpu::getCurrentXPUStream(cache.device().index()).queue();
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(
+        sycl::nd_range<1>(
+            sycl::range<1>(global), sycl::range<1>(RowsPerWG)),
+        [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+          const int64_t row = static_cast<int64_t>(item.get_global_id(0));
+          if (row >= row_count) {
+            return;
+          }
+          const int64_t slot = slots_ptr[row];
+          if (slot < 0 || slot >= capacity) {
+            return;
+          }
+          const int64_t page = slot / page_size;
+          const int64_t token = slot - page * page_size;
+          const int64_t destination =
+              page * cache_page_stride + token * cache_token_stride;
+          static_assert(
+              Width % LanesPerRow == 0,
+              "QSA row width must be divisible by vector lanes");
+#pragma unroll
+          for (int begin = 0; begin < Width; begin += LanesPerRow) {
+            simd<scalar_t, LanesPerRow> values;
+#pragma unroll
+            for (int column = 0; column < LanesPerRow; ++column) {
+              const int64_t source_column =
+                  (begin + column) *
+                  (StridedColumns ? rows_column_stride : 1);
+              values[column] =
+                  rows_ptr[row * rows_stride + source_column];
+            }
+#pragma unroll
+            for (int column = 0; column < LanesPerRow; ++column) {
+              cache_ptr[destination + begin + column] = values[column];
+            }
+          }
+        });
+  });
+}
+
+}  // namespace
+
+at::Tensor store_cache_rows_r_aware_v1(
+    at::Tensor cache,
+    const at::Tensor& slot_mapping,
+    const at::Tensor& rows,
+    bool unique_slots_proven) {
+  validate_store_inputs(cache, slot_mapping, rows);
+  TORCH_CHECK(
+      unique_slots_proven,
+      "parallel QSA row-store requires a trusted unique-slot proof");
+  TORCH_CHECK(
+      slot_mapping.numel() <= 32,
+      "parallel QSA row-store staging ABI is limited to R<=32");
+  if (rows.size(0) == 0) {
+    return cache;
+  }
+
+  if (cache.scalar_type() == at::kHalf) {
+    launch_store_parallel<
+        sycl::half, kKeyWidth, false, QSA_PARALLEL_ROWS_PER_WG,
+        QSA_PARALLEL_LANES>(cache, slot_mapping, rows);
+  } else if (cache.scalar_type() == at::kBFloat16) {
+    launch_store_parallel<
+        sycl::ext::oneapi::bfloat16, kKeyWidth, false,
+        QSA_PARALLEL_ROWS_PER_WG, QSA_PARALLEL_LANES>(
+        cache, slot_mapping, rows);
+  } else if (rows.stride(rows.dim() - 1) == 1) {
+    launch_store_parallel<
+        int64_t, kPositionWidth, false, QSA_PARALLEL_ROWS_PER_WG,
+        kPositionWidth>(cache, slot_mapping, rows);
+  } else {
+    launch_store_parallel<
+        int64_t, kPositionWidth, true, QSA_PARALLEL_ROWS_PER_WG,
+        kPositionWidth>(cache, slot_mapping, rows);
+  }
+  return cache;
+}
+
+at::Tensor store_cache_rows_v3(
+    at::Tensor cache,
+    const at::Tensor& slot_mapping,
+    const at::Tensor& rows) {
+  validate_store_inputs(cache, slot_mapping, rows);
+  if (rows.size(0) == 0) {
+    return cache;
+  }
+
+  if (cache.scalar_type() == at::kHalf) {
+    launch_store<sycl::half, kKeyWidth>(cache, slot_mapping, rows);
+  } else if (cache.scalar_type() == at::kBFloat16) {
+    launch_store<sycl::ext::oneapi::bfloat16, kKeyWidth>(
+        cache, slot_mapping, rows);
+  } else if (rows.stride(rows.dim() - 1) == 1) {
+    launch_store<int64_t, kPositionWidth>(cache, slot_mapping, rows);
+  } else {
+    launch_store<int64_t, kPositionWidth, true>(cache, slot_mapping, rows);
+  }
+  return cache;
+}
+
+std::tuple<at::Tensor, at::Tensor> store_cache_rows_v4(
+    at::Tensor cache,
+    const at::Tensor& slot_mapping,
+    const at::Tensor& rows,
+    at::Tensor receipt) {
+  validate_store_inputs(cache, slot_mapping, rows);
+  TORCH_CHECK(
+      receipt.device() == cache.device() && receipt.scalar_type() == at::kLong &&
+          receipt.dim() == 2 && receipt.size(0) == slot_mapping.numel() &&
+          receipt.size(1) == 2 && receipt.is_contiguous(),
+      "receipt must be contiguous int64 [N,2] on the cache XPU device");
+  TORCH_CHECK(
+      is_positive_non_overlapping(receipt),
+      "receipt must have positive non-overlapping strides");
+  TORCH_CHECK(
+      !cache.is_alias_of(receipt) && !slot_mapping.is_alias_of(receipt) &&
+          !rows.is_alias_of(receipt),
+      "receipt must not alias cache, slot_mapping or rows");
+  if (rows.size(0) == 0) {
+    return {cache, receipt};
+  }
+
+  if (cache.scalar_type() == at::kHalf) {
+    launch_store<sycl::half, kKeyWidth>(cache, slot_mapping, rows, receipt);
+  } else if (cache.scalar_type() == at::kBFloat16) {
+    launch_store<sycl::ext::oneapi::bfloat16, kKeyWidth>(
+        cache, slot_mapping, rows, receipt);
+  } else if (rows.stride(rows.dim() - 1) == 1) {
+    launch_store<int64_t, kPositionWidth>(cache, slot_mapping, rows, receipt);
+  } else {
+    launch_store<int64_t, kPositionWidth, true>(
+        cache, slot_mapping, rows, receipt);
+  }
+  return {cache, receipt};
+}
+
+}  // namespace qsa

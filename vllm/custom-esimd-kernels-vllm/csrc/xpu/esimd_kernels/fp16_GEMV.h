@@ -15,6 +15,9 @@
  */
 
 #pragma once
+
+#include <stdexcept>
+
 #include "utils.h"
 
 namespace esimd_math = sycl::ext::intel::esimd;
@@ -32,7 +35,27 @@ SYCL_ESIMD_FUNCTION inline float gelu_tanh_scalar_esimd(float x) {
     return (0.5f * xv * (1.0f + tanh_v))[0];
 }
 
-template<int VL, int K_SPLIT>
+constexpr int kHcDownSiluWidth = 320;
+
+template<bool APPLY_HC_DOWN_EPILOGUE>
+SYCL_ESIMD_FUNCTION inline fp16 gemv_fp16_epilogue(float value, int n) {
+    const fp16 rounded_linear(value);
+    if constexpr (APPLY_HC_DOWN_EPILOGUE) {
+        if (n < kHcDownSiluWidth) {
+            // Preserve F.linear(fp16) -> fp16 division -> SiLU ordering.
+            const fp16 rounded_scaled(
+                static_cast<float>(rounded_linear) * 0.25f);
+            const simd<float, 1> scaled(
+                static_cast<float>(rounded_scaled));
+            const simd<float, 1> activated =
+                scaled / (1.0f + esimd_math::exp<float, 1>(-scaled));
+            return fp16(activated[0]);
+        }
+    }
+    return rounded_linear;
+}
+
+template<int VL, int K_SPLIT, bool APPLY_HC_DOWN_EPILOGUE = false>
 struct GEMV_fp16_kernel {
     const fp16* input;
     const fp16* weight;
@@ -68,16 +91,49 @@ struct GEMV_fp16_kernel {
         float my_sum = reduce<float>(acc, std::plus<>());
 
         if constexpr (K_SPLIT == 1) {
-            output[(size_t)m * N + n] = fp16(my_sum);
+            output[(size_t)m * N + n] =
+                gemv_fp16_epilogue<APPLY_HC_DOWN_EPILOGUE>(my_sum, n);
         } else {
             slm_block_store<float, 1>(lid * sizeof(float), simd<float, 1>(my_sum));
             barrier();
             if (lid == 0) {
                 simd<float, K_SPLIT> parts = slm_block_load<float, K_SPLIT>(0);
-                output[(size_t)m * N + n] = fp16(
-                    reduce<float>(parts, std::plus<>()));
+                output[(size_t)m * N + n] =
+                    gemv_fp16_epilogue<APPLY_HC_DOWN_EPILOGUE>(
+                        reduce<float>(parts, std::plus<>()), n);
             }
         }
+    }
+};
+
+// HC up-projection M=1 fast path: the short K dimension does not benefit
+// from a one-output work-group.  Use one output row per work-item and group
+// 32 rows so the scheduler pays one work-group launch per output block.
+struct GEMV_fp16_hc_up_m1_kernel {
+    const fp16* input;
+    const fp16* weight;
+    fp16*       output;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        constexpr int W = 128;
+        constexpr int T = 64;
+        const int row = item.get_global_id(0);
+        const size_t row_base = static_cast<size_t>(row) * 320;
+
+        simd<fp16, W> x0 = block_load<fp16, W>(input);
+        simd<fp16, W> w0 = block_load<fp16, W>(weight + row_base);
+        simd<fp16, W> x1 = block_load<fp16, W>(input + W);
+        simd<fp16, W> w1 = block_load<fp16, W>(weight + row_base + W);
+        simd<fp16, T> x2 = block_load<fp16, T>(input + 2 * W);
+        simd<fp16, T> w2 = block_load<fp16, T>(weight + row_base + 2 * W);
+
+        float acc0 = reduce<float>(simd<float, W>(x0) * simd<float, W>(w0),
+                                   std::plus<>());
+        float acc1 = reduce<float>(simd<float, W>(x1) * simd<float, W>(w1),
+                                   std::plus<>());
+        float acc2 = reduce<float>(simd<float, T>(x2) * simd<float, T>(w2),
+                                   std::plus<>());
+        output[row] = fp16(acc0 + acc1 + acc2);
     }
 };
 
@@ -141,31 +197,55 @@ struct GEMV_fp16_gelu_mul_kernel {
 // header-self-contained. Same heuristic: small-N + large-K benefits from
 // K_SPLIT > 1 to spread work across more threads.
 inline void select_vl_ks_fp16(uint32_t N, uint32_t K, int& vl, int& ks) {
-    vl = 512; ks = 1;
+    vl = 512;
+    ks = 1;
     if (K < 512) {
-        vl = 128; ks = 1;
+        vl = 128;
     } else if (K == 512) {
-        vl = 256; ks = 1;
+        vl = 256;
     }
     if (N <= 128 && K >= 2048) {
-        vl = 128; ks = 8;
+        ks = 8;
+        vl = 128;
     } else if (N <= 512 && K >= 2048) {
-        vl = 128; ks = 4;
+        ks = 4;
+        vl = 128;
     }
-    int kpt = K / ks;
-    while (vl > kpt || kpt % vl != 0) {
-        if (vl > 32) {
-            vl /= 2;
-        } else if (ks > 1) {
-            ks /= 2;
-            kpt = K / ks;
+
+    // K_SPLIT must partition K exactly.  The old selector truncated K / ks
+    // when K was not divisible by ks, which silently dropped tail elements.
+    // Fall back to the largest divisor not exceeding the requested split.
+    if (K % static_cast<uint32_t>(ks) != 0) {
+        const int requested_ks = ks;
+        if (requested_ks >= 4 && K % 4 == 0) {
+            ks = 4;
+        } else if (requested_ks >= 2 && K % 2 == 0) {
+            ks = 2;
         } else {
-            break;
+            ks = 1;
         }
     }
+
+    const int k_per_thread = static_cast<int>(K / static_cast<uint32_t>(ks));
+    // Every instantiated kernel uses an unmasked contiguous block_load.  Pick
+    // a vector width that divides the per-thread range, including small and
+    // non-power-of-two K values, so no load can cross the row boundary.  The
+    // split variants historically dispatch only through VL=128; keep that
+    // bound so the selector cannot request an uninstantiated split kernel.
+    const int max_vector_width = (ks == 1) ? 512 : 128;
+    constexpr int k_vector_widths[] = {512, 256, 128, 64, 32, 16, 8, 4, 2, 1};
+    for (int candidate : k_vector_widths) {
+        if (candidate <= max_vector_width && candidate <= k_per_thread &&
+            k_per_thread % candidate == 0) {
+            vl = candidate;
+            return;
+        }
+    }
+    vl = 1;
 }
 
-inline void GEMV_fp16_host(
+template<bool APPLY_HC_DOWN_EPILOGUE>
+inline void GEMV_fp16_host_impl(
     const fp16* input,
     const fp16* weight,
     fp16*       output,
@@ -174,13 +254,24 @@ inline void GEMV_fp16_host(
     uint32_t K,
     sycl::queue& q) {
 
+    if constexpr (!APPLY_HC_DOWN_EPILOGUE) {
+        if (M == 1 && N == 10240 && K == 320) {
+            q.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(
+                    sycl::nd_range<1>(N, 32),
+                    GEMV_fp16_hc_up_m1_kernel{input, weight, output});
+            });
+            return;
+        }
+    }
+
     int vl, ks;
     select_vl_ks_fp16(N, K, vl, ks);
 
     uint32_t global = M * N * ks;
     uint32_t local  = ks;
 
-    #define LAUNCH(V, KS)         q.submit([&](sycl::handler& cgh) {             cgh.parallel_for(                 sycl::nd_range<1>(global, local),                 GEMV_fp16_kernel<V, KS>{input, weight, output, (int)N, (int)K});         });
+    #define LAUNCH(V, KS)         q.submit([&](sycl::handler& cgh) {             cgh.parallel_for(                 sycl::nd_range<1>(global, local),                 GEMV_fp16_kernel<V, KS, APPLY_HC_DOWN_EPILOGUE>{input, weight, output, (int)N, (int)K});         });
 
     if      (vl == 512 && ks == 1) { LAUNCH(512, 1) }
     else if (vl == 256 && ks == 1) { LAUNCH(256, 1) }
@@ -196,9 +287,51 @@ inline void GEMV_fp16_host(
     else if (vl == 128 && ks == 8) { LAUNCH(128, 8) }
     else if (vl == 64  && ks == 8) { LAUNCH(64,  8) }
     else if (vl == 32  && ks == 8) { LAUNCH(32,  8) }
-    else                           { LAUNCH(64,  1) }
+    else if (vl == 16  && ks == 1) { LAUNCH(16,  1) }
+    else if (vl == 8   && ks == 1) { LAUNCH(8,   1) }
+    else if (vl == 4   && ks == 1) { LAUNCH(4,   1) }
+    else if (vl == 2   && ks == 1) { LAUNCH(2,   1) }
+    else if (vl == 1   && ks == 1) { LAUNCH(1,   1) }
+    else if (vl == 16  && ks == 2) { LAUNCH(16,  2) }
+    else if (vl == 8   && ks == 2) { LAUNCH(8,   2) }
+    else if (vl == 4   && ks == 2) { LAUNCH(4,   2) }
+    else if (vl == 2   && ks == 2) { LAUNCH(2,   2) }
+    else if (vl == 1   && ks == 2) { LAUNCH(1,   2) }
+    else if (vl == 16  && ks == 4) { LAUNCH(16,  4) }
+    else if (vl == 8   && ks == 4) { LAUNCH(8,   4) }
+    else if (vl == 4   && ks == 4) { LAUNCH(4,   4) }
+    else if (vl == 2   && ks == 4) { LAUNCH(2,   4) }
+    else if (vl == 1   && ks == 4) { LAUNCH(1,   4) }
+    else if (vl == 16  && ks == 8) { LAUNCH(16,  8) }
+    else if (vl == 8   && ks == 8) { LAUNCH(8,   8) }
+    else if (vl == 4   && ks == 8) { LAUNCH(4,   8) }
+    else if (vl == 2   && ks == 8) { LAUNCH(2,   8) }
+    else if (vl == 1   && ks == 8) { LAUNCH(1,   8) }
+    else {
+        throw std::logic_error("unsupported FP16 GEMV dispatch combination");
+    }
 
     #undef LAUNCH
+}
+
+inline void GEMV_fp16_host(
+    const fp16* input,
+    const fp16* weight,
+    fp16* output,
+    uint32_t M,
+    uint32_t N,
+    uint32_t K,
+    sycl::queue& q) {
+    GEMV_fp16_host_impl<false>(input, weight, output, M, N, K, q);
+}
+
+inline void GEMV_fp16_hc_down_host(
+    const fp16* input,
+    const fp16* weight,
+    fp16* output,
+    uint32_t N,
+    sycl::queue& q) {
+    GEMV_fp16_host_impl<true>(input, weight, output, 1, N, 10240, q);
 }
 
 inline void GEMV_fp16_gelu_mul_host(
@@ -235,7 +368,29 @@ inline void GEMV_fp16_gelu_mul_host(
     else if (vl == 128 && ks == 8) { LAUNCH_GELU(128, 8) }
     else if (vl == 64  && ks == 8) { LAUNCH_GELU(64,  8) }
     else if (vl == 32  && ks == 8) { LAUNCH_GELU(32, 8) }
-    else                           { LAUNCH_GELU(64, 1) }
+    else if (vl == 16  && ks == 1) { LAUNCH_GELU(16,  1) }
+    else if (vl == 8   && ks == 1) { LAUNCH_GELU(8,   1) }
+    else if (vl == 4   && ks == 1) { LAUNCH_GELU(4,   1) }
+    else if (vl == 2   && ks == 1) { LAUNCH_GELU(2,   1) }
+    else if (vl == 1   && ks == 1) { LAUNCH_GELU(1,   1) }
+    else if (vl == 16  && ks == 2) { LAUNCH_GELU(16,  2) }
+    else if (vl == 8   && ks == 2) { LAUNCH_GELU(8,   2) }
+    else if (vl == 4   && ks == 2) { LAUNCH_GELU(4,   2) }
+    else if (vl == 2   && ks == 2) { LAUNCH_GELU(2,   2) }
+    else if (vl == 1   && ks == 2) { LAUNCH_GELU(1,   2) }
+    else if (vl == 16  && ks == 4) { LAUNCH_GELU(16,  4) }
+    else if (vl == 8   && ks == 4) { LAUNCH_GELU(8,   4) }
+    else if (vl == 4   && ks == 4) { LAUNCH_GELU(4,   4) }
+    else if (vl == 2   && ks == 4) { LAUNCH_GELU(2,   4) }
+    else if (vl == 1   && ks == 4) { LAUNCH_GELU(1,   4) }
+    else if (vl == 16  && ks == 8) { LAUNCH_GELU(16,  8) }
+    else if (vl == 8   && ks == 8) { LAUNCH_GELU(8,   8) }
+    else if (vl == 4   && ks == 8) { LAUNCH_GELU(4,   8) }
+    else if (vl == 2   && ks == 8) { LAUNCH_GELU(2,   8) }
+    else if (vl == 1   && ks == 8) { LAUNCH_GELU(1,   8) }
+    else {
+        throw std::logic_error("unsupported FP16 GELU GEMV dispatch combination");
+    }
 
     #undef LAUNCH_GELU
 }
