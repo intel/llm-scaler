@@ -20,6 +20,97 @@ static inline sycl::queue& get_device_queue(const at::Tensor& tensor) {
     return c10::xpu::getCurrentXPUStream(tensor.device().index()).queue();
 }
 
+static inline void validate_gdn_conv_args(
+    const at::Tensor& qkvz,
+    const at::Tensor& conv_state,
+    const at::Tensor& conv_weight,
+    const at::Tensor& conv_bias,
+    const at::Tensor& conv_state_indices,
+    const at::Tensor& A_log,
+    const at::Tensor& dt_bias,
+    const at::Tensor& ba,
+    const at::Tensor& ssm_state,
+    const at::Tensor& ssm_state_indices,
+    const at::Tensor& output,
+    const at::Tensor& z_out,
+    int64_t N, int64_t H, int64_t HV, int64_t K, int64_t V) {
+    TORCH_CHECK(N > 0, "gdn_conv_fused: N must be positive");
+    TORCH_CHECK(H > 0 && HV > 0 && HV % H == 0,
+                "gdn_conv_fused: require H>0, HV>0 and HV%H==0");
+    TORCH_CHECK(K == 128 && V == 128,
+                "gdn_conv_fused: only K=V=128 is supported");
+
+    const auto device = qkvz.device();
+    TORCH_CHECK(device.type() == c10::DeviceType::XPU,
+                "gdn_conv_fused: all tensors must be on XPU");
+    const at::Tensor tensors[] = {
+        conv_state, conv_weight, conv_bias, conv_state_indices, A_log,
+        dt_bias, ba, ssm_state, ssm_state_indices, output, z_out};
+    for (const auto& tensor : tensors) {
+        TORCH_CHECK(tensor.device() == device,
+                    "gdn_conv_fused: all tensors must be on the same XPU device");
+    }
+
+    const at::Tensor fp16_tensors[] = {
+        qkvz, conv_state, conv_weight, conv_bias, A_log, dt_bias,
+        ba, ssm_state, output, z_out};
+    for (const auto& tensor : fp16_tensors) {
+        TORCH_CHECK(tensor.scalar_type() == at::kHalf,
+                    "gdn_conv_fused: all data/state/output tensors must be FP16");
+    }
+    TORCH_CHECK(conv_state_indices.scalar_type() == at::kInt &&
+                    ssm_state_indices.scalar_type() == at::kInt,
+                "gdn_conv_fused: state indices must be int32");
+
+    const int64_t dim = 2 * H * K + HV * V;
+    const int64_t qkvz_dim = 2 * H * K + 2 * HV * V;
+    TORCH_CHECK(qkvz.dim() == 2 && qkvz.size(0) >= N &&
+                    qkvz.size(1) >= qkvz_dim && qkvz.is_contiguous(),
+                "gdn_conv_fused: qkvz must be contiguous [>=N, >=", qkvz_dim, "]");
+    TORCH_CHECK(ba.dim() == 2 && ba.size(0) >= N && ba.size(1) >= 2 * HV &&
+                    ba.is_contiguous(),
+                "gdn_conv_fused: ba must be contiguous [>=N, >=2*HV]");
+    TORCH_CHECK(conv_weight.dim() == 2 && conv_weight.size(0) >= dim &&
+                    conv_weight.size(1) == 4 && conv_weight.is_contiguous(),
+                "gdn_conv_fused: conv_weight must be contiguous [>=dim, 4]");
+    TORCH_CHECK(conv_bias.dim() == 1 && conv_bias.numel() >= dim &&
+                    conv_bias.is_contiguous(),
+                "gdn_conv_fused: conv_bias must be contiguous [>=dim]");
+    TORCH_CHECK(A_log.dim() == 1 && A_log.numel() >= HV && A_log.is_contiguous(),
+                "gdn_conv_fused: A_log must be contiguous [>=HV]");
+    TORCH_CHECK(dt_bias.dim() == 1 && dt_bias.numel() >= HV &&
+                    dt_bias.is_contiguous(),
+                "gdn_conv_fused: dt_bias must be contiguous [>=HV]");
+    TORCH_CHECK(conv_state_indices.dim() == 1 &&
+                    conv_state_indices.numel() >= N &&
+                    conv_state_indices.is_contiguous(),
+                "gdn_conv_fused: conv_state_indices must be contiguous [>=N]");
+    TORCH_CHECK(ssm_state_indices.dim() == 1 &&
+                    ssm_state_indices.numel() >= N &&
+                    ssm_state_indices.is_contiguous(),
+                "gdn_conv_fused: ssm_state_indices must be contiguous [>=N]");
+
+    TORCH_CHECK(conv_state.dim() == 3 && conv_state.size(0) > 0 &&
+                    conv_state.size(1) == 3 && conv_state.size(2) >= dim &&
+                    conv_state.stride(2) == 1 && conv_state.stride(1) == dim &&
+                    conv_state.stride(0) >= 3 * dim,
+                "gdn_conv_fused: invalid conv_state shape/stride");
+    TORCH_CHECK(ssm_state.dim() == 4 && ssm_state.size(0) > 0 &&
+                    ssm_state.size(1) == HV && ssm_state.size(2) == V &&
+                    ssm_state.size(3) == K && ssm_state.stride(3) == 1 &&
+                    ssm_state.stride(2) == K && ssm_state.stride(1) == V * K &&
+                    ssm_state.stride(0) >= HV * V * K,
+                "gdn_conv_fused: invalid ssm_state shape/stride");
+    TORCH_CHECK(output.dim() == 3 && output.size(0) >= N &&
+                    output.size(1) == HV && output.size(2) == V &&
+                    output.is_contiguous(),
+                "gdn_conv_fused: output must be contiguous [>=N, HV, V]");
+    TORCH_CHECK(z_out.dim() == 3 && z_out.size(0) >= N &&
+                    z_out.size(1) == HV && z_out.size(2) == V &&
+                    z_out.is_contiguous(),
+                "gdn_conv_fused: z_out must be contiguous [>=N, HV, V]");
+}
+
 at::Tensor esimd_gdn_conv_fused(
     at::Tensor qkvz,                // [N, qkvz_dim] fp16 — projected_states_qkvz
     at::Tensor conv_state,           // [num_cache, 3, 2048] fp16, strided dim0
@@ -37,6 +128,10 @@ at::Tensor esimd_gdn_conv_fused(
     int64_t K, int64_t V,
     double scale)
 {
+    validate_gdn_conv_args(
+        qkvz, conv_state, conv_weight, conv_bias, conv_state_indices,
+        A_log, dt_bias, ba, ssm_state, ssm_state_indices, output, z_out,
+        N, H, HV, K, V);
     auto& dpcpp_queue = get_device_queue(qkvz);
 
     // Extract strides (in fp16 elements)
@@ -65,6 +160,7 @@ at::Tensor esimd_gdn_conv_fused(
         p_sstate, p_ssidx, p_out, p_zout,
         (int)N, (int)H, (int)HV, (int)K, (int)V,
         (float)scale, conv_stride0, ssm_stride0,
+        (int)conv_state.size(0), (int)ssm_state.size(0),
         dpcpp_queue);
 
     return output;
@@ -87,6 +183,10 @@ at::Tensor esimd_gdn_conv_fused_seq(
     int64_t K, int64_t V,
     double scale)
 {
+    validate_gdn_conv_args(
+        qkvz, conv_state, conv_weight, conv_bias, conv_state_indices,
+        A_log, dt_bias, ba, ssm_state, ssm_state_indices, output, z_out,
+        N, H, HV, K, V);
     auto& dpcpp_queue = get_device_queue(qkvz);
 
     int64_t qkvz_stride0 = qkvz.stride(0);
@@ -113,6 +213,7 @@ at::Tensor esimd_gdn_conv_fused_seq(
         p_sstate, p_ssidx, p_out, p_zout,
         (int)N, (int)H, (int)HV, (int)K, (int)V,
         (float)scale, conv_stride0, ssm_stride0,
+        (int)conv_state.size(0), (int)ssm_state.size(0),
         dpcpp_queue);
 
     return output;
