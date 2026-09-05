@@ -60,14 +60,16 @@ def test_norm_dispatch_ladders_are_platform_independent():
     )
 
 
-def test_segmented_rms_modulation_uses_semantic_api_and_native_policy():
+def test_segmented_rms_modulation_uses_native_capability_without_sku_whitelist():
     policy_query = NORM_SOURCE.split(
         "bool rms_norm_segmented_modulation_supported", 1
     )[1].split("torch::Tensor rms_norm_segmented_modulation", 1)[0]
 
-    assert "selection.kernel_profile" in policy_query
-    assert "selection.physical_sku" not in policy_query
-    assert "!selection.forced" in policy_query
+    assert "return input.is_xpu();" in policy_query
+    assert "get_bmg_selection" not in policy_query
+    assert "BmgKernelProfile" not in policy_query
+    assert "physical_sku" not in policy_query
+    assert ".forced" not in policy_query
     for legacy_name in (
         "rms_norm_modulate_b580",
         "supports_rms_norm_modulate_b580",

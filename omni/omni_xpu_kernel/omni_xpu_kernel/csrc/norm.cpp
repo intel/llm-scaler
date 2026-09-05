@@ -730,13 +730,11 @@ void rms_norm_segmented_modulation_kernel(
 }
 
 bool rms_norm_segmented_modulation_supported(torch::Tensor input) {
-    if (!input.is_xpu()) {
-        return false;
-    }
-    auto& queue = utils::get_queue(input.device());
-    const auto selection = device::get_bmg_selection(queue);
-    return !selection.forced &&
-        selection.kernel_profile == device::BmgKernelProfile::b580;
+    // This entry point is compiled only into the BMG binary. The structural
+    // H5376 reduction and BF16 materialization do not select SKU-specific
+    // parameters; a product/profile whitelist is not a kernel capability.
+    // The operation below independently validates dtype, shape and layout.
+    return input.is_xpu();
 }
 
 torch::Tensor rms_norm_segmented_modulation(

@@ -139,9 +139,10 @@ def rms_norm_segmented_modulation(
     cover the complete contiguous BF16 ``[S,5376]`` input. Scale and shift may
     be row-strided ``[modulation_rows,5376]`` views.
 
-    Runtime eligibility is owned by native device-policy dispatch. Callers
-    must query :func:`rms_norm_segmented_modulation_supported` and retain their
-    normal fallback for every unsupported policy or tensor contract.
+    Availability comes from the installed BMG binary and an XPU input, not a
+    product-SKU whitelist. Callers must query
+    :func:`rms_norm_segmented_modulation_supported` and retain their normal
+    fallback for unsupported binaries, devices or tensor contracts.
     """
     starts = []
     stops = []
