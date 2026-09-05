@@ -125,6 +125,37 @@ def onednn_int4_gemm_preconverted(
     return _get_native().onednn_int4_gemm_preconverted(act, packed_u4, scales_f16)
 
 
+def quantize_act_s8(
+    input: torch.Tensor,
+    group_size: int = 64,
+) -> tuple:
+    """Per-group symmetric s8 activation quantization for onednn_s8u4_gemm.
+
+    Returns:
+        (act_s8 [M, K] int8, scales [M, K/gs] f32)
+    """
+    return _get_native().quantize_svdq_act_s8(input, group_size)
+
+
+def onednn_s8u4_gemm(
+    act: torch.Tensor,
+    xscales: torch.Tensor,
+    packed_u4: torch.Tensor,
+    scales_f16: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+    zp_u8: torch.Tensor = None,
+) -> torch.Tensor:
+    """W4A8 GEMM: s8 act x u4 packed weights via oneDNN.
+
+    zp_u8=None 走标量 zp=8（wa4）；zp_u8=[G_wei, N] 走 per-block zp
+    （tint4/torchao 非对称，w=(q-zp)*scale 在 oneDNN 内完成）。
+    src/wei 分组解耦：src 32/64、wei 可到 128。
+    """
+    out = _get_native().onednn_s8u4_gemm(
+        act, xscales, packed_u4, scales_f16, out_dtype, zp_u8)
+    return out.to(out_dtype)
+
+
 def onednn_int4_gemm_add_to_output(
     act: torch.Tensor,
     packed_u4: torch.Tensor,
@@ -229,8 +260,10 @@ __all__ = [
     "unpack_int4",
     "quantize_act_int4",
     "quantize_act_uint4",
+    "quantize_act_s8",
     "onednn_int4_gemm",
     "onednn_int4_gemm_preconverted",
+    "onednn_s8u4_gemm",
     "onednn_int4_gemm_add_to_output",
     "prepare_onednn_weights",
     "fused_convert_add",

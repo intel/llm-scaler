@@ -909,5 +909,117 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_svdq_act_uint4(
 }
 
 
+// ============================================================================
+// per-group symmetric s8 activation quantization for onednn_s8u4_gemm.
+//   input  [M, K]  fp16/bf16
+//   output [M, K]  int8   (q = round(v * 127/absmax), clamped to [-127, 127])
+//   scales [M, G]  f32    (per-group, row-major; matches onednn src scales.
+//   f32 not f16: QW-style bf16 models can have group absmax > 8.3e6, which
+//   overflows an f16 scale (65504) to inf -> dequant NaN -> black image.)
+// ============================================================================
+template<typename IT, int GS, int GroupsPerWorkItem = 8, int WorkGroupSize = 64>
+void quantize_svdq_act_s8_kernel(
+    const IT* __restrict__ input,
+    int8_t* __restrict__ output,
+    float* __restrict__ scales,
+    const int64_t M,
+    const int64_t K,
+    const int64_t num_groups,
+    const at::Device& device) {
+  const int64_t group_chunks =
+      (num_groups + GroupsPerWorkItem - 1) / GroupsPerWorkItem;
+  const int64_t total_items = M * group_chunks;
+  constexpr int WG = WorkGroupSize;
+  const int64_t padded_size = (total_items + WG - 1) / WG * WG;
+  auto cgf = [&](sycl::handler& handle) {
+    handle.parallel_for(
+        sycl::nd_range<1>(sycl::range<1>(padded_size), sycl::range<1>(WG)),
+        [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+          const int64_t gid = item.get_global_id(0);
+          if (gid >= total_items) return;
+          const int64_t row = gid / group_chunks;
+          const int64_t first_grp = (gid % group_chunks) * GroupsPerWorkItem;
+          for (int local_grp = 0; local_grp < GroupsPerWorkItem; ++local_grp) {
+            const int64_t grp = first_grp + local_grp;
+            if (grp >= num_groups) break;
+            const IT* src = input + row * K + grp * GS;
+            int8_t* dst = output + row * K + grp * GS;
+            simd<float, GS> vals;
+            if constexpr (std::is_same_v<IT, fp16>) {
+              vals = block_load<fp16, GS>(
+                  reinterpret_cast<const fp16*>(src), overaligned_tag<16>{});
+            } else {
+              vals = block_load<bf16, GS>(
+                  reinterpret_cast<const bf16*>(src), overaligned_tag<16>{});
+            }
+            const float m = hmax<float>(abs<float, GS>(vals));
+            const float rscale = (m > 1e-10f) ? (127.0f / m) : 1.27e12f;
+            const float scale = (m > 1e-10f) ? (m / 127.0f) : 1e-10f;
+            simd<float, GS> q = rnde<float, GS>(vals * rscale);
+            q = max<float, GS>(min<float, GS>(q, simd<float, GS>(127.0f)),
+                               simd<float, GS>(-127.0f));
+            block_store<int8_t, GS>(dst, simd<int8_t, GS>(q),
+                                    overaligned_tag<16>{});
+            scales[row * num_groups + grp] = scale;
+          }
+        });
+  };
+  utils::submit_kernel(cgf, device, "quantize_svdq_act_s8");
+}
+
+std::tuple<torch::Tensor, torch::Tensor> quantize_svdq_act_s8(
+    const torch::Tensor& input,
+    int64_t group_size
+) {
+    TORCH_CHECK(input.is_contiguous(), "input tensor must be contiguous");
+    TORCH_CHECK(input.dim() == 2, "input must be 2D [M, K]");
+    TORCH_CHECK(input.scalar_type() == torch::kFloat16 ||
+                input.scalar_type() == torch::kBFloat16,
+                "input must be fp16 or bf16");
+    TORCH_CHECK(group_size == 32 || group_size == 64,
+                "Only group_size=32/64 is supported, got ", group_size);
+    const int64_t M = input.size(0);
+    const int64_t K = input.size(1);
+    TORCH_CHECK(K % group_size == 0, "K must be divisible by group_size");
+    const int64_t num_groups = K / group_size;
+
+    auto output = torch::empty({M, K},
+        torch::TensorOptions().dtype(torch::kChar).device(input.device()));
+    auto scales_out = torch::empty({M, num_groups},
+        torch::TensorOptions().dtype(torch::kFloat).device(input.device()));
+
+    if (input.scalar_type() == torch::kFloat16) {
+        if (group_size == 32) {
+            quantize_svdq_act_s8_kernel<fp16, 32>(
+                reinterpret_cast<const fp16*>(input.data_ptr()),
+                output.data_ptr<int8_t>(),
+                scales_out.data_ptr<float>(),
+                M, K, num_groups, input.device());
+        } else {
+            quantize_svdq_act_s8_kernel<fp16, 64>(
+                reinterpret_cast<const fp16*>(input.data_ptr()),
+                output.data_ptr<int8_t>(),
+                scales_out.data_ptr<float>(),
+                M, K, num_groups, input.device());
+        }
+    } else {
+        if (group_size == 32) {
+            quantize_svdq_act_s8_kernel<bf16, 32>(
+                reinterpret_cast<const bf16*>(input.data_ptr()),
+                output.data_ptr<int8_t>(),
+                scales_out.data_ptr<float>(),
+                M, K, num_groups, input.device());
+        } else {
+            quantize_svdq_act_s8_kernel<bf16, 64>(
+                reinterpret_cast<const bf16*>(input.data_ptr()),
+                output.data_ptr<int8_t>(),
+                scales_out.data_ptr<float>(),
+                M, K, num_groups, input.device());
+        }
+    }
+    return {output, scales_out};
+}
+
+
 }  // namespace svdq
 }  // namespace omni_xpu
