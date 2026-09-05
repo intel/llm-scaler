@@ -215,23 +215,6 @@ B70 的 `sycl-ls --verbose` 应报告：
 Architecture: intel_gpu_bmg_g31
 ```
 
-### 6.1 下一轮 multi-SKU candidate
-
-当前开发源码把 Linux 和 Windows 的 BMG CUTE target list 统一为：
-
-```text
--device bmg-g21,bmg-g31
-```
-
-同一个 `.pyd` 因而包含 G21 image、B70 使用的 G31 image，以及编译器保留的
-generic IR，不再按操作系统选择不同默认值。这是下一轮候选
-构建合同，不是对第 7 节现有验收 wheel 的追溯描述。第 7 节的文件名、SHA256 和
-第 9 节结果仍是此前 B70/G31 产物的历史证据，不能用于证明该 fat-binary candidate。
-
-fat binary 构建成功只证明 artifact 组成；当前 Windows runtime 结论仍限于实际
-验收过的 B70。新 candidate 需要重新生成并记录 wheel SHA256；其他物理目标必须
-在对应设备上单独完成 correctness 和工作流 gate。
-
 如果使用第 4 节的项目内 Windows SDK，在 `pip wheel` 前添加：
 
 ```bat
@@ -428,9 +411,6 @@ Portable 的 `python_embeded\Library\bin` 和
 ## 11. 当前边界
 
 - Windows CUTE/Sol-Attn 当前只验收 BMG；PTL-H 需要独立构建与验收。
-- 当前开发源码的 BMG CUTE candidate 同时携带 G21/G31 AOT image；现有 Windows
-  runtime 证据仍只有此前的 B70/G31 artifact，不能据此宣称新 candidate 或
-  其他物理目标已验收。
 - 当前 ComfyUI CUTE route 以已验证 D128 contract 为主；不支持的
   dtype、layout、mask、head dimension 或 GQA contract 回退到 dense
   attention。
