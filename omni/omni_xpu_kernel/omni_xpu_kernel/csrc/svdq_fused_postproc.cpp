@@ -517,7 +517,33 @@ torch::Tensor fused_smooth_convert(
         reinterpret_cast<fp16*>(output.data_ptr());
 #if defined(OMNI_XPU_ARCH_BMG)
     auto& queue = utils::get_queue(x.device());
-    if (device::use_b60_kernel_profile(queue)) {
+    const auto selection = device::get_bmg_selection(queue);
+    const auto kernel_profile = selection.kernel_profile;
+    if (selection.b580_policy_candidate ==
+            device::B580PolicyCandidate::svdq_smooth) {
+        // Keep the B580 base algorithm fixed; B60's separate 2D route is
+        // outside this policy-value A/B.
+        fused_smooth_convert_kernel<
+            device::B580SvdqSmoothCandidatePolicy::svdq_smooth_elements,
+            device::B580SvdqSmoothCandidatePolicy::
+                svdq_smooth_work_group_size>(
+                x_ptr,
+                smooth_ptr,
+                output_ptr,
+                M,
+                K,
+                x.device());
+    } else if (kernel_profile == device::BmgKernelProfile::b580) {
+        fused_smooth_convert_kernel<
+            device::B580KernelPolicy::svdq_smooth_elements,
+            device::B580KernelPolicy::svdq_smooth_work_group_size>(
+                x_ptr,
+                smooth_ptr,
+                output_ptr,
+                M,
+                K,
+                x.device());
+    } else if (kernel_profile == device::BmgKernelProfile::b60) {
         constexpr int B60Elements =
             device::B60KernelPolicy::svdq_smooth_elements;
         constexpr int B60WorkGroup =
@@ -543,6 +569,16 @@ torch::Tensor fused_smooth_convert(
                     K,
                     x.device());
         }
+    } else if (kernel_profile == device::BmgKernelProfile::generic_bmg) {
+        fused_smooth_convert_kernel<
+            device::GenericBmgKernelPolicy::svdq_smooth_elements,
+            device::GenericBmgKernelPolicy::svdq_smooth_work_group_size>(
+                x_ptr,
+                smooth_ptr,
+                output_ptr,
+                M,
+                K,
+                x.device());
     } else {
         fused_smooth_convert_kernel<
             device::B70KernelPolicy::svdq_smooth_elements,
@@ -627,9 +663,43 @@ void fused_convert_add(
 
 #if defined(OMNI_XPU_ARCH_BMG)
     auto& queue = utils::get_queue(out.device());
-    if (device::use_b60_kernel_profile(queue)) {
+    const auto selection = device::get_bmg_selection(queue);
+    const auto kernel_profile = selection.kernel_profile;
+    if (selection.b580_policy_candidate ==
+            device::B580PolicyCandidate::svdq_convert_add) {
+        launch_fused_convert_add<
+            device::B580SvdqConvertAddCandidatePolicy::
+                svdq_convert_add_elements>(
+                out,
+                result,
+                residual,
+                M_out,
+                N_out,
+                result_N,
+                residual_N);
+    } else if (kernel_profile == device::BmgKernelProfile::b580) {
+        launch_fused_convert_add<
+            device::B580KernelPolicy::svdq_convert_add_elements>(
+                out,
+                result,
+                residual,
+                M_out,
+                N_out,
+                result_N,
+                residual_N);
+    } else if (kernel_profile == device::BmgKernelProfile::b60) {
         launch_fused_convert_add<
             device::B60KernelPolicy::svdq_convert_add_elements>(
+                out,
+                result,
+                residual,
+                M_out,
+                N_out,
+                result_N,
+                residual_N);
+    } else if (kernel_profile == device::BmgKernelProfile::generic_bmg) {
+        launch_fused_convert_add<
+            device::GenericBmgKernelPolicy::svdq_convert_add_elements>(
                 out,
                 result,
                 residual,

@@ -69,6 +69,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
         "OMNIXPU_ATTENTION",
         "OMNIXPU_ROTARY",
         "OMNIXPU_NORM",
+        "OMNIXPU_H3_RMS_MODULATION",
         "OMNIXPU_FP8_GEMM",
         "OMNIXPU_INT8_FFN",
         "OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM",
@@ -86,6 +87,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     assert config.attention
     assert config.rotary
     assert config.norm
+    assert config.h3_rms_modulation
     assert config.fp8_gemm
     assert config.int8_ffn
     assert config.dynamic_vram_boundary_trim
@@ -107,6 +109,7 @@ def test_disabled_components_are_reported_without_importing_modules(monkeypatch)
         attention=False,
         rotary=False,
         norm=False,
+        h3_rms_modulation=False,
         fp8_gemm=False,
         int8_ffn=False,
         dynamic_vram_boundary_trim=False,

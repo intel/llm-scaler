@@ -75,19 +75,75 @@ assert omni.core_aot_target() == omni.__xpu_target__
 
 ## Build targets
 
-`OMNI_XPU_DEVICE` selects the AOT ISA and architecture-level policy. Unknown
-values are rejected before compilation. One BMG wheel contains both B60 and
-B70 kernel profiles and selects between them from the exact runtime PCI Device
-ID:
+`OMNI_XPU_DEVICE` selects the AOT ISA and architecture-level build defaults.
+Unknown values are rejected before compilation. One BMG wheel selects its
+runtime policy from the exact PCI Device ID. The documented policy statuses
+are:
 
-| PCI Device ID | Runtime BMG profile |
-|---|---|
-| `0xE210`, `0xE211` | `b60` |
-| `0xE223` | `b70` |
-| other BMG ID | `generic-bmg` (the shipped B70-compatible defaults) |
+| PCI Device ID | Runtime BMG policy | Support status |
+|---|---|---|
+| `0xE210`, `0xE211` | `b60` | experimental |
+| `0xE223` | `b70` | stable |
+| `0xE212` | `generic-bmg` | experimental fallback |
+
+Each OS-specific BMG CUTE sidecar uses the same fat-target contract. It
+contains explicit `bmg-g21` and `bmg-g31` images plus the compiler-provided
+generic IR fallback. Runtime Device ID dispatch still selects the concrete
+kernel policy. The presence of an image is a build property, not a
+physical-SKU correctness or performance claim.
 
 Use `omni_xpu_kernel.device.info(index)` to inspect the detected ID, selected
-profile, and concrete policy values.
+physical/effective SKU, profile, debug-override state, performance-claim
+eligibility, concrete policy values, and the exact compiled values of all 23
+build-time controls in `tuning_overrides`. Experimental policies and generic
+fallback emit a native one-shot warning with the Device ID, policy ID, and
+support status.
+
+The packaged `policies/kernel-policy-v1.json` is the source of truth for build
+defaults, per-SKU runtime defaults, and support status. Build-time code
+generation creates the checked-in C++ policy headers and fails if they are
+stale. The public helpers expose the same packaged data without loading an XPU
+extension:
+
+```python
+from omni_xpu_kernel import device
+
+print(device.policy_defaults("b70"))
+print(device.policy_manifest())
+```
+
+Equal parameter values do not alias policy identity. B60 is a functional,
+experimental policy and therefore keeps `performance_claim_allowed=false`;
+only the stable B70 policy is eligible when no debug selector or non-default
+build tuning is active. Functional promotion of an experimental policy
+requires the applicable correctness and workflow gates, but does not by itself
+require a full milestone performance B/C/B. Performance claims remain a
+separate, formally measured decision.
+
+For development sweeps, pass a comma-separated, integer-only whitelist through
+`OMNI_XPU_TUNING_DEFINES`, for example
+`OMNI_RMS_NORM_H120_MODE=1,OMNI_RMS_NORM_H128_BLOCK_SIZE=64`. Unknown or
+duplicate controls fail the build. The unset defaults reproduce the maintained
+target routes. Candidate status compares the final compiled values with the
+manifest's maintained architecture profile, so explicitly supplying the same
+value as the default is not a candidate. A genuinely non-default build is a
+candidate and requires its own exact correctness validation. It cannot support
+a performance claim until the applicable formal comparison also passes.
+
+`OMNI_XPU_FORCE_SKU=b50|b60|b70|generic` overrides only the effective
+SKU/profile for dispatch testing. It never changes `device_id` or
+`physical_bmg_sku`, emits a warning, and forces
+`performance_claim_allowed=false`. This is suitable for classifier, AOT, and
+parameter-portability prescreens; it cannot validate another SKU's performance:
+
+```bash
+OMNI_XPU_FORCE_SKU=b60 python -c \
+  'import omni_xpu_kernel as omni; print(omni.device.info(0))'
+```
+
+Invalid override values fail closed. Do not set the variable in a publication,
+wheel, image-milestone, or formal benchmark environment.
+`generic-bmg` is accepted as a compatibility spelling of `generic`.
 
 | GPU architecture | `sycl-ls --verbose` architecture | `OMNI_XPU_DEVICE` |
 |---|---|---|
@@ -495,8 +551,8 @@ Sol-Attn operators; it does not enable either runtime route automatically.
 
 `setup.py` derives one architecture macro from `OMNI_XPU_DEVICE` so wheel
 metadata, core AOT ISA, and sidecars identify the same target. BMG core and
-CUTE components query the exact runtime Device ID and share the B60/B70 policy
-table.
+CUTE components query the exact runtime Device ID and share the
+B60/B70/generic profile selection contract.
 
 ## License
 

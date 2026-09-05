@@ -46,11 +46,7 @@ void submit(sycl::queue& queue, int64_t groups, KernelFunc&& kernel) {
   });
 }
 
-struct SummaryKernel;
-struct KStatsKernel;
-struct ThresholdKernel;
-struct RouteKernel;
-struct MaterializeRouteKernel;
+struct TopKThresholdKernel;
 
 void check_input(const at::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.device().is_xpu(), name, " must be on XPU");
@@ -62,9 +58,15 @@ void check_input(const at::Tensor& tensor, const char* name) {
 }
 
 #if SOL_ATTN_INLINE_ROUTE
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> prepare(
+std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor> prepare_with_controls(
 #else
-std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare_with_controls(
 #endif
     const at::Tensor& q,
     const at::Tensor& k,
@@ -74,7 +76,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare(
     int64_t sink_start,
     int64_t sink_end,
     int64_t sink_q_start,
-    int64_t sink_q_end) {
+    int64_t sink_q_end,
+    int64_t topk_count,
+    const at::Tensor& block_len) {
   check_input(q, "q");
   check_input(k, "k");
   check_input(v, "v");
@@ -89,10 +93,26 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare(
   const int64_t tokens = q.size(1);
   const int64_t heads = q.size(2);
   const int64_t blocks = (tokens + kBlock - 1) / kBlock;
+  TORCH_CHECK(
+      block_len.device() == q.device() &&
+          block_len.scalar_type() == at::kInt &&
+          block_len.is_contiguous() &&
+          (block_len.numel() == 0 ||
+           (block_len.dim() == 1 && block_len.numel() == blocks)),
+      "block_len must be an empty int32 XPU tensor or contiguous int32 (N,)");
   TORCH_CHECK(0 <= sink_start && sink_start <= sink_end && sink_end <= blocks,
               "sink_blocks must be an ordered range inside the block count");
   TORCH_CHECK(0 <= sink_q_start && sink_q_start <= sink_q_end && sink_q_end <= blocks,
               "sink_q must be an ordered range inside the block count");
+  const int64_t sink_count = sink_end - sink_start;
+  const int64_t selectable_blocks = blocks - sink_count;
+  const int64_t max_topk_count = selectable_blocks > 0
+      ? selectable_blocks - 1
+      : 0;
+  TORCH_CHECK(topk_count == -1 ||
+                  (topk_count >= 0 &&
+                   topk_count <= max_topk_count),
+              "topk_count must be -1 or inside the non-sink block budget");
 
   const float scale_log2 = static_cast<float>(scale_value) * kLog2E;
   const float tau = static_cast<float>(tau_value);
@@ -108,10 +128,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare(
 #if SOL_ATTN_INLINE_ROUTE
   auto key_sinks = at::empty(
       {batch, heads, blocks}, q.options().dtype(at::kByte));
+  auto topk_routes = topk_count >= 0
+      ? at::empty(
+            {batch, heads, blocks, blocks},
+            q.options().dtype(at::kByte))
+      : at::empty({0}, q.options().dtype(at::kByte));
 #else
   auto routes = at::empty(
       {batch, heads, blocks, blocks}, q.options().dtype(at::kByte));
 #endif
+  auto route_scores = topk_count >= 0
+      ? at::empty({batch, heads, blocks, blocks}, float_options)
+      : at::Tensor{};
 
   const auto* q_ptr = reinterpret_cast<const bf16*>(q.data_ptr());
   const auto* k_ptr = reinterpret_cast<const bf16*>(k.data_ptr());
@@ -124,9 +152,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare(
   auto* threshold_ptr = thresholds.data_ptr<float>();
 #if SOL_ATTN_INLINE_ROUTE
   auto* key_sink_ptr = key_sinks.data_ptr<uint8_t>();
+  auto* topk_route_ptr = topk_count >= 0
+      ? topk_routes.data_ptr<uint8_t>()
+      : nullptr;
 #else
   auto* route_ptr = routes.data_ptr<uint8_t>();
 #endif
+  auto* route_score_ptr = topk_count >= 0
+      ? route_scores.data_ptr<float>()
+      : nullptr;
+  const auto* block_len_ptr = block_len.numel() == 0
+      ? nullptr
+      : block_len.data_ptr<int32_t>();
 
   const int64_t sq_b = q.stride(0);
   const int64_t sq_t = q.stride(1);
@@ -148,7 +185,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare(
     const int64_t head = batch_head % heads;
     const int64_t batch_index = batch_head / heads;
     const int64_t start = block * kBlock;
-    const int64_t length = sycl::min(kBlock, tokens - start);
+    const int64_t physical_length = sycl::min(kBlock, tokens - start);
+    const int64_t requested_length = block_len_ptr == nullptr
+        ? physical_length
+        : static_cast<int64_t>(block_len_ptr[block]);
+    const int64_t length = requested_length < 1
+        ? 1
+        : (requested_length > physical_length
+               ? physical_length
+               : requested_length);
 
     float q_sum = 0.0f;
     float k_sum = 0.0f;
@@ -167,6 +212,40 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare(
     kc_ptr[summary] = static_cast<bf16>(k_sum / static_cast<float>(length));
     vm_ptr[summary] = static_cast<bf16>(v_sum / static_cast<float>(length));
   });
+
+  if (topk_count >= 0) {
+    submit(queue, summary_groups,
+           [=](sycl::nd_item<1> item)
+               [[sycl::reqd_sub_group_size(16)]] {
+      const int64_t group = item.get_group_linear_id();
+      const int64_t query_block = group % blocks;
+      const int64_t batch_head = group / blocks;
+      const int64_t summary_offset = batch_head * blocks * kHeadDim;
+      const auto subgroup = item.get_sub_group();
+      const int64_t subgroup_id = subgroup.get_group_linear_id();
+      const int64_t subgroup_count = item.get_local_range(0) / 16;
+      const int64_t lane = subgroup.get_local_linear_id();
+
+      for (int64_t key_block = subgroup_id; key_block < blocks;
+           key_block += subgroup_count) {
+        float partial = 0.0f;
+        for (int64_t dim = lane; dim < kHeadDim; dim += 16) {
+          partial +=
+              qc_ptr[summary_offset + query_block * kHeadDim + dim] *
+              static_cast<float>(
+                  kc_ptr[summary_offset + key_block * kHeadDim + dim]);
+        }
+        const float score = sycl::reduce_over_group(
+            subgroup, partial, sycl::plus<float>()) * scale_log2;
+        if (lane == 0) {
+          route_score_ptr[
+              (batch_head * blocks + query_block) * blocks + key_block] =
+                  score;
+        }
+      }
+    });
+
+  }
 
   submit(queue, batch * heads, [=](sycl::nd_item<1> item) {
     const int64_t batch_head = item.get_group_linear_id();
@@ -215,6 +294,90 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare(
     }
   });
 
+  if (topk_count >= 0) {
+    int64_t padded_blocks = 1;
+    while (padded_blocks < blocks) {
+      padded_blocks *= 2;
+    }
+    const auto local_memory =
+        queue.get_device().get_info<sycl::info::device::local_mem_size>();
+    TORCH_CHECK(
+        padded_blocks * static_cast<int64_t>(sizeof(float)) <=
+            static_cast<int64_t>(local_memory),
+        "top-k Sol-Attn block count exceeds XPU local-memory capacity");
+
+    queue.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> sorted_scores(
+          sycl::range<1>(static_cast<size_t>(padded_blocks)), cgh);
+      cgh.parallel_for<TopKThresholdKernel>(
+          sycl::nd_range<1>(
+              sycl::range<1>(
+                  static_cast<size_t>(summary_groups * kWorkGroup)),
+              sycl::range<1>(static_cast<size_t>(kWorkGroup))),
+          [=](sycl::nd_item<1> item) {
+            const int64_t group = item.get_group_linear_id();
+            const int64_t lane = item.get_local_linear_id();
+            const int64_t query_block = group % blocks;
+            const int64_t batch_head = group / blocks;
+            const int64_t row_offset =
+                (batch_head * blocks + query_block) * blocks;
+
+            for (int64_t index = lane; index < padded_blocks;
+                 index += kWorkGroup) {
+              sorted_scores[index] =
+                  index < blocks &&
+                      !(index >= sink_start && index < sink_end)
+                  ? route_score_ptr[row_offset + index]
+                  : -std::numeric_limits<float>::infinity();
+            }
+            sycl::group_barrier(item.get_group());
+
+            for (int64_t width = 2; width <= padded_blocks; width *= 2) {
+              for (int64_t stride = width / 2; stride > 0; stride /= 2) {
+                for (int64_t index = lane; index < padded_blocks;
+                     index += kWorkGroup) {
+                  const int64_t peer = index ^ stride;
+                  if (peer <= index) {
+                    continue;
+                  }
+                  const float left = sorted_scores[index];
+                  const float right = sorted_scores[peer];
+                  const bool descending = (index & width) == 0;
+                  const bool swap = descending ? left < right : left > right;
+                  if (swap) {
+                    sorted_scores[index] = right;
+                    sorted_scores[peer] = left;
+                  }
+                }
+                sycl::group_barrier(item.get_group());
+              }
+            }
+
+            if (lane == 0 &&
+                !(query_block >= sink_q_start && query_block < sink_q_end)) {
+              float threshold = topk_count == 0
+                  ? std::numeric_limits<float>::infinity()
+                  : sorted_scores[topk_count - 1];
+              threshold_ptr[batch_head * blocks + query_block] = threshold;
+            }
+          });
+    });
+
+#if SOL_ATTN_INLINE_ROUTE
+    const int64_t route_elements = summary_groups * blocks;
+    const int64_t route_groups =
+        (route_elements + kWorkGroup - 1) / kWorkGroup;
+    submit(queue, route_groups, [=](sycl::nd_item<1> item) {
+      const int64_t index = item.get_global_linear_id();
+      if (index < route_elements) {
+        const int64_t query_row = index / blocks;
+        topk_route_ptr[index] = static_cast<uint8_t>(
+            route_score_ptr[index] >= threshold_ptr[query_row]);
+      }
+    });
+#endif
+  }
+
 #if !SOL_ATTN_INLINE_ROUTE
   submit(queue, summary_groups, [=](sycl::nd_item<1> item) {
     const int64_t group = item.get_group_linear_id();
@@ -238,7 +401,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare(
             : key_block - query_block;
         const bool key_sink = key_block >= sink_start && key_block < sink_end;
         const bool exact = query_sink || key_sink || distance <= 1 ||
-            route_score > threshold;
+            (topk_count >= 0 ? route_score >= threshold
+                             : route_score > threshold);
         route_ptr[(batch_head * blocks + query_block) * blocks + key_block] =
             static_cast<uint8_t>(exact);
       }
@@ -247,9 +411,45 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare(
 #endif
 
 #if SOL_ATTN_INLINE_ROUTE
-  return {k_centroids, v_means, q_centroids, thresholds, key_sinks};
+  return {
+      k_centroids,
+      v_means,
+      q_centroids,
+      thresholds,
+      key_sinks,
+      topk_routes};
 #else
   return {k_centroids, v_means, routes};
+#endif
+}
+
+#if SOL_ATTN_INLINE_ROUTE
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> prepare(
+#else
+std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare(
+#endif
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    double scale_value,
+    double tau_value,
+    int64_t sink_start,
+    int64_t sink_end,
+    int64_t sink_q_start,
+    int64_t sink_q_end) {
+  auto block_len = at::empty({0}, q.options().dtype(at::kInt));
+  auto prepared = prepare_with_controls(
+      q, k, v, scale_value, tau_value, sink_start, sink_end,
+      sink_q_start, sink_q_end, -1, block_len);
+#if SOL_ATTN_INLINE_ROUTE
+  return {
+      std::get<0>(prepared),
+      std::get<1>(prepared),
+      std::get<2>(prepared),
+      std::get<3>(prepared),
+      std::get<4>(prepared)};
+#else
+  return prepared;
 #endif
 }
 
@@ -350,10 +550,20 @@ TORCH_LIBRARY_FRAGMENT(omni_xpu_sol_attn, m) {
       "prepare(Tensor q, Tensor k, Tensor v, float scale, float tau, "
       "int sink_start, int sink_end, int sink_q_start, int sink_q_end) "
       "-> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+  m.def(
+      "prepare_with_controls(Tensor q, Tensor k, Tensor v, float scale, "
+      "float tau, int sink_start, int sink_end, int sink_q_start, "
+      "int sink_q_end, int topk_count, Tensor block_len) "
+      "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
 #else
   m.def(
       "prepare(Tensor q, Tensor k, Tensor v, float scale, float tau, "
       "int sink_start, int sink_end, int sink_q_start, int sink_q_end) "
+      "-> (Tensor, Tensor, Tensor)");
+  m.def(
+      "prepare_with_controls(Tensor q, Tensor k, Tensor v, float scale, "
+      "float tau, int sink_start, int sink_end, int sink_q_start, "
+      "int sink_q_end, int topk_count, Tensor block_len) "
       "-> (Tensor, Tensor, Tensor)");
 #endif
   m.def(
@@ -363,5 +573,8 @@ TORCH_LIBRARY_FRAGMENT(omni_xpu_sol_attn, m) {
 
 TORCH_LIBRARY_IMPL(omni_xpu_sol_attn, XPU, m) {
   m.impl("prepare", &omni_xpu_sol_attn::prepare);
+  m.impl(
+      "prepare_with_controls",
+      &omni_xpu_sol_attn::prepare_with_controls);
   m.impl("materialize_routes", &omni_xpu_sol_attn::materialize_routes);
 }

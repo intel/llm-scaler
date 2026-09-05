@@ -1775,6 +1775,9 @@ class TestXPUNativeInt8:
 
     def test_cache_hit_reuses_primitive(self, device, seed):
         """Repeated identical shapes hit the oneDNN primitive cache."""
+        if device.type != "xpu":
+            pytest.skip("oneDNN primitive cache requires native XPU execution")
+
         from omni_xpu_kernel import int8
 
         int8.int8_cache_clear()
@@ -1796,6 +1799,9 @@ class TestXPUNativeInt8:
 
     def test_cache_miss_on_shape_change(self, device, seed):
         """Different GEMM shapes create separate cache entries."""
+        if device.type != "xpu":
+            pytest.skip("oneDNN primitive cache requires native XPU execution")
+
         from omni_xpu_kernel import int8
 
         int8.int8_cache_clear()

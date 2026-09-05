@@ -106,7 +106,8 @@ template <
     int SubgroupLayoutQOverride = 0,
     int MmaKOverride = 0,
     int VTileOverride = 0,
-    int HeadDimOverride = 0>
+    int HeadDimOverride = 0,
+    int KvTileOverride = 0>
 struct D128TileKernel {
   using PlatformConfig = cute_fmha_config::ActiveConfig;
   static constexpr int QTile =
@@ -128,7 +129,8 @@ struct D128TileKernel {
   // K-dim match and tripped the gemm.hpp static_assert.)
   static constexpr int KvTile = 64;
 #else
-  static constexpr int KvTile = PlatformConfig::KV_TILE;
+  static constexpr int KvTile =
+      KvTileOverride > 0 ? KvTileOverride : PlatformConfig::KV_TILE;
 #endif
   using ShapeQK = Shape<
       Int<QTile>, Int<KvTile>, Int<MmaK>>;
@@ -206,7 +208,8 @@ template <
     int SubgroupLayoutQOverride = 0,
     int MmaKOverride = 0,
     int VTileOverride = 0,
-    int HeadDimOverride = 0>
+    int HeadDimOverride = 0,
+    int KvTileOverride = 0>
 void run_d128_tile(
     const void* q_ptr, const void* k_ptr, const void* v_ptr, void* o_ptr,
     int B, int H, int Lq, int Lkv, int D, float scale,
@@ -223,7 +226,8 @@ void run_d128_tile(
       SubgroupLayoutQOverride,
       MmaKOverride,
       VTileOverride,
-      HeadDimOverride>;
+      HeadDimOverride,
+      KvTileOverride>;
   using K    = typename KT::Kernel;
   using PS   = typename KT::ProblemShapeType;
 
@@ -576,6 +580,71 @@ at::Tensor sdp_minimax_h3_vae_d64(
   at::Tensor output =
       at::empty({B, L, H, D}, q.options()).permute({0, 2, 1, 3});
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+  // Only the measured E210/E211 S1797 contract selects KV64 by default. The
+  // physical-B580 selector exposes the same value for attributable A/B only.
+  // An unforced physical B580 retains KV32 but uses its independently validated
+  // Q128/SG8 geometry. Every shorter legal tile and every B50/B70/generic BMG
+  // device retains the shipped Q256/SG16/KV32 instance.
+  if (L == 1797) {
+    auto& queue =
+        c10::xpu::getCurrentXPUStream(q.device().index()).queue();
+    const auto selection =
+        omni_xpu::device::get_bmg_selection_unwarned(queue);
+    if (selection.b580_policy_candidate ==
+        omni_xpu::device::B580PolicyCandidate::
+            h3_vae_d64_s1797_kv_tile) {
+      run_d128_tile<
+          cutlass::half_t,
+          0,
+          0,
+          0,
+          0,
+          0,
+          64,
+          omni_xpu::device::B580H3VaeD64S1797CandidatePolicy::
+              h3_vae_d64_s1797_kv_tile>(
+          q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(), B, H, L,
+          L, D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+          k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+          output.stride(2), output.stride(1), output.stride(0));
+      return output;
+    }
+    if (selection.physical_sku == omni_xpu::device::BmgSku::b580 &&
+        !selection.forced) {
+      run_d128_tile<
+          cutlass::half_t,
+          0,
+          128,
+          8,
+          0,
+          0,
+          64,
+          omni_xpu::device::B580KernelPolicy::
+              h3_vae_d64_s1797_kv_tile>(
+          q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(), B, H, L,
+          L, D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+          k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+          output.stride(2), output.stride(1), output.stride(0));
+      return output;
+    }
+    if (selection.kernel_profile ==
+        omni_xpu::device::BmgKernelProfile::b60) {
+      run_d128_tile<
+          cutlass::half_t,
+          0,
+          0,
+          0,
+          0,
+          0,
+          64,
+          omni_xpu::device::B60KernelPolicy::h3_vae_d64_s1797_kv_tile>(
+          q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(), B, H, L,
+          L, D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+          k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+          output.stride(2), output.stride(1), output.stride(0));
+      return output;
+    }
+  }
   run_d128_tile<cutlass::half_t, 0, 0, 0, 0, 0, 64>(
       q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(), B, H, L, L,
       D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
@@ -615,10 +684,49 @@ at::Tensor sdp_bhld_d120(
 #if defined(OMNI_XPU_ARCH_BMG)
     auto& queue =
         c10::xpu::getCurrentXPUStream(q.device().index()).queue();
+    // The public Python wrapper asks the core _C extension to emit the one-shot
+    // policy warning. This sidecar only selects a profile, avoiding one warning
+    // per DSO when both native components are used in the same process.
+    const auto selection =
+        omni_xpu::device::get_bmg_selection_unwarned(queue);
     const bool use_b60 =
-        omni_xpu::device::use_b60_kernel_profile(queue);
+        selection.kernel_profile == omni_xpu::device::BmgKernelProfile::b60;
+    const bool use_b580 =
+        selection.kernel_profile == omni_xpu::device::BmgKernelProfile::b580;
+    const bool use_b580_candidate =
+        selection.b580_policy_candidate ==
+        omni_xpu::device::B580PolicyCandidate::d120_l4205_v_tile;
     // B60's L4205 workflow benefits from a 64-wide V tile. B70 and
     // unrecognized BMG IDs keep the shipped V32 specialization.
+    if (use_b580_candidate && L == 4205) {
+      run_d128_tile<
+          cutlass::half_t,
+          1,
+          0,
+          0,
+          0,
+          omni_xpu::device::B580D120L4205CandidatePolicy::
+              d120_l4205_v_tile>(
+          q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(), B, H, L, L,
+          D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+          k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+          o.stride(2), o.stride(1), o.stride(0));
+      return o;
+    }
+    if (use_b580 && L == 4205) {
+      run_d128_tile<
+          cutlass::half_t,
+          1,
+          0,
+          0,
+          0,
+          omni_xpu::device::B580KernelPolicy::d120_l4205_v_tile>(
+          q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(), B, H, L, L,
+          D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+          k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+          o.stride(2), o.stride(1), o.stride(0));
+      return o;
+    }
     if (use_b60 && L == 4205) {
       run_d128_tile<
           cutlass::half_t,

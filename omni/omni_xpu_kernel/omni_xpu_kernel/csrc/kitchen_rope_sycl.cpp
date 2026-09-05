@@ -9,6 +9,7 @@
 #include "bmg_kernel_policy.h"
 #include "device_utils.h"
 #endif
+#include "kernel_tuning_overrides.h"
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -18,26 +19,6 @@ namespace omni_xpu {
 namespace rotary {
 
 namespace {
-
-#ifndef OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE
-#if defined(OMNI_XPU_ARCH_PTL_H)
-#define OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE 1
-#elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE 1
-#else
-#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
-#endif
-#endif
-
-#ifndef OMNI_KITCHEN_ROPE_PAIR_WG_SIZE
-#if defined(OMNI_XPU_ARCH_PTL_H)
-#define OMNI_KITCHEN_ROPE_PAIR_WG_SIZE 128
-#elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_KITCHEN_ROPE_PAIR_WG_SIZE 32
-#else
-#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
-#endif
-#endif
 
 bool broadcastable_dim(int64_t source, int64_t target, bool allow_longer) {
     return source == 1 || source == target || (allow_longer && source >= target);
@@ -706,7 +687,26 @@ torch::Tensor apply_kitchen_rope1_fast(
     auto unused = torch::Tensor();
 #if defined(OMNI_XPU_ARCH_BMG)
     auto& queue = utils::get_queue(x.device());
-    if (device::use_b60_kernel_profile(queue) &&
+    const auto selection = device::get_bmg_selection(queue);
+    if (selection.b580_policy_candidate ==
+            device::B580PolicyCandidate::kitchen_rope &&
+        b60_exact_row_supported(x, freqs, 4352)) {
+        launch_b60_exact_row<
+            4352,
+            false,
+            device::B580KitchenRopeCandidatePolicy::
+                kitchen_rope_pairs_per_work_item,
+            device::B580KitchenRopeCandidatePolicy::
+                kitchen_rope_work_group_size>(
+                x,
+                unused,
+                freqs,
+                output,
+                unused,
+                split_half);
+        return output;
+    }
+    if (selection.kernel_profile == device::BmgKernelProfile::b60 &&
         b60_exact_row_supported(x, freqs, 4352)) {
         launch_b60_exact_row<
             4352,
@@ -748,7 +748,27 @@ std::tuple<torch::Tensor, torch::Tensor> apply_kitchen_rope_fast(
     auto out_k = torch::empty_like(xk);
 #if defined(OMNI_XPU_ARCH_BMG)
     auto& queue = utils::get_queue(xq.device());
-    if (device::use_b60_kernel_profile(queue) &&
+    const auto selection = device::get_bmg_selection(queue);
+    if (selection.b580_policy_candidate ==
+            device::B580PolicyCandidate::kitchen_rope &&
+        b60_exact_row_supported(xq, freqs, 4096) &&
+        b60_exact_row_supported(xk, freqs, 4096)) {
+        launch_b60_exact_row<
+            4096,
+            true,
+            device::B580KitchenRopeCandidatePolicy::
+                kitchen_rope_pairs_per_work_item,
+            device::B580KitchenRopeCandidatePolicy::
+                kitchen_rope_work_group_size>(
+                xq,
+                xk,
+                freqs,
+                out_q,
+                out_k,
+                split_half);
+        return {out_q, out_k};
+    }
+    if (selection.kernel_profile == device::BmgKernelProfile::b60 &&
         b60_exact_row_supported(xq, freqs, 4096) &&
         b60_exact_row_supported(xk, freqs, 4096)) {
         launch_b60_exact_row<

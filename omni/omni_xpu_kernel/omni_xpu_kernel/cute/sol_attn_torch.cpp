@@ -34,6 +34,7 @@
 
 #include "sol_attn_config.h"
 #include "sol_attn_mainloop.hpp"
+#include "../csrc/device_utils.h"
 
 namespace omni_xpu_sol_attn::cute_backend {
 
@@ -49,6 +50,18 @@ using namespace cute;
 
 #ifndef SOL_ATTN_GRF_SIZE
 #define SOL_ATTN_GRF_SIZE 256
+#endif
+
+#ifndef SOL_ATTN_B580_Q_TILE
+#define SOL_ATTN_B580_Q_TILE 128
+#endif
+
+#ifndef SOL_ATTN_B580_SUBGROUP_LAYOUT_Q
+#define SOL_ATTN_B580_SUBGROUP_LAYOUT_Q 16
+#endif
+
+#ifndef SOL_ATTN_B580_GRF_SIZE
+#define SOL_ATTN_B580_GRF_SIZE 256
 #endif
 
 #ifndef SOL_ATTN_NESTED_EXACT
@@ -187,22 +200,40 @@ struct SolPairedQ256TileScheduler {
 };
 #endif
 
+template <int QTile_, int SubgroupLayoutQ_, int GrfSize_>
+struct SolTilePolicy {
+  static constexpr int QTile = QTile_;
+  static constexpr int SubgroupLayoutQ = SubgroupLayoutQ_;
+  static constexpr int GrfSize = GrfSize_;
+};
+
+using SolConfiguredTilePolicy = SolTilePolicy<
+    SOL_ATTN_Q_TILE,
+    SOL_ATTN_SUBGROUP_LAYOUT_Q,
+    SOL_ATTN_GRF_SIZE>;
+using SolB580TilePolicy = SolTilePolicy<
+    SOL_ATTN_B580_Q_TILE,
+    SOL_ATTN_B580_SUBGROUP_LAYOUT_Q,
+    SOL_ATTN_B580_GRF_SIZE>;
+
 template <
     typename Element,
+    typename TilePolicy,
     bool CacheableExactKV = (SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS != 0),
     bool ParallelSharedRoute =
         (SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE != 0),
     bool CrossQueryRouteColumns =
-        (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0)>
+        (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0),
+    bool ControlAware = true>
 struct SolKernel {
-  static constexpr int QTile = SOL_ATTN_Q_TILE;
+  static constexpr int QTile = TilePolicy::QTile;
   static constexpr int KvTile = 64;
   static constexpr int VTile = 32;
   static constexpr int MmaK = 16;
   static constexpr int HeadDim = 128;
-  static constexpr int SubgroupLayoutQ = SOL_ATTN_SUBGROUP_LAYOUT_Q;
+  static constexpr int SubgroupLayoutQ = TilePolicy::SubgroupLayoutQ;
   static constexpr int PipelineStages = 1;
-  static constexpr int GrfSize = SOL_ATTN_GRF_SIZE;
+  static constexpr int GrfSize = TilePolicy::GrfSize;
 
   static_assert(QTile % 64 == 0,
                 "Sol-Attn Q tile must contain whole Q64 route blocks");
@@ -255,7 +286,8 @@ struct SolKernel {
       DenseMainloop,
       CacheableExactKV,
       ParallelSharedRoute,
-      CrossQueryRouteColumns>;
+      CrossQueryRouteColumns,
+      ControlAware>;
   using CollectiveEpilogue = cutlass::fmha::collective::FMHAFwdEpilogue<
       CollectiveMainloop, ShapeOutput, TensorO, void>;
   using ProblemShape = cutlass::fmha::kernel::FMHAProblemShape<false>;
@@ -280,10 +312,12 @@ struct SolKernel {
 
 template <
     typename Element,
+    typename TilePolicy,
     bool CacheableExactKV,
     bool ParallelSharedRoute,
     bool CrossQueryRouteColumns,
-    bool ParentTag = false>
+    bool ParentTag = false,
+    bool ControlAware = true>
 void run(
     const at::Tensor& q,
     const at::Tensor& k,
@@ -294,17 +328,31 @@ void run(
     const at::Tensor& q_centroids,
     const at::Tensor& thresholds,
     const at::Tensor& key_sinks,
+    const at::Tensor& topk_routes,
 #else
     const at::Tensor& routes,
 #endif
+    const at::Tensor& key_bias,
+    const at::Tensor& block_len,
     at::Tensor& output,
-    float scale) {
+    float scale,
+    bool tail,
+    bool route_inclusive) {
   using KT = SolKernel<
       Element,
+      TilePolicy,
       CacheableExactKV,
       ParallelSharedRoute,
-      CrossQueryRouteColumns>;
+      CrossQueryRouteColumns,
+      ControlAware>;
   using K = typename KT::Kernel;
+
+  if constexpr (!ControlAware) {
+    TORCH_INTERNAL_ASSERT(
+        key_bias.numel() == 0 && block_len.numel() == 0 && tail &&
+        !route_inclusive,
+        "Sol-Attn no-controls mainloop requires the legacy/default contract");
+  }
 
   const int B = checked_int(q.size(0), "batch");
   const int T = checked_int(q.size(1), "sequence length");
@@ -366,10 +414,15 @@ void run(
       q_centroids.data_ptr<float>(),
       thresholds.data_ptr<float>(),
       key_sinks.data_ptr<uint8_t>(),
+      route_inclusive ? topk_routes.data_ptr<uint8_t>() : nullptr,
 #else
       routes.data_ptr<uint8_t>(),
 #endif
       static_cast<const Element*>(k.data_ptr()),
+      key_bias.numel() == 0 ? nullptr : key_bias.data_ptr<float>(),
+      block_len.numel() == 0 ? nullptr : block_len.data_ptr<int32_t>(),
+      tail,
+      route_inclusive,
       T,
       H,
       blocks,
@@ -390,6 +443,7 @@ void run(
 }
 
 template <
+    typename TilePolicy,
     bool CacheableExactKV,
     bool ParallelSharedRoute,
     bool CrossQueryRouteColumns,
@@ -404,10 +458,15 @@ at::Tensor forward_cute_impl(
     const at::Tensor& q_centroids,
     const at::Tensor& thresholds,
     const at::Tensor& key_sinks,
+    const at::Tensor& topk_routes,
 #else
     const at::Tensor& routes,
 #endif
-    double scale_value) {
+    const at::Tensor& key_bias,
+    const at::Tensor& block_len,
+    double scale_value,
+    bool tail,
+    bool route_inclusive) {
   TORCH_CHECK(q.device().is_xpu() && k.device() == q.device() && v.device() == q.device(),
               "Sol-Attn CUTE requires Q/K/V on one XPU device");
   TORCH_CHECK(q.dim() == 4 && q.sizes() == k.sizes() && q.sizes() == v.sizes(),
@@ -426,11 +485,27 @@ at::Tensor forward_cute_impl(
   TORCH_CHECK(k_centroids.device() == q.device() && v_means.device() == q.device()
 #if SOL_ATTN_INLINE_ROUTE
                   && q_centroids.device() == q.device() &&
-                  thresholds.device() == q.device() && key_sinks.device() == q.device(),
+                  thresholds.device() == q.device() &&
+                  key_sinks.device() == q.device() &&
+                  topk_routes.device() == q.device(),
 #else
                   && routes.device() == q.device(),
 #endif
               "Sol-Attn summaries/routes must be on the Q device");
+  TORCH_CHECK(
+      key_bias.device() == q.device() &&
+          key_bias.scalar_type() == at::kFloat &&
+          key_bias.is_contiguous() &&
+          (key_bias.numel() == 0 ||
+           key_bias.sizes() == at::IntArrayRef({q.size(0), q.size(1)})),
+      "Sol-Attn key-bias contract mismatch");
+  TORCH_CHECK(
+      block_len.device() == q.device() &&
+          block_len.scalar_type() == at::kInt &&
+          block_len.is_contiguous() &&
+          (block_len.numel() == 0 ||
+           (block_len.dim() == 1 && block_len.numel() == blocks)),
+      "Sol-Attn block-length contract mismatch");
   TORCH_CHECK(k_centroids.scalar_type() == q.scalar_type() &&
                   v_means.scalar_type() == q.scalar_type() &&
                   k_centroids.sizes() == at::IntArrayRef(
@@ -452,6 +527,14 @@ at::Tensor forward_cute_impl(
                   key_sinks.is_contiguous() &&
                   key_sinks.sizes() == thresholds.sizes(),
               "Sol-Attn key-sink contract mismatch");
+  TORCH_CHECK(
+      topk_routes.scalar_type() == at::kByte &&
+          topk_routes.is_contiguous() &&
+          (route_inclusive
+               ? topk_routes.sizes() == at::IntArrayRef(
+                     {q.size(0), q.size(2), blocks, blocks})
+               : topk_routes.numel() == 0),
+      "Sol-Attn top-k route contract mismatch");
 #else
   TORCH_CHECK(routes.scalar_type() == at::kByte && routes.is_contiguous() &&
                   routes.sizes() == at::IntArrayRef(
@@ -459,21 +542,112 @@ at::Tensor forward_cute_impl(
               "Sol-Attn route contract mismatch");
 #endif
   auto output = at::empty(q.sizes(), q.options());
-  run<
-      cutlass::bfloat16_t,
-      CacheableExactKV,
-      ParallelSharedRoute,
-      CrossQueryRouteColumns,
-      ParentTag>(
+  const bool has_controls =
+      key_bias.numel() != 0 || block_len.numel() != 0 || !tail ||
+      route_inclusive;
+  if (has_controls) {
+    run<
+        cutlass::bfloat16_t,
+        TilePolicy,
+        CacheableExactKV,
+        ParallelSharedRoute,
+        CrossQueryRouteColumns,
+        ParentTag,
+        true>(
+        q, k, v, k_centroids, v_means,
+#if SOL_ATTN_INLINE_ROUTE
+        q_centroids, thresholds, key_sinks, topk_routes,
+#else
+        routes,
+#endif
+        key_bias,
+        block_len,
+        output,
+        static_cast<float>(scale_value),
+        tail,
+        route_inclusive);
+  } else {
+    run<
+        cutlass::bfloat16_t,
+        TilePolicy,
+        CacheableExactKV,
+        ParallelSharedRoute,
+        CrossQueryRouteColumns,
+        ParentTag,
+        false>(
+        q, k, v, k_centroids, v_means,
+#if SOL_ATTN_INLINE_ROUTE
+        q_centroids, thresholds, key_sinks, topk_routes,
+#else
+        routes,
+#endif
+        key_bias,
+        block_len,
+        output,
+        static_cast<float>(scale_value),
+        tail,
+        route_inclusive);
+  }
+  return output;
+}
+
+bool use_b580_tile_policy(const at::Tensor& q) {
+  TORCH_CHECK(q.device().is_xpu(),
+              "Sol-Attn CUTE requires Q on an XPU device");
+  auto& queue = c10::xpu::getCurrentXPUStream(q.device().index()).queue();
+  const auto selection =
+      omni_xpu::device::get_bmg_selection_unwarned(queue);
+  return selection.physical_sku == omni_xpu::device::BmgSku::b580 &&
+      !selection.forced;
+}
+
+at::Tensor forward_cute_with_controls(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& k_centroids,
+    const at::Tensor& v_means,
+#if SOL_ATTN_INLINE_ROUTE
+    const at::Tensor& q_centroids,
+    const at::Tensor& thresholds,
+    const at::Tensor& key_sinks,
+    const at::Tensor& topk_routes,
+#else
+    const at::Tensor& routes,
+#endif
+    const at::Tensor& key_bias,
+    const at::Tensor& block_len,
+    double scale_value,
+    bool tail,
+    bool route_inclusive) {
+  if (use_b580_tile_policy(q)) {
+    return forward_cute_impl<
+        SolB580TilePolicy,
+        (SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS != 0),
+        (SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE != 0),
+        (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0),
+        false>(
+        q, k, v, k_centroids, v_means,
+#if SOL_ATTN_INLINE_ROUTE
+        q_centroids, thresholds, key_sinks, topk_routes,
+#else
+        routes,
+#endif
+        key_bias, block_len, scale_value, tail, route_inclusive);
+  }
+  return forward_cute_impl<
+      SolConfiguredTilePolicy,
+      (SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS != 0),
+      (SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE != 0),
+      (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0),
+      false>(
       q, k, v, k_centroids, v_means,
 #if SOL_ATTN_INLINE_ROUTE
-      q_centroids, thresholds, key_sinks,
+      q_centroids, thresholds, key_sinks, topk_routes,
 #else
       routes,
 #endif
-      output,
-      static_cast<float>(scale_value));
-  return output;
+      key_bias, block_len, scale_value, tail, route_inclusive);
 }
 
 at::Tensor forward_cute(
@@ -490,21 +664,70 @@ at::Tensor forward_cute(
     const at::Tensor& routes,
 #endif
     double scale_value) {
-  return forward_cute_impl<
-      (SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS != 0),
-      (SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE != 0),
-      (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0),
-      false>(
-      q, k, v, k_centroids, v_means,
+  auto key_bias = at::empty({0}, q.options().dtype(at::kFloat));
+  auto block_len = at::empty({0}, q.options().dtype(at::kInt));
 #if SOL_ATTN_INLINE_ROUTE
-      q_centroids, thresholds, key_sinks,
+  auto topk_routes = at::empty({0}, q.options().dtype(at::kByte));
+  return forward_cute_with_controls(
+      q, k, v, k_centroids, v_means, q_centroids, thresholds, key_sinks,
+      topk_routes, key_bias, block_len, scale_value, true, false);
 #else
-      routes,
+  return forward_cute_with_controls(
+      q, k, v, k_centroids, v_means, routes, key_bias, block_len,
+      scale_value, true, false);
 #endif
-      scale_value);
 }
 
 #if SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS
+at::Tensor forward_cute_parent_with_controls(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& k_centroids,
+    const at::Tensor& v_means,
+#if SOL_ATTN_INLINE_ROUTE
+    const at::Tensor& q_centroids,
+    const at::Tensor& thresholds,
+    const at::Tensor& key_sinks,
+    const at::Tensor& topk_routes,
+#else
+    const at::Tensor& routes,
+#endif
+    const at::Tensor& key_bias,
+    const at::Tensor& block_len,
+    double scale_value,
+    bool tail,
+    bool route_inclusive) {
+  if (use_b580_tile_policy(q)) {
+    return forward_cute_impl<
+        SolB580TilePolicy,
+        false,
+        (SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE != 0),
+        (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0),
+        true>(
+        q, k, v, k_centroids, v_means,
+#if SOL_ATTN_INLINE_ROUTE
+        q_centroids, thresholds, key_sinks, topk_routes,
+#else
+        routes,
+#endif
+        key_bias, block_len, scale_value, tail, route_inclusive);
+  }
+  return forward_cute_impl<
+      SolConfiguredTilePolicy,
+      false,
+      (SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE != 0),
+      (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0),
+      true>(
+      q, k, v, k_centroids, v_means,
+#if SOL_ATTN_INLINE_ROUTE
+      q_centroids, thresholds, key_sinks, topk_routes,
+#else
+      routes,
+#endif
+      key_bias, block_len, scale_value, tail, route_inclusive);
+}
+
 at::Tensor forward_cute_parent(
     const at::Tensor& q,
     const at::Tensor& k,
@@ -519,22 +742,71 @@ at::Tensor forward_cute_parent(
     const at::Tensor& routes,
 #endif
     double scale_value) {
-  return forward_cute_impl<
-      false,
-      (SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE != 0),
-      (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0),
-      true>(
-      q, k, v, k_centroids, v_means,
+  auto key_bias = at::empty({0}, q.options().dtype(at::kFloat));
+  auto block_len = at::empty({0}, q.options().dtype(at::kInt));
 #if SOL_ATTN_INLINE_ROUTE
-      q_centroids, thresholds, key_sinks,
+  auto topk_routes = at::empty({0}, q.options().dtype(at::kByte));
+  return forward_cute_parent_with_controls(
+      q, k, v, k_centroids, v_means, q_centroids, thresholds, key_sinks,
+      topk_routes, key_bias, block_len, scale_value, true, false);
 #else
-      routes,
+  return forward_cute_parent_with_controls(
+      q, k, v, k_centroids, v_means, routes, key_bias, block_len,
+      scale_value, true, false);
 #endif
-      scale_value);
 }
 #endif
 
 #if SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE
+at::Tensor forward_cute_serial_route_parent_with_controls(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& k_centroids,
+    const at::Tensor& v_means,
+#if SOL_ATTN_INLINE_ROUTE
+    const at::Tensor& q_centroids,
+    const at::Tensor& thresholds,
+    const at::Tensor& key_sinks,
+    const at::Tensor& topk_routes,
+#else
+    const at::Tensor& routes,
+#endif
+    const at::Tensor& key_bias,
+    const at::Tensor& block_len,
+    double scale_value,
+    bool tail,
+    bool route_inclusive) {
+  if (use_b580_tile_policy(q)) {
+    return forward_cute_impl<
+        SolB580TilePolicy,
+        (SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS != 0),
+        false,
+        false,
+        true>(
+        q, k, v, k_centroids, v_means,
+#if SOL_ATTN_INLINE_ROUTE
+        q_centroids, thresholds, key_sinks, topk_routes,
+#else
+        routes,
+#endif
+        key_bias, block_len, scale_value, tail, route_inclusive);
+  }
+  return forward_cute_impl<
+      SolConfiguredTilePolicy,
+      (SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS != 0),
+      false,
+      false,
+      true>(
+      q, k, v, k_centroids, v_means,
+#if SOL_ATTN_INLINE_ROUTE
+      q_centroids, thresholds, key_sinks, topk_routes,
+#else
+      routes,
+#endif
+      key_bias, block_len, scale_value, tail, route_inclusive);
+}
+
 at::Tensor forward_cute_serial_route_parent(
     const at::Tensor& q,
     const at::Tensor& k,
@@ -549,18 +821,18 @@ at::Tensor forward_cute_serial_route_parent(
     const at::Tensor& routes,
 #endif
     double scale_value) {
-  return forward_cute_impl<
-      (SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS != 0),
-      false,
-      false,
-      true>(
-      q, k, v, k_centroids, v_means,
+  auto key_bias = at::empty({0}, q.options().dtype(at::kFloat));
+  auto block_len = at::empty({0}, q.options().dtype(at::kInt));
 #if SOL_ATTN_INLINE_ROUTE
-      q_centroids, thresholds, key_sinks,
+  auto topk_routes = at::empty({0}, q.options().dtype(at::kByte));
+  return forward_cute_serial_route_parent_with_controls(
+      q, k, v, k_centroids, v_means, q_centroids, thresholds, key_sinks,
+      topk_routes, key_bias, block_len, scale_value, true, false);
 #else
-      routes,
+  return forward_cute_serial_route_parent_with_controls(
+      q, k, v, k_centroids, v_means, routes, key_bias, block_len,
+      scale_value, true, false);
 #endif
-      scale_value);
 }
 #endif
 
@@ -572,46 +844,89 @@ TORCH_LIBRARY_FRAGMENT(omni_xpu_sol_attn, m) {
       "forward_cute(Tensor q, Tensor k, Tensor v, Tensor k_centroids, "
       "Tensor v_means, Tensor q_centroids, Tensor thresholds, "
       "Tensor key_sinks, float scale) -> Tensor");
+  m.def(
+      "forward_cute_with_controls(Tensor q, Tensor k, Tensor v, "
+      "Tensor k_centroids, Tensor v_means, Tensor q_centroids, "
+      "Tensor thresholds, Tensor key_sinks, Tensor topk_routes, "
+      "Tensor key_bias, Tensor block_len, float scale, bool tail, "
+      "bool route_inclusive) -> Tensor");
 #if SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS
   m.def(
       "forward_cute_parent(Tensor q, Tensor k, Tensor v, Tensor k_centroids, "
       "Tensor v_means, Tensor q_centroids, Tensor thresholds, "
       "Tensor key_sinks, float scale) -> Tensor");
+  m.def(
+      "forward_cute_parent_with_controls(Tensor q, Tensor k, Tensor v, "
+      "Tensor k_centroids, Tensor v_means, Tensor q_centroids, "
+      "Tensor thresholds, Tensor key_sinks, Tensor topk_routes, "
+      "Tensor key_bias, Tensor block_len, float scale, bool tail, "
+      "bool route_inclusive) -> Tensor");
 #endif
 #if SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE
   m.def(
       "forward_cute_serial_route_parent(Tensor q, Tensor k, Tensor v, "
       "Tensor k_centroids, Tensor v_means, Tensor q_centroids, "
       "Tensor thresholds, Tensor key_sinks, float scale) -> Tensor");
+  m.def(
+      "forward_cute_serial_route_parent_with_controls(Tensor q, Tensor k, "
+      "Tensor v, Tensor k_centroids, Tensor v_means, Tensor q_centroids, "
+      "Tensor thresholds, Tensor key_sinks, Tensor topk_routes, "
+      "Tensor key_bias, Tensor block_len, float scale, "
+      "bool tail, bool route_inclusive) -> Tensor");
 #endif
 #else
   m.def(
       "forward_cute(Tensor q, Tensor k, Tensor v, Tensor k_centroids, "
       "Tensor v_means, Tensor routes, float scale) -> Tensor");
+  m.def(
+      "forward_cute_with_controls(Tensor q, Tensor k, Tensor v, "
+      "Tensor k_centroids, Tensor v_means, Tensor routes, Tensor key_bias, "
+      "Tensor block_len, float scale, bool tail, "
+      "bool route_inclusive) -> Tensor");
 #if SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS
   m.def(
       "forward_cute_parent(Tensor q, Tensor k, Tensor v, Tensor k_centroids, "
       "Tensor v_means, Tensor routes, float scale) -> Tensor");
+  m.def(
+      "forward_cute_parent_with_controls(Tensor q, Tensor k, Tensor v, "
+      "Tensor k_centroids, Tensor v_means, Tensor routes, Tensor key_bias, "
+      "Tensor block_len, float scale, bool tail, "
+      "bool route_inclusive) -> Tensor");
 #endif
 #if SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE
   m.def(
       "forward_cute_serial_route_parent(Tensor q, Tensor k, Tensor v, "
       "Tensor k_centroids, Tensor v_means, Tensor routes, float scale) "
       "-> Tensor");
+  m.def(
+      "forward_cute_serial_route_parent_with_controls(Tensor q, Tensor k, "
+      "Tensor v, Tensor k_centroids, Tensor v_means, Tensor routes, "
+      "Tensor key_bias, Tensor block_len, float scale, "
+      "bool tail, bool route_inclusive) -> Tensor");
 #endif
 #endif
 }
 
 TORCH_LIBRARY_IMPL(omni_xpu_sol_attn, XPU, m) {
   m.impl("forward_cute", &omni_xpu_sol_attn::cute_backend::forward_cute);
+  m.impl(
+      "forward_cute_with_controls",
+      &omni_xpu_sol_attn::cute_backend::forward_cute_with_controls);
 #if SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS
   m.impl(
       "forward_cute_parent",
       &omni_xpu_sol_attn::cute_backend::forward_cute_parent);
+  m.impl(
+      "forward_cute_parent_with_controls",
+      &omni_xpu_sol_attn::cute_backend::forward_cute_parent_with_controls);
 #endif
 #if SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE
   m.impl(
       "forward_cute_serial_route_parent",
       &omni_xpu_sol_attn::cute_backend::forward_cute_serial_route_parent);
+  m.impl(
+      "forward_cute_serial_route_parent_with_controls",
+      &omni_xpu_sol_attn::cute_backend::
+          forward_cute_serial_route_parent_with_controls);
 #endif
 }

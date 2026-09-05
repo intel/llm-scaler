@@ -24,6 +24,7 @@
 #include "bmg_kernel_policy.h"
 #include "device_utils.h"
 #endif
+#include "kernel_tuning_overrides.h"
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -35,21 +36,6 @@ namespace xmx = sycl::ext::intel::esimd::xmx;
 
 namespace omni_xpu {
 namespace int8_ops {
-
-#ifndef OMNI_SILU_MUL_ELEMENTS_PER_WI
-#if defined(OMNI_XPU_ARCH_PTL_H)
-// PTL-H's math pipeline benefits from exposing each exp as an independent
-// work-item instead of serializing several transcendental operations.
-#define OMNI_SILU_MUL_ELEMENTS_PER_WI 1
-#elif defined(OMNI_XPU_ARCH_BMG)
-// BMG workflow shapes are also math-pipeline limited: exposing each exp as an
-// independent work-item is faster than serializing eight transcendental
-// operations while preserving byte-exact FP16/BF16 output.
-#define OMNI_SILU_MUL_ELEMENTS_PER_WI 1
-#else
-#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
-#endif
-#endif
 
 // ============================================================================
 // Kernel: Fused per-row INT8 quantization
@@ -174,6 +160,19 @@ void quantize_int8_rowwise_kernel(
 }
 
 #if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
+#if OMNI_ROWQ_VECTOR_WIDTH_OVERRIDE > 0
+#define OMNI_ROWQ_VECTOR_WIDTH(DEFAULT_VALUE) \
+    OMNI_ROWQ_VECTOR_WIDTH_OVERRIDE
+#else
+#define OMNI_ROWQ_VECTOR_WIDTH(DEFAULT_VALUE) DEFAULT_VALUE
+#endif
+#if OMNI_ROWQ_SUBGROUPS_PER_ROW_OVERRIDE > 0
+#define OMNI_ROWQ_SUBGROUPS_PER_ROW(DEFAULT_VALUE) \
+    OMNI_ROWQ_SUBGROUPS_PER_ROW_OVERRIDE
+#else
+#define OMNI_ROWQ_SUBGROUPS_PER_ROW(DEFAULT_VALUE) DEFAULT_VALUE
+#endif
+
 #if defined(OMNI_XPU_ARCH_PTL_H)
 // Large PTL BF16 ConvRot activations no longer remain cache-resident between
 // the generic kernel's two global-memory passes. One work-group therefore owns
@@ -183,9 +182,9 @@ struct RowwiseQuantizeLargePTLConfig {
     static constexpr int Columns = 10240;
     static constexpr int MinimumRows = 1024;
     static constexpr int SubgroupSize = 32;
-    static constexpr int SubgroupsPerRow = 24;
+    static constexpr int SubgroupsPerRow = OMNI_ROWQ_SUBGROUPS_PER_ROW(24);
     static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
-    static constexpr int VectorWidth = 16;
+    static constexpr int VectorWidth = OMNI_ROWQ_VECTOR_WIDTH(16);
 };
 
 // Krea2 Turbo INT8 at 1024x1024 produces BF16 [4192, 6144] activations. Eight
@@ -195,9 +194,9 @@ struct RowwiseQuantizeKrea2PTLConfig {
     static constexpr int Columns = 6144;
     static constexpr int Rows = 4192;
     static constexpr int SubgroupSize = 32;
-    static constexpr int SubgroupsPerRow = 8;
+    static constexpr int SubgroupsPerRow = OMNI_ROWQ_SUBGROUPS_PER_ROW(8);
     static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
-    static constexpr int VectorWidth = 8;
+    static constexpr int VectorWidth = OMNI_ROWQ_VECTOR_WIDTH(8);
 };
 
 // The Krea2 FFN down projection quantizes a much wider BF16 activation before
@@ -208,9 +207,9 @@ struct RowwiseQuantizeKrea2FFNDownPTLConfig {
     static constexpr int Columns = 16384;
     static constexpr int Rows = 4192;
     static constexpr int SubgroupSize = 32;
-    static constexpr int SubgroupsPerRow = 16;
+    static constexpr int SubgroupsPerRow = OMNI_ROWQ_SUBGROUPS_PER_ROW(16);
     static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
-    static constexpr int VectorWidth = 8;
+    static constexpr int VectorWidth = OMNI_ROWQ_VECTOR_WIDTH(8);
 };
 
 // Boogu Image Turbo at 1024x1024 uses FP16 activations with either the image
@@ -225,9 +224,9 @@ struct RowwiseQuantizeBooguHiddenPTLConfig {
     static constexpr int ImageRows = 4096;
     static constexpr int JointRows = 4205;
     static constexpr int SubgroupSize = 32;
-    static constexpr int SubgroupsPerRow = 20;
+    static constexpr int SubgroupsPerRow = OMNI_ROWQ_SUBGROUPS_PER_ROW(20);
     static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
-    static constexpr int VectorWidth = 16;
+    static constexpr int VectorWidth = OMNI_ROWQ_VECTOR_WIDTH(16);
 };
 
 struct RowwiseQuantizeBooguFFNDownPTLConfig {
@@ -235,9 +234,9 @@ struct RowwiseQuantizeBooguFFNDownPTLConfig {
     static constexpr int ImageRows = 4096;
     static constexpr int JointRows = 4205;
     static constexpr int SubgroupSize = 32;
-    static constexpr int SubgroupsPerRow = 20;
+    static constexpr int SubgroupsPerRow = OMNI_ROWQ_SUBGROUPS_PER_ROW(20);
     static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
-    static constexpr int VectorWidth = 16;
+    static constexpr int VectorWidth = OMNI_ROWQ_VECTOR_WIDTH(16);
 };
 #endif
 
@@ -260,18 +259,18 @@ struct RowwiseQuantizeH3HiddenBMGConfig {
     static constexpr int Columns = 5376;
     static constexpr int MinimumRows = 4096;
     static constexpr int SubgroupSize = 32;
-    static constexpr int SubgroupsPerRow = 12;
+    static constexpr int SubgroupsPerRow = OMNI_ROWQ_SUBGROUPS_PER_ROW(12);
     static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
-    static constexpr int VectorWidth = 8;
+    static constexpr int VectorWidth = OMNI_ROWQ_VECTOR_WIDTH(8);
 };
 
 struct RowwiseQuantizeH3FFNDownBMGConfig {
     static constexpr int Columns = 7168;
     static constexpr int MinimumRows = 4096;
     static constexpr int SubgroupSize = 32;
-    static constexpr int SubgroupsPerRow = 12;
+    static constexpr int SubgroupsPerRow = OMNI_ROWQ_SUBGROUPS_PER_ROW(12);
     static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
-    static constexpr int VectorWidth = 8;
+    static constexpr int VectorWidth = OMNI_ROWQ_VECTOR_WIDTH(8);
 };
 
 struct RowwiseQuantizeZImageHiddenBMGConfig {
@@ -279,9 +278,9 @@ struct RowwiseQuantizeZImageHiddenBMGConfig {
     static constexpr int ImageRows = 4096;
     static constexpr int JointRows = 4128;
     static constexpr int SubgroupSize = 32;
-    static constexpr int SubgroupsPerRow = 16;
+    static constexpr int SubgroupsPerRow = OMNI_ROWQ_SUBGROUPS_PER_ROW(16);
     static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
-    static constexpr int VectorWidth = 8;
+    static constexpr int VectorWidth = OMNI_ROWQ_VECTOR_WIDTH(8);
 };
 
 struct RowwiseQuantizeZImageBMGConfig {
@@ -289,27 +288,27 @@ struct RowwiseQuantizeZImageBMGConfig {
     static constexpr int ImageRows = 4096;
     static constexpr int JointRows = 4128;
     static constexpr int SubgroupSize = 32;
-    static constexpr int SubgroupsPerRow = 20;
+    static constexpr int SubgroupsPerRow = OMNI_ROWQ_SUBGROUPS_PER_ROW(20);
     static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
-    static constexpr int VectorWidth = 8;
+    static constexpr int VectorWidth = OMNI_ROWQ_VECTOR_WIDTH(8);
 };
 
 struct RowwiseQuantizeKrea2BMGConfig {
     static constexpr int Columns = 6144;
     static constexpr int Rows = 4192;
     static constexpr int SubgroupSize = 32;
-    static constexpr int SubgroupsPerRow = 12;
+    static constexpr int SubgroupsPerRow = OMNI_ROWQ_SUBGROUPS_PER_ROW(12);
     static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
-    static constexpr int VectorWidth = 8;
+    static constexpr int VectorWidth = OMNI_ROWQ_VECTOR_WIDTH(8);
 };
 
 struct RowwiseQuantizeKrea2FFNDownBMGConfig {
     static constexpr int Columns = 16384;
     static constexpr int Rows = 4192;
     static constexpr int SubgroupSize = 32;
-    static constexpr int SubgroupsPerRow = 32;
+    static constexpr int SubgroupsPerRow = OMNI_ROWQ_SUBGROUPS_PER_ROW(32);
     static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
-    static constexpr int VectorWidth = 8;
+    static constexpr int VectorWidth = OMNI_ROWQ_VECTOR_WIDTH(8);
 };
 
 // BMG was tuned independently for the same Boogu Image Turbo 1024x1024 FP16
@@ -321,9 +320,9 @@ struct RowwiseQuantizeBooguHiddenBMGConfig {
     static constexpr int ImageRows = 4096;
     static constexpr int JointRows = 4205;
     static constexpr int SubgroupSize = 32;
-    static constexpr int SubgroupsPerRow = 16;
+    static constexpr int SubgroupsPerRow = OMNI_ROWQ_SUBGROUPS_PER_ROW(16);
     static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
-    static constexpr int VectorWidth = 8;
+    static constexpr int VectorWidth = OMNI_ROWQ_VECTOR_WIDTH(8);
 };
 
 struct RowwiseQuantizeBooguFFNDownBMGConfig {
@@ -331,11 +330,14 @@ struct RowwiseQuantizeBooguFFNDownBMGConfig {
     static constexpr int ImageRows = 4096;
     static constexpr int JointRows = 4205;
     static constexpr int SubgroupSize = 32;
-    static constexpr int SubgroupsPerRow = 16;
+    static constexpr int SubgroupsPerRow = OMNI_ROWQ_SUBGROUPS_PER_ROW(16);
     static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
-    static constexpr int VectorWidth = 8;
+    static constexpr int VectorWidth = OMNI_ROWQ_VECTOR_WIDTH(8);
 };
 #endif
+
+#undef OMNI_ROWQ_VECTOR_WIDTH
+#undef OMNI_ROWQ_SUBGROUPS_PER_ROW
 
 // Retain the historical PTL kernel identity so existing PTL traces remain
 // comparable. BMG uses the same SLM algorithm with independently tuned config
@@ -358,6 +360,10 @@ void quantize_int8_rowwise_large_ptl_kernel(
     using InputVector = sycl::vec<InputT, Config::VectorWidth>;
     using OutputVector = sycl::vec<int8_t, Config::VectorWidth>;
     static_assert(Config::WorkgroupSize <= 1024);
+    static_assert(Config::SubgroupsPerRow > 0);
+    static_assert(Config::SubgroupsPerRow <= Config::SubgroupSize);
+    static_assert(Config::VectorWidth > 0);
+    static_assert(Config::Columns % Config::VectorWidth == 0);
 
     const sycl::range<1> local(Config::WorkgroupSize);
     const sycl::range<1> global(
@@ -1445,10 +1451,32 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_g16_bmg(
 ) {
     TORCH_CHECK(input.device().is_xpu(), "input must be on XPU");
     auto& queue = utils::get_queue(input.device());
-    if (device::use_b60_kernel_profile(queue)) {
+    const auto selection = device::get_bmg_selection(queue);
+    const auto kernel_profile = selection.kernel_profile;
+    if (selection.b580_policy_candidate ==
+            device::B580PolicyCandidate::convrot_g16) {
+        return quantize_int8_convrot_g16_bmg_policy<
+            device::B580ConvrotG16CandidatePolicy::
+                convrot_g16_groups_per_dpas,
+            device::B580ConvrotG16CandidatePolicy::
+                convrot_g16_work_items_per_row>(input);
+    }
+    if (kernel_profile == device::BmgKernelProfile::b580) {
+        return quantize_int8_convrot_g16_bmg_policy<
+            device::B580KernelPolicy::convrot_g16_groups_per_dpas,
+            device::B580KernelPolicy::convrot_g16_work_items_per_row>(
+                input);
+    }
+    if (kernel_profile == device::BmgKernelProfile::b60) {
         return quantize_int8_convrot_g16_bmg_policy<
             device::B60KernelPolicy::convrot_g16_groups_per_dpas,
             device::B60KernelPolicy::convrot_g16_work_items_per_row>(
+                input);
+    }
+    if (kernel_profile == device::BmgKernelProfile::generic_bmg) {
+        return quantize_int8_convrot_g16_bmg_policy<
+            device::GenericBmgKernelPolicy::convrot_g16_groups_per_dpas,
+            device::GenericBmgKernelPolicy::convrot_g16_work_items_per_row>(
                 input);
     }
     return quantize_int8_convrot_g16_bmg_policy<

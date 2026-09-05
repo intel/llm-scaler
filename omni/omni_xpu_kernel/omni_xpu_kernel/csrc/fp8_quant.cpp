@@ -4,6 +4,7 @@
 
 #include "bmg_kernel_policy.h"
 #include "device_utils.h"
+#include "kernel_tuning_overrides.h"
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -18,24 +19,6 @@ torch::Tensor dequantize_per_tensor_fused(
     torch::ScalarType out_dtype);
 
 namespace {
-
-#ifndef OMNI_FP8_QUANT_VEC
-#if defined(OMNI_XPU_ARCH_PTL_H)
-#define OMNI_FP8_QUANT_VEC 16
-#elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_FP8_QUANT_VEC 8
-#else
-#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
-#endif
-#endif
-
-#ifndef OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM
-#if defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM 6
-#else
-#define OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM 8
-#endif
-#endif
 
 double fp8_max(torch::ScalarType dtype) {
     if (dtype == torch::kFloat8_e4m3fn) return 448.0;
@@ -566,9 +549,18 @@ torch::Tensor stochastic_rounding(
     const double limit = fp8_max(out_dtype);
 #if defined(OMNI_XPU_ARCH_BMG)
     auto& queue = utils::get_queue(input.device());
-    const bool use_b60 = device::use_b60_kernel_profile(queue);
+    const auto selection = device::get_bmg_selection(queue);
+    const bool use_b60 =
+        selection.kernel_profile == device::BmgKernelProfile::b60;
+    const bool use_b580 =
+        selection.kernel_profile == device::BmgKernelProfile::b580;
+    const bool use_b580_candidate =
+        selection.b580_policy_candidate ==
+            device::B580PolicyCandidate::fp8_stochastic;
 #else
     const bool use_b60 = false;
+    const bool use_b580 = false;
+    const bool use_b580_candidate = false;
 #endif
 #define DISPATCH_STOCHASTIC_ELEMENTS(InputT, Elements)                     \
     do {                                                                   \
@@ -583,6 +575,15 @@ torch::Tensor stochastic_rounding(
     } while (false)
 #define DISPATCH_STOCHASTIC(InputT)                                        \
     do {                                                                   \
+        if (use_b580_candidate) {                                           \
+            DISPATCH_STOCHASTIC_ELEMENTS(                                  \
+                InputT, device::B580Fp8StochasticCandidatePolicy::         \
+                    fp8_stochastic_elements);                              \
+        }                                                                  \
+        if (use_b580) {                                                     \
+            DISPATCH_STOCHASTIC_ELEMENTS(                                  \
+                InputT, device::B580KernelPolicy::fp8_stochastic_elements);\
+        }                                                                  \
         if (use_b60) {                                                      \
             DISPATCH_STOCHASTIC_ELEMENTS(                                  \
                 InputT, device::B60KernelPolicy::fp8_stochastic_elements); \

@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 #include <sycl/sycl.hpp>
 
+#include "kernel_tuning_overrides.h"
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -9,16 +10,6 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 namespace omni_xpu {
 namespace int8_ops {
 namespace {
-
-#ifndef OMNI_INT8_TENSORWISE_VEC
-#if defined(OMNI_XPU_ARCH_PTL_H)
-#define OMNI_INT8_TENSORWISE_VEC 16
-#elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_INT8_TENSORWISE_VEC 8
-#else
-#error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
-#endif
-#endif
 
 template<typename InputT>
 void tensorwise_absmax_kernel(

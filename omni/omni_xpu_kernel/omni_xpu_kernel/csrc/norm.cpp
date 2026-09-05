@@ -8,6 +8,12 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 
+#include <algorithm>
+#include <cstdint>
+#include <vector>
+
+#include "device_utils.h"
+#include "kernel_tuning_overrides.h"
 #include "utils.h"
 
 using fp16 = sycl::half;
@@ -28,11 +34,16 @@ namespace norm {
 // platform-specific traces and AOT images remain unambiguous.
 struct RmsNormH120FP16Config {
     static constexpr int HiddenSize = 120;
+    static constexpr int NarrowBlockSize = 8;
+    static constexpr int NarrowBlocks = HiddenSize / NarrowBlockSize;
     static constexpr int WideBlockSize = 16;
     static constexpr int WideBlocks = 7;
     static constexpr int TailBlockSize = 8;
     static constexpr int TailOffset = WideBlockSize * WideBlocks;
 };
+static_assert(
+    OMNI_RMS_NORM_H120_MODE >= 0 && OMNI_RMS_NORM_H120_MODE <= 2,
+    "OMNI_RMS_NORM_H120_MODE must be 0, 1, or 2");
 
 #if defined(OMNI_XPU_ARCH_PTL_H)
 class RmsNormH120FP16PTLKernel;
@@ -67,6 +78,7 @@ void rms_norm_h120_fp16_kernel(
                 fp16* output_row =
                     output + static_cast<size_t>(row) * Config::HiddenSize;
                 simd<fp16, Config::HiddenSize> cached;
+#if OMNI_RMS_NORM_H120_MODE == 2
                 simd<float, Config::WideBlockSize> accumulator = 0;
 
 #pragma unroll
@@ -91,9 +103,44 @@ void rms_norm_h120_fp16_kernel(
                     sycl::ext::intel::esimd::detail::sum<
                         float, float, Config::TailBlockSize>(
                         tail_f32 * tail_f32);
+#elif OMNI_RMS_NORM_H120_MODE == 1
+                simd<float, Config::NarrowBlocks> partials;
+#pragma unroll
+                for (int block = 0; block < Config::NarrowBlocks; ++block) {
+                    simd<fp16, Config::NarrowBlockSize> values =
+                        block_load<fp16, Config::NarrowBlockSize>(
+                            input_row + block * Config::NarrowBlockSize);
+                    cached.template select<Config::NarrowBlockSize, 1>(
+                        block * Config::NarrowBlockSize) = values;
+                    simd<float, Config::NarrowBlockSize> values_f32 = values;
+                    partials[block] =
+                        sycl::ext::intel::esimd::detail::sum<
+                            float, float, Config::NarrowBlockSize>(
+                            values_f32 * values_f32);
+                }
+                const float sum_squares =
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::NarrowBlocks>(partials);
+#else
+                simd<float, Config::NarrowBlockSize> accumulator = 0;
+#pragma unroll
+                for (int block = 0; block < Config::NarrowBlocks; ++block) {
+                    simd<fp16, Config::NarrowBlockSize> values =
+                        block_load<fp16, Config::NarrowBlockSize>(
+                            input_row + block * Config::NarrowBlockSize);
+                    cached.template select<Config::NarrowBlockSize, 1>(
+                        block * Config::NarrowBlockSize) = values;
+                    simd<float, Config::NarrowBlockSize> values_f32 = values;
+                    accumulator += values_f32 * values_f32;
+                }
+                const float sum_squares =
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::NarrowBlockSize>(accumulator);
+#endif
                 const float scale = rsqrt(
                     sum_squares / Config::HiddenSize + eps);
 
+#if OMNI_RMS_NORM_H120_MODE == 2
 #pragma unroll
                 for (int block = 0; block < Config::WideBlocks; ++block) {
                     simd<float, Config::WideBlockSize> values =
@@ -117,6 +164,21 @@ void rms_norm_h120_fp16_kernel(
                     output_row + Config::TailOffset,
                     simd<fp16, Config::TailBlockSize>(
                         tail_values * scale * tail_weights));
+#else
+#pragma unroll
+                for (int block = 0; block < Config::NarrowBlocks; ++block) {
+                    simd<float, Config::NarrowBlockSize> values =
+                        cached.template select<Config::NarrowBlockSize, 1>(
+                            block * Config::NarrowBlockSize);
+                    simd<float, Config::NarrowBlockSize> weights =
+                        block_load<fp16, Config::NarrowBlockSize>(
+                            weight + block * Config::NarrowBlockSize);
+                    block_store<fp16, Config::NarrowBlockSize>(
+                        output_row + block * Config::NarrowBlockSize,
+                        simd<fp16, Config::NarrowBlockSize>(
+                            values * scale * weights));
+                }
+#endif
             });
     };
 #if defined(OMNI_XPU_ARCH_PTL_H)
@@ -137,7 +199,8 @@ void rms_norm_h120_fp16_kernel(
 // model-defined accumulation semantics.
 struct RmsNormH128PTLConfig {
     static constexpr int HiddenSize = 128;
-    static constexpr int BlockSize = 32;
+    static constexpr int BlockSize = OMNI_RMS_NORM_H128_BLOCK_SIZE;
+    static_assert(HiddenSize % BlockSize == 0);
     static constexpr int Blocks = HiddenSize / BlockSize;
     static constexpr int MinimumRows = 1024;
     static constexpr int PartialBytes =
@@ -409,7 +472,8 @@ void rms_norm_gate_residual_h3840_ptl_kernel(
 struct RmsNormH128BMGConfig {
     static constexpr int HiddenSize = 128;
     static constexpr int MinimumRows = 4096;
-    static constexpr int BlockSize = 64;
+    static constexpr int BlockSize = OMNI_RMS_NORM_H128_BLOCK_SIZE;
+    static_assert(HiddenSize % BlockSize == 0);
     static constexpr int Blocks = HiddenSize / BlockSize;
     static constexpr int PartialBytes =
         ((Blocks * static_cast<int>(sizeof(float)) + 15) / 16) * 16;
@@ -483,6 +547,260 @@ void rms_norm_h128_fp32_bmg_kernel(
             });
     };
     utils::submit_kernel(cgf, device, "rms_norm_h128_fp32_bmg");
+}
+
+// MiniMax H3 normalizes one complete packed stream and then applies one
+// scale/shift row to each ordered contiguous segment. Keep the generic H5376
+// RMSNorm reduction source-shaped: changing the SLM allocation or folding the
+// runtime block partition into constants can alter sparse BF16 output bits.
+struct H3SegmentedRmsModulationConfig {
+    static constexpr int HiddenSize = 5376;
+    static constexpr int BlockSize = 64;
+    static constexpr int GroupSize = 32;
+    static constexpr int MaxSegments = 8;
+};
+
+struct H3RmsModulationSegmentMap {
+    int32_t count;
+    int64_t starts[H3SegmentedRmsModulationConfig::MaxSegments];
+    int64_t stops[H3SegmentedRmsModulationConfig::MaxSegments];
+    int64_t modulation_rows[H3SegmentedRmsModulationConfig::MaxSegments];
+};
+
+H3RmsModulationSegmentMap make_h3_rms_modulation_segment_map(
+    int64_t input_rows,
+    int64_t modulation_table_rows,
+    const std::vector<int64_t>& starts,
+    const std::vector<int64_t>& stops,
+    const std::vector<int64_t>& modulation_rows
+) {
+    using Config = H3SegmentedRmsModulationConfig;
+    TORCH_CHECK(
+        !starts.empty() && starts.size() <= Config::MaxSegments &&
+            starts.size() == stops.size() &&
+            starts.size() == modulation_rows.size(),
+        "segments must contain 1..8 matched starts, stops, and modulation rows");
+    H3RmsModulationSegmentMap result{};
+    result.count = static_cast<int32_t>(starts.size());
+    int64_t previous_stop = 0;
+    for (int index = 0; index < result.count; ++index) {
+        TORCH_CHECK(
+            starts[index] == previous_stop && stops[index] > starts[index],
+            "segments must be ordered, nonempty, contiguous, and start at zero");
+        TORCH_CHECK(
+            modulation_rows[index] >= 0 &&
+                modulation_rows[index] < modulation_table_rows,
+            "segment modulation row is outside the scale/shift table");
+        result.starts[index] = starts[index];
+        result.stops[index] = stops[index];
+        result.modulation_rows[index] = modulation_rows[index];
+        previous_stop = stops[index];
+    }
+    TORCH_CHECK(
+        previous_stop == input_rows,
+        "segments must cover every input row");
+    return result;
+}
+
+inline int64_t h3_rms_modulation_row(
+    int64_t input_row,
+    const H3RmsModulationSegmentMap& segments
+) {
+    int64_t result = 0;
+#pragma unroll
+    for (int index = 0;
+         index < H3SegmentedRmsModulationConfig::MaxSegments;
+         ++index) {
+        if (index < segments.count && input_row >= segments.starts[index] &&
+            input_row < segments.stops[index]) {
+            result = segments.modulation_rows[index];
+        }
+    }
+    return result;
+}
+
+void rms_norm_segmented_modulation_kernel(
+    const bf16* weight,
+    const bf16* input,
+    const bf16* scale,
+    const bf16* shift,
+    bf16* output,
+    int64_t scale_row_stride,
+    int64_t shift_row_stride,
+    H3RmsModulationSegmentMap segments,
+    float eps,
+    int input_size,
+    int hidden_size,
+    const at::Device& device
+) {
+    using Config = H3SegmentedRmsModulationConfig;
+    const int nb = hidden_size / Config::BlockSize;
+    const int sub_nb = nb / Config::GroupSize;
+    const int rem_nb = nb % Config::GroupSize;
+    constexpr int slm_acc_align =
+        ((Config::GroupSize * static_cast<int>(sizeof(float)) + 15) / 16) * 16;
+    const int acc_offset = hidden_size * sizeof(bf16);
+    sycl::range<2> global_size(input_size, Config::GroupSize);
+    sycl::range<2> local_size(1, Config::GroupSize);
+
+    auto cgf = [&](sycl::handler& handle) {
+        handle.parallel_for(
+            sycl::nd_range<2>(global_size, local_size),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                slm_init<8 * 1024 * sizeof(bf16) + slm_acc_align>();
+
+                const int rid = item.get_global_id(0);
+                const int tid = item.get_local_id(1);
+                const bf16* input_row =
+                    input + hidden_size * static_cast<size_t>(rid);
+                bf16* output_row =
+                    output + hidden_size * static_cast<size_t>(rid);
+                const int start_blk =
+                    sub_nb * tid + std::min(tid, rem_nb);
+                const int end_blk =
+                    start_blk + sub_nb + (tid < rem_nb);
+
+                simd<float, Config::BlockSize> accv = 0;
+                for (int i = start_blk; i < end_blk; ++i) {
+                    simd<bf16, Config::BlockSize> xv =
+                        block_load<bf16, Config::BlockSize>(
+                            input_row + i * Config::BlockSize);
+                    slm_block_store<bf16, Config::BlockSize>(
+                        i * Config::BlockSize * sizeof(bf16), xv);
+                    simd<float, Config::BlockSize> xv_f32 = xv;
+                    accv += xv_f32 * xv_f32;
+                }
+                float acc =
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::BlockSize>(accv) /
+                    hidden_size;
+                slm_block_store<float, 1>(
+                    acc_offset + tid * sizeof(float), acc);
+                barrier();
+
+                simd<float, Config::GroupSize> accs =
+                    slm_block_load<float, Config::GroupSize>(acc_offset);
+                float mean =
+                    sycl::ext::intel::esimd::detail::sum<
+                        float, float, Config::GroupSize>(accs);
+                float rms_scale = rsqrt(mean + eps);
+                const int64_t modulation_row =
+                    h3_rms_modulation_row(rid, segments);
+                for (int i = start_blk; i < end_blk; ++i) {
+                    const int column = i * Config::BlockSize;
+                    simd<float, Config::BlockSize> xv =
+                        slm_block_load<bf16, Config::BlockSize>(
+                            column * sizeof(bf16));
+                    simd<float, Config::BlockSize> yv =
+                        block_load<bf16, Config::BlockSize>(weight + column);
+
+                    // Match the real four-boundary BF16 chain: normalize,
+                    // materialize 1+scale, multiply, then add shift.
+                    simd<bf16, Config::BlockSize> normalized_bf16 =
+                        xv * rms_scale * yv;
+                    simd<float, Config::BlockSize> normalized =
+                        normalized_bf16;
+                    const int64_t scale_offset =
+                        modulation_row * scale_row_stride + column;
+                    const int64_t shift_offset =
+                        modulation_row * shift_row_stride + column;
+                    simd<float, Config::BlockSize> scale_values =
+                        block_load<bf16, Config::BlockSize>(
+                            scale + scale_offset);
+                    simd<float, Config::BlockSize> shift_values =
+                        block_load<bf16, Config::BlockSize>(
+                            shift + shift_offset);
+                    simd<bf16, Config::BlockSize> one_plus_scale_bf16 =
+                        scale_values + 1.0f;
+                    simd<float, Config::BlockSize> one_plus_scale =
+                        one_plus_scale_bf16;
+                    simd<bf16, Config::BlockSize> multiplied_bf16 =
+                        normalized * one_plus_scale;
+                    simd<float, Config::BlockSize> multiplied =
+                        multiplied_bf16;
+                    simd<bf16, Config::BlockSize> result =
+                        multiplied + shift_values;
+                    block_store<bf16, Config::BlockSize>(
+                        output_row + column, result);
+                }
+            });
+    };
+    utils::submit_kernel(
+        cgf, device, "rms_norm_segmented_modulation_h3");
+}
+
+bool rms_norm_segmented_modulation_supported(torch::Tensor input) {
+    // This entry point is compiled only into the BMG binary. The structural
+    // H5376 reduction and BF16 materialization do not select SKU-specific
+    // parameters; a product/profile whitelist is not a kernel capability.
+    // The operation below independently validates dtype, shape and layout.
+    return input.is_xpu();
+}
+
+torch::Tensor rms_norm_segmented_modulation(
+    torch::Tensor weight,
+    torch::Tensor input,
+    torch::Tensor scale,
+    torch::Tensor shift,
+    const std::vector<int64_t>& starts,
+    const std::vector<int64_t>& stops,
+    const std::vector<int64_t>& modulation_rows,
+    double eps
+) {
+    using Config = H3SegmentedRmsModulationConfig;
+    TORCH_CHECK(
+        input.is_xpu() && weight.is_xpu() && scale.is_xpu() && shift.is_xpu(),
+        "weight, input, scale, and shift must be XPU tensors");
+    TORCH_CHECK(
+        input.device() == weight.device() && input.device() == scale.device() &&
+            input.device() == shift.device(),
+        "weight, input, scale, and shift must be on the same XPU device");
+    TORCH_CHECK(
+        input.scalar_type() == ST::BFloat16 &&
+            weight.scalar_type() == ST::BFloat16 &&
+            scale.scalar_type() == ST::BFloat16 &&
+            shift.scalar_type() == ST::BFloat16,
+        "segmented RMS modulation requires BF16 tensors");
+    TORCH_CHECK(
+        input.dim() == 2 && input.size(0) > 0 &&
+            input.size(1) == Config::HiddenSize && input.is_contiguous(),
+        "input must be contiguous BF16 [rows,5376]");
+    TORCH_CHECK(
+        weight.dim() == 1 && weight.numel() == Config::HiddenSize &&
+            weight.is_contiguous(),
+        "weight must be contiguous BF16 [5376]");
+    TORCH_CHECK(
+        scale.dim() == 2 && shift.dim() == 2 &&
+            scale.sizes() == shift.sizes() &&
+            scale.size(0) > 0 && scale.size(1) == Config::HiddenSize &&
+            scale.stride(0) >= Config::HiddenSize &&
+            shift.stride(0) >= Config::HiddenSize &&
+            scale.stride(1) == 1 && shift.stride(1) == 1,
+        "scale and shift must be matched row-strided BF16 [mod_rows,5376] tables");
+    TORCH_CHECK(
+        input.size(0) <= static_cast<int64_t>(INT32_MAX),
+        "input row count exceeds the segmented RMS modulation contract");
+
+    TORCH_CHECK(
+        rms_norm_segmented_modulation_supported(input),
+        "segmented RMS modulation is disabled by native device policy");
+    const auto segment_map = make_h3_rms_modulation_segment_map(
+        input.size(0), scale.size(0), starts, stops, modulation_rows);
+    auto output = torch::empty_like(input);
+    rms_norm_segmented_modulation_kernel(
+        reinterpret_cast<const bf16*>(weight.data_ptr()),
+        reinterpret_cast<const bf16*>(input.data_ptr()),
+        reinterpret_cast<const bf16*>(scale.data_ptr()),
+        reinterpret_cast<const bf16*>(shift.data_ptr()),
+        reinterpret_cast<bf16*>(output.data_ptr()),
+        scale.stride(0),
+        shift.stride(0),
+        segment_map,
+        static_cast<float>(eps),
+        static_cast<int>(input.size(0)),
+        static_cast<int>(input.size(1)),
+        input.device());
+    return output;
 }
 #endif
 

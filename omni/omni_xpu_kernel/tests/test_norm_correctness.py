@@ -167,6 +167,64 @@ class TestRMSNormCorrectness:
         assert mismatches <= max(4, actual.numel() // 200_000)
         assert float(difference.max().item()) <= 0.0625
 
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    @pytest.mark.parametrize("rows", [17, 129, 15787])
+    @pytest.mark.parametrize("eps", [1e-6, 1e-5])
+    @pytest.mark.parametrize("seed_offset", [0, 100000])
+    def test_rms_norm_segmented_modulation_is_bit_exact(
+        self, rows, eps, seed_offset
+    ):
+        """Validate packed AdaLN views, boundary rows and the 480p H3 shape."""
+        from omni_xpu_kernel import norm
+
+        if not norm.supports_rms_norm_segmented_modulation():
+            pytest.skip("loaded binary does not contain the segmented route")
+
+        generator = torch.Generator(device="xpu").manual_seed(
+            5376 + rows + seed_offset
+        )
+        value = torch.randn(
+            rows,
+            5376,
+            device="xpu",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        # An available BMG operation must run on the real XPU, including B70.
+        # A SKU restriction is a failed contract, not a silently skipped test.
+        assert norm.rms_norm_segmented_modulation_supported(value)
+        weight = torch.randn(
+            5376,
+            device="xpu",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        packed = torch.randn(
+            3,
+            6 * 5376,
+            device="xpu",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        shift, scale, *_unused = packed.chunk(6, dim=-1)
+        segments = (
+            [(0, 388, 0), (388, 802, 1), (802, rows, 2)]
+            if rows == 15787
+            else [(0, 3, 0), (3, 8, 1), (8, rows, 2)]
+        )
+
+        expected = norm.rms_norm(weight, value, eps=eps)
+        for start, stop, row in segments:
+            expected[start:stop].mul_(1.0 + scale[row]).add_(shift[row])
+        actual = norm.rms_norm_segmented_modulation(
+            weight, value, scale, shift, segments, eps=eps
+        )
+
+        assert scale.stride() == (6 * 5376, 1)
+        assert shift.stride() == (6 * 5376, 1)
+        assert torch.isfinite(actual).all()
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
 
 class TestGroupNormBMGCorrectness:
     """Correctness tests for the exact BMG Boogu GroupNorm route."""

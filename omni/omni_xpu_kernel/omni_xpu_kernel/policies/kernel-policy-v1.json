@@ -1,0 +1,282 @@
+{
+  "$schema": "kernel-policy-v1.schema.json",
+  "schema_version": 1,
+  "kind": "omni_xpu_kernel_policy_manifest",
+  "build_tuning_profiles": {
+    "bmg": {
+      "policy_id": "bmg-build-v1",
+      "parameters": {
+        "OMNI_FP8_DEQUANT_ELEMENTS_PER_WI": 256,
+        "OMNI_FP8_QUANT_VEC": 8,
+        "OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM": 6,
+        "OMNI_CONVROT_DEQUANT_WG_SIZE": 1,
+        "OMNI_CONVROT_QUANT_WG_SIZE": 8,
+        "OMNI_INT8_DEQUANT_ELEMENTS_PER_WI": 32,
+        "OMNI_SILU_MUL_ELEMENTS_PER_WI": 1,
+        "OMNI_INT8_TENSORWISE_VEC": 8,
+        "OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE": 1,
+        "OMNI_KITCHEN_ROPE_PAIR_WG_SIZE": 32,
+        "OMNI_SVDQ_DEQUANT_GROUPS_PER_WI": 60,
+        "OMNI_SVDQ_QUANT_GROUPS_PER_WI": 60,
+        "OMNI_SVDQ_UNPACK_COLS_PER_WI": 3840,
+        "OMNI_SVDQ_UNPACK_BYTES_PER_ITERATION": 128,
+        "OMNI_SVDQ_UNPACK_WG_SIZE": 1,
+        "OMNI_RMS_NORM_H120_MODE": 2,
+        "OMNI_RMS_NORM_H128_BLOCK_SIZE": 64,
+        "OMNI_GROUP_NORM_BMG_TILE": 32768,
+        "OMNI_GROUP_NORM_BMG_REDUCE_VECTOR": 32,
+        "OMNI_H3_RMS_ROPE_FAST_REDUCE": 0,
+        "OMNI_H3_RMS_ROPE_SLM_BF16": 0,
+        "OMNI_ROWQ_VECTOR_WIDTH_OVERRIDE": 0,
+        "OMNI_ROWQ_SUBGROUPS_PER_ROW_OVERRIDE": 0
+      }
+    },
+    "ptl-h": {
+      "policy_id": "ptl-h-build-v1",
+      "parameters": {
+        "OMNI_FP8_DEQUANT_ELEMENTS_PER_WI": 256,
+        "OMNI_FP8_QUANT_VEC": 16,
+        "OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM": 8,
+        "OMNI_CONVROT_DEQUANT_WG_SIZE": 1,
+        "OMNI_CONVROT_QUANT_WG_SIZE": 1,
+        "OMNI_INT8_DEQUANT_ELEMENTS_PER_WI": 64,
+        "OMNI_SILU_MUL_ELEMENTS_PER_WI": 1,
+        "OMNI_INT8_TENSORWISE_VEC": 16,
+        "OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE": 1,
+        "OMNI_KITCHEN_ROPE_PAIR_WG_SIZE": 128,
+        "OMNI_SVDQ_DEQUANT_GROUPS_PER_WI": 60,
+        "OMNI_SVDQ_QUANT_GROUPS_PER_WI": 60,
+        "OMNI_SVDQ_UNPACK_COLS_PER_WI": 3840,
+        "OMNI_SVDQ_UNPACK_BYTES_PER_ITERATION": 64,
+        "OMNI_SVDQ_UNPACK_WG_SIZE": 32,
+        "OMNI_RMS_NORM_H120_MODE": 2,
+        "OMNI_RMS_NORM_H128_BLOCK_SIZE": 32,
+        "OMNI_GROUP_NORM_BMG_TILE": 32768,
+        "OMNI_GROUP_NORM_BMG_REDUCE_VECTOR": 32,
+        "OMNI_H3_RMS_ROPE_FAST_REDUCE": 0,
+        "OMNI_H3_RMS_ROPE_SLM_BF16": 0,
+        "OMNI_ROWQ_VECTOR_WIDTH_OVERRIDE": 0,
+        "OMNI_ROWQ_SUBGROUPS_PER_ROW_OVERRIDE": 0
+      }
+    }
+  },
+  "runtime_policies": {
+    "b580": {
+      "cpp_type": "B580KernelPolicy",
+      "policy_id": "b580-v1",
+      "status": "experimental",
+      "performance_claim_allowed": false,
+      "parameters": {
+        "adaln_block_size": 32,
+        "adaln_work_group_size": 64,
+        "int8_dequant_fp32_elements": 32,
+        "int8_dequant_fp32_work_group_size": 64,
+        "int8_dequant_fp16_elements": 32,
+        "int8_dequant_fp16_work_group_size": 64,
+        "int8_dequant_bf16_elements": 32,
+        "int8_dequant_bf16_work_group_size": 64,
+        "int8_scaleback_elements": 32,
+        "int8_scaleback_work_group_rows": 4,
+        "int8_scaleback_work_group_cols": 8,
+        "convrot_g16_groups_per_dpas": 8,
+        "convrot_g16_work_items_per_row": 27,
+        "fp8_stochastic_elements": 6,
+        "svdq_dequant_groups": 60,
+        "svdq_dequant_work_group_size": 64,
+        "svdq_quant_groups": 60,
+        "svdq_quant_work_group_size": 64,
+        "svdq_smooth_elements": 256,
+        "svdq_smooth_work_group_size": 64,
+        "svdq_convert_add_elements": 32,
+        "kitchen_rope_pairs_per_work_item": 0,
+        "kitchen_rope_work_group_size": 0,
+        "d120_l4205_v_tile": 32,
+        "h3_vae_d64_s1797_kv_tile": 32
+      }
+    },
+    "b60": {
+      "cpp_type": "B60KernelPolicy",
+      "policy_id": "b60-v1",
+      "status": "experimental",
+      "performance_claim_allowed": false,
+      "parameters": {
+        "adaln_block_size": 512,
+        "adaln_work_group_size": 1,
+        "int8_dequant_fp32_elements": 256,
+        "int8_dequant_fp32_work_group_size": 64,
+        "int8_dequant_fp16_elements": 32,
+        "int8_dequant_fp16_work_group_size": 64,
+        "int8_dequant_bf16_elements": 128,
+        "int8_dequant_bf16_work_group_size": 16,
+        "int8_scaleback_elements": 256,
+        "int8_scaleback_work_group_rows": 4,
+        "int8_scaleback_work_group_cols": 8,
+        "convrot_g16_groups_per_dpas": 7,
+        "convrot_g16_work_items_per_row": 30,
+        "fp8_stochastic_elements": 7,
+        "svdq_dequant_groups": 60,
+        "svdq_dequant_work_group_size": 1,
+        "svdq_quant_groups": 60,
+        "svdq_quant_work_group_size": 1,
+        "svdq_smooth_elements": 256,
+        "svdq_smooth_work_group_size": 1,
+        "svdq_convert_add_elements": 128,
+        "kitchen_rope_pairs_per_work_item": 1,
+        "kitchen_rope_work_group_size": 64,
+        "d120_l4205_v_tile": 64,
+        "h3_vae_d64_s1797_kv_tile": 64
+      }
+    },
+    "b70": {
+      "cpp_type": "B70KernelPolicy",
+      "policy_id": "b70-v1",
+      "status": "stable",
+      "performance_claim_allowed": true,
+      "parameters": {
+        "adaln_block_size": 32,
+        "adaln_work_group_size": 64,
+        "int8_dequant_fp32_elements": 32,
+        "int8_dequant_fp32_work_group_size": 64,
+        "int8_dequant_fp16_elements": 32,
+        "int8_dequant_fp16_work_group_size": 64,
+        "int8_dequant_bf16_elements": 32,
+        "int8_dequant_bf16_work_group_size": 64,
+        "int8_scaleback_elements": 32,
+        "int8_scaleback_work_group_rows": 4,
+        "int8_scaleback_work_group_cols": 8,
+        "convrot_g16_groups_per_dpas": 8,
+        "convrot_g16_work_items_per_row": 27,
+        "fp8_stochastic_elements": 6,
+        "svdq_dequant_groups": 60,
+        "svdq_dequant_work_group_size": 64,
+        "svdq_quant_groups": 60,
+        "svdq_quant_work_group_size": 64,
+        "svdq_smooth_elements": 256,
+        "svdq_smooth_work_group_size": 64,
+        "svdq_convert_add_elements": 32,
+        "kitchen_rope_pairs_per_work_item": 0,
+        "kitchen_rope_work_group_size": 0,
+        "d120_l4205_v_tile": 32,
+        "h3_vae_d64_s1797_kv_tile": 32
+      }
+    },
+    "generic-bmg": {
+      "cpp_type": "GenericBmgKernelPolicy",
+      "policy_id": "generic-bmg-v1",
+      "status": "experimental-fallback",
+      "performance_claim_allowed": false,
+      "parameters": {
+        "adaln_block_size": 32,
+        "adaln_work_group_size": 64,
+        "int8_dequant_fp32_elements": 32,
+        "int8_dequant_fp32_work_group_size": 64,
+        "int8_dequant_fp16_elements": 32,
+        "int8_dequant_fp16_work_group_size": 64,
+        "int8_dequant_bf16_elements": 32,
+        "int8_dequant_bf16_work_group_size": 64,
+        "int8_scaleback_elements": 32,
+        "int8_scaleback_work_group_rows": 4,
+        "int8_scaleback_work_group_cols": 8,
+        "convrot_g16_groups_per_dpas": 8,
+        "convrot_g16_work_items_per_row": 27,
+        "fp8_stochastic_elements": 6,
+        "svdq_dequant_groups": 60,
+        "svdq_dequant_work_group_size": 64,
+        "svdq_quant_groups": 60,
+        "svdq_quant_work_group_size": 64,
+        "svdq_smooth_elements": 256,
+        "svdq_smooth_work_group_size": 64,
+        "svdq_convert_add_elements": 32,
+        "kitchen_rope_pairs_per_work_item": 0,
+        "kitchen_rope_work_group_size": 0,
+        "d120_l4205_v_tile": 32,
+        "h3_vae_d64_s1797_kv_tile": 32
+      }
+    }
+  },
+  "sku_profiles": {
+    "b580": {
+      "sku_id": "bmg-b580",
+      "device_ids": ["0xE20B"],
+      "build_target": "bmg-g21",
+      "effective_policy": "b580",
+      "functional_evidence": {
+        "level": "functional_pass",
+        "scope": "Linux B580 isolated installed-wheel provider and focused native-route correctness",
+        "performance_claim": false
+      }
+    },
+    "b50": {
+      "sku_id": "bmg-b50",
+      "device_ids": ["0xE212"],
+      "build_target": "bmg-g21",
+      "effective_policy": "generic-bmg"
+    },
+    "b60": {
+      "sku_id": "bmg-b60",
+      "device_ids": ["0xE210", "0xE211"],
+      "build_target": "bmg-g21",
+      "effective_policy": "b60"
+    },
+    "b70": {
+      "sku_id": "bmg-b70",
+      "device_ids": ["0xE223"],
+      "build_target": "bmg-g31",
+      "effective_policy": "b70"
+    }
+  },
+  "b580_candidates": {
+    "adaln": {
+      "cpp_type": "B580AdalnCandidatePolicy",
+      "overrides": {"adaln_block_size": 512, "adaln_work_group_size": 1}
+    },
+    "int8-dequant-fp32": {
+      "cpp_type": "B580Int8DequantFp32CandidatePolicy",
+      "overrides": {"int8_dequant_fp32_elements": 256, "int8_dequant_fp32_work_group_size": 64}
+    },
+    "int8-dequant-bf16": {
+      "cpp_type": "B580Int8DequantBf16CandidatePolicy",
+      "overrides": {"int8_dequant_bf16_elements": 128, "int8_dequant_bf16_work_group_size": 16}
+    },
+    "int8-scaleback": {
+      "cpp_type": "B580Int8ScalebackCandidatePolicy",
+      "overrides": {"int8_scaleback_elements": 256}
+    },
+    "convrot-g16": {
+      "cpp_type": "B580ConvrotG16CandidatePolicy",
+      "overrides": {"convrot_g16_groups_per_dpas": 7, "convrot_g16_work_items_per_row": 30}
+    },
+    "fp8-stochastic": {
+      "cpp_type": "B580Fp8StochasticCandidatePolicy",
+      "overrides": {"fp8_stochastic_elements": 7}
+    },
+    "svdq-dequant": {
+      "cpp_type": "B580SvdqDequantCandidatePolicy",
+      "overrides": {"svdq_dequant_work_group_size": 1}
+    },
+    "svdq-quant": {
+      "cpp_type": "B580SvdqQuantCandidatePolicy",
+      "overrides": {"svdq_quant_work_group_size": 1}
+    },
+    "svdq-smooth": {
+      "cpp_type": "B580SvdqSmoothCandidatePolicy",
+      "overrides": {"svdq_smooth_work_group_size": 1}
+    },
+    "svdq-convert-add": {
+      "cpp_type": "B580SvdqConvertAddCandidatePolicy",
+      "overrides": {"svdq_convert_add_elements": 128}
+    },
+    "kitchen-rope": {
+      "cpp_type": "B580KitchenRopeCandidatePolicy",
+      "overrides": {"kitchen_rope_pairs_per_work_item": 1, "kitchen_rope_work_group_size": 64}
+    },
+    "d120-l4205-v-tile": {
+      "cpp_type": "B580D120L4205CandidatePolicy",
+      "overrides": {"d120_l4205_v_tile": 64}
+    },
+    "h3-vae-d64-s1797-kv-tile": {
+      "cpp_type": "B580H3VaeD64S1797CandidatePolicy",
+      "overrides": {"h3_vae_d64_s1797_kv_tile": 64}
+    }
+  }
+}

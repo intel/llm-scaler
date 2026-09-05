@@ -69,6 +69,10 @@ def get_onednn_package_version():
 
 
 VERSION_NAMESPACE = run_path(str(Path(__file__).parent / "omni_xpu_kernel" / "_version.py"))
+POLICY_CODEGEN_FILE = Path(__file__).parent / "policy_codegen.py"
+POLICY_CODEGEN_NAMESPACE = run_path(str(POLICY_CODEGEN_FILE))
+POLICY_MANIFEST = POLICY_CODEGEN_NAMESPACE["load_policy_manifest"]()
+POLICY_CODEGEN_NAMESPACE["verify_generated_headers"](POLICY_MANIFEST)
 BUILD_TORCH_VERSION = VERSION_NAMESPACE["get_installed_torch_version"]()
 BUILD_XPU_TARGET = VERSION_NAMESPACE["get_build_xpu_target"]()
 PACKAGE_VERSION = VERSION_NAMESPACE["get_package_version"](
@@ -79,10 +83,70 @@ XPU_ARCH_MACROS = {
     "ptl-h": "OMNI_XPU_ARCH_PTL_H",
 }
 XPU_ARCH_MACRO = XPU_ARCH_MACROS[BUILD_XPU_TARGET]
-WINDOWS_CUTE_AOT_TARGETS = {
-    # The Windows B70 validation used the compiler's explicit BMG-G31 target.
-    "bmg": "bmg-g31",
+KERNEL_TUNING_DEFINE_NAMES = POLICY_CODEGEN_NAMESPACE[
+    "EXPECTED_TUNING_PARAMETERS"
+]
+
+
+def get_kernel_tuning_compile_args(*, windows=None):
+    """Parse the intentionally narrow build-time kernel tuning surface."""
+    if windows is None:
+        windows = IS_WINDOWS
+    raw = os.environ.get("OMNI_XPU_TUNING_DEFINES", "").strip()
+    if not raw:
+        return []
+
+    allowed = set(KERNEL_TUNING_DEFINE_NAMES)
+    parsed = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        match = re.fullmatch(r"(OMNI_[A-Z0-9_]+)=(-?[0-9]+)", entry)
+        if match is None:
+            raise RuntimeError(
+                "OMNI_XPU_TUNING_DEFINES entries must use NAME=integer: "
+                f"{entry!r}"
+            )
+        name, value = match.groups()
+        if name not in allowed:
+            raise RuntimeError(
+                f"Unsupported kernel tuning define {name!r}"
+            )
+        if name in parsed:
+            raise RuntimeError(f"Duplicate kernel tuning define {name!r}")
+        parsed[name] = value
+
+    prefix = "/D" if windows else "-D"
+    return [
+        f"{prefix}{name}={parsed[name]}"
+        for name in KERNEL_TUNING_DEFINE_NAMES
+        if name in parsed
+    ]
+
+
+BMG_CUTE_SKU_AOT_TARGETS = {
+    sku: POLICY_MANIFEST["sku_profiles"][sku]["build_target"]
+    for sku in ("b580", "b60", "b70")
 }
+CUTE_AOT_TARGETS = {
+    # Keep one BMG sidecar portable across the maintained physical SKUs. The
+    # target list de-duplicates the shared G21 image used by B580 and B60.
+    "bmg": tuple(dict.fromkeys(BMG_CUTE_SKU_AOT_TARGETS.values())),
+    "ptl-h": ("ptl-h",),
+}
+
+
+def get_cute_aot_target(xpu_target):
+    """Return the OS-independent compiler target list for a CUTE sidecar."""
+    target = str(xpu_target).strip().lower()
+    try:
+        targets = CUTE_AOT_TARGETS[target]
+    except KeyError as error:
+        supported = ", ".join(CUTE_AOT_TARGETS)
+        raise RuntimeError(
+            f"Unsupported CUTE AOT architecture {xpu_target!r}; "
+            f"supported architectures: {supported}"
+        ) from error
+    return ",".join(targets)
 
 BMG_CUTE_REMAINDER_MASK_ORIGINAL = """\
           FragSRow k_rem_mask;
@@ -753,12 +817,13 @@ class ICPXBuildExt(build_ext):
                         "include/, tools/util/include/, examples/common/, "
                         "applications/. Got: " + repr(cutlass)
                     )
-                cute_aot_target = WINDOWS_CUTE_AOT_TARGETS.get(BUILD_XPU_TARGET)
-                if cute_aot_target is None:
+                if BUILD_XPU_TARGET != "bmg":
                     raise RuntimeError(
-                        "Windows CUTE is currently validated only for "
+                        "Windows CUTE is currently available only for "
                         "OMNI_XPU_DEVICE=bmg"
                     )
+                cute_aot_target = get_cute_aot_target(BUILD_XPU_TARGET)
+                print(f"CUTE AOT target: {cute_aot_target}")
                 overlay = prepare_bmg_cute_include_overlay(
                     cutlass, self.build_temp
                 )
@@ -821,6 +886,7 @@ class ICPXBuildExt(build_ext):
                     "/EHsc",  # Enable C++ exception handling
                     "/std:c++17",
                 ]
+                cmd += get_kernel_tuning_compile_args(windows=True)
                 # PyTorch XPU wheels also bundle oneDNN headers. Keep the
                 # headers selected with the external oneDNN library first so
                 # declarations and exported symbols use the same ABI.
@@ -879,10 +945,12 @@ class ICPXBuildExt(build_ext):
                         cutlass, self.build_temp
                     )
                     cute_overlay_flags.append(f"-I{overlay}")
+                cute_aot_target = get_cute_aot_target(BUILD_XPU_TARGET)
+                print(f"CUTE AOT target: {cute_aot_target}")
                 cmd += [
                     "-std=c++17", "-O3", "-DNDEBUG", "-fPIC", "-shared",
                     "-fsycl-targets=spir64_gen",
-                    "-Xsycl-target-backend", f"-device {BUILD_XPU_TARGET}",
+                    "-Xsycl-target-backend", f"-device {cute_aot_target}",
                     "-Xspirv-translator",
                     "-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,"
                     "+SPV_INTEL_subgroup_matrix_multiply_accumulate",
@@ -923,6 +991,7 @@ class ICPXBuildExt(build_ext):
                     "-fPIC", "-shared",
                     "-std=c++17",
                 ]
+                cmd += get_kernel_tuning_compile_args(windows=False)
                 # torch/include contains another oneDNN header tree. Put the
                 # explicitly selected installation first so it matches -ldnnl.
                 if has_onednn:
@@ -1012,6 +1081,8 @@ class ICPXExtension(Extension):
             depends = sorted(kernel_root.glob("*.h")) + sorted(
                 kernel_root.glob("*.hpp")
             ) + [
+                csrc_root / "bmg_device_policy.h",
+                csrc_root / "bmg_device_warning.h",
                 csrc_root / "bmg_kernel_policy.h",
                 csrc_root / "device_utils.h",
             ]
@@ -1019,6 +1090,25 @@ class ICPXExtension(Extension):
             kernel_root = source_root / "omni_xpu_kernel" / "csrc"
             sources = sorted(kernel_root.glob("*.cpp"))
             depends = sorted(kernel_root.glob("*.h"))
+        depends += [
+            source_root / "policy_codegen.py",
+            source_root
+            / "omni_xpu_kernel"
+            / "policies"
+            / "kernel-policy-v1.json",
+            source_root
+            / "omni_xpu_kernel"
+            / "policies"
+            / "kernel-policy-v1.schema.json",
+        ]
+        depends += sorted(
+            (
+                source_root
+                / "omni_xpu_kernel"
+                / "csrc"
+                / "generated"
+            ).glob("*.h")
+        )
         super().__init__(
             name,
             sources=[source.as_posix() for source in sources],
@@ -1100,6 +1190,7 @@ setup(
         "omni_xpu_kernel": [
             ".libs/*.dll",
             ".libs/onednn/*",
+            "policies/*.json",
         ],
     },
     include_package_data=True,
