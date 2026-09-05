@@ -66,6 +66,13 @@ def make_qsa_extension(
     ]
     if os.environ.get("QSA_TOKEN_SPLIT_DOUBLE_GRF") == "1":
         sycl_flags.extend(["-Xs", "-device bmg -options -doubleGRF"])
+    prefetch_distance = os.environ.get("QSA_TOKEN_SPLIT_PREFETCH_DISTANCE")
+    if prefetch_distance is not None:
+        if prefetch_distance not in {str(value) for value in range(9)}:
+            raise ValueError(
+                "QSA_TOKEN_SPLIT_PREFETCH_DISTANCE must be in [0,8]"
+            )
+        sycl_flags.append(f"-DPREFETCH_DISTANCE={prefetch_distance}")
 
     return SyclExtension(
         name=extension_name,

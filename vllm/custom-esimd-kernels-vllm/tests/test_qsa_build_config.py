@@ -103,6 +103,21 @@ def test_qsa_token_split_build_can_enable_bmg_double_grf(monkeypatch):
     assert "-device bmg -options -doubleGRF" in extension.extra_compile_args["sycl"]
 
 
+def test_qsa_build_can_override_token_split_prefetch_distance(monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("QSA_TOKEN_SPLIT_PREFETCH_DISTANCE", "2")
+    extension = make_qsa_extension(root, "/torch/include")
+
+    assert "-DPREFETCH_DISTANCE=2" in extension.extra_compile_args["sycl"]
+
+
+def test_qsa_token_split_defaults_to_no_software_prefetch():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "csrc/qsa/qsa_token_split_attention.sycl").read_text()
+
+    assert "#define PREFETCH_DISTANCE 0" in source
+
+
 def test_qsa_row_store_source_has_fixed_allocation_free_contract():
     root = Path(__file__).resolve().parents[1]
     source = (root / "csrc/qsa/qsa_store_cache_rows.sycl").read_text()

@@ -24,16 +24,17 @@ namespace esx = sycl::ext::intel::experimental::esimd;
 using fp16 = sycl::half;
 using fp32 = float;
 
-// Node 3's verified loader configuration uses prefetch distance two.  The
-// partial span is compile-time tunable so verify_agent can sweep only this
-// geometry axis without changing the phase ABI.
+// On BMG, the validated production configuration disables software prefetch:
+// the four lsc prefetches per four-slot run add fixed work without hiding
+// enough latency.  Keep the distance compile-time tunable so focused
+// experiments can re-enable it without changing the phase ABI.
 #ifndef TOKENS_PER_PARTIAL
 #define TOKENS_PER_PARTIAL 36
 #endif
 constexpr int TOKENS_PER_PARTIAL_VALUE = TOKENS_PER_PARTIAL;
 
 #ifndef PREFETCH_DISTANCE
-#define PREFETCH_DISTANCE 2
+#define PREFETCH_DISTANCE 0
 #endif
 constexpr int PREFETCH_DISTANCE_RUNS = PREFETCH_DISTANCE;
 
@@ -177,12 +178,14 @@ void sparse_attention_token_split_candidate__phase0_impl(
           fp32 running_max = NEG_SENTINEL;
           fp32 running_sum = 0.0f;
 
-          // Walk twelve fixed four-slot runs.  Before consuming the current
-          // run, issue a depth-controlled prefetch for a future run.  The
-          // inner lane order is exactly the original slot order, so holes and
-          // duplicates retain their original online-softmax contribution.
+          // Walk twelve fixed four-slot runs.  When enabled, issue a
+          // depth-controlled prefetch for a future run before consuming the
+          // current run.  The inner lane order is exactly the original slot
+          // order, so holes and duplicates retain their original
+          // online-softmax contribution.
           #pragma unroll
           for (int run = 0; run < TokensPerPartial / 4; ++run) {
+#if PREFETCH_DISTANCE > 0
             const int prefetch_start =
                 slot_start + (run + PREFETCH_DISTANCE_RUNS) * 4;
             #pragma unroll
@@ -190,6 +193,7 @@ void sparse_attention_token_split_candidate__phase0_impl(
               prefetch_slot(packed_kv, logical_row, block_table,
                             block_table_stride, block_table_rows,
                             physical_pages, request, prefetch_start + pi);
+#endif
 
             #pragma unroll
             for (int lane = 0; lane < 4; ++lane) {
@@ -436,6 +440,7 @@ void sparse_attention_token_split_candidate__fused_impl(
           fp32 running_sum = 0.0f;
           #pragma unroll
           for (int run = 0; run < TokensPerPartial / 4; ++run) {
+#if PREFETCH_DISTANCE > 0
             const int prefetch_start =
                 slot_start + (run + PREFETCH_DISTANCE_RUNS) * 4;
             #pragma unroll
@@ -443,6 +448,7 @@ void sparse_attention_token_split_candidate__fused_impl(
               prefetch_slot(packed_kv, logical_row, block_table,
                             block_table_stride, block_table_rows,
                             physical_pages, request, prefetch_start + pi);
+#endif
 
             #pragma unroll
             for (int lane = 0; lane < 4; ++lane) {
