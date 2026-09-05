@@ -64,6 +64,7 @@ def test_qsa_build_matches_validated_fp16_packed_contract():
         "QSA_NATIVE_SINGLE_EXP=0",
         "QSA_NATIVE_BLOCK_SOFTMAX=0",
         "QSA_NATIVE_FAST_EXP=1",
+        "TOKENS_PER_PARTIAL=64",
     }
 
 

@@ -865,7 +865,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.attr("qsa_token_split_candidate_abi_version") = 3;
   module.attr("qsa_token_split_candidate_max_rows") = 128;
   module.attr("qsa_token_split_candidate_page_size") = 256;
-  module.attr("qsa_token_split_candidate_partial_count") = 57;
+  // 33 default partials (64 slots each) and 43 batch partials (48 slots
+  // each) share one 43-partial caller-owned workspace.
+  module.attr("qsa_token_split_candidate_partial_count") = 43;
   module.attr("qsa_token_split_candidate_batch_opt_max_rows") = 6;
   module.attr("qsa_token_split_candidate_fused_abi_version") = 1;
   module.attr("qsa_token_split_candidate_fused_single_launch") = 1;

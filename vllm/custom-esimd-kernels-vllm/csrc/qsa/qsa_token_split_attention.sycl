@@ -4,9 +4,10 @@
 // sparse_attention_token_split_candidate -- token-split scalar SDP candidate.
 // The source keeps the QSA token-list ABI unchanged and separates the long
 // selected-token reduction from the final partial merge.
-// This candidate carries forward node 3's prefetch-aware split.  The only
-// sweep interface is TOKENS_PER_PARTIAL_VALUE; PREFETCH_DISTANCE stays fixed at 2
-// runs, and the partial workspace/phase-1 merge contract remains unchanged.
+// This candidate carries forward node 3's prefetch-aware split.  The default
+// split uses 64 slots per partial (33 partials); M=2..6 uses the separate
+// 48-slot batch geometry below.  Both variants stay inside the single-launch
+// epoch protocol, so no host wait is required by async scheduling.
 
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
@@ -29,7 +30,7 @@ using fp32 = float;
 // enough latency.  Keep the distance compile-time tunable so focused
 // experiments can re-enable it without changing the phase ABI.
 #ifndef TOKENS_PER_PARTIAL
-#define TOKENS_PER_PARTIAL 36
+#define TOKENS_PER_PARTIAL 64
 #endif
 constexpr int TOKENS_PER_PARTIAL_VALUE = TOKENS_PER_PARTIAL;
 
@@ -69,6 +70,12 @@ constexpr int BATCH_PARTIAL_COUNT =
     (SLOT_COUNT + BATCH_TOKENS_PER_PARTIAL - 1) /
     BATCH_TOKENS_PER_PARTIAL;
 constexpr int BATCH_OPT_MAX_ROWS = 6;
+// The caller-owned tensor is shared by the default and batch geometries.
+// Keep one explicit capacity for ABI validation and head-stride calculation;
+// using PARTIAL_COUNT for the batch stride would make adjacent heads overlap.
+constexpr int STORAGE_PARTIAL_COUNT =
+    (PARTIAL_COUNT > BATCH_PARTIAL_COUNT) ? PARTIAL_COUNT
+                                          : BATCH_PARTIAL_COUNT;
 constexpr float INV_SQRT_HD = 0.0625f;
 constexpr float LOG2E = 1.4426950408889634f;
 // A finite sentinel avoids (-inf)-(-inf) in an all-hole partial.  The mask
@@ -404,7 +411,7 @@ void sparse_attention_token_split_candidate__fused_impl(
     fp16* output, fp32* partials, uint32_t* ready_counters,
     const int ready_epoch) {
   // BMG limits this ESIMD work-group to 64 work-items.  Use a full two-subgroup
-  // group for stable barrier behavior; the normal path uses 57 active partials
+  // group for stable barrier behavior; the normal path uses 33 active partials
   // and the batch path uses 43, with the remaining work-items participating in
   // the barrier but doing no memory work.
   constexpr int kWorkItems = 64;
@@ -839,11 +846,11 @@ at::Tensor sparse_attention_token_split_candidate_v3(
   TORCH_CHECK(token_split_partials.dim() == 4 &&
                   token_split_partials.size(0) == q.size(0) &&
                   token_split_partials.size(1) == qsa_token_split_candidate::HEADS &&
-                  token_split_partials.size(2) == qsa_token_split_candidate::PARTIAL_COUNT &&
+                  token_split_partials.size(2) == qsa_token_split_candidate::STORAGE_PARTIAL_COUNT &&
                   token_split_partials.size(3) == qsa_token_split_candidate::PARTIAL_STRIDE,
-              "v3 partials must have shape [rows,3,57,258]");
+              "v3 partials must have shape [rows,3,43,258]");
   const int partial_head_stride =
-      qsa_token_split_candidate::PARTIAL_COUNT *
+      qsa_token_split_candidate::STORAGE_PARTIAL_COUNT *
       qsa_token_split_candidate::PARTIAL_STRIDE;
   return run_token_split_candidate(
       q, packed_kv, logical_indices, block_table, token_to_req, page_size,
@@ -872,9 +879,9 @@ at::Tensor sparse_attention_token_split_candidate_v4(
   TORCH_CHECK(token_split_partials.dim() == 4 &&
                   token_split_partials.size(0) == q.size(0) &&
                   token_split_partials.size(1) == qsa_token_split_candidate::HEADS &&
-                  token_split_partials.size(2) == qsa_token_split_candidate::PARTIAL_COUNT &&
+                  token_split_partials.size(2) == qsa_token_split_candidate::STORAGE_PARTIAL_COUNT &&
                   token_split_partials.size(3) == qsa_token_split_candidate::PARTIAL_STRIDE,
-              "v4 partials must have shape [rows,3,57,258]");
+              "v4 partials must have shape [rows,3,43,258]");
   TORCH_CHECK(ready_counters.device() == q.device() &&
                   ready_counters.scalar_type() == at::kInt &&
                   ready_counters.is_contiguous() &&
@@ -885,7 +892,7 @@ at::Tensor sparse_attention_token_split_candidate_v4(
   TORCH_CHECK(ready_epoch >= 0 && ready_epoch <= 0xffff,
               "v4 ready epoch must fit in uint16");
   const int partial_head_stride =
-      qsa_token_split_candidate::PARTIAL_COUNT *
+      qsa_token_split_candidate::STORAGE_PARTIAL_COUNT *
       qsa_token_split_candidate::PARTIAL_STRIDE;
   return run_token_split_candidate(
       q, packed_kv, logical_indices, block_table, token_to_req, page_size,

@@ -154,6 +154,13 @@ def _reference(
 
 def test_qsa_module_contract(qsa_ops):
     assert qsa_ops.qsa_abi_version == 2
+    assert qsa_ops.qsa_token_split_candidate_abi_version == 3
+    assert qsa_ops.qsa_token_split_candidate_max_rows == 128
+    assert qsa_ops.qsa_token_split_candidate_page_size == 256
+    assert qsa_ops.qsa_token_split_candidate_partial_count == 43
+    assert qsa_ops.qsa_token_split_candidate_batch_opt_max_rows == 6
+    assert qsa_ops.qsa_token_split_candidate_fused_abi_version == 1
+    assert qsa_ops.qsa_token_split_candidate_fused_single_launch == 1
     assert qsa_ops.qsa_row_store_abi_version == 3
     assert callable(qsa_ops.qsa_store_cache_rows_v3)
     assert qsa_ops.row_store_predicated_bounds == 1
@@ -220,6 +227,86 @@ def test_qsa_matches_reference_and_preserves_inputs(
         [q, packed_kv, logical_indices, block_table, token_to_req], snapshots
     ):
         assert torch.equal(actual, snapshot)
+
+
+@pytest.mark.parametrize("case", ["holes_duplicates_pages", "full_width_2051"])
+@pytest.mark.parametrize("rows", [1, 2, 4, 8])
+def test_qsa_token_split_candidate_matches_reference_for_m_rows(
+    qsa_ops, case, rows
+):
+    """The v3 ABI must cover M=1 and M>1 with the same caller contract."""
+    torch.manual_seed(20260906 + rows)
+    args = list(_make_inputs(case, rows, 256))
+    packed_kv = args.pop()
+    q, k_cache, v_cache, logical, block_table, token_to_req, page_size, out = args
+    partials = torch.empty(
+        rows, 3, qsa_ops.qsa_token_split_candidate_partial_count, 258,
+        dtype=torch.float32,
+        device="xpu",
+    )
+    expected = _reference(
+        q, k_cache, v_cache, logical, block_table, token_to_req, page_size
+    )
+
+    returned = qsa_ops.sparse_attention_token_split_candidate_v3(
+        q,
+        packed_kv,
+        logical,
+        block_table,
+        token_to_req,
+        page_size,
+        out,
+        partials,
+    )
+    # No host wait is allowed between phase 0 and phase 1 or between calls;
+    # synchronize only at the observation boundary.
+    assert returned.data_ptr() == out.data_ptr()
+    torch.xpu.synchronize()
+    assert torch.isfinite(returned).all()
+    assert torch.allclose(
+        returned.float(), expected.float(), atol=2e-2, rtol=2e-2
+    )
+
+
+def test_qsa_token_split_candidate_async_workspace_reuse(qsa_ops):
+    """Back-to-back M>1 submissions remain correct on one in-order stream."""
+    rows = 4
+    args = list(_make_inputs("full_width_2051", rows, 256))
+    packed_kv = args.pop()
+    _, k_cache, v_cache, logical, block_table, token_to_req, page_size, _ = args
+    partials = torch.empty(
+        rows, 3, qsa_ops.qsa_token_split_candidate_partial_count, 258,
+        dtype=torch.float32,
+        device="xpu",
+    )
+    outputs = []
+    expected = []
+    for seed in (20260907, 20260908, 20260909):
+        torch.manual_seed(seed)
+        q = torch.randn(
+            rows, HEADS, HEAD_DIM, dtype=torch.float16, device="xpu"
+        )
+        out = torch.empty_like(q)
+        returned = qsa_ops.sparse_attention_token_split_candidate_v3(
+            q,
+            packed_kv,
+            logical,
+            block_table,
+            token_to_req,
+            page_size,
+            out,
+            partials,
+        )
+        assert returned.data_ptr() == out.data_ptr()
+        outputs.append(out)
+        expected.append(
+            _reference(q, k_cache, v_cache, logical, block_table, token_to_req, page_size)
+        )
+
+    torch.xpu.synchronize()
+    for actual, target in zip(outputs, expected):
+        assert torch.isfinite(actual).all()
+        assert torch.allclose(actual.float(), target.float(), atol=2e-2, rtol=2e-2)
 
 
 def test_qsa_rejects_bf16_query(qsa_ops):
