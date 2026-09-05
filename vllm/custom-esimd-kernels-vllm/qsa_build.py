@@ -1,5 +1,6 @@
 """Shared build definition for the fixed-contract Qwen3.8 QSA extension."""
 
+import os
 from pathlib import Path
 
 from torch.utils.cpp_extension import SyclExtension
@@ -57,6 +58,15 @@ def make_qsa_extension(
     RPATH without changing the production setup.
     """
 
+    sycl_flags = [
+        "-O3",
+        "-fsycl-device-code-split=per_kernel",
+        f"-I{torch_include}",
+        *(f"-D{definition}" for definition in QSA_DEFINES),
+    ]
+    if os.environ.get("QSA_TOKEN_SPLIT_DOUBLE_GRF") == "1":
+        sycl_flags.extend(["-Xs", "-device bmg -options -doubleGRF"])
+
     return SyclExtension(
         name=extension_name,
         sources=[
@@ -66,16 +76,12 @@ def make_qsa_extension(
             "csrc/qsa/qsa_indexer_norm_rope.sycl",
             "csrc/qsa/qsa_q_norm_rope_select.sycl",
             "csrc/qsa/qsa_group_compression.sycl",
+            "csrc/qsa/qsa_token_split_attention.sycl",
         ],
         include_dirs=[root / "csrc" / "qsa"],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
-            "sycl": [
-                "-O3",
-                "-fsycl-device-code-split=per_kernel",
-                f"-I{torch_include}",
-                *(f"-D{definition}" for definition in QSA_DEFINES),
-            ],
+            "sycl": sycl_flags,
         },
         extra_link_args=[f"-Wl,-rpath,{rpath}"],
         py_limited_api=False,

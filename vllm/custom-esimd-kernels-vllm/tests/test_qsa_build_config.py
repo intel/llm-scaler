@@ -78,16 +78,29 @@ def test_qsa_build_contains_attention_and_selection_sources():
         "csrc/qsa/qsa_indexer_norm_rope.sycl",
         "csrc/qsa/qsa_q_norm_rope_select.sycl",
         "csrc/qsa/qsa_group_compression.sycl",
+        "csrc/qsa/qsa_token_split_attention.sycl",
     ]
     module_source = (root / "csrc/qsa/qsa_sparse_attention.sycl").read_text()
     for required in (
         "qsa_store_cache_rows_r_aware_v1",
         "qsa_q_norm_rope_select_v1",
+        "sparse_attention_token_split_candidate_v3",
+        "sparse_attention_token_split_candidate_v4",
+        "qsa_token_split_candidate_fused_abi_version",
+        "qsa_token_split_candidate_fused_single_launch",
         "qsa_fusion_abi_version",
         "qsa_row_store_parallel_abi_version",
         "qsa_row_store_parallel_requires_unique_slots",
     ):
         assert required in module_source
+
+
+def test_qsa_token_split_build_can_enable_bmg_double_grf(monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("QSA_TOKEN_SPLIT_DOUBLE_GRF", "1")
+    extension = make_qsa_extension(root, "/torch/include")
+
+    assert "-device bmg -options -doubleGRF" in extension.extra_compile_args["sycl"]
 
 
 def test_qsa_row_store_source_has_fixed_allocation_free_contract():

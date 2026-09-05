@@ -247,6 +247,61 @@ def test_qsa_group_compress_v2_supports_m_gt1_raw_and_ring(qsa_ops, dtype):
     assert returned.data_ptr() == case[9].data_ptr()
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_qsa_group_compress_v2_accepts_projected_noncontiguous_raw(qsa_ops, dtype):
+    case = list(_make_m_gt1_case(dtype))
+    dense_raw = case[0]
+    # The production indexer passes the K half of a wider Q/K projection.  It
+    # has an inner-contiguous row stride but is not dense-contiguous across
+    # rows; v2 must consume that view without a host-side/device copy.
+    backing = torch.empty((dense_raw.shape[0], 1, 640), dtype=dtype, device="xpu")
+    projected_raw = backing[..., 512:640]
+    projected_raw.copy_(dense_raw)
+    assert projected_raw.stride() == (640, 640, 1)
+    assert not projected_raw.is_contiguous()
+    case[0] = projected_raw
+
+    returned = qsa_ops.qsa_group_compress_v2(*case, 4, 16, True)
+    torch.xpu.synchronize()
+
+    raw, _, cache, positions = case[:4]
+    expected = torch.stack(
+        [
+            cache[0, 7, 0].float()
+            + cache[0, 0, 0].float()
+            + cache[0, 1, 0].float()
+            + raw[0, 0].float(),
+            cache[0, 0, 0].float()
+            + cache[0, 1, 0].float()
+            + raw[0, 0].float()
+            + raw[1, 0].float(),
+            cache[1, 1, 0].float()
+            + cache[1, 2, 0].float()
+            + cache[1, 3, 0].float()
+            + raw[2, 0].float(),
+            cache[1, 2, 0].float()
+            + cache[1, 3, 0].float()
+            + raw[2, 0].float()
+            + raw[3, 0].float(),
+        ],
+        dim=0,
+    ) / 4.0
+    expected_positions = torch.stack(
+        [
+            positions[0, 7, 0],
+            positions[0, 0, 0],
+            positions[1, 1, 0],
+            positions[1, 2, 0],
+        ],
+        dim=0,
+    )
+    torch.testing.assert_close(
+        case[9].float(), expected.reshape(4, 1, 128), atol=2e-2, rtol=2e-2
+    )
+    assert torch.equal(case[10], expected_positions)
+    assert returned.data_ptr() == case[9].data_ptr()
+
+
 def test_qsa_group_compress_v1_invalid_block_matches_partial_fallback(qsa_ops):
     case = list(_make_case(torch.float16))
     case[4].fill_(-1)

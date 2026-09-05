@@ -778,6 +778,28 @@ at::Tensor sparse_paged_attention_bounded_v2(
       max_valid_width, out);
 }
 
+at::Tensor sparse_attention_token_split_candidate_v3(
+    const at::Tensor& q,
+    const at::Tensor& packed_kv,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t page_size,
+    at::Tensor output,
+    at::Tensor token_split_partials);
+
+at::Tensor sparse_attention_token_split_candidate_v4(
+    const at::Tensor& q,
+    const at::Tensor& packed_kv,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t page_size,
+    at::Tensor output,
+    at::Tensor token_split_partials,
+    at::Tensor ready_counters,
+    int64_t ready_epoch);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def(
       "sparse_paged_attention",
@@ -795,6 +817,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       "sparse_paged_attention_bounded_v2",
       &sparse_paged_attention_bounded_v2,
       "Qwen3.8 page-specialized sparse paged attention with trusted scan bound (XPU)");
+  module.def(
+      "sparse_attention_token_split_candidate_v3",
+      &sparse_attention_token_split_candidate_v3,
+      "Qwen3.8 batched token-split sparse attention candidate (XPU)");
+  module.def(
+      "sparse_attention_token_split_candidate_v4",
+      &sparse_attention_token_split_candidate_v4,
+      "Qwen3.8 single-launch batched token-split sparse attention candidate (XPU)");
   module.def(
       "qsa_select_paged_tokens",
       &qsa::select_paged_tokens,
@@ -832,6 +862,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       &qsa::group_compress_v2,
       "Qwen3.8 QSA stream-ordered M-row group compression (XPU)");
   module.attr("qsa_abi_version") = 2;
+  module.attr("qsa_token_split_candidate_abi_version") = 3;
+  module.attr("qsa_token_split_candidate_max_rows") = 128;
+  module.attr("qsa_token_split_candidate_page_size") = 256;
+  module.attr("qsa_token_split_candidate_partial_count") = 57;
+  module.attr("qsa_token_split_candidate_batch_opt_max_rows") = 6;
+  module.attr("qsa_token_split_candidate_fused_abi_version") = 1;
+  module.attr("qsa_token_split_candidate_fused_single_launch") = 1;
   module.attr("qsa_row_store_abi_version") = 3;
   module.attr("qsa_row_store_receipt_abi_version") = 4;
   module.attr("row_store_receipt_caller_owned") = 1;

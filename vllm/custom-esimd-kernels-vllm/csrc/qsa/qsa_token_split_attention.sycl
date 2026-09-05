@@ -1,0 +1,892 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+// sparse_attention_token_split_candidate -- token-split scalar SDP candidate.
+// The source keeps the QSA token-list ABI unchanged and separates the long
+// selected-token reduction from the final partial merge.
+// This candidate carries forward node 3's prefetch-aware split.  The only
+// sweep interface is TOKENS_PER_PARTIAL_VALUE; PREFETCH_DISTANCE stays fixed at 2
+// runs, and the partial workspace/phase-1 merge contract remains unchanged.
+
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+
+#include <cstdint>
+
+using namespace sycl::ext::intel::esimd;
+using namespace sycl::ext::intel::experimental::esimd;
+namespace esx = sycl::ext::intel::experimental::esimd;
+
+using fp16 = sycl::half;
+using fp32 = float;
+
+// Node 3's verified loader configuration uses prefetch distance two.  The
+// partial span is compile-time tunable so verify_agent can sweep only this
+// geometry axis without changing the phase ABI.
+#ifndef TOKENS_PER_PARTIAL
+#define TOKENS_PER_PARTIAL 36
+#endif
+constexpr int TOKENS_PER_PARTIAL_VALUE = TOKENS_PER_PARTIAL;
+
+#ifndef PREFETCH_DISTANCE
+#define PREFETCH_DISTANCE 2
+#endif
+constexpr int PREFETCH_DISTANCE_RUNS = PREFETCH_DISTANCE;
+
+namespace qsa_token_split_candidate {
+
+// Keep explicit kernel names for profiling and trace correlation. The
+// previous anonymous lambdas were valid SYCL kernels, but their generated
+// names were not stable/visible in UnitTrace, which made it impossible to
+// distinguish a real candidate launch from an integration/fallback issue.
+template <int TokensPerPartial, int PartialCount>
+class QsaTokenSplitPhase0Kernel;
+
+template <int PartialCount>
+class QsaTokenSplitPhase1Kernel;
+
+template <int TokensPerPartial, int PartialCount>
+class QsaTokenSplitFusedKernel;
+
+constexpr int HEADS = 3;
+constexpr int HD = 256;
+constexpr int DIM_BLOCKS = HD / 16;
+constexpr int SLOT_COUNT = 2051;
+constexpr int PAGE_SIZE = 256;
+constexpr int KV_ROW_STRIDE = 512;
+constexpr int KV_PAGE_STRIDE = PAGE_SIZE * KV_ROW_STRIDE;
+constexpr int MAX_ROWS = 128;
+constexpr int PARTIAL_STRIDE = 2 + HD;
+constexpr int PARTIAL_COUNT =
+    (SLOT_COUNT + TOKENS_PER_PARTIAL_VALUE - 1) / TOKENS_PER_PARTIAL_VALUE;
+constexpr int BATCH_TOKENS_PER_PARTIAL = 48;
+constexpr int BATCH_PARTIAL_COUNT =
+    (SLOT_COUNT + BATCH_TOKENS_PER_PARTIAL - 1) /
+    BATCH_TOKENS_PER_PARTIAL;
+constexpr int BATCH_OPT_MAX_ROWS = 6;
+constexpr float INV_SQRT_HD = 0.0625f;
+constexpr float LOG2E = 1.4426950408889634f;
+// A finite sentinel avoids (-inf)-(-inf) in an all-hole partial.  The mask
+// below gives such slots zero weight, so the sentinel never contributes.
+constexpr float NEG_SENTINEL = -1.0e30f;
+
+static_assert(TOKENS_PER_PARTIAL_VALUE > 0, "TOKENS_PER_PARTIAL_VALUE must be positive");
+static_assert((TOKENS_PER_PARTIAL_VALUE % 4) == 0,
+              "TOKENS_PER_PARTIAL_VALUE must contain complete four-slot runs");
+static_assert(TOKENS_PER_PARTIAL_VALUE <= SLOT_COUNT,
+              "TOKENS_PER_PARTIAL_VALUE exceeds the fixed QSA slot width");
+static_assert((BATCH_TOKENS_PER_PARTIAL % 4) == 0,
+              "BATCH_TOKENS_PER_PARTIAL must contain complete four-slot runs");
+static_assert(BATCH_TOKENS_PER_PARTIAL <= SLOT_COUNT,
+              "BATCH_TOKENS_PER_PARTIAL exceeds the fixed QSA slot width");
+static_assert(PREFETCH_DISTANCE_RUNS >= 0 && PREFETCH_DISTANCE_RUNS <= 8,
+              "PREFETCH_DISTANCE must be a small non-negative run distance");
+
+
+// Issue the next run's packed K/V reads before its consumer reaches them.  The
+// logical-index and page-table lookups intentionally mirror phase 0's existing
+// safe-address rules: holes and padded slots map to a valid row, while the
+// consumer's merge mask still gives them zero weight.  Thus prefetches never
+// dereference an OOB page even for a short/holed selection row.
+ESIMD_INLINE void prefetch_slot(const fp16* packed_kv,
+                                const int* logical_indices,
+                                const int* block_table,
+                                const int block_table_stride,
+                                const int block_table_rows,
+                                const int physical_pages,
+                                const int request,
+                                const int slot) {
+  const int over = (slot >= SLOT_COUNT) ? 1 : 0;
+  const int safe_slot = slot - over * (slot - (SLOT_COUNT - 1));
+  const int logical = logical_indices[safe_slot];
+  const int nonnegative = (logical >= 0) ? 1 : 0;
+  const int request_valid =
+      (request >= 0 && request < block_table_rows) ? 1 : 0;
+  const int safe_request = request_valid ? request : 0;
+  const int valid_slot = (1 - over) * nonnegative * request_valid;
+  const int safe_logical = logical * valid_slot;
+  const int logical_page = safe_logical >> 8;
+  const int page_valid =
+      (logical_page >= 0 && logical_page < block_table_stride) ? 1 : 0;
+  const int safe_page = page_valid ? logical_page : 0;
+  const int in_page = safe_logical & (PAGE_SIZE - 1);
+  const int physical_page =
+      block_table[safe_request * block_table_stride + safe_page];
+  const int physical_valid =
+      (physical_page >= 0 && physical_page < physical_pages) ? 1 : 0;
+  const int safe_physical_page = physical_valid ? physical_page : 0;
+  const fp16* kv_row =
+      packed_kv + safe_physical_page * KV_PAGE_STRIDE +
+      in_page * KV_ROW_STRIDE;
+  const uint32_t* k_ptr = reinterpret_cast<const uint32_t*>(kv_row);
+  const uint32_t* v_ptr = reinterpret_cast<const uint32_t*>(kv_row + HD);
+  // Two 256-byte prefetches cover each 256-half row.  All row offsets are
+  // multiples of 512 half elements, so the uint32 pointers meet alignment.
+  esx::lsc_prefetch<uint32_t, 64, esx::lsc_data_size::default_size,
+                   esx::cache_hint::cached, esx::cache_hint::cached>(k_ptr);
+  esx::lsc_prefetch<uint32_t, 64, esx::lsc_data_size::default_size,
+                   esx::cache_hint::cached, esx::cache_hint::cached>(k_ptr + 64);
+  esx::lsc_prefetch<uint32_t, 64, esx::lsc_data_size::default_size,
+                   esx::cache_hint::cached, esx::cache_hint::cached>(v_ptr);
+  esx::lsc_prefetch<uint32_t, 64, esx::lsc_data_size::default_size,
+                   esx::cache_hint::cached, esx::cache_hint::cached>(v_ptr + 64);
+}
+
+// One phase-1 work-item owns one query head and one compile-time-sized slot
+// interval.  Invalid slots use a safe address but are masked before the
+// online-softmax update; duplicate valid slots are intentionally processed
+// independently and in their original order.
+template <int TokensPerPartial, int PartialCount>
+void sparse_attention_token_split_candidate__phase0_impl(
+    sycl::queue& queue, const fp16* q_in, const fp16* packed_kv,
+    const int* logical_indices, const int* block_table,
+    const int* token_to_req, const int block_table_stride, const int rows,
+    const int block_table_rows, const int physical_pages,
+    const int partial_row_stride, const int partial_head_stride,
+    fp32* partials) {
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<QsaTokenSplitPhase0Kernel<TokensPerPartial,
+                                               PartialCount>>(
+        sycl::nd_range<1>(
+            sycl::range<1>(rows * HEADS * PartialCount),
+            sycl::range<1>(1)),
+        [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+          const int gid = static_cast<int>(item.get_global_id(0));
+          const int row = gid / (HEADS * PartialCount);
+          const int row_gid = gid - row * HEADS * PartialCount;
+          const int head = row_gid / PartialCount;
+          const int partial_id = row_gid - head * PartialCount;
+          const int slot_start = partial_id * TokensPerPartial;
+          const int request = token_to_req[row];
+          const int* logical_row = logical_indices + row * SLOT_COUNT;
+
+          simd<fp32, 16> q_vec[DIM_BLOCKS];
+          simd<fp32, 16> accum[DIM_BLOCKS];
+          #pragma unroll
+          for (int db = 0; db < DIM_BLOCKS; ++db) {
+            simd<fp16, 16> q_half = block_load<fp16, 16>(
+                q_in + row * HEADS * HD + head * HD + db * 16);
+            q_vec[db] = q_half;
+            accum[db] = 0.0f;
+          }
+
+          fp32 running_max = NEG_SENTINEL;
+          fp32 running_sum = 0.0f;
+
+          // Walk twelve fixed four-slot runs.  Before consuming the current
+          // run, issue a depth-controlled prefetch for a future run.  The
+          // inner lane order is exactly the original slot order, so holes and
+          // duplicates retain their original online-softmax contribution.
+          #pragma unroll
+          for (int run = 0; run < TokensPerPartial / 4; ++run) {
+            const int prefetch_start =
+                slot_start + (run + PREFETCH_DISTANCE_RUNS) * 4;
+            #pragma unroll
+            for (int pi = 0; pi < 4; ++pi)
+              prefetch_slot(packed_kv, logical_row, block_table,
+                            block_table_stride, block_table_rows,
+                            physical_pages, request, prefetch_start + pi);
+
+            #pragma unroll
+            for (int lane = 0; lane < 4; ++lane) {
+              const int slot = slot_start + run * 4 + lane;
+              const int over = (slot >= SLOT_COUNT) ? 1 : 0;
+              const int safe_slot =
+                  slot - over * (slot - (SLOT_COUNT - 1));
+              const int logical = logical_row[safe_slot];
+              const int nonnegative = (logical >= 0) ? 1 : 0;
+              const int request_valid =
+                  (request >= 0 && request < block_table_rows) ? 1 : 0;
+              const int safe_request = request_valid ? request : 0;
+              const int valid_slot =
+                  (1 - over) * nonnegative * request_valid;
+              const int safe_logical = logical * valid_slot;
+              const int logical_page = safe_logical >> 8;
+              const int page_valid =
+                  (logical_page >= 0 && logical_page < block_table_stride) ? 1 : 0;
+              const int safe_page = page_valid ? logical_page : 0;
+              const int in_page = safe_logical & (PAGE_SIZE - 1);
+              const int physical_page =
+                  block_table[safe_request * block_table_stride + safe_page];
+              const int physical_valid =
+                  (physical_page >= 0 && physical_page < physical_pages) ? 1 : 0;
+              const int safe_physical_page = physical_valid ? physical_page : 0;
+              const int valid = valid_slot * page_valid * physical_valid;
+              const fp16* kv_row =
+                  packed_kv + safe_physical_page * KV_PAGE_STRIDE +
+                  in_page * KV_ROW_STRIDE;
+
+              fp32 score = 0.0f;
+              #pragma unroll
+              for (int db = 0; db < DIM_BLOCKS; ++db) {
+                simd<fp16, 16> k_half =
+                    block_load<fp16, 16>(kv_row + db * 16);
+                simd<fp32, 16> k_vec = k_half;
+                score += sycl::ext::intel::esimd::detail::sum<fp32, fp32, 16>(
+                    q_vec[db] * k_vec);
+              }
+              score *= INV_SQRT_HD;
+
+              // ESIMD merge supplies a branch-free invalid-slot mask.  The
+              // finite sentinel also makes the first valid update well-defined.
+              simd<float, 1> score_lane;
+              score_lane[0] = score;
+              simd_mask<1> invalid_mask = (simd<int, 1>(valid) == 0);
+              score_lane = merge(simd<float, 1>(NEG_SENTINEL), score_lane,
+                                 invalid_mask);
+              const fp32 masked_score = score_lane[0];
+
+              simd<float, 1> max_lane = __ESIMD_NS::max<float, 1, float>(
+                  simd<float, 1>(running_max), score_lane);
+              const fp32 next_max = max_lane[0];
+              const fp32 old_correction = sycl::exp2(
+                  (running_max - next_max) * LOG2E);
+              simd<float, 1> weight_lane;
+              weight_lane[0] = sycl::exp2(
+                  (masked_score - next_max) * LOG2E);
+              weight_lane = merge(simd<float, 1>(0.0f), weight_lane,
+                                  invalid_mask);
+              const fp32 weight = weight_lane[0];
+
+              #pragma unroll
+              for (int db = 0; db < DIM_BLOCKS; ++db) {
+                simd<fp16, 16> v_half =
+                    block_load<fp16, 16>(kv_row + HD + db * 16);
+                simd<fp32, 16> v_vec = v_half;
+                accum[db] = accum[db] * old_correction + v_vec * weight;
+              }
+              running_sum = running_sum * old_correction + weight;
+              running_max = next_max;
+            }
+          }
+
+          fp32* dst = partials +
+                      static_cast<size_t>(row) * partial_row_stride +
+                      static_cast<size_t>(head) * partial_head_stride +
+                      static_cast<size_t>(partial_id) * PARTIAL_STRIDE;
+          block_store<fp32, 1>(dst, running_max);
+          block_store<fp32, 1>(dst + 1, running_sum);
+          #pragma unroll
+          for (int db = 0; db < DIM_BLOCKS; ++db)
+            block_store<fp32, 16>(dst + 2 + db * 16, accum[db]);
+        });
+  });
+}
+
+extern "C" void sparse_attention_token_split_candidate__phase0(
+    sycl::queue& queue, const fp16* q_in, const fp16* packed_kv,
+    const int* logical_indices, const int* block_table,
+    const int* token_to_req, const int block_table_stride, const int rows,
+    const int block_table_rows, const int physical_pages,
+    const int partial_row_stride, const int partial_head_stride,
+    fp32* partials) {
+  sparse_attention_token_split_candidate__phase0_impl<
+      TOKENS_PER_PARTIAL_VALUE, PARTIAL_COUNT>(
+      queue, q_in, packed_kv, logical_indices, block_table, token_to_req,
+      block_table_stride, rows, block_table_rows, physical_pages,
+      partial_row_stride, partial_head_stride, partials);
+}
+
+extern "C" void sparse_attention_token_split_candidate__phase0_batch(
+    sycl::queue& queue, const fp16* q_in, const fp16* packed_kv,
+    const int* logical_indices, const int* block_table,
+    const int* token_to_req, const int block_table_stride, const int rows,
+    const int block_table_rows, const int physical_pages,
+    const int partial_row_stride, const int partial_head_stride,
+    fp32* partials) {
+  sparse_attention_token_split_candidate__phase0_impl<
+      BATCH_TOKENS_PER_PARTIAL, BATCH_PARTIAL_COUNT>(
+      queue, q_in, packed_kv, logical_indices, block_table, token_to_req,
+      block_table_stride, rows, block_table_rows, physical_pages,
+      partial_row_stride, partial_head_stride, partials);
+}
+
+// Phase 1 merges all partial online-softmax states per query head.  A phase-0
+// partial stores (max, sum_exp, weighted_value[HD]); the correction is exp2(mi-m).
+template <int MergePartialCount>
+void sparse_attention_token_split_candidate__phase1_impl(
+    sycl::queue& queue, fp16* output, const fp32* partials, const int rows,
+    const int partial_row_stride, const int partial_head_stride) {
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<QsaTokenSplitPhase1Kernel<MergePartialCount>>(
+        sycl::nd_range<1>(sycl::range<1>(rows * HEADS), sycl::range<1>(1)),
+        [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+          const int gid = static_cast<int>(item.get_global_id(0));
+          const int row = gid / HEADS;
+          const int head = gid - row * HEADS;
+          fp32 global_max = NEG_SENTINEL;
+          #pragma unroll
+          for (int p = 0; p < MergePartialCount; ++p) {
+            const fp32* src = partials +
+                static_cast<size_t>(row) * partial_row_stride +
+                static_cast<size_t>(head) * partial_head_stride +
+                static_cast<size_t>(p) * PARTIAL_STRIDE;
+            const fp32 local_max = src[0];
+            simd<float, 1> global_lane = __ESIMD_NS::max<float, 1, float>(
+                simd<float, 1>(global_max), simd<float, 1>(local_max));
+            global_max = global_lane[0];
+          }
+
+          simd<fp32, 16> merged[DIM_BLOCKS];
+          #pragma unroll
+          for (int db = 0; db < DIM_BLOCKS; ++db)
+            merged[db] = 0.0f;
+          fp32 merged_sum = 0.0f;
+
+          #pragma unroll
+          for (int p = 0; p < MergePartialCount; ++p) {
+            const fp32* src = partials +
+                static_cast<size_t>(row) * partial_row_stride +
+                static_cast<size_t>(head) * partial_head_stride +
+                static_cast<size_t>(p) * PARTIAL_STRIDE;
+            const fp32 local_max = src[0];
+            const fp32 local_sum = src[1];
+            const fp32 correction = sycl::exp2(
+                (local_max - global_max) * LOG2E);
+            merged_sum += local_sum * correction;
+            #pragma unroll
+            for (int db = 0; db < DIM_BLOCKS; ++db) {
+              simd<fp32, 16> local =
+                  block_load<fp32, 16>(src + 2 + db * 16);
+              merged[db] = merged[db] + local * correction;
+            }
+          }
+
+          const fp32 inv_sum =
+              (merged_sum > 0.0f) ? (1.0f / merged_sum) : 0.0f;
+          #pragma unroll
+          for (int db = 0; db < DIM_BLOCKS; ++db) {
+            simd<fp32, 16> normalized = merged[db] * inv_sum;
+            simd<fp16, 16> out_half = normalized;
+            block_store<fp16, 16>(
+                output + row * HEADS * HD + head * HD + db * 16, out_half);
+          }
+        });
+  });
+}
+
+extern "C" void sparse_attention_token_split_candidate__phase1(
+    sycl::queue& queue, fp16* output, const fp32* partials, const int rows,
+    const int partial_row_stride, const int partial_head_stride) {
+  sparse_attention_token_split_candidate__phase1_impl<PARTIAL_COUNT>(
+      queue, output, partials, rows, partial_row_stride, partial_head_stride);
+}
+
+extern "C" void sparse_attention_token_split_candidate__phase1_batch(
+    sycl::queue& queue, fp16* output, const fp32* partials, const int rows,
+    const int partial_row_stride, const int partial_head_stride) {
+  sparse_attention_token_split_candidate__phase1_impl<BATCH_PARTIAL_COUNT>(
+      queue, output, partials, rows, partial_row_stride, partial_head_stride);
+}
+
+// Keep the producer and consumer for one head in one work-group.  The old v3
+// path submits phase 0 and phase 1 separately; although both submissions are
+// ordered on the current stream, their host-side queue submission cost is
+// comparable to the old single-launch kernel.  Here each head owns one padded
+// 64-work-item group, the active partials are produced first, and work-item 0
+// merges them after a global fence.  No host wait or cross-stream event is
+// introduced.
+template <int TokensPerPartial, int MergePartialCount>
+void sparse_attention_token_split_candidate__fused_impl(
+    sycl::queue& queue, const fp16* q_in, const fp16* packed_kv,
+    const int* logical_indices, const int* block_table,
+    const int* token_to_req, const int block_table_stride, const int rows,
+    const int block_table_rows, const int physical_pages,
+    const int partial_row_stride, const int partial_head_stride,
+    fp16* output, fp32* partials, uint32_t* ready_counters,
+    const int ready_epoch) {
+  // BMG limits this ESIMD work-group to 64 work-items.  Use a full two-subgroup
+  // group for stable barrier behavior; the normal path uses 57 active partials
+  // and the batch path uses 43, with the remaining work-items participating in
+  // the barrier but doing no memory work.
+  constexpr int kWorkItems = 64;
+  constexpr int kActiveWorkItems = MergePartialCount;
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<QsaTokenSplitFusedKernel<TokensPerPartial,
+                                               MergePartialCount>>(
+        sycl::nd_range<1>(sycl::range<1>(rows * HEADS * kWorkItems),
+                          sycl::range<1>(kWorkItems)),
+        [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+          const int gid = static_cast<int>(item.get_global_id(0));
+          const int row_head_count = HEADS * kWorkItems;
+          const int row = gid / row_head_count;
+          const int row_head_gid = gid - row * row_head_count;
+          const int head = row_head_gid / kWorkItems;
+          const int partial_id = row_head_gid - head * kWorkItems;
+          if (partial_id < kActiveWorkItems) {
+          const int slot_start = partial_id * TokensPerPartial;
+          const int request = token_to_req[row];
+          const int* logical_row = logical_indices + row * SLOT_COUNT;
+
+          simd<fp32, 16> q_vec[DIM_BLOCKS];
+          simd<fp32, 16> accum[DIM_BLOCKS];
+          #pragma unroll
+          for (int db = 0; db < DIM_BLOCKS; ++db) {
+            simd<fp16, 16> q_half = block_load<fp16, 16>(
+                q_in + row * HEADS * HD + head * HD + db * 16);
+            q_vec[db] = q_half;
+            accum[db] = 0.0f;
+          }
+
+          fp32 running_max = NEG_SENTINEL;
+          fp32 running_sum = 0.0f;
+          #pragma unroll
+          for (int run = 0; run < TokensPerPartial / 4; ++run) {
+            const int prefetch_start =
+                slot_start + (run + PREFETCH_DISTANCE_RUNS) * 4;
+            #pragma unroll
+            for (int pi = 0; pi < 4; ++pi)
+              prefetch_slot(packed_kv, logical_row, block_table,
+                            block_table_stride, block_table_rows,
+                            physical_pages, request, prefetch_start + pi);
+
+            #pragma unroll
+            for (int lane = 0; lane < 4; ++lane) {
+              const int slot = slot_start + run * 4 + lane;
+              const int over = (slot >= SLOT_COUNT) ? 1 : 0;
+              const int safe_slot =
+                  slot - over * (slot - (SLOT_COUNT - 1));
+              const int logical = logical_row[safe_slot];
+              const int nonnegative = (logical >= 0) ? 1 : 0;
+              const int request_valid =
+                  (request >= 0 && request < block_table_rows) ? 1 : 0;
+              const int safe_request = request_valid ? request : 0;
+              const int valid_slot =
+                  (1 - over) * nonnegative * request_valid;
+              const int safe_logical = logical * valid_slot;
+              const int logical_page = safe_logical >> 8;
+              const int page_valid =
+                  (logical_page >= 0 && logical_page < block_table_stride) ? 1 : 0;
+              const int safe_page = page_valid ? logical_page : 0;
+              const int in_page = safe_logical & (PAGE_SIZE - 1);
+              const int physical_page =
+                  block_table[safe_request * block_table_stride + safe_page];
+              const int physical_valid =
+                  (physical_page >= 0 && physical_page < physical_pages) ? 1 : 0;
+              const int safe_physical_page = physical_valid ? physical_page : 0;
+              const int valid = valid_slot * page_valid * physical_valid;
+              const fp16* kv_row =
+                  packed_kv + safe_physical_page * KV_PAGE_STRIDE +
+                  in_page * KV_ROW_STRIDE;
+
+              fp32 score = 0.0f;
+              #pragma unroll
+              for (int db = 0; db < DIM_BLOCKS; ++db) {
+                simd<fp16, 16> k_half =
+                    block_load<fp16, 16>(kv_row + db * 16);
+                simd<fp32, 16> k_vec = k_half;
+                score += sycl::ext::intel::esimd::detail::sum<fp32, fp32, 16>(
+                    q_vec[db] * k_vec);
+              }
+              score *= INV_SQRT_HD;
+
+              simd<float, 1> score_lane;
+              score_lane[0] = score;
+              simd_mask<1> invalid_mask = (simd<int, 1>(valid) == 0);
+              score_lane = merge(simd<float, 1>(NEG_SENTINEL), score_lane,
+                                 invalid_mask);
+              const fp32 masked_score = score_lane[0];
+
+              simd<float, 1> max_lane = __ESIMD_NS::max<float, 1, float>(
+                  simd<float, 1>(running_max), score_lane);
+              const fp32 next_max = max_lane[0];
+              const fp32 old_correction = sycl::exp2(
+                  (running_max - next_max) * LOG2E);
+              simd<float, 1> weight_lane;
+              weight_lane[0] = sycl::exp2(
+                  (masked_score - next_max) * LOG2E);
+              weight_lane = merge(simd<float, 1>(0.0f), weight_lane,
+                                  invalid_mask);
+              const fp32 weight = weight_lane[0];
+
+              #pragma unroll
+              for (int db = 0; db < DIM_BLOCKS; ++db) {
+                simd<fp16, 16> v_half =
+                    block_load<fp16, 16>(kv_row + HD + db * 16);
+                simd<fp32, 16> v_vec = v_half;
+                accum[db] = accum[db] * old_correction + v_vec * weight;
+              }
+              running_sum = running_sum * old_correction + weight;
+              running_max = next_max;
+            }
+          }
+
+          fp32* dst = partials +
+                      static_cast<size_t>(row) * partial_row_stride +
+                      static_cast<size_t>(head) * partial_head_stride +
+                      static_cast<size_t>(partial_id) * PARTIAL_STRIDE;
+          block_store<fp32, 1>(dst, running_max);
+          block_store<fp32, 1>(dst + 1, running_sum);
+          #pragma unroll
+          for (int db = 0; db < DIM_BLOCKS; ++db)
+            block_store<fp32, 16>(dst + 2 + db * 16, accum[db]);
+          }
+
+          // Avoid a work-group barrier here: both SYCL and ESIMD barrier
+          // variants are not reliable for this explicit-SIMD kernel on BMG.
+          // Each head has a caller-owned epoch counter.  Every active partial
+          // publishes with an atomic CAS; partial 0 waits until all partials
+          // from this invocation are visible, then performs the merge.  The
+          // epoch lets consecutive calls reuse the same counter without a
+          // host-side memset or a second device launch.
+          if (partial_id < kActiveWorkItems) {
+            const uint32_t ready_byte_offset = static_cast<uint32_t>(
+                (row * HEADS + head) * static_cast<int>(sizeof(uint32_t)));
+            const simd<uint32_t, 1> ready_offset(ready_byte_offset);
+            const simd_mask<1> ready_mask(1);
+            const uint32_t target_epoch =
+                static_cast<uint32_t>(ready_epoch) & 0xffffu;
+            const uint32_t previous_epoch =
+                (target_epoch + 0xffffu) & 0xffffu;
+            while (true) {
+              const uint32_t observed =
+                  atomic_update<atomic_op::load, uint32_t, 1>(
+                      ready_counters, ready_offset, ready_mask)[0];
+              const uint32_t observed_epoch = observed >> 16;
+              const uint32_t observed_count = observed & 0xffffu;
+              uint32_t desired = 0;
+              if (observed_epoch == target_epoch &&
+                  observed_count < static_cast<uint32_t>(kActiveWorkItems)) {
+                desired = (target_epoch << 16) | (observed_count + 1);
+              } else if (observed_epoch == previous_epoch &&
+                         observed_count > 0) {
+                desired = (target_epoch << 16) | 1u;
+              } else {
+                continue;
+              }
+              const uint32_t old =
+                  atomic_update<atomic_op::cmpxchg, uint32_t, 1>(
+                      ready_counters, ready_offset,
+                      simd<uint32_t, 1>(desired),
+                      simd<uint32_t, 1>(observed), ready_mask)[0];
+              if (old == observed)
+                break;
+            }
+
+            if (partial_id != 0)
+              return;
+
+            const uint32_t target_state =
+                (target_epoch << 16) | static_cast<uint32_t>(kActiveWorkItems);
+            while (atomic_update<atomic_op::load, uint32_t, 1>(
+                       ready_counters, ready_offset, ready_mask)[0] !=
+                   target_state) {
+            }
+
+            const int merge_head = head;
+            fp32 global_max = NEG_SENTINEL;
+            #pragma unroll
+            for (int p = 0; p < MergePartialCount; ++p) {
+              const fp32* src = partials +
+                  static_cast<size_t>(row) * partial_row_stride +
+                  static_cast<size_t>(merge_head) * partial_head_stride +
+                  static_cast<size_t>(p) * PARTIAL_STRIDE;
+              const fp32 local_max = src[0];
+              simd<float, 1> global_lane = __ESIMD_NS::max<float, 1, float>(
+                  simd<float, 1>(global_max), simd<float, 1>(local_max));
+              global_max = global_lane[0];
+            }
+
+            simd<fp32, 16> merged[DIM_BLOCKS];
+            #pragma unroll
+            for (int db = 0; db < DIM_BLOCKS; ++db)
+              merged[db] = 0.0f;
+            fp32 merged_sum = 0.0f;
+
+            #pragma unroll
+            for (int p = 0; p < MergePartialCount; ++p) {
+              const fp32* src = partials +
+                  static_cast<size_t>(row) * partial_row_stride +
+                  static_cast<size_t>(merge_head) * partial_head_stride +
+                  static_cast<size_t>(p) * PARTIAL_STRIDE;
+              const fp32 local_max = src[0];
+              const fp32 local_sum = src[1];
+              const fp32 correction = sycl::exp2(
+                  (local_max - global_max) * LOG2E);
+              merged_sum += local_sum * correction;
+              #pragma unroll
+              for (int db = 0; db < DIM_BLOCKS; ++db) {
+                simd<fp32, 16> local =
+                    block_load<fp32, 16>(src + 2 + db * 16);
+                merged[db] = merged[db] + local * correction;
+              }
+            }
+
+            const fp32 inv_sum =
+                (merged_sum > 0.0f) ? (1.0f / merged_sum) : 0.0f;
+            #pragma unroll
+            for (int db = 0; db < DIM_BLOCKS; ++db) {
+              simd<fp32, 16> normalized = merged[db] * inv_sum;
+              simd<fp16, 16> out_half = normalized;
+              block_store<fp16, 16>(
+                  output + row * HEADS * HD + merge_head * HD + db * 16,
+                  out_half);
+            }
+          }
+        });
+  });
+}
+
+extern "C" void sparse_attention_token_split_candidate__fused(
+    sycl::queue& queue, const fp16* q_in, const fp16* packed_kv,
+    const int* logical_indices, const int* block_table,
+    const int* token_to_req, const int block_table_stride, const int rows,
+    const int block_table_rows, const int physical_pages,
+    const int partial_row_stride, const int partial_head_stride,
+    fp16* output, fp32* partials, uint32_t* ready_counters,
+    const int ready_epoch) {
+  if (rows >= 2 && rows <= BATCH_OPT_MAX_ROWS) {
+    sparse_attention_token_split_candidate__fused_impl<
+        BATCH_TOKENS_PER_PARTIAL, BATCH_PARTIAL_COUNT>(
+        queue, q_in, packed_kv, logical_indices, block_table, token_to_req,
+        block_table_stride, rows, block_table_rows, physical_pages,
+        partial_row_stride, partial_head_stride, output, partials,
+        ready_counters, ready_epoch);
+  } else {
+    sparse_attention_token_split_candidate__fused_impl<
+        TOKENS_PER_PARTIAL_VALUE, PARTIAL_COUNT>(
+        queue, q_in, packed_kv, logical_indices, block_table, token_to_req,
+        block_table_stride, rows, block_table_rows, physical_pages,
+        partial_row_stride, partial_head_stride, output, partials,
+        ready_counters, ready_epoch);
+  }
+}
+
+}  // namespace qsa_token_split_candidate
+
+namespace {
+
+void check_xpu(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.device().is_xpu(), name, " must be on XPU");
+}
+
+void check_contiguous(const at::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+}  // namespace
+
+namespace {
+
+at::Tensor run_token_split_candidate(
+    const at::Tensor& q,
+    const at::Tensor& packed_kv,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t page_size,
+    at::Tensor output,
+    at::Tensor token_split_partials,
+    int partial_row_stride,
+    int partial_head_stride,
+    int32_t* ready_counters,
+    int ready_epoch,
+    bool fused) {
+  TORCH_CHECK(q.scalar_type() == at::kHalf, "q must be float16");
+  TORCH_CHECK(packed_kv.scalar_type() == at::kHalf,
+              "packed_kv must be float16");
+  TORCH_CHECK(output.scalar_type() == at::kHalf,
+              "output must be float16");
+  TORCH_CHECK(logical_indices.scalar_type() == at::kInt,
+              "logical_indices must be int32");
+  TORCH_CHECK(block_table.scalar_type() == at::kInt,
+              "block_table must be int32");
+  TORCH_CHECK(token_to_req.scalar_type() == at::kInt,
+              "token_to_req must be int32");
+  TORCH_CHECK(token_split_partials.scalar_type() == at::kFloat,
+              "token_split_partials must be float32");
+  check_xpu(q, "q");
+  check_xpu(packed_kv, "packed_kv");
+  check_xpu(logical_indices, "logical_indices");
+  check_xpu(block_table, "block_table");
+  check_xpu(token_to_req, "token_to_req");
+  check_xpu(output, "output");
+  check_xpu(token_split_partials, "token_split_partials");
+  check_contiguous(q, "q");
+  check_contiguous(logical_indices, "logical_indices");
+  check_contiguous(block_table, "block_table");
+  check_contiguous(token_to_req, "token_to_req");
+  check_contiguous(output, "output");
+  check_contiguous(token_split_partials, "token_split_partials");
+  TORCH_CHECK(q.dim() == 3 && q.size(0) > 0 && q.size(0) <=
+                  qsa_token_split_candidate::MAX_ROWS && q.size(1) == 3 &&
+                  q.size(2) == 256,
+              "q must have shape [1..128,3,256]");
+  TORCH_CHECK(page_size == qsa_token_split_candidate::PAGE_SIZE,
+              "candidate currently requires page_size=256");
+  TORCH_CHECK(packed_kv.dim() == 4 && packed_kv.size(0) > 0 &&
+                  packed_kv.size(1) == 1 &&
+                  packed_kv.size(2) == qsa_token_split_candidate::PAGE_SIZE &&
+                  packed_kv.size(3) == 512,
+              "packed_kv must have shape [pages,1,256,512]");
+  TORCH_CHECK(packed_kv.stride(0) ==
+                  qsa_token_split_candidate::KV_PAGE_STRIDE &&
+                  packed_kv.stride(2) == qsa_token_split_candidate::KV_ROW_STRIDE &&
+                  packed_kv.stride(3) == 1,
+              "packed_kv must expose packed strides [131072,*,512,1]");
+  TORCH_CHECK(logical_indices.dim() == 2 &&
+                  logical_indices.size(0) == q.size(0) &&
+                  logical_indices.size(1) == qsa_token_split_candidate::SLOT_COUNT,
+              "logical_indices must have shape [rows,2051]");
+  TORCH_CHECK(block_table.dim() == 2 && block_table.size(0) >= 1 &&
+                  block_table.size(1) > 0 &&
+                  block_table.size(1) <= packed_kv.size(0),
+              "block_table must have shape [requests,pages] within packed KV");
+  TORCH_CHECK(token_to_req.dim() == 1 &&
+                  token_to_req.size(0) == q.size(0),
+              "token_to_req must have shape [rows]");
+  TORCH_CHECK(output.sizes() == q.sizes(), "output must match q");
+  TORCH_CHECK(q.device() == packed_kv.device() &&
+                  q.device() == logical_indices.device() &&
+                  q.device() == block_table.device() &&
+                  q.device() == token_to_req.device() &&
+                  q.device() == output.device() &&
+                  q.device() == token_split_partials.device(),
+              "all tensors must share one XPU device");
+
+  auto& queue = c10::xpu::getCurrentXPUStream(q.device().index()).queue();
+  const auto* q_ptr = reinterpret_cast<const fp16*>(q.data_ptr<at::Half>());
+  const auto* packed_ptr =
+      reinterpret_cast<const fp16*>(packed_kv.data_ptr<at::Half>());
+  const auto* indices_ptr = logical_indices.data_ptr<int32_t>();
+  const auto* table_ptr = block_table.data_ptr<int32_t>();
+  const auto* request_ptr = token_to_req.data_ptr<int32_t>();
+  auto* output_ptr = reinterpret_cast<fp16*>(output.data_ptr<at::Half>());
+  auto* partial_ptr = token_split_partials.data_ptr<float>();
+  const int rows = static_cast<int>(q.size(0));
+  const int block_table_stride = static_cast<int>(block_table.size(1));
+  const int block_table_rows = static_cast<int>(block_table.size(0));
+  const int physical_pages = static_cast<int>(packed_kv.size(0));
+
+  if (fused) {
+    qsa_token_split_candidate::sparse_attention_token_split_candidate__fused(
+        queue, q_ptr, packed_ptr, indices_ptr, table_ptr, request_ptr,
+        block_table_stride, rows, block_table_rows, physical_pages,
+        partial_row_stride, partial_head_stride, output_ptr, partial_ptr,
+        reinterpret_cast<uint32_t*>(ready_counters), ready_epoch);
+  } else if (rows >= 2 && rows <= qsa_token_split_candidate::BATCH_OPT_MAX_ROWS) {
+    qsa_token_split_candidate::sparse_attention_token_split_candidate__phase0_batch(
+        queue, q_ptr, packed_ptr, indices_ptr, table_ptr, request_ptr,
+        block_table_stride, rows, block_table_rows, physical_pages,
+        partial_row_stride, partial_head_stride, partial_ptr);
+    qsa_token_split_candidate::sparse_attention_token_split_candidate__phase1_batch(
+        queue, output_ptr, partial_ptr, rows, partial_row_stride,
+        partial_head_stride);
+  } else {
+    qsa_token_split_candidate::sparse_attention_token_split_candidate__phase0(
+        queue, q_ptr, packed_ptr, indices_ptr, table_ptr, request_ptr,
+        block_table_stride, rows, block_table_rows, physical_pages,
+        partial_row_stride, partial_head_stride, partial_ptr);
+    qsa_token_split_candidate::sparse_attention_token_split_candidate__phase1(
+        queue, output_ptr, partial_ptr, rows, partial_row_stride,
+        partial_head_stride);
+  }
+  return output;
+}
+
+}  // namespace
+
+at::Tensor sparse_attention_token_split_candidate_v2(
+    const at::Tensor& q,
+    const at::Tensor& packed_kv,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t page_size,
+    at::Tensor output,
+    at::Tensor token_split_partials) {
+  TORCH_CHECK(q.dim() == 3 && q.size(0) == 1,
+              "v2 requires exactly one row");
+  TORCH_CHECK(token_split_partials.dim() == 3 &&
+                  token_split_partials.size(0) == 3 &&
+                  token_split_partials.size(1) == qsa_token_split_candidate::SLOT_COUNT &&
+                  token_split_partials.size(2) == qsa_token_split_candidate::PARTIAL_STRIDE,
+              "v2 partials must have shape [3,2051,258]");
+  return run_token_split_candidate(
+      q, packed_kv, logical_indices, block_table, token_to_req, page_size,
+      output, token_split_partials,
+      3 * qsa_token_split_candidate::SLOT_COUNT *
+          qsa_token_split_candidate::PARTIAL_STRIDE,
+      qsa_token_split_candidate::SLOT_COUNT *
+          qsa_token_split_candidate::PARTIAL_STRIDE,
+      nullptr,
+      0,
+      false);
+}
+
+at::Tensor sparse_attention_token_split_candidate_v3(
+    const at::Tensor& q,
+    const at::Tensor& packed_kv,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t page_size,
+    at::Tensor output,
+    at::Tensor token_split_partials) {
+  TORCH_CHECK(q.dim() == 3 && q.size(0) >= 1 &&
+                  q.size(0) <= qsa_token_split_candidate::MAX_ROWS,
+              "v3 rows must be in [1,128]");
+  TORCH_CHECK(token_split_partials.dim() == 4 &&
+                  token_split_partials.size(0) == q.size(0) &&
+                  token_split_partials.size(1) == qsa_token_split_candidate::HEADS &&
+                  token_split_partials.size(2) == qsa_token_split_candidate::PARTIAL_COUNT &&
+                  token_split_partials.size(3) == qsa_token_split_candidate::PARTIAL_STRIDE,
+              "v3 partials must have shape [rows,3,57,258]");
+  const int partial_head_stride =
+      qsa_token_split_candidate::PARTIAL_COUNT *
+      qsa_token_split_candidate::PARTIAL_STRIDE;
+  return run_token_split_candidate(
+      q, packed_kv, logical_indices, block_table, token_to_req, page_size,
+      output, token_split_partials,
+      qsa_token_split_candidate::HEADS * partial_head_stride,
+      partial_head_stride,
+      nullptr,
+      0,
+      false);
+}
+
+at::Tensor sparse_attention_token_split_candidate_v4(
+    const at::Tensor& q,
+    const at::Tensor& packed_kv,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t page_size,
+    at::Tensor output,
+    at::Tensor token_split_partials,
+    at::Tensor ready_counters,
+    int64_t ready_epoch) {
+  TORCH_CHECK(q.dim() == 3 && q.size(0) >= 1 &&
+                  q.size(0) <= qsa_token_split_candidate::MAX_ROWS,
+              "v4 rows must be in [1,128]");
+  TORCH_CHECK(token_split_partials.dim() == 4 &&
+                  token_split_partials.size(0) == q.size(0) &&
+                  token_split_partials.size(1) == qsa_token_split_candidate::HEADS &&
+                  token_split_partials.size(2) == qsa_token_split_candidate::PARTIAL_COUNT &&
+                  token_split_partials.size(3) == qsa_token_split_candidate::PARTIAL_STRIDE,
+              "v4 partials must have shape [rows,3,57,258]");
+  TORCH_CHECK(ready_counters.device() == q.device() &&
+                  ready_counters.scalar_type() == at::kInt &&
+                  ready_counters.is_contiguous() &&
+                  ready_counters.dim() == 2 &&
+                  ready_counters.size(0) >= q.size(0) &&
+                  ready_counters.size(1) == qsa_token_split_candidate::HEADS,
+              "v4 ready counters must have contiguous shape [rows,3]");
+  TORCH_CHECK(ready_epoch >= 0 && ready_epoch <= 0xffff,
+              "v4 ready epoch must fit in uint16");
+  const int partial_head_stride =
+      qsa_token_split_candidate::PARTIAL_COUNT *
+      qsa_token_split_candidate::PARTIAL_STRIDE;
+  return run_token_split_candidate(
+      q, packed_kv, logical_indices, block_table, token_to_req, page_size,
+      output, token_split_partials,
+      qsa_token_split_candidate::HEADS * partial_head_stride,
+      partial_head_stride,
+      ready_counters.data_ptr<int32_t>(),
+      static_cast<int>(ready_epoch),
+      true);
+}

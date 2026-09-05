@@ -633,10 +633,10 @@ void validate_group_compression_v2_inputs(
       "first_positions must be caller-owned contiguous int64 [M,3]");
 
   TORCH_CHECK(
-      raw_keys.is_contiguous() && raw_positions.is_contiguous() &&
+      raw_keys.stride(2) == 1 && raw_positions.is_contiguous() &&
           raw_positions.stride(2) == 1 &&
           compressor_state_cache.stride(3) == 1,
-      "QSA group compression v2 requires contiguous raw inputs and inner cache width");
+      "QSA group compression v2 requires inner-contiguous raw inputs and cache width");
   TORCH_CHECK(
       is_positive_non_overlapping(compressor_state_cache),
       "compressor state cache must have positive non-overlapping strides");
