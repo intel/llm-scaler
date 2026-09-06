@@ -2,10 +2,56 @@
 #include <torch/all.h>
 #include <torch/library.h>
 #include <Python.h>
+#include <cstdint>
 
 #include "kernel_ops.h"
 
+namespace {
+
+// Metadata-only fixed-geometry preflight, in the same order as the caller.
+// Status: 0=valid, 1=device, 2=dtype, 3=shape, 4=layout/alignment.
+int64_t qwen38_moe_weight_contract_v1(
+    at::TensorList tensors, c10::Device device) {
+  TORCH_CHECK(tensors.size() == 7, "Qwen3.8 MoE preflight expects seven weights");
+  static constexpr int64_t shapes[7][3] = {
+      {512, 256, 1280}, {512, 256, 20}, {512, 2560, 64},
+      {512, 2560, 1}, {160, 2560, 0}, {2560, 80, 0}, {1, 2560, 0}};
+  for (size_t i = 0; i < tensors.size(); ++i) {
+    const auto& tensor = tensors[i];
+    if (tensor.device() != device) return 1;
+    if (tensor.scalar_type() != ((i == 0 || i == 2) ? at::kByte : at::kHalf))
+      return 2;
+    const int64_t dims = i < 4 ? 3 : 2;
+    if (tensor.dim() != dims) return 3;
+    for (int64_t dim = 0; dim < dims; ++dim)
+      if (tensor.size(dim) != shapes[i][dim]) return 3;
+    if (!tensor.is_contiguous() ||
+        reinterpret_cast<uintptr_t>(tensor.const_data_ptr()) % 16 != 0)
+      return 4;
+  }
+  return 0;
+}
+
+bool qwen38_moe_output_overlaps_v1(
+    const at::Tensor& output, at::TensorList inputs) {
+  const auto begin = reinterpret_cast<uintptr_t>(output.const_data_ptr());
+  const auto end = begin + output.numel() * output.element_size();
+  for (const auto& input : inputs) {
+    if (input.device() != output.device() || input.numel() == 0) continue;
+    const auto input_begin = reinterpret_cast<uintptr_t>(input.const_data_ptr());
+    const auto input_end = input_begin + input.numel() * input.element_size();
+    if (begin < input_end && input_begin < end) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
 TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
+  m.def("qwen38_moe_weight_contract_v1(Tensor[] weights, Device device) -> int",
+        &qwen38_moe_weight_contract_v1);
+  m.def("qwen38_moe_output_overlaps_v1(Tensor output, Tensor[] inputs) -> bool",
+        &qwen38_moe_output_overlaps_v1);
   m.def("esimd_gemv_fp8_pern(Tensor input, Tensor weight, Tensor weight_scale, "
         "Tensor output, int N, int K) -> Tensor");
   m.impl("esimd_gemv_fp8_pern", torch::kXPU, &esimd_gemv_fp8_pern);
