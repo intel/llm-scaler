@@ -9,6 +9,20 @@
 
 namespace {
 
+// Metadata-only batching: preserve the complete ATen alias rule, including
+// shared-owner storages, without 30 Python/C++ crossings per HC boundary.
+static bool hc_outputs_alias_inputs_v1(
+    at::TensorList outputs, at::TensorList inputs) {
+  for (const auto& output : outputs) {
+    for (const auto& input : inputs) {
+      if (output.is_alias_of(input)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 // The existing HC ESIMD kernels use an even FP16 storage offset as their
 // 4-byte alignment contract.  Keep the same conservative rule for every
 // tensor in the host chain, including the caller-owned scratch outputs.
@@ -139,6 +153,7 @@ static void validate_hc_combine_mix_m1(
 // The PLE-only build does not link esimd_kernel.sycl.  Resolve the two GEMV
 // operators through the dispatcher instead of taking direct symbol references
 // so that this translation unit remains linkable in that standalone artifact.
+template<bool FUSED_UP_GATE = false>
 static void hc_combine_mix_m1_v1(
     at::Tensor hidden,
     at::Tensor block,
@@ -166,6 +181,19 @@ static void hc_combine_mix_m1_v1(
                                "esimd_hc_down_fp16_out",
                                "")
                            .typed<HcDownFunction>();
+  if constexpr (FUSED_UP_GATE) {
+    using FusedUpFunction = void(at::Tensor, at::Tensor, at::Tensor, at::Tensor);
+    static const auto fused_op = c10::Dispatcher::singleton()
+        .findSchemaOrThrow(
+            "custom_esimd_kernels_vllm::esimd_hc_up_gate_mix_m1_v1", "")
+        .typed<FusedUpFunction>();
+    const auto down_narrow = down.narrow(1, 0, 320);
+    (void)ple::hc_combine_norm_v1(
+        hidden, block, injection, norm_weight, combined, normed, eps);
+    down_op.call(normed, down_weight, down);
+    fused_op.call(down_narrow, up_weight, normed, mixed);
+    return;
+  }
   static const auto gemv_op = c10::Dispatcher::singleton()
                            .findSchemaOrThrow(
                                "custom_esimd_kernels_vllm::esimd_gemv_fp16",
@@ -186,6 +214,8 @@ static void hc_combine_mix_m1_v1(
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
+  m.def("hc_outputs_alias_inputs_v1(Tensor[] outputs, Tensor[] inputs) -> bool",
+        &hc_outputs_alias_inputs_v1);
   m.def("ple_ngram_ids(Tensor input_ids, Tensor query_start_loc, "
         "Tensor ngram_context, Tensor layer_multipliers, "
         "Tensor ngram_heads_vocab_sizes, Tensor ngram_heads_offsets, "
@@ -279,6 +309,14 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
                hidden, prev_block, prev_injection, norm_weight, down_weight,
                up_weight, combined, normed, down, gate, mixed, eps);
          });
+
+  m.def(
+      "hc_combine_mix_m1_v2(Tensor hidden, Tensor prev_block, "
+      "Tensor prev_injection, Tensor norm_weight, Tensor down_weight, "
+      "Tensor up_weight, Tensor(a!) combined, Tensor(b!) normed, "
+      "Tensor(c!) down, Tensor(d!) gate, Tensor(e!) mixed, float eps) -> ()");
+  m.impl("hc_combine_mix_m1_v2", torch::kXPU,
+         &hc_combine_mix_m1_v1<true>);
 
   m.def("hc_combine_norm_m4_v1(Tensor hidden_states, Tensor block_output, "
         "Tensor injection, Tensor weight, Tensor(a!) combined_output, "

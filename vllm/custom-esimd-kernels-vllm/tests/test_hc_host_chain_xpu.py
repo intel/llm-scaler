@@ -53,6 +53,30 @@ def _chain_op():
     return torch.ops.custom_esimd_kernels_vllm.hc_combine_mix_m1_v1
 
 
+@pytest.mark.parametrize("on_cpu", [False, True])
+def test_batched_alias_matches_aten_without_writes(device, on_cpu):
+    operation = getattr(
+        torch.ops.custom_esimd_kernels_vllm, "hc_outputs_alias_inputs_v1", None
+    )
+    if operation is None:
+        pytest.skip("canonical main DSO lacks optional batched alias schema")
+    target = torch.device("cpu") if on_cpu else device
+    base = torch.arange(32, device=target)
+    other = torch.zeros_like(base)
+    outputs = (base[:8], other[:8])
+    for inputs in ((base[16:],), (other[12:],), (torch.ones_like(base),), ()):
+        expected = any(
+            torch._C._is_alias_of(output, value)
+            for output in outputs for value in inputs
+        )
+        assert operation(outputs, inputs) == expected
+    assert not operation((), (base,))
+    replacement = torch.full_like(base, 7)
+    outputs[0].set_(replacement.untyped_storage(), 0, (8,))
+    assert operation(outputs, (replacement,))
+    assert torch.equal(replacement, torch.full_like(base, 7))
+
+
 def _random_fp16(
     device: torch.device,
     shape: tuple[int, ...],
@@ -160,6 +184,58 @@ def test_chain_matches_the_four_existing_ops_bitwise(device: torch.device) -> No
 
     _assert_exact(chain_outputs, reference_outputs)
     assert chain_outputs[2][:, 320:324].shape == (1, 4)
+
+
+@pytest.mark.parametrize("scale", [0.01, 0.2, 1.0, 8.0])
+def test_fused_up_gate_preserves_fp16_projection_rounding(device, scale):
+    operation = getattr(
+        torch.ops.custom_esimd_kernels_vllm, "esimd_hc_up_gate_mix_m1_v1", None
+    )
+    if operation is None:
+        pytest.skip("main DSO lacks fused HC up+gate")
+    generator = torch.Generator().manual_seed(3820)
+    x = _random_fp16(device, (1, HC_RANK), generator, scale)
+    w = _random_fp16(device, (HC_WIDTH, HC_RANK), generator, scale)
+    normed = _random_fp16(device, (1, HC_WIDTH), generator, 1.0)
+    expected = torch.empty((1, HC_HIDDEN), device=device, dtype=torch.float16)
+    actual = torch.empty_like(expected)
+    gate = torch.empty_like(normed)
+    ops = torch.ops.custom_esimd_kernels_vllm
+    ops.esimd_gemv_fp16(x, w, gate)
+    ops.hc_gate_mix_v1(normed, gate, expected)
+    operation(x, w, normed, actual)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # Current and nondefault streams need no shared workspace or host wait.
+    stream = torch.xpu.Stream(device=device)
+    stream.wait_stream(torch.xpu.current_stream(device))
+    with torch.xpu.stream(stream):
+        for _ in range(32):
+            operation(x, w, normed, actual)
+    torch.xpu.current_stream(device).wait_stream(stream)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_fused_chain_keeps_outputs_and_transaction_preflight(device):
+    operation = getattr(
+        torch.ops.custom_esimd_kernels_vllm, "hc_combine_mix_m1_v2", None
+    )
+    if operation is None:
+        pytest.skip("main DSO lacks HC chain v2")
+    inputs = _make_inputs(device)
+    actual, expected = _make_outputs(device), _make_outputs(device)
+    _run_four_existing_ops(inputs, expected)
+    operation(*inputs, *actual, EPS)
+    # v2 does not materialize the obsolete gate scratch, kept for ABI stability.
+    for index in (0, 1, 2, 4):
+        torch.testing.assert_close(actual[index], expected[index], rtol=0, atol=0)
+    snapshots = _snapshot_outputs(actual)
+    with pytest.raises(RuntimeError):
+        operation(*inputs, *actual, -1.0)
+    _assert_outputs_unchanged(actual, snapshots)
+    bad_outputs = (*actual[:4], actual[0][:, :HC_HIDDEN])
+    with pytest.raises(RuntimeError):
+        operation(*inputs, *bad_outputs, EPS)
+    _assert_outputs_unchanged(actual, snapshots)
 
 
 def test_rejects_bad_dtype_before_writing_outputs(device: torch.device) -> None:

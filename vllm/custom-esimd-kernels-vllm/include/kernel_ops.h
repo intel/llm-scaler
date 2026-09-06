@@ -40,6 +40,9 @@ at::Tensor esimd_gemv_fp16(
 
 // Qwen3.8 HC down GEMV.  The first 320 outputs receive SiLU(x / 4)
 // after the linear FP16 rounding boundary; an optional 16-row tail stays linear.
+void esimd_hc_up_gate_mix_m1_v1(
+    at::Tensor input, at::Tensor weight, at::Tensor normed, at::Tensor output);
+
 void esimd_hc_down_fp16_out(
     at::Tensor input, at::Tensor weight, at::Tensor output);
 

@@ -137,6 +137,51 @@ struct GEMV_fp16_hc_up_m1_kernel {
     }
 };
 
+// One work-item owns all four HC branches of an output coordinate. Preserve
+// the old 128+128+64 reduction and the FP16 gate rounding before sigmoid.
+struct GEMV_fp16_hc_up_gate_mix_m1_kernel {
+    const fp16* input;
+    const fp16* weight;
+    const fp16* normed;
+    fp16* output;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        constexpr int W = 128;
+        constexpr int T = 64;
+        const int h = item.get_global_id(0);
+        const simd<float, W> x0 = block_load<fp16, W>(input);
+        const simd<float, W> x1 = block_load<fp16, W>(input + W);
+        const simd<float, T> x2 = block_load<fp16, T>(input + 2 * W);
+        simd<float, 1> mixed = 0.0f;
+#pragma unroll
+        for (int branch = 0; branch < 4; ++branch) {
+            const int row = branch * 2560 + h;
+            const size_t base = static_cast<size_t>(row) * 320;
+            const simd<float, W> w0 = block_load<fp16, W>(weight + base);
+            const simd<float, W> w1 = block_load<fp16, W>(weight + base + W);
+            const simd<float, T> w2 = block_load<fp16, T>(weight + base + 2 * W);
+            const float a0 = reduce<float>(x0 * w0, std::plus<>());
+            const float a1 = reduce<float>(x1 * w1, std::plus<>());
+            const float a2 = reduce<float>(x2 * w2, std::plus<>());
+            const fp16 rounded_gate(a0 + a1 + a2);
+            const simd<float, 1> gate(static_cast<float>(rounded_gate));
+            const simd<float, 1> value(static_cast<float>(normed[row]));
+            mixed += value / (1.0f + esimd_math::exp(-gate));
+        }
+        output[h] = fp16((mixed * 0.25f)[0]);
+    }
+};
+
+inline void GEMV_fp16_hc_up_gate_mix_m1_host(
+    const fp16* input, const fp16* weight, const fp16* normed,
+    fp16* output, sycl::queue& q) {
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(2560, 32),
+            GEMV_fp16_hc_up_gate_mix_m1_kernel{input, weight, normed, output});
+    });
+}
+
 template<int VL, int K_SPLIT>
 struct GEMV_fp16_gelu_mul_kernel {
     const fp16* input;
