@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import os
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,11 @@ pytestmark = pytest.mark.skipif(
 
 
 def _load_qsa_extension():
+    if dso := os.environ.get("QSA_TEST_DSO"):
+        spec = importlib.util.spec_from_file_location("qsa_ops", dso)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
     try:
         return importlib.import_module("custom_esimd_kernels_vllm.qsa_ops")
     except ImportError:
@@ -188,12 +194,15 @@ def test_qsa_module_contract(qsa_ops):
 
 @pytest.mark.parametrize("page_size", [256, 512])
 @pytest.mark.parametrize(
+    "operation", ["sparse_paged_attention_v2", "sparse_paged_attention_v3"]
+)
+@pytest.mark.parametrize(
     "case",
     ["empty", "holes_duplicates_pages", "valid_width_32", "full_width_2051"],
 )
 @pytest.mark.parametrize("rows", [1, 2])
 def test_qsa_matches_reference_and_preserves_inputs(
-    qsa_ops, case, rows, page_size
+    qsa_ops, case, rows, page_size, operation
 ):
     torch.manual_seed(20260828)
     args = list(_make_inputs(case, rows, page_size))
@@ -208,7 +217,7 @@ def test_qsa_matches_reference_and_preserves_inputs(
     ]
     expected = _reference(*args[:6], page_size)
 
-    returned = qsa_ops.sparse_paged_attention_v2(*args)
+    returned = getattr(qsa_ops, operation)(*args)
     torch.xpu.synchronize()
 
     assert q.dtype == torch.float16
@@ -227,6 +236,56 @@ def test_qsa_matches_reference_and_preserves_inputs(
         [q, packed_kv, logical_indices, block_table, token_to_req], snapshots
     ):
         assert torch.equal(actual, snapshot)
+
+
+def test_qsa_v3_v2_abi_reuses_scratch_across_rows_and_streams(qsa_ops):
+    """Grow/reuse scratch with queued consumers, without per-call waits."""
+    cases = [
+        _make_inputs("holes_duplicates_pages", rows, 256)
+        for rows in (1, 4, 2, 128, 1)
+    ]
+    expected = [_reference(*args[:7]) for args in cases]
+    streams = [torch.xpu.current_stream(), torch.xpu.Stream()]
+    streams[1].wait_stream(streams[0])
+    results = []
+    for stream in streams:
+        with torch.xpu.stream(stream):
+            for _ in range(12):
+                for index, args in enumerate(cases):
+                    out = torch.empty_like(args[0])
+                    returned = qsa_ops.sparse_paged_attention_v3(*args[:7], out)
+                    assert returned.data_ptr() == out.data_ptr()
+                    results.append((index, out.clone()))
+    torch.xpu.synchronize()
+    for index, out in results:
+        torch.testing.assert_close(out, expected[index], atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("rows", [0, 129])
+def test_qsa_v3_v2_abi_falls_back_outside_row_range(qsa_ops, rows):
+    args = _make_inputs("valid_width_32", rows, 256)
+    expected = qsa_ops.sparse_paged_attention_v2(*args[:8]).clone()
+    out = torch.empty_like(args[0])
+    returned = qsa_ops.sparse_paged_attention_v3(*args[:7], out)
+    torch.xpu.synchronize()
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("invalid", ["v_storage", "output_alias", "indices_dtype"])
+def test_qsa_v3_v2_abi_rejects_before_output_write(qsa_ops, invalid):
+    args = list(_make_inputs("valid_width_32", 1, 256)[:8])
+    if invalid == "v_storage":
+        args[2] = _make_inputs("empty", 1, 256)[2]
+    elif invalid == "output_alias":
+        args[7] = args[0]
+    else:
+        args[3] = args[3].long()
+    args[7].fill_(7)
+    with pytest.raises(RuntimeError):
+        qsa_ops.sparse_paged_attention_v3(*args)
+    torch.xpu.synchronize()
+    assert torch.all(args[7] == 7)
 
 
 @pytest.mark.parametrize("case", ["holes_duplicates_pages", "full_width_2051"])

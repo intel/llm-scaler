@@ -800,6 +800,10 @@ at::Tensor sparse_attention_token_split_candidate_v4(
     at::Tensor ready_counters,
     int64_t ready_epoch);
 
+at::Tensor sparse_paged_attention_v3(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, int64_t, at::Tensor);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def(
       "sparse_paged_attention",
@@ -813,6 +817,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       "sparse_paged_attention_v2",
       &sparse_paged_attention_v2,
       "Qwen3.8 page-specialized sparse paged attention (XPU)");
+  module.def(
+      "sparse_paged_attention_v3",
+      &sparse_paged_attention_v3,
+      "Qwen3.8 token-split attention with the v2 caller ABI (XPU)");
+  module.attr("qsa_token_split_v2_caller_abi_version") = 1;
   module.def(
       "sparse_paged_attention_bounded_v2",
       &sparse_paged_attention_bounded_v2,

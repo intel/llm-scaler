@@ -17,6 +17,8 @@
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
 
 #include <cstdint>
+#include <map>
+#include <tuple>
 
 using namespace sycl::ext::intel::esimd;
 using namespace sycl::ext::intel::experimental::esimd;
@@ -860,6 +862,63 @@ at::Tensor sparse_attention_token_split_candidate_v3(
       nullptr,
       0,
       false);
+}
+
+at::Tensor sparse_paged_attention_v2(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, int64_t, at::Tensor);
+
+// Same caller ABI as v2; only the backend and private workspace differ.
+at::Tensor sparse_paged_attention_v3(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t main_page_size,
+    at::Tensor output) {
+  if (main_page_size != 256 || (q.dim() == 3 && q.size(0) > 128) ||
+      (q.dim() == 3 && q.size(0) == 0)) {
+    return sparse_paged_attention_v2(
+        q, k_cache, v_cache, logical_indices, block_table, token_to_req,
+        main_page_size, output);
+  }
+  check_xpu(q, "q");
+  TORCH_CHECK(q.dim() == 3 && q.size(0) >= 1 && q.size(0) <= 128,
+              "v3 rows must be in [1,128]");
+  TORCH_CHECK(k_cache.dim() == 4 && k_cache.size(1) == 256 &&
+                  k_cache.size(2) == 1 && k_cache.size(3) == 256 &&
+                  k_cache.stride(0) == 131072 && k_cache.stride(1) == 512 &&
+                  k_cache.stride(2) == 256 && k_cache.stride(3) == 1,
+              "k_cache must have packed shape [pages,256,1,256]");
+  TORCH_CHECK(v_cache.sizes() == k_cache.sizes() &&
+                  v_cache.strides() == k_cache.strides() &&
+                  v_cache.scalar_type() == k_cache.scalar_type() &&
+                  v_cache.device() == k_cache.device() &&
+                  v_cache.is_alias_of(k_cache) &&
+                  v_cache.storage_offset() == k_cache.storage_offset() + 256,
+              "v_cache must be the adjacent packed V view");
+  for (const auto* input : {&q, &k_cache, &v_cache, &logical_indices,
+                            &block_table, &token_to_req}) {
+    TORCH_CHECK(!output.is_alias_of(*input), "output must not alias an input");
+  }
+  auto packed_kv = k_cache.as_strided(
+      {k_cache.size(0), 1, 256, 512}, {131072, 131072, 512, 1});
+  const auto stream = c10::xpu::getCurrentXPUStream(q.device().index());
+  TORCH_CHECK(stream.queue().is_in_order(), "QSA v3 requires an in-order queue");
+  // No scratch is shared by different streams or submitting host threads.
+  // Reuse on this stream is fenced by the existing phase0 -> phase1 ordering.
+  // Grow one buffer per stream, rather than retaining one per row count.
+  using Key = std::tuple<int, int64_t>;
+  thread_local std::map<Key, at::Tensor> workspaces;
+  auto& workspace = workspaces[{q.device().index(), stream.id()}];
+  if (!workspace.defined() || workspace.size(0) < q.size(0)) {
+    workspace = at::empty({q.size(0), 3, 43, 258}, q.options().dtype(at::kFloat));
+  }
+  return sparse_attention_token_split_candidate_v3(
+      q, packed_kv, logical_indices, block_table, token_to_req, main_page_size,
+      output, workspace.narrow(0, 0, q.size(0)));
 }
 
 at::Tensor sparse_attention_token_split_candidate_v4(
