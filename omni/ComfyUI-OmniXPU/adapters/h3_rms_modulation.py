@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import inspect
 import logging
 from functools import wraps
@@ -16,9 +15,6 @@ from ..patches.debug import log_debug_event, trace_patch
 log = logging.getLogger("ComfyUI-OmniXPU")
 
 _PATCH_MARKER = "__omnixpu_h3_rms_modulation_original__"
-_EXPECTED_FORWARD_SHA256 = (
-    "a117b068b48abfc4e3b6e0a92fdf6b964043028f9846212562ec192a7a9136e5"
-)
 _HIDDEN_SIZE = 5376
 _MODULATION_EXPAND = 6
 _MAX_SEGMENTS = 8
@@ -42,8 +38,32 @@ def get_stats() -> dict[str, Any]:
     }
 
 
-def _source_sha256(function: Callable[..., Any]) -> str:
-    return hashlib.sha256(inspect.getsource(function).encode("utf-8")).hexdigest()
+def _forward_api_reason(function: Callable[..., Any]) -> str:
+    # Registration needs the supported call API, not a particular source-file
+    # spelling. Installed-source tests separately check the upstream model math.
+    try:
+        parameters = tuple(inspect.signature(function).parameters.values())
+    except (TypeError, ValueError):
+        return "MiniMax H3 DiTBlock.forward signature is unavailable"
+    names = (
+        "self", "x", "t_emb", "mod_segments", "rope_freqs",
+        "transformer_options",
+    )
+    if (
+        tuple(parameter.name for parameter in parameters) != names
+        or any(
+            parameter.kind != inspect.Parameter.POSITIONAL_OR_KEYWORD
+            for parameter in parameters
+        )
+        or any(
+            parameter.default is not inspect.Parameter.empty
+            for parameter in parameters[:-1]
+        )
+        or not isinstance(parameters[-1].default, dict)
+        or parameters[-1].default
+    ):
+        return "MiniMax H3 DiTBlock.forward API is unsupported"
+    return ""
 
 
 def _segment_reason(segments: Any, rows: int, modulation_rows: int) -> str:
@@ -168,6 +188,36 @@ def _run_fused(
     return output, ""
 
 
+def _rms_modulation(
+    comfy_ops: Any,
+    original_modulate: Callable[..., Any],
+    layer: Any,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    segments: list[tuple[int, int, int]],
+    reason: str,
+) -> tuple[torch.Tensor, int]:
+    global _routed_calls
+
+    # Cast helpers execute these hooks. Let the original norm own that call
+    # once instead of probing a hook result and then invoking the norm again.
+    if not reason and len(getattr(layer, "weight_function", ())) > 0:
+        reason = "norm_weight_function"
+    if not reason and len(getattr(layer, "bias_function", ())) > 0:
+        reason = "norm_bias_function"
+    if not reason:
+        output, reason = _run_fused(comfy_ops, layer, x, scale, shift, segments)
+        if output is not None:
+            _routed_calls += 1
+            return output, 1
+
+    # Once AdaLN or a residual update has run, keep fallback at this operator
+    # boundary. Replaying the block would repeat projection or in-place gates.
+    _record_fallback(reason)
+    return original_modulate(layer(x), shift, scale, segments), 0
+
+
 def apply():
     global _omni_norm
 
@@ -185,6 +235,8 @@ def apply():
     )
     if not callable(policy_supported):
         return False, "native segmented RMS modulation policy is unavailable"
+    if not callable(getattr(candidate, "rms_norm_segmented_modulation", None)):
+        return False, "native segmented RMS modulation operation is unavailable"
 
     try:
         import comfy.model_management
@@ -192,10 +244,14 @@ def apply():
         import comfy.ldm.minimax.model as h3_model
     except ImportError:
         return False, "MiniMax H3 ComfyUI model is unavailable"
-    if not hasattr(comfy_ops, "CastBiasWeightContext") or not hasattr(
-        comfy_ops, "run_every_op"
-    ):
+    if not all(callable(getattr(comfy_ops, name, None)) for name in (
+        "CastBiasWeightContext", "run_every_op",
+    )):
         return False, "ComfyUI cast/offload helpers are unavailable"
+    if not all(callable(getattr(h3_model, name, None)) for name in (
+        "_mod_scale_shift", "_mod_gate",
+    )):
+        return False, "MiniMax H3 modulation helpers are unavailable"
 
     target = getattr(h3_model, "DiTBlock", None)
     if target is None or not callable(getattr(target, "forward", None)):
@@ -203,12 +259,9 @@ def apply():
     original = target.forward
     if hasattr(original, _PATCH_MARKER):
         return True, "already patched"
-    try:
-        source_hash = _source_sha256(original)
-    except (OSError, TypeError):
-        return False, "MiniMax H3 DiTBlock.forward source is unavailable"
-    if source_hash != _EXPECTED_FORWARD_SHA256:
-        return False, "MiniMax H3 DiTBlock.forward source changed"
+    reason = _forward_api_reason(original)
+    if reason:
+        return False, reason
 
     _omni_norm = candidate
 
@@ -221,8 +274,6 @@ def apply():
         rope_freqs,
         transformer_options={},
     ):
-        global _routed_calls
-
         if not policy_supported(x):
             return original(
                 self,
@@ -247,16 +298,6 @@ def apply():
 
         modulation = self.adaln_proj(t_emb)
         reason = _modulation_reason(modulation, x, mod_segments)
-        if reason:
-            _record_fallback(reason)
-            return original(
-                self,
-                x,
-                t_emb,
-                mod_segments,
-                rope_freqs,
-                transformer_options=transformer_options,
-            )
         (
             shift_msa,
             scale_msa,
@@ -266,24 +307,16 @@ def apply():
             gate_mlp,
         ) = modulation
 
-        h, reason = _run_fused(
+        h, first_fused = _rms_modulation(
             comfy_ops,
+            h3_model._mod_scale_shift,
             self.norm1,
             x,
             scale_msa,
             shift_msa,
             mod_segments,
+            reason,
         )
-        if h is None:
-            _record_fallback(reason)
-            return original(
-                self,
-                x,
-                t_emb,
-                mod_segments,
-                rope_freqs,
-                transformer_options=transformer_options,
-            )
 
         x = h3_model._mod_gate(
             x,
@@ -295,19 +328,16 @@ def apply():
             ),
             mod_segments,
         )
-        h, reason = _run_fused(
+        h, second_fused = _rms_modulation(
             comfy_ops,
+            h3_model._mod_scale_shift,
             self.norm2,
             x,
             scale_mlp,
             shift_mlp,
             mod_segments,
+            reason,
         )
-        if h is None:
-            raise RuntimeError(
-                "H3 norm2 modulation contract changed after routing: "
-                f"{reason}"
-            )
         output = h3_model._mod_gate(
             x,
             gate_mlp,
@@ -315,17 +345,18 @@ def apply():
             mod_segments,
         )
 
-        _routed_calls += 2
-        log_debug_event(
-            "kernel",
-            "h3_rms_norm_segmented_modulation",
-            {"input": x, "output": output},
-            details={
-                "backend": "bmg_sycl",
-                "segments": len(mod_segments),
-                "fused_calls": 2,
-            },
-        )
+        fused_calls = first_fused + second_fused
+        if fused_calls:
+            log_debug_event(
+                "kernel",
+                "h3_rms_norm_segmented_modulation",
+                {"input": x, "output": output},
+                details={
+                    "backend": "bmg_sycl",
+                    "segments": len(mod_segments),
+                    "fused_calls": fused_calls,
+                },
+            )
         return output
 
     patched = trace_patch(
