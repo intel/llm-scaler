@@ -512,6 +512,29 @@ These are inference interfaces, with no registered backward. Other native
 APIs, including the in-place normalization/rotary operations, require their
 own compiler contracts; this is not a package-wide full-graph guarantee.
 
+Native dispatcher operators are opaque to Inductor. Compilation can fuse
+surrounding Torch operations, but these boundaries do not expose the native
+SYCL or oneDNN implementation for cross-operator fusion.
+
+Operator-level numerical equality does not guarantee model-level equality.
+Inductor fusion can change FP16/BF16 intermediate rounding; validate the
+compiled model against its own accuracy requirements. For numerical diagnosis,
+where the installed Inductor exposes `emulate_precision_casts`, select it
+explicitly to preserve eager low-precision casts:
+
+```python
+compiled_model = torch.compile(
+    model,
+    backend="inductor",
+    options={"emulate_precision_casts": True},
+)
+```
+
+This compiler policy can affect performance and is not a universal bitwise
+accuracy guarantee. The library does not change it globally. PyTorch describes
+backend isolation and model-quality checks in its
+[compiled-model numerical guidance](https://docs.pytorch.org/blog/training-production-ai-models/).
+
 ## Debug logging
 
 Native logging is disabled by default. Enable all modules or a comma-separated

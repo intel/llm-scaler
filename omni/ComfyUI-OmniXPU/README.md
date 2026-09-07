@@ -138,6 +138,23 @@ OMNIXPU_MEDIAN_STRICT_INDICES=1
 median workaround was only verified on BMG with Torch 2.10 and remains
 disabled by default on other configurations.
 
+## Native compiled inference
+
+Upstream `TorchCompileModel` clones the diffusion model with
+`disable_dynamic=True`. That clone does not disable service-wide DynamicVRAM
+for text encoding or VAE execution. Match the service memory mode and model
+cloning when comparing eager and compiled performance; use ComfyUI's separate
+`--disable-dynamic-vram` option when explicitly selecting a service without
+DynamicVRAM.
+
+Compiled FP16/BF16 pointwise operations can round differently from eager even
+when each native operator matches. See the kernel package's
+[compiled-inference guidance](../omni_xpu_kernel/README.md#compiled-inference).
+On an installed Torch build that supports the option,
+`TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1` before ComfyUI startup selects eager
+precision emulation for that process. This is an explicit numerical policy to
+validate for the model, not a default enabled by OmniXPU.
+
 ## Debugging and diagnostics
 
 Kernel-only tracing:
