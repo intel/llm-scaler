@@ -41,6 +41,12 @@ from typing import Optional, Tuple
 
 import torch
 
+from .._compile_ops import (
+    compile_op, fake_rowwise, fake_silu_mul, fake_silu_mul_rowwise,
+    fake_swiglu_rowwise, fake_gelu_rowwise, fake_int8_linear,
+    fake_prequantized, fake_shared_input, fake_rotate_convrot,
+)
+
 from ._reference import (
     quantize_int8_tensorwise as _ref_quantize_int8_tensorwise,
     quantize_int8_rowwise as _ref_quantize_int8_rowwise,
@@ -808,6 +814,7 @@ def quantize_int8_tensorwise(
     return _ref_quantize_int8_tensorwise(x, scale, stochastic_rounding)
 
 
+@compile_op("quantize_int8_rowwise", fake_rowwise)
 def quantize_int8_rowwise(
     x: torch.Tensor,
     stochastic_rounding: int = 0,
@@ -823,6 +830,8 @@ def quantize_int8_rowwise(
             - quantized_int8: INT8 tensor with same shape
             - scales: Float32 tensor [..., 1] with per-row scales
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.quantize_int8_rowwise(x, stochastic_rounding)
     native = _get_native()
     if native is not None:
         # The fused hot path covers deterministic FP32/FP16/BF16 rowwise input.
@@ -839,6 +848,7 @@ def quantize_int8_rowwise(
     return _ref_quantize_int8_rowwise(x, stochastic_rounding)
 
 
+@compile_op("fused_silu_mul_quantize_rowwise", fake_silu_mul_rowwise)
 def fused_silu_mul_quantize_rowwise(
     x1: torch.Tensor,
     x2: torch.Tensor,
@@ -849,16 +859,21 @@ def fused_silu_mul_quantize_rowwise(
     returned quantized tensor and row scales can be passed directly to
     :func:`int8_linear_prequantized`.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.fused_silu_mul_quantize_rowwise(x1, x2)
     native = _get_native()
     if native is not None and hasattr(native, "fused_silu_mul_quantize_rowwise"):
         return native.fused_silu_mul_quantize_rowwise(x1, x2)
     return _ref_fused_silu_mul_quantize_rowwise(x1, x2)
 
 
+@compile_op("fused_swiglu_quantize_rowwise", fake_swiglu_rowwise)
 def fused_swiglu_quantize_rowwise(
     input: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fuse concatenated ``[gate | up]`` SwiGLU with rowwise INT8 quantization."""
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.fused_swiglu_quantize_rowwise(input)
     if input.shape[-1] <= 0 or input.shape[-1] % 2:
         raise ValueError("SwiGLU input last dimension must be positive and even")
     native = _get_native()
@@ -868,10 +883,13 @@ def fused_swiglu_quantize_rowwise(
     return _ref_fused_silu_mul_quantize_rowwise(gate, up)
 
 
+@compile_op("fused_gelu_tanh_quantize_rowwise", fake_gelu_rowwise)
 def fused_gelu_tanh_quantize_rowwise(
     input: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fuse tanh-approximate GELU with rowwise INT8 quantization."""
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.fused_gelu_tanh_quantize_rowwise(input)
     if input.shape[-1] <= 0:
         raise ValueError("GELU input last dimension must be positive")
     native = _get_native()
@@ -881,6 +899,7 @@ def fused_gelu_tanh_quantize_rowwise(
     return quantize_int8_rowwise(activated)
 
 
+@compile_op("fused_silu_mul", fake_silu_mul)
 def fused_silu_mul(
     x1: torch.Tensor,
     x2: torch.Tensor,
@@ -891,6 +910,8 @@ def fused_silu_mul(
     ConvRot: it removes the separate SiLU allocation while preserving the
     existing optimized transform implementation.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.fused_silu_mul(x1, x2)
     native = _get_native()
     if native is not None and hasattr(native, "fused_silu_mul"):
         return native.fused_silu_mul(x1, x2)
@@ -963,6 +984,7 @@ def mm_int8(
     return _ref_mm_int8(a, b)
 
 
+@compile_op("int8_linear", fake_int8_linear)
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -993,6 +1015,8 @@ def int8_linear(
     Returns:
         Result tensor [..., N] in out_dtype.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.int8_linear(x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize, input_act)
     if out_dtype is None:
         out_dtype = x.dtype
     width = 2 if input_act == "swiglu" else 1
@@ -1183,6 +1207,7 @@ def int8_linear(
     )
 
 
+@compile_op("int8_linear_prequantized", fake_prequantized)
 def int8_linear_prequantized(
     x_int8: torch.Tensor,
     x_scale: torch.Tensor,
@@ -1208,6 +1233,8 @@ def int8_linear_prequantized(
     Returns:
         Result tensor [..., N] in out_dtype.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.int8_linear_prequantized(x_int8, x_scale, weight, weight_scale, bias, out_dtype)
     dtype_code = {
         torch.float32: 0,
         torch.float16: 1,
@@ -1241,6 +1268,7 @@ def int8_linear_prequantized(
     )
 
 
+@compile_op("int8_linear_shared_input", fake_shared_input)
 def int8_linear_shared_input(
     x: torch.Tensor,
     weight1: torch.Tensor,
@@ -1258,6 +1286,8 @@ def int8_linear_shared_input(
     ConvRot, when requested, is also applied once and therefore must be shared
     by both weights.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.int8_linear_shared_input(x, weight1, weight_scale1, weight2, weight_scale2, bias1, bias2, out_dtype, convrot, convrot_groupsize)
     _clear_krea2_activation_cache()
     _clear_bmg_qkv_activation_cache()
     if out_dtype is None:
@@ -1338,11 +1368,14 @@ def int8_linear_shared_input(
     )
 
 
+@compile_op("rotate_convrot", fake_rotate_convrot)
 def rotate_convrot(
     x: torch.Tensor,
     group_size: int = 256,
 ) -> torch.Tensor:
     """Apply the online groupwise Hadamard activation rotation."""
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.rotate_convrot(x, group_size)
     if x.shape[-1] % group_size != 0:
         raise ValueError(
             f"features {x.shape[-1]} not divisible by group_size {group_size}"

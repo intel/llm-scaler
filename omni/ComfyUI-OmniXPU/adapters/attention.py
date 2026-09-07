@@ -52,6 +52,8 @@ _torch_sdpa_count = 0
 
 
 def _record_attention_route(route):
+    if torch.compiler.is_compiling():
+        return 0
     count = _attention_route_counts.get(route, 0) + 1
     _attention_route_counts[route] = count
     return count
@@ -116,6 +118,8 @@ def _trace_attention_contract(
     skip_reshape,
     skip_output_reshape,
 ):
+    if torch.compiler.is_compiling():
+        return
     if os.environ.get("OMNI_ATTN_TRACE_CONTRACTS", "0") not in {
         "1",
         "true",
@@ -859,8 +863,9 @@ def apply():
             skip_reshape,
             skip_output_reshape,
         ):
-            _torch_sdpa_count += 1
-            if _torch_sdpa_count <= 3:
+            if not torch.compiler.is_compiling():
+                _torch_sdpa_count += 1
+            if not torch.compiler.is_compiling() and _torch_sdpa_count <= 3:
                 log.info(
                     "[OmniXPU] attention TORCH #%d: heads=%d seq=%d dtype=%s",
                     _torch_sdpa_count,
@@ -892,11 +897,12 @@ def apply():
         # auto-only route for validated target/Torch pairs and workflow shapes;
         # unsupported wheels and layouts retain the unmodified Torch fallback.
         if not reasons and use_workflow_cute_d120:
-            _cute_call_count += 1
+            if not torch.compiler.is_compiling():
+                _cute_call_count += 1
             route_call_count = _record_attention_route(
                 "boogu_cute_d120_bhld"
             )
-            if route_call_count <= 3:
+            if 0 < route_call_count <= 3:
                 log.info(
                     "[OmniXPU] attention CUTE_D120 #%d: heads=%d seq=%d dtype=%s",
                     route_call_count,
@@ -918,7 +924,8 @@ def apply():
         # the former as metadata-only views and pass the latter directly so
         # the public D128 op avoids three 216 MiB layout copies per H3 block.
         if not reasons and use_bmg_d128_bhld_cute:
-            _cute_call_count += 1
+            if not torch.compiler.is_compiling():
+                _cute_call_count += 1
             if heads == 56:
                 route = "minimax_h3_h56_bf16_d128_qkv_bhld"
             elif q_len == kv_len:
@@ -931,14 +938,14 @@ def apply():
             else:
                 route = f"bmg_b{b}_bf16_d128_kv1024_cross"
             route_call_count = _record_attention_route(route)
-            if not _attention_experimental_warning_emitted:
+            if not torch.compiler.is_compiling() and not _attention_experimental_warning_emitted:
                 log.warning(
                     "[OmniXPU] experimental capability-driven BMG D128 "
                     "CUTE route enabled; set OMNI_ATTN_BACKEND=torch "
                     "to disable it if this workflow shows an issue"
                 )
                 _attention_experimental_warning_emitted = True
-            if route_call_count <= 3:
+            if 0 < route_call_count <= 3:
                 log.info(
                     "[OmniXPU] attention CUTE_BHLD_D128 #%d: "
                     "heads=%d q=%d kv=%d dtype=%s",
@@ -1008,11 +1015,12 @@ def apply():
         # rectangular contract. Use the dedicated BMG CUTE entry point so the
         # cross-attention accumulates in FP32 instead of the ESIMD FP16 path.
         if not reasons and use_bmg_wan22_cute_cross:
-            _cute_call_count += 1
+            if not torch.compiler.is_compiling():
+                _cute_call_count += 1
             route_call_count = _record_attention_route(
                 "wan22_t2v_turbo_720p_cross"
             )
-            if route_call_count <= 3:
+            if 0 < route_call_count <= 3:
                 log.info(
                     "[OmniXPU] attention CUTE_WAN22 #%d: "
                     "heads=%d q=%d kv=%d dtype=%s",
@@ -1064,10 +1072,11 @@ def apply():
         # extent. Derive all strides from the runtime sequence length and keep
         # unrelated D64 layouts on Torch SDPA.
         if not reasons and use_bmg_minimax_h3_vae_d64:
-            _cute_call_count += 1
+            if not torch.compiler.is_compiling():
+                _cute_call_count += 1
             route = "minimax_h3_video_vae_fp16_d64"
             route_call_count = _record_attention_route(route)
-            if route_call_count <= 3:
+            if 0 < route_call_count <= 3:
                 log.info(
                     "[OmniXPU] attention CUTE_H3_VAE_D64 #%d: "
                     "heads=%d seq=%d dtype=%s",
@@ -1131,14 +1140,15 @@ def apply():
             )
 
         if reasons:
-            _attention_fallback_count += 1
-            key = ",".join(reasons)
-            _attention_fallback_reasons[key] = (
-                _attention_fallback_reasons.get(key, 0) + 1
-            )
-            if _attention_fallback_count <= 5:
-                seq = q.shape[1] if not skip_reshape else q.shape[2]
-                log.info("[OmniXPU] attention fallback: %s (seq=%d)", key, seq)
+            if not torch.compiler.is_compiling():
+                _attention_fallback_count += 1
+                key = ",".join(reasons)
+                _attention_fallback_reasons[key] = (
+                    _attention_fallback_reasons.get(key, 0) + 1
+                )
+                if _attention_fallback_count <= 5:
+                    seq = q.shape[1] if not skip_reshape else q.shape[2]
+                    log.info("[OmniXPU] attention fallback: %s (seq=%d)", key, seq)
             return _pytorch_fallback(
                 q,
                 k,
@@ -1152,12 +1162,14 @@ def apply():
             )
 
         if selected_backend == "cute":
-            _cute_call_count += 1
-            selected_call_count = _cute_call_count
+            if not torch.compiler.is_compiling():
+                _cute_call_count += 1
+            selected_call_count = 0 if torch.compiler.is_compiling() else _cute_call_count
         else:
-            _esimd_call_count += 1
-            selected_call_count = _esimd_call_count
-        if selected_call_count <= 3:
+            if not torch.compiler.is_compiling():
+                _esimd_call_count += 1
+            selected_call_count = 0 if torch.compiler.is_compiling() else _esimd_call_count
+        if 0 < selected_call_count <= 3:
             seq = q.shape[1] if not skip_reshape else q.shape[2]
             log.info(
                 "[OmniXPU] attention %s #%d: heads=%d seq=%d dtype=%s",

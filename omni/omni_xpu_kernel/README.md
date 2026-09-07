@@ -494,6 +494,24 @@ if rotary.kitchen_rope_fast_supported(x, freqs_cis):
 Callers should use the capability query before selecting a specialized native
 route and preserve the established PyTorch fallback.
 
+## Compiled inference
+
+The allocating RMSNorm/LayerNorm APIs and the INT8 activation, ConvRot and
+linear APIs used by Z-Image expose dispatcher operators for `torch.compile`.
+Their FakeTensor implementations describe output shape, dtype and layout;
+execution still uses the existing native kernels. Dense CUTE attention also
+provides FakeTensor implementations for its available entry points.
+
+```python
+with torch.inference_mode():
+    compiled_norm = torch.compile(norm.rms_norm, fullgraph=True)
+    output = compiled_norm(weight, activation, eps=1e-6)
+```
+
+These are inference interfaces, with no registered backward. Other native
+APIs, including the in-place normalization/rotary operations, require their
+own compiler contracts; this is not a package-wide full-graph guarantee.
+
 ## Debug logging
 
 Native logging is disabled by default. Enable all modules or a comma-separated

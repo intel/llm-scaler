@@ -139,6 +139,8 @@ def _route_inputs(
 
 
 def _record_fallback(reason: str) -> None:
+    if torch.compiler.is_compiling():
+        return
     global _fallback_calls
     _fallback_calls += 1
     _fallback_reasons[reason] = _fallback_reasons.get(reason, 0) + 1
@@ -153,6 +155,8 @@ def get_stats() -> dict[str, Any]:
 
 
 def _record_krea_fallback(reason: str) -> None:
+    if torch.compiler.is_compiling():
+        return
     global _krea_fallback_calls
     _krea_fallback_calls += 1
     _krea_fallback_reasons[reason] = (
@@ -342,7 +346,8 @@ def apply():
                 w2.scale,
                 out_dtype=x.dtype,
             )
-            _routed_calls += 1
+            if not torch.compiler.is_compiling():
+                _routed_calls += 1
             log_debug_event(
                 "kernel",
                 "int8_swiglu_mlp",
@@ -391,7 +396,8 @@ def apply():
                     gated = F.silu(gate).mul_(up)
                 else:
                     gated = _omni_int8.fused_silu_mul(gate, up)
-                    _krea_routed_calls += 1
+                    if not torch.compiler.is_compiling():
+                        _krea_routed_calls += 1
                     log_debug_event(
                         "kernel",
                         "krea2_swiglu",

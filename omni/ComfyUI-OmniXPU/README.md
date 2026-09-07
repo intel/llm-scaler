@@ -172,6 +172,11 @@ Set tracing variables before startup. The **OmniXPU Status** node reports:
   and apply status;
 - attention and fused INT8 FFN routing counters.
 
+Attention and INT8 FFN counters record eager calls. During `torch.compile`,
+these diagnostic counters and logs are excluded from tracing so changing a
+counter cannot cause recompilation. Use the Torch profiler's operator events
+to inspect compiled native calls.
+
 Kitchen backend ownership can be inspected independently:
 
 ```bash

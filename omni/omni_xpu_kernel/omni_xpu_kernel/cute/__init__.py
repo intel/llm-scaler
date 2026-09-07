@@ -78,11 +78,45 @@ def _ensure_loaded():
             "(set OMNI_CUTE_FMHA_SO to override)"
         )
     torch.ops.load_library(extension)
+    _register_fake_kernels()
     _loaded = True
+
+
+
+def _fake_blhd(q, k, v):
+    return q.new_empty(q.shape)
+
+
+def _fake_bhld_blhd_backed(q, k, v):
+    b, h, length, d = q.shape
+    return q.new_empty((b, length, h, d)).permute(0, 2, 1, 3)
+
+
+def _fake_bhld_d128(q, k, v):
+    # Match the native output layout, including QKV-backed H3 inputs.
+    if q.stride(1) == q.shape[2] * q.shape[3] and q.stride(2) == q.shape[3]:
+        return q.new_empty(q.shape)
+    return _fake_bhld_blhd_backed(q, k, v)
+
+
+def _register_fake_kernels():
+    # The loaded sidecar determines which target-specific schemas exist.
+    for name, implementation in (
+        ("sdp", _fake_blhd),
+        ("sdp_wan22_cross", _fake_blhd),
+        ("sdp_bhld_d128", _fake_bhld_d128),
+        ("sdp_bhld_d120", _fake_bhld_blhd_backed),
+        ("sdp_minimax_h3_vae_d64", _fake_bhld_blhd_backed),
+    ):
+        if hasattr(torch.ops.cute_fmha, name):
+            torch.library.register_fake("cute_fmha::" + name)(implementation)
 
 
 def _prepare_bmg_policy_dispatch(tensor: torch.Tensor) -> None:
     """Let the core extension own the process-wide BMG policy warning."""
+
+    if torch.compiler.is_compiling():
+        return
 
     from .. import __xpu_target__, device
 

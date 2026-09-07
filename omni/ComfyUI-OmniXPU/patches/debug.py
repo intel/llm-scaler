@@ -84,7 +84,9 @@ def log_debug_event(
     xpu_only: bool = True,
     verbose_only: bool = False,
 ) -> None:
-    """Log one debug event without evaluating or synchronizing tensors."""
+    """Log eager events; tracing must not specialize on diagnostic state."""
+    if torch.compiler.is_compiling():
+        return
     if verbose_only:
         if not verbose_debug_enabled():
             return
