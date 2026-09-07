@@ -33,6 +33,7 @@
 
 #include "moe_topk.h"
 #include "../xpu/esimd_kernels/moe_ops.h"  // TopK V2 vectorized argmax
+#include "../xpu/esimd_kernels/int4_GEMV.h"  // Same router GEMV as esimd_gemv_int4
 
 using fp16 = sycl::half;
 using namespace sycl::ext::intel::esimd;
@@ -3321,6 +3322,11 @@ static inline bool moe_asymmetric_v1_tensors_overlap(
 }
 
 struct MoeM1AsymmetricV1Buffers {
+    // The router result shares the existing per-stream scratch entry with
+    // top-k and expert intermediates. The queue is in-order, so a later layer
+    // can reuse it only after the previous layer's down kernel consumes it;
+    // a different stream gets a different entry.
+    torch::Tensor router_logits;
     torch::Tensor topk_idx;
     torch::Tensor topk_weight;
     torch::Tensor intermediates;
@@ -3354,6 +3360,8 @@ static MoeM1AsymmetricV1Buffers& ensure_moe_m1_asymmetric_v1_buffers(
     MoeM1AsymmetricV1Buffers candidate;
     auto int_options = torch::device(device).dtype(torch::kInt32);
     auto half_options = torch::device(device).dtype(torch::kHalf);
+    candidate.router_logits = torch::empty(
+        {N_TOKENS, 512}, half_options);
     candidate.topk_idx = torch::empty({N_TOKENS, TOP_K}, int_options);
     candidate.topk_weight = torch::empty({N_TOKENS, TOP_K}, half_options);
     candidate.intermediates =
@@ -3800,6 +3808,155 @@ torch::Tensor moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_out_v1(
         (const fp16*)shared_down_weight.data_ptr(),
         (fp16*)output.data_ptr(), N_TOKENS, TOP_K, HIDDEN_SIZE,
         ROUTED_INTERMEDIATE_SIZE, SHARED_INTERMEDIATE_SIZE,
+        NUM_SHARED_EXPERTS, device);
+
+    return output;
+}
+
+
+// Compact80 M=1 host chain: run the exact N-major INT4 router GEMV used by
+// esimd_gemv_int4, then reuse the existing FP32-internal top-k and compact80
+// up/down kernels.  The router weights are supplied in the linear ESIMD
+// layout [E, K/2] uint8 with [E, K/128] FP16 scales; no weight conversion is
+// performed here.
+torch::Tensor moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_router_out_v1(
+    torch::Tensor x,
+    torch::Tensor router_weight,
+    torch::Tensor router_scale,
+    torch::Tensor w13_qweight_s4,
+    torch::Tensor w13_scales,
+    torch::Tensor w2_qweight_s4,
+    torch::Tensor w2_scales,
+    torch::Tensor shared_gate_up_weight,
+    torch::Tensor shared_down_weight,
+    torch::Tensor shared_expert_gate_weight,
+    torch::Tensor output,
+    int64_t top_k,
+    int64_t num_shared_experts,
+    int64_t n_routed_experts) {
+
+    constexpr int N_TOKENS = 1;
+    constexpr int HIDDEN_SIZE = 2560;
+    constexpr int N_ROUTED_EXPERTS = 512;
+    constexpr int TOP_K = 10;
+    constexpr int ROUTER_K_PACKED = HIDDEN_SIZE / 2;
+    constexpr int ROUTER_GROUPS = HIDDEN_SIZE / 128;
+    constexpr int ROUTED_INTERMEDIATE_SIZE = 80;
+    constexpr int SHARED_INTERMEDIATE_SIZE = 80;
+    constexpr int NUM_SHARED_EXPERTS = 1;
+
+    TORCH_CHECK(top_k == TOP_K,
+                "compact80 router out v1 requires top_k=10");
+    TORCH_CHECK(num_shared_experts == NUM_SHARED_EXPERTS,
+                "compact80 router out v1 requires one shared expert");
+    TORCH_CHECK(n_routed_experts == N_ROUTED_EXPERTS,
+                "compact80 router out v1 requires 512 routed experts");
+
+    const torch::Device device = x.device();
+    check_moe_asymmetric_v1_tensor(
+        x, "x", torch::kHalf, {N_TOKENS, HIDDEN_SIZE}, device);
+    check_moe_asymmetric_v1_tensor(
+        router_weight, "router_weight", torch::kByte,
+        {N_ROUTED_EXPERTS, ROUTER_K_PACKED}, device);
+    check_moe_asymmetric_v1_tensor(
+        router_scale, "router_scale", torch::kHalf,
+        {N_ROUTED_EXPERTS, ROUTER_GROUPS}, device);
+    check_moe_asymmetric_v1_tensor(
+        w13_qweight_s4, "w13_qweight_s4", torch::kByte,
+        {N_ROUTED_EXPERTS, 2 * ROUTED_INTERMEDIATE_SIZE,
+         HIDDEN_SIZE / 2}, device);
+    check_moe_asymmetric_v1_tensor(
+        w13_scales, "w13_scales", torch::kHalf,
+        {N_ROUTED_EXPERTS, 2 * ROUTED_INTERMEDIATE_SIZE,
+         HIDDEN_SIZE / 128}, device);
+    check_moe_asymmetric_v1_tensor(
+        w2_qweight_s4, "w2_qweight_s4", torch::kByte,
+        {N_ROUTED_EXPERTS, HIDDEN_SIZE, ROUTED_INTERMEDIATE_SIZE / 2},
+        device);
+    check_moe_asymmetric_v1_tensor(
+        w2_scales, "w2_scales", torch::kHalf,
+        {N_ROUTED_EXPERTS, HIDDEN_SIZE,
+         (ROUTED_INTERMEDIATE_SIZE + 127) / 128}, device);
+    check_moe_asymmetric_v1_tensor(
+        shared_gate_up_weight, "shared_gate_up_weight", torch::kHalf,
+        {2 * SHARED_INTERMEDIATE_SIZE, HIDDEN_SIZE}, device);
+    check_moe_asymmetric_v1_tensor(
+        shared_down_weight, "shared_down_weight", torch::kHalf,
+        {HIDDEN_SIZE, SHARED_INTERMEDIATE_SIZE}, device);
+    check_moe_asymmetric_v1_tensor(
+        shared_expert_gate_weight, "shared_expert_gate_weight", torch::kHalf,
+        {NUM_SHARED_EXPERTS, HIDDEN_SIZE}, device);
+    check_moe_asymmetric_v1_tensor(
+        output, "output", torch::kHalf, {N_TOKENS, HIDDEN_SIZE}, device);
+    TORCH_CHECK(
+        !moe_asymmetric_v1_tensors_overlap(output, x) &&
+            !moe_asymmetric_v1_tensors_overlap(output, router_weight) &&
+            !moe_asymmetric_v1_tensors_overlap(output, router_scale) &&
+            !moe_asymmetric_v1_tensors_overlap(output, w13_qweight_s4) &&
+            !moe_asymmetric_v1_tensors_overlap(output, w13_scales) &&
+            !moe_asymmetric_v1_tensors_overlap(output, w2_qweight_s4) &&
+            !moe_asymmetric_v1_tensors_overlap(output, w2_scales) &&
+            !moe_asymmetric_v1_tensors_overlap(output, shared_gate_up_weight) &&
+            !moe_asymmetric_v1_tensors_overlap(output, shared_down_weight) &&
+            !moe_asymmetric_v1_tensors_overlap(
+                output, shared_expert_gate_weight),
+        "output must not alias any input tensor");
+
+    // Resolve the stream/context and allocate all internal workspace before
+    // submitting the router.  There is deliberately no post-submit fallback.
+    auto stream = c10::xpu::getCurrentXPUStream(device.index());
+    sycl::queue& queue = stream.queue();
+    TORCH_CHECK(stream.device_index() == device.index(),
+                "current XPU stream does not match x device");
+    TORCH_CHECK(queue.get_context() == c10::xpu::get_device_context(),
+                "current XPU stream uses a foreign SYCL context");
+    TORCH_CHECK(
+        queue.get_device() == c10::xpu::get_raw_device(device.index()),
+        "current XPU stream queue does not match x device");
+    auto& buffers = ensure_moe_m1_asymmetric_v1_buffers(device, stream);
+
+    // This is the same GEMV_int4_host implementation called by the regular
+    // esimd_gemv_int4 linear path. It writes FP16 router logits directly into
+    // the stream-local buffer consumed by the existing top-k kernel.
+    GEMV_int4_host(
+        reinterpret_cast<uint8_t*>(x.data_ptr()),
+        reinterpret_cast<uint8_t*>(router_weight.data_ptr()),
+        reinterpret_cast<uint8_t*>(router_scale.data_ptr()),
+        reinterpret_cast<uint8_t*>(buffers.router_logits.data_ptr()),
+        N_ROUTED_EXPERTS, HIDDEN_SIZE, queue);
+    moe_topk_v2_host<N_ROUTED_EXPERTS, TOP_K>(
+        reinterpret_cast<const fp16*>(buffers.router_logits.data_ptr()),
+        reinterpret_cast<fp16*>(buffers.topk_weight.data_ptr()),
+        buffers.topk_idx.data_ptr<int32_t>(), N_TOKENS, queue);
+
+    fp16* routed_intermediates_ptr =
+        reinterpret_cast<fp16*>(buffers.intermediates.data_ptr());
+    fp16* shared_intermediates_ptr = routed_intermediates_ptr +
+        static_cast<size_t>(N_TOKENS) * TOP_K * ROUTED_INTERMEDIATE_SIZE;
+    float* shared_gate_values_ptr = buffers.gate_values.data_ptr<float>();
+
+    moe_tiny_m_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
+        reinterpret_cast<const fp16*>(x.data_ptr()),
+        reinterpret_cast<const uint8_t*>(w13_qweight_s4.data_ptr()),
+        reinterpret_cast<const fp16*>(w13_scales.data_ptr()),
+        buffers.topk_idx.data_ptr<int32_t>(),
+        reinterpret_cast<const fp16*>(shared_gate_up_weight.data_ptr()),
+        reinterpret_cast<const fp16*>(shared_expert_gate_weight.data_ptr()),
+        routed_intermediates_ptr, shared_intermediates_ptr,
+        shared_gate_values_ptr, N_TOKENS, TOP_K, HIDDEN_SIZE,
+        ROUTED_INTERMEDIATE_SIZE, SHARED_INTERMEDIATE_SIZE,
+        NUM_SHARED_EXPERTS, device);
+    moe_tiny_m_down_cutlass_int4_with_shared_fp16_htile_kernel<int32_t>(
+        reinterpret_cast<const fp16*>(routed_intermediates_ptr),
+        reinterpret_cast<const uint8_t*>(w2_qweight_s4.data_ptr()),
+        reinterpret_cast<const fp16*>(w2_scales.data_ptr()),
+        reinterpret_cast<const fp16*>(buffers.topk_weight.data_ptr()),
+        buffers.topk_idx.data_ptr<int32_t>(),
+        reinterpret_cast<const fp16*>(shared_intermediates_ptr),
+        reinterpret_cast<const float*>(shared_gate_values_ptr),
+        reinterpret_cast<const fp16*>(shared_down_weight.data_ptr()),
+        reinterpret_cast<fp16*>(output.data_ptr()), N_TOKENS, TOP_K,
+        HIDDEN_SIZE, ROUTED_INTERMEDIATE_SIZE, SHARED_INTERMEDIATE_SIZE,
         NUM_SHARED_EXPERTS, device);
 
     return output;
@@ -5149,6 +5306,7 @@ TORCH_LIBRARY_FRAGMENT(moe_int4_ops, m) {
     m.def("moe_router_topk_int4(Tensor x, Tensor weight, Tensor scale, bool use_ggml_layout, int top_k, int n_routed_experts, bool norm) -> (Tensor, Tensor)");
     m.def("moe_topk_int4(Tensor logits, int top_k, int n_routed_experts, bool norm) -> (Tensor, Tensor)");
     m.def("moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_out_v1(Tensor x, Tensor logits, Tensor w13_qweight_s4, Tensor w13_scales, Tensor w2_qweight_s4, Tensor w2_scales, Tensor shared_gate_up_weight, Tensor shared_down_weight, Tensor shared_expert_gate_weight, Tensor(a!) output, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor(a!)");
+    m.def("moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_router_out_v1(Tensor x, Tensor router_weight, Tensor router_scale, Tensor w13_qweight_s4, Tensor w13_scales, Tensor w2_qweight_s4, Tensor w2_scales, Tensor shared_gate_up_weight, Tensor shared_down_weight, Tensor shared_expert_gate_weight, Tensor(a!) output, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor(a!)");
     m.def("moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_compact80_out_v1(Tensor x, Tensor logits, Tensor w13_qweight_s4, Tensor w13_scales, Tensor w2_qweight_s4, Tensor w2_scales, Tensor shared_gate_up_weight, Tensor shared_down_weight, Tensor shared_expert_gate_weight, Tensor(a!) output, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor(a!)");
     m.def("moe_route_precompute_int4(Tensor topk_weight, Tensor topk_idx, int num_experts) -> (Tensor, Tensor, Tensor)");
     m.def("moe_silu_mul_int4(Tensor gate_up) -> Tensor");
@@ -5214,6 +5372,7 @@ TORCH_LIBRARY_IMPL(moe_int4_ops, XPU, m) {
     m.impl("moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits", &moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits);
     m.impl("moe_forward_m1_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1", &moe_forward_m1_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1);
     m.impl("moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_out_v1", &moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_out_v1);
+    m.impl("moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_router_out_v1", &moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_router_out_v1);
     m.impl("moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_compact80_out_v1", &moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_compact80_out_v1);
     m.impl("moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1", &moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1);
     m.impl("moe_tiny_fp16_shared_up", &moe_tiny_fp16_shared_up);
@@ -5238,6 +5397,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared", &moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared);
     m.def("moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits", &moe_forward_tiny_cutlass_nmajor_int4_full_fp16_shared_from_logits);
     m.def("moe_forward_m1_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1", &moe_forward_m1_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1);
+    m.def("moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_router_out_v1", &moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_router_out_v1);
     m.def("moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1", &moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1);
     m.def("moe_tiny_fp16_shared_up", &moe_tiny_fp16_shared_up);
     m.def("moe_tiny_fp16_shared_finalize", &moe_tiny_fp16_shared_finalize);

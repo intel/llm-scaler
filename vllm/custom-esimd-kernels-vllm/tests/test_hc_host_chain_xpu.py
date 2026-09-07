@@ -238,6 +238,49 @@ def test_fused_chain_keeps_outputs_and_transaction_preflight(device):
     _assert_outputs_unchanged(actual, snapshots)
 
 
+def test_workspace_matches_v2_and_owns_scratch_per_stream(device):
+    try:
+        workspace = torch.classes.custom_esimd_kernels_vllm.HCWorkspace()
+    except RuntimeError:
+        pytest.skip("main DSO lacks optional HCWorkspace class")
+
+    inputs = _make_inputs(device, seed=3807)
+    expected = _make_outputs(device)
+    _run_four_existing_ops(inputs, expected)
+
+    actual = workspace.run(*inputs, EPS)
+    torch.xpu.synchronize()
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], expected[4], rtol=0, atol=0)
+    torch.testing.assert_close(actual[2], expected[2][:, 320:324], rtol=0, atol=0)
+
+    first_pointers = tuple(value.data_ptr() for value in actual)
+    repeated = workspace.run(*inputs, EPS)
+    assert tuple(value.data_ptr() for value in repeated) == first_pointers
+
+    # Returned tensors are live outputs.  Reusing them as the next input must
+    # force a fresh owner scratch allocation rather than overwrite in-flight
+    # data on the same stream.
+    recurrent_inputs = (
+        actual[0], inputs[1], actual[2], *inputs[3:]
+    )
+    recurrent = workspace.run(*recurrent_inputs, EPS)
+    assert recurrent[0].data_ptr() != actual[0].data_ptr()
+    assert recurrent[2].data_ptr() != actual[2].data_ptr()
+
+    other_stream = torch.xpu.Stream(device=device)
+    with torch.xpu.stream(other_stream):
+        other = workspace.run(*inputs, EPS)
+    other_stream.synchronize()
+    assert other[0].data_ptr() not in {
+        actual[0].data_ptr(), recurrent[0].data_ptr()
+    }
+
+    bad_inputs = _make_inputs(device, rows=2, seed=3808)
+    with pytest.raises(RuntimeError):
+        workspace.run(*bad_inputs, EPS)
+
+
 def test_rejects_bad_dtype_before_writing_outputs(device: torch.device) -> None:
     inputs = list(_make_inputs(device))
     inputs[5] = inputs[5].float()

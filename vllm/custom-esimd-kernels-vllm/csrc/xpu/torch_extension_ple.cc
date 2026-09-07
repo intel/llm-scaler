@@ -1,9 +1,15 @@
 #include <ATen/core/dispatch/Dispatcher.h>
+#include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
+#include <torch/custom_class.h>
 #include <torch/library.h>
 
 #include <array>
 #include <cmath>
+#include <mutex>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
 
 #include "xpu/esimd_kernels/ple.h"
 
@@ -154,7 +160,7 @@ static void validate_hc_combine_mix_m1(
 // operators through the dispatcher instead of taking direct symbol references
 // so that this translation unit remains linkable in that standalone artifact.
 template<bool FUSED_UP_GATE = false>
-static void hc_combine_mix_m1_v1(
+static void hc_combine_mix_m1_v1_impl(
     at::Tensor hidden,
     at::Tensor block,
     at::Tensor injection,
@@ -166,10 +172,13 @@ static void hc_combine_mix_m1_v1(
     at::Tensor down,
     at::Tensor gate,
     at::Tensor mixed,
-    double eps) {
-  validate_hc_combine_mix_m1(
-      hidden, block, injection, norm_weight, down_weight, up_weight,
-      combined, normed, down, gate, mixed, eps);
+    double eps,
+    bool validate) {
+  if (validate) {
+    validate_hc_combine_mix_m1(
+        hidden, block, injection, norm_weight, down_weight, up_weight,
+        combined, normed, down, gate, mixed, eps);
+  }
 
   using HcDownFunction = void(at::Tensor, at::Tensor, at::Tensor);
   using HcGemvFunction = at::Tensor(at::Tensor, at::Tensor, at::Tensor);
@@ -210,6 +219,131 @@ static void hc_combine_mix_m1_v1(
   (void)gemv_op.call(down_narrow, up_weight, gate);
   (void)ple::hc_gate_mix_v1(normed, gate, mixed);
 }
+
+template<bool FUSED_UP_GATE = false>
+static void hc_combine_mix_m1_v1(
+    at::Tensor hidden,
+    at::Tensor block,
+    at::Tensor injection,
+    at::Tensor norm_weight,
+    at::Tensor down_weight,
+    at::Tensor up_weight,
+    at::Tensor combined,
+    at::Tensor normed,
+    at::Tensor down,
+    at::Tensor gate,
+    at::Tensor mixed,
+    double eps) {
+  hc_combine_mix_m1_v1_impl<FUSED_UP_GATE>(
+      hidden, block, injection, norm_weight, down_weight, up_weight,
+      combined, normed, down, gate, mixed, eps, true);
+}
+
+struct HcM1Scratch {
+  at::Tensor combined;
+  at::Tensor normed;
+  at::Tensor down;
+  at::Tensor gate;
+  at::Tensor mixed;
+  at::Tensor injection;
+};
+
+static HcM1Scratch make_hc_m1_scratch(const at::Tensor& hidden) {
+  const auto options = at::TensorOptions()
+                           .device(hidden.device())
+                           .dtype(at::kHalf)
+                           .requires_grad(false);
+  HcM1Scratch scratch{
+      at::empty({1, 10240}, options),
+      at::empty({1, 10240}, options),
+      at::empty({1, 336}, options),
+      at::empty({1, 10240}, options),
+      at::empty({1, 2560}, options),
+      at::Tensor(),
+  };
+  // Entries [320:324] are the injected stream used by the next HC boundary.
+  scratch.injection = scratch.down.narrow(/*dim=*/1, /*start=*/320, /*length=*/4);
+  return scratch;
+}
+
+static bool hc_m1_scratch_aliases(
+    const HcM1Scratch& scratch,
+    const std::array<at::Tensor, 6>& inputs) {
+  const std::array<const at::Tensor*, 5> outputs = {
+      &scratch.combined, &scratch.normed, &scratch.down,
+      &scratch.gate, &scratch.mixed};
+  for (size_t output_index = 0; output_index < outputs.size();
+       ++output_index) {
+    for (const at::Tensor& input : inputs) {
+      if (outputs[output_index]->is_alias_of(input)) {
+        return true;
+      }
+    }
+    for (size_t other_index = output_index + 1;
+         other_index < outputs.size(); ++other_index) {
+      if (outputs[output_index]->is_alias_of(*outputs[other_index])) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+class HcM1Workspace final : public torch::CustomClassHolder {
+ public:
+  std::tuple<at::Tensor, at::Tensor, at::Tensor> run(
+      at::Tensor hidden,
+      at::Tensor block,
+      at::Tensor injection,
+      at::Tensor norm_weight,
+      at::Tensor down_weight,
+      at::Tensor up_weight,
+      double eps) {
+    TORCH_CHECK(hidden.defined(), "hidden must be defined");
+    TORCH_CHECK(hidden.device().is_xpu(), "hidden must be on XPU");
+
+    // Torch may invoke a custom class from multiple Python threads after the
+    // GIL is released. Protect the per-stream map and the complete
+    // preflight/submit transaction for this owner. Scratch remains
+    // partitioned by stream; this only serializes host bookkeeping.
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    const std::array<at::Tensor, 6> inputs = {
+        hidden, block, injection, norm_weight, down_weight, up_weight};
+    const c10::Stream stream =
+        c10::xpu::getCurrentXPUStream(hidden.device().index()).unwrap();
+    auto scratch_it = scratch_by_stream_.find(stream);
+    if (scratch_it == scratch_by_stream_.end() ||
+        hc_m1_scratch_aliases(scratch_it->second, inputs)) {
+      HcM1Scratch scratch = make_hc_m1_scratch(hidden);
+      scratch_it =
+          scratch_by_stream_.insert_or_assign(stream, std::move(scratch)).first;
+    }
+    HcM1Scratch& scratch = scratch_it->second;
+
+    // This is the complete transaction preflight.  It must finish before the
+    // first GPU submit; no post-submit exception is converted into fallback.
+    validate_hc_combine_mix_m1(
+        hidden, block, injection, norm_weight, down_weight, up_weight,
+        scratch.combined, scratch.normed, scratch.down, scratch.gate,
+        scratch.mixed, eps);
+    hc_combine_mix_m1_v1_impl<true>(
+        hidden, block, injection, norm_weight, down_weight, up_weight,
+        scratch.combined, scratch.normed, scratch.down, scratch.gate,
+        scratch.mixed, eps, false);
+    return {scratch.combined, scratch.mixed, scratch.injection};
+  }
+
+ private:
+  std::mutex mutex_;
+  std::unordered_map<c10::Stream, HcM1Scratch> scratch_by_stream_;
+};
+
+static auto register_hc_m1_workspace =
+    torch::class_<HcM1Workspace>(
+        "custom_esimd_kernels_vllm", "HCWorkspace")
+        .def(torch::init<>())
+        .def("run", &HcM1Workspace::run);
 
 }  // namespace
 

@@ -49,6 +49,15 @@ def _load_focused_dso() -> None:
     torch.ops.load_library(str(dso))
 
 
+@pytest.fixture(scope="module")
+def real_router_gemv():
+    try:
+        from custom_esimd_kernels_vllm import esimd_gemv_int4
+    except (ImportError, OSError) as exc:
+        pytest.skip(f"canonical esimd_gemv_int4 is unavailable: {exc}")
+    return esimd_gemv_int4
+
+
 @dataclass
 class Inputs:
     x_cpu: torch.Tensor
@@ -61,6 +70,10 @@ class Inputs:
     w2_selected_scales_cpu: torch.Tensor
     w2_qweight_s4: torch.Tensor
     w2_scales: torch.Tensor
+    w13_compact80_qweight_s4: torch.Tensor
+    w13_compact80_scales: torch.Tensor
+    w2_compact80_qweight_s4: torch.Tensor
+    w2_compact80_scales: torch.Tensor
     shared_gate_up_cpu: torch.Tensor
     shared_gate_up_weight: torch.Tensor
     shared_down_cpu: torch.Tensor
@@ -169,6 +182,26 @@ def build_inputs() -> Inputs:
         0, selected_expert_indices, w2_selected_scales_cpu.to("xpu")
     )
 
+    # The compact80 ABI removes only the physical routed padding.  Preserve
+    # the logical gate/up layout exactly: gate rows [0, 80), followed by up
+    # rows [128, 208).  W2 keeps the corresponding packed S4 channels [0, 40).
+    w13_compact80_qweight_s4 = torch.cat(
+        (
+            w13_qweight_s4[:, :SHARED_SIZE, :],
+            w13_qweight_s4[:, ROUTED_SIZE : ROUTED_SIZE + SHARED_SIZE, :],
+        ),
+        dim=1,
+    ).contiguous()
+    w13_compact80_scales = torch.cat(
+        (
+            w13_scales[:, :SHARED_SIZE, :],
+            w13_scales[:, ROUTED_SIZE : ROUTED_SIZE + SHARED_SIZE, :],
+        ),
+        dim=1,
+    ).contiguous()
+    w2_compact80_qweight_s4 = w2_qweight_s4[..., : SHARED_SIZE // 2].contiguous()
+    w2_compact80_scales = w2_scales.contiguous()
+
     shared_gate_up_cpu = (
         torch.randn(2 * SHARED_SIZE, HIDDEN_SIZE, generator=generator)
         * SHARED_WEIGHT_SCALE
@@ -192,6 +225,10 @@ def build_inputs() -> Inputs:
         w2_selected_scales_cpu=w2_selected_scales_cpu,
         w2_qweight_s4=w2_qweight_s4,
         w2_scales=w2_scales,
+        w13_compact80_qweight_s4=w13_compact80_qweight_s4,
+        w13_compact80_scales=w13_compact80_scales,
+        w2_compact80_qweight_s4=w2_compact80_qweight_s4,
+        w2_compact80_scales=w2_compact80_scales,
         shared_gate_up_cpu=shared_gate_up_cpu,
         shared_gate_up_weight=shared_gate_up_cpu.to("xpu"),
         shared_down_cpu=shared_down_cpu,
@@ -300,6 +337,194 @@ def _op(*args: object) -> torch.Tensor:
     return torch.ops.moe_int4_ops.moe_forward_m1_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1(
         *args
     )
+
+
+def _compact80_op(
+    inputs: Inputs,
+    logits: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops.moe_int4_ops.moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_out_v1(
+        inputs.x,
+        logits,
+        inputs.w13_compact80_qweight_s4,
+        inputs.w13_compact80_scales,
+        inputs.w2_compact80_qweight_s4,
+        inputs.w2_compact80_scales,
+        inputs.shared_gate_up_weight,
+        inputs.shared_down_weight,
+        inputs.shared_expert_gate_weight,
+        output,
+        TOP_K,
+        NUM_SHARED_EXPERTS,
+        NUM_EXPERTS,
+    )
+
+
+def _router_weights() -> tuple[torch.Tensor, torch.Tensor]:
+    generator = torch.Generator().manual_seed(20260907)
+    weight = torch.randint(
+        0,
+        256,
+        (NUM_EXPERTS, HIDDEN_SIZE // 2),
+        dtype=torch.uint8,
+        generator=generator,
+    ).to("xpu")
+    scale = (
+        0.008
+        + 0.00003
+        * torch.arange(NUM_EXPERTS * (HIDDEN_SIZE // GROUP_SIZE))
+        .view(NUM_EXPERTS, HIDDEN_SIZE // GROUP_SIZE)
+    ).half().to("xpu")
+    return weight, scale
+
+
+def _router_chain_op(
+    inputs: Inputs,
+    router_weight: torch.Tensor,
+    router_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops.moe_int4_ops.moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_router_out_v1(
+        inputs.x,
+        router_weight,
+        router_scale,
+        inputs.w13_compact80_qweight_s4,
+        inputs.w13_compact80_scales,
+        inputs.w2_compact80_qweight_s4,
+        inputs.w2_compact80_scales,
+        inputs.shared_gate_up_weight,
+        inputs.shared_down_weight,
+        inputs.shared_expert_gate_weight,
+        output,
+        TOP_K,
+        NUM_SHARED_EXPERTS,
+        NUM_EXPERTS,
+    )
+
+
+def test_compact80_router_chain_matches_real_gemv_then_old_path_bitwise(
+    inputs: Inputs, real_router_gemv
+) -> None:
+    router_weight, router_scale = _router_weights()
+    logits = torch.empty(
+        (1, NUM_EXPERTS), dtype=torch.float16, device="xpu"
+    )
+    real_router_gemv(inputs.x, router_weight, router_scale, logits)
+
+    old_output = torch.empty_like(inputs.output)
+    _compact80_op(inputs, logits, old_output)
+    new_output = torch.empty_like(inputs.output)
+    _router_chain_op(inputs, router_weight, router_scale, new_output)
+    torch.xpu.synchronize()
+
+    # The new entry uses the same GEMV_int4_host header and the same compact80
+    # top-k/up/down kernels. Internal router logits are intentionally not part
+    # of the production ABI; final output is the observable bitwise contract.
+    assert torch.equal(new_output, old_output)
+
+
+def test_compact80_router_chain_interleaves_two_non_default_streams_bitwise(
+    inputs: Inputs, real_router_gemv
+) -> None:
+    router_weight, router_scale = _router_weights()
+    stream_a = torch.xpu.Stream()
+    stream_b = torch.xpu.Stream()
+    old_outputs_a: list[torch.Tensor] = []
+    new_outputs_a: list[torch.Tensor] = []
+    old_outputs_b: list[torch.Tensor] = []
+    new_outputs_b: list[torch.Tensor] = []
+
+    for _ in range(20):
+        logits_a = torch.empty(
+            (1, NUM_EXPERTS), dtype=torch.float16, device="xpu"
+        )
+        logits_b = torch.empty_like(logits_a)
+        old_a = torch.empty_like(inputs.output)
+        new_a = torch.empty_like(inputs.output)
+        old_b = torch.empty_like(inputs.output)
+        new_b = torch.empty_like(inputs.output)
+        with torch.xpu.stream(stream_a):
+            real_router_gemv(
+                inputs.x, router_weight, router_scale, logits_a
+            )
+            _compact80_op(inputs, logits_a, old_a)
+            _router_chain_op(inputs, router_weight, router_scale, new_a)
+        with torch.xpu.stream(stream_b):
+            real_router_gemv(
+                inputs.x, router_weight, router_scale, logits_b
+            )
+            _compact80_op(inputs, logits_b, old_b)
+            _router_chain_op(inputs, router_weight, router_scale, new_b)
+        old_outputs_a.append(old_a)
+        new_outputs_a.append(new_a)
+        old_outputs_b.append(old_b)
+        new_outputs_b.append(new_b)
+
+    torch.xpu.synchronize()
+    for old, new in (
+        *zip(old_outputs_a, new_outputs_a),
+        *zip(old_outputs_b, new_outputs_b),
+    ):
+        assert torch.equal(new, old)
+
+
+def test_router_chain_invalid_inputs_preserve_sentinels_before_submit(
+    inputs: Inputs,
+) -> None:
+    router_weight, router_scale = _router_weights()
+    cases = (
+        (
+            router_weight[:, :-1],
+            router_scale,
+            "router_weight has an unsupported shape",
+        ),
+        (
+            router_weight,
+            router_scale.float(),
+            "router_scale has an unsupported dtype",
+        ),
+    )
+    for invalid_weight, invalid_scale, expected_error in cases:
+        sentinel = torch.full_like(inputs.output, 3.25)
+        with pytest.raises(RuntimeError, match=re.escape(expected_error)):
+            _router_chain_op(
+                inputs, invalid_weight, invalid_scale, sentinel
+            )
+        assert torch.equal(sentinel, torch.full_like(sentinel, 3.25))
+
+    input_before = inputs.x.clone()
+    with pytest.raises(
+        RuntimeError, match=re.escape("output must not alias any input tensor")
+    ):
+        _router_chain_op(inputs, router_weight, router_scale, inputs.x)
+    assert torch.equal(inputs.x, input_before)
+
+
+def test_router_chain_source_preflight_precedes_first_router_submit() -> None:
+    source = (
+        Path(__file__).parents[1] / "csrc/moe_batch/moe_int4.sycl"
+    ).read_text()
+    start = source.index(
+        "torch::Tensor "
+        "moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_router_out_v1("
+    )
+    end = source.index(
+        "torch::Tensor "
+        "moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_compact80_out_v1(",
+        start,
+    )
+    body = source[start:end]
+    first_router_submit = body.index("GEMV_int4_host(")
+    assert body.index('router_weight, "router_weight"') < first_router_submit
+    assert body.index('router_scale, "router_scale"') < first_router_submit
+    assert body.index('output, "output"') < first_router_submit
+    assert body.index("output must not alias any input tensor") < first_router_submit
+    assert body.index("ensure_moe_m1_asymmetric_v1_buffers") < first_router_submit
+    assert first_router_submit < body.index(
+        "moe_topk_v2_host<N_ROUTED_EXPERTS, TOP_K>"
+    )
+    assert "router_output" not in body
 
 
 def test_00_preflight_rejects_before_first_valid_submit(inputs: Inputs) -> None:
