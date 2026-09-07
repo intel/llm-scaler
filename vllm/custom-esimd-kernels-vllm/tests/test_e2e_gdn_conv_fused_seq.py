@@ -69,7 +69,8 @@ def make_strided_states(num_cache, HV, DIM, device="xpu"):
     return conv_state, ssm_state
 
 
-def run_e2e_seq(N=1, num_v_heads_global=32, tp_size=4, num_cache=32, seed=42):
+def run_e2e_seq(N=1, num_v_heads_global=32, tp_size=4, num_cache=32,
+                seed=42, num_steps=1):
     H = NUM_K_HEADS_GLOBAL // tp_size
     HV = num_v_heads_global // tp_size
     HPG = HV // H
@@ -77,13 +78,10 @@ def run_e2e_seq(N=1, num_v_heads_global=32, tp_size=4, num_cache=32, seed=42):
     QKVZ_DIM = H * (K + K + HPG * V * 2)
 
     print(f"\n=== E2E Test seq: N={N}, H={H}, HV={HV}, K={K}, V={V}, "
-          f"num_v_heads_global={num_v_heads_global}, TP={tp_size} ===")
+          f"num_v_heads_global={num_v_heads_global}, TP={tp_size}, "
+          f"steps={num_steps} ===")
     torch.manual_seed(seed)
     device = "xpu"
-
-    # Generate data in SEQUENTIAL layout (matching model's decode path)
-    qkvz_seq = torch.randn(N, QKVZ_DIM, dtype=torch.float16, device=device) * 0.1
-    ba_seq = torch.randn(N, 2 * HV, dtype=torch.float16, device=device) * 0.5
 
     # conv_weight/conv_bias use same dim layout for both kernels
     conv_weight = torch.randn(DIM, 4, dtype=torch.float16, device=device) * 0.1
@@ -98,52 +96,16 @@ def run_e2e_seq(N=1, num_v_heads_global=32, tp_size=4, num_cache=32, seed=42):
     init_conv = torch.randn(num_cache, 3, DIM, dtype=torch.float16, device=device) * 0.01
     init_ssm = torch.zeros(num_cache, HV, V, K, dtype=torch.float16, device=device)
 
-    # Convert qkvz/ba to interleaved layout for reference kernel
-    qkvz_intl = seq_to_interleaved_qkvz(qkvz_seq, H, HV, K, V)
-    ba_intl = seq_to_interleaved_ba(ba_seq, H, HV)
-
-    # ---- Reference: torch.ops._xpu_C.gdn_attention (interleaved, prefill path) ----
+    # Initialize both implementations once. Keeping these states alive across
+    # all steps mirrors autoregressive decode and catches accumulating state
+    # corruption rather than testing several independent one-token calls.
     conv_ref, ssm_ref = make_strided_states(num_cache, HV, DIM, device)
     conv_ref.copy_(init_conv); ssm_ref.copy_(init_ssm)
-    out_ref = torch.empty(N, HV, V, dtype=torch.float16, device=device)
-    z_ref = torch.empty(N, HV, V, dtype=torch.float16, device=device)
-
-    torch.ops._xpu_C.gdn_attention(
-        out_ref, z_ref,
-        qkvz_intl.clone(), ba_intl.clone(),
-        NUM_K_HEADS_GLOBAL, num_v_heads_global, K, V,
-        conv_state=conv_ref, ssm_state=ssm_ref,
-        conv_weights=conv_weight, conv_bias=None, activation="silu",
-        A_log=A_log, dt_bias=dt_bias,
-        num_prefills=0, num_decodes=N, num_spec_decodes=0,
-        has_initial_state=None,
-        non_spec_query_start_loc=query_start_loc,
-        non_spec_token_indx=None,
-        non_spec_state_indices_tensor=state_indices,
-        spec_query_start_loc=None,
-        spec_token_indx=None,
-        spec_state_indices_tensor=None,
-        num_accepted_tokens=None,
-        num_actual_tokens=N, tp_size=tp_size,
-        reorder_input=False)
-    torch.xpu.synchronize()
-
-    # ---- Our kernel: esimd_gdn_conv_fused_seq (sequential, decode path) ----
     from custom_esimd_kernels_vllm import esimd_gdn_conv_fused_seq
 
     conv_ours, ssm_ours = make_strided_states(num_cache, HV, DIM, device)
     conv_ours.copy_(init_conv); ssm_ours.copy_(init_ssm)
-    out_ours = torch.empty(N, HV, V, dtype=torch.float16, device=device)
-    z_ours = torch.empty(N, HV, V, dtype=torch.float16, device=device)
 
-    esimd_gdn_conv_fused_seq(
-        qkvz_seq, conv_ours, conv_weight, conv_bias_zeros, state_indices,
-        A_log.half(), dt_bias, ba_seq,
-        ssm_ours, state_indices, out_ours, z_ours,
-        N, H, HV, K, V, float(K ** -0.5))
-    torch.xpu.synchronize()
-
-    # ---- Compare ----
     def check(name, ref, test, atol=1.0):
         d = (ref.float() - test.float()).abs()
         max_d = d.max().item()
@@ -153,22 +115,65 @@ def run_e2e_seq(N=1, num_v_heads_global=32, tp_size=4, num_cache=32, seed=42):
         return ok
 
     ok = True
-    ok &= check("core_attn_out", out_ref, out_ours, atol=1e-3)
-    ok &= check("z_out", z_ref, z_ours, atol=1e-3)
-    ok &= check("conv_state", conv_ref, conv_ours, atol=1e-3)
-    ok &= check("ssm_state", ssm_ref, ssm_ours, atol=1e-3)
+    for step in range(num_steps):
+        # New projected activations for every decode step; model weights and
+        # reference/ESIMD recurrent states remain unchanged between steps.
+        torch.manual_seed(seed + 2000 + step)
+        qkvz_seq = (
+            torch.randn(N, QKVZ_DIM, dtype=torch.float16, device=device)
+            * 0.1
+        )
+        ba_seq = (
+            torch.randn(N, 2 * HV, dtype=torch.float16, device=device) * 0.5
+        )
+        qkvz_intl = seq_to_interleaved_qkvz(qkvz_seq, H, HV, K, V)
+        ba_intl = seq_to_interleaved_ba(ba_seq, H, HV)
 
-    print(f"  Ref  out[0,0,:4]: {out_ref.float()[0,0,:4].cpu().tolist()}")
-    print(f"  Ours out[0,0,:4]: {out_ours.float()[0,0,:4].cpu().tolist()}")
-    print(f"  Ref  z[0,0,:4]:   {z_ref.float()[0,0,:4].cpu().tolist()}")
-    print(f"  Ours z[0,0,:4]:   {z_ours.float()[0,0,:4].cpu().tolist()}")
+        # Reference: native GDN with interleaved projected-state layout.
+        out_ref = torch.empty(N, HV, V, dtype=torch.float16, device=device)
+        z_ref = torch.empty(N, HV, V, dtype=torch.float16, device=device)
+        torch.ops._xpu_C.gdn_attention(
+            out_ref, z_ref,
+            qkvz_intl.clone(), ba_intl.clone(),
+            NUM_K_HEADS_GLOBAL, num_v_heads_global, K, V,
+            conv_state=conv_ref, ssm_state=ssm_ref,
+            conv_weights=conv_weight, conv_bias=None, activation="silu",
+            A_log=A_log, dt_bias=dt_bias,
+            num_prefills=0, num_decodes=N, num_spec_decodes=0,
+            has_initial_state=None,
+            non_spec_query_start_loc=query_start_loc,
+            non_spec_token_indx=None,
+            non_spec_state_indices_tensor=state_indices,
+            spec_query_start_loc=None,
+            spec_token_indx=None,
+            spec_state_indices_tensor=None,
+            num_accepted_tokens=None,
+            num_actual_tokens=N, tp_size=tp_size,
+            reorder_input=False)
+
+        # ESIMD GDN with sequential projected-state layout.
+        out_ours = torch.empty(N, HV, V, dtype=torch.float16, device=device)
+        z_ours = torch.empty(N, HV, V, dtype=torch.float16, device=device)
+        esimd_gdn_conv_fused_seq(
+            qkvz_seq, conv_ours, conv_weight, conv_bias_zeros, state_indices,
+            A_log.half(), dt_bias, ba_seq,
+            ssm_ours, state_indices, out_ours, z_ours,
+            N, H, HV, K, V, float(K ** -0.5))
+        torch.xpu.synchronize()
+
+        print(f"  Decode step {step}:")
+        ok &= check("core_attn_out", out_ref, out_ours, atol=1e-3)
+        ok &= check("z_out", z_ref, z_ours, atol=1e-3)
+        ok &= check("conv_state", conv_ref, conv_ours, atol=1e-3)
+        ok &= check("ssm_state", ssm_ref, ssm_ours, atol=1e-3)
+
     return ok
 
 
 def test_qwen36_tp2_two_sequence_decode():
-    for seed in range(8):
+    for seed in range(4):
         assert run_e2e_seq(
-            N=2, num_v_heads_global=48, tp_size=2, seed=seed
+            N=2, num_v_heads_global=48, tp_size=2, seed=seed, num_steps=8
         )
 
 
