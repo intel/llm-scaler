@@ -31,7 +31,7 @@ def make_inputs(N, H, HV, K=128, V=128, dtype=torch.float16, device="xpu"):
     ba = torch.randn(N, 2 * HV, dtype=dtype, device=device) * 0.1
 
     conv_dim = 2 * H * K + HV * V
-    NUM_CACHE = 4
+    NUM_CACHE = max(4, N)
     conv_state = torch.randn(NUM_CACHE, 3, conv_dim, dtype=dtype, device=device) * 0.1
     conv_weight = torch.randn(conv_dim, 4, dtype=dtype, device=device) * 0.1
     conv_bias = torch.zeros(conv_dim, dtype=dtype, device=device)
@@ -50,21 +50,6 @@ def make_inputs(N, H, HV, K=128, V=128, dtype=torch.float16, device="xpu"):
         A_log=A_log, dt_bias=dt_bias,
         ssm_state=ssm_state, ssm_state_indices=ssm_state_indices,
     )
-
-
-def gqa_to_seq_qkvz(qkvz_gqa, H, HV, K, V):
-    """ESIMD GQA-interleaved -> sequential [q|k|v|z] layout for C++ ref."""
-    heads_per_group = HV // H
-    group_dim = K + K + 2 * heads_per_group * V
-    N = qkvz_gqa.shape[0]
-    qkvz_grouped = qkvz_gqa.view(N, H, group_dim)
-    q = qkvz_grouped[:, :, :K].reshape(N, H * K)
-    k = qkvz_grouped[:, :, K:2*K].reshape(N, H * K)
-    v_part = qkvz_grouped[:, :, 2*K:2*K + heads_per_group*V]
-    v = v_part.reshape(N, HV * V)
-    z_part = qkvz_grouped[:, :, 2*K + heads_per_group*V:]
-    z = z_part.reshape(N, HV * V)
-    return torch.cat([q, k, v, z], dim=1)
 
 
 def run_esimd(inp, N, H, HV, K=128, V=128):
@@ -90,8 +75,6 @@ def run_esimd(inp, N, H, HV, K=128, V=128):
 
 def run_reference(inp, N, H, HV, K=128, V=128):
     """跑 C++ gdn_attention (作为 reference)."""
-    qkvz_seq = gqa_to_seq_qkvz(inp["qkvz"], H, HV, K, V)
-
     output = torch.zeros(N, HV, V, dtype=torch.float16, device="xpu")
     z_out = torch.zeros(N, HV, V, dtype=torch.float16, device="xpu")
 
@@ -103,16 +86,21 @@ def run_reference(inp, N, H, HV, K=128, V=128):
 
     torch.ops._xpu_C.gdn_attention(
         output, z_out,
-        qkvz_seq, inp["ba"],
+        inp["qkvz"], inp["ba"],
         H, HV, K, V,
         conv_state=cs, ssm_state=ss,
         conv_weights=inp["conv_weight"], conv_bias=inp["conv_bias"],
         activation="silu",
         A_log=inp["A_log"].float(), dt_bias=inp["dt_bias"],
-        num_prefills=0, num_decodes=N,
+        num_prefills=0, num_decodes=N, num_spec_decodes=0,
         has_initial_state=has_initial_state,
         non_spec_query_start_loc=non_spec_query_start_loc,
+        non_spec_token_indx=None,
         non_spec_state_indices_tensor=inp["conv_state_indices"],
+        spec_query_start_loc=None,
+        spec_token_indx=None,
+        spec_state_indices_tensor=None,
+        num_accepted_tokens=None,
         num_actual_tokens=N,
         tp_size=1, reorder_input=False,
     )
@@ -157,11 +145,10 @@ if __name__ == "__main__":
     # TP=8 等价: 16 dead threads, 修复前会越界
     results["TP=8 (H=2, HV=4)"] = test_config("TP=8 equivalent", H=2, HV=4, N=1)
 
-    # 多 seq 的情况 (N=4): 仍 inline shift (N*HV=16 <= 32)
-    results["TP=8 N=4 inline shift"] = test_config("TP=8 N=4 inline", H=2, HV=4, N=4)
+    # 多 seq 的情况 (N=4)
+    results["TP=8 N=4"] = test_config("TP=8 N=4", H=2, HV=4, N=4)
 
-    # 多 seq 走 non-inline shift (N*HV > 32)
-    results["TP=8 N=16 non-inline shift"] = test_config("TP=8 N=16 non-inline", H=2, HV=4, N=16)
+    results["TP=8 N=16"] = test_config("TP=8 N=16", H=2, HV=4, N=16)
 
     print("\n" + "=" * 60)
     all_ok = True

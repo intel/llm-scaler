@@ -121,7 +121,6 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
     fp16* __restrict__ z_out_ptr,
     int N, int H, int HV, int gdn_K, int gdn_V,
     float attn_scale, int64_t conv_stride0, int64_t ssm_stride0,
-    int inline_conv_shift,   // 1 = do conv_state shift inline (safe when N*HV<=32)
     nd_item<3>& ndi)
 {
     slm_init<2048>();
@@ -401,25 +400,6 @@ ESIMD_INLINE void gdn_conv_fused_seq_kernel(
                 out, simd<fp16, VPT>(0.0f));
         } else {
             block_store<fp16, VPT>(out, simd<fp16, VPT>(0.0f));
-        }
-    }
-
-    // ---- Phase 3: conv_state shift (inline path, only when N*HV <= WG_SIZE) ----
-    // When N*HV > WG_SIZE, the shift is done by a separate kernel to avoid a
-    // cross-WG race: one WG's shift writes could land before another WG's
-    // Phase 1 reads for the same seq_idx.
-    // Uses register-cached s1, s2, x_fp16 from Phase 1 (not re-read from memory).
-    if (inline_conv_shift && conv_idx >= 0 && hv == 0 && !v_oob) {
-        // lo chunk (all threads)
-        block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start, simd<fp16, 64>(s1));
-        block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start, simd<fp16, 64>(s2));
-        block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start, x_fp16);
-
-        // hi chunk (v-threads only, when double_v)
-        if (double_v && tid >= 4 * H) {
-            block_store<fp16, 64>(cstate_base + 0 * dim + chunk_start_hi, simd<fp16, 64>(s1_hi));
-            block_store<fp16, 64>(cstate_base + 1 * dim + chunk_start_hi, simd<fp16, 64>(s2_hi));
-            block_store<fp16, 64>(cstate_base + 2 * dim + chunk_start_hi, x_fp16_hi);
         }
     }
 
@@ -784,9 +764,6 @@ inline void gdn_conv_fused_seq_dispatch(
     int64_t conv_stride0, int64_t ssm_stride0,
     sycl::queue& q)
 {
-    const int total_wgs = N * HV;
-    const int inline_shift = (total_wgs <= WG_SIZE) ? 1 : 0;
-
     sycl::nd_range<3> Range(
         sycl::range<3>(N, HV, WG_SIZE),
         sycl::range<3>(1, 1, WG_SIZE));
@@ -800,25 +777,25 @@ inline void gdn_conv_fused_seq_dispatch(
                 ssm_state_ptr, ssm_state_indices_ptr,
                 output_ptr, z_out_ptr,
                 N, H, HV, K, V, scale, conv_stride0, ssm_stride0,
-                inline_shift, ndi);
+                ndi);
         });
     });
 
-    if (!inline_shift) {
-        sycl::nd_range<3> ShiftRange(
-            sycl::range<3>(N, 1, WG_SIZE),
-            sycl::range<3>(1, 1, WG_SIZE));
+    // A separate launch provides the global ordering needed before shifting
+    // state shared by all value-head work-groups for a sequence.
+    sycl::nd_range<3> ShiftRange(
+        sycl::range<3>(N, 1, WG_SIZE),
+        sycl::range<3>(1, 1, WG_SIZE));
 
-        q.submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(ShiftRange, [=](sycl::nd_item<3> ndi) SYCL_ESIMD_KERNEL {
-                conv_state_shift_seq_kernel<WG_SIZE>(
-                    qkvz_ptr, qkvz_stride0, conv_state_ptr,
-                    conv_state_indices_ptr,
-                    N, H, HV, K, V,
-                    conv_stride0, ndi);
-            });
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(ShiftRange, [=](sycl::nd_item<3> ndi) SYCL_ESIMD_KERNEL {
+            conv_state_shift_seq_kernel<WG_SIZE>(
+                qkvz_ptr, qkvz_stride0, conv_state_ptr,
+                conv_state_indices_ptr,
+                N, H, HV, K, V,
+                conv_stride0, ndi);
         });
-    }
+    });
 }
 
 /* ============================================================
