@@ -9,6 +9,7 @@ Only qkvz and ba differ in layout.
 """
 
 import torch
+import vllm_xpu_kernels._xpu_C
 
 NUM_K_HEADS_GLOBAL = 16
 K = 128
@@ -68,7 +69,7 @@ def make_strided_states(num_cache, HV, DIM, device="xpu"):
     return conv_state, ssm_state
 
 
-def test_e2e_seq(N=1, num_v_heads_global=32, tp_size=4, num_cache=32, seed=42):
+def run_e2e_seq(N=1, num_v_heads_global=32, tp_size=4, num_cache=32, seed=42):
     H = NUM_K_HEADS_GLOBAL // tp_size
     HV = num_v_heads_global // tp_size
     HPG = HV // H
@@ -114,9 +115,15 @@ def test_e2e_seq(N=1, num_v_heads_global=32, tp_size=4, num_cache=32, seed=42):
         conv_state=conv_ref, ssm_state=ssm_ref,
         conv_weights=conv_weight, conv_bias=None, activation="silu",
         A_log=A_log, dt_bias=dt_bias,
-        num_prefills=0, num_decodes=N, has_initial_state=None,
+        num_prefills=0, num_decodes=N, num_spec_decodes=0,
+        has_initial_state=None,
         non_spec_query_start_loc=query_start_loc,
+        non_spec_token_indx=None,
         non_spec_state_indices_tensor=state_indices,
+        spec_query_start_loc=None,
+        spec_token_indx=None,
+        spec_state_indices_tensor=None,
+        num_accepted_tokens=None,
         num_actual_tokens=N, tp_size=tp_size,
         reorder_input=False)
     torch.xpu.synchronize()
@@ -158,8 +165,14 @@ def test_e2e_seq(N=1, num_v_heads_global=32, tp_size=4, num_cache=32, seed=42):
     return ok
 
 
+def test_qwen36_tp2_two_sequence_decode():
+    for seed in range(8):
+        assert run_e2e_seq(
+            N=2, num_v_heads_global=48, tp_size=2, seed=seed
+        )
+
+
 if __name__ == "__main__":
-    import vllm_xpu_kernels._xpu_C
     ok = True
     # (label, num_v_heads_global, tp_size)
     # TP=4 configs (original)
@@ -167,8 +180,9 @@ if __name__ == "__main__":
         ("Qwen3.5-35B-A3B TP4", 32, 4),
         ("Qwen3.5-27B TP4", 48, 4),
         ("Qwen3.5-122B-A10B TP4", 64, 4),
+        ("Qwen3.6-27B TP2", 48, 2),
     ]
-    # TP=1 configs — triggers H=16, HV=48 (currently fails: WG_SIZE too small)
+    # TP=1 configs use the large-H kernel.
     configs += [
         ("Qwen3.5-27B TP1", 48, 1),
         ("Qwen3.6-27B TP1", 48, 1),
@@ -177,7 +191,7 @@ if __name__ == "__main__":
         for n in [1, 4, 8]:
             print(f"\n--- {label} (num_v_heads_global={num_v_heads}, TP={tp}) N={n} ---")
             try:
-                ok &= test_e2e_seq(N=n, num_v_heads_global=num_v_heads, tp_size=tp)
+                ok &= run_e2e_seq(N=n, num_v_heads_global=num_v_heads, tp_size=tp)
             except RuntimeError as e:
                 print(f"  CRASH: {e}")
                 ok = False
