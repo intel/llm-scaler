@@ -33,6 +33,8 @@ from importlib.machinery import EXTENSION_SUFFIXES
 
 import torch
 
+from .._compile_ops import compile_op
+
 _loaded = False
 _prepared_bmg_policy_dispatches = set()
 
@@ -140,8 +142,11 @@ def is_available():
         return False
 
 
+@compile_op("cute_sdp", _fake_blhd)
 def sdp(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """Fused scaled-dot-product attention. Inputs [B, L, H, D] (B==1, D==128)."""
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.cute_sdp(q, k, v)
     _ensure_loaded()
     return torch.ops.cute_fmha.sdp(q, k, v)
 
@@ -155,10 +160,13 @@ def supports_wan22_cross() -> bool:
         return False
 
 
+@compile_op("cute_sdp_wan22_cross", _fake_blhd)
 def sdp_wan22_cross(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> torch.Tensor:
     """Wan 2.2 14B T2V Turbo 720p FP16 cross-attention."""
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.cute_sdp_wan22_cross(q, k, v)
     _ensure_loaded()
     if not hasattr(torch.ops.cute_fmha, "sdp_wan22_cross"):
         raise RuntimeError(
@@ -177,10 +185,13 @@ def supports_d128_bhld() -> bool:
         return False
 
 
+@compile_op("cute_sdp_bhld_d128", _fake_bhld_d128)
 def sdp_bhld_d128(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> torch.Tensor:
     """Attention for supported dense or H3 QKV-backed ``[B,H,L,128]`` inputs."""
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.cute_sdp_bhld_d128(q, k, v)
     _ensure_loaded()
     if not hasattr(torch.ops.cute_fmha, "sdp_bhld_d128"):
         raise RuntimeError(
@@ -199,6 +210,7 @@ def supports_minimax_h3_vae_d64() -> bool:
         return False
 
 
+@compile_op("cute_sdp_minimax_h3_vae_d64", _fake_bhld_blhd_backed)
 def sdp_minimax_h3_vae_d64(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> torch.Tensor:
@@ -208,6 +220,8 @@ def sdp_minimax_h3_vae_d64(
     Q/K use the ``H*D`` sequence stride and V remains a view into the
     three-wide QKV projection.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.cute_sdp_minimax_h3_vae_d64(q, k, v)
     _ensure_loaded()
     if not hasattr(torch.ops.cute_fmha, "sdp_minimax_h3_vae_d64"):
         raise RuntimeError(
@@ -227,10 +241,13 @@ def supports_d120_bhld() -> bool:
         return False
 
 
+@compile_op("cute_sdp_bhld_d120", _fake_bhld_blhd_backed)
 def sdp_bhld_d120(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> torch.Tensor:
     """Fused self-attention for validated dense ``[B,H,L,120]`` inputs."""
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.cute_sdp_bhld_d120(q, k, v)
     _ensure_loaded()
     if not hasattr(torch.ops.cute_fmha, "sdp_bhld_d120"):
         raise RuntimeError("CUTE D120 BHLD kernel is unavailable in this sidecar")
@@ -254,6 +271,24 @@ def supports_sol_attn() -> bool:
         return False
 
 
+def _fake_sol(q, k, v, tau=1.0, scale=None, sink_blocks=None, sink_q=None,
+              key_bias=None, topk_ratio=0.0, tail=True, block_len=None, coarse_gate=None):
+    return q.new_empty(q.shape)
+
+
+@compile_op("cute_sol_attn", _fake_sol)
+def _compiled_sol_attn(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    tau: float = 1.0, scale: float | None = None,
+    sink_blocks: list[int] | None = None, sink_q: list[int] | None = None,
+    key_bias: torch.Tensor | None = None, topk_ratio: float = 0.0,
+    tail: bool = True, block_len: torch.Tensor | None = None,
+    coarse_gate: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return sol_attn(q, k, v, tau, scale, sink_blocks, sink_q, key_bias,
+                    topk_ratio, tail, block_len, coarse_gate)
+
+
 def sol_attn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -275,6 +310,13 @@ def sol_attn(
     semantics; callers may use :func:`supports_sol_attn` for capability
     routing. A query row with no finite routed key score returns zero.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.cute_sol_attn(
+            q, k, v, tau, scale,
+            None if sink_blocks is None else list(sink_blocks),
+            None if sink_q is None else list(sink_q), key_bias,
+            topk_ratio, tail, block_len, coarse_gate,
+        )
     _ensure_loaded()
     ops = _sol_attn_ops()
     if not hasattr(ops, "prepare_with_controls") or not hasattr(

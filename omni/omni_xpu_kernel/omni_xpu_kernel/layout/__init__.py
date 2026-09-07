@@ -2,6 +2,9 @@
 
 import torch
 
+from .. import _compile_meta as _meta
+from .._compile_ops import compile_op
+
 
 def _get_native():
     from .. import _load_extension
@@ -14,6 +17,7 @@ def supports_cat_pad_bmg() -> bool:
     return bool(getattr(_get_native(), "__cat_pad_bmg__", False))
 
 
+@compile_op("layout_cat_pad_bmg", _meta.cat_pad)
 def cat_pad_bmg(
     prefix: torch.Tensor,
     input: torch.Tensor,
@@ -25,4 +29,6 @@ def cat_pad_bmg(
     BMG FP16 inference contracts and raises for all other inputs. Callers must
     retain their normal fallback.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.layout_cat_pad_bmg(prefix, input, spatial_pad)
     return _get_native().cat_pad_bmg(prefix, input, spatial_pad)

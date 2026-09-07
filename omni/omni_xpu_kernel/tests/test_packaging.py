@@ -803,10 +803,12 @@ def test_cute_compile_command_uses_same_bmg_fat_target(
 
 
 def test_cute_loader_finds_windows_pyd(monkeypatch, tmp_path):
-    namespace = run_path(
-        str(PROJECT_ROOT / "omni_xpu_kernel" / "cute" / "__init__.py"),
-        run_name="__cute_loader_test__",
-    )
+    # CUTE now imports its package-level dispatcher helper. Exercise the real
+    # package loader without executing __init__ as an unrelated script or
+    # registering its operators a second time.
+    from omni_xpu_kernel import cute
+
+    namespace = vars(cute)
     package_dir = tmp_path / "omni_xpu_kernel" / "cute"
     package_dir.mkdir(parents=True)
     extension = package_dir / "cute_fmha_torch.cp313-win_amd64.pyd"

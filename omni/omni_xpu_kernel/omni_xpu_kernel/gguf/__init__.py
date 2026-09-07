@@ -17,6 +17,9 @@ Example:
 
 import torch
 
+from .. import _compile_meta as _meta
+from .._compile_ops import compile_op
+
 
 def _get_native():
     """Get the native GGUF module."""
@@ -25,6 +28,7 @@ def _get_native():
     return _load_extension().gguf
 
 
+@compile_op("gguf_dequantize_q4_0", _meta.gguf_q4_0)
 def dequantize_q4_0(
     input: torch.Tensor, dtype: torch.dtype = torch.float16
 ) -> torch.Tensor:
@@ -39,18 +43,24 @@ def dequantize_q4_0(
     high1, ... . Use :func:`dequantize_q4_0_comfyui` for the sequential
     low-half/high-half layout.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.gguf_dequantize_q4_0(input, dtype)
     sequential = _get_native().dequantize_q4_0(input, dtype)
     return sequential.reshape(-1, 2, 16).transpose(1, 2).reshape_as(sequential)
 
 
+@compile_op("gguf_dequantize_q4_0_comfyui", _meta.gguf_q4_0)
 def dequantize_q4_0_comfyui(
     input: torch.Tensor,
     dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
     """Dequantize Q4_0 to ComfyUI's low-16 then high-16 layout."""
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.gguf_dequantize_q4_0_comfyui(input, dtype)
     return _get_native().dequantize_q4_0(input, dtype)
 
 
+@compile_op("gguf_dequantize_q4_1", _meta.gguf_q4_1)
 def dequantize_q4_1(
     input: torch.Tensor, dtype: torch.dtype = torch.float16
 ) -> torch.Tensor:
@@ -59,9 +69,12 @@ def dequantize_q4_1(
     Q4_1 stores one FP16 scale, one FP16 minimum, and 16 packed bytes
     per 32 output elements.
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.gguf_dequantize_q4_1(input, dtype)
     return _get_native().dequantize_q4_1(input, dtype)
 
 
+@compile_op("gguf_dequantize_q8_0", _meta.gguf_q8_0)
 def dequantize_q8_0(
     input: torch.Tensor, dtype: torch.dtype = torch.float16
 ) -> torch.Tensor:
@@ -72,9 +85,12 @@ def dequantize_q8_0(
     - 2 bytes: FP16 scale
     - 32 bytes: int8 values
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.gguf_dequantize_q8_0(input, dtype)
     return _get_native().dequantize_q8_0(input, dtype)
 
 
+@compile_op("gguf_dequantize_q4_k", _meta.gguf_q4_k)
 def dequantize_q4_k(
     input: torch.Tensor, dtype: torch.dtype = torch.float16
 ) -> torch.Tensor:
@@ -87,9 +103,12 @@ def dequantize_q4_k(
     - 12 bytes: packed scales
     - 128 bytes: packed 4-bit values
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.gguf_dequantize_q4_k(input, dtype)
     return _get_native().dequantize_q4_k(input, dtype)
 
 
+@compile_op("gguf_dequantize_q6_k", _meta.gguf_q6_k)
 def dequantize_q6_k(
     input: torch.Tensor, dtype: torch.dtype = torch.float16
 ) -> torch.Tensor:
@@ -102,12 +121,16 @@ def dequantize_q6_k(
     - 16 bytes: int8 scales
     - 2 bytes: FP16 d (scale)
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.gguf_dequantize_q6_k(input, dtype)
     return _get_native().dequantize_q6_k(input, dtype)
 
 
+@compile_op("gguf_dequantize_batch", _meta.gguf_batch,
+            schema="(Tensor[] inputs, str[] formats, ScalarType dtype) -> Tensor[]")
 def dequantize_batch(
-    inputs: list, formats: list, dtype: torch.dtype = torch.float16
-) -> list:
+    inputs: list[torch.Tensor], formats: list[str], dtype: torch.dtype = torch.float16
+) -> list[torch.Tensor]:
     """
     Batch dequantize multiple tensors with platform-selected dispatch.
 
@@ -129,6 +152,8 @@ def dequantize_batch(
             torch.float16
         )
     """
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.gguf_dequantize_batch(inputs, formats, dtype)
     outputs = _get_native().dequantize_batch(inputs, formats, dtype)
     return [
         output.reshape(-1, 2, 16).transpose(1, 2).reshape_as(output)

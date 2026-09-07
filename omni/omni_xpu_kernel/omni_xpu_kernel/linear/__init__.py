@@ -17,6 +17,9 @@ from typing import Optional
 
 import torch
 
+from .. import _compile_meta as _meta
+from .._compile_ops import compile_op
+
 
 log = logging.getLogger("omni_xpu_kernel.fp8")
 
@@ -53,6 +56,7 @@ def _cached_failure_error(key: tuple) -> RuntimeError:
     return RuntimeError(f"{_UNSUPPORTED_MARKER}cached: key={key}")
 
 
+@compile_op("linear_onednn_w8a16_fp8", _meta.linear_fp8, ordered=True)
 def onednn_w8a16_fp8(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -73,6 +77,8 @@ def onednn_w8a16_fp8(
     """
     global _PYTHON_NEGATIVE_HITS
 
+    if torch.compiler.is_compiling():
+        return torch.ops.omni_xpu.linear_onednn_w8a16_fp8(x, weight, scales, bias)
     key = _failure_key(x, weight, bias)
     with _FAILED_KEYS_LOCK:
         if key in _FAILED_KEYS:
@@ -105,6 +111,7 @@ def onednn_w8a16_fp8(
         raise
 
 
+@torch.compiler.disable
 def try_onednn_w8a16_fp8(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -116,6 +123,12 @@ def try_onednn_w8a16_fp8(
     The first unsupported descriptor logs one warning and populates the native
     and Python negative caches. Later calls bypass native primitive creation.
     Validation errors and other runtime failures are not suppressed.
+
+    This runtime capability probe is an eager boundary in a compiled caller:
+    primitive construction can return either Tensor or None and change the
+    negative cache. Select the route before a fullgraph region and use
+    :func:`onednn_w8a16_fp8` inside it. A fake kernel must not guess that a
+    runtime primitive will be available or suppress a construction failure.
     """
     try:
         return onednn_w8a16_fp8(x, weight, scales, bias)

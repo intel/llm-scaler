@@ -3,17 +3,18 @@
 Eager callers retain the original Python/native dispatch. Compiled callers see
 an opaque operator with an explicit FakeTensor output contract; Dynamo and AOT
 must never execute a pybind kernel on a FakeTensor. These inference operators
-do not implement backward. In-place APIs require separate mutation schemas and
-must not use this helper.
+do not implement backward. Mutable boundaries name their modified arguments and
+return None; public Python wrappers return the original inputs when required.
 """
 
 import torch
 
 
 _OPERATORS = {}
+_EFFECT_HANDLES = []
 
 
-def compile_op(name, fake):
+def compile_op(name, fake, *, mutates_args=(), schema=None, ordered=False):
     """Register an inference API; its compile branch calls torch.ops directly.
 
     Keep each public function's own code object. A shared dispatch closure would
@@ -21,9 +22,14 @@ def compile_op(name, fake):
     """
     def decorate(function):
         operator = torch.library.custom_op(
-            "omni_xpu::" + name, function, mutates_args=()
+            "omni_xpu::" + name, function, mutates_args=mutates_args, schema=schema
         )
         operator.register_fake(fake)
+        if ordered:
+            # These APIs expose runtime cache state. Effect tokens preserve
+            # call order and calls whose tensor result is otherwise unused.
+            from torch._higher_order_ops.effects import _EffectType, _register_effectful_op
+            _EFFECT_HANDLES.append(_register_effectful_op(getattr(torch.ops.omni_xpu, name).default, _EffectType.ORDERED))
         _OPERATORS[name] = operator
         return function
     return decorate
@@ -46,9 +52,11 @@ def fake_silu_mul(x1, x2):
 
 
 def fake_rowwise(x, stochastic_rounding=0):
-    # Both the fused deterministic and generic stochastic native APIs return
-    # a contiguous quantized tensor and [..., 1] FP32 scales.
-    return (x.new_empty(x.shape, dtype=torch.int8),
+    # Stochastic TensorIterator output retains dense input layouts; the fused
+    # deterministic path is contiguous. Both have [..., 1] FP32 scales.
+    quantized = (torch.empty_like(x, dtype=torch.int8) if stochastic_rounding > 0
+                 else x.new_empty(x.shape, dtype=torch.int8))
+    return (quantized,
             x.new_empty((*x.shape[:-1], 1), dtype=torch.float32))
 
 
