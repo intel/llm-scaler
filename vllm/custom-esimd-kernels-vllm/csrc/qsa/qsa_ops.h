@@ -108,6 +108,39 @@ at::Tensor qsa_q_norm_rope_select_v1(
     bool mrope,
     bool positions_bounds_proven);
 
+at::Tensor qsa_q_norm_rope_select_parallel_v1(
+    const at::Tensor& projected_q,
+    const at::Tensor& norm_weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths,
+    at::Tensor q_output,
+    at::Tensor out,
+    bool mrope,
+    bool positions_bounds_proven);
+
+at::Tensor select_preprocessed_parallel(
+    const at::Tensor& q, const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table, const at::Tensor& token_to_req,
+    const at::Tensor& query_positions, const at::Tensor& sequence_lengths,
+    at::Tensor out);
+
+at::Tensor select_paged_tokens_parallel_v1(
+    const at::Tensor& q,
+    const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths,
+    int64_t token_topk,
+    int64_t compress_ratio,
+    int64_t compressed_page_size,
+    at::Tensor out);
+
 }  // namespace qsa
 
 at::Tensor sparse_paged_attention_v2(

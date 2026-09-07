@@ -859,9 +859,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       &qsa::indexer_norm_rope_v1,
       "Qwen3.8 QSA indexer Gemma norm and RoPE (XPU)");
   module.def(
+      "qsa_select_paged_tokens_parallel_v1",
+      &qsa::select_paged_tokens_parallel_v1,
+      "Qwen3.8 QSA exact partitioned selection for preprocessed Q (XPU)");
+  module.def(
       "qsa_q_norm_rope_select_v1",
       &qsa::qsa_q_norm_rope_select_v1,
       "Qwen3.8 QSA fused Q norm, RoPE and selection (XPU)");
+  module.def(
+      "qsa_q_norm_rope_select_parallel_v1",
+      &qsa::qsa_q_norm_rope_select_parallel_v1,
+      "Qwen3.8 QSA exact partitioned long-context selection (XPU)");
   module.def(
       "qsa_group_compress_v1",
       &qsa::group_compress_v1,

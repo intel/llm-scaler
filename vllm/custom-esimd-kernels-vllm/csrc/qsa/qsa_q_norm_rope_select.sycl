@@ -77,10 +77,96 @@ inline uint32_t position_for_pair(
   }
 }
 
-template <bool Mrope, typename PosT, typename QLocalT>
+template <bool Mrope, typename PosT, typename QLocalT, bool Preprocessed>
 class QsaQNormRopeSelectKernel;
 
-template <bool Mrope, typename PosT, typename QLocalT>
+// Exact merge of descending top-512 lists, including ascending-index ties.
+class QsaSelectionMergeKernel;
+
+void merge_selection_partitions(
+    sycl::queue& queue, int rows, int partitions,
+    at::Tensor scores_a, at::Tensor indices_a,
+    const at::Tensor& token_to_req, const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths, at::Tensor out) {
+  auto scores_b = at::empty_like(scores_a);
+  auto indices_b = at::empty_like(indices_a);
+  const int row_stride = partitions * kBlockTopk;
+  const auto* requests = token_to_req.data_ptr<int32_t>();
+  const auto* positions = query_positions.data_ptr<int64_t>();
+  const auto* lengths = sequence_lengths.data_ptr<int32_t>();
+  const int request_count = sequence_lengths.numel();
+  auto* output = out.data_ptr<int32_t>();
+  for (int lists = partitions; lists > 1; lists /= 2) {
+    const int pairs = lists / 2;
+    const bool final = pairs == 1;
+    const auto* src_scores = scores_a.data_ptr<float>();
+    const auto* src_indices = indices_a.data_ptr<int32_t>();
+    auto* dst_scores = scores_b.data_ptr<float>();
+    auto* dst_indices = indices_b.data_ptr<int32_t>();
+    queue.submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> scores(sycl::range<1>(kSortSize), cgh);
+      sycl::local_accessor<int32_t, 1> indices(sycl::range<1>(kSortSize), cgh);
+      cgh.parallel_for<QsaSelectionMergeKernel>(
+          sycl::nd_range<1>(rows * pairs * 512, 512),
+          [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+            const int row = item.get_group_linear_id() / pairs;
+            const int pair = item.get_group_linear_id() % pairs;
+            const int lane = item.get_local_linear_id();
+            const int base = row * row_stride + pair * kSortSize;
+            scores[lane] = src_scores[base + lane];
+            indices[lane] = src_indices[base + lane];
+            scores[kSortSize - 1 - lane] = src_scores[base + kBlockTopk + lane];
+            indices[kSortSize - 1 - lane] = src_indices[base + kBlockTopk + lane];
+            item.barrier(sycl::access::fence_space::local_space);
+            for (int stride = kBlockTopk; stride; stride >>= 1) {
+              // Descending A + reversed B is bitonic: ten comparator stages.
+              const int left = (lane / stride) * (2 * stride) + lane % stride;
+              const int right = left + stride;
+              const float a = scores[left], b = scores[right];
+              const int ia = indices[left], ib = indices[right];
+              if (a < b || (a == b && ia > ib)) {
+                scores[left] = b; scores[right] = a;
+                indices[left] = ib; indices[right] = ia;
+              }
+              item.barrier(sycl::access::fence_space::local_space);
+            }
+            if (!final) {
+              const int dst = row * row_stride + pair * kBlockTopk + lane;
+              dst_scores[dst] = scores[lane];
+              dst_indices[dst] = indices[lane];
+              return;
+            }
+            const int request = requests[row];
+            const int64_t length = request >= 0 && request < request_count
+                ? lengths[request] : 0;
+            const int64_t visible = positions[row] + 1;
+            const int64_t blocks = sycl::min(
+                visible > 0 ? visible / 4 : 0, length > 0 ? length / 4 : 0);
+            const int expanded = (blocks < kBlockTopk ? blocks : kBlockTopk) * 4;
+            for (int column = lane; column < kOutputWidth; column += 512) {
+              int32_t token = -1;
+              if (column < expanded) {
+                const int block = indices[column / 4];
+                const int64_t value = int64_t(block) * 4 + column % 4;
+                if (block >= 0 && value < length) token = value;
+              } else {
+                const int offset = column - expanded;
+                const int64_t start = visible / 4 * 4;
+                const int64_t value = start + offset;
+                if (offset < 3 && offset < visible - start &&
+                    value >= 0 && value < length) token = value;
+              }
+              output[int64_t(row) * kOutputWidth + column] = token;
+            }
+          });
+    });
+    // Invocation-private allocations, ordered on the caller's current stream.
+    std::swap(scores_a, scores_b);
+    std::swap(indices_a, indices_b);
+  }
+}
+
+template <bool Mrope, typename PosT, typename QLocalT, bool Preprocessed = false>
 void launch_fused(
     const at::Tensor& projected_q,
     const at::Tensor& norm_weight,
@@ -92,7 +178,8 @@ void launch_fused(
     const at::Tensor& query_positions,
     const at::Tensor& sequence_lengths,
     at::Tensor q_output,
-    at::Tensor out) {
+    at::Tensor out,
+    int partitions = 1) {
   const uint32_t rows = static_cast<uint32_t>(projected_q.size(0));
   const uint32_t requests = static_cast<uint32_t>(page_table.size(0));
   const uint32_t pages_per_request = static_cast<uint32_t>(page_table.size(1));
@@ -104,21 +191,33 @@ void launch_fused(
 
   const auto* input_ptr = reinterpret_cast<const fp16*>(
       projected_q.data_ptr());
-  const auto* weight_ptr = reinterpret_cast<const fp16*>(
-      norm_weight.data_ptr());
+  const auto* weight_ptr = norm_weight.defined()
+      ? reinterpret_cast<const fp16*>(norm_weight.data_ptr()) : nullptr;
   const auto* position_ptr = positions.data_ptr<PosT>();
-  const auto* cos_ptr = reinterpret_cast<const fp16*>(
-      cos_sin_cache.data_ptr());
+  const auto* cos_ptr = cos_sin_cache.defined()
+      ? reinterpret_cast<const fp16*>(cos_sin_cache.data_ptr()) : nullptr;
   const auto* cache_ptr = reinterpret_cast<const fp16*>(
       compressed_key_cache.data_ptr());
   const auto* page_ptr = page_table.data_ptr<int32_t>();
   const auto* request_ptr = token_to_req.data_ptr<int32_t>();
   const auto* query_position_ptr = query_positions.data_ptr<int64_t>();
   const auto* sequence_ptr = sequence_lengths.data_ptr<int32_t>();
-  auto* q_out_ptr = q_output.numel() == 0
+  auto* q_out_ptr = !q_output.defined() || q_output.numel() == 0
       ? static_cast<fp16*>(nullptr)
       : reinterpret_cast<fp16*>(q_output.data_ptr());
   auto* out_ptr = out.data_ptr<int32_t>();
+
+  at::Tensor partition_scores, partition_indices;
+  float* partial_scores = nullptr;
+  int32_t* partial_indices = nullptr;
+  if (partitions > 1) {
+    partition_scores = at::empty(
+        {rows, partitions, kBlockTopk}, projected_q.options().dtype(at::kFloat));
+    partition_indices = at::empty(
+        {rows, partitions, kBlockTopk}, out.options());
+    partial_scores = partition_scores.data_ptr<float>();
+    partial_indices = partition_indices.data_ptr<int32_t>();
+  }
 
   const int64_t cache_page_stride = compressed_key_cache.stride(0);
   const int64_t cache_token_stride = compressed_key_cache.stride(1);
@@ -135,13 +234,14 @@ void launch_fused(
     sycl::local_accessor<int32_t, 1> page_cache(
         sycl::range<1>(kPageCacheSlots), cgh);
 
-    cgh.parallel_for<QsaQNormRopeSelectKernel<Mrope, PosT, QLocalT>>(
+    cgh.parallel_for<QsaQNormRopeSelectKernel<Mrope, PosT, QLocalT, Preprocessed>>(
         sycl::nd_range<1>(
-            sycl::range<1>(static_cast<size_t>(rows * kWorkgroup)),
+            sycl::range<1>(static_cast<size_t>(rows * partitions * kWorkgroup)),
             sycl::range<1>(static_cast<size_t>(kWorkgroup))),
         [=](sycl::nd_item<1> item)
             [[sycl::reqd_sub_group_size(kSubgroup)]] {
-          const uint32_t row = item.get_group_linear_id();
+          const uint32_t row = item.get_group_linear_id() / partitions;
+          const int partition = item.get_group_linear_id() % partitions;
           const uint32_t local = item.get_local_linear_id();
           const uint32_t subgroup_id = local / kSubgroup;
           const uint32_t lane = local % kSubgroup;
@@ -149,7 +249,11 @@ void launch_fused(
 
           // Four subgroups cooperate on the four independent RMSNorm rows.
           // Each lane owns four dimensions, keeping only four FP32 values live.
-          if (local < kQStageThreads) {
+          if constexpr (Preprocessed) {
+            for (int dim = local; dim < kIndexHeads * kHeadDim; dim += kWorkgroup) {
+              q_shared[dim] = input_ptr[row * kIndexHeads * kHeadDim + dim];
+            }
+          } else if (local < kQStageThreads) {
             const uint32_t head = subgroup_id;
             float values[4];
             float partial_sum = 0.0f;
@@ -202,7 +306,7 @@ void launch_fused(
                     static_cast<QLocalT>(rotated_first);
                 q_shared[head * kHeadDim + dim + kRotaryHalf] =
                     static_cast<QLocalT>(second * cosine + value * sine);
-                if (q_out_ptr != nullptr) {
+                if (q_out_ptr != nullptr && partition == 0) {
                   const uint32_t output_base =
                       row * kIndexHeads * kHeadDim + head * kHeadDim;
                   q_out_ptr[output_base + dim] =
@@ -213,7 +317,7 @@ void launch_fused(
               } else if (dim >= kRotaryDim) {
                 q_shared[head * kHeadDim + dim] =
                     static_cast<QLocalT>(value);
-                if (q_out_ptr != nullptr) {
+                if (q_out_ptr != nullptr && partition == 0) {
                   const uint32_t output_base =
                       row * kIndexHeads * kHeadDim + head * kHeadDim;
                   q_out_ptr[output_base + dim] = static_cast<fp16>(value);
@@ -268,8 +372,9 @@ void launch_fused(
           // as in qsa_select_paged_tokens_v2.  The query is read from local
           // storage, while compressed K remains in the production
           // [physical_page, token_in_page, 1, dim] layout.
-          for (int64_t chunk_start = 0; chunk_start < visible_blocks;
-               chunk_start += kBlockTopk) {
+          for (int64_t chunk_start = partition * kBlockTopk;
+               chunk_start < visible_blocks;
+               chunk_start += partitions * kBlockTopk) {
             for (int block_in_chunk = static_cast<int>(subgroup_id);
                  block_in_chunk < kBlockTopk;
                  block_in_chunk += kSubgroups) {
@@ -377,6 +482,16 @@ void launch_fused(
           item.barrier(sycl::access::fence_space::local_space);
           }
 
+          if (partitions > 1) {
+            if (local < kBlockTopk) {
+              const int64_t dst =
+                  (int64_t(row) * partitions + partition) * kBlockTopk + local;
+              partial_scores[dst] = scores[local];
+              partial_indices[dst] = indices[local];
+            }
+            return;
+          }
+
           const int64_t output_base =
               static_cast<int64_t>(row) * kOutputWidth;
           for (int column = static_cast<int>(local); column < kOutputWidth;
@@ -414,6 +529,11 @@ void launch_fused(
           }
         });
   });
+  if (partitions > 1) {
+    merge_selection_partitions(queue, rows, partitions, partition_scores,
+                               partition_indices, token_to_req, query_positions,
+                               sequence_lengths, out);
+  }
 }
 
 bool ranges_overlap(const at::Tensor& left, const at::Tensor& right) {
@@ -441,7 +561,8 @@ void validate_and_launch(
     at::Tensor q_output,
     at::Tensor out,
     bool mrope,
-    bool positions_bounds_proven) {
+    bool positions_bounds_proven,
+    int partitions) {
   TORCH_CHECK(positions_bounds_proven,
               "QSA fusion requires a trusted position-bound proof");
   const at::Tensor tensors[] = {
@@ -540,16 +661,62 @@ void validate_and_launch(
     launch_fused<Mrope, int32_t, std::conditional_t<kUseFp32LocalQ, float, fp16>>(
         projected_q, norm_weight, positions, cos_sin_cache,
         compressed_key_cache, page_table, token_to_req, query_positions,
-        sequence_lengths, q_output, out);
+        sequence_lengths, q_output, out, partitions);
   } else {
     launch_fused<Mrope, int64_t, std::conditional_t<kUseFp32LocalQ, float, fp16>>(
         projected_q, norm_weight, positions, cos_sin_cache,
         compressed_key_cache, page_table, token_to_req, query_positions,
-        sequence_lengths, q_output, out);
+        sequence_lengths, q_output, out, partitions);
   }
 }
 
 }  // namespace
+
+at::Tensor qsa_q_norm_rope_select_impl(
+    const at::Tensor& projected_q,
+    const at::Tensor& norm_weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths,
+    at::Tensor q_output,
+    at::Tensor out,
+    bool mrope,
+    bool positions_bounds_proven,
+    int partitions) {
+  TORCH_CHECK(positions.scalar_type() == at::kInt ||
+                  positions.scalar_type() == at::kLong,
+              "positions must be int32 or int64");
+  if (positions.scalar_type() == at::kInt) {
+    if (mrope) {
+      validate_and_launch<int32_t, true>(
+          projected_q, norm_weight, positions, cos_sin_cache,
+          compressed_key_cache, page_table, token_to_req, query_positions,
+          sequence_lengths, q_output, out, mrope, positions_bounds_proven, partitions);
+    } else {
+      validate_and_launch<int32_t, false>(
+          projected_q, norm_weight, positions, cos_sin_cache,
+          compressed_key_cache, page_table, token_to_req, query_positions,
+          sequence_lengths, q_output, out, mrope, positions_bounds_proven, partitions);
+    }
+  } else {
+    if (mrope) {
+      validate_and_launch<int64_t, true>(
+          projected_q, norm_weight, positions, cos_sin_cache,
+          compressed_key_cache, page_table, token_to_req, query_positions,
+          sequence_lengths, q_output, out, mrope, positions_bounds_proven, partitions);
+    } else {
+      validate_and_launch<int64_t, false>(
+          projected_q, norm_weight, positions, cos_sin_cache,
+          compressed_key_cache, page_table, token_to_req, query_positions,
+          sequence_lengths, q_output, out, mrope, positions_bounds_proven, partitions);
+    }
+  }
+  return out;
+}
 
 at::Tensor qsa_q_norm_rope_select_v1(
     const at::Tensor& projected_q,
@@ -565,34 +732,41 @@ at::Tensor qsa_q_norm_rope_select_v1(
     at::Tensor out,
     bool mrope,
     bool positions_bounds_proven) {
-  TORCH_CHECK(positions.scalar_type() == at::kInt ||
-                  positions.scalar_type() == at::kLong,
-              "positions must be int32 or int64");
-  if (positions.scalar_type() == at::kInt) {
-    if (mrope) {
-      validate_and_launch<int32_t, true>(
-          projected_q, norm_weight, positions, cos_sin_cache,
-          compressed_key_cache, page_table, token_to_req, query_positions,
-          sequence_lengths, q_output, out, mrope, positions_bounds_proven);
-    } else {
-      validate_and_launch<int32_t, false>(
-          projected_q, norm_weight, positions, cos_sin_cache,
-          compressed_key_cache, page_table, token_to_req, query_positions,
-          sequence_lengths, q_output, out, mrope, positions_bounds_proven);
-    }
-  } else {
-    if (mrope) {
-      validate_and_launch<int64_t, true>(
-          projected_q, norm_weight, positions, cos_sin_cache,
-          compressed_key_cache, page_table, token_to_req, query_positions,
-          sequence_lengths, q_output, out, mrope, positions_bounds_proven);
-    } else {
-      validate_and_launch<int64_t, false>(
-          projected_q, norm_weight, positions, cos_sin_cache,
-          compressed_key_cache, page_table, token_to_req, query_positions,
-          sequence_lengths, q_output, out, mrope, positions_bounds_proven);
-    }
-  }
+  return qsa_q_norm_rope_select_impl(
+      projected_q, norm_weight, positions, cos_sin_cache,
+      compressed_key_cache, page_table, token_to_req, query_positions,
+      sequence_lengths, q_output, out, mrope, positions_bounds_proven, 1);
+}
+
+at::Tensor qsa_q_norm_rope_select_parallel_v1(
+    const at::Tensor& projected_q,
+    const at::Tensor& norm_weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& token_to_req,
+    const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths,
+    at::Tensor q_output,
+    at::Tensor out,
+    bool mrope,
+    bool positions_bounds_proven) {
+  return qsa_q_norm_rope_select_impl(
+      projected_q, norm_weight, positions, cos_sin_cache,
+      compressed_key_cache, page_table, token_to_req, query_positions,
+      sequence_lengths, q_output, out, mrope, positions_bounds_proven, 32);
+}
+
+at::Tensor select_preprocessed_parallel(
+    const at::Tensor& q, const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table, const at::Tensor& token_to_req,
+    const at::Tensor& query_positions, const at::Tensor& sequence_lengths,
+    at::Tensor out) {
+  launch_fused<false, int64_t, fp16, true>(
+      q, at::Tensor(), query_positions, at::Tensor(), compressed_key_cache,
+      page_table, token_to_req, query_positions, sequence_lengths,
+      at::Tensor(), out, 32);
   return out;
 }
 

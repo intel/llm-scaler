@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 
 import pytest
@@ -16,11 +17,13 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def qsa_ops():
     package_dir = (
-        Path(__file__).resolve().parents[1]
-        / "python"
-        / "custom_esimd_kernels_vllm"
+        Path(__file__).resolve().parents[1] / "python" / "custom_esimd_kernels_vllm"
     )
-    candidates = sorted(package_dir.glob("qsa_ops*.so"))
+    candidates = (
+        [Path(os.environ["QSA_TEST_DSO"])]
+        if "QSA_TEST_DSO" in os.environ
+        else sorted(package_dir.glob("qsa_ops*.so"))
+    )
     if len(candidates) != 1:
         pytest.skip("focused QSA DSO is not built")
     spec = importlib.util.spec_from_file_location("qsa_ops", candidates[0])
@@ -31,16 +34,16 @@ def qsa_ops():
     return module
 
 
-def _make_case(rows: int, mrope: bool):
+def _make_case(rows: int, mrope: bool, length: int = 9216):
     device = torch.device("xpu")
     generator = torch.Generator(device="cpu").manual_seed(7000 + rows)
-    projected = torch.randn(
-        rows, 4, 128, generator=generator, dtype=torch.float16
-    ).to(device)
+    projected = torch.randn(rows, 4, 128, generator=generator, dtype=torch.float16).to(
+        device
+    )
     weight = (torch.randn(128, generator=generator) * 0.2).to(
         device=device, dtype=torch.float16
     )
-    query_positions = torch.full((rows,), 9214, dtype=torch.int64)
+    query_positions = torch.full((rows,), length - 2, dtype=torch.int64)
     if mrope:
         positions = torch.stack(
             (
@@ -53,16 +56,16 @@ def _make_case(rows: int, mrope: bool):
         positions = query_positions
     positions = positions.to(device)
     cache_cpu = torch.randn(
-        36, 64, 1, 128, generator=generator, dtype=torch.float16
+        (length + 255) // 256, 64, 1, 128, generator=generator, dtype=torch.float16
     )
     cache = cache_cpu.to(device)
-    page_table = torch.arange(36, dtype=torch.int32).view(1, -1).to(device)
-    token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
-    sequence_lengths = torch.full(
-        (1,), 9216, dtype=torch.int32, device=device
+    page_table = (
+        torch.arange(cache_cpu.shape[0], dtype=torch.int32).view(1, -1).to(device)
     )
-    cos_sin_cpu = torch.empty((10000, 64), dtype=torch.float16)
-    positions_cpu = torch.arange(10000, dtype=torch.float32).view(-1, 1)
+    token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
+    sequence_lengths = torch.full((1,), length, dtype=torch.int32, device=device)
+    cos_sin_cpu = torch.empty((length + 4, 64), dtype=torch.float16)
+    positions_cpu = torch.arange(length + 4, dtype=torch.float32).view(-1, 1)
     pairs = torch.arange(32, dtype=torch.float32).view(1, -1)
     angles = (positions_cpu + 1.0) * (pairs + 1.0) * 0.0007
     cos_sin_cpu[:, :32] = torch.cos(angles).to(torch.float16)
@@ -198,3 +201,110 @@ def test_qsa_fusion_rejects_unproven_positions(qsa_ops):
             mrope,
             False,
         )
+
+
+@pytest.mark.parametrize("length", [4, 2050, 32770, 128002, 256002, 1000002])
+@pytest.mark.parametrize("rows,mrope", [(1, False), (4, True)])
+def test_parallel_selection_preserves_serial_order_and_query(
+    qsa_ops, length, rows, mrope
+):
+    case = _make_case(rows, mrope, length)
+    args, mrope = case[:-1], case[-1]
+    old_q, new_q = torch.empty_like(args[0]), torch.empty_like(args[0])
+    old = torch.empty(rows, 2051, dtype=torch.int32, device="xpu")
+    new = torch.empty_like(old)
+    qsa_ops.qsa_q_norm_rope_select_v1(*args, old_q, old, mrope, True)
+    qsa_ops.qsa_q_norm_rope_select_parallel_v1(*args, new_q, new, mrope, True)
+    torch.xpu.synchronize()
+    assert torch.equal(new_q, old_q)
+    assert torch.equal(new, old)
+
+
+def test_parallel_selection_ties_invalid_pages_and_async_streams(qsa_ops):
+    case = list(_make_case(4, True, 128004))
+    case[4].zero_()  # Exact score ties spanning every partition.
+    case[5][:, 2:4] = -1  # Invalid physical pages must not enter top-k.
+    args, mrope = case[:-1], case[-1]
+    qout = torch.empty_like(args[0])
+    expected = torch.empty(4, 2051, dtype=torch.int32, device="xpu")
+    qsa_ops.qsa_q_norm_rope_select_v1(*args, qout, expected, mrope, True)
+    streams = [torch.xpu.Stream(), torch.xpu.Stream()]
+    outputs = [torch.empty_like(expected) for _ in streams]
+    queries = [torch.empty_like(qout) for _ in streams]
+    parent = torch.xpu.current_stream()
+    for stream in streams:
+        stream.wait_stream(parent)
+    for _ in range(20):
+        for stream, query, output in zip(streams, queries, outputs):
+            with torch.xpu.stream(stream):
+                qsa_ops.qsa_q_norm_rope_select_parallel_v1(
+                    *args, query, output, mrope, True
+                )
+    for stream in streams:
+        parent.wait_stream(stream)
+    torch.xpu.synchronize()
+    for query, output in zip(queries, outputs):
+        assert torch.equal(query, qout)
+        assert torch.equal(output, expected)
+
+
+@pytest.mark.parametrize("length", [4, 2050, 32770, 128002, 256002, 1000002])
+@pytest.mark.parametrize("rows", [1, 4])
+def test_preprocessed_parallel_selection_is_bitwise(qsa_ops, length, rows):
+    case = _make_case(rows, False, length)
+    q, _, _, _, cache, table, requests, positions, lengths, _ = case
+    old = torch.empty(rows, 2051, dtype=torch.int32, device="xpu")
+    new = torch.empty_like(old)
+    inputs = (q, cache, table, requests, positions, lengths, 2048, 4, 64)
+    qsa_ops.qsa_select_paged_tokens_v2(*inputs, old)
+    qsa_ops.qsa_select_paged_tokens_parallel_v1(*inputs, new)
+    torch.xpu.synchronize()
+    assert torch.equal(new, old)
+
+
+def test_preprocessed_parallel_selection_async_ties_and_alias_guard(qsa_ops):
+    case = _make_case(4, False, 128004)
+    q, _, _, _, cache, table, requests, positions, lengths, _ = case
+    cache.zero_()
+    table[:, 2:4] = -1
+    inputs = (q, cache, table, requests, positions, lengths, 2048, 4, 64)
+    expected = torch.empty(4, 2051, dtype=torch.int32, device="xpu")
+    qsa_ops.qsa_select_paged_tokens_v2(*inputs, expected)
+    outputs = [torch.empty_like(expected), torch.empty_like(expected)]
+    streams = [torch.xpu.Stream(), torch.xpu.Stream()]
+    parent = torch.xpu.current_stream()
+    for stream in streams:
+        stream.wait_stream(parent)
+    for _ in range(20):
+        for stream, output in zip(streams, outputs):
+            with torch.xpu.stream(stream):
+                qsa_ops.qsa_select_paged_tokens_parallel_v1(*inputs, output)
+    for stream in streams:
+        parent.wait_stream(stream)
+    torch.xpu.synchronize()
+    assert all(torch.equal(output, expected) for output in outputs)
+    alias = cache.view(torch.int32).flatten()[:4 * 2051].view(4, 2051)
+    with pytest.raises(RuntimeError, match="must not alias"):
+        qsa_ops.qsa_select_paged_tokens_parallel_v1(*inputs, alias)
+
+
+def test_preprocessed_parallel_selection_mixed_requests_and_visible_lengths(qsa_ops):
+    q, _, _, _, cache, table, _, _, _, _ = _make_case(8, False, 128004)
+    table = table.flip(1).repeat(3, 1).contiguous()
+    table[:, 7] = -1
+    table[:, 22] = cache.shape[0]  # An out-of-range physical page is invalid.
+    requests = torch.tensor(
+        [-1, 0, 1, 2, 3, 0, 1, 2], dtype=torch.int32, device="xpu"
+    )
+    positions = torch.tensor(
+        [-1, 0, 2047, 4098, 32767, 128003, 999999, 5],
+        dtype=torch.int64, device="xpu",
+    )
+    lengths = torch.tensor([128004, 32770, 4099], dtype=torch.int32, device="xpu")
+    inputs = (q, cache, table, requests, positions, lengths, 2048, 4, 64)
+    old = torch.empty(8, 2051, dtype=torch.int32, device="xpu")
+    new = torch.empty_like(old)
+    qsa_ops.qsa_select_paged_tokens_v2(*inputs, old)
+    qsa_ops.qsa_select_paged_tokens_parallel_v1(*inputs, new)
+    torch.xpu.synchronize()
+    assert torch.equal(new, old)
