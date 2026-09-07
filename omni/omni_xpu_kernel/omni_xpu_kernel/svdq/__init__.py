@@ -105,6 +105,7 @@ def onednn_int4_gemm_preconverted(
     act: torch.Tensor,
     packed_u4: torch.Tensor,
     scales_f16: torch.Tensor,
+    zp_u8: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Fused INT4 dequant + GEMM using oneDNN u4 matmul (pre-converted weights).
@@ -118,11 +119,13 @@ def onednn_int4_gemm_preconverted(
         act: [M, K] bf16/f16/f32 activations (f16 is ~3.5x faster than bf16)
         packed_u4: [N, K/2] uint8 — unsigned u4 weights (from packed ^ 0x88)
         scales_f16: [num_groups, N] f16 — weight scales
+        zp_u8: [num_groups, N] uint8, optional — per-block zero points
+            (TINT4/torchao format, w = (q - zp) * scale inside oneDNN)
 
     Returns:
         [M, N] same dtype as act
     """
-    return _get_native().onednn_int4_gemm_preconverted(act, packed_u4, scales_f16)
+    return _get_native().onednn_int4_gemm_preconverted(act, packed_u4, scales_f16, zp_u8)
 
 
 def onednn_int4_gemm_add_to_output(

@@ -65,6 +65,13 @@ COMPONENTS = (
         "adapters/int8_ffn.py",
     ),
     Component(
+        "int4_gemm_adapter",
+        "int4_gemm",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/int4_gemm.py",
+    ),
+    Component(
         "dynamic_vram_boundary_trim",
         "dynamic_vram_boundary_trim",
         "adapter",

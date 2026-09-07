@@ -19,6 +19,7 @@ class Config:
         )
         self.fp8_gemm = master and os.environ.get("OMNIXPU_FP8_GEMM", "1") != "0"
         self.int8_ffn = master and os.environ.get("OMNIXPU_INT8_FFN", "1") != "0"
+        self.int4_gemm = master and os.environ.get("OMNIXPU_INT4_GEMM", "1") != "0"
         self.lora_memory = (
             master and os.environ.get("OMNIXPU_LORA_MEMORY", "1") != "0"
         )
