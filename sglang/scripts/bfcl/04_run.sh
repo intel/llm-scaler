@@ -87,7 +87,7 @@ echo "[run] EVALDONE $(date)"
 #    but NEVER touch an external BYO server (SKIP_START=1).
 SCORE_FILE=$(find "$WORKDIR/score" -type f -name "*${CAT}*_score.json" -print -quit 2>/dev/null)
 SCORE=""
-[[ -n "$SCORE_FILE" ]] && SCORE=$(cat "$SCORE_FILE")
+[[ -n "$SCORE_FILE" ]] && SCORE=$(head -n 1 "$SCORE_FILE")
 echo "[run] SCORE: $SCORE"
 echo "$SCORE" >> "$GEN"
 if [[ "$SKIP_START" != "1" ]]; then
