@@ -114,9 +114,13 @@ def test_e2e_seq(N=1, num_v_heads_global=32, tp_size=4, num_cache=32, seed=42):
         conv_state=conv_ref, ssm_state=ssm_ref,
         conv_weights=conv_weight, conv_bias=None, activation="silu",
         A_log=A_log, dt_bias=dt_bias,
-        num_prefills=0, num_decodes=N, has_initial_state=None,
+        num_prefills=0, num_decodes=N, num_spec_decodes=0,
+        has_initial_state=None,
         non_spec_query_start_loc=query_start_loc,
+        non_spec_token_indx=None,
         non_spec_state_indices_tensor=state_indices,
+        spec_query_start_loc=None, spec_token_indx=None,
+        spec_state_indices_tensor=None, num_accepted_tokens=None,
         num_actual_tokens=N, tp_size=tp_size,
         reorder_input=False)
     torch.xpu.synchronize()
