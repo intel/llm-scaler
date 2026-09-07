@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Pre-fetch the Qwen3.6 tokenizer (the fork's Qwen/Qwen3.6-35B-A3B-FC config
-# points model_name at "Qwen/Qwen3.6-35B-A3B" which does NOT exist on HF — we
-# pass --local-model-path <unsloth tokenizer> instead) and write RUN_CONFIG.sh.
+# Validate or fetch a tokenizer directory and write RUN_CONFIG.sh.
+# Pass TOK_DIR explicitly for Qwen3.6 or Gemma4 local model evaluation.
 #
 # Runs INSIDE the container.
 set -euo pipefail

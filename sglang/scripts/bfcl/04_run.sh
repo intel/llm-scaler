@@ -4,9 +4,8 @@
 # server across runs lets radix state accumulate cross-run and contaminates the
 # comparison), runs the eval, scores.
 #
-# Runs INSIDE the container. Try to keep threads=1 (only bsz=1 is 100% valid on XPU;
-# threads>1 will cause Batch Variant bugs, the result may be unstable). No `| tail` anywhere (the generate child
-# tail blocks on a dead pipe and hangs forever — R5).
+# Runs INSIDE the container. The default is 16 BFCL workers. No `| tail`
+# anywhere (the generate child tail blocks on a dead pipe and hangs forever).
 #
 # Usage (inside container):
 #   bash 04_run.sh                       # full multi_turn_base (200)
@@ -20,7 +19,7 @@ RANGE="${2:-}"                       # "", "6" (single), or "0-29" (range)
 VENV="${VENV:-/opt/venv}"
 WORKDIR="${WORKDIR:-/workspace/bfcl_kit/workspace_xpu}"
 PORT="${PORT:-9010}"
-BFCL_NUM_THREADS="${BFCL_NUM_THREADS:-1}"
+BFCL_NUM_THREADS="${BFCL_NUM_THREADS:-16}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3.6-35B-A3B-FC}"
 START="${START:-$(cd "$(dirname "$0")" && pwd)/01_start_server.sh}"
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -74,7 +73,7 @@ else
   echo "[run] server ready"
 fi
 
-# 2. Generate + evaluate. threads=1, temp=0, local tokenizer. NO | tail.
+# 2. Generate + evaluate. temp=0, local tokenizer. NO | tail.
 cd "$WORKDIR"
 echo "[run] generate: cat=$CAT range='${RANGE:-full}' ids='${IDS:-}' $(date)"
 bfcl generate --model "$MODEL_ID" --test-category "$CAT" --skip-server-setup \
@@ -86,7 +85,9 @@ echo "[run] EVALDONE $(date)"
 
 # 3. Report score. Stop the reference server we started (R1: leave GPU clean) —
 #    but NEVER touch an external BYO server (SKIP_START=1).
-SCORE=$(cat "$WORKDIR"/score/*/multi_turn/*multi_turn_base*_score.json 2>/dev/null | head -1)
+SCORE_FILE=$(find "$WORKDIR/score" -type f -name "*${CAT}*_score.json" -print -quit 2>/dev/null)
+SCORE=""
+[[ -n "$SCORE_FILE" ]] && SCORE=$(cat "$SCORE_FILE")
 echo "[run] SCORE: $SCORE"
 echo "$SCORE" >> "$GEN"
 if [[ "$SKIP_START" != "1" ]]; then

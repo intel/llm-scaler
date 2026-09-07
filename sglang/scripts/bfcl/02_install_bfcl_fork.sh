@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Install zhangYi's gorilla fork (has the Qwen3.6 model entry) as editable
-# bfcl_eval into the sglang container's venv. Same fork as the llama.cpp kit
-# (commit 6ee7b771) — the harness is backend-agnostic; only the server differs.
+# Install the pinned gorilla fork with Qwen3.6 and Gemma4 model entries as
+# editable bfcl_eval into the sglang container's venv.
 #
 # OFFLINE-FIRST: the fork's berkeley-function-call-leaderboard subdir is VENDORED
 # into this kit (vendor/), so install needs NO network and does not depend on
@@ -14,7 +13,8 @@ set -euo pipefail
 KIT_ROOT="${KIT_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 VENDOR_PKG="$KIT_ROOT/vendor/berkeley-function-call-leaderboard"
 VENV="${VENV:-/opt/venv}"
-FORK_COMMIT="${FORK_COMMIT:-6ee7b7718d9c7498b26e043635db6381a6583593}"
+FORK_REPO="${FORK_REPO:-https://github.com/liu-shaojun/gorilla.git}"
+FORK_COMMIT="${FORK_COMMIT:-9d49adb45bd765794fd6b0a0f8006e0b31b997d2}"
 USE_NETWORK="${USE_NETWORK:-0}"
 # Where to clone if USE_NETWORK=1 (and the editable path in that case)
 FORK_DIR="${FORK_DIR:-/workspace/bfcl_kit/gorilla}"
@@ -24,8 +24,9 @@ source "$VENV/bin/activate"
 if [[ "$USE_NETWORK" == "1" ]]; then
   echo "USE_NETWORK=1 → cloning upstream fork at $FORK_COMMIT"
   if [[ ! -d "$FORK_DIR/.git" ]]; then
-    git clone https://github.com/zhangYiIntel/gorilla.git "$FORK_DIR"
+    git clone "$FORK_REPO" "$FORK_DIR"
   fi
+  git -C "$FORK_DIR" remote set-url origin "$FORK_REPO"
   git -C "$FORK_DIR" fetch origin --tags 2>/dev/null || true
   git -C "$FORK_DIR" checkout "$FORK_COMMIT"
   PKG_DIR="$FORK_DIR/berkeley-function-call-leaderboard"
@@ -46,7 +47,8 @@ pip install soundfile   # qwen-agent transitive, missing from package deps
 
 # CRITICAL (kit README quirk #3): a stale non-fork bfcl_eval in site-packages
 # would shadow the editable install. Verify `import bfcl_eval` resolves to OUR
-# package dir and the Qwen3.6 entry routes through QwenFCHandler.
+# package dir and all four model entries route through the native SGLang
+# function-calling handlers.
 PKG_DIR="$PKG_DIR" python3 - <<'PY'
 import bfcl_eval, os
 p = os.path.realpath(bfcl_eval.__file__)
@@ -57,8 +59,17 @@ assert p.startswith(want), (
     f"site-packages/bfcl_eval/ is shadowing it. `pip uninstall bfcl_eval` "
     f"(maybe twice) and rm the stale dir, then re-run.")
 from bfcl_eval.constants.model_config import MODEL_CONFIG_MAPPING
-m = MODEL_CONFIG_MAPPING["Qwen/Qwen3.6-35B-A3B-FC"]
-print("handler:", m.model_handler.__name__, "| hf model name:", m.model_name)
-assert m.model_handler.__name__ == "QwenFCHandler", "fork pinning didn't take"
+expected = {
+    "Qwen/Qwen3.6-27B-FC": "Qwen36FCHandler",
+    "Qwen/Qwen3.6-35B-A3B-FC": "Qwen36FCHandler",
+    "google/gemma-4-31B-it-FC": "Gemma4FCHandler",
+    "google/gemma-4-26B-A4B-it-FC": "Gemma4FCHandler",
+}
+for model_id, handler_name in expected.items():
+    model = MODEL_CONFIG_MAPPING[model_id]
+    print(model_id, "→", model.model_handler.__name__)
+    assert model.model_handler.__name__ == handler_name, (
+        f"{model_id} did not resolve to {handler_name}"
+    )
 print("OK — fork installed correctly")
 PY
