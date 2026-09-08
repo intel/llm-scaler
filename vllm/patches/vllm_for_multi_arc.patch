@@ -6502,6 +6502,113 @@ index 000000000..002cace5c
 +
 +    assert client.vllm_config.cache_config.block_size == 64
 +    assert client.vllm_config.cache_config.mamba_block_size == 32
+diff --git a/tests/v1/worker/test_mamba_utils.py b/tests/v1/worker/test_mamba_utils.py
+index 4bbab10b4..bc574ece1 100644
+--- a/tests/v1/worker/test_mamba_utils.py
++++ b/tests/v1/worker/test_mamba_utils.py
+@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpe
+ from vllm.v1.worker.mamba_utils import (
+     MambaCopyBuffers,
+     MambaSpecDecodeGPUContext,
++    _reinterpret_u64_as_i64,
+     collect_mamba_copy_meta,
+     do_mamba_copy_block,
+     preprocess_mamba,
+@@ -187,6 +188,94 @@ class _MockCpuGpuBuffer:
+         return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
+ 
+ 
++class _FakeDataPtrTensor:
++    """Tensor wrapper that exposes a controlled data_ptr for metadata tests."""
++
++    def __init__(self, tensor: torch.Tensor, data_ptr: int):
++        self._tensor = tensor
++        self._data_ptr = data_ptr
++        self.shape = tensor.shape
++
++    def data_ptr(self) -> int:
++        return self._data_ptr
++
++    def dim(self) -> int:
++        return self._tensor.dim()
++
++    def stride(self, *args):
++        return self._tensor.stride(*args)
++
++    def numel(self) -> int:
++        return self._tensor.numel()
++
++    def element_size(self) -> int:
++        return self._tensor.element_size()
++
++    def size(self, *args):
++        return self._tensor.size(*args)
++
++    def __getitem__(self, item):
++        return self._tensor[item]
++
++
++def test_reinterpret_u64_as_i64_preserves_pointer_bits():
++    ptrs = [
++        0,
++        1,
++        (1 << 63) - 1,
++        1 << 63,
++        (1 << 63) + 1234,
++        (1 << 64) - 1,
++    ]
++    ptr_tensor = torch.zeros(len(ptrs), dtype=torch.int64)
++
++    for idx, ptr in enumerate(ptrs):
++        ptr_tensor[idx] = _reinterpret_u64_as_i64(ptr)
++
++    assert ptr_tensor.numpy().view(np.uint64).tolist() == ptrs
++
++
++def test_gpu_context_reinterprets_high_data_ptrs_for_int64_metadata():
++    cfg = _TestConfig(num_layers=1)
++    device = torch.device("cpu")
++    kv_cache_config = _make_kv_cache_config(cfg, ["layer_0"])
++    gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
++    conv_ptr = 1 << 63
++    temporal_ptr = (1 << 64) - 8
++    block_table_ptr = (1 << 63) + 42
++
++    conv_state = _FakeDataPtrTensor(
++        torch.empty(
++            cfg.num_blocks,
++            cfg.conv_width,
++            cfg.conv_inner_dim,
++            dtype=cfg.dtype,
++        ),
++        conv_ptr,
++    )
++    temporal_state = _FakeDataPtrTensor(
++        torch.empty(cfg.num_blocks, cfg.temporal_state_dim, dtype=cfg.dtype),
++        temporal_ptr,
++    )
++    block_table = _FakeDataPtrTensor(
++        torch.empty(1, 4, dtype=torch.int32),
++        block_table_ptr,
++    )
++    forward_context = {"layer_0": _make_mock_attention(conv_state, temporal_state)}
++
++    gpu_ctx.initialize_from_forward_context(
++        kv_cache_config, forward_context, _COPY_FUNCS, [block_table]
++    )
++
++    assert gpu_ctx.state_base_addrs.tolist() == [
++        _reinterpret_u64_as_i64(conv_ptr),
++        _reinterpret_u64_as_i64(temporal_ptr),
++    ]
++    assert gpu_ctx.block_table_ptrs.tolist() == [
++        _reinterpret_u64_as_i64(block_table_ptr)
++    ]
++
++
+ def _make_postprocess_scheduler_output(
+     req_ids: list[str],
+     num_scheduled_tokens: dict[str, int],
 diff --git a/tests/v1/worker/test_qwen3_next_plain_mrope.py b/tests/v1/worker/test_qwen3_next_plain_mrope.py
 new file mode 100644
 index 000000000..d7ade31a3
@@ -20643,3 +20750,39 @@ index 7b6199984..1c4d23034 100644
              )
              with self.sm_control:
                  return self._run_ubatches(ubatch_metadata, self.runnable)
+diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
+index 7f611a2ee..424b0aef8 100644
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -23,6 +23,11 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
+ from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+ 
+ 
++def _reinterpret_u64_as_i64(value: int) -> int:
++    """Preserve a uint64 pointer bit pattern in a torch.int64 tensor."""
++    return value if value < (1 << 63) else value - (1 << 64)
++
++
+ @triton.jit
+ def _copy_mamba_state_block(
+     state_idx,
+@@ -646,7 +651,9 @@ class MambaSpecDecodeGPUContext:
+ 
+                 for state_type_idx, state in enumerate(kv_caches):
+                     # Base address
+-                    self.state_base_addrs[idx] = state.data_ptr()
++                    self.state_base_addrs[idx] = _reinterpret_u64_as_i64(
++                        state.data_ptr()
++                    )
+ 
+                     # Block stride (bytes between consecutive blocks)
+                     # state shape: [num_blocks, ...], stride(0) = elements per block
+@@ -729,7 +736,7 @@ class MambaSpecDecodeGPUContext:
+         )
+         self.block_table_stride_req = int(next(iter(strides)))
+         for i, bt in enumerate(block_tables):
+-            self.block_table_ptrs[i] = bt.data_ptr()
++            self.block_table_ptrs[i] = _reinterpret_u64_as_i64(bt.data_ptr())
+ 
+         self.is_initialized = True
+ 

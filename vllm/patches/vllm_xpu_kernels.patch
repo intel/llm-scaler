@@ -3051,7 +3051,7 @@ index 0000000..57fa952
 +if __name__ == "__main__":
 +    main()
 diff --git a/tests/flash_attn/test_flash_attn_varlen_func.py b/tests/flash_attn/test_flash_attn_varlen_func.py
-index 55aa520..cdaf43b 100644
+index 55aa520..727ef76 100644
 --- a/tests/flash_attn/test_flash_attn_varlen_func.py
 +++ b/tests/flash_attn/test_flash_attn_varlen_func.py
 @@ -378,6 +378,152 @@ def test_varlen_with_paged_kv(
@@ -3207,6 +3207,120 @@ index 55aa520..cdaf43b 100644
  @pytest.mark.parametrize("seq_lens", [[(1, 1328), (5, 18), (129, 463)]])
  @pytest.mark.parametrize("num_heads", NUM_HEADS)
  @pytest.mark.parametrize("head_size", HEAD_SIZES)
+@@ -1241,3 +1387,113 @@ def test_decode_with_cross_layer_paged_kv(
+     torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol), \
+         f"{torch.max(torch.abs(output - ref_output))}"
+     torch.xpu.empty_cache()
++
++
++# Speculative-decoding fast path: a uniform, small, causal query length per
++# sequence (q_len = num_speculative_tokens + 1) must be routed to the split-K
++# decode kernel and still match the causal reference exactly.
++@pytest.mark.parametrize("q_len", [2, 3, 4])
++@pytest.mark.parametrize("seq_lens", [[(1328, ), (18, ), (463, )],
++                                      [(1025, ), (523, ), (37, ), (200, )]])
++@pytest.mark.parametrize("num_heads", [(8, 2), (16, 1)])
++@pytest.mark.parametrize("head_size", [128])
++@pytest.mark.parametrize("block_size", [16, 32, 64])
++@pytest.mark.parametrize("window_size", [(-1, -1), (256, 0)])
++@pytest.mark.parametrize("dtype", DTYPES, ids=format_tc)
++@pytest.mark.parametrize("is_sink", [False, True])
++@pytest.mark.parametrize("num_blocks", [4096])
++@torch.inference_mode()
++def test_spec_decode_uniform_qlen(
++    q_len: int,
++    seq_lens: list[tuple[int]],
++    num_heads: tuple[int, int],
++    head_size: int,
++    block_size: int,
++    window_size: tuple[int, int],
++    dtype: torch.dtype,
++    is_sink: bool,
++    num_blocks: int,
++) -> None:
++    import vllm_xpu_kernels.flash_attn_interface as fai
++
++    torch.set_default_device("xpu")
++    torch.xpu.set_device("xpu:0")
++    torch.manual_seed(4242)
++
++    num_seqs = len(seq_lens)
++    query_lens = [q_len] * num_seqs
++    kv_lens = [x[0] for x in seq_lens]
++    num_query_heads, num_kv_heads = num_heads
++    assert num_query_heads % num_kv_heads == 0
++    max_kv_len = max(kv_lens)
++    scale = head_size**-0.5
++
++    query = torch.randn(sum(query_lens),
++                        num_query_heads,
++                        head_size,
++                        dtype=dtype)
++    key_cache = torch.randn(num_blocks,
++                            block_size,
++                            num_kv_heads,
++                            head_size,
++                            dtype=dtype)
++    value_cache = torch.randn_like(key_cache)
++
++    cu_query_lens = torch.tensor([0] + query_lens,
++                                 dtype=torch.int32).cumsum(dim=0,
++                                                           dtype=torch.int32)
++    seq_k = torch.tensor(kv_lens, dtype=torch.int32)
++    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
++    block_tables = torch.randint(0,
++                                 num_blocks, (num_seqs, max_num_blocks_per_seq),
++                                 dtype=torch.int32)
++    sink = torch.randn(num_query_heads, dtype=dtype) if is_sink else None
++
++    # Confirm the spec-decode fast path is actually taken.
++    orig_spec = fai._spec_decode_varlen_fwd
++    used = {"flag": False, "q_len": 0}
++
++    def _traced(*args, **kwargs):
++        used["flag"] = True
++        used["q_len"] = args[0].shape[0] // (args[4].numel() - 1)
++        return orig_spec(*args, **kwargs)
++
++    fai._spec_decode_varlen_fwd = _traced
++    try:
++        output = flash_attn_varlen_func(query,
++                                        key_cache,
++                                        value_cache,
++                                        q_len,
++                                        cu_query_lens,
++                                        max_kv_len,
++                                        seqused_k=seq_k,
++                                        softmax_scale=scale,
++                                        causal=True,
++                                        block_table=block_tables,
++                                        window_size=list(window_size),
++                                        s_aux=sink)
++    finally:
++        fai._spec_decode_varlen_fwd = orig_spec
++
++    assert used["flag"] and used["q_len"] == q_len, \
++        "speculative-decode fast path was not taken"
++
++    ref_output = ref_paged_attn(query=query.contiguous(),
++                                key_cache=key_cache.contiguous(),
++                                value_cache=value_cache.contiguous(),
++                                query_lens=query_lens,
++                                kv_lens=kv_lens,
++                                block_tables=block_tables,
++                                scale=scale,
++                                casual=True,
++                                is_paged=True,
++                                sink=sink,
++                                window_size_left=window_size[0],
++                                window_size_right=window_size[1],
++                                dtype=dtype)
++    atol, rtol = 2e-2, 1e-2
++    if window_size[0] != -1 or window_size[1] != -1:
++        atol, rtol = 1.5e-2, 1.5e-2
++    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol), \
++        f"{torch.max(torch.abs(output - ref_output))}"
++    torch.xpu.empty_cache()
 diff --git a/tests/fused_moe/test_fused_moe.py b/tests/fused_moe/test_fused_moe.py
 index 07f5911..18088a2 100755
 --- a/tests/fused_moe/test_fused_moe.py
@@ -4988,10 +5102,135 @@ index 0000000..046a99a
 +        )
 \ No newline at end of file
 diff --git a/vllm_xpu_kernels/flash_attn_interface.py b/vllm_xpu_kernels/flash_attn_interface.py
-index 1e2dc45..9e6e335 100644
+index 1e2dc45..2518455 100644
 --- a/vllm_xpu_kernels/flash_attn_interface.py
 +++ b/vllm_xpu_kernels/flash_attn_interface.py
-@@ -314,6 +314,7 @@ def flash_attn_varlen_func(
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
++import os
+ from typing import Optional
+ 
+ import torch
+@@ -16,6 +17,118 @@ except ImportError as e:
+ 
+ DEFAULT_FA_VERSION = 2
+ 
++# Speculative-decoding fast path.
++#
++# In speculative decoding every sequence in the batch issues the same small
++# number of query tokens (q_len = num_speculative_tokens + 1, e.g. 2/3/4). By
++# default such a batch (max_seqlen_q > 1) is routed to the chunk-prefill
++# kernel, which has no split-K parallelism over the KV dimension. With a long
++# KV cache and only a handful of query rows the GPU is heavily under-utilized,
++# so prefill is slow.
++#
++# Instead we reuse the split-K *decode* kernel: for a uniform, causal, paged
++# batch we treat each (sequence, query-position) pair as an independent
++# single-token decode "sequence" and run the whole batch in one decode
++# launch. Query token ``j`` (0-indexed within the q_len window) attends
++# causally to KV positions ``[0, kv_len - q_len + j]``, i.e.
++# ``seqused_k - (q_len - 1 - j)`` tokens, so each pseudo-sequence is an
++# ordinary q_len==1 decode with a per-position-adjusted ``seqused_k``. This is
++# exact (it matches the causal reference) and gets the decode path's split-K
++# parallelism.
++#
++# The path only triggers for small, uniform query lengths; larger uniform
++# query lengths keep using chunk-prefill (which reuses the shared KV tile
++# across the Q block, whereas the decode path rescans KV per query token).
++# The default threshold (16) stays within the measured win region across KV
++# lengths on Xe2 (crossover is ~q_len 32); override it with
++# VLLM_XPU_SPEC_DECODE_MAX_QLEN (set to 0/1 to disable the fast path).
++try:
++    _SPEC_DECODE_MAX_QLEN = int(
++        os.environ.get("VLLM_XPU_SPEC_DECODE_MAX_QLEN", "16"))
++except ValueError:
++    _SPEC_DECODE_MAX_QLEN = 16
++
++
++def _spec_decode_varlen_fwd(
++    q,
++    k,
++    v,
++    out,
++    cu_seqlens_q,
++    seqused_k,
++    block_table,
++    max_seqlen_k,
++    k_descale,
++    v_descale,
++    softmax_scale,
++    s_aux,
++    window_size,
++    softcap,
++):
++    """Run the split-K decode kernel once for a speculative-decode batch.
++
++    Assumes a uniform query length: every sequence contributes the same
++    ``q_len`` consecutive query tokens, laid out as ``q[i * q_len + j]`` for
++    sequence ``i`` and position ``j``. Each (sequence, position) pair is
++    treated as an independent single-token decode "sequence", so the whole
++    batch runs in a single ``varlen_fwd`` launch. Returns the output tensor
++    (same row order as ``q``).
++    """
++    batch = cu_seqlens_q.numel() - 1
++    q_len = q.shape[0] // batch
++    total = q.shape[0]  # batch * q_len
++
++    # One decode query per (sequence, position) pair; the row order already
++    # matches q, so the output needs no reordering.
++    cu_seqlens_q_spec = torch.arange(total + 1,
++                                     dtype=torch.int32,
++                                     device=q.device)
++    dummy_cu_seqlens_k = torch.zeros_like(cu_seqlens_q_spec)
++    # Causal per-position KV length: query row i*q_len + j (position j within
++    # the q_len window of sequence i) attends to seqused_k[i] - (q_len-1-j)
++    # tokens.
++    pos = torch.arange(q_len, device=q.device, dtype=seqused_k.dtype)
++    seqused_k_spec = (seqused_k.view(batch, 1) -
++                      (q_len - 1 - pos).view(1, q_len)).clamp_(min=1).reshape(
++                          total).to(torch.int32)
++
++    # Expand the block table so each pseudo-sequence points at its parent
++    # sequence's blocks.
++    block_table_spec = block_table.repeat_interleave(q_len, dim=0)
++
++    out, _ = torch.ops._vllm_fa2_C.varlen_fwd(
++        q,
++        k,
++        v,
++        out,
++        cu_seqlens_q_spec,
++        dummy_cu_seqlens_k,
++        seqused_k_spec,
++        None,
++        block_table_spec,
++        None,  # alibi_slopes
++        1,  # max_seqlen_q
++        max_seqlen_k,
++        0.0,  # dropout_p
++        k_descale,
++        v_descale,
++        softmax_scale,
++        s_aux,
++        False,  # zero_tensors
++        False,  # causal: handled by per-position seqused_k
++        window_size[0],
++        window_size[1],
++        softcap,
++        False,  # return_softmax
++        None,  # gen
++        None,  # num_splits (let the kernel pick via get_num_splits)
++        False,  # is_mix_batch
++        None,  # splits_per_seq
++        None,  # work_list
++        None,  # per_seq_causal
++    )
++    return out
++
+ 
+ def maybe_contiguous(x):
+     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+@@ -314,6 +427,7 @@ def flash_attn_varlen_func(
      num_splits_kv: Optional[int] = None,
      is_mix_batch: bool = True,
      host_kv_lens: Optional[torch.Tensor] = None,
@@ -4999,7 +5238,44 @@ index 1e2dc45..9e6e335 100644
  ):
      """
      FlashAttention interface for variable-length sequences, with optional
-@@ -444,6 +445,7 @@ def flash_attn_varlen_func(
+@@ -387,6 +501,36 @@ def flash_attn_varlen_func(
+                                            and v_descale is not None):
+             raise NotImplementedError(
+                 "FA2 only supports both KV cache descaled")
++
++        # Speculative-decoding fast path: redirect small, uniform, causal,
++        # paged query batches (q_len = num_speculative_tokens + 1) from the
++        # slow chunk-prefill kernel to the split-K decode kernel. See the
++        # comment on _SPEC_DECODE_MAX_QLEN above for the rationale.
++        batch = cu_seqlens_q.numel() - 1
++        is_uniform_qlen = (batch > 0 and q.shape[0] == batch * max_seqlen_q)
++        if (block_table is not None and causal and not return_softmax_lse
++                and softcap == 0.0 and alibi_slopes is None and q_v is None
++                and q_descale is None and scheduler_metadata is None
++                and seqused_k is not None
++                and 1 < max_seqlen_q <= _SPEC_DECODE_MAX_QLEN
++                and is_uniform_qlen):
++            return _spec_decode_varlen_fwd(
++                q,
++                k,
++                v,
++                out,
++                cu_seqlens_q,
++                seqused_k,
++                block_table,
++                max_seqlen_k,
++                k_descale,
++                v_descale,
++                softmax_scale,
++                s_aux,
++                real_window_size,
++                softcap,
++            )
++
+         # Compute per-seq splits and work_list on host, upload to device.
+         # Only enable for decode (max_seqlen_q == 1) with paged KV cache,
+         # multi-seq batches, and global num_splits_kv > 1.
+@@ -444,6 +588,7 @@ def flash_attn_varlen_func(
                  is_mix_batch,
                  splits_per_seq_dev,
                  work_list_dev,
@@ -5007,10 +5283,11 @@ index 1e2dc45..9e6e335 100644
              )
          except RuntimeError as e:
              if "not compiled" not in str(e):
-@@ -568,4 +570,3 @@ def _fallback_varlen_attn(
+@@ -567,5 +712,3 @@ def _fallback_varlen_attn(
+     if return_softmax_lse:
          return result[0], result[1]
      return result, None
- 
+-
 -
 diff --git a/vllm_xpu_kernels/fused_moe_interface.py b/vllm_xpu_kernels/fused_moe_interface.py
 index 9156687..24e2341 100755
