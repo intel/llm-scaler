@@ -240,6 +240,56 @@ def test_segment_contract_is_structural_not_sequence_specific(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("fallback", [False, True])
+def test_compile_diagnostics_do_not_specialize_on_eager_counters(
+    monkeypatch, fallback,
+):
+    adapter = _load_adapter(monkeypatch)
+    graphs = []
+
+    def backend(graph, _inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    class Layer:
+        def __call__(self, value):
+            return value.clone()
+
+    def fused(_ops, _layer, value, _scale, _shift, _segments):
+        return value.clone(), ""
+
+    def modulate(value, _shift, _scale, _segments):
+        return value.clone()
+
+    monkeypatch.setattr(adapter, "_run_fused", fused)
+    layer = Layer()
+
+    def invoke(value):
+        return adapter._rms_modulation(
+            None, modulate, layer, value, value, value, [],
+            "input_layout" if fallback else "",
+        )[0]
+
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(invoke, backend=backend, fullgraph=True)
+        value = _metadata(7, 5376)
+        for _ in range(12):
+            actual = compiled(value)
+            assert actual.is_meta and actual.shape == value.shape
+            # A separate eager call changes counters between compiled calls.
+            # It must not invalidate a compiled graph's guards.
+            invoke(value)
+        assert len(graphs) == 1
+        assert adapter.get_stats() == {
+            "routed": 0 if fallback else 12,
+            "fallback": 12 if fallback else 0,
+            "reasons": {"input_layout": 12} if fallback else {},
+        }
+    finally:
+        torch._dynamo.reset()
+
+
 @pytest.mark.parametrize("modulation_dtype", [torch.bfloat16, torch.float32])
 def test_modulation_requires_the_real_packed_six_chunk_layout(
     monkeypatch, modulation_dtype

@@ -26,6 +26,8 @@ _fallback_reasons: dict[str, int] = {}
 
 def _record_fallback(reason: str) -> None:
     global _fallback_calls
+    if torch.compiler.is_compiling():
+        return
     _fallback_calls += 1
     _fallback_reasons[reason] = _fallback_reasons.get(reason, 0) + 1
 
@@ -209,7 +211,9 @@ def _rms_modulation(
     if not reason:
         output, reason = _run_fused(comfy_ops, layer, x, scale, shift, segments)
         if output is not None:
-            _routed_calls += 1
+            # Eager diagnostics must not become mutable Dynamo guards.
+            if not torch.compiler.is_compiling():
+                _routed_calls += 1
             return output, 1
 
     # Once AdaLN or a residual update has run, keep fallback at this operator

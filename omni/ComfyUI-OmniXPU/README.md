@@ -181,6 +181,13 @@ staging operation, including its XPU state and any failure, enable:
 OMNIXPU_LORA_MEMORY_TRACE=1 python main.py
 ```
 
+LoRA memory logs report `xpu_memory=available`, `partial`, or `unavailable`
+for the diagnostic snapshot, not GPU availability. Allocator counters and
+device free/total memory are queried independently; successful values remain
+visible if another query fails. Missing values are listed rather than reported
+as zero, and query errors include the interface, exception type and message.
+Statistics failures do not change LoRA budgets or interrupt model loading.
+
 Set tracing variables before startup. The **OmniXPU Status** node reports:
 
 - GPU and `omni_xpu_kernel` capabilities;
@@ -189,7 +196,7 @@ Set tracing variables before startup. The **OmniXPU Status** node reports:
   and apply status;
 - attention and fused INT8 FFN routing counters.
 
-Attention and INT8 FFN counters record eager calls. During `torch.compile`,
+Attention, INT8 FFN and H3 RMS modulation counters record eager calls. During `torch.compile`,
 these diagnostic counters and logs are excluded from tracing so changing a
 counter cannot cause recompilation. Use the Torch profiler's operator events
 to inspect compiled native calls.

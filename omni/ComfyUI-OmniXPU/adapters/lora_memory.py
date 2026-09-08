@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
 from numbers import Real
@@ -268,21 +269,40 @@ def _runtime_patch_bytes(modules):
 
 
 def _xpu_snapshot(device=None):
+    snapshot = dict.fromkeys(("allocated", "reserved", "free", "total"))
+    snapshot["errors"] = {}
+
+    def query(name, operation):
+        try:
+            operation()
+        except Exception as error:
+            # Diagnostics must not interrupt loading or mask its original error.
+            snapshot["errors"][name] = f"{type(error).__name__}: {error}"
+
     try:
         import torch
 
         if device is None:
             device = torch.xpu.current_device()
+    except Exception as error:
+        snapshot["errors"]["current_device"] = f"{type(error).__name__}: {error}"
+        return snapshot
+
+    def allocator_stats():
         stats = torch.xpu.memory_stats(device)
+        # Missing allocator counters are unknown, not zero bytes.
+        for name in ("allocated", "reserved"):
+            key = f"{name}_bytes.all.current"
+            if key in stats:
+                snapshot[name] = int(stats[key])
+
+    def device_memory():
         free, total = torch.xpu.mem_get_info(device)
-        return {
-            "allocated": int(stats.get("allocated_bytes.all.current", 0)),
-            "reserved": int(stats.get("reserved_bytes.all.current", 0)),
-            "free": int(free),
-            "total": int(total),
-        }
-    except (AttributeError, RuntimeError, TypeError):
-        return None
+        snapshot["free"], snapshot["total"] = int(free), int(total)
+
+    query("memory_stats", allocator_stats)
+    query("mem_get_info", device_memory)
+    return snapshot
 
 
 def _mib(value):
@@ -291,12 +311,20 @@ def _mib(value):
 
 def _snapshot_text(snapshot):
     if snapshot is None:
-        return "xpu=unavailable"
-    return (
-        f"xpu_allocated={_mib(snapshot['allocated']):.1f}MiB "
-        f"xpu_reserved={_mib(snapshot['reserved']):.1f}MiB "
-        f"xpu_free={_mib(snapshot['free']):.1f}MiB"
+        return 'xpu_memory=unavailable reason="snapshot not collected"'
+    names = ("allocated", "reserved", "free", "total")
+    known = [name for name in names if snapshot.get(name) is not None]
+    status = "available" if len(known) == len(names) else "partial" if known else "unavailable"
+    parts = [f"xpu_memory={status}"]
+    parts.extend(f"xpu_{name}={_mib(snapshot[name]):.1f}MiB" for name in known)
+    parts.extend(
+        f"{name}_error={json.dumps(message)}"
+        for name, message in snapshot.get("errors", {}).items()
     )
+    missing = [name for name in names if name not in known]
+    if missing:
+        parts.append("missing=" + ",".join(missing))
+    return " ".join(parts)
 
 
 def _patch_lora_loader(comfy_sd):

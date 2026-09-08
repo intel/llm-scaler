@@ -27,6 +27,85 @@ def _load_module():
     return module
 
 
+@pytest.mark.parametrize("failed_query", ("memory_stats", "mem_get_info"))
+def test_snapshot_preserves_independent_metrics_and_query_error(monkeypatch, failed_query):
+    monitor = _load_module()
+    calls = []
+
+    def memory_stats(device):
+        calls.append(("memory_stats", device))
+        return {"allocated_bytes.all.current": 1024**2, "reserved_bytes.all.current": 2 * 1024**2}
+
+    def mem_get_info(device):
+        calls.append(("mem_get_info", device))
+        return 3 * 1024**2, 4 * 1024**2
+
+    def unavailable(device):
+        calls.append((failed_query, device))
+        raise RuntimeError('statistics unsupported\n"backend"')
+
+    xpu = types.SimpleNamespace(current_device=lambda: 0, memory_stats=memory_stats, mem_get_info=mem_get_info)
+    setattr(xpu, failed_query, unavailable)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(xpu=xpu))
+
+    snapshot = monitor._xpu_snapshot()
+    text = monitor._snapshot_text(snapshot)
+
+    assert calls == [("memory_stats", 0), ("mem_get_info", 0)]
+    assert "xpu_memory=partial" in text
+    assert failed_query + '_error="RuntimeError:' in text
+    assert "\n" not in text
+    assert "xpu=unavailable" not in text
+    if failed_query == "mem_get_info":
+        assert "xpu_allocated=1.0MiB xpu_reserved=2.0MiB" in text
+        assert "xpu_free=" not in text
+    else:
+        assert "xpu_free=3.0MiB xpu_total=4.0MiB" in text
+        assert "xpu_allocated=" not in text
+
+
+def test_snapshot_missing_counters_are_unknown_not_zero(monkeypatch):
+    monitor = _load_module()
+    xpu = types.SimpleNamespace(
+        current_device=lambda: 0,
+        memory_stats=lambda device: {},
+        mem_get_info=lambda device: (3 * 1024**2, 4 * 1024**2),
+    )
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(xpu=xpu))
+    text = monitor._snapshot_text(monitor._xpu_snapshot())
+    assert "xpu_memory=partial" in text
+    assert "missing=allocated,reserved" in text
+    assert "xpu_allocated=" not in text
+    assert "xpu_reserved=" not in text
+
+
+def test_snapshot_device_error_does_not_mask_model_load_error(monkeypatch, caplog):
+    monitor = _load_module()
+
+    def device_error():
+        raise RuntimeError("device query failed")
+
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(
+        xpu=types.SimpleNamespace(current_device=device_error),
+    ))
+    patcher = _patcher()
+    monitor._set_budget_entries(patcher, monitor._patcher_entries(patcher))
+    original_error = MemoryError("original model error")
+
+    def load(*args, **kwargs):
+        raise original_error
+
+    management = types.SimpleNamespace(load_models_gpu=load)
+    monitor._patch_model_loader(management)
+    with caplog.at_level(logging.INFO, logger="ComfyUI-OmniXPU"):
+        with pytest.raises(MemoryError) as caught:
+            management.load_models_gpu([patcher], memory_required=4096)
+    assert caught.value is original_error
+    assert 'current_device_error="RuntimeError: device query failed"' in caplog.text
+    assert "xpu_memory=unavailable" in caplog.text
+    assert "xpu=unavailable" not in caplog.text
+
+
 class FakeTensor:
     def __init__(self, numel, element_size):
         self._numel = numel
