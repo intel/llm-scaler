@@ -11,10 +11,11 @@
  * vllm-xpu speculative GDN kernels while avoiding the intermediate q/k/v/b/a
  * buffers and the separate conv and delta-rule launches.
  *
- * This implementation is intentionally scoped to the Qwen3.5/3.6 TP=2
- * geometries (H=8, HV=16/24, K=V=128, WG_SIZE=64). The host dispatcher
- * rejects unsupported geometries rather than silently selecting a slower or
- * incorrect layout.
+ * The implementation uses a fixed WG_SIZE=64 and K=V=128. It supports the
+ * existing Qwen3.5/3.6 TP=2 geometries (H=8, HV=16/24) and, through the
+ * versioned host entry point, the Qwen3.8 TP=8 geometry (H=2, HV=6).
+ * Unsupported geometries are rejected rather than silently selecting a slower
+ * or incorrect layout.
  */
 
 template <int WG_SIZE>
@@ -440,11 +441,25 @@ inline void gdn_conv_fused_seq_spec_host(
     int conv_state_len,
     int64_t conv_stride0,
     int64_t ssm_stride0,
-    sycl::queue& q)
+    sycl::queue& q,
+    bool allow_qwen38_tp8 = false)
 {
-    TORCH_CHECK(H == 8 && (HV == 16 || HV == 24) && K == 128 && V == 128,
-        "gdn_conv_fused_seq_spec supports H=8, HV=16/24, K=V=128; got H=",
-        H, " HV=", HV, " K=", K, " V=", V);
+    const bool legacy_geometry =
+        H == 8 && (HV == 16 || HV == 24) && K == 128 && V == 128;
+    const bool qwen38_tp8_geometry =
+        H == 2 && HV == 6 && K == 128 && V == 128;
+    if (allow_qwen38_tp8) {
+        TORCH_CHECK(
+            legacy_geometry || qwen38_tp8_geometry,
+            "gdn_conv_fused_seq_spec_v2 supports H=8, HV=16/24 or H=2, "
+            "HV=6, K=V=128; got H=", H, " HV=", HV, " K=", K,
+            " V=", V);
+    } else {
+        TORCH_CHECK(
+            legacy_geometry,
+            "gdn_conv_fused_seq_spec supports H=8, HV=16/24, K=V=128; "
+            "got H=", H, " HV=", HV, " K=", K, " V=", V);
+    }
     TORCH_CHECK(num_spec_decodes > 0 && num_spec_tokens > 0,
         "speculative GDN dimensions must be positive");
     TORCH_CHECK(
@@ -467,5 +482,180 @@ inline void gdn_conv_fused_seq_spec_host(
                 H, HV, K, V, scale, conv_state_len, conv_stride0,
                 ssm_stride0, ndi);
         });
+    });
+}
+
+// V2 owns each convolution feature exactly once. No recurrent work-group
+// reads mutable conv history: the next submission consumes FP16 q/k/v only.
+inline sycl::event gdn_spec_v2_conv_host(
+    const fp16* qkvz, int64_t qkvz_stride, fp16* conv,
+    const fp16* weight, const fp16* bias, const int* indices,
+    const int* tokens, const int* accepted, fp16* qkv, fp16* z,
+    int sequences, int M, int H, int HV, int conv_len,
+    int64_t conv_stride, sycl::queue& queue)
+{
+    const int dim = (2 * H + HV) * 128;
+    const int chunks = dim / 64;
+    const int groups = (chunks + 15) / 16;
+    return queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>(sequences, groups * 16),
+                              sycl::range<2>(1, 16)),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                const int seq = item.get_global_id(0);
+                const int chunk = item.get_global_id(1);
+                if (chunk >= chunks) return;
+                const int feature = chunk * 64;
+                const int row = seq * M;
+                const int initial_col = accepted[seq] - 1;
+                if (initial_col < 0 || initial_col >= M) return;
+                const bool packed = conv_len != 3;
+                const int initial_idx = indices[row + (packed ? 0 : initial_col)];
+                // Standard Triton uses NULL_BLOCK_ID=0, not the old wheel's -1.
+                if (initial_idx <= 0) return;
+                fp16* source = conv + (int64_t)initial_idx * conv_stride + feature;
+                const int offset = packed ? initial_col : 0;
+                simd<float, 64> s0 = block_load<fp16, 64>(source + offset * dim);
+                simd<float, 64> s1 = block_load<fp16, 64>(source + (offset + 1) * dim);
+                simd<float, 64> s2 = block_load<fp16, 64>(source + (offset + 2) * dim);
+                simd<fp16, 256> w = block_load<fp16, 256>(weight + feature * 4);
+                const simd<float, 64> w0 = w.select<64, 4>(0);
+                const simd<float, 64> w1 = w.select<64, 4>(1);
+                const simd<float, 64> w2 = w.select<64, 4>(2);
+                const simd<float, 64> w3 = w.select<64, 4>(3);
+                const simd<float, 64> bias_value = block_load<fp16, 64>(bias + feature);
+                // Triton caps effective state_len at M+2 even when the physical
+                // cache has more rows; the unused suffix must remain untouched.
+                const int retained = 2;
+                if (packed) {
+                    // Forward copy is safe: every source row is strictly after
+                    // its destination, and this work-item is the sole owner.
+                    for (int j = 0; j < retained; ++j) {
+                        const auto history = block_load<fp16, 64>(
+                            source + (offset + 1 + j) * dim);
+                        block_store<fp16, 64>(source + j * dim, history);
+                    }
+                }
+                for (int t = 0; t < M; ++t) {
+                    const int global_t = tokens[row + t];
+                    const fp16* input = qkvz + (int64_t)global_t * qkvz_stride;
+                    const simd<fp16, 64> x16 = block_load<fp16, 64>(input + feature);
+                    const simd<float, 64> x = x16;
+                    simd<float, 64> acc = bias_value;
+                    // Standard Triton multiplies FP16 operands in FP16 before
+                    // extending each product into the FP32 accumulator.
+                    acc += simd<float, 64>(simd<fp16, 64>(s0 * w0));
+                    acc += simd<float, 64>(simd<fp16, 64>(s1 * w1));
+                    acc += simd<float, 64>(simd<fp16, 64>(s2 * w2));
+                    acc += simd<float, 64>(simd<fp16, 64>(x * w3));
+                    acc = acc / (1.0f + sycl::ext::intel::esimd::exp(-acc));
+                    block_store<fp16, 64>(
+                        qkv + (int64_t)(row + t) * dim + feature,
+                        simd<fp16, 64>(acc));
+                    const int save_idx = packed ? initial_idx : indices[row + t];
+                    if (save_idx > 0) {
+                        fp16* dest = conv + (int64_t)save_idx * conv_stride + feature;
+                        if (!packed) {
+                            block_store<fp16, 64>(dest, simd<fp16, 64>(s1));
+                            block_store<fp16, 64>(dest + dim, simd<fp16, 64>(s2));
+                        }
+                        block_store<fp16, 64>(
+                            dest + (packed ? retained + t : 2) * dim, x16);
+                    }
+                    if (feature >= 2 * H * 128) {
+                        const int z_feature = feature - 2 * H * 128;
+                        block_store<fp16, 64>(
+                            z + (int64_t)global_t * HV * 128 + z_feature,
+                            block_load<fp16, 64>(input + dim + z_feature));
+                    }
+                    s0 = s1;
+                    s1 = s2;
+                    s2 = x;
+                }
+            });
+    });
+}
+
+template <typename AType>
+inline void gdn_spec_v2_recurrent_host(
+    const fp16* qkv, const AType* A_log, const fp16* dt_bias,
+    const fp16* ba, int64_t ba_stride, fp16* state, int64_t state_stride,
+    fp16* output, const int* indices, const int* tokens, const int* accepted,
+    int sequences, int M, int H, int HV, float scale,
+    const sycl::event& conv_ready, sycl::queue& queue)
+{
+    const int dim = (2 * H + HV) * 128;
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.depends_on(conv_ready);
+        cgh.parallel_for(
+            sycl::nd_range<3>(sycl::range<3>(sequences, HV, 64),
+                              sycl::range<3>(1, 1, 64)),
+            [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
+                const int seq = item.get_group(0);
+                const int hv = item.get_group(1);
+                const int vi = item.get_local_id(2) * 2;
+                const int kh = hv / (HV / H);
+                const int row = seq * M;
+                const int initial_col = accepted[seq] - 1;
+                if (initial_col < 0 || initial_col >= M) return;
+                const int initial_idx = indices[row + initial_col];
+                if (initial_idx <= 0) return;
+                const int64_t head_offset = (int64_t)hv * 128 * 128 + vi * 128;
+                const fp16* initial = state + (int64_t)initial_idx * state_stride + head_offset;
+                // Keep these FP32 registers alive for the entire sequence.
+                simd<float, 64> h0_lo = lsc_load_state_64_seq(initial);
+                simd<float, 64> h0_hi = lsc_load_state_64_seq(initial + 64);
+                simd<float, 64> h1_lo = lsc_load_state_64_seq(initial + 128);
+                simd<float, 64> h1_hi = lsc_load_state_64_seq(initial + 192);
+                const float neg_A = -esimd_expf_seq((float)A_log[hv]);
+                const float bias = (float)dt_bias[hv];
+                for (int t = 0; t < M; ++t) {
+                    const int global_t = tokens[row + t];
+                    const fp16* input = qkv + (int64_t)(row + t) * dim;
+                    simd<float, 64> q0 = block_load<fp16, 64>(input + kh * 128);
+                    simd<float, 64> q1 = block_load<fp16, 64>(input + kh * 128 + 64);
+                    simd<float, 64> k0 = block_load<fp16, 64>(input + (H + kh) * 128);
+                    simd<float, 64> k1 = block_load<fp16, 64>(input + (H + kh) * 128 + 64);
+                    const float q_inv = 1.0f / esimd_sqrtf_seq(
+                        gdn_dot128_seq(q0, q1, q0, q1) + 1e-6f);
+                    const float k_inv = 1.0f / esimd_sqrtf_seq(
+                        gdn_dot128_seq(k0, k1, k0, k1) + 1e-6f);
+                    q0 *= q_inv * scale;
+                    q1 *= q_inv * scale;
+                    k0 *= k_inv;
+                    k1 *= k_inv;
+                    const simd<float, 2> v = block_load<fp16, 2>(
+                        input + (2 * H + hv) * 128 + vi);
+                    const float b = (float)ba[(int64_t)global_t * ba_stride + hv];
+                    const float x = (float)ba[(int64_t)global_t * ba_stride + HV + hv] + bias;
+                    const float softplus = x > 20.0f ? x : esimd_logf_seq(1.0f + esimd_expf_seq(x));
+                    const float decay = esimd_expf_seq(neg_A * softplus);
+                    const float beta = 1.0f / (1.0f + esimd_expf_seq(-b));
+                    h0_lo *= decay;
+                    h0_hi *= decay;
+                    h1_lo *= decay;
+                    h1_hi *= decay;
+                    const float d0 = (v[0] - gdn_dot128_seq(h0_lo, h0_hi, k0, k1)) * beta;
+                    const float d1 = (v[1] - gdn_dot128_seq(h1_lo, h1_hi, k0, k1)) * beta;
+                    h0_lo += d0 * k0;
+                    h0_hi += d0 * k1;
+                    h1_lo += d1 * k0;
+                    h1_hi += d1 * k1;
+                    simd<float, 2> result;
+                    result[0] = gdn_dot128_seq(h0_lo, h0_hi, q0, q1);
+                    result[1] = gdn_dot128_seq(h1_lo, h1_hi, q0, q1);
+                    block_store<fp16, 2>(
+                        output + (int64_t)global_t * HV * 128 + hv * 128 + vi,
+                        simd<fp16, 2>(result));
+                    const int save_idx = indices[row + t];
+                    if (save_idx > 0) {
+                        fp16* dest = state + (int64_t)save_idx * state_stride + head_offset;
+                        lsc_store_state_64_seq(dest, h0_lo);
+                        lsc_store_state_64_seq(dest + 64, h0_hi);
+                        lsc_store_state_64_seq(dest + 128, h1_lo);
+                        lsc_store_state_64_seq(dest + 192, h1_hi);
+                    }
+                }
+            });
     });
 }

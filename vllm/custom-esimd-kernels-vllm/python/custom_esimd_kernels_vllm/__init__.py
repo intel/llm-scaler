@@ -83,6 +83,8 @@ from custom_esimd_kernels_vllm.ops import (
     esimd_norm_gemv_int4_sigmoid,
     esimd_gdn_conv_fused_seq,
     esimd_gdn_conv_fused_seq_spec,
+    esimd_gdn_conv_fused_seq_spec_v2,
+    has_esimd_gdn_conv_fused_seq_spec_v2,
     esimd_moe_topk,
     esimd_moe_scatter_fused,
     esimd_moe_silu_mul,

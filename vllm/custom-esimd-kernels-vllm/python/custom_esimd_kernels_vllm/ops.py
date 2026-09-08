@@ -4,6 +4,20 @@ import torch.nn.functional as F
 
 _ops = torch.ops.custom_esimd_kernels_vllm
 
+try:
+    _ESIMD_GDN_CONV_FUSED_SEQ_SPEC_V2 = (
+        _ops.esimd_gdn_conv_fused_seq_spec_v2
+    )
+except AttributeError:
+    # Keep an older installed DSO usable. The caller checks this capability
+    # before invoking the versioned wrapper, so no native submission occurs.
+    _ESIMD_GDN_CONV_FUSED_SEQ_SPEC_V2 = None
+
+
+def has_esimd_gdn_conv_fused_seq_spec_v2() -> bool:
+    """Return whether the loaded LGRF DSO registered the v2 spec op."""
+    return _ESIMD_GDN_CONV_FUSED_SEQ_SPEC_V2 is not None
+
 
 def _tensors_alias(left: torch.Tensor, right: torch.Tensor) -> bool:
     """Use the alias API available across supported PyTorch XPU builds."""
@@ -1982,6 +1996,38 @@ def esimd_gdn_conv_fused_seq_spec(
 ) -> torch.Tensor:
     """Fused sequential GDN for speculative tokens with rollback states."""
     return _ops.esimd_gdn_conv_fused_seq_spec(
+        qkvz, conv_state, conv_weight, conv_bias, spec_state_indices,
+        A_log, dt_bias, ba, ssm_state, output, z_out, token_indx,
+        num_accepted_tokens, num_spec_decodes, num_spec_tokens,
+        H, HV, K, V, scale)
+
+
+def esimd_gdn_conv_fused_seq_spec_v2(
+    qkvz: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor,
+    spec_state_indices: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    ba: torch.Tensor,
+    ssm_state: torch.Tensor,
+    output: torch.Tensor,
+    z_out: torch.Tensor,
+    token_indx: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    num_spec_decodes: int,
+    num_spec_tokens: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    scale: float,
+) -> torch.Tensor:
+    """Versioned spec GDN op with the Qwen3.8 TP=8 geometry."""
+    if _ESIMD_GDN_CONV_FUSED_SEQ_SPEC_V2 is None:
+        raise RuntimeError("esimd_gdn_conv_fused_seq_spec_v2 is unavailable")
+    return _ESIMD_GDN_CONV_FUSED_SEQ_SPEC_V2(
         qkvz, conv_state, conv_weight, conv_bias, spec_state_indices,
         A_log, dt_bias, ba, ssm_state, output, z_out, token_indx,
         num_accepted_tokens, num_spec_decodes, num_spec_tokens,
