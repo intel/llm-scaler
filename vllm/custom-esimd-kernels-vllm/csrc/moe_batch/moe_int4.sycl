@@ -20,6 +20,7 @@
 #include <c10/xpu/XPUStream.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <initializer_list>
 #include <limits>
@@ -2410,6 +2411,78 @@ static void moe_ws_up_shared_fp16_kernel(
     submit_kernel(cgf, device, "moe ws up shared fp16");
 }
 
+// compact80 小 M shared UP：四个 work-item 分担连续 K 段。
+// 每段仍用 VL64 FP32 累加；只在最后一次写回 intermediate 时转 FP16。
+// K-split 改变 FP32 加法顺序，不能假定与旧路径 bitexact。
+class MoeCompact80SharedUpKSplit4V1;
+
+static void moe_compact80_shared_up_ksplit4_kernel(
+    const fp16* x, const fp16* shared_gate_up_weight,
+    const fp16* shared_expert_gate_weight,
+    fp16* shared_intermediates, float* shared_gate_values,
+    const int n_tokens, const torch::Device& device) {
+    constexpr int H = 2560;
+    constexpr int I = 80;
+    constexpr int VL = 64;
+    constexpr int KS = 4;
+    constexpr int K_PER_SPLIT = H / KS;
+    constexpr uint32_t VECTOR_BYTES = VL * sizeof(float);
+    constexpr uint32_t SPLIT_BYTES = 2 * VECTOR_BYTES;
+    static_assert(K_PER_SPLIT % VL == 0);
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<MoeCompact80SharedUpKSplit4V1>(
+            sycl::nd_range<2>(sycl::range<2>(n_tokens, (I + 1) * KS),
+                              sycl::range<2>(1, KS)),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+                slm_init<KS * SPLIT_BYTES>();
+                const int token = (int)item.get_group(0);
+                const int col = (int)item.get_group(1);
+                const int split = (int)item.get_local_id(1);
+                const int begin = split * K_PER_SPLIT;
+                const fp16* xr = x + (size_t)token * H;
+                const fp16* gw = col < I
+                    ? shared_gate_up_weight + (size_t)col * H
+                    : shared_expert_gate_weight;
+                simd<float, VL> ga(0.f), ua(0.f);
+                for (int k = begin; k < begin + K_PER_SPLIT; k += VL) {
+                    simd<float, VL> xv = block_load<fp16, VL>(xr + k);
+                    ga += xv * simd<float, VL>(block_load<fp16, VL>(gw + k));
+                    if (col < I) {
+                        const fp16* uw = shared_gate_up_weight +
+                            (size_t)(I + col) * H;
+                        ua += xv * simd<float, VL>(block_load<fp16, VL>(uw + k));
+                    }
+                }
+                slm_block_store<float, VL>(split * SPLIT_BYTES, ga);
+                slm_block_store<float, VL>(split * SPLIT_BYTES + VECTOR_BYTES, ua);
+                // 所有 work-item 必须参与；gate 列也不能提前退出。
+                barrier();
+                if (split == 0) {
+                    simd<float, VL> g01 = slm_block_load<float, VL>(0) +
+                        slm_block_load<float, VL>(SPLIT_BYTES);
+                    simd<float, VL> g23 = slm_block_load<float, VL>(2 * SPLIT_BYTES) +
+                        slm_block_load<float, VL>(3 * SPLIT_BYTES);
+                    simd<float, VL> g_acc = g01 + g23;
+                    float g = sycl::ext::intel::esimd::detail::sum<float, float, VL>(g_acc);
+                    if (col < I) {
+                        simd<float, VL> u01 = slm_block_load<float, VL>(VECTOR_BYTES) +
+                            slm_block_load<float, VL>(SPLIT_BYTES + VECTOR_BYTES);
+                        simd<float, VL> u23 = slm_block_load<float, VL>(2 * SPLIT_BYTES + VECTOR_BYTES) +
+                            slm_block_load<float, VL>(3 * SPLIT_BYTES + VECTOR_BYTES);
+                        simd<float, VL> u_acc = u01 + u23;
+                        float u = sycl::ext::intel::esimd::detail::sum<float, float, VL>(u_acc);
+                        float silu = g / (1.f + sycl::exp(-g));
+                        shared_intermediates[(size_t)token * I + col] = fp16(silu * u);
+                    } else {
+                        shared_gate_values[token] = 1.f / (1.f + sycl::exp(-g));
+                    }
+                }
+            });
+    };
+    submit_kernel(cgf, device, "moe compact80 shared up ksplit4 v1");
+}
+
 template <typename IndexT>
 void moe_ws_up_cutlass_int4_with_shared_fp16_kernel(
     const fp16* x, const uint8_t* w13, const fp16* w13_scales,
@@ -2418,7 +2491,7 @@ void moe_ws_up_cutlass_int4_with_shared_fp16_kernel(
     fp16* routed_intermediates, fp16* shared_intermediates, float* shared_gate_values,
     const int n_tokens, const int top_k, const int hidden_size, const int intermediate_size,
     const int shared_inter_size, const int num_shared_experts,
-    const torch::Device& device) {
+    const torch::Device& device, const bool shared_up_ksplit4 = false) {
 
     // N_TILE routing: keep WI/EU in sweet spot [8, 50]
     // N_TILE=16 causes GRF spill (8KB acc fills large GRF), capped at 8
@@ -2436,10 +2509,17 @@ void moe_ws_up_cutlass_int4_with_shared_fp16_kernel(
             n_tokens, top_k, hidden_size, intermediate_size, device);
     }
 
-    moe_ws_up_shared_fp16_kernel<IndexT>(
-        x, shared_gate_up_weight, shared_expert_gate_weight,
-        shared_intermediates, shared_gate_values,
-        n_tokens, hidden_size, shared_inter_size, num_shared_experts, device);
+    if (shared_up_ksplit4 && n_tokens >= 2 && n_tokens <= 8 &&
+        hidden_size == 2560 && shared_inter_size == 80 && num_shared_experts == 1) {
+        moe_compact80_shared_up_ksplit4_kernel(
+            x, shared_gate_up_weight, shared_expert_gate_weight,
+            shared_intermediates, shared_gate_values, n_tokens, device);
+    } else {
+        moe_ws_up_shared_fp16_kernel<IndexT>(
+            x, shared_gate_up_weight, shared_expert_gate_weight,
+            shared_intermediates, shared_gate_values,
+            n_tokens, hidden_size, shared_inter_size, num_shared_experts, device);
+    }
 }
 
 template <typename IndexT, int HT, bool Compact80 = false> class MoeWsDownCutlassInt4WithSharedFP16;
@@ -2567,6 +2647,355 @@ void moe_ws_down_cutlass_int4_with_shared_fp16_kernel(
     submit_kernel(cgf, device, "moe ws down cutlass int4 with shared fp16");
 }
 
+
+
+// The tiled variant keeps two tokens in one work-item.  It preserves enough
+// parallel expert/column work for M=5..8 while cutting each compact expert-row
+// load roughly in half.
+template <typename IndexT, int TOKEN_TILE, int N_TILE>
+class MoeCompact80GroupedUpTiled;
+template <typename IndexT, int TOKEN_TILE, int N_TILE>
+class MoeCompact80GroupedSharedUpTiled;
+
+template <typename IndexT, int TOKEN_TILE, int N_TILE>
+static void moe_compact80_grouped_up_tiled_kernel(
+    const fp16* x, const uint8_t* w13, const fp16* w13_scales,
+    const IndexT* topk_idx, fp16* routed_intermediates,
+    const int n_tokens, const int top_k, const int hidden_size,
+    const int intermediate_size, const torch::Device& device) {
+
+    constexpr int VL = 64;
+    const int two_inter = 2 * intermediate_size;
+    const int k_bytes = hidden_size / 2;
+    const int k_groups = hidden_size / 128;
+    const int n_token_tiles = (n_tokens + TOKEN_TILE - 1) / TOKEN_TILE;
+    const int flat_routes = TOKEN_TILE * top_k;
+    const int n_col_tiles = intermediate_size / N_TILE;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeCompact80GroupedUpTiled<
+            IndexT, TOKEN_TILE, N_TILE>>(
+            sycl::range<3>(n_token_tiles, flat_routes, n_col_tiles),
+            [=](sycl::id<3> idx) SYCL_ESIMD_KERNEL {
+                const int token_base = (int)idx[0] * TOKEN_TILE;
+                if (token_base >= n_tokens) {
+                    return;
+                }
+                const int flat_route = (int)idx[1];
+                const int col_base = (int)idx[2] * N_TILE;
+                const int leader_token_offset = flat_route / top_k;
+                const int leader_route = flat_route % top_k;
+                const int leader_token = token_base + leader_token_offset;
+                if (leader_token >= n_tokens) {
+                    return;
+                }
+                const int expert =
+                    (int)topk_idx[leader_token * top_k + leader_route];
+
+                bool leader = true;
+                for (int prior_flat = 0;
+                     prior_flat < flat_route && prior_flat <
+                         (n_tokens - token_base) * top_k;
+                     ++prior_flat) {
+                    const int prior_token = token_base + prior_flat / top_k;
+                    const int prior_route = prior_flat % top_k;
+                    if ((int)topk_idx[prior_token * top_k + prior_route] ==
+                        expert) {
+                        leader = false;
+                        break;
+                    }
+                }
+                if (!leader) {
+                    return;
+                }
+
+                int route_for_token[TOKEN_TILE];
+                #pragma unroll
+                for (int token_offset = 0; token_offset < TOKEN_TILE;
+                     ++token_offset) {
+                    const int token = token_base + token_offset;
+                    route_for_token[token_offset] = -1;
+                    if (token >= n_tokens) {
+                        continue;
+                    }
+                    for (int route = 0; route < top_k; ++route) {
+                        if ((int)topk_idx[token * top_k + route] == expert) {
+                            route_for_token[token_offset] = route;
+                            break;
+                        }
+                    }
+                }
+
+                simd<float, VL> gate_acc[TOKEN_TILE][N_TILE];
+                simd<float, VL> up_acc[TOKEN_TILE][N_TILE];
+                #pragma unroll
+                for (int token_offset = 0; token_offset < TOKEN_TILE;
+                     ++token_offset) {
+                    #pragma unroll
+                    for (int t = 0; t < N_TILE; ++t) {
+                        gate_acc[token_offset][t] = 0.f;
+                        up_acc[token_offset][t] = 0.f;
+                    }
+                }
+
+                for (int kb = 0; kb < k_bytes; kb += VL) {
+                    simd<float, VL> xef[TOKEN_TILE];
+                    simd<float, VL> xof[TOKEN_TILE];
+                    #pragma unroll
+                    for (int token_offset = 0; token_offset < TOKEN_TILE;
+                         ++token_offset) {
+                        xef[token_offset] = 0.f;
+                        xof[token_offset] = 0.f;
+                        if (route_for_token[token_offset] >= 0) {
+                            const int token = token_base + token_offset;
+                            const fp16* x_row = x + (size_t)token * hidden_size;
+                            simd<fp16, 2 * VL> x_chunk = block_load<fp16, 2 * VL>(
+                                x_row + kb * 2, overaligned_tag<16>{});
+                            xef[token_offset] = x_chunk.select<VL, 2>(0);
+                            xof[token_offset] = x_chunk.select<VL, 2>(1);
+                        }
+                    }
+                    const int group = kb / VL;
+
+                    #pragma unroll
+                    for (int t = 0; t < N_TILE; ++t) {
+                        const int col = col_base + t;
+                        const uint8_t* gate_row =
+                            w13 + ((size_t)expert * two_inter + col) * k_bytes;
+                        const uint8_t* up_row = w13 +
+                            ((size_t)expert * two_inter + intermediate_size + col) * k_bytes;
+                        simd<uint8_t, VL> gate_raw = block_load<uint8_t, VL>(
+                            gate_row + kb, overaligned_tag<16>{});
+                        simd<uint8_t, VL> up_raw = block_load<uint8_t, VL>(
+                            up_row + kb, overaligned_tag<16>{});
+                        simd<uint16_t, VL> gate16 = convert<uint16_t>(gate_raw);
+                        simd<uint16_t, VL> up16 = convert<uint16_t>(up_raw);
+                        simd<float, VL> gate_lo = convert<float>(gate16 & 0x0Fu);
+                        simd<float, VL> gate_hi = convert<float>((gate16 >> 4) & 0x0Fu);
+                        simd<float, VL> up_lo = convert<float>(up16 & 0x0Fu);
+                        simd<float, VL> up_hi = convert<float>((up16 >> 4) & 0x0Fu);
+                        gate_lo.merge(gate_lo - 16.f, gate_lo >= 8.f);
+                        gate_hi.merge(gate_hi - 16.f, gate_hi >= 8.f);
+                        up_lo.merge(up_lo - 16.f, up_lo >= 8.f);
+                        up_hi.merge(up_hi - 16.f, up_hi >= 8.f);
+                        const float gate_scale = (float)(
+                            w13_scales + ((size_t)expert * two_inter + col) * k_groups
+                        )[group];
+                        const float up_scale = (float)(
+                            w13_scales +
+                            ((size_t)expert * two_inter + intermediate_size + col) * k_groups
+                        )[group];
+                        #pragma unroll
+                        for (int token_offset = 0; token_offset < TOKEN_TILE;
+                             ++token_offset) {
+                            if (route_for_token[token_offset] >= 0) {
+                                gate_acc[token_offset][t] +=
+                                    xef[token_offset] * (gate_lo * gate_scale) +
+                                    xof[token_offset] * (gate_hi * gate_scale);
+                                up_acc[token_offset][t] +=
+                                    xef[token_offset] * (up_lo * up_scale) +
+                                    xof[token_offset] * (up_hi * up_scale);
+                            }
+                        }
+                    }
+                }
+
+                #pragma unroll
+                for (int token_offset = 0; token_offset < TOKEN_TILE;
+                     ++token_offset) {
+                    if (route_for_token[token_offset] < 0) {
+                        continue;
+                    }
+                    const int token = token_base + token_offset;
+                    const int route = route_for_token[token_offset];
+                    #pragma unroll
+                    for (int t = 0; t < N_TILE; ++t) {
+                        const float gate =
+                            sycl::ext::intel::esimd::detail::sum<float, float, VL>(
+                                gate_acc[token_offset][t]);
+                        const float up =
+                            sycl::ext::intel::esimd::detail::sum<float, float, VL>(
+                                up_acc[token_offset][t]);
+                        routed_intermediates[((size_t)token * top_k + route) *
+                                                 intermediate_size + col_base + t] =
+                            fp16((gate / (1.f + sycl::exp(-gate))) * up);
+                    }
+                }
+            });
+    };
+    submit_kernel(cgf, device, "moe compact80 grouped tiled up");
+}
+
+template <typename IndexT, int TOKEN_TILE, int N_TILE>
+static void moe_compact80_grouped_shared_up_tiled_kernel(
+    const fp16* x, const fp16* shared_gate_up_weight,
+    const fp16* shared_expert_gate_weight, fp16* shared_intermediates,
+    float* shared_gate_values, const int n_tokens, const int hidden_size,
+    const int shared_inter_size, const int num_shared_experts,
+    const torch::Device& device) {
+
+    constexpr int VL = 64;
+    const int two_inter = 2 * shared_inter_size;
+    const int n_token_tiles = (n_tokens + TOKEN_TILE - 1) / TOKEN_TILE;
+    const int n_col_tiles = shared_inter_size / N_TILE;
+
+    auto cgf = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoeCompact80GroupedSharedUpTiled<
+            IndexT, TOKEN_TILE, N_TILE>>(
+            sycl::range<3>(n_token_tiles, num_shared_experts, n_col_tiles),
+            [=](sycl::id<3> idx) SYCL_ESIMD_KERNEL {
+                const int token_base = (int)idx[0] * TOKEN_TILE;
+                const int sid = (int)idx[1];
+                const int col_base = (int)idx[2] * N_TILE;
+                if (token_base >= n_tokens) {
+                    return;
+                }
+
+                float expert_gate_acc[TOKEN_TILE];
+                simd<float, VL> gate_up_acc[TOKEN_TILE][N_TILE];
+                simd<float, VL> up_acc[TOKEN_TILE][N_TILE];
+                #pragma unroll
+                for (int token_offset = 0; token_offset < TOKEN_TILE;
+                     ++token_offset) {
+                    expert_gate_acc[token_offset] = 0.f;
+                    #pragma unroll
+                    for (int t = 0; t < N_TILE; ++t) {
+                        gate_up_acc[token_offset][t] = 0.f;
+                        up_acc[token_offset][t] = 0.f;
+                    }
+                }
+
+                for (int k = 0; k < hidden_size; k += VL) {
+                    simd<float, VL> x_values[TOKEN_TILE];
+                    #pragma unroll
+                    for (int token_offset = 0; token_offset < TOKEN_TILE;
+                         ++token_offset) {
+                        const int token = token_base + token_offset;
+                        x_values[token_offset] = 0.f;
+                        if (token < n_tokens) {
+                            x_values[token_offset] = simd<float, VL>(
+                                block_load<fp16, VL>(
+                                    x + (size_t)token * hidden_size + k,
+                                    overaligned_tag<16>{}));
+                        }
+                    }
+
+                    const fp16* expert_gate_row =
+                        shared_expert_gate_weight + (size_t)sid * hidden_size;
+                    simd<float, VL> expert_gate_weight = simd<float, VL>(
+                        block_load<fp16, VL>(
+                            expert_gate_row + k, overaligned_tag<16>{}));
+                    #pragma unroll
+                    for (int token_offset = 0; token_offset < TOKEN_TILE;
+                         ++token_offset) {
+                        expert_gate_acc[token_offset] +=
+                            sycl::ext::intel::esimd::detail::sum<float, float, VL>(
+                                x_values[token_offset] * expert_gate_weight);
+                    }
+
+                    const fp16* gate_up = shared_gate_up_weight +
+                        (size_t)sid * two_inter * hidden_size;
+                    #pragma unroll
+                    for (int t = 0; t < N_TILE; ++t) {
+                        const int col = col_base + t;
+                        simd<float, VL> gate_up_weight = simd<float, VL>(
+                            block_load<fp16, VL>(
+                                gate_up + (size_t)col * hidden_size + k,
+                                overaligned_tag<16>{}));
+                        simd<float, VL> up_weight = simd<float, VL>(
+                            block_load<fp16, VL>(
+                                gate_up +
+                                    (size_t)(shared_inter_size + col) * hidden_size + k,
+                                overaligned_tag<16>{}));
+                        #pragma unroll
+                        for (int token_offset = 0; token_offset < TOKEN_TILE;
+                             ++token_offset) {
+                            gate_up_acc[token_offset][t] +=
+                                x_values[token_offset] * gate_up_weight;
+                            up_acc[token_offset][t] +=
+                                x_values[token_offset] * up_weight;
+                        }
+                    }
+                }
+
+                #pragma unroll
+                for (int token_offset = 0; token_offset < TOKEN_TILE;
+                     ++token_offset) {
+                    const int token = token_base + token_offset;
+                    if (token >= n_tokens) {
+                        continue;
+                    }
+                    #pragma unroll
+                    for (int t = 0; t < N_TILE; ++t) {
+                        const float gate =
+                            sycl::ext::intel::esimd::detail::sum<float, float, VL>(
+                                gate_up_acc[token_offset][t]);
+                        const float up =
+                            sycl::ext::intel::esimd::detail::sum<float, float, VL>(
+                                up_acc[token_offset][t]);
+                        shared_intermediates[((size_t)token * num_shared_experts +
+                                              sid) * shared_inter_size + col_base + t] =
+                            fp16((gate / (1.f + sycl::exp(-gate))) * up);
+                    }
+                    if (col_base == 0) {
+                        shared_gate_values[(size_t)token * num_shared_experts + sid] =
+                            1.f / (1.f + sycl::exp(-expert_gate_acc[token_offset]));
+                    }
+                }
+            });
+    };
+    submit_kernel(cgf, device, "moe compact80 grouped tiled shared up");
+}
+
+template <typename IndexT>
+static void moe_compact80_grouped_launch(
+    const fp16* x, const uint8_t* w13, const fp16* w13_scales,
+    const uint8_t* w2, const fp16* w2_scales, const IndexT* topk_idx,
+    const fp16* topk_weight, const fp16* shared_gate_up_weight,
+    const fp16* shared_down_weight, const fp16* shared_expert_gate_weight,
+    fp16* routed_intermediates,
+    fp16* shared_intermediates,
+    float* gate_values, fp16* output, const int n_tokens, const int top_k,
+    const int hidden_size, const int routed_intermediate_size,
+    const int shared_intermediate_size, const int num_shared_experts,
+    const torch::Device& device, const bool shared_up_ksplit4 = false) {
+
+    // Two tokens/columns per work-item reuse expert rows without collapsing
+    // the M=5..8 grid to one serial down work-item per hidden tile.
+    constexpr int TOKEN_TILE = 2;
+    constexpr int N_TILE = 2;
+    moe_compact80_grouped_up_tiled_kernel<IndexT, TOKEN_TILE, N_TILE>(
+        x, w13, w13_scales, topk_idx, routed_intermediates, n_tokens, top_k,
+        hidden_size, routed_intermediate_size, device);
+    if (shared_up_ksplit4 && n_tokens >= 2 && n_tokens <= 8 &&
+        hidden_size == 2560 && shared_intermediate_size == 80 && num_shared_experts == 1) {
+        moe_compact80_shared_up_ksplit4_kernel(
+            x, shared_gate_up_weight, shared_expert_gate_weight,
+            shared_intermediates, gate_values, n_tokens, device);
+    } else {
+        moe_compact80_grouped_shared_up_tiled_kernel<IndexT, TOKEN_TILE, N_TILE>(
+            x, shared_gate_up_weight, shared_expert_gate_weight,
+            shared_intermediates, gate_values, n_tokens, hidden_size,
+            shared_intermediate_size, num_shared_experts, device);
+    }
+    // Keep the proven compact80 down/final reduction as the single finishing
+    // submit.  Grouping the two UP projections is the weight-reuse change;
+    // splitting DOWN into route-output plus finalize would add a fourth
+    // submission and erase the small-M win.
+    if (n_tokens <= 2) {
+        moe_ws_down_cutlass_int4_with_shared_fp16_kernel<IndexT, 4, true>(
+            routed_intermediates, w2, w2_scales, topk_weight, topk_idx,
+            shared_intermediates, gate_values, shared_down_weight, output,
+            n_tokens, top_k, hidden_size, routed_intermediate_size,
+            shared_intermediate_size, num_shared_experts, device);
+    } else {
+        moe_ws_down_cutlass_int4_with_shared_fp16_kernel<IndexT, 8, true>(
+            routed_intermediates, w2, w2_scales, topk_weight, topk_idx,
+            shared_intermediates, gate_values, shared_down_weight, output,
+            n_tokens, top_k, hidden_size, routed_intermediate_size,
+            shared_intermediate_size, num_shared_experts, device);
+    }
+}
 
 
 template <typename IndexT>
@@ -3321,6 +3750,58 @@ static inline bool moe_asymmetric_v1_tensors_overlap(
     return left_begin - right_begin < right_bytes;
 }
 
+// 仅供独立对拍/微基准：caller-owned 输出，不分配全局或跨 stream scratch。
+// false 直接运行未改动的旧 shared UP；true 运行唯一的 K-split4 候选。
+static void moe_compact80_shared_up_ab_out_v1(
+    torch::Tensor x, torch::Tensor shared_gate_up_weight,
+    torch::Tensor shared_expert_gate_weight, torch::Tensor intermediates,
+    torch::Tensor gate_values, bool candidate) {
+    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 2 && x.size(0) <= 8,
+                "compact80 shared UP A/B requires 2..8 tokens");
+    const int n_tokens = (int)x.size(0);
+    const auto device = x.device();
+    check_moe_asymmetric_v1_tensor(x, "x", torch::kHalf, {n_tokens, 2560}, device);
+    check_moe_asymmetric_v1_tensor(shared_gate_up_weight, "shared_gate_up_weight",
+                                   torch::kHalf, {160, 2560}, device);
+    check_moe_asymmetric_v1_tensor(shared_expert_gate_weight, "shared_expert_gate_weight",
+                                   torch::kHalf, {1, 2560}, device);
+    check_moe_asymmetric_v1_tensor(intermediates, "intermediates",
+                                   torch::kHalf, {n_tokens, 80}, device);
+    check_moe_asymmetric_v1_tensor(gate_values, "gate_values",
+                                   torch::kFloat, {n_tokens, 1}, device);
+    for (const auto& tensor : {x, shared_gate_up_weight, shared_expert_gate_weight,
+                               intermediates, gate_values}) {
+        TORCH_CHECK(!tensor.is_neg() && !tensor.is_conj(),
+                    "compact80 shared UP A/B rejects lazy neg/conj tensors");
+    }
+    for (const auto& output : {intermediates, gate_values}) {
+        for (const auto& input : {x, shared_gate_up_weight, shared_expert_gate_weight}) {
+            TORCH_CHECK(!moe_asymmetric_v1_tensors_overlap(output, input),
+                        "compact80 shared UP outputs must not alias inputs");
+        }
+    }
+    TORCH_CHECK(!moe_asymmetric_v1_tensors_overlap(intermediates, gate_values),
+                "compact80 shared UP outputs must not alias each other");
+    auto stream = c10::xpu::getCurrentXPUStream(device.index());
+    auto& queue = stream.queue();
+    TORCH_CHECK(queue.is_in_order(), "compact80 shared UP requires an in-order queue");
+    TORCH_CHECK(queue.get_context() == c10::xpu::get_device_context() &&
+                    queue.get_device() == c10::xpu::get_raw_device(device.index()),
+                "compact80 shared UP current queue must match x device/context");
+    if (candidate) {
+        moe_compact80_shared_up_ksplit4_kernel(
+            (const fp16*)x.data_ptr(), (const fp16*)shared_gate_up_weight.data_ptr(),
+            (const fp16*)shared_expert_gate_weight.data_ptr(),
+            (fp16*)intermediates.data_ptr(), gate_values.data_ptr<float>(), n_tokens, device);
+    } else {
+        moe_ws_up_shared_fp16_kernel<int32_t>(
+            (const fp16*)x.data_ptr(), (const fp16*)shared_gate_up_weight.data_ptr(),
+            (const fp16*)shared_expert_gate_weight.data_ptr(),
+            (fp16*)intermediates.data_ptr(), gate_values.data_ptr<float>(),
+            n_tokens, 2560, 80, 1, device);
+    }
+}
+
 struct MoeM1AsymmetricV1Buffers {
     // The router result shares the existing per-stream scratch entry with
     // top-k and expert intermediates. The queue is in-order, so a later layer
@@ -3543,6 +4024,57 @@ static MoeMultiMAsymmetricV1Buffers& ensure_moe_multi_m_asymmetric_v1_buffers(
         {MAX_N_TOKENS * NUM_SHARED_EXPERTS},
         torch::device(device).dtype(torch::kFloat));
     auto committed = s_moe_multi_m_asymmetric_v1_buffers_by_stream.emplace(
+        stream, std::move(candidate));
+    return committed.first->second;
+}
+
+struct MoeCompact80GroupedBuffers {
+    torch::Tensor topk_idx;
+    torch::Tensor topk_weight;
+    torch::Tensor routed_intermediates;
+    torch::Tensor shared_intermediates;
+    torch::Tensor gate_values;
+};
+
+// The grouped compact80 ABI has its own stream-local workspace.  Keeping it
+// separate from the legacy M=2..32 cache makes the new [80]-wide routed
+// scratch layout explicit and prevents two streams from ever sharing a
+// producer/consumer buffer.
+static thread_local std::unordered_map<
+    c10::xpu::XPUStream, MoeCompact80GroupedBuffers>
+    s_moe_compact80_grouped_buffers_by_stream;
+
+static MoeCompact80GroupedBuffers& ensure_moe_compact80_grouped_buffers(
+    const torch::Device& device,
+    const c10::xpu::XPUStream& stream) {
+    constexpr int MAX_N_TOKENS = 8;
+    constexpr int TOP_K = 10;
+    constexpr int ROUTED_INTERMEDIATE_SIZE = 80;
+    constexpr int SHARED_INTERMEDIATE_SIZE = 80;
+    constexpr int NUM_SHARED_EXPERTS = 1;
+
+    auto existing = s_moe_compact80_grouped_buffers_by_stream.find(stream);
+    if (existing != s_moe_compact80_grouped_buffers_by_stream.end()) {
+        return existing->second;
+    }
+
+    // Do not publish a partially initialized entry.  This is also before the
+    // first top-k/native submit, so allocation failures cannot leave a queued
+    // transaction without its complete private scratch set.
+    MoeCompact80GroupedBuffers candidate;
+    auto int_options = torch::device(device).dtype(torch::kInt32);
+    auto half_options = torch::device(device).dtype(torch::kHalf);
+    candidate.topk_idx = torch::empty({MAX_N_TOKENS, TOP_K}, int_options);
+    candidate.topk_weight = torch::empty({MAX_N_TOKENS, TOP_K}, half_options);
+    candidate.routed_intermediates = torch::empty(
+        {MAX_N_TOKENS * TOP_K, ROUTED_INTERMEDIATE_SIZE}, half_options);
+    candidate.shared_intermediates = torch::empty(
+        {MAX_N_TOKENS * NUM_SHARED_EXPERTS, SHARED_INTERMEDIATE_SIZE},
+        half_options);
+    candidate.gate_values = torch::empty(
+        {MAX_N_TOKENS * NUM_SHARED_EXPERTS},
+        torch::device(device).dtype(torch::kFloat));
+    auto committed = s_moe_compact80_grouped_buffers_by_stream.emplace(
         stream, std::move(candidate));
     return committed.first->second;
 }
@@ -4045,6 +4577,19 @@ torch::Tensor moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_compact80_out_
                 output, shared_expert_gate_weight),
         "output must not alias any input tensor");
 
+    // M2..6 的 shared UP 在完整 MoE 三轮 A/B 中获益；M7/8 默认保留旧路径。
+    // 显式 "1" 可测试全部 M2..8，"0" 关闭；不影响独立的 M1/M9+ 路径。
+    const char* shared_up_env = std::getenv("VLLM_XPU_MOE_COMPACT80_SHARED_UP_KSPLIT4");
+    const bool shared_up_ksplit4 = shared_up_env == nullptr
+        ? n_tokens <= 6
+        : n_tokens <= 8 && shared_up_env[0] == '1' && shared_up_env[1] == '\0';
+    if (shared_up_ksplit4) {
+        for (const auto& tensor : {x, shared_gate_up_weight, shared_expert_gate_weight}) {
+            TORCH_CHECK(!tensor.is_neg() && !tensor.is_conj(),
+                        "compact80 shared UP candidate rejects lazy neg/conj tensors");
+        }
+    }
+
     // All tensor/scalar/alias checks precede cache allocation and submission.
     auto stream = c10::xpu::getCurrentXPUStream(device.index());
     sycl::queue& queue = stream.queue();
@@ -4055,6 +4600,8 @@ torch::Tensor moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_compact80_out_
     TORCH_CHECK(
         queue.get_device() == c10::xpu::get_raw_device(device.index()),
         "current XPU stream queue does not match x device");
+    TORCH_CHECK(!shared_up_ksplit4 || queue.is_in_order(),
+                "compact80 shared UP candidate requires an in-order queue");
     auto& buffers = ensure_moe_multi_m_asymmetric_v1_buffers(device, stream);
 
     moe_topk_v2_host<N_ROUTED_EXPERTS, TOP_K>(
@@ -4072,7 +4619,7 @@ torch::Tensor moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_compact80_out_
         (fp16*)buffers.shared_intermediates.data_ptr(),
         buffers.gate_values.data_ptr<float>(), n_tokens, TOP_K, HIDDEN_SIZE,
         ROUTED_INTERMEDIATE_SIZE, SHARED_INTERMEDIATE_SIZE,
-        NUM_SHARED_EXPERTS, device);
+        NUM_SHARED_EXPERTS, device, shared_up_ksplit4);
     if (n_tokens <= 2) {
         moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t, 4, true>(
             (const fp16*)buffers.routed_intermediates.data_ptr(),
@@ -4105,6 +4652,148 @@ torch::Tensor moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_compact80_out_
 }
 
 
+
+
+torch::Tensor moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_compact80_grouped_out_v1(
+    torch::Tensor x,
+    torch::Tensor logits,
+    torch::Tensor w13_qweight_s4,
+    torch::Tensor w13_scales,
+    torch::Tensor w2_qweight_s4,
+    torch::Tensor w2_scales,
+    torch::Tensor shared_gate_up_weight,
+    torch::Tensor shared_down_weight,
+    torch::Tensor shared_expert_gate_weight,
+    torch::Tensor output,
+    int64_t top_k,
+    int64_t num_shared_experts,
+    int64_t n_routed_experts) {
+
+    constexpr int MIN_N_TOKENS = 2;
+    constexpr int MAX_N_TOKENS = 8;
+    constexpr int HIDDEN_SIZE = 2560;
+    constexpr int N_ROUTED_EXPERTS = 512;
+    constexpr int TOP_K = 10;
+    constexpr int ROUTED_INTERMEDIATE_SIZE = 80;
+    constexpr int SHARED_INTERMEDIATE_SIZE = 80;
+    constexpr int NUM_SHARED_EXPERTS = 1;
+
+    TORCH_CHECK(top_k == TOP_K,
+                "compact80 grouped out v1 requires top_k=10");
+    TORCH_CHECK(num_shared_experts == NUM_SHARED_EXPERTS,
+                "compact80 grouped out v1 requires one shared expert");
+    TORCH_CHECK(n_routed_experts == N_ROUTED_EXPERTS,
+                "compact80 grouped out v1 requires 512 routed experts");
+    TORCH_CHECK(x.dim() == 2,
+                "compact80 grouped out v1 requires rank-2 x");
+    const int n_tokens = (int)x.size(0);
+    TORCH_CHECK(n_tokens >= MIN_N_TOKENS && n_tokens <= MAX_N_TOKENS,
+                "compact80 grouped out v1 requires 2..8 tokens");
+
+    const torch::Device device = x.device();
+    check_moe_asymmetric_v1_tensor(
+        x, "x", torch::kHalf, {n_tokens, HIDDEN_SIZE}, device);
+    check_moe_asymmetric_v1_tensor(
+        logits, "logits", torch::kHalf,
+        {n_tokens, N_ROUTED_EXPERTS}, device);
+    check_moe_asymmetric_v1_tensor(
+        w13_qweight_s4, "w13_qweight_s4", torch::kByte,
+        {N_ROUTED_EXPERTS, 2 * ROUTED_INTERMEDIATE_SIZE, HIDDEN_SIZE / 2},
+        device);
+    check_moe_asymmetric_v1_tensor(
+        w13_scales, "w13_scales", torch::kHalf,
+        {N_ROUTED_EXPERTS, 2 * ROUTED_INTERMEDIATE_SIZE, HIDDEN_SIZE / 128},
+        device);
+    check_moe_asymmetric_v1_tensor(
+        w2_qweight_s4, "w2_qweight_s4", torch::kByte,
+        {N_ROUTED_EXPERTS, HIDDEN_SIZE, ROUTED_INTERMEDIATE_SIZE / 2},
+        device);
+    check_moe_asymmetric_v1_tensor(
+        w2_scales, "w2_scales", torch::kHalf,
+        {N_ROUTED_EXPERTS, HIDDEN_SIZE, 1}, device);
+    check_moe_asymmetric_v1_tensor(
+        shared_gate_up_weight, "shared_gate_up_weight", torch::kHalf,
+        {2 * SHARED_INTERMEDIATE_SIZE, HIDDEN_SIZE}, device);
+    check_moe_asymmetric_v1_tensor(
+        shared_down_weight, "shared_down_weight", torch::kHalf,
+        {HIDDEN_SIZE, SHARED_INTERMEDIATE_SIZE}, device);
+    check_moe_asymmetric_v1_tensor(
+        shared_expert_gate_weight, "shared_expert_gate_weight", torch::kHalf,
+        {NUM_SHARED_EXPERTS, HIDDEN_SIZE}, device);
+    check_moe_asymmetric_v1_tensor(
+        output, "output", torch::kHalf, {n_tokens, HIDDEN_SIZE}, device);
+    TORCH_CHECK(
+        !moe_asymmetric_v1_tensors_overlap(output, x) &&
+            !moe_asymmetric_v1_tensors_overlap(output, logits) &&
+            !moe_asymmetric_v1_tensors_overlap(output, w13_qweight_s4) &&
+            !moe_asymmetric_v1_tensors_overlap(output, w13_scales) &&
+            !moe_asymmetric_v1_tensors_overlap(output, w2_qweight_s4) &&
+            !moe_asymmetric_v1_tensors_overlap(output, w2_scales) &&
+            !moe_asymmetric_v1_tensors_overlap(output, shared_gate_up_weight) &&
+            !moe_asymmetric_v1_tensors_overlap(output, shared_down_weight) &&
+            !moe_asymmetric_v1_tensors_overlap(
+                output, shared_expert_gate_weight),
+        "output must not alias any input tensor");
+
+    // M5/6 的生产 grouped 入口使用同一个 M2..6 默认启用的 shared-UP 实现。
+    // 此开关不选择 routed UP 或 DOWN 的实现。
+    const char* shared_up_env = std::getenv("VLLM_XPU_MOE_COMPACT80_SHARED_UP_KSPLIT4");
+    const bool shared_up_ksplit4 = shared_up_env == nullptr
+        ? n_tokens <= 6
+        : shared_up_env[0] == '1' && shared_up_env[1] == '\0';
+    if (shared_up_ksplit4) {
+        for (const auto& tensor : {x, shared_gate_up_weight, shared_expert_gate_weight}) {
+            TORCH_CHECK(!tensor.is_neg() && !tensor.is_conj(),
+                        "compact80 shared UP candidate rejects lazy neg/conj tensors");
+        }
+    }
+
+    // Every tensor/scalar/alias check precedes cache allocation and the first
+    // native submit.  The cache is keyed by the current stream, so the three
+    // dependent submits below cannot cross-contaminate two queues.
+    auto stream = c10::xpu::getCurrentXPUStream(device.index());
+    sycl::queue& queue = stream.queue();
+    TORCH_CHECK(stream.device_index() == device.index(),
+                "current XPU stream does not match x device");
+    TORCH_CHECK(queue.get_context() == c10::xpu::get_device_context(),
+                "current XPU stream uses a foreign SYCL context");
+    TORCH_CHECK(
+        queue.get_device() == c10::xpu::get_raw_device(device.index()),
+        "current XPU stream queue does not match x device");
+    TORCH_CHECK(!shared_up_ksplit4 || queue.is_in_order(),
+                "compact80 shared UP candidate requires an in-order queue");
+    auto& buffers = ensure_moe_compact80_grouped_buffers(device, stream);
+
+    moe_topk_v2_host<N_ROUTED_EXPERTS, TOP_K>(
+        (const fp16*)logits.data_ptr(),
+        (fp16*)buffers.topk_weight.data_ptr(),
+        buffers.topk_idx.data_ptr<int32_t>(), n_tokens, queue);
+
+    const fp16* x_ptr = (const fp16*)x.data_ptr();
+    const uint8_t* w13_ptr = (const uint8_t*)w13_qweight_s4.data_ptr();
+    const fp16* w13_scale_ptr = (const fp16*)w13_scales.data_ptr();
+    const uint8_t* w2_ptr = (const uint8_t*)w2_qweight_s4.data_ptr();
+    const fp16* w2_scale_ptr = (const fp16*)w2_scales.data_ptr();
+    const fp16* topk_weight_ptr = (const fp16*)buffers.topk_weight.data_ptr();
+    const int32_t* topk_idx_ptr = buffers.topk_idx.data_ptr<int32_t>();
+    const fp16* shared_up_ptr = (const fp16*)shared_gate_up_weight.data_ptr();
+    const fp16* shared_down_ptr = (const fp16*)shared_down_weight.data_ptr();
+    const fp16* shared_gate_ptr =
+        (const fp16*)shared_expert_gate_weight.data_ptr();
+    fp16* routed_ptr = (fp16*)buffers.routed_intermediates.data_ptr();
+    fp16* shared_ptr = (fp16*)buffers.shared_intermediates.data_ptr();
+    float* gate_ptr = buffers.gate_values.data_ptr<float>();
+    fp16* output_ptr = (fp16*)output.data_ptr();
+
+    moe_compact80_grouped_launch<int32_t>(
+        x_ptr, w13_ptr, w13_scale_ptr, w2_ptr, w2_scale_ptr, topk_idx_ptr,
+        topk_weight_ptr, shared_up_ptr, shared_down_ptr, shared_gate_ptr,
+        routed_ptr, shared_ptr, gate_ptr, output_ptr,
+        n_tokens, TOP_K, HIDDEN_SIZE, ROUTED_INTERMEDIATE_SIZE,
+        SHARED_INTERMEDIATE_SIZE, NUM_SHARED_EXPERTS, device, shared_up_ksplit4);
+
+    return output;
+}
 
 
 torch::Tensor moe_tiny_fp16_shared_up(
@@ -5300,6 +5989,7 @@ torch::Tensor moe_forward_gelu_tanh_int4_decode(
 }
 
 TORCH_LIBRARY_FRAGMENT(moe_int4_ops, m) {
+    m.def("_moe_compact80_shared_up_ab_out_v1(Tensor x, Tensor shared_gate_up_weight, Tensor shared_expert_gate_weight, Tensor(a!) intermediates, Tensor(b!) gate_values, bool candidate) -> ()");
     m.def("qwen38_moe_compact80_weight_contract_v1(Tensor[] weights, Device device) -> int", &qwen38_moe_compact80_weight_contract_v1);
     m.def("moe_compact80_down_grouped_gemm(Tensor x, Tensor weight, Tensor scale, Tensor rows_per_expert) -> Tensor");
     m.def("moe_router_forward_int4(Tensor x, Tensor weight, Tensor scale, bool use_ggml_layout) -> Tensor");
@@ -5308,6 +5998,7 @@ TORCH_LIBRARY_FRAGMENT(moe_int4_ops, m) {
     m.def("moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_out_v1(Tensor x, Tensor logits, Tensor w13_qweight_s4, Tensor w13_scales, Tensor w2_qweight_s4, Tensor w2_scales, Tensor shared_gate_up_weight, Tensor shared_down_weight, Tensor shared_expert_gate_weight, Tensor(a!) output, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor(a!)");
     m.def("moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_router_out_v1(Tensor x, Tensor router_weight, Tensor router_scale, Tensor w13_qweight_s4, Tensor w13_scales, Tensor w2_qweight_s4, Tensor w2_scales, Tensor shared_gate_up_weight, Tensor shared_down_weight, Tensor shared_expert_gate_weight, Tensor(a!) output, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor(a!)");
     m.def("moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_compact80_out_v1(Tensor x, Tensor logits, Tensor w13_qweight_s4, Tensor w13_scales, Tensor w2_qweight_s4, Tensor w2_scales, Tensor shared_gate_up_weight, Tensor shared_down_weight, Tensor shared_expert_gate_weight, Tensor(a!) output, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor(a!)");
+    m.def("moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_compact80_grouped_out_v1(Tensor x, Tensor logits, Tensor w13_qweight_s4, Tensor w13_scales, Tensor w2_qweight_s4, Tensor w2_scales, Tensor shared_gate_up_weight, Tensor shared_down_weight, Tensor shared_expert_gate_weight, Tensor(a!) output, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor(a!)");
     m.def("moe_route_precompute_int4(Tensor topk_weight, Tensor topk_idx, int num_experts) -> (Tensor, Tensor, Tensor)");
     m.def("moe_silu_mul_int4(Tensor gate_up) -> Tensor");
     m.def("moe_route_gather_int4(Tensor route_output, Tensor sorted_rows, Tensor sorted_weights, int n_tokens) -> Tensor");
@@ -5356,7 +6047,20 @@ TORCH_LIBRARY_FRAGMENT(moe_int4_ops, m) {
           "int top_k, int num_shared_experts, int n_routed_experts) -> Tensor");
 }
 
+// 此私有 out/void ABI 必须让 preflight 看到原始 math bits。
+// 通用 MathBitsFallback 会先 clone/resolve 再执行 XPU kernel；对 mutable
+// 参数还会在执行后尝试返回值回写，不能满足本 ABI 的提交前拒绝契约。
+// 只覆盖这一 op，不能给整个命名空间设置 fallthrough。
+TORCH_LIBRARY_IMPL(moe_int4_ops, Negative, m) {
+    m.impl("_moe_compact80_shared_up_ab_out_v1", torch::CppFunction::makeFallthrough());
+}
+
+TORCH_LIBRARY_IMPL(moe_int4_ops, Conjugate, m) {
+    m.impl("_moe_compact80_shared_up_ab_out_v1", torch::CppFunction::makeFallthrough());
+}
+
 TORCH_LIBRARY_IMPL(moe_int4_ops, XPU, m) {
+    m.impl("_moe_compact80_shared_up_ab_out_v1", &moe_compact80_shared_up_ab_out_v1);
     m.impl("moe_compact80_down_grouped_gemm", &moe_compact80_down_grouped_gemm);
     m.impl("moe_router_forward_int4", &moe_router_forward_int4);
     m.impl("moe_router_topk_int4", &moe_router_topk_int4);
@@ -5374,6 +6078,7 @@ TORCH_LIBRARY_IMPL(moe_int4_ops, XPU, m) {
     m.impl("moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_out_v1", &moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_out_v1);
     m.impl("moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_router_out_v1", &moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_router_out_v1);
     m.impl("moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_compact80_out_v1", &moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_compact80_out_v1);
+    m.impl("moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_compact80_grouped_out_v1", &moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_compact80_grouped_out_v1);
     m.impl("moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1", &moe_forward_multi_m_cutlass_nmajor_int4_fp16_shared_asymmetric_out_v1);
     m.impl("moe_tiny_fp16_shared_up", &moe_tiny_fp16_shared_up);
     m.impl("moe_tiny_fp16_shared_finalize", &moe_tiny_fp16_shared_finalize);

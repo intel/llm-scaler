@@ -6,6 +6,8 @@
 
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <mutex>
 #include <tuple>
 #include <unordered_map>
@@ -345,6 +347,194 @@ static auto register_hc_m1_workspace =
         .def(torch::init<>())
         .def("run", &HcM1Workspace::run);
 
+// Separate optional ABI: the established M=1 workspace and its scratch/rounding
+// contracts remain unchanged. Multi-row projection views need a real row stride.
+struct HcMultiMScratch {
+  at::Tensor combined;
+  at::Tensor normed;
+  at::Tensor down;
+  at::Tensor mixed;
+};
+
+static void check_hc_multi_m_tensor(
+    const at::Tensor& tensor, const at::Device& device, const char* name) {
+  check_hc_chain_tensor(tensor, device, name);
+  TORCH_CHECK(!tensor.is_conj() && !tensor.is_neg(),
+              name, " must not be a lazy conjugate/negative view");
+  TORCH_CHECK(reinterpret_cast<std::uintptr_t>(tensor.data_ptr()) % 4 == 0,
+              name, " data pointer must be 4-byte aligned");
+}
+
+static std::pair<std::uintptr_t, std::uintptr_t> hc_multi_m_byte_range(
+    const at::Tensor& tensor) {
+  const auto begin = reinterpret_cast<std::uintptr_t>(tensor.data_ptr());
+  if (tensor.numel() == 0) {
+    return {begin, begin};
+  }
+  constexpr auto limit = std::numeric_limits<std::uintptr_t>::max();
+  std::uintptr_t elements = 1;
+  for (int64_t dim = 0; dim < tensor.dim(); ++dim) {
+    TORCH_CHECK(tensor.stride(dim) >= 0, "HC workspace requires positive strides");
+    const auto count = static_cast<std::uintptr_t>(tensor.size(dim) - 1);
+    const auto stride = static_cast<std::uintptr_t>(tensor.stride(dim));
+    TORCH_CHECK(count == 0 || stride <= (limit - elements) / count,
+                "HC workspace tensor span overflows address space");
+    elements += count * stride;
+  }
+  TORCH_CHECK(elements <= (limit - begin) / tensor.element_size(),
+              "HC workspace byte range overflows address space");
+  return {begin, begin + elements * tensor.element_size()};
+}
+
+static bool hc_multi_m_tensors_alias(const at::Tensor& a, const at::Tensor& b) {
+  if (a.is_alias_of(b)) {
+    return true;
+  }
+  if (a.device() != b.device()) {
+    return false;
+  }
+  const auto [a_begin, a_end] = hc_multi_m_byte_range(a);
+  const auto [b_begin, b_end] = hc_multi_m_byte_range(b);
+  return a_begin < b_end && b_begin < a_end;
+}
+
+static void validate_hc_multi_m_inputs(
+    const at::Tensor& hidden, const at::Tensor& block,
+    const at::Tensor& injection, const at::Tensor& norm_weight,
+    const at::Tensor& down_weight, const at::Tensor& up_weight, double eps) {
+  TORCH_CHECK(hidden.defined() && hidden.device().is_xpu(),
+              "hidden must be defined on XPU");
+  const auto device = hidden.device();
+  check_hc_multi_m_tensor(hidden, device, "hidden");
+  check_hc_multi_m_tensor(block, device, "block");
+  check_hc_multi_m_tensor(norm_weight, device, "norm_weight");
+  check_hc_multi_m_tensor(down_weight, device, "down_weight");
+  check_hc_multi_m_tensor(up_weight, device, "up_weight");
+  TORCH_CHECK(injection.defined() && injection.device() == device &&
+                  injection.scalar_type() == at::kHalf,
+              "injection must be float16 on the same XPU device as hidden");
+  TORCH_CHECK(hidden.dim() == 2 && hidden.size(0) >= 2 && hidden.size(0) <= 8 &&
+                  hidden.size(1) == 10240,
+              "hidden must have shape [M, 10240], 2 <= M <= 8");
+  const auto rows = hidden.size(0);
+  TORCH_CHECK(block.dim() == 2 && block.size(0) == rows && block.size(1) == 2560 &&
+                  injection.dim() == 2 && injection.size(0) == rows &&
+                  injection.size(1) == 4 && norm_weight.dim() == 1 &&
+                  norm_weight.size(0) == 10240 && down_weight.dim() == 2 &&
+                  down_weight.size(0) == 336 && down_weight.size(1) == 10240 &&
+                  up_weight.dim() == 2 && up_weight.size(0) == 10240 &&
+                  up_weight.size(1) == 320,
+              "HCMultiMWorkspaceV1 expects block [M, 2560], injection [M, 4], "
+              "norm_weight [10240], down_weight [336, 10240], "
+              "and up_weight [10240, 320]");
+  TORCH_CHECK(injection.stride(1) == 1 && injection.stride(0) >= 4 &&
+                  injection.storage_offset() % 2 == 0 &&
+                  reinterpret_cast<std::uintptr_t>(injection.data_ptr()) % 4 == 0 &&
+                  !injection.is_conj() && !injection.is_neg(),
+              "injection requires inner stride 1, row stride >= 4 and "
+              "4-byte aligned storage offset");
+  const float eps_fp32 = static_cast<float>(eps);
+  TORCH_CHECK(std::isfinite(eps) && eps > 0.0 &&
+                  std::isfinite(eps_fp32) && eps_fp32 > 0.0f,
+              "eps must remain finite and positive in FP32");
+}
+
+static HcMultiMScratch make_hc_multi_m_scratch(const at::Tensor& hidden) {
+  const auto rows = hidden.size(0);
+  const auto options = hidden.options().requires_grad(false);
+  HcMultiMScratch scratch{
+      at::empty({rows, 10240}, options), at::empty({rows, 10240}, options),
+      at::empty({rows, 336}, options), at::empty({rows, 2560}, options)};
+  return scratch;
+}
+
+static bool hc_multi_m_scratch_aliases(
+    const HcMultiMScratch& scratch,
+    const std::array<at::Tensor, 6>& inputs) {
+  const std::array<const at::Tensor*, 4> outputs = {
+      &scratch.combined, &scratch.normed, &scratch.down, &scratch.mixed};
+  for (size_t index = 0; index < outputs.size(); ++index) {
+    for (const auto& input : inputs) {
+      if (hc_multi_m_tensors_alias(*outputs[index], input)) {
+        return true;
+      }
+    }
+    for (size_t other = index + 1; other < outputs.size(); ++other) {
+      if (hc_multi_m_tensors_alias(*outputs[index], *outputs[other])) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+class HcMultiMWorkspaceV1 final : public torch::CustomClassHolder {
+ public:
+  std::tuple<at::Tensor, at::Tensor, at::Tensor> run(
+      at::Tensor hidden, at::Tensor block, at::Tensor injection,
+      at::Tensor norm_weight, at::Tensor down_weight, at::Tensor up_weight,
+      double eps) {
+    // All user input validation and operator resolution precede any launch.
+    validate_hc_multi_m_inputs(
+        hidden, block, injection, norm_weight, down_weight, up_weight, eps);
+    using DownFunction = void(at::Tensor, at::Tensor, at::Tensor);
+    using UpFunction = void(at::Tensor, at::Tensor, at::Tensor, at::Tensor);
+    static const auto down_op = c10::Dispatcher::singleton()
+        .findSchemaOrThrow(
+            "custom_esimd_kernels_vllm::esimd_hc_down_fp16_multi_m_out_v1", "")
+        .typed<DownFunction>();
+    static const auto up_op = c10::Dispatcher::singleton()
+        .findSchemaOrThrow(
+            "custom_esimd_kernels_vllm::esimd_hc_up_gate_mix_multi_m_v1", "")
+        .typed<UpFunction>();
+    std::lock_guard<std::mutex> lock(mutex_);
+    const c10::Stream stream =
+        c10::xpu::getCurrentXPUStream(hidden.device().index()).unwrap();
+    TORCH_CHECK(c10::xpu::getCurrentXPUStream(hidden.device().index()).queue()
+                    .has_property<sycl::property::queue::in_order>(),
+                "HC multi-M workspace requires the current in-order stream");
+    // Partition by both stream (includes device) and M; no resizing an in-flight
+    // buffer when async scheduling alternates batch sizes on the same owner.
+    auto& scratch = scratch_by_stream_[stream][hidden.size(0)];
+    const std::array<at::Tensor, 6> inputs = {
+        hidden, block, injection, norm_weight, down_weight, up_weight};
+    if (!scratch.combined.defined() || hc_multi_m_scratch_aliases(scratch, inputs)) {
+      scratch = make_hc_multi_m_scratch(hidden);
+    }
+    // Outputs are borrowed until this owner is run again on the same stream/M,
+    // matching HCWorkspace. Validate cached metadata in case a caller changed
+    // a returned tensor with set_/resize_; fail before any submission.
+    const std::array<const at::Tensor*, 4> outputs = {
+        &scratch.combined, &scratch.normed, &scratch.down, &scratch.mixed};
+    constexpr std::array<int64_t, 4> widths = {10240, 10240, 336, 2560};
+    for (size_t index = 0; index < outputs.size(); ++index) {
+      check_hc_multi_m_tensor(*outputs[index], hidden.device(), "scratch");
+      TORCH_CHECK(outputs[index]->dim() == 2 &&
+                      outputs[index]->size(0) == hidden.size(0) &&
+                      outputs[index]->size(1) == widths[index],
+                  "HCMultiMWorkspaceV1 scratch metadata was modified");
+    }
+    const auto down_input = scratch.down.narrow(1, 0, 320);
+    const auto next_injection = scratch.down.narrow(1, 320, 4);
+    (void)ple::hc_combine_norm_multi_m_strided_v1(
+        hidden, block, injection, norm_weight, scratch.combined, scratch.normed,
+        eps);
+    down_op.call(scratch.normed, down_weight, scratch.down);
+    up_op.call(down_input, up_weight, scratch.normed, scratch.mixed);
+    return {scratch.combined, scratch.mixed, next_injection};
+  }
+
+ private:
+  std::mutex mutex_;
+  std::unordered_map<c10::Stream, std::array<HcMultiMScratch, 9>> scratch_by_stream_;
+};
+
+static auto register_hc_multi_m_workspace =
+    torch::class_<HcMultiMWorkspaceV1>(
+        "custom_esimd_kernels_vllm", "HCMultiMWorkspaceV1")
+        .def(torch::init<>())
+        .def("run", &HcMultiMWorkspaceV1::run);
+
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
@@ -406,6 +596,13 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
            ple::hc_gate_mix_m4_v1(input, gate, output);
          });
 
+  m.def("hc_gate_mix_multi_m_v1(Tensor input, Tensor gate, "
+        "Tensor(a!) output) -> ()");
+  m.impl("hc_gate_mix_multi_m_v1", torch::kXPU,
+         [](at::Tensor input, at::Tensor gate, at::Tensor output) -> void {
+           ple::hc_gate_mix_multi_m_v1(input, gate, output);
+         });
+
   m.def("hc_combine_v1(Tensor hidden_states, Tensor block_output, "
         "Tensor injection, Tensor(a!) output) -> ()");
   m.impl("hc_combine_v1", torch::kXPU,
@@ -461,6 +658,33 @@ TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
             at::Tensor combined_output, at::Tensor normed_output,
             double eps) -> void {
            ple::hc_combine_norm_m4_v1(
+               hidden_states, block_output, injection, weight,
+               combined_output, normed_output, eps);
+         });
+
+  m.def("hc_combine_norm_multi_m_v1(Tensor hidden_states, Tensor block_output, "
+        "Tensor injection, Tensor weight, Tensor(a!) combined_output, "
+        "Tensor(b!) normed_output, float eps) -> ()");
+  m.impl("hc_combine_norm_multi_m_v1", torch::kXPU,
+         [](at::Tensor hidden_states, at::Tensor block_output,
+            at::Tensor injection, at::Tensor weight,
+            at::Tensor combined_output, at::Tensor normed_output,
+            double eps) -> void {
+           ple::hc_combine_norm_multi_m_v1(
+               hidden_states, block_output, injection, weight,
+               combined_output, normed_output, eps);
+         });
+
+  m.def("hc_combine_norm_multi_m_strided_v1(Tensor hidden_states, "
+        "Tensor block_output, Tensor injection, Tensor weight, "
+        "Tensor(a!) combined_output, Tensor(b!) normed_output, "
+        "float eps) -> ()");
+  m.impl("hc_combine_norm_multi_m_strided_v1", torch::kXPU,
+         [](at::Tensor hidden_states, at::Tensor block_output,
+            at::Tensor injection, at::Tensor weight,
+            at::Tensor combined_output, at::Tensor normed_output,
+            double eps) -> void {
+           ple::hc_combine_norm_multi_m_strided_v1(
                hidden_states, block_output, injection, weight,
                combined_output, normed_output, eps);
          });

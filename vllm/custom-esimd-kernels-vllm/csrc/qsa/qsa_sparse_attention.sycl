@@ -859,6 +859,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       &qsa::indexer_norm_rope_v1,
       "Qwen3.8 QSA indexer Gemma norm and RoPE (XPU)");
   module.def(
+      "qsa_indexer_norm_rope_v2",
+      &qsa::indexer_norm_rope_v2,
+      "Qwen3.8 QSA M2..8 indexer norm and NeoX RoPE with eager FP16 rounding (XPU)");
+  module.def(
       "qsa_select_paged_tokens_parallel_v1",
       &qsa::select_paged_tokens_parallel_v1,
       "Qwen3.8 QSA exact partitioned selection for preprocessed Q (XPU)");
@@ -882,6 +886,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.attr("qsa_token_split_candidate_abi_version") = 3;
   module.attr("qsa_token_split_candidate_max_rows") = 128;
   module.attr("qsa_token_split_candidate_page_size") = 256;
+  module.attr("qsa_token_split_candidate_page512") = 1;
   // 33 default partials (64 slots each) and 43 batch partials (48 slots
   // each) share one 43-partial caller-owned workspace.
   module.attr("qsa_token_split_candidate_partial_count") = 43;
@@ -898,6 +903,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.attr("row_store_receipt_invalid_status") = 1;
   module.attr("row_store_receipt_async_completion_required") = 1;
   module.attr("qsa_indexer_postprocess_abi_version") = 1;
+  module.attr("qsa_indexer_postprocess_v2_abi_version") = 2;
+  module.attr("qsa_indexer_postprocess_v2_min_rows") = 2;
+  module.attr("qsa_indexer_postprocess_v2_max_rows") = 8;
+  module.attr("qsa_indexer_postprocess_v2_norm_fp16") = 1;
+  module.attr("qsa_indexer_postprocess_v2_rope_fp16_products") = 1;
+  module.attr("qsa_indexer_postprocess_v2_neox_only") = 1;
+  module.attr("qsa_indexer_postprocess_v2_fp32_compute") = 0;
+  module.attr("qsa_indexer_postprocess_v2_device_bounds_checked") = 1;
+  module.attr("qsa_indexer_postprocess_v2_negative_indices") = 1;
+  module.attr("qsa_indexer_postprocess_v2_input_row_stride") = 1;
+  module.attr("qsa_indexer_postprocess_v2_position_col_stride") = 1;
   module.attr("qsa_fusion_abi_version") = 1;
   module.attr("qsa_fusion_head_dim") = 128;
   module.attr("qsa_fusion_rotary_dim") = 64;

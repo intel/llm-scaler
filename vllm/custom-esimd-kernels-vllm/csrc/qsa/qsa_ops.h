@@ -93,6 +93,17 @@ at::Tensor indexer_norm_rope_v1(
     bool mrope,
     bool positions_bounds_proven);
 
+// 独立 v2：M2..8、NeoX、eager FP16 norm/mul/add 舍入边界。
+at::Tensor indexer_norm_rope_v2(
+    const at::Tensor& input,
+    at::Tensor output,
+    const at::Tensor& weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    bool mrope,
+    bool is_neox_style,
+    bool enable_fp32_compute);
+
 at::Tensor qsa_q_norm_rope_select_v1(
     const at::Tensor& projected_q,
     const at::Tensor& norm_weight,

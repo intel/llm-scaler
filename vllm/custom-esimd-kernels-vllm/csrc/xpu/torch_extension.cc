@@ -83,6 +83,16 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
   m.impl("esimd_hc_up_gate_mix_m1_v1", torch::kXPU,
          &esimd_hc_up_gate_mix_m1_v1);
 
+  m.def("esimd_hc_down_fp16_multi_m_out_v1(Tensor input, Tensor weight, "
+        "Tensor(a!) output) -> ()");
+  m.impl("esimd_hc_down_fp16_multi_m_out_v1", torch::kXPU,
+         &esimd_hc_down_fp16_multi_m_out_v1);
+
+  m.def("esimd_hc_up_gate_mix_multi_m_v1(Tensor input, Tensor weight, "
+        "Tensor normed, Tensor(a!) output) -> ()");
+  m.impl("esimd_hc_up_gate_mix_multi_m_v1", torch::kXPU,
+         &esimd_hc_up_gate_mix_multi_m_v1);
+
   m.def("esimd_gemv_fp16_gelu_mul(Tensor input, Tensor weight, "
         "Tensor output) -> Tensor");
   m.impl("esimd_gemv_fp16_gelu_mul", torch::kXPU,

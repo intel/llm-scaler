@@ -46,6 +46,19 @@ void esimd_hc_up_gate_mix_m1_v1(
 void esimd_hc_down_fp16_out(
     at::Tensor input, at::Tensor weight, at::Tensor output);
 
+// 独立 M=2..8 ABI；caller-owned output，当前 in-order XPU stream。
+// down: input[M,10240], weight[N,10240], output[M,N] 均 contiguous，
+// N=320/336；前 320 列逐步 FP16 linear -> FP16 /4 -> FP32 SiLU -> FP16。
+void esimd_hc_down_fp16_multi_m_out_v1(
+    at::Tensor input, at::Tensor weight, at::Tensor output);
+
+// up: input[M,320/336] 前 320 列已 scaled-SiLU，inner stride=1，
+// row stride 为偶数且 >= 逻辑宽度；其余张量 contiguous。
+// weight[10240,320], normed[M,10240], output[M,2560]。
+// 两入口均要求 same-XPU FP16、真实指针 4-byte aligned、output 不 alias 输入。
+void esimd_hc_up_gate_mix_multi_m_v1(
+    at::Tensor input, at::Tensor weight, at::Tensor normed, at::Tensor output);
+
 // Fused FP16 gate-up GEMV plus GELU-tanh and multiply for Gemma MTP.
 // weight is [2*N, K] with gate rows followed by up rows; output is [1, N].
 at::Tensor esimd_gemv_fp16_gelu_mul(

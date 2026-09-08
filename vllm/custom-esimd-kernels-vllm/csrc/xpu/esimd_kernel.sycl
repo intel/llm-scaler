@@ -212,6 +212,113 @@ void esimd_hc_down_fp16_out(
         dpcpp_queue);
 }
 
+namespace {
+
+// 仅供两个 multi-M 入口使用；不改变旧 M1 的 preflight/ABI。
+void hc_projection_multi_tensor_check(
+    const at::Tensor& tensor, const at::Tensor& input) {
+    TORCH_CHECK(tensor.device().is_xpu() && tensor.device() == input.device(),
+                "HC multi projection requires tensors on the same XPU device");
+    TORCH_CHECK(tensor.scalar_type() == at::kHalf,
+                "HC multi projection requires FP16 tensors");
+    TORCH_CHECK(tensor.layout() == at::kStrided && tensor.dim() == 2,
+                "HC multi projection requires strided 2D tensors");
+    TORCH_CHECK(!tensor.is_conj() && !tensor.is_neg(),
+                "HC multi projection does not support lazy conjugate/negative views");
+    TORCH_CHECK(reinterpret_cast<std::uintptr_t>(tensor.data_ptr()) % 4 == 0,
+                "HC multi projection requires 4-byte aligned data pointers");
+}
+
+// 调用前 shape/stride 已校验。保守包含行间 padding，且检查真实地址，
+// 避免独立 DLPack/storage 包装绕过 is_alias_of；无张量内容读回。
+std::uintptr_t hc_projection_multi_span(const at::Tensor& tensor) {
+    constexpr auto limit = std::numeric_limits<std::uintptr_t>::max();
+    const auto rows = static_cast<std::uintptr_t>(tensor.size(0));
+    const auto width = static_cast<std::uintptr_t>(tensor.size(1));
+    const auto stride = static_cast<std::uintptr_t>(tensor.stride(0));
+    TORCH_CHECK(stride <= (limit / sizeof(fp16) - width) / (rows - 1),
+                "HC multi projection row span overflows address space");
+    const auto bytes = ((rows - 1) * stride + width) * sizeof(fp16);
+    const auto begin = reinterpret_cast<std::uintptr_t>(tensor.data_ptr());
+    TORCH_CHECK(begin <= limit - bytes,
+                "HC multi projection byte range overflows address space");
+    return bytes;
+}
+
+void hc_projection_multi_no_output_alias(
+    const at::Tensor& output, at::TensorList inputs) {
+    const auto out_begin = reinterpret_cast<std::uintptr_t>(output.data_ptr());
+    const auto out_end = out_begin + hc_projection_multi_span(output);
+    for (const auto& input : inputs) {
+        const auto begin = reinterpret_cast<std::uintptr_t>(input.data_ptr());
+        const auto end = begin + hc_projection_multi_span(input);
+        TORCH_CHECK(!output.is_alias_of(input) &&
+                        !(out_begin < end && begin < out_end),
+                    "HC multi projection output must not alias an input");
+    }
+}
+
+}  // namespace
+
+void esimd_hc_down_fp16_multi_m_out_v1(
+    at::Tensor input, at::Tensor weight, at::Tensor output) {
+    for (const auto& tensor : {input, weight, output}) {
+        hc_projection_multi_tensor_check(tensor, input);
+        TORCH_CHECK(tensor.is_contiguous(),
+                    "HC multi down requires contiguous tensors");
+    }
+    const int64_t M = input.size(0);
+    const int64_t N = weight.size(0);
+    TORCH_CHECK(M >= 2 && M <= 8 && input.size(1) == 10240,
+                "HC multi down input must have shape [M,10240], 2 <= M <= 8");
+    TORCH_CHECK((N == 320 || N == 336) && weight.size(1) == 10240,
+                "HC multi down weight must have shape [320 or 336,10240]");
+    TORCH_CHECK(output.size(0) == M && output.size(1) == N,
+                "HC multi down output must have shape [M,N]");
+    hc_projection_multi_no_output_alias(output, {input, weight});
+    auto& queue = get_device_queue(input);
+    TORCH_CHECK(queue.has_property<sycl::property::queue::in_order>(),
+                "HC multi projection requires the current in-order XPU stream");
+    GEMV_fp16_hc_down_multi_m_host(
+        reinterpret_cast<const fp16*>(input.data_ptr()),
+        reinterpret_cast<const fp16*>(weight.data_ptr()),
+        reinterpret_cast<fp16*>(output.data_ptr()),
+        static_cast<int>(M), static_cast<int>(N), queue);
+}
+
+void esimd_hc_up_gate_mix_multi_m_v1(
+    at::Tensor input, at::Tensor weight, at::Tensor normed, at::Tensor output) {
+    for (const auto& tensor : {input, weight, normed, output}) {
+        hc_projection_multi_tensor_check(tensor, input);
+    }
+    const int64_t M = input.size(0);
+    TORCH_CHECK(M >= 2 && M <= 8 &&
+                    (input.size(1) == 320 || input.size(1) == 336),
+                "HC multi up input must have shape [M,320 or 336], 2 <= M <= 8");
+    TORCH_CHECK(input.stride(1) == 1 &&
+                    input.stride(0) >= input.size(1) && input.stride(0) % 2 == 0,
+                "HC multi up input requires inner stride 1 and an even, "
+                "non-overlapping row stride >= input width");
+    TORCH_CHECK(weight.sizes() == at::IntArrayRef({10240, 320}) &&
+                    normed.sizes() == at::IntArrayRef({M, 10240}) &&
+                    output.sizes() == at::IntArrayRef({M, 2560}),
+                "HC multi up expects weight [10240,320], normed [M,10240], "
+                "output [M,2560]");
+    TORCH_CHECK(weight.is_contiguous() && normed.is_contiguous() &&
+                    output.is_contiguous(),
+                "HC multi up weight, normed and output must be contiguous");
+    hc_projection_multi_no_output_alias(output, {input, weight, normed});
+    auto& queue = get_device_queue(input);
+    TORCH_CHECK(queue.has_property<sycl::property::queue::in_order>(),
+                "HC multi projection requires the current in-order XPU stream");
+    GEMV_fp16_hc_up_gate_mix_multi_m_host(
+        reinterpret_cast<const fp16*>(input.data_ptr()),
+        reinterpret_cast<const fp16*>(weight.data_ptr()),
+        reinterpret_cast<const fp16*>(normed.data_ptr()),
+        reinterpret_cast<fp16*>(output.data_ptr()), static_cast<int>(M),
+        static_cast<size_t>(input.stride(0)), queue);
+}
+
 at::Tensor esimd_gemv_fp16_gelu_mul(
     at::Tensor input,
     at::Tensor weight,

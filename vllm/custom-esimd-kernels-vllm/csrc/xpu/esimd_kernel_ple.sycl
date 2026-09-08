@@ -9,6 +9,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <unordered_set>
@@ -469,6 +470,59 @@ static void launch_hc_grouped_norm_v1(
     });
 }
 
+// PLE's small verify batch uses the same four 2560-wide groups per token.
+// Keep the M=1 implementation untouched; only the input/output row base grows,
+// while affine weights remain shared across tokens. Reduction/FP16 boundaries
+// intentionally match running that existing M=1 kernel once per token.
+struct HcGroupedNormMultiMKernel {
+    const sycl::half* input;
+    const sycl::half* weight;
+    sycl::half* output;
+    float eps;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        const int64_t group = static_cast<int64_t>(item.get_group(0));
+        const int64_t begin = group * kHcHiddenSize;
+        const int64_t weight_begin = (group % kHcCount) * kHcHiddenSize;
+        float sum_sq = 0.0f;
+#pragma unroll
+        for (int chunk = 0; chunk < kHcNormChunks; ++chunk) {
+            const int64_t offset = begin + chunk * kHcNormVectorLength;
+            const esimd::simd<float, kHcNormVectorLength> values =
+                esimd::block_load<sycl::half, kHcNormVectorLength>(input + offset);
+            const esimd::simd<float, kHcNormVectorLength> squared = values * values;
+            sum_sq += esimd::reduce<float>(squared, std::plus<>());
+        }
+        const float inverse = esimd::rsqrt(esimd::simd<float, 8>(
+            sum_sq / static_cast<float>(kHcHiddenSize) + eps))[0];
+#pragma unroll
+        for (int chunk = 0; chunk < kHcNormChunks; ++chunk) {
+            const int64_t column = chunk * kHcNormVectorLength;
+            const int64_t offset = begin + column;
+            const esimd::simd<float, kHcNormVectorLength> values =
+                esimd::block_load<sycl::half, kHcNormVectorLength>(input + offset);
+            const esimd::simd<float, kHcNormVectorLength> scales =
+                esimd::block_load<sycl::half, kHcNormVectorLength>(
+                    weight + weight_begin + column);
+            const esimd::simd<float, kHcNormVectorLength> normalized =
+                values * inverse * (1.0f + scales);
+            esimd::block_store<sycl::half, kHcNormVectorLength>(
+                output + offset,
+                esimd::simd<sycl::half, kHcNormVectorLength>(normalized));
+        }
+    }
+};
+
+static void launch_hc_grouped_norm_multi_m(
+    sycl::queue& queue, const sycl::half* input, const sycl::half* weight,
+    sycl::half* output, int64_t rows, float eps) {
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>({static_cast<size_t>(rows * kHcCount)}, {1}),
+            HcGroupedNormMultiMKernel{input, weight, output, eps});
+    });
+}
+
 struct PleGatedValueGroupedNormV1Kernel {
     const sycl::half* gate;
     const sycl::half* value;
@@ -632,12 +686,13 @@ static void launch_hc_gate_mix_m4_v1(
     sycl::queue& queue,
     const sycl::half* input,
     const sycl::half* gate,
-    sycl::half* output) {
+    sycl::half* output,
+    int64_t rows) {
     constexpr int m4_chunks = kHcHiddenSize / 64;
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
             sycl::range<2>(
-                static_cast<size_t>(4),
+                static_cast<size_t>(rows),
                 static_cast<size_t>(m4_chunks)),
             HcGateMixM4V1Kernel{input, gate, output});
     });
@@ -889,6 +944,7 @@ struct HcCombineNormM4V1Kernel {
     const sycl::half* hidden_states;
     const sycl::half* block_output;
     const sycl::half* injection;
+    int64_t injection_row_stride;
     const sycl::half* weight;
     sycl::half* combined_output;
     sycl::half* normed_output;
@@ -910,7 +966,9 @@ struct HcCombineNormM4V1Kernel {
                 batch * kHcHiddenSize + column;
             const esimd::simd<sycl::half, 1> injection_h =
                 esimd::block_load<sycl::half, 1>(
-                    injection + batch * kHcCount + stream,
+                    injection +
+                        static_cast<int64_t>(batch) * injection_row_stride +
+                        stream,
                     esimd::properties{esimd::alignment<2>});
             const float injection_value =
                 static_cast<float>(injection_h[0]);
@@ -1009,16 +1067,24 @@ static void launch_hc_combine_norm_m4_v1(
     const sycl::half* weight,
     sycl::half* combined_output,
     sycl::half* normed_output,
-    float eps) {
+    float eps,
+    int64_t rows,
+    int64_t injection_row_stride) {
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
             sycl::nd_range<1>(
-                {static_cast<size_t>(4 * kHcCount *
+                {static_cast<size_t>(rows * kHcCount *
                                       kHcCombineNormM4WorkgroupThreads)},
                 {static_cast<size_t>(kHcCombineNormM4WorkgroupThreads)}),
             HcCombineNormM4V1Kernel{
-                hidden_states, block_output, injection, weight,
-                combined_output, normed_output, eps});
+                hidden_states,
+                block_output,
+                injection,
+                injection_row_stride,
+                weight,
+                combined_output,
+                normed_output,
+                eps});
     });
 }
 
@@ -1041,6 +1107,11 @@ static void launch_grouped_norm(
     if (rows == 1 && width == kHcWidth &&
         group_size == kHcHiddenSize && block_io_aligned) {
         launch_hc_grouped_norm_v1(queue, input, weight, output, eps);
+        return;
+    }
+    if (rows >= 2 && rows <= 8 && width == kHcWidth &&
+        group_size == kHcHiddenSize && block_io_aligned) {
+        launch_hc_grouped_norm_multi_m(queue, input, weight, output, rows, eps);
         return;
     }
     const int64_t groups = width / group_size;
@@ -1078,9 +1149,6 @@ struct HcScoreGateV1Kernel {
 
     void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
         const int64_t group = static_cast<int64_t>(item.get_group(0));
-        if (group >= kHcCount) {
-            return;
-        }
         const int64_t begin = group * kHcHiddenSize;
         float dot = 0.0f;
 #pragma unroll
@@ -1121,10 +1189,11 @@ static void launch_hc_score_gate_v1(
     sycl::queue& queue,
     const sycl::half* key,
     const sycl::half* query,
-    sycl::half* output) {
+    sycl::half* output,
+    int64_t group_count = kHcCount) {
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
-            sycl::nd_range<1>({static_cast<size_t>(kHcCount)}, {1}),
+            sycl::nd_range<1>({static_cast<size_t>(group_count)}, {1}),
             HcScoreGateV1Kernel{key, query, output});
     });
 }
@@ -1147,9 +1216,16 @@ static void launch_score_gate(
     const bool block_load_aligned =
         reinterpret_cast<std::uintptr_t>(key) % 4 == 0 &&
         reinterpret_cast<std::uintptr_t>(query) % 4 == 0;
-    if (rows * groups == kHcCount && hidden_size == kHcHiddenSize &&
+    static const bool multi_enabled = [] {
+        const char* disabled = std::getenv(
+            "VLLM_XPU_DISABLE_QWEN38_PLE_MULTI_SCORE");
+        return !(disabled && disabled[0] == '1' && disabled[1] == '\0');
+    }();
+    const bool multi = multi_enabled && rows >= 2 && rows <= 8 &&
+        groups == kHcCount;
+    if ((rows * groups == kHcCount || multi) && hidden_size == kHcHiddenSize &&
         block_load_aligned) {
-        launch_hc_score_gate_v1(queue, key, query, output);
+        launch_hc_score_gate_v1(queue, key, query, output, rows * groups);
         return;
     }
     queue.submit([&](sycl::handler& cgh) {
@@ -1874,7 +1950,36 @@ at::Tensor hc_gate_mix_m4_v1(
         queue,
         reinterpret_cast<const sycl::half*>(input.data_ptr()),
         reinterpret_cast<const sycl::half*>(gate.data_ptr()),
-        reinterpret_cast<sycl::half*>(output.data_ptr()));
+        reinterpret_cast<sycl::half*>(output.data_ptr()), 4);
+    return output;
+}
+
+at::Tensor hc_gate_mix_multi_m_v1(
+    at::Tensor input,
+    at::Tensor gate,
+    at::Tensor output) {
+    check_primary_half(input, "input");
+    check_half(input, gate, "gate");
+    check_output(input, output, "output");
+    TORCH_CHECK(
+        input.dim() == 2 && input.size(0) >= 2 && input.size(0) <= 8 &&
+            input.size(1) == kHcWidth && gate.sizes() == input.sizes() &&
+            output.dim() == 2 && output.size(0) == input.size(0) &&
+            output.size(1) == kHcHiddenSize,
+        "hc_gate_mix_multi_m_v1 expects input/gate [M, 10240] with "
+        "2 <= M <= 8 and output [M, 2560]");
+    TORCH_CHECK(!output.is_alias_of(gate),
+                "hc_gate_mix_multi_m_v1 output must not share storage with gate");
+    TORCH_CHECK(
+        input.storage_offset() % 2 == 0 && gate.storage_offset() % 2 == 0 &&
+            output.storage_offset() % 2 == 0,
+        "hc_gate_mix_multi_m_v1 requires 4-byte aligned tensor data");
+    auto& queue = get_device_queue(input);
+    launch_hc_gate_mix_m4_v1(
+        queue,
+        reinterpret_cast<const sycl::half*>(input.data_ptr()),
+        reinterpret_cast<const sycl::half*>(gate.data_ptr()),
+        reinterpret_cast<sycl::half*>(output.data_ptr()), input.size(0));
     return output;
 }
 
@@ -2002,9 +2107,11 @@ at::Tensor hc_combine_norm_m4_v1(
     TORCH_CHECK(
         hidden_states.dim() == 2 && hidden_states.size(0) == 4 &&
             hidden_states.size(1) == kHcWidth &&
-            block_output.dim() == 2 && block_output.size(0) == 4 &&
+            block_output.dim() == 2 &&
+            block_output.size(0) == 4 &&
             block_output.size(1) == kHcHiddenSize &&
-            injection.dim() == 2 && injection.size(0) == 4 &&
+            injection.dim() == 2 &&
+            injection.size(0) == 4 &&
             injection.size(1) == kHcCount &&
             weight.dim() == 1 && weight.numel() == kHcWidth &&
             combined_output.sizes() == hidden_states.sizes() &&
@@ -2043,7 +2150,147 @@ at::Tensor hc_combine_norm_m4_v1(
         reinterpret_cast<const sycl::half*>(weight.data_ptr()),
         reinterpret_cast<sycl::half*>(combined_output.data_ptr()),
         reinterpret_cast<sycl::half*>(normed_output.data_ptr()),
-        eps_float);
+        eps_float, 4, kHcCount);
+    return combined_output;
+}
+
+at::Tensor hc_combine_norm_multi_m_v1(
+    at::Tensor hidden_states,
+    at::Tensor block_output,
+    at::Tensor injection,
+    at::Tensor weight,
+    at::Tensor combined_output,
+    at::Tensor normed_output,
+    double eps) {
+    check_primary_half(hidden_states, "hidden_states");
+    check_half(hidden_states, block_output, "block_output");
+    check_half(hidden_states, injection, "injection");
+    check_half(hidden_states, weight, "weight");
+    check_output(hidden_states, combined_output, "combined_output");
+    check_output(hidden_states, normed_output, "normed_output");
+    TORCH_CHECK(
+        hidden_states.dim() == 2 && hidden_states.size(0) >= 2 &&
+            hidden_states.size(0) <= 8 &&
+            hidden_states.size(1) == kHcWidth &&
+            block_output.dim() == 2 &&
+            block_output.size(0) == hidden_states.size(0) &&
+            block_output.size(1) == kHcHiddenSize &&
+            injection.dim() == 2 &&
+            injection.size(0) == hidden_states.size(0) &&
+            injection.size(1) == kHcCount &&
+            weight.dim() == 1 && weight.numel() == kHcWidth &&
+            combined_output.sizes() == hidden_states.sizes() &&
+            normed_output.sizes() == hidden_states.sizes(),
+        "hc_combine_norm_multi_m_v1 expects hidden/combined/normed [M, "
+        "10240] with 2 <= M <= 8, block_output [M, 2560], injection [M, "
+        "4], and weight [10240]");
+    TORCH_CHECK(
+        !combined_output.is_alias_of(block_output) &&
+            !combined_output.is_alias_of(injection) &&
+            !combined_output.is_alias_of(weight) &&
+            !normed_output.is_alias_of(block_output) &&
+            !normed_output.is_alias_of(injection) &&
+            !normed_output.is_alias_of(weight) &&
+            !normed_output.is_alias_of(combined_output),
+        "hc_combine_norm_multi_m_v1 outputs must not share storage with "
+        "inputs or each other");
+    TORCH_CHECK(
+        hidden_states.storage_offset() % 2 == 0 &&
+            block_output.storage_offset() % 2 == 0 &&
+            injection.storage_offset() % 2 == 0 &&
+            weight.storage_offset() % 2 == 0 &&
+            combined_output.storage_offset() % 2 == 0 &&
+            normed_output.storage_offset() % 2 == 0,
+        "hc_combine_norm_multi_m_v1 requires 4-byte aligned tensor data");
+    const float eps_float = static_cast<float>(eps);
+    TORCH_CHECK(
+        std::isfinite(eps) && eps > 0.0 &&
+            std::isfinite(eps_float) && eps_float > 0.0f,
+        "hc_combine_norm_multi_m_v1 eps must remain finite and positive in FP32");
+    auto& queue = get_device_queue(hidden_states);
+    launch_hc_combine_norm_m4_v1(
+        queue,
+        reinterpret_cast<const sycl::half*>(hidden_states.data_ptr()),
+        reinterpret_cast<const sycl::half*>(block_output.data_ptr()),
+        reinterpret_cast<const sycl::half*>(injection.data_ptr()),
+        reinterpret_cast<const sycl::half*>(weight.data_ptr()),
+        reinterpret_cast<sycl::half*>(combined_output.data_ptr()),
+        reinterpret_cast<sycl::half*>(normed_output.data_ptr()),
+        eps_float, hidden_states.size(0), kHcCount);
+    return combined_output;
+}
+
+at::Tensor hc_combine_norm_multi_m_strided_v1(
+    at::Tensor hidden_states,
+    at::Tensor block_output,
+    at::Tensor injection,
+    at::Tensor weight,
+    at::Tensor combined_output,
+    at::Tensor normed_output,
+    double eps) {
+    check_primary_half(hidden_states, "hidden_states");
+    check_half(hidden_states, block_output, "block_output");
+    check_same_xpu(hidden_states, injection, "injection");
+    TORCH_CHECK(injection.scalar_type() == at::kHalf,
+                "injection must have dtype float16");
+    check_half(hidden_states, weight, "weight");
+    check_output(hidden_states, combined_output, "combined_output");
+    check_output(hidden_states, normed_output, "normed_output");
+    TORCH_CHECK(
+        hidden_states.dim() == 2 && hidden_states.size(0) >= 2 &&
+            hidden_states.size(0) <= 8 &&
+            hidden_states.size(1) == kHcWidth &&
+            block_output.dim() == 2 &&
+            block_output.size(0) == hidden_states.size(0) &&
+            block_output.size(1) == kHcHiddenSize &&
+            injection.dim() == 2 &&
+            injection.size(0) == hidden_states.size(0) &&
+            injection.size(1) == kHcCount &&
+            weight.dim() == 1 && weight.numel() == kHcWidth &&
+            combined_output.sizes() == hidden_states.sizes() &&
+            normed_output.sizes() == hidden_states.sizes(),
+        "hc_combine_norm_multi_m_strided_v1 expects hidden/combined/normed "
+        "[M, 10240] with 2 <= M <= 8, block_output [M, 2560], injection "
+        "[M, 4], and weight [10240]");
+    TORCH_CHECK(
+        injection.stride(1) == 1 && injection.stride(0) >= kHcCount,
+        "hc_combine_norm_multi_m_strided_v1 requires injection inner stride "
+        "1 and non-overlapping row stride >= 4");
+    TORCH_CHECK(
+        !combined_output.is_alias_of(block_output) &&
+            !combined_output.is_alias_of(injection) &&
+            !combined_output.is_alias_of(weight) &&
+            !normed_output.is_alias_of(block_output) &&
+            !normed_output.is_alias_of(injection) &&
+            !normed_output.is_alias_of(weight) &&
+            !normed_output.is_alias_of(combined_output),
+        "hc_combine_norm_multi_m_strided_v1 outputs must not share storage "
+        "with inputs or each other");
+    TORCH_CHECK(
+        hidden_states.storage_offset() % 2 == 0 &&
+            block_output.storage_offset() % 2 == 0 &&
+            injection.storage_offset() % 2 == 0 &&
+            weight.storage_offset() % 2 == 0 &&
+            combined_output.storage_offset() % 2 == 0 &&
+            normed_output.storage_offset() % 2 == 0,
+        "hc_combine_norm_multi_m_strided_v1 requires 4-byte aligned tensor "
+        "data");
+    const float eps_float = static_cast<float>(eps);
+    TORCH_CHECK(
+        std::isfinite(eps) && eps > 0.0 &&
+            std::isfinite(eps_float) && eps_float > 0.0f,
+        "hc_combine_norm_multi_m_strided_v1 eps must remain finite and "
+        "positive in FP32");
+    auto& queue = get_device_queue(hidden_states);
+    launch_hc_combine_norm_m4_v1(
+        queue,
+        reinterpret_cast<const sycl::half*>(hidden_states.data_ptr()),
+        reinterpret_cast<const sycl::half*>(block_output.data_ptr()),
+        reinterpret_cast<const sycl::half*>(injection.data_ptr()),
+        reinterpret_cast<const sycl::half*>(weight.data_ptr()),
+        reinterpret_cast<sycl::half*>(combined_output.data_ptr()),
+        reinterpret_cast<sycl::half*>(normed_output.data_ptr()),
+        eps_float, hidden_states.size(0), injection.stride(0));
     return combined_output;
 }
 

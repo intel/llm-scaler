@@ -182,6 +182,135 @@ inline void GEMV_fp16_hc_up_gate_mix_m1_host(
     });
 }
 
+// 独立 M=2..8 ABI：每个 work-group 计算同一输出列的两行，复用权重。
+// 保留 M1 的 VL=128、K_SPLIT=4、FP32 累加及两级 reduction 顺序。
+struct GEMV_fp16_hc_down_multi_m_kernel {
+    const fp16* input;
+    const fp16* weight;
+    fp16* output;
+    int M, N;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        constexpr int VL = 128;
+        constexpr int KS = 4;
+        constexpr int K = 10240;
+        slm_init<2 * KS * sizeof(float)>();
+        const int group = item.get_group(0);
+        const int m = (group / N) * 2;
+        const int n = group % N;
+        const int lid = item.get_local_id(0);
+        const int begin = lid * (K / KS);
+        simd<float, VL> acc0 = 0.0f;
+        simd<float, VL> acc1 = 0.0f;
+        for (int k = begin; k < begin + K / KS; k += VL) {
+            const simd<float, VL> w = block_load<fp16, VL>(
+                weight + static_cast<size_t>(n) * K + k);
+            const simd<float, VL> x0 = block_load<fp16, VL>(
+                input + static_cast<size_t>(m) * K + k);
+            acc0 += x0 * w;
+            if (m + 1 < M) {
+                const simd<float, VL> x1 = block_load<fp16, VL>(
+                    input + static_cast<size_t>(m + 1) * K + k);
+                acc1 += x1 * w;
+            }
+        }
+        slm_block_store<float, 1>(
+            lid * sizeof(float),
+            simd<float, 1>(reduce<float>(acc0, std::plus<>())));
+        slm_block_store<float, 1>(
+            (KS + lid) * sizeof(float),
+            simd<float, 1>(reduce<float>(acc1, std::plus<>())));
+        // 奇数 M 的尾 tile 也必须让所有 K split 到达 barrier。
+        barrier();
+        if (lid == 0) {
+            const simd<float, KS> parts0 = slm_block_load<float, KS>(0);
+            output[static_cast<size_t>(m) * N + n] =
+                gemv_fp16_epilogue<true>(
+                    reduce<float>(parts0, std::plus<>()), n);
+            if (m + 1 < M) {
+                const simd<float, KS> parts1 =
+                    slm_block_load<float, KS>(KS * sizeof(float));
+                output[static_cast<size_t>(m + 1) * N + n] =
+                    gemv_fp16_epilogue<true>(
+                        reduce<float>(parts1, std::plus<>()), n);
+            }
+        }
+    }
+};
+
+inline void GEMV_fp16_hc_down_multi_m_host(
+    const fp16* input, const fp16* weight, fp16* output,
+    int M, int N, sycl::queue& q) {
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(((M + 1) / 2) * N * 4, 4),
+            GEMV_fp16_hc_down_multi_m_kernel{input, weight, output, M, N});
+    });
+}
+
+// 每个 work-item 持有同一 h 的两行、四个 branch；每个 branch 的
+// 320 个权重仅加载一次。x 在内层逐行加载，不缓存全部 M 行向量。
+struct GEMV_fp16_hc_up_gate_mix_multi_m_kernel {
+    const fp16* input;
+    const fp16* weight;
+    const fp16* normed;
+    fp16* output;
+    int M;
+    size_t input_row_stride;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        constexpr int W = 128;
+        constexpr int T = 64;
+        const int index = item.get_global_id(0);
+        const int m = (index / 2560) * 2;
+        const int h = index % 2560;
+        // 与 M1 保持相同的展开累加表达式。动态 branch 循环加上标量
+        // lane 更新会改变编译器的 contraction/reassociation，抵消场景下
+        // 可跨过 FP16 舍入边界。两行索引展开后均为编译期常量。
+        simd<float, 1> mixed[2] = {
+            simd<float, 1>(0.0f), simd<float, 1>(0.0f)};
+#pragma unroll
+        for (int branch = 0; branch < 4; ++branch) {
+            const int n = branch * 2560 + h;
+            const size_t base = static_cast<size_t>(n) * 320;
+            const simd<float, W> w0 = block_load<fp16, W>(weight + base);
+            const simd<float, W> w1 = block_load<fp16, W>(weight + base + W);
+            const simd<float, T> w2 = block_load<fp16, T>(weight + base + 2 * W);
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                if (m + r >= M) continue;
+                const fp16* x = input + static_cast<size_t>(m + r) * input_row_stride;
+                const simd<float, W> x0 = block_load<fp16, W>(x);
+                const simd<float, W> x1 = block_load<fp16, W>(x + W);
+                const simd<float, T> x2 = block_load<fp16, T>(x + 2 * W);
+                const float a0 = reduce<float>(x0 * w0, std::plus<>());
+                const float a1 = reduce<float>(x1 * w1, std::plus<>());
+                const float a2 = reduce<float>(x2 * w2, std::plus<>());
+                const fp16 rounded_gate(a0 + a1 + a2);
+                const simd<float, 1> gate(static_cast<float>(rounded_gate));
+                const simd<float, 1> value(static_cast<float>(
+                    normed[static_cast<size_t>(m + r) * 10240 + n]));
+                mixed[r] += value / (1.0f + esimd_math::exp(-gate));
+            }
+        }
+        output[static_cast<size_t>(m) * 2560 + h] = fp16((mixed[0] * 0.25f)[0]);
+        if (m + 1 < M) {
+            output[static_cast<size_t>(m + 1) * 2560 + h] = fp16((mixed[1] * 0.25f)[0]);
+        }
+    }
+};
+
+inline void GEMV_fp16_hc_up_gate_mix_multi_m_host(
+    const fp16* input, const fp16* weight, const fp16* normed,
+    fp16* output, int M, size_t input_row_stride, sycl::queue& q) {
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(((M + 1) / 2) * 2560, 32),
+            GEMV_fp16_hc_up_gate_mix_multi_m_kernel{
+                input, weight, normed, output, M, input_row_stride});
+    });
+}
+
 template<int VL, int K_SPLIT>
 struct GEMV_fp16_gelu_mul_kernel {
     const fp16* input;
