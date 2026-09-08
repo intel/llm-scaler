@@ -111,6 +111,8 @@ Both accept `TP_SIZE`, `HOST`, `PORT`, and `MEM_FRACTION_STATIC` overrides.
 
 For function-calling evaluation of the four FP8 models, see
 [`scripts/bfcl/README.md`](scripts/bfcl/README.md).
+For the complete FP8/GGUF accuracy, BFCL, and serving-performance test matrix,
+see [`TESTING.md`](TESTING.md).
 
 ### Gemma4-26B-A4B
 

@@ -1,43 +1,96 @@
-# BFCL Evaluation on Intel XPU
+# BFCL Evaluation Kit on Intel XPU (SGLang)
 
-This directory contains the BFCL setup and evaluation scripts used with an
-OpenAI-compatible SGLang endpoint. Run the commands inside the GPU container.
-The examples below use the image's `/llm-scaler/sglang` source tree. For a
-source-mounted development container, replace it with
-`/workspace/llm-scaler/sglang`.
+This README provides a step-by-step guide to installing and running the
+Berkeley Function Calling Leaderboard (BFCL) inside the GPU container. The
+examples use `/llm-scaler/sglang`; replace it with
+`/workspace/llm-scaler/sglang` in a source-mounted development container.
 
-## 1. Install the pinned BFCL fork
+This workflow has been validated on Intel XPU with the following FP8 models:
 
-The pinned fork adds native SGLang function-calling handlers for Qwen3.6 and
-Gemma4:
+- Qwen3.6-27B
+- Qwen3.6-35B-A3B
+- Gemma4-31B
+- Gemma4-26B-A4B
 
-```text
-https://github.com/liu-shaojun/gorilla.git
-9d49adb45bd765794fd6b0a0f8006e0b31b997d2
+## Prerequisites
+
+Ensure the Intel oneAPI environment and SGLang are available in the container.
+
+## Step 1. Define the kit root directory
+
+```bash
+export KIT_ROOT="/workspace/bfcl_kit"
+mkdir -p "$KIT_ROOT"
+cd "$KIT_ROOT"
 ```
 
-Install it into `/opt/venv`:
+## Step 2. Clone the BFCL fork
+
+The fork adds native SGLang Function Calling handlers for Qwen3.6 and Gemma4.
+
+```bash
+git clone https://github.com/liu-shaojun/gorilla.git vendor
+```
+
+## Step 3. Check out the pinned commit
+
+```bash
+cd "$KIT_ROOT/vendor"
+git checkout 9d49adb45bd765794fd6b0a0f8006e0b31b997d2
+```
+
+## Step 4. Configure environment variables
+
+Choose one matching set of `TOK_DIR`, `MODEL_ID`, and `WORKDIR`:
+
+| Model | `TOK_DIR` | `MODEL_ID` | `WORKDIR` |
+|---|---|---|---|
+| Qwen3.6-27B | `/models/Qwen3.6-27B` | `Qwen/Qwen3.6-27B-FC` | `/workspace/bfcl_kit/workspace_qwen27` |
+| Qwen3.6-35B-A3B | `/models/Qwen3.6-35B-A3B` | `Qwen/Qwen3.6-35B-A3B-FC` | `/workspace/bfcl_kit/workspace_qwen35` |
+| Gemma4-31B | `/models/gemma-4-31B-it` | `google/gemma-4-31B-it-FC` | `/workspace/bfcl_kit/workspace_gemma31` |
+| Gemma4-26B-A4B | `/models/gemma-4-26B-A4B-it` | `google/gemma-4-26B-A4B-it-FC` | `/workspace/bfcl_kit/workspace_gemma26` |
+
+For example, to evaluate Qwen3.6-35B-A3B:
+
+```bash
+export TOK_DIR="/models/Qwen3.6-35B-A3B"
+export MODEL_ID="Qwen/Qwen3.6-35B-A3B-FC"
+export WORKDIR="/workspace/bfcl_kit/workspace_qwen35"
+export PORT="30000"
+```
+
+`TOK_DIR` must point to the tokenizer files for the selected model. Use a
+different `WORKDIR` for each model to keep their results separate.
+
+## Step 5. Install BFCL
+
+Run the installation script from the BFCL scripts directory. It installs the
+pinned vendored checkout and verifies that all four model IDs resolve to the
+expected handlers.
 
 ```bash
 cd /llm-scaler/sglang/scripts/bfcl
 
-python3 -m venv --system-site-packages /opt/venv
-
-KIT_ROOT=/workspace/bfcl_kit \
-VENV=/opt/venv \
-USE_NETWORK=1 \
-FORK_DIR=/workspace/bfcl_kit/vendor \
 bash 02_install_bfcl_fork.sh
 ```
 
-The installer checks that all four model IDs resolve to their expected
-handlers. For an offline install, stage the pinned repository at
-`/workspace/bfcl_kit/vendor` and omit `USE_NETWORK=1`.
+## Step 6. Prepare the workspace
 
-## 2. Start one FP8 model
+Generate `RUN_CONFIG.sh` and stage the tokenizer configuration:
 
-Run one model at a time on XPU 6 and 7. Keep the service running in the first
-terminal.
+```bash
+cd /llm-scaler/sglang/scripts/bfcl
+
+bash 03_prepare_workspace.sh
+```
+
+Run this step again with matching `TOK_DIR` and `WORKDIR` values when switching
+models.
+
+## Step 7. Start the model service
+
+Start one model at a time and keep the service running. Open another terminal
+in the same container for Step 8.
 
 ### Qwen3.6-27B
 
@@ -47,7 +100,7 @@ cd /llm-scaler/sglang
 MODEL_PATH=/models/Qwen3.6-27B \
 ZE_AFFINITY_MASK=6,7 \
 TP_SIZE=2 \
-HOST=127.0.0.1 \
+HOST=0.0.0.0 \
 PORT=30000 \
 bash scripts/start_qwen3_6_service.sh
 ```
@@ -60,7 +113,7 @@ cd /llm-scaler/sglang
 MODEL_PATH=/models/Qwen3.6-35B-A3B \
 ZE_AFFINITY_MASK=6,7 \
 TP_SIZE=2 \
-HOST=127.0.0.1 \
+HOST=0.0.0.0 \
 PORT=30000 \
 bash scripts/start_qwen3_6_service.sh
 ```
@@ -91,98 +144,55 @@ PORT=30000 \
 bash scripts/run_gemma4_26b_moe.sh
 ```
 
-Wait until `http://127.0.0.1:30000/health` is ready before running BFCL.
+Wait for the service to become ready before starting BFCL:
 
-## 3. Prepare a model workspace
+```bash
+curl http://127.0.0.1:30000/health
+```
 
-In a second terminal, select the tokenizer directory and a unique workspace:
+## Step 8. Run the BFCL evaluation
 
-| Model | `TOK_DIR` | `MODEL_ID` | `WORKDIR` |
-|---|---|---|---|
-| Qwen3.6-27B | `/models/Qwen3.6-27B` | `Qwen/Qwen3.6-27B-FC` | `/workspace/bfcl_kit/workspace_qwen27` |
-| Qwen3.6-35B-A3B | `/models/Qwen3.6-35B-A3B` | `Qwen/Qwen3.6-35B-A3B-FC` | `/workspace/bfcl_kit/workspace_qwen35` |
-| Gemma4-31B | `/models/gemma-4-31B-it` | `google/gemma-4-31B-it-FC` | `/workspace/bfcl_kit/workspace_gemma31` |
-| Gemma4-26B-A4B | `/models/gemma-4-26B-A4B-it` | `google/gemma-4-26B-A4B-it-FC` | `/workspace/bfcl_kit/workspace_gemma26` |
-
-For example, prepare Qwen3.6-35B-A3B:
+In the second terminal, select the same model configuration used in Step 4.
+Set `SKIP_START=1` so `04_run.sh` connects to the service started in Step 7
+instead of launching the bundled reference server. For Qwen3.6-35B-A3B:
 
 ```bash
 cd /llm-scaler/sglang/scripts/bfcl
 
-TOK_DIR=/models/Qwen3.6-35B-A3B \
-PORT=30000 \
-VENV=/opt/venv \
-WORKDIR=/workspace/bfcl_kit/workspace_qwen35 \
-bash 03_prepare_workspace.sh
-```
+export MODEL_ID="Qwen/Qwen3.6-35B-A3B-FC"
+export WORKDIR="/workspace/bfcl_kit/workspace_qwen35"
+export SKIP_START=1
+export BFCL_NUM_THREADS=1
 
-Run this step again with the matching values when switching models.
-
-## 4. Run BFCL against the existing service
-
-`SKIP_START=1` tells `04_run.sh` to use the service started in the first
-terminal. It health-checks the endpoint but does not start or stop it.
-
-Quick function-calling and concurrency check:
-
-```bash
-SKIP_START=1 \
-MODEL_ID=Qwen/Qwen3.6-35B-A3B-FC \
-VENV=/opt/venv \
-WORKDIR=/workspace/bfcl_kit/workspace_qwen35 \
-bash 04_run.sh simple_python 0-15
-```
-
-Multi-turn smoke test:
-
-```bash
-SKIP_START=1 \
-MODEL_ID=Qwen/Qwen3.6-35B-A3B-FC \
-VENV=/opt/venv \
-WORKDIR=/workspace/bfcl_kit/workspace_qwen35 \
-bash 04_run.sh multi_turn_base 6
-```
-
-Full multi-turn category:
-
-```bash
-SKIP_START=1 \
-MODEL_ID=Qwen/Qwen3.6-35B-A3B-FC \
-VENV=/opt/venv \
-WORKDIR=/workspace/bfcl_kit/workspace_qwen35 \
 bash 04_run.sh multi_turn_base
 ```
 
-`04_run.sh` defaults to 16 BFCL client workers. Override it when needed:
+Usage options for `04_run.sh`:
 
 ```bash
-BFCL_NUM_THREADS=1 SKIP_START=1 MODEL_ID=Qwen/Qwen3.6-35B-A3B-FC \
-VENV=/opt/venv WORKDIR=/workspace/bfcl_kit/workspace_qwen35 \
-bash 04_run.sh simple_python 0-15
-```
+# Run all 200 multi_turn_base cases.
+bash 04_run.sh multi_turn_base
 
-The worker count controls concurrent BFCL clients. The server can queue or
-limit requests according to its own `--max-running-requests` setting, so 16
-workers does not guarantee a device batch size of 16.
+# Run one case as a smoke test.
+bash 04_run.sh multi_turn_base 6
 
-Use the same `SKIP_START`, `MODEL_ID`, `VENV`, and `WORKDIR` values with other
-selectors:
-
-```bash
-SKIP_START=1 MODEL_ID=Qwen/Qwen3.6-35B-A3B-FC \
-VENV=/opt/venv WORKDIR=/workspace/bfcl_kit/workspace_qwen35 \
+# Run cases base_0 through base_29.
 bash 04_run.sh multi_turn_base 0-29
 
-IDS="6,10,42" SKIP_START=1 MODEL_ID=Qwen/Qwen3.6-35B-A3B-FC \
-VENV=/opt/venv WORKDIR=/workspace/bfcl_kit/workspace_qwen35 \
-bash 04_run.sh multi_turn_base
+# Run an explicit list of cases.
+IDS="6,10,42" bash 04_run.sh multi_turn_base
 ```
 
-Results are written below the selected `WORKDIR` in `result/`, `score/`, and
+Keep the exported `SKIP_START`, `MODEL_ID`, and `WORKDIR` values when using
+these selectors.
+
+For the safest XPU validation, `BFCL_NUM_THREADS=1` is recommended because only
+batch size 1 is guaranteed to be valid; Batch Invariant has not been achieved
+for vLLM on XPU. `04_run.sh` currently defaults to 16 BFCL client workers when
+the variable is not set, but higher concurrency should only be used after the
+selected model and server configuration have been verified. The server may
+also queue or limit requests according to its own `--max-running-requests`
+setting, so the worker count does not guarantee the same device batch size.
+
+Results are written under the selected `WORKDIR` in `result/`, `score/`, and
 the timestamped `gen_*.log`.
-
-## Bundled reference server
-
-Without `SKIP_START=1`, `04_run.sh` invokes `01_start_server.sh`. That script is
-only the bundled Qwen3.6-35B-A3B GGUF reference configuration; it is not the
-launcher for the four FP8 examples above.

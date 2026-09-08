@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install the pinned gorilla fork with Qwen3.6 and Gemma4 model entries as
-# editable bfcl_eval into the sglang container's venv.
+# editable bfcl_eval into the SGLang container's Python environment.
 #
 # OFFLINE-FIRST: the fork's berkeley-function-call-leaderboard subdir is VENDORED
 # into this kit (vendor/), so install needs NO network and does not depend on
@@ -12,14 +12,11 @@ set -euo pipefail
 
 KIT_ROOT="${KIT_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 VENDOR_PKG="$KIT_ROOT/vendor/berkeley-function-call-leaderboard"
-VENV="${VENV:-/opt/venv}"
 FORK_REPO="${FORK_REPO:-https://github.com/liu-shaojun/gorilla.git}"
 FORK_COMMIT="${FORK_COMMIT:-9d49adb45bd765794fd6b0a0f8006e0b31b997d2}"
 USE_NETWORK="${USE_NETWORK:-0}"
 # Where to clone if USE_NETWORK=1 (and the editable path in that case)
 FORK_DIR="${FORK_DIR:-/workspace/bfcl_kit/gorilla}"
-
-source "$VENV/bin/activate"
 
 if [[ "$USE_NETWORK" == "1" ]]; then
   echo "USE_NETWORK=1 → cloning upstream fork at $FORK_COMMIT"
@@ -42,8 +39,8 @@ else
 fi
 
 # Editable install + the one missing transitive dep.
-pip install -e "$PKG_DIR"
-pip install soundfile   # qwen-agent transitive, missing from package deps
+pip install --break-system-packages -e "$PKG_DIR"
+pip install --break-system-packages soundfile   # qwen-agent transitive, missing from package deps
 
 # CRITICAL (kit README quirk #3): a stale non-fork bfcl_eval in site-packages
 # would shadow the editable install. Verify `import bfcl_eval` resolves to OUR

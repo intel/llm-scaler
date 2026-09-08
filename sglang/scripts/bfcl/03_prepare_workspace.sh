@@ -5,13 +5,11 @@
 # Runs INSIDE the container.
 set -euo pipefail
 
-VENV="${VENV:-/opt/venv}"
 WORKDIR="${WORKDIR:-/workspace/bfcl_kit/workspace_xpu}"
 PORT="${PORT:-9010}"
 # Reuse the already-downloaded unsloth tokenizer snapshot if present; else fetch.
 TOK_DIR="${TOK_DIR:-}"
 
-source "$VENV/bin/activate"
 mkdir -p "$WORKDIR"
 
 if [[ -z "$TOK_DIR" ]]; then

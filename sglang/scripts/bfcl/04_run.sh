@@ -16,7 +16,6 @@ set -uo pipefail
 
 CAT="${1:-multi_turn_base}"
 RANGE="${2:-}"                       # "", "6" (single), or "0-29" (range)
-VENV="${VENV:-/opt/venv}"
 WORKDIR="${WORKDIR:-/workspace/bfcl_kit/workspace_xpu}"
 PORT="${PORT:-9010}"
 BFCL_NUM_THREADS="${BFCL_NUM_THREADS:-16}"
@@ -26,7 +25,6 @@ TS="$(date +%Y%m%d_%H%M%S)"
 SRV="${SRV:-$WORKDIR/srv_${TS}.log}"
 GEN="${GEN:-$WORKDIR/gen_${TS}.log}"
 
-source "$VENV/bin/activate"
 [ -f "$WORKDIR/RUN_CONFIG.sh" ] || { echo "ERROR: run 03_prepare_workspace.sh first"; exit 1; }
 source "$WORKDIR/RUN_CONFIG.sh"
 
