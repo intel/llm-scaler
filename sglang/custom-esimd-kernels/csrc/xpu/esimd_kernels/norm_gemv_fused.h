@@ -126,6 +126,120 @@ struct NormGEMV_fp8_pert_kernel {
     }
 };
 
+/* ================================================================
+ * M-tiled variant: one work-group per output column, MT rows at a time.
+ *
+ * The FP8 weight row depends only on (n, h), never on the row index, so it is
+ * dequantised EXACTLY ONCE per row-block and reused for all MT rows. Only the
+ * per-row RMSNorm and the silu gate scale with M. Rows past MT are handled by
+ * an outer row-block loop, so one instantiation covers any M.
+ *
+ * x/z are [M, HV, V] and output is [M, N], both row-major contiguous.
+ * MT accumulators of simd<float,128> cost MT*8 registers (MT=4 -> 32).
+ * ================================================================ */
+template <int MT>
+struct NormGEMM_fp8_pert_Mtile_kernel {
+    const fp16*    x_ptr;        // [M, HV, V] core_attn_out
+    const fp16*    z_ptr;        // [M, HV, V] z_out
+    const fp16*    norm_w_ptr;   // [V] norm weight
+    const uint8_t* gemv_weight;  // [N, K] FP8, K = HV * V
+    const float*   gemv_scale;   // [1] per-tensor scale
+    fp16*          output;       // [M, N]
+    int M, N;
+    int HV;
+    int V;
+    float eps;
+    int fp8_mode;
+
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        const int n = item.get_group(0);
+        if (n >= N) return;
+
+        const int K = HV * V;
+        simd<float, 128> norm_w = block_load<fp16, 128>(norm_w_ptr);
+        const float scale = *gemv_scale;
+
+        for (int m0 = 0; m0 < M; m0 += MT) {
+            simd<float, 128> acc[MT];
+#pragma unroll
+            for (int m = 0; m < MT; ++m) acc[m] = 0.0f;
+
+            for (int h = 0; h < HV; h++) {
+                const int offset = h * V;
+
+                // Dequantise the weight row once for the whole row-block.
+                simd<uint8_t, 128> w_raw = block_load<uint8_t, 128>(
+                    gemv_weight + (size_t)n * K + offset);
+                simd<float, 128> w_f = fp8_dequant_norm<128>(w_raw, fp8_mode);
+
+#pragma unroll
+                for (int m = 0; m < MT; ++m) {
+                    // Rows past the end clamp to the last valid row so the
+                    // loads stay in bounds; their results are never stored.
+                    const int mr = (m0 + m < M) ? (m0 + m) : (M - 1);
+                    const size_t base = (size_t)mr * K;
+
+                    simd<float, 128> x_f = block_load<fp16, 128>(x_ptr + base + offset);
+                    simd<float, 128> z_f = block_load<fp16, 128>(z_ptr + base + offset);
+
+                    simd<float, 128> x_sq = x_f * x_f;
+                    float mean_sq = reduce128(x_sq) * (1.0f / V);
+                    float inv_rms = sycl::ext::intel::esimd::rsqrt(
+                        simd<float, 8>(mean_sq + eps))[0];
+                    simd<float, 128> normed = x_f * inv_rms * norm_w;
+
+                    simd<float, 128> neg_z = -z_f;
+                    simd<float, 128> exp_neg_z = sycl::ext::intel::esimd::exp(neg_z);
+                    simd<float, 128> silu_z = z_f / (1.0f + exp_neg_z);
+                    normed *= silu_z;
+
+                    acc[m] += normed * w_f;
+                }
+            }
+
+#pragma unroll
+            for (int m = 0; m < MT; ++m) {
+                const int mr = m0 + m;
+                if (mr < M) {
+                    output[(size_t)mr * N + n] = fp16(reduce128(acc[m]) * scale);
+                }
+            }
+        }
+    }
+};
+
+/* Host dispatcher for M > 1. Returns false when M has no compiled tile size;
+ * larger M is deliberately left to the unfused DPAS path, which is nearly flat
+ * in M while this scalar kernel is not. */
+inline bool norm_gemm_fp8_pert_mtile_host(
+    const fp16* x_ptr,
+    const fp16* z_ptr,
+    const fp16* norm_w_ptr,
+    const uint8_t* gemv_weight,
+    const float* gemv_scale,
+    fp16* output,
+    int M, int N, int HV, int V, float eps, int fp8_mode,
+    sycl::queue& q)
+{
+    if (M < 2 || V != 128) return false;
+#define NGEMM_MTILE_LAUNCH(MT_)                                                \
+    q.submit([&](sycl::handler& cgh) {                                         \
+        cgh.parallel_for(sycl::nd_range<1>(N, 1),                              \
+            NormGEMM_fp8_pert_Mtile_kernel<MT_>{                               \
+                x_ptr, z_ptr, norm_w_ptr, gemv_weight, gemv_scale, output,     \
+                M, N, HV, V, eps, fp8_mode});                                  \
+    })
+    if (M <= 2) {
+        NGEMM_MTILE_LAUNCH(2);
+    } else if (M <= 4) {
+        NGEMM_MTILE_LAUNCH(4);
+    } else {
+        return false;
+    }
+#undef NGEMM_MTILE_LAUNCH
+    return true;
+}
+
 /* Host dispatcher */
 inline void norm_gemv_fp8_pert_host(
     const fp16* x_ptr,

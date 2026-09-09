@@ -62,14 +62,15 @@ sglang_decode_attn_phase1_impl(
     uint32_t Hkv,
     uint32_t gqa_ratio,
     uint32_t n_splits,                  // S
-    float    sm_scale)
+    float    sm_scale,
+    uint32_t split_tile)                // tokens per work-item (runtime)
 {
     const uint32_t kv_head  = q_head / gqa_ratio;
     const uint32_t kv_start = kv_indptr[batch];
     const uint32_t kv_end   = kv_indptr[batch + 1];
     const uint32_t kv_len   = kv_end - kv_start;
 
-    const uint32_t base   = split * SPLIT_TILE;
+    const uint32_t base   = split * split_tile;
     if (base >= kv_len) {
         // Empty split: write neutral state.
         const size_t  hidx  = (batch * Hq + q_head) * (size_t)n_splits + split;
@@ -85,8 +86,8 @@ sglang_decode_attn_phase1_impl(
         }
         return;
     }
-    const uint32_t actual = ((kv_len - base) < SPLIT_TILE)
-        ? (kv_len - base) : SPLIT_TILE;
+    const uint32_t actual = ((kv_len - base) < split_tile)
+        ? (kv_len - base) : split_tile;
 
     // Load q for this head once.
     esimd::simd<fp16, HEAD_DIM> q_vec;

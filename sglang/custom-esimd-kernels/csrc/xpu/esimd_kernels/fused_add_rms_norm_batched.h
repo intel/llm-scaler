@@ -11,6 +11,9 @@
 #pragma once
 #include "utils.h"
 
+// See fused_add_rms_norm.h for why VL is a host-chosen template
+// parameter rather than a fixed 512.
+template <int VL>
 struct FusedAddRmsNorm_batched_kernel {
     fp16*       hidden_ptr;    // [rows, K] — input and output
     fp16*       residual_ptr;  // [rows, K] — updated in-place
@@ -23,7 +26,6 @@ struct FusedAddRmsNorm_batched_kernel {
         int row = item.get_group(0);
         if (row >= rows) return;
 
-        constexpr int VL = 512;
         int n_chunks = K / VL;
         const int base = row * K;
 
@@ -37,16 +39,9 @@ struct FusedAddRmsNorm_batched_kernel {
 
             block_store<fp16, VL>(residual_ptr + offset, simd<fp16, VL>(added));
 
-            simd<float, VL> sq = added * added;
-            sq.select<256,1>(0) += sq.select<256,1>(256);
-            sq.select<128,1>(0) += sq.select<128,1>(128);
-            sq.select<64,1>(0) += sq.select<64,1>(64);
-            sq.select<32,1>(0) += sq.select<32,1>(32);
-            sq.select<16,1>(0) += sq.select<16,1>(16);
-            sq.select<8,1>(0) += sq.select<8,1>(8);
-            sq.select<4,1>(0) += sq.select<4,1>(4);
-            sq.select<2,1>(0) += sq.select<2,1>(2);
-            sum_sq += (float)sq[0] + (float)sq[1];
+            // VL-generic pairwise tree (the previous hand-rolled version
+            // started at select<256> and so was only valid for VL == 512).
+            sum_sq += sycl::ext::intel::esimd::detail::sum<float, float, VL>(added * added);
         }
 
         float inv_rms = sycl::ext::intel::esimd::rsqrt(
@@ -67,10 +62,18 @@ inline void fused_add_rms_norm_batched_host(
     fp16* hidden_ptr, fp16* residual_ptr, const fp16* weight_ptr,
     int rows, int K, float eps, sycl::queue& q)
 {
-    q.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(
-            sycl::nd_range<1>({(size_t)rows}, {1}),
-            FusedAddRmsNorm_batched_kernel{
-                hidden_ptr, residual_ptr, weight_ptr, rows, K, eps});
-    });
+    #define LAUNCH_FARNB(V)                                                   \
+        q.submit([&](sycl::handler& cgh) {                                    \
+            cgh.parallel_for(                                                 \
+                sycl::nd_range<1>({(size_t)rows}, {1}),                       \
+                FusedAddRmsNorm_batched_kernel<V>{                            \
+                    hidden_ptr, residual_ptr, weight_ptr, rows, K, eps});     \
+        });
+
+    if      (K % 512 == 0) { LAUNCH_FARNB(512) }
+    else if (K % 256 == 0) { LAUNCH_FARNB(256) }
+    else if (K % 128 == 0) { LAUNCH_FARNB(128) }
+    else                   { LAUNCH_FARNB(64)  }
+
+    #undef LAUNCH_FARNB
 }

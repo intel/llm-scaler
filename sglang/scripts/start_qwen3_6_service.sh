@@ -18,11 +18,28 @@
 #     GGUF_CFG_DIR=/models/Qwen3.6-35B-A3B ZE_AFFINITY_MASK=6,7 \
 #     bash scripts/start_qwen3_6_service.sh
 #
+# MTP / speculative decoding (NEXTN), opt-in for either format by pointing
+# SPEC_DRAFT_PATH at a checkpoint that carries the mtp.* tensors. For GGUF that
+# is an MTP-enabled .gguf, which is also its own draft model:
+#   MODEL_PATH=/models/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
+#     GGUF_CFG_DIR=/models/Qwen3.6-35B-A3B \
+#     SPEC_DRAFT_PATH="$MODEL_PATH" ZE_AFFINITY_MASK=6,7 \
+#     bash scripts/start_qwen3_6_service.sh
+#
 # Run one model at a time on the same GPUs/port.
 # GGUF_CFG_DIR must contain the matching HF config, tokenizer and safetensors
 # index (or HF shards for weight-name mapping). Tested GGUF flavor: Q4_K_M.
 # Optional: TP_SIZE=2 PORT=30000 HOST=127.0.0.1 MEM_FRACTION_STATIC=0.8.
+# MEM_FRACTION_STATIC defaults lower with MTP on, because the draft model needs
+# headroom the non-speculative defaults do not leave. Raising it back for an MTP
+# run surfaces as UR_RESULT_ERROR_OUT_OF_RESOURCES in the draft extend, or as a
+# misleading oneCCL "unknown memory type" during warmup.
 # HOST defaults to 0.0.0.0; use 127.0.0.1 for local-only access.
+# Optional MTP tuning: SPEC_NUM_STEPS=3 SPEC_TOPK=1 SPEC_NUM_DRAFT_TOKENS=4.
+# For GGUF the served model id defaults to GGUF_CFG_DIR so that OpenAI-style
+# clients can use it as a tokenizer id; override with SERVED_MODEL_NAME.
+# Long-context runs (e.g. BFCL multi-turn) also need
+# MAMBA_TRACK_INTERVAL=8192 CHUNKED_PREFILL_SIZE=8192.
 
 set -euo pipefail
 
@@ -35,6 +52,26 @@ TP_SIZE="${TP_SIZE:-2}"
 # Pin to the last two BMG cards (physical 0,1). After masking, sglang sees
 # them as XPU 0,1 so TP=2 maps onto exactly these two devices.
 export ZE_AFFINITY_MASK="${ZE_AFFINITY_MASK:-0,1}"
+
+# --- MTP / speculative decoding (NEXTN) ---
+# Off unless SPEC_DRAFT_PATH is set. The draft model is the mtp.* branch of the
+# checkpoint, so for GGUF it is the same file as MODEL_PATH. Verify runs the
+# target model on num_draft_tokens rows at once, which is what the batched
+# ESIMD M-tile GEMVs are tuned for. XPU graph capture cannot express the
+# speculative control flow, so decode stays eager here too.
+SPEC_ARGS=()
+SPEC_ON=0
+if [[ -n "${SPEC_DRAFT_PATH:-}" ]]; then
+    SPEC_ON=1
+    SPEC_ARGS=(
+        --speculative-algorithm NEXTN
+        --speculative-draft-model-path "$SPEC_DRAFT_PATH"
+        --speculative-num-steps "${SPEC_NUM_STEPS:-3}"
+        --speculative-eagle-topk "${SPEC_TOPK:-1}"
+        --speculative-num-draft-tokens "${SPEC_NUM_DRAFT_TOKENS:-4}"
+        --disable-cuda-graph
+    )
+fi
 
 # Keep the GGUF path separate from FP8-only quantization and fusion settings.
 if [[ "$MODEL_PATH" == *.gguf ]]; then
@@ -56,10 +93,30 @@ if [[ "$MODEL_PATH" == *.gguf ]]; then
     export SGL_XPU_PREFILL_DPAS=1
     export SGL_XPU_ENABLE_GRAPH=0
     export SGLANG_XPU_ENABLE_GRAPH=0
+    # GGUF-native decode fusions. These are the GGUF counterparts of the fp8
+    # MoE-full / resadd-norm fusions below; the fp8 ones never fire here because
+    # the attention and GDN projections are q8_0 GEMVs.
+    # Full GGUF MoE fusion: router topk + routed Q4_K/Q5_K experts + Q8_0 shared
+    # expert in one dispatch. Defaults OFF in the loader, and it is the main
+    # decode TPOT lever for GGUF, so turn it on here.
+    export SGL_XPU_GGUF_MOE_FULL="${SGL_XPU_GGUF_MOE_FULL:-1}"
+    # Q8_0 shared-expert kernel, used on the steps the full fusion declines.
+    export SGL_XPU_GGUF_MOE_SHARED="${SGL_XPU_GGUF_MOE_SHARED:-1}"
+    # Folds GemmaRMSNorm(input_layernorm) + the q8_0 in_proj/qkv GEMV + the fp16
+    # in_proj_ba GEMV into one op. Set to 0 for the unfused fallback.
+    export SGL_XPU_GGUF_RESADD_NORM="${SGL_XPU_GGUF_RESADD_NORM:-1}"
+    # Largest decode batch the fusions handle. Must cover the MTP verify batch
+    # (concurrency x num_draft_tokens), so leave it at the default 64.
+    export SGL_XPU_GGUF_FUSE_MAX_M="${SGL_XPU_GGUF_FUSE_MAX_M:-64}"
 
+    # Report the HF config dir as the model id instead of the .gguf path.
+    # OpenAI-style clients reuse the id from /v1/models as a tokenizer id, and
+    # AutoTokenizer cannot load a .gguf ("not a valid JSON file"). sglang's own
+    # bench_serving hits this unless it is passed an explicit --tokenizer.
     exec python3 -m sglang.launch_server \
         --model-path "$MODEL_PATH" \
         --tokenizer-path "$GGUF_CFG_DIR" \
+        --served-model-name "${SERVED_MODEL_NAME:-$GGUF_CFG_DIR}" \
         --device xpu \
         --tp "$TP_SIZE" \
         --dtype float16 \
@@ -70,14 +127,24 @@ if [[ "$MODEL_PATH" == *.gguf ]]; then
         --max-mamba-cache-size 64 \
         --disable-overlap-schedule \
         --mamba-scheduler-strategy extra_buffer \
-        --mamba-track-interval 64 \
+        --mamba-track-interval "${MAMBA_TRACK_INTERVAL:-64}" \
+        --chunked-prefill-size "${CHUNKED_PREFILL_SIZE:-8192}" \
         --tool-call-parser qwen3_coder \
         --reasoning-parser qwen3 \
+        --enable-cache-report \
+        --enable-metrics \
         --host "$HOST" \
-        --port "$PORT"
+        --port "$PORT" \
+        ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"}
 fi
 
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.9}"
+if [[ -z "${MEM_FRACTION_STATIC:-}" ]]; then
+    if [[ $SPEC_ON == 1 ]]; then
+        MEM_FRACTION_STATIC=0.75
+    else
+        MEM_FRACTION_STATIC=0.9
+    fi
+fi
 
 # --- triton-xpu fp16 mismatch workaround ---
 # Mamba state pool defaults to bf16; force fp16 so it matches the activation
@@ -159,4 +226,5 @@ exec python3 -m sglang.launch_server \
     --enable-cache-report \
     --enable-metrics \
     --host "${HOST}" \
-    --port "${PORT}"
+    --port "${PORT}" \
+    ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"}

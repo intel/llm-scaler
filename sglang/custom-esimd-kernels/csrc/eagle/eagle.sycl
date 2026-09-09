@@ -1019,14 +1019,18 @@ struct CausalConv1dVerifyFn {
   int act;        // 1 = silu/swish
   int cs_stride0; // conv_state.stride(0) = conv_dim*(W-1)
   int ic_stride0; // inter_conv.stride(0) = N*conv_dim*(W-1)
+  // x/out element strides. Channel-major [bs,conv_dim,N]: (conv_dim*N, N, 1).
+  // Token-major   [bs,N,conv_dim]:                        (N*conv_dim, 1, conv_dim).
+  int xs_n, xs_c, xs_t;
+  int os_n, os_c, os_t;
   void operator()(sycl::item<2> it) const {
     int n = it.get_id(0);   // request
     int c = it.get_id(1);   // channel
     if (c >= conv_dim) return;
     int Wm1 = W - 1;
     const T* cs = conv_state + (int64_t)cache_indices[n] * cs_stride0 + (int64_t)c * Wm1;
-    const T* xc = x + ((int64_t)n * conv_dim + c) * N;
-    T* oc = out + ((int64_t)n * conv_dim + c) * N;
+    const T* xc = x + (int64_t)n * xs_n + (int64_t)c * xs_c;
+    T* oc = out + (int64_t)n * os_n + (int64_t)c * os_c;
     const T* wc = conv_w + (int64_t)c * W;
     float bias = (conv_bias != nullptr) ? (float)conv_bias[c] : 0.0f;
     T* icbase = inter_conv + (int64_t)inter_indices[n] * ic_stride0;
@@ -1040,13 +1044,13 @@ struct CausalConv1dVerifyFn {
     for (int t = 0; t < N; ++t) {
       // shift: the current token's value goes to win[W-1]; window for this step
       // is win[0..W-1] where win[W-1]=x[t], win[0..W-2]=last W-1 inputs.
-      float xt = (float)xc[t];
+      float xt = (float)xc[(int64_t)t * xs_t];
       // build the W-wide window: [win(history), xt]
       float acc = bias;
       for (int w = 0; w < Wm1; ++w) acc += win[w] * (float)wc[w];
       acc += xt * (float)wc[Wm1];
       if (act == 1) acc = acc / (1.0f + sycl::exp(-acc));  // silu
-      oc[t] = (T)acc;
+      oc[(int64_t)t * os_t] = (T)acc;
       // advance window: drop oldest, append xt
       for (int w = 0; w < Wm1 - 1; ++w) win[w] = win[w + 1];
       if (Wm1 > 0) win[Wm1 - 1] = xt;
@@ -1058,18 +1062,39 @@ struct CausalConv1dVerifyFn {
 };
 }  // namespace
 
-void causal_conv1d_verify(
+namespace {
+// Shared launcher for both layouts. `token_major` selects the x/out strides:
+//   false -> [bs, conv_dim, N]  (legacy, channel-major)
+//   true  -> [bs, N, conv_dim]  (token-major; matches the caller's natural
+//            mixed_qkv layout so neither the input nor the output needs a
+//            transpose+copy, and adjacent channels are adjacent in memory so
+//            the (bs, conv_dim) work-items coalesce instead of striding by N)
+void causal_conv1d_verify_impl(
     torch::Tensor& out, torch::Tensor& x, torch::Tensor& conv_w,
     const std::optional<torch::Tensor>& conv_bias, torch::Tensor& conv_state,
     torch::Tensor& inter_conv, torch::Tensor& cache_indices,
-    torch::Tensor& inter_indices, int64_t activation) {
+    torch::Tensor& inter_indices, int64_t activation, bool token_major) {
   TORCH_CHECK(x.scalar_type() == torch::kHalf || x.scalar_type() == torch::kBFloat16);
-  const int bs = x.size(0), conv_dim = x.size(1), N = x.size(2);
+  const int bs = x.size(0);
+  const int conv_dim = token_major ? x.size(2) : x.size(1);
+  const int N = token_major ? x.size(1) : x.size(2);
   const int W = conv_w.size(1);
   TORCH_CHECK(W <= 8, "conv width <= 8");
+  TORCH_CHECK(out.sizes() == x.sizes(), "out must match x shape");
+  TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+  TORCH_CHECK(x.stride(token_major ? 2 : 1) >= 1 && x.stride(token_major ? 1 : 2) >= 1,
+              "x strides must be positive");
   auto qd = c10::xpu::getCurrentXPUStream().queue();
   int cs_stride0 = conv_state.stride(0);
   int ic_stride0 = inter_conv.stride(0);
+  // Take x's real strides so a column slice of a wider buffer (token-major
+  // mixed_qkv = projected_states_qkvz[:, :qkv_dim]) can be read in place.
+  const int s_n = (int)x.stride(0);
+  const int s_c = (int)(token_major ? x.stride(2) : x.stride(1));
+  const int s_t = (int)(token_major ? x.stride(1) : x.stride(2));
+  const int o_n = (int)out.stride(0);
+  const int o_c = (int)(token_major ? out.stride(2) : out.stride(1));
+  const int o_t = (int)(token_major ? out.stride(1) : out.stride(2));
   const void* biasp = conv_bias.has_value() ? conv_bias->data_ptr() : nullptr;
   // Basic-range parallel_for (no explicit work-group) — channels are
   // independent, no sub-group reductions needed for depthwise conv.
@@ -1079,7 +1104,8 @@ void causal_conv1d_verify(
         (const fp16*)biasp, (const fp16*)conv_state.data_ptr(),
         (fp16*)inter_conv.data_ptr(), (fp16*)out.data_ptr(),
         (const int*)cache_indices.data_ptr(), (const int*)inter_indices.data_ptr(),
-        conv_dim, N, W, (int)activation, cs_stride0, ic_stride0};
+        conv_dim, N, W, (int)activation, cs_stride0, ic_stride0,
+        s_n, s_c, s_t, o_n, o_c, o_t};
     qd.submit([&](sycl::handler& h) { h.parallel_for(sycl::range<2>(bs, conv_dim), kf); });
   } else {
     CausalConv1dVerifyFn<bf16> kf{
@@ -1087,9 +1113,33 @@ void causal_conv1d_verify(
         (const bf16*)biasp, (const bf16*)conv_state.data_ptr(),
         (bf16*)inter_conv.data_ptr(), (bf16*)out.data_ptr(),
         (const int*)cache_indices.data_ptr(), (const int*)inter_indices.data_ptr(),
-        conv_dim, N, W, (int)activation, cs_stride0, ic_stride0};
+        conv_dim, N, W, (int)activation, cs_stride0, ic_stride0,
+        s_n, s_c, s_t, o_n, o_c, o_t};
     qd.submit([&](sycl::handler& h) { h.parallel_for(sycl::range<2>(bs, conv_dim), kf); });
   }
+}
+}  // namespace
+
+void causal_conv1d_verify(
+    torch::Tensor& out, torch::Tensor& x, torch::Tensor& conv_w,
+    const std::optional<torch::Tensor>& conv_bias, torch::Tensor& conv_state,
+    torch::Tensor& inter_conv, torch::Tensor& cache_indices,
+    torch::Tensor& inter_indices, int64_t activation) {
+  causal_conv1d_verify_impl(out, x, conv_w, conv_bias, conv_state, inter_conv,
+                            cache_indices, inter_indices, activation,
+                            /*token_major=*/false);
+}
+
+// Token-major variant: x / out are [bs, N, conv_dim]. Numerically identical to
+// causal_conv1d_verify (same accumulation order), only the addressing differs.
+void causal_conv1d_verify_tm(
+    torch::Tensor& out, torch::Tensor& x, torch::Tensor& conv_w,
+    const std::optional<torch::Tensor>& conv_bias, torch::Tensor& conv_state,
+    torch::Tensor& inter_conv, torch::Tensor& cache_indices,
+    torch::Tensor& inter_indices, int64_t activation) {
+  causal_conv1d_verify_impl(out, x, conv_w, conv_bias, conv_state, inter_conv,
+                            cache_indices, inter_indices, activation,
+                            /*token_major=*/true);
 }
 
 // ── gdn_target_verify: SYCL GDN recurrence for the speculative VERIFY step ───
@@ -1127,7 +1177,11 @@ static constexpr int GDN_VPSG = 4;           // v_dim_per_sg
 static constexpr int GDN_VPG = GDN_VPSG * GDN_SG_PER_GROUP;  // 32
 static constexpr float GDN_EPS = 1e-6f;
 
-template <typename T, int KB>  // KB = k_bucket_size = head_k_dim / 32
+// ST = dtype of the SSM state pool / intermediate buffer (float, fp16 or bf16).
+// The recurrence itself always runs in fp32 registers (`st[]`); ST only controls
+// how the state is loaded from and snapshotted back into the pool, so a
+// lower-precision pool costs no arithmetic accuracy inside a verify step.
+template <typename T, int KB, typename ST = float>
 struct GdnTargetVerifyFn {
   T* out;
   const T* q;
@@ -1137,8 +1191,8 @@ struct GdnTargetVerifyFn {
   const T* b;
   const float* A_log;
   const float* dt_bias;
-  const float* ssm_state;      // [slots,Hv,V,K] fp32, READ-only
-  float* inter;                // [slots, cache_steps, Hv, V, K] fp32, WRITTEN
+  const ST* ssm_state;         // [slots,Hv,V,K] ST, READ-only
+  ST* inter;                   // [slots, cache_steps, Hv, V, K] ST, WRITTEN
   const int ssm_stride0;
   const int inter_stride0;     // = cache_steps*Hv*V*K
   const int* query_start_loc;
@@ -1149,6 +1203,21 @@ struct GdnTargetVerifyFn {
   const int num_v_heads;
   const int head_v_dim;
   const int cache_steps;
+  // Row stride + element offset for q/k/v inside their backing tensor. For the
+  // split call these are (Hk*K,0) / (Hk*K,0) / (Hv*V,0) with three separate
+  // pointers; for the packed call all three point at the same [T, qkv_dim]
+  // mixed_qkv buffer with rs=qkv_dim and offsets 0 / q_dim / q_dim+k_dim, which
+  // lets the caller skip the three .contiguous() copies that torch.split's
+  // strided views would otherwise force (3 copies * 30 GDN layers per forward).
+  const int q_rs, q_off;
+  const int k_rs, k_off;
+  const int v_rs, v_off;
+  // Row stride of a/b ([T, Hv]). Normally Hv, but the caller may hand over
+  // strided slices of a packed [T, 2*Hv] mixed_ba buffer (b = ba[:, :Hv],
+  // a = ba[:, Hv:]), in which case both have stride(0) = 2*Hv and the base
+  // pointer already carries the column offset.
+  const int a_rs;
+  const int b_rs;
 
   static inline float act_sigmoid(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
   static inline float act_softplus(float x, float beta = 1.0f, float thr = 20.0f) {
@@ -1173,26 +1242,26 @@ struct GdnTargetVerifyFn {
     float st[GDN_VPSG * KB];
     float ql[KB], kl[KB], vl[GDN_VPSG];
 
-    const float* ssm_ptr = ssm_state + (int64_t)cache_indices[batch_id] * ssm_stride0;
+    const ST* ssm_ptr = ssm_state + (int64_t)cache_indices[batch_id] * ssm_stride0;
     // load initial state (verify ALWAYS has an initial state = post-prefill)
     for (int j = 0; j < GDN_VPSG; ++j)
       for (int i = 0; i < KB; ++i)
-        st[j * KB + i] = ssm_ptr[hv * head_k_dim * head_v_dim +
-                                 (KB * sg_lid + i) + (hvd + j) * head_k_dim];
+        st[j * KB + i] = (float)ssm_ptr[hv * head_k_dim * head_v_dim +
+                                       (KB * sg_lid + i) + (hvd + j) * head_k_dim];
 
     int s0 = query_start_loc[batch_id];
     int s1 = query_start_loc[batch_id + 1];
     int inter_base = inter_indices[batch_id] * inter_stride0;  // into `inter`
     int step = 0;
     for (int t = s0; t < s1; ++t, ++step) {
-      float beta = act_sigmoid((float)b[t * num_v_heads + hv]);
-      float a_l = (float)a[t * num_v_heads + hv] + dt_l;
+      float beta = act_sigmoid((float)b[(int64_t)t * b_rs + hv]);
+      float a_l = (float)a[(int64_t)t * a_rs + hv] + dt_l;
       float g = sycl::exp(A_log_l * act_softplus(a_l));
 
       float qs = 0.0f, ks = 0.0f;
       for (int i = 0; i < KB; ++i) {
-        ql[i] = (float)q[t * num_k_heads * head_k_dim + (hv / kv_ratio) * head_k_dim + (KB * sg_lid + i)];
-        kl[i] = (float)k[t * num_k_heads * head_k_dim + (hv / kv_ratio) * head_k_dim + (KB * sg_lid + i)];
+        ql[i] = (float)q[(int64_t)t * q_rs + q_off + (hv / kv_ratio) * head_k_dim + (KB * sg_lid + i)];
+        kl[i] = (float)k[(int64_t)t * k_rs + k_off + (hv / kv_ratio) * head_k_dim + (KB * sg_lid + i)];
         qs += ql[i] * ql[i];
         ks += kl[i] * kl[i];
       }
@@ -1214,7 +1283,7 @@ struct GdnTargetVerifyFn {
         kv_mem[i] = sycl::reduce_over_group(sg, kv_mem[i], sycl::plus<>());
 
       for (int i = 0; i < GDN_VPSG; ++i)
-        vl[i] = (float)v[t * num_v_heads * head_v_dim + hv * head_v_dim + hvd + i];
+        vl[i] = (float)v[(int64_t)t * v_rs + v_off + hv * head_v_dim + hvd + i];
       float delta[GDN_VPSG];
       for (int i = 0; i < GDN_VPSG; ++i) delta[i] = (vl[i] - kv_mem[i]) * beta;
 
@@ -1234,11 +1303,11 @@ struct GdnTargetVerifyFn {
 
       // (1) cache the post-token state into the intermediate buffer at `step`.
       if (step < cache_steps) {
-        float* ip = inter + inter_base + step * num_v_heads * head_v_dim * head_k_dim;
+        ST* ip = inter + inter_base + step * num_v_heads * head_v_dim * head_k_dim;
         for (int j = 0; j < GDN_VPSG; ++j)
           for (int i = 0; i < KB; ++i)
             ip[hv * head_k_dim * head_v_dim + (KB * sg_lid + i) + (hvd + j) * head_k_dim] =
-                st[j * KB + i];
+                (ST)st[j * KB + i];
       }
     }
     // (2) disable_state_update: do NOT write st back to ssm_state.
@@ -1246,18 +1315,28 @@ struct GdnTargetVerifyFn {
 };
 }  // namespace
 
-void gdn_target_verify(
+namespace {
+void gdn_target_verify_impl(
     torch::Tensor& out, torch::Tensor& q, torch::Tensor& k, torch::Tensor& v,
     torch::Tensor& a, torch::Tensor& b, torch::Tensor& A_log, torch::Tensor& dt_bias,
     torch::Tensor& ssm_state, torch::Tensor& intermediate,
     torch::Tensor& query_start_loc, torch::Tensor& cache_indices,
-    torch::Tensor& inter_indices, int64_t cache_steps) {
+    torch::Tensor& inter_indices, int64_t cache_steps,
+    int Hk, int K, int Hv, int V,
+    int q_rs, int q_off, int k_rs, int k_off, int v_rs, int v_off) {
   TORCH_CHECK(q.scalar_type() == torch::kHalf || q.scalar_type() == torch::kBFloat16);
   TORCH_CHECK(A_log.scalar_type() == torch::kFloat32 && dt_bias.scalar_type() == torch::kFloat32);
-  TORCH_CHECK(ssm_state.scalar_type() == torch::kFloat32 && intermediate.scalar_type() == torch::kFloat32);
-  TORCH_CHECK(q.dim() == 4 && q.size(0) == 1, "q must be [1,T,Hk,K]");
-  const int T = q.size(1), Hk = q.size(2), K = q.size(3);
-  const int Hv = v.size(2), V = v.size(3);
+  // The SSM state pool may be fp32 (default) or fp16/bf16 (SGLANG_MAMBA_SSM_DTYPE).
+  // The recurrence always runs in fp32 registers; ST only sets the pool's
+  // load/snapshot precision. intermediate must match ssm_state so that
+  // mamba_state_scatter can copy between them without a cast.
+  TORCH_CHECK(ssm_state.scalar_type() == intermediate.scalar_type(),
+              "ssm_state and intermediate must share a dtype, got ",
+              ssm_state.scalar_type(), " vs ", intermediate.scalar_type());
+  TORCH_CHECK(ssm_state.scalar_type() == torch::kFloat32 ||
+                  ssm_state.scalar_type() == torch::kHalf ||
+                  ssm_state.scalar_type() == torch::kBFloat16,
+              "ssm_state must be fp32, fp16 or bf16, got ", ssm_state.scalar_type());
   TORCH_CHECK(K == 128 && V == 128, "only head_dim 128");
   TORCH_CHECK(K % GDN_SG == 0);
   const int KB = K / GDN_SG;  // 4
@@ -1271,27 +1350,94 @@ void gdn_target_verify(
 
   int ssm_stride0 = ssm_state.stride(0);
   int inter_stride0 = cache_steps * Hv * V * K;
+  // a/b may be strided slices of a packed [T, 2*Hv] mixed_ba buffer, so take
+  // their real row stride instead of assuming Hv.
+  TORCH_CHECK(a.dim() == 2 && b.dim() == 2, "a/b must be [T, Hv]");
+  TORCH_CHECK(a.stride(1) == 1 && b.stride(1) == 1, "a/b must be row-dense");
+  TORCH_CHECK(a.size(1) == Hv && b.size(1) == Hv, "a/b must have Hv columns");
+  const int a_rs = (int)a.stride(0);
+  const int b_rs = (int)b.stride(0);
 
-#define GDNV_LAUNCH(T_, KB_)                                                      \
+#define GDNV_LAUNCH(T_, KB_, ST_)                                                 \
   do {                                                                           \
-    GdnTargetVerifyFn<T_, KB_> kf{                                               \
+    GdnTargetVerifyFn<T_, KB_, ST_> kf{                                          \
         (T_*)out.data_ptr(), (const T_*)q.data_ptr(), (const T_*)k.data_ptr(),   \
         (const T_*)v.data_ptr(), (const T_*)a.data_ptr(), (const T_*)b.data_ptr(),\
         (const float*)A_log.data_ptr(), (const float*)dt_bias.data_ptr(),        \
-        (const float*)ssm_state.data_ptr(), (float*)intermediate.data_ptr(),     \
+        (const ST_*)ssm_state.data_ptr(), (ST_*)intermediate.data_ptr(),         \
         ssm_stride0, inter_stride0,                                              \
         (const int*)query_start_loc.data_ptr(), (const int*)cache_indices.data_ptr(),\
         (const int*)inter_indices.data_ptr(),                                    \
-        Hk, K, Hv, V, (int)cache_steps};                                         \
+        Hk, K, Hv, V, (int)cache_steps,                                          \
+        q_rs, q_off, k_rs, k_off, v_rs, v_off, a_rs, b_rs};                      \
     qd.submit([&](sycl::handler& h) { h.parallel_for(range, kf); });             \
   } while (0)
 
+#define GDNV_DISPATCH_ST(T_)                                                     \
+  do {                                                                           \
+    TORCH_CHECK(KB == 4, "KB must be 4 for K=128");                              \
+    if (ssm_state.scalar_type() == torch::kFloat32) {                            \
+      GDNV_LAUNCH(T_, 4, float);                                                 \
+    } else if (ssm_state.scalar_type() == torch::kHalf) {                        \
+      GDNV_LAUNCH(T_, 4, fp16);                                                  \
+    } else {                                                                     \
+      GDNV_LAUNCH(T_, 4, bf16);                                                  \
+    }                                                                            \
+  } while (0)
+
   if (q.scalar_type() == torch::kHalf) {
-    TORCH_CHECK(KB == 4, "KB must be 4 for K=128"); GDNV_LAUNCH(fp16, 4);
+    GDNV_DISPATCH_ST(fp16);
   } else {
-    TORCH_CHECK(KB == 4, "KB must be 4 for K=128"); GDNV_LAUNCH(bf16, 4);
+    GDNV_DISPATCH_ST(bf16);
   }
+#undef GDNV_DISPATCH_ST
 #undef GDNV_LAUNCH
+}
+}  // namespace
+
+void gdn_target_verify(
+    torch::Tensor& out, torch::Tensor& q, torch::Tensor& k, torch::Tensor& v,
+    torch::Tensor& a, torch::Tensor& b, torch::Tensor& A_log, torch::Tensor& dt_bias,
+    torch::Tensor& ssm_state, torch::Tensor& intermediate,
+    torch::Tensor& query_start_loc, torch::Tensor& cache_indices,
+    torch::Tensor& inter_indices, int64_t cache_steps) {
+  TORCH_CHECK(q.dim() == 4 && q.size(0) == 1, "q must be [1,T,Hk,K]");
+  const int Hk = q.size(2), K = q.size(3);
+  const int Hv = v.size(2), V = v.size(3);
+  gdn_target_verify_impl(out, q, k, v, a, b, A_log, dt_bias, ssm_state,
+                         intermediate, query_start_loc, cache_indices,
+                         inter_indices, cache_steps, Hk, K, Hv, V,
+                         Hk * K, 0, Hk * K, 0, Hv * V, 0);
+}
+
+// Packed variant: q/k/v live side by side in one [T, qkv_dim] mixed_qkv buffer
+// (the conv output), so the caller does not have to materialise three
+// contiguous copies out of torch.split's strided views. Numerically identical
+// to gdn_target_verify -- only the addressing changes.
+void gdn_target_verify_packed(
+    torch::Tensor& out, torch::Tensor& mixed_qkv,
+    torch::Tensor& a, torch::Tensor& b, torch::Tensor& A_log, torch::Tensor& dt_bias,
+    torch::Tensor& ssm_state, torch::Tensor& intermediate,
+    torch::Tensor& query_start_loc, torch::Tensor& cache_indices,
+    torch::Tensor& inter_indices, int64_t cache_steps,
+    int64_t num_k_heads, int64_t head_k_dim,
+    int64_t num_v_heads, int64_t head_v_dim) {
+  TORCH_CHECK(mixed_qkv.dim() == 2, "mixed_qkv must be [T, qkv_dim]");
+  TORCH_CHECK(mixed_qkv.stride(1) == 1, "mixed_qkv must be row-dense");
+  const int Hk = (int)num_k_heads, K = (int)head_k_dim;
+  const int Hv = (int)num_v_heads, V = (int)head_v_dim;
+  const int q_dim = Hk * K, k_dim = Hk * K;
+  // Row stride, not row width: mixed_qkv may be a column slice of a wider
+  // buffer (e.g. projected_states_qkvz[:, :qkv_dim], which drops the trailing
+  // z block for free instead of copying it out).
+  const int rs = (int)mixed_qkv.stride(0);
+  TORCH_CHECK((int)mixed_qkv.size(1) == q_dim + k_dim + Hv * V,
+              "mixed_qkv row width ", mixed_qkv.size(1), " != q_dim+k_dim+v_dim");
+  gdn_target_verify_impl(out, mixed_qkv, mixed_qkv, mixed_qkv, a, b, A_log,
+                         dt_bias, ssm_state, intermediate, query_start_loc,
+                         cache_indices, inter_indices, cache_steps,
+                         Hk, K, Hv, V,
+                         rs, 0, rs, q_dim, rs, q_dim + k_dim);
 }
 
 // ── gdn_fused_verify: FUSED conv + recurrence for the speculative VERIFY step ─
@@ -1981,8 +2127,10 @@ TORCH_LIBRARY_FRAGMENT(eagle_ops, m) {
     m.def("filter_finished_cache_loc_xpu(Tensor out_cache_loc, Tensor! tgt_cache_loc, Tensor accept_length, Tensor accept_length_filter) -> ()");
     m.def("build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode) -> ()");
     m.def("gdn_target_verify(Tensor! out, Tensor q, Tensor k, Tensor v, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, Tensor ssm_state, Tensor! intermediate, Tensor query_start_loc, Tensor cache_indices, Tensor inter_indices, int cache_steps) -> ()");
+    m.def("gdn_target_verify_packed(Tensor! out, Tensor mixed_qkv, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, Tensor ssm_state, Tensor! intermediate, Tensor query_start_loc, Tensor cache_indices, Tensor inter_indices, int cache_steps, int num_k_heads, int head_k_dim, int num_v_heads, int head_v_dim) -> ()");
     m.def("gdn_fused_verify(Tensor! out, Tensor! zout, Tensor qkvz, Tensor ba, Tensor conv_w, Tensor? conv_bias, Tensor conv_state, Tensor A_log, Tensor dt_bias, Tensor ssm_state, Tensor! inter_ssm, Tensor! inter_conv, Tensor query_start_loc, Tensor cache_indices, Tensor inter_indices, int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim, int activation, int cache_steps) -> ()");
     m.def("causal_conv1d_verify(Tensor! out, Tensor x, Tensor conv_w, Tensor? conv_bias, Tensor conv_state, Tensor! inter_conv, Tensor cache_indices, Tensor inter_indices, int activation) -> ()");
+    m.def("causal_conv1d_verify_tm(Tensor! out, Tensor x, Tensor conv_w, Tensor? conv_bias, Tensor conv_state, Tensor! inter_conv, Tensor cache_indices, Tensor inter_indices, int activation) -> ()");
     m.def("verify_tree_greedy(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, Tensor target_predict) -> ()");
     m.def("gdn_eagle(Tensor! qkvz, Tensor! z_out, Tensor conv_w, Tensor? conv_b, Tensor! conv_state, Tensor accepted_tokens, Tensor ba, Tensor a_log, Tensor dt_bias, Tensor! state_in, Tensor ssm_state_idx, Tensor norm_w, int max_query_len) -> Tensor");
     m.def("page_attn_decode(Tensor query, Tensor key_cache, Tensor value_cache, Tensor block_table, Tensor seq_lens, Tensor! out, int max_query_len, int max_seq_len, Tensor(a!)? temp_p=None) -> ()");
@@ -2006,8 +2154,10 @@ TORCH_LIBRARY_IMPL(eagle_ops, XPU, m) {
     m.impl("build_tree_kernel_efficient", &build_tree_kernel_efficient);
     m.impl("verify_tree_greedy", &verify_tree_greedy);
     m.impl("gdn_target_verify", &gdn_target_verify);
+    m.impl("gdn_target_verify_packed", &gdn_target_verify_packed);
     m.impl("gdn_fused_verify", &gdn_fused_verify);
     m.impl("causal_conv1d_verify", &causal_conv1d_verify);
+    m.impl("causal_conv1d_verify_tm", &causal_conv1d_verify_tm);
     m.impl("mamba_state_scatter", &mamba_state_scatter);
 }
 
@@ -2024,7 +2174,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("build_tree_kernel_efficient", &build_tree_kernel_efficient, "build_tree_kernel_efficient");
     m.def("verify_tree_greedy", &verify_tree_greedy, "verify_tree_greedy");
     m.def("gdn_target_verify", &gdn_target_verify, "gdn_target_verify");
+    m.def("gdn_target_verify_packed", &gdn_target_verify_packed, "gdn_target_verify_packed");
     m.def("gdn_fused_verify", &gdn_fused_verify, "gdn_fused_verify");
     m.def("causal_conv1d_verify", &causal_conv1d_verify, "causal_conv1d_verify");
+    m.def("causal_conv1d_verify_tm", &causal_conv1d_verify_tm, "causal_conv1d_verify_tm");
     m.def("mamba_state_scatter", &mamba_state_scatter, "mamba_state_scatter");
 }

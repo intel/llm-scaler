@@ -26,6 +26,11 @@ static constexpr int Q6_K_VL   = 512;
 static constexpr int Q6_K_ROWS = 4;
 static constexpr int Q6_K_GS   = 16;    // q6_K scale group (per-16, not 32)
 
+// VLP is the K-tile length. 512 is the fast default; 256 covers shards whose K
+// is not a multiple of 512 (gemma-4 hidden_size 5376). Every K-quant tensor has
+// K % 256 == 0 because that is the GGUF super-block size, so the two
+// instantiations together span every possible shard.
+template <int VLP>
 struct Q6_K_gemv_kernel {
     const fp16*    input;   // [1, K]
     const uint8_t* ql;      // [N, K/2]
@@ -38,8 +43,8 @@ struct Q6_K_gemv_kernel {
         const int row = (int)ndi.get_group(0) * Q6_K_ROWS + (int)ndi.get_local_id(0);
         if (row >= N) return;
 
-        constexpr int VL = Q6_K_VL;
-        constexpr int VL_HALF = VL / 2;     // 256 ql bytes/tile
+        constexpr int VL = VLP;
+        constexpr int VL_HALF = VL / 2;     // ql bytes/tile
         constexpr int VL_QTR = VL / 4;      // 128 qh bytes/tile
         constexpr int VL_GS = VL / Q6_K_GS; // 32 scale per tile (group-16)
         const int K_ITERS = K / VL;
@@ -102,10 +107,16 @@ inline void q6_k_gemv_host(
     const fp16* input, const uint8_t* ql, const uint8_t* qh,
     const fp16* scale, fp16* output, uint32_t N, uint32_t K, sycl::queue& q) {
     const int NWG = ((int)N + Q6_K_ROWS - 1) / Q6_K_ROWS;
+    const bool wide = (K % Q6_K_VL) == 0;
     q.submit([&](sycl::handler& h) {
-        h.parallel_for(
-            sycl::nd_range<1>((size_t)NWG * Q6_K_ROWS, Q6_K_ROWS),
-            Q6_K_gemv_kernel{input, ql, qh, scale, output, (int)N, (int)K});
+        sycl::nd_range<1> r((size_t)NWG * Q6_K_ROWS, Q6_K_ROWS);
+        if (wide) {
+            h.parallel_for(
+                r, Q6_K_gemv_kernel<Q6_K_VL>{input, ql, qh, scale, output, (int)N, (int)K});
+        } else {
+            h.parallel_for(
+                r, Q6_K_gemv_kernel<Q6_K_VL / 2>{input, ql, qh, scale, output, (int)N, (int)K});
+        }
     });
 }
 
@@ -115,7 +126,7 @@ inline void q6_k_gemv_host(
 // weight_f a single time, then multiply against ALL M activation rows (M
 // accumulators). Much less weight BW than the fp16-table GEMM. input [M,K] row-
 // major, output [M,N] row-major.
-template <int M>
+template <int M, int VLP>
 struct Q6_K_gemv_M_kernel {
     const fp16*    input;   // [M, K]
     const uint8_t* ql;      // [N, K/2]
@@ -123,11 +134,14 @@ struct Q6_K_gemv_M_kernel {
     const fp16*    scale;   // [N, K/16]
     fp16*          output;  // [M, N]
     int N, K;
+    // Row stride of `output`, so a caller can write a column slice of a
+    // wider buffer (the GGUF mixed-kind group path) without a torch.cat.
+    int ldo;
 
     void operator()(sycl::nd_item<1> ndi) const SYCL_ESIMD_KERNEL {
         const int row = (int)ndi.get_group(0) * Q6_K_ROWS + (int)ndi.get_local_id(0);
         if (row >= N) return;
-        constexpr int VL = Q6_K_VL;
+        constexpr int VL = VLP;
         constexpr int VL_HALF = VL / 2;
         constexpr int VL_QTR = VL / 4;
         constexpr int VL_GS = VL / Q6_K_GS;
@@ -136,10 +150,18 @@ struct Q6_K_gemv_M_kernel {
         const int QH_STRIDE = K / 4;
         const int SC_STRIDE = K / Q6_K_GS;
 
-        simd<float, 8> acc[M];
+        // Accumulate lane-wise and fold ONCE at the end. A per-iteration
+        // sum<VL>() costs M * K_ITERS cross-lane reduction trees whose shuffles
+        // produce no useful FLOPs; at M=16 that tree is about half of the
+        // per-row instruction count and this kernel is ALU bound.
+        // Folding the VL-wide product into an AW-wide accumulator as VL/AW
+        // strided FMAs issues the same number of instructions as one VL-wide
+        // FMA, so AW can stay small: AW*4*M is 4 KB at M=16, against the 32 KB
+        // a full VL-wide accumulator would need (the GRF is 8 KB).
+        constexpr int AW = 64;
+        simd<float, AW> vacc[M];
         #pragma unroll
-        for (int m = 0; m < M; m++) acc[m] = 0.0f;
-        int ai = 0;
+        for (int m = 0; m < M; m++) vacc[m] = 0.0f;
 
         for (int iter = 0; iter < K_ITERS; iter++) {
             const int k = iter * VL;
@@ -176,34 +198,42 @@ struct Q6_K_gemv_M_kernel {
             #pragma unroll
             for (int m = 0; m < M; m++) {
                 simd<fp16, VL> act = block_load<fp16, VL>(input + (size_t)m * K + k);
-                simd<float, VL> prod = weight_f * simd<float, VL>(act);
-                acc[m][ai] += esimd_detail::sum<float, float, VL>(prod);
+                #pragma unroll
+                for (int c = 0; c < VL / AW; c++)
+                    vacc[m] += weight_f.template select<AW, 1>(c * AW) *
+                               simd<float, AW>(act.template select<AW, 1>(c * AW));
             }
-            ai = (ai + 1) & 7;
         }
         #pragma unroll
         for (int m = 0; m < M; m++)
-            output[(size_t)m * N + row] = (fp16)esimd_detail::sum<float, float, 8>(acc[m]);
+            output[(size_t)m * ldo + row] = (fp16)esimd_detail::sum<float, float, AW>(vacc[m]);
     }
 };
 
 template <int M>
 inline void q6_k_gemv_M_launch(
     const fp16* input, const uint8_t* ql, const uint8_t* qh,
-    const fp16* scale, fp16* output, uint32_t N, uint32_t K, sycl::queue& q) {
+    const fp16* scale, fp16* output, uint32_t N, uint32_t K, uint32_t ldo, sycl::queue& q) {
     const int NWG = ((int)N + Q6_K_ROWS - 1) / Q6_K_ROWS;
+    const bool wide = (K % Q6_K_VL) == 0;
     q.submit([&](sycl::handler& h) {
-        h.parallel_for(
-            sycl::nd_range<1>((size_t)NWG * Q6_K_ROWS, Q6_K_ROWS),
-            Q6_K_gemv_M_kernel<M>{input, ql, qh, scale, output, (int)N, (int)K});
+        sycl::nd_range<1> r((size_t)NWG * Q6_K_ROWS, Q6_K_ROWS);
+        if (wide) {
+            h.parallel_for(
+                r, Q6_K_gemv_M_kernel<M, Q6_K_VL>{input, ql, qh, scale, output, (int)N, (int)K, (int)ldo});
+        } else {
+            h.parallel_for(
+                r, Q6_K_gemv_M_kernel<M, Q6_K_VL / 2>{input, ql, qh, scale, output, (int)N, (int)K, (int)ldo});
+        }
     });
 }
 
-// Dispatch arbitrary M (2..16) onto fixed-M kernels by tiling in chunks; the
-// common MTP verify M is exactly draft_token_num (<=8). Round up to {2,4,8,16}.
+// Dispatch arbitrary M onto fixed-M kernels by tiling in chunks of
+// {16,8,4,2,1}. Each tile streams the whole weight matrix once, so the
+// widest tile that fits M decides how many times the weights are read.
 inline void q6_k_gemv_M_host(
     const fp16* input, const uint8_t* ql, const uint8_t* qh,
-    const fp16* scale, fp16* output, uint32_t M, uint32_t N, uint32_t K,
+    const fp16* scale, fp16* output, uint32_t M, uint32_t N, uint32_t K, uint32_t ldo,
     sycl::queue& q) {
     if (M == 1) { q6_k_gemv_host(input, ql, qh, scale, output, N, K, q); return; }
     // process in fixed tiles; each tile reads the weights once for its rows.
@@ -211,10 +241,11 @@ inline void q6_k_gemv_M_host(
     while (m0 < M) {
         uint32_t r = M - m0;
         const fp16* in = input + (size_t)m0 * K;
-        fp16* out = output + (size_t)m0 * N;
-        if      (r >= 8) { q6_k_gemv_M_launch<8>(in, ql, qh, scale, out, N, K, q); m0 += 8; }
-        else if (r >= 4) { q6_k_gemv_M_launch<4>(in, ql, qh, scale, out, N, K, q); m0 += 4; }
-        else if (r >= 2) { q6_k_gemv_M_launch<2>(in, ql, qh, scale, out, N, K, q); m0 += 2; }
+        fp16* out = output + (size_t)m0 * ldo;
+        if      (r >= 16) { q6_k_gemv_M_launch<16>(in, ql, qh, scale, out, N, K, ldo, q); m0 += 16; }
+        else if (r >= 8) { q6_k_gemv_M_launch<8>(in, ql, qh, scale, out, N, K, ldo, q); m0 += 8; }
+        else if (r >= 4) { q6_k_gemv_M_launch<4>(in, ql, qh, scale, out, N, K, ldo, q); m0 += 4; }
+        else if (r >= 2) { q6_k_gemv_M_launch<2>(in, ql, qh, scale, out, N, K, ldo, q); m0 += 2; }
         else { q6_k_gemv_host(in, ql, qh, scale, out, N, K, q); m0 += 1; }
     }
 }
