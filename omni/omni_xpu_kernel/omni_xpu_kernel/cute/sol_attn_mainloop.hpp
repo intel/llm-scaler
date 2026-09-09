@@ -533,7 +533,9 @@ template <
         (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0),
     bool ControlAware = true,
     bool PreparedState = false,
-    bool TokenAugmented = false>
+    bool TokenAugmented = false,
+    bool SelectedOnly = false,
+    bool RowTail = false>
 struct SolFwdMainloop : DenseMainloop {
   using Base = DenseMainloop;
   using TiledMMAQK = typename Base::TiledMMAQK;
@@ -627,6 +629,8 @@ struct SolFwdMainloop : DenseMainloop {
   static_assert(!PreparedState || (!ControlAware && !CrossQueryRouteColumns),
                 "prepared routes own their controls and use parallel row owners");
   static_assert(!TokenAugmented || PreparedState);
+  static_assert(!SelectedOnly || (TokenAugmented && !RowTail));
+  static_assert(!RowTail || (PreparedState && !TokenAugmented));
 
   // The prepared API changes storage and route/tail semantics, while retaining
   // the maintained CUTE MMA and its register-fragment copy/reorder path. Scales
@@ -642,6 +646,8 @@ struct SolFwdMainloop : DenseMainloop {
     const int32_t* extra_counts = nullptr;
     const float* key_bias = nullptr;
     int extra_budget = 0;
+    float* selected_state = nullptr;
+    const float* row_state = nullptr;
   };
 
   struct Arguments {
@@ -1448,6 +1454,7 @@ struct SolFwdMainloop : DenseMainloop {
       }
     };
 
+    if constexpr (!SelectedOnly) {
     const int summary_tiles = cute::ceil_div(sol_params.blocks, BLK_K);
     for (int tile = 0; tile < summary_tiles; ++tile) {
       bool has_approximate = false;
@@ -1748,6 +1755,7 @@ struct SolFwdMainloop : DenseMainloop {
     }
 #endif
 
+    } // ordinary routed/pooled attention
     if constexpr (TokenAugmented) {
       constexpr int Groups = (QueryBlocksPerWorkgroup + 1) / 2;
       const int groups_per_head = cute::ceil_div(sol_params.blocks, 2);
@@ -1817,7 +1825,7 @@ struct SolFwdMainloop : DenseMainloop {
     if constexpr (PreparedState) {
       const float* tail = sol_params.prepared.tail_state +
           (batch_head * sol_params.blocks + query_block) * 130;
-      const float tail_sum = tail[1];
+      const float tail_sum = SelectedOnly ? 0.0f : tail[1];
       FragARow exact_rescale, tail_rescale;
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tA_max.size(); ++i) {
@@ -1835,9 +1843,57 @@ struct SolFwdMainloop : DenseMainloop {
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tArA.size(); ++i) {
         const int dim = get<1>(output_coords(i));
-        tArA(i) = (tArA(i) * broadcast<0>(exact_rescale, tArA, i) +
-            tail[2 + dim] * broadcast<0>(tail_rescale, tArA, i)) *
-            sol_params.prepared.v_scale[batch_head * 128 + dim];
+        if constexpr (SelectedOnly) {
+          tArA(i) *= sol_params.prepared.v_scale[batch_head * 128 + dim];
+        } else {
+          tArA(i) = (tArA(i) * broadcast<0>(exact_rescale, tArA, i) +
+              tail[2 + dim] * broadcast<0>(tail_rescale, tArA, i)) *
+              sol_params.prepared.v_scale[batch_head * 128 + dim];
+        }
+      }
+      if constexpr (SelectedOnly) {
+        // The normal epilogue writes FP32 selected output into columns 16..143.
+        // Store one maximum/sum pair per row, before its zero-sum guard.
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tArA.size(); ++i) {
+          const int row = get<0>(output_coords(i));
+          const int dim = get<1>(output_coords(i));
+          if (dim == 0 && row < seq_len) {
+            float* state = sol_params.prepared.selected_state +
+                (int64_t(batch_head) * seq_len + row) * 144;
+            state[0] = broadcast<0>(tA_max, tArA, i);
+            state[1] = broadcast<0>(tA_sum_full, tArA, i);
+          }
+        }
+      }
+      if constexpr (RowTail) {
+        // The separately selected exact keys contribute at each query row.
+        // Keep this specialization outside the ordinary Q256 K-tile loop.
+        FragARow ordinary_rescale, selected_weight;
+        const int lane = int(sg.get_local_linear_id());
+        const int row_base = get<0>(output_coords(0)) -
+            get<0>(FragA{}.tv_layout()(lane, 0));
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tA_max.size(); ++i) {
+          const int row = row_base + lane + i * cute::intel::sg_size;
+          const float* state = sol_params.prepared.row_state +
+              (int64_t(batch_head) * seq_len + cute::min(row,seq_len-1)) * 144;
+          const float selected_sum = row < seq_len ? state[1] : 0.0f;
+          const float maximum = selected_sum > 0 ? sycl::max(tA_max(i), state[0]) : tA_max(i);
+          ordinary_rescale(i) = tA_sum_full(i) > 0 ? sycl::native::exp2(tA_max(i)-maximum) : 0.0f;
+          selected_weight(i) = selected_sum > 0 ? selected_sum * sycl::native::exp2(state[0]-maximum) : 0.0f;
+          tA_max(i) = maximum;
+          tA_sum_full(i) = tA_sum_full(i)*ordinary_rescale(i)+selected_weight(i);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tArA.size(); ++i) {
+          const int row = get<0>(output_coords(i));
+          const int dim = get<1>(output_coords(i));
+          const float selected_output = row < seq_len ? sol_params.prepared.row_state[
+              (int64_t(batch_head)*seq_len+row)*144+16+dim] : 0.0f;
+          tArA(i) = tArA(i)*broadcast<0>(ordinary_rescale,tArA,i) +
+              selected_output*broadcast<0>(selected_weight,tArA,i);
+        }
       }
     }
     static_assert(

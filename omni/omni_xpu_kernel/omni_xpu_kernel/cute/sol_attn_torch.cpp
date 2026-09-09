@@ -227,7 +227,9 @@ template <
     bool ControlAware = true,
     typename StorageElement = Element,
     bool PreparedState = false,
-    bool TokenAugmented = false>
+    bool TokenAugmented = false,
+    bool SelectedOnly = false,
+    bool RowTail = false>
 struct SolKernel {
   static constexpr int QTile = TilePolicy::QTile;
   static constexpr int KvTile = 64;
@@ -299,7 +301,7 @@ struct SolKernel {
       CrossQueryRouteColumns,
       ControlAware,
       PreparedState,
-      TokenAugmented>;
+      TokenAugmented, SelectedOnly, RowTail>;
   using CollectiveEpilogue = cutlass::fmha::collective::FMHAFwdEpilogue<
       CollectiveMainloop, ShapeOutput, TensorO, void>;
   using ProblemShape = cutlass::fmha::kernel::FMHAProblemShape<false>;
@@ -327,13 +329,15 @@ struct SolKernel {
 
 // Internal prepared-state boundary. Public Kitchen preparation and token
 // selection are separate from this unchanged exact-tile CUTE computation.
-template <typename OutputElement, bool TokenAugmented>
+template <typename OutputElement, bool TokenAugmented,
+          bool SelectedOnly = false, bool RowTail = false>
 at::Tensor forward_cute_prepared_impl(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     const at::Tensor& q_scale, const at::Tensor& k_scale,
     const at::Tensor& v_scale, const at::Tensor& routes,
     const at::Tensor& tail_state, double scale, const at::Tensor& extra_indices,
-    const at::Tensor& extra_counts, const at::Tensor& key_bias) {
+    const at::Tensor& extra_counts, const at::Tensor& key_bias,
+    const at::Tensor& row_state = at::Tensor{}) {
   TORCH_CHECK(q.device().is_xpu() && q.dim() == 4 && q.scalar_type() == at::kChar,
               "prepared Sol requires INT8 BTHD XPU Q/K/V");
   const int B = checked_int(q.size(0), "batch");
@@ -368,13 +372,22 @@ at::Tensor forward_cute_prepared_impl(
     check(extra_counts, at::kInt, {B,H,(N+1)/2}, "extra counts");
   }
   if (key_bias.defined()) check(key_bias, at::kFloat, {B,T}, "log2 key bias");
+  if constexpr (RowTail) check(row_state, at::kFloat, {B,H,T,144}, "selected row state");
   using PreparedPolicy = std::conditional_t<TokenAugmented,
       SolTilePolicy<128, 32, 256>, SolConfiguredTilePolicy>;
   using KT = SolKernel<OutputElement, PreparedPolicy,
-      true, true, false, false, int8_t, true, TokenAugmented>;
+      true, true, false, false, int8_t, true, TokenAugmented, SelectedOnly, RowTail>;
   using K = typename KT::Kernel;
   constexpr auto output_dtype = std::is_same_v<OutputElement,cutlass::half_t> ? at::kHalf : at::kBFloat16;
-  at::Tensor output = at::empty(q.sizes(), q.options().dtype(output_dtype));
+  at::Tensor selected_state;
+  at::Tensor output;
+  if constexpr (SelectedOnly) {
+    static_assert(std::is_same_v<OutputElement,float>);
+    // The output view starts at a 64-byte aligned offset and has a 64-byte
+    // aligned pitch. Columns 0 and 1 store max/sum; 2 through 15 are alignment padding.
+    selected_state = at::empty({B,H,T,144}, q.options().dtype(at::kFloat));
+    output = selected_state.slice(3,16,144).permute({0,2,1,3});
+  } else output = at::empty(q.sizes(), q.options().dtype(output_dtype));
   typename K::Arguments args{};
   auto& shape = args.kernel.shape;
   shape.batch = B;
@@ -411,6 +424,8 @@ at::Tensor forward_cute_prepared_impl(
   mainloop.prepared = {routes.data_ptr<uint8_t>(), q_scale.data_ptr<float>(),
       k_scale.data_ptr<float>(), v_scale.data_ptr<float>(), tail_state.data_ptr<float>()};
   mainloop.prepared.key_bias = key_bias.defined() ? key_bias.data_ptr<float>() : nullptr;
+  if constexpr (SelectedOnly) mainloop.prepared.selected_state = selected_state.data_ptr<float>();
+  if constexpr (RowTail) mainloop.prepared.row_state = row_state.data_ptr<float>();
   if constexpr (TokenAugmented) {
     mainloop.prepared.extra_indices = extra_indices.data_ptr<int32_t>();
     mainloop.prepared.extra_counts = extra_counts.data_ptr<int32_t>();
@@ -424,7 +439,8 @@ at::Tensor forward_cute_prepared_impl(
   K::initialize_workspace(args, workspace.data_ptr());
   auto params = K::to_underlying_arguments(args, workspace.data_ptr());
   launch_on_torch_queue<K, KT::GrfSize>(params, q.device().index());
-  return output;
+  if constexpr (SelectedOnly) return selected_state;
+  else return output;
 }
 
 at::Tensor forward_cute_prepared(
@@ -447,6 +463,30 @@ at::Tensor forward_cute_prepared(
   }
   if (extra_indices.has_value()) return launch(cutlass::bfloat16_t{},C<true>{});
   return launch(cutlass::bfloat16_t{},C<false>{});
+}
+
+at::Tensor forward_cute_selected(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    const at::Tensor& qs, const at::Tensor& ks, const at::Tensor& vs,
+    const at::Tensor& routes, const at::Tensor& tail, double scale,
+    const at::Tensor& indices, const at::Tensor& counts,
+    const std::optional<at::Tensor>& bias) {
+  return forward_cute_prepared_impl<float,true,true>(q,k,v,qs,ks,vs,routes,tail,scale,
+      indices,counts,bias.value_or(at::Tensor{}));
+}
+
+at::Tensor forward_cute_prepared_split(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    const at::Tensor& qs, const at::Tensor& ks, const at::Tensor& vs,
+    const at::Tensor& routes, const at::Tensor& tail, const at::Tensor& row_state,
+    double scale, const std::optional<at::Tensor>& bias, bool fp16) {
+  auto launch = [&](auto output_type) {
+    return forward_cute_prepared_impl<decltype(output_type),false,false,true>(
+        q,k,v,qs,ks,vs,routes,tail,scale,at::Tensor{},at::Tensor{},
+        bias.value_or(at::Tensor{}),row_state);
+  };
+  if (fp16) return launch(cutlass::half_t{});
+  return launch(cutlass::bfloat16_t{});
 }
 
 template <
@@ -978,6 +1018,10 @@ at::Tensor forward_cute_serial_route_parent(
 }  // namespace omni_xpu_sol_attn::cute_backend
 
 TORCH_LIBRARY_FRAGMENT(omni_xpu_sol_attn, m) {
+  m.def("forward_cute_selected(Tensor q, Tensor k, Tensor v, Tensor qs, Tensor ks, Tensor vs, "
+        "Tensor routes, Tensor tail, float scale, Tensor indices, Tensor counts, Tensor? bias=None) -> Tensor");
+  m.def("forward_cute_prepared_split(Tensor q, Tensor k, Tensor v, Tensor qs, Tensor ks, Tensor vs, "
+        "Tensor routes, Tensor tail, Tensor row_state, float scale, Tensor? bias=None, bool fp16=False) -> Tensor");
   m.def("token_remainder(Tensor q, Tensor qs, Tensor refs, Tensor k, Tensor ks, Tensor v, Tensor common, Tensor cutoff, float scale, int budget, bool tail) -> Tensor[]");
   m.def("token_histogram(Tensor q, Tensor qs, Tensor refs, Tensor k, Tensor ks, Tensor common, float scale) -> Tensor");
   m.def("centroid_scores(Tensor q, Tensor k, Tensor qs, Tensor ks, float scale) -> Tensor");
@@ -1053,6 +1097,8 @@ TORCH_LIBRARY_FRAGMENT(omni_xpu_sol_attn, m) {
 }
 
 TORCH_LIBRARY_IMPL(omni_xpu_sol_attn, XPU, m) {
+  m.impl("forward_cute_selected", &omni_xpu_sol_attn::cute_backend::forward_cute_selected);
+  m.impl("forward_cute_prepared_split", &omni_xpu_sol_attn::cute_backend::forward_cute_prepared_split);
   m.impl("token_remainder", &omni_xpu_sol_attn::cute_backend::token_remainder);
   m.impl("token_histogram", &omni_xpu_sol_attn::cute_backend::token_histogram);
   m.impl("centroid_scores", &omni_xpu_sol_attn::cute_backend::centroid_scores);

@@ -93,6 +93,8 @@ def _finish(c,scale,sinks,sink_q,topk,tail,token_aug,lengths,key_bias=None,fp16=
         indices,counts,group=ops.token_remainder(gq,gqs,gref,c[1],c[4],c[2],common,cut,scale,token_aug,tail)
         indices=ops.sort_token_indices(indices,counts)
         state=ops.merge_token_tail(state,group)
+        selected=ops.forward_cute_selected(*c[:6],routes,state,scale,indices,counts,key_bias)
+        return ops.forward_cute_prepared_split(*c[:6],routes,state,selected,scale,key_bias,fp16)
     return ops.forward_cute_prepared(*c[:6],routes,state,scale,indices,counts,key_bias,fp16)
 
 
@@ -103,7 +105,8 @@ def is_available():
         return all(hasattr(ops,name) for name in (
             'prepare_carriers','centroid_scores','pooled_routes','token_group_centroids',
             'token_histogram','token_bin_cutoff','token_remainder','sort_token_indices',
-            'merge_token_tail','forward_cute_prepared','producer_begin','producer_chunk',
+            'merge_token_tail','forward_cute_prepared','forward_cute_selected',
+            'forward_cute_prepared_split','producer_begin','producer_chunk',
             'producer_finish','coarse_output','add_coarse_'))
     except (ImportError,OSError,RuntimeError):
         return False
