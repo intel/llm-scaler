@@ -79,6 +79,11 @@ After an official package upgrade, an incompatible provider is skipped in
 `auto` mode instead of being forced into a new API contract. Upgrade the
 corresponding provider wheel to restore XPU routing.
 
+AIMDO 0.5.3 memory compilation (recording and replaying allocation graphs) is
+not yet supported on XPU. Its basic APIs and DynamicVRAM model-weight
+offloading remain available. This limitation does not disable OmniXPU's
+`torch.compile` support.
+
 ## Components and switches
 
 Adapters are enabled by default and always retain the original ComfyUI route

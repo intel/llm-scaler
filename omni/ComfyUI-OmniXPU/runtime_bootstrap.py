@@ -533,6 +533,11 @@ def bootstrap(
                 nvml_pressure=nvml_pressure,
             )
             _set_provider_state(aimdo.provider_id, "active")
+            _LOG.info(
+                "[OmniXPU] AIMDO memory compiler is not yet supported on XPU; "
+                "DynamicVRAM model-weight offloading is available. "
+                "This does not disable torch.compile."
+            )
         except SystemExit:
             raise
         except Exception as exc:

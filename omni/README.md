@@ -138,14 +138,14 @@ see [ComfyUI usage](docs/COMFYUI.md).
 
 The focused image contains:
 
-- upstream [ComfyUI v0.33.4](https://github.com/Comfy-Org/ComfyUI/releases/tag/v0.33.4),
-  pinned to `7a131a3afadc8200120f67f9236311a2c48b7445`;
+- upstream [ComfyUI v0.35.0](https://github.com/Comfy-Org/ComfyUI/tree/v0.35.0),
+  pinned to `40c4fcdf513a4523e39d54a9d391908af8df8171`;
 - `omni_xpu_kernel`, built for the selected Torch minor and XPU target;
-- official `comfy-kitchen==0.2.31` plus the co-installable XPU runtime provider
-  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/9eccb7fa42edf14bc4a4c41aafd645ff1f1dcb75),
+- official `comfy-kitchen==0.2.33` plus the co-installable XPU runtime provider
+  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/6828dce4cfe3675c5aa44d5634a4081277adde20),
   including the managed GGUF and Nunchaku W4A16 routes;
-- official `comfy-aimdo==0.4.13` plus the co-installable XPU runtime provider
-  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/063d66e5345fea58d1a4e8aa6f160ccc0c593f16),
+- official `comfy-aimdo==0.5.3` plus the co-installable XPU runtime provider
+  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/c4f428adefd0352fcc1c94bce824890f1a3bbf66),
   built with its Level Zero allocator backend;
 - [`ComfyUI-GGUF-XPU`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
   with GGUF, SentencePiece, and Protobuf dependencies installed from the same
@@ -156,7 +156,7 @@ The focused image contains:
   using the packaged `omni_xpu_kernel` CUTE/DPAS backend without a second XPU
   build path or Triton dependency;
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md);
-- ComfyUI v0.33.4 integrated Node Manager plus pinned VideoHelperSuite,
+- ComfyUI v0.35.0 integrated Node Manager plus pinned VideoHelperSuite,
   Easy-Use, KJNodes, CacheDiT, and ControlNet auxiliary nodes;
 - an exact installed Python dependency snapshot at
   `/llm/manifests/comfyui-python-freeze.txt`.

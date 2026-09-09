@@ -77,16 +77,16 @@ COMPONENT_PINS = {
     ),
     "COMFYUI_COMMIT": (
         "COMFYUI_COMMIT",
-        "7a131a3afadc8200120f67f9236311a2c48b7445",
+        "40c4fcdf513a4523e39d54a9d391908af8df8171",
     ),
-    "COMFYUI_VERSION": ("COMFYUI_VERSION", "0.33.4"),
+    "COMFYUI_VERSION": ("COMFYUI_VERSION", "0.35.0"),
     "COMFYUI_FRONTEND_VERSION": (
         "COMFYUI_FRONTEND_VERSION",
-        "1.49.6",
+        "1.51.10",
     ),
     "COMFYUI_WORKFLOW_TEMPLATES_VERSION": (
         "COMFYUI_WORKFLOW_TEMPLATES_VERSION",
-        "0.11.46",
+        "0.11.57",
     ),
     "COMFYUI_MANAGER_VERSION": ("COMFYUI_MANAGER_VERSION", "4.2.2"),
     "COMFY_KITCHEN_REPOSITORY": (
@@ -95,18 +95,18 @@ COMPONENT_PINS = {
     ),
     "COMFY_KITCHEN_COMMIT": (
         "KITCHEN_COMMIT",
-        "9eccb7fa42edf14bc4a4c41aafd645ff1f1dcb75",
+        "6828dce4cfe3675c5aa44d5634a4081277adde20",
     ),
-    "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.31"),
+    "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.33"),
     "COMFY_AIMDO_REPOSITORY": (
         "AIMDO_REPOSITORY",
         "https://github.com/xiangyuT/comfy-aimdo-xpu.git",
     ),
     "COMFY_AIMDO_COMMIT": (
         "AIMDO_COMMIT",
-        "063d66e5345fea58d1a4e8aa6f160ccc0c593f16",
+        "c4f428adefd0352fcc1c94bce824890f1a3bbf66",
     ),
-    "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.4.13"),
+    "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.5.3"),
     "COMFY_GGUF_REPOSITORY": (
         "GGUF_REPOSITORY",
         "https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git",
