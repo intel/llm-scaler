@@ -55,6 +55,8 @@ exec python3 -m sglang.launch_server \
     --watchdog-timeout 3600 \
     --trust-remote-code \
     --model-impl sglang \
+    --tool-call-parser gemma4 \
+    --reasoning-parser gemma4 \
     "${speculative_args[@]}" \
     --host "${HOST}" \
     --port "${PORT}"

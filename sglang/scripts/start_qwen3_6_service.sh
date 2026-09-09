@@ -1,9 +1,28 @@
 #!/usr/bin/env bash
-# Launch SGLang server for Qwen3.6-35B-A3B online fp8 on Intel BMG, TP=2.
+# Launch Qwen3.6-27B / 35B-A3B on Intel BMG, TP=2 by default.
 #
-# e5m2 online-fp8 + full-ESIMD config, XPU-graph DISABLED (accuracy).
-# All ESIMD fast-paths + prefill fast-paths + e5m2 fused decode kernels enabled.
-# Required env knobs are documented inline.
+# Run INSIDE the container with the oneAPI environment initialized:
+#   cd /llm-scaler/sglang
+#
+# FP8 (HF directory; loaded and quantized online to E5M2):
+#   MODEL_PATH=/models/Qwen3.6-27B ZE_AFFINITY_MASK=6,7 \
+#     bash scripts/start_qwen3_6_service.sh
+#   MODEL_PATH=/models/Qwen3.6-35B-A3B ZE_AFFINITY_MASK=6,7 \
+#     bash scripts/start_qwen3_6_service.sh
+#
+# GGUF (detected automatically from the .gguf suffix):
+#   MODEL_PATH=/models/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf \
+#     GGUF_CFG_DIR=/models/Qwen3.6-27B ZE_AFFINITY_MASK=6,7 \
+#     bash scripts/start_qwen3_6_service.sh
+#   MODEL_PATH=/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
+#     GGUF_CFG_DIR=/models/Qwen3.6-35B-A3B ZE_AFFINITY_MASK=6,7 \
+#     bash scripts/start_qwen3_6_service.sh
+#
+# Run one model at a time on the same GPUs/port.
+# GGUF_CFG_DIR must contain the matching HF config, tokenizer and safetensors
+# index (or HF shards for weight-name mapping). Tested GGUF flavor: Q4_K_M.
+# Optional: TP_SIZE=2 PORT=30000 HOST=127.0.0.1 MEM_FRACTION_STATIC=0.8.
+# HOST defaults to 0.0.0.0; use 127.0.0.1 for local-only access.
 
 set -euo pipefail
 
@@ -11,12 +30,54 @@ MODEL_PATH="${MODEL_PATH:-/models/Qwen3.6-35B-A3B}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-30000}"
 TP_SIZE="${TP_SIZE:-2}"
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.9}"
 
 # --- device selection ---
 # Pin to the last two BMG cards (physical 0,1). After masking, sglang sees
 # them as XPU 0,1 so TP=2 maps onto exactly these two devices.
 export ZE_AFFINITY_MASK="${ZE_AFFINITY_MASK:-0,1}"
+
+# Keep the GGUF path separate from FP8-only quantization and fusion settings.
+if [[ "$MODEL_PATH" == *.gguf ]]; then
+    if [[ ! -f "$MODEL_PATH" ]]; then
+        echo "MODEL_PATH must point to an existing .gguf file." >&2
+        exit 2
+    fi
+    if [[ -z "${GGUF_CFG_DIR:-}" || ! -f "$GGUF_CFG_DIR/config.json" ]]; then
+        echo "GGUF_CFG_DIR must point to the matching HF model directory containing config.json." >&2
+        exit 2
+    fi
+    export SGLANG_GGUF_HF_CONFIG_DIR="$GGUF_CFG_DIR"
+    export SGLANG_MAMBA_CONV_DTYPE=float16
+    export SGLANG_MAMBA_SSM_DTYPE=float16
+    export SGL_XPU_ESIMD_DECODE=1
+    export SGL_XPU_FA_ESIMD_QKV=1
+    export SGL_XPU_GDN_ESIMD=1
+    export SGL_XPU_GDN_EXTEND_ESIMD=1
+    export SGL_XPU_PREFILL_DPAS=1
+    export SGL_XPU_ENABLE_GRAPH=0
+    export SGLANG_XPU_ENABLE_GRAPH=0
+
+    exec python3 -m sglang.launch_server \
+        --model-path "$MODEL_PATH" \
+        --tokenizer-path "$GGUF_CFG_DIR" \
+        --device xpu \
+        --tp "$TP_SIZE" \
+        --dtype float16 \
+        --attention-backend intel_xpu \
+        --trust-remote-code \
+        --mem-fraction-static "${MEM_FRACTION_STATIC:-0.8}" \
+        --page-size 64 \
+        --max-mamba-cache-size 64 \
+        --disable-overlap-schedule \
+        --mamba-scheduler-strategy extra_buffer \
+        --mamba-track-interval 64 \
+        --tool-call-parser qwen3_coder \
+        --reasoning-parser qwen3 \
+        --host "$HOST" \
+        --port "$PORT"
+fi
+
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.9}"
 
 # --- triton-xpu fp16 mismatch workaround ---
 # Mamba state pool defaults to bf16; force fp16 so it matches the activation
@@ -93,6 +154,7 @@ exec python3 -m sglang.launch_server \
     --max-mamba-cache-size 64 \
     --page-size 64 \
     --mamba-scheduler-strategy extra_buffer \
+    --tool-call-parser qwen3_coder \
     --reasoning-parser qwen3 \
     --enable-cache-report \
     --enable-metrics \

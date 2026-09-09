@@ -8,7 +8,6 @@
 # Runs INSIDE the container.
 set -uo pipefail
 
-VENV="${VENV:-/opt/venv}"
 GGUF="${GGUF:-/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}"
 PORT="${PORT:-9010}"
 START="${START:-$(cd "$(dirname "$0")" && pwd)/01_start_server.sh}"
@@ -17,7 +16,6 @@ TS="$(date +%Y%m%d_%H%M%S)"
 SRV="$WORKDIR/gsm_srv_${TS}.log"
 OUT="$WORKDIR/gsm_${TS}.log"
 
-source "$VENV/bin/activate"
 mkdir -p "$WORKDIR"
 
 setsid bash -c "PORT=$PORT bash '$START' </dev/null >'$SRV' 2>&1" </dev/null >/dev/null 2>&1 &
