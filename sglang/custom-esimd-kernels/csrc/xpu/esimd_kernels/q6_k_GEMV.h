@@ -150,10 +150,18 @@ struct Q6_K_gemv_M_kernel {
         const int QH_STRIDE = K / 4;
         const int SC_STRIDE = K / Q6_K_GS;
 
-        simd<float, 8> acc[M];
+        // Accumulate lane-wise and fold ONCE at the end. A per-iteration
+        // sum<VL>() costs M * K_ITERS cross-lane reduction trees whose shuffles
+        // produce no useful FLOPs; at M=16 that tree is about half of the
+        // per-row instruction count and this kernel is ALU bound.
+        // Folding the VL-wide product into an AW-wide accumulator as VL/AW
+        // strided FMAs issues the same number of instructions as one VL-wide
+        // FMA, so AW can stay small: AW*4*M is 4 KB at M=16, against the 32 KB
+        // a full VL-wide accumulator would need (the GRF is 8 KB).
+        constexpr int AW = 64;
+        simd<float, AW> vacc[M];
         #pragma unroll
-        for (int m = 0; m < M; m++) acc[m] = 0.0f;
-        int ai = 0;
+        for (int m = 0; m < M; m++) vacc[m] = 0.0f;
 
         for (int iter = 0; iter < K_ITERS; iter++) {
             const int k = iter * VL;
@@ -190,14 +198,15 @@ struct Q6_K_gemv_M_kernel {
             #pragma unroll
             for (int m = 0; m < M; m++) {
                 simd<fp16, VL> act = block_load<fp16, VL>(input + (size_t)m * K + k);
-                simd<float, VL> prod = weight_f * simd<float, VL>(act);
-                acc[m][ai] += esimd_detail::sum<float, float, VL>(prod);
+                #pragma unroll
+                for (int c = 0; c < VL / AW; c++)
+                    vacc[m] += weight_f.template select<AW, 1>(c * AW) *
+                               simd<float, AW>(act.template select<AW, 1>(c * AW));
             }
-            ai = (ai + 1) & 7;
         }
         #pragma unroll
         for (int m = 0; m < M; m++)
-            output[(size_t)m * ldo + row] = (fp16)esimd_detail::sum<float, float, 8>(acc[m]);
+            output[(size_t)m * ldo + row] = (fp16)esimd_detail::sum<float, float, AW>(vacc[m]);
     }
 };
 
@@ -219,8 +228,9 @@ inline void q6_k_gemv_M_launch(
     });
 }
 
-// Dispatch arbitrary M (2..16) onto fixed-M kernels by tiling in chunks; the
-// common MTP verify M is exactly draft_token_num (<=8). Round up to {2,4,8,16}.
+// Dispatch arbitrary M onto fixed-M kernels by tiling in chunks of
+// {16,8,4,2,1}. Each tile streams the whole weight matrix once, so the
+// widest tile that fits M decides how many times the weights are read.
 inline void q6_k_gemv_M_host(
     const fp16* input, const uint8_t* ql, const uint8_t* qh,
     const fp16* scale, fp16* output, uint32_t M, uint32_t N, uint32_t K, uint32_t ldo,
@@ -232,7 +242,8 @@ inline void q6_k_gemv_M_host(
         uint32_t r = M - m0;
         const fp16* in = input + (size_t)m0 * K;
         fp16* out = output + (size_t)m0 * ldo;
-        if      (r >= 8) { q6_k_gemv_M_launch<8>(in, ql, qh, scale, out, N, K, ldo, q); m0 += 8; }
+        if      (r >= 16) { q6_k_gemv_M_launch<16>(in, ql, qh, scale, out, N, K, ldo, q); m0 += 16; }
+        else if (r >= 8) { q6_k_gemv_M_launch<8>(in, ql, qh, scale, out, N, K, ldo, q); m0 += 8; }
         else if (r >= 4) { q6_k_gemv_M_launch<4>(in, ql, qh, scale, out, N, K, ldo, q); m0 += 4; }
         else if (r >= 2) { q6_k_gemv_M_launch<2>(in, ql, qh, scale, out, N, K, ldo, q); m0 += 2; }
         else { q6_k_gemv_host(in, ql, qh, scale, out, N, K, q); m0 += 1; }
