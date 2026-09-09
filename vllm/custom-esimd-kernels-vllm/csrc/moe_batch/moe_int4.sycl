@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <initializer_list>
 #include <limits>
@@ -28,6 +29,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <utility>
+#include <type_traits>
 
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/esimd/memory.hpp>
@@ -2415,14 +2417,15 @@ static void moe_ws_up_shared_fp16_kernel(
 // 每段仍用 VL64 FP32 累加；只在最后一次写回 intermediate 时转 FP16。
 // K-split 改变 FP32 加法顺序，不能假定与旧路径 bitexact。
 class MoeCompact80SharedUpKSplit4V1;
+class MoeCompact160SharedUpKSplit4V1;
 
+template<int I = 80>
 static void moe_compact80_shared_up_ksplit4_kernel(
     const fp16* x, const fp16* shared_gate_up_weight,
     const fp16* shared_expert_gate_weight,
     fp16* shared_intermediates, float* shared_gate_values,
     const int n_tokens, const torch::Device& device) {
     constexpr int H = 2560;
-    constexpr int I = 80;
     constexpr int VL = 64;
     constexpr int KS = 4;
     constexpr int K_PER_SPLIT = H / KS;
@@ -2431,7 +2434,9 @@ static void moe_compact80_shared_up_ksplit4_kernel(
     static_assert(K_PER_SPLIT % VL == 0);
 
     auto cgf = [&](sycl::handler& cgh) {
-        cgh.parallel_for<MoeCompact80SharedUpKSplit4V1>(
+        using Kernel = std::conditional_t<I == 80,
+            MoeCompact80SharedUpKSplit4V1, MoeCompact160SharedUpKSplit4V1>;
+        cgh.parallel_for<Kernel>(
             sycl::nd_range<2>(sycl::range<2>(n_tokens, (I + 1) * KS),
                               sycl::range<2>(1, KS)),
             [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
@@ -2510,10 +2515,17 @@ void moe_ws_up_cutlass_int4_with_shared_fp16_kernel(
     }
 
     if (shared_up_ksplit4 && n_tokens >= 2 && n_tokens <= 8 &&
-        hidden_size == 2560 && shared_inter_size == 80 && num_shared_experts == 1) {
-        moe_compact80_shared_up_ksplit4_kernel(
-            x, shared_gate_up_weight, shared_expert_gate_weight,
-            shared_intermediates, shared_gate_values, n_tokens, device);
+        hidden_size == 2560 && (shared_inter_size == 80 || shared_inter_size == 160) &&
+        num_shared_experts == 1) {
+        if (shared_inter_size == 160) {
+            moe_compact80_shared_up_ksplit4_kernel<160>(
+                x, shared_gate_up_weight, shared_expert_gate_weight,
+                shared_intermediates, shared_gate_values, n_tokens, device);
+        } else {
+            moe_compact80_shared_up_ksplit4_kernel(
+                x, shared_gate_up_weight, shared_expert_gate_weight,
+                shared_intermediates, shared_gate_values, n_tokens, device);
+        }
     } else {
         moe_ws_up_shared_fp16_kernel<IndexT>(
             x, shared_gate_up_weight, shared_expert_gate_weight,
@@ -2522,9 +2534,26 @@ void moe_ws_up_cutlass_int4_with_shared_fp16_kernel(
     }
 }
 
-template <typename IndexT, int HT, bool Compact80 = false, bool Compact160 = false> class MoeWsDownCutlassInt4WithSharedFP16;
+template<int WIDTH, int OFFSET = 0>
+SYCL_ESIMD_FUNCTION inline void moe_compact_down_accumulate(
+    simd<float,64>& acc, simd<float,64> even,
+    simd<float,64> odd, simd<uint8_t,64> raw, float scale) {
+    const simd<uint16_t,WIDTH> packed = convert<uint16_t>(
+        simd<uint8_t,WIDTH>(raw.template select<WIDTH,1>(OFFSET)));
+    simd<float,WIDTH> lo = convert<float>(packed & 0x0Fu);
+    simd<float,WIDTH> hi = convert<float>((packed >> 4) & 0x0Fu);
+    lo.merge(lo - 16.f, lo >= 8.f);
+    hi.merge(hi - 16.f, hi >= 8.f);
+    acc.template select<WIDTH,1>(OFFSET) +=
+        simd<float,WIDTH>(even.template select<WIDTH,1>(OFFSET)) * (lo * scale) +
+        simd<float,WIDTH>(odd.template select<WIDTH,1>(OFFSET)) * (hi * scale);
+}
 
-template <typename IndexT, int H_TILE, bool Compact80 = false, bool Compact160 = false>
+template <typename IndexT, int HT, bool Compact80 = false, bool Compact160 = false,
+          bool TightTail = false> class MoeWsDownCutlassInt4WithSharedFP16;
+
+template <typename IndexT, int H_TILE, bool Compact80 = false, bool Compact160 = false,
+          bool TightTail = false>
 void moe_ws_down_cutlass_int4_with_shared_fp16_kernel(
     const fp16* routed_intermediates, const uint8_t* w2, const fp16* w2_scales,
     const fp16* topk_weight, const IndexT* topk_idx,
@@ -2534,12 +2563,26 @@ void moe_ws_down_cutlass_int4_with_shared_fp16_kernel(
     const int shared_inter_size, const int num_shared_experts,
     const torch::Device& device) {
 
+    if constexpr (!TightTail && (Compact80 || Compact160)) {
+        static const bool tight_tail = [] {
+            const char* value = std::getenv("VLLM_XPU_QWEN38_MOE_DOWN_TIGHT_TAIL");
+            return value == nullptr || std::strcmp(value, "1") == 0;
+        }();
+        if (tight_tail && n_tokens >= 2 && n_tokens <= 8) {
+            return moe_ws_down_cutlass_int4_with_shared_fp16_kernel<
+                IndexT,H_TILE,Compact80,Compact160,true>(
+                routed_intermediates, w2, w2_scales, topk_weight, topk_idx,
+                shared_intermediates, shared_gate_values, shared_down_weight,
+                output, n_tokens, top_k, hidden_size, intermediate_size,
+                shared_inter_size, num_shared_experts, device);
+        }
+    }
     const int k_bytes = intermediate_size / 2;
     const int k_groups = (intermediate_size + 127) / 128;
     const int h_tiles = hidden_size / H_TILE;
 
     auto cgf = [&](sycl::handler& cgh) {
-        cgh.parallel_for<class MoeWsDownCutlassInt4WithSharedFP16<IndexT, H_TILE, Compact80, Compact160>>(
+        cgh.parallel_for<class MoeWsDownCutlassInt4WithSharedFP16<IndexT, H_TILE, Compact80, Compact160, TightTail>>(
             sycl::range<2>(n_tokens, h_tiles),
             [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
                 const int token  = (int)idx[0];
@@ -2609,13 +2652,24 @@ void moe_ws_down_cutlass_int4_with_shared_fp16_kernel(
                             } else {
                                 raw = block_load<uint8_t, VL>(weight_row);
                             }
-                            simd<uint16_t, VL> raw16 = convert<uint16_t>(raw);
-                            simd<float, VL> lo = convert<float>(raw16 & 0x0Fu);
-                            simd<float, VL> hi = convert<float>((raw16 >> 4) & 0x0Fu);
-                            lo.merge(lo - 16.f, lo >= 8.f);
-                            hi.merge(hi - 16.f, hi >= 8.f);
                             float s = (float)(w2_scales + ((size_t)expert * hidden_size + h) * k_groups)[group];
-                            acc[hh] += ief * (lo * s) + iof * (hi * s);
+                            if constexpr (TightTail && Compact80) {
+                                moe_compact_down_accumulate<32>(acc[hh], ief, iof, raw, s);
+                                moe_compact_down_accumulate<8,32>(acc[hh], ief, iof, raw, s);
+                            } else if constexpr (TightTail && Compact160) {
+                                if (kb == 0) {
+                                    moe_compact_down_accumulate<64>(acc[hh], ief, iof, raw, s);
+                                } else {
+                                    moe_compact_down_accumulate<16>(acc[hh], ief, iof, raw, s);
+                                }
+                            } else {
+                                simd<uint16_t, VL> raw16 = convert<uint16_t>(raw);
+                                simd<float, VL> lo = convert<float>(raw16 & 0x0Fu);
+                                simd<float, VL> hi = convert<float>((raw16 >> 4) & 0x0Fu);
+                                lo.merge(lo - 16.f, lo >= 8.f);
+                                hi.merge(hi - 16.f, hi >= 8.f);
+                                acc[hh] += ief * (lo * s) + iof * (hi * s);
+                            }
                         }
                     }
                     #pragma unroll

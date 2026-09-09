@@ -100,21 +100,65 @@ static torch::Tensor compact160_forward(
             reinterpret_cast<fp16*>(b.routed.data_ptr()), reinterpret_cast<fp16*>(b.shared.data_ptr()),
             b.gates.data_ptr<float>(), m, 10, 2560, 160, 160, 1, device);
     } else {
-        moe_ws_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
+        static const bool shared_ksplit = [] {
+            const char* value = std::getenv("VLLM_XPU_MOE_COMPACT160_SHARED_UP_KSPLIT4");
+            return value == nullptr || std::strcmp(value, "1") == 0;
+        }();
+        static const bool grouped_up = [] {
+            const char* value = std::getenv("VLLM_XPU_MOE_COMPACT160_GROUPED_UP");
+            return value == nullptr || std::strcmp(value, "1") == 0;
+        }();
+        // M4..6 amortizes expert grouping. M2 and M8 do not win consistently
+        // with the larger DOWN tile, including disjoint routing controls.
+        if (grouped_up && m >= 4 && m <= 6) {
+            moe_compact80_grouped_up_tiled_kernel<int32_t,2,2>(
+                reinterpret_cast<const fp16*>(x.data_ptr()), w13.data_ptr<uint8_t>(),
+                reinterpret_cast<const fp16*>(s13.data_ptr()), b.ids.data_ptr<int32_t>(),
+                reinterpret_cast<fp16*>(b.routed.data_ptr()), m, 10, 2560, 160, device);
+            if (shared_ksplit) {
+                moe_compact80_shared_up_ksplit4_kernel<160>(
+                    reinterpret_cast<const fp16*>(x.data_ptr()),
+                    reinterpret_cast<const fp16*>(shared_up.data_ptr()),
+                    reinterpret_cast<const fp16*>(shared_gate.data_ptr()),
+                    reinterpret_cast<fp16*>(b.shared.data_ptr()), b.gates.data_ptr<float>(),
+                    m, device);
+            } else {
+                moe_ws_up_shared_fp16_kernel<int32_t>(
+                    reinterpret_cast<const fp16*>(x.data_ptr()),
+                    reinterpret_cast<const fp16*>(shared_up.data_ptr()),
+                    reinterpret_cast<const fp16*>(shared_gate.data_ptr()),
+                    reinterpret_cast<fp16*>(b.shared.data_ptr()), b.gates.data_ptr<float>(),
+                    m, 2560, 160, 1, device);
+            }
+        } else {
+            moe_ws_up_cutlass_int4_with_shared_fp16_kernel<int32_t>(
             reinterpret_cast<const fp16*>(x.data_ptr()), w13.data_ptr<uint8_t>(),
             reinterpret_cast<const fp16*>(s13.data_ptr()), b.ids.data_ptr<int32_t>(),
             reinterpret_cast<const fp16*>(shared_up.data_ptr()),
             reinterpret_cast<const fp16*>(shared_gate.data_ptr()),
             reinterpret_cast<fp16*>(b.routed.data_ptr()), reinterpret_cast<fp16*>(b.shared.data_ptr()),
-            b.gates.data_ptr<float>(), m, 10, 2560, 160, 160, 1, device);
+            b.gates.data_ptr<float>(), m, 10, 2560, 160, 160, 1, device,
+            shared_ksplit && m <= 6);
+        }
     }
-    moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t,4,false,true>(
+    const auto launch_down = [&](auto tile) {
+        moe_ws_down_cutlass_int4_with_shared_fp16_kernel<int32_t,decltype(tile)::value,false,true>(
         reinterpret_cast<const fp16*>(b.routed.data_ptr()), w2.data_ptr<uint8_t>(),
         reinterpret_cast<const fp16*>(s2.data_ptr()),
         reinterpret_cast<const fp16*>(b.weights.data_ptr()), b.ids.data_ptr<int32_t>(),
         reinterpret_cast<const fp16*>(b.shared.data_ptr()), b.gates.data_ptr<float>(),
         reinterpret_cast<const fp16*>(shared_down.data_ptr()),
         reinterpret_cast<fp16*>(output.data_ptr()), m, 10, 2560, 160, 160, 1, device);
+    };
+    static const bool down_tile8 = [] {
+        const char* value = std::getenv("VLLM_XPU_MOE_COMPACT160_DOWN_H_TILE");
+        return value == nullptr || std::strcmp(value, "8") == 0;
+    }();
+    if (down_tile8 && m >= 4 && m <= 6) {
+        launch_down(std::integral_constant<int,8>{});
+    } else {
+        launch_down(std::integral_constant<int,4>{});
+    }
     return output;
 }
 

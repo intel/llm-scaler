@@ -58,6 +58,8 @@ from custom_esimd_kernels_vllm.ops import (
     esimd_gemv_int4,
     esimd_gemv_int4_fused2,
     esimd_gemm_int4_pgrp,
+    esimd_gemm_int4_small_n_v1,
+    has_esimd_gemm_int4_small_n_v1,
     esimd_qkv_split_norm_rope,
     esimd_qkv_split_norm_rope_mrope_v1,
     esimd_qkv_split_norm_rope_v,

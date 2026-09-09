@@ -401,6 +401,10 @@ at::Tensor esimd_gemm_int4_pgrp(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output);
 
+at::Tensor esimd_gemm_int4_small_n_v1(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output);
+
 // MoE grouped GEMM — FP8 E5M2 with per-tensor scale (one scalar per expert)
 at::Tensor esimd_moe_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor scale,

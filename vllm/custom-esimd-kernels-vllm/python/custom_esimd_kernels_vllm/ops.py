@@ -3,6 +3,12 @@ import torch
 import torch.nn.functional as F
 
 _ops = torch.ops.custom_esimd_kernels_vllm
+_ESIMD_INT4_SMALL_N_V1 = getattr(_ops, "esimd_gemm_int4_small_n_v1", None)
+
+
+def has_esimd_gemm_int4_small_n_v1() -> bool:
+    """Keep new Python wrappers compatible with an older GEMM DSO."""
+    return _ESIMD_INT4_SMALL_N_V1 is not None
 
 try:
     _ESIMD_GDN_CONV_FUSED_SEQ_SPEC_V2 = (
@@ -1470,6 +1476,13 @@ def esimd_gemv_int4_fused2(
     Returns o0. Both o0 and o1 are written.
     """
     return _ops.esimd_gemv_int4_fused2(input, w0, s0, o0, w1, s1, o1)
+
+
+def esimd_gemm_int4_small_n_v1(input, weight, weight_scale, output):
+    """Qwen3.8 GDN b/a projection: M2..8, N12/24, K2560, Q4_0 group128."""
+    if _ESIMD_INT4_SMALL_N_V1 is None:
+        raise RuntimeError("Loaded GEMM DSO does not support INT4 small-N v1")
+    return _ESIMD_INT4_SMALL_N_V1(input, weight, weight_scale, output)
 
 
 def esimd_gemm_int4_pgrp(

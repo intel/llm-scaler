@@ -17,6 +17,8 @@
 #pragma once
 
 #include <stdexcept>
+#include <cstdlib>
+#include <cstring>
 
 #include "utils.h"
 
@@ -250,6 +252,7 @@ inline void GEMV_fp16_hc_down_multi_m_host(
 
 // 每个 work-item 持有同一 h 的两行、四个 branch；每个 branch 的
 // 320 个权重仅加载一次。x 在内层逐行加载，不缓存全部 M 行向量。
+template<int ROWS>
 struct GEMV_fp16_hc_up_gate_mix_multi_m_kernel {
     const fp16* input;
     const fp16* weight;
@@ -262,13 +265,14 @@ struct GEMV_fp16_hc_up_gate_mix_multi_m_kernel {
         constexpr int W = 128;
         constexpr int T = 64;
         const int index = item.get_global_id(0);
-        const int m = (index / 2560) * 2;
+        const int m = (index / 2560) * ROWS;
         const int h = index % 2560;
         // 与 M1 保持相同的展开累加表达式。动态 branch 循环加上标量
         // lane 更新会改变编译器的 contraction/reassociation，抵消场景下
         // 可跨过 FP16 舍入边界。两行索引展开后均为编译期常量。
-        simd<float, 1> mixed[2] = {
-            simd<float, 1>(0.0f), simd<float, 1>(0.0f)};
+        simd<float, 1> mixed[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) mixed[r] = 0.0f;
 #pragma unroll
         for (int branch = 0; branch < 4; ++branch) {
             const int n = branch * 2560 + h;
@@ -277,7 +281,7 @@ struct GEMV_fp16_hc_up_gate_mix_multi_m_kernel {
             const simd<float, W> w1 = block_load<fp16, W>(weight + base + W);
             const simd<float, T> w2 = block_load<fp16, T>(weight + base + 2 * W);
 #pragma unroll
-            for (int r = 0; r < 2; ++r) {
+            for (int r = 0; r < ROWS; ++r) {
                 if (m + r >= M) continue;
                 const fp16* x = input + static_cast<size_t>(m + r) * input_row_stride;
                 const simd<float, W> x0 = block_load<fp16, W>(x);
@@ -293,22 +297,41 @@ struct GEMV_fp16_hc_up_gate_mix_multi_m_kernel {
                 mixed[r] += value / (1.0f + esimd_math::exp(-gate));
             }
         }
-        output[static_cast<size_t>(m) * 2560 + h] = fp16((mixed[0] * 0.25f)[0]);
-        if (m + 1 < M) {
-            output[static_cast<size_t>(m + 1) * 2560 + h] = fp16((mixed[1] * 0.25f)[0]);
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            if (m + r < M) {
+                output[static_cast<size_t>(m + r) * 2560 + h] = fp16((mixed[r] * 0.25f)[0]);
+            }
         }
     }
 };
 
-inline void GEMV_fp16_hc_up_gate_mix_multi_m_host(
+template<int ROWS>
+inline void GEMV_fp16_hc_up_gate_mix_multi_m_launch(
     const fp16* input, const fp16* weight, const fp16* normed,
     fp16* output, int M, size_t input_row_stride, sycl::queue& q) {
     q.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
-            sycl::nd_range<1>(((M + 1) / 2) * 2560, 32),
-            GEMV_fp16_hc_up_gate_mix_multi_m_kernel{
+            sycl::nd_range<1>(((M + ROWS - 1) / ROWS) * 2560, 32),
+            GEMV_fp16_hc_up_gate_mix_multi_m_kernel<ROWS>{
                 input, weight, normed, output, M, input_row_stride});
     });
+}
+
+inline void GEMV_fp16_hc_up_gate_mix_multi_m_host(
+    const fp16* input, const fp16* weight, const fp16* normed,
+    fp16* output, int M, size_t input_row_stride, sycl::queue& q) {
+    static const bool tile4 = [] {
+        const char* value = std::getenv("VLLM_XPU_QWEN38_HC_UP_M_TILE");
+        return value == nullptr || std::strcmp(value, "4") == 0;
+    }();
+    if (tile4 && M >= 4) {
+        GEMV_fp16_hc_up_gate_mix_multi_m_launch<4>(
+            input, weight, normed, output, M, input_row_stride, q);
+    } else {
+        GEMV_fp16_hc_up_gate_mix_multi_m_launch<2>(
+            input, weight, normed, output, M, input_row_stride, q);
+    }
 }
 
 template<int VL, int K_SPLIT>
