@@ -175,7 +175,6 @@ ENV VIRTUAL_ENV=/opt/venv \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     VLLM_QUANTIZE_Q40_LIB="/opt/venv/lib/python3.12/site-packages/vllm_int4_for_multi_arc.so" \
-    VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 \
     VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
     VLLM_WORKER_MULTIPROC_METHOD=spawn
 
