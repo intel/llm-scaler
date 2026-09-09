@@ -8827,7 +8827,7 @@ index 3629782ca..3d7068ab4 100644
          # Prepare bidirectional attention masks for image tokens during prefill.
          # mm_inputs is preserved on every PP rank up to the first-rank embed
 diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
-index 37552404b..c7a99c621 100644
+index 37552404b..8aa941fdd 100644
 --- a/python/sglang/srt/models/qwen2_moe.py
 +++ b/python/sglang/srt/models/qwen2_moe.py
 @@ -19,6 +19,7 @@
@@ -9776,7 +9776,7 @@ index 37552404b..c7a99c621 100644
  
          if shared_output is not None:
              final_hidden_states += shared_output
-@@ -542,6 +1433,131 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+@@ -542,6 +1433,138 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
  
          return final_hidden_states.view(num_tokens, hidden_dim)
  
@@ -9841,9 +9841,16 @@ index 37552404b..c7a99c621 100644
 +                # gemma_fused_add_rmsnorm + standalone router path (80 extra
 +                # norm dispatches per verify forward).
 +                or forward_batch.forward_mode.is_target_verify()
++                # The MTP draft-extend forward (one draft layer over the full
++                # tree width per request) satisfies every guard below as well,
++                # and it is the same MoE block as the draft decode step. While
++                # it was excluded it fell back to the standalone router +
++                # python grouped-GEMM bookkeeping (argsort/scatter_add/cumsum/
++                # stack/index), which is host-bound and dominates this stage.
++                or forward_batch.forward_mode.is_draft_extend_v2()
 +            )
 +        ):
-+            return _skip("not xpu decode/verify")
++            return _skip("not xpu decode/verify/draft-extend")
 +        # M>1 is serviceable by the GGUF norm-fused op and, since the router
 +        # kernel is per-token, by the fp8 twin as well (_MOE_FUSED_MAX_M, the
 +        # same knob that gates moe_forward_full_rtfused).
@@ -13396,7 +13403,7 @@ index 65f78e691..fabd3bcaa 100644
 +
  EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
 diff --git a/python/sglang/srt/models/qwen3_5_mtp.py b/python/sglang/srt/models/qwen3_5_mtp.py
-index 6b39a590c..a49d0b9b7 100644
+index 6b39a590c..323f0a8f4 100644
 --- a/python/sglang/srt/models/qwen3_5_mtp.py
 +++ b/python/sglang/srt/models/qwen3_5_mtp.py
 @@ -33,7 +33,11 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -13436,6 +13443,45 @@ index 6b39a590c..a49d0b9b7 100644
          torch.cuda.empty_cache()
          torch.cuda.synchronize()
  
+@@ -265,6 +271,26 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
+ 
++        # GGUF stores GemmaRMSNorm weights with the +1 already folded in (the
++        # checkpoint value is standard_weight + 1), but GemmaRMSNorm computes
++        # x*(1+w), so the param must hold (stored - 1). Qwen3_5ForCausalLM does
++        # this for the main branch, but it skips every "mtp" name (they are
++        # routed here), so the MTP branch has to redo it. The MTP layer is a
++        # full-attention layer, so no GDN linear_attn.norm (plain RMSNormGated,
++        # no offset) can show up in this list.
++        _is_gguf = (
++            getattr(self, "quant_config", None) is not None
++            and getattr(self.quant_config, "get_name", lambda: "")() == "gguf"
++        )
++        _gemma_norm_suffixes = (
++            "pre_fc_norm_embedding.weight",
++            "pre_fc_norm_hidden.weight",
++            "input_layernorm.weight",
++            "post_attention_layernorm.weight",
++            "self_attn.q_norm.weight",
++            "self_attn.k_norm.weight",
++        )
++
+         for name, loaded_weight in weights:
+             if "rotary_emb.inv_freq" in name:
+                 continue
+@@ -273,6 +299,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
+             if "mtp" not in name:
+                 continue
+ 
++            if _is_gguf and (
++                name.endswith(_gemma_norm_suffixes) or name == "mtp.norm.weight"
++            ):
++                loaded_weight = loaded_weight - 1.0
++
+             if name.startswith("mtp."):
+                 # Remove the mtp. prefix for processing
+                 name = name.replace("mtp.", "model.")
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
 index 6c77ff64f..127dedb7b 100644
 --- a/python/sglang/srt/server_args.py
@@ -13890,3 +13936,568 @@ index f66ea9a67..8e5f7beda 100644
          if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
              raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
          _set_architectures(config, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type])
+diff --git a/test/registered/unit/server_args/test_xpu_hicache_server_args.py b/test/registered/unit/server_args/test_xpu_hicache_server_args.py
+new file mode 100644
+index 000000000..47b4372a0
+--- /dev/null
++++ b/test/registered/unit/server_args/test_xpu_hicache_server_args.py
+@@ -0,0 +1,100 @@
++"""
++Unit tests for the XPU HiCache validation guard in ServerArgs.
++
++The guard (ServerArgs._reject_unsupported_xpu_hicache) rejects HiCache mem layouts
++and IO backends that have not been validated on Intel XPU, and honours
++SGLANG_XPU_ALLOW_UNVALIDATED_HICACHE=1 as an escape hatch so an unvalidated-but-
++implemented path can still be measured without patching this file.
++
++No XPU hardware is required: is_xpu() is patched, so this runs on CPU CI runners.
++
++Usage:
++python3 -m unittest test_xpu_hicache_server_args -v
++"""
++
++import unittest
++from unittest.mock import patch
++
++from sglang.srt.server_args import ServerArgs
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cpu_ci(est_time=5, suite="base-a-test-cpu")
++register_cpu_ci(est_time=5, suite="base-b-test-cpu")
++
++
++def _args(layout: str, io_backend: str) -> ServerArgs:
++    """Build only the two fields the guard reads.
++
++    The guard runs at the end of __post_init__, which also resolves the device, the
++    ports and the model config -- none of which exist on a CPU-only runner. Bypassing
++    __init__ keeps this a unit test of the guard rather than an integration test of
++    ServerArgs, so it cannot start passing (or failing) because of an unrelated
++    __post_init__ change.
++    """
++    server_args = ServerArgs.__new__(ServerArgs)
++    server_args.hicache_mem_layout = layout
++    server_args.hicache_io_backend = io_backend
++    return server_args
++
++
++class TestXPUHiCacheGuard(CustomTestCase):
++    """Testcase: HiCache flag validation on Intel XPU.
++
++    Cover scenarios:
++    1. Validated layout/backend pairs are accepted
++    2. Unvalidated layouts are rejected, naming the resolved pair
++    3. io_backend=direct is rejected as unvalidated, not as unimplemented
++    4. The escape hatch downgrades every rejection to a warning
++    5. Non-XPU devices are never touched by the guard
++
++    [Test Category] HiCache
++    [Test Target] ServerArgs._reject_unsupported_xpu_hicache
++    """
++
++    def test_validated_pairs_are_accepted(self):
++        with patch("sglang.srt.server_args.is_xpu", return_value=True):
++            for layout in ("layer_first", "page_first"):
++                _args(layout, "kernel")._reject_unsupported_xpu_hicache()
++
++    def test_unvalidated_layout_is_rejected(self):
++        with patch("sglang.srt.server_args.is_xpu", return_value=True):
++            for layout in ("page_first_direct", "page_first_kv_split", "page_head"):
++                with self.assertRaises(ValueError) as ctx:
++                    _args(layout, "kernel")._reject_unsupported_xpu_hicache()
++                # The message must report the RESOLVED pair. hicache_mem_layout and
++                # hicache_io_backend rewrite each other before the guard runs, so a
++                # message naming only one of them can describe a flag the user never
++                # passed.
++                self.assertIn("resolved:", str(ctx.exception))
++                self.assertIn("not validated", str(ctx.exception))
++
++    def test_direct_io_backend_is_rejected_as_unvalidated(self):
++        with patch("sglang.srt.server_args.is_xpu", return_value=True):
++            with self.assertRaises(ValueError) as ctx:
++                _args("layer_first", "direct")._reject_unsupported_xpu_hicache()
++            msg = str(ctx.exception)
++            self.assertIn("not validated on XPU", msg)
++            # The direct-family ops DO exist on XPU as page-by-page torch copy_
++            # fallbacks (sgl_kernel/kvcacheio.py _transfer_page_direct). Asserting the
++            # wording keeps the guard from regressing back to claiming they are
++            # missing, which is what an earlier revision of it wrongly said.
++            self.assertIn("implemented", msg)
++
++    def test_escape_hatch_downgrades_to_warning(self):
++        env = {"SGLANG_XPU_ALLOW_UNVALIDATED_HICACHE": "1"}
++        with patch("sglang.srt.server_args.is_xpu", return_value=True), patch.dict(
++            "os.environ", env
++        ), patch("sglang.srt.server_args.logger") as mock_logger:
++            # Both rejection sites must honour the hatch, so exercise both.
++            _args("page_first_direct", "direct")._reject_unsupported_xpu_hicache()
++            self.assertEqual(mock_logger.warning.call_count, 2)
++
++    def test_guard_is_inert_off_xpu(self):
++        with patch("sglang.srt.server_args.is_xpu", return_value=False):
++            # A CUDA user must never see an XPU message, even on a pair that XPU rejects.
++            _args("page_first_direct", "direct")._reject_unsupported_xpu_hicache()
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/xpu/test_xpu_hicache_storage_file.py b/test/registered/xpu/test_xpu_hicache_storage_file.py
+new file mode 100644
+index 000000000..42576c840
+--- /dev/null
++++ b/test/registered/xpu/test_xpu_hicache_storage_file.py
+@@ -0,0 +1,209 @@
++"""
++HiCache L3 (file storage backend) tests on Intel XPU.
++
++Two properties, in order, because the second is meaningless without the first:
++  1. write:  a prefix served by the device tier is backed up to disk
++  2. read:   after the server is restarted -- which destroys the host tier -- the same
++             prefix is served from disk
++
++The restart is what makes the read test honest. With a live host tier, a hit proves
++nothing about L3, because L2 could have answered.
++
++Usage:
++python3 -m unittest test_xpu_hicache_storage_file -v
++"""
++
++import os
++import shutil
++import tempfile
++import time
++import unittest
++import uuid
++
++import requests
++
++from sglang.srt.utils import kill_process_tree
++from sglang.test.ci.ci_register import register_xpu_ci
++from sglang.test.test_utils import (
++    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
++    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++    DEFAULT_URL_FOR_TEST,
++    CustomTestCase,
++    popen_launch_server,
++)
++
++register_xpu_ci(est_time=600, suite="stage-b-test-1-gpu-xpu")
++
++# See test_xpu_hierarchical_cache.py: --hicache-ratio sizes the pinned host pool from
++# the device pool, so the device pool must be pinned too.
++MAX_TOTAL_TOKENS = 4096
++PAGE_SIZE = 64
++# How long to wait for the write-through backup to reach disk. The backup is
++# asynchronous: the device write acks first, the host write acks next, and only then is
++# the page handed to the storage backend.
++WRITE_TIMEOUT_S = 60
++
++
++def pin_loopback_no_proxy():
++    """Keep the loopback address out of any ambient HTTP proxy.
++
++    Duplicated from test_xpu_hierarchical_cache.py rather than imported, so each test
++    file stays runnable on its own from any working directory. See that file for the
++    failure this prevents: a proxied self-warmup GET makes the server kill its own pid,
++    and the test reports a launch failure that names neither HTTP nor the proxy.
++    """
++    for var in ("no_proxy", "NO_PROXY"):
++        current = os.environ.get(var, "")
++        missing = [h for h in ("127.0.0.1", "localhost", "::1") if h not in current]
++        if missing:
++            os.environ[var] = ",".join(missing + ([current] if current else []))
++
++
++class TestXPUHiCacheStorageFile(CustomTestCase):
++    """Testcase: HiCache file storage backend on Intel XPU.
++
++    Cover scenarios:
++    1. write_through backs a served prefix up to the file backend
++    2. the prefix is read back from disk after a server restart
++
++    [Test Category] HiCache
++    [Test Target] --hicache-storage-backend file on --device xpu
++    """
++
++    @classmethod
++    def setUpClass(cls):
++        pin_loopback_no_proxy()
++        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
++        cls.base_url = DEFAULT_URL_FOR_TEST
++        cls.storage_dir = tempfile.mkdtemp(prefix="xpu-hicache-l3-")
++        # Nonce the prefix so a rerun cannot read files planted by a previous run. The
++        # L3 key is a chained hash of the token pages, so different text is a different
++        # key.
++        cls.nonce = uuid.uuid4().hex[:8]
++        cls.prefix = f"Document {cls.nonce}. " + "Section 7.4 of the manual. " * 64
++        cls.process = None
++
++    @classmethod
++    def tearDownClass(cls):
++        if cls.process:
++            kill_process_tree(cls.process.pid)
++        shutil.rmtree(cls.storage_dir, ignore_errors=True)
++
++    @classmethod
++    def _launch(cls):
++        """Launch a server against the shared storage dir.
++
++        The dir is deliberately NOT cleared between launches: keeping it is the entire
++        experiment. Clearing it on relaunch produces a correct miss that reads exactly
++        like a broken read path.
++        """
++        other_args = [
++            "--device",
++            "xpu",
++            "--attention-backend",
++            "intel_xpu",
++            "--mem-fraction-static",
++            "0.6",
++            "--tp-size",
++            "1",
++            "--page-size",
++            str(PAGE_SIZE),
++            "--max-total-tokens",
++            str(MAX_TOTAL_TOKENS),
++            "--enable-cache-report",
++            "--enable-hierarchical-cache",
++            "--hicache-ratio",
++            "2",
++            "--hicache-write-policy",
++            "write_through",
++            "--hicache-io-backend",
++            "kernel",
++            "--hicache-mem-layout",
++            "layer_first",
++            "--hicache-storage-backend",
++            "file",
++            # wait_complete is mandatory, not a tuning choice. Under the default
++            # best_effort policy can_terminate_prefetch() returns True unconditionally,
++            # so the L3 prefetch is cancelled on the first scheduler tick and a cold
++            # request keeps zero prefetched tokens. The read assertion below would then
++            # be unfalsifiable.
++            "--hicache-storage-prefetch-policy",
++            "wait_complete",
++        ]
++        return popen_launch_server(
++            cls.model,
++            cls.base_url,
++            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++            other_args=other_args,
++            # See test_xpu_hierarchical_cache.py: device="auto" would append a second
++            # --device after ours and win.
++            device="xpu",
++            env={
++                **os.environ,
++                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.storage_dir,
++            },
++        )
++
++    def _generate(self, text: str) -> dict:
++        response = requests.post(
++            f"{self.base_url}/generate",
++            json={
++                "text": text,
++                "sampling_params": {"temperature": 0, "max_new_tokens": 1},
++            },
++        )
++        self.assertEqual(response.status_code, 200, response.text)
++        return response.json()["meta_info"]
++
++    @staticmethod
++    def _tiers(meta: dict) -> tuple:
++        details = meta.get("cached_tokens_details") or {}
++        return (
++            meta.get("cached_tokens", 0),
++            details.get("device", 0),
++            details.get("host", 0),
++            details.get("storage", 0),
++        )
++
++    def _files(self) -> int:
++        return len(os.listdir(self.storage_dir))
++
++    def test_l3_write_then_read_across_restart(self):
++        # One test method, not two, because the read step depends on state the write
++        # step creates. Split across methods it would depend on execution order.
++        type(self).process = self._launch()
++
++        # --- write ---
++        self._generate(self.prefix)
++        deadline = time.monotonic() + WRITE_TIMEOUT_S
++        while self._files() == 0 and time.monotonic() < deadline:
++            time.sleep(1)
++        planted = self._files()
++        self.assertGreater(
++            planted,
++            0,
++            "write_through did not back the prefix up to the file backend; there is "
++            "nothing on disk, so the read step below could only fail for the wrong "
++            "reason",
++        )
++
++        # --- restart: this is what destroys the host tier ---
++        kill_process_tree(type(self).process.pid)
++        type(self).process = None
++        self.assertEqual(
++            self._files(), planted, "the restart must not disturb the planted files"
++        )
++        type(self).process = self._launch()
++
++        # --- read ---
++        cached, device, host, storage = self._tiers(self._generate(self.prefix))
++        self.assertGreater(
++            storage,
++            0,
++            f"expected an L3 hit, got cached={cached} device={device} host={host}",
++        )
++        self.assertGreaterEqual(cached, storage)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/xpu/test_xpu_hierarchical_cache.py b/test/registered/xpu/test_xpu_hierarchical_cache.py
+new file mode 100644
+index 000000000..d66b31f29
+--- /dev/null
++++ b/test/registered/xpu/test_xpu_hierarchical_cache.py
+@@ -0,0 +1,238 @@
++"""
++HierarchicalCache (L1 device <-> L2 pinned host) tests on Intel XPU.
++
++Mirrors the Ascend HiCache suite under test/registered/ascend/basic_function/HiCache/,
++with one XPU-specific addition: a test that a prefix evicted from the device pool is
++reloaded from the host tier rather than recomputed. That is the only test here that
++actually exercises the XPU KV transfer kernels in both directions.
++
++Usage:
++python3 -m unittest test_xpu_hierarchical_cache -v
++"""
++
++import os
++import unittest
++import uuid
++
++import requests
++
++from sglang.srt.utils import kill_process_tree
++from sglang.test.ci.ci_register import register_xpu_ci
++from sglang.test.test_utils import (
++    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
++    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++    DEFAULT_URL_FOR_TEST,
++    CustomTestCase,
++    popen_launch_server,
++)
++
++register_xpu_ci(est_time=420, suite="stage-b-test-1-gpu-xpu")
++
++# The device KV pool is pinned, not auto-sized, for two independent reasons:
++#   1. --hicache-ratio sizes the PINNED HOST pool as a multiple of the DEVICE pool, so
++#      an auto-sized device pool makes the host allocation unpredictable. On BMG an
++#      oversized pinned allocation presents as a device fault, i.e. as a driver bug
++#      rather than as a configuration error.
++#   2. The eviction test below has to overflow this pool. A known size is what makes
++#      the flood self-sizing and quick instead of a guess.
++MAX_TOTAL_TOKENS = 4096
++PAGE_SIZE = 64
++# Must match --hicache-ratio below. The host pool is this multiple of the device pool:
++# measured 2026-08-19, "KV Cache is allocated ... K size: 0.06 GB, V size: 0.06 GB" for
++# 4096 device tokens against "Allocating 0.24 GB host memory", i.e. exactly 2x.
++HICACHE_RATIO = 2
++HOST_TOTAL_TOKENS = HICACHE_RATIO * MAX_TOTAL_TOKENS
++
++# The flood in test_3 has to land inside a WINDOW, not just be "big":
++#   lower bound  > MAX_TOTAL_TOKENS   or the device copy is never displaced, the request
++#                                     is answered from L1, and the host tier is not read
++#   upper bound  < HOST_TOTAL_TOKENS  or the flood evicts the HOST copy too, and the
++#                                     prefix is recomputed -- indistinguishable from a
++#                                     broken transfer path
++# The first version of this test used 3x the device pool, which is 1.5x the HOST pool,
++# and failed with cached=0 on a working system: 37 fillers x 384 allocated tokens =
++# 14208 tokens through an 8192-token host pool. 1.25x sits above the device pool and
++# leaves ~1.4k tokens of host headroom for the target.
++FLOOD_TOKENS = int(1.25 * MAX_TOTAL_TOKENS)
++assert MAX_TOTAL_TOKENS < FLOOD_TOKENS < HOST_TOTAL_TOKENS - 8 * PAGE_SIZE, (
++    "flood target is outside the eviction window; re-derive it if MAX_TOTAL_TOKENS or "
++    "HICACHE_RATIO changes"
++)
++
++
++def pin_loopback_no_proxy():
++    """Keep the loopback address out of any ambient HTTP proxy.
++
++    The server warms ITSELF up over HTTP: _execute_server_warmup() polls
++    GET http://127.0.0.1:<port>/model_info 120 times and, on failure, calls
++    kill_process_tree on its own pid. Behind a corporate proxy whose no_proxy does not
++    cover the loopback address, that GET is answered by the proxy with a 403 block page,
++    the request never reaches the server, and after ~130 s the server kills itself. The
++    launch then fails in setUpClass with "Server process exited with code -9" and zero
++    tests run -- a failure that mentions neither the proxy nor HTTP, and that reads like
++    a HiCache or driver problem.
++
++    Measured on this box 2026-08-19 00:12-00:14: both the offline and the online launch
++    attempt died this way, 320 s wasted, `Ran 0 tests`.
++    """
++    for var in ("no_proxy", "NO_PROXY"):
++        current = os.environ.get(var, "")
++        missing = [h for h in ("127.0.0.1", "localhost", "::1") if h not in current]
++        if missing:
++            os.environ[var] = ",".join(missing + ([current] if current else []))
++
++
++class TestXPUHierarchicalCache(CustomTestCase):
++    """Testcase: HierarchicalCache test on Intel XPU.
++
++    Cover scenarios:
++    1. Long identical texts: cache is reused
++    2. Short identical texts (< one page): cache is not reused
++    3. A prefix evicted from L1 is reloaded from L2, not recomputed
++
++    [Test Category] HiCache
++    [Test Target] --enable-hierarchical-cache on --device xpu
++    """
++
++    @classmethod
++    def setUpClass(cls):
++        # Before the launch, not after: the server's self-warmup is the first thing that
++        # breaks, and popen_launch_server passes this process's environ to the child.
++        pin_loopback_no_proxy()
++        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
++        cls.base_url = DEFAULT_URL_FOR_TEST
++        # Nonce every prompt in this class. Without it a rerun on the same machine can
++        # hit a cache populated by the previous run, which turns a broken write path
++        # into a passing test.
++        cls.nonce = uuid.uuid4().hex[:8]
++        other_args = [
++            "--device",
++            "xpu",
++            "--attention-backend",
++            "intel_xpu",
++            "--mem-fraction-static",
++            "0.6",
++            "--tp-size",
++            "1",
++            "--page-size",
++            str(PAGE_SIZE),
++            "--max-total-tokens",
++            str(MAX_TOTAL_TOKENS),
++            "--enable-cache-report",
++            "--enable-hierarchical-cache",
++            "--hicache-ratio",
++            "2",
++            "--hicache-write-policy",
++            "write_through",
++            "--hicache-io-backend",
++            "kernel",
++            "--hicache-mem-layout",
++            "layer_first",
++        ]
++        cls.process = popen_launch_server(
++            cls.model,
++            cls.base_url,
++            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++            other_args=other_args,
++            # Pass the device explicitly, as test_gemma_4_e2b.py does. The default
++            # device="auto" makes popen_launch_server call auto_config_device() and
++            # APPEND its own --device to the end of the command line, after the one in
++            # other_args. argparse takes the last occurrence, so on a box where
++            # detection falls back to "cpu" this XPU test would silently run on CPU and
++            # still pass -- proving nothing about the XPU transfer kernels.
++            device="xpu",
++        )
++
++    @classmethod
++    def tearDownClass(cls):
++        if hasattr(cls, "process") and cls.process:
++            kill_process_tree(cls.process.pid)
++
++    def _generate(self, text: str) -> dict:
++        """Return meta_info for one greedy single-token request."""
++        response = requests.post(
++            f"{self.base_url}/generate",
++            json={
++                "text": text,
++                "sampling_params": {"temperature": 0, "max_new_tokens": 1},
++            },
++        )
++        self.assertEqual(response.status_code, 200, response.text)
++        return response.json()["meta_info"]
++
++    @staticmethod
++    def _tiers(meta: dict) -> tuple:
++        """(cached, device, host, storage) from one meta_info.
++
++        cached_tokens_details is None when every tier counter is zero -- an absent dict
++        is a legitimate all-zero report, not a missing field.
++        """
++        details = meta.get("cached_tokens_details") or {}
++        return (
++            meta.get("cached_tokens", 0),
++            details.get("device", 0),
++            details.get("host", 0),
++            details.get("storage", 0),
++        )
++
++    def test_1_reuse_long_identical(self):
++        """A long prompt sent twice must hit on the second send."""
++        text = f"Document {self.nonce}. " + "Section 7.4 of the manual. " * 64
++
++        cached, _, _, _ = self._tiers(self._generate(text))
++        self.assertEqual(cached, 0, "first send of a nonced prompt must be a cold miss")
++
++        cached, device, _, _ = self._tiers(self._generate(text))
++        self.assertGreater(cached, 0, "second send must reuse the cached prefix")
++        self.assertGreater(device, 0, "a just-used prefix should still be on device")
++
++    def test_2_no_reuse_shorter_than_one_page(self):
++        """A prompt below page_size cannot be cached: the radix tree stores whole pages."""
++        text = f"who am i {self.nonce}?"
++        for _ in range(2):
++            cached, _, _, _ = self._tiers(self._generate(text))
++            self.assertEqual(cached, 0)
++
++    def test_3_evicted_prefix_returns_from_host(self):
++        """Overflow L1, then prove the prefix comes back from L2 instead of recompute.
++
++        This is the test that exercises the XPU transfer kernels in both directions:
++        write_through pushes the prefix to the host pool, the flood evicts the device
++        copy, and the final request has to load it back.
++        """
++        target = f"Target {self.nonce}. " + "Section 7.4 of the manual. " * 64
++
++        # Populate, and confirm the prefix is genuinely resident before evicting it.
++        self._generate(target)
++        cached, _, _, _ = self._tiers(self._generate(target))
++        self.assertGreater(cached, 0, "precondition: target must be cached before flood")
++
++        # Flood into the window defined at the top of this file. Count what the server
++        # ALLOCATES, not what the client sent: allocation is page-aligned, so a 332-token
++        # filler occupies 384 tokens of pool. Counting prompt_tokens undercounts by ~15%
++        # per request and the flood then overshoots into host-eviction territory.
++        allocated = 0
++        i = 0
++        while allocated < FLOOD_TOKENS:
++            filler = f"Filler {self.nonce} {i}. " + "Unrelated background text. " * 64
++            meta = self._generate(filler)
++            fresh = max(meta.get("prompt_tokens", 0) - meta.get("cached_tokens", 0), 0)
++            allocated += -(-fresh // PAGE_SIZE) * PAGE_SIZE
++            i += 1
++        self.assertLess(
++            allocated,
++            HOST_TOTAL_TOKENS,
++            f"flood allocated {allocated} tokens against a {HOST_TOTAL_TOKENS}-token "
++            "host pool, so a miss below would say nothing about the transfer path",
++        )
++
++        cached, device, host, _ = self._tiers(self._generate(target))
++        self.assertGreater(cached, 0, "evicted prefix was recomputed instead of reloaded")
++        # host > 0 is the whole point. HiCache prefers a device copy whenever one
++        # exists, so host stays 0 unless the device copy really was evicted -- which
++        # makes this assertion, not `cached > 0`, the one that proves L2 was read.
++        self.assertGreater(host, 0, f"expected an L2 hit, got device={device} host={host}")
++
++
++if __name__ == "__main__":
++    unittest.main()
