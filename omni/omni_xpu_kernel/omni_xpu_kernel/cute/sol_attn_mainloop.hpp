@@ -515,6 +515,15 @@ struct SolRouteSharedStorage<
   uint16_t route_column_pairs[QuerySubgroups * BufferCount];
 };
 
+template <bool Enabled, int Groups>
+struct SolSelectedSharedStorage {};
+
+template <int Groups>
+struct SolSelectedSharedStorage<true, Groups> {
+  alignas(64) uint32_t extra_k[64 * 128 / 4];
+  alignas(64) uint32_t extra_v[64 * 128 / 2];
+};
+
 template <
     class DenseMainloop,
     bool CacheableExactKV = (SOL_ATTN_BMG_CACHEABLE_EXACT_KV_LOADS != 0),
@@ -522,7 +531,9 @@ template <
         (SOL_ATTN_PARALLEL_SHARED_INLINE_ROUTE != 0),
     bool CrossQueryRouteColumns =
         (SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS != 0),
-    bool ControlAware = true>
+    bool ControlAware = true,
+    bool PreparedState = false,
+    bool TokenAugmented = false>
 struct SolFwdMainloop : DenseMainloop {
   using Base = DenseMainloop;
   using TiledMMAQK = typename Base::TiledMMAQK;
@@ -543,13 +554,16 @@ struct SolFwdMainloop : DenseMainloop {
   using ElementQ = typename TensorQ::element_type;
   using ElementK = typename TensorK::element_type;
   using ElementV = typename TensorV::element_type;
-  using ElementS = typename Base::ElementS;
+  using ElementS = float;
   using ElementA = typename Base::ElementA;
   using FragA = typename Base::FragA;
   using FragARow = typename Base::FragARow;
-  using FragS = typename Base::FragS;
+  using FragS = remove_cvref_t<decltype(make_subgroup_tensor(
+      make_tensor<ElementS>(typename Base::FragS{}.layout()),
+      typename Base::FragS{}.tv_layout()))>;
   using FragSPartialRow = decltype(
       sol_reduce_vertical<1>(FragS{}, sycl::plus<void>{}));
+  using FragSColumn = decltype(reduce<0>(FragS{}, sycl::plus<void>{}));
 
   using TiledCopyQ = typename Base::TiledCopyQ;
   using TiledCopyK = typename Base::TiledCopyK;
@@ -578,6 +592,7 @@ struct SolFwdMainloop : DenseMainloop {
 
 #if SOL_ATTN_SHARED_INLINE_ROUTE
   struct SharedStorage : BaseSharedStorage,
+      SolSelectedSharedStorage<TokenAugmented, (QueryBlocksPerWorkgroup + 1) / 2>,
       SolRouteSharedStorage<
           RouteMaskSlots,
           QuerySubgroups,
@@ -593,7 +608,8 @@ struct SolFwdMainloop : DenseMainloop {
 #endif
   };
 #else
-  using SharedStorage = BaseSharedStorage;
+  struct SharedStorage : BaseSharedStorage,
+      SolSelectedSharedStorage<TokenAugmented, (QueryBlocksPerWorkgroup + 1) / 2> {};
 #endif
 
   static_assert(BLK_Q % 64 == 0,
@@ -605,8 +621,28 @@ struct SolFwdMainloop : DenseMainloop {
                 "one route-column byte supports at most eight Q64 rows");
   static_assert(!CrossQueryRouteColumns || QuerySubgroups * 2 == BLK_K,
                 "packed route-column pairs require two K64 columns per subgroup");
-  static_assert(std::is_same_v<ElementQ, cutlass::bfloat16_t>,
-                "The initial XPU Sol-Attn CUTE backend is BF16-only");
+  static_assert(std::is_same_v<ElementQ, cutlass::bfloat16_t> ||
+                    (PreparedState && std::is_same_v<ElementQ, int8_t>),
+                "Sol-Attn requires BF16 or prepared INT8 storage");
+  static_assert(!PreparedState || (!ControlAware && !CrossQueryRouteColumns),
+                "prepared routes own their controls and use parallel row owners");
+  static_assert(!TokenAugmented || PreparedState);
+
+  // The prepared API changes storage and route/tail semantics, while retaining
+  // the maintained CUTE MMA and its register-fragment copy/reorder path. Scales
+  // are BH,T for Q/K and BH,D for V. Tail rows are BH,Q64,(max_log2,sum,num[D]);
+  // their numerator is in quantized-V units, prior to the common V scale.
+  struct Prepared {
+    const uint8_t* routes = nullptr;
+    const float* q_scale = nullptr;
+    const float* k_scale = nullptr;
+    const float* v_scale = nullptr;
+    const float* tail_state = nullptr;
+    const int32_t* extra_indices = nullptr;
+    const int32_t* extra_counts = nullptr;
+    const float* key_bias = nullptr;
+    int extra_budget = 0;
+  };
 
   struct Arguments {
     ElementS scale;
@@ -630,6 +666,7 @@ struct SolFwdMainloop : DenseMainloop {
     int blocks;
     int64_t k_stride_batch;
     int64_t k_stride_head;
+    Prepared prepared{};
   };
 
   struct Params {
@@ -654,9 +691,11 @@ struct SolFwdMainloop : DenseMainloop {
     int blocks;
     int64_t k_stride_batch;
     int64_t k_stride_head;
+    Prepared prepared{};
   };
 
   Params sol_params;
+  SharedStorage& selected_shared;
 #if SOL_ATTN_SHARED_INLINE_ROUTE
   SharedStorage& sol_shared;
 #endif
@@ -684,10 +723,19 @@ struct SolFwdMainloop : DenseMainloop {
         args.heads,
         args.blocks,
         args.k_stride_batch,
-        args.k_stride_head};
+        args.k_stride_head,
+        args.prepared};
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args) {
+    if constexpr (PreparedState) {
+      return args.prepared.routes && args.prepared.q_scale &&
+          args.prepared.k_scale && args.prepared.v_scale &&
+          args.prepared.tail_state && args.k_base && args.tokens > 0 &&
+          args.heads > 0 && args.blocks == cute::ceil_div(args.tokens, 64) &&
+          (!TokenAugmented || (args.prepared.extra_indices && args.prepared.extra_counts &&
+              args.prepared.extra_budget > 0 && args.prepared.extra_budget <= 256));
+    }
     return args.k_centroids != nullptr && args.v_means != nullptr &&
 #if SOL_ATTN_INLINE_ROUTE
         args.q_centroids != nullptr && args.thresholds != nullptr &&
@@ -703,16 +751,16 @@ struct SolFwdMainloop : DenseMainloop {
   CUTLASS_HOST_DEVICE
   SolFwdMainloop(Params const& params, SharedStorage& shared)
       : Base(
-            typename Base::Params{params.scale, nullptr, 0, nullptr},
+            typename Base::Params{typename Base::ElementS(params.scale), nullptr, 0, nullptr},
             static_cast<BaseSharedStorage&>(shared)),
-        sol_params(params)
+        sol_params(params), selected_shared(shared)
 #if SOL_ATTN_SHARED_INLINE_ROUTE
         , sol_shared(shared)
 #endif
         {}
 
   CUTLASS_DEVICE
-  auto softmax_deferred_sum(FragS& tS, FragARow& tA_max) {
+  static auto softmax_deferred_sum(FragS& tS, FragARow& tA_max) {
     auto tS_bmax = reduce<1>(tS, sycl::maximum<void>{});
 
     FragARow rescale;
@@ -801,11 +849,11 @@ struct SolFwdMainloop : DenseMainloop {
             make_shape(128, sol_params.blocks),
             make_stride(_1{}, int(128))));
 #if SOL_ATTN_INLINE_ROUTE
-    const float* query_centroid = sol_params.q_centroids +
-        summary_offset + query_block * 128;
-    const float route_threshold =
+    const float* query_centroid = PreparedState ? nullptr :
+        sol_params.q_centroids + summary_offset + query_block * 128;
+    const float route_threshold = PreparedState ? 0.0f :
         sol_params.thresholds[batch_head * sol_params.blocks + query_block];
-    const uint8_t* key_sinks =
+    const uint8_t* key_sinks = PreparedState ? nullptr :
         sol_params.key_sinks + batch_head * sol_params.blocks;
 #else
     const int route_offset =
@@ -825,6 +873,21 @@ struct SolFwdMainloop : DenseMainloop {
     TiledMMAPV mma_pv{};
     auto thr_mma_qk = mma_qk.get_slice(thr_id);
     auto thr_mma_pv = mma_pv.get_slice(thr_id);
+    // The Q scale belongs to one row, independent of every routed K tile.
+    // Use CUTE's row fragment/broadcast mapping, as for online-softmax maxima.
+    FragARow prepared_q_scales;
+    if constexpr (PreparedState) {
+      auto gc = local_tile(make_identity_tensor(make_shape(seq_len, seq_len)),
+          take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), 0));
+      auto coords = thr_mma_qk.partition_C(gc);
+      const int lane = thr_id % cute::intel::sg_size;
+      const int row_base = get<0>(coords(0)) - get<0>(FragS{}.tv_layout()(lane, 0));
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < prepared_q_scales.size(); ++i) {
+        const int row = row_base + lane + i * cute::intel::sg_size;
+        prepared_q_scales(i) = row < seq_len ? sol_params.prepared.q_scale[batch_head * seq_len + row] : 0;
+      }
+    }
     auto tSrQ = thr_mma_qk.partition_sg_fragment_A(gQ(_, _, 0));
     std::array<decltype(tSrQ), DTiles> tSrQ_arr;
     FragSPartialRow tA_partial_sum;
@@ -947,7 +1010,12 @@ struct SolFwdMainloop : DenseMainloop {
     decltype(tKrK) tKrK_next{};
 #endif
     Tensor cP = make_identity_tensor(take<0, 2>(TileShapeQK{}));
-    auto tSrS = thr_mma_qk.partition_sg_fragment_C(cP);
+    FragS tSrS;
+    typename Base::FragS tSrS_integer;
+    auto& qk_accumulator = [&]() -> auto& {
+      if constexpr (PreparedState) return tSrS_integer;
+      else return tSrS;
+    }();
     auto tArP = thr_mma_pv.partition_sg_fragment_A(cP);
     auto tVrV = thr_copy_v_exact.partition_sg_fragment_D(
         gV_exact_split(_, _, 0, 0));
@@ -1013,6 +1081,11 @@ struct SolFwdMainloop : DenseMainloop {
     }
 #endif
     auto route_block = [&](int key_block) {
+      if constexpr (PreparedState) {
+        return sol_params.prepared.routes[
+            (batch_head * sol_params.blocks + query_block) *
+                sol_params.blocks + key_block] != 0;
+      } else {
       const int distance = query_block > key_block
           ? query_block - key_block
           : key_block - query_block;
@@ -1071,6 +1144,7 @@ struct SolFwdMainloop : DenseMainloop {
       const float score = sycl::reduce_over_group(
           sg, partial, sycl::plus<float>()) * sol_params.scale;
       return score > route_threshold;
+      }
     };
 #if SOL_ATTN_CROSS_QUERY_ROUTE_COLUMNS
     auto route_columns_for_key = [&](int key_block) {
@@ -1150,26 +1224,65 @@ struct SolFwdMainloop : DenseMainloop {
 #endif
 #endif
 
-    auto process_tile = [&](auto& copy_k, auto& copy_v, auto& tKgK,
+    auto selected_key = [&](int slot) {
+      if constexpr (TokenAugmented) {
+        const int group = batch_head * cute::ceil_div(sol_params.blocks, 2) + query_block / 2;
+        const int count = cute::min(sol_params.prepared.extra_budget,
+            cute::max(0, sol_params.prepared.extra_counts[group]));
+        if (slot >= count) return -1;
+        const int key = sol_params.prepared.extra_indices[group * sol_params.prepared.extra_budget + slot];
+        return key >= 0 && key < seq_len ? key : -1;
+      } else return -1;
+    };
+    auto process_tile = [&](auto selected_kind, auto& copy_k, auto& copy_v, auto& tKgK,
                             auto& tVgV, int tile_index, bool approximate,
                             uint64_t route_mask, int route_begin) {
-      clear(tSrS);
+      constexpr bool Selected = decltype(selected_kind)::value;
+      // The same bounded column vector feeds scale/bias masking and indexed
+      // K/V fragment loads for the individually selected tokens.
+      FragSColumn prepared_k_scales, prepared_key_bias;
+      if constexpr (PreparedState) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < prepared_k_scales.size(); ++i) {
+          const int slot = tile_index * BLK_K + int(sg.get_local_linear_id()) + i * cute::intel::sg_size;
+          const int key = Selected ? selected_key(slot) : (slot < seq_len ? slot : -1);
+          prepared_k_scales(i) = key >= 0 ? sol_params.prepared.k_scale[batch_head * seq_len + key] : 0;
+          prepared_key_bias(i) = key >= 0 && sol_params.prepared.key_bias != nullptr ?
+              sol_params.prepared.key_bias[int64_t(l_coord) * seq_len + key] : 0;
+        }
+      }
+      clear(qk_accumulator);
       constexpr int kAtomsPerD =
           decltype(get<2>(TileShapeQK{}))::value /
           decltype(get<2>(typename TiledMMAQK::AtomShape_MNK{}))::value;
       auto consume_qk_fragment = [&](int d) {
         auto const& tSrQ_d = tSrQ_arr[d];
         if (d == 0) {
-          cute::gemm(mma_qk, tSrQ_d(_, _, 0), tSrK(_, _, 0), tSrS);
+          cute::gemm(mma_qk, tSrQ_d(_, _, 0), tSrK(_, _, 0), qk_accumulator);
           CUTLASS_PRAGMA_UNROLL
           for (int atom = 1; atom < kAtomsPerD; ++atom) {
             cute::gemm(
-                mma_qk, tSrQ_d(_, _, atom), tSrK(_, _, atom), tSrS);
+                mma_qk, tSrQ_d(_, _, atom), tSrK(_, _, atom), qk_accumulator);
           }
         } else {
-          cute::gemm(mma_qk, tSrQ_d, tSrK, tSrS);
+          cute::gemm(mma_qk, tSrQ_d, tSrK, qk_accumulator);
         }
       };
+      if constexpr (Selected) {
+        auto& selected_slm = static_cast<SolSelectedSharedStorage<
+            Selected, (QueryBlocksPerWorkgroup + 1) / 2>&>(selected_shared);
+        auto packed_k = recast<uint32_t>(tSrK);
+        constexpr int Words = decltype(packed_k.size())::value;
+        CUTLASS_PRAGMA_UNROLL
+        for (int d = 0; d < DTiles; ++d) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < Words; ++i) {
+            packed_k(i) = selected_slm.extra_k[
+                (d * Words + i) * 16 + sg.get_local_linear_id()];
+          }
+          consume_qk_fragment(d);
+        }
+      } else {
 #if SOL_ATTN_REGISTER_PIPELINE_EXACT_K
       if (!approximate) {
         copy(copy_k, tKgK(_, _, _, tile_index, 0), tKrK);
@@ -1195,6 +1308,7 @@ struct SolFwdMainloop : DenseMainloop {
 #if SOL_ATTN_REGISTER_PIPELINE_EXACT_K
       }
 #endif
+      }
 
 #if SOL_ATTN_STAGGER_ROUTED_K_PREFETCH
       if (!approximate && deferred_k_prefetch_block >= 0) {
@@ -1206,7 +1320,12 @@ struct SolFwdMainloop : DenseMainloop {
       }
 #endif
 
-      const int key_extent = approximate ? sol_params.blocks : seq_len;
+      if constexpr (PreparedState) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tSrS.size(); ++i) tSrS(i) = float(qk_accumulator(i));
+      }
+      const int key_extent = Selected ? sol_params.prepared.extra_budget :
+          (approximate ? sol_params.blocks : seq_len);
       Tensor cScores = make_identity_tensor(make_shape(seq_len, key_extent));
       Tensor gScores = local_tile(
           cScores, take<0, 2>(TileShapeQK{}),
@@ -1223,8 +1342,10 @@ struct SolFwdMainloop : DenseMainloop {
             ElementS(sycl::log2(static_cast<float>(tail_block_length)));
       }
 #endif
-      auto exact_key_is_masked = [&](int key) {
-        if constexpr (ControlAware) {
+      auto exact_key_is_masked = [&](int key, int score_index) {
+        if constexpr (PreparedState) {
+          return broadcast<1>(prepared_k_scales, tSrS, score_index) == 0;
+        } else if constexpr (ControlAware) {
           return sol_params.block_lengths != nullptr &&
               key % 64 >= block_length_of(key / 64);
         } else {
@@ -1236,7 +1357,7 @@ struct SolFwdMainloop : DenseMainloop {
         const int key = get<1>(score_coords(i));
         if (key >= key_extent) {
           tSrS(i) = ElementS(-INFINITY);
-        } else if (!approximate && exact_key_is_masked(key)) {
+        } else if (!approximate && exact_key_is_masked(key, i)) {
           tSrS(i) = ElementS(-INFINITY);
 #if SOL_ATTN_INLINE_ROUTE
         } else if (approximate &&
@@ -1250,6 +1371,12 @@ struct SolFwdMainloop : DenseMainloop {
           // per-key log-bias even when the caller deliberately sets the QK
           // scale to zero.
           tSrS(i) *= sol_params.scale;
+          if constexpr (PreparedState) {
+            tSrS(i) *= broadcast<0>(prepared_q_scales, tSrS, i) *
+                broadcast<1>(prepared_k_scales, tSrS, i);
+            if (sol_params.prepared.key_bias != nullptr)
+              tSrS(i) += broadcast<1>(prepared_key_bias, tSrS, i);
+          }
           if constexpr (ControlAware) {
             if (!approximate && sol_params.key_bias != nullptr) {
               tSrS(i) += ElementS(
@@ -1292,8 +1419,20 @@ struct SolFwdMainloop : DenseMainloop {
 
       CUTLASS_PRAGMA_UNROLL
       for (int vv = 0; vv < VTiles; ++vv) {
-        copy(copy_v, tVgV(_, _, _, vv, tile_index), tVrV);
-        reorder(tVrV, tArV);
+        if constexpr (Selected) {
+          auto& selected_slm = static_cast<SolSelectedSharedStorage<
+              Selected, (QueryBlocksPerWorkgroup + 1) / 2>&>(selected_shared);
+          auto packed_v = recast<uint32_t>(tArV);
+          constexpr int Words = decltype(packed_v.size())::value;
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < Words; ++i) {
+            packed_v(i) = selected_slm.extra_v[
+                (vv * Words + i) * 16 + sg.get_local_linear_id()];
+          }
+        } else {
+          copy(copy_v, tVgV(_, _, _, vv, tile_index), tVrV);
+          reorder(tVrV, tArV);
+        }
         CUTLASS_PRAGMA_UNROLL
         for (int i = tArA.size() / VTiles - 1; i >= 0; --i) {
           tArA(_, _, _, vv)(i) *= broadcast<0>(rescale, tArA, i);
@@ -1530,15 +1669,16 @@ struct SolFwdMainloop : DenseMainloop {
         }
       }
 #endif
-      if constexpr (ControlAware) {
+      if constexpr (PreparedState) {
+        // The new API supplies its query-group tail explicitly. Do not mix it
+        // with the old per-token query-to-block-centroid approximation.
+      } else if constexpr (ControlAware) {
         if (sol_params.tail && has_approximate) {
-          process_tile(
-              copy_k_summary, copy_v_summary, tKgK_summary, tVgV_summary,
+          process_tile(C<false>{}, copy_k_summary, copy_v_summary, tKgK_summary, tVgV_summary,
               tile, true, route_mask, begin);
         }
       } else if (has_approximate) {
-        process_tile(
-            copy_k_summary, copy_v_summary, tKgK_summary, tVgV_summary,
+        process_tile(C<false>{}, copy_k_summary, copy_v_summary, tKgK_summary, tVgV_summary,
             tile, true, route_mask, begin);
       }
 #if SOL_ATTN_INLINE_ROUTE
@@ -1570,8 +1710,7 @@ struct SolFwdMainloop : DenseMainloop {
           }
         }
         if ((route_mask >> (block - begin)) & uint64_t(1)) {
-          process_tile(
-              copy_k_exact, copy_v_exact, tKgK_exact, tVgV_exact,
+          process_tile(C<false>{}, copy_k_exact, copy_v_exact, tKgK_exact, tVgV_exact,
               block, false, 0, 0);
 #if SOL_ATTN_STAGGER_ROUTED_K_PREFETCH
         } else if (deferred_k_prefetch_block >= 0) {
@@ -1585,8 +1724,7 @@ struct SolFwdMainloop : DenseMainloop {
 #else
       for (int block = begin; block < end; ++block) {
         if ((route_mask >> (block - begin)) & uint64_t(1)) {
-          process_tile(
-              copy_k_exact, copy_v_exact, tKgK_exact, tVgV_exact,
+          process_tile(C<false>{}, copy_k_exact, copy_v_exact, tKgK_exact, tVgV_exact,
               block, false, 0, 0);
         }
       }
@@ -1594,8 +1732,7 @@ struct SolFwdMainloop : DenseMainloop {
 #elif SOL_ATTN_NESTED_EXACT
       for (int block = begin; block < end; ++block) {
         if (route[block] != 0) {
-          process_tile(
-              copy_k_exact, copy_v_exact, tKgK_exact, tVgV_exact,
+          process_tile(C<false>{}, copy_k_exact, copy_v_exact, tKgK_exact, tVgV_exact,
               block, false, 0, 0);
         }
       }
@@ -1605,15 +1742,104 @@ struct SolFwdMainloop : DenseMainloop {
 #if !SOL_ATTN_INLINE_ROUTE && !SOL_ATTN_NESTED_EXACT
     for (int block = 0; block < sol_params.blocks; ++block) {
       if (route[block] != 0) {
-        process_tile(
-            copy_k_exact, copy_v_exact, tKgK_exact, tVgV_exact,
+        process_tile(C<false>{}, copy_k_exact, copy_v_exact, tKgK_exact, tVgV_exact,
             block, false, 0, 0);
       }
     }
 #endif
 
+    if constexpr (TokenAugmented) {
+      constexpr int Groups = (QueryBlocksPerWorkgroup + 1) / 2;
+      const int groups_per_head = cute::ceil_div(sol_params.blocks, 2);
+      const int first_group = int(get<0>(blk_qv)) * QueryBlocksPerWorkgroup / 2;
+      const int group = batch_head * groups_per_head + query_block / 2;
+      const int count = cute::min(sol_params.prepared.extra_budget,
+          cute::max(0, sol_params.prepared.extra_counts[group]));
+      for (int local_group = 0; local_group < Groups; ++local_group) {
+        if (first_group + local_group >= groups_per_head) break;
+        const int group_index = batch_head * groups_per_head + first_group + local_group;
+        const int group_count = cute::min(sol_params.prepared.extra_budget,
+            cute::max(0, sol_params.prepared.extra_counts[group_index]));
+        for (int slot = 0; slot < group_count; slot += BLK_K) {
+          sycl::group_barrier(get_work_group<3>());
+          // K is stored in INT8 MMA word order. V is converted exactly to
+          // FP16 while staging, eliminating a second full V register fragment.
+          constexpr int KWords = decltype(tSrK.size())::value / 4;
+          constexpr int VWords = decltype(tArV.size())::value / 2;
+          static_assert(DTiles * KWords * 16 == BLK_K * 128 / 4);
+          static_assert(VTiles * VWords * 16 == BLK_K * 128 / 2);
+          const auto ktv = tSrK.tv_layout();
+          const auto vtv = tArV.tv_layout();
+          for (int part = thr_id; part < DTiles * KWords * 16; part += QuerySubgroups * 16) {
+            const int lane = part % 16, word = (part / 16) % KWords;
+            const int depth = part / (16 * KWords);
+            uint32_t packed = 0;
+            CUTLASS_PRAGMA_UNROLL
+            for (int byte = 0; byte < 4; ++byte) {
+              const auto coord = ktv(lane, word * 4 + byte);
+              const int key_slot = slot + get<0>(coord);
+              const int dim = depth * get<2>(TileShapeQK{}) + get<1>(coord);
+              int key = key_slot < group_count ? sol_params.prepared.extra_indices[
+                  group_index * sol_params.prepared.extra_budget + key_slot] : -1;
+              if (key < 0 || key >= seq_len) key = -1;
+              const uint8_t value = key >= 0 ? uint8_t(K_2D(key, dim)) : 0;
+              packed |= uint32_t(value) << (byte * 8);
+            }
+            selected_shared.extra_k[part] = packed;
+          }
+          for (int part = thr_id; part < VTiles * VWords * 16; part += QuerySubgroups * 16) {
+            const int lane = part % 16, word = (part / 16) % VWords;
+            const int feature = part / (16 * VWords);
+            uint32_t packed = 0;
+            CUTLASS_PRAGMA_UNROLL
+            for (int half = 0; half < 2; ++half) {
+              const auto coord = vtv(lane, word * 2 + half);
+              const int key_slot = slot + get<1>(coord);
+              const int dim = feature * get<1>(TileShapePV{}) + get<0>(coord);
+              int key = key_slot < group_count ? sol_params.prepared.extra_indices[
+                  group_index * sol_params.prepared.extra_budget + key_slot] : -1;
+              if (key < 0 || key >= seq_len) key = -1;
+              const sycl::half value = key >= 0 ? sycl::half(int(V_2D(dim, key))) : sycl::half(0);
+              packed |= uint32_t(sycl::bit_cast<uint16_t>(value)) << (half * 16);
+            }
+            selected_shared.extra_v[part] = packed;
+          }
+          sycl::group_barrier(get_work_group<3>());
+          if (query_block / 2 == first_group + local_group && slot < count) {
+            process_tile(C<true>{}, copy_k_exact, copy_v_exact, tKgK_exact, tVgV_exact,
+                slot / BLK_K, false, 0, 0);
+          }
+        }
+      }
+    }
     auto tA_sum_full =
         sol_reduce_horizontal(tA_partial_sum, sycl::plus<void>{});
+    if constexpr (PreparedState) {
+      const float* tail = sol_params.prepared.tail_state +
+          (batch_head * sol_params.blocks + query_block) * 130;
+      const float tail_sum = tail[1];
+      FragARow exact_rescale, tail_rescale;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tA_max.size(); ++i) {
+        const float maximum = tail_sum > 0 ? sycl::max(tA_max(i), tail[0]) : tA_max(i);
+        exact_rescale(i) = tA_sum_full(i) > 0 ? sycl::native::exp2(tA_max(i) - maximum) : 0;
+        tail_rescale(i) = tail_sum > 0 ? sycl::native::exp2(tail[0] - maximum) : 0;
+        tA_max(i) = maximum;
+        tA_sum_full(i) = tA_sum_full(i) * exact_rescale(i) + tail_sum * tail_rescale(i);
+      }
+      Tensor cOutput = make_identity_tensor(make_shape(seq_len, 128));
+      Tensor gOutput = local_tile(
+          cOutput, make_shape(get<0>(TileShapeQK{}), get<1>(tile_shape_v)),
+          make_coord(get<0>(blk_qv), get<1>(blk_qv)));
+      auto output_coords = thr_mma_pv.partition_C(gOutput);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tArA.size(); ++i) {
+        const int dim = get<1>(output_coords(i));
+        tArA(i) = (tArA(i) * broadcast<0>(exact_rescale, tArA, i) +
+            tail[2 + dim] * broadcast<0>(tail_rescale, tArA, i)) *
+            sol_params.prepared.v_scale[batch_head * 128 + dim];
+      }
+    }
     static_assert(
         decltype(tA_sum_full.size())::value ==
         decltype(tA_sum.size())::value);

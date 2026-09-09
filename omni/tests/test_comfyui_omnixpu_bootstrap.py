@@ -107,6 +107,7 @@ def test_disabled_components_are_reported_without_importing_modules(monkeypatch)
     patches = _load_registry(monkeypatch)
     cfg = types.SimpleNamespace(
         attention=False,
+        sparse_attention=False,
         rotary=False,
         norm=False,
         h3_rms_modulation=False,

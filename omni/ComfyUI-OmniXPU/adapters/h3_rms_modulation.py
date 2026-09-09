@@ -51,6 +51,15 @@ def _forward_api_reason(function: Callable[..., Any]) -> str:
         "self", "x", "t_emb", "mod_segments", "rope_freqs",
         "transformer_options",
     )
+    if len(parameters) == len(names) + 1:
+        attention = parameters[-1]
+        if (
+            attention.name != "attention"
+            or attention.default is not None
+            or attention.kind != inspect.Parameter.POSITIONAL_OR_KEYWORD
+        ):
+            return "MiniMax H3 DiTBlock.forward API is unsupported"
+        parameters = parameters[:-1]
     if (
         tuple(parameter.name for parameter in parameters) != names
         or any(
@@ -268,6 +277,7 @@ def apply():
         return False, reason
 
     _omni_norm = candidate
+    accepts_attention = "attention" in inspect.signature(original).parameters
 
     @wraps(original)
     def patched(
@@ -277,7 +287,11 @@ def apply():
         mod_segments,
         rope_freqs,
         transformer_options={},
+        attention=None,
     ):
+        attention_kwargs = {"attention": attention} if accepts_attention else {}
+        if attention is not None and not accepts_attention:
+            raise TypeError("this MiniMax H3 forward API has no attention override")
         if not policy_supported(x):
             return original(
                 self,
@@ -286,6 +300,7 @@ def apply():
                 mod_segments,
                 rope_freqs,
                 transformer_options=transformer_options,
+                **attention_kwargs,
             )
 
         reason = _block_input_reason(self, x, mod_segments)
@@ -298,6 +313,7 @@ def apply():
                 mod_segments,
                 rope_freqs,
                 transformer_options=transformer_options,
+                **attention_kwargs,
             )
 
         modulation = self.adaln_proj(t_emb)
@@ -325,7 +341,7 @@ def apply():
         x = h3_model._mod_gate(
             x,
             gate_msa,
-            self.attn(
+            (self.attn if attention is None else attention)(
                 h,
                 rope_freqs=rope_freqs,
                 transformer_options=transformer_options,

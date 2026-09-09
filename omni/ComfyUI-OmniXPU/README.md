@@ -92,6 +92,7 @@ for unsupported inputs:
 ```bash
 OMNIXPU_ENABLE=0            # Disable every custom-node component
 OMNIXPU_ATTENTION=0         # Disable the attention adapter
+OMNIXPU_SPARSE_ATTENTION=0  # Disable XPU eligibility for Model Sparse Attention
 OMNIXPU_NORM=0              # Disable the norm adapter
 OMNIXPU_FP8_GEMM=0          # Disable the temporary FP8 model/factory adapter
 OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
@@ -142,6 +143,16 @@ OMNIXPU_MEDIAN_STRICT_INDICES=1
 `OMNIXPU_MEDIAN_STRICT_INDICES=1` reproduces the exact tie-break indices. The
 median workaround was only verified on BMG with Torch 2.10 and remains
 disabled by default on other configurations.
+
+## Model Sparse Attention
+
+With a matching native Sol sidecar, the upstream **Model Sparse Attention**
+node can select XPU tensors. Its generic Sol/SLA path and MiniMax-H3 chunked
+producer call Kitchen's public APIs. The upstream node owns block selection,
+4096-token projection chunks, previous-step statistics, VSA tiling and cleanup.
+The adapter only extends its device eligibility checks. An unavailable native
+API or an unsupported upstream eligibility contract leaves the original node
+behavior in place.
 
 ## Native compiled inference
 

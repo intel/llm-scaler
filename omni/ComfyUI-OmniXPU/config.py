@@ -11,6 +11,7 @@ class Config:
     def __init__(self):
         master = os.environ.get("OMNIXPU_ENABLE", "1") != "0"
         self.attention = master and os.environ.get("OMNIXPU_ATTENTION", "1") != "0"
+        self.sparse_attention = master and os.environ.get("OMNIXPU_SPARSE_ATTENTION", "1") != "0"
         self.rotary = master and os.environ.get("OMNIXPU_ROTARY", "1") != "0"
         self.norm = master and os.environ.get("OMNIXPU_NORM", "1") != "0"
         self.h3_rms_modulation = (

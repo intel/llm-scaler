@@ -23,6 +23,13 @@ class Component:
 # registration, capability checks, dispatch, and eager fallback.
 COMPONENTS = (
     Component(
+        "sparse_attention_adapter",
+        "sparse_attention",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/sparse_attention.py",
+    ),
+    Component(
         "attention_adapter",
         "attention",
         "adapter",
