@@ -47,16 +47,17 @@ namespace qsa_token_split_candidate {
 // previous anonymous lambdas were valid SYCL kernels, but their generated
 // names were not stable/visible in UnitTrace, which made it impossible to
 // distinguish a real candidate launch from an integration/fallback issue.
-template <int TokensPerPartial, int PartialCount, int PageSize>
+template <int QueryHeads, int TokensPerPartial, int PartialCount, int PageSize>
 class QsaTokenSplitPhase0Kernel;
 
-template <int PartialCount>
+template <int QueryHeads, int PartialCount>
 class QsaTokenSplitPhase1Kernel;
 
 template <int TokensPerPartial, int PartialCount>
 class QsaTokenSplitFusedKernel;
 
 constexpr int HEADS = 3;
+constexpr int Q6_HEADS = 6;
 constexpr int HD = 256;
 constexpr int DIM_BLOCKS = HD / 16;
 constexpr int SLOT_COUNT = 2051;
@@ -151,7 +152,8 @@ ESIMD_INLINE void prefetch_slot(const fp16* packed_kv,
 // interval.  Invalid slots use a safe address but are masked before the
 // online-softmax update; duplicate valid slots are intentionally processed
 // independently and in their original order.
-template <int TokensPerPartial, int PartialCount, int PageSize = PAGE_SIZE>
+template <int QueryHeads, int TokensPerPartial, int PartialCount,
+          int PageSize = PAGE_SIZE>
 void sparse_attention_token_split_candidate__phase0_impl(
     sycl::queue& queue, const fp16* q_in, const fp16* packed_kv,
     const int* logical_indices, const int* block_table,
@@ -162,15 +164,15 @@ void sparse_attention_token_split_candidate__phase0_impl(
   static_assert(PageSize == 256 || PageSize == 512,
                 "phase 0 supports only page sizes 256 and 512");
   queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for<QsaTokenSplitPhase0Kernel<TokensPerPartial,
+    cgh.parallel_for<QsaTokenSplitPhase0Kernel<QueryHeads, TokensPerPartial,
                                                PartialCount, PageSize>>(
         sycl::nd_range<1>(
-            sycl::range<1>(rows * HEADS * PartialCount),
+            sycl::range<1>(rows * QueryHeads * PartialCount),
             sycl::range<1>(1)),
         [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
           const int gid = static_cast<int>(item.get_global_id(0));
-          const int row = gid / (HEADS * PartialCount);
-          const int row_gid = gid - row * HEADS * PartialCount;
+          const int row = gid / (QueryHeads * PartialCount);
+          const int row_gid = gid - row * QueryHeads * PartialCount;
           const int head = row_gid / PartialCount;
           const int partial_id = row_gid - head * PartialCount;
           const int slot_start = partial_id * TokensPerPartial;
@@ -182,7 +184,7 @@ void sparse_attention_token_split_candidate__phase0_impl(
           #pragma unroll
           for (int db = 0; db < DIM_BLOCKS; ++db) {
             simd<fp16, 16> q_half = block_load<fp16, 16>(
-                q_in + row * HEADS * HD + head * HD + db * 16);
+                q_in + row * QueryHeads * HD + head * HD + db * 16);
             q_vec[db] = q_half;
             accum[db] = 0.0f;
           }
@@ -302,7 +304,7 @@ extern "C" void sparse_attention_token_split_candidate__phase0(
     const int partial_row_stride, const int partial_head_stride,
     fp32* partials) {
   sparse_attention_token_split_candidate__phase0_impl<
-      TOKENS_PER_PARTIAL_VALUE, PARTIAL_COUNT>(
+      HEADS, TOKENS_PER_PARTIAL_VALUE, PARTIAL_COUNT>(
       queue, q_in, packed_kv, logical_indices, block_table, token_to_req,
       block_table_stride, rows, block_table_rows, physical_pages,
       partial_row_stride, partial_head_stride, partials);
@@ -316,7 +318,7 @@ extern "C" void sparse_attention_token_split_candidate__phase0_batch(
     const int partial_row_stride, const int partial_head_stride,
     fp32* partials) {
   sparse_attention_token_split_candidate__phase0_impl<
-      BATCH_TOKENS_PER_PARTIAL, BATCH_PARTIAL_COUNT>(
+      HEADS, BATCH_TOKENS_PER_PARTIAL, BATCH_PARTIAL_COUNT>(
       queue, q_in, packed_kv, logical_indices, block_table, token_to_req,
       block_table_stride, rows, block_table_rows, physical_pages,
       partial_row_stride, partial_head_stride, partials);
@@ -324,17 +326,17 @@ extern "C" void sparse_attention_token_split_candidate__phase0_batch(
 
 // Phase 1 merges all partial online-softmax states per query head.  A phase-0
 // partial stores (max, sum_exp, weighted_value[HD]); the correction is exp2(mi-m).
-template <int MergePartialCount>
+template <int QueryHeads, int MergePartialCount>
 void sparse_attention_token_split_candidate__phase1_impl(
     sycl::queue& queue, fp16* output, const fp32* partials, const int rows,
     const int partial_row_stride, const int partial_head_stride) {
   queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for<QsaTokenSplitPhase1Kernel<MergePartialCount>>(
-        sycl::nd_range<1>(sycl::range<1>(rows * HEADS), sycl::range<1>(1)),
+    cgh.parallel_for<QsaTokenSplitPhase1Kernel<QueryHeads, MergePartialCount>>(
+        sycl::nd_range<1>(sycl::range<1>(rows * QueryHeads), sycl::range<1>(1)),
         [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
           const int gid = static_cast<int>(item.get_global_id(0));
-          const int row = gid / HEADS;
-          const int head = gid - row * HEADS;
+          const int row = gid / QueryHeads;
+          const int head = gid - row * QueryHeads;
           fp32 global_max = NEG_SENTINEL;
           #pragma unroll
           for (int p = 0; p < MergePartialCount; ++p) {
@@ -380,7 +382,8 @@ void sparse_attention_token_split_candidate__phase1_impl(
             simd<fp32, 16> normalized = merged[db] * inv_sum;
             simd<fp16, 16> out_half = normalized;
             block_store<fp16, 16>(
-                output + row * HEADS * HD + head * HD + db * 16, out_half);
+                output + row * QueryHeads * HD + head * HD + db * 16,
+                out_half);
           }
         });
   });
@@ -389,14 +392,15 @@ void sparse_attention_token_split_candidate__phase1_impl(
 extern "C" void sparse_attention_token_split_candidate__phase1(
     sycl::queue& queue, fp16* output, const fp32* partials, const int rows,
     const int partial_row_stride, const int partial_head_stride) {
-  sparse_attention_token_split_candidate__phase1_impl<PARTIAL_COUNT>(
+  sparse_attention_token_split_candidate__phase1_impl<HEADS, PARTIAL_COUNT>(
       queue, output, partials, rows, partial_row_stride, partial_head_stride);
 }
 
 extern "C" void sparse_attention_token_split_candidate__phase1_batch(
     sycl::queue& queue, fp16* output, const fp32* partials, const int rows,
     const int partial_row_stride, const int partial_head_stride) {
-  sparse_attention_token_split_candidate__phase1_impl<BATCH_PARTIAL_COUNT>(
+  sparse_attention_token_split_candidate__phase1_impl<HEADS,
+                                                       BATCH_PARTIAL_COUNT>(
       queue, output, partials, rows, partial_row_stride, partial_head_stride);
 }
 
@@ -693,7 +697,8 @@ namespace {
 
 // Default instantiation preserves the legacy v2/v4 page-256 contract.  Only
 // the caller-owned v3 entry below opts into the page-512 phase-0 kernels.
-template <int PageSize = qsa_token_split_candidate::PAGE_SIZE>
+template <int QueryHeads,
+          int PageSize = qsa_token_split_candidate::PAGE_SIZE>
 at::Tensor run_token_split_candidate(
     const at::Tensor& q,
     const at::Tensor& packed_kv,
@@ -734,10 +739,12 @@ at::Tensor run_token_split_candidate(
   check_contiguous(token_to_req, "token_to_req");
   check_contiguous(output, "output");
   check_contiguous(token_split_partials, "token_split_partials");
+  static_assert(QueryHeads == qsa_token_split_candidate::HEADS ||
+                QueryHeads == qsa_token_split_candidate::Q6_HEADS);
   TORCH_CHECK(q.dim() == 3 && q.size(0) > 0 && q.size(0) <=
-                  qsa_token_split_candidate::MAX_ROWS && q.size(1) == 3 &&
-                  q.size(2) == 256,
-              "q must have shape [1..128,3,256]");
+                  qsa_token_split_candidate::MAX_ROWS &&
+                  q.size(1) == QueryHeads && q.size(2) == 256,
+              "q must have shape [1..128,", QueryHeads, ",256]");
   TORCH_CHECK(page_size == PageSize,
               "candidate requires page_size=", PageSize);
   TORCH_CHECK(packed_kv.dim() == 4 && packed_kv.size(0) > 0 &&
@@ -786,45 +793,66 @@ at::Tensor run_token_split_candidate(
   const int physical_pages = static_cast<int>(packed_kv.size(0));
 
   if (fused) {
-    qsa_token_split_candidate::sparse_attention_token_split_candidate__fused(
-        queue, q_ptr, packed_ptr, indices_ptr, table_ptr, request_ptr,
-        block_table_stride, rows, block_table_rows, physical_pages,
-        partial_row_stride, partial_head_stride, output_ptr, partial_ptr,
-        reinterpret_cast<uint32_t*>(ready_counters), ready_epoch);
+    if constexpr (QueryHeads == qsa_token_split_candidate::HEADS) {
+      qsa_token_split_candidate::sparse_attention_token_split_candidate__fused(
+          queue, q_ptr, packed_ptr, indices_ptr, table_ptr, request_ptr,
+          block_table_stride, rows, block_table_rows, physical_pages,
+          partial_row_stride, partial_head_stride, output_ptr, partial_ptr,
+          reinterpret_cast<uint32_t*>(ready_counters), ready_epoch);
+    } else {
+      TORCH_CHECK(false, "fused token-split supports only q3");
+    }
   } else if (rows >= 2 && rows <= qsa_token_split_candidate::BATCH_OPT_MAX_ROWS) {
-    if constexpr (PageSize == 256) {
+    if constexpr (QueryHeads == qsa_token_split_candidate::HEADS &&
+                  PageSize == 256) {
       qsa_token_split_candidate::sparse_attention_token_split_candidate__phase0_batch(
           queue, q_ptr, packed_ptr, indices_ptr, table_ptr, request_ptr,
           block_table_stride, rows, block_table_rows, physical_pages,
           partial_row_stride, partial_head_stride, partial_ptr);
     } else {
       qsa_token_split_candidate::sparse_attention_token_split_candidate__phase0_impl<
+          QueryHeads,
           qsa_token_split_candidate::BATCH_TOKENS_PER_PARTIAL,
           qsa_token_split_candidate::BATCH_PARTIAL_COUNT, PageSize>(
           queue, q_ptr, packed_ptr, indices_ptr, table_ptr, request_ptr,
           block_table_stride, rows, block_table_rows, physical_pages,
           partial_row_stride, partial_head_stride, partial_ptr);
     }
-    qsa_token_split_candidate::sparse_attention_token_split_candidate__phase1_batch(
-        queue, output_ptr, partial_ptr, rows, partial_row_stride,
-        partial_head_stride);
+    if constexpr (QueryHeads == qsa_token_split_candidate::HEADS) {
+      qsa_token_split_candidate::sparse_attention_token_split_candidate__phase1_batch(
+          queue, output_ptr, partial_ptr, rows, partial_row_stride,
+          partial_head_stride);
+    } else {
+      qsa_token_split_candidate::sparse_attention_token_split_candidate__phase1_impl<
+          QueryHeads, qsa_token_split_candidate::BATCH_PARTIAL_COUNT>(
+          queue, output_ptr, partial_ptr, rows, partial_row_stride,
+          partial_head_stride);
+    }
   } else {
-    if constexpr (PageSize == 256) {
+    if constexpr (QueryHeads == qsa_token_split_candidate::HEADS &&
+                  PageSize == 256) {
       qsa_token_split_candidate::sparse_attention_token_split_candidate__phase0(
           queue, q_ptr, packed_ptr, indices_ptr, table_ptr, request_ptr,
           block_table_stride, rows, block_table_rows, physical_pages,
           partial_row_stride, partial_head_stride, partial_ptr);
     } else {
       qsa_token_split_candidate::sparse_attention_token_split_candidate__phase0_impl<
-          TOKENS_PER_PARTIAL_VALUE, qsa_token_split_candidate::PARTIAL_COUNT,
-          PageSize>(
+          QueryHeads, TOKENS_PER_PARTIAL_VALUE,
+          qsa_token_split_candidate::PARTIAL_COUNT, PageSize>(
           queue, q_ptr, packed_ptr, indices_ptr, table_ptr, request_ptr,
           block_table_stride, rows, block_table_rows, physical_pages,
           partial_row_stride, partial_head_stride, partial_ptr);
     }
-    qsa_token_split_candidate::sparse_attention_token_split_candidate__phase1(
-        queue, output_ptr, partial_ptr, rows, partial_row_stride,
-        partial_head_stride);
+    if constexpr (QueryHeads == qsa_token_split_candidate::HEADS) {
+      qsa_token_split_candidate::sparse_attention_token_split_candidate__phase1(
+          queue, output_ptr, partial_ptr, rows, partial_row_stride,
+          partial_head_stride);
+    } else {
+      qsa_token_split_candidate::sparse_attention_token_split_candidate__phase1_impl<
+          QueryHeads, qsa_token_split_candidate::PARTIAL_COUNT>(
+          queue, output_ptr, partial_ptr, rows, partial_row_stride,
+          partial_head_stride);
+    }
   }
   return output;
 }
@@ -847,7 +875,7 @@ at::Tensor sparse_attention_token_split_candidate_v2(
                   token_split_partials.size(1) == qsa_token_split_candidate::SLOT_COUNT &&
                   token_split_partials.size(2) == qsa_token_split_candidate::PARTIAL_STRIDE,
               "v2 partials must have shape [3,2051,258]");
-  return run_token_split_candidate(
+  return run_token_split_candidate<qsa_token_split_candidate::HEADS>(
       q, packed_kv, logical_indices, block_table, token_to_req, page_size,
       output, token_split_partials,
       3 * qsa_token_split_candidate::SLOT_COUNT *
@@ -881,7 +909,7 @@ at::Tensor sparse_attention_token_split_candidate_v3(
       qsa_token_split_candidate::STORAGE_PARTIAL_COUNT *
       qsa_token_split_candidate::PARTIAL_STRIDE;
   if (page_size == 512) {
-    return run_token_split_candidate<512>(
+    return run_token_split_candidate<qsa_token_split_candidate::HEADS, 512>(
         q, packed_kv, logical_indices, block_table, token_to_req, page_size,
         output, token_split_partials,
         qsa_token_split_candidate::HEADS * partial_head_stride,
@@ -890,7 +918,7 @@ at::Tensor sparse_attention_token_split_candidate_v3(
         0,
         false);
   }
-  return run_token_split_candidate(
+  return run_token_split_candidate<qsa_token_split_candidate::HEADS>(
       q, packed_kv, logical_indices, block_table, token_to_req, page_size,
       output, token_split_partials,
       qsa_token_split_candidate::HEADS * partial_head_stride,
@@ -898,6 +926,44 @@ at::Tensor sparse_attention_token_split_candidate_v3(
       nullptr,
       0,
       false);
+}
+
+at::Tensor sparse_attention_token_split_candidate_q6_v1(
+    const at::Tensor& q,
+    const at::Tensor& packed_kv,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t page_size,
+    at::Tensor output,
+    at::Tensor token_split_partials) {
+  TORCH_CHECK(q.dim() == 3 && q.size(0) >= 1 &&
+                  q.size(0) <= qsa_token_split_candidate::MAX_ROWS,
+              "q6 v1 rows must be in [1,128]");
+  TORCH_CHECK(token_split_partials.dim() == 4 &&
+                  token_split_partials.size(0) == q.size(0) &&
+                  token_split_partials.size(1) ==
+                      qsa_token_split_candidate::Q6_HEADS &&
+                  token_split_partials.size(2) ==
+                      qsa_token_split_candidate::STORAGE_PARTIAL_COUNT &&
+                  token_split_partials.size(3) ==
+                      qsa_token_split_candidate::PARTIAL_STRIDE,
+              "q6 v1 partials must have shape [rows,6,43,258]");
+  const int partial_head_stride =
+      qsa_token_split_candidate::STORAGE_PARTIAL_COUNT *
+      qsa_token_split_candidate::PARTIAL_STRIDE;
+  if (page_size == 512) {
+    return run_token_split_candidate<qsa_token_split_candidate::Q6_HEADS, 512>(
+        q, packed_kv, logical_indices, block_table, token_to_req, page_size,
+        output, token_split_partials,
+        qsa_token_split_candidate::Q6_HEADS * partial_head_stride,
+        partial_head_stride, nullptr, 0, false);
+  }
+  return run_token_split_candidate<qsa_token_split_candidate::Q6_HEADS>(
+      q, packed_kv, logical_indices, block_table, token_to_req, page_size,
+      output, token_split_partials,
+      qsa_token_split_candidate::Q6_HEADS * partial_head_stride,
+      partial_head_stride, nullptr, 0, false);
 }
 
 at::Tensor sparse_paged_attention_v2(
@@ -989,7 +1055,7 @@ at::Tensor sparse_attention_token_split_candidate_v4(
   const int partial_head_stride =
       qsa_token_split_candidate::STORAGE_PARTIAL_COUNT *
       qsa_token_split_candidate::PARTIAL_STRIDE;
-  return run_token_split_candidate(
+  return run_token_split_candidate<qsa_token_split_candidate::HEADS>(
       q, packed_kv, logical_indices, block_table, token_to_req, page_size,
       output, token_split_partials,
       qsa_token_split_candidate::HEADS * partial_head_stride,

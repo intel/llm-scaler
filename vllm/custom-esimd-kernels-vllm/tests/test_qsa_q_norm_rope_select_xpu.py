@@ -34,7 +34,9 @@ def qsa_ops():
     return module
 
 
-def _make_case(rows: int, mrope: bool, length: int = 9216):
+def _make_case(
+    rows: int, mrope: bool, length: int = 9216, compressed_page_size: int = 64
+):
     device = torch.device("xpu")
     generator = torch.Generator(device="cpu").manual_seed(7000 + rows)
     projected = torch.randn(rows, 4, 128, generator=generator, dtype=torch.float16).to(
@@ -55,8 +57,14 @@ def _make_case(rows: int, mrope: bool, length: int = 9216):
     else:
         positions = query_positions
     positions = positions.to(device)
+    tokens_per_page = compressed_page_size * 4
     cache_cpu = torch.randn(
-        (length + 255) // 256, 64, 1, 128, generator=generator, dtype=torch.float16
+        (length + tokens_per_page - 1) // tokens_per_page,
+        compressed_page_size,
+        1,
+        128,
+        generator=generator,
+        dtype=torch.float16,
     )
     cache = cache_cpu.to(device)
     page_table = (
@@ -248,26 +256,52 @@ def test_parallel_selection_ties_invalid_pages_and_async_streams(qsa_ops):
         assert torch.equal(output, expected)
 
 
-@pytest.mark.parametrize("length", [4, 2050, 32770, 128002, 256002, 1000002])
-@pytest.mark.parametrize("rows", [1, 4])
-def test_preprocessed_parallel_selection_is_bitwise(qsa_ops, length, rows):
-    case = _make_case(rows, False, length)
+@pytest.mark.parametrize("compressed_page_size", [64, 128])
+@pytest.mark.parametrize("length", [4, 2050, 128002])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8, 32])
+def test_preprocessed_parallel_selection_is_bitwise(
+    qsa_ops, compressed_page_size, length, rows
+):
+    case = _make_case(rows, False, length, compressed_page_size)
     q, _, _, _, cache, table, requests, positions, lengths, _ = case
     old = torch.empty(rows, 2051, dtype=torch.int32, device="xpu")
     new = torch.empty_like(old)
-    inputs = (q, cache, table, requests, positions, lengths, 2048, 4, 64)
+    inputs = (
+        q,
+        cache,
+        table,
+        requests,
+        positions,
+        lengths,
+        2048,
+        4,
+        compressed_page_size,
+    )
     qsa_ops.qsa_select_paged_tokens_v2(*inputs, old)
     qsa_ops.qsa_select_paged_tokens_parallel_v1(*inputs, new)
     torch.xpu.synchronize()
     assert torch.equal(new, old)
 
 
-def test_preprocessed_parallel_selection_async_ties_and_alias_guard(qsa_ops):
-    case = _make_case(4, False, 128004)
+@pytest.mark.parametrize("compressed_page_size", [64, 128])
+def test_preprocessed_parallel_selection_async_ties_and_alias_guard(
+    qsa_ops, compressed_page_size
+):
+    case = _make_case(4, False, 128004, compressed_page_size)
     q, _, _, _, cache, table, requests, positions, lengths, _ = case
     cache.zero_()
     table[:, 2:4] = -1
-    inputs = (q, cache, table, requests, positions, lengths, 2048, 4, 64)
+    inputs = (
+        q,
+        cache,
+        table,
+        requests,
+        positions,
+        lengths,
+        2048,
+        4,
+        compressed_page_size,
+    )
     expected = torch.empty(4, 2051, dtype=torch.int32, device="xpu")
     qsa_ops.qsa_select_paged_tokens_v2(*inputs, expected)
     outputs = [torch.empty_like(expected), torch.empty_like(expected)]
@@ -288,8 +322,13 @@ def test_preprocessed_parallel_selection_async_ties_and_alias_guard(qsa_ops):
         qsa_ops.qsa_select_paged_tokens_parallel_v1(*inputs, alias)
 
 
-def test_preprocessed_parallel_selection_mixed_requests_and_visible_lengths(qsa_ops):
-    q, _, _, _, cache, table, _, _, _, _ = _make_case(8, False, 128004)
+@pytest.mark.parametrize("compressed_page_size", [64, 128])
+def test_preprocessed_parallel_selection_mixed_requests_and_visible_lengths(
+    qsa_ops, compressed_page_size
+):
+    q, _, _, _, cache, table, _, _, _, _ = _make_case(
+        8, False, 128004, compressed_page_size
+    )
     table = table.flip(1).repeat(3, 1).contiguous()
     table[:, 7] = -1
     table[:, 22] = cache.shape[0]  # An out-of-range physical page is invalid.
@@ -301,8 +340,55 @@ def test_preprocessed_parallel_selection_mixed_requests_and_visible_lengths(qsa_
         dtype=torch.int64, device="xpu",
     )
     lengths = torch.tensor([128004, 32770, 4099], dtype=torch.int32, device="xpu")
-    inputs = (q, cache, table, requests, positions, lengths, 2048, 4, 64)
+    inputs = (
+        q,
+        cache,
+        table,
+        requests,
+        positions,
+        lengths,
+        2048,
+        4,
+        compressed_page_size,
+    )
     old = torch.empty(8, 2051, dtype=torch.int32, device="xpu")
+    new = torch.empty_like(old)
+    qsa_ops.qsa_select_paged_tokens_v2(*inputs, old)
+    qsa_ops.qsa_select_paged_tokens_parallel_v1(*inputs, new)
+    torch.xpu.synchronize()
+    assert torch.equal(new, old)
+
+
+@pytest.mark.parametrize("compressed_page_size", [64, 128])
+def test_preprocessed_parallel_selection_exact_page_boundaries(
+    qsa_ops, compressed_page_size
+):
+    length = compressed_page_size * 8 + 8
+    q, _, _, _, cache, table, requests, _, lengths, _ = _make_case(
+        4, False, length, compressed_page_size
+    )
+    positions = torch.tensor(
+        [
+            compressed_page_size * 4 - 1,
+            compressed_page_size * 4 + 3,
+            compressed_page_size * 8 - 1,
+            compressed_page_size * 8 + 3,
+        ],
+        dtype=torch.int64,
+        device="xpu",
+    )
+    inputs = (
+        q,
+        cache,
+        table,
+        requests,
+        positions,
+        lengths,
+        2048,
+        4,
+        compressed_page_size,
+    )
+    old = torch.empty(4, 2051, dtype=torch.int32, device="xpu")
     new = torch.empty_like(old)
     qsa_ops.qsa_select_paged_tokens_v2(*inputs, old)
     qsa_ops.qsa_select_paged_tokens_parallel_v1(*inputs, new)

@@ -11,6 +11,7 @@ import pytest
 import torch
 
 HEADS = 3
+Q6_HEADS = 6
 HEAD_DIM = 256
 INDEX_WIDTH = 2051
 PACKED_STRIDES = {
@@ -74,7 +75,7 @@ def _canonicalize_singleton_dim_strides(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.as_strided(tensor.shape, strides) if changed else tensor
 
 
-def _make_inputs(case: str, rows: int, page_size: int):
+def _make_inputs(case: str, rows: int, page_size: int, heads: int = HEADS):
     pages_per_request = (INDEX_WIDTH + page_size - 1) // page_size
     pages = rows * pages_per_request
     packed_kv = torch.randn(
@@ -89,7 +90,7 @@ def _make_inputs(case: str, rows: int, page_size: int):
     k_cache = _canonicalize_singleton_dim_strides(k_cache)
     v_cache = _canonicalize_singleton_dim_strides(v_cache)
     q = 0.1 * torch.randn(
-        rows, HEADS, HEAD_DIM, dtype=torch.float16, device="xpu"
+        rows, heads, HEAD_DIM, dtype=torch.float16, device="xpu"
     )
     logical_indices = torch.full(
         (rows, INDEX_WIDTH), -1, dtype=torch.int32, device="xpu"
@@ -167,6 +168,13 @@ def test_qsa_module_contract(qsa_ops):
     assert qsa_ops.qsa_token_split_candidate_batch_opt_max_rows == 6
     assert qsa_ops.qsa_token_split_candidate_fused_abi_version == 1
     assert qsa_ops.qsa_token_split_candidate_fused_single_launch == 1
+    assert qsa_ops.qsa_q6_abi_version == 1
+    assert qsa_ops.qsa_q6_query_heads == Q6_HEADS
+    assert qsa_ops.qsa_q6_kv_heads == 1
+    assert qsa_ops.qsa_q6_token_split_v3 == 1
+    assert qsa_ops.qsa_q6_page512 == 1
+    assert callable(qsa_ops.sparse_paged_attention_q6_v1)
+    assert callable(qsa_ops.sparse_attention_token_split_candidate_q6_v1)
     assert qsa_ops.qsa_row_store_abi_version == 3
     assert callable(qsa_ops.qsa_store_cache_rows_v3)
     assert qsa_ops.row_store_predicated_bounds == 1
@@ -366,6 +374,93 @@ def test_qsa_token_split_candidate_async_workspace_reuse(qsa_ops):
     for actual, target in zip(outputs, expected):
         assert torch.isfinite(actual).all()
         assert torch.allclose(actual.float(), target.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("page_size", [256, 512])
+@pytest.mark.parametrize("rows", [1, 2, 4, 8])
+def test_qsa_q6_native_paths_match_independent_reference(qsa_ops, rows, page_size):
+    torch.manual_seed(20260910 + rows + page_size)
+    args = list(_make_inputs("holes_duplicates_pages", rows, page_size, Q6_HEADS))
+    packed_kv = args.pop()
+    q, k_cache, v_cache, logical, block_table, token_to_req, _, out = args
+    expected = _reference(
+        q, k_cache, v_cache, logical, block_table, token_to_req, page_size
+    )
+
+    sparse = qsa_ops.sparse_paged_attention_q6_v1(*args)
+    partials = torch.full(
+        (rows, Q6_HEADS, 43, 258),
+        float("nan"),
+        dtype=torch.float32,
+        device="xpu",
+    )
+    split_out = torch.empty_like(q)
+    split = qsa_ops.sparse_attention_token_split_candidate_q6_v1(
+        q,
+        packed_kv,
+        logical,
+        block_table,
+        token_to_req,
+        page_size,
+        split_out,
+        partials,
+    )
+    torch.xpu.synchronize()
+
+    assert sparse.data_ptr() == out.data_ptr()
+    assert split.data_ptr() == split_out.data_ptr()
+    torch.testing.assert_close(sparse, expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(split, expected, atol=2e-2, rtol=2e-2)
+    active_partials = 43 if 2 <= rows <= 6 else 33
+    assert torch.isfinite(partials[:, :, :active_partials]).all()
+    assert torch.isnan(partials[:, :, active_partials:]).all()
+
+
+@pytest.mark.parametrize("page_size", [256, 512])
+def test_qsa_q6_tp4_rank_mapping_matches_global_24_head_reference(
+    qsa_ops, page_size
+):
+    """TP4 ranks 0/1 share KV0 and ranks 2/3 share KV1."""
+    torch.manual_seed(20260911 + page_size)
+    rows = 2
+    global_q = torch.randn(
+        rows, 24, HEAD_DIM, dtype=torch.float16, device="xpu"
+    )
+    kv_inputs = [
+        _make_inputs("holes_duplicates_pages", rows, page_size, Q6_HEADS)
+        for _ in range(2)
+    ]
+    actual_rank_outputs = []
+    expected_rank_outputs = []
+    for rank in range(4):
+        source = kv_inputs[rank // 2]
+        local_q = global_q[:, rank * Q6_HEADS : (rank + 1) * Q6_HEADS].contiguous()
+        out = torch.empty_like(local_q)
+        actual_rank_outputs.append(
+            qsa_ops.sparse_paged_attention_q6_v1(
+                local_q, *source[1:6], page_size, out
+            )
+        )
+        expected_rank_outputs.append(
+            _reference(local_q, *source[1:6], page_size)
+        )
+    torch.xpu.synchronize()
+
+    actual = torch.cat(actual_rank_outputs, dim=1)
+    expected = torch.cat(expected_rank_outputs, dim=1)
+    assert actual.shape == global_q.shape
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_qsa_q3_exports_reject_q6_without_relaxing_the_legacy_abi(qsa_ops):
+    args = list(_make_inputs("valid_width_32", 1, 256, Q6_HEADS))
+    with pytest.raises(RuntimeError, match=r"\[R,3,256\]"):
+        qsa_ops.sparse_paged_attention_v2(*args[:8])
+    partials = torch.empty((1, Q6_HEADS, 43, 258), dtype=torch.float32, device="xpu")
+    with pytest.raises(RuntimeError, match=r"\[rows,3,43,258\]"):
+        qsa_ops.sparse_attention_token_split_candidate_v3(
+            args[0], args[8], *args[3:7], args[7], partials
+        )
 
 
 def test_qsa_rejects_bf16_query(qsa_ops):

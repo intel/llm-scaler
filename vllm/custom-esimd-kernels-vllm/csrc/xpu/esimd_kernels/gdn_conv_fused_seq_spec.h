@@ -13,10 +13,23 @@
  *
  * The implementation uses a fixed WG_SIZE=64 and K=V=128. It supports the
  * existing Qwen3.5/3.6 TP=2 geometries (H=8, HV=16/24) and, through the
- * versioned host entry point, the Qwen3.8 TP=8 geometry (H=2, HV=6).
+ * versioned host entry point, the Qwen3.8 TP=8/4 geometries
+ * (H=2/HV=6 and H=4/HV=12).
  * Unsupported geometries are rejected rather than silently selecting a slower
  * or incorrect layout.
  */
+
+// Keep the v2 geometry contract in one place. The split v2 kernels below are
+// deliberately dimension-generic, but only these Qwen geometries have been
+// audited for the fixed K=V=128 state/update mapping. In particular, TP4
+// H=4/HV=12 produces dim=2560 (40 x 64-lane chunks) and HV/H=3.
+inline bool gdn_spec_v2_geometry_supported(
+    int H, int HV, int K, int V)
+{
+    return K == 128 && V == 128 &&
+        ((H == 2 && HV == 6) || (H == 4 && HV == 12) ||
+         (H == 8 && (HV == 16 || HV == 24)));
+}
 
 template <int WG_SIZE>
 ESIMD_INLINE simd<float, 2> gdn_spec_update_seq(
@@ -448,12 +461,14 @@ inline void gdn_conv_fused_seq_spec_host(
         H == 8 && (HV == 16 || HV == 24) && K == 128 && V == 128;
     const bool qwen38_tp8_geometry =
         H == 2 && HV == 6 && K == 128 && V == 128;
+    const bool qwen38_tp4_geometry =
+        H == 4 && HV == 12 && K == 128 && V == 128;
     if (allow_qwen38_tp8) {
         TORCH_CHECK(
-            legacy_geometry || qwen38_tp8_geometry,
-            "gdn_conv_fused_seq_spec_v2 supports H=8, HV=16/24 or H=2, "
-            "HV=6, K=V=128; got H=", H, " HV=", HV, " K=", K,
-            " V=", V);
+            legacy_geometry || qwen38_tp8_geometry || qwen38_tp4_geometry,
+            "gdn_conv_fused_seq_spec_v2 supports H=8, HV=16/24, H=2/HV=6, "
+            "or H=4/HV=12, K=V=128; got H=", H, " HV=", HV,
+            " K=", K, " V=", V);
     } else {
         TORCH_CHECK(
             legacy_geometry,

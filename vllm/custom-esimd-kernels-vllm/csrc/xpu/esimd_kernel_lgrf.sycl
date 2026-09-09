@@ -221,10 +221,11 @@ at::Tensor esimd_gdn_conv_fused_seq_spec_v2(
     double scale)
 {
     TORCH_CHECK(
-        ((H == 2 && HV == 6) || (H == 8 && (HV == 16 || HV == 24))) &&
-        K == 128 && V == 128 && num_spec_decodes > 0 &&
+        gdn_spec_v2_geometry_supported((int)H, (int)HV, (int)K, (int)V) &&
+        num_spec_decodes > 0 &&
         num_spec_tokens >= 2 && num_spec_tokens <= 8 && scale > 0,
-        "GDN spec v2 requires H/HV=2/6 or 8/16,24, K=V=128, M=2..8");
+        "GDN spec v2 requires H/HV=2/6, 4/12, or 8/16,24, "
+        "K=V=128, M=2..8");
     const int64_t N = num_spec_decodes * num_spec_tokens;
     const int64_t dim = (2 * H + HV) * K;
     const auto device = qkvz.device();

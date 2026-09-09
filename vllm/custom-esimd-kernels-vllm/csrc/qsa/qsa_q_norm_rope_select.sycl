@@ -80,6 +80,9 @@ inline uint32_t position_for_pair(
 template <bool Mrope, typename PosT, typename QLocalT, bool Preprocessed>
 class QsaQNormRopeSelectKernel;
 
+template <bool Mrope, typename PosT, typename QLocalT, bool Preprocessed>
+class QsaQNormRopeSelectPage128Kernel;
+
 // Exact merge of descending top-512 lists, including ascending-index ties.
 class QsaSelectionMergeKernel;
 
@@ -166,7 +169,8 @@ void merge_selection_partitions(
   }
 }
 
-template <bool Mrope, typename PosT, typename QLocalT, bool Preprocessed = false>
+template <bool Mrope, typename PosT, typename QLocalT, bool Preprocessed = false,
+          int PageSizeT = 64>
 void launch_fused(
     const at::Tensor& projected_q,
     const at::Tensor& norm_weight,
@@ -180,6 +184,7 @@ void launch_fused(
     at::Tensor q_output,
     at::Tensor out,
     int partitions = 1) {
+  static_assert(PageSizeT == 64 || PageSizeT == 128);
   const uint32_t rows = static_cast<uint32_t>(projected_q.size(0));
   const uint32_t requests = static_cast<uint32_t>(page_table.size(0));
   const uint32_t pages_per_request = static_cast<uint32_t>(page_table.size(1));
@@ -234,7 +239,11 @@ void launch_fused(
     sycl::local_accessor<int32_t, 1> page_cache(
         sycl::range<1>(kPageCacheSlots), cgh);
 
-    cgh.parallel_for<QsaQNormRopeSelectKernel<Mrope, PosT, QLocalT, Preprocessed>>(
+    using KernelName = std::conditional_t<
+        PageSizeT == 64,
+        QsaQNormRopeSelectKernel<Mrope, PosT, QLocalT, Preprocessed>,
+        QsaQNormRopeSelectPage128Kernel<Mrope, PosT, QLocalT, Preprocessed>>;
+    cgh.parallel_for<KernelName>(
         sycl::nd_range<1>(
             sycl::range<1>(static_cast<size_t>(rows * partitions * kWorkgroup)),
             sycl::range<1>(static_cast<size_t>(kWorkgroup))),
@@ -382,7 +391,7 @@ void launch_fused(
             bool valid = logical_block < visible_blocks && request_valid;
             int64_t cache_base = -1;
             if (valid) {
-              const int64_t page_column = logical_block / 64;
+              const int64_t page_column = logical_block / PageSizeT;
               valid = page_column < pages_per_request;
               if (valid) {
                 int32_t physical_page;
@@ -400,7 +409,7 @@ void launch_fused(
                 if (valid) {
                   cache_base = static_cast<int64_t>(physical_page) *
                           cache_page_stride +
-                      (logical_block % 64) * cache_token_stride;
+                      (logical_block % PageSizeT) * cache_token_stride;
                 }
               }
             }
@@ -762,11 +771,20 @@ at::Tensor select_preprocessed_parallel(
     const at::Tensor& q, const at::Tensor& compressed_key_cache,
     const at::Tensor& page_table, const at::Tensor& token_to_req,
     const at::Tensor& query_positions, const at::Tensor& sequence_lengths,
-    at::Tensor out) {
-  launch_fused<false, int64_t, fp16, true>(
-      q, at::Tensor(), query_positions, at::Tensor(), compressed_key_cache,
-      page_table, token_to_req, query_positions, sequence_lengths,
-      at::Tensor(), out, 32);
+    int64_t compressed_page_size, at::Tensor out) {
+  TORCH_CHECK(compressed_page_size == 64 || compressed_page_size == 128,
+              "preprocessed parallel selection requires page64 or page128");
+  if (compressed_page_size == 64) {
+    launch_fused<false, int64_t, fp16, true, 64>(
+        q, at::Tensor(), query_positions, at::Tensor(), compressed_key_cache,
+        page_table, token_to_req, query_positions, sequence_lengths,
+        at::Tensor(), out, 32);
+  } else {
+    launch_fused<false, int64_t, fp16, true, 128>(
+        q, at::Tensor(), query_positions, at::Tensor(), compressed_key_cache,
+        page_table, token_to_req, query_positions, sequence_lengths,
+        at::Tensor(), out, 32);
+  }
   return out;
 }
 

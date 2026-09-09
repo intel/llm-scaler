@@ -138,7 +138,7 @@ at::Tensor select_preprocessed_parallel(
     const at::Tensor& q, const at::Tensor& compressed_key_cache,
     const at::Tensor& page_table, const at::Tensor& token_to_req,
     const at::Tensor& query_positions, const at::Tensor& sequence_lengths,
-    at::Tensor out);
+    int64_t compressed_page_size, at::Tensor out);
 
 at::Tensor select_paged_tokens_parallel_v1(
     const at::Tensor& q,
@@ -172,5 +172,15 @@ at::Tensor sparse_paged_attention_bounded_v2(
     const at::Tensor& block_table,
     const at::Tensor& token_to_req,
     int64_t max_valid_width,
+    int64_t main_page_size,
+    at::Tensor out);
+
+at::Tensor sparse_paged_attention_q6_v1(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
     int64_t main_page_size,
     at::Tensor out);

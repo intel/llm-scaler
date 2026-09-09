@@ -7,6 +7,8 @@ Sources: gdn_conv_fused_seq_spec.h (ESIMD) and installed wheel revision
 a692986, csrc/xpu/gdn_attn/{causal_conv1d,gated_delta_rule}.hpp (fallback).
 The fallback's FP16 q/k/v interface and FP32 intra-call SSM carry are modeled
 separately from the native implementation, unlike the old native reference.
+The packed contract cases cover both Qwen3.8 local geometries: TP8
+H=2/HV=6 and TP4 H=4/HV=12.
 """
 
 import collections
@@ -180,31 +182,36 @@ def _padded_pool(shape, padding, rng):
     return storage, view
 
 
-def make_positive_packed_case(m, seed=813):
-    """CPU-only real TP8 dimensions, positive IDs, padded block strides.
+def make_positive_packed_case(m, seed=813, *, H=2, HV=6):
+    """CPU-only Qwen3.8 dimensions, positive IDs, padded block strides.
 
     Exposed for a later GPU harness, but this audit never loads native ops.
     SSM is stored as [block, HV*V, K] with exactly the native addressing.
     """
     rng = torch.Generator(device="cpu").manual_seed(seed + m)
+    assert HV % H == 0
+    conv_dim = (2 * H + HV) * 128
+    qkvz_dim = (2 * H + 2 * HV) * 128
     ids = torch.arange(2, 2 + 3 * m, 3, dtype=torch.int64)
     nblocks = int(ids[-1]) + 2
-    conv_storage, conv = _padded_pool((nblocks, m + 2, 1280), 256, rng)
-    ssm_storage, ssm = _padded_pool((nblocks, 6 * 128, 128), 256, rng)
+    conv_storage, conv = _padded_pool((nblocks, m + 2, conv_dim), 256, rng)
+    ssm_storage, ssm = _padded_pool((nblocks, HV * 128, 128), 256, rng)
     return {
         "m": m,
+        "H": H,
+        "HV": HV,
         "ids": ids,
         "accepted": 1,
         "conv": conv,
         "conv_storage": conv_storage,
         "ssm": ssm,
         "ssm_storage": ssm_storage,
-        "qkvz": (torch.randn(m, 2048, generator=rng) * 0.75).half(),
-        "weight": (torch.randn(1280, 4, generator=rng) * 0.5).half(),
-        "bias": (torch.randn(1280, generator=rng) * 0.5).half(),
-        "ba": (torch.randn(m, 12, generator=rng) * 0.5).half(),
-        "A_log": torch.randn(6, generator=rng) * 0.5 - 1,
-        "dt_bias": (torch.randn(6, generator=rng) * 0.5).half(),
+        "qkvz": (torch.randn(m, qkvz_dim, generator=rng) * 0.75).half(),
+        "weight": (torch.randn(conv_dim, 4, generator=rng) * 0.5).half(),
+        "bias": (torch.randn(conv_dim, generator=rng) * 0.5).half(),
+        "ba": (torch.randn(m, 2 * HV, generator=rng) * 0.5).half(),
+        "A_log": torch.randn(HV, generator=rng) * 0.5 - 1,
+        "dt_bias": (torch.randn(HV, generator=rng) * 0.5).half(),
         "token_indices": torch.arange(m - 1, -1, -1),
     }
 
@@ -216,36 +223,41 @@ def packed_contract_reference(case, dtype=torch.float32):
     FP16. Conv products AND the q/k/v interface are FP16, A_log is FP32 input.
     FP64 mode supplies an independent higher-precision arithmetic oracle.
     """
-    m, ids, accepted = case["m"], case["ids"], case["accepted"]
+    m, H, HV = case["m"], case["H"], case["HV"]
+    ids, accepted = case["ids"], case["accepted"]
+    key_dim = H * 128
+    conv_dim = (2 * H + HV) * 128
     history = case["conv"][ids[0], accepted - 1 : accepted + 2].clone()
-    state = case["ssm"][ids[accepted - 1]].to(dtype).reshape(6, 128, 128)
-    outputs = torch.empty((m, 6, 128), dtype=torch.float16)
+    state = case["ssm"][ids[accepted - 1]].to(dtype).reshape(HV, 128, 128)
+    outputs = torch.empty((m, HV, 128), dtype=torch.float16)
     z = torch.empty_like(outputs)
     for t, global_t in enumerate(case["token_indices"]):
-        raw = case["qkvz"][global_t, :1280]
+        raw = case["qkvz"][global_t, :conv_dim]
         window = torch.cat((history, raw[None]), dim=0).to(dtype)
         products = (window.T * case["weight"].to(dtype)).half().to(dtype)
         conv = case["bias"].to(dtype)
         for j in range(4):
             conv = conv + products[:, j]
         conv = (conv / (1 + torch.exp(-conv))).half().to(dtype)
-        q = conv[:256].reshape(2, 128).repeat_interleave(3, dim=0)
-        k = conv[256:512].reshape(2, 128).repeat_interleave(3, dim=0)
-        v = conv[512:].reshape(6, 128)
+        q = conv[:key_dim].reshape(H, 128).repeat_interleave(HV // H, dim=0)
+        k = conv[key_dim : 2 * key_dim].reshape(H, 128).repeat_interleave(
+            HV // H, dim=0
+        )
+        v = conv[2 * key_dim:].reshape(HV, 128)
         q = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6) / 128**0.5
         k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
         ba = case["ba"][global_t].to(dtype)
-        x_gate = ba[6:] + case["dt_bias"].to(dtype)
+        x_gate = ba[HV:] + case["dt_bias"].to(dtype)
         softplus = torch.where(x_gate > 20, x_gate, torch.log1p(torch.exp(x_gate)))
         decay = torch.exp(-torch.exp(case["A_log"].to(dtype)) * softplus)
-        beta = torch.sigmoid(ba[:6])
+        beta = torch.sigmoid(ba[:HV])
         state = state * decay[:, None, None]
         memory = torch.einsum("hvk,hk->hv", state, k)
         delta = (v - memory) * beta[:, None]
         state = state + delta[:, :, None] * k[:, None, :]
         outputs[global_t] = torch.einsum("hvk,hk->hv", state, q).half()
-        z[global_t] = case["qkvz"][global_t, 1280:].reshape(6, 128)
-        case["ssm"][ids[t]].copy_(state.reshape(768, 128).half())
+        z[global_t] = case["qkvz"][global_t, conv_dim:].reshape(HV, 128)
+        case["ssm"][ids[t]].copy_(state.reshape(HV * 128, 128).half())
         if t == 0:
             case["conv"][ids[0], :2].copy_(history[1:])
         case["conv"][ids[0], 2 + t].copy_(raw)
@@ -254,19 +266,23 @@ def packed_contract_reference(case, dtype=torch.float32):
 
 
 @pytest.mark.parametrize("m", range(2, 9))
-def test_positive_packed_padded_multistep_reference_and_storage_guards(m):
+@pytest.mark.parametrize(
+    ("H", "HV"), [(2, 6), (4, 12)], ids=["tp8-h2-hv6", "tp4-h4-hv12"]
+)
+def test_positive_packed_padded_multistep_reference_and_storage_guards(m, H, HV):
     """All acceptance counts, no zero blocks, exact history and padding checks."""
-    case = make_positive_packed_case(m)
+    case = make_positive_packed_case(m, H=H, HV=HV)
     oracle = copy.deepcopy(case)
     assert case["ids"].min() > 0
-    assert case["conv"].stride(0) > (m + 2) * 1280
-    assert case["ssm"].stride(0) > 6 * 128 * 128
+    conv_dim = (2 * H + HV) * 128
+    assert case["conv"].stride(0) > (m + 2) * conv_dim
+    assert case["ssm"].stride(0) > HV * 128 * 128
     for accepted in [1, *range(1, m + 1), m, 1]:
         case["accepted"] = oracle["accepted"] = accepted
         before = case["conv"].clone()
         expected_history = before[case["ids"][0], accepted : accepted + 2]
         expected_history = torch.cat(
-            (expected_history, case["qkvz"][case["token_indices"], :1280])
+            (expected_history, case["qkvz"][case["token_indices"], :conv_dim])
         )
         output, z = packed_contract_reference(case)
         expected, expected_z = packed_contract_reference(oracle, torch.float64)
@@ -283,12 +299,15 @@ def test_positive_packed_padded_multistep_reference_and_storage_guards(m):
             assert torch.all(rows[:, -256:] == 123)
 
 
+@pytest.mark.parametrize(
+    ("H", "HV"), [(2, 6), (4, 12)], ids=["tp8-h2-hv6", "tp4-h4-hv12"]
+)
 @pytest.mark.skipif(os.environ.get("GDN_STRICT_XPU") != "1", reason="opt-in XPU")
-def test_native_v2_strict_positive_packed_multistep_xpu():
+def test_native_v2_strict_positive_packed_multistep_xpu(H, HV):
     """正式 v2 的 packed-state 多轮回归；失败时不可放宽数值阈值。"""
     torch.ops.load_library(os.environ["GDN_SPEC_DSO"])
     op = torch.ops.custom_esimd_kernels_vllm.esimd_gdn_conv_fused_seq_spec_v2
-    cpu = make_positive_packed_case(4)
+    cpu = make_positive_packed_case(4, H=H, HV=HV)
     device = {}
     for name in ("conv", "ssm"):
         storage = cpu[name + "_storage"].to("xpu")
@@ -301,7 +320,7 @@ def test_native_v2_strict_positive_packed_multistep_xpu():
     device["A_log"] = cpu["A_log"].half().to("xpu")
     ids = cpu["ids"].int().to("xpu")
     tokens = cpu["token_indices"].int().to("xpu")
-    output = torch.empty((4, 6, 128), dtype=torch.float16, device="xpu")
+    output = torch.empty((4, HV, 128), dtype=torch.float16, device="xpu")
     z = torch.empty_like(output)
     failures = []
     for step, accepted in enumerate((1, 4, 2, 1, 3, 4)):
@@ -317,15 +336,15 @@ def test_native_v2_strict_positive_packed_multistep_xpu():
             device["A_log"],
             device["dt_bias"],
             device["ba"],
-            device["ssm"].view(-1, 6, 128, 128),
+            device["ssm"].view(-1, HV, 128, 128),
             output,
             z,
             tokens,
             accepted_gpu,
             1,
             4,
-            2,
-            6,
+            H,
+            HV,
             128,
             128,
             128**-0.5,

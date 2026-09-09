@@ -1,7 +1,7 @@
 // Copyright 2026
 // SPDX-License-Identifier: Apache-2.0
 //
-// Fixed-contract Qwen3.8 TP8-rank sparse paged attention for Intel XPU.
+// Fixed-contract Qwen3.8 TP8/TP4-rank sparse paged attention for Intel XPU.
 
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
@@ -79,12 +79,10 @@ constexpr const char* kActivationName = "bfloat16";
 #define QSA_NATIVE_EXACT_PACKED_CACHE 0
 #endif
 
-constexpr int64_t kQueryHeads = 3;
 constexpr int64_t kKvHeads = 1;
 constexpr int64_t kHeadDim = 256;
 constexpr int64_t kIndexWidth = 2051;
 constexpr int64_t kSubgroup = QSA_NATIVE_SUBGROUP;
-constexpr int64_t kWorkgroup = 4 * kSubgroup;
 constexpr int64_t kValuesPerLane = kHeadDim / kSubgroup;
 constexpr int64_t kTile = QSA_NATIVE_KV_TILE;
 constexpr int64_t kTileElements = kTile * kHeadDim;
@@ -94,30 +92,6 @@ static_assert(
     kTile == 4 || kTile == 8 || kTile == 16 || kTile == 32 || kTile == 64);
 static_assert(kSubgroup == 16 || kSubgroup == 32);
 static_assert(kHeadDim % kSubgroup == 0);
-#if QSA_NATIVE_TOKEN_LOADER
-static_assert(kWorkgroup % kTile == 0);
-constexpr int64_t kWorkersPerToken = kWorkgroup / kTile;
-static_assert(kSubgroup % kWorkersPerToken == 0);
-static_assert(kHeadDim % kWorkersPerToken == 0);
-constexpr int64_t kDimsPerWorker = kHeadDim / kWorkersPerToken;
-#if QSA_NATIVE_PACKED_KV
-constexpr int64_t kPackedElements = 8;
-static_assert(kDimsPerWorker % kPackedElements == 0);
-#endif
-#endif
-#if QSA_NATIVE_PIPELINED_LOADER
-static_assert(QSA_NATIVE_TOKEN_LOADER);
-static_assert(QSA_NATIVE_PACKED_KV);
-static_assert(kTile == 16);
-static_assert(kSubgroup == 32);
-constexpr int64_t kPipelineLoaderSubgroup = kQueryHeads;
-constexpr int64_t kPipelineWorkersPerToken = kSubgroup / kTile;
-constexpr int64_t kPipelineDimsPerWorker =
-    kHeadDim / kPipelineWorkersPerToken;
-static_assert(kSubgroup % kTile == 0);
-static_assert(kHeadDim % kPipelineWorkersPerToken == 0);
-static_assert(kPipelineDimsPerWorker % kPackedElements == 0);
-#endif
 #if QSA_NATIVE_STAGE_VALIDITY
 static_assert(QSA_NATIVE_TOKEN_LOADER);
 static_assert(!QSA_NATIVE_PIPELINED_LOADER);
@@ -126,7 +100,7 @@ static_assert(!QSA_NATIVE_PIPELINED_LOADER);
 static_assert(!QSA_NATIVE_SINGLE_EXP);
 #endif
 
-template <int64_t PageSize>
+template <int64_t QueryHeads, int64_t PageSize>
 class SparsePagedAttentionKernel;
 
 inline float qsa_exp(float value) {
@@ -153,7 +127,7 @@ void check_int32_xpu(const at::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
-template <int64_t PageSize>
+template <int64_t QueryHeads, int64_t PageSize>
 at::Tensor sparse_paged_attention_impl(
     const at::Tensor& q,
     const at::Tensor& k_cache,
@@ -163,7 +137,36 @@ at::Tensor sparse_paged_attention_impl(
     const at::Tensor& token_to_req,
     int64_t valid_width_scan_bound,
     at::Tensor out) {
+  static_assert(QueryHeads == 3 || QueryHeads == 6);
   static_assert(PageSize == 256 || PageSize == 512);
+  constexpr int64_t kHeadsPerGroup = 3;
+  constexpr int64_t kGroupsPerRow = QueryHeads / kHeadsPerGroup;
+  constexpr int64_t kWorkgroup = 4 * kSubgroup;
+  static_assert(QueryHeads % kHeadsPerGroup == 0);
+#if QSA_NATIVE_TOKEN_LOADER
+  constexpr int64_t kWorkersPerToken = kWorkgroup / kTile;
+  constexpr int64_t kDimsPerWorker = kHeadDim / kWorkersPerToken;
+  static_assert(kWorkgroup % kTile == 0);
+  static_assert(kSubgroup % kWorkersPerToken == 0);
+  static_assert(kHeadDim % kWorkersPerToken == 0);
+#if QSA_NATIVE_PACKED_KV
+  constexpr int64_t kPackedElements = 8;
+  static_assert(kDimsPerWorker % kPackedElements == 0);
+#endif
+#endif
+#if QSA_NATIVE_PIPELINED_LOADER
+  static_assert(QSA_NATIVE_TOKEN_LOADER);
+  static_assert(QSA_NATIVE_PACKED_KV);
+  static_assert(kTile == 16);
+  static_assert(kSubgroup == 32);
+  constexpr int64_t kPipelineLoaderSubgroup = kHeadsPerGroup;
+  constexpr int64_t kPipelineWorkersPerToken = kSubgroup / kTile;
+  constexpr int64_t kPipelineDimsPerWorker =
+      kHeadDim / kPipelineWorkersPerToken;
+  static_assert(kSubgroup % kTile == 0);
+  static_assert(kHeadDim % kPipelineWorkersPerToken == 0);
+  static_assert(kPipelineDimsPerWorker % kPackedElements == 0);
+#endif
   constexpr int64_t kPageSize = PageSize;
   constexpr int64_t kPackedPageStride = kPageSize * kPackedTokenStride;
   check_activation_xpu(q, "q", true);
@@ -173,9 +176,9 @@ at::Tensor sparse_paged_attention_impl(
   check_int32_xpu(logical_indices, "logical_indices");
   check_int32_xpu(block_table, "block_table");
   check_int32_xpu(token_to_req, "token_to_req");
-  TORCH_CHECK(q.dim() == 3 && q.size(1) == kQueryHeads &&
+  TORCH_CHECK(q.dim() == 3 && q.size(1) == QueryHeads &&
                   q.size(2) == kHeadDim,
-              "q must have shape [R,3,256]");
+              "q must have shape [R,", QueryHeads, ",256]");
   TORCH_CHECK(k_cache.dim() == 4 && k_cache.size(1) == kPageSize &&
                   k_cache.size(2) == kKvHeads &&
                   k_cache.size(3) == kHeadDim,
@@ -255,15 +258,20 @@ at::Tensor sparse_paged_attention_impl(
 #else
         sycl::range<1>(2 * kTileElements), cgh);
 #endif
-    cgh.parallel_for<SparsePagedAttentionKernel<PageSize>>(
+    cgh.parallel_for<SparsePagedAttentionKernel<QueryHeads, PageSize>>(
         sycl::nd_range<1>(
-            sycl::range<1>(static_cast<size_t>(rows * kWorkgroup)),
+            sycl::range<1>(
+                static_cast<size_t>(rows * kGroupsPerRow * kWorkgroup)),
             sycl::range<1>(static_cast<size_t>(kWorkgroup))),
         [=](sycl::nd_item<1> item)
             [[sycl::reqd_sub_group_size(QSA_NATIVE_SUBGROUP)]] {
-          const int64_t row = item.get_group_linear_id();
+          const int64_t group = item.get_group_linear_id();
+          const int64_t row = group / kGroupsPerRow;
+          const int64_t head_base =
+              (group - row * kGroupsPerRow) * kHeadsPerGroup;
           const int64_t local = item.get_local_linear_id();
           const int64_t subgroup_id = local / kSubgroup;
+          const int64_t query_head = head_base + subgroup_id;
           const int64_t lane = local % kSubgroup;
           const int32_t request = request_ptr[row];
 #if QSA_NATIVE_TRIM_VALID_WIDTH
@@ -285,11 +293,11 @@ at::Tensor sparse_paged_attention_impl(
 
           float q_values[kValuesPerLane];
           float accumulators[kValuesPerLane];
-          if (subgroup_id < kQueryHeads) {
+          if (subgroup_id < kHeadsPerGroup) {
             for (int64_t fragment = 0; fragment < kValuesPerLane; ++fragment) {
               const int64_t dim = lane + fragment * kSubgroup;
               q_values[fragment] = static_cast<float>(
-                  q_ptr[(row * kQueryHeads + subgroup_id) * kHeadDim + dim]);
+                  q_ptr[(row * QueryHeads + query_head) * kHeadDim + dim]);
               accumulators[fragment] = 0.0f;
             }
           }
@@ -533,7 +541,7 @@ at::Tensor sparse_paged_attention_impl(
               item.barrier(sycl::access::fence_space::local_space);
 #endif
 
-              if (subgroup_id < kQueryHeads) {
+              if (subgroup_id < kHeadsPerGroup) {
 #if QSA_NATIVE_PIPELINED_LOADER
                 const int64_t stage_base =
                     stage_slot * 2 * kTileElements;
@@ -689,13 +697,13 @@ at::Tensor sparse_paged_attention_impl(
 #endif
           }
 
-          if (subgroup_id < kQueryHeads) {
+          if (subgroup_id < kHeadsPerGroup) {
             for (int64_t fragment = 0; fragment < kValuesPerLane; ++fragment) {
               const int64_t dim = lane + fragment * kSubgroup;
               const float value = denominator > 0.0f
                   ? accumulators[fragment] / denominator
                   : 0.0f;
-              out_ptr[(row * kQueryHeads + subgroup_id) * kHeadDim + dim] =
+              out_ptr[(row * QueryHeads + query_head) * kHeadDim + dim] =
                   static_cast<activation_t>(value);
             }
           }
@@ -714,7 +722,7 @@ at::Tensor sparse_paged_attention(
     const at::Tensor& block_table,
     const at::Tensor& token_to_req,
     at::Tensor out) {
-  return sparse_paged_attention_impl<512>(
+  return sparse_paged_attention_impl<3, 512>(
       q, k_cache, v_cache, logical_indices, block_table, token_to_req,
       kIndexWidth, out);
 }
@@ -728,7 +736,7 @@ at::Tensor sparse_paged_attention_bounded(
     const at::Tensor& token_to_req,
     int64_t max_valid_width,
     at::Tensor out) {
-  return sparse_paged_attention_impl<512>(
+  return sparse_paged_attention_impl<3, 512>(
       q, k_cache, v_cache, logical_indices, block_table, token_to_req,
       max_valid_width, out);
 }
@@ -746,11 +754,11 @@ at::Tensor sparse_paged_attention_v2(
       main_page_size == 256 || main_page_size == 512,
       "main_page_size must be 256 or 512");
   if (main_page_size == 256) {
-    return sparse_paged_attention_impl<256>(
+    return sparse_paged_attention_impl<3, 256>(
         q, k_cache, v_cache, logical_indices, block_table, token_to_req,
         kIndexWidth, out);
   }
-  return sparse_paged_attention_impl<512>(
+  return sparse_paged_attention_impl<3, 512>(
       q, k_cache, v_cache, logical_indices, block_table, token_to_req,
       kIndexWidth, out);
 }
@@ -769,13 +777,35 @@ at::Tensor sparse_paged_attention_bounded_v2(
       main_page_size == 256 || main_page_size == 512,
       "main_page_size must be 256 or 512");
   if (main_page_size == 256) {
-    return sparse_paged_attention_impl<256>(
+    return sparse_paged_attention_impl<3, 256>(
         q, k_cache, v_cache, logical_indices, block_table, token_to_req,
         max_valid_width, out);
   }
-  return sparse_paged_attention_impl<512>(
+  return sparse_paged_attention_impl<3, 512>(
       q, k_cache, v_cache, logical_indices, block_table, token_to_req,
       max_valid_width, out);
+}
+
+at::Tensor sparse_paged_attention_q6_v1(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t main_page_size,
+    at::Tensor out) {
+  TORCH_CHECK(
+      main_page_size == 256 || main_page_size == 512,
+      "main_page_size must be 256 or 512");
+  if (main_page_size == 256) {
+    return sparse_paged_attention_impl<6, 256>(
+        q, k_cache, v_cache, logical_indices, block_table, token_to_req,
+        kIndexWidth, out);
+  }
+  return sparse_paged_attention_impl<6, 512>(
+      q, k_cache, v_cache, logical_indices, block_table, token_to_req,
+      kIndexWidth, out);
 }
 
 at::Tensor sparse_attention_token_split_candidate_v3(
@@ -800,6 +830,16 @@ at::Tensor sparse_attention_token_split_candidate_v4(
     at::Tensor ready_counters,
     int64_t ready_epoch);
 
+at::Tensor sparse_attention_token_split_candidate_q6_v1(
+    const at::Tensor& q,
+    const at::Tensor& packed_kv,
+    const at::Tensor& logical_indices,
+    const at::Tensor& block_table,
+    const at::Tensor& token_to_req,
+    int64_t page_size,
+    at::Tensor output,
+    at::Tensor token_split_partials);
+
 at::Tensor sparse_paged_attention_v3(
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
     const at::Tensor&, const at::Tensor&, int64_t, at::Tensor);
@@ -818,6 +858,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       &sparse_paged_attention_v2,
       "Qwen3.8 page-specialized sparse paged attention (XPU)");
   module.def(
+      "sparse_paged_attention_q6_v1",
+      &sparse_paged_attention_q6_v1,
+      "Qwen3.8 TP4 q6 page-specialized sparse paged attention (XPU)");
+  module.def(
       "sparse_paged_attention_v3",
       &sparse_paged_attention_v3,
       "Qwen3.8 token-split attention with the v2 caller ABI (XPU)");
@@ -830,6 +874,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       "sparse_attention_token_split_candidate_v3",
       &sparse_attention_token_split_candidate_v3,
       "Qwen3.8 batched token-split sparse attention candidate (XPU)");
+  module.def(
+      "sparse_attention_token_split_candidate_q6_v1",
+      &sparse_attention_token_split_candidate_q6_v1,
+      "Qwen3.8 TP4 q6 batched token-split sparse attention (XPU)");
   module.def(
       "sparse_attention_token_split_candidate_v4",
       &sparse_attention_token_split_candidate_v4,
@@ -893,6 +941,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.attr("qsa_token_split_candidate_batch_opt_max_rows") = 6;
   module.attr("qsa_token_split_candidate_fused_abi_version") = 1;
   module.attr("qsa_token_split_candidate_fused_single_launch") = 1;
+  module.attr("qsa_q6_abi_version") = 1;
+  module.attr("qsa_q6_query_heads") = 6;
+  module.attr("qsa_q6_kv_heads") = 1;
+  module.attr("qsa_q6_token_split_v3") = 1;
+  module.attr("qsa_q6_page512") = 1;
   module.attr("qsa_row_store_abi_version") = 3;
   module.attr("qsa_row_store_receipt_abi_version") = 4;
   module.attr("row_store_receipt_caller_owned") = 1;
@@ -958,6 +1011,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.attr("row_store_bf16_width") = 128;
   module.attr("row_store_int64_width") = 3;
   module.attr("selection_page_sizes") = py::make_tuple(64, 128);
+  module.attr("qsa_parallel_selection_page_sizes") = py::make_tuple(64, 128);
   module.attr("attention_page_sizes") = py::make_tuple(256, 512);
   module.attr("kv_tile") = QSA_NATIVE_KV_TILE;
   module.attr("subgroup") = QSA_NATIVE_SUBGROUP;

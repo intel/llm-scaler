@@ -2522,9 +2522,9 @@ void moe_ws_up_cutlass_int4_with_shared_fp16_kernel(
     }
 }
 
-template <typename IndexT, int HT, bool Compact80 = false> class MoeWsDownCutlassInt4WithSharedFP16;
+template <typename IndexT, int HT, bool Compact80 = false, bool Compact160 = false> class MoeWsDownCutlassInt4WithSharedFP16;
 
-template <typename IndexT, int H_TILE, bool Compact80 = false>
+template <typename IndexT, int H_TILE, bool Compact80 = false, bool Compact160 = false>
 void moe_ws_down_cutlass_int4_with_shared_fp16_kernel(
     const fp16* routed_intermediates, const uint8_t* w2, const fp16* w2_scales,
     const fp16* topk_weight, const IndexT* topk_idx,
@@ -2539,7 +2539,7 @@ void moe_ws_down_cutlass_int4_with_shared_fp16_kernel(
     const int h_tiles = hidden_size / H_TILE;
 
     auto cgf = [&](sycl::handler& cgh) {
-        cgh.parallel_for<class MoeWsDownCutlassInt4WithSharedFP16<IndexT, H_TILE, Compact80>>(
+        cgh.parallel_for<class MoeWsDownCutlassInt4WithSharedFP16<IndexT, H_TILE, Compact80, Compact160>>(
             sycl::range<2>(n_tokens, h_tiles),
             [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
                 const int token  = (int)idx[0];
@@ -2566,6 +2566,14 @@ void moe_ws_down_cutlass_int4_with_shared_fp16_kernel(
                                 block_load<fp16,64>(in_row, overaligned_tag<16>{});
                             in_chunk.template select<16,1>(64) =
                                 block_load<fp16,16>(in_row+64, overaligned_tag<16>{});
+                        } else if constexpr (Compact160) {
+                            in_chunk = fp16(0);
+                            if (kb == 0) {
+                                in_chunk = block_load<fp16,128>(in_row, overaligned_tag<16>{});
+                            } else {
+                                in_chunk.template select<32,1>(0) =
+                                    block_load<fp16,32>(in_row+128, overaligned_tag<16>{});
+                            }
                         } else {
                             in_chunk = block_load<fp16, 2 * VL>(in_row + kb * 2);
                         }
@@ -2585,6 +2593,18 @@ void moe_ws_down_cutlass_int4_with_shared_fp16_kernel(
                                     block_load<uint32_t,8>(packed, overaligned_tag<8>{});
                                 words.template select<2,1>(8) =
                                     block_load<uint32_t,2>(packed+8, overaligned_tag<8>{});
+                                raw = words.template bit_cast_view<uint8_t>();
+                            } else if constexpr (Compact160) {
+                                // 80-byte rows: group 0 has 64 bytes; group 1
+                                // has only 16. Never read into the next row.
+                                simd<uint32_t,16> words(0);
+                                const auto* packed = reinterpret_cast<const uint32_t*>(weight_row);
+                                if (kb == 0) {
+                                    words = block_load<uint32_t,16>(packed, overaligned_tag<16>{});
+                                } else {
+                                    words.template select<4,1>(0) =
+                                        block_load<uint32_t,4>(packed, overaligned_tag<16>{});
+                                }
                                 raw = words.template bit_cast_view<uint8_t>();
                             } else {
                                 raw = block_load<uint8_t, VL>(weight_row);
@@ -2626,6 +2646,17 @@ void moe_ws_down_cutlass_int4_with_shared_fp16_kernel(
                     // A block load may not cross a shared row: for Qwen3.8 S=80,
                     // the second 64-lane load would consume 48 values from the
                     // following token/output row and include them in the dot.
+                    if constexpr (Compact160) {
+                        // Shared I=160 has one 32-value tail after two VL64 blocks.
+                        simd<float,32> hv = block_load<fp16,32>(hi_row + 128, overaligned_tag<16>{});
+                        #pragma unroll
+                        for (int hh = 0; hh < H_TILE; ++hh) {
+                            const fp16* wr = shared_down_weight + (size_t)(h_base+hh)*160 + 128;
+                            simd<float,32> wv = block_load<fp16,32>(wr, overaligned_tag<16>{});
+                            sum[hh] += gate * sycl::ext::intel::esimd::detail::sum<float,float,32>(hv*wv);
+                        }
+                        k = shared_inter_size;
+                    }
                     for (; k < shared_inter_size; ++k) {
                         float hv = (float)hi_row[k];
                         #pragma unroll
@@ -5288,7 +5319,8 @@ torch::Tensor moe_shared_expert_forward_int4_nmajor(
 // Compact Qwen3.8 TP8 prefill down GEMM. Logical group_size stays 128;
 // each row stores only the 80 valid INT4 values. Activations are expert-sorted
 // by the existing remap kernel; row counts must sum to x.size(0).
-torch::Tensor moe_compact80_down_grouped_gemm(
+template <int K>
+static torch::Tensor moe_compact_down_grouped_gemm(
     torch::Tensor x,              // [M, K] fp16
     torch::Tensor weight,          // [E, N, K/2] signed-S4 bytes (int8)
     torch::Tensor scale,           // [E, N, K/GS] fp16
@@ -5298,7 +5330,7 @@ torch::Tensor moe_compact80_down_grouped_gemm(
     TORCH_CHECK(weight.is_contiguous() && weight.device() == x.device() && weight.scalar_type() == at::kChar && weight.dim() == 3, "compact GEMM: contiguous S4 weights required");
     TORCH_CHECK(scale.is_contiguous() && scale.device() == x.device() && scale.scalar_type() == at::kHalf, "compact GEMM: FP16 scales required");
     TORCH_CHECK(expert_idx.is_contiguous() && expert_idx.device() == x.device() && expert_idx.scalar_type() == at::kInt && expert_idx.numel() == weight.size(0), "compact GEMM: E int32 row counts required");
-    TORCH_CHECK(weight.size(0) == 512 && x.size(1) == 80 && weight.size(1) == 2560, "compact GEMM: unsupported geometry");
+    TORCH_CHECK(weight.size(0) == 512 && x.size(1) == K && weight.size(1) == 2560, "compact GEMM: unsupported geometry");
     TORCH_CHECK(weight.size(2)*2 == x.size(1) && scale.sizes() == torch::IntArrayRef({512,weight.size(1),(x.size(1)+127)/128}), "compact GEMM: inconsistent weight/scale shapes");
     TORCH_CHECK(reinterpret_cast<uintptr_t>(x.const_data_ptr()) % 64 == 0,
                 "compact GEMM: 2D activation loads require 64-byte base alignment");
@@ -5307,11 +5339,10 @@ torch::Tensor moe_compact80_down_grouped_gemm(
     TORCH_CHECK(x.size(0) <= std::numeric_limits<int>::max() - 8192,
                 "compact GEMM: too many rows");
     const int M = x.size(0);
-    constexpr int K = 80;
     constexpr int E = 512;
     constexpr int N = 2560;
     const int K_packed = K / 8;
-    constexpr int K_groups = 1;
+    constexpr int K_groups = (K + 127) / 128;
 
     auto output = torch::empty({M, N}, x.options());
 
@@ -5425,6 +5456,24 @@ torch::Tensor moe_compact80_down_grouped_gemm(
     return output;
 }
 
+
+torch::Tensor moe_compact80_down_grouped_gemm(
+    torch::Tensor x, torch::Tensor weight, torch::Tensor scale, torch::Tensor counts) {
+    return moe_compact_down_grouped_gemm<80>(x, weight, scale, counts);
+}
+
+torch::Tensor moe_compact160_down_grouped_gemm(
+    torch::Tensor x, torch::Tensor weight, torch::Tensor scale, torch::Tensor counts) {
+    TORCH_CHECK(x.is_xpu(), "compact160 GEMM requires XPU");
+    auto& queue = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
+    TORCH_CHECK(queue.is_in_order() && queue.get_context() == c10::xpu::get_device_context() &&
+                queue.get_device() == c10::xpu::get_raw_device(x.device().index()),
+                "compact160 GEMM requires current in-order XPU queue/device/context");
+    for (const auto& t : {x,weight,scale,counts}) {
+        TORCH_CHECK(!t.is_neg() && !t.is_conj(), "compact160 GEMM rejects lazy neg/conj tensors");
+    }
+    return moe_compact_down_grouped_gemm<160>(x, weight, scale, counts);
+}
 
 // Same metadata-only contract as the legacy fast path, with compact shapes.
 int64_t qwen38_moe_compact80_weight_contract_v1(at::TensorList tensors, c10::Device device) {
@@ -5988,7 +6037,13 @@ torch::Tensor moe_forward_gelu_tanh_int4_decode(
     return output;
 }
 
+#include "moe_compact160.h"
+
 TORCH_LIBRARY_FRAGMENT(moe_int4_ops, m) {
+    m.def("qwen38_moe_compact160_weight_contract_v1(Tensor[] weights, Device device) -> int", &qwen38_moe_compact160_weight_contract_v1);
+    m.def("moe_compact160_down_grouped_gemm(Tensor x, Tensor weight, Tensor scale, Tensor rows_per_expert) -> Tensor");
+    m.def("moe_forward_compact160_out_v1(Tensor x, Tensor logits, Tensor w13_qweight_s4, Tensor w13_scales, Tensor w2_qweight_s4, Tensor w2_scales, Tensor shared_gate_up_weight, Tensor shared_down_weight, Tensor shared_expert_gate_weight, Tensor(a!) output, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor(a!)");
+    m.def("moe_forward_compact160_router_out_v1(Tensor x, Tensor router_weight, Tensor router_scale, Tensor w13_qweight_s4, Tensor w13_scales, Tensor w2_qweight_s4, Tensor w2_scales, Tensor shared_gate_up_weight, Tensor shared_down_weight, Tensor shared_expert_gate_weight, Tensor(a!) output, int top_k, int num_shared_experts, int n_routed_experts) -> Tensor(a!)");
     m.def("_moe_compact80_shared_up_ab_out_v1(Tensor x, Tensor shared_gate_up_weight, Tensor shared_expert_gate_weight, Tensor(a!) intermediates, Tensor(b!) gate_values, bool candidate) -> ()");
     m.def("qwen38_moe_compact80_weight_contract_v1(Tensor[] weights, Device device) -> int", &qwen38_moe_compact80_weight_contract_v1);
     m.def("moe_compact80_down_grouped_gemm(Tensor x, Tensor weight, Tensor scale, Tensor rows_per_expert) -> Tensor");
@@ -6050,16 +6105,25 @@ TORCH_LIBRARY_FRAGMENT(moe_int4_ops, m) {
 // 此私有 out/void ABI 必须让 preflight 看到原始 math bits。
 // 通用 MathBitsFallback 会先 clone/resolve 再执行 XPU kernel；对 mutable
 // 参数还会在执行后尝试返回值回写，不能满足本 ABI 的提交前拒绝契约。
-// 只覆盖这一 op，不能给整个命名空间设置 fallthrough。
+// 只覆盖显式拒绝 math bits 的 op，不能给整个命名空间设置 fallthrough。
 TORCH_LIBRARY_IMPL(moe_int4_ops, Negative, m) {
+    m.impl("moe_compact160_down_grouped_gemm", torch::CppFunction::makeFallthrough());
+    m.impl("moe_forward_compact160_out_v1", torch::CppFunction::makeFallthrough());
+    m.impl("moe_forward_compact160_router_out_v1", torch::CppFunction::makeFallthrough());
     m.impl("_moe_compact80_shared_up_ab_out_v1", torch::CppFunction::makeFallthrough());
 }
 
 TORCH_LIBRARY_IMPL(moe_int4_ops, Conjugate, m) {
+    m.impl("moe_compact160_down_grouped_gemm", torch::CppFunction::makeFallthrough());
+    m.impl("moe_forward_compact160_out_v1", torch::CppFunction::makeFallthrough());
+    m.impl("moe_forward_compact160_router_out_v1", torch::CppFunction::makeFallthrough());
     m.impl("_moe_compact80_shared_up_ab_out_v1", torch::CppFunction::makeFallthrough());
 }
 
 TORCH_LIBRARY_IMPL(moe_int4_ops, XPU, m) {
+    m.impl("moe_compact160_down_grouped_gemm", &moe_compact160_down_grouped_gemm);
+    m.impl("moe_forward_compact160_out_v1", &moe_forward_compact160_out_v1);
+    m.impl("moe_forward_compact160_router_out_v1", &moe_forward_compact160_router_out_v1);
     m.impl("_moe_compact80_shared_up_ab_out_v1", &moe_compact80_shared_up_ab_out_v1);
     m.impl("moe_compact80_down_grouped_gemm", &moe_compact80_down_grouped_gemm);
     m.impl("moe_router_forward_int4", &moe_router_forward_int4);

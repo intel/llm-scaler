@@ -2,6 +2,10 @@
 
 No _xpu_C fallback is loaded. Set GDN_STRICT_XPU=1 and GDN_SPEC_DSO to a
 build-only LGRF DSO; ZE_AFFINITY_MASK must be set by the GPU owner.
+
+The same harness covers Qwen3.8 TP8 H=2/HV=6 and TP4 H=4/HV=12, so the
+TP4 dispatch is compared against the real Triton conv plus recurrent path for
+every M=2..8 and both A_log input dtypes.
 """
 
 import os
@@ -15,9 +19,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _device_case(m, seed=813, a_fp32=True, extra_rows=0):
-    cpu = make_positive_packed_case(m, seed)
+def _device_case(m, seed=813, a_fp32=True, extra_rows=0, *, H=2, HV=6):
+    cpu = make_positive_packed_case(m, seed, H=H, HV=HV)
     case = {"m": m}
+    case["H"], case["HV"] = H, HV
     for name in ("conv", "ssm"):
         shape, strides = cpu[name].shape, cpu[name].stride()
         if name == "conv" and extra_rows:
@@ -45,7 +50,9 @@ def _device_case(m, seed=813, a_fp32=True, extra_rows=0):
     case["accepted"] = {
         n: torch.tensor([n], dtype=torch.int32, device="xpu") for n in range(1, m + 1)
     }
-    case["output"] = torch.full((m, 6, 128), -123.0, dtype=torch.float16, device="xpu")
+    case["output"] = torch.full(
+        (m, HV, 128), -123.0, dtype=torch.float16, device="xpu"
+    )
     case["z"] = torch.full_like(case["output"], -123.0)
     return case
 
@@ -60,15 +67,15 @@ def _native(case, accepted):
         case["A_log"],
         case["dt_bias"],
         case["ba"],
-        case["ssm"].view(-1, 6, 128, 128),
+        case["ssm"].view(-1, case["HV"], 128, 128),
         case["output"],
         case["z"],
         case["tokens"],
         case["accepted"][accepted],
         1,
         case["m"],
-        2,
-        6,
+        case["H"],
+        case["HV"],
         128,
         128,
         128**-0.5,
@@ -82,10 +89,13 @@ def _triton(case, accepted):
     )
 
     m = case["m"]
+    H, HV = case["H"], case["HV"]
+    key_dim = H * 128
+    conv_dim = (2 * H + HV) * 128
     tokens = case["tokens_long"]
     # Same sequential QKV layout as prepare_gdn_attention_core_inputs. The
     # reference materializes its own input since causal_conv mutates x in place.
-    mixed = case["qkvz"].index_select(0, tokens)[:, :1280].contiguous()
+    mixed = case["qkvz"].index_select(0, tokens)[:, :conv_dim].contiguous()
     mixed = causal_conv1d_update(
         mixed,
         case["conv"].transpose(-1, -2),
@@ -101,13 +111,13 @@ def _triton(case, accepted):
     ba = case["ba"].index_select(0, tokens)
     result, _ = fused_sigmoid_gating_delta_rule_update(
         A_log=case["A_log"],
-        a=ba[:, 6:],
-        b=ba[:, :6],
+        a=ba[:, HV:],
+        b=ba[:, :HV],
         dt_bias=case["dt_bias"],
-        q=mixed[:, :256].reshape(1, m, 2, 128),
-        k=mixed[:, 256:512].reshape(1, m, 2, 128),
-        v=mixed[:, 512:].reshape(1, m, 6, 128),
-        initial_state=case["ssm"].view(-1, 6, 128, 128),
+        q=mixed[:, :key_dim].reshape(1, m, H, 128),
+        k=mixed[:, key_dim : 2 * key_dim].reshape(1, m, H, 128),
+        v=mixed[:, 2 * key_dim:].reshape(1, m, HV, 128),
+        initial_state=case["ssm"].view(-1, HV, 128, 128),
         inplace_final_state=True,
         cu_seqlens=case["starts"],
         ssm_state_indices=case["ids"],
@@ -115,7 +125,7 @@ def _triton(case, accepted):
         use_qk_l2norm_in_kernel=True,
     )
     case["output"].index_copy_(0, tokens, result[0])
-    case["z"].copy_(case["qkvz"][:, 1280:].reshape(m, 6, 128))
+    case["z"].copy_(case["qkvz"][:, conv_dim:].reshape(m, HV, 128))
 
 
 def _compare(native, reference, label):
@@ -147,15 +157,20 @@ def _load_native():
 
 @pytest.mark.parametrize("m", range(2, 9))
 @pytest.mark.parametrize("a_fp32", [False, True])
-def test_all_acceptance_counts_multistep_actual_triton(m, a_fp32):
-    native = _device_case(m, a_fp32=a_fp32, extra_rows=2)
-    reference = _device_case(m, a_fp32=a_fp32, extra_rows=2)
+@pytest.mark.parametrize(
+    ("H", "HV"), [(2, 6), (4, 12)], ids=["tp8-h2-hv6", "tp4-h4-hv12"]
+)
+def test_all_acceptance_counts_multistep_actual_triton(m, a_fp32, H, HV):
+    native = _device_case(m, a_fp32=a_fp32, extra_rows=2, H=H, HV=HV)
+    reference = _device_case(m, a_fp32=a_fp32, extra_rows=2, H=H, HV=HV)
     rng = torch.Generator(device="cpu").manual_seed(1907 + m)
     for step, accepted in enumerate([1, *range(m, 0, -1), m, 1]):
         # Every forward sees new token projections, while both providers keep
         # their own persistent rollback states across all acceptance patterns.
-        qkvz = (torch.randn(m, 2048, generator=rng) * 0.75).half()
-        ba = (torch.randn(m, 12, generator=rng) * 0.5).half()
+        qkvz = (
+            torch.randn(m, native["qkvz"].shape[1], generator=rng) * 0.75
+        ).half()
+        ba = torch.randn(m, native["ba"].shape[1], generator=rng).mul(0.5).half()
         for case in (native, reference):
             case["qkvz"].copy_(qkvz)
             case["ba"].copy_(ba)
@@ -164,9 +179,16 @@ def test_all_acceptance_counts_multistep_actual_triton(m, a_fp32):
         _compare(native, reference, f"M={m} step={step} accepted={accepted}")
 
 
-def test_independent_and_handoff_streams_have_no_shared_scratch():
-    native_a, reference_a = _device_case(4, 104), _device_case(4, 104)
-    native_b, reference_b = _device_case(6, 206), _device_case(6, 206)
+@pytest.mark.parametrize(
+    ("H", "HV"), [(2, 6), (4, 12)], ids=["tp8-h2-hv6", "tp4-h4-hv12"]
+)
+def test_independent_and_handoff_streams_have_no_shared_scratch(H, HV):
+    native_a, reference_a = _device_case(4, 104, H=H, HV=HV), _device_case(
+        4, 104, H=H, HV=HV
+    )
+    native_b, reference_b = _device_case(6, 206, H=H, HV=HV), _device_case(
+        6, 206, H=H, HV=HV
+    )
     producer, consumer = torch.xpu.Stream(), torch.xpu.Stream()
     producer.wait_stream(torch.xpu.current_stream())
     consumer.wait_stream(torch.xpu.current_stream())

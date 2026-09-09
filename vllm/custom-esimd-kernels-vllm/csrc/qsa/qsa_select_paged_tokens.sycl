@@ -120,8 +120,8 @@ at::Tensor select_paged_tokens_impl(
     return out;
   }
   if (parallel) {
-    TORCH_CHECK(PageSizeT == 64 && rows <= 64,
-                "parallel selection requires page64 and at most 64 rows");
+    TORCH_CHECK(rows <= 64,
+                "parallel selection supports at most 64 rows");
     for (const auto& input : {q, compressed_key_cache, page_table, token_to_req,
                               query_positions, sequence_lengths}) {
       TORCH_CHECK(!out.is_alias_of(input),
@@ -129,7 +129,7 @@ at::Tensor select_paged_tokens_impl(
     }
     return select_preprocessed_parallel(q, compressed_key_cache, page_table,
                                         token_to_req, query_positions,
-                                        sequence_lengths, out);
+                                        sequence_lengths, PageSizeT, out);
   }
   const int64_t physical_pages = compressed_key_cache.size(0);
   const int64_t requests = page_table.size(0);
@@ -373,9 +373,14 @@ at::Tensor select_paged_tokens_parallel_v1(
     int64_t compress_ratio,
     int64_t compressed_page_size,
     at::Tensor out) {
-  TORCH_CHECK(compressed_page_size == 64,
-              "parallel selection requires compressed_page_size=64");
-  return select_paged_tokens_impl<64>(
+  TORCH_CHECK(compressed_page_size == 64 || compressed_page_size == 128,
+              "parallel selection requires compressed_page_size=64 or 128");
+  if (compressed_page_size == 64) {
+    return select_paged_tokens_impl<64>(
+        q, compressed_key_cache, page_table, token_to_req, query_positions,
+        sequence_lengths, token_topk, compress_ratio, out, true);
+  }
+  return select_paged_tokens_impl<128>(
       q, compressed_key_cache, page_table, token_to_req, query_positions,
       sequence_lengths, token_topk, compress_ratio, out, true);
 }
