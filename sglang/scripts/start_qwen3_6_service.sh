@@ -105,6 +105,11 @@ if [[ "$MODEL_PATH" == *.gguf ]]; then
     # Folds GemmaRMSNorm(input_layernorm) + the q8_0 in_proj/qkv GEMV + the fp16
     # in_proj_ba GEMV into one op. Set to 0 for the unfused fallback.
     export SGL_XPU_GGUF_RESADD_NORM="${SGL_XPU_GGUF_RESADD_NORM:-1}"
+    # GGUF k-quant-only fusions. They default to off in SGLang so FP8 launches
+    # do not probe GGUF layouts; enable them explicitly for the GGUF path.
+    export SGL_XPU_GGUF_RESADD_NORM_KQ="${SGL_XPU_GGUF_RESADD_NORM_KQ:-1}"
+    export SGL_XPU_GGUF_MLP_SILU="${SGL_XPU_GGUF_MLP_SILU:-1}"
+    export SGL_XPU_GGUF_NORM_OUT_Q5K="${SGL_XPU_GGUF_NORM_OUT_Q5K:-1}"
     # Largest decode batch the fusions handle. Must cover the MTP verify batch
     # (concurrency x num_draft_tokens), so leave it at the default 64.
     export SGL_XPU_GGUF_FUSE_MAX_M="${SGL_XPU_GGUF_FUSE_MAX_M:-64}"
