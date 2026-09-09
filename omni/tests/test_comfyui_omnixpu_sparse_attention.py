@@ -75,6 +75,7 @@ def test_unrecognized_guard_fails_closed(function):
 
 
 def test_apply_atomic_and_idempotent(monkeypatch):
+    monkeypatch.setitem(sys.modules,"nodes",SimpleNamespace(NODE_CLASS_MAPPINGS={}))
     ck=types.ModuleType("comfy_kitchen");ck.sol_attn_is_available=lambda:True
     module=types.ModuleType("comfy_extras.nodes_sparse_attention")
     module._ineligible=generic;module.h3_eligible=unsupported
@@ -90,6 +91,34 @@ def test_apply_atomic_and_idempotent(monkeypatch):
     assert adapter.apply()==(True,"already patched")
     assert (module._ineligible,module.h3_eligible)==first
     assert module.h3_sparse_attention is untouched and module.SparseAttnPatch is untouched
+
+
+def test_apply_targets_registered_file_loader_module(monkeypatch,tmp_path):
+    ck=types.ModuleType("comfy_kitchen");ck.sol_attn_is_available=lambda:True
+    module=types.ModuleType("nodes_sparse_attention")
+    module.__file__=str(tmp_path/"comfy_extras/nodes_sparse_attention.py")
+    node=type("BlockSparseAttention",(),{"__module__":module.__name__})
+    module.BlockSparseAttention=node
+    module._ineligible=generic;module.h3_eligible=eligible
+    canonical=types.ModuleType("comfy_extras.nodes_sparse_attention")
+    canonical._ineligible=generic;canonical.h3_eligible=eligible
+    package=types.ModuleType("comfy_extras");package.nodes_sparse_attention=canonical
+    nodes=SimpleNamespace(__file__=str(tmp_path/"nodes.py"),NODE_CLASS_MAPPINGS={"BlockSparseAttention":node})
+    for name,value in (("nodes",nodes),(module.__name__,module),("comfy_extras",package),("comfy_kitchen",ck)):
+        monkeypatch.setitem(sys.modules,name,value)
+    assert adapter.apply()==(True,"")
+    q=SimpleNamespace(device=SimpleNamespace(type="xpu"))
+    assert module._ineligible(q,q,q,128) is None
+    assert canonical._ineligible is generic and canonical.h3_eligible is eligible
+    assert adapter.apply()==(True,"already patched")
+
+
+def test_registered_node_ownership_mismatch_fails_closed(monkeypatch):
+    ck=types.ModuleType("comfy_kitchen");ck.sol_attn_is_available=lambda:True
+    node=type("BlockSparseAttention",(),{"__module__":"missing_sparse_module"})
+    monkeypatch.setitem(sys.modules,"nodes",SimpleNamespace(NODE_CLASS_MAPPINGS={"BlockSparseAttention":node}))
+    monkeypatch.setitem(sys.modules,"comfy_kitchen",ck)
+    assert adapter.apply()==(False,"upstream sparse eligibility is unsupported: registered sparse node has no owning module")
 
 
 def test_missing_native_leaves_upstream_unmodified(monkeypatch):

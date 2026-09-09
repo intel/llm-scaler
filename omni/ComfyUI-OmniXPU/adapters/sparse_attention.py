@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import ast
 import inspect
+import sys
 import textwrap
 from functools import update_wrapper
+from pathlib import Path
 
 _MARKER = "__omnixpu_sparse_eligibility_original__"
 
@@ -45,12 +47,30 @@ def _extend_device_guard(function, tensor_name):
     return adapted
 
 
+def _upstream_module():
+    # ComfyUI's file loader registers this built-in as nodes_sparse_attention,
+    # whereas a normal package import creates a separate module object.
+    # Follow the registered node class so its closures use the adapted guards.
+    nodes = sys.modules.get("nodes")
+    node = getattr(nodes, "NODE_CLASS_MAPPINGS", {}).get("BlockSparseAttention")
+    if node is not None:
+        module = sys.modules.get(node.__module__)
+        if module is None or getattr(module, "BlockSparseAttention", None) is not node:
+            raise ValueError("registered sparse node has no owning module")
+        expected = Path(nodes.__file__).resolve().parent / "comfy_extras/nodes_sparse_attention.py"
+        if Path(module.__file__).resolve() != expected:
+            raise ValueError("registered sparse node is not the upstream built-in")
+        return module
+    from comfy_extras import nodes_sparse_attention
+    return nodes_sparse_attention
+
+
 def apply():
     try:
         import comfy_kitchen as ck
         if not ck.sol_attn_is_available():
             return False, "complete native XPU Sol API is unavailable"
-        from comfy_extras import nodes_sparse_attention as upstream
+        upstream = _upstream_module()
         functions = (upstream._ineligible, upstream.h3_eligible)
         if all(hasattr(f, _MARKER) for f in functions):
             return True, "already patched"
