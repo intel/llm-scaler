@@ -28,6 +28,11 @@ RoPE, generic INT8 linear dispatch, and the old FP8 negative-zero wrapper are
 not registered by this custom node. Duplicating those registrations here can
 override Kitchen's constraints and fallback policy.
 
+ComfyUI's quantized-format eligibility recognizes `int8_tensorwise` when the
+active Kitchen XPU backend provides its native INT8 and ConvRot operations.
+Model requests for full-precision matrix multiplication still apply. Other
+quantized formats retain ComfyUI's own eligibility decisions.
+
 ## Install
 
 The node is bundled with the `llm-scaler-omni` ComfyUI image. It requires:
@@ -95,6 +100,7 @@ OMNIXPU_ATTENTION=0         # Disable the attention adapter
 OMNIXPU_SPARSE_ATTENTION=0  # Disable XPU eligibility for Model Sparse Attention
 OMNIXPU_NORM=0              # Disable the norm adapter
 OMNIXPU_FP8_GEMM=0          # Disable the temporary FP8 model/factory adapter
+OMNIXPU_QUANTIZED_MATMUL=0  # Disable native INT8 model-format eligibility
 OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
 OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM=0  # Disable Windows XPU model-boundary trim
 OMNIXPU_LORA_MEMORY=0       # Disable cached whole-LoRA budgets and staging logs
