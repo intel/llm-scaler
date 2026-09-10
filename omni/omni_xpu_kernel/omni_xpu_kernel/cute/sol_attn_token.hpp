@@ -124,6 +124,11 @@ std::vector<at::Tensor> token_scan(
           const float ks0=broadcast<1>(kscale,acc,i);
           float kept_score=-INFINITY;
           if(query<NG && key<T && ks0>0 && cp[(int64_t(bh)*NG+query)*N+block]) {
+            // Histogram and remainder must assign identical bins. Contracting
+            // the final score multiply with reference subtraction only in the
+            // histogram can move a boundary token and exceed the whole-bin
+            // budget. Preserve the shared FP32 rounding sequence in this block.
+            #pragma clang fp contract(off)
             const float score=float(acc(i))*broadcast<0>(qscale,acc,i)*ks0;
             kept_score=score;
             const float rel=score-broadcast<0>(reference,acc,i)+8.0f;
