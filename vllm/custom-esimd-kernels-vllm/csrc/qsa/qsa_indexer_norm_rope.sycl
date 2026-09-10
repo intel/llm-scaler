@@ -1,0 +1,510 @@
+// Copyright 2026
+// SPDX-License-Identifier: Apache-2.0
+//
+// Qwen3.8 QSA indexer Gemma RMSNorm + exact 1D/interleaved MRoPE.
+
+#include "qsa_ops.h"
+#include "../xpu/mrope_ranges.h"
+
+#include <c10/xpu/XPUStream.h>
+#include <c10/macros/Macros.h>
+#include <torch/extension.h>
+
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/sycl.hpp>
+
+#include <cstdint>
+#include <limits>
+
+namespace qsa {
+namespace {
+
+using fp16 = sycl::half;
+using namespace sycl::ext::intel::esimd;
+
+constexpr int64_t kHeadDim = 128;
+constexpr int64_t kRotaryDim = 64;
+constexpr int64_t kRotaryHalf = kRotaryDim / 2;
+constexpr int64_t kMropeAxes = 3;
+constexpr int64_t kMropeSection1 = 11;
+constexpr int64_t kMropeSection2 = 10;
+constexpr float kEpsilon = 1e-6f;
+
+static_assert(kMropeSection1 + kMropeSection1 + kMropeSection2 == kRotaryHalf);
+
+template <bool Mrope, typename PosT>
+class QsaIndexerNormRopeKernel;
+
+template <bool Mrope, typename PosT>
+ESIMD_INLINE void apply_rope(
+    simd<float, kHeadDim>& value,
+    const PosT* positions,
+    uint32_t position_row_stride,
+    uint32_t row,
+    fp16* cos_sin_cache) {
+  uint32_t pos_t = static_cast<uint32_t>(positions[row]);
+  uint32_t pos_h = pos_t;
+  uint32_t pos_w = pos_t;
+  if constexpr (Mrope) {
+    pos_h = static_cast<uint32_t>(positions[position_row_stride + row]);
+    pos_w = static_cast<uint32_t>(positions[2 * position_row_stride + row]);
+  }
+
+  simd<fp16, kRotaryHalf> t_cos16 =
+      block_load<fp16, kRotaryHalf>(cos_sin_cache + pos_t * kRotaryDim);
+  simd<fp16, kRotaryHalf> t_sin16 = block_load<fp16, kRotaryHalf>(
+      cos_sin_cache + pos_t * kRotaryDim + kRotaryHalf);
+  simd<float, kRotaryHalf> cos_values = t_cos16;
+  simd<float, kRotaryHalf> sin_values = t_sin16;
+
+  if constexpr (Mrope) {
+    simd<fp16, kRotaryHalf> h_cos16 =
+        block_load<fp16, kRotaryHalf>(cos_sin_cache + pos_h * kRotaryDim);
+    simd<fp16, kRotaryHalf> h_sin16 = block_load<fp16, kRotaryHalf>(
+        cos_sin_cache + pos_h * kRotaryDim + kRotaryHalf);
+    simd<fp16, kRotaryHalf> w_cos16 =
+        block_load<fp16, kRotaryHalf>(cos_sin_cache + pos_w * kRotaryDim);
+    simd<fp16, kRotaryHalf> w_sin16 = block_load<fp16, kRotaryHalf>(
+        cos_sin_cache + pos_w * kRotaryDim + kRotaryHalf);
+    // Qwen3.8 interleaved sections select T/H/W by pair index modulo three.
+    cos_values.select<kMropeSection1, 3>(1) =
+        h_cos16.select<kMropeSection1, 3>(1);
+    sin_values.select<kMropeSection1, 3>(1) =
+        h_sin16.select<kMropeSection1, 3>(1);
+    cos_values.select<kMropeSection2, 3>(2) =
+        w_cos16.select<kMropeSection2, 3>(2);
+    sin_values.select<kMropeSection2, 3>(2) =
+        w_sin16.select<kMropeSection2, 3>(2);
+  }
+
+  simd<float, kRotaryHalf> first = value.select<kRotaryHalf, 1>(0);
+  simd<float, kRotaryHalf> second =
+      value.select<kRotaryHalf, 1>(kRotaryHalf);
+  value.select<kRotaryHalf, 1>(0) = first * cos_values - second * sin_values;
+  value.select<kRotaryHalf, 1>(kRotaryHalf) =
+      second * cos_values + first * sin_values;
+}
+
+template <bool Mrope, typename PosT>
+void launch_indexer_norm_rope(
+    const at::Tensor& input,
+    at::Tensor output,
+    const at::Tensor& weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache) {
+  const uint32_t rows = static_cast<uint32_t>(input.size(0));
+  const uint32_t heads = static_cast<uint32_t>(input.size(1));
+  const uint32_t position_row_stride = Mrope
+      ? static_cast<uint32_t>(positions.stride(0))
+      : 1;
+  const auto* input_ptr = reinterpret_cast<const fp16*>(input.data_ptr());
+  auto* output_ptr = reinterpret_cast<fp16*>(output.data_ptr());
+  const auto* weight_ptr = reinterpret_cast<const fp16*>(weight.data_ptr());
+  const auto* position_ptr = positions.data_ptr<PosT>();
+  auto* cache_ptr = reinterpret_cast<fp16*>(cos_sin_cache.data_ptr());
+
+  auto& queue = c10::xpu::getCurrentXPUStream(input.device().index()).queue();
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<QsaIndexerNormRopeKernel<Mrope, PosT>>(
+        sycl::nd_range<2>(sycl::range<2>(heads, rows), sycl::range<2>(1, 1)),
+        [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+          const uint32_t head = item.get_group(0);
+          const uint32_t row = item.get_group(1);
+          const uint32_t offset = row * heads * kHeadDim + head * kHeadDim;
+          simd<fp16, kHeadDim> input_values =
+              block_load<fp16, kHeadDim>(input_ptr + offset);
+          simd<float, kHeadDim> values = input_values;
+          simd<float, kHeadDim> squares = values * values;
+          const float variance =
+              sycl::ext::intel::esimd::detail::sum<float, float, kHeadDim>(
+                  squares) /
+              static_cast<float>(kHeadDim);
+          const float inverse_rms = __ESIMD_NS::rsqrt(variance + kEpsilon);
+          simd<float, kHeadDim> norm_weight =
+              block_load<fp16, kHeadDim>(weight_ptr);
+          values = values * (norm_weight + 1.0f);
+          values *= inverse_rms;
+          apply_rope<Mrope, PosT>(
+              values, position_ptr, position_row_stride, row, cache_ptr);
+          block_store<fp16, kHeadDim>(output_ptr + offset, values);
+        });
+  });
+}
+
+// v2 单独保留 eager FP16 中间舍入，不改变 v1 的 FP32 RoPE。
+template <bool Mrope, typename PosT>
+class QsaIndexerNormRopeV2Kernel;
+
+template <bool Mrope, typename PosT>
+class QsaIndexerPositionsCheckV2Kernel;
+
+// 以整数位运算表达 FP16 RNE，而非可被后端折叠的 fptrunc/fpext 对。
+// 返回值仍用 FP32 承载，但只能是 FP16 可表示值；加减不能越过这个边界
+// 与原乘法收缩。仅用于 v2 的 RoPE 四个乘积，不影响 norm/v1。
+ESIMD_INLINE simd<float, kRotaryHalf> round_rope_product_fp16_v2(
+    simd<float, kRotaryHalf> value) {
+  simd<uint32_t, kRotaryHalf> bits = value.bit_cast_view<uint32_t>();
+  simd<uint32_t, kRotaryHalf> sign = bits & 0x80000000u;
+  simd<uint32_t, kRotaryHalf> magnitude = bits & 0x7fffffffu;
+
+  // 正规 FP16 数保留 FP32 尾数高 10 位；恰好半 ULP 时向偶数舍入。
+  simd<uint32_t, kRotaryHalf> rounded =
+      (magnitude + 0xfffu + ((magnitude >> 13) & 1u)) & 0xffffe000u;
+  rounded.merge(0x7f800000u, rounded >= 0x47800000u);
+
+  // FP16 subnormal 的步长固定为 2^-24。限制 shift 到 [14,24]，
+  // 即使此 SIMD lane 是正规值/NaN，也不能执行无效的整数移位。
+  simd<uint32_t, kRotaryHalf> exponent = magnitude >> 23;
+  exponent.merge(102u, exponent < 102u);
+  exponent.merge(112u, exponent > 112u);
+  simd<uint32_t, kRotaryHalf> shift = 126u - exponent;
+  simd<uint32_t, kRotaryHalf> significand = (magnitude & 0x7fffffu) | 0x800000u;
+  simd<uint32_t, kRotaryHalf> one(1u);
+  simd<uint32_t, kRotaryHalf> bias = (one << (shift - 1u)) - 1u;
+  simd<uint32_t, kRotaryHalf> units =
+      (significand + bias + ((significand >> shift) & 1u)) >> shift;
+  units.merge(0u, magnitude < 0x33000000u);  // 小于半个最小 subnormal。
+  simd<float, kRotaryHalf> subnormal = convert<float>(units) * 0x1p-24f;
+  simd<uint32_t, kRotaryHalf> subnormal_bits = subnormal.bit_cast_view<uint32_t>();
+  rounded.merge(subnormal_bits, magnitude < 0x38800000u);
+  // Infinity 保持 infinity；NaN 保持为 quiet NaN，不能误变成 infinity。
+  rounded.merge(0x7fc00000u, magnitude > 0x7f800000u);
+  rounded |= sign;
+  return rounded.bit_cast_view<float>();
+}
+
+template <bool Mrope>
+ESIMD_INLINE void apply_rope_fp16_v2(
+    simd<fp16, kHeadDim>& value,
+    uint32_t pos_t, uint32_t pos_h, uint32_t pos_w,
+    const fp16* cache) {
+#pragma clang fp contract(off) reassociate(off)
+  simd<fp16, kRotaryHalf> cos16 =
+      block_load<fp16, kRotaryHalf>(cache + pos_t * kRotaryDim);
+  simd<fp16, kRotaryHalf> sin16 = block_load<fp16, kRotaryHalf>(
+      cache + pos_t * kRotaryDim + kRotaryHalf);
+  if constexpr (Mrope) {
+    simd<fp16, kRotaryHalf> h_cos =
+        block_load<fp16, kRotaryHalf>(cache + pos_h * kRotaryDim);
+    simd<fp16, kRotaryHalf> h_sin = block_load<fp16, kRotaryHalf>(
+        cache + pos_h * kRotaryDim + kRotaryHalf);
+    simd<fp16, kRotaryHalf> w_cos =
+        block_load<fp16, kRotaryHalf>(cache + pos_w * kRotaryDim);
+    simd<fp16, kRotaryHalf> w_sin = block_load<fp16, kRotaryHalf>(
+        cache + pos_w * kRotaryDim + kRotaryHalf);
+    cos16.select<kMropeSection1, 3>(1) = h_cos.select<kMropeSection1, 3>(1);
+    sin16.select<kMropeSection1, 3>(1) = h_sin.select<kMropeSection1, 3>(1);
+    cos16.select<kMropeSection2, 3>(2) = w_cos.select<kMropeSection2, 3>(2);
+    sin16.select<kMropeSection2, 3>(2) = w_sin.select<kMropeSection2, 3>(2);
+  }
+  simd<float, kRotaryHalf> first = value.select<kRotaryHalf, 1>(0);
+  simd<float, kRotaryHalf> second = value.select<kRotaryHalf, 1>(kRotaryHalf);
+  simd<float, kRotaryHalf> cos_values = cos16;
+  simd<float, kRotaryHalf> sin_values = sin16;
+  // 对应四个独立的 eager torch.mul(FP16)。转换不能挪到加减之后，
+  // 也不能收缩成 FMA，否则 cancellation 附近会与 fallback 明显不同。
+  simd<float, kRotaryHalf> first_cos = round_rope_product_fp16_v2(first * cos_values);
+  simd<float, kRotaryHalf> second_sin = round_rope_product_fp16_v2(second * sin_values);
+  simd<float, kRotaryHalf> second_cos = round_rope_product_fp16_v2(second * cos_values);
+  simd<float, kRotaryHalf> first_sin = round_rope_product_fp16_v2(first * sin_values);
+  value.select<kRotaryHalf, 1>(0) = convert<fp16>(first_cos - second_sin);
+  value.select<kRotaryHalf, 1>(kRotaryHalf) = convert<fp16>(second_cos + first_sin);
+}
+
+template <bool Mrope, typename PosT>
+void launch_indexer_norm_rope_v2(
+    const at::Tensor& input, at::Tensor output, const at::Tensor& weight,
+    const at::Tensor& positions, const at::Tensor& cos_sin_cache) {
+  const uint32_t rows = static_cast<uint32_t>(input.size(0));
+  const uint32_t heads = static_cast<uint32_t>(input.size(1));
+  const int64_t cache_rows = cos_sin_cache.size(0);
+  const uint32_t input_row_stride = static_cast<uint32_t>(input.stride(0));
+  const uint32_t position_row_stride = Mrope
+      ? static_cast<uint32_t>(positions.stride(0)) : 1;
+  const uint32_t position_col_stride = Mrope
+      ? static_cast<uint32_t>(positions.stride(1)) : 1;
+  const auto* input_ptr = reinterpret_cast<const fp16*>(input.data_ptr());
+  auto* output_ptr = reinterpret_cast<fp16*>(output.data_ptr());
+  const auto* weight_ptr = reinterpret_cast<const fp16*>(weight.data_ptr());
+  const auto* position_ptr = positions.data_ptr<PosT>();
+  const auto* cache_ptr = reinterpret_cast<const fp16*>(cos_sin_cache.data_ptr());
+  auto& queue = c10::xpu::getCurrentXPUStream(input.device().index()).queue();
+  // 使用与 ATen indexing 相同的 regular SYCL 断言，避免依赖 ESIMD 对
+  // __assert_fail 的后端支持。不写 workspace/CPU proof。
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<QsaIndexerPositionsCheckV2Kernel<Mrope, PosT>>(
+        sycl::range<1>(rows), [=](sycl::id<1> index) {
+          const uint32_t column = static_cast<uint32_t>(index[0]) * position_col_stride;
+          const int64_t pos_t = position_ptr[column];
+          int64_t pos_h = pos_t;
+          int64_t pos_w = pos_t;
+          if constexpr (Mrope) {
+            pos_h = position_ptr[position_row_stride + column];
+            pos_w = position_ptr[2 * position_row_stride + column];
+          }
+          const bool valid = pos_t >= -cache_rows && pos_t < cache_rows &&
+              pos_h >= -cache_rows && pos_h < cache_rows &&
+              pos_w >= -cache_rows && pos_w < cache_rows;
+          SYCL_KERNEL_ASSERT(valid && "QSA norm+RoPE v2 position out of bounds");
+        });
+  });
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<QsaIndexerNormRopeV2Kernel<Mrope, PosT>>(
+        sycl::nd_range<2>(sycl::range<2>(heads, rows), sycl::range<2>(1, 1)),
+        [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+#pragma clang fp contract(off) reassociate(off)
+          const uint32_t head = item.get_group(0);
+          const uint32_t row = item.get_group(1);
+          const uint32_t position_col = row * position_col_stride;
+          int64_t pos_t = position_ptr[position_col];
+          int64_t pos_h = pos_t;
+          int64_t pos_w = pos_t;
+          if constexpr (Mrope) {
+            pos_h = position_ptr[position_row_stride + position_col];
+            pos_w = position_ptr[2 * position_row_stride + position_col];
+          }
+          // 与 eager cache[positions] 一致：负索引允许一次回绕。
+          // 必须在缩窄到 uint32 或任何 cache load 之前检查原始 int64。
+          const bool valid = pos_t >= -cache_rows && pos_t < cache_rows &&
+              pos_h >= -cache_rows && pos_h < cache_rows &&
+              pos_w >= -cache_rows && pos_w < cache_rows;
+          if (!valid) {
+            return;  // 不依赖前一个 kernel 的 assert 是否中止队列，绝不越界读取。
+          }
+          if (pos_t < 0) pos_t += cache_rows;
+          if (pos_h < 0) pos_h += cache_rows;
+          if (pos_w < 0) pos_w += cache_rows;
+          const uint32_t offset = (row * heads + head) * kHeadDim;
+          simd<float, kHeadDim> values =
+              block_load<fp16, kHeadDim>(
+                  input_ptr + row * input_row_stride + head * kHeadDim);
+          simd<float, kHeadDim> squares = values * values;
+          const float variance =
+              sycl::ext::intel::esimd::detail::sum<float, float, kHeadDim>(squares) /
+              static_cast<float>(kHeadDim);
+          const float inverse_rms = __ESIMD_NS::rsqrt(variance + kEpsilon);
+          simd<float, kHeadDim> norm_weight =
+              block_load<fp16, kHeadDim>(weight_ptr);
+          values = values * inverse_rms;
+          values = values * (1.0f + norm_weight);
+          simd<fp16, kHeadDim> normed = convert<fp16>(values);
+          apply_rope_fp16_v2<Mrope>(
+              normed, static_cast<uint32_t>(pos_t),
+              static_cast<uint32_t>(pos_h), static_cast<uint32_t>(pos_w), cache_ptr);
+          block_store<fp16, kHeadDim>(output_ptr + offset, normed);
+        });
+  });
+}
+
+bool aligned(const at::Tensor& tensor, size_t alignment) {
+  return reinterpret_cast<std::uintptr_t>(tensor.data_ptr()) % alignment == 0;
+}
+
+// v2 的正 stride activation/positions 按覆盖范围保守检查，不依赖 Storage 身份。
+bool ranges_overlap_v2(const at::Tensor& output, const at::Tensor& input) {
+  uint64_t elements = 1;
+  for (int64_t dim = 0; dim < input.dim(); ++dim) {
+    elements += static_cast<uint64_t>(input.size(dim) - 1) * input.stride(dim);
+  }
+  return qwen38_mrope_byte_ranges_overlap(
+      reinterpret_cast<std::uintptr_t>(output.data_ptr()),
+      output.numel() * output.element_size(),
+      reinterpret_cast<std::uintptr_t>(input.data_ptr()),
+      elements * input.element_size());
+}
+
+void validate_indexer_norm_rope_metadata(
+    const at::Tensor& input,
+    const at::Tensor& output,
+    const at::Tensor& weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    bool mrope, bool multi_strided = false) {
+  TORCH_CHECK(
+      input.device().is_xpu() && output.device() == input.device() &&
+          weight.device() == input.device() &&
+          positions.device() == input.device() &&
+          cos_sin_cache.device() == input.device(),
+      "QSA indexer norm+RoPE tensors must share one XPU device");
+  TORCH_CHECK(
+      input.scalar_type() == at::kHalf && output.scalar_type() == at::kHalf &&
+          weight.scalar_type() == at::kHalf &&
+          cos_sin_cache.scalar_type() == at::kHalf,
+      "QSA indexer norm+RoPE activations, weight and cache must be float16");
+  TORCH_CHECK(
+      input.dim() == 3 && input.size(0) >= 1 && input.size(0) <= 64 &&
+          (input.size(1) == 1 || input.size(1) == 4) &&
+          input.size(2) == kHeadDim,
+      "input must have shape [1..64,1|4,128]");
+  TORCH_CHECK(
+      output.sizes() == input.sizes(),
+      "output must have the same shape as input");
+  TORCH_CHECK(
+      weight.dim() == 1 && weight.size(0) == kHeadDim,
+      "weight must have shape [128]");
+  TORCH_CHECK(
+      positions.dim() == (mrope ? 2 : 1) &&
+          positions.size(mrope ? 1 : 0) == input.size(0) &&
+          (positions.scalar_type() == at::kInt ||
+           positions.scalar_type() == at::kLong),
+      mrope ? "MRoPE positions must be [3,R] int32/int64"
+            : "RoPE positions must be [R] int32/int64");
+  if (mrope) {
+    if (multi_strided) {
+      constexpr int64_t max_index = std::numeric_limits<uint32_t>::max();
+      TORCH_CHECK(
+          positions.size(0) == kMropeAxes && positions.stride(0) > 0 &&
+              positions.stride(1) > 0 && positions.stride(1) <= max_index &&
+              (input.size(0) - 1) * positions.stride(1) <= max_index &&
+              positions.stride(0) <=
+                  (max_index - (input.size(0) - 1) * positions.stride(1)) / 2,
+          "MRoPE v2 positions must have safe positive axis/column strides");
+    } else {
+    TORCH_CHECK(
+        positions.size(0) == kMropeAxes && positions.stride(1) == 1 &&
+            positions.stride(0) >= input.size(0) &&
+            positions.stride(0) <=
+                static_cast<int64_t>(
+                    (std::numeric_limits<uint32_t>::max() -
+                     static_cast<uint32_t>(input.size(0) - 1)) /
+                    2),
+        "MRoPE positions must have safe [3,R] row-strided layout");
+    }
+  } else {
+    TORCH_CHECK(
+        positions.is_contiguous(),
+        "RoPE positions must be contiguous");
+  }
+  TORCH_CHECK(
+      cos_sin_cache.dim() == 2 && cos_sin_cache.size(0) > 0 &&
+          cos_sin_cache.size(1) == kRotaryDim &&
+          cos_sin_cache.size(0) <=
+              static_cast<int64_t>(std::numeric_limits<uint32_t>::max() /
+                                   kRotaryDim),
+      "cos_sin_cache must have shape [max_position,64]");
+  const at::Tensor contiguous_tensors[] = {
+      input, output, weight, cos_sin_cache};
+  for (const auto& tensor : contiguous_tensors) {
+    if (multi_strided && tensor.is_same(input)) {
+      const int64_t width = input.size(1) * kHeadDim;
+      TORCH_CHECK(
+          input.stride(2) == 1 && input.stride(1) == kHeadDim &&
+              input.stride(0) >= width && input.stride(0) % 8 == 0 &&
+              input.stride(0) <=
+                  (std::numeric_limits<uint32_t>::max() - width) /
+                      (input.size(0) - 1),
+          "QSA norm+RoPE v2 input needs safe aligned row stride and contiguous heads");
+      continue;
+    }
+    TORCH_CHECK(
+        tensor.is_contiguous(),
+        "QSA indexer norm+RoPE tensors must be contiguous");
+  }
+  TORCH_CHECK(
+      aligned(input, 16) && aligned(output, 16) && aligned(weight, 16) &&
+          aligned(cos_sin_cache, 16),
+      "QSA indexer norm+RoPE tensors must be 16-byte aligned");
+  TORCH_CHECK(
+      aligned(positions, positions.scalar_type() == at::kLong ? 8 : 4),
+      "QSA indexer norm+RoPE positions have invalid alignment");
+  if (multi_strided) {
+    TORCH_CHECK(
+        !ranges_overlap_v2(output, input) && !ranges_overlap_v2(output, weight) &&
+            !ranges_overlap_v2(output, positions) && !ranges_overlap_v2(output, cos_sin_cache),
+        "QSA indexer norm+RoPE output must not overlap an input");
+  } else {
+  TORCH_CHECK(
+      !qwen38_mrope_ranges_overlap(output, input) &&
+          !qwen38_mrope_ranges_overlap(output, weight) &&
+          !qwen38_mrope_ranges_overlap(output, positions) &&
+          !qwen38_mrope_ranges_overlap(output, cos_sin_cache),
+      "QSA indexer norm+RoPE output must not overlap an input");
+  }
+}
+
+void validate_indexer_norm_rope(
+    const at::Tensor& input, const at::Tensor& output, const at::Tensor& weight,
+    const at::Tensor& positions, const at::Tensor& cos_sin_cache,
+    bool mrope, bool positions_bounds_proven) {
+  // v1 仍要求真实的调用方 proof，检查顺序/错误与原入口保持一致。
+  TORCH_CHECK(positions_bounds_proven,
+              "QSA indexer norm+RoPE requires a trusted position-bound proof");
+  validate_indexer_norm_rope_metadata(
+      input, output, weight, positions, cos_sin_cache, mrope);
+}
+
+}  // namespace
+
+at::Tensor indexer_norm_rope_v1(
+    const at::Tensor& input,
+    at::Tensor output,
+    const at::Tensor& weight,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    bool mrope,
+    bool positions_bounds_proven) {
+  validate_indexer_norm_rope(
+      input, output, weight, positions, cos_sin_cache, mrope,
+      positions_bounds_proven);
+  if (positions.scalar_type() == at::kInt) {
+    if (mrope) {
+      launch_indexer_norm_rope<true, int32_t>(
+          input, output, weight, positions, cos_sin_cache);
+    } else {
+      launch_indexer_norm_rope<false, int32_t>(
+          input, output, weight, positions, cos_sin_cache);
+    }
+  } else {
+    // The implementation uses the same 32-bit index ABI after this host
+    // contract proves positions fit in the representable range.
+    TORCH_CHECK(
+        positions.numel() <= std::numeric_limits<uint32_t>::max(),
+        "QSA indexer norm+RoPE positions are too large");
+    if (mrope) {
+      launch_indexer_norm_rope<true, int64_t>(
+          input, output, weight, positions, cos_sin_cache);
+    } else {
+      launch_indexer_norm_rope<false, int64_t>(
+          input, output, weight, positions, cos_sin_cache);
+    }
+  }
+  return output;
+}
+
+at::Tensor indexer_norm_rope_v2(
+    const at::Tensor& input, at::Tensor output, const at::Tensor& weight,
+    const at::Tensor& positions, const at::Tensor& cos_sin_cache,
+    bool mrope,
+    bool is_neox_style, bool enable_fp32_compute) {
+  TORCH_CHECK(is_neox_style && !enable_fp32_compute,
+              "QSA norm+RoPE v2 requires NeoX and fp32_compute=False");
+  TORCH_CHECK(input.dim() == 3 && input.size(0) >= 2 && input.size(0) <= 8,
+              "QSA norm+RoPE v2 requires 2..8 rows");
+  validate_indexer_norm_rope_metadata(
+      input, output, weight, positions, cos_sin_cache, mrope, true);
+  for (const auto& tensor : {input, output, weight, positions, cos_sin_cache}) {
+    TORCH_CHECK(!tensor.is_neg() && !tensor.is_conj(),
+                "QSA norm+RoPE v2 rejects lazy neg/conj tensors");
+  }
+  auto& queue = c10::xpu::getCurrentXPUStream(input.device().index()).queue();
+  TORCH_CHECK(queue.is_in_order(), "QSA norm+RoPE v2 requires an in-order queue");
+  TORCH_CHECK(queue.get_context() == c10::xpu::get_device_context() &&
+                  queue.get_device() == c10::xpu::get_raw_device(input.device().index()),
+              "QSA norm+RoPE v2 current queue must match input device/context");
+  // metadata、实际指针、physical alias 在首次 submit 前检查。
+  // v2 不接收 CPU proof：每行位置由设备检查，非法值异步报错，不回读数据。
+  if (positions.scalar_type() == at::kInt) {
+    if (mrope) {
+      launch_indexer_norm_rope_v2<true, int32_t>(input, output, weight, positions, cos_sin_cache);
+    } else {
+      launch_indexer_norm_rope_v2<false, int32_t>(input, output, weight, positions, cos_sin_cache);
+    }
+  } else if (mrope) {
+    launch_indexer_norm_rope_v2<true, int64_t>(input, output, weight, positions, cos_sin_cache);
+  } else {
+    launch_indexer_norm_rope_v2<false, int64_t>(input, output, weight, positions, cos_sin_cache);
+  }
+  return output;
+}
+
+}  // namespace qsa

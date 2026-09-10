@@ -1,13 +1,14 @@
-import sys
 from pathlib import Path
 
+import torch
+from esimd_build_extention import BuildExtension
+from ngram_offload_build import make_ngram_offload_extension
+from qsa_build import make_qsa_extension
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import SyclExtension
-from esimd_build_extention import BuildExtension
 
 root = Path(__file__).parent.resolve()
 
-import torch
 torch_include = str(Path(torch.__file__).parent / "include")
 
 ext_modules = [
@@ -16,6 +17,8 @@ ext_modules = [
         sources=[
             "csrc/xpu/esimd_kernel.sycl",
             "csrc/xpu/torch_extension.cc",
+            "csrc/xpu/esimd_kernel_ple.sycl",
+            "csrc/xpu/torch_extension_ple.cc",
         ],
         include_dirs=[
             root / "include",
@@ -237,6 +240,11 @@ ext_modules.append(
     )
 )
 ### Q4_0 quantize kernel
+
+### Qwen3.8 TP8-rank sparse paged attention — FP16 packed-cache ABI
+ext_modules.append(make_qsa_extension(root, torch_include))
+ext_modules.append(make_ngram_offload_extension())
+### Qwen3.8 QSA kernel
 
 setup(
     name="custom-esimd-kernels-vllm",
