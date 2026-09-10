@@ -373,8 +373,9 @@ at::Tensor forward_cute_prepared_impl(
   }
   if (key_bias.defined()) check(key_bias, at::kFloat, {B,T}, "log2 key bias");
   if constexpr (RowTail) check(row_state, at::kFloat, {B,H,T,144}, "selected row state");
-  using PreparedPolicy = std::conditional_t<TokenAugmented,
-      SolTilePolicy<128, 32, 256>, SolConfiguredTilePolicy>;
+  using PreparedPolicy = std::conditional_t<SelectedOnly,
+      SolTilePolicy<128, 16, 256>, std::conditional_t<TokenAugmented,
+      SolTilePolicy<128, 32, 256>, SolConfiguredTilePolicy>>;
   using KT = SolKernel<OutputElement, PreparedPolicy,
       true, true, false, false, int8_t, true, TokenAugmented, SelectedOnly, RowTail>;
   using K = typename KT::Kernel;

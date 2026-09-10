@@ -895,13 +895,15 @@ struct SolFwdMainloop : DenseMainloop {
       }
     }
     auto tSrQ = thr_mma_qk.partition_sg_fragment_A(gQ(_, _, 0));
-    std::array<decltype(tSrQ), DTiles> tSrQ_arr;
+    std::array<decltype(tSrQ), SelectedOnly ? 1 : DTiles> tSrQ_arr;
     FragSPartialRow tA_partial_sum;
 
-    CUTLASS_PRAGMA_UNROLL
-    for (int d = 0; d < DTiles; ++d) {
-      copy(copy_q, tQgQ(_, _, _, d), tQrQ);
-      reorder(tQrQ, tSrQ_arr[d]);
+    if constexpr (!SelectedOnly) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int d = 0; d < DTiles; ++d) {
+        copy(copy_q, tQgQ(_, _, _, d), tQrQ);
+        reorder(tQrQ, tSrQ_arr[d]);
+      }
     }
 
     if (blk_k0 == 0) {
@@ -1262,7 +1264,11 @@ struct SolFwdMainloop : DenseMainloop {
           decltype(get<2>(TileShapeQK{}))::value /
           decltype(get<2>(typename TiledMMAQK::AtomShape_MNK{}))::value;
       auto consume_qk_fragment = [&](int d) {
-        auto const& tSrQ_d = tSrQ_arr[d];
+        if constexpr (SelectedOnly) {
+          copy(copy_q, tQgQ(_, _, _, d), tQrQ);
+          reorder(tQrQ, tSrQ_arr[0]);
+        }
+        auto const& tSrQ_d = tSrQ_arr[SelectedOnly ? 0 : d];
         if (d == 0) {
           cute::gemm(mma_qk, tSrQ_d(_, _, 0), tSrK(_, _, 0), qk_accumulator);
           CUTLASS_PRAGMA_UNROLL
