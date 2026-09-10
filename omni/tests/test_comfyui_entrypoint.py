@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import subprocess
 
+import pytest
+
 
 ENTRYPOINT = Path(__file__).parents[1] / "entrypoints" / "start_comfyui.sh"
 
@@ -90,3 +92,37 @@ def test_entrypoint_rejects_invalid_reserve(tmp_path):
     assert completed.returncode == 2
     assert arguments == []
     assert "must be a nonnegative number" in completed.stderr
+
+
+def test_entrypoint_allows_explicit_dynamic_vram_disable(tmp_path):
+    completed, arguments = _run_entrypoint(
+        tmp_path, extra_arguments=("--disable-dynamic-vram",)
+    )
+
+    assert completed.returncode == 0
+    assert "--enable-dynamic-vram" not in arguments
+    assert arguments.count("--disable-dynamic-vram") == 1
+    assert arguments[arguments.index("--reserve-vram") + 1] == "4"
+    assert "--enable-manager" in arguments
+
+
+def test_entrypoint_forwards_explicit_enable_once(tmp_path):
+    completed, arguments = _run_entrypoint(
+        tmp_path, extra_arguments=("--enable-dynamic-vram",)
+    )
+
+    assert completed.returncode == 0
+    assert arguments.count("--enable-dynamic-vram") == 1
+    assert "--disable-dynamic-vram" not in arguments
+
+
+@pytest.mark.parametrize("arguments", [
+    ("--enable-dynamic-vram", "--disable-dynamic-vram"),
+    ("--disable-dynamic-vram", "--enable-dynamic-vram"),
+])
+def test_entrypoint_rejects_conflicting_dynamic_vram_flags(tmp_path, arguments):
+    completed, forwarded = _run_entrypoint(tmp_path, extra_arguments=arguments)
+
+    assert completed.returncode == 2
+    assert forwarded == []
+    assert "choose only one DynamicVRAM" in completed.stderr

@@ -62,6 +62,20 @@ Additional ComfyUI arguments are forwarded by the entrypoint. For example:
 /llm/entrypoints/start_comfyui.sh --disable-smart-memory
 ```
 
+To keep the entrypoint's model paths, reserve and manager configuration while
+explicitly disabling DynamicVRAM, pass:
+
+```bash
+OMNIXPU_PROVIDER_BOOTSTRAP=auto \
+    /llm/entrypoints/start_comfyui.sh --disable-dynamic-vram
+```
+
+The explicit flag replaces the entrypoint's enable default. Supplying both
+enable and disable flags is rejected. In provider `auto` mode, Kitchen XPU
+routing remains available while AIMDO is skipped for disabled DynamicVRAM;
+provider `required` mode requires both providers and therefore rejects this
+configuration.
+
 ## Models and workflows
 
 Organize the host directory with the standard ComfyUI model subdirectories and
