@@ -2568,7 +2568,14 @@ void moe_ws_down_cutlass_int4_with_shared_fp16_kernel(
             const char* value = std::getenv("VLLM_XPU_QWEN38_MOE_DOWN_TIGHT_TAIL");
             return value == nullptr || std::strcmp(value, "1") == 0;
         }();
-        if (tight_tail && n_tokens >= 2 && n_tokens <= 8) {
+        // Keep M2..8 unchanged; TP4 M1 uses the effective 32-element tail.
+        // TP8 M1 remains opt-in until its complete-chain E2E is measured.
+        static const bool tight_tail_m1 = [] {
+            const char* value = std::getenv("VLLM_XPU_QWEN38_MOE_DOWN_TIGHT_TAIL_M1");
+            return value == nullptr ? Compact160 : std::strcmp(value, "1") == 0;
+        }();
+        if (tight_tail && n_tokens <= 8 &&
+            (n_tokens >= 2 || (n_tokens == 1 && tight_tail_m1))) {
             return moe_ws_down_cutlass_int4_with_shared_fp16_kernel<
                 IndexT,H_TILE,Compact80,Compact160,true>(
                 routed_intermediates, w2, w2_scales, topk_weight, topk_idx,

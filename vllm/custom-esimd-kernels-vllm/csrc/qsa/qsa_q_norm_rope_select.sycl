@@ -771,19 +771,21 @@ at::Tensor select_preprocessed_parallel(
     const at::Tensor& q, const at::Tensor& compressed_key_cache,
     const at::Tensor& page_table, const at::Tensor& token_to_req,
     const at::Tensor& query_positions, const at::Tensor& sequence_lengths,
-    int64_t compressed_page_size, at::Tensor out) {
+    int64_t compressed_page_size, at::Tensor out, int partitions) {
+  TORCH_CHECK(partitions == 1 || partitions == 32,
+              "preprocessed selection supports one or 32 partitions");
   TORCH_CHECK(compressed_page_size == 64 || compressed_page_size == 128,
               "preprocessed parallel selection requires page64 or page128");
   if (compressed_page_size == 64) {
     launch_fused<false, int64_t, fp16, true, 64>(
         q, at::Tensor(), query_positions, at::Tensor(), compressed_key_cache,
         page_table, token_to_req, query_positions, sequence_lengths,
-        at::Tensor(), out, 32);
+        at::Tensor(), out, partitions);
   } else {
     launch_fused<false, int64_t, fp16, true, 128>(
         q, at::Tensor(), query_positions, at::Tensor(), compressed_key_cache,
         page_table, token_to_req, query_positions, sequence_lengths,
-        at::Tensor(), out, 32);
+        at::Tensor(), out, partitions);
   }
   return out;
 }

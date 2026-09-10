@@ -138,6 +138,13 @@ at::Tensor select_preprocessed_parallel(
     const at::Tensor& q, const at::Tensor& compressed_key_cache,
     const at::Tensor& page_table, const at::Tensor& token_to_req,
     const at::Tensor& query_positions, const at::Tensor& sequence_lengths,
+    int64_t compressed_page_size, at::Tensor out, int partitions = 32);
+
+at::Tensor select_paged_tokens_local_v1(
+    const at::Tensor& q, const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table, const at::Tensor& token_to_req,
+    const at::Tensor& query_positions, const at::Tensor& sequence_lengths,
+    int64_t token_topk, int64_t compress_ratio,
     int64_t compressed_page_size, at::Tensor out);
 
 at::Tensor select_paged_tokens_parallel_v1(

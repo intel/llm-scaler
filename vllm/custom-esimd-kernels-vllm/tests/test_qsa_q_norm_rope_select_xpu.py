@@ -257,10 +257,14 @@ def test_parallel_selection_ties_invalid_pages_and_async_streams(qsa_ops):
 
 
 @pytest.mark.parametrize("compressed_page_size", [64, 128])
-@pytest.mark.parametrize("length", [4, 2050, 128002])
+@pytest.mark.parametrize("length", [4, 512, 1024, 1536, 2050, 128002])
 @pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8, 32])
+@pytest.mark.parametrize(
+    "operation",
+    ["qsa_select_paged_tokens_parallel_v1", "qsa_select_paged_tokens_local_v1"],
+)
 def test_preprocessed_parallel_selection_is_bitwise(
-    qsa_ops, compressed_page_size, length, rows
+    qsa_ops, compressed_page_size, length, rows, operation
 ):
     case = _make_case(rows, False, length, compressed_page_size)
     q, _, _, _, cache, table, requests, positions, lengths, _ = case
@@ -278,14 +282,18 @@ def test_preprocessed_parallel_selection_is_bitwise(
         compressed_page_size,
     )
     qsa_ops.qsa_select_paged_tokens_v2(*inputs, old)
-    qsa_ops.qsa_select_paged_tokens_parallel_v1(*inputs, new)
+    getattr(qsa_ops, operation)(*inputs, new)
     torch.xpu.synchronize()
     assert torch.equal(new, old)
 
 
 @pytest.mark.parametrize("compressed_page_size", [64, 128])
+@pytest.mark.parametrize(
+    "operation",
+    ["qsa_select_paged_tokens_parallel_v1", "qsa_select_paged_tokens_local_v1"],
+)
 def test_preprocessed_parallel_selection_async_ties_and_alias_guard(
-    qsa_ops, compressed_page_size
+    qsa_ops, compressed_page_size, operation
 ):
     case = _make_case(4, False, 128004, compressed_page_size)
     q, _, _, _, cache, table, requests, positions, lengths, _ = case
@@ -312,14 +320,14 @@ def test_preprocessed_parallel_selection_async_ties_and_alias_guard(
     for _ in range(20):
         for stream, output in zip(streams, outputs):
             with torch.xpu.stream(stream):
-                qsa_ops.qsa_select_paged_tokens_parallel_v1(*inputs, output)
+                getattr(qsa_ops, operation)(*inputs, output)
     for stream in streams:
         parent.wait_stream(stream)
     torch.xpu.synchronize()
     assert all(torch.equal(output, expected) for output in outputs)
     alias = cache.view(torch.int32).flatten()[:4 * 2051].view(4, 2051)
     with pytest.raises(RuntimeError, match="must not alias"):
-        qsa_ops.qsa_select_paged_tokens_parallel_v1(*inputs, alias)
+        getattr(qsa_ops, operation)(*inputs, alias)
 
 
 @pytest.mark.parametrize("compressed_page_size", [64, 128])

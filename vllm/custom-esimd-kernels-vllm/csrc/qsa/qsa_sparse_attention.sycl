@@ -915,6 +915,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       &qsa::select_paged_tokens_parallel_v1,
       "Qwen3.8 QSA exact partitioned selection for preprocessed Q (XPU)");
   module.def(
+      "qsa_select_paged_tokens_local_v1",
+      &qsa::select_paged_tokens_local_v1,
+      "Qwen3.8 QSA exact single-launch selection with local Q (XPU)");
+  module.attr("qsa_local_selection_page_sizes") = pybind11::make_tuple(64, 128);
+  module.def(
       "qsa_q_norm_rope_select_v1",
       &qsa::qsa_q_norm_rope_select_v1,
       "Qwen3.8 QSA fused Q norm, RoPE and selection (XPU)");

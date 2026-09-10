@@ -69,7 +69,7 @@ at::Tensor select_paged_tokens_impl(
     int64_t token_topk,
     int64_t compress_ratio,
     at::Tensor out,
-    bool parallel = false) {
+    bool parallel = false, int partitions = 32) {
   static_assert(PageSizeT == 64 || PageSizeT == 128);
   check_fp16_xpu(q, "q", true);
   check_fp16_xpu(compressed_key_cache, "compressed_key_cache", true);
@@ -129,7 +129,7 @@ at::Tensor select_paged_tokens_impl(
     }
     return select_preprocessed_parallel(q, compressed_key_cache, page_table,
                                         token_to_req, query_positions,
-                                        sequence_lengths, PageSizeT, out);
+                                        sequence_lengths, PageSizeT, out, partitions);
   }
   const int64_t physical_pages = compressed_key_cache.size(0);
   const int64_t requests = page_table.size(0);
@@ -383,6 +383,26 @@ at::Tensor select_paged_tokens_parallel_v1(
   return select_paged_tokens_impl<128>(
       q, compressed_key_cache, page_table, token_to_req, query_positions,
       sequence_lengths, token_topk, compress_ratio, out, true);
+}
+
+at::Tensor select_paged_tokens_local_v1(
+    const at::Tensor& q, const at::Tensor& compressed_key_cache,
+    const at::Tensor& page_table, const at::Tensor& token_to_req,
+    const at::Tensor& query_positions, const at::Tensor& sequence_lengths,
+    int64_t token_topk, int64_t compress_ratio,
+    int64_t compressed_page_size, at::Tensor out) {
+  TORCH_CHECK(compressed_page_size == 64 || compressed_page_size == 128,
+              "local-Q selection requires compressed_page_size=64 or 128");
+  // Reuse the validated preprocessed-Q kernel and all pre-submit checks,
+  // without partition buffers or merge launches. Q is staged once in SLM.
+  if (compressed_page_size == 64) {
+    return select_paged_tokens_impl<64>(
+        q, compressed_key_cache, page_table, token_to_req, query_positions,
+        sequence_lengths, token_topk, compress_ratio, out, true, 1);
+  }
+  return select_paged_tokens_impl<128>(
+      q, compressed_key_cache, page_table, token_to_req, query_positions,
+      sequence_lengths, token_topk, compress_ratio, out, true, 1);
 }
 
 }  // namespace qsa

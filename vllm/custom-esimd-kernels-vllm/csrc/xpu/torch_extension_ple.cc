@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -293,6 +294,34 @@ static bool hc_m1_scratch_aliases(
 
 class HcM1Workspace final : public torch::CustomClassHolder {
  public:
+  std::optional<std::tuple<at::Tensor, at::Tensor, at::Tensor>> try_run(
+      at::Tensor hidden, at::Tensor block, at::Tensor injection,
+      at::Tensor norm_weight, at::Tensor down_weight, at::Tensor up_weight,
+      double eps) {
+    // Optional, metadata-only eligibility check before any allocation/submit.
+    // Inspect the live TensorImpl on every call, including Parameter set_data;
+    // no cached weight pointer, shape or version witness is trusted.
+    if (!hidden.defined() || !hidden.device().is_xpu()) return std::nullopt;
+    const auto device = hidden.device();
+    const auto compatible = [&](const at::Tensor& t, at::IntArrayRef sizes) {
+      return t.defined() && t.device() == device && t.layout() == at::kStrided &&
+          t.scalar_type() == at::kHalf && t.sizes() == sizes &&
+          t.is_contiguous() && !t.is_neg() && !t.is_conj() &&
+          t.storage_offset() % 2 == 0 &&
+          reinterpret_cast<std::uintptr_t>(t.const_data_ptr()) % 4 == 0;
+    };
+    const float eps_fp32 = static_cast<float>(eps);
+    if (!compatible(hidden, {1, 10240}) || !compatible(block, {1, 2560}) ||
+        !compatible(injection, {1, 4}) || !compatible(norm_weight, {10240}) ||
+        !compatible(down_weight, {336, 10240}) ||
+        !compatible(up_weight, {10240, 320}) ||
+        !std::isfinite(eps) || eps <= 0 || !std::isfinite(eps_fp32) || eps_fp32 <= 0)
+      return std::nullopt;
+    // Keep the established stream-isolated scratch, alias checks and complete
+    // transaction validation. Exceptions after this point must never fallback.
+    return run(hidden, block, injection, norm_weight, down_weight, up_weight, eps);
+  }
+
   std::tuple<at::Tensor, at::Tensor, at::Tensor> run(
       at::Tensor hidden,
       at::Tensor block,
@@ -345,6 +374,7 @@ static auto register_hc_m1_workspace =
     torch::class_<HcM1Workspace>(
         "custom_esimd_kernels_vllm", "HCWorkspace")
         .def(torch::init<>())
+        .def("try_run", &HcM1Workspace::try_run)
         .def("run", &HcM1Workspace::run);
 
 // Separate optional ABI: the established M=1 workspace and its scratch/rounding
