@@ -894,6 +894,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       "qsa_store_cache_rows_v3",
       &qsa::store_cache_rows_v3,
       "Qwen3.8 predicated strided QSA cache row-store (XPU)");
+  module.attr("qsa_store_m1_transaction_abi_version") = 1;
+  module.def(
+      "try_store_m1_transaction_v1", &qsa::try_store_m1_transaction_v1,
+      "Preflight all M1 stores then submit in order; false means no writes");
   module.def(
       "qsa_store_cache_rows_v4",
       &qsa::store_cache_rows_v4,
