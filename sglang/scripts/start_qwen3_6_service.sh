@@ -36,6 +36,7 @@
 # misleading oneCCL "unknown memory type" during warmup.
 # HOST defaults to 0.0.0.0; use 127.0.0.1 for local-only access.
 # Optional MTP tuning: SPEC_NUM_STEPS=3 SPEC_TOPK=1 SPEC_NUM_DRAFT_TOKENS=4.
+# The XPU GDN verify kernels support linear chains only (SPEC_TOPK=1).
 # For GGUF the served model id defaults to GGUF_CFG_DIR so that OpenAI-style
 # clients can use it as a tokenizer id; override with SERVED_MODEL_NAME.
 # Long-context runs (e.g. BFCL multi-turn) also need
@@ -63,6 +64,14 @@ SPEC_ARGS=()
 SPEC_ON=0
 if [[ -n "${SPEC_DRAFT_PATH:-}" ]]; then
     SPEC_ON=1
+    if [[ "${SPEC_TOPK:-1}" != 1 ]]; then
+        echo "XPU GDN MTP verification requires SPEC_TOPK=1." >&2
+        exit 2
+    fi
+    # Use the existing XPU kernels for verification and rollback snapshots,
+    # just as decode/extend use their XPU kernels. Ordinary launches leave
+    # this MTP-only switch unset; an explicit override is preserved.
+    export SGL_XPU_GDN_VERIFY_ESIMD="${SGL_XPU_GDN_VERIFY_ESIMD:-1}"
     SPEC_ARGS=(
         --speculative-algorithm NEXTN
         --speculative-draft-model-path "$SPEC_DRAFT_PATH"
@@ -84,6 +93,15 @@ if [[ "$MODEL_PATH" == *.gguf ]]; then
         exit 2
     fi
     export SGLANG_GGUF_HF_CONFIG_DIR="$GGUF_CFG_DIR"
+    # The draft weights, KV cache and per-token GDN snapshots need headroom
+    # beyond the target's static allocation. Preserve user memory settings.
+    if [[ -z "${MEM_FRACTION_STATIC:-}" ]]; then
+        if [[ $SPEC_ON == 1 ]]; then
+            MEM_FRACTION_STATIC=0.65
+        else
+            MEM_FRACTION_STATIC=0.8
+        fi
+    fi
     export SGLANG_MAMBA_CONV_DTYPE=float16
     export SGLANG_MAMBA_SSM_DTYPE=float16
     export SGL_XPU_ESIMD_DECODE=1

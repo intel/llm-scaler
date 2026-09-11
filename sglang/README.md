@@ -128,10 +128,32 @@ SPEC_DRAFT_PATH=$MODEL_PATH ZE_AFFINITY_MASK=6,7 \
   bash scripts/start_qwen3_6_service.sh
 ```
 
-Defaults are `SPEC_NUM_STEPS=3`, `SPEC_TOPK=1`, `SPEC_NUM_DRAFT_TOKENS=4`;
-override them to change the tree width. Each verify step runs the target model
+For Qwen3.8-27B, the GGUF includes its MTP branch:
+
+```bash
+MODEL_PATH=/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
+GGUF_CFG_DIR=/models/Qwen3.8-27B \
+SPEC_DRAFT_PATH=/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
+ZE_AFFINITY_MASK=6,7 TP_SIZE=2 PORT=30001 \
+  bash scripts/start_qwen3_6_service.sh
+```
+
+Defaults are `SPEC_NUM_STEPS=3`, `SPEC_TOPK=1`, `SPEC_NUM_DRAFT_TOKENS=4`.
+Use steps `1` and draft tokens `2` for a smaller initial trial. Keep
+`SPEC_TOPK=1`: the XPU GDN verify kernels support a linear chain only.
+The launcher enables `SGL_XPU_GDN_VERIFY_ESIMD` when MTP is requested and
+defaults GGUF MTP to `MEM_FRACTION_STATIC=0.65` to leave room for draft weights,
+KV cache and GDN snapshots. Explicit environment overrides are preserved.
+The ordinary GGUF memory default remains `0.8`.
+
+The local `Qwen3.6-27B-Q4_K_M.gguf` does not include an MTP branch; it needs
+a separate matching GGUF draft with those tensors. Do not use another model
+version's MTP weights as its draft.
+
+Each verify step runs the target model
 on `num_draft_tokens x concurrency` rows at once, which is the batch the
-M-tiled ESIMD GEMVs are tuned for, so the gain grows with concurrency. XPU
+M-tiled ESIMD GEMVs are tuned for. Measure acceptance and throughput at the
+intended concurrency; extra draft work does not guarantee a speedup. XPU
 graph capture cannot express the speculative control flow, so decode stays
 eager (`--disable-cuda-graph`) as it already does for the non-MTP paths.
 
