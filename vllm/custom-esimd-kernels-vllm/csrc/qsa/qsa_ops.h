@@ -6,6 +6,7 @@
 #include <ATen/ATen.h>
 
 #include <tuple>
+#include <vector>
 
 namespace qsa {
 
@@ -36,6 +37,11 @@ at::Tensor store_cache_rows_v3(
     at::Tensor cache,
     const at::Tensor& slot_mapping,
     const at::Tensor& rows);
+
+// False means no submission; all stores are validated before any mutation.
+bool try_store_m1_transaction_v1(
+    const std::vector<std::tuple<at::Tensor, at::Tensor, at::Tensor>>& stores,
+    bool fused);
 
 std::tuple<at::Tensor, at::Tensor> store_cache_rows_v4(
     at::Tensor cache,

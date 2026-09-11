@@ -357,6 +357,110 @@ at::Tensor store_cache_rows_v3(
   return cache;
 }
 
+namespace {
+struct M1StoreDescriptor {
+  void* cache;
+  const void* rows;
+  const int64_t* slot;
+  int64_t capacity, page_size, page_stride, token_stride, column_stride;
+  int width;
+};
+class QsaStoreM1TransactionKernel;
+}  // namespace
+
+bool try_store_m1_transaction_v1(
+    const std::vector<std::tuple<at::Tensor, at::Tensor, at::Tensor>>& stores,
+    bool fused) {
+  // Keep larger batches (including circular duplicate-slot semantics), zero
+  // work, unsupported dtypes and strict receipts on their existing paths.
+  if (stores.empty() || stores.size() > 3) return false;
+  const auto device = std::get<0>(stores.front()).device();
+  for (const auto& [cache, slots, rows] : stores) {
+    if (!cache.is_xpu() || cache.device() != device || cache.dim() != 4 ||
+        cache.size(1) <= 0 || cache.size(2) != 1 ||
+        (rows.dim() != 2 && rows.dim() != 3) || rows.size(0) != 1 ||
+        (rows.dim() == 3 && rows.size(1) != 1)) return false;
+    const bool supported =
+        ((cache.scalar_type() == at::kHalf || cache.scalar_type() == at::kBFloat16) &&
+         cache.size(3) == kKeyWidth) ||
+        (cache.scalar_type() == at::kLong && cache.size(3) == kPositionWidth);
+    if (!supported) return false;
+    // Match the Python native-candidate boundary, not just the kernel's
+    // throwing validator. E.g. dtype conversion and strided key rows are
+    // valid *Torch fallback* operations and must decline without mutation.
+    if (rows.scalar_type() != cache.scalar_type() || rows.device() != device ||
+        slots.device() != device || slots.dim() != 1 ||
+        slots.scalar_type() != at::kLong || !slots.is_contiguous() ||
+        slots.numel() != 1 || rows.size(rows.dim() - 1) != cache.size(3) ||
+        cache.stride(3) != 1 ||
+        (cache.scalar_type() != at::kLong && rows.stride(rows.dim() - 1) != 1))
+      return false;
+    // BMG block messages require dword alignment even for 16-bit elements.
+    // Preserve the legacy scalar store for valid element-aligned odd views;
+    // never select a block store using the device slot value on the host.
+    if (cache.scalar_type() != at::kLong &&
+        ((reinterpret_cast<uintptr_t>(cache.data_ptr()) % 4) ||
+         (reinterpret_cast<uintptr_t>(rows.data_ptr()) % 4) ||
+         (cache.stride(0) % 2) || (cache.stride(1) % 2))) fused = false;
+  }
+  // All preflight completes before the first submit. An invalid later store
+  // must not leave the earlier cache partially mutated.
+  for (const auto& [cache, slots, rows] : stores) {
+    // Match the Python storage-base check as well as Tensor::is_alias_of:
+    // separate DLPack wrappers can own distinct StorageImpls at one address.
+    TORCH_CHECK(
+        !cache.numel() ||
+            (cache.storage().data_ptr().get() != slots.storage().data_ptr().get() &&
+             cache.storage().data_ptr().get() != rows.storage().data_ptr().get()),
+        "cache must not alias slot_mapping or rows");
+    validate_store_inputs(cache, slots, rows);
+  }
+  if (!fused) {
+    for (const auto& [cache, slots, rows] : stores) {
+      store_cache_rows_v3(cache, slots, rows);
+    }
+    return true;
+  }
+  std::array<M1StoreDescriptor, 3> descriptors{};
+  for (size_t i = 0; i < stores.size(); ++i) {
+    const auto& [cache, slots, rows] = stores[i];
+    descriptors[i] = {cache.data_ptr(), rows.data_ptr(), slots.data_ptr<int64_t>(),
+                     cache.size(0) * cache.size(1), cache.size(1), cache.stride(0),
+                     cache.stride(1), rows.stride(rows.dim() - 1),
+                     static_cast<int>(cache.size(3))};
+  }
+  const int count = stores.size();
+  auto& queue = c10::xpu::getCurrentXPUStream(device.index()).queue();
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<QsaStoreM1TransactionKernel>(
+        sycl::range<1>(1), [=](sycl::id<1>) SYCL_ESIMD_KERNEL {
+          // One work item preserves the original transaction order, including
+          // cross-store aliases. FP16/BF16 keys are copied as raw 16-bit bits.
+          for (int i = 0; i < count; ++i) {
+            const auto d = descriptors[i];
+            const int64_t slot = *d.slot;
+            if (slot < 0 || slot >= d.capacity) continue;
+            const int64_t dst = (slot / d.page_size) * d.page_stride +
+                                (slot % d.page_size) * d.token_stride;
+            if (d.width == kKeyWidth) {
+              auto* output = static_cast<uint16_t*>(d.cache);
+              const auto* input = static_cast<const uint16_t*>(d.rows);
+              const simd<uint16_t, kKeyWidth> values =
+                  block_load<uint16_t, kKeyWidth>(input);
+              block_store<uint16_t, kKeyWidth>(output + dst, values);
+            } else {
+              auto* output = static_cast<int64_t*>(d.cache);
+              const auto* input = static_cast<const int64_t*>(d.rows);
+#pragma unroll
+              for (int j = 0; j < kPositionWidth; ++j)
+                output[dst + j] = input[j * d.column_stride];
+            }
+          }
+        });
+  });
+  return true;
+}
+
 std::tuple<at::Tensor, at::Tensor> store_cache_rows_v4(
     at::Tensor cache,
     const at::Tensor& slot_mapping,
