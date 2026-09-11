@@ -87,6 +87,8 @@ _EXPORTS = [
     "esimd_gemv_iq4_m",
     "esimd_gemv_q3_k",
     "esimd_gemv_q3_k_m",
+    "esimd_gemv_iq3_s",
+    "esimd_gemv_iq3_s_m",
     "esimd_gemv_q5_k",
     "esimd_gemv_q5_k_m",
     "esimd_gemv_q6_k",

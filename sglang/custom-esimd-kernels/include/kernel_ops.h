@@ -305,6 +305,16 @@ at::Tensor esimd_gemv_q3_k_m(
     at::Tensor input, at::Tensor ql, at::Tensor qh,
     at::Tensor weight_scale, at::Tensor output);
 
+// Canonical GGUF IQ3_S GEMV: qs [N,K/4], qh [N,K/32], signs [N,K/8],
+// and final per-32-element scale [N,K/32].
+at::Tensor esimd_gemv_iq3_s(
+    at::Tensor input, at::Tensor qs, at::Tensor qh, at::Tensor signs,
+    at::Tensor weight_scale, at::Tensor output);
+
+at::Tensor esimd_gemv_iq3_s_m(
+    at::Tensor input, at::Tensor qs, at::Tensor qh, at::Tensor signs,
+    at::Tensor weight_scale, at::Tensor output);
+
 // GGUF q5_K GEMV: PACKED (ql nibble [N,K/2] + pre-shuffled 1-bit qh [N,K/8]),
 // asymmetric scale+min [N,K/32]. dequant v5=nibble|(qh<<4); w=scale*v5-min.
 at::Tensor esimd_gemv_q5_k(
