@@ -17,6 +17,7 @@ def _run_entrypoint(
     *,
     reserve: str | None = None,
     extra_arguments: tuple[str, ...] = ("--disable-all-custom-nodes",),
+    allocator_mode: str | None = None,
 ):
     capture = tmp_path / "args.txt"
     fake_python = tmp_path / "python"
@@ -28,6 +29,9 @@ def _run_entrypoint(
     environment = os.environ.copy()
     environment["PATH"] = f"{tmp_path}:{environment['PATH']}"
     environment["OMNI_TEST_CAPTURE"] = str(capture)
+    environment.pop("AIMDO_XPU_ALLOCATOR_MODE", None)
+    if allocator_mode is not None:
+        environment["AIMDO_XPU_ALLOCATOR_MODE"] = allocator_mode
     if reserve is None:
         environment.pop("OMNI_COMFYUI_RESERVE_VRAM_GB", None)
     else:
@@ -126,3 +130,18 @@ def test_entrypoint_rejects_conflicting_dynamic_vram_flags(tmp_path, arguments):
     assert completed.returncode == 2
     assert forwarded == []
     assert "choose only one DynamicVRAM" in completed.stderr
+
+
+def test_native_entrypoint_rejects_disabled_dynamic_vram(tmp_path):
+    completed, arguments = _run_entrypoint(tmp_path, allocator_mode="native_hook",
+        extra_arguments=("--disable-dynamic-vram",))
+    assert completed.returncode == 2
+    assert arguments == []
+    assert "requires DynamicVRAM" in completed.stderr
+
+
+def test_native_entrypoint_rejects_empty_provider_preload(tmp_path):
+    completed, arguments = _run_entrypoint(tmp_path, allocator_mode="native_hook")
+    assert completed.returncode == 2
+    assert arguments[-1] == "--native-preload-path"
+    assert "empty preload path" in completed.stderr
