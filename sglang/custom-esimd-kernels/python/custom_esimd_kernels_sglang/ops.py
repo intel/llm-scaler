@@ -241,6 +241,22 @@ def esimd_gemv_iq4_m(
     return _ops.esimd_gemv_iq4_m(input, weight, weight_scale, output)
 
 
+def esimd_gemv_q3_k(
+    input: torch.Tensor, ql: torch.Tensor, qh: torch.Tensor,
+    weight_scale: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """Canonical Q3_K GEMV for decode (M=1)."""
+    return _ops.esimd_gemv_q3_k(input, ql, qh, weight_scale, output)
+
+
+def esimd_gemv_q3_k_m(
+    input: torch.Tensor, ql: torch.Tensor, qh: torch.Tensor,
+    weight_scale: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """M-tiled canonical Q3_K GEMV for M>=1."""
+    return _ops.esimd_gemv_q3_k_m(input, ql, qh, weight_scale, output)
+
+
 def esimd_gemv_q5_k(
     input: torch.Tensor, ql: torch.Tensor, qh: torch.Tensor,
     weight_scale: torch.Tensor, weight_min: torch.Tensor, output: torch.Tensor,

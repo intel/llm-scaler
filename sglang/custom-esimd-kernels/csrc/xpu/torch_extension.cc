@@ -82,6 +82,14 @@ TORCH_LIBRARY(custom_esimd_kernels_sglang, m) {
         "Tensor output) -> Tensor");
   m.impl("esimd_gemv_iq4_m", torch::kXPU, &esimd_gemv_iq4_m);
 
+  m.def("esimd_gemv_q3_k(Tensor input, Tensor ql, Tensor qh, "
+        "Tensor weight_scale, Tensor output) -> Tensor");
+  m.impl("esimd_gemv_q3_k", torch::kXPU, &esimd_gemv_q3_k);
+
+  m.def("esimd_gemv_q3_k_m(Tensor input, Tensor ql, Tensor qh, "
+        "Tensor weight_scale, Tensor output) -> Tensor");
+  m.impl("esimd_gemv_q3_k_m", torch::kXPU, &esimd_gemv_q3_k_m);
+
   // GGUF q5_K GEMV: PACKED (ql nibble + pre-shuffled 1-bit qh), asym scale+min.
   m.def("esimd_gemv_q5_k(Tensor input, Tensor ql, Tensor qh, "
         "Tensor weight_scale, Tensor weight_min, Tensor output) -> Tensor");
