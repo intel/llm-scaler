@@ -6099,6 +6099,7 @@ torch::Tensor moe_forward_gelu_tanh_int4_decode(
 }
 
 #include "moe_compact160.h"
+#include "moe_m1_workspace.h"
 
 TORCH_LIBRARY_FRAGMENT(moe_int4_ops, m) {
     m.def("qwen38_moe_compact160_weight_contract_v1(Tensor[] weights, Device device) -> int", &qwen38_moe_compact160_weight_contract_v1);

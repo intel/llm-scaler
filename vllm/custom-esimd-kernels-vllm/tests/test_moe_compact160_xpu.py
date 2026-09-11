@@ -49,6 +49,104 @@ def inputs(m):
     return x, logits
 
 
+@pytest.fixture(scope="module", params=[80, 160])
+def workspace_case(case, request):
+    _, weights = case
+    compact = request.param
+    if compact == 80:
+        def half_gate_up(t):
+            axis = 1 if t.ndim == 3 else 0
+            return torch.cat((t.narrow(axis, 0, 80), t.narrow(axis, 160, 80)), axis)
+        weights = (half_gate_up(weights[0]), half_gate_up(weights[1]),
+                   weights[2][..., :40].contiguous(), weights[3][..., :1].contiguous(),
+                   half_gate_up(weights[4]), weights[5][:, :80].contiguous(), weights[6])
+    router = torch.randint(256, (512, 1280), dtype=torch.uint8, device="xpu")
+    scale = torch.full((512, 20), 1 / 512, dtype=torch.float16, device="xpu")
+    x = inputs(1)[0].to("xpu")
+    torch.xpu.synchronize()
+    return compact, weights, router, scale, x
+
+
+def workspace_reference(compact, x, router, scale, weights):
+    name = ("moe_forward_compact160_router_out_v1" if compact == 160 else
+            "moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_router_out_v1")
+    return getattr(torch.ops.moe_int4_ops, name)(
+        x, router, scale, *weights, torch.empty_like(x), 10, 1, 512)
+
+
+def test_m1_workspace_matches_existing_kernels_and_live_rebind(workspace_case):
+    compact, weights, router, scale, x = workspace_case
+    workspace = torch.classes.moe_int4_ops.Qwen38M1WorkspaceV1()
+    live = list(weights)
+    live[0] = torch.nn.Parameter(weights[0].view(torch.int8), requires_grad=False)
+    for rebind in (False, True):
+        if rebind:
+            live[0].data = torch.zeros_like(live[0])
+        reference_weights = (live[0].view(torch.uint8), *live[1:])
+        expected = workspace_reference(compact, x, router, scale, reference_weights)
+        actual = workspace.try_run(x, router, scale, live, compact)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_m1_workspace_isolates_streams_and_replaces_aliased_output(workspace_case):
+    compact, weights, router, scale, x = workspace_case
+    workspace = torch.classes.moe_int4_ops.Qwen38M1WorkspaceV1()
+    streams = [torch.xpu.Stream(), torch.xpu.Stream()]
+    observations = []
+    for _ in range(4):
+        for stream in streams:
+            with torch.xpu.stream(stream):
+                expected = workspace_reference(compact, x, router, scale, weights)
+                actual = workspace.try_run(x, router, scale, weights, compact)
+                observations.append((actual.clone(), expected, actual.data_ptr()))
+    torch.xpu.synchronize()
+    assert observations[0][2] != observations[1][2]
+    for actual, expected, _ in observations:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    previous = workspace.try_run(x, router, scale, weights, compact)
+    expected = workspace_reference(compact, previous, router, scale, weights)
+    actual = workspace.try_run(previous, router, scale, weights, compact)
+    assert actual.data_ptr() != previous.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("failure", ["m2", "weight_shape", "weight_dtype", "device"])
+def test_m1_workspace_unsupported_contract_does_not_modify_output(workspace_case, failure):
+    compact, weights, router, scale, x = workspace_case
+    workspace = torch.classes.moe_int4_ops.Qwen38M1WorkspaceV1()
+    output = workspace.try_run(x, router, scale, weights, compact)
+    before = output.clone()
+    bad = list(weights)
+    if failure == "m2":
+        x = x.repeat(2, 1)
+    elif failure == "weight_shape":
+        bad[0] = bad[0][:, :-1]
+    elif failure == "weight_dtype":
+        bad[1] = bad[1].view(torch.int16)
+    else:
+        x = x.cpu()
+    assert workspace.try_run(x, router, scale, bad, compact) is None
+    torch.testing.assert_close(output, before, rtol=0, atol=0)
+
+
+def test_m1_workspace_corrupt_output_is_hard_error(workspace_case):
+    compact, weights, router, scale, x = workspace_case
+    workspace = torch.classes.moe_int4_ops.Qwen38M1WorkspaceV1()
+    output = workspace.try_run(x, router, scale, weights, compact)
+    torch.xpu.synchronize()
+    output.resize_(2, 2560)
+    with pytest.raises(RuntimeError, match="output cache is inconsistent"):
+        workspace.try_run(x, router, scale, weights, compact)
+
+
+def test_m1_workspace_defers_lazy_views_to_legacy_dispatcher(workspace_case):
+    compact, weights, router, scale, x = workspace_case
+    workspace = torch.classes.moe_int4_ops.Qwen38M1WorkspaceV1()
+    assert workspace.try_run(torch._neg_view(x), router, scale, weights, compact) is None
+    negative_weights = (*weights[:1], torch._neg_view(weights[1]), *weights[2:])
+    assert workspace.try_run(x, router, scale, negative_weights, compact) is None
+
+
 def golden(x, logits, cpu, *, prefill=False, include_shared=True):
     q13, s13, q2, s2, su, sd, sg = cpu
     probability = logits.float().softmax(-1)
