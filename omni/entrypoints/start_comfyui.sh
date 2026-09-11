@@ -10,6 +10,42 @@ if [[ ! "$reserve_vram_gb" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     exit 2
 fi
 
+# An explicit memory-mode argument replaces the entrypoint default. ComfyUI
+# gives --enable-dynamic-vram precedence if both flags reach its parser.
+dynamic_vram_arguments=(--enable-dynamic-vram)
+explicit_dynamic_vram_argument=""
+for argument in "$@"; do
+    case "$argument" in
+        --enable-dynamic-vram|--disable-dynamic-vram)
+            if [[ -n "$explicit_dynamic_vram_argument" && \
+                  "$explicit_dynamic_vram_argument" != "$argument" ]]; then
+                echo "choose only one DynamicVRAM enable/disable argument" >&2
+                exit 2
+            fi
+            explicit_dynamic_vram_argument="$argument"
+            dynamic_vram_arguments=()
+            ;;
+    esac
+done
+
+if [[ "$explicit_dynamic_vram_argument" == "--disable-dynamic-vram" ]]; then
+    if [[ "${AIMDO_XPU_ALLOCATOR_MODE:-}" == "native_hook" ]]; then
+        echo "native_hook requires DynamicVRAM" >&2
+        exit 2
+    fi
+else
+    native_preload_path=$(python \
+        /llm/ComfyUI/custom_nodes/ComfyUI-OmniXPU/runtime_bootstrap.py \
+        --allocator-preload-path)
+    if [[ -n "$native_preload_path" ]]; then
+        export AIMDO_XPU_ALLOCATOR_MODE=native_hook
+        export LD_PRELOAD="${native_preload_path}${LD_PRELOAD:+:$LD_PRELOAD}"
+    elif [[ "${AIMDO_XPU_ALLOCATOR_MODE:-}" == "native_hook" ]]; then
+        echo "native_hook provider returned an empty preload path" >&2
+        exit 2
+    fi
+fi
+
 exec python /llm/ComfyUI/main.py \
     --listen 0.0.0.0 \
     --port 8188 \
@@ -18,6 +54,6 @@ exec python /llm/ComfyUI/main.py \
     --output-directory /data/output \
     --user-directory /data/user \
     --reserve-vram "$reserve_vram_gb" \
-    --enable-dynamic-vram \
+    "${dynamic_vram_arguments[@]}" \
     --enable-manager \
     "$@"

@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <limits>
 #include <tuple>
+#include <vector>
 
 #include "sol_attn_config.h"
 
@@ -47,6 +48,10 @@ void submit(sycl::queue& queue, int64_t groups, KernelFunc&& kernel) {
 }
 
 struct TopKThresholdKernel;
+
+#include "sol_attn_carriers.hpp"
+#include "sol_attn_routes.hpp"
+#include "sol_attn_coarse.hpp"
 
 void check_input(const at::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.device().is_xpu(), name, " must be on XPU");
@@ -195,22 +200,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare_with_controls(
                ? physical_length
                : requested_length);
 
-    float q_sum = 0.0f;
-    float k_sum = 0.0f;
-    float v_sum = 0.0f;
-    for (int64_t offset = 0; offset < length; ++offset) {
-      const int64_t token = start + offset;
-      q_sum += static_cast<float>(
-          q_ptr[batch_index * sq_b + token * sq_t + head * sq_h + dim]);
-      k_sum += static_cast<float>(
-          k_ptr[batch_index * sk_b + token * sk_t + head * sk_h + dim]);
-      v_sum += static_cast<float>(
-          v_ptr[batch_index * sv_b + token * sv_t + head * sv_h + dim]);
-    }
+    const auto sums = sol_block_sums<false>(
+        SolInputView<bf16>{q_ptr, sq_b, sq_t, sq_h},
+        SolInputView<bf16>{k_ptr, sk_b, sk_t, sk_h},
+        SolInputView<bf16>{v_ptr, sv_b, sv_t, sv_h},
+        batch_index, start, head, dim, length);
     const int64_t summary = (batch_head * blocks + block) * kHeadDim + dim;
-    qc_ptr[summary] = q_sum / static_cast<float>(length);
-    kc_ptr[summary] = static_cast<bf16>(k_sum / static_cast<float>(length));
-    vm_ptr[summary] = static_cast<bf16>(v_sum / static_cast<float>(length));
+    qc_ptr[summary] = sums.q / static_cast<float>(length);
+    kc_ptr[summary] = static_cast<bf16>(sums.k / static_cast<float>(length));
+    vm_ptr[summary] = static_cast<bf16>(sums.v / static_cast<float>(length));
   });
 
   if (topk_count >= 0) {
@@ -332,26 +330,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> prepare_with_controls(
             }
             sycl::group_barrier(item.get_group());
 
-            for (int64_t width = 2; width <= padded_blocks; width *= 2) {
-              for (int64_t stride = width / 2; stride > 0; stride /= 2) {
-                for (int64_t index = lane; index < padded_blocks;
-                     index += kWorkGroup) {
-                  const int64_t peer = index ^ stride;
-                  if (peer <= index) {
-                    continue;
-                  }
-                  const float left = sorted_scores[index];
-                  const float right = sorted_scores[peer];
-                  const bool descending = (index & width) == 0;
-                  const bool swap = descending ? left < right : left > right;
-                  if (swap) {
-                    sorted_scores[index] = right;
-                    sorted_scores[peer] = left;
-                  }
-                }
-                sycl::group_barrier(item.get_group());
-              }
-            }
+            sol_sort_descending(sorted_scores, padded_blocks, item);
 
             if (lane == 0 &&
                 !(query_block >= sink_q_start && query_block < sink_q_end)) {
@@ -545,6 +524,17 @@ at::Tensor materialize_routes(
 }  // namespace omni_xpu_sol_attn
 
 TORCH_LIBRARY_FRAGMENT(omni_xpu_sol_attn, m) {
+  m.def("coarse_output(Tensor qmean, Tensor kmean, Tensor vsum, Tensor block_len, int tokens, float scale) -> Tensor");
+  m.def("add_coarse_(Tensor(a!) output, Tensor coarse, Tensor gate) -> ()");
+  m.def("producer_begin(Tensor reference, int tokens, int heads, Tensor vscale) -> Tensor[]");
+  m.def("producer_chunk(Tensor q, Tensor k, Tensor v, Tensor(a!)[] carriers, Tensor kmean, int offset, Tensor block_len) -> ()");
+  m.def("producer_finish(Tensor(a!)[] carriers, float scale, float tau, Tensor block_len) -> ()");
+  m.def("sort_token_indices(Tensor indices, Tensor counts) -> Tensor");
+  m.def("merge_token_tail(Tensor pooled, Tensor grouped) -> Tensor");
+  m.def("token_group_centroids(Tensor qmean, Tensor refs) -> Tensor[]");
+  m.def("token_bin_cutoff(Tensor hist, int budget) -> Tensor");
+  m.def("pooled_routes(Tensor scores, Tensor threshold, Tensor v_sum, Tensor v_scale, Tensor block_len, int tokens, int sink_start, int sink_end, int sink_q_start, int sink_q_end, int topk, bool tail, bool token_groups) -> Tensor[]");
+  m.def("prepare_carriers(Tensor q, Tensor k, Tensor v, float scale, float tau, Tensor block_len) -> Tensor[]");
 #if SOL_ATTN_INLINE_ROUTE
   m.def(
       "prepare(Tensor q, Tensor k, Tensor v, float scale, float tau, "
@@ -572,6 +562,17 @@ TORCH_LIBRARY_FRAGMENT(omni_xpu_sol_attn, m) {
 }
 
 TORCH_LIBRARY_IMPL(omni_xpu_sol_attn, XPU, m) {
+  m.impl("coarse_output", &omni_xpu_sol_attn::coarse_output);
+  m.impl("add_coarse_", &omni_xpu_sol_attn::add_coarse_);
+  m.impl("producer_begin", &omni_xpu_sol_attn::producer_begin);
+  m.impl("producer_chunk", &omni_xpu_sol_attn::producer_chunk);
+  m.impl("producer_finish", &omni_xpu_sol_attn::producer_finish);
+  m.impl("sort_token_indices", &omni_xpu_sol_attn::sort_token_indices);
+  m.impl("merge_token_tail", &omni_xpu_sol_attn::merge_token_tail);
+  m.impl("token_group_centroids", &omni_xpu_sol_attn::token_group_centroids);
+  m.impl("token_bin_cutoff", &omni_xpu_sol_attn::token_bin_cutoff);
+  m.impl("pooled_routes", &omni_xpu_sol_attn::pooled_routes);
+  m.impl("prepare_carriers", &omni_xpu_sol_attn::prepare_carriers);
   m.impl("prepare", &omni_xpu_sol_attn::prepare);
   m.impl(
       "prepare_with_controls",

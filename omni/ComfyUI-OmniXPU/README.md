@@ -28,6 +28,11 @@ RoPE, generic INT8 linear dispatch, and the old FP8 negative-zero wrapper are
 not registered by this custom node. Duplicating those registrations here can
 override Kitchen's constraints and fallback policy.
 
+ComfyUI's quantized-format eligibility recognizes `int8_tensorwise` when the
+active Kitchen XPU backend provides its native INT8 and ConvRot operations.
+Model requests for full-precision matrix multiplication still apply. Other
+quantized formats retain ComfyUI's own eligibility decisions.
+
 ## Install
 
 The node is bundled with the `llm-scaler-omni` ComfyUI image. It requires:
@@ -79,6 +84,24 @@ After an official package upgrade, an incompatible provider is skipped in
 `auto` mode instead of being forced into a new API contract. Upgrade the
 corresponding provider wheel to restore XPU routing.
 
+The image's Linux provider defaults to `native_hook`, keeping Torch's native
+XPU allocator while AIMDO manages DynamicVRAM weights. The standard
+`start_comfyui.sh` entrypoint validates the provider, resolves its default and
+preloads its exact native library before starting Python. Set
+`AIMDO_XPU_ALLOCATOR_MODE=global` to select the Linux pluggable allocator.
+Older providers retain their own advertised default.
+
+Native mode requires DynamicVRAM and fails startup if activation fails after
+selection; it cannot silently fall back to another memory policy. Direct Python
+launchers enabling DynamicVRAM must also prepare the native preload before
+startup. Allocator modes do not change the model graph or enable XPU memory
+compilation.
+
+AIMDO 0.5.3 memory compilation (recording and replaying allocation graphs) is
+not yet supported on XPU. Its basic APIs and DynamicVRAM model-weight
+offloading remain available. This limitation does not disable OmniXPU's
+`torch.compile` support.
+
 ## Components and switches
 
 Adapters are enabled by default and always retain the original ComfyUI route
@@ -87,8 +110,10 @@ for unsupported inputs:
 ```bash
 OMNIXPU_ENABLE=0            # Disable every custom-node component
 OMNIXPU_ATTENTION=0         # Disable the attention adapter
+OMNIXPU_SPARSE_ATTENTION=0  # Disable XPU eligibility for Model Sparse Attention
 OMNIXPU_NORM=0              # Disable the norm adapter
 OMNIXPU_FP8_GEMM=0          # Disable the temporary FP8 model/factory adapter
+OMNIXPU_QUANTIZED_MATMUL=0  # Disable native INT8 model-format eligibility
 OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
 OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM=0  # Disable Windows XPU model-boundary trim
 OMNIXPU_LORA_MEMORY=0       # Disable cached whole-LoRA budgets and staging logs
@@ -137,6 +162,16 @@ OMNIXPU_MEDIAN_STRICT_INDICES=1
 `OMNIXPU_MEDIAN_STRICT_INDICES=1` reproduces the exact tie-break indices. The
 median workaround was only verified on BMG with Torch 2.10 and remains
 disabled by default on other configurations.
+
+## Model Sparse Attention
+
+With a matching native Sol sidecar, the upstream **Model Sparse Attention**
+node can select XPU tensors. Its generic Sol/SLA path and MiniMax-H3 chunked
+producer call Kitchen's public APIs. The upstream node owns block selection,
+4096-token projection chunks, previous-step statistics, VSA tiling and cleanup.
+The adapter only extends its device eligibility checks. An unavailable native
+API or an unsupported upstream eligibility contract leaves the original node
+behavior in place.
 
 ## Native compiled inference
 

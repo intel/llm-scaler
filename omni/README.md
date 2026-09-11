@@ -124,6 +124,10 @@ Override `OMNI_COMFYUI_RESERVE_VRAM_GB` only when the workload requires a
 different reserve. The supplied entrypoint automatically loads
 `/llm/configs/comfyui_host_models.yaml`.
 
+The Linux provider defaults to `native_hook`; the entrypoint prepares its
+verified preload so Torch retains its native XPU caching allocator. Set
+`AIMDO_XPU_ALLOCATOR_MODE=global` to select the Linux pluggable allocator.
+
 Keep host models and mutable runtime data outside `/llm/ComfyUI`. Mounting over
 its `models`, `input`, or `output` directories hides files tracked by upstream
 ComfyUI, which makes the checkout appear modified and causes
@@ -138,15 +142,15 @@ see [ComfyUI usage](docs/COMFYUI.md).
 
 The focused image contains:
 
-- upstream [ComfyUI v0.33.4](https://github.com/Comfy-Org/ComfyUI/releases/tag/v0.33.4),
-  pinned to `7a131a3afadc8200120f67f9236311a2c48b7445`;
+- upstream [ComfyUI v0.35.0](https://github.com/Comfy-Org/ComfyUI/tree/v0.35.0),
+  pinned to `40c4fcdf513a4523e39d54a9d391908af8df8171`;
 - `omni_xpu_kernel`, built for the selected Torch minor and XPU target;
-- official `comfy-kitchen==0.2.31` plus the co-installable XPU runtime provider
-  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/9eccb7fa42edf14bc4a4c41aafd645ff1f1dcb75),
+- official `comfy-kitchen==0.2.33` plus the co-installable XPU runtime provider
+  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/9a46ea72e3e9a639ec9cfc0af8d763614eb00b4d),
   including the managed GGUF and Nunchaku W4A16 routes;
-- official `comfy-aimdo==0.4.13` plus the co-installable XPU runtime provider
-  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/063d66e5345fea58d1a4e8aa6f160ccc0c593f16),
-  built with its Level Zero allocator backend;
+- official `comfy-aimdo==0.5.3` plus the co-installable XPU runtime provider
+  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/a79b5668d0a79a957796bd9c539577a70d384aa1),
+  built with its Level Zero backend and native allocator hook;
 - [`ComfyUI-GGUF-XPU`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
   with GGUF, SentencePiece, and Protobuf dependencies installed from the same
   pinned checkout's requirements;
@@ -156,7 +160,7 @@ The focused image contains:
   using the packaged `omni_xpu_kernel` CUTE/DPAS backend without a second XPU
   build path or Triton dependency;
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md);
-- ComfyUI v0.33.4 integrated Node Manager plus pinned VideoHelperSuite,
+- ComfyUI v0.35.0 integrated Node Manager plus pinned VideoHelperSuite,
   Easy-Use, KJNodes, CacheDiT, and ControlNet auxiliary nodes;
 - an exact installed Python dependency snapshot at
   `/llm/manifests/comfyui-python-freeze.txt`.

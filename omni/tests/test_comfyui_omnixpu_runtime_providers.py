@@ -34,6 +34,8 @@ def runtime(monkeypatch):
     spec.loader.exec_module(module)
     monkeypatch.delenv("OMNIXPU_PROVIDER_BOOTSTRAP", raising=False)
     monkeypatch.delenv("OMNIXPU_ENABLE", raising=False)
+    monkeypatch.delenv("AIMDO_XPU_ALLOCATOR_MODE", raising=False)
+    monkeypatch.delenv("AIMDO_XPU_DISABLE_UR_HOOK", raising=False)
     yield module
     sys.meta_path[:] = original_meta_path
     for name in tuple(sys.modules):
@@ -60,6 +62,139 @@ def _provider(runtime, tmp_path, provider_id, canonical_import, activation):
         canonical_root=canonical_root,
         manifest=manifest,
     )
+
+
+def _native_provider(runtime, tmp_path):
+    return _provider(runtime, tmp_path, "comfy_aimdo.xpu", "comfy_aimdo", {
+        "strategy": "canonical_control_overlay", "requires_dynamic_vram": True,
+        "allocator_modes": {"linux": ["global", "native_hook"]},
+        "default_allocator_modes": {"linux": "native_hook"},
+    })
+
+
+def test_native_default_and_global_override_are_manifest_bound(runtime, monkeypatch, tmp_path):
+    monkeypatch.setattr(runtime.sys, "platform", "linux")
+    provider = _native_provider(runtime, tmp_path)
+    assert runtime._select_aimdo_allocator_mode(provider) == "native_hook"
+    monkeypatch.setenv("AIMDO_XPU_ALLOCATOR_MODE", "global")
+    assert runtime._select_aimdo_allocator_mode(provider) == "global"
+    monkeypatch.delenv("AIMDO_XPU_ALLOCATOR_MODE")
+    provider.manifest["activation"]["allocator_modes"]["linux"] = ["global"]
+    with pytest.raises(RuntimeError, match="does not admit"):
+        runtime._select_aimdo_allocator_mode(provider)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_native_mode_activation_preserves_native_owner(runtime, monkeypatch, tmp_path, explicit):
+    monkeypatch.setattr(runtime.sys, "platform", "linux")
+    _, control = _install_official_aimdo(monkeypatch, tmp_path)
+    provider = _native_provider(runtime, tmp_path)
+    (provider.canonical_root / "control.py").write_text(
+        "lib = None\ndevctxs = []\n_xpu_allocator_ready = False\n_torch_allocator = None\n"
+        "def init(**kwargs):\n"
+        "    global lib, _xpu_allocator_ready, CALL\n"
+        "    CALL = kwargs\n    lib = object()\n    _xpu_allocator_ready = True\n    return True\n"
+        "def get_xpu_allocator_mode():\n    return 'native_hook'\n"
+    )
+    if explicit:
+        monkeypatch.setenv("AIMDO_XPU_ALLOCATOR_MODE", "native_hook")
+    state = runtime.bootstrap(providers_override={provider.provider_id: provider})
+    assert state["providers"][provider.provider_id]["status"] == "active"
+    assert control.CALL["xpu_allocator_mode"] == "native_hook"
+    assert control._torch_allocator is None
+
+
+@pytest.mark.parametrize("reason", ["missing", "disabled", "failure", "wrong_mode"])
+def test_explicit_native_fails_closed_even_in_auto(runtime, monkeypatch, tmp_path, reason):
+    monkeypatch.setattr(runtime.sys, "platform", "linux")
+    _install_official_aimdo(monkeypatch, tmp_path)
+    provider = _native_provider(runtime, tmp_path)
+    (provider.canonical_root / "control.py").write_text(
+        "lib = None\ndevctxs = []\n_xpu_allocator_ready = False\n_torch_allocator = None\n"
+        f"def init(**kwargs):\n    return {reason == 'wrong_mode'}\n"
+        "def get_xpu_allocator_mode():\n    return 'global'\n"
+    )
+    monkeypatch.setenv("AIMDO_XPU_ALLOCATOR_MODE", "native_hook")
+    with pytest.raises(SystemExit):
+        runtime.bootstrap(providers_override={} if reason == "missing" else {provider.provider_id: provider},
+                          dynamic_vram_override=reason != "disabled")
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_native_preload_requires_verified_library_without_torch(runtime, monkeypatch, tmp_path, explicit):
+    monkeypatch.setattr(runtime.sys, "platform", "linux")
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    if explicit:
+        monkeypatch.setenv("AIMDO_XPU_ALLOCATOR_MODE", "native_hook")
+    provider = _native_provider(runtime, tmp_path)
+    library = provider.canonical_root / "aimdo_xpu.so"
+    library.write_bytes(b"native-test-library")
+    provider.manifest.update(vendor_root="provider/_vendor", vendored_files={
+        "provider/_vendor/comfy_aimdo/aimdo_xpu.so": hashlib.sha256(library.read_bytes()).hexdigest()})
+    monkeypatch.setattr(runtime, "discover_providers", lambda: ({provider.provider_id: provider}, []))
+    assert runtime.prepare_native_preload() == str(library)
+    assert runtime.prepare_native_preload(allow_inactive=True) == str(library)
+    assert "torch" not in sys.modules
+    library.write_bytes(b"changed-library")
+    with pytest.raises(RuntimeError, match="unverified"):
+        runtime.prepare_native_preload()
+
+
+@pytest.mark.parametrize("reason", ["failure", "wrong_mode", "early_torch"])
+def test_default_native_activation_failure_is_fatal(runtime, monkeypatch, tmp_path, reason):
+    monkeypatch.setattr(runtime.sys, "platform", "linux")
+    _install_official_aimdo(monkeypatch, tmp_path)
+    provider = _native_provider(runtime, tmp_path)
+    (provider.canonical_root / "control.py").write_text(
+        "lib = None\ndevctxs = []\n_xpu_allocator_ready = False\n_torch_allocator = None\n"
+        f"def init(**kwargs):\n    return {reason == 'wrong_mode'}\n"
+        "def get_xpu_allocator_mode():\n    return 'global'\n"
+    )
+    if reason == "early_torch":
+        monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
+    with pytest.raises(SystemExit, match="AIMDO provider activation failed"):
+        runtime.bootstrap(providers_override={provider.provider_id: provider})
+
+
+@pytest.mark.parametrize("selection", ["global_override", "legacy_global", "bootstrap_off", "master_off", "missing"])
+def test_entrypoint_preload_allows_global_or_inactive(runtime, monkeypatch, tmp_path, selection):
+    monkeypatch.setattr(runtime.sys, "platform", "linux")
+    provider = _native_provider(runtime, tmp_path)
+    if selection == "global_override":
+        monkeypatch.setenv("AIMDO_XPU_ALLOCATOR_MODE", "global")
+        monkeypatch.setenv("AIMDO_XPU_DISABLE_UR_HOOK", "1")
+    elif selection == "legacy_global":
+        provider.manifest["activation"].pop("default_allocator_modes")
+        provider.manifest["activation"]["allocator_modes"]["linux"] = ["global"]
+    elif selection == "bootstrap_off":
+        monkeypatch.setenv("OMNIXPU_PROVIDER_BOOTSTRAP", "off")
+    elif selection == "master_off":
+        monkeypatch.setenv("OMNIXPU_ENABLE", "0")
+    providers = {} if selection == "missing" else {provider.provider_id: provider}
+    monkeypatch.setattr(runtime, "discover_providers", lambda: (providers, []))
+    assert runtime.prepare_native_preload(allow_inactive=True) == ""
+    with pytest.raises(RuntimeError):
+        runtime.prepare_native_preload()
+
+
+@pytest.mark.parametrize("reason", ["hook_disabled", "invalid_mode", "required_missing", "explicit_missing", "explicit_off"])
+def test_entrypoint_preload_rejects_unavailable_selection(runtime, monkeypatch, tmp_path, reason):
+    monkeypatch.setattr(runtime.sys, "platform", "linux")
+    provider = _native_provider(runtime, tmp_path)
+    if reason == "hook_disabled":
+        monkeypatch.setenv("AIMDO_XPU_DISABLE_UR_HOOK", "1")
+    elif reason == "invalid_mode":
+        monkeypatch.setenv("AIMDO_XPU_ALLOCATOR_MODE", "invalid")
+    elif reason == "required_missing":
+        monkeypatch.setenv("OMNIXPU_PROVIDER_BOOTSTRAP", "required")
+    else:
+        monkeypatch.setenv("AIMDO_XPU_ALLOCATOR_MODE", "native_hook")
+        if reason == "explicit_off":
+            monkeypatch.setenv("OMNIXPU_PROVIDER_BOOTSTRAP", "off")
+    providers = {} if reason.endswith("missing") else {provider.provider_id: provider}
+    monkeypatch.setattr(runtime, "discover_providers", lambda: (providers, []))
+    with pytest.raises(RuntimeError):
+        runtime.prepare_native_preload(allow_inactive=True)
 
 
 def _install_official_aimdo(monkeypatch, tmp_path, *, dynamic=True):

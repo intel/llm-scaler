@@ -76,15 +76,19 @@ def _routing_h3_module(monkeypatch, state):
         {"state": state, "torch": torch, "opaque_output": _opaque_output}
     )
     source = """
+def _mod_row(vecs, row, dtype):
+    return vecs[row].to(dtype)
+
+
 def _mod_scale_shift(h, shift, scale, segments):
     for a, b, row in segments:
-        h[a:b].mul_(1.0 + scale[row].to(h.dtype)).add_(shift[row].to(h.dtype))
+        h[a:b].mul_(1.0 + _mod_row(scale, row, h.dtype)).add_(_mod_row(shift, row, h.dtype))
     return h
 
 
 def _mod_gate(x, gate, other, segments):
     for a, b, row in segments:
-        x[a:b].addcmul_(other[a:b], gate[row].to(x.dtype))
+        x[a:b].addcmul_(other[a:b], _mod_row(gate, row, x.dtype))
     return x
 
 
@@ -120,10 +124,11 @@ class DiTBlock:
     def mlp(self, h):
         return opaque_output(h)
 
-    def forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}):
+    def forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}, attention=None):
+        attention = self.attn if attention is None else attention
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
         h = _mod_scale_shift(self.norm1(x), shift_msa, scale_msa, mod_segments)
-        x = _mod_gate(x, gate_msa, self.attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options), mod_segments)
+        x = _mod_gate(x, gate_msa, attention(h, rope_freqs=rope_freqs, transformer_options=transformer_options), mod_segments)
         h = _mod_scale_shift(self.norm2(x), shift_mlp, scale_mlp, mod_segments)
         return _mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
 """
@@ -378,6 +383,34 @@ def test_dispatch_uses_the_selected_interface_without_numerical_claims(
     direct = block.norm1(value.clone())
     assert isinstance(direct, torch.Tensor)
     assert state["fallback_norm_calls"] == (1 if policy_supported else 3)
+
+
+@pytest.mark.parametrize("policy_supported", [False, True])
+@pytest.mark.parametrize("training", [False, True])
+def test_attention_override_survives_native_and_fallback_routes(
+    monkeypatch, policy_supported, training,
+):
+    adapter = _load_adapter(monkeypatch)
+    model, state = _install_routing_stubs(
+        monkeypatch, adapter, policy_supported=policy_supported,
+    )
+    sys.modules["comfy.model_management"].in_training = training
+    block = model.DiTBlock(_metadata(5376), _packed_modulation())
+    calls = []
+    def selected(value, **kwargs):
+        calls.append(kwargs)
+        return _opaque_output(value)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the attention override must be retained")
+    block.attn = forbidden
+    assert adapter.apply() == (True, "")
+    rope, options = object(), {"override": True}
+    block.forward(
+        _metadata(7, 5376), None, [(0, 7, 0)], rope,
+        transformer_options=options, attention=selected,
+    )
+    assert calls == [{"rope_freqs": rope, "transformer_options": options}]
+    assert state["projection_calls"] == 1
 
 
 def test_unsupported_input_layout_uses_original_interface(monkeypatch):
@@ -821,6 +854,7 @@ def test_fixture_call_boundaries_match_installed_comfy_source(monkeypatch):
     model, _state = _install_routing_stubs(monkeypatch, adapter, policy_supported=True)
     for real_node, fixture in (
         (forward, model.DiTBlock.forward),
+        (top_level["_mod_row"], model._mod_row),
         (top_level["_mod_scale_shift"], model._mod_scale_shift),
         (top_level["_mod_gate"], model._mod_gate),
     ):
