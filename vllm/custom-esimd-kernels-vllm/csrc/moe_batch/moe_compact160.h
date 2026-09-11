@@ -40,6 +40,15 @@ static MoeCompact160Buffers& compact160_buffers(
     return cache.emplace(stream, std::move(value)).first->second;
 }
 
+// Private submit helper: callers must validate the live tensor transaction.
+// Queue validation and scratch allocation remain before the first GPU submit.
+template <bool Router>
+static torch::Tensor compact160_submit(
+    torch::Tensor x, torch::Tensor logits_or_router, torch::Tensor router_scale,
+    torch::Tensor w13, torch::Tensor s13, torch::Tensor w2, torch::Tensor s2,
+    torch::Tensor shared_up, torch::Tensor shared_down, torch::Tensor shared_gate,
+    torch::Tensor output);
+
 template <bool Router>
 static torch::Tensor compact160_forward(
     torch::Tensor x, torch::Tensor logits_or_router, torch::Tensor router_scale,
@@ -73,6 +82,18 @@ static torch::Tensor compact160_forward(
                     "compact160 output must not alias inputs");
     }
     TORCH_CHECK(!output.is_neg() && !output.is_conj(), "compact160 rejects lazy output");
+    return compact160_submit<Router>(x, logits_or_router, router_scale,
+        w13, s13, w2, s2, shared_up, shared_down, shared_gate, output);
+}
+
+template <bool Router>
+static torch::Tensor compact160_submit(
+    torch::Tensor x, torch::Tensor logits_or_router, torch::Tensor router_scale,
+    torch::Tensor w13, torch::Tensor s13, torch::Tensor w2, torch::Tensor s2,
+    torch::Tensor shared_up, torch::Tensor shared_down, torch::Tensor shared_gate,
+    torch::Tensor output) {
+    const int m = x.size(0);
+    const auto device = x.device();
     const auto stream = c10::xpu::getCurrentXPUStream(device.index());
     auto& queue = stream.queue();
     TORCH_CHECK(queue.is_in_order() && queue.get_context() == c10::xpu::get_device_context() &&

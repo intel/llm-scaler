@@ -1,5 +1,7 @@
 """HC live-metadata preflight: no cached weights, no submit on rejection."""
 
+import os
+
 import pytest
 import torch
 from test_hc_host_chain_xpu import (
@@ -17,6 +19,9 @@ from test_hc_host_chain_xpu import (
 
 
 def workspace():
+    if os.getenv("QWEN38_DIRECT_WORKSPACE_TEST") == "1":
+        from custom_esimd_kernels_vllm import custom_esimd_kernels
+        return custom_esimd_kernels.HCWorkspaceDirectV1()
     value = torch.classes.custom_esimd_kernels_vllm.HCWorkspace()
     assert callable(value.try_run), "test requires the new build-only DSO"
     return value
@@ -112,3 +117,15 @@ def test_current_stream_producer_consumer_and_reuse(device):
         parent.wait_stream(stream)
     for result in outputs:
         exact(result, reference)
+
+
+def test_borrowed_output_metadata_is_rechecked_before_submit(device):
+    args = _make_inputs(device)
+    ws = workspace()
+    combined, mixed, injection = ws.try_run(*args, EPS)
+    snapshot = combined.clone()
+    torch.xpu.synchronize()
+    mixed.resize_(2560)
+    with pytest.raises(RuntimeError, match="expects hidden"):
+        ws.try_run(*args, EPS)
+    torch.testing.assert_close(combined, snapshot, rtol=0, atol=0)

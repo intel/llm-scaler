@@ -6215,6 +6215,10 @@ TORCH_LIBRARY_IMPL(moe_int4_ops, XPU, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    // Direct binding only changes host marshalling; try_run owns all checks.
+    pybind11::class_<Qwen38MoeM1Workspace>(m, "Qwen38M1WorkspaceDirectV1")
+        .def(pybind11::init<>())
+        .def("try_run", &Qwen38MoeM1Workspace::try_run);
     m.def("moe_router_forward_int4", &moe_router_forward_int4);
     m.def("moe_router_topk_int4", &moe_router_topk_int4);
     m.def("moe_topk_int4", &moe_topk_int4);

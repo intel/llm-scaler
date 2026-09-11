@@ -58,13 +58,14 @@ class Qwen38MoeM1Workspace final : public torch::CustomClassHolder {
       found = outputs_.emplace(stream, at::empty({1, 2560}, x.options())).first;
     }
     auto output = found->second;
-    // These established entries still validate the full transaction before
-    // their first submit (including queue, lazy bits and output overlap).
-    // Their exceptions are hard errors; never convert them into a fallback.
+    // All live TP4 inputs and the selected output were checked in this call.
+    // Do not repeat the public entry's metadata/alias checks. The private
+    // submit helper still checks the current queue and prepares scratch before
+    // launching. Errors are hard failures, never a post-submit fallback.
     if (intermediate == 160) {
-      return moe_forward_compact160_router_out_v1(
+      return compact160_submit<true>(
           x, router, router_scale, weights[0], weights[1], weights[2], weights[3],
-          weights[4], weights[5], weights[6], output, 10, 1, 512);
+          weights[4], weights[5], weights[6], output);
     }
     return moe_forward_m1_cutlass_nmajor_int4_fp16_shared_compact80_router_out_v1(
         x, router, router_scale, weights[0], weights[1], weights[2], weights[3],

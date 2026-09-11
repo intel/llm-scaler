@@ -3,6 +3,8 @@
 #include <torch/all.h>
 #include <torch/custom_class.h>
 #include <torch/library.h>
+#include <torch/csrc/utils/pybind.h>
+#include <pybind11/stl.h>
 
 #include <array>
 #include <cmath>
@@ -103,17 +105,21 @@ static void validate_hc_combine_mix_m1(
     const at::Tensor& down,
     const at::Tensor& gate,
     const at::Tensor& mixed,
-    double eps) {
+    double eps,
+    bool inputs_checked = false,
+    bool aliases_checked = false) {
   TORCH_CHECK(hidden.defined(), "hidden must be defined");
   TORCH_CHECK(hidden.device().is_xpu(), "hidden must be on XPU");
   const at::Device device = hidden.device();
 
-  check_hc_chain_tensor(hidden, device, "hidden");
-  check_hc_chain_tensor(block, device, "block");
-  check_hc_chain_tensor(injection, device, "injection");
-  check_hc_chain_tensor(norm_weight, device, "norm_weight");
-  check_hc_chain_tensor(down_weight, device, "down_weight");
-  check_hc_chain_tensor(up_weight, device, "up_weight");
+  if (!inputs_checked) {
+    check_hc_chain_tensor(hidden, device, "hidden");
+    check_hc_chain_tensor(block, device, "block");
+    check_hc_chain_tensor(injection, device, "injection");
+    check_hc_chain_tensor(norm_weight, device, "norm_weight");
+    check_hc_chain_tensor(down_weight, device, "down_weight");
+    check_hc_chain_tensor(up_weight, device, "up_weight");
+  }
   check_hc_chain_tensor(combined, device, "combined");
   check_hc_chain_tensor(normed, device, "normed");
   check_hc_chain_tensor(down, device, "down");
@@ -121,7 +127,7 @@ static void validate_hc_combine_mix_m1(
   check_hc_chain_tensor(mixed, device, "mixed");
 
   TORCH_CHECK(
-      hidden.dim() == 2 && hidden.size(0) == 1 &&
+      (inputs_checked || (hidden.dim() == 2 && hidden.size(0) == 1 &&
           hidden.size(1) == 10240 &&
           block.dim() == 2 && block.size(0) == 1 &&
           block.size(1) == 2560 &&
@@ -131,7 +137,7 @@ static void validate_hc_combine_mix_m1(
           down_weight.dim() == 2 && down_weight.size(0) == 336 &&
           down_weight.size(1) == 10240 &&
           up_weight.dim() == 2 && up_weight.size(0) == 10240 &&
-          up_weight.size(1) == 320 &&
+          up_weight.size(1) == 320)) &&
           combined.dim() == 2 && combined.size(0) == 1 &&
           combined.size(1) == 10240 &&
           normed.dim() == 2 && normed.size(0) == 1 &&
@@ -144,14 +150,16 @@ static void validate_hc_combine_mix_m1(
       "up_weight [10240, 320], combined/normed/gate [1, 10240], "
       "down [1, 336], and mixed [1, 2560]");
 
-  check_hc_chain_no_output_alias(
-      hidden, block, injection, norm_weight, down_weight, up_weight,
-      combined, normed, down, gate, mixed);
+  if (!aliases_checked) {
+    check_hc_chain_no_output_alias(
+        hidden, block, injection, norm_weight, down_weight, up_weight,
+        combined, normed, down, gate, mixed);
+  }
 
   const float eps_fp32 = static_cast<float>(eps);
   TORCH_CHECK(
-      std::isfinite(eps) && eps > 0.0 &&
-          std::isfinite(eps_fp32) && eps_fp32 > 0.0f,
+      inputs_checked || (std::isfinite(eps) && eps > 0.0 &&
+          std::isfinite(eps_fp32) && eps_fp32 > 0.0f),
       "hc_combine_mix_m1_v1 eps must remain finite and positive in FP32");
 }
 
@@ -319,7 +327,8 @@ class HcM1Workspace final : public torch::CustomClassHolder {
       return std::nullopt;
     // Keep the established stream-isolated scratch, alias checks and complete
     // transaction validation. Exceptions after this point must never fallback.
-    return run(hidden, block, injection, norm_weight, down_weight, up_weight, eps);
+    return run_impl(hidden, block, injection, norm_weight, down_weight,
+                    up_weight, eps, true);
   }
 
   std::tuple<at::Tensor, at::Tensor, at::Tensor> run(
@@ -330,6 +339,15 @@ class HcM1Workspace final : public torch::CustomClassHolder {
       at::Tensor down_weight,
       at::Tensor up_weight,
       double eps) {
+    return run_impl(hidden, block, injection, norm_weight, down_weight,
+                    up_weight, eps, false);
+  }
+
+ private:
+  std::tuple<at::Tensor, at::Tensor, at::Tensor> run_impl(
+      at::Tensor hidden, at::Tensor block, at::Tensor injection,
+      at::Tensor norm_weight, at::Tensor down_weight, at::Tensor up_weight,
+      double eps, bool inputs_checked) {
     TORCH_CHECK(hidden.defined(), "hidden must be defined");
     TORCH_CHECK(hidden.device().is_xpu(), "hidden must be on XPU");
 
@@ -352,12 +370,13 @@ class HcM1Workspace final : public torch::CustomClassHolder {
     }
     HcM1Scratch& scratch = scratch_it->second;
 
-    // This is the complete transaction preflight.  It must finish before the
-    // first GPU submit; no post-submit exception is converted into fallback.
+    // Reuse checks only within THIS invocation: try_run proved input metadata,
+    // and scratch selection above checked all aliases (fresh allocations cannot
+    // alias live inputs). Scratch geometry is still checked on every call.
     validate_hc_combine_mix_m1(
         hidden, block, injection, norm_weight, down_weight, up_weight,
         scratch.combined, scratch.normed, scratch.down, scratch.gate,
-        scratch.mixed, eps);
+        scratch.mixed, eps, inputs_checked, true);
     hc_combine_mix_m1_v1_impl<true>(
         hidden, block, injection, norm_weight, down_weight, up_weight,
         scratch.combined, scratch.normed, scratch.down, scratch.gate,
@@ -566,6 +585,14 @@ static auto register_hc_multi_m_workspace =
         .def("run", &HcMultiMWorkspaceV1::run);
 
 }  // namespace
+
+// Opt-in direct binding for measuring Python/IValue marshalling overhead.
+// The same live preflight, stream ownership and kernels back both entries.
+void bind_hc_direct_workspace(pybind11::module_& module) {
+  pybind11::class_<HcM1Workspace>(module, "HCWorkspaceDirectV1")
+      .def(pybind11::init<>())
+      .def("try_run", &HcM1Workspace::try_run);
+}
 
 TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
   m.def("hc_outputs_alias_inputs_v1(Tensor[] outputs, Tensor[] inputs) -> bool",

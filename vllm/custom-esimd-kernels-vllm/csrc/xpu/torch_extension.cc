@@ -2,6 +2,7 @@
 #include <torch/all.h>
 #include <torch/library.h>
 #include <Python.h>
+#include <pybind11/pybind11.h>
 #include <cstdint>
 
 #include "kernel_ops.h"
@@ -324,7 +325,8 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
   m.impl("esimd_gemv_fp8_pert_bmg", torch::kXPU, &esimd_gemv_fp8_pert_bmg);
 }
 
-PyMODINIT_FUNC PyInit_custom_esimd_kernels() {
-    static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, "custom_esimd_kernels", nullptr, 0, nullptr};
-    return PyModule_Create(&module);
+void bind_hc_direct_workspace(pybind11::module_& module);
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+    bind_hc_direct_workspace(module);
 }

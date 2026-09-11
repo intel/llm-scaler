@@ -7,6 +7,13 @@ import torch
 from test_moe_m1_asymmetric_v1_xpu import OUTPUT_ATOL, _dso_path
 
 
+def make_workspace():
+    if os.getenv("QWEN38_DIRECT_WORKSPACE_TEST") == "1":
+        from custom_esimd_kernels_vllm import moe_int4_ops
+        return moe_int4_ops.Qwen38M1WorkspaceDirectV1()
+    return torch.classes.moe_int4_ops.Qwen38M1WorkspaceV1()
+
+
 def unpack_s4(packed, scales):
     raw = packed.cpu().view(torch.uint8).int()
     values = torch.stack((raw & 15, raw >> 4), dim=-1).flatten(-2)
@@ -76,7 +83,7 @@ def workspace_reference(compact, x, router, scale, weights):
 
 def test_m1_workspace_matches_existing_kernels_and_live_rebind(workspace_case):
     compact, weights, router, scale, x = workspace_case
-    workspace = torch.classes.moe_int4_ops.Qwen38M1WorkspaceV1()
+    workspace = make_workspace()
     live = list(weights)
     live[0] = torch.nn.Parameter(weights[0].view(torch.int8), requires_grad=False)
     for rebind in (False, True):
@@ -90,7 +97,7 @@ def test_m1_workspace_matches_existing_kernels_and_live_rebind(workspace_case):
 
 def test_m1_workspace_isolates_streams_and_replaces_aliased_output(workspace_case):
     compact, weights, router, scale, x = workspace_case
-    workspace = torch.classes.moe_int4_ops.Qwen38M1WorkspaceV1()
+    workspace = make_workspace()
     streams = [torch.xpu.Stream(), torch.xpu.Stream()]
     observations = []
     for _ in range(4):
@@ -113,7 +120,7 @@ def test_m1_workspace_isolates_streams_and_replaces_aliased_output(workspace_cas
 @pytest.mark.parametrize("failure", ["m2", "weight_shape", "weight_dtype", "device"])
 def test_m1_workspace_unsupported_contract_does_not_modify_output(workspace_case, failure):
     compact, weights, router, scale, x = workspace_case
-    workspace = torch.classes.moe_int4_ops.Qwen38M1WorkspaceV1()
+    workspace = make_workspace()
     output = workspace.try_run(x, router, scale, weights, compact)
     before = output.clone()
     bad = list(weights)
@@ -131,7 +138,7 @@ def test_m1_workspace_unsupported_contract_does_not_modify_output(workspace_case
 
 def test_m1_workspace_corrupt_output_is_hard_error(workspace_case):
     compact, weights, router, scale, x = workspace_case
-    workspace = torch.classes.moe_int4_ops.Qwen38M1WorkspaceV1()
+    workspace = make_workspace()
     output = workspace.try_run(x, router, scale, weights, compact)
     torch.xpu.synchronize()
     output.resize_(2, 2560)
@@ -141,7 +148,7 @@ def test_m1_workspace_corrupt_output_is_hard_error(workspace_case):
 
 def test_m1_workspace_defers_lazy_views_to_legacy_dispatcher(workspace_case):
     compact, weights, router, scale, x = workspace_case
-    workspace = torch.classes.moe_int4_ops.Qwen38M1WorkspaceV1()
+    workspace = make_workspace()
     assert workspace.try_run(torch._neg_view(x), router, scale, weights, compact) is None
     negative_weights = (*weights[:1], torch._neg_view(weights[1]), *weights[2:])
     assert workspace.try_run(x, router, scale, negative_weights, compact) is None
