@@ -141,10 +141,16 @@ ZE_AFFINITY_MASK=6,7 TP_SIZE=2 PORT=30001 \
 Defaults are `SPEC_NUM_STEPS=3`, `SPEC_TOPK=1`, `SPEC_NUM_DRAFT_TOKENS=4`.
 Use steps `1` and draft tokens `2` for a smaller initial trial. Keep
 `SPEC_TOPK=1`: the XPU GDN verify kernels support a linear chain only.
-The launcher enables `SGL_XPU_GDN_VERIFY_ESIMD` when MTP is requested and
+The launcher enables `SGLANG_XPU_MTP_GDN_VERIFY` when MTP is requested and
 defaults GGUF MTP to `MEM_FRACTION_STATIC=0.65` to leave room for draft weights,
 KV cache and GDN snapshots. Explicit environment overrides are preserved.
 The ordinary GGUF memory default remains `0.8`.
+Here, "verify" means the target-model forward that checks MTP draft tokens
+and saves GDN state snapshots for the accepted prefix. This selects the XPU
+kernels for that inference stage; it is not a test mode or the MTP enable switch.
+`SGL_XPU_GDN_VERIFY_ESIMD` is accepted as a legacy name; the new name takes
+precedence when both are set. The launcher also forwards the resolved value
+under the legacy name for compatibility with older SGLang revisions.
 
 The local `Qwen3.6-27B-Q4_K_M.gguf` does not include an MTP branch; it needs
 a separate matching GGUF draft with those tensors. Do not use another model

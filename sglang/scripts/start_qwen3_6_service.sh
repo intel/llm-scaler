@@ -71,7 +71,9 @@ if [[ -n "${SPEC_DRAFT_PATH:-}" ]]; then
     # Use the existing XPU kernels for verification and rollback snapshots,
     # just as decode/extend use their XPU kernels. Ordinary launches leave
     # this MTP-only switch unset; an explicit override is preserved.
-    export SGL_XPU_GDN_VERIFY_ESIMD="${SGL_XPU_GDN_VERIFY_ESIMD:-1}"
+    export SGLANG_XPU_MTP_GDN_VERIFY="${SGLANG_XPU_MTP_GDN_VERIFY:-${SGL_XPU_GDN_VERIFY_ESIMD:-1}}"
+    # Forward the resolved value for SGLang revisions that read the old name.
+    export SGL_XPU_GDN_VERIFY_ESIMD="$SGLANG_XPU_MTP_GDN_VERIFY"
     SPEC_ARGS=(
         --speculative-algorithm NEXTN
         --speculative-draft-model-path "$SPEC_DRAFT_PATH"
