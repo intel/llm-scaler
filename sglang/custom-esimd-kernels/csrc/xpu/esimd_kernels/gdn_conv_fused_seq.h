@@ -626,8 +626,10 @@ inline void gdn_conv_fused_seq_dispatch(
     int conv_native,
     sycl::queue& q)
 {
-    const int total_wgs = N * HV;
-    const int inline_shift = (total_wgs <= WG_SIZE) ? 1 : 0;
+    // All HV workgroups must finish reading convolution state before it is
+    // shifted. A workgroup barrier cannot order other workgroups, even when
+    // their total count fits in WG_SIZE; use the existing ordered shift kernel.
+    const int inline_shift = 0;
 
     sycl::nd_range<3> Range(
         sycl::range<3>(N, HV, WG_SIZE),

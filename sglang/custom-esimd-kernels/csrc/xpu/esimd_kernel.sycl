@@ -270,6 +270,191 @@ at::Tensor esimd_gemv_q4_k_m(
     return output;
 }
 
+// ---- GGUF IQ4_NL/IQ4_XS canonical GEMV: LUT index + final scale ----
+
+#include "esimd_kernels/iq4_GEMV.h"
+
+at::Tensor esimd_gemv_iq4(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output) {
+    int64_t N = weight.size(0);
+    int64_t K = weight.size(1) * 2;
+    TORCH_CHECK(K % IQ4_GROUP == 0,
+                "esimd_gemv_iq4: K must be divisible by 32, got ", K);
+    TORCH_CHECK(weight_scale.size(0) == N && weight_scale.size(1) == K / 32,
+                "esimd_gemv_iq4: invalid scale shape");
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_w, weight);
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    iq4_gemv_host(reinterpret_cast<const fp16*>(p_in), p_w,
+                  reinterpret_cast<const fp16*>(p_sc),
+                  reinterpret_cast<fp16*>(p_out),
+                  (uint32_t)N, (uint32_t)K, dpcpp_queue);
+    return output;
+}
+
+at::Tensor esimd_gemv_iq4_m(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output) {
+    int64_t M = input.size(0);
+    int64_t N = weight.size(0);
+    int64_t K = weight.size(1) * 2;
+    TORCH_CHECK(K % IQ4_GROUP == 0,
+                "esimd_gemv_iq4_m: K must be divisible by 32, got ", K);
+    TORCH_CHECK(weight_scale.size(0) == N && weight_scale.size(1) == K / 32,
+                "esimd_gemv_iq4_m: invalid scale shape");
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_w, weight);
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    iq4_gemv_M_host(reinterpret_cast<const fp16*>(p_in), p_w,
+                    reinterpret_cast<const fp16*>(p_sc),
+                    reinterpret_cast<fp16*>(p_out),
+                    (uint32_t)M, (uint32_t)N, (uint32_t)K,
+                    (uint32_t)output.stride(0), dpcpp_queue);
+    return output;
+}
+
+// ---- GGUF Q3_K canonical GEMV ----
+
+#include "esimd_kernels/q3_k_GEMV.h"
+
+at::Tensor esimd_gemv_q3_k(
+    at::Tensor input, at::Tensor ql, at::Tensor qh,
+    at::Tensor weight_scale, at::Tensor output) {
+    int64_t N = ql.size(0);
+    int64_t K = ql.size(1) * 4;
+    TORCH_CHECK(K % 256 == 0,
+                "esimd_gemv_q3_k: K must be divisible by 256, got ", K);
+    TORCH_CHECK(qh.size(0) == N && qh.size(1) == K / 8,
+                "esimd_gemv_q3_k: invalid subtract-mask shape");
+    TORCH_CHECK(weight_scale.size(0) == N &&
+                    weight_scale.size(1) == K / 16,
+                "esimd_gemv_q3_k: invalid scale shape");
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_ql, ql); EXTRACT_PTR(p_qh, qh);
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    q3k_gemv_host(reinterpret_cast<const fp16*>(p_in), p_ql, p_qh,
+                  reinterpret_cast<const fp16*>(p_sc),
+                  reinterpret_cast<fp16*>(p_out),
+                  (uint32_t)N, (uint32_t)K, dpcpp_queue);
+    return output;
+}
+
+at::Tensor esimd_gemv_q3_k_m(
+    at::Tensor input, at::Tensor ql, at::Tensor qh,
+    at::Tensor weight_scale, at::Tensor output) {
+    int64_t M = input.size(0);
+    int64_t N = ql.size(0);
+    int64_t K = ql.size(1) * 4;
+    TORCH_CHECK(K % 256 == 0,
+                "esimd_gemv_q3_k_m: K must be divisible by 256, got ", K);
+    TORCH_CHECK(qh.size(0) == N && qh.size(1) == K / 8,
+                "esimd_gemv_q3_k_m: invalid subtract-mask shape");
+    TORCH_CHECK(weight_scale.size(0) == N &&
+                    weight_scale.size(1) == K / 16,
+                "esimd_gemv_q3_k_m: invalid scale shape");
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_ql, ql); EXTRACT_PTR(p_qh, qh);
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    q3k_gemv_M_host(reinterpret_cast<const fp16*>(p_in), p_ql, p_qh,
+                    reinterpret_cast<const fp16*>(p_sc),
+                    reinterpret_cast<fp16*>(p_out),
+                    (uint32_t)M, (uint32_t)N, (uint32_t)K,
+                    (uint32_t)output.stride(0), dpcpp_queue);
+    return output;
+}
+
+// ---- GGUF IQ3_S canonical GEMV ----
+
+#include "esimd_kernels/iq3_s_GEMV.h"
+
+static void check_iq3s_gemv_args(
+    const char* op, const at::Tensor& input, const at::Tensor& qs,
+    const at::Tensor& qh, const at::Tensor& signs,
+    const at::Tensor& weight_scale, const at::Tensor& output,
+    bool require_single_m) {
+    TORCH_CHECK(input.is_xpu() && qs.is_xpu() && qh.is_xpu() &&
+                    signs.is_xpu() && weight_scale.is_xpu() && output.is_xpu(),
+                op, ": all tensors must be XPU tensors");
+    TORCH_CHECK(input.device() == qs.device() && input.device() == qh.device() &&
+                    input.device() == signs.device() &&
+                    input.device() == weight_scale.device() &&
+                    input.device() == output.device(),
+                op, ": all tensors must be on the same XPU");
+    TORCH_CHECK(input.scalar_type() == at::kHalf &&
+                    weight_scale.scalar_type() == at::kHalf &&
+                    output.scalar_type() == at::kHalf,
+                op, ": input, scale, and output must be float16");
+    TORCH_CHECK(qs.scalar_type() == at::kByte && qh.scalar_type() == at::kByte &&
+                    signs.scalar_type() == at::kByte,
+                op, ": qs, qh, and signs must be uint8");
+    TORCH_CHECK(input.dim() == 2 && qs.dim() == 2 && qh.dim() == 2 &&
+                    signs.dim() == 2 && weight_scale.dim() == 2 &&
+                    output.dim() == 2,
+                op, ": all tensors must be rank 2");
+    TORCH_CHECK(input.is_contiguous() && qs.is_contiguous() &&
+                    qh.is_contiguous() && signs.is_contiguous() &&
+                    weight_scale.is_contiguous(),
+                op, ": input, qs, qh, signs, and scale must be contiguous");
+
+    const int64_t M = input.size(0);
+    const int64_t N = qs.size(0);
+    const int64_t K = qs.size(1) * 4;
+    TORCH_CHECK(M > 0 && N > 0 && K > 0 && K % 256 == 0,
+                op, ": K must be a positive multiple of 256, got ", K);
+    TORCH_CHECK(!require_single_m || M == 1,
+                op, ": decode op requires input.shape[0] == 1, got ", M);
+    TORCH_CHECK(input.size(1) == K,
+                op, ": input K does not match qs shape");
+    TORCH_CHECK(qh.size(0) == N && qh.size(1) == K / 32,
+                op, ": invalid qh shape");
+    TORCH_CHECK(signs.size(0) == N && signs.size(1) == K / 8,
+                op, ": invalid signs shape");
+    TORCH_CHECK(weight_scale.size(0) == N && weight_scale.size(1) == K / 32,
+                op, ": invalid scale shape");
+    TORCH_CHECK(output.size(0) == M && output.size(1) == N &&
+                    output.stride(1) == 1 && output.stride(0) >= N,
+                op, ": output must be [M,N] with contiguous rows");
+}
+
+at::Tensor esimd_gemv_iq3_s(
+    at::Tensor input, at::Tensor qs, at::Tensor qh, at::Tensor signs,
+    at::Tensor weight_scale, at::Tensor output) {
+    check_iq3s_gemv_args("esimd_gemv_iq3_s", input, qs, qh, signs,
+                         weight_scale, output, true);
+    const int64_t N = qs.size(0);
+    const int64_t K = qs.size(1) * 4;
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_qs, qs); EXTRACT_PTR(p_qh, qh);
+    EXTRACT_PTR(p_signs, signs); EXTRACT_PTR(p_sc, weight_scale);
+    EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    iq3s_gemv_host(reinterpret_cast<const fp16*>(p_in), p_qs, p_qh, p_signs,
+                   reinterpret_cast<const fp16*>(p_sc),
+                   reinterpret_cast<fp16*>(p_out),
+                   (uint32_t)N, (uint32_t)K, dpcpp_queue);
+    return output;
+}
+
+at::Tensor esimd_gemv_iq3_s_m(
+    at::Tensor input, at::Tensor qs, at::Tensor qh, at::Tensor signs,
+    at::Tensor weight_scale, at::Tensor output) {
+    check_iq3s_gemv_args("esimd_gemv_iq3_s_m", input, qs, qh, signs,
+                         weight_scale, output, false);
+    const int64_t M = input.size(0);
+    const int64_t N = qs.size(0);
+    const int64_t K = qs.size(1) * 4;
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_qs, qs); EXTRACT_PTR(p_qh, qh);
+    EXTRACT_PTR(p_signs, signs); EXTRACT_PTR(p_sc, weight_scale);
+    EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    iq3s_gemv_M_host(reinterpret_cast<const fp16*>(p_in), p_qs, p_qh, p_signs,
+                     reinterpret_cast<const fp16*>(p_sc),
+                     reinterpret_cast<fp16*>(p_out),
+                     (uint32_t)M, (uint32_t)N, (uint32_t)K,
+                     (uint32_t)output.stride(0), dpcpp_queue);
+    return output;
+}
+
 // ---- GGUF q5_K GEMV: PACKED (ql nibble + pre-shuffled 1-bit qh), asym ----
 
 #include "esimd_kernels/q5_k_GEMV.h"

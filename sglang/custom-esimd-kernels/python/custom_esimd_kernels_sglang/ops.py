@@ -220,6 +220,67 @@ def esimd_gemv_q4_k_m(
     return _ops.esimd_gemv_q4_k_m(input, weight, weight_scale, weight_min, output)
 
 
+def esimd_gemv_iq4(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Canonical IQ4_NL/IQ4_XS GEMV for decode (M=1).
+
+    ``weight`` is [N,K/2] packed LUT indices (low nibble is element 2j), and
+    ``weight_scale`` is the final FP16 scale [N,K/32]. The raw GGUF format has
+    already been normalized, so both IQ4 variants use this operation.
+    """
+    return _ops.esimd_gemv_iq4(input, weight, weight_scale, output)
+
+
+def esimd_gemv_iq4_m(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """M-tiled canonical IQ4_NL/IQ4_XS GEMV for M>=1."""
+    return _ops.esimd_gemv_iq4_m(input, weight, weight_scale, output)
+
+
+def esimd_gemv_q3_k(
+    input: torch.Tensor, ql: torch.Tensor, qh: torch.Tensor,
+    weight_scale: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """Canonical Q3_K GEMV for decode (M=1)."""
+    return _ops.esimd_gemv_q3_k(input, ql, qh, weight_scale, output)
+
+
+def esimd_gemv_q3_k_m(
+    input: torch.Tensor, ql: torch.Tensor, qh: torch.Tensor,
+    weight_scale: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """M-tiled canonical Q3_K GEMV for M>=1."""
+    return _ops.esimd_gemv_q3_k_m(input, ql, qh, weight_scale, output)
+
+
+def esimd_gemv_iq3_s(
+    input: torch.Tensor, qs: torch.Tensor, qh: torch.Tensor,
+    signs: torch.Tensor, weight_scale: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """Canonical IQ3_S GEMV for decode (M=1).
+
+    ``qs`` is the low eight bits of each 9-bit grid index [N,K/4]; ``qh``
+    stores the high bits LSB-first [N,K/32], and ``signs`` stores one
+    LSB-first sign bit per value [N,K/8]. ``weight_scale`` is the final FP16
+    per-32-element scale [N,K/32].
+    """
+    return _ops.esimd_gemv_iq3_s(input, qs, qh, signs, weight_scale, output)
+
+
+def esimd_gemv_iq3_s_m(
+    input: torch.Tensor, qs: torch.Tensor, qh: torch.Tensor,
+    signs: torch.Tensor, weight_scale: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """M-tiled canonical IQ3_S GEMV for M>=1."""
+    return _ops.esimd_gemv_iq3_s_m(
+        input, qs, qh, signs, weight_scale, output
+    )
+
+
 def esimd_gemv_q5_k(
     input: torch.Tensor, ql: torch.Tensor, qh: torch.Tensor,
     weight_scale: torch.Tensor, weight_min: torch.Tensor, output: torch.Tensor,

@@ -2816,8 +2816,12 @@ e.
         sycl_compile_rule = ['rule sycl_compile']
         # SYCL compiler does not recognize .sycl extension automatically,
         # so we pass '-x c++' explicitly notifying compiler of file format
+        # ESIMD implementations live in headers. Without a depfile, changing
+        # a kernel header silently reuses the old SYCL object in a new wheel.
         sycl_compile_rule.append(
-            '  command = $sycl $sycl_cflags -c -x c++ $in -o $out $sycl_post_cflags')
+            '  command = $sycl -MMD -MF $out.d $sycl_cflags -c -x c++ $in -o $out $sycl_post_cflags')
+        sycl_compile_rule.append('  depfile = $out.d')
+        sycl_compile_rule.append('  deps = gcc')
 
 
     # Emit one build rule per source to enable incremental build.
