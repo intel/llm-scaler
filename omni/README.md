@@ -146,10 +146,10 @@ The focused image contains:
   pinned to `40c4fcdf513a4523e39d54a9d391908af8df8171`;
 - `omni_xpu_kernel`, built for the selected Torch minor and XPU target;
 - official `comfy-kitchen==0.2.33` plus the co-installable XPU runtime provider
-  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/44bf8628a577eb70e23485937f28a1f2ecdd9811),
+  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/9a46ea72e3e9a639ec9cfc0af8d763614eb00b4d),
   including the managed GGUF and Nunchaku W4A16 routes;
 - official `comfy-aimdo==0.5.3` plus the co-installable XPU runtime provider
-  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/1ecaedd9ee2eb8f8738edf51a3217616d98edc32),
+  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/a79b5668d0a79a957796bd9c539577a70d384aa1),
   built with its Level Zero backend and native allocator hook;
 - [`ComfyUI-GGUF-XPU`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
   with GGUF, SentencePiece, and Protobuf dependencies installed from the same
