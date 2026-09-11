@@ -20,27 +20,33 @@ static constexpr int IQ4_GROUP = 32;
 static constexpr int IQ4_VL = 512;
 static constexpr int IQ4_ROWS = 4;
 
+// Bit b of LUT[index] is bit index of planes[b]. Keeping the 16-entry
+// truth tables in immediate integers avoids ESIMD indirect register gathers.
+// The top plane contributes -128, so this is the exact signed IQ4 LUT, not
+// an approximation. It changes neither the canonical ABI nor FP32 arithmetic.
+template <int VL>
+SYCL_ESIMD_FUNCTION inline simd<float, VL> iq4_lookup(
+    simd<uint16_t, VL> indices) {
+    constexpr uint16_t planes[8] = {0xf73d, 0x08d8, 0x3abc, 0x467e, 0xd4aa, 0x98cc, 0xe0f0, 0x00ff};
+    simd<int16_t, VL> values(0);
+    #pragma unroll
+    for (int bit = 0; bit < 8; bit++) {
+        const int coefficient = bit == 7 ? -128 : (1 << bit);
+        values += convert<int16_t>(
+            (simd<uint16_t, VL>(planes[bit]) >> indices) & 1) * coefficient;
+    }
+    return convert<float>(values);
+}
+
 template <int VL>
 SYCL_ESIMD_FUNCTION inline simd<float, VL> iq4_dequant_tile(
     simd<uint8_t, VL / 2> packed, simd<fp16, VL / IQ4_GROUP> scale_h) {
     static_assert(VL % IQ4_GROUP == 0);
-    simd<int16_t, 16> lut;
-    lut[0] = -127; lut[1] = -104; lut[2] = -83; lut[3] = -65;
-    lut[4] = -49;  lut[5] = -35;  lut[6] = -22; lut[7] = -10;
-    lut[8] = 1;    lut[9] = 13;    lut[10] = 25; lut[11] = 38;
-    lut[12] = 53;  lut[13] = 69;   lut[14] = 89; lut[15] = 113;
-
+    simd<uint16_t, VL / 2> lo = convert<uint16_t>(packed & 0x0F);
+    simd<uint16_t, VL / 2> hi = convert<uint16_t>((packed >> 4) & 0x0F);
     simd<float, VL> weight_f;
-    #pragma unroll
-    for (int c = 0; c < VL / 32; c++) {
-        auto bytes = packed.template select<16, 1>(c * 16);
-        simd<uint16_t, 16> lo = convert<uint16_t>(bytes & 0x0F);
-        simd<uint16_t, 16> hi = convert<uint16_t>((bytes >> 4) & 0x0F);
-        weight_f.template select<16, 2>(c * 32) =
-            convert<float>(lut.template iselect<16>(lo));
-        weight_f.template select<16, 2>(c * 32 + 1) =
-            convert<float>(lut.template iselect<16>(hi));
-    }
+    weight_f.template select<VL / 2, 2>(0) = iq4_lookup<VL / 2>(lo);
+    weight_f.template select<VL / 2, 2>(1) = iq4_lookup<VL / 2>(hi);
 
     simd<float, VL / IQ4_GROUP> scale_f = scale_h;
     #pragma unroll
