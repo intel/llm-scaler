@@ -124,6 +124,10 @@ Override `OMNI_COMFYUI_RESERVE_VRAM_GB` only when the workload requires a
 different reserve. The supplied entrypoint automatically loads
 `/llm/configs/comfyui_host_models.yaml`.
 
+The Linux provider defaults to `native_hook`; the entrypoint prepares its
+verified preload so Torch retains its native XPU caching allocator. Set
+`AIMDO_XPU_ALLOCATOR_MODE=global` to select the Linux pluggable allocator.
+
 Keep host models and mutable runtime data outside `/llm/ComfyUI`. Mounting over
 its `models`, `input`, or `output` directories hides files tracked by upstream
 ComfyUI, which makes the checkout appear modified and causes
@@ -142,11 +146,11 @@ The focused image contains:
   pinned to `40c4fcdf513a4523e39d54a9d391908af8df8171`;
 - `omni_xpu_kernel`, built for the selected Torch minor and XPU target;
 - official `comfy-kitchen==0.2.33` plus the co-installable XPU runtime provider
-  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/6828dce4cfe3675c5aa44d5634a4081277adde20),
+  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/44bf8628a577eb70e23485937f28a1f2ecdd9811),
   including the managed GGUF and Nunchaku W4A16 routes;
 - official `comfy-aimdo==0.5.3` plus the co-installable XPU runtime provider
-  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/c4f428adefd0352fcc1c94bce824890f1a3bbf66),
-  built with its Level Zero allocator backend;
+  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/1ecaedd9ee2eb8f8738edf51a3217616d98edc32),
+  built with its Level Zero backend and native allocator hook;
 - [`ComfyUI-GGUF-XPU`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
   with GGUF, SentencePiece, and Protobuf dependencies installed from the same
   pinned checkout's requirements;
