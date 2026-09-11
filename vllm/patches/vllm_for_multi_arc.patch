@@ -11415,10 +11415,10 @@ index 000000000..a5465c7d1
 +    )
 diff --git a/vllm/model_executor/layers/quantization/sym_int4.py b/vllm/model_executor/layers/quantization/sym_int4.py
 new file mode 100644
-index 000000000..94a6222b6
+index 000000000..9cf2279c1
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/sym_int4.py
-@@ -0,0 +1,722 @@
+@@ -0,0 +1,724 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Runtime symmetric INT4 weight-only quantization for Intel XPU.
@@ -11814,16 +11814,18 @@ index 000000000..94a6222b6
 +            allow_batch=allow_batch_esimd,
 +        )
 +        if output is not None:
-+            logger.info_once(
-+                "sym_int4 linear execution is using the guarded ESIMD path.",
-+                scope="local",
-+            )
++            if not torch.compiler.is_compiling():
++                logger.info_once(
++                    "sym_int4 linear execution is using the guarded ESIMD path.",
++                    scope="local",
++                )
 +            return output.reshape(x.shape[:-1] + (output.shape[-1],))
 +
-+        logger.info_once(
-+            "sym_int4 linear execution is using the XPU W4A16 kernel.",
-+            scope="local",
-+        )
++        if not torch.compiler.is_compiling():
++            logger.info_once(
++                "sym_int4 linear execution is using the XPU W4A16 kernel.",
++                scope="local",
++            )
 +        output = torch.ops._xpu_C.int4_gemm_w4a16(
 +            x_2d,
 +            layer.qweight,
