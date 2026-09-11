@@ -270,6 +270,50 @@ at::Tensor esimd_gemv_q4_k_m(
     return output;
 }
 
+// ---- GGUF IQ4_NL/IQ4_XS canonical GEMV: LUT index + final scale ----
+
+#include "esimd_kernels/iq4_GEMV.h"
+
+at::Tensor esimd_gemv_iq4(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output) {
+    int64_t N = weight.size(0);
+    int64_t K = weight.size(1) * 2;
+    TORCH_CHECK(K % IQ4_GROUP == 0,
+                "esimd_gemv_iq4: K must be divisible by 32, got ", K);
+    TORCH_CHECK(weight_scale.size(0) == N && weight_scale.size(1) == K / 32,
+                "esimd_gemv_iq4: invalid scale shape");
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_w, weight);
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    iq4_gemv_host(reinterpret_cast<const fp16*>(p_in), p_w,
+                  reinterpret_cast<const fp16*>(p_sc),
+                  reinterpret_cast<fp16*>(p_out),
+                  (uint32_t)N, (uint32_t)K, dpcpp_queue);
+    return output;
+}
+
+at::Tensor esimd_gemv_iq4_m(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output) {
+    int64_t M = input.size(0);
+    int64_t N = weight.size(0);
+    int64_t K = weight.size(1) * 2;
+    TORCH_CHECK(K % IQ4_GROUP == 0,
+                "esimd_gemv_iq4_m: K must be divisible by 32, got ", K);
+    TORCH_CHECK(weight_scale.size(0) == N && weight_scale.size(1) == K / 32,
+                "esimd_gemv_iq4_m: invalid scale shape");
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_w, weight);
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    iq4_gemv_M_host(reinterpret_cast<const fp16*>(p_in), p_w,
+                    reinterpret_cast<const fp16*>(p_sc),
+                    reinterpret_cast<fp16*>(p_out),
+                    (uint32_t)M, (uint32_t)N, (uint32_t)K,
+                    (uint32_t)output.stride(0), dpcpp_queue);
+    return output;
+}
+
 // ---- GGUF q5_K GEMV: PACKED (ql nibble + pre-shuffled 1-bit qh), asym ----
 
 #include "esimd_kernels/q5_k_GEMV.h"

@@ -220,6 +220,27 @@ def esimd_gemv_q4_k_m(
     return _ops.esimd_gemv_q4_k_m(input, weight, weight_scale, weight_min, output)
 
 
+def esimd_gemv_iq4(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Canonical IQ4_NL/IQ4_XS GEMV for decode (M=1).
+
+    ``weight`` is [N,K/2] packed LUT indices (low nibble is element 2j), and
+    ``weight_scale`` is the final FP16 scale [N,K/32]. The raw GGUF format has
+    already been normalized, so both IQ4 variants use this operation.
+    """
+    return _ops.esimd_gemv_iq4(input, weight, weight_scale, output)
+
+
+def esimd_gemv_iq4_m(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """M-tiled canonical IQ4_NL/IQ4_XS GEMV for M>=1."""
+    return _ops.esimd_gemv_iq4_m(input, weight, weight_scale, output)
+
+
 def esimd_gemv_q5_k(
     input: torch.Tensor, ql: torch.Tensor, qh: torch.Tensor,
     weight_scale: torch.Tensor, weight_min: torch.Tensor, output: torch.Tensor,

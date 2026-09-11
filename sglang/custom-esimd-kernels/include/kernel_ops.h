@@ -285,6 +285,16 @@ at::Tensor esimd_gemv_q4_k_m(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor weight_min, at::Tensor output);
 
+// Canonical GGUF IQ4_NL/IQ4_XS GEMV: packed LUT indices [N,K/2] and final
+// scale [N,K/32]. Both raw GGUF formats are normalized before this interface.
+at::Tensor esimd_gemv_iq4(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output);
+
+at::Tensor esimd_gemv_iq4_m(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output);
+
 // GGUF q5_K GEMV: PACKED (ql nibble [N,K/2] + pre-shuffled 1-bit qh [N,K/8]),
 // asymmetric scale+min [N,K/32]. dequant v5=nibble|(qh<<4); w=scale*v5-min.
 at::Tensor esimd_gemv_q5_k(

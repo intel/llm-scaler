@@ -73,6 +73,15 @@ TORCH_LIBRARY(custom_esimd_kernels_sglang, m) {
         "Tensor weight_min, Tensor output) -> Tensor");
   m.impl("esimd_gemv_q4_k_m", torch::kXPU, &esimd_gemv_q4_k_m);
 
+  // Canonical IQ4_NL/IQ4_XS: packed LUT indices + final per-group scale.
+  m.def("esimd_gemv_iq4(Tensor input, Tensor weight, Tensor weight_scale, "
+        "Tensor output) -> Tensor");
+  m.impl("esimd_gemv_iq4", torch::kXPU, &esimd_gemv_iq4);
+
+  m.def("esimd_gemv_iq4_m(Tensor input, Tensor weight, Tensor weight_scale, "
+        "Tensor output) -> Tensor");
+  m.impl("esimd_gemv_iq4_m", torch::kXPU, &esimd_gemv_iq4_m);
+
   // GGUF q5_K GEMV: PACKED (ql nibble + pre-shuffled 1-bit qh), asym scale+min.
   m.def("esimd_gemv_q5_k(Tensor input, Tensor ql, Tensor qh, "
         "Tensor weight_scale, Tensor weight_min, Tensor output) -> Tensor");
