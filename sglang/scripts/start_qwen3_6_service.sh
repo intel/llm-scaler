@@ -138,6 +138,7 @@ if [[ "$MODEL_PATH" == *.gguf ]]; then
         --reasoning-parser qwen3 \
         --enable-cache-report \
         --enable-metrics \
+        --skip-server-warmup \
         --host "$HOST" \
         --port "$PORT" \
         ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"}
