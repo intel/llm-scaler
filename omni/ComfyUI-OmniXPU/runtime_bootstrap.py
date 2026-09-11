@@ -410,18 +410,32 @@ def _select_aimdo_allocator_mode(provider: RuntimeProvider) -> str:
     return selected
 
 
-def prepare_native_preload() -> str:
-    """Resolve a verified Linux provider DSO before starting the Python runtime."""
-    if sys.platform != "linux" or _mode() == "off":
+def prepare_native_preload(*, allow_inactive: bool = False) -> str:
+    """Resolve the selected provider's preload before starting Python.
+
+    The entrypoint permits an empty path for global or inactive auto routing.
+    The strict native-only interface remains available to explicit callers.
+    """
+    mode = _mode()
+    explicit_native = os.environ.get("AIMDO_XPU_ALLOCATOR_MODE", "").strip() == "native_hook"
+    if mode == "off" and allow_inactive and not explicit_native:
+        return ""
+    if sys.platform != "linux" or mode == "off":
         raise RuntimeError("native preload requires enabled Linux provider bootstrap")
-    if os.environ.get("AIMDO_XPU_DISABLE_UR_HOOK") == "1":
-        raise RuntimeError("native preload requires the UR allocation hook")
     providers, errors = discover_providers()
     provider = providers.get("comfy_aimdo.xpu")
     if provider is None:
+        if allow_inactive and mode == "auto" and not explicit_native:
+            for error in errors:
+                _LOG.warning("[OmniXPU] runtime provider rejected: %s", error)
+            return ""
         raise RuntimeError("native preload requires a compatible AIMDO provider: " + "; ".join(errors))
     if _select_aimdo_allocator_mode(provider) != "native_hook":
-        raise RuntimeError("native preload requires explicit native_hook selection")
+        if allow_inactive:
+            return ""
+        raise RuntimeError("native preload requires native_hook selection")
+    if os.environ.get("AIMDO_XPU_DISABLE_UR_HOOK") == "1":
+        raise RuntimeError("native preload requires the UR allocation hook")
     library = provider.canonical_root / "aimdo_xpu.so"
     key = str(Path(provider.manifest["vendor_root"]) / "comfy_aimdo" / "aimdo_xpu.so")
     digest = provider.manifest["vendored_files"].get(key)
@@ -568,7 +582,9 @@ def bootstrap(
                 "[OmniXPU] AIMDO provider activation requires DynamicVRAM"
             )
     elif aimdo is not None:
+        selected_native = explicit_native
         try:
+            selected_native = _select_aimdo_allocator_mode(aimdo) == "native_hook"
             _activate_aimdo(
                 aimdo,
                 simple_vram_headroom=headroom,
@@ -584,7 +600,7 @@ def bootstrap(
             raise
         except Exception as exc:
             _set_provider_state(aimdo.provider_id, "skipped", str(exc))
-            if mode == "required" or explicit_native:
+            if mode == "required" or selected_native:
                 raise SystemExit(f"[OmniXPU] AIMDO provider activation failed: {exc}")
             _LOG.warning("[OmniXPU] AIMDO provider skipped: %s", exc)
 
@@ -604,9 +620,9 @@ __all__ = [
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] != ["--native-preload-path"]:
-        raise SystemExit("usage: runtime_bootstrap.py --native-preload-path")
+    if sys.argv[1:] not in (["--native-preload-path"], ["--allocator-preload-path"]):
+        raise SystemExit("usage: runtime_bootstrap.py --native-preload-path|--allocator-preload-path")
     try:
-        print(prepare_native_preload())
+        print(prepare_native_preload(allow_inactive=sys.argv[1] == "--allocator-preload-path"))
     except Exception as exc:
         raise SystemExit(f"[OmniXPU] native preload preparation failed: {exc}") from exc

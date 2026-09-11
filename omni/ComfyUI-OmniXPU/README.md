@@ -84,13 +84,18 @@ After an official package upgrade, an incompatible provider is skipped in
 `auto` mode instead of being forced into a new API contract. Upgrade the
 corresponding provider wheel to restore XPU routing.
 
-On Linux, a provider that advertises both allocator modes defaults to `global`.
-Set `AIMDO_XPU_ALLOCATOR_MODE=native_hook` before the standard image entrypoint
-to keep Torch's native XPU allocator. The entrypoint validates the provider and
-preloads its exact native library before starting Python. Explicit native mode
-requires DynamicVRAM and fails startup if provider activation is unavailable;
-it cannot silently fall back to another memory policy. Allocator modes do not
-change the model graph or enable XPU memory compilation.
+The image's Linux provider defaults to `native_hook`, keeping Torch's native
+XPU allocator while AIMDO manages DynamicVRAM weights. The standard
+`start_comfyui.sh` entrypoint validates the provider, resolves its default and
+preloads its exact native library before starting Python. Set
+`AIMDO_XPU_ALLOCATOR_MODE=global` to select the Linux pluggable allocator.
+Older providers retain their own advertised default.
+
+Native mode requires DynamicVRAM and fails startup if activation fails after
+selection; it cannot silently fall back to another memory policy. Direct Python
+launchers enabling DynamicVRAM must also prepare the native preload before
+startup. Allocator modes do not change the model graph or enable XPU memory
+compilation.
 
 AIMDO 0.5.3 memory compilation (recording and replaying allocation graphs) is
 not yet supported on XPU. Its basic APIs and DynamicVRAM model-weight

@@ -56,6 +56,13 @@ OOM failures, but the additional weight-management work can reduce performance
 when the workflow already fits in XPU memory. The reserve can be changed with
 `OMNI_COMFYUI_RESERVE_VRAM_GB` when required by a specific workload.
 
+The Linux provider defaults to `native_hook`. This entrypoint automatically
+preloads its verified library before Python starts, so Torch keeps its native
+XPU caching allocator while AIMDO manages DynamicVRAM weights. Set
+`AIMDO_XPU_ALLOCATOR_MODE=global` before the entrypoint to use the Linux
+pluggable allocator instead. A direct Python launch with DynamicVRAM enabled
+must prepare the native preload itself.
+
 Additional ComfyUI arguments are forwarded by the entrypoint. For example:
 
 ```bash

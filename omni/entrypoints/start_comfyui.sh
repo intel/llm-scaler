@@ -28,19 +28,22 @@ for argument in "$@"; do
     esac
 done
 
-if [[ "${AIMDO_XPU_ALLOCATOR_MODE:-}" == "native_hook" ]]; then
-    if [[ "$explicit_dynamic_vram_argument" == "--disable-dynamic-vram" ]]; then
+if [[ "$explicit_dynamic_vram_argument" == "--disable-dynamic-vram" ]]; then
+    if [[ "${AIMDO_XPU_ALLOCATOR_MODE:-}" == "native_hook" ]]; then
         echo "native_hook requires DynamicVRAM" >&2
         exit 2
     fi
+else
     native_preload_path=$(python \
         /llm/ComfyUI/custom_nodes/ComfyUI-OmniXPU/runtime_bootstrap.py \
-        --native-preload-path)
-    if [[ -z "$native_preload_path" ]]; then
+        --allocator-preload-path)
+    if [[ -n "$native_preload_path" ]]; then
+        export AIMDO_XPU_ALLOCATOR_MODE=native_hook
+        export LD_PRELOAD="${native_preload_path}${LD_PRELOAD:+:$LD_PRELOAD}"
+    elif [[ "${AIMDO_XPU_ALLOCATOR_MODE:-}" == "native_hook" ]]; then
         echo "native_hook provider returned an empty preload path" >&2
         exit 2
     fi
-    export LD_PRELOAD="${native_preload_path}${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
 
 exec python /llm/ComfyUI/main.py \

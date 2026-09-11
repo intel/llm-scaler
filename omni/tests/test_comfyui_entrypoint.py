@@ -18,17 +18,28 @@ def _run_entrypoint(
     reserve: str | None = None,
     extra_arguments: tuple[str, ...] = ("--disable-all-custom-nodes",),
     allocator_mode: str | None = None,
+    preload_path: str = "",
+    preload_exit: int = 0,
 ):
     capture = tmp_path / "args.txt"
     fake_python = tmp_path / "python"
     fake_python.write_text(
         "#!/usr/bin/env bash\n"
+        "if [[ \"$2\" == \"--allocator-preload-path\" ]]; then\n"
+        "  printf '%s\\n' \"$@\" > \"$OMNI_TEST_CAPTURE.resolver\"\n"
+        "  printf '%s\\n' \"$OMNI_TEST_PRELOAD\"\n"
+        "  exit \"$OMNI_TEST_PRELOAD_EXIT\"\n"
+        "fi\n"
         "printf '%s\\n' \"$@\" > \"$OMNI_TEST_CAPTURE\"\n"
+        "printf '%s\\n' \"${AIMDO_XPU_ALLOCATOR_MODE:-}\" \"${LD_PRELOAD:-}\" > \"$OMNI_TEST_CAPTURE.env\"\n"
     )
     fake_python.chmod(0o755)
     environment = os.environ.copy()
     environment["PATH"] = f"{tmp_path}:{environment['PATH']}"
     environment["OMNI_TEST_CAPTURE"] = str(capture)
+    environment["OMNI_TEST_PRELOAD"] = preload_path
+    environment["OMNI_TEST_PRELOAD_EXIT"] = str(preload_exit)
+    environment.pop("LD_PRELOAD", None)
     environment.pop("AIMDO_XPU_ALLOCATOR_MODE", None)
     if allocator_mode is not None:
         environment["AIMDO_XPU_ALLOCATOR_MODE"] = allocator_mode
@@ -143,5 +154,40 @@ def test_native_entrypoint_rejects_disabled_dynamic_vram(tmp_path):
 def test_native_entrypoint_rejects_empty_provider_preload(tmp_path):
     completed, arguments = _run_entrypoint(tmp_path, allocator_mode="native_hook")
     assert completed.returncode == 2
-    assert arguments[-1] == "--native-preload-path"
+    assert arguments == []
+    assert (tmp_path / "args.txt.resolver").read_text().splitlines()[-1] == "--allocator-preload-path"
     assert "empty preload path" in completed.stderr
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_entrypoint_preloads_selected_native_before_main(tmp_path, explicit):
+    library = "/lib/x86_64-linux-gnu/libm.so.6"
+    completed, arguments = _run_entrypoint(
+        tmp_path, extra_arguments=(), preload_path=library,
+        allocator_mode="native_hook" if explicit else None,
+    )
+    assert completed.returncode == 0
+    assert arguments[0] == "/llm/ComfyUI/main.py"
+    assert (tmp_path / "args.txt.env").read_text().splitlines() == ["native_hook", library]
+    assert (tmp_path / "args.txt.resolver").exists()
+
+
+def test_entrypoint_does_not_launch_after_preload_failure(tmp_path):
+    completed, arguments = _run_entrypoint(tmp_path, preload_exit=7)
+    assert completed.returncode == 7
+    assert arguments == []
+
+
+def test_disabled_dynamic_vram_does_not_resolve_provider_default(tmp_path):
+    completed, arguments = _run_entrypoint(
+        tmp_path, extra_arguments=("--disable-dynamic-vram",), preload_exit=7,
+    )
+    assert completed.returncode == 0
+    assert "--disable-dynamic-vram" in arguments
+    assert not (tmp_path / "args.txt.resolver").exists()
+
+
+def test_global_override_does_not_add_preload(tmp_path):
+    completed, _ = _run_entrypoint(tmp_path, allocator_mode="global")
+    assert completed.returncode == 0
+    assert (tmp_path / "args.txt.env").read_text().splitlines() == ["global", ""]
