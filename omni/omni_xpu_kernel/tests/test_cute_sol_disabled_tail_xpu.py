@@ -32,7 +32,9 @@ def inputs(n, unusual=False):
         vscale[..., 5] = -1.0
         vscale[..., 6] = float('inf')
         vscale[..., 7] = float('nan')
-    return scores, threshold, vsum, vscale, lengths, n * 64 - 17, 0, min(n, 1), 0, min(n, 1), min(n - 1, 28)
+    sink_end = min(n, 1)
+    topk = min(max(0, n - sink_end - 1), 28)
+    return scores, threshold, vsum, vscale, lengths, n * 64 - 17, 0, sink_end, 0, sink_end, topk
 
 
 @pytest.mark.parametrize('n', [1, 3, 65, 294, 674])
