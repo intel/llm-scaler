@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "sol_attn_config.h"
+#include "../csrc/device_utils.h"
 
 namespace omni_xpu_sol_attn {
 namespace {
