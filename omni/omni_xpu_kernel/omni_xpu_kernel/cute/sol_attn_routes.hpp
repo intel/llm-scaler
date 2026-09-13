@@ -23,6 +23,8 @@ void sol_sort_descending(LocalScores scores, int64_t padded, sycl::nd_item<1> it
 
 struct SolPreparedRouteKernel;
 struct SolPreparedTailKernel;
+struct SolDisabledTailHeadKernel;
+struct SolDisabledTailFillKernel;
 
 std::vector<at::Tensor> token_group_centroids(const at::Tensor& qmean, const at::Tensor& refs) {
   TORCH_CHECK(qmean.device().is_xpu() && qmean.scalar_type() == at::kFloat &&
@@ -178,6 +180,46 @@ std::vector<at::Tensor> pooled_routes(
           qsink || (j >= sink_start && j < sink_end) || sycl::abs(q-j) <= 1 || sp[row*N+j] >= thr);
     });
   });
+  if (!tail && !token_groups) {
+    const auto selection = omni_xpu::device::get_bmg_selection_unwarned(queue);
+    if (selection.physical_sku == omni_xpu::device::BmgSku::b70 && !selection.forced) {
+      auto head_values = at::empty({BH,128}, scores.options());
+      auto* hp = head_values.data_ptr<float>();
+      queue.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<bf16,1> zero_probs(sycl::range<1>(N),cgh);
+        cgh.parallel_for<SolDisabledTailHeadKernel>(
+            sycl::nd_range<1>(sycl::range<1>(BH*kWorkGroup),sycl::range<1>(kWorkGroup)),
+            [=](sycl::nd_item<1> item) {
+          const int64_t bh = item.get_group_linear_id(), d = item.get_local_linear_id();
+          for (int64_t j = d; j < N; j += kWorkGroup) zero_probs[j] = bf16(0.0f);
+          sycl::group_barrier(item.get_group());
+          // Keep the legacy zero-weight accumulation and division, including
+          // nonfinite V sums and signed-zero scales, but evaluate it once per
+          // head instead of once for every query in that head.
+          float numerator = 0;
+          for (int64_t j = 0; j < N; ++j)
+            numerator += float(zero_probs[j])*float(vp[(bh*N+j)*128+d]);
+          hp[bh*128+d] = numerator/vsp[bh*128+d];
+        });
+      });
+      const int64_t values = BH*N*128, common_values = BH*((N+1)/2)*N;
+      queue.parallel_for<SolDisabledTailFillKernel>(
+          sycl::range<1>(std::max(values,common_values)),[=](sycl::id<1> index) {
+        const int64_t i = index[0];
+        if (i < values) {
+          const int64_t row = i/128, d = i%128;
+          op[row*130+2+d] = hp[(row/N)*128+d];
+          if (d == 0) {
+            op[row*130] = -INFINITY;
+            op[row*130+1] = 0.0f;
+            refp[row] = -INFINITY;
+          }
+        }
+        if (i < common_values) cp[i] = 0;
+      });
+      return {routes,state,refs,common};
+    }
+  }
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<bf16,1> probs(sycl::range<1>(N),cgh);
     cgh.parallel_for<SolPreparedTailKernel>(
