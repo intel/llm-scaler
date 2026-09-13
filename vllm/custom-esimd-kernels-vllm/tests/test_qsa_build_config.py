@@ -123,6 +123,23 @@ def test_qsa_row_store_source_has_fixed_allocation_free_contract():
     root = Path(__file__).resolve().parents[1]
     source = (root / "csrc/qsa/qsa_store_cache_rows.sycl").read_text()
 
+    # The optional M1 transaction ABI accepts a Python sequence as a C++
+    # vector.  Keep that ABI declaration out of the legacy row-store contract,
+    # while still rejecting vector construction in the transaction body and
+    # anywhere in the original row-store implementation.
+    transaction_signature = "bool try_store_m1_transaction_v1("
+    transaction_end_signature = (
+        "std::tuple<at::Tensor, at::Tensor> store_cache_rows_v4("
+    )
+    transaction_start = source.index(transaction_signature)
+    transaction_end = source.index(transaction_end_signature, transaction_start)
+    transaction_source = source[transaction_start:transaction_end]
+    transaction_body = transaction_source[transaction_source.index("{") + 1 :]
+    legacy_source = source[:transaction_start] + source[transaction_end:]
+
+    assert transaction_source.count("std::vector") == 1
+    assert "std::array<M1StoreDescriptor, 3> descriptors{}" in transaction_body
+
     assert "sycl::range<1>(1)" in source
     assert "store_cache_rows_v4" in source
     assert "receipt_ptr" in source
@@ -145,7 +162,8 @@ def test_qsa_row_store_source_has_fixed_allocation_free_contract():
         "synchronize(",
         "nonzero",
     ):
-        assert forbidden not in source
+        assert forbidden not in legacy_source
+        assert forbidden not in transaction_body
 
 
 def test_qsa_selection_workgroup_is_512():

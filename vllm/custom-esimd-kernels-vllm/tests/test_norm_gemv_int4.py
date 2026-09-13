@@ -1,6 +1,8 @@
 """Unit tests for esimd_norm_gemv_int4_pert — fused RMSNormGated + INT4 GEMV."""
 import ctypes
 import os
+import sysconfig
+from pathlib import Path
 
 import pytest
 import torch
@@ -13,7 +15,7 @@ from custom_esimd_kernels_vllm import (
 DEVICE = "xpu"
 CLIB_PATH = os.environ.get(
     "VLLM_QUANTIZE_Q40_LIB",
-    "/usr/local/lib/python3.12/dist-packages/vllm_int4_for_multi_arc.so",
+    str(Path(sysconfig.get_path("platlib")) / "vllm_int4_for_multi_arc.so"),
 )
 
 
@@ -35,6 +37,31 @@ def cpu_quantize(weight_fp16, block_size=128):
     sc = ctypes.cast(scale.data_ptr(), ctypes.POINTER(ctypes.c_uint16))
     clib.quantize_q4_0_to_qweight_and_scale(src, qw, sc, N, K, block_size)
     return qweight, scale
+
+
+def pack_int4_reference(qvalues):
+    """Pack unsigned INT4 values in the exact low-to-high nibble order."""
+    assert qvalues.dim() == 2 and qvalues.shape[1] % 8 == 0
+    qvalues_i64 = qvalues.to(torch.int64)
+    assert torch.all((0 <= qvalues_i64) & (qvalues_i64 <= 15)).item()
+    shifts = torch.arange(8, dtype=torch.int64) * 4
+    words = torch.sum(qvalues_i64.reshape(qvalues.shape[0], -1, 8) << shifts,
+                      dim=-1)
+    words = torch.where(words >= 2**31, words - 2**32, words)
+    return words.to(torch.int32)
+
+
+def dequantize_int4_reference_fp32(qweight, scale, block_size=128):
+    """Independent FP32 reference for (nibble - 8) * per-block scale."""
+    assert qweight.dim() == 2 and scale.dim() == 2
+    assert block_size % 8 == 0
+    words = qweight.cpu().to(torch.int64) & 0xFFFFFFFF
+    shifts = torch.arange(8, dtype=torch.int64) * 4
+    qvalues = ((words.unsqueeze(-1) >> shifts) & 0xF).reshape(
+        qweight.shape[0], -1)
+    scales = scale.cpu().float().repeat_interleave(block_size, dim=1)
+    assert qvalues.shape == scales.shape
+    return (qvalues.float() - 8.0) * scales
 
 
 def ref_norm_gemv_fp16(
@@ -75,6 +102,53 @@ def ref_norm_gemv_fp16(
     result = normed_flat @ weight_fp16.cpu().float().T
 
     return result, normed_flat
+
+
+@pytest.mark.parametrize("HV", [3, 5, 6, 7, 9])
+@pytest.mark.parametrize("gate", ["silu", "sigmoid"])
+def test_norm_gemv_non_divisible_hv_covers_tail_heads(HV, gate):
+    """Small-N split selection must not drop a non-divisible tail head."""
+    V, N = 128, 12
+    K = HV * V
+    eps = 1e-6
+
+    # Only the final head contributes. The old threshold-only dispatcher chose
+    # K_SPLIT=2/4/8 and silently omitted this head for every HV in the matrix.
+    x_cpu = torch.zeros(HV, V, dtype=torch.float16)
+    z_cpu = torch.zeros(HV, V, dtype=torch.float16)
+    x_cpu[-1].fill_(1.0)
+    z_cpu[-1].fill_(2.0)
+    norm_weight_cpu = torch.ones(V, dtype=torch.float16)
+
+    qvalues = torch.full((N, K), 8, dtype=torch.int32)
+    qvalues[:, -V:] = 9
+    qweight_cpu = pack_int4_reference(qvalues)
+    scale_cpu = torch.full((N, K // 128), 0.125, dtype=torch.float16)
+    dequant_weight = dequantize_int4_reference_fp32(
+        qweight_cpu, scale_cpu)
+
+    x_fp32 = x_cpu.float()
+    z_fp32 = z_cpu.float()
+    inv_rms = torch.rsqrt(x_fp32.square().mean(dim=-1, keepdim=True) + eps)
+    normalized = x_fp32 * inv_rms * norm_weight_cpu.float()
+    gate_fp32 = (torch.sigmoid(z_fp32) if gate == "sigmoid"
+                 else torch.nn.functional.silu(z_fp32))
+    reference = (normalized * gate_fp32).reshape(1, K) @ dequant_weight.T
+
+    x = x_cpu.to(DEVICE)
+    z = z_cpu.to(DEVICE)
+    norm_weight = norm_weight_cpu.to(DEVICE)
+    qweight = qweight_cpu.to(DEVICE)
+    scale = scale_cpu.to(DEVICE)
+    output = torch.empty(1, N, dtype=torch.float16, device=DEVICE)
+    op = (esimd_norm_gemv_int4_sigmoid
+          if gate == "sigmoid" else esimd_norm_gemv_int4_pert)
+    op(x, z, norm_weight, qweight, scale, output, HV, V, eps)
+    torch.xpu.synchronize()
+
+    assert reference.abs().min().item() > 1.0
+    torch.testing.assert_close(
+        output.cpu().float(), reference, rtol=0.01, atol=0.5)
 
 
 @pytest.mark.parametrize("HV,V,N", [

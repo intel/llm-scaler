@@ -132,7 +132,8 @@ ESIMD_INLINE void prefetch_slot(const fp16* packed_kv,
       (physical_page >= 0 && physical_page < physical_pages) ? 1 : 0;
   const int safe_physical_page = physical_valid ? physical_page : 0;
   const fp16* kv_row =
-      packed_kv + safe_physical_page * (PageSize * KV_ROW_STRIDE) +
+      packed_kv + static_cast<int64_t>(safe_physical_page) *
+          (PageSize * KV_ROW_STRIDE) +
       in_page * KV_ROW_STRIDE;
   const uint32_t* k_ptr = reinterpret_cast<const uint32_t*>(kv_row);
   const uint32_t* v_ptr = reinterpret_cast<const uint32_t*>(kv_row + HD);
@@ -236,7 +237,8 @@ void sparse_attention_token_split_candidate__phase0_impl(
               const int safe_physical_page = physical_valid ? physical_page : 0;
               const int valid = valid_slot * page_valid * physical_valid;
               const fp16* kv_row =
-                  packed_kv + safe_physical_page * (PageSize * KV_ROW_STRIDE) +
+                  packed_kv + static_cast<int64_t>(safe_physical_page) *
+                      (PageSize * KV_ROW_STRIDE) +
                   in_page * KV_ROW_STRIDE;
 
               fp32 score = 0.0f;
@@ -276,6 +278,10 @@ void sparse_attention_token_split_candidate__phase0_impl(
                 simd<fp16, 16> v_half =
                     block_load<fp16, 16>(kv_row + HD + db * 16);
                 simd<fp32, 16> v_vec = v_half;
+                // A safe address can contain unselected NaN/Inf. Zero weight
+                // alone cannot mask it; preserve non-finites on valid slots.
+                v_vec = merge(simd<fp32, 16>(0.0f), v_vec,
+                              simd_mask<16>(valid == 0));
                 accum[db] = accum[db] * old_correction + v_vec * weight;
               }
               running_sum = running_sum * old_correction + weight;
@@ -493,7 +499,8 @@ void sparse_attention_token_split_candidate__fused_impl(
               const int safe_physical_page = physical_valid ? physical_page : 0;
               const int valid = valid_slot * page_valid * physical_valid;
               const fp16* kv_row =
-                  packed_kv + safe_physical_page * KV_PAGE_STRIDE +
+                  packed_kv + static_cast<int64_t>(safe_physical_page) *
+                      KV_PAGE_STRIDE +
                   in_page * KV_ROW_STRIDE;
 
               fp32 score = 0.0f;
@@ -531,6 +538,9 @@ void sparse_attention_token_split_candidate__fused_impl(
                 simd<fp16, 16> v_half =
                     block_load<fp16, 16>(kv_row + HD + db * 16);
                 simd<fp32, 16> v_vec = v_half;
+                // Match phase 0: holes must not consume safe-row NaN/Inf.
+                v_vec = merge(simd<fp32, 16>(0.0f), v_vec,
+                              simd_mask<16>(valid == 0));
                 accum[db] = accum[db] * old_correction + v_vec * weight;
               }
               running_sum = running_sum * old_correction + weight;

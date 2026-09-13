@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import os
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,10 @@ pytestmark = pytest.mark.skipif(
 
 
 def _load_qsa_extension():
+    if os.environ.get("QSA_TEST_DSO"):
+        from test_qsa_sparse_attention_xpu import _load_qsa_extension as load_explicit
+
+        return load_explicit()
     try:
         return importlib.import_module("custom_esimd_kernels_vllm.qsa_ops")
     except ImportError:

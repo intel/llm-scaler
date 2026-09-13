@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _load_qsa_extension():
-    configured = os.environ.get("QSA_DSO")
+    configured = os.environ.get("QSA_TEST_DSO") or os.environ.get("QSA_DSO")
     if configured:
         spec = importlib.util.spec_from_file_location("qsa_ops", configured)
         if spec is None or spec.loader is None:

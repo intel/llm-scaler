@@ -149,6 +149,14 @@ struct MoE_TopK_V2_Kernel {
             total += h_sum<float, C>(probs[c]);
         }
 
+        // Inspect exponent bits instead of using an FP isfinite comparison:
+        // this must remain effective under the extension's fast-math flags.
+        simd<float, 1> total_vec(total);
+        simd<uint32_t, 1> total_bits =
+            total_vec.template bit_cast_view<uint32_t>().read();
+        const bool total_nonfinite =
+            (total_bits[0] & 0x7f800000u) == 0x7f800000u;
+
         // ── Softmax: normalize ──
         float inv = 1.0f / total;
         #pragma unroll
@@ -184,6 +192,14 @@ struct MoE_TopK_V2_Kernel {
         float inv_top = 1.0f / top_sum;
         #pragma unroll
         for (int k = 0; k < TOPK; k++) tv[k] *= inv_top;
+
+        // Non-finite softmax arithmetic deliberately remains visible in the
+        // weights. Only harden the ids so downstream MoE kernels cannot see
+        // duplicate or out-of-range routes; finite rows keep the original path.
+        if (total_nonfinite) {
+            #pragma unroll
+            for (int k = 0; k < TOPK; k++) ti[k] = k;
+        }
 
         // ── Store ──
         fp16* vp = top_values + (size_t)row * TOPK;

@@ -188,9 +188,11 @@ inline void norm_gemv_int4_host_impl(
     // Large N (>512) has enough WGs — use K_SPLIT=1 to avoid SLM overhead.
     int ks = 1;
     if (N <= 512) {
-        if      (HV >= 8) ks = 8;
-        else if (HV >= 4) ks = 4;
-        else if (HV >= 2) ks = 2;
+        // The kernel assigns exactly HV / K_SPLIT heads to each work-item,
+        // so only use splits that cover HV without a remainder.
+        if      (HV >= 8 && HV % 8 == 0) ks = 8;
+        else if (HV >= 4 && HV % 4 == 0) ks = 4;
+        else if (HV >= 2 && HV % 2 == 0) ks = 2;
     }
 
     int global = N * ks;

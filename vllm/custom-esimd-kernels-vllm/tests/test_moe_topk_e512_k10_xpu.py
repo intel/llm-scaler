@@ -130,6 +130,69 @@ def test_e512_k10_edge_logits(case: str, rows: int) -> None:
     _assert_matches_reference(_edge_logits(case, rows))
 
 
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -float("inf")])
+def test_e512_k10_nonfinite_rows_have_unique_safe_ids(bad_value: float) -> None:
+    logits = torch.full(
+        (1, NUM_EXPERTS), bad_value, dtype=torch.float16, device="xpu"
+    )
+    native_weight, native_idx = torch.ops.moe_int4_ops.moe_topk_int4(
+        logits, TOP_K, NUM_EXPERTS, True
+    )
+    native_weight = native_weight.cpu()
+    native_idx = native_idx.cpu()
+
+    torch.testing.assert_close(
+        native_idx,
+        torch.arange(TOP_K, dtype=torch.int32).reshape(1, TOP_K),
+        rtol=0,
+        atol=0,
+    )
+    assert torch.isnan(native_weight).all().item()
+
+    # A non-finite row must not poison the following finite invocation.
+    _assert_matches_reference(_unique_logits(1))
+
+
+@pytest.mark.parametrize("rows", TOKEN_COUNTS)
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -float("inf")])
+def test_e512_k10_nonfinite_and_finite_rows_are_isolated(
+    bad_value: float, rows: int
+) -> None:
+    logits = _unique_logits(rows)
+    # M=4/64 exercise bad and finite rows in one launch. A one-row launch
+    # necessarily has only the bad row; the preceding test also checks that a
+    # following finite M=1 invocation remains correct.
+    bad_rows = torch.arange(rows) % 2 == 0
+    logits[bad_rows] = bad_value
+
+    native_weight, native_idx = torch.ops.moe_int4_ops.moe_topk_int4(
+        logits.to("xpu"), TOP_K, NUM_EXPERTS, True
+    )
+    native_weight = native_weight.cpu()
+    native_idx = native_idx.cpu()
+
+    expected_safe_ids = torch.arange(TOP_K, dtype=torch.int32).expand(
+        int(bad_rows.sum()), TOP_K
+    )
+    torch.testing.assert_close(
+        native_idx[bad_rows], expected_safe_ids, rtol=0, atol=0
+    )
+    assert torch.isnan(native_weight[bad_rows]).all().item()
+
+    finite_rows = ~bad_rows
+    if finite_rows.any():
+        reference_weight, reference_idx = _reference(logits[finite_rows])
+        torch.testing.assert_close(
+            native_idx[finite_rows], reference_idx, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            native_weight[finite_rows],
+            reference_weight,
+            rtol=2e-3,
+            atol=2e-4,
+        )
+
+
 def test_topk_v2_tail_stores_declare_natural_alignment() -> None:
     source = (
         Path(__file__).parents[1] / "csrc/xpu/esimd_kernels/moe_ops.h"

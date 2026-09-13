@@ -609,14 +609,22 @@ def test_production_main_dso_is_the_single_ple_owner() -> None:
     assert source.count("csrc/xpu/torch_extension_ple.cc") == 1
     assert "TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m)" in registration
     assert "TORCH_LIBRARY(custom_esimd_kernels_vllm, m)" not in registration
-    assert set(re.findall(r'm\.def\("([^("]+)\(', registration)) == {
+    assert set(re.findall(r'm\.def\s*\(\s*"([^("]+)\(', registration)) == {
+        "hc_outputs_alias_inputs_v1",
         "ple_ngram_ids",
         "ple_embedding_gather",
         "ple_grouped_norm",
         "hc_grouped_norm_v1",
         "hc_gate_mix_v1",
+        "hc_gate_mix_m4_v1",
+        "hc_gate_mix_multi_m_v1",
         "hc_combine_v1",
         "hc_combine_norm_v1",
+        "hc_combine_mix_m1_v1",
+        "hc_combine_mix_m1_v2",
+        "hc_combine_norm_m4_v1",
+        "hc_combine_norm_multi_m_v1",
+        "hc_combine_norm_multi_m_strided_v1",
         "ple_score_gate",
         "ple_gated_value",
         "ple_gated_value_grouped_norm",
