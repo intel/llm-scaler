@@ -384,7 +384,7 @@ at::Tensor forward_cute_prepared_impl(
   using PreparedPolicy = std::conditional_t<SelectedOnly,
       SolTilePolicy<128, 16, 256>, std::conditional_t<TokenAugmented,
       SolTilePolicy<128, 32, 256>, SolConfiguredTilePolicy>>;
-  auto launch_prepared = [&](auto storage_value) -> at::Tensor {
+  auto launch_prepared = [&](auto storage_value, auto tile_policy) -> at::Tensor {
     using StorageV = decltype(storage_value);
     at::Tensor kernel_v = v;
     if constexpr (std::is_same_v<StorageV, cutlass::half_t>) {
@@ -393,7 +393,7 @@ at::Tensor forward_cute_prepared_impl(
       // for every routed query subgroup. Include this allocation/copy in timing.
       kernel_v = v.to(at::kHalf);
     }
-    using KT = SolKernel<OutputElement, PreparedPolicy,
+    using KT = SolKernel<OutputElement, decltype(tile_policy),
         true, true, false, false, int8_t, true, TokenAugmented, SelectedOnly, RowTail, StorageV>;
     using K = typename KT::Kernel;
     constexpr auto output_dtype = std::is_same_v<OutputElement,cutlass::half_t> ? at::kHalf : at::kBFloat16;
@@ -465,10 +465,12 @@ at::Tensor forward_cute_prepared_impl(
     const auto& queue = c10::xpu::getCurrentXPUStream(q.device().index()).queue();
     const auto selection = omni_xpu::device::get_bmg_selection_unwarned(queue);
     if (selection.physical_sku == omni_xpu::device::BmgSku::b70 && !selection.forced) {
-      return launch_prepared(cutlass::half_t{});
+      // Keep eight query rows per subgroup; independent Q64 workgroups
+      // avoid coupling four prepared route masks and their prefetch progress.
+      return launch_prepared(cutlass::half_t{}, SolTilePolicy<64, 8, 256>{});
     }
   }
-  return launch_prepared(int8_t{});
+  return launch_prepared(int8_t{}, PreparedPolicy{});
 }
 
 at::Tensor forward_cute_prepared(
