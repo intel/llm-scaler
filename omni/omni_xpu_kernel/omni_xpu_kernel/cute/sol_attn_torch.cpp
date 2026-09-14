@@ -36,6 +36,10 @@
 #include "sol_attn_mainloop.hpp"
 #include "../csrc/device_utils.h"
 
+namespace omni_xpu_sol_attn {
+at::Tensor token_cutoff_for_scan(const at::Tensor& hist, int64_t budget);
+}
+
 namespace omni_xpu_sol_attn::cute_backend {
 
 using namespace cute;
@@ -1052,6 +1056,7 @@ TORCH_LIBRARY_FRAGMENT(omni_xpu_sol_attn, m) {
         "Tensor routes, Tensor tail, Tensor row_state, float scale, Tensor? bias=None, bool fp16=False) -> Tensor");
   m.def("token_remainder(Tensor q, Tensor qs, Tensor refs, Tensor k, Tensor ks, Tensor v, Tensor common, Tensor cutoff, float scale, int budget, bool tail) -> Tensor[]");
   m.def("token_histogram(Tensor q, Tensor qs, Tensor refs, Tensor k, Tensor ks, Tensor common, float scale) -> Tensor");
+  m.def("token_select_remainder(Tensor q, Tensor qs, Tensor refs, Tensor k, Tensor ks, Tensor v, Tensor common, float scale, int budget, bool tail) -> Tensor[]");
   m.def("centroid_scores(Tensor q, Tensor k, Tensor qs, Tensor ks, float scale) -> Tensor");
   m.def("forward_cute_prepared(Tensor q, Tensor k, Tensor v, Tensor q_scale, "
         "Tensor k_scale, Tensor v_scale, Tensor routes, Tensor tail_state, float scale, "
@@ -1129,6 +1134,7 @@ TORCH_LIBRARY_IMPL(omni_xpu_sol_attn, XPU, m) {
   m.impl("forward_cute_prepared_split", &omni_xpu_sol_attn::cute_backend::forward_cute_prepared_split);
   m.impl("token_remainder", &omni_xpu_sol_attn::cute_backend::token_remainder);
   m.impl("token_histogram", &omni_xpu_sol_attn::cute_backend::token_histogram);
+  m.impl("token_select_remainder", &omni_xpu_sol_attn::cute_backend::token_select_remainder);
   m.impl("centroid_scores", &omni_xpu_sol_attn::cute_backend::centroid_scores);
   m.impl("forward_cute_prepared", &omni_xpu_sol_attn::cute_backend::forward_cute_prepared);
   m.impl("forward_cute", &omni_xpu_sol_attn::cute_backend::forward_cute);
