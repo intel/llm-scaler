@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import math
 import os
+import importlib
+import sys
 from pathlib import Path
 
 import pytest
@@ -51,8 +53,48 @@ def _workspace():
     return torch.classes.custom_esimd_kernels_vllm.HCMultiMWorkspaceV1()
 
 
+@pytest.fixture(autouse=True, params=("script", "direct"))
+def workspace_binding(request, monkeypatch, device):
+    if request.param == "direct":
+        module = importlib.import_module("custom_esimd_kernels_vllm.custom_esimd_kernels")
+        factory = getattr(module, "HCMultiMWorkspaceDirectV1", None)
+        assert factory is not None, "new canonical main DSO required"
+        monkeypatch.setattr(sys.modules[__name__], "_workspace", factory)
+
+
 def _op(name):
     return getattr(torch.ops.custom_esimd_kernels_vllm, name)
+
+
+@pytest.mark.parametrize("case", ["dtype", "shape", "stride", "negative", "eps"])
+def test_direct_try_rejects_before_submit(device, weights, case):
+    module = importlib.import_module("custom_esimd_kernels_vllm.custom_esimd_kernels")
+    workspace = module.HCMultiMWorkspaceDirectV1()
+    args = list(_inputs(device, weights))
+    eps = EPS
+    if case == "dtype":
+        args[0] = args[0].float()
+    elif case == "shape":
+        args[4] = args[4][:-1]
+    elif case == "stride":
+        args[2] = args[2][:1].expand(5, 4)
+    elif case == "negative":
+        args[0] = torch._neg_view(args[0])
+    else:
+        eps = float("nan")
+    snapshots = tuple(t.clone() for t in args)
+    assert workspace.try_run(*args, eps) is None
+    _exact(args, snapshots)
+
+
+@pytest.mark.parametrize("rows", range(2, 9))
+def test_direct_try_matches_script_run(device, weights, rows):
+    module = importlib.import_module("custom_esimd_kernels_vllm.custom_esimd_kernels")
+    args = _inputs(device, weights, rows)
+    expected = _sequential(args)
+    actual = module.HCMultiMWorkspaceDirectV1().try_run(*args, EPS)
+    assert actual is not None
+    _exact(actual, expected)
 
 
 def _rand(shape, device, generator, scale):

@@ -519,6 +519,42 @@ static bool hc_multi_m_scratch_aliases(
 
 class HcMultiMWorkspaceV1 final : public torch::CustomClassHolder {
  public:
+  std::optional<std::tuple<at::Tensor, at::Tensor, at::Tensor>> try_run(
+      at::Tensor hidden, at::Tensor block, at::Tensor injection,
+      at::Tensor norm_weight, at::Tensor down_weight, at::Tensor up_weight,
+      double eps) {
+    // Optional direct entry: inspect live TensorImpls before any allocation or
+    // submission. In particular, injection is a [M,4] view with row stride 336.
+    // Never cache a Parameter's storage/shape or replay after a native failure.
+    if (!hidden.defined() || !hidden.device().is_xpu() || hidden.dim() != 2 ||
+        hidden.size(0) < 2 || hidden.size(0) > 8)
+      return std::nullopt;
+    const auto device = hidden.device();
+    const auto rows = hidden.size(0);
+    const auto compatible = [&](const at::Tensor& t, at::IntArrayRef sizes,
+                                bool contiguous = true) {
+      return t.defined() && t.device() == device && t.layout() == at::kStrided &&
+          t.scalar_type() == at::kHalf && t.sizes() == sizes &&
+          (!contiguous || t.is_contiguous()) && !t.is_neg() && !t.is_conj() &&
+          t.storage_offset() % 2 == 0 &&
+          reinterpret_cast<std::uintptr_t>(t.const_data_ptr()) % 4 == 0;
+    };
+    const float eps_fp32 = static_cast<float>(eps);
+    if (!compatible(hidden, {rows, 10240}) ||
+        !compatible(block, {rows, 2560}) ||
+        !compatible(injection, {rows, 4}, false) ||
+        injection.stride(1) != 1 || injection.stride(0) < 4 ||
+        !compatible(norm_weight, {10240}) ||
+        !compatible(down_weight, {336, 10240}) ||
+        !compatible(up_weight, {10240, 320}) ||
+        !std::isfinite(eps) || eps <= 0 ||
+        !std::isfinite(eps_fp32) || eps_fp32 <= 0)
+      return std::nullopt;
+    // Retain the established full validation, alias checks, stream/M scratch
+    // partitioning and exact same three kernels. No unchecked public entry.
+    return run(hidden, block, injection, norm_weight, down_weight, up_weight, eps);
+  }
+
   std::tuple<at::Tensor, at::Tensor, at::Tensor> run(
       at::Tensor hidden, at::Tensor block, at::Tensor injection,
       at::Tensor norm_weight, at::Tensor down_weight, at::Tensor up_weight,
@@ -592,6 +628,10 @@ void bind_hc_direct_workspace(pybind11::module_& module) {
   pybind11::class_<HcM1Workspace>(module, "HCWorkspaceDirectV1")
       .def(pybind11::init<>())
       .def("try_run", &HcM1Workspace::try_run);
+  pybind11::class_<HcMultiMWorkspaceV1>(module, "HCMultiMWorkspaceDirectV1")
+      .def(pybind11::init<>())
+      .def("try_run", &HcMultiMWorkspaceV1::try_run)
+      .def("run", &HcMultiMWorkspaceV1::run);
 }
 
 TORCH_LIBRARY_FRAGMENT(custom_esimd_kernels_vllm, m) {
