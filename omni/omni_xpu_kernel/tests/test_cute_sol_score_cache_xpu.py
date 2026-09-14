@@ -78,8 +78,8 @@ def test_cached_dispatch_and_forced_streaming_are_distinct(monkeypatch):
                 actual=ops().token_select_remainder(*data,128**-0.5,64,True);torch.xpu.synchronize()
             equal(actual,expected,64)
             names=[e.name for e in prof.events()]
-            assert any(('SolTokenScanKernel' if forced else 'SolTokenScoreCacheKernel') in n for n in names)
-            if forced:assert not any('SolTokenScoreCacheKernel' in n for n in names)
+            assert any(('SolTokenScanKernel' if forced else 'SolTokenCompactCacheKernel') in n for n in names)
+            if forced:assert not any('SolTokenCompactCacheKernel' in n for n in names)
 
 
 @pytest.mark.parametrize('invalid',['budget','common_dtype','v_shape','scale'])
@@ -90,3 +90,18 @@ def test_composite_validates_before_cache_allocation(invalid):
     if invalid=='v_shape':data[5]=data[5][:,:-1]
     if invalid=='scale':scale=float('nan')
     with pytest.raises(RuntimeError):ops().token_select_remainder(*data,scale,budget,True)
+
+
+@pytest.mark.parametrize('dot_case',['positive_max','negative_max','i16_max','i16_overflow','i16_min','i16_underflow'])
+def test_compact_integer_dot_boundaries(monkeypatch,dot_case):
+    data=list(values(257,'packed','random'));q,k=data[0],data[3]
+    q.zero_();k.zero_();data[6].fill_(1)
+    if dot_case in ('positive_max','negative_max'):
+        q.fill_(-128);k.fill_(-128 if dot_case=='positive_max' else 127)
+    else:
+        q[...,0:2]=127;k[...,0:2]=127;q[...,2]=4;k[...,2]=127;k[...,3]=1
+        q[...,3]={'i16_max':1,'i16_overflow':2,'i16_min':2,'i16_underflow':3}[dot_case]
+        if dot_case in ('i16_min','i16_underflow'):q.neg_()
+    monkeypatch.delenv('OMNI_XPU_FORCE_SKU',raising=False)
+    for tail in (False,True):
+        equal(ops().token_select_remainder(*data,128**-0.5,64,tail),baseline(data,64,tail),64)

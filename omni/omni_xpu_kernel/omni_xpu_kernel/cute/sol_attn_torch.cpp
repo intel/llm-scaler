@@ -18,6 +18,7 @@
 
 #include <cute/tensor.hpp>
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/sub_group_mask.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include "cutlass/cutlass.h"

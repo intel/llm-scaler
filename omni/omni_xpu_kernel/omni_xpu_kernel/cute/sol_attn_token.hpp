@@ -3,17 +3,20 @@
 // Token selection keeps the maintained CUTE QK fragment. A single subgroup
 // owns its eight query-group rows and streams K64 tiles; no NG x T score
 // matrix or global partial histogram is materialized in the streaming APIs.
-// The optional composition can retain lossless FP32 scores within one call.
+// The optional composition retains exact integer dots in a compact call-local
+// cache, then reconstructs the original FP32 score operations.
 
 template <bool WriteTail> struct SolTokenScanKernel;
-template <bool WriteTail, int CacheMode> struct SolTokenScoreCacheKernel;
+template <bool WriteTail, int CacheMode> struct SolTokenCompactCacheKernel;
 
 template <bool WriteTail, int CacheMode = 0>
 std::vector<at::Tensor> token_scan(
     const at::Tensor& q, const at::Tensor& qs, const at::Tensor& refs,
     const at::Tensor& k, const at::Tensor& ks, const at::Tensor& common, double scale,
     const at::Tensor& v, const at::Tensor& cutoff, int64_t budget, bool tail,
-    const at::Tensor& score_cache = at::Tensor{}) {
+    const at::Tensor& low_cache = at::Tensor{},
+    const at::Tensor& high_cache = at::Tensor{},
+    const at::Tensor& mask_cache = at::Tensor{}) {
   static_assert(CacheMode == 0 || (!WriteTail && CacheMode == 1) ||
       (WriteTail && CacheMode == 2));
   TORCH_CHECK(q.device().is_xpu() && q.scalar_type()==at::kChar && q.is_contiguous() &&
@@ -62,13 +65,19 @@ std::vector<at::Tensor> token_scan(
   const int vt=WriteTail?checked_int(v.stride(1),"V token stride"):128;
   const float log2scale=float(scale)*1.4426950408889634f;
   const int groups=(NG+7)/8;
-  float* scorep = nullptr;
+  uint16_t* lowp = nullptr;
+  int8_t* highp = nullptr;
+  uint32_t* maskp = nullptr;
   if constexpr (CacheMode != 0) {
-    check(score_cache,at::kFloat,{B,H,groups,N,512});
-    scorep=score_cache.data_ptr<float>();
+    check(low_cache,at::kShort,{B,H,groups,N,512});
+    check(high_cache,at::kChar,{B,H,groups,N,512});
+    check(mask_cache,at::kInt,{B,H,groups,N,32});
+    lowp=reinterpret_cast<uint16_t*>(low_cache.data_ptr<int16_t>());
+    highp=high_cache.data_ptr<int8_t>();
+    maskp=reinterpret_cast<uint32_t*>(mask_cache.data_ptr<int32_t>());
   }
   using ScanKernel = std::conditional_t<CacheMode == 0,
-      SolTokenScanKernel<WriteTail>, SolTokenScoreCacheKernel<WriteTail,CacheMode>>;
+      SolTokenScanKernel<WriteTail>, SolTokenCompactCacheKernel<WriteTail,CacheMode>>;
   auto& queue=c10::xpu::getCurrentXPUStream(q.device().index()).queue();
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<uint32_t,1> counts(sycl::range<1>(WriteTail?8:8*128),cgh);
@@ -135,25 +144,54 @@ std::vector<at::Tensor> token_scan(
         auto gc=local_tile(make_identity_tensor(make_shape(NG-q0,T)),make_shape(_64{},_64{}),make_coord(0,block));
         auto coords=tm.partition_C(gc);
         typename Collective::FragS softmax_scores;
+        uint32_t high_offset=0;
         CUTLASS_PRAGMA_UNROLL
         for(int i=0;i<acc.size();++i) {
           const int row=get<0>(coords(i)),key=get<1>(coords(i)),query=q0+row;
           const float ks0=broadcast<1>(kscale,acc,i);
           float kept_score=-INFINITY;
-          if(query<NG && key<T && ks0>0 && cp[(int64_t(bh)*NG+query)*N+block]) {
+          const bool valid=query<NG && key<T && ks0>0 && cp[(int64_t(bh)*NG+query)*N+block];
+          int32_t dot=0;
+          if constexpr (CacheMode != 2) dot=int32_t(acc(i));
+          if constexpr (CacheMode != 0) {
+            const int64_t base=(int64_t(tile)*N+block)*512;
+            const int64_t offset=base+i*16+lane;
+            uint32_t overflow_mask=0;
+            if constexpr (CacheMode == 1) {
+              const uint16_t low=uint16_t(dot);
+              const int32_t extended=int32_t(low)-((low&0x8000u)?65536:0);
+              const bool overflow=valid && dot!=extended;
+              // The entire subgroup participates, including invalid score lanes.
+              sycl::ext::oneapi::group_ballot(sg,overflow).extract_bits(overflow_mask);
+              if(lane==0) maskp[(int64_t(tile)*N+block)*32+i]=overflow_mask;
+              if(valid) lowp[offset]=low;
+              if(overflow) {
+                const uint32_t prefix=sycl::popcount(overflow_mask&((uint32_t(1)<<lane)-1));
+                // A D128 signed-byte dot has magnitude at most2^21, so this
+                // exact high part always fits int8. Division avoids signed shifts.
+                highp[base+high_offset+prefix]=int8_t((dot-int32_t(low))/65536);
+              }
+            } else {
+              if(lane==0) overflow_mask=maskp[(int64_t(tile)*N+block)*32+i];
+              overflow_mask=sycl::group_broadcast(sg,overflow_mask,0);
+              if(valid) {
+                const uint16_t low=lowp[offset];
+                dot=int32_t(low)-((low&0x8000u)?65536:0);
+                if((overflow_mask>>lane)&1u) {
+                  const uint32_t prefix=sycl::popcount(overflow_mask&((uint32_t(1)<<lane)-1));
+                  dot=int32_t(highp[base+high_offset+prefix])*65536+int32_t(low);
+                }
+              }
+            }
+            high_offset+=sycl::popcount(overflow_mask);
+          }
+          if(valid) {
             // Histogram and remainder must assign identical bins. Contracting
             // the final score multiply with reference subtraction only in the
             // histogram can move a boundary token and exceed the whole-bin
             // budget. Preserve the shared FP32 rounding sequence in this block.
             #pragma clang fp contract(off)
-            float score;
-            if constexpr (CacheMode == 2) {
-              score=scorep[(int64_t(tile)*N+block)*512+i*16+lane];
-            } else {
-              score=float(acc(i))*broadcast<0>(qscale,acc,i)*ks0;
-              if constexpr (CacheMode == 1)
-                scorep[(int64_t(tile)*N+block)*512+i*16+lane]=score;
-            }
+            const float score=float(dot)*broadcast<0>(qscale,acc,i)*ks0;
             kept_score=score;
             const float rel=score-broadcast<0>(reference,acc,i)+8.0f;
             if(rel>=0) {
@@ -256,16 +294,18 @@ std::vector<at::Tensor> token_select_remainder(
   const auto selection=omni_xpu::device::get_bmg_selection_unwarned(queue);
   if (selection.physical_sku==omni_xpu::device::BmgSku::b70 && !selection.forced) {
     const uint64_t groups=uint64_t(B)*H*((NG+7)/8);
-    const uint64_t elements_per_group=uint64_t(N)*512;
+    const uint64_t bytes_per_group=uint64_t(N)*(512*3+32*sizeof(uint32_t));
     const uint64_t memory=queue.get_device().get_info<sycl::info::device::global_mem_size>();
     // Division avoids overflow for large runtime shapes. Larger calls retain
     // streaming behavior; no model or captured-sequence dispatch whitelist.
-    if (groups <= (memory/8/sizeof(float))/elements_per_group) {
-      auto scores=at::empty({B,H,(NG+7)/8,N,512},q.options().dtype(at::kFloat));
+    if (groups <= (memory/8)/bytes_per_group) {
+      auto low=at::empty({B,H,(NG+7)/8,N,512},q.options().dtype(at::kShort));
+      auto high=at::empty({B,H,(NG+7)/8,N,512},q.options().dtype(at::kChar));
+      auto masks=at::empty({B,H,(NG+7)/8,N,32},q.options().dtype(at::kInt));
       auto hist=token_scan<false,1>(q,qs,refs,k,ks,common,scale,
-          at::Tensor{},at::Tensor{},0,false,scores)[0];
+          at::Tensor{},at::Tensor{},0,false,low,high,masks)[0];
       auto cutoff=omni_xpu_sol_attn::token_cutoff_for_scan(hist,budget);
-      return token_scan<true,2>(q,qs,refs,k,ks,common,scale,v,cutoff,budget,tail,scores);
+      return token_scan<true,2>(q,qs,refs,k,ks,common,scale,v,cutoff,budget,tail,low,high,masks);
     }
   }
   auto hist=token_histogram(q,qs,refs,k,ks,common,scale);
