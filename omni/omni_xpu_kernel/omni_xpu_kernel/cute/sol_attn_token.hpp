@@ -279,7 +279,7 @@ std::vector<at::Tensor> token_remainder(const at::Tensor& q,const at::Tensor& qs
 std::vector<at::Tensor> token_select_remainder(
     const at::Tensor& q,const at::Tensor& qs,const at::Tensor& refs,
     const at::Tensor& k,const at::Tensor& ks,const at::Tensor& v,
-    const at::Tensor& common,double scale,int64_t budget,bool tail) {
+    const at::Tensor& common,double scale,int64_t budget,bool tail,bool return_cache=false) {
   // Validate the complete boundary before sizing or allocating scratch.
   TORCH_CHECK(q.device().is_xpu() && q.scalar_type()==at::kChar && q.is_contiguous() &&
       q.dim()==4 && q.size(3)==128 && q.size(0)>0 && q.size(1)>0 && q.size(2)>0,
@@ -315,7 +315,9 @@ std::vector<at::Tensor> token_select_remainder(
       auto hist=token_scan<false,1>(q,qs,refs,k,ks,common,scale,
           at::Tensor{},at::Tensor{},0,false,low,high,masks)[0];
       auto cutoff=omni_xpu_sol_attn::token_cutoff_for_scan(hist,budget);
-      return token_scan<true,2>(q,qs,refs,k,ks,common,scale,v,cutoff,budget,tail,low,high,masks);
+      auto result=token_scan<true,2>(q,qs,refs,k,ks,common,scale,v,cutoff,budget,tail,low,high,masks);
+      if(return_cache) { result.push_back(low);result.push_back(high);result.push_back(masks); }
+      return result;
     }
   }
   auto hist=token_histogram(q,qs,refs,k,ks,common,scale);
